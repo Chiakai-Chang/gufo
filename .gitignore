@@ -52,6 +52,10 @@ Makefile
 install_manifest.txt
 compile_commands.json
 
+# nix build symlink
+result
+result-*
+
 # Temporary files
 *.tmp
 *.log
