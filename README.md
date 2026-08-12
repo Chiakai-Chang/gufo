@@ -1,6 +1,6 @@
-# Strix-cpp
+# Strix-Halo.cpp
 
-Strix-cpp is a local inference runtime built specifically for AMD Strix
+Strix-Halo.cpp is a local inference runtime built specifically for AMD Strix
 Halo systems with a `gfx1151` RDNA 3.5 GPU, an XDNA2 NPU, and up to 128 GiB of
 unified memory.
 

@@ -51,7 +51,7 @@ logit checks, and isolating HTTP from inference failures.
 
 ### Client mode
 
-Client mode sends a request to a running Strix.cpp server:
+Client mode sends a request to a running Strix-Halo.cpp server:
 
 ```bash
 strix-server prompt \

@@ -1,5 +1,5 @@
 {
-  description = "strix.cpp - Strix Engine for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
+  description = "strix-halo.cpp - Strix Engine for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

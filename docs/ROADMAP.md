@@ -4,7 +4,7 @@ Status: initial roadmap, 2026-08-11
 
 ## Objective
 
-Build Strix.cpp incrementally from a deterministic, testable vertical slice.
+Build Strix-Halo.cpp incrementally from a deterministic, testable vertical slice.
 Do not begin with the complete server, both models, continuous batching, and
 heterogeneous execution simultaneously.
 

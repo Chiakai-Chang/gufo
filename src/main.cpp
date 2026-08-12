@@ -1,4 +1,4 @@
-// strix.cpp — hello world / ROCm + NPU smoke test.
+// strix-halo.cpp — hello world / ROCm + NPU smoke test.
 //
 // Prints build info, verifies the ROCm/HIP GPU toolchain (when built with
 // ENGINE_ENABLE_HIP=1) and the XRT NPU shim (when ENGINE_ENABLE_XRT=1):
