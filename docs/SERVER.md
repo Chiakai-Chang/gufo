@@ -1,0 +1,474 @@
+# OpenAI-Compatible Server
+
+Status: design draft, 2026-08-11
+
+## Purpose
+
+The server exposes a focused OpenAI-compatible API while keeping inference,
+scheduling, and device execution in the C++ process. Compatibility is a
+versioned contract: supported fields behave as documented, and unsupported
+fields return explicit errors.
+
+The primary API is the Responses API. Chat Completions is an adapter over the
+same internal request representation. The implementation should follow the
+official OpenAI API reference for object names and streaming event shapes:
+
+- https://developers.openai.com/api/reference/resources/responses/methods/create/
+- https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create/
+- https://developers.openai.com/api/reference/resources/models/methods/list/
+
+The local server does not need to reproduce OpenAI-hosted storage, billing,
+organization, or account behavior.
+
+The only supported production platform is Linux x86-64 on Strix Halo.
+
+## Implementation
+
+Use C++20 for the complete runtime:
+
+- Asynchronous HTTP/1.1 with keep-alive.
+- Server-Sent Events for streaming.
+- Separate I/O, scheduling, and device-execution threads.
+- Incremental JSON parsing with bounded request sizes.
+- Backpressure-aware response writers.
+- Cancellation propagated from socket closure to the scheduler.
+
+Boost.Asio/Beast is a reasonable initial transport. Keep HTTP and JSON types
+outside the inference core so the transport can be replaced without changing
+request scheduling.
+
+Python may be used for development tools and API conformance tests, but it must
+not be required to serve requests.
+
+## Single Executable and Model Configuration
+
+The deployed product is one `strix-server` executable. Supported model graphs,
+tokenizers, HIP kernels, and AIE programs are compiled into it.
+
+The executable provides subcommands rather than separate inference binaries:
+
+```text
+strix-server serve
+strix-server chat
+strix-server prompt
+```
+
+`chat` and `prompt` are transport adapters over the same scheduler and may
+either load the runtime directly or connect to a running server. Their detailed
+contract is defined in [Command-Line Interface](CLI.md).
+
+The user provides weight artifacts and configuration:
+
+```toml
+bind = "127.0.0.1:8080"
+memory_policy = "guaranteed"
+
+[[models]]
+alias = "qwen-current-27b"
+kind = "QWEN36_27B"
+weights = "/models/qwen-current/strix-manifest.json"
+enable_gpu = true
+enable_npu = true
+
+[[models]]
+alias = "deepseek-flash"
+kind = "DEEPSEEK_V4_FLASH"
+weights = "/models/deepseek-flash/strix-manifest.json"
+enable_gpu = true
+enable_npu = true
+```
+
+`kind` resolves through a closed compiled-in enum. The server verifies that the
+manifest, tensor inventory, dimensions, quantization, tokenizer, and state
+contract match that implementation.
+
+Model artifacts cannot provide:
+
+- Host shared libraries.
+- HIP or generic GPU code objects.
+- AIE overlays or `ctrlcode`.
+- Tokenizer plugins.
+- Executable chat templates.
+
+Adding another model architecture requires rebuilding `strix-server`.
+Changing weights for an already supported kind does not.
+
+## Process and State Ownership
+
+Use separate execution domains:
+
+```text
+HTTP I/O threads
+tokenization workers
+single-owner scheduler
+GPU submit/completion worker
+NPU submit/completion worker
+background storage workers
+```
+
+Only the scheduler mutates logical request, session, KV-ownership, speculative,
+and commit state. Other threads send immutable commands or completion records.
+
+Every completion record contains:
+
+- Request and execution IDs.
+- Allocation and state generations.
+- Backend route and program/kernel identity.
+- Completion status and bounded result metadata.
+
+Stale completions are rejected by generation before they can alter request
+state. I/O threads never wait synchronously for device completion.
+
+## Endpoint Set
+
+### Milestone 1
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/v1/models` | List loaded model aliases and capabilities |
+| `POST` | `/v1/responses` | Primary text generation API |
+| `POST` | `/v1/chat/completions` | Chat Completions compatibility |
+| `POST` | `/v1/completions` | Optional legacy text completion adapter |
+| `GET` | `/healthz` | Process liveness |
+| `GET` | `/readyz` | Model and backend readiness |
+| `GET` | `/metrics` | Prometheus-format operational metrics |
+
+### Later, capability-gated
+
+| Method | Path | Condition |
+| --- | --- | --- |
+| `POST` | `/v1/embeddings` | An embedding implementation is compiled and loaded |
+| `POST` | `/v1/audio/transcriptions` | An STT implementation is compiled and loaded |
+| `POST` | `/v1/audio/speech` | A TTS implementation is compiled and loaded |
+| `POST` | `/v1/images/generations` | An image implementation is compiled and loaded |
+
+Future video support must follow the then-current official API shape rather than
+freezing a speculative endpoint now.
+
+## Internal Request Model
+
+All public endpoints translate into one scheduler request:
+
+```cpp
+struct GenerationRequest {
+    RequestId id;
+    ModelId model;
+    Prompt prompt;
+    SamplingConfig sampling;
+    OutputConstraints constraints;
+    ToolConfig tools;
+    Priority priority;
+    Deadline deadline;
+    bool stream;
+};
+```
+
+Transport adapters may not directly call a model backend.
+
+The prompt representation must preserve:
+
+- System, developer, user, assistant, and tool roles where supported.
+- Text and structured tool-call items.
+- Model-specific chat-template version.
+- Exact token IDs after tokenization.
+- Request-level stop conditions.
+
+## Responses API Subset
+
+`POST /v1/responses` initially accepts:
+
+- `model`
+- `input` as text or a supported item array
+- `instructions`
+- `max_output_tokens`
+- `temperature`
+- `top_p`
+- `stream`
+- `text` for supported text and structured-output configuration
+- `tools` and `tool_choice` for model implementations with validated tool support
+- `metadata`, retained only for logging if enabled
+
+The first release is stateless by default:
+
+- `store` is accepted only when it is false; `store: true` is rejected.
+- Server-side conversations and `previous_response_id` are rejected.
+- Clients provide all context required for the request.
+
+Non-streaming responses return one completed response object. Streaming uses
+SSE and emits a stable subset of Responses streaming events, including:
+
+```text
+response.created
+response.output_item.added
+response.content_part.added
+response.output_text.delta
+response.output_text.done
+response.completed
+```
+
+Errors terminate the stream with an error event when possible.
+
+## Chat Completions Adapter
+
+`POST /v1/chat/completions` accepts the common compatibility subset:
+
+- `model`
+- `messages`
+- `max_tokens` or `max_completion_tokens`
+- `temperature`
+- `top_p`
+- `seed`
+- `stop`
+- `stream`
+- `stream_options.include_usage`
+- `tools` and `tool_choice` when supported
+- common frequency and presence penalties when implemented by the sampler
+
+Streaming objects use `chat.completion.chunk` and end with the compatibility
+sentinel expected by common clients.
+
+The adapter must not implement a second inference path. It converts messages
+into the same prompt and sampling structures used by `/v1/responses`.
+
+## Model Discovery
+
+`GET /v1/models` returns only usable model aliases. Each model entry includes
+the standard identifier fields plus optional local metadata under a namespaced
+extension:
+
+```json
+{
+  "id": "qwen-current-27b",
+  "object": "model",
+  "created": 0,
+  "owned_by": "local",
+  "strix": {
+    "artifact_id": "qwen-27b-shq-t16-4p42bpw",
+    "context_length": 131072,
+    "quantization": "SHQ-T16",
+    "bits_per_weight": 4.42,
+    "tensor_encodings": ["SHQ4-T16", "SHQ8-T16", "BF16"],
+    "backends": ["gfx1151", "xdna2"],
+    "capabilities": ["responses", "chat", "tools"]
+  }
+}
+```
+
+Clients must not need the extension to use the model.
+
+When several sizes of the same model are loaded, their public aliases must be
+distinct and should expose the measured size, for example:
+
+```text
+qwen-27b-4.4bpw
+qwen-27b-5.2bpw
+qwen-27b-6.1bpw
+```
+
+Aliases are configuration choices; compatibility depends on the immutable
+artifact ID returned in the `strix` metadata.
+
+## Errors
+
+Return an OpenAI-style error object:
+
+```json
+{
+  "error": {
+    "message": "Unsupported field: logprobs",
+    "type": "invalid_request_error",
+    "param": "logprobs",
+    "code": "unsupported_parameter"
+  }
+}
+```
+
+Use appropriate HTTP status codes:
+
+- `400` invalid request or unsupported field
+- `401` missing or invalid configured bearer token
+- `404` unknown model or endpoint object
+- `409` incompatible session state
+- `413` request or prompt too large
+- `429` admission queue full or rate limit exceeded
+- `499` internally recorded client cancellation
+- `500` internal failure
+- `503` model or backend unavailable
+
+Do not silently clamp context or output limits without returning the effective
+limits in response metadata.
+
+## Authentication and Exposure
+
+Default binding should be loopback-only. Optional bearer-token authentication
+uses:
+
+```text
+Authorization: Bearer <local-token>
+```
+
+Remote binding requires an explicit configuration flag. TLS should normally be
+terminated by a local reverse proxy, though native TLS may be added later.
+
+Prompt and generated text logging is disabled by default.
+
+Tool definitions and generated tool calls are treated as data. `strix-server`
+never executes tools, shell commands, URLs, or generated code.
+
+Browser access requires an explicit CORS origin allowlist. Do not enable a
+wildcard origin on a remotely reachable authenticated server.
+
+Metrics and future administrative endpoints may use a separate loopback
+listener or a distinct administrative bearer token. They are not implicitly
+exposed merely because the inference listener is remote.
+
+## Backpressure and Cancellation
+
+- Bound accepted request count, queued tokens, and active KV pages.
+- Reject before tokenization when the admission queue is full.
+- Stop scheduling new decode work immediately after cancellation.
+- Reclaim provisional KV and speculative state transactionally.
+- Permit an in-flight device step to finish if it cannot be safely interrupted.
+- Never block an I/O thread waiting for a device event.
+
+## Startup and Readiness
+
+Process states are:
+
+```text
+STARTING
+WARMING
+READY
+DEGRADED
+DRAINING
+FAILED
+```
+
+Startup performs:
+
+1. Parse configuration and reject unknown fields.
+2. Discover and fingerprint the Strix Halo GPU and NPU.
+3. Initialize the allocation broker and safety reserves.
+4. Initialize compiled backend programs and kernel registries.
+5. Load each configured weight artifact into unpublished state.
+6. Validate tensors, checksums, tokenizer, quantization, and state contracts.
+7. Prefault required memory and create graph-stable allocations.
+8. Run backend visibility, kernel, and model smoke tests.
+9. Warm required single-request and configured batch routes.
+10. Publish usable model aliases and become ready.
+
+`GET /healthz` reports whether the process event loops and control plane are
+alive. It does not imply that a model is usable.
+
+`GET /readyz` succeeds when at least one advertised model alias can admit work.
+Its body reports:
+
+- Process state.
+- Loaded aliases.
+- GPU and NPU availability.
+- Disabled or degraded routes.
+- Memory-pressure state.
+
+If NPU initialization or recovery fails but a model has a validated GPU route,
+the process enters `DEGRADED` and remains ready for GPU-only serving. A model
+that requires an unavailable backend is omitted from `/v1/models`.
+
+## Configuration
+
+Configuration precedence is:
+
+```text
+compiled safe defaults
+< configuration file
+< explicitly supported command-line flags
+```
+
+Secrets such as bearer tokens may be read from protected files or environment
+variables, but their values are never rendered by configuration diagnostics.
+
+Reject:
+
+- Unknown configuration keys.
+- Duplicate model aliases.
+- Unsupported model kinds.
+- Relative or escaping model paths where policy forbids them.
+- Unsafe memory budgets below the platform minimum without an explicit
+  development override.
+- Remote binding without the remote-exposure flag.
+
+The effective non-secret configuration is available in startup logs and
+diagnostic output.
+
+## Model Replacement
+
+Weight replacement for a supported model kind is transactional:
+
+1. Resolve and validate the candidate artifact.
+2. Reserve its complete load and warmup budget.
+3. Load it under an unpublished internal ID.
+4. Run required smoke and compatibility tests.
+5. Atomically move the public alias to the candidate.
+6. Drain sessions using the previous artifact.
+7. Release previous weights after the final reference retires.
+
+The server never changes the weights underneath an active session. Rollback is
+available only when memory for the previous artifact was deliberately retained.
+
+Replacement is initiated through a local administrative mechanism, not the
+public OpenAI API.
+
+## Graceful Shutdown
+
+On `SIGTERM` or an administrative shutdown:
+
+1. Enter `DRAINING`.
+2. Stop accepting new inference requests.
+3. Finish or cancel queued work according to configured grace time.
+4. Let uninterruptible device operations retire.
+5. Commit only transitions completed before cancellation.
+6. Flush bounded response and metric buffers.
+7. Finish or abort snapshot writes transactionally.
+8. Destroy graphs, NPU contexts, queues, and allocations in dependency order.
+
+A second termination signal or expired hard deadline performs an immediate
+best-effort shutdown without publishing partial snapshots or state.
+
+After system suspend/resume or a backend reset, the server recreates affected
+contexts and imported allocations, reruns visibility and smoke tests, and keeps
+the route disabled until validation succeeds.
+
+## Metrics
+
+At minimum expose:
+
+- Time to first token.
+- Inter-token latency.
+- Prompt and generated tokens per second.
+- Queue and admission delay.
+- Active, queued, cancelled, and failed requests.
+- GPU-only, NPU-only, and heterogeneous route counts.
+- Scheduler batch width and padding.
+- KV pages used, shared, evicted, dumped, and restored.
+- Speculative proposed, verified, accepted, and committed tokens.
+- Per-backend execution and synchronization time.
+
+Metrics labels must use bounded model and route identifiers. Do not place
+request IDs or prompt text in labels.
+
+## Conformance Tests
+
+- Golden JSON request/response fixtures for every supported field.
+- Official-client smoke tests against a local base URL.
+- Streaming chunk ordering and disconnect tests.
+- Chat Completions and Responses token parity.
+- Tool-call and structured-output fixtures.
+- Unknown and unsupported parameter tests.
+- Queue saturation, timeout, and cancellation tests.
+- Direct runtime versus HTTP exact-token tests for greedy generation.
+- Startup failure at every initialization stage.
+- GPU-only degraded readiness after NPU failure.
+- Model replacement, drain, alias switch, and rollback.
+- Graceful and forced shutdown with active requests.
+- Suspend/resume and backend-context reconstruction.
+- Scheduler stale-completion rejection.
+- Configuration and secret-redaction tests.

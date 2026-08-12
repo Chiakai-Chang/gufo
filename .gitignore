@@ -71,3 +71,6 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Model artifacts, logit dumps, teacher captures (never commit weights/logits)
+artifacts/

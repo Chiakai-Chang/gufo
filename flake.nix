@@ -18,6 +18,18 @@
         system:
         pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit version; }
       );
+
+      # Offline model-conversion toolchain. Python only; never a transitive
+      # dependency of the server (see docs/QUANTIZATION.md "Offline Toolchain").
+      pythonTools = system: (pkgs.${system}.python3.withPackages (ps: [
+        ps.torch
+        ps.transformers
+        ps.safetensors
+        ps.huggingface-hub
+        ps.numpy
+        ps.scipy
+        ps.zstandard
+      ]));
     in
     {
       packages = forAllSystems (
@@ -38,9 +50,13 @@
 
       devShells = forAllSystems (
         system:
+        let
+          py = pythonTools system;
+        in
         {
           default = pkgs.${system}.mkShell {
             inputsFrom = [ self.packages.${system}.default ];
+            packages = [ py ];
           };
           rocm = pkgs.${system}.mkShell {
             inputsFrom = [ self.packages.${system}.rocm-gfx1151 ];
