@@ -19,9 +19,18 @@ tools/strix-inspect.py --source artifacts/source --revision <sha> \
 tools/strix-capture.py --source artifacts/source \
   --suite tools/suites/teacher.json --out artifacts/teacher
 
+# 3b. capture per-input-channel imatrix (E[x^2]) for imatrix-weighted scale search
+tools/strix-calibrate.py --source artifacts/source \
+  --suite tools/suites/teacher.json --out artifacts/calib
+
 # 4. quantize LM linear projections to SHQ4-T16 U4Z G64
+#   (add --imatrix DIR to enable importance-weighted scale search)
 tools/strix-quantize.py --source artifacts/source \
   --out artifacts/quant --plan artifacts/work/quantization-plan.json
+#   imatrix/GPTQ-style scale search variant:
+tools/strix-quantize.py --source artifacts/source \
+  --out artifacts/quant --plan artifacts/work/quantization-plan.json \
+  --imatrix artifacts/calib
 
 # 5. benchmark: candidate-vs-teacher quality + prefill/decode speed
 tools/strix-bench.py --source artifacts/source --quant artifacts/quant \
@@ -43,7 +52,8 @@ tools/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --recon \
 - `strix/model.py` — Qwen3.5 teacher/candidate load + logit extraction
 - `strix/quality.py` — KL, perplexity, top-k agreement
 - `strix-capture.py` — teacher logit artifact (chunked zstd)
-- `strix-quantize.py` — deterministic conversion
+- `strix-calibrate.py` — per-input-channel E[x^2] imatrix artifact
+- `strix-quantize.py` — deterministic conversion (range or imatrix scale search)
 - `strix-bench.py` — correctness-linked benchmark
 - `strix-gguf.py` — GGUF header/tensor-info inspection + Q4-family dequant
   (`--card` model card, `--recon` per-tensor retention vs bf16 with our SHQ4
@@ -60,4 +70,35 @@ python3 -c "import sys; sys.path.insert(0,'tools'); from strix.conformance impor
 See docs/QUANTIZATION.md. Byte layout: `qweight[n_tile][k_group][k16][lane=16][k_pair=8]`,
 scales/zeros BF16 + packed UINT4 per (tile,group,lane). U4Z dequant:
 `s * (q - z)`, scale rounded to BF16 RNE-ties-even before code selection.
-Deterministic v1 scale search is per-channel-per-group min/max range.
+
+Scale selection is deterministic, two modes:
+
+- `range` (default): per-channel-per-group min/max range (v1).
+- `imatrix-weighted-ls` (`--imatrix DIR`): per-input-channel E[x^2]
+  importance; per (tile,group) all 16 lanes solved at once. For each lane,
+  enumerate zero candidates {round(-min/s_r)+d, d in -1..1}, refine scale by
+  weighted least squares (`s = sum(h*w*d)/sum(h*d^2)`, d = q-z) for 2 rounds,
+  fix s to BF16 RNE, keep best (s,z,q) by weight sensitivity `S = sum_h(w-ŵ)^2`.
+  Result is never worse than the range baseline per block.
+
+Planes are byte-identical in layout for both modes; only s/z/q values differ.
+
+## Performance
+
+`strix-shq` is fully batch-vectorized and chunk-parallel. Scale/zero/code
+selection and packing run as numpy ops on one `[B,16,G]` block array;
+chunks fan out across threads (numpy releases the GIL in its C loops, so
+elementwise/bandwidth-bound work parallelizes). Threads default to
+`min(4, cores)` (memory-bandwidth bound past 4); override with
+`STRIX_QUANT_THREADS`, fixed chunk size with `STRIX_QUANT_CHUNK`.
+`dequant_shq4` is batch-vectorized too.
+
+Whole-model Qwen3.5-0.8B (158 tensors, G64) rough timings on this box:
+
+| path | time (1 thread) | time (4 threads) |
+| --- | --- | --- |
+| range | ~30s | ~6s |
+| imatrix | ~30s | ~16s |
+
+(The 4-thread row is the default. The prior per-block Python-loop version took
+minutes and choked imatrix; this is ~20x faster and scales memory-bounded.)

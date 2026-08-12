@@ -26,10 +26,11 @@ def read_bf16_tensor(path, info, dtype, shape, data_off, offset=0) -> np.ndarray
     return (np.frombuffer(data, dtype=np.uint16).astype(np.uint32) << np.uint32(16)).view(np.float32).copy()
 
 
-def quantize_one(name, shape, data, recipe) -> dict:
+def quantize_one(name, shape, data, recipe, importance=None) -> dict:
     """Returns dict with format, planes bytes, and reconstruction stats."""
     W = data.reshape(shape)
-    planes = shq.quantize_shq4(W, group_size=recipe["group_size"])
+    planes = shq.quantize_shq4(W, group_size=recipe["group_size"],
+                               importance=importance)
     Wd = shq.dequant_shq4(planes)[: shape[0], : shape[1]]
     err = np.abs(Wd - W)
     stats = {
@@ -41,14 +42,39 @@ def quantize_one(name, shape, data, recipe) -> dict:
     return planes, stats
 
 
+def load_imatrix(imatrix_dir: str) -> dict:
+    """Load a strix-calibrate artifact dir -> {tensor name: importance[K]}."""
+    d = Path(imatrix_dir)
+    manifest = json.loads((d / "manifest.json").read_text("utf-8"))
+    if manifest.get("schema") != "strix.imatrix.v1":
+        raise SystemExit(f"{imatrix_dir}: not a strix.imatrix.v1 artifact")
+    out = {}
+    for name, info in manifest["tensors"].items():
+        raw = (d / info["file"]).read_bytes()
+        arr = np.frombuffer(raw, dtype=np.float32)
+        if arr.shape[0] != info["dim"]:
+            raise SystemExit(f"{name}: imatrix dim mismatch {arr.shape[0]} != {info['dim']}")
+        # calibrate keys are module names (language_model...); quantize keys
+        # are safetensors names (model.<module>.weight)
+        out["model." + name + ".weight"] = arr
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="strix-quantize")
     ap.add_argument("--source", required=True, help="HF snapshot directory")
     ap.add_argument("--out", default="artifacts/quant")
     ap.add_argument("--plan", default="artifacts/work/quantization-plan.json")
     ap.add_argument("--group-size", type=int, default=64, choices=[32, 64])
+    ap.add_argument("--imatrix", default=None,
+                    help="strix-calibrate artifact dir; enables imatrix/GPTQ-style "
+                         "importance-weighted scale search")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
+
+    imatrix = load_imatrix(args.imatrix) if args.imatrix else None
+    if imatrix:
+        print(f"imatrix: {len(imatrix)} tensors from {args.imatrix}")
 
     src = Path(args.source)
     index = src / "model.safetensors.index.json"
@@ -82,7 +108,8 @@ def main(argv=None):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     recipe = {"family": "SHQ-T16", "group_size": args.group_size,
-              "variant": f"SHQ4_T16_V1_U4Z_G{args.group_size}"}
+              "variant": f"SHQ4_T16_V1_U4Z_G{args.group_size}",
+              "scale_search": "imatrix-weighted-ls" if imatrix else "range"}
     plan = {"schema": "strix.quant-plan.v1", "recipe": recipe,
             "source_manifest": str(Path(args.source) / ".."),
             "tensors": {}}
@@ -98,7 +125,13 @@ def main(argv=None):
                 plan["tensors"][name] = {"format": "BF16", "note": "source dtype not BF16"}
                 continue
             data = read_bf16_tensor(p, infos[name], dtype, shape, data_off)
-            planes, stats = quantize_one(name, shape, data, recipe)
+            imp = imatrix.get(name) if imatrix else None
+            if imp is not None and imp.shape[0] != shape[1]:
+                raise SystemExit(f"{name}: imatrix dim {imp.shape[0]} != K {shape[1]}")
+            planes, stats = quantize_one(name, shape, data, recipe, importance=imp)
+            if imp is not None:
+                stats["scale_search"] = "imatrix-weighted-ls"
+                stats["imatrix_mean"] = float(imp.mean())
             # write shard
             shard = out / (name.replace(".", "/") + ".shq4")
             shard.parent.mkdir(parents=True, exist_ok=True)
@@ -131,7 +164,8 @@ def main(argv=None):
                           "total_tensors": len(plan["tensors"])}, indent=2))
     else:
         print(f"quantization plan: {plan_file}")
-        print(f"quantized {n_q} tensors to SHQ4-T16 U4Z G{args.group_size}")
+        print(f"quantized {n_q} tensors to SHQ4-T16 U4Z G{args.group_size} "
+              f"(scale search: {recipe['scale_search']})")
     return 0
 
 

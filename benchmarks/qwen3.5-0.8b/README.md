@@ -104,8 +104,11 @@ unsloth 1.85% ours 9.97%`, `ssm_out Q5_K 5.50bpw unsloth 4.05% ours 10.32%`).
   our 10%) because Q4_K_M uses **imatrix / mixed-precision recipes** (Q6_K
   for embed and ffn_down, Q5_K/Q8_0 for linear-attn projections) plus
   importance-weighted quantization. Our SHQ4 slice is uniform U4Z G64 on
-  everything. Imatrix/GPTQ-style scale search is the obvious next lever
-  (already planned; see next steps).
+  everything. Imatrix/GPTQ-style scale search is implemented (see next steps);
+  on the current tiny calibration set it trims activation-weighted
+  reconstruction ~3% but does not move logit KL — the remaining gap is
+  dominated by the **mixed-precision recipe** (upcast embed + ffn_down +
+  linear-attn projections), not by scale selection.
 - We retain more where we stay bf16 (embed, norms) — 0% loss.
 - linear_attn compares unevenly because the recipes pick different tensors to
   quantize (their ssm small projections vs our qkv/z/out). Per-tensor rows
@@ -140,8 +143,17 @@ milestone.
 
 - Port SHQ4 decode GEMV to HIP (gfx1151) and XDNA2 (AIE2P); consume the
   packed planes directly (no dequant-to-bf16).
-- Imatrix / GPTQ-style scale search to pull KL tail down (Q4_K_M comparison
-  shows the headroom: ~7% vs ~10% weight retention on attn/mlp).
+- Imatrix scale search is DONE (`tools/strix-calibrate.py` + `--imatrix`):
+  importance-weighted LS per (tile,group), byte-identical planes, never worse
+  than range per block. With the 78-token teacher suite as calibration it
+  trims activation-weighted reconstruction 0.886% -> 0.857% but leaves logit
+  KL unchanged (0.1722) — calibration is the same set as evaluation, and
+  LayerNorm-flattened channels make E[x^2] near-uniform. Next calibration
+  slice needs a disjoint, longer (>=1k token) prompt set to show signal.
+- The measured gap vs Q4_K_M is dominated by mixed precision, not scale
+  search: add recipe support to promote embed + ffn_down (+ linear-attn
+  projections) to SHQ8/Q6_K-class bpw, mirroring unsloth's Q6_K/Q5_K/Q8_0
+  choices; then re-run the retention table.
 - G32 quality groups for sensitive attention tensors.
 - Per-layer quality breakdown (see `docs/BENCHMARKS.md`).
 - GGUF cross-quant matrix: run `strix-gguf.py --recon` on `Q4_K_S`, `Q4_0`,

@@ -21,11 +21,21 @@ Quantizer rounding:
   scale rounded to BF16 RNE-ties-to-even before final code selection.
 
 This is the deterministic v1 scale search: per-channel-per-group min/max range
-for U4Z, max-abs for S4/SHQ8. Imatrix/GPTQ-style search is a later recipe step.
+for U4Z, max-abs for S4/SHQ8. When an importance vector (per-input-channel
+E[x^2] imatrix) is supplied, scales/zeros are searched GPTQ/imatrix style:
+per (tile, group), all 16 output lanes at once, enumerate zero candidates
+{round(-min/s_r) + d, d in -1..1}, refine the scale by importance-weighted
+least squares against the integer codes (s = sum(h*w*d)/sum(h*d^2),
+d = q-z), fix s to BF16 RNE, and keep the best (s, z, q) by weighted error.
+Keeping the min/max zero candidate makes imatrix never worse than the range
+baseline per block. The packed planes are byte-identical in layout; only the
+s/z/q values differ. Same output for same input (deterministic).
 """
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 U4_MAX = 15
@@ -59,8 +69,131 @@ def _round_even(v):
     return np.round(v)
 
 
-def quantize_shq4(W: np.ndarray, group_size: int, symmetric: bool = False):
+def _bf16r(a):
+    """Round float32 array/scalar to BF16 RNE-ties-to-even (vectorized)."""
+    return bf16_uint16_to_f32(f32_to_bf16_uint16(np.asarray(a, dtype=np.float32)))
+
+
+def _imatrix_block_search_batched(Wb: np.ndarray, h: np.ndarray, G: int):
+    """Batched importance-weighted scale/zero search over many (tile, group)
+    blocks at once. Wb: [B,16,G] weights, h: [B,1,G] importance (broadcast over
+    lanes). For each block/lane enumerate zero candidates {round(-min/s_r)+d,
+    d in -1..1}, refine scale by weighted least squares (s = sum(h*w*d) /
+    sum(h*d^2), d = q-z) for 2 rounds, fix s to BF16 RNE, keep best by weighted
+    error. Constant rows keep the all-zero convention. Returns (s_bf [B,16],
+    z [B,16] int, q [B,16,G] codes) with s_bf <= 0 for constant rows.
+    """
+    B = Wb.shape[0]
+    wmin = Wb.min(axis=2)
+    wmax = Wb.max(axis=2)
+    rng = (wmax - wmin) / 15.0
+    const = rng <= 0.0
+    s_safe = np.where(const, 1.0, rng)
+    z_rng = _clamp(_round_even(np.where(const, 0.0, -wmin / np.where(const, 1.0, rng))),
+                   0, U4_MAX).astype(np.int64)
+
+    best_err = np.full((B, 16), np.inf)
+    best_s = np.zeros((B, 16), dtype=np.float32)
+    best_z = np.zeros((B, 16), dtype=np.int64)
+    best_q = np.zeros((B, 16, G), dtype=np.float32)
+    for dz in (-1, 0, 1):
+        z = np.clip(z_rng + dz, 0, 15)  # [B,16]
+        s = s_safe.copy()
+        q = _clamp(_round_even(Wb / s[..., None] + z[..., None]), 0, U4_MAX)
+        for _ in range(2):
+            d = (q - z[..., None]).astype(np.float32)
+            den = (h * d * d).sum(axis=2)
+            num = (h * Wb * d).sum(axis=2)
+            ok = den > 1e-18
+            s_new = np.where(ok, num / np.where(ok, den, 1.0), s)
+            s = np.where(s_new > 0.0, s_new, s)
+            q = _clamp(_round_even(Wb / s[..., None] + z[..., None]), 0, U4_MAX)
+        s_bf = _bf16r(s)
+        s_bf = np.where((s_bf > 0.0) | const, s_bf, s_safe)
+        q = _clamp(_round_even(Wb / s_bf[..., None] + z[..., None]), 0, U4_MAX)
+        d = (q - z[..., None]).astype(np.float32)
+        err = (h * (Wb - s_bf[..., None] * d) ** 2).sum(axis=2)
+        upd = err < best_err
+        best_err = np.where(upd, err, best_err)
+        best_s = np.where(upd, s_bf, best_s)
+        best_z = np.where(upd, z, best_z)
+        best_q = np.where(upd[..., None], q, best_q)
+    best_s = np.where(const, 0.0, best_s)
+    best_z = np.where(const, 0, best_z)
+    best_q = np.where(const[..., None], 0.0, best_q)
+    return best_s, best_z, best_q
+
+
+def _quantize_chunk(Wc, hc, symmetric, G, k16_per):
+    """Scale/zero/code selection + packing for one chunk of [Bc,16,G] blocks.
+
+    Returns (weight_bytes, scale_bytes, zero_bytes) for the chunk, in packing
+    order (gidx = nt*k_group_count+g). Runs one chunk's worth of vectorized
+    numpy; callers fan chunks out across threads (numpy releases the GIL
+    inside its C loops, so elementwise/bandwidth-bound work parallelizes).
+    """
+    Bc = Wc.shape[0]
+    wmin = Wc.min(axis=2)
+    wmax = Wc.max(axis=2)
+    const = wmax == wmin
+
+    if symmetric:
+        s = np.where(const, 0.0, np.maximum(np.abs(wmax), np.abs(wmin)) / 7.0)
+    else:
+        s = np.where(const, 0.0, (wmax - wmin) / 15.0)
+    s_bf = _bf16r(s)  # [Bc,16] scale, BF16 RNE
+    valid = (const == False) & (s_bf > 0.0)
+
+    if symmetric:
+        qx = np.where((Wc == 0), 0,
+                      _clamp(_round_even(Wc / np.where(valid, s_bf, 1.0)[..., None]),
+                             S4_MIN, S4_MAX))
+        q = np.where(valid[..., None], qx, 0.0)
+        z = np.zeros((Bc, 16))
+    elif hc is not None:
+        s_bf, z, q = _imatrix_block_search_batched(Wc, hc, G)
+    else:
+        s_eff = np.where(valid, s_bf, 1.0)
+        z = np.where(valid, _clamp(_round_even(-wmin / s_eff), 0, U4_MAX), 0.0)
+        q = _clamp(_round_even(Wc / s_eff[..., None] + z[..., None]), 0, U4_MAX)
+        q = np.where(valid[..., None], q, 0.0)
+
+    sbytes = f32_to_bf16_uint16(np.where(valid, s_bf, 0.0)).astype(np.uint16).tobytes()
+    if not symmetric:
+        zz = np.clip(np.round(z), 0, U4_MAX).reshape(Bc, 16).astype(np.uint8)
+        zz = zz.reshape(Bc, 8, 2)
+        zbytes = (zz[:, :, 0] | (zz[:, :, 1] << 4)).tobytes()
+    else:
+        zbytes = b""
+    if symmetric:
+        qn = (q.astype(np.int8).astype(np.uint8)) & 0x0F
+    else:
+        qn = np.clip(np.round(q), 0, U4_MAX).astype(np.uint8)
+    qr = qn.reshape(Bc, 16, k16_per, 16).transpose(0, 2, 1, 3)
+    wbytes = (qr[:, :, :, 0::2] | (qr[:, :, :, 1::2] << 4)).tobytes()
+    return wbytes, sbytes, zbytes
+
+
+def _quant_workers() -> int:
+    """Thread count for chunk fan-out: env override, else min(8, cpus)."""
+    env = os.environ.get("STRIX_QUANT_THREADS")
+    if env:
+        return max(1, int(env))
+    return min(4, os.cpu_count() or 1)
+
+
+def quantize_shq4(W: np.ndarray, group_size: int, symmetric: bool = False,
+                  importance: np.ndarray | None = None):
     """Quantize logical W[N,K] (float32) to SHQ4-T16 planes.
+
+    importance: optional per-input-channel imatrix vector of length K
+    (E[x_j^2] over calibration). When given, scales/zeros come from the
+    importance-weighted least-squares search instead of the min/max range.
+    Layout is identical; only s/z/q values differ.
+
+    Fully batched over all (tile, group) blocks at once: scale/zero/code
+    selection and packing are vectorized numpy ops on one [B,16,G] block
+    array, processed in chunks to bound peak memory (see CHUNK). Deterministic.
 
     Returns dict with byte planes: 'weight', 'scale', 'zero' and metadata.
     """
@@ -72,71 +205,43 @@ def quantize_shq4(W: np.ndarray, group_size: int, symmetric: bool = False):
     k_groups = Kp // group_size
     k16_per = group_size // 16
     k_group_count = k_groups
+    G = group_size
+    B = n_tiles * k_group_count
+    if importance is not None:
+        if importance.shape[0] != K:
+            raise ValueError(f"importance length {importance.shape[0]} != K {K}")
+        importance = np.ascontiguousarray(importance.astype(np.float32))
+        # [k_groups, G] -> [B, G]: block (nt,g) gets input-channel group g
+        hbig = np.broadcast_to(importance.reshape(k_groups, G),
+                               (n_tiles, k_groups, G)).reshape(B, G)
 
-    weight = bytearray(n_tiles * k_group_count * k16_per * 16 * 8)
-    scale = bytearray(n_tiles * k_group_count * 16 * 2)  # BF16
-    zero = bytearray(n_tiles * k_group_count * 16 // 2) if not symmetric else bytearray()
-
-    # Pad W to Np x Kp with q=z (U4Z) / 0 (S4)
+    # Pad W to Np x Kp with q=z (U4Z) / 0 (S4), then reblock to [B,16,G].
+    # Block order is the packing order: gidx = nt*k_group_count+g.
     Wp = np.zeros((Np, Kp), dtype=np.float32)
     Wp[:N, :K] = W
+    Wb = np.ascontiguousarray(Wp.reshape(n_tiles, 16, k_groups, G)
+                              .transpose(0, 2, 1, 3)).reshape(B, 16, G)
 
-    for nt in range(n_tiles):
-        for g in range(k_groups):
-            col = g * group_size
-            for lane in range(16):
-                row = nt * 16 + lane
-                w = Wp[row, col:col + group_size].astype(np.float32)
-                wmin = float(w.min())
-                wmax = float(w.max())
-                s32 = 0.0
-                z32 = 0.0
-                q = np.zeros(group_size, dtype=np.float32)
-                if wmax != wmin:
-                    if symmetric:
-                        s32 = max(abs(wmax), abs(wmin)) / 7.0
-                    else:
-                        s32 = (wmax - wmin) / 15.0
-                # Round scale to BF16 RNE-ties-to-even before code selection.
-                s_bf16 = float(bf16_uint16_to_f32(f32_to_bf16_uint16(np.array([s32])))[0])
-                if s_bf16 > 0:
-                    if symmetric:
-                        q = _clamp(_round_even(w / s_bf16), S4_MIN, S4_MAX)
-                        q = np.where(w == 0, 0, q)
-                    else:
-                        z32 = _clamp(_round_even(-wmin / s_bf16), 0, U4_MAX)
-                        q = _clamp(_round_even(w / s_bf16 + z32), 0, U4_MAX)
-                # else all-zero group: s=0, z=0, q=0
+    n_workers = _quant_workers()
+    # auto chunk so there are ~4x workers worth of chunks (parallel granularity);
+    # env override STRIX_QUANT_CHUNK forces a fixed block count.
+    env_chunk = os.environ.get("STRIX_QUANT_CHUNK")
+    CHUNK = int(env_chunk) if env_chunk else max(1024, B // max(1, n_workers * 4))
+    bounds = [(b0, min(B, b0 + CHUNK)) for b0 in range(0, B, CHUNK)]
 
-                # Pack scales + zeros (per lane)
-                s_u16 = int(f32_to_bf16_uint16(np.array([s32]))[0])
-                gidx = nt * k_group_count + g
-                scale[gidx * 32 + lane * 2: gidx * 32 + lane * 2 + 2] = s_u16.to_bytes(2, "little")
-                if not symmetric:
-                    z_byte = int(z32)
-                    pair = lane // 2
-                    nib = (lane % 2 == 0)  # even lane in low nibble
-                    zi = gidx * 8 + pair
-                    if nib:
-                        zero[zi] |= (z_byte & 0xF)
-                    else:
-                        zero[zi] |= (z_byte & 0xF) << 4
-                # Pack weight microtile
-                for k16 in range(k16_per):
-                    base = col + k16 * 16
-                    sub = w[base - col: base - col + 16].astype(np.float32)
-                    qsub = q[base - col: base - col + 16]
-                    micro = (gidx * k16_per + k16) * 16 * 8 + lane * 8
-                    for kp in range(8):
-                        v0 = int(qsub[2 * kp])
-                        v1 = int(qsub[2 * kp + 1])
-                        if symmetric:
-                            v0 = (v0 & 0xF) if v0 >= 0 else ((v0 + 16) & 0xF)
-                            v1 = (v1 & 0xF) if v1 >= 0 else ((v1 + 16) & 0xF)
-                            b = (v0 & 0xF) | ((v1 & 0xF) << 4)
-                        else:
-                            b = (v0 & 0xF) | ((v1 & 0xF) << 4)
-                        weight[micro + kp] = b
+    def run(bound):
+        b0, b1 = bound
+        hc = hbig[b0:b1, None, :] if importance is not None else None
+        return _quantize_chunk(Wb[b0:b1], hc, symmetric, G, k16_per)
+
+    if len(bounds) < 2 or n_workers < 2:
+        parts = [run(b) for b in bounds]
+    else:
+        with ThreadPoolExecutor(max_workers=n_workers) as ex:
+            parts = list(ex.map(run, bounds))
+    weight = b"".join(p[0] for p in parts)
+    scale = b"".join(p[1] for p in parts)
+    zero = b"".join(p[2] for p in parts)
 
     return {
         "weight": bytes(weight),
@@ -194,7 +299,12 @@ def quantize_shq8(W: np.ndarray, group_size: int):
 
 
 def dequant_shq4(planes: dict) -> np.ndarray:
-    """Decode SHQ4-T16 planes back to float32 W[Np,Kp]. CPU reference oracle."""
+    """Decode SHQ4-T16 planes back to float32 W[Np,Kp]. CPU reference oracle.
+
+    Fully batched: unpack all block codes, scales and zeros into [B,16,G]
+    arrays, reconstruct s*(q-z), then reblock to [Np,Kp]. Byte layout and
+    semantics identical to the reference loop.
+    """
     weight = np.frombuffer(planes["weight"], dtype=np.uint8)
     scale = np.frombuffer(planes["scale"], dtype=np.uint16)
     Np, Kp = planes["Np"], planes["Kp"]
@@ -202,34 +312,25 @@ def dequant_shq4(planes: dict) -> np.ndarray:
     n_tiles = Np // 16
     k_groups = Kp // G
     k16_per = G // 16
-    k_group_count = k_groups
-    W = np.zeros((Np, Kp), dtype=np.float32)
-    zero_arr = np.frombuffer(planes["zero"], dtype=np.uint8) if planes["zero"] else None
-    for nt in range(n_tiles):
-        for g in range(k_groups):
-            gidx = nt * k_group_count + g
-            for lane in range(16):
-                s = float(bf16_uint16_to_f32(np.array([scale[gidx * 16 + lane]]))[0])
-                z = 0
-                if zero_arr is not None:
-                    zi = gidx * 8 + lane // 2
-                    z = int(zero_arr[zi] & 0xF) if lane % 2 == 0 else int((zero_arr[zi] >> 4) & 0xF)
-                for k16 in range(k16_per):
-                    micro = (gidx * k16_per + k16) * 16 * 8 + lane * 8
-                    for kp in range(8):
-                        b = int(weight[micro + kp])
-                        v0 = b & 0xF
-                        v1 = (b >> 4) & 0xF
-                        if planes["symmetric"]:
-                            v0 = v0 if v0 < 8 else v0 - 16
-                            v1 = v1 if v1 < 8 else v1 - 16
-                        else:
-                            v0 = v0 - z
-                            v1 = v1 - z
-                        row = nt * 16 + lane
-                        col = g * G + k16 * 16 + 2 * kp
-                        W[row, col] = s * v0
-                        W[row, col + 1] = s * v1
+    B = n_tiles * k_groups
+
+    # codes: weight bytes [B][k16][lane][kp8] -> lo/hi nibbles interleaved
+    wb = weight.reshape(B, k16_per, 16, 8)
+    lo = (wb & 0x0F)
+    hi = ((wb >> 4) & 0x0F)
+    codes = np.stack([lo, hi], axis=-1).reshape(B, k16_per, 16, 16)  # [B,k16,lane,16]
+    codes = codes.transpose(0, 2, 1, 3).reshape(B, 16, G).astype(np.float32)
+
+    s = bf16_uint16_to_f32(scale).reshape(B, 16)
+    if planes["symmetric"]:
+        codes = np.where(codes < 8, codes, codes - 16)  # signed S4
+        W = s[..., None] * codes
+    else:
+        zero = np.frombuffer(planes["zero"], dtype=np.uint8).reshape(B, 8)
+        zi = np.stack([zero & 0x0F, (zero >> 4) & 0x0F], axis=-1).reshape(B, 16).astype(np.float32)
+        W = s[..., None] * (codes - zi[..., None])
+    # reblock [B(nt,g), lane, k] -> [nt, lane, g, k] -> [Np,Kp]
+    W = W.reshape(n_tiles, k_groups, 16, G).transpose(0, 2, 1, 3).reshape(Np, Kp)
     return W
 
 
