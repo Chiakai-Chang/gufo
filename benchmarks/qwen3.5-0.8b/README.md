@@ -104,28 +104,33 @@ unsloth 1.85% ours 9.97%`, `ssm_out Q5_K 5.50bpw unsloth 4.05% ours 10.32%`).
   our 10%) because Q4_K_M uses **imatrix / mixed-precision recipes** (Q6_K
   for embed and ffn_down, Q5_K/Q8_0 for linear-attn projections) plus
   importance-weighted quantization. Our SHQ4 slice is uniform U4Z G64 on
-  everything. Imatrix/GPTQ-style scale search is implemented (see next steps);
-  on the current tiny calibration set it trims activation-weighted
-  reconstruction ~3% but does not move logit KL — the remaining gap is
-  dominated by the **mixed-precision recipe** (upcast embed + ffn_down +
-  linear-attn projections), not by scale selection.
+  everything with imatrix-weighted scale search. With a proper disjoint
+  calibration set, imatrix closes most of the logit-level gap (see quality
+  table below); the remaining per-weight rel_mae gap is still dominated by
+  the **mixed-precision recipe** (upcast embed + ffn_down + linear-attn
+  projections), not by scale selection.
 - We retain more where we stay bf16 (embed, norms) — 0% loss.
 - linear_attn compares unevenly because the recipes pick different tensors to
   quantize (their ssm small projections vs our qkv/z/out). Per-tensor rows
   are the apples-to-apples view; the aggregate bpw column shows why.
 
-## Quality (candidate vs teacher, matched-token suite, 74 positions)
+## Quality (candidate vs teacher, matched-token suite, 78 positions)
 
-| metric | value |
-| --- | --- |
-| KL mean | 0.172 |
-| KL median | 0.044 |
-| KL p95 | 0.794 |
-| KL p99 | 1.734 |
-| KL max | 2.419 |
-| top-1 agreement | 0.821 |
-| teacher perplexity | 3.481 |
-| candidate perplexity | 4.259 |
+| metric | range | imatrix |
+| --- | --- | --- |
+| KL mean | 0.172 | 0.117 |
+| KL median | 0.044 | 0.040 |
+| KL p95 | 0.794 | 0.424 |
+| KL p99 | 1.734 | 1.212 |
+| KL max | 2.419 | 1.759 |
+| top-1 agreement | 0.821 | 0.872 |
+| teacher perplexity | 3.481 | 3.481 |
+| candidate perplexity | 4.259 | 3.942 |
+
+`range` = min/max scale search; `imatrix` = importance-weighted scale search
+calibrated on `tools/suites/calib.json` (666 tokens, disjoint from this eval
+suite). Calibrating on the eval suite itself changed nothing (KL 0.172) —
+the disjoint calibration set is what unlocks imatrix.
 
 ## Speed (CPU reference runtime)
 
@@ -143,15 +148,13 @@ milestone.
 
 - Port SHQ4 decode GEMV to HIP (gfx1151) and XDNA2 (AIE2P); consume the
   packed planes directly (no dequant-to-bf16).
-- Imatrix scale search is DONE (`tools/strix-calibrate.py` + `--imatrix`):
-  importance-weighted LS per (tile,group), byte-identical planes, never worse
-  than range per block. With the 78-token teacher suite as calibration it
-  trims activation-weighted reconstruction 0.886% -> 0.857% but leaves logit
-  KL unchanged (0.1722) — calibration is the same set as evaluation, and
-  LayerNorm-flattened channels make E[x^2] near-uniform. Next calibration
-  slice needs a disjoint, longer (>=1k token) prompt set to show signal.
-- The measured gap vs Q4_K_M is dominated by mixed precision, not scale
-  search: add recipe support to promote embed + ffn_down (+ linear-attn
+- Imatrix scale search is DONE and validated: `tools/strix-calibrate.py` +
+  `--imatrix` with the disjoint 666-token `tools/suites/calib.json` drops
+  logit KL mean 0.172 -> 0.117, top-1 0.821 -> 0.872, ppl 4.259 -> 3.942
+  (measured on this eval suite; calibration set disjoint). Self-calibrating
+  on the eval suite is a documented anti-pattern — it changes nothing.
+- The remaining per-weight gap vs Q4_K_M is dominated by mixed precision, not
+  scale search: add recipe support to promote embed + ffn_down (+ linear-attn
   projections) to SHQ8/Q6_K-class bpw, mirroring unsloth's Q6_K/Q5_K/Q8_0
   choices; then re-run the retention table.
 - G32 quality groups for sensitive attention tensors.

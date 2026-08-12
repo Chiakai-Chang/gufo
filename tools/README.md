@@ -20,8 +20,9 @@ tools/strix-capture.py --source artifacts/source \
   --suite tools/suites/teacher.json --out artifacts/teacher
 
 # 3b. capture per-input-channel imatrix (E[x^2]) for imatrix-weighted scale search
+#   (calibration suite MUST be disjoint from the eval suite; see tools/suites/calib.json)
 tools/strix-calibrate.py --source artifacts/source \
-  --suite tools/suites/teacher.json --out artifacts/calib
+  --suite tools/suites/calib.json --out artifacts/calib
 
 # 4. quantize LM linear projections to SHQ4-T16 U4Z G64
 #   (add --imatrix DIR to enable importance-weighted scale search)
@@ -31,7 +32,6 @@ tools/strix-quantize.py --source artifacts/source \
 tools/strix-quantize.py --source artifacts/source \
   --out artifacts/quant --plan artifacts/work/quantization-plan.json \
   --imatrix artifacts/calib
-
 # 5. benchmark: candidate-vs-teacher quality + prefill/decode speed
 tools/strix-bench.py --source artifacts/source --quant artifacts/quant \
   --suite tools/suites/teacher.json --teacher-artifact artifacts/teacher
