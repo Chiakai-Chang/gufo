@@ -74,3 +74,5 @@ Testing/
 
 # Model artifacts, logit dumps, teacher captures (never commit weights/logits)
 artifacts/
+__pycache__/
+*.pyc
