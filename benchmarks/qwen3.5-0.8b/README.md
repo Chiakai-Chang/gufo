@@ -15,6 +15,102 @@ Candidate: all LM linear projections (qkv/z/out/mlp/full-attn/mtp) quantized
 SHQ4-T16 U4Z G64; norms, embeddings, conv1d, vision kept bf16. 158 tensors
 quantized, 267 MB artifact.
 
+## How the models are pulled from Hugging Face
+
+Everything runs inside `nix develop` (flake adds `huggingface-hub`).
+
+```bash
+nix develop
+
+# 1. bf16 safetensors source (tokenizer + weights + config)
+mkdir -p artifacts/source
+hf download Qwen/Qwen3.5-0.8B \
+  --local-dir artifacts/source \
+  --revision 2fc06364715b967f1860aea9cf38778875588b17
+
+# 2. unsloth GGUF, closest 4-bit resolution (Q4_K_M, 533 MB)
+mkdir -p artifacts/gguf
+hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf \
+  --local-dir artifacts/gguf
+```
+
+`hf download` is the `huggingface-hub` CLI (same lib that
+`strix-inspect.py` uses). Pin the source revision — the benchmark is only
+comparable against the same revision, suite, tokenizer, and reference
+runtime. Other 4-bit resolutions available on the unsloth repo: `Q4_K_S`,
+`IQ4_XS`, `IQ4_NL`, `Q4_0`, `UD-Q4_K_XL` (dynamic). We compare against
+`Q4_K_M` because it is the standard closest-resolution 4-bit reference and
+ships an imatrix file (`imatrix_unsloth.gguf_file`).
+
+## Model components and MTP
+
+Component map (24 blocks; layers 0-2 linear, 3 full, repeating per
+`full_attention_interval: 4`):
+
+| component | tensors | params (M) | our candidate | unsloth Q4_K_M gguf |
+| --- | --- | --- | --- | --- |
+| embed | 1 | 254.3 | bf16 (kept) | Q6_K 6.56 bpw |
+| full_attn | 42 | 157.3 | SHQ4 4.5 bpw | Q4_K 4.5 bpw |
+| linear_attn (ssm) | 108 | 38.8 | SHQ4 (in_proj_qkv/z/out), bf16 rest | Q8_0/Q5_K/F32 |
+| mlp | 72 | 264.2 | SHQ4 4.5 bpw | Q4_K gate/up, Q6_K down |
+| norm | 79 | 0.1 | bf16 | F32 |
+| MTP head | 1 block + fc | ~50 | SHQ4 (quantized) | **absent** |
+
+**MTP answer: the model has it, the GGUF does not.** The HF model config sets
+`mtp_num_hidden_layers: 1` (model card: "MTP: trained with multi-steps"), and
+the safetensors carry `mtp.layers.0.*` + `mtp.fc`. Our candidate quantizes the
+MTP head to SHQ4 (`artifacts/quant/mtp/`). The unsloth GGUF has zero MTP
+tensors (`strix-gguf.py` reports `MTP tensors present: False`) — the llama.cpp
+`qwen35` conversion drops the speculative head. MTP is a multi-token draft
+head, not part of the single-token NLL/KL benchmark above, so the two files
+are comparable on the shared LM body; only our build carries the MTP head
+(4-bit) for speculative decoding later.
+
+## Comparison vs unsloth Q4_K_M (closest 4-bit resolution)
+
+Both quants are scored against the same bf16 source, tensor by tensor:
+
+```bash
+nix develop
+tools/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf \
+  --recon --bf16-source artifacts/source \
+  --plan artifacts/work/quantization-plan.json
+```
+
+`strix-gguf.py` parses the GGUF header/tensor-info, dequants the Q4 family
+(Q4_0/Q4_K/Q5_K/Q6_K/Q8_0), and reports per-tensor `rel_mae` (mean abs error
+/ mean |w|) — the same scale `strix-quantize.py` records for our SHQ4, merged
+from `quantization-plan.json`. Weight reconstruction is a per-component proxy;
+the logit-level matched-token KL above stays the authoritative whole-model
+metric (per-layer logit attribution is still a planned slice).
+
+### Per-component retention (mean rel_mae vs bf16)
+
+| component | n | gguf bpw | unsloth Q4_K_M | our SHQ4 |
+| --- | --- | --- | --- | --- |
+| embed | 1 | 6.56 | 1.9% | kept bf16 |
+| full_attn | 24 | 4.84 | 7.1% | 10.7% |
+| linear_attn | 90 | 8.5-17.3 | 1.1% | 10.6% |
+| mlp | 72 | 4.84 | 6.7% | 10.1% |
+| norm | 36 | 32 | ~0% | kept bf16 |
+
+Per-layer/per-tensor rows print below the aggregate (e.g. layer 0:
+`ffn_gate Q4_K 4.50bpw unsloth 7.53% ours 9.92%`, `ffn_down Q6_K 6.56bpw
+unsloth 1.85% ours 9.97%`, `ssm_out Q5_K 5.50bpw unsloth 4.05% ours 10.32%`).
+
+### Reading
+
+- Unsloth retains more per weight on the Q4_K attention/mlp tensors (7% vs
+  our 10%) because Q4_K_M uses **imatrix / mixed-precision recipes** (Q6_K
+  for embed and ffn_down, Q5_K/Q8_0 for linear-attn projections) plus
+  importance-weighted quantization. Our SHQ4 slice is uniform U4Z G64 on
+  everything. Imatrix/GPTQ-style scale search is the obvious next lever
+  (already planned; see next steps).
+- We retain more where we stay bf16 (embed, norms) — 0% loss.
+- linear_attn compares unevenly because the recipes pick different tensors to
+  quantize (their ssm small projections vs our qkv/z/out). Per-tensor rows
+  are the apples-to-apples view; the aggregate bpw column shows why.
+
 ## Quality (candidate vs teacher, matched-token suite, 74 positions)
 
 | metric | value |
@@ -44,6 +140,9 @@ milestone.
 
 - Port SHQ4 decode GEMV to HIP (gfx1151) and XDNA2 (AIE2P); consume the
   packed planes directly (no dequant-to-bf16).
-- Imatrix / GPTQ-style scale search to pull KL tail down.
+- Imatrix / GPTQ-style scale search to pull KL tail down (Q4_K_M comparison
+  shows the headroom: ~7% vs ~10% weight retention on attn/mlp).
 - G32 quality groups for sensitive attention tensors.
 - Per-layer quality breakdown (see `docs/BENCHMARKS.md`).
+- GGUF cross-quant matrix: run `strix-gguf.py --recon` on `Q4_K_S`, `Q4_0`,
+  `IQ4_XS`, `Q6_K` and tabulate retention per layer across resolutions.

@@ -26,6 +26,12 @@ tools/strix-quantize.py --source artifacts/source \
 # 5. benchmark: candidate-vs-teacher quality + prefill/decode speed
 tools/strix-bench.py --source artifacts/source --quant artifacts/quant \
   --suite tools/suites/teacher.json --teacher-artifact artifacts/teacher
+
+# 6. inspect an external GGUF (e.g. unsloth) and score it vs bf16, cross-quant
+tools/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --card
+# per-tensor retention vs bf16, side-by-side with our SHQ4 (from the plan)
+tools/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --recon \
+  --bf16-source artifacts/source --plan artifacts/work/quantization-plan.json
 ```
 
 ## Modules
@@ -39,6 +45,9 @@ tools/strix-bench.py --source artifacts/source --quant artifacts/quant \
 - `strix-capture.py` — teacher logit artifact (chunked zstd)
 - `strix-quantize.py` — deterministic conversion
 - `strix-bench.py` — correctness-linked benchmark
+- `strix-gguf.py` — GGUF header/tensor-info inspection + Q4-family dequant
+  (`--card` model card, `--recon` per-tensor retention vs bf16 with our SHQ4
+  stats merged from the quantization plan; see `benchmarks/qwen3.5-0.8b/`)
 
 ## Conformance tests
 
