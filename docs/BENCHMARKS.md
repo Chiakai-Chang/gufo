@@ -1,44 +1,121 @@
-# Benchmark: Qwen3.5-0.8B, SHQ4-T16 U4Z G64 candidate vs bf16 teacher
+# Benchmark Methodology
 
-Status: first vertical slice, 2026-08-11. CPU-only reference path (torch
-fallback for linear attention; no flash-linear-attention/causal-conv1d fast
-path). Measures OUR SHQ4 quantization quality; speed here is the reference
-runtime, not Strix kernels yet.
+How Strix benchmarks are computed, and which utilities produce them. This
+file documents the method; per-model results live in `benchmarks/<model>/`
+(readmes), never as raw committed artifacts (`artifacts/` is gitignored).
 
-Source: `Qwen/Qwen3.5-0.8B` @ `2fc06364715b967f1860aea9cf38778875588b17`, bf16.
+## Pipeline (tools/)
 
-Candidate: all LM linear projections (qkv/z/out/mlp/full-attn/mtp) quantized
-SHQ4-T16 U4Z G64; norms, embeddings, conv1d, vision kept bf16. 158 tensors
-quantized, 267 MB artifact.
+Benchmarks are the last step of the offline conversion toolchain. Each step
+has one utility; a benchmark consumes the artifacts the earlier steps produce:
 
-## Quality (candidate vs teacher, matched-token suite, 74 positions)
+```bash
+# 1. download safetensors + tokenizer -> artifacts/source
+# 2. validate safetensors, write source manifest
+tools/strix-inspect.py --source artifacts/source --revision <sha> \
+  --out artifacts/work/source-manifest.json
 
-| metric | value |
-| --- | --- |
-| KL mean | 0.172 |
-| KL median | 0.044 |
-| KL p95 | 0.794 |
-| KL p99 | 1.734 |
-| KL max | 2.419 |
-| top-1 agreement | 0.821 |
-| teacher perplexity | 3.481 |
-| candidate perplexity | 4.259 |
+# 3. capture full-precision teacher logits + perplexity (matched-token)
+tools/strix-capture.py --source artifacts/source \
+  --suite tools/suites/teacher.json --out artifacts/teacher
 
-## Speed (CPU reference runtime)
+# 4. quantize LM linear projections to SHQ4-T16 U4Z G64
+tools/strix-quantize.py --source artifacts/source \
+  --out artifacts/quant --plan artifacts/work/quantization-plan.json
 
-| metric | teacher (bf16) | candidate (SHQ4 dequant bf16) |
-| --- | --- | --- |
-| prefill tokens/s | 99.8 | 49.1 |
-| decode tokens/s | 4.09 | 4.55 |
-| decode ms/token | 245 | 220 |
+# 5. benchmark: candidate-vs-teacher quality + prefill/decode speed
+tools/strix-bench.py --source artifacts/source --quant artifacts/quant \
+  --suite tools/suites/teacher.json --teacher-artifact artifacts/teacher
+```
 
-Note: candidate dequant-reloads to bf16 and runs through the same torch path,
-so speed is the reference runtime, not our kernels. Kernel speed is a later
-milestone.
+Key utilities and their roles:
 
-## Next steps
+- `strix-capture.py` — teacher-forced full-precision logit dump. Logits are
+  chunked by position, zstd-compressed, checksummed into an artifact dir
+  (`manifest.json`, `tokens.u32`, `logits-*.f32.zst`, `metrics.json`).
+  This is the teacher oracle; it is captured once and reused.
+- `strix-quantize.py` — deterministic SHQ4 conversion. Records per-tensor
+  reconstruction stats (max abs err, rmse, mean abs err) in the plan.
+- `strix-bench.py` — the benchmark itself. Runs the candidate forward pass,
+  compares candidate logits against the captured teacher artifact, and times
+  prefill/decode on both.
+- `tools/suites/<model>.json` — prompt suite (schema `strix.suite.v1`):
+  a small fixed set of prompts, tokenized once with the pinned tokenizer.
 
-- Port SHQ4 decode GEMV to HIP (gfx1151) and XDNA2 (AIE2P); consume the
-  packed planes directly (no dequant-to-bf16).
-- Imatrix / GPTQ-style scale search to pull KL tail down.
-- G32 quality groups for sensitive attention tensors.
+## Quality method (matched-token, per position)
+
+Per `docs/TESTING.md`: quantization comparisons are teacher forced, not
+free-running. One tokenization; the same input prefix drives both teacher and
+candidate; compare their full next-token distributions; append the
+predetermined evaluation token, never each model's sampled token. This
+isolates intrinsic quantization error from trajectory divergence.
+
+For each prompt, at every position:
+
+```text
+p_t = softmax(z_t)   # teacher logits (captured artifact, f32)
+p_c = softmax(z_c)   # candidate logits (forward run)
+KL  = sum_v p_t[v] * (log p_t[v] - log p_c[v])
+NLL = -log(p_c[target_token])
+```
+
+Aggregates over all scored positions (`quality.py`):
+
+- KL: mean, median, p95, p99, p99.9, max
+- teacher-token NLL and corpus perplexity
+- top-1 agreement; top-5 / top-k set overlap
+- candidate probability on the teacher top-1 token
+- rank displacement of the teacher top-1 token
+- max and RMS diff of normalized log probabilities
+- count of non-finite values
+
+Current slice reports mean/median/p95/p99/max KL, top-1 agreement, and
+teacher + candidate perplexity.
+
+### Position count
+
+`positions` in a report equals the total number of scored next-token
+positions across all suite prompts (74 for the Qwen3.5-0.8B teacher suite).
+KL aggregates are computed over positions, not prompts.
+
+### Per-layer breakdown (planned)
+
+The first slice measures whole-model, whole-prompt quality: one KL per scored
+position, aggregated model-wide. It does not isolate which layer or tensor
+contributes the KL tail. Per-layer and per-tensor attribution (layer-output
+error, per-layer KL, first-divergent-layer search) is a planned refinement;
+`strix-quantize.py` already records per-tensor reconstruction stats, and
+`docs/TESTING.md` T3 documents layer-boundary capture. A per-layer quality
+gate will be added before the imatrix/GPTQ scale-search milestone.
+
+## Speed method (CPU reference runtime)
+
+Speed is measured only after logits are comparable
+(`docs/TESTING.md`: correctness before performance counts).
+
+- Prefill: full-prompt forward (all suite prompts), summed tokens.
+- Decode: single-token forward, repeated.
+- Both teacher and candidate run through the same pinned torch reference path,
+  timed with `time.perf_counter`, median of `--repeats` runs (default 2).
+
+Important: candidate speed here is the reference runtime after
+dequant-reload-to-bf16 — it measures SHQ4 dequant cost, not Strix kernels.
+Real kernel speed (HIP gfx1151 / XDNA2 AIE2P consuming packed planes
+directly) is a separate, later milestone. Kernel benchmarks will record the
+backend and kernel name per timing row.
+
+## Reporting rules
+
+Every report records, at minimum:
+
+- Source repo + immutable revision, source storage dtype (bf16), accumulation
+  contract.
+- Candidate: which tensors quantized, the SHQ4 scheme (T16, U4Z, group size),
+  tensor count, artifact size.
+- Suite hash and scored position count.
+- Oracle runtime and version.
+- `--json` output is machine-readable; human form prints speed then quality.
+
+A benchmark result is only comparable against another result with the same
+source revision, suite, tokenizer, and reference runtime. Do not average
+numbers across revisions or suites.
