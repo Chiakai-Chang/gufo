@@ -689,6 +689,27 @@ Support both native calibration artifacts and compatible llama.cpp imatrix
 imports. Imported data is accepted only when tensor dimensions and the source
 model identity match.
 
+#### Calibration compute (strix-calibrate)
+
+The imatrix reduction `h[j] = E[x_j^2]` is always accumulated in float64. The
+corpus is forwarded in token-budgeted batches (`--max-tokens`, default 4096);
+pad positions are excluded with the attention mask, never summed, so batching
+does not change per-real-token mathematics. Runs are bit-reproducible for a
+fixed `--device` and batch budget. `--device cuda` offloads the forward to the
+gfx1151 GPU (ROCm torch; unified default shell) for multi-million-token
+corpora; the GPU path forces fp32 accumulation (`allow_tf32=False`) and
+deterministic algorithms. `--max-tokens 1` reproduces the legacy one-prompt
+per-forward result; `--reference DIR` cross-checks a new artifact against a
+prior one.
+
+Batch size and device change the forward's low bits (GEMM accumulation order,
+as with any parallel matmul), so activations agree only to fp32 precision and
+the difference propagates through the 24+ layers; on low-energy channels this
+is larger in relative terms. This is not pad leakage (the first projected layer
+matches bit-for-bit across batch sizes) and it does not affect the objective:
+quantized reconstruction rmse shifts by <0.03% between sequential, batched,
+and GPU calibration on the 0.8B reference.
+
 Raw private calibration text should not be embedded in a published model.
 Publish dataset identifiers, revisions, licenses, category counts, and hashes
 when redistribution of the raw samples is not appropriate.

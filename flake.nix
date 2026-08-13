@@ -19,17 +19,22 @@
         pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit version; }
       );
 
-      # Offline model-conversion toolchain. Python only; never a transitive
+      # Offline model-conversion toolchain. Python-only; never a transitive
       # dependency of the server (see docs/QUANTIZATION.md "Offline Toolchain").
-      pythonTools = system: (pkgs.${system}.python3.withPackages (ps: [
-        ps.torch
-        ps.transformers
-        ps.safetensors
-        ps.huggingface-hub
-        ps.numpy
-        ps.scipy
-        ps.zstandard
-      ]));
+      # Unified python313 + torchWithRocm: every Strix Halo box ships ROCm, so
+      # the single toolchain serves CPU flows and the --device cuda
+      # calibration forward alike. gfx1151 verified on this host.
+      pythonTools = system:
+        let pt = pkgs.${system}.python313; in
+        pt.withPackages (ps: [
+          ps.torchWithRocm
+          ps.transformers
+          ps.safetensors
+          ps.huggingface-hub
+          ps.numpy
+          ps.scipy
+          ps.zstandard
+        ]);
     in
     {
       packages = forAllSystems (
@@ -50,16 +55,12 @@
 
       devShells = forAllSystems (
         system:
-        let
-          py = pythonTools system;
-        in
         {
+          # Unified toolchain (CPU + ROCm torch): one default shell serves all
+          # offline CPU flows and the --device cuda calibration forward.
           default = pkgs.${system}.mkShell {
             inputsFrom = [ self.packages.${system}.default ];
-            packages = [ py ];
-          };
-          rocm = pkgs.${system}.mkShell {
-            inputsFrom = [ self.packages.${system}.rocm-gfx1151 ];
+            packages = [ (pythonTools system) ];
           };
         }
       );

@@ -21,6 +21,15 @@ tools/strix-capture.py --source artifacts/source \
 
 # 3b. capture per-input-channel imatrix (E[x^2]) for imatrix-weighted scale search
 #   (calibration suite MUST be disjoint from the eval suite; see tools/suites/calib.json)
+#   CPU default; batched -> fast, exact fp64 reduction, bit-reproducible:
+#   tools/strix-calibrate.py --source artifacts/source \
+#     --suite tools/suites/calib.json --out artifacts/calib
+#   GPU (gfx1151 ROCm torch, default shell) for big corpora:
+#   tools/strix-calibrate.py --source artifacts/source \
+#     --suite tools/suites/calib.json --out artifacts/calib --device cuda
+#   --max-tokens N bounds real tokens per batched forward; --max-tokens 1
+#   reproduces the legacy one-prompt-at-a-time result. --reference DIR
+#   cross-checks against a prior artifact.
 tools/strix-calibrate.py --source artifacts/source \
   --suite tools/suites/calib.json --out artifacts/calib
 
