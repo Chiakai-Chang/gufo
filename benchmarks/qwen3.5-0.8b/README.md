@@ -144,10 +144,24 @@ Note: candidate dequant-reloads to bf16 and runs through the same torch path,
 so speed is the reference runtime, not our kernels. Kernel speed is a later
 milestone.
 
+## Mixed-precision revision (see MIXED_PRECISION.md)
+
+The uniform-SHQ4 slice is superseded by a per-tensor tier recipe. Experiments
+across 8 presets show:
+
+- ffn_down -> SHQ8 is the quality lever (KL 0.1154 -> 0.0862).
+- embed -> SHQ8 is a free 246 MB size cut (quality-neutral); the bf16-embed
+  policy over-spent the largest tensor.
+- G32 attention buys no quality; dropped.
+- linear_attn -> SHQ8 is the biggest further lever (KL 0.0866 -> 0.0383).
+- Chosen deployment: `embed_ffn` (embed+ffn_down SHQ8, rest SHQ4 G64; 789 MB,
+  KL 0.0866); quality variant `unsloth_mirror` (884 MB, KL 0.0383).
+
 ## Next steps
 
-- Port SHQ4 decode GEMV to HIP (gfx1151) and XDNA2 (AIE2P); consume the
-  packed planes directly (no dequant-to-bf16).
+- Port SHQ4/SHQ8 decode GEMV to HIP (gfx1151) and XDNA2 (AIE2P); consume the
+  packed planes directly (no dequant-to-bf16). SHQ8 shares the SHQ4 T16 tile
+  layout, so it needs no separate kernel family.
 - Imatrix scale search is DONE and validated: `tools/strix-calibrate.py` +
   `--imatrix` with the disjoint 666-token `tools/suites/calib.json` drops
   logit KL mean 0.172 -> 0.117, top-1 0.821 -> 0.872, ppl 4.259 -> 3.942

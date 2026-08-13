@@ -254,8 +254,27 @@ def quantize_shq4(W: np.ndarray, group_size: int, symmetric: bool = False,
     }
 
 
+def _quantize_shq8_batched(Wb: np.ndarray):
+    """Batched SHQ8 scale/code selection over [B,16,G] blocks.
+
+    Per lane: max-abs scale, codes = clamp(round(w/s), -127,127). Returns
+    (s_bf [B,16] float, q [B,16,G] float codes). Constant rows -> zero scale.
+    """
+    B = Wb.shape[0]
+    amax = np.maximum(np.abs(Wb).min(axis=2), np.abs(Wb).max(axis=2))  # use max abs
+    amax = np.max(np.abs(Wb), axis=2)
+    const = amax <= 0.0
+    s_safe = np.where(const, 1.0, amax / S8_MAX)
+    s_bf = _bf16r(s_safe)
+    valid = (const == False) & (s_bf > 0.0)
+    q = _clamp(_round_even(Wb / np.where(valid, s_bf, 1.0)[..., None]), -S8_MAX, S8_MAX)
+    q = np.where(valid[..., None], q, 0.0)
+    s = np.where(const, 0.0, s_bf)
+    return s, q
+
+
 def quantize_shq8(W: np.ndarray, group_size: int):
-    """Quantize W[N,K] to SHQ8-T16 (signed INT8, no zero point)."""
+    """Quantize W[N,K] to SHQ8-T16 (signed INT8, no zero point). Batched."""
     W = W.astype(np.float32, copy=False)
     N, K = W.shape
     Np = (N + 15) // 16 * 16
@@ -263,33 +282,23 @@ def quantize_shq8(W: np.ndarray, group_size: int):
     n_tiles = Np // 16
     k_groups = Kp // group_size
     k16_per = group_size // 16
+    B = n_tiles * k_groups
+    G = group_size
 
-    weight = bytearray(n_tiles * k_groups * k16_per * 16 * 16)  # 256 bytes/microtile
-    scale = bytearray(n_tiles * k_groups * 16 * 2)
     Wp = np.zeros((Np, Kp), dtype=np.float32)
     Wp[:N, :K] = W
-    for nt in range(n_tiles):
-        for g in range(k_groups):
-            col = g * group_size
-            for lane in range(16):
-                w = Wp[nt * 16 + lane, col:col + group_size].astype(np.float32)
-                amax = float(np.max(np.abs(w)))
-                s32 = amax / S8_MAX if amax > 0 else 0.0
-                s_bf16 = float(bf16_uint16_to_f32(f32_to_bf16_uint16(np.array([s32])))[0])
-                q = np.zeros(group_size, dtype=np.float32)
-                if s_bf16 > 0:
-                    q = _clamp(_round_even(w / s_bf16), -S8_MAX, S8_MAX)
-                s_u16 = int(f32_to_bf16_uint16(np.array([s32]))[0])
-                gidx = nt * k_groups + g
-                scale[gidx * 32 + lane * 2: gidx * 32 + lane * 2 + 2] = s_u16.to_bytes(2, "little")
-                for k16 in range(k16_per):
-                    qsub = q[k16 * 16: k16 * 16 + 16]
-                    micro = (gidx * k16_per + k16) * 16 * 16 + lane * 16
-                    for kp in range(16):
-                        weight[micro + kp] = int(qsub[kp]) & 0xFF
+    Wb = np.ascontiguousarray(Wp.reshape(n_tiles, 16, k_groups, G)
+                              .transpose(0, 2, 1, 3)).reshape(B, 16, G)
+
+    s, q = _quantize_shq8_batched(Wb)  # [B,16], [B,16,G]
+    sbytes = f32_to_bf16_uint16(s).astype(np.uint16).tobytes()
+    # pack: [B,16,G] -> [B, k16_per, 16, 16] microtile order, byte per value
+    qn = q.astype(np.int8).astype(np.uint8)
+    qr = qn.reshape(B, 16, k16_per, 16).transpose(0, 2, 1, 3)  # [B,k16,lane,kp16]
+    weight = qr.tobytes()
     return {
         "weight": bytes(weight),
-        "scale": bytes(scale),
+        "scale": bytes(sbytes),
         "zero": b"",
         "N": N, "K": K, "Np": Np, "Kp": Kp,
         "group_size": group_size,

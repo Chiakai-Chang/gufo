@@ -967,10 +967,27 @@ Do not force every tensor into Q4. An `SHQ-T16` artifact may include:
 | Format | Intended use |
 | --- | --- |
 | `SHQ4-T16-G64-U4Z` | Bulk linear tensors |
-| `SHQ4-T16-G32-U4Z` | Sensitive attention or output tensors |
+| `SHQ4-T16-G32-U4Z` | Sensitive attention or output tensors (see note) |
 | `SHQ4-T16-G64-S4` | Fast symmetric tensors |
 | `SHQ8-T16-G64` | Difficult tensors and sensitive experts |
-| `BF16` | Norms, routers, embeddings, selected heads, reference paths |
+| `BF16` | Norms, routers, selected heads, reference paths |
+
+Evidence (benchmarks/qwen3.5-0.8b/MIXED_PRECISION.md, Qwen3.5-0.8B):
+
+- ffn_down -> SHQ8 is the top quality lever (matched-token KL 0.1154 -> 0.0862).
+- embed -> SHQ8 is a free size cut: quality-neutral, 246 MB smaller. The
+  BF16-embed policy over-spends the largest tensor; embeddings do not need
+  full precision when the LM head is tied to them.
+- SHQ4-G32 attention measured no quality gain on the 78-position suite; treat
+  G32 as optional, not default (it adds a second group-size kernel path).
+- linear_attn projections -> SHQ8 is the biggest further lever (KL 0.0866 ->
+  0.0383), mirroring unsloth Q8_0/Q5_K linear-attn choices.
+
+SHQ8 uses the same T16 tile layout and packing order as SHQ4 (byte-exact), so
+it is one kernel family, not a new one; only the per-weight read width differs.
+Keep the SHQ8 tier small on the decode GEMV path (decode is bandwidth-bound;
+SHQ8 costs 2x bytes/weight). Precision selection is per-tensor, never
+per-block, so hot kernels do not branch per block.
 
 Precision selection should be at tensor or contiguous channel-range
 granularity. Per-block format branching is avoided in hot kernels.

@@ -33,14 +33,17 @@ tools/strix-capture.py --source artifacts/source \
 tools/strix-calibrate.py --source artifacts/source \
   --suite tools/suites/calib.json --out artifacts/calib
 
-# 4. quantize LM linear projections to SHQ4-T16 U4Z G64
-#   (add --imatrix DIR to enable importance-weighted scale search)
+# 4. quantize to a mixed-precision recipe (default embed_ffn: embed+ffn_down
+#   SHQ8, rest SHQ4 G64; see benchmarks/qwen3.5-0.8b/MIXED_PRECISION.md)
+#   --imatrix DIR enables importance-weighted SHQ4 scale search
+#   --recipe NAME selects a preset (bulk_g64/embed_only/embed_ffn/ffn_only/
+#   embed_attn/mirror_no_lin/unsloth_mirror/full_shq8) or a JSON rule file
 tools/strix-quantize.py --source artifacts/source \
-  --out artifacts/quant --plan artifacts/work/quantization-plan.json
-#   imatrix/GPTQ-style scale search variant:
-tools/strix-quantize.py --source artifacts/source \
-  --out artifacts/quant --plan artifacts/work/quantization-plan.json \
-  --imatrix artifacts/calib
+  --out artifacts/quant --plan artifacts/work/quantization-plan.json --imatrix artifacts/calib
+# 4b. sweep mixed-precision presets, benchmark each, print comparison table
+tools/strix-mp-experiment.py --source artifacts/source \
+  --suite tools/suites/teacher.json --teacher-artifact artifacts/teacher \
+  --imatrix artifacts/calib --json
 # 5. benchmark: candidate-vs-teacher quality + prefill/decode speed
 tools/strix-bench.py --source artifacts/source --quant artifacts/quant \
   --suite tools/suites/teacher.json --teacher-artifact artifacts/teacher
@@ -62,7 +65,9 @@ tools/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --recon \
 - `strix/quality.py` — KL, perplexity, top-k agreement
 - `strix-capture.py` — teacher logit artifact (chunked zstd)
 - `strix-calibrate.py` — per-input-channel E[x^2] imatrix artifact
-- `strix-quantize.py` — deterministic conversion (range or imatrix scale search)
+- `strix/recipe.py` — SHQ-T16 mixed-precision recipe presets (per-tensor tiers)
+- `strix-quantize.py` — deterministic conversion (recipe + range/imatrix search)
+- `strix-mp-experiment.py` — quantize+bench sweep across presets (comparison table)
 - `strix-bench.py` — correctness-linked benchmark
 - `strix-gguf.py` — GGUF header/tensor-info inspection + Q4-family dequant
   (`--card` model card, `--recon` per-tensor retention vs bf16 with our SHQ4

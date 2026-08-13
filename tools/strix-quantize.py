@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""strix-quantize — deterministic SHQ4-T16 conversion of a source snapshot.
+"""strix-quantize — deterministic SHQ-T16 conversion of a source snapshot.
 
-Implements docs/QUANTIZATION.md end-to-end pipeline steps 1 and 5 (first
-slice): inspect already done by strix-inspect; here we quantize eligible
-linear tensors to SHQ4-T16 U4Z G64, keep norms/embeddings/conv BF16, and write
-per-tensor shards plus a reviewable quantization-plan.json.
+Implements docs/QUANTIZATION.md end-to-end pipeline steps 1 and 5. Each
+tensor's encoding comes from a mixed-precision recipe (tools/strix/recipe.py):
+SHQ4-G64-U4Z (bulk), SHQ4-G32-U4Z (attention), SHQ8-G64 (high-precision tier),
+or BF16 (kept). The recipe is per-tensor, so precision varies across layers
+and components the way the unsloth Q4_K_M recipe does.
 
 Deterministic: identical inputs -> identical bytes.
 """
@@ -17,6 +18,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/strix/..")
 import numpy as np
 from strix import safetensors, shq
+from strix import recipe as recipe_mod
 from strix.manifest import write_json
 
 
@@ -26,12 +28,18 @@ def read_bf16_tensor(path, info, dtype, shape, data_off, offset=0) -> np.ndarray
     return (np.frombuffer(data, dtype=np.uint16).astype(np.uint32) << np.uint32(16)).view(np.float32).copy()
 
 
-def quantize_one(name, shape, data, recipe, importance=None) -> dict:
-    """Returns dict with format, planes bytes, and reconstruction stats."""
+def quantize_one(name, shape, data, fmt, importance=None) -> dict:
+    """Quantize W to the recipe encoding. Returns planes dict + stats."""
     W = data.reshape(shape)
-    planes = shq.quantize_shq4(W, group_size=recipe["group_size"],
-                               importance=importance)
-    Wd = shq.dequant_shq4(planes)[: shape[0], : shape[1]]
+    if fmt.startswith("SHQ4"):
+        G = 32 if "G32" in fmt else 64
+        planes = shq.quantize_shq4(W, group_size=G, importance=importance)
+        Wd = shq.dequant_shq4(planes)[: shape[0], : shape[1]]
+    elif fmt.startswith("SHQ8"):
+        planes = shq.quantize_shq8(W, group_size=64)
+        Wd = shq.dequant_shq8(planes)[: shape[0], : shape[1]]
+    else:
+        raise ValueError(f"{name}: cannot quantize to {fmt}")
     err = np.abs(Wd - W)
     stats = {
         "format": planes["format"],
@@ -65,12 +73,25 @@ def main(argv=None):
     ap.add_argument("--source", required=True, help="HF snapshot directory")
     ap.add_argument("--out", default="artifacts/quant")
     ap.add_argument("--plan", default="artifacts/work/quantization-plan.json")
-    ap.add_argument("--group-size", type=int, default=64, choices=[32, 64])
+    ap.add_argument("--recipe", default="embed_ffn",
+                    help="preset recipe name (recipe.py PRESETS) or path to a "
+                         "JSON rule list [[substr, fmt], ...]  (default embed_ffn: "
+                         "embed+ffn_down SHQ8, rest SHQ4 G64, per MIXED_PRECISION.md)")
     ap.add_argument("--imatrix", default=None,
                     help="strix-calibrate artifact dir; enables imatrix/GPTQ-style "
                          "importance-weighted scale search")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
+
+    # resolve recipe rules
+    rp = Path(args.recipe)
+    if rp.exists():
+        rules = [(str(k), str(v)) for k, v in json.loads(rp.read_text("utf-8")).items()]
+    elif args.recipe in recipe_mod.PRESETS:
+        rules = recipe_mod.PRESETS[args.recipe]
+    else:
+        raise SystemExit(f"unknown recipe preset '{args.recipe}'")
+    rid = recipe_mod.recipe_id(rules)
 
     imatrix = load_imatrix(args.imatrix) if args.imatrix else None
     if imatrix:
@@ -83,89 +104,71 @@ def main(argv=None):
     infos = safetensors.validate_file(p)
     hdr, data_off = safetensors.read_header(p)
 
-    # Eligible linear projection weights (bulk). Everything else stays BF16.
-    ELIGIBLE = (
-        ".linear_attn.in_proj_qkv.weight",
-        ".linear_attn.in_proj_z.weight",
-        ".linear_attn.out_proj.weight",
-        ".mlp.gate_proj.weight",
-        ".mlp.up_proj.weight",
-        ".mlp.down_proj.weight",
-        ".self_attn.q_proj.weight",
-        ".self_attn.k_proj.weight",
-        ".self_attn.v_proj.weight",
-        ".self_attn.o_proj.weight",
-        "mtp.fc.weight",
-        "mtp.layers.0.mlp.gate_proj.weight",
-        "mtp.layers.0.mlp.up_proj.weight",
-        "mtp.layers.0.mlp.down_proj.weight",
-        "mtp.layers.0.self_attn.q_proj.weight",
-        "mtp.layers.0.self_attn.k_proj.weight",
-        "mtp.layers.0.self_attn.v_proj.weight",
-        "mtp.layers.0.self_attn.o_proj.weight",
-    )
-
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    recipe = {"family": "SHQ-T16", "group_size": args.group_size,
-              "variant": f"SHQ4_T16_V1_U4Z_G{args.group_size}",
+    recipe = {"family": "SHQ-T16", "recipe_id": rid, "rules": rules,
               "scale_search": "imatrix-weighted-ls" if imatrix else "range"}
     plan = {"schema": "strix.quant-plan.v1", "recipe": recipe,
             "source_manifest": str(Path(args.source) / ".."),
             "tensors": {}}
     plan_file = Path(args.plan)
 
+    n_q = {"SHQ4-G64-U4Z": 0, "SHQ4-G32-U4Z": 0, "SHQ8-G64": 0}
     for name in sorted(infos):
         dtype, shape, (b0, b1) = infos[name]
         if name == "__metadata__" or not name.endswith(".weight"):
             continue
-        is_eligible = any(name.endswith(sfx) for sfx in ELIGIBLE)
-        if is_eligible:
-            if dtype != "BF16":
-                plan["tensors"][name] = {"format": "BF16", "note": "source dtype not BF16"}
-                continue
-            data = read_bf16_tensor(p, infos[name], dtype, shape, data_off)
-            imp = imatrix.get(name) if imatrix else None
-            if imp is not None and imp.shape[0] != shape[1]:
-                raise SystemExit(f"{name}: imatrix dim {imp.shape[0]} != K {shape[1]}")
-            planes, stats = quantize_one(name, shape, data, recipe, importance=imp)
-            if imp is not None:
-                stats["scale_search"] = "imatrix-weighted-ls"
-                stats["imatrix_mean"] = float(imp.mean())
-            # write shard
-            shard = out / (name.replace(".", "/") + ".shq4")
-            shard.parent.mkdir(parents=True, exist_ok=True)
-            meta = {"name": name, "shape": shape, "format": planes["format"],
-                     "Np": planes["Np"], "Kp": planes["Kp"],
-                     "group_size": planes["group_size"],
-                     "w_len": len(planes["weight"]),
-                     "s_len": len(planes["scale"]),
-                     "z_len": len(planes["zero"])}
-            with shard.open("wb") as f:
-                f.write(json.dumps(meta).encode("utf-8"))
-                f.write(b"\n")
-                f.write(planes["weight"])
-                f.write(planes["scale"])
-                f.write(planes["zero"])
-            plan["tensors"][name] = {
-                "format": planes["format"],
-                "shard": str(shard),
-                "shape": list(shape),
-                **stats,
-            }
-            del data
-        else:
-            plan["tensors"][name] = {"format": "BF16", "shard": "source-copy"}
+        fmt = recipe_mod.resolve(name, rules)
+        # Quantization is for linear projections only: 1D norms/bias stay BF16.
+        if len(shape) != 2:
+            fmt = "BF16"
+        if fmt == "BF16":
+            plan["tensors"][name] = {"format": "BF16", "shape": list(shape), "shard": "source-copy"}
+            continue
+        if dtype != "BF16":
+            plan["tensors"][name] = {"format": "BF16", "shape": list(shape), "note": "source dtype not BF16"}
+            continue
+        data = read_bf16_tensor(p, infos[name], dtype, shape, data_off)
+        imp = imatrix.get(name) if imatrix else None
+        if imp is not None and imp.shape[0] != shape[1]:
+            raise SystemExit(f"{name}: imatrix dim {imp.shape[0]} != K {shape[1]}")
+        # SHQ8 has no imatrix search; SHQ4-G32/G64 use it when available.
+        if fmt.startswith("SHQ8"):
+            imp = None
+        planes, stats = quantize_one(name, shape, data, fmt, importance=imp)
+        if imp is not None:
+            stats["scale_search"] = "imatrix-weighted-ls"
+            stats["imatrix_mean"] = float(imp.mean())
+        # write shard
+        shard = out / (name.replace(".", "/") + ".shq4")
+        shard.parent.mkdir(parents=True, exist_ok=True)
+        meta = {"name": name, "shape": shape, "format": planes["format"],
+                 "Np": planes["Np"], "Kp": planes["Kp"],
+                 "group_size": planes["group_size"],
+                 "w_len": len(planes["weight"]),
+                 "s_len": len(planes["scale"]),
+                 "z_len": len(planes["zero"])}
+        with shard.open("wb") as f:
+            f.write(json.dumps(meta).encode("utf-8"))
+            f.write(b"\n")
+            f.write(planes["weight"])
+            f.write(planes["scale"])
+            f.write(planes["zero"])
+        plan["tensors"][name] = {
+            "format": planes["format"], "recipe_fmt": fmt,
+            "shard": str(shard), "shape": list(shape), **stats,
+        }
+        n_q[fmt] += 1
+        del data
 
     write_json(plan_file, plan)
-    n_q = sum(1 for t in plan["tensors"].values() if t["format"].startswith("SHQ4"))
     if args.json:
-        print(json.dumps({"plan": str(plan_file), "quantized_tensors": n_q,
-                          "total_tensors": len(plan["tensors"])}, indent=2))
+        print(json.dumps({"plan": str(plan_file), "recipe": rid,
+                          "quantized": dict(n_q)}, indent=2))
     else:
-        print(f"quantization plan: {plan_file}")
-        print(f"quantized {n_q} tensors to SHQ4-T16 U4Z G{args.group_size} "
-              f"(scale search: {recipe['scale_search']})")
+        print(f"quantization plan: {plan_file}  (recipe '{rid}')")
+        print(f"quantized per tier: " +
+              ", ".join(f"{k}:{v}" for k, v in n_q.items()))
     return 0
 
 

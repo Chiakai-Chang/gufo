@@ -43,7 +43,7 @@ def is_eligible(name: str) -> bool:
 
 
 def dequant_shard(shard_path) -> np.ndarray:
-    """Read an SHQ4 shard file and dequantize to float32 W[Np,Kp]."""
+    """Read an SHQ4/SHQ8 shard file and dequantize to float32 W[Np,Kp]."""
     with open(shard_path, "rb") as f:
         first = f.readline()
         meta = json.loads(first.decode("utf-8"))
@@ -55,6 +55,8 @@ def dequant_shard(shard_path) -> np.ndarray:
             "group_size": meta["group_size"],
             "symmetric": False,
         }
+    if meta["format"].startswith("SHQ8"):
+        return shq.dequant_shq8(planes)
     return shq.dequant_shq4(planes)
 
 
@@ -80,15 +82,16 @@ def load_candidate(source_dir: str, quant_dir: str):
     st = {k.removeprefix("model."): v for k, v in st.items()
           if not k.startswith("mtp.")}
 
-    # Read quantization plan for shard paths.
+    # Read quantization plan for shard paths (STRIX_PLAN override for experiments).
     import os
-    plan_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
-                             "artifacts", "work", "quantization-plan.json")
+    default_plan = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                "artifacts", "work", "quantization-plan.json")
+    plan_path = os.environ.get("STRIX_PLAN", default_plan)
     with open(plan_path) as f:
         plan = json.load(f)
 
     for name, info in plan["tensors"].items():
-        if info["format"].startswith("SHQ4"):
+        if info["format"].startswith("SHQ4") or info["format"].startswith("SHQ8"):
             shard = info["shard"]
             W = dequant_shard(shard)[: info["shape"][0], : info["shape"][1]]
             key = name.removeprefix("model.")
