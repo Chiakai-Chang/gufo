@@ -10,70 +10,78 @@ Recipes are per-tensor tiers (never per-block). Tiers used:
 |---|---|---|
 | SHQ4-G64-U4Z | 4.50 | bulk linear tensors |
 | SHQ4-G32-U4Z | 4.625 | sensitive attention (evaluated, no gain) |
-| SHQ8-G64 | 8.25 | high-precision tier (embed, ffn_down, linear-attn) |
+| SHQ6-G64 | 6.56 | Q6_K-class tier (embed, ffn_down, linear-attn) |
+| SHQ8-G64 | 8.25 | high-precision fallback tier |
 | BF16 | 16 | norms, conv1d, small projections, vision |
 
 **True model size** = quantized shard bytes + BF16-kept tensor bytes (source
 bf16). Shard-only totals undercount BF16-kept tensors (embed is 508 MB bf16).
 
+## Two independent size gaps vs unsloth Q4_K_M (533 MB)
+
+1. **Vision tower (~200 MB)** — we keep `model.visual.*` bf16. llama.cpp /
+   unsloth **drop the vision encoder entirely** (their GGUF has zero vision
+   tensors). For a text-only serving runtime this is dead weight: the single
+   biggest lever. Product decision: drop vision for the text artifact.
+2. **Tier gap** — we upcast with SHQ8 (8.25 bpw) where unsloth uses Q6_K
+   (6.56 bpw) / Q5_K (5.5 bpw). Added **SHQ6** (6.56 bpw, signed 6-bit, 4-per-3
+   bytes, INT8 kernel expansion) to close it.
+
 ## Results (KL = matched-token mean; suite 78 positions)
 
-| recipe | true MB | S8 | G32 | G64 | KL mean | KL p95 | top1 | ppl |
-|---|---|---|---|---|---|---|---|---|
-| bulk_g64 (baseline) | 990.7 | 0 | 0 | 158 | 0.1154 | 0.434 | 0.833 | 3.882 |
-| ffn_only | 1035.9 | 25 | 0 | 133 | 0.0862 | 0.309 | 0.885 | 3.956 |
-| embed_only | 744.4 | 1 | 0 | 158 | 0.1189 | 0.434 | 0.833 | 3.890 |
-| embed_ffn | 789.5 | 26 | 0 | 133 | 0.0866 | 0.308 | 0.872 | 3.957 |
-| embed_attn | 746.4 | 1 | 28 | 130 | 0.1232 | 0.407 | 0.859 | 3.903 |
-| mirror_no_lin | 791.5 | 26 | 28 | 105 | 0.0887 | 0.297 | 0.859 | 3.987 |
-| unsloth_mirror | 884.4 | 80 | 28 | 51 | 0.0383 | 0.156 | 0.910 | 3.831 |
-| full_shq8 | 999.1 | 159 | 0 | 0 | 0.0013 | 0.003 | 0.974 | 3.453 |
+| recipe | true+vision MB | true-vision MB | KL mean | KL p95 | top1 | ppl |
+|---|---|---|---|---|---|---|
+| bulk_g64 (baseline) | 990.7 | 789.8 | 0.1154 | 0.434 | 0.833 | 3.882 |
+| embed_ffn (SHQ8) | 789.5 | 588.6 | 0.0866 | 0.308 | 0.872 | 3.957 |
+| shq6_ffn | 703.0 | **502.0** | 0.0886 | 0.296 | 0.872 | 3.915 |
+| unsloth_mirror (SHQ8) | 884.4 | 683.5 | 0.0383 | 0.156 | 0.910 | 3.831 |
+| shq6_mirror | 750.7 | **549.8** | 0.0498 | 0.172 | 0.885 | 4.003 |
+| full_shq8 | 999.1 | 798.2 | 0.0013 | 0.003 | 0.974 | 3.453 |
 
-## What the ladder shows (isolated levers)
+unsloth Q4_K_M = 533 MB (text-only, vision+MTP dropped).
 
-1. **ffn_down SHQ8 is the quality lever.** `ffn_only` drops KL 0.1154 -> 0.0862
-   (-26%) for upcasting only 25 tensors (one ffn_down per layer). This is the
-   single highest quality-per-byte move, and it mirrors unsloth's `Q6_K` ffn_down.
-2. **embed SHQ8 is a free size cut.** `embed_only` is quality-neutral (KL 0.1189,
-   within suite noise of 0.1154) but is 246 MB smaller than baseline. `embed_ffn`
-   (789.5 MB) matches `ffn_only` (1035.9 MB) quality at 246 MB smaller — the embed
-   upcast pays for itself entirely. **The bf16 embed policy was over-spending the
-   largest tensor for zero measured quality.**
-3. **G32 attention adds nothing.** `mirror_no_lin` (adds G32 attention) is slightly
-   worse than `embed_ffn` (0.0887 vs 0.0866); `embed_attn` (G32 only) is worse than
-   `embed_only`. Drop G32: it buys no quality and adds a second group-size kernel
-   path.
-4. **linear_attn SHQ8 is the biggest further lever.** `unsloth_mirror` (adds
-   linear_attn qkv/z/out SHQ8) drops KL 0.0866 -> 0.0383 (-56%) for +95 MB. Mirrors
-   unsloth's Q8_0/Q5_K linear-attn. Best quality-per-MB overall.
-5. `full_shq8` (KL 0.0013) is the ceiling but is bigger than baseline — not a
-   deployment size.
+## Levers (isolated)
 
-## Chosen deployment recipe: `embed_ffn`
+1. **ffn_down upcast is the quality lever.** KL 0.1154 -> 0.0862 (SHQ8) /
+   0.0886 (SHQ6) for 25 tensors. Mirrors unsloth Q6_K ffn_down.
+2. **embed upcast is a free size cut** (quality-neutral): SHQ6 6.56bpw saves
+   246 MB vs bf16. The bf16-embed policy over-spends the largest tensor.
+3. **SHQ6 vs SHQ8 on the upcast set** saves 86 MB (shq6_ffn) to 134 MB
+   (shq6_mirror) at a small quality cost (0.0886 vs 0.0866; 0.0498 vs 0.0383).
+   SHQ6 is the Q6_K-class tier that closes the unsloth size gap.
+4. **G32 attention adds nothing** (mirror_no_lin 0.0887 vs embed_ffn 0.0866;
+   embed_attn worse than embed_only). Drop G32 — no quality, extra kernel path.
+5. **linear_attn upcast is the biggest further lever** (0.0886 -> 0.0498 via
+   shq6_mirror, +48 MB). Mirrors unsloth Q8_0/Q5_K linear-attn.
+6. **Vision drop (~200 MB)** is the dominant size lever, independent of
+   quantization.
 
-Embed SHQ8 + ffn_down SHQ8 + bulk SHQ4 G64; norms/conv/vision bf16.
-789.5 MB, KL 0.0866. Best balance of quality, size, and hardware decode cost.
+## Recommended (text-only deployment, vision dropped)
 
-Quality variant: `unsloth_mirror` (884 MB, KL 0.0383) when prefill-heavy or
-quality floor demands, accepting linear_attn SHQ8 decode bandwidth.
+- **shq6_ffn**: 502 MB, KL 0.0886 — size-competitive with unsloth's 533 MB at
+  comparable quality. Minimum-size variant.
+- **shq6_mirror**: 550 MB, KL 0.0498 — best quality-per-MB; linear_attn SHQ6
+  adds 48 MB for a large KL gain. Preferred when the quality floor is tight.
+
+Keep MTP (speculative) as SHQ4 — unsloth drops it, we keep it for speculative
+decoding (~22 MB).
 
 ## Strix Halo hardware compatibility (format-level)
 
 Measured kernel speed is **not** available yet — `src/main.cpp` is only a
-device probe; SHQ4/SHQ8 decode GEMV kernels are the next milestone. What is
-verified at the format level:
+device probe; SHQ4/SHQ6/SHQ8 decode GEMV kernels are the next milestone. What
+is verified at the format level:
 
-- SHQ8-T16 uses the **identical T16 tile layout and packing order** as SHQ4-T16
-  (verified byte-identical to the reference loop; conformance suite passes).
-  The decode GEMV kernel is the same structure — only the per-weight read width
-  differs (1 byte vs nibble). So a SHQ8 tensor needs no new kernel family.
-- Precision is **per-tensor**, never per-block (docs/QUANTIZATION.md), so hot
-  kernels do not branch per block.
-- The chosen recipe keeps the bulk hot path on a single SHQ4-G64 group size
-  (G32 dropped), and the SHQ8 tier is small (embed + ffn_down only): on the
-  single-token decode GEMV path SHQ8 costs 2x memory bandwidth per weight vs
-  SHQ4, and decode is bandwidth-bound, so keeping the tier small protects
-  decode throughput. Prefill (compute-bound matmul) is far less sensitive.
+- SHQ6 and SHQ8 share the **identical T16 tile layout and packing order** as
+  SHQ4 (SHQ6 byte-identical to reference loop; conformance suite passes). The
+  decode GEMV kernel is one family — only the per-weight read width differs
+  (SHQ6 is 3 bytes per 4 weights). SHQ6 expands to INT8 in the kernel
+  (storage != compute, per docs/QUANTIZATION.md).
+- Precision is **per-tensor**, never per-block, so hot kernels do not branch.
+- SHQ6 (6.56 bpw) costs ~1.46x SHQ4 decode bandwidth (vs SHQ8's 2x), so it is
+  the right tier for upcast tensors on the bandwidth-bound decode path.
+- Chosen recipe keeps the bulk hot path on a single SHQ4-G64 group size (G32
+  dropped).
 
 ## Tooling
 

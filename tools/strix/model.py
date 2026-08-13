@@ -55,6 +55,8 @@ def dequant_shard(shard_path) -> np.ndarray:
             "group_size": meta["group_size"],
             "symmetric": False,
         }
+    if meta["format"].startswith("SHQ6"):
+        return shq.dequant_shq6(planes)
     if meta["format"].startswith("SHQ8"):
         return shq.dequant_shq8(planes)
     return shq.dequant_shq4(planes)
@@ -91,7 +93,8 @@ def load_candidate(source_dir: str, quant_dir: str):
         plan = json.load(f)
 
     for name, info in plan["tensors"].items():
-        if info["format"].startswith("SHQ4") or info["format"].startswith("SHQ8"):
+        if info["format"].startswith("SHQ4") or info["format"].startswith("SHQ6") \
+           or info["format"].startswith("SHQ8"):
             shard = info["shard"]
             W = dequant_shard(shard)[: info["shape"][0], : info["shape"][1]]
             key = name.removeprefix("model.")

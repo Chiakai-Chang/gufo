@@ -37,7 +37,8 @@ tools/strix-calibrate.py --source artifacts/source \
 #   SHQ8, rest SHQ4 G64; see benchmarks/qwen3.5-0.8b/MIXED_PRECISION.md)
 #   --imatrix DIR enables importance-weighted SHQ4 scale search
 #   --recipe NAME selects a preset (bulk_g64/embed_only/embed_ffn/ffn_only/
-#   embed_attn/mirror_no_lin/unsloth_mirror/full_shq8) or a JSON rule file
+#   embed_attn/mirror_no_lin/unsloth_mirror/shq6_ffn/shq6_mirror/full_shq8)
+#   or a JSON rule file; tiers SHQ4-G64/G32, SHQ6-G64, SHQ8-G64, BF16
 tools/strix-quantize.py --source artifacts/source \
   --out artifacts/quant --plan artifacts/work/quantization-plan.json --imatrix artifacts/calib
 # 4b. sweep mixed-precision presets, benchmark each, print comparison table
@@ -58,7 +59,7 @@ tools/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --recon \
 ## Modules
 
 - `strix/safetensors.py` — safetensors validation + lazy read (Source Contract)
-- `strix/shq.py` — SHQ4-T16 / SHQ8-T16 quantize/pack/dequant (normative contract)
+- `strix/shq.py` — SHQ4-T16 / SHQ6-T16 / SHQ8-T16 quantize/pack/dequant (normative contract)
 - `strix/conformance.py` — byte-exact conformance vectors (T1)
 - `strix/manifest.py` — source-manifest / quantization-plan writers
 - `strix/model.py` — Qwen3.5 teacher/candidate load + logit extraction

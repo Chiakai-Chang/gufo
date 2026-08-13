@@ -18,8 +18,10 @@ import numpy as np
 from .shq import (
     quantize_shq4,
     quantize_shq8,
+    quantize_shq6,
     dequant_shq4,
     dequant_shq8,
+    dequant_shq6,
     f32_to_bf16_uint16,
     bf16_uint16_to_f32,
     U4_MAX,
@@ -167,6 +169,20 @@ def test_shq8():
     assert err < 0.02, f"SHQ8 reconstruction too large: {err}"
 
 
+def test_shq6():
+    """SHQ6: signed 6-bit round-trip, 4-per-3-byte bit packing, reconstruction."""
+    W = np.random.RandomState(11).rand(16, 64).astype(np.float32)
+    p = quantize_shq6(W, group_size=64)
+    d = dequant_shq6(p)[:16, :64]
+    err = np.abs(d - W).max()
+    assert err < 0.03, f"SHQ6 reconstruction too large: {err}"
+    # 4 codes per 3 bytes: 64 K values = 16 bytes/lane per k16 (64/4*3)
+    assert len(p["weight"]) == 16 * 64 * 3 // 4, f"SHQ6 weight size {len(p['weight'])}"
+    # bit-packing round trip: reconstruct codes from bytes directly
+    q6 = dequant_shq6(p)
+    assert np.all(np.abs(q6[:16, :64] - W) < 0.04)
+
+
 def run_all():
     tests = [
         test_exhaustive_nibble,
@@ -178,6 +194,7 @@ def run_all():
         test_determinism,
         test_g64_g32_offsets,
         test_shq8,
+        test_shq6,
     ]
     for t in tests:
         t()

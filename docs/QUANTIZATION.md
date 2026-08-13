@@ -100,8 +100,14 @@ The runtime cannot reconstruct a higher-precision variant from a
 lower-precision artifact.
 
 The initial size range should be produced by changing the tensor-level mixture
-of native Q4, Q8, and BF16 encodings. Do not introduce packed Q5 or Q6 merely to
-hit a marketing BPW because neither backend has a natural Q5/Q6 matrix path.
+of native Q4, Q6, Q8, and BF16 encodings. `SHQ6-T16` is a Q6_K-class storage
+encoding (6.56 bpw): signed 6-bit codes packed 4-per-3-bytes, expanded to INT8
+in the kernel. It exists because the unsloth Q4_K_M comparison showed the Q6_K
+tier (embed/ffn_down/linear-attn) is exactly what closes the size gap without a
+quality cliff (benchmarks/qwen3.5-0.8b/MIXED_PRECISION.md). Storage is not
+compute: SHQ6 expands to native INT8 tiles before matrix multiplication, so
+neither backend needs a packed Q6 matrix path. Packed Q5 is still avoided (no
+natural Q5 matrix path; Q6 covers the intermediate tier).
 
 Sub-four-bit variants require a separately specified Q2 or Q3 tensor encoding
 and an efficient tile-local expansion path. They are later research and are not
@@ -444,6 +450,51 @@ Effective size:             8.25 bits per weight
 The output-lane, K-subtile, padding, BF16 rounding, and alignment conventions
 match SHQ4-T16. A complete normative SHQ8 byte-offset and conformance-vector
 section must be added before its kernels are promoted.
+
+## SHQ6-T16 Tensor Encoding
+
+SHQ6-T16 is the Q6_K-class storage encoding (6.56 bpw) for tensors that need
+more than SHQ4 but less than SHQ8 (embed, ffn_down, linear-attn projections).
+It closes the unsloth Q4_K_M size gap (see MIXED_PRECISION.md). Storage is not
+compute: SHQ6 expands to native INT8 tiles before matrix multiplication.
+
+```text
+Weight codes:       signed INT6 (-32..31)
+Scale:              BF16
+Zero point:         none
+Default K group:    64
+Output tile:        16 channels
+K microtile:        16 values
+```
+
+Decoding is:
+
+```text
+dequant(q) = float(scale) * signed6(q)
+signed6: code < 32 ? code : code - 64
+```
+
+Packing is 4 codes per 3 bytes, little-endian 24-bit stream along K:
+
+```text
+byte0 = v0 | ((v1 & 3) << 6)
+byte1 = (v1 >> 2) | ((v2 & 15) << 4)
+byte2 = (v2 >> 4) | (v3 << 2)
+```
+
+One `K16 x N16` microtile contains 256 6-bit codes = 192 bytes. Four
+microtiles plus sixteen BF16 scales form a G64 tile:
+
+```text
+Four K16 weight microtiles: 768 bytes
+Sixteen BF16 scales:         32 bytes
+Total:                       800 bytes for 1024 weights
+Effective size:            6.5625 bits per weight
+```
+
+Output-lane, K-subtile, padding, BF16 rounding, and alignment conventions
+match SHQ8/SHQ4. Conformance vectors cover the 4-per-3-byte bit packing and
+signed 6-bit round-trip.
 
 ## Backend Arithmetic
 
@@ -969,8 +1020,13 @@ Do not force every tensor into Q4. An `SHQ-T16` artifact may include:
 | `SHQ4-T16-G64-U4Z` | Bulk linear tensors |
 | `SHQ4-T16-G32-U4Z` | Sensitive attention or output tensors (see note) |
 | `SHQ4-T16-G64-S4` | Fast symmetric tensors |
+| `SHQ6-T16-G64` | Q6_K-class tier: embed, ffn_down, linear-attn |
 | `SHQ8-T16-G64` | Difficult tensors and sensitive experts |
 | `BF16` | Norms, routers, selected heads, reference paths |
+
+For text-only serving, the source vision encoder (`model.visual.*`, ~200 MB
+bf16 on Qwen3.5-0.8B) should be dropped from the artifact, matching llama.cpp /
+unsloth. It is dead weight for text inference and is the dominant size lever.
 
 Evidence (benchmarks/qwen3.5-0.8b/MIXED_PRECISION.md, Qwen3.5-0.8B):
 
@@ -978,16 +1034,22 @@ Evidence (benchmarks/qwen3.5-0.8b/MIXED_PRECISION.md, Qwen3.5-0.8B):
 - embed -> SHQ8 is a free size cut: quality-neutral, 246 MB smaller. The
   BF16-embed policy over-spends the largest tensor; embeddings do not need
   full precision when the LM head is tied to them.
+- SHQ6 (6.56 bpw) replaces SHQ8 on the upcast set: saves 86-134 MB at a small
+  quality cost (shq6_ffn 0.0886 vs 0.0866; shq6_mirror 0.0498 vs 0.0383). It is
+  the Q6_K-class tier that closes the unsloth size gap.
 - SHQ4-G32 attention measured no quality gain on the 78-position suite; treat
   G32 as optional, not default (it adds a second group-size kernel path).
-- linear_attn projections -> SHQ8 is the biggest further lever (KL 0.0866 ->
-  0.0383), mirroring unsloth Q8_0/Q5_K linear-attn choices.
+- linear_attn projections -> SHQ8/SHQ6 is the biggest further lever (KL 0.0866
+  -> 0.0383 / 0.0498), mirroring unsloth Q8_0/Q5_K linear-attn choices.
+- Vision tower (~200 MB bf16) should be dropped for text-only serving; llama.cpp
+  / unsloth drop it. Dominant size lever, independent of quantization.
 
-SHQ8 uses the same T16 tile layout and packing order as SHQ4 (byte-exact), so
-it is one kernel family, not a new one; only the per-weight read width differs.
-Keep the SHQ8 tier small on the decode GEMV path (decode is bandwidth-bound;
-SHQ8 costs 2x bytes/weight). Precision selection is per-tensor, never
-per-block, so hot kernels do not branch per block.
+SHQ6/SHQ8 share the SHQ4 T16 tile layout and packing order (byte-exact), so
+they are one kernel family, not new ones; only the per-weight read width
+differs (SHQ6: 3 bytes per 4 weights, SHQ8: 1 byte per weight). SHQ6 expands to
+INT8 in the kernel. Keep the upcast tier small on the decode GEMV path (decode
+is bandwidth-bound; SHQ8 costs 2x bytes/weight, SHQ6 ~1.46x). Precision
+selection is per-tensor, never per-block, so hot kernels do not branch per block.
 
 Precision selection should be at tensor or contiguous channel-range
 granularity. Per-block format branching is avoided in hot kernels.

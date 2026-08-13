@@ -6,17 +6,19 @@ and BF16 the rest. Encodings:
 
   SHQ4-G64-U4Z   4.5  bpw  bulk linear tensors
   SHQ4-G32-U4Z   4.625bpw  sensitive attention / output tensors
+  SHQ6-G64       6.56 bpw  Q6_K-class tier (embed, ffn_down, linear-attn)
   SHQ8-G64       8.25 bpw  high-precision tier (embed, ffn_down, linear-attn)
   BF16           16   bpw  norms, conv1d, small projections, vision
 
-Per-tensor precision (never per-block) keeps hot kernels branch-free; SHQ8
-uses the same T16 tile layout as SHQ4, so the decode GEMV kernel is identical
-(only weight-read width differs), which is what makes the tier hardware-safe
-on gfx1151 / XDNA2.
+Per-tensor precision (never per-block) keeps hot kernels branch-free; SHQ6 and
+SHQ8 share the SHQ4 T16 tile layout, so the decode GEMV kernel structure is
+identical (only per-weight read width differs), which is what makes the tiers
+hardware-safe on gfx1151 / XDNA2. SHQ6 is the Q6_K-class tier: 6-bit codes
+packed 4-per-3-bytes, expanded to INT8 in the kernel (storage != compute).
 
 Presets mirror the unsloth Q4_K_M recipe (Q6_K embed, Q6_K ffn_down, Q5_K/Q8_0
-linear-attn, Q4_K attention) using our native SHQ8/SHQ4-G32 tiers instead of
-Q5/Q6 (docs/QUANTIZATION.md bans Q5/Q6: no natural backend matrix path).
+linear-attn, Q4_K attention). SHQ6 replaces the Q6_K choices; SHQ8 is the
+higher-precision fallback tier.
 """
 
 from __future__ import annotations
@@ -81,6 +83,24 @@ PRESETS = {
         (EMBED, "SHQ8-G64"),
         (FFN_DOWN, "SHQ8-G64"),
     ],
+    # unsloth-mirror but with SHQ6 (Q6_K-class) instead of SHQ8 on the
+    # upcast set: embed + ffn_down + linear-attn -> SHQ6, attention G32, rest Q4
+    "shq6_mirror": [
+        (EMBED, "SHQ6-G64"),
+        (FFN_DOWN, "SHQ6-G64"),
+        (LIN_QKV, "SHQ6-G64"),
+        (LIN_Z, "SHQ6-G64"),
+        (LIN_OUT, "SHQ6-G64"),
+        (ATTN[0], "SHQ4-G32-U4Z"),
+        (ATTN[1], "SHQ4-G32-U4Z"),
+        (ATTN[2], "SHQ4-G32-U4Z"),
+        (ATTN[3], "SHQ4-G32-U4Z"),
+    ],
+    # embed + ffn_down -> SHQ6, linear-attn stays SHQ4 G64 (smaller Q6 tier)
+    "shq6_ffn": [
+        (EMBED, "SHQ6-G64"),
+        (FFN_DOWN, "SHQ6-G64"),
+    ],
     # full SHQ8: every eligible tensor to 8.25bpw (max quality ceiling)
     "full_shq8": [
         (EMBED, "SHQ8-G64"),
@@ -141,8 +161,8 @@ def resolve(name: str, rules: list) -> str:
 
 
 def bpw(fmt: str) -> float:
-    return {"SHQ4-G64-U4Z": 4.5, "SHQ4-G32-U4Z": 4.625, "SHQ8-G64": 8.25,
-            "BF16": 16.0}.get(fmt, 0.0)
+    return {"SHQ4-G64-U4Z": 4.5, "SHQ4-G32-U4Z": 4.625, "SHQ6-G64": 6.5625,
+            "SHQ8-G64": 8.25, "BF16": 16.0}.get(fmt, 0.0)
 
 
 def recipe_id(rules: list) -> str:

@@ -41,6 +41,7 @@ import numpy as np
 U4_MAX = 15
 S4_MIN, S4_MAX = -8, 7
 S8_MAX = 127
+S6_MAX = 31  # signed 6-bit -32..31 (SHQ6, 6.56bpw; Q6_K-class)
 
 
 def f32_to_bf16_uint16(arr: np.ndarray) -> np.ndarray:
@@ -305,6 +306,95 @@ def quantize_shq8(W: np.ndarray, group_size: int):
         "symmetric": False,
         "format": f"SHQ8_T16_V1_G{group_size}",
     }
+
+
+def _quantize_shq6_batched(Wb: np.ndarray):
+    """Batched SHQ6 scale/code selection over [B,16,G] blocks.
+
+    Per lane: max-abs scale, signed 6-bit codes -32..31, dequant = s*q
+    (symmetric, no zero point; Q6_K-class). Constant rows -> zero scale.
+    """
+    B = Wb.shape[0]
+    amax = np.max(np.abs(Wb), axis=2)
+    const = amax <= 0.0
+    s_safe = np.where(const, 1.0, amax / S6_MAX)
+    s_bf = _bf16r(s_safe)
+    valid = (const == False) & (s_bf > 0.0)
+    q = _clamp(_round_even(Wb / np.where(valid, s_bf, 1.0)[..., None]), -S6_MAX, S6_MAX)
+    q = np.where(valid[..., None], q, 0.0)
+    s = np.where(const, 0.0, s_bf)
+    return s, q
+
+
+def quantize_shq6(W: np.ndarray, group_size: int):
+    """Quantize W[N,K] to SHQ6-T16 (signed 6-bit, Q6_K-class).
+
+    Same T16 tile layout as SHQ4/SHQ8: microtile [k16][lane][kp16]. Codes are
+    6-bit signed -32..31 packed 4-per-3-bytes (little-endian bit stream along
+    kp). Scale plane: BF16 per output lane per K group (like SHQ8). Batched.
+    """
+    W = W.astype(np.float32, copy=False)
+    N, K = W.shape
+    Np = (N + 15) // 16 * 16
+    Kp = (K + group_size - 1) // group_size * group_size
+    n_tiles = Np // 16
+    k_groups = Kp // group_size
+    k16_per = group_size // 16
+    B = n_tiles * k_groups
+    G = group_size
+
+    Wp = np.zeros((Np, Kp), dtype=np.float32)
+    Wp[:N, :K] = W
+    Wb = np.ascontiguousarray(Wp.reshape(n_tiles, 16, k_groups, G)
+                              .transpose(0, 2, 1, 3)).reshape(B, 16, G)
+
+    s, q = _quantize_shq6_batched(Wb)  # [B,16], [B,16,G]
+    sbytes = f32_to_bf16_uint16(s).astype(np.uint16).tobytes()
+    qn = (q.astype(np.int8).astype(np.uint8)) & 0x3F  # 6-bit codes
+    qr = qn.reshape(B, 16, k16_per, 16).transpose(0, 2, 1, 3)  # [B,k16,lane,kp16]
+    # pack 4 consecutive kp codes -> 3 bytes (little-endian 24-bit stream)
+    qg = qr.reshape(B, k16_per, 16, 4, 4)  # [B,k16,lane,g4,kp4]
+    v0, v1, v2, v3 = qg[..., 0], qg[..., 1], qg[..., 2], qg[..., 3]
+    b0 = v0 | ((v1 & 3) << 6)
+    b1 = (v1 >> 2) | ((v2 & 15) << 4)
+    b2 = (v2 >> 4) | (v3 << 2)
+    pack = np.stack([b0, b1, b2], axis=-1).astype(np.uint8)  # [B,k16,lane,g4,3]
+    weight = pack.tobytes()
+    return {
+        "weight": bytes(weight),
+        "scale": bytes(sbytes),
+        "zero": b"",
+        "N": N, "K": K, "Np": Np, "Kp": Kp,
+        "group_size": group_size,
+        "symmetric": False,
+        "format": f"SHQ6_T16_V1_G{group_size}",
+    }
+
+
+def dequant_shq6(planes: dict) -> np.ndarray:
+    """Decode SHQ6-T16 planes back to float32 W[Np,Kp]. CPU reference oracle."""
+    weight = np.frombuffer(planes["weight"], dtype=np.uint8)
+    scale = np.frombuffer(planes["scale"], dtype=np.uint16)
+    Np, Kp = planes["Np"], planes["Kp"]
+    G = planes["group_size"]
+    n_tiles = Np // 16
+    k_groups = Kp // G
+    k16_per = G // 16
+    B = n_tiles * k_groups
+
+    wg = weight.reshape(B, k16_per, 16, 4, 3)
+    b0 = wg[..., 0]; b1 = wg[..., 1]; b2 = wg[..., 2]
+    v0 = b0 & 0x3F
+    v1 = (b0 >> 6) | ((b1 & 0x0F) << 2)
+    v2 = (b1 >> 4) | ((b2 & 0x03) << 4)
+    v3 = (b2 >> 2) & 0x3F
+    codes = np.stack([v0, v1, v2, v3], axis=-1).reshape(B, k16_per, 16, 4, 4)
+    codes = codes.reshape(B, k16_per, 16, 16).transpose(0, 2, 1, 3).reshape(B, 16, G).astype(np.float32)
+    codes = np.where(codes < 32, codes, codes - 64)  # signed -32..31
+    s = bf16_uint16_to_f32(scale).reshape(B, 16)
+    W = s[..., None] * codes
+    W = W.reshape(n_tiles, k_groups, 16, G).transpose(0, 2, 1, 3).reshape(Np, Kp)
+    return W
 
 
 def dequant_shq4(planes: dict) -> np.ndarray:

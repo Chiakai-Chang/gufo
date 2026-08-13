@@ -35,6 +35,9 @@ def quantize_one(name, shape, data, fmt, importance=None) -> dict:
         G = 32 if "G32" in fmt else 64
         planes = shq.quantize_shq4(W, group_size=G, importance=importance)
         Wd = shq.dequant_shq4(planes)[: shape[0], : shape[1]]
+    elif fmt.startswith("SHQ6"):
+        planes = shq.quantize_shq6(W, group_size=64)
+        Wd = shq.dequant_shq6(planes)[: shape[0], : shape[1]]
     elif fmt.startswith("SHQ8"):
         planes = shq.quantize_shq8(W, group_size=64)
         Wd = shq.dequant_shq8(planes)[: shape[0], : shape[1]]
@@ -113,7 +116,7 @@ def main(argv=None):
             "tensors": {}}
     plan_file = Path(args.plan)
 
-    n_q = {"SHQ4-G64-U4Z": 0, "SHQ4-G32-U4Z": 0, "SHQ8-G64": 0}
+    n_q = {"SHQ4-G64-U4Z": 0, "SHQ4-G32-U4Z": 0, "SHQ6-G64": 0, "SHQ8-G64": 0}
     for name in sorted(infos):
         dtype, shape, (b0, b1) = infos[name]
         if name == "__metadata__" or not name.endswith(".weight"):
@@ -132,8 +135,8 @@ def main(argv=None):
         imp = imatrix.get(name) if imatrix else None
         if imp is not None and imp.shape[0] != shape[1]:
             raise SystemExit(f"{name}: imatrix dim {imp.shape[0]} != K {shape[1]}")
-        # SHQ8 has no imatrix search; SHQ4-G32/G64 use it when available.
-        if fmt.startswith("SHQ8"):
+        # SHQ6/SHQ8 have no imatrix search; SHQ4-G32/G64 use it when available.
+        if fmt.startswith("SHQ6") or fmt.startswith("SHQ8"):
             imp = None
         planes, stats = quantize_one(name, shape, data, fmt, importance=imp)
         if imp is not None:

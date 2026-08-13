@@ -147,15 +147,20 @@ milestone.
 ## Mixed-precision revision (see MIXED_PRECISION.md)
 
 The uniform-SHQ4 slice is superseded by a per-tensor tier recipe. Experiments
-across 8 presets show:
+across presets show:
 
-- ffn_down -> SHQ8 is the quality lever (KL 0.1154 -> 0.0862).
-- embed -> SHQ8 is a free 246 MB size cut (quality-neutral); the bf16-embed
-  policy over-spent the largest tensor.
+- ffn_down upcast is the quality lever (KL 0.1154 -> 0.0862 SHQ8 / 0.0886 SHQ6).
+- embed upcast is a free 246 MB size cut (quality-neutral); bf16-embed
+  over-spent the largest tensor.
+- SHQ6 (6.56 bpw, Q6_K-class) replaces SHQ8 on the upcast set: saves 86-134 MB
+  at small quality cost. This is the tier that closes the unsloth size gap.
 - G32 attention buys no quality; dropped.
-- linear_attn -> SHQ8 is the biggest further lever (KL 0.0866 -> 0.0383).
-- Chosen deployment: `embed_ffn` (embed+ffn_down SHQ8, rest SHQ4 G64; 789 MB,
-  KL 0.0866); quality variant `unsloth_mirror` (884 MB, KL 0.0383).
+- linear_attn upcast is the biggest further lever (KL 0.0886 -> 0.0498 shq6).
+- Vision tower (~200 MB) should be dropped for text-only serving (llama.cpp /
+  unsloth drop it); dominant size lever.
+- Chosen text-only deployment: `shq6_ffn` (embed+ffn_down SHQ6, rest SHQ4 G64;
+  502 MB, KL 0.0886) size-competitive with unsloth's 533 MB; quality variant
+  `shq6_mirror` (550 MB, KL 0.0498).
 
 ## Next steps
 
