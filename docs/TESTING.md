@@ -195,7 +195,9 @@ Initial thresholds are established by measuring:
 - Known higher- and lower-quality quantization candidates.
 
 Each model implementation then declares release budgets for mean and tail KL,
-perplexity delta, top-token agreement, router agreement, and task scores. A new
+perplexity delta, top-token agreement, router agreement, and task scores.
+Capability-suite composition, grading, and task-gate policy are defined in
+EVAL.md. A new
 candidate must satisfy the absolute quality floor and must not regress the
 currently published artifact beyond its declared budget.
 
@@ -287,8 +289,8 @@ Required route comparisons include:
 
 ### T5: Quantized-model quality
 
-Run teacher-forced full-logit evaluation, perplexity, and capability suites
-against the source checkpoint. Report both absolute quality and delta from the
+Run teacher-forced full-logit evaluation (BENCHMARKS.md), perplexity, and
+capability suites (EVAL.md) against the source checkpoint. Report both absolute quality and delta from the
 currently promoted quantization.
 
 A quantization release cannot be promoted from reconstruction error alone.
@@ -446,6 +448,7 @@ strix-test-kernel     Compare one HIP or AIE kernel with a CPU oracle
 strix-capture         Capture layer boundaries or full logits
 strix-compare         Compare exact, tolerant, or distribution artifacts
 strix-quality         Run teacher-forced logits, perplexity, and task suites
+                      (task suites defined in EVAL.md)
 strix-stress          Run concurrency, cancellation, and lifecycle tests
 strix-bench           Produce correctness-linked performance artifacts
 strix-report          Validate JSON artifacts and render summaries

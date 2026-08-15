@@ -112,6 +112,8 @@ docs/
 7. Build the full-quality teacher-logit capture workflow.
 8. Define the versioned logit artifact and matched-token comparison runner.
 9. Add the initial SHQ4-T16 and SHQ8-T16 byte-exact conformance vectors.
+10. Commit the capability evaluation suite with provenance and extraction
+    fixtures (EVAL.md).
 
 ### Exit criteria
 
@@ -176,9 +178,11 @@ complete model.
 3. Implement the initial contiguous KV cache.
 4. Implement deterministic greedy sampling.
 5. Implement request-owned model and sampling state.
-6. Implement `strix-server prompt` in direct mode.
-7. Implement `strix-server chat` in direct mode.
-8. Add eager execution first; add HIP graphs only after correctness.
+6. Implement the capability evaluation drift gate, trace format, and offline
+   regrade (EVAL.md).
+7. Implement `strix-server prompt` in direct mode.
+8. Implement `strix-server chat` in direct mode.
+9. Add eager execution first; add HIP graphs only after correctness.
 
 Start with BF16 or SHQ8 where it simplifies bring-up, then introduce SHQ4
 tensor by tensor. Do not debug every low-bit kernel simultaneously.

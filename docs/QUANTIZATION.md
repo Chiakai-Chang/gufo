@@ -36,7 +36,8 @@ activation and accumulation paths.
 Each supported model has one release objective applied to every published size.
 The objective defines:
 
-- Absolute full-logit, perplexity, task, and routing quality floors.
+- Absolute full-logit, perplexity, task, and routing quality floors. The
+  task floors are capability-suite scores as defined in EVAL.md.
 - Explicit encoded-byte targets for the selected size variants.
 - Resident-memory budgets for each selected size.
 - Protected single-request latency and throughput objectives.
@@ -49,7 +50,7 @@ A candidate for a selected size is promoted only when it is the best measured
 overall tradeoff for that size and is on or improves the model's
 quality-performance frontier. Evaluation includes:
 
-- Full-logit KL, perplexity, task behavior, and router agreement.
+- Full-logit KL, perplexity, task behavior (EVAL.md), and router agreement.
 - Model size and resident memory.
 - GPU decode latency.
 - GPU and NPU prefill throughput.

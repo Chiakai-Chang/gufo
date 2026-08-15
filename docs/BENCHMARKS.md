@@ -3,6 +3,9 @@
 How Strix benchmarks are computed, and which utilities produce them. This
 file documents the method; per-model results live in `benchmarks/<model>/`
 (readmes), never as raw committed artifacts (`artifacts/` is gitignored).
+This method is teacher-forced and matched-token; it is not free-running
+evaluation. Capability evaluation (free-running, answer-graded) is defined
+in EVAL.md.
 
 ## Pipeline (tools/)
 
