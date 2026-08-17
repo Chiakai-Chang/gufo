@@ -109,8 +109,13 @@ if (ENGINE_ENABLE_XRT)
   target_link_libraries(strix_diagnostics PRIVATE ${XRT_COREUTIL_LIB})
 endif()
 
+add_library(strix_core STATIC
+  src/core/model_registry.cpp
+)
+target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
+
 add_executable(strix-server src/server/main.cpp)
-target_link_libraries(strix-server PRIVATE strix_diagnostics)
+target_link_libraries(strix-server PRIVATE strix_diagnostics strix_core)
 
 install(TARGETS strix strix-server DESTINATION bin)
 
