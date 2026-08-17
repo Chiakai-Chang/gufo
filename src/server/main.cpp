@@ -2,6 +2,8 @@
 #include <span>
 #include <string_view>
 
+#include "src/cli/diagnose.h"
+
 namespace strix::server {
 namespace {
 
@@ -12,14 +14,16 @@ void print_version() {
 }
 
 void print_help(std::string_view program_name) {
-  std::cout << "Usage: " << program_name << " [OPTIONS] [COMMAND]\n\n"
-            << "Commands:\n"
-            << "  serve    Start the OpenAI-compatible server\n"
-            << "  chat     Maintain an interactive conversation\n"
-            << "  prompt   Execute one request and exit\n\n"
-            << "Options:\n"
-            << "  -h, --help     Print help\n"
-            << "  -v, --version  Print version\n";
+  std::cout
+      << "Usage: " << program_name << " [OPTIONS] [COMMAND]\n\n"
+      << "Commands:\n"
+      << "  serve     Start the OpenAI-compatible server\n"
+      << "  chat      Maintain an interactive conversation\n"
+      << "  prompt    Execute one request and exit\n"
+      << "  diagnose  Run non-interactive system and hardware diagnostics\n\n"
+      << "Options:\n"
+      << "  -h, --help     Print help\n"
+      << "  -v, --version  Print version\n";
 }
 
 int run(std::span<const char* const> args) {
@@ -47,6 +51,10 @@ int run(std::span<const char* const> args) {
   if (first_arg == "--help" || first_arg == "-h") {
     print_help(program_name);
     return 0;
+  }
+
+  if (first_arg == "diagnose") {
+    return strix::cli::RunDiagnose(options);
   }
 
   std::cerr << "Error: unknown command or option '" << first_arg << "'\n";

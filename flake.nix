@@ -76,11 +76,11 @@
         in
         {
           format = pkgsSys.runCommand "check-format" {
-            nativeBuildInputs = [ pkgsSys.clang-tools ];
+            nativeBuildInputs = [ pkgsSys.clang-tools pkgsSys.findutils ];
             src = self;
           } ''
             cd "$src"
-            clang-format --dry-run --Werror src/main.cpp src/server/main.cpp
+            find src tests -not -path "*/fixtures/*" \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) -exec clang-format --dry-run --Werror {} +
             mkdir -p $out
             echo "PASS: Formatting check clean" > $out/result.txt
           '';
@@ -92,13 +92,14 @@
               pkgsSys.cmake
               pkgsSys.ninja
               pkgsSys.python3
+              pkgsSys.findutils
             ];
             src = self;
           } ''
             export HOME=$TMPDIR
             mkdir -p build && cd build
             cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF -DENGINE_ENABLE_XRT=OFF
-            clang-tidy -p . "$src"/src/main.cpp "$src"/src/server/main.cpp
+            find "$src"/src "$src"/tests/diagnostics -name "*.cpp" -exec clang-tidy -p . {} +
             mkdir -p $out
             echo "PASS: clang-tidy static analysis clean" > $out/result.txt
           '';
@@ -131,6 +132,7 @@
               pkgsSys.cmake
               pkgsSys.ninja
               pkgsSys.python3
+              pkgsSys.findutils
             ];
             src = self;
           } ''
@@ -139,13 +141,13 @@
 
             echo "=== [PR Gate 1/7] Format Validation (clang-format) ==="
             cd "$src"
-            clang-format --dry-run --Werror src/main.cpp src/server/main.cpp
+            find src tests -not -path "*/fixtures/*" \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) -exec clang-format --dry-run --Werror {} +
             echo "PASS: Formatting check clean"
 
             echo "=== [PR Gate 2/7] Static Analysis (clang-tidy) ==="
             mkdir -p "$TMPDIR/build-static" && cd "$TMPDIR/build-static"
             cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF -DENGINE_ENABLE_XRT=OFF
-            clang-tidy -p . "$src"/src/main.cpp "$src"/src/server/main.cpp
+            find "$src"/src "$src"/tests/diagnostics -name "*.cpp" -exec clang-tidy -p . {} +
             echo "PASS: Static analysis clean"
 
             echo "=== [PR Gate 3/7] Dependency and License Inventory Consistency ==="

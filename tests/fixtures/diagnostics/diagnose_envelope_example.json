@@ -1,0 +1,62 @@
+{
+  "schemaVersion": "1.0.0",
+  "engineRevision": "0.1.0",
+  "timestamp": "2026-08-17T20:00:00Z",
+  "status": "PASS",
+  "checks": [
+    {
+      "name": "platform",
+      "status": "PASS",
+      "message": "Supported architecture: Linux x86-64",
+      "details": {
+        "targetArchitecture": "x86_64-linux"
+      }
+    },
+    {
+      "name": "system",
+      "status": "PASS",
+      "message": "Host operating system and kernel identified",
+      "details": {
+        "machine": "x86_64",
+        "nodename": "strix-halo",
+        "release": "7.1.8",
+        "sysname": "Linux",
+        "version": "#1-NixOS SMP"
+      }
+    },
+    {
+      "name": "toolchain",
+      "status": "PASS",
+      "message": "C++20 runtime environment configured",
+      "details": {
+        "compiler": "GCC 15.3.0",
+        "cppStandard": "C++20",
+        "rocmHipBackend": "enabled",
+        "xrtNpuBackend": "enabled"
+      }
+    },
+    {
+      "name": "gpu",
+      "status": "PASS",
+      "message": "Detected 1 accessible HIP device(s)",
+      "details": {
+        "device0_gcnArchName": "gfx1151:xnack-",
+        "device0_multiProcessorCount": "40",
+        "device0_name": "AMD Radeon Graphics",
+        "device0_totalGlobalMem": "137438953472",
+        "deviceCount": "1"
+      }
+    },
+    {
+      "name": "npu",
+      "status": "PASS",
+      "message": "Detected 1 accessible XRT device(s)",
+      "details": {
+        "npu0_name": "AMD XDNA2 NPU",
+        "xrtDeviceCount": "1"
+      }
+    }
+  ],
+  "warnings": [],
+  "errors": []
+}

@@ -3,6 +3,7 @@ project(strix LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+include_directories(${CMAKE_SOURCE_DIR})
 
 # ROCm/HIP GPU backend — compiled natively for the Strix Halo gfx1151 target.
 option(ENGINE_ENABLE_HIP "Build strix with ROCm/HIP GPU backend" OFF)
@@ -83,7 +84,25 @@ if (ENGINE_ENABLE_XRT)
   target_link_libraries(strix PRIVATE ${XRT_COREUTIL_LIB})
 endif()
 
+add_library(strix_diagnostics STATIC
+  src/core/diagnostics/report.cpp
+  src/cli/diagnose.cpp
+)
+target_include_directories(strix_diagnostics PUBLIC ${CMAKE_SOURCE_DIR})
+
+if (ENGINE_ENABLE_HIP)
+  target_compile_definitions(strix_diagnostics PRIVATE ENGINE_ENABLE_HIP=1)
+  target_link_libraries(strix_diagnostics PRIVATE hip::host roc::hipblas roc::rocblas)
+endif()
+
+if (ENGINE_ENABLE_XRT)
+  target_compile_definitions(strix_diagnostics PRIVATE ENGINE_ENABLE_XRT=1)
+  target_include_directories(strix_diagnostics PRIVATE ${XRT_INCLUDE_DIR})
+  target_link_libraries(strix_diagnostics PRIVATE ${XRT_COREUTIL_LIB})
+endif()
+
 add_executable(strix-server src/server/main.cpp)
+target_link_libraries(strix-server PRIVATE strix_diagnostics)
 
 install(TARGETS strix strix-server DESTINATION bin)
 
@@ -96,6 +115,18 @@ if (BUILD_TESTING)
 
   add_test(NAME strix_server_help COMMAND strix-server --help)
   set_tests_properties(strix_server_help PROPERTIES LABELS "cpu")
+
+  add_test(NAME strix_server_diagnose_help COMMAND strix-server diagnose --help)
+  set_tests_properties(strix_server_diagnose_help PROPERTIES LABELS "cpu")
+
+  add_test(NAME strix_server_diagnose_json COMMAND strix-server diagnose --json)
+  set_tests_properties(strix_server_diagnose_json PROPERTIES LABELS "cpu")
+
+  add_executable(diagnose_cli_test tests/diagnostics/diagnose_cli_test.cpp)
+  target_link_libraries(diagnose_cli_test PRIVATE strix_diagnostics)
+
+  add_test(NAME diagnose_cli_test COMMAND diagnose_cli_test)
+  set_tests_properties(diagnose_cli_test PROPERTIES LABELS "cpu;diagnostics;cli")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)

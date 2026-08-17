@@ -14,9 +14,13 @@ Checks: >
   -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
   -cppcoreguidelines-pro-type-vararg,
   -cppcoreguidelines-avoid-magic-numbers,
+  -cppcoreguidelines-init-variables,
   -readability-magic-numbers,
+  -readability-identifier-length,
   -readability-function-cognitive-complexity,
+  -readability-use-concise-preprocessor-directives,
   -modernize-use-trailing-return-type,
+  -modernize-raw-string-literal,
   -misc-include-cleaner,
   -misc-use-anonymous-namespace
 

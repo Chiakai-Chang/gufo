@@ -22,10 +22,12 @@ contain a second inference path.
 strix-server serve
 strix-server chat
 strix-server prompt
+strix-server diagnose
 ```
 
 `serve` starts the OpenAI-compatible server. `chat` maintains an interactive
-conversation. `prompt` executes one request and exits.
+conversation. `prompt` executes one request and exits. `diagnose` runs
+non-interactive system and hardware diagnostics.
 
 All commands support `--help` and `--version`. Unknown options and invalid
 combinations return an error instead of being ignored.
@@ -246,8 +248,44 @@ Direct mode reports:
 - Prefix-cache and graph hits.
 - Speculative acceptance statistics when applicable.
 
-Diagnostics must not print bearer tokens, hidden configuration secrets, or
-prompt content unless an explicit unsafe debug option is supplied.
+## System Diagnostics
+
+`strix-server diagnose` executes non-interactive platform, system, toolchain,
+GPU, and NPU diagnostics without starting a server or loading a model:
+
+```bash
+strix-server diagnose
+strix-server diagnose --json
+```
+
+### JSON Output Schema (v1.0.0)
+
+When `--json` is supplied, `diagnose` emits structured JSON output to stdout:
+
+```json
+{
+  "schemaVersion": "1.0.0",
+  "engineRevision": "0.1.0",
+  "timestamp": "2026-08-17T20:00:00Z",
+  "status": "PASS",
+  "checks": [
+    {
+      "name": "platform",
+      "status": "PASS",
+      "message": "Supported architecture: Linux x86-64",
+      "details": {
+        "targetArchitecture": "x86_64-linux"
+      }
+    }
+  ],
+  "warnings": [],
+  "errors": []
+}
+```
+
+The top-level `status` reflects overall health: `PASS` when all checks pass,
+`WARN` when non-fatal hardware/device warnings exist, and `FAIL` when a critical
+platform/system failure occurs.
 
 ## Conversation Files
 
