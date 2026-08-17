@@ -41,8 +41,10 @@ planned production platform. Windows, macOS, and CUDA are out of scope.
 Build with Nix only; direct host builds are unsupported:
 
 ```sh
-nix build
-./result/bin/strix
+nix build                          # build default package (gfx1151 + XRT)
+./result/bin/strix                 # run hardware probe
+./result/bin/strix-server          # run server
+nix build .#checks.x86_64-linux.pr # canonical PR test command (all gates)
 ```
 
 ## Development Presets

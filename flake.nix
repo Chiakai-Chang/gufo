@@ -122,6 +122,83 @@
             python3 tools/check-docs.py --root "$src"
             echo "PASS: Documentation check clean" > $out/result.txt
           '';
+
+          # Canonical Milestone 0 PR umbrella check
+          pr = pkgsSys.runCommand "check-pr" {
+            nativeBuildInputs = [
+              pkgsSys.stdenv.cc
+              pkgsSys.clang-tools
+              pkgsSys.cmake
+              pkgsSys.ninja
+              pkgsSys.python3
+            ];
+            src = self;
+          } ''
+            export HOME=$TMPDIR
+            set -euo pipefail
+
+            echo "=== [PR Gate 1/7] Format Validation (clang-format) ==="
+            cd "$src"
+            clang-format --dry-run --Werror src/main.cpp src/server/main.cpp
+            echo "PASS: Formatting check clean"
+
+            echo "=== [PR Gate 2/7] Static Analysis (clang-tidy) ==="
+            mkdir -p "$TMPDIR/build-static" && cd "$TMPDIR/build-static"
+            cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF -DENGINE_ENABLE_XRT=OFF
+            clang-tidy -p . "$src"/src/main.cpp "$src"/src/server/main.cpp
+            echo "PASS: Static analysis clean"
+
+            echo "=== [PR Gate 3/7] Dependency and License Inventory Consistency ==="
+            cd "$src"
+            python3 tools/check-dependencies.py --notices "$src"/THIRD_PARTY_NOTICES.md --package-nix "$src"/.devops/nix/package.nix
+            echo "PASS: Dependency inventory consistent"
+
+            echo "=== [PR Gate 4/7] Documentation and Local Link Validation ==="
+            python3 tools/check-docs.py --root "$src"
+            echo "PASS: Documentation links and syntax valid"
+
+            echo "=== [PR Gate 5/7] Build and CTest Test Suites ==="
+            mkdir -p "$TMPDIR/build-test" && cd "$TMPDIR/build-test"
+            cmake "$src" -GNinja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DSTRIX_ENABLE_WARNINGS=ON -DSTRIX_ENABLE_SANITIZERS=OFF
+            ninja
+            ctest --output-on-failure
+            echo "PASS: CTest test suite passed"
+
+            echo "=== [PR Gate 6/7] Anti-CUDA Boundary Scanner ==="
+            python3 "$src"/tools/check-no-cuda.py \
+              --source "$src"/src \
+              --source "$src"/models \
+              --source "$src"/CMakeLists.txt \
+              --binary "${self.packages.${system}.default}/bin/strix" \
+              --binary "${self.packages.${system}.default}/bin/strix-server" \
+              --self-test "$src"/tests/static/fixtures
+            echo "PASS: Anti-CUDA boundary scan clean"
+
+            echo "=== [PR Gate 7/7] Installed strix-server --version & --help Smoke ==="
+            "${self.packages.${system}.default}/bin/strix-server" --version
+            "${self.packages.${system}.default}/bin/strix-server" --help
+            echo "PASS: strix-server CLI version and help smoke passed"
+
+            mkdir -p $out/bin
+            cp "${self.packages.${system}.default}/bin/strix" $out/bin/strix
+            cp "${self.packages.${system}.default}/bin/strix-server" $out/bin/strix-server
+
+            cat <<EOF > $out/pr-summary.txt
+PR Check Summary
+Status: ALL GATES PASSED
+Package: ${self.packages.${system}.default.name}
+Revision: ${version}
+System: ${system}
+Composed Gates:
+  1. Format Validation (clang-format)
+  2. Static Analysis (clang-tidy)
+  3. Dependency and License Inventory (THIRD_PARTY_NOTICES.md)
+  4. Documentation & Local Link Validation (check-docs.py)
+  5. CTest Test Suites (CPU & Static Tests)
+  6. Anti-CUDA Boundary Scan (Sources & Binaries)
+  7. Installed strix-server CLI Smoke (--version, --help)
+EOF
+          '';
         }
       );
     };

@@ -5,14 +5,16 @@
 Linux x86-64 on AMD Strix Halo (`gfx1151` GPU and XDNA2 NPU) is the only
 supported production target.
 
-## Build (Nix)
+## Build & Test (Nix)
 
-Build with Nix only. Direct host builds and Makefiles are unsupported.
+Build and test with Nix only. Direct host builds and Makefiles are unsupported.
 
 ```sh
-nix build           # build
-./result/bin/strix  # run
-nix develop         # dev shell
+nix build                          # build default package (gfx1151 + XRT)
+./result/bin/strix                 # run hardware probe
+./result/bin/strix-server          # run server
+nix build .#checks.x86_64-linux.pr # canonical PR test command (all gates)
+nix develop                        # dev shell
 ```
 
 - `git add` before `nix build` — Nix sees only tracked files.

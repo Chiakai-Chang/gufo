@@ -501,3 +501,21 @@ When a regression is found:
 If a kernel optimization fails logits, state, or quality gates, revert the
 candidate behavior and keep the reproducer. A speedup is not partial credit for
 incorrect inference.
+
+## Canonical PR Test Command
+
+The canonical PR test command composes all Milestone 0 gates:
+
+```sh
+nix build .#checks.x86_64-linux.pr
+```
+
+This single command executes:
+1. Format validation with `clang-format` in dry-run error mode.
+2. Static analysis with `clang-tidy` against the compilation database.
+3. Dependency inventory consistency against `THIRD_PARTY_NOTICES.md`.
+4. Documentation, local links, anchors, and fenced JSON syntax validation.
+5. CTest test suite execution.
+6. Anti-CUDA boundary scans over sources, headers, compile commands, libraries, and symbols.
+7. Installed `strix-server --version` and `--help` smoke execution.
+
