@@ -137,14 +137,12 @@ if (BUILD_TESTING)
   set_tests_properties(diagnose_cli_test PROPERTIES LABELS "cpu;diagnostics;cli")
 
   add_executable(system_inventory_test tests/diagnostics/system_inventory_test.cpp)
-  target_compile_definitions(system_inventory_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics/sysfs")
   target_link_libraries(system_inventory_test PRIVATE strix_diagnostics)
 
   add_test(NAME system_inventory_test COMMAND system_inventory_test)
   set_tests_properties(system_inventory_test PROPERTIES LABELS "cpu;diagnostics;inventory;compatibility")
 
   add_executable(fingerprint_test tests/diagnostics/fingerprint_test.cpp)
-  target_compile_definitions(fingerprint_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
   target_link_libraries(fingerprint_test PRIVATE strix_diagnostics)
 
   add_test(NAME fingerprint_test COMMAND fingerprint_test)

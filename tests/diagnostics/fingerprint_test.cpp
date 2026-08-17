@@ -1,8 +1,6 @@
 #include "src/core/diagnostics/fingerprint.h"
 
-#include <array>
 #include <cstdlib>
-#include <filesystem>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -19,25 +17,6 @@ void Expect(bool condition, std::string_view msg) {
   }
 }
 
-std::filesystem::path FindFixturesRoot() {
-#ifdef TEST_FIXTURES_DIR
-  if (std::filesystem::exists(TEST_FIXTURES_DIR)) {
-    return TEST_FIXTURES_DIR;
-  }
-#endif
-  const std::array<std::filesystem::path, 3> paths = {
-      "tests/fixtures/diagnostics",
-      "../tests/fixtures/diagnostics",
-      "../../tests/fixtures/diagnostics",
-  };
-  for (const auto& path : paths) {
-    if (std::filesystem::exists(path)) {
-      return path;
-    }
-  }
-  return "tests/fixtures/diagnostics";
-}
-
 void TestSha256Implementation() {
   const std::string input = "hello world";
   const std::string hash = strix::diagnostics::ComputeSha256Hex(input);
@@ -48,15 +27,15 @@ void TestSha256Implementation() {
 
 void TestCanonicalJsonAndStability() {
   strix::diagnostics::CanonicalFingerprint fp1;
-  fp1.cpu_model = "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S";
+  fp1.cpu_model = "Generic AMD Strix Halo APU";
   fp1.cpu_logical_cores = 32;
   fp1.cpu_physical_cores = 16;
-  fp1.gpu_name = "AMD Radeon 8060S Graphics";
+  fp1.gpu_name = "Generic Radeon Graphics";
   fp1.gpu_architecture = "gfx1151";
   fp1.gpu_compute_units = 40;
-  fp1.npu_identity = "AMD XDNA2 NPU";
+  fp1.npu_identity = "Generic XDNA2 NPU";
   fp1.npu_architecture = "XDNA2";
-  fp1.kernel_release = "7.1.8";
+  fp1.kernel_release = "6.14.0";
 
   const std::string id1 = fp1.ComputeFingerprintId();
   Expect(id1.size() == 64, "Fingerprint ID is 64 hex characters");
@@ -88,18 +67,23 @@ void TestPrivacyRedaction() {
          "No sensitive data in human text");
 }
 
-void TestArtifactValidatorGolden() {
-  const auto golden_path = FindFixturesRoot() / "fingerprint_v1.json";
-  const auto result = strix::diagnostics::ValidateArtifactFile(golden_path);
-  if (!result.is_valid) {
-    for (const auto& err : result.errors) {
-      std::cerr << "Golden validation error: " << err << "\n";
-    }
-  }
-  Expect(result.is_valid, "Golden fingerprint_v1.json passes validation");
-  Expect(result.errors.empty(), "Zero errors on golden fixture");
+void TestArtifactValidatorWithValidFingerprint() {
+  strix::diagnostics::SystemInventory mock_inv;
+  mock_inv.cpu.architecture = "x86_64";
+  mock_inv.cpu.logical_cores = 32;
+  mock_inv.cpu.physical_cores = 16;
+  mock_inv.gpu.architecture = "gfx1151";
+  mock_inv.gpu.compute_units = 40;
+  mock_inv.npu.architecture = "XDNA2";
+
+  const auto fp = strix::diagnostics::GenerateMachineFingerprint(mock_inv);
+  const std::string json = fp.ToJson();
+
+  const auto result = strix::diagnostics::ValidateArtifactContent(json);
+  Expect(result.is_valid, "Valid generated fingerprint passes validation");
+  Expect(result.errors.empty(), "Zero errors on valid artifact");
   Expect(result.schema_version == "1.0.0", "Schema version is 1.0.0");
-  Expect(!result.fingerprint_id.empty(), "Fingerprint ID is present");
+  Expect(result.fingerprint_id == fp.fingerprint_id, "Fingerprint ID matches");
 }
 
 void TestArtifactValidatorRejections() {
@@ -124,25 +108,25 @@ void TestArtifactValidatorRejections() {
       "    \"cppStandard\": \"C++20\",\n"
       "    \"cpuArchitecture\": \"x86_64\",\n"
       "    \"cpuLogicalCores\": 32,\n"
-      "    \"cpuModel\": \"AMD RYZEN AI MAX+ 395 w/ Radeon 8060S\",\n"
+      "    \"cpuModel\": \"Generic Strix Halo CPU\",\n"
       "    \"cpuPhysicalCores\": 16,\n"
-      "    \"cxxCompiler\": \"GCC 15.3.0\",\n"
+      "    \"cxxCompiler\": \"GCC 15.0.0\",\n"
       "    \"gpuArchitecture\": \"gfx1151\",\n"
       "    \"gpuComputeUnits\": 40,\n"
       "    \"gpuDriver\": \"amdgpu\",\n"
-      "    \"gpuName\": \"AMD Radeon 8060S Graphics\",\n"
+      "    \"gpuName\": \"Generic GPU\",\n"
       "    \"gpuPciId\": \"1002:1586\",\n"
-      "    \"kernelRelease\": \"7.1.8\",\n"
+      "    \"kernelRelease\": \"6.14.0\",\n"
       "    \"memoryTotalBytes\": 134309888000,\n"
       "    \"memoryType\": \"LPDDR5X (Unified)\",\n"
       "    \"npuArchitecture\": \"XDNA2\",\n"
       "    \"npuDriver\": \"amdxdna\",\n"
-      "    \"npuFirmwareVersion\": \"npu.sbin (1.1.2.64/65)\",\n"
+      "    \"npuFirmwareVersion\": \"npu.sbin\",\n"
       "    \"npuIdentity\": \"AMD XDNA2 NPU\",\n"
       "    \"npuPciId\": \"1022:17f0\",\n"
-      "    \"rocmVersion\": \"7.2.3\",\n"
+      "    \"rocmVersion\": \"7.0.0\",\n"
       "    \"schemaVersion\": \"1.0.0\",\n"
-      "    \"xrtCommit\": \"8661761775a266b11992a3bd6eb08209d88aa845\"\n"
+      "    \"xrtCommit\": \"abcdef0123456789\"\n"
       "  }\n"
       "}";
   const auto mismatch_res =
@@ -169,7 +153,7 @@ int main() {
   TestSha256Implementation();
   TestCanonicalJsonAndStability();
   TestPrivacyRedaction();
-  TestArtifactValidatorGolden();
+  TestArtifactValidatorWithValidFingerprint();
   TestArtifactValidatorRejections();
 
   std::cout << "All machine fingerprint & artifact validator tests passed "
