@@ -16,3 +16,7 @@ nix develop         # dev shell
 ```
 
 - `git add` before `nix build` — Nix sees only tracked files.
+
+## Development
+
+- Use `gh` CLI to retrieve and update issues content. Verify if installed and configured with `gh auth status`, and use it unless the user explicitly says otherwise.
