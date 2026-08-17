@@ -77,9 +77,18 @@ teacher + candidate perplexity.
 
 ### Position count
 
-`positions` in a report equals the total number of scored next-token
-positions across all suite prompts (74 for the Qwen3.5-0.8B teacher suite).
-KL aggregates are computed over positions, not prompts.
+`positions` in a report equals the total number of scored next-token positions
+across all suite prompts. The current Qwen3.5-0.8B teacher results contain 78
+positions. The committed suite identity is:
+
+```text
+tools/suites/teacher.json
+sha256: b33862883e78e7500cc8553cffe68ec8c44ca5ac1ceca8cbccb3070f6d42b131
+```
+
+KL aggregates are computed over positions, not prompts. A changed suite hash or
+position count creates a new benchmark identity and must not be compared as the
+same run.
 
 ### Per-layer breakdown (planned)
 
@@ -88,8 +97,10 @@ position, aggregated model-wide. It does not isolate which layer or tensor
 contributes the KL tail. Per-layer and per-tensor attribution (layer-output
 error, per-layer KL, first-divergent-layer search) is a planned refinement;
 `strix-quantize.py` already records per-tensor reconstruction stats, and
-`docs/TESTING.md` T3 documents layer-boundary capture. A per-layer quality
-gate will be added before the imatrix/GPTQ scale-search milestone.
+`docs/TESTING.md` T3 documents layer-boundary capture. Imatrix search was
+implemented before this planned prerequisite; per-layer attribution is now a
+required catch-up gate before selecting the Qwen3.8-27B production recipe or
+promoting native quantized kernels.
 
 ## Speed method (CPU reference runtime)
 

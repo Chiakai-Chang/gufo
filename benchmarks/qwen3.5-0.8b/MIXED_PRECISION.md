@@ -4,6 +4,11 @@ Status: 2026-08-13. Compares SHQ-T16 mixed-precision recipes against the
 bf16 teacher, same matched-token suite as the base benchmark. Same source
 revision, tokenizer, imatrix (`artifacts/calib`, 666-token disjoint set).
 
+Teacher suite: 78 scored positions, SHA-256
+`b33862883e78e7500cc8553cffe68ec8c44ca5ac1ceca8cbccb3070f6d42b131`.
+Calibration suite SHA-256:
+`f1314e80685482cd80c99a6093054ce44ec2b326fa2edc7c87065dc249a1b37e`.
+
 Recipes are per-tensor tiers (never per-block). Tiers used:
 
 | encoding | bpw | role |

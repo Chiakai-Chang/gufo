@@ -1,39 +1,52 @@
 # Implementation Roadmap
 
-Status: initial roadmap, 2026-08-11
+Status: active roadmap, updated 2026-08-17
+
+Live decisions and the current implementation boundary are recorded in
+[Project Status and Decisions](PROJECT_STATUS.md). GitHub issues and one GitHub
+Project track execution; this document defines ordering and exit criteria.
 
 ## Objective
 
 Build Strix-Halo.cpp incrementally from a deterministic, testable vertical slice.
-Do not begin with the complete server, both models, continuous batching, and
-heterogeneous execution simultaneously.
+Do not begin with the complete server, continuous batching, and heterogeneous
+execution simultaneously.
+
+Qwen3.5-0.8B is the rapid-iteration and correctness fixture. Qwen3.8-27B is the
+first production model. Both use curated compiled model kinds over shared
+runtime primitives; model dimensions, kernels, tuning, and acceptance records
+remain explicit rather than inferred by a general architecture loader.
 
 The first useful system is:
 
 ```text
 safetensors source
-    -> validated conversion
-    -> one compiled Qwen implementation
+    -> validated text-only conversion
+    -> compiled Qwen3.5/Qwen3.8 implementation family
     -> GPU-only greedy inference
     -> terminal prompt
-    -> full-logit and performance report
+    -> exact-token, full-logit, and performance report
 ```
 
 This path establishes the model contract, tensor orientation, tokenizer, KV
 state, numerical oracle, kernel interfaces, and performance baseline required
 by later work.
 
-An independent early NPU feasibility track validates XRT, AIE programs, and
-shared allocations before the common weight layout is frozen.
+An independent early NPU feasibility track validates XRT, AIE programs,
+XRT-BO/dma-buf import into HIP, explicit ownership transfer, and sustained
+concurrent operation before the common weight layout is frozen. Its evidence
+and probe matrix are recorded in [NPU_RESEARCH.md](NPU_RESEARCH.md).
 
 ## Delivery Rules
 
-- Implement one model first.
-- Make single-request direct execution correct before adding HTTP.
+- Use Qwen3.5-0.8B for fast iteration and Qwen3.8-27B for production acceptance.
+- Make single-request direct greedy execution correct before adding sampling,
+  interactive chat, or HTTP.
 - Make the GPU path correct before depending on the NPU.
 - Establish CPU and full-quality oracles before optimizing kernels.
-- Keep numerical source and tuning private to each model implementation.
-- Freeze a binary format only after CPU, GPU, and NPU conformance tests exist.
+- Keep numerical source and tuning private to each curated model kind.
+- Treat current SHQ bytes as a candidate contract; freeze v1 only after CPU,
+  GPU, AIE, and malformed-artifact conformance gates pass.
 - Retain a performance change only when the end-to-end workload improves.
 - Every milestone leaves the repository in a runnable and testable state.
 
@@ -60,7 +73,11 @@ src/
   server/
   cli/
 models/
-  qwen36_27b/
+  qwen35_08b/
+    cpu/
+    gpu/gfx1151/
+    npu/aie2p/
+  qwen38_27b/
     cpu/
     gpu/gfx1151/
     npu/aie2p/
@@ -111,7 +128,8 @@ docs/
 6. Create small high-precision CPU operator oracles.
 7. Build the full-quality teacher-logit capture workflow.
 8. Define the versioned logit artifact and matched-token comparison runner.
-9. Add the initial SHQ4-T16 and SHQ8-T16 byte-exact conformance vectors.
+9. Add the initial SHQ4-T16, SHQ6-T16, and SHQ8-T16 byte-exact conformance
+   vectors.
 10. Commit the capability evaluation suite with provenance and extraction
     fixtures (EVAL.md).
 
@@ -139,26 +157,37 @@ complete model.
 ### NPU track
 
 1. Compile and execute a minimal model-private AIE2P program through XRT.
-2. Implement W4A8 and W8A8 GEMM microbenchmarks.
-3. Validate the T16 microtile ordering and scale epilogues.
-4. Test the required row and column shape buckets.
-5. Measure context creation, program load, command submission, DMA, and
+2. Implement W4A8, W8A8, and BF16 GEMM microbenchmarks.
+3. Measure large/high-arithmetic-intensity GEMM and batch-1 GEMV separately;
+   do not infer decode performance from GEMM TOPS.
+4. Validate the T16 microtile ordering and scale epilogues.
+5. Test a small set of reusable row/column shape buckets and record the cost of
+   program/configuration changes.
+6. Measure context creation, program load, command submission, DMA overlap, and
    completion overhead.
 
 ### Shared-allocation track
 
-1. Attempt direct CPU/GPU/NPU access to one broker-owned allocation.
-2. Validate explicit producer/consumer ordering and cache visibility.
-3. Measure simultaneous GPU and NPU reads.
-4. Test lossless backend views and explicit-copy fallback tiers.
-5. Decide whether one-copy heterogeneous operators are viable.
+1. Allocate an XRT BO, export its DRM PRIME/dma-buf FD, and attempt import and
+   mapping through HIP external memory on gfx1151.
+2. Alternate HIP and NPU producer/consumer access with explicit completion waits
+   and required cache maintenance; do not depend on implicit dma-buf fencing.
+3. Stress full- and partial-range handoffs over multiple allocation sizes for at
+   least 10,000 iterations.
+4. Measure one-way ownership-transition latency without copying payload bytes.
+5. Measure immutable simultaneous GPU/NPU reads.
+6. Run sustained ROCm+XDNA2 concurrent load and record firmware stalls, resets,
+   corruption, bandwidth contention, and decode-latency impact.
+7. Test lossless backend views and explicit-copy fallback tiers.
+8. Decide whether one-copy heterogeneous operators are viable.
 
 ### Exit criteria
 
 - CPU, HIP, and AIE results agree under their declared numerical contracts.
 - The common layout has measured results on both accelerators.
 - The memory interoperability tier is selected from evidence.
-- SHQ-T16 v1 is either frozen or revised before model conversion depends on it.
+- The SHQ candidate is frozen as v1 or revised before published artifacts depend
+  on long-term compatibility.
 - Unstable or slower NPU paths remain disabled rather than blocking GPU work.
 
 ## Milestone 4: Qwen GPU-Only Vertical Slice
@@ -180,9 +209,10 @@ complete model.
 5. Implement request-owned model and sampling state.
 6. Implement the capability evaluation drift gate, trace format, and offline
    regrade (EVAL.md).
-7. Implement `strix-server prompt` in direct mode.
-8. Implement `strix-server chat` in direct mode.
-9. Add eager execution first; add HIP graphs only after correctness.
+7. Implement `strix-server prompt` in direct greedy mode.
+8. Add exact-token fixtures comparing the native CLI with the pinned reference.
+9. Add sampling and `strix-server chat` only after the greedy slice passes.
+10. Add eager execution first; add HIP graphs only after correctness.
 
 Start with BF16 or SHQ8 where it simplifies bring-up, then introduce SHQ4
 tensor by tensor. Do not debug every low-bit kernel simultaneously.
@@ -203,8 +233,9 @@ tensor by tensor. Do not debug every low-bit kernel simultaneously.
 1. Implement `strix-inspect`.
 2. Implement deterministic imatrix and activation calibration.
 3. Implement `strix-plan-quant`.
-4. Implement streaming, resumable SHQ4-T16 and SHQ8-T16 conversion.
-5. Implement mixed Q4/Q8/BF16 tensor selection.
+4. Implement streaming, resumable SHQ4-T16, SHQ6-T16, and SHQ8-T16
+   conversion.
+5. Implement mixed Q4/Q6/Q8/BF16 tensor selection.
 6. Search candidate recipes at a small number of explicit byte targets.
 7. Validate every candidate against teacher logits, perplexity, tasks, and
    hardware performance.
@@ -271,7 +302,7 @@ tensor by tensor. Do not debug every low-bit kernel simultaneously.
 ### Tasks
 
 1. Integrate Qwen-private AIE programs into the compiled server.
-2. Implement NPU prefill for promoted matrix shapes.
+2. Implement NPU prefill only for promoted reusable matrix-shape buckets.
 3. Add NPU SHQ4-T16 W4A8 and SHQ8-T16 W8A8 paths.
 4. Implement activation packing and scale handling.
 5. Add shape-bucket selection based on columns actually assigned by
@@ -291,15 +322,18 @@ tensor by tensor. Do not debug every low-bit kernel simultaneously.
 
 ### Tasks
 
-1. Implement request-level GPU/NPU pipelining.
-2. Add bandwidth-pressure estimation.
+1. Implement request-level GPU/NPU pipelining, initially allowing NPU prefill
+   for one request while the GPU decodes another.
+2. Add bandwidth-pressure estimation and a protected GPU-decode budget.
 3. Add `NPU_ONLY`, `SPLIT_N`, `SPLIT_K_REDUCE`, and expert-parallel route
    experiments.
 4. Batch candidate verification and draft work before considering tensor
    splitting.
 5. Add explicit cross-device completion and reduction transactions.
 6. Measure concurrent prefill, decode, and verification under realistic load.
-7. Promote only route/shape combinations that improve end-to-end behavior.
+7. Run a sustained concurrency soak covering known `amdxdna` firmware-timeout
+   risks before enabling a production route.
+8. Promote only route/shape combinations that improve end-to-end behavior.
 
 ### Exit criteria
 
@@ -369,22 +403,23 @@ tensor by tensor. Do not debug every low-bit kernel simultaneously.
 - Published hashes match locally validated release artifacts.
 - Licensing, model redistribution, and attribution gates pass.
 
-## Deferred Work
+## Out of Scope and Deferred Work
 
-Do not place the following on the critical path for the first model:
+The following are out of scope rather than future compatibility goals:
 
-- General architecture loading.
 - Windows or macOS support.
 - CUDA compatibility.
+- General architecture loading.
+
+Do not place the following on the critical path for the first production model:
+
 - Arbitrary JIT kernels.
-- Packed Q5 or Q6 formats.
+- Packed Q5 formats.
 - Sub-four-bit production weights.
 - Multiple models resident by default.
+- Multimodal serving. The first Qwen3.8-27B artifact is explicitly text-only and
+  excludes the vision encoder; any later multimodal artifact is separate.
 - Speech, image, or video generation.
-
-Future modalities should begin only after the resource broker, scheduler,
-server lifecycle, and model-isolation rules are proven by the initial LLM
-release.
 
 ## First Backlog
 
@@ -398,11 +433,12 @@ The first concrete issues should be opened in this order:
 6. Implement safetensors inspection.
 7. Implement Qwen tokenizer conformance tests.
 8. Add teacher-logit artifact capture and comparison.
-9. Commit SHQ4-T16 and SHQ8-T16 conformance vectors.
+9. Commit SHQ4-T16, SHQ6-T16, and SHQ8-T16 conformance vectors.
 10. Implement Qwen-private HIP Q8 GEMV.
-11. Implement Qwen-private HIP Q4 GEMV.
-12. Implement AIE2P W8A8 and W4A8 microbenchmarks.
-13. Decide shared-allocation interoperability tier.
-14. Freeze or revise SHQ-T16 v1.
-15. Execute one Qwen layer from converted weights.
-16. Produce the first deterministic GPU-only terminal completion.
+11. Implement Qwen-private HIP Q4/SHQ6 decode kernels.
+12. Implement AIE2P W8A8, W4A8, and BF16 GEMM microbenchmarks.
+13. Prove or reject XRT-BO/dma-buf import into HIP with explicit handoffs.
+14. Decide the shared-allocation interoperability tier.
+15. Freeze or revise the SHQ candidate as SHQ-T16 v1.
+16. Execute one Qwen layer from converted weights.
+17. Produce the first deterministic GPU-only terminal completion.

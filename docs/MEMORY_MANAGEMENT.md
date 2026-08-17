@@ -74,22 +74,32 @@ The broker records:
 
 ## Interoperability Tiers
 
+The API evidence and validation matrix for GPU/NPU sharing are recorded in
+[XDNA2 GPU/NPU Interoperability Research](NPU_RESEARCH.md).
+
 Runtime probing selects one tier for each allocation class.
 
 ### Tier A: Direct shared allocation
 
 One allocation is legally and efficiently accessible by CPU, GPU, and NPU.
-Release/acquire synchronization establishes visibility without a whole-device
-barrier.
+Explicit producer completion plus required cache maintenance establishes
+visibility without copying payload bytes.
+
+The first candidate path is an XRT-owned BO exported as a DRM PRIME/dma-buf FD
+and imported into HIP external memory. The exact `amdxdna`/XRT to gfx1151/HIP
+combination is a measured platform capability, not an assumed API guarantee.
 
 Tier A is the required mode for:
 
 - One-copy shared weights.
 - GPU/NPU split execution of one operator.
-- Disjoint GPU/NPU writes into one output allocation.
+- Zero-copy request-stage handoff.
 
-Tier A is enabled only after startup probes validate access, coherency, and
-measured bandwidth.
+Tier A is enabled only after probes validate access, explicit ordering, cache
+visibility, sustained concurrency, and measured bandwidth. Immutable
+simultaneous reads may be promoted separately. Concurrent writes, including
+disjoint ranges, remain disabled until a dedicated safety gate proves their
+whole-BO fencing and cache behavior.
 
 ### Tier B: Shared source with backend views
 

@@ -12,10 +12,11 @@ not the intended serving representation. The quantizer searches for the best
 quality available within declared model-size, memory, and performance targets.
 
 The shared artifact family is provisionally named `SHQ-T16`. One artifact may
-contain `SHQ4-T16`, `SHQ8-T16`, and BF16 tensor encodings. The first normative
-encoding combines established AWQ/GPTQ-style UINT4 quantization with a physical
-tile layout that can be consumed by both gfx1151 and XDNA2 from one resident
-weight copy.
+contain `SHQ4-T16`, `SHQ6-T16`, `SHQ8-T16`, and BF16 tensor encodings. The
+current Python-produced layout is a candidate contract, not yet a frozen v1
+artifact ABI. It combines established AWQ/GPTQ-style quantization with a
+physical tile layout intended for consumption by gfx1151 and XDNA2 from one
+resident weight copy.
 
 These names describe deployment encodings, not new quantization algorithms.
 
@@ -85,9 +86,9 @@ Names use measured quantities rather than subjective quality labels. For
 example:
 
 ```text
-Qwen-27B-SHQ-T16-4.4bpw
-Qwen-27B-SHQ-T16-5.2bpw
-Qwen-27B-SHQ-T16-6.1bpw
+Qwen3.8-27B-Text-SHQ-T16-4.4bpw
+Qwen3.8-27B-Text-SHQ-T16-5.2bpw
+Qwen3.8-27B-Text-SHQ-T16-6.1bpw
 ```
 
 The displayed BPW is calculated from all encoded model tensor bytes divided by
@@ -112,7 +113,7 @@ natural Q5 matrix path; Q6 covers the intermediate tier).
 
 Sub-four-bit variants require a separately specified Q2 or Q3 tensor encoding
 and an efficient tile-local expansion path. They are later research and are not
-part of `SHQ-T16` v1.
+part of the current `SHQ-T16` candidate contract.
 
 ## SHQ4-T16 Tensor Encoding
 
@@ -175,15 +176,19 @@ independently.
 The byte layout is a design hypothesis until both backend microbenchmarks prove
 that it is acceptably close to their device-native layouts.
 
-## Normative SHQ4-T16 v1 Contract
+## Candidate SHQ4-T16 Contract
 
-The following rules define the first interoperable CPU, GPU, and NPU format.
-Implementations may use a lossless internal repack, but values produced by
-decoding this contract must not change.
+The following rules define the candidate interoperable CPU, GPU, and NPU
+format. They are normative for current experiments and conformance vectors, but
+portable artifact compatibility is not frozen. The contract becomes
+`SHQ4-T16 v1` only after the independent C++ parser, CPU decoder, HIP kernels,
+promoted AIE programs, and malformed-artifact tests pass. Implementations may
+use a lossless internal repack, but decoded values must agree throughout the
+candidate-validation period.
 
 ### Logical tensor
 
-SHQ4 v1 stores a logical rank-2 linear weight:
+The SHQ4 candidate stores a logical rank-2 linear weight:
 
 ```text
 W[N, K]
@@ -449,8 +454,9 @@ Effective size:             8.25 bits per weight
 ```
 
 The output-lane, K-subtile, padding, BF16 rounding, and alignment conventions
-match SHQ4-T16. A complete normative SHQ8 byte-offset and conformance-vector
-section must be added before its kernels are promoted.
+match SHQ4-T16. Complete candidate SHQ8 byte-offset and conformance-vector
+sections must be added before its kernels are promoted or the family is frozen
+as v1.
 
 ## SHQ6-T16 Tensor Encoding
 
@@ -492,6 +498,10 @@ Sixteen BF16 scales:         32 bytes
 Total:                       800 bytes for 1024 weights
 Effective size:            6.5625 bits per weight
 ```
+
+A complete candidate SHQ6 byte-offset, validation, and conformance-vector
+section is required before its kernels are promoted or the family is frozen as
+v1.
 
 Output-lane, K-subtile, padding, BF16 rounding, and alignment conventions
 match SHQ8/SHQ4. Conformance vectors cover the 4-per-3-byte bit packing and

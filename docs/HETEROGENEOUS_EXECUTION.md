@@ -17,6 +17,20 @@ The GPU and NPU share the same external memory bandwidth. Their peak compute
 figures must never be added without a workload-specific roofline and an
 end-to-end measurement.
 
+The full evidence record is in [XDNA2 GPU/NPU Interoperability
+Research](NPU_RESEARCH.md).
+
+Current evidence makes large, reusable GEMM shapes the first NPU target and
+batch-1 GEMV/decode a poor initial target. The primary concurrency hypothesis is
+NPU prefill for one request while the GPU protects decode for another. Per-layer
+GPU/NPU ping-pong is not an initial route.
+
+The exact XRT/`amdxdna` dma-buf to HIP/gfx1151 path is plausible from current
+kernel and runtime APIs but is not treated as a supported contract until the
+feasibility probes in this document pass. Current ROCm+XDNA2 firmware-timeout
+reports, including `amd/xdna-driver#1605`, require a sustained concurrency soak
+before production promotion.
+
 ## Execution Routes
 
 Every schedulable operation selects one route:
@@ -176,13 +190,33 @@ Unified physical memory does not remove the need for:
 - Stable buffer lifetimes.
 - Scheduler-visible ownership.
 
+The first Tier-A experiment uses an XRT-owned BO exported as a DRM
+PRIME/dma-buf FD and imported through HIP external memory. Public support for
+this exact XDNA2-to-gfx1151 combination is not assumed merely because both API
+halves exist.
+
 The allocation broker is backend-neutral. GPU and NPU executions depend on
 opaque completion tokens translated into native XRT or HIP completion
-primitives by the backend.
+primitives by the backend. Initial correctness uses explicit host-mediated
+handoffs:
+
+```text
+HIP producer -> HIP completion wait -> required BO/cache sync -> XRT submit
+XRT producer -> XRT completion wait -> required BO/cache sync -> HIP submit
+```
+
+`xrt::bo::sync()` is treated as cache/visibility maintenance where required,
+not as proof of execution ordering. Implicit amdgpu-to-amdxdna dma-buf fencing
+is not part of the correctness contract until independently demonstrated.
+
+Immutable simultaneous reads may be enabled after producer completion. Same-
+range writes are forbidden, and disjoint simultaneous writes remain disabled
+initially because reservation/fence and cache behavior may operate at whole-BO
+granularity.
 
 Avoid a CPU synchronization between every layer. A heterogeneous route should
-submit a complete operator, layer group, or speculative stage before crossing
-devices.
+submit a complete operator, layer group, prefill stage, or speculative stage
+before crossing devices.
 
 ## Bandwidth Policy
 
@@ -220,8 +254,12 @@ Microkernel speedup alone is insufficient.
 
 ## Tests
 
-- Shared-buffer write/read and disjoint writes.
-- GPU/NPU completion ordering.
+- Alternating shared-buffer HIP-write/NPU-read and NPU-write/HIP-read stress at
+  multiple sizes and partial ranges.
+- Explicit GPU/NPU completion ordering and cache visibility.
+- Immutable simultaneous reads; verify that concurrent writes remain rejected
+  until a separate safety gate passes.
+- Sustained ROCm+XDNA2 concurrency, firmware timeout, reset, and recovery.
 - Split-N versus unsplit output.
 - Split-K reduction accuracy.
 - Expert routing and weighted combination.

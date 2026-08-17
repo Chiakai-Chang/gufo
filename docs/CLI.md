@@ -258,7 +258,7 @@ raw KV data:
 {
   "format": "strix-conversation-v1",
   "model": "qwen-current-27b",
-  "chat_template_id": "qwen36-chat-v1",
+  "chat_template_id": "qwen38-chat-v1",
   "system": "You are concise.",
   "messages": [
     {"role": "user", "content": "Hello"},

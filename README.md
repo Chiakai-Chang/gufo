@@ -11,6 +11,40 @@ the hardware.
 Model-specific quantization, kernels, graph structure, scheduling policy, and
 memory layout will be extremely tailored for Strix Halo.
 
+## Current Status
+
+The native C++ executable is currently a HIP/XRT hardware probe, not yet an
+inference runtime. The implemented model work is the offline Python
+quantization and quality toolchain under `tools/`, including Qwen3.5-0.8B
+SHQ4/SHQ6/SHQ8 experiments.
+
+Qwen3.5-0.8B is the rapid-iteration model. Qwen3.8-27B is the first production
+model. The first production artifact and runtime capability are text-only; the
+vision encoder is excluded.
+
+The first native inference milestone is deterministic GPU-only greedy text
+generation from a terminal prompt. GPU/NPU interoperability and NPU prefill
+remain evidence-gated parallel work.
+
+See:
+
+- [Project status and decisions](docs/PROJECT_STATUS.md)
+- [Implementation roadmap](docs/ROADMAP.md)
+- [Offline tools](tools/README.md)
+- [Qwen3.5-0.8B benchmark](benchmarks/qwen3.5-0.8b/README.md)
+
+## Supported Platform
+
+Linux x86-64 on AMD Strix Halo (`gfx1151` GPU and XDNA2 NPU) is the only
+planned production platform. Windows, macOS, and CUDA are out of scope.
+
+Build through Nix:
+
+```sh
+nix build
+./result/bin/strix
+```
+
 ## Reference Projects
 
 The initial design is informed by the following open source projects:

@@ -11,6 +11,11 @@ Methodology: `docs/BENCHMARKS.md` (matched-token, per position; utilities
 
 Source: `Qwen/Qwen3.5-0.8B` @ `2fc06364715b967f1860aea9cf38778875588b17`, bf16.
 
+Teacher suite: `tools/suites/teacher.json`, 78 scored positions,
+SHA-256 `b33862883e78e7500cc8553cffe68ec8c44ca5ac1ceca8cbccb3070f6d42b131`.
+Calibration suite: `tools/suites/calib.json`, SHA-256
+`f1314e80685482cd80c99a6093054ce44ec2b326fa2edc7c87065dc249a1b37e`.
+
 Candidate: all LM linear projections (qkv/z/out/mlp/full-attn/mtp) quantized
 SHQ4-T16 U4Z G64; norms, embeddings, conv1d, vision kept bf16. 158 tensors
 quantized, 267 MB artifact.

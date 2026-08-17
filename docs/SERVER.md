@@ -65,7 +65,7 @@ memory_policy = "guaranteed"
 
 [[models]]
 alias = "qwen-current-27b"
-kind = "QWEN36_27B"
+kind = "QWEN38_27B_TEXT"
 weights = "/models/qwen-current/strix-manifest.json"
 enable_gpu = true
 enable_npu = true
@@ -81,6 +81,10 @@ enable_npu = true
 `kind` resolves through a closed compiled-in enum. The server verifies that the
 manifest, tensor inventory, dimensions, quantization, tokenizer, and state
 contract match that implementation.
+
+Qwen3.8-27B is the first production model; Qwen3.5-0.8B is the rapid-iteration
+fixture. The first production artifact is text-only, excludes the vision
+encoder, and rejects image/video input.
 
 Model artifacts cannot provide:
 

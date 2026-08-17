@@ -259,9 +259,37 @@ unchanged.
 Different quantized sizes of the same model reuse its private AIE program set
 when their tensors use supported SHQ4-T16, SHQ8-T16, or BF16 encodings.
 
+## Initial Feasibility Priorities
+
+The supporting API analysis, measurements, stability reports, and required
+probe matrix are recorded in [XDNA2 GPU/NPU Interoperability
+Research](NPU_RESEARCH.md).
+
+Current XRT and `amdxdna` expose DRM PRIME/dma-buf BO sharing, while HIP exposes
+Linux external-memory import. The first interoperability probe therefore uses
+an XRT-owned BO exported to HIP. This exact cross-driver combination is not a
+production guarantee until it passes access, explicit-ordering, cache-
+visibility, partial-range, and sustained-load tests on gfx1151/XDNA2.
+
+Initial synchronization is host-mediated and explicit. Do not depend on
+implicit dma-buf fences between amdgpu and `amdxdna`. Do not enable concurrent
+writes, even to disjoint ranges, in the first implementation.
+
+Public XDNA2 GEMM evidence favors large, high-arithmetic-intensity INT8 and BF16
+shapes. It also shows meaningful configuration and DMA-scheduling costs. The
+backend therefore compiles a small set of reusable shape buckets, overlaps DMA
+with compute, measures GEMV separately, and treats large prefill as the first
+model workload. Batch-1 decode remains GPU-owned unless later measurements
+reverse this decision.
+
+Sustained concurrent ROCm+XDNA2 testing is mandatory because current field
+reports include firmware command timeouts under combined load. A failed or
+unstable probe selects GPU-only operation rather than reducing server
+readiness.
+
 ## First Kernel Family
 
-The first custom numerical kernel is mixed W4A8 GEMM:
+The first custom quantized numerical kernel is mixed W4A8 GEMM:
 
 ```text
 A: dynamic INT8 rows

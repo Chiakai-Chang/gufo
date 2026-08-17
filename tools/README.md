@@ -33,8 +33,10 @@ tools/strix-capture.py --source artifacts/source \
 tools/strix-calibrate.py --source artifacts/source \
   --suite tools/suites/calib.json --out artifacts/calib
 
-# 4. quantize to a mixed-precision recipe (default embed_ffn: embed+ffn_down
-#   SHQ8, rest SHQ4 G64; see benchmarks/qwen3.5-0.8b/MIXED_PRECISION.md)
+# 4. quantize to a mixed-precision research recipe (tool default embed_ffn:
+#   embed+ffn_down SHQ8, rest SHQ4 G64). This is not the Qwen3.8 production
+#   default; that recipe remains unset until model-specific calibration and
+#   native kernel gates pass. See benchmarks/qwen3.5-0.8b/MIXED_PRECISION.md.
 #   --imatrix DIR enables importance-weighted SHQ4 scale search
 #   --recipe NAME selects a preset (bulk_g64/embed_only/embed_ffn/ffn_only/
 #   embed_attn/mirror_no_lin/unsloth_mirror/shq6_ffn/shq6_mirror/full_shq8)
@@ -59,7 +61,7 @@ tools/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --recon \
 ## Modules
 
 - `strix/safetensors.py` — safetensors validation + lazy read (Source Contract)
-- `strix/shq.py` — SHQ4-T16 / SHQ6-T16 / SHQ8-T16 quantize/pack/dequant (normative contract)
+- `strix/shq.py` — SHQ4-T16 / SHQ6-T16 / SHQ8-T16 quantize/pack/dequant (candidate contract; portable v1 not yet frozen)
 - `strix/conformance.py` — byte-exact conformance vectors (T1)
 - `strix/manifest.py` — source-manifest / quantization-plan writers
 - `strix/model.py` — Qwen3.5 teacher/candidate load + logit extraction
