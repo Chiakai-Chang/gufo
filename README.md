@@ -38,7 +38,7 @@ See:
 Linux x86-64 on AMD Strix Halo (`gfx1151` GPU and XDNA2 NPU) is the only
 planned production platform. Windows, macOS, and CUDA are out of scope.
 
-Build through Nix:
+Build with Nix only; direct host builds are unsupported:
 
 ```sh
 nix build

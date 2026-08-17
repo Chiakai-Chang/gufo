@@ -2,7 +2,7 @@
 id: M001-C001
 title: "Normalize the repository and MIT license baseline"
 milestone: M001
-status: planned
+status: done
 dependencies: []
 ---
 
@@ -39,10 +39,10 @@ Leave a clean, intentionally initialized source repository with the complete can
 
 ## Definition of Done
 
-- [ ] LICENSE contains the complete unmodified MIT grant, condition, and warranty disclaimer with the project copyright line.
-- [ ] README.md and AGENTS.md consistently state Linux x86-64/Strix Halo support and Nix-only build policy without advertising Makefile or direct host builds.
-- [ ] Generated CMake, Nix result, test-output, and model-artifact paths are ignored while source and fixture paths remain trackable.
-- [ ] The PR contains only repository/license baseline changes.
+- [x] LICENSE contains the complete unmodified MIT grant, condition, and warranty disclaimer with the project copyright line.
+- [x] README.md and AGENTS.md consistently state Linux x86-64/Strix Halo support and Nix-only build policy without advertising Makefile or direct host builds.
+- [x] Generated CMake, Nix result, test-output, and model-artifact paths are ignored while source and fixture paths remain trackable.
+- [x] The PR contains only repository/license baseline changes.
 
 ## Development Loop
 

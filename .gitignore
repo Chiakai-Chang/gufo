@@ -69,8 +69,10 @@ vcpkg_installed/
 # debug information files
 *.dwo
 
-# test output & cache
+# Test output & cache
 Testing/
+test-output/
+test-results/
 .cache/
 
 # Model artifacts, logit dumps, teacher captures (never commit weights/logits)
@@ -79,7 +81,16 @@ __pycache__/
 *.pyc
 
 # Sources
+# Temporary DS4 source trees and downloads
 ds4*
+
+# Keep intentional test fixtures trackable regardless of generated-file suffixes
+!fixtures/
+!fixtures/**
+!test/fixtures/
+!test/fixtures/**
+!tests/fixtures/
+!tests/fixtures/**
 
 # Agent helpers
 .codegraph

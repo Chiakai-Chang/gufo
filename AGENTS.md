@@ -1,8 +1,13 @@
 # AGENTS.md
 
+## Supported Platform
+
+Linux x86-64 on AMD Strix Halo (`gfx1151` GPU and XDNA2 NPU) is the only
+supported production target.
+
 ## Build (Nix)
 
-Build with Nix only. No Makefile.
+Build with Nix only. Direct host builds and Makefiles are unsupported.
 
 ```sh
 nix build           # build
