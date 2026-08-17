@@ -2,7 +2,7 @@
 id: M001-C002
 title: "Add project NOTICE and initial third-party inventory"
 milestone: M001
-status: planned
+status: done
 dependencies: [M001-C001]
 ---
 
@@ -40,11 +40,11 @@ Create reviewable NOTICE and THIRD_PARTY_NOTICES.md files that identify every de
 
 ## Definition of Done
 
-- [ ] NOTICE identifies Strix-Halo.cpp and points recipients to LICENSE and THIRD_PARTY_NOTICES.md.
-- [ ] THIRD_PARTY_NOTICES.md records at least name, upstream URL, pinned version/revision, component used, SPDX identifier, copyright/notice source, relationship (linked/copied/modified/system), and corresponding-source location for XRT, amd/xdna-driver shim, ROCm/HIP, hipBLAS, rocBLAS, and other shipped direct dependencies.
-- [ ] Apache-2.0 NOTICE obligations for the exact pinned XRT and XDNA sources are checked and applicable text is preserved rather than guessed.
-- [ ] The inventory distinguishes the system kernel driver and firmware from distributed userspace content.
-- [ ] The PR contains only notice/inventory documentation.
+- [x] NOTICE identifies Strix-Halo.cpp and points recipients to LICENSE and THIRD_PARTY_NOTICES.md.
+- [x] THIRD_PARTY_NOTICES.md records at least name, upstream URL, pinned version/revision, component used, SPDX identifier, copyright/notice source, relationship (linked/copied/modified/system), and corresponding-source location for XRT, amd/xdna-driver shim, ROCm/HIP, hipBLAS, rocBLAS, and other shipped direct dependencies.
+- [x] Apache-2.0 NOTICE obligations for the exact pinned XRT and XDNA sources are checked and applicable text is preserved rather than guessed.
+- [x] The inventory distinguishes the system kernel driver and firmware from distributed userspace content.
+- [x] The PR contains only notice/inventory documentation.
 
 ## Development Loop
 
