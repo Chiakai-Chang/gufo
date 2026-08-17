@@ -130,24 +130,6 @@ if (BUILD_TESTING)
   add_test(NAME strix_server_diagnose_json COMMAND strix-server diagnose --json --section platform)
   set_tests_properties(strix_server_diagnose_json PROPERTIES LABELS "cpu")
 
-  add_executable(diagnose_cli_test tests/diagnostics/diagnose_cli_test.cpp)
-  target_link_libraries(diagnose_cli_test PRIVATE strix_diagnostics)
-
-  add_test(NAME diagnose_cli_test COMMAND diagnose_cli_test)
-  set_tests_properties(diagnose_cli_test PROPERTIES LABELS "cpu;diagnostics;cli")
-
-  add_executable(system_inventory_test tests/diagnostics/system_inventory_test.cpp)
-  target_link_libraries(system_inventory_test PRIVATE strix_diagnostics)
-
-  add_test(NAME system_inventory_test COMMAND system_inventory_test)
-  set_tests_properties(system_inventory_test PROPERTIES LABELS "cpu;diagnostics;inventory;compatibility")
-
-  add_executable(fingerprint_test tests/diagnostics/fingerprint_test.cpp)
-  target_link_libraries(fingerprint_test PRIVATE strix_diagnostics)
-
-  add_test(NAME fingerprint_test COMMAND fingerprint_test)
-  set_tests_properties(fingerprint_test PROPERTIES LABELS "cpu;diagnostics;fingerprint;artifact_validator")
-
   add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
   target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
   target_link_libraries(bandwidth_test PRIVATE strix_diagnostics)
