@@ -69,11 +69,26 @@ stdenv.mkDerivation (finalAttrs: {
     runHook postInstall
   '';
 
+  passthru = {
+    inherit rocmPackages xrt xrt-plugin-amdxdna;
+    toolchain = {
+      targetPlatform = "x86_64-linux";
+      targetGpu = "gfx1151";
+      targetNpu = "XDNA2/AIE2P";
+      cxxCompiler = stdenv.cc.name;
+      rocmVersion = rocmPackages.clr.version;
+      hipClangVersion = rocmPackages.llvm.clang.version;
+      xrtCommit = xrt.src.rev;
+      xrtPluginCommit = xrt-plugin-amdxdna.src.rev;
+      xrtPluginVersion = xrt-plugin-amdxdna.pluginVersion;
+    };
+  };
+
   meta = with lib; {
     description = "Strix Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
     homepage = "https://github.com/";
     license = licenses.mit;
-    platforms = platforms.unix;
+    platforms = [ "x86_64-linux" ];
     mainProgram = "strix";
   };
 })

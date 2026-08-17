@@ -7,17 +7,19 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # ROCm/HIP GPU backend — compiled natively for the Strix Halo gfx1151 target.
 option(ENGINE_ENABLE_HIP "Build strix with ROCm/HIP GPU backend" OFF)
 
-# ROCM_PATH discovery (same convention as ggml's ggml-hip):
-#   $ROCM_PATH  -> /opt/rocm -> /usr
+# ROCm/HIP GPU discovery — compiled natively for the Strix Halo gfx1151 target.
+# Dependencies are supplied by the Nix environment via $ROCM_PATH.
+# Host ambient /usr fallbacks are rejected.
 if (NOT DEFINED ENV{ROCM_PATH})
   if (EXISTS /opt/rocm)
     set(ENV{ROCM_PATH} /opt/rocm)
-  else()
-    set(ENV{ROCM_PATH} /usr)
   endif()
 endif()
-list(APPEND CMAKE_PREFIX_PATH $ENV{ROCM_PATH})
-list(APPEND CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}/lib64/cmake")
+
+if (DEFINED ENV{ROCM_PATH})
+  list(APPEND CMAKE_PREFIX_PATH $ENV{ROCM_PATH})
+  list(APPEND CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}/lib64/cmake")
+endif()
 
 # Forward GPU_TARGETS (set by the nix package) to CMAKE_HIP_ARCHITECTURES.
 # e.g. -DGPU_TARGETS=gfx1151
@@ -41,12 +43,14 @@ option(ENGINE_ENABLE_XRT "Build strix with the XRT NPU shim" OFF)
 if (ENGINE_ENABLE_XRT)
   # XRT install prefix: $XRT_PATH or the default /opt/xilinx/xrt layout.
   find_path(XRT_INCLUDE_DIR xrt/experimental/xrt_system.h
-    PATHS "$ENV{XRT_PATH}/include" "/opt/xilinx/xrt/include")
+    PATHS "$ENV{XRT_PATH}/include" "/opt/xilinx/xrt/include"
+    NO_DEFAULT_PATH)
   find_library(XRT_COREUTIL_LIB xrt_coreutil
-    PATHS "$ENV{XRT_PATH}/lib" "/opt/xilinx/xrt/lib")
+    PATHS "$ENV{XRT_PATH}/lib" "/opt/xilinx/xrt/lib"
+    NO_DEFAULT_PATH)
 
   if (NOT XRT_INCLUDE_DIR OR NOT XRT_COREUTIL_LIB)
-    message(FATAL_ERROR "XRT not found (ENGINE_ENABLE_XRT=ON)")
+    message(FATAL_ERROR "XRT not found (ENGINE_ENABLE_XRT=ON). Please enter the Nix development environment (nix develop)")
   endif()
   message(STATUS "strix: XRT NPU shim enabled, include=${XRT_INCLUDE_DIR}")
 endif()
