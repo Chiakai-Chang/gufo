@@ -85,6 +85,9 @@ if (ENGINE_ENABLE_XRT)
 endif()
 
 add_library(strix_diagnostics STATIC
+  src/core/diagnostics/linux_sysfs.cpp
+  src/core/diagnostics/system_inventory.cpp
+  src/core/diagnostics/compatibility.cpp
   src/core/diagnostics/report.cpp
   src/cli/diagnose.cpp
 )
@@ -119,7 +122,7 @@ if (BUILD_TESTING)
   add_test(NAME strix_server_diagnose_help COMMAND strix-server diagnose --help)
   set_tests_properties(strix_server_diagnose_help PROPERTIES LABELS "cpu")
 
-  add_test(NAME strix_server_diagnose_json COMMAND strix-server diagnose --json)
+  add_test(NAME strix_server_diagnose_json COMMAND strix-server diagnose --json --section platform)
   set_tests_properties(strix_server_diagnose_json PROPERTIES LABELS "cpu")
 
   add_executable(diagnose_cli_test tests/diagnostics/diagnose_cli_test.cpp)
@@ -127,6 +130,13 @@ if (BUILD_TESTING)
 
   add_test(NAME diagnose_cli_test COMMAND diagnose_cli_test)
   set_tests_properties(diagnose_cli_test PROPERTIES LABELS "cpu;diagnostics;cli")
+
+  add_executable(system_inventory_test tests/diagnostics/system_inventory_test.cpp)
+  target_compile_definitions(system_inventory_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics/sysfs")
+  target_link_libraries(system_inventory_test PRIVATE strix_diagnostics)
+
+  add_test(NAME system_inventory_test COMMAND system_inventory_test)
+  set_tests_properties(system_inventory_test PROPERTIES LABELS "cpu;diagnostics;inventory;compatibility")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)

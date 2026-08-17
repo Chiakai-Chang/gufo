@@ -21,8 +21,10 @@ Checks: >
   -readability-use-concise-preprocessor-directives,
   -modernize-use-trailing-return-type,
   -modernize-raw-string-literal,
+  -modernize-avoid-c-arrays,
   -misc-include-cleaner,
-  -misc-use-anonymous-namespace
+  -misc-use-anonymous-namespace,
+  -misc-non-private-member-variables-in-classes
 
 WarningsAsErrors: '*'
 HeaderFilterRegex: 'src/.*'

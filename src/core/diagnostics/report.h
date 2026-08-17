@@ -3,9 +3,13 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "src/core/diagnostics/compatibility.h"
+#include "src/core/diagnostics/system_inventory.h"
 
 namespace strix::diagnostics {
 
@@ -34,6 +38,8 @@ public:
   void AddCheck(DiagnosticCheck check);
   void AddWarning(std::string_view warning);
   void AddError(std::string_view error);
+  void SetInventory(SystemInventory inventory);
+  void SetCompatibility(CompatibilityReport compatibility);
 
   [[nodiscard]] std::string_view SchemaVersion() const {
     return schema_version_;
@@ -52,6 +58,13 @@ public:
   [[nodiscard]] const std::vector<std::string>& Errors() const {
     return errors_;
   }
+  [[nodiscard]] const std::optional<SystemInventory>& Inventory() const {
+    return inventory_;
+  }
+  [[nodiscard]] const std::optional<CompatibilityReport>& Compatibility()
+      const {
+    return compatibility_;
+  }
 
   [[nodiscard]] std::string ToJson() const;
   [[nodiscard]] std::string ToHuman() const;
@@ -66,6 +79,8 @@ private:
   std::vector<DiagnosticCheck> checks_;
   std::vector<std::string> warnings_;
   std::vector<std::string> errors_;
+  std::optional<SystemInventory> inventory_;
+  std::optional<CompatibilityReport> compatibility_;
 };
 
 }  // namespace strix::diagnostics

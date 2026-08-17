@@ -22,8 +22,8 @@ std::string CurrentIso8601Utc() {
 
 std::string EscapeJson(std::string_view str) {
   std::ostringstream oss;
-  for (const char ch : str) {
-    switch (ch) {
+  for (const char character : str) {
+    switch (character) {
       case '"':
         oss << "\\\"";
         break;
@@ -46,11 +46,11 @@ std::string EscapeJson(std::string_view str) {
         oss << "\\t";
         break;
       default:
-        if (static_cast<unsigned char>(ch) < 0x20) {
+        if (static_cast<unsigned char>(character) < 0x20) {
           oss << "\\u" << std::hex << std::setw(4) << std::setfill('0')
-              << static_cast<int>(ch);
+              << static_cast<int>(character);
         } else {
-          oss << ch;
+          oss << character;
         }
         break;
     }
@@ -109,23 +109,36 @@ void DiagnosticReport::AddError(std::string_view error) {
   overall_status_ = DiagnosticStatus::kFail;
 }
 
+void DiagnosticReport::SetInventory(SystemInventory inventory) {
+  inventory_ = std::move(inventory);
+}
+
+void DiagnosticReport::SetCompatibility(CompatibilityReport compatibility) {
+  if (compatibility.overall_verdict == CompatibilityVerdict::kUnsupported) {
+    overall_status_ = DiagnosticStatus::kFail;
+  }
+  compatibility_ = std::move(compatibility);
+}
+
 void DiagnosticReport::RecomputeStatus() {
-  DiagnosticStatus st = DiagnosticStatus::kPass;
+  DiagnosticStatus overall_st = DiagnosticStatus::kPass;
   for (const auto& check : checks_) {
     if (check.status == DiagnosticStatus::kFail) {
-      st = DiagnosticStatus::kFail;
+      overall_st = DiagnosticStatus::kFail;
       break;
     }
     if (check.status == DiagnosticStatus::kWarn) {
-      st = DiagnosticStatus::kWarn;
+      overall_st = DiagnosticStatus::kWarn;
     }
   }
-  if (!errors_.empty()) {
-    st = DiagnosticStatus::kFail;
-  } else if (!warnings_.empty() && st == DiagnosticStatus::kPass) {
-    st = DiagnosticStatus::kWarn;
+  if (!errors_.empty() ||
+      (compatibility_ &&
+       compatibility_->overall_verdict == CompatibilityVerdict::kUnsupported)) {
+    overall_st = DiagnosticStatus::kFail;
+  } else if (!warnings_.empty() && overall_st == DiagnosticStatus::kPass) {
+    overall_st = DiagnosticStatus::kWarn;
   }
-  overall_status_ = st;
+  overall_status_ = overall_st;
 }
 
 std::string DiagnosticReport::ToJson() const {
@@ -136,22 +149,30 @@ std::string DiagnosticReport::ToJson() const {
   oss << "  \"timestamp\": \"" << EscapeJson(timestamp_) << "\",\n";
   oss << "  \"status\": \"" << ToString(overall_status_) << "\",\n";
 
+  if (inventory_) {
+    oss << "  \"inventory\": " << inventory_->ToJson() << ",\n";
+  }
+
+  if (compatibility_) {
+    oss << "  \"compatibility\": " << compatibility_->ToJson() << ",\n";
+  }
+
   // checks array
   oss << "  \"checks\": [\n";
   for (std::size_t i = 0; i < checks_.size(); ++i) {
-    const auto& c = checks_[i];
+    const auto& check_item = checks_[i];
     oss << "    {\n";
-    oss << "      \"name\": \"" << EscapeJson(c.name) << "\",\n";
-    oss << "      \"status\": \"" << ToString(c.status) << "\",\n";
-    oss << "      \"message\": \"" << EscapeJson(c.message) << "\",\n";
+    oss << "      \"name\": \"" << EscapeJson(check_item.name) << "\",\n";
+    oss << "      \"status\": \"" << ToString(check_item.status) << "\",\n";
+    oss << "      \"message\": \"" << EscapeJson(check_item.message) << "\",\n";
     oss << "      \"details\": {";
-    if (!c.details.empty()) {
+    if (!check_item.details.empty()) {
       oss << "\n";
       std::size_t detail_idx = 0;
-      for (const auto& [k, v] : c.details) {
-        oss << "        \"" << EscapeJson(k) << "\": \"" << EscapeJson(v)
+      for (const auto& [key, val] : check_item.details) {
+        oss << "        \"" << EscapeJson(key) << "\": \"" << EscapeJson(val)
             << "\"";
-        if (++detail_idx < c.details.size()) {
+        if (++detail_idx < check_item.details.size()) {
           oss << ",";
         }
         oss << "\n";
@@ -212,26 +233,34 @@ std::string DiagnosticReport::ToHuman() const {
   oss << "Timestamp       : " << timestamp_ << "\n";
   oss << "Overall Status  : [" << ToString(overall_status_) << "]\n\n";
 
+  if (inventory_) {
+    oss << inventory_->ToHuman() << "\n";
+  }
+
+  if (compatibility_) {
+    oss << compatibility_->ToHuman() << "\n";
+  }
+
   oss << "--- Checks ---\n";
   for (const auto& check : checks_) {
     oss << "  [" << ToString(check.status) << "] " << check.name << ": "
         << check.message << "\n";
-    for (const auto& [k, v] : check.details) {
-      oss << "      - " << k << ": " << v << "\n";
+    for (const auto& [key, val] : check.details) {
+      oss << "      - " << key << ": " << val << "\n";
     }
   }
 
   if (!warnings_.empty()) {
     oss << "\n--- Warnings ---\n";
-    for (const auto& w : warnings_) {
-      oss << "  [WARN] " << w << "\n";
+    for (const auto& warning_msg : warnings_) {
+      oss << "  [WARN] " << warning_msg << "\n";
     }
   }
 
   if (!errors_.empty()) {
     oss << "\n--- Errors ---\n";
-    for (const auto& e : errors_) {
-      oss << "  [ERROR] " << e << "\n";
+    for (const auto& error_msg : errors_) {
+      oss << "  [ERROR] " << error_msg << "\n";
     }
   }
 

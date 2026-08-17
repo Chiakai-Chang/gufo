@@ -256,6 +256,7 @@ GPU, and NPU diagnostics without starting a server or loading a model:
 ```bash
 strix-server diagnose
 strix-server diagnose --json
+strix-server diagnose --json --section inventory
 ```
 
 ### JSON Output Schema (v1.0.0)
@@ -268,6 +269,30 @@ When `--json` is supplied, `diagnose` emits structured JSON output to stdout:
   "engineRevision": "0.1.0",
   "timestamp": "2026-08-17T20:00:00Z",
   "status": "PASS",
+  "inventory": {
+    "cpu": {
+      "modelName": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "architecture": "x86_64",
+      "logicalCores": 32,
+      "physicalCores": 16
+    },
+    "gpu": {
+      "name": "AMD Radeon 8060S Graphics",
+      "architecture": "gfx1151",
+      "computeUnits": 40,
+      "driverName": "amdgpu"
+    },
+    "npu": {
+      "identity": "AMD XDNA2 NPU",
+      "architecture": "XDNA2",
+      "pciDeviceId": "1022:17f0",
+      "driverName": "amdxdna"
+    }
+  },
+  "compatibility": {
+    "overallVerdict": "supported",
+    "items": []
+  },
   "checks": [
     {
       "name": "platform",
@@ -286,6 +311,9 @@ When `--json` is supplied, `diagnose` emits structured JSON output to stdout:
 The top-level `status` reflects overall health: `PASS` when all checks pass,
 `WARN` when non-fatal hardware/device warnings exist, and `FAIL` when a critical
 platform/system failure occurs.
+
+Diagnostic sections can be selected using `--section <name>` (`all`, `inventory`,
+`platform`, `gpu`, `npu`).
 
 ## Conversation Files
 
