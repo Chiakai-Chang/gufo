@@ -1,0 +1,155 @@
+name: Milestone Progress Card
+description: Create a new milestone progress card adhering to the project card schema
+title: "<filename>.md"
+labels: ["card", "status:planned"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please fill out this card according to the canonical milestone card schema.
+  - type: input
+    id: card_id
+    attributes:
+      label: Card ID
+      description: "Identifier for the card (e.g. M001-C001, M004-C001)"
+      placeholder: "M00X-C00Y"
+    validations:
+      required: true
+  - type: dropdown
+    id: milestone
+    attributes:
+      label: Milestone
+      options:
+        - "001-repository-toolchain (M001: Repository and Toolchain)"
+        - "002-hardware-diagnostics-baselines (M002: Hardware Diagnostics and Baselines)"
+        - "003-test-oracles-model-contracts (M003: Test Oracles and Model Contracts)"
+        - "004-gpu-npu-format-feasibility (M004: Early GPU and NPU Format Feasibility)"
+        - "005-qwen-gpu-only-vertical-slice (M005: Qwen GPU-Only Vertical Slice)"
+    validations:
+      required: true
+  - type: dropdown
+    id: track
+    attributes:
+      label: Track (Optional)
+      options:
+        - "None / Core Tooling"
+        - "gpu"
+        - "npu"
+        - "shared-allocation"
+        - "GPU blocking gate"
+        - "shared-allocation, non-blocking research"
+  - type: dropdown
+    id: status
+    attributes:
+      label: Initial Status
+      options:
+        - "planned"
+        - "in_progress"
+        - "done"
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: "List prerequisite cards or issues this card depends on."
+      placeholder: "- [ ] #18 (`M001-C008`: Single PR test entrypoint)"
+    validations:
+      required: true
+  - type: textarea
+    id: required_context
+    attributes:
+      label: Required Context
+      description: "References to docs/ROADMAP.md, specs, or prior milestone artifacts."
+      placeholder: "- docs/ROADMAP.md\n- README.md\n- AGENTS.md"
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: "Clear, single-sentence or concise statement of what this card achieves."
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-Goals
+      description: "Explicit boundaries of what this card must NOT do to avoid scope creep."
+      placeholder: "- Do not create ...; card M00X-C00Y owns it."
+    validations:
+      required: true
+  - type: textarea
+    id: expected_paths
+    attributes:
+      label: Expected Paths
+      description: "List of files/directories created, modified, or tested."
+      placeholder: "- `src/...`\n- `tests/...`\n- `CMakeLists.txt`"
+    validations:
+      required: true
+  - type: textarea
+    id: definition_of_done
+    attributes:
+      label: Definition of Done
+      description: "Checklist of verifiable acceptance criteria."
+      value: |
+        - [ ] 
+    validations:
+      required: true
+  - type: textarea
+    id: development_loop
+    attributes:
+      label: Development Loop
+      description: "Exact shell / Nix commands used to build, test, and verify this card."
+      placeholder: |
+        ```sh
+        git add -A
+        nix develop -c bash -lc 'cmake -S . -B build/m00x-c00y -DBUILD_TESTING=ON && cmake --build build/m00x-c00y --target test_target && ctest --test-dir build/m00x-c00y --output-on-failure'
+        nix build -L
+        ```
+    validations:
+      required: true
+  - type: textarea
+    id: hardware_validation
+    attributes:
+      label: Hardware Validation (Optional)
+      description: "Hardware requirements for accelerator tasks (gfx1151 / XDNA2)."
+      placeholder: "- Build and static checks run on x86_64-linux. Numerical device and performance acceptance requires Strix Halo gfx1151; a missing/wrong GPU is an explicit not-run hardware result, not a pass."
+  - type: textarea
+    id: output_artifacts
+    attributes:
+      label: Output Artifacts
+      description: "Deliverables produced by completing this card."
+      placeholder: "- Deliverable binary / library\n- Benchmark JSON report"
+    validations:
+      required: true
+  - type: textarea
+    id: stop_conditions
+    attributes:
+      label: Stop Conditions
+      description: "Conditions under which execution should halt and report rather than proceeding blindly."
+      placeholder: "- Stop and fail if ...\n- Stop after ...; leave next phase to downstream card."
+    validations:
+      required: true
+  - type: textarea
+    id: roadmap_traceability
+    attributes:
+      label: ROADMAP Traceability
+      description: "Mapping to Milestone tasks and exit criteria in docs/ROADMAP.md."
+      placeholder: "- tasks: M0 task 1\n- exitCriteria: M0-E1 ..."
+    validations:
+      required: true
+  - type: textarea
+    id: agent_handoff
+    attributes:
+      label: Agent Handoff
+      description: "Reporting requirements upon completion."
+      value: |
+        When complete, report:
+        - Files changed.
+        - Exact commands run and their results.
+        - Produced artifact paths and hashes where applicable.
+        - Any skipped hardware checks and why.
+        - Residual risks or follow-up cards without expanding this card's scope.
+    validations:
+      required: true
