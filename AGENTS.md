@@ -22,3 +22,5 @@ nix develop                        # dev shell
 ## Development
 
 - Use `gh` CLI to retrieve and update issues content. Verify if installed and configured with `gh auth status`, and use it unless the user explicitly says otherwise.
+- Follow Conventional Commits format with single-line commit messages (e.g., `feat(scope): summary (#issue)`, `fix(scope): summary (#issue)`).
+
