@@ -1,0 +1,7 @@
+[
+  {
+    "directory": "/build",
+    "command": "g++ -I/usr/local/cuda/include -lcudart -o fake_bin fake.cpp",
+    "file": "fake.cpp"
+  }
+]

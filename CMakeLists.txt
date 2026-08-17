@@ -111,3 +111,7 @@ if (BUILD_TESTING)
     set_tests_properties(strix_cpu_smoke PROPERTIES LABELS "cpu")
   endif()
 endif()
+
+# Anti-CUDA boundary checks and targets
+include(cmake/CheckNoCuda.cmake)
+

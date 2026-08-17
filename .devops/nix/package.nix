@@ -4,6 +4,7 @@
   cmake,
   ninja,
   pkg-config,
+  python3,
   libuuid,
   rocmPackages,
   xrt,
@@ -27,6 +28,7 @@ stdenv.mkDerivation (finalAttrs: {
     cmake
     ninja
     pkg-config
+    python3
   ]
   ++ lib.optional rocmSupport rocmPackages.clr;
 
@@ -67,6 +69,40 @@ stdenv.mkDerivation (finalAttrs: {
     chmod +x $out/bin/strix $out/bin/strix-server
 
     runHook postInstall
+  '';
+
+  doCheck = true;
+  checkPhase = ''
+    runHook preCheck
+
+    # Run anti-CUDA boundary scanner on built binaries, fixtures, and project sources
+    python3 ../tools/check-no-cuda.py \
+      --source ../src \
+      --source ../models \
+      --source ../CMakeLists.txt \
+      --binary strix \
+      --binary strix-server \
+      --self-test ../tests/static/fixtures
+
+    runHook postCheck
+  '';
+
+  doInstallCheck = true;
+  installCheckPhase = ''
+    runHook preInstallCheck
+
+    # Scan installed package binaries and verify no CUDA libraries/symbols
+    python3 ../tools/check-no-cuda.py \
+      --binary $out/bin/strix \
+      --binary $out/bin/strix-server
+
+    # Scan output directory references for any forbidden CUDA strings or paths
+    if grep -rnwi "$out" -e "libcudart" -e "libcublas" -e "cuda_runtime" 2>/dev/null; then
+      echo "ERROR: CUDA string/library found in output closure!" >&2
+      exit 1
+    fi
+
+    runHook postInstallCheck
   '';
 
   passthru = {
