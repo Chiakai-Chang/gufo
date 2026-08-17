@@ -3,6 +3,7 @@
 #include <string_view>
 
 namespace strix::server {
+namespace {
 
 constexpr std::string_view version_string = "strix-server 0.1.0";
 
@@ -53,7 +54,8 @@ int run(std::span<const char* const> args) {
   return 2;
 }
 
-} // namespace strix::server
+}  // namespace
+}  // namespace strix::server
 
 int main(int argc, char* argv[]) {
   return strix::server::run(

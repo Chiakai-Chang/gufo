@@ -14,34 +14,41 @@
 #include <hip/hip_runtime.h>
 
 static bool isHipRequired() {
-  const char *val = std::getenv("STRIX_REQUIRE_HIP");
-  if (!val) val = std::getenv("STRIX_REQUIRE_GPU");
-  if (!val) val = std::getenv("STRIX_REQUIRE_GFX1151");
-  return val && std::string_view(val) != "0" && std::string_view(val) != "false";
+  const char* val = std::getenv("STRIX_REQUIRE_HIP");
+  if (!val)
+    val = std::getenv("STRIX_REQUIRE_GPU");
+  if (!val)
+    val = std::getenv("STRIX_REQUIRE_GFX1151");
+  return val && std::string_view(val) != "0" &&
+         std::string_view(val) != "false";
 }
 
-static const char *hipErrStr(hipError_t e) { return hipGetErrorName(e); }
+static const char* hipErrStr(hipError_t e) {
+  return hipGetErrorName(e);
+}
 
-static void checkHip(hipError_t e, const char *what) {
+static void checkHip(hipError_t e, const char* what) {
   if (e != hipSuccess) {
     std::fprintf(stderr, "HIP error on %s: %s\n", what, hipErrStr(e));
     if (isHipRequired()) {
       std::exit(1);
     } else {
-      std::printf("SKIP: HIP hardware/runtime not available (%s)\n", hipErrStr(e));
+      std::printf("SKIP: HIP hardware/runtime not available (%s)\n",
+                  hipErrStr(e));
       std::exit(0);
     }
   }
 }
 
 static void checkGpu() {
-  std::printf("ROCm version: %d.%d.%d\n",
-              HIP_VERSION_MAJOR, HIP_VERSION_MINOR, HIP_VERSION_PATCH);
+  std::printf("ROCm version: %d.%d.%d\n", HIP_VERSION_MAJOR, HIP_VERSION_MINOR,
+              HIP_VERSION_PATCH);
 
   int devCount = 0;
   hipError_t err = hipGetDeviceCount(&devCount);
   if (err != hipSuccess) {
-    std::fprintf(stderr, "HIP error on hipGetDeviceCount: %s\n", hipErrStr(err));
+    std::fprintf(stderr, "HIP error on hipGetDeviceCount: %s\n",
+                 hipErrStr(err));
     if (isHipRequired()) {
       std::exit(1);
     } else {
@@ -52,7 +59,8 @@ static void checkGpu() {
 
   std::printf("HIP device count: %d\n", devCount);
   if (devCount == 0) {
-    std::printf("No HIP device found — is kfd loaded / device in render group?\n");
+    std::printf(
+        "No HIP device found — is kfd loaded / device in render group?\n");
     if (isHipRequired()) {
       std::exit(1);
     }
@@ -78,7 +86,7 @@ static void checkGpu() {
                 (double)total / (1024.0 * 1024.0 * 1024.0));
 
     // Quick sanity: a tiny unified-memory allocation + memset + free.
-    char *buf = nullptr;
+    char* buf = nullptr;
     checkHip(hipMalloc(&buf, 4096), "hipMalloc");
     checkHip(hipMemset(buf, 0xAB, 4096), "hipMemset");
     checkHip(hipFree(buf), "hipFree");
@@ -92,9 +100,11 @@ static void checkGpu() {
 #include <xrt/xrt_device.h>
 
 static bool isXdna2Required() {
-  const char *val = std::getenv("STRIX_REQUIRE_XDNA2");
-  if (!val) val = std::getenv("STRIX_REQUIRE_NPU");
-  return val && std::string_view(val) != "0" && std::string_view(val) != "false";
+  const char* val = std::getenv("STRIX_REQUIRE_XDNA2");
+  if (!val)
+    val = std::getenv("STRIX_REQUIRE_NPU");
+  return val && std::string_view(val) != "0" &&
+         std::string_view(val) != "false";
 }
 
 static void checkNpu() {
@@ -114,7 +124,7 @@ static void checkNpu() {
       std::string name = dev.get_info<xrt::info::device::name>();
       std::printf("  npu[%u]: %s\n", i, name.c_str());
     }
-  } catch (const std::exception &e) {
+  } catch (const std::exception& e) {
     std::printf("NPU check error: %s\n", e.what());
     if (isXdna2Required()) {
       std::exit(1);

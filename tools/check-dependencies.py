@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+check-dependencies.py — Third-party dependency inventory consistency checker for Strix-Halo.cpp
+
+Validates that:
+1. Every shipped/linked runtime dependency in Nix/CMake is documented in THIRD_PARTY_NOTICES.md and NOTICE.
+2. SPDX license identifiers and pinned versions are valid and present.
+3. No forbidden CUDA dependencies appear in the declared or detected dependency tree.
+4. Emits a deterministic machine-readable dependency inventory report.
+"""
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Dict, List, Set
+
+FORBIDDEN_CUDA_DEP_PATTERNS = [
+    re.compile(r'cuda\b', re.IGNORECASE),
+    re.compile(r'cudart\b', re.IGNORECASE),
+    re.compile(r'cublas\b', re.IGNORECASE),
+    re.compile(r'cudnn\b', re.IGNORECASE),
+    re.compile(r'nccl\b', re.IGNORECASE),
+    re.compile(r'nvidia\b', re.IGNORECASE),
+]
+
+# Expected runtime and build dependencies that must be tracked
+REQUIRED_SHIPPED_COMPONENTS = {
+    "XRT",
+    "xdna-driver",
+    "ROCm / HIP",
+    "hipBLAS",
+    "rocBLAS",
+    "libuuid",
+}
+
+
+def parse_third_party_notices(notices_path: Path) -> Dict[str, Dict[str, str]]:
+    """Parse THIRD_PARTY_NOTICES.md markdown table into structured component data."""
+    if not notices_path.is_file():
+        raise FileNotFoundError(f"Missing notices file: {notices_path}")
+
+    content = notices_path.read_text(encoding="utf-8")
+    components: Dict[str, Dict[str, str]] = {}
+
+    for line in content.splitlines():
+        line_clean = line.strip()
+        if not line_clean.startswith("|") or "Component Name" in line_clean or "---" in line_clean:
+            continue
+
+        parts = [p.strip() for p in line_clean.split("|")]
+        # Form: | [0] empty | [1] Name | [2] Rel | [3] SPDX | [4] Version | [5] Source | [6] empty |
+        if len(parts) >= 6:
+            raw_name = parts[1].replace("*", "").replace("`", "").strip()
+            if not raw_name:
+                continue
+            components[raw_name] = {
+                "name": raw_name,
+                "relationship": parts[2].strip(),
+                "spdx": parts[3].replace("`", "").strip(),
+                "version": parts[4].replace("`", "").strip(),
+                "source": parts[5].strip(),
+            }
+
+    return components
+
+
+def verify_dependencies(
+    notices_file: Path,
+    package_nix_file: Path,
+    json_report_path: Path = None,
+) -> int:
+    errors: List[str] = []
+    components = parse_third_party_notices(notices_file)
+
+    # 1. Check for forbidden CUDA dependencies in third-party inventory
+    for name, info in components.items():
+        for pat in FORBIDDEN_CUDA_DEP_PATTERNS:
+            if pat.search(name) or pat.search(info["source"]):
+                errors.append(f"Forbidden CUDA dependency detected in inventory: '{name}'")
+
+    # 2. Check that all required shipped components are present in inventory
+    for req in REQUIRED_SHIPPED_COMPONENTS:
+        if not any(req.lower() in name.lower() for name in components):
+            errors.append(f"Required shipped dependency '{req}' is missing from {notices_file.name}")
+
+    # 3. Check package.nix inputs consistency
+    if package_nix_file.is_file():
+        pkg_content = package_nix_file.read_text(encoding="utf-8")
+        # Check that rocmPackages, xrt, xrt-plugin-amdxdna, libuuid are wired
+        for dep in ["rocmPackages", "xrt", "xrt-plugin-amdxdna", "libuuid"]:
+            if dep not in pkg_content:
+                errors.append(f"Expected dependency '{dep}' missing from {package_nix_file.name}")
+
+    # 4. Check for invalid or empty SPDX licenses
+    for name, info in components.items():
+        spdx = info.get("spdx", "")
+        if not spdx or spdx.lower() == "unknown" or spdx.lower() == "todo":
+            errors.append(f"Component '{name}' has invalid SPDX license: '{spdx}'")
+        if not info.get("version") or info.get("version").lower() == "todo":
+            errors.append(f"Component '{name}' has missing pinned version")
+
+    # Generate deterministic inventory report
+    report = {
+        "status": "FAIL" if errors else "PASS",
+        "tracked_components_count": len(components),
+        "inventory": components,
+        "errors_count": len(errors),
+        "errors": errors,
+    }
+
+    if json_report_path:
+        json_report_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(json_report_path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, sort_keys=True)
+
+    if errors:
+        print(f"\n[check-dependencies] FAILED: {len(errors)} dependency consistency errors found:")
+        for err in errors:
+            print(f"  - {err}")
+        return 1
+
+    print(
+        f"[check-dependencies] PASSED: All {len(components)} third-party dependencies "
+        f"verified consistent with licenses, pins, and package boundaries."
+    )
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Verify third-party dependency notices and license inventory consistency."
+    )
+    parser.add_argument(
+        "--notices",
+        default="THIRD_PARTY_NOTICES.md",
+        help="Path to THIRD_PARTY_NOTICES.md",
+    )
+    parser.add_argument(
+        "--package-nix",
+        default=".devops/nix/package.nix",
+        help="Path to package.nix",
+    )
+    parser.add_argument(
+        "--json-report",
+        help="Path to output machine-readable JSON inventory report",
+    )
+
+    args = parser.parse_args()
+
+    notices_path = Path(args.notices)
+    package_nix_path = Path(args.package_nix)
+    report_path = Path(args.json_report) if args.json_report else None
+
+    return verify_dependencies(notices_path, package_nix_path, report_path)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

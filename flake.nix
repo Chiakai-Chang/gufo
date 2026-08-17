@@ -68,5 +68,61 @@
           };
         }
       );
+
+      checks = forAllSystems (
+        system:
+        let
+          pkgsSys = pkgs.${system};
+        in
+        {
+          format = pkgsSys.runCommand "check-format" {
+            nativeBuildInputs = [ pkgsSys.clang-tools ];
+            src = self;
+          } ''
+            cd "$src"
+            clang-format --dry-run --Werror src/main.cpp src/server/main.cpp
+            mkdir -p $out
+            echo "PASS: Formatting check clean" > $out/result.txt
+          '';
+
+          static-analysis = pkgsSys.runCommand "check-static-analysis" {
+            nativeBuildInputs = [
+              pkgsSys.stdenv.cc
+              pkgsSys.clang-tools
+              pkgsSys.cmake
+              pkgsSys.ninja
+              pkgsSys.python3
+            ];
+            src = self;
+          } ''
+            export HOME=$TMPDIR
+            mkdir -p build && cd build
+            cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF -DENGINE_ENABLE_XRT=OFF
+            clang-tidy -p . "$src"/src/main.cpp "$src"/src/server/main.cpp
+            mkdir -p $out
+            echo "PASS: clang-tidy static analysis clean" > $out/result.txt
+          '';
+
+          dependency-inventory = pkgsSys.runCommand "check-dependency-inventory" {
+            nativeBuildInputs = [ pkgsSys.python3 ];
+            src = self;
+          } ''
+            cd "$src"
+            mkdir -p $out
+            python3 tools/check-dependencies.py --json-report $out/dependency-inventory.json
+            echo "PASS: Dependency inventory clean" > $out/result.txt
+          '';
+
+          docs = pkgsSys.runCommand "check-docs" {
+            nativeBuildInputs = [ pkgsSys.python3 ];
+            src = self;
+          } ''
+            cd "$src"
+            mkdir -p $out
+            python3 tools/check-docs.py --root "$src"
+            echo "PASS: Documentation check clean" > $out/result.txt
+          '';
+        }
+      );
     };
 }
