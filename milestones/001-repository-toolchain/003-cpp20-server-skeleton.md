@@ -2,7 +2,7 @@
 id: M001-C003
 title: "Create the C++20 source layout and placeholder strix-server"
 milestone: M001
-status: planned
+status: complete
 dependencies: [M001-C001]
 ---
 
@@ -51,12 +51,12 @@ Establish the roadmap's top-level C++20 layout and build a side-effect-free plac
 
 ## Definition of Done
 
-- [ ] CMake declares C++20, disables compiler extensions, and defines the installed executable target strix-server.
-- [ ] All directories in docs/ROADMAP.md's Milestone 0 initial layout exist in a trackable form without placeholder production code masquerading as implementation.
-- [ ] strix-server --version writes a stable project/version line, exits 0, and performs no HIP/XRT discovery or allocation.
-- [ ] Unknown top-level options return the CLI/configuration error code 2, consistent with docs/CLI.md.
-- [ ] The Nix package installs the new `result/bin/strix-server` placeholder without removing or renaming the existing `result/bin/strix`; `mainProgram` remains unchanged unless a separate reviewed decision updates it.
-- [ ] A CPU-disabled-backend build and --version smoke pass through Nix.
+- [x] CMake declares C++20, disables compiler extensions, and defines the installed executable target strix-server.
+- [x] All directories in docs/ROADMAP.md's Milestone 0 initial layout exist in a trackable form without placeholder production code masquerading as implementation.
+- [x] strix-server --version writes a stable project/version line, exits 0, and performs no HIP/XRT discovery or allocation.
+- [x] Unknown top-level options return the CLI/configuration error code 2, consistent with docs/CLI.md.
+- [x] The Nix package installs the new `result/bin/strix-server` placeholder without removing or renaming the existing `result/bin/strix`; `mainProgram` remains unchanged unless a separate reviewed decision updates it.
+- [x] A CPU-disabled-backend build and --version smoke pass through Nix.
 
 ## Development Loop
 

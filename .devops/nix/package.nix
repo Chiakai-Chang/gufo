@@ -63,7 +63,8 @@ stdenv.mkDerivation (finalAttrs: {
 
     mkdir -p $out/bin
     cp strix $out/bin/strix
-    chmod +x $out/bin/strix
+    cp strix-server $out/bin/strix-server
+    chmod +x $out/bin/strix $out/bin/strix-server
 
     runHook postInstall
   '';

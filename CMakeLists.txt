@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 project(strix LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ROCm/HIP GPU backend — compiled natively for the Strix Halo gfx1151 target.
 option(ENGINE_ENABLE_HIP "Build strix with ROCm/HIP GPU backend" OFF)
@@ -62,3 +63,8 @@ if (ENGINE_ENABLE_XRT)
   target_include_directories(strix PRIVATE ${XRT_INCLUDE_DIR})
   target_link_libraries(strix PRIVATE ${XRT_COREUTIL_LIB})
 endif()
+
+add_executable(strix-server src/server/main.cpp)
+
+install(TARGETS strix strix-server DESTINATION bin)
+
