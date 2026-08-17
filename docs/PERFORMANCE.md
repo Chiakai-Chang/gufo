@@ -82,7 +82,22 @@ depends more strongly on:
 - Padding and shape buckets.
 - DMA and synchronization overlap.
 
-This is the primary area where GPU and NPU compute may combine usefully.
+### Measured Sustained Memory Bandwidth Baselines
+
+Sustained bandwidth across CPU, GPU (`gfx1151`), and NPU (`XDNA2`) buffer paths on AMD Strix Halo (128 GiB unified LPDDR5X, fingerprint `bb565d5eff3a9f23b4ac3f1ff03f66bebef651e57093cd558c4cded823358849`):
+
+| Backend | Path | Allocation Type | Working Set | Median (GB/s) | P95 (GB/s) | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| CPU | `cpu_copy` | `host_pageable` | 256 MiB | 50.62 | 51.11 | `completed` |
+| CPU | `cpu_read` | `host_pageable` | 256 MiB | 13.88 | 13.89 | `completed` |
+| CPU | `cpu_write` | `host_pageable` | 256 MiB | 37.96 | 38.37 | `completed` |
+| HIP | `hip_h2d` | `hip_device_memory` | 256 MiB | 68.36 | 68.56 | `completed` |
+| HIP | `hip_device_copy` | `hip_device_memory` | 256 MiB | 211.03 | 211.63 | `completed` |
+| HIP | `hip_d2h` | `hip_device_memory` | 256 MiB | 55.89 | 56.42 | `completed` |
+| XRT | `xrt_bo_sync_to_device` | `xrt_bo_dma_sync` | 64 MiB | 127.06 | 127.75 | `completed` |
+| XRT | `xrt_bo_sync_from_device` | `xrt_bo_dma_sync` | 64 MiB | 120.35 | 127.74 | `completed` |
+
+These measured ceilings, rather than theoretical LPDDR bandwidth, govern decode GEMV and weight-streaming roofline bounds.
 
 ## Measurement Rules
 

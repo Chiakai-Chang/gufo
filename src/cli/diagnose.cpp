@@ -1,12 +1,16 @@
 #include "src/cli/diagnose.h"
 
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "src/core/diagnostics/artifact_validator.h"
+#include "src/core/diagnostics/bandwidth.h"
 #include "src/core/diagnostics/compatibility.h"
 #include "src/core/diagnostics/fingerprint.h"
 #include "src/core/diagnostics/linux_sysfs.h"
@@ -30,6 +34,15 @@ void PrintDiagnoseHelp(std::string_view program_name) {
          "and SHA-256 ID\n"
       << "  --validate-artifact <path>   Validate a diagnostic/benchmark "
          "artifact against schema & fingerprint\n"
+      << "  --benchmark <name>           Run benchmark suite: bandwidth\n"
+      << "  --backends <csv>             Backends to benchmark (default: "
+         "cpu,hip,xrt)\n"
+      << "  --warmup <n>                 Number of warmup iterations (default: "
+         "3)\n"
+      << "  --repetitions <n>            Number of benchmark repetitions "
+         "(default: 10)\n"
+      << "  --duration-ms <ms>           Target duration per benchmark in ms "
+         "(default: 2000)\n"
       << "  --output <path>              Write command output to specified "
          "file\n"
       << "  --section <name>             Diagnostic section to run: all, "
@@ -48,6 +61,21 @@ void OutputContent(std::string_view content, std::string_view output_file) {
                 << "\n";
     }
   }
+}
+
+std::vector<std::string> SplitCommaSeparated(std::string_view csv) {
+  std::vector<std::string> result;
+  std::size_t start = 0;
+  while (start < csv.size()) {
+    const auto end = csv.find(',', start);
+    if (end == std::string_view::npos) {
+      result.emplace_back(csv.substr(start));
+      break;
+    }
+    result.emplace_back(csv.substr(start, end - start));
+    start = end + 1;
+  }
+  return result;
 }
 
 }  // namespace
@@ -188,6 +216,11 @@ int RunDiagnose(std::span<const char* const> args) {
   bool json_mode = false;
   bool fingerprint_mode = false;
   std::string validate_artifact_path;
+  std::string benchmark_name;
+  std::string backends_csv = "cpu,hip,xrt";
+  std::uint32_t warmup = 3;
+  std::uint32_t repetitions = 10;
+  std::uint32_t duration_ms = 2000;
   std::string output_file;
   std::string section = "all";
   std::size_t start_idx = 0;
@@ -218,6 +251,54 @@ int RunDiagnose(std::span<const char* const> args) {
       validate_artifact_path = args[++i];
     } else if (arg.starts_with("--validate-artifact=")) {
       validate_artifact_path = std::string(arg.substr(20));
+    } else if (arg == "--benchmark") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "Error: --benchmark requires an argument\n";
+        PrintDiagnoseHelp("strix-server");
+        return 2;
+      }
+      benchmark_name = args[++i];
+    } else if (arg.starts_with("--benchmark=")) {
+      benchmark_name = std::string(arg.substr(12));
+    } else if (arg == "--backends") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "Error: --backends requires an argument\n";
+        PrintDiagnoseHelp("strix-server");
+        return 2;
+      }
+      backends_csv = args[++i];
+    } else if (arg.starts_with("--backends=")) {
+      backends_csv = std::string(arg.substr(11));
+    } else if (arg == "--warmup") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "Error: --warmup requires an integer argument\n";
+        PrintDiagnoseHelp("strix-server");
+        return 2;
+      }
+      warmup = static_cast<std::uint32_t>(std::stoul(args[++i]));
+    } else if (arg.starts_with("--warmup=")) {
+      warmup =
+          static_cast<std::uint32_t>(std::stoul(std::string(arg.substr(9))));
+    } else if (arg == "--repetitions") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "Error: --repetitions requires an integer argument\n";
+        PrintDiagnoseHelp("strix-server");
+        return 2;
+      }
+      repetitions = static_cast<std::uint32_t>(std::stoul(args[++i]));
+    } else if (arg.starts_with("--repetitions=")) {
+      repetitions =
+          static_cast<std::uint32_t>(std::stoul(std::string(arg.substr(14))));
+    } else if (arg == "--duration-ms") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "Error: --duration-ms requires an integer argument\n";
+        PrintDiagnoseHelp("strix-server");
+        return 2;
+      }
+      duration_ms = static_cast<std::uint32_t>(std::stoul(args[++i]));
+    } else if (arg.starts_with("--duration-ms=")) {
+      duration_ms =
+          static_cast<std::uint32_t>(std::stoul(std::string(arg.substr(14))));
     } else if (arg == "--output") {
       if (i + 1 >= args.size()) {
         std::cerr << "Error: --output requires a file path argument\n";
@@ -253,6 +334,31 @@ int RunDiagnose(std::span<const char* const> args) {
     const std::string content = json_mode ? result.ToJson() : result.ToHuman();
     OutputContent(content, output_file);
     return result.is_valid ? 0 : 1;
+  }
+
+  // Handle benchmark execution mode
+  if (!benchmark_name.empty()) {
+    if (benchmark_name != "bandwidth") {
+      std::cerr << "Error: unsupported benchmark '" << benchmark_name
+                << "'. Supported: bandwidth\n";
+      return 2;
+    }
+
+    diagnostics::BandwidthOptions bw_options;
+    bw_options.backends = SplitCommaSeparated(backends_csv);
+    bw_options.warmup = warmup;
+    bw_options.repetitions = repetitions;
+    bw_options.duration_ms = duration_ms;
+
+    const auto inventory =
+        diagnostics::CollectSystemInventory(diagnostics::LinuxSysfs());
+    const auto fingerprint = diagnostics::GenerateMachineFingerprint(inventory);
+
+    const auto report =
+        diagnostics::RunBandwidthBenchmark(bw_options, fingerprint);
+    const std::string content = json_mode ? report.ToJson() : report.ToHuman();
+    OutputContent(content, output_file);
+    return 0;
   }
 
   // Handle fingerprint mode

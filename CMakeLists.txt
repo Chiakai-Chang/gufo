@@ -90,6 +90,9 @@ add_library(strix_diagnostics STATIC
   src/core/diagnostics/compatibility.cpp
   src/core/diagnostics/fingerprint.cpp
   src/core/diagnostics/artifact_validator.cpp
+  src/core/diagnostics/bandwidth.cpp
+  src/core/hip/bandwidth.cpp
+  src/core/xdna2/bandwidth.cpp
   src/core/diagnostics/report.cpp
   src/cli/diagnose.cpp
 )
@@ -146,6 +149,13 @@ if (BUILD_TESTING)
 
   add_test(NAME fingerprint_test COMMAND fingerprint_test)
   set_tests_properties(fingerprint_test PROPERTIES LABELS "cpu;diagnostics;fingerprint;artifact_validator")
+
+  add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
+  target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
+  target_link_libraries(bandwidth_test PRIVATE strix_diagnostics)
+
+  add_test(NAME bandwidth_test COMMAND bandwidth_test)
+  set_tests_properties(bandwidth_test PROPERTIES LABELS "cpu;diagnostics;bandwidth;bandwidth_schema;bandwidth_correctness")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)

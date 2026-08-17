@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "StrixHaloBandwidthReport",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "fingerprintId",
+    "engineRevision",
+    "timestamp",
+    "options",
+    "paths"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "string",
+      "const": "1.0.0"
+    },
+    "fingerprintId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "engineRevision": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "options": {
+      "type": "object",
+      "required": ["warmup", "repetitions", "durationMs", "workingSetBytes"],
+      "properties": {
+        "warmup": { "type": "integer", "minimum": 0 },
+        "repetitions": { "type": "integer", "minimum": 1 },
+        "durationMs": { "type": "integer", "minimum": 0 },
+        "workingSetBytes": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "paths": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "backend",
+          "pathName",
+          "allocationType",
+          "workingSetBytes",
+          "warmupRuns",
+          "repetitions",
+          "medianGbps",
+          "p95Gbps",
+          "minGbps",
+          "maxGbps",
+          "sentinelVerified",
+          "status",
+          "reason",
+          "rawRepetitionsGbps"
+        ],
+        "properties": {
+          "backend": { "type": "string", "enum": ["cpu", "hip", "xrt"] },
+          "pathName": { "type": "string" },
+          "allocationType": { "type": "string" },
+          "workingSetBytes": { "type": "integer", "minimum": 1 },
+          "warmupRuns": { "type": "integer", "minimum": 0 },
+          "repetitions": { "type": "integer", "minimum": 1 },
+          "medianGbps": { "type": "number", "minimum": 0.0 },
+          "p95Gbps": { "type": "number", "minimum": 0.0 },
+          "minGbps": { "type": "number", "minimum": 0.0 },
+          "maxGbps": { "type": "number", "minimum": 0.0 },
+          "sentinelVerified": { "type": "boolean" },
+          "status": { "type": "string", "enum": ["completed", "unsupported", "unavailable"] },
+          "reason": { "type": "string" },
+          "rawRepetitionsGbps": {
+            "type": "array",
+            "items": { "type": "number", "minimum": 0.0 }
+          }
+        }
+      }
+    }
+  }
+}

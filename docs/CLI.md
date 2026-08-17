@@ -259,6 +259,7 @@ strix-server diagnose --json
 strix-server diagnose --json --section inventory
 strix-server diagnose --fingerprint --json --output /tmp/strix-fingerprint.json
 strix-server diagnose --validate-artifact /tmp/strix-fingerprint.json
+strix-server diagnose --benchmark bandwidth --backends cpu,hip,xrt --output /tmp/strix-bandwidth.json
 ```
 
 ### Machine Fingerprint and Artifact Validation
@@ -266,6 +267,11 @@ strix-server diagnose --validate-artifact /tmp/strix-fingerprint.json
 - `--fingerprint`: Emits a canonical machine fingerprint object with a 64-character SHA-256 identity hash computed over CPU topology, gfx1151 GPU identity, XDNA2 NPU identity, kernel drivers, and pinned toolchain versions.
 - `--validate-artifact <path>`: Validates a benchmark or diagnostic JSON artifact against schema v1.0.0, verifies fingerprint SHA-256 integrity, and checks architecture requirements (`gfx1151`, `XDNA2`).
 - `--output <path>`: Writes command output to the specified file path.
+- `--benchmark <name>`: Runs a diagnostic benchmark suite (`bandwidth`).
+- `--backends <csv>`: Comma-separated list of backends to benchmark (`cpu`, `hip`, `xrt`).
+- `--warmup <n>`: Number of warmup iterations (default: `3`).
+- `--repetitions <n>`: Number of benchmark repetitions (default: `10`).
+- `--duration-ms <ms>`: Target duration per test in milliseconds (default: `2000`).
 
 ### JSON Output Schema (v1.0.0)
 
