@@ -88,6 +88,8 @@ add_library(strix_diagnostics STATIC
   src/core/diagnostics/linux_sysfs.cpp
   src/core/diagnostics/system_inventory.cpp
   src/core/diagnostics/compatibility.cpp
+  src/core/diagnostics/fingerprint.cpp
+  src/core/diagnostics/artifact_validator.cpp
   src/core/diagnostics/report.cpp
   src/cli/diagnose.cpp
 )
@@ -137,6 +139,13 @@ if (BUILD_TESTING)
 
   add_test(NAME system_inventory_test COMMAND system_inventory_test)
   set_tests_properties(system_inventory_test PROPERTIES LABELS "cpu;diagnostics;inventory;compatibility")
+
+  add_executable(fingerprint_test tests/diagnostics/fingerprint_test.cpp)
+  target_compile_definitions(fingerprint_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
+  target_link_libraries(fingerprint_test PRIVATE strix_diagnostics)
+
+  add_test(NAME fingerprint_test COMMAND fingerprint_test)
+  set_tests_properties(fingerprint_test PROPERTIES LABELS "cpu;diagnostics;fingerprint;artifact_validator")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)

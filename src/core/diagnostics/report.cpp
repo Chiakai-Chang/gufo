@@ -120,6 +120,10 @@ void DiagnosticReport::SetCompatibility(CompatibilityReport compatibility) {
   compatibility_ = std::move(compatibility);
 }
 
+void DiagnosticReport::SetFingerprint(MachineFingerprint fingerprint) {
+  fingerprint_ = std::move(fingerprint);
+}
+
 void DiagnosticReport::RecomputeStatus() {
   DiagnosticStatus overall_st = DiagnosticStatus::kPass;
   for (const auto& check : checks_) {
@@ -148,6 +152,12 @@ std::string DiagnosticReport::ToJson() const {
   oss << "  \"engineRevision\": \"" << EscapeJson(engine_revision_) << "\",\n";
   oss << "  \"timestamp\": \"" << EscapeJson(timestamp_) << "\",\n";
   oss << "  \"status\": \"" << ToString(overall_status_) << "\",\n";
+
+  if (fingerprint_) {
+    oss << "  \"fingerprintId\": \"" << EscapeJson(fingerprint_->fingerprint_id)
+        << "\",\n";
+    oss << "  \"fingerprint\": " << fingerprint_->ToJson() << ",\n";
+  }
 
   if (inventory_) {
     oss << "  \"inventory\": " << inventory_->ToJson() << ",\n";
@@ -232,6 +242,10 @@ std::string DiagnosticReport::ToHuman() const {
   oss << "Schema Version  : " << schema_version_ << "\n";
   oss << "Timestamp       : " << timestamp_ << "\n";
   oss << "Overall Status  : [" << ToString(overall_status_) << "]\n\n";
+
+  if (fingerprint_) {
+    oss << fingerprint_->ToHuman() << "\n";
+  }
 
   if (inventory_) {
     oss << inventory_->ToHuman() << "\n";

@@ -257,7 +257,15 @@ GPU, and NPU diagnostics without starting a server or loading a model:
 strix-server diagnose
 strix-server diagnose --json
 strix-server diagnose --json --section inventory
+strix-server diagnose --fingerprint --json --output /tmp/strix-fingerprint.json
+strix-server diagnose --validate-artifact /tmp/strix-fingerprint.json
 ```
+
+### Machine Fingerprint and Artifact Validation
+
+- `--fingerprint`: Emits a canonical machine fingerprint object with a 64-character SHA-256 identity hash computed over CPU topology, gfx1151 GPU identity, XDNA2 NPU identity, kernel drivers, and pinned toolchain versions.
+- `--validate-artifact <path>`: Validates a benchmark or diagnostic JSON artifact against schema v1.0.0, verifies fingerprint SHA-256 integrity, and checks architecture requirements (`gfx1151`, `XDNA2`).
+- `--output <path>`: Writes command output to the specified file path.
 
 ### JSON Output Schema (v1.0.0)
 
@@ -269,6 +277,7 @@ When `--json` is supplied, `diagnose` emits structured JSON output to stdout:
   "engineRevision": "0.1.0",
   "timestamp": "2026-08-17T20:00:00Z",
   "status": "PASS",
+  "fingerprintId": "e124845f98b4db093157486a779156beabb0dd32438945d5aa0e0c4c0baf89e5",
   "inventory": {
     "cpu": {
       "modelName": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",

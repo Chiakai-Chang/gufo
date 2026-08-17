@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "src/core/diagnostics/compatibility.h"
+#include "src/core/diagnostics/fingerprint.h"
 #include "src/core/diagnostics/system_inventory.h"
 
 namespace strix::diagnostics {
@@ -40,6 +41,7 @@ public:
   void AddError(std::string_view error);
   void SetInventory(SystemInventory inventory);
   void SetCompatibility(CompatibilityReport compatibility);
+  void SetFingerprint(MachineFingerprint fingerprint);
 
   [[nodiscard]] std::string_view SchemaVersion() const {
     return schema_version_;
@@ -65,6 +67,9 @@ public:
       const {
     return compatibility_;
   }
+  [[nodiscard]] const std::optional<MachineFingerprint>& Fingerprint() const {
+    return fingerprint_;
+  }
 
   [[nodiscard]] std::string ToJson() const;
   [[nodiscard]] std::string ToHuman() const;
@@ -81,6 +86,7 @@ private:
   std::vector<std::string> errors_;
   std::optional<SystemInventory> inventory_;
   std::optional<CompatibilityReport> compatibility_;
+  std::optional<MachineFingerprint> fingerprint_;
 };
 
 }  // namespace strix::diagnostics

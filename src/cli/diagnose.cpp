@@ -1,11 +1,14 @@
 #include "src/cli/diagnose.h"
 
+#include <fstream>
 #include <iostream>
 #include <span>
 #include <string>
 #include <string_view>
 
+#include "src/core/diagnostics/artifact_validator.h"
 #include "src/core/diagnostics/compatibility.h"
+#include "src/core/diagnostics/fingerprint.h"
 #include "src/core/diagnostics/linux_sysfs.h"
 #include "src/core/diagnostics/system_inventory.h"
 
@@ -16,14 +19,35 @@ namespace {
 void PrintDiagnoseHelp(std::string_view program_name) {
   std::cout
       << "Usage: " << program_name << " diagnose [OPTIONS]\n\n"
-      << "Run non-interactive system and accelerator diagnostics for Strix "
-         "Halo.\n\n"
+      << "Run non-interactive system, hardware, and benchmark diagnostics for "
+         "Strix Halo.\n\n"
       << "Options:\n"
-      << "  --json             Emit structured JSON output conforming to "
-         "diagnostics schema v1.0.0\n"
-      << "  --section <name>   Diagnostic section to run: all, inventory, "
-         "platform, gpu, npu\n"
-      << "  -h, --help         Print help information\n";
+      << "  --json                       Emit structured JSON output "
+         "conforming "
+         "to diagnostics schema v1.0.0\n"
+      << "  --fingerprint                Generate canonical machine "
+         "fingerprint "
+         "and SHA-256 ID\n"
+      << "  --validate-artifact <path>   Validate a diagnostic/benchmark "
+         "artifact against schema & fingerprint\n"
+      << "  --output <path>              Write command output to specified "
+         "file\n"
+      << "  --section <name>             Diagnostic section to run: all, "
+         "inventory, platform, gpu, npu\n"
+      << "  -h, --help                   Print help information\n";
+}
+
+void OutputContent(std::string_view content, std::string_view output_file) {
+  std::cout << content;
+  if (!output_file.empty()) {
+    std::ofstream out{std::string(output_file)};
+    if (out.is_open()) {
+      out << content;
+    } else {
+      std::cerr << "Warning: could not write output to file: " << output_file
+                << "\n";
+    }
+  }
 }
 
 }  // namespace
@@ -35,9 +59,11 @@ diagnostics::DiagnosticReport CollectDiagnostics(
   const auto inventory = diagnostics::CollectSystemInventory(sysfs);
   const auto compatibility =
       diagnostics::EvaluateCompatibility(inventory, section);
+  const auto fingerprint = diagnostics::GenerateMachineFingerprint(inventory);
 
   report.SetInventory(inventory);
   report.SetCompatibility(compatibility);
+  report.SetFingerprint(fingerprint);
 
   // 1. Platform Check
   if (section == "all" || section == "platform" || section == "inventory") {
@@ -64,6 +90,7 @@ diagnostics::DiagnosticReport CollectDiagnostics(
     sys_check.message = "Host operating system and kernel identified";
     sys_check.details["kernelRelease"] = inventory.toolchain.kernel_release;
     report.AddCheck(std::move(sys_check));
+
     diagnostics::DiagnosticCheck cpu_check;
     cpu_check.name = "cpu";
     cpu_check.status = diagnostics::DiagnosticStatus::kPass;
@@ -159,6 +186,9 @@ diagnostics::DiagnosticReport CollectDiagnostics(
 
 int RunDiagnose(std::span<const char* const> args) {
   bool json_mode = false;
+  bool fingerprint_mode = false;
+  std::string validate_artifact_path;
+  std::string output_file;
   std::string section = "all";
   std::size_t start_idx = 0;
 
@@ -177,6 +207,26 @@ int RunDiagnose(std::span<const char* const> args) {
     const std::string_view arg = args[i];
     if (arg == "--json") {
       json_mode = true;
+    } else if (arg == "--fingerprint") {
+      fingerprint_mode = true;
+    } else if (arg == "--validate-artifact") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "Error: --validate-artifact requires a path argument\n";
+        PrintDiagnoseHelp("strix-server");
+        return 2;
+      }
+      validate_artifact_path = args[++i];
+    } else if (arg.starts_with("--validate-artifact=")) {
+      validate_artifact_path = std::string(arg.substr(20));
+    } else if (arg == "--output") {
+      if (i + 1 >= args.size()) {
+        std::cerr << "Error: --output requires a file path argument\n";
+        PrintDiagnoseHelp("strix-server");
+        return 2;
+      }
+      output_file = args[++i];
+    } else if (arg.starts_with("--output=")) {
+      output_file = std::string(arg.substr(9));
     } else if (arg == "--help" || arg == "-h") {
       PrintDiagnoseHelp("strix-server");
       return 0;
@@ -196,13 +246,30 @@ int RunDiagnose(std::span<const char* const> args) {
     }
   }
 
-  const auto report = CollectDiagnostics(diagnostics::LinuxSysfs(), section);
-
-  if (json_mode) {
-    std::cout << report.ToJson();
-  } else {
-    std::cout << report.ToHuman();
+  // Handle artifact validation mode
+  if (!validate_artifact_path.empty()) {
+    const auto result =
+        diagnostics::ValidateArtifactFile(validate_artifact_path);
+    const std::string content = json_mode ? result.ToJson() : result.ToHuman();
+    OutputContent(content, output_file);
+    return result.is_valid ? 0 : 1;
   }
+
+  // Handle fingerprint mode
+  if (fingerprint_mode) {
+    const auto inventory =
+        diagnostics::CollectSystemInventory(diagnostics::LinuxSysfs());
+    const auto fingerprint = diagnostics::GenerateMachineFingerprint(inventory);
+    const std::string content =
+        json_mode ? fingerprint.ToJson() : fingerprint.ToHuman();
+    OutputContent(content, output_file);
+    return 0;
+  }
+
+  // Handle default diagnostics report
+  const auto report = CollectDiagnostics(diagnostics::LinuxSysfs(), section);
+  const std::string content = json_mode ? report.ToJson() : report.ToHuman();
+  OutputContent(content, output_file);
 
   if (report.Status() == diagnostics::DiagnosticStatus::kFail) {
     return 1;

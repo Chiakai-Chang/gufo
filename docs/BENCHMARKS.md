@@ -118,10 +118,24 @@ Real kernel speed (HIP gfx1151 / XDNA2 AIE2P consuming packed planes
 directly) is a separate, later milestone. Kernel benchmarks will record the
 backend and kernel name per timing row.
 
+## Machine Fingerprint & Artifact Binding
+
+All diagnostic and benchmark artifacts must embed a canonical machine fingerprint
+and its SHA-256 identifier (`fingerprintId`):
+
+- **Canonical Identity**: Records pinned CPU topology, gfx1151 GPU identity/CUs,
+  XDNA2 NPU identity, kernel drivers (`amdgpu`, `amdxdna`), ROCm/HIP, and XRT toolchain pins.
+- **Privacy Redaction**: Hostnames, usernames, process secrets, timestamps, and local
+  user paths are strictly excluded from the canonical identity and forbidden in benchmark artifacts.
+- **Validation**: Artifacts can be validated with `strix-server diagnose --validate-artifact <path>`,
+  which checks schema compliance (`schemaVersion: 1.0.0`), re-hashes canonical fields,
+  and rejects mismatched fingerprints or incompatible architectures.
+
 ## Reporting rules
 
 Every report records, at minimum:
 
+- Machine `fingerprintId` referencing the canonical machine fingerprint.
 - Source repo + immutable revision, source storage dtype (bf16), accumulation
   contract.
 - Candidate: which tensors quantized, the SHQ4 scheme (T16, U4Z, group size),
@@ -131,5 +145,5 @@ Every report records, at minimum:
 - `--json` output is machine-readable; human form prints speed then quality.
 
 A benchmark result is only comparable against another result with the same
-source revision, suite, tokenizer, and reference runtime. Do not average
+machine fingerprint, source revision, suite, tokenizer, and reference runtime. Do not average
 numbers across revisions or suites.
