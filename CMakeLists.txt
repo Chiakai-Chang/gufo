@@ -51,6 +51,21 @@ if (ENGINE_ENABLE_XRT)
   message(STATUS "strix: XRT NPU shim enabled, include=${XRT_INCLUDE_DIR}")
 endif()
 
+# Compiler warnings and sanitizers
+option(STRIX_ENABLE_WARNINGS "Enable compiler warnings" ON)
+option(STRIX_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+
+if (STRIX_ENABLE_WARNINGS)
+  if (CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wall -Wextra -Wpedantic)
+  endif()
+endif()
+
+if (STRIX_ENABLE_SANITIZERS)
+  add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+  add_link_options(-fsanitize=address,undefined)
+endif()
+
 add_executable(strix src/main.cpp)
 
 if (ENGINE_ENABLE_HIP)
@@ -68,3 +83,27 @@ add_executable(strix-server src/server/main.cpp)
 
 install(TARGETS strix strix-server DESTINATION bin)
 
+# CTest integration
+include(CTest)
+
+if (BUILD_TESTING)
+  add_test(NAME strix_server_version COMMAND strix-server --version)
+  set_tests_properties(strix_server_version PROPERTIES LABELS "cpu")
+
+  add_test(NAME strix_server_help COMMAND strix-server --help)
+  set_tests_properties(strix_server_help PROPERTIES LABELS "cpu")
+
+  if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
+    add_test(NAME strix_npu_smoke COMMAND strix)
+    set_tests_properties(strix_npu_smoke PROPERTIES LABELS "npu;xdna2;xrt;hip;gpu")
+  elseif (ENGINE_ENABLE_HIP)
+    add_test(NAME strix_hip_smoke COMMAND strix)
+    set_tests_properties(strix_hip_smoke PROPERTIES LABELS "hip;gpu")
+  elseif (ENGINE_ENABLE_XRT)
+    add_test(NAME strix_npu_smoke COMMAND strix)
+    set_tests_properties(strix_npu_smoke PROPERTIES LABELS "npu;xdna2;xrt")
+  else()
+    add_test(NAME strix_cpu_smoke COMMAND strix)
+    set_tests_properties(strix_cpu_smoke PROPERTIES LABELS "cpu")
+  endif()
+endif()

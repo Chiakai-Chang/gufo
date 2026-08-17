@@ -45,6 +45,55 @@ nix build
 ./result/bin/strix
 ```
 
+## Development Presets
+
+Reproducible CMake presets are configured in `CMakePresets.json` and must be entered through the Nix development environment (`nix develop`). Direct host CMake is unsupported.
+
+| Preset | Purpose | Description |
+| --- | --- | --- |
+| `development` | Development | CPU-only Debug build with warnings (`-Wall -Wextra -Wpedantic`) |
+| `release` | Release | CPU-only optimized Release build |
+| `sanitizer` | Diagnostics | CPU-only build with AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) |
+| `test` | Unit Tests | CPU-only test suite executed with CTest |
+| `hip-test` | GPU Tests | ROCm/HIP enabled for `gfx1151` without XRT |
+| `npu-test` | Full Stack Tests | Pinned ROCm/HIP (`gfx1151`) and XRT (`XDNA2`) research stack |
+
+### Development Workflow
+
+```sh
+# Development build
+nix develop -c cmake --preset development
+nix develop -c cmake --build --preset development
+
+# Release build
+nix develop -c cmake --preset release
+nix develop -c cmake --build --preset release
+
+# Sanitizer build & test
+nix develop -c cmake --preset sanitizer
+nix develop -c cmake --build --preset sanitizer
+nix develop -c ctest --preset sanitizer --output-on-failure
+
+# CPU tests
+nix develop -c cmake --preset test
+nix develop -c cmake --build --preset test
+nix develop -c ctest --preset test --output-on-failure
+
+# HIP GPU tests (gfx1151)
+nix develop -c cmake --preset hip-test
+nix develop -c cmake --build --preset hip-test
+nix develop -c ctest --preset hip-test --output-on-failure
+
+# NPU tests (HIP + XRT)
+nix develop -c cmake --preset npu-test
+nix develop -c cmake --build --preset npu-test
+nix develop -c ctest --preset npu-test --output-on-failure
+```
+
+Hardware presets label tests so unavailable devices skip normally during development. Strict presence validation can be enforced with:
+- `STRIX_REQUIRE_HIP=1` (or `STRIX_REQUIRE_GPU=1`)
+- `STRIX_REQUIRE_XDNA2=1` (or `STRIX_REQUIRE_NPU=1`)
+
 ## Reference Projects
 
 The initial design is informed by the following open source projects:

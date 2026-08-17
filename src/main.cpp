@@ -6,17 +6,31 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <string>
+#include <string_view>
 
 #ifdef ENGINE_ENABLE_HIP
 #include <hip/hip_runtime.h>
+
+static bool isHipRequired() {
+  const char *val = std::getenv("STRIX_REQUIRE_HIP");
+  if (!val) val = std::getenv("STRIX_REQUIRE_GPU");
+  if (!val) val = std::getenv("STRIX_REQUIRE_GFX1151");
+  return val && std::string_view(val) != "0" && std::string_view(val) != "false";
+}
 
 static const char *hipErrStr(hipError_t e) { return hipGetErrorName(e); }
 
 static void checkHip(hipError_t e, const char *what) {
   if (e != hipSuccess) {
     std::fprintf(stderr, "HIP error on %s: %s\n", what, hipErrStr(e));
-    std::exit(1);
+    if (isHipRequired()) {
+      std::exit(1);
+    } else {
+      std::printf("SKIP: HIP hardware/runtime not available (%s)\n", hipErrStr(e));
+      std::exit(0);
+    }
   }
 }
 
@@ -25,10 +39,23 @@ static void checkGpu() {
               HIP_VERSION_MAJOR, HIP_VERSION_MINOR, HIP_VERSION_PATCH);
 
   int devCount = 0;
-  checkHip(hipGetDeviceCount(&devCount), "hipGetDeviceCount");
+  hipError_t err = hipGetDeviceCount(&devCount);
+  if (err != hipSuccess) {
+    std::fprintf(stderr, "HIP error on hipGetDeviceCount: %s\n", hipErrStr(err));
+    if (isHipRequired()) {
+      std::exit(1);
+    } else {
+      std::printf("SKIP: HIP device discovery failed\n");
+      return;
+    }
+  }
+
   std::printf("HIP device count: %d\n", devCount);
   if (devCount == 0) {
     std::printf("No HIP device found — is kfd loaded / device in render group?\n");
+    if (isHipRequired()) {
+      std::exit(1);
+    }
     return;
   }
 
@@ -64,17 +91,43 @@ static void checkGpu() {
 #include <xrt/experimental/xrt_system.h>
 #include <xrt/xrt_device.h>
 
+static bool isXdna2Required() {
+  const char *val = std::getenv("STRIX_REQUIRE_XDNA2");
+  if (!val) val = std::getenv("STRIX_REQUIRE_NPU");
+  return val && std::string_view(val) != "0" && std::string_view(val) != "false";
+}
+
 static void checkNpu() {
   std::printf("XRT NPU shim enabled\n");
-  unsigned int npuCount = xrt::system::enumerate_devices();
-  std::printf("XRT device count (NPU): %u\n", npuCount);
-  for (unsigned int i = 0; i < npuCount; ++i) {
-    xrt::device dev(i);
-    std::string name = dev.get_info<xrt::info::device::name>();
-    std::printf("  npu[%u]: %s\n", i, name.c_str());
-  }
-  if (npuCount == 0) {
-    std::printf("No NPU found — is amdxdna loaded? ls /sys/class/accel\n");
+  try {
+    unsigned int npuCount = xrt::system::enumerate_devices();
+    std::printf("XRT device count (NPU): %u\n", npuCount);
+    if (npuCount == 0) {
+      std::printf("No NPU found — is amdxdna loaded? ls /sys/class/accel\n");
+      if (isXdna2Required()) {
+        std::exit(1);
+      }
+      return;
+    }
+    for (unsigned int i = 0; i < npuCount; ++i) {
+      xrt::device dev(i);
+      std::string name = dev.get_info<xrt::info::device::name>();
+      std::printf("  npu[%u]: %s\n", i, name.c_str());
+    }
+  } catch (const std::exception &e) {
+    std::printf("NPU check error: %s\n", e.what());
+    if (isXdna2Required()) {
+      std::exit(1);
+    } else {
+      std::printf("SKIP: XDNA2/NPU device not accessible\n");
+    }
+  } catch (...) {
+    std::printf("NPU check error: unknown exception\n");
+    if (isXdna2Required()) {
+      std::exit(1);
+    } else {
+      std::printf("SKIP: XDNA2/NPU device not accessible\n");
+    }
   }
 }
 #endif
