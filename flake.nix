@@ -123,7 +123,7 @@
             echo "PASS: Documentation check clean" > $out/result.txt
           '';
 
-          # Canonical Milestone 0 PR umbrella check
+          # Canonical PR umbrella check (all quality gates)
           pr = pkgsSys.runCommand "check-pr" {
             nativeBuildInputs = [
               pkgsSys.stdenv.cc
