@@ -134,6 +134,13 @@ struct GgufTensorInfo {
   }
 };
 
+/// One contiguous mapped GGUF file region. Split models expose one region per
+/// shard while single-file and in-memory readers expose exactly one.
+struct GgufMappedRegion {
+  const void* data{nullptr};
+  std::size_t size{0};
+};
+
 /// Zero-copy, lightweight GGUF binary reader and tensor indexer.
 class GgufReader {
 public:
@@ -162,8 +169,13 @@ public:
   [[nodiscard]] std::uint64_t GetAlignment() const noexcept {
     return alignment_;
   }
+  /// Returns the contiguous backing pointer for single-file readers only.
   [[nodiscard]] const void* GetData() const noexcept { return data_; }
   [[nodiscard]] std::size_t GetSize() const noexcept { return size_; }
+  [[nodiscard]] std::span<const GgufMappedRegion> GetMappedRegions()
+      const noexcept {
+    return mapped_regions_;
+  }
 
   /// Metadata lookup helpers
   [[nodiscard]] const GgufMetadataValue* FindMetadata(
@@ -203,6 +215,12 @@ public:
 private:
   GgufReader() = default;
 
+  [[nodiscard]] static std::unique_ptr<GgufReader> OpenSingleFile(
+      const std::filesystem::path& path, std::string* error_msg);
+  [[nodiscard]] static std::unique_ptr<GgufReader> OpenSplitFileSet(
+      const std::filesystem::path& path, std::unique_ptr<GgufReader> first,
+      std::string* error_msg);
+
   bool ParseHeaders(std::string* error_msg);
 
   const std::uint8_t* data_{nullptr};
@@ -216,6 +234,8 @@ private:
   std::unordered_map<std::string_view, GgufMetadataValue> metadata_;
   std::vector<GgufTensorInfo> tensors_;
   std::unordered_map<std::string_view, std::size_t> tensor_index_;
+  std::vector<GgufMappedRegion> mapped_regions_;
+  std::vector<std::unique_ptr<GgufReader>> shards_;
 };
 
 }  // namespace strix::core

@@ -1,8 +1,12 @@
 #include "src/core/gguf_reader.hpp"
 
+#include <unistd.h>
+
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <string_view>
@@ -51,6 +55,13 @@ public:
   void AddMetadataUint64(std::string_view key, std::uint64_t val) {
     AppendString(key);
     AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kUint64));
+    AppendPod(val);
+    metadata_count_++;
+  }
+
+  void AddMetadataInt32(std::string_view key, std::int32_t val) {
+    AppendString(key);
+    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kInt32));
     AppendPod(val);
     metadata_count_++;
   }
@@ -208,24 +219,31 @@ void TestBasicGgufParsing() {
 void TestQwen38_27BParsing() {
   GgufBuilder builder;
   builder.AddMetadataString("general.architecture", "qwen35");
-  builder.AddMetadataString("general.name", "qwen3.8-27b-text");
-  builder.AddMetadataUint32("qwen35.block_count", 64);
+  builder.AddMetadataString("general.name", "Qwen3.8-27B");
+  builder.AddMetadataUint32("qwen35.block_count", 65);
   builder.AddMetadataUint32("qwen35.embedding_length", 5120);
-  builder.AddMetadataUint32("qwen35.feed_forward_length", 17920);
-  builder.AddMetadataUint32("qwen35.attention.head_count", 40);
-  builder.AddMetadataUint32("qwen35.attention.head_count_kv", 8);
-  builder.AddMetadataUint32("qwen35.attention.key_length", 128);
-  builder.AddMetadataUint32("qwen35.context_length", 131072);
+  builder.AddMetadataUint32("qwen35.feed_forward_length", 17408);
+  builder.AddMetadataUint32("qwen35.attention.head_count", 24);
+  builder.AddMetadataUint32("qwen35.attention.head_count_kv", 4);
+  builder.AddMetadataUint32("qwen35.attention.key_length", 256);
+  builder.AddMetadataUint32("qwen35.context_length", 262144);
   builder.AddMetadataUint32("qwen35.full_attention_interval", 4);
-  builder.AddMetadataFloat32("qwen35.rope.freq_base", 1000000.0F);
+  builder.AddMetadataUint32("qwen35.nextn_predict_layers", 1);
+  builder.AddMetadataUint32("qwen35.ssm.conv_kernel", 4);
+  builder.AddMetadataUint32("qwen35.ssm.state_size", 128);
+  builder.AddMetadataUint32("qwen35.ssm.group_count", 16);
+  builder.AddMetadataUint32("qwen35.ssm.time_step_rank", 48);
+  builder.AddMetadataUint32("qwen35.ssm.inner_size", 6144);
+  builder.AddMetadataUint32("qwen35.rope.dimension_count", 64);
+  builder.AddMetadataFloat32("qwen35.rope.freq_base", 10000000.0F);
 
   builder.AddTensor("token_embd.weight", {248320, 5120},
                     strix::core::GgmlType::kBF16, 0);
-  builder.AddTensor("blk.0.attn_q.weight", {5120, 5120},
+  builder.AddTensor("blk.3.attn_q.weight", {12288, 5120},
                     strix::core::GgmlType::kStrixSHQ4_T16, 64);
-  builder.AddTensor("blk.63.ffn_gate.weight", {17920, 5120},
+  builder.AddTensor("blk.63.ffn_gate.weight", {17408, 5120},
                     strix::core::GgmlType::kStrixSHQ4_T16, 128);
-  builder.AddTensor("mtp.0.proj.weight", {5120, 5120},
+  builder.AddTensor("blk.64.nextn.enorm.weight", {5120},
                     strix::core::GgmlType::kStrixSHQ8_T16, 192);
 
   auto binary = builder.Build(512);
@@ -241,16 +259,69 @@ void TestQwen38_27BParsing() {
   Expect(config.has_value(), "ExtractModelConfig succeeds for 27B: " + err);
   Expect(config->num_layers == 64, "64 layers for 27B");
   Expect(config->hidden_size == 5120, "5120 hidden size for 27B");
-  Expect(config->intermediate_size == 17920, "17920 intermediate size for 27B");
-  Expect(config->num_attention_heads == 40, "40 attention heads for 27B");
-  Expect(config->num_key_value_heads == 8, "8 KV heads for 27B");
-  Expect(config->head_dim == 128, "128 head dim for 27B");
-  Expect(config->context_length == 131072, "131072 context length for 27B");
+  Expect(config->intermediate_size == 17408, "17408 intermediate size for 27B");
+  Expect(config->num_attention_heads == 24, "24 attention heads for 27B");
+  Expect(config->num_key_value_heads == 4, "4 KV heads for 27B");
+  Expect(config->head_dim == 256, "256 head dim for 27B");
+  Expect(config->context_length == 262144, "262144 context length for 27B");
   Expect(config->full_attention_interval == 4,
          "full_attention_interval 4 for 27B");
   Expect(config->mtp_num_layers == 1, "MTP layer count 1 for 27B");
+  Expect(config->AttentionSize() == 6144, "6144 full-attention width for 27B");
+  Expect(config->FullAttentionLayerCount() == 16,
+         "16 full-attention layers for 27B");
+  Expect(config->SsmQkvSize() == 10240, "10240 SSM QKV width for 27B");
+  Expect(config->SsmValueSize() == 128, "128 SSM value width for 27B");
   Expect(config->is_text_only, "is_text_only true for 27B");
   Expect(config->IsValidQwen(), "IsValidQwen true for 27B");
+}
+
+void WriteBinaryFile(const std::filesystem::path& path,
+                     const std::vector<std::uint8_t>& data) {
+  std::ofstream out(path, std::ios::binary);
+  out.write(reinterpret_cast<const char*>(data.data()),
+            static_cast<std::streamsize>(data.size()));
+  Expect(out.good(), "Write GGUF test shard");
+}
+
+void TestSplitGgufDiscovery() {
+  const auto temp_dir =
+      std::filesystem::temp_directory_path() /
+      ("strix-gguf-reader-" + std::to_string(static_cast<long>(getpid())));
+  std::filesystem::create_directories(temp_dir);
+  const auto first_path = temp_dir / "model-00001-of-00002.gguf";
+  const auto second_path = temp_dir / "model-00002-of-00002.gguf";
+
+  GgufBuilder first;
+  first.AddMetadataString("general.architecture", "qwen35");
+  first.AddMetadataUint32("split.no", 0);
+  first.AddMetadataUint32("split.count", 2);
+  first.AddMetadataInt32("split.tensors.count", 2);
+  first.AddTensor("token_embd.weight", {8, 4}, strix::core::GgmlType::kBF16, 0);
+
+  GgufBuilder second;
+  second.AddMetadataUint32("split.no", 1);
+  second.AddMetadataUint32("split.count", 2);
+  second.AddMetadataInt32("split.tensors.count", 2);
+  second.AddTensor("output_norm.weight", {4}, strix::core::GgmlType::kF32, 0);
+
+  WriteBinaryFile(first_path, first.Build(128));
+  WriteBinaryFile(second_path, second.Build(128));
+
+  std::string err;
+  const auto reader = strix::core::GgufReader::OpenFile(second_path, &err);
+  Expect(reader != nullptr, "Split reader opens from any shard: " + err);
+  Expect(reader->GetTensorCount() == 2, "Split reader merges tensor indexes");
+  Expect(reader->FindTensor("token_embd.weight") != nullptr,
+         "Tensor from first shard found");
+  Expect(reader->FindTensor("output_norm.weight") != nullptr,
+         "Tensor from second shard found");
+  Expect(reader->GetMappedRegions().size() == 2,
+         "Split reader exposes two mapped regions");
+  Expect(reader->GetData() == nullptr,
+         "Split reader has no single contiguous backing pointer");
+
+  std::filesystem::remove_all(temp_dir);
 }
 
 void TestVisionExclusionValidation() {
@@ -304,6 +375,7 @@ int main() {
   std::cout << "Running GgufReader unit tests...\n";
   TestBasicGgufParsing();
   TestQwen38_27BParsing();
+  TestSplitGgufDiscovery();
   TestVisionExclusionValidation();
   TestMalformedGgufRejection();
   std::cout << "All GgufReader tests passed successfully!\n";

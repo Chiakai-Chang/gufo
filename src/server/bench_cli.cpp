@@ -25,6 +25,19 @@
 namespace strix::server {
 namespace {
 
+void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
+                        bool success = true) {
+  const double load_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  auto& output = success ? std::cout : std::cerr;
+  output << "[Model Load]: " << load_seconds << " s";
+  if (!success) {
+    output << " (failed)";
+  }
+  output << '\n';
+}
+
 void PrintBenchHelp(std::string_view program_name) {
   std::cout << "Usage: " << program_name << " bench [options]\n\n"
             << "Benchmark prompt processing (pp) and token generation (tg) "
@@ -213,11 +226,13 @@ int RunBench(std::span<const char* const> args) {
 
   const auto& opt = *opt_res;
 
+  const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
   const auto reader = strix::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
+    PrintModelLoadTime(model_load_start, false);
     return 1;
   }
 
@@ -225,6 +240,7 @@ int RunBench(std::span<const char* const> args) {
   int device_count = 0;
   if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
     std::cerr << "Error: No HIP GPU devices available for benchmarking.\n";
+    PrintModelLoadTime(model_load_start, false);
     return 1;
   }
 
@@ -244,13 +260,21 @@ int RunBench(std::span<const char* const> args) {
   auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(*reader, &err);
   if (!gpu_exec) {
     std::cerr << "Error creating Qwen GPU executor: " << err << "\n";
+    PrintModelLoadTime(model_load_start, false);
     return 1;
   }
+  PrintModelLoadTime(model_load_start);
 
   const auto& config = gpu_exec->GetConfig();
-  const std::string model_name = config.architecture + " 4B BF16";
-  const double model_size_gib = 7.84;
-  const double model_params_b = 4.21;
+  const std::string model_name = config.model_name + " BF16";
+  const double model_size_gib =
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
+  std::uint64_t parameter_count = 0;
+  for (const auto& tensor : reader->GetTensors()) {
+    parameter_count += tensor.ElementCount();
+  }
+  const double model_params_b =
+      static_cast<double>(parameter_count) / 1'000'000'000.0;
 
   std::cout << "| " << std::left << std::setw(30) << "model"
             << " | " << std::right << std::setw(10) << "size"
@@ -368,6 +392,7 @@ int RunBench(std::span<const char* const> args) {
   return 0;
 #else
   std::cerr << "Error: Strix GPU benchmark requires ENGINE_ENABLE_HIP=ON\n";
+  PrintModelLoadTime(model_load_start, false);
   return 1;
 #endif
 }

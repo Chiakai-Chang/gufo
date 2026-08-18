@@ -22,6 +22,19 @@
 namespace strix::server {
 namespace {
 
+void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
+                        bool success = true) {
+  const double load_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+          .count();
+  auto& output = success ? std::cout : std::cerr;
+  output << "[Model Load]: " << load_seconds << " s";
+  if (!success) {
+    output << " (failed)";
+  }
+  output << '\n';
+}
+
 void PrintPromptHelp(std::string_view program_name) {
   std::cout
       << "Usage: " << program_name << " prompt [OPTIONS] <PROMPT>\n\n"
@@ -193,11 +206,13 @@ int RunPrompt(std::span<const char* const> args) {
     return 0;
   }
 
+  const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
   const auto reader = strix::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
+    PrintModelLoadTime(model_load_start, false);
     return 1;
   }
 
@@ -222,6 +237,7 @@ int RunPrompt(std::span<const char* const> args) {
       dev_count > 0) {
     auto gpu_exec = strix::hip::QwenGpuExecutor::CreateFromGguf(*reader, &err);
     if (gpu_exec) {
+      PrintModelLoadTime(model_load_start);
       const auto prompt_tokens =
           gpu_exec->GetTokenizer().Encode(rendered_prompt);
 
@@ -276,8 +292,10 @@ int RunPrompt(std::span<const char* const> args) {
   auto generator = models::QwenGenerator::CreateFromGguf(*reader, &err);
   if (!generator) {
     std::cerr << "Error creating Qwen generator: " << err << "\n";
+    PrintModelLoadTime(model_load_start, false);
     return 1;
   }
+  PrintModelLoadTime(model_load_start);
 
   const auto prompt_tokens = generator->GetTokenizer().Encode(rendered_prompt);
 
@@ -343,19 +361,23 @@ int RunChat(std::span<const char* const> args) {
     return 0;
   }
 
+  const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
   const auto reader = strix::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
+    PrintModelLoadTime(model_load_start, false);
     return 1;
   }
 
   auto generator = models::QwenGenerator::CreateFromGguf(*reader, &err);
   if (!generator) {
     std::cerr << "Error creating Qwen generator: " << err << "\n";
+    PrintModelLoadTime(model_load_start, false);
     return 1;
   }
+  PrintModelLoadTime(model_load_start);
 
   std::cout << "=== Strix Halo Interactive Chat ("
             << generator->GetConfig().architecture << ") ===\n"

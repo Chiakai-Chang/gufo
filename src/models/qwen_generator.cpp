@@ -13,9 +13,13 @@ QwenGenerator::QwenGenerator(
     std::uint32_t max_context)
     : weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
-      kv_cache_(weights_.config.num_layers, weights_.config.num_key_value_heads,
-                max_context, weights_.config.head_dim),
-      ssm_cache_(weights_.config.num_layers, 8192, 32, 128, 128),
+      kv_cache_(weights_.config.FullAttentionLayerCount(),
+                weights_.config.num_key_value_heads, max_context,
+                weights_.config.head_dim),
+      ssm_cache_(
+          weights_.config.num_layers, weights_.config.SsmQkvSize(),
+          weights_.config.ssm_conv_kernel, weights_.config.ssm_time_step_rank,
+          weights_.config.ssm_state_size, weights_.config.SsmValueSize()),
       arena_(weights_.config) {}
 
 std::unique_ptr<QwenGenerator> QwenGenerator::CreateFromGguf(

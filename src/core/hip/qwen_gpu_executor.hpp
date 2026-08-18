@@ -1,6 +1,7 @@
 #ifndef STRIX_CORE_HIP_QWEN_GPU_EXECUTOR_HPP_
 #define STRIX_CORE_HIP_QWEN_GPU_EXECUTOR_HPP_
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -20,6 +21,14 @@
 #include <hipblas/hipblas.h>
 
 namespace strix::hip {
+
+struct QwenGpuWeightRegion {
+  const void* host_data{nullptr};
+  void* device_data{nullptr};
+  std::size_t size{0};
+  bool owns_device_memory{false};
+  bool host_registered{false};
+};
 
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
@@ -64,6 +73,9 @@ public:
   [[nodiscard]] std::uint32_t GetMaxBatch() const noexcept {
     return max_batch_;
   }
+  [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
+    return max_context_;
+  }
 
 private:
   void FreeAll() noexcept;
@@ -78,7 +90,7 @@ class QwenGpuExecutor {
 public:
   QwenGpuExecutor(models::QwenModelWeights weights,
                   std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
-                  void* d_model_weights = nullptr,
+                  std::vector<QwenGpuWeightRegion> weight_regions,
                   std::uint32_t max_context = 4096);
   ~QwenGpuExecutor();
 
@@ -117,7 +129,7 @@ public:
 private:
   models::QwenModelWeights weights_;
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
-  void* d_model_weights_{nullptr};
+  std::vector<QwenGpuWeightRegion> weight_regions_;
   QwenGpuArena arena_;
   std::vector<float> h_logits_;
 };

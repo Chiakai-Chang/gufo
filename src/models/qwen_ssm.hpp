@@ -16,12 +16,12 @@ namespace strix::models {
 class QwenSsmCache {
 public:
   QwenSsmCache(std::uint32_t num_layers, std::size_t conv_channels,
-               std::uint32_t num_heads, std::uint32_t key_dim,
-               std::uint32_t val_dim);
+               std::uint32_t conv_kernel, std::uint32_t num_heads,
+               std::uint32_t key_dim, std::uint32_t val_dim);
 
   void Reset() noexcept;
 
-  /// Returns rolling conv state buffer for given layer [conv_channels * 4]
+  /// Returns rolling conv state buffer for the given layer.
   [[nodiscard]] std::span<float> GetConvState(std::uint32_t layer) noexcept;
 
   /// Returns recurrent DeltaNet state matrix for given layer and head
@@ -36,6 +36,7 @@ public:
 private:
   std::uint32_t num_layers_;
   std::size_t conv_channels_;
+  std::uint32_t conv_kernel_;
   std::uint32_t num_heads_;
   std::uint32_t key_dim_;
   std::uint32_t val_dim_;
@@ -52,8 +53,8 @@ private:
 /// 6. Gated activation: y = RMSNorm(o) * SiLU(gate)
 /// 7. Linear output projection to out
 void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
-                QwenSsmCache& ssm_cache, std::uint32_t layer_idx,
-                std::span<float> ssm_qkv_scratch,
+                const core::ModelConfig& config, QwenSsmCache& ssm_cache,
+                std::uint32_t layer_idx, std::span<float> ssm_qkv_scratch,
                 std::span<float> ssm_gate_scratch,
                 std::span<float> ssm_out_scratch,
                 std::span<float> out) noexcept;

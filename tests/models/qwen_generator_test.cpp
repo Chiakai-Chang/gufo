@@ -18,7 +18,7 @@ void TestSyntheticGeneration() {
   config.head_dim = 2;
   config.vocab_size = 8;
   config.context_length = 32;
-  config.full_attention_interval = 4;
+  config.full_attention_interval = 1;
   config.is_text_only = true;
 
   // Embedding table [vocab=8, hidden=4]

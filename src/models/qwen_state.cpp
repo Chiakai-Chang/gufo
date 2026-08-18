@@ -20,6 +20,33 @@ QwenTensorRef ExtractTensorRef(const core::GgufReader& reader,
           .num_elements = tensor->ElementCount()};
 }
 
+bool ValidateTensor(const QwenTensorRef& tensor, std::size_t expected_elements,
+                    std::string_view name, std::string* error_msg) {
+  if (tensor.empty()) {
+    if (error_msg != nullptr) {
+      *error_msg = "Missing required Qwen tensor: " + std::string(name);
+    }
+    return false;
+  }
+  if (tensor.type != core::GgmlType::kF32 &&
+      tensor.type != core::GgmlType::kBF16) {
+    if (error_msg != nullptr) {
+      *error_msg = "Unsupported tensor type for " + std::string(name) + ": " +
+                   std::string(core::ToString(tensor.type));
+    }
+    return false;
+  }
+  if (tensor.num_elements != expected_elements) {
+    if (error_msg != nullptr) {
+      *error_msg = "Tensor shape mismatch for " + std::string(name) +
+                   ": expected " + std::to_string(expected_elements) +
+                   " elements, found " + std::to_string(tensor.num_elements);
+    }
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
@@ -38,6 +65,16 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
   if (weights.output.empty()) {
     // Tied LM head shares token embeddings
     weights.output = weights.token_embd;
+  }
+  const std::size_t hidden_size = weights.config.hidden_size;
+  const std::size_t vocab_size = weights.config.vocab_size;
+  if (!ValidateTensor(weights.token_embd, vocab_size * hidden_size,
+                      "token_embd.weight", error_msg) ||
+      !ValidateTensor(weights.output_norm, hidden_size, "output_norm.weight",
+                      error_msg) ||
+      !ValidateTensor(weights.output, vocab_size * hidden_size, "output.weight",
+                      error_msg)) {
+    return std::nullopt;
   }
 
   weights.layers.resize(weights.config.num_layers);
@@ -118,6 +155,76 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
     l.ffn_gate = ExtractTensorRef(reader, prefix + "ffn_gate.weight");
     l.ffn_up = ExtractTensorRef(reader, prefix + "ffn_up.weight");
     l.ffn_down = ExtractTensorRef(reader, prefix + "ffn_down.weight");
+
+    const bool expected_full_attention =
+        ((i + 1) % weights.config.full_attention_interval) == 0;
+    if (l.is_full_attention != expected_full_attention) {
+      if (error_msg != nullptr) {
+        *error_msg =
+            "Unexpected Qwen layer kind at blk." + std::to_string(i) +
+            ": expected " +
+            (expected_full_attention ? "full attention" : "Gated DeltaNet");
+      }
+      return std::nullopt;
+    }
+
+    const std::size_t intermediate_size = weights.config.intermediate_size;
+    if (!ValidateTensor(l.attn_norm, hidden_size, prefix + "attn_norm.weight",
+                        error_msg) ||
+        !ValidateTensor(l.ffn_norm, hidden_size,
+                        prefix + "post_attention_norm.weight", error_msg) ||
+        !ValidateTensor(l.ffn_gate, intermediate_size * hidden_size,
+                        prefix + "ffn_gate.weight", error_msg) ||
+        !ValidateTensor(l.ffn_up, intermediate_size * hidden_size,
+                        prefix + "ffn_up.weight", error_msg) ||
+        !ValidateTensor(l.ffn_down, hidden_size * intermediate_size,
+                        prefix + "ffn_down.weight", error_msg)) {
+      return std::nullopt;
+    }
+
+    if (l.is_full_attention) {
+      const std::size_t attention_size = weights.config.AttentionSize();
+      const std::size_t kv_size =
+          static_cast<std::size_t>(weights.config.num_key_value_heads) *
+          weights.config.head_dim;
+      if (!ValidateTensor(l.attn_q, 2 * attention_size * hidden_size,
+                          prefix + "attn_q.weight", error_msg) ||
+          !ValidateTensor(l.attn_k, kv_size * hidden_size,
+                          prefix + "attn_k.weight", error_msg) ||
+          !ValidateTensor(l.attn_v, kv_size * hidden_size,
+                          prefix + "attn_v.weight", error_msg) ||
+          !ValidateTensor(l.attn_output, hidden_size * attention_size,
+                          prefix + "attn_output.weight", error_msg) ||
+          !ValidateTensor(l.attn_q_norm, weights.config.head_dim,
+                          prefix + "attn_q_norm.weight", error_msg) ||
+          !ValidateTensor(l.attn_k_norm, weights.config.head_dim,
+                          prefix + "attn_k_norm.weight", error_msg)) {
+        return std::nullopt;
+      }
+    } else {
+      const std::size_t qkv_size = weights.config.SsmQkvSize();
+      const std::size_t inner_size = weights.config.ssm_inner_size;
+      const std::size_t rank = weights.config.ssm_time_step_rank;
+      if (!ValidateTensor(l.attn_qkv, qkv_size * hidden_size,
+                          prefix + "attn_qkv.weight", error_msg) ||
+          !ValidateTensor(l.attn_gate, inner_size * hidden_size,
+                          prefix + "attn_gate.weight", error_msg) ||
+          !ValidateTensor(l.ssm_a, rank, prefix + "ssm_a", error_msg) ||
+          !ValidateTensor(l.ssm_conv1d,
+                          qkv_size * weights.config.ssm_conv_kernel,
+                          prefix + "ssm_conv1d.weight", error_msg) ||
+          !ValidateTensor(l.ssm_dt, rank, prefix + "ssm_dt.bias", error_msg) ||
+          !ValidateTensor(l.ssm_alpha, rank * hidden_size,
+                          prefix + "ssm_alpha.weight", error_msg) ||
+          !ValidateTensor(l.ssm_beta, rank * hidden_size,
+                          prefix + "ssm_beta.weight", error_msg) ||
+          !ValidateTensor(l.ssm_norm, weights.config.SsmValueSize(),
+                          prefix + "ssm_norm.weight", error_msg) ||
+          !ValidateTensor(l.ssm_out, hidden_size * inner_size,
+                          prefix + "ssm_out.weight", error_msg)) {
+        return std::nullopt;
+      }
+    }
   }
 
   return weights;
@@ -181,8 +288,7 @@ std::span<const float> QwenKvCache::GetValueSlice(
 
 QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   const std::size_t hidden_size = config.hidden_size;
-  const std::size_t q_size =
-      static_cast<std::size_t>(config.num_attention_heads) * config.head_dim;
+  const std::size_t q_size = config.AttentionSize();
   const std::size_t kv_size =
       static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
   const std::size_t max_context =
@@ -190,12 +296,15 @@ QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
 
-  const std::size_t ssm_qkv_size = 8192;
-  const std::size_t ssm_gate_size = 4096;
+  const std::size_t ssm_qkv_size =
+      std::max<std::size_t>(config.SsmQkvSize(), 2 * q_size);
+  const std::size_t ssm_gate_size =
+      std::max<std::size_t>(config.ssm_inner_size, q_size);
 
-  const std::size_t total_size =
-      (hidden_size * 3) + q_size + (kv_size * 2) + max_context +
-      (intermediate_size * 4) + ssm_qkv_size + (ssm_gate_size * 2) + vocab_size;
+  const std::size_t total_size = (hidden_size * 4) + q_size + (kv_size * 2) +
+                                 max_context + (intermediate_size * 3) +
+                                 ssm_qkv_size + ssm_gate_size +
+                                 config.ssm_inner_size + vocab_size;
   buffer.resize(total_size, 0.0F);
 
   std::size_t cur = 0;
@@ -218,7 +327,7 @@ QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   mlp_out = alloc_span(hidden_size);
   ssm_qkv = alloc_span(ssm_qkv_size);
   ssm_gate = alloc_span(ssm_gate_size);
-  ssm_out_buf = alloc_span(ssm_gate_size);
+  ssm_out_buf = alloc_span(config.ssm_inner_size);
   logits = alloc_span(vocab_size);
 }
 

@@ -13,15 +13,16 @@
 namespace strix::models {
 
 QwenSsmCache::QwenSsmCache(std::uint32_t num_layers, std::size_t conv_channels,
-                           std::uint32_t num_heads, std::uint32_t key_dim,
-                           std::uint32_t val_dim)
+                           std::uint32_t conv_kernel, std::uint32_t num_heads,
+                           std::uint32_t key_dim, std::uint32_t val_dim)
     : num_layers_(num_layers),
       conv_channels_(conv_channels),
+      conv_kernel_(conv_kernel),
       num_heads_(num_heads),
       key_dim_(key_dim),
       val_dim_(val_dim) {
   const std::size_t total_conv =
-      static_cast<std::size_t>(num_layers_) * conv_channels_ * 4;
+      static_cast<std::size_t>(num_layers_) * conv_channels_ * conv_kernel_;
   const std::size_t total_deltanet =
       static_cast<std::size_t>(num_layers_) * num_heads_ * key_dim_ * val_dim_;
   conv_states_.resize(total_conv, 0.0F);
@@ -35,8 +36,8 @@ void QwenSsmCache::Reset() noexcept {
 
 std::span<float> QwenSsmCache::GetConvState(std::uint32_t layer) noexcept {
   const std::size_t offset =
-      static_cast<std::size_t>(layer) * conv_channels_ * 4;
-  return {&conv_states_[offset], conv_channels_ * 4};
+      static_cast<std::size_t>(layer) * conv_channels_ * conv_kernel_;
+  return {&conv_states_[offset], conv_channels_ * conv_kernel_};
 }
 
 std::span<float> QwenSsmCache::GetDeltaNetState(std::uint32_t layer,
@@ -61,18 +62,25 @@ namespace {
 }  // namespace
 
 void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
-                QwenSsmCache& ssm_cache, std::uint32_t layer_idx,
-                std::span<float> ssm_qkv_scratch,
+                const core::ModelConfig& config, QwenSsmCache& ssm_cache,
+                std::uint32_t layer_idx, std::span<float> ssm_qkv_scratch,
                 std::span<float> ssm_gate_scratch,
                 std::span<float> ssm_out_scratch,
                 std::span<float> out) noexcept {
   const std::size_t hidden_size = x_normed.size();
-  const std::size_t qkv_dim = 8192;
-  const std::size_t gate_dim = 4096;
-  const std::uint32_t num_k_heads = 16;
-  const std::uint32_t num_v_heads = 32;
-  const std::uint32_t key_dim = 128;
-  const std::uint32_t val_dim = 128;
+  const std::size_t qkv_dim = config.SsmQkvSize();
+  const std::size_t gate_dim = config.ssm_inner_size;
+  const std::uint32_t num_k_heads = config.ssm_group_count;
+  const std::uint32_t num_v_heads = config.ssm_time_step_rank;
+  const std::uint32_t key_dim = config.ssm_state_size;
+  const std::uint32_t val_dim = config.SsmValueSize();
+  const std::uint32_t conv_kernel = config.ssm_conv_kernel;
+
+  if (ssm_qkv_scratch.size() < qkv_dim || ssm_gate_scratch.size() < gate_dim ||
+      ssm_out_scratch.size() < gate_dim || out.size() < hidden_size) {
+    std::ranges::fill(out, 0.0F);
+    return;
+  }
 
   // 1. QKV, Gate, Alpha, and Beta Projections
   if (!layer.attn_qkv.empty()) {
@@ -88,13 +96,13 @@ void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
     std::ranges::fill(ssm_gate_scratch, 0.0F);
   }
 
-  std::vector<float> alpha_buf(32, 0.0F);
-  std::vector<float> beta_buf(32, 0.0F);
+  std::vector<float> alpha_buf(num_v_heads, 0.0F);
+  std::vector<float> beta_buf(num_v_heads, 0.0F);
   if (!layer.ssm_alpha.empty()) {
-    TensorGEMV(layer.ssm_alpha, x_normed, 32, hidden_size, alpha_buf);
+    TensorGEMV(layer.ssm_alpha, x_normed, num_v_heads, hidden_size, alpha_buf);
   }
   if (!layer.ssm_beta.empty()) {
-    TensorGEMV(layer.ssm_beta, x_normed, 32, hidden_size, beta_buf);
+    TensorGEMV(layer.ssm_beta, x_normed, num_v_heads, hidden_size, beta_buf);
   }
 
   // 2. 1D Causal Convolution with rolling conv state
@@ -103,18 +111,18 @@ void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
 
 #pragma omp parallel for schedule(static)
   for (std::size_t c = 0; c < qkv_dim; ++c) {
-    const std::size_t c_off = c * 4;
-    // Shift history: [0, 1, 2] <- [1, 2, 3]
-    conv_state[c_off + 0] = conv_state[c_off + 1];
-    conv_state[c_off + 1] = conv_state[c_off + 2];
-    conv_state[c_off + 2] = conv_state[c_off + 3];
-    conv_state[c_off + 3] = ssm_qkv_scratch[c];
+    const std::size_t c_off = c * conv_kernel;
+    for (std::uint32_t k = 1; k < conv_kernel; ++k) {
+      conv_state[c_off + k - 1] = conv_state[c_off + k];
+    }
+    conv_state[c_off + conv_kernel - 1] = ssm_qkv_scratch[c];
 
     // Compute convolution
     float dot = 0.0F;
     if (!layer.ssm_conv1d.empty()) {
-      for (std::size_t k = 0; k < 4; ++k) {
-        dot += conv_state[c_off + k] * layer.ssm_conv1d.Get((c * 4) + k);
+      for (std::uint32_t k = 0; k < conv_kernel; ++k) {
+        dot +=
+            conv_state[c_off + k] * layer.ssm_conv1d.Get((c * conv_kernel) + k);
       }
     } else {
       dot = ssm_qkv_scratch[c];
@@ -130,7 +138,7 @@ void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
   const float* v_ptr =
       conv_out.data() + (static_cast<std::size_t>(num_k_heads) * key_dim * 2);
 
-  // 4. Per-Head Gated DeltaNet Matrix Recurrence (32 heads, 128x128 state each)
+  // 4. Per-head Gated DeltaNet matrix recurrence.
 #pragma omp parallel for schedule(static)
   for (std::uint32_t h = 0; h < num_v_heads; ++h) {
     auto s_matrix = ssm_cache.GetDeltaNetState(layer_idx, h);
@@ -145,11 +153,11 @@ void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
     // = sigmoid(beta)
     float dt = 0.0F;
     if (!layer.ssm_dt.empty()) {
-      dt = layer.ssm_dt.Get(h % layer.ssm_dt.num_elements);
+      dt = layer.ssm_dt.Get(h);
     }
     float a_val = -0.05F;
     if (!layer.ssm_a.empty()) {
-      a_val = layer.ssm_a.Get(h % layer.ssm_a.num_elements);
+      a_val = layer.ssm_a.Get(h);
     }
     const float alpha_biased = alpha_buf[h] + dt;
     const float alpha_softplus = (alpha_biased > 20.0F)

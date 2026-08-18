@@ -9,9 +9,12 @@
 #include <array>
 #include <cstring>
 #include <filesystem>
+#include <iomanip>
 #include <memory>
 #include <optional>
+#include <regex>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -70,7 +73,9 @@ GgufReader::GgufReader(GgufReader&& other) noexcept
       alignment_(other.alignment_),
       metadata_(std::move(other.metadata_)),
       tensors_(std::move(other.tensors_)),
-      tensor_index_(std::move(other.tensor_index_)) {
+      tensor_index_(std::move(other.tensor_index_)),
+      mapped_regions_(std::move(other.mapped_regions_)),
+      shards_(std::move(other.shards_)) {
   other.data_ = nullptr;
   other.mmap_addr_ = nullptr;
   other.size_ = 0;
@@ -97,6 +102,8 @@ GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
     metadata_ = std::move(other.metadata_);
     tensors_ = std::move(other.tensors_);
     tensor_index_ = std::move(other.tensor_index_);
+    mapped_regions_ = std::move(other.mapped_regions_);
+    shards_ = std::move(other.shards_);
 
     other.data_ = nullptr;
     other.mmap_addr_ = nullptr;
@@ -108,6 +115,20 @@ GgufReader& GgufReader::operator=(GgufReader&& other) noexcept {
 }
 
 std::unique_ptr<GgufReader> GgufReader::OpenFile(
+    const std::filesystem::path& path, std::string* error_msg) {
+  auto first = OpenSingleFile(path, error_msg);
+  if (!first) {
+    return nullptr;
+  }
+
+  const auto split_count = first->GetMetadataUint32("split.count").value_or(1U);
+  if (split_count <= 1) {
+    return first;
+  }
+  return OpenSplitFileSet(path, std::move(first), error_msg);
+}
+
+std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
     const std::filesystem::path& path, std::string* error_msg) {
   const int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) {
@@ -127,8 +148,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenFile(
   }
 
   const auto size = static_cast<std::size_t>(sb.st_size);
-  void* const addr =
-      mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
+  void* const addr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
   if (addr == MAP_FAILED) {
     close(fd);
     if (error_msg != nullptr) {
@@ -136,7 +156,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenFile(
     }
     return nullptr;
   }
-  madvise(addr, size, MADV_WILLNEED);
+  (void)madvise(addr, size, MADV_SEQUENTIAL);
 
   auto reader = std::unique_ptr<GgufReader>(new GgufReader());
   reader->mmap_addr_ = addr;
@@ -148,7 +168,121 @@ std::unique_ptr<GgufReader> GgufReader::OpenFile(
   if (!reader->ParseHeaders(error_msg)) {
     return nullptr;
   }
+  reader->mapped_regions_.push_back({reader->data_, reader->size_});
   return reader;
+}
+
+std::unique_ptr<GgufReader> GgufReader::OpenSplitFileSet(
+    const std::filesystem::path& path, std::unique_ptr<GgufReader> first,
+    std::string* error_msg) {
+  const auto split_count = first->GetMetadataUint32("split.count").value_or(1U);
+  const auto split_no = first->GetMetadataUint32("split.no");
+  const auto total_tensor_count =
+      first->GetMetadataUint64("split.tensors.count");
+  if (!split_no.has_value() || *split_no >= split_count ||
+      !total_tensor_count.has_value()) {
+    if (error_msg != nullptr) {
+      *error_msg = "Invalid split GGUF metadata in " + path.string();
+    }
+    return nullptr;
+  }
+
+  const std::string filename = path.filename().string();
+  const std::regex split_pattern{R"(^(.*)-([0-9]+)-of-([0-9]+)\.gguf$)"};
+  std::smatch match;
+  if (!std::regex_match(filename, match, split_pattern)) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "Split GGUF filename does not match "
+          "<name>-00001-of-00002.gguf: " +
+          filename;
+    }
+    return nullptr;
+  }
+
+  const std::string prefix = match[1].str();
+  const std::size_t index_width = match[2].str().size();
+  const std::size_t count_width = match[3].str().size();
+  const auto build_path = [&](std::uint32_t index) {
+    std::ostringstream name;
+    name << prefix << '-' << std::setfill('0')
+         << std::setw(static_cast<int>(index_width)) << (index + 1) << "-of-"
+         << std::setw(static_cast<int>(count_width)) << split_count << ".gguf";
+    return path.parent_path() / name.str();
+  };
+
+  std::vector<std::unique_ptr<GgufReader>> shards(split_count);
+  shards[*split_no] = std::move(first);
+  for (std::uint32_t i = 0; i < split_count; ++i) {
+    if (shards[i]) {
+      continue;
+    }
+    const auto shard_path = build_path(i);
+    shards[i] = OpenSingleFile(shard_path, error_msg);
+    if (!shards[i]) {
+      if (error_msg != nullptr && error_msg->empty()) {
+        *error_msg = "Failed to open split GGUF shard: " + shard_path.string();
+      }
+      return nullptr;
+    }
+  }
+
+  const auto architecture =
+      shards[0]->GetMetadataString("general.architecture");
+  for (std::uint32_t i = 0; i < split_count; ++i) {
+    const auto shard_no = shards[i]->GetMetadataUint32("split.no");
+    const auto shard_count = shards[i]->GetMetadataUint32("split.count");
+    const auto shard_architecture =
+        shards[i]->GetMetadataString("general.architecture");
+    if (!shard_no.has_value() || *shard_no != i || !shard_count.has_value() ||
+        *shard_count != split_count ||
+        shards[i]->GetVersion() != shards[0]->GetVersion() ||
+        (shard_architecture.has_value() &&
+         shard_architecture != architecture)) {
+      if (error_msg != nullptr) {
+        *error_msg =
+            "Inconsistent split GGUF shard metadata: " + build_path(i).string();
+      }
+      return nullptr;
+    }
+  }
+
+  auto combined = std::unique_ptr<GgufReader>(new GgufReader());
+  combined->version_ = shards[0]->version_;
+  combined->alignment_ = shards[0]->alignment_;
+  combined->metadata_ = shards[0]->metadata_;
+  combined->tensors_.reserve(static_cast<std::size_t>(*total_tensor_count));
+  combined->tensor_index_.reserve(
+      static_cast<std::size_t>(*total_tensor_count));
+  combined->mapped_regions_.reserve(split_count);
+
+  for (const auto& shard : shards) {
+    combined->size_ += shard->size_;
+    combined->mapped_regions_.push_back({shard->data_, shard->size_});
+    for (const auto& tensor : shard->tensors_) {
+      if (combined->tensor_index_.contains(tensor.name)) {
+        if (error_msg != nullptr) {
+          *error_msg = "Duplicate tensor across split GGUF shards: " +
+                       std::string(tensor.name);
+        }
+        return nullptr;
+      }
+      combined->tensor_index_[tensor.name] = combined->tensors_.size();
+      combined->tensors_.push_back(tensor);
+    }
+  }
+
+  if (combined->tensors_.size() != *total_tensor_count) {
+    if (error_msg != nullptr) {
+      *error_msg = "Split GGUF tensor count mismatch: expected " +
+                   std::to_string(*total_tensor_count) + ", found " +
+                   std::to_string(combined->tensors_.size());
+    }
+    return nullptr;
+  }
+
+  combined->shards_ = std::move(shards);
+  return combined;
 }
 
 std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
@@ -171,6 +305,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
   if (!reader->ParseHeaders(error_msg)) {
     return nullptr;
   }
+  reader->mapped_regions_.push_back({reader->data_, reader->size_});
   return reader;
 }
 
@@ -486,8 +621,17 @@ std::optional<std::string_view> GgufReader::GetMetadataString(
 std::optional<std::uint32_t> GgufReader::GetMetadataUint32(
     std::string_view key) const noexcept {
   const auto* meta = FindMetadata(key);
-  if (meta != nullptr && std::holds_alternative<std::uint64_t>(meta->value)) {
-    return static_cast<std::uint32_t>(std::get<std::uint64_t>(meta->value));
+  if (meta == nullptr) {
+    return std::nullopt;
+  }
+  if (const auto* value = std::get_if<std::uint64_t>(&meta->value)) {
+    if (std::in_range<std::uint32_t>(*value)) {
+      return static_cast<std::uint32_t>(*value);
+    }
+  } else if (const auto* value = std::get_if<std::int64_t>(&meta->value)) {
+    if (std::in_range<std::uint32_t>(*value)) {
+      return static_cast<std::uint32_t>(*value);
+    }
   }
   return std::nullopt;
 }
@@ -495,8 +639,16 @@ std::optional<std::uint32_t> GgufReader::GetMetadataUint32(
 std::optional<std::uint64_t> GgufReader::GetMetadataUint64(
     std::string_view key) const noexcept {
   const auto* meta = FindMetadata(key);
-  if (meta != nullptr && std::holds_alternative<std::uint64_t>(meta->value)) {
-    return std::get<std::uint64_t>(meta->value);
+  if (meta == nullptr) {
+    return std::nullopt;
+  }
+  if (const auto* value = std::get_if<std::uint64_t>(&meta->value)) {
+    return *value;
+  }
+  if (const auto* value = std::get_if<std::int64_t>(&meta->value)) {
+    if (std::in_range<std::uint64_t>(*value)) {
+      return static_cast<std::uint64_t>(*value);
+    }
   }
   return std::nullopt;
 }
@@ -545,7 +697,8 @@ bool GgufReader::HasTensor(std::string_view name) const noexcept {
 bool GgufReader::HasMtpTensors() const noexcept {
   return std::ranges::any_of(tensors_, [](const auto& t) {
     return t.name.starts_with("mtp.") ||
-           t.name.find(".mtp.") != std::string_view::npos;
+           t.name.find(".mtp.") != std::string_view::npos ||
+           t.name.find(".nextn.") != std::string_view::npos;
   });
 }
 
@@ -566,9 +719,8 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   const std::string prefix = config.architecture + ".";
 
   // 2. Read standard architectural hyperparameters
-  if (auto val = GetMetadataUint32(prefix + "block_count")) {
-    config.num_layers = *val;
-  }
+  const auto total_layers =
+      GetMetadataUint32(prefix + "block_count").value_or(config.num_layers);
   if (auto val = GetMetadataUint32(prefix + "embedding_length")) {
     config.hidden_size = *val;
   }
@@ -592,6 +744,21 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   if (auto val = GetMetadataUint32(prefix + "full_attention_interval")) {
     config.full_attention_interval = *val;
   }
+  if (auto val = GetMetadataUint32(prefix + "ssm.conv_kernel")) {
+    config.ssm_conv_kernel = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "ssm.state_size")) {
+    config.ssm_state_size = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "ssm.group_count")) {
+    config.ssm_group_count = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "ssm.time_step_rank")) {
+    config.ssm_time_step_rank = *val;
+  }
+  if (auto val = GetMetadataUint32(prefix + "ssm.inner_size")) {
+    config.ssm_inner_size = *val;
+  }
   if (auto val = GetMetadataFloat32(prefix + "rope.freq_base")) {
     config.rope_theta = *val;
   }
@@ -601,8 +768,20 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
     config.rotary_dim = config.head_dim;
   }
 
-  // 3. MTP speculative layers check
-  config.mtp_num_layers = HasMtpTensors() ? 1 : 0;
+  // 3. MTP speculative layers are included in qwen35.block_count but are not
+  // part of the main autoregressive transformer stack.
+  const auto embedded_mtp_layers =
+      GetMetadataUint32(prefix + "nextn_predict_layers");
+  config.mtp_num_layers =
+      embedded_mtp_layers.value_or(HasMtpTensors() ? 1U : 0U);
+  const std::uint32_t layers_in_block_count = embedded_mtp_layers.value_or(0U);
+  if (layers_in_block_count > total_layers) {
+    if (error_msg != nullptr) {
+      *error_msg = "MTP layer count exceeds qwen block count";
+    }
+    return std::nullopt;
+  }
+  config.num_layers = total_layers - layers_in_block_count;
 
   // 4. Assert text-only contract
   if (HasVisionTensors()) {
@@ -618,6 +797,14 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   // 5. Model name
   if (auto name = GetMetadataString("general.name")) {
     config.model_name = std::string(*name);
+  }
+  if (const auto* token_embd = FindTensor("token_embd.weight");
+      token_embd != nullptr && config.hidden_size > 0) {
+    const auto elements = token_embd->ElementCount();
+    if ((elements % config.hidden_size) == 0) {
+      config.vocab_size =
+          static_cast<std::uint32_t>(elements / config.hidden_size);
+    }
   }
 
   // 6. Validate configuration against Qwen3.5/3.8 structural rules

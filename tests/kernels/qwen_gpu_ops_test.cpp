@@ -276,16 +276,23 @@ void TestHipblasGEMM() {
 
 void TestBatchedSSMConvEquivalence() {
   constexpr std::size_t batch = 4;
-  constexpr std::size_t qkv_dim = 8192;
+  constexpr std::uint32_t num_key_heads = 16;
+  constexpr std::uint32_t num_heads = 48;
+  constexpr std::uint32_t key_dim = 128;
+  constexpr std::uint32_t val_dim = 128;
+  constexpr std::size_t qkv_dim =
+      (2 * num_key_heads * key_dim) + (num_heads * val_dim);
+  constexpr std::size_t inner_size = num_heads * val_dim;
 
   std::vector<float> h_qkv(batch * qkv_dim);
   for (std::size_t i = 0; i < h_qkv.size(); ++i) {
-    h_qkv[i] = std::sin(static_cast<float>(i));
+    h_qkv[i] = std::sin(static_cast<float>(i) * 0.01F);
   }
-  std::vector<float> h_weights(qkv_dim * 4);
-  for (std::size_t i = 0; i < h_weights.size(); ++i) {
-    h_weights[i] = 0.25F;
-  }
+  std::vector<float> h_weights(qkv_dim * 4, 0.25F);
+  std::vector<float> h_ssm_a(num_heads, -0.05F);
+  std::vector<float> h_ssm_dt(num_heads, 0.01F);
+  std::vector<float> h_ssm_norm(val_dim, 1.0F);
+  std::vector<float> h_gate(batch * inner_size, 0.5F);
 
   float *d_qkv = nullptr, *d_w = nullptr;
   float *d_state_seq = nullptr, *d_state_batch = nullptr;
@@ -296,7 +303,7 @@ void TestBatchedSSMConvEquivalence() {
   float* d_gate = nullptr;
   float *d_out_seq = nullptr, *d_out_batch = nullptr;
 
-  const std::size_t delta_size = 32 * 128 * 128;
+  const std::size_t delta_size = num_heads * key_dim * val_dim;
   HIP_CHECK(hipMalloc(&d_qkv, batch * qkv_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_w, qkv_dim * 4 * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_state_seq, qkv_dim * 4 * sizeof(float)));
@@ -305,14 +312,14 @@ void TestBatchedSSMConvEquivalence() {
   HIP_CHECK(hipMalloc(&d_conv_out_batch, batch * qkv_dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_delta_seq, delta_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_delta_batch, delta_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha, batch * 32 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta, batch * 32 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_a, 32 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_dt, 32 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_norm, 128 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_gate, batch * 4096 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_out_seq, batch * 4096 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_out_batch, batch * 4096 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_alpha, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_beta, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_a, num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_dt, num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_norm, val_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_gate, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_seq, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_batch, batch * inner_size * sizeof(float)));
 
   HIP_CHECK(hipMemcpy(d_qkv, h_qkv.data(), batch * qkv_dim * sizeof(float),
                       hipMemcpyHostToDevice));
@@ -322,34 +329,43 @@ void TestBatchedSSMConvEquivalence() {
   HIP_CHECK(hipMemset(d_state_batch, 0, qkv_dim * 4 * sizeof(float)));
   HIP_CHECK(hipMemset(d_delta_seq, 0, delta_size * sizeof(float)));
   HIP_CHECK(hipMemset(d_delta_batch, 0, delta_size * sizeof(float)));
-  HIP_CHECK(hipMemset(d_alpha, 0, batch * 32 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_beta, 0, batch * 32 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_ssm_a, 0, 32 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_ssm_dt, 0, 32 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_ssm_norm, 0, 128 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_gate, 0, batch * 4096 * sizeof(float)));
+  HIP_CHECK(hipMemset(d_alpha, 0, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMemset(d_beta, 0, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_ssm_a, h_ssm_a.data(), num_heads * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_ssm_dt, h_ssm_dt.data(), num_heads * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_ssm_norm, h_ssm_norm.data(), val_dim * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_gate, h_gate.data(), batch * inner_size * sizeof(float),
+                      hipMemcpyHostToDevice));
 
   // Sequential
   for (std::size_t t = 0; t < batch; ++t) {
     strix::hip::LaunchSSMConvRecurrence(
         d_qkv + t * qkv_dim, d_w, d_state_seq, d_conv_out_seq + t * qkv_dim,
-        d_delta_seq, d_alpha + t * 32, d_beta + t * 32, d_ssm_a, d_ssm_dt,
-        d_ssm_norm, d_gate + t * 4096, d_out_seq + t * 4096, 0, 32, 128, 128);
+        d_delta_seq, d_alpha + t * num_heads, d_beta + t * num_heads, d_ssm_a,
+        d_ssm_dt, d_ssm_norm, d_gate + t * inner_size,
+        d_out_seq + t * inner_size, 0, qkv_dim, num_key_heads, num_heads,
+        key_dim, val_dim);
   }
 
   // Batched
   strix::hip::LaunchBatchedSSMConvRecurrence(
       d_qkv, d_w, d_state_batch, d_conv_out_batch, d_delta_batch, d_alpha,
-      d_beta, d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_batch, 0, batch, 32,
-      128, 128);
+      d_beta, d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_batch, 0, batch,
+      qkv_dim, num_key_heads, num_heads, key_dim, val_dim);
 
   HIP_CHECK(hipDeviceSynchronize());
 
-  std::vector<float> res_seq(batch * 4096), res_batch(batch * 4096);
-  HIP_CHECK(hipMemcpy(res_seq.data(), d_out_seq, batch * 4096 * sizeof(float),
+  std::vector<float> res_seq(batch * inner_size);
+  std::vector<float> res_batch(batch * inner_size);
+  HIP_CHECK(hipMemcpy(res_seq.data(), d_out_seq,
+                      batch * inner_size * sizeof(float),
                       hipMemcpyDeviceToHost));
   HIP_CHECK(hipMemcpy(res_batch.data(), d_out_batch,
-                      batch * 4096 * sizeof(float), hipMemcpyDeviceToHost));
+                      batch * inner_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
 
   float max_diff = 0.0F;
   for (std::size_t i = 0; i < res_seq.size(); ++i) {
@@ -464,13 +480,16 @@ void TestBatchedAttentionEquivalence() {
 
 void TestBatchedFusedProjectionsEquivalence() {
   constexpr std::size_t batch = 4;
-  constexpr std::size_t hidden_size = 2560;
+  constexpr std::size_t hidden_size = 256;
+  constexpr std::size_t qkv_size = 10240;
+  constexpr std::size_t inner_size = 6144;
+  constexpr std::size_t time_step_rank = 48;
 
   std::vector<float> h_x(batch * hidden_size, 0.5F);
-  std::vector<float> h_qkv_w(8192 * hidden_size, 0.01F);
-  std::vector<float> h_gate_w(4096 * hidden_size, 0.02F);
-  std::vector<float> h_alpha_w(32 * hidden_size, 0.03F);
-  std::vector<float> h_beta_w(32 * hidden_size, 0.04F);
+  std::vector<float> h_qkv_w(qkv_size * hidden_size, 0.01F);
+  std::vector<float> h_gate_w(inner_size * hidden_size, 0.02F);
+  std::vector<float> h_alpha_w(time_step_rank * hidden_size, 0.03F);
+  std::vector<float> h_beta_w(time_step_rank * hidden_size, 0.04F);
 
   float *d_x = nullptr, *d_qkv_w = nullptr, *d_gate_w = nullptr,
         *d_alpha_w = nullptr, *d_beta_w = nullptr;
@@ -480,54 +499,60 @@ void TestBatchedFusedProjectionsEquivalence() {
   float *d_beta_seq = nullptr, *d_beta_batch = nullptr;
 
   HIP_CHECK(hipMalloc(&d_x, batch * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_qkv_w, 8192 * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_gate_w, 4096 * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha_w, 32 * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta_w, 32 * hidden_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_qkv_w, qkv_size * hidden_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_gate_w, inner_size * hidden_size * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&d_alpha_w, time_step_rank * hidden_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_beta_w, time_step_rank * hidden_size * sizeof(float)));
 
-  HIP_CHECK(hipMalloc(&d_qkv_seq, batch * 8192 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_qkv_batch, batch * 8192 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_gate_seq, batch * 4096 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_gate_batch, batch * 4096 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha_seq, batch * 32 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha_batch, batch * 32 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta_seq, batch * 32 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta_batch, batch * 32 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_qkv_seq, batch * qkv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_qkv_batch, batch * qkv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_gate_seq, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_gate_batch, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_alpha_seq, batch * time_step_rank * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_alpha_batch, batch * time_step_rank * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_beta_seq, batch * time_step_rank * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_beta_batch, batch * time_step_rank * sizeof(float)));
 
   HIP_CHECK(hipMemcpy(d_x, h_x.data(), batch * hidden_size * sizeof(float),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_qkv_w, h_qkv_w.data(),
-                      8192 * hidden_size * sizeof(float),
+                      qkv_size * hidden_size * sizeof(float),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_gate_w, h_gate_w.data(),
-                      4096 * hidden_size * sizeof(float),
+                      inner_size * hidden_size * sizeof(float),
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_alpha_w, h_alpha_w.data(),
-                      32 * hidden_size * sizeof(float), hipMemcpyHostToDevice));
+                      time_step_rank * hidden_size * sizeof(float),
+                      hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_beta_w, h_beta_w.data(),
-                      32 * hidden_size * sizeof(float), hipMemcpyHostToDevice));
+                      time_step_rank * hidden_size * sizeof(float),
+                      hipMemcpyHostToDevice));
 
   // Sequential
   for (std::size_t t = 0; t < batch; ++t) {
     strix::hip::LaunchFusedSSMInputProjections(
         d_qkv_w, false, d_gate_w, false, d_alpha_w, false, d_beta_w, false,
-        d_x + t * hidden_size, d_qkv_seq + t * 8192, d_gate_seq + t * 4096,
-        d_alpha_seq + t * 32, d_beta_seq + t * 32, hidden_size);
+        d_x + t * hidden_size, d_qkv_seq + t * qkv_size,
+        d_gate_seq + t * inner_size, d_alpha_seq + t * time_step_rank,
+        d_beta_seq + t * time_step_rank, hidden_size, qkv_size, inner_size,
+        time_step_rank);
   }
 
   // Batched
   strix::hip::LaunchBatchedFusedSSMInputProjections(
       d_qkv_w, false, d_gate_w, false, d_alpha_w, false, d_beta_w, false, d_x,
       d_qkv_batch, d_gate_batch, d_alpha_batch, d_beta_batch, batch,
-      hidden_size);
+      hidden_size, qkv_size, inner_size, time_step_rank);
 
   HIP_CHECK(hipDeviceSynchronize());
 
-  std::vector<float> res_seq(batch * 8192), res_batch(batch * 8192);
-  HIP_CHECK(hipMemcpy(res_seq.data(), d_qkv_seq, batch * 8192 * sizeof(float),
-                      hipMemcpyDeviceToHost));
+  std::vector<float> res_seq(batch * qkv_size);
+  std::vector<float> res_batch(batch * qkv_size);
+  HIP_CHECK(hipMemcpy(res_seq.data(), d_qkv_seq,
+                      batch * qkv_size * sizeof(float), hipMemcpyDeviceToHost));
   HIP_CHECK(hipMemcpy(res_batch.data(), d_qkv_batch,
-                      batch * 8192 * sizeof(float), hipMemcpyDeviceToHost));
+                      batch * qkv_size * sizeof(float), hipMemcpyDeviceToHost));
 
   float max_diff = 0.0F;
   for (std::size_t i = 0; i < res_seq.size(); ++i) {

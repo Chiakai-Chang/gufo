@@ -4,14 +4,179 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <string_view>
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
 #include "src/models/qwen_oracles.hpp"
 
 namespace strix::hip {
+namespace {
+
+enum class WeightMappingMode {
+  kAuto,
+  kMapped,
+  kCopy,
+};
+
+[[nodiscard]] WeightMappingMode GetWeightMappingMode() noexcept {
+  const char* value = std::getenv("STRIX_GPU_WEIGHT_MODE");
+  if (value == nullptr) {
+    return WeightMappingMode::kAuto;
+  }
+  const std::string_view mode{value};
+  if (mode == "mapped") {
+    return WeightMappingMode::kMapped;
+  }
+  if (mode == "copy") {
+    return WeightMappingMode::kCopy;
+  }
+  return WeightMappingMode::kAuto;
+}
+
+void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
+  for (auto& region : regions) {
+    if (region.owns_device_memory && region.device_data != nullptr) {
+      (void)hipFree(region.device_data);
+    }
+    if (region.host_registered && region.host_data != nullptr) {
+      (void)hipHostUnregister(const_cast<void*>(region.host_data));
+    }
+    region.device_data = nullptr;
+    region.owns_device_memory = false;
+    region.host_registered = false;
+  }
+}
+
+[[nodiscard]] hipError_t MapRegisteredRegion(
+    const core::GgufMappedRegion& source,
+    QwenGpuWeightRegion& destination) noexcept {
+  const auto register_error =
+      hipHostRegister(const_cast<void*>(source.data), source.size,
+                      hipHostRegisterMapped | hipHostRegisterReadOnly);
+  if (register_error != hipSuccess) {
+    return register_error;
+  }
+
+  void* device_data = nullptr;
+  const auto pointer_error =
+      hipHostGetDevicePointer(&device_data, const_cast<void*>(source.data), 0);
+  if (pointer_error != hipSuccess) {
+    (void)hipHostUnregister(const_cast<void*>(source.data));
+    return pointer_error;
+  }
+
+  destination = {.host_data = source.data,
+                 .device_data = device_data,
+                 .size = source.size,
+                 .owns_device_memory = false,
+                 .host_registered = true};
+  return hipSuccess;
+}
+
+[[nodiscard]] hipError_t CopyRegionToDevice(
+    const core::GgufMappedRegion& source,
+    QwenGpuWeightRegion& destination) noexcept {
+  void* device_data = nullptr;
+  const auto malloc_error = hipMalloc(&device_data, source.size);
+  if (malloc_error != hipSuccess) {
+    return malloc_error;
+  }
+  const auto copy_error =
+      hipMemcpy(device_data, source.data, source.size, hipMemcpyHostToDevice);
+  if (copy_error != hipSuccess) {
+    (void)hipFree(device_data);
+    return copy_error;
+  }
+
+  destination = {.host_data = source.data,
+                 .device_data = device_data,
+                 .size = source.size,
+                 .owns_device_memory = true,
+                 .host_registered = false};
+  return hipSuccess;
+}
+
+[[nodiscard]] bool CreateWeightRegions(
+    const core::GgufReader& reader,
+    std::vector<QwenGpuWeightRegion>& weight_regions, std::string* error_msg) {
+  const auto source_regions = reader.GetMappedRegions();
+  if (source_regions.empty()) {
+    if (error_msg != nullptr) {
+      *error_msg = "GGUF reader has no mapped weight regions";
+    }
+    return false;
+  }
+
+  hipDeviceProp_t properties{};
+  const bool integrated =
+      hipGetDeviceProperties(&properties, 0) == hipSuccess &&
+      properties.integrated != 0;
+  const auto mode = GetWeightMappingMode();
+  const bool prefer_mapped = mode == WeightMappingMode::kMapped ||
+                             (mode == WeightMappingMode::kAuto && integrated);
+
+  weight_regions.resize(source_regions.size());
+  for (std::size_t i = 0; i < source_regions.size(); ++i) {
+    const auto& source = source_regions[i];
+    auto& destination = weight_regions[i];
+    hipError_t first_error = hipSuccess;
+    hipError_t second_error = hipSuccess;
+
+    if (prefer_mapped) {
+      first_error = MapRegisteredRegion(source, destination);
+      if (first_error != hipSuccess && mode == WeightMappingMode::kAuto) {
+        second_error = CopyRegionToDevice(source, destination);
+      }
+    } else {
+      first_error = CopyRegionToDevice(source, destination);
+      if (first_error != hipSuccess && mode == WeightMappingMode::kAuto) {
+        second_error = MapRegisteredRegion(source, destination);
+      }
+    }
+
+    if (destination.device_data == nullptr) {
+      ReleaseWeightRegions(weight_regions);
+      if (error_msg != nullptr) {
+        const auto final_error =
+            second_error != hipSuccess ? second_error : first_error;
+        *error_msg =
+            "Failed to make GGUF shard " + std::to_string(i) +
+            " GPU-visible in " +
+            (prefer_mapped ? std::string("mapped") : std::string("copy")) +
+            " mode: " + hipGetErrorString(final_error);
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+[[nodiscard]] bool RemapTensor(
+    models::QwenTensorRef& tensor,
+    std::span<const QwenGpuWeightRegion> regions) noexcept {
+  if (tensor.empty()) {
+    return true;
+  }
+  const auto tensor_address = reinterpret_cast<std::uintptr_t>(tensor.data);
+  for (const auto& region : regions) {
+    const auto region_address =
+        reinterpret_cast<std::uintptr_t>(region.host_data);
+    if (tensor_address >= region_address &&
+        tensor_address < region_address + region.size) {
+      const auto offset = tensor_address - region_address;
+      tensor.data =
+          static_cast<const std::uint8_t*>(region.device_data) + offset;
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
 
 QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
                            std::uint32_t max_context)
@@ -27,40 +192,53 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   const std::size_t num_kv_heads = config_.num_key_value_heads;
   const std::size_t head_dim = config_.head_dim;
   const std::size_t batch = max_batch_;
+  const std::size_t attention_size = config_.AttentionSize();
+  const std::size_t kv_size = num_kv_heads * head_dim;
+  const std::size_t q_projection_size = 2 * attention_size;
+  const std::size_t ssm_qkv_size = config_.SsmQkvSize();
+  const std::size_t ssm_inner_size = config_.ssm_inner_size;
+  const std::size_t recurrent_width = std::max(attention_size, ssm_inner_size);
+  const std::size_t projection_width =
+      std::max(q_projection_size, ssm_qkv_size);
+  const std::size_t time_step_rank = config_.ssm_time_step_rank;
 
   HIP_CHECK(hipMalloc(&d_hidden, batch * hidden_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_normed, batch * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_q, batch * 8192 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_k, batch * 1024 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_v, batch * 1024 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_q, batch * attention_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_k, batch * kv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_v, batch * kv_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_attn_out, batch * hidden_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_ffn_gate, batch * intermediate_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_ffn_up, batch * intermediate_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_ffn_act, batch * intermediate_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_ffn_out, batch * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_qkv, batch * 8192 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_conv_out, batch * 8192 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_gate, batch * 4096 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_out, batch * 4096 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha_buf, batch * 32 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta_buf, batch * 32 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_qkv, batch * projection_width * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_conv_out, batch * ssm_qkv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_gate, batch * recurrent_width * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_out, batch * recurrent_width * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_alpha_buf, batch * time_step_rank * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_beta_buf, batch * time_step_rank * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_logits, vocab_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_prompt_tokens, batch * sizeof(std::uint32_t)));
 
   const std::size_t scratch_elements =
-      batch *
-      std::max<std::size_t>({intermediate_size, hidden_size, 8192, 12352});
+      batch * std::max<std::size_t>(
+                  {intermediate_size, hidden_size, projection_width,
+                   ssm_qkv_size + ssm_inner_size + (2 * time_step_rank)});
   HIP_CHECK(
       hipMalloc(&d_scratch_bf16, scratch_elements * sizeof(hip_bfloat16)));
 
-  // 8 full-attention layers in Qwen 3.5
-  const std::size_t total_kv = 8 * num_kv_heads * max_context_ * head_dim;
+  const std::size_t total_kv = config_.FullAttentionLayerCount() *
+                               num_kv_heads * max_context_ * head_dim;
   HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
 
-  const std::size_t total_conv = num_layers * 8192 * 4;
+  const std::size_t total_conv =
+      num_layers * ssm_qkv_size * config_.ssm_conv_kernel;
   HIP_CHECK(hipMalloc(&d_ssm_conv_state, total_conv * sizeof(float)));
 
-  const std::size_t total_deltanet = num_layers * 16 * 128 * 256;
+  const std::size_t total_deltanet = num_layers * time_step_rank *
+                                     config_.ssm_state_size *
+                                     config_.SsmValueSize();
   HIP_CHECK(hipMalloc(&d_ssm_deltanet_state, total_deltanet * sizeof(float)));
 
   Reset();
@@ -188,9 +366,13 @@ void QwenGpuArena::Reset() noexcept {
   const std::size_t num_layers = config_.num_layers;
   const std::size_t num_kv_heads = config_.num_key_value_heads;
   const std::size_t head_dim = config_.head_dim;
-  const std::size_t total_kv = 8 * num_kv_heads * max_context_ * head_dim * 2;
-  const std::size_t total_conv = num_layers * 8192 * 4;
-  const std::size_t total_deltanet = num_layers * 16 * 128 * 256;
+  const std::size_t total_kv = config_.FullAttentionLayerCount() *
+                               num_kv_heads * max_context_ * head_dim * 2;
+  const std::size_t total_conv =
+      num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
+  const std::size_t total_deltanet = num_layers * config_.ssm_time_step_rank *
+                                     config_.ssm_state_size *
+                                     config_.SsmValueSize();
 
   if (d_kv_cache != nullptr) {
     HIP_CHECK(hipMemsetAsync(d_kv_cache, 0, total_kv * sizeof(float), stream));
@@ -284,83 +466,23 @@ void QwenGpuArena::FreeAll() noexcept {
 QwenGpuExecutor::QwenGpuExecutor(
     models::QwenModelWeights weights,
     std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
-    void* d_model_weights, std::uint32_t max_context)
+    std::vector<QwenGpuWeightRegion> weight_regions, std::uint32_t max_context)
     : weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
-      d_model_weights_(d_model_weights),
+      weight_regions_(std::move(weight_regions)),
       arena_(weights_.config, max_context),
       h_logits_(weights_.config.vocab_size, 0.0F) {}
 
 QwenGpuExecutor::~QwenGpuExecutor() {
-  if (d_model_weights_ != nullptr) {
-    hipFree(d_model_weights_);
-    d_model_weights_ = nullptr;
-  }
+  (void)hipStreamSynchronize(arena_.stream);
+  ReleaseWeightRegions(weight_regions_);
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {
-  void* dev_base_ptr = nullptr;
-  void* d_allocated_weights = nullptr;
-
-  if (reader.GetData() != nullptr && reader.GetSize() > 0) {
-    const auto malloc_err = hipMalloc(&dev_base_ptr, reader.GetSize());
-    if (malloc_err == hipSuccess) {
-      HIP_CHECK(hipMemcpy(dev_base_ptr, reader.GetData(), reader.GetSize(),
-                          hipMemcpyHostToDevice));
-      d_allocated_weights = dev_base_ptr;
-    } else {
-      const auto reg_err =
-          hipHostRegister(const_cast<void*>(reader.GetData()), reader.GetSize(),
-                          hipHostRegisterMapped | hipHostRegisterReadOnly);
-      if (reg_err == hipSuccess) {
-        HIP_CHECK(hipHostGetDevicePointer(
-            &dev_base_ptr, const_cast<void*>(reader.GetData()), 0));
-      }
-    }
-  }
-
   auto weights_opt = models::QwenModelWeights::LoadFromGguf(reader, error_msg);
   if (!weights_opt.has_value()) {
-    if (d_allocated_weights != nullptr) {
-      hipFree(d_allocated_weights);
-    }
     return nullptr;
-  }
-
-  if (dev_base_ptr != nullptr) {
-    auto remap = [&](models::QwenTensorRef& t) {
-      if (t.data != nullptr) {
-        const auto offset = static_cast<const std::uint8_t*>(t.data) -
-                            static_cast<const std::uint8_t*>(reader.GetData());
-        t.data = static_cast<const std::uint8_t*>(dev_base_ptr) + offset;
-      }
-    };
-    remap(weights_opt->token_embd);
-    remap(weights_opt->output_norm);
-    remap(weights_opt->output);
-    for (auto& l : weights_opt->layers) {
-      remap(l.attn_norm);
-      remap(l.attn_q);
-      remap(l.attn_k);
-      remap(l.attn_v);
-      remap(l.attn_output);
-      remap(l.attn_q_norm);
-      remap(l.attn_k_norm);
-      remap(l.attn_qkv);
-      remap(l.attn_gate);
-      remap(l.ssm_out);
-      remap(l.ssm_conv1d);
-      remap(l.ssm_alpha);
-      remap(l.ssm_beta);
-      remap(l.ssm_a);
-      remap(l.ssm_dt);
-      remap(l.ssm_norm);
-      remap(l.ffn_norm);
-      remap(l.ffn_gate);
-      remap(l.ffn_up);
-      remap(l.ffn_down);
-    }
   }
 
   auto tokenizer =
@@ -371,11 +493,38 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
     if (bin_tok) {
       tokenizer = std::move(bin_tok);
     } else if (!tokenizer) {
-      if (d_allocated_weights != nullptr) {
-        hipFree(d_allocated_weights);
-      }
       return nullptr;
     }
+  }
+
+  std::vector<QwenGpuWeightRegion> weight_regions;
+  if (!CreateWeightRegions(reader, weight_regions, error_msg)) {
+    return nullptr;
+  }
+
+  const auto remap = [&](models::QwenTensorRef& tensor) {
+    return RemapTensor(tensor, weight_regions);
+  };
+  bool remapped = remap(weights_opt->token_embd) &&
+                  remap(weights_opt->output_norm) && remap(weights_opt->output);
+  for (auto& layer : weights_opt->layers) {
+    remapped = remapped && remap(layer.attn_norm) && remap(layer.attn_q) &&
+               remap(layer.attn_k) && remap(layer.attn_v) &&
+               remap(layer.attn_output) && remap(layer.attn_q_norm) &&
+               remap(layer.attn_k_norm) && remap(layer.attn_qkv) &&
+               remap(layer.attn_gate) && remap(layer.ssm_out) &&
+               remap(layer.ssm_conv1d) && remap(layer.ssm_alpha) &&
+               remap(layer.ssm_beta) && remap(layer.ssm_a) &&
+               remap(layer.ssm_dt) && remap(layer.ssm_norm) &&
+               remap(layer.ffn_norm) && remap(layer.ffn_gate) &&
+               remap(layer.ffn_up) && remap(layer.ffn_down);
+  }
+  if (!remapped) {
+    ReleaseWeightRegions(weight_regions);
+    if (error_msg != nullptr) {
+      *error_msg = "A Qwen tensor does not belong to any mapped GGUF shard";
+    }
+    return nullptr;
   }
 
   const std::uint32_t context_len =
@@ -383,9 +532,9 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
                    ? weights_opt->config.context_length
                    : 4096U,
                4096U);
-  return std::make_unique<QwenGpuExecutor>(std::move(*weights_opt),
-                                           std::move(tokenizer),
-                                           d_allocated_weights, context_len);
+  return std::make_unique<QwenGpuExecutor>(
+      std::move(*weights_opt), std::move(tokenizer), std::move(weight_regions),
+      context_len);
 }
 
 tokenization::TokenId QwenGpuExecutor::ForwardToken(
@@ -394,6 +543,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
+  const std::size_t attention_size = config.AttentionSize();
+  const std::size_t kv_size =
+      static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  const std::size_t q_projection_size = 2 * attention_size;
+  const std::size_t ssm_qkv_size = config.SsmQkvSize();
+  const std::size_t ssm_inner_size = config.ssm_inner_size;
+  const std::size_t time_step_rank = config.ssm_time_step_rank;
 
   // 1. Embedding lookup
   const bool embd_is_bf16 = weights_.token_embd.type == core::GgmlType::kBF16;
@@ -416,14 +572,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
       const bool v_bf16 = layer.attn_v.type == core::GgmlType::kBF16;
       const bool o_bf16 = layer.attn_output.type == core::GgmlType::kBF16;
 
-      const std::size_t q_dim =
-          config.num_attention_heads * config.head_dim * 2;
-      const std::size_t kv_dim = config.num_key_value_heads * config.head_dim;
-
-      LaunchFusedQKVProjections(
-          layer.attn_q.data, q_bf16, layer.attn_k.data, k_bf16,
-          layer.attn_v.data, v_bf16, arena_.d_normed, arena_.d_ssm_qkv,
-          arena_.d_k, arena_.d_v, q_dim, kv_dim, hidden_size, arena_.stream);
+      LaunchFusedQKVProjections(layer.attn_q.data, q_bf16, layer.attn_k.data,
+                                k_bf16, layer.attn_v.data, v_bf16,
+                                arena_.d_normed, arena_.d_ssm_qkv, arena_.d_k,
+                                arena_.d_v, q_projection_size, kv_size,
+                                hidden_size, arena_.stream);
 
       // De-interleave Q and Gate from attn_q projection
       LaunchUnpackQG(arena_.d_ssm_qkv, arena_.d_q, arena_.d_ssm_gate,
@@ -450,18 +603,20 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                  pos, config.rope_theta, arena_.stream);
 
       // Softmax Attention + Gating
-      const std::size_t total_k =
-          8 * config.num_key_value_heads * 4096 * config.head_dim;
-      const std::uint32_t attn_layer_idx = l / 4;
+      const std::size_t total_k = config.FullAttentionLayerCount() *
+                                  config.num_key_value_heads *
+                                  arena_.GetMaxContext() * config.head_dim;
+      const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
       LaunchAttention(arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
                       arena_.d_kv_cache, arena_.d_kv_cache + total_k,
-                      arena_.d_ssm_out, attn_layer_idx, pos, 4096,
-                      config.num_attention_heads, config.num_key_value_heads,
-                      config.head_dim, arena_.stream);
+                      arena_.d_ssm_out, attn_layer_idx, pos,
+                      arena_.GetMaxContext(), config.num_attention_heads,
+                      config.num_key_value_heads, config.head_dim,
+                      arena_.stream);
 
       // Output projection
       LaunchGEMV(layer.attn_output.data, o_bf16, arena_.d_ssm_out,
-                 arena_.d_attn_out, hidden_size, 4096, arena_.stream);
+                 arena_.d_attn_out, hidden_size, attention_size, arena_.stream);
     } else {
       // SSM path
       const bool qkv_bf16 = layer.attn_qkv.type == core::GgmlType::kBF16;
@@ -474,7 +629,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
           layer.attn_qkv.data, qkv_bf16, layer.attn_gate.data, gate_bf16,
           layer.ssm_alpha.data, alpha_bf16, layer.ssm_beta.data, beta_bf16,
           arena_.d_normed, arena_.d_ssm_qkv, arena_.d_ssm_gate,
-          arena_.d_alpha_buf, arena_.d_beta_buf, hidden_size, arena_.stream);
+          arena_.d_alpha_buf, arena_.d_beta_buf, hidden_size, ssm_qkv_size,
+          ssm_inner_size, time_step_rank, arena_.stream);
 
       LaunchSSMConvRecurrence(
           arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -483,10 +639,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
           static_cast<const float*>(layer.ssm_a.data),
           static_cast<const float*>(layer.ssm_dt.data),
           static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
-          arena_.d_ssm_out, l, 32, 128, 128, arena_.stream);
+          arena_.d_ssm_out, l, ssm_qkv_size, config.ssm_group_count,
+          config.ssm_time_step_rank, config.ssm_state_size,
+          config.SsmValueSize(), arena_.stream);
 
       LaunchGEMV(layer.ssm_out.data, out_bf16, arena_.d_ssm_out,
-                 arena_.d_attn_out, hidden_size, 4096, arena_.stream);
+                 arena_.d_attn_out, hidden_size, ssm_inner_size, arena_.stream);
     }
 
     // Residual Add
@@ -548,6 +706,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
   const std::size_t batch_size = prompt_tokens.size();
+  const std::size_t attention_size = config.AttentionSize();
+  const std::size_t kv_size =
+      static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  const std::size_t q_projection_size = 2 * attention_size;
+  const std::size_t ssm_qkv_size = config.SsmQkvSize();
+  const std::size_t ssm_inner_size = config.ssm_inner_size;
+  const std::size_t time_step_rank = config.ssm_time_step_rank;
   const float eps = 1e-6F;
 
   if (batch_size == 0) {
@@ -609,37 +774,35 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       const bool v_bf16 = layer.attn_v.type == core::GgmlType::kBF16;
       const bool o_bf16 = layer.attn_output.type == core::GgmlType::kBF16;
 
-      const std::size_t q_dim =
-          config.num_attention_heads * config.head_dim * 2;
-      const std::size_t kv_dim = config.num_key_value_heads * config.head_dim;
-
       if (q_bf16) {
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_q.data,
                               arena_.d_scratch_bf16, arena_.d_ssm_qkv,
-                              batch_size, q_dim, hidden_size, arena_.stream);
+                              batch_size, q_projection_size, hidden_size,
+                              arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_q.data, false,
-                          arena_.d_normed, arena_.d_ssm_qkv, batch_size, q_dim,
-                          hidden_size, arena_.d_scratch_bf16, arena_.stream);
+                          arena_.d_normed, arena_.d_ssm_qkv, batch_size,
+                          q_projection_size, hidden_size, arena_.d_scratch_bf16,
+                          arena_.stream);
       }
 
       if (k_bf16) {
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_k.data,
                               arena_.d_scratch_bf16, arena_.d_k, batch_size,
-                              kv_dim, hidden_size, arena_.stream);
+                              kv_size, hidden_size, arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_k.data, false,
-                          arena_.d_normed, arena_.d_k, batch_size, kv_dim,
+                          arena_.d_normed, arena_.d_k, batch_size, kv_size,
                           hidden_size, arena_.d_scratch_bf16, arena_.stream);
       }
 
       if (v_bf16) {
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_v.data,
                               arena_.d_scratch_bf16, arena_.d_v, batch_size,
-                              kv_dim, hidden_size, arena_.stream);
+                              kv_size, hidden_size, arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_v.data, false,
-                          arena_.d_normed, arena_.d_v, batch_size, kv_dim,
+                          arena_.d_normed, arena_.d_v, batch_size, kv_size,
                           hidden_size, arena_.d_scratch_bf16, arena_.stream);
       }
 
@@ -665,25 +828,28 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
                         config.head_dim, config.rotary_dim, 0,
                         config.rope_theta, arena_.stream);
 
-      const std::size_t total_k =
-          8 * config.num_key_value_heads * 4096 * config.head_dim;
-      const std::uint32_t attn_layer_idx = l / 4;
+      const std::size_t total_k = config.FullAttentionLayerCount() *
+                                  config.num_key_value_heads *
+                                  arena_.GetMaxContext() * config.head_dim;
+      const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
       LaunchBatchedAttention(
           arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
           arena_.d_kv_cache, arena_.d_kv_cache + total_k, arena_.d_ssm_out,
-          attn_layer_idx, 0, batch_size, 4096, config.num_attention_heads,
-          config.num_key_value_heads, config.head_dim, arena_.stream);
+          attn_layer_idx, 0, batch_size, arena_.GetMaxContext(),
+          config.num_attention_heads, config.num_key_value_heads,
+          config.head_dim, arena_.stream);
 
       if (o_bf16) {
         LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
-                              batch_size * 4096, arena_.stream);
+                              batch_size * attention_size, arena_.stream);
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_output.data,
                               arena_.d_scratch_bf16, arena_.d_attn_out,
-                              batch_size, hidden_size, 4096, arena_.stream);
+                              batch_size, hidden_size, attention_size,
+                              arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_output.data, false,
                           arena_.d_ssm_out, arena_.d_attn_out, batch_size,
-                          hidden_size, 4096, arena_.d_scratch_bf16,
+                          hidden_size, attention_size, arena_.d_scratch_bf16,
                           arena_.stream);
       }
       if (do_profile) {
@@ -703,41 +869,49 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       if (qkv_bf16) {
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_qkv.data,
                               arena_.d_scratch_bf16, arena_.d_ssm_qkv,
-                              batch_size, 8192, hidden_size, arena_.stream);
+                              batch_size, ssm_qkv_size, hidden_size,
+                              arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_qkv.data, false,
-                          arena_.d_normed, arena_.d_ssm_qkv, batch_size, 8192,
-                          hidden_size, arena_.d_scratch_bf16, arena_.stream);
+                          arena_.d_normed, arena_.d_ssm_qkv, batch_size,
+                          ssm_qkv_size, hidden_size, arena_.d_scratch_bf16,
+                          arena_.stream);
       }
 
       if (gate_bf16) {
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_gate.data,
                               arena_.d_scratch_bf16, arena_.d_ssm_gate,
-                              batch_size, 4096, hidden_size, arena_.stream);
+                              batch_size, ssm_inner_size, hidden_size,
+                              arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_gate.data, false,
-                          arena_.d_normed, arena_.d_ssm_gate, batch_size, 4096,
-                          hidden_size, arena_.d_scratch_bf16, arena_.stream);
+                          arena_.d_normed, arena_.d_ssm_gate, batch_size,
+                          ssm_inner_size, hidden_size, arena_.d_scratch_bf16,
+                          arena_.stream);
       }
 
       if (alpha_bf16) {
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.ssm_alpha.data,
                               arena_.d_scratch_bf16, arena_.d_alpha_buf,
-                              batch_size, 32, hidden_size, arena_.stream);
+                              batch_size, time_step_rank, hidden_size,
+                              arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.ssm_alpha.data, false,
-                          arena_.d_normed, arena_.d_alpha_buf, batch_size, 32,
-                          hidden_size, arena_.d_scratch_bf16, arena_.stream);
+                          arena_.d_normed, arena_.d_alpha_buf, batch_size,
+                          time_step_rank, hidden_size, arena_.d_scratch_bf16,
+                          arena_.stream);
       }
 
       if (beta_bf16) {
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.ssm_beta.data,
                               arena_.d_scratch_bf16, arena_.d_beta_buf,
-                              batch_size, 32, hidden_size, arena_.stream);
+                              batch_size, time_step_rank, hidden_size,
+                              arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.ssm_beta.data, false,
-                          arena_.d_normed, arena_.d_beta_buf, batch_size, 32,
-                          hidden_size, arena_.d_scratch_bf16, arena_.stream);
+                          arena_.d_normed, arena_.d_beta_buf, batch_size,
+                          time_step_rank, hidden_size, arena_.d_scratch_bf16,
+                          arena_.stream);
       }
       if (do_profile) {
         HIP_CHECK(hipStreamSynchronize(arena_.stream));
@@ -754,7 +928,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
           static_cast<const float*>(layer.ssm_a.data),
           static_cast<const float*>(layer.ssm_dt.data),
           static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
-          arena_.d_ssm_out, l, batch_size, 32, 128, 128, arena_.stream);
+          arena_.d_ssm_out, l, batch_size, ssm_qkv_size, config.ssm_group_count,
+          config.ssm_time_step_rank, config.ssm_state_size,
+          config.SsmValueSize(), arena_.stream);
 
       if (do_profile) {
         HIP_CHECK(hipStreamSynchronize(arena_.stream));
@@ -766,14 +942,15 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
 
       if (out_bf16) {
         LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
-                              batch_size * 4096, arena_.stream);
+                              batch_size * ssm_inner_size, arena_.stream);
         LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.ssm_out.data,
                               arena_.d_scratch_bf16, arena_.d_attn_out,
-                              batch_size, hidden_size, 4096, arena_.stream);
+                              batch_size, hidden_size, ssm_inner_size,
+                              arena_.stream);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.ssm_out.data, false,
                           arena_.d_ssm_out, arena_.d_attn_out, batch_size,
-                          hidden_size, 4096, arena_.d_scratch_bf16,
+                          hidden_size, ssm_inner_size, arena_.d_scratch_bf16,
                           arena_.stream);
       }
       if (do_profile) {

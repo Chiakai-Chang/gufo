@@ -53,14 +53,13 @@ void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
 
 /// Computes Fused SSM Input Projections (QKV, Gate, Alpha, Beta) in a single
 /// kernel
-void LaunchFusedSSMInputProjections(const void* qkv_w, bool qkv_is_bf16,
-                                    const void* gate_w, bool gate_is_bf16,
-                                    const void* alpha_w, bool alpha_is_bf16,
-                                    const void* beta_w, bool beta_is_bf16,
-                                    const float* x, float* qkv_out,
-                                    float* gate_out, float* alpha_out,
-                                    float* beta_out, std::size_t hidden_size,
-                                    hipStream_t stream = nullptr);
+void LaunchFusedSSMInputProjections(
+    const void* qkv_w, bool qkv_is_bf16, const void* gate_w, bool gate_is_bf16,
+    const void* alpha_w, bool alpha_is_bf16, const void* beta_w,
+    bool beta_is_bf16, const float* x, float* qkv_out, float* gate_out,
+    float* alpha_out, float* beta_out, std::size_t hidden_size,
+    std::size_t qkv_size, std::size_t inner_size, std::size_t time_step_rank,
+    hipStream_t stream = nullptr);
 
 /// Computes Fused QKV Projections for Full Attention layers in a single kernel
 void LaunchFusedQKVProjections(const void* q_w, bool q_is_bf16, const void* k_w,
@@ -86,15 +85,14 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t num_heads, std::uint32_t num_kv_heads,
                      std::uint32_t head_dim, hipStream_t stream = nullptr);
 
-void LaunchSSMConvRecurrence(const float* qkv_in, const float* conv_weights,
-                             float* conv_state, float* conv_out,
-                             float* deltanet_state, const float* alpha_buf,
-                             const float* beta_buf, const float* ssm_a,
-                             const float* ssm_dt, const float* ssm_norm,
-                             const float* gate, float* out_buf,
-                             std::uint32_t layer_idx, std::uint32_t num_heads,
-                             std::uint32_t key_dim, std::uint32_t val_dim,
-                             hipStream_t stream = nullptr);
+void LaunchSSMConvRecurrence(
+    const float* qkv_in, const float* conv_weights, float* conv_state,
+    float* conv_out, float* deltanet_state, const float* alpha_buf,
+    const float* beta_buf, const float* ssm_a, const float* ssm_dt,
+    const float* ssm_norm, const float* gate, float* out_buf,
+    std::uint32_t layer_idx, std::size_t qkv_size, std::uint32_t num_key_heads,
+    std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
+    hipStream_t stream = nullptr);
 
 /// Computes parallel GPU argmax reduction over logits
 void LaunchGPUArgmax(const float* logits, std::uint32_t* out_token,
@@ -178,7 +176,8 @@ void LaunchBatchedFusedSSMInputProjections(
     const void* alpha_w, bool alpha_is_bf16, const void* beta_w,
     bool beta_is_bf16, const float* X, float* qkv_out, float* gate_out,
     float* alpha_out, float* beta_out, std::size_t batch_size,
-    std::size_t hidden_size, hipStream_t stream = nullptr);
+    std::size_t hidden_size, std::size_t qkv_size, std::size_t inner_size,
+    std::size_t time_step_rank, hipStream_t stream = nullptr);
 
 /// Batched Fused QKV Projections across B tokens
 void LaunchBatchedFusedQKVProjections(
@@ -212,8 +211,9 @@ void LaunchBatchedSSMConvRecurrence(
     float* conv_out, float* deltanet_state, const float* alpha_buf,
     const float* beta_buf, const float* ssm_a, const float* ssm_dt,
     const float* ssm_norm, const float* gate, float* out_buf,
-    std::uint32_t layer_idx, std::size_t batch_size, std::uint32_t num_heads,
-    std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream = nullptr);
+    std::uint32_t layer_idx, std::size_t batch_size, std::size_t qkv_size,
+    std::uint32_t num_key_heads, std::uint32_t num_heads, std::uint32_t key_dim,
+    std::uint32_t val_dim, hipStream_t stream = nullptr);
 
 }  // namespace strix::hip
 

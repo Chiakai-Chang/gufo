@@ -319,9 +319,14 @@ __global__ void FusedSSMInputProjectionsKernel(
     const void* __restrict__ beta_w, bool beta_is_bf16,
     const float* __restrict__ x, float* __restrict__ qkv_out,
     float* __restrict__ gate_out, float* __restrict__ alpha_out,
-    float* __restrict__ beta_out, std::size_t hidden_size) {
+    float* __restrict__ beta_out, std::size_t hidden_size,
+    std::size_t qkv_size, std::size_t inner_size,
+    std::size_t time_step_rank) {
   const std::size_t m = blockIdx.x;
-  if (m >= 12352)
+  const std::size_t gate_end = qkv_size + inner_size;
+  const std::size_t alpha_end = gate_end + time_step_rank;
+  const std::size_t total_rows = alpha_end + time_step_rank;
+  if (m >= total_rows)
     return;
 
   const void* A = nullptr;
@@ -329,26 +334,26 @@ __global__ void FusedSSMInputProjectionsKernel(
   float* out_target = nullptr;
   std::size_t row_idx = 0;
 
-  if (m < 8192) {
+  if (m < qkv_size) {
     A = qkv_w;
     is_bf16 = qkv_is_bf16;
     out_target = qkv_out;
     row_idx = m;
-  } else if (m < 12288) {
+  } else if (m < gate_end) {
     A = gate_w;
     is_bf16 = gate_is_bf16;
     out_target = gate_out;
-    row_idx = m - 8192;
-  } else if (m < 12320) {
+    row_idx = m - qkv_size;
+  } else if (m < alpha_end) {
     A = alpha_w;
     is_bf16 = alpha_is_bf16;
     out_target = alpha_out;
-    row_idx = m - 12288;
+    row_idx = m - gate_end;
   } else {
     A = beta_w;
     is_bf16 = beta_is_bf16;
     out_target = beta_out;
-    row_idx = m - 12320;
+    row_idx = m - alpha_end;
   }
 
   const std::size_t tid = threadIdx.x;
@@ -731,7 +736,8 @@ __global__ void DeltaNetRecurrenceKernel(
     const float* __restrict__ ssm_a, const float* __restrict__ ssm_dt,
     const float* __restrict__ ssm_norm, const float* __restrict__ gate,
     float* __restrict__ out_buf, std::uint32_t layer_idx,
-    std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim) {
+    std::uint32_t num_key_heads, std::uint32_t num_heads,
+    std::uint32_t key_dim, std::uint32_t val_dim) {
   const std::uint32_t h = blockIdx.x;
   if (h >= num_heads)
     return;
@@ -739,10 +745,10 @@ __global__ void DeltaNetRecurrenceKernel(
   const std::size_t tid = threadIdx.x;
 
   const float* q_ptr = conv_out;
-  const float* k_ptr = conv_out + (16 * key_dim);
-  const float* v_ptr = conv_out + (16 * key_dim * 2);
+  const float* k_ptr = conv_out + (num_key_heads * key_dim);
+  const float* v_ptr = conv_out + (num_key_heads * key_dim * 2);
 
-  const std::uint32_t kh_idx = h % 16;
+  const std::uint32_t kh_idx = h % num_key_heads;
   const float* q_h = q_ptr + (kh_idx * key_dim);
   const float* k_h = k_ptr + (kh_idx * key_dim);
   const float* v_h = v_ptr + (h * val_dim);
@@ -754,8 +760,8 @@ __global__ void DeltaNetRecurrenceKernel(
 
   // 1. Decay & learning rate: alpha = exp(ssm_a * softplus(alpha + dt)), beta =
   // sigmoid(beta)
-  const float dt = (ssm_dt != nullptr) ? ssm_dt[h % 32] : 0.0F;
-  const float a_val = (ssm_a != nullptr) ? ssm_a[h % 32] : -0.05F;
+  const float dt = (ssm_dt != nullptr) ? ssm_dt[h] : 0.0F;
+  const float a_val = (ssm_a != nullptr) ? ssm_a[h] : -0.05F;
   const float alpha_in = (alpha_buf != nullptr) ? alpha_buf[h] : 0.0F;
   const float beta_in = (beta_buf != nullptr) ? beta_buf[h] : 0.0F;
 
@@ -898,7 +904,7 @@ void LaunchSwiGLU(const float* gate, const float* up, float* out,
 
 void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
                 std::size_t M, std::size_t K, hipStream_t stream) {
-  FastGEMVBlockKernel<<<M, 128, 0, stream>>>(A, is_bf16, x, y, M, K);
+  FastGEMVBlockKernel<<<M, 256, 0, stream>>>(A, is_bf16, x, y, M, K);
 }
 
 void LaunchFusedSSMInputProjections(const void* qkv_w, bool qkv_is_bf16,
@@ -908,11 +914,16 @@ void LaunchFusedSSMInputProjections(const void* qkv_w, bool qkv_is_bf16,
                                     const float* x, float* qkv_out,
                                     float* gate_out, float* alpha_out,
                                     float* beta_out, std::size_t hidden_size,
+                                    std::size_t qkv_size,
+                                    std::size_t inner_size,
+                                    std::size_t time_step_rank,
                                     hipStream_t stream) {
-  constexpr std::size_t total_rows = 12352;
+  const std::size_t total_rows =
+      qkv_size + inner_size + (2 * time_step_rank);
   FusedSSMInputProjectionsKernel<<<total_rows, 128, 0, stream>>>(
       qkv_w, qkv_is_bf16, gate_w, gate_is_bf16, alpha_w, alpha_is_bf16, beta_w,
-      beta_is_bf16, x, qkv_out, gate_out, alpha_out, beta_out, hidden_size);
+      beta_is_bf16, x, qkv_out, gate_out, alpha_out, beta_out, hidden_size,
+      qkv_size, inner_size, time_step_rank);
 }
 
 void LaunchFusedQKVProjections(const void* q_w, bool q_is_bf16, const void* k_w,
@@ -931,7 +942,7 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, bool gate_is_bf16,
                            const void* up_w, bool up_is_bf16, const float* x,
                            float* out, std::size_t intermediate_size,
                            std::size_t hidden_size, hipStream_t stream) {
-  FastFusedSwiGLUGEMVBlockKernel<<<intermediate_size, 128, 0, stream>>>(
+  FastFusedSwiGLUGEMVBlockKernel<<<intermediate_size, 256, 0, stream>>>(
       gate_w, gate_is_bf16, up_w, up_is_bf16, x, out, intermediate_size,
       hidden_size);
 }
@@ -968,21 +979,22 @@ void LaunchSSMConvRecurrence(const float* qkv_in, const float* conv_weights,
                              const float* beta_buf, const float* ssm_a,
                              const float* ssm_dt, const float* ssm_norm,
                              const float* gate, float* out_buf,
-                             std::uint32_t layer_idx, std::uint32_t num_heads,
-                             std::uint32_t key_dim, std::uint32_t val_dim,
+                             std::uint32_t layer_idx, std::size_t qkv_size,
+                             std::uint32_t num_key_heads,
+                             std::uint32_t num_heads, std::uint32_t key_dim,
+                             std::uint32_t val_dim,
                              hipStream_t stream) {
-  const std::size_t qkv_dim = 8192;
   const std::size_t block_size = 256;
-  const std::size_t grid_size = (qkv_dim + block_size - 1) / block_size;
+  const std::size_t grid_size = (qkv_size + block_size - 1) / block_size;
   float* conv_layer_state =
-      conv_state + (static_cast<std::size_t>(layer_idx) * 8192 * 4);
+      conv_state + (static_cast<std::size_t>(layer_idx) * qkv_size * 4);
 
   SSMConvKernel<<<grid_size, block_size, 0, stream>>>(
-      qkv_in, conv_weights, conv_layer_state, conv_out, qkv_dim);
+      qkv_in, conv_weights, conv_layer_state, conv_out, qkv_size);
 
   DeltaNetRecurrenceKernel<<<num_heads, 256, 0, stream>>>(
       conv_out, deltanet_state, alpha_buf, beta_buf, ssm_a, ssm_dt, ssm_norm,
-      gate, out_buf, layer_idx, num_heads, key_dim, val_dim);
+      gate, out_buf, layer_idx, num_key_heads, num_heads, key_dim, val_dim);
 }
 
 __global__ void ArgmaxKernel(const float* __restrict__ logits,
@@ -1517,10 +1529,14 @@ __global__ void BatchedFusedSSMInputProjectionsKernel(
     const float* __restrict__ X, float* __restrict__ qkv_out,
     float* __restrict__ gate_out, float* __restrict__ alpha_out,
     float* __restrict__ beta_out, std::size_t batch_size,
-    std::size_t hidden_size) {
+    std::size_t hidden_size, std::size_t qkv_size, std::size_t inner_size,
+    std::size_t time_step_rank) {
   const std::size_t m = blockIdx.x;
   const std::size_t b = blockIdx.y;
-  if (m >= 12352 || b >= batch_size)
+  const std::size_t gate_end = qkv_size + inner_size;
+  const std::size_t alpha_end = gate_end + time_step_rank;
+  const std::size_t total_rows = alpha_end + time_step_rank;
+  if (m >= total_rows || b >= batch_size)
     return;
 
   const void* A = nullptr;
@@ -1528,26 +1544,26 @@ __global__ void BatchedFusedSSMInputProjectionsKernel(
   float* out_target = nullptr;
   std::size_t row_idx = 0;
 
-  if (m < 8192) {
+  if (m < qkv_size) {
     A = qkv_w;
     is_bf16 = qkv_is_bf16;
-    out_target = qkv_out + (b * 8192);
+    out_target = qkv_out + (b * qkv_size);
     row_idx = m;
-  } else if (m < 12288) {
+  } else if (m < gate_end) {
     A = gate_w;
     is_bf16 = gate_is_bf16;
-    out_target = gate_out + (b * 4096);
-    row_idx = m - 8192;
-  } else if (m < 12320) {
+    out_target = gate_out + (b * inner_size);
+    row_idx = m - qkv_size;
+  } else if (m < alpha_end) {
     A = alpha_w;
     is_bf16 = alpha_is_bf16;
-    out_target = alpha_out + (b * 32);
-    row_idx = m - 12288;
+    out_target = alpha_out + (b * time_step_rank);
+    row_idx = m - gate_end;
   } else {
     A = beta_w;
     is_bf16 = beta_is_bf16;
-    out_target = beta_out + (b * 32);
-    row_idx = m - 12320;
+    out_target = beta_out + (b * time_step_rank);
+    row_idx = m - alpha_end;
   }
 
   const float* x_row = X + (b * hidden_size);
@@ -1628,14 +1644,16 @@ void LaunchBatchedFusedSSMInputProjections(
     const void* alpha_w, bool alpha_is_bf16, const void* beta_w,
     bool beta_is_bf16, const float* X, float* qkv_out, float* gate_out,
     float* alpha_out, float* beta_out, std::size_t batch_size,
-    std::size_t hidden_size, hipStream_t stream) {
-  constexpr std::size_t total_rows = 12352;
+    std::size_t hidden_size, std::size_t qkv_size, std::size_t inner_size,
+    std::size_t time_step_rank, hipStream_t stream) {
+  const std::size_t total_rows =
+      qkv_size + inner_size + (2 * time_step_rank);
   const dim3 grid(static_cast<unsigned int>(total_rows),
                   static_cast<unsigned int>(batch_size));
   BatchedFusedSSMInputProjectionsKernel<<<grid, 128, 0, stream>>>(
       qkv_w, qkv_is_bf16, gate_w, gate_is_bf16, alpha_w, alpha_is_bf16, beta_w,
       beta_is_bf16, X, qkv_out, gate_out, alpha_out, beta_out, batch_size,
-      hidden_size);
+      hidden_size, qkv_size, inner_size, time_step_rank);
 }
 
 __global__ void BatchedFusedQKVProjectionsKernel(
@@ -2070,8 +2088,9 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
     const float* __restrict__ alpha_buf, const float* __restrict__ beta_buf,
     const float* __restrict__ ssm_a, const float* __restrict__ ssm_dt,
     float* __restrict__ raw_out, std::uint32_t layer_idx,
-    std::size_t batch_size, std::uint32_t num_heads, std::uint32_t key_dim,
-    std::uint32_t val_dim) {
+    std::size_t batch_size, std::size_t qkv_size,
+    std::uint32_t num_key_heads, std::uint32_t num_heads,
+    std::uint32_t key_dim, std::uint32_t val_dim) {
   const std::uint32_t h = blockIdx.x;
   if (h >= num_heads) {
     return;
@@ -2080,14 +2099,14 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
   const std::size_t tid = threadIdx.x;
   const std::size_t lane_id = tid & 31u;
   const std::size_t warp_id = tid >> 5u;
-  const std::uint32_t kh_idx = h % 16;
+  const std::uint32_t kh_idx = h % num_key_heads;
 
   float* s_matrix =
       deltanet_state + ((static_cast<std::size_t>(layer_idx) * num_heads + h) *
                         key_dim * val_dim);
 
-  const float dt = (ssm_dt != nullptr) ? ssm_dt[h % 32] : 0.0F;
-  const float a_val = (ssm_a != nullptr) ? ssm_a[h % 32] : -0.05F;
+  const float dt = (ssm_dt != nullptr) ? ssm_dt[h] : 0.0F;
+  const float a_val = (ssm_a != nullptr) ? ssm_a[h] : -0.05F;
 
   __shared__ float s_k[128];
   __shared__ float s_q[128];
@@ -2109,16 +2128,20 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
   }
 
   for (std::size_t t = 0; t < batch_size; ++t) {
-    const float* conv_t = conv_out + (t * 8192);
+    const float* conv_t = conv_out + (t * qkv_size);
     const float* q_h = conv_t + (kh_idx * key_dim);
-    const float* k_h = conv_t + (16 * key_dim) + (kh_idx * key_dim);
-    const float* v_h = conv_t + (32 * key_dim) + (h * val_dim);
-    float* o_h = raw_out + (t * 4096) + (h * val_dim);
+    const float* k_h =
+        conv_t + (num_key_heads * key_dim) + (kh_idx * key_dim);
+    const float* v_h =
+        conv_t + (2 * num_key_heads * key_dim) + (h * val_dim);
+    const std::size_t inner_size =
+        static_cast<std::size_t>(num_heads) * val_dim;
+    float* o_h = raw_out + (t * inner_size) + (h * val_dim);
 
     const float alpha_in =
-        (alpha_buf != nullptr) ? (alpha_buf + (t * 32))[h] : 0.0F;
+        (alpha_buf != nullptr) ? (alpha_buf + (t * num_heads))[h] : 0.0F;
     const float beta_in =
-        (beta_buf != nullptr) ? (beta_buf + (t * 32))[h] : 0.0F;
+        (beta_buf != nullptr) ? (beta_buf + (t * num_heads))[h] : 0.0F;
 
     const float alpha_biased = alpha_in + dt;
     const float alpha_softplus =
@@ -2236,7 +2259,8 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
 __global__ void BatchedSSMPostNormGateKernel(
     const float* __restrict__ raw_out, const float* __restrict__ ssm_norm,
     const float* __restrict__ gate, float* __restrict__ out_buf,
-    std::size_t batch_size, std::uint32_t num_heads, std::uint32_t val_dim) {
+    std::size_t batch_size, std::size_t inner_size,
+    std::uint32_t num_heads, std::uint32_t val_dim) {
   const std::size_t h = blockIdx.x;
   const std::size_t t = blockIdx.y;
   if (h >= num_heads || t >= batch_size) {
@@ -2247,8 +2271,8 @@ __global__ void BatchedSSMPostNormGateKernel(
   const std::size_t lane_id = tid & 31u;
   const std::size_t warp_id = tid >> 5u;
 
-  const float* in_h = raw_out + (t * 4096) + (h * val_dim);
-  float* o_h = out_buf + (t * 4096) + (h * val_dim);
+  const float* in_h = raw_out + (t * inner_size) + (h * val_dim);
+  float* o_h = out_buf + (t * inner_size) + (h * val_dim);
 
   const float in_val = (tid < val_dim) ? in_h[tid] : 0.0F;
   float o_sq = in_val * in_val;
@@ -2276,7 +2300,7 @@ __global__ void BatchedSSMPostNormGateKernel(
     const float w = (ssm_norm != nullptr) ? ssm_norm[tid] : 1.0F;
     float val = normed * w;
     if (gate != nullptr) {
-      const float g = (gate + (t * 4096))[h * val_dim + tid];
+      const float g = (gate + (t * inner_size))[h * val_dim + tid];
       const float sig = 1.0F / (1.0F + expf(-g));
       val *= (g * sig);
     }
@@ -2289,27 +2313,31 @@ void LaunchBatchedSSMConvRecurrence(
     float* conv_out, float* deltanet_state, const float* alpha_buf,
     const float* beta_buf, const float* ssm_a, const float* ssm_dt,
     const float* ssm_norm, const float* gate, float* out_buf,
-    std::uint32_t layer_idx, std::size_t batch_size, std::uint32_t num_heads,
+    std::uint32_t layer_idx, std::size_t batch_size, std::size_t qkv_size,
+    std::uint32_t num_key_heads, std::uint32_t num_heads,
     std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream) {
-  const std::size_t qkv_dim = 8192;
   const std::size_t block_size = 256;
-  const std::size_t grid_x = (qkv_dim + block_size - 1) / block_size;
+  const std::size_t grid_x = (qkv_size + block_size - 1) / block_size;
   const dim3 conv_grid(static_cast<unsigned int>(grid_x),
                        static_cast<unsigned int>(batch_size));
   float* conv_layer_state =
-      conv_state + (static_cast<std::size_t>(layer_idx) * 8192 * 4);
+      conv_state + (static_cast<std::size_t>(layer_idx) * qkv_size * 4);
 
   BatchedSSMConvKernel<<<conv_grid, static_cast<unsigned int>(block_size), 0,
                          stream>>>(qkv_in, conv_weights, conv_layer_state,
-                                   conv_out, batch_size, qkv_dim);
+                                   conv_out, batch_size, qkv_size);
 
   BatchedDeltaNetRecurrenceKernel<<<num_heads, 128, 0, stream>>>(
       conv_out, deltanet_state, alpha_buf, beta_buf, ssm_a, ssm_dt, out_buf,
-      layer_idx, batch_size, num_heads, key_dim, val_dim);
+      layer_idx, batch_size, qkv_size, num_key_heads, num_heads, key_dim,
+      val_dim);
 
   const dim3 post_grid(num_heads, static_cast<unsigned int>(batch_size));
+  const std::size_t inner_size =
+      static_cast<std::size_t>(num_heads) * val_dim;
   BatchedSSMPostNormGateKernel<<<post_grid, 128, 0, stream>>>(
-      out_buf, ssm_norm, gate, out_buf, batch_size, num_heads, val_dim);
+      out_buf, ssm_norm, gate, out_buf, batch_size, inner_size, num_heads,
+      val_dim);
 }
 
 }  // namespace strix::hip

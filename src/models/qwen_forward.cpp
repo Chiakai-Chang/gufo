@@ -222,8 +222,7 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
                   std::uint32_t pos, QwenScratchArena& arena) noexcept {
   const std::size_t hidden_size = config.hidden_size;
   const std::uint32_t head_dim = config.head_dim;
-  const std::size_t q_size =
-      static_cast<std::size_t>(config.num_attention_heads) * head_dim;
+  const std::size_t q_size = config.AttentionSize();
   const std::size_t kv_size =
       static_cast<std::size_t>(config.num_key_value_heads) * head_dim;
 
@@ -233,14 +232,17 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
   // 2. Self-Attention / SSM
   if (layer.is_full_attention) {
     if (!layer.attn_q.empty()) {
-      if (layer.attn_q.num_elements == 8192 * hidden_size) {
-        TensorGEMV(layer.attn_q, arena.normed, 8192, hidden_size,
+      const std::size_t q_projection_size =
+          layer.attn_q.num_elements / hidden_size;
+      if (q_projection_size == 2 * q_size) {
+        TensorGEMV(layer.attn_q, arena.normed, q_projection_size, hidden_size,
                    arena.ssm_qkv);
         for (std::uint32_t h = 0; h < config.num_attention_heads; ++h) {
           const auto q_src = arena.ssm_qkv.subspan(
-              (static_cast<std::size_t>(h) * 512), head_dim);
+              (static_cast<std::size_t>(h) * head_dim * 2), head_dim);
           const auto g_src = arena.ssm_qkv.subspan(
-              (static_cast<std::size_t>(h) * 512) + head_dim, head_dim);
+              (static_cast<std::size_t>(h) * head_dim * 2) + head_dim,
+              head_dim);
           std::ranges::copy(
               q_src,
               arena.q.begin() + static_cast<std::ptrdiff_t>(
@@ -282,13 +284,13 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
                 config.num_key_value_heads, config.head_dim, config.rotary_dim,
                 pos, config.rope_theta);
 
-    ForwardAttention(arena.q, arena.k, arena.v,
-                     arena.ssm_gate.subspan(0, q_size), layer.attn_output,
-                     kv_cache, layer_idx, pos, config.num_attention_heads,
-                     config.num_key_value_heads, config.head_dim, hidden_size,
-                     arena.attn_scores, arena.attn_out);
+    ForwardAttention(
+        arena.q, arena.k, arena.v, arena.ssm_gate.subspan(0, q_size),
+        layer.attn_output, kv_cache, layer_idx / config.full_attention_interval,
+        pos, config.num_attention_heads, config.num_key_value_heads,
+        config.head_dim, hidden_size, arena.attn_scores, arena.attn_out);
   } else {
-    ForwardSSM(arena.normed, layer, ssm_cache, layer_idx, arena.ssm_qkv,
+    ForwardSSM(arena.normed, layer, config, ssm_cache, layer_idx, arena.ssm_qkv,
                arena.ssm_gate, arena.ssm_out_buf, arena.attn_out);
   }
 
