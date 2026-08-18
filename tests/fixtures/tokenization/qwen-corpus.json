@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "family": "qwen35",
+  "models": [
+    "qwen3.5-4b",
+    "qwen3.8-27b"
+  ],
+  "cases": [
+    {
+      "id": "empty_string",
+      "description": "Empty input text",
+      "text": "",
+      "add_bos": false,
+      "add_eos": false
+    },
+    {
+      "id": "ascii_simple",
+      "description": "Basic ASCII sentence",
+      "text": "Hello, world! Welcome to Strix Halo.",
+      "add_bos": false,
+      "add_eos": false
+    },
+    {
+      "id": "whitespace_and_newlines",
+      "description": "Multiple spaces, tabs, and newlines",
+      "text": "  Leading spaces\n\nDouble newline\tTab\r\nCRLF",
+      "add_bos": false,
+      "add_eos": false
+    },
+    {
+      "id": "unicode_multilingual",
+      "description": "CJK, Cyrillic, Greek, Arabic, Emoji",
+      "text": "你好世界！ Привет мир! Γειά σου κόσμε! مرحبا بالعالم! 🚀✨🔥",
+      "add_bos": false,
+      "add_eos": false
+    },
+    {
+      "id": "special_tokens_im_tags",
+      "description": "ChatML special tokens",
+      "text": "<|im_start|>system\nYou are a helpful assistant.<|im_end|>",
+      "add_bos": false,
+      "add_eos": false
+    },
+    {
+      "id": "special_tokens_reasoning",
+      "description": "Thinking tags and endoftext",
+      "text": "<think>\nLet's analyze the hardware architecture.\n</think><|endoftext|>",
+      "add_bos": false,
+      "add_eos": false
+    },
+    {
+      "id": "code_snippet",
+      "description": "C++ code with indentation and symbols",
+      "text": "template <typename T>\nconstexpr T Square(T x) noexcept {\n  return x * x;\n}\n",
+      "add_bos": false,
+      "add_eos": false
+    },
+    {
+      "id": "numbers_and_punctuation",
+      "description": "Numbers, decimals, hex, arithmetic",
+      "text": "3.1415926535 0xDEADBEEF 128*1024=131072",
+      "add_bos": false,
+      "add_eos": false
+    }
+  ]
+}

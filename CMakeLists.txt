@@ -112,6 +112,7 @@ endif()
 add_library(strix_core STATIC
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
+  src/tokenization/qwen_tokenizer.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -148,6 +149,12 @@ if (BUILD_TESTING)
 
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   set_tests_properties(gguf_reader_test PROPERTIES LABELS "cpu;core;gguf;model_config")
+
+  add_executable(qwen_tokenizer_test tests/tokenization/qwen_tokenizer_test.cpp)
+  target_link_libraries(qwen_tokenizer_test PRIVATE strix_core)
+
+  add_test(NAME qwen_tokenizer_test COMMAND qwen_tokenizer_test)
+  set_tests_properties(qwen_tokenizer_test PROPERTIES LABELS "cpu;tokenization;qwen")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)
