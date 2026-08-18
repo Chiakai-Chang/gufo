@@ -119,6 +119,8 @@ add_library(strix_core STATIC
   src/models/qwen_ssm.cpp
   src/models/qwen_forward.cpp
   src/models/qwen_generator.cpp
+  src/testing/compare/logit_comparator.cpp
+  src/eval/regrade.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -224,11 +226,31 @@ if (BUILD_TESTING)
   add_test(NAME qwen_ssm_test COMMAND qwen_ssm_test)
   set_tests_properties(qwen_ssm_test PROPERTIES LABELS "cpu;models;ssm")
 
+  add_executable(qwen_oracle_test tests/models/qwen_oracle_test.cpp)
+  target_link_libraries(qwen_oracle_test PRIVATE strix_core)
+  add_test(NAME qwen_oracle_test COMMAND qwen_oracle_test)
+  set_tests_properties(qwen_oracle_test PROPERTIES LABELS "cpu;models;oracles")
+
+  add_executable(exact_token_test tests/quality/exact_token_test.cpp)
+  target_link_libraries(exact_token_test PRIVATE strix_core)
+  add_test(NAME exact_token_test COMMAND exact_token_test)
+  set_tests_properties(exact_token_test PROPERTIES LABELS "cpu;quality;tokens")
+
+  add_executable(eval_regrade_test tests/quality/eval_regrade_test.cpp)
+  target_link_libraries(eval_regrade_test PRIVATE strix_core)
+  add_test(NAME eval_regrade_test COMMAND eval_regrade_test)
+  set_tests_properties(eval_regrade_test PROPERTIES LABELS "cpu;quality;eval")
+
   if (ENGINE_ENABLE_HIP)
     add_executable(qwen_gpu_ops_test tests/kernels/qwen_gpu_ops_test.cpp)
     target_link_libraries(qwen_gpu_ops_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME qwen_gpu_ops_test COMMAND qwen_gpu_ops_test)
     set_tests_properties(qwen_gpu_ops_test PROPERTIES LABELS "hip;gpu;kernels")
+
+    add_executable(gfx1151_acceptance_test tests/benchmarks/gfx1151_acceptance_test.cpp)
+    target_link_libraries(gfx1151_acceptance_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
+    add_test(NAME gfx1151_acceptance_test COMMAND gfx1151_acceptance_test)
+    set_tests_properties(gfx1151_acceptance_test PROPERTIES LABELS "hip;gpu;benchmarks")
   endif()
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
