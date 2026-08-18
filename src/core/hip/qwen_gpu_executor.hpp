@@ -107,6 +107,9 @@ public:
   [[nodiscard]] tokenization::TokenId ForwardPromptBatch(
       std::span<const tokenization::TokenId> prompt_tokens);
 
+  /// Resets GPU cache and recurrent states in the arena.
+  void Reset() noexcept { arena_.Reset(); }
+
 private:
   models::QwenModelWeights weights_;
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;

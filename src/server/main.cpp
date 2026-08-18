@@ -3,6 +3,7 @@
 #include <string_view>
 
 #include "src/cli/diagnose.h"
+#include "src/server/bench_cli.hpp"
 #include "src/server/prompt_cli.hpp"
 
 namespace strix::server {
@@ -21,6 +22,7 @@ void print_help(std::string_view program_name) {
       << "  serve     Start the OpenAI-compatible server\n"
       << "  chat      Maintain an interactive conversation\n"
       << "  prompt    Execute one request and exit\n"
+      << "  bench     Run inference throughput benchmarks\n"
       << "  diagnose  Run non-interactive system and hardware diagnostics\n\n"
       << "Options:\n"
       << "  -h, --help     Print help\n"
@@ -56,6 +58,10 @@ int run(std::span<const char* const> args) {
 
   if (first_arg == "diagnose") {
     return strix::cli::RunDiagnose(options);
+  }
+
+  if (first_arg == "bench") {
+    return RunBench(options.subspan(1));
   }
 
   if (first_arg == "prompt") {

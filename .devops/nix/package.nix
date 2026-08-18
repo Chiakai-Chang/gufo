@@ -66,6 +66,9 @@ stdenv.mkDerivation (finalAttrs: {
     mkdir -p $out/bin
     cp strix $out/bin/strix
     cp strix-server $out/bin/strix-server
+    if [ -f strix-bench ]; then
+      cp strix-bench $out/bin/strix-bench
+    fi
     if [ -f qwen_gpu_ops_test ]; then
       cp qwen_gpu_ops_test $out/bin/qwen_gpu_ops_test
     fi

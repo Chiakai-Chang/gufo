@@ -140,11 +140,18 @@ endif()
 
 add_executable(strix-server
   src/server/main.cpp
+  src/server/bench_cli.cpp
   src/server/prompt_cli.cpp
 )
 target_link_libraries(strix-server PRIVATE strix_diagnostics strix_core)
 
-install(TARGETS strix strix-server DESTINATION bin)
+add_executable(strix-bench
+  src/bench/main.cpp
+  src/server/bench_cli.cpp
+)
+target_link_libraries(strix-bench PRIVATE strix_diagnostics strix_core)
+
+install(TARGETS strix strix-server strix-bench DESTINATION bin)
 
 # CTest integration
 include(CTest)
