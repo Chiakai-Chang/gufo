@@ -380,6 +380,10 @@ int RunBench(std::span<const char* const> args) {
       prompt_tokens[i] = static_cast<tokenization::TokenId>((i % 1000) + 100);
     }
 
+    gpu_exec->Reset();
+    (void)gpu_exec->ForwardPromptBatch(prompt_tokens);
+    HIP_CHECK(hipDeviceSynchronize());
+
     std::vector<double> runs;
     runs.reserve(opt.repetitions);
 

@@ -57,13 +57,11 @@ The GGUF reader discovers all shards when either shard path is supplied.
 Tensor pointers retain their source-shard identity, allowing the HIP executor
 to map each file independently.
 
-On the integrated GPU, `STRIX_GPU_WEIGHT_MODE=auto` prefers mapped, read-only
-host pages so the 54.7 GB model is not duplicated in unified memory. The
-explicit alternatives are:
+On the integrated GPU, the default weight mode uses mapped, read-only host
+pages so the 54.7 GB model is not duplicated in unified memory:
 
 ```sh
 STRIX_GPU_WEIGHT_MODE=mapped ./result/bin/strix-server prompt ...
-STRIX_GPU_WEIGHT_MODE=copy ./result/bin/strix-server prompt ...
 ```
 
 The prompt, chat, and benchmark commands print `[Model Load]` after the GGUF
@@ -94,14 +92,19 @@ MODEL=models/Qwen3.8-27B-GGUF/BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf
 
 ./result/bin/strix-bench \
   --model "$MODEL" \
-  --n-prompt 32,64,128,256,512 \
+  --n-prompt 32,64,128,256,512,1024,2048,4096 \
   --n-gen 0 \
+  --repetitions 3
+
+STRIX_GPU_WEIGHT_MODE=mapped ./result/bin/strix-bench \
+  --model "$MODEL" \
+  --n-gen 8,128 \
   --repetitions 3
 
 ./result/bin/strix-bench \
   --model "$MODEL" \
-  --validate-prefill 32 \
-  --n-prompt 32 \
+  --validate-prefill 1024 \
+  --n-prompt 1024 \
   --n-gen 0 \
   --repetitions 1
 
@@ -112,26 +115,26 @@ nix develop -c rocprofv3 \
   --summary \
   -- ./result/bin/strix-bench \
     --model "$MODEL" \
-    --n-prompt 512 \
+    --n-prompt 4096 \
     --n-gen 0 \
     --repetitions 1
 
 llama-bench \
   --model "$MODEL" \
-  --n-prompt 1,8,32,64,128,256,512 \
+  --n-prompt 1,8,32,64,128,256,512,1024,2048,4096 \
   --n-gen 0 \
   --repetitions 3 \
   --n-gpu-layers 99 \
   --flash-attn auto \
-  --batch-size 512 \
-  --ubatch-size 512 \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
   --threads 32 \
   --load-mode mmap
 
 llama-bench \
   --model "$MODEL" \
   --n-prompt 0 \
-  --n-gen 8 \
+  --n-gen 8,128 \
   --repetitions 3 \
   --n-gpu-layers 99 \
   --flash-attn auto \
@@ -147,8 +150,8 @@ The focused Nix/HIP suite covers split-shard discovery, live 27B metadata,
 dynamic CPU state sizing, the 27B SSM layout, batched-vs-sequential HIP
 recurrence, attention, projection, RoPE, and normalization equivalence.
 
-Prompt quality is checked using the unchanged sequential `ForwardToken` path
-as the numerical reference. `--validate-prefill` runs the same token sequence
+Prompt quality is checked using the single-token `ForwardToken` path as the
+numerical reference. `--validate-prefill` runs the same token sequence
 through sequential and batched prefill, copies the complete final-token
 vocabulary logits to the host, and requires finite logits and identical top-1
 tokens. It also reports maximum and mean absolute error, RMSE, and cosine
@@ -159,6 +162,7 @@ similarity.
 | Original batched path | 32 tokens | 222 | 0.01224522 | 0.99998373 |
 | Optimized batched path | 32 tokens | 222 | 0.01086507 | 0.99998587 |
 | Optimized batched path | 128 tokens | 194 | 0.01236322 | 0.99998993 |
+| GEMM attention path | 1024 tokens | 198 | 0.01823735 | 0.99998158 |
 
 The top-1 IDs differ between the 32-token and 128-token prompts because their
 last input tokens differ. In both cases the optimized batch result matches its
@@ -169,6 +173,10 @@ optimized prefill remains coherent:
 The capital of France is Paris. The capital of Germany is Berlin. The capital
 of Italy is Rome. The capital of Spain is
 ```
+
+A 1,271-token prompt using the large-batch attention path also completed
+"What is the capital of France?" with `Paris.`, confirming that optimized
+prefill state hands off correctly to decode.
 
 ## Results
 
@@ -182,13 +190,14 @@ ROCm 7.2.3. All runs use the default BF16 model without custom quantization.
 | HIP mapped weights | model load | 1.63-1.95 s |
 | HIP mapped weights | raw one-token prompt + one generated token, cold | 0.670 tok/s |
 | HIP mapped weights | `tg8`, three repetitions, baseline | 4.17 tok/s |
-| HIP mapped weights | `tg8`, three repetitions, optimized | 4.29 tok/s |
+| HIP mapped weights | `tg8`, three repetitions, optimized | 4.31 tok/s |
 
-The retained HIP change uses 256 threads for the generic BF16 GEMV and fused
-FFN gate/up GEMV kernels. SSM and full-attention projection experiments at 256
-threads were neutral and were reverted. The measured decode improvement is
-2.9%; the remaining BF16 path is bandwidth-bound at roughly the machine's
-measured unified-memory copy ceiling.
+The retained HIP decode changes use 512 threads for the fused FFN gate/up GEMV
+and the 17,408-wide FFN down projection. Other generic BF16 GEMVs remain at 256
+threads. The DeltaNet recurrence combines decay with retrieval and update with
+readout, reducing four state-row passes to two. The measured improvement over
+the original `4.17 tok/s` baseline is 3.4%; the remaining BF16 path streams
+weights near the machine's unified-memory bandwidth ceiling.
 
 The llama.cpp comparison uses system `llama-bench` build 10173, commit
 `e9fa078`, with the ROCm backend, full GPU offload, automatic flash attention,
@@ -196,17 +205,27 @@ and the same split BF16 GGUF. Both engines use three measured repetitions:
 
 | Test | Strix HIP | llama.cpp ROCm | llama.cpp / Strix |
 | --- | ---: | ---: | ---: |
-| `pp32` | 79.31 +/- 0.20 tok/s | 74.90 +/- 1.18 tok/s | 0.94x |
-| `pp64` | 148.37 +/- 1.02 tok/s | 111.40 +/- 1.36 tok/s | 0.75x |
-| `pp128` | 205.19 +/- 1.26 tok/s | 221.03 +/- 2.05 tok/s | 1.08x |
-| `pp256` | 257.14 +/- 1.10 tok/s | 242.99 +/- 1.00 tok/s | 0.94x |
-| `pp512` | 329.82 +/- 1.04 tok/s | 390.96 +/- 0.85 tok/s | 1.19x |
-| `tg8` | 4.29 +/- 0.00 tok/s | 4.02 +/- 0.04 tok/s | 0.94x |
+| `pp32` | 79.28 +/- 0.14 tok/s | 74.90 +/- 1.18 tok/s | 0.94x |
+| `pp64` | 148.49 +/- 0.31 tok/s | 111.40 +/- 1.36 tok/s | 0.75x |
+| `pp128` | 210.37 +/- 0.08 tok/s | 221.03 +/- 2.05 tok/s | 1.05x |
+| `pp256` | 262.34 +/- 0.29 tok/s | 242.99 +/- 1.00 tok/s | 0.93x |
+| `pp512` | 350.99 +/- 1.19 tok/s | 390.96 +/- 0.85 tok/s | 1.11x |
+| `pp1024` | 344.64 +/- 0.73 tok/s | 383.55 +/- 3.36 tok/s | 1.11x |
+| `pp2048` | 310.31 +/- 0.70 tok/s | 333.44 +/- 3.38 tok/s | 1.07x |
+| `pp4096` | 277.46 +/- 0.23 tok/s | 313.31 +/- 2.05 tok/s | 1.13x |
+| `tg8` | 4.31 +/- 0.00 tok/s | 4.02 +/- 0.04 tok/s | 0.93x |
+| `tg128` | 4.31 +/- 0.00 tok/s | 4.01 +/- 0.00 tok/s | 0.93x |
 
 The optimized native path is faster than llama.cpp at `pp32`, `pp64`, and
-`pp256`, and remains 7.2% and 15.6% behind at `pp128` and `pp512`,
-respectively. The native HIP executor remains 6.6% faster for steady `tg8`
-decode.
+`pp256`. llama.cpp is 5.1% faster at `pp128` and 7.5-12.9% faster from
+`pp512` through `pp4096`. The native HIP executor remains 7.2% faster for
+`tg8` and 7.5% faster for `tg128` decode.
+
+The `tg128` test confirms sustained generation from a shallow context; it is
+not a context-depth sweep. Future decode comparisons should measure the same
+generation length at multiple starting positions. llama.cpp exposes this with
+`--n-depth`; `strix-bench` needs an equivalent option so both engines populate
+and time the KV/recurrent state using the same depth methodology.
 
 ## Prompt Optimization
 
@@ -225,13 +244,27 @@ scratch traffic.
 
 | Metric | Original | Optimized |
 | --- | ---: | ---: |
-| `pp512` | 46.47 tok/s | 329.82 tok/s |
+| `pp512` | 46.47 tok/s | 350.99 tok/s |
 | DeltaNet recurrence, profiled warmup + `pp512` | ~565 ms | ~100 ms |
 | Recurrence VGPRs | 192 | 136 |
 | Recurrence scratch per thread | 988 bytes | 0 bytes |
 | Recurrence scratch allocation | 40.6 MiB | 0 bytes |
 
-This is a 7.10x `pp512` throughput improvement. In the final trace,
-hipBLASLt GEMMs account for about 78.9% of GPU time, attention for 7.6%,
-DeltaNet recurrence for 5.1%, and the remaining small rocBLAS projections for
-2.3%.
+This is a 7.55x `pp512` throughput improvement.
+
+The arena and KV cache now support full-batch prefill through 4096 tokens.
+Prompts below 1024 tokens use the custom wave-cooperative causal attention
+kernel. Batch 1024 uses float32 QK/PV GEMMs one head at a time, while batches
+2048 and 4096 group the query heads that share each KV head into strided
+batched GEMMs. The grouped path reduces 48 BLAS calls per attention layer to
+eight and raises `pp4096` from 242.04 to 277.46 tok/s.
+
+In the final `pp4096` trace, BF16 projection GEMMs account for 70.7% of GPU
+time, QK/PV attention GEMMs for 15.6%, causal softmax for 1.5%, and DeltaNet
+recurrence for 4.6%. The original per-query attention kernel accounted for
+28.0% before the GEMM attention path.
+
+`strix-bench` warms every requested prompt size once before measured
+repetitions. This is required because hipBLASLt loads shape-specific code
+objects on first use; timing the first invocation produced misleading
+outliers and large standard deviations.

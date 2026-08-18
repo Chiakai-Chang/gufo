@@ -450,11 +450,11 @@ void TestBatchedSSMConvEquivalence() {
 }
 
 void TestBatchedAttentionEquivalence() {
-  constexpr std::size_t batch = 4;
-  constexpr std::uint32_t num_heads = 16;
-  constexpr std::uint32_t num_kv_heads = 2;
-  constexpr std::uint32_t head_dim = 256;
-  constexpr std::uint32_t max_context = 64;
+  constexpr std::size_t batch = 2048;
+  constexpr std::uint32_t num_heads = 2;
+  constexpr std::uint32_t num_kv_heads = 1;
+  constexpr std::uint32_t head_dim = 32;
+  constexpr std::uint32_t max_context = 2048;
 
   const std::size_t q_size = batch * num_heads * head_dim;
   const std::size_t kv_size = batch * num_kv_heads * head_dim;
@@ -466,17 +466,25 @@ void TestBatchedAttentionEquivalence() {
   std::vector<float> h_gate(q_size, 0.5F);
 
   float *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_gate = nullptr;
-  float *d_cache_seq = nullptr, *d_cache_batch = nullptr;
-  float *d_out_seq = nullptr, *d_out_batch = nullptr;
+  float *d_cache_seq = nullptr, *d_cache_batch = nullptr,
+        *d_cache_gemm = nullptr;
+  float *d_out_seq = nullptr, *d_out_batch = nullptr, *d_out_gemm = nullptr;
+  float* d_scores = nullptr;
+  hipblasHandle_t hipblas_handle = nullptr;
 
+  HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
   HIP_CHECK(hipMalloc(&d_q, q_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_k, kv_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_v, kv_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_gate, q_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_cache_seq, cache_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_cache_batch, cache_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_cache_gemm, cache_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_out_seq, q_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_out_batch, q_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_gemm, q_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_scores, (num_heads / num_kv_heads) * batch *
+                                     max_context * sizeof(float)));
 
   HIP_CHECK(hipMemcpy(d_q, h_q.data(), q_size * sizeof(float),
                       hipMemcpyHostToDevice));
@@ -488,6 +496,7 @@ void TestBatchedAttentionEquivalence() {
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemset(d_cache_seq, 0, cache_size * sizeof(float)));
   HIP_CHECK(hipMemset(d_cache_batch, 0, cache_size * sizeof(float)));
+  HIP_CHECK(hipMemset(d_cache_gemm, 0, cache_size * sizeof(float)));
 
   const std::size_t total_k = 8 * num_kv_heads * max_context * head_dim;
 
@@ -505,32 +514,50 @@ void TestBatchedAttentionEquivalence() {
   strix::hip::LaunchBatchedAttention(
       d_q, d_k, d_v, d_gate, d_cache_batch, d_cache_batch + total_k,
       d_out_batch, 0, 0, batch, max_context, num_heads, num_kv_heads, head_dim);
+  strix::hip::LaunchBatchedAttentionGemm(
+      hipblas_handle, d_q, d_k, d_v, d_gate, d_cache_gemm,
+      d_cache_gemm + total_k, d_scores, d_out_gemm, 0, 0, batch, max_context,
+      num_heads, num_kv_heads, head_dim);
 
   HIP_CHECK(hipDeviceSynchronize());
 
-  std::vector<float> res_seq(q_size), res_batch(q_size);
+  std::vector<float> res_seq(q_size), res_batch(q_size), res_gemm(q_size);
   HIP_CHECK(hipMemcpy(res_seq.data(), d_out_seq, q_size * sizeof(float),
                       hipMemcpyDeviceToHost));
   HIP_CHECK(hipMemcpy(res_batch.data(), d_out_batch, q_size * sizeof(float),
                       hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_gemm.data(), d_out_gemm, q_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
 
   float max_diff = 0.0F;
+  float max_gemm_diff = 0.0F;
   for (std::size_t i = 0; i < res_seq.size(); ++i) {
     const float d = std::abs(res_seq[i] - res_batch[i]);
     if (d > max_diff)
       max_diff = d;
+    const float gemm_diff = std::abs(res_seq[i] - res_gemm[i]);
+    if (gemm_diff > max_gemm_diff)
+      max_gemm_diff = gemm_diff;
   }
   std::cout << "Attention Seq vs Batch max diff: " << max_diff << "\n";
-  assert(max_diff < 1e-4F);
+  std::cout << "Attention Seq vs GEMM max diff: " << max_gemm_diff << "\n";
+  if (max_diff >= 1e-4F || max_gemm_diff >= 1e-4F) {
+    std::cerr << "Batched attention mismatch\n";
+    std::abort();
+  }
 
+  HIPBLAS_CHECK(hipblasDestroy(hipblas_handle));
   HIP_CHECK(hipFree(d_q));
   HIP_CHECK(hipFree(d_k));
   HIP_CHECK(hipFree(d_v));
   HIP_CHECK(hipFree(d_gate));
   HIP_CHECK(hipFree(d_cache_seq));
   HIP_CHECK(hipFree(d_cache_batch));
+  HIP_CHECK(hipFree(d_cache_gemm));
   HIP_CHECK(hipFree(d_out_seq));
   HIP_CHECK(hipFree(d_out_batch));
+  HIP_CHECK(hipFree(d_out_gemm));
+  HIP_CHECK(hipFree(d_scores));
 }
 
 void TestBatchedFusedProjectionsEquivalence() {
