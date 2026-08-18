@@ -115,6 +115,8 @@ add_library(strix_core STATIC
   src/tokenization/qwen_tokenizer.cpp
   src/tokenization/qwen_chat_template.cpp
   src/models/qwen_oracles.cpp
+  src/models/qwen_state.cpp
+  src/models/qwen_forward.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -187,6 +189,12 @@ if (BUILD_TESTING)
 
   add_test(NAME qwen_cpu_oracles_test COMMAND qwen_cpu_oracles_test)
   set_tests_properties(qwen_cpu_oracles_test PROPERTIES LABELS "cpu;models;oracles")
+
+  add_executable(qwen_forward_test tests/models/qwen_forward_test.cpp)
+  target_link_libraries(qwen_forward_test PRIVATE strix_core)
+
+  add_test(NAME qwen_forward_test COMMAND qwen_forward_test)
+  set_tests_properties(qwen_forward_test PROPERTIES LABELS "cpu;models;forward")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)
