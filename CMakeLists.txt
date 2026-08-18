@@ -111,6 +111,7 @@ endif()
 
 add_library(strix_core STATIC
   src/core/model_registry.cpp
+  src/core/gguf_reader.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -141,6 +142,12 @@ if (BUILD_TESTING)
 
   add_test(NAME bandwidth_test COMMAND bandwidth_test)
   set_tests_properties(bandwidth_test PROPERTIES LABELS "cpu;diagnostics;bandwidth;bandwidth_schema;bandwidth_correctness")
+
+  add_executable(gguf_reader_test tests/core/gguf_reader_test.cpp)
+  target_link_libraries(gguf_reader_test PRIVATE strix_core)
+
+  add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
+  set_tests_properties(gguf_reader_test PROPERTIES LABELS "cpu;core;gguf;model_config")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)

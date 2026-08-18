@@ -57,6 +57,7 @@ GGML_TYPE_NAME = {
     21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS", 24: "I8", 25: "I16", 26: "I32",
     27: "I64", 28: "F64", 29: "IQ1_M", 30: "BF16", 34: "TQ1_0", 35: "TQ2_0",
     39: "MXFP4", 40: "NVFP4",
+    1000: "STRIX_SHQ4_T16", 1001: "STRIX_SHQ6_T16", 1002: "STRIX_SHQ8_T16",
 }
 
 # type -> (block_size, type_size_bytes)
