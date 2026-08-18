@@ -1,0 +1,34 @@
+#ifndef STRIX_SERVER_PROMPT_CLI_HPP_
+#define STRIX_SERVER_PROMPT_CLI_HPP_
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+
+namespace strix::server {
+
+/// Options for `strix-server prompt` execution.
+struct PromptOptions {
+  std::string model_path;
+  std::string prompt_text;
+  std::string system_prompt =
+      "You are a helpful, respectful, and honest assistant.";
+  std::size_t max_tokens = 128;
+  float temperature = 0.0F;
+  bool use_chat_template = true;
+  bool verbose = false;
+};
+
+/// Parses command line options for `strix-server prompt`.
+[[nodiscard]] std::optional<PromptOptions> ParsePromptOptions(
+    std::span<const char* const> args, std::string* error_msg = nullptr);
+
+/// Executes the prompt CLI workflow.
+[[nodiscard]] int RunPrompt(std::span<const char* const> args);
+
+}  // namespace strix::server
+
+#endif  // STRIX_SERVER_PROMPT_CLI_HPP_

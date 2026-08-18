@@ -3,6 +3,7 @@
 #include <string_view>
 
 #include "src/cli/diagnose.h"
+#include "src/server/prompt_cli.hpp"
 
 namespace strix::server {
 namespace {
@@ -55,6 +56,21 @@ int run(std::span<const char* const> args) {
 
   if (first_arg == "diagnose") {
     return strix::cli::RunDiagnose(options);
+  }
+
+  if (first_arg == "prompt") {
+    return RunPrompt(options.subspan(1));
+  }
+
+  if (first_arg == "chat") {
+    std::cout << "strix-server chat: interactive conversation session\n";
+    return 0;
+  }
+
+  if (first_arg == "serve") {
+    std::cout
+        << "strix-server serve: OpenAI-compatible HTTP inference endpoint\n";
+    return 0;
   }
 
   std::cerr << "Error: unknown command or option '" << first_arg << "'\n";

@@ -118,7 +118,10 @@ add_library(strix_core STATIC
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
-add_executable(strix-server src/server/main.cpp)
+add_executable(strix-server
+  src/server/main.cpp
+  src/server/prompt_cli.cpp
+)
 target_link_libraries(strix-server PRIVATE strix_diagnostics strix_core)
 
 install(TARGETS strix strix-server DESTINATION bin)
@@ -138,6 +141,21 @@ if (BUILD_TESTING)
 
   add_test(NAME strix_server_diagnose_json COMMAND strix-server diagnose --json --section platform)
   set_tests_properties(strix_server_diagnose_json PROPERTIES LABELS "cpu")
+
+  add_test(NAME strix_server_prompt_help COMMAND strix-server prompt --help)
+  set_tests_properties(strix_server_prompt_help PROPERTIES LABELS "cpu;server;cli")
+
+  add_test(NAME strix_server_prompt_smoke COMMAND strix-server prompt "Hello world")
+  set_tests_properties(strix_server_prompt_smoke PROPERTIES LABELS "cpu;server;cli")
+
+  add_executable(prompt_cli_test
+    tests/server/prompt_cli_test.cpp
+    src/server/prompt_cli.cpp
+  )
+  target_link_libraries(prompt_cli_test PRIVATE strix_core)
+
+  add_test(NAME prompt_cli_test COMMAND prompt_cli_test)
+  set_tests_properties(prompt_cli_test PROPERTIES LABELS "cpu;server;cli")
 
   add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
   target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
