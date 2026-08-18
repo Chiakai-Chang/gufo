@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -9,6 +10,12 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
+
+static inline std::uint16_t FloatToBf16Bits(float f) {
+  std::uint32_t bits = 0;
+  std::memcpy(&bits, &f, sizeof(bits));
+  return static_cast<std::uint16_t>(bits >> 16);
+}
 
 void TestGpuRMSNorm() {
   const std::size_t dim = 256;
@@ -153,6 +160,117 @@ void TestBatchedGEMM() {
   HIP_CHECK(hipFree(d_A));
   HIP_CHECK(hipFree(d_X));
   HIP_CHECK(hipFree(d_Y));
+}
+
+void TestHipblasGEMM() {
+  hipblasHandle_t handle = nullptr;
+  HIPBLAS_CHECK(hipblasCreate(&handle));
+
+  constexpr std::size_t batch = 4;
+  constexpr std::size_t M = 8;
+  constexpr std::size_t K = 16;
+
+  // Test FP32
+  {
+    std::vector<float> h_A(M * K, 1.5F);
+    std::vector<float> h_X(batch * K);
+    for (std::size_t b = 0; b < batch; ++b) {
+      for (std::size_t k = 0; k < K; ++k) {
+        h_X[b * K + k] = static_cast<float>(b + 1);
+      }
+    }
+    std::vector<float> h_Y(batch * M, 0.0F);
+
+    float *d_A = nullptr, *d_X = nullptr, *d_Y = nullptr;
+    HIP_CHECK(hipMalloc(&d_A, M * K * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_X, batch * K * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_Y, batch * M * sizeof(float)));
+
+    HIP_CHECK(hipMemcpy(d_A, h_A.data(), M * K * sizeof(float),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_X, h_X.data(), batch * K * sizeof(float),
+                        hipMemcpyHostToDevice));
+
+    strix::hip::LaunchHipblasGEMM(handle, d_A, false, d_X, d_Y, batch, M, K,
+                                  nullptr);
+    HIP_CHECK(hipDeviceSynchronize());
+
+    HIP_CHECK(hipMemcpy(h_Y.data(), d_Y, batch * M * sizeof(float),
+                        hipMemcpyDeviceToHost));
+
+    for (std::size_t b = 0; b < batch; ++b) {
+      const float expected =
+          static_cast<float>(b + 1) * 1.5F * static_cast<float>(K);
+      for (std::size_t m = 0; m < M; ++m) {
+        const float diff = std::abs(h_Y[b * M + m] - expected);
+        if (diff >= 1e-4F) {
+          std::cerr << "Mismatch in FP32 HipblasGEMM at b=" << b << " m=" << m
+                    << "\n";
+          std::abort();
+        }
+      }
+    }
+
+    HIP_CHECK(hipFree(d_A));
+    HIP_CHECK(hipFree(d_X));
+    HIP_CHECK(hipFree(d_Y));
+  }
+
+  // Test BF16
+  {
+    std::vector<std::uint16_t> h_A(M * K);
+    for (std::size_t i = 0; i < M * K; ++i) {
+      h_A[i] = FloatToBf16Bits(1.5F);
+    }
+    std::vector<float> h_X(batch * K);
+    for (std::size_t b = 0; b < batch; ++b) {
+      for (std::size_t k = 0; k < K; ++k) {
+        h_X[b * K + k] = static_cast<float>(b + 1);
+      }
+    }
+    std::vector<float> h_Y(batch * M, 0.0F);
+
+    void* d_A = nullptr;
+    float *d_X = nullptr, *d_Y = nullptr;
+    void* d_x_bf16 = nullptr;
+    HIP_CHECK(hipMalloc(&d_A, M * K * sizeof(std::uint16_t)));
+    HIP_CHECK(hipMalloc(&d_X, batch * K * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_Y, batch * M * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_x_bf16, batch * K * sizeof(std::uint16_t)));
+
+    HIP_CHECK(hipMemcpy(d_A, h_A.data(), M * K * sizeof(std::uint16_t),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_X, h_X.data(), batch * K * sizeof(float),
+                        hipMemcpyHostToDevice));
+
+    strix::hip::LaunchHipblasGEMM(handle, d_A, true, d_X, d_Y, batch, M, K,
+                                  d_x_bf16);
+    HIP_CHECK(hipDeviceSynchronize());
+
+    HIP_CHECK(hipMemcpy(h_Y.data(), d_Y, batch * M * sizeof(float),
+                        hipMemcpyDeviceToHost));
+
+    for (std::size_t b = 0; b < batch; ++b) {
+      const float expected =
+          static_cast<float>(b + 1) * 1.5F * static_cast<float>(K);
+      for (std::size_t m = 0; m < M; ++m) {
+        const float diff = std::abs(h_Y[b * M + m] - expected);
+        if (diff >= 1e-2F) {
+          std::cerr << "Mismatch in BF16 HipblasGEMM at b=" << b << " m=" << m
+                    << " got=" << h_Y[b * M + m] << " expected=" << expected
+                    << "\n";
+          std::abort();
+        }
+      }
+    }
+
+    HIP_CHECK(hipFree(d_A));
+    HIP_CHECK(hipFree(d_X));
+    HIP_CHECK(hipFree(d_Y));
+    HIP_CHECK(hipFree(d_x_bf16));
+  }
+
+  HIPBLAS_CHECK(hipblasDestroy(handle));
 }
 
 void TestBatchedSSMConvEquivalence() {
@@ -653,6 +771,7 @@ int main() {
   TestGpuResidualAdd();
   TestGpuGEMV();
   TestBatchedGEMM();
+  TestHipblasGEMM();
   TestBatchedSSMConvEquivalence();
   TestBatchedAttentionEquivalence();
   TestBatchedFusedProjectionsEquivalence();

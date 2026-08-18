@@ -1385,6 +1385,90 @@ void LaunchBatchedGEMM(const void* A, bool is_bf16, const float* X, float* Y,
                                               K);
 }
 
+__global__ void FloatToBfloat16Kernel(const float* __restrict__ in,
+                                      hip_bfloat16* __restrict__ out,
+                                      std::size_t num_elements) {
+  const std::size_t idx = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (idx < num_elements) {
+    out[idx] = hip_bfloat16(in[idx]);
+  }
+}
+
+void LaunchFloatToBfloat16(const float* in, void* out, std::size_t num_elements,
+                           hipStream_t stream) {
+  if (num_elements == 0) {
+    return;
+  }
+  const unsigned int block_size = 256;
+  const unsigned int num_blocks =
+      static_cast<unsigned int>((num_elements + block_size - 1) / block_size);
+  FloatToBfloat16Kernel<<<num_blocks, block_size, 0, stream>>>(
+      in, static_cast<hip_bfloat16*>(out), num_elements);
+}
+
+__global__ void BatchedSwiGLUActivationKernel(const float* __restrict__ gate,
+                                              const float* __restrict__ up,
+                                              float* __restrict__ out,
+                                              std::size_t num_elements) {
+  const std::size_t idx = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (idx < num_elements) {
+    const float g = gate[idx];
+    const float u = up[idx];
+    const float sig_g = 1.0F / (1.0F + expf(-g));
+    out[idx] = (g * sig_g) * u;
+  }
+}
+
+void LaunchBatchedSwiGLUActivation(const float* gate, const float* up,
+                                   float* out, std::size_t num_elements,
+                                   hipStream_t stream) {
+  if (num_elements == 0) {
+    return;
+  }
+  const unsigned int block_size = 256;
+  const unsigned int num_blocks =
+      static_cast<unsigned int>((num_elements + block_size - 1) / block_size);
+  BatchedSwiGLUActivationKernel<<<num_blocks, block_size, 0, stream>>>(
+      gate, up, out, num_elements);
+}
+
+void LaunchHipblasGEMM(hipblasHandle_t handle, const void* A, bool is_bf16,
+                       const float* X, float* Y, std::size_t batch_size,
+                       std::size_t M, std::size_t K, void* d_x_bf16_buf,
+                       hipStream_t stream) {
+  if (batch_size == 0 || M == 0 || K == 0) {
+    return;
+  }
+
+  HIPBLAS_CHECK(hipblasSetStream(handle, stream));
+
+  const float alpha = 1.0F;
+  const float beta = 0.0F;
+
+  if (is_bf16) {
+    LaunchFloatToBfloat16(X, d_x_bf16_buf, batch_size * K, stream);
+    hipblasStatus_t stat = hipblasGemmEx(
+        handle, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(M),
+        static_cast<int>(batch_size), static_cast<int>(K), &alpha, A,
+        HIP_R_16BF, static_cast<int>(K), d_x_bf16_buf, HIP_R_16BF,
+        static_cast<int>(K), &beta, Y, HIP_R_32F, static_cast<int>(M),
+        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
+    if (stat != HIPBLAS_STATUS_SUCCESS) {
+      std::cerr << "hipblasGemmEx BF16 returned error code: " << stat << "\n";
+    }
+  } else {
+    hipblasStatus_t stat = hipblasGemmEx(
+        handle, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(M),
+        static_cast<int>(batch_size), static_cast<int>(K), &alpha, A, HIP_R_32F,
+        static_cast<int>(K), X, HIP_R_32F, static_cast<int>(K), &beta, Y,
+        HIP_R_32F, static_cast<int>(M), HIPBLAS_COMPUTE_32F,
+        HIPBLAS_GEMM_DEFAULT);
+    if (stat != HIPBLAS_STATUS_SUCCESS) {
+      std::cerr << "hipblasGemmEx FP32 returned error code: " << stat << "\n";
+    }
+  }
+}
+
 __global__ void BatchedFusedSSMInputProjectionsKernel(
     const void* __restrict__ qkv_w, bool qkv_is_bf16,
     const void* __restrict__ gate_w, bool gate_is_bf16,

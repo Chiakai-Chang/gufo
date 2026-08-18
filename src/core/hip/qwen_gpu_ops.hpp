@@ -6,6 +6,7 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 
 namespace strix::hip {
 
@@ -144,6 +145,22 @@ void LaunchBatchedRoPE(float* q, float* k, std::size_t batch_size,
 void LaunchBatchedGEMM(const void* A, bool is_bf16, const float* X, float* Y,
                        std::size_t batch_size, std::size_t M, std::size_t K,
                        hipStream_t stream = nullptr);
+
+/// Converts float buffer to bfloat16 buffer on GPU
+void LaunchFloatToBfloat16(const float* in, void* out, std::size_t num_elements,
+                           hipStream_t stream = nullptr);
+
+/// Hardware-accelerated Batched GEMM: Y[B, M] = X[B, K] * A[M, K]^T using
+/// hipBLAS
+void LaunchHipblasGEMM(hipblasHandle_t handle, const void* A, bool is_bf16,
+                       const float* X, float* Y, std::size_t batch_size,
+                       std::size_t M, std::size_t K, void* d_x_bf16_buf,
+                       hipStream_t stream = nullptr);
+
+/// Batched SwiGLU activation: out = (gate * sigmoid(gate)) * up
+void LaunchBatchedSwiGLUActivation(const float* gate, const float* up,
+                                   float* out, std::size_t num_elements,
+                                   hipStream_t stream = nullptr);
 
 /// Batched Fused SSM Input Projections across B tokens
 void LaunchBatchedFusedSSMInputProjections(

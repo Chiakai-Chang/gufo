@@ -15,7 +15,9 @@
 #include "src/tokenization/qwen_tokenizer.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 
 namespace strix::hip {
 
@@ -56,6 +58,8 @@ public:
   std::uint32_t* d_prompt_tokens{nullptr};
 
   hipStream_t stream{nullptr};
+  hipblasHandle_t hipblas_handle{nullptr};
+  void* d_scratch_bf16{nullptr};
 
   [[nodiscard]] std::uint32_t GetMaxBatch() const noexcept {
     return max_batch_;
