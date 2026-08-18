@@ -32,8 +32,8 @@ void TestRoPEPreservation() {
   std::vector<float> k = {1.0F, 1.0F, 1.0F, 1.0F};
 
   const float norm_before = std::sqrt(q[0] * q[0] + q[1] * q[1]);
-  strix::models::ForwardRoPE(q, k, num_heads, num_kv_heads, head_dim, 5,
-                             10000.0F);
+  strix::models::ForwardRoPE(q, k, num_heads, num_kv_heads, head_dim, head_dim,
+                             5, 10000.0F);
   const float norm_after = std::sqrt(q[0] * q[0] + q[1] * q[1]);
 
   assert(std::abs(norm_before - norm_after) < 1e-5F);

@@ -25,7 +25,8 @@ struct ModelConfig {
   std::uint32_t linear_key_value_heads{16};  ///< 16 for 4B (32 for 27B)
   std::uint32_t linear_head_dim{128};
   std::uint32_t mtp_num_layers{1};
-  float rope_theta{1000000.0F};
+  std::uint32_t rotary_dim{64};
+  float rope_theta{10000000.0F};
   float rope_scale{1.0F};
   bool is_text_only{true};
 

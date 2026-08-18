@@ -26,8 +26,8 @@ void ForwardRMSNorm(std::span<const float> x, const QwenTensorRef& weight,
 /// Computes RoPE rotation on Q and K heads for a given position.
 void ForwardRoPE(std::span<float> q, std::span<float> k,
                  std::uint32_t num_heads, std::uint32_t num_kv_heads,
-                 std::uint32_t head_dim, std::uint32_t pos,
-                 float rope_theta) noexcept;
+                 std::uint32_t head_dim, std::uint32_t rotary_dim,
+                 std::uint32_t pos, float rope_theta) noexcept;
 
 /// Computes Grouped-Query Attention with KV-cache for a single sequence
 /// position.

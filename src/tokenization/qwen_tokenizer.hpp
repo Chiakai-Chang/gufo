@@ -44,6 +44,10 @@ public:
   [[nodiscard]] static std::unique_ptr<QwenTokenizer> CreateFromGguf(
       const core::GgufReader& reader, std::string* error_msg = nullptr);
 
+  /// Creates a tokenizer from a binary vocabulary file.
+  [[nodiscard]] static std::unique_ptr<QwenTokenizer> CreateFromBinaryFile(
+      const std::string& path, std::string* error_msg = nullptr);
+
   /// Creates a tokenizer directly from token and merge lists (useful for tests
   /// and custom models).
   [[nodiscard]] static std::unique_ptr<QwenTokenizer> CreateFromVocabulary(

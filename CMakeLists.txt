@@ -122,6 +122,11 @@ add_library(strix_core STATIC
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
+find_package(OpenMP)
+if (OpenMP_CXX_FOUND)
+  target_link_libraries(strix_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
 add_executable(strix-server
   src/server/main.cpp
   src/server/prompt_cli.cpp

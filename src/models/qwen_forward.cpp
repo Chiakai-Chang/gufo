@@ -18,6 +18,7 @@ void TensorGEMV(const QwenTensorRef& A, std::span<const float> x, std::size_t M,
   }
   if (A.type == core::GgmlType::kF32) {
     const auto* ptr = static_cast<const float*>(A.data);
+#pragma omp parallel for schedule(static)
     for (std::size_t m = 0; m < M; ++m) {
       const auto* row = ptr + (m * K);
       float dot = 0.0F;
@@ -28,6 +29,7 @@ void TensorGEMV(const QwenTensorRef& A, std::span<const float> x, std::size_t M,
     }
   } else if (A.type == core::GgmlType::kBF16) {
     const auto* ptr = static_cast<const std::uint16_t*>(A.data);
+#pragma omp parallel for schedule(static)
     for (std::size_t m = 0; m < M; ++m) {
       const auto* row = ptr + (m * K);
       float dot = 0.0F;
@@ -79,16 +81,18 @@ void ForwardRMSNorm(std::span<const float> x, const QwenTensorRef& weight,
 
 void ForwardRoPE(std::span<float> q, std::span<float> k,
                  std::uint32_t num_heads, std::uint32_t num_kv_heads,
-                 std::uint32_t head_dim, std::uint32_t pos,
-                 float rope_theta) noexcept {
+                 std::uint32_t head_dim, std::uint32_t rotary_dim,
+                 std::uint32_t pos, float rope_theta) noexcept {
+  const std::uint32_t r_dim =
+      (rotary_dim > 0 && rotary_dim <= head_dim) ? rotary_dim : head_dim;
   for (std::uint32_t h = 0; h < num_heads; ++h) {
     const auto q_slice =
-        q.subspan(static_cast<std::size_t>(h) * head_dim, head_dim);
+        q.subspan(static_cast<std::size_t>(h) * head_dim, r_dim);
     qwen::ReferenceRoPE(q_slice, pos, rope_theta, q_slice);
   }
   for (std::uint32_t h = 0; h < num_kv_heads; ++h) {
     const auto k_slice =
-        k.subspan(static_cast<std::size_t>(h) * head_dim, head_dim);
+        k.subspan(static_cast<std::size_t>(h) * head_dim, r_dim);
     qwen::ReferenceRoPE(k_slice, pos, rope_theta, k_slice);
   }
 }
@@ -240,8 +244,8 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
     }
 
     ForwardRoPE(arena.q, arena.k, config.num_attention_heads,
-                config.num_key_value_heads, config.head_dim, pos,
-                config.rope_theta);
+                config.num_key_value_heads, config.head_dim, config.rotary_dim,
+                pos, config.rope_theta);
 
     ForwardAttention(arena.q, arena.k, arena.v, layer.attn_output, kv_cache,
                      layer_idx, pos, config.num_attention_heads,

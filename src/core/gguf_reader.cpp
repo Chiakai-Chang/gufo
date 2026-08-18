@@ -593,6 +593,11 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   if (auto val = GetMetadataFloat32(prefix + "rope.freq_base")) {
     config.rope_theta = *val;
   }
+  if (auto val = GetMetadataUint32(prefix + "rope.dimension_count")) {
+    config.rotary_dim = *val;
+  } else {
+    config.rotary_dim = config.head_dim;
+  }
 
   // 3. MTP speculative layers check
   config.mtp_num_layers = HasMtpTensors() ? 1 : 0;
