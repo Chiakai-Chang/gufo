@@ -32,7 +32,7 @@ struct ModelConfig {
   /// Returns true if this configuration conforms to the Qwen3.5/3.8 repeating
   /// block structure.
   [[nodiscard]] constexpr bool IsValidQwen() const noexcept {
-    return head_dim == 128 && num_layers > 0 && hidden_size > 0 &&
+    return head_dim > 0 && num_layers > 0 && hidden_size > 0 &&
            intermediate_size > 0 && num_attention_heads > 0 &&
            num_key_value_heads > 0 && vocab_size > 0 &&
            full_attention_interval == 4 && is_text_only;

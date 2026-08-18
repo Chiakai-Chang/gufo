@@ -117,6 +117,7 @@ add_library(strix_core STATIC
   src/models/qwen_oracles.cpp
   src/models/qwen_state.cpp
   src/models/qwen_forward.cpp
+  src/models/qwen_generator.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -195,6 +196,12 @@ if (BUILD_TESTING)
 
   add_test(NAME qwen_forward_test COMMAND qwen_forward_test)
   set_tests_properties(qwen_forward_test PROPERTIES LABELS "cpu;models;forward")
+
+  add_executable(qwen_generator_test tests/models/qwen_generator_test.cpp)
+  target_link_libraries(qwen_generator_test PRIVATE strix_core)
+
+  add_test(NAME qwen_generator_test COMMAND qwen_generator_test)
+  set_tests_properties(qwen_generator_test PROPERTIES LABELS "cpu;models;generator")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)

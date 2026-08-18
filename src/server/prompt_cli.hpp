@@ -10,7 +10,7 @@
 
 namespace strix::server {
 
-/// Options for `strix-server prompt` execution.
+/// Options for `strix-server prompt` and `chat` execution.
 struct PromptOptions {
   std::string model_path;
   std::string prompt_text;
@@ -28,6 +28,9 @@ struct PromptOptions {
 
 /// Executes the prompt CLI workflow.
 [[nodiscard]] int RunPrompt(std::span<const char* const> args);
+
+/// Executes the interactive multi-turn terminal chat workflow.
+[[nodiscard]] int RunChat(std::span<const char* const> args);
 
 }  // namespace strix::server
 

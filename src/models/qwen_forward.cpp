@@ -4,25 +4,77 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <span>
 
 #include "src/models/qwen_oracles.hpp"
 
 namespace strix::models {
 
-void ForwardEmbedding(std::uint32_t token_id, std::span<const float> token_embd,
-                      std::size_t hidden_size,
-                      std::span<float> hidden_out) noexcept {
-  const std::size_t offset = static_cast<std::size_t>(token_id) * hidden_size;
-  if (offset + hidden_size <= token_embd.size() &&
-      hidden_out.size() >= hidden_size) {
-    std::copy_n(token_embd.data() + offset, hidden_size, hidden_out.data());
+void TensorGEMV(const QwenTensorRef& A, std::span<const float> x, std::size_t M,
+                std::size_t K, std::span<float> y) noexcept {
+  if (A.empty() || y.size() < M) {
+    return;
+  }
+  if (A.type == core::GgmlType::kF32) {
+    const auto* ptr = static_cast<const float*>(A.data);
+    for (std::size_t m = 0; m < M; ++m) {
+      const auto* row = ptr + (m * K);
+      float dot = 0.0F;
+      for (std::size_t k = 0; k < K; ++k) {
+        dot += row[k] * x[k];
+      }
+      y[m] = dot;
+    }
+  } else if (A.type == core::GgmlType::kBF16) {
+    const auto* ptr = static_cast<const std::uint16_t*>(A.data);
+    for (std::size_t m = 0; m < M; ++m) {
+      const auto* row = ptr + (m * K);
+      float dot = 0.0F;
+      for (std::size_t k = 0; k < K; ++k) {
+        const std::uint32_t u32 = static_cast<std::uint32_t>(row[k]) << 16;
+        float val = 0.0F;
+        std::memcpy(&val, &u32, sizeof(float));
+        dot += val * x[k];
+      }
+      y[m] = dot;
+    }
   }
 }
 
-void ForwardRMSNorm(std::span<const float> x, std::span<const float> weight,
+void ForwardEmbedding(std::uint32_t token_id, const QwenTensorRef& token_embd,
+                      std::size_t hidden_size,
+                      std::span<float> hidden_out) noexcept {
+  const std::size_t offset = static_cast<std::size_t>(token_id) * hidden_size;
+  if (offset + hidden_size <= token_embd.num_elements &&
+      hidden_out.size() >= hidden_size) {
+    if (token_embd.type == core::GgmlType::kF32) {
+      const auto* ptr = static_cast<const float*>(token_embd.data) + offset;
+      std::copy_n(ptr, hidden_size, hidden_out.data());
+    } else if (token_embd.type == core::GgmlType::kBF16) {
+      const auto* ptr =
+          static_cast<const std::uint16_t*>(token_embd.data) + offset;
+      for (std::size_t i = 0; i < hidden_size; ++i) {
+        const std::uint32_t u32 = static_cast<std::uint32_t>(ptr[i]) << 16;
+        float f = 0.0F;
+        std::memcpy(&f, &u32, sizeof(float));
+        hidden_out[i] = f;
+      }
+    }
+  }
+}
+
+void ForwardRMSNorm(std::span<const float> x, const QwenTensorRef& weight,
                     float eps, std::span<float> out) noexcept {
-  qwen::ReferenceRMSNorm(x, weight, eps, out);
+  if (weight.type == core::GgmlType::kF32) {
+    qwen::ReferenceRMSNorm(x, weight.AsFloatSpan(), eps, out);
+  } else {
+    std::vector<float> w_f32(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i) {
+      w_f32[i] = weight.Get(i);
+    }
+    qwen::ReferenceRMSNorm(x, w_f32, eps, out);
+  }
 }
 
 void ForwardRoPE(std::span<float> q, std::span<float> k,
@@ -42,13 +94,12 @@ void ForwardRoPE(std::span<float> q, std::span<float> k,
 }
 
 void ForwardAttention(std::span<const float> q, std::span<const float> k,
-                      std::span<const float> v, std::span<const float> o_weight,
+                      std::span<const float> v, const QwenTensorRef& o_weight,
                       QwenKvCache& kv_cache, std::uint32_t layer_idx,
                       std::uint32_t pos, std::uint32_t num_heads,
                       std::uint32_t num_kv_heads, std::uint32_t head_dim,
                       std::span<float> attn_scores_scratch,
                       std::span<float> attn_out) noexcept {
-  // Store new K, V into cache
   for (std::uint32_t kv_h = 0; kv_h < num_kv_heads; ++kv_h) {
     const auto k_src =
         k.subspan(static_cast<std::size_t>(kv_h) * head_dim, head_dim);
@@ -75,7 +126,6 @@ void ForwardAttention(std::span<const float> q, std::span<const float> k,
     const auto q_head =
         q.subspan(static_cast<std::size_t>(h) * head_dim, head_dim);
 
-    // Compute scores for 0..pos
     float max_score = -1e30F;
     for (std::size_t p = 0; p < seq_len; ++p) {
       const auto k_p =
@@ -89,7 +139,6 @@ void ForwardAttention(std::span<const float> q, std::span<const float> k,
       max_score = std::max(score, max_score);
     }
 
-    // Softmax
     double sum_exp = 0.0;
     for (std::size_t p = 0; p < seq_len; ++p) {
       sum_exp +=
@@ -102,7 +151,6 @@ void ForwardAttention(std::span<const float> q, std::span<const float> k,
           inv_sum);
     }
 
-    // Weighted sum of values
     auto ctx_head = std::span<float>(
         &context[static_cast<std::size_t>(h) * head_dim], head_dim);
     std::ranges::fill(ctx_head, 0.0F);
@@ -119,36 +167,33 @@ void ForwardAttention(std::span<const float> q, std::span<const float> k,
     }
   }
 
-  // Output projection: context @ o_weight -> attn_out
   const std::size_t hidden_size =
       static_cast<std::size_t>(num_heads) * head_dim;
   if (!o_weight.empty()) {
-    qwen::ReferenceGEMV(o_weight, context, hidden_size, hidden_size, attn_out);
+    TensorGEMV(o_weight, context, hidden_size, hidden_size, attn_out);
   } else {
     std::copy_n(context.data(), hidden_size, attn_out.data());
   }
 }
 
-void ForwardFFN(std::span<const float> x, std::span<const float> gate_weight,
-                std::span<const float> up_weight,
-                std::span<const float> down_weight, std::size_t hidden_size,
+void ForwardFFN(std::span<const float> x, const QwenTensorRef& gate_weight,
+                const QwenTensorRef& up_weight,
+                const QwenTensorRef& down_weight, std::size_t hidden_size,
                 std::size_t intermediate_size, std::span<float> gate_scratch,
                 std::span<float> up_scratch, std::span<float> act_scratch,
                 std::span<float> ffn_out) noexcept {
   if (!gate_weight.empty()) {
-    qwen::ReferenceGEMV(gate_weight, x, intermediate_size, hidden_size,
-                        gate_scratch);
+    TensorGEMV(gate_weight, x, intermediate_size, hidden_size, gate_scratch);
   }
   if (!up_weight.empty()) {
-    qwen::ReferenceGEMV(up_weight, x, intermediate_size, hidden_size,
-                        up_scratch);
+    TensorGEMV(up_weight, x, intermediate_size, hidden_size, up_scratch);
   }
 
   qwen::ReferenceSwiGLU(gate_scratch, up_scratch, act_scratch);
 
   if (!down_weight.empty()) {
-    qwen::ReferenceGEMV(down_weight, act_scratch, hidden_size,
-                        intermediate_size, ffn_out);
+    TensorGEMV(down_weight, act_scratch, hidden_size, intermediate_size,
+               ffn_out);
   }
 }
 
@@ -166,45 +211,49 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
   // 1. Attention Pre-RMSNorm
   ForwardRMSNorm(hidden, layer.attn_norm, 1e-6F, arena.normed);
 
-  // 2. Q, K, V Projections
-  if (!layer.attn_q.empty()) {
-    qwen::ReferenceGEMV(layer.attn_q, arena.normed, q_size, hidden_size,
-                        arena.q);
-  }
-  if (!layer.attn_k.empty()) {
-    qwen::ReferenceGEMV(layer.attn_k, arena.normed, kv_size, hidden_size,
-                        arena.k);
-  }
-  if (!layer.attn_v.empty()) {
-    qwen::ReferenceGEMV(layer.attn_v, arena.normed, kv_size, hidden_size,
-                        arena.v);
+  // 2. Attention / SSM block
+  if (layer.is_full_attention) {
+    if (!layer.attn_q.empty()) {
+      TensorGEMV(layer.attn_q, arena.normed, q_size, hidden_size, arena.q);
+    }
+    if (!layer.attn_k.empty()) {
+      TensorGEMV(layer.attn_k, arena.normed, kv_size, hidden_size, arena.k);
+    }
+    if (!layer.attn_v.empty()) {
+      TensorGEMV(layer.attn_v, arena.normed, kv_size, hidden_size, arena.v);
+    }
+
+    ForwardRoPE(arena.q, arena.k, config.num_attention_heads,
+                config.num_key_value_heads, config.head_dim, pos,
+                config.rope_theta);
+
+    ForwardAttention(arena.q, arena.k, arena.v, layer.attn_output, kv_cache,
+                     layer_idx, pos, config.num_attention_heads,
+                     config.num_key_value_heads, config.head_dim,
+                     arena.attn_scores, arena.attn_out);
+  } else {
+    if (!layer.attn_qkv.empty() && !layer.ssm_out.empty()) {
+      TensorGEMV(layer.attn_qkv, arena.normed, q_size, hidden_size, arena.q);
+      TensorGEMV(layer.ssm_out, arena.q, hidden_size, q_size, arena.attn_out);
+    } else {
+      std::ranges::fill(arena.attn_out, 0.0F);
+    }
   }
 
-  // 3. RoPE
-  ForwardRoPE(arena.q, arena.k, config.num_attention_heads,
-              config.num_key_value_heads, config.head_dim, pos,
-              config.rope_theta);
-
-  // 4. Attention + KV cache
-  ForwardAttention(arena.q, arena.k, arena.v, layer.attn_output, kv_cache,
-                   layer_idx, pos, config.num_attention_heads,
-                   config.num_key_value_heads, config.head_dim,
-                   arena.attn_scores, arena.attn_out);
-
-  // 5. Residual Add
+  // 3. Residual Add
   for (std::size_t i = 0; i < hidden_size; ++i) {
     hidden[i] += arena.attn_out[i];
   }
 
-  // 6. FFN Pre-RMSNorm
+  // 4. FFN Pre-RMSNorm
   ForwardRMSNorm(hidden, layer.ffn_norm, 1e-6F, arena.normed);
 
-  // 7. SwiGLU FFN
+  // 5. SwiGLU FFN
   ForwardFFN(arena.normed, layer.ffn_gate, layer.ffn_up, layer.ffn_down,
              hidden_size, config.intermediate_size, arena.mlp_gate,
              arena.mlp_up, arena.mlp_act, arena.mlp_out);
 
-  // 8. Residual Add
+  // 6. Residual Add
   for (std::size_t i = 0; i < hidden_size; ++i) {
     hidden[i] += arena.mlp_out[i];
   }
@@ -225,8 +274,8 @@ void ForwardModel(std::uint32_t token_id, std::uint32_t pos,
   ForwardRMSNorm(arena.hidden, weights.output_norm, 1e-6F, arena.normed);
 
   if (!weights.output.empty()) {
-    qwen::ReferenceGEMV(weights.output, arena.normed, weights.config.vocab_size,
-                        weights.config.hidden_size, logits_out);
+    TensorGEMV(weights.output, arena.normed, weights.config.vocab_size,
+               weights.config.hidden_size, logits_out);
   }
 }
 

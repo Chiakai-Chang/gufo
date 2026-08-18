@@ -14,7 +14,10 @@ void TestEmbeddingLookup() {
   };
   std::vector<float> hidden(hidden_size, 0.0F);
 
-  strix::models::ForwardEmbedding(1, table, hidden_size, hidden);
+  const strix::models::QwenTensorRef ref = {.data = table.data(),
+                                            .type = strix::core::GgmlType::kF32,
+                                            .num_elements = table.size()};
+  strix::models::ForwardEmbedding(1, ref, hidden_size, hidden);
   assert(hidden[0] == 5.0F);
   assert(hidden[1] == 6.0F);
   assert(hidden[2] == 7.0F);
@@ -44,12 +47,25 @@ void TestSwiGLUFFN() {
   const std::vector<float> up_w = {1.0F, 0.0F, 0.0F, 1.0F};    // identity
   const std::vector<float> down_w = {1.0F, 0.0F, 0.0F, 1.0F};  // identity
 
+  const strix::models::QwenTensorRef gate_ref = {
+      .data = gate_w.data(),
+      .type = strix::core::GgmlType::kF32,
+      .num_elements = gate_w.size()};
+  const strix::models::QwenTensorRef up_ref = {
+      .data = up_w.data(),
+      .type = strix::core::GgmlType::kF32,
+      .num_elements = up_w.size()};
+  const strix::models::QwenTensorRef down_ref = {
+      .data = down_w.data(),
+      .type = strix::core::GgmlType::kF32,
+      .num_elements = down_w.size()};
+
   std::vector<float> gate_sc(intermediate_size);
   std::vector<float> up_sc(intermediate_size);
   std::vector<float> act_sc(intermediate_size);
   std::vector<float> ffn_out(hidden_size);
 
-  strix::models::ForwardFFN(x, gate_w, up_w, down_w, hidden_size,
+  strix::models::ForwardFFN(x, gate_ref, up_ref, down_ref, hidden_size,
                             intermediate_size, gate_sc, up_sc, act_sc, ffn_out);
 
   // gate = [1.0, 2.0], up = [1.0, 2.0]

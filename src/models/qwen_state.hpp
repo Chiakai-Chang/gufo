@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <optional>
 #include <span>
@@ -14,27 +15,79 @@
 
 namespace strix::models {
 
-/// Tensor weight references for a single transformer layer block.
-struct QwenLayerWeights {
-  std::span<const float> attn_norm;
-  std::span<const float> attn_q;
-  std::span<const float> attn_k;
-  std::span<const float> attn_v;
-  std::span<const float> attn_output;
+/// Generic reference to a mapped tensor supporting F32 and BF16 formats.
+struct QwenTensorRef {
+  const void* data = nullptr;
+  core::GgmlType type = core::GgmlType::kF32;
+  std::size_t num_elements = 0;
 
-  std::span<const float> ffn_norm;
-  std::span<const float> ffn_gate;
-  std::span<const float> ffn_up;
-  std::span<const float> ffn_down;
+  [[nodiscard]] bool empty() const noexcept {
+    return data == nullptr || num_elements == 0;
+  }
+
+  [[nodiscard]] float Get(std::size_t index) const noexcept {
+    if (type == core::GgmlType::kF32) {
+      return static_cast<const float*>(data)[index];
+    }
+    if (type == core::GgmlType::kBF16) {
+      const auto u16 = static_cast<const std::uint16_t*>(data)[index];
+      const std::uint32_t u32 = static_cast<std::uint32_t>(u16) << 16;
+      float f = 0.0F;
+      std::memcpy(&f, &u32, sizeof(float));
+      return f;
+    }
+    return 0.0F;
+  }
+
+  [[nodiscard]] std::span<const float> AsFloatSpan() const noexcept {
+    if (type == core::GgmlType::kF32 && data != nullptr) {
+      return {static_cast<const float*>(data), num_elements};
+    }
+    return {};
+  }
+};
+
+/// Tensor weight references for a single transformer layer block (Linear SSM or
+/// Full Attention).
+struct QwenLayerWeights {
+  bool is_full_attention = false;
+
+  // Common Layer Norms
+  QwenTensorRef attn_norm;
+  QwenTensorRef ffn_norm;
+
+  // Full Attention Weights (every 4th block)
+  QwenTensorRef attn_q;
+  QwenTensorRef attn_k;
+  QwenTensorRef attn_v;
+  QwenTensorRef attn_output;
+  QwenTensorRef attn_q_norm;
+  QwenTensorRef attn_k_norm;
+
+  // Linear Attention / SSM Weights (3 of 4 blocks)
+  QwenTensorRef attn_qkv;
+  QwenTensorRef attn_gate;
+  QwenTensorRef ssm_a;
+  QwenTensorRef ssm_conv1d;
+  QwenTensorRef ssm_dt;
+  QwenTensorRef ssm_alpha;
+  QwenTensorRef ssm_beta;
+  QwenTensorRef ssm_norm;
+  QwenTensorRef ssm_out;
+
+  // Feed Forward Network
+  QwenTensorRef ffn_gate;
+  QwenTensorRef ffn_up;
+  QwenTensorRef ffn_down;
 };
 
 /// Full model tensor references mapped directly from GGUF storage.
 struct QwenModelWeights {
   core::ModelConfig config;
-  std::span<const float> token_embd;
+  QwenTensorRef token_embd;
   std::vector<QwenLayerWeights> layers;
-  std::span<const float> output_norm;
-  std::span<const float> output;
+  QwenTensorRef output_norm;
+  QwenTensorRef output;
 
   /// Loads and binds weights from a GgufReader.
   [[nodiscard]] static std::optional<QwenModelWeights> LoadFromGguf(
@@ -42,7 +95,6 @@ struct QwenModelWeights {
 };
 
 /// Contiguous Key-Value Cache for auto-regressive generation.
-/// Memory layout: [num_layers, num_kv_heads, max_context_length, head_dim].
 class QwenKvCache {
 public:
   QwenKvCache(std::uint32_t num_layers, std::uint32_t num_kv_heads,

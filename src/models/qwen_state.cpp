@@ -1,5 +1,6 @@
 #include "src/models/qwen_state.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -8,13 +9,15 @@
 namespace strix::models {
 namespace {
 
-std::span<const float> ExtractTensorSpan(const core::GgufReader& reader,
-                                         std::string_view name) {
+QwenTensorRef ExtractTensorRef(const core::GgufReader& reader,
+                               std::string_view name) {
   const auto* tensor = reader.FindTensor(name);
   if (tensor == nullptr || tensor->data == nullptr) {
     return {};
   }
-  return {static_cast<const float*>(tensor->data), tensor->ElementCount()};
+  return {.data = tensor->data,
+          .type = tensor->type,
+          .num_elements = tensor->ElementCount()};
 }
 
 }  // namespace
@@ -29,9 +32,9 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
   QwenModelWeights weights;
   weights.config = *config_opt;
 
-  weights.token_embd = ExtractTensorSpan(reader, "token_embd.weight");
-  weights.output_norm = ExtractTensorSpan(reader, "output_norm.weight");
-  weights.output = ExtractTensorSpan(reader, "output.weight");
+  weights.token_embd = ExtractTensorRef(reader, "token_embd.weight");
+  weights.output_norm = ExtractTensorRef(reader, "output_norm.weight");
+  weights.output = ExtractTensorRef(reader, "output.weight");
   if (weights.output.empty()) {
     // Tied LM head shares token embeddings
     weights.output = weights.token_embd;
@@ -42,16 +45,38 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
     const std::string prefix = "blk." + std::to_string(i) + ".";
     auto& l = weights.layers[i];
 
-    l.attn_norm = ExtractTensorSpan(reader, prefix + "attn_norm.weight");
-    l.attn_q = ExtractTensorSpan(reader, prefix + "attn_q.weight");
-    l.attn_k = ExtractTensorSpan(reader, prefix + "attn_k.weight");
-    l.attn_v = ExtractTensorSpan(reader, prefix + "attn_v.weight");
-    l.attn_output = ExtractTensorSpan(reader, prefix + "attn_output.weight");
+    l.attn_norm = ExtractTensorRef(reader, prefix + "attn_norm.weight");
+    l.ffn_norm = ExtractTensorRef(reader, prefix + "ffn_norm.weight");
+    if (l.ffn_norm.empty()) {
+      l.ffn_norm =
+          ExtractTensorRef(reader, prefix + "post_attention_norm.weight");
+    }
 
-    l.ffn_norm = ExtractTensorSpan(reader, prefix + "ffn_norm.weight");
-    l.ffn_gate = ExtractTensorSpan(reader, prefix + "ffn_gate.weight");
-    l.ffn_up = ExtractTensorSpan(reader, prefix + "ffn_up.weight");
-    l.ffn_down = ExtractTensorSpan(reader, prefix + "ffn_down.weight");
+    // Check if full attention layer
+    l.attn_q = ExtractTensorRef(reader, prefix + "attn_q.weight");
+    if (!l.attn_q.empty()) {
+      l.is_full_attention = true;
+      l.attn_k = ExtractTensorRef(reader, prefix + "attn_k.weight");
+      l.attn_v = ExtractTensorRef(reader, prefix + "attn_v.weight");
+      l.attn_output = ExtractTensorRef(reader, prefix + "attn_output.weight");
+      l.attn_q_norm = ExtractTensorRef(reader, prefix + "attn_q_norm.weight");
+      l.attn_k_norm = ExtractTensorRef(reader, prefix + "attn_k_norm.weight");
+    } else {
+      l.is_full_attention = false;
+      l.attn_qkv = ExtractTensorRef(reader, prefix + "attn_qkv.weight");
+      l.attn_gate = ExtractTensorRef(reader, prefix + "attn_gate.weight");
+      l.ssm_a = ExtractTensorRef(reader, prefix + "ssm_a");
+      l.ssm_conv1d = ExtractTensorRef(reader, prefix + "ssm_conv1d.weight");
+      l.ssm_dt = ExtractTensorRef(reader, prefix + "ssm_dt.bias");
+      l.ssm_alpha = ExtractTensorRef(reader, prefix + "ssm_alpha.weight");
+      l.ssm_beta = ExtractTensorRef(reader, prefix + "ssm_beta.weight");
+      l.ssm_norm = ExtractTensorRef(reader, prefix + "ssm_norm.weight");
+      l.ssm_out = ExtractTensorRef(reader, prefix + "ssm_out.weight");
+    }
+
+    l.ffn_gate = ExtractTensorRef(reader, prefix + "ffn_gate.weight");
+    l.ffn_up = ExtractTensorRef(reader, prefix + "ffn_up.weight");
+    l.ffn_down = ExtractTensorRef(reader, prefix + "ffn_down.weight");
   }
 
   return weights;
@@ -61,7 +86,7 @@ QwenKvCache::QwenKvCache(std::uint32_t num_layers, std::uint32_t num_kv_heads,
                          std::uint32_t max_context, std::uint32_t head_dim)
     : num_layers_(num_layers),
       num_kv_heads_(num_kv_heads),
-      max_context_(max_context),
+      max_context_(std::min(max_context, 8192U)),
       head_dim_(head_dim) {
   const std::size_t total_elements = static_cast<std::size_t>(num_layers_) *
                                      num_kv_heads_ * max_context_ * head_dim_;
@@ -120,7 +145,7 @@ QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   const std::size_t kv_size =
       static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
   const std::size_t max_context =
-      config.context_length > 0 ? config.context_length : 32768;
+      std::min(config.context_length > 0 ? config.context_length : 4096, 8192U);
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
 

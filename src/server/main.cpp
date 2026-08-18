@@ -63,8 +63,7 @@ int run(std::span<const char* const> args) {
   }
 
   if (first_arg == "chat") {
-    std::cout << "strix-server chat: interactive conversation session\n";
-    return 0;
+    return RunChat(options.subspan(1));
   }
 
   if (first_arg == "serve") {
