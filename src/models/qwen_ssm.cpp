@@ -114,7 +114,7 @@ void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
     float dot = 0.0F;
     if (!layer.ssm_conv1d.empty()) {
       for (std::size_t k = 0; k < 4; ++k) {
-        dot += conv_state[c_off + k] * layer.ssm_conv1d.Get(c * 4 + k);
+        dot += conv_state[c_off + k] * layer.ssm_conv1d.Get((c * 4) + k);
       }
     } else {
       dot = ssm_qkv_scratch[c];
@@ -125,18 +125,21 @@ void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
 
   // 3. Partition Q, K, V from conv_out
   const float* q_ptr = conv_out.data();
-  const float* k_ptr = conv_out.data() + (num_k_heads * key_dim);
-  const float* v_ptr = conv_out.data() + (num_k_heads * key_dim * 2);
+  const float* k_ptr =
+      conv_out.data() + (static_cast<std::size_t>(num_k_heads) * key_dim);
+  const float* v_ptr =
+      conv_out.data() + (static_cast<std::size_t>(num_k_heads) * key_dim * 2);
 
   // 4. Per-Head Gated DeltaNet Matrix Recurrence (32 heads, 128x128 state each)
 #pragma omp parallel for schedule(static)
   for (std::uint32_t h = 0; h < num_v_heads; ++h) {
     auto s_matrix = ssm_cache.GetDeltaNetState(layer_idx, h);
-    const std::uint32_t kh_idx = h / 2;
-    const float* q_h = q_ptr + (kh_idx * key_dim);
-    const float* k_h = k_ptr + (kh_idx * key_dim);
-    const float* v_h = v_ptr + (h * val_dim);
-    float* o_h = ssm_out_scratch.data() + (h * val_dim);
+    const std::uint32_t kh_idx = h % num_k_heads;
+    const float* q_h = q_ptr + (static_cast<std::size_t>(kh_idx) * key_dim);
+    const float* k_h = k_ptr + (static_cast<std::size_t>(kh_idx) * key_dim);
+    const float* v_h = v_ptr + (static_cast<std::size_t>(h) * val_dim);
+    float* o_h =
+        ssm_out_scratch.data() + (static_cast<std::size_t>(h) * val_dim);
 
     // Compute decay alpha_h = exp(ssm_a * softplus(alpha + ssm_dt)) and beta_h
     // = sigmoid(beta)

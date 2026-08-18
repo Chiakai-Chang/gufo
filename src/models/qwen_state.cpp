@@ -46,28 +46,69 @@ std::optional<QwenModelWeights> QwenModelWeights::LoadFromGguf(
     auto& l = weights.layers[i];
 
     l.attn_norm = ExtractTensorRef(reader, prefix + "attn_norm.weight");
+    if (l.attn_norm.empty()) {
+      l.attn_norm = ExtractTensorRef(reader, prefix + "input_norm.weight");
+    }
+
     l.ffn_norm = ExtractTensorRef(reader, prefix + "ffn_norm.weight");
     if (l.ffn_norm.empty()) {
       l.ffn_norm =
           ExtractTensorRef(reader, prefix + "post_attention_norm.weight");
     }
+    if (l.ffn_norm.empty()) {
+      l.ffn_norm = ExtractTensorRef(reader, prefix + "attn_post_norm.weight");
+    }
 
     // Check if full attention layer
     l.attn_q = ExtractTensorRef(reader, prefix + "attn_q.weight");
+    if (l.attn_q.empty()) {
+      l.attn_q = ExtractTensorRef(reader, prefix + "wq.weight");
+    }
+
     if (!l.attn_q.empty()) {
       l.is_full_attention = true;
       l.attn_k = ExtractTensorRef(reader, prefix + "attn_k.weight");
+      if (l.attn_k.empty()) {
+        l.attn_k = ExtractTensorRef(reader, prefix + "wk.weight");
+      }
       l.attn_v = ExtractTensorRef(reader, prefix + "attn_v.weight");
+      if (l.attn_v.empty()) {
+        l.attn_v = ExtractTensorRef(reader, prefix + "wv.weight");
+      }
       l.attn_output = ExtractTensorRef(reader, prefix + "attn_output.weight");
+      if (l.attn_output.empty()) {
+        l.attn_output = ExtractTensorRef(reader, prefix + "attn_out.weight");
+      }
+      if (l.attn_output.empty()) {
+        l.attn_output = ExtractTensorRef(reader, prefix + "wo.weight");
+      }
       l.attn_q_norm = ExtractTensorRef(reader, prefix + "attn_q_norm.weight");
       l.attn_k_norm = ExtractTensorRef(reader, prefix + "attn_k_norm.weight");
     } else {
       l.is_full_attention = false;
       l.attn_qkv = ExtractTensorRef(reader, prefix + "attn_qkv.weight");
+      if (l.attn_qkv.empty()) {
+        l.attn_qkv = ExtractTensorRef(reader, prefix + "wqkv.weight");
+      }
       l.attn_gate = ExtractTensorRef(reader, prefix + "attn_gate.weight");
+      if (l.attn_gate.empty()) {
+        l.attn_gate = ExtractTensorRef(reader, prefix + "wqkv_gate.weight");
+      }
       l.ssm_a = ExtractTensorRef(reader, prefix + "ssm_a");
+      if (l.ssm_a.empty()) {
+        l.ssm_a = ExtractTensorRef(reader, prefix + "ssm_a.weight");
+      }
       l.ssm_conv1d = ExtractTensorRef(reader, prefix + "ssm_conv1d.weight");
+      if (l.ssm_conv1d.empty()) {
+        l.ssm_conv1d = ExtractTensorRef(reader, prefix + "ssm_conv1d");
+      }
       l.ssm_dt = ExtractTensorRef(reader, prefix + "ssm_dt.bias");
+      if (l.ssm_dt.empty()) {
+        l.ssm_dt = ExtractTensorRef(reader, prefix + "ssm_dt.weight");
+      }
+      if (l.ssm_dt.empty()) {
+        l.ssm_dt = ExtractTensorRef(reader, prefix + "ssm_dt");
+      }
       l.ssm_alpha = ExtractTensorRef(reader, prefix + "ssm_alpha.weight");
       l.ssm_beta = ExtractTensorRef(reader, prefix + "ssm_beta.weight");
       l.ssm_norm = ExtractTensorRef(reader, prefix + "ssm_norm.weight");

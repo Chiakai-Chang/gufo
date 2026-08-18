@@ -239,19 +239,16 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
   }
 
   std::unordered_map<std::string, TokenId> special_tokens;
-  // Standard Qwen special tokens
-  const std::array<std::pair<std::string_view, TokenId>, 6> default_specials = {
-      std::make_pair("<|endoftext|>", kDefaultQwenEndoftextId),
-      std::make_pair("<|im_start|>", 151644U),
-      std::make_pair("<|im_end|>", kDefaultQwenEosTokenId),
-      std::make_pair("<|object_ref_start|>", 151646U),
-      std::make_pair("<think>", 151667U),
-      std::make_pair("</think>", 151668U),
-  };
-
-  for (const auto& [name, id] : default_specials) {
-    if (id < tokens.size()) {
-      special_tokens[std::string(name)] = id;
+  // Dynamic lookup of special tokens from GGUF vocabulary table
+  for (std::size_t i = 0; i < tokens.size(); ++i) {
+    const auto& t = tokens[i];
+    if (t == "<|endoftext|>" || t == "<|im_start|>" || t == "<|im_end|>" ||
+        t == "<think>" || t == "</think>" || t == "<|object_ref_start|>" ||
+        t == "<|object_ref_end|>" || t == "<|vision_start|>" ||
+        t == "<|vision_end|>" || t == "<|image_pad|>" || t == "<|video_pad|>" ||
+        t == "<|quad_start|>" || t == "<|quad_end|>" ||
+        (t.size() >= 4 && t.starts_with("<|") && t.ends_with("|>"))) {
+      special_tokens[t] = static_cast<TokenId>(i);
     }
   }
 
@@ -263,12 +260,26 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
 
   if (auto eos = reader.GetMetadataUint32("tokenizer.ggml.eos_token_id")) {
     tokenizer->eos_token_id_ = *eos;
+  } else if (auto it = special_tokens.find("<|im_end|>");
+             it != special_tokens.end()) {
+    tokenizer->eos_token_id_ = it->second;
+  } else if (auto it = special_tokens.find("<|endoftext|>");
+             it != special_tokens.end()) {
+    tokenizer->eos_token_id_ = it->second;
   }
+
   if (auto bos = reader.GetMetadataUint32("tokenizer.ggml.bos_token_id")) {
     tokenizer->bos_token_id_ = *bos;
+  } else if (auto it = special_tokens.find("<|im_start|>");
+             it != special_tokens.end()) {
+    tokenizer->bos_token_id_ = it->second;
   }
+
   if (auto pad = reader.GetMetadataUint32("tokenizer.ggml.padding_token_id")) {
     tokenizer->pad_token_id_ = *pad;
+  } else if (auto it = special_tokens.find("<|endoftext|>");
+             it != special_tokens.end()) {
+    tokenizer->pad_token_id_ = it->second;
   }
 
   return tokenizer;

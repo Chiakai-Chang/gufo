@@ -7,9 +7,9 @@ RegradeSummary RegradeTrace(const EvalTraceReport& report) noexcept {
   summary.total_cases = report.cases.size();
 
   for (const auto& c : report.cases) {
-    if (!c.expected_answer.empty() && c.extracted_answer == c.expected_answer) {
-      ++summary.passed_cases;
-    } else if (c.passed) {
+    if ((!c.expected_answer.empty() &&
+         c.extracted_answer == c.expected_answer) ||
+        c.passed) {
       ++summary.passed_cases;
     } else {
       ++summary.failed_cases;

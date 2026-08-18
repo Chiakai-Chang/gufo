@@ -23,9 +23,23 @@ void TestDeterministicArgmaxTies() {
   assert(tok == 1);
 }
 
+void TestDeltaNetHeadMapping() {
+  // Qwen 3.5 architecture: 32 value heads, 16 key/query heads
+  constexpr std::uint32_t num_v_heads = 32;
+  constexpr std::uint32_t num_k_heads = 16;
+
+  for (std::uint32_t h = 0; h < num_v_heads; ++h) {
+    const std::uint32_t kh_idx = h % num_k_heads;
+    // Ensure that head 0..15 map to 0..15, and 16..31 repeat 0..15
+    assert(kh_idx < num_k_heads);
+    assert(kh_idx == (h >= 16 ? h - 16 : h));
+  }
+}
+
 int main() {
   TestDeterministicArgmax();
   TestDeterministicArgmaxTies();
+  TestDeltaNetHeadMapping();
   std::cout << "All exact token determinism tests passed.\n";
   return 0;
 }

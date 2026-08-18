@@ -232,8 +232,12 @@ int RunPrompt(std::span<const char* const> args) {
                   << config.num_layers
                   << " layers, hidden=" << config.hidden_size
                   << ", heads=" << config.num_attention_heads << ")\n"
-                  << "Prompt tokens: " << prompt_tokens.size() << "\n"
-                  << "Max tokens: " << opt.max_tokens << "\n"
+                  << "Prompt tokens (" << prompt_tokens.size() << "): ";
+        for (const auto t : prompt_tokens) {
+          std::cout << "[" << t << ": '"
+                    << gpu_exec->GetTokenizer().DecodeToken(t) << "'] ";
+        }
+        std::cout << "\nMax tokens: " << opt.max_tokens << "\n"
                   << "--- Generation Output ---\n";
       }
 

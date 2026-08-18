@@ -44,6 +44,7 @@ public:
   float* d_ffn_act{nullptr};
   float* d_ffn_out{nullptr};
   float* d_ssm_qkv{nullptr};
+  float* d_conv_out{nullptr};
   float* d_ssm_gate{nullptr};
   float* d_ssm_out{nullptr};
   float* d_alpha_buf{nullptr};
@@ -52,14 +53,20 @@ public:
   float* d_kv_cache{nullptr};
   float* d_ssm_conv_state{nullptr};
   float* d_ssm_deltanet_state{nullptr};
+  std::uint32_t* d_prompt_tokens{nullptr};
 
   hipStream_t stream{nullptr};
+
+  [[nodiscard]] std::uint32_t GetMaxBatch() const noexcept {
+    return max_batch_;
+  }
 
 private:
   void FreeAll() noexcept;
 
   core::ModelConfig config_;
   std::uint32_t max_context_;
+  std::uint32_t max_batch_{512};
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
@@ -67,8 +74,9 @@ class QwenGpuExecutor {
 public:
   QwenGpuExecutor(models::QwenModelWeights weights,
                   std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+                  void* d_model_weights = nullptr,
                   std::uint32_t max_context = 4096);
-  ~QwenGpuExecutor() = default;
+  ~QwenGpuExecutor();
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> CreateFromGguf(
       const core::GgufReader& reader, std::string* error_msg = nullptr);
@@ -94,9 +102,15 @@ public:
       tokenization::TokenId token_id, std::uint32_t pos,
       bool compute_logits = true);
 
+  /// Runs batched prompt prefill on GPU, returning the first predicted token
+  /// ID.
+  [[nodiscard]] tokenization::TokenId ForwardPromptBatch(
+      std::span<const tokenization::TokenId> prompt_tokens);
+
 private:
   models::QwenModelWeights weights_;
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
+  void* d_model_weights_{nullptr};
   QwenGpuArena arena_;
   std::vector<float> h_logits_;
 };

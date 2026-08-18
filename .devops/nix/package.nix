@@ -66,7 +66,10 @@ stdenv.mkDerivation (finalAttrs: {
     mkdir -p $out/bin
     cp strix $out/bin/strix
     cp strix-server $out/bin/strix-server
-    chmod +x $out/bin/strix $out/bin/strix-server
+    if [ -f qwen_gpu_ops_test ]; then
+      cp qwen_gpu_ops_test $out/bin/qwen_gpu_ops_test
+    fi
+    chmod +x $out/bin/*
 
     runHook postInstall
   '';

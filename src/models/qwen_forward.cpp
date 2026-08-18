@@ -238,15 +238,17 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
                    arena.ssm_qkv);
         for (std::uint32_t h = 0; h < config.num_attention_heads; ++h) {
           const auto q_src = arena.ssm_qkv.subspan(
-              static_cast<std::size_t>(h) * 512, head_dim);
+              (static_cast<std::size_t>(h) * 512), head_dim);
           const auto g_src = arena.ssm_qkv.subspan(
-              static_cast<std::size_t>(h) * 512 + head_dim, head_dim);
+              (static_cast<std::size_t>(h) * 512) + head_dim, head_dim);
           std::ranges::copy(
               q_src,
-              arena.q.begin() + (static_cast<std::size_t>(h) * head_dim));
+              arena.q.begin() + static_cast<std::ptrdiff_t>(
+                                    static_cast<std::size_t>(h) * head_dim));
           std::ranges::copy(g_src,
                             arena.ssm_gate.begin() +
-                                (static_cast<std::size_t>(h) * head_dim));
+                                static_cast<std::ptrdiff_t>(
+                                    static_cast<std::size_t>(h) * head_dim));
         }
       } else {
         TensorGEMV(layer.attn_q, arena.normed, q_size, hidden_size, arena.q);

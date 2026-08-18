@@ -50,6 +50,25 @@ void LaunchSwiGLU(const float* gate, const float* up, float* out,
 void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
                 std::size_t M, std::size_t K, hipStream_t stream = nullptr);
 
+/// Computes Fused SSM Input Projections (QKV, Gate, Alpha, Beta) in a single
+/// kernel
+void LaunchFusedSSMInputProjections(const void* qkv_w, bool qkv_is_bf16,
+                                    const void* gate_w, bool gate_is_bf16,
+                                    const void* alpha_w, bool alpha_is_bf16,
+                                    const void* beta_w, bool beta_is_bf16,
+                                    const float* x, float* qkv_out,
+                                    float* gate_out, float* alpha_out,
+                                    float* beta_out, std::size_t hidden_size,
+                                    hipStream_t stream = nullptr);
+
+/// Computes Fused QKV Projections for Full Attention layers in a single kernel
+void LaunchFusedQKVProjections(const void* q_w, bool q_is_bf16, const void* k_w,
+                               bool k_is_bf16, const void* v_w, bool v_is_bf16,
+                               const float* x, float* q_out, float* k_out,
+                               float* v_out, std::size_t q_dim,
+                               std::size_t kv_dim, std::size_t hidden_size,
+                               hipStream_t stream = nullptr);
+
 /// Computes Fused SwiGLU GEMV: out = SiLU(W_gate * x) * (W_up * x)
 void LaunchFusedSwiGLUGEMV(const void* gate_w, bool gate_is_bf16,
                            const void* up_w, bool up_is_bf16, const float* x,
@@ -67,18 +86,107 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t head_dim, hipStream_t stream = nullptr);
 
 void LaunchSSMConvRecurrence(const float* qkv_in, const float* conv_weights,
-                             float* conv_state, float* deltanet_state,
-                             const float* alpha_buf, const float* beta_buf,
-                             const float* ssm_a, const float* ssm_dt,
-                             const float* ssm_norm, const float* gate,
-                             float* out_buf, std::uint32_t layer_idx,
-                             std::uint32_t num_heads, std::uint32_t key_dim,
-                             std::uint32_t val_dim,
+                             float* conv_state, float* conv_out,
+                             float* deltanet_state, const float* alpha_buf,
+                             const float* beta_buf, const float* ssm_a,
+                             const float* ssm_dt, const float* ssm_norm,
+                             const float* gate, float* out_buf,
+                             std::uint32_t layer_idx, std::uint32_t num_heads,
+                             std::uint32_t key_dim, std::uint32_t val_dim,
                              hipStream_t stream = nullptr);
 
 /// Computes parallel GPU argmax reduction over logits
 void LaunchGPUArgmax(const float* logits, std::uint32_t* out_token,
                      std::size_t vocab_size, hipStream_t stream = nullptr);
+
+// =========================================================================
+// Batched GPU Operators for High-Throughput Prompt Processing (Prefill)
+// =========================================================================
+
+/// Batched Embedding lookup for B tokens
+void LaunchBatchedEmbeddingLookup(const void* table, bool is_bf16,
+                                  const std::uint32_t* token_ids,
+                                  float* out_hidden, std::size_t batch_size,
+                                  std::size_t hidden_size,
+                                  hipStream_t stream = nullptr);
+
+/// Batched RMSNorm across B tokens
+void LaunchBatchedRMSNorm(const float* x, const float* weight, float* out,
+                          std::size_t batch_size, std::size_t dim,
+                          float eps = 1e-6F, hipStream_t stream = nullptr);
+
+/// Batched Per-Head RMSNorm across B tokens
+void LaunchBatchedPerHeadRMSNorm(const float* x, const float* weight,
+                                 float* out, std::size_t batch_size,
+                                 std::uint32_t num_heads,
+                                 std::uint32_t head_dim, float eps = 1e-6F,
+                                 hipStream_t stream = nullptr);
+
+/// Batched Residual Add across B tokens
+void LaunchBatchedResidualAdd(const float* a, const float* b, float* out,
+                              std::size_t batch_size, std::size_t dim,
+                              hipStream_t stream = nullptr);
+
+/// Batched Unpack Q and Gate across B tokens
+void LaunchBatchedUnpackQG(const float* qg_interleaved, float* q_out,
+                           float* gate_out, std::size_t batch_size,
+                           std::uint32_t num_heads, std::uint32_t head_dim,
+                           hipStream_t stream = nullptr);
+
+/// Batched RoPE across B tokens starting at pos
+void LaunchBatchedRoPE(float* q, float* k, std::size_t batch_size,
+                       std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                       std::uint32_t head_dim, std::uint32_t rotary_dim,
+                       std::uint32_t start_pos, float rope_theta,
+                       hipStream_t stream = nullptr);
+
+/// Batched GEMM: Y[B, M] = X[B, K] * A[M, K]^T
+void LaunchBatchedGEMM(const void* A, bool is_bf16, const float* X, float* Y,
+                       std::size_t batch_size, std::size_t M, std::size_t K,
+                       hipStream_t stream = nullptr);
+
+/// Batched Fused SSM Input Projections across B tokens
+void LaunchBatchedFusedSSMInputProjections(
+    const void* qkv_w, bool qkv_is_bf16, const void* gate_w, bool gate_is_bf16,
+    const void* alpha_w, bool alpha_is_bf16, const void* beta_w,
+    bool beta_is_bf16, const float* X, float* qkv_out, float* gate_out,
+    float* alpha_out, float* beta_out, std::size_t batch_size,
+    std::size_t hidden_size, hipStream_t stream = nullptr);
+
+/// Batched Fused QKV Projections across B tokens
+void LaunchBatchedFusedQKVProjections(
+    const void* q_w, bool q_is_bf16, const void* k_w, bool k_is_bf16,
+    const void* v_w, bool v_is_bf16, const float* X, float* q_out, float* k_out,
+    float* v_out, std::size_t batch_size, std::size_t q_dim, std::size_t kv_dim,
+    std::size_t hidden_size, hipStream_t stream = nullptr);
+
+/// Batched Fused SwiGLU GEMM: Out[B, intermediate] = SiLU(X[B, K] * W_gate^T) *
+/// (X[B, K] * W_up^T)
+void LaunchBatchedFusedSwiGLUGEMM(const void* gate_w, bool gate_is_bf16,
+                                  const void* up_w, bool up_is_bf16,
+                                  const float* X, float* out,
+                                  std::size_t batch_size,
+                                  std::size_t intermediate_size,
+                                  std::size_t hidden_size,
+                                  hipStream_t stream = nullptr);
+
+/// Batched Causal Attention for B tokens with KV Cache
+void LaunchBatchedAttention(const float* q, const float* k, const float* v,
+                            const float* gate, float* k_cache, float* v_cache,
+                            float* out_context, std::uint32_t layer_idx,
+                            std::uint32_t start_pos, std::size_t batch_size,
+                            std::uint32_t max_context, std::uint32_t num_heads,
+                            std::uint32_t num_kv_heads, std::uint32_t head_dim,
+                            hipStream_t stream = nullptr);
+
+/// Batched Causal SSM Conv1D + DeltaNet Recurrence for B tokens
+void LaunchBatchedSSMConvRecurrence(
+    const float* qkv_in, const float* conv_weights, float* conv_state,
+    float* conv_out, float* deltanet_state, const float* alpha_buf,
+    const float* beta_buf, const float* ssm_a, const float* ssm_dt,
+    const float* ssm_norm, const float* gate, float* out_buf,
+    std::uint32_t layer_idx, std::size_t batch_size, std::uint32_t num_heads,
+    std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream = nullptr);
 
 }  // namespace strix::hip
 
