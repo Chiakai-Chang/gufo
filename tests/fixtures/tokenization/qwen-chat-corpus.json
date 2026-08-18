@@ -1,0 +1,140 @@
+{
+  "version": 1,
+  "family": "qwen35",
+  "models": [
+    "qwen3.5-4b",
+    "qwen3.8-27b"
+  ],
+  "cases": [
+    {
+      "id": "single_turn_user",
+      "description": "Single user query with generation prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello, Strix Halo!"
+        }
+      ],
+      "options": {
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected_rendered": "<|im_start|>user\nHello, Strix Halo!<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "system_and_user",
+      "description": "System prompt followed by user request",
+      "messages": [
+        {
+          "role": "system",
+          "content": "You are a concise assistant."
+        },
+        {
+          "role": "user",
+          "content": "What is 2+2?"
+        }
+      ],
+      "options": {
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected_rendered": "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "multi_turn_conversation",
+      "description": "Multi-turn user and assistant dialogue",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hi."
+        },
+        {
+          "role": "assistant",
+          "content": "Hello! How can I help?"
+        },
+        {
+          "role": "user",
+          "content": "Tell me about RDNA3.5."
+        }
+      ],
+      "options": {
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected_rendered": "<|im_start|>user\nHi.<|im_end|>\n<|im_start|>assistant\nHello! How can I help?<|im_end|>\n<|im_start|>user\nTell me about RDNA3.5.<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "thinking_enabled",
+      "description": "Assistant thinking reasoning blocks and thinking generation prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Solve this equation."
+        },
+        {
+          "role": "assistant",
+          "thought": "First let's factor the polynomial.",
+          "content": "The roots are 2 and 3."
+        },
+        {
+          "role": "user",
+          "content": "Explain step 1."
+        }
+      ],
+      "options": {
+        "add_generation_prompt": true,
+        "enable_thinking": true
+      },
+      "expected_rendered": "<|im_start|>user\nSolve this equation.<|im_end|>\n<|im_start|>assistant\n<think>\nFirst let's factor the polynomial.\n</think>\nThe roots are 2 and 3.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    },
+    {
+      "id": "tool_message",
+      "description": "Tool execution result message",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Fetch weather."
+        },
+        {
+          "role": "tool",
+          "content": "{\"temp\": 22, \"city\": \"Rome\"}"
+        }
+      ],
+      "options": {
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected_rendered": "<|im_start|>user\nFetch weather.<|im_end|>\n<|im_start|>tool\n{\"temp\": 22, \"city\": \"Rome\"}<|im_end|>\n<|im_start|>assistant\n"
+    },
+    {
+      "id": "no_generation_prompt",
+      "description": "Render conversation without trailing assistant prompt",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Final message."
+        }
+      ],
+      "options": {
+        "add_generation_prompt": false,
+        "enable_thinking": false
+      },
+      "expected_rendered": "<|im_start|>user\nFinal message.<|im_end|>\n"
+    },
+    {
+      "id": "unicode_cjk",
+      "description": "Multilingual CJK and Emoji text rendering",
+      "messages": [
+        {
+          "role": "user",
+          "content": "你好，世界！🚀"
+        }
+      ],
+      "options": {
+        "add_generation_prompt": true,
+        "enable_thinking": false
+      },
+      "expected_rendered": "<|im_start|>user\n你好，世界！🚀<|im_end|>\n<|im_start|>assistant\n"
+    }
+  ]
+}

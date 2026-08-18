@@ -113,6 +113,7 @@ add_library(strix_core STATIC
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
   src/tokenization/qwen_tokenizer.cpp
+  src/tokenization/qwen_chat_template.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -155,6 +156,12 @@ if (BUILD_TESTING)
 
   add_test(NAME qwen_tokenizer_test COMMAND qwen_tokenizer_test)
   set_tests_properties(qwen_tokenizer_test PROPERTIES LABELS "cpu;tokenization;qwen")
+
+  add_executable(qwen_chat_template_test tests/tokenization/qwen_chat_template_test.cpp)
+  target_link_libraries(qwen_chat_template_test PRIVATE strix_core)
+
+  add_test(NAME qwen_chat_template_test COMMAND qwen_chat_template_test)
+  set_tests_properties(qwen_chat_template_test PROPERTIES LABELS "cpu;tokenization;chat_template")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)
