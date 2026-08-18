@@ -10,4 +10,5 @@ lib.makeScope newScope (self: {
   xrt-plugin-amdxdna = self.callPackage ./xrt-plugin-amdxdna.nix {
     inherit (self) xrt;
   };
+  hrx-system = self.callPackage ./hrx-system.nix { };
 })
