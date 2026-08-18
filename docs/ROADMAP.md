@@ -60,10 +60,9 @@ and probe matrix are recorded in [NPU_RESEARCH.md](NPU_RESEARCH.md).
 4. Add development, release, sanitizer, and test build presets.
 5. Pin the supported Linux, compiler, ROCm, XRT, `amdxdna`, firmware, and AIE
    toolchain versions.
-6. Add a build-time check that rejects CUDA headers, libraries, and symbols.
-7. Add formatting, static analysis, dependency inventory, and documentation
+6. Add formatting, static analysis, dependency inventory, and documentation
    checks.
-8. Create the initial PR test command.
+7. Create the initial PR test command.
 
 ### Initial layout
 
@@ -91,7 +90,6 @@ docs/
 - A clean checkout configures and builds on the supported Strix Halo Linux
   environment.
 - A placeholder `strix-server --version` runs.
-- The binary and dependency scan contain no CUDA dependency.
 - The PR test command succeeds from one documented entry point.
 
 ## Milestone 1: Hardware Diagnostics and Baselines

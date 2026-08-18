@@ -107,41 +107,98 @@ set(CMAKE_CXX_FLAGS_MSAN
 # .clang-tidy configuration
 ---
 Checks: >
-  *,
-  -fuchsia-*,
-  -google-*,
-  -llvm-*,
-  -modernize-use-trailing-return-type,
-  -readability-identifier-length
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  misc-*,
+  performance-*
 
 WarningsAsErrors: '*'
-
-CheckOptions:
-  - key: readability-identifier-naming.ClassCase
-    value: CamelCase
-  - key: readability-identifier-naming.FunctionCase
-    value: lower_case
-  - key: readability-identifier-naming.VariableCase
-    value: lower_case
-  - key: readability-identifier-naming.ConstantCase
-    value: UPPER_CASE
-  - key: readability-identifier-naming.MemberCase
-    value: lower_case
-  - key: readability-identifier-naming.MemberSuffix
-    value: '_'
-  - key: modernize-use-nullptr.NullMacros
-    value: 'NULL'
 ```
 
 ```bash
-# Run clang-tidy
-clang-tidy src/*.cpp -p build/
+# Analyze production translation units from the compilation database.
+# Deduplicate entries first when multiple targets compile the same source.
+run-clang-tidy -p build -j 8 'src/.*\.cpp'
 
 # Run cppcheck
 cppcheck --enable=all --std=c++20 --suppress=missingInclude src/
 
 # Run include-what-you-use
 include-what-you-use -std=c++20 src/main.cpp
+```
+
+Prefer checks that identify correctness, security, undefined behavior, and
+performance defects. Broad `readability-*` and `modernize-*` families often
+create review churn and slow blocking gates; keep them opt-in or non-blocking
+unless the project has adopted those rules explicitly.
+
+Static analysis should consume the generated compilation database, analyze
+each production translation unit once, and use bounded parallelism. Do not
+scan headers independently or analyze test targets when the same headers and
+sources are already covered through production translation units.
+
+## Fast, High-Signal PR Gates
+
+Measure each gate before removing checks. Optimize the critical path and cache
+invalidation first:
+
+- Provide one canonical PR command. CI should invoke it rather than repeat its
+  format, test, package, or smoke-test steps.
+- Model independent checks as separate cacheable build derivations. Make the
+  umbrella PR gate depend on their outputs so the build system can run them in
+  parallel and reuse unchanged results.
+- Give each derivation the smallest source closure it needs. Documentation,
+  benchmarks, tests, and agent instructions should not invalidate a production
+  package build.
+- Build production with `BUILD_TESTING=OFF`. Use a dedicated test derivation
+  with `BUILD_TESTING=ON` to compile and execute tests.
+- Keep runtime smoke tests with the installed package. This validates packaging
+  and dynamic linkage without rerunning the same command in CI.
+- Avoid registering format or static-analysis commands in CTest when they
+  already have dedicated gates.
+- Parallelize expensive per-translation-unit tools with a conservative worker
+  cap to avoid memory pressure and contention with concurrent builds.
+
+Example Nix source filtering:
+
+```nix
+productionSource = lib.cleanSourceWith {
+  src = ./.;
+  filter = path: _type:
+    let
+      root = toString ./.;
+      relative = lib.removePrefix "${root}/" (toString path);
+    in
+    toString path == root
+    || relative == "CMakeLists.txt"
+    || relative == "cmake"
+    || lib.hasPrefix "cmake/" relative
+    || relative == "src"
+    || lib.hasPrefix "src/" relative;
+};
+```
+
+For a Nix-based CMake project, keep production and test configurations
+separate:
+
+```nix
+cmakeFlags = [
+  "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+  "-DBUILD_TESTING=OFF"
+];
+
+testCheck = pkgs.runCommand "check-tests" {
+  src = testSource;
+  nativeBuildInputs = [ pkgs.cmake pkgs.ninja pkgs.stdenv.cc ];
+} ''
+  cmake -S "$src" -B build -GNinja -DBUILD_TESTING=ON
+  cmake --build build
+  ctest --test-dir build --output-on-failure
+  touch "$out"
+'';
 ```
 
 ## Testing with Catch2

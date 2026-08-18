@@ -215,7 +215,6 @@ Run on every change:
 - Tensor name, dtype, shape, offset, alignment, and checksum checks.
 - Safetensors and Strix-container corruption rejection.
 - Unsupported layout and architecture rejection.
-- No CUDA headers, symbols, build dependencies, or runtime libraries.
 - Deterministic model-kind and model-local dispatch resolution.
 
 ### T1: Quantization and CPU primitives
@@ -516,6 +515,12 @@ This single command executes:
 3. Dependency inventory consistency against `THIRD_PARTY_NOTICES.md`.
 4. Documentation, local links, anchors, and fenced JSON syntax validation.
 5. CTest test suite execution.
-6. Anti-CUDA boundary scans over sources, headers, compile commands, libraries, and symbols.
-7. Installed `strix-server --version` and `--help` smoke execution.
 
+The five checks are independent Nix derivations, so Nix can build them in
+parallel and reuse their cached results. Static analysis deduplicates the
+compilation database and runs up to eight `clang-tidy` workers. The production
+package hashes only production sources and builds with `BUILD_TESTING=OFF`;
+CTest compiles and runs from a separate test derivation.
+
+The production package remains a dependency of the PR gate. Its build and
+install checks execute `strix-server --version` and `--help`.

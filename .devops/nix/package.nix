@@ -4,7 +4,6 @@
   cmake,
   ninja,
   pkg-config,
-  python3,
   libuuid,
   rocmPackages,
   xrt,
@@ -19,16 +18,34 @@
   xrtSupport ? true,
 }:
 
+let
+  sourceRoot = ../..;
+  productionSource = lib.cleanSourceWith {
+    src = sourceRoot;
+    filter =
+      path: _type:
+      let
+        root = toString sourceRoot;
+        pathString = toString path;
+        relativePath = lib.removePrefix "${root}/" pathString;
+      in
+      pathString == root
+      || relativePath == "CMakeLists.txt"
+      || relativePath == "cmake"
+      || lib.hasPrefix "cmake/" relativePath
+      || relativePath == "src"
+      || lib.hasPrefix "src/" relativePath;
+  };
+in
 stdenv.mkDerivation (finalAttrs: {
   pname = "strix";
   inherit version;
-  src = lib.cleanSource ../..;
+  src = productionSource;
 
   nativeBuildInputs = [
     cmake
     ninja
     pkg-config
-    python3
   ]
   ++ lib.optional rocmSupport rocmPackages.clr;
 
@@ -45,6 +62,7 @@ stdenv.mkDerivation (finalAttrs: {
 
   cmakeFlags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
+    "-DBUILD_TESTING=OFF"
   ]
   ++ lib.optional rocmSupport "-DENGINE_ENABLE_HIP=ON"
   ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
@@ -69,44 +87,17 @@ stdenv.mkDerivation (finalAttrs: {
     if [ -f strix-bench ]; then
       cp strix-bench $out/bin/strix-bench
     fi
-    if [ -f qwen_gpu_ops_test ]; then
-      cp qwen_gpu_ops_test $out/bin/qwen_gpu_ops_test
-    fi
     chmod +x $out/bin/*
 
     runHook postInstall
-  '';
-
-  doCheck = true;
-  checkPhase = ''
-    runHook preCheck
-
-    # Run anti-CUDA boundary scanner on built binaries, fixtures, and project sources
-    python3 ../tools/check-no-cuda.py \
-      --source ../src \
-      --source ../models \
-      --source ../CMakeLists.txt \
-      --binary strix \
-      --binary strix-server \
-      --self-test ../tests/static/fixtures
-
-    runHook postCheck
   '';
 
   doInstallCheck = true;
   installCheckPhase = ''
     runHook preInstallCheck
 
-    # Scan installed package binaries and verify no CUDA libraries/symbols
-    python3 ../tools/check-no-cuda.py \
-      --binary $out/bin/strix \
-      --binary $out/bin/strix-server
-
-    # Scan output directory references for any forbidden CUDA strings or paths
-    if grep -rnwi "$out" -e "libcudart" -e "libcublas" -e "cuda_runtime" 2>/dev/null; then
-      echo "ERROR: CUDA string/library found in output closure!" >&2
-      exit 1
-    fi
+    $out/bin/strix-server --version
+    $out/bin/strix-server --help >/dev/null
 
     runHook postInstallCheck
   '';

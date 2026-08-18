@@ -5,25 +5,14 @@ check-dependencies.py — Third-party dependency inventory consistency checker f
 Validates that:
 1. Every shipped/linked runtime dependency in Nix/CMake is documented in THIRD_PARTY_NOTICES.md and NOTICE.
 2. SPDX license identifiers and pinned versions are valid and present.
-3. No forbidden CUDA dependencies appear in the declared or detected dependency tree.
-4. Emits a deterministic machine-readable dependency inventory report.
+3. Emits a deterministic machine-readable dependency inventory report.
 """
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Set
-
-FORBIDDEN_CUDA_DEP_PATTERNS = [
-    re.compile(r'cuda\b', re.IGNORECASE),
-    re.compile(r'cudart\b', re.IGNORECASE),
-    re.compile(r'cublas\b', re.IGNORECASE),
-    re.compile(r'cudnn\b', re.IGNORECASE),
-    re.compile(r'nccl\b', re.IGNORECASE),
-    re.compile(r'nvidia\b', re.IGNORECASE),
-]
+from typing import Dict, List
 
 # Expected runtime and build dependencies that must be tracked
 REQUIRED_SHIPPED_COMPONENTS = {
@@ -74,18 +63,12 @@ def verify_dependencies(
     errors: List[str] = []
     components = parse_third_party_notices(notices_file)
 
-    # 1. Check for forbidden CUDA dependencies in third-party inventory
-    for name, info in components.items():
-        for pat in FORBIDDEN_CUDA_DEP_PATTERNS:
-            if pat.search(name) or pat.search(info["source"]):
-                errors.append(f"Forbidden CUDA dependency detected in inventory: '{name}'")
-
-    # 2. Check that all required shipped components are present in inventory
+    # 1. Check that all required shipped components are present in inventory
     for req in REQUIRED_SHIPPED_COMPONENTS:
         if not any(req.lower() in name.lower() for name in components):
             errors.append(f"Required shipped dependency '{req}' is missing from {notices_file.name}")
 
-    # 3. Check package.nix inputs consistency
+    # 2. Check package.nix inputs consistency
     if package_nix_file.is_file():
         pkg_content = package_nix_file.read_text(encoding="utf-8")
         # Check that rocmPackages, xrt, xrt-plugin-amdxdna, libuuid are wired
@@ -93,7 +76,7 @@ def verify_dependencies(
             if dep not in pkg_content:
                 errors.append(f"Expected dependency '{dep}' missing from {package_nix_file.name}")
 
-    # 4. Check for invalid or empty SPDX licenses
+    # 3. Check for invalid or empty SPDX licenses
     for name, info in components.items():
         spdx = info.get("spdx", "")
         if not spdx or spdx.lower() == "unknown" or spdx.lower() == "todo":

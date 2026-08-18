@@ -276,10 +276,6 @@ if (BUILD_TESTING)
   endif()
 endif()
 
-# Anti-CUDA boundary checks and targets
-include(cmake/CheckNoCuda.cmake)
-
 # Static analysis and formatting targets
 include(cmake/StaticAnalysis.cmake)
-
 

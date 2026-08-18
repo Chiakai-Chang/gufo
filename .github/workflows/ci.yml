@@ -20,12 +20,7 @@ jobs:
       - name: Enable Magic Nix Cache
         uses: DeterminateSystems/magic-nix-cache-action@v13
 
-      - name: Run Nix Flake Checks
-        run: nix flake check
-
       - name: Run Canonical PR Test Suite
         run: |
           nix build .#checks.x86_64-linux.pr --print-build-logs
-          ./result/bin/strix-server --version
-          ./result/bin/strix-server --help
           cat ./result/pr-summary.txt
