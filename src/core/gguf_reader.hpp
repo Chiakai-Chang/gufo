@@ -162,6 +162,8 @@ public:
   [[nodiscard]] std::uint64_t GetAlignment() const noexcept {
     return alignment_;
   }
+  [[nodiscard]] const void* GetData() const noexcept { return data_; }
+  [[nodiscard]] std::size_t GetSize() const noexcept { return size_; }
 
   /// Metadata lookup helpers
   [[nodiscard]] const GgufMetadataValue* FindMetadata(

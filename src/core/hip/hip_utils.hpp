@@ -1,0 +1,23 @@
+#ifndef STRIX_CORE_HIP_HIP_UTILS_HPP_
+#define STRIX_CORE_HIP_HIP_UTILS_HPP_
+
+#if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+#define HIP_CHECK(call)                                                      \
+  do {                                                                       \
+    hipError_t err = (call);                                                 \
+    if (err != hipSuccess) {                                                 \
+      std::string msg = std::string("HIP error in ") + __FILE__ + ":" +      \
+                        std::to_string(__LINE__) + " (" #call                \
+                        "): " + hipGetErrorString(err);                      \
+      std::cerr << msg << std::endl;                                         \
+    }                                                                        \
+  } while (0)
+
+#endif  // defined(ENGINE_ENABLE_HIP)
+
+#endif  // STRIX_CORE_HIP_HIP_UTILS_HPP_

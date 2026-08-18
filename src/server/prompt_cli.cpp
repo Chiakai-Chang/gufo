@@ -13,6 +13,11 @@
 #include "src/tokenization/qwen_chat_template.hpp"
 #include "src/tokenization/qwen_tokenizer.hpp"
 
+#if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_runtime.h>
+#include "src/core/hip/qwen_gpu_executor.hpp"
+#endif
+
 namespace strix::server {
 namespace {
 
@@ -190,12 +195,6 @@ int RunPrompt(std::span<const char* const> args) {
     return 1;
   }
 
-  auto generator = models::QwenGenerator::CreateFromGguf(*reader, &err);
-  if (!generator) {
-    std::cerr << "Error creating Qwen generator: " << err << "\n";
-    return 1;
-  }
-
   std::string rendered_prompt = opt.prompt_text;
   if (opt.use_chat_template) {
     std::vector<tokenization::ChatMessage> messages;
@@ -211,11 +210,69 @@ int RunPrompt(std::span<const char* const> args) {
     }
   }
 
+#if defined(ENGINE_ENABLE_HIP)
+  int dev_count = 0;
+  if (hipGetDeviceCount(&dev_count) == hipSuccess && dev_count > 0) {
+    auto gpu_exec = strix::hip::QwenGpuExecutor::CreateFromGguf(*reader, &err);
+    if (gpu_exec) {
+      const auto prompt_tokens =
+          gpu_exec->GetTokenizer().Encode(rendered_prompt);
+
+      if (opt.verbose) {
+        const auto& config = gpu_exec->GetConfig();
+        std::cout << "[Engine]: AMD Strix Halo gfx1151 GPU Executor\n"
+                  << "Model: " << config.architecture << " (" << config.num_layers
+                  << " layers, hidden=" << config.hidden_size
+                  << ", heads=" << config.num_attention_heads << ")\n"
+                  << "Prompt tokens: " << prompt_tokens.size() << "\n"
+                  << "Max tokens: " << opt.max_tokens << "\n"
+                  << "--- Generation Output ---\n";
+      }
+
+      models::GenerationOptions gen_opts;
+      gen_opts.max_new_tokens = opt.max_tokens;
+      gen_opts.temperature = opt.temperature;
+
+      const auto start_time = std::chrono::steady_clock::now();
+      std::size_t generated_count = 0;
+
+      gpu_exec->Generate(
+          prompt_tokens, gen_opts,
+          [&](tokenization::TokenId, std::string_view piece) -> bool {
+            std::cout << piece << std::flush;
+            ++generated_count;
+            return true;
+          });
+
+      std::cout << "\n";
+
+      if (opt.verbose && generated_count > 0) {
+        const auto elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start_time);
+        const double sec = static_cast<double>(elapsed.count()) / 1000.0;
+        const double tok_per_sec =
+            (sec > 0.0) ? (static_cast<double>(generated_count) / sec) : 0.0;
+        std::cout << "Generated " << generated_count << " tokens on GPU in "
+                  << sec << "s (" << tok_per_sec << " tok/s)\n";
+      }
+      return 0;
+    }
+  }
+#endif
+
+  auto generator = models::QwenGenerator::CreateFromGguf(*reader, &err);
+  if (!generator) {
+    std::cerr << "Error creating Qwen generator: " << err << "\n";
+    return 1;
+  }
+
   const auto prompt_tokens = generator->GetTokenizer().Encode(rendered_prompt);
 
   if (opt.verbose) {
     const auto& config = generator->GetConfig();
-    std::cout << "Model: " << config.architecture << " (" << config.num_layers
+    std::cout << "[Engine]: CPU (OpenMP Multi-Threaded)\n"
+              << "Model: " << config.architecture << " (" << config.num_layers
               << " layers, hidden=" << config.hidden_size
               << ", heads=" << config.num_attention_heads << ")\n"
               << "Prompt tokens: " << prompt_tokens.size() << "\n"
@@ -247,7 +304,7 @@ int RunPrompt(std::span<const char* const> args) {
     const double sec = static_cast<double>(elapsed.count()) / 1000.0;
     const double tok_per_sec =
         (sec > 0.0) ? (static_cast<double>(generated_count) / sec) : 0.0;
-    std::cout << "Generated " << generated_count << " tokens in " << sec
+    std::cout << "Generated " << generated_count << " tokens on CPU in " << sec
               << "s (" << tok_per_sec << " tok/s)\n";
   }
 

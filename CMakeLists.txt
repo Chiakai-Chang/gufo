@@ -127,6 +127,15 @@ if (OpenMP_CXX_FOUND)
   target_link_libraries(strix_core PUBLIC OpenMP::OpenMP_CXX)
 endif()
 
+if (ENGINE_ENABLE_HIP)
+  target_sources(strix_core PRIVATE
+    src/core/hip/qwen_gpu_ops.hip
+    src/core/hip/qwen_gpu_executor.cpp
+  )
+  target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
+  target_link_libraries(strix_core PUBLIC hip::host roc::hipblas roc::rocblas)
+endif()
+
 add_executable(strix-server
   src/server/main.cpp
   src/server/prompt_cli.cpp
@@ -214,6 +223,13 @@ if (BUILD_TESTING)
 
   add_test(NAME qwen_ssm_test COMMAND qwen_ssm_test)
   set_tests_properties(qwen_ssm_test PROPERTIES LABELS "cpu;models;ssm")
+
+  if (ENGINE_ENABLE_HIP)
+    add_executable(qwen_gpu_ops_test tests/kernels/qwen_gpu_ops_test.cpp)
+    target_link_libraries(qwen_gpu_ops_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
+    add_test(NAME qwen_gpu_ops_test COMMAND qwen_gpu_ops_test)
+    set_tests_properties(qwen_gpu_ops_test PROPERTIES LABELS "hip;gpu;kernels")
+  endif()
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)

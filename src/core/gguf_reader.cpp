@@ -127,7 +127,8 @@ std::unique_ptr<GgufReader> GgufReader::OpenFile(
   }
 
   const auto size = static_cast<std::size_t>(sb.st_size);
-  void* const addr = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  void* const addr =
+      mmap(nullptr, size, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd, 0);
   if (addr == MAP_FAILED) {
     close(fd);
     if (error_msg != nullptr) {
@@ -135,6 +136,7 @@ std::unique_ptr<GgufReader> GgufReader::OpenFile(
     }
     return nullptr;
   }
+  madvise(addr, size, MADV_WILLNEED);
 
   auto reader = std::unique_ptr<GgufReader>(new GgufReader());
   reader->mmap_addr_ = addr;
