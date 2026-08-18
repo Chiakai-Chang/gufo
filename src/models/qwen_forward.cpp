@@ -199,8 +199,8 @@ void ForwardFFN(std::span<const float> x, const QwenTensorRef& gate_weight,
 
 void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
                   const core::ModelConfig& config, QwenKvCache& kv_cache,
-                  std::uint32_t layer_idx, std::uint32_t pos,
-                  QwenScratchArena& arena) noexcept {
+                  QwenSsmCache& ssm_cache, std::uint32_t layer_idx,
+                  std::uint32_t pos, QwenScratchArena& arena) noexcept {
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t head_dim = config.head_dim;
   const std::size_t q_size =
@@ -223,6 +223,22 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
       TensorGEMV(layer.attn_v, arena.normed, kv_size, hidden_size, arena.v);
     }
 
+    // Apply QK-Norm
+    if (!layer.attn_q_norm.empty()) {
+      for (std::uint32_t h = 0; h < config.num_attention_heads; ++h) {
+        auto q_head =
+            arena.q.subspan(static_cast<std::size_t>(h) * head_dim, head_dim);
+        ForwardRMSNorm(q_head, layer.attn_q_norm, 1e-6F, q_head);
+      }
+    }
+    if (!layer.attn_k_norm.empty()) {
+      for (std::uint32_t h = 0; h < config.num_key_value_heads; ++h) {
+        auto k_head =
+            arena.k.subspan(static_cast<std::size_t>(h) * head_dim, head_dim);
+        ForwardRMSNorm(k_head, layer.attn_k_norm, 1e-6F, k_head);
+      }
+    }
+
     ForwardRoPE(arena.q, arena.k, config.num_attention_heads,
                 config.num_key_value_heads, config.head_dim, pos,
                 config.rope_theta);
@@ -232,12 +248,8 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
                      config.num_key_value_heads, config.head_dim,
                      arena.attn_scores, arena.attn_out);
   } else {
-    if (!layer.attn_qkv.empty() && !layer.ssm_out.empty()) {
-      TensorGEMV(layer.attn_qkv, arena.normed, q_size, hidden_size, arena.q);
-      TensorGEMV(layer.ssm_out, arena.q, hidden_size, q_size, arena.attn_out);
-    } else {
-      std::ranges::fill(arena.attn_out, 0.0F);
-    }
+    ForwardSSM(arena.normed, layer, ssm_cache, layer_idx, arena.ssm_qkv,
+               arena.ssm_gate, arena.ssm_out_buf, arena.attn_out);
   }
 
   // 3. Residual Add
@@ -261,14 +273,14 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
 
 void ForwardModel(std::uint32_t token_id, std::uint32_t pos,
                   const QwenModelWeights& weights, QwenKvCache& kv_cache,
-                  QwenScratchArena& arena,
+                  QwenSsmCache& ssm_cache, QwenScratchArena& arena,
                   std::span<float> logits_out) noexcept {
   ForwardEmbedding(token_id, weights.token_embd, weights.config.hidden_size,
                    arena.hidden);
 
   for (std::uint32_t l = 0; l < weights.config.num_layers; ++l) {
-    ForwardLayer(arena.hidden, weights.layers[l], weights.config, kv_cache, l,
-                 pos, arena);
+    ForwardLayer(arena.hidden, weights.layers[l], weights.config, kv_cache,
+                 ssm_cache, l, pos, arena);
   }
 
   ForwardRMSNorm(arena.hidden, weights.output_norm, 1e-6F, arena.normed);

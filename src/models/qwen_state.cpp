@@ -149,9 +149,12 @@ QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
 
-  const std::size_t total_size = (hidden_size * 3) + q_size + (kv_size * 2) +
-                                 max_context + (intermediate_size * 4) +
-                                 vocab_size;
+  const std::size_t ssm_qkv_size = 8192;
+  const std::size_t ssm_gate_size = 4096;
+
+  const std::size_t total_size =
+      (hidden_size * 3) + q_size + (kv_size * 2) + max_context +
+      (intermediate_size * 4) + ssm_qkv_size + (ssm_gate_size * 2) + vocab_size;
   buffer.resize(total_size, 0.0F);
 
   std::size_t cur = 0;
@@ -172,6 +175,9 @@ QwenScratchArena::QwenScratchArena(const core::ModelConfig& config) {
   mlp_up = alloc_span(intermediate_size);
   mlp_act = alloc_span(intermediate_size);
   mlp_out = alloc_span(hidden_size);
+  ssm_qkv = alloc_span(ssm_qkv_size);
+  ssm_gate = alloc_span(ssm_gate_size);
+  ssm_out_buf = alloc_span(ssm_gate_size);
   logits = alloc_span(vocab_size);
 }
 

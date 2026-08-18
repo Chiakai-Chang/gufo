@@ -147,6 +147,9 @@ struct QwenScratchArena {
   std::span<float> mlp_up;
   std::span<float> mlp_act;
   std::span<float> mlp_out;
+  std::span<float> ssm_qkv;
+  std::span<float> ssm_gate;
+  std::span<float> ssm_out_buf;
   std::span<float> logits;
 };
 

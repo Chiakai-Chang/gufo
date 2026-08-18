@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <span>
 
+#include "src/models/qwen_ssm.hpp"
 #include "src/models/qwen_state.hpp"
 
 namespace strix::models {
@@ -49,14 +50,14 @@ void ForwardFFN(std::span<const float> x, const QwenTensorRef& gate_weight,
 /// Computes one forward transformer layer block.
 void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
                   const core::ModelConfig& config, QwenKvCache& kv_cache,
-                  std::uint32_t layer_idx, std::uint32_t pos,
-                  QwenScratchArena& arena) noexcept;
+                  QwenSsmCache& ssm_cache, std::uint32_t layer_idx,
+                  std::uint32_t pos, QwenScratchArena& arena) noexcept;
 
 /// Computes a full model forward pass on a single token, producing output
 /// logits.
 void ForwardModel(std::uint32_t token_id, std::uint32_t pos,
                   const QwenModelWeights& weights, QwenKvCache& kv_cache,
-                  QwenScratchArena& arena,
+                  QwenSsmCache& ssm_cache, QwenScratchArena& arena,
                   std::span<float> logits_out) noexcept;
 
 /// Computes greedy argmax over logit distribution.

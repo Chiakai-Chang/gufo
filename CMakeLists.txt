@@ -116,6 +116,7 @@ add_library(strix_core STATIC
   src/tokenization/qwen_chat_template.cpp
   src/models/qwen_oracles.cpp
   src/models/qwen_state.cpp
+  src/models/qwen_ssm.cpp
   src/models/qwen_forward.cpp
   src/models/qwen_generator.cpp
 )
@@ -202,6 +203,12 @@ if (BUILD_TESTING)
 
   add_test(NAME qwen_generator_test COMMAND qwen_generator_test)
   set_tests_properties(qwen_generator_test PROPERTIES LABELS "cpu;models;generator")
+
+  add_executable(qwen_ssm_test tests/models/qwen_ssm_test.cpp)
+  target_link_libraries(qwen_ssm_test PRIVATE strix_core)
+
+  add_test(NAME qwen_ssm_test COMMAND qwen_ssm_test)
+  set_tests_properties(qwen_ssm_test PROPERTIES LABELS "cpu;models;ssm")
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
     add_test(NAME strix_npu_smoke COMMAND strix)

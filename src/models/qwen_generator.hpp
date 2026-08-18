@@ -61,6 +61,7 @@ private:
   QwenModelWeights weights_;
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   QwenKvCache kv_cache_;
+  QwenSsmCache ssm_cache_;
   QwenScratchArena arena_;
 };
 

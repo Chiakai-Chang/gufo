@@ -15,6 +15,7 @@ QwenGenerator::QwenGenerator(
       tokenizer_(std::move(tokenizer)),
       kv_cache_(weights_.config.num_layers, weights_.config.num_key_value_heads,
                 max_context, weights_.config.head_dim),
+      ssm_cache_(weights_.config.num_layers, 8192, 4096),
       arena_(weights_.config) {}
 
 std::unique_ptr<QwenGenerator> QwenGenerator::CreateFromGguf(
@@ -48,11 +49,12 @@ std::vector<tokenization::TokenId> QwenGenerator::Generate(
   }
 
   kv_cache_.Reset();
+  ssm_cache_.Reset();
 
   // 1. Prefill prompt tokens
   for (std::size_t p = 0; p < prompt_tokens.size(); ++p) {
     ForwardModel(prompt_tokens[p], static_cast<std::uint32_t>(p), weights_,
-                 kv_cache_, arena_, arena_.logits);
+                 kv_cache_, ssm_cache_, arena_, arena_.logits);
   }
 
   // 2. Decode first generated token
@@ -78,7 +80,7 @@ std::vector<tokenization::TokenId> QwenGenerator::Generate(
     }
 
     ForwardModel(next_token, static_cast<std::uint32_t>(cur_pos), weights_,
-                 kv_cache_, arena_, arena_.logits);
+                 kv_cache_, ssm_cache_, arena_, arena_.logits);
     next_token = GreedyArgmax(arena_.logits);
     ++cur_pos;
   }
