@@ -111,10 +111,11 @@ void LaunchBatchedEmbeddingLookup(const void* table, bool is_bf16,
                                   std::size_t hidden_size,
                                   hipStream_t stream = nullptr);
 
-/// Batched RMSNorm across B tokens
+/// Batched RMSNorm across B tokens (optional BF16 output in single pass)
 void LaunchBatchedRMSNorm(const float* x, const float* weight, float* out,
-                          std::size_t batch_size, std::size_t dim,
-                          float eps = 1e-6F, hipStream_t stream = nullptr);
+                          void* out_bf16, std::size_t batch_size,
+                          std::size_t dim, float eps = 1e-6F,
+                          hipStream_t stream = nullptr);
 
 /// Batched Per-Head RMSNorm across B tokens
 void LaunchBatchedPerHeadRMSNorm(const float* x, const float* weight,
@@ -157,9 +158,18 @@ void LaunchHipblasGEMM(hipblasHandle_t handle, const void* A, bool is_bf16,
                        std::size_t M, std::size_t K, void* d_x_bf16_buf,
                        hipStream_t stream = nullptr);
 
-/// Batched SwiGLU activation: out = (gate * sigmoid(gate)) * up
+/// Direct BF16 GEMM without input conversion: Y[B, M] = X_bf16[B, K] *
+/// A_bf16[M, K]^T
+void LaunchHipblasGEMMBF16(hipblasHandle_t handle, const void* A_bf16,
+                           const void* d_x_bf16, float* Y,
+                           std::size_t batch_size, std::size_t M, std::size_t K,
+                           hipStream_t stream = nullptr);
+
+/// Batched SwiGLU activation: out = (gate * sigmoid(gate)) * up (optional BF16
+/// output)
 void LaunchBatchedSwiGLUActivation(const float* gate, const float* up,
-                                   float* out, std::size_t num_elements,
+                                   float* out, void* out_bf16,
+                                   std::size_t num_elements,
                                    hipStream_t stream = nullptr);
 
 /// Batched Fused SSM Input Projections across B tokens

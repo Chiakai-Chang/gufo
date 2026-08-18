@@ -1073,16 +1073,20 @@ void LaunchBatchedEmbeddingLookup(const void* table, bool is_bf16,
 __global__ void BatchedRMSNormKernel(const float* __restrict__ x,
                                      const float* __restrict__ weight,
                                      float* __restrict__ out,
+                                     hip_bfloat16* __restrict__ out_bf16,
                                      std::size_t batch_size, std::size_t dim,
                                      float eps) {
   const std::size_t b = blockIdx.x;
-  if (b >= batch_size)
+  if (b >= batch_size) {
     return;
+  }
 
   const std::size_t tid = threadIdx.x;
   const std::size_t block_size = blockDim.x;
   const float* in_row = x + (b * dim);
-  float* out_row = out + (b * dim);
+  float* out_row = (out != nullptr) ? out + (b * dim) : nullptr;
+  hip_bfloat16* out_bf16_row =
+      (out_bf16 != nullptr) ? out_bf16 + (b * dim) : nullptr;
 
   float sum_sq = 0.0F;
   for (std::size_t i = tid; i < dim; i += block_size) {
@@ -1106,15 +1110,22 @@ __global__ void BatchedRMSNormKernel(const float* __restrict__ x,
 
   for (std::size_t i = tid; i < dim; i += block_size) {
     const float w = (weight != nullptr) ? weight[i] : 1.0F;
-    out_row[i] = (in_row[i] * inv_rms) * w;
+    const float normed = (in_row[i] * inv_rms) * w;
+    if (out_row != nullptr) {
+      out_row[i] = normed;
+    }
+    if (out_bf16_row != nullptr) {
+      out_bf16_row[i] = hip_bfloat16(normed);
+    }
   }
 }
 
 void LaunchBatchedRMSNorm(const float* x, const float* weight, float* out,
-                          std::size_t batch_size, std::size_t dim, float eps,
-                          hipStream_t stream) {
-  BatchedRMSNormKernel<<<batch_size, 256, 0, stream>>>(x, weight, out,
-                                                       batch_size, dim, eps);
+                          void* out_bf16, std::size_t batch_size,
+                          std::size_t dim, float eps, hipStream_t stream) {
+  BatchedRMSNormKernel<<<batch_size, 256, 0, stream>>>(
+      x, weight, out, static_cast<hip_bfloat16*>(out_bf16), batch_size, dim,
+      eps);
 }
 
 __global__ void BatchedPerHeadRMSNormKernel(const float* __restrict__ x,
@@ -1379,6 +1390,9 @@ __global__ void BatchedGEMMKernel(const void* __restrict__ A, bool is_bf16,
 void LaunchBatchedGEMM(const void* A, bool is_bf16, const float* X, float* Y,
                        std::size_t batch_size, std::size_t M, std::size_t K,
                        hipStream_t stream) {
+  if (batch_size == 0 || M == 0 || K == 0) {
+    return;
+  }
   const dim3 grid(static_cast<unsigned int>(M),
                   static_cast<unsigned int>(batch_size));
   BatchedGEMMKernel<<<grid, 128, 0, stream>>>(A, is_bf16, X, Y, batch_size, M,
@@ -1406,21 +1420,28 @@ void LaunchFloatToBfloat16(const float* in, void* out, std::size_t num_elements,
       in, static_cast<hip_bfloat16*>(out), num_elements);
 }
 
-__global__ void BatchedSwiGLUActivationKernel(const float* __restrict__ gate,
-                                              const float* __restrict__ up,
-                                              float* __restrict__ out,
-                                              std::size_t num_elements) {
+__global__ void BatchedSwiGLUActivationKernel(
+    const float* __restrict__ gate, const float* __restrict__ up,
+    float* __restrict__ out, hip_bfloat16* __restrict__ out_bf16,
+    std::size_t num_elements) {
   const std::size_t idx = (blockIdx.x * blockDim.x) + threadIdx.x;
   if (idx < num_elements) {
     const float g = gate[idx];
     const float u = up[idx];
     const float sig_g = 1.0F / (1.0F + expf(-g));
-    out[idx] = (g * sig_g) * u;
+    const float val = (g * sig_g) * u;
+    if (out != nullptr) {
+      out[idx] = val;
+    }
+    if (out_bf16 != nullptr) {
+      out_bf16[idx] = hip_bfloat16(val);
+    }
   }
 }
 
 void LaunchBatchedSwiGLUActivation(const float* gate, const float* up,
-                                   float* out, std::size_t num_elements,
+                                   float* out, void* out_bf16,
+                                   std::size_t num_elements,
                                    hipStream_t stream) {
   if (num_elements == 0) {
     return;
@@ -1429,7 +1450,7 @@ void LaunchBatchedSwiGLUActivation(const float* gate, const float* up,
   const unsigned int num_blocks =
       static_cast<unsigned int>((num_elements + block_size - 1) / block_size);
   BatchedSwiGLUActivationKernel<<<num_blocks, block_size, 0, stream>>>(
-      gate, up, out, num_elements);
+      gate, up, out, static_cast<hip_bfloat16*>(out_bf16), num_elements);
 }
 
 void LaunchHipblasGEMM(hipblasHandle_t handle, const void* A, bool is_bf16,
@@ -1440,33 +1461,52 @@ void LaunchHipblasGEMM(hipblasHandle_t handle, const void* A, bool is_bf16,
     return;
   }
 
-  HIPBLAS_CHECK(hipblasSetStream(handle, stream));
+  if (stream != nullptr) {
+    HIPBLAS_CHECK(hipblasSetStream(handle, stream));
+  }
 
   const float alpha = 1.0F;
   const float beta = 0.0F;
 
   if (is_bf16) {
     LaunchFloatToBfloat16(X, d_x_bf16_buf, batch_size * K, stream);
-    hipblasStatus_t stat = hipblasGemmEx(
+    HIPBLAS_CHECK(hipblasGemmEx(
         handle, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(M),
         static_cast<int>(batch_size), static_cast<int>(K), &alpha, A,
         HIP_R_16BF, static_cast<int>(K), d_x_bf16_buf, HIP_R_16BF,
         static_cast<int>(K), &beta, Y, HIP_R_32F, static_cast<int>(M),
-        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT);
-    if (stat != HIPBLAS_STATUS_SUCCESS) {
-      std::cerr << "hipblasGemmEx BF16 returned error code: " << stat << "\n";
-    }
+        HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
   } else {
-    hipblasStatus_t stat = hipblasGemmEx(
+    HIPBLAS_CHECK(hipblasGemmEx(
         handle, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(M),
         static_cast<int>(batch_size), static_cast<int>(K), &alpha, A, HIP_R_32F,
         static_cast<int>(K), X, HIP_R_32F, static_cast<int>(K), &beta, Y,
         HIP_R_32F, static_cast<int>(M), HIPBLAS_COMPUTE_32F,
-        HIPBLAS_GEMM_DEFAULT);
-    if (stat != HIPBLAS_STATUS_SUCCESS) {
-      std::cerr << "hipblasGemmEx FP32 returned error code: " << stat << "\n";
-    }
+        HIPBLAS_GEMM_DEFAULT));
   }
+}
+
+void LaunchHipblasGEMMBF16(hipblasHandle_t handle, const void* A_bf16,
+                           const void* d_x_bf16, float* Y,
+                           std::size_t batch_size, std::size_t M, std::size_t K,
+                           hipStream_t stream) {
+  if (batch_size == 0 || M == 0 || K == 0) {
+    return;
+  }
+
+  if (stream != nullptr) {
+    HIPBLAS_CHECK(hipblasSetStream(handle, stream));
+  }
+
+  const float alpha = 1.0F;
+  const float beta = 0.0F;
+
+  HIPBLAS_CHECK(hipblasGemmEx(
+      handle, HIPBLAS_OP_T, HIPBLAS_OP_N, static_cast<int>(M),
+      static_cast<int>(batch_size), static_cast<int>(K), &alpha, A_bf16,
+      HIP_R_16BF, static_cast<int>(K), d_x_bf16, HIP_R_16BF,
+      static_cast<int>(K), &beta, Y, HIP_R_32F, static_cast<int>(M),
+      HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
 }
 
 __global__ void BatchedFusedSSMInputProjectionsKernel(
@@ -1855,8 +1895,10 @@ __global__ void BatchedAttentionKernel(
     std::uint32_t num_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim) {
   const std::uint32_t h = blockIdx.x;
-  if (h >= num_heads)
+  const std::uint32_t t = blockIdx.y;
+  if (h >= num_heads || t >= batch_size) {
     return;
+  }
 
   const std::size_t tid = threadIdx.x;
   const std::uint32_t kv_h = h / (num_heads / num_kv_heads);
@@ -1865,91 +1907,92 @@ __global__ void BatchedAttentionKernel(
   __shared__ float s_scratch[256];
   extern __shared__ float s_scores[];
 
-  for (std::size_t t = 0; t < batch_size; ++t) {
-    const std::uint32_t cur_pos = start_pos + static_cast<std::uint32_t>(t);
-    const std::size_t seq_len = static_cast<std::size_t>(cur_pos) + 1;
-    const float* q_h = q + (t * num_heads * head_dim) +
-                       (static_cast<std::size_t>(h) * head_dim);
+  const std::uint32_t cur_pos = start_pos + static_cast<std::uint32_t>(t);
+  const std::size_t seq_len = static_cast<std::size_t>(cur_pos) + 1;
+  const float* q_h =
+      q + (t * num_heads * head_dim) + (static_cast<std::size_t>(h) * head_dim);
 
-    // Step 1: Dot product Q * K
-    for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+  // Step 1: Dot product Q * K with vectorization
+  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+    const std::size_t p_offset =
+        (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
+              max_context +
+          p) *
+         head_dim);
+    const auto* k_p_vec = reinterpret_cast<const float4*>(k_cache + p_offset);
+    const auto* q_h_vec = reinterpret_cast<const float4*>(q_h);
+
+    float dot = 0.0F;
+    const std::size_t num_vec = head_dim / 4;
+    for (std::size_t d = 0; d < num_vec; ++d) {
+      const float4 qv = q_h_vec[d];
+      const float4 kv = k_p_vec[d];
+      dot += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+    }
+    s_scores[p] = dot * scale;
+  }
+  __syncthreads();
+
+  // Step 2: Softmax
+  float local_max = -1e30F;
+  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+    local_max = fmaxf(local_max, s_scores[p]);
+  }
+  s_scratch[tid] = local_max;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_scratch[tid] = fmaxf(s_scratch[tid], s_scratch[tid + stride]);
+    }
+    __syncthreads();
+  }
+  const float max_score = s_scratch[0];
+  __syncthreads();
+
+  float local_sum = 0.0F;
+  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+    const float e = expf(s_scores[p] - max_score);
+    s_scores[p] = e;
+    local_sum += e;
+  }
+  s_scratch[tid] = local_sum;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_scratch[tid] += s_scratch[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float inv_sum_exp = 1.0F / (s_scratch[0] + 1e-9F);
+  __syncthreads();
+
+  for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
+    s_scores[p] *= inv_sum_exp;
+  }
+  __syncthreads();
+
+  // Step 3: Weighted sum of V
+  if (tid < head_dim) {
+    float ctx = 0.0F;
+    for (std::size_t p = 0; p < seq_len; ++p) {
       const std::size_t p_offset =
           (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
                 max_context +
             p) *
            head_dim);
-      const float* k_p = k_cache + p_offset;
+      const float* v_p = v_cache + p_offset;
+      ctx += s_scores[p] * v_p[tid];
+    }
 
-      float dot = 0.0F;
-      for (std::size_t d = 0; d < head_dim; ++d) {
-        dot += q_h[d] * k_p[d];
-      }
-      s_scores[p] = dot * scale;
+    if (gate != nullptr) {
+      const float g =
+          (gate + (t * num_heads *
+                   head_dim))[static_cast<std::size_t>(h) * head_dim + tid];
+      const float sig = 1.0F / (1.0F + expf(-g));
+      ctx *= sig;
     }
-    __syncthreads();
-
-    // Step 2: Softmax
-    float local_max = -1e30F;
-    for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
-      local_max = fmaxf(local_max, s_scores[p]);
-    }
-    s_scratch[tid] = local_max;
-    __syncthreads();
-    for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
-      if (tid < stride) {
-        s_scratch[tid] = fmaxf(s_scratch[tid], s_scratch[tid + stride]);
-      }
-      __syncthreads();
-    }
-    const float max_score = s_scratch[0];
-    __syncthreads();
-
-    float local_sum = 0.0F;
-    for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
-      const float e = expf(s_scores[p] - max_score);
-      s_scores[p] = e;
-      local_sum += e;
-    }
-    s_scratch[tid] = local_sum;
-    __syncthreads();
-    for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
-      if (tid < stride) {
-        s_scratch[tid] += s_scratch[tid + stride];
-      }
-      __syncthreads();
-    }
-    const float inv_sum_exp = 1.0F / (s_scratch[0] + 1e-9F);
-    __syncthreads();
-
-    for (std::size_t p = tid; p < seq_len; p += blockDim.x) {
-      s_scores[p] *= inv_sum_exp;
-    }
-    __syncthreads();
-
-    // Step 3: Weighted sum of V
-    if (tid < head_dim) {
-      float ctx = 0.0F;
-      for (std::size_t p = 0; p < seq_len; ++p) {
-        const std::size_t p_offset =
-            (((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_h) *
-                  max_context +
-              p) *
-             head_dim);
-        const float* v_p = v_cache + p_offset;
-        ctx += s_scores[p] * v_p[tid];
-      }
-
-      if (gate != nullptr) {
-        const float g =
-            (gate + (t * num_heads *
-                     head_dim))[static_cast<std::size_t>(h) * head_dim + tid];
-        const float sig = 1.0F / (1.0F + expf(-g));
-        ctx *= sig;
-      }
-      out_context[(t * num_heads * head_dim) +
-                  (static_cast<std::size_t>(h) * head_dim) + tid] = ctx;
-    }
-    __syncthreads();
+    out_context[(t * num_heads * head_dim) +
+                (static_cast<std::size_t>(h) * head_dim) + tid] = ctx;
   }
 }
 
@@ -1965,10 +2008,11 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
       k, v, k_cache, v_cache, layer_idx, start_pos, batch_size, max_context,
       num_kv_heads, head_dim);
 
+  const dim3 attn_grid(num_heads, static_cast<unsigned int>(batch_size));
   const std::size_t max_seq_len =
       static_cast<std::size_t>(start_pos) + batch_size;
   const std::size_t shared_scores_bytes = max_seq_len * sizeof(float);
-  BatchedAttentionKernel<<<num_heads, 256, shared_scores_bytes, stream>>>(
+  BatchedAttentionKernel<<<attn_grid, 256, shared_scores_bytes, stream>>>(
       q, gate, k_cache, v_cache, out_context, layer_idx, start_pos, batch_size,
       max_context, num_heads, num_kv_heads, head_dim);
 }
@@ -1980,56 +2024,62 @@ __global__ void BatchedSSMConvKernel(const float* __restrict__ qkv_in,
                                      std::size_t batch_size,
                                      std::size_t qkv_dim) {
   const std::size_t c = (blockIdx.x * blockDim.x) + threadIdx.x;
-  if (c >= qkv_dim)
+  const std::size_t t = blockIdx.y;
+  if (c >= qkv_dim || t >= batch_size) {
     return;
+  }
 
   const std::size_t c_off = c * 4;
-  float s0 = conv_state[c_off + 0];
-  float s1 = conv_state[c_off + 1];
-  float s2 = conv_state[c_off + 2];
-  float s3 = conv_state[c_off + 3];
-
   const float w0 = (conv_weights != nullptr) ? conv_weights[c * 4 + 0] : 0.0F;
   const float w1 = (conv_weights != nullptr) ? conv_weights[c * 4 + 1] : 0.0F;
   const float w2 = (conv_weights != nullptr) ? conv_weights[c * 4 + 2] : 0.0F;
   const float w3 = (conv_weights != nullptr) ? conv_weights[c * 4 + 3] : 1.0F;
 
-  for (std::size_t t = 0; t < batch_size; ++t) {
-    s0 = s1;
-    s1 = s2;
-    s2 = s3;
-    s3 = qkv_in[(t * qkv_dim) + c];
+  const float s3 = qkv_in[(t * qkv_dim) + c];
+  const float s2 =
+      (t >= 1) ? qkv_in[((t - 1) * qkv_dim) + c] : conv_state[c_off + 3];
+  const float s1 = (t >= 2)   ? qkv_in[((t - 2) * qkv_dim) + c]
+                   : (t == 1) ? conv_state[c_off + 3]
+                              : conv_state[c_off + 2];
+  const float s0 = (t >= 3)   ? qkv_in[((t - 3) * qkv_dim) + c]
+                   : (t == 2) ? conv_state[c_off + 3]
+                   : (t == 1) ? conv_state[c_off + 2]
+                              : conv_state[c_off + 1];
 
-    float dot = 0.0F;
-    if (conv_weights != nullptr) {
-      dot = (s0 * w0) + (s1 * w1) + (s2 * w2) + (s3 * w3);
-    } else {
-      dot = s3;
-    }
-
-    const float sig = 1.0F / (1.0F + expf(-dot));
-    conv_out[(t * qkv_dim) + c] = dot * sig;
+  float dot = 0.0F;
+  if (conv_weights != nullptr) {
+    dot = (s0 * w0) + (s1 * w1) + (s2 * w2) + (s3 * w3);
+  } else {
+    dot = s3;
   }
 
-  conv_state[c_off + 0] = s0;
-  conv_state[c_off + 1] = s1;
-  conv_state[c_off + 2] = s2;
-  conv_state[c_off + 3] = s3;
+  const float sig = 1.0F / (1.0F + expf(-dot));
+  conv_out[(t * qkv_dim) + c] = dot * sig;
+
+  // Final token updates state for future decode steps
+  if (t == batch_size - 1) {
+    conv_state[c_off + 0] = s0;
+    conv_state[c_off + 1] = s1;
+    conv_state[c_off + 2] = s2;
+    conv_state[c_off + 3] = s3;
+  }
 }
 
 __global__ void BatchedDeltaNetRecurrenceKernel(
     const float* __restrict__ conv_out, float* __restrict__ deltanet_state,
     const float* __restrict__ alpha_buf, const float* __restrict__ beta_buf,
     const float* __restrict__ ssm_a, const float* __restrict__ ssm_dt,
-    const float* __restrict__ ssm_norm, const float* __restrict__ gate,
-    float* __restrict__ out_buf, std::uint32_t layer_idx,
+    float* __restrict__ raw_out, std::uint32_t layer_idx,
     std::size_t batch_size, std::uint32_t num_heads, std::uint32_t key_dim,
     std::uint32_t val_dim) {
   const std::uint32_t h = blockIdx.x;
-  if (h >= num_heads)
+  if (h >= num_heads) {
     return;
+  }
 
   const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
   const std::uint32_t kh_idx = h % 16;
 
   float* s_matrix =
@@ -2039,16 +2089,31 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
   const float dt = (ssm_dt != nullptr) ? ssm_dt[h % 32] : 0.0F;
   const float a_val = (ssm_a != nullptr) ? ssm_a[h % 32] : -0.05F;
 
+  __shared__ float s_k[128];
+  __shared__ float s_q[128];
+  __shared__ float s_warp_k[4];
+  __shared__ float s_warp_q[4];
+  __shared__ float s_warp_kq[4];
+  __shared__ float s_scales[3];  // inv_k_norm, q_scale, kq_dot
+
+  // Thread j loads and keeps its entire row in registers!
+  float4 s_reg[32];
+  if (tid < val_dim) {
+    const std::size_t j = tid;
+    const float* s_row = s_matrix + (j * key_dim);
+    const auto* s_row_vec = reinterpret_cast<const float4*>(s_row);
+#pragma unroll
+    for (std::size_t vi = 0; vi < 32; ++vi) {
+      s_reg[vi] = s_row_vec[vi];
+    }
+  }
+
   for (std::size_t t = 0; t < batch_size; ++t) {
     const float* conv_t = conv_out + (t * 8192);
-    const float* q_ptr = conv_t;
-    const float* k_ptr = conv_t + (16 * key_dim);
-    const float* v_ptr = conv_t + (16 * key_dim * 2);
-
-    const float* q_h = q_ptr + (kh_idx * key_dim);
-    const float* k_h = k_ptr + (kh_idx * key_dim);
-    const float* v_h = v_ptr + (h * val_dim);
-    float* o_h = out_buf + (t * 4096) + (h * val_dim);
+    const float* q_h = conv_t + (kh_idx * key_dim);
+    const float* k_h = conv_t + (16 * key_dim) + (kh_idx * key_dim);
+    const float* v_h = conv_t + (32 * key_dim) + (h * val_dim);
+    float* o_h = raw_out + (t * 4096) + (h * val_dim);
 
     const float alpha_in =
         (alpha_buf != nullptr) ? (alpha_buf + (t * 32))[h] : 0.0F;
@@ -2061,81 +2126,161 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
     const float alpha_h = expf(alpha_softplus * a_val);
     const float beta_h = 1.0F / (1.0F + expf(-beta_in));
 
-    // 2. Normalize key and query
-    __shared__ float s_norm[2];
-    if (tid == 0) {
-      float k_sq = 0.0F;
-      float q_sq = 0.0F;
-      for (std::uint32_t i = 0; i < key_dim; ++i) {
-        k_sq += k_h[i] * k_h[i];
-        q_sq += q_h[i] * q_h[i];
-      }
-      s_norm[0] = 1.0F / sqrtf(k_sq + 1e-6F);
-      s_norm[1] = 1.0F / sqrtf(q_sq + 1e-6F);
+    // 1. Normalize k and q in parallel across 128 threads
+    float raw_k = (tid < key_dim) ? k_h[tid] : 0.0F;
+    float raw_q = (tid < key_dim) ? q_h[tid] : 0.0F;
+    float k_sq = raw_k * raw_k;
+    float q_sq = raw_q * raw_q;
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      k_sq += __shfl_xor(k_sq, offset);
+      q_sq += __shfl_xor(q_sq, offset);
+    }
+    if (lane_id == 0) {
+      s_warp_k[warp_id] = k_sq;
+      s_warp_q[warp_id] = q_sq;
     }
     __syncthreads();
-    const float q_scale =
-        (1.0F / sqrtf(static_cast<float>(key_dim))) * s_norm[1];
-    const float inv_k_norm = s_norm[0];
 
-    // 3. Associative retrieval
+    if (tid == 0) {
+      const float total_k_sq =
+          s_warp_k[0] + s_warp_k[1] + s_warp_k[2] + s_warp_k[3];
+      const float total_q_sq =
+          s_warp_q[0] + s_warp_q[1] + s_warp_q[2] + s_warp_q[3];
+      s_scales[0] = 1.0F / sqrtf(total_k_sq + 1e-6F);
+      s_scales[1] = (1.0F / sqrtf(static_cast<float>(key_dim))) *
+                    (1.0F / sqrtf(total_q_sq + 1e-6F));
+    }
+    __syncthreads();
+
+    const float inv_k_norm = s_scales[0];
+    const float q_scale = s_scales[1];
+    const float norm_k = raw_k * inv_k_norm;
+    const float norm_q = raw_q * q_scale;
+
+    if (tid < 128) {
+      s_k[tid] = norm_k;
+      s_q[tid] = norm_q;
+    }
+
+    // 2. Parallel reduction for kq_dot
+    float local_kq = norm_k * norm_q;
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      local_kq += __shfl_xor(local_kq, offset);
+    }
+    if (lane_id == 0) {
+      s_warp_kq[warp_id] = local_kq;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      s_scales[2] = s_warp_kq[0] + s_warp_kq[1] + s_warp_kq[2] + s_warp_kq[3];
+    }
+    __syncthreads();
+    const float kq_dot = s_scales[2];
+
+    // 3. Associative retrieval: 128 threads process 128 rows entirely in
+    // registers!
     if (tid < val_dim) {
       const std::size_t j = tid;
-      float* s_row = s_matrix + (j * key_dim);
-
-      for (std::size_t i = 0; i < key_dim; ++i) {
-        s_row[i] *= alpha_h;
-      }
+      const auto* k_vec = reinterpret_cast<const float4*>(s_k);
+      const auto* q_vec = reinterpret_cast<const float4*>(s_q);
 
       float u_j = 0.0F;
-      for (std::size_t i = 0; i < key_dim; ++i) {
-        u_j += s_row[i] * (k_h[i] * inv_k_norm);
+      float p_j = 0.0F;
+
+#pragma unroll
+      for (std::size_t vi = 0; vi < 32; ++vi) {
+        float4 s4 = s_reg[vi];
+        s4.x *= alpha_h;
+        s4.y *= alpha_h;
+        s4.z *= alpha_h;
+        s4.w *= alpha_h;
+        s_reg[vi] = s4;
+
+        const float4 kv = k_vec[vi];
+        const float4 qv = q_vec[vi];
+
+        u_j += (s4.x * kv.x) + (s4.y * kv.y) + (s4.z * kv.z) + (s4.w * kv.w);
+        p_j += (s4.x * qv.x) + (s4.y * qv.y) + (s4.z * qv.z) + (s4.w * qv.w);
       }
+
       const float d_j = (v_h[j] - u_j) * beta_h;
+      o_h[j] = p_j + (d_j * kq_dot);
 
-      for (std::size_t i = 0; i < key_dim; ++i) {
-        s_row[i] += d_j * (k_h[i] * inv_k_norm);
+#pragma unroll
+      for (std::size_t vi = 0; vi < 32; ++vi) {
+        float4 s4 = s_reg[vi];
+        const float4 kv = k_vec[vi];
+        s4.x += (d_j * kv.x);
+        s4.y += (d_j * kv.y);
+        s4.z += (d_j * kv.z);
+        s4.w += (d_j * kv.w);
+        s_reg[vi] = s4;
       }
+    }
+  }
 
-      float o_j = 0.0F;
-      for (std::size_t i = 0; i < key_dim; ++i) {
-        o_j += s_row[i] * (q_h[i] * q_scale);
-      }
-      o_h[j] = o_j;
+  // Write final row state back to global memory ONCE
+  if (tid < val_dim) {
+    const std::size_t j = tid;
+    float* s_row = s_matrix + (j * key_dim);
+    auto* s_row_vec = reinterpret_cast<float4*>(s_row);
+#pragma unroll
+    for (std::size_t vi = 0; vi < 32; ++vi) {
+      s_row_vec[vi] = s_reg[vi];
     }
-    __syncthreads();
+  }
+}
 
-    // 4. Per-head RMSNorm on o_h
-    __shared__ float s_sum[256];
-    if (tid < val_dim) {
-      s_sum[tid] = o_h[tid] * o_h[tid];
-    } else {
-      s_sum[tid] = 0.0F;
-    }
-    __syncthreads();
-    for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
-      if (tid < stride) {
-        s_sum[tid] += s_sum[tid + stride];
-      }
-      __syncthreads();
-    }
-    const float mean_sq = s_sum[0] / static_cast<float>(val_dim);
-    const float inv_rms = rsqrtf(mean_sq + 1e-6F);
-    __syncthreads();
+__global__ void BatchedSSMPostNormGateKernel(
+    const float* __restrict__ raw_out, const float* __restrict__ ssm_norm,
+    const float* __restrict__ gate, float* __restrict__ out_buf,
+    std::size_t batch_size, std::uint32_t num_heads, std::uint32_t val_dim) {
+  const std::size_t h = blockIdx.x;
+  const std::size_t t = blockIdx.y;
+  if (h >= num_heads || t >= batch_size) {
+    return;
+  }
 
-    if (tid < val_dim) {
-      const float normed = o_h[tid] * inv_rms;
-      const float w = (ssm_norm != nullptr) ? ssm_norm[tid] : 1.0F;
-      float val = normed * w;
-      if (gate != nullptr) {
-        const float g =
-            (gate + (t * 4096))[static_cast<std::size_t>(h) * val_dim + tid];
-        const float sig = 1.0F / (1.0F + expf(-g));
-        val *= (g * sig);
-      }
-      o_h[tid] = val;
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+
+  const float* in_h = raw_out + (t * 4096) + (h * val_dim);
+  float* o_h = out_buf + (t * 4096) + (h * val_dim);
+
+  const float in_val = (tid < val_dim) ? in_h[tid] : 0.0F;
+  float o_sq = in_val * in_val;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    o_sq += __shfl_xor(o_sq, offset);
+  }
+
+  __shared__ float s_warp_rms[4];
+  if (lane_id == 0) {
+    s_warp_rms[warp_id] = o_sq;
+  }
+  __syncthreads();
+
+  __shared__ float s_inv_rms;
+  if (tid == 0) {
+    const float total_o_sq =
+        s_warp_rms[0] + s_warp_rms[1] + s_warp_rms[2] + s_warp_rms[3];
+    const float mean_sq = total_o_sq / static_cast<float>(val_dim);
+    s_inv_rms = rsqrtf(mean_sq + 1e-6F);
+  }
+  __syncthreads();
+
+  if (tid < val_dim) {
+    const float normed = in_val * s_inv_rms;
+    const float w = (ssm_norm != nullptr) ? ssm_norm[tid] : 1.0F;
+    float val = normed * w;
+    if (gate != nullptr) {
+      const float g = (gate + (t * 4096))[h * val_dim + tid];
+      const float sig = 1.0F / (1.0F + expf(-g));
+      val *= (g * sig);
     }
-    __syncthreads();
+    o_h[tid] = val;
   }
 }
 
@@ -2148,16 +2293,23 @@ void LaunchBatchedSSMConvRecurrence(
     std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream) {
   const std::size_t qkv_dim = 8192;
   const std::size_t block_size = 256;
-  const std::size_t grid_size = (qkv_dim + block_size - 1) / block_size;
+  const std::size_t grid_x = (qkv_dim + block_size - 1) / block_size;
+  const dim3 conv_grid(static_cast<unsigned int>(grid_x),
+                       static_cast<unsigned int>(batch_size));
   float* conv_layer_state =
       conv_state + (static_cast<std::size_t>(layer_idx) * 8192 * 4);
 
-  BatchedSSMConvKernel<<<grid_size, block_size, 0, stream>>>(
-      qkv_in, conv_weights, conv_layer_state, conv_out, batch_size, qkv_dim);
+  BatchedSSMConvKernel<<<conv_grid, static_cast<unsigned int>(block_size), 0,
+                         stream>>>(qkv_in, conv_weights, conv_layer_state,
+                                   conv_out, batch_size, qkv_dim);
 
-  BatchedDeltaNetRecurrenceKernel<<<num_heads, 256, 0, stream>>>(
-      conv_out, deltanet_state, alpha_buf, beta_buf, ssm_a, ssm_dt, ssm_norm,
-      gate, out_buf, layer_idx, batch_size, num_heads, key_dim, val_dim);
+  BatchedDeltaNetRecurrenceKernel<<<num_heads, 128, 0, stream>>>(
+      conv_out, deltanet_state, alpha_buf, beta_buf, ssm_a, ssm_dt, out_buf,
+      layer_idx, batch_size, num_heads, key_dim, val_dim);
+
+  const dim3 post_grid(num_heads, static_cast<unsigned int>(batch_size));
+  BatchedSSMPostNormGateKernel<<<post_grid, 128, 0, stream>>>(
+      out_buf, ssm_norm, gate, out_buf, batch_size, num_heads, val_dim);
 }
 
 }  // namespace strix::hip
