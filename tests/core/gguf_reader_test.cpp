@@ -205,6 +205,54 @@ void TestBasicGgufParsing() {
   Expect(config->IsValidQwen(), "IsValidQwen true");
 }
 
+void TestQwen38_27BParsing() {
+  GgufBuilder builder;
+  builder.AddMetadataString("general.architecture", "qwen35");
+  builder.AddMetadataString("general.name", "qwen3.8-27b-text");
+  builder.AddMetadataUint32("qwen35.block_count", 64);
+  builder.AddMetadataUint32("qwen35.embedding_length", 5120);
+  builder.AddMetadataUint32("qwen35.feed_forward_length", 17920);
+  builder.AddMetadataUint32("qwen35.attention.head_count", 40);
+  builder.AddMetadataUint32("qwen35.attention.head_count_kv", 8);
+  builder.AddMetadataUint32("qwen35.attention.key_length", 128);
+  builder.AddMetadataUint32("qwen35.context_length", 131072);
+  builder.AddMetadataUint32("qwen35.full_attention_interval", 4);
+  builder.AddMetadataFloat32("qwen35.rope.freq_base", 1000000.0F);
+
+  builder.AddTensor("token_embd.weight", {248320, 5120},
+                    strix::core::GgmlType::kBF16, 0);
+  builder.AddTensor("blk.0.attn_q.weight", {5120, 5120},
+                    strix::core::GgmlType::kStrixSHQ4_T16, 64);
+  builder.AddTensor("blk.63.ffn_gate.weight", {17920, 5120},
+                    strix::core::GgmlType::kStrixSHQ4_T16, 128);
+  builder.AddTensor("mtp.0.proj.weight", {5120, 5120},
+                    strix::core::GgmlType::kStrixSHQ8_T16, 192);
+
+  auto binary = builder.Build(512);
+
+  std::string err;
+  auto reader =
+      strix::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+  Expect(reader != nullptr, "Reader open succeeds: " + err);
+  Expect(reader->GetTensorCount() == 4, "4 tensors parsed for 27B");
+
+  // Config extraction and verification for 27B
+  auto config = reader->ExtractModelConfig(&err);
+  Expect(config.has_value(), "ExtractModelConfig succeeds for 27B: " + err);
+  Expect(config->num_layers == 64, "64 layers for 27B");
+  Expect(config->hidden_size == 5120, "5120 hidden size for 27B");
+  Expect(config->intermediate_size == 17920, "17920 intermediate size for 27B");
+  Expect(config->num_attention_heads == 40, "40 attention heads for 27B");
+  Expect(config->num_key_value_heads == 8, "8 KV heads for 27B");
+  Expect(config->head_dim == 128, "128 head dim for 27B");
+  Expect(config->context_length == 131072, "131072 context length for 27B");
+  Expect(config->full_attention_interval == 4,
+         "full_attention_interval 4 for 27B");
+  Expect(config->mtp_num_layers == 1, "MTP layer count 1 for 27B");
+  Expect(config->is_text_only, "is_text_only true for 27B");
+  Expect(config->IsValidQwen(), "IsValidQwen true for 27B");
+}
+
 void TestVisionExclusionValidation() {
   GgufBuilder builder;
   builder.AddMetadataString("general.architecture", "qwen35");
@@ -255,6 +303,7 @@ void TestMalformedGgufRejection() {
 int main() {
   std::cout << "Running GgufReader unit tests...\n";
   TestBasicGgufParsing();
+  TestQwen38_27BParsing();
   TestVisionExclusionValidation();
   TestMalformedGgufRejection();
   std::cout << "All GgufReader tests passed successfully!\n";
