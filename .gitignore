@@ -95,3 +95,6 @@ ds4*
 
 # Agent helpers
 .codegraph
+
+# Uncommitted opt-in capability suites
+tests/quality/compsec.json

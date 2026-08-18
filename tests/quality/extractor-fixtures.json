@@ -1,0 +1,50 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "type": "mcq",
+      "text": "Therefore, the answer is \\boxed{B}.",
+      "expected": "B"
+    },
+    {
+      "type": "mcq",
+      "text": "The correct option is **(C)**.",
+      "expected": "C"
+    },
+    {
+      "type": "mcq",
+      "text": "Answer: A",
+      "expected": "A"
+    },
+    {
+      "type": "mcq",
+      "text": "Option D is the valid conclusion.",
+      "expected": "D"
+    },
+    {
+      "type": "integer",
+      "text": "Hence, the total number of ways is \\boxed{420}.",
+      "expected": 420
+    },
+    {
+      "type": "integer",
+      "text": "The answer is 0.",
+      "expected": 0
+    },
+    {
+      "type": "integer",
+      "text": "Thus, the final remainder is 999",
+      "expected": 999
+    },
+    {
+      "type": "linespec",
+      "text": "The buffer overflow vulnerability exists on line 54.",
+      "expected": [54]
+    },
+    {
+      "type": "linespec",
+      "text": "Lines 12-15 miss null checks.",
+      "expected": [12, 13, 14, 15]
+    }
+  ]
+}
