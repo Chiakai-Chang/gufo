@@ -75,11 +75,15 @@ Aggregates over all scored positions (`quality.py`):
 Current slice reports mean/median/p95/p99/max KL, top-1 agreement, and
 teacher + candidate perplexity.
 
-### Position count
+### Position count and Artifact Schema
 
 `positions` in a report equals the total number of scored next-token positions
-across all suite prompts. The current Qwen3.5-0.8B teacher results contain 78
-positions. The committed suite identity is:
+across all suite prompts. The captured teacher logit artifact follows the
+`strix.logit-artifact.v1` schema with chunked zstd compression, dynamic
+vocabulary extraction for Qwen3.5-4B and Qwen3.8-27B, and SHA-256 chunk
+manifest validation.
+
+The committed suite identity is:
 
 ```text
 tools/suites/teacher.json
