@@ -91,8 +91,8 @@ void TestAttentionWithKvCache() {
   std::vector<float> scores(16, 0.0F);
   std::vector<float> out(8, 0.0F);
 
-  strix::models::ForwardAttention(q, k, v, {}, kv_cache, 0, 0, num_heads,
-                                  num_kv_heads, head_dim, scores, out);
+  strix::models::ForwardAttention(q, k, v, {}, {}, kv_cache, 0, 0, num_heads,
+                                  num_kv_heads, head_dim, 8, scores, out);
 
   // Since pos=0, softmax weight is 1.0, out should equal value vectors
   assert(std::abs(out[0] - 2.0F) < 1e-5F);

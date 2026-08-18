@@ -29,13 +29,14 @@ void ForwardRoPE(std::span<float> q, std::span<float> k,
                  std::uint32_t head_dim, std::uint32_t rotary_dim,
                  std::uint32_t pos, float rope_theta) noexcept;
 
-/// Computes Grouped-Query Attention with KV-cache for a single sequence
-/// position.
+/// Computes Grouped-Query Attention with KV-cache and optional gating for a
+/// single sequence position.
 void ForwardAttention(std::span<const float> q, std::span<const float> k,
-                      std::span<const float> v, const QwenTensorRef& o_weight,
-                      QwenKvCache& kv_cache, std::uint32_t layer_idx,
-                      std::uint32_t pos, std::uint32_t num_heads,
-                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
+                      std::span<const float> v, std::span<const float> gate,
+                      const QwenTensorRef& o_weight, QwenKvCache& kv_cache,
+                      std::uint32_t layer_idx, std::uint32_t pos,
+                      std::uint32_t num_heads, std::uint32_t num_kv_heads,
+                      std::uint32_t head_dim, std::size_t hidden_size,
                       std::span<float> attn_scores_scratch,
                       std::span<float> attn_out) noexcept;
 
