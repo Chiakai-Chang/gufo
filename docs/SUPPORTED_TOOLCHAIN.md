@@ -31,7 +31,7 @@ All userspace toolchain dependencies are locked via [`flake.lock`](file:///home/
 | **Build Tools** | CMake `4.3.4`, Ninja `1.13.2` | `pkgs.cmake`, `pkgs.ninja` | Build generation and compilation runner |
 | **ROCm CLR** | ROCm `7.2.3` | `rocmPackages.clr` (`7.2.3`) | AMD ROCm Common Language Runtime |
 | **Device HIP Compiler** | AMD Clang `22.0.0` (`rocm-7.2.3`) | `rocmPackages.llvm.clang` / `hipClang` | Native device code generation for `gfx1151` |
-| **ROCm Libraries** | `hipblas` `7.2.3`, `rocblas` `7.2.3` | `rocmPackages.hipblas`, `rocmPackages.rocblas` | BLAS baselines and runtime utilities |
+| **ROCm Libraries** | `hipblas` `7.2.3`, `hipblaslt` `7.2.3`, `rocblas` `7.2.3` | `rocmPackages.hipblas`, `rocmPackages.hipblaslt`, `rocmPackages.rocblas` | Tuned BF16 prefill GEMMs, BLAS baselines, and runtime utilities |
 | **XRT Userspace Runtime** | Git commit `8661761775a266b11992a3bd6eb08209d88aa845` | `github:Xilinx/XRT` (`sha256-JrqJIGJoQiXTwXjZpqAXVaHx+6i09B1qtqkJzoRPZKw=`) | AMD XRT NPU runtime shim (`libxrt_coreutil.so`) |
 | **AMD XDNA Driver Plugin** | Git commit `4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305` (Plugin `2.21.0`) | `github:amd/xdna-driver` (`sha256-YUiM9u9vtISttbThTt9fTtBB/w3d5UatGyVK5mAgWNM=`) | Userspace driver plugin (`libxrt_driver_xdna.so`) |
 | **Offline Python Toolchain** | Python `3.13` (`python313`) | `python313.withPackages` | Offline quantization and logit evaluation (`torchWithRocm`, `transformers`, `safetensors`, `numpy`, `scipy`, `zstandard`) |

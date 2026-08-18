@@ -1,9 +1,16 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
+#include <hipblaslt/hipblaslt.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <memory>
+#include <ranges>
+#include <span>
+#include <utility>
+#include <vector>
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
@@ -11,6 +18,131 @@
 namespace strix::hip {
 
 namespace {
+
+constexpr std::size_t kHipblasLtMaxAlgorithms = 16;
+constexpr std::size_t kHipblasLtWideFfnThreshold = 3;
+constexpr std::size_t kHipblasLtLargeBatch = 256;
+constexpr std::size_t kHipblasLtLargeWideRank = 4;
+constexpr std::size_t kHipblasLtTallRank = 5;
+
+struct HipblasLtPlan {
+  std::size_t batch_size{0};
+  std::size_t m{0};
+  std::size_t k{0};
+  hipblasLtMatmulDesc_t operation{nullptr};
+  hipblasLtMatrixLayout_t a_layout{nullptr};
+  hipblasLtMatrixLayout_t x_layout{nullptr};
+  hipblasLtMatrixLayout_t y_layout{nullptr};
+  hipblasLtMatmulAlgo_t algorithm{};
+
+  HipblasLtPlan() = default;
+  HipblasLtPlan(const HipblasLtPlan&) = delete;
+  HipblasLtPlan& operator=(const HipblasLtPlan&) = delete;
+
+  ~HipblasLtPlan() {
+    if (a_layout != nullptr) {
+      (void)hipblasLtMatrixLayoutDestroy(a_layout);
+    }
+    if (x_layout != nullptr) {
+      (void)hipblasLtMatrixLayoutDestroy(x_layout);
+    }
+    if (y_layout != nullptr) {
+      (void)hipblasLtMatrixLayoutDestroy(y_layout);
+    }
+    if (operation != nullptr) {
+      (void)hipblasLtMatmulDescDestroy(operation);
+    }
+  }
+};
+
+[[nodiscard]] std::size_t SelectHipblasLtHeuristicRank(
+    std::size_t batch_size, std::size_t m, std::size_t k,
+    std::size_t result_count) noexcept {
+  if (batch_size >= kHipblasLtLargeBatch) {
+    return k >= kHipblasLtWideFfnThreshold * m ? kHipblasLtTallRank
+                                               : kHipblasLtLargeWideRank;
+  }
+  if (m > 2 * k || k >= kHipblasLtWideFfnThreshold * m) {
+    return kHipblasLtTallRank;
+  }
+  return result_count - 1;
+}
+
+[[nodiscard]] bool IsUsable(
+    const hipblasLtMatmulHeuristicResult_t& result) noexcept {
+  return result.state == HIPBLAS_STATUS_SUCCESS && result.workspaceSize == 0;
+}
+
+[[nodiscard]] std::unique_ptr<HipblasLtPlan> CreateHipblasLtPlan(
+    hipblasLtHandle_t handle, std::size_t batch_size, std::size_t m,
+    std::size_t k) {
+  auto plan = std::make_unique<HipblasLtPlan>();
+  plan->batch_size = batch_size;
+  plan->m = m;
+  plan->k = k;
+
+  if (hipblasLtMatmulDescCreate(&plan->operation, HIPBLAS_COMPUTE_32F,
+                                HIP_R_32F) != HIPBLAS_STATUS_SUCCESS) {
+    return nullptr;
+  }
+  const hipblasOperation_t transpose = HIPBLAS_OP_T;
+  if (hipblasLtMatmulDescSetAttribute(
+          plan->operation, HIPBLASLT_MATMUL_DESC_TRANSA, &transpose,
+          sizeof(transpose)) != HIPBLAS_STATUS_SUCCESS) {
+    return nullptr;
+  }
+  if (hipblasLtMatrixLayoutCreate(&plan->a_layout, HIP_R_16BF, k, m, k) !=
+          HIPBLAS_STATUS_SUCCESS ||
+      hipblasLtMatrixLayoutCreate(&plan->x_layout, HIP_R_16BF, k, batch_size,
+                                  k) != HIPBLAS_STATUS_SUCCESS ||
+      hipblasLtMatrixLayoutCreate(&plan->y_layout, HIP_R_32F, m, batch_size,
+                                  m) != HIPBLAS_STATUS_SUCCESS) {
+    return nullptr;
+  }
+
+  hipblasLtMatmulPreference_t preference = nullptr;
+  if (hipblasLtMatmulPreferenceCreate(&preference) != HIPBLAS_STATUS_SUCCESS) {
+    return nullptr;
+  }
+  constexpr std::size_t max_workspace_bytes = 0;
+  const auto preference_status = hipblasLtMatmulPreferenceSetAttribute(
+      preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+      &max_workspace_bytes, sizeof(max_workspace_bytes));
+
+  std::vector<hipblasLtMatmulHeuristicResult_t> results(
+      kHipblasLtMaxAlgorithms);
+  int result_count = 0;
+  const auto heuristic_status =
+      preference_status == HIPBLAS_STATUS_SUCCESS
+          ? hipblasLtMatmulAlgoGetHeuristic(
+                handle, plan->operation, plan->a_layout, plan->x_layout,
+                plan->y_layout, plan->y_layout, preference,
+                static_cast<int>(results.size()), results.data(), &result_count)
+          : preference_status;
+  (void)hipblasLtMatmulPreferenceDestroy(preference);
+
+  if (heuristic_status != HIPBLAS_STATUS_SUCCESS || result_count <= 0) {
+    return nullptr;
+  }
+
+  const auto result_span =
+      std::span(results.data(), static_cast<std::size_t>(result_count));
+  const auto preferred_rank =
+      SelectHipblasLtHeuristicRank(batch_size, m, k, result_span.size());
+  if (preferred_rank < result_span.size() &&
+      IsUsable(result_span[preferred_rank])) {
+    plan->algorithm = result_span[preferred_rank].algo;
+    return plan;
+  }
+
+  const auto fallback = std::ranges::find_if(
+      result_span, [](const auto& result) { return IsUsable(result); });
+  if (fallback == result_span.end()) {
+    return nullptr;
+  }
+  plan->algorithm = fallback->algo;
+  return plan;
+}
 
 __global__ void EmbeddingLookupKernel(const void* __restrict__ table,
                                       bool is_bf16, std::uint32_t token_id,
@@ -319,9 +451,8 @@ __global__ void FusedSSMInputProjectionsKernel(
     const void* __restrict__ beta_w, bool beta_is_bf16,
     const float* __restrict__ x, float* __restrict__ qkv_out,
     float* __restrict__ gate_out, float* __restrict__ alpha_out,
-    float* __restrict__ beta_out, std::size_t hidden_size,
-    std::size_t qkv_size, std::size_t inner_size,
-    std::size_t time_step_rank) {
+    float* __restrict__ beta_out, std::size_t hidden_size, std::size_t qkv_size,
+    std::size_t inner_size, std::size_t time_step_rank) {
   const std::size_t m = blockIdx.x;
   const std::size_t gate_end = qkv_size + inner_size;
   const std::size_t alpha_end = gate_end + time_step_rank;
@@ -736,8 +867,8 @@ __global__ void DeltaNetRecurrenceKernel(
     const float* __restrict__ ssm_a, const float* __restrict__ ssm_dt,
     const float* __restrict__ ssm_norm, const float* __restrict__ gate,
     float* __restrict__ out_buf, std::uint32_t layer_idx,
-    std::uint32_t num_key_heads, std::uint32_t num_heads,
-    std::uint32_t key_dim, std::uint32_t val_dim) {
+    std::uint32_t num_key_heads, std::uint32_t num_heads, std::uint32_t key_dim,
+    std::uint32_t val_dim) {
   const std::uint32_t h = blockIdx.x;
   if (h >= num_heads)
     return;
@@ -848,6 +979,69 @@ __global__ void DeltaNetRecurrenceKernel(
 
 }  // namespace
 
+struct HipblasLtGemm::Impl {
+  hipblasLtHandle_t handle{nullptr};
+  std::vector<std::unique_ptr<HipblasLtPlan>> plans;
+
+  Impl() {
+    if (hipblasLtCreate(&handle) != HIPBLAS_STATUS_SUCCESS) {
+      handle = nullptr;
+    }
+  }
+
+  ~Impl() {
+    plans.clear();
+    if (handle != nullptr) {
+      (void)hipblasLtDestroy(handle);
+    }
+  }
+
+  [[nodiscard]] HipblasLtPlan* GetPlan(std::size_t batch_size, std::size_t m,
+                                       std::size_t k) {
+    const auto existing = std::ranges::find_if(plans, [&](const auto& plan) {
+      return plan->batch_size == batch_size && plan->m == m && plan->k == k;
+    });
+    if (existing != plans.end()) {
+      return existing->get();
+    }
+    auto plan = CreateHipblasLtPlan(handle, batch_size, m, k);
+    if (plan == nullptr) {
+      return nullptr;
+    }
+    auto* result = plan.get();
+    plans.push_back(std::move(plan));
+    return result;
+  }
+};
+
+HipblasLtGemm::HipblasLtGemm() : impl_(std::make_unique<Impl>()) {}
+
+HipblasLtGemm::~HipblasLtGemm() = default;
+
+HipblasLtGemm::HipblasLtGemm(HipblasLtGemm&&) noexcept = default;
+
+HipblasLtGemm& HipblasLtGemm::operator=(HipblasLtGemm&&) noexcept = default;
+
+bool HipblasLtGemm::RunBf16(const void* a_bf16, const void* x_bf16, float* y,
+                            std::size_t batch_size, std::size_t m,
+                            std::size_t k, hipStream_t stream) {
+  if (impl_ == nullptr || impl_->handle == nullptr || batch_size == 0 ||
+      m == 0 || k == 0) {
+    return false;
+  }
+  auto* plan = impl_->GetPlan(batch_size, m, k);
+  if (plan == nullptr) {
+    return false;
+  }
+
+  const float alpha = 1.0F;
+  const float beta = 0.0F;
+  return hipblasLtMatmul(impl_->handle, plan->operation, &alpha, a_bf16,
+                         plan->a_layout, x_bf16, plan->x_layout, &beta, y,
+                         plan->y_layout, y, plan->y_layout, &plan->algorithm,
+                         nullptr, 0, stream) == HIPBLAS_STATUS_SUCCESS;
+}
+
 void LaunchEmbeddingLookup(const void* table, bool is_bf16,
                            std::uint32_t token_id, float* out_hidden,
                            std::size_t hidden_size, hipStream_t stream) {
@@ -907,19 +1101,14 @@ void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
   FastGEMVBlockKernel<<<M, 256, 0, stream>>>(A, is_bf16, x, y, M, K);
 }
 
-void LaunchFusedSSMInputProjections(const void* qkv_w, bool qkv_is_bf16,
-                                    const void* gate_w, bool gate_is_bf16,
-                                    const void* alpha_w, bool alpha_is_bf16,
-                                    const void* beta_w, bool beta_is_bf16,
-                                    const float* x, float* qkv_out,
-                                    float* gate_out, float* alpha_out,
-                                    float* beta_out, std::size_t hidden_size,
-                                    std::size_t qkv_size,
-                                    std::size_t inner_size,
-                                    std::size_t time_step_rank,
-                                    hipStream_t stream) {
-  const std::size_t total_rows =
-      qkv_size + inner_size + (2 * time_step_rank);
+void LaunchFusedSSMInputProjections(
+    const void* qkv_w, bool qkv_is_bf16, const void* gate_w, bool gate_is_bf16,
+    const void* alpha_w, bool alpha_is_bf16, const void* beta_w,
+    bool beta_is_bf16, const float* x, float* qkv_out, float* gate_out,
+    float* alpha_out, float* beta_out, std::size_t hidden_size,
+    std::size_t qkv_size, std::size_t inner_size, std::size_t time_step_rank,
+    hipStream_t stream) {
+  const std::size_t total_rows = qkv_size + inner_size + (2 * time_step_rank);
   FusedSSMInputProjectionsKernel<<<total_rows, 128, 0, stream>>>(
       qkv_w, qkv_is_bf16, gate_w, gate_is_bf16, alpha_w, alpha_is_bf16, beta_w,
       beta_is_bf16, x, qkv_out, gate_out, alpha_out, beta_out, hidden_size,
@@ -982,8 +1171,7 @@ void LaunchSSMConvRecurrence(const float* qkv_in, const float* conv_weights,
                              std::uint32_t layer_idx, std::size_t qkv_size,
                              std::uint32_t num_key_heads,
                              std::uint32_t num_heads, std::uint32_t key_dim,
-                             std::uint32_t val_dim,
-                             hipStream_t stream) {
+                             std::uint32_t val_dim, hipStream_t stream) {
   const std::size_t block_size = 256;
   const std::size_t grid_size = (qkv_size + block_size - 1) / block_size;
   float* conv_layer_state =
@@ -1646,8 +1834,7 @@ void LaunchBatchedFusedSSMInputProjections(
     float* alpha_out, float* beta_out, std::size_t batch_size,
     std::size_t hidden_size, std::size_t qkv_size, std::size_t inner_size,
     std::size_t time_step_rank, hipStream_t stream) {
-  const std::size_t total_rows =
-      qkv_size + inner_size + (2 * time_step_rank);
+  const std::size_t total_rows = qkv_size + inner_size + (2 * time_step_rank);
   const dim3 grid(static_cast<unsigned int>(total_rows),
                   static_cast<unsigned int>(batch_size));
   BatchedFusedSSMInputProjectionsKernel<<<grid, 128, 0, stream>>>(
@@ -2088,9 +2275,8 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
     const float* __restrict__ alpha_buf, const float* __restrict__ beta_buf,
     const float* __restrict__ ssm_a, const float* __restrict__ ssm_dt,
     float* __restrict__ raw_out, std::uint32_t layer_idx,
-    std::size_t batch_size, std::size_t qkv_size,
-    std::uint32_t num_key_heads, std::uint32_t num_heads,
-    std::uint32_t key_dim, std::uint32_t val_dim) {
+    std::size_t batch_size, std::size_t qkv_size, std::uint32_t num_key_heads,
+    std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim) {
   const std::uint32_t h = blockIdx.x;
   if (h >= num_heads) {
     return;
@@ -2110,19 +2296,26 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
 
   __shared__ float s_k[128];
   __shared__ float s_q[128];
-  __shared__ float s_warp_k[4];
-  __shared__ float s_warp_q[4];
-  __shared__ float s_warp_kq[4];
+  __shared__ float s_warp_k[8];
+  __shared__ float s_warp_q[8];
+  __shared__ float s_warp_kq[8];
   __shared__ float s_scales[3];  // inv_k_norm, q_scale, kq_dot
 
-  // Thread j loads and keeps its entire row in registers!
-  float4 s_reg[32];
-  if (tid < val_dim) {
-    const std::size_t j = tid;
-    const float* s_row = s_matrix + (j * key_dim);
+  // Two adjacent lanes own one state row, cutting the live register tile in
+  // half while preserving the token-serial recurrence.
+  constexpr std::size_t row_vectors_per_thread = 16;
+  constexpr std::size_t row_values_per_thread =
+      row_vectors_per_thread * sizeof(float4) / sizeof(float);
+  const std::size_t j = tid >> 1U;
+  const std::size_t row_segment = tid & 1U;
+  const std::size_t row_offset = row_segment * row_values_per_thread;
+
+  float4 s_reg[row_vectors_per_thread];
+  if (j < val_dim) {
+    const float* s_row = s_matrix + (j * key_dim) + row_offset;
     const auto* s_row_vec = reinterpret_cast<const float4*>(s_row);
 #pragma unroll
-    for (std::size_t vi = 0; vi < 32; ++vi) {
+    for (std::size_t vi = 0; vi < row_vectors_per_thread; ++vi) {
       s_reg[vi] = s_row_vec[vi];
     }
   }
@@ -2130,10 +2323,8 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
   for (std::size_t t = 0; t < batch_size; ++t) {
     const float* conv_t = conv_out + (t * qkv_size);
     const float* q_h = conv_t + (kh_idx * key_dim);
-    const float* k_h =
-        conv_t + (num_key_heads * key_dim) + (kh_idx * key_dim);
-    const float* v_h =
-        conv_t + (2 * num_key_heads * key_dim) + (h * val_dim);
+    const float* k_h = conv_t + (num_key_heads * key_dim) + (kh_idx * key_dim);
+    const float* v_h = conv_t + (2 * num_key_heads * key_dim) + (h * val_dim);
     const std::size_t inner_size =
         static_cast<std::size_t>(num_heads) * val_dim;
     float* o_h = raw_out + (t * inner_size) + (h * val_dim);
@@ -2149,9 +2340,9 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
     const float alpha_h = expf(alpha_softplus * a_val);
     const float beta_h = 1.0F / (1.0F + expf(-beta_in));
 
-    // 1. Normalize k and q in parallel across 128 threads
-    float raw_k = (tid < key_dim) ? k_h[tid] : 0.0F;
-    float raw_q = (tid < key_dim) ? q_h[tid] : 0.0F;
+    // 1. Normalize k and q. The upper four waves contribute zeros.
+    const float raw_k = (tid < key_dim) ? k_h[tid] : 0.0F;
+    const float raw_q = (tid < key_dim) ? q_h[tid] : 0.0F;
     float k_sq = raw_k * raw_k;
     float q_sq = raw_q * raw_q;
 
@@ -2166,10 +2357,13 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
     __syncthreads();
 
     if (tid == 0) {
-      const float total_k_sq =
-          s_warp_k[0] + s_warp_k[1] + s_warp_k[2] + s_warp_k[3];
-      const float total_q_sq =
-          s_warp_q[0] + s_warp_q[1] + s_warp_q[2] + s_warp_q[3];
+      float total_k_sq = 0.0F;
+      float total_q_sq = 0.0F;
+#pragma unroll
+      for (std::size_t warp = 0; warp < 8; ++warp) {
+        total_k_sq += s_warp_k[warp];
+        total_q_sq += s_warp_q[warp];
+      }
       s_scales[0] = 1.0F / sqrtf(total_k_sq + 1e-6F);
       s_scales[1] = (1.0F / sqrtf(static_cast<float>(key_dim))) *
                     (1.0F / sqrtf(total_q_sq + 1e-6F));
@@ -2197,23 +2391,29 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
     __syncthreads();
 
     if (tid == 0) {
-      s_scales[2] = s_warp_kq[0] + s_warp_kq[1] + s_warp_kq[2] + s_warp_kq[3];
+      float total_kq = 0.0F;
+#pragma unroll
+      for (std::size_t warp = 0; warp < 8; ++warp) {
+        total_kq += s_warp_kq[warp];
+      }
+      s_scales[2] = total_kq;
     }
     __syncthreads();
     const float kq_dot = s_scales[2];
 
-    // 3. Associative retrieval: 128 threads process 128 rows entirely in
-    // registers!
-    if (tid < val_dim) {
-      const std::size_t j = tid;
-      const auto* k_vec = reinterpret_cast<const float4*>(s_k);
-      const auto* q_vec = reinterpret_cast<const float4*>(s_q);
+    // 3. Each lane processes half a row, then exchanges its two partial dots
+    // with the adjacent lane that owns the other half.
+    if (j < val_dim) {
+      const auto* k_vec = reinterpret_cast<const float4*>(s_k) +
+                          (row_segment * row_vectors_per_thread);
+      const auto* q_vec = reinterpret_cast<const float4*>(s_q) +
+                          (row_segment * row_vectors_per_thread);
 
       float u_j = 0.0F;
       float p_j = 0.0F;
 
 #pragma unroll
-      for (std::size_t vi = 0; vi < 32; ++vi) {
+      for (std::size_t vi = 0; vi < row_vectors_per_thread; ++vi) {
         float4 s4 = s_reg[vi];
         s4.x *= alpha_h;
         s4.y *= alpha_h;
@@ -2228,11 +2428,15 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
         p_j += (s4.x * qv.x) + (s4.y * qv.y) + (s4.z * qv.z) + (s4.w * qv.w);
       }
 
+      u_j += __shfl_xor(u_j, 1);
+      p_j += __shfl_xor(p_j, 1);
       const float d_j = (v_h[j] - u_j) * beta_h;
-      o_h[j] = p_j + (d_j * kq_dot);
+      if (row_segment == 0) {
+        o_h[j] = p_j + (d_j * kq_dot);
+      }
 
 #pragma unroll
-      for (std::size_t vi = 0; vi < 32; ++vi) {
+      for (std::size_t vi = 0; vi < row_vectors_per_thread; ++vi) {
         float4 s4 = s_reg[vi];
         const float4 kv = k_vec[vi];
         s4.x += (d_j * kv.x);
@@ -2245,12 +2449,11 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
   }
 
   // Write final row state back to global memory ONCE
-  if (tid < val_dim) {
-    const std::size_t j = tid;
-    float* s_row = s_matrix + (j * key_dim);
+  if (j < val_dim) {
+    float* s_row = s_matrix + (j * key_dim) + row_offset;
     auto* s_row_vec = reinterpret_cast<float4*>(s_row);
 #pragma unroll
-    for (std::size_t vi = 0; vi < 32; ++vi) {
+    for (std::size_t vi = 0; vi < row_vectors_per_thread; ++vi) {
       s_row_vec[vi] = s_reg[vi];
     }
   }
@@ -2259,8 +2462,8 @@ __global__ void BatchedDeltaNetRecurrenceKernel(
 __global__ void BatchedSSMPostNormGateKernel(
     const float* __restrict__ raw_out, const float* __restrict__ ssm_norm,
     const float* __restrict__ gate, float* __restrict__ out_buf,
-    std::size_t batch_size, std::size_t inner_size,
-    std::uint32_t num_heads, std::uint32_t val_dim) {
+    std::size_t batch_size, std::size_t inner_size, std::uint32_t num_heads,
+    std::uint32_t val_dim) {
   const std::size_t h = blockIdx.x;
   const std::size_t t = blockIdx.y;
   if (h >= num_heads || t >= batch_size) {
@@ -2314,8 +2517,8 @@ void LaunchBatchedSSMConvRecurrence(
     const float* beta_buf, const float* ssm_a, const float* ssm_dt,
     const float* ssm_norm, const float* gate, float* out_buf,
     std::uint32_t layer_idx, std::size_t batch_size, std::size_t qkv_size,
-    std::uint32_t num_key_heads, std::uint32_t num_heads,
-    std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream) {
+    std::uint32_t num_key_heads, std::uint32_t num_heads, std::uint32_t key_dim,
+    std::uint32_t val_dim, hipStream_t stream) {
   const std::size_t block_size = 256;
   const std::size_t grid_x = (qkv_size + block_size - 1) / block_size;
   const dim3 conv_grid(static_cast<unsigned int>(grid_x),
@@ -2327,14 +2530,13 @@ void LaunchBatchedSSMConvRecurrence(
                          stream>>>(qkv_in, conv_weights, conv_layer_state,
                                    conv_out, batch_size, qkv_size);
 
-  BatchedDeltaNetRecurrenceKernel<<<num_heads, 128, 0, stream>>>(
+  BatchedDeltaNetRecurrenceKernel<<<num_heads, 256, 0, stream>>>(
       conv_out, deltanet_state, alpha_buf, beta_buf, ssm_a, ssm_dt, out_buf,
       layer_idx, batch_size, qkv_size, num_key_heads, num_heads, key_dim,
       val_dim);
 
   const dim3 post_grid(num_heads, static_cast<unsigned int>(batch_size));
-  const std::size_t inner_size =
-      static_cast<std::size_t>(num_heads) * val_dim;
+  const std::size_t inner_size = static_cast<std::size_t>(num_heads) * val_dim;
   BatchedSSMPostNormGateKernel<<<post_grid, 128, 0, stream>>>(
       out_buf, ssm_norm, gate, out_buf, batch_size, inner_size, num_heads,
       val_dim);

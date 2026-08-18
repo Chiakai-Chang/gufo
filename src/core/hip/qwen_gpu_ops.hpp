@@ -3,12 +3,35 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
 namespace strix::hip {
+
+/// Cached hipBLASLt BF16 GEMM plans for prompt-processing projections.
+class HipblasLtGemm {
+public:
+  HipblasLtGemm();
+  ~HipblasLtGemm();
+
+  HipblasLtGemm(const HipblasLtGemm&) = delete;
+  HipblasLtGemm& operator=(const HipblasLtGemm&) = delete;
+  HipblasLtGemm(HipblasLtGemm&&) noexcept;
+  HipblasLtGemm& operator=(HipblasLtGemm&&) noexcept;
+
+  /// Computes Y[B, M] = X_bf16[B, K] * A_bf16[M, K]^T.
+  /// Returns false when hipBLASLt cannot provide a supported plan.
+  [[nodiscard]] bool RunBf16(const void* a_bf16, const void* x_bf16, float* y,
+                             std::size_t batch_size, std::size_t m,
+                             std::size_t k, hipStream_t stream = nullptr);
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 /// Asynchronously copies embedding row for token_id into out_hidden
 void LaunchEmbeddingLookup(const void* table, bool is_bf16,

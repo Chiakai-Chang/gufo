@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/testing/compare/logit_comparator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -52,6 +53,8 @@ void PrintBenchHelp(std::string_view program_name) {
                "(default: 128)\n"
             << "  -r, --repetitions <N>       Number of repetitions per test "
                "(default: 3)\n"
+            << "  --validate-prefill <N>      Compare batched logits against "
+               "sequential prefill\n"
             << "  -ngl, --n-gpu-layers <N>    Number of layers offloaded to "
                "GPU (default: 99)\n"
             << "  -v, --verbose               Verbose progress output\n";
@@ -79,6 +82,7 @@ std::vector<std::size_t> ParseCommaSeparatedSizes(std::string_view str) {
   return result;
 }
 
+#if defined(ENGINE_ENABLE_HIP)
 struct BenchStats {
   double mean{0.0};
   double stddev{0.0};
@@ -100,6 +104,52 @@ BenchStats ComputeStats(const std::vector<double>& values) {
   const double variance = sq_sum / static_cast<double>(values.size() - 1);
   return {.mean = mean, .stddev = std::sqrt(variance)};
 }
+
+bool ValidatePrefill(hip::QwenGpuExecutor& executor,
+                     std::size_t prompt_length) {
+  if (prompt_length == 0 || prompt_length > executor.GetMaxPromptBatch()) {
+    std::cerr << "Error: --validate-prefill must be between 1 and "
+              << executor.GetMaxPromptBatch() << " tokens.\n";
+    return false;
+  }
+
+  std::vector<tokenization::TokenId> prompt_tokens(prompt_length);
+  for (std::size_t i = 0; i < prompt_length; ++i) {
+    prompt_tokens[i] = static_cast<tokenization::TokenId>((i % 1000) + 100);
+  }
+
+  executor.Reset();
+  tokenization::TokenId sequential_token = 0;
+  for (std::size_t i = 0; i < prompt_tokens.size(); ++i) {
+    sequential_token =
+        executor.ForwardToken(prompt_tokens[i], static_cast<std::uint32_t>(i),
+                              i + 1 == prompt_tokens.size());
+  }
+  const auto sequential_logits_view = executor.CopyLastLogits();
+  const std::vector<float> sequential_logits(sequential_logits_view.begin(),
+                                             sequential_logits_view.end());
+
+  executor.Reset();
+  const auto batched_token = executor.ForwardPromptBatch(prompt_tokens);
+  const auto batched_logits = executor.CopyLastLogits();
+  const auto comparison =
+      testing::CompareLogits(sequential_logits, batched_logits);
+
+  std::cout << std::fixed << std::setprecision(8)
+            << "[Prefill Validation] tokens=" << prompt_length
+            << " sequential_top1=" << sequential_token
+            << " batched_top1=" << batched_token
+            << " top1_match=" << (comparison.top1_match ? "yes" : "no")
+            << " finite=" << (comparison.finite ? "yes" : "no") << '\n'
+            << "  max_abs_diff=" << comparison.max_abs_diff
+            << " mean_abs_diff=" << comparison.mean_abs_diff
+            << " rmse=" << comparison.root_mean_square_error
+            << " cosine_similarity=" << comparison.cosine_similarity << '\n';
+
+  return comparison.finite && comparison.top1_match &&
+         sequential_token == batched_token;
+}
+#endif
 
 }  // namespace
 
@@ -171,6 +221,27 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       std::from_chars(val.data(), val.data() + val.size(), r);
       if (r > 0) {
         opt.repetitions = r;
+      }
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "--validate-prefill") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --validate-prefill";
+        }
+        return std::nullopt;
+      }
+      const std::string_view val = args[i + 1];
+      const auto [ptr, ec] = std::from_chars(
+          val.data(), val.data() + val.size(), opt.validate_prefill_tokens);
+      if (ec != std::errc{} || ptr != val.data() + val.size() ||
+          opt.validate_prefill_tokens == 0) {
+        if (error_msg != nullptr) {
+          *error_msg = "Invalid argument for --validate-prefill";
+        }
+        return std::nullopt;
       }
       skip_next = true;
       continue;
@@ -275,6 +346,11 @@ int RunBench(std::span<const char* const> args) {
   }
   const double model_params_b =
       static_cast<double>(parameter_count) / 1'000'000'000.0;
+
+  if (opt.validate_prefill_tokens > 0 &&
+      !ValidatePrefill(*gpu_exec, opt.validate_prefill_tokens)) {
+    return 1;
+  }
 
   std::cout << "| " << std::left << std::setw(30) << "model"
             << " | " << std::right << std::setw(10) << "size"

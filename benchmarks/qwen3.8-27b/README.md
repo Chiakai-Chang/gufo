@@ -92,10 +92,29 @@ MODEL=models/Qwen3.8-27B-GGUF/BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf
   --verbose \
   Hello
 
-./result/bin/strix-server bench \
+./result/bin/strix-bench \
   --model "$MODEL" \
+  --n-prompt 32,64,128,256,512 \
+  --n-gen 0 \
+  --repetitions 3
+
+./result/bin/strix-bench \
+  --model "$MODEL" \
+  --validate-prefill 32 \
   --n-prompt 32 \
+  --n-gen 0 \
   --repetitions 1
+
+nix develop -c rocprofv3 \
+  --kernel-trace \
+  --scratch-memory-trace \
+  --stats \
+  --summary \
+  -- ./result/bin/strix-bench \
+    --model "$MODEL" \
+    --n-prompt 512 \
+    --n-gen 0 \
+    --repetitions 1
 
 llama-bench \
   --model "$MODEL" \
@@ -128,6 +147,29 @@ The focused Nix/HIP suite covers split-shard discovery, live 27B metadata,
 dynamic CPU state sizing, the 27B SSM layout, batched-vs-sequential HIP
 recurrence, attention, projection, RoPE, and normalization equivalence.
 
+Prompt quality is checked using the unchanged sequential `ForwardToken` path
+as the numerical reference. `--validate-prefill` runs the same token sequence
+through sequential and batched prefill, copies the complete final-token
+vocabulary logits to the host, and requires finite logits and identical top-1
+tokens. It also reports maximum and mean absolute error, RMSE, and cosine
+similarity.
+
+| Path | Prompt | Top-1 | RMSE | Cosine similarity |
+| --- | ---: | ---: | ---: | ---: |
+| Original batched path | 32 tokens | 222 | 0.01224522 | 0.99998373 |
+| Optimized batched path | 32 tokens | 222 | 0.01086507 | 0.99998587 |
+| Optimized batched path | 128 tokens | 194 | 0.01236322 | 0.99998993 |
+
+The top-1 IDs differ between the 32-token and 128-token prompts because their
+last input tokens differ. In both cases the optimized batch result matches its
+sequential reference. A deterministic end-to-end raw completion after
+optimized prefill remains coherent:
+
+```text
+The capital of France is Paris. The capital of Germany is Berlin. The capital
+of Italy is Rome. The capital of Spain is
+```
+
 ## Results
 
 Machine: Ryzen AI MAX+ 395, Radeon 8060S `gfx1151`, 128 GiB unified LPDDR5X,
@@ -154,29 +196,42 @@ and the same split BF16 GGUF. Both engines use three measured repetitions:
 
 | Test | Strix HIP | llama.cpp ROCm | llama.cpp / Strix |
 | --- | ---: | ---: | ---: |
-| `pp1` | 0.80 +/- 0.02 tok/s | 3.87 +/- 0.17 tok/s | 4.84x |
-| `pp8` | 5.56 +/- 0.01 tok/s | 28.20 +/- 0.41 tok/s | 5.07x |
-| `pp32` | 20.16 +/- 0.01 tok/s | 74.90 +/- 1.18 tok/s | 3.72x |
-| `pp64` | 28.57 +/- 0.06 tok/s | 111.40 +/- 1.36 tok/s | 3.90x |
-| `pp128` | 41.71 +/- 0.11 tok/s | 221.03 +/- 2.05 tok/s | 5.30x |
-| `pp256` | 48.77 +/- 0.35 tok/s | 242.99 +/- 1.00 tok/s | 4.98x |
-| `pp512` | 46.32 +/- 0.18 tok/s | 390.96 +/- 0.85 tok/s | 8.44x |
+| `pp32` | 79.31 +/- 0.20 tok/s | 74.90 +/- 1.18 tok/s | 0.94x |
+| `pp64` | 148.37 +/- 1.02 tok/s | 111.40 +/- 1.36 tok/s | 0.75x |
+| `pp128` | 205.19 +/- 1.26 tok/s | 221.03 +/- 2.05 tok/s | 1.08x |
+| `pp256` | 257.14 +/- 1.10 tok/s | 242.99 +/- 1.00 tok/s | 0.94x |
+| `pp512` | 329.82 +/- 1.04 tok/s | 390.96 +/- 0.85 tok/s | 1.19x |
 | `tg8` | 4.29 +/- 0.00 tok/s | 4.02 +/- 0.04 tok/s | 0.94x |
 
-The native HIP prompt path peaks at batch 256. Its 512-token result is lower
-because the causal full-attention layers add quadratic work while the GEMMs
-are already large enough to saturate the GPU.
+The optimized native path is faster than llama.cpp at `pp32`, `pp64`, and
+`pp256`, and remains 7.2% and 15.6% behind at `pp128` and `pp512`,
+respectively. The native HIP executor remains 6.6% faster for steady `tg8`
+decode.
 
-llama.cpp is 3.7-8.4x faster for prompt processing, with its advantage growing
-at 512 tokens. The native HIP executor is 6.6% faster for steady `tg8` decode.
+## Prompt Optimization
 
-The `pp32` profile before the decode launch tuning was:
+The original `rocprofv3` trace showed one rocBLAS GEMM kernel family consuming
+82.6% of `pp512` GPU time, with a second GEMM family consuming 10.7%. Exact
+Qwen3.8 projection-shape probes showed 4-6x lower kernel time with
+hipBLASLt-selected algorithms. The executor now caches a hipBLASLt plan by
+batch and matrix shape for the large BF16 projections, while retaining the
+hipBLAS path for the small alpha/beta projections.
 
-| Stage | Time |
-| --- | ---: |
-| Total | 1378.2 ms |
-| Norms | 1.4 ms |
-| Input projections | 309.5 ms |
-| SSM recurrence | 36.8 ms |
-| SSM output | 56.1 ms |
-| FFN GEMMs | 974.4 ms |
+After moving the projections, `rocprofv3 --scratch-memory-trace` identified
+the serial DeltaNet recurrence as the next bottleneck. The old kernel used 192
+VGPRs and 988 bytes of scratch per thread. Splitting each 128-element state row
+across an adjacent lane pair preserves recurrence order while removing
+scratch traffic.
+
+| Metric | Original | Optimized |
+| --- | ---: | ---: |
+| `pp512` | 46.47 tok/s | 329.82 tok/s |
+| DeltaNet recurrence, profiled warmup + `pp512` | ~565 ms | ~100 ms |
+| Recurrence VGPRs | 192 | 136 |
+| Recurrence scratch per thread | 988 bytes | 0 bytes |
+| Recurrence scratch allocation | 40.6 MiB | 0 bytes |
+
+This is a 7.10x `pp512` throughput improvement. In the final trace,
+hipBLASLt GEMMs account for about 78.9% of GPU time, attention for 7.6%,
+DeltaNet recurrence for 5.1%, and the remaining small rocBLAS projections for
+2.3%.

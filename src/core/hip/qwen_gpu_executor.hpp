@@ -22,6 +22,8 @@
 
 namespace strix::hip {
 
+class HipblasLtGemm;
+
 struct QwenGpuWeightRegion {
   const void* host_data{nullptr};
   void* device_data{nullptr};
@@ -68,6 +70,7 @@ public:
 
   hipStream_t stream{nullptr};
   hipblasHandle_t hipblas_handle{nullptr};
+  std::unique_ptr<HipblasLtGemm> hipblaslt_gemm;
   void* d_scratch_bf16{nullptr};
 
   [[nodiscard]] std::uint32_t GetMaxBatch() const noexcept {
@@ -122,6 +125,13 @@ public:
   /// ID.
   [[nodiscard]] tokenization::TokenId ForwardPromptBatch(
       std::span<const tokenization::TokenId> prompt_tokens);
+
+  /// Copies the logits produced by the most recent forward pass to host memory.
+  [[nodiscard]] std::span<const float> CopyLastLogits();
+
+  [[nodiscard]] std::uint32_t GetMaxPromptBatch() const noexcept {
+    return arena_.GetMaxBatch();
+  }
 
   /// Resets GPU cache and recurrent states in the arena.
   void Reset() noexcept { arena_.Reset(); }

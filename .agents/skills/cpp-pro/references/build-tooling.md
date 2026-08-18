@@ -349,6 +349,34 @@ BENCHMARK_MAIN();
 ```
 
 ```bash
+# Profile Strix Halo HIP kernels with the repository-pinned profiler.
+nix develop -c rocprofv3 \
+  --output-directory /tmp/strix-rocprof \
+  --output-format csv \
+  --kernel-trace \
+  --stats \
+  --summary \
+  --summary-units msec \
+  -- ./result/bin/strix-bench \
+    --model /path/to/model.gguf \
+    --n-prompt 512 \
+    --n-gen 0 \
+    --repetitions 1
+
+# Add this when private-memory traffic or register pressure is suspected.
+nix develop -c rocprofv3 \
+  --output-directory /tmp/strix-rocprof-scratch \
+  --output-format csv \
+  --kernel-trace \
+  --scratch-memory-trace \
+  --stats \
+  --summary \
+  -- ./result/bin/strix-bench \
+    --model /path/to/model.gguf \
+    --n-prompt 512 \
+    --n-gen 0 \
+    --repetitions 1
+
 # Profiling with perf (Linux)
 perf record -g ./myapp
 perf report
@@ -364,6 +392,14 @@ kcachegrind callgrind.out.*
 valgrind --tool=massif ./myapp
 ms_print massif.out.*
 ```
+
+For Strix Halo work, use `nix develop -c rocprofv3`; do not depend on a
+globally installed ROCm profiler. Keep traces bounded to one warmed repetition
+and write raw CSV output under `/tmp` or an ignored artifact directory.
+Profile to identify the dominant cost, then benchmark without profiler
+instrumentation because tracing distorts wall time. Retain a HIP optimization
+only after the relevant kernel/oracle tests, full-logit comparison, and
+unprofiled end-to-end benchmark pass.
 
 ## Conan Package Manager
 
@@ -494,4 +530,5 @@ jobs:
 | Catch2 | Unit testing | `TEST_CASE("name") { REQUIRE(...); }` |
 | GoogleTest | Unit testing | `TEST(Suite, Name) { EXPECT_EQ(...); }` |
 | Google Benchmark | Performance | `BENCHMARK(func)->Range(...)` |
+| rocprofv3 | ROCm kernel and scratch profiling | `nix develop -c rocprofv3` |
 | Valgrind | Memory profiler | `valgrind --tool=memcheck ./app` |

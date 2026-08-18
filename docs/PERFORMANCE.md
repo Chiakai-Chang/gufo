@@ -1,6 +1,6 @@
 # Strix Halo Performance Engineering
 
-Status: design draft, 2026-08-11
+Status: design draft, 2026-08-18
 
 ## Purpose
 
@@ -391,6 +391,83 @@ Use:
 
 Profiler collection must not run inside the default production path. Markers
 and bounded counters remain available in release builds.
+
+### HIP profiling with rocprofv3
+
+The repository dev shell provides the pinned `rocprofv3` from
+`rocmPackages.rocprofiler-sdk`. Do not use a globally installed ROCm profiler:
+
+```sh
+nix develop -c rocprofv3 --version
+```
+
+Build the production binary first, then collect one bounded trace into `/tmp`.
+`strix-bench` performs its own warmup before the measured repetition:
+
+```sh
+git add .
+nix build
+
+MODEL=/path/to/model.gguf
+OUT=/tmp/strix-rocprof
+
+nix develop -c rocprofv3 \
+  --output-directory "$OUT" \
+  --output-format csv \
+  --kernel-trace \
+  --stats \
+  --summary \
+  --summary-units msec \
+  -- ./result/bin/strix-bench \
+    --model "$MODEL" \
+    --n-prompt 512 \
+    --n-gen 0 \
+    --repetitions 1
+```
+
+Use the summary to rank kernel families by total device time. Inspect the
+kernel-dispatch CSV for launch count, grid and workgroup dimensions, and
+per-dispatch duration. After identifying a kernel family, narrow later traces
+with `--kernel-include-regex` instead of repeatedly tracing the entire model.
+
+Add scratch tracing when investigating register pressure or unexpected private
+memory traffic:
+
+```sh
+nix develop -c rocprofv3 \
+  --output-directory /tmp/strix-rocprof-scratch \
+  --output-format csv \
+  --kernel-trace \
+  --scratch-memory-trace \
+  --stats \
+  --summary \
+  --summary-units msec \
+  -- ./result/bin/strix-bench \
+    --model "$MODEL" \
+    --n-prompt 512 \
+    --n-gen 0 \
+    --repetitions 1
+```
+
+Use `--runtime-trace` only when launch, synchronization, allocation, or memory
+copy overhead is the suspected bottleneck. It collects substantially more
+data than a kernel-only trace.
+
+Profiler instrumentation changes wall-clock timing. Use traces to attribute
+cost, then measure final throughput without `rocprofv3`, with the same model,
+tokens, warmup, repetitions, power mode, and competing system load. Compare
+baseline and candidate in alternating order where practical.
+
+Raw profiler output can be large and machine-specific. Keep it under `/tmp` or
+another ignored artifact directory; do not commit it. Retain the following in
+the model benchmark record:
+
+- Exact profiler command and ROCm version.
+- Workload shape and repetition count.
+- Dominant kernel families and percentages.
+- Relevant VGPR, LDS, scratch, launch-count, or copy findings.
+- Before/after unprofiled throughput.
+- Numerical and state validation used to accept the change.
 
 ## Promotion Gates
 

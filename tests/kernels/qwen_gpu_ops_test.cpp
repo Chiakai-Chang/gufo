@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -274,6 +275,57 @@ void TestHipblasGEMM() {
   HIPBLAS_CHECK(hipblasDestroy(handle));
 }
 
+void TestHipblasLtGEMM() {
+  constexpr std::size_t batch = 32;
+  constexpr std::size_t m = 256;
+  constexpr std::size_t k = 64;
+
+  std::vector<std::uint16_t> h_a(m * k, FloatToBf16Bits(1.5F));
+  std::vector<std::uint16_t> h_x(batch * k);
+  for (std::size_t b = 0; b < batch; ++b) {
+    const auto value = FloatToBf16Bits(static_cast<float>(b + 1));
+    std::fill_n(h_x.begin() + static_cast<std::ptrdiff_t>(b * k), k, value);
+  }
+  std::vector<float> h_y(batch * m, 0.0F);
+
+  void* d_a = nullptr;
+  void* d_x = nullptr;
+  float* d_y = nullptr;
+  HIP_CHECK(hipMalloc(&d_a, h_a.size() * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_x, h_x.size() * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_y, h_y.size() * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_a, h_a.data(), h_a.size() * sizeof(std::uint16_t),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_x, h_x.data(), h_x.size() * sizeof(std::uint16_t),
+                      hipMemcpyHostToDevice));
+
+  strix::hip::HipblasLtGemm gemm;
+  if (!gemm.RunBf16(d_a, d_x, d_y, batch, m, k)) {
+    std::cerr << "hipBLASLt did not return a supported BF16 GEMM plan\n";
+    std::abort();
+  }
+  HIP_CHECK(hipDeviceSynchronize());
+  HIP_CHECK(hipMemcpy(h_y.data(), d_y, h_y.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  for (std::size_t b = 0; b < batch; ++b) {
+    const float expected =
+        static_cast<float>(b + 1) * 1.5F * static_cast<float>(k);
+    for (std::size_t row = 0; row < m; ++row) {
+      if (std::abs(h_y[b * m + row] - expected) >= 1e-2F) {
+        std::cerr << "hipBLASLt mismatch at batch=" << b << " row=" << row
+                  << " got=" << h_y[b * m + row] << " expected=" << expected
+                  << '\n';
+        std::abort();
+      }
+    }
+  }
+
+  HIP_CHECK(hipFree(d_y));
+  HIP_CHECK(hipFree(d_x));
+  HIP_CHECK(hipFree(d_a));
+}
+
 void TestBatchedSSMConvEquivalence() {
   constexpr std::size_t batch = 4;
   constexpr std::uint32_t num_key_heads = 16;
@@ -374,7 +426,10 @@ void TestBatchedSSMConvEquivalence() {
       max_diff = d;
   }
   std::cout << "DeltaNet Seq vs Batch max diff: " << max_diff << "\n";
-  assert(max_diff < 1e-4F);
+  if (max_diff >= 1e-4F) {
+    std::cerr << "DeltaNet batched recurrence mismatch\n";
+    std::abort();
+  }
 
   HIP_CHECK(hipFree(d_qkv));
   HIP_CHECK(hipFree(d_w));
@@ -798,6 +853,7 @@ int main() {
   TestGpuGEMV();
   TestBatchedGEMM();
   TestHipblasGEMM();
+  TestHipblasLtGEMM();
   TestBatchedSSMConvEquivalence();
   TestBatchedAttentionEquivalence();
   TestBatchedFusedProjectionsEquivalence();

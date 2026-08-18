@@ -52,6 +52,7 @@ stdenv.mkDerivation (finalAttrs: {
   buildInputs = lib.optionals rocmSupport [
     rocmPackages.clr
     rocmPackages.hipblas
+    rocmPackages.hipblaslt
     rocmPackages.rocblas
   ]
   ++ lib.optionals xrtSupport [

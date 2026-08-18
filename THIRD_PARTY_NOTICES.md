@@ -15,6 +15,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 | **xdna-driver** | Linked / Loaded | `Apache-2.0` | `4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305` | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
 | **ROCm / HIP** | Linked / Toolchain | `MIT OR Apache-2.0 WITH LLVM-exception` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/clr](https://github.com/ROCm/clr) |
 | **hipBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLAS](https://github.com/ROCm/hipBLAS) |
+| **hipBLASLt** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLASLt](https://github.com/ROCm/hipBLASLt) |
 | **rocBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocBLAS](https://github.com/ROCm/rocBLAS) |
 | **libuuid** | Linked | `BSD-3-Clause` / `LGPL-2.1-or-later` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [util-linux](https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git) |
 | **`amdxdna` Kernel Driver** | System (Kernel) | `GPL-2.0-only` | System Kernel (`amdxdna.ko`) | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
@@ -72,7 +73,18 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Linked (Dynamic library dependency)
 - **Corresponding-Source Location**: https://github.com/ROCm/hipBLAS (via Nix derivation `rocmPackages.hipblas`)
 
-### 1.5 rocBLAS
+### 1.5 hipBLASLt
+
+- **Component Name**: hipBLASLt (AMD ROCm Tunable BLAS Library)
+- **Upstream URL**: https://github.com/ROCm/hipBLASLt
+- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.hipblaslt`)
+- **Component Used**: Tuned BF16 matrix multiplication kernels and algorithm-selection interface for prompt processing
+- **SPDX License Identifier**: `MIT`
+- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+- **Relationship**: Linked (Dynamic library dependency)
+- **Corresponding-Source Location**: https://github.com/ROCm/hipBLASLt (via Nix derivation `rocmPackages.hipblaslt`)
+
+### 1.6 rocBLAS
 
 - **Component Name**: rocBLAS (AMD ROCm Basic Linear Algebra Subprograms)
 - **Upstream URL**: https://github.com/ROCm/rocBLAS
@@ -83,7 +95,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Linked (Dynamic library dependency)
 - **Corresponding-Source Location**: https://github.com/ROCm/rocBLAS (via Nix derivation `rocmPackages.rocblas`)
 
-### 1.6 libuuid (util-linux)
+### 1.7 libuuid (util-linux)
 
 - **Component Name**: libuuid (util-linux UUID library)
 - **Upstream URL**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git

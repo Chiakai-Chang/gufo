@@ -15,9 +15,9 @@ It must not depend on:
 - PyTorch, ATen, or Triton.
 - vLLM runtime components.
 
-Optional ROCm libraries such as hipBLASLt and rocBLAS may provide baselines or
-selected production algorithms, but model-critical paths may use custom HIP
-kernels.
+hipBLASLt provides selected production BF16 prefill algorithms, while rocBLAS
+provides baselines and fallback algorithms. Model-critical paths may still use
+custom HIP kernels where profiling demonstrates a benefit.
 
 ## Build
 

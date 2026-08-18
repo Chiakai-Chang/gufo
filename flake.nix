@@ -62,7 +62,7 @@
             inputsFrom = [ self.packages.${system}.default ];
             packages = [
               (pythonTools system)
-              pkgs.${system}.rocmPackages.rocprofiler
+              pkgs.${system}.rocmPackages.rocprofiler-sdk
             ];
             env = {
               ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";

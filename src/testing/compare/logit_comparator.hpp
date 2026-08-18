@@ -9,9 +9,16 @@ namespace strix::testing {
 
 struct LogitCompareResult {
   bool match{true};
+  bool finite{true};
+  bool top1_match{true};
   float max_abs_diff{0.0F};
   float max_rel_diff{0.0F};
+  float mean_abs_diff{0.0F};
+  float root_mean_square_error{0.0F};
+  float cosine_similarity{1.0F};
   std::size_t first_mismatch_idx{0};
+  std::size_t reference_argmax{0};
+  std::size_t candidate_argmax{0};
   std::string details;
 };
 

@@ -20,6 +20,7 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "xdna-driver",
     "ROCm / HIP",
     "hipBLAS",
+    "hipBLASLt",
     "rocBLAS",
     "libuuid",
 }

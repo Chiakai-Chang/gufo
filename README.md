@@ -30,6 +30,7 @@ See:
 
 - [Project status and decisions](docs/PROJECT_STATUS.md)
 - [Implementation roadmap](docs/ROADMAP.md)
+- [Performance engineering and profiling](docs/PERFORMANCE.md)
 - [Offline tools](tools/README.md)
 - [Qwen3.5-0.8B benchmark](benchmarks/qwen3.5-0.8b/README.md)
 

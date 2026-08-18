@@ -184,6 +184,7 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   HIP_CHECK(hipStreamCreate(&stream));
   HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
   HIPBLAS_CHECK(hipblasSetStream(hipblas_handle, stream));
+  hipblaslt_gemm = std::make_unique<HipblasLtGemm>();
 
   const std::size_t hidden_size = config_.hidden_size;
   const std::size_t intermediate_size = config_.intermediate_size;
@@ -275,6 +276,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_prompt_tokens = other.d_prompt_tokens;
   stream = other.stream;
   hipblas_handle = other.hipblas_handle;
+  hipblaslt_gemm = std::move(other.hipblaslt_gemm);
   d_scratch_bf16 = other.d_scratch_bf16;
 
   other.d_hidden = nullptr;
@@ -332,6 +334,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_prompt_tokens = other.d_prompt_tokens;
     stream = other.stream;
     hipblas_handle = other.hipblas_handle;
+    hipblaslt_gemm = std::move(other.hipblaslt_gemm);
     d_scratch_bf16 = other.d_scratch_bf16;
 
     other.d_hidden = nullptr;
@@ -434,6 +437,7 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_scratch_bf16));
   if (hipblas_handle != nullptr)
     HIPBLAS_CHECK(hipblasDestroy(hipblas_handle));
+  hipblaslt_gemm.reset();
   if (stream != nullptr)
     HIP_CHECK(hipStreamDestroy(stream));
 
@@ -746,6 +750,20 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   double time_attn_proj = 0, time_ssm_recur = 0, time_ssm_out = 0;
   double time_ffn = 0, time_norm = 0;
 
+  constexpr std::size_t hipblaslt_min_dimension = 1024;
+  const auto launch_bf16_gemm = [&](const void* weights, const void* input,
+                                    float* output, std::size_t m,
+                                    std::size_t k) {
+    const bool use_hipblaslt =
+        m >= hipblaslt_min_dimension && k >= hipblaslt_min_dimension &&
+        arena_.hipblaslt_gemm->RunBf16(weights, input, output, batch_size, m, k,
+                                       arena_.stream);
+    if (!use_hipblaslt) {
+      LaunchHipblasGEMMBF16(arena_.hipblas_handle, weights, input, output,
+                            batch_size, m, k, arena_.stream);
+    }
+  };
+
   // 3. Layer stack across all 32 layers
   for (std::uint32_t l = 0; l < config.num_layers; ++l) {
     const auto& layer = weights_.layers[l];
@@ -775,10 +793,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       const bool o_bf16 = layer.attn_output.type == core::GgmlType::kBF16;
 
       if (q_bf16) {
-        LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_q.data,
-                              arena_.d_scratch_bf16, arena_.d_ssm_qkv,
-                              batch_size, q_projection_size, hidden_size,
-                              arena_.stream);
+        launch_bf16_gemm(layer.attn_q.data, arena_.d_scratch_bf16,
+                         arena_.d_ssm_qkv, q_projection_size, hidden_size);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_q.data, false,
                           arena_.d_normed, arena_.d_ssm_qkv, batch_size,
@@ -787,9 +803,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       }
 
       if (k_bf16) {
-        LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_k.data,
-                              arena_.d_scratch_bf16, arena_.d_k, batch_size,
-                              kv_size, hidden_size, arena_.stream);
+        launch_bf16_gemm(layer.attn_k.data, arena_.d_scratch_bf16, arena_.d_k,
+                         kv_size, hidden_size);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_k.data, false,
                           arena_.d_normed, arena_.d_k, batch_size, kv_size,
@@ -797,9 +812,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       }
 
       if (v_bf16) {
-        LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_v.data,
-                              arena_.d_scratch_bf16, arena_.d_v, batch_size,
-                              kv_size, hidden_size, arena_.stream);
+        launch_bf16_gemm(layer.attn_v.data, arena_.d_scratch_bf16, arena_.d_v,
+                         kv_size, hidden_size);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_v.data, false,
                           arena_.d_normed, arena_.d_v, batch_size, kv_size,
@@ -842,10 +856,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       if (o_bf16) {
         LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
                               batch_size * attention_size, arena_.stream);
-        LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_output.data,
-                              arena_.d_scratch_bf16, arena_.d_attn_out,
-                              batch_size, hidden_size, attention_size,
-                              arena_.stream);
+        launch_bf16_gemm(layer.attn_output.data, arena_.d_scratch_bf16,
+                         arena_.d_attn_out, hidden_size, attention_size);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_output.data, false,
                           arena_.d_ssm_out, arena_.d_attn_out, batch_size,
@@ -867,10 +879,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       const bool out_bf16 = layer.ssm_out.type == core::GgmlType::kBF16;
 
       if (qkv_bf16) {
-        LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_qkv.data,
-                              arena_.d_scratch_bf16, arena_.d_ssm_qkv,
-                              batch_size, ssm_qkv_size, hidden_size,
-                              arena_.stream);
+        launch_bf16_gemm(layer.attn_qkv.data, arena_.d_scratch_bf16,
+                         arena_.d_ssm_qkv, ssm_qkv_size, hidden_size);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_qkv.data, false,
                           arena_.d_normed, arena_.d_ssm_qkv, batch_size,
@@ -879,10 +889,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       }
 
       if (gate_bf16) {
-        LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.attn_gate.data,
-                              arena_.d_scratch_bf16, arena_.d_ssm_gate,
-                              batch_size, ssm_inner_size, hidden_size,
-                              arena_.stream);
+        launch_bf16_gemm(layer.attn_gate.data, arena_.d_scratch_bf16,
+                         arena_.d_ssm_gate, ssm_inner_size, hidden_size);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.attn_gate.data, false,
                           arena_.d_normed, arena_.d_ssm_gate, batch_size,
@@ -943,10 +951,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
       if (out_bf16) {
         LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
                               batch_size * ssm_inner_size, arena_.stream);
-        LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.ssm_out.data,
-                              arena_.d_scratch_bf16, arena_.d_attn_out,
-                              batch_size, hidden_size, ssm_inner_size,
-                              arena_.stream);
+        launch_bf16_gemm(layer.ssm_out.data, arena_.d_scratch_bf16,
+                         arena_.d_attn_out, hidden_size, ssm_inner_size);
       } else {
         LaunchHipblasGEMM(arena_.hipblas_handle, layer.ssm_out.data, false,
                           arena_.d_ssm_out, arena_.d_attn_out, batch_size,
@@ -977,10 +983,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
     const bool ffn_d_bf16 = layer.ffn_down.type == core::GgmlType::kBF16;
 
     if (ffn_g_bf16) {
-      LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.ffn_gate.data,
-                            arena_.d_scratch_bf16, arena_.d_ffn_gate,
-                            batch_size, intermediate_size, hidden_size,
-                            arena_.stream);
+      launch_bf16_gemm(layer.ffn_gate.data, arena_.d_scratch_bf16,
+                       arena_.d_ffn_gate, intermediate_size, hidden_size);
     } else {
       LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate.data, false,
                         arena_.d_normed, arena_.d_ffn_gate, batch_size,
@@ -989,9 +993,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
     }
 
     if (ffn_u_bf16) {
-      LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.ffn_up.data,
-                            arena_.d_scratch_bf16, arena_.d_ffn_up, batch_size,
-                            intermediate_size, hidden_size, arena_.stream);
+      launch_bf16_gemm(layer.ffn_up.data, arena_.d_scratch_bf16,
+                       arena_.d_ffn_up, intermediate_size, hidden_size);
     } else {
       LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_up.data, false,
                         arena_.d_normed, arena_.d_ffn_up, batch_size,
@@ -1004,9 +1007,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
         arena_.d_scratch_bf16, batch_size * intermediate_size, arena_.stream);
 
     if (ffn_d_bf16) {
-      LaunchHipblasGEMMBF16(arena_.hipblas_handle, layer.ffn_down.data,
-                            arena_.d_scratch_bf16, arena_.d_ffn_out, batch_size,
-                            hidden_size, intermediate_size, arena_.stream);
+      launch_bf16_gemm(layer.ffn_down.data, arena_.d_scratch_bf16,
+                       arena_.d_ffn_out, hidden_size, intermediate_size);
     } else {
       LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_down.data, false,
                         arena_.d_ffn_act, arena_.d_ffn_out, batch_size,
@@ -1060,6 +1062,14 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
 
   return next_token_id;
+}
+
+std::span<const float> QwenGpuExecutor::CopyLastLogits() {
+  HIP_CHECK(hipMemcpyAsync(h_logits_.data(), arena_.d_logits,
+                           h_logits_.size() * sizeof(float),
+                           hipMemcpyDeviceToHost, arena_.stream));
+  HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  return h_logits_;
 }
 
 std::vector<tokenization::TokenId> QwenGpuExecutor::Generate(

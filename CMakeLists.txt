@@ -32,6 +32,7 @@ if (ENGINE_ENABLE_HIP)
   enable_language(HIP)
   find_package(hip REQUIRED)
   find_package(hipblas REQUIRED)
+  find_package(hipblaslt REQUIRED)
   find_package(rocblas REQUIRED)
 
   message(STATUS "strix: ROCm/HIP enabled, architectures=${CMAKE_HIP_ARCHITECTURES}")
@@ -135,7 +136,8 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_executor.cpp
   )
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
-  target_link_libraries(strix_core PUBLIC hip::host roc::hipblas roc::rocblas)
+  target_link_libraries(strix_core PUBLIC hip::host roc::hipblas
+    roc::hipblaslt roc::rocblas)
 endif()
 
 add_executable(strix-server
@@ -278,4 +280,3 @@ endif()
 
 # Static analysis and formatting targets
 include(cmake/StaticAnalysis.cmake)
-
