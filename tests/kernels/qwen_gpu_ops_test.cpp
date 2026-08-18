@@ -4,8 +4,8 @@
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
-#include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_runtime.h>
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
@@ -21,13 +21,16 @@ void TestGpuRMSNorm() {
   HIP_CHECK(hipMalloc(&d_w, dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_out, dim * sizeof(float)));
 
-  HIP_CHECK(hipMemcpy(d_x, h_x.data(), dim * sizeof(float), hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_w, h_w.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_x, h_x.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_w, h_w.data(), dim * sizeof(float), hipMemcpyHostToDevice));
 
   strix::hip::LaunchRMSNorm(d_x, d_w, d_out, dim, 1e-6F);
   HIP_CHECK(hipDeviceSynchronize());
 
-  HIP_CHECK(hipMemcpy(h_out.data(), d_out, dim * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(h_out.data(), d_out, dim * sizeof(float),
+                      hipMemcpyDeviceToHost));
 
   // mean(x^2) = 1.0, rms = 1.0, out = (1.0 / 1.0) * 2.0 = 2.0
   for (std::size_t i = 0; i < dim; ++i) {
@@ -50,13 +53,16 @@ void TestGpuResidualAdd() {
   HIP_CHECK(hipMalloc(&d_b, dim * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_out, dim * sizeof(float)));
 
-  HIP_CHECK(hipMemcpy(d_a, h_a.data(), dim * sizeof(float), hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_b, h_b.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_a, h_a.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_b, h_b.data(), dim * sizeof(float), hipMemcpyHostToDevice));
 
   strix::hip::LaunchResidualAdd(d_a, d_b, d_out, dim);
   HIP_CHECK(hipDeviceSynchronize());
 
-  HIP_CHECK(hipMemcpy(h_out.data(), d_out, dim * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(h_out.data(), d_out, dim * sizeof(float),
+                      hipMemcpyDeviceToHost));
 
   for (std::size_t i = 0; i < dim; ++i) {
     assert(std::abs(h_out[i] - 5.0F) < 1e-5F);
@@ -79,13 +85,16 @@ void TestGpuGEMV() {
   HIP_CHECK(hipMalloc(&d_x, K * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_y, M * sizeof(float)));
 
-  HIP_CHECK(hipMemcpy(d_A, h_A.data(), M * K * sizeof(float), hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_A, h_A.data(), M * K * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
 
   strix::hip::LaunchGEMV(d_A, false, d_x, d_y, M, K);
   HIP_CHECK(hipDeviceSynchronize());
 
-  HIP_CHECK(hipMemcpy(h_y.data(), d_y, M * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(
+      hipMemcpy(h_y.data(), d_y, M * sizeof(float), hipMemcpyDeviceToHost));
 
   // Each row has K=8 ones * 2.0 = 16.0
   for (std::size_t m = 0; m < M; ++m) {

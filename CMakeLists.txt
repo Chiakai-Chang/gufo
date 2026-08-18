@@ -251,6 +251,7 @@ if (BUILD_TESTING)
     target_link_libraries(gfx1151_acceptance_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME gfx1151_acceptance_test COMMAND gfx1151_acceptance_test)
     set_tests_properties(gfx1151_acceptance_test PROPERTIES LABELS "hip;gpu;benchmarks")
+
   endif()
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)

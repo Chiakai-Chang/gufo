@@ -15,6 +15,7 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
+
 #include "src/core/hip/qwen_gpu_executor.hpp"
 #endif
 
@@ -143,6 +144,11 @@ std::optional<PromptOptions> ParsePromptOptions(
       continue;
     }
 
+    if (arg == "--cpu") {
+      opt.force_cpu = true;
+      continue;
+    }
+
     if (!arg.empty() && arg[0] != '-') {
       if (!opt.prompt_text.empty()) {
         opt.prompt_text += " ";
@@ -212,7 +218,8 @@ int RunPrompt(std::span<const char* const> args) {
 
 #if defined(ENGINE_ENABLE_HIP)
   int dev_count = 0;
-  if (hipGetDeviceCount(&dev_count) == hipSuccess && dev_count > 0) {
+  if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
+      dev_count > 0) {
     auto gpu_exec = strix::hip::QwenGpuExecutor::CreateFromGguf(*reader, &err);
     if (gpu_exec) {
       const auto prompt_tokens =
@@ -221,7 +228,8 @@ int RunPrompt(std::span<const char* const> args) {
       if (opt.verbose) {
         const auto& config = gpu_exec->GetConfig();
         std::cout << "[Engine]: AMD Strix Halo gfx1151 GPU Executor\n"
-                  << "Model: " << config.architecture << " (" << config.num_layers
+                  << "Model: " << config.architecture << " ("
+                  << config.num_layers
                   << " layers, hidden=" << config.hidden_size
                   << ", heads=" << config.num_attention_heads << ")\n"
                   << "Prompt tokens: " << prompt_tokens.size() << "\n"

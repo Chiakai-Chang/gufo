@@ -6,6 +6,7 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
+
 #include "src/core/hip/hip_utils.hpp"
 #endif
 
@@ -31,7 +32,8 @@ void TestHardwareAcceptanceAccounting() {
     HIP_CHECK(hipGetDeviceProperties(&prop, 0));
     std::cout << "[Acceptance Baseline]: Device=" << prop.name
               << " GCNArch=" << prop.gcnArchName
-              << " GlobalMem=" << (prop.totalGlobalMem / (1024 * 1024)) << " MB\n";
+              << " GlobalMem=" << (prop.totalGlobalMem / (1024 * 1024))
+              << " MB\n";
   }
 #endif
 }

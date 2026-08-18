@@ -172,12 +172,12 @@ void ForwardAttention(std::span<const float> q, std::span<const float> k,
     }
   }
 
-  // Attention gating
+  // Attention gating (Sigmoid gating for Qwen 3.5 full attention)
   if (!gate.empty() && gate.size() >= context.size()) {
     for (std::size_t i = 0; i < context.size(); ++i) {
       const float g = gate[i];
       const float sig = 1.0F / (1.0F + std::exp(-g));
-      context[i] *= (g * sig);
+      context[i] *= sig;
     }
   }
 
@@ -185,7 +185,8 @@ void ForwardAttention(std::span<const float> q, std::span<const float> k,
   if (!o_weight.empty()) {
     TensorGEMV(o_weight, context, hidden_size, ctx_dim, attn_out);
   } else {
-    std::copy_n(context.data(), std::min(hidden_size, ctx_dim), attn_out.data());
+    std::copy_n(context.data(), std::min(hidden_size, ctx_dim),
+                attn_out.data());
   }
 }
 
@@ -235,9 +236,18 @@ void ForwardLayer(std::span<float> hidden, const QwenLayerWeights& layer,
       if (layer.attn_q.num_elements == 8192 * hidden_size) {
         TensorGEMV(layer.attn_q, arena.normed, 8192, hidden_size,
                    arena.ssm_qkv);
-        std::ranges::copy(arena.ssm_qkv.subspan(0, q_size), arena.q.begin());
-        std::ranges::copy(arena.ssm_qkv.subspan(q_size, q_size),
-                          arena.ssm_gate.begin());
+        for (std::uint32_t h = 0; h < config.num_attention_heads; ++h) {
+          const auto q_src = arena.ssm_qkv.subspan(
+              static_cast<std::size_t>(h) * 512, head_dim);
+          const auto g_src = arena.ssm_qkv.subspan(
+              static_cast<std::size_t>(h) * 512 + head_dim, head_dim);
+          std::ranges::copy(
+              q_src,
+              arena.q.begin() + (static_cast<std::size_t>(h) * head_dim));
+          std::ranges::copy(g_src,
+                            arena.ssm_gate.begin() +
+                                (static_cast<std::size_t>(h) * head_dim));
+        }
       } else {
         TensorGEMV(layer.attn_q, arena.normed, q_size, hidden_size, arena.q);
         std::ranges::fill(arena.ssm_gate, 0.0F);

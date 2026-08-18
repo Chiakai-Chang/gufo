@@ -8,9 +8,9 @@
 void TestQwenSsmConvRecurrence() {
   const std::uint32_t num_layers = 1;
   const std::size_t conv_channels = 8192;
-  const std::uint32_t num_heads = 16;
+  const std::uint32_t num_heads = 32;
   const std::uint32_t key_dim = 128;
-  const std::uint32_t val_dim = 256;
+  const std::uint32_t val_dim = 128;
 
   strix::models::QwenSsmCache cache(num_layers, conv_channels, num_heads,
                                     key_dim, val_dim);

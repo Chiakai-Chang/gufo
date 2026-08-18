@@ -15,7 +15,7 @@ QwenGenerator::QwenGenerator(
       tokenizer_(std::move(tokenizer)),
       kv_cache_(weights_.config.num_layers, weights_.config.num_key_value_heads,
                 max_context, weights_.config.head_dim),
-      ssm_cache_(weights_.config.num_layers, 8192, 16, 128, 256),
+      ssm_cache_(weights_.config.num_layers, 8192, 32, 128, 128),
       arena_(weights_.config) {}
 
 std::unique_ptr<QwenGenerator> QwenGenerator::CreateFromGguf(
@@ -28,8 +28,8 @@ std::unique_ptr<QwenGenerator> QwenGenerator::CreateFromGguf(
   auto tokenizer =
       tokenization::QwenTokenizer::CreateFromGguf(reader, error_msg);
   if (!tokenizer || tokenizer->GetVocabSize() <= 256) {
-    auto bin_tok =
-        tokenization::QwenTokenizer::CreateFromBinaryFile("models/qwen_vocab.bin");
+    auto bin_tok = tokenization::QwenTokenizer::CreateFromBinaryFile(
+        "models/qwen_vocab.bin");
     if (bin_tok) {
       tokenizer = std::move(bin_tok);
     } else if (!tokenizer) {

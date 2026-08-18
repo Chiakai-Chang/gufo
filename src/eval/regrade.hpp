@@ -12,8 +12,10 @@ struct RegradeSummary {
   double pass_rate{0.0};
 };
 
-/// Regrades a captured evaluation trace without loading any model weights or initializing hardware.
-[[nodiscard]] RegradeSummary RegradeTrace(const EvalTraceReport& report) noexcept;
+/// Regrades a captured evaluation trace without loading any model weights or
+/// initializing hardware.
+[[nodiscard]] RegradeSummary RegradeTrace(
+    const EvalTraceReport& report) noexcept;
 
 }  // namespace strix::eval
 

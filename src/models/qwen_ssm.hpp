@@ -51,10 +51,8 @@ private:
 /// 5. Readout: o = S^T * q
 /// 6. Gated activation: y = RMSNorm(o) * SiLU(gate)
 /// 7. Linear output projection to out
-void ForwardSSM(std::span<const float> x_normed,
-                const QwenLayerWeights& layer,
-                QwenSsmCache& ssm_cache,
-                std::uint32_t layer_idx,
+void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
+                QwenSsmCache& ssm_cache, std::uint32_t layer_idx,
                 std::span<float> ssm_qkv_scratch,
                 std::span<float> ssm_gate_scratch,
                 std::span<float> ssm_out_scratch,

@@ -15,7 +15,8 @@ struct LogitCompareResult {
   std::string details;
 };
 
-/// Compares candidate logits against reference logits with specified atol and rtol tolerances.
+/// Compares candidate logits against reference logits with specified atol and
+/// rtol tolerances.
 LogitCompareResult CompareLogits(std::span<const float> reference,
                                  std::span<const float> candidate,
                                  float atol = 1e-3F, float rtol = 1e-3F);

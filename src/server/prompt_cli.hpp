@@ -20,6 +20,7 @@ struct PromptOptions {
   float temperature = 0.0F;
   bool use_chat_template = true;
   bool verbose = false;
+  bool force_cpu = false;
 };
 
 /// Parses command line options for `strix-server prompt`.

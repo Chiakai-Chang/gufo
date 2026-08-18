@@ -12,10 +12,8 @@
 
 namespace strix::models {
 
-QwenSsmCache::QwenSsmCache(std::uint32_t num_layers,
-                           std::size_t conv_channels,
-                           std::uint32_t num_heads,
-                           std::uint32_t key_dim,
+QwenSsmCache::QwenSsmCache(std::uint32_t num_layers, std::size_t conv_channels,
+                           std::uint32_t num_heads, std::uint32_t key_dim,
                            std::uint32_t val_dim)
     : num_layers_(num_layers),
       conv_channels_(conv_channels),
@@ -24,8 +22,8 @@ QwenSsmCache::QwenSsmCache(std::uint32_t num_layers,
       val_dim_(val_dim) {
   const std::size_t total_conv =
       static_cast<std::size_t>(num_layers_) * conv_channels_ * 4;
-  const std::size_t total_deltanet = static_cast<std::size_t>(num_layers_) *
-                                     num_heads_ * key_dim_ * val_dim_;
+  const std::size_t total_deltanet =
+      static_cast<std::size_t>(num_layers_) * num_heads_ * key_dim_ * val_dim_;
   conv_states_.resize(total_conv, 0.0F);
   deltanet_states_.resize(total_deltanet, 0.0F);
 }
@@ -62,10 +60,8 @@ namespace {
 
 }  // namespace
 
-void ForwardSSM(std::span<const float> x_normed,
-                const QwenLayerWeights& layer,
-                QwenSsmCache& ssm_cache,
-                std::uint32_t layer_idx,
+void ForwardSSM(std::span<const float> x_normed, const QwenLayerWeights& layer,
+                QwenSsmCache& ssm_cache, std::uint32_t layer_idx,
                 std::span<float> ssm_qkv_scratch,
                 std::span<float> ssm_gate_scratch,
                 std::span<float> ssm_out_scratch,
@@ -73,9 +69,10 @@ void ForwardSSM(std::span<const float> x_normed,
   const std::size_t hidden_size = x_normed.size();
   const std::size_t qkv_dim = 8192;
   const std::size_t gate_dim = 4096;
-  const std::uint32_t num_heads = ssm_cache.NumHeads();  // 16
-  const std::uint32_t key_dim = ssm_cache.KeyDim();      // 128
-  const std::uint32_t val_dim = ssm_cache.ValDim();      // 256
+  const std::uint32_t num_k_heads = 16;
+  const std::uint32_t num_v_heads = 32;
+  const std::uint32_t key_dim = 128;
+  const std::uint32_t val_dim = 128;
 
   // 1. QKV, Gate, Alpha, and Beta Projections
   if (!layer.attn_qkv.empty()) {
@@ -128,19 +125,21 @@ void ForwardSSM(std::span<const float> x_normed,
 
   // 3. Partition Q, K, V from conv_out
   const float* q_ptr = conv_out.data();
-  const float* k_ptr = conv_out.data() + (num_heads * key_dim);
-  const float* v_ptr = conv_out.data() + (num_heads * key_dim * 2);
+  const float* k_ptr = conv_out.data() + (num_k_heads * key_dim);
+  const float* v_ptr = conv_out.data() + (num_k_heads * key_dim * 2);
 
-  // 4. Per-Head Gated DeltaNet Matrix Recurrence
+  // 4. Per-Head Gated DeltaNet Matrix Recurrence (32 heads, 128x128 state each)
 #pragma omp parallel for schedule(static)
-  for (std::uint32_t h = 0; h < num_heads; ++h) {
+  for (std::uint32_t h = 0; h < num_v_heads; ++h) {
     auto s_matrix = ssm_cache.GetDeltaNetState(layer_idx, h);
-    const float* q_h = q_ptr + (h * key_dim);
-    const float* k_h = k_ptr + (h * key_dim);
+    const std::uint32_t kh_idx = h / 2;
+    const float* q_h = q_ptr + (kh_idx * key_dim);
+    const float* k_h = k_ptr + (kh_idx * key_dim);
     const float* v_h = v_ptr + (h * val_dim);
     float* o_h = ssm_out_scratch.data() + (h * val_dim);
 
-    // Compute decay alpha_h and learning rate beta_h
+    // Compute decay alpha_h = exp(ssm_a * softplus(alpha + ssm_dt)) and beta_h
+    // = sigmoid(beta)
     float dt = 0.0F;
     if (!layer.ssm_dt.empty()) {
       dt = layer.ssm_dt.Get(h % layer.ssm_dt.num_elements);
@@ -149,51 +148,58 @@ void ForwardSSM(std::span<const float> x_normed,
     if (!layer.ssm_a.empty()) {
       a_val = layer.ssm_a.Get(h % layer.ssm_a.num_elements);
     }
-    const float alpha_h = Sigmoid(alpha_buf[h] + dt) * std::exp(-std::abs(a_val));
+    const float alpha_biased = alpha_buf[h] + dt;
+    const float alpha_softplus = (alpha_biased > 20.0F)
+                                     ? alpha_biased
+                                     : std::log1p(std::exp(alpha_biased));
+    const float alpha_h = std::exp(alpha_softplus * a_val);
     const float beta_h = Sigmoid(beta_buf[h]);
 
-    // Normalize key k_h
+    // Normalize query q_h and key k_h, and scale query by 1/sqrt(key_dim)
+    float q_norm_sq = 0.0F;
     float k_norm_sq = 0.0F;
     for (std::uint32_t i = 0; i < key_dim; ++i) {
+      q_norm_sq += q_h[i] * q_h[i];
       k_norm_sq += k_h[i] * k_h[i];
     }
+    const float q_scale = (1.0F / std::sqrt(static_cast<float>(key_dim))) /
+                          std::sqrt(q_norm_sq + 1e-6F);
     const float inv_k_norm = 1.0F / std::sqrt(k_norm_sq + 1e-6F);
 
-    // Associative memory retrieval: u = S^T * k
-    std::vector<float> u_h(val_dim, 0.0F);
-    for (std::uint32_t i = 0; i < key_dim; ++i) {
-      const float k_val = k_h[i] * inv_k_norm;
-      const float* s_row = &s_matrix[i * val_dim];
-      for (std::uint32_t j = 0; j < val_dim; ++j) {
-        u_h[j] += s_row[j] * k_val;
-      }
+    // 1. Decay state: S = alpha * S
+    for (std::size_t idx = 0; idx < static_cast<std::size_t>(val_dim) * key_dim;
+         ++idx) {
+      s_matrix[idx] *= alpha_h;
     }
 
-    // Prediction error: error = v - u
-    std::vector<float> err_h(val_dim, 0.0F);
+    // 2. Associative retrieval: u_j = sum_i S[j, i] * (k[i] * inv_k_norm)
+    std::vector<float> d_h(val_dim, 0.0F);
     for (std::uint32_t j = 0; j < val_dim; ++j) {
-      err_h[j] = v_h[j] - u_h[j];
-    }
-
-    // Delta update: S = alpha * S + beta * (k * err^T)
-    for (std::uint32_t i = 0; i < key_dim; ++i) {
-      const float k_val = k_h[i] * inv_k_norm;
-      float* s_row = &s_matrix[i * val_dim];
-      for (std::uint32_t j = 0; j < val_dim; ++j) {
-        s_row[j] = (alpha_h * s_row[j]) + (beta_h * k_val * err_h[j]);
+      float u_j = 0.0F;
+      const float* s_row = &s_matrix[static_cast<std::size_t>(j) * key_dim];
+      for (std::uint32_t i = 0; i < key_dim; ++i) {
+        u_j += s_row[i] * (k_h[i] * inv_k_norm);
       }
+      d_h[j] = (v_h[j] - u_j) * beta_h;
     }
 
-    // Query readout: o = S^T * q
+    // 3. Delta update: S[j, i] += d[j] * (k[i] * inv_k_norm)
     for (std::uint32_t j = 0; j < val_dim; ++j) {
-      o_h[j] = 0.0F;
-    }
-    for (std::uint32_t i = 0; i < key_dim; ++i) {
-      const float q_val = q_h[i];
-      const float* s_row = &s_matrix[i * val_dim];
-      for (std::uint32_t j = 0; j < val_dim; ++j) {
-        o_h[j] += s_row[j] * q_val;
+      float* s_row = &s_matrix[static_cast<std::size_t>(j) * key_dim];
+      const float d_val = d_h[j];
+      for (std::uint32_t i = 0; i < key_dim; ++i) {
+        s_row[i] += d_val * (k_h[i] * inv_k_norm);
       }
+    }
+
+    // 4. Query readout: o_j = sum_i S[j, i] * (q[i] * q_scale)
+    for (std::uint32_t j = 0; j < val_dim; ++j) {
+      float o_j = 0.0F;
+      const float* s_row = &s_matrix[static_cast<std::size_t>(j) * key_dim];
+      for (std::uint32_t i = 0; i < key_dim; ++i) {
+        o_j += s_row[i] * (q_h[i] * q_scale);
+      }
+      o_h[j] = o_j;
     }
   }
 

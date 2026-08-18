@@ -3,19 +3,20 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
+
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
-#define HIP_CHECK(call)                                                      \
-  do {                                                                       \
-    hipError_t err = (call);                                                 \
-    if (err != hipSuccess) {                                                 \
-      std::string msg = std::string("HIP error in ") + __FILE__ + ":" +      \
-                        std::to_string(__LINE__) + " (" #call                \
-                        "): " + hipGetErrorString(err);                      \
-      std::cerr << msg << std::endl;                                         \
-    }                                                                        \
+#define HIP_CHECK(call)                                                 \
+  do {                                                                  \
+    hipError_t err = (call);                                            \
+    if (err != hipSuccess) {                                            \
+      std::string msg = std::string("HIP error in ") + __FILE__ + ":" + \
+                        std::to_string(__LINE__) +                      \
+                        " (" #call "): " + hipGetErrorString(err);      \
+      std::cerr << msg << std::endl;                                    \
+    }                                                                   \
   } while (0)
 
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -60,7 +60,10 @@
           # offline CPU flows and the --device cuda calibration forward.
           default = pkgs.${system}.mkShell {
             inputsFrom = [ self.packages.${system}.default ];
-            packages = [ (pythonTools system) ];
+            packages = [
+              (pythonTools system)
+              pkgs.${system}.rocmPackages.rocprofiler
+            ];
             env = {
               ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";
               XRT_PATH = "${strixPackages.${system}.xrt}/opt/xilinx/xrt";

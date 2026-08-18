@@ -43,8 +43,7 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   HIP_CHECK(hipMalloc(&d_logits, vocab_size * sizeof(float)));
 
   // 8 full-attention layers in Qwen 3.5
-  const std::size_t total_kv =
-      8 * num_kv_heads * max_context_ * head_dim;
+  const std::size_t total_kv = 8 * num_kv_heads * max_context_ * head_dim;
   HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
 
   const std::size_t total_conv = num_layers * 8192 * 4;
@@ -159,8 +158,7 @@ void QwenGpuArena::Reset() noexcept {
   const std::size_t num_layers = config_.num_layers;
   const std::size_t num_kv_heads = config_.num_key_value_heads;
   const std::size_t head_dim = config_.head_dim;
-  const std::size_t total_kv =
-      8 * num_kv_heads * max_context_ * head_dim * 2;
+  const std::size_t total_kv = 8 * num_kv_heads * max_context_ * head_dim * 2;
   const std::size_t total_conv = num_layers * 8192 * 4;
   const std::size_t total_deltanet = num_layers * 16 * 128 * 256;
 
@@ -178,26 +176,46 @@ void QwenGpuArena::Reset() noexcept {
 }
 
 void QwenGpuArena::FreeAll() noexcept {
-  if (d_hidden != nullptr) HIP_CHECK(hipFree(d_hidden));
-  if (d_normed != nullptr) HIP_CHECK(hipFree(d_normed));
-  if (d_q != nullptr) HIP_CHECK(hipFree(d_q));
-  if (d_k != nullptr) HIP_CHECK(hipFree(d_k));
-  if (d_v != nullptr) HIP_CHECK(hipFree(d_v));
-  if (d_attn_out != nullptr) HIP_CHECK(hipFree(d_attn_out));
-  if (d_ffn_gate != nullptr) HIP_CHECK(hipFree(d_ffn_gate));
-  if (d_ffn_up != nullptr) HIP_CHECK(hipFree(d_ffn_up));
-  if (d_ffn_act != nullptr) HIP_CHECK(hipFree(d_ffn_act));
-  if (d_ffn_out != nullptr) HIP_CHECK(hipFree(d_ffn_out));
-  if (d_ssm_qkv != nullptr) HIP_CHECK(hipFree(d_ssm_qkv));
-  if (d_ssm_gate != nullptr) HIP_CHECK(hipFree(d_ssm_gate));
-  if (d_ssm_out != nullptr) HIP_CHECK(hipFree(d_ssm_out));
-  if (d_alpha_buf != nullptr) HIP_CHECK(hipFree(d_alpha_buf));
-  if (d_beta_buf != nullptr) HIP_CHECK(hipFree(d_beta_buf));
-  if (d_logits != nullptr) HIP_CHECK(hipFree(d_logits));
-  if (d_kv_cache != nullptr) HIP_CHECK(hipFree(d_kv_cache));
-  if (d_ssm_conv_state != nullptr) HIP_CHECK(hipFree(d_ssm_conv_state));
-  if (d_ssm_deltanet_state != nullptr) HIP_CHECK(hipFree(d_ssm_deltanet_state));
-  if (stream != nullptr) HIP_CHECK(hipStreamDestroy(stream));
+  if (d_hidden != nullptr)
+    HIP_CHECK(hipFree(d_hidden));
+  if (d_normed != nullptr)
+    HIP_CHECK(hipFree(d_normed));
+  if (d_q != nullptr)
+    HIP_CHECK(hipFree(d_q));
+  if (d_k != nullptr)
+    HIP_CHECK(hipFree(d_k));
+  if (d_v != nullptr)
+    HIP_CHECK(hipFree(d_v));
+  if (d_attn_out != nullptr)
+    HIP_CHECK(hipFree(d_attn_out));
+  if (d_ffn_gate != nullptr)
+    HIP_CHECK(hipFree(d_ffn_gate));
+  if (d_ffn_up != nullptr)
+    HIP_CHECK(hipFree(d_ffn_up));
+  if (d_ffn_act != nullptr)
+    HIP_CHECK(hipFree(d_ffn_act));
+  if (d_ffn_out != nullptr)
+    HIP_CHECK(hipFree(d_ffn_out));
+  if (d_ssm_qkv != nullptr)
+    HIP_CHECK(hipFree(d_ssm_qkv));
+  if (d_ssm_gate != nullptr)
+    HIP_CHECK(hipFree(d_ssm_gate));
+  if (d_ssm_out != nullptr)
+    HIP_CHECK(hipFree(d_ssm_out));
+  if (d_alpha_buf != nullptr)
+    HIP_CHECK(hipFree(d_alpha_buf));
+  if (d_beta_buf != nullptr)
+    HIP_CHECK(hipFree(d_beta_buf));
+  if (d_logits != nullptr)
+    HIP_CHECK(hipFree(d_logits));
+  if (d_kv_cache != nullptr)
+    HIP_CHECK(hipFree(d_kv_cache));
+  if (d_ssm_conv_state != nullptr)
+    HIP_CHECK(hipFree(d_ssm_conv_state));
+  if (d_ssm_deltanet_state != nullptr)
+    HIP_CHECK(hipFree(d_ssm_deltanet_state));
+  if (stream != nullptr)
+    HIP_CHECK(hipStreamDestroy(stream));
 
   d_hidden = nullptr;
   d_normed = nullptr;
@@ -234,9 +252,9 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {
   void* dev_base_ptr = nullptr;
   if (reader.GetData() != nullptr && reader.GetSize() > 0) {
-    const auto reg_err = hipHostRegister(
-        const_cast<void*>(reader.GetData()), reader.GetSize(),
-        hipHostRegisterMapped | hipHostRegisterReadOnly);
+    const auto reg_err =
+        hipHostRegister(const_cast<void*>(reader.GetData()), reader.GetSize(),
+                        hipHostRegisterMapped | hipHostRegisterReadOnly);
     if (reg_err == hipSuccess) {
       HIP_CHECK(hipHostGetDevicePointer(
           &dev_base_ptr, const_cast<void*>(reader.GetData()), 0));
@@ -305,15 +323,14 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
 }
 
 tokenization::TokenId QwenGpuExecutor::ForwardToken(
-    tokenization::TokenId token_id, std::uint32_t pos) {
+    tokenization::TokenId token_id, std::uint32_t pos, bool compute_logits) {
   const auto& config = weights_.config;
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
   const std::size_t vocab_size = config.vocab_size;
 
   // 1. Embedding lookup
-  const bool embd_is_bf16 =
-      weights_.token_embd.type == core::GgmlType::kBF16;
+  const bool embd_is_bf16 = weights_.token_embd.type == core::GgmlType::kBF16;
   LaunchEmbeddingLookup(weights_.token_embd.data, embd_is_bf16, token_id,
                         arena_.d_hidden, hidden_size, arena_.stream);
 
@@ -340,33 +357,39 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
       LaunchGEMV(layer.attn_v.data, v_bf16, arena_.d_normed, arena_.d_v, 1024,
                  hidden_size, arena_.stream);
 
+      // De-interleave Q and Gate from attn_q projection
+      LaunchUnpackQG(arena_.d_ssm_qkv, arena_.d_q, arena_.d_ssm_gate,
+                     config.num_attention_heads, config.head_dim,
+                     arena_.stream);
+
       // QK-Norm
       if (!layer.attn_q_norm.empty()) {
-        LaunchRMSNorm(arena_.d_ssm_qkv,
-                      static_cast<const float*>(layer.attn_q_norm.data),
-                      arena_.d_q, 256, 1e-6F, arena_.stream);
+        LaunchPerHeadRMSNorm(arena_.d_q,
+                             static_cast<const float*>(layer.attn_q_norm.data),
+                             arena_.d_q, config.num_attention_heads,
+                             config.head_dim, 1e-6F, arena_.stream);
       }
       if (!layer.attn_k_norm.empty()) {
-        LaunchRMSNorm(arena_.d_k,
-                      static_cast<const float*>(layer.attn_k_norm.data),
-                      arena_.d_k, 256, 1e-6F, arena_.stream);
+        LaunchPerHeadRMSNorm(arena_.d_k,
+                             static_cast<const float*>(layer.attn_k_norm.data),
+                             arena_.d_k, config.num_key_value_heads,
+                             config.head_dim, 1e-6F, arena_.stream);
       }
 
       // RoPE
       LaunchRoPE(arena_.d_q, arena_.d_k, config.num_attention_heads,
-                 config.num_key_value_heads, config.head_dim,
-                 config.rotary_dim, pos, config.rope_theta, arena_.stream);
+                 config.num_key_value_heads, config.head_dim, config.rotary_dim,
+                 pos, config.rope_theta, arena_.stream);
 
       // Softmax Attention + Gating
       const std::size_t total_k =
           8 * config.num_key_value_heads * 4096 * config.head_dim;
       const std::uint32_t attn_layer_idx = l / 4;
-      LaunchAttention(arena_.d_q, arena_.d_k, arena_.d_v,
-                      arena_.d_ssm_qkv + 4096, arena_.d_kv_cache,
-                      arena_.d_kv_cache + total_k, arena_.d_ssm_out,
-                      attn_layer_idx, pos, 4096, config.num_attention_heads,
-                      config.num_key_value_heads, config.head_dim,
-                      arena_.stream);
+      LaunchAttention(arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+                      arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+                      arena_.d_ssm_out, attn_layer_idx, pos, 4096,
+                      config.num_attention_heads, config.num_key_value_heads,
+                      config.head_dim, arena_.stream);
 
       // Output projection
       LaunchGEMV(layer.attn_output.data, o_bf16, arena_.d_ssm_out,
@@ -382,6 +405,18 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
       LaunchGEMV(layer.attn_gate.data, gate_bf16, arena_.d_normed,
                  arena_.d_ssm_gate, 4096, hidden_size, arena_.stream);
 
+      if (!layer.ssm_alpha.empty()) {
+        LaunchGEMV(layer.ssm_alpha.data,
+                   layer.ssm_alpha.type == core::GgmlType::kBF16,
+                   arena_.d_normed, arena_.d_alpha_buf, 32, hidden_size,
+                   arena_.stream);
+      }
+      if (!layer.ssm_beta.empty()) {
+        LaunchGEMV(
+            layer.ssm_beta.data, layer.ssm_beta.type == core::GgmlType::kBF16,
+            arena_.d_normed, arena_.d_beta_buf, 32, hidden_size, arena_.stream);
+      }
+
       LaunchSSMConvRecurrence(
           arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
           arena_.d_ssm_conv_state, arena_.d_ssm_deltanet_state,
@@ -389,7 +424,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
           static_cast<const float*>(layer.ssm_a.data),
           static_cast<const float*>(layer.ssm_dt.data),
           static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
-          arena_.d_ssm_out, 16, 128, 256, arena_.stream);
+          arena_.d_ssm_out, l, 32, 128, 128, arena_.stream);
 
       LaunchGEMV(layer.ssm_out.data, out_bf16, arena_.d_ssm_out,
                  arena_.d_attn_out, hidden_size, 4096, arena_.stream);
@@ -404,28 +439,25 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                   static_cast<const float*>(layer.ffn_norm.data),
                   arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
 
-    // SwiGLU FFN
+    // Fused SwiGLU FFN
     const bool ffn_g_bf16 = layer.ffn_gate.type == core::GgmlType::kBF16;
     const bool ffn_u_bf16 = layer.ffn_up.type == core::GgmlType::kBF16;
     const bool ffn_d_bf16 = layer.ffn_down.type == core::GgmlType::kBF16;
 
-    LaunchGEMV(layer.ffn_gate.data, ffn_g_bf16, arena_.d_normed,
-               arena_.d_ffn_gate, intermediate_size, hidden_size,
-               arena_.stream);
-    LaunchGEMV(layer.ffn_up.data, ffn_u_bf16, arena_.d_normed,
-               arena_.d_ffn_up, intermediate_size, hidden_size,
-               arena_.stream);
-
-    LaunchSwiGLU(arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act,
-                 intermediate_size, arena_.stream);
+    LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, ffn_g_bf16, layer.ffn_up.data,
+                          ffn_u_bf16, arena_.d_normed, arena_.d_ffn_act,
+                          intermediate_size, hidden_size, arena_.stream);
 
     LaunchGEMV(layer.ffn_down.data, ffn_d_bf16, arena_.d_ffn_act,
-               arena_.d_ffn_out, hidden_size, intermediate_size,
-               arena_.stream);
+               arena_.d_ffn_out, hidden_size, intermediate_size, arena_.stream);
 
     // Residual Add
     LaunchResidualAdd(arena_.d_hidden, arena_.d_ffn_out, arena_.d_hidden,
                       hidden_size, arena_.stream);
+  }
+
+  if (!compute_logits) {
+    return 0;
   }
 
   // 3. Final Output Norm
@@ -438,13 +470,16 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   LaunchGEMV(weights_.output.data, out_bf16, arena_.d_normed, arena_.d_logits,
              vocab_size, hidden_size, arena_.stream);
 
-  // 5. Transfer logits to host and compute Greedy Argmax
-  HIP_CHECK(hipMemcpyAsync(h_logits_.data(), arena_.d_logits,
-                           vocab_size * sizeof(float), hipMemcpyDeviceToHost,
-                           arena_.stream));
+  // 5. Parallel GPU Argmax and 4-byte host transfer
+  auto* d_out_token = reinterpret_cast<std::uint32_t*>(arena_.d_alpha_buf);
+  LaunchGPUArgmax(arena_.d_logits, d_out_token, vocab_size, arena_.stream);
+
+  std::uint32_t next_token_id = 0;
+  HIP_CHECK(hipMemcpyAsync(&next_token_id, d_out_token, sizeof(std::uint32_t),
+                           hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
 
-  return models::GreedyArgmax(h_logits_);
+  return next_token_id;
 }
 
 std::vector<tokenization::TokenId> QwenGpuExecutor::Generate(
@@ -459,11 +494,13 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::Generate(
 
   arena_.Reset();
 
-  // 1. Prefill prompt tokens on GPU
+  // 1. Prefill prompt tokens on GPU (only compute logits on the final prompt
+  // token)
   tokenization::TokenId next_token = 0;
   for (std::size_t p = 0; p < prompt_tokens.size(); ++p) {
+    const bool is_last = (p + 1 == prompt_tokens.size());
     next_token =
-        ForwardToken(prompt_tokens[p], static_cast<std::uint32_t>(p));
+        ForwardToken(prompt_tokens[p], static_cast<std::uint32_t>(p), is_last);
   }
 
   std::size_t cur_pos = prompt_tokens.size();

@@ -91,7 +91,8 @@ public:
 
   /// Runs one single token forward step on GPU, returning next token ID.
   [[nodiscard]] tokenization::TokenId ForwardToken(
-      tokenization::TokenId token_id, std::uint32_t pos);
+      tokenization::TokenId token_id, std::uint32_t pos,
+      bool compute_logits = true);
 
 private:
   models::QwenModelWeights weights_;

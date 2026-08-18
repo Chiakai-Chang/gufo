@@ -41,11 +41,11 @@ void ReferenceRoPE(std::span<const float> head, std::size_t pos,
     const double cos_val = std::cos(angle);
     const double sin_val = std::sin(angle);
 
-    const auto v0 = static_cast<double>(head[2 * i]);
-    const auto v1 = static_cast<double>(head[(2 * i) + 1]);
+    const auto v0 = static_cast<double>(head[i]);
+    const auto v1 = static_cast<double>(head[i + half_dim]);
 
-    out[2 * i] = static_cast<float>((v0 * cos_val) - (v1 * sin_val));
-    out[(2 * i) + 1] = static_cast<float>((v0 * sin_val) + (v1 * cos_val));
+    out[i] = static_cast<float>((v0 * cos_val) - (v1 * sin_val));
+    out[i + half_dim] = static_cast<float>((v0 * sin_val) + (v1 * cos_val));
   }
 }
 

@@ -7,8 +7,8 @@
 namespace strix::testing {
 
 LogitCompareResult CompareLogits(std::span<const float> reference,
-                                 std::span<const float> candidate,
-                                 float atol, float rtol) {
+                                 std::span<const float> candidate, float atol,
+                                 float rtol) {
   LogitCompareResult res;
   if (reference.size() != candidate.size()) {
     res.match = false;
@@ -24,10 +24,10 @@ LogitCompareResult CompareLogits(std::span<const float> reference,
     const float denom = std::max(std::abs(ref), std::abs(cand));
     const float rel_diff = (denom > 1e-7F) ? (abs_diff / denom) : abs_diff;
 
-    if (abs_diff > res.max_abs_diff) res.max_abs_diff = abs_diff;
-    if (rel_diff > res.max_rel_diff) res.max_rel_diff = rel_diff;
+    res.max_abs_diff = std::max(res.max_abs_diff, abs_diff);
+    res.max_rel_diff = std::max(res.max_rel_diff, rel_diff);
 
-    const float tol = atol + rtol * std::abs(ref);
+    const float tol = atol + (rtol * std::abs(ref));
     if (abs_diff > tol && res.match) {
       res.match = false;
       res.first_mismatch_idx = i;

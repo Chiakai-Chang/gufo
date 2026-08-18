@@ -40,6 +40,99 @@ constexpr int HexCharToInt(char c) noexcept {
   return -1;
 }
 
+std::string ByteToGpt2Utf8(std::uint8_t b) {
+  static const auto b2u_map = []() {
+    std::array<std::string, 256> table;
+    for (int i = '!'; i <= '~'; ++i) {
+      table[i] = std::string(1, static_cast<char>(i));
+    }
+    for (int i = 161; i <= 172; ++i) {
+      char buf[3] = {static_cast<char>(0xC0 | (i >> 6)),
+                     static_cast<char>(0x80 | (i & 0x3F)), 0};
+      table[i] = buf;
+    }
+    for (int i = 174; i <= 255; ++i) {
+      char buf[3] = {static_cast<char>(0xC0 | (i >> 6)),
+                     static_cast<char>(0x80 | (i & 0x3F)), 0};
+      table[i] = buf;
+    }
+    int n = 0;
+    for (int i = 0; i < 256; ++i) {
+      if ((i < '!' || i > '~') && (i < 161 || i > 172) &&
+          (i < 174 || i > 255)) {
+        const int cp = 256 + n;
+        char buf[3] = {static_cast<char>(0xC0 | (cp >> 6)),
+                       static_cast<char>(0x80 | (cp & 0x3F)), 0};
+        table[i] = buf;
+        ++n;
+      }
+    }
+    return table;
+  }();
+  return b2u_map[b];
+}
+
+std::string UnescapeGpt2Bytes(std::string_view text) {
+  static const auto u2b_map = []() {
+    std::unordered_map<char32_t, std::uint8_t> m;
+    for (int b = '!'; b <= '~'; ++b) {
+      m[static_cast<char32_t>(b)] = static_cast<std::uint8_t>(b);
+    }
+    for (int b = 161; b <= 172; ++b) {
+      m[static_cast<char32_t>(b)] = static_cast<std::uint8_t>(b);
+    }
+    for (int b = 174; b <= 255; ++b) {
+      m[static_cast<char32_t>(b)] = static_cast<std::uint8_t>(b);
+    }
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+      if ((b < '!' || b > '~') && (b < 161 || b > 172) &&
+          (b < 174 || b > 255)) {
+        m[static_cast<char32_t>(256 + n)] = static_cast<std::uint8_t>(b);
+        ++n;
+      }
+    }
+    return m;
+  }();
+
+  std::string result;
+  result.reserve(text.size());
+
+  std::size_t i = 0;
+  while (i < text.size()) {
+    const auto b0 = static_cast<unsigned char>(text[i]);
+    char32_t cp = b0;
+    std::size_t len = 1;
+
+    if ((b0 & 0xE0) == 0xC0 && i + 1 < text.size()) {
+      cp =
+          ((b0 & 0x1F) << 6) | (static_cast<unsigned char>(text[i + 1]) & 0x3F);
+      len = 2;
+    } else if ((b0 & 0xF0) == 0xE0 && i + 2 < text.size()) {
+      cp = ((b0 & 0x0F) << 12) |
+           ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 6) |
+           (static_cast<unsigned char>(text[i + 2]) & 0x3F);
+      len = 3;
+    } else if ((b0 & 0xF8) == 0xF0 && i + 3 < text.size()) {
+      cp = ((b0 & 0x07) << 18) |
+           ((static_cast<unsigned char>(text[i + 1]) & 0x3F) << 12) |
+           ((static_cast<unsigned char>(text[i + 2]) & 0x3F) << 6) |
+           (static_cast<unsigned char>(text[i + 3]) & 0x3F);
+      len = 4;
+    }
+
+    auto it = u2b_map.find(cp);
+    if (it != u2b_map.end()) {
+      result.push_back(static_cast<char>(it->second));
+    } else {
+      result.append(text.substr(i, len));
+    }
+    i += len;
+  }
+
+  return result;
+}
+
 }  // namespace
 
 std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromBinaryFile(
@@ -235,19 +328,44 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromVocabulary(
 }
 
 void QwenTokenizer::InitializeByteTokens() {
+  id_to_decoded_token_.resize(id_to_token_.size());
+  for (std::size_t i = 0; i < id_to_token_.size(); ++i) {
+    if (is_special_token_.contains(static_cast<TokenId>(i))) {
+      id_to_decoded_token_[i] = id_to_token_[i];
+    } else {
+      const auto& tok = id_to_token_[i];
+      if (tok.size() == 6 && tok.starts_with("<0x") && tok.ends_with('>')) {
+        const int h1 = HexCharToInt(tok[3]);
+        const int h2 = HexCharToInt(tok[4]);
+        if (h1 >= 0 && h2 >= 0) {
+          const auto byte_val = static_cast<std::uint8_t>((h1 << 4) | h2);
+          id_to_decoded_token_[i] = std::string(1, static_cast<char>(byte_val));
+          continue;
+        }
+      }
+      id_to_decoded_token_[i] = UnescapeGpt2Bytes(tok);
+    }
+  }
+
   for (std::size_t b = 0; b < 256; ++b) {
     const auto byte_val = static_cast<std::uint8_t>(b);
-    const std::string direct_char(1, static_cast<char>(byte_val));
-    auto it = token_to_id_.find(direct_char);
+    const std::string gpt2_utf8 = ByteToGpt2Utf8(byte_val);
+    auto it = token_to_id_.find(gpt2_utf8);
     if (it != token_to_id_.end()) {
       byte_tokens_[b] = it->second;
     } else {
-      const std::string hex_token = FormatHexByteToken(byte_val);
-      auto hex_it = token_to_id_.find(hex_token);
-      if (hex_it != token_to_id_.end()) {
-        byte_tokens_[b] = hex_it->second;
+      const std::string direct_char(1, static_cast<char>(byte_val));
+      auto direct_it = token_to_id_.find(direct_char);
+      if (direct_it != token_to_id_.end()) {
+        byte_tokens_[b] = direct_it->second;
       } else {
-        byte_tokens_[b] = kInvalidTokenId;
+        const std::string hex_token = FormatHexByteToken(byte_val);
+        auto hex_it = token_to_id_.find(hex_token);
+        if (hex_it != token_to_id_.end()) {
+          byte_tokens_[b] = hex_it->second;
+        } else {
+          byte_tokens_[b] = kInvalidTokenId;
+        }
       }
     }
   }
@@ -377,25 +495,15 @@ std::vector<TokenId> QwenTokenizer::Encode(
 std::string QwenTokenizer::Decode(std::span<const TokenId> tokens) const {
   std::string result;
   for (const TokenId id : tokens) {
-    if (id < id_to_token_.size()) {
-      const auto& tok = id_to_token_[id];
-      // Check if it is a byte token <0xXX>
-      if (tok.size() == 6 && tok.starts_with("<0x") && tok.ends_with('>')) {
-        const int h1 = HexCharToInt(tok[3]);
-        const int h2 = HexCharToInt(tok[4]);
-        if (h1 >= 0 && h2 >= 0) {
-          const auto byte_val = static_cast<std::uint8_t>((h1 << 4) | h2);
-          result.push_back(static_cast<char>(byte_val));
-          continue;
-        }
-      }
-      result.append(tok);
-    }
+    result.append(DecodeToken(id));
   }
   return result;
 }
 
 std::string_view QwenTokenizer::DecodeToken(TokenId token_id) const noexcept {
+  if (token_id < id_to_decoded_token_.size()) {
+    return id_to_decoded_token_[token_id];
+  }
   if (token_id < id_to_token_.size()) {
     return id_to_token_[token_id];
   }

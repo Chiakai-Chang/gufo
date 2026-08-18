@@ -92,6 +92,7 @@ private:
   std::vector<TokenId> BpeMergeChunk(std::string_view chunk) const;
 
   std::vector<std::string> id_to_token_;
+  std::vector<std::string> id_to_decoded_token_;
   std::unordered_map<std::string, TokenId> token_to_id_;
   std::unordered_map<std::pair<TokenId, TokenId>, std::uint32_t, PairHash>
       merge_ranks_;
