@@ -144,6 +144,8 @@ add_executable(strix-server
   src/server/main.cpp
   src/server/bench_cli.cpp
   src/server/prompt_cli.cpp
+  src/server/inference_backend.cpp
+  src/server/http_server.cpp
 )
 target_link_libraries(strix-server PRIVATE strix_diagnostics strix_core)
 
@@ -173,6 +175,9 @@ if (BUILD_TESTING)
 
   add_test(NAME strix_server_prompt_help COMMAND strix-server prompt --help)
   set_tests_properties(strix_server_prompt_help PROPERTIES LABELS "cpu;server;cli")
+
+  add_test(NAME strix_server_serve_help COMMAND strix-server serve --help)
+  set_tests_properties(strix_server_serve_help PROPERTIES LABELS "cpu;server;cli")
 
   add_test(NAME strix_server_prompt_smoke COMMAND strix-server prompt "Hello world")
   set_tests_properties(strix_server_prompt_smoke PROPERTIES LABELS "cpu;server;cli")
