@@ -226,6 +226,7 @@
           testCheck = pkgsSys.runCommand "check-tests" {
             nativeBuildInputs = [
               pkgsSys.stdenv.cc
+              pkgsSys.ccache
               pkgsSys.cmake
               pkgsSys.ninja
             ];
@@ -234,10 +235,28 @@
             export HOME=$TMPDIR
             set -euo pipefail
 
+            ccache_launcher=
+            ccache_dir=/tmp/strix-ccache
+            if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
+              export CCACHE_DIR="$ccache_dir"
+              export CCACHE_BASEDIR="$src"
+              export CCACHE_COMPILERCHECK=content
+              export CCACHE_MAXSIZE=2G
+              export CCACHE_NOHASHDIR=true
+              export CCACHE_UMASK=000
+              export NIX_CFLAGS_COMPILE="''${NIX_CFLAGS_COMPILE:-} -fdebug-prefix-map=$src=."
+              ccache_launcher=-DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+              ccache --zero-stats
+            fi
+
             mkdir -p build && cd build
-            cmake "$src" -GNinja -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DSTRIX_ENABLE_WARNINGS=ON -DSTRIX_ENABLE_SANITIZERS=OFF
+            cmake "$src" -GNinja $ccache_launcher -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DSTRIX_ENABLE_WARNINGS=ON -DSTRIX_ENABLE_SANITIZERS=OFF
             ninja
             ctest --output-on-failure
+
+            if [[ -n "$ccache_launcher" ]]; then
+              ccache --show-stats
+            fi
 
             mkdir -p $out
             echo "PASS: CPU build and CTest suite passed" > $out/result.txt

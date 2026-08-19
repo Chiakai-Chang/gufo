@@ -12,13 +12,36 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compute CMake compiler cache key
+        id: ccache-key
+        shell: bash
+        run: echo "epoch-week=$(( $(date -u +%s) / 604800 ))" >> "$GITHUB_OUTPUT"
+
+      - name: Restore CMake compiler cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/strix-ccache
+          key: strix-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}-${{ steps.ccache-key.outputs.epoch-week }}
+          restore-keys: |
+            strix-ccache-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('flake.lock') }}-
+
+      - name: Prepare CMake compiler cache
+        shell: bash
+        run: |
+          mkdir -p /tmp/strix-ccache
+          chmod -R a+rwX /tmp/strix-ccache
+          chmod 1777 /tmp/strix-ccache
 
       - name: Install Nix
-        uses: DeterminateSystems/nix-installer-action@v16
+        uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+        with:
+          extra-conf: |
+            extra-sandbox-paths = /tmp/strix-ccache
 
       - name: Enable Magic Nix Cache
-        uses: DeterminateSystems/magic-nix-cache-action@v13
+        uses: DeterminateSystems/magic-nix-cache-action@908b263ff629f4cc17666315b7fd3ec127c6244d # v14
 
       - name: Run Canonical PR Test Suite
         run: |
