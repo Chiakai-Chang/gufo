@@ -143,6 +143,8 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_executor.cpp
     src/core/hip/qwen_gpu_model_loader.cpp
     src/core/hip/qwen_gpu_prefill.cpp
+    src/core/speculative/draft_heads.cpp
+    src/core/speculative/self_speculative.cpp
     src/core/speculative/speculative_verifier.cpp
   )
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
@@ -298,6 +300,11 @@ if (BUILD_TESTING)
     target_link_libraries(speculative_verification_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME speculative_verification_test COMMAND speculative_verification_test)
     set_tests_properties(speculative_verification_test PROPERTIES LABELS "hip;gpu;speculative")
+
+    add_executable(test_draft_heads tests/core/test_draft_heads.cpp)
+    target_link_libraries(test_draft_heads PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
+    add_test(NAME test_draft_heads COMMAND test_draft_heads)
+    set_tests_properties(test_draft_heads PROPERTIES LABELS "hip;gpu;draft_heads;speculative")
 
   endif()
 
