@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <sstream>
@@ -51,8 +52,10 @@ void PrintBenchHelp(std::string_view program_name) {
                "benchmark (default: 64,128,512)\n"
             << "  -n, --n-gen <n,n,...>       Number of text generation tokens "
                "(default: 128)\n"
+            << "  -d, --n-depth <n,n,...>     Context depths prepared outside "
+               "the timed region (default: 0)\n"
             << "  -r, --repetitions <N>       Number of repetitions per test "
-               "(default: 3)\n"
+               "(default: 1)\n"
             << "  --validate-prefill <N>      Compare batched logits against "
                "sequential prefill\n"
             << "  -ngl, --n-gpu-layers <N>    Number of layers offloaded to "
@@ -60,7 +63,8 @@ void PrintBenchHelp(std::string_view program_name) {
             << "  -v, --verbose               Verbose progress output\n";
 }
 
-std::vector<std::size_t> ParseCommaSeparatedSizes(std::string_view str) {
+std::vector<std::size_t> ParseCommaSeparatedSizes(std::string_view str,
+                                                  bool allow_zero = false) {
   std::vector<std::size_t> result;
   std::size_t start = 0;
   while (start < str.size()) {
@@ -73,7 +77,7 @@ std::vector<std::size_t> ParseCommaSeparatedSizes(std::string_view str) {
       std::size_t val = 0;
       const auto [ptr, ec] =
           std::from_chars(part.data(), part.data() + part.size(), val);
-      if (ec == std::errc{} && val > 0) {
+      if (ec == std::errc{} && (val > 0 || allow_zero)) {
         result.push_back(val);
       }
     }
@@ -105,6 +109,25 @@ BenchStats ComputeStats(const std::vector<double>& values) {
   return {.mean = mean, .stddev = std::sqrt(variance)};
 }
 
+std::vector<tokenization::TokenId> MakeBenchmarkTokens(
+    std::size_t count, std::size_t start_pos = 0) {
+  std::vector<tokenization::TokenId> tokens(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    tokens[i] =
+        static_cast<tokenization::TokenId>(((start_pos + i) % 1000) + 100);
+  }
+  return tokens;
+}
+
+std::string MakeTestName(std::string_view prefix, std::size_t count,
+                         std::size_t depth) {
+  std::string result = std::string(prefix) + std::to_string(count);
+  if (depth > 0) {
+    result += " @ d" + std::to_string(depth);
+  }
+  return result;
+}
+
 bool ValidatePrefill(hip::QwenGpuExecutor& executor,
                      std::size_t prompt_length) {
   if (prompt_length == 0 || prompt_length > executor.GetMaxPromptBatch()) {
@@ -113,10 +136,7 @@ bool ValidatePrefill(hip::QwenGpuExecutor& executor,
     return false;
   }
 
-  std::vector<tokenization::TokenId> prompt_tokens(prompt_length);
-  for (std::size_t i = 0; i < prompt_length; ++i) {
-    prompt_tokens[i] = static_cast<tokenization::TokenId>((i % 1000) + 100);
-  }
+  const auto prompt_tokens = MakeBenchmarkTokens(prompt_length);
 
   executor.Reset();
   tokenization::TokenId sequential_token = 0;
@@ -205,6 +225,24 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       }
       opt.n_gens = ParseCommaSeparatedSizes(args[i + 1]);
       explicit_n = true;
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "-d" || arg == "--n-depth") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for " + std::string(arg);
+        }
+        return std::nullopt;
+      }
+      opt.n_depths = ParseCommaSeparatedSizes(args[i + 1], true);
+      if (opt.n_depths.empty()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Invalid argument for " + std::string(arg);
+        }
+        return std::nullopt;
+      }
       skip_next = true;
       continue;
     }
@@ -328,7 +366,24 @@ int RunBench(std::span<const char* const> args) {
             << ", VRAM: " << static_cast<std::size_t>(total_vram_mib)
             << " MiB\n";
 
-  auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(*reader, &err);
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(opt.n_depths);
+  const std::size_t max_test_tokens =
+      std::max({max_or_zero(opt.n_prompts), max_or_zero(opt.n_gens),
+                opt.validate_prefill_tokens});
+  if (max_depth > std::numeric_limits<std::uint32_t>::max() - max_test_tokens) {
+    std::cerr << "Error: requested benchmark context is too large.\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  const std::size_t required_context =
+      std::max<std::size_t>(4096, max_depth + max_test_tokens);
+
+  auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(
+      *reader, &err, static_cast<std::uint32_t>(required_context));
   if (!gpu_exec) {
     std::cerr << "Error creating Qwen GPU executor: " << err << "\n";
     PrintModelLoadTime(model_load_start, false);
@@ -367,50 +422,21 @@ int RunBench(std::span<const char* const> args) {
 
   // Warmup run
   {
-    std::vector<tokenization::TokenId> warmup_tokens(32, 100);
+    const auto warmup_tokens = MakeBenchmarkTokens(32);
     gpu_exec->Reset();
     (void)gpu_exec->ForwardPromptBatch(warmup_tokens);
     HIP_CHECK(hipDeviceSynchronize());
   }
 
-  // 1. Benchmark Prompt Processing (pp<N>)
-  for (const std::size_t p_len : opt.n_prompts) {
-    std::vector<tokenization::TokenId> prompt_tokens(p_len);
-    for (std::size_t i = 0; i < p_len; ++i) {
-      prompt_tokens[i] = static_cast<tokenization::TokenId>((i % 1000) + 100);
-    }
+  std::ostringstream ss_size, ss_params;
+  ss_size << std::fixed << std::setprecision(2) << model_size_gib << " GiB";
+  ss_params << std::fixed << std::setprecision(2) << model_params_b << " B";
 
-    gpu_exec->Reset();
-    (void)gpu_exec->ForwardPromptBatch(prompt_tokens);
-    HIP_CHECK(hipDeviceSynchronize());
-
-    std::vector<double> runs;
-    runs.reserve(opt.repetitions);
-
-    for (std::size_t r = 0; r < opt.repetitions; ++r) {
-      gpu_exec->Reset();
-      HIP_CHECK(hipDeviceSynchronize());
-
-      const auto t0 = std::chrono::high_resolution_clock::now();
-      (void)gpu_exec->ForwardPromptBatch(prompt_tokens);
-      HIP_CHECK(hipDeviceSynchronize());
-      const auto t1 = std::chrono::high_resolution_clock::now();
-
-      const double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
-      if (elapsed_sec > 0.0) {
-        runs.push_back(static_cast<double>(p_len) / elapsed_sec);
-      }
-    }
-
-    const auto stats = ComputeStats(runs);
-    const std::string test_name = "pp" + std::to_string(p_len);
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
     std::ostringstream ss_ts;
     ss_ts << std::fixed << std::setprecision(2) << stats.mean << " ± "
           << stats.stddev;
-
-    std::ostringstream ss_size, ss_params;
-    ss_size << std::fixed << std::setprecision(2) << model_size_gib << " GiB";
-    ss_params << std::fixed << std::setprecision(2) << model_params_b << " B";
 
     std::cout << "| " << std::left << std::setw(30) << model_name << " | "
               << std::right << std::setw(10) << ss_size.str() << " | "
@@ -420,52 +446,129 @@ int RunBench(std::span<const char* const> args) {
               << " | " << std::right << std::setw(15) << test_name << " | "
               << std::right << std::setw(21) << ss_ts.str() << " |\n"
               << std::flush;
-  }
+  };
 
-  // 2. Benchmark Text Generation (tg<N>)
-  for (const std::size_t g_len : opt.n_gens) {
-    std::vector<double> runs;
-    runs.reserve(opt.repetitions);
-
-    for (std::size_t r = 0; r < opt.repetitions; ++r) {
-      gpu_exec->Reset();
-      HIP_CHECK(hipDeviceSynchronize());
-
-      tokenization::TokenId next_tok = gpu_exec->ForwardToken(100, 0, false);
-      HIP_CHECK(hipDeviceSynchronize());
-
-      const auto t0 = std::chrono::high_resolution_clock::now();
-      for (std::size_t step = 1; step <= g_len; ++step) {
-        next_tok = gpu_exec->ForwardToken(
-            next_tok, static_cast<std::uint32_t>(step), step == g_len);
+  std::size_t prepared_depth = 0;
+  bool has_prepared_depth = false;
+  for (const std::size_t depth : opt.n_depths) {
+    if (depth > 0) {
+      if (opt.verbose) {
+        std::cerr << "Preparing context depth " << depth << "...\n";
+      }
+      std::size_t preparation_start = 0;
+      double restore_ms = 0.0;
+      if (has_prepared_depth && depth >= prepared_depth) {
+        const auto restore_start = std::chrono::steady_clock::now();
+        gpu_exec->RestoreState();
+        const auto restore_end = std::chrono::steady_clock::now();
+        restore_ms = std::chrono::duration<double, std::milli>(restore_end -
+                                                               restore_start)
+                         .count();
+        preparation_start = prepared_depth;
+      } else {
+        gpu_exec->Reset();
       }
       HIP_CHECK(hipDeviceSynchronize());
-      const auto t1 = std::chrono::high_resolution_clock::now();
-
-      const double elapsed_sec = std::chrono::duration<double>(t1 - t0).count();
-      if (elapsed_sec > 0.0) {
-        runs.push_back(static_cast<double>(g_len) / elapsed_sec);
+      const auto depth_tokens =
+          MakeBenchmarkTokens(depth - preparation_start, preparation_start);
+      const auto preparation_begin = std::chrono::steady_clock::now();
+      (void)gpu_exec->ForwardPromptBatch(
+          depth_tokens, static_cast<std::uint32_t>(preparation_start), false);
+      HIP_CHECK(hipDeviceSynchronize());
+      const auto preparation_end = std::chrono::steady_clock::now();
+      const auto cache_begin = preparation_end;
+      gpu_exec->SaveState(static_cast<std::uint32_t>(depth));
+      const auto cache_end = std::chrono::steady_clock::now();
+      if (opt.verbose) {
+        const double preparation_seconds =
+            std::chrono::duration<double>(preparation_end - preparation_begin)
+                .count();
+        const double cache_ms =
+            std::chrono::duration<double, std::milli>(cache_end - cache_begin)
+                .count();
+        std::cerr << "Prepared " << (depth - preparation_start)
+                  << " new tokens in " << std::fixed << std::setprecision(3)
+                  << preparation_seconds << " s; cached depth " << depth
+                  << " in " << std::setprecision(2) << cache_ms << " ms";
+        if (preparation_start > 0) {
+          std::cerr << " after restoring depth " << preparation_start << " in "
+                    << restore_ms << " ms";
+        }
+        std::cerr << "\n";
       }
+      prepared_depth = depth;
+      has_prepared_depth = true;
     }
 
-    const auto stats = ComputeStats(runs);
-    const std::string test_name = "tg" + std::to_string(g_len);
-    std::ostringstream ss_ts;
-    ss_ts << std::fixed << std::setprecision(2) << stats.mean << " ± "
-          << stats.stddev;
+    const auto restore_depth = [&] {
+      if (depth == 0) {
+        gpu_exec->Reset();
+      } else {
+        gpu_exec->RestoreState();
+      }
+      HIP_CHECK(hipDeviceSynchronize());
+    };
 
-    std::ostringstream ss_size, ss_params;
-    ss_size << std::fixed << std::setprecision(2) << model_size_gib << " GiB";
-    ss_params << std::fixed << std::setprecision(2) << model_params_b << " B";
+    for (const std::size_t p_len : opt.n_prompts) {
+      const auto prompt_tokens = MakeBenchmarkTokens(p_len, depth);
 
-    std::cout << "| " << std::left << std::setw(30) << model_name << " | "
-              << std::right << std::setw(10) << ss_size.str() << " | "
-              << std::right << std::setw(10) << ss_params.str() << " | "
-              << std::left << std::setw(10) << "ROCm (HIP)"
-              << " | " << std::right << std::setw(3) << opt.n_gpu_layers
-              << " | " << std::right << std::setw(15) << test_name << " | "
-              << std::right << std::setw(21) << ss_ts.str() << " |\n"
-              << std::flush;
+      restore_depth();
+      (void)gpu_exec->ForwardPromptBatch(prompt_tokens,
+                                         static_cast<std::uint32_t>(depth));
+      HIP_CHECK(hipDeviceSynchronize());
+
+      std::vector<double> runs;
+      runs.reserve(opt.repetitions);
+      for (std::size_t r = 0; r < opt.repetitions; ++r) {
+        restore_depth();
+
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        (void)gpu_exec->ForwardPromptBatch(prompt_tokens,
+                                           static_cast<std::uint32_t>(depth));
+        HIP_CHECK(hipDeviceSynchronize());
+        const auto t1 = std::chrono::high_resolution_clock::now();
+
+        const double elapsed_sec =
+            std::chrono::duration<double>(t1 - t0).count();
+        if (elapsed_sec > 0.0) {
+          runs.push_back(static_cast<double>(p_len) / elapsed_sec);
+        }
+      }
+
+      print_result(MakeTestName("pp", p_len, depth), ComputeStats(runs));
+    }
+
+    for (const std::size_t g_len : opt.n_gens) {
+      restore_depth();
+      (void)gpu_exec->ForwardToken(
+          static_cast<tokenization::TokenId>((depth % 1000) + 100),
+          static_cast<std::uint32_t>(depth));
+      HIP_CHECK(hipDeviceSynchronize());
+
+      std::vector<double> runs;
+      runs.reserve(opt.repetitions);
+      for (std::size_t r = 0; r < opt.repetitions; ++r) {
+        restore_depth();
+
+        const auto t0 = std::chrono::high_resolution_clock::now();
+        for (std::size_t step = 0; step < g_len; ++step) {
+          const auto token =
+              static_cast<tokenization::TokenId>(((depth + step) % 1000) + 100);
+          (void)gpu_exec->ForwardToken(
+              token, static_cast<std::uint32_t>(depth + step));
+        }
+        HIP_CHECK(hipDeviceSynchronize());
+        const auto t1 = std::chrono::high_resolution_clock::now();
+
+        const double elapsed_sec =
+            std::chrono::duration<double>(t1 - t0).count();
+        if (elapsed_sec > 0.0) {
+          runs.push_back(static_cast<double>(g_len) / elapsed_sec);
+        }
+      }
+
+      print_result(MakeTestName("tg", g_len, depth), ComputeStats(runs));
+    }
   }
 
   std::cout << "\n";

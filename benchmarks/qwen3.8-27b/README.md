@@ -1,6 +1,6 @@
 # Qwen3.8-27B BF16 on Strix Halo
 
-Status: 2026-08-18. Native BF16 GGUF bring-up for the CPU and ROCm/HIP
+Status: 2026-08-19. Native BF16 GGUF bring-up for the CPU and ROCm/HIP
 executors on AMD Strix Halo (`gfx1151`).
 
 ## Model
@@ -101,6 +101,13 @@ STRIX_GPU_WEIGHT_MODE=mapped ./result/bin/strix-bench \
   --n-gen 8,128 \
   --repetitions 3
 
+STRIX_GPU_WEIGHT_MODE=mapped ./result/bin/strix-bench \
+  --model "$MODEL" \
+  --n-prompt 2048 \
+  --n-gen 128 \
+  --n-depth 4096,8192,12288,16384 \
+  --verbose
+
 ./result/bin/strix-bench \
   --model "$MODEL" \
   --validate-prefill 1024 \
@@ -140,6 +147,19 @@ llama-bench \
   --flash-attn auto \
   --batch-size 512 \
   --ubatch-size 512 \
+  --threads 32 \
+  --load-mode mmap
+
+llama-bench \
+  --model "$MODEL" \
+  --n-prompt 2048 \
+  --n-gen 128 \
+  --n-depth 4096,8192,12288,16384 \
+  --repetitions 1 \
+  --n-gpu-layers 99 \
+  --flash-attn auto \
+  --batch-size 4096 \
+  --ubatch-size 4096 \
   --threads 32 \
   --load-mode mmap
 ```
@@ -236,11 +256,53 @@ Long-prompt throughput is sensitive to sustained APU temperature. The
 temperature; immediate back-to-back runs produced order-dependent results and
 are not used for the comparison.
 
-The `tg128` test confirms sustained generation from a shallow context; it is
-not a context-depth sweep. Future decode comparisons should measure the same
-generation length at multiple starting positions. llama.cpp exposes this with
-`--n-depth`; `strix-bench` needs an equivalent option so both engines populate
-and time the KV/recurrent state using the same depth methodology.
+The shallow `tg128` row above remains useful for comparison with earlier
+measurements. The context-depth benchmark below measures the same work after
+preparing progressively deeper KV, convolution, and DeltaNet state.
+
+### Context-depth comparison
+
+`strix-bench -d/--n-depth` mirrors llama-bench semantics: context preparation
+is outside the timed PP/TG interval, each timed repetition starts from a
+restored snapshot, and increasing depths extend one live session rather than
+recomputing the common prefix. Activation batches remain capped at 4096
+tokens, while persistent state is sized for the deepest requested position.
+The default is one measured repetition; use `--repetitions` explicitly when a
+statistical run is required.
+
+The comparison uses one measured repetition per case, mapped model weights,
+full ROCm offload, a 4096-token batch and microbatch for llama.cpp, and the
+same split BF16 GGUF. llama.cpp uses its default F16 KV cache. Strix keeps its
+FP32 decode cache and FP16 tiled-prefill cache.
+
+| Depth | Strix `pp2048` | llama.cpp `pp2048` | llama / Strix | Strix `tg128` | llama.cpp `tg128` | llama / Strix |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096 | 296.00 tok/s | 363.72 tok/s | 1.23x | 3.63 tok/s | 3.97 tok/s | 1.09x |
+| 8192 | 252.78 tok/s | 289.56 tok/s | 1.15x | 3.24 tok/s | 3.94 tok/s | 1.22x |
+| 12288 | 222.26 tok/s | 269.15 tok/s | 1.21x | 2.91 tok/s | 3.93 tok/s | 1.35x |
+| 16384 | 198.66 tok/s | 266.82 tok/s | 1.34x | 2.66 tok/s | 3.94 tok/s | 1.48x |
+
+Strix context preparation performs real model computation, as llama-bench
+does. Only the newly exposed suffix is processed at each frontier:
+
+| Frontier | New suffix processing | Prior restore | Snapshot |
+| ---: | ---: | ---: | ---: |
+| 4096 | 13.10 s | n/a | 306.61 ms |
+| 8192 | 14.83 s | 9.44 ms | 16.74 ms |
+| 12288 | 17.20 s | 16.62 ms | 23.99 ms |
+| 16384 | 19.27 s | 23.94 ms | 31.32 ms |
+
+The first snapshot includes lazy allocation and page setup. Subsequent
+device-to-device restore/snapshot operations copy only the populated KV
+prefix and remain in the tens of milliseconds.
+
+A `rocprofv3` trace of eight decode tokens at depth 16K reports 144
+`QwenDecodeOnlineAttentionKernel` dispatches, including warmup, at an average
+8.29 ms per full-attention layer. Across the model's 16 full-attention layers,
+that is approximately 133 ms of attention work per token. The kernel avoids
+the old LDS failure, but it rereads FP32 K/V independently for each of the six
+query heads sharing a KV head. A GQA-cooperative tiled decode kernel and a
+validated lower-width KV representation are the next measured TG targets.
 
 ## Prompt Optimization
 
@@ -267,9 +329,11 @@ scratch traffic.
 
 This is a 7.55x `pp512` throughput improvement.
 
-The arena and KV cache support full-batch prefill through 4096 tokens. Prompts
-below 1024 tokens use the wave-cooperative causal attention kernel. Batches
-from 1024 tokens use a Qwen3.8-specific native HIP tile adapted from
+The activation arena supports batches through 4096 tokens, while chunked
+prefill extends persistent KV and recurrent state to the configured context
+limit with absolute RoPE positions. Prompts below 1024 tokens use the
+wave-cooperative causal attention kernel. Batches from 1024 tokens use a
+Qwen3.8-specific native HIP tile adapted from
 llama.cpp's MIT `fattn-tile` scheduling: each 256-thread block handles 16 query
 positions and two GQA heads, stages 64 K/V rows, accumulates QK scores in FP32,
 accumulates the weighted V result in FP32 with packed half2 dot products, and
@@ -300,12 +364,14 @@ candidate wins the performance check.
    `96x96x32`/`32x96x32` kernels where llama.cpp selects `128x128x32`.
 2. Remove unused FP32 activation writes and emit BF16 directly from attention
    gating and SSM post-normalization when the next projection consumes BF16.
-3. Add chunked prefill beyond 4096 tokens while preserving absolute positions,
-   KV state, DeltaNet state, and the full-logit validation boundary.
-4. Evaluate verified speculative decoding with the model's MTP block. Greedy
+3. Optimize long-context decode attention. The current one-wave online
+   softmax fixes the 16K shared-memory limit but falls from 3.63 tok/s at 4K
+   to 2.66 tok/s at 16K, while llama.cpp remains near 3.94 tok/s.
+4. Improve long-context prefill scheduling and K/V reuse; the `pp2048` gap
+   grows from 1.23x at 4K depth to 1.34x at 16K.
+5. Evaluate verified speculative decoding with the model's MTP block. Greedy
    output must match the baseline token-for-token, with normal decode as the
    rejection fallback and no second model copy.
-5. Add context-depth decode benchmarks equivalent to llama.cpp `--n-depth`.
 6. Move the HTTP backend from the serialized CPU generator to shared mapped
    HIP weights, per-request state, and continuous batching.
 
@@ -339,3 +405,6 @@ sizes from 32 through 4096 tokens.
 - FAIL: FP16 weighted-V accumulation reached 360.89 tok/s at `pp1024` but reduced 1024-token logit cosine to 0.99994785.
 - FAIL: scalar FP32 weighted-V accumulation restored precision but reduced `pp1024` to 322.55 tok/s.
 - PASS: packed half2 dot products with FP32 weighted-V accumulators reached 362.87 tok/s at `pp1024` and restored the approximately 0.99998 logit envelope.
+- PASS: chunked prefill plus GPU state snapshots added llama-bench-compatible `--n-depth` PP/TG measurements through 16K without recomputing shared prefixes.
+- FAIL: the original decode attention used one FP32 LDS score per context token; at 16K it exceeded the gfx1151 block limit and silently skipped attention.
+- PASS: one-wave FP32 online-softmax decode attention removed context-sized LDS, passed the explicit 16K launch test, and restored a monotonic TG-depth curve.

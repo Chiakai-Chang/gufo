@@ -194,6 +194,15 @@ if (BUILD_TESTING)
   add_test(NAME prompt_cli_test COMMAND prompt_cli_test)
   set_tests_properties(prompt_cli_test PROPERTIES LABELS "cpu;server;cli")
 
+  add_executable(bench_cli_test
+    tests/server/bench_cli_test.cpp
+    src/server/bench_cli.cpp
+  )
+  target_link_libraries(bench_cli_test PRIVATE strix_core)
+
+  add_test(NAME bench_cli_test COMMAND bench_cli_test)
+  set_tests_properties(bench_cli_test PROPERTIES LABELS "cpu;server;cli")
+
   add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
   target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
   target_link_libraries(bandwidth_test PRIVATE strix_diagnostics)

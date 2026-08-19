@@ -13,7 +13,8 @@ struct BenchOptions {
   std::string model_path{"models/Qwen3.5-4B-BF16.gguf"};
   std::vector<std::size_t> n_prompts{64, 128, 512};
   std::vector<std::size_t> n_gens{128};
-  std::size_t repetitions{3};
+  std::vector<std::size_t> n_depths{0};
+  std::size_t repetitions{1};
   std::size_t validate_prefill_tokens{0};
   int n_gpu_layers{99};
   bool verbose{false};

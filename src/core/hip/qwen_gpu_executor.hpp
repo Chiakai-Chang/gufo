@@ -45,6 +45,8 @@ public:
   QwenGpuArena& operator=(QwenGpuArena&&) noexcept;
 
   void Reset() noexcept;
+  void SaveState(std::uint32_t valid_context);
+  void RestoreState();
 
   float* d_hidden{nullptr};
   float* d_normed{nullptr};
@@ -83,10 +85,17 @@ public:
 
 private:
   void FreeAll() noexcept;
+  void AllocateStateSnapshot();
 
   core::ModelConfig config_;
   std::uint32_t max_context_;
   std::uint32_t max_batch_;
+  float* d_saved_kv_cache_{nullptr};
+  void* d_saved_attention_kv_f16_{nullptr};
+  float* d_saved_ssm_conv_state_{nullptr};
+  float* d_saved_ssm_deltanet_state_{nullptr};
+  std::uint32_t saved_context_{0};
+  bool has_saved_state_{false};
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
@@ -99,7 +108,8 @@ public:
   ~QwenGpuExecutor();
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> CreateFromGguf(
-      const core::GgufReader& reader, std::string* error_msg = nullptr);
+      const core::GgufReader& reader, std::string* error_msg = nullptr,
+      std::uint32_t max_context = 4096);
 
   /// Generates tokens auto-regressively on GPU with streaming callback.
   std::vector<tokenization::TokenId> Generate(
@@ -125,7 +135,8 @@ public:
   /// Runs batched prompt prefill on GPU, returning the first predicted token
   /// ID.
   [[nodiscard]] tokenization::TokenId ForwardPromptBatch(
-      std::span<const tokenization::TokenId> prompt_tokens);
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t start_pos = 0, bool compute_logits = true);
 
   /// Copies the logits produced by the most recent forward pass to host memory.
   [[nodiscard]] std::span<const float> CopyLastLogits();
@@ -133,11 +144,22 @@ public:
   [[nodiscard]] std::uint32_t GetMaxPromptBatch() const noexcept {
     return arena_.GetMaxBatch();
   }
+  [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
+    return arena_.GetMaxContext();
+  }
 
   /// Resets GPU cache and recurrent states in the arena.
   void Reset() noexcept { arena_.Reset(); }
+  void SaveState(std::uint32_t valid_context) {
+    arena_.SaveState(valid_context);
+  }
+  void RestoreState() { arena_.RestoreState(); }
 
 private:
+  [[nodiscard]] tokenization::TokenId ForwardPromptChunk(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::uint32_t start_pos, bool compute_logits);
+
   models::QwenModelWeights weights_;
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::vector<QwenGpuWeightRegion> weight_regions_;

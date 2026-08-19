@@ -877,6 +877,102 @@ __global__ void AttentionKernel(
   }
 }
 
+__launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionKernel(
+    const float* __restrict__ q, const float* __restrict__ gate,
+    const float* __restrict__ k_cache, const float* __restrict__ v_cache,
+    float* __restrict__ out_context, std::uint32_t layer_idx, std::uint32_t pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads) {
+  constexpr std::uint32_t head_dim = 256;
+  constexpr std::uint32_t vector_width = head_dim / 4;
+  constexpr std::uint32_t vectors_per_lane = vector_width / 32;
+
+  const std::uint32_t head = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  if (head >= num_heads || lane >= 32) {
+    return;
+  }
+
+  const std::uint32_t group_size = num_heads / num_kv_heads;
+  const std::uint32_t kv_head = head / group_size;
+  const auto* query = reinterpret_cast<const float4*>(
+      q + (static_cast<std::size_t>(head) * head_dim));
+  const std::size_t cache_head_offset =
+      ((static_cast<std::size_t>(layer_idx) * num_kv_heads + kv_head) *
+       max_context * head_dim);
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+
+  float4 query_values[vectors_per_lane];
+  float4 output_values[vectors_per_lane] = {};
+#pragma unroll
+  for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+    query_values[vector] = query[lane + (vector * 32)];
+  }
+
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
+  const std::size_t sequence_length = static_cast<std::size_t>(pos) + 1;
+  for (std::size_t position = 0; position < sequence_length; ++position) {
+    const auto* key = reinterpret_cast<const float4*>(
+        k_cache + cache_head_offset + (position * head_dim));
+    float score = 0.0F;
+#pragma unroll
+    for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+      const float4 query_value = query_values[vector];
+      const float4 key_value = key[lane + (vector * 32)];
+      score += (query_value.x * key_value.x) + (query_value.y * key_value.y) +
+               (query_value.z * key_value.z) + (query_value.w * key_value.w);
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+      score += __shfl_down(score, offset);
+    }
+    score = __shfl(score, 0) * scale;
+
+    const float new_max = fmaxf(running_max, score);
+    const float previous_scale = expf(running_max - new_max);
+    const float value_scale = expf(score - new_max);
+    running_sum = (running_sum * previous_scale) + value_scale;
+    running_max = new_max;
+
+    const auto* value = reinterpret_cast<const float4*>(
+        v_cache + cache_head_offset + (position * head_dim));
+#pragma unroll
+    for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+      const float4 value_data = value[lane + (vector * 32)];
+      float4& output = output_values[vector];
+      output.x = (output.x * previous_scale) + (value_data.x * value_scale);
+      output.y = (output.y * previous_scale) + (value_data.y * value_scale);
+      output.z = (output.z * previous_scale) + (value_data.z * value_scale);
+      output.w = (output.w * previous_scale) + (value_data.w * value_scale);
+    }
+  }
+
+  auto* output = reinterpret_cast<float4*>(
+      out_context + (static_cast<std::size_t>(head) * head_dim));
+  const auto* gate_values =
+      gate == nullptr ? nullptr
+                      : reinterpret_cast<const float4*>(
+                            gate + (static_cast<std::size_t>(head) * head_dim));
+  const float inverse_sum = 1.0F / running_sum;
+#pragma unroll
+  for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+    float4 result = output_values[vector];
+    result.x *= inverse_sum;
+    result.y *= inverse_sum;
+    result.z *= inverse_sum;
+    result.w *= inverse_sum;
+    if (gate_values != nullptr) {
+      const float4 gate_value = gate_values[lane + (vector * 32)];
+      result.x *= 1.0F / (1.0F + expf(-gate_value.x));
+      result.y *= 1.0F / (1.0F + expf(-gate_value.y));
+      result.z *= 1.0F / (1.0F + expf(-gate_value.z));
+      result.w *= 1.0F / (1.0F + expf(-gate_value.w));
+    }
+    output[lane + (vector * 32)] = result;
+  }
+}
+
 __global__ void SSMConvKernel(const float* __restrict__ qkv_in,
                               const float* __restrict__ conv_weights,
                               float* __restrict__ conv_state,
@@ -1196,12 +1292,19 @@ void LaunchAttention(const float* q, const float* k, const float* v,
       k, v, k_cache, v_cache, layer_idx, pos, max_context, num_kv_heads,
       head_dim);
 
-  // 2. Launch Attention with exact Softmax and dynamic score buffer
-  const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
-  const std::size_t shared_scores_bytes = seq_len * sizeof(float);
-  AttentionKernel<<<num_heads, 256, shared_scores_bytes, stream>>>(
-      q, gate, k_cache, v_cache, out_context, layer_idx, pos, max_context,
-      num_heads, num_kv_heads, head_dim);
+  // 2. Qwen3.8 uses D=256. A one-wave online softmax avoids the context-sized
+  // LDS score buffer, which exceeds the gfx1151 block limit beyond 16K tokens.
+  if (head_dim == 256 && num_kv_heads > 0 && (num_heads % num_kv_heads) == 0) {
+    QwenDecodeOnlineAttentionKernel<<<num_heads, 32, 0, stream>>>(
+        q, gate, k_cache, v_cache, out_context, layer_idx, pos, max_context,
+        num_heads, num_kv_heads);
+  } else {
+    const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
+    const std::size_t shared_scores_bytes = seq_len * sizeof(float);
+    AttentionKernel<<<num_heads, 256, shared_scores_bytes, stream>>>(
+        q, gate, k_cache, v_cache, out_context, layer_idx, pos, max_context,
+        num_heads, num_kv_heads, head_dim);
+  }
 }
 
 void LaunchSSMConvRecurrence(const float* qkv_in, const float* conv_weights,
@@ -2382,7 +2485,7 @@ __global__ void PackTiledAttentionKvKernel(
     const float* __restrict__ k, const float* __restrict__ v,
     __half* __restrict__ k_cache_f16, __half* __restrict__ v_cache_f16,
     float* __restrict__ k_cache, float* __restrict__ v_cache,
-    std::uint32_t layer_idx, std::size_t batch_size,
+    std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
     std::uint32_t max_context) {
   const std::size_t token = blockIdx.y;
   const std::size_t index = (blockIdx.x * blockDim.x) + threadIdx.x;
@@ -2393,16 +2496,18 @@ __global__ void PackTiledAttentionKvKernel(
   }
 
   const std::size_t source_offset = (token * kv_width) + index;
+  const std::size_t position = start_pos + token;
   const std::size_t kv_head = index / kTileAttentionHeadDim;
   const std::size_t dimension = index % kTileAttentionHeadDim;
   const std::size_t f16_cache_offset =
-      ((static_cast<std::size_t>(layer_idx) * max_context + token) * kv_width) +
+      ((static_cast<std::size_t>(layer_idx) * max_context + position) *
+       kv_width) +
       index;
   const std::size_t f32_cache_offset =
       (((static_cast<std::size_t>(layer_idx) * kTileAttentionKvHeads +
          kv_head) *
             max_context +
-        token) *
+        position) *
        kTileAttentionHeadDim) +
       dimension;
   const float key = k[source_offset];
@@ -2413,13 +2518,11 @@ __global__ void PackTiledAttentionKvKernel(
   v_cache[f32_cache_offset] = value;
 }
 
-__launch_bounds__(256, 3) __global__
-    void QwenTiledAttentionKernel(const float* __restrict__ q,
-                                  const float* __restrict__ gate,
-                                  const __half* __restrict__ k_cache_f16,
-                                  const __half* __restrict__ v_cache_f16,
-                                  float* __restrict__ out_context,
-                                  std::size_t batch_size) {
+__launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
+    const float* __restrict__ q, const float* __restrict__ gate,
+    const __half* __restrict__ k_cache_f16,
+    const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
+    std::uint32_t start_pos, std::size_t batch_size) {
   const std::uint32_t lane = threadIdx.x;
   const std::uint32_t wave = threadIdx.y;
   const std::uint32_t query_start = blockIdx.x * kTileAttentionQueryRows;
@@ -2463,15 +2566,15 @@ __launch_bounds__(256, 3) __global__
         tiled_column / kTileAttentionHeadsPerBlock;
     const std::uint32_t query_head =
         first_query_head + (tiled_column % kTileAttentionHeadsPerBlock);
-    const std::uint32_t query_position = query_start + query_offset;
+    const std::uint32_t local_query_position = query_start + query_offset;
 #pragma unroll
     for (std::uint32_t half2_index = lane; half2_index < kTileAttentionHalf2Dim;
          half2_index += 32) {
       __half2 packed =
           __halves2half2(__float2half_rn(0.0F), __float2half_rn(0.0F));
-      if (query_position < batch_size) {
+      if (local_query_position < batch_size) {
         const std::size_t source =
-            (static_cast<std::size_t>(query_position) * attention_width) +
+            (static_cast<std::size_t>(local_query_position) * attention_width) +
             (static_cast<std::size_t>(query_head) * kTileAttentionHeadDim) +
             (2 * half2_index);
         packed =
@@ -2483,8 +2586,10 @@ __launch_bounds__(256, 3) __global__
   }
   __syncthreads();
 
-  const std::uint32_t max_visible = min(static_cast<std::uint32_t>(batch_size),
-                                        query_start + kTileAttentionQueryRows);
+  const std::uint32_t context_end =
+      start_pos + static_cast<std::uint32_t>(batch_size);
+  const std::uint32_t max_visible =
+      min(context_end, start_pos + query_start + kTileAttentionQueryRows);
   for (std::uint32_t key_start = 0; key_start < max_visible;
        key_start += kTileAttentionKeyRows) {
     float scores[columns_per_wave][2] = {};
@@ -2498,7 +2603,7 @@ __launch_bounds__(256, 3) __global__
              half2_index < kTileAttentionKeyHalf2Dim; half2_index += 32) {
           __half2 packed =
               __halves2half2(__float2half_rn(0.0F), __float2half_rn(0.0F));
-          if (key_position < batch_size) {
+          if (key_position < context_end) {
             const auto* layer_key =
                 reinterpret_cast<const __half2*>(k_cache_f16);
             packed = layer_key
@@ -2541,14 +2646,17 @@ __launch_bounds__(256, 3) __global__
       const std::uint32_t tiled_column = (wave * columns_per_wave) + column;
       const std::uint32_t query_offset =
           tiled_column / kTileAttentionHeadsPerBlock;
-      const std::uint32_t query_position = query_start + query_offset;
+      const std::uint32_t local_query_position = query_start + query_offset;
+      const std::uint32_t absolute_query_position =
+          start_pos + local_query_position;
       const std::uint32_t key_positions[2] = {key_start + lane,
                                               key_start + lane + 32};
-      const bool valid[2] = {
-          query_position < batch_size && key_positions[0] <= query_position &&
-              key_positions[0] < batch_size,
-          query_position < batch_size && key_positions[1] <= query_position &&
-              key_positions[1] < batch_size};
+      const bool valid[2] = {local_query_position < batch_size &&
+                                 key_positions[0] <= absolute_query_position &&
+                                 key_positions[0] < context_end,
+                             local_query_position < batch_size &&
+                                 key_positions[1] <= absolute_query_position &&
+                                 key_positions[1] < context_end};
       const float score_values[2] = {valid[0] ? scores[column][0] : -INFINITY,
                                      valid[1] ? scores[column][1] : -INFINITY};
       const float tile_max =
@@ -2583,7 +2691,7 @@ __launch_bounds__(256, 3) __global__
              half2_index < kTileAttentionHalf2Dim; half2_index += 32) {
           __half2 packed =
               __halves2half2(__float2half_rn(0.0F), __float2half_rn(0.0F));
-          if (key_position < batch_size) {
+          if (key_position < context_end) {
             const auto* layer_value =
                 reinterpret_cast<const __half2*>(v_cache_f16);
             packed = layer_value
@@ -2641,9 +2749,9 @@ __launch_bounds__(256, 3) __global__
         tiled_column / kTileAttentionHeadsPerBlock;
     const std::uint32_t query_head =
         first_query_head + (tiled_column % kTileAttentionHeadsPerBlock);
-    const std::uint32_t query_position = query_start + query_offset;
+    const std::uint32_t local_query_position = query_start + query_offset;
     const float denominator = TileWaveReduceSum(running_sum[column]);
-    if (query_position >= batch_size || denominator == 0.0F) {
+    if (local_query_position >= batch_size || denominator == 0.0F) {
       continue;
     }
 #pragma unroll
@@ -2651,7 +2759,7 @@ __launch_bounds__(256, 3) __global__
       const std::uint32_t half2_index = lane + (slot * 32);
       const std::uint32_t dimension = 2 * half2_index;
       const std::size_t output_offset =
-          (static_cast<std::size_t>(query_position) * attention_width) +
+          (static_cast<std::size_t>(local_query_position) * attention_width) +
           (static_cast<std::size_t>(query_head) * kTileAttentionHeadDim) +
           dimension;
       const float2 result = output[column][slot];
@@ -2672,12 +2780,12 @@ bool LaunchBatchedAttentionTile(
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
     std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream) {
-  const bool supported = batch_size != 0 && start_pos == 0 &&
-                         num_heads == kTileAttentionQueryHeads &&
-                         num_kv_heads == kTileAttentionKvHeads &&
-                         head_dim == kTileAttentionHeadDim &&
-                         batch_size <= max_context && k_cache_f16 != nullptr &&
-                         v_cache_f16 != nullptr;
+  const bool supported =
+      batch_size != 0 && num_heads == kTileAttentionQueryHeads &&
+      num_kv_heads == kTileAttentionKvHeads &&
+      head_dim == kTileAttentionHeadDim &&
+      static_cast<std::size_t>(start_pos) + batch_size <= max_context &&
+      k_cache_f16 != nullptr && v_cache_f16 != nullptr;
   if (!supported) {
     return false;
   }
@@ -2694,7 +2802,7 @@ bool LaunchBatchedAttentionTile(
       static_cast<unsigned int>(batch_size));
   PackTiledAttentionKvKernel<<<pack_grid, block_size, 0, stream>>>(
       k, v, static_cast<__half*>(k_cache_f16),
-      static_cast<__half*>(v_cache_f16), k_cache, v_cache, layer_idx,
+      static_cast<__half*>(v_cache_f16), k_cache, v_cache, layer_idx, start_pos,
       batch_size, max_context);
 
   const dim3 attention_grid(
@@ -2703,7 +2811,7 @@ bool LaunchBatchedAttentionTile(
       kTileAttentionKvHeads * (kTileAttentionGqa / 2));
   const dim3 attention_block(32, 8);
   QwenTiledAttentionKernel<<<attention_grid, attention_block, 0, stream>>>(
-      q, gate, layer_k, layer_v, out_context, batch_size);
+      q, gate, layer_k, layer_v, out_context, start_pos, batch_size);
   return true;
 }
 

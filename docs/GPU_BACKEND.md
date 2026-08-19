@@ -136,6 +136,10 @@ row-tiled GEMV.
 - Fused RoPE and Q/K preparation where model-specific fusion is beneficial.
 - Native Qwen3.8 causal GQA tiles adapted from llama.cpp's MIT online-softmax
   scheduling for long prompts, with Composable Kernel as a shape fallback.
+- Chunked prefill keeps activation batches bounded while carrying absolute
+  positions and persistent KV/recurrent state across context frontiers.
+- Single-token Qwen3.8 attention uses FP32 online softmax without a
+  context-sized LDS score array, including at 16K and deeper positions.
 - Paged KV attention.
 - Separate single-token and batched attention kernels.
 - GQA-aware K/V reuse.
