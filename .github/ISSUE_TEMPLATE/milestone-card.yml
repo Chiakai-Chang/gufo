@@ -1,7 +1,6 @@
 name: Milestone Progress Card
 description: Create a new milestone progress card adhering to the project card schema
-title: "<filename>.md"
-labels: ["card", "status:planned"]
+title: ""
 body:
   - type: markdown
     attributes:
