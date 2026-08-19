@@ -18,6 +18,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 | **hipBLASLt** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLASLt](https://github.com/ROCm/hipBLASLt) |
 | **rocBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocBLAS](https://github.com/ROCm/rocBLAS) |
 | **Composable Kernel** | Header / compiled kernels | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/composable_kernel](https://github.com/ROCm/composable_kernel) |
+| **ROCprofiler SDK / ROCTx** | Benchmark marker library / profiling tool | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocprofiler-sdk](https://github.com/ROCm/rocprofiler-sdk) |
 | **llama.cpp** | Source-derived algorithm | `MIT` | `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | **libuuid** | Linked | `BSD-3-Clause` / `LGPL-2.1-or-later` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [util-linux](https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git) |
 | **`amdxdna` Kernel Driver** | System (Kernel) | `GPL-2.0-only` | System Kernel (`amdxdna.ko`) | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
@@ -108,7 +109,18 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Header / compiled kernels
 - **Corresponding-Source Location**: https://github.com/ROCm/composable_kernel (via Nix derivation `rocmPackages.composable_kernel`)
 
-### 1.8 llama.cpp
+### 1.8 ROCprofiler SDK / ROCTx
+
+- **Component Name**: ROCprofiler SDK / ROCTx
+- **Upstream URL**: https://github.com/ROCm/rocprofiler-sdk
+- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.rocprofiler-sdk`)
+- **Component Used**: The `rocprofv3` diagnostic profiler and the lightweight ROCTx marker library linked only by `strix-kernel-bench`
+- **SPDX License Identifier**: `MIT`
+- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+- **Relationship**: Benchmark marker library / profiling tool; the inference server does not link the profiler SDK
+- **Corresponding-Source Location**: https://github.com/ROCm/rocprofiler-sdk (via Nix derivation `rocmPackages.rocprofiler-sdk`)
+
+### 1.9 llama.cpp
 
 - **Component Name**: llama.cpp
 - **Upstream URL**: https://github.com/ggml-org/llama.cpp
@@ -119,7 +131,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Source-derived algorithm; no llama.cpp runtime code or library is linked
 - **Corresponding-Source Location**: https://github.com/ggml-org/llama.cpp/tree/e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0/ggml/src/ggml-cuda
 
-### 1.9 libuuid (util-linux)
+### 1.10 libuuid (util-linux)
 
 - **Component Name**: libuuid (util-linux UUID library)
 - **Upstream URL**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git

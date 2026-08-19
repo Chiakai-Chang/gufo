@@ -4,12 +4,20 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
 namespace strix::hip {
+
+struct HipblasLtDispatchInfo {
+  int algorithm_id{-1};
+  std::string solution_name;
+  std::string kernel_name;
+  bool plan_cache_hit{false};
+};
 
 /// Cached hipBLASLt BF16 GEMM plans for prompt-processing projections.
 class HipblasLtGemm {
@@ -26,7 +34,8 @@ public:
   /// Returns false when hipBLASLt cannot provide a supported plan.
   [[nodiscard]] bool RunBf16(const void* a_bf16, const void* x_bf16, float* y,
                              std::size_t batch_size, std::size_t m,
-                             std::size_t k, hipStream_t stream = nullptr);
+                             std::size_t k, hipStream_t stream = nullptr,
+                             HipblasLtDispatchInfo* dispatch_info = nullptr);
 
 private:
   struct Impl;

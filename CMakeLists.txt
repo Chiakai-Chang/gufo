@@ -3,6 +3,7 @@ project(strix LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(STRIX_VERSION "development" CACHE STRING "Strix build revision")
 include_directories(${CMAKE_SOURCE_DIR})
 
 # ROCm/HIP GPU backend — compiled natively for the Strix Halo gfx1151 target.
@@ -34,6 +35,8 @@ if (ENGINE_ENABLE_HIP)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
   find_package(rocblas REQUIRED)
+  find_path(ROCTX_INCLUDE_DIR rocprofiler-sdk-roctx/roctx.h REQUIRED)
+  find_library(ROCTX_LIBRARY NAMES rocprofiler-sdk-roctx REQUIRED)
   find_path(COMPOSABLE_KERNEL_INCLUDE_DIR ck/ck.hpp REQUIRED)
 
   message(STATUS "strix: ROCm/HIP enabled, architectures=${CMAKE_HIP_ARCHITECTURES}")
@@ -178,7 +181,30 @@ add_executable(strix-bench
 )
 target_link_libraries(strix-bench PRIVATE strix_diagnostics strix_core)
 
+add_library(strix_kernel_bench_support STATIC
+  src/bench/kernel_bench.cpp
+)
+target_include_directories(strix_kernel_bench_support PUBLIC ${CMAKE_SOURCE_DIR})
+
+if (ENGINE_ENABLE_HIP)
+  add_executable(strix-kernel-bench
+    src/bench/kernel_bench_main.cpp
+  )
+  target_compile_definitions(strix-kernel-bench PRIVATE
+    STRIX_VERSION="${STRIX_VERSION}")
+  target_include_directories(strix-kernel-bench SYSTEM PRIVATE
+    ${ROCTX_INCLUDE_DIR})
+  target_link_libraries(strix-kernel-bench PRIVATE
+    strix_kernel_bench_support
+    strix_diagnostics
+    strix_core
+    ${ROCTX_LIBRARY})
+endif()
+
 install(TARGETS strix strix-server strix-bench DESTINATION bin)
+if (ENGINE_ENABLE_HIP)
+  install(TARGETS strix-kernel-bench DESTINATION bin)
+endif()
 
 # CTest integration
 include(CTest)
@@ -293,6 +319,12 @@ if (BUILD_TESTING)
   add_test(NAME qwen_attention_policy_test COMMAND qwen_attention_policy_test)
   set_tests_properties(qwen_attention_policy_test PROPERTIES
     LABELS "cpu;models;attention;dispatch")
+
+  add_executable(kernel_bench_test tests/benchmarks/kernel_bench_test.cpp)
+  target_link_libraries(kernel_bench_test PRIVATE strix_kernel_bench_support)
+  add_test(NAME kernel_bench_test COMMAND kernel_bench_test)
+  set_tests_properties(kernel_bench_test PROPERTIES
+    LABELS "cpu;benchmarks;statistics;json")
 
   if (ENGINE_ENABLE_HIP)
     add_executable(qwen_gpu_ops_test tests/kernels/qwen_gpu_ops_test.cpp)

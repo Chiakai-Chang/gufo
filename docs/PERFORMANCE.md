@@ -469,6 +469,72 @@ the model benchmark record:
 - Before/after unprofiled throughput.
 - Numerical and state validation used to accept the change.
 
+### Focused kernel harness
+
+`strix-kernel-bench` supplies deterministic inputs, correctness sentinels,
+unprofiled HIP-event timing, percentile statistics, effective bandwidth, the
+machine fingerprint, structured dispatch metadata, and ROCTx case markers. It
+covers GEMV, GEMM, single-token attention, batched attention, batched DeltaNet
+recurrence, RMSNorm, residual add, and SwiGLU. Attention, GEMM, DeltaNet, and
+elementwise cases accept the standard context/batch matrix:
+
+```sh
+git add .
+nix build
+
+./result/bin/strix-kernel-bench \
+  --kernel gemv,gemm,decode-attention,batched-attention,deltanet,elementwise \
+  --context 128,1024,4096 \
+  --m 4096 \
+  --k 4096 \
+  --type bf16 \
+  --warmup 3 \
+  --repetitions 10 \
+  --output /tmp/strix-kernel-bench.json
+```
+
+Use `--kernel all` for the same complete case set and omit `--context` to use
+`128,512,1024,2048,4096,8192,16384,32768`. The JSON report records explicit
+`batchSize`, `m`, `n`, `k`, data type, layout, raw samples, percentiles,
+tokens/s, effective GB/s, correctness status, selected attention backend, GEMV
+strategy, rejected fast paths, hipBLASLt algorithm/kernel identity, plan-cache
+status, and graph-cache status.
+
+Headline latency comes from the unprofiled command above. Run the same case
+through `rocprofv3` separately for dispatch/resource evidence:
+
+```sh
+nix develop -c rocprofv3 \
+  --kernel-trace \
+  --marker-trace \
+  --scratch-memory-trace \
+  --stats \
+  --selected-regions \
+  --output-format json \
+  --output-directory /tmp/strix-kernel-profile \
+  -- ./result/bin/strix-kernel-bench \
+    --kernel decode-attention \
+    --context 4096,16384 \
+    --warmup 3 \
+    --repetitions 1
+```
+
+The report reserves resource fields for occupancy, VGPR, LDS, and scratch data
+produced by the profiler pass; they are `null` in the unprofiled timing report
+so profiler overhead is never presented as headline latency. Project-side
+dispatch telemetry remains responsible for semantic decisions the profiler
+cannot infer. Enable newline-delimited diagnostic events only in a separate
+diagnostic run:
+
+```sh
+STRIX_DISPATCH_TELEMETRY=1 ./result/bin/strix-server prompt \
+  --model "$MODEL" "Hello"
+```
+
+This logs selected attention backends, GEMV strategies, rejected fast paths,
+hipBLASLt algorithm and plan-cache status, and HIP graph hit/miss state. Leave
+it disabled for performance measurements.
+
 ## Promotion Gates
 
 A performance change is promoted only when:

@@ -23,6 +23,7 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "hipBLASLt",
     "rocBLAS",
     "Composable Kernel",
+    "ROCprofiler SDK / ROCTx",
     "llama.cpp",
     "libuuid",
 }

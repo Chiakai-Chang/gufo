@@ -55,6 +55,7 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.hipblaslt
     rocmPackages.rocblas
     rocmPackages.composable_kernel
+    rocmPackages.rocprofiler-sdk
   ]
   ++ lib.optionals xrtSupport [
     xrt
@@ -65,6 +66,7 @@ stdenv.mkDerivation (finalAttrs: {
   cmakeFlags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
     "-DBUILD_TESTING=OFF"
+    "-DSTRIX_VERSION=${version}"
   ]
   ++ lib.optional rocmSupport "-DENGINE_ENABLE_HIP=ON"
   ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
@@ -89,6 +91,9 @@ stdenv.mkDerivation (finalAttrs: {
     if [ -f strix-bench ]; then
       cp strix-bench $out/bin/strix-bench
     fi
+    if [ -f strix-kernel-bench ]; then
+      cp strix-kernel-bench $out/bin/strix-kernel-bench
+    fi
     chmod +x $out/bin/*
 
     runHook postInstall
@@ -100,6 +105,9 @@ stdenv.mkDerivation (finalAttrs: {
 
     $out/bin/strix-server --version
     $out/bin/strix-server --help >/dev/null
+    if [ -x $out/bin/strix-kernel-bench ]; then
+      $out/bin/strix-kernel-bench --help >/dev/null
+    fi
 
     runHook postInstallCheck
   '';

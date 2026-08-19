@@ -122,6 +122,22 @@ Real kernel speed (HIP gfx1151 / XDNA2 AIE2P consuming packed planes
 directly) is a separate, later milestone. Kernel benchmarks will record the
 backend and kernel name per timing row.
 
+## Focused GPU kernel benchmarks
+
+The installed `strix-kernel-bench` executable measures production HIP entry
+points without loading a model artifact. It supports GEMV/GEMM, decode and
+batched attention, DeltaNet recurrence, RMSNorm, residual add, and SwiGLU.
+Deterministic inputs and lightweight correctness sentinels run outside the
+timed interval. The standard `128..32768` context matrix is the default for
+context- and batch-sensitive cases.
+
+The structured report binds each row to the machine fingerprint and engine
+revision and records shape, type, layout, raw HIP-event samples, median/p10/p90,
+tokens/s, effective bandwidth, dispatch choices, rejected fast paths, and
+profiler resource fields. Resource fields are intentionally null in unprofiled
+reports; collect VGPR, LDS, scratch, occupancy, and counter evidence in a
+separate `rocprofv3` pass using the emitted ROCTx case marker.
+
 ## Machine Fingerprint & Artifact Binding
 
 All diagnostic and benchmark artifacts must embed a canonical machine fingerprint

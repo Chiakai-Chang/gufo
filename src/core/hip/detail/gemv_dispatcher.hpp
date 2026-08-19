@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string_view>
 
 namespace strix::hip::detail {
 
@@ -13,7 +14,22 @@ enum class GemvStrategy : std::uint8_t {
   kWave32QuadRow = 3,
 };
 
-[[nodiscard]] constexpr GemvStrategy SelectGemvStrategy(std::size_t M,
+[[nodiscard]] constexpr std::string_view GemvStrategyName(
+    GemvStrategy strategy) noexcept {
+  switch (strategy) {
+    case GemvStrategy::kBaselineBlock:
+      return "baseline_block";
+    case GemvStrategy::kWave32SingleRow:
+      return "wave32_single_row";
+    case GemvStrategy::kWave32DualRow:
+      return "wave32_dual_row";
+    case GemvStrategy::kWave32QuadRow:
+      return "wave32_quad_row";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] constexpr GemvStrategy SelectGemvStrategy(std::size_t,
                                                         std::size_t K,
                                                         bool is_bf16) noexcept {
   if (!is_bf16 || (K % 8 != 0)) {

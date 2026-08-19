@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
 
@@ -1492,6 +1493,7 @@ void LaunchSwiGLU(const float* gate, const float* up, float* out,
 void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
                 std::size_t M, std::size_t K, hipStream_t stream) {
   const auto strategy = detail::SelectGemvStrategy(M, K, is_bf16);
+  detail::EmitGemvDispatch(M, K, is_bf16, detail::GemvStrategyName(strategy));
   constexpr std::uint32_t kWavesPerBlock = 4;
   constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
 

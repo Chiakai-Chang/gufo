@@ -3,12 +3,14 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <hipblaslt/hipblaslt-ext.hpp>
 #include <memory>
 #include <ranges>
 #include <span>
 #include <utility>
 #include <vector>
 
+#include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
 
@@ -148,6 +150,11 @@ struct HipblasLtPlan {
 }  // namespace
 
 struct HipblasLtGemm::Impl {
+  struct PlanLookup {
+    HipblasLtPlan* plan{nullptr};
+    bool cache_hit{false};
+  };
+
   hipblasLtHandle_t handle{nullptr};
   std::vector<std::unique_ptr<HipblasLtPlan>> plans;
 
@@ -164,21 +171,21 @@ struct HipblasLtGemm::Impl {
     }
   }
 
-  [[nodiscard]] HipblasLtPlan* GetPlan(std::size_t batch_size, std::size_t m,
-                                       std::size_t k) {
+  [[nodiscard]] PlanLookup GetPlan(std::size_t batch_size, std::size_t m,
+                                   std::size_t k) {
     const auto existing = std::ranges::find_if(plans, [&](const auto& plan) {
       return plan->batch_size == batch_size && plan->m == m && plan->k == k;
     });
     if (existing != plans.end()) {
-      return existing->get();
+      return {.plan = existing->get(), .cache_hit = true};
     }
     auto plan = CreateHipblasLtPlan(handle, batch_size, m, k);
     if (plan == nullptr) {
-      return nullptr;
+      return {};
     }
     auto* result = plan.get();
     plans.push_back(std::move(plan));
-    return result;
+    return {.plan = result, .cache_hit = false};
   }
 };
 
@@ -192,22 +199,48 @@ HipblasLtGemm& HipblasLtGemm::operator=(HipblasLtGemm&&) noexcept = default;
 
 bool HipblasLtGemm::RunBf16(const void* a_bf16, const void* x_bf16, float* y,
                             std::size_t batch_size, std::size_t m,
-                            std::size_t k, hipStream_t stream) {
+                            std::size_t k, hipStream_t stream,
+                            HipblasLtDispatchInfo* dispatch_info) {
   if (impl_ == nullptr || impl_->handle == nullptr || batch_size == 0 ||
       m == 0 || k == 0) {
     return false;
   }
-  auto* plan = impl_->GetPlan(batch_size, m, k);
-  if (plan == nullptr) {
+  const auto lookup = impl_->GetPlan(batch_size, m, k);
+  if (lookup.plan == nullptr) {
     return false;
   }
 
   const float alpha = 1.0F;
   const float beta = 0.0F;
-  return hipblasLtMatmul(impl_->handle, plan->operation, &alpha, a_bf16,
-                         plan->a_layout, x_bf16, plan->x_layout, &beta, y,
-                         plan->y_layout, y, plan->y_layout, &plan->algorithm,
-                         nullptr, 0, stream) == HIPBLAS_STATUS_SUCCESS;
+  const bool succeeded =
+      hipblasLtMatmul(impl_->handle, lookup.plan->operation, &alpha, a_bf16,
+                      lookup.plan->a_layout, x_bf16, lookup.plan->x_layout,
+                      &beta, y, lookup.plan->y_layout, y, lookup.plan->y_layout,
+                      &lookup.plan->algorithm, nullptr, 0,
+                      stream) == HIPBLAS_STATUS_SUCCESS;
+  if (!succeeded) {
+    return false;
+  }
+
+  if (dispatch_info != nullptr || detail::DispatchTelemetryEnabled()) {
+    const int algorithm_id =
+        hipblaslt_ext::getIndexFromAlgo(lookup.plan->algorithm);
+    const std::string solution_name = hipblaslt_ext::getSolutionNameFromAlgo(
+        impl_->handle, lookup.plan->algorithm);
+    const std::string kernel_name = hipblaslt_ext::getKernelNameFromAlgo(
+        impl_->handle, lookup.plan->algorithm);
+    if (dispatch_info != nullptr) {
+      *dispatch_info = {
+          .algorithm_id = algorithm_id,
+          .solution_name = solution_name,
+          .kernel_name = kernel_name,
+          .plan_cache_hit = lookup.cache_hit,
+      };
+    }
+    detail::EmitHipblasLtDispatch(batch_size, m, k, algorithm_id, solution_name,
+                                  kernel_name, lookup.cache_hit);
+  }
+  return true;
 }
 
 void LaunchHipblasGEMM(hipblasHandle_t handle, const void* A, bool is_bf16,

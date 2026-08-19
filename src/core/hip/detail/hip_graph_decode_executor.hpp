@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <string_view>
 
+#include "src/core/hip/detail/dispatch_telemetry.hpp"
+
 namespace strix::hip::detail {
 
 class HipGraphDecodeExecutor {
@@ -42,6 +44,7 @@ public:
   template<typename CaptureFn>
   bool TryCapture(hipStream_t stream, CaptureFn&& capture_fn) {
     if (!is_enabled_ || capture_attempted_) {
+      EmitGraphDispatch(is_enabled_ ? "miss_already_attempted" : "disabled");
       return false;
     }
     capture_attempted_ = true;
@@ -49,6 +52,7 @@ public:
     hipError_t err = hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal);
     if (err != hipSuccess) {
       is_enabled_ = false;
+      EmitGraphDispatch("miss_begin_failed");
       return false;
     }
 
@@ -61,6 +65,7 @@ public:
         graph_ = nullptr;
       }
       is_enabled_ = false;
+      EmitGraphDispatch("miss_end_failed");
       return false;
     }
 
@@ -75,18 +80,22 @@ public:
         graph_ = nullptr;
       }
       is_enabled_ = false;
+      EmitGraphDispatch("miss_instantiate_failed");
       return false;
     }
 
     is_captured_ = true;
+    EmitGraphDispatch("miss_captured");
     return true;
   }
 
   bool Launch(hipStream_t stream) {
     if (!is_captured_ || instance_ == nullptr) {
+      EmitGraphDispatch("launch_without_capture");
       return false;
     }
     hipError_t err = hipGraphLaunch(instance_, stream);
+    EmitGraphDispatch(err == hipSuccess ? "hit" : "launch_failed");
     return err == hipSuccess;
   }
 

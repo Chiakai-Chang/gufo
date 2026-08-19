@@ -12,6 +12,7 @@
 #include "ck/tensor_operation/gpu/device/impl/device_grouped_query_attention_forward_wmma.hpp"
 #include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
+#include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/qwen_attention_policy.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
@@ -451,10 +452,13 @@ void LaunchAttention(const float* q, const float* k, const float* v,
   // 2. Qwen3.8 uses D=256. A one-wave online softmax avoids the context-sized
   // LDS score buffer, which exceeds the gfx1151 block limit beyond 16K tokens.
   if (head_dim == 256 && num_kv_heads > 0 && (num_heads % num_kv_heads) == 0) {
+    detail::EmitAttentionDispatch("decode_online_fp32", "");
     QwenDecodeOnlineAttentionKernel<<<num_heads, 32, 0, stream>>>(
         q, gate, k_cache, v_cache, out_context, layer_idx, pos, max_context,
         num_heads, num_kv_heads);
   } else {
+    detail::EmitAttentionDispatch("decode_baseline",
+                                  "decode_online_fp32: unsupported_shape");
     const std::size_t seq_len = static_cast<std::size_t>(pos) + 1;
     const std::size_t shared_scores_bytes = seq_len * sizeof(float);
     AttentionKernel<<<num_heads, 256, shared_scores_bytes, stream>>>(
@@ -476,9 +480,13 @@ void LaunchAttention(const float* q, const float* k, const float* v,
       num_kv_heads, head_dim);
 
   if (head_dim == 256 && num_kv_heads > 0 && (num_heads % num_kv_heads) == 0) {
+    detail::EmitAttentionDispatch("decode_online_fp32_graph", "");
     QwenDecodeOnlineAttentionPtrKernel<<<num_heads, 32, 0, stream>>>(
         q, gate, k_cache, v_cache, out_context, layer_idx, d_pos, max_context,
         num_heads, num_kv_heads);
+  } else {
+    detail::EmitAttentionDispatch(
+        "none", "decode_online_fp32_graph: unsupported_shape");
   }
 }
 
