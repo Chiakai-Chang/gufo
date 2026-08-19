@@ -6,22 +6,38 @@
 namespace strix::heterogeneous {
 
 NpuDraftBackend::NpuDraftBackend(NpuDrafterConfig config) : config_(config) {
+  LoadMtpGguf();
   InitializeXrt();
 }
 
 NpuDraftBackend::~NpuDraftBackend() = default;
 
+void NpuDraftBackend::LoadMtpGguf() {
+  if (config_.mtp_model_path.empty()) {
+    return;
+  }
+  std::string err;
+  mtp_reader_ = core::GgufReader::OpenFile(config_.mtp_model_path, &err);
+  if (mtp_reader_) {
+    has_mtp_model_ = true;
+  }
+}
+
 void NpuDraftBackend::InitializeXrt() {
 #ifdef ENGINE_ENABLE_XRT
   if (!config_.enable_xrt) {
-    status_message_ = "XRT disabled by configuration";
+    status_message_ = has_mtp_model_
+                          ? "MTP loaded; XRT disabled by configuration"
+                          : "XRT disabled by configuration";
     return;
   }
 
   try {
     const unsigned int npu_count = xrt::system::enumerate_devices();
     if (npu_count == 0) {
-      status_message_ = "No XDNA2 NPU device found via XRT";
+      status_message_ =
+          has_mtp_model_ ? "MTP loaded; No XDNA2 NPU device found (using host)"
+                         : "No XDNA2 NPU device found via XRT";
       npu_available_ = false;
       return;
     }
@@ -31,13 +47,16 @@ void NpuDraftBackend::InitializeXrt() {
                                            xrt::bo::flags::normal, 0);
 
     npu_available_ = true;
-    status_message_ = "XDNA2 NPU active via XRT";
+    status_message_ = has_mtp_model_
+                          ? "XDNA2 NPU active with MTP Layer 64 via XRT"
+                          : "XDNA2 NPU active via XRT";
   } catch (const std::exception& e) {
     npu_available_ = false;
     status_message_ = std::string("XRT initialization failed: ") + e.what();
   }
 #else
-  status_message_ = "Compiled without XRT support";
+  status_message_ = has_mtp_model_ ? "MTP Layer 64 loaded (host/fallback)"
+                                   : "Compiled without XRT support";
   npu_available_ = false;
 #endif
 }
