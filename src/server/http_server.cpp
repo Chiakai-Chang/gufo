@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <iomanip>
 #include <iostream>
 #include <random>
 #include <sstream>
@@ -70,6 +72,17 @@ bool SendAll(int fd, std::string_view data) {
     sent += static_cast<std::size_t>(n);
   }
   return true;
+}
+
+bool IsPeerDisconnected(int fd) noexcept {
+  pollfd descriptor{
+      .fd = fd,
+      .events = POLLERR | POLLHUP,
+      .revents = 0,
+  };
+  const int ready = ::poll(&descriptor, 1, 0);
+  return ready > 0 &&
+         (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +146,12 @@ std::string BuildResponse(const HttpResponse& resp) {
   out += "Access-Control-Allow-Origin: *\r\n";
   out += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
   out += "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+  for (const auto& [name, value] : resp.headers) {
+    out += name;
+    out += ": ";
+    out += value;
+    out += "\r\n";
+  }
   out += "Connection: close\r\n\r\n";
   out += resp.body;
   return out;
@@ -160,7 +179,16 @@ std::string RandomId() {
 }
 
 HttpResponse Ok(const json::Value& v) {
-  return {200, "OK", v.dump()};
+  return {200, "OK", v.dump(), {}};
+}
+
+HttpResponse WithTiming(HttpResponse response,
+                        const InferenceBackend::Result& result) {
+  std::ostringstream value;
+  value << std::fixed << std::setprecision(3) << "ttft;dur=" << result.ttft_ms
+        << ", inter_token;dur=" << result.mean_inter_token_ms;
+  response.headers.emplace_back("Server-Timing", value.str());
+  return response;
 }
 
 HttpResponse Err(int status, const char* reason, const char* message,
@@ -171,7 +199,7 @@ HttpResponse Err(int status, const char* reason, const char* message,
   obj["type"] = type;
   obj["code"] = code;
   e["error"] = std::move(obj);
-  return {status, reason, e.dump()};
+  return {status, reason, e.dump(), {}};
 }
 
 HttpResponse NotImplemented(const HttpRequest&, InferenceBackend&) {
@@ -257,7 +285,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req, InferenceBackend& b) {
   const float temperature =
       static_cast<float>(body.member_double("temperature", 0.7));
 
-  const auto res = b.complete(prompt, max_tokens, temperature);
+  const auto res =
+      b.complete(prompt, max_tokens, temperature, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "cmpl-" + RandomId();
@@ -277,7 +306,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req, InferenceBackend& b) {
   usage["completion_tokens"] = res.completion_tokens;
   usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
   resp["usage"] = std::move(usage);
-  return Ok(resp);
+  return WithTiming(Ok(resp), res);
 }
 
 HttpResponse OpenAiChat(const HttpRequest& req, InferenceBackend& b) {
@@ -309,7 +338,7 @@ HttpResponse OpenAiChat(const HttpRequest& req, InferenceBackend& b) {
   const float temperature =
       static_cast<float>(body.member_double("temperature", 0.7));
 
-  const auto res = b.chat(messages, max_tokens, temperature);
+  const auto res = b.chat(messages, max_tokens, temperature, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "chatcmpl-" + RandomId();
@@ -331,7 +360,7 @@ HttpResponse OpenAiChat(const HttpRequest& req, InferenceBackend& b) {
   usage["completion_tokens"] = res.completion_tokens;
   usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
   resp["usage"] = std::move(usage);
-  return Ok(resp);
+  return WithTiming(Ok(resp), res);
 }
 
 HttpResponse OpenAiResponses(const HttpRequest& req, InferenceBackend& b) {
@@ -369,7 +398,7 @@ HttpResponse OpenAiResponses(const HttpRequest& req, InferenceBackend& b) {
   const float temperature =
       static_cast<float>(body.member_double("temperature", 0.7));
 
-  const auto res = b.chat(messages, max_tokens, temperature);
+  const auto res = b.chat(messages, max_tokens, temperature, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "resp_" + RandomId();
@@ -394,7 +423,7 @@ HttpResponse OpenAiResponses(const HttpRequest& req, InferenceBackend& b) {
   usage["output_tokens"] = res.completion_tokens;
   usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
   resp["usage"] = std::move(usage);
-  return Ok(resp);
+  return WithTiming(Ok(resp), res);
 }
 
 HttpResponse AnthropicMessages(const HttpRequest& req, InferenceBackend& b) {
@@ -428,7 +457,7 @@ HttpResponse AnthropicMessages(const HttpRequest& req, InferenceBackend& b) {
   const float temperature =
       static_cast<float>(body.member_double("temperature", 1.0));
 
-  const auto res = b.chat(messages, max_tokens, temperature);
+  const auto res = b.chat(messages, max_tokens, temperature, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "msg_" + RandomId();
@@ -447,7 +476,7 @@ HttpResponse AnthropicMessages(const HttpRequest& req, InferenceBackend& b) {
   usage["input_tokens"] = res.prompt_tokens;
   usage["output_tokens"] = res.completion_tokens;
   resp["usage"] = std::move(usage);
-  return Ok(resp);
+  return WithTiming(Ok(resp), res);
 }
 
 HttpResponse AnthropicCountTokens(const HttpRequest& req, InferenceBackend& b) {
@@ -497,7 +526,8 @@ HttpResponse LlamaCompletion(const HttpRequest& req, InferenceBackend& b) {
   const float temperature =
       static_cast<float>(body.member_double("temperature", 0.8));
 
-  const auto res = b.complete(prompt, max_tokens, temperature);
+  const auto res =
+      b.complete(prompt, max_tokens, temperature, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["content"] = res.text;
@@ -509,7 +539,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req, InferenceBackend& b) {
   resp["stopping_word"] = "";
   resp["tokens_predicted"] = res.completion_tokens;
   resp["tokens_evaluated"] = res.prompt_tokens;
-  return Ok(resp);
+  return WithTiming(Ok(resp), res);
 }
 
 HttpResponse LlamaInfill(const HttpRequest& req, InferenceBackend& b) {
@@ -527,11 +557,12 @@ HttpResponse LlamaInfill(const HttpRequest& req, InferenceBackend& b) {
   const float temperature =
       static_cast<float>(body.member_double("temperature", 0.7));
 
-  const auto res = b.complete(prompt, max_tokens, temperature);
+  const auto res =
+      b.complete(prompt, max_tokens, temperature, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["content"] = res.text;
-  return Ok(resp);
+  return WithTiming(Ok(resp), res);
 }
 
 HttpResponse LlamaProps(const HttpRequest& req, InferenceBackend&) {
@@ -725,8 +756,12 @@ void HttpServer::handle_connection(int client_fd) {
         } else {
           ok = true;
         }
-        if (ok)
+        if (ok) {
           req.body = std::move(body);
+          req.is_cancelled = [client_fd] {
+            return IsPeerDisconnected(client_fd);
+          };
+        }
       }
     }
 
@@ -735,7 +770,7 @@ void HttpServer::handle_connection(int client_fd) {
       resp = Err(400, "Bad Request", "malformed request",
                  "invalid_request_error", "bad_request");
     } else if (req.method == "OPTIONS") {
-      resp = {204, "No Content", ""};
+      resp = {204, "No Content", "", {}};
     } else {
       resp = handle_request(req);
     }

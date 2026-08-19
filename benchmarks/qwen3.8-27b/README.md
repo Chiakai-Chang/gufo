@@ -480,6 +480,33 @@ prompt measurement, and one `rocprofv3` trace. The expensive 1024-token
 sequential logit oracle and deterministic generation run only after a
 candidate wins the performance check.
 
+## HTTP HIP Serving
+
+The HTTP backend now uses the same HIP prefill and decode implementation as
+the direct prompt command. One shared immutable model owns the two mapped GGUF
+shards, GPU registrations, tensor references, and tokenizer. A bounded pool
+owns request-local activation arenas, KV/recurrent state, graph state, and
+logits; its default size is one for the single-request fast path.
+
+The gfx1151 regression loads the model once and verifies:
+
+- Raw completion tokens exactly match a direct `QwenGpuExecutor`.
+- Chat-template tokens exactly match the direct CLI framing and executor.
+- Cancellation and injected callback errors return a reusable session.
+- Repeated cleanup does not grow steady GPU memory by more than 16 MiB.
+- The number of GPU weight regions remains equal to the two GGUF mappings.
+
+A one-token socket smoke reported:
+
+| Route | Prompt tokens | Completion tokens | TTFT | Result |
+| --- | ---: | ---: | ---: | --- |
+| `/v1/completions` | 5 | 1 | 528.235 ms | nonempty |
+| `/v1/chat/completions` | 13 | 1 | 401.124 ms | nonempty |
+
+These are functional smoke observations, not temperature-controlled latency
+benchmarks. Both responses included `Server-Timing`; server telemetry contained
+only status, token counts, latency, and cancellation state.
+
 ## Next Steps
 
 1. Remove unused FP32 activation writes and emit BF16 directly from attention
@@ -492,8 +519,8 @@ candidate wins the performance check.
 4. Evaluate verified speculative decoding with the model's MTP block. Greedy
    output must match the baseline token-for-token, with normal decode as the
    rejection fallback and no second model copy.
-5. Move the HTTP backend from the serialized CPU generator to shared mapped
-   HIP weights, per-request state, and continuous batching.
+5. Add continuous batching and fairness over the shared HTTP HIP session
+   contract without regressing the zero-delay single-request path.
 
 Every retained optimization must preserve finite full-vocabulary logits,
 identical top-1 tokens, cosine similarity within the current approximately

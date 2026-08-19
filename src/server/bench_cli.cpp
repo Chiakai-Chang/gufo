@@ -372,13 +372,15 @@ int RunBench(std::span<const char* const> args) {
 
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
-  const auto reader = strix::core::GgufReader::OpenFile(opt.model_path, &err);
-  if (!reader) {
+  auto reader_owner = strix::core::GgufReader::OpenFile(opt.model_path, &err);
+  if (!reader_owner) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
+  const std::shared_ptr<const strix::core::GgufReader> reader(
+      std::move(reader_owner));
 
 #if defined(ENGINE_ENABLE_HIP)
   int device_count = 0;
@@ -418,7 +420,7 @@ int RunBench(std::span<const char* const> args) {
       std::max<std::size_t>(4096, max_depth + max_test_tokens);
 
   auto gpu_exec = hip::QwenGpuExecutor::CreateFromGguf(
-      *reader, &err, static_cast<std::uint32_t>(required_context));
+      reader, &err, static_cast<std::uint32_t>(required_context));
   if (!gpu_exec) {
     std::cerr << "Error creating Qwen GPU executor: " << err << "\n";
     PrintModelLoadTime(model_load_start, false);

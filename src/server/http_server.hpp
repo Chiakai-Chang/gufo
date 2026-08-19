@@ -17,6 +17,7 @@ struct HttpRequest {
   std::string path;    // "/v1/chat/completions" (no query)
   std::string query;   // raw query string (no leading '?')
   std::string body;
+  InferenceBackend::CancellationCheck is_cancelled;
 
   /// URL-decoded value of a query param, or "" if absent.
   std::string query_param(const std::string& key) const;
@@ -26,6 +27,7 @@ struct HttpResponse {
   int status = 200;
   std::string reason = "OK";
   std::string body;
+  std::vector<std::pair<std::string, std::string>> headers;
 };
 
 using Handler =

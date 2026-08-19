@@ -177,26 +177,36 @@ enum class WeightMappingMode {
 
 }  // namespace
 
-std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
-    const core::GgufReader& reader, std::string* error_msg,
-    std::uint32_t max_context) {
-  auto weights_opt = models::QwenModelWeights::LoadFromGguf(reader, error_msg);
-  if (!weights_opt.has_value()) {
-    return nullptr;
-  }
+QwenGpuModel::QwenGpuModel(
+    std::shared_ptr<const core::GgufReader> reader,
+    models::QwenModelWeights weights,
+    std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
+    std::vector<QwenGpuWeightRegion> weight_regions)
+    : reader_(std::move(reader)),
+      weights_(std::move(weights)),
+      tokenizer_(std::move(tokenizer)),
+      weight_regions_(std::move(weight_regions)) {}
 
-  const std::uint32_t model_context = weights_opt->config.context_length > 0
-                                          ? weights_opt->config.context_length
-                                          : max_context;
-  if (max_context == 0 || max_context > model_context) {
+QwenGpuModel::~QwenGpuModel() {
+  ReleaseWeightRegions(weight_regions_);
+}
+
+std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
+    std::shared_ptr<const core::GgufReader> reader, std::string* error_msg) {
+  if (reader == nullptr) {
     if (error_msg != nullptr) {
-      *error_msg = "Requested GPU context exceeds the model context length";
+      *error_msg = "GGUF reader must not be null";
     }
     return nullptr;
   }
 
+  auto weights_opt = models::QwenModelWeights::LoadFromGguf(*reader, error_msg);
+  if (!weights_opt.has_value()) {
+    return nullptr;
+  }
+
   auto tokenizer =
-      tokenization::QwenTokenizer::CreateFromGguf(reader, error_msg);
+      tokenization::QwenTokenizer::CreateFromGguf(*reader, error_msg);
   if (!tokenizer || tokenizer->GetVocabSize() <= 256) {
     auto bin_tok = tokenization::QwenTokenizer::CreateFromBinaryFile(
         "models/qwen_vocab.bin");
@@ -208,7 +218,7 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
   }
 
   std::vector<QwenGpuWeightRegion> weight_regions;
-  if (!CreateWeightRegions(reader, weight_regions, error_msg)) {
+  if (!CreateWeightRegions(*reader, weight_regions, error_msg)) {
     return nullptr;
   }
 
@@ -237,9 +247,44 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
     return nullptr;
   }
 
-  return std::make_unique<QwenGpuExecutor>(
-      std::move(*weights_opt), std::move(tokenizer), std::move(weight_regions),
-      max_context);
+  std::shared_ptr<const tokenization::QwenTokenizer> shared_tokenizer(
+      std::move(tokenizer));
+  return std::make_shared<const QwenGpuModel>(
+      std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
+      std::move(weight_regions));
+}
+
+std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(
+    std::shared_ptr<const QwenGpuModel> model, std::string* error_msg,
+    std::uint32_t max_context) {
+  if (model == nullptr) {
+    if (error_msg != nullptr) {
+      *error_msg = "Qwen GPU model must not be null";
+    }
+    return nullptr;
+  }
+
+  const auto& config = model->GetConfig();
+  const std::uint32_t model_context =
+      config.context_length > 0 ? config.context_length : max_context;
+  if (max_context == 0 || max_context > model_context) {
+    if (error_msg != nullptr) {
+      *error_msg = "Requested GPU context exceeds the model context length";
+    }
+    return nullptr;
+  }
+
+  return std::make_unique<QwenGpuExecutor>(std::move(model), max_context);
+}
+
+std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
+    std::shared_ptr<const core::GgufReader> reader, std::string* error_msg,
+    std::uint32_t max_context) {
+  auto model = QwenGpuModel::CreateFromGguf(std::move(reader), error_msg);
+  if (model == nullptr) {
+    return nullptr;
+  }
+  return Create(std::move(model), error_msg, max_context);
 }
 
 }  // namespace strix::hip

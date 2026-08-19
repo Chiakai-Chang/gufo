@@ -247,13 +247,15 @@ int RunPrompt(std::span<const char* const> args) {
 
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
-  const auto reader = strix::core::GgufReader::OpenFile(opt.model_path, &err);
-  if (!reader) {
+  auto reader_owner = strix::core::GgufReader::OpenFile(opt.model_path, &err);
+  if (!reader_owner) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
+  const std::shared_ptr<const strix::core::GgufReader> reader(
+      std::move(reader_owner));
 
   std::string rendered_prompt = opt.prompt_text;
   if (opt.use_chat_template) {
@@ -274,7 +276,7 @@ int RunPrompt(std::span<const char* const> args) {
   int dev_count = 0;
   if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
       dev_count > 0) {
-    auto gpu_exec = strix::hip::QwenGpuExecutor::CreateFromGguf(*reader, &err);
+    auto gpu_exec = strix::hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
     if (gpu_exec) {
       PrintModelLoadTime(model_load_start);
       const auto prompt_tokens =

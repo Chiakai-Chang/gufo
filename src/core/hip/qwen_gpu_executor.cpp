@@ -2,14 +2,13 @@
 #include "src/core/hip/qwen_gpu_executor.hpp"
 
 #include <cstdlib>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
-#include "src/core/hip/detail/qwen_gpu_weight_regions.hpp"
 #include "src/core/hip/hip_utils.hpp"
 
 namespace strix::hip {
-using detail::ReleaseWeightRegions;
 namespace {
 
 bool IsSsmReplayEnabled() noexcept {
@@ -21,21 +20,26 @@ bool IsSsmReplayEnabled() noexcept {
   return setting == "0" || setting == "false" || setting == "off";
 }
 
+const QwenGpuModel& RequireModel(
+    const std::shared_ptr<const QwenGpuModel>& model) {
+  if (model == nullptr) {
+    throw std::invalid_argument("Qwen GPU model must not be null");
+  }
+  return *model;
+}
+
 }  // namespace
 
-QwenGpuExecutor::QwenGpuExecutor(
-    models::QwenModelWeights weights,
-    std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
-    std::vector<QwenGpuWeightRegion> weight_regions, std::uint32_t max_context)
-    : weights_(std::move(weights)),
-      tokenizer_(std::move(tokenizer)),
-      weight_regions_(std::move(weight_regions)),
+QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
+                                 std::uint32_t max_context)
+    : model_(std::move(model)),
+      weights_(RequireModel(model_).GetWeights()),
+      tokenizer_(&model_->GetTokenizer()),
       arena_(weights_.config, max_context),
       h_logits_(weights_.config.vocab_size, 0.0F) {}
 
 QwenGpuExecutor::~QwenGpuExecutor() {
   (void)hipStreamSynchronize(arena_.stream);
-  ReleaseWeightRegions(weight_regions_);
 }
 
 void QwenGpuExecutor::Reset() noexcept {

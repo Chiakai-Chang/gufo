@@ -41,6 +41,8 @@ void PrintServeHelp() {
       << "  -p, --port <N>     Port to listen on (default: 8080)\n"
       << "  -m, --model <PATH> Path to GGUF model file "
          "(default: models/Qwen3.5-4B-BF16.gguf)\n"
+      << "  -c, --context <N>  Maximum context tokens (default: 4096)\n"
+      << "  -j, --sessions <N> Preallocated GPU request sessions (default: 1)\n"
       << "  -h, --help         Print this help\n";
 }
 
@@ -48,6 +50,8 @@ int RunServe(std::span<const char* const> args) {
   std::string host = "127.0.0.1";
   int port = 8080;
   std::string model = "models/Qwen3.5-4B-BF16.gguf";
+  std::uint32_t max_context = 4096;
+  std::size_t session_count = 1;
 
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string_view a = args[i];
@@ -64,12 +68,19 @@ int RunServe(std::span<const char* const> args) {
     } else if ((a == "-m" || a == "--model") && i + 1 < args.size()) {
       model = args[i + 1];
       ++i;
+    } else if ((a == "-c" || a == "--context") && i + 1 < args.size()) {
+      max_context =
+          static_cast<std::uint32_t>(std::stoul(std::string(args[i + 1])));
+      ++i;
+    } else if ((a == "-j" || a == "--sessions") && i + 1 < args.size()) {
+      session_count = std::stoul(std::string(args[i + 1]));
+      ++i;
     }
   }
 
   auto backend = std::make_shared<InferenceBackend>();
   std::string err;
-  if (!backend->load(model, &err)) {
+  if (!backend->load(model, &err, max_context, session_count)) {
     std::cerr << "Error loading model '" << model << "': " << err << "\n";
     return 1;
   }

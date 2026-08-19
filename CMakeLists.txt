@@ -363,6 +363,16 @@ if (BUILD_TESTING)
     set_tests_properties(persistent_deltanet_test PROPERTIES
       LABELS "hip;gpu;kernels;deltanet;speculative")
 
+    add_executable(inference_backend_gpu_test
+      tests/server/inference_backend_gpu_test.cpp
+      src/server/inference_backend.cpp)
+    target_link_libraries(inference_backend_gpu_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME inference_backend_gpu_test COMMAND inference_backend_gpu_test)
+    set_tests_properties(inference_backend_gpu_test PROPERTIES
+      LABELS "hip;gpu;server;correctness"
+      SKIP_RETURN_CODE 77)
+
     add_executable(gfx1151_acceptance_test tests/benchmarks/gfx1151_acceptance_test.cpp)
     target_link_libraries(gfx1151_acceptance_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME gfx1151_acceptance_test COMMAND gfx1151_acceptance_test)

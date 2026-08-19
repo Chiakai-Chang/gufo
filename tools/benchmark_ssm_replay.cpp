@@ -97,12 +97,15 @@ int main(int argc, const char* const* argv) {
   try {
     const auto options = ParseOptions({argv, static_cast<std::size_t>(argc)});
     std::string error;
-    auto reader = strix::core::GgufReader::OpenFile(options.model_path, &error);
-    if (!reader) {
+    auto reader_owner =
+        strix::core::GgufReader::OpenFile(options.model_path, &error);
+    if (!reader_owner) {
       throw std::runtime_error(error);
     }
+    const std::shared_ptr<const strix::core::GgufReader> reader(
+        std::move(reader_owner));
     auto executor = strix::hip::QwenGpuExecutor::CreateFromGguf(
-        *reader, &error, options.context_tokens + 32);
+        reader, &error, options.context_tokens + 32);
     if (!executor) {
       throw std::runtime_error(error);
     }
