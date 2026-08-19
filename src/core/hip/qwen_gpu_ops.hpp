@@ -100,13 +100,14 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, bool gate_is_bf16,
                            hipStream_t stream = nullptr);
 
 /// Computes Grouped-Query Softmax Attention with KV-cache and optional gating
-/// on GPU
+/// on GPU (maintaining both FP32 and FP16 cache representations)
 void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
-                     float* out_context, std::uint32_t layer_idx,
-                     std::uint32_t pos, std::uint32_t max_context,
-                     std::uint32_t num_heads, std::uint32_t num_kv_heads,
-                     std::uint32_t head_dim, hipStream_t stream = nullptr);
+                     void* k_cache_f16, void* v_cache_f16, float* out_context,
+                     std::uint32_t layer_idx, std::uint32_t pos,
+                     std::uint32_t max_context, std::uint32_t num_heads,
+                     std::uint32_t num_kv_heads, std::uint32_t head_dim,
+                     hipStream_t stream = nullptr);
 
 void LaunchSSMConvRecurrence(
     const float* qkv_in, const float* conv_weights, float* conv_state,
@@ -222,6 +223,7 @@ void LaunchBatchedFusedSwiGLUGEMM(const void* gate_w, bool gate_is_bf16,
 /// Batched Causal Attention for B tokens with KV Cache
 void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             const float* gate, float* k_cache, float* v_cache,
+                            void* k_cache_f16, void* v_cache_f16,
                             float* out_context, std::uint32_t layer_idx,
                             std::uint32_t start_pos, std::size_t batch_size,
                             std::uint32_t max_context, std::uint32_t num_heads,
@@ -254,9 +256,10 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
 /// [batch, context] score buffer.
 void LaunchBatchedAttentionGemm(
     hipblasHandle_t handle, const float* q, const float* k, const float* v,
-    const float* gate, float* k_cache, float* v_cache, float* scores,
-    float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
-    std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
+    const float* gate, float* k_cache, float* v_cache, void* k_cache_f16,
+    void* v_cache_f16, float* scores, float* out_context,
+    std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
+    std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     hipStream_t stream = nullptr);
 

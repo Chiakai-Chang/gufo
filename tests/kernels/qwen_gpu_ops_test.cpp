@@ -514,19 +514,20 @@ void TestBatchedAttentionEquivalence() {
     strix::hip::LaunchAttention(
         d_q + t * num_heads * head_dim, d_k + t * num_kv_heads * head_dim,
         d_v + t * num_kv_heads * head_dim, d_gate + t * num_heads * head_dim,
-        d_cache_seq, d_cache_seq + total_k,
+        d_cache_seq, d_cache_seq + total_k, nullptr, nullptr,
         d_out_seq + t * num_heads * head_dim, 0, static_cast<std::uint32_t>(t),
         max_context, num_heads, num_kv_heads, head_dim);
   }
 
   // Batched
-  strix::hip::LaunchBatchedAttention(
-      d_q, d_k, d_v, d_gate, d_cache_batch, d_cache_batch + total_k,
-      d_out_batch, 0, 0, batch, max_context, num_heads, num_kv_heads, head_dim);
+  strix::hip::LaunchBatchedAttention(d_q, d_k, d_v, d_gate, d_cache_batch,
+                                     d_cache_batch + total_k, nullptr, nullptr,
+                                     d_out_batch, 0, 0, batch, max_context,
+                                     num_heads, num_kv_heads, head_dim);
   strix::hip::LaunchBatchedAttentionGemm(
       hipblas_handle, d_q, d_k, d_v, d_gate, d_cache_gemm,
-      d_cache_gemm + total_k, d_scores, d_out_gemm, 0, 0, batch, max_context,
-      num_heads, num_kv_heads, head_dim);
+      d_cache_gemm + total_k, nullptr, nullptr, d_scores, d_out_gemm, 0, 0,
+      batch, max_context, num_heads, num_kv_heads, head_dim);
 
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -636,12 +637,13 @@ void TestAttentionBackendEquivalence() {
       hipMemset(d_cache_ck_f16, 0, 2 * cache_elements * sizeof(hip_bfloat16)));
 
   for (std::size_t token = 0; token < batch; ++token) {
-    strix::hip::LaunchAttention(
-        d_q + token * attention_width, d_k + token * kv_width,
-        d_v + token * kv_width, d_gate + token * attention_width, d_cache_seq,
-        d_cache_seq + cache_elements, d_out_seq + token * attention_width, 0,
-        static_cast<std::uint32_t>(token), max_context, num_heads, num_kv_heads,
-        head_dim);
+    strix::hip::LaunchAttention(d_q + token * attention_width,
+                                d_k + token * kv_width, d_v + token * kv_width,
+                                d_gate + token * attention_width, d_cache_seq,
+                                d_cache_seq + cache_elements, nullptr, nullptr,
+                                d_out_seq + token * attention_width, 0,
+                                static_cast<std::uint32_t>(token), max_context,
+                                num_heads, num_kv_heads, head_dim);
   }
   const bool tile_launched = strix::hip::LaunchBatchedAttentionTile(
       d_q, d_k, d_v, d_gate, d_cache_tile, d_cache_tile + cache_elements,
@@ -836,8 +838,8 @@ void TestLongContextDecodeAttention() {
                       hipMemcpyHostToDevice));
 
   strix::hip::LaunchAttention(d_q, d_k, d_v, d_gate, d_k_cache, d_v_cache,
-                              d_out, 0, position, max_context, num_heads,
-                              num_kv_heads, head_dim);
+                              nullptr, nullptr, d_out, 0, position, max_context,
+                              num_heads, num_kv_heads, head_dim);
   HIP_CHECK(hipGetLastError());
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -1223,6 +1225,145 @@ void TestBatchedPerHeadRMSNormEquivalence() {
   HIP_CHECK(hipFree(d_w));
 }
 
+void TestBaselineToTiledKvCacheTransition() {
+  constexpr std::size_t chunk0_size = 512;
+  constexpr std::size_t chunk1_size = 1024;
+  constexpr std::size_t total_batch = chunk0_size + chunk1_size;
+  constexpr std::uint32_t num_heads = 24;
+  constexpr std::uint32_t num_kv_heads = 4;
+  constexpr std::uint32_t head_dim = 256;
+  constexpr std::uint32_t max_context = 2048;
+
+  const std::size_t attention_width = num_heads * head_dim;
+  const std::size_t kv_width = num_kv_heads * head_dim;
+  const std::size_t q_size = total_batch * attention_width;
+  const std::size_t kv_size = total_batch * kv_width;
+  const std::size_t cache_elements = num_kv_heads * max_context * head_dim;
+
+  std::vector<float> h_q(q_size);
+  std::vector<float> h_k(kv_size);
+  std::vector<float> h_v(kv_size);
+  std::vector<float> h_gate(q_size);
+
+  for (std::size_t index = 0; index < q_size; ++index) {
+    h_q[index] =
+        0.15F * std::sin(static_cast<float>((index % 257) + 1) * 0.017F);
+    h_gate[index] =
+        0.5F * std::cos(static_cast<float>((index % 193) + 1) * 0.013F);
+  }
+  for (std::size_t index = 0; index < kv_size; ++index) {
+    h_k[index] =
+        0.2F * std::cos(static_cast<float>((index % 251) + 1) * 0.019F);
+    h_v[index] =
+        0.25F * std::sin(static_cast<float>((index % 239) + 1) * 0.023F);
+  }
+
+  float *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_gate = nullptr;
+  float *d_cache_seq = nullptr, *d_out_seq = nullptr;
+  float *d_cache_trans = nullptr, *d_out_trans = nullptr;
+  void* d_cache_trans_f16 = nullptr;
+
+  HIP_CHECK(hipMalloc(&d_q, q_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_k, kv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_v, kv_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_gate, q_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_cache_seq, 2 * cache_elements * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_seq, q_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_cache_trans, 2 * cache_elements * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_trans, q_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_cache_trans_f16,
+                      2 * cache_elements * sizeof(std::uint16_t)));
+
+  HIP_CHECK(hipMemcpy(d_q, h_q.data(), q_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_k, h_k.data(), kv_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_v, h_v.data(), kv_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_gate, h_gate.data(), q_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+
+  HIP_CHECK(hipMemset(d_cache_seq, 0, 2 * cache_elements * sizeof(float)));
+  HIP_CHECK(hipMemset(d_out_seq, 0, q_size * sizeof(float)));
+  HIP_CHECK(hipMemset(d_cache_trans, 0, 2 * cache_elements * sizeof(float)));
+  HIP_CHECK(hipMemset(d_out_trans, 0, q_size * sizeof(float)));
+  HIP_CHECK(hipMemset(d_cache_trans_f16, 0,
+                      2 * cache_elements * sizeof(std::uint16_t)));
+
+  // 1. Golden sequential reference token-by-token
+  for (std::size_t token = 0; token < total_batch; ++token) {
+    strix::hip::LaunchAttention(d_q + token * attention_width,
+                                d_k + token * kv_width, d_v + token * kv_width,
+                                d_gate + token * attention_width, d_cache_seq,
+                                d_cache_seq + cache_elements, nullptr, nullptr,
+                                d_out_seq + token * attention_width, 0,
+                                static_cast<std::uint32_t>(token), max_context,
+                                num_heads, num_kv_heads, head_dim);
+  }
+
+  // 2. Incremental transition:
+  // Chunk 0 (0..512): LaunchBatchedAttention (Baseline)
+  strix::hip::LaunchBatchedAttention(
+      d_q, d_k, d_v, d_gate, d_cache_trans, d_cache_trans + cache_elements,
+      d_cache_trans_f16,
+      static_cast<std::uint16_t*>(d_cache_trans_f16) + cache_elements,
+      d_out_trans, 0, 0, chunk0_size, max_context, num_heads, num_kv_heads,
+      head_dim);
+
+  // Chunk 1 (512..1536): LaunchBatchedAttentionTile (Tiled FP16 at start_pos =
+  // 512)
+  const bool chunk1_ok = strix::hip::LaunchBatchedAttentionTile(
+      d_q + chunk0_size * attention_width, d_k + chunk0_size * kv_width,
+      d_v + chunk0_size * kv_width, d_gate + chunk0_size * attention_width,
+      d_cache_trans, d_cache_trans + cache_elements, d_cache_trans_f16,
+      static_cast<std::uint16_t*>(d_cache_trans_f16) + cache_elements,
+      d_out_trans + chunk0_size * attention_width, 0,
+      static_cast<std::uint32_t>(chunk0_size), chunk1_size, max_context,
+      num_heads, num_kv_heads, head_dim);
+  assert(chunk1_ok);
+
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<float> golden(q_size);
+  std::vector<float> transition(q_size);
+  HIP_CHECK(hipMemcpy(golden.data(), d_out_seq, q_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(transition.data(), d_out_trans, q_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  for (std::size_t token = 0; token < total_batch; ++token) {
+    for (std::size_t i = 0; i < attention_width; ++i) {
+      const float g = golden[token * attention_width + i];
+      const float tr = transition[token * attention_width + i];
+      const float diff = std::abs(g - tr);
+      if (diff > 1e-3F || !std::isfinite(tr)) {
+        std::cout << "Token " << token << " index " << i << " head "
+                  << (i / head_dim) << " dim " << (i % head_dim)
+                  << " golden=" << g << " trans=" << tr << " diff=" << diff
+                  << "\n";
+        goto done_diff;
+      }
+    }
+  }
+done_diff:
+  float max_diff = 0.0F;
+  for (std::size_t i = 0; i < q_size; ++i) {
+    max_diff = std::max(max_diff, std::abs(golden[i] - transition[i]));
+  }
+  std::cout << "Baseline-to-Tiled transition max diff: " << max_diff << "\n";
+  assert(max_diff < 5e-3F);
+
+  HIP_CHECK(hipFree(d_q));
+  HIP_CHECK(hipFree(d_k));
+  HIP_CHECK(hipFree(d_v));
+  HIP_CHECK(hipFree(d_gate));
+  HIP_CHECK(hipFree(d_cache_seq));
+  HIP_CHECK(hipFree(d_out_seq));
+  HIP_CHECK(hipFree(d_cache_trans));
+  HIP_CHECK(hipFree(d_out_trans));
+  HIP_CHECK(hipFree(d_cache_trans_f16));
+}
+
 int main() {
   int device_count = 0;
   HIP_CHECK(hipGetDeviceCount(&device_count));
@@ -1231,6 +1372,7 @@ int main() {
     return 0;
   }
 
+  TestBaselineToTiledKvCacheTransition();
   TestGpuRMSNorm();
   TestGpuResidualAdd();
   TestGpuGEMV();

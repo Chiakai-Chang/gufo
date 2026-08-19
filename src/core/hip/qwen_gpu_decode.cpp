@@ -80,12 +80,14 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                                   config.num_key_value_heads *
                                   arena_.GetMaxContext() * config.head_dim;
       const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
-      LaunchAttention(arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-                      arena_.d_kv_cache, arena_.d_kv_cache + total_k,
-                      arena_.d_ssm_out, attn_layer_idx, pos,
-                      arena_.GetMaxContext(), config.num_attention_heads,
-                      config.num_key_value_heads, config.head_dim,
-                      arena_.stream);
+      LaunchAttention(
+          arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+          arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+          arena_.d_attention_kv_f16,
+          static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+          arena_.d_ssm_out, attn_layer_idx, pos, arena_.GetMaxContext(),
+          config.num_attention_heads, config.num_key_value_heads,
+          config.head_dim, arena_.stream);
 
       // Output projection
       LaunchGEMV(layer.attn_output.data, o_bf16, arena_.d_ssm_out,
