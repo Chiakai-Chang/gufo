@@ -549,6 +549,29 @@ nix develop -c rocprofv3 \
     --repetitions 1
 ```
 
+### SSM rollback replay benchmark
+
+`benchmark_ssm_replay` loads the production model path, prepares one checkpoint,
+records a 16-token greedy target sequence, then measures recurrent rollback and
+accepted-input replay. Every row verifies the authoritative next token after
+the replay:
+
+```sh
+git add .
+nix build
+
+./result/bin/benchmark_ssm_replay \
+  --model <model.gguf> \
+  --context 128 \
+  --draft-lengths 1,2,4,8,16
+```
+
+Use the same executable with `STRIX_DISABLE_SSM_REPLAY=1` to measure the
+full-model replay fallback under identical model, build, and thermal
+conditions. The diagnostic fallback is intentionally slow because
+`ForwardToken(..., false)` executes the full layer stack without the logits
+tail or the decode graph.
+
 The report reserves resource fields for occupancy, VGPR, LDS, and scratch data
 produced by the profiler pass; they are `null` in the unprofiled timing report
 so profiler overhead is never presented as headline latency. Project-side

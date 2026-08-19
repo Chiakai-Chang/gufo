@@ -18,6 +18,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   if (prompt_tokens.empty()) {
     return 0;
   }
+  replaying_ssm_state_ = false;
+  arena_.DisableSsmReplayCapture();
+
   const std::size_t end_pos =
       static_cast<std::size_t>(start_pos) + prompt_tokens.size();
   if (end_pos > arena_.GetMaxContext()) {

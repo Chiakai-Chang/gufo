@@ -1,6 +1,8 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/core/hip/qwen_gpu_executor.hpp"
 
+#include <cstdlib>
+#include <string_view>
 #include <utility>
 
 #include "src/core/hip/detail/qwen_gpu_weight_regions.hpp"
@@ -8,6 +10,18 @@
 
 namespace strix::hip {
 using detail::ReleaseWeightRegions;
+namespace {
+
+bool IsSsmReplayEnabled() noexcept {
+  const char* value = std::getenv("STRIX_DISABLE_SSM_REPLAY");
+  if (value == nullptr) {
+    return true;
+  }
+  const std::string_view setting{value};
+  return setting == "0" || setting == "false" || setting == "off";
+}
+
+}  // namespace
 
 QwenGpuExecutor::QwenGpuExecutor(
     models::QwenModelWeights weights,
@@ -22,6 +36,48 @@ QwenGpuExecutor::QwenGpuExecutor(
 QwenGpuExecutor::~QwenGpuExecutor() {
   (void)hipStreamSynchronize(arena_.stream);
   ReleaseWeightRegions(weight_regions_);
+}
+
+void QwenGpuExecutor::Reset() noexcept {
+  replaying_ssm_state_ = false;
+  arena_.Reset();
+  graph_executor_.Reset();
+}
+
+void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
+  replaying_ssm_state_ = false;
+  arena_.SaveState(valid_context);
+  if (IsSsmReplayEnabled() && arena_.BeginSsmReplayCapture()) {
+    graph_executor_.Reset();
+  }
+}
+
+void QwenGpuExecutor::RestoreState() {
+  arena_.RestoreState();
+  replaying_ssm_state_ = IsSsmReplayEnabled();
+}
+
+void QwenGpuExecutor::ReplaySsmState(std::uint32_t position) {
+  const auto& config = weights_.config;
+  for (std::uint32_t layer_idx = 0; layer_idx < config.num_layers;
+       ++layer_idx) {
+    const auto& layer = weights_.layers[layer_idx];
+    if (layer.is_full_attention) {
+      continue;
+    }
+
+    LaunchSSMConvRecurrence(
+        arena_.GetReplayQkv(layer_idx, position),
+        static_cast<const float*>(layer.ssm_conv1d.data),
+        arena_.d_ssm_conv_state, arena_.d_conv_out, arena_.d_ssm_deltanet_state,
+        arena_.GetReplayAlpha(layer_idx, position),
+        arena_.GetReplayBeta(layer_idx, position),
+        static_cast<const float*>(layer.ssm_a.data),
+        static_cast<const float*>(layer.ssm_dt.data), nullptr, nullptr,
+        arena_.d_ssm_out, layer_idx, config.SsmQkvSize(),
+        config.ssm_group_count, config.ssm_time_step_rank,
+        config.ssm_state_size, config.SsmValueSize(), arena_.stream);
+  }
 }
 
 std::span<const float> QwenGpuExecutor::CopyLastLogits() {

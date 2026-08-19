@@ -36,7 +36,8 @@ let
       || relativePath == "src"
       || lib.hasPrefix "src/" relativePath
       || relativePath == "tools"
-      || relativePath == "tools/tune_hipblaslt.cpp";
+      || relativePath == "tools/tune_hipblaslt.cpp"
+      || relativePath == "tools/benchmark_ssm_replay.cpp";
   };
 in
 stdenv.mkDerivation (finalAttrs: {
@@ -98,6 +99,9 @@ stdenv.mkDerivation (finalAttrs: {
     fi
     if [ -f tune_hipblaslt ]; then
       cp tune_hipblaslt $out/bin/tune_hipblaslt
+    fi
+    if [ -f benchmark_ssm_replay ]; then
+      cp benchmark_ssm_replay $out/bin/benchmark_ssm_replay
     fi
     chmod +x $out/bin/*
 

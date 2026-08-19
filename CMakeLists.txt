@@ -203,11 +203,15 @@ if (ENGINE_ENABLE_HIP)
 
   add_executable(tune_hipblaslt tools/tune_hipblaslt.cpp)
   target_link_libraries(tune_hipblaslt PRIVATE strix_core hip::host)
+
+  add_executable(benchmark_ssm_replay tools/benchmark_ssm_replay.cpp)
+  target_link_libraries(benchmark_ssm_replay PRIVATE strix_core hip::host)
 endif()
 
 install(TARGETS strix strix-server strix-bench DESTINATION bin)
 if (ENGINE_ENABLE_HIP)
-  install(TARGETS strix-kernel-bench tune_hipblaslt DESTINATION bin)
+  install(TARGETS strix-kernel-bench tune_hipblaslt benchmark_ssm_replay
+    DESTINATION bin)
 endif()
 
 # CTest integration
@@ -351,6 +355,13 @@ if (BUILD_TESTING)
     target_link_libraries(qwen_gpu_ops_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME qwen_gpu_ops_test COMMAND qwen_gpu_ops_test)
     set_tests_properties(qwen_gpu_ops_test PROPERTIES LABELS "hip;gpu;kernels")
+
+    add_executable(persistent_deltanet_test
+      tests/kernels/persistent_deltanet_test.cpp)
+    target_link_libraries(persistent_deltanet_test PRIVATE strix_core hip::host)
+    add_test(NAME persistent_deltanet_test COMMAND persistent_deltanet_test)
+    set_tests_properties(persistent_deltanet_test PROPERTIES
+      LABELS "hip;gpu;kernels;deltanet;speculative")
 
     add_executable(gfx1151_acceptance_test tests/benchmarks/gfx1151_acceptance_test.cpp)
     target_link_libraries(gfx1151_acceptance_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)

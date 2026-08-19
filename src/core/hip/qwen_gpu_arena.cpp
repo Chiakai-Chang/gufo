@@ -56,7 +56,8 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   HIP_CHECK(hipMalloc(&d_alpha_buf, batch * time_step_rank * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_beta_buf, batch * time_step_rank * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_logits, vocab_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_prompt_tokens, batch * sizeof(std::uint32_t)));
+  HIP_CHECK(hipMalloc(&d_prompt_tokens,
+                      std::max<std::size_t>(batch, 2) * sizeof(std::uint32_t)));
 
   const std::size_t scratch_elements =
       batch * std::max<std::size_t>(
@@ -117,12 +118,17 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   hipblas_handle = other.hipblas_handle;
   hipblaslt_gemm = std::move(other.hipblaslt_gemm);
   d_scratch_bf16 = other.d_scratch_bf16;
-  d_saved_kv_cache_ = other.d_saved_kv_cache_;
-  d_saved_attention_kv_f16_ = other.d_saved_attention_kv_f16_;
   d_saved_ssm_conv_state_ = other.d_saved_ssm_conv_state_;
   d_saved_ssm_deltanet_state_ = other.d_saved_ssm_deltanet_state_;
+  d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
+  d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
+  d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
+  d_ssm_replay_enabled_ = other.d_ssm_replay_enabled_;
   saved_context_ = other.saved_context_;
+  replay_last_position_ = other.replay_last_position_;
+  replay_captured_positions_ = other.replay_captured_positions_;
   has_saved_state_ = other.has_saved_state_;
+  replay_capture_active_ = other.replay_capture_active_;
 
   other.d_hidden = nullptr;
   other.d_normed = nullptr;
@@ -149,12 +155,17 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.stream = nullptr;
   other.hipblas_handle = nullptr;
   other.d_scratch_bf16 = nullptr;
-  other.d_saved_kv_cache_ = nullptr;
-  other.d_saved_attention_kv_f16_ = nullptr;
   other.d_saved_ssm_conv_state_ = nullptr;
   other.d_saved_ssm_deltanet_state_ = nullptr;
+  other.d_ssm_replay_qkv_ = nullptr;
+  other.d_ssm_replay_alpha_ = nullptr;
+  other.d_ssm_replay_beta_ = nullptr;
+  other.d_ssm_replay_enabled_ = nullptr;
   other.saved_context_ = 0;
+  other.replay_last_position_ = 0;
+  other.replay_captured_positions_ = 0;
   other.has_saved_state_ = false;
+  other.replay_capture_active_ = false;
 }
 
 QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
@@ -189,12 +200,17 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     hipblas_handle = other.hipblas_handle;
     hipblaslt_gemm = std::move(other.hipblaslt_gemm);
     d_scratch_bf16 = other.d_scratch_bf16;
-    d_saved_kv_cache_ = other.d_saved_kv_cache_;
-    d_saved_attention_kv_f16_ = other.d_saved_attention_kv_f16_;
     d_saved_ssm_conv_state_ = other.d_saved_ssm_conv_state_;
     d_saved_ssm_deltanet_state_ = other.d_saved_ssm_deltanet_state_;
+    d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
+    d_ssm_replay_alpha_ = other.d_ssm_replay_alpha_;
+    d_ssm_replay_beta_ = other.d_ssm_replay_beta_;
+    d_ssm_replay_enabled_ = other.d_ssm_replay_enabled_;
     saved_context_ = other.saved_context_;
+    replay_last_position_ = other.replay_last_position_;
+    replay_captured_positions_ = other.replay_captured_positions_;
     has_saved_state_ = other.has_saved_state_;
+    replay_capture_active_ = other.replay_capture_active_;
 
     other.d_hidden = nullptr;
     other.d_normed = nullptr;
@@ -221,12 +237,17 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.stream = nullptr;
     other.hipblas_handle = nullptr;
     other.d_scratch_bf16 = nullptr;
-    other.d_saved_kv_cache_ = nullptr;
-    other.d_saved_attention_kv_f16_ = nullptr;
     other.d_saved_ssm_conv_state_ = nullptr;
     other.d_saved_ssm_deltanet_state_ = nullptr;
+    other.d_ssm_replay_qkv_ = nullptr;
+    other.d_ssm_replay_alpha_ = nullptr;
+    other.d_ssm_replay_beta_ = nullptr;
+    other.d_ssm_replay_enabled_ = nullptr;
     other.saved_context_ = 0;
+    other.replay_last_position_ = 0;
+    other.replay_captured_positions_ = 0;
     other.has_saved_state_ = false;
+    other.replay_capture_active_ = false;
   }
   return *this;
 }
@@ -254,25 +275,24 @@ void QwenGpuArena::Reset() noexcept {
     HIP_CHECK(hipMemsetAsync(d_ssm_deltanet_state, 0,
                              total_deltanet * sizeof(float), stream));
   }
+  DisableSsmReplayCapture();
+  saved_context_ = 0;
+  replay_last_position_ = 0;
+  replay_captured_positions_ = 0;
+  has_saved_state_ = false;
 }
 
-void QwenGpuArena::AllocateStateSnapshot() {
-  if (d_saved_kv_cache_ != nullptr) {
+void QwenGpuArena::AllocateRecurrentSnapshot() {
+  if (d_saved_ssm_conv_state_ != nullptr) {
     return;
   }
 
-  const std::size_t total_kv = config_.FullAttentionLayerCount() *
-                               config_.num_key_value_heads * max_context_ *
-                               config_.head_dim * 2;
   const std::size_t total_conv =
       config_.num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
   const std::size_t total_deltanet =
       config_.num_layers * config_.ssm_time_step_rank * config_.ssm_state_size *
       config_.SsmValueSize();
 
-  HIP_CHECK(hipMalloc(&d_saved_kv_cache_, total_kv * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&d_saved_attention_kv_f16_, total_kv * sizeof(std::uint16_t)));
   HIP_CHECK(hipMalloc(&d_saved_ssm_conv_state_, total_conv * sizeof(float)));
   HIP_CHECK(
       hipMalloc(&d_saved_ssm_deltanet_state_, total_deltanet * sizeof(float)));
@@ -282,41 +302,17 @@ void QwenGpuArena::SaveState(std::uint32_t valid_context) {
   if (valid_context > max_context_) {
     throw std::length_error("saved GPU state exceeds the context length");
   }
-  AllocateStateSnapshot();
+  AllocateRecurrentSnapshot();
 
-  const std::size_t attention_layers = config_.FullAttentionLayerCount();
-  const std::size_t num_kv_heads = config_.num_key_value_heads;
-  const std::size_t head_dim = config_.head_dim;
-  const std::size_t kv_width = num_kv_heads * head_dim;
-  const std::size_t total_kv =
-      attention_layers * num_kv_heads * max_context_ * head_dim;
   const std::size_t total_conv =
       config_.num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
   const std::size_t total_deltanet =
       config_.num_layers * config_.ssm_time_step_rank * config_.ssm_state_size *
       config_.SsmValueSize();
 
-  for (std::size_t cache = 0; cache < 2; ++cache) {
-    for (std::size_t layer = 0; layer < attention_layers; ++layer) {
-      for (std::size_t head = 0; head < num_kv_heads; ++head) {
-        const std::size_t offset =
-            (cache * total_kv) +
-            (((layer * num_kv_heads + head) * max_context_) * head_dim);
-        HIP_CHECK(hipMemcpyAsync(
-            d_saved_kv_cache_ + offset, d_kv_cache + offset,
-            static_cast<std::size_t>(valid_context) * head_dim * sizeof(float),
-            hipMemcpyDeviceToDevice, stream));
-      }
-      const std::size_t offset =
-          (cache * total_kv) + (layer * max_context_ * kv_width);
-      HIP_CHECK(hipMemcpyAsync(
-          static_cast<std::uint16_t*>(d_saved_attention_kv_f16_) + offset,
-          static_cast<const std::uint16_t*>(d_attention_kv_f16) + offset,
-          static_cast<std::size_t>(valid_context) * kv_width *
-              sizeof(std::uint16_t),
-          hipMemcpyDeviceToDevice, stream));
-    }
-  }
+  // KV entries are append-only and every attention launch is bounded by its
+  // explicit position. Draft entries beyond valid_context can remain in place:
+  // accepted positions reuse them and rejected positions are overwritten.
   HIP_CHECK(hipMemcpyAsync(d_saved_ssm_conv_state_, d_ssm_conv_state,
                            total_conv * sizeof(float), hipMemcpyDeviceToDevice,
                            stream));
@@ -325,6 +321,8 @@ void QwenGpuArena::SaveState(std::uint32_t valid_context) {
                            hipMemcpyDeviceToDevice, stream));
   HIP_CHECK(hipStreamSynchronize(stream));
   saved_context_ = valid_context;
+  replay_last_position_ = valid_context;
+  replay_captured_positions_ = 0;
   has_saved_state_ = true;
 }
 
@@ -333,39 +331,12 @@ void QwenGpuArena::RestoreState() {
     throw std::logic_error("GPU state has not been saved");
   }
 
-  const std::size_t attention_layers = config_.FullAttentionLayerCount();
-  const std::size_t num_kv_heads = config_.num_key_value_heads;
-  const std::size_t head_dim = config_.head_dim;
-  const std::size_t kv_width = num_kv_heads * head_dim;
-  const std::size_t total_kv =
-      attention_layers * num_kv_heads * max_context_ * head_dim;
   const std::size_t total_conv =
       config_.num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
   const std::size_t total_deltanet =
       config_.num_layers * config_.ssm_time_step_rank * config_.ssm_state_size *
       config_.SsmValueSize();
 
-  for (std::size_t cache = 0; cache < 2; ++cache) {
-    for (std::size_t layer = 0; layer < attention_layers; ++layer) {
-      for (std::size_t head = 0; head < num_kv_heads; ++head) {
-        const std::size_t offset =
-            (cache * total_kv) +
-            (((layer * num_kv_heads + head) * max_context_) * head_dim);
-        HIP_CHECK(hipMemcpyAsync(
-            d_kv_cache + offset, d_saved_kv_cache_ + offset,
-            static_cast<std::size_t>(saved_context_) * head_dim * sizeof(float),
-            hipMemcpyDeviceToDevice, stream));
-      }
-      const std::size_t offset =
-          (cache * total_kv) + (layer * max_context_ * kv_width);
-      HIP_CHECK(hipMemcpyAsync(
-          static_cast<std::uint16_t*>(d_attention_kv_f16) + offset,
-          static_cast<const std::uint16_t*>(d_saved_attention_kv_f16_) + offset,
-          static_cast<std::size_t>(saved_context_) * kv_width *
-              sizeof(std::uint16_t),
-          hipMemcpyDeviceToDevice, stream));
-    }
-  }
   HIP_CHECK(hipMemcpyAsync(d_ssm_conv_state, d_saved_ssm_conv_state_,
                            total_conv * sizeof(float), hipMemcpyDeviceToDevice,
                            stream));
@@ -373,6 +344,110 @@ void QwenGpuArena::RestoreState() {
                            total_deltanet * sizeof(float),
                            hipMemcpyDeviceToDevice, stream));
   HIP_CHECK(hipStreamSynchronize(stream));
+}
+
+bool QwenGpuArena::AllocateSsmReplayLog() {
+  if (d_ssm_replay_qkv_ != nullptr) {
+    return false;
+  }
+
+  const std::size_t layer_slots =
+      static_cast<std::size_t>(config_.num_layers) * kSsmReplayCapacity;
+  HIP_CHECK(hipMalloc(&d_ssm_replay_qkv_,
+                      layer_slots * config_.SsmQkvSize() * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&d_ssm_replay_alpha_,
+                layer_slots * config_.ssm_time_step_rank * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&d_ssm_replay_beta_,
+                layer_slots * config_.ssm_time_step_rank * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_replay_enabled_, sizeof(std::uint32_t)));
+  return true;
+}
+
+bool QwenGpuArena::BeginSsmReplayCapture() {
+  const bool allocated = AllocateSsmReplayLog();
+  HIP_CHECK(
+      hipMemsetAsync(d_ssm_replay_enabled_, 1, sizeof(std::uint32_t), stream));
+  replay_capture_active_ = true;
+  replay_last_position_ = saved_context_;
+  replay_captured_positions_ = 0;
+  return allocated;
+}
+
+void QwenGpuArena::DisableSsmReplayCapture() noexcept {
+  if (d_ssm_replay_enabled_ != nullptr) {
+    HIP_CHECK(hipMemsetAsync(d_ssm_replay_enabled_, 0, sizeof(std::uint32_t),
+                             stream));
+  }
+  replay_capture_active_ = false;
+}
+
+void QwenGpuArena::MarkSsmReplayPosition(std::uint32_t position) noexcept {
+  if (replay_capture_active_ && position >= saved_context_) {
+    replay_last_position_ = std::max(replay_last_position_, position);
+    replay_captured_positions_ =
+        std::max(replay_captured_positions_,
+                 static_cast<std::size_t>(position - saved_context_) + 1);
+  }
+}
+
+bool QwenGpuArena::CanReplaySsmPosition(std::uint32_t position) const noexcept {
+  if (!has_saved_state_ || d_ssm_replay_qkv_ == nullptr ||
+      replay_captured_positions_ == 0) {
+    return false;
+  }
+  return replay_captured_positions_ <= kSsmReplayCapacity &&
+         position >= saved_context_ && position <= replay_last_position_;
+}
+
+SsmReplayCapture QwenGpuArena::GetSsmReplayCapture() const noexcept {
+  return {
+      .qkv = d_ssm_replay_qkv_,
+      .alpha = d_ssm_replay_alpha_,
+      .beta = d_ssm_replay_beta_,
+      .position = d_prompt_tokens + 1,
+      .enabled = d_ssm_replay_enabled_,
+  };
+}
+
+const float* QwenGpuArena::GetReplayQkv(std::uint32_t layer,
+                                        std::uint32_t position) const {
+  if (!CanReplaySsmPosition(position)) {
+    throw std::out_of_range("SSM replay position is outside the capture");
+  }
+  const std::size_t slot =
+      static_cast<std::size_t>(position) % kSsmReplayCapacity;
+  const std::size_t offset =
+      (static_cast<std::size_t>(layer) * kSsmReplayCapacity + slot) *
+      config_.SsmQkvSize();
+  return d_ssm_replay_qkv_ + offset;
+}
+
+const float* QwenGpuArena::GetReplayAlpha(std::uint32_t layer,
+                                          std::uint32_t position) const {
+  if (!CanReplaySsmPosition(position)) {
+    throw std::out_of_range("SSM replay position is outside the capture");
+  }
+  const std::size_t slot =
+      static_cast<std::size_t>(position) % kSsmReplayCapacity;
+  const std::size_t offset =
+      (static_cast<std::size_t>(layer) * kSsmReplayCapacity + slot) *
+      config_.ssm_time_step_rank;
+  return d_ssm_replay_alpha_ + offset;
+}
+
+const float* QwenGpuArena::GetReplayBeta(std::uint32_t layer,
+                                         std::uint32_t position) const {
+  if (!CanReplaySsmPosition(position)) {
+    throw std::out_of_range("SSM replay position is outside the capture");
+  }
+  const std::size_t slot =
+      static_cast<std::size_t>(position) % kSsmReplayCapacity;
+  const std::size_t offset =
+      (static_cast<std::size_t>(layer) * kSsmReplayCapacity + slot) *
+      config_.ssm_time_step_rank;
+  return d_ssm_replay_beta_ + offset;
 }
 
 void QwenGpuArena::FreeAll() noexcept {
@@ -422,14 +497,18 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_prompt_tokens));
   if (d_scratch_bf16 != nullptr)
     HIP_CHECK(hipFree(d_scratch_bf16));
-  if (d_saved_kv_cache_ != nullptr)
-    HIP_CHECK(hipFree(d_saved_kv_cache_));
-  if (d_saved_attention_kv_f16_ != nullptr)
-    HIP_CHECK(hipFree(d_saved_attention_kv_f16_));
   if (d_saved_ssm_conv_state_ != nullptr)
     HIP_CHECK(hipFree(d_saved_ssm_conv_state_));
   if (d_saved_ssm_deltanet_state_ != nullptr)
     HIP_CHECK(hipFree(d_saved_ssm_deltanet_state_));
+  if (d_ssm_replay_qkv_ != nullptr)
+    HIP_CHECK(hipFree(d_ssm_replay_qkv_));
+  if (d_ssm_replay_alpha_ != nullptr)
+    HIP_CHECK(hipFree(d_ssm_replay_alpha_));
+  if (d_ssm_replay_beta_ != nullptr)
+    HIP_CHECK(hipFree(d_ssm_replay_beta_));
+  if (d_ssm_replay_enabled_ != nullptr)
+    HIP_CHECK(hipFree(d_ssm_replay_enabled_));
   if (hipblas_handle != nullptr)
     HIPBLAS_CHECK(hipblasDestroy(hipblas_handle));
   hipblaslt_gemm.reset();
@@ -459,12 +538,17 @@ void QwenGpuArena::FreeAll() noexcept {
   d_ssm_deltanet_state = nullptr;
   d_prompt_tokens = nullptr;
   d_scratch_bf16 = nullptr;
-  d_saved_kv_cache_ = nullptr;
-  d_saved_attention_kv_f16_ = nullptr;
   d_saved_ssm_conv_state_ = nullptr;
   d_saved_ssm_deltanet_state_ = nullptr;
+  d_ssm_replay_qkv_ = nullptr;
+  d_ssm_replay_alpha_ = nullptr;
+  d_ssm_replay_beta_ = nullptr;
+  d_ssm_replay_enabled_ = nullptr;
   saved_context_ = 0;
+  replay_last_position_ = 0;
+  replay_captured_positions_ = 0;
   has_saved_state_ = false;
+  replay_capture_active_ = false;
   hipblas_handle = nullptr;
   stream = nullptr;
 }

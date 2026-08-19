@@ -12,6 +12,16 @@
 
 namespace strix::hip {
 
+inline constexpr std::size_t kSsmReplayCapacity = 16;
+
+struct SsmReplayCapture {
+  float* qkv{nullptr};
+  float* alpha{nullptr};
+  float* beta{nullptr};
+  const std::uint32_t* position{nullptr};
+  const std::uint32_t* enabled{nullptr};
+};
+
 struct HipblasLtDispatchInfo {
   int algorithm_id{-1};
   std::string solution_name;
@@ -191,7 +201,7 @@ void LaunchSSMConvRecurrence(
     const float* ssm_norm, const float* gate, float* out_buf,
     std::uint32_t layer_idx, std::size_t qkv_size, std::uint32_t num_key_heads,
     std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
-    hipStream_t stream = nullptr);
+    hipStream_t stream = nullptr, SsmReplayCapture replay_capture = {});
 
 /// Computes parallel GPU argmax reduction over logits
 void LaunchGPUArgmax(const float* logits, std::uint32_t* out_token,

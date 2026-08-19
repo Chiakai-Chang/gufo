@@ -1273,11 +1273,24 @@ __global__ void PerHeadRMSNormKernel(const float* __restrict__ x,
 __global__ void SSMConvKernel(const float* __restrict__ qkv_in,
                               const float* __restrict__ conv_weights,
                               float* __restrict__ conv_state,
-                              float* __restrict__ conv_out,
-                              std::size_t qkv_dim) {
+                              float* __restrict__ conv_out, std::size_t qkv_dim,
+                              std::uint32_t layer_idx,
+                              SsmReplayCapture replay_capture) {
   const std::size_t c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= qkv_dim)
     return;
+
+  if (replay_capture.qkv != nullptr && replay_capture.position != nullptr &&
+      replay_capture.enabled != nullptr && replay_capture.enabled[0] != 0U) {
+    const std::size_t slot =
+        static_cast<std::size_t>(replay_capture.position[0]) %
+        kSsmReplayCapacity;
+    const std::size_t offset =
+        ((static_cast<std::size_t>(layer_idx) * kSsmReplayCapacity + slot) *
+         qkv_dim) +
+        c;
+    replay_capture.qkv[offset] = qkv_in[c];
+  }
 
   const std::size_t c_off = c * 4;
   conv_state[c_off + 0] = conv_state[c_off + 1];
@@ -1305,7 +1318,7 @@ __global__ void DeltaNetRecurrenceKernel(
     const float* __restrict__ ssm_norm, const float* __restrict__ gate,
     float* __restrict__ out_buf, std::uint32_t layer_idx,
     std::uint32_t num_key_heads, std::uint32_t num_heads, std::uint32_t key_dim,
-    std::uint32_t val_dim) {
+    std::uint32_t val_dim, SsmReplayCapture replay_capture) {
   const std::uint32_t h = blockIdx.x;
   if (h >= num_heads)
     return;
@@ -1332,6 +1345,20 @@ __global__ void DeltaNetRecurrenceKernel(
   const float a_val = (ssm_a != nullptr) ? ssm_a[h] : -0.05F;
   const float alpha_in = (alpha_buf != nullptr) ? alpha_buf[h] : 0.0F;
   const float beta_in = (beta_buf != nullptr) ? beta_buf[h] : 0.0F;
+
+  if (tid == 0 && replay_capture.alpha != nullptr &&
+      replay_capture.beta != nullptr && replay_capture.position != nullptr &&
+      replay_capture.enabled != nullptr && replay_capture.enabled[0] != 0U) {
+    const std::size_t slot =
+        static_cast<std::size_t>(replay_capture.position[0]) %
+        kSsmReplayCapacity;
+    const std::size_t offset =
+        ((static_cast<std::size_t>(layer_idx) * kSsmReplayCapacity + slot) *
+         num_heads) +
+        h;
+    replay_capture.alpha[offset] = alpha_in;
+    replay_capture.beta[offset] = beta_in;
+  }
 
   const float alpha_biased = alpha_in + dt;
   const float alpha_softplus =
@@ -1623,27 +1650,27 @@ void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
                                                       head_dim, eps);
 }
 
-void LaunchSSMConvRecurrence(const float* qkv_in, const float* conv_weights,
-                             float* conv_state, float* conv_out,
-                             float* deltanet_state, const float* alpha_buf,
-                             const float* beta_buf, const float* ssm_a,
-                             const float* ssm_dt, const float* ssm_norm,
-                             const float* gate, float* out_buf,
-                             std::uint32_t layer_idx, std::size_t qkv_size,
-                             std::uint32_t num_key_heads,
-                             std::uint32_t num_heads, std::uint32_t key_dim,
-                             std::uint32_t val_dim, hipStream_t stream) {
+void LaunchSSMConvRecurrence(
+    const float* qkv_in, const float* conv_weights, float* conv_state,
+    float* conv_out, float* deltanet_state, const float* alpha_buf,
+    const float* beta_buf, const float* ssm_a, const float* ssm_dt,
+    const float* ssm_norm, const float* gate, float* out_buf,
+    std::uint32_t layer_idx, std::size_t qkv_size, std::uint32_t num_key_heads,
+    std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
+    hipStream_t stream, SsmReplayCapture replay_capture) {
   const std::size_t block_size = 256;
   const std::size_t grid_size = (qkv_size + block_size - 1) / block_size;
   float* conv_layer_state =
       conv_state + (static_cast<std::size_t>(layer_idx) * qkv_size * 4);
 
   SSMConvKernel<<<grid_size, block_size, 0, stream>>>(
-      qkv_in, conv_weights, conv_layer_state, conv_out, qkv_size);
+      qkv_in, conv_weights, conv_layer_state, conv_out, qkv_size, layer_idx,
+      replay_capture);
 
   DeltaNetRecurrenceKernel<<<num_heads, 256, 0, stream>>>(
       conv_out, deltanet_state, alpha_buf, beta_buf, ssm_a, ssm_dt, ssm_norm,
-      gate, out_buf, layer_idx, num_key_heads, num_heads, key_dim, val_dim);
+      gate, out_buf, layer_idx, num_key_heads, num_heads, key_dim, val_dim,
+      replay_capture);
 }
 
 __global__ void ArgmaxKernel(const float* __restrict__ logits,

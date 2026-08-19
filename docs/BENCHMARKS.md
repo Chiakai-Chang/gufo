@@ -146,6 +146,12 @@ verified improvement, and writes a hardware/ROCm-bound binary database. Set
 `strix-bench`, or `strix-kernel-bench`. Generated databases are local benchmark
 artifacts and are not committed.
 
+`benchmark_ssm_replay` compares speculative recurrent rollback at draft lengths
+1, 2, 4, 8, and 16. It reports checkpoint latency, rollback-plus-replay
+latency, and authoritative next-token verification. The default path uses the
+device SSM input ring; `STRIX_DISABLE_SSM_REPLAY=1` selects the full-model
+fallback for a matched comparison.
+
 ## Machine Fingerprint & Artifact Binding
 
 All diagnostic and benchmark artifacts must embed a canonical machine fingerprint

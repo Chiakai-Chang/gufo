@@ -13,6 +13,20 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
     throw std::length_error("token position exceeds the GPU context length");
   }
 
+  if (replaying_ssm_state_ && !compute_logits) {
+    if (arena_.CanReplaySsmPosition(pos)) {
+      ReplaySsmState(pos);
+      return 0;
+    }
+    replaying_ssm_state_ = false;
+    arena_.DisableSsmReplayCapture();
+  } else if (replaying_ssm_state_) {
+    replaying_ssm_state_ = false;
+    arena_.DisableSsmReplayCapture();
+  }
+
+  arena_.MarkSsmReplayPosition(pos);
+
   const auto& config = weights_.config;
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
@@ -146,7 +160,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
             static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
             arena_.d_ssm_out, l, ssm_qkv_size, config.ssm_group_count,
             config.ssm_time_step_rank, config.ssm_state_size,
-            config.SsmValueSize(), arena_.stream);
+            config.SsmValueSize(), arena_.stream, arena_.GetSsmReplayCapture());
 
         LaunchGEMV(layer.ssm_out.data, out_bf16, arena_.d_ssm_out,
                    arena_.d_attn_out, hidden_size, ssm_inner_size,

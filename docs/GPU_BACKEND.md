@@ -198,6 +198,27 @@ implemented and validated on gfx1151, treat baseline-to-tiled transitions as a
 separate correctness/performance follow-up rather than changing that policy as
 part of structural refactors.
 
+### DeltaNet recurrence and speculative rollback
+
+Prompt recurrence uses one persistent Wave32 block per DeltaNet head. Each
+adjacent lane pair owns one 128-value state row, keeps that row in registers
+across the token chunk, and writes it back once. The retained gfx1151 kernel
+uses 136 VGPRs, 1,536 bytes of LDS, and no scratch memory.
+
+Speculative checkpoints copy only convolution and DeltaNet state. KV cache
+entries are append-only, attention reads are bounded by the explicit token
+position, and rejected entries are overwritten by the authoritative decode.
+Copying the valid KV prefix into a second multi-gigabyte allocation is
+therefore redundant.
+
+During target verification, the decode recurrence records projected
+QKV/alpha/beta inputs in a 16-position device ring. After a rejection,
+accepted positions call the same decode recurrence kernels with those recorded
+inputs instead of rerunning embeddings, attention, FFN, and LM-head
+projections. Draft windows larger than 16 or incomplete captures use the
+original full-model replay path. Set `STRIX_DISABLE_SSM_REPLAY=1` only for
+fallback diagnosis or benchmark comparison.
+
 ### MoE
 
 - GPU router and top-k baseline.

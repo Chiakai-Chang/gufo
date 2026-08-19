@@ -21,6 +21,7 @@
 #include <hipblas/hipblas.h>
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+#include "src/core/hip/qwen_gpu_ops.hpp"
 
 namespace strix::hip {
 
@@ -49,6 +50,18 @@ public:
   void Reset() noexcept;
   void SaveState(std::uint32_t valid_context);
   void RestoreState();
+  [[nodiscard]] bool BeginSsmReplayCapture();
+  void DisableSsmReplayCapture() noexcept;
+  void MarkSsmReplayPosition(std::uint32_t position) noexcept;
+  [[nodiscard]] bool CanReplaySsmPosition(
+      std::uint32_t position) const noexcept;
+  [[nodiscard]] SsmReplayCapture GetSsmReplayCapture() const noexcept;
+  [[nodiscard]] const float* GetReplayQkv(std::uint32_t layer,
+                                          std::uint32_t position) const;
+  [[nodiscard]] const float* GetReplayAlpha(std::uint32_t layer,
+                                            std::uint32_t position) const;
+  [[nodiscard]] const float* GetReplayBeta(std::uint32_t layer,
+                                           std::uint32_t position) const;
 
   float* d_hidden{nullptr};
   float* d_normed{nullptr};
@@ -87,17 +100,23 @@ public:
 
 private:
   void FreeAll() noexcept;
-  void AllocateStateSnapshot();
+  void AllocateRecurrentSnapshot();
+  [[nodiscard]] bool AllocateSsmReplayLog();
 
   core::ModelConfig config_;
   std::uint32_t max_context_;
   std::uint32_t max_batch_;
-  float* d_saved_kv_cache_{nullptr};
-  void* d_saved_attention_kv_f16_{nullptr};
   float* d_saved_ssm_conv_state_{nullptr};
   float* d_saved_ssm_deltanet_state_{nullptr};
+  float* d_ssm_replay_qkv_{nullptr};
+  float* d_ssm_replay_alpha_{nullptr};
+  float* d_ssm_replay_beta_{nullptr};
+  std::uint32_t* d_ssm_replay_enabled_{nullptr};
   std::uint32_t saved_context_{0};
+  std::uint32_t replay_last_position_{0};
+  std::size_t replay_captured_positions_{0};
   bool has_saved_state_{false};
+  bool replay_capture_active_{false};
 };
 
 /// End-to-end GPU model executor running directly on the gfx1151 RDNA 3.5 CUs.
@@ -151,16 +170,13 @@ public:
   }
 
   /// Resets GPU cache and recurrent states in the arena.
-  void Reset() noexcept {
-    arena_.Reset();
-    graph_executor_.Reset();
-  }
-  void SaveState(std::uint32_t valid_context) {
-    arena_.SaveState(valid_context);
-  }
-  void RestoreState() { arena_.RestoreState(); }
+  void Reset() noexcept;
+  void SaveState(std::uint32_t valid_context);
+  void RestoreState();
 
 private:
+  void ReplaySsmState(std::uint32_t position);
+
   [[nodiscard]] tokenization::TokenId ForwardPromptChunk(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t start_pos, bool compute_logits);
@@ -171,6 +187,7 @@ private:
   QwenGpuArena arena_;
   detail::HipGraphDecodeExecutor graph_executor_;
   std::vector<float> h_logits_;
+  bool replaying_ssm_state_{false};
 };
 
 }  // namespace strix::hip

@@ -396,6 +396,41 @@ scratch traffic.
 
 This is a 7.55x `pp512` throughput improvement.
 
+The same two-lane kernel is persistent across each prefill chunk. A focused
+batch sweep on the release package measured:
+
+| DeltaNet batch | Median | Isolated throughput |
+| ---: | ---: | ---: |
+| 1 | 24.75 us | 40,409 tok/s |
+| 2 | 26.69 us | 74,934 tok/s |
+| 4 | 31.96 us | 125,156 tok/s |
+| 8 | 43.78 us | 182,721 tok/s |
+| 16 | 67.89 us | 235,682 tok/s |
+| 32 | 119.73 us | 267,279 tok/s |
+
+The batch-16 profiler trace reports 136 VGPRs, 1,536 bytes of LDS, and zero
+scratch. Speculative rollback now snapshots only mutable convolution and
+DeltaNet state; append-only KV entries remain position-bounded and are
+overwritten when rejected. Decode records projected SSM inputs in a
+16-position ring and replays the accepted recurrence inputs rather than the
+full model.
+
+On the 27B BF16 model at depth 128, first checkpoint time fell from 564.59 ms
+to 11.19 ms while `tg1` remained 3.72 versus 3.73 tok/s. The matched replay
+benchmark produced:
+
+| Accepted draft | Full-model replay | SSM input replay | Speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 4,146.21 ms | 43.06 ms | 96.3x |
+| 2 | 8,290.26 ms | 83.99 ms | 98.7x |
+| 4 | 16,572.47 ms | 166.10 ms | 99.8x |
+| 8 | 33,159.18 ms | 330.79 ms | 100.2x |
+| 16 | 66,348.93 ms | 659.37 ms | 100.6x |
+
+Every replay length reproduced the authoritative correction token. The focused
+GPU regression additionally checks bitwise convolution and DeltaNet state
+agreement, ring wrap, and recurrent-only snapshot restoration.
+
 The activation arena supports batches through 4096 tokens, while chunked
 prefill extends persistent KV and recurrent state to the configured context
 limit with absolute RoPE positions. Prompts below 1024 tokens use the
@@ -500,6 +535,8 @@ The runtime includes a provider-neutral speculative decoding engine (`Speculativ
 
 - PASS: hipBLASLt large-projection plans raised `pp512` from 46.47 to more than 300 tok/s.
 - PASS: two-lane DeltaNet recurrence removed 988 bytes/thread of scratch and reduced VGPR use from 192 to 136.
+- PASS: recurrent-only checkpoints cut the 27B depth-128 save from 564.59 ms to 11.19 ms.
+- PASS: logged SSM input replay reduced accepted-token rollback by 96-101x for draft lengths 1-16.
 - PASS: wave-cooperative short-prompt attention improved `pp512` without changing top-1 logits.
 - PASS: grouped GQA GEMM attention raised `pp4096` from 242.04 to 277.46 tok/s.
 - PASS: 512-thread fused FFN gate/up and down-projection GEMVs raised decode from 4.17 to 4.31 tok/s.
