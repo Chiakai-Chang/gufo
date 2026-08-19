@@ -157,7 +157,7 @@ endif()
 
 if (ENGINE_ENABLE_XRT)
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_XRT=1)
-  target_include_directories(strix_core PRIVATE ${XRT_INCLUDE_DIR})
+  target_include_directories(strix_core PUBLIC ${XRT_INCLUDE_DIR})
   target_link_libraries(strix_core PUBLIC ${XRT_COREUTIL_LIB})
 endif()
 

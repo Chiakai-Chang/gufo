@@ -20,8 +20,12 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
+#include "src/core/heterogeneous/npu_drafter.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_executor.hpp"
+#include "src/core/speculative/draft_heads.hpp"
+#include "src/core/speculative/self_speculative.hpp"
+#include "src/core/speculative/speculative_verifier.hpp"
 #endif
 
 namespace strix::server {
@@ -300,6 +304,35 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       continue;
     }
 
+    if (arg == "--speculative") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --speculative";
+        }
+        return std::nullopt;
+      }
+      opt.speculative_backend = std::string(args[i + 1]);
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "--draft-tokens") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --draft-tokens";
+        }
+        return std::nullopt;
+      }
+      std::uint32_t k = 0;
+      const std::string_view val = args[i + 1];
+      std::from_chars(val.data(), val.data() + val.size(), k);
+      if (k > 0) {
+        opt.draft_tokens = k;
+      }
+      skip_next = true;
+      continue;
+    }
+
     if (arg == "-v" || arg == "--verbose") {
       opt.verbose = true;
       continue;
@@ -550,12 +583,64 @@ int RunBench(std::span<const char* const> args) {
       for (std::size_t r = 0; r < opt.repetitions; ++r) {
         restore_depth();
 
+        std::unique_ptr<speculative::IDraftBackend> draft_backend;
+        if (opt.speculative_backend == "mtp") {
+          speculative::MtpDraftHeadConfig cfg;
+          cfg.num_heads = opt.draft_tokens;
+          cfg.hidden_size = config.hidden_size;
+          cfg.vocab_size = config.vocab_size;
+          draft_backend = std::make_unique<speculative::MtpDraftBackend>(cfg);
+        } else if (opt.speculative_backend == "self") {
+          speculative::SelfSpeculativeConfig cfg;
+          cfg.total_layers = config.num_layers;
+          cfg.exit_layer = std::max<std::uint32_t>(4U, config.num_layers / 4);
+          cfg.draft_step_count = opt.draft_tokens;
+          draft_backend =
+              std::make_unique<speculative::SelfSpeculativeBackend>(cfg);
+        } else if (opt.speculative_backend == "npu") {
+          heterogeneous::NpuDrafterConfig cfg;
+          cfg.max_draft_tokens = opt.draft_tokens;
+          cfg.vocab_size = config.vocab_size;
+          draft_backend = std::make_unique<heterogeneous::NpuDraftBackend>(cfg);
+        }
+
+        std::unique_ptr<speculative::SpeculativeVerifier> spec_verifier;
+        if (draft_backend) {
+          speculative::SpeculativeOptions s_opts;
+          s_opts.max_draft_tokens = opt.draft_tokens;
+          s_opts.initial_draft_tokens = opt.draft_tokens;
+          spec_verifier = std::make_unique<speculative::SpeculativeVerifier>(
+              *gpu_exec, std::move(draft_backend), s_opts);
+        }
+
         const auto t0 = std::chrono::high_resolution_clock::now();
-        for (std::size_t step = 0; step < g_len; ++step) {
-          const auto token =
-              static_cast<tokenization::TokenId>(((depth + step) % 1000) + 100);
-          (void)gpu_exec->ForwardToken(
-              token, static_cast<std::uint32_t>(depth + step));
+        if (spec_verifier) {
+          spec_verifier->Reset();
+          std::vector<tokenization::TokenId> seq =
+              MakeBenchmarkTokens(depth > 0 ? depth : 16);
+          tokenization::TokenId cur_tok = seq.back();
+          std::uint32_t cur_pos = static_cast<std::uint32_t>(seq.size());
+          std::size_t emitted = 0;
+          while (emitted < g_len) {
+            const auto step_res =
+                spec_verifier->VerifyStep(seq, cur_pos, cur_tok, 999999);
+            for (const auto t : step_res.emitted_tokens) {
+              seq.push_back(t);
+              ++cur_pos;
+              ++emitted;
+              if (emitted >= g_len) {
+                break;
+              }
+            }
+            cur_tok = step_res.next_token;
+          }
+        } else {
+          for (std::size_t step = 0; step < g_len; ++step) {
+            const auto token = static_cast<tokenization::TokenId>(
+                ((depth + step) % 1000) + 100);
+            (void)gpu_exec->ForwardToken(
+                token, static_cast<std::uint32_t>(depth + step));
+          }
         }
         HIP_CHECK(hipDeviceSynchronize());
         const auto t1 = std::chrono::high_resolution_clock::now();
@@ -567,7 +652,11 @@ int RunBench(std::span<const char* const> args) {
         }
       }
 
-      print_result(MakeTestName("tg", g_len, depth), ComputeStats(runs));
+      std::string test_name = MakeTestName("tg", g_len, depth);
+      if (!opt.speculative_backend.empty()) {
+        test_name += "-" + opt.speculative_backend;
+      }
+      print_result(test_name, ComputeStats(runs));
     }
   }
 

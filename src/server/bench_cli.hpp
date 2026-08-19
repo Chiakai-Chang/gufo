@@ -2,6 +2,7 @@
 #define STRIX_SERVER_BENCH_CLI_HPP_
 
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string>
@@ -17,6 +18,8 @@ struct BenchOptions {
   std::size_t repetitions{1};
   std::size_t validate_prefill_tokens{0};
   int n_gpu_layers{99};
+  std::string speculative_backend{""};
+  std::uint32_t draft_tokens{3};
   bool verbose{false};
 };
 
