@@ -145,6 +145,15 @@ row-tiled GEMV.
 - GQA-aware K/V reuse.
 - Long-context kernels selected by measured context ranges.
 
+Known limitation: an incremental prefill that begins on the baseline attention
+path and later crosses the optimized-attention threshold can select the tiled
+backend with a nonzero start position. The baseline path updates the FP32 KV
+cache, while the tiled path consumes a separate FP16 cache and currently packs
+only the active chunk. Until cache-coherence tracking or prefix conversion is
+implemented and validated on gfx1151, treat baseline-to-tiled transitions as a
+separate correctness/performance follow-up rather than changing that policy as
+part of structural refactors.
+
 ### MoE
 
 - GPU router and top-k baseline.

@@ -133,8 +133,16 @@ endif()
 
 if (ENGINE_ENABLE_HIP)
   target_sources(strix_core PRIVATE
-    src/core/hip/qwen_gpu_ops.hip
+    src/core/hip/qwen_gpu_attention.hip
+    src/core/hip/qwen_gpu_batched_ssm.hip
+    src/core/hip/qwen_gpu_blas.hip
+    src/core/hip/qwen_gpu_decode_ops.hip
+    src/core/hip/qwen_gpu_prefill_ops.hip
+    src/core/hip/qwen_gpu_arena.cpp
+    src/core/hip/qwen_gpu_decode.cpp
     src/core/hip/qwen_gpu_executor.cpp
+    src/core/hip/qwen_gpu_model_loader.cpp
+    src/core/hip/qwen_gpu_prefill.cpp
   )
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
   target_include_directories(strix_core SYSTEM PRIVATE
@@ -266,6 +274,13 @@ if (BUILD_TESTING)
   target_link_libraries(eval_regrade_test PRIVATE strix_core)
   add_test(NAME eval_regrade_test COMMAND eval_regrade_test)
   set_tests_properties(eval_regrade_test PROPERTIES LABELS "cpu;quality;eval")
+
+  add_executable(qwen_attention_policy_test
+    tests/kernels/qwen_attention_policy_test.cpp)
+  target_link_libraries(qwen_attention_policy_test PRIVATE strix_core)
+  add_test(NAME qwen_attention_policy_test COMMAND qwen_attention_policy_test)
+  set_tests_properties(qwen_attention_policy_test PROPERTIES
+    LABELS "cpu;models;attention;dispatch")
 
   if (ENGINE_ENABLE_HIP)
     add_executable(qwen_gpu_ops_test tests/kernels/qwen_gpu_ops_test.cpp)
