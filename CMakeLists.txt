@@ -146,12 +146,19 @@ if (ENGINE_ENABLE_HIP)
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
     src/core/speculative/speculative_verifier.cpp
+    src/core/heterogeneous/npu_drafter.cpp
   )
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
   target_include_directories(strix_core SYSTEM PRIVATE
     ${COMPOSABLE_KERNEL_INCLUDE_DIR})
   target_link_libraries(strix_core PUBLIC hip::host roc::hipblas
     roc::hipblaslt roc::rocblas)
+endif()
+
+if (ENGINE_ENABLE_XRT)
+  target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_XRT=1)
+  target_include_directories(strix_core PRIVATE ${XRT_INCLUDE_DIR})
+  target_link_libraries(strix_core PUBLIC ${XRT_COREUTIL_LIB})
 endif()
 
 add_executable(strix-server
@@ -305,6 +312,14 @@ if (BUILD_TESTING)
     target_link_libraries(test_draft_heads PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME test_draft_heads COMMAND test_draft_heads)
     set_tests_properties(test_draft_heads PROPERTIES LABELS "hip;gpu;draft_heads;speculative")
+
+    add_executable(test_npu_speculative tests/npu/test_npu_speculative.cpp)
+    target_link_libraries(test_npu_speculative PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
+    if (ENGINE_ENABLE_XRT)
+      target_link_libraries(test_npu_speculative PRIVATE ${XRT_COREUTIL_LIB})
+    endif()
+    add_test(NAME test_npu_speculative COMMAND test_npu_speculative)
+    set_tests_properties(test_npu_speculative PROPERTIES LABELS "npu;xdna2;speculative")
 
   endif()
 
