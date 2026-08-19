@@ -35,6 +35,26 @@ __global__ void EmbeddingLookupKernel(const void* __restrict__ table,
   }
 }
 
+__global__ void EmbeddingLookupPtrKernel(
+    const void* __restrict__ table, bool is_bf16,
+    const std::uint32_t* __restrict__ d_token_id,
+    float* __restrict__ out_hidden, std::size_t hidden_size) {
+  const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= hidden_size)
+    return;
+
+  const std::uint32_t token_id = *d_token_id;
+  const std::size_t offset =
+      static_cast<std::size_t>(token_id) * hidden_size + idx;
+  if (is_bf16) {
+    const auto* bf_ptr = static_cast<const hip_bfloat16*>(table);
+    out_hidden[idx] = static_cast<float>(bf_ptr[offset]);
+  } else {
+    const auto* f_ptr = static_cast<const float*>(table);
+    out_hidden[idx] = f_ptr[offset];
+  }
+}
+
 __global__ void RMSNormKernel(const float* __restrict__ x,
                               const float* __restrict__ weight,
                               float* __restrict__ out, std::size_t dim,
@@ -103,6 +123,64 @@ __global__ void RoPEKernel(float* __restrict__ q, float* __restrict__ k,
       static_cast<std::size_t>(num_heads) * half_rot;
   const std::size_t total_kv_pairs =
       static_cast<std::size_t>(num_kv_heads) * half_rot;
+
+  // Process Q heads
+  if (tid < total_q_pairs) {
+    const std::uint32_t h = static_cast<std::uint32_t>(tid / half_rot);
+    const std::uint32_t pair = static_cast<std::uint32_t>(tid % half_rot);
+
+    const float exponent =
+        static_cast<float>(2 * pair) / static_cast<float>(rotary_dim);
+    const float inv_freq = 1.0F / powf(rope_theta, exponent);
+    const float angle = static_cast<float>(pos) * inv_freq;
+    const float cos_val = cosf(angle);
+    const float sin_val = sinf(angle);
+
+    const std::size_t idx0 = static_cast<std::size_t>(h) * head_dim + pair;
+    const std::size_t idx1 = idx0 + half_rot;
+
+    const float q0 = q[idx0];
+    const float q1 = q[idx1];
+    q[idx0] = q0 * cos_val - q1 * sin_val;
+    q[idx1] = q0 * sin_val + q1 * cos_val;
+  }
+
+  // Process K heads
+  if (tid < total_kv_pairs && k != nullptr) {
+    const std::uint32_t h = static_cast<std::uint32_t>(tid / half_rot);
+    const std::uint32_t pair = static_cast<std::uint32_t>(tid % half_rot);
+
+    const float exponent =
+        static_cast<float>(2 * pair) / static_cast<float>(rotary_dim);
+    const float inv_freq = 1.0F / powf(rope_theta, exponent);
+    const float angle = static_cast<float>(pos) * inv_freq;
+    const float cos_val = cosf(angle);
+    const float sin_val = sinf(angle);
+
+    const std::size_t idx0 = static_cast<std::size_t>(h) * head_dim + pair;
+    const std::size_t idx1 = idx0 + half_rot;
+
+    const float k0 = k[idx0];
+    const float k1 = k[idx1];
+    k[idx0] = k0 * cos_val - k1 * sin_val;
+    k[idx1] = k0 * sin_val + k1 * cos_val;
+  }
+}
+
+__global__ void RoPEPtrKernel(float* __restrict__ q, float* __restrict__ k,
+                              std::uint32_t num_heads,
+                              std::uint32_t num_kv_heads,
+                              std::uint32_t head_dim, std::uint32_t rotary_dim,
+                              const std::uint32_t* __restrict__ d_pos,
+                              float rope_theta) {
+  const std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t half_rot = rotary_dim / 2;
+  const std::size_t total_q_pairs =
+      static_cast<std::size_t>(num_heads) * half_rot;
+  const std::size_t total_kv_pairs =
+      static_cast<std::size_t>(num_kv_heads) * half_rot;
+
+  const std::uint32_t pos = *d_pos;
 
   // Process Q heads
   if (tid < total_q_pairs) {
@@ -1343,6 +1421,15 @@ void LaunchEmbeddingLookup(const void* table, bool is_bf16,
       table, is_bf16, token_id, out_hidden, hidden_size);
 }
 
+void LaunchEmbeddingLookup(const void* table, bool is_bf16,
+                           const std::uint32_t* d_token_id, float* out_hidden,
+                           std::size_t hidden_size, hipStream_t stream) {
+  const std::size_t block_size = 256;
+  const std::size_t grid_size = (hidden_size + block_size - 1) / block_size;
+  EmbeddingLookupPtrKernel<<<grid_size, block_size, 0, stream>>>(
+      table, is_bf16, d_token_id, out_hidden, hidden_size);
+}
+
 void LaunchRMSNorm(const float* x, const float* weight, float* out,
                    std::size_t dim, float eps, hipStream_t stream) {
   RMSNormKernel<<<1, 256, 0, stream>>>(x, weight, out, dim, eps);
@@ -1377,6 +1464,20 @@ void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
   const std::size_t grid_size = (total_pairs + block_size - 1) / block_size;
   RoPEKernel<<<grid_size, block_size, 0, stream>>>(
       q, k, num_heads, num_kv_heads, head_dim, rotary_dim, pos, rope_theta);
+}
+
+void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
+                std::uint32_t num_kv_heads, std::uint32_t head_dim,
+                std::uint32_t rotary_dim, const std::uint32_t* d_pos,
+                float rope_theta, hipStream_t stream) {
+  const std::size_t half_rot = rotary_dim / 2;
+  const std::size_t total_pairs =
+      std::max(static_cast<std::size_t>(num_heads) * half_rot,
+               static_cast<std::size_t>(num_kv_heads) * half_rot);
+  const std::size_t block_size = 256;
+  const std::size_t grid_size = (total_pairs + block_size - 1) / block_size;
+  RoPEPtrKernel<<<grid_size, block_size, 0, stream>>>(
+      q, k, num_heads, num_kv_heads, head_dim, rotary_dim, d_pos, rope_theta);
 }
 
 void LaunchSwiGLU(const float* gate, const float* up, float* out,

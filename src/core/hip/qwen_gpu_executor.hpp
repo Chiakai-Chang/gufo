@@ -20,6 +20,8 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
+#include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+
 namespace strix::hip {
 
 class HipblasLtGemm;
@@ -149,7 +151,10 @@ public:
   }
 
   /// Resets GPU cache and recurrent states in the arena.
-  void Reset() noexcept { arena_.Reset(); }
+  void Reset() noexcept {
+    arena_.Reset();
+    graph_executor_.Reset();
+  }
   void SaveState(std::uint32_t valid_context) {
     arena_.SaveState(valid_context);
   }
@@ -164,6 +169,7 @@ private:
   std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::vector<QwenGpuWeightRegion> weight_regions_;
   QwenGpuArena arena_;
+  detail::HipGraphDecodeExecutor graph_executor_;
   std::vector<float> h_logits_;
 };
 

@@ -39,6 +39,12 @@ void LaunchEmbeddingLookup(const void* table, bool is_bf16,
                            std::size_t hidden_size,
                            hipStream_t stream = nullptr);
 
+/// Asynchronously copies embedding row for *d_token_id into out_hidden
+void LaunchEmbeddingLookup(const void* table, bool is_bf16,
+                           const std::uint32_t* d_token_id, float* out_hidden,
+                           std::size_t hidden_size,
+                           hipStream_t stream = nullptr);
+
 /// Computes RMSNorm on GPU: out = (x / sqrt(mean(x^2) + eps)) * weight
 void LaunchRMSNorm(const float* x, const float* weight, float* out,
                    std::size_t dim, float eps = 1e-6F,
@@ -64,6 +70,13 @@ void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
                 std::uint32_t num_kv_heads, std::uint32_t head_dim,
                 std::uint32_t rotary_dim, std::uint32_t pos, float rope_theta,
                 hipStream_t stream = nullptr);
+
+/// Computes Rotary Position Embedding (RoPE) reading position from device
+/// memory
+void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
+                std::uint32_t num_kv_heads, std::uint32_t head_dim,
+                std::uint32_t rotary_dim, const std::uint32_t* d_pos,
+                float rope_theta, hipStream_t stream = nullptr);
 
 /// Computes SwiGLU: out = SiLU(gate) * up
 void LaunchSwiGLU(const float* gate, const float* up, float* out,
@@ -105,6 +118,15 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
                      void* k_cache_f16, void* v_cache_f16, float* out_context,
                      std::uint32_t layer_idx, std::uint32_t pos,
+                     std::uint32_t max_context, std::uint32_t num_heads,
+                     std::uint32_t num_kv_heads, std::uint32_t head_dim,
+                     hipStream_t stream = nullptr);
+
+/// Computes Grouped-Query Softmax Attention reading position from device memory
+void LaunchAttention(const float* q, const float* k, const float* v,
+                     const float* gate, float* k_cache, float* v_cache,
+                     void* k_cache_f16, void* v_cache_f16, float* out_context,
+                     std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream = nullptr);
