@@ -965,11 +965,17 @@ constexpr std::uint32_t kTileAttentionQueryRows = 16;
 constexpr std::uint32_t kTileAttentionHeadsPerBlock = 2;
 constexpr std::uint32_t kTileAttentionColumns =
     kTileAttentionQueryRows * kTileAttentionHeadsPerBlock;
+static_assert((kTileAttentionGqa % kTileAttentionHeadsPerBlock) == 0,
+              "GQA heads must divide evenly across tiled blocks");
 constexpr std::uint32_t kTileAttentionKeyRows = 64;
 constexpr std::uint32_t kTileAttentionHalf2Dim = kTileAttentionHeadDim / 2;
 constexpr std::uint32_t kTileAttentionKeyHalf2Dim = kTileAttentionHalf2Dim / 2;
 constexpr std::uint32_t kTileAttentionValueRows = 32;
-constexpr std::uint32_t kTileAttentionHalf2Padding = 4;
+constexpr std::uint32_t kTileAttentionHalf2Padding = 1;
+constexpr std::uint32_t kTileAttentionKeyRowStride =
+    kTileAttentionKeyHalf2Dim + kTileAttentionHalf2Padding;
+static_assert((kTileAttentionKeyRowStride % 2) == 1,
+              "Wave32 key rows require an odd stride across 32 LDS banks");
 
 __device__ __forceinline__ float TileWaveReduceMax(float value) {
 #pragma unroll
@@ -1054,8 +1060,7 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
 
   __shared__ __half2 q_tile[kTileAttentionColumns][kTileAttentionHalf2Dim];
   __shared__ __half2
-      kv_tile[kTileAttentionKeyRows *
-              (kTileAttentionKeyHalf2Dim + kTileAttentionHalf2Padding)];
+      kv_tile[kTileAttentionKeyRows * kTileAttentionKeyRowStride];
   __shared__ __half weights[kTileAttentionColumns][kTileAttentionKeyRows];
 
   constexpr std::uint32_t columns_per_wave = kTileAttentionColumns / 8;
@@ -1124,9 +1129,8 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
                  (static_cast<std::size_t>(kv_head) * kTileAttentionHalf2Dim) +
                  (key_dimension * kTileAttentionKeyHalf2Dim) + half2_index];
           }
-          kv_tile[(key_row *
-                   (kTileAttentionKeyHalf2Dim + kTileAttentionHalf2Padding)) +
-                  half2_index] = packed;
+          kv_tile[(key_row * kTileAttentionKeyRowStride) + half2_index] =
+              packed;
         }
       }
       __syncthreads();
@@ -1135,11 +1139,8 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
       for (std::uint32_t half2_index = 0;
            half2_index < kTileAttentionKeyHalf2Dim; ++half2_index) {
         const __half2 key_values[2] = {
-            kv_tile[(lane *
-                     (kTileAttentionKeyHalf2Dim + kTileAttentionHalf2Padding)) +
-                    half2_index],
-            kv_tile[((lane + 32) *
-                     (kTileAttentionKeyHalf2Dim + kTileAttentionHalf2Padding)) +
+            kv_tile[(lane * kTileAttentionKeyRowStride) + half2_index],
+            kv_tile[((lane + 32) * kTileAttentionKeyRowStride) +
                     half2_index]};
 #pragma unroll
         for (std::uint32_t column = 0; column < columns_per_wave; ++column) {
@@ -1335,7 +1336,8 @@ bool LaunchBatchedAttentionTile(
   const dim3 attention_grid(
       static_cast<unsigned int>((batch_size + kTileAttentionQueryRows - 1) /
                                 kTileAttentionQueryRows),
-      kTileAttentionKvHeads * (kTileAttentionGqa / 2));
+      kTileAttentionKvHeads *
+          (kTileAttentionGqa / kTileAttentionHeadsPerBlock));
   const dim3 attention_block(32, 8);
   QwenTiledAttentionKernel<<<attention_grid, attention_block, 0, stream>>>(
       q, gate, layer_k, layer_v, out_context, start_pos, batch_size);

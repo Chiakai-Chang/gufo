@@ -364,9 +364,31 @@ Kernel remains the fallback for unsupported shapes.
 
 The FP16 tile cache is packed together with the unchanged FP32 decode cache.
 Removing the old global score arena saves 24 MiB relative to the CK/GEMM
-split. The retained 64-key tile uses 37,888 bytes of LDS, zero scratch, and a
-three-block launch bound on `gfx1151`. Its profiled `pp4096` attention time is
-about 48.0 ms per full-attention layer, down from CK's 114.6 ms.
+split. The retained 64-key tile uses an odd 65-half2 LDS row stride so Wave32
+lanes reading different key rows map across all 32 banks. This removes the
+measured bank conflicts without changing the FP16 inputs, FP32 accumulation,
+tile shape, or causal online-softmax order.
+
+| Batched attention | Original median | Conflict-free median | Latency change |
+| ---: | ---: | ---: | ---: |
+| 1024 tokens | 3380.95 us | 3174.18 us | -6.1% |
+| 2048 tokens | 12507.93 us | 11657.08 us | -6.8% |
+| 4096 tokens | 47791.72 us | 44687.93 us | -6.5% |
+
+The 2048-token `rocprofv3` counter comparison reports
+`LDSBankConflict` falling from 37.6% to 0%. LDS allocation falls from 37,888
+to 37,376 bytes, while VGPR use remains 224, occupancy remains approximately
+36%, and scratch remains zero. The profiled 4096-token attention time is about
+44.7 ms per full-attention layer, down from 47.8 ms before the layout change
+and CK's 114.6 ms.
+
+An end-to-end follow-up measured 209.41, 351.74, 361.26, 336.01, 313.32, and
+295.48 tok/s at `pp128`, `pp512`, `pp1024`, `pp2048`, `pp4096`, and `pp8192`.
+The run started at 41 C but reached 50 C during the increasing-length sweep,
+and the room temperature prevented a matched cooldown comparison. The
+128-1024 rows remain within 0.5% of the stored baseline; the longer rows are
+retained as ambient-limited observations and are not attributed to the LDS
+change.
 
 `strix-bench` warms every requested prompt size once before measured
 repetitions. This is required because hipBLASLt loads shape-specific code
