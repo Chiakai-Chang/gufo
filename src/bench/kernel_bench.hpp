@@ -38,7 +38,11 @@ struct KernelDispatchTelemetry {
   std::int64_t hipblaslt_algorithm_id{-1};
   std::string hipblaslt_solution_name;
   std::string hipblaslt_kernel_name;
+  std::string hipblaslt_plan_source;
+  std::uint64_t hipblaslt_workspace_bytes{0};
+  double hipblaslt_plan_resolution_us{0.0};
   std::string plan_cache_status{"not_applicable"};
+  std::string persistent_plan_cache_status{"not_applicable"};
   std::string graph_cache_status{"not_applicable"};
 };
 
@@ -69,7 +73,7 @@ struct KernelBenchResult {
 };
 
 struct KernelBenchReport {
-  std::string schema_version{"1.0.0"};
+  std::string schema_version{"1.1.0"};
   std::string fingerprint_id;
   std::string engine_revision{"development"};
   std::string device_name;

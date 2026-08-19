@@ -71,17 +71,21 @@ inline void EmitAttentionDispatch(std::string_view selected_backend,
   });
 }
 
-inline void EmitHipblasLtDispatch(std::size_t batch_size, std::size_t m,
-                                  std::size_t k, int algorithm_id,
-                                  std::string_view solution_name,
-                                  std::string_view kernel_name,
-                                  bool plan_cache_hit) {
+inline void EmitHipblasLtDispatch(
+    std::size_t batch_size, std::size_t m, std::size_t k, int algorithm_id,
+    std::string_view solution_name, std::string_view kernel_name,
+    std::string_view plan_source, std::string_view persistent_cache_status,
+    std::size_t workspace_bytes, bool plan_cache_hit) {
   EmitDispatchTelemetry("hipblaslt", [&](std::ostringstream& output) {
     output << ",\"batchSize\":" << batch_size << ",\"m\":" << m
            << ",\"k\":" << k << ",\"algorithmId\":" << algorithm_id
+           << ",\"workspaceBytes\":" << workspace_bytes
            << ",\"planCacheHit\":" << (plan_cache_hit ? "true" : "false");
     WriteTelemetryField(output, "solutionName", solution_name);
     WriteTelemetryField(output, "kernelName", kernel_name);
+    WriteTelemetryField(output, "planSource", plan_source);
+    WriteTelemetryField(output, "persistentCacheStatus",
+                        persistent_cache_status);
   });
 }
 

@@ -34,7 +34,9 @@ let
       || relativePath == "cmake"
       || lib.hasPrefix "cmake/" relativePath
       || relativePath == "src"
-      || lib.hasPrefix "src/" relativePath;
+      || lib.hasPrefix "src/" relativePath
+      || relativePath == "tools"
+      || relativePath == "tools/tune_hipblaslt.cpp";
   };
 in
 stdenv.mkDerivation (finalAttrs: {
@@ -94,6 +96,9 @@ stdenv.mkDerivation (finalAttrs: {
     if [ -f strix-kernel-bench ]; then
       cp strix-kernel-bench $out/bin/strix-kernel-bench
     fi
+    if [ -f tune_hipblaslt ]; then
+      cp tune_hipblaslt $out/bin/tune_hipblaslt
+    fi
     chmod +x $out/bin/*
 
     runHook postInstall
@@ -107,6 +112,9 @@ stdenv.mkDerivation (finalAttrs: {
     $out/bin/strix-server --help >/dev/null
     if [ -x $out/bin/strix-kernel-bench ]; then
       $out/bin/strix-kernel-bench --help >/dev/null
+    fi
+    if [ -x $out/bin/tune_hipblaslt ]; then
+      $out/bin/tune_hipblaslt --help >/dev/null
     fi
 
     runHook postInstallCheck

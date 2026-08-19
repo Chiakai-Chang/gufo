@@ -619,10 +619,16 @@ strix::bench::KernelBenchResult BenchmarkGemm(std::size_t batch_size,
     dispatch.hipblaslt_algorithm_id = dispatch_info.algorithm_id;
     dispatch.hipblaslt_solution_name = dispatch_info.solution_name;
     dispatch.hipblaslt_kernel_name = dispatch_info.kernel_name;
+    dispatch.hipblaslt_plan_source = dispatch_info.plan_source;
+    dispatch.hipblaslt_workspace_bytes = dispatch_info.workspace_bytes;
+    dispatch.hipblaslt_plan_resolution_us = dispatch_info.plan_resolution_us;
     dispatch.plan_cache_status = "hit";
+    dispatch.persistent_plan_cache_status =
+        dispatch_info.persistent_cache_status;
   } else if (hipblaslt_rejected) {
     dispatch.rejected_fast_paths.push_back("hipblaslt: no supported plan");
     dispatch.plan_cache_status = "miss";
+    dispatch.persistent_plan_cache_status = "miss";
   }
 
   strix::bench::KernelBenchResult result;

@@ -138,6 +138,14 @@ profiler resource fields. Resource fields are intentionally null in unprofiled
 reports; collect VGPR, LDS, scratch, occupancy, and counter evidence in a
 separate `rocprofv3` pass using the emitted ROCTx case marker.
 
+`tune_hipblaslt` is the separate offline search tool for production BF16 GEMM
+shapes. It benchmarks supported algorithms with HIP events, rechecks any
+candidate that differs from the runtime heuristic, requires at least a 2%
+verified improvement, and writes a hardware/ROCm-bound binary database. Set
+`STRIX_HIPBLASLT_PLAN_CACHE` to use that artifact in `strix-server`,
+`strix-bench`, or `strix-kernel-bench`. Generated databases are local benchmark
+artifacts and are not committed.
+
 ## Machine Fingerprint & Artifact Binding
 
 All diagnostic and benchmark artifacts must embed a canonical machine fingerprint

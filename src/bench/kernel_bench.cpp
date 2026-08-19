@@ -115,8 +115,20 @@ void WriteDispatchTelemetry(std::ostringstream& output,
   } else {
     output << "\"" << EscapeJson(dispatch.hipblaslt_kernel_name) << "\",\n";
   }
+  output << "        \"hipblasltPlanSource\": ";
+  if (dispatch.hipblaslt_plan_source.empty()) {
+    output << "null,\n";
+  } else {
+    output << "\"" << EscapeJson(dispatch.hipblaslt_plan_source) << "\",\n";
+  }
+  output << "        \"hipblasltWorkspaceBytes\": "
+         << dispatch.hipblaslt_workspace_bytes << ",\n";
+  output << "        \"hipblasltPlanResolutionUs\": "
+         << dispatch.hipblaslt_plan_resolution_us << ",\n";
   output << "        \"planCacheStatus\": \""
          << EscapeJson(dispatch.plan_cache_status) << "\",\n";
+  output << "        \"persistentPlanCacheStatus\": \""
+         << EscapeJson(dispatch.persistent_plan_cache_status) << "\",\n";
   output << "        \"graphCacheStatus\": \""
          << EscapeJson(dispatch.graph_cache_status) << "\"\n";
   output << "      },\n";

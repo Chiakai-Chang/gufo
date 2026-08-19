@@ -36,6 +36,43 @@ objects unless a development build explicitly enables another architecture.
 Compiler version, flags, ROCm version, kernel source hash, and architecture are
 part of every cached artifact key.
 
+### hipBLASLt plan database
+
+Large BF16 prefill projections can use an optional offline-tuned hipBLASLt
+plan database:
+
+```sh
+git add .
+nix build
+
+./result/bin/tune_hipblaslt \
+  --out "$HOME/.cache/strix/hipblaslt-plans.bin"
+
+STRIX_HIPBLASLT_PLAN_CACHE="$HOME/.cache/strix/hipblaslt-plans.bin" \
+  ./result/bin/strix-server prompt --model "$MODEL" "Hello"
+```
+
+The tuner covers the seven Qwen3.8 projection shapes at prompt batches
+`32,64,128,256,512,1024,2048,4096`. `--quick` limits development runs to the
+batch-128 FFN gate/up shape; `--batch` and repeated `--shape MxK` options
+select custom matrices.
+
+The binary database stores:
+
+- A format version and gfx1151 device fingerprint.
+- HIP runtime and hipBLASLt library versions.
+- Batch, M, K, and BF16 data type.
+- Algorithm ID and the same-version serialized hipBLASLt descriptor.
+- Required workspace, tuning median, solution name, and kernel name.
+
+Runtime loading is opt-in. A compatible hit reconstructs the first algorithm
+through hipBLASLt to initialize its solution library, then restores later
+descriptors directly. Every restored algorithm is checked with
+`matmulIsAlgoSupported`, including its exact workspace requirement. A schema,
+device, runtime, library, algorithm-ID, kernel-identity, support, or workspace
+mismatch falls back to the ordinary heuristic search for that exact shape.
+The hot path remains the existing in-memory plan lookup after first use.
+
 ## Backend Boundary
 
 The model runtime calls whole operations through raw-pointer interfaces:
@@ -225,9 +262,10 @@ Each model is compiled as an independent object target with unique host and
 device symbol prefixes. The final link places all targets in the single
 `strix-server` executable, but does not merge their kernel ownership.
 
-There is no global numerical kernel registry, shared tuning table, or
-production `common/kernels` directory. A model binds its tensors to its own
-dispatch table during load.
+There is no global numerical kernel registry or production `common/kernels`
+directory. A model binds its tensors to its own dispatch table during load.
+The optional hipBLASLt database is an external, versioned deployment artifact
+containing exact standard-library GEMM shapes, not a compiled kernel registry.
 
 Shared runtime helpers may provide allocation, graph capture, raw launch
 plumbing, streams, events, error handling, and profiling. They do not contain:

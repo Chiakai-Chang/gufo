@@ -527,7 +527,8 @@ Use `--kernel all` for the same complete case set and omit `--context` to use
 `batchSize`, `m`, `n`, `k`, data type, layout, raw samples, percentiles,
 tokens/s, effective GB/s, correctness status, selected attention backend, GEMV
 strategy, rejected fast paths, hipBLASLt algorithm/kernel identity, plan-cache
-status, and graph-cache status.
+status, persistent-plan status, plan source, workspace bytes, first-resolution
+time, and graph-cache status.
 
 Headline latency comes from the unprofiled command above. Run the same case
 through `rocprofv3` separately for dispatch/resource evidence:
@@ -561,8 +562,9 @@ STRIX_DISPATCH_TELEMETRY=1 ./result/bin/strix-server prompt \
 ```
 
 This logs selected attention backends, GEMV strategies, rejected fast paths,
-hipBLASLt algorithm and plan-cache status, and HIP graph hit/miss state. Leave
-it disabled for performance measurements.
+hipBLASLt algorithm, in-memory and persistent plan-cache status, plan source,
+workspace, and HIP graph hit/miss state. Leave it disabled for performance
+measurements.
 
 ## Promotion Gates
 

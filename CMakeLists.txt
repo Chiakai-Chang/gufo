@@ -126,6 +126,7 @@ add_library(strix_core STATIC
   src/models/qwen_generator.cpp
   src/testing/compare/logit_comparator.cpp
   src/eval/regrade.cpp
+  src/core/hip/hipblaslt_plan_database.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -199,11 +200,14 @@ if (ENGINE_ENABLE_HIP)
     strix_diagnostics
     strix_core
     ${ROCTX_LIBRARY})
+
+  add_executable(tune_hipblaslt tools/tune_hipblaslt.cpp)
+  target_link_libraries(tune_hipblaslt PRIVATE strix_core hip::host)
 endif()
 
 install(TARGETS strix strix-server strix-bench DESTINATION bin)
 if (ENGINE_ENABLE_HIP)
-  install(TARGETS strix-kernel-bench DESTINATION bin)
+  install(TARGETS strix-kernel-bench tune_hipblaslt DESTINATION bin)
 endif()
 
 # CTest integration
@@ -326,7 +330,23 @@ if (BUILD_TESTING)
   set_tests_properties(kernel_bench_test PROPERTIES
     LABELS "cpu;benchmarks;statistics;json")
 
+  add_executable(hipblaslt_plan_cache_test
+    tests/core/hipblaslt_plan_cache_test.cpp)
+  target_link_libraries(hipblaslt_plan_cache_test PRIVATE strix_core)
+  add_test(NAME hipblaslt_plan_cache_test COMMAND hipblaslt_plan_cache_test)
+  set_tests_properties(hipblaslt_plan_cache_test PROPERTIES
+    LABELS "cpu;hipblaslt;cache")
+
   if (ENGINE_ENABLE_HIP)
+    add_executable(hipblaslt_runtime_cache_test
+      tests/kernels/hipblaslt_runtime_cache_test.cpp)
+    target_link_libraries(hipblaslt_runtime_cache_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME hipblaslt_runtime_cache_test
+      COMMAND hipblaslt_runtime_cache_test)
+    set_tests_properties(hipblaslt_runtime_cache_test PROPERTIES
+      LABELS "hip;gpu;hipblaslt;cache")
+
     add_executable(qwen_gpu_ops_test tests/kernels/qwen_gpu_ops_test.cpp)
     target_link_libraries(qwen_gpu_ops_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME qwen_gpu_ops_test COMMAND qwen_gpu_ops_test)

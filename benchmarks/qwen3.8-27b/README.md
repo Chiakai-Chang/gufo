@@ -20,7 +20,7 @@ executors on AMD Strix Halo (`gfx1151`).
 The model is downloaded directly on the Strix Halo host:
 
 ```sh
-cd /home/fbozzo/projects/strix-halo.cpp
+cd strix-halo.cpp
 nix develop -c hf download unsloth/Qwen3.8-27B-GGUF \
   --include 'BF16/*' \
   --local-dir models/Qwen3.8-27B-GGUF \
@@ -335,6 +335,51 @@ hipBLASLt-selected algorithms. The executor now caches a hipBLASLt plan by
 batch and matrix shape for the large BF16 projections, while retaining the
 hipBLAS path for the small alpha/beta projections.
 
+Issue #70 adds offline algorithm tuning and an opt-in persisted plan database.
+The default sweep covers seven Qwen3.8 BF16 projection shapes across eight
+prompt batches, producing 56 exact entries. A reduced validation sweep used
+one warmup and three measured launches per candidate, completed all 56
+entries, and retained 13 alternatives after a second interleaved comparison
+required at least a 2% win over the runtime heuristic.
+
+```sh
+./result/bin/tune_hipblaslt \
+  --out /tmp/qwen38-hipblaslt-plans.bin \
+  --warmup 1 \
+  --repetitions 3
+
+STRIX_HIPBLASLT_PLAN_CACHE=/tmp/qwen38-hipblaslt-plans.bin \
+  ./result/bin/strix-kernel-bench ...
+```
+
+Representative release-build replay results:
+
+| BF16 GEMM | Heuristic | Persisted | Change |
+| --- | ---: | ---: | ---: |
+| First FFN plan resolution, batch 128, five-process median | 121.996 ms | 108.449 ms | -11.1% |
+| Attention K/V, `B=128, M=1024, K=5120` | 128.44 us, algo 4427 | 112.75 us, algo 4426 | -12.2% |
+| FFN down, `B=4096, M=5120, K=17408` | 61.073 ms, algo 4427 | 49.997 ms, algo 4428 | -18.1% |
+
+The unchanged batch-128 FFN gate/up algorithm remained within run noise
+(`1719.9` versus `1719.2 us`). Every replay ran the benchmark correctness
+sentinel. The first persisted lookup still pays hipBLASLt solution-library
+initialization; persistence removes heuristic policy and later per-shape
+search, but does not claim to eliminate that library startup cost.
+
+The opt-in database was also checked with the 128-token full-vocabulary
+prefill oracle on the exact release package:
+
+| Plan source | Top-1 | RMSE | Cosine | `pp128` |
+| --- | ---: | ---: | ---: | ---: |
+| Default heuristic | 194 | 0.01156697 | 0.99999118 | 209.18 tok/s |
+| Persisted database | 194 | 0.01277768 | 0.99998951 | 209.23 tok/s |
+
+Both paths produced finite logits and remain inside the established
+approximately `0.99998` cosine / `0.01323` RMSE envelope. The persisted path
+is slightly less close to the sequential oracle at this batch, so the
+database remains explicitly opt-in; default production dispatch and quality
+are unchanged.
+
 After moving the projections, `rocprofv3 --scratch-memory-trace` identified
 the serial DeltaNet recurrence as the next bottleneck. The old kernel used 192
 VGPRs and 988 bytes of scratch per thread. Splitting each 128-element state row
@@ -402,21 +447,17 @@ candidate wins the performance check.
 
 ## Next Steps
 
-1. Autotune rocBLAS and hipBLASLt per projection shape. Permit a bounded,
-   reusable workspace and cache the winning backend and algorithm by GPU,
-   ROCm version, model shape, and batch size; the current fixed policy selects
-   `96x96x32`/`32x96x32` kernels where llama.cpp selects `128x128x32`.
-2. Remove unused FP32 activation writes and emit BF16 directly from attention
+1. Remove unused FP32 activation writes and emit BF16 directly from attention
    gating and SSM post-normalization when the next projection consumes BF16.
-3. Optimize long-context decode attention. The current one-wave online
+2. Optimize long-context decode attention. The current one-wave online
    softmax fixes the 16K shared-memory limit but falls from 3.63 tok/s at 4K
    to 2.66 tok/s at 16K, while llama.cpp remains near 3.94 tok/s.
-4. Improve long-context prefill scheduling and K/V reuse; the `pp2048` gap
+3. Improve long-context prefill scheduling and K/V reuse; the `pp2048` gap
    grows from 1.23x at 4K depth to 1.34x at 16K.
-5. Evaluate verified speculative decoding with the model's MTP block. Greedy
+4. Evaluate verified speculative decoding with the model's MTP block. Greedy
    output must match the baseline token-for-token, with normal decode as the
    rejection fallback and no second model copy.
-6. Move the HTTP backend from the serialized CPU generator to shared mapped
+5. Move the HTTP backend from the serialized CPU generator to shared mapped
    HIP weights, per-request state, and continuous batching.
 
 Every retained optimization must preserve finite full-vocabulary logits,

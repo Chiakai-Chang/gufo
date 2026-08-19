@@ -16,13 +16,43 @@ struct HipblasLtDispatchInfo {
   int algorithm_id{-1};
   std::string solution_name;
   std::string kernel_name;
+  std::string plan_source{"heuristic"};
+  std::string persistent_cache_status{"disabled"};
+  std::size_t workspace_bytes{0};
+  double plan_resolution_us{0.0};
   bool plan_cache_hit{false};
+};
+
+struct HipblasLtGemmOptions {
+  std::string plan_database_path;
+  std::size_t tuning_workspace_bytes{0};
+  bool ignore_environment{false};
+};
+
+struct HipblasLtTuningOptions {
+  std::uint32_t warmup{2};
+  std::uint32_t repetitions{5};
+  std::size_t max_algorithms{64};
+};
+
+struct HipblasLtTuningResult {
+  int algorithm_id{-1};
+  int heuristic_algorithm_id{-1};
+  std::string solution_name;
+  std::string kernel_name;
+  std::size_t workspace_bytes{0};
+  double median_us{0.0};
+  double heuristic_median_us{0.0};
+  double verified_speedup{1.0};
+  std::size_t supported_algorithms{0};
+  std::size_t measured_algorithms{0};
+  bool retained_tuned_algorithm{false};
 };
 
 /// Cached hipBLASLt BF16 GEMM plans for prompt-processing projections.
 class HipblasLtGemm {
 public:
-  HipblasLtGemm();
+  explicit HipblasLtGemm(HipblasLtGemmOptions options = {});
   ~HipblasLtGemm();
 
   HipblasLtGemm(const HipblasLtGemm&) = delete;
@@ -36,6 +66,19 @@ public:
                              std::size_t batch_size, std::size_t m,
                              std::size_t k, hipStream_t stream = nullptr,
                              HipblasLtDispatchInfo* dispatch_info = nullptr);
+
+  /// Benchmarks supported algorithms, installs the fastest plan, and retains
+  /// it for SavePlans(). Buffers must use the same layout as RunBf16().
+  [[nodiscard]] bool TuneBf16(const void* a_bf16, const void* x_bf16, float* y,
+                              std::size_t batch_size, std::size_t m,
+                              std::size_t k,
+                              const HipblasLtTuningOptions& options,
+                              HipblasLtTuningResult* result,
+                              hipStream_t stream = nullptr);
+
+  /// Atomically writes all resolved plans using the current hardware/ROCm key.
+  [[nodiscard]] bool SavePlans(const std::string& path,
+                               std::string* error = nullptr) const;
 
 private:
   struct Impl;

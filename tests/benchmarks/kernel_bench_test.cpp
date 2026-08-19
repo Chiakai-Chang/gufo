@@ -76,12 +76,16 @@ void TestJsonReport() {
   result.raw_microseconds = {8, 9, 10};
   result.dispatch.selected_attention_backend = "decode_online_fp32";
   result.dispatch.rejected_fast_paths = {"baseline: unsupported"};
+  result.dispatch.hipblaslt_plan_source = "persistent";
+  result.dispatch.hipblaslt_workspace_bytes = 4096;
+  result.dispatch.hipblaslt_plan_resolution_us = 12.5;
   result.dispatch.plan_cache_status = "not_applicable";
+  result.dispatch.persistent_plan_cache_status = "hit";
   result.dispatch.graph_cache_status = "hit";
   report.results.push_back(std::move(result));
 
   const std::string json = report.ToJson();
-  Expect(json.find("\"schemaVersion\": \"1.0.0\"") != std::string::npos,
+  Expect(json.find("\"schemaVersion\": \"1.1.0\"") != std::string::npos,
          "schema version");
   Expect(json.find("\"gpuArchitecture\": \"gfx1151\"") != std::string::npos,
          "GPU architecture");
@@ -97,6 +101,14 @@ void TestJsonReport() {
          "rejected fast paths");
   Expect(json.find("\"graphCacheStatus\": \"hit\"") != std::string::npos,
          "graph cache status");
+  Expect(
+      json.find("\"hipblasltPlanSource\": \"persistent\"") != std::string::npos,
+      "hipBLASLt plan source");
+  Expect(json.find("\"hipblasltWorkspaceBytes\": 4096") != std::string::npos,
+         "hipBLASLt workspace");
+  Expect(
+      json.find("\"persistentPlanCacheStatus\": \"hit\"") != std::string::npos,
+      "persistent plan cache status");
   Expect(json.find("\"occupancyPercent\": null") != std::string::npos,
          "profiler resource placeholder");
   Expect(json.find("\"correctnessVerified\": true") != std::string::npos,
