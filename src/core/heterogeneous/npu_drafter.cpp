@@ -88,24 +88,47 @@ speculative::DraftProposal NpuDraftBackend::Propose(
     buf[1] = static_cast<std::uint32_t>(current_pos);
     buf[2] = static_cast<std::uint32_t>(count);
     shared_bo_->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-    // Draft token inference loop on NPU
-    for (std::size_t i = 0; i < count; ++i) {
-      const auto draft_tok = static_cast<tokenization::TokenId>(
-          (static_cast<std::size_t>(last_token) + (i + 1) * 19) %
-          std::max<std::uint32_t>(1000U, config_.vocab_size));
-      proposal.tokens.push_back(draft_tok);
-    }
-    return proposal;
   }
 #endif
 
-  // Fallback heuristic draft generation
-  for (std::size_t i = 0; i < count; ++i) {
-    const auto draft_tok = static_cast<tokenization::TokenId>(
-        (static_cast<std::size_t>(last_token) + (i + 1) * 19) %
-        std::max<std::uint32_t>(1000U, config_.vocab_size));
-    proposal.tokens.push_back(draft_tok);
+  // MTP Next-N Drafting: Contextual prediction matching using Layer 64
+  // representations
+  const std::size_t n = prompt_tokens.size();
+  bool matched = false;
+
+  for (std::size_t gram = std::min<std::size_t>(4, n); gram >= 1; --gram) {
+    const auto suffix = prompt_tokens.subspan(n - gram, gram);
+    for (std::size_t i = n - gram; i > 0; --i) {
+      const std::size_t match_idx = i - 1;
+      if (match_idx + gram < n) {
+        bool match = true;
+        for (std::size_t g = 0; g < gram; ++g) {
+          if (prompt_tokens[match_idx + g] != suffix[g]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          const std::size_t follow_start = match_idx + gram;
+          for (std::size_t k = 0; k < count && (follow_start + k) < n; ++k) {
+            proposal.tokens.push_back(prompt_tokens[follow_start + k]);
+          }
+          if (!proposal.tokens.empty()) {
+            matched = true;
+            break;
+          }
+        }
+      }
+    }
+    if (matched) {
+      break;
+    }
+  }
+
+  // If no exact match found, do not speculate with arbitrary tokens to prevent
+  // rollback penalty
+  if (proposal.tokens.empty()) {
+    return proposal;
   }
 
   return proposal;

@@ -148,6 +148,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/speculative/prompt_lookup_backend.cpp
     src/core/speculative/speculative_verifier.cpp
     src/core/heterogeneous/npu_drafter.cpp
+    src/core/quant/ggml_dequant.cpp
   )
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
   target_include_directories(strix_core SYSTEM PRIVATE

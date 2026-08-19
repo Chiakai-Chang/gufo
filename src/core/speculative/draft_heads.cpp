@@ -68,11 +68,6 @@ DraftProposal MtpDraftBackend::Propose(
     }
   }
 
-  while (proposal.tokens.size() < count) {
-    const auto fallback_token = prompt_tokens.back();
-    proposal.tokens.push_back(fallback_token);
-  }
-
   last_drafted_ = proposal.tokens;
   return proposal;
 }
