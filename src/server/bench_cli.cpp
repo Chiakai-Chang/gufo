@@ -10,6 +10,7 @@
 #include <memory>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -484,6 +485,8 @@ int RunBench(std::span<const char* const> args) {
 
   std::size_t prepared_depth = 0;
   bool has_prepared_depth = false;
+  tokenization::TokenId prepared_next_token = 0;
+  bool has_prepared_next_token = false;
   for (const std::size_t depth : opt.n_depths) {
     if (depth > 0) {
       if (opt.verbose) {
@@ -506,8 +509,16 @@ int RunBench(std::span<const char* const> args) {
       const auto depth_tokens =
           MakeBenchmarkTokens(depth - preparation_start, preparation_start);
       const auto preparation_begin = std::chrono::steady_clock::now();
-      (void)gpu_exec->ForwardPromptBatch(
-          depth_tokens, static_cast<std::uint32_t>(preparation_start), false);
+      const bool compute_next_token = !opt.speculative_backend.empty();
+      if (!depth_tokens.empty()) {
+        const auto next_token = gpu_exec->ForwardPromptBatch(
+            depth_tokens, static_cast<std::uint32_t>(preparation_start),
+            compute_next_token);
+        if (compute_next_token) {
+          prepared_next_token = next_token;
+          has_prepared_next_token = true;
+        }
+      }
       HIP_CHECK(hipDeviceSynchronize());
       const auto preparation_end = std::chrono::steady_clock::now();
       const auto cache_begin = preparation_end;
@@ -620,26 +631,45 @@ int RunBench(std::span<const char* const> args) {
               *gpu_exec, std::move(draft_backend), s_opts);
         }
 
+        std::vector<tokenization::TokenId> speculative_sequence;
+        tokenization::TokenId speculative_current_token = 0;
+        std::uint32_t speculative_current_pos = 0;
+        if (spec_verifier) {
+          if (depth > 0) {
+            if (!has_prepared_next_token) {
+              throw std::logic_error(
+                  "prepared speculative depth has no target token");
+            }
+            speculative_sequence = MakeBenchmarkTokens(depth);
+            speculative_current_token = prepared_next_token;
+            speculative_current_pos = static_cast<std::uint32_t>(depth);
+          } else {
+            speculative_sequence = MakeBenchmarkTokens(16);
+            speculative_current_token =
+                gpu_exec->ForwardPromptBatch(speculative_sequence);
+            speculative_current_pos =
+                static_cast<std::uint32_t>(speculative_sequence.size());
+          }
+          speculative_sequence.push_back(speculative_current_token);
+        }
+
         const auto t0 = std::chrono::high_resolution_clock::now();
         if (spec_verifier) {
           spec_verifier->Reset();
-          std::vector<tokenization::TokenId> seq =
-              MakeBenchmarkTokens(depth > 0 ? depth : 16);
-          tokenization::TokenId cur_tok = seq.back();
-          std::uint32_t cur_pos = static_cast<std::uint32_t>(seq.size());
           std::size_t emitted = 0;
           while (emitted < g_len) {
-            const auto step_res =
-                spec_verifier->VerifyStep(seq, cur_pos, cur_tok, 999999);
+            const auto step_res = spec_verifier->VerifyStep(
+                speculative_sequence, speculative_current_pos,
+                speculative_current_token, 999999);
             for (const auto t : step_res.emitted_tokens) {
-              seq.push_back(t);
-              ++cur_pos;
+              speculative_sequence.push_back(t);
+              ++speculative_current_pos;
               ++emitted;
               if (emitted >= g_len) {
                 break;
               }
             }
-            cur_tok = step_res.next_token;
+            speculative_current_token = step_res.next_token;
           }
         } else {
           for (std::size_t step = 0; step < g_len; ++step) {

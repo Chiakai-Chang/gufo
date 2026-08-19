@@ -6,11 +6,67 @@
 #include <stdexcept>
 
 namespace strix::speculative {
+namespace {
+
+class QwenGpuSpeculativeTarget final : public ISpeculativeTargetExecutor {
+public:
+  explicit QwenGpuSpeculativeTarget(hip::QwenGpuExecutor& executor)
+      : executor_(executor) {}
+
+  void Reset() noexcept override { executor_.Reset(); }
+
+  tokenization::TokenId ForwardPromptBatch(
+      std::span<const tokenization::TokenId> prompt_tokens) override {
+    return executor_.ForwardPromptBatch(prompt_tokens);
+  }
+
+  tokenization::TokenId ForwardToken(tokenization::TokenId token_id,
+                                     std::uint32_t pos,
+                                     bool compute_logits) override {
+    return executor_.ForwardToken(token_id, pos, compute_logits);
+  }
+
+  void SaveState(std::uint32_t valid_context) override {
+    executor_.SaveState(valid_context);
+  }
+
+  void RestoreState() override { executor_.RestoreState(); }
+
+  tokenization::TokenId GetEosTokenId() const noexcept override {
+    return executor_.GetTokenizer().GetEosTokenId();
+  }
+
+  std::string_view DecodeToken(
+      tokenization::TokenId token_id) const noexcept override {
+    return executor_.GetTokenizer().DecodeToken(token_id);
+  }
+
+private:
+  hip::QwenGpuExecutor& executor_;
+};
+
+bool IsStopToken(tokenization::TokenId token,
+                 tokenization::TokenId eos_id) noexcept {
+  return token == eos_id || token == tokenization::kDefaultQwenEndoftextId ||
+         token == 248044U || token == 248046U;
+}
+
+}  // namespace
 
 SpeculativeVerifier::SpeculativeVerifier(
     hip::QwenGpuExecutor& target_executor,
     std::unique_ptr<IDraftBackend> draft_backend, SpeculativeOptions options)
-    : target_executor_(target_executor),
+    : owned_target_executor_(
+          std::make_unique<QwenGpuSpeculativeTarget>(target_executor)),
+      target_executor_(owned_target_executor_.get()),
+      draft_backend_(std::move(draft_backend)),
+      options_(options),
+      current_draft_length_(options_.initial_draft_tokens) {}
+
+SpeculativeVerifier::SpeculativeVerifier(
+    ISpeculativeTargetExecutor& target_executor,
+    std::unique_ptr<IDraftBackend> draft_backend, SpeculativeOptions options)
+    : target_executor_(&target_executor),
       draft_backend_(std::move(draft_backend)),
       options_(options),
       current_draft_length_(options_.initial_draft_tokens) {}
@@ -53,11 +109,10 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     std::vector<tokenization::TokenId>& current_sequence, std::uint32_t cur_pos,
     tokenization::TokenId current_token, tokenization::TokenId eos_id) {
   if (draft_backend_ == nullptr || current_draft_length_ == 0) {
-    const auto next = target_executor_.ForwardToken(current_token, cur_pos);
+    const auto next = target_executor_->ForwardToken(current_token, cur_pos);
     ++stats_.total_verification_steps;
     ++stats_.total_emitted_tokens;
-    const bool hit_eos = (next == eos_id || next == 151643U ||
-                          next == 248044U || next == 248046U);
+    const bool hit_eos = IsStopToken(next, eos_id);
     return {.emitted_tokens = {next},
             .accepted_count = 0,
             .draft_count = 0,
@@ -69,11 +124,10 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
   const auto proposal =
       draft_backend_->Propose(current_sequence, cur_pos, current_draft_length_);
   if (proposal.tokens.empty()) {
-    const auto next = target_executor_.ForwardToken(current_token, cur_pos);
+    const auto next = target_executor_->ForwardToken(current_token, cur_pos);
     ++stats_.total_verification_steps;
     ++stats_.total_emitted_tokens;
-    const bool hit_eos = (next == eos_id || next == 151643U ||
-                          next == 248044U || next == 248046U);
+    const bool hit_eos = IsStopToken(next, eos_id);
     return {.emitted_tokens = {next},
             .accepted_count = 0,
             .draft_count = 0,
@@ -84,7 +138,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
   const std::size_t num_draft = proposal.tokens.size();
 
   // 2. Transactional state checkpoint at cur_pos
-  target_executor_.SaveState(cur_pos);
+  target_executor_->SaveState(cur_pos);
 
   // 3. Execute target forward verification pass
   std::vector<tokenization::TokenId> target_predictions;
@@ -94,7 +148,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
   std::uint32_t eval_pos = cur_pos;
 
   for (std::size_t i = 0; i < num_draft; ++i) {
-    const auto target_pred = target_executor_.ForwardToken(in_tok, eval_pos);
+    const auto target_pred = target_executor_->ForwardToken(in_tok, eval_pos);
     target_predictions.push_back(target_pred);
     if (target_pred != proposal.tokens[i]) {
       break;
@@ -113,26 +167,26 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
   }
 
   // 5. Transactional state commit / rollback
-  tokenization::TokenId correction_token =
-      (accepted_count < target_predictions.size())
-          ? target_predictions[accepted_count]
-          : 0;
-
-  if (accepted_count < num_draft) {
+  tokenization::TokenId correction_token = 0;
+  if (accepted_count == num_draft) {
+    // All draft tokens were accepted. Process the final accepted token to
+    // commit it and produce the target model's bonus token.
+    correction_token = target_executor_->ForwardToken(in_tok, eval_pos);
+  } else {
     // Rollback speculative state beyond accepted tokens
-    target_executor_.RestoreState();
+    target_executor_->RestoreState();
 
     // Replay accepted tokens
     tokenization::TokenId replay_in = current_token;
     std::uint32_t replay_pos = cur_pos;
     for (std::size_t i = 0; i < accepted_count; ++i) {
-      (void)target_executor_.ForwardToken(replay_in, replay_pos, false);
+      (void)target_executor_->ForwardToken(replay_in, replay_pos, false);
       replay_in = proposal.tokens[i];
       ++replay_pos;
     }
     // Commit authoritative correction token
     correction_token =
-        target_executor_.ForwardToken(replay_in, replay_pos, true);
+        target_executor_->ForwardToken(replay_in, replay_pos, true);
   }
 
   StepResult result;
@@ -148,7 +202,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
 
   // Check EOS in emitted tokens
   for (const auto tok : result.emitted_tokens) {
-    if (tok == eos_id || tok == 151643U || tok == 248044U || tok == 248046U) {
+    if (IsStopToken(tok, eos_id)) {
       result.hit_eos = true;
       break;
     }
@@ -180,43 +234,55 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
   }
 
   Reset();
-  target_executor_.Reset();
+  target_executor_->Reset();
 
   // 1. Prefill prompt
-  tokenization::TokenId next_token =
-      target_executor_.ForwardPromptBatch(prompt_tokens);
+  const tokenization::TokenId first_token =
+      target_executor_->ForwardPromptBatch(prompt_tokens);
+  const auto eos_id = target_executor_->GetEosTokenId();
+  if (options.max_new_tokens == 0 || IsStopToken(first_token, eos_id)) {
+    return output_tokens;
+  }
 
   std::vector<tokenization::TokenId> current_sequence(prompt_tokens.begin(),
                                                       prompt_tokens.end());
+  current_sequence.push_back(first_token);
   std::uint32_t cur_pos = static_cast<std::uint32_t>(prompt_tokens.size());
-  const auto eos_id = target_executor_.GetTokenizer().GetEosTokenId();
+  tokenization::TokenId next_token = first_token;
+
+  output_tokens.push_back(first_token);
+  if (on_token) {
+    const auto piece = target_executor_->DecodeToken(first_token);
+    if (!on_token(first_token, piece)) {
+      return output_tokens;
+    }
+  }
 
   // 2. Speculative Decode Generation Loop
   while (output_tokens.size() < options.max_new_tokens) {
-    if (next_token == eos_id || next_token == 151643U ||
-        next_token == 248044U || next_token == 248046U) {
-      break;
-    }
-
     const auto step_res =
         VerifyStep(current_sequence, cur_pos, next_token, eos_id);
 
     bool should_stop = false;
     for (const auto tok : step_res.emitted_tokens) {
+      if (IsStopToken(tok, eos_id)) {
+        should_stop = true;
+        break;
+      }
+
       output_tokens.push_back(tok);
       current_sequence.push_back(tok);
       ++cur_pos;
 
       if (on_token) {
-        const auto piece = target_executor_.GetTokenizer().DecodeToken(tok);
+        const auto piece = target_executor_->DecodeToken(tok);
         if (!on_token(tok, piece)) {
           should_stop = true;
           break;
         }
       }
 
-      if (tok == eos_id || tok == 151643U || tok == 248044U || tok == 248046U ||
-          output_tokens.size() >= options.max_new_tokens) {
+      if (output_tokens.size() >= options.max_new_tokens) {
         should_stop = true;
         break;
       }

@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 #include "src/core/speculative/draft_backend.hpp"
@@ -42,11 +43,32 @@ struct SpeculativeStats {
 
 #if defined(ENGINE_ENABLE_HIP)
 
+class ISpeculativeTargetExecutor {
+public:
+  virtual ~ISpeculativeTargetExecutor() = default;
+
+  virtual void Reset() noexcept = 0;
+  [[nodiscard]] virtual tokenization::TokenId ForwardPromptBatch(
+      std::span<const tokenization::TokenId> prompt_tokens) = 0;
+  [[nodiscard]] virtual tokenization::TokenId ForwardToken(
+      tokenization::TokenId token_id, std::uint32_t pos,
+      bool compute_logits = true) = 0;
+  virtual void SaveState(std::uint32_t valid_context) = 0;
+  virtual void RestoreState() = 0;
+  [[nodiscard]] virtual tokenization::TokenId GetEosTokenId()
+      const noexcept = 0;
+  [[nodiscard]] virtual std::string_view DecodeToken(
+      tokenization::TokenId token_id) const noexcept = 0;
+};
+
 /// High-throughput speculative decoding verifier with transactional state
 /// management
 class SpeculativeVerifier {
 public:
   SpeculativeVerifier(hip::QwenGpuExecutor& target_executor,
+                      std::unique_ptr<IDraftBackend> draft_backend,
+                      SpeculativeOptions options = {});
+  SpeculativeVerifier(ISpeculativeTargetExecutor& target_executor,
                       std::unique_ptr<IDraftBackend> draft_backend,
                       SpeculativeOptions options = {});
 
@@ -84,7 +106,8 @@ public:
 private:
   void UpdateAdaptiveDraftLength(std::size_t accepted, std::size_t drafted);
 
-  hip::QwenGpuExecutor& target_executor_;
+  std::unique_ptr<ISpeculativeTargetExecutor> owned_target_executor_;
+  ISpeculativeTargetExecutor* target_executor_;
   std::unique_ptr<IDraftBackend> draft_backend_;
   SpeculativeOptions options_;
   SpeculativeStats stats_;
