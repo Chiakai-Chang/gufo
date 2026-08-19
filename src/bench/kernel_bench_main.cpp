@@ -423,6 +423,9 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
   HipBuffer<std::uint16_t> key_cache_f16(cache_elements);
   HipBuffer<std::uint16_t> value_cache_f16(cache_elements);
   HipBuffer<float> output(query_elements);
+  HipBuffer<float> split_k_scratch(
+      strix::hip::detail::DecodeAttentionScratchElements(kAttentionHeads,
+                                                         kAttentionHeadDim));
 
   FillBytes(query, 0x3c, stream);
   FillBytes(gate, 0x3c, stream);
@@ -434,23 +437,29 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
   FillBytes(value_cache_f16, 0, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 
+  const std::uint32_t split_count =
+      strix::hip::detail::SelectDecodeAttentionSplitCount(context);
+  const bool use_split_k = strix::hip::detail::IsSplitKDecodeAttentionSupported(
+      context, kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim);
+  const std::string backend = use_split_k ? "split_k_fp32" : "online_fp32";
   const std::string marker =
       "decode_attention/context=" + std::to_string(context) +
-      "/heads=24/kv_heads=4/head_dim=256/backend=online_fp32";
+      "/heads=24/kv_heads=4/head_dim=256/backend=" + backend +
+      "/splits=" + std::to_string(split_count);
   const auto launch = [&] {
     strix::hip::LaunchAttention(
         query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
         value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
         output.Get(), 0, static_cast<std::uint32_t>(context - 1),
         static_cast<std::uint32_t>(context), kAttentionHeads, kAttentionKvHeads,
-        kAttentionHeadDim, stream);
+        kAttentionHeadDim, stream, split_k_scratch.Get());
   };
   auto samples_us = MeasureKernel(options, marker, stream, launch);
   VerifyFiniteNonzero(output);
 
   strix::bench::KernelBenchResult result;
   result.kernel = "decode_attention";
-  result.backend = "online_fp32";
+  result.backend = backend;
   result.marker = marker;
   result.data_type = "f32";
   result.layout = "head_major";
@@ -462,7 +471,18 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
   result.num_kv_heads = kAttentionKvHeads;
   result.head_dim = kAttentionHeadDim;
   result.estimated_bytes_per_iteration = EstimateDecodeAttentionBytes(context);
-  result.dispatch.selected_attention_backend = "decode_online_fp32";
+  if (use_split_k) {
+    result.estimated_bytes_per_iteration +=
+        2U *
+        strix::hip::detail::DecodeAttentionScratchElements(kAttentionHeads,
+                                                           kAttentionHeadDim) *
+        sizeof(float);
+    result.dispatch.selected_attention_backend = "decode_split_k_fp32";
+  } else {
+    result.dispatch.selected_attention_backend = "decode_online_fp32";
+    result.dispatch.rejected_fast_paths.emplace_back(
+        "decode_split_k_fp32: below_threshold");
+  }
   return FinalizeResult(std::move(result), std::move(samples_us));
 }
 

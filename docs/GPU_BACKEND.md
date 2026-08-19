@@ -138,8 +138,15 @@ row-tiled GEMV.
   scheduling for long prompts, with Composable Kernel as a shape fallback.
 - Chunked prefill keeps activation batches bounded while carrying absolute
   positions and persistent KV/recurrent state across context frontiers.
-- Single-token Qwen3.8 attention uses FP32 online softmax without a
-  context-sized LDS score array, including at 16K and deeper positions.
+- Single-token Qwen3.8 attention below 4K uses the graph-captured one-wave
+  FP32 online-softmax kernel.
+- At 4K and deeper positions, decode attention uses 32 sequence partitions.
+  Each partition writes an FP32 `(max, sum, weighted value)` partial and a
+  second kernel applies the stable online-softmax merge formula. The scratch
+  region is preallocated and reused between attention layers.
+- Long-context split-K decode bypasses the fixed-shape HIP graph. Attention
+  dominates at these contexts, and host-selected grid dimensions avoid
+  launching empty partitions on the short-context fast path.
 - Paged KV attention.
 - Separate single-token and batched attention kernels.
 - GQA-aware K/V reuse.

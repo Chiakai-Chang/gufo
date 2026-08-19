@@ -13,6 +13,8 @@ inline constexpr std::uint32_t kTiledAttentionKvHeads{4};
 inline constexpr std::uint32_t kTiledAttentionHeadDim{256};
 inline constexpr std::uint32_t kCkAttentionKvHeads{4};
 inline constexpr std::uint32_t kCkAttentionHeadDim{256};
+inline constexpr std::size_t kSplitKDecodeAttentionMinContext{4096};
+inline constexpr std::uint32_t kSplitKDecodeAttentionMaxSplits{32};
 
 struct AttentionSupportParams {
   std::size_t batch_size{0};
@@ -29,6 +31,28 @@ struct AttentionSupportParams {
 [[nodiscard]] constexpr bool ShouldAttemptOptimizedAttention(
     std::size_t visible_context) noexcept {
   return visible_context >= kOptimizedAttentionMinBatch;
+}
+
+[[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
+    std::size_t sequence_length) noexcept {
+  if (sequence_length < kSplitKDecodeAttentionMinContext) {
+    return 1;
+  }
+  return kSplitKDecodeAttentionMaxSplits;
+}
+
+[[nodiscard]] constexpr bool IsSplitKDecodeAttentionSupported(
+    std::size_t sequence_length, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim) noexcept {
+  return SelectDecodeAttentionSplitCount(sequence_length) > 1 &&
+         num_heads != 0 && num_kv_heads != 0 &&
+         (num_heads % num_kv_heads) == 0 && head_dim == 256;
+}
+
+[[nodiscard]] constexpr std::size_t DecodeAttentionScratchElements(
+    std::uint32_t num_heads, std::uint32_t head_dim) noexcept {
+  return static_cast<std::size_t>(num_heads) * kSplitKDecodeAttentionMaxSplits *
+         (static_cast<std::size_t>(head_dim) + 2);
 }
 
 [[nodiscard]] constexpr bool IsTiledAttentionSupported(

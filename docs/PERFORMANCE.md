@@ -235,6 +235,35 @@ Do not route every `M > 1` operation through one matrix kernel.
 Long-context performance reports include both attention wall time and complete
 decode wall time.
 
+#### Split-K single-token decode attention
+
+For the Qwen3.8 `24` query-head, `4` KV-head, `256` head-dimension shape,
+single-token attention keeps the one-wave online-softmax path below 4K tokens.
+At 4K and above, the KV sequence is divided into 32 workgroup partitions. Each
+partition produces an FP32 maximum, exponential sum, and weighted-value
+partial; the reduction kernel combines them with max-rescaling before applying
+the attention gate.
+
+The split-K path uses
+`num_heads * 32 * (head_dim + 2) * sizeof(float)` bytes of preallocated
+scratch. It does not allocate, tune, or synchronize with the host in the
+decode loop. The fixed-shape HIP graph remains the short-context route; the
+long-context route uses host-selected split-K grid dimensions.
+
+Representative `RelWithDebInfo` gfx1151 kernel medians from the issue #66
+validation sweep are:
+
+| Context | One-wave baseline | Split-K | Speedup |
+| ---: | ---: | ---: | ---: |
+| 4,096 | 1,554.63 us | 147.17 us | 10.56x |
+| 8,192 | 4,006.86 us | 406.28 us | 9.86x |
+| 16,384 | 8,014.85 us | 731.83 us | 10.95x |
+| 32,768 | 16,055.00 us | 1,441.48 us | 11.14x |
+
+These are attention-kernel measurements, not complete token latency. Promotion
+still requires end-to-end decode measurements on the same model artifact and
+power/thermal configuration.
+
 ### MoE
 
 - Keep routing on device where practical.

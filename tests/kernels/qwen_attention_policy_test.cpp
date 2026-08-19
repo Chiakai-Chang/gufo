@@ -180,14 +180,49 @@ void TestBackendSupportPredicates() {
   Check(!IsCkAttentionSupported(params), "CK attention rejects an empty batch");
 }
 
+void TestDecodeSplitPolicy() {
+  using strix::hip::detail::DecodeAttentionScratchElements;
+  using strix::hip::detail::IsSplitKDecodeAttentionSupported;
+  using strix::hip::detail::SelectDecodeAttentionSplitCount;
+
+  Check(SelectDecodeAttentionSplitCount(1024) == 1,
+        "1K decode uses one online-softmax partition");
+  Check(SelectDecodeAttentionSplitCount(4095) == 1,
+        "decode stays on one partition below 4K");
+  Check(SelectDecodeAttentionSplitCount(4096) == 32,
+        "4K decode fills the 32-wave-per-CU split ceiling");
+  Check(SelectDecodeAttentionSplitCount(8192) == 32,
+        "8K decode uses the measured split ceiling");
+  Check(SelectDecodeAttentionSplitCount(16384) == 32,
+        "16K decode uses the measured split ceiling");
+  Check(SelectDecodeAttentionSplitCount(32768) == 32,
+        "32K decode caps the partition count");
+
+  Check(IsSplitKDecodeAttentionSupported(4096, 24, 4, 256),
+        "Qwen3.8 long-context decode shape supports split-K");
+  Check(!IsSplitKDecodeAttentionSupported(2048, 24, 4, 256),
+        "short-context decode does not use split-K");
+  Check(!IsSplitKDecodeAttentionSupported(4096, 24, 0, 256),
+        "split-K rejects zero KV heads");
+  Check(!IsSplitKDecodeAttentionSupported(4096, 22, 4, 256),
+        "split-K rejects non-divisible GQA heads");
+  Check(!IsSplitKDecodeAttentionSupported(4096, 24, 4, 128),
+        "split-K rejects unsupported head dimensions");
+  Check(DecodeAttentionScratchElements(24, 256) ==
+            static_cast<std::size_t>(24 * 32 * 258),
+        "split-K scratch layout covers stats and partial values");
+}
+
 static_assert(!strix::hip::detail::ShouldAttemptOptimizedAttention(1023));
 static_assert(strix::hip::detail::ShouldAttemptOptimizedAttention(1024));
+static_assert(strix::hip::detail::SelectDecodeAttentionSplitCount(32768) == 32);
 
 }  // namespace
 
 int main() {
   TestDispatchThresholdAndFallbackOrder();
   TestBackendSupportPredicates();
+  TestDecodeSplitPolicy();
   if (failures != 0) {
     std::cerr << failures << " Qwen attention policy test(s) failed.\n";
     return 1;

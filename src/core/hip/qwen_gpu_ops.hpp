@@ -129,7 +129,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t layer_idx, std::uint32_t pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                     hipStream_t stream = nullptr);
+                     hipStream_t stream = nullptr,
+                     float* split_k_scratch = nullptr);
 
 /// Computes Grouped-Query Softmax Attention reading position from device memory
 void LaunchAttention(const float* q, const float* k, const float* v,

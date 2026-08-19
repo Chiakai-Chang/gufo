@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <stdexcept>
 
+#include "src/core/hip/detail/qwen_attention_policy.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_executor.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
@@ -23,6 +24,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   const std::size_t ssm_qkv_size = config.SsmQkvSize();
   const std::size_t ssm_inner_size = config.ssm_inner_size;
   const std::size_t time_step_rank = config.ssm_time_step_rank;
+  const std::size_t sequence_length = static_cast<std::size_t>(pos) + 1;
+  const bool use_split_k_decode = detail::IsSplitKDecodeAttentionSupported(
+      sequence_length, config.num_attention_heads, config.num_key_value_heads,
+      config.head_dim);
 
   // GPU parameter buffers
   const std::uint32_t* d_in_token = arena_.d_prompt_tokens + 0;
@@ -92,14 +97,26 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                                     config.num_key_value_heads *
                                     arena_.GetMaxContext() * config.head_dim;
         const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
-        LaunchAttention(
-            arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-            arena_.d_kv_cache, arena_.d_kv_cache + total_k,
-            arena_.d_attention_kv_f16,
-            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
-            arena_.d_ssm_out, attn_layer_idx, d_in_pos, arena_.GetMaxContext(),
-            config.num_attention_heads, config.num_key_value_heads,
-            config.head_dim, arena_.stream);
+        if (use_split_k_decode) {
+          LaunchAttention(
+              arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+              arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+              arena_.d_attention_kv_f16,
+              static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+              arena_.d_ssm_out, attn_layer_idx, pos, arena_.GetMaxContext(),
+              config.num_attention_heads, config.num_key_value_heads,
+              config.head_dim, arena_.stream,
+              static_cast<float*>(arena_.d_scratch_bf16));
+        } else {
+          LaunchAttention(
+              arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+              arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+              arena_.d_attention_kv_f16,
+              static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+              arena_.d_ssm_out, attn_layer_idx, d_in_pos,
+              arena_.GetMaxContext(), config.num_attention_heads,
+              config.num_key_value_heads, config.head_dim, arena_.stream);
+        }
 
         // Output projection
         LaunchGEMV(layer.attn_output.data, o_bf16, arena_.d_ssm_out,
@@ -179,7 +196,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
     }
   };
 
-  if (compute_logits && graph_executor_.IsEnabled()) {
+  if (compute_logits && !use_split_k_decode && graph_executor_.IsEnabled()) {
     if (graph_executor_.IsCaptured()) {
       graph_executor_.Launch(arena_.stream);
     } else {

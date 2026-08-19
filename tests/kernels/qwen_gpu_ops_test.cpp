@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
+#include "src/core/hip/detail/qwen_attention_policy.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
 
@@ -862,11 +863,12 @@ void TestAttentionBackendEquivalence() {
 }
 
 void TestLongContextDecodeAttention() {
-  constexpr std::uint32_t position = 16384;
-  constexpr std::uint32_t max_context = position + 129;
+  constexpr std::uint32_t max_position = 32767;
+  constexpr std::uint32_t max_context = max_position + 129;
   constexpr std::uint32_t num_heads = 6;
   constexpr std::uint32_t num_kv_heads = 1;
   constexpr std::uint32_t head_dim = 256;
+  constexpr std::uint32_t positions[] = {4095, 8191, 16383, max_position};
   const std::size_t attention_width =
       static_cast<std::size_t>(num_heads) * head_dim;
   const std::size_t kv_width =
@@ -898,6 +900,7 @@ void TestLongContextDecodeAttention() {
 
   float *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_gate = nullptr;
   float *d_k_cache = nullptr, *d_v_cache = nullptr, *d_out = nullptr;
+  float* d_split_k_scratch = nullptr;
   HIP_CHECK(hipMalloc(&d_q, attention_width * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_k, kv_width * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_v, kv_width * sizeof(float)));
@@ -905,6 +908,10 @@ void TestLongContextDecodeAttention() {
   HIP_CHECK(hipMalloc(&d_k_cache, cache_elements * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_v_cache, cache_elements * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_out, attention_width * sizeof(float)));
+  HIP_CHECK(hipMalloc(
+      &d_split_k_scratch,
+      strix::hip::detail::DecodeAttentionScratchElements(num_heads, head_dim) *
+          sizeof(float)));
 
   HIP_CHECK(hipMemcpy(d_q, h_q.data(), attention_width * sizeof(float),
                       hipMemcpyHostToDevice));
@@ -914,81 +921,86 @@ void TestLongContextDecodeAttention() {
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(d_gate, h_gate.data(), attention_width * sizeof(float),
                       hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_k_cache, h_cache.data(), cache_elements * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_v_cache, h_cache.data(), cache_elements * sizeof(float),
-                      hipMemcpyHostToDevice));
-
-  strix::hip::LaunchAttention(d_q, d_k, d_v, d_gate, d_k_cache, d_v_cache,
-                              nullptr, nullptr, d_out, 0, position, max_context,
-                              num_heads, num_kv_heads, head_dim);
-  HIP_CHECK(hipGetLastError());
-  HIP_CHECK(hipDeviceSynchronize());
-
   std::vector<float> output(attention_width);
-  HIP_CHECK(hipMemcpy(output.data(), d_out, attention_width * sizeof(float),
-                      hipMemcpyDeviceToHost));
   std::vector<float> reference(attention_width);
-  std::vector<double> scores(static_cast<std::size_t>(position) + 1);
   const double scale = 1.0 / std::sqrt(static_cast<double>(head_dim));
-  for (std::uint32_t head = 0; head < num_heads; ++head) {
-    const std::size_t query_offset = static_cast<std::size_t>(head) * head_dim;
-    double max_score = -std::numeric_limits<double>::infinity();
-    for (std::uint32_t token = 0; token <= position; ++token) {
-      double dot = 0.0;
-      const std::size_t cache_offset =
-          static_cast<std::size_t>(token) * head_dim;
-      for (std::uint32_t dim = 0; dim < head_dim; ++dim) {
-        const float key =
-            token == position ? h_k[dim] : h_cache[cache_offset + dim];
-        dot += static_cast<double>(h_q[query_offset + dim]) * key;
-      }
-      scores[token] = dot * scale;
-      max_score = std::max(max_score, scores[token]);
-    }
+  for (const std::uint32_t position : positions) {
+    HIP_CHECK(hipMemcpy(d_k_cache, h_cache.data(),
+                        cache_elements * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_v_cache, h_cache.data(),
+                        cache_elements * sizeof(float), hipMemcpyHostToDevice));
 
-    double denominator = 0.0;
-    for (double& score : scores) {
-      score = std::exp(score - max_score);
-      denominator += score;
-    }
-    for (std::uint32_t dim = 0; dim < head_dim; ++dim) {
-      double weighted_value = 0.0;
+    strix::hip::LaunchAttention(d_q, d_k, d_v, d_gate, d_k_cache, d_v_cache,
+                                nullptr, nullptr, d_out, 0, position,
+                                max_context, num_heads, num_kv_heads, head_dim,
+                                nullptr, d_split_k_scratch);
+    HIP_CHECK(hipGetLastError());
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipMemcpy(output.data(), d_out, attention_width * sizeof(float),
+                        hipMemcpyDeviceToHost));
+
+    std::vector<double> scores(static_cast<std::size_t>(position) + 1);
+    for (std::uint32_t head = 0; head < num_heads; ++head) {
+      const std::size_t query_offset =
+          static_cast<std::size_t>(head) * head_dim;
+      double max_score = -std::numeric_limits<double>::infinity();
       for (std::uint32_t token = 0; token <= position; ++token) {
+        double dot = 0.0;
         const std::size_t cache_offset =
             static_cast<std::size_t>(token) * head_dim;
-        const float value =
-            token == position ? h_v[dim] : h_cache[cache_offset + dim];
-        weighted_value += scores[token] * value;
+        for (std::uint32_t dim = 0; dim < head_dim; ++dim) {
+          const float key =
+              token == position ? h_k[dim] : h_cache[cache_offset + dim];
+          dot += static_cast<double>(h_q[query_offset + dim]) * key;
+        }
+        scores[token] = dot * scale;
+        max_score = std::max(max_score, scores[token]);
       }
-      const double sigmoid =
-          1.0 / (1.0 + std::exp(-h_gate[query_offset + dim]));
-      reference[query_offset + dim] =
-          static_cast<float>((weighted_value / denominator) * sigmoid);
-    }
-  }
 
-  bool has_nonzero = false;
-  float max_reference_diff = 0.0F;
-  for (std::size_t index = 0; index < output.size(); ++index) {
-    const float value = output[index];
-    max_reference_diff =
-        std::max(max_reference_diff, std::abs(value - reference[index]));
-    if (!std::isfinite(value)) {
-      std::cerr << "Long-context decode attention produced non-finite output\n";
+      double denominator = 0.0;
+      for (double& score : scores) {
+        score = std::exp(score - max_score);
+        denominator += score;
+      }
+      for (std::uint32_t dim = 0; dim < head_dim; ++dim) {
+        double weighted_value = 0.0;
+        for (std::uint32_t token = 0; token <= position; ++token) {
+          const std::size_t cache_offset =
+              static_cast<std::size_t>(token) * head_dim;
+          const float value =
+              token == position ? h_v[dim] : h_cache[cache_offset + dim];
+          weighted_value += scores[token] * value;
+        }
+        const double sigmoid =
+            1.0 / (1.0 + std::exp(-h_gate[query_offset + dim]));
+        reference[query_offset + dim] =
+            static_cast<float>((weighted_value / denominator) * sigmoid);
+      }
+    }
+
+    bool has_nonzero = false;
+    float max_reference_diff = 0.0F;
+    for (std::size_t index = 0; index < output.size(); ++index) {
+      const float value = output[index];
+      max_reference_diff =
+          std::max(max_reference_diff, std::abs(value - reference[index]));
+      if (!std::isfinite(value)) {
+        std::cerr
+            << "Long-context decode attention produced non-finite output\n";
+        std::abort();
+      }
+      has_nonzero = has_nonzero || std::abs(value) > 1e-8F;
+    }
+    std::cout << "Split-K decode attention context " << (position + 1)
+              << " max reference diff: " << max_reference_diff << "\n";
+    if (max_reference_diff >= 5e-4F) {
+      std::cerr << "Long-context decode attention mismatch\n";
       std::abort();
     }
-    has_nonzero = has_nonzero || std::abs(value) > 1e-8F;
-  }
-  std::cout << "Long-context decode attention max reference diff: "
-            << max_reference_diff << "\n";
-  if (max_reference_diff >= 5e-4F) {
-    std::cerr << "Long-context decode attention mismatch\n";
-    std::abort();
-  }
-  if (!has_nonzero) {
-    std::cerr << "Long-context decode attention produced only zeroes\n";
-    std::abort();
+    if (!has_nonzero) {
+      std::cerr << "Long-context decode attention produced only zeroes\n";
+      std::abort();
+    }
   }
 
   HIP_CHECK(hipFree(d_q));
@@ -998,6 +1010,7 @@ void TestLongContextDecodeAttention() {
   HIP_CHECK(hipFree(d_k_cache));
   HIP_CHECK(hipFree(d_v_cache));
   HIP_CHECK(hipFree(d_out));
+  HIP_CHECK(hipFree(d_split_k_scratch));
 }
 
 void TestBatchedFusedProjectionsEquivalence() {
