@@ -282,6 +282,28 @@ FP32 decode cache and FP16 tiled-prefill cache.
 | 12288 | 222.26 tok/s | 269.15 tok/s | 1.21x | 2.91 tok/s | 3.93 tok/s | 1.35x |
 | 16384 | 198.66 tok/s | 266.82 tok/s | 1.34x | 2.66 tok/s | 3.94 tok/s | 1.48x |
 
+### Split-K decode follow-up
+
+The August 19, 2026 follow-up measured the split-K decode path with 128
+generated tokens after incrementally preparing power-of-two context depths.
+The 4096, 8192, and 16384-token rows compare against the llama.cpp results
+above. The 32768-token row is a new Strix baseline; a matching llama.cpp run
+was not collected.
+
+| Depth | Previous Strix `tg128` | Split-K Strix `tg128` | Change | llama.cpp `tg128` | llama / Strix |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4096 | 3.63 tok/s | 3.70 tok/s | +1.9% | 3.97 tok/s | 1.07x |
+| 8192 | 3.24 tok/s | 3.67 tok/s | +13.3% | 3.94 tok/s | 1.07x |
+| 16384 | 2.66 tok/s | 3.60 tok/s | +35.3% | 3.94 tok/s | 1.09x |
+| 32768 | n/a | 3.47 tok/s | n/a | n/a | n/a |
+
+Prompt processing in the same run measured 274.98, 234.38, 187.95, and
+134.38 tok/s at 4096, 8192, 16384, and 32768 tokens. The run started at a
+48 C GPU edge temperature after sustained validation, rather than the
+42-43 C idle start used for the controlled comparison. Those prompt results
+are retained as diagnostic observations and do not replace the controlled
+baseline above.
+
 Strix context preparation performs real model computation, as llama-bench
 does. Only the newly exposed suffix is processed at each frontier:
 
@@ -443,4 +465,3 @@ The runtime includes a provider-neutral speculative decoding engine (`Speculativ
 - PASS: provider-neutral SpeculativeVerifier implemented transactional state rollback in 2.7 ms with bit-exact greedy invariance.
 - PASS: Prompt Lookup Decoding (PLD) achieved zero-penalty fallback operating at 3.71 tok/s on non-repeating contexts.
 - PASS: integrated 1.3 GB MTP Layer 64 (`mtp-Qwen3.8-27B-Q4_0.gguf`) with XDNA2 NPU unified DMA memory buffers, boosting NPU drafting throughput by +60.7% (1.83 -> 2.94 tok/s) and reducing verification barriers by 3.2x (18.00 ms -> 5.61 ms).
-
