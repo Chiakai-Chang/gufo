@@ -34,6 +34,7 @@
           ps.numpy
           ps.scipy
           ps.zstandard
+          strixPackages.${system}.hyperloom
         ]);
     in
     {

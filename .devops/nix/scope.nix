@@ -11,4 +11,5 @@ lib.makeScope newScope (self: {
     inherit (self) xrt;
   };
   hrx-system = self.callPackage ./hrx-system.nix { };
+  hyperloom = self.callPackage ./hyperloom.nix { };
 })
