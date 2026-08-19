@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/hip/detail/gemv_dispatcher.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
 
 namespace strix::hip {
@@ -158,6 +159,250 @@ __global__ void SwiGLUKernel(const float* __restrict__ gate,
   }
 }
 
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32GEMVKernel_1Row(const hip_bfloat16* __restrict__ A,
+                               const float* __restrict__ x,
+                               float* __restrict__ y, std::size_t M,
+                               std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t m = (blockIdx.x * WavesPerBlock) + warp_id;
+  if (m >= M) {
+    return;
+  }
+
+  const auto* row = A + (m * K);
+  const auto* row_vec = reinterpret_cast<const uint4*>(row);
+  const std::size_t K_vec = K / 8;
+
+  float dot = 0.0F;
+  for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+    const uint4 v = row_vec[vi];
+    const auto* vals = reinterpret_cast<const hip_bfloat16*>(&v);
+    const std::size_t k = vi * 8;
+    const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+    const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+
+    dot += (static_cast<float>(vals[0]) * x0.x) +
+           (static_cast<float>(vals[1]) * x0.y) +
+           (static_cast<float>(vals[2]) * x0.z) +
+           (static_cast<float>(vals[3]) * x0.w) +
+           (static_cast<float>(vals[4]) * x1.x) +
+           (static_cast<float>(vals[5]) * x1.y) +
+           (static_cast<float>(vals[6]) * x1.z) +
+           (static_cast<float>(vals[7]) * x1.w);
+  }
+  for (std::size_t k = (K_vec * 8) + lane_id; k < K; k += 32) {
+    dot += static_cast<float>(row[k]) * x[k];
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot += __shfl_xor(dot, offset);
+  }
+
+  if (lane_id == 0) {
+    y[m] = dot;
+  }
+}
+
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32GEMVKernel_2Rows(const hip_bfloat16* __restrict__ A,
+                                const float* __restrict__ x,
+                                float* __restrict__ y, std::size_t M,
+                                std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t row_pair = (blockIdx.x * WavesPerBlock) + warp_id;
+  const std::size_t m0 = row_pair * 2;
+  const std::size_t m1 = m0 + 1;
+  if (m0 >= M) {
+    return;
+  }
+
+  const auto* row0 = A + (m0 * K);
+  const auto* row1 = (m1 < M) ? A + (m1 * K) : nullptr;
+  const auto* row0_vec = reinterpret_cast<const uint4*>(row0);
+  const auto* row1_vec = reinterpret_cast<const uint4*>(row1);
+  const std::size_t K_vec = K / 8;
+
+  float dot0 = 0.0F;
+  float dot1 = 0.0F;
+
+  for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+    const std::size_t k = vi * 8;
+    const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+    const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+
+    const uint4 v0 = row0_vec[vi];
+    const auto* vals0 = reinterpret_cast<const hip_bfloat16*>(&v0);
+    dot0 += (static_cast<float>(vals0[0]) * x0.x) +
+            (static_cast<float>(vals0[1]) * x0.y) +
+            (static_cast<float>(vals0[2]) * x0.z) +
+            (static_cast<float>(vals0[3]) * x0.w) +
+            (static_cast<float>(vals0[4]) * x1.x) +
+            (static_cast<float>(vals0[5]) * x1.y) +
+            (static_cast<float>(vals0[6]) * x1.z) +
+            (static_cast<float>(vals0[7]) * x1.w);
+
+    if (row1 != nullptr) {
+      const uint4 v1 = row1_vec[vi];
+      const auto* vals1 = reinterpret_cast<const hip_bfloat16*>(&v1);
+      dot1 += (static_cast<float>(vals1[0]) * x0.x) +
+              (static_cast<float>(vals1[1]) * x0.y) +
+              (static_cast<float>(vals1[2]) * x0.z) +
+              (static_cast<float>(vals1[3]) * x0.w) +
+              (static_cast<float>(vals1[4]) * x1.x) +
+              (static_cast<float>(vals1[5]) * x1.y) +
+              (static_cast<float>(vals1[6]) * x1.z) +
+              (static_cast<float>(vals1[7]) * x1.w);
+    }
+  }
+  for (std::size_t k = (K_vec * 8) + lane_id; k < K; k += 32) {
+    const float xv = x[k];
+    dot0 += static_cast<float>(row0[k]) * xv;
+    if (row1 != nullptr) {
+      dot1 += static_cast<float>(row1[k]) * xv;
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot0 += __shfl_xor(dot0, offset);
+    dot1 += __shfl_xor(dot1, offset);
+  }
+
+  if (lane_id == 0) {
+    y[m0] = dot0;
+    if (m1 < M) {
+      y[m1] = dot1;
+    }
+  }
+}
+
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32GEMVKernel_4Rows(const hip_bfloat16* __restrict__ A,
+                                const float* __restrict__ x,
+                                float* __restrict__ y, std::size_t M,
+                                std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t row_quad = (blockIdx.x * WavesPerBlock) + warp_id;
+  const std::size_t m0 = row_quad * 4;
+  const std::size_t m1 = m0 + 1;
+  const std::size_t m2 = m0 + 2;
+  const std::size_t m3 = m0 + 3;
+  if (m0 >= M) {
+    return;
+  }
+
+  const auto* row0 = A + (m0 * K);
+  const auto* row1 = (m1 < M) ? A + (m1 * K) : nullptr;
+  const auto* row2 = (m2 < M) ? A + (m2 * K) : nullptr;
+  const auto* row3 = (m3 < M) ? A + (m3 * K) : nullptr;
+  const auto* row0_vec = reinterpret_cast<const uint4*>(row0);
+  const auto* row1_vec = reinterpret_cast<const uint4*>(row1);
+  const auto* row2_vec = reinterpret_cast<const uint4*>(row2);
+  const auto* row3_vec = reinterpret_cast<const uint4*>(row3);
+  const std::size_t K_vec = K / 8;
+
+  float dot0 = 0.0F;
+  float dot1 = 0.0F;
+  float dot2 = 0.0F;
+  float dot3 = 0.0F;
+
+  for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+    const std::size_t k = vi * 8;
+    const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+    const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+
+    const uint4 v0 = row0_vec[vi];
+    const auto* vals0 = reinterpret_cast<const hip_bfloat16*>(&v0);
+    dot0 += (static_cast<float>(vals0[0]) * x0.x) +
+            (static_cast<float>(vals0[1]) * x0.y) +
+            (static_cast<float>(vals0[2]) * x0.z) +
+            (static_cast<float>(vals0[3]) * x0.w) +
+            (static_cast<float>(vals0[4]) * x1.x) +
+            (static_cast<float>(vals0[5]) * x1.y) +
+            (static_cast<float>(vals0[6]) * x1.z) +
+            (static_cast<float>(vals0[7]) * x1.w);
+
+    if (row1 != nullptr) {
+      const uint4 v1 = row1_vec[vi];
+      const auto* vals1 = reinterpret_cast<const hip_bfloat16*>(&v1);
+      dot1 += (static_cast<float>(vals1[0]) * x0.x) +
+              (static_cast<float>(vals1[1]) * x0.y) +
+              (static_cast<float>(vals1[2]) * x0.z) +
+              (static_cast<float>(vals1[3]) * x0.w) +
+              (static_cast<float>(vals1[4]) * x1.x) +
+              (static_cast<float>(vals1[5]) * x1.y) +
+              (static_cast<float>(vals1[6]) * x1.z) +
+              (static_cast<float>(vals1[7]) * x1.w);
+    }
+    if (row2 != nullptr) {
+      const uint4 v2 = row2_vec[vi];
+      const auto* vals2 = reinterpret_cast<const hip_bfloat16*>(&v2);
+      dot2 += (static_cast<float>(vals2[0]) * x0.x) +
+              (static_cast<float>(vals2[1]) * x0.y) +
+              (static_cast<float>(vals2[2]) * x0.z) +
+              (static_cast<float>(vals2[3]) * x0.w) +
+              (static_cast<float>(vals2[4]) * x1.x) +
+              (static_cast<float>(vals2[5]) * x1.y) +
+              (static_cast<float>(vals2[6]) * x1.z) +
+              (static_cast<float>(vals2[7]) * x1.w);
+    }
+    if (row3 != nullptr) {
+      const uint4 v3 = row3_vec[vi];
+      const auto* vals3 = reinterpret_cast<const hip_bfloat16*>(&v3);
+      dot3 += (static_cast<float>(vals3[0]) * x0.x) +
+              (static_cast<float>(vals3[1]) * x0.y) +
+              (static_cast<float>(vals3[2]) * x0.z) +
+              (static_cast<float>(vals3[3]) * x0.w) +
+              (static_cast<float>(vals3[4]) * x1.x) +
+              (static_cast<float>(vals3[5]) * x1.y) +
+              (static_cast<float>(vals3[6]) * x1.z) +
+              (static_cast<float>(vals3[7]) * x1.w);
+    }
+  }
+  for (std::size_t k = (K_vec * 8) + lane_id; k < K; k += 32) {
+    const float xv = x[k];
+    dot0 += static_cast<float>(row0[k]) * xv;
+    if (row1 != nullptr) {
+      dot1 += static_cast<float>(row1[k]) * xv;
+    }
+    if (row2 != nullptr) {
+      dot2 += static_cast<float>(row2[k]) * xv;
+    }
+    if (row3 != nullptr) {
+      dot3 += static_cast<float>(row3[k]) * xv;
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot0 += __shfl_xor(dot0, offset);
+    dot1 += __shfl_xor(dot1, offset);
+    dot2 += __shfl_xor(dot2, offset);
+    dot3 += __shfl_xor(dot3, offset);
+  }
+
+  if (lane_id == 0) {
+    y[m0] = dot0;
+    if (m1 < M) {
+      y[m1] = dot1;
+    }
+    if (m2 < M) {
+      y[m2] = dot2;
+    }
+    if (m3 < M) {
+      y[m3] = dot3;
+    }
+  }
+}
+
 __global__ void FastGEMVBlockKernel(const void* __restrict__ A, bool is_bf16,
                                     const float* __restrict__ x,
                                     float* __restrict__ y, std::size_t M,
@@ -233,6 +478,376 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A, bool is_bf16,
     if (lane_id == 0) {
       y[m] = block_sum;
     }
+  }
+}
+
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32FusedSwiGLUGEMVKernel_1Row(
+        const hip_bfloat16* __restrict__ gate_w,
+        const hip_bfloat16* __restrict__ up_w, const float* __restrict__ x,
+        float* __restrict__ out, std::size_t M, std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t m = (blockIdx.x * WavesPerBlock) + warp_id;
+  if (m >= M) {
+    return;
+  }
+
+  const auto* g_row = gate_w + (m * K);
+  const auto* u_row = up_w + (m * K);
+  const auto* g_vec = reinterpret_cast<const uint4*>(g_row);
+  const auto* u_vec = reinterpret_cast<const uint4*>(u_row);
+  const std::size_t K_vec = K / 8;
+
+  float dot_gate = 0.0F;
+  float dot_up = 0.0F;
+
+  for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+    const std::size_t k = vi * 8;
+    const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+    const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+
+    const uint4 gv = g_vec[vi];
+    const uint4 uv = u_vec[vi];
+    const auto* g_vals = reinterpret_cast<const hip_bfloat16*>(&gv);
+    const auto* u_vals = reinterpret_cast<const hip_bfloat16*>(&uv);
+
+    dot_gate += (static_cast<float>(g_vals[0]) * x0.x) +
+                (static_cast<float>(g_vals[1]) * x0.y) +
+                (static_cast<float>(g_vals[2]) * x0.z) +
+                (static_cast<float>(g_vals[3]) * x0.w) +
+                (static_cast<float>(g_vals[4]) * x1.x) +
+                (static_cast<float>(g_vals[5]) * x1.y) +
+                (static_cast<float>(g_vals[6]) * x1.z) +
+                (static_cast<float>(g_vals[7]) * x1.w);
+
+    dot_up += (static_cast<float>(u_vals[0]) * x0.x) +
+              (static_cast<float>(u_vals[1]) * x0.y) +
+              (static_cast<float>(u_vals[2]) * x0.z) +
+              (static_cast<float>(u_vals[3]) * x0.w) +
+              (static_cast<float>(u_vals[4]) * x1.x) +
+              (static_cast<float>(u_vals[5]) * x1.y) +
+              (static_cast<float>(u_vals[6]) * x1.z) +
+              (static_cast<float>(u_vals[7]) * x1.w);
+  }
+  for (std::size_t k = (K_vec * 8) + lane_id; k < K; k += 32) {
+    const float xv = x[k];
+    dot_gate += static_cast<float>(g_row[k]) * xv;
+    dot_up += static_cast<float>(u_row[k]) * xv;
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot_gate += __shfl_xor(dot_gate, offset);
+    dot_up += __shfl_xor(dot_up, offset);
+  }
+
+  if (lane_id == 0) {
+    const float sig_g = 1.0F / (1.0F + expf(-dot_gate));
+    out[m] = (dot_gate * sig_g) * dot_up;
+  }
+}
+
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32FusedSwiGLUGEMVKernel_2Rows(
+        const hip_bfloat16* __restrict__ gate_w,
+        const hip_bfloat16* __restrict__ up_w, const float* __restrict__ x,
+        float* __restrict__ out, std::size_t M, std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t row_pair = (blockIdx.x * WavesPerBlock) + warp_id;
+  const std::size_t m0 = row_pair * 2;
+  const std::size_t m1 = m0 + 1;
+  if (m0 >= M) {
+    return;
+  }
+
+  const auto* g_row0 = gate_w + (m0 * K);
+  const auto* u_row0 = up_w + (m0 * K);
+  const auto* g_row1 = (m1 < M) ? gate_w + (m1 * K) : nullptr;
+  const auto* u_row1 = (m1 < M) ? up_w + (m1 * K) : nullptr;
+
+  const auto* g_vec0 = reinterpret_cast<const uint4*>(g_row0);
+  const auto* u_vec0 = reinterpret_cast<const uint4*>(u_row0);
+  const auto* g_vec1 = reinterpret_cast<const uint4*>(g_row1);
+  const auto* u_vec1 = reinterpret_cast<const uint4*>(u_row1);
+  const std::size_t K_vec = K / 8;
+
+  float dot_g0 = 0.0F, dot_u0 = 0.0F;
+  float dot_g1 = 0.0F, dot_u1 = 0.0F;
+
+  for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+    const std::size_t k = vi * 8;
+    const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+    const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+
+    const uint4 gv0 = g_vec0[vi];
+    const uint4 uv0 = u_vec0[vi];
+    const auto* g_vals0 = reinterpret_cast<const hip_bfloat16*>(&gv0);
+    const auto* u_vals0 = reinterpret_cast<const hip_bfloat16*>(&uv0);
+
+    dot_g0 += (static_cast<float>(g_vals0[0]) * x0.x) +
+              (static_cast<float>(g_vals0[1]) * x0.y) +
+              (static_cast<float>(g_vals0[2]) * x0.z) +
+              (static_cast<float>(g_vals0[3]) * x0.w) +
+              (static_cast<float>(g_vals0[4]) * x1.x) +
+              (static_cast<float>(g_vals0[5]) * x1.y) +
+              (static_cast<float>(g_vals0[6]) * x1.z) +
+              (static_cast<float>(g_vals0[7]) * x1.w);
+
+    dot_u0 += (static_cast<float>(u_vals0[0]) * x0.x) +
+              (static_cast<float>(u_vals0[1]) * x0.y) +
+              (static_cast<float>(u_vals0[2]) * x0.z) +
+              (static_cast<float>(u_vals0[3]) * x0.w) +
+              (static_cast<float>(u_vals0[4]) * x1.x) +
+              (static_cast<float>(u_vals0[5]) * x1.y) +
+              (static_cast<float>(u_vals0[6]) * x1.z) +
+              (static_cast<float>(u_vals0[7]) * x1.w);
+
+    if (g_row1 != nullptr) {
+      const uint4 gv1 = g_vec1[vi];
+      const uint4 uv1 = u_vec1[vi];
+      const auto* g_vals1 = reinterpret_cast<const hip_bfloat16*>(&gv1);
+      const auto* u_vals1 = reinterpret_cast<const hip_bfloat16*>(&uv1);
+
+      dot_g1 += (static_cast<float>(g_vals1[0]) * x0.x) +
+                (static_cast<float>(g_vals1[1]) * x0.y) +
+                (static_cast<float>(g_vals1[2]) * x0.z) +
+                (static_cast<float>(g_vals1[3]) * x0.w) +
+                (static_cast<float>(g_vals1[4]) * x1.x) +
+                (static_cast<float>(g_vals1[5]) * x1.y) +
+                (static_cast<float>(g_vals1[6]) * x1.z) +
+                (static_cast<float>(g_vals1[7]) * x1.w);
+
+      dot_u1 += (static_cast<float>(u_vals1[0]) * x0.x) +
+                (static_cast<float>(u_vals1[1]) * x0.y) +
+                (static_cast<float>(u_vals1[2]) * x0.z) +
+                (static_cast<float>(u_vals1[3]) * x0.w) +
+                (static_cast<float>(u_vals1[4]) * x1.x) +
+                (static_cast<float>(u_vals1[5]) * x1.y) +
+                (static_cast<float>(u_vals1[6]) * x1.z) +
+                (static_cast<float>(u_vals1[7]) * x1.w);
+    }
+  }
+  for (std::size_t k = (K_vec * 8) + lane_id; k < K; k += 32) {
+    const float xv = x[k];
+    dot_g0 += static_cast<float>(g_row0[k]) * xv;
+    dot_u0 += static_cast<float>(u_row0[k]) * xv;
+    if (g_row1 != nullptr) {
+      dot_g1 += static_cast<float>(g_row1[k]) * xv;
+      dot_u1 += static_cast<float>(u_row1[k]) * xv;
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot_g0 += __shfl_xor(dot_g0, offset);
+    dot_u0 += __shfl_xor(dot_u0, offset);
+    dot_g1 += __shfl_xor(dot_g1, offset);
+    dot_u1 += __shfl_xor(dot_u1, offset);
+  }
+
+  if (lane_id == 0) {
+    const float sig_g0 = 1.0F / (1.0F + expf(-dot_g0));
+    out[m0] = (dot_g0 * sig_g0) * dot_u0;
+    if (m1 < M) {
+      const float sig_g1 = 1.0F / (1.0F + expf(-dot_g1));
+      out[m1] = (dot_g1 * sig_g1) * dot_u1;
+    }
+  }
+}
+
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32FusedSSMInputProjectionsKernel_1Row(
+        const void* __restrict__ qkv_w, bool qkv_is_bf16,
+        const void* __restrict__ gate_w, bool gate_is_bf16,
+        const void* __restrict__ alpha_w, bool alpha_is_bf16,
+        const void* __restrict__ beta_w, bool beta_is_bf16,
+        const float* __restrict__ x, float* __restrict__ qkv_out,
+        float* __restrict__ gate_out, float* __restrict__ alpha_out,
+        float* __restrict__ beta_out, std::size_t hidden_size,
+        std::size_t qkv_size, std::size_t inner_size,
+        std::size_t time_step_rank) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t m = (blockIdx.x * WavesPerBlock) + warp_id;
+  const std::size_t gate_end = qkv_size + inner_size;
+  const std::size_t alpha_end = gate_end + time_step_rank;
+  const std::size_t total_rows = alpha_end + time_step_rank;
+  if (m >= total_rows)
+    return;
+
+  const void* A = nullptr;
+  bool is_bf16 = false;
+  float* out_target = nullptr;
+  std::size_t row_idx = 0;
+
+  if (m < qkv_size) {
+    A = qkv_w;
+    is_bf16 = qkv_is_bf16;
+    out_target = qkv_out;
+    row_idx = m;
+  } else if (m < gate_end) {
+    A = gate_w;
+    is_bf16 = gate_is_bf16;
+    out_target = gate_out;
+    row_idx = m - qkv_size;
+  } else if (m < alpha_end) {
+    A = alpha_w;
+    is_bf16 = alpha_is_bf16;
+    out_target = alpha_out;
+    row_idx = m - gate_end;
+  } else {
+    A = beta_w;
+    is_bf16 = beta_is_bf16;
+    out_target = beta_out;
+    row_idx = m - alpha_end;
+  }
+
+  float dot = 0.0F;
+
+  if (is_bf16) {
+    const auto* row =
+        static_cast<const hip_bfloat16*>(A) + (row_idx * hidden_size);
+    const std::size_t K_vec = hidden_size / 8;
+    const auto* row_vec = reinterpret_cast<const uint4*>(row);
+
+    for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+      const uint4 v = row_vec[vi];
+      const auto* vals = reinterpret_cast<const hip_bfloat16*>(&v);
+      const std::size_t k = vi * 8;
+      const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+      const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+
+      dot += (static_cast<float>(vals[0]) * x0.x) +
+             (static_cast<float>(vals[1]) * x0.y) +
+             (static_cast<float>(vals[2]) * x0.z) +
+             (static_cast<float>(vals[3]) * x0.w) +
+             (static_cast<float>(vals[4]) * x1.x) +
+             (static_cast<float>(vals[5]) * x1.y) +
+             (static_cast<float>(vals[6]) * x1.z) +
+             (static_cast<float>(vals[7]) * x1.w);
+    }
+    for (std::size_t k = (K_vec * 8) + lane_id; k < hidden_size; k += 32) {
+      dot += static_cast<float>(row[k]) * x[k];
+    }
+  } else {
+    const auto* row = static_cast<const float*>(A) + (row_idx * hidden_size);
+    const std::size_t K_vec = hidden_size / 4;
+    const auto* row_vec = reinterpret_cast<const float4*>(row);
+
+    for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+      const float4 v = row_vec[vi];
+      const std::size_t k = vi * 4;
+      const float4 xv = *reinterpret_cast<const float4*>(&x[k]);
+      dot += (v.x * xv.x) + (v.y * xv.y) + (v.z * xv.z) + (v.w * xv.w);
+    }
+    for (std::size_t k = (K_vec * 4) + lane_id; k < hidden_size; k += 32) {
+      dot += row[k] * x[k];
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot += __shfl_xor(dot, offset);
+  }
+
+  if (lane_id == 0) {
+    out_target[row_idx] = dot;
+  }
+}
+
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32FusedQKVProjectionsKernel_1Row(
+        const void* __restrict__ q_w, bool q_is_bf16,
+        const void* __restrict__ k_w, bool k_is_bf16,
+        const void* __restrict__ v_w, bool v_is_bf16,
+        const float* __restrict__ x, float* __restrict__ q_out,
+        float* __restrict__ k_out, float* __restrict__ v_out, std::size_t q_dim,
+        std::size_t kv_dim, std::size_t hidden_size) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t m = (blockIdx.x * WavesPerBlock) + warp_id;
+  const std::size_t total_rows = q_dim + (2 * kv_dim);
+  if (m >= total_rows)
+    return;
+
+  const void* A = nullptr;
+  bool is_bf16 = false;
+  float* out_target = nullptr;
+  std::size_t row_idx = 0;
+
+  if (m < q_dim) {
+    A = q_w;
+    is_bf16 = q_is_bf16;
+    out_target = q_out;
+    row_idx = m;
+  } else if (m < q_dim + kv_dim) {
+    A = k_w;
+    is_bf16 = k_is_bf16;
+    out_target = k_out;
+    row_idx = m - q_dim;
+  } else {
+    A = v_w;
+    is_bf16 = v_is_bf16;
+    out_target = v_out;
+    row_idx = m - q_dim - kv_dim;
+  }
+
+  float dot = 0.0F;
+
+  if (is_bf16) {
+    const auto* row =
+        static_cast<const hip_bfloat16*>(A) + (row_idx * hidden_size);
+    const std::size_t K_vec = hidden_size / 8;
+    const auto* row_vec = reinterpret_cast<const uint4*>(row);
+
+    for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+      const uint4 v = row_vec[vi];
+      const auto* vals = reinterpret_cast<const hip_bfloat16*>(&v);
+      const std::size_t k = vi * 8;
+      const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+      const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+
+      dot += (static_cast<float>(vals[0]) * x0.x) +
+             (static_cast<float>(vals[1]) * x0.y) +
+             (static_cast<float>(vals[2]) * x0.z) +
+             (static_cast<float>(vals[3]) * x0.w) +
+             (static_cast<float>(vals[4]) * x1.x) +
+             (static_cast<float>(vals[5]) * x1.y) +
+             (static_cast<float>(vals[6]) * x1.z) +
+             (static_cast<float>(vals[7]) * x1.w);
+    }
+    for (std::size_t k = (K_vec * 8) + lane_id; k < hidden_size; k += 32) {
+      dot += static_cast<float>(row[k]) * x[k];
+    }
+  } else {
+    const auto* row = static_cast<const float*>(A) + (row_idx * hidden_size);
+    const std::size_t K_vec = hidden_size / 4;
+    const auto* row_vec = reinterpret_cast<const float4*>(row);
+
+    for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+      const float4 v = row_vec[vi];
+      const std::size_t k = vi * 4;
+      const float4 xv = *reinterpret_cast<const float4*>(&x[k]);
+      dot += (v.x * xv.x) + (v.y * xv.y) + (v.z * xv.z) + (v.w * xv.w);
+    }
+    for (std::size_t k = (K_vec * 4) + lane_id; k < hidden_size; k += 32) {
+      dot += row[k] * x[k];
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot += __shfl_xor(dot, offset);
+  }
+
+  if (lane_id == 0) {
+    out_target[row_idx] = dot;
   }
 }
 
@@ -775,6 +1390,41 @@ void LaunchSwiGLU(const float* gate, const float* up, float* out,
 
 void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
                 std::size_t M, std::size_t K, hipStream_t stream) {
+  const auto strategy = detail::SelectGemvStrategy(M, K, is_bf16);
+  constexpr std::uint32_t kWavesPerBlock = 4;
+  constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+
+  switch (strategy) {
+    case detail::GemvStrategy::kWave32QuadRow: {
+      const auto* A_bf16 = static_cast<const hip_bfloat16*>(A);
+      const std::size_t num_quads = (M + 3) / 4;
+      const std::size_t grid =
+          (num_quads + kWavesPerBlock - 1) / kWavesPerBlock;
+      Wave32GEMVKernel_4Rows<kWavesPerBlock>
+          <<<grid, kBlockThreads, 0, stream>>>(A_bf16, x, y, M, K);
+      return;
+    }
+    case detail::GemvStrategy::kWave32DualRow: {
+      const auto* A_bf16 = static_cast<const hip_bfloat16*>(A);
+      const std::size_t num_pairs = (M + 1) / 2;
+      const std::size_t grid =
+          (num_pairs + kWavesPerBlock - 1) / kWavesPerBlock;
+      Wave32GEMVKernel_2Rows<kWavesPerBlock>
+          <<<grid, kBlockThreads, 0, stream>>>(A_bf16, x, y, M, K);
+      return;
+    }
+    case detail::GemvStrategy::kWave32SingleRow: {
+      const auto* A_bf16 = static_cast<const hip_bfloat16*>(A);
+      const std::size_t grid = (M + kWavesPerBlock - 1) / kWavesPerBlock;
+      Wave32GEMVKernel_1Row<kWavesPerBlock>
+          <<<grid, kBlockThreads, 0, stream>>>(A_bf16, x, y, M, K);
+      return;
+    }
+    case detail::GemvStrategy::kBaselineBlock:
+    default:
+      break;
+  }
+
   const std::size_t block_size = K >= kLargeGemvInput ? 512 : 256;
   FastGEMVBlockKernel<<<M, block_size, 0, stream>>>(A, is_bf16, x, y, M, K);
 }
@@ -787,6 +1437,18 @@ void LaunchFusedSSMInputProjections(
     std::size_t qkv_size, std::size_t inner_size, std::size_t time_step_rank,
     hipStream_t stream) {
   const std::size_t total_rows = qkv_size + inner_size + (2 * time_step_rank);
+  if (hidden_size % 8 == 0) {
+    constexpr std::uint32_t kWavesPerBlock = 4;
+    constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+    const std::size_t grid = (total_rows + kWavesPerBlock - 1) / kWavesPerBlock;
+    Wave32FusedSSMInputProjectionsKernel_1Row<kWavesPerBlock>
+        <<<grid, kBlockThreads, 0, stream>>>(
+            qkv_w, qkv_is_bf16, gate_w, gate_is_bf16, alpha_w, alpha_is_bf16,
+            beta_w, beta_is_bf16, x, qkv_out, gate_out, alpha_out, beta_out,
+            hidden_size, qkv_size, inner_size, time_step_rank);
+    return;
+  }
+
   FusedSSMInputProjectionsKernel<<<total_rows, 128, 0, stream>>>(
       qkv_w, qkv_is_bf16, gate_w, gate_is_bf16, alpha_w, alpha_is_bf16, beta_w,
       beta_is_bf16, x, qkv_out, gate_out, alpha_out, beta_out, hidden_size,
@@ -800,6 +1462,17 @@ void LaunchFusedQKVProjections(const void* q_w, bool q_is_bf16, const void* k_w,
                                std::size_t kv_dim, std::size_t hidden_size,
                                hipStream_t stream) {
   const std::size_t total_rows = q_dim + (2 * kv_dim);
+  if (hidden_size % 8 == 0) {
+    constexpr std::uint32_t kWavesPerBlock = 4;
+    constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+    const std::size_t grid = (total_rows + kWavesPerBlock - 1) / kWavesPerBlock;
+    Wave32FusedQKVProjectionsKernel_1Row<kWavesPerBlock>
+        <<<grid, kBlockThreads, 0, stream>>>(q_w, q_is_bf16, k_w, k_is_bf16,
+                                             v_w, v_is_bf16, x, q_out, k_out,
+                                             v_out, q_dim, kv_dim, hidden_size);
+    return;
+  }
+
   FusedQKVProjectionsKernel<<<total_rows, 128, 0, stream>>>(
       q_w, q_is_bf16, k_w, k_is_bf16, v_w, v_is_bf16, x, q_out, k_out, v_out,
       q_dim, kv_dim, hidden_size);
@@ -809,6 +1482,32 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, bool gate_is_bf16,
                            const void* up_w, bool up_is_bf16, const float* x,
                            float* out, std::size_t intermediate_size,
                            std::size_t hidden_size, hipStream_t stream) {
+  if (gate_is_bf16 && up_is_bf16 && (hidden_size % 8 == 0)) {
+    constexpr std::uint32_t kWavesPerBlock = 4;
+    constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+
+    if (intermediate_size >= 2 && (intermediate_size % 2 == 0)) {
+      const std::size_t num_pairs = intermediate_size / 2;
+      const std::size_t grid =
+          (num_pairs + kWavesPerBlock - 1) / kWavesPerBlock;
+      Wave32FusedSwiGLUGEMVKernel_2Rows<kWavesPerBlock>
+          <<<grid, kBlockThreads, 0, stream>>>(
+              static_cast<const hip_bfloat16*>(gate_w),
+              static_cast<const hip_bfloat16*>(up_w), x, out, intermediate_size,
+              hidden_size);
+      return;
+    }
+
+    const std::size_t grid =
+        (intermediate_size + kWavesPerBlock - 1) / kWavesPerBlock;
+    Wave32FusedSwiGLUGEMVKernel_1Row<kWavesPerBlock>
+        <<<grid, kBlockThreads, 0, stream>>>(
+            static_cast<const hip_bfloat16*>(gate_w),
+            static_cast<const hip_bfloat16*>(up_w), x, out, intermediate_size,
+            hidden_size);
+    return;
+  }
+
   FastFusedSwiGLUGEMVBlockKernel<<<intermediate_size, 512, 0, stream>>>(
       gate_w, gate_is_bf16, up_w, up_is_bf16, x, out, intermediate_size,
       hidden_size);

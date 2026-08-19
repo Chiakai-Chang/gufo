@@ -20,6 +20,13 @@ static inline std::uint16_t FloatToBf16Bits(float f) {
   return static_cast<std::uint16_t>(bits >> 16);
 }
 
+static inline float Bf16BitsToFloat(std::uint16_t bits) {
+  std::uint32_t f_bits = static_cast<std::uint32_t>(bits) << 16;
+  float f = 0.0F;
+  std::memcpy(&f, &f_bits, sizeof(f));
+  return f;
+}
+
 void TestGpuRMSNorm() {
   const std::size_t dim = 256;
   std::vector<float> h_x(dim, 1.0F);
@@ -84,36 +91,110 @@ void TestGpuResidualAdd() {
 }
 
 void TestGpuGEMV() {
-  const std::size_t M = 4;
-  const std::size_t K = 8;
-  std::vector<float> h_A(M * K, 1.0F);  // all ones
-  std::vector<float> h_x(K, 2.0F);      // all twos
-  std::vector<float> h_y(M, 0.0F);
+  // Test 1: FP32 GEMV baseline fallback
+  {
+    const std::size_t M = 4;
+    const std::size_t K = 8;
+    std::vector<float> h_A(M * K, 1.0F);  // all ones
+    std::vector<float> h_x(K, 2.0F);      // all twos
+    std::vector<float> h_y(M, 0.0F);
 
-  float *d_A = nullptr, *d_x = nullptr, *d_y = nullptr;
-  HIP_CHECK(hipMalloc(&d_A, M * K * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_x, K * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_y, M * sizeof(float)));
+    float *d_A = nullptr, *d_x = nullptr, *d_y = nullptr;
+    HIP_CHECK(hipMalloc(&d_A, M * K * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_x, K * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_y, M * sizeof(float)));
 
-  HIP_CHECK(
-      hipMemcpy(d_A, h_A.data(), M * K * sizeof(float), hipMemcpyHostToDevice));
-  HIP_CHECK(
-      hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
+    HIP_CHECK(hipMemcpy(d_A, h_A.data(), M * K * sizeof(float),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(
+        hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
 
-  strix::hip::LaunchGEMV(d_A, false, d_x, d_y, M, K);
-  HIP_CHECK(hipDeviceSynchronize());
+    strix::hip::LaunchGEMV(d_A, false, d_x, d_y, M, K);
+    HIP_CHECK(hipDeviceSynchronize());
 
-  HIP_CHECK(
-      hipMemcpy(h_y.data(), d_y, M * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(
+        hipMemcpy(h_y.data(), d_y, M * sizeof(float), hipMemcpyDeviceToHost));
 
-  // Each row has K=8 ones * 2.0 = 16.0
-  for (std::size_t m = 0; m < M; ++m) {
-    assert(std::abs(h_y[m] - 16.0F) < 1e-4F);
+    // Each row has K=8 ones * 2.0 = 16.0
+    for (std::size_t m = 0; m < M; ++m) {
+      assert(std::abs(h_y[m] - 16.0F) < 1e-4F);
+    }
+
+    HIP_CHECK(hipFree(d_A));
+    HIP_CHECK(hipFree(d_x));
+    HIP_CHECK(hipFree(d_y));
   }
 
-  HIP_CHECK(hipFree(d_A));
-  HIP_CHECK(hipFree(d_x));
-  HIP_CHECK(hipFree(d_y));
+  // Test 2: BF16 Wave32 Single-Row, Dual-Row, Quad-Row and Qwen projection
+  // shapes
+  const std::vector<std::pair<std::size_t, std::size_t>> test_shapes = {
+      {1, 256},     // Single row (kWave32SingleRow)
+      {2, 512},     // Dual row (kWave32DualRow)
+      {3, 256},     // Odd rows (kWave32SingleRow)
+      {4, 512},     // Quad row (kWave32QuadRow)
+      {64, 1024},   // Medium quad row
+      {256, 4096},  // Large Qwen-like projection
+  };
+
+  for (const auto& [M, K] : test_shapes) {
+    std::vector<std::uint16_t> h_A(M * K);
+    std::vector<float> h_A_f32(M * K);
+    std::vector<float> h_x(K);
+    std::vector<float> h_y_ref(M, 0.0F);
+    std::vector<float> h_y(M, 0.0F);
+
+    for (std::size_t i = 0; i < M * K; ++i) {
+      const float val =
+          0.05F * static_cast<float>(static_cast<int>(i % 13) - 6);
+      h_A_f32[i] = val;
+      h_A[i] = FloatToBf16Bits(val);
+    }
+    for (std::size_t k = 0; k < K; ++k) {
+      h_x[k] = 0.1F * static_cast<float>(static_cast<int>(k % 17) - 8);
+    }
+
+    // CPU reference computation
+    for (std::size_t m = 0; m < M; ++m) {
+      float dot = 0.0F;
+      for (std::size_t k = 0; k < K; ++k) {
+        dot += Bf16BitsToFloat(h_A[m * K + k]) * h_x[k];
+      }
+      h_y_ref[m] = dot;
+    }
+
+    void* d_A = nullptr;
+    float *d_x = nullptr, *d_y = nullptr;
+    HIP_CHECK(hipMalloc(&d_A, M * K * sizeof(std::uint16_t)));
+    HIP_CHECK(hipMalloc(&d_x, K * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_y, M * sizeof(float)));
+
+    HIP_CHECK(hipMemcpy(d_A, h_A.data(), M * K * sizeof(std::uint16_t),
+                        hipMemcpyHostToDevice));
+    HIP_CHECK(
+        hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
+
+    strix::hip::LaunchGEMV(d_A, true, d_x, d_y, M, K);
+    HIP_CHECK(hipDeviceSynchronize());
+
+    HIP_CHECK(
+        hipMemcpy(h_y.data(), d_y, M * sizeof(float), hipMemcpyDeviceToHost));
+
+    std::cout << "M=" << M << " K=" << K
+              << " h_A[0]=" << Bf16BitsToFloat(h_A[0]) << " h_x[0]=" << h_x[0]
+              << " ref[0]=" << h_y_ref[0] << " y[0]=" << h_y[0] << "\n";
+
+    float max_diff = 0.0F;
+    for (std::size_t m = 0; m < M; ++m) {
+      max_diff = std::max(max_diff, std::abs(h_y[m] - h_y_ref[m]));
+    }
+    std::cout << "Shape M=" << M << " K=" << K << " max diff=" << max_diff
+              << " y[0]=" << h_y[0] << " ref[0]=" << h_y_ref[0] << "\n";
+    assert(max_diff < 1e-2F);
+
+    HIP_CHECK(hipFree(d_A));
+    HIP_CHECK(hipFree(d_x));
+    HIP_CHECK(hipFree(d_y));
+  }
 }
 
 void TestBatchedGEMM() {
