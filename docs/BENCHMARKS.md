@@ -124,33 +124,29 @@ backend and kernel name per timing row.
 
 ## Focused GPU kernel benchmarks
 
-The installed `strix-kernel-bench` executable measures production HIP entry
-points without loading a model artifact. It supports GEMV/GEMM, decode and
-batched attention, DeltaNet recurrence, RMSNorm, residual add, and SwiGLU.
-Deterministic inputs and lightweight correctness sentinels run outside the
-timed interval. The standard `128..32768` context matrix is the default for
-context- and batch-sensitive cases.
+`strix-kernel-bench` measures production HIP entry points without loading a
+model. It covers matrix operations, attention, DeltaNet, normalization, and
+elementwise kernels. Correctness sentinels run outside the timed interval.
 
-The structured report binds each row to the machine fingerprint and engine
-revision and records shape, type, layout, raw HIP-event samples, median/p10/p90,
-tokens/s, effective bandwidth, dispatch choices, rejected fast paths, and
-profiler resource fields. Resource fields are intentionally null in unprofiled
-reports; collect VGPR, LDS, scratch, occupancy, and counter evidence in a
-separate `rocprofv3` pass using the emitted ROCTx case marker.
+```sh
+./result/bin/strix-kernel-bench --list
+./result/bin/strix-kernel-bench \
+  --case decode-attention \
+  --context 4096,8192,12288,16384 \
+  --warmup 5 \
+  --repetitions 30 \
+  --json
+```
 
-`tune_hipblaslt` is the separate offline search tool for production BF16 GEMM
-shapes. It benchmarks supported algorithms with HIP events, rechecks any
-candidate that differs from the runtime heuristic, requires at least a 2%
-verified improvement, and writes a hardware/ROCm-bound binary database. Set
-`STRIX_HIPBLASLT_PLAN_CACHE` to use that artifact in `strix-server`,
-`strix-bench`, or `strix-kernel-bench`. Generated databases are local benchmark
-artifacts and are not committed.
+The JSON report records shapes, raw HIP-event samples, summary latency,
+dispatch choices, and a privacy-safe machine fingerprint. Collect profiler
+resource data in a separate `rocprofv3` pass.
 
-`benchmark_ssm_replay` compares speculative recurrent rollback at draft lengths
-1, 2, 4, 8, and 16. It reports checkpoint latency, rollback-plus-replay
-latency, and authoritative next-token verification. The default path uses the
-device SSM input ring; `STRIX_DISABLE_SSM_REPLAY=1` selects the full-model
-fallback for a matched comparison.
+`tune_hipblaslt` creates an optional hardware/ROCm-bound plan database.
+`benchmark_ssm_replay` compares recurrent rollback at draft lengths 1-16.
+Generated databases, traces, and replay reports are local artifacts and are
+not committed. See [Performance Engineering](PERFORMANCE.md) for commands and
+promotion rules.
 
 ## Machine Fingerprint & Artifact Binding
 

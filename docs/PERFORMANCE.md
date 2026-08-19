@@ -1,537 +1,182 @@
 # Strix Halo Performance Engineering
 
-Status: design draft, 2026-08-18
+Status: stable guidance, 2026-08-19.
 
-## Purpose
-
-This document defines how performance-critical host code, HIP kernels, AIE2P
-programs, memory layouts, and GPU/NPU routes are designed and reviewed for
-Strix Halo.
-
-The project optimizes end-to-end request behavior, not isolated peak FLOPS or
-TOPS. A kernel is promoted only when it preserves its numerical contract and
-improves the declared serving workload.
+This document defines the measurement and promotion rules for performance
+work. Current model numbers belong in `benchmarks/<model>/README.md`; issue
+comments and local artifacts hold detailed experiment history.
 
 ## Target
 
-The only production target is:
+The only production target is Linux x86-64 on AMD Strix Halo:
 
-```text
-OS:          Linux x86-64
-APU:         AMD Strix Halo
-GPU:         gfx1151, RDNA 3.5, up to 40 CUs
-GPU waves:   wave32
-NPU:         XDNA2/AIE2P, 4 rows x 8 columns
-NPU L2:      4 MiB software-managed memory-tile capacity
-Memory:      unified LPDDR5X, up to 128 GiB
-```
+- `gfx1151` GPU using Wave32 HIP kernels.
+- XDNA2/AIE2P NPU.
+- Unified LPDDR5X shared by CPU, GPU, and NPU.
+- Nix-provided compilers, libraries, profilers, and test tools.
 
-Runtime probing records the actual CU count, clocks, memory configuration,
-available AIE columns, driver and firmware versions, thermals, and power mode.
-Do not assume that every machine exposes the top configuration.
+Runtime probes, not assumed peak specifications, determine the available CUs,
+AIE columns, memory, firmware, power mode, and thermal state.
 
-## Optimization Order
+## Optimization Loop
 
-For every workload:
+1. Define the numerical and mutable-state contract.
+2. Measure the complete workload and identify the dominant phase.
+3. Classify it as bandwidth, compute, launch, synchronization, or scheduling
+   limited.
+4. Build a focused reproducer with a trusted oracle.
+5. Change one mechanism at a time.
+6. Reject candidates that lose focused correctness or measured performance.
+7. Run broader quality and integration gates only for the retained candidate.
+8. Record the current result, not the full experiment diary.
 
-1. Define the numerical and state contract.
-2. Measure end-to-end wall time and identify the dominant phase.
-3. Classify the phase as bandwidth, compute, launch, synchronization, or
-   scheduling limited.
-4. Build a narrow reproducer and CPU or canonical oracle.
-5. Optimize the dominant cost.
-6. Re-run full correctness and request-level performance.
-7. Retain the result only when the complete route improves.
+Optimize end-to-end request behavior. A faster isolated kernel is not a win if
+packing, synchronization, state management, or thermals erase the gain.
 
-Do not begin with a device instruction simply because it has a high advertised
-throughput.
+## Measurement Contract
 
-## Roofline Model
+Comparable runs use the same:
 
-Estimate arithmetic intensity:
+- Source revision and Nix build mode.
+- Model revision, artifact, quantization, and KV representation.
+- Prompt tokens, generated-token count, batch, depth, and concurrency.
+- GPU/NPU route and dispatch configuration.
+- Driver, firmware, ROCm, XRT, power mode, and memory configuration.
+- Warmup policy and repetition count.
 
-```text
-intensity = useful operations / external-memory bytes
-```
+Alternate baseline and candidate runs on the same machine. Report medians and
+tail values rather than the best sample. Record the starting thermal state for
+long model runs; do not attribute an increasing-length sweep when the shared
+APU heats materially between cases.
 
-Then compare against measured, not theoretical, machine ceilings.
+Headline latency comes from an unprofiled run. Use separate profiler runs for
+kernel timing, counters, occupancy, VGPR, LDS, and scratch because tracing
+changes timing.
 
-### Single-token decode
+Benchmark artifacts may include a privacy-safe machine fingerprint. They must
+not include hostnames, usernames, local paths, prompts, generated text,
+credentials, process secrets, or raw token IDs.
 
-Dense and selected-expert GEMV usually read each active weight once for one
-token. Decode performance is primarily determined by:
+## Workload Guide
 
-- Compressed bytes read per active parameter.
-- Effective LPDDR bandwidth.
-- Coalescing and outstanding memory operations.
-- Weight and metadata duplication.
-- Launch count.
-- KV traffic at the active context length.
+| Workload | Typical limit | First measurements |
+| --- | --- | --- |
+| Single-token decode | Weight and KV bandwidth, launch count | Effective bytes/s, kernel count, context scaling |
+| Prompt prefill | GEMM utilization, attention reuse, packing | Projection and attention share, batch scaling |
+| Long-context attention | KV traffic and parallelism | Per-layer attention time at 4K/8K/12K/16K |
+| Speculative verification | Checkpoint, rollback, acceptance | Accepted tokens, replay time, baseline token parity |
+| HTTP serving | Admission, queueing, session reuse | TTFT, inter-token latency, cancellation cleanup |
+| NPU offload | DMA, synchronization, padded work | Transfer time, program time, end-to-end overlap |
 
-Peak matrix throughput is secondary when `M=1`.
+For decode GEMV, reduce bytes read before chasing peak matrix throughput. For
+prefill GEMM, measure reuse and matrix-instruction utilization. For every
+heterogeneous route, include shared-memory-bandwidth contention and transfer
+cost in the result.
 
-### Prefill and verification
+## Implementation Rules
 
-Larger row counts reuse weights and increase arithmetic intensity. Performance
-depends more strongly on:
+### Host runtime
 
-- Matrix-instruction utilization.
-- Tile reuse.
-- Activation packing.
-- NPU memory-tile and GPU LDS reuse.
-- Padding and shape buckets.
-- DMA and synchronization overlap.
-
-### Measured Sustained Memory Bandwidth Baselines
-
-Sustained bandwidth across CPU, GPU (`gfx1151`), and NPU (`XDNA2`) buffer paths on AMD Strix Halo (128 GiB unified LPDDR5X, fingerprint `bb565d5eff3a9f23b4ac3f1ff03f66bebef651e57093cd558c4cded823358849`):
-
-| Backend | Path | Allocation Type | Working Set | Median (GB/s) | P95 (GB/s) | Status |
-| --- | --- | --- | --- | --- | --- | --- |
-| CPU | `cpu_copy` | `host_pageable` | 256 MiB | 50.62 | 51.11 | `completed` |
-| CPU | `cpu_read` | `host_pageable` | 256 MiB | 13.88 | 13.89 | `completed` |
-| CPU | `cpu_write` | `host_pageable` | 256 MiB | 37.96 | 38.37 | `completed` |
-| HIP | `hip_h2d` | `hip_device_memory` | 256 MiB | 68.36 | 68.56 | `completed` |
-| HIP | `hip_device_copy` | `hip_device_memory` | 256 MiB | 211.03 | 211.63 | `completed` |
-| HIP | `hip_d2h` | `hip_device_memory` | 256 MiB | 55.89 | 56.42 | `completed` |
-| XRT | `xrt_bo_sync_to_device` | `xrt_bo_dma_sync` | 64 MiB | 127.06 | 127.75 | `completed` |
-| XRT | `xrt_bo_sync_from_device` | `xrt_bo_dma_sync` | 64 MiB | 120.35 | 127.74 | `completed` |
-
-These measured ceilings, rather than theoretical LPDDR bandwidth, govern decode GEMV and weight-streaming roofline bounds.
-
-## Measurement Rules
-
-Every retained performance result records:
-
-- Exact server revision and build type.
-- Model, weight artifact hash, quantization, and KV profile.
-- Prompt token IDs and output-token count.
-- Concurrency and service class.
-- GPU/NPU route and physical shape.
-- Kernel, graph, AIE program, and compiler artifact hashes.
-- Linux kernel, `amdxdna`, firmware, ROCm, HIP compiler, and AIE compiler.
-- Memory configuration, power mode, clocks, and temperature.
-- Warmup policy and every measured repetition.
-- Correctness artifact proving the tested route is valid.
-
-Compare baseline and candidate on the same machine and in alternating order.
-Report median and tail latency, not the best run.
-
-## C++ Host Code
-
-### Ownership and allocation
-
-- Use RAII for every file, mapping, queue, event, graph, context, and
-  allocation.
-- Allocate model, KV, graph, and scratch resources before readiness.
-- Perform no general heap allocation in decode dispatch.
-- Reuse bounded vectors, command records, and response buffers.
-- Keep scheduler-visible ownership explicit.
-- Reject integer overflow before calculating tensor or allocation bytes.
-
-### Threading
-
-Use separate bounded execution domains for:
-
-- HTTP and SSE I/O.
-- Tokenization and detokenization.
-- The single-owner scheduler.
-- GPU submission and completion.
-- NPU submission and completion.
-- Background storage I/O.
-
-Do not create one thread per request. Avoid oversubscribing CPU cores merely to
-hide device latency.
-
-Thread affinity, priority, and busy polling are promoted only after measuring
-system-wide effects. Latency-critical polling must yield or sleep when the
-server is idle.
-
-### Synchronization
-
-- Prefer single-owner state machines and message passing.
+- Use RAII for mappings, streams, events, graphs, contexts, and allocations.
+- Allocate model, KV, recurrent, graph, and scratch resources before serving.
+- Avoid general heap allocation in decode dispatch.
+- Keep hot scheduler data compact and ownership explicit.
+- Prefer single-owner state machines and bounded message passing.
 - Do not hold a process-wide mutex while waiting for a device.
-- Keep device completion callbacks small.
-- Batch page-table and row-map publication.
-- Use generation-tagged handles to reject stale completions.
-- Avoid CPU round trips between kernels in one graph or AIE program.
+- Reject size and offset overflow before allocating or launching.
 
-### Data structures
+### HIP
 
-- Keep hot scheduler arrays compact and contiguous.
-- Use structure-of-arrays layouts for fields consumed independently.
-- Separate cold diagnostics and strings from hot request state.
-- Use fixed-width integer types in serialized and device-visible structures.
-- Align shared command and tensor metadata explicitly.
-- Measure cache behavior before adding pointer-rich abstractions.
+- Compile production kernels for `gfx1151` and treat Wave32 as explicit.
+- Prove alignment before vector loads and provide bounded tail paths.
+- Track VGPR, LDS, occupancy, and scratch for retained kernels.
+- Keep distinct decode and prefill routes where their reuse differs.
+- Read only live KV spans and reuse GQA/MQA K/V across query heads.
+- Retain hipBLASLt or rocBLAS as the baseline for supported matrix shapes.
+- Do not inherit launch geometry from CUDA or another RDNA target without a
+  new measurement on `gfx1151`.
 
-## HIP Kernel Guidance
+### XDNA2
 
-### General rules
+- Include host packing, BO synchronization, program time, and output transfer.
+- Reuse AIE programs, contexts, BOs, and command buffers.
+- Keep memory-tile layouts explicit and reject unbounded padding.
+- Prefer work that is independent of the critical GPU path.
+- Promote concurrent GPU/NPU execution only after measuring shared-memory
+  contention and request latency.
 
-- Compile production kernels directly for `gfx1151`.
-- Treat wave32 as an explicit kernel contract.
-- Inspect generated ISA for critical kernels.
-- Use aligned vector loads only when the alignment contract proves them legal.
-- Provide bounded tail paths for every non-multiple dimension.
-- Keep register and LDS use low enough to preserve useful occupancy.
-- Benchmark sustained clocks, not only short bursts.
-- Never inherit launch geometry from `gfx1100`, W7900, or CUDA without a new
-  gfx1151 measurement.
+### Quantization
 
-### Decode GEMV
+- Report artifact size and effective bits per weight, including metadata.
+- Fuse unpacking, scale application, and zero correction when practical.
+- Avoid materializing dequantized weights in global memory.
+- Verify full-vocabulary logits before reporting speed.
+- Use separate kernel strategies when metadata or group shape changes.
 
-Optimize in this order:
+## Commands
 
-1. Read each weight and scale as few times as possible.
-2. Make adjacent lanes read adjacent packed bytes.
-3. Reuse one activation across multiple output accumulators when registers
-   permit.
-4. Fuse SHQ unpack, zero correction, scaling, and dot product.
-5. Fuse adjacent projections only when total bytes and launches decrease.
-6. Reduce partial sums with wave operations before using LDS.
-7. Keep the output epilogue bounded and branch-free.
+### Build and quality gate
 
-Candidate shapes include:
-
-- One wave per output tile.
-- Multiple output channels per wave.
-- Multiple waves per workgroup when activation or metadata reuse justifies LDS.
-
-The chosen shape is tensor-specific. Large hidden sizes, small projections,
-MoE expert matrices, and output heads need separate measurements.
-
-Avoid:
-
-- Dequantizing full weight tiles into global memory.
-- Reading scale or zero-point metadata once per weight.
-- One kernel launch per small tensor transformation.
-- Excessive output accumulators that spill registers.
-- Repeated-lane load patterns that are not independently validated on gfx1151.
-
-### Prefill and small-batch GEMM
-
-- Maintain separate paths for small rows and large matrices.
-- Use row-tiled GEMV when WMMA setup and padding dominate.
-- Use WMMA-class tiles when row count and dimensions provide reuse.
-- Stage only data that will be reused enough to repay LDS traffic.
-- Fuse activation quantization when the packed result feeds several
-  projections.
-- Retain hipBLASLt or rocBLAS as a correctness and performance baseline for
-  supported standard shapes.
-
-Do not route every `M > 1` operation through one matrix kernel.
-
-### Attention and KV
-
-- Use distinct decode and prefill attention kernels.
-- Read only live KV spans.
-- Fuse scale application for quantized KV into the consuming kernel.
-- Reuse GQA/MQA K/V across query heads.
-- Select context-range-specific kernels.
-- Keep page-table entries compact and device resident.
-- Avoid rebuilding host pointer arrays for every token.
-
-Long-context performance reports include both attention wall time and complete
-decode wall time.
-
-#### Split-K single-token decode attention
-
-For the Qwen3.8 `24` query-head, `4` KV-head, `256` head-dimension shape,
-single-token attention keeps the one-wave online-softmax path below 4K tokens.
-At 4K and above, the KV sequence is divided into 32 workgroup partitions. Each
-partition produces an FP32 maximum, exponential sum, and weighted-value
-partial; the reduction kernel combines them with max-rescaling before applying
-the attention gate.
-
-The split-K path uses
-`num_heads * 32 * (head_dim + 2) * sizeof(float)` bytes of preallocated
-scratch. It does not allocate, tune, or synchronize with the host in the
-decode loop. The fixed-shape HIP graph remains the short-context route; the
-long-context route uses host-selected split-K grid dimensions.
-
-Representative `RelWithDebInfo` gfx1151 kernel medians from the issue #66
-validation sweep are:
-
-| Context | One-wave baseline | Split-K | Speedup |
-| ---: | ---: | ---: | ---: |
-| 4,096 | 1,554.63 us | 147.17 us | 10.56x |
-| 8,192 | 4,006.86 us | 406.28 us | 9.86x |
-| 16,384 | 8,014.85 us | 731.83 us | 10.95x |
-| 32,768 | 16,055.00 us | 1,441.48 us | 11.14x |
-
-These are attention-kernel measurements, not complete token latency. Promotion
-still requires end-to-end decode measurements on the same model artifact and
-power/thermal configuration.
-
-### MoE
-
-- Keep routing on device where practical.
-- Compact rows by expert before grouped GEMM.
-- Use selected-expert GEMV for sparse decode.
-- Use grouped GEMM only after population exceeds its measured crossover.
-- Avoid loading inactive expert weights.
-- Fuse weighted combination when it removes traffic without changing routing
-  or accumulation semantics.
-
-### Sampling
-
-- Keep ordinary full-vocabulary logits on device.
-- Use deterministic request-owned RNG state.
-- Separate greedy, top-k, top-p, and constrained paths when one generic kernel
-  adds material overhead.
-- Transfer only the selected token and bounded diagnostics to the host.
-
-## HIP Graphs
-
-Capture graphs only after:
-
-- Allocations and pointer identities are stable.
-- The physical shape is known.
-- Kernel selection has been promoted.
-- Eager execution passes correctness.
-
-Graphs are keyed by all state that changes topology, including model kind,
-route, physical width, context class, KV profile, and speculative shape.
-
-Measure graph replay end to end. Reducing launches does not guarantee a win when
-the phase is bandwidth-bound.
-
-## AIE2P Program Guidance
-
-### Workload shape
-
-The NPU is best used for stable, sufficiently large row batches. Use fixed
-program families for row buckets and requested column counts.
-
-- Prefer native INT8 x INT4/UINT4 operations for SHQ4-T16 tensors.
-- Match the native `4 x 16 x 16` mixed-precision microtile.
-- Avoid padding a tiny logical batch to a large physical program.
-- Compile smaller-column programs for narrow work and shared-resource
-  conditions.
-- Key performance records by columns actually assigned by `amdxdna`.
-
-### Memory movement
-
-Each AIE column has DMA resources between host DDR and its memory tile. The
-software-managed memory-tile capacity is limited, so program design must
-explicitly schedule:
-
-- Input activation DMA.
-- Packed weight DMA.
-- Scale and zero-point metadata.
-- Double-buffered tile execution.
-- Output or partial-result DMA.
-
-The program should overlap DMA and compute when tile sizes permit. Count all
-host-memory bytes in the route roofline.
-
-Do not unpack the complete model or tensor into INT8/BF16 host memory. Expand
-or reinterpret packed values at the smallest tile scope supported by the
-microkernel.
-
-### Programs and contexts
-
-- Compile overlays and `ctrlcode` ahead of time.
-- Keep program metadata immutable.
-- Reuse workload contexts when supported and healthy.
-- Account for driver-managed instruction and command buffers.
-- Minimize context creation and overlay reconfiguration in request paths.
-- Recreate contexts and reload programs after NPU suspend, reset, or firmware
-  restart.
-
-### NPU epilogues
-
-Fuse where practical:
-
-- U4 zero-point correction.
-- Activation and weight scales.
-- Bias.
-- Output conversion.
-- Simple model-specific activation.
-
-An epilogue is retained only when it reduces host-memory traffic or
-synchronization without increasing numerical error beyond the route contract.
-
-## GPU and NPU Together
-
-### Shared bandwidth
-
-GPU and NPU external-memory bandwidth does not add. Concurrent work can improve
-performance only when:
-
-- The workload has enough arithmetic intensity.
-- Each device reads disjoint weight regions or works on independent requests.
-- DMA and compute overlap exceeds synchronization overhead.
-- Protected GPU decode latency remains within budget.
-
-Do not split single-token dense decode merely to occupy the NPU.
-
-### Preferred concurrency
-
-Initial priorities:
-
-```text
-GPU: interactive decode
-NPU: batched prefill, proposal, or verification
-CPU: tokenization, transport, and bounded orchestration
-```
-
-For one large prefill or verification operator, test `SPLIT_N`,
-`SPLIT_K_REDUCE`, and single-device baselines. For MoE, test expert ownership
-before splitting individual expert matrices.
-
-### Synchronization
-
-- Submit complete operators or stages before crossing devices.
-- Use release/acquire completion tokens.
-- Avoid a CPU wait between every layer.
-- Keep reductions on the consuming device where possible.
-- Include activation conversion, barriers, and copies in reported wall time.
-
-## Quantization Performance
-
-Quality is evaluated independently from speed. For each quantization candidate
-measure:
-
-- Effective bytes per weight including scales, zero points, padding, and index
-  metadata.
-- GPU decode bandwidth efficiency.
-- GPU prefill wall time.
-- NPU DMA plus compute wall time.
-- Shared-layout penalty versus an ideal backend-native layout.
-- Cost and memory of optional lossless repacks.
-- Full-model quality at matched size and matched performance.
-
-A nominally smaller format is rejected when unpack, metadata, or restoration
-cost makes the complete model slower.
-
-## Profiling
-
-Use:
-
-- `rocprofv3` or current ROCm profiling interfaces for HIP timelines and
-  counters.
-- Generated ISA inspection for critical gfx1151 kernels.
-- `amdxdna` DRM client usage statistics and available driver telemetry.
-- Explicit scheduler spans for queueing, submission, synchronization, and
-  commit.
-- CPU sampling or tracing for tokenizer, JSON, and scheduler overhead.
-
-Profiler collection must not run inside the default production path. Markers
-and bounded counters remain available in release builds.
-
-### HIP profiling with rocprofv3
-
-The repository dev shell provides the pinned `rocprofv3` from
-`rocmPackages.rocprofiler-sdk`. Do not use a globally installed ROCm profiler:
+Nix must see new files, so stage them before building:
 
 ```sh
-nix develop -c rocprofv3 --version
-```
-
-Build the production binary first, then collect one bounded trace into `/tmp`.
-`strix-bench` performs its own warmup before the measured repetition:
-
-```sh
-git add .
+git add <changed-files>
 nix build
-
-MODEL=/path/to/model.gguf
-OUT=/tmp/strix-rocprof
-
-nix develop -c rocprofv3 \
-  --output-directory "$OUT" \
-  --output-format csv \
-  --kernel-trace \
-  --stats \
-  --summary \
-  --summary-units msec \
-  -- ./result/bin/strix-bench \
-    --model "$MODEL" \
-    --n-prompt 512 \
-    --n-gen 0 \
-    --repetitions 1
+nix build .#checks.x86_64-linux.pr
 ```
 
-Use the summary to rank kernel families by total device time. Inspect the
-kernel-dispatch CSV for launch count, grid and workgroup dimensions, and
-per-dispatch duration. After identifying a kernel family, narrow later traces
-with `--kernel-include-regex` instead of repeatedly tracing the entire model.
+Run focused tests during iteration. Run the full hardware or full-logit suite
+when a retained kernel, numerical route, state transition, or model dispatch
+changes.
 
-Add scratch tracing when investigating register pressure or unexpected private
-memory traffic:
+### End-to-end model benchmark
 
 ```sh
-nix develop -c rocprofv3 \
-  --output-directory /tmp/strix-rocprof-scratch \
-  --output-format csv \
-  --kernel-trace \
-  --scratch-memory-trace \
-  --stats \
-  --summary \
-  --summary-units msec \
-  -- ./result/bin/strix-bench \
-    --model "$MODEL" \
-    --n-prompt 512 \
-    --n-gen 0 \
-    --repetitions 1
+MODEL=models/<model>/<artifact>.gguf
+
+./result/bin/strix-bench \
+  --model "$MODEL" \
+  --n-prompt 128,512,1024,2048,4096 \
+  --n-gen 0 \
+  --repetitions 3
+
+./result/bin/strix-bench \
+  --model "$MODEL" \
+  --n-prompt 2048 \
+  --n-gen 128 \
+  --n-depth 4096,8192,12288,16384 \
+  --repetitions 1
+
+./result/bin/strix-bench \
+  --model "$MODEL" \
+  --validate-prefill 1024 \
+  --n-prompt 1024 \
+  --n-gen 0 \
+  --repetitions 1
 ```
 
-Use `--runtime-trace` only when launch, synchronization, allocation, or memory
-copy overhead is the suspected bottleneck. It collects substantially more
-data than a kernel-only trace.
+Keep current per-model results and matching third-party commands in that
+model's benchmark README.
 
-Profiler instrumentation changes wall-clock timing. Use traces to attribute
-cost, then measure final throughput without `rocprofv3`, with the same model,
-tokens, warmup, repetitions, power mode, and competing system load. Compare
-baseline and candidate in alternating order where practical.
+### Focused HIP benchmark
 
-Raw profiler output can be large and machine-specific. Keep it under `/tmp` or
-another ignored artifact directory; do not commit it. Retain the following in
-the model benchmark record:
-
-- Exact profiler command and ROCm version.
-- Workload shape and repetition count.
-- Dominant kernel families and percentages.
-- Relevant VGPR, LDS, scratch, launch-count, or copy findings.
-- Before/after unprofiled throughput.
-- Numerical and state validation used to accept the change.
-
-### Focused kernel harness
-
-`strix-kernel-bench` supplies deterministic inputs, correctness sentinels,
-unprofiled HIP-event timing, percentile statistics, effective bandwidth, the
-machine fingerprint, structured dispatch metadata, and ROCTx case markers. It
-covers GEMV, GEMM, single-token attention, batched attention, batched DeltaNet
-recurrence, RMSNorm, residual add, and SwiGLU. Attention, GEMM, DeltaNet, and
-elementwise cases accept the standard context/batch matrix:
+List cases, then run the smallest relevant matrix:
 
 ```sh
-git add .
-nix build
+./result/bin/strix-kernel-bench --list
 
 ./result/bin/strix-kernel-bench \
-  --kernel gemv,gemm,decode-attention,batched-attention,deltanet,elementwise \
-  --context 128,1024,4096 \
-  --m 4096 \
-  --k 4096 \
-  --type bf16 \
-  --warmup 3 \
-  --repetitions 10 \
-  --output /tmp/strix-kernel-bench.json
+  --case decode-attention \
+  --context 4096,8192,12288,16384 \
+  --warmup 5 \
+  --repetitions 30 \
+  --json
 ```
 
-Use `--kernel all` for the same complete case set and omit `--context` to use
-`128,512,1024,2048,4096,8192,16384,32768`. The JSON report records explicit
-`batchSize`, `m`, `n`, `k`, data type, layout, raw samples, percentiles,
-tokens/s, effective GB/s, correctness status, selected attention backend, GEMV
-strategy, rejected fast paths, hipBLASLt algorithm/kernel identity, plan-cache
-status, persistent-plan status, plan source, workspace bytes, first-resolution
-time, and graph-cache status.
+The report includes raw HIP-event samples, summary latency, correctness
+sentinels, dispatch choices, and the privacy-safe machine fingerprint.
 
-Headline latency comes from the unprofiled command above. Run the same case
-through `rocprofv3` separately for dispatch/resource evidence:
+### Profiling
 
 ```sh
 nix develop -c rocprofv3 \
@@ -539,81 +184,58 @@ nix develop -c rocprofv3 \
   --marker-trace \
   --scratch-memory-trace \
   --stats \
-  --selected-regions \
-  --output-format json \
-  --output-directory /tmp/strix-kernel-profile \
+  --summary \
+  --output-directory /tmp/strix-profile \
   -- ./result/bin/strix-kernel-bench \
-    --kernel decode-attention \
-    --context 4096,16384 \
-    --warmup 3 \
-    --repetitions 1
+    --case decode-attention \
+    --context 16384 \
+    --warmup 1 \
+    --repetitions 3
 ```
 
-### SSM rollback replay benchmark
+Use the emitted ROCTx case marker to isolate the measured region. Add selected
+PMC counters only in a separate diagnostic pass.
 
-`benchmark_ssm_replay` loads the production model path, prepares one checkpoint,
-records a 16-token greedy target sequence, then measures recurrent rollback and
-accepted-input replay. Every row verifies the authoritative next token after
-the replay:
+### Offline tuning and replay
 
 ```sh
-git add .
-nix build
+./result/bin/tune_hipblaslt \
+  --out /tmp/strix-hipblaslt-plans.bin \
+  --warmup 3 \
+  --repetitions 10
+
+STRIX_HIPBLASLT_PLAN_CACHE=/tmp/strix-hipblaslt-plans.bin \
+  ./result/bin/strix-bench ...
 
 ./result/bin/benchmark_ssm_replay \
-  --model <model.gguf> \
+  --model "$MODEL" \
   --context 128 \
   --draft-lengths 1,2,4,8,16
 ```
 
-Use the same executable with `STRIX_DISABLE_SSM_REPLAY=1` to measure the
-full-model replay fallback under identical model, build, and thermal
-conditions. The diagnostic fallback is intentionally slow because
-`ForwardToken(..., false)` executes the full layer stack without the logits
-tail or the decode graph.
+Generated profiler, plan, and replay artifacts stay outside the repository.
 
-The report reserves resource fields for occupancy, VGPR, LDS, and scratch data
-produced by the profiler pass; they are `null` in the unprofiled timing report
-so profiler overhead is never presented as headline latency. Project-side
-dispatch telemetry remains responsible for semantic decisions the profiler
-cannot infer. Enable newline-delimited diagnostic events only in a separate
-diagnostic run:
+### Dispatch telemetry
 
 ```sh
-STRIX_DISPATCH_TELEMETRY=1 ./result/bin/strix-server prompt \
-  --model "$MODEL" "Hello"
+STRIX_DISPATCH_TELEMETRY=1 ./result/bin/strix-kernel-bench ...
 ```
 
-This logs selected attention backends, GEMV strategies, rejected fast paths,
-hipBLASLt algorithm, in-memory and persistent plan-cache status, plan source,
-workspace, and HIP graph hit/miss state. Leave it disabled for performance
-measurements.
+Telemetry is diagnostic JSONL. It records semantic dispatch decisions and
+must not contain prompts, tokens, model paths, or machine identity.
 
 ## Promotion Gates
 
-A performance change is promoted only when:
+A performance change is retained only when:
 
-- The targeted numerical and state tests pass.
-- The released model remains within its declared quality budget.
-- The end-to-end metric improves beyond measured noise.
-- Single-request latency does not regress outside its declared budget.
-- Memory use and pressure behavior remain acceptable.
-- Sustained performance survives thermal steady state.
-- Multi-request fairness remains within policy.
-- The exact benchmark artifact is retained.
+- Focused correctness passes against the canonical oracle.
+- Full-vocabulary logits remain finite and within the accepted envelope.
+- Greedy output keeps the required token parity.
+- Request state, rollback, cancellation, and cleanup remain correct.
+- The declared workload improves outside measurement noise.
+- Memory, startup, and tail latency do not regress unexpectedly.
+- Required Nix checks pass on the exact staged source.
 
-Hard-coded prompt, token, shape, or request-ID special cases are prohibited.
-
-## Review Checklist
-
-- What end-to-end phase is dominant?
-- Is the phase bandwidth, compute, launch, or synchronization limited?
-- What external bytes and useful operations are expected?
-- Which exact shape and route are optimized?
-- What CPU or canonical oracle validates it?
-- Are allocations, first touch, and JIT work outside the timed path?
-- Does the candidate work for tails and non-multiple dimensions?
-- What are register, LDS, AIE memory-tile, and context costs?
-- Does it affect GPU/NPU shared bandwidth?
-- Does single-request latency remain protected?
-- Is the result reproducible from a structured artifact?
+Document the winning route, current measurements, reproduction command, and
+remaining gap. Keep rejected alternatives to a short summary or the relevant
+issue discussion.

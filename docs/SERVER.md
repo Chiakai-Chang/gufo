@@ -59,43 +59,34 @@ contract is defined in [Command-Line Interface](CLI.md).
 
 ### Current Single-Request HIP Path
 
-The implemented Qwen HTTP path loads the split GGUF mapping, registers its
-GPU-visible weight regions, and constructs the tokenizer once. Those immutable
-resources live in one shared `QwenGpuModel` for the server lifetime.
-
-Each request leases a preallocated `QwenGpuExecutor` containing its own
-activation arena, contiguous KV cache, recurrent state, HIP graph state,
-hipBLASLt plans, and host logits. The default one-session pool preserves the
-zero-queue single-request path. `--sessions N` preallocates additional
-independent request states without remapping or copying the model weights;
-continuous batching remains a separate scheduler feature.
+Qwen HTTP requests share one immutable `QwenGpuModel` containing the mapped
+weights and tokenizer. Each request leases a preallocated `QwenGpuExecutor`
+with independent KV, recurrent, graph, activation, and logit state.
+`--sessions N` controls the bounded session pool; it does not enable
+continuous batching.
 
 ```sh
 nix build
 
 ./result/bin/strix-server serve \
-  --model /models/qwen.gguf \
+  --model models/qwen.gguf \
   --context 4096 \
   --sessions 1 \
   --host 127.0.0.1 \
   --port 8080
 ```
 
-Socket disconnect checks are propagated to token generation. Session leases
-reset and return their mutable state on normal completion, cancellation, or
-exceptions. Model replacement is transactional: active requests retain the
-previous shared model and pool until their final lease retires.
-
-Generation responses include:
+Cancellation and exceptions return a reset session to the pool. Model
+replacement is transactional, so active requests retain their original model
+until their lease ends. Generation responses include:
 
 ```text
 Server-Timing: ttft;dur=<milliseconds>, inter_token;dur=<milliseconds>
 ```
 
-The server also emits one JSON telemetry row containing only status, prompt
-and completion token counts, TTFT, mean inter-token latency, and cancellation
-status. It does not emit prompt text, model paths, machine identifiers, request
-IDs, or token IDs.
+Diagnostic telemetry is limited to status, token counts, timing, and
+cancellation state. It must not contain prompt text, model paths, machine
+identity, request IDs, or token IDs.
 
 The user provides weight artifacts and configuration:
 
