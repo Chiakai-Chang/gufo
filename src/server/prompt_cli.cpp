@@ -16,7 +16,12 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
+#include "src/core/heterogeneous/npu_drafter.hpp"
 #include "src/core/hip/qwen_gpu_executor.hpp"
+#include "src/core/speculative/draft_heads.hpp"
+#include "src/core/speculative/prompt_lookup_backend.hpp"
+#include "src/core/speculative/self_speculative.hpp"
+#include "src/core/speculative/speculative_verifier.hpp"
 #endif
 
 namespace strix::server {
@@ -162,6 +167,40 @@ std::optional<PromptOptions> ParsePromptOptions(
       continue;
     }
 
+    if (arg == "--speculative") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --speculative";
+        }
+        return std::nullopt;
+      }
+      opt.speculative_backend = args[i + 1];
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "--draft-tokens") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --draft-tokens";
+        }
+        return std::nullopt;
+      }
+      const std::string_view val = args[i + 1];
+      std::size_t num = 0;
+      const auto res =
+          std::from_chars(val.data(), val.data() + val.size(), num);
+      if (res.ec != std::errc{}) {
+        if (error_msg != nullptr) {
+          *error_msg = "Invalid integer for draft-tokens: " + std::string(val);
+        }
+        return std::nullopt;
+      }
+      opt.draft_tokens = num;
+      skip_next = true;
+      continue;
+    }
+
     if (!arg.empty() && arg[0] != '-') {
       if (!opt.prompt_text.empty()) {
         opt.prompt_text += " ";
@@ -264,13 +303,77 @@ int RunPrompt(std::span<const char* const> args) {
       const auto start_time = std::chrono::steady_clock::now();
       std::size_t generated_count = 0;
 
-      gpu_exec->Generate(
-          prompt_tokens, gen_opts,
-          [&](tokenization::TokenId, std::string_view piece) -> bool {
-            std::cout << piece << std::flush;
-            ++generated_count;
-            return true;
-          });
+      if (!opt.speculative_backend.empty()) {
+        const auto& config = gpu_exec->GetConfig();
+        std::unique_ptr<speculative::IDraftBackend> draft_backend;
+        if (opt.speculative_backend == "npu") {
+          heterogeneous::NpuDrafterConfig cfg;
+          cfg.max_draft_tokens = opt.draft_tokens;
+          cfg.vocab_size = config.vocab_size;
+          draft_backend = std::make_unique<heterogeneous::NpuDraftBackend>(cfg);
+        } else if (opt.speculative_backend == "pld" ||
+                   opt.speculative_backend == "lookup") {
+          speculative::PromptLookupConfig cfg;
+          cfg.max_draft_tokens = opt.draft_tokens;
+          draft_backend =
+              std::make_unique<speculative::PromptLookupDraftBackend>(cfg);
+        } else if (opt.speculative_backend == "mtp") {
+          speculative::MtpDraftHeadConfig cfg;
+          cfg.num_heads = opt.draft_tokens;
+          cfg.hidden_size = config.hidden_size;
+          cfg.vocab_size = config.vocab_size;
+          draft_backend = std::make_unique<speculative::MtpDraftBackend>(cfg);
+        } else if (opt.speculative_backend == "self") {
+          speculative::SelfSpeculativeConfig cfg;
+          cfg.total_layers = config.num_layers;
+          cfg.exit_layer = std::max<std::uint32_t>(4U, config.num_layers / 4);
+          cfg.draft_step_count = opt.draft_tokens;
+          draft_backend =
+              std::make_unique<speculative::SelfSpeculativeBackend>(cfg);
+        }
+
+        if (draft_backend) {
+          speculative::SpeculativeOptions s_opts;
+          s_opts.max_draft_tokens = opt.draft_tokens;
+          s_opts.initial_draft_tokens = opt.draft_tokens;
+          speculative::SpeculativeVerifier spec_verifier(
+              *gpu_exec, std::move(draft_backend), s_opts);
+
+          spec_verifier.Reset();
+          std::vector<tokenization::TokenId> current_seq = prompt_tokens;
+          tokenization::TokenId cur_token = prompt_tokens.back();
+          std::uint32_t cur_pos =
+              static_cast<std::uint32_t>(current_seq.size());
+
+          while (generated_count < opt.max_tokens) {
+            const auto step_res = spec_verifier.VerifyStep(current_seq, cur_pos,
+                                                           cur_token, 151643);
+            for (const auto t : step_res.emitted_tokens) {
+              const std::string_view p =
+                  gpu_exec->GetTokenizer().DecodeToken(t);
+              std::cout << p << std::flush;
+              current_seq.push_back(t);
+              ++cur_pos;
+              ++generated_count;
+              if (generated_count >= opt.max_tokens) {
+                break;
+              }
+            }
+            cur_token = step_res.next_token;
+            if (cur_token == 151643 || cur_token == 151645) {
+              break;  // End of text
+            }
+          }
+        }
+      } else {
+        gpu_exec->Generate(
+            prompt_tokens, gen_opts,
+            [&](tokenization::TokenId, std::string_view piece) -> bool {
+              std::cout << piece << std::flush;
+              ++generated_count;
+              return true;
+            });
+      }
 
       std::cout << "\n";
 

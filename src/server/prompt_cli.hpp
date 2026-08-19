@@ -21,6 +21,8 @@ struct PromptOptions {
   bool use_chat_template = true;
   bool verbose = false;
   bool force_cpu = false;
+  std::string speculative_backend;  // "npu", "pld", "mtp", "self", or empty
+  std::size_t draft_tokens = 3;
 };
 
 /// Parses command line options for `strix-server prompt`.
