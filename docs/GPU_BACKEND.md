@@ -17,7 +17,8 @@ It must not depend on:
 
 hipBLASLt provides selected production BF16 prefill algorithms, while rocBLAS
 provides baselines and fallback algorithms. Model-critical paths may still use
-custom HIP kernels where profiling demonstrates a benefit.
+custom HIP kernels where profiling demonstrates a benefit. Composable Kernel
+provides a fused causal GQA fallback for shapes not handled by a native tile.
 
 ## Build
 
@@ -133,6 +134,8 @@ row-tiled GEMV.
 ### Attention
 
 - Fused RoPE and Q/K preparation where model-specific fusion is beneficial.
+- Native Qwen3.8 causal GQA tiles adapted from llama.cpp's MIT online-softmax
+  scheduling for long prompts, with Composable Kernel as a shape fallback.
 - Paged KV attention.
 - Separate single-token and batched attention kernels.
 - GQA-aware K/V reuse.

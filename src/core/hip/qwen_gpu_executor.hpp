@@ -63,7 +63,7 @@ public:
   float* d_alpha_buf{nullptr};
   float* d_beta_buf{nullptr};
   float* d_logits{nullptr};
-  float* d_attention_scores{nullptr};
+  void* d_attention_kv_f16{nullptr};
   float* d_kv_cache{nullptr};
   float* d_ssm_conv_state{nullptr};
   float* d_ssm_deltanet_state{nullptr};

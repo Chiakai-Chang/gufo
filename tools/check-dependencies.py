@@ -22,6 +22,8 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "hipBLAS",
     "hipBLASLt",
     "rocBLAS",
+    "Composable Kernel",
+    "llama.cpp",
     "libuuid",
 }
 

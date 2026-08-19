@@ -163,6 +163,15 @@ similarity.
 | Optimized batched path | 32 tokens | 222 | 0.01086507 | 0.99998587 |
 | Optimized batched path | 128 tokens | 194 | 0.01236322 | 0.99998993 |
 | GEMM attention path | 1024 tokens | 198 | 0.01823735 | 0.99998158 |
+| Native tiled attention | 128 tokens | 194 | 0.01323033 | 0.99998856 |
+| Native tiled attention | 1024 tokens | 198 | 0.02007305 | 0.99997753 |
+
+The CK attention candidate was forced through the 1024-token oracle before
+production routing was enabled. It retained top-1 token 198 with cosine
+similarity 0.99997616. The retained native tiled-attention path improves on
+that result, retains the same top-1 token, and rounds to the established
+0.99998 cosine envelope. The focused GPU test independently compares its
+output and exact FP32 decode-cache handoff against sequential attention.
 
 The top-1 IDs differ between the 32-token and 128-token prompts because their
 last input tokens differ. In both cases the optimized batch result matches its
@@ -210,16 +219,22 @@ and the same split BF16 GGUF. Both engines use three measured repetitions:
 | `pp128` | 210.37 +/- 0.08 tok/s | 221.03 +/- 2.05 tok/s | 1.05x |
 | `pp256` | 262.34 +/- 0.29 tok/s | 242.99 +/- 1.00 tok/s | 0.93x |
 | `pp512` | 350.99 +/- 1.19 tok/s | 390.96 +/- 0.85 tok/s | 1.11x |
-| `pp1024` | 344.64 +/- 0.73 tok/s | 383.55 +/- 3.36 tok/s | 1.11x |
-| `pp2048` | 310.31 +/- 0.70 tok/s | 333.44 +/- 3.38 tok/s | 1.07x |
-| `pp4096` | 277.46 +/- 0.23 tok/s | 313.31 +/- 2.05 tok/s | 1.13x |
+| `pp1024` | 362.87 +/- 0.41 tok/s | 388.61 +/- 2.60 tok/s | 1.07x |
+| `pp2048` | 349.68 +/- 0.18 tok/s | 334.04 +/- 0.93 tok/s | 0.96x |
+| `pp4096` | 319.57 +/- 0.43 tok/s | 315.03 +/- 0.93 tok/s | 0.99x |
 | `tg8` | 4.31 +/- 0.00 tok/s | 4.02 +/- 0.04 tok/s | 0.93x |
 | `tg128` | 4.31 +/- 0.00 tok/s | 4.01 +/- 0.00 tok/s | 0.93x |
 
-The optimized native path is faster than llama.cpp at `pp32`, `pp64`, and
-`pp256`. llama.cpp is 5.1% faster at `pp128` and 7.5-12.9% faster from
-`pp512` through `pp4096`. The native HIP executor remains 7.2% faster for
-`tg8` and 7.5% faster for `tg128` decode.
+The optimized native path is faster than llama.cpp at `pp32`, `pp64`,
+`pp256`, `pp2048`, and `pp4096`. llama.cpp remains 5.1% faster at `pp128`,
+11.4% faster at `pp512`, and 7.1% faster at `pp1024`. Strix is 4.7% faster at
+`pp2048` and 1.4% faster at `pp4096`. The native HIP executor remains 7.2%
+faster for `tg8` and 7.5% faster for `tg128` decode.
+
+Long-prompt throughput is sensitive to sustained APU temperature. The
+`pp4096` comparison above starts each engine from a 42-43 C idle GPU edge
+temperature; immediate back-to-back runs produced order-dependent results and
+are not used for the comparison.
 
 The `tg128` test confirms sustained generation from a shallow context; it is
 not a context-depth sweep. Future decode comparisons should measure the same
@@ -252,19 +267,75 @@ scratch traffic.
 
 This is a 7.55x `pp512` throughput improvement.
 
-The arena and KV cache now support full-batch prefill through 4096 tokens.
-Prompts below 1024 tokens use the custom wave-cooperative causal attention
-kernel. Batch 1024 uses float32 QK/PV GEMMs one head at a time, while batches
-2048 and 4096 group the query heads that share each KV head into strided
-batched GEMMs. The grouped path reduces 48 BLAS calls per attention layer to
-eight and raises `pp4096` from 242.04 to 277.46 tok/s.
+The arena and KV cache support full-batch prefill through 4096 tokens. Prompts
+below 1024 tokens use the wave-cooperative causal attention kernel. Batches
+from 1024 tokens use a Qwen3.8-specific native HIP tile adapted from
+llama.cpp's MIT `fattn-tile` scheduling: each 256-thread block handles 16 query
+positions and two GQA heads, stages 64 K/V rows, accumulates QK scores in FP32,
+accumulates the weighted V result in FP32 with packed half2 dot products, and
+applies causal online softmax without a materialized score matrix. Composable
+Kernel remains the fallback for unsupported shapes.
 
-In the final `pp4096` trace, BF16 projection GEMMs account for 70.7% of GPU
-time, QK/PV attention GEMMs for 15.6%, causal softmax for 1.5%, and DeltaNet
-recurrence for 4.6%. The original per-query attention kernel accounted for
-28.0% before the GEMM attention path.
+The FP16 tile cache is packed together with the unchanged FP32 decode cache.
+Removing the old global score arena saves 24 MiB relative to the CK/GEMM
+split. The retained 64-key tile uses 37,888 bytes of LDS, zero scratch, and a
+three-block launch bound on `gfx1151`. Its profiled `pp4096` attention time is
+about 48.0 ms per full-attention layer, down from CK's 114.6 ms.
 
 `strix-bench` warms every requested prompt size once before measured
 repetitions. This is required because hipBLASLt loads shape-specific code
 objects on first use; timing the first invocation produced misleading
 outliers and large standard deviations.
+
+The optimization inner loop uses a focused GPU equivalence test, one warmed
+prompt measurement, and one `rocprofv3` trace. The expensive 1024-token
+sequential logit oracle and deterministic generation run only after a
+candidate wins the performance check.
+
+## Next Steps
+
+1. Autotune rocBLAS and hipBLASLt per projection shape. Permit a bounded,
+   reusable workspace and cache the winning backend and algorithm by GPU,
+   ROCm version, model shape, and batch size; the current fixed policy selects
+   `96x96x32`/`32x96x32` kernels where llama.cpp selects `128x128x32`.
+2. Remove unused FP32 activation writes and emit BF16 directly from attention
+   gating and SSM post-normalization when the next projection consumes BF16.
+3. Add chunked prefill beyond 4096 tokens while preserving absolute positions,
+   KV state, DeltaNet state, and the full-logit validation boundary.
+4. Evaluate verified speculative decoding with the model's MTP block. Greedy
+   output must match the baseline token-for-token, with normal decode as the
+   rejection fallback and no second model copy.
+5. Add context-depth decode benchmarks equivalent to llama.cpp `--n-depth`.
+6. Move the HTTP backend from the serialized CPU generator to shared mapped
+   HIP weights, per-request state, and continuous batching.
+
+Every retained optimization must preserve finite full-vocabulary logits,
+identical top-1 tokens, cosine similarity within the current approximately
+`0.99998` envelope, and deterministic generation across representative prompt
+sizes from 32 through 4096 tokens.
+
+## Experiment Log
+
+- PASS: hipBLASLt large-projection plans raised `pp512` from 46.47 to more than 300 tok/s.
+- PASS: two-lane DeltaNet recurrence removed 988 bytes/thread of scratch and reduced VGPR use from 192 to 136.
+- PASS: wave-cooperative short-prompt attention improved `pp512` without changing top-1 logits.
+- PASS: grouped GQA GEMM attention raised `pp4096` from 242.04 to 277.46 tok/s.
+- PASS: 512-thread fused FFN gate/up and down-projection GEMVs raised decode from 4.17 to 4.31 tok/s.
+- PASS: two-pass decode recurrence preserved logits and reduced recurrent-state traffic.
+- FAIL: four-lane DeltaNet recurrence reduced register pressure further but regressed every measured prompt size.
+- FAIL: concurrent gate/up GEMMs were 7-10% slower than the tuned serial launches.
+- FAIL: a blanket hipBLASLt rank-4 override won isolated probes but regressed full-model throughput.
+- FAIL: a 1024-thread FFN down GEMV reduced decode throughput and was reverted.
+- FAIL: GEMM attention at `pp512` regressed throughput, so the custom path remains active below 1024 tokens.
+- FAIL: one-query-per-block online-softmax attention fell to 323.99 tok/s at `pp1024` and reduced logit cosine to 0.99996793.
+- PASS: Composable Kernel causal GQA raised `pp2048` to 318.60 tok/s and `pp4096` to 287.97 tok/s with identical top-1 logits.
+- FAIL: fusing CK attention gating with BF16 output conversion reduced `pp4096` from 287.74 to 279.91 tok/s.
+- FAIL: using CK at `pp1024` was slower than the native tile and was retained only as a shape fallback.
+- FAIL: a rank-4 override limited to the `pp4096` FFN-down GEMM was neutral in a three-run A/B and was reverted.
+- PASS: a native llama.cpp-inspired 32-key tile raised `pp4096` from 287.97 to 299.17 tok/s.
+- PASS: reusing K/V fragments across four query columns raised `pp4096` to 312.92 tok/s.
+- PASS: the RDNA 64-key tile and three-block launch bound reached llama.cpp-class throughput at `pp1024`, `pp2048`, and `pp4096`.
+- FAIL: head-major FP16 KV storage reduced `pp4096` from 321.58 to 307.37 tok/s and was reverted.
+- FAIL: FP16 weighted-V accumulation reached 360.89 tok/s at `pp1024` but reduced 1024-token logit cosine to 0.99994785.
+- FAIL: scalar FP32 weighted-V accumulation restored precision but reduced `pp1024` to 322.55 tok/s.
+- PASS: packed half2 dot products with FP32 weighted-V accumulators reached 362.87 tok/s at `pp1024` and restored the approximately 0.99998 logit envelope.

@@ -54,6 +54,7 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.hipblas
     rocmPackages.hipblaslt
     rocmPackages.rocblas
+    rocmPackages.composable_kernel
   ]
   ++ lib.optionals xrtSupport [
     xrt

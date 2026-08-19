@@ -34,6 +34,7 @@ if (ENGINE_ENABLE_HIP)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
   find_package(rocblas REQUIRED)
+  find_path(COMPOSABLE_KERNEL_INCLUDE_DIR ck/ck.hpp REQUIRED)
 
   message(STATUS "strix: ROCm/HIP enabled, architectures=${CMAKE_HIP_ARCHITECTURES}")
   message(STATUS "strix: ROCM_PATH=$ENV{ROCM_PATH}")
@@ -136,6 +137,8 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_executor.cpp
   )
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
+  target_include_directories(strix_core SYSTEM PRIVATE
+    ${COMPOSABLE_KERNEL_INCLUDE_DIR})
   target_link_libraries(strix_core PUBLIC hip::host roc::hipblas
     roc::hipblaslt roc::rocblas)
 endif()

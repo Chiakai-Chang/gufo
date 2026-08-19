@@ -23,6 +23,8 @@ enum class WeightMappingMode {
   kCopy,
 };
 
+constexpr std::size_t kTiledAttentionBatch = 1024;
+
 [[nodiscard]] WeightMappingMode GetWeightMappingMode() noexcept {
   const char* value = std::getenv("STRIX_GPU_WEIGHT_MODE");
   if (value == nullptr) {
@@ -198,8 +200,6 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   const std::size_t batch = max_batch_;
   const std::size_t attention_size = config_.AttentionSize();
   const std::size_t kv_size = num_kv_heads * head_dim;
-  const std::size_t attention_group_size =
-      config_.num_attention_heads / num_kv_heads;
   const std::size_t q_projection_size = 2 * attention_size;
   const std::size_t ssm_qkv_size = config_.SsmQkvSize();
   const std::size_t ssm_inner_size = config_.ssm_inner_size;
@@ -225,8 +225,6 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   HIP_CHECK(hipMalloc(&d_alpha_buf, batch * time_step_rank * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_beta_buf, batch * time_step_rank * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_logits, vocab_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_attention_scores, attention_group_size * batch *
-                                               max_context_ * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_prompt_tokens, batch * sizeof(std::uint32_t)));
 
   const std::size_t scratch_elements =
@@ -239,6 +237,8 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   const std::size_t total_kv = config_.FullAttentionLayerCount() *
                                num_kv_heads * max_context_ * head_dim;
   HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
+  HIP_CHECK(
+      hipMalloc(&d_attention_kv_f16, total_kv * sizeof(std::uint16_t) * 2));
 
   const std::size_t total_conv =
       num_layers * ssm_qkv_size * config_.ssm_conv_kernel;
@@ -277,7 +277,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_alpha_buf = other.d_alpha_buf;
   d_beta_buf = other.d_beta_buf;
   d_logits = other.d_logits;
-  d_attention_scores = other.d_attention_scores;
+  d_attention_kv_f16 = other.d_attention_kv_f16;
   d_kv_cache = other.d_kv_cache;
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
@@ -304,7 +304,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_alpha_buf = nullptr;
   other.d_beta_buf = nullptr;
   other.d_logits = nullptr;
-  other.d_attention_scores = nullptr;
+  other.d_attention_kv_f16 = nullptr;
   other.d_kv_cache = nullptr;
   other.d_ssm_conv_state = nullptr;
   other.d_ssm_deltanet_state = nullptr;
@@ -337,7 +337,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_alpha_buf = other.d_alpha_buf;
     d_beta_buf = other.d_beta_buf;
     d_logits = other.d_logits;
-    d_attention_scores = other.d_attention_scores;
+    d_attention_kv_f16 = other.d_attention_kv_f16;
     d_kv_cache = other.d_kv_cache;
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;
@@ -364,7 +364,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_alpha_buf = nullptr;
     other.d_beta_buf = nullptr;
     other.d_logits = nullptr;
-    other.d_attention_scores = nullptr;
+    other.d_attention_kv_f16 = nullptr;
     other.d_kv_cache = nullptr;
     other.d_ssm_conv_state = nullptr;
     other.d_ssm_deltanet_state = nullptr;
@@ -436,8 +436,8 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_beta_buf));
   if (d_logits != nullptr)
     HIP_CHECK(hipFree(d_logits));
-  if (d_attention_scores != nullptr)
-    HIP_CHECK(hipFree(d_attention_scores));
+  if (d_attention_kv_f16 != nullptr)
+    HIP_CHECK(hipFree(d_attention_kv_f16));
   if (d_kv_cache != nullptr)
     HIP_CHECK(hipFree(d_kv_cache));
   if (d_ssm_conv_state != nullptr)
@@ -471,7 +471,7 @@ void QwenGpuArena::FreeAll() noexcept {
   d_alpha_buf = nullptr;
   d_beta_buf = nullptr;
   d_logits = nullptr;
-  d_attention_scores = nullptr;
+  d_attention_kv_f16 = nullptr;
   d_kv_cache = nullptr;
   d_ssm_conv_state = nullptr;
   d_ssm_deltanet_state = nullptr;
@@ -863,14 +863,33 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
                                   config.num_key_value_heads *
                                   arena_.GetMaxContext() * config.head_dim;
       const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
-      constexpr std::size_t gemm_attention_min_batch = 1024;
-      if (batch_size >= gemm_attention_min_batch) {
-        LaunchBatchedAttentionGemm(
-            arena_.hipblas_handle, arena_.d_q, arena_.d_k, arena_.d_v,
-            arena_.d_ssm_gate, arena_.d_kv_cache, arena_.d_kv_cache + total_k,
-            arena_.d_attention_scores, arena_.d_ssm_out, attn_layer_idx, 0,
-            batch_size, arena_.GetMaxContext(), config.num_attention_heads,
+      if (batch_size >= kTiledAttentionBatch) {
+        bool launched = LaunchBatchedAttentionTile(
+            arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+            arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+            arena_.d_attention_kv_f16,
+            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+            arena_.d_ssm_out, attn_layer_idx, 0, batch_size,
+            arena_.GetMaxContext(), config.num_attention_heads,
             config.num_key_value_heads, config.head_dim, arena_.stream);
+        if (!launched) {
+          launched = LaunchBatchedAttentionCk(
+              arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+              arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+              arena_.d_attention_kv_f16,
+              static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+              arena_.d_scratch_bf16, arena_.d_ssm_out, attn_layer_idx, 0,
+              batch_size, arena_.GetMaxContext(), config.num_attention_heads,
+              config.num_key_value_heads, config.head_dim, arena_.stream);
+        }
+        if (!launched) {
+          LaunchBatchedAttention(
+              arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+              arena_.d_kv_cache, arena_.d_kv_cache + total_k, arena_.d_ssm_out,
+              attn_layer_idx, 0, batch_size, arena_.GetMaxContext(),
+              config.num_attention_heads, config.num_key_value_heads,
+              config.head_dim, arena_.stream);
+        }
       } else {
         LaunchBatchedAttention(
             arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,

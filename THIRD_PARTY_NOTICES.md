@@ -17,6 +17,8 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 | **hipBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLAS](https://github.com/ROCm/hipBLAS) |
 | **hipBLASLt** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLASLt](https://github.com/ROCm/hipBLASLt) |
 | **rocBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocBLAS](https://github.com/ROCm/rocBLAS) |
+| **Composable Kernel** | Header / compiled kernels | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/composable_kernel](https://github.com/ROCm/composable_kernel) |
+| **llama.cpp** | Source-derived algorithm | `MIT` | `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | **libuuid** | Linked | `BSD-3-Clause` / `LGPL-2.1-or-later` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [util-linux](https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git) |
 | **`amdxdna` Kernel Driver** | System (Kernel) | `GPL-2.0-only` | System Kernel (`amdxdna.ko`) | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
 | **`amdxdna` UAPI Headers** | System / Header | `GPL-2.0 WITH Linux-syscall-note` | `4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305` | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
@@ -95,7 +97,29 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Linked (Dynamic library dependency)
 - **Corresponding-Source Location**: https://github.com/ROCm/rocBLAS (via Nix derivation `rocmPackages.rocblas`)
 
-### 1.7 libuuid (util-linux)
+### 1.7 Composable Kernel
+
+- **Component Name**: Composable Kernel (ROCm GPU kernel library)
+- **Upstream URL**: https://github.com/ROCm/composable_kernel
+- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.composable_kernel`)
+- **Component Used**: Header-instantiated causal grouped-query attention kernel compiled into the `gfx1151` HIP backend
+- **SPDX License Identifier**: `MIT`
+- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
+- **Relationship**: Header / compiled kernels
+- **Corresponding-Source Location**: https://github.com/ROCm/composable_kernel (via Nix derivation `rocmPackages.composable_kernel`)
+
+### 1.8 llama.cpp
+
+- **Component Name**: llama.cpp
+- **Upstream URL**: https://github.com/ggml-org/llama.cpp
+- **Pinned Revision**: Commit `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0`
+- **Component Used**: Causal tiled-attention scheduling and online-softmax algorithm adapted into the native Qwen3.8 `gfx1151` HIP kernel
+- **SPDX License Identifier**: `MIT`
+- **Copyright / Notice Source**: Copyright (c) 2023-2026 The ggml authors
+- **Relationship**: Source-derived algorithm; no llama.cpp runtime code or library is linked
+- **Corresponding-Source Location**: https://github.com/ggml-org/llama.cpp/tree/e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0/ggml/src/ggml-cuda
+
+### 1.9 libuuid (util-linux)
 
 - **Component Name**: libuuid (util-linux UUID library)
 - **Upstream URL**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git
