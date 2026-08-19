@@ -145,6 +145,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_prefill.cpp
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
+    src/core/speculative/prompt_lookup_backend.cpp
     src/core/speculative/speculative_verifier.cpp
     src/core/heterogeneous/npu_drafter.cpp
   )
@@ -320,6 +321,11 @@ if (BUILD_TESTING)
     endif()
     add_test(NAME test_npu_speculative COMMAND test_npu_speculative)
     set_tests_properties(test_npu_speculative PROPERTIES LABELS "npu;xdna2;speculative")
+
+    add_executable(test_prompt_lookup tests/core/test_prompt_lookup.cpp)
+    target_link_libraries(test_prompt_lookup PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
+    add_test(NAME test_prompt_lookup COMMAND test_prompt_lookup)
+    set_tests_properties(test_prompt_lookup PROPERTIES LABELS "speculative;lookup;pld")
 
   endif()
 

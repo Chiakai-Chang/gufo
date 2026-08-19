@@ -36,13 +36,41 @@ DraftProposal MtpDraftBackend::Propose(
 
   // Auto-regressive multi-token prediction heads projecting from sequence
   // context
-  const auto last_token = prompt_tokens.back();
-  for (std::size_t i = 0; i < count; ++i) {
-    // Generate deterministic draft candidate from MTP head i
-    const auto draft_tok = static_cast<tokenization::TokenId>(
-        (static_cast<std::size_t>(last_token) + (i + 1) * 7) %
-        std::max<std::uint32_t>(1000U, config_.vocab_size));
-    proposal.tokens.push_back(draft_tok);
+  bool matched = false;
+  const std::size_t n = prompt_tokens.size();
+
+  for (std::size_t gram = std::min<std::size_t>(4, n); gram >= 1; --gram) {
+    const auto suffix = prompt_tokens.subspan(n - gram, gram);
+    for (std::size_t i = n - gram; i > 0; --i) {
+      const std::size_t match_idx = i - 1;
+      if (match_idx + gram < n) {
+        bool match = true;
+        for (std::size_t g = 0; g < gram; ++g) {
+          if (prompt_tokens[match_idx + g] != suffix[g]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          const std::size_t follow_start = match_idx + gram;
+          for (std::size_t k = 0; k < count && (follow_start + k) < n; ++k) {
+            proposal.tokens.push_back(prompt_tokens[follow_start + k]);
+          }
+          if (!proposal.tokens.empty()) {
+            matched = true;
+            break;
+          }
+        }
+      }
+    }
+    if (matched) {
+      break;
+    }
+  }
+
+  while (proposal.tokens.size() < count) {
+    const auto fallback_token = prompt_tokens.back();
+    proposal.tokens.push_back(fallback_token);
   }
 
   last_drafted_ = proposal.tokens;

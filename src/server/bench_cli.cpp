@@ -24,6 +24,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_executor.hpp"
 #include "src/core/speculative/draft_heads.hpp"
+#include "src/core/speculative/prompt_lookup_backend.hpp"
 #include "src/core/speculative/self_speculative.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #endif
@@ -602,6 +603,12 @@ int RunBench(std::span<const char* const> args) {
           cfg.max_draft_tokens = opt.draft_tokens;
           cfg.vocab_size = config.vocab_size;
           draft_backend = std::make_unique<heterogeneous::NpuDraftBackend>(cfg);
+        } else if (opt.speculative_backend == "pld" ||
+                   opt.speculative_backend == "lookup") {
+          speculative::PromptLookupConfig cfg;
+          cfg.max_draft_tokens = opt.draft_tokens;
+          draft_backend =
+              std::make_unique<speculative::PromptLookupDraftBackend>(cfg);
         }
 
         std::unique_ptr<speculative::SpeculativeVerifier> spec_verifier;

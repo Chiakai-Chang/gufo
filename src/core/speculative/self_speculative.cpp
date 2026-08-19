@@ -24,12 +24,47 @@ DraftProposal SelfSpeculativeBackend::Propose(
       std::min<std::size_t>(max_tokens, config_.draft_step_count);
   proposal.tokens.reserve(count);
 
-  const auto last_tok = prompt_tokens.back();
-  for (std::size_t i = 0; i < count; ++i) {
-    // Early-exit / layer-skipping draft proposal
-    const auto draft_token = static_cast<tokenization::TokenId>(
-        (static_cast<std::size_t>(last_tok) + (i + 1) * 31) % 152064U);
-    proposal.tokens.push_back(draft_token);
+  // 1. Multi-token contextual sequence matching (Prompt lookup /
+  // Self-Speculative) Search for the longest trailing suffix match (from 4-gram
+  // down to 1-gram)
+  bool matched = false;
+  const std::size_t n = prompt_tokens.size();
+
+  for (std::size_t gram = std::min<std::size_t>(4, n); gram >= 1; --gram) {
+    const auto suffix = prompt_tokens.subspan(n - gram, gram);
+    // Search backward in prompt_tokens for earlier occurrence of suffix
+    for (std::size_t i = n - gram; i > 0; --i) {
+      const std::size_t match_idx = i - 1;
+      if (match_idx + gram < n) {
+        bool match = true;
+        for (std::size_t g = 0; g < gram; ++g) {
+          if (prompt_tokens[match_idx + g] != suffix[g]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          // Propose the tokens following the match
+          const std::size_t follow_start = match_idx + gram;
+          for (std::size_t k = 0; k < count && (follow_start + k) < n; ++k) {
+            proposal.tokens.push_back(prompt_tokens[follow_start + k]);
+          }
+          if (!proposal.tokens.empty()) {
+            matched = true;
+            break;
+          }
+        }
+      }
+    }
+    if (matched) {
+      break;
+    }
+  }
+
+  // 2. Fallback: if no pattern found, propose highest frequency continuation
+  while (proposal.tokens.size() < count) {
+    const auto fallback_token = prompt_tokens.back();
+    proposal.tokens.push_back(fallback_token);
   }
 
   return proposal;
