@@ -340,15 +340,30 @@ int RunPrompt(std::span<const char* const> args) {
               *gpu_exec, std::move(draft_backend), s_opts);
 
           spec_verifier.Reset();
+          tokenization::TokenId first_tok =
+              gpu_exec->ForwardPromptBatch(prompt_tokens);
           std::vector<tokenization::TokenId> current_seq = prompt_tokens;
-          tokenization::TokenId cur_token = prompt_tokens.back();
+          current_seq.push_back(first_tok);
           std::uint32_t cur_pos =
-              static_cast<std::uint32_t>(current_seq.size());
+              static_cast<std::uint32_t>(prompt_tokens.size());
+          const std::string_view first_piece =
+              gpu_exec->GetTokenizer().DecodeToken(first_tok);
+          std::cout << first_piece << std::flush;
+          ++generated_count;
+          tokenization::TokenId cur_token = first_tok;
 
-          while (generated_count < opt.max_tokens) {
+          const auto eos_id = gpu_exec->GetTokenizer().GetEosTokenId();
+          bool stop = false;
+
+          while (generated_count < opt.max_tokens && !stop) {
             const auto step_res = spec_verifier.VerifyStep(current_seq, cur_pos,
-                                                           cur_token, 151643);
+                                                           cur_token, eos_id);
             for (const auto t : step_res.emitted_tokens) {
+              if (t == eos_id || t == 151643U || t == 151644U || t == 151645U ||
+                  t == 248044U || t == 248046U) {
+                stop = true;
+                break;
+              }
               const std::string_view p =
                   gpu_exec->GetTokenizer().DecodeToken(t);
               std::cout << p << std::flush;
@@ -356,12 +371,13 @@ int RunPrompt(std::span<const char* const> args) {
               ++cur_pos;
               ++generated_count;
               if (generated_count >= opt.max_tokens) {
+                stop = true;
                 break;
               }
             }
             cur_token = step_res.next_token;
-            if (cur_token == 151643 || cur_token == 151645) {
-              break;  // End of text
+            if (step_res.hit_eos) {
+              break;
             }
           }
         }

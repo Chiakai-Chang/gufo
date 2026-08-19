@@ -96,7 +96,7 @@ speculative::DraftProposal NpuDraftBackend::Propose(
   const std::size_t n = prompt_tokens.size();
   bool matched = false;
 
-  for (std::size_t gram = std::min<std::size_t>(4, n); gram >= 1; --gram) {
+  for (std::size_t gram = std::min<std::size_t>(4, n); gram >= 2; --gram) {
     const auto suffix = prompt_tokens.subspan(n - gram, gram);
     for (std::size_t i = n - gram; i > 0; --i) {
       const std::size_t match_idx = i - 1;

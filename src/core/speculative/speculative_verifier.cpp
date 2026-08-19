@@ -112,9 +112,28 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     ++accepted_count;
   }
 
-  // Authoritative correction token from target model
-  const tokenization::TokenId correction_token =
-      target_predictions[accepted_count];
+  // 5. Transactional state commit / rollback
+  tokenization::TokenId correction_token =
+      (accepted_count < target_predictions.size())
+          ? target_predictions[accepted_count]
+          : 0;
+
+  if (accepted_count < num_draft) {
+    // Rollback speculative state beyond accepted tokens
+    target_executor_.RestoreState();
+
+    // Replay accepted tokens
+    tokenization::TokenId replay_in = current_token;
+    std::uint32_t replay_pos = cur_pos;
+    for (std::size_t i = 0; i < accepted_count; ++i) {
+      (void)target_executor_.ForwardToken(replay_in, replay_pos, false);
+      replay_in = proposal.tokens[i];
+      ++replay_pos;
+    }
+    // Commit authoritative correction token
+    correction_token =
+        target_executor_.ForwardToken(replay_in, replay_pos, true);
+  }
 
   StepResult result;
   result.draft_count = num_draft;
@@ -133,23 +152,6 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
       result.hit_eos = true;
       break;
     }
-  }
-
-  // 5. Transactional state commit / rollback
-  if (accepted_count < num_draft) {
-    // Rollback speculative state beyond accepted tokens
-    target_executor_.RestoreState();
-
-    // Replay accepted tokens plus correction token
-    tokenization::TokenId replay_in = current_token;
-    std::uint32_t replay_pos = cur_pos;
-    for (std::size_t i = 0; i < accepted_count; ++i) {
-      (void)target_executor_.ForwardToken(replay_in, replay_pos, false);
-      replay_in = proposal.tokens[i];
-      ++replay_pos;
-    }
-    // Commit correction token
-    (void)target_executor_.ForwardToken(replay_in, replay_pos, true);
   }
 
   // 6. Update stats and notify backend
