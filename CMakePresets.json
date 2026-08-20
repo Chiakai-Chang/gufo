@@ -177,6 +177,58 @@
       "output": {
         "outputOnFailure": true
       }
+    },
+    {
+      "name": "npu-fast",
+      "displayName": "Fast HIP and XRT Tests",
+      "configurePreset": "npu-test",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "exclude": {
+          "label": "slow|external-model"
+        }
+      }
+    },
+    {
+      "name": "npu-deepseek",
+      "displayName": "DeepSeek V4 Flash Model Tests",
+      "configurePreset": "npu-test",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "deepseek-v4-flash"
+        }
+      }
+    },
+    {
+      "name": "npu-qwen-kernel-oracle",
+      "displayName": "Qwen Comprehensive GPU Kernel Oracle",
+      "configurePreset": "npu-test",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "qwen-kernel-oracle"
+        }
+      }
+    },
+    {
+      "name": "npu-xrt-hardware",
+      "displayName": "XDNA2 XRT Hardware Tests",
+      "configurePreset": "npu-test",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "label": "xrt-hardware"
+        }
+      }
     }
   ]
 }

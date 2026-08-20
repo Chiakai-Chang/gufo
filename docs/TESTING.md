@@ -524,3 +524,27 @@ CTest compiles and runs from a separate test derivation.
 
 The production package remains a dependency of the PR gate. Its build and
 install checks execute `strix-server --version` and `--help`.
+
+## Hardware Test Tiers
+
+The complete HIP/XRT suite is retained, but it is not the default inner-loop
+command. Run the smallest tier that covers the ownership boundary changed:
+
+| Change | Required hardware tests |
+| --- | --- |
+| Repository-owned code without model or accelerator changes | `ctest --preset npu-fast` |
+| DeepSeek graph, kernels, state, or server adapter | `ctest --preset npu-fast` and `ctest --preset npu-deepseek` |
+| Qwen compute kernels | `ctest --preset npu-fast` and `ctest --preset npu-qwen-kernel-oracle` |
+| XRT/AIE program or NPU runtime | `ctest --preset npu-fast` and `ctest --preset npu-xrt-hardware` |
+| Shared allocator, dispatch, toolchain, or cross-model runtime | `ctest --preset npu-test` |
+
+`npu-fast` excludes tests labeled `slow` or `external-model`. The model presets
+require their documented model environment variables. The comprehensive Qwen
+kernel oracle and real-model DeepSeek tests remain mandatory when their owned
+implementation changes, but unrelated model/device suites need not run on
+every iteration.
+
+Run the complete `npu-test` preset before merging shared runtime or toolchain
+changes, and periodically as a scheduled/manual retention gate. This preserves
+cross-system coverage without charging every model-private edit for every
+other model and accelerator.

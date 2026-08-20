@@ -57,42 +57,7 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (ENGINE_ENABLE_HIP)
-  set(DEEPSEEK_V4_FLASH_VENDOR_DIR
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/models/deepseek_v4_flash/vendor/antirez")
-  add_library(strix_deepseek_v4_flash STATIC
-    src/models/deepseek_v4_flash/engine.cpp
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4.c
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_distributed.c
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_tp.c
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_ssd.c
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_layer_pack.c
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm.hip.cpp
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm_compat.cpp
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm_unavailable.cpp)
-  set_source_files_properties(
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm.hip.cpp
-    PROPERTIES LANGUAGE HIP)
-  target_compile_definitions(strix_deepseek_v4_flash PRIVATE
-    _GNU_SOURCE
-    DS4_ROCM_BUILD=1)
-  target_compile_options(strix_deepseek_v4_flash PRIVATE
-    $<$<COMPILE_LANGUAGE:C>:-O3;-ffast-math;-fno-finite-math-only>
-    $<$<COMPILE_LANGUAGE:CXX>:-O3;-ffast-math;-fno-finite-math-only>
-    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument>)
-  target_include_directories(strix_deepseek_v4_flash
-    PUBLIC
-      ${CMAKE_CURRENT_SOURCE_DIR}
-    SYSTEM PUBLIC
-      ${DEEPSEEK_V4_FLASH_VENDOR_DIR}
-      ${HIPCUB_INCLUDE_DIR}
-      ${ROCPRIM_INCLUDE_DIR}
-      ${ROCWMMA_INCLUDE_DIR})
-  target_link_libraries(strix_deepseek_v4_flash PUBLIC
-    hip::host
-    roc::hipblas
-    roc::hipblaslt
-    Threads::Threads
-    ${CMAKE_DL_LIBS})
+  add_subdirectory(src/models/deepseek_v4_flash)
 endif()
 
 # XRT NPU shim — AMD XDNA2 userspace runtime over the amdxdna kernel driver.
@@ -533,7 +498,7 @@ if (BUILD_TESTING)
     add_test(NAME deepseek_v4_flash_engine_test
       COMMAND deepseek_v4_flash_engine_test)
     set_tests_properties(deepseek_v4_flash_engine_test PROPERTIES
-      LABELS "gpu;hip;gfx1151;deepseek-v4-flash;external-model"
+      LABELS "gpu;hip;gfx1151;deepseek-v4-flash;external-model;slow"
       SKIP_RETURN_CODE 77)
 
     add_executable(qwen_mtp_gpu_test
@@ -556,7 +521,8 @@ if (BUILD_TESTING)
     add_executable(qwen_gpu_ops_test tests/kernels/qwen_gpu_ops_test.cpp)
     target_link_libraries(qwen_gpu_ops_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME qwen_gpu_ops_test COMMAND qwen_gpu_ops_test)
-    set_tests_properties(qwen_gpu_ops_test PROPERTIES LABELS "hip;gpu;kernels")
+    set_tests_properties(qwen_gpu_ops_test PROPERTIES
+      LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow")
 
     add_executable(persistent_deltanet_test
       tests/kernels/persistent_deltanet_test.cpp)
@@ -583,7 +549,7 @@ if (BUILD_TESTING)
     add_test(NAME deepseek_v4_flash_backend_test
       COMMAND deepseek_v4_flash_backend_test)
     set_tests_properties(deepseek_v4_flash_backend_test PROPERTIES
-      LABELS "hip;gpu;server;correctness;deepseek-v4-flash;external-model"
+      LABELS "hip;gpu;server;correctness;deepseek-v4-flash;external-model;slow"
       SKIP_RETURN_CODE 77)
 
     add_executable(gfx1151_acceptance_test tests/benchmarks/gfx1151_acceptance_test.cpp)
