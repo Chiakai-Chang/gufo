@@ -362,6 +362,14 @@ if (BUILD_TESTING)
       LABELS "npu;xdna2;xrt;xrt-hardware;qwen;mtp;gemv")
   endif()
 
+  add_executable(qwen_aie2p_w4a8_pack_test
+    tests/kernels/qwen38_27b/test_aie2p_w4a8.cpp)
+  target_link_libraries(qwen_aie2p_w4a8_pack_test PRIVATE strix_core)
+  add_test(NAME qwen_aie2p_w4a8_pack_test
+    COMMAND qwen_aie2p_w4a8_pack_test)
+  set_tests_properties(qwen_aie2p_w4a8_pack_test PROPERTIES
+    LABELS "cpu;qwen;mtp;w4a8;quantization")
+
   add_executable(gguf_reader_test tests/core/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strix_core)
 
