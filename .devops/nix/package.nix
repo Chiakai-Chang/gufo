@@ -6,6 +6,7 @@
   pkg-config,
   libuuid,
   rocmPackages,
+  aie-qwen-mtp-rmsnorm,
   aie-smoke,
   xrt,
   xrt-plugin-amdxdna,
@@ -62,6 +63,7 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.rocprofiler-sdk
   ]
   ++ lib.optionals xrtSupport [
+    aie-qwen-mtp-rmsnorm
     aie-smoke
     xrt
     xrt-plugin-amdxdna
@@ -77,12 +79,14 @@ stdenv.mkDerivation (finalAttrs: {
   ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
   ++ lib.optional rocmSupport "-DGPU_TARGETS=${lib.concatStringsSep ";" rocmGpuTargets}"
   ++ lib.optional xrtSupport "-DENGINE_ENABLE_XRT=ON"
+  ++ lib.optional xrtSupport "-DSTRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/qwen-mtp-rmsnorm"
   ++ lib.optional xrtSupport "-DSTRIX_AIE_SMOKE_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/smoke";
 
   env = lib.optionalAttrs rocmSupport {
     ROCM_PATH = "${rocmPackages.clr}";
   }
   // lib.optionalAttrs xrtSupport {
+    STRIX_AIE_QWEN_MTP_RMSNORM_ROOT = "${aie-qwen-mtp-rmsnorm}";
     STRIX_AIE_SMOKE_ROOT = "${aie-smoke}";
     XRT_PATH = "${xrt}/opt/xilinx/xrt";
     # Combined NPU lib dir so XRT can discover the amdxdna plugin at runtime.
@@ -114,6 +118,17 @@ stdenv.mkDerivation (finalAttrs: {
         ${aie-smoke}/smoke.aie-partition.json \
         ${aie-smoke}/manifest.json ${aie-smoke}/SHA256SUMS \
         $out/share/strix/aie/smoke/
+    fi
+    if [ -d ${aie-qwen-mtp-rmsnorm} ]; then
+      mkdir -p $out/share/strix/aie/qwen-mtp-rmsnorm
+      cp ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.xclbin \
+        ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.insts.elf \
+        ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.insts.bin \
+        ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.pdi \
+        ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.aie-partition.json \
+        ${aie-qwen-mtp-rmsnorm}/manifest.json \
+        ${aie-qwen-mtp-rmsnorm}/SHA256SUMS \
+        $out/share/strix/aie/qwen-mtp-rmsnorm/
     fi
     chmod +x $out/bin/*
 

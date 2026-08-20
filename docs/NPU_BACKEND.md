@@ -19,11 +19,13 @@ initialize both GPU and NPU backends.
 
 ## Current Status
 
-The Nix package builds a reviewed one-column NPU2 add-one program with pinned
-MLIR-AIE, LLVM-AIE, and AIEBU tools. `strix-server diagnose --smoke xrt`
-executes it repeatedly through XRT with bounded waits, exact output checks,
-content hashes, and fingerprint-bound JSON. Model inference and MTP remain
-GPU-owned until the model-private NPU programs pass their numerical gates.
+The Nix package builds reviewed NPU2 programs with pinned MLIR-AIE, LLVM-AIE,
+and AIEBU tools. The deterministic XRT smoke validates the runtime lifecycle.
+The first model-private program executes Qwen3.8 MTP RMSNorm with the actual
+5120-element weight vector: its BF16 result matches the FP64 oracle at
+`0.00405` RMSE and `0.999982` cosine similarity, with observed warm commands
+between `0.08` and `0.12 ms`. MTP matrix operators and full draft generation
+remain GPU-owned.
 
 ## Initial Platform
 

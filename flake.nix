@@ -51,6 +51,8 @@
             rocmSupport = true;
             rocmGpuTargets = [ "gfx1151" ];
           };
+          aie-qwen-mtp-rmsnorm =
+            strixPackages.${system}.aie-qwen-mtp-rmsnorm;
           aie-smoke = strixPackages.${system}.aie-smoke;
         }
       );
@@ -65,6 +67,23 @@
             packages = [
               (pythonTools system)
               pkgs.${system}.rocmPackages.rocprofiler-sdk
+            ];
+            env = {
+              ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";
+              STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
+                "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
+              STRIX_AIE_QWEN_MTP_RMSNORM_ROOT =
+                "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
+              STRIX_AIE_SMOKE_PROGRAM_DIR = "${strixPackages.${system}.aie-smoke}";
+              STRIX_AIE_SMOKE_ROOT = "${strixPackages.${system}.aie-smoke}";
+              XRT_PATH = "${strixPackages.${system}.xrt}/opt/xilinx/xrt";
+            };
+          };
+
+          # Isolated Python 3.12 AIE compiler shell. Keeping this separate
+          # prevents MLIR-AIE's NumPy ABI from leaking into pythonTools.
+          aie = pkgs.${system}.mkShell {
+            packages = [
               strixPackages.${system}.aiebu
               strixPackages.${system}.llvm-aie
               strixPackages.${system}.mlir-aie
@@ -72,9 +91,11 @@
             env = {
               MLIR_AIE_INSTALL_DIR = "${strixPackages.${system}.mlir-aie}/${pkgs.${system}.python312.sitePackages}/mlir_aie";
               PEANO_INSTALL_DIR = "${strixPackages.${system}.llvm-aie}/${pkgs.${system}.python312.sitePackages}/llvm-aie";
-              ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";
+              STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
+                "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
+              STRIX_AIE_QWEN_MTP_RMSNORM_ROOT =
+                "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
               STRIX_AIE_SMOKE_PROGRAM_DIR = "${strixPackages.${system}.aie-smoke}";
-              STRIX_AIE_SMOKE_ROOT = "${strixPackages.${system}.aie-smoke}";
               XRT_PATH = "${strixPackages.${system}.xrt}/opt/xilinx/xrt";
             };
           };

@@ -6,8 +6,9 @@ Status: active implementation, 2026-08-20
 
 The native runtime loads Qwen3.8 GGUF artifacts, executes prefill and decode on
 gfx1151, and serves the OpenAI-compatible HTTP path with request-owned state.
-XDNA2 currently has a reproducible XRT/AIE smoke program; model-private NPU
-MTP execution is the active implementation boundary.
+XDNA2 has a reproducible XRT/AIE lifecycle and a numerically validated
+model-private MTP RMSNorm program. K-quant matrix operators and complete NPU
+draft generation are the active implementation boundary.
 
 ## Product Decisions
 
