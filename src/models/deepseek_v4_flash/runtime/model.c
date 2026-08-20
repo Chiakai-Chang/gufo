@@ -40,16 +40,12 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "ds4.h"
-#include "ds4_distributed.h"
-#include "ds4_tp.h"
+#include "model.h"
+#include "single_node.h"
 
-/* Wave-2 multi-GPU types are needed in every build because the engine
- * struct embeds ds4_gpu_config and the placement table. ds4_layer_pack.h
- * is included unconditionally for the same reason (engine helpers call
- * the packer in multi-tier mode, but the headers are tiny and C-safe). */
-#include "ds4_layer_pack.h"
-#include "ds4_gpu_mgpu.h"
+/* The imported graph still carries placement fields in its internal structs,
+ * but Strix exposes only the single-device ROCm route. */
+#include "../kernels/rocm/device.h"
 
 #define DS4_ROCM_TP_PEER_TMP_BYTES \
     ((uint64_t)DS4_N_EXPERT_USED * DS4_N_EMBD * sizeof(float) + 128u)
@@ -105,7 +101,7 @@ static uint32_t metal_graph_hip_tp_output_tiers_for_head(
 }
 
 #ifndef DS4_NO_GPU
-#include "ds4_gpu.h"
+#include "../kernels/rocm/gpu.h"
 #endif
 
 /* Non-ROCM builds (Mac/Metal, CPU-only) never link ds4_rocm.hip.cpp. Provide
@@ -1289,9 +1285,6 @@ static int ds4_expert_hotlist_sort_cmp(const void *a, const void *b) {
     if (ea->expert != eb->expert) return ea->expert < eb->expert ? -1 : 1;
     return 0;
 }
-
-#include "ds4_streaming_hotlist.inc"
-#include "ds4_streaming_hotlist_glm52.inc"
 
 static void ds4_json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
@@ -20708,38 +20701,7 @@ static bool metal_graph_streaming_expert_hotlist_load_default(
     if (max_entries == 0 || !experts || !priorities || !counts || !seen || !loaded_out) {
         return false;
     }
-    const uint16_t (*hotlist)[2] = NULL;
-    uint32_t hotlist_count = 0;
-    if (g_ds4_shape.variant == DS4_VARIANT_PRO) {
-        hotlist = ds4_default_streaming_hotlist_pro;
-        hotlist_count = ds4_default_streaming_hotlist_pro_count;
-    } else if (g_ds4_shape.variant == DS4_VARIANT_FLASH) {
-        hotlist = ds4_default_streaming_hotlist_flash;
-        hotlist_count = ds4_default_streaming_hotlist_flash_count;
-    } else if (g_ds4_shape.variant == DS4_VARIANT_GLM52) {
-        hotlist = ds4_default_streaming_hotlist_glm52;
-        hotlist_count = ds4_default_streaming_hotlist_glm52_count;
-    } else {
-        *loaded_out = 0;
-        return true;
-    }
-    uint32_t loaded = 0;
-    for (uint32_t i = 0;
-         i < hotlist_count && loaded < max_entries;
-         i++) {
-        if (!metal_graph_streaming_expert_hotlist_add(
-                hotlist[i][0],
-                hotlist[i][1],
-                max_entries - loaded,
-                experts,
-                priorities,
-                counts,
-                seen,
-                &loaded)) {
-            return false;
-        }
-    }
-    *loaded_out = loaded;
+    *loaded_out = 0;
     return true;
 }
 
@@ -20826,51 +20788,7 @@ static bool metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
         metal_graph_streaming_expert_preload_count(g, cache_budget);
     if (preload_count == 0) return true;
 
-    const uint16_t (*hotlist)[2] = NULL;
-    uint32_t hotlist_count = 0;
-    if (g_ds4_shape.variant == DS4_VARIANT_FLASH) {
-        hotlist = ds4_default_streaming_hotlist_flash;
-        hotlist_count = ds4_default_streaming_hotlist_flash_count;
-    } else {
-        hotlist = ds4_default_streaming_hotlist_pro;
-        hotlist_count = ds4_default_streaming_hotlist_pro_count;
-    }
-    const uint32_t target_count = preload_count < hotlist_count ?
-        preload_count : hotlist_count;
-    if (ds4_gpu_stream_expert_cache_current_count() >= target_count) {
-        return true;
-    }
-
-    int32_t experts[DS4_MAX_EXPERT];
-    uint32_t priorities[DS4_MAX_EXPERT];
-    uint32_t n = 0;
-    uint32_t loaded = 0;
-    for (uint32_t i = 0;
-         i < hotlist_count && loaded < preload_count;
-         i++) {
-        const uint32_t hot_layer = hotlist[i][0];
-        const uint32_t hot_expert = hotlist[i][1];
-        if (hot_layer >= DS4_N_LAYER || hot_expert >= DS4_N_EXPERT) continue;
-        const uint32_t priority = preload_count - loaded;
-        loaded++;
-        if (hot_layer != il) continue;
-        if (n >= DS4_MAX_EXPERT) return false;
-        experts[n] = (int32_t)hot_expert;
-        priorities[n] = priority;
-        n++;
-    }
-    if (n == 0) return true;
-
-    const ds4_gpu_stream_expert_table table =
-        graph_stream_expert_table_make(model,
-                                       layer,
-                                       il,
-                                       gate_expert_bytes,
-                                       down_expert_bytes);
-    return ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(&table,
-                                                              experts,
-                                                              priorities,
-                                                              n) != 0;
+    return true;
 }
 #endif
 

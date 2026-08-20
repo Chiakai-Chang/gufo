@@ -7,7 +7,7 @@
 #include <utility>
 
 extern "C" {
-#include "src/models/deepseek_v4_flash/vendor/antirez/ds4.h"
+#include "src/models/deepseek_v4_flash/runtime/model.h"
 }
 
 namespace strix::models::deepseek_v4_flash {

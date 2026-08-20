@@ -1,19 +1,18 @@
-set(DEEPSEEK_V4_FLASH_VENDOR_DIR
-  "${CMAKE_CURRENT_SOURCE_DIR}/vendor/antirez")
+set(DEEPSEEK_V4_FLASH_RUNTIME_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/runtime")
+set(DEEPSEEK_V4_FLASH_ROCM_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/kernels/rocm")
 
 add_library(strix_deepseek_v4_flash STATIC
   engine.cpp
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4.c
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_distributed.c
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_tp.c
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_ssd.c
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_layer_pack.c
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm.hip.cpp
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm_compat.cpp
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm_unavailable.cpp)
+  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/model.c
+  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/single_node.c
+  ${DEEPSEEK_V4_FLASH_ROCM_DIR}/backend.hip.cpp
+  ${DEEPSEEK_V4_FLASH_ROCM_DIR}/device.cpp
+  ${DEEPSEEK_V4_FLASH_ROCM_DIR}/unavailable.cpp)
 
 set_source_files_properties(
-  ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm.hip.cpp
+  ${DEEPSEEK_V4_FLASH_ROCM_DIR}/backend.hip.cpp
   PROPERTIES LANGUAGE HIP)
 
 target_compile_definitions(strix_deepseek_v4_flash PRIVATE
@@ -29,7 +28,9 @@ target_include_directories(strix_deepseek_v4_flash
   PUBLIC
     ${PROJECT_SOURCE_DIR}
   SYSTEM PUBLIC
-    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}
+    ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}
+    ${DEEPSEEK_V4_FLASH_ROCM_DIR}
+    ${DEEPSEEK_V4_FLASH_ROCM_DIR}/detail
     ${HIPCUB_INCLUDE_DIR}
     ${ROCPRIM_INCLUDE_DIR}
     ${ROCWMMA_INCLUDE_DIR})

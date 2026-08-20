@@ -1,4 +1,4 @@
-#include "ds4_rocm.h"
+#include "backend.h"
 #include <hipblaslt/hipblaslt.h>
 
 #define FULL_WARP_MASK 0xFFFFFFFFFFFFFFFFULL
@@ -24,7 +24,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "ds4_gpu.h"
+#include "gpu.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -73,50 +73,50 @@ typedef struct {
     uint16_t qs[ROCM_QK_K / 8];
 } hip_block_iq2_xxs;
 
-#include "ds4_iq2_tables_rocm.inc"
+#include "iq2_tables.inc"
 
-#include "rocm/ds4_rocm_runtime.hip.hpp"
+#include "detail/ds4_rocm_runtime.hip.hpp"
 
-#include "rocm/ds4_rocm_common.hip.hpp"
+#include "detail/ds4_rocm_common.hip.hpp"
 
-#include "rocm/ds4_rocm_q8.hip.hpp"
+#include "detail/ds4_rocm_q8.hip.hpp"
 
-#include "rocm/ds4_rocm_norm_rope.hip.hpp"
+#include "detail/ds4_rocm_norm_rope.hip.hpp"
 
-#include "rocm/ds4_rocm_fp8_kv.hip.hpp"
+#include "detail/ds4_rocm_fp8_kv.hip.hpp"
 
-#include "rocm/ds4_rocm_attention.hip.hpp"
+#include "detail/ds4_rocm_attention.hip.hpp"
 
-#include "rocm/ds4_rocm_hc.hip.hpp"
+#include "detail/ds4_rocm_hc.hip.hpp"
 
-#include "rocm/ds4_rocm_output.hip.hpp"
+#include "detail/ds4_rocm_output.hip.hpp"
 
-#include "rocm/ds4_rocm_indexer.hip.hpp"
+#include "detail/ds4_rocm_indexer.hip.hpp"
 
-#include "rocm/ds4_rocm_embedding_launch.hip.hpp"
+#include "detail/ds4_rocm_embedding_launch.hip.hpp"
 
-#include "rocm/ds4_rocm_matmul.hip.hpp"
+#include "detail/ds4_rocm_matmul.hip.hpp"
 
-#include "rocm/ds4_rocm_fp8_kv_launch.hip.hpp"
+#include "detail/ds4_rocm_fp8_kv_launch.hip.hpp"
 
-#include "rocm/ds4_rocm_compressor.hip.hpp"
+#include "detail/ds4_rocm_compressor.hip.hpp"
 
-#include "rocm/ds4_rocm_attention_launch.hip.hpp"
+#include "detail/ds4_rocm_attention_launch.hip.hpp"
 
-#include "rocm/ds4_rocm_shared_expert.hip.hpp"
+#include "detail/ds4_rocm_shared_expert.hip.hpp"
 
-#include "rocm/ds4_rocm_misc_launch.hip.hpp"
-#include "rocm/ds4_rocm_router.hip.hpp"
+#include "detail/ds4_rocm_misc_launch.hip.hpp"
+#include "detail/ds4_rocm_router.hip.hpp"
 
-#include "rocm/ds4_rocm_moe.hip.hpp"
+#include "detail/ds4_rocm_moe.hip.hpp"
 
-#include "rocm/ds4_rocm_moe_launch.hip.hpp"
+#include "detail/ds4_rocm_moe_launch.hip.hpp"
 
-#include "rocm/ds4_rocm_glm.hip.hpp"
+#include "detail/ds4_rocm_glm.hip.hpp"
 
-#include "rocm/ds4_rocm_hc_output_launch.hip.hpp"
+#include "detail/ds4_rocm_hc_output_launch.hip.hpp"
 
-#include "rocm/ds4_rocm_current_api_compat.hip.hpp"
+#include "detail/ds4_rocm_current_api_compat.hip.hpp"
 
 /* Tensor-parallel gates are Metal-only; stubs keep shared graph code
  * linkable (TP option validation rejects non-Metal backends). */

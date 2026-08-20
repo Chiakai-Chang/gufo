@@ -4,9 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "ds4_gpu_mgpu.h"
-#include "ds4_gpu.h"
-#include "ds4_gpu_args.h"
+#include "device.h"
+#include "gpu.h"
 
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
 int g_n_gpus = 1;
@@ -138,57 +137,6 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int tier) {
         return 0;
     }
     return (uint64_t)free_bytes;
-}
-
-extern "C" int ds4_gpu_args_probe_auto_hip(
-        const int *device_filter, int filter_len, ds4_gpu_config *out,
-        size_t safety_margin_bytes, char *errbuf, size_t errbuflen) {
-    if (!out) {
-        if (errbuf && errbuflen) snprintf(errbuf, errbuflen, "internal: NULL out");
-        return 1;
-    }
-    int visible = 0;
-    hipError_t rc = hipGetDeviceCount(&visible);
-    if (rc != hipSuccess || visible <= 0) {
-        if (errbuf && errbuflen) {
-            snprintf(errbuf, errbuflen, "hipGetDeviceCount failed: %s",
-                     rc == hipSuccess ? "no devices" : hipGetErrorString(rc));
-        }
-        return 1;
-    }
-    if (filter_len > 1 || (!device_filter && visible > 1)) {
-        if (errbuf && errbuflen) {
-            snprintf(errbuf, errbuflen,
-                     "ROCm supports one GPU per process; select one device");
-        }
-        return 1;
-    }
-    const int device = device_filter && filter_len == 1 ? device_filter[0] : 0;
-    if (device < 0 || device >= visible || hipSetDevice(device) != hipSuccess) {
-        if (errbuf && errbuflen) {
-            snprintf(errbuf, errbuflen, "invalid ROCm device %d", device);
-        }
-        return 1;
-    }
-    size_t free_bytes = 0;
-    size_t total_bytes = 0;
-    rc = hipMemGetInfo(&free_bytes, &total_bytes);
-    if (rc != hipSuccess) {
-        if (errbuf && errbuflen) {
-            snprintf(errbuf, errbuflen, "hipMemGetInfo failed: %s",
-                     hipGetErrorString(rc));
-        }
-        return 1;
-    }
-    const size_t reserve_floor = (size_t)2ull * 1024ull * 1024ull * 1024ull;
-    const size_t reserve_pct = free_bytes / 20u;
-    const size_t reserve = reserve_floor > reserve_pct ? reserve_floor : reserve_pct;
-    memset(out, 0, sizeof(*out));
-    out->device_indices[0] = device;
-    out->vram_bytes[0] = free_bytes > reserve ? free_bytes - reserve : 0;
-    out->n_gpus = 1;
-    out->safety_margin_bytes = safety_margin_bytes;
-    return 0;
 }
 
 extern "C" void ds4_gpu_enable_q8_dequant_gemm(void) {

@@ -193,6 +193,8 @@
             find src tests \
               -not -path "*/fixtures/*" \
               -not -path "*/vendor/*" \
+              -not -path "src/models/deepseek_v4_flash/runtime/*" \
+              -not -path "src/models/deepseek_v4_flash/kernels/rocm/*" \
               \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) \
               -exec clang-format --dry-run --Werror {} +
             mkdir -p $out

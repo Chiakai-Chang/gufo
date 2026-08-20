@@ -6,8 +6,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include "ds4_ssd.h"
-
 /* Public engine boundary.
  *
  * The CLI and server should treat ds4_engine as the loaded model and

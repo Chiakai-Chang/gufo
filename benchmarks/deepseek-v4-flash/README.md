@@ -99,6 +99,9 @@ plans 82.07 GiB total, including model, KV state, and working buffers.
 ## Successful
 
 - Imported the minimum DS4 engine and ROCm kernel closure needed for the model.
+- Moved the engine into repository-owned `runtime` and `kernels/rocm`
+  packages, removing the standalone distributed, tensor-parallel, SSD
+  streaming/planning, multi-GPU placement, and embedded hotlist modules.
 - Converted the private fork to native ROCm/HIP naming and APIs.
 - Kept DeepSeek code, kernels, state, and dispatch isolated from Qwen.
 - Reused the existing Strix CLI, benchmark, and OpenAI-compatible server.
