@@ -54,9 +54,23 @@ if (ENGINE_ENABLE_XRT)
   find_library(XRT_COREUTIL_LIB xrt_coreutil
     PATHS "$ENV{XRT_PATH}/lib" "/opt/xilinx/xrt/lib"
     NO_DEFAULT_PATH)
+  find_library(UUID_LIBRARY uuid REQUIRED)
 
   if (NOT XRT_INCLUDE_DIR OR NOT XRT_COREUTIL_LIB)
     message(FATAL_ERROR "XRT not found (ENGINE_ENABLE_XRT=ON). Please enter the Nix development environment (nix develop)")
+  endif()
+  if (DEFINED ENV{STRIX_AIE_SMOKE_PROGRAM_DIR}
+      AND NOT "$ENV{STRIX_AIE_SMOKE_PROGRAM_DIR}" STREQUAL "")
+    set(STRIX_AIE_SMOKE_PROGRAM_DIR "$ENV{STRIX_AIE_SMOKE_PROGRAM_DIR}"
+      CACHE PATH "Directory containing the reviewed XDNA2 smoke artifacts"
+      FORCE)
+  else()
+    set(STRIX_AIE_SMOKE_PROGRAM_DIR "${STRIX_AIE_SMOKE_PROGRAM_DIR}"
+      CACHE PATH "Directory containing the reviewed XDNA2 smoke artifacts")
+  endif()
+  set(STRIX_AIE_SMOKE_INCLUDE_DIR "$ENV{STRIX_AIE_SMOKE_ROOT}/include")
+  if (NOT STRIX_AIE_SMOKE_PROGRAM_DIR OR NOT STRIX_AIE_SMOKE_INCLUDE_DIR)
+    message(FATAL_ERROR "XDNA2 smoke artifacts not found. Use the Nix development environment")
   endif()
   message(STATUS "strix: XRT NPU shim enabled, include=${XRT_INCLUDE_DIR}")
 endif()
@@ -85,8 +99,8 @@ endif()
 
 if (ENGINE_ENABLE_XRT)
   target_compile_definitions(strix PRIVATE ENGINE_ENABLE_XRT=1)
-  target_include_directories(strix PRIVATE ${XRT_INCLUDE_DIR})
-  target_link_libraries(strix PRIVATE ${XRT_COREUTIL_LIB})
+  target_include_directories(strix SYSTEM PRIVATE ${XRT_INCLUDE_DIR})
+  target_link_libraries(strix PRIVATE ${XRT_COREUTIL_LIB} ${UUID_LIBRARY})
 endif()
 
 add_library(strix_diagnostics STATIC
@@ -98,6 +112,8 @@ add_library(strix_diagnostics STATIC
   src/core/diagnostics/bandwidth.cpp
   src/core/hip/bandwidth.cpp
   src/core/xdna2/bandwidth.cpp
+  src/core/xdna2/device.cpp
+  src/core/xdna2/smoke.cpp
   src/core/diagnostics/report.cpp
   src/cli/diagnose.cpp
 )
@@ -109,9 +125,15 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (ENGINE_ENABLE_XRT)
-  target_compile_definitions(strix_diagnostics PRIVATE ENGINE_ENABLE_XRT=1)
-  target_include_directories(strix_diagnostics PRIVATE ${XRT_INCLUDE_DIR})
-  target_link_libraries(strix_diagnostics PRIVATE ${XRT_COREUTIL_LIB})
+  target_compile_definitions(strix_diagnostics PRIVATE
+    ENGINE_ENABLE_XRT=1
+    STRIX_AIE_SMOKE_PROGRAM_DIR="${STRIX_AIE_SMOKE_PROGRAM_DIR}")
+  target_include_directories(strix_diagnostics SYSTEM PRIVATE
+    ${XRT_INCLUDE_DIR}
+    ${STRIX_AIE_SMOKE_INCLUDE_DIR})
+  target_link_libraries(strix_diagnostics PRIVATE
+    ${XRT_COREUTIL_LIB}
+    ${UUID_LIBRARY})
 endif()
 
 add_library(strix_core STATIC
@@ -163,8 +185,8 @@ endif()
 
 if (ENGINE_ENABLE_XRT)
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_XRT=1)
-  target_include_directories(strix_core PUBLIC ${XRT_INCLUDE_DIR})
-  target_link_libraries(strix_core PUBLIC ${XRT_COREUTIL_LIB})
+  target_include_directories(strix_core SYSTEM PUBLIC ${XRT_INCLUDE_DIR})
+  target_link_libraries(strix_core PUBLIC ${XRT_COREUTIL_LIB} ${UUID_LIBRARY})
 endif()
 
 add_executable(strix-server
@@ -263,6 +285,16 @@ if (BUILD_TESTING)
 
   add_test(NAME bandwidth_test COMMAND bandwidth_test)
   set_tests_properties(bandwidth_test PROPERTIES LABELS "cpu;diagnostics;bandwidth;bandwidth_schema;bandwidth_correctness")
+
+  if (ENGINE_ENABLE_XRT)
+    add_executable(xrt_smoke_test tests/device/xrt_smoke_test.cpp)
+    target_compile_definitions(xrt_smoke_test PRIVATE
+      STRIX_AIE_SMOKE_PROGRAM_DIR="${STRIX_AIE_SMOKE_PROGRAM_DIR}")
+    target_link_libraries(xrt_smoke_test PRIVATE strix_diagnostics)
+    add_test(NAME xrt_smoke_test COMMAND xrt_smoke_test)
+    set_tests_properties(xrt_smoke_test PROPERTIES
+      LABELS "npu;xdna2;xrt;xrt-hardware")
+  endif()
 
   add_executable(gguf_reader_test tests/core/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strix_core)

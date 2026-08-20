@@ -1,6 +1,6 @@
 # XDNA2 NPU Backend
 
-Status: design draft, 2026-08-11
+Status: implementation in progress, updated 2026-08-20
 
 ## Purpose
 
@@ -16,6 +16,14 @@ strix-server
 
 The NPU module is statically linked into `strix-server`. The core runtime may
 initialize both GPU and NPU backends.
+
+## Current Status
+
+The Nix package builds a reviewed one-column NPU2 add-one program with pinned
+MLIR-AIE, LLVM-AIE, and AIEBU tools. `strix-server diagnose --smoke xrt`
+executes it repeatedly through XRT with bounded waits, exact output checks,
+content hashes, and fingerprint-bound JSON. Model inference and MTP remain
+GPU-owned until the model-private NPU programs pass their numerical gates.
 
 ## Initial Platform
 

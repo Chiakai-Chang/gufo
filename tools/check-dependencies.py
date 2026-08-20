@@ -26,6 +26,9 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "ROCprofiler SDK / ROCTx",
     "llama.cpp",
     "libuuid",
+    "MLIR-AIE",
+    "LLVM-AIE",
+    "AIEBU",
 }
 
 

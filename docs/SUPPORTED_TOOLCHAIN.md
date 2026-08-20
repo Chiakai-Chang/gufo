@@ -22,7 +22,9 @@ Strix-Halo.cpp exclusively targets **AMD Strix Halo** systems on **Linux x86-64*
 
 ## Pinned Nix Build & Development Toolchain
 
-All userspace toolchain dependencies are locked via [`flake.lock`](file:///home/mixer/strix-halo.cpp/flake.lock) and machine-checkable via `nix eval .#default.toolchain --json`.
+All userspace toolchain dependencies are locked via
+[`flake.lock`](../flake.lock) and machine-checkable with
+`nix eval .#default.toolchain --json`.
 
 | Dependency | Version / Revision | Source / Derivation | Purpose |
 | --- | --- | --- | --- |
@@ -35,7 +37,9 @@ All userspace toolchain dependencies are locked via [`flake.lock`](file:///home/
 | **XRT Userspace Runtime** | Git commit `8661761775a266b11992a3bd6eb08209d88aa845` | `github:Xilinx/XRT` (`sha256-JrqJIGJoQiXTwXjZpqAXVaHx+6i09B1qtqkJzoRPZKw=`) | AMD XRT NPU runtime shim (`libxrt_coreutil.so`) |
 | **AMD XDNA Driver Plugin** | Git commit `4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305` (Plugin `2.21.0`) | `github:amd/xdna-driver` (`sha256-YUiM9u9vtISttbThTt9fTtBB/w3d5UatGyVK5mAgWNM=`) | Userspace driver plugin (`libxrt_driver_xdna.so`) |
 | **Offline Python Toolchain** | Python `3.13` (`python313`) | `python313.withPackages` | Offline quantization and logit evaluation (`torchWithRocm`, `transformers`, `safetensors`, `numpy`, `scipy`, `zstandard`) |
-| **AIE Microkernel Toolchain** | Ahead-of-Time MLIR-AIE / IRON | `github:amd/IRON` & `github:Xilinx/aie_api` | Ahead-of-time AIE2P microkernel generation (`mmul_8_4`) |
+| **MLIR-AIE / IRON** | `1.4.1` | `github:Xilinx/mlir-aie` release wheel | NPU2 array, DMA, and program generation |
+| **LLVM-AIE / Peano** | `21.0.0.2026080301+c9c5ecb7` | `github:Xilinx/llvm-aie` release wheel | AIE2P core compilation |
+| **AIEBU** | `27a302c5840773e79c79f0f2fc8a1832d6ab1774` | `github:Xilinx/aiebu` | AIE control-code ELF assembly |
 
 ---
 
@@ -72,6 +76,9 @@ Output:
   "targetGpu": "gfx1151",
   "targetNpu": "XDNA2/AIE2P",
   "targetPlatform": "x86_64-linux",
+  "aiebuRevision": "27a302c5840773e79c79f0f2fc8a1832d6ab1774",
+  "llvmAieVersion": "21.0.0.2026080301+c9c5ecb7",
+  "mlirAieVersion": "1.4.1",
   "xrtCommit": "8661761775a266b11992a3bd6eb08209d88aa845",
   "xrtPluginCommit": "4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305",
   "xrtPluginVersion": "2.21.0"

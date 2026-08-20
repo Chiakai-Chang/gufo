@@ -260,6 +260,8 @@ strix-server diagnose --json --section inventory
 strix-server diagnose --fingerprint --json --output /tmp/strix-fingerprint.json
 strix-server diagnose --validate-artifact /tmp/strix-fingerprint.json
 strix-server diagnose --benchmark bandwidth --backends cpu,hip,xrt --output /tmp/strix-bandwidth.json
+strix-server diagnose --smoke xrt --iterations 100 --timeout-ms 30000 \
+  --json --output /tmp/strix-xrt-smoke.json
 ```
 
 ### Machine Fingerprint and Artifact Validation
@@ -272,6 +274,9 @@ strix-server diagnose --benchmark bandwidth --backends cpu,hip,xrt --output /tmp
 - `--warmup <n>`: Number of warmup iterations (default: `3`).
 - `--repetitions <n>`: Number of benchmark repetitions (default: `10`).
 - `--duration-ms <ms>`: Target duration per test in milliseconds (default: `2000`).
+- `--smoke xrt`: Executes the packaged deterministic XDNA2 program.
+- `--iterations <n>`: Number of command/completion cycles (default: `100`).
+- `--timeout-ms <n>`: Per-command timeout; a timeout fails and quarantines the context.
 
 ### JSON Output Schema (v1.0.0)
 

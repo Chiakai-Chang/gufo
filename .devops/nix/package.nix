@@ -6,6 +6,7 @@
   pkg-config,
   libuuid,
   rocmPackages,
+  aie-smoke,
   xrt,
   xrt-plugin-amdxdna,
   config,
@@ -61,6 +62,7 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.rocprofiler-sdk
   ]
   ++ lib.optionals xrtSupport [
+    aie-smoke
     xrt
     xrt-plugin-amdxdna
     libuuid
@@ -74,12 +76,14 @@ stdenv.mkDerivation (finalAttrs: {
   ++ lib.optional rocmSupport "-DENGINE_ENABLE_HIP=ON"
   ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
   ++ lib.optional rocmSupport "-DGPU_TARGETS=${lib.concatStringsSep ";" rocmGpuTargets}"
-  ++ lib.optional xrtSupport "-DENGINE_ENABLE_XRT=ON";
+  ++ lib.optional xrtSupport "-DENGINE_ENABLE_XRT=ON"
+  ++ lib.optional xrtSupport "-DSTRIX_AIE_SMOKE_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/smoke";
 
   env = lib.optionalAttrs rocmSupport {
     ROCM_PATH = "${rocmPackages.clr}";
   }
   // lib.optionalAttrs xrtSupport {
+    STRIX_AIE_SMOKE_ROOT = "${aie-smoke}";
     XRT_PATH = "${xrt}/opt/xilinx/xrt";
     # Combined NPU lib dir so XRT can discover the amdxdna plugin at runtime.
     LD_LIBRARY_PATH = "${xrt}/opt/xilinx/xrt/lib:${xrt-plugin-amdxdna}/opt/xilinx/xrt/lib";
@@ -102,6 +106,14 @@ stdenv.mkDerivation (finalAttrs: {
     fi
     if [ -f benchmark_ssm_replay ]; then
       cp benchmark_ssm_replay $out/bin/benchmark_ssm_replay
+    fi
+    if [ -d ${aie-smoke} ]; then
+      mkdir -p $out/share/strix/aie/smoke
+      cp ${aie-smoke}/smoke.xclbin ${aie-smoke}/smoke.insts.elf \
+        ${aie-smoke}/smoke.insts.bin ${aie-smoke}/smoke.pdi \
+        ${aie-smoke}/smoke.aie-partition.json \
+        ${aie-smoke}/manifest.json ${aie-smoke}/SHA256SUMS \
+        $out/share/strix/aie/smoke/
     fi
     chmod +x $out/bin/*
 
@@ -136,6 +148,9 @@ stdenv.mkDerivation (finalAttrs: {
       xrtCommit = xrt.src.rev;
       xrtPluginCommit = xrt-plugin-amdxdna.src.rev;
       xrtPluginVersion = xrt-plugin-amdxdna.pluginVersion;
+      aiebuRevision = aie-smoke.passthru.aiebu.src.rev;
+      llvmAieVersion = aie-smoke.passthru."llvm-aie".version;
+      mlirAieVersion = aie-smoke.passthru."mlir-aie".version;
     };
   };
 

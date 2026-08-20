@@ -51,6 +51,7 @@
             rocmSupport = true;
             rocmGpuTargets = [ "gfx1151" ];
           };
+          aie-smoke = strixPackages.${system}.aie-smoke;
         }
       );
 
@@ -64,9 +65,16 @@
             packages = [
               (pythonTools system)
               pkgs.${system}.rocmPackages.rocprofiler-sdk
+              strixPackages.${system}.aiebu
+              strixPackages.${system}.llvm-aie
+              strixPackages.${system}.mlir-aie
             ];
             env = {
+              MLIR_AIE_INSTALL_DIR = "${strixPackages.${system}.mlir-aie}/${pkgs.${system}.python312.sitePackages}/mlir_aie";
+              PEANO_INSTALL_DIR = "${strixPackages.${system}.llvm-aie}/${pkgs.${system}.python312.sitePackages}/llvm-aie";
               ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";
+              STRIX_AIE_SMOKE_PROGRAM_DIR = "${strixPackages.${system}.aie-smoke}";
+              STRIX_AIE_SMOKE_ROOT = "${strixPackages.${system}.aie-smoke}";
               XRT_PATH = "${strixPackages.${system}.xrt}/opt/xilinx/xrt";
             };
           };

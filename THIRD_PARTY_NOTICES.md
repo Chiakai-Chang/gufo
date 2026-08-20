@@ -13,6 +13,9 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 | --- | --- | --- | --- | --- |
 | **XRT** | Linked | `Apache-2.0` | `8661761775a266b11992a3bd6eb08209d88aa845` | [Xilinx/XRT](https://github.com/Xilinx/XRT) |
 | **xdna-driver** | Linked / Loaded | `Apache-2.0` | `4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305` | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
+| **MLIR-AIE** | Build toolchain | `Apache-2.0 WITH LLVM-exception` | `1.4.1` | [Xilinx/mlir-aie](https://github.com/Xilinx/mlir-aie) |
+| **LLVM-AIE** | Build toolchain | `Apache-2.0 WITH LLVM-exception` | `21.0.0.2026080301+c9c5ecb7` | [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie) |
+| **AIEBU** | Build toolchain | `MIT` | `27a302c5840773e79c79f0f2fc8a1832d6ab1774` | [Xilinx/aiebu](https://github.com/Xilinx/aiebu) |
 | **ROCm / HIP** | Linked / Toolchain | `MIT OR Apache-2.0 WITH LLVM-exception` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/clr](https://github.com/ROCm/clr) |
 | **hipBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLAS](https://github.com/ROCm/hipBLAS) |
 | **hipBLASLt** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLASLt](https://github.com/ROCm/hipBLASLt) |
@@ -141,6 +144,31 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Copyright / Notice Source**: Copyright (C) 1996, 1997, 1998 Theodore Ts'o.
 - **Relationship**: Linked (Dynamic runtime library dependency required by XRT and strix)
 - **Corresponding-Source Location**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git
+
+### 1.11 MLIR-AIE / IRON
+
+- **Pinned Version**: `1.4.1`
+- **Component Used**: Ahead-of-time NPU2 program and DMA generation
+- **SPDX License Identifier**: `Apache-2.0 WITH LLVM-exception`
+- **Relationship**: Build-only toolchain; generated reviewed artifacts are packaged
+- **Corresponding-Source Location**: https://github.com/Xilinx/mlir-aie/tree/v1.4.1
+
+### 1.12 LLVM-AIE / Peano
+
+- **Pinned Version**: `21.0.0.2026080301+c9c5ecb7`
+- **Component Used**: AIE2P core compiler distributed as a pinned release wheel
+- **SPDX License Identifier**: `Apache-2.0 WITH LLVM-exception`
+- **Relationship**: Build-only toolchain
+- **Corresponding-Source Location**: https://github.com/Xilinx/llvm-aie
+
+### 1.13 AIEBU
+
+- **Pinned Revision**: `27a302c5840773e79c79f0f2fc8a1832d6ab1774`
+- **Component Used**: `aiebu-asm` control-code ELF assembler
+- **SPDX License Identifier**: `MIT`
+- **Copyright / Notice Source**: Copyright (C) 2022 Xilinx, Inc.; 2022-2024 Advanced Micro Devices, Inc.
+- **Relationship**: Build-only toolchain
+- **Corresponding-Source Location**: https://github.com/Xilinx/aiebu/tree/27a302c5840773e79c79f0f2fc8a1832d6ab1774
 
 ---
 

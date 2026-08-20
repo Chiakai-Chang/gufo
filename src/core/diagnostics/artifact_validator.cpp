@@ -56,6 +56,30 @@ std::uint64_t ExtractJsonUint64Field(std::string_view content,
   return std::strtoull(num_str.c_str(), nullptr, 10);
 }
 
+bool ExtractJsonBoolField(std::string_view content, std::string_view field_name,
+                          bool fallback) {
+  const std::string needle = "\"" + std::string(field_name) + "\"";
+  const auto pos = content.find(needle);
+  if (pos == std::string_view::npos) {
+    return fallback;
+  }
+  const auto colon_pos = content.find(':', pos + needle.size());
+  if (colon_pos == std::string_view::npos) {
+    return fallback;
+  }
+  const auto value_pos = content.find_first_not_of(" \t\r\n", colon_pos + 1);
+  if (value_pos == std::string_view::npos) {
+    return fallback;
+  }
+  if (content.substr(value_pos, 4) == "true") {
+    return true;
+  }
+  if (content.substr(value_pos, 5) == "false") {
+    return false;
+  }
+  return fallback;
+}
+
 std::string EscapeJsonString(std::string_view str) {
   std::ostringstream oss;
   for (const char character : str) {
@@ -167,6 +191,35 @@ ValidationResult ValidateArtifactContent(std::string_view content) {
     res.is_valid = false;
     res.errors.emplace_back("Incompatible NPU architecture: " + npu_arch +
                             " (expected XDNA2 or AIE2P)");
+  }
+
+  const std::string artifact_type =
+      ExtractJsonStringField(content, "artifactType");
+  if (artifact_type == "xrtSmoke") {
+    const std::string program_hash =
+        ExtractJsonStringField(content, "programSha256");
+    if (program_hash.size() != 64) {
+      res.is_valid = false;
+      res.errors.emplace_back(
+          "Invalid XRT smoke programSha256: expected 64-char SHA-256");
+    }
+    const auto iterations = ExtractJsonUint64Field(content, "iterations");
+    const auto completed =
+        ExtractJsonUint64Field(content, "completedIterations");
+    if (iterations == 0 || completed != iterations) {
+      res.is_valid = false;
+      res.errors.emplace_back(
+          "XRT smoke did not complete every requested iteration");
+    }
+    if (ExtractJsonStringField(content, "status") != "completed" ||
+        ExtractJsonStringField(content, "completionStatus") != "completed") {
+      res.is_valid = false;
+      res.errors.emplace_back("XRT smoke completion status is not successful");
+    }
+    if (ExtractJsonBoolField(content, "quarantined", true)) {
+      res.is_valid = false;
+      res.errors.emplace_back("XRT smoke context was quarantined");
+    }
   }
 
   // 5. Redaction and sensitive field checks

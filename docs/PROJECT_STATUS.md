@@ -1,24 +1,13 @@
 # Project Status and Decisions
 
-Status: active planning and offline quantization research, 2026-08-17
+Status: active implementation, 2026-08-20
 
 ## Current Implementation Boundary
 
-The native C++ program is currently a Strix Halo hardware probe. It discovers
-HIP and XRT devices and validates a small HIP allocation; it does not yet load
-a model or perform inference.
-
-The implemented inference-related work is the offline Python toolchain under
-`tools/`:
-
-- Safetensors inspection and source manifests.
-- SHQ4-T16, SHQ6-T16, and SHQ8-T16 quantization/dequantization.
-- Importance-matrix calibration and mixed-precision recipe experiments.
-- Teacher-logit capture and candidate quality comparison.
-- Qwen3.5-0.8B quantization benchmarks.
-
-The server, native model loader, tokenizer, CPU oracle, GPU/NPU numerical
-kernels, KV cache, scheduler, and OpenAI-compatible API remain design work.
+The native runtime loads Qwen3.8 GGUF artifacts, executes prefill and decode on
+gfx1151, and serves the OpenAI-compatible HTTP path with request-owned state.
+XDNA2 currently has a reproducible XRT/AIE smoke program; model-private NPU
+MTP execution is the active implementation boundary.
 
 ## Product Decisions
 
