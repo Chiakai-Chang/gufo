@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -181,6 +182,238 @@ bool ValidatePrefill(hip::QwenGpuExecutor& executor,
 
   return comparison.finite && comparison.top1_match &&
          sequential_token == batched_token;
+}
+
+bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "deepseek4";
+}
+
+std::vector<int> MakeDeepSeekBenchmarkTokens(
+    const models::deepseek_v4_flash::Model& model, std::size_t count) {
+  const auto pattern = model.Tokenize(
+      "The quick brown fox jumps over the lazy dog. "
+      "Strix Halo executes this deterministic benchmark sequence. ");
+  if (pattern.empty()) {
+    throw std::runtime_error("DeepSeek benchmark token pattern is empty");
+  }
+  std::vector<int> tokens(count);
+  for (std::size_t index = 0; index < count; ++index) {
+    tokens[index] = pattern[index % pattern.size()];
+  }
+  return tokens;
+}
+
+int RunDeepSeekBenchmark(
+    const BenchOptions& options,
+    const std::shared_ptr<const core::GgufReader>& reader,
+    std::chrono::steady_clock::time_point model_load_start) {
+  int device_count = 0;
+  if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
+    std::cerr << "Error: no HIP GPU is available for DeepSeek V4 Flash\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(options.n_depths);
+  const std::size_t max_test_tokens =
+      std::max(max_or_zero(options.n_prompts), max_or_zero(options.n_gens));
+  const std::size_t required_context =
+      std::max<std::size_t>(4096, max_depth + max_test_tokens + 1);
+  if (required_context > std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: requested DeepSeek benchmark context is too large\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  if (options.validate_prefill_tokens != 0) {
+    std::cerr << "Error: DeepSeek prefill oracle validation is not available "
+                 "through --validate-prefill\n";
+    return 1;
+  }
+  if (!options.speculative_backend.empty()) {
+    std::cerr << "Error: DeepSeek speculative benchmark modes are not yet "
+                 "implemented\n";
+    return 1;
+  }
+
+  std::string error;
+  auto model = models::deepseek_v4_flash::Model::Load(
+      options.model_path,
+      models::deepseek_v4_flash::ModelOptions{
+          .max_context = static_cast<std::uint32_t>(required_context),
+          .prefill_chunk = 2048,
+          .power_percent = 100,
+          .warm_weights = false,
+      },
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating DeepSeek V4 Flash model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+
+  const auto tokens = MakeDeepSeekBenchmarkTokens(*model, required_context);
+  const double size_gib =
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
+  const auto model_name = model->ModelName();
+
+  std::cout << "| " << std::left << std::setw(32) << "model"
+            << " | " << std::right << std::setw(10) << "size"
+            << " | " << std::left << std::setw(10) << "backend"
+            << " | " << std::right << std::setw(18) << "test"
+            << " | " << std::right << std::setw(21) << "t/s"
+            << " |\n"
+            << "| " << std::string(32, '-') << " | " << std::string(10, '-')
+            << " | " << std::string(10, '-') << " | " << std::string(18, '-')
+            << " | " << std::string(21, '-') << " |\n";
+
+  std::ostringstream size_text;
+  size_text << std::fixed << std::setprecision(2) << size_gib << " GiB";
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
+    std::ostringstream throughput;
+    throughput << std::fixed << std::setprecision(2) << stats.mean << " ± "
+               << stats.stddev;
+    std::cout << "| " << std::left << std::setw(32) << model_name << " | "
+              << std::right << std::setw(10) << size_text.str() << " | "
+              << std::left << std::setw(10) << "ROCm (HIP)"
+              << " | " << std::right << std::setw(18) << test_name << " | "
+              << std::right << std::setw(21) << throughput.str() << " |\n"
+              << std::flush;
+  };
+
+  std::unique_ptr<models::deepseek_v4_flash::Session> prepared_session;
+  std::size_t prepared_depth = 0;
+  for (const std::size_t depth : options.n_depths) {
+    std::unique_ptr<models::deepseek_v4_flash::SessionSnapshot> snapshot;
+    if (depth > 0) {
+      if (prepared_session == nullptr || depth < prepared_depth) {
+        prepared_session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
+        prepared_depth = 0;
+      }
+      if (prepared_session == nullptr ||
+          !prepared_session->Sync(std::span(tokens.data(), depth), &error)) {
+        std::cerr << "Error preparing DeepSeek depth " << depth << ": " << error
+                  << '\n';
+        return 1;
+      }
+      prepared_depth = depth;
+      snapshot = prepared_session->SaveSnapshot(&error);
+      if (snapshot == nullptr) {
+        std::cerr << "Error snapshotting DeepSeek depth " << depth << ": "
+                  << error << '\n';
+        return 1;
+      }
+      if (options.verbose) {
+        std::cerr << "Prepared DeepSeek depth " << depth
+                  << " snapshot_bytes=" << snapshot->SizeBytes() << '\n';
+      }
+    }
+
+    for (const std::size_t prompt_length : options.n_prompts) {
+      if (depth + prompt_length >= required_context) {
+        std::cerr << "Error: DeepSeek prompt benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      runs.reserve(options.repetitions);
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        std::unique_ptr<models::deepseek_v4_flash::Session> local_session;
+        models::deepseek_v4_flash::Session* session = prepared_session.get();
+        if (depth == 0) {
+          local_session = model->CreateSession(
+              static_cast<std::uint32_t>(required_context), &error);
+          session = local_session.get();
+        } else if (!prepared_session->RestoreSnapshot(*snapshot, &error)) {
+          std::cerr << "Error restoring DeepSeek depth: " << error << '\n';
+          return 1;
+        }
+        if (session == nullptr) {
+          std::cerr << "Error creating DeepSeek session: " << error << '\n';
+          return 1;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Sync(std::span(tokens.data(), depth + prompt_length),
+                           &error)) {
+          std::cerr << "Error running DeepSeek prefill: " << error << '\n';
+          return 1;
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        runs.push_back(static_cast<double>(prompt_length) / seconds);
+        if (options.verbose) {
+          std::cerr << "DeepSeek pp depth=" << depth
+                    << " payload_bytes=" << session->PayloadBytes() << '\n';
+        }
+      }
+      print_result(MakeTestName("pp", prompt_length, depth),
+                   ComputeStats(runs));
+    }
+
+    for (const std::size_t generation_length : options.n_gens) {
+      const std::size_t prefix_length = depth > 0 ? depth : 16;
+      if (prefix_length + generation_length >= required_context) {
+        std::cerr << "Error: DeepSeek generation benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      runs.reserve(options.repetitions);
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        std::unique_ptr<models::deepseek_v4_flash::Session> local_session;
+        models::deepseek_v4_flash::Session* session = prepared_session.get();
+        if (depth == 0) {
+          local_session = model->CreateSession(
+              static_cast<std::uint32_t>(required_context), &error);
+          session = local_session.get();
+          if (session != nullptr &&
+              !session->Sync(std::span(tokens.data(), prefix_length), &error)) {
+            session = nullptr;
+          }
+        } else if (!prepared_session->RestoreSnapshot(*snapshot, &error)) {
+          session = nullptr;
+        }
+        if (session == nullptr) {
+          std::cerr << "Error preparing DeepSeek generation: " << error << '\n';
+          return 1;
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t step = 0; step < generation_length; ++step) {
+          const int token = session->SelectNextExcluding(model->EosToken());
+          if (token < 0 || !session->Evaluate(token, &error)) {
+            std::cerr << "Error running DeepSeek decode: " << error << '\n';
+            return 1;
+          }
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        runs.push_back(static_cast<double>(generation_length) / seconds);
+        if (options.verbose) {
+          std::cerr << "DeepSeek tg depth=" << depth
+                    << " payload_bytes=" << session->PayloadBytes() << '\n';
+        }
+      }
+      print_result(MakeTestName("tg", generation_length, depth),
+                   ComputeStats(runs));
+    }
+
+    if (depth > 0 && !prepared_session->RestoreSnapshot(*snapshot, &error)) {
+      std::cerr << "Error restoring final DeepSeek depth: " << error << '\n';
+      return 1;
+    }
+  }
+
+  std::cout << '\n';
+  return 0;
 }
 #endif
 
@@ -402,6 +635,10 @@ int RunBench(std::span<const char* const> args) {
       std::move(reader_owner));
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (IsDeepSeekV4Flash(*reader)) {
+    return RunDeepSeekBenchmark(opt, reader, model_load_start);
+  }
+
   int device_count = 0;
   if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
     std::cerr << "Error: No HIP GPU devices available for benchmarking.\n";

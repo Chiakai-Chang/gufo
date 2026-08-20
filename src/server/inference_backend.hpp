@@ -16,6 +16,10 @@ namespace strix::hip {
 class QwenGpuModel;
 }
 
+namespace strix::models::deepseek_v4_flash {
+class Model;
+}
+
 namespace strix::server {
 
 /// Thread-safe HTTP inference facade over shared immutable GPU model resources
@@ -50,6 +54,11 @@ public:
   /// Installs a previously loaded model without duplicating mapped weights.
   bool load(std::shared_ptr<const hip::QwenGpuModel> model, std::string* error,
             std::uint32_t max_context = 4096, std::size_t session_count = 1);
+
+  /// Installs a previously loaded DeepSeek model with request-owned sessions.
+  bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,
+            std::string* error, std::uint32_t max_context = 4096,
+            std::size_t session_count = 1);
 #endif
 
   /// Stable model identifier used in API responses.

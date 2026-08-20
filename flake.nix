@@ -72,6 +72,9 @@
             ];
             env = {
               ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";
+              STRIX_HIPCUB_ROOT = "${pkgs.${system}.rocmPackages.hipcub}";
+              STRIX_ROCPRIM_ROOT = "${pkgs.${system}.rocmPackages.rocprim}";
+              STRIX_ROCWMMA_ROOT = "${pkgs.${system}.rocmPackages.rocwmma}";
               STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
                 "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
               STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT =
@@ -187,7 +190,11 @@
             src = formatSource;
           } ''
             cd "$src"
-            find src tests -not -path "*/fixtures/*" \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) -exec clang-format --dry-run --Werror {} +
+            find src tests \
+              -not -path "*/fixtures/*" \
+              -not -path "*/vendor/*" \
+              \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) \
+              -exec clang-format --dry-run --Werror {} +
             mkdir -p $out
             echo "PASS: Formatting check clean" > $out/result.txt
           '';

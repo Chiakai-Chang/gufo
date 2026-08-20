@@ -59,6 +59,9 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.clr
     rocmPackages.hipblas
     rocmPackages.hipblaslt
+    rocmPackages.hipcub
+    rocmPackages.rocprim
+    rocmPackages.rocwmma
     rocmPackages.rocblas
     rocmPackages.composable_kernel
     rocmPackages.rocprofiler-sdk
@@ -80,6 +83,9 @@ stdenv.mkDerivation (finalAttrs: {
   ++ lib.optional rocmSupport "-DENGINE_ENABLE_HIP=ON"
   ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
   ++ lib.optional rocmSupport "-DGPU_TARGETS=${lib.concatStringsSep ";" rocmGpuTargets}"
+  ++ lib.optional rocmSupport "-DHIPCUB_INCLUDE_DIR=${rocmPackages.hipcub}/include"
+  ++ lib.optional rocmSupport "-DROCPRIM_INCLUDE_DIR=${rocmPackages.rocprim}/include"
+  ++ lib.optional rocmSupport "-DROCWMMA_INCLUDE_DIR=${rocmPackages.rocwmma}/include"
   ++ lib.optional xrtSupport "-DENGINE_ENABLE_XRT=ON"
   ++ lib.optional xrtSupport "-DSTRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/qwen-mtp-eh-proj"
   ++ lib.optional xrtSupport "-DSTRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/qwen-mtp-rmsnorm"
@@ -87,6 +93,9 @@ stdenv.mkDerivation (finalAttrs: {
 
   env = lib.optionalAttrs rocmSupport {
     ROCM_PATH = "${rocmPackages.clr}";
+    STRIX_HIPCUB_ROOT = "${rocmPackages.hipcub}";
+    STRIX_ROCPRIM_ROOT = "${rocmPackages.rocprim}";
+    STRIX_ROCWMMA_ROOT = "${rocmPackages.rocwmma}";
   }
   // lib.optionalAttrs xrtSupport {
     STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT = "${aie-qwen-mtp-eh-proj}";

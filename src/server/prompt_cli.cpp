@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen_generator.hpp"
 #include "src/tokenization/qwen_chat_template.hpp"
 #include "src/tokenization/qwen_tokenizer.hpp"
@@ -73,6 +74,104 @@ void PrintChatHelp(std::string_view program_name) {
       << "  --system <PROMPT>       Custom system prompt\n"
       << "  -h, --help              Print help\n";
 }
+
+bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "deepseek4";
+}
+
+#if defined(ENGINE_ENABLE_HIP)
+int RunDeepSeekPrompt(const PromptOptions& opt,
+                      std::chrono::steady_clock::time_point load_start) {
+  if (opt.force_cpu) {
+    std::cerr << "DeepSeek V4 Flash is supported only by the ROCm backend\n";
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  if (!opt.speculative_backend.empty()) {
+    std::cerr << "DeepSeek V4 Flash speculative decoding is not implemented\n";
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+
+  constexpr std::uint32_t kDefaultContext = 4096;
+  std::string error;
+  auto model = models::deepseek_v4_flash::Model::Load(
+      opt.model_path,
+      models::deepseek_v4_flash::ModelOptions{
+          .max_context = kDefaultContext,
+          .prefill_chunk = 2048,
+          .power_percent = 100,
+          .warm_weights = false,
+      },
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating DeepSeek V4 Flash model: " << error << '\n';
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(load_start);
+
+  const auto prompt_tokens =
+      opt.use_chat_template
+          ? model->EncodeChat(opt.system_prompt, opt.prompt_text)
+          : model->Tokenize(opt.prompt_text);
+  if (prompt_tokens.empty()) {
+    std::cerr << "DeepSeek V4 Flash prompt produced no tokens\n";
+    return 1;
+  }
+  if (prompt_tokens.size() + opt.max_tokens >= kDefaultContext) {
+    std::cerr << "DeepSeek V4 Flash prompt and output exceed the 4096-token "
+                 "CLI context\n";
+    return 1;
+  }
+
+  auto session = model->CreateSession(kDefaultContext, &error);
+  if (session == nullptr || !session->Sync(prompt_tokens, &error)) {
+    std::cerr << "DeepSeek V4 Flash prefill failed: " << error << '\n';
+    return 1;
+  }
+
+  if (opt.verbose) {
+    std::cout << "[Engine]: DeepSeek V4 Flash ROCm (gfx1151)\n"
+              << "Model: " << model->ModelName() << '\n'
+              << "Prompt tokens: " << prompt_tokens.size() << '\n'
+              << "Max tokens: " << opt.max_tokens << '\n'
+              << "--- Generation Output ---\n";
+  }
+
+  const auto generation_start = std::chrono::steady_clock::now();
+  std::uint64_t rng_state = 0x5354524958445334ULL;
+  std::size_t generated = 0;
+  for (; generated < opt.max_tokens; ++generated) {
+    const int token =
+        session->SelectNext(opt.temperature, &rng_state, 0, 1.0F, 0.05F);
+    if (token < 0) {
+      std::cerr << "\nDeepSeek V4 Flash token selection failed\n";
+      return 1;
+    }
+    if (model->IsStopToken(token)) {
+      break;
+    }
+    std::cout << model->DecodeToken(token) << std::flush;
+    if (generated + 1 < opt.max_tokens && !session->Evaluate(token, &error)) {
+      std::cerr << "\nDeepSeek V4 Flash decode failed: " << error << '\n';
+      return 1;
+    }
+  }
+  std::cout << '\n';
+
+  if (opt.verbose && generated > 0) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                      generation_start)
+            .count();
+    std::cout << "Generated " << generated << " tokens on ROCm in " << seconds
+              << "s (" << static_cast<double>(generated) / seconds
+              << " tok/s)\n";
+  }
+  return 0;
+}
+#endif
 
 }  // namespace
 
@@ -274,6 +373,18 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const strix::core::GgufReader> reader(
       std::move(reader_owner));
+
+#if defined(ENGINE_ENABLE_HIP)
+  if (IsDeepSeekV4Flash(*reader)) {
+    return RunDeepSeekPrompt(opt, model_load_start);
+  }
+#else
+  if (IsDeepSeekV4Flash(*reader)) {
+    std::cerr << "DeepSeek V4 Flash requires ENGINE_ENABLE_HIP=ON\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+#endif
 
   std::string rendered_prompt = opt.prompt_text;
   if (opt.use_chat_template) {

@@ -22,6 +22,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 | **rocBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocBLAS](https://github.com/ROCm/rocBLAS) |
 | **Composable Kernel** | Header / compiled kernels | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/composable_kernel](https://github.com/ROCm/composable_kernel) |
 | **ROCprofiler SDK / ROCTx** | Benchmark marker library / profiling tool | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocprofiler-sdk](https://github.com/ROCm/rocprofiler-sdk) |
+| **DS4** | Vendored model engine and ROCm kernels | `MIT` | `84cc882352757baf628a1776badf7cc54d584e28` | [antirez/ds4](https://github.com/antirez/ds4) |
 | **llama.cpp** | Source-derived algorithm | `MIT` | `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | **libuuid** | Linked | `BSD-3-Clause` / `LGPL-2.1-or-later` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [util-linux](https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git) |
 | **`amdxdna` Kernel Driver** | System (Kernel) | `GPL-2.0-only` | System Kernel (`amdxdna.ko`) | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
@@ -134,7 +135,24 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Source-derived algorithm; no llama.cpp runtime code or library is linked
 - **Corresponding-Source Location**: https://github.com/ggml-org/llama.cpp/tree/e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0/ggml/src/ggml-cuda
 
-### 1.10 libuuid (util-linux)
+### 1.10 DS4
+
+- **Component Name**: DS4
+- **Upstream URL**: https://github.com/antirez/ds4
+- **Pinned Revision**: Commit `84cc882352757baf628a1776badf7cc54d584e28`
+- **Component Used**: DeepSeek V4 Flash GGUF loader, tokenizer, request-session
+  graph, and ROCm numerical kernels
+- **SPDX License Identifier**: `MIT`
+- **Copyright / Notice Source**: Copyright (c) 2026 Salvatore Sanfilippo
+  and DS4 contributors; the upstream license is retained under
+  `src/models/deepseek_v4_flash/vendor/antirez/LICENSE`.
+- **Relationship**: Vendored and adapted into a model-private ROCm backend.
+  Strix does not import the upstream command-line interface, HTTP server,
+  agent, evaluator, or disk-cache frontend.
+- **Corresponding-Source Location**:
+  https://github.com/antirez/ds4/tree/84cc882352757baf628a1776badf7cc54d584e28
+
+### 1.11 libuuid (util-linux)
 
 - **Component Name**: libuuid (util-linux UUID library)
 - **Upstream URL**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git
@@ -145,7 +163,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Linked (Dynamic runtime library dependency required by XRT and strix)
 - **Corresponding-Source Location**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git
 
-### 1.11 MLIR-AIE / IRON
+### 1.12 MLIR-AIE / IRON
 
 - **Pinned Version**: `1.4.1`
 - **Component Used**: Ahead-of-time NPU2 program and DMA generation
@@ -153,7 +171,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Build-only toolchain; generated reviewed artifacts are packaged
 - **Corresponding-Source Location**: https://github.com/Xilinx/mlir-aie/tree/v1.4.1
 
-### 1.12 LLVM-AIE / Peano
+### 1.13 LLVM-AIE / Peano
 
 - **Pinned Version**: `21.0.0.2026080301+c9c5ecb7`
 - **Component Used**: AIE2P core compiler distributed as a pinned release wheel
@@ -161,7 +179,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Build-only toolchain
 - **Corresponding-Source Location**: https://github.com/Xilinx/llvm-aie
 
-### 1.13 AIEBU
+### 1.14 AIEBU
 
 - **Pinned Revision**: `27a302c5840773e79c79f0f2fc8a1832d6ab1774`
 - **Component Used**: `aiebu-asm` control-code ELF assembler

@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
-project(strix LANGUAGES CXX)
+project(strix LANGUAGES C CXX)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -35,12 +38,61 @@ if (ENGINE_ENABLE_HIP)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
   find_package(rocblas REQUIRED)
+  find_package(Threads REQUIRED)
+  find_path(HIPCUB_INCLUDE_DIR hipcub/hipcub.hpp
+    HINTS "$ENV{STRIX_HIPCUB_ROOT}/include"
+    REQUIRED)
+  find_path(ROCPRIM_INCLUDE_DIR rocprim/rocprim.hpp
+    HINTS "$ENV{STRIX_ROCPRIM_ROOT}/include"
+    REQUIRED)
+  find_path(ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
+    HINTS "$ENV{STRIX_ROCWMMA_ROOT}/include"
+    REQUIRED)
   find_path(ROCTX_INCLUDE_DIR rocprofiler-sdk-roctx/roctx.h REQUIRED)
   find_library(ROCTX_LIBRARY NAMES rocprofiler-sdk-roctx REQUIRED)
   find_path(COMPOSABLE_KERNEL_INCLUDE_DIR ck/ck.hpp REQUIRED)
 
   message(STATUS "strix: ROCm/HIP enabled, architectures=${CMAKE_HIP_ARCHITECTURES}")
   message(STATUS "strix: ROCM_PATH=$ENV{ROCM_PATH}")
+endif()
+
+if (ENGINE_ENABLE_HIP)
+  set(DEEPSEEK_V4_FLASH_VENDOR_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/models/deepseek_v4_flash/vendor/antirez")
+  add_library(strix_deepseek_v4_flash STATIC
+    src/models/deepseek_v4_flash/engine.cpp
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4.c
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_distributed.c
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_tp.c
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_ssd.c
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_layer_pack.c
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm.hip.cpp
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm_compat.cpp
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm_unavailable.cpp)
+  set_source_files_properties(
+    ${DEEPSEEK_V4_FLASH_VENDOR_DIR}/ds4_rocm.hip.cpp
+    PROPERTIES LANGUAGE HIP)
+  target_compile_definitions(strix_deepseek_v4_flash PRIVATE
+    _GNU_SOURCE
+    DS4_ROCM_BUILD=1)
+  target_compile_options(strix_deepseek_v4_flash PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:-O3;-ffast-math;-fno-finite-math-only>
+    $<$<COMPILE_LANGUAGE:CXX>:-O3;-ffast-math;-fno-finite-math-only>
+    $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument>)
+  target_include_directories(strix_deepseek_v4_flash
+    PUBLIC
+      ${CMAKE_CURRENT_SOURCE_DIR}
+    SYSTEM PUBLIC
+      ${DEEPSEEK_V4_FLASH_VENDOR_DIR}
+      ${HIPCUB_INCLUDE_DIR}
+      ${ROCPRIM_INCLUDE_DIR}
+      ${ROCWMMA_INCLUDE_DIR})
+  target_link_libraries(strix_deepseek_v4_flash PUBLIC
+    hip::host
+    roc::hipblas
+    roc::hipblaslt
+    Threads::Threads
+    ${CMAKE_DL_LIBS})
 endif()
 
 # XRT NPU shim — AMD XDNA2 userspace runtime over the amdxdna kernel driver.
@@ -248,6 +300,11 @@ add_executable(strix-bench
 )
 target_link_libraries(strix-bench PRIVATE strix_diagnostics strix_core)
 
+if (ENGINE_ENABLE_HIP)
+  target_link_libraries(strix-server PRIVATE strix_deepseek_v4_flash)
+  target_link_libraries(strix-bench PRIVATE strix_deepseek_v4_flash)
+endif()
+
 add_library(strix_kernel_bench_support STATIC
   src/bench/kernel_bench.cpp
 )
@@ -310,6 +367,9 @@ if (BUILD_TESTING)
     src/server/prompt_cli.cpp
   )
   target_link_libraries(prompt_cli_test PRIVATE strix_core)
+  if (ENGINE_ENABLE_HIP)
+    target_link_libraries(prompt_cli_test PRIVATE strix_deepseek_v4_flash)
+  endif()
 
   add_test(NAME prompt_cli_test COMMAND prompt_cli_test)
   set_tests_properties(prompt_cli_test PROPERTIES LABELS "cpu;server;cli")
@@ -319,6 +379,9 @@ if (BUILD_TESTING)
     src/server/bench_cli.cpp
   )
   target_link_libraries(bench_cli_test PRIVATE strix_core)
+  if (ENGINE_ENABLE_HIP)
+    target_link_libraries(bench_cli_test PRIVATE strix_deepseek_v4_flash)
+  endif()
 
   add_test(NAME bench_cli_test COMMAND bench_cli_test)
   set_tests_properties(bench_cli_test PROPERTIES LABELS "cpu;server;cli")
@@ -463,6 +526,16 @@ if (BUILD_TESTING)
     LABELS "cpu;hipblaslt;cache")
 
   if (ENGINE_ENABLE_HIP)
+    add_executable(deepseek_v4_flash_engine_test
+      tests/models/deepseek_v4_flash_engine_test.cpp)
+    target_link_libraries(deepseek_v4_flash_engine_test PRIVATE
+      strix_deepseek_v4_flash)
+    add_test(NAME deepseek_v4_flash_engine_test
+      COMMAND deepseek_v4_flash_engine_test)
+    set_tests_properties(deepseek_v4_flash_engine_test PROPERTIES
+      LABELS "gpu;hip;gfx1151;deepseek-v4-flash;external-model"
+      SKIP_RETURN_CODE 77)
+
     add_executable(qwen_mtp_gpu_test
       tests/kernels/qwen_mtp_gpu_test.cpp)
     target_link_libraries(qwen_mtp_gpu_test PRIVATE strix_core)
@@ -496,10 +569,21 @@ if (BUILD_TESTING)
       tests/server/inference_backend_gpu_test.cpp
       src/server/inference_backend.cpp)
     target_link_libraries(inference_backend_gpu_test PRIVATE
-      strix_core hip::host)
+      strix_core strix_deepseek_v4_flash hip::host)
     add_test(NAME inference_backend_gpu_test COMMAND inference_backend_gpu_test)
     set_tests_properties(inference_backend_gpu_test PROPERTIES
       LABELS "hip;gpu;server;correctness"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(deepseek_v4_flash_backend_test
+      tests/server/deepseek_v4_flash_backend_test.cpp
+      src/server/inference_backend.cpp)
+    target_link_libraries(deepseek_v4_flash_backend_test PRIVATE
+      strix_core strix_deepseek_v4_flash hip::host)
+    add_test(NAME deepseek_v4_flash_backend_test
+      COMMAND deepseek_v4_flash_backend_test)
+    set_tests_properties(deepseek_v4_flash_backend_test PROPERTIES
+      LABELS "hip;gpu;server;correctness;deepseek-v4-flash;external-model"
       SKIP_RETURN_CODE 77)
 
     add_executable(gfx1151_acceptance_test tests/benchmarks/gfx1151_acceptance_test.cpp)
