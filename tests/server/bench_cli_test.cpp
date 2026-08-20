@@ -41,6 +41,17 @@ void TestDepthOptions() {
   Expect(options->repetitions == 1, "repetition count parsed");
 }
 
+void TestHybridMtpOptions() {
+  const std::array<const char*, 8> args = {
+      "--speculative",  "mtp-npu", "--mtp-model", "mtp.gguf",
+      "--draft-tokens", "2",       "--n-gen",     "128"};
+  const auto options = strix::server::ParseBenchOptions(args);
+  Expect(options.has_value(), "hybrid MTP options parse");
+  Expect(options->speculative_backend == "mtp-npu", "hybrid MTP mode parsed");
+  Expect(options->mtp_model_path == "mtp.gguf", "MTP model path parsed");
+  Expect(options->draft_tokens == 2, "draft token count parsed");
+}
+
 void TestInvalidDepth() {
   std::string error;
   const std::array<const char*, 2> args = {"--n-depth", "invalid"};
@@ -54,6 +65,7 @@ void TestInvalidDepth() {
 int main() {
   TestDefaultOptions();
   TestDepthOptions();
+  TestHybridMtpOptions();
   TestInvalidDepth();
   std::cout << "All benchmark CLI tests passed.\n";
   return 0;

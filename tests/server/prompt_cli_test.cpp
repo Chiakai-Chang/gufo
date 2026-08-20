@@ -31,6 +31,17 @@ void TestExplicitFlags() {
   assert(opt->prompt_text == "Test prompt");
 }
 
+void TestHybridMtpFlags() {
+  const std::array<const char*, 7> args = {
+      "--speculative",  "mtp-npu", "--mtp-model", "mtp.gguf",
+      "--draft-tokens", "2",       "Prompt"};
+  const auto opt = strix::server::ParsePromptOptions(args);
+  assert(opt.has_value());
+  assert(opt->speculative_backend == "mtp-npu");
+  assert(opt->mtp_model_path == "mtp.gguf");
+  assert(opt->draft_tokens == 2);
+}
+
 void TestInvalidFlags() {
   std::string err;
   const std::array<const char*, 1> args1 = {"--model"};
@@ -47,6 +58,7 @@ void TestInvalidFlags() {
 int main() {
   TestDefaultOptions();
   TestExplicitFlags();
+  TestHybridMtpFlags();
   TestInvalidFlags();
   std::cout << "All prompt CLI tests passed.\n";
   return 0;

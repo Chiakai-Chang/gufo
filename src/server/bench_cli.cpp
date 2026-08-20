@@ -66,8 +66,8 @@ void PrintBenchHelp(std::string_view program_name) {
                "(default: 1)\n"
             << "  --validate-prefill <N>      Compare batched logits against "
                "sequential prefill\n"
-            << "  --speculative <MODE>        Draft backend: mtp, npu, pld, or "
-               "self\n"
+            << "  --speculative <MODE>        Draft backend: mtp, mtp-npu, "
+               "npu, pld, or self\n"
             << "  --mtp-model <PATH>          Quantized Qwen MTP GGUF\n"
             << "  --draft-tokens <N>          Maximum speculative block "
                "length\n"
@@ -449,7 +449,8 @@ int RunBench(std::span<const char* const> args) {
 
   const auto& config = gpu_exec->GetConfig();
   std::shared_ptr<const hip::QwenMtpGpuModel> mtp_gpu_model;
-  if (opt.speculative_backend == "mtp") {
+  if (opt.speculative_backend == "mtp" ||
+      opt.speculative_backend == "mtp-npu") {
     std::string mtp_path = opt.mtp_model_path;
     if (mtp_path.empty()) {
       if (const char* environment = std::getenv("STRIX_MTP_MODEL");
@@ -516,6 +517,8 @@ int RunBench(std::span<const char* const> args) {
   ss_size << std::fixed << std::setprecision(2) << model_size_gib << " GiB";
   ss_params << std::fixed << std::setprecision(2) << model_params_b << " B";
 
+  const std::string_view backend_name =
+      opt.speculative_backend == "mtp-npu" ? "HIP+XDNA2" : "ROCm (HIP)";
   const auto print_result = [&](std::string_view test_name,
                                 const BenchStats& stats) {
     std::ostringstream ss_ts;
@@ -525,10 +528,10 @@ int RunBench(std::span<const char* const> args) {
     std::cout << "| " << std::left << std::setw(30) << model_name << " | "
               << std::right << std::setw(10) << ss_size.str() << " | "
               << std::right << std::setw(10) << ss_params.str() << " | "
-              << std::left << std::setw(10) << "ROCm (HIP)"
-              << " | " << std::right << std::setw(3) << opt.n_gpu_layers
-              << " | " << std::right << std::setw(15) << test_name << " | "
-              << std::right << std::setw(21) << ss_ts.str() << " |\n"
+              << std::left << std::setw(10) << backend_name << " | "
+              << std::right << std::setw(3) << opt.n_gpu_layers << " | "
+              << std::right << std::setw(15) << test_name << " | " << std::right
+              << std::setw(21) << ss_ts.str() << " |\n"
               << std::flush;
   };
 
@@ -643,20 +646,33 @@ int RunBench(std::span<const char* const> args) {
       runs.reserve(opt.repetitions);
       std::vector<double> acceptance_runs;
       acceptance_runs.reserve(opt.repetitions);
+      std::vector<double> hybrid_gpu_to_host_runs;
+      std::vector<double> hybrid_activation_pack_runs;
+      std::vector<double> hybrid_command_runs;
+      std::vector<double> hybrid_end_to_end_runs;
+      std::vector<double> hybrid_host_to_gpu_runs;
       for (std::size_t r = 0; r < opt.repetitions; ++r) {
         restore_depth();
 
         std::unique_ptr<speculative::IDraftBackend> draft_backend;
-        if (opt.speculative_backend == "mtp") {
+        hip::QwenMtpGpuDraftBackend* mtp_backend = nullptr;
+        if (opt.speculative_backend == "mtp" ||
+            opt.speculative_backend == "mtp-npu") {
           hip::QwenMtpGpuDraftConfig cfg{
               .max_context = static_cast<std::uint32_t>(required_context),
               .max_draft_tokens = opt.draft_tokens,
+              .execution_mode =
+                  opt.speculative_backend == "mtp-npu"
+                      ? hip::QwenMtpExecutionMode::kHybridNpuEhProj
+                      : hip::QwenMtpExecutionMode::kGpu,
           };
           draft_backend =
               hip::QwenMtpGpuDraftBackend::Create(mtp_gpu_model, cfg, &err);
           if (draft_backend == nullptr) {
-            throw std::runtime_error("GPU MTP initialization failed: " + err);
+            throw std::runtime_error("MTP initialization failed: " + err);
           }
+          mtp_backend =
+              static_cast<hip::QwenMtpGpuDraftBackend*>(draft_backend.get());
         } else if (opt.speculative_backend == "self") {
           speculative::SelfSpeculativeConfig cfg;
           cfg.total_layers = config.num_layers;
@@ -734,6 +750,20 @@ int RunBench(std::span<const char* const> args) {
             speculative_current_token = step_res.next_token;
           }
           acceptance_runs.push_back(spec_verifier->GetStats().AcceptanceRate());
+          if (mtp_backend != nullptr && opt.speculative_backend == "mtp-npu") {
+            const auto& metrics = mtp_backend->GetHybridMetrics();
+            if (metrics.projection_count > 0) {
+              const double count =
+                  static_cast<double>(metrics.projection_count);
+              hybrid_gpu_to_host_runs.push_back(metrics.gpu_to_host_us / count);
+              hybrid_activation_pack_runs.push_back(metrics.activation_pack_us /
+                                                    count);
+              hybrid_command_runs.push_back(metrics.npu_command_us / count);
+              hybrid_end_to_end_runs.push_back(metrics.npu_end_to_end_us /
+                                               count);
+              hybrid_host_to_gpu_runs.push_back(metrics.host_to_gpu_us / count);
+            }
+          }
         } else {
           for (std::size_t step = 0; step < g_len; ++step) {
             greedy_current_token = gpu_exec->ForwardToken(greedy_current_token,
@@ -761,6 +791,19 @@ int RunBench(std::span<const char* const> args) {
         std::cerr << test_name << " acceptance=" << std::fixed
                   << std::setprecision(3) << acceptance.mean << " +/- "
                   << acceptance.stddev << '\n';
+      }
+      if (opt.verbose && !hybrid_command_runs.empty()) {
+        const auto gpu_to_host = ComputeStats(hybrid_gpu_to_host_runs);
+        const auto activation_pack = ComputeStats(hybrid_activation_pack_runs);
+        const auto command = ComputeStats(hybrid_command_runs);
+        const auto npu_end_to_end = ComputeStats(hybrid_end_to_end_runs);
+        const auto host_to_gpu = ComputeStats(hybrid_host_to_gpu_runs);
+        std::cerr << test_name << " hybrid_us_per_projection: gpu_to_host="
+                  << gpu_to_host.mean
+                  << " activation_pack=" << activation_pack.mean
+                  << " npu_command=" << command.mean
+                  << " npu_end_to_end=" << npu_end_to_end.mean
+                  << " host_to_gpu=" << host_to_gpu.mean << '\n';
       }
     }
   }

@@ -15,8 +15,25 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
+#if defined(ENGINE_ENABLE_XRT)
+#include "src/core/xdna2/qwen_mtp_eh_proj.h"
+#endif
 
 namespace strix::hip {
+
+enum class QwenMtpExecutionMode : std::uint8_t {
+  kGpu,
+  kHybridNpuEhProj,
+};
+
+struct QwenMtpHybridMetrics {
+  std::uint64_t projection_count{0};
+  double gpu_to_host_us{0.0};
+  double activation_pack_us{0.0};
+  double npu_command_us{0.0};
+  double npu_end_to_end_us{0.0};
+  double host_to_gpu_us{0.0};
+};
 
 /// Immutable GPU-visible MTP layer weights. Current GGUF K-quant matrices are
 /// expanded once to BF16; the tied embedding and LM head remain shared with
@@ -47,17 +64,23 @@ public:
   [[nodiscard]] double GetPackTimeSeconds() const noexcept {
     return pack_time_seconds_;
   }
+  [[nodiscard]] const models::QwenTensorRef& GetRawFusionProjection()
+      const noexcept {
+    return raw_fusion_projection_;
+  }
 
 private:
   QwenMtpGpuModel(std::shared_ptr<const core::GgufReader> mtp_reader,
                   std::shared_ptr<const QwenGpuModel> target_model,
                   speculative::QwenMtpWeights weights,
+                  models::QwenTensorRef raw_fusion_projection,
                   std::vector<void*> allocations,
                   std::size_t packed_weight_bytes, double pack_time_seconds);
 
   std::shared_ptr<const core::GgufReader> mtp_reader_;
   std::shared_ptr<const QwenGpuModel> target_model_;
   speculative::QwenMtpWeights weights_;
+  models::QwenTensorRef raw_fusion_projection_;
   std::vector<void*> allocations_;
   std::size_t packed_weight_bytes_{0};
   double pack_time_seconds_{0.0};
@@ -75,7 +98,8 @@ public:
 
   [[nodiscard]] static std::unique_ptr<QwenMtpGpuExecutor> Create(
       std::shared_ptr<const QwenMtpGpuModel> model, std::uint32_t max_context,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr,
+      QwenMtpExecutionMode execution_mode = QwenMtpExecutionMode::kGpu);
 
   void Reset() noexcept;
   void Rewind(std::uint32_t position);
@@ -100,10 +124,18 @@ public:
   [[nodiscard]] std::size_t GetHiddenSize() const noexcept {
     return model_->GetConfig().hidden_size;
   }
+  [[nodiscard]] QwenMtpExecutionMode GetExecutionMode() const noexcept {
+    return execution_mode_;
+  }
+  [[nodiscard]] const QwenMtpHybridMetrics& GetHybridMetrics() const noexcept {
+    return hybrid_metrics_;
+  }
+  void ResetHybridMetrics() noexcept { hybrid_metrics_ = {}; }
 
 private:
   QwenMtpGpuExecutor(std::shared_ptr<const QwenMtpGpuModel> model,
-                     std::uint32_t max_context);
+                     std::uint32_t max_context,
+                     QwenMtpExecutionMode execution_mode);
 
   [[nodiscard]] tokenization::TokenId Run(tokenization::TokenId input_token,
                                           const float* hidden_input,
@@ -115,6 +147,8 @@ private:
   std::shared_ptr<const QwenMtpGpuModel> model_;
   std::uint32_t max_context_;
   std::uint32_t next_position_{0};
+  QwenMtpExecutionMode execution_mode_{QwenMtpExecutionMode::kGpu};
+  QwenMtpHybridMetrics hybrid_metrics_;
   hipStream_t stream_{nullptr};
 
   float* d_target_hidden_{nullptr};
@@ -140,11 +174,17 @@ private:
 
   std::vector<float> h_last_hidden_;
   std::vector<float> h_logits_;
+#if defined(ENGINE_ENABLE_XRT)
+  std::unique_ptr<xdna2::QwenMtpEhProjSession> npu_eh_proj_;
+  std::vector<float> h_npu_input_;
+  std::vector<float> h_npu_output_;
+#endif
 };
 
 struct QwenMtpGpuDraftConfig {
   std::uint32_t max_context{4096};
   std::uint32_t max_draft_tokens{4};
+  QwenMtpExecutionMode execution_mode{QwenMtpExecutionMode::kGpu};
 };
 
 /// Stateful MTP draft provider backed by the production HIP executor.
@@ -160,7 +200,9 @@ public:
       QwenMtpGpuDraftConfig config = {}, std::string* error_msg = nullptr);
 
   [[nodiscard]] std::string_view Name() const noexcept override {
-    return "QwenMtpGpuDraftBackend";
+    return config_.execution_mode == QwenMtpExecutionMode::kHybridNpuEhProj
+               ? "QwenMtpHybridNpuDraftBackend"
+               : "QwenMtpGpuDraftBackend";
   }
 
   [[nodiscard]] bool RequiresTargetHiddenStates() const noexcept override {
@@ -182,6 +224,9 @@ public:
 
   [[nodiscard]] const std::string& GetLastError() const noexcept {
     return last_error_;
+  }
+  [[nodiscard]] const QwenMtpHybridMetrics& GetHybridMetrics() const noexcept {
+    return executor_->GetHybridMetrics();
   }
 
 private:

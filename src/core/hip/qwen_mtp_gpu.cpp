@@ -15,6 +15,10 @@
 #include "src/core/hip/detail/qwen_attention_policy.hpp"
 #include "src/core/hip/qwen_gpu_ops.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#if defined(ENGINE_ENABLE_XRT)
+#include "src/core/diagnostics/system_inventory.h"
+#include "src/core/xdna2/device.h"
+#endif
 
 namespace strix::hip {
 namespace {
@@ -213,11 +217,13 @@ void AllocateBuffer(T*& pointer, std::size_t elements) {
 QwenMtpGpuModel::QwenMtpGpuModel(
     std::shared_ptr<const core::GgufReader> mtp_reader,
     std::shared_ptr<const QwenGpuModel> target_model,
-    speculative::QwenMtpWeights weights, std::vector<void*> allocations,
+    speculative::QwenMtpWeights weights,
+    models::QwenTensorRef raw_fusion_projection, std::vector<void*> allocations,
     std::size_t packed_weight_bytes, double pack_time_seconds)
     : mtp_reader_(std::move(mtp_reader)),
       target_model_(std::move(target_model)),
       weights_(std::move(weights)),
+      raw_fusion_projection_(raw_fusion_projection),
       allocations_(std::move(allocations)),
       packed_weight_bytes_(packed_weight_bytes),
       pack_time_seconds_(pack_time_seconds) {}
@@ -252,6 +258,7 @@ std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::Create(
 
   std::vector<void*> allocations;
   std::size_t packed_bytes = 0;
+  const auto raw_fusion_projection = weights->fusion_projection;
   const auto start = std::chrono::steady_clock::now();
   try {
     PackPrivateWeights(*weights, allocations, packed_bytes);
@@ -268,19 +275,50 @@ std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::Create(
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();
 
-  return std::shared_ptr<const QwenMtpGpuModel>(new QwenMtpGpuModel(
-      std::move(mtp_reader), std::move(target_model), std::move(*weights),
-      std::move(allocations), packed_bytes, pack_seconds));
+  return std::shared_ptr<const QwenMtpGpuModel>(
+      new QwenMtpGpuModel(std::move(mtp_reader), std::move(target_model),
+                          std::move(*weights), raw_fusion_projection,
+                          std::move(allocations), packed_bytes, pack_seconds));
 }
 
 QwenMtpGpuExecutor::QwenMtpGpuExecutor(
-    std::shared_ptr<const QwenMtpGpuModel> model, std::uint32_t max_context)
+    std::shared_ptr<const QwenMtpGpuModel> model, std::uint32_t max_context,
+    QwenMtpExecutionMode execution_mode)
     : model_(std::move(model)),
       max_context_(max_context),
+      execution_mode_(execution_mode),
       h_last_hidden_(model_->GetConfig().hidden_size),
-      h_logits_(model_->GetConfig().vocab_size) {
+      h_logits_(model_->GetConfig().vocab_size)
+#if defined(ENGINE_ENABLE_XRT)
+      ,
+      h_npu_input_(execution_mode == QwenMtpExecutionMode::kHybridNpuEhProj
+                       ? 2 * model_->GetConfig().hidden_size
+                       : 0),
+      h_npu_output_(execution_mode == QwenMtpExecutionMode::kHybridNpuEhProj
+                        ? model_->GetConfig().hidden_size
+                        : 0)
+#endif
+{
   try {
     Allocate();
+#if defined(ENGINE_ENABLE_XRT)
+    if (execution_mode_ == QwenMtpExecutionMode::kHybridNpuEhProj) {
+      const auto inventory = diagnostics::CollectSystemInventory();
+      const auto device = xdna2::DiscoverXrtDevice(0, inventory);
+      xdna2::QwenMtpEhProjFailure failure;
+      npu_eh_proj_ = xdna2::QwenMtpEhProjSession::Create(
+          {}, device, model_->GetRawFusionProjection(), &failure);
+      if (npu_eh_proj_ == nullptr) {
+        throw std::runtime_error("MTP NPU eh_proj initialization failed: " +
+                                 failure.category + ": " + failure.message);
+      }
+    }
+#else
+    if (execution_mode_ == QwenMtpExecutionMode::kHybridNpuEhProj) {
+      throw std::runtime_error(
+          "MTP NPU execution requested without ENGINE_ENABLE_XRT");
+    }
+#endif
     Reset();
   } catch (...) {
     Free();
@@ -297,7 +335,7 @@ QwenMtpGpuExecutor::~QwenMtpGpuExecutor() {
 
 std::unique_ptr<QwenMtpGpuExecutor> QwenMtpGpuExecutor::Create(
     std::shared_ptr<const QwenMtpGpuModel> model, std::uint32_t max_context,
-    std::string* error_msg) {
+    std::string* error_msg, QwenMtpExecutionMode execution_mode) {
   if (model == nullptr || max_context == 0 ||
       max_context > model->GetConfig().context_length) {
     if (error_msg != nullptr) {
@@ -307,7 +345,7 @@ std::unique_ptr<QwenMtpGpuExecutor> QwenMtpGpuExecutor::Create(
   }
   try {
     return std::unique_ptr<QwenMtpGpuExecutor>(
-        new QwenMtpGpuExecutor(std::move(model), max_context));
+        new QwenMtpGpuExecutor(std::move(model), max_context, execution_mode));
   } catch (const std::exception& exception) {
     if (error_msg != nullptr) {
       *error_msg = exception.what();
@@ -398,6 +436,7 @@ void QwenMtpGpuExecutor::Reset() noexcept {
   (void)hipMemsetAsync(d_kv_cache_f16_, 0, 2 * total_kv * sizeof(std::uint16_t),
                        stream_);
   next_position_ = 0;
+  hybrid_metrics_ = {};
 }
 
 void QwenMtpGpuExecutor::Rewind(std::uint32_t position) {
@@ -456,8 +495,50 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
   LaunchRMSNorm(hidden_input,
                 static_cast<const float*>(weights.hidden_norm.data),
                 d_fusion_ + hidden, hidden, 1.0e-6F, stream_);
-  LaunchGEMV(weights.fusion_projection.data, true, d_fusion_, d_hidden_, hidden,
-             2 * hidden, stream_);
+  if (execution_mode_ == QwenMtpExecutionMode::kHybridNpuEhProj) {
+#if defined(ENGINE_ENABLE_XRT)
+    const auto gpu_to_host_start = std::chrono::steady_clock::now();
+    const auto download_error = hipMemcpyAsync(
+        h_npu_input_.data(), d_fusion_, h_npu_input_.size() * sizeof(float),
+        hipMemcpyDeviceToHost, stream_);
+    const auto download_sync_error = hipStreamSynchronize(stream_);
+    if (download_error != hipSuccess || download_sync_error != hipSuccess) {
+      throw std::runtime_error("MTP GPU-to-NPU input copy failed");
+    }
+    const auto gpu_to_host_end = std::chrono::steady_clock::now();
+    xdna2::QwenMtpEhProjRunMetrics metrics;
+    xdna2::QwenMtpEhProjFailure failure;
+    if (!npu_eh_proj_->Run(h_npu_input_, h_npu_output_, &metrics, &failure)) {
+      throw std::runtime_error("MTP NPU eh_proj failed: " + failure.category +
+                               ": " + failure.message);
+    }
+    const auto host_to_gpu_start = std::chrono::steady_clock::now();
+    const auto upload_error = hipMemcpyAsync(
+        d_hidden_, h_npu_output_.data(), h_npu_output_.size() * sizeof(float),
+        hipMemcpyHostToDevice, stream_);
+    const auto upload_sync_error = hipStreamSynchronize(stream_);
+    if (upload_error != hipSuccess || upload_sync_error != hipSuccess) {
+      throw std::runtime_error("MTP NPU-to-GPU output copy failed");
+    }
+    const auto host_to_gpu_end = std::chrono::steady_clock::now();
+    ++hybrid_metrics_.projection_count;
+    hybrid_metrics_.gpu_to_host_us += std::chrono::duration<double, std::micro>(
+                                          gpu_to_host_end - gpu_to_host_start)
+                                          .count();
+    hybrid_metrics_.activation_pack_us += metrics.activation_pack_us;
+    hybrid_metrics_.npu_command_us += metrics.command_us;
+    hybrid_metrics_.npu_end_to_end_us += metrics.end_to_end_us;
+    hybrid_metrics_.host_to_gpu_us += std::chrono::duration<double, std::micro>(
+                                          host_to_gpu_end - host_to_gpu_start)
+                                          .count();
+#else
+    throw std::runtime_error(
+        "MTP NPU execution requested without ENGINE_ENABLE_XRT");
+#endif
+  } else {
+    LaunchGEMV(weights.fusion_projection.data, true, d_fusion_, d_hidden_,
+               hidden, 2 * hidden, stream_);
+  }
 
   LaunchRMSNorm(d_hidden_, static_cast<const float*>(layer.attn_norm.data),
                 d_normed_, hidden, 1.0e-6F, stream_);
@@ -547,8 +628,8 @@ std::unique_ptr<QwenMtpGpuDraftBackend> QwenMtpGpuDraftBackend::Create(
     }
     return nullptr;
   }
-  auto executor = QwenMtpGpuExecutor::Create(std::move(model),
-                                             config.max_context, error_msg);
+  auto executor = QwenMtpGpuExecutor::Create(
+      std::move(model), config.max_context, error_msg, config.execution_mode);
   if (executor == nullptr) {
     return nullptr;
   }
@@ -605,6 +686,7 @@ bool QwenMtpGpuDraftBackend::PrimeTargetContext(
     const auto final_hidden =
         context.prompt_hidden_states.subspan(final_offset, context.hidden_size);
     std::ranges::copy(final_hidden, target_hidden_.begin());
+    executor_->ResetHybridMetrics();
     primed_ = true;
     return true;
   } catch (const std::exception& exception) {

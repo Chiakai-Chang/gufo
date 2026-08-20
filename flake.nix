@@ -51,6 +51,8 @@
             rocmSupport = true;
             rocmGpuTargets = [ "gfx1151" ];
           };
+          aie-qwen-mtp-eh-proj =
+            strixPackages.${system}.aie-qwen-mtp-eh-proj;
           aie-qwen-mtp-rmsnorm =
             strixPackages.${system}.aie-qwen-mtp-rmsnorm;
           aie-smoke = strixPackages.${system}.aie-smoke;
@@ -70,6 +72,10 @@
             ];
             env = {
               ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";
+              STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
+                "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
+              STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT =
+                "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
               STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
                 "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
               STRIX_AIE_QWEN_MTP_RMSNORM_ROOT =
@@ -91,6 +97,10 @@
             env = {
               MLIR_AIE_INSTALL_DIR = "${strixPackages.${system}.mlir-aie}/${pkgs.${system}.python312.sitePackages}/mlir_aie";
               PEANO_INSTALL_DIR = "${strixPackages.${system}.llvm-aie}/${pkgs.${system}.python312.sitePackages}/llvm-aie";
+              STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
+                "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
+              STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT =
+                "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
               STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
                 "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
               STRIX_AIE_QWEN_MTP_RMSNORM_ROOT =

@@ -53,8 +53,9 @@ void PrintPromptHelp(std::string_view program_name) {
          "greedy)\n"
       << "  --system <PROMPT>       Custom system prompt\n"
       << "  --raw                   Disable chat template framing\n"
-      << "  --speculative <MODE>    Draft backend: mtp, npu, pld, or self\n"
-      << "  --mtp-model <PATH>      Quantized Qwen MTP GGUF for mtp mode\n"
+      << "  --speculative <MODE>    Draft backend: mtp, mtp-npu, npu, pld, "
+         "or self\n"
+      << "  --mtp-model <PATH>      Quantized Qwen MTP GGUF for mtp modes\n"
       << "  --draft-tokens <N>      Maximum speculative block length\n"
       << "  -v, --verbose           Print detailed timing and token metrics\n"
       << "  -h, --help              Print help\n";
@@ -336,7 +337,8 @@ int RunPrompt(std::span<const char* const> args) {
           cfg.max_draft_tokens = opt.draft_tokens;
           draft_backend =
               std::make_unique<speculative::PromptLookupDraftBackend>(cfg);
-        } else if (opt.speculative_backend == "mtp") {
+        } else if (opt.speculative_backend == "mtp" ||
+                   opt.speculative_backend == "mtp-npu") {
           std::string mtp_path = opt.mtp_model_path;
           if (mtp_path.empty()) {
             if (const char* environment = std::getenv("STRIX_MTP_MODEL");
@@ -347,11 +349,15 @@ int RunPrompt(std::span<const char* const> args) {
           hip::QwenMtpGpuDraftConfig cfg{
               .max_context = gpu_exec->GetMaxContext(),
               .max_draft_tokens = static_cast<std::uint32_t>(opt.draft_tokens),
+              .execution_mode =
+                  opt.speculative_backend == "mtp-npu"
+                      ? hip::QwenMtpExecutionMode::kHybridNpuEhProj
+                      : hip::QwenMtpExecutionMode::kGpu,
           };
           draft_backend = hip::QwenMtpGpuDraftBackend::CreateFromGguf(
               mtp_path, gpu_exec->GetSharedModel(), cfg, &err);
           if (draft_backend == nullptr) {
-            std::cerr << "Failed to initialize GPU MTP: " << err << '\n';
+            std::cerr << "Failed to initialize MTP backend: " << err << '\n';
             return 1;
           }
         } else if (opt.speculative_backend == "self") {

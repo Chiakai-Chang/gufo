@@ -82,9 +82,24 @@ if (ENGINE_ENABLE_XRT)
   endif()
   set(STRIX_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR
     "$ENV{STRIX_AIE_QWEN_MTP_RMSNORM_ROOT}/include")
+  if (DEFINED ENV{STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}
+      AND NOT "$ENV{STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}" STREQUAL "")
+    set(STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR
+      "$ENV{STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
+      CACHE PATH "Directory containing the reviewed Qwen MTP eh_proj artifacts"
+      FORCE)
+  else()
+    set(STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR
+      "${STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
+      CACHE PATH "Directory containing the reviewed Qwen MTP eh_proj artifacts")
+  endif()
+  set(STRIX_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR
+    "$ENV{STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT}/include")
   if (NOT STRIX_AIE_SMOKE_PROGRAM_DIR OR NOT STRIX_AIE_SMOKE_INCLUDE_DIR
       OR NOT STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
-      OR NOT STRIX_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR)
+      OR NOT STRIX_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR
+      OR NOT STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR
+      OR NOT STRIX_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR)
     message(FATAL_ERROR "XDNA2 program artifacts not found. Use the Nix development environment")
   endif()
   message(STATUS "strix: XRT NPU shim enabled, include=${XRT_INCLUDE_DIR}")
@@ -202,12 +217,15 @@ endif()
 
 if (ENGINE_ENABLE_XRT)
   target_sources(strix_core PRIVATE
+    src/core/xdna2/qwen_mtp_eh_proj.cpp
     src/core/xdna2/qwen_mtp_rmsnorm.cpp)
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_XRT=1)
   target_compile_definitions(strix_core PRIVATE
+    STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
     STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
   target_include_directories(strix_core SYSTEM PUBLIC
     ${XRT_INCLUDE_DIR}
+    ${STRIX_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR}
     ${STRIX_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR})
   target_link_libraries(strix_core PUBLIC
     strix_diagnostics
@@ -331,6 +349,17 @@ if (BUILD_TESTING)
     add_test(NAME qwen_mtp_rmsnorm_test COMMAND qwen_mtp_rmsnorm_test)
     set_tests_properties(qwen_mtp_rmsnorm_test PROPERTIES
       LABELS "npu;xdna2;xrt;xrt-hardware;qwen;mtp;rmsnorm")
+
+    add_executable(qwen_mtp_eh_proj_test
+      tests/device/qwen_mtp_eh_proj_test.cpp)
+    target_compile_definitions(qwen_mtp_eh_proj_test PRIVATE
+      STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}")
+    target_link_libraries(qwen_mtp_eh_proj_test PRIVATE
+      strix_core
+      strix_diagnostics)
+    add_test(NAME qwen_mtp_eh_proj_test COMMAND qwen_mtp_eh_proj_test)
+    set_tests_properties(qwen_mtp_eh_proj_test PROPERTIES
+      LABELS "npu;xdna2;xrt;xrt-hardware;qwen;mtp;gemv")
   endif()
 
   add_executable(gguf_reader_test tests/core/gguf_reader_test.cpp)

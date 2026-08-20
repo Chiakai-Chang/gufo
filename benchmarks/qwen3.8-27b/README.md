@@ -1,6 +1,6 @@
 # Qwen3.8-27B BF16 on Strix Halo
 
-Status: 2026-08-19. This page is the current performance snapshot, not an
+Status: 2026-08-20. This page is the current performance snapshot, not an
 optimization history.
 
 ## Model
@@ -169,6 +169,47 @@ complete final-token vocabulary.
 The acceptance contract is finite logits, identical top-1, and no material
 regression from this numerical envelope.
 
+### MTP and XDNA2
+
+The separate Qwen3.8 MTP artifact is optional. The `mtp` route runs its
+layer-64 draft graph on the GPU. The experimental `mtp-npu` route runs the
+Q4_K `nextn.eh_proj` projection on all eight XDNA2 columns through a W4A8
+backend view, then returns to the GPU for attention, FFN, logits, and target
+verification.
+
+```sh
+MTP_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf
+
+./result/bin/strix-bench --model "$MODEL" \
+  --n-prompt 1 --n-gen 128 --repetitions 1
+
+./result/bin/strix-bench --model "$MODEL" \
+  --n-prompt 1 --n-gen 128 --repetitions 1 \
+  --speculative mtp --mtp-model "$MTP_MODEL" --draft-tokens 2
+
+./result/bin/strix-bench --model "$MODEL" \
+  --n-prompt 1 --n-gen 128 --repetitions 1 \
+  --speculative mtp-npu --mtp-model "$MTP_MODEL" --draft-tokens 2 --verbose
+```
+
+This is a same-build, single-repetition mode comparison under the current
+ambient conditions; it does not replace the controlled shallow baseline above.
+
+| Mode | `tg128` | Draft acceptance |
+| --- | ---: | ---: |
+| Autoregressive GPU (no MTP) | 3.73 tok/s | - |
+| GPU MTP | 3.01 tok/s | 74.5% |
+| GPU + XDNA2 MTP (`eh_proj` on NPU) | 3.00 tok/s | 74.5% |
+
+The NPU projection matches the exact Q4_K CPU oracle with RMSE
+`8.33e-7`, cosine `1.0`, and maximum error `6.20e-6`. After warmup, each
+hybrid projection averages `1.20 ms` of NPU command time, plus `2.10 ms` for
+the serialized GPU-to-host boundary and `0.06 ms` to return to the GPU.
+
+This route proves real Q4_K MTP execution on XDNA2, but it is not a performance
+win for single-request decode. It remains explicit and opt-in; autoregressive
+GPU execution is the default.
+
 ## Runtime Status
 
 | Area | Current production route |
@@ -179,6 +220,7 @@ regression from this numerical envelope.
 | Prefill attention | Native causal GQA tile with conflict-free LDS layout |
 | Decode attention | Online softmax below 4K; split-K at 4K and above |
 | HTTP | Shared immutable model with request-owned HIP sessions |
+| MTP | Real GPU draft layer; optional XDNA2 W4A8 `eh_proj` offload |
 | Optional tuning | Hardware-bound hipBLASLt plan database |
 
 The main remaining performance gap is long-context prompt processing:
@@ -193,7 +235,7 @@ decode is 1.07-1.09x behind, while shallow decode is about 7% faster.
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
-| Speculation | Zero-penalty prompt lookup fallback | Draft routes that reduce end-to-end decode throughput |
+| Speculation | Exact target verification and explicit GPU/XDNA2 MTP experiments | MTP as a default route while it reduces decode throughput |
 
 This table records only decisions that affect the current direction. Detailed
 profiling data belongs in issue discussions or local artifacts, not in this

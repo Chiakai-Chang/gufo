@@ -6,6 +6,7 @@
   pkg-config,
   libuuid,
   rocmPackages,
+  aie-qwen-mtp-eh-proj,
   aie-qwen-mtp-rmsnorm,
   aie-smoke,
   xrt,
@@ -63,6 +64,7 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.rocprofiler-sdk
   ]
   ++ lib.optionals xrtSupport [
+    aie-qwen-mtp-eh-proj
     aie-qwen-mtp-rmsnorm
     aie-smoke
     xrt
@@ -79,6 +81,7 @@ stdenv.mkDerivation (finalAttrs: {
   ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
   ++ lib.optional rocmSupport "-DGPU_TARGETS=${lib.concatStringsSep ";" rocmGpuTargets}"
   ++ lib.optional xrtSupport "-DENGINE_ENABLE_XRT=ON"
+  ++ lib.optional xrtSupport "-DSTRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/qwen-mtp-eh-proj"
   ++ lib.optional xrtSupport "-DSTRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/qwen-mtp-rmsnorm"
   ++ lib.optional xrtSupport "-DSTRIX_AIE_SMOKE_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/smoke";
 
@@ -86,6 +89,7 @@ stdenv.mkDerivation (finalAttrs: {
     ROCM_PATH = "${rocmPackages.clr}";
   }
   // lib.optionalAttrs xrtSupport {
+    STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT = "${aie-qwen-mtp-eh-proj}";
     STRIX_AIE_QWEN_MTP_RMSNORM_ROOT = "${aie-qwen-mtp-rmsnorm}";
     STRIX_AIE_SMOKE_ROOT = "${aie-smoke}";
     XRT_PATH = "${xrt}/opt/xilinx/xrt";
@@ -129,6 +133,17 @@ stdenv.mkDerivation (finalAttrs: {
         ${aie-qwen-mtp-rmsnorm}/manifest.json \
         ${aie-qwen-mtp-rmsnorm}/SHA256SUMS \
         $out/share/strix/aie/qwen-mtp-rmsnorm/
+    fi
+    if [ -d ${aie-qwen-mtp-eh-proj} ]; then
+      mkdir -p $out/share/strix/aie/qwen-mtp-eh-proj
+      cp ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.xclbin \
+        ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.insts.elf \
+        ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj_insts.bin \
+        ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.pdi \
+        ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.aie-partition.json \
+        ${aie-qwen-mtp-eh-proj}/manifest.json \
+        ${aie-qwen-mtp-eh-proj}/SHA256SUMS \
+        $out/share/strix/aie/qwen-mtp-eh-proj/
     fi
     chmod +x $out/bin/*
 
