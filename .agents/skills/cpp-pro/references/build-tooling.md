@@ -357,7 +357,7 @@ nix develop -c rocprofv3 \
   --stats \
   --summary \
   --summary-units msec \
-  -- ./result/bin/strix-bench \
+  -- ./result/bin/strix-server bench \
     --model /path/to/model.gguf \
     --n-prompt 512 \
     --n-gen 0 \
@@ -371,7 +371,7 @@ nix develop -c rocprofv3 \
   --scratch-memory-trace \
   --stats \
   --summary \
-  -- ./result/bin/strix-bench \
+  -- ./result/bin/strix-server bench \
     --model /path/to/model.gguf \
     --n-prompt 512 \
     --n-gen 0 \
