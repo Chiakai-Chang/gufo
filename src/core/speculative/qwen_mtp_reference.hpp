@@ -38,6 +38,11 @@ public:
       std::shared_ptr<const core::GgufReader> reader,
       std::uint32_t max_context = 4096, std::string* error_msg = nullptr);
 
+  [[nodiscard]] static std::unique_ptr<QwenMtpReference> CreateWithTiedWeights(
+      std::shared_ptr<const core::GgufReader> reader,
+      std::shared_ptr<const core::GgufReader> tied_reader,
+      std::uint32_t max_context = 4096, std::string* error_msg = nullptr);
+
   void Reset() noexcept;
 
   [[nodiscard]] std::span<const float> ForwardHidden(
@@ -56,9 +61,11 @@ public:
 
 private:
   QwenMtpReference(std::shared_ptr<const core::GgufReader> reader,
+                   std::shared_ptr<const core::GgufReader> tied_reader,
                    QwenMtpWeights weights, std::uint32_t max_context);
 
   std::shared_ptr<const core::GgufReader> reader_;
+  std::shared_ptr<const core::GgufReader> tied_reader_;
   QwenMtpWeights weights_;
   models::QwenKvCache kv_cache_;
   models::QwenSsmCache ssm_cache_;

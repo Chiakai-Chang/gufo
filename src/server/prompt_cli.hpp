@@ -22,6 +22,7 @@ struct PromptOptions {
   bool verbose = false;
   bool force_cpu = false;
   std::string speculative_backend;  // "npu", "pld", "mtp", "self", or empty
+  std::string mtp_model_path;
   std::size_t draft_tokens = 3;
 };
 

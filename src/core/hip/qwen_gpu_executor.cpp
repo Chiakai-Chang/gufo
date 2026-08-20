@@ -44,6 +44,9 @@ QwenGpuExecutor::~QwenGpuExecutor() {
 
 void QwenGpuExecutor::Reset() noexcept {
   replaying_ssm_state_ = false;
+  h_prompt_hidden_.clear();
+  h_last_hidden_.clear();
+  last_hidden_offset_ = 0;
   arena_.Reset();
   graph_executor_.Reset();
 }
@@ -90,6 +93,21 @@ std::span<const float> QwenGpuExecutor::CopyLastLogits() {
                            hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
   return h_logits_;
+}
+
+void QwenGpuExecutor::SetPromptHiddenCapture(bool enabled) {
+  capture_prompt_hidden_ = enabled;
+  h_prompt_hidden_.clear();
+}
+
+std::span<const float> QwenGpuExecutor::CopyLastHidden() {
+  h_last_hidden_.resize(weights_.config.hidden_size);
+  HIP_CHECK(hipMemcpyAsync(h_last_hidden_.data(),
+                           arena_.d_hidden + last_hidden_offset_,
+                           h_last_hidden_.size() * sizeof(float),
+                           hipMemcpyDeviceToHost, arena_.stream));
+  HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  return h_last_hidden_;
 }
 
 std::vector<tokenization::TokenId> QwenGpuExecutor::Generate(

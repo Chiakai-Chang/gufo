@@ -179,13 +179,51 @@ std::unique_ptr<QwenMtpReference> QwenMtpReference::Create(
     return nullptr;
   }
   return std::unique_ptr<QwenMtpReference>(new QwenMtpReference(
-      std::move(reader), std::move(*weights), max_context));
+      std::move(reader), nullptr, std::move(*weights), max_context));
+}
+
+std::unique_ptr<QwenMtpReference> QwenMtpReference::CreateWithTiedWeights(
+    std::shared_ptr<const core::GgufReader> reader,
+    std::shared_ptr<const core::GgufReader> tied_reader,
+    std::uint32_t max_context, std::string* error_msg) {
+  if (reader == nullptr || tied_reader == nullptr) {
+    if (error_msg != nullptr) {
+      *error_msg = "Qwen MTP and tied-weight readers must not be null";
+    }
+    return nullptr;
+  }
+  auto weights = QwenMtpWeights::LoadFromGguf(*reader, error_msg);
+  auto tied_weights =
+      models::QwenModelWeights::LoadFromGguf(*tied_reader, error_msg);
+  if (!weights.has_value() || !tied_weights.has_value()) {
+    return nullptr;
+  }
+  if (weights->config.hidden_size != tied_weights->config.hidden_size ||
+      weights->config.vocab_size != tied_weights->config.vocab_size) {
+    if (error_msg != nullptr) {
+      *error_msg = "Qwen MTP and tied model dimensions are incompatible";
+    }
+    return nullptr;
+  }
+  if (max_context == 0 || max_context > weights->config.context_length) {
+    if (error_msg != nullptr) {
+      *error_msg = "Qwen MTP context length is invalid";
+    }
+    return nullptr;
+  }
+  weights->token_embedding = tied_weights->token_embd;
+  weights->output = tied_weights->output;
+  return std::unique_ptr<QwenMtpReference>(
+      new QwenMtpReference(std::move(reader), std::move(tied_reader),
+                           std::move(*weights), max_context));
 }
 
 QwenMtpReference::QwenMtpReference(
-    std::shared_ptr<const core::GgufReader> reader, QwenMtpWeights weights,
+    std::shared_ptr<const core::GgufReader> reader,
+    std::shared_ptr<const core::GgufReader> tied_reader, QwenMtpWeights weights,
     std::uint32_t max_context)
     : reader_(std::move(reader)),
+      tied_reader_(std::move(tied_reader)),
       weights_(std::move(weights)),
       kv_cache_(1, weights_.config.num_key_value_heads, max_context,
                 weights_.config.head_dim),

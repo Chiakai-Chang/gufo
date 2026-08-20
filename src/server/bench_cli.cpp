@@ -4,6 +4,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -24,6 +25,7 @@
 #include "src/core/heterogeneous/npu_drafter.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/hip/qwen_gpu_executor.hpp"
+#include "src/core/hip/qwen_mtp_gpu.hpp"
 #include "src/core/speculative/draft_heads.hpp"
 #include "src/core/speculative/prompt_lookup_backend.hpp"
 #include "src/core/speculative/self_speculative.hpp"
@@ -64,6 +66,11 @@ void PrintBenchHelp(std::string_view program_name) {
                "(default: 1)\n"
             << "  --validate-prefill <N>      Compare batched logits against "
                "sequential prefill\n"
+            << "  --speculative <MODE>        Draft backend: mtp, npu, pld, or "
+               "self\n"
+            << "  --mtp-model <PATH>          Quantized Qwen MTP GGUF\n"
+            << "  --draft-tokens <N>          Maximum speculative block "
+               "length\n"
             << "  -ngl, --n-gpu-layers <N>    Number of layers offloaded to "
                "GPU (default: 99)\n"
             << "  -v, --verbose               Verbose progress output\n";
@@ -318,6 +325,18 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       continue;
     }
 
+    if (arg == "--mtp-model") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --mtp-model";
+        }
+        return std::nullopt;
+      }
+      opt.mtp_model_path = std::string(args[i + 1]);
+      skip_next = true;
+      continue;
+    }
+
     if (arg == "--draft-tokens") {
       if (i + 1 >= args.size()) {
         if (error_msg != nullptr) {
@@ -429,6 +448,34 @@ int RunBench(std::span<const char* const> args) {
   PrintModelLoadTime(model_load_start);
 
   const auto& config = gpu_exec->GetConfig();
+  std::shared_ptr<const hip::QwenMtpGpuModel> mtp_gpu_model;
+  if (opt.speculative_backend == "mtp") {
+    std::string mtp_path = opt.mtp_model_path;
+    if (mtp_path.empty()) {
+      if (const char* environment = std::getenv("STRIX_MTP_MODEL");
+          environment != nullptr) {
+        mtp_path = environment;
+      }
+    }
+    auto mtp_reader_owner = core::GgufReader::OpenFile(mtp_path, &err);
+    if (mtp_reader_owner == nullptr) {
+      std::cerr << "Error loading MTP GGUF model: " << err << '\n';
+      return 1;
+    }
+    std::shared_ptr<const core::GgufReader> mtp_reader(
+        std::move(mtp_reader_owner));
+    mtp_gpu_model = hip::QwenMtpGpuModel::Create(
+        std::move(mtp_reader), gpu_exec->GetSharedModel(), &err);
+    if (mtp_gpu_model == nullptr) {
+      std::cerr << "Error creating GPU MTP model: " << err << '\n';
+      return 1;
+    }
+    if (opt.verbose) {
+      std::cerr << "Packed GPU MTP view: "
+                << mtp_gpu_model->GetPackedWeightBytes() << " bytes in "
+                << mtp_gpu_model->GetPackTimeSeconds() << " s\n";
+    }
+  }
   const std::string model_name = config.model_name + " BF16";
   const double model_size_gib =
       static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
@@ -511,7 +558,7 @@ int RunBench(std::span<const char* const> args) {
       const auto depth_tokens =
           MakeBenchmarkTokens(depth - preparation_start, preparation_start);
       const auto preparation_begin = std::chrono::steady_clock::now();
-      const bool compute_next_token = !opt.speculative_backend.empty();
+      const bool compute_next_token = !opt.n_gens.empty();
       if (!depth_tokens.empty()) {
         const auto next_token = gpu_exec->ForwardPromptBatch(
             depth_tokens, static_cast<std::uint32_t>(preparation_start),
@@ -594,16 +641,22 @@ int RunBench(std::span<const char* const> args) {
 
       std::vector<double> runs;
       runs.reserve(opt.repetitions);
+      std::vector<double> acceptance_runs;
+      acceptance_runs.reserve(opt.repetitions);
       for (std::size_t r = 0; r < opt.repetitions; ++r) {
         restore_depth();
 
         std::unique_ptr<speculative::IDraftBackend> draft_backend;
         if (opt.speculative_backend == "mtp") {
-          speculative::MtpDraftHeadConfig cfg;
-          cfg.num_heads = opt.draft_tokens;
-          cfg.hidden_size = config.hidden_size;
-          cfg.vocab_size = config.vocab_size;
-          draft_backend = std::make_unique<speculative::MtpDraftBackend>(cfg);
+          hip::QwenMtpGpuDraftConfig cfg{
+              .max_context = static_cast<std::uint32_t>(required_context),
+              .max_draft_tokens = opt.draft_tokens,
+          };
+          draft_backend =
+              hip::QwenMtpGpuDraftBackend::Create(mtp_gpu_model, cfg, &err);
+          if (draft_backend == nullptr) {
+            throw std::runtime_error("GPU MTP initialization failed: " + err);
+          }
         } else if (opt.speculative_backend == "self") {
           speculative::SelfSpeculativeConfig cfg;
           cfg.total_layers = config.num_layers;
@@ -637,27 +690,34 @@ int RunBench(std::span<const char* const> args) {
         tokenization::TokenId speculative_current_token = 0;
         std::uint32_t speculative_current_pos = 0;
         if (spec_verifier) {
+          speculative_sequence =
+              MakeBenchmarkTokens(depth > 0 ? depth : std::size_t{16});
+          speculative_current_token =
+              spec_verifier->Prime(speculative_sequence);
+          speculative_current_pos =
+              static_cast<std::uint32_t>(speculative_sequence.size());
+          speculative_sequence.push_back(speculative_current_token);
+        }
+        tokenization::TokenId greedy_current_token = 0;
+        std::uint32_t greedy_current_pos = 0;
+        if (!spec_verifier) {
           if (depth > 0) {
             if (!has_prepared_next_token) {
               throw std::logic_error(
-                  "prepared speculative depth has no target token");
+                  "prepared generation depth has no target token");
             }
-            speculative_sequence = MakeBenchmarkTokens(depth);
-            speculative_current_token = prepared_next_token;
-            speculative_current_pos = static_cast<std::uint32_t>(depth);
+            greedy_current_token = prepared_next_token;
+            greedy_current_pos = static_cast<std::uint32_t>(depth);
           } else {
-            speculative_sequence = MakeBenchmarkTokens(16);
-            speculative_current_token =
-                gpu_exec->ForwardPromptBatch(speculative_sequence);
-            speculative_current_pos =
-                static_cast<std::uint32_t>(speculative_sequence.size());
+            const auto prompt = MakeBenchmarkTokens(16);
+            greedy_current_token = gpu_exec->ForwardPromptBatch(prompt);
+            greedy_current_pos = static_cast<std::uint32_t>(prompt.size());
           }
-          speculative_sequence.push_back(speculative_current_token);
         }
+        HIP_CHECK(hipDeviceSynchronize());
 
         const auto t0 = std::chrono::high_resolution_clock::now();
         if (spec_verifier) {
-          spec_verifier->Reset();
           std::size_t emitted = 0;
           while (emitted < g_len) {
             const auto step_res = spec_verifier->VerifyStep(
@@ -673,12 +733,12 @@ int RunBench(std::span<const char* const> args) {
             }
             speculative_current_token = step_res.next_token;
           }
+          acceptance_runs.push_back(spec_verifier->GetStats().AcceptanceRate());
         } else {
           for (std::size_t step = 0; step < g_len; ++step) {
-            const auto token = static_cast<tokenization::TokenId>(
-                ((depth + step) % 1000) + 100);
-            (void)gpu_exec->ForwardToken(
-                token, static_cast<std::uint32_t>(depth + step));
+            greedy_current_token = gpu_exec->ForwardToken(greedy_current_token,
+                                                          greedy_current_pos);
+            ++greedy_current_pos;
           }
         }
         HIP_CHECK(hipDeviceSynchronize());
@@ -696,6 +756,12 @@ int RunBench(std::span<const char* const> args) {
         test_name += "-" + opt.speculative_backend;
       }
       print_result(test_name, ComputeStats(runs));
+      if (opt.verbose && !acceptance_runs.empty()) {
+        const auto acceptance = ComputeStats(acceptance_runs);
+        std::cerr << test_name << " acceptance=" << std::fixed
+                  << std::setprecision(3) << acceptance.mean << " +/- "
+                  << acceptance.stddev << '\n';
+      }
     }
   }
 

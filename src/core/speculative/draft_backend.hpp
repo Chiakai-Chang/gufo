@@ -2,6 +2,7 @@
 #define STRIX_CORE_SPECULATIVE_DRAFT_BACKEND_HPP_
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string_view>
@@ -19,6 +20,13 @@ struct DraftProposal {
   std::uint32_t start_pos{0};
 };
 
+struct DraftTargetContext {
+  std::span<const tokenization::TokenId> prompt_tokens;
+  std::span<const float> prompt_hidden_states;
+  std::size_t hidden_size{0};
+  tokenization::TokenId first_token{0};
+};
+
 /// Provider-neutral interface for draft token generators (NPU, MTP heads, small
 /// model, heuristic)
 class IDraftBackend {
@@ -32,6 +40,23 @@ public:
   [[nodiscard]] virtual DraftProposal Propose(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos, std::uint32_t max_tokens) = 0;
+
+  /// Returns true when the backend consumes target-model hidden states.
+  [[nodiscard]] virtual bool RequiresTargetHiddenStates() const noexcept {
+    return false;
+  }
+
+  /// Primes provider-specific state after target prompt prefill.
+  [[nodiscard]] virtual bool PrimeTargetContext(
+      const DraftTargetContext& context) {
+    (void)context;
+    return true;
+  }
+
+  /// Supplies the target hidden state paired with the next correction token.
+  virtual void UpdateTargetHidden(std::span<const float> hidden) {
+    (void)hidden;
+  }
 
   /// Notifies the draft backend of which tokens were accepted and the target
   /// correction token

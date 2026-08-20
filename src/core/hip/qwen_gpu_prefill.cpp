@@ -20,6 +20,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   }
   replaying_ssm_state_ = false;
   arena_.DisableSsmReplayCapture();
+  if (capture_prompt_hidden_) {
+    h_prompt_hidden_.clear();
+    h_prompt_hidden_.reserve(prompt_tokens.size() *
+                             weights_.config.hidden_size);
+  }
 
   const std::size_t end_pos =
       static_cast<std::size_t>(start_pos) + prompt_tokens.size();
@@ -440,6 +445,17 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
               << "  - SSM Out:    " << time_ssm_out << " ms\n"
               << "  - FFN (3 GEMM): " << time_ffn << " ms\n";
   }
+
+  if (capture_prompt_hidden_) {
+    const std::size_t old_size = h_prompt_hidden_.size();
+    const std::size_t chunk_elements = batch_size * hidden_size;
+    h_prompt_hidden_.resize(old_size + chunk_elements);
+    HIP_CHECK(hipMemcpyAsync(h_prompt_hidden_.data() + old_size,
+                             arena_.d_hidden, chunk_elements * sizeof(float),
+                             hipMemcpyDeviceToHost, arena_.stream));
+    HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  }
+  last_hidden_offset_ = (batch_size - 1) * hidden_size;
 
   if (!compute_logits) {
     return 0;

@@ -32,6 +32,18 @@ public:
 
   void RestoreState() override { executor_.RestoreState(); }
 
+  void SetPromptHiddenCapture(bool enabled) override {
+    executor_.SetPromptHiddenCapture(enabled);
+  }
+
+  std::span<const float> GetPromptHiddenStates() const noexcept override {
+    return executor_.GetPromptHiddenStates();
+  }
+
+  std::span<const float> CopyLastHidden() override {
+    return executor_.CopyLastHidden();
+  }
+
   tokenization::TokenId GetEosTokenId() const noexcept override {
     return executor_.GetTokenizer().GetEosTokenId();
   }
@@ -105,11 +117,25 @@ void SpeculativeVerifier::UpdateAdaptiveDraftLength(std::size_t accepted,
   }
 }
 
+void SpeculativeVerifier::UpdateDraftTargetHidden() {
+  if (draft_backend_ == nullptr ||
+      !draft_backend_->RequiresTargetHiddenStates()) {
+    return;
+  }
+  const auto hidden = target_executor_->CopyLastHidden();
+  if (hidden.empty()) {
+    throw std::runtime_error(
+        "draft backend requires a committed target hidden state");
+  }
+  draft_backend_->UpdateTargetHidden(hidden);
+}
+
 SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     std::vector<tokenization::TokenId>& current_sequence, std::uint32_t cur_pos,
     tokenization::TokenId current_token, tokenization::TokenId eos_id) {
   if (draft_backend_ == nullptr || current_draft_length_ == 0) {
     const auto next = target_executor_->ForwardToken(current_token, cur_pos);
+    UpdateDraftTargetHidden();
     ++stats_.total_verification_steps;
     ++stats_.total_emitted_tokens;
     const bool hit_eos = IsStopToken(next, eos_id);
@@ -125,6 +151,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
       draft_backend_->Propose(current_sequence, cur_pos, current_draft_length_);
   if (proposal.tokens.empty()) {
     const auto next = target_executor_->ForwardToken(current_token, cur_pos);
+    UpdateDraftTargetHidden();
     ++stats_.total_verification_steps;
     ++stats_.total_emitted_tokens;
     const bool hit_eos = IsStopToken(next, eos_id);
@@ -219,6 +246,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
   draft_backend_->AcceptFeedback(std::span<const tokenization::TokenId>(
                                      proposal.tokens.data(), accepted_count),
                                  correction_token);
+  UpdateDraftTargetHidden();
 
   return result;
 }
@@ -233,12 +261,7 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
     return output_tokens;
   }
 
-  Reset();
-  target_executor_->Reset();
-
-  // 1. Prefill prompt
-  const tokenization::TokenId first_token =
-      target_executor_->ForwardPromptBatch(prompt_tokens);
+  const tokenization::TokenId first_token = Prime(prompt_tokens);
   const auto eos_id = target_executor_->GetEosTokenId();
   if (options.max_new_tokens == 0 || IsStopToken(first_token, eos_id)) {
     return output_tokens;
@@ -258,7 +281,7 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
     }
   }
 
-  // 2. Speculative Decode Generation Loop
+  // Speculative decode generation loop.
   while (output_tokens.size() < options.max_new_tokens) {
     const auto step_res =
         VerifyStep(current_sequence, cur_pos, next_token, eos_id);
@@ -296,6 +319,39 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
   }
 
   return output_tokens;
+}
+
+tokenization::TokenId SpeculativeVerifier::Prime(
+    std::span<const tokenization::TokenId> prompt_tokens) {
+  if (prompt_tokens.empty()) {
+    throw std::invalid_argument("speculative prompt must not be empty");
+  }
+  Reset();
+  target_executor_->Reset();
+
+  const bool capture_hidden =
+      draft_backend_ != nullptr && draft_backend_->RequiresTargetHiddenStates();
+  target_executor_->SetPromptHiddenCapture(capture_hidden);
+  const tokenization::TokenId first_token =
+      target_executor_->ForwardPromptBatch(prompt_tokens);
+  if (capture_hidden) {
+    const auto prompt_hidden = target_executor_->GetPromptHiddenStates();
+    if (prompt_hidden.empty() ||
+        (prompt_hidden.size() % prompt_tokens.size()) != 0) {
+      throw std::runtime_error(
+          "target executor did not capture complete prompt hidden states");
+    }
+    const DraftTargetContext context{
+        .prompt_tokens = prompt_tokens,
+        .prompt_hidden_states = prompt_hidden,
+        .hidden_size = prompt_hidden.size() / prompt_tokens.size(),
+        .first_token = first_token,
+    };
+    if (!draft_backend_->PrimeTargetContext(context)) {
+      throw std::runtime_error("draft backend failed to prime target context");
+    }
+  }
+  return first_token;
 }
 
 }  // namespace strix::speculative

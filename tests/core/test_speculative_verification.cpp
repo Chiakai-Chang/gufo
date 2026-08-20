@@ -32,6 +32,8 @@ public:
 
   void Reset() noexcept override {
     prompt_.clear();
+    prompt_hidden_.clear();
+    last_hidden_.clear();
     state_.clear();
     saved_state_.clear();
     restore_count_ = 0;
@@ -40,6 +42,15 @@ public:
   TokenId ForwardPromptBatch(std::span<const TokenId> prompt_tokens) override {
     prompt_.assign(prompt_tokens.begin(), prompt_tokens.end());
     state_ = prompt_;
+    prompt_hidden_.clear();
+    for (const auto token : prompt_) {
+      prompt_hidden_.push_back(static_cast<float>(token));
+      prompt_hidden_.push_back(-static_cast<float>(token));
+    }
+    if (!prompt_.empty()) {
+      last_hidden_ = {static_cast<float>(prompt_.back()),
+                      -static_cast<float>(prompt_.back())};
+    }
     if (generated_tokens_.empty()) {
       return eos_id_;
     }
@@ -57,6 +68,7 @@ public:
     Expect(token_id == generated_tokens_[generated_index],
            "target input token must match the greedy sequence");
     state_.push_back(token_id);
+    last_hidden_ = {static_cast<float>(token_id), static_cast<float>(pos)};
     if (generated_index + 1 < generated_tokens_.size()) {
       return generated_tokens_[generated_index + 1];
     }
@@ -75,6 +87,16 @@ public:
     ++restore_count_;
   }
 
+  void SetPromptHiddenCapture(bool enabled) override {
+    hidden_capture_enabled_ = enabled;
+  }
+
+  std::span<const float> GetPromptHiddenStates() const noexcept override {
+    return prompt_hidden_;
+  }
+
+  std::span<const float> CopyLastHidden() override { return last_hidden_; }
+
   TokenId GetEosTokenId() const noexcept override { return eos_id_; }
 
   std::string_view DecodeToken(TokenId token_id) const noexcept override {
@@ -90,13 +112,93 @@ public:
     return restore_count_;
   }
 
+  [[nodiscard]] bool HiddenCaptureEnabled() const noexcept {
+    return hidden_capture_enabled_;
+  }
+
 private:
   std::vector<TokenId> generated_tokens_;
   TokenId eos_id_;
   std::vector<TokenId> prompt_;
+  std::vector<float> prompt_hidden_;
+  std::vector<float> last_hidden_;
   std::vector<TokenId> state_;
   std::vector<TokenId> saved_state_;
   std::size_t restore_count_{0};
+  bool hidden_capture_enabled_{false};
+};
+
+class HiddenAwareDraftBackend final : public strix::speculative::IDraftBackend {
+public:
+  [[nodiscard]] std::string_view Name() const noexcept override {
+    return "HiddenAwareDraftBackend";
+  }
+
+  [[nodiscard]] bool RequiresTargetHiddenStates() const noexcept override {
+    return true;
+  }
+
+  [[nodiscard]] bool PrimeTargetContext(
+      const strix::speculative::DraftTargetContext& context) override {
+    primed_prompt_.assign(context.prompt_tokens.begin(),
+                          context.prompt_tokens.end());
+    primed_hidden_.assign(context.prompt_hidden_states.begin(),
+                          context.prompt_hidden_states.end());
+    hidden_size_ = context.hidden_size;
+    first_token_ = context.first_token;
+    return context.hidden_size == 2 &&
+           context.prompt_hidden_states.size() ==
+               context.prompt_tokens.size() * context.hidden_size;
+  }
+
+  [[nodiscard]] strix::speculative::DraftProposal Propose(
+      std::span<const TokenId> prompt_tokens, std::uint32_t current_pos,
+      std::uint32_t max_tokens) override {
+    (void)prompt_tokens;
+    strix::speculative::DraftProposal proposal;
+    proposal.start_pos = current_pos;
+    if (max_tokens > 0) {
+      proposal.tokens.push_back(11);
+    }
+    return proposal;
+  }
+
+  void AcceptFeedback(std::span<const TokenId> accepted,
+                      TokenId correction_token) override {
+    accepted_.assign(accepted.begin(), accepted.end());
+    correction_token_ = correction_token;
+  }
+
+  void UpdateTargetHidden(std::span<const float> hidden) override {
+    updated_hidden_.assign(hidden.begin(), hidden.end());
+  }
+
+  [[nodiscard]] const std::vector<TokenId>& PrimedPrompt() const noexcept {
+    return primed_prompt_;
+  }
+  [[nodiscard]] const std::vector<float>& PrimedHidden() const noexcept {
+    return primed_hidden_;
+  }
+  [[nodiscard]] std::size_t HiddenSize() const noexcept { return hidden_size_; }
+  [[nodiscard]] TokenId FirstToken() const noexcept { return first_token_; }
+  [[nodiscard]] const std::vector<TokenId>& Accepted() const noexcept {
+    return accepted_;
+  }
+  [[nodiscard]] TokenId CorrectionToken() const noexcept {
+    return correction_token_;
+  }
+  [[nodiscard]] const std::vector<float>& UpdatedHidden() const noexcept {
+    return updated_hidden_;
+  }
+
+private:
+  std::vector<TokenId> primed_prompt_;
+  std::vector<float> primed_hidden_;
+  std::size_t hidden_size_{0};
+  TokenId first_token_{0};
+  std::vector<TokenId> accepted_;
+  TokenId correction_token_{0};
+  std::vector<float> updated_hidden_;
 };
 
 strix::models::GenerationOptions GenerationOptions(std::size_t max_tokens,
@@ -148,8 +250,41 @@ void TestFullAcceptanceProducesTargetBonusToken() {
   Expect(target.State() == std::vector<TokenId>({1, 2, 3, 10, 11, 12}),
          "full acceptance target state");
   Expect(target.RestoreCount() == 0, "full acceptance must not roll back");
+  Expect(!target.HiddenCaptureEnabled(),
+         "plain draft backend must not capture target hidden states");
   Expect(verifier.GetStats().total_accepted_tokens == 2,
          "full acceptance statistics");
+}
+
+void TestHiddenAwareBackendReceivesCommittedTargetState() {
+  constexpr TokenId eos_id = 900;
+  ScriptedTargetExecutor target({10, 11, 12}, eos_id);
+  auto backend = std::make_unique<HiddenAwareDraftBackend>();
+  auto* backend_view = backend.get();
+  strix::speculative::SpeculativeVerifier verifier(target, std::move(backend));
+  const std::vector<TokenId> prompt = {1, 2, 3};
+
+  const auto output = verifier.Generate(prompt, GenerationOptions(3, eos_id));
+
+  Expect(output == std::vector<TokenId>({10, 11, 12}),
+         "hidden-aware output must match greedy target");
+  Expect(target.HiddenCaptureEnabled(),
+         "hidden-aware backend enables target capture");
+  Expect(backend_view->PrimedPrompt() == prompt,
+         "hidden-aware backend receives prompt tokens");
+  Expect(backend_view->PrimedHidden() ==
+             std::vector<float>({1.0F, -1.0F, 2.0F, -2.0F, 3.0F, -3.0F}),
+         "hidden-aware backend receives all prompt hidden states");
+  Expect(backend_view->HiddenSize() == 2,
+         "hidden-aware backend receives hidden width");
+  Expect(backend_view->FirstToken() == 10,
+         "hidden-aware backend receives first target token");
+  Expect(backend_view->Accepted() == std::vector<TokenId>({11}),
+         "hidden-aware backend receives accepted draft");
+  Expect(backend_view->CorrectionToken() == 12,
+         "hidden-aware backend receives target correction");
+  Expect(backend_view->UpdatedHidden() == std::vector<float>({11.0F, 4.0F}),
+         "hidden-aware backend receives latest committed target hidden");
 }
 
 void TestPartialRejectionRestoresAndReplaysState() {
@@ -237,6 +372,7 @@ int main() {
   TestFullAcceptanceProducesTargetBonusToken();
   TestPartialRejectionRestoresAndReplaysState();
   TestImmediateRejectionRestoresGreedyState();
+  TestHiddenAwareBackendReceivesCommittedTargetState();
   TestFirstPrefillTokenHonorsBudgetAndCallback();
   TestFirstPrefillEosIsNotEmitted();
   std::cout << "All speculative verification tests passed.\n";

@@ -19,6 +19,7 @@ struct BenchOptions {
   std::size_t validate_prefill_tokens{0};
   int n_gpu_layers{99};
   std::string speculative_backend{""};
+  std::string mtp_model_path;
   std::uint32_t draft_tokens{3};
   bool verbose{false};
 };

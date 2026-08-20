@@ -195,6 +195,11 @@ public:
     return *model_;
   }
 
+  [[nodiscard]] const std::shared_ptr<const QwenGpuModel>& GetSharedModel()
+      const noexcept {
+    return model_;
+  }
+
   /// Runs one single token forward step on GPU, returning next token ID.
   [[nodiscard]] tokenization::TokenId ForwardToken(
       tokenization::TokenId token_id, std::uint32_t pos,
@@ -208,6 +213,19 @@ public:
 
   /// Copies the logits produced by the most recent forward pass to host memory.
   [[nodiscard]] std::span<const float> CopyLastLogits();
+
+  /// Enables host capture of every final-layer prompt hidden state. Disabled
+  /// by default so ordinary prefill does not incur device-to-host copies.
+  void SetPromptHiddenCapture(bool enabled);
+
+  /// Returns the flattened [prompt_tokens, hidden_size] capture from the most
+  /// recent ForwardPromptBatch call.
+  [[nodiscard]] std::span<const float> GetPromptHiddenStates() const noexcept {
+    return h_prompt_hidden_;
+  }
+
+  /// Copies the final-layer hidden state from the most recent forward pass.
+  [[nodiscard]] std::span<const float> CopyLastHidden();
 
   [[nodiscard]] std::uint32_t GetMaxPromptBatch() const noexcept {
     return arena_.GetMaxBatch();
@@ -234,6 +252,10 @@ private:
   QwenGpuArena arena_;
   detail::HipGraphDecodeExecutor graph_executor_;
   std::vector<float> h_logits_;
+  std::vector<float> h_prompt_hidden_;
+  std::vector<float> h_last_hidden_;
+  std::size_t last_hidden_offset_{0};
+  bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};
 };
 

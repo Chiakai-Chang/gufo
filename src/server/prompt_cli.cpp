@@ -2,6 +2,7 @@
 
 #include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -18,6 +19,7 @@
 
 #include "src/core/heterogeneous/npu_drafter.hpp"
 #include "src/core/hip/qwen_gpu_executor.hpp"
+#include "src/core/hip/qwen_mtp_gpu.hpp"
 #include "src/core/speculative/draft_heads.hpp"
 #include "src/core/speculative/prompt_lookup_backend.hpp"
 #include "src/core/speculative/self_speculative.hpp"
@@ -51,6 +53,9 @@ void PrintPromptHelp(std::string_view program_name) {
          "greedy)\n"
       << "  --system <PROMPT>       Custom system prompt\n"
       << "  --raw                   Disable chat template framing\n"
+      << "  --speculative <MODE>    Draft backend: mtp, npu, pld, or self\n"
+      << "  --mtp-model <PATH>      Quantized Qwen MTP GGUF for mtp mode\n"
+      << "  --draft-tokens <N>      Maximum speculative block length\n"
       << "  -v, --verbose           Print detailed timing and token metrics\n"
       << "  -h, --help              Print help\n";
 }
@@ -175,6 +180,18 @@ std::optional<PromptOptions> ParsePromptOptions(
         return std::nullopt;
       }
       opt.speculative_backend = args[i + 1];
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "--mtp-model") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --mtp-model";
+        }
+        return std::nullopt;
+      }
+      opt.mtp_model_path = args[i + 1];
       skip_next = true;
       continue;
     }
@@ -320,11 +337,23 @@ int RunPrompt(std::span<const char* const> args) {
           draft_backend =
               std::make_unique<speculative::PromptLookupDraftBackend>(cfg);
         } else if (opt.speculative_backend == "mtp") {
-          speculative::MtpDraftHeadConfig cfg;
-          cfg.num_heads = opt.draft_tokens;
-          cfg.hidden_size = config.hidden_size;
-          cfg.vocab_size = config.vocab_size;
-          draft_backend = std::make_unique<speculative::MtpDraftBackend>(cfg);
+          std::string mtp_path = opt.mtp_model_path;
+          if (mtp_path.empty()) {
+            if (const char* environment = std::getenv("STRIX_MTP_MODEL");
+                environment != nullptr) {
+              mtp_path = environment;
+            }
+          }
+          hip::QwenMtpGpuDraftConfig cfg{
+              .max_context = gpu_exec->GetMaxContext(),
+              .max_draft_tokens = static_cast<std::uint32_t>(opt.draft_tokens),
+          };
+          draft_backend = hip::QwenMtpGpuDraftBackend::CreateFromGguf(
+              mtp_path, gpu_exec->GetSharedModel(), cfg, &err);
+          if (draft_backend == nullptr) {
+            std::cerr << "Failed to initialize GPU MTP: " << err << '\n';
+            return 1;
+          }
         } else if (opt.speculative_backend == "self") {
           speculative::SelfSpeculativeConfig cfg;
           cfg.total_layers = config.num_layers;
@@ -332,6 +361,10 @@ int RunPrompt(std::span<const char* const> args) {
           cfg.draft_step_count = opt.draft_tokens;
           draft_backend =
               std::make_unique<speculative::SelfSpeculativeBackend>(cfg);
+        } else {
+          std::cerr << "Unknown speculative backend: "
+                    << opt.speculative_backend << '\n';
+          return 1;
         }
 
         if (draft_backend) {

@@ -55,6 +55,12 @@ public:
       bool compute_logits = true) = 0;
   virtual void SaveState(std::uint32_t valid_context) = 0;
   virtual void RestoreState() = 0;
+  virtual void SetPromptHiddenCapture(bool enabled) { (void)enabled; }
+  [[nodiscard]] virtual std::span<const float> GetPromptHiddenStates()
+      const noexcept {
+    return {};
+  }
+  [[nodiscard]] virtual std::span<const float> CopyLastHidden() { return {}; }
   [[nodiscard]] virtual tokenization::TokenId GetEosTokenId()
       const noexcept = 0;
   [[nodiscard]] virtual std::string_view DecodeToken(
@@ -78,6 +84,11 @@ public:
       const models::GenerationOptions& options,
       const std::function<bool(tokenization::TokenId, std::string_view)>&
           on_token = nullptr);
+
+  /// Resets target and draft state, prefills the prompt, and returns the first
+  /// target token. This setup is outside benchmarked decode regions.
+  [[nodiscard]] tokenization::TokenId Prime(
+      std::span<const tokenization::TokenId> prompt_tokens);
 
   /// Performs a single speculative verification step
   struct StepResult {
@@ -104,6 +115,7 @@ public:
   void Reset() noexcept;
 
 private:
+  void UpdateDraftTargetHidden();
   void UpdateAdaptiveDraftLength(std::size_t accepted, std::size_t drafted);
 
   std::unique_ptr<ISpeculativeTargetExecutor> owned_target_executor_;

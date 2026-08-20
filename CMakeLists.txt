@@ -186,6 +186,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_executor.cpp
     src/core/hip/qwen_gpu_model_loader.cpp
     src/core/hip/qwen_gpu_prefill.cpp
+    src/core/hip/qwen_mtp_gpu.cpp
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
     src/core/speculative/prompt_lookup_backend.cpp
@@ -425,6 +426,14 @@ if (BUILD_TESTING)
     LABELS "cpu;hipblaslt;cache")
 
   if (ENGINE_ENABLE_HIP)
+    add_executable(qwen_mtp_gpu_test
+      tests/kernels/qwen_mtp_gpu_test.cpp)
+    target_link_libraries(qwen_mtp_gpu_test PRIVATE strix_core)
+    add_test(NAME qwen_mtp_gpu_test COMMAND qwen_mtp_gpu_test)
+    set_tests_properties(qwen_mtp_gpu_test PROPERTIES
+      LABELS "gpu;hip;gfx1151;qwen;mtp;external-model"
+      SKIP_RETURN_CODE 77)
+
     add_executable(hipblaslt_runtime_cache_test
       tests/kernels/hipblaslt_runtime_cache_test.cpp)
     target_link_libraries(hipblaslt_runtime_cache_test PRIVATE

@@ -26,6 +26,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   }
 
   arena_.MarkSsmReplayPosition(pos);
+  last_hidden_offset_ = 0;
 
   const auto& config = weights_.config;
   const std::size_t hidden_size = config.hidden_size;
