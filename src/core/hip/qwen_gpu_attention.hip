@@ -609,13 +609,17 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t layer_idx, std::uint32_t pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                     hipStream_t stream, float* split_k_scratch) {
+                     hipStream_t stream, float* split_k_scratch,
+                     bool skip_kv_write) {
   // 1. Write K and V into KV cache across all num_kv_heads (updating FP32 and
-  // FP16 coherently)
-  WriteKVCacheKernel<<<num_kv_heads, 256, 0, stream>>>(
-      k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-      static_cast<__half*>(v_cache_f16), layer_idx, pos, max_context,
-      num_kv_heads, head_dim);
+  // FP16 coherently). May be skipped when a fused kernel already wrote the
+  // cache (opt-c010-qk-rope-kv).
+  if (!skip_kv_write) {
+    WriteKVCacheKernel<<<num_kv_heads, 256, 0, stream>>>(
+        k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
+        static_cast<__half*>(v_cache_f16), layer_idx, pos, max_context,
+        num_kv_heads, head_dim);
+  }
 
   const std::size_t sequence_length = static_cast<std::size_t>(pos) + 1;
   const bool split_k_supported = detail::IsSplitKDecodeAttentionSupported(
@@ -658,11 +662,13 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                     hipStream_t stream) {
-  WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
-      k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-      static_cast<__half*>(v_cache_f16), layer_idx, d_pos, max_context,
-      num_kv_heads, head_dim);
+                     hipStream_t stream, bool skip_kv_write) {
+  if (!skip_kv_write) {
+    WriteKVCachePtrKernel<<<num_kv_heads, 256, 0, stream>>>(
+        k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
+        static_cast<__half*>(v_cache_f16), layer_idx, d_pos, max_context,
+        num_kv_heads, head_dim);
+  }
 
   if (head_dim == 256 && num_kv_heads > 0 && (num_heads % num_kv_heads) == 0) {
     detail::EmitAttentionDispatch("decode_online_fp32_graph", "");
@@ -890,12 +896,14 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             std::uint32_t start_pos, std::size_t batch_size,
                             std::uint32_t max_context, std::uint32_t num_heads,
                             std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                            hipStream_t stream) {
+                            hipStream_t stream, bool skip_kv_write) {
   const dim3 kv_grid(num_kv_heads, static_cast<unsigned int>(batch_size));
-  WriteBatchedKVCacheKernel<<<kv_grid, 256, 0, stream>>>(
-      k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
-      static_cast<__half*>(v_cache_f16), layer_idx, start_pos, batch_size,
-      max_context, num_kv_heads, head_dim);
+  if (!skip_kv_write) {
+    WriteBatchedKVCacheKernel<<<kv_grid, 256, 0, stream>>>(
+        k, v, k_cache, v_cache, static_cast<__half*>(k_cache_f16),
+        static_cast<__half*>(v_cache_f16), layer_idx, start_pos, batch_size,
+        max_context, num_kv_heads, head_dim);
+  }
 
   const dim3 attn_grid(num_heads, static_cast<unsigned int>(batch_size));
   const std::size_t max_seq_len =
@@ -1140,8 +1148,7 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
            half2_index < kTileAttentionKeyHalf2Dim; ++half2_index) {
         const __half2 key_values[2] = {
             kv_tile[(lane * kTileAttentionKeyRowStride) + half2_index],
-            kv_tile[((lane + 32) * kTileAttentionKeyRowStride) +
-                    half2_index]};
+            kv_tile[((lane + 32) * kTileAttentionKeyRowStride) + half2_index]};
 #pragma unroll
         for (std::uint32_t column = 0; column < columns_per_wave; ++column) {
           const std::uint32_t tiled_column = (wave * columns_per_wave) + column;

@@ -175,7 +175,9 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, bool gate_is_bf16,
                            hipStream_t stream = nullptr);
 
 /// Computes Grouped-Query Softmax Attention with KV-cache and optional gating
-/// on GPU (maintaining both FP32 and FP16 cache representations)
+/// on GPU (maintaining both FP32 and FP16 cache representations). When
+/// skip_kv_write is true the KV cache is assumed already written (e.g. by the
+/// fused QK norm+RoPE kernel, opt-c010-qk-rope-kv).
 void LaunchAttention(const float* q, const float* k, const float* v,
                      const float* gate, float* k_cache, float* v_cache,
                      void* k_cache_f16, void* v_cache_f16, float* out_context,
@@ -183,7 +185,8 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
                      hipStream_t stream = nullptr,
-                     float* split_k_scratch = nullptr);
+                     float* split_k_scratch = nullptr,
+                     bool skip_kv_write = false);
 
 /// Computes Grouped-Query Softmax Attention reading position from device memory
 void LaunchAttention(const float* q, const float* k, const float* v,
@@ -192,7 +195,20 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      std::uint32_t layer_idx, const std::uint32_t* d_pos,
                      std::uint32_t max_context, std::uint32_t num_heads,
                      std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                     hipStream_t stream = nullptr);
+                     hipStream_t stream = nullptr, bool skip_kv_write = false);
+
+/// Fuses per-head Q/K RMSNorm, RoPE, and the KV-cache write for a single decode
+/// token into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
+/// q_out and the normed+roped K into k_out, K/V into the FP32+FP16 caches.
+void LaunchFusedQKNormRoPEKvWrite(
+    const float* q, const float* k, const float* v, const float* q_weight,
+    const float* k_weight, float* q_out, float* k_out, float* k_cache,
+    float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    std::uint32_t layer_idx, const std::uint32_t* d_pos,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float rope_theta, float eps = 1e-6F,
+    hipStream_t stream = nullptr);
 
 void LaunchSSMConvRecurrence(
     const float* qkv_in, const float* conv_weights, float* conv_state,
@@ -305,7 +321,9 @@ void LaunchBatchedFusedSwiGLUGEMM(const void* gate_w, bool gate_is_bf16,
                                   std::size_t hidden_size,
                                   hipStream_t stream = nullptr);
 
-/// Batched Causal Attention for B tokens with KV Cache
+/// Batched Causal Attention for B tokens with KV Cache. When skip_kv_write is
+/// true the KV cache is assumed already written by the fused prefill kernel
+/// (opt-c010-qk-rope-kv).
 void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             const float* gate, float* k_cache, float* v_cache,
                             void* k_cache_f16, void* v_cache_f16,
@@ -313,7 +331,21 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             std::uint32_t start_pos, std::size_t batch_size,
                             std::uint32_t max_context, std::uint32_t num_heads,
                             std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                            hipStream_t stream = nullptr);
+                            hipStream_t stream = nullptr,
+                            bool skip_kv_write = false);
+
+/// Batched fuse of per-head Q/K RMSNorm, RoPE, and the KV-cache write across B
+/// tokens into one launch (opt-c010-qk-rope-kv). Writes the normed+roped Q into
+/// q_out and the normed+roped K into k_out, K/V into the FP32+FP16 caches.
+void LaunchBatchedFusedQKNormRoPEKvWrite(
+    const float* q, const float* k, const float* v, const float* q_weight,
+    const float* k_weight, float* q_out, float* k_out, float* k_cache,
+    float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float rope_theta, float eps = 1e-6F,
+    hipStream_t stream = nullptr);
 
 /// Qwen3.8-specific causal GQA tile for gfx1151. The kernel processes 16 query
 /// positions and two query heads per block while reusing one FP16 K/V tile.

@@ -134,20 +134,20 @@ changes.
 ```sh
 MODEL=models/<model>/<artifact>.gguf
 
-./result/bin/strix-bench \
+./result/bin/strix-server bench \
   --model "$MODEL" \
   --n-prompt 128,512,1024,2048,4096 \
   --n-gen 0 \
   --repetitions 3
 
-./result/bin/strix-bench \
+./result/bin/strix-server bench \
   --model "$MODEL" \
   --n-prompt 2048 \
   --n-gen 128 \
   --n-depth 4096,8192,12288,16384 \
   --repetitions 1
 
-./result/bin/strix-bench \
+./result/bin/strix-server bench \
   --model "$MODEL" \
   --validate-prefill 1024 \
   --n-prompt 1024 \
@@ -205,7 +205,7 @@ PMC counters only in a separate diagnostic pass.
   --repetitions 10
 
 STRIX_HIPBLASLT_PLAN_CACHE=/tmp/strix-hipblaslt-plans.bin \
-  ./result/bin/strix-bench ...
+  ./result/bin/strix-server bench ...
 
 ./result/bin/benchmark_ssm_replay \
   --model "$MODEL" \

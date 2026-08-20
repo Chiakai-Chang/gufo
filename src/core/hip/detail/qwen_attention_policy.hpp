@@ -33,6 +33,14 @@ struct AttentionSupportParams {
   return visible_context >= kOptimizedAttentionMinBatch;
 }
 
+// opt-c010-qk-rope-kv: fuse per-head Q/K RMSNorm, RoPE, and the KV-cache write
+// into a single kernel per token (decode) / per token row (prefill). Flip to
+// false to revert to the unfused chain (PerHeadRMSNorm x2 + RoPE +
+// WriteKVCache*), which stays wired as the independent reference.
+[[nodiscard]] constexpr bool ShouldFuseQKNormRoPEKvWrite() noexcept {
+  return true;
+}
+
 [[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
     std::size_t sequence_length) noexcept {
   if (sequence_length < kSplitKDecodeAttentionMinContext) {

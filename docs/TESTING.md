@@ -449,7 +449,7 @@ strix-compare         Compare exact, tolerant, or distribution artifacts
 strix-quality         Run teacher-forced logits, perplexity, and task suites
                       (task suites defined in EVAL.md)
 strix-stress          Run concurrency, cancellation, and lifecycle tests
-strix-bench           Produce correctness-linked performance artifacts
+strix-server bench    Produce correctness-linked performance artifacts
 strix-report          Validate JSON artifacts and render summaries
 ```
 

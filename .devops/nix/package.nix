@@ -112,9 +112,6 @@ stdenv.mkDerivation (finalAttrs: {
     mkdir -p $out/bin
     cp strix $out/bin/strix
     cp strix-server $out/bin/strix-server
-    if [ -f strix-bench ]; then
-      cp strix-bench $out/bin/strix-bench
-    fi
     if [ -f strix-kernel-bench ]; then
       cp strix-kernel-bench $out/bin/strix-kernel-bench
     fi

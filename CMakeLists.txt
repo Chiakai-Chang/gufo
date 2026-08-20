@@ -259,17 +259,9 @@ add_executable(strix-server
 )
 target_link_libraries(strix-server PRIVATE strix_diagnostics strix_core)
 
-add_executable(strix-bench
-  src/bench/main.cpp
-  src/server/bench_cli.cpp
-)
-target_link_libraries(strix-bench PRIVATE strix_diagnostics strix_core)
-
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(strix-server PRIVATE strix_deepseek_v4_flash)
-  target_link_libraries(strix-bench PRIVATE strix_deepseek_v4_flash)
 endif()
-
 add_library(strix_kernel_bench_support STATIC
   src/bench/kernel_bench.cpp
 )
@@ -296,7 +288,7 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(benchmark_ssm_replay PRIVATE strix_core hip::host)
 endif()
 
-install(TARGETS strix strix-server strix-bench DESTINATION bin)
+install(TARGETS strix strix-server DESTINATION bin)
 if (ENGINE_ENABLE_HIP)
   install(TARGETS strix-kernel-bench tune_hipblaslt benchmark_ssm_replay
     DESTINATION bin)
@@ -525,7 +517,7 @@ if (BUILD_TESTING)
     target_link_libraries(qwen_gpu_ops_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME qwen_gpu_ops_test COMMAND qwen_gpu_ops_test)
     set_tests_properties(qwen_gpu_ops_test PROPERTIES
-      LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow")
+      LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;opt-c010-qk-rope-kv")
 
     add_executable(persistent_deltanet_test
       tests/kernels/persistent_deltanet_test.cpp)

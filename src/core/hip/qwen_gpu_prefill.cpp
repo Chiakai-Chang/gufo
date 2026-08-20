@@ -162,28 +162,47 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                             batch_size, config.num_attention_heads,
                             config.head_dim, arena_.stream);
 
-      if (!layer.attn_q_norm.empty()) {
-        LaunchBatchedPerHeadRMSNorm(
-            arena_.d_q, static_cast<const float*>(layer.attn_q_norm.data),
-            arena_.d_q, batch_size, config.num_attention_heads, config.head_dim,
-            eps, arena_.stream);
-      }
-      if (!layer.attn_k_norm.empty()) {
-        LaunchBatchedPerHeadRMSNorm(
-            arena_.d_k, static_cast<const float*>(layer.attn_k_norm.data),
-            arena_.d_k, batch_size, config.num_key_value_heads, config.head_dim,
-            eps, arena_.stream);
-      }
-
-      LaunchBatchedRoPE(arena_.d_q, arena_.d_k, batch_size,
-                        config.num_attention_heads, config.num_key_value_heads,
-                        config.head_dim, config.rotary_dim, start_pos,
-                        config.rope_theta, arena_.stream);
-
       const std::size_t total_k = config.FullAttentionLayerCount() *
                                   config.num_key_value_heads *
                                   arena_.GetMaxContext() * config.head_dim;
       const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
+
+      // QK-Norm + RoPE + KV-cache write fused into one kernel
+      // (opt-c010-qk-rope-kv). The unfused chain stays wired behind the policy
+      // toggle as the independent reference.
+      const bool fused_qknorm_rope_kv = detail::ShouldFuseQKNormRoPEKvWrite();
+      if (fused_qknorm_rope_kv) {
+        LaunchBatchedFusedQKNormRoPEKvWrite(
+            arena_.d_q, arena_.d_k, arena_.d_v,
+            static_cast<const float*>(layer.attn_q_norm.data),
+            static_cast<const float*>(layer.attn_k_norm.data), arena_.d_q,
+            arena_.d_k, arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+            arena_.d_attention_kv_f16,
+            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+            attn_layer_idx, start_pos, batch_size, arena_.GetMaxContext(),
+            config.num_attention_heads, config.num_key_value_heads,
+            config.head_dim, config.rotary_dim, config.rope_theta, eps,
+            arena_.stream);
+      } else {
+        if (!layer.attn_q_norm.empty()) {
+          LaunchBatchedPerHeadRMSNorm(
+              arena_.d_q, static_cast<const float*>(layer.attn_q_norm.data),
+              arena_.d_q, batch_size, config.num_attention_heads,
+              config.head_dim, eps, arena_.stream);
+        }
+        if (!layer.attn_k_norm.empty()) {
+          LaunchBatchedPerHeadRMSNorm(
+              arena_.d_k, static_cast<const float*>(layer.attn_k_norm.data),
+              arena_.d_k, batch_size, config.num_key_value_heads,
+              config.head_dim, eps, arena_.stream);
+        }
+
+        LaunchBatchedRoPE(
+            arena_.d_q, arena_.d_k, batch_size, config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, config.rotary_dim,
+            start_pos, config.rope_theta, arena_.stream);
+      }
+
       const std::size_t visible_context =
           static_cast<std::size_t>(start_pos) + batch_size;
       enum class SelectedAttention {
@@ -237,7 +256,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                     total_k,
                 arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
                 arena_.GetMaxContext(), config.num_attention_heads,
-                config.num_key_value_heads, config.head_dim, arena_.stream);
+                config.num_key_value_heads, config.head_dim, arena_.stream,
+                fused_qknorm_rope_kv);
           });
       if (selected_attention == SelectedAttention::kTiled) {
         detail::EmitAttentionDispatch("prefill_tiled", "");

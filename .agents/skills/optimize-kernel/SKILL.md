@@ -23,17 +23,16 @@ before pushing - it only makes sense during the optimization.
 1. Clean stage state: `git add .` (Nix sees only tracked files).
 2. Probe hardware + print baseline revision: `./result/bin/strix`.
 3. Build:
-   - Fast iteration: `nix develop -c cmake --build --preset hip-test`
-   - Canonical: `nix build` (produces `result/`).
-   Build often. Run a build (fast iteration first) after EVERY step that
-   edits kernels or launchers; never batch several uncommitted kernel edits
-   and only then compile - accumulating broken code between builds turns one
-   small brace mistake into a cascade of confusing secondary errors.
-4. Benchmark with `./result/bin/strix-server bench`. Do NOT pass
+   - Always prefer `nix build` (produces `result/`): it builds fully-optimized release binaries with Nix and `./result/bin/strix-server` runs significantly faster with consistent performance.
+   - `git add .` before `nix build` (Nix sees only tracked files).
+   - Fast incremental compilation check during editing: `nix develop -c cmake --build --preset hip-test`.
+   Build often. Run a build after EVERY step that edits kernels or launchers; never batch several uncommitted kernel edits before compiling.
+4. Benchmark with `./result/bin/strix-server bench` (much faster than dev-build binaries). Do NOT pass
    `--repetitions` (single run per case is the contract; alternate
    baseline/candidate runs).
-   - Decode: `--n-prompt 0 --n-gen 128`
-   - Prefill: `--n-prompt 2048 --n-gen 0`
+   - Fast combined headline run: `-p 2048 -n 128`
+   - Decode only: `--n-prompt 0 --n-gen 128`
+   - Prefill only: `--n-prompt 2048 --n-gen 0`
    - Depth scaling: `--n-prompt 2048 --n-depth 0,4096,8192,16384`
      plus `--n-gen 128 --n-depth 0,4096,8192,16384` for tg. Use powers of
      2; for larger contexts keep the same pp value with deeper blocks.

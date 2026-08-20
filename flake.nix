@@ -33,6 +33,7 @@
           ps.huggingface-hub
           ps.numpy
           ps.scipy
+          ps.pandas
           ps.zstandard
           strixPackages.${system}.hyperloom
         ]);

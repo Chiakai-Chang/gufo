@@ -75,6 +75,10 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
         const bool k_bf16 = layer.attn_k.type == core::GgmlType::kBF16;
         const bool v_bf16 = layer.attn_v.type == core::GgmlType::kBF16;
         const bool o_bf16 = layer.attn_output.type == core::GgmlType::kBF16;
+        const std::size_t total_k = config.FullAttentionLayerCount() *
+                                    config.num_key_value_heads *
+                                    arena_.GetMaxContext() * config.head_dim;
+        const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
 
         LaunchFusedQKVProjections(layer.attn_q.data, q_bf16, layer.attn_k.data,
                                   k_bf16, layer.attn_v.data, v_bf16,
@@ -87,31 +91,44 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                        config.num_attention_heads, config.head_dim,
                        arena_.stream);
 
-        // QK-Norm
-        if (!layer.attn_q_norm.empty()) {
-          LaunchPerHeadRMSNorm(
-              arena_.d_q, static_cast<const float*>(layer.attn_q_norm.data),
-              arena_.d_q, config.num_attention_heads, config.head_dim, 1e-6F,
+        // QK-Norm + RoPE + KV-cache write fused into one kernel
+        // (opt-c010-qk-rope-kv). The unfused chain stays wired behind the
+        // policy toggle as the independent reference.
+        const bool fused_qknorm_rope_kv = detail::ShouldFuseQKNormRoPEKvWrite();
+        if (fused_qknorm_rope_kv) {
+          LaunchFusedQKNormRoPEKvWrite(
+              arena_.d_q, arena_.d_k, arena_.d_v,
+              static_cast<const float*>(layer.attn_q_norm.data),
+              static_cast<const float*>(layer.attn_k_norm.data), arena_.d_q,
+              arena_.d_k, arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+              arena_.d_attention_kv_f16,
+              static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+              attn_layer_idx, d_in_pos, arena_.GetMaxContext(),
+              config.num_attention_heads, config.num_key_value_heads,
+              config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
               arena_.stream);
-        }
-        if (!layer.attn_k_norm.empty()) {
-          LaunchPerHeadRMSNorm(
-              arena_.d_k, static_cast<const float*>(layer.attn_k_norm.data),
-              arena_.d_k, config.num_key_value_heads, config.head_dim, 1e-6F,
-              arena_.stream);
-        }
+        } else {
+          if (!layer.attn_q_norm.empty()) {
+            LaunchPerHeadRMSNorm(
+                arena_.d_q, static_cast<const float*>(layer.attn_q_norm.data),
+                arena_.d_q, config.num_attention_heads, config.head_dim, 1e-6F,
+                arena_.stream);
+          }
+          if (!layer.attn_k_norm.empty()) {
+            LaunchPerHeadRMSNorm(
+                arena_.d_k, static_cast<const float*>(layer.attn_k_norm.data),
+                arena_.d_k, config.num_key_value_heads, config.head_dim, 1e-6F,
+                arena_.stream);
+          }
 
-        // RoPE (using device pos pointer for graph capture invariance)
-        LaunchRoPE(arena_.d_q, arena_.d_k, config.num_attention_heads,
-                   config.num_key_value_heads, config.head_dim,
-                   config.rotary_dim, d_in_pos, config.rope_theta,
-                   arena_.stream);
+          // RoPE (using device pos pointer for graph capture invariance)
+          LaunchRoPE(arena_.d_q, arena_.d_k, config.num_attention_heads,
+                     config.num_key_value_heads, config.head_dim,
+                     config.rotary_dim, d_in_pos, config.rope_theta,
+                     arena_.stream);
+        }
 
         // Softmax Attention + Gating
-        const std::size_t total_k = config.FullAttentionLayerCount() *
-                                    config.num_key_value_heads *
-                                    arena_.GetMaxContext() * config.head_dim;
-        const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
         if (use_split_k_decode) {
           LaunchAttention(
               arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
@@ -121,7 +138,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
               arena_.d_ssm_out, attn_layer_idx, pos, arena_.GetMaxContext(),
               config.num_attention_heads, config.num_key_value_heads,
               config.head_dim, arena_.stream,
-              static_cast<float*>(arena_.d_scratch_bf16));
+              static_cast<float*>(arena_.d_scratch_bf16), fused_qknorm_rope_kv);
         } else {
           LaunchAttention(
               arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
@@ -130,7 +147,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
               static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
               arena_.d_ssm_out, attn_layer_idx, d_in_pos,
               arena_.GetMaxContext(), config.num_attention_heads,
-              config.num_key_value_heads, config.head_dim, arena_.stream);
+              config.num_key_value_heads, config.head_dim, arena_.stream,
+              fused_qknorm_rope_kv);
         }
 
         // Output projection

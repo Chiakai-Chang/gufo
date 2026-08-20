@@ -45,18 +45,18 @@ MODEL=models/Qwen3.8-27B-GGUF/BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf
 Measure Strix prompt processing, shallow decode, and context depth:
 
 ```sh
-./result/bin/strix-bench \
+./result/bin/strix-server bench \
   --model "$MODEL" \
   --n-prompt 32,64,128,256,512,1024,2048,4096 \
   --n-gen 0 \
   --repetitions 3
 
-./result/bin/strix-bench \
+./result/bin/strix-server bench \
   --model "$MODEL" \
   --n-gen 8,128 \
   --repetitions 3
 
-./result/bin/strix-bench \
+./result/bin/strix-server bench \
   --model "$MODEL" \
   --n-prompt 2048 \
   --n-gen 128 \
@@ -67,7 +67,7 @@ Measure Strix prompt processing, shallow decode, and context depth:
 Check the complete final-token vocabulary against sequential execution:
 
 ```sh
-./result/bin/strix-bench \
+./result/bin/strix-server bench \
   --model "$MODEL" \
   --validate-prefill 1024 \
   --n-prompt 1024 \
@@ -180,14 +180,14 @@ verification.
 ```sh
 MTP_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf
 
-./result/bin/strix-bench --model "$MODEL" \
+./result/bin/strix-server bench --model "$MODEL" \
   --n-prompt 1 --n-gen 128 --repetitions 1
 
-./result/bin/strix-bench --model "$MODEL" \
+./result/bin/strix-server bench --model "$MODEL" \
   --n-prompt 1 --n-gen 128 --repetitions 1 \
   --speculative mtp --mtp-model "$MTP_MODEL" --draft-tokens 2
 
-./result/bin/strix-bench --model "$MODEL" \
+./result/bin/strix-server bench --model "$MODEL" \
   --n-prompt 1 --n-gen 128 --repetitions 1 \
   --speculative mtp-npu --mtp-model "$MTP_MODEL" --draft-tokens 2 --verbose
 ```
@@ -219,6 +219,7 @@ GPU execution is the default.
 | DeltaNet | Persistent two-lane recurrence and recurrent-only rollback |
 | Prefill attention | Native causal GQA tile with conflict-free LDS layout |
 | Decode attention | Online softmax below 4K; split-K at 4K and above |
+| Q/K Norm & RoPE | Fused per-head Q/K RMSNorm, RoPE, and KV-cache write per layer |
 | HTTP | Shared immutable model with request-owned HIP sessions |
 | MTP | Real GPU draft layer; optional XDNA2 W4A8 `eh_proj` offload |
 | Optional tuning | Hardware-bound hipBLASLt plan database |
@@ -235,6 +236,7 @@ decode is 1.07-1.09x behind, while shallow decode is about 7% faster.
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
+| Q/K Norm & RoPE | Fused Q/K RMSNorm + RoPE + KV-cache write into single kernel | Unfused 4-kernel launch chain per layer |
 | Speculation | Exact target verification and explicit GPU/XDNA2 MTP experiments | MTP as a default route while it reduces decode throughput |
 
 This table records only decisions that affect the current direction. Detailed
