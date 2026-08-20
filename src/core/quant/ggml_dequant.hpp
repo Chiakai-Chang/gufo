@@ -10,6 +10,11 @@
 
 namespace strix::quant {
 
+/// Returns the encoded byte count for one logical row, or zero when the type
+/// is unsupported or the element count is not block aligned.
+[[nodiscard]] std::size_t QuantizedRowBytes(core::GgmlType type,
+                                            std::size_t elements) noexcept;
+
 // Standard 16-bit float helper
 float Fp16ToFloat(std::uint16_t h) noexcept;
 

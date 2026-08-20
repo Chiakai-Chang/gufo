@@ -161,9 +161,11 @@ add_library(strix_core STATIC
   src/models/qwen_ssm.cpp
   src/models/qwen_forward.cpp
   src/models/qwen_generator.cpp
+  src/core/speculative/qwen_mtp_reference.cpp
   src/testing/compare/logit_comparator.cpp
   src/eval/regrade.cpp
   src/core/hip/hipblaslt_plan_database.cpp
+  src/core/quant/ggml_dequant.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 
@@ -189,7 +191,6 @@ if (ENGINE_ENABLE_HIP)
     src/core/speculative/prompt_lookup_backend.cpp
     src/core/speculative/speculative_verifier.cpp
     src/core/heterogeneous/npu_drafter.cpp
-    src/core/quant/ggml_dequant.cpp
   )
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
   target_include_directories(strix_core SYSTEM PRIVATE
@@ -336,6 +337,21 @@ if (BUILD_TESTING)
 
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   set_tests_properties(gguf_reader_test PROPERTIES LABELS "cpu;core;gguf;model_config")
+
+  add_executable(ggml_dequant_test tests/core/ggml_dequant_test.cpp)
+  target_link_libraries(ggml_dequant_test PRIVATE strix_core)
+
+  add_test(NAME ggml_dequant_test COMMAND ggml_dequant_test)
+  set_tests_properties(ggml_dequant_test PROPERTIES LABELS "cpu;core;quant")
+
+  add_executable(qwen_mtp_reference_test
+    tests/core/qwen_mtp_reference_test.cpp)
+  target_link_libraries(qwen_mtp_reference_test PRIVATE strix_core)
+
+  add_test(NAME qwen_mtp_reference_test COMMAND qwen_mtp_reference_test)
+  set_tests_properties(qwen_mtp_reference_test PROPERTIES
+    LABELS "cpu;core;qwen;mtp;external-model"
+    SKIP_RETURN_CODE 77)
 
   add_executable(qwen_tokenizer_test tests/tokenization/qwen_tokenizer_test.cpp)
   target_link_libraries(qwen_tokenizer_test PRIVATE strix_core)

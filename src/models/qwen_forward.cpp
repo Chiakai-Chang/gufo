@@ -7,13 +7,57 @@
 #include <cstring>
 #include <span>
 
+#include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen_oracles.hpp"
 
 namespace strix::models {
+namespace {
+
+const void* QuantizedRow(const QwenTensorRef& tensor, std::size_t row,
+                         std::size_t columns) noexcept {
+  const std::size_t row_bytes = quant::QuantizedRowBytes(tensor.type, columns);
+  if (row_bytes == 0) {
+    return nullptr;
+  }
+  return static_cast<const std::uint8_t*>(tensor.data) + (row * row_bytes);
+}
+
+float QuantizedDot(const QwenTensorRef& tensor, const void* row,
+                   std::span<const float> input, std::size_t columns) noexcept {
+  switch (tensor.type) {
+    case core::GgmlType::kQ3_K:
+      return quant::DotProductQ3_K(row, input, columns);
+    case core::GgmlType::kQ4_K:
+      return quant::DotProductQ4_K(row, input, columns);
+    case core::GgmlType::kQ6_K:
+      return quant::DotProductQ6_K(row, input, columns);
+    default:
+      return 0.0F;
+  }
+}
+
+void DequantizeRow(const QwenTensorRef& tensor, const void* row, float* output,
+                   std::size_t columns) noexcept {
+  switch (tensor.type) {
+    case core::GgmlType::kQ3_K:
+      quant::DequantizeQ3_K(row, output, columns);
+      break;
+    case core::GgmlType::kQ4_K:
+      quant::DequantizeQ4_K(row, output, columns);
+      break;
+    case core::GgmlType::kQ6_K:
+      quant::DequantizeQ6_K(row, output, columns);
+      break;
+    default:
+      break;
+  }
+}
+
+}  // namespace
 
 void TensorGEMV(const QwenTensorRef& A, std::span<const float> x, std::size_t M,
                 std::size_t K, std::span<float> y) noexcept {
-  if (A.empty() || y.size() < M) {
+  if (A.empty() || x.size() < K || y.size() < M) {
     return;
   }
   if (A.type == core::GgmlType::kF32) {
@@ -41,6 +85,12 @@ void TensorGEMV(const QwenTensorRef& A, std::span<const float> x, std::size_t M,
       }
       y[m] = dot;
     }
+  } else if (quant::QuantizedRowBytes(A.type, K) != 0) {
+#pragma omp parallel for schedule(static)
+    for (std::size_t m = 0; m < M; ++m) {
+      const void* row = QuantizedRow(A, m, K);
+      y[m] = QuantizedDot(A, row, x, K);
+    }
   }
 }
 
@@ -62,6 +112,9 @@ void ForwardEmbedding(std::uint32_t token_id, const QwenTensorRef& token_embd,
         std::memcpy(&f, &u32, sizeof(float));
         hidden_out[i] = f;
       }
+    } else if (quant::QuantizedRowBytes(token_embd.type, hidden_size) != 0) {
+      const void* row = QuantizedRow(token_embd, token_id, hidden_size);
+      DequantizeRow(token_embd, row, hidden_out.data(), hidden_size);
     }
   }
 }

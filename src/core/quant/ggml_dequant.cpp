@@ -1,5 +1,6 @@
 #include "src/core/quant/ggml_dequant.hpp"
 
+#include <array>
 #include <cmath>
 #include <cstring>
 
@@ -57,23 +58,136 @@ struct block_q3_K {
 };
 #pragma pack(pop)
 
+static_assert(sizeof(block_q4_K) == 144);
+static_assert(sizeof(block_q6_K) == 210);
+static_assert(sizeof(block_q3_K) == 110);
+
+namespace {
+
+void GetQ4ScaleMin(std::size_t index, const std::uint8_t* packed,
+                   std::uint8_t& scale, std::uint8_t& minimum) noexcept {
+  if (index < 4) {
+    scale = packed[index] & 0x3FU;
+    minimum = packed[index + 4] & 0x3FU;
+    return;
+  }
+  scale = static_cast<std::uint8_t>((packed[index + 4] & 0x0FU) |
+                                    ((packed[index - 4] >> 6U) << 4U));
+  minimum = static_cast<std::uint8_t>((packed[index + 4] >> 4U) |
+                                      ((packed[index] >> 6U) << 4U));
+}
+
+std::array<std::int8_t, 16> UnpackQ3Scales(
+    const std::uint8_t* packed) noexcept {
+  std::array<std::int8_t, 16> scales{};
+  for (std::size_t index = 0; index < scales.size(); ++index) {
+    const auto low =
+        index < 8 ? packed[index] & 0x0FU : (packed[index - 8] >> 4U) & 0x0FU;
+    const auto high = (packed[8 + (index % 4)] >> (2U * (index / 4))) & 0x03U;
+    scales[index] =
+        static_cast<std::int8_t>(static_cast<int>(low | (high << 4U)) - 32);
+  }
+  return scales;
+}
+
+float Q4Value(const block_q4_K& block, std::size_t index) noexcept {
+  const std::size_t group = index / 32;
+  const std::size_t pair = group / 2;
+  const bool high_nibble = (group & 1U) != 0;
+  const std::size_t lane = index % 32;
+  const std::uint8_t packed = block.qs[(pair * 32) + lane];
+  const std::uint8_t quant = high_nibble ? packed >> 4U : packed & 0x0FU;
+  std::uint8_t scale = 0;
+  std::uint8_t minimum = 0;
+  GetQ4ScaleMin(group, block.scales, scale, minimum);
+  return Fp16ToFloat(block.d) * static_cast<float>(scale) *
+             static_cast<float>(quant) -
+         Fp16ToFloat(block.dmin) * static_cast<float>(minimum);
+}
+
+float Q6Value(const block_q6_K& block, std::size_t index) noexcept {
+  const std::size_t half = index / 128;
+  const std::size_t within_half = index % 128;
+  const std::size_t segment = within_half / 32;
+  const std::size_t lane = within_half % 32;
+  const std::size_t ql_base = half * 64;
+  const std::uint8_t qh = block.qh[(half * 32) + lane];
+
+  std::uint8_t low = 0;
+  std::uint8_t high = 0;
+  switch (segment) {
+    case 0:
+      low = block.ql[ql_base + lane] & 0x0FU;
+      high = qh & 0x03U;
+      break;
+    case 1:
+      low = block.ql[ql_base + 32 + lane] & 0x0FU;
+      high = (qh >> 2U) & 0x03U;
+      break;
+    case 2:
+      low = block.ql[ql_base + lane] >> 4U;
+      high = (qh >> 4U) & 0x03U;
+      break;
+    default:
+      low = block.ql[ql_base + 32 + lane] >> 4U;
+      high = (qh >> 6U) & 0x03U;
+      break;
+  }
+
+  const std::size_t scale_index = (half * 8) + (lane / 16) + (segment * 2);
+  const auto quant =
+      static_cast<std::int8_t>(static_cast<int>((high << 4U) | low) - 32);
+  return Fp16ToFloat(block.d) * static_cast<float>(block.scales[scale_index]) *
+         static_cast<float>(quant);
+}
+
+float Q3Value(const block_q3_K& block,
+              const std::array<std::int8_t, 16>& scales,
+              std::size_t index) noexcept {
+  const std::size_t half = index / 128;
+  const std::size_t within_half = index % 128;
+  const std::size_t scale_pair = within_half / 32;
+  const std::size_t lane = within_half % 32;
+  const std::size_t quant_index = (half * 32) + lane;
+  const std::uint8_t shift = static_cast<std::uint8_t>(2U * scale_pair);
+  const std::uint8_t high_mask =
+      static_cast<std::uint8_t>(1U << ((half * 4) + scale_pair));
+  const auto low =
+      static_cast<std::int8_t>((block.qs[quant_index] >> shift) & 0x03U);
+  const auto quant = static_cast<std::int8_t>(
+      static_cast<int>(low) - ((block.hmask[lane] & high_mask) != 0 ? 0 : 4));
+  const std::size_t scale_index = (half * 8) + (scale_pair * 2) + (lane / 16);
+  return Fp16ToFloat(block.d) * static_cast<float>(scales[scale_index]) *
+         static_cast<float>(quant);
+}
+
+}  // namespace
+
+std::size_t QuantizedRowBytes(core::GgmlType type,
+                              std::size_t elements) noexcept {
+  if ((elements % 256U) != 0) {
+    return 0;
+  }
+  const std::size_t blocks = elements / 256U;
+  switch (type) {
+    case core::GgmlType::kQ3_K:
+      return blocks * sizeof(block_q3_K);
+    case core::GgmlType::kQ4_K:
+      return blocks * sizeof(block_q4_K);
+    case core::GgmlType::kQ6_K:
+      return blocks * sizeof(block_q6_K);
+    default:
+      return 0;
+  }
+}
+
 void DequantizeQ4_K(const void* src, float* dst, std::size_t k) {
   const auto* blocks = static_cast<const block_q4_K*>(src);
   const std::size_t nb = k / 256;
 
   for (std::size_t b = 0; b < nb; ++b) {
-    const float d = Fp16ToFloat(blocks[b].d);
-    const float min = Fp16ToFloat(blocks[b].dmin);
-    const auto* scales = blocks[b].scales;
-    const auto* qs = blocks[b].qs;
-
     for (std::size_t i = 0; i < 256; ++i) {
-      const std::size_t is = i / 32;
-      const std::size_t sc_idx = is < 4 ? is : is + 4;
-      const std::uint8_t sc = (scales[sc_idx / 2] >> ((sc_idx % 2) * 4)) & 0x0F;
-      const std::uint8_t q = (qs[i / 2] >> ((i % 2) * 4)) & 0x0F;
-      dst[b * 256 + i] =
-          d * static_cast<float>(sc) * static_cast<float>(q) - min;
+      dst[(b * 256) + i] = Q4Value(blocks[b], i);
     }
   }
 }
@@ -83,18 +197,8 @@ void DequantizeQ6_K(const void* src, float* dst, std::size_t k) {
   const std::size_t nb = k / 256;
 
   for (std::size_t b = 0; b < nb; ++b) {
-    const float d = Fp16ToFloat(blocks[b].d);
-    const auto* ql = blocks[b].ql;
-    const auto* qh = blocks[b].qh;
-    const auto* sc = blocks[b].scales;
-
     for (std::size_t i = 0; i < 256; ++i) {
-      const std::size_t is = i / 16;
-      const std::int8_t scale = sc[is];
-      const std::uint8_t l = (ql[i / 2] >> ((i % 2) * 4)) & 0x0F;
-      const std::uint8_t h = (qh[i / 4] >> ((i % 4) * 2)) & 0x03;
-      const std::int8_t q = static_cast<std::int8_t>((h << 4) | l) - 32;
-      dst[b * 256 + i] = d * static_cast<float>(scale) * static_cast<float>(q);
+      dst[(b * 256) + i] = Q6Value(blocks[b], i);
     }
   }
 }
@@ -104,11 +208,9 @@ void DequantizeQ3_K(const void* src, float* dst, std::size_t k) {
   const std::size_t nb = k / 256;
 
   for (std::size_t b = 0; b < nb; ++b) {
-    const float d = Fp16ToFloat(blocks[b].d);
-    const auto* qs = blocks[b].qs;
+    const auto scales = UnpackQ3Scales(blocks[b].scales);
     for (std::size_t i = 0; i < 256; ++i) {
-      const std::uint8_t q = (qs[i / 4] >> ((i % 4) * 2)) & 0x03;
-      dst[b * 256 + i] = d * static_cast<float>(static_cast<int>(q) - 2);
+      dst[(b * 256) + i] = Q3Value(blocks[b], scales, i);
     }
   }
 }
@@ -120,19 +222,10 @@ float DotProductQ4_K(const void* row_data, std::span<const float> vec,
   float sum = 0.0F;
 
   for (std::size_t b = 0; b < nb; ++b) {
-    const float d = Fp16ToFloat(blocks[b].d);
-    const float min = Fp16ToFloat(blocks[b].dmin);
-    const auto* scales = blocks[b].scales;
-    const auto* qs = blocks[b].qs;
     const float* v = vec.data() + b * 256;
 
     for (std::size_t i = 0; i < 256; ++i) {
-      const std::size_t is = i / 32;
-      const std::size_t sc_idx = is < 4 ? is : is + 4;
-      const std::uint8_t sc = (scales[sc_idx / 2] >> ((sc_idx % 2) * 4)) & 0x0F;
-      const std::uint8_t q = (qs[i / 2] >> ((i % 2) * 4)) & 0x0F;
-      const float w = d * static_cast<float>(sc) * static_cast<float>(q) - min;
-      sum += w * v[i];
+      sum += Q4Value(blocks[b], i) * v[i];
     }
   }
   return sum;
@@ -145,20 +238,10 @@ float DotProductQ6_K(const void* row_data, std::span<const float> vec,
   float sum = 0.0F;
 
   for (std::size_t b = 0; b < nb; ++b) {
-    const float d = Fp16ToFloat(blocks[b].d);
-    const auto* ql = blocks[b].ql;
-    const auto* qh = blocks[b].qh;
-    const auto* sc = blocks[b].scales;
     const float* v = vec.data() + b * 256;
 
     for (std::size_t i = 0; i < 256; ++i) {
-      const std::size_t is = i / 16;
-      const std::int8_t scale = sc[is];
-      const std::uint8_t l = (ql[i / 2] >> ((i % 2) * 4)) & 0x0F;
-      const std::uint8_t h = (qh[i / 4] >> ((i % 4) * 2)) & 0x03;
-      const std::int8_t q = static_cast<std::int8_t>((h << 4) | l) - 32;
-      const float w = d * static_cast<float>(scale) * static_cast<float>(q);
-      sum += w * v[i];
+      sum += Q6Value(blocks[b], i) * v[i];
     }
   }
   return sum;
@@ -171,14 +254,11 @@ float DotProductQ3_K(const void* row_data, std::span<const float> vec,
   float sum = 0.0F;
 
   for (std::size_t b = 0; b < nb; ++b) {
-    const float d = Fp16ToFloat(blocks[b].d);
-    const auto* qs = blocks[b].qs;
+    const auto scales = UnpackQ3Scales(blocks[b].scales);
     const float* v = vec.data() + b * 256;
 
     for (std::size_t i = 0; i < 256; ++i) {
-      const std::uint8_t q = (qs[i / 4] >> ((i % 4) * 2)) & 0x03;
-      const float w = d * static_cast<float>(static_cast<int>(q) - 2);
-      sum += w * v[i];
+      sum += Q3Value(blocks[b], scales, i) * v[i];
     }
   }
   return sum;
