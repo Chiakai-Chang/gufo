@@ -4,7 +4,7 @@
 
 #include "src/core/heterogeneous/npu_drafter.hpp"
 
-void TestNpuDrafterInitialization() {
+void TestNpuDraftFallback() {
   strix::heterogeneous::NpuDrafterConfig config;
   config.mtp_model_path.clear();
   config.enable_xrt = false;
@@ -17,7 +17,8 @@ void TestNpuDrafterInitialization() {
   assert(!drafter.HasMtpModel());
   assert(!drafter.GetStatusMessage().empty());
 
-  std::cout << "NPU Drafter status: " << drafter.GetStatusMessage() << "\n";
+  std::cout << "NPU draft fallback status: " << drafter.GetStatusMessage()
+            << "\n";
 
   const std::vector<strix::tokenization::TokenId> prompt = {10, 20, 30, 40,
                                                             50, 60, 10, 20};
@@ -39,7 +40,7 @@ void TestNpuDrafterInitialization() {
 }
 
 int main() {
-  TestNpuDrafterInitialization();
-  std::cout << "All NPU speculative tests passed.\n";
+  TestNpuDraftFallback();
+  std::cout << "NPU draft fallback test passed.\n";
   return 0;
 }

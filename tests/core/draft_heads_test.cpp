@@ -1,8 +1,9 @@
+#include "src/core/speculative/draft_heads.hpp"
+
 #include <cassert>
 #include <iostream>
 #include <vector>
 
-#include "src/core/speculative/draft_heads.hpp"
 #include "src/core/speculative/self_speculative.hpp"
 
 void TestMtpDraftBackend() {
@@ -56,6 +57,6 @@ void TestSelfSpeculativeBackend() {
 int main() {
   TestMtpDraftBackend();
   TestSelfSpeculativeBackend();
-  std::cout << "All MTP and self-speculative draft head tests passed.\n";
+  std::cout << "Draft heads test passed.\n";
   return 0;
 }

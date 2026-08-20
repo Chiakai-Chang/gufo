@@ -1,5 +1,3 @@
-#include "src/core/xdna2/qwen_mtp_rmsnorm.h"
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -19,6 +17,7 @@
 #include "src/core/diagnostics/system_inventory.h"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/xdna2/device.h"
+#include "src/core/xdna2/qwen_mtp_rmsnorm.h"
 #include "src/models/qwen_oracles.hpp"
 
 namespace {
@@ -352,7 +351,8 @@ int main() {
     const auto model_weight = LoadModelWeight(model);
     RunCase(device_info, model_weight, "qwen3.8-mtp");
   } else {
-    std::cout << "qwen3.8-mtp: skipped (STRIX_MTP_MODEL not set)\n";
+    std::cout << "qwen3.8-mtp XDNA2 RMSNorm: skipped "
+                 "(STRIX_MTP_MODEL not set)\n";
   }
   return 0;
 }

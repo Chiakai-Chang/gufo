@@ -56,10 +56,10 @@ Reproducible CMake presets are configured in `CMakePresets.json` and must be ent
 | --- | --- | --- |
 | `development` | Development | CPU-only Debug build with warnings (`-Wall -Wextra -Wpedantic`) |
 | `release` | Release | CPU-only optimized Release build |
-| `sanitizer` | Diagnostics | CPU-only build with AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) |
-| `test` | Unit Tests | CPU-only test suite executed with CTest |
-| `hip-test` | GPU Tests | ROCm/HIP enabled for `gfx1151` without XRT |
-| `npu-test` | Full Stack Tests | Pinned ROCm/HIP (`gfx1151`) and XRT (`XDNA2`) research stack |
+| `cpu-sanitizer` | Diagnostics | CPU-only build with AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) |
+| `cpu-test` | Unit Tests | CPU-only test suite executed with CTest |
+| `gpu-test` | GPU Tests | ROCm/HIP enabled for `gfx1151` without XRT |
+| `hardware-test` | Full Hardware Build | Pinned ROCm/HIP (`gfx1151`) and XRT (`XDNA2`) stacks |
 
 ### Development Workflow
 
@@ -73,24 +73,24 @@ nix develop -c cmake --preset release
 nix develop -c cmake --build --preset release
 
 # Sanitizer build & test
-nix develop -c cmake --preset sanitizer
-nix develop -c cmake --build --preset sanitizer
-nix develop -c ctest --preset sanitizer --output-on-failure
+nix develop -c cmake --preset cpu-sanitizer
+nix develop -c cmake --build --preset cpu-sanitizer
+nix develop -c ctest --preset cpu-sanitizer --output-on-failure
 
 # CPU tests
-nix develop -c cmake --preset test
-nix develop -c cmake --build --preset test
-nix develop -c ctest --preset test --output-on-failure
+nix develop -c cmake --preset cpu-test
+nix develop -c cmake --build --preset cpu-test
+nix develop -c ctest --preset cpu-test --output-on-failure
 
 # HIP GPU tests (gfx1151)
-nix develop -c cmake --preset hip-test
-nix develop -c cmake --build --preset hip-test
-nix develop -c ctest --preset hip-test --output-on-failure
+nix develop -c cmake --preset gpu-test
+nix develop -c cmake --build --preset gpu-test
+nix develop -c ctest --preset gpu-full --output-on-failure
 
-# NPU tests (HIP + XRT)
-nix develop -c cmake --preset npu-test
-nix develop -c cmake --build --preset npu-test
-nix develop -c ctest --preset npu-test --output-on-failure
+# Complete gfx1151 and XDNA2 tests
+nix develop -c cmake --preset hardware-test
+nix develop -c cmake --build --preset hardware-test
+nix develop -c ctest --preset hardware-full --output-on-failure
 ```
 
 Hardware presets label tests so unavailable devices skip normally during development. Strict presence validation can be enforced with:

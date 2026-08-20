@@ -57,6 +57,6 @@ int main() {
   TestPromptLookupExactMatch();
   TestPromptLookupNoMatchReturnsEmpty();
   TestPromptLookupShortSequence();
-  std::cout << "All Prompt Lookup Decoding tests passed.\n";
+  std::cout << "Prompt lookup test passed.\n";
   return 0;
 }

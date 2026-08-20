@@ -1,5 +1,3 @@
-#include "src/core/xdna2/qwen_mtp_eh_proj.h"
-
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -20,6 +18,7 @@
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/core/speculative/qwen_mtp_reference.hpp"
 #include "src/core/xdna2/device.h"
+#include "src/core/xdna2/qwen_mtp_eh_proj.h"
 
 namespace {
 
@@ -280,7 +279,8 @@ int main() {
     TestSynthetic(device);
     return 0;
   } catch (const std::exception& exception) {
-    std::cerr << "qwen_mtp_eh_proj_test failed: " << exception.what() << '\n';
+    std::cerr << "qwen_mtp_xdna2_eh_proj_test failed: " << exception.what()
+              << '\n';
     return 1;
   }
 }

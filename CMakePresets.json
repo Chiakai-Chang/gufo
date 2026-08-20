@@ -41,8 +41,8 @@
       }
     },
     {
-      "name": "sanitizer",
-      "displayName": "Sanitizer (CPU-only)",
+      "name": "cpu-sanitizer",
+      "displayName": "CPU Sanitizer",
       "description": "CPU-only build with AddressSanitizer and UndefinedBehaviorSanitizer enabled",
       "inherits": "base",
       "cacheVariables": {
@@ -54,8 +54,8 @@
       }
     },
     {
-      "name": "test",
-      "displayName": "Test (CPU-only)",
+      "name": "cpu-test",
+      "displayName": "CPU Tests",
       "description": "CPU-only build for running unit and smoke tests with CTest",
       "inherits": "base",
       "cacheVariables": {
@@ -66,8 +66,8 @@
       }
     },
     {
-      "name": "hip-test",
-      "displayName": "HIP Test (gfx1151 GPU)",
+      "name": "gpu-test",
+      "displayName": "gfx1151 GPU Tests",
       "description": "Build enabling ROCm/HIP for gfx1151 GPU without XRT",
       "inherits": "base",
       "cacheVariables": {
@@ -79,9 +79,9 @@
       }
     },
     {
-      "name": "npu-test",
-      "displayName": "NPU Test (HIP + XRT)",
-      "description": "Build enabling pinned HIP and XRT research stack for gfx1151 and XDNA2",
+      "name": "hardware-test",
+      "displayName": "gfx1151 and XDNA2 Hardware Tests",
+      "description": "Build enabling the pinned HIP and XRT stacks for gfx1151 and XDNA2",
       "inherits": "base",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
@@ -104,24 +104,24 @@
       "configurePreset": "release"
     },
     {
-      "name": "sanitizer",
-      "displayName": "Sanitizer",
-      "configurePreset": "sanitizer"
+      "name": "cpu-sanitizer",
+      "displayName": "CPU Sanitizer",
+      "configurePreset": "cpu-sanitizer"
     },
     {
-      "name": "test",
-      "displayName": "Test",
-      "configurePreset": "test"
+      "name": "cpu-test",
+      "displayName": "CPU Tests",
+      "configurePreset": "cpu-test"
     },
     {
-      "name": "hip-test",
-      "displayName": "HIP Test",
-      "configurePreset": "hip-test"
+      "name": "gpu-test",
+      "displayName": "gfx1151 GPU Tests",
+      "configurePreset": "gpu-test"
     },
     {
-      "name": "npu-test",
-      "displayName": "NPU Test",
-      "configurePreset": "npu-test"
+      "name": "hardware-test",
+      "displayName": "gfx1151 and XDNA2 Hardware Tests",
+      "configurePreset": "hardware-test"
     }
   ],
   "testPresets": [
@@ -134,25 +134,17 @@
       }
     },
     {
-      "name": "release",
-      "displayName": "Release Tests",
-      "configurePreset": "release",
+      "name": "cpu-sanitizer",
+      "displayName": "CPU ASan and UBSan Tests",
+      "configurePreset": "cpu-sanitizer",
       "output": {
         "outputOnFailure": true
       }
     },
     {
-      "name": "sanitizer",
-      "displayName": "Sanitizer Tests",
-      "configurePreset": "sanitizer",
-      "output": {
-        "outputOnFailure": true
-      }
-    },
-    {
-      "name": "test",
+      "name": "cpu-test",
       "displayName": "CPU Tests",
-      "configurePreset": "test",
+      "configurePreset": "cpu-test",
       "output": {
         "outputOnFailure": true
       },
@@ -163,25 +155,25 @@
       }
     },
     {
-      "name": "hip-test",
-      "displayName": "HIP GPU Tests",
-      "configurePreset": "hip-test",
+      "name": "gpu-full",
+      "displayName": "All gfx1151 GPU Tests",
+      "configurePreset": "gpu-test",
       "output": {
         "outputOnFailure": true
       }
     },
     {
-      "name": "npu-test",
-      "displayName": "NPU Tests",
-      "configurePreset": "npu-test",
+      "name": "hardware-full",
+      "displayName": "Complete gfx1151 and XDNA2 Test Suite",
+      "configurePreset": "hardware-test",
       "output": {
         "outputOnFailure": true
       }
     },
     {
-      "name": "npu-fast",
-      "displayName": "Fast HIP and XRT Tests",
-      "configurePreset": "npu-test",
+      "name": "hardware-fast",
+      "displayName": "Fast gfx1151 and XDNA2 Tests",
+      "configurePreset": "hardware-test",
       "output": {
         "outputOnFailure": true
       },
@@ -192,9 +184,9 @@
       }
     },
     {
-      "name": "npu-deepseek",
-      "displayName": "DeepSeek V4 Flash Model Tests",
-      "configurePreset": "npu-test",
+      "name": "deepseek-gpu",
+      "displayName": "DeepSeek V4 Flash GPU Model Tests",
+      "configurePreset": "hardware-test",
       "output": {
         "outputOnFailure": true
       },
@@ -205,9 +197,9 @@
       }
     },
     {
-      "name": "npu-qwen-kernel-oracle",
+      "name": "qwen-gpu-kernel-oracle",
       "displayName": "Qwen Comprehensive GPU Kernel Oracle",
-      "configurePreset": "npu-test",
+      "configurePreset": "hardware-test",
       "output": {
         "outputOnFailure": true
       },
@@ -218,9 +210,9 @@
       }
     },
     {
-      "name": "npu-xrt-hardware",
-      "displayName": "XDNA2 XRT Hardware Tests",
-      "configurePreset": "npu-test",
+      "name": "xdna2-programs",
+      "displayName": "XDNA2 Program Tests",
+      "configurePreset": "hardware-test",
       "output": {
         "outputOnFailure": true
       },

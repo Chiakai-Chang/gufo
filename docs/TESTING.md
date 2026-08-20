@@ -532,19 +532,19 @@ command. Run the smallest tier that covers the ownership boundary changed:
 
 | Change | Required hardware tests |
 | --- | --- |
-| Repository-owned code without model or accelerator changes | `ctest --preset npu-fast` |
-| DeepSeek graph, kernels, state, or server adapter | `ctest --preset npu-fast` and `ctest --preset npu-deepseek` |
-| Qwen compute kernels | `ctest --preset npu-fast` and `ctest --preset npu-qwen-kernel-oracle` |
-| XRT/AIE program or NPU runtime | `ctest --preset npu-fast` and `ctest --preset npu-xrt-hardware` |
-| Shared allocator, dispatch, toolchain, or cross-model runtime | `ctest --preset npu-test` |
+| Repository-owned code without model or accelerator changes | `ctest --preset hardware-fast` |
+| DeepSeek graph, kernels, state, or server adapter | `ctest --preset hardware-fast` and `ctest --preset deepseek-gpu` |
+| Qwen compute kernels | `ctest --preset hardware-fast` and `ctest --preset qwen-gpu-kernel-oracle` |
+| XRT/AIE program or XDNA2 runtime | `ctest --preset hardware-fast` and `ctest --preset xdna2-programs` |
+| Shared allocator, dispatch, toolchain, or cross-model runtime | `ctest --preset hardware-full` |
 
-`npu-fast` excludes tests labeled `slow` or `external-model`. The model presets
+`hardware-fast` excludes tests labeled `slow` or `external-model`. The model presets
 require their documented model environment variables. The comprehensive Qwen
 kernel oracle and real-model DeepSeek tests remain mandatory when their owned
 implementation changes, but unrelated model/device suites need not run on
 every iteration.
 
-Run the complete `npu-test` preset before merging shared runtime or toolchain
+Run the complete `hardware-full` preset before merging shared runtime or toolchain
 changes, and periodically as a scheduled/manual retention gate. This preserves
 cross-system coverage without charging every model-private edit for every
 other model and accelerator.

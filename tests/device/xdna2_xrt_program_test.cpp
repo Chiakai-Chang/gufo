@@ -60,7 +60,7 @@ int main() {
   missing_program.iterations = 1;
   missing_program.program_dir =
       std::filesystem::temp_directory_path() /
-      ("strix-xrt-smoke-missing-" +
+      ("strix-xdna2-program-missing-" +
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
   const auto missing_report =
@@ -87,7 +87,7 @@ int main() {
 
   const auto validation =
       strix::diagnostics::ValidateArtifactContent(report.ToJson());
-  Expect(validation.is_valid, "smoke JSON validates");
+  Expect(validation.is_valid, "XDNA2 program JSON validates");
 
   std::cout << report.ToHuman();
   return 0;

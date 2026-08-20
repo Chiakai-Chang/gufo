@@ -359,34 +359,37 @@ if (BUILD_TESTING)
   set_tests_properties(bandwidth_test PROPERTIES LABELS "cpu;diagnostics;bandwidth;bandwidth_schema;bandwidth_correctness")
 
   if (ENGINE_ENABLE_XRT)
-    add_executable(xrt_smoke_test tests/device/xrt_smoke_test.cpp)
-    target_compile_definitions(xrt_smoke_test PRIVATE
+    add_executable(xdna2_xrt_program_test
+      tests/device/xdna2_xrt_program_test.cpp)
+    target_compile_definitions(xdna2_xrt_program_test PRIVATE
       STRIX_AIE_SMOKE_PROGRAM_DIR="${STRIX_AIE_SMOKE_PROGRAM_DIR}")
-    target_link_libraries(xrt_smoke_test PRIVATE strix_diagnostics)
-    add_test(NAME xrt_smoke_test COMMAND xrt_smoke_test)
-    set_tests_properties(xrt_smoke_test PROPERTIES
+    target_link_libraries(xdna2_xrt_program_test PRIVATE strix_diagnostics)
+    add_test(NAME xdna2_xrt_program_test COMMAND xdna2_xrt_program_test)
+    set_tests_properties(xdna2_xrt_program_test PROPERTIES
       LABELS "npu;xdna2;xrt;xrt-hardware")
 
-    add_executable(qwen_mtp_rmsnorm_test
-      tests/device/qwen_mtp_rmsnorm_test.cpp)
-    target_compile_definitions(qwen_mtp_rmsnorm_test PRIVATE
+    add_executable(qwen_mtp_xdna2_rmsnorm_test
+      tests/device/qwen_mtp_xdna2_rmsnorm_test.cpp)
+    target_compile_definitions(qwen_mtp_xdna2_rmsnorm_test PRIVATE
       STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
-    target_link_libraries(qwen_mtp_rmsnorm_test PRIVATE
+    target_link_libraries(qwen_mtp_xdna2_rmsnorm_test PRIVATE
       strix_core
       strix_diagnostics)
-    add_test(NAME qwen_mtp_rmsnorm_test COMMAND qwen_mtp_rmsnorm_test)
-    set_tests_properties(qwen_mtp_rmsnorm_test PROPERTIES
+    add_test(NAME qwen_mtp_xdna2_rmsnorm_test
+      COMMAND qwen_mtp_xdna2_rmsnorm_test)
+    set_tests_properties(qwen_mtp_xdna2_rmsnorm_test PROPERTIES
       LABELS "npu;xdna2;xrt;xrt-hardware;qwen;mtp;rmsnorm")
 
-    add_executable(qwen_mtp_eh_proj_test
-      tests/device/qwen_mtp_eh_proj_test.cpp)
-    target_compile_definitions(qwen_mtp_eh_proj_test PRIVATE
+    add_executable(qwen_mtp_xdna2_eh_proj_test
+      tests/device/qwen_mtp_xdna2_eh_proj_test.cpp)
+    target_compile_definitions(qwen_mtp_xdna2_eh_proj_test PRIVATE
       STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}")
-    target_link_libraries(qwen_mtp_eh_proj_test PRIVATE
+    target_link_libraries(qwen_mtp_xdna2_eh_proj_test PRIVATE
       strix_core
       strix_diagnostics)
-    add_test(NAME qwen_mtp_eh_proj_test COMMAND qwen_mtp_eh_proj_test)
-    set_tests_properties(qwen_mtp_eh_proj_test PROPERTIES
+    add_test(NAME qwen_mtp_xdna2_eh_proj_test
+      COMMAND qwen_mtp_xdna2_eh_proj_test)
+    set_tests_properties(qwen_mtp_xdna2_eh_proj_test PROPERTIES
       LABELS "npu;xdna2;xrt;xrt-hardware;qwen;mtp;gemv")
   endif()
 
@@ -562,38 +565,44 @@ if (BUILD_TESTING)
     add_test(NAME speculative_verification_test COMMAND speculative_verification_test)
     set_tests_properties(speculative_verification_test PROPERTIES LABELS "hip;gpu;speculative")
 
-    add_executable(test_draft_heads tests/core/test_draft_heads.cpp)
-    target_link_libraries(test_draft_heads PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
-    add_test(NAME test_draft_heads COMMAND test_draft_heads)
-    set_tests_properties(test_draft_heads PROPERTIES LABELS "hip;gpu;draft_heads;speculative")
+    add_executable(draft_heads_test tests/core/draft_heads_test.cpp)
+    target_link_libraries(draft_heads_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
+    add_test(NAME draft_heads_test COMMAND draft_heads_test)
+    set_tests_properties(draft_heads_test PROPERTIES LABELS "hip;gpu;draft_heads;speculative")
 
-    add_executable(test_npu_speculative tests/npu/test_npu_speculative.cpp)
-    target_link_libraries(test_npu_speculative PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
+    add_executable(npu_draft_fallback_test
+      tests/core/npu_draft_fallback_test.cpp)
+    target_link_libraries(npu_draft_fallback_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
     if (ENGINE_ENABLE_XRT)
-      target_link_libraries(test_npu_speculative PRIVATE ${XRT_COREUTIL_LIB})
+      target_link_libraries(npu_draft_fallback_test PRIVATE ${XRT_COREUTIL_LIB})
     endif()
-    add_test(NAME test_npu_speculative COMMAND test_npu_speculative)
-    set_tests_properties(test_npu_speculative PROPERTIES LABELS "npu;xdna2;speculative")
+    add_test(NAME npu_draft_fallback_test COMMAND npu_draft_fallback_test)
+    set_tests_properties(npu_draft_fallback_test PROPERTIES
+      LABELS "host;speculative;lookup;npu-fallback")
 
-    add_executable(test_prompt_lookup tests/core/test_prompt_lookup.cpp)
-    target_link_libraries(test_prompt_lookup PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
-    add_test(NAME test_prompt_lookup COMMAND test_prompt_lookup)
-    set_tests_properties(test_prompt_lookup PROPERTIES LABELS "speculative;lookup;pld")
+    add_executable(prompt_lookup_test tests/core/prompt_lookup_test.cpp)
+    target_link_libraries(prompt_lookup_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
+    add_test(NAME prompt_lookup_test COMMAND prompt_lookup_test)
+    set_tests_properties(prompt_lookup_test PROPERTIES LABELS "speculative;lookup;pld")
 
   endif()
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
-    add_test(NAME strix_npu_smoke COMMAND strix)
-    set_tests_properties(strix_npu_smoke PROPERTIES LABELS "npu;xdna2;xrt;hip;gpu")
+    add_test(NAME strix_gpu_xdna2_probe COMMAND strix)
+    set_tests_properties(strix_gpu_xdna2_probe PROPERTIES
+      LABELS "platform;probe;xdna2;xrt;hip;gpu")
   elseif (ENGINE_ENABLE_HIP)
-    add_test(NAME strix_hip_smoke COMMAND strix)
-    set_tests_properties(strix_hip_smoke PROPERTIES LABELS "hip;gpu")
+    add_test(NAME strix_gpu_probe COMMAND strix)
+    set_tests_properties(strix_gpu_probe PROPERTIES
+      LABELS "platform;probe;hip;gpu")
   elseif (ENGINE_ENABLE_XRT)
-    add_test(NAME strix_npu_smoke COMMAND strix)
-    set_tests_properties(strix_npu_smoke PROPERTIES LABELS "npu;xdna2;xrt")
+    add_test(NAME strix_xdna2_probe COMMAND strix)
+    set_tests_properties(strix_xdna2_probe PROPERTIES
+      LABELS "platform;probe;xdna2;xrt")
   else()
-    add_test(NAME strix_cpu_smoke COMMAND strix)
-    set_tests_properties(strix_cpu_smoke PROPERTIES LABELS "cpu")
+    add_test(NAME strix_cpu_probe COMMAND strix)
+    set_tests_properties(strix_cpu_probe PROPERTIES
+      LABELS "platform;probe;cpu")
   endif()
 endif()
 
