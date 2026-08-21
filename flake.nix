@@ -178,6 +178,16 @@
             ];
           };
 
+          h3ManifestSource = mkFilteredSource {
+            directories = [
+              "tools/strix"
+            ];
+            files = [
+              "tests/tools/test_h3_manifest.py"
+              "tools/strix-h3-manifest.py"
+            ];
+          };
+
           dependencySource = mkFilteredSource {
             files = [
               ".devops/nix/package.nix"
@@ -272,6 +282,16 @@
             echo "PASS: Documentation check clean" > $out/result.txt
           '';
 
+          h3ManifestCheck = pkgsSys.runCommand "check-h3-manifest" {
+            nativeBuildInputs = [ pkgsSys.python3 ];
+            src = h3ManifestSource;
+          } ''
+            cd "$src"
+            python3 tests/tools/test_h3_manifest.py
+            mkdir -p $out
+            echo "PASS: MiniMax H3 manifest tests clean" > $out/result.txt
+          '';
+
           testCheck = pkgsSys.runCommand "check-tests" {
             nativeBuildInputs = [
               pkgsSys.stdenv.cc
@@ -322,6 +342,7 @@
             cat "${staticAnalysisCheck}/result.txt"
             cat "${dependencyInventoryCheck}/result.txt"
             cat "${docsCheck}/result.txt"
+            cat "${h3ManifestCheck}/result.txt"
             cat "${testCheck}/result.txt"
 
             cat <<EOF > $out/pr-summary.txt
@@ -335,7 +356,8 @@ Composed Gates:
   2. Static Analysis (clang-tidy)
   3. Dependency and License Inventory (THIRD_PARTY_NOTICES.md)
   4. Documentation & Local Link Validation (check-docs.py)
-  5. CPU Build and Runtime/Unit Tests (CTest)
+  5. MiniMax H3 Source-Manifest Validation
+  6. CPU Build and Runtime/Unit Tests (CTest)
 Production Package Validation:
   - gfx1151 ROCm/HIP + XRT build
   - Installed strix-server version/help smoke
@@ -347,6 +369,7 @@ EOF
           static-analysis = staticAnalysisCheck;
           dependency-inventory = dependencyInventoryCheck;
           docs = docsCheck;
+          h3-manifest = h3ManifestCheck;
           tests = testCheck;
           pr = prCheck;
         }

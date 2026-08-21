@@ -23,6 +23,8 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 | **Composable Kernel** | Header / compiled kernels | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/composable_kernel](https://github.com/ROCm/composable_kernel) |
 | **ROCprofiler SDK / ROCTx** | Benchmark marker library / profiling tool | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocprofiler-sdk](https://github.com/ROCm/rocprofiler-sdk) |
 | **DS4** | Vendored model engine and ROCm kernels | `MIT` | `84cc882352757baf628a1776badf7cc54d584e28` | [antirez/ds4](https://github.com/antirez/ds4) |
+| **h3.c** | Pinned implementation reference; selected code may be adapted model-privately | `MIT` | `8974cc055ea9c02fcd14cc27dfda3e1027c05153` | [antirez/h3.c](https://github.com/antirez/h3.c) |
+| **ccv TensorOps matmul ancestry** | Algorithm/source ancestry identified by h3.c | `BSD-3-Clause` | Notice pinned through h3.c commit `8974cc055ea9c02fcd14cc27dfda3e1027c05153` | [libccv/ccv](https://github.com/liuliu/ccv) |
 | **llama.cpp** | Source-derived algorithm | `MIT` | `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | **libuuid** | Linked | `BSD-3-Clause` / `LGPL-2.1-or-later` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [util-linux](https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git) |
 | **`amdxdna` Kernel Driver** | System (Kernel) | `GPL-2.0-only` | System Kernel (`amdxdna.ko`) | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
@@ -189,6 +191,29 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Copyright / Notice Source**: Copyright (C) 2022 Xilinx, Inc.; 2022-2024 Advanced Micro Devices, Inc.
 - **Relationship**: Build-only toolchain
 - **Corresponding-Source Location**: https://github.com/Xilinx/aiebu/tree/27a302c5840773e79c79f0f2fc8a1832d6ab1774
+
+### 1.15 h3.c
+
+- **Component Name**: h3.c
+- **Upstream URL**: https://github.com/antirez/h3.c
+- **Pinned Revision**: `8974cc055ea9c02fcd14cc27dfda3e1027c05153`
+- **Component Used**: Native MiniMax H3 architecture, tensor naming, packed
+  multimodal layout, scheduler, sampler, VAE, tokenizer, fixtures, and
+  performance reference for the model-private ROCm/HIP port
+- **SPDX License Identifier**: `MIT`
+- **Copyright / Notice Source**: Copyright (c) 2026 Salvatore Sanfilippo
+- **Relationship**: Pinned implementation reference. Selected compatible code
+  may be copied or adapted into `src/models/minimax_h3/` with provenance and
+  modifications recorded; Metal and Objective-C execution are not imported.
+- **Corresponding-Source Location**:
+  https://github.com/antirez/h3.c/tree/8974cc055ea9c02fcd14cc27dfda3e1027c05153
+
+The upstream `THIRD_PARTY_NOTICES.md` identifies the rectangular Morton
+decoder and dynamic INT8/TensorOps scheduling design in `h3_shaders.metal` as
+adapted from ccv's `NAMatMulKernel` and `NAInt8MatMulKernel`, licensed
+BSD-3-Clause with copyright (c) 2010, Liu Liu. Any adapted expression or design
+retains that notice. See
+[`src/models/minimax_h3/UPSTREAM.md`](src/models/minimax_h3/UPSTREAM.md).
 
 ---
 

@@ -10,7 +10,7 @@ namespace strix::core {
 
 namespace {
 
-constexpr std::array<ModelDescriptor, 2> kCompiledModels = {
+constexpr std::array<ModelDescriptor, 3> kCompiledModels = {
     ModelDescriptor{
         .kind = ModelKind::kQwen35_4B_Text,
         .family = ModelFamily::kQwen35,
@@ -30,6 +30,8 @@ constexpr std::array<ModelDescriptor, 2> kCompiledModels = {
                 .vision_input = false,
                 .video_input = false,
                 .audio_input = false,
+                .video_output = false,
+                .audio_output = false,
                 .mtp_speculative = true,
             },
         .arch =
@@ -67,6 +69,8 @@ constexpr std::array<ModelDescriptor, 2> kCompiledModels = {
                 .vision_input = false,
                 .video_input = false,
                 .audio_input = false,
+                .video_output = false,
+                .audio_output = false,
                 .mtp_speculative = true,
             },
         .arch =
@@ -83,6 +87,46 @@ constexpr std::array<ModelDescriptor, 2> kCompiledModels = {
                 .linear_key_value_heads = 32,
                 .linear_head_dim = 128,
                 .mtp_num_layers = 1,
+            },
+    },
+    ModelDescriptor{
+        .kind = ModelKind::kMiniMaxH3Fl2vaBf16,
+        .family = ModelFamily::kMiniMaxH3,
+        .role = ModelRole::kProduction,
+        .canonical_id = "minimax-h3-fl2va-bf16",
+        .display_name = "MiniMax H3 Base FL2VA BF16",
+        .family_name = "minimax-h3",
+        .source_repo = "https://huggingface.co/MiniMaxAI/MiniMax-H3",
+        .pinned_revision = "42ed227ee7df40d41602854ae760620d6eb651fe",
+        .architecture_pattern =
+            "Qwen3-VL layer-50 text state + 50-block joint audio/video DiT",
+        .default_tokenizer_id = "minimax-h3-qwen2",
+        .default_chat_template_id = "minimax-h3-chat-v1",
+        .capabilities =
+            ModelCapabilities{
+                .text_input = true,
+                .text_output = false,
+                .vision_input = false,
+                .video_input = false,
+                .audio_input = false,
+                .video_output = true,
+                .audio_output = true,
+                .mtp_speculative = false,
+            },
+        .arch =
+            ArchitectureParameters{
+                .num_layers = 50,
+                .hidden_size = 5376,
+                .intermediate_size = 14336,
+                .num_attention_heads = 56,
+                .num_key_value_heads = 56,
+                .head_dim = 128,
+                .vocab_size = 151936,
+                .default_context_tokens = 512,
+                .full_attention_interval = 1,
+                .linear_key_value_heads = 0,
+                .linear_head_dim = 0,
+                .mtp_num_layers = 0,
             },
     },
 };

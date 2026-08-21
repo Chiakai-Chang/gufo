@@ -26,6 +26,32 @@ license sha256:
 The upstream port used as an implementation reference is pinned separately by
 the H3 source-manifest work. No model weights are copied from that project.
 
+## Reproducible Acquisition and Verification
+
+After independently obtaining access from MiniMax, a clean machine downloads
+only the selected family:
+
+```sh
+hf download MiniMaxAI/MiniMax-H3 \
+  --revision 42ed227ee7df40d41602854ae760620d6eb651fe \
+  --include LICENSE README.md model_index.json "FL2VA/**" \
+  --local-dir /var/llms/huggingface/MiniMax-H3
+```
+
+The native inventory tool parses JSON and safetensors metadata directly. It
+does not import or execute Python supplied by the model repository:
+
+```sh
+nix develop -c python3 tools/strix-h3-manifest.py \
+  --model-root /var/llms/huggingface/MiniMax-H3 \
+  --verify src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json
+```
+
+Verification checks the Hugging Face revision metadata for every file, hashes
+every payload, validates every safetensors header/index/tensor, and rejects
+missing or unreferenced shards, unsupported dtypes, Ref2VA, 2K regeneration,
+pickle checkpoints, and wrong revisions before runtime device allocation.
+
 ## Operator Attestation
 
 The operator of the dedicated Strix Halo development machine has stated that

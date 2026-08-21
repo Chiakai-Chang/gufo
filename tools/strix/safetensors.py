@@ -42,6 +42,35 @@ class SafetensorsError(Exception):
     pass
 
 
+def _reject_duplicate_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise SafetensorsError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def load_json_bytes(data: bytes, source: str):
+    try:
+        value = json.loads(
+            data.decode("utf-8"), object_pairs_hook=_reject_duplicate_keys
+        )
+    except SafetensorsError:
+        raise
+    except Exception as exc:
+        raise SafetensorsError(f"{source}: invalid JSON: {exc}") from exc
+    return value
+
+
+def load_json_file(path: Path):
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise SafetensorsError(f"{path}: unable to read JSON: {exc}") from exc
+    return load_json_bytes(data, str(path))
+
+
 def dtype_size(dtype: str) -> int:
     if dtype not in DTYPES:
         raise SafetensorsError(f"unknown dtype {dtype!r}")
@@ -58,10 +87,7 @@ def read_header(path: Path):
         header = f.read(nbytes)
         if len(header) != nbytes:
             raise SafetensorsError(f"{path}: header length {nbytes} exceeds file")
-        try:
-            hdr = json.loads(header.decode("utf-8"))
-        except Exception as e:
-            raise SafetensorsError(f"{path}: invalid header JSON: {e}") from e
+        hdr = load_json_bytes(header, str(path))
         if not isinstance(hdr, dict):
             raise SafetensorsError(f"{path}: header must be a JSON dict")
         return hdr, 8 + nbytes
@@ -98,7 +124,11 @@ def validate_file(path: Path, expect: set | None = None) -> dict:
             raise SafetensorsError(f"{path}: {name}: unknown dtype {dtype!r}")
         if not isinstance(shape, list) or not all(isinstance(d, int) for d in shape):
             raise SafetensorsError(f"{path}: {name}: bad shape {shape!r}")
-        if not isinstance(data_offsets, list) or len(data_offsets) != 2:
+        if (
+            not isinstance(data_offsets, list)
+            or len(data_offsets) != 2
+            or not all(isinstance(offset, int) for offset in data_offsets)
+        ):
             raise SafetensorsError(f"{path}: {name}: bad data_offsets")
         if name in infos:
             raise SafetensorsError(f"{path}: duplicate tensor {name!r}")
@@ -107,7 +137,7 @@ def validate_file(path: Path, expect: set | None = None) -> dict:
     declared = []
     for name, (dtype, shape, (b0, b1)) in infos.items():
         tbytes = _tensor_bytes(dtype, shape)
-        if b0 >= b1 or b1 - b0 != tbytes:
+        if b0 < 0 or b0 >= b1 or b1 - b0 != tbytes:
             raise SafetensorsError(
                 f"{path}: {name}: offsets [{b0},{b1}) length {b1-b0} != tensor bytes {tbytes}"
             )
@@ -121,6 +151,18 @@ def validate_file(path: Path, expect: set | None = None) -> dict:
         if declared[i][1] < declared[i - 1][2]:
             raise SafetensorsError(
                 f"{path}: overlapping payloads {declared[i-1][0]} and {declared[i][0]}"
+            )
+    if expect is not None:
+        actual = set(infos)
+        missing = expect - actual
+        extra = actual - expect
+        if missing:
+            raise SafetensorsError(
+                f"{path}: missing indexed tensors: {sorted(missing)}"
+            )
+        if extra:
+            raise SafetensorsError(
+                f"{path}: tensors absent from index: {sorted(extra)}"
             )
     return infos
 
@@ -160,28 +202,50 @@ def inspect_snapshot(dir_path: Path, index_path: Path | None):
     tensors = {}
     files = []
     if index_path is not None:
-        index = json.loads(index_path.read_text("utf-8"))
+        index = load_json_file(index_path)
+        if not isinstance(index, dict):
+            raise SafetensorsError(f"{index_path}: index must be a JSON object")
         weight_map = index.get("weight_map")
         if not isinstance(weight_map, dict):
             raise SafetensorsError("index.json missing weight_map")
         # Map shard -> names
         shard_names = {}
         for name, shard in weight_map.items():
+            if not isinstance(name, str) or not name:
+                raise SafetensorsError("index contains an invalid tensor name")
+            if not isinstance(shard, str) or not shard:
+                raise SafetensorsError(
+                    f"index tensor {name!r} has an invalid shard name"
+                )
+            shard_path = Path(shard)
+            if shard_path.is_absolute() or ".." in shard_path.parts:
+                raise SafetensorsError(
+                    f"index tensor {name!r} escapes the snapshot directory"
+                )
             if name in shard_names:
                 raise SafetensorsError(f"duplicate tensor {name!r} in index")
             shard_names[name] = shard
         shards = {}
         for name, shard in shard_names.items():
             shards.setdefault(shard, []).append(name)
-        for shard, names in shards.items():
+        expected_shards = set(shards)
+        actual_shards = {path.name for path in dir_path.glob("*.safetensors")}
+        unreferenced = actual_shards - expected_shards
+        if unreferenced:
+            raise SafetensorsError(
+                f"unreferenced safetensors shards: {sorted(unreferenced)}"
+            )
+        for shard in sorted(shards):
+            names = shards[shard]
             p = dir_path / shard
             if not p.exists():
                 raise SafetensorsError(f"indexed shard missing: {shard}")
             infos = validate_file(p, expect=set(names))
-            missing = set(names) - set(infos)
-            if missing:
-                raise SafetensorsError(f"{shard}: missing indexed tensors: {sorted(missing)}")
-            for n in names:
+            for n in sorted(names):
+                if n in tensors:
+                    raise SafetensorsError(
+                        f"duplicate tensor {n!r} across snapshot shards"
+                    )
                 tensors[n] = (shard, infos[n])
             files.append(p)
     else:
@@ -191,7 +255,7 @@ def inspect_snapshot(dir_path: Path, index_path: Path | None):
             raise SafetensorsError(f"expected exactly one safetensors file, got {len(cands)}")
         p = cands[0]
         infos = validate_file(p)
-        for n in infos:
+        for n in sorted(infos):
             tensors[n] = (p.name, infos[n])
         files.append(p)
 

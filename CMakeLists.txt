@@ -399,6 +399,13 @@ if (BUILD_TESTING)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   set_tests_properties(gguf_reader_test PROPERTIES LABELS "cpu;core;gguf;model_config")
 
+  add_executable(model_registry_test tests/core/model_registry_test.cpp)
+  target_link_libraries(model_registry_test PRIVATE strix_core)
+
+  add_test(NAME model_registry_test COMMAND model_registry_test)
+  set_tests_properties(model_registry_test PROPERTIES
+    LABELS "cpu;core;model_registry;minimax-h3")
+
   add_executable(ggml_dequant_test tests/core/ggml_dequant_test.cpp)
   target_link_libraries(ggml_dequant_test PRIVATE strix_core)
 
