@@ -27,6 +27,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 | **ccv TensorOps matmul ancestry** | Algorithm/source ancestry identified by h3.c | `BSD-3-Clause` | Notice pinned through h3.c commit `8974cc055ea9c02fcd14cc27dfda3e1027c05153` | [libccv/ccv](https://github.com/liuliu/ccv) |
 | **llama.cpp** | Source-derived algorithm | `MIT` | `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
 | **libuuid** | Linked | `BSD-3-Clause` / `LGPL-2.1-or-later` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [util-linux](https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git) |
+| **ICU** | Linked | `Unicode-3.0` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [unicode-org/icu](https://github.com/unicode-org/icu) |
 | **`amdxdna` Kernel Driver** | System (Kernel) | `GPL-2.0-only` | System Kernel (`amdxdna.ko`) | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
 | **`amdxdna` UAPI Headers** | System / Header | `GPL-2.0 WITH Linux-syscall-note` | `4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305` | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
 | **AMD NPU Firmware** | System (Firmware) | Proprietary Binary (`LICENSE.amdnpu`) | System Firmware (`linux-firmware`) | Host OS Distribution / AMD |
@@ -128,7 +129,20 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Benchmark marker library / profiling tool; the inference server does not link the profiler SDK
 - **Corresponding-Source Location**: https://github.com/ROCm/rocprofiler-sdk (via Nix derivation `rocmPackages.rocprofiler-sdk`)
 
-### 1.9 llama.cpp
+### 1.9 ICU
+
+- **Component Name**: ICU (International Components for Unicode)
+- **Upstream URL**: https://github.com/unicode-org/icu
+- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision
+  `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`icu`)
+- **Component Used**: Unicode NFC normalization and Unicode general-category /
+  whitespace classification for the model-private MiniMax H3 tokenizer
+- **SPDX License Identifier**: `Unicode-3.0`
+- **Relationship**: Linked dynamic runtime dependency
+- **Corresponding-Source Location**: https://github.com/unicode-org/icu
+  (via Nix derivation `icu`)
+
+### 1.10 llama.cpp
 
 - **Component Name**: llama.cpp
 - **Upstream URL**: https://github.com/ggml-org/llama.cpp
@@ -139,7 +153,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Source-derived algorithm; no llama.cpp runtime code or library is linked
 - **Corresponding-Source Location**: https://github.com/ggml-org/llama.cpp/tree/e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0/ggml/src/ggml-cuda
 
-### 1.10 DS4
+### 1.11 DS4
 
 - **Component Name**: DS4
 - **Upstream URL**: https://github.com/antirez/ds4
@@ -156,7 +170,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Corresponding-Source Location**:
   https://github.com/antirez/ds4/tree/84cc882352757baf628a1776badf7cc54d584e28
 
-### 1.11 libuuid (util-linux)
+### 1.12 libuuid (util-linux)
 
 - **Component Name**: libuuid (util-linux UUID library)
 - **Upstream URL**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git
@@ -167,7 +181,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Linked (Dynamic runtime library dependency required by XRT and strix)
 - **Corresponding-Source Location**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git
 
-### 1.12 MLIR-AIE / IRON
+### 1.13 MLIR-AIE / IRON
 
 - **Pinned Version**: `1.4.1`
 - **Component Used**: Ahead-of-time NPU2 program and DMA generation
@@ -175,7 +189,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Build-only toolchain; generated reviewed artifacts are packaged
 - **Corresponding-Source Location**: https://github.com/Xilinx/mlir-aie/tree/v1.4.1
 
-### 1.13 LLVM-AIE / Peano
+### 1.14 LLVM-AIE / Peano
 
 - **Pinned Version**: `21.0.0.2026080301+c9c5ecb7`
 - **Component Used**: AIE2P core compiler distributed as a pinned release wheel
@@ -183,7 +197,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Build-only toolchain
 - **Corresponding-Source Location**: https://github.com/Xilinx/llvm-aie
 
-### 1.14 AIEBU
+### 1.15 AIEBU
 
 - **Pinned Revision**: `27a302c5840773e79c79f0f2fc8a1832d6ab1774`
 - **Component Used**: `aiebu-asm` control-code ELF assembler
@@ -192,7 +206,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Relationship**: Build-only toolchain
 - **Corresponding-Source Location**: https://github.com/Xilinx/aiebu/tree/27a302c5840773e79c79f0f2fc8a1832d6ab1774
 
-### 1.15 h3.c
+### 1.16 h3.c
 
 - **Component Name**: h3.c
 - **Upstream URL**: https://github.com/antirez/h3.c

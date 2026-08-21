@@ -62,6 +62,28 @@ Issue #175 must revisit this default using alternating, thermally balanced
 complete generations. A metadata or load-only microbenchmark is not an
 end-to-end performance claim.
 
+## Prompt-Encoder Streaming Measurement
+
+The Qwen phase does not make its 62.13 GiB inventory resident at once. The
+text-only encoder loads the 1.45 GiB embedding for lookup and releases it, then
+keeps one layer resident while a second layer is copied on a background
+transfer stream. Every read-only file registration is removed after its copy.
+Only layers 0 through 49 are addressed; vision and deepstack paths fail before
+allocation.
+
+For the six-token fox prompt on the same gfx1151 host:
+
+| Run | Layers | Wall time | Peak device bytes | Dispatches |
+| --- | ---: | ---: | ---: | ---: |
+| first boundary bring-up | 1 | 1.37 s | 1.45 GiB | 17 |
+| first complete run | 50 | 21.80 s | 1.88 GiB | 850 |
+| warmer complete run with oracle | 50 | 15.06 s | 1.88 GiB | 850 |
+| fully warm repeated validation | 50 | 5.83 s | 1.88 GiB | 850 |
+
+Layer 1 and layer 50 were byte-identical to independent Transformers BF16
+oracles. The repeated complete execution retained stable output bytes and
+dispatch count, with zero registered host bytes after return.
+
 ## Regression Gates
 
 - Duplicate JSON keys, unsafe shard paths, unknown indexed tensors, bad dtypes,
@@ -73,3 +95,10 @@ end-to-end performance claim.
 - Entering timed execution performs no allocation or first-touch operation.
 - The real-checkpoint HIP test remains opt-in through explicit model and
   manifest environment variables; normal CI never downloads weights.
+- Exact tokenizer cases include Unicode, contractions, emoji, added tokens,
+  empty prompts, malformed UTF-8, unsupported added-token policies, and wrong
+  normalizers.
+- Analytic gfx1151 tests cover RMSNorm, per-head Q/K normalization, RoPE,
+  causal GQA, residual add, and SwiGLU.
+- External prompt tests cover selected and final layer boundaries, non-finite
+  rejection, stable repeated bytes/dispatches, and registered-page cleanup.

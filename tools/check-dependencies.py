@@ -29,6 +29,7 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "MLIR-AIE",
     "LLVM-AIE",
     "AIEBU",
+    "ICU",
 }
 
 
@@ -79,7 +80,7 @@ def verify_dependencies(
     if package_nix_file.is_file():
         pkg_content = package_nix_file.read_text(encoding="utf-8")
         # Check that rocmPackages, xrt, xrt-plugin-amdxdna, libuuid are wired
-        for dep in ["rocmPackages", "xrt", "xrt-plugin-amdxdna", "libuuid"]:
+        for dep in ["rocmPackages", "xrt", "xrt-plugin-amdxdna", "libuuid", "icu"]:
             if dep not in pkg_content:
                 errors.append(f"Expected dependency '{dep}' missing from {package_nix_file.name}")
 

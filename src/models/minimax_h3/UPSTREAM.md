@@ -66,3 +66,12 @@ Every copied or adapted file must record:
 The model-private H3 implementation lives under `src/models/minimax_h3/`.
 Shared engine infrastructure must not gain H3 tensor-name guesses or
 model-specific numerical dispatch.
+
+Current prompt-boundary adaptations:
+
+| Upstream source | Local destination | Method and material changes |
+| --- | --- | --- |
+| `h3_tokenizer.m` | `tokenizer.cpp`, `tokenizer.hpp` | Semantic translation to C++20; Foundation storage replaced by strict project JSON and ICU NFC/category APIs; stronger duplicate/range/schema rejection |
+| `h3_text_encoder.c` | `prompt_encoder.hip`, `prompt_encoder.hpp` | Layer/tensor contract adapted; Metal resource management replaced by device-copy streaming, next-layer prefetch, hipBLASLt, phase lease, cancellation, and telemetry |
+| text kernels in `h3_shaders.metal` | `prompt_encoder_ops.cuh` | Operation-boundary translation to HIP; BF16 rounding and FP32 reductions retained; no Metal/MPSGraph or ccv TensorOps code imported |
+| `tests/test_tokenizer.c`, `tests/test_real_prompt.c` | MiniMax H3 tokenizer and prompt-encoder tests | Released corpus retained; synthetic malformed cases, analytic HIP fixtures, content-hashed external Transformers boundaries, repetition, and leak checks added |

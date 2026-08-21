@@ -1,0 +1,333 @@
+#ifndef STRIX_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
+#define STRIX_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
+
+// BF16 text-encoder operation boundaries translated from antirez/h3.c
+// h3_shaders.metal at 8974cc055ea9c02fcd14cc27dfda3e1027c05153 (MIT).
+// The implementation below is native HIP for gfx1151 and does not import
+// Metal, MPSGraph, Objective-C, or ccv TensorOps matmul code.
+
+#include <hip/hip_runtime.h>
+
+#include <cstddef>
+#include <cstdint>
+
+namespace strix::minimax_h3::ops {
+
+__device__ __forceinline__ float Bf16ToFloat(std::uint16_t value) {
+  return __uint_as_float(static_cast<std::uint32_t>(value) << 16U);
+}
+
+__device__ __forceinline__ std::uint16_t FloatToBf16(float value) {
+  std::uint32_t bits = __float_as_uint(value);
+  bits += 0x7FFFU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>(bits >> 16U);
+}
+
+static __global__ void EmbeddingKernel(const std::uint16_t* weight,
+                                       const std::uint32_t* token_ids,
+                                       std::uint16_t* output,
+                                       std::uint32_t tokens,
+                                       std::uint32_t vocabulary,
+                                       std::uint32_t width) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t token = blockIdx.y;
+  if (token >= tokens || column >= width) {
+    return;
+  }
+  const std::uint32_t identifier = token_ids[token];
+  output[static_cast<std::size_t>(token) * width + column] =
+      identifier < vocabulary
+          ? weight[static_cast<std::size_t>(identifier) * width + column]
+          : 0;
+}
+
+inline void LaunchEmbedding(const std::uint16_t* weight,
+                            const std::uint32_t* token_ids,
+                            std::uint16_t* output, std::uint32_t tokens,
+                            std::uint32_t vocabulary, std::uint32_t width,
+                            hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  hipLaunchKernelGGL(EmbeddingKernel,
+                     dim3((width + kThreads - 1U) / kThreads, tokens),
+                     dim3(kThreads), 0, stream, weight, token_ids, output,
+                     tokens, vocabulary, width);
+}
+
+static __global__ void RmsNormKernel(const std::uint16_t* input,
+                                     const std::uint16_t* weight,
+                                     std::uint16_t* output, std::uint32_t rows,
+                                     std::uint32_t width, float epsilon) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float reductions[256];
+  const auto* row_input = input + static_cast<std::size_t>(row) * width;
+  float local = 0.0F;
+  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
+    const float value = Bf16ToFloat(row_input[column]);
+    local = fmaf(value, value, local);
+  }
+  reductions[lane] = local;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+    if (lane < stride) {
+      reductions[lane] += reductions[lane + stride];
+    }
+    __syncthreads();
+  }
+  const float inverse =
+      rsqrtf(reductions[0] / static_cast<float>(width) + epsilon);
+  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
+    output[static_cast<std::size_t>(row) * width + column] = FloatToBf16(
+        Bf16ToFloat(row_input[column]) * inverse * Bf16ToFloat(weight[column]));
+  }
+}
+
+inline void LaunchRmsNorm(const std::uint16_t* input,
+                          const std::uint16_t* weight, std::uint16_t* output,
+                          std::uint32_t rows, std::uint32_t width,
+                          float epsilon, hipStream_t stream) {
+  hipLaunchKernelGGL(RmsNormKernel, dim3(rows), dim3(256), 0, stream, input,
+                     weight, output, rows, width, epsilon);
+}
+
+static __global__ void HeadRmsNormKernel(
+    std::uint16_t* tensor, const std::uint16_t* weight, std::uint32_t sequence,
+    std::uint32_t heads, std::uint32_t head_dimension, float epsilon) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  if (row >= sequence || head >= heads) {
+    return;
+  }
+  __shared__ float reductions[128];
+  const std::uint32_t lane = threadIdx.x;
+  const std::size_t base =
+      (static_cast<std::size_t>(row) * heads + head) * head_dimension;
+  float local = 0.0F;
+  for (std::uint32_t dimension = lane; dimension < head_dimension;
+       dimension += blockDim.x) {
+    const float value = Bf16ToFloat(tensor[base + dimension]);
+    local = fmaf(value, value, local);
+  }
+  reductions[lane] = local;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+    if (lane < stride) {
+      reductions[lane] += reductions[lane + stride];
+    }
+    __syncthreads();
+  }
+  const float inverse =
+      rsqrtf(reductions[0] / static_cast<float>(head_dimension) + epsilon);
+  for (std::uint32_t dimension = lane; dimension < head_dimension;
+       dimension += blockDim.x) {
+    tensor[base + dimension] =
+        FloatToBf16(Bf16ToFloat(tensor[base + dimension]) * inverse *
+                    Bf16ToFloat(weight[dimension]));
+  }
+}
+
+inline void LaunchHeadRmsNorm(std::uint16_t* tensor,
+                              const std::uint16_t* weight,
+                              std::uint32_t sequence, std::uint32_t heads,
+                              std::uint32_t head_dimension, float epsilon,
+                              hipStream_t stream) {
+  hipLaunchKernelGGL(HeadRmsNormKernel, dim3(sequence, heads), dim3(128), 0,
+                     stream, tensor, weight, sequence, heads, head_dimension,
+                     epsilon);
+}
+
+static __global__ void RopeKernel(std::uint16_t* query, std::uint16_t* key,
+                                  std::uint32_t sequence,
+                                  std::uint32_t query_heads,
+                                  std::uint32_t key_value_heads,
+                                  std::uint32_t head_dimension, float theta) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t dimension = threadIdx.x;
+  const std::uint32_t half = head_dimension / 2U;
+  if (row >= sequence || dimension >= half) {
+    return;
+  }
+  const float inverse_frequency =
+      expf(-logf(theta) * (2.0F * static_cast<float>(dimension) /
+                           static_cast<float>(head_dimension)));
+  const float angle = static_cast<float>(row) * inverse_frequency;
+  const float cosine = cosf(angle);
+  const float sine = sinf(angle);
+  if (head < query_heads) {
+    const std::size_t base =
+        (static_cast<std::size_t>(row) * query_heads + head) * head_dimension;
+    const float first = Bf16ToFloat(query[base + dimension]);
+    const float second = Bf16ToFloat(query[base + half + dimension]);
+    query[base + dimension] = FloatToBf16(first * cosine - second * sine);
+    query[base + half + dimension] =
+        FloatToBf16(second * cosine + first * sine);
+  }
+  if (head < key_value_heads) {
+    const std::size_t base =
+        (static_cast<std::size_t>(row) * key_value_heads + head) *
+        head_dimension;
+    const float first = Bf16ToFloat(key[base + dimension]);
+    const float second = Bf16ToFloat(key[base + half + dimension]);
+    key[base + dimension] = FloatToBf16(first * cosine - second * sine);
+    key[base + half + dimension] = FloatToBf16(second * cosine + first * sine);
+  }
+}
+
+inline void LaunchRope(std::uint16_t* query, std::uint16_t* key,
+                       std::uint32_t sequence, std::uint32_t query_heads,
+                       std::uint32_t key_value_heads,
+                       std::uint32_t head_dimension, float theta,
+                       hipStream_t stream) {
+  hipLaunchKernelGGL(
+      RopeKernel,
+      dim3(sequence,
+           query_heads > key_value_heads ? query_heads : key_value_heads),
+      dim3(head_dimension / 2U), 0, stream, query, key, sequence, query_heads,
+      key_value_heads, head_dimension, theta);
+}
+
+static __global__ void CausalGqaKernel(
+    const std::uint16_t* query, const std::uint16_t* key,
+    const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
+    std::uint32_t query_heads, std::uint32_t key_value_heads,
+    std::uint32_t head_dimension, float scale) {
+  const std::uint32_t query_row = blockIdx.x;
+  const std::uint32_t query_head = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x;
+  if (query_row >= sequence || query_head >= query_heads) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* scores = shared;
+  float* shared_query = scores + sequence;
+  float* reductions = shared_query + head_dimension;
+  const std::uint32_t key_value_head =
+      query_head / (query_heads / key_value_heads);
+  const std::size_t query_base =
+      (static_cast<std::size_t>(query_row) * query_heads + query_head) *
+      head_dimension;
+  for (std::uint32_t dimension = lane; dimension < head_dimension;
+       dimension += blockDim.x) {
+    shared_query[dimension] = Bf16ToFloat(
+        FloatToBf16(Bf16ToFloat(query[query_base + dimension]) * scale));
+  }
+  __syncthreads();
+
+  const std::uint32_t key_count = query_row + 1U;
+  float local_maximum = -INFINITY;
+  for (std::uint32_t key_row = lane; key_row < key_count;
+       key_row += blockDim.x) {
+    const std::size_t key_base =
+        (static_cast<std::size_t>(key_row) * key_value_heads + key_value_head) *
+        head_dimension;
+    float dot = 0.0F;
+    for (std::uint32_t dimension = 0; dimension < head_dimension; ++dimension) {
+      dot = fmaf(shared_query[dimension],
+                 Bf16ToFloat(key[key_base + dimension]), dot);
+    }
+    scores[key_row] = dot;
+    local_maximum = fmaxf(local_maximum, dot);
+  }
+  reductions[lane] = local_maximum;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+    if (lane < stride) {
+      reductions[lane] = fmaxf(reductions[lane], reductions[lane + stride]);
+    }
+    __syncthreads();
+  }
+  const float maximum = reductions[0];
+  float local_sum = 0.0F;
+  for (std::uint32_t key_row = lane; key_row < key_count;
+       key_row += blockDim.x) {
+    const float probability = expf(scores[key_row] - maximum);
+    scores[key_row] = probability;
+    local_sum += probability;
+  }
+  reductions[lane] = local_sum;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+    if (lane < stride) {
+      reductions[lane] += reductions[lane + stride];
+    }
+    __syncthreads();
+  }
+  const float inverse_sum = 1.0F / reductions[0];
+  for (std::uint32_t dimension = lane; dimension < head_dimension;
+       dimension += blockDim.x) {
+    float sum = 0.0F;
+    for (std::uint32_t key_row = 0; key_row < key_count; ++key_row) {
+      const std::size_t value_index =
+          (static_cast<std::size_t>(key_row) * key_value_heads +
+           key_value_head) *
+              head_dimension +
+          dimension;
+      sum = fmaf(scores[key_row] * inverse_sum, Bf16ToFloat(value[value_index]),
+                 sum);
+    }
+    output[query_base + dimension] = FloatToBf16(sum);
+  }
+}
+
+inline void LaunchCausalGqa(const std::uint16_t* query,
+                            const std::uint16_t* key,
+                            const std::uint16_t* value, std::uint16_t* output,
+                            std::uint32_t sequence, std::uint32_t query_heads,
+                            std::uint32_t key_value_heads,
+                            std::uint32_t head_dimension, float scale,
+                            hipStream_t stream) {
+  const std::size_t shared_bytes =
+      (static_cast<std::size_t>(sequence) + head_dimension + 128U) *
+      sizeof(float);
+  hipLaunchKernelGGL(CausalGqaKernel, dim3(sequence, query_heads), dim3(128),
+                     shared_bytes, stream, query, key, value, output, sequence,
+                     query_heads, key_value_heads, head_dimension, scale);
+}
+
+static __global__ void AddKernel(const std::uint16_t* left,
+                                 const std::uint16_t* right,
+                                 std::uint16_t* output, std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    output[index] =
+        FloatToBf16(Bf16ToFloat(left[index]) + Bf16ToFloat(right[index]));
+  }
+}
+
+inline void LaunchAdd(const std::uint16_t* left, const std::uint16_t* right,
+                      std::uint16_t* output, std::size_t elements,
+                      hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(AddKernel, dim3((elements + kThreads - 1U) / kThreads),
+                     dim3(kThreads), 0, stream, left, right, output, elements);
+}
+
+static __global__ void SwiGluKernel(const std::uint16_t* gate,
+                                    const std::uint16_t* up,
+                                    std::uint16_t* output,
+                                    std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    const float gate_value = Bf16ToFloat(gate[index]);
+    output[index] = FloatToBf16(gate_value / (1.0F + expf(-gate_value)) *
+                                Bf16ToFloat(up[index]));
+  }
+}
+
+inline void LaunchSwiGlu(const std::uint16_t* gate, const std::uint16_t* up,
+                         std::uint16_t* output, std::size_t elements,
+                         hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(SwiGluKernel, dim3((elements + kThreads - 1U) / kThreads),
+                     dim3(kThreads), 0, stream, gate, up, output, elements);
+}
+
+}  // namespace strix::minimax_h3::ops
+
+#endif  // STRIX_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_

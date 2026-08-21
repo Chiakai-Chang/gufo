@@ -232,6 +232,7 @@
               pkgsSys.ninja
               pkgsSys.python3
               pkgsSys.findutils
+              pkgsSys.icu
             ];
             src = staticAnalysisSource;
           } ''
@@ -322,6 +323,7 @@
               pkgsSys.ccache
               pkgsSys.cmake
               pkgsSys.ninja
+              pkgsSys.icu
             ];
             src = testSource;
           } ''

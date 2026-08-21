@@ -4,6 +4,7 @@
   cmake,
   ninja,
   pkg-config,
+  icu,
   libuuid,
   rocmPackages,
   aie-qwen-mtp-eh-proj,
@@ -55,7 +56,8 @@ stdenv.mkDerivation (finalAttrs: {
   ]
   ++ lib.optional rocmSupport rocmPackages.clr;
 
-  buildInputs = lib.optionals rocmSupport [
+  buildInputs = [ icu ]
+  ++ lib.optionals rocmSupport [
     rocmPackages.clr
     rocmPackages.hipblas
     rocmPackages.hipblaslt

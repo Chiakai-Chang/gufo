@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(STRIX_VERSION "development" CACHE STRING "Strix build revision")
 include_directories(${CMAKE_SOURCE_DIR})
+find_package(ICU REQUIRED COMPONENTS uc)
 
 # ROCm/HIP GPU backend — compiled natively for the Strix Halo gfx1151 target.
 option(ENGINE_ENABLE_HIP "Build strix with ROCm/HIP GPU backend" OFF)
@@ -187,8 +188,10 @@ add_library(strix_core STATIC
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
   src/models/minimax_h3/json.cpp
+  src/models/minimax_h3/prompt_encoder.cpp
   src/models/minimax_h3/runtime.cpp
   src/models/minimax_h3/sha256.cpp
+  src/models/minimax_h3/tokenizer.cpp
   src/tokenization/qwen_tokenizer.cpp
   src/tokenization/qwen_chat_template.cpp
   src/models/qwen_oracles.cpp
@@ -203,6 +206,7 @@ add_library(strix_core STATIC
   src/core/quant/ggml_dequant.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(strix_core PUBLIC ICU::uc)
 
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
@@ -223,6 +227,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_prefill.cpp
     src/core/hip/qwen_mtp_gpu.cpp
     src/models/minimax_h3/runtime_hip.cpp
+    src/models/minimax_h3/prompt_encoder.hip
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
     src/core/speculative/prompt_lookup_backend.cpp
@@ -233,7 +238,7 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(strix_core SYSTEM PRIVATE
     ${COMPOSABLE_KERNEL_INCLUDE_DIR})
   target_link_libraries(strix_core PUBLIC hip::host roc::hipblas
-    roc::hipblaslt roc::rocblas)
+    roc::hipblaslt roc::rocblas Threads::Threads)
 endif()
 
 if (ENGINE_ENABLE_XRT)
@@ -420,6 +425,13 @@ if (BUILD_TESTING)
   set_tests_properties(minimax_h3_runtime_test PROPERTIES
     LABELS "cpu;models;minimax-h3;safetensors;residency;failure-injection")
 
+  add_executable(minimax_h3_tokenizer_test
+    tests/models/minimax_h3_tokenizer_test.cpp)
+  target_link_libraries(minimax_h3_tokenizer_test PRIVATE strix_core)
+  add_test(NAME minimax_h3_tokenizer_test COMMAND minimax_h3_tokenizer_test)
+  set_tests_properties(minimax_h3_tokenizer_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;tokenizer;quality")
+
   add_executable(ggml_dequant_test tests/core/ggml_dequant_test.cpp)
   target_link_libraries(ggml_dequant_test PRIVATE strix_core)
 
@@ -515,6 +527,22 @@ if (BUILD_TESTING)
       COMMAND minimax_h3_runtime_hip_test)
     set_tests_properties(minimax_h3_runtime_hip_test PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_prompt_encoder_hip_test
+      tests/models/minimax_h3_prompt_encoder_hip_test.hip)
+    target_compile_definitions(minimax_h3_prompt_encoder_hip_test PRIVATE
+      STRIX_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_prompt_encoder_hip_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME minimax_h3_prompt_encoder_analytic
+      COMMAND minimax_h3_prompt_encoder_hip_test --analytic)
+    set_tests_properties(minimax_h3_prompt_encoder_analytic PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;prompt-encoder;analytic")
+    add_test(NAME minimax_h3_prompt_encoder_real
+      COMMAND minimax_h3_prompt_encoder_hip_test --real)
+    set_tests_properties(minimax_h3_prompt_encoder_real PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;prompt-encoder;external-model;slow"
       SKIP_RETURN_CODE 77)
 
     add_executable(deepseek_v4_flash_engine_test

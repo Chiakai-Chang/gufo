@@ -104,6 +104,26 @@ The production runtime never imports model-provided Python. A separately
 isolated offline teacher capture may use a pinned official runtime, but that
 runtime, its command, and its dependency versions become part of the artifact.
 
+## Prompt-Encoder Frozen Evidence
+
+The text-only port was checked against isolated Transformers 5.14.1 and ROCm
+PyTorch 2.12.0/HIP 7.2.53211 on the supported Radeon 8060S. The teacher
+instantiates only the Qwen3-VL text model on the meta device, loads the exact
+embedding and requested layers from the pinned H3 shards, uses eager
+attention, and captures the BF16 tensor entering the final RMSNorm.
+
+For `A red fox walking through snow`, token IDs are
+`32 2518 38835 11435 1526 11794`. External raw-BF16 payloads are:
+
+| Boundary | Shape | Bytes | SHA-256 |
+| --- | --- | ---: | --- |
+| after layer 1 | 6x5120 | 61,440 | `72c28520b592a79bf278fcced10f215b44e12864e803a7ca2a18e7528305ef08` |
+| after layer 50 | 6x5120 | 61,440 | `8015af1d2a551a0509bccc84372a30087f66721613f909c3f99e36ad7e269692` |
+
+The gfx1151 HIP implementation matched both payloads byte-for-byte: measured
+relative max and relative L2 were zero. A repeated complete run produced the
+same output bytes, 850 dispatches, and zero live registered host bytes.
+
 ## Numerical Gates
 
 The initial upstream ceilings are strict inequalities:

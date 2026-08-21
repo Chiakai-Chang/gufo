@@ -61,6 +61,47 @@ The model-private loader's phase boundaries and first gfx1151 residency
 measurement are recorded in
 [the MiniMax H3 residency baseline](../src/models/minimax_h3/RESIDENCY.md).
 
+## Text-Only Prompt Encoder
+
+The first executable H3 boundary is the FL2VA tokenizer plus the first 50
+Qwen3-VL-32B decoder layers. It intentionally stops after layer index 49,
+before the checkpoint's final text norm, because that BF16 hidden state is the
+conditioning tensor consumed by H3.
+
+The tokenizer is model-private. It implements the pinned NFC, GPT-2 byte
+encoding, BPE merge order, added-token policies, longest/earliest special-token
+matching, and empty-prompt pad behavior. ICU supplies complete Unicode NFC and
+category handling. No BOS, EOS, chat template, or vision framing is inserted
+for the initial text-only path.
+
+The HIP encoder:
+
+- validates the fixed 151936x5120 embedding and all 11 tensors in each layer;
+- keeps activations and operation boundaries in BF16 with FP32 reductions and
+  matrix accumulation;
+- uses hipBLASLt BF16 projections plus model-private RMSNorm, Q/K norm, RoPE,
+  causal GQA, residual, and SwiGLU kernels;
+- loads only the embedding and layers 0 through 49;
+- overlaps the next layer's read-only registered mapping/device copy with
+  current-layer execution, then unregisters every host page;
+- admits one prompt-encoder phase at a time;
+- rejects vision spans and deepstack inputs before allocation;
+- does not call the repository's Qwen language-model runtime and has no CPU
+  tensor-compute fallback.
+
+The offline teacher capture is reproducible but not part of the production
+package:
+
+```sh
+nix develop -c python tools/strix/h3_prompt_golden.py \
+  --model-root /var/llms/huggingface/MiniMax-H3 \
+  --layers 50 \
+  --output /var/llms/huggingface/strix-h3-oracles/\
+fox-layer50-transformers.bf16
+```
+
+The raw BF16 oracle and metadata remain outside Git.
+
 ## Operator Attestation
 
 The operator of the dedicated Strix Halo development machine has stated that
