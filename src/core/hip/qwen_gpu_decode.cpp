@@ -186,14 +186,23 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                    arena_.stream);
       }
 
-      // Residual Add
-      LaunchResidualAdd(arena_.d_hidden, arena_.d_attn_out, arena_.d_hidden,
-                        hidden_size, arena_.stream);
+      // Residual Add + FFN Pre-RMSNorm fused into one kernel
+      // (opt-c010-residual-rmsnorm). The unfused chain stays wired behind the
+      // policy toggle as the independent reference.
+      if (detail::ShouldFuseResidualAddRMSNorm()) {
+        LaunchFusedResidualAddRMSNorm(
+            arena_.d_hidden, arena_.d_attn_out, arena_.d_hidden,
+            static_cast<const float*>(layer.ffn_norm.data), arena_.d_normed,
+            hidden_size, 1e-6F, arena_.stream);
+      } else {
+        LaunchResidualAdd(arena_.d_hidden, arena_.d_attn_out, arena_.d_hidden,
+                          hidden_size, arena_.stream);
 
-      // FFN Pre-RMSNorm
-      LaunchRMSNorm(arena_.d_hidden,
-                    static_cast<const float*>(layer.ffn_norm.data),
-                    arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
+        // FFN Pre-RMSNorm
+        LaunchRMSNorm(arena_.d_hidden,
+                      static_cast<const float*>(layer.ffn_norm.data),
+                      arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
+      }
 
       // Fused SwiGLU FFN
       const bool ffn_g_bf16 = layer.ffn_gate.type == core::GgmlType::kBF16;

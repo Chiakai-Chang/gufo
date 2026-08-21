@@ -121,6 +121,16 @@ void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
 void LaunchResidualAdd(const float* a, const float* b, float* out,
                        std::size_t dim, hipStream_t stream = nullptr);
 
+/// Fuses the residual add with the subsequent RMSNorm into one launch
+/// (opt-c010-residual-rmsnorm): writes out_sum = a + b in place and
+/// out = (out_sum / sqrt(mean(out_sum^2) + eps)) * weight. Unfused reference:
+/// LaunchResidualAdd followed by LaunchRMSNorm.
+void LaunchFusedResidualAddRMSNorm(const float* a, const float* b,
+                                   float* out_sum, const float* weight,
+                                   float* out, std::size_t dim,
+                                   float eps = 1e-6F,
+                                   hipStream_t stream = nullptr);
+
 /// De-interleaves [Q0 (head_dim), Gate0 (head_dim), Q1, Gate1, ...] into
 /// separate Q and Gate buffers
 void LaunchUnpackQG(const float* qg_interleaved, float* q_out, float* gate_out,
@@ -252,6 +262,16 @@ void LaunchBatchedResidualAdd(const float* a, const float* b, float* out,
                               std::size_t batch_size, std::size_t dim,
                               hipStream_t stream = nullptr);
 
+/// Batched fuse of residual add and RMSNorm across B tokens into one launch
+/// (opt-c010-residual-rmsnorm), with optional BF16 normed output. Unfused
+/// reference: LaunchBatchedResidualAdd followed by LaunchBatchedRMSNorm.
+void LaunchBatchedFusedResidualAddRMSNorm(const float* a, const float* b,
+                                          float* out_sum, const float* weight,
+                                          float* out, void* out_bf16,
+                                          std::size_t batch_size,
+                                          std::size_t dim, float eps = 1e-6F,
+                                          hipStream_t stream = nullptr);
+
 /// Batched Unpack Q and Gate across B tokens
 void LaunchBatchedUnpackQG(const float* qg_interleaved, float* q_out,
                            float* gate_out, std::size_t batch_size,
@@ -312,10 +332,10 @@ void LaunchBatchedFusedQKVProjections(
     std::size_t hidden_size, hipStream_t stream = nullptr);
 
 /// Batched Fused SwiGLU GEMM: Out[B, intermediate] = SiLU(X[B, K] * W_gate^T) *
-/// (X[B, K] * W_up^T)
+/// (X[B, K] * W_up^T), with optional BF16 output (opt-c010-ffn-swiglu)
 void LaunchBatchedFusedSwiGLUGEMM(const void* gate_w, bool gate_is_bf16,
                                   const void* up_w, bool up_is_bf16,
-                                  const float* X, float* out,
+                                  const float* X, float* out, void* out_bf16,
                                   std::size_t batch_size,
                                   std::size_t intermediate_size,
                                   std::size_t hidden_size,

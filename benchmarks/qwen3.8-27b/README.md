@@ -237,8 +237,26 @@ decode is 1.07-1.09x behind, while shallow decode is about 7% faster.
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
 | Q/K Norm & RoPE | Fused Q/K RMSNorm + RoPE + KV-cache write into single kernel | Unfused 4-kernel launch chain per layer |
+| Residual Add + RMSNorm | Unfused residual add + RMSNorm per layer | Fused residual-add + RMSNorm: bit-exact and one fewer launch per layer, but no end-to-end gain within noise (`opt-c010-residual-rmsnorm`) |
+| FFN Projection + SwiGLU | hipBLASLt BF16 gate/up GEMMs + SwiGLU activation | Naive fused per-row gate/up GEMV + SwiGLU: ~37x prefill regression against hipBLASLt (`opt-c010-ffn-swiglu`) |
 | Speculation | Exact target verification and explicit GPU/XDNA2 MTP experiments | MTP as a default route while it reduces decode throughput |
 
 This table records only decisions that affect the current direction. Detailed
 profiling data belongs in issue discussions or local artifacts, not in this
 status page.
+
+Both fusions from `opt-c010-residual-rmsnorm` and `opt-c010-ffn-swiglu` remain
+implemented and tested behind policy toggles in
+`src/core/hip/detail/qwen_attention_policy.hpp`; they are kept disabled because
+they did not beat the unfused routes end-to-end on gfx1151.
+
+## TODOs
+
+- Re-evaluate `opt-c010-ffn-swiglu` with a tiled fused gate/up GEMM + SwiGLU
+  kernel (block-level K tiling and LDS staging, e.g. the decode
+  `FastFusedSwiGLUGEMVBlockKernel` pattern) so prefill can compete with the
+  hipBLASLt BF16 gate/up GEMMs instead of the naive per-row kernel.
+- Re-evaluate `opt-c010-residual-rmsnorm` with an LDS-staged normed pass that
+  avoids re-reading the residual sum from global memory; the current variant
+  saves one launch but keeps the extra global round-trip, so it is neutral
+  end-to-end.

@@ -394,43 +394,64 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       }
     }
 
-    LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_attn_out,
-                             arena_.d_hidden, batch_size, hidden_size,
-                             arena_.stream);
+    // Residual Add + FFN RMSNorm fused into one kernel
+    // (opt-c010-residual-rmsnorm). The unfused chain stays wired behind the
+    // policy toggle as the independent reference.
+    if (detail::ShouldFuseResidualAddRMSNorm()) {
+      LaunchBatchedFusedResidualAddRMSNorm(
+          arena_.d_hidden, arena_.d_attn_out, arena_.d_hidden,
+          static_cast<const float*>(layer.ffn_norm.data), arena_.d_normed,
+          arena_.d_scratch_bf16, batch_size, hidden_size, eps, arena_.stream);
+    } else {
+      LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_attn_out,
+                               arena_.d_hidden, batch_size, hidden_size,
+                               arena_.stream);
 
-    // FFN RMSNorm (generates BF16 into d_scratch_bf16 directly)
-    LaunchBatchedRMSNorm(arena_.d_hidden,
-                         static_cast<const float*>(layer.ffn_norm.data),
-                         arena_.d_normed, arena_.d_scratch_bf16, batch_size,
-                         hidden_size, eps, arena_.stream);
+      // FFN RMSNorm (generates BF16 into d_scratch_bf16 directly)
+      LaunchBatchedRMSNorm(arena_.d_hidden,
+                           static_cast<const float*>(layer.ffn_norm.data),
+                           arena_.d_normed, arena_.d_scratch_bf16, batch_size,
+                           hidden_size, eps, arena_.stream);
+    }
 
     const bool ffn_g_bf16 = layer.ffn_gate.type == core::GgmlType::kBF16;
     const bool ffn_u_bf16 = layer.ffn_up.type == core::GgmlType::kBF16;
     const bool ffn_d_bf16 = layer.ffn_down.type == core::GgmlType::kBF16;
 
-    if (ffn_g_bf16) {
-      launch_bf16_gemm(layer.ffn_gate.data, arena_.d_scratch_bf16,
-                       arena_.d_ffn_gate, intermediate_size, hidden_size);
+    // Fused FFN gate/up projection with SwiGLU activation into one kernel
+    // (opt-c010-ffn-swiglu). The fused kernel supports the BF16 weight route;
+    // the unfused chain stays wired behind the policy toggle as the
+    // independent reference.
+    if (detail::ShouldFuseFFNSwiGLU() && ffn_g_bf16 && ffn_u_bf16) {
+      LaunchBatchedFusedSwiGLUGEMM(
+          layer.ffn_gate.data, true, layer.ffn_up.data, true, arena_.d_normed,
+          arena_.d_ffn_act, arena_.d_scratch_bf16, batch_size,
+          intermediate_size, hidden_size, arena_.stream);
     } else {
-      LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate.data, false,
-                        arena_.d_normed, arena_.d_ffn_gate, batch_size,
-                        intermediate_size, hidden_size, arena_.d_scratch_bf16,
-                        arena_.stream);
-    }
+      if (ffn_g_bf16) {
+        launch_bf16_gemm(layer.ffn_gate.data, arena_.d_scratch_bf16,
+                         arena_.d_ffn_gate, intermediate_size, hidden_size);
+      } else {
+        LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_gate.data, false,
+                          arena_.d_normed, arena_.d_ffn_gate, batch_size,
+                          intermediate_size, hidden_size, arena_.d_scratch_bf16,
+                          arena_.stream);
+      }
 
-    if (ffn_u_bf16) {
-      launch_bf16_gemm(layer.ffn_up.data, arena_.d_scratch_bf16,
-                       arena_.d_ffn_up, intermediate_size, hidden_size);
-    } else {
-      LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_up.data, false,
-                        arena_.d_normed, arena_.d_ffn_up, batch_size,
-                        intermediate_size, hidden_size, arena_.d_scratch_bf16,
-                        arena_.stream);
-    }
+      if (ffn_u_bf16) {
+        launch_bf16_gemm(layer.ffn_up.data, arena_.d_scratch_bf16,
+                         arena_.d_ffn_up, intermediate_size, hidden_size);
+      } else {
+        LaunchHipblasGEMM(arena_.hipblas_handle, layer.ffn_up.data, false,
+                          arena_.d_normed, arena_.d_ffn_up, batch_size,
+                          intermediate_size, hidden_size, arena_.d_scratch_bf16,
+                          arena_.stream);
+      }
 
-    LaunchBatchedSwiGLUActivation(
-        arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act,
-        arena_.d_scratch_bf16, batch_size * intermediate_size, arena_.stream);
+      LaunchBatchedSwiGLUActivation(
+          arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act,
+          arena_.d_scratch_bf16, batch_size * intermediate_size, arena_.stream);
+    }
 
     if (ffn_d_bf16) {
       launch_bf16_gemm(layer.ffn_down.data, arena_.d_scratch_bf16,

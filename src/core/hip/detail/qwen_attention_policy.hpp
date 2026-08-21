@@ -41,6 +41,23 @@ struct AttentionSupportParams {
   return true;
 }
 
+// opt-c010-residual-rmsnorm: fuse the post-attention residual add with the
+// subsequent FFN RMSNorm into a single kernel per token (decode) / per token
+// row (prefill). Flip to false to revert to the unfused chain
+// (ResidualAdd + RMSNorm), which stays wired as the independent reference.
+[[nodiscard]] constexpr bool ShouldFuseResidualAddRMSNorm() noexcept {
+  return false;
+}
+
+// opt-c010-ffn-swiglu: fuse the FFN gate/up projections with the SwiGLU
+// activation into a single batched kernel for prefill. Rejected on gfx1151:
+// the naive per-row fused kernel regresses prefill ~37x (pp1024 9.70 vs 362.87
+// tok/s) against the hipBLASLt BF16 gate/up GEMMs plus SwiGLU activation, so
+// the unfused chain is the production route. Kept at false for re-evaluation.
+[[nodiscard]] constexpr bool ShouldFuseFFNSwiGLU() noexcept {
+  return false;
+}
+
 [[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
     std::size_t sequence_length) noexcept {
   if (sequence_length < kSplitKDecodeAttentionMinContext) {

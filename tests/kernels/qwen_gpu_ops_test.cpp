@@ -1152,7 +1152,7 @@ void TestBatchedFusedSwiGLUEquivalence() {
 
   // Batched
   strix::hip::LaunchBatchedFusedSwiGLUGEMM(d_gate_w, false, d_up_w, false, d_x,
-                                           d_out_batch, batch,
+                                           d_out_batch, nullptr, batch,
                                            intermediate_size, hidden_size);
 
   HIP_CHECK(hipDeviceSynchronize());
@@ -2014,6 +2014,292 @@ void TestBatchedFusedQKNormRoPEKvWriteEquivalence() {
   HIP_CHECK(hipFree(d_out_ref));
   HIP_CHECK(hipFree(d_out_fus));
 }
+
+// opt-c010-residual-rmsnorm: fused residual add + RMSNorm must reproduce the
+// unfused decode chain (ResidualAdd then RMSNorm) bit-for-bit for both the
+// residual-updated sum and the normed output.
+void TestFusedResidualAddRMSNormEquivalence() {
+  constexpr std::size_t dim = 5120;
+  std::vector<float> h_a(dim), h_b(dim), h_w(dim);
+  for (std::size_t i = 0; i < dim; ++i) {
+    h_a[i] = 0.17F * std::sin(static_cast<float>(i + 1) * 0.013F);
+    h_b[i] = 0.09F * std::cos(static_cast<float>(i + 1) * 0.007F);
+    h_w[i] = 0.9F + 0.05F * static_cast<float>(i % 23);
+  }
+
+  float *d_a = nullptr, *d_b = nullptr, *d_w = nullptr;
+  float *d_sum_ref = nullptr, *d_sum_fus = nullptr;
+  float *d_out_ref = nullptr, *d_out_fus = nullptr;
+  HIP_CHECK(hipMalloc(&d_a, dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_b, dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_w, dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_sum_ref, dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_sum_fus, dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_ref, dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_fus, dim * sizeof(float)));
+  HIP_CHECK(
+      hipMemcpy(d_a, h_a.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_b, h_b.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_w, h_w.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+
+  // Unfused reference chain.
+  strix::hip::LaunchResidualAdd(d_a, d_b, d_sum_ref, dim);
+  strix::hip::LaunchRMSNorm(d_sum_ref, d_w, d_out_ref, dim, 1e-6F);
+
+  // Fused kernel.
+  strix::hip::LaunchFusedResidualAddRMSNorm(d_a, d_b, d_sum_fus, d_w, d_out_fus,
+                                            dim, 1e-6F);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<float> res_sum_ref(dim), res_sum_fus(dim);
+  std::vector<float> res_out_ref(dim), res_out_fus(dim);
+  HIP_CHECK(hipMemcpy(res_sum_ref.data(), d_sum_ref, dim * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_sum_fus.data(), d_sum_fus, dim * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_out_ref.data(), d_out_ref, dim * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_out_fus.data(), d_out_fus, dim * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  for (std::size_t i = 0; i < dim; ++i) {
+    if (res_sum_ref[i] != res_sum_fus[i]) {
+      std::cerr << "Fused residual sum mismatch at " << i << ": "
+                << res_sum_ref[i] << " vs " << res_sum_fus[i] << "\n";
+      std::abort();
+    }
+    if (res_out_ref[i] != res_out_fus[i]) {
+      std::cerr << "Fused residual RMSNorm mismatch at " << i << ": "
+                << res_out_ref[i] << " vs " << res_out_fus[i] << "\n";
+      std::abort();
+    }
+  }
+  std::cout << "FusedResidualAddRMSNorm decode: exact sum and normed match\n";
+
+  HIP_CHECK(hipFree(d_a));
+  HIP_CHECK(hipFree(d_b));
+  HIP_CHECK(hipFree(d_w));
+  HIP_CHECK(hipFree(d_sum_ref));
+  HIP_CHECK(hipFree(d_sum_fus));
+  HIP_CHECK(hipFree(d_out_ref));
+  HIP_CHECK(hipFree(d_out_fus));
+}
+
+// opt-c010-residual-rmsnorm: batched fused residual add + RMSNorm must
+// reproduce the unfused prefill chain bit-for-bit for the residual sum, the
+// FP32 normed output, and the BF16 normed output.
+void TestBatchedFusedResidualAddRMSNormEquivalence() {
+  constexpr std::size_t batch = 4;
+  constexpr std::size_t dim = 5120;
+  std::vector<float> h_a(batch * dim), h_b(batch * dim), h_w(dim);
+  for (std::size_t i = 0; i < batch * dim; ++i) {
+    h_a[i] = 0.23F * std::cos(static_cast<float>(i + 1) * 0.011F);
+    h_b[i] = 0.11F * std::sin(static_cast<float>(i + 1) * 0.019F);
+  }
+  for (std::size_t i = 0; i < dim; ++i) {
+    h_w[i] = 1.1F - 0.04F * static_cast<float>(i % 19);
+  }
+
+  float *d_a = nullptr, *d_b = nullptr, *d_w = nullptr;
+  float *d_sum_ref = nullptr, *d_sum_fus = nullptr;
+  float *d_out_ref = nullptr, *d_out_fus = nullptr;
+  void *d_out_bf16_ref = nullptr, *d_out_bf16_fus = nullptr;
+  HIP_CHECK(hipMalloc(&d_a, batch * dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_b, batch * dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_w, dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_sum_ref, batch * dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_sum_fus, batch * dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_ref, batch * dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_fus, batch * dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_bf16_ref, batch * dim * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_out_bf16_fus, batch * dim * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMemcpy(d_a, h_a.data(), batch * dim * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_b, h_b.data(), batch * dim * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_w, h_w.data(), dim * sizeof(float), hipMemcpyHostToDevice));
+
+  // Unfused reference chain.
+  strix::hip::LaunchBatchedResidualAdd(d_a, d_b, d_sum_ref, batch, dim);
+  strix::hip::LaunchBatchedRMSNorm(d_sum_ref, d_w, d_out_ref, d_out_bf16_ref,
+                                   batch, dim, 1e-6F);
+
+  // Fused kernel.
+  strix::hip::LaunchBatchedFusedResidualAddRMSNorm(
+      d_a, d_b, d_sum_fus, d_w, d_out_fus, d_out_bf16_fus, batch, dim, 1e-6F);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<float> res_sum_ref(batch * dim), res_sum_fus(batch * dim);
+  std::vector<float> res_out_ref(batch * dim), res_out_fus(batch * dim);
+  std::vector<std::uint16_t> res_bf16_ref(batch * dim),
+      res_bf16_fus(batch * dim);
+  HIP_CHECK(hipMemcpy(res_sum_ref.data(), d_sum_ref,
+                      batch * dim * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_sum_fus.data(), d_sum_fus,
+                      batch * dim * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_out_ref.data(), d_out_ref,
+                      batch * dim * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_out_fus.data(), d_out_fus,
+                      batch * dim * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_bf16_ref.data(), d_out_bf16_ref,
+                      batch * dim * sizeof(std::uint16_t),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_bf16_fus.data(), d_out_bf16_fus,
+                      batch * dim * sizeof(std::uint16_t),
+                      hipMemcpyDeviceToHost));
+
+  for (std::size_t i = 0; i < batch * dim; ++i) {
+    if (res_sum_ref[i] != res_sum_fus[i]) {
+      std::cerr << "Batched fused residual sum mismatch at " << i << ": "
+                << res_sum_ref[i] << " vs " << res_sum_fus[i] << "\n";
+      std::abort();
+    }
+    if (res_out_ref[i] != res_out_fus[i]) {
+      std::cerr << "Batched fused residual RMSNorm mismatch at " << i << ": "
+                << res_out_ref[i] << " vs " << res_out_fus[i] << "\n";
+      std::abort();
+    }
+    if (res_bf16_ref[i] != res_bf16_fus[i]) {
+      std::cerr << "Batched fused residual BF16 mismatch at " << i << "\n";
+      std::abort();
+    }
+  }
+  std::cout << "BatchedFusedResidualAddRMSNorm prefill: exact sum, normed, and "
+               "BF16 match\n";
+
+  HIP_CHECK(hipFree(d_a));
+  HIP_CHECK(hipFree(d_b));
+  HIP_CHECK(hipFree(d_w));
+  HIP_CHECK(hipFree(d_sum_ref));
+  HIP_CHECK(hipFree(d_sum_fus));
+  HIP_CHECK(hipFree(d_out_ref));
+  HIP_CHECK(hipFree(d_out_fus));
+  HIP_CHECK(hipFree(d_out_bf16_ref));
+  HIP_CHECK(hipFree(d_out_bf16_fus));
+}
+
+// opt-c010-ffn-swiglu: batched fused FFN gate/up projection + SwiGLU must
+// match the unfused production prefill chain (BF16 gate GEMM, BF16 up GEMM,
+// SwiGLU activation) under the declared arithmetic contract. The fused kernel
+// consumes the FP32 normed input while the unfused chain consumes the BF16
+// normed input, so a finite tolerance applies.
+void TestBatchedFusedSwiGLUProductionEquivalence() {
+  constexpr std::size_t batch = 4;
+  constexpr std::size_t hidden_size = 512;
+  constexpr std::size_t intermediate_size = 1024;
+
+  std::vector<float> h_x(batch * hidden_size);
+  std::vector<std::uint16_t> h_gate_w(intermediate_size * hidden_size);
+  std::vector<std::uint16_t> h_up_w(intermediate_size * hidden_size);
+  for (std::size_t i = 0; i < batch * hidden_size; ++i) {
+    h_x[i] = 0.5F * std::sin(static_cast<float>(i + 1) * 0.037F);
+  }
+  for (std::size_t i = 0; i < intermediate_size * hidden_size; ++i) {
+    h_gate_w[i] =
+        FloatToBf16Bits(0.012F * std::cos(static_cast<float>(i + 1) * 0.0021F));
+    h_up_w[i] =
+        FloatToBf16Bits(0.017F * std::sin(static_cast<float>(i + 1) * 0.0017F));
+  }
+
+  float *d_x = nullptr, *d_x_bf16 = nullptr;
+  void *d_gate_w = nullptr, *d_up_w = nullptr;
+  float *d_gate = nullptr, *d_up = nullptr;
+  float *d_out_ref = nullptr, *d_out_fus = nullptr;
+  void *d_out_bf16_ref = nullptr, *d_out_bf16_fus = nullptr;
+  HIP_CHECK(hipMalloc(&d_x, batch * hidden_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_x_bf16, batch * hidden_size * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_gate_w,
+                      intermediate_size * hidden_size * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_up_w,
+                      intermediate_size * hidden_size * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_gate, batch * intermediate_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_up, batch * intermediate_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_ref, batch * intermediate_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_fus, batch * intermediate_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_bf16_ref,
+                      batch * intermediate_size * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_out_bf16_fus,
+                      batch * intermediate_size * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMemcpy(d_x, h_x.data(), batch * hidden_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_gate_w, h_gate_w.data(),
+                      intermediate_size * hidden_size * sizeof(std::uint16_t),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_up_w, h_up_w.data(),
+                      intermediate_size * hidden_size * sizeof(std::uint16_t),
+                      hipMemcpyHostToDevice));
+  strix::hip::LaunchFloatToBfloat16(d_x, d_x_bf16, batch * hidden_size);
+
+  hipblasHandle_t handle = nullptr;
+  HIPBLAS_CHECK(hipblasCreate(&handle));
+
+  // Unfused production chain: gate GEMM, up GEMM, SwiGLU activation.
+  strix::hip::LaunchHipblasGEMMBF16(handle, d_gate_w, d_x_bf16, d_gate, batch,
+                                    intermediate_size, hidden_size);
+  strix::hip::LaunchHipblasGEMMBF16(handle, d_up_w, d_x_bf16, d_up, batch,
+                                    intermediate_size, hidden_size);
+  strix::hip::LaunchBatchedSwiGLUActivation(
+      d_gate, d_up, d_out_ref, d_out_bf16_ref, batch * intermediate_size);
+
+  // Fused kernel (consumes the FP32 normed input).
+  strix::hip::LaunchBatchedFusedSwiGLUGEMM(d_gate_w, true, d_up_w, true, d_x,
+                                           d_out_fus, d_out_bf16_fus, batch,
+                                           intermediate_size, hidden_size);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<float> res_ref(batch * intermediate_size);
+  std::vector<float> res_fus(batch * intermediate_size);
+  std::vector<float> res_bf16_ref(batch * intermediate_size);
+  std::vector<float> res_bf16_fus(batch * intermediate_size);
+  HIP_CHECK(hipMemcpy(res_ref.data(), d_out_ref,
+                      batch * intermediate_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_fus.data(), d_out_fus,
+                      batch * intermediate_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_bf16_ref.data(), d_out_bf16_ref,
+                      batch * intermediate_size * sizeof(std::uint16_t),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_bf16_fus.data(), d_out_bf16_fus,
+                      batch * intermediate_size * sizeof(std::uint16_t),
+                      hipMemcpyDeviceToHost));
+
+  float max_diff = 0.0F, max_bf16_diff = 0.0F, mean_diff = 0.0F;
+  for (std::size_t i = 0; i < batch * intermediate_size; ++i) {
+    const float d = std::abs(res_ref[i] - res_fus[i]);
+    max_diff = std::max(max_diff, d);
+    mean_diff += d;
+    const float db = std::abs(Bf16BitsToFloat(res_bf16_ref[i]) -
+                              Bf16BitsToFloat(res_bf16_fus[i]));
+    max_bf16_diff = std::max(max_bf16_diff, db);
+  }
+  mean_diff /= static_cast<float>(batch * intermediate_size);
+  std::cout << "BatchedFusedSwiGLU vs production chain: max_diff=" << max_diff
+            << " mean_diff=" << mean_diff << " max_bf16_diff=" << max_bf16_diff
+            << "\n";
+  if (max_diff >= 1e-2F || max_bf16_diff >= 1e-2F) {
+    std::cerr << "Fused SwiGLU GEMM does not match the unfused production "
+                 "chain (max_diff "
+              << max_diff << ", max_bf16_diff " << max_bf16_diff << ")\n";
+    std::abort();
+  }
+
+  HIPBLAS_CHECK(hipblasDestroy(handle));
+  HIP_CHECK(hipFree(d_x));
+  HIP_CHECK(hipFree(d_x_bf16));
+  HIP_CHECK(hipFree(d_gate_w));
+  HIP_CHECK(hipFree(d_up_w));
+  HIP_CHECK(hipFree(d_gate));
+  HIP_CHECK(hipFree(d_up));
+  HIP_CHECK(hipFree(d_out_ref));
+  HIP_CHECK(hipFree(d_out_fus));
+  HIP_CHECK(hipFree(d_out_bf16_ref));
+  HIP_CHECK(hipFree(d_out_bf16_fus));
+}
+
 int main() {
   int device_count = 0;
   HIP_CHECK(hipGetDeviceCount(&device_count));
@@ -2040,6 +2326,9 @@ int main() {
   TestBatchedPerHeadRMSNormEquivalence();
   TestFusedQKNormRoPEKvWriteEquivalence();
   TestBatchedFusedQKNormRoPEKvWriteEquivalence();
+  TestFusedResidualAddRMSNormEquivalence();
+  TestBatchedFusedResidualAddRMSNormEquivalence();
+  TestBatchedFusedSwiGLUProductionEquivalence();
   std::cout << "All Qwen HIP GPU kernel tests passed on gfx1151.\n";
   return 0;
 }
