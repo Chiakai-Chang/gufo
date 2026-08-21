@@ -73,22 +73,27 @@ for the same artifact. Prompt rows compare the final context after adding the
 
 | Prepared depth | Strix `pp2048` | DS4 `pp2048` | Delta | Strix `tg128` | DS4 `tg128` | Delta | Snapshot bytes |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2K | 193.66 | 205.49 | -5.8% | 15.52 | 14.76 | +5.1% | 52,184,460 |
-| 8K | 188.28 | 197.13 | -4.5% | 14.61 | 13.87 | +5.3% | 136,750,476 |
-| 16K | 183.10 | 190.09 | -3.7% | 14.32 | 13.63 | +5.1% | 249,505,164 |
-| 32K | 167.05 | 171.83 | -2.8% | 13.55 | 12.93 | +4.8% | 475,014,540 |
+| 2K | 193.66 | 205.49 | -5.8% | 16.27 | 14.76 | +10.2% | 52,184,460 |
+| 8K | 188.28 | 197.13 | -4.5% | 14.68 | 13.87 | +5.8% | 136,750,476 |
+| 16K | 183.10 | 190.09 | -3.7% | 14.41 | 13.63 | +5.7% | 249,505,164 |
+| 32K | 167.05 | 171.83 | -2.8% | 13.67 | 12.93 | +5.7% | 475,014,540 |
 | 64K | 145.66 | not supplied | - | 12.42 | 11.91 | +4.3% | 926,033,292 |
 
 The model loads 80.76 GiB of tensor spans in about 21 seconds. The 64K run
 plans 82.07 GiB total, including model, KV state, and working buffers.
-The 2K row was rerun after the native C++ runtime refactor; the deeper rows
-retain the prior measurements from the same numerical kernel family.
+The 2K generation value is the mean of three interleaved release samples. The
+8K-32K generation values come from one paired sparse-depth sweep. Prompt
+processing is unchanged by the decode-only Q2-down optimization.
 
 ## Quality and Integration
 
 - The pinned upstream DS4 CLI and packaged Strix CLI produce the exact same
   four-token greedy continuation, ` Paris. It is`, for the same raw prompt and
   artifact.
+- A pinned 128-token teacher-forced trajectory keeps at least 116/128 reference
+  tokens at top-1, every reference token within top-3, and aggregate rank at
+  most 142. This catches sustained numerical drift without treating
+  free-running near-tie flips as state corruption.
 - Full logits are finite after real GGUF prefill.
 - Snapshot restore reproduces the exact position, greedy token, and logit
   vector.
@@ -110,6 +115,9 @@ retain the prior measurements from the same numerical kernel family.
 - Reused the existing Strix CLI, benchmark, and OpenAI-compatible server.
 - Matched the DS4 state payload sizes and stayed close to or ahead of the
   supplied throughput curve through 64K.
+- Reduced the six-expert Q2-down kernel by 7.8% with a two-way compiler unroll;
+  `tg128` improved 1.2% at 2K and 0.6-0.7% at 8K-32K without changing VGPR,
+  LDS, or scratch allocation.
 
 ## Failed
 
@@ -118,6 +126,8 @@ retain the prior measurements from the same numerical kernel family.
   are retained.
 - The upstream DS4 frontend build is not imported. Strix owns CLI, HTTP,
   benchmarking, cancellation, and session pooling.
+- Q8 projection row grouping (`1/2/4/8`) and high-compression row grouping
+  (`8/16/32`) produced no repeatable end-to-end improvement.
 
 ## To Do
 
