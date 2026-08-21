@@ -2556,6 +2556,30 @@ void TestGEMVResidualEquivalence() {
   HIP_CHECK(hipFree(d_y_fus2));
 }
 
+void TestLayerWeightPrefetch() {
+  // opt-c014-layer-prefetch: the async page-touch must never modify the buffer
+  // and must be safe on a trailing partial page (bounds-clamped reads).
+  constexpr std::size_t kBytes = 4096U * 3U + 123U;
+  std::vector<unsigned char> h_buf(kBytes);
+  for (std::size_t i = 0; i < kBytes; ++i) {
+    h_buf[i] = static_cast<unsigned char>((i * 31U) & 0xFFU);
+  }
+  void* d_buf = nullptr;
+  HIP_CHECK(hipMalloc(&d_buf, kBytes));
+  HIP_CHECK(hipMemcpy(d_buf, h_buf.data(), kBytes, hipMemcpyHostToDevice));
+
+  strix::hip::LaunchLayerWeightPrefetch(d_buf, kBytes);
+  strix::hip::LaunchLayerWeightPrefetch(nullptr, kBytes);
+  strix::hip::LaunchLayerWeightPrefetch(d_buf, 0);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<unsigned char> h_out(kBytes);
+  HIP_CHECK(hipMemcpy(h_out.data(), d_buf, kBytes, hipMemcpyDeviceToHost));
+  assert(h_out == h_buf);
+
+  HIP_CHECK(hipFree(d_buf));
+}
+
 // opt-c010-rmsnorm-projection: fused layer pre-RMSNorm + QKV projections must
 // match the unfused chain (RMSNorm then FusedQKVProjections) bit-for-bit.
 void TestFusedRMSNormQKVProjectionsEquivalence() {
@@ -2918,6 +2942,7 @@ int main() {
   TestBatchedFusedSwiGLUProductionEquivalence();
   TestBatchedSSMRecurrenceNormGateEquivalence();
   TestGEMVResidualEquivalence();
+  TestLayerWeightPrefetch();
   TestFusedRMSNormQKVProjectionsEquivalence();
   TestFusedRMSNormSSMInputProjectionsEquivalence();
   TestFusedRMSNormSwiGLUEquivalence();

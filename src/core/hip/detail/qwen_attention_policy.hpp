@@ -78,6 +78,15 @@ struct AttentionSupportParams {
   return false;
 }
 
+// opt-c014-layer-prefetch: issue an asynchronous GPU touch of the next layer's
+// weight pages on a side stream while the current layer executes, so the next
+// layer's projection kernels do not stall on first-touch page walks. Flip to
+// false to revert to the no-prefetch route, which stays wired as the
+// independent reference.
+[[nodiscard]] constexpr bool ShouldPrefetchNextLayer() noexcept {
+  return false;
+}
+
 [[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
     std::size_t sequence_length) noexcept {
   if (sequence_length < kSplitKDecodeAttentionMinContext) {

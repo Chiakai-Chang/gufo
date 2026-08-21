@@ -166,6 +166,11 @@ void LaunchGEMVResidual(const void* A, bool is_bf16, const float* x, float* y,
                         const float* residual, std::size_t M, std::size_t K,
                         hipStream_t stream = nullptr);
 
+/// opt-c014-layer-prefetch: asynchronous page-touch of a weight region on the
+/// given stream. Reads one 16B chunk per 4KiB page; never writes.
+void LaunchLayerWeightPrefetch(const void* data, std::size_t bytes,
+                               hipStream_t stream = nullptr);
+
 /// Computes Fused SSM Input Projections (QKV, Gate, Alpha, Beta) in a single
 /// kernel
 void LaunchFusedSSMInputProjections(

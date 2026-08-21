@@ -60,9 +60,62 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
     LaunchEmbeddingLookup(weights_.token_embd.data, embd_is_bf16, d_in_token,
                           arena_.d_hidden, hidden_size, arena_.stream);
 
+    // opt-c014-layer-prefetch: touch the next layer's weight pages on a side
+    // stream while the current layer computes, so the next layer's projection
+    // kernels do not stall on first-touch page walks. The join below keeps the
+    // side stream bounded to exactly one layer ahead. The unfused route (no
+    // prefetch) stays wired behind the policy toggle as the reference.
+    auto PrefetchLayerWeights = [](const models::QwenLayerWeights& layer,
+                                   hipStream_t stream) {
+      auto PrefetchTensor = [stream](const models::QwenTensorRef& tensor) {
+        if (tensor.empty()) {
+          return;
+        }
+        const std::size_t element_bytes =
+            tensor.type == core::GgmlType::kBF16 ? 2U : 4U;
+        LaunchLayerWeightPrefetch(tensor.data,
+                                  tensor.num_elements * element_bytes, stream);
+      };
+      PrefetchTensor(layer.attn_norm);
+      PrefetchTensor(layer.ffn_norm);
+      PrefetchTensor(layer.attn_q);
+      PrefetchTensor(layer.attn_k);
+      PrefetchTensor(layer.attn_v);
+      PrefetchTensor(layer.attn_output);
+      PrefetchTensor(layer.attn_q_norm);
+      PrefetchTensor(layer.attn_k_norm);
+      PrefetchTensor(layer.attn_qkv);
+      PrefetchTensor(layer.attn_gate);
+      PrefetchTensor(layer.ssm_a);
+      PrefetchTensor(layer.ssm_conv1d);
+      PrefetchTensor(layer.ssm_dt);
+      PrefetchTensor(layer.ssm_alpha);
+      PrefetchTensor(layer.ssm_beta);
+      PrefetchTensor(layer.ssm_norm);
+      PrefetchTensor(layer.ssm_out);
+      PrefetchTensor(layer.ffn_gate);
+      PrefetchTensor(layer.ffn_up);
+      PrefetchTensor(layer.ffn_down);
+    };
+
     // 2. Layer stack
     for (std::uint32_t l = 0; l < config.num_layers; ++l) {
       const auto& layer = weights_.layers[l];
+
+      // opt-c014-layer-prefetch: start the next layer's page touch on the side
+      // stream while this layer runs, then join before layer l+1 computes.
+      // The side stream records the completion marker; the captured main
+      // stream waits on it (the capture-compatible dependency direction), so
+      // HIP-graph capture keeps working.
+      if (detail::ShouldPrefetchNextLayer() && l + 1 < config.num_layers) {
+        if (l > 0) {
+          HIP_CHECK(
+              hipStreamWaitEvent(arena_.stream, arena_.prefetch_event, 0));
+        }
+        PrefetchLayerWeights(weights_.layers[l + 1], arena_.prefetch_stream);
+        HIP_CHECK(
+            hipEventRecord(arena_.prefetch_event, arena_.prefetch_stream));
+      }
 
       // opt-c010-rmsnorm-projection: fuse the layer pre-RMSNorm into the
       // projection GEMVs below (QKV / SSM input / FFN SwiGLU), so the

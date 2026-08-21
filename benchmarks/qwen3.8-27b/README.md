@@ -241,6 +241,7 @@ decode is 1.07-1.09x behind, while shallow decode is about 7% faster.
 | FFN Projection + SwiGLU | hipBLASLt BF16 gate/up GEMMs + SwiGLU activation | Naive fused per-row gate/up GEMV + SwiGLU: ~37x prefill regression against hipBLASLt (`opt-c010-ffn-swiglu`) |
 | SSM norm + gate + residual | Unfused recurrence + post-norm kernel; ssm_out GEMV + residual add | Fused recurrence + post-norm + gate: bit-exact but +41% recurrence time and 104B scratch spill; decode residual folded into ssm_out GEMV: bit-exact, one fewer launch, no end-to-end gain (`opt-c010-ssm-gate-residual`) |
 | RMSNorm + projection input | Decode RMSNorm kernel + fused QKV/SSM-input/SwiGLU projection GEMVs | Norm folded into the projection GEMVs: bit-exact but every block redundantly re-normalizes the row, +9-21% per projection launch and ~9% decode regression (`opt-c010-rmsnorm-projection`) |
+| Layer prefetch | Single-stream decode; no prefetch | Async next-layer page-touch on a side stream: tg128 -1.6%, and the per-layer cross-stream join serializes the non-graph (split-K) decode path, ~4x regression at depth 4K/8K/16K (`opt-c014-layer-prefetch`) |
 | Speculation | Exact target verification and explicit GPU/XDNA2 MTP experiments | MTP as a default route while it reduces decode throughput |
 
 This table records only decisions that affect the current direction. Detailed
@@ -277,3 +278,10 @@ they did not beat the unfused routes end-to-end on gfx1151.
   projection block.
 - Consider folding the decode output-norm into the LM-head GEMV only with a
   single-block pre-pass that stages the normed row, not a per-block reduction.
+- Re-evaluate `opt-c014-layer-prefetch` as a targeted prefetch of only the next
+  layer's hot projection tensors into pinned scratch via stream-ordered copy
+  instead of a full-layer page-touch: the full-layer variant re-reads the whole
+  ~1.06 GiB layer every token and its per-layer cross-stream join serializes
+  the non-graph (split-K) decode path (~4x at depth); a resident
+  `STRIX_GPU_WEIGHT_MODE=copy` comparison would show whether mapped-weight
+  re-reads cost anything in steady state at all.

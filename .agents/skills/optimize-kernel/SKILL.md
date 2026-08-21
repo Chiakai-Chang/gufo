@@ -107,15 +107,47 @@ allocation, scratch, occupancy) before touching code.
 
 - Baseline bench (no reps): see section 1.4.
 - rocprofv3 invocation: see section 1.6.
-- rocprof sqlite aggregate (decode stats), devshell python3:
+- rocprof sqlite aggregate (decode stats), devshell python3; table names carry
+  a per-session suffix so match by prefix and unwrap the 1-tuples:
   ```python
   import sqlite3
   c = sqlite3.connect('/tmp/<prof>/homelab/*.db')
-  kd = [t for t in c.execute("SELECT name FROM sqlite_master WHERE type='table'") if 'kernel_dispatch' in t][0]
-  ks = [t for t in c.execute("SELECT name FROM sqlite_master WHERE type='table'") if 'kernel_symbol' in t][0]
+  kd = [t[0] for t in c.execute("SELECT name FROM sqlite_master WHERE type='table'") if t[0].startswith('rocpd_kernel_dispatch')][0]
+  ks = [t[0] for t in c.execute("SELECT name FROM sqlite_master WHERE type='table'") if t[0].startswith('rocpd_info_kernel_symbol')][0]
   q = f"SELECT ks.kernel_name, COUNT(*), SUM(kd.end-kd.start)/1000.0, AVG(kd.end-kd.start)/1000.0, "\
       f"MAX(ks.arch_vgpr_count), MAX(ks.sgpr_count), MAX(ks.group_segment_size), "\
       f"MAX(ks.private_segment_size), MAX(kd.workgroup_size_x), MAX(kd.grid_size_x) "\
       f"FROM {kd} kd JOIN {ks} ks ON kd.kernel_id=ks.id GROUP BY ks.kernel_name ORDER BY 3 DESC"
   for r in c.execute(q): print(r)
   ```
+## Graph-capture and A/B pitfalls (learned on opt-c010/opt-c014)
+
+- Cross-stream events in a graph-captured decode path: only the
+  side-stream-records -> main-stream-waits direction is capture-compatible.
+  The reverse (main records, side waits) fails `hipStreamEndCapture`
+  (`miss_end_failed` in `STRIX_DISPATCH_TELEMETRY=1` stderr).
+- Work launched on a NON-captured side stream during capture is NOT part of
+  the captured graph: only event edges are baked in. On replay the side-stream
+  kernels never run, so verify with rocprof that the "prefetch" actually
+  dispatches per token, or it only fires during capture.
+- Decode silently switches to split-K (non-graph) at depth >= 4K. A
+  per-layer cross-stream event join can serialize only that path (observed
+  ~4x regression) while the graph path hides it. Always A/B both
+  `tg128` and `tg@depth 4K/8K/16K`, and if adding cross-stream work, also run
+  `STRIX_ENABLE_HIP_GRAPH=0` to force the non-graph path.
+- Bench table parse (rows like `| ... | tg128 | 3.74 ± 0.00 |`):
+  `rg '\| *tg128' | sed -E 's/.*\|\s*([0-9.]+) ±.*/\1/'`. Depth rows are named
+  `tg128@d4096` etc. Each bench invocation reloads the model and runs a
+  32-token warmup; keep `result-base`/`result-cand` symlinks and alternate
+  binaries, reporting medians. `pp2048` in the same run is a useful
+  "untouched-path" sanity check (it must stay within noise).
+- rocprofv3 schema drift: table names carry a per-session suffix
+  (`rocpd_kernel_dispatch_<hex>`, `rocpd_info_kernel_symbol_<hex>`). Match by
+  prefix from `sqlite_master`; kernel symbols live in
+  `rocpd_info_kernel_symbol_*` (not `kernel_symbol`). The skill's earlier
+  snippet needs `t[0]` unwrapping (names come back as 1-tuples).
+- Steady-state decode on the integrated APU is DRAM-bandwidth bound with
+  weights fully page-cached; page-touch "prefetch" just re-reads the same
+  DRAM and adds traffic. Measure the real cost first (e.g. mapped vs
+  `STRIX_GPU_WEIGHT_MODE=copy` resident weights) before building prefetch
+  machinery.

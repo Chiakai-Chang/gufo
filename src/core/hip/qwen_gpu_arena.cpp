@@ -18,6 +18,8 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       max_context_(std::max(max_context, 1U)),
       max_batch_(std::min(max_context_, kMaxPromptBatch)) {
   HIP_CHECK(hipStreamCreate(&stream));
+  HIP_CHECK(hipStreamCreate(&prefetch_stream));
+  HIP_CHECK(hipEventCreateWithFlags(&prefetch_event, hipEventDisableTiming));
   HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
   HIPBLAS_CHECK(hipblasSetStream(hipblas_handle, stream));
   hipblaslt_gemm = std::make_unique<HipblasLtGemm>();
@@ -514,6 +516,10 @@ void QwenGpuArena::FreeAll() noexcept {
   hipblaslt_gemm.reset();
   if (stream != nullptr)
     HIP_CHECK(hipStreamDestroy(stream));
+  if (prefetch_stream != nullptr)
+    HIP_CHECK(hipStreamDestroy(prefetch_stream));
+  if (prefetch_event != nullptr)
+    HIP_CHECK(hipEventDestroy(prefetch_event));
 
   d_hidden = nullptr;
   d_normed = nullptr;

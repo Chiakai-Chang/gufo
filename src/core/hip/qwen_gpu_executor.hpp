@@ -128,6 +128,8 @@ public:
   std::uint32_t* d_prompt_tokens{nullptr};
 
   hipStream_t stream{nullptr};
+  hipStream_t prefetch_stream{nullptr};
+  hipEvent_t prefetch_event{nullptr};
   hipblasHandle_t hipblas_handle{nullptr};
   std::unique_ptr<HipblasLtGemm> hipblaslt_gemm;
   void* d_scratch_bf16{nullptr};

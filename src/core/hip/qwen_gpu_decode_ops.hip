@@ -1491,11 +1491,11 @@ __device__ inline float FusedRMSNormInvScale(const float* __restrict__ x,
 // chain (RMSNormKernel then Wave32FusedQKVProjectionsKernel_1Row) bit-for-bit.
 __launch_bounds__(256, 4) __global__ void FusedRMSNormQKVProjectionsKernel(
     const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
-    const void* __restrict__ q_w, bool q_is_bf16,
-    const void* __restrict__ k_w, bool k_is_bf16,
-    const void* __restrict__ v_w, bool v_is_bf16, float* __restrict__ q_out,
-    float* __restrict__ k_out, float* __restrict__ v_out, std::size_t q_dim,
-    std::size_t kv_dim, std::size_t hidden_size) {
+    const void* __restrict__ q_w, bool q_is_bf16, const void* __restrict__ k_w,
+    bool k_is_bf16, const void* __restrict__ v_w, bool v_is_bf16,
+    float* __restrict__ q_out, float* __restrict__ k_out,
+    float* __restrict__ v_out, std::size_t q_dim, std::size_t kv_dim,
+    std::size_t hidden_size) {
   const std::size_t tid = threadIdx.x;
   const std::size_t lane_id = tid & 31u;
   const std::size_t warp_id = tid >> 5u;
@@ -1846,7 +1846,45 @@ __launch_bounds__(256, 4) __global__ void FusedRMSNormSwiGLUGEMVKernel(
     }
   }
 }
+
+// opt-c014-layer-prefetch: touch up to 16 bytes per 4KiB page of a weight
+// region so the page mappings are resident before the real projection kernels
+// read them. Reads only; the guarded store can never fire (its value depends
+// on the loaded data) and exists to defeat dead-code elimination. Reads are
+// clamped to `bytes` so the last partial page never runs past the region.
+__launch_bounds__(256, 4) __global__
+    void LayerWeightPrefetchKernel(const void* __restrict__ data,
+                                   std::size_t bytes) {
+  const auto* p = static_cast<const unsigned char*>(data);
+  constexpr std::size_t kPageBytes = 4096U;
+  constexpr std::size_t kTouchBytes = 16U;
+  const std::size_t num_pages = (bytes + kPageBytes - 1U) / kPageBytes;
+  float acc = 0.0F;
+  for (std::size_t page = threadIdx.x; page < num_pages; page += blockDim.x) {
+    const std::size_t base = page * kPageBytes;
+    const std::size_t n = std::min<std::size_t>(kTouchBytes, bytes - base);
+    for (std::size_t i = 0; i < n; ++i) {
+      acc += static_cast<float>(p[base + i]);
+    }
+  }
+  if (acc == 1.234567e30F) {
+    const_cast<unsigned char*>(p)[0] = 0U;
+  }
+}
 }  // namespace
+
+// opt-c014-layer-prefetch: touch one 16B chunk per 4KiB page of a weight
+// region on the given stream (async). Reads only; the guarded store inside the
+// kernel can never fire.
+void LaunchLayerWeightPrefetch(const void* data, std::size_t bytes,
+                               hipStream_t stream) {
+  if (data == nullptr || bytes == 0) {
+    return;
+  }
+  const std::size_t num_pages = (bytes + 4095U) / 4096U;
+  const std::size_t grid = (num_pages + 255U) / 256U;
+  LayerWeightPrefetchKernel<<<grid, 256, 0, stream>>>(data, bytes);
+}
 
 __global__ void SSMConvKernel(const float* __restrict__ qkv_in,
                               const float* __restrict__ conv_weights,
@@ -2261,9 +2299,8 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, bool gate_is_bf16,
 void LaunchFusedRMSNormQKVProjections(
     const float* x, const float* norm_w, float eps, const void* q_w,
     bool q_is_bf16, const void* k_w, bool k_is_bf16, const void* v_w,
-    bool v_is_bf16, float* q_out, float* k_out, float* v_out,
-    std::size_t q_dim, std::size_t kv_dim, std::size_t hidden_size,
-    hipStream_t stream) {
+    bool v_is_bf16, float* q_out, float* k_out, float* v_out, std::size_t q_dim,
+    std::size_t kv_dim, std::size_t hidden_size, hipStream_t stream) {
   const std::size_t total_rows = q_dim + (2 * kv_dim);
   const std::size_t grid = (total_rows + 7U) / 8U;
   FusedRMSNormQKVProjectionsKernel<<<grid, 256, 0, stream>>>(
@@ -2291,10 +2328,10 @@ void LaunchFusedRMSNormSSMInputProjections(
 // opt-c010-rmsnorm-projection: fused layer pre-RMSNorm + FFN SwiGLU gate/up
 // projections (BF16 weights only, matching the production decode route).
 void LaunchFusedRMSNormSwiGLUGEMV(const float* x, const float* norm_w,
-                                   float eps, const void* gate_w,
-                                   const void* up_w, float* out,
-                                   std::size_t intermediate_size,
-                                   std::size_t hidden_size, hipStream_t stream) {
+                                  float eps, const void* gate_w,
+                                  const void* up_w, float* out,
+                                  std::size_t intermediate_size,
+                                  std::size_t hidden_size, hipStream_t stream) {
   const std::size_t num_pairs = intermediate_size / 2;
   const std::size_t grid = (num_pairs + 7U) / 8U;
   FusedRMSNormSwiGLUGEMVKernel<<<grid, 256, 0, stream>>>(
