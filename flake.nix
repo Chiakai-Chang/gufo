@@ -188,6 +188,18 @@
             ];
           };
 
+          h3QualitySource = mkFilteredSource {
+            directories = [
+              "tools/strix"
+            ];
+            files = [
+              "src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+              "tests/fixtures/minimax_h3/quality-contract-v1.json"
+              "tests/tools/test_h3_quality.py"
+              "tools/strix-h3-quality.py"
+            ];
+          };
+
           dependencySource = mkFilteredSource {
             files = [
               ".devops/nix/package.nix"
@@ -292,6 +304,18 @@
             echo "PASS: MiniMax H3 manifest tests clean" > $out/result.txt
           '';
 
+          h3QualityCheck = pkgsSys.runCommand "check-h3-quality" {
+            nativeBuildInputs = [
+              (pkgsSys.python3.withPackages (ps: [ ps.numpy ]))
+            ];
+            src = h3QualitySource;
+          } ''
+            cd "$src"
+            python3 tests/tools/test_h3_quality.py
+            mkdir -p $out
+            echo "PASS: MiniMax H3 quality-oracle tests clean" > $out/result.txt
+          '';
+
           testCheck = pkgsSys.runCommand "check-tests" {
             nativeBuildInputs = [
               pkgsSys.stdenv.cc
@@ -343,6 +367,7 @@
             cat "${dependencyInventoryCheck}/result.txt"
             cat "${docsCheck}/result.txt"
             cat "${h3ManifestCheck}/result.txt"
+            cat "${h3QualityCheck}/result.txt"
             cat "${testCheck}/result.txt"
 
             cat <<EOF > $out/pr-summary.txt
@@ -357,7 +382,8 @@ Composed Gates:
   3. Dependency and License Inventory (THIRD_PARTY_NOTICES.md)
   4. Documentation & Local Link Validation (check-docs.py)
   5. MiniMax H3 Source-Manifest Validation
-  6. CPU Build and Runtime/Unit Tests (CTest)
+  6. MiniMax H3 Quality-Oracle Validation
+  7. CPU Build and Runtime/Unit Tests (CTest)
 Production Package Validation:
   - gfx1151 ROCm/HIP + XRT build
   - Installed strix-server version/help smoke
@@ -370,6 +396,7 @@ EOF
           dependency-inventory = dependencyInventoryCheck;
           docs = docsCheck;
           h3-manifest = h3ManifestCheck;
+          h3-quality = h3QualityCheck;
           tests = testCheck;
           pr = prCheck;
         }

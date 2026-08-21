@@ -1,0 +1,149 @@
+{
+  "contract_id": "minimax-h3-fl2va-bf16-quality-v1",
+  "metrics": [
+    "relative_max",
+    "relative_l2",
+    "nonfinite_count",
+    "psnr",
+    "ssim",
+    "lpips",
+    "temporal_delta_relative_l2",
+    "waveform_max_abs",
+    "spectrogram_relative_l2",
+    "channel_integrity",
+    "duration",
+    "av_sync",
+    "human_review"
+  ],
+  "model": {
+    "kind": "minimax-h3-fl2va-bf16",
+    "repository": "MiniMaxAI/MiniMax-H3",
+    "revision": "42ed227ee7df40d41602854ae760620d6eb651fe"
+  },
+  "oracle_hierarchy": [
+    "analytic-host",
+    "pinned-component-teacher",
+    "pinned-bf16-end-to-end"
+  ],
+  "reference": {
+    "repository": "antirez/h3.c",
+    "revision": "8974cc055ea9c02fcd14cc27dfda3e1027c05153"
+  },
+  "retained_cases": [
+    {
+      "blocks": 50,
+      "class": "rapid",
+      "frames": 22,
+      "height": 256,
+      "id": "fox-256x256x22-4",
+      "prompt": "A red fox walking through snow",
+      "prompt_sha256": "df0ff96bcdb3a350f115cc39daaf0d7523814258890aa90c06fa784e3ad06169",
+      "reuse": 1,
+      "seed": 42,
+      "selected_frames": [
+        0,
+        11,
+        21
+      ],
+      "steps": 4,
+      "width": 256
+    },
+    {
+      "blocks": 50,
+      "class": "exact",
+      "frames": 22,
+      "height": 512,
+      "id": "fox-512x512x22-50",
+      "prompt": "A red fox walking through snow",
+      "prompt_sha256": "df0ff96bcdb3a350f115cc39daaf0d7523814258890aa90c06fa784e3ad06169",
+      "reuse": 1,
+      "seed": 42,
+      "steps": 50,
+      "width": 512
+    },
+    {
+      "blocks": 50,
+      "class": "independent",
+      "frames": 22,
+      "height": 512,
+      "id": "mug-512x512x22-50",
+      "prompt": "A single ceramic mug on a wooden table, static camera, soft daylight.",
+      "prompt_sha256": "5e6eaa98796b071d51290f69446fbf08cd0b3a126fdb56c10f87916a9c4968c8",
+      "reuse": 1,
+      "seed": 314159,
+      "steps": 50,
+      "width": 512
+    }
+  ],
+  "schema": "strix.minimax-h3-quality-contract.v1",
+  "source_manifest_sha256": "8776014efafac996761041c0e3df740b41667275ed12a1e021cf8b49faf9b009",
+  "thresholds": {
+    "audio_vae": {
+      "max_abs": 0.001,
+      "relative_l2": 0.05
+    },
+    "dit_block": {
+      "relative_l2": 0.01,
+      "relative_max": 0.01
+    },
+    "prompt": {
+      "relative_l2": 0.05,
+      "relative_max": 0.1
+    },
+    "semantic_latent": {
+      "relative_l2": 0.1,
+      "relative_max": 0.15
+    },
+    "video_vae": {
+      "relative_l2": 0.05,
+      "relative_max": 0.05
+    }
+  },
+  "tokenizer": {
+    "prompts": [
+      {
+        "ids": [
+          32,
+          2518,
+          38835,
+          11435,
+          1526,
+          11794
+        ],
+        "prompt": "A red fox walking through snow",
+        "prompt_sha256": "df0ff96bcdb3a350f115cc39daaf0d7523814258890aa90c06fa784e3ad06169"
+      },
+      {
+        "ids": [
+          32,
+          3175,
+          42024,
+          51489,
+          389,
+          264,
+          22360,
+          1965,
+          11,
+          1099,
+          6249,
+          11,
+          8413,
+          52021,
+          13
+        ],
+        "prompt": "A single ceramic mug on a wooden table, static camera, soft daylight.",
+        "prompt_sha256": "5e6eaa98796b071d51290f69446fbf08cd0b3a126fdb56c10f87916a9c4968c8"
+      }
+    ],
+    "special_tokens": {
+      "<|endoftext|>": 151643,
+      "<|image_pad|>": 151655,
+      "<|im_end|>": 151645,
+      "<|im_start|>": 151644,
+      "<|lyrics_start|>": 151672,
+      "<|video_pad|>": 151656,
+      "<|vision_end|>": 151653,
+      "<|vision_start|>": 151652
+    }
+  }
+}

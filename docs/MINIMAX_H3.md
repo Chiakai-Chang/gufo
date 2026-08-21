@@ -52,6 +52,11 @@ every payload, validates every safetensors header/index/tensor, and rejects
 missing or unreferenced shards, unsupported dtypes, Ref2VA, 2K regeneration,
 pickle checkpoints, and wrong revisions before runtime device allocation.
 
+Numerical and audiovisual work follows the frozen
+[MiniMax H3 quality-oracle contract](MINIMAX_H3_QUALITY.md). Large teacher
+outputs remain outside Git in schema-validated, content-addressed directories;
+CI never regenerates them.
+
 ## Operator Attestation
 
 The operator of the dedicated Strix Halo development machine has stated that
