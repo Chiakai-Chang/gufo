@@ -147,6 +147,26 @@ project in design documentation but should not copy source expression.
 The engine license does not grant rights to model weights, tokenizers,
 calibration corpora, benchmark datasets, or generated quantized artifacts.
 
+Strix-Halo.cpp follows a bring-your-own-weights policy:
+
+- The engine never downloads a gated model at build or runtime.
+- Model weights and derived quantized artifacts are excluded from source and
+  binary packages.
+- An operator supplies a local path after independently obtaining access and
+  accepting or obtaining the terms applicable to that operator.
+- A missing, incomplete, or unsupported checkpoint fails closed; the runtime
+  does not fetch a replacement or fall back to an unreviewed model.
+- Repository documentation of a model integration is not a grant of model
+  rights and is not a substitute for the publisher's terms.
+
+The MiniMax H3-specific boundary is recorded in
+[MINIMAX_H3.md](MINIMAX_H3.md). Its official community agreement contains
+territorial, hosted-service, acceptable-use, safeguards, user-terms,
+attribution, and redistribution conditions. Operators in a territory or use
+case requiring separate authorization must obtain it directly from MiniMax.
+The repository records only an operator attestation and public artifact
+metadata; it does not store private authorization or credentials.
+
 Every published model artifact must record:
 
 - Source model and revision.
@@ -158,6 +178,10 @@ Every published model artifact must record:
 
 Hugging Face publication must include the model license independently from the
 Strix-Halo.cpp engine license.
+
+MiniMax H3 weights and derived H3 quantized artifacts are not publication
+targets for this repository. Changing that boundary requires a separate
+license review and an explicit release decision.
 
 ## Release Files
 

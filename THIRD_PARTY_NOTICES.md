@@ -28,6 +28,8 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 | **`amdxdna` Kernel Driver** | System (Kernel) | `GPL-2.0-only` | System Kernel (`amdxdna.ko`) | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
 | **`amdxdna` UAPI Headers** | System / Header | `GPL-2.0 WITH Linux-syscall-note` | `4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305` | [amd/xdna-driver](https://github.com/amd/xdna-driver) |
 | **AMD NPU Firmware** | System (Firmware) | Proprietary Binary (`LICENSE.amdnpu`) | System Firmware (`linux-firmware`) | Host OS Distribution / AMD |
+| **MiniMax H3 FL2VA checkpoint** | External operator-supplied model; not distributed | `LicenseRef-MiniMax-H3-Community-2026-08-02` or operator-specific authorization | `42ed227ee7df40d41602854ae760620d6eb651fe` | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) |
+| **Qwen3-VL-32B encoder weights used by H3** | External operator-supplied model component; not distributed | `Apache-2.0` | Included by the pinned H3 FL2VA checkpoint | [QwenLM/Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) |
 
 ---
 
@@ -226,3 +228,54 @@ The following components are required from the host environment or system kernel
 - **Copyright / Notice Source**: Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All Rights Reserved.
 - **Relationship**: System (Host system dependency. Strix-Halo.cpp does **not** bundle or redistribute NPU firmware binaries; firmware must be provided by the host Linux distribution).
 - **Corresponding-Source Location**: Host OS `linux-firmware` package / AMD hardware driver packages
+
+---
+
+## 3. External Model Artifacts (Non-Distributed)
+
+Model checkpoints are not part of the Strix-Halo.cpp source or binary
+distribution. Operators obtain them directly from their publisher and remain
+responsible for the terms governing their location and use.
+
+### 3.1 MiniMax H3 FL2VA
+
+- **Component Name**: MiniMax H3 Base FL2VA checkpoint
+- **Upstream URL**: https://huggingface.co/MiniMaxAI/MiniMax-H3
+- **Pinned Revision**: `42ed227ee7df40d41602854ae760620d6eb651fe`
+- **Component Used**: Locally supplied BF16 text encoder, Omni Transformer,
+  VisualVAE, AudioVAE, tokenizer, scheduler configuration, and metadata under
+  `FL2VA/`
+- **License**: MiniMax H3 Community License Agreement dated August 2, 2026, or
+  separate operator-specific authorization where required
+- **License File SHA-256 at Pinned Revision**:
+  `59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44`
+- **Copyright / Notice Source**: Copyright © 2026 MiniMax. All Rights Reserved.
+- **Relationship**: External, access-controlled, operator-supplied runtime
+  artifact. It is never committed, packaged, mirrored, automatically
+  downloaded, or redistributed by Strix-Halo.cpp.
+- **Operational Boundary**: Every operator must independently obtain access
+  from MiniMax, accept or obtain the terms applicable to that operator, and
+  configure a local checkpoint path. Possession of the Strix-Halo.cpp source
+  does not grant model rights.
+- **Serving Boundary**: The engine supplies numerical execution only. Anyone
+  exposing H3 through an API is responsible for the publisher's user terms,
+  acceptable-use, safeguards, disclosures, reporting, attribution, and
+  territorial requirements.
+
+The project records an operator attestation that the dedicated development
+machine is authorized for this work. The repository does not contain private
+license correspondence or credentials and does not independently make a legal
+determination about a downstream operator.
+
+### 3.2 Qwen3-VL-32B Encoder Component
+
+- **Component Name**: Qwen3-VL-32B encoder weights used by MiniMax H3
+- **Upstream URL**: https://github.com/QwenLM/Qwen3-VL
+- **Pinned Revision**: Supplied as part of the pinned MiniMax H3 FL2VA package
+- **Component Used**: H3 prompt encoder through layer 50
+- **SPDX License Identifier**: `Apache-2.0`
+- **Relationship**: External model component within the operator-supplied H3
+  checkpoint; not distributed by Strix-Halo.cpp
+
+See [docs/MINIMAX_H3.md](docs/MINIMAX_H3.md) for the acquisition, release, and
+runtime boundary.

@@ -79,6 +79,10 @@ test-results/
 # Model artifacts, logit dumps, teacher captures (never commit weights/logits)
 artifacts/
 /models/
+*.safetensors
+*.gguf
+*.ckpt
+pytorch_model*.bin
 __pycache__/
 *.pyc
 
