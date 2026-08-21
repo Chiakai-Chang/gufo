@@ -187,6 +187,7 @@ endif()
 add_library(strix_core STATIC
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
+  src/models/minimax_h3/dit.cpp
   src/models/minimax_h3/json.cpp
   src/models/minimax_h3/prompt_encoder.cpp
   src/models/minimax_h3/runtime.cpp
@@ -227,6 +228,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_model_loader.cpp
     src/core/hip/qwen_gpu_prefill.cpp
     src/core/hip/qwen_mtp_gpu.cpp
+    src/models/minimax_h3/dit.hip
     src/models/minimax_h3/runtime_hip.cpp
     src/models/minimax_h3/prompt_encoder.hip
     src/models/minimax_h3/sampling.hip
@@ -562,6 +564,22 @@ if (BUILD_TESTING)
       COMMAND minimax_h3_sampling_hip_test)
     set_tests_properties(minimax_h3_sampling_hip_test PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;sampling;euler;analytic"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_dit_hip_test
+      tests/models/minimax_h3_dit_hip_test.hip)
+    target_compile_definitions(minimax_h3_dit_hip_test PRIVATE
+      STRIX_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_dit_hip_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME minimax_h3_dit_analytic
+      COMMAND minimax_h3_dit_hip_test --analytic)
+    set_tests_properties(minimax_h3_dit_analytic PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;dit;analytic")
+    add_test(NAME minimax_h3_dit_block0_real
+      COMMAND minimax_h3_dit_hip_test --real)
+    set_tests_properties(minimax_h3_dit_block0_real PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;dit;external-model;slow"
       SKIP_RETURN_CODE 77)
 
     add_executable(deepseek_v4_flash_engine_test

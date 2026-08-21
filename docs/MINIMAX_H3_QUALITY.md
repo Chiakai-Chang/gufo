@@ -154,6 +154,35 @@ The gfx1151 analytic test keeps the sample in device F32 and matches the
 pinned four-element BF16-velocity Euler result byte-for-byte on repeated
 allocations. Zero-delta and out-of-range updates fail before launch.
 
+## DiT Block Frozen Evidence
+
+The block-0 teacher uses direct ROCm PyTorch formulas rather than the native
+runtime. It loads only the eight released BF16 block tensors, constructs the
+canonical six-text-row 256x256x22 layout, executes explicit FP32 full
+attention, and retains every required BF16 boundary. The payloads remain
+operator-owned; their immutable sizes and hashes are frozen in
+`tests/fixtures/minimax_h3/dit-block0-oracle-v1.json`.
+
+On the supported gfx1151 route, the complete 528-row block measured:
+
+| Retained boundary | Relative L2 | Relative max |
+| --- | ---: | ---: |
+| attention AdaLN | `1.54491e-5` | `0.0015625` |
+| attention output | `0.000920278` | `0.00414938` |
+| MLP AdaLN | `0.00110717` | `0.00621118` |
+| block output | `0.00356519` | `0.00478469` |
+
+Every value is below the frozen `1e-2` limits. A second execution on the same
+session produced byte-identical retained tensors and the same scratch address.
+The session rejects a pre-cancelled block, out-of-range row maps, changed
+tensor shapes, non-finite retained values, and a rocBLAS solution that fails a
+paired byte-repeat check.
+
+The diagnostic rocprof/ISA records in `artifacts/minimax_h3/issue-169/`
+identify the actual full-attention, grouped-QKV/RoPE, AdaLN, gate, SwiGLU, and
+gfx1151 rocBLAS kernels. They establish implementation identity, not a
+performance claim.
+
 ## Numerical Gates
 
 The initial upstream ceilings are strict inequalities:

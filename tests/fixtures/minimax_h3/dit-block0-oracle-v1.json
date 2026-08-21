@@ -1,0 +1,68 @@
+{
+  "schema": "strix.minimax-h3-dit-block-golden.v1",
+  "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+  "reference_revision": "8974cc055ea9c02fcd14cc27dfda3e1027c05153",
+  "block": 0,
+  "geometry": {
+    "text_rows": 6,
+    "width": 256,
+    "height": 256,
+    "frames": 22,
+    "audio_rows": 74,
+    "video_rows": 448,
+    "rows": 528
+  },
+  "arithmetic": {
+    "weights": "BF16",
+    "activations": "BF16 at operation boundaries",
+    "norm_and_attention_accumulation": "FP32",
+    "epsilon": 1e-05
+  },
+  "files": {
+    "hidden.bf16": {
+      "bytes": 5677056,
+      "shape": [528, 5376],
+      "sha256": "08516eb99b3c24c644eaf5040680ba1e149be773202223833f8c2e40ab1dd3ec"
+    },
+    "modulation.bf16": {
+      "bytes": 193536,
+      "shape": [3, 6, 5376],
+      "sha256": "dbfa48daedca87c113a556bbc59d0364914efe25e8b0c8deb4c89c80024707ed"
+    },
+    "row_map.u32": {
+      "bytes": 2112,
+      "shape": [528],
+      "sha256": "816629a33e18daef4f94301aba7b54ba832c50db86fd8ae16a66f86f8d03f5d0"
+    },
+    "rope_cos.bf16": {
+      "bytes": 50688,
+      "shape": [528, 48],
+      "sha256": "bcc490f17cd0a9d2df03909560bdaa48d6794a2ad1750010067b922fd5be661b"
+    },
+    "rope_sin.bf16": {
+      "bytes": 50688,
+      "shape": [528, 48],
+      "sha256": "0acfacc27e06e8e9478502dd435135d2f7fadf272dc62a0444bcde8ea2fb7156"
+    },
+    "modulation_attention.bf16": {
+      "bytes": 5677056,
+      "shape": [528, 5376],
+      "sha256": "cd5ddb6ac83aae51747cbe9ccfa5e0de6f8a6b19b21286a89a3aceb37bd29746"
+    },
+    "attention_output.bf16": {
+      "bytes": 5677056,
+      "shape": [528, 5376],
+      "sha256": "16d1653569726dda2c3eb90f347c8bc8d190f9b927aeaa31b085d38f68f0b241"
+    },
+    "modulation_mlp.bf16": {
+      "bytes": 5677056,
+      "shape": [528, 5376],
+      "sha256": "91ee821daa225b34b6ff6e249fea8b07f1d22aac576cf5be95ce45a24ec73ea5"
+    },
+    "block_output.bf16": {
+      "bytes": 5677056,
+      "shape": [528, 5376],
+      "sha256": "73846047c178018c3be608ae636b38c5126cbd5b4d26d9d79dba4a11ad92057b"
+    }
+  }
+}

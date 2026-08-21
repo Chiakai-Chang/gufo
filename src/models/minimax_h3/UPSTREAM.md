@@ -84,3 +84,11 @@ Current sampler-boundary adaptations:
 | packing and reuse helpers in `h3_dit.c` | `sampling.cpp`, `sampling.hpp` | Exact visual/audio row order, reuse selection, and bounded extrapolation retained; Ref2VA and frame-anchor segment kinds deferred |
 | `h3_euler_bf16` in `h3_shaders.metal` | `sampling.hip` | Operation-boundary translation to one gfx1151 HIP kernel; F32 sample state, BF16 velocities, fused extrapolation/update, bounds validation, and no CPU tensor fallback |
 | `tests/test_h3.c`, `tests/test_bf16.c` | MiniMax H3 sampling host/HIP tests | Exact schedule/layout/row-map/noise hashes, temporal cases, overflow/malformed inputs, round trips, reuse masks, and repeated byte-exact device Euler coverage |
+
+Current DiT-boundary adaptations:
+
+| Upstream source | Local destination | Method and material changes |
+| --- | --- | --- |
+| `h3_dit.c` block load/run paths | `dit.hpp`, `dit.cpp`, `dit.hip` | One-block BF16 session with model-private tensor contracts, direct shard loading, atomics-disabled rocBLAS projections warmed before execution, fixed activation storage, explicit stream/cancellation/telemetry, and no allocation during block execution |
+| DiT kernels in `h3_shaders.metal` | `dit_ops.cuh` | Operation-boundary HIP translation for casts, residual arithmetic, SiLU/SwiGLU, RMS/layer/AdaLN, gated residuals, grouped QKV interpretation, per-head Q/K norm, partial 3D MM-RoPE, and full SDPA |
+| `tests/test_real_dit_block.c` | `minimax_h3_dit_hip_test.hip`, `tools/strix/h3_dit_golden.py` | Odd-tail analytic fixtures plus an operator-owned 528-row block-0 oracle produced by direct ROCm PyTorch formulas; retained payloads are never committed |

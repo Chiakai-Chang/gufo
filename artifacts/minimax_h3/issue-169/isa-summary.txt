@@ -1,0 +1,51 @@
+schema=strix.minimax-h3-dit-isa-summary.v1
+target=gfx1151
+compiler=ROCm LLVM 22.0.0
+source=src/models/minimax_h3/dit.hip
+complete_assembly_sha256=85477ec66a7aab974683ed60d7ed491f5a2bd1c581797a13189426c63bf243ad
+kernel_trace_sha256=abd25d009139e9bde0a9b0333449c2d31cfdb3d77e65b34c8021faebcf9475b9
+kernel_stats_sha256=94c4998aa928a795f85651935daaa8ec2e92548a304d553e2d766ec4b0f8db9f
+
+AdaLnKernel
+  wavefront_size=32
+  fixed_lds_bytes=1024
+  private_segment_bytes=0
+  next_free_vgpr=14
+  next_free_sgpr=27
+
+GroupedQkvNormRopeKernel
+  wavefront_size=32
+  fixed_lds_bytes=8
+  private_segment_bytes=0
+  next_free_vgpr=17
+  next_free_sgpr=32
+
+FullAttentionKernel
+  wavefront_size=32
+  fixed_lds_bytes=0
+  dynamic_lds_bytes=sequence_rows*4
+  private_segment_bytes=0
+  next_free_vgpr=15
+  next_free_sgpr=54
+  code_bytes=3144
+  scratch_bytes=0
+
+GateKernel
+  wavefront_size=32
+  fixed_lds_bytes=0
+  private_segment_bytes=0
+  next_free_vgpr=8
+  next_free_sgpr=18
+
+SwiGluKernel
+  wavefront_size=32
+  fixed_lds_bytes=0
+  private_segment_bytes=0
+  next_free_vgpr=10
+  next_free_sgpr=10
+
+Observed gfx1151 rocBLAS kernel identity:
+  Cijk_Alik_Bljk_BBS_BH_MT128x128x32_MI16x16x16x1_..._ISA1151_..._GSU1_...
+
+Pinned rocBLAS solution index:
+  -1162085109

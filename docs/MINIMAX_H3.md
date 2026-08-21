@@ -128,6 +128,55 @@ the same fused arithmetic as the pinned h3.c boundary.
 First/last-frame conditioning and ordered Ref2VA inputs are deliberately not
 accepted by this text-only layout API; their row kinds remain future work.
 
+## BF16 DiT Block Baseline
+
+The first transformer-core boundary is one complete dense H3 block at the
+released width: hidden size 5376, 56 grouped QKV heads, head dimension 128,
+attention width 7168, and SwiGLU width 14336.
+
+`DitBlockSession` loads only the selected block's eight BF16 tensors directly
+from the validated safetensors inventory. Session creation allocates every
+input, retained boundary, activation, comparison buffer, and rocBLAS resource.
+It pins and byte-validates the gfx1151 rocBLAS solution before admitting a
+run. `Run` performs no device allocation and keeps a single explicit stream.
+
+The exact path is:
+
+1. RMS AdaLN slots 0/1;
+2. BF16 grouped QKV projection;
+3. per-head Q/K RMSNorm and 3D partial MM-RoPE;
+4. deterministic full scaled dot-product attention;
+5. BF16 output projection and gated residual slot 2;
+6. RMS AdaLN slots 3/4;
+7. BF16 FC1, SwiGLU, FC2, and gated residual slot 5.
+
+Model-private utility kernels also cover BF16/F32 casts, add/subtract, SiLU,
+layer norm, F32 patch projection to BF16, and BF16 final projection to F32.
+The patch/output helpers retain straightforward fixed-order accumulation for
+the initial quality route; later pipeline work may replace them only against
+the same retained boundaries.
+
+The independent oracle is generated outside production:
+
+```sh
+nix develop -c python3 tools/strix/h3_dit_golden.py \
+  --model-root /var/llms/huggingface/MiniMax-H3 \
+  --output /var/llms/huggingface/strix-h3-oracles/dit-block0-528-v1
+```
+
+Run the analytic and external-model gates:
+
+```sh
+./build-h3-169/minimax_h3_dit_hip_test --analytic
+
+STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+STRIX_H3_DIT_GOLDEN=/var/llms/huggingface/strix-h3-oracles/dit-block0-528-v1 \
+  ./build-h3-169/minimax_h3_dit_hip_test --real
+```
+
+Sparse attention, token reduction, cross-block fusion, reuse, layer thinning,
+and quantized DiT weights are not part of this baseline.
+
 ## Operator Attestation
 
 The operator of the dedicated Strix Halo development machine has stated that
