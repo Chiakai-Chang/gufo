@@ -68,6 +68,16 @@ struct AttentionSupportParams {
   return false;
 }
 
+// opt-c010-rmsnorm-projection: fuse the layer pre-RMSNorm into the fused
+// decode projection GEMVs (QKV, SSM input, and FFN SwiGLU), so the projection
+// kernel reads the raw hidden row and prepares its own normed input. Flip to
+// false to revert to the unfused chain (RMSNormKernel + projection kernel),
+// which stays wired as the independent reference. Prefill is unaffected: its
+// batched norm kernel already fuses the FP32 + BF16 input preparation.
+[[nodiscard]] constexpr bool ShouldFuseRMSNormProjection() noexcept {
+  return false;
+}
+
 [[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
     std::size_t sequence_length) noexcept {
   if (sequence_length < kSplitKDecodeAttentionMinContext) {

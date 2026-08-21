@@ -191,6 +191,33 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, bool gate_is_bf16,
                            std::size_t hidden_size,
                            hipStream_t stream = nullptr);
 
+/// Fused layer pre-RMSNorm + QKV projections (opt-c010-rmsnorm-projection).
+/// Computes the norm over x and feeds the projections, matching the unfused
+/// RMSNormKernel + LaunchFusedQKVProjections chain bit-for-bit.
+void LaunchFusedRMSNormQKVProjections(
+    const float* x, const float* norm_w, float eps, const void* q_w,
+    bool q_is_bf16, const void* k_w, bool k_is_bf16, const void* v_w,
+    bool v_is_bf16, float* q_out, float* k_out, float* v_out, std::size_t q_dim,
+    std::size_t kv_dim, std::size_t hidden_size, hipStream_t stream = nullptr);
+
+/// Fused layer pre-RMSNorm + SSM input projections (QKV, Gate, Alpha, Beta).
+void LaunchFusedRMSNormSSMInputProjections(
+    const float* x, const float* norm_w, float eps, const void* qkv_w,
+    bool qkv_is_bf16, const void* gate_w, bool gate_is_bf16,
+    const void* alpha_w, bool alpha_is_bf16, const void* beta_w,
+    bool beta_is_bf16, float* qkv_out, float* gate_out, float* alpha_out,
+    float* beta_out, std::size_t hidden_size, std::size_t qkv_size,
+    std::size_t inner_size, std::size_t time_step_rank,
+    hipStream_t stream = nullptr);
+
+/// Fused layer pre-RMSNorm + FFN SwiGLU gate/up GEMV (BF16 weights).
+void LaunchFusedRMSNormSwiGLUGEMV(const float* x, const float* norm_w,
+                                  float eps, const void* gate_w,
+                                  const void* up_w, float* out,
+                                  std::size_t intermediate_size,
+                                  std::size_t hidden_size,
+                                  hipStream_t stream = nullptr);
+
 /// Computes Grouped-Query Softmax Attention with KV-cache and optional gating
 /// on GPU (maintaining both FP32 and FP16 cache representations). When
 /// skip_kv_write is true the KV cache is assumed already written (e.g. by the

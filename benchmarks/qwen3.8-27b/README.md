@@ -240,6 +240,7 @@ decode is 1.07-1.09x behind, while shallow decode is about 7% faster.
 | Residual Add + RMSNorm | Unfused residual add + RMSNorm per layer | Fused residual-add + RMSNorm: bit-exact and one fewer launch per layer, but no end-to-end gain within noise (`opt-c010-residual-rmsnorm`) |
 | FFN Projection + SwiGLU | hipBLASLt BF16 gate/up GEMMs + SwiGLU activation | Naive fused per-row gate/up GEMV + SwiGLU: ~37x prefill regression against hipBLASLt (`opt-c010-ffn-swiglu`) |
 | SSM norm + gate + residual | Unfused recurrence + post-norm kernel; ssm_out GEMV + residual add | Fused recurrence + post-norm + gate: bit-exact but +41% recurrence time and 104B scratch spill; decode residual folded into ssm_out GEMV: bit-exact, one fewer launch, no end-to-end gain (`opt-c010-ssm-gate-residual`) |
+| RMSNorm + projection input | Decode RMSNorm kernel + fused QKV/SSM-input/SwiGLU projection GEMVs | Norm folded into the projection GEMVs: bit-exact but every block redundantly re-normalizes the row, +9-21% per projection launch and ~9% decode regression (`opt-c010-rmsnorm-projection`) |
 | Speculation | Exact target verification and explicit GPU/XDNA2 MTP experiments | MTP as a default route while it reduces decode throughput |
 
 This table records only decisions that affect the current direction. Detailed
@@ -269,3 +270,10 @@ they did not beat the unfused routes end-to-end on gfx1151.
 - Re-evaluate the `opt-c010-ssm-gate-residual` decode residual fold with a
   residual-aware Wave32 2-row/4-row GEMV or a hipBLASLt epilogue so the
   saved launch survives outside graph capture.
+- Re-evaluate `opt-c010-rmsnorm-projection` with a persistent normed-input
+  buffer written once per layer (norm kernel writes FP32 + BF16 like the
+  prefill batched norm) instead of re-normalizing per projection block; the
+  current variant adds a full-row read + tree reduction + two syncs to every
+  projection block.
+- Consider folding the decode output-norm into the LM-head GEMV only with a
+  single-block pre-pass that stages the normed row, not a per-block reduction.

@@ -1457,6 +1457,395 @@ __launch_bounds__(256, 4) __global__ void FusedQKNormRoPEKvWriteKernel(
     }
   }
 }
+
+// opt-c010-rmsnorm-projection: computes the layer RMSNorm scale exactly like
+// RMSNormKernel (256-thread strided partition over dim, tree reduction with
+// stride 128..1 over s_sum[256]) so inv_rms is bit-identical to the unfused
+// chain. All 256 threads must reach the embedded __syncthreads() calls before
+// any divergent per-warp exit.
+__device__ inline float FusedRMSNormInvScale(const float* __restrict__ x,
+                                             const float* __restrict__ weight,
+                                             std::size_t dim, float eps,
+                                             float* __restrict__ s_sum) {
+  const std::size_t tid = threadIdx.x;
+  float sum_sq = 0.0F;
+  for (std::size_t i = tid; i < dim; i += 256U) {
+    const float val = x[i];
+    sum_sq += val * val;
+  }
+  s_sum[tid] = sum_sq;
+  __syncthreads();
+  for (std::size_t stride = 128U; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_sum[tid] += s_sum[tid + stride];
+    }
+    __syncthreads();
+  }
+  const float mean_sq = s_sum[0] / static_cast<float>(dim);
+  return rsqrtf(mean_sq + eps);
+}
+
+// opt-c010-rmsnorm-projection: fused layer pre-RMSNorm + Q/K/V projections.
+// 8 rows per block (256 threads); the norm is computed once per block and the
+// projection dots consume (x * inv_rms * w) per element, matching the unfused
+// chain (RMSNormKernel then Wave32FusedQKVProjectionsKernel_1Row) bit-for-bit.
+__launch_bounds__(256, 4) __global__ void FusedRMSNormQKVProjectionsKernel(
+    const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
+    const void* __restrict__ q_w, bool q_is_bf16,
+    const void* __restrict__ k_w, bool k_is_bf16,
+    const void* __restrict__ v_w, bool v_is_bf16, float* __restrict__ q_out,
+    float* __restrict__ k_out, float* __restrict__ v_out, std::size_t q_dim,
+    std::size_t kv_dim, std::size_t hidden_size) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+
+  __shared__ float s_sum[256];
+  const float inv_rms =
+      FusedRMSNormInvScale(x, norm_w, hidden_size, eps, s_sum);
+
+  const std::size_t m = (blockIdx.x * 8U) + warp_id;
+  const std::size_t total_rows = q_dim + (2 * kv_dim);
+  if (m >= total_rows) {
+    return;
+  }
+
+  const void* A = nullptr;
+  bool is_bf16 = false;
+  float* out_target = nullptr;
+  std::size_t row_idx = 0;
+
+  if (m < q_dim) {
+    A = q_w;
+    is_bf16 = q_is_bf16;
+    out_target = q_out;
+    row_idx = m;
+  } else if (m < q_dim + kv_dim) {
+    A = k_w;
+    is_bf16 = k_is_bf16;
+    out_target = k_out;
+    row_idx = m - q_dim;
+  } else {
+    A = v_w;
+    is_bf16 = v_is_bf16;
+    out_target = v_out;
+    row_idx = m - q_dim - kv_dim;
+  }
+
+  const float* nw = (norm_w != nullptr) ? norm_w : nullptr;
+  float dot = 0.0F;
+
+  if (is_bf16) {
+    const auto* row =
+        static_cast<const hip_bfloat16*>(A) + (row_idx * hidden_size);
+    const std::size_t K_vec = hidden_size / 8;
+    const auto* row_vec = reinterpret_cast<const uint4*>(row);
+
+    for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+      const uint4 v = row_vec[vi];
+      const auto* vals = reinterpret_cast<const hip_bfloat16*>(&v);
+      const std::size_t k = vi * 8;
+      const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+      const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+      const float n0 = (x0.x * inv_rms) * ((nw != nullptr) ? nw[k + 0] : 1.0F);
+      const float n1 = (x0.y * inv_rms) * ((nw != nullptr) ? nw[k + 1] : 1.0F);
+      const float n2 = (x0.z * inv_rms) * ((nw != nullptr) ? nw[k + 2] : 1.0F);
+      const float n3 = (x0.w * inv_rms) * ((nw != nullptr) ? nw[k + 3] : 1.0F);
+      const float n4 = (x1.x * inv_rms) * ((nw != nullptr) ? nw[k + 4] : 1.0F);
+      const float n5 = (x1.y * inv_rms) * ((nw != nullptr) ? nw[k + 5] : 1.0F);
+      const float n6 = (x1.z * inv_rms) * ((nw != nullptr) ? nw[k + 6] : 1.0F);
+      const float n7 = (x1.w * inv_rms) * ((nw != nullptr) ? nw[k + 7] : 1.0F);
+
+      dot += (static_cast<float>(vals[0]) * n0) +
+             (static_cast<float>(vals[1]) * n1) +
+             (static_cast<float>(vals[2]) * n2) +
+             (static_cast<float>(vals[3]) * n3) +
+             (static_cast<float>(vals[4]) * n4) +
+             (static_cast<float>(vals[5]) * n5) +
+             (static_cast<float>(vals[6]) * n6) +
+             (static_cast<float>(vals[7]) * n7);
+    }
+    for (std::size_t k = (K_vec * 8) + lane_id; k < hidden_size; k += 32) {
+      const float nv = (x[k] * inv_rms) * ((nw != nullptr) ? nw[k] : 1.0F);
+      dot += static_cast<float>(row[k]) * nv;
+    }
+  } else {
+    const auto* row = static_cast<const float*>(A) + (row_idx * hidden_size);
+    const std::size_t K_vec = hidden_size / 4;
+    const auto* row_vec = reinterpret_cast<const float4*>(row);
+
+    for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+      const float4 v = row_vec[vi];
+      const std::size_t k = vi * 4;
+      const float4 xv = *reinterpret_cast<const float4*>(&x[k]);
+      const float n0 = (xv.x * inv_rms) * ((nw != nullptr) ? nw[k + 0] : 1.0F);
+      const float n1 = (xv.y * inv_rms) * ((nw != nullptr) ? nw[k + 1] : 1.0F);
+      const float n2 = (xv.z * inv_rms) * ((nw != nullptr) ? nw[k + 2] : 1.0F);
+      const float n3 = (xv.w * inv_rms) * ((nw != nullptr) ? nw[k + 3] : 1.0F);
+      dot += (v.x * n0) + (v.y * n1) + (v.z * n2) + (v.w * n3);
+    }
+    for (std::size_t k = (K_vec * 4) + lane_id; k < hidden_size; k += 32) {
+      const float nv = (x[k] * inv_rms) * ((nw != nullptr) ? nw[k] : 1.0F);
+      dot += row[k] * nv;
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot += __shfl_xor(dot, offset);
+  }
+
+  if (lane_id == 0) {
+    out_target[row_idx] = dot;
+  }
+}
+
+// opt-c010-rmsnorm-projection: fused layer pre-RMSNorm + SSM input projections
+// (QKV, gate, alpha, beta). Mirrors Wave32FusedSSMInputProjectionsKernel_1Row
+// row mapping with 8 rows per block.
+__launch_bounds__(256, 4) __global__ void FusedRMSNormSSMInputProjectionsKernel(
+    const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
+    const void* __restrict__ qkv_w, bool qkv_is_bf16,
+    const void* __restrict__ gate_w, bool gate_is_bf16,
+    const void* __restrict__ alpha_w, bool alpha_is_bf16,
+    const void* __restrict__ beta_w, bool beta_is_bf16,
+    float* __restrict__ qkv_out, float* __restrict__ gate_out,
+    float* __restrict__ alpha_out, float* __restrict__ beta_out,
+    std::size_t hidden_size, std::size_t qkv_size, std::size_t inner_size,
+    std::size_t time_step_rank) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+
+  __shared__ float s_sum[256];
+  const float inv_rms =
+      FusedRMSNormInvScale(x, norm_w, hidden_size, eps, s_sum);
+
+  const std::size_t m = (blockIdx.x * 8U) + warp_id;
+  const std::size_t gate_end = qkv_size + inner_size;
+  const std::size_t alpha_end = gate_end + time_step_rank;
+  const std::size_t total_rows = alpha_end + time_step_rank;
+  if (m >= total_rows) {
+    return;
+  }
+
+  const void* A = nullptr;
+  bool is_bf16 = false;
+  float* out_target = nullptr;
+  std::size_t row_idx = 0;
+
+  if (m < qkv_size) {
+    A = qkv_w;
+    is_bf16 = qkv_is_bf16;
+    out_target = qkv_out;
+    row_idx = m;
+  } else if (m < gate_end) {
+    A = gate_w;
+    is_bf16 = gate_is_bf16;
+    out_target = gate_out;
+    row_idx = m - qkv_size;
+  } else if (m < alpha_end) {
+    A = alpha_w;
+    is_bf16 = alpha_is_bf16;
+    out_target = alpha_out;
+    row_idx = m - gate_end;
+  } else {
+    A = beta_w;
+    is_bf16 = beta_is_bf16;
+    out_target = beta_out;
+    row_idx = m - alpha_end;
+  }
+
+  const float* nw = (norm_w != nullptr) ? norm_w : nullptr;
+  float dot = 0.0F;
+
+  if (is_bf16) {
+    const auto* row =
+        static_cast<const hip_bfloat16*>(A) + (row_idx * hidden_size);
+    const std::size_t K_vec = hidden_size / 8;
+    const auto* row_vec = reinterpret_cast<const uint4*>(row);
+
+    for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+      const uint4 v = row_vec[vi];
+      const auto* vals = reinterpret_cast<const hip_bfloat16*>(&v);
+      const std::size_t k = vi * 8;
+      const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+      const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+      const float n0 = (x0.x * inv_rms) * ((nw != nullptr) ? nw[k + 0] : 1.0F);
+      const float n1 = (x0.y * inv_rms) * ((nw != nullptr) ? nw[k + 1] : 1.0F);
+      const float n2 = (x0.z * inv_rms) * ((nw != nullptr) ? nw[k + 2] : 1.0F);
+      const float n3 = (x0.w * inv_rms) * ((nw != nullptr) ? nw[k + 3] : 1.0F);
+      const float n4 = (x1.x * inv_rms) * ((nw != nullptr) ? nw[k + 4] : 1.0F);
+      const float n5 = (x1.y * inv_rms) * ((nw != nullptr) ? nw[k + 5] : 1.0F);
+      const float n6 = (x1.z * inv_rms) * ((nw != nullptr) ? nw[k + 6] : 1.0F);
+      const float n7 = (x1.w * inv_rms) * ((nw != nullptr) ? nw[k + 7] : 1.0F);
+
+      dot += (static_cast<float>(vals[0]) * n0) +
+             (static_cast<float>(vals[1]) * n1) +
+             (static_cast<float>(vals[2]) * n2) +
+             (static_cast<float>(vals[3]) * n3) +
+             (static_cast<float>(vals[4]) * n4) +
+             (static_cast<float>(vals[5]) * n5) +
+             (static_cast<float>(vals[6]) * n6) +
+             (static_cast<float>(vals[7]) * n7);
+    }
+    for (std::size_t k = (K_vec * 8) + lane_id; k < hidden_size; k += 32) {
+      const float nv = (x[k] * inv_rms) * ((nw != nullptr) ? nw[k] : 1.0F);
+      dot += static_cast<float>(row[k]) * nv;
+    }
+  } else {
+    const auto* row = static_cast<const float*>(A) + (row_idx * hidden_size);
+    const std::size_t K_vec = hidden_size / 4;
+    const auto* row_vec = reinterpret_cast<const float4*>(row);
+
+    for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+      const float4 v = row_vec[vi];
+      const std::size_t k = vi * 4;
+      const float4 xv = *reinterpret_cast<const float4*>(&x[k]);
+      const float n0 = (xv.x * inv_rms) * ((nw != nullptr) ? nw[k + 0] : 1.0F);
+      const float n1 = (xv.y * inv_rms) * ((nw != nullptr) ? nw[k + 1] : 1.0F);
+      const float n2 = (xv.z * inv_rms) * ((nw != nullptr) ? nw[k + 2] : 1.0F);
+      const float n3 = (xv.w * inv_rms) * ((nw != nullptr) ? nw[k + 3] : 1.0F);
+      dot += (v.x * n0) + (v.y * n1) + (v.z * n2) + (v.w * n3);
+    }
+    for (std::size_t k = (K_vec * 4) + lane_id; k < hidden_size; k += 32) {
+      const float nv = (x[k] * inv_rms) * ((nw != nullptr) ? nw[k] : 1.0F);
+      dot += row[k] * nv;
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot += __shfl_xor(dot, offset);
+  }
+
+  if (lane_id == 0) {
+    out_target[row_idx] = dot;
+  }
+}
+
+// opt-c010-rmsnorm-projection: fused layer pre-RMSNorm + FFN SwiGLU gate/up
+// projections. Mirrors Wave32FusedSwiGLUGEMVKernel_2Rows with 8 row pairs per
+// block.
+__launch_bounds__(256, 4) __global__ void FusedRMSNormSwiGLUGEMVKernel(
+    const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
+    const hip_bfloat16* __restrict__ gate_w,
+    const hip_bfloat16* __restrict__ up_w, float* __restrict__ out,
+    std::size_t M, std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+
+  __shared__ float s_sum[256];
+  const float inv_rms = FusedRMSNormInvScale(x, norm_w, K, eps, s_sum);
+
+  const std::size_t row_pair = (blockIdx.x * 8U) + warp_id;
+  const std::size_t m0 = row_pair * 2;
+  const std::size_t m1 = m0 + 1;
+  if (m0 >= M) {
+    return;
+  }
+
+  const auto* g_row0 = gate_w + (m0 * K);
+  const auto* u_row0 = up_w + (m0 * K);
+  const auto* g_row1 = (m1 < M) ? gate_w + (m1 * K) : nullptr;
+  const auto* u_row1 = (m1 < M) ? up_w + (m1 * K) : nullptr;
+
+  const auto* g_vec0 = reinterpret_cast<const uint4*>(g_row0);
+  const auto* u_vec0 = reinterpret_cast<const uint4*>(u_row0);
+  const auto* g_vec1 = reinterpret_cast<const uint4*>(g_row1);
+  const auto* u_vec1 = reinterpret_cast<const uint4*>(u_row1);
+  const std::size_t K_vec = K / 8;
+
+  const float* nw = (norm_w != nullptr) ? norm_w : nullptr;
+  float dot_g0 = 0.0F, dot_u0 = 0.0F;
+  float dot_g1 = 0.0F, dot_u1 = 0.0F;
+
+  for (std::size_t vi = lane_id; vi < K_vec; vi += 32) {
+    const std::size_t k = vi * 8;
+    const float4 x0 = *reinterpret_cast<const float4*>(&x[k + 0]);
+    const float4 x1 = *reinterpret_cast<const float4*>(&x[k + 4]);
+    const float n0 = (x0.x * inv_rms) * ((nw != nullptr) ? nw[k + 0] : 1.0F);
+    const float n1 = (x0.y * inv_rms) * ((nw != nullptr) ? nw[k + 1] : 1.0F);
+    const float n2 = (x0.z * inv_rms) * ((nw != nullptr) ? nw[k + 2] : 1.0F);
+    const float n3 = (x0.w * inv_rms) * ((nw != nullptr) ? nw[k + 3] : 1.0F);
+    const float n4 = (x1.x * inv_rms) * ((nw != nullptr) ? nw[k + 4] : 1.0F);
+    const float n5 = (x1.y * inv_rms) * ((nw != nullptr) ? nw[k + 5] : 1.0F);
+    const float n6 = (x1.z * inv_rms) * ((nw != nullptr) ? nw[k + 6] : 1.0F);
+    const float n7 = (x1.w * inv_rms) * ((nw != nullptr) ? nw[k + 7] : 1.0F);
+
+    const uint4 gv0 = g_vec0[vi];
+    const uint4 uv0 = u_vec0[vi];
+    const auto* g_vals0 = reinterpret_cast<const hip_bfloat16*>(&gv0);
+    const auto* u_vals0 = reinterpret_cast<const hip_bfloat16*>(&uv0);
+
+    dot_g0 += (static_cast<float>(g_vals0[0]) * n0) +
+              (static_cast<float>(g_vals0[1]) * n1) +
+              (static_cast<float>(g_vals0[2]) * n2) +
+              (static_cast<float>(g_vals0[3]) * n3) +
+              (static_cast<float>(g_vals0[4]) * n4) +
+              (static_cast<float>(g_vals0[5]) * n5) +
+              (static_cast<float>(g_vals0[6]) * n6) +
+              (static_cast<float>(g_vals0[7]) * n7);
+
+    dot_u0 += (static_cast<float>(u_vals0[0]) * n0) +
+              (static_cast<float>(u_vals0[1]) * n1) +
+              (static_cast<float>(u_vals0[2]) * n2) +
+              (static_cast<float>(u_vals0[3]) * n3) +
+              (static_cast<float>(u_vals0[4]) * n4) +
+              (static_cast<float>(u_vals0[5]) * n5) +
+              (static_cast<float>(u_vals0[6]) * n6) +
+              (static_cast<float>(u_vals0[7]) * n7);
+
+    if (g_row1 != nullptr) {
+      const uint4 gv1 = g_vec1[vi];
+      const uint4 uv1 = u_vec1[vi];
+      const auto* g_vals1 = reinterpret_cast<const hip_bfloat16*>(&gv1);
+      const auto* u_vals1 = reinterpret_cast<const hip_bfloat16*>(&uv1);
+
+      dot_g1 += (static_cast<float>(g_vals1[0]) * n0) +
+                (static_cast<float>(g_vals1[1]) * n1) +
+                (static_cast<float>(g_vals1[2]) * n2) +
+                (static_cast<float>(g_vals1[3]) * n3) +
+                (static_cast<float>(g_vals1[4]) * n4) +
+                (static_cast<float>(g_vals1[5]) * n5) +
+                (static_cast<float>(g_vals1[6]) * n6) +
+                (static_cast<float>(g_vals1[7]) * n7);
+
+      dot_u1 += (static_cast<float>(u_vals1[0]) * n0) +
+                (static_cast<float>(u_vals1[1]) * n1) +
+                (static_cast<float>(u_vals1[2]) * n2) +
+                (static_cast<float>(u_vals1[3]) * n3) +
+                (static_cast<float>(u_vals1[4]) * n4) +
+                (static_cast<float>(u_vals1[5]) * n5) +
+                (static_cast<float>(u_vals1[6]) * n6) +
+                (static_cast<float>(u_vals1[7]) * n7);
+    }
+  }
+  for (std::size_t k = (K_vec * 8) + lane_id; k < K; k += 32) {
+    const float nv = (x[k] * inv_rms) * ((nw != nullptr) ? nw[k] : 1.0F);
+    dot_g0 += static_cast<float>(g_row0[k]) * nv;
+    dot_u0 += static_cast<float>(u_row0[k]) * nv;
+    if (g_row1 != nullptr) {
+      dot_g1 += static_cast<float>(g_row1[k]) * nv;
+      dot_u1 += static_cast<float>(u_row1[k]) * nv;
+    }
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot_g0 += __shfl_xor(dot_g0, offset);
+    dot_u0 += __shfl_xor(dot_u0, offset);
+    dot_g1 += __shfl_xor(dot_g1, offset);
+    dot_u1 += __shfl_xor(dot_u1, offset);
+  }
+
+  if (lane_id == 0) {
+    const float sig_g0 = 1.0F / (1.0F + expf(-dot_g0));
+    out[m0] = (dot_g0 * sig_g0) * dot_u0;
+    if (m1 < M) {
+      const float sig_g1 = 1.0F / (1.0F + expf(-dot_g1));
+      out[m1] = (dot_g1 * sig_g1) * dot_u1;
+    }
+  }
+}
 }  // namespace
 
 __global__ void SSMConvKernel(const float* __restrict__ qkv_in,
@@ -1862,6 +2251,55 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, bool gate_is_bf16,
 
   FastFusedSwiGLUGEMVBlockKernel<<<intermediate_size, 512, 0, stream>>>(
       gate_w, gate_is_bf16, up_w, up_is_bf16, x, out, intermediate_size,
+      hidden_size);
+}
+
+// opt-c010-rmsnorm-projection: fused layer pre-RMSNorm + Q/K/V projections.
+// 256-thread blocks (8 rows each); requires hidden_size % 8 == 0 for the
+// Wave32 BF16 path. The norm scale is computed once per block, bit-identical
+// to RMSNormKernel.
+void LaunchFusedRMSNormQKVProjections(
+    const float* x, const float* norm_w, float eps, const void* q_w,
+    bool q_is_bf16, const void* k_w, bool k_is_bf16, const void* v_w,
+    bool v_is_bf16, float* q_out, float* k_out, float* v_out,
+    std::size_t q_dim, std::size_t kv_dim, std::size_t hidden_size,
+    hipStream_t stream) {
+  const std::size_t total_rows = q_dim + (2 * kv_dim);
+  const std::size_t grid = (total_rows + 7U) / 8U;
+  FusedRMSNormQKVProjectionsKernel<<<grid, 256, 0, stream>>>(
+      x, norm_w, eps, q_w, q_is_bf16, k_w, k_is_bf16, v_w, v_is_bf16, q_out,
+      k_out, v_out, q_dim, kv_dim, hidden_size);
+}
+
+// opt-c010-rmsnorm-projection: fused layer pre-RMSNorm + SSM input projections
+// (QKV, gate, alpha, beta).
+void LaunchFusedRMSNormSSMInputProjections(
+    const float* x, const float* norm_w, float eps, const void* qkv_w,
+    bool qkv_is_bf16, const void* gate_w, bool gate_is_bf16,
+    const void* alpha_w, bool alpha_is_bf16, const void* beta_w,
+    bool beta_is_bf16, float* qkv_out, float* gate_out, float* alpha_out,
+    float* beta_out, std::size_t hidden_size, std::size_t qkv_size,
+    std::size_t inner_size, std::size_t time_step_rank, hipStream_t stream) {
+  const std::size_t total_rows = qkv_size + inner_size + (2 * time_step_rank);
+  const std::size_t grid = (total_rows + 7U) / 8U;
+  FusedRMSNormSSMInputProjectionsKernel<<<grid, 256, 0, stream>>>(
+      x, norm_w, eps, qkv_w, qkv_is_bf16, gate_w, gate_is_bf16, alpha_w,
+      alpha_is_bf16, beta_w, beta_is_bf16, qkv_out, gate_out, alpha_out,
+      beta_out, hidden_size, qkv_size, inner_size, time_step_rank);
+}
+
+// opt-c010-rmsnorm-projection: fused layer pre-RMSNorm + FFN SwiGLU gate/up
+// projections (BF16 weights only, matching the production decode route).
+void LaunchFusedRMSNormSwiGLUGEMV(const float* x, const float* norm_w,
+                                   float eps, const void* gate_w,
+                                   const void* up_w, float* out,
+                                   std::size_t intermediate_size,
+                                   std::size_t hidden_size, hipStream_t stream) {
+  const std::size_t num_pairs = intermediate_size / 2;
+  const std::size_t grid = (num_pairs + 7U) / 8U;
+  FusedRMSNormSwiGLUGEMVKernel<<<grid, 256, 0, stream>>>(
+      x, norm_w, eps, static_cast<const hip_bfloat16*>(gate_w),
+      static_cast<const hip_bfloat16*>(up_w), out, intermediate_size,
       hidden_size);
 }
 

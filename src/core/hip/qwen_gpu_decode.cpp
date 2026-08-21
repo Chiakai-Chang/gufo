@@ -64,10 +64,17 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
     for (std::uint32_t l = 0; l < config.num_layers; ++l) {
       const auto& layer = weights_.layers[l];
 
-      // Pre-RMSNorm
-      LaunchRMSNorm(arena_.d_hidden,
-                    static_cast<const float*>(layer.attn_norm.data),
-                    arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
+      // opt-c010-rmsnorm-projection: fuse the layer pre-RMSNorm into the
+      // projection GEMVs below (QKV / SSM input / FFN SwiGLU), so the
+      // projection kernel prepares its own normed input. The unfused chain
+      // (RMSNormKernel + projection kernel) stays wired as the reference.
+      const bool fused_rmsnorm_proj = detail::ShouldFuseRMSNormProjection();
+      if (!fused_rmsnorm_proj) {
+        // Pre-RMSNorm
+        LaunchRMSNorm(arena_.d_hidden,
+                      static_cast<const float*>(layer.attn_norm.data),
+                      arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
+      }
 
       // opt-c010-ssm-gate-residual: the SSM branch folds the post-SSM residual
       // add into the ssm_out GEMV; the common residual-add step below then
@@ -85,11 +92,20 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                                     arena_.GetMaxContext() * config.head_dim;
         const std::uint32_t attn_layer_idx = l / config.full_attention_interval;
 
-        LaunchFusedQKVProjections(layer.attn_q.data, q_bf16, layer.attn_k.data,
-                                  k_bf16, layer.attn_v.data, v_bf16,
-                                  arena_.d_normed, arena_.d_ssm_qkv, arena_.d_k,
-                                  arena_.d_v, q_projection_size, kv_size,
-                                  hidden_size, arena_.stream);
+        if (fused_rmsnorm_proj) {
+          LaunchFusedRMSNormQKVProjections(
+              arena_.d_hidden, static_cast<const float*>(layer.attn_norm.data),
+              1e-6F, layer.attn_q.data, q_bf16, layer.attn_k.data, k_bf16,
+              layer.attn_v.data, v_bf16, arena_.d_ssm_qkv, arena_.d_k,
+              arena_.d_v, q_projection_size, kv_size, hidden_size,
+              arena_.stream);
+        } else {
+          LaunchFusedQKVProjections(
+              layer.attn_q.data, q_bf16, layer.attn_k.data, k_bf16,
+              layer.attn_v.data, v_bf16, arena_.d_normed, arena_.d_ssm_qkv,
+              arena_.d_k, arena_.d_v, q_projection_size, kv_size, hidden_size,
+              arena_.stream);
+        }
 
         // De-interleave Q and Gate from attn_q projection
         LaunchUnpackQG(arena_.d_ssm_qkv, arena_.d_q, arena_.d_ssm_gate,
@@ -169,12 +185,22 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
         const bool beta_bf16 = layer.ssm_beta.type == core::GgmlType::kBF16;
         const bool out_bf16 = layer.ssm_out.type == core::GgmlType::kBF16;
 
-        LaunchFusedSSMInputProjections(
-            layer.attn_qkv.data, qkv_bf16, layer.attn_gate.data, gate_bf16,
-            layer.ssm_alpha.data, alpha_bf16, layer.ssm_beta.data, beta_bf16,
-            arena_.d_normed, arena_.d_ssm_qkv, arena_.d_ssm_gate,
-            arena_.d_alpha_buf, arena_.d_beta_buf, hidden_size, ssm_qkv_size,
-            ssm_inner_size, time_step_rank, arena_.stream);
+        if (fused_rmsnorm_proj) {
+          LaunchFusedRMSNormSSMInputProjections(
+              arena_.d_hidden, static_cast<const float*>(layer.attn_norm.data),
+              1e-6F, layer.attn_qkv.data, qkv_bf16, layer.attn_gate.data,
+              gate_bf16, layer.ssm_alpha.data, alpha_bf16, layer.ssm_beta.data,
+              beta_bf16, arena_.d_ssm_qkv, arena_.d_ssm_gate,
+              arena_.d_alpha_buf, arena_.d_beta_buf, hidden_size, ssm_qkv_size,
+              ssm_inner_size, time_step_rank, arena_.stream);
+        } else {
+          LaunchFusedSSMInputProjections(
+              layer.attn_qkv.data, qkv_bf16, layer.attn_gate.data, gate_bf16,
+              layer.ssm_alpha.data, alpha_bf16, layer.ssm_beta.data, beta_bf16,
+              arena_.d_normed, arena_.d_ssm_qkv, arena_.d_ssm_gate,
+              arena_.d_alpha_buf, arena_.d_beta_buf, hidden_size, ssm_qkv_size,
+              ssm_inner_size, time_step_rank, arena_.stream);
+        }
 
         LaunchSSMConvRecurrence(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -219,10 +245,14 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
         LaunchResidualAdd(arena_.d_hidden, arena_.d_attn_out, arena_.d_hidden,
                           hidden_size, arena_.stream);
 
-        // FFN Pre-RMSNorm
-        LaunchRMSNorm(arena_.d_hidden,
-                      static_cast<const float*>(layer.ffn_norm.data),
-                      arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
+        if (fused_rmsnorm_proj) {
+          // FFN Pre-RMSNorm is folded into the SwiGLU GEMV below.
+        } else {
+          // FFN Pre-RMSNorm
+          LaunchRMSNorm(arena_.d_hidden,
+                        static_cast<const float*>(layer.ffn_norm.data),
+                        arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
+        }
       }
 
       // Fused SwiGLU FFN
@@ -230,9 +260,17 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
       const bool ffn_u_bf16 = layer.ffn_up.type == core::GgmlType::kBF16;
       const bool ffn_d_bf16 = layer.ffn_down.type == core::GgmlType::kBF16;
 
-      LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, ffn_g_bf16, layer.ffn_up.data,
-                            ffn_u_bf16, arena_.d_normed, arena_.d_ffn_act,
-                            intermediate_size, hidden_size, arena_.stream);
+      if (fused_rmsnorm_proj && ffn_g_bf16 && ffn_u_bf16) {
+        LaunchFusedRMSNormSwiGLUGEMV(
+            arena_.d_hidden, static_cast<const float*>(layer.ffn_norm.data),
+            1e-6F, layer.ffn_gate.data, layer.ffn_up.data, arena_.d_ffn_act,
+            intermediate_size, hidden_size, arena_.stream);
+      } else {
+        LaunchFusedSwiGLUGEMV(layer.ffn_gate.data, ffn_g_bf16,
+                              layer.ffn_up.data, ffn_u_bf16, arena_.d_normed,
+                              arena_.d_ffn_act, intermediate_size, hidden_size,
+                              arena_.stream);
+      }
 
       LaunchGEMV(layer.ffn_down.data, ffn_d_bf16, arena_.d_ffn_act,
                  arena_.d_ffn_out, hidden_size, intermediate_size,
