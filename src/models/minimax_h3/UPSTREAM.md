@@ -75,3 +75,12 @@ Current prompt-boundary adaptations:
 | `h3_text_encoder.c` | `prompt_encoder.hip`, `prompt_encoder.hpp` | Layer/tensor contract adapted; Metal resource management replaced by device-copy streaming, next-layer prefetch, hipBLASLt, phase lease, cancellation, and telemetry |
 | text kernels in `h3_shaders.metal` | `prompt_encoder_ops.cuh` | Operation-boundary translation to HIP; BF16 rounding and FP32 reductions retained; no Metal/MPSGraph or ccv TensorOps code imported |
 | `tests/test_tokenizer.c`, `tests/test_real_prompt.c` | MiniMax H3 tokenizer and prompt-encoder tests | Released corpus retained; synthetic malformed cases, analytic HIP fixtures, content-hashed external Transformers boundaries, repetition, and leak checks added |
+
+Current sampler-boundary adaptations:
+
+| Upstream source | Local destination | Method and material changes |
+| --- | --- | --- |
+| `h3_host.c`, `h3_host.h` | `sampling.cpp`, `sampling.hpp` | Semantic C++20 translation of checked geometry, temporal alignment, text-only MM-RoPE layout, shifted serving schedules, timestep rows, PCG/Box-Muller noise, and explicit ownership/error handling |
+| packing and reuse helpers in `h3_dit.c` | `sampling.cpp`, `sampling.hpp` | Exact visual/audio row order, reuse selection, and bounded extrapolation retained; Ref2VA and frame-anchor segment kinds deferred |
+| `h3_euler_bf16` in `h3_shaders.metal` | `sampling.hip` | Operation-boundary translation to one gfx1151 HIP kernel; F32 sample state, BF16 velocities, fused extrapolation/update, bounds validation, and no CPU tensor fallback |
+| `tests/test_h3.c`, `tests/test_bf16.c` | MiniMax H3 sampling host/HIP tests | Exact schedule/layout/row-map/noise hashes, temporal cases, overflow/malformed inputs, round trips, reuse masks, and repeated byte-exact device Euler coverage |

@@ -102,6 +102,32 @@ fox-layer50-transformers.bf16
 
 The raw BF16 oracle and metadata remain outside Git.
 
+## Text-Only Layout and Sampler
+
+The initial FL2VA sampler boundary is model-private and text-only. It accepts
+checked 32-pixel canvas multiples within the released 768x1344 pixel-area
+limit, aligns requests to `5 + 17*n` frames through the 362-frame ceiling, and
+derives the separate video and audio latent timelines at 24 fps.
+
+Before any large DiT allocation, the host planner freezes:
+
+- text, target-audio, then target-video row order;
+- three-dimensional MM-RoPE coordinates and per-step AdaLN row maps;
+- 2x2 visual patch order and stereo audio row order;
+- independent video/audio shifted sigma grids with terminal zero;
+- independent PCG/Box-Muller generators initialized from the same request
+  seed;
+- denoiser evaluation selection and bounded linear velocity extrapolation.
+
+This is host planning and input construction, not a CPU tensor-inference
+fallback. Euler sample state remains F32 in gfx1151 device memory. The HIP
+kernel reads the most recent and previous BF16 DiT velocities, applies the
+frozen extrapolation ratio, and updates only the requested device range with
+the same fused arithmetic as the pinned h3.c boundary.
+
+First/last-frame conditioning and ordered Ref2VA inputs are deliberately not
+accepted by this text-only layout API; their row kinds remain future work.
+
 ## Operator Attestation
 
 The operator of the dedicated Strix Halo development machine has stated that

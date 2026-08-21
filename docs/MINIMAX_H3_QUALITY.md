@@ -124,6 +124,36 @@ The gfx1151 HIP implementation matched both payloads byte-for-byte: measured
 relative max and relative L2 were zero. A repeated complete run produced the
 same output bytes, 850 dispatches, and zero live registered host bytes.
 
+## Host Sampler Frozen Evidence
+
+The text-only sampler tests freeze the exact released linear base grid after
+independent video shift 12 and audio shift 3. Concatenated little-endian F32
+video/audio arrays have these SHA-256 values:
+
+| Evaluations | Schedule SHA-256 |
+| ---: | --- |
+| 4 | `dee27052a1aa4aa508a7b81bbe39e6bb4b880dd2d61dd3953380c5d0da3eb686` |
+| 7 | `cbd915b9d5fb117e3c35fb1e02771e0fdbe427736726dff0086de229ea01ffc0` |
+| 20 | `f78a6b940322389481be761fb2dc503e869573f37c87c75e32e418e42b3b3e39` |
+| 50 | `711fc5640698dec50ad677b604bd1cc95dcc3def734e0e7f88967c1d28ca2033` |
+
+For six text rows and the 22-frame temporal shape, canonical packed-layout and
+step-7 modulation-map hashes are:
+
+| Canvas | Rows | Layout SHA-256 | Row-map SHA-256 |
+| --- | ---: | --- | --- |
+| 256x256 | 528 | `61be3a596b2670766a7e86b5a526e13438e89a68523d99eb5bdd9f2c8ca7f61a` | `8574df4af41e95bb6ec35f3ec9459ceb88a319f68ad07e9ec70af5a84cb6a6e3` |
+| 512x512 | 1,872 | `c3481ff47fabdf534823889a95df5655bd19ac11ff1755f5daa7b6e1655d00b0` | `c95bbf9938ac6b5c2d901af8466d374f6e173953954872e19ec12ed82fec98a1` |
+
+The 256x256x22 seed-42 initial video and audio noise payloads hash together to
+`0b9e324f731605e8b6050b2c7cdc46a320b75609c426ea548adb35332204620d`.
+Separate same-seed generators make the complete audio payload byte-identical
+to the corresponding video prefix.
+
+The gfx1151 analytic test keeps the sample in device F32 and matches the
+pinned four-element BF16-velocity Euler result byte-for-byte on repeated
+allocations. Zero-delta and out-of-range updates fail before launch.
+
 ## Numerical Gates
 
 The initial upstream ceilings are strict inequalities:

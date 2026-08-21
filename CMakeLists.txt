@@ -190,6 +190,7 @@ add_library(strix_core STATIC
   src/models/minimax_h3/json.cpp
   src/models/minimax_h3/prompt_encoder.cpp
   src/models/minimax_h3/runtime.cpp
+  src/models/minimax_h3/sampling.cpp
   src/models/minimax_h3/sha256.cpp
   src/models/minimax_h3/tokenizer.cpp
   src/tokenization/qwen_tokenizer.cpp
@@ -228,6 +229,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_mtp_gpu.cpp
     src/models/minimax_h3/runtime_hip.cpp
     src/models/minimax_h3/prompt_encoder.hip
+    src/models/minimax_h3/sampling.hip
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
     src/core/speculative/prompt_lookup_backend.cpp
@@ -432,6 +434,13 @@ if (BUILD_TESTING)
   set_tests_properties(minimax_h3_tokenizer_test PROPERTIES
     LABELS "cpu;models;minimax-h3;tokenizer;quality")
 
+  add_executable(minimax_h3_sampling_test
+    tests/models/minimax_h3_sampling_test.cpp)
+  target_link_libraries(minimax_h3_sampling_test PRIVATE strix_core)
+  add_test(NAME minimax_h3_sampling_test COMMAND minimax_h3_sampling_test)
+  set_tests_properties(minimax_h3_sampling_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;layout;schedule;rng;quality")
+
   add_executable(ggml_dequant_test tests/core/ggml_dequant_test.cpp)
   target_link_libraries(ggml_dequant_test PRIVATE strix_core)
 
@@ -543,6 +552,16 @@ if (BUILD_TESTING)
       COMMAND minimax_h3_prompt_encoder_hip_test --real)
     set_tests_properties(minimax_h3_prompt_encoder_real PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;prompt-encoder;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_sampling_hip_test
+      tests/models/minimax_h3_sampling_hip_test.hip)
+    target_link_libraries(minimax_h3_sampling_hip_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME minimax_h3_sampling_hip_test
+      COMMAND minimax_h3_sampling_hip_test)
+    set_tests_properties(minimax_h3_sampling_hip_test PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;sampling;euler;analytic"
       SKIP_RETURN_CODE 77)
 
     add_executable(deepseek_v4_flash_engine_test
