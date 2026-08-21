@@ -73,17 +73,33 @@ for the same artifact. Prompt rows compare the final context after adding the
 
 | Prepared depth | Strix `pp2048` | DS4 `pp2048` | Delta | Strix `tg128` | DS4 `tg128` | Delta | Snapshot bytes |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2K | 193.66 | 205.49 | -5.8% | 16.27 | 14.76 | +10.2% | 52,184,460 |
-| 8K | 188.28 | 197.13 | -4.5% | 14.68 | 13.87 | +5.8% | 136,750,476 |
-| 16K | 183.10 | 190.09 | -3.7% | 14.41 | 13.63 | +5.7% | 249,505,164 |
-| 32K | 167.05 | 171.83 | -2.8% | 13.67 | 12.93 | +5.7% | 475,014,540 |
-| 64K | 145.66 | not supplied | - | 12.42 | 11.91 | +4.3% | 926,033,292 |
+| 2K | 201.42 | 205.49 | -2.0% | 16.27 | 14.76 | +10.2% | 52,184,460 |
+| 8K | 197.76 | 197.13 | +0.3% | 14.68 | 13.87 | +5.8% | 136,750,476 |
+| 16K | 192.49 | 190.09 | +1.3% | 14.41 | 13.63 | +5.7% | 249,505,164 |
+| 32K | 174.61 | 171.83 | +1.6% | 13.67 | 12.93 | +5.7% | 475,014,540 |
+| 64K | not remeasured | not supplied | - | 12.42 | 11.91 | +4.3% | 926,033,292 |
 
 The model loads 80.76 GiB of tensor spans in about 21 seconds. The 64K run
 plans 82.07 GiB total, including model, KV state, and working buffers.
 The 2K generation value is the mean of three interleaved release samples. The
-8K-32K generation values come from one paired sparse-depth sweep. Prompt
-processing is unchanged by the decode-only Q2-down optimization.
+8K-32K generation values come from one paired sparse-depth sweep. The 64K
+prompt row was not rerun because the retained prompt-kernel gain was already
+stable through 32K.
+
+A separate full-prompt comparison isolates the retained Q2-down prompt kernel:
+
+| Prompt | Baseline | Current | Delta |
+| ---: | ---: | ---: | ---: |
+| 4K | 192.05 | 197.15 | +2.7% |
+| 8K | 207.96 | 210.21 | +1.1% |
+| 16K | 202.88 | 205.52 | +1.3% |
+
+The 4K values are means from an interleaved baseline/candidate replay. The 8K
+and 16K values are matched release-package runs. Profiling shows the routed
+Q2-down kernel falling from 50.78 ms to 40.12 ms per layer (-21.0%): the
+four-fragment kernel halves the output-column grid, dynamic LDS drops from
+11,520 to 8,448 bytes, scratch remains zero, and VGPR allocation rises from 48
+to 80. The LDS and register budgets still permit at least four waves per SIMD.
 
 ## Quality and Integration
 
@@ -94,6 +110,10 @@ processing is unchanged by the decode-only Q2-down optimization.
   tokens at top-1, every reference token within top-3, and aggregate rank at
   most 142. This catches sustained numerical drift without treating
   free-running near-tie flips as state corruption.
+- A 128-token batched-prefill versus sequential-state comparison matches the
+  immutable pre-optimization envelope: RMSE at most 1.12, cosine at least
+  0.979, maximum logit error at most 5.0, and the sequential winner remains
+  within the batched top-3.
 - Full logits are finite after real GGUF prefill.
 - Snapshot restore reproduces the exact position, greedy token, and logit
   vector.
@@ -118,6 +138,10 @@ processing is unchanged by the decode-only Q2-down optimization.
 - Reduced the six-expert Q2-down kernel by 7.8% with a two-way compiler unroll;
   `tg128` improved 1.2% at 2K and 0.6-0.7% at 8K-32K without changing VGPR,
   LDS, or scratch allocation.
+- Reused each routed-MoE activation tile across four Q2-down output fragments
+  and aliased the epilogue over dead staging LDS. Full-prompt throughput improves
+  1.1-2.7%, while the canonical 2K-suffix prompt rows improve about 4-5%
+  through 32K.
 
 ## Failed
 
@@ -128,6 +152,11 @@ processing is unchanged by the decode-only Q2-down optimization.
   benchmarking, cancellation, and session pooling.
 - Q8 projection row grouping (`1/2/4/8`) and high-compression row grouping
   (`8/16/32`) produced no repeatable end-to-end improvement.
+- Q2-down LDS aliasing alone was noise (`192.01` versus `192.13 tok/s` at
+  4K); it is retained only because it enables the faster four-fragment kernel.
+- An 8K prefill capacity regressed the 8K prompt (`201.80` versus `210.21
+  tok/s`) and was noise in a 16K replay (`204.14` versus `203.62 tok/s`), so
+  the existing 4K chunk policy remains.
 
 ## To Do
 

@@ -2717,6 +2717,56 @@ __device__ __forceinline__ static void q2_K_dequant_dual_tile_half_rowwise(
     }
 }
 
+/* NFRAG-wide variant of the pair dequantizer below.  Emits NFRAG consecutive
+ * col-major B tiles into one contiguous window; per-element arithmetic is
+ * identical. */
+template <int BN, int BK, int NFRAG>
+__device__ __forceinline__ static void q2_K_dequant_wide_tile_half_rowwise(
+        __half *shB,
+        const unsigned char *base,
+        uint64_t row_bytes,
+        uint32_t n0,
+        uint32_t k0,
+        uint32_t out_dim,
+        uint32_t tid) {
+    const uint32_t g = (k0 & 255u) >> 4u;
+    const uint32_t within = g & 7u;
+    const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+    const uint32_t shift = (within >> 1u) * 2u;
+    constexpr uint32_t KG = 4u;
+    constexpr uint32_t UNITS_PER_TILE = (uint32_t)(BN * (BK / KG));
+    for (uint32_t j = tid; j < (uint32_t)NFRAG * UNITS_PER_TILE; j += blockDim.x) {
+        const uint32_t tile = j / UNITS_PER_TILE;
+        const uint32_t rem = j - tile * UNITS_PER_TILE;
+        const uint32_t nn = rem / (uint32_t)(BK / KG);
+        const uint32_t kk0 = (rem - nn * (uint32_t)(BK / KG)) * KG;
+        const uint32_t row = n0 + tile * (uint32_t)BN + nn;
+        uint32_t v0 = 0u;
+        uint32_t v1 = 0u;
+        if (row < out_dim) {
+            const unsigned char *blk = base + (uint64_t)row * row_bytes + (uint64_t)(k0 >> 8u) * 84u;
+            const float d = dev_f16_to_f32((uint16_t)blk[80] | ((uint16_t)blk[81] << 8));
+            const float dm = dev_f16_to_f32((uint16_t)blk[82] | ((uint16_t)blk[83] << 8));
+            const float s = (float)(blk[g] & 0x0fu);
+            const float m = (float)(blk[g] >> 4u);
+            const uint32_t qbits = *reinterpret_cast<const uint32_t *>(blk + 16u + qbase + kk0);
+            const uint32_t q0 = (qbits >> shift) & 3u;
+            const uint32_t q1 = (qbits >> (8u + shift)) & 3u;
+            const uint32_t q2 = (qbits >> (16u + shift)) & 3u;
+            const uint32_t q3 = (qbits >> (24u + shift)) & 3u;
+            const float ds = d * s;
+            const float dmm = dm * m;
+            v0 = dev_pack_half2_bits(ds * (float)q0 - dmm,
+                                     ds * (float)q1 - dmm);
+            v1 = dev_pack_half2_bits(ds * (float)q2 - dmm,
+                                     ds * (float)q3 - dmm);
+        }
+        __half *dst = shB + tile * (uint32_t)(BK * BN) + nn * (uint32_t)BK + kk0;
+        *reinterpret_cast<uint32_t *>(dst) = v0;
+        *reinterpret_cast<uint32_t *>(dst + 2u) = v1;
+    }
+}
+
 template <int BN, int BK>
 __device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise(
         __half *shB0,
@@ -3692,7 +3742,8 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     __half *shA = reinterpret_cast<__half *>(raw_sh);
     __half *shB0 = shA + MTILES * BM * BK;
     __half *shB1 = shB0 + BK * BN;
-    float *shC0 = reinterpret_cast<float *>(shB1 + BK * BN);
+    /* C staging is dead until the K loop has retired every A/B read. */
+    float *shC0 = reinterpret_cast<float *>(raw_sh);
     float *shC1 = shC0 + MTILES * BM * BN;
     const uint32_t hot_idx = (uint32_t)blockIdx.z;
     if (hot_idx >= hot_count) return;
@@ -3808,6 +3859,145 @@ __global__ static void moe_down_q2K_hotlist_wmma_n2_kernel(
     }
 }
 
+/* Wide-N routed Q2_K down.
+ *
+ * The n2 kernel above is activation-traffic bound rather than compute or
+ * dequantization bound: its 64-row mid tile is 92% of the bytes it touches, and
+ * with 32 output columns per workgroup that tile is re-staged 128 times per
+ * layer, once per column block.  Arithmetic intensity is about 30 FLOP/byte
+ * where roughly 230 would be needed to saturate the matrix cores.
+ *
+ * This variant stages the same mid tile once and runs NFRAG column fragments
+ * against it, halving (NFRAG=4) or quartering (NFRAG=8) the activation
+ * re-reads.  The accumulators live in registers, and the epilogue writes them
+ * back two fragments at a time through the same 8 KiB staging window the n2
+ * kernel uses, so dynamic LDS and resident workgroups per CU are unchanged.
+ * The K loop order, fragment shapes, and accumulation order per output element
+ * are identical to the n2 kernel, so results stay bit-exact. */
+template <int MTILES=4, int BM=16, int BN=16, int BK=16, int NFRAG=4,
+          bool MID_F16=false, bool OUT_F16=false, bool SLOT_MAJOR=false>
+__global__ static void moe_down_q2K_hotlist_wmma_wide_kernel(
+        float *down_out,
+        __half *down_out_h,
+        const char *down_base,
+        const float *mid,
+        const __half *mid_h,
+        const uint32_t *counts,
+        const uint32_t *offsets,
+        const uint32_t *pairs,
+        const uint32_t *hot_experts,
+        uint32_t hot_count,
+        uint32_t expert_mid_dim,
+        uint32_t out_dim,
+        uint64_t down_expert_bytes,
+        uint64_t down_row_bytes,
+        uint32_t n_tokens = 0u) {
+    extern __shared__ unsigned char raw_sh[];
+    __half *shA = reinterpret_cast<__half *>(raw_sh);
+    __half *shB = shA + MTILES * BM * BK;
+    float *shC = reinterpret_cast<float *>(raw_sh);
+    const uint32_t hot_idx = (uint32_t)blockIdx.z;
+    if (hot_idx >= hot_count) return;
+    const uint32_t expert = hot_experts[hot_idx];
+    const uint32_t count = counts[expert];
+    const uint32_t m_group0 = (uint32_t)blockIdx.y * MTILES * BM;
+    if (m_group0 >= count) return;
+    const uint32_t n0 = (uint32_t)blockIdx.x * (NFRAG * BN);
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    const uint32_t first = offsets[expert];
+    __shared__ uint32_t shPair[MTILES * BM];
+    for (uint32_t j = tid; j < MTILES * BM; j += blockDim.x) {
+        const uint32_t bucket_row = m_group0 + j;
+        shPair[j] = (bucket_row < count) ? pairs[first + bucket_row] : UINT32_MAX;
+    }
+    __syncthreads();
+
+    using frag_a = rocwmma::fragment<rocwmma::matrix_a, BM, BN, BK, __half, rocwmma::row_major>;
+    using frag_b = rocwmma::fragment<rocwmma::matrix_b, BM, BN, BK, __half, rocwmma::col_major>;
+    using frag_c = rocwmma::fragment<rocwmma::accumulator, BM, BN, BK, float>;
+    frag_a a;
+    frag_b b[NFRAG];
+    frag_c acc[NFRAG];
+    if (wave < MTILES) {
+#pragma unroll
+        for (int f = 0; f < NFRAG; f++) rocwmma::fill_fragment(acc[f], 0.0f);
+    }
+
+    const unsigned char *dew = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
+    for (uint32_t k0 = 0; k0 < expert_mid_dim; k0 += BK) {
+        if (MID_F16) {
+            for (uint32_t j = tid; j < MTILES * BM * (BK / 2); j += blockDim.x) {
+                const uint32_t pair_row = j / (BK / 2);
+                const uint32_t kk2 = j - pair_row * (BK / 2);
+                const uint32_t pair = shPair[pair_row];
+                uint32_t v = 0u;
+                if (pair != UINT32_MAX) {
+                    const uint64_t moff = (uint64_t)pair * expert_mid_dim + k0 + kk2 * 2u;
+                    v = *reinterpret_cast<const uint32_t *>(mid_h + moff);
+                }
+                *reinterpret_cast<uint32_t *>(shA + pair_row * BK + kk2 * 2u) = v;
+            }
+        } else {
+            for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+                const uint32_t mt = j / (BM * BK);
+                const uint32_t rem = j - mt * BM * BK;
+                const uint32_t mm = rem / BK;
+                const uint32_t kk = rem - mm * BK;
+                const uint32_t pair = shPair[mt * BM + mm];
+                if (pair != UINT32_MAX) {
+                    shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
+                } else {
+                    shA[j] = __float2half(0.0f);
+                }
+            }
+        }
+        q2_K_dequant_wide_tile_half_rowwise<BN, BK, NFRAG>(
+                shB, dew, down_row_bytes, n0, k0, out_dim, tid);
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+#pragma unroll
+            for (int f = 0; f < NFRAG; f++) {
+                rocwmma::load_matrix_sync(b[f], shB + f * (BK * BN), BN);
+                rocwmma::mma_sync(acc[f], a, b[f], acc[f]);
+            }
+        }
+        __syncthreads();
+    }
+
+    /* Page the accumulators out two fragments at a time so the C window stays
+     * the same size the n2 kernel aliases. */
+#pragma unroll
+    for (int base = 0; base < NFRAG; base += 2) {
+        __syncthreads();
+        if (wave < MTILES) {
+            rocwmma::store_matrix_sync(shC + wave * BM * BN, acc[base], BN, rocwmma::mem_row_major);
+            rocwmma::store_matrix_sync(shC + (MTILES + wave) * BM * BN, acc[base + 1], BN, rocwmma::mem_row_major);
+        }
+        __syncthreads();
+        for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
+            const uint32_t mt = j / (BM * BN);
+            const uint32_t rem = j - mt * BM * BN;
+            const uint32_t mm = rem / BN;
+            const uint32_t nn = rem - mm * BN;
+            const uint32_t pair = shPair[mt * BM + mm];
+            if (pair == UINT32_MAX) continue;
+            const uint32_t tok = pair / 6u;
+            const uint32_t slot = pair - tok * 6u;
+#pragma unroll
+            for (int half_i = 0; half_i < 2; half_i++) {
+                const uint32_t row = n0 + (uint32_t)(base + half_i) * BN + nn;
+                if (row >= out_dim) continue;
+                const float v = shC[(uint32_t)half_i * (MTILES * BM * BN) + j];
+                uint64_t dst = (uint64_t)pair * out_dim + row;
+                if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row;
+                if (OUT_F16) down_out_h[dst] = __float2half(v);
+                else down_out[dst] = v;
+            }
+        }
+    }
+}
 #endif
 
 __device__ static float dev_iq2_xxs_dot_f32(const hip_block_iq2_xxs *row, const float *x, uint32_t nb) {

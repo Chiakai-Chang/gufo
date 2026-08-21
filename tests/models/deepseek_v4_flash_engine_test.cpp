@@ -4,9 +4,11 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "src/models/deepseek_v4_flash/engine.hpp"
 
@@ -82,6 +84,84 @@ void CheckPinnedTrajectory(
   Expect(worst_rank <= 3, "128-token worst rank");
 }
 
+void CheckBatchedPrefill(
+    const std::shared_ptr<strix::models::deepseek_v4_flash::Model>& model) {
+  std::string error;
+  const auto prompt = model->Tokenize(kTrajectoryPrompt);
+  Expect(!prompt.empty(), "prefill prompt tokenization");
+  auto tokens = prompt;
+  tokens.insert(tokens.end(), kPinnedDs4Trajectory.begin(),
+                kPinnedDs4Trajectory.end());
+
+  auto batched = model->CreateSession(4096, &error);
+  Expect(batched != nullptr, error.c_str());
+  Expect(batched->Sync(tokens, &error), error.c_str());
+  const auto batched_logits = batched->CopyLogits(&error);
+  Expect(!batched_logits.empty(), error.c_str());
+
+  auto sequential = model->CreateSession(4096, &error);
+  Expect(sequential != nullptr, error.c_str());
+  Expect(sequential->Sync(prompt, &error), error.c_str());
+  for (const int token : kPinnedDs4Trajectory) {
+    Expect(sequential->Evaluate(token, &error), error.c_str());
+  }
+  const auto sequential_logits = sequential->CopyLogits(&error);
+  Expect(sequential_logits.size() == batched_logits.size(),
+         "prefill logit shape");
+
+  double squared_error = 0.0;
+  double dot = 0.0;
+  double batched_norm = 0.0;
+  double sequential_norm = 0.0;
+  float max_error = 0.0F;
+  bool finite = true;
+  for (std::size_t index = 0; index < batched_logits.size(); ++index) {
+    const float batched_value = batched_logits[index];
+    const float sequential_value = sequential_logits[index];
+    finite = finite && std::isfinite(batched_value) &&
+             std::isfinite(sequential_value);
+    const double difference =
+        static_cast<double>(batched_value) - sequential_value;
+    squared_error += difference * difference;
+    dot += static_cast<double>(batched_value) * sequential_value;
+    batched_norm += static_cast<double>(batched_value) * batched_value;
+    sequential_norm += static_cast<double>(sequential_value) * sequential_value;
+    max_error = std::max(max_error, std::abs(batched_value - sequential_value));
+  }
+
+  const double rmse =
+      std::sqrt(squared_error / static_cast<double>(batched_logits.size()));
+  const double denominator = std::sqrt(batched_norm * sequential_norm);
+  const double cosine = denominator > std::numeric_limits<double>::min()
+                            ? dot / denominator
+                            : 0.0;
+  const auto batched_top =
+      std::max_element(batched_logits.begin(), batched_logits.end());
+  const auto sequential_top =
+      std::max_element(sequential_logits.begin(), sequential_logits.end());
+  const auto batched_top_index = static_cast<std::size_t>(
+      std::distance(batched_logits.begin(), batched_top));
+  const auto sequential_top_index = static_cast<std::size_t>(
+      std::distance(sequential_logits.begin(), sequential_top));
+  const float sequential_choice_logit = batched_logits[sequential_top_index];
+  const int sequential_choice_rank =
+      1 + static_cast<int>(
+              std::count_if(batched_logits.begin(), batched_logits.end(),
+                            [sequential_choice_logit](float value) {
+                              return value > sequential_choice_logit;
+                            }));
+
+  std::cout << "Batched prefill vs sequential: rmse=" << rmse
+            << " cosine=" << cosine << " max_error=" << max_error
+            << " top1_match=" << (batched_top_index == sequential_top_index)
+            << " sequential_choice_rank=" << sequential_choice_rank << '\n';
+  Expect(finite, "prefill finite logits");
+  Expect(rmse <= 1.12, "prefill RMSE envelope");
+  Expect(cosine >= 0.979, "prefill cosine envelope");
+  Expect(max_error <= 5.0F, "prefill maximum error envelope");
+  Expect(sequential_choice_rank <= 3, "prefill sequential choice rank");
+}
+
 }  // namespace
 
 int main() {
@@ -144,6 +224,7 @@ int main() {
   Expect(session->CopyLogits(&error) == logits, "restored logits");
 
   CheckPinnedTrajectory(model);
+  CheckBatchedPrefill(model);
 
   std::cout << "DeepSeek V4 Flash model/session test passed\n";
   return 0;

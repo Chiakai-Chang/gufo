@@ -1,3 +1,25 @@
+/* Dynamic LDS for the Q2-down WMMA kernel. The epilogue aliases its
+ * float C staging over the half A/B staging buffers, so allocation needs the
+ * larger region rather than their sum. */
+static size_t ds4_rocm_q2_down_wmma_shmem(uint32_t mtiles, uint32_t bm,
+                                          uint32_t bn, uint32_t bk) {
+    const size_t ab = ((size_t)mtiles * bm * bk + 2u * (size_t)bk * bn) *
+                      sizeof(__half);
+    const size_t c = (2u * (size_t)mtiles * bm * bn) * sizeof(float);
+    return ab > c ? ab : c;
+}
+
+/* Dynamic LDS for the wide-N variant: NFRAG B tiles for staging, versus the
+ * two-fragment C page used by its epilogue. */
+static size_t ds4_rocm_q2_down_wide_shmem(uint32_t mtiles, uint32_t bm,
+                                          uint32_t bn, uint32_t bk,
+                                          uint32_t nfrag) {
+    const size_t ab = ((size_t)mtiles * bm * bk +
+                       (size_t)nfrag * bk * bn) * sizeof(__half);
+    const size_t c = (2u * (size_t)mtiles * bm * bn) * sizeof(float);
+    return ab > c ? ab : c;
+}
+
 /* Mixed IQ2_XXS-gate/Q2_K-down models already compute routed mid activations
  * as float.  Reuse the newer Q2_K expert-batch/WMMA down kernels instead of
  * re-quantizing mid to Q8_K and taking the older qwarp down path.  This keeps
@@ -109,14 +131,28 @@ static int routed_moe_q2_float_down_launch(
         constexpr uint32_t bm = 16u, bn = 16u, bk = 16u;
         const int no_n2 = 0;
         const uint32_t wmma_mtiles = 4u;
-        if (!no_n2) {
+        constexpr uint32_t wide_nfrag = 4u;
+        if (wmma_mtiles == 4u && use_f16_down && hot_mid_f16 && mid_h_hot &&
+            (out_dim % (wide_nfrag * bn)) == 0u) {
+            constexpr uint32_t mt = 4u;
+            const dim3 block(32u * mt, 1u, 1u);
+            const dim3 grid(out_dim / (wide_nfrag * bn),
+                            (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
+            const size_t shmem =
+                ds4_rocm_q2_down_wide_shmem(mt, bm, bn, bk, wide_nfrag);
+            moe_down_q2K_hotlist_wmma_wide_kernel<
+                4, 16, 16, 16, wide_nfrag, true, true><<<grid, block, shmem>>>(
+                    NULL, down_h, down_w, NULL, mid_h_hot,
+                    counts, offsets, sorted_pairs, hot_experts_dev, hot_count,
+                    expert_mid_dim, out_dim, down_expert_bytes, down_row_bytes);
+        } else if (!no_n2) {
             if (wmma_mtiles == 4u) {
                 constexpr uint32_t mt = 4u;
                 const dim3 block(32u * mt, 1u, 1u);
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
-                const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(__half) +
-                                        (2u * mt * bm * bn) * sizeof(float);
+                const size_t shmem_n2 =
+                ds4_rocm_q2_down_wmma_shmem(mt, bm, bn, bk);
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<4,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,
@@ -143,8 +179,8 @@ static int routed_moe_q2_float_down_launch(
                 const dim3 block(32u * mt, 1u, 1u);
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
-                const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(__half) +
-                                        (2u * mt * bm * bn) * sizeof(float);
+                const size_t shmem_n2 =
+                    ds4_rocm_q2_down_wmma_shmem(mt, bm, bn, bk);
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<16,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,
@@ -171,8 +207,8 @@ static int routed_moe_q2_float_down_launch(
                 const dim3 block(32u * mt, 1u, 1u);
                 const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                                 (hot_max + mt * bm - 1u) / (mt * bm), hot_count);
-                const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(__half) +
-                                        (2u * mt * bm * bn) * sizeof(float);
+                const size_t shmem_n2 =
+                    ds4_rocm_q2_down_wmma_shmem(mt, bm, bn, bk);
                 if (use_f16_down && hot_mid_f16 && mid_h_hot) {
                     moe_down_q2K_hotlist_wmma_n2_kernel<8,16,16,16,true,true><<<grid, block, shmem_n2>>>(
                             NULL, down_h, down_w, NULL, mid_h_hot,
@@ -1127,8 +1163,8 @@ static int routed_moe_launch(
             const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                             (wmma_f16_low_max + mt4 * bm - 1u) / (mt4 * bm),
                             wmma_f16_low_count);
-            const size_t shmem_n2 = (mt4 * bm * bk + 2u * bk * bn) * sizeof(__half) +
-                                    (2u * mt4 * bm * bn) * sizeof(float);
+            const size_t shmem_n2 =
+                ds4_rocm_q2_down_wmma_shmem(mt4, bm, bn, bk);
             if (!hip_ok(hipMemcpy(wmma_down_f16_low_dev, h_f16_low,
                                     wmma_f16_low_count * sizeof(uint32_t), hipMemcpyHostToDevice),
                          "routed_moe q2 wmma f16-low down hot copy")) return 0;
@@ -1144,8 +1180,8 @@ static int routed_moe_launch(
             const dim3 grid((out_dim + 2u * bn - 1u) / (2u * bn),
                             (wmma_f16_hot_max + mt * bm - 1u) / (mt * bm),
                             wmma_f16_hot_count);
-            const size_t shmem_n2 = (mt * bm * bk + 2u * bk * bn) * sizeof(__half) +
-                                    (2u * mt * bm * bn) * sizeof(float);
+            const size_t shmem_n2 =
+                    ds4_rocm_q2_down_wmma_shmem(mt, bm, bn, bk);
             if (!hip_ok(hipMemcpy(wmma_down_hot_dev, h_f16_hot,
                                     wmma_f16_hot_count * sizeof(uint32_t), hipMemcpyHostToDevice),
                          "routed_moe q2 wmma f16-mid down hot copy")) return 0;
