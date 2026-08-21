@@ -1570,8 +1570,8 @@ __global__ static void grouped_q8_0_a_f32_batch_sharedx_chunked_w32_kernel(
 
 /*
  * Variant of the grouped shared-X kernel for inputs whose logical groups are
- * slices of a wider physical row.  GLM QK-low projects only qk_nope values
- * from each q head, while consecutive heads remain qk_dim values apart.
+ * slices of a wider physical row. Consecutive groups can remain a fixed
+ * physical stride apart.
  */
 template <uint32_t TOK_TILE, uint32_t BLOCKS_TILE>
 __global__ static void grouped_q8_0_a_f32_batch_sharedx_chunked_strided_w32_kernel(

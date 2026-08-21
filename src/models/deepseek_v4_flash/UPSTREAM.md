@@ -14,32 +14,26 @@ or mutable state.
 
 ## Integration Boundary
 
-`engine.hpp` and `engine.cpp` are the stable Strix-owned C++20 facade. Product
-code uses that facade for model loading, tokenization, request sessions,
-snapshots, logits, and cancellation. It does not include vendor headers.
+`engine.hpp` and `engine.cpp` are the stable Strix-owned C++20 API. Product
+code uses that API for model loading, tokenization, request sessions,
+snapshots, logits, and cancellation.
 
 The imported implementation is part of the Strix model package rather than a
 nested external project:
 
-- `runtime` owns the GGUF loader, tokenizer, graph, and request state.
+- `runtime` owns independent C++20 modules for GGUF/model data, tokenizer,
+  sampling, request state, snapshots, and ROCm graph execution.
 - `kernels/rocm` owns every DeepSeek numerical kernel and ROCm dispatch rule.
-- `engine.hpp` and `engine.cpp` are the stable C++ product facade.
+- `engine.hpp` and `engine.cpp` directly own the native runtime handles.
 
 The model package intentionally duplicates numerical code instead of calling
 Qwen kernels. A DeepSeek kernel change must not alter another model's output or
 performance.
 
-The imported runtime and kernels retain their upstream formatting where that
-keeps license review and numerical comparison auditable. New product behavior
-belongs in the facade unless it is intrinsically part of the DeepSeek graph or
-kernel implementation.
-
-The standalone distributed, tensor-parallel, SSD planning/streaming,
-multi-GPU placement, and DS4 frontend implementations are not built or
-shipped. The retained upstream graph and ROCm translation units still contain
-shared conditional ABI branches because the resident single-device route uses
-the same internal types and kernels. The Strix facade cannot enable those
-modes, and fail-closed compatibility hooks reject them if one is reached.
+The standalone distributed, tensor-parallel, SSD weight streaming, multi-GPU
+placement, CPU reference graph, MTP, steering, and DS4 frontend
+implementations are not built or shipped. The production runtime has one
+single-device resident ROCm route and one authoritative state layout.
 
 ## Update Policy
 

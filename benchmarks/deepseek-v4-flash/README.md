@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash Q2-imatrix on Strix Halo
 
-Status: 2026-08-20. This page is the current functional and performance
+Status: 2026-08-21. This page is the current functional and performance
 snapshot, not an optimization history.
 
 ## Model
@@ -73,7 +73,7 @@ for the same artifact. Prompt rows compare the final context after adding the
 
 | Prepared depth | Strix `pp2048` | DS4 `pp2048` | Delta | Strix `tg128` | DS4 `tg128` | Delta | Snapshot bytes |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 2K | 194.93 | 205.49 | -5.1% | 15.60 | 14.76 | +5.7% | 52,184,460 |
+| 2K | 193.66 | 205.49 | -5.8% | 15.52 | 14.76 | +5.1% | 52,184,460 |
 | 8K | 188.28 | 197.13 | -4.5% | 14.61 | 13.87 | +5.3% | 136,750,476 |
 | 16K | 183.10 | 190.09 | -3.7% | 14.32 | 13.63 | +5.1% | 249,505,164 |
 | 32K | 167.05 | 171.83 | -2.8% | 13.55 | 12.93 | +4.8% | 475,014,540 |
@@ -81,6 +81,8 @@ for the same artifact. Prompt rows compare the final context after adding the
 
 The model loads 80.76 GiB of tensor spans in about 21 seconds. The 64K run
 plans 82.07 GiB total, including model, KV state, and working buffers.
+The 2K row was rerun after the native C++ runtime refactor; the deeper rows
+retain the prior measurements from the same numerical kernel family.
 
 ## Quality and Integration
 
@@ -98,10 +100,11 @@ plans 82.07 GiB total, including model, KV state, and working buffers.
 
 ## Successful
 
-- Imported the minimum DS4 engine and ROCm kernel closure needed for the model.
-- Moved the engine into repository-owned `runtime` and `kernels/rocm`
-  packages, removing the standalone distributed, tensor-parallel, SSD
-  streaming/planning, multi-GPU placement, and embedded hotlist modules.
+- Adapted the required DS4 graph and ROCm kernels into repository-owned C++20
+  `runtime` and `kernels/rocm` packages.
+- Removed standalone distributed, tensor-parallel, SSD weight streaming,
+  multi-GPU placement, CPU reference, MTP, steering, and embedded hotlist
+  implementations from the production closure.
 - Converted the private fork to native ROCm/HIP naming and APIs.
 - Kept DeepSeek code, kernels, state, and dispatch isolated from Qwen.
 - Reused the existing Strix CLI, benchmark, and OpenAI-compatible server.
@@ -118,8 +121,12 @@ plans 82.07 GiB total, including model, KV state, and working buffers.
 
 ## To Do
 
+- Add model-owned thinking/reasoning mode and effort controls; the current chat
+  template intentionally uses the no-thinking path.
 - Run the compact `strix-eval` qualification suite when #153 is implemented.
 - Profile and optimize the model-owned gfx1151 kernels under #155.
 - Add DSpark speculative decoding under #156.
+- Add model-owned offline calibration/imatrix tooling only when a new
+  quantization recipe requires it.
 - Add multi-session scheduling and restart-safe SSD state reuse through the
   serving milestones.

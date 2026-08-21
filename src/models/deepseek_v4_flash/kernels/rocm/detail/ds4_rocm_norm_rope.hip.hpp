@@ -448,26 +448,6 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(ds4_gpu_tensor *out, const ds
     return hip_ok(hipGetLastError(), "rms_norm_weight launch");
 }
 
-extern "C" int ds4_gpu_add_rms_norm_weight_tensor(
-        ds4_gpu_tensor       *norm_out,
-        ds4_gpu_tensor       *sum_out,
-        const ds4_gpu_tensor *a,
-        const ds4_gpu_tensor *b,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint32_t                n,
-        float                   eps) {
-    return ds4_gpu_add_tensor(sum_out, a, b, n) &&
-           ds4_gpu_rms_norm_weight_tensor(norm_out,
-                                          sum_out,
-                                          model_map,
-                                          model_size,
-                                          weight_offset,
-                                          n,
-                                          eps);
-}
-
 extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,
@@ -520,86 +500,6 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok, u
     head_rms_norm_kernel<<<(uint32_t)rows64, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, eps);
     return hip_ok(hipGetLastError(), "head_rms_norm launch");
 }
-extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow, float eps) {
-    uint64_t rows64 = 0;
-    if (n_rot > head_dim || (n_rot & 1u) ||
-        !hip_u64_mul_checked(n_tok, n_head, &rows64) || rows64 > UINT32_MAX ||
-        !hip_tensor_has_elems3(x, n_tok, n_head, head_dim, sizeof(float))) return 0;
-    if (rows64 == 0u || head_dim == 0u) return 1;
-    head_rms_norm_rope_tail_kernel<<<(uint32_t)rows64, 256>>>((float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow, eps);
-    return hip_ok(hipGetLastError(), "head_rms_norm_rope_tail launch");
-}
-extern "C" int ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor(
-        ds4_gpu_tensor       *out,
-        ds4_gpu_tensor       *q_half,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              weight_offset,
-        uint64_t              in_dim,
-        uint64_t              out_dim,
-        const ds4_gpu_tensor *x,
-        uint32_t              n_tok,
-        uint32_t              n_head,
-        uint32_t              head_dim,
-        uint32_t              n_rot,
-        uint32_t              pos0,
-        uint32_t              n_ctx_orig,
-        bool                  inverse,
-        float                 freq_base,
-        float                 freq_scale,
-        float                 ext_factor,
-        float                 attn_factor,
-        float                 beta_fast,
-        float                 beta_slow,
-        float                 eps) {
-    if (!g_hipblas_ready || !out || !q_half || !x || !model_map || n_tok == 0 ||
-        n_rot > head_dim || (n_rot & 1u) || out_dim != (uint64_t)n_head * head_dim ||
-        x->bytes < (uint64_t)n_tok * in_dim * sizeof(float) ||
-        out->bytes < (uint64_t)n_tok * out_dim * sizeof(float) ||
-        q_half->bytes < (uint64_t)n_tok * out_dim * sizeof(__half)) return 0;
-    const uint64_t blocks = (in_dim + 31u) / 32u;
-    if (weight_offset > model_size || out_dim > UINT64_MAX / (blocks * 34u)) return 0;
-    const uint64_t weight_bytes = out_dim * blocks * 34u;
-    if (weight_bytes > model_size - weight_offset) return 0;
-    const __half *w_f16 = hip_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, "attn_q_b");
-    if (!w_f16) return 0;
-    const uint64_t xh_count = (uint64_t)n_tok * in_dim;
-    __half *xh = (__half *)hip_tmp_alloc(xh_count * sizeof(__half), "attn q_b f16 activations");
-    if (!xh) return 0;
-    f32_to_f16_kernel<<<(xh_count + 255u) / 256u, 256>>>(xh, (const float *)x->ptr, xh_count);
-    if (!hip_ok(hipGetLastError(), "attn q_b f16 activation convert launch")) return 0;
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    hipblasStatus_t st = hipblasGemmEx(g_hipblas,
-                                     HIPBLAS_OP_T,
-                                     HIPBLAS_OP_N,
-                                     (int)out_dim,
-                                     (int)n_tok,
-                                     (int)in_dim,
-                                     &alpha,
-                                     w_f16,
-                                     HIPBLAS_R_16F,
-                                     (int)in_dim,
-                                     xh,
-                                     HIPBLAS_R_16F,
-                                     (int)in_dim,
-                                     &beta,
-                                     q_half->ptr,
-                                     HIPBLAS_R_16F,
-                                     (int)out_dim,
-                                     HIPBLAS_COMPUTE_32F,
-                                     HIPBLAS_GEMM_DEFAULT);
-    if (st != HIPBLAS_STATUS_SUCCESS) {
-        fprintf(stderr, "ds4: " DS4_GPU_BLAS_NAME " attn q_b f16-out matmul failed: status %d\n", (int)st);
-        return 0;
-    }
-    head_rms_norm_rope_tail_from_half_kernel<<<n_tok * n_head, 256>>>(
-            (float *)out->ptr, (const __half *)q_half->ptr, n_tok, n_head, head_dim, n_rot,
-            pos0, n_ctx_orig, inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,
-            beta_fast, beta_slow, eps);
-    return hip_ok(hipGetLastError(), "attn q_b f16-out head_rms_norm_rope launch");
-}
-
 static int hip_rope_tail_stride_tensor(ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim, uint32_t n_rot, uint32_t pos0, uint32_t pos_stride, uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
     if (!x || n_rot > head_dim || (n_rot & 1) || x->bytes < (uint64_t)n_tok * n_head * head_dim * sizeof(float)) return 0;
     uint32_t pairs = n_tok * n_head * (n_rot / 2);

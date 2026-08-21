@@ -5,11 +5,12 @@ set(DEEPSEEK_V4_FLASH_ROCM_DIR
 
 add_library(strix_deepseek_v4_flash STATIC
   engine.cpp
-  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/model.c
-  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/single_node.c
-  ${DEEPSEEK_V4_FLASH_ROCM_DIR}/backend.hip.cpp
-  ${DEEPSEEK_V4_FLASH_ROCM_DIR}/device.cpp
-  ${DEEPSEEK_V4_FLASH_ROCM_DIR}/unavailable.cpp)
+  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/model_data.cpp
+  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/rocm_graph.cpp
+  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/sampling.cpp
+  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/session.cpp
+  ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/tokenizer.cpp
+  ${DEEPSEEK_V4_FLASH_ROCM_DIR}/backend.hip.cpp)
 
 set_source_files_properties(
   ${DEEPSEEK_V4_FLASH_ROCM_DIR}/backend.hip.cpp
@@ -20,7 +21,6 @@ target_compile_definitions(strix_deepseek_v4_flash PRIVATE
   DS4_ROCM_BUILD=1)
 
 target_compile_options(strix_deepseek_v4_flash PRIVATE
-  $<$<COMPILE_LANGUAGE:C>:-O3;-ffast-math;-fno-finite-math-only>
   $<$<COMPILE_LANGUAGE:CXX>:-O3;-ffast-math;-fno-finite-math-only>
   $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-command-line-argument>)
 

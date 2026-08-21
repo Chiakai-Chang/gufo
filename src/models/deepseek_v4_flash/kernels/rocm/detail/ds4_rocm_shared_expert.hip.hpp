@@ -40,7 +40,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         const char *wg = hip_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8");
         const char *wu = hip_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8");
         if (!wg || !wu) return 0;
-        const int store_gate_up = (g_quality_mode || hip_runtime_config()->graph_dump) ? 1 : 0;
+        constexpr int store_gate_up = 0;
         const unsigned rows_per_block = 32u;
         shared_gate_up_swiglu_q8_0_rows_w32_kernel<<<
                 (unsigned)((out_dim + rows_per_block - 1u) / rows_per_block),
@@ -66,26 +66,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp, 1.0f);
 }
 
-extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok,
-        float                   clamp) {
-    (void)gate; (void)up; (void)mid; (void)model_map; (void)model_size;
-    (void)gate_offset; (void)up_offset; (void)in_dim; (void)out_dim;
-    (void)x; (void)n_tok; (void)clamp;
-    return 0;
-}
-
-extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
+static int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -97,103 +78,6 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         uint64_t                n_tok);
-
-extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
-        ds4_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        float                   clamp) {
-    if (!mid || out_dim == 0u || out_dim > UINT32_MAX) return 0;
-    uint64_t tmp_bytes = 0;
-    if (!hip_u64_mul3_checked(2u, out_dim, sizeof(float), &tmp_bytes)) return 0;
-    void *tmp = hip_tmp_alloc(tmp_bytes, "shared gate/up mid wrapper");
-    if (!tmp) return 0;
-    ds4_gpu_tensor gate_tmp = { tmp, out_dim * sizeof(float), 0 };
-    ds4_gpu_tensor up_tmp = { (char *)tmp + out_dim * sizeof(float),
-                              out_dim * sizeof(float),
-                              0 };
-    return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(&gate_tmp,
-                                                     &up_tmp,
-                                                     mid,
-                                                     model_map,
-                                                     model_size,
-                                                     gate_offset,
-                                                     up_offset,
-                                                     in_dim,
-                                                     out_dim,
-                                                     x,
-                                                     clamp);
-}
-
-extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        float                   clamp) {
-    return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(gate,
-                                                     up,
-                                                     mid,
-                                                     model_map,
-                                                     model_size,
-                                                     gate_offset,
-                                                     up_offset,
-                                                     in_dim,
-                                                     out_dim,
-                                                     x,
-                                                     clamp);
-}
-
-extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok,
-        float                   clamp) {
-    if (n_tok == 1u) {
-        return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(gate,
-                                                         up,
-                                                         mid,
-                                                         model_map,
-                                                         model_size,
-                                                         gate_offset,
-                                                         up_offset,
-                                                         in_dim,
-                                                         out_dim,
-                                                         x,
-                                                         clamp);
-    }
-    if (clamp > 1.0e-6f) return 0;
-    return ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(gate,
-                                                           up,
-                                                           mid,
-                                                           model_map,
-                                                           model_size,
-                                                           gate_offset,
-                                                           up_offset,
-                                                           in_dim,
-                                                           out_dim,
-                                                           x,
-                                                           n_tok);
-}
 
 static hipStream_t g_shared_gate_up_stream = NULL;
 static hipEvent_t g_shared_gate_up_ready_event = NULL;
@@ -254,140 +138,7 @@ static void hip_shared_gate_up_async_cleanup(void) {
     }
 }
 
-extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_async_tensor(
-        ds4_gpu_tensor       *gate,
-        ds4_gpu_tensor       *up,
-        ds4_gpu_tensor       *mid,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                gate_offset,
-        uint64_t                up_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        float                   clamp) {
-    if (g_quality_mode || hip_runtime_config()->graph_dump) return 0;
-    if (g_shared_gate_up_pending && !hip_shared_gate_up_async_wait_internal()) return 0;
-    if (!gate || !up || !mid || !model_map || !x ||
-        in_dim == 0u || out_dim == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX) {
-        return 0;
-    }
-    const uint64_t blocks = (in_dim + 31u) / 32u;
-    uint64_t row_bytes = 0;
-    uint64_t weight_bytes = 0;
-    if (!hip_u64_mul_checked(blocks, 34u, &row_bytes) ||
-        !hip_u64_mul_checked(out_dim, row_bytes, &weight_bytes)) {
-        return 0;
-    }
-    if (g_quality_mode ||
-        !gate || !up || !mid || !model_map || !x ||
-        in_dim == 0u || out_dim == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
-        gate_offset > model_size || up_offset > model_size ||
-        weight_bytes > model_size - gate_offset ||
-        weight_bytes > model_size - up_offset ||
-        x->bytes < in_dim * sizeof(float) ||
-        gate->bytes < out_dim * sizeof(float) ||
-        up->bytes < out_dim * sizeof(float) ||
-        mid->bytes < out_dim * sizeof(float)) {
-        return 0;
-    }
-    const char *wg = hip_model_range_ptr(model_map, gate_offset, weight_bytes, "shared_gate_q8_pair_async");
-    const char *wu = hip_model_range_ptr(model_map, up_offset, weight_bytes, "shared_up_q8_pair_async");
-    if (!wg || !wu) return 0;
-    if (!g_shared_gate_up_stream) {
-        int least_priority = 0;
-        int greatest_priority = 0;
-#ifdef __HIP_PLATFORM_AMD__
-        hipError_t err = hipDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
-        if (err == hipSuccess) {
-            err = hipStreamCreateWithPriority(&g_shared_gate_up_stream, hipStreamNonBlocking, least_priority);
-        } else {
-            (void)hipGetLastError();
-            err = hipStreamCreateWithFlags(&g_shared_gate_up_stream, hipStreamNonBlocking);
-        }
-        if (err != hipSuccess) return 0;
-#else
-        hipError_t err = hipDeviceGetStreamPriorityRange(&least_priority, &greatest_priority);
-        if (err == hipSuccess) {
-            err = hipStreamCreateWithPriority(&g_shared_gate_up_stream, hipStreamNonBlocking, least_priority);
-        } else {
-            (void)hipGetLastError();
-            err = hipStreamCreateWithFlags(&g_shared_gate_up_stream, hipStreamNonBlocking);
-        }
-        if (err != hipSuccess) return 0;
-#endif
-    }
-    if (!g_shared_gate_up_ready_event) {
-        hipError_t err = hipEventCreateWithFlags(&g_shared_gate_up_ready_event, hipEventDisableTiming);
-        if (err != hipSuccess) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async event create failed: %s\n", hipGetErrorString(err));
-            (void)hipGetLastError();
-            return 0;
-        }
-    }
-    /*
-     * This stream is intentionally non-blocking so it can overlap routed MoE.
-     * Non-blocking streams do not inherit default-stream ordering, so explicitly
-     * wait until the default-stream producer of x (ffn_norm) has completed before
-     * quantizing it here.
-     */
-    hipError_t dep_err = hipEventRecord(g_shared_gate_up_ready_event, 0);
-    if (dep_err != hipSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async dependency record failed: %s\n", hipGetErrorString(dep_err));
-        (void)hipGetLastError();
-        return 0;
-    }
-#ifdef __HIP_PLATFORM_AMD__
-    dep_err = hipStreamWaitEvent(g_shared_gate_up_stream, g_shared_gate_up_ready_event, 0);
-#else
-    dep_err = hipStreamWaitEvent(g_shared_gate_up_stream, g_shared_gate_up_ready_event, 0);
-#endif
-    if (dep_err != hipSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "shared gate/up async dependency wait failed: %s\n", hipGetErrorString(dep_err));
-        (void)hipGetLastError();
-        return 0;
-    }
-    const uint64_t xq_bytes = blocks * 32u;
-    const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
-    const uint64_t tmp_bytes = scale_offset + blocks * sizeof(float);
-    void *tmp = hip_shared_gate_up_async_tmp_alloc(tmp_bytes);
-    if (!tmp) return 0;
-    int8_t *xq = (int8_t *)tmp;
-    float *xscale = (float *)((char *)tmp + scale_offset);
-    const int use_dp4a = 1;
-    dim3 qgrid((unsigned)blocks, 1, 1);
-    quantize_q8_0_f32_kernel<<<qgrid, 32, 0, g_shared_gate_up_stream>>>(xq, xscale, (const float *)x->ptr, in_dim, blocks);
-    if (!hip_ok(hipGetLastError(), "shared gate/up async quantize launch")) return 0;
-    matmul_q8_0_pair_preq_warp8_kernel<<<((unsigned)out_dim + 7u) / 8u, 256, 0, g_shared_gate_up_stream>>>(
-            (float *)gate->ptr,
-            (float *)up->ptr,
-            reinterpret_cast<const unsigned char *>(wg),
-            reinterpret_cast<const unsigned char *>(wu),
-            xq,
-            xscale,
-            in_dim,
-            out_dim,
-            out_dim,
-            blocks,
-            use_dp4a);
-    if (!hip_ok(hipGetLastError(), "shared gate/up async pair launch")) return 0;
-    swiglu_kernel<<<((unsigned)out_dim + 255u) / 256u, 256, 0, g_shared_gate_up_stream>>>(
-            (float *)mid->ptr,
-            (const float *)gate->ptr,
-            (const float *)up->ptr,
-            (uint32_t)out_dim,
-            clamp,
-            1.0f);
-    if (!hip_ok(hipGetLastError(), "shared gate/up async swiglu launch")) return 0;
-    g_shared_gate_up_pending = 1;
-    return 1;
-}
-
-extern "C" int ds4_gpu_shared_gate_up_async_wait(void) {
-    return hip_shared_gate_up_async_wait_internal();
-}
-
-extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
+static int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
         ds4_gpu_tensor       *mid,
@@ -427,7 +178,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor(
                     (uint32_t)((n_tok + tile - 1u) / tile),
                     1u);
     const size_t shmem = (size_t)tile * block_tile * 32u * sizeof(float);
-    const int store_gate_up = (g_quality_mode || hip_runtime_config()->graph_dump) ? 1 : 0;
+    constexpr int store_gate_up = 0;
 #define DS4_LAUNCH_SHARED_GU_BATCH(TT, BT) \
     shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel<TT, BT><<<grid, rows_per_block * 32u, shmem>>>( \
             (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr, \

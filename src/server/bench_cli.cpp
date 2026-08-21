@@ -246,7 +246,6 @@ int RunDeepSeekBenchmark(
           .max_context = static_cast<std::uint32_t>(required_context),
           .prefill_chunk = 2048,
           .power_percent = 100,
-          .warm_weights = false,
       },
       &error);
   if (model == nullptr) {

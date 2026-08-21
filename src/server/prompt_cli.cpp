@@ -101,7 +101,6 @@ int RunDeepSeekPrompt(const PromptOptions& opt,
           .max_context = kDefaultContext,
           .prefill_chunk = 2048,
           .power_percent = 100,
-          .warm_weights = false,
       },
       &error);
   if (model == nullptr) {

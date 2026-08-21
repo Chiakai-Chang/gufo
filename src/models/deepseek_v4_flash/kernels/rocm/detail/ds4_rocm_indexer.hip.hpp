@@ -868,7 +868,7 @@ static int indexer_scores_launch(
                                                          scale, causal ? 1 : 0);
         return hip_ok(hipGetLastError(), "indexer score one direct launch");
     }
-    if (!g_quality_mode && head_dim == 128u && n_head == 64u) {
+    if (head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
         indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
                                                      (const float *)q->ptr,
@@ -1154,79 +1154,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                          (const float *)scores->ptr,
                                          n_comp, n_tokens, top_k);
     return hip_ok(hipGetLastError(), "indexer topk launch");
-}
-
-extern "C" int ds4_gpu_argmax_tensor(
-        ds4_gpu_tensor       *out_idx,
-        const ds4_gpu_tensor *logits,
-        uint32_t                n_vocab) {
-    uint64_t logits_bytes = 0;
-    if (!out_idx || !logits || n_vocab == 0u ||
-        out_idx->bytes < sizeof(int32_t) ||
-        !hip_u64_mul3_checked(n_vocab, 1u, sizeof(float), &logits_bytes) ||
-        logits->bytes < logits_bytes) {
-        return 0;
-    }
-    argmax_kernel<<<1, 1024>>>((int32_t *)out_idx->ptr,
-                               (const float *)logits->ptr,
-                               n_vocab);
-    return hip_ok(hipGetLastError(), "argmax launch");
-}
-
-extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
-        ds4_gpu_tensor       *out_idx,
-        const ds4_gpu_tensor *logits_row,
-        const void           *model_map,
-        uint64_t              model_size,
-        uint64_t              w1_offset,
-        uint64_t              w2_offset,
-        uint32_t              prev_token,
-        uint32_t              vocab,
-        uint32_t              rank) {
-    if (!out_idx || !logits_row || !model_map || vocab == 0 ||
-        rank == 0 || (rank & 31u) != 0u || rank > 256u ||
-        out_idx->bytes < sizeof(unsigned long long) ||
-        logits_row->bytes < (uint64_t)vocab * sizeof(float)) {
-        return 0;
-    }
-    const uint32_t rank_blocks = rank / 32u;
-    const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
-    if (prev_token > UINT64_MAX / row_bytes ||
-        vocab > UINT64_MAX / row_bytes) {
-        return 0;
-    }
-    const uint64_t w1_row_offset = (uint64_t)prev_token * row_bytes;
-    const uint64_t w2_bytes = (uint64_t)vocab * row_bytes;
-    if (w1_offset > model_size ||
-        w1_row_offset > model_size - w1_offset ||
-        row_bytes > model_size - w1_offset - w1_row_offset ||
-        w2_offset > model_size || w2_bytes > model_size - w2_offset) {
-        return 0;
-    }
-    const unsigned char *w1_row =
-        (const unsigned char *)hip_model_range_ptr(
-            model_map,
-            w1_offset + w1_row_offset,
-            row_bytes,
-            "markov_w1_row");
-    const unsigned char *w2 =
-        (const unsigned char *)hip_model_range_ptr(
-            model_map, w2_offset, w2_bytes, "markov_w2");
-    if (!w1_row || !w2) return 0;
-
-    if (!hip_ok(hipMemsetAsync(out_idx->ptr, 0,
-                                 sizeof(unsigned long long)),
-                 "DSpark markov argmax clear")) {
-        return 0;
-    }
-    dspark_markov_argmax_kernel<<<128, 256>>>(
-            (unsigned long long *)out_idx->ptr,
-            (const float *)logits_row->ptr,
-            w1_row,
-            w2,
-            vocab,
-            rank_blocks);
-    return hip_ok(hipGetLastError(), "DSpark markov argmax launch");
 }
 
 extern "C" int ds4_gpu_dsv4_topk_mask_tensor(

@@ -188,7 +188,7 @@ static int hip_compressor_shape_supported(uint32_t head_dim, uint32_t ratio) {
     return head_dim <= UINT32_MAX / coff;
 }
 
-extern "C" int ds4_gpu_compressor_store_batch_tensor(
+static int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,
         ds4_gpu_tensor       *state_kv,

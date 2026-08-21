@@ -61,7 +61,6 @@ int main() {
                                  .max_context = 512,
                                  .prefill_chunk = 512,
                                  .power_percent = 100,
-                                 .warm_weights = false,
                              },
                              &error);
     Expect(model != nullptr, error);

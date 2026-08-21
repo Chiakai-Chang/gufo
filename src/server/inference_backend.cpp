@@ -471,7 +471,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .max_context = max_context,
             .prefill_chunk = 2048,
             .power_percent = 100,
-            .warm_weights = false,
         },
         &load_error);
     if (model == nullptr) {

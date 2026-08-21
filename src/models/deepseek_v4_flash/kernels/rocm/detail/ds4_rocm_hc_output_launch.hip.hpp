@@ -1,29 +1,3 @@
-extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *row, uint32_t n_embd, uint32_t n_hc) {
-    uint64_t n = 0;
-    if (n_embd == 0 || n_hc == 0 ||
-        !hip_u64_mul_checked(n_embd, n_hc, &n) ||
-        !hip_tensor_has_f32(row, n_embd) || !hip_tensor_has_f32(out, n)) {
-        return 0;
-    }
-    repeat_hc_kernel<<<(n + 255) / 256, 256>>>((float *)out->ptr, (const float *)row->ptr, n_embd, n_hc);
-    return hip_ok(hipGetLastError(), "repeat_hc launch");
-}
-
-extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *rows, uint32_t n_tokens, uint32_t n_embd, uint32_t n_hc) {
-    uint64_t rows_elems = 0;
-    uint64_t n = 0;
-    if (n_tokens == 0 || n_embd == 0 || n_hc == 0 ||
-        !hip_u64_mul_checked(n_tokens, n_embd, &rows_elems) ||
-        !hip_u64_mul_checked(rows_elems, n_hc, &n) ||
-        !hip_tensor_has_f32(rows, rows_elems) || !hip_tensor_has_f32(out, n)) {
-        return 0;
-    }
-    const uint64_t blocks = (n + 255u) / 256u;
-    if (blocks > UINT32_MAX) return 0;
-    repeat_hc_rows_kernel<<<(unsigned)blocks, 256>>>((float *)out->ptr, (const float *)rows->ptr, n_tokens, n_embd, n_hc);
-    return hip_ok(hipGetLastError(), "repeat_hc_rows launch");
-}
-
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
@@ -288,38 +262,6 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
                                                     mix_hc, mix_hc, 0);
     return hip_ok(hipGetLastError(), "hc_expand_split launch");
 }
-extern "C" int ds4_gpu_hc_expand_split_half_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out_h, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    uint64_t n_tokens64 = 0, flat_half_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
-    if (!out_hc || !block_out_h || !residual_hc || !split ||
-        !hip_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
-        !hip_hc_mix_width(n_hc, &mix_hc64) ||
-        !hip_u64_mul3_checked(n_tokens64, n_embd, sizeof(__half), &flat_half_bytes) ||
-        !hip_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
-        !hip_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
-        block_out_h->bytes < flat_half_bytes || residual_hc->bytes < hc_bytes || split->bytes < split_bytes) return 0;
-    uint32_t n_tokens = (uint32_t)n_tokens64;
-    if (n_hc == 4u) {
-        const uint64_t n = (uint64_t)n_tokens * n_embd;
-        hc_expand4_half_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr,
-                                                         (const __half *)block_out_h->ptr,
-                                                         (const float *)residual_hc->ptr,
-                                                         (const float *)split->ptr,
-                                                         n_embd,
-                                                         n_tokens);
-        return hip_ok(hipGetLastError(), "hc_expand_split_half4 launch");
-    }
-    uint32_t mix_hc = (uint32_t)mix_hc64;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    const float *base = (const float *)split->ptr;
-    hc_expand_half_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
-                                                         (const __half *)block_out_h->ptr,
-                                                         (const float *)residual_hc->ptr,
-                                                         base + n_hc,
-                                                         base + 2u * n_hc,
-                                                         n_embd, n_hc, n_tokens,
-                                                         mix_hc, mix_hc);
-    return hip_ok(hipGetLastError(), "hc_expand_split_half launch");
-}
 extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
     uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
     if (!out_hc || !block_out || !block_add || !residual_hc || !split ||
@@ -354,42 +296,6 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
                                                     n_embd, n_hc, n_tokens,
                                                     mix_hc, mix_hc, 1);
     return hip_ok(hipGetLastError(), "hc_expand_add_split launch");
-}
-extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add_h, const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
-    uint64_t n_tokens64 = 0, flat_bytes = 0, flat_half_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
-    if (!out_hc || !block_out || !block_add_h || !residual_hc || !split ||
-        !hip_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
-        !hip_hc_mix_width(n_hc, &mix_hc64) ||
-        !hip_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
-        !hip_u64_mul3_checked(n_tokens64, n_embd, sizeof(__half), &flat_half_bytes) ||
-        !hip_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
-        !hip_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
-        block_out->bytes < flat_bytes || block_add_h->bytes < flat_half_bytes ||
-        residual_hc->bytes < hc_bytes || split->bytes < split_bytes) return 0;
-    uint32_t n_tokens = (uint32_t)n_tokens64;
-    if (n_hc == 4u) {
-        const uint64_t n = (uint64_t)n_tokens * n_embd;
-        hc_expand4_add_half_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr,
-                                                             (const float *)block_out->ptr,
-                                                             (const __half *)block_add_h->ptr,
-                                                             (const float *)residual_hc->ptr,
-                                                             (const float *)split->ptr,
-                                                             n_embd,
-                                                             n_tokens);
-        return hip_ok(hipGetLastError(), "hc_expand_add_split_half4 launch");
-    }
-    uint32_t mix_hc = (uint32_t)mix_hc64;
-    uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-    const float *base = (const float *)split->ptr;
-    hc_expand_add_half_kernel<<<(n_elem + 255) / 256, 256>>>((float *)out_hc->ptr,
-                                                             (const float *)block_out->ptr,
-                                                             (const __half *)block_add_h->ptr,
-                                                             (const float *)residual_hc->ptr,
-                                                             base + n_hc,
-                                                             base + 2u * n_hc,
-                                                             n_embd, n_hc, n_tokens,
-                                                             mix_hc, mix_hc);
-    return hip_ok(hipGetLastError(), "hc_expand_add_split_half_add launch");
 }
 extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,

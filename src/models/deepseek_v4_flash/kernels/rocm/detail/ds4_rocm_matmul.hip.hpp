@@ -294,20 +294,6 @@ static int hip_matmul_q8_0_tensor_f16_gemm_out_half(
     return 0;
 }
 
-extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
-        ds4_gpu_tensor       *out_h,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok) {
-    return hip_matmul_q8_0_tensor_f16_gemm_out_half(out_h, model_map, model_size,
-                                                     weight_offset, in_dim, out_dim,
-                                                     x, n_tok, "q8_f16_out");
-}
-
 static int hip_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok, const char *label) {
     if (!out || !x || !model_map ||
         in_dim == 0u || out_dim == 0u || n_tok == 0u ||
@@ -321,7 +307,7 @@ static int hip_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model
         !hip_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
         !hip_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
         x->bytes < x_bytes || out->bytes < out_bytes) return 0;
-    if (n_tok > 1 && !g_quality_mode &&
+    if (n_tok > 1 &&
         hip_runtime_config()->shared_down_hipblas && in_dim == 2048u && out_dim == 4096u &&
         hip_matmul_q8_0_tensor_f16_gemm(out, model_map, model_size, weight_offset,
                                          in_dim, out_dim, x, n_tok, label ? label : "shared_expert")) {
@@ -388,7 +374,7 @@ static int hip_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *model
     }
     if (n_tok > 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-        if (!g_quality_mode && (in_dim % 32u) == 0u &&
+        if ((in_dim % 32u) == 0u &&
             out_dim >= 1024u &&
             n_tok >= 256u &&
             in_dim <= UINT32_MAX && out_dim <= UINT32_MAX && n_tok <= UINT32_MAX) {
@@ -528,61 +514,7 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(ds4_gpu_tensor *out, const void *model
                                            in_dim, out_dim, x, n_tok, "q8_0");
 }
 
-extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok) {
-    return hip_matmul_q8_0_tensor_labeled(out,
-                                           model_map,
-                                           model_size,
-                                           weight_offset,
-                                           in_dim,
-                                           out_dim,
-                                           x,
-                                           n_tok,
-                                           "q8_0_decode");
-}
-
-extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
-        ds4_gpu_tensor       *out,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                weight_offset,
-        uint64_t                in_dim,
-        uint64_t                out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t                n_tok) {
-    return hip_matmul_q8_0_tensor_labeled(out,
-                                           model_map,
-                                           model_size,
-                                           weight_offset,
-                                           in_dim,
-                                           out_dim,
-                                           x,
-                                           n_tok,
-                                           "q8_0_decode_model_view");
-}
-
-extern "C" int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
-        ds4_gpu_tensor *out,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_offset,
-        uint64_t in_dim,
-        uint64_t out_dim,
-        const ds4_gpu_tensor *x,
-        uint64_t n_tok) {
-    (void)out; (void)model_map; (void)model_size; (void)weight_offset;
-    (void)in_dim; (void)out_dim; (void)x; (void)n_tok;
-    return 0;
-}
-
-extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
+static int ds4_gpu_matmul_q8_0_pair_tensor(
         ds4_gpu_tensor *out0,
         ds4_gpu_tensor *out1,
         const void *model_map,
@@ -849,8 +781,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(ds4_gpu_tensor *out, const void *model_
      * 32-thread row kernel is at least as fast on gfx1151; keep shared-X for
      * compressor/indexer F16 decode where reusing x across rows is the win. */
     const bool f16_decode_router_shape = (in_dim == 4096u && out_dim == 256u);
-    if (n_tok == 1u && !g_quality_mode && !hip_runtime_config()->graph_dump &&
-        !f16_decode_router_shape) {
+    if (n_tok == 1u && !f16_decode_router_shape) {
         if (in_dim <= 8192u && in_dim * sizeof(float) <= 65536u) {
             const uint32_t rows_per_block = 32u;
             matmul_f16_f32_sharedx_warp_rows_w32_kernel<<<
@@ -906,17 +837,15 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     const __half *w0 = (const __half *)hip_model_range_ptr(model_map, weight0_offset, weight_bytes, "f16_pair0");
     const __half *w1 = (const __half *)hip_model_range_ptr(model_map, weight1_offset, weight_bytes, "f16_pair1");
     if (!w0 || !w1) return 0;
-    if (!g_quality_mode && !hip_runtime_config()->graph_dump) {
-        if (in_dim <= 8192u && in_dim * sizeof(float) <= 65536u) {
-            const uint32_t rows_per_block = 32u;
-            matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<
-                    ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
-                    rows_per_block * 32u,
-                    (size_t)in_dim * sizeof(float)>>>(
-                    (float *)out0->ptr, (float *)out1->ptr, w0, w1,
-                    (const float *)x->ptr, (uint32_t)in_dim, out_dim);
-            return hip_ok(hipGetLastError(), "matmul_f16_pair sharedx launch");
-        }
+    if (in_dim <= 8192u && in_dim * sizeof(float) <= 65536u) {
+        const uint32_t rows_per_block = 32u;
+        matmul_f16_pair_f32_sharedx_warp_rows_w32_kernel<<<
+                ((unsigned)out_dim + rows_per_block - 1u) / rows_per_block,
+                rows_per_block * 32u,
+                (size_t)in_dim * sizeof(float)>>>(
+                (float *)out0->ptr, (float *)out1->ptr, w0, w1,
+                (const float *)x->ptr, (uint32_t)in_dim, out_dim);
+        return hip_ok(hipGetLastError(), "matmul_f16_pair sharedx launch");
     }
     matmul_f16_pair_ordered_chunks_kernel<<<(unsigned)out_dim, 32>>>(
         (float *)out0->ptr,
@@ -928,40 +857,6 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         out_dim,
         out_dim);
     return hip_ok(hipGetLastError(), "matmul_f16_pair_ordered_chunks launch");
-}
-
-extern "C" int ds4_gpu_matmul_f16_pair_compressor_store_tensor(
-        ds4_gpu_tensor *out_kv,
-        ds4_gpu_tensor *out_score,
-        ds4_gpu_tensor *state_kv,
-        ds4_gpu_tensor *state_score,
-        const void *model_map,
-        uint64_t model_size,
-        uint64_t weight_kv_offset,
-        uint64_t weight_score_offset,
-        uint64_t ape_offset,
-        uint32_t ape_type,
-        uint64_t in_dim,
-        uint32_t width,
-        const ds4_gpu_tensor *x,
-        uint32_t ratio,
-        uint32_t pos) {
-    (void)out_kv;
-    (void)out_score;
-    (void)state_kv;
-    (void)state_score;
-    (void)model_map;
-    (void)model_size;
-    (void)weight_kv_offset;
-    (void)weight_score_offset;
-    (void)ape_offset;
-    (void)ape_type;
-    (void)in_dim;
-    (void)width;
-    (void)x;
-    (void)ratio;
-    (void)pos;
-    return 0;
 }
 
 extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim, const ds4_gpu_tensor *x, uint64_t n_tok) {

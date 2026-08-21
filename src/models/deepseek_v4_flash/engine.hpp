@@ -10,13 +10,14 @@
 #include <string_view>
 #include <vector>
 
+#include "src/models/deepseek_v4_flash/runtime/model.h"
+
 namespace strix::models::deepseek_v4_flash {
 
 struct ModelOptions {
   std::uint32_t max_context = 4096;
   std::uint32_t prefill_chunk = 2048;
   int power_percent = 100;
-  bool warm_weights = false;
 };
 
 struct ChatMessage {
@@ -56,11 +57,9 @@ public:
   [[nodiscard]] std::uint32_t MaxContext() const noexcept;
 
 private:
-  struct Impl;
+  Model(ds4_engine* engine, ModelOptions options);
 
-  Model(std::unique_ptr<Impl> impl, ModelOptions options);
-
-  std::unique_ptr<Impl> impl_;
+  ds4_engine* engine_ = nullptr;
   ModelOptions options_;
 
   friend class Session;
@@ -97,12 +96,11 @@ public:
   [[nodiscard]] std::uint64_t PayloadBytes() const;
 
 private:
-  struct Impl;
-
-  Session(std::shared_ptr<Model> model, std::unique_ptr<Impl> impl);
+  Session(std::shared_ptr<Model> model, ds4_session* session);
 
   std::shared_ptr<Model> model_;
-  std::unique_ptr<Impl> impl_;
+  ds4_session* session_ = nullptr;
+  CancellationCheck is_cancelled_;
 
   friend class Model;
 };
@@ -119,11 +117,9 @@ public:
   [[nodiscard]] std::uint64_t SizeBytes() const noexcept;
 
 private:
-  struct Impl;
+  explicit SessionSnapshot(ds4_session_snapshot snapshot);
 
-  explicit SessionSnapshot(std::unique_ptr<Impl> impl);
-
-  std::unique_ptr<Impl> impl_;
+  ds4_session_snapshot snapshot_{};
 
   friend class Session;
 };

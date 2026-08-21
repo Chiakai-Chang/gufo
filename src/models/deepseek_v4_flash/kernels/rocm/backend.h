@@ -30,7 +30,7 @@ static __device__ __forceinline__ int32_t __vsub4(int32_t a, int32_t b) {
 // __dp4a: dot product of 4 signed int8s packed in an int32.
 // gfx11-class AMD GPUs expose this as a single v_dot4_i32_i8 instruction;
 // using the clang builtin avoids expanding every Q8/Q8_K dot into scalar byte
-// multiplies in the ROCm compatibility layer.
+// multiplies in the resident ROCm implementation.
 static __device__ __forceinline__ int32_t __dp4a(int32_t a, int32_t b, int32_t c) {
     union ds4_i8x4_bits { int32_t i; char4 v; } av, bv;
     av.i = a;
