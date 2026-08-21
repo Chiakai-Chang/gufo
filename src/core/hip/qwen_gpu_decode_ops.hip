@@ -280,8 +280,9 @@ template<std::uint32_t WavesPerBlock>
 __launch_bounds__(WavesPerBlock * 32, 4) __global__
     void Wave32GEMVKernel_1Row(const hip_bfloat16* __restrict__ A,
                                const float* __restrict__ x,
-                               float* __restrict__ y, std::size_t M,
-                               std::size_t K) {
+                               float* __restrict__ y,
+                               const float* __restrict__ residual,
+                               std::size_t M, std::size_t K) {
   const std::size_t tid = threadIdx.x;
   const std::size_t lane_id = tid & 31u;
   const std::size_t warp_id = tid >> 5u;
@@ -320,7 +321,8 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   }
 
   if (lane_id == 0) {
-    y[m] = dot;
+    const float r = (residual != nullptr) ? residual[m] : 0.0F;
+    y[m] = dot + r;
   }
 }
 
@@ -522,8 +524,9 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
 
 __global__ void FastGEMVBlockKernel(const void* __restrict__ A, bool is_bf16,
                                     const float* __restrict__ x,
-                                    float* __restrict__ y, std::size_t M,
-                                    std::size_t K) {
+                                    float* __restrict__ y,
+                                    const float* __restrict__ residual,
+                                    std::size_t M, std::size_t K) {
   const std::size_t m = blockIdx.x;
   if (m >= M)
     return;
@@ -593,7 +596,8 @@ __global__ void FastGEMVBlockKernel(const void* __restrict__ A, bool is_bf16,
       block_sum += __shfl_xor(block_sum, offset);
     }
     if (lane_id == 0) {
-      y[m] = block_sum;
+      const float r = (residual != nullptr) ? residual[m] : 0.0F;
+      y[m] = block_sum + r;
     }
   }
 }
@@ -1738,7 +1742,7 @@ void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
       const auto* A_bf16 = static_cast<const hip_bfloat16*>(A);
       const std::size_t grid = (M + kWavesPerBlock - 1) / kWavesPerBlock;
       Wave32GEMVKernel_1Row<kWavesPerBlock>
-          <<<grid, kBlockThreads, 0, stream>>>(A_bf16, x, y, M, K);
+          <<<grid, kBlockThreads, 0, stream>>>(A_bf16, x, y, nullptr, M, K);
       return;
     }
     case detail::GemvStrategy::kBaselineBlock:
@@ -1747,7 +1751,34 @@ void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
   }
 
   const std::size_t block_size = K >= kLargeGemvInput ? 512 : 256;
-  FastGEMVBlockKernel<<<M, block_size, 0, stream>>>(A, is_bf16, x, y, M, K);
+  FastGEMVBlockKernel<<<M, block_size, 0, stream>>>(A, is_bf16, x, y, nullptr,
+                                                    M, K);
+}
+
+// opt-c010-ssm-gate-residual: GEMV with an optional residual-add epilogue
+// (y = A*x + residual). The dispatch mirrors LaunchGEMV; the Wave32 single-row
+// and block strategies gain the residual fold, and the remaining strategies
+// fall back to the single-row residual kernel. Used to fold the post-SSM
+// residual add into the ssm_out GEMV for decode.
+void LaunchGEMVResidual(const void* A, bool is_bf16, const float* x, float* y,
+                        const float* residual, std::size_t M, std::size_t K,
+                        hipStream_t stream) {
+  const auto strategy = detail::SelectGemvStrategy(M, K, is_bf16);
+  detail::EmitGemvDispatch(M, K, is_bf16, detail::GemvStrategyName(strategy));
+  constexpr std::uint32_t kWavesPerBlock = 4;
+  constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+
+  if (strategy != detail::GemvStrategy::kBaselineBlock) {
+    const auto* A_bf16 = static_cast<const hip_bfloat16*>(A);
+    const std::size_t grid = (M + kWavesPerBlock - 1) / kWavesPerBlock;
+    Wave32GEMVKernel_1Row<kWavesPerBlock>
+        <<<grid, kBlockThreads, 0, stream>>>(A_bf16, x, y, residual, M, K);
+    return;
+  }
+
+  const std::size_t block_size = K >= kLargeGemvInput ? 512 : 256;
+  FastGEMVBlockKernel<<<M, block_size, 0, stream>>>(A, is_bf16, x, y, residual,
+                                                    M, K);
 }
 
 void LaunchFusedSSMInputProjections(

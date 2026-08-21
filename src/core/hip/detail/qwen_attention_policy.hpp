@@ -58,6 +58,16 @@ struct AttentionSupportParams {
   return false;
 }
 
+// opt-c010-ssm-gate-residual: fuse the SSM per-head post-RMSNorm + SiLU gate
+// into the DeltaNet recurrence epilogue (prefill, replacing
+// BatchedSSMPostNormGateKernel) and fold the post-SSM residual add into the
+// ssm_out GEMV (decode). Flip to false to revert to the unfused chain
+// (recurrence + post-norm kernel; ssm_out GEMV + residual add), which stays
+// wired as the independent reference.
+[[nodiscard]] constexpr bool ShouldFuseSSMGateResidual() noexcept {
+  return false;
+}
+
 [[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
     std::size_t sequence_length) noexcept {
   if (sequence_length < kSplitKDecodeAttentionMinContext) {

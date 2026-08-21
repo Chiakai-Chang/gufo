@@ -2300,6 +2300,262 @@ void TestBatchedFusedSwiGLUProductionEquivalence() {
   HIP_CHECK(hipFree(d_out_bf16_fus));
 }
 
+// opt-c010-ssm-gate-residual: the fused batched recurrence with the per-head
+// post-RMSNorm + SiLU gate folded into the epilogue must match the unfused
+// chain (BatchedSSMConvRecurrence + BatchedSSMPostNormGateKernel) bit-for-bit.
+void TestBatchedSSMRecurrenceNormGateEquivalence() {
+  constexpr std::size_t batch = 4;
+  constexpr std::uint32_t num_key_heads = 16;
+  constexpr std::uint32_t num_heads = 48;
+  constexpr std::uint32_t key_dim = 128;
+  constexpr std::uint32_t val_dim = 128;
+  constexpr std::size_t qkv_dim =
+      (2 * num_key_heads * key_dim) + (num_heads * val_dim);
+  constexpr std::size_t inner_size = num_heads * val_dim;
+
+  std::vector<float> h_qkv(batch * qkv_dim);
+  for (std::size_t i = 0; i < h_qkv.size(); ++i) {
+    h_qkv[i] = std::sin(static_cast<float>(i) * 0.01F);
+  }
+  std::vector<float> h_weights(qkv_dim * 4, 0.25F);
+  std::vector<float> h_ssm_a(num_heads, -0.05F);
+  std::vector<float> h_ssm_dt(num_heads, 0.01F);
+  std::vector<float> h_ssm_norm(val_dim);
+  std::vector<float> h_gate(batch * inner_size);
+  for (std::size_t i = 0; i < val_dim; ++i) {
+    h_ssm_norm[i] = 0.9F + 0.05F * static_cast<float>(i % 23);
+  }
+  for (std::size_t i = 0; i < batch * inner_size; ++i) {
+    h_gate[i] = 0.5F * std::sin(static_cast<float>(i + 1) * 0.013F);
+  }
+
+  float *d_qkv = nullptr, *d_w = nullptr;
+  float *d_state_ref = nullptr, *d_state_fus = nullptr;
+  float *d_conv_out_ref = nullptr, *d_conv_out_fus = nullptr;
+  float *d_delta_ref = nullptr, *d_delta_fus = nullptr;
+  float *d_alpha = nullptr, *d_beta = nullptr;
+  float *d_ssm_a = nullptr, *d_ssm_dt = nullptr, *d_ssm_norm = nullptr;
+  float* d_gate = nullptr;
+  float *d_out_ref = nullptr, *d_out_fus = nullptr;
+
+  const std::size_t delta_size = num_heads * key_dim * val_dim;
+  HIP_CHECK(hipMalloc(&d_qkv, batch * qkv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_w, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_state_ref, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_state_fus, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_conv_out_ref, batch * qkv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_conv_out_fus, batch * qkv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_delta_ref, delta_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_delta_fus, delta_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_alpha, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_beta, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_a, num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_dt, num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_norm, val_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_gate, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_ref, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_fus, batch * inner_size * sizeof(float)));
+
+  HIP_CHECK(hipMemcpy(d_qkv, h_qkv.data(), batch * qkv_dim * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_w, h_weights.data(), qkv_dim * 4 * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemset(d_state_ref, 0, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMemset(d_state_fus, 0, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMemset(d_delta_ref, 0, delta_size * sizeof(float)));
+  HIP_CHECK(hipMemset(d_delta_fus, 0, delta_size * sizeof(float)));
+  HIP_CHECK(hipMemset(d_alpha, 0, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMemset(d_beta, 0, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_ssm_a, h_ssm_a.data(), num_heads * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_ssm_dt, h_ssm_dt.data(), num_heads * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_ssm_norm, h_ssm_norm.data(), val_dim * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_gate, h_gate.data(), batch * inner_size * sizeof(float),
+                      hipMemcpyHostToDevice));
+
+  // Unfused reference chain: conv + recurrence + post-norm gate.
+  strix::hip::LaunchBatchedSSMConvRecurrence(
+      d_qkv, d_w, d_state_ref, d_conv_out_ref, d_delta_ref, d_alpha, d_beta,
+      d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_ref, 0, batch, qkv_dim,
+      num_key_heads, num_heads, key_dim, val_dim);
+
+  // Fused: conv + recurrence with the norm+gate in the epilogue.
+  strix::hip::LaunchBatchedSSMConvRecurrenceNormGate(
+      d_qkv, d_w, d_state_fus, d_conv_out_fus, d_delta_fus, d_alpha, d_beta,
+      d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_fus, 0, batch, qkv_dim,
+      num_key_heads, num_heads, key_dim, val_dim);
+
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<float> res_ref(batch * inner_size);
+  std::vector<float> res_fus(batch * inner_size);
+  HIP_CHECK(hipMemcpy(res_ref.data(), d_out_ref,
+                      batch * inner_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(res_fus.data(), d_out_fus,
+                      batch * inner_size * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  float max_diff = 0.0F;
+  for (std::size_t i = 0; i < res_ref.size(); ++i) {
+    const float d = std::abs(res_ref[i] - res_fus[i]);
+    if (d > max_diff)
+      max_diff = d;
+  }
+  std::cout << "Batched SSM recurrence+norm+gate fused vs unfused max diff: "
+            << max_diff << "\n";
+  if (max_diff != 0.0F) {
+    std::cerr << "Fused SSM recurrence+norm+gate mismatch\n";
+    std::abort();
+  }
+
+  HIP_CHECK(hipFree(d_qkv));
+  HIP_CHECK(hipFree(d_w));
+  HIP_CHECK(hipFree(d_state_ref));
+  HIP_CHECK(hipFree(d_state_fus));
+  HIP_CHECK(hipFree(d_conv_out_ref));
+  HIP_CHECK(hipFree(d_conv_out_fus));
+  HIP_CHECK(hipFree(d_delta_ref));
+  HIP_CHECK(hipFree(d_delta_fus));
+  HIP_CHECK(hipFree(d_alpha));
+  HIP_CHECK(hipFree(d_beta));
+  HIP_CHECK(hipFree(d_ssm_a));
+  HIP_CHECK(hipFree(d_ssm_dt));
+  HIP_CHECK(hipFree(d_ssm_norm));
+  HIP_CHECK(hipFree(d_gate));
+  HIP_CHECK(hipFree(d_out_ref));
+  HIP_CHECK(hipFree(d_out_fus));
+}
+
+// opt-c010-ssm-gate-residual: the GEMV residual epilogue (y = A*x + residual)
+// must match the unfused chain (GEMV then ResidualAdd) bit-for-bit for both
+// the Wave32 single-row strategy (decode ssm_out shape) and the block
+// strategy.
+void TestGEMVResidualEquivalence() {
+  // Wave32 single-row: BF16 weights, M=5120, K=6144 (decode ssm_out shape).
+  constexpr std::size_t M = 5120;
+  constexpr std::size_t K = 6144;
+  std::vector<std::uint16_t> h_A(M * K);
+  std::vector<float> h_x(K);
+  std::vector<float> h_res(M);
+  for (std::size_t i = 0; i < M * K; ++i) {
+    h_A[i] = FloatToBf16Bits(0.01F * std::sin(static_cast<float>(i) * 0.0007F));
+  }
+  for (std::size_t i = 0; i < K; ++i) {
+    h_x[i] = 0.3F * std::cos(static_cast<float>(i) * 0.011F);
+  }
+  for (std::size_t i = 0; i < M; ++i) {
+    h_res[i] = 0.25F * std::sin(static_cast<float>(i) * 0.017F);
+  }
+
+  void* d_A = nullptr;
+  float *d_x = nullptr, *d_res = nullptr;
+  float *d_y_ref = nullptr, *d_y_fus = nullptr;
+  HIP_CHECK(hipMalloc(&d_A, M * K * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_x, K * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_res, M * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_y_ref, M * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_y_fus, M * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_A, h_A.data(), M * K * sizeof(std::uint16_t),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_res, h_res.data(), M * sizeof(float), hipMemcpyHostToDevice));
+
+  strix::hip::LaunchGEMV(d_A, true, d_x, d_y_ref, M, K);
+  strix::hip::LaunchResidualAdd(d_res, d_y_ref, d_y_ref, M);
+  strix::hip::LaunchGEMVResidual(d_A, true, d_x, d_y_fus, d_res, M, K);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<float> ref(M);
+  std::vector<float> fus(M);
+  HIP_CHECK(
+      hipMemcpy(ref.data(), d_y_ref, M * sizeof(float), hipMemcpyDeviceToHost));
+  HIP_CHECK(
+      hipMemcpy(fus.data(), d_y_fus, M * sizeof(float), hipMemcpyDeviceToHost));
+  float max_diff = 0.0F;
+  for (std::size_t i = 0; i < M; ++i) {
+    const float d = std::abs(ref[i] - fus[i]);
+    if (d > max_diff)
+      max_diff = d;
+  }
+  std::cout << "Wave32 GEMV+residual fused vs unfused max diff: " << max_diff
+            << "\n";
+  if (max_diff != 0.0F) {
+    std::cerr << "Wave32 GEMV+residual mismatch\n";
+    std::abort();
+  }
+
+  HIP_CHECK(hipFree(d_A));
+  HIP_CHECK(hipFree(d_x));
+  HIP_CHECK(hipFree(d_res));
+  HIP_CHECK(hipFree(d_y_ref));
+  HIP_CHECK(hipFree(d_y_fus));
+
+  // Block strategy: FP32 weights, K >= 8192.
+  constexpr std::size_t M2 = 2048;
+  constexpr std::size_t K2 = 12288;
+  std::vector<float> h_A2(M2 * K2);
+  std::vector<float> h_x2(K2);
+  std::vector<float> h_res2(M2);
+  for (std::size_t i = 0; i < M2 * K2; ++i) {
+    h_A2[i] = 0.008F * std::sin(static_cast<float>(i) * 0.0003F);
+  }
+  for (std::size_t i = 0; i < K2; ++i) {
+    h_x2[i] = 0.2F * std::cos(static_cast<float>(i) * 0.007F);
+  }
+  for (std::size_t i = 0; i < M2; ++i) {
+    h_res2[i] = 0.15F * std::sin(static_cast<float>(i) * 0.019F);
+  }
+
+  float *d_A2 = nullptr, *d_x2 = nullptr, *d_res2 = nullptr;
+  float *d_y_ref2 = nullptr, *d_y_fus2 = nullptr;
+  HIP_CHECK(hipMalloc(&d_A2, M2 * K2 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_x2, K2 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_res2, M2 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_y_ref2, M2 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_y_fus2, M2 * sizeof(float)));
+  HIP_CHECK(hipMemcpy(d_A2, h_A2.data(), M2 * K2 * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(
+      hipMemcpy(d_x2, h_x2.data(), K2 * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_res2, h_res2.data(), M2 * sizeof(float),
+                      hipMemcpyHostToDevice));
+
+  strix::hip::LaunchGEMV(d_A2, false, d_x2, d_y_ref2, M2, K2);
+  strix::hip::LaunchResidualAdd(d_res2, d_y_ref2, d_y_ref2, M2);
+  strix::hip::LaunchGEMVResidual(d_A2, false, d_x2, d_y_fus2, d_res2, M2, K2);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<float> ref2(M2);
+  std::vector<float> fus2(M2);
+  HIP_CHECK(hipMemcpy(ref2.data(), d_y_ref2, M2 * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(fus2.data(), d_y_fus2, M2 * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  max_diff = 0.0F;
+  for (std::size_t i = 0; i < M2; ++i) {
+    const float d = std::abs(ref2[i] - fus2[i]);
+    if (d > max_diff)
+      max_diff = d;
+  }
+  std::cout << "Block GEMV+residual fused vs unfused max diff: " << max_diff
+            << "\n";
+  if (max_diff != 0.0F) {
+    std::cerr << "Block GEMV+residual mismatch\n";
+    std::abort();
+  }
+
+  HIP_CHECK(hipFree(d_A2));
+  HIP_CHECK(hipFree(d_x2));
+  HIP_CHECK(hipFree(d_res2));
+  HIP_CHECK(hipFree(d_y_ref2));
+  HIP_CHECK(hipFree(d_y_fus2));
+}
+
 int main() {
   int device_count = 0;
   HIP_CHECK(hipGetDeviceCount(&device_count));
@@ -2329,6 +2585,8 @@ int main() {
   TestFusedResidualAddRMSNormEquivalence();
   TestBatchedFusedResidualAddRMSNormEquivalence();
   TestBatchedFusedSwiGLUProductionEquivalence();
+  TestBatchedSSMRecurrenceNormGateEquivalence();
+  TestGEMVResidualEquivalence();
   std::cout << "All Qwen HIP GPU kernel tests passed on gfx1151.\n";
   return 0;
 }

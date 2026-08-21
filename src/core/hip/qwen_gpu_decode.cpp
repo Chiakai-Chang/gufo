@@ -69,6 +69,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                     static_cast<const float*>(layer.attn_norm.data),
                     arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
 
+      // opt-c010-ssm-gate-residual: the SSM branch folds the post-SSM residual
+      // add into the ssm_out GEMV; the common residual-add step below then
+      // runs only the FFN pre-norm for SSM layers.
+      bool ssm_residual_folded = false;
+
       if (layer.is_full_attention) {
         // Full attention path
         const bool q_bf16 = layer.attn_q.type == core::GgmlType::kBF16;
@@ -157,6 +162,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                    arena_.stream);
       } else {
         // SSM path
+        ssm_residual_folded = detail::ShouldFuseSSMGateResidual();
         const bool qkv_bf16 = layer.attn_qkv.type == core::GgmlType::kBF16;
         const bool gate_bf16 = layer.attn_gate.type == core::GgmlType::kBF16;
         const bool alpha_bf16 = layer.ssm_alpha.type == core::GgmlType::kBF16;
@@ -181,15 +187,30 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
             config.ssm_time_step_rank, config.ssm_state_size,
             config.SsmValueSize(), arena_.stream, arena_.GetSsmReplayCapture());
 
-        LaunchGEMV(layer.ssm_out.data, out_bf16, arena_.d_ssm_out,
-                   arena_.d_attn_out, hidden_size, ssm_inner_size,
-                   arena_.stream);
+        // opt-c010-ssm-gate-residual: fold the post-SSM residual add into the
+        // ssm_out GEMV epilogue (y = A*x + hidden). The unfused chain (GEMV
+        // into d_attn_out + residual add) stays wired as the reference.
+        if (ssm_residual_folded) {
+          LaunchGEMVResidual(layer.ssm_out.data, out_bf16, arena_.d_ssm_out,
+                             arena_.d_hidden, arena_.d_hidden, hidden_size,
+                             ssm_inner_size, arena_.stream);
+        } else {
+          LaunchGEMV(layer.ssm_out.data, out_bf16, arena_.d_ssm_out,
+                     arena_.d_attn_out, hidden_size, ssm_inner_size,
+                     arena_.stream);
+        }
       }
 
       // Residual Add + FFN Pre-RMSNorm fused into one kernel
       // (opt-c010-residual-rmsnorm). The unfused chain stays wired behind the
       // policy toggle as the independent reference.
-      if (detail::ShouldFuseResidualAddRMSNorm()) {
+      // When the SSM residual is folded into the ssm_out GEMV above, the
+      // residual-add step is already applied, so only the FFN pre-norm runs.
+      if (ssm_residual_folded) {
+        LaunchRMSNorm(arena_.d_hidden,
+                      static_cast<const float*>(layer.ffn_norm.data),
+                      arena_.d_normed, hidden_size, 1e-6F, arena_.stream);
+      } else if (detail::ShouldFuseResidualAddRMSNorm()) {
         LaunchFusedResidualAddRMSNorm(
             arena_.d_hidden, arena_.d_attn_out, arena_.d_hidden,
             static_cast<const float*>(layer.ffn_norm.data), arena_.d_normed,

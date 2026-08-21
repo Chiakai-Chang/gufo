@@ -239,6 +239,7 @@ decode is 1.07-1.09x behind, while shallow decode is about 7% faster.
 | Q/K Norm & RoPE | Fused Q/K RMSNorm + RoPE + KV-cache write into single kernel | Unfused 4-kernel launch chain per layer |
 | Residual Add + RMSNorm | Unfused residual add + RMSNorm per layer | Fused residual-add + RMSNorm: bit-exact and one fewer launch per layer, but no end-to-end gain within noise (`opt-c010-residual-rmsnorm`) |
 | FFN Projection + SwiGLU | hipBLASLt BF16 gate/up GEMMs + SwiGLU activation | Naive fused per-row gate/up GEMV + SwiGLU: ~37x prefill regression against hipBLASLt (`opt-c010-ffn-swiglu`) |
+| SSM norm + gate + residual | Unfused recurrence + post-norm kernel; ssm_out GEMV + residual add | Fused recurrence + post-norm + gate: bit-exact but +41% recurrence time and 104B scratch spill; decode residual folded into ssm_out GEMV: bit-exact, one fewer launch, no end-to-end gain (`opt-c010-ssm-gate-residual`) |
 | Speculation | Exact target verification and explicit GPU/XDNA2 MTP experiments | MTP as a default route while it reduces decode throughput |
 
 This table records only decisions that affect the current direction. Detailed
@@ -260,3 +261,11 @@ they did not beat the unfused routes end-to-end on gfx1151.
   avoids re-reading the residual sum from global memory; the current variant
   saves one launch but keeps the extra global round-trip, so it is neutral
   end-to-end.
+- Re-evaluate `opt-c010-ssm-gate-residual` prefill fold with
+  `__launch_bounds__(256, 4)` and a register-resident norm reduction so the
+  recurrence epilogue stops spilling (192 VGPR, 104B scratch) and keeps the
+  state tile live; the current variant serializes the norm+gate inside the
+  token loop and regresses pp2048 ~4.6%.
+- Re-evaluate the `opt-c010-ssm-gate-residual` decode residual fold with a
+  residual-aware Wave32 2-row/4-row GEMV or a hipBLASLt epilogue so the
+  saved launch survives outside graph capture.

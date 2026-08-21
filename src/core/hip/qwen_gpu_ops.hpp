@@ -159,6 +159,13 @@ void LaunchSwiGLU(const float* gate, const float* up, float* out,
 void LaunchGEMV(const void* A, bool is_bf16, const float* x, float* y,
                 std::size_t M, std::size_t K, hipStream_t stream = nullptr);
 
+/// Computes Matrix-Vector Multiplication with a residual-add epilogue:
+/// y = A*x + residual (opt-c010-ssm-gate-residual). The residual is read
+/// before y is written, so residual may alias y (in-place accumulate).
+void LaunchGEMVResidual(const void* A, bool is_bf16, const float* x, float* y,
+                        const float* residual, std::size_t M, std::size_t K,
+                        hipStream_t stream = nullptr);
+
 /// Computes Fused SSM Input Projections (QKV, Gate, Alpha, Beta) in a single
 /// kernel
 void LaunchFusedSSMInputProjections(
@@ -402,6 +409,18 @@ void LaunchBatchedAttentionGemm(
 
 /// Batched Causal SSM Conv1D + DeltaNet Recurrence for B tokens
 void LaunchBatchedSSMConvRecurrence(
+    const float* qkv_in, const float* conv_weights, float* conv_state,
+    float* conv_out, float* deltanet_state, const float* alpha_buf,
+    const float* beta_buf, const float* ssm_a, const float* ssm_dt,
+    const float* ssm_norm, const float* gate, float* out_buf,
+    std::uint32_t layer_idx, std::size_t batch_size, std::size_t qkv_size,
+    std::uint32_t num_key_heads, std::uint32_t num_heads, std::uint32_t key_dim,
+    std::uint32_t val_dim, hipStream_t stream = nullptr);
+
+/// Batched Causal SSM Conv1D + DeltaNet recurrence with the per-head
+/// post-RMSNorm + SiLU gate folded into the recurrence epilogue
+/// (opt-c010-ssm-gate-residual). Writes the final gated output into out_buf.
+void LaunchBatchedSSMConvRecurrenceNormGate(
     const float* qkv_in, const float* conv_weights, float* conv_state,
     float* conv_out, float* deltanet_state, const float* alpha_buf,
     const float* beta_buf, const float* ssm_a, const float* ssm_dt,

@@ -355,16 +355,33 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         t0 = t1;
       }
 
-      LaunchBatchedSSMConvRecurrence(
-          arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
-          arena_.d_ssm_conv_state, arena_.d_conv_out,
-          arena_.d_ssm_deltanet_state, arena_.d_alpha_buf, arena_.d_beta_buf,
-          static_cast<const float*>(layer.ssm_a.data),
-          static_cast<const float*>(layer.ssm_dt.data),
-          static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
-          arena_.d_ssm_out, l, batch_size, ssm_qkv_size, config.ssm_group_count,
-          config.ssm_time_step_rank, config.ssm_state_size,
-          config.SsmValueSize(), arena_.stream);
+      // opt-c010-ssm-gate-residual: fuse the per-head post-RMSNorm + SiLU
+      // gate into the DeltaNet recurrence epilogue (one launch, no raw_out
+      // global round trip). The unfused chain (recurrence +
+      // BatchedSSMPostNormGateKernel) stays wired as the reference.
+      if (detail::ShouldFuseSSMGateResidual()) {
+        LaunchBatchedSSMConvRecurrenceNormGate(
+            arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
+            arena_.d_ssm_conv_state, arena_.d_conv_out,
+            arena_.d_ssm_deltanet_state, arena_.d_alpha_buf, arena_.d_beta_buf,
+            static_cast<const float*>(layer.ssm_a.data),
+            static_cast<const float*>(layer.ssm_dt.data),
+            static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
+            arena_.d_ssm_out, l, batch_size, ssm_qkv_size,
+            config.ssm_group_count, config.ssm_time_step_rank,
+            config.ssm_state_size, config.SsmValueSize(), arena_.stream);
+      } else {
+        LaunchBatchedSSMConvRecurrence(
+            arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
+            arena_.d_ssm_conv_state, arena_.d_conv_out,
+            arena_.d_ssm_deltanet_state, arena_.d_alpha_buf, arena_.d_beta_buf,
+            static_cast<const float*>(layer.ssm_a.data),
+            static_cast<const float*>(layer.ssm_dt.data),
+            static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
+            arena_.d_ssm_out, l, batch_size, ssm_qkv_size,
+            config.ssm_group_count, config.ssm_time_step_rank,
+            config.ssm_state_size, config.SsmValueSize(), arena_.stream);
+      }
 
       if (do_profile) {
         HIP_CHECK(hipStreamSynchronize(arena_.stream));
