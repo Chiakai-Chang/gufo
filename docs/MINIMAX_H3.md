@@ -57,6 +57,10 @@ Numerical and audiovisual work follows the frozen
 outputs remain outside Git in schema-validated, content-addressed directories;
 CI never regenerates them.
 
+The model-private loader's phase boundaries and first gfx1151 residency
+measurement are recorded in
+[the MiniMax H3 residency baseline](../src/models/minimax_h3/RESIDENCY.md).
+
 ## Operator Attestation
 
 The operator of the dedicated Strix Halo development machine has stated that

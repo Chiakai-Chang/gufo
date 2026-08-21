@@ -186,6 +186,9 @@ endif()
 add_library(strix_core STATIC
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
+  src/models/minimax_h3/json.cpp
+  src/models/minimax_h3/runtime.cpp
+  src/models/minimax_h3/sha256.cpp
   src/tokenization/qwen_tokenizer.cpp
   src/tokenization/qwen_chat_template.cpp
   src/models/qwen_oracles.cpp
@@ -219,6 +222,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_model_loader.cpp
     src/core/hip/qwen_gpu_prefill.cpp
     src/core/hip/qwen_mtp_gpu.cpp
+    src/models/minimax_h3/runtime_hip.cpp
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
     src/core/speculative/prompt_lookup_backend.cpp
@@ -289,6 +293,9 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 install(TARGETS strix strix-server DESTINATION bin)
+install(FILES
+  src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json
+  DESTINATION share/strix/models/minimax_h3)
 if (ENGINE_ENABLE_HIP)
   install(TARGETS strix-kernel-bench tune_hipblaslt benchmark_ssm_replay
     DESTINATION bin)
@@ -406,6 +413,13 @@ if (BUILD_TESTING)
   set_tests_properties(model_registry_test PROPERTIES
     LABELS "cpu;core;model_registry;minimax-h3")
 
+  add_executable(minimax_h3_runtime_test
+    tests/models/minimax_h3_runtime_test.cpp)
+  target_link_libraries(minimax_h3_runtime_test PRIVATE strix_core)
+  add_test(NAME minimax_h3_runtime_test COMMAND minimax_h3_runtime_test)
+  set_tests_properties(minimax_h3_runtime_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;safetensors;residency;failure-injection")
+
   add_executable(ggml_dequant_test tests/core/ggml_dequant_test.cpp)
   target_link_libraries(ggml_dequant_test PRIVATE strix_core)
 
@@ -493,6 +507,16 @@ if (BUILD_TESTING)
     LABELS "cpu;hipblaslt;cache")
 
   if (ENGINE_ENABLE_HIP)
+    add_executable(minimax_h3_runtime_hip_test
+      tests/models/minimax_h3_runtime_hip_test.cpp)
+    target_link_libraries(minimax_h3_runtime_hip_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME minimax_h3_runtime_hip_test
+      COMMAND minimax_h3_runtime_hip_test)
+    set_tests_properties(minimax_h3_runtime_hip_test PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
     add_executable(deepseek_v4_flash_engine_test
       tests/models/deepseek_v4_flash_engine_test.cpp)
     target_link_libraries(deepseek_v4_flash_engine_test PRIVATE

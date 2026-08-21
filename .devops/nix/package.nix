@@ -112,6 +112,9 @@ stdenv.mkDerivation (finalAttrs: {
     mkdir -p $out/bin
     cp strix $out/bin/strix
     cp strix-server $out/bin/strix-server
+    mkdir -p $out/share/strix/models/minimax_h3
+    cp $src/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json \
+      $out/share/strix/models/minimax_h3/
     if [ -f strix-kernel-bench ]; then
       cp strix-kernel-bench $out/bin/strix-kernel-bench
     fi
