@@ -85,6 +85,7 @@ struct ds4_rocm_graph {
      * the row counters whenever a checkpoint is saved or partially rewound. */
     ds4_gpu_tensor *layer_raw_cache[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_comp_cache[DS4_MAX_LAYER];
+    ds4_gpu_tensor *layer_attn_comp_cache_f16[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_kv[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_attn_state_score[DS4_MAX_LAYER];
     ds4_gpu_tensor *layer_index_comp_cache[DS4_MAX_LAYER];
@@ -304,6 +305,7 @@ static void rocm_graph_free(ds4_gpu_graph *g) {
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_comp_cache[il]);
+        ds4_gpu_tensor_free(g->layer_attn_comp_cache_f16[il]);
     }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         ds4_gpu_tensor_free(g->layer_attn_state_kv[il]);
@@ -353,6 +355,7 @@ static uint64_t rocm_graph_kv_cache_bytes_for_context(uint32_t ctx_size, uint32_
         const uint64_t comp_cap = (uint64_t)(ctx_size / ratio + 2u);
         bytes += comp_cap * DS4_N_HEAD_DIM * sizeof(float);
         if (ratio == 4) {
+            bytes += comp_cap * DS4_N_HEAD_DIM * sizeof(uint16_t);
             bytes += comp_cap * DS4_N_INDEXER_HEAD_DIM * sizeof(float);
         }
     }
@@ -491,6 +494,13 @@ static bool rocm_graph_alloc_raw_cap(
             g->layer_attn_comp_cache[il] = rocm_graph_alloc_kv_cache_tensor(
                     managed_kv_cache,
                     (uint64_t)g->layer_comp_cap[il] * DS4_N_HEAD_DIM * sizeof(float));
+            if (ratio == 4) {
+                g->layer_attn_comp_cache_f16[il] =
+                    rocm_graph_alloc_kv_cache_tensor(
+                        managed_kv_cache,
+                        (uint64_t)g->layer_comp_cap[il] *
+                            DS4_N_HEAD_DIM * sizeof(uint16_t));
+            }
             g->layer_attn_state_kv[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             g->layer_attn_state_score[il] = ds4_gpu_tensor_alloc(attn_width * attn_rows * sizeof(float));
             if (g->layer_attn_state_kv[il]) {
@@ -603,7 +613,8 @@ static bool rocm_graph_alloc_raw_cap(
                              g->layer_attn_state_score[il] != NULL;
         }
         if (layer_cache_ok && ratio == 4) {
-            layer_cache_ok = g->layer_index_comp_cache[il] != NULL &&
+            layer_cache_ok = g->layer_attn_comp_cache_f16[il] != NULL &&
+                             g->layer_index_comp_cache[il] != NULL &&
                              g->layer_index_state_kv[il] != NULL &&
                              g->layer_index_state_score[il] != NULL;
         }
@@ -824,6 +835,29 @@ static uint32_t rocm_graph_attn_comp_cache_is_f16(void) {
     return 0;
 }
 
+static bool rocm_graph_use_attn_comp_mirror(
+        const ds4_gpu_graph *g,
+        uint32_t             il,
+        uint32_t             n_tokens) {
+    return n_tokens >= 128u && g->layer_attn_comp_cache_f16[il] != nullptr;
+}
+
+static ds4_gpu_tensor *rocm_graph_prefill_attn_comp_cache(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       n_tokens) {
+    return rocm_graph_use_attn_comp_mirror(g, il, n_tokens)
+        ? g->layer_attn_comp_cache_f16[il]
+        : g->layer_attn_comp_cache[il];
+}
+
+static uint32_t rocm_graph_prefill_attn_comp_cache_is_f16(
+        const ds4_gpu_graph *g,
+        uint32_t             il,
+        uint32_t             n_tokens) {
+    return rocm_graph_use_attn_comp_mirror(g, il, n_tokens) ? 1u : 0u;
+}
+
 static ds4_gpu_tensor *rocm_graph_attn_comp_update_target(
         ds4_gpu_graph *g,
         uint32_t       il) {
@@ -843,6 +877,17 @@ static ds4_gpu_tensor *rocm_graph_attn_comp_row_view(
                                (uint64_t)DS4_N_HEAD_DIM * sizeof(float));
 }
 
+static ds4_gpu_tensor *rocm_graph_attn_comp_mirror_row_view(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       row) {
+    if (!g->layer_attn_comp_cache_f16[il]) return nullptr;
+    return ds4_gpu_tensor_view(
+        g->layer_attn_comp_cache_f16[il],
+        (uint64_t)row * DS4_N_HEAD_DIM * sizeof(uint16_t),
+        (uint64_t)DS4_N_HEAD_DIM * sizeof(uint16_t));
+}
+
 static ds4_gpu_tensor *rocm_graph_attn_comp_prefill_target(
         ds4_gpu_graph *g,
         uint32_t       il,
@@ -854,8 +899,48 @@ static ds4_gpu_tensor *rocm_graph_attn_comp_prefill_target(
                                (uint64_t)view_rows * DS4_N_HEAD_DIM * sizeof(float));
 }
 
+static ds4_gpu_tensor *rocm_graph_attn_comp_prefill_mirror(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       first_row,
+        uint32_t       rows) {
+    if (!g->layer_attn_comp_cache_f16[il]) return nullptr;
+    const uint32_t view_rows = rows ? rows : 1u;
+    return ds4_gpu_tensor_view(
+        g->layer_attn_comp_cache_f16[il],
+        (uint64_t)first_row * DS4_N_HEAD_DIM * sizeof(uint16_t),
+        (uint64_t)view_rows * DS4_N_HEAD_DIM * sizeof(uint16_t));
+}
+
 static void rocm_graph_attn_comp_prefill_target_free(ds4_gpu_tensor *t) {
     ds4_gpu_tensor_free(t);
+}
+
+static bool rocm_graph_quantize_attn_comp_row(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       row,
+        ds4_gpu_tensor *comp_row_f32) {
+    ds4_gpu_tensor *mirror_row =
+        rocm_graph_attn_comp_mirror_row_view(g, il, row);
+    const bool ok = mirror_row
+        ? ds4_gpu_dsv4_fp8_kv_quantize_mirror_f16_tensor(
+              comp_row_f32, mirror_row, 1u, DS4_N_HEAD_DIM, DS4_N_ROT) != 0
+        : ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+              comp_row_f32, 1u, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+    ds4_gpu_tensor_free(mirror_row);
+    return ok;
+}
+
+static bool rocm_graph_rebuild_attn_comp_mirror(
+        ds4_gpu_graph *g,
+        uint32_t       il,
+        uint32_t       rows) {
+    if (!g->layer_attn_comp_cache_f16[il] || rows == 0u) return true;
+    return ds4_gpu_tensor_convert_f32_to_f16(
+               g->layer_attn_comp_cache_f16[il],
+               g->layer_attn_comp_cache[il],
+               (uint64_t)rows * DS4_N_HEAD_DIM) != 0;
 }
 
 /* Encode one DS4 decode layer on ROCm.  This is the release single-token
@@ -1130,7 +1215,8 @@ static bool rocm_graph_encode_decode_layer(
             if (!comp_row_view) {
                 ok = false;
             } else {
-                ok = ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view, 1, DS4_N_HEAD_DIM, DS4_N_ROT) != 0;
+                ok = rocm_graph_quantize_attn_comp_row(
+                    g, il, comp_row, comp_row_view);
                 if (ok) {
                 }
                 ds4_gpu_tensor_free(comp_row_view);
@@ -2384,10 +2470,16 @@ static bool rocm_graph_encode_layer_attention_batch(
                 fprintf(stderr, "ds4: ROCm layer-major compressed KV cache capacity exceeded at layer %u\n", il);
                 ok = false;
             }
-            ds4_gpu_tensor *attn_comp_target = NULL;
+            ds4_gpu_tensor *attn_comp_target = nullptr;
+            ds4_gpu_tensor *attn_comp_mirror = nullptr;
             if (ok) {
                 attn_comp_target = rocm_graph_attn_comp_prefill_target(g, il, 0, n_comp);
-                ok = attn_comp_target != NULL &&
+                if (ratio == 4) {
+                    attn_comp_mirror =
+                        rocm_graph_attn_comp_prefill_mirror(g, il, 0, n_comp);
+                }
+                ok = attn_comp_target != nullptr &&
+                     (ratio != 4 || attn_comp_mirror != nullptr) &&
                      ds4_gpu_compressor_prefill_tensor(attn_comp_target,
                                                          g->layer_attn_state_kv[il],
                                                          g->layer_attn_state_score[il],
@@ -2412,7 +2504,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                          attn_factor,
                                                          DS4_ROPE_YARN_BETA_FAST,
                                                          DS4_ROPE_YARN_BETA_SLOW,
-                                                         DS4_RMS_EPS) != 0;
+                                                         DS4_RMS_EPS,
+                                                         attn_comp_mirror) != 0;
                 if (ok && ratio == 4) {
                     ok = rocm_graph_refresh_ratio4_compressor_state(g,
                                                                      model,
@@ -2435,6 +2528,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                 if (n_comp != 0) {
                 }
             }
+            rocm_graph_attn_comp_prefill_target_free(attn_comp_mirror);
             rocm_graph_attn_comp_prefill_target_free(attn_comp_target);
         } else {
             const bool aligned_chunk = (pos0 % ratio) == 0u && (n_tokens % ratio) == 0u;
@@ -2445,9 +2539,18 @@ static bool rocm_graph_encode_layer_attention_batch(
                     fprintf(stderr, "ds4: ROCm graph compressed KV cache capacity exceeded at layer %u\n", il);
                     ok = false;
                 }
-                ds4_gpu_tensor *attn_comp_target =
-                    ok ? rocm_graph_attn_comp_prefill_target(g, il, comp_before, comp_chunk) : NULL;
-                if (ok && !attn_comp_target) ok = false;
+                ds4_gpu_tensor *attn_comp_target = ok
+                    ? rocm_graph_attn_comp_prefill_target(
+                          g, il, comp_before, comp_chunk)
+                    : nullptr;
+                ds4_gpu_tensor *attn_comp_mirror = ok && ratio == 4
+                    ? rocm_graph_attn_comp_prefill_mirror(
+                          g, il, comp_before, comp_chunk)
+                    : nullptr;
+                if (ok && (!attn_comp_target ||
+                           (ratio == 4 && !attn_comp_mirror))) {
+                    ok = false;
+                }
                 if (ok && ratio == 4) {
                     ok = ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                             attn_comp_target,
@@ -2473,7 +2576,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                             attn_factor,
                             DS4_ROPE_YARN_BETA_FAST,
                             DS4_ROPE_YARN_BETA_SLOW,
-                            DS4_RMS_EPS) != 0;
+                            DS4_RMS_EPS,
+                            attn_comp_mirror) != 0;
                 } else if (ok) {
                     ok = ds4_gpu_compressor_prefill_tensor(
                             attn_comp_target,
@@ -2500,7 +2604,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                             attn_factor,
                             DS4_ROPE_YARN_BETA_FAST,
                             DS4_ROPE_YARN_BETA_SLOW,
-                            DS4_RMS_EPS) != 0;
+                            DS4_RMS_EPS,
+                            attn_comp_mirror) != 0;
                 }
                 if (ok && ratio == 4) {
                     ok = rocm_graph_refresh_ratio4_compressor_state(g,
@@ -2523,6 +2628,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                         }
                     }
                 }
+                rocm_graph_attn_comp_prefill_target_free(attn_comp_mirror);
                 rocm_graph_attn_comp_prefill_target_free(attn_comp_target);
             } else {
                 for (uint32_t t = 0; ok && t < n_tokens; t++) {
@@ -2566,11 +2672,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                             false) != 0;
                     if (ok && emit) {
                         ds4_gpu_tensor *comp_row_view = rocm_graph_attn_comp_row_view(g, il, comp_row);
-                        ok = comp_row_view &&
-                             ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_row_view,
-                                                                   1,
-                                                                   DS4_N_HEAD_DIM,
-                                                                   DS4_N_ROT) != 0;
+                        ok = comp_row_view && rocm_graph_quantize_attn_comp_row(
+                            g, il, comp_row, comp_row_view);
                         if (ok) {
                         }
                         ds4_gpu_tensor_free(comp_row_view);
@@ -2674,7 +2777,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                              attn_factor,
                                                              DS4_ROPE_YARN_BETA_FAST,
                                                              DS4_ROPE_YARN_BETA_SLOW,
-                                                             DS4_RMS_EPS) != 0;
+                                                             DS4_RMS_EPS,
+                                                             nullptr) != 0;
                 }
                 if (ok && n_comp != 0) {
                     ok = ds4_gpu_dsv4_indexer_qat_tensor(g->layer_index_comp_cache[il],
@@ -2744,7 +2848,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                                 attn_factor,
                                 DS4_ROPE_YARN_BETA_FAST,
                                 DS4_ROPE_YARN_BETA_SLOW,
-                                DS4_RMS_EPS) != 0;
+                                DS4_RMS_EPS,
+                                nullptr) != 0;
                     }
                     if (ok && index_chunk != 0) {
                         ok = ds4_gpu_dsv4_indexer_qat_tensor(index_view,
@@ -2915,8 +3020,10 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                                               layer->attn_sinks->abs_offset,
                                                                               g->batch_q,
                                                                               g->layer_raw_cache[il],
-                                                                              g->layer_attn_comp_cache[il],
-                                                                              rocm_graph_attn_comp_cache_is_f16(),
+                                                                              rocm_graph_prefill_attn_comp_cache(
+                                                                                  g, il, n_tokens),
+                                                                              rocm_graph_prefill_attn_comp_cache_is_f16(
+                                                                                  g, il, n_tokens),
                                                                               g->comp_selected,
                                                                               n_tokens,
                                                                               pos0,
@@ -3019,8 +3126,10 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                                           layer->attn_sinks->abs_offset,
                                                                           g->batch_q,
                                                                           g->layer_raw_cache[il],
-                                                                          g->layer_attn_comp_cache[il],
-                                                                          rocm_graph_attn_comp_cache_is_f16(),
+                                                                          rocm_graph_prefill_attn_comp_cache(
+                                                                              g, il, n_tokens),
+                                                                          rocm_graph_prefill_attn_comp_cache_is_f16(
+                                                                              g, il, n_tokens),
                                                                           g->comp_selected,
                                                                           n_tokens,
                                                                           pos0,
@@ -4599,6 +4708,13 @@ static int rocm_graph_load_payload(ds4_rocm_graph *graph,
                                       &remaining,
                                       err,
                                       errlen);
+        if (rc == 0 && ratio == 4 &&
+            !rocm_graph_rebuild_attn_comp_mirror(
+                graph, il, n_comp[il])) {
+            payload_set_err(
+                err, errlen, "failed to rebuild FP16 attention cache mirror");
+            rc = 1;
+        }
         if (rc == 0) rc = payload_read_tensor_span(fp,
                                                    graph->layer_attn_state_kv[il],
                                                    0,

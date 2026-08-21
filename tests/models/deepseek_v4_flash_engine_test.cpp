@@ -86,12 +86,16 @@ void CheckPinnedTrajectory(
 
 void CheckBatchedPrefill(
     const std::shared_ptr<strix::models::deepseek_v4_flash::Model>& model) {
+  constexpr int kTrajectoryRepetitions = 2;
+
   std::string error;
   const auto prompt = model->Tokenize(kTrajectoryPrompt);
   Expect(!prompt.empty(), "prefill prompt tokenization");
   auto tokens = prompt;
-  tokens.insert(tokens.end(), kPinnedDs4Trajectory.begin(),
-                kPinnedDs4Trajectory.end());
+  for (int repetition = 0; repetition < kTrajectoryRepetitions; ++repetition) {
+    tokens.insert(tokens.end(), kPinnedDs4Trajectory.begin(),
+                  kPinnedDs4Trajectory.end());
+  }
 
   auto batched = model->CreateSession(4096, &error);
   Expect(batched != nullptr, error.c_str());
@@ -102,8 +106,10 @@ void CheckBatchedPrefill(
   auto sequential = model->CreateSession(4096, &error);
   Expect(sequential != nullptr, error.c_str());
   Expect(sequential->Sync(prompt, &error), error.c_str());
-  for (const int token : kPinnedDs4Trajectory) {
-    Expect(sequential->Evaluate(token, &error), error.c_str());
+  for (int repetition = 0; repetition < kTrajectoryRepetitions; ++repetition) {
+    for (const int token : kPinnedDs4Trajectory) {
+      Expect(sequential->Evaluate(token, &error), error.c_str());
+    }
   }
   const auto sequential_logits = sequential->CopyLogits(&error);
   Expect(sequential_logits.size() == batched_logits.size(),
@@ -151,8 +157,9 @@ void CheckBatchedPrefill(
                               return value > sequential_choice_logit;
                             }));
 
-  std::cout << "Batched prefill vs sequential: rmse=" << rmse
-            << " cosine=" << cosine << " max_error=" << max_error
+  std::cout << "Batched prefill (" << tokens.size()
+            << " tokens) vs sequential: rmse=" << rmse << " cosine=" << cosine
+            << " max_error=" << max_error
             << " top1_match=" << (batched_top_index == sequential_top_index)
             << " sequential_choice_rank=" << sequential_choice_rank << '\n';
   Expect(finite, "prefill finite logits");

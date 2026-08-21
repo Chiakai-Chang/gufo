@@ -372,7 +372,6 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         uint32_t                ratio,
         uint32_t                n_head,
         uint32_t                head_dim) {
-    if (comp_kv_f16) return 0;
     if (!heads || !q || !raw_kv || !comp_kv || !topk || !model_map ||
         n_tokens == 0 || n_raw == 0 || raw_cap < n_raw || raw_start >= raw_cap ||
         n_comp == 0 || top_k == 0 ||
@@ -381,7 +380,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         heads->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         raw_kv->bytes < (uint64_t)raw_cap * head_dim * sizeof(float) ||
-        comp_kv->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+        comp_kv->bytes < (uint64_t)n_comp * head_dim *
+                             (comp_kv_f16 ? sizeof(half) : sizeof(float)) ||
         topk->bytes < (uint64_t)n_tokens * top_k * sizeof(int32_t)) {
         return 0;
     }
@@ -390,6 +390,10 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
     const int32_t *topk_ptr = (const int32_t *)topk->ptr;
+    const bool wmma_supported =
+        n_tokens >= 128u && n_head == 64u && head_dim == 512u &&
+        top_k == 512u && window <= 256u;
+    if (comp_kv_f16 && !wmma_supported) return 0;
     const ds4_rocm_runtime_config *cfg = hip_runtime_config();
     if (n_tokens == 1u && cfg->oldhip_attention_decode) {
         const uint32_t rows = n_raw + (top_k < n_comp ? top_k : n_comp);
@@ -413,10 +417,38 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 (uint32_t)((head_dim & 3u) == 0u));
         return hip_ok(hipGetLastError(), "attention indexed decode oldhip fast launch");
     }
+    float *wmma_score_cache = nullptr;
+    uint32_t wmma_score_stride = 0u;
     if (n_tokens > 1u && top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
-        int32_t *sorted = (int32_t *)hip_tmp_alloc(sort_bytes, "indexed attention topk sort");
+        const uint64_t sort_aligned = (sort_bytes + 255u) & ~255ull;
+        uint64_t tmp_bytes = sort_aligned;
+        if (wmma_supported) {
+            const uint32_t stride = DS4_ROCM_ATTENTION_RAW_SCORE_CAP + top_k;
+            uint64_t score_bytes = 0u;
+            if (hip_u64_mul3_checked(
+                    n_tokens,
+                    (uint64_t)n_head * stride,
+                    sizeof(float),
+                    &score_bytes) &&
+                score_bytes <= (1ull << 30u) &&
+                sort_aligned <= UINT64_MAX - score_bytes) {
+                wmma_score_stride = stride;
+                tmp_bytes = sort_aligned + score_bytes;
+            }
+        }
+        char *scratch = (char *)hip_tmp_alloc(
+            tmp_bytes, "indexed attention topk and WMMA scores");
+        if (!scratch && wmma_score_stride != 0u) {
+            wmma_score_stride = 0u;
+            scratch = (char *)hip_tmp_alloc(
+                sort_bytes, "indexed attention topk sort");
+        }
+        int32_t *sorted = (int32_t *)scratch;
         if (!sorted) return 0;
+        if (wmma_score_stride != 0u) {
+            wmma_score_cache = (float *)(scratch + sort_aligned);
+        }
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
         if (!hip_ok(hipGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
@@ -425,6 +457,57 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         head_dim == 512 &&
         top_k <= DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        if (wmma_supported) {
+            const dim3 grid(n_tokens, n_head / 32u, 1u);
+            if (comp_kv_f16) {
+                attention_mixed_heads32_wmma_kernel<true, true>
+                    <<<grid, 1024>>>(
+                        (float *)heads->ptr,
+                        sinks,
+                        (const float *)q->ptr,
+                        (const float *)raw_kv->ptr,
+                        comp_kv->ptr,
+                        topk_ptr,
+                        wmma_score_cache,
+                        wmma_score_stride,
+                        n_tokens,
+                        pos0,
+                        n_raw,
+                        raw_cap,
+                        raw_start,
+                        n_comp,
+                        top_k,
+                        window,
+                        ratio,
+                        n_head,
+                        head_dim);
+            } else {
+                attention_mixed_heads32_wmma_kernel<true, false>
+                    <<<grid, 1024>>>(
+                        (float *)heads->ptr,
+                        sinks,
+                        (const float *)q->ptr,
+                        (const float *)raw_kv->ptr,
+                        comp_kv->ptr,
+                        topk_ptr,
+                        wmma_score_cache,
+                        wmma_score_stride,
+                        n_tokens,
+                        pos0,
+                        n_raw,
+                        raw_cap,
+                        raw_start,
+                        n_comp,
+                        top_k,
+                        window,
+                        ratio,
+                        n_head,
+                        head_dim);
+            }
+            return hip_ok(
+                hipGetLastError(),
+                "attention indexed wave32 wmma launch");
+        }
         if (n_head <= 64u) {
             dim3 grid(n_tokens, (n_head + 31u) / 32u, 1);
             attention_indexed_mixed_heads8_online_kernel<8, 32><<<grid, 1024>>>((float *)heads->ptr,

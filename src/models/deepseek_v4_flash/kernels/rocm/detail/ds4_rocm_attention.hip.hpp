@@ -82,6 +82,275 @@ __global__ static void attention_noncausal_raw_batch_heads_kernel(
 #define DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP 1024u
 #define DS4_ROCM_ATTENTION_INDEXED_SCORE_CAP \
     (256u + DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP)
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+template <bool INDEXED, bool COMP_F16>
+__global__ __launch_bounds__(1024, 1) static void attention_mixed_heads32_wmma_kernel(
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        const void *comp_kv,
+        const int32_t *topk,
+        float *score_cache,
+        uint32_t score_stride,
+        uint32_t n_tokens,
+        uint32_t pos0,
+        uint32_t n_raw,
+        uint32_t raw_cap,
+        uint32_t raw_start,
+        uint32_t n_comp,
+        uint32_t top_k,
+        uint32_t window,
+        uint32_t ratio,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    constexpr uint32_t BM = 16u;
+    constexpr uint32_t BN = 16u;
+    constexpr uint32_t BK = 16u;
+    constexpr uint32_t HEADS = 32u;
+    constexpr uint32_t ROWS = 16u;
+    constexpr uint32_t DIM = 512u;
+    constexpr uint32_t LDS_DIM = DIM + 4u;
+
+    const uint32_t t = (uint32_t)blockIdx.x;
+    const uint32_t head0 = (uint32_t)blockIdx.y * HEADS;
+    if (t >= n_tokens || head_dim != DIM || head0 + HEADS > n_head) return;
+    const uint32_t tid = threadIdx.x;
+    const uint32_t wave = tid >> 5u;
+    float *block_score_cache = score_cache
+        ? score_cache +
+            ((uint64_t)t * (n_head / HEADS) + (uint32_t)blockIdx.y) *
+                HEADS * score_stride
+        : NULL;
+
+    __shared__ uint32_t raw_rows[256];
+    __shared__ uint32_t comp_rows[
+        INDEXED ? DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP : 1u];
+    __shared__ uint32_t raw_count_s;
+    __shared__ uint32_t comp_count_s;
+    __shared__ half q_half[HEADS * LDS_DIM];
+    __shared__ half kv_half[ROWS * LDS_DIM];
+    __shared__ float scores[HEADS * ROWS];
+    __shared__ half probs[HEADS * ROWS];
+    __shared__ float softmax_max[HEADS];
+    __shared__ float softmax_den[HEADS];
+
+    const uint32_t qpos = pos0 + t;
+    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t visible_comp = n_comp;
+    if (ratio != 0u) {
+        visible_comp = (qpos + 1u) / ratio;
+        if (visible_comp > n_comp) visible_comp = n_comp;
+    }
+    if (tid == 0u) {
+        uint32_t raw_count = 0u;
+        uint32_t raw_first_idx = 0u;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+        raw_count_s = raw_count;
+        if constexpr (INDEXED) {
+            uint32_t comp_count = 0u;
+            for (uint32_t i = 0u;
+                 i < top_k &&
+                 comp_count < DS4_ROCM_ATTENTION_INDEXED_TOPK_CAP;
+                 i++) {
+                const int32_t ci = topk[(uint64_t)t * top_k + i];
+                if (ci >= 0 && (uint32_t)ci < n_comp &&
+                    (uint32_t)ci < visible_comp) {
+                    comp_rows[comp_count++] = (uint32_t)ci;
+                }
+            }
+            comp_count_s = comp_count;
+        } else {
+            comp_count_s = visible_comp;
+        }
+        for (uint32_t r = 0u; r < raw_count; r++) {
+            raw_rows[r] = (raw_start + raw_first_idx + r) % raw_cap;
+        }
+    }
+    __syncthreads();
+
+    for (uint32_t j = tid; j < HEADS * DIM; j += blockDim.x) {
+        const uint32_t h = j / DIM;
+        const uint32_t d = j - h * DIM;
+        q_half[h * LDS_DIM + d] = __float2half(
+            q[((uint64_t)t * n_head + head0 + h) * DIM + d]);
+    }
+    if (tid < HEADS) {
+        softmax_max[tid] = sinks[head0 + tid];
+        softmax_den[tid] = 1.0f;
+    }
+    __syncthreads();
+
+    using frag_a = rocwmma::fragment<
+        rocwmma::matrix_a, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_b_col = rocwmma::fragment<
+        rocwmma::matrix_b, BM, BN, BK, half, rocwmma::col_major>;
+    using frag_b_row = rocwmma::fragment<
+        rocwmma::matrix_b, BM, BN, BK, half, rocwmma::row_major>;
+    using frag_c = rocwmma::fragment<
+        rocwmma::accumulator, BM, BN, BK, float>;
+
+    frag_c out0;
+    frag_c out1;
+    const uint32_t raw_count = raw_count_s;
+    const uint32_t n_score = raw_count + comp_count_s;
+    const float score_scale = rsqrtf((float)DIM);
+
+    for (uint32_t pass = 0u; pass < 2u; pass++) {
+        if (pass == 1u) {
+            rocwmma::fill_fragment(out0, 0.0f);
+            rocwmma::fill_fragment(out1, 0.0f);
+        }
+        for (uint32_t row0 = 0u; row0 < n_score; row0 += ROWS) {
+            const uint32_t nr =
+                n_score - row0 < ROWS ? n_score - row0 : ROWS;
+            for (uint32_t j = tid; j < ROWS * DIM; j += blockDim.x) {
+                const uint32_t rr = j / DIM;
+                const uint32_t d = j - rr * DIM;
+                half v = __float2half(0.0f);
+                if (rr < nr) {
+                    const uint32_t sr = row0 + rr;
+                    if (sr < raw_count) {
+                        v = __float2half(
+                            raw_kv[(uint64_t)raw_rows[sr] * DIM + d]);
+                    } else {
+                        uint32_t comp_row = sr - raw_count;
+                        if constexpr (INDEXED) {
+                            comp_row = comp_rows[comp_row];
+                        }
+                        if constexpr (COMP_F16) {
+                            v = ((const half *)comp_kv)[
+                                (uint64_t)comp_row * DIM + d];
+                        } else {
+                            v = __float2half(((const float *)comp_kv)[
+                                (uint64_t)comp_row * DIM + d]);
+                        }
+                    }
+                }
+                kv_half[rr * LDS_DIM + d] = v;
+            }
+            __syncthreads();
+
+            if (pass == 0u || !block_score_cache) {
+                frag_c score_acc;
+                if (wave < 2u) {
+                    rocwmma::fill_fragment(score_acc, 0.0f);
+                }
+                for (uint32_t k0 = 0u; k0 < DIM; k0 += BK) {
+                    if (wave < 2u) {
+                        frag_a qa;
+                        frag_b_col kb;
+                        rocwmma::load_matrix_sync(
+                            qa, q_half + wave * BM * LDS_DIM + k0, LDS_DIM);
+                        rocwmma::load_matrix_sync(
+                            kb, kv_half + k0, LDS_DIM);
+                        rocwmma::mma_sync(score_acc, qa, kb, score_acc);
+                    }
+                }
+                if (wave < 2u) {
+                    rocwmma::store_matrix_sync(
+                        scores + wave * BM * ROWS,
+                        score_acc,
+                        ROWS,
+                        rocwmma::mem_row_major);
+                }
+                __syncthreads();
+                if (pass == 0u && block_score_cache) {
+                    for (uint32_t j = tid; j < HEADS * ROWS;
+                         j += blockDim.x) {
+                        const uint32_t h = j / ROWS;
+                        const uint32_t r = j - h * ROWS;
+                        if (r < nr) {
+                            block_score_cache[h * score_stride + row0 + r] =
+                                scores[j];
+                        }
+                    }
+                    __syncthreads();
+                }
+            } else {
+                for (uint32_t j = tid; j < HEADS * ROWS;
+                     j += blockDim.x) {
+                    const uint32_t h = j / ROWS;
+                    const uint32_t r = j - h * ROWS;
+                    if (r < nr) {
+                        scores[j] =
+                            block_score_cache[h * score_stride + row0 + r];
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (pass == 0u) {
+                if (tid < HEADS) {
+                    float m = softmax_max[tid];
+                    float den = softmax_den[tid];
+                    for (uint32_t r = 0u; r < nr; r++) {
+                        const float s = scores[tid * ROWS + r] * score_scale;
+                        const float new_m = fmaxf(m, s);
+                        den = den * expf(m - new_m) + expf(s - new_m);
+                        m = new_m;
+                    }
+                    softmax_max[tid] = m;
+                    softmax_den[tid] = den;
+                }
+                __syncthreads();
+                continue;
+            }
+
+            for (uint32_t j = tid; j < HEADS * ROWS; j += blockDim.x) {
+                const uint32_t h = j / ROWS;
+                const uint32_t r = j - h * ROWS;
+                float p = 0.0f;
+                if (r < nr && softmax_den[h] != 0.0f) {
+                    const float s = scores[h * ROWS + r] * score_scale;
+                    p = expf(s - softmax_max[h]) / softmax_den[h];
+                }
+                probs[j] = __float2half(p);
+            }
+            __syncthreads();
+
+            if (wave < 32u) {
+                frag_a p0;
+                frag_a p1;
+                frag_b_row vb;
+                rocwmma::load_matrix_sync(p0, probs, ROWS);
+                rocwmma::load_matrix_sync(p1, probs + BM * ROWS, ROWS);
+                rocwmma::load_matrix_sync(
+                    vb, kv_half + wave * BN, LDS_DIM);
+                rocwmma::mma_sync(out0, p0, vb, out0);
+                rocwmma::mma_sync(out1, p1, vb, out1);
+            }
+            __syncthreads();
+        }
+    }
+
+    if (wave < 32u) {
+        float *out = heads + ((uint64_t)t * n_head + head0) * DIM;
+        rocwmma::store_matrix_sync(
+            out + wave * BN, out0, DIM, rocwmma::mem_row_major);
+        rocwmma::store_matrix_sync(
+            out + BM * DIM + wave * BN,
+            out1,
+            DIM,
+            rocwmma::mem_row_major);
+    }
+}
+#endif
 
 __global__ static void attention_prefill_raw_kernel(
         float *heads,

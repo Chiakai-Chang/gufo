@@ -350,7 +350,8 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_mirror_f16) {
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         !hip_compressor_shape_supported(head_dim, ratio) || n_tokens == 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -375,7 +376,10 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
         !hip_model_range_fits(model_size, norm_offset, norm_bytes) ||
         !hip_tensor_has_bytes(kv, kv_bytes) || !hip_tensor_has_bytes(sc, kv_bytes) ||
         !hip_tensor_has_bytes(state_kv, state_bytes) || !hip_tensor_has_bytes(state_score, state_bytes) ||
-        (n_comp && !hip_tensor_has_bytes(comp_cache, comp_bytes))) {
+        (n_comp && !hip_tensor_has_bytes(comp_cache, comp_bytes)) ||
+        (comp_mirror_f16 &&
+         !hip_tensor_has_elems2(
+                 comp_mirror_f16, n_comp, head_dim, sizeof(half)))) {
         return 0;
     }
     const char *ape = hip_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
@@ -433,7 +437,16 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
                                                          n_rot, pos0, ratio, n_ctx_orig, false,
                                                          freq_base, freq_scale, ext_factor,
                                                          attn_factor, beta_fast, beta_slow)) return 0;
-        if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
+        if (quantize_fp8) {
+            const int quantized = comp_mirror_f16
+                ? ds4_gpu_dsv4_fp8_kv_quantize_mirror_f16_tensor(
+                        comp_cache, comp_mirror_f16, n_comp, head_dim, n_rot)
+                : ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+                        comp_cache, n_comp, head_dim, n_rot);
+            if (!quantized) return 0;
+        } else if (comp_mirror_f16) {
+            return 0;
+        }
     }
     return 1;
 }
@@ -461,7 +474,8 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         float                   attn_factor,
         float                   beta_fast,
         float                   beta_slow,
-        float                   rms_eps) {
+        float                   rms_eps,
+        ds4_gpu_tensor       *comp_mirror_f16) {
     if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
         head_dim == 0 || n_tokens == 0 || (n_tokens & 3u) != 0 || (pos0 & 3u) != 0 ||
         n_rot > head_dim || (n_rot & 1u) != 0 ||
@@ -483,7 +497,10 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
         !hip_model_range_fits(model_size, norm_offset, norm_bytes) ||
         !hip_tensor_has_bytes(kv, kv_bytes) || !hip_tensor_has_bytes(sc, kv_bytes) ||
         !hip_tensor_has_bytes(state_kv, state_bytes) || !hip_tensor_has_bytes(state_score, state_bytes) ||
-        !hip_tensor_has_bytes(comp_cache, comp_bytes)) {
+        !hip_tensor_has_bytes(comp_cache, comp_bytes) ||
+        (comp_mirror_f16 &&
+         !hip_tensor_has_elems2(
+                 comp_mirror_f16, n_comp, head_dim, sizeof(half)))) {
         return 0;
     }
     const char *ape = hip_model_range_ptr(model_map, ape_offset, ape_bytes, "compressor_ape");
@@ -504,7 +521,16 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                                                      n_rot, pos0, ratio, n_ctx_orig, false,
                                                      freq_base, freq_scale, ext_factor,
                                                      attn_factor, beta_fast, beta_slow)) return 0;
-    if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) return 0;
+    if (quantize_fp8) {
+        const int quantized = comp_mirror_f16
+            ? ds4_gpu_dsv4_fp8_kv_quantize_mirror_f16_tensor(
+                    comp_cache, comp_mirror_f16, n_comp, head_dim, n_rot)
+            : ds4_gpu_dsv4_fp8_kv_quantize_tensor(
+                    comp_cache, n_comp, head_dim, n_rot);
+        if (!quantized) return 0;
+    } else if (comp_mirror_f16) {
+        return 0;
+    }
 
     uint64_t state_n = (uint64_t)state_rows * width;
     if (!hip_ok(hipMemsetAsync(state_kv->ptr, 0, (size_t)(state_n * sizeof(float))),
