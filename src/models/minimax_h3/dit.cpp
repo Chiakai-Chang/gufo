@@ -69,6 +69,9 @@ std::uint64_t DitBlockSession::weight_bytes() const noexcept {
 std::uint64_t DitBlockSession::activation_bytes() const noexcept {
   return 0;
 }
+std::uint64_t DitBlockSession::gemm_plan_validations() const noexcept {
+  return 0;
+}
 double DitBlockSession::load_ms() const noexcept {
   return 0.0;
 }

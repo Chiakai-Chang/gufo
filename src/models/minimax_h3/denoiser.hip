@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <memory>
 #include <numeric>
@@ -1094,6 +1096,153 @@ struct DenoiserSession::Impl {
       }
     }
 
+    if (active_blocks == static_cast<int>(kDitBlocks)) {
+      struct CoreLoadResult {
+        std::vector<std::unique_ptr<DitBlockSession>> sessions;
+        double load_ms{0.0};
+        std::uint64_t weight_bytes{0};
+        std::uint64_t scratch_bytes{0};
+        std::uint64_t cumulative_allocation_bytes{0};
+        std::uint64_t gemm_plan_validations{0};
+        std::string error;
+      };
+      const std::size_t rows = layout.rows();
+      const std::size_t modulation_rows =
+          static_cast<std::size_t>(time_rows.time_rows) * kDitModalities;
+      auto core_future = std::async(
+          std::launch::async,
+          [this, rows, modulation_rows, cancellation]() {
+            CoreLoadResult result;
+            const auto load_begin = Clock::now();
+            struct WorkerResult {
+              std::vector<std::pair<std::size_t,
+                                    std::unique_ptr<DitBlockSession>>>
+                  sessions;
+              std::uint64_t weight_bytes{0};
+              std::uint64_t scratch_bytes{0};
+              std::uint64_t cumulative_allocation_bytes{0};
+              std::uint64_t gemm_plan_validations{0};
+              std::string error;
+            };
+            std::atomic<std::size_t> next_block{0};
+            const auto worker = [&]() {
+              WorkerResult worker_result;
+              worker_result.sessions.reserve(kDitBlocks / 2U + 1U);
+              while (true) {
+                const std::size_t block =
+                    next_block.fetch_add(1, std::memory_order_relaxed);
+                if (block >= kDitBlocks) {
+                  break;
+                }
+                if (IsCancelled(cancellation)) {
+                  worker_result.error = "MiniMax H3 core load cancelled";
+                  break;
+                }
+                auto session = DitBlockSession::Create(
+                    *inventory,
+                    {.block_index = block,
+                     .rows = rows,
+                     .modulation_rows = modulation_rows,
+                     .row_parallel_attention = row_parallel_attention,
+                     .validate_gemm_plans = block == 0},
+                    cancellation, &worker_result.error);
+                if (session == nullptr) {
+                  break;
+                }
+                worker_result.weight_bytes += session->weight_bytes();
+                worker_result.scratch_bytes += session->activation_bytes();
+                worker_result.gemm_plan_validations +=
+                    session->gemm_plan_validations();
+                worker_result.cumulative_allocation_bytes +=
+                    session->weight_bytes() + session->activation_bytes();
+                worker_result.sessions.emplace_back(block, std::move(session));
+              }
+              return worker_result;
+            };
+            auto second_worker =
+                std::async(std::launch::async, worker);
+            WorkerResult first = worker();
+            WorkerResult second = second_worker.get();
+            result.sessions.resize(kDitBlocks);
+            const auto merge = [&](WorkerResult* worker_result) {
+              if (result.error.empty() && !worker_result->error.empty()) {
+                result.error = std::move(worker_result->error);
+              }
+              result.weight_bytes += worker_result->weight_bytes;
+              result.scratch_bytes += worker_result->scratch_bytes;
+              result.cumulative_allocation_bytes +=
+                  worker_result->cumulative_allocation_bytes;
+              result.gemm_plan_validations +=
+                  worker_result->gemm_plan_validations;
+              for (auto& [block, session] : worker_result->sessions) {
+                result.sessions[block] = std::move(session);
+              }
+            };
+            merge(&first);
+            merge(&second);
+            result.load_ms = Milliseconds(load_begin, Clock::now());
+            return result;
+          });
+
+      ranked_modulations.resize(kDitBlocks);
+      for (const std::size_t block : selected_blocks) {
+        if (IsCancelled(cancellation)) {
+          SetError(error, "MiniMax H3 AdaLN precompute cancelled");
+          return false;
+        }
+        const std::string prefix =
+            "blocks." + std::to_string(block) + ".adaln_proj";
+        const auto modulation_begin = Clock::now();
+        if (!ComputeModulation(prefix, kBlockModulationWidth, time_embedding,
+                               block == 0, cancellation,
+                               &ranked_modulations[block], error)) {
+          return false;
+        }
+        base_telemetry.adaln_precompute_ms +=
+            Milliseconds(modulation_begin, Clock::now());
+      }
+      block0_modulation_host = ranked_modulations[0];
+      const auto final_begin = Clock::now();
+      if (!ComputeModulation("final_layer.adaln_proj", kFinalModulationWidth,
+                             time_embedding, true, cancellation,
+                             &final_modulation_host, error)) {
+        return false;
+      }
+      base_telemetry.adaln_precompute_ms +=
+          Milliseconds(final_begin, Clock::now());
+
+      CoreLoadResult loaded = core_future.get();
+      const bool missing_block =
+          std::ranges::any_of(loaded.sessions, [](const auto& session) {
+            return session == nullptr;
+          });
+      if (!loaded.error.empty() || missing_block) {
+        SetError(error, loaded.error.empty()
+                            ? "MiniMax H3 core load did not return every block"
+                            : std::move(loaded.error));
+        return false;
+      }
+      base_telemetry.core_load_ms += loaded.load_ms;
+      base_telemetry.core_weight_bytes += loaded.weight_bytes;
+      base_telemetry.scratch_bytes += loaded.scratch_bytes;
+      base_telemetry.core_gemm_plan_validations +=
+          loaded.gemm_plan_validations;
+      base_telemetry.cumulative_allocation_bytes +=
+          loaded.cumulative_allocation_bytes;
+      blocks = std::move(loaded.sessions);
+      for (std::size_t index = 0; index < blocks.size(); ++index) {
+        const auto prepare_begin = Clock::now();
+        if (!blocks[index]->PrepareConstants(ranked_modulations[index],
+                                             rope_cos, rope_sin, cancellation,
+                                             error)) {
+          return false;
+        }
+        base_telemetry.core_load_ms +=
+            Milliseconds(prepare_begin, Clock::now());
+      }
+      return true;
+    }
+
     blocks.reserve(selected_blocks.size());
     for (const std::size_t block : selected_blocks) {
       if (IsCancelled(cancellation)) {
@@ -1126,7 +1275,8 @@ struct DenoiserSession::Impl {
            .rows = layout.rows(),
            .modulation_rows =
                static_cast<std::size_t>(time_rows.time_rows) * kDitModalities,
-           .row_parallel_attention = row_parallel_attention},
+           .row_parallel_attention = row_parallel_attention,
+           .validate_gemm_plans = blocks.empty()},
           cancellation, error);
       if (session == nullptr ||
           !session->PrepareConstants(modulation, rope_cos, rope_sin,
@@ -1136,6 +1286,8 @@ struct DenoiserSession::Impl {
       base_telemetry.core_load_ms += Milliseconds(load_begin, Clock::now());
       base_telemetry.core_weight_bytes += session->weight_bytes();
       base_telemetry.scratch_bytes += session->activation_bytes();
+      base_telemetry.core_gemm_plan_validations +=
+          session->gemm_plan_validations();
       base_telemetry.cumulative_allocation_bytes +=
           session->weight_bytes() + session->activation_bytes();
       blocks.push_back(std::move(session));
@@ -1490,6 +1642,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
     const DenoiserConditioning& conditioning,
     const CancellationToken* cancellation, DenoiserTelemetry* telemetry,
     std::string* error) {
+  const auto setup_begin = Clock::now();
   const Faults faults_before = ReadFaults();
   if (options.evaluations < 2 || options.evaluations > kH3MaximumEvaluations ||
       options.active_blocks < 3 ||
@@ -1561,6 +1714,7 @@ std::unique_ptr<DenoiserSession> DenoiserSession::Create(
   }
   (void)hipHostFree(impl->staging);
   impl->staging = nullptr;
+  impl->base_telemetry.setup_ms = Milliseconds(setup_begin, Clock::now());
   const Faults faults_after = ReadFaults();
   impl->base_telemetry.minor_page_faults =
       faults_after.minor - faults_before.minor;

@@ -47,6 +47,7 @@ SelectGateRankedDenoiserBlocks(std::span<const double> gate_scores,
                                int active_blocks, std::string* error = nullptr);
 
 struct DenoiserTelemetry {
+  double setup_ms{0.0};
   double text_refiner_ms{0.0};
   double adaln_precompute_ms{0.0};
   double core_load_ms{0.0};
@@ -57,6 +58,7 @@ struct DenoiserTelemetry {
   std::uint64_t scratch_bytes{0};
   std::uint64_t peak_live_bytes{0};
   std::uint64_t cumulative_allocation_bytes{0};
+  std::uint64_t core_gemm_plan_validations{0};
   std::uint64_t minor_page_faults{0};
   std::uint64_t major_page_faults{0};
   std::uint64_t swap_bytes{0};

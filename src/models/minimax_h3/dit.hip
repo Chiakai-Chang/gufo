@@ -38,6 +38,25 @@ constexpr std::size_t kMaximumBatchedAttentionRows = 4'096;
 // 7.2.3 toolchain. A changed rocBLAS database fails session construction.
 constexpr rocblas_int kGfx1151RocblasBf16Solution = -1162085109;
 
+rocblas_int PinnedBf16Solution(std::size_t batch, std::size_t rows,
+                              std::size_t columns) {
+  if (batch == 1872) {
+    if (rows == 21504 && columns == 5376) {
+      return -1162085131;
+    }
+    if (rows == 5376 && columns == 7168) {
+      return -1162085139;
+    }
+    if (rows == 28672 && columns == 5376) {
+      return -1162085137;
+    }
+    if (rows == 5376 && columns == 14336) {
+      return -1162085127;
+    }
+  }
+  return kGfx1151RocblasBf16Solution;
+}
+
 template<ck::index_t... Values>
 using CkSequence = ck::Sequence<Values...>;
 
@@ -348,8 +367,23 @@ public:
     }
     if (FindPlan(batch, rows, columns) == nullptr) {
       plans_.push_back(
-          {batch, rows, columns, kGfx1151RocblasBf16Solution, false});
+          {batch, rows, columns, PinnedBf16Solution(batch, rows, columns),
+           false});
     }
+    return true;
+  }
+
+  bool TrustPinnedSolution(std::size_t batch, std::size_t rows,
+                           std::size_t columns, std::string* error) {
+    if (!Prepare(batch, rows, columns, error)) {
+      return false;
+    }
+    Plan* plan = FindPlan(batch, rows, columns);
+    if (plan == nullptr) {
+      SetError(error, "rocBLAS BF16 DiT plan lookup failed");
+      return false;
+    }
+    plan->selected = true;
     return true;
   }
 
@@ -637,6 +671,7 @@ struct DitBlockSession::Impl {
 
   std::uint64_t weight_bytes{0};
   std::uint64_t activation_bytes{0};
+  std::uint64_t gemm_plan_validations{0};
   double load_ms{0.0};
   bool constants_prepared{false};
 
@@ -796,9 +831,12 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
       !allocate(&impl->fc1, bf16_bytes(fc1_elements)) ||
       !allocate(&impl->activated, bf16_bytes(activated_elements)) ||
       !allocate(&impl->mlp_output, bf16_bytes(hidden_elements)) ||
-      !allocate(&impl->block_output, bf16_bytes(hidden_elements)) ||
-      !allocate(&impl->gemm_reference, bf16_bytes(fc1_elements)) ||
-      !allocate(&impl->gemm_first_mismatch, sizeof(unsigned long long))) {
+      !allocate(&impl->block_output, bf16_bytes(hidden_elements))) {
+    return nullptr;
+  }
+  if (options.validate_gemm_plans &&
+      (!allocate(&impl->gemm_reference, bf16_bytes(fc1_elements)) ||
+       !allocate(&impl->gemm_first_mismatch, sizeof(unsigned long long)))) {
     return nullptr;
   }
   if (options.row_parallel_attention && !impl->fused_attention) {
@@ -828,56 +866,71 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
                           error)) {
     return nullptr;
   }
-  // Select a concrete byte-deterministic rocBLAS solution for every fixed
-  // orientation. This also performs all library initialization before Run.
-  const auto fill = [&](DeviceBuffer* buffer, std::uint32_t seed) {
-    dit_ops::LaunchFillBf16Pattern(buffer->As<std::uint16_t>(),
-                                   buffer->bytes() / sizeof(std::uint16_t),
-                                   seed, impl->stream);
-    return hipPeekAtLastError() == hipSuccess;
-  };
-  if (!fill(&impl->hidden, 0x169001U) ||
-      !fill(&impl->attention_heads, 0x169002U) ||
-      !fill(&impl->modulation_mlp, 0x169003U) ||
-      !fill(&impl->activated, 0x169004U) ||
-      !impl->gemm.SelectDeterministic(
-          impl->qkv_weight.storage.As<std::uint16_t>(),
-          impl->hidden.As<std::uint16_t>(), impl->qkv.As<std::uint16_t>(),
-          impl->gemm_reference.As<std::uint16_t>(),
-          impl->gemm_first_mismatch.As<unsigned long long>(), options.rows,
-          kDitAttentionWidth * 3U, kDitHiddenSize, impl->stream, error) ||
-      !impl->gemm.SelectDeterministic(
-          impl->output_weight.storage.As<std::uint16_t>(),
-          impl->attention_heads.As<std::uint16_t>(),
-          impl->attention_output.As<std::uint16_t>(),
-          impl->gemm_reference.As<std::uint16_t>(),
-          impl->gemm_first_mismatch.As<unsigned long long>(), options.rows,
-          kDitHiddenSize, kDitAttentionWidth, impl->stream, error) ||
-      !impl->gemm.SelectDeterministic(
-          impl->fc1_weight.storage.As<std::uint16_t>(),
-          impl->modulation_mlp.As<std::uint16_t>(),
-          impl->fc1.As<std::uint16_t>(),
-          impl->gemm_reference.As<std::uint16_t>(),
-          impl->gemm_first_mismatch.As<unsigned long long>(), options.rows,
-          kDitFeedForwardSize * 2U, kDitHiddenSize, impl->stream, error) ||
-      !impl->gemm.SelectDeterministic(
-          impl->fc2_weight.storage.As<std::uint16_t>(),
-          impl->activated.As<std::uint16_t>(),
-          impl->mlp_output.As<std::uint16_t>(),
-          impl->gemm_reference.As<std::uint16_t>(),
-          impl->gemm_first_mismatch.As<unsigned long long>(), options.rows,
-          kDitHiddenSize, kDitFeedForwardSize, impl->stream, error)) {
+  if (options.validate_gemm_plans) {
+    // Validate each fixed orientation once. Denoiser construction performs
+    // this on its first selected block and reuses the pinned gfx1151 contract
+    // for every remaining block with the same shapes.
+    const auto fill = [&](DeviceBuffer* buffer, std::uint32_t seed) {
+      dit_ops::LaunchFillBf16Pattern(buffer->As<std::uint16_t>(),
+                                     buffer->bytes() / sizeof(std::uint16_t),
+                                     seed, impl->stream);
+      return hipPeekAtLastError() == hipSuccess;
+    };
+    if (!fill(&impl->hidden, 0x169001U) ||
+        !fill(&impl->attention_heads, 0x169002U) ||
+        !fill(&impl->modulation_mlp, 0x169003U) ||
+        !fill(&impl->activated, 0x169004U) ||
+        !impl->gemm.SelectDeterministic(
+            impl->qkv_weight.storage.As<std::uint16_t>(),
+            impl->hidden.As<std::uint16_t>(), impl->qkv.As<std::uint16_t>(),
+            impl->gemm_reference.As<std::uint16_t>(),
+            impl->gemm_first_mismatch.As<unsigned long long>(), options.rows,
+            kDitAttentionWidth * 3U, kDitHiddenSize, impl->stream, error) ||
+        !impl->gemm.SelectDeterministic(
+            impl->output_weight.storage.As<std::uint16_t>(),
+            impl->attention_heads.As<std::uint16_t>(),
+            impl->attention_output.As<std::uint16_t>(),
+            impl->gemm_reference.As<std::uint16_t>(),
+            impl->gemm_first_mismatch.As<unsigned long long>(), options.rows,
+            kDitHiddenSize, kDitAttentionWidth, impl->stream, error) ||
+        !impl->gemm.SelectDeterministic(
+            impl->fc1_weight.storage.As<std::uint16_t>(),
+            impl->modulation_mlp.As<std::uint16_t>(),
+            impl->fc1.As<std::uint16_t>(),
+            impl->gemm_reference.As<std::uint16_t>(),
+            impl->gemm_first_mismatch.As<unsigned long long>(), options.rows,
+            kDitFeedForwardSize * 2U, kDitHiddenSize, impl->stream, error) ||
+        !impl->gemm.SelectDeterministic(
+            impl->fc2_weight.storage.As<std::uint16_t>(),
+            impl->activated.As<std::uint16_t>(),
+            impl->mlp_output.As<std::uint16_t>(),
+            impl->gemm_reference.As<std::uint16_t>(),
+            impl->gemm_first_mismatch.As<unsigned long long>(), options.rows,
+            kDitHiddenSize, kDitFeedForwardSize, impl->stream, error)) {
+      return nullptr;
+    }
+    status = hipStreamSynchronize(impl->stream);
+    if (status != hipSuccess) {
+      SetError(error, HipError("validate MiniMax H3 DiT GEMMs", status));
+      return nullptr;
+    }
+    impl->gemm_plan_validations = 4;
+    impl->activation_bytes -=
+        impl->gemm_reference.bytes() + impl->gemm_first_mismatch.bytes();
+    impl->gemm_reference.Reset();
+    impl->gemm_first_mismatch.Reset();
+  } else if (!impl->gemm.TrustPinnedSolution(
+                 options.rows, kDitAttentionWidth * 3U, kDitHiddenSize,
+                 error) ||
+             !impl->gemm.TrustPinnedSolution(
+                 options.rows, kDitHiddenSize, kDitAttentionWidth, error) ||
+             !impl->gemm.TrustPinnedSolution(
+                 options.rows, kDitFeedForwardSize * 2U, kDitHiddenSize,
+                 error) ||
+             !impl->gemm.TrustPinnedSolution(
+                 options.rows, kDitHiddenSize, kDitFeedForwardSize, error)) {
     return nullptr;
   }
-  status = hipStreamSynchronize(impl->stream);
-  if (status != hipSuccess) {
-    SetError(error, HipError("warm MiniMax H3 DiT GEMMs", status));
-    return nullptr;
-  }
-  impl->activation_bytes -=
-      impl->gemm_reference.bytes() + impl->gemm_first_mismatch.bytes();
-  impl->gemm_reference.Reset();
-  impl->gemm_first_mismatch.Reset();
   return std::unique_ptr<DitBlockSession>(new DitBlockSession(std::move(impl)));
 }
 
@@ -1232,6 +1285,10 @@ std::uint64_t DitBlockSession::weight_bytes() const noexcept {
 
 std::uint64_t DitBlockSession::activation_bytes() const noexcept {
   return impl_ == nullptr ? 0 : impl_->activation_bytes;
+}
+
+std::uint64_t DitBlockSession::gemm_plan_validations() const noexcept {
+  return impl_ == nullptr ? 0 : impl_->gemm_plan_validations;
 }
 
 double DitBlockSession::load_ms() const noexcept {

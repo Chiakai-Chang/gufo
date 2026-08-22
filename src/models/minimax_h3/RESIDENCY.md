@@ -89,6 +89,30 @@ The full-denoiser route does not overlap the 62.13 GiB prompt encoder with the
 transformer peak. It accepts only the retained layer-50 tensor and immediately
 reduces the live prompt boundary to the 63 KiB refined conditioning tensor.
 
+Exact-mode construction validates the four fixed BF16 GEMM shapes once, then
+loads two independent DiT blocks concurrently while AdaLN projections are
+precomputed. Concurrency is deliberately bounded at two workers. The 528-row
+oracle reduced measured setup from approximately 35.0 s to 13.51 s while
+retaining four plan validations, zero swap, and the refined-text, modulation,
+video-velocity, and audio-velocity quality bounds.
+
+Direct file-backed execution was rejected for repeatedly reused DiT weights:
+although its output passed the block oracle, a production 1,872-row block
+regressed against normal device-resident execution. A phase-wide
+mapped-to-device copy also increased measured setup. Mapped weights therefore
+remain appropriate for streamed phases such as the prompt encoder, not for the
+repeatedly reused DiT core.
+
+Production-shape profiling pins four rocBLAS solutions specifically for the
+1,872-row 512x512 workload. The focused block improved from 203.28 ms to
+177.33 ms (12.8%). The independent 512 oracle retained its refined-text,
+block-0 modulation, video-velocity, and audio-velocity bounds.
+
+VisualVAE linear bias application uses aligned `float4` transactions whenever
+the output width permits it. The selected-frame oracle remained within
+`8.16e-7` relative L2 and `2.39e-6` relative maximum error; profiled bias
+kernels fell from 1.549 s to 0.677 s (56.3%).
+
 AdaLN/time weights are never admitted as a 24.35 GiB phase. The runtime keeps
 the small timestep embedding, then loads one block's 96,768x2,688 projection
 and bias, materializes all required schedule rows, transfers those constants

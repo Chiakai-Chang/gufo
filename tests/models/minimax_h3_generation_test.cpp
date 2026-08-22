@@ -181,6 +181,8 @@ void TestPresetsAndReports() {
                                              .gpu_ms = 4.0,
                                              .dispatches = 17});
   telemetry.denoiser.adaln_precompute_ms = 5.0;
+  telemetry.denoiser.core_gemm_plan_validations = 4;
+  telemetry.denoiser.setup_ms = 1234.5;
   telemetry.video_vae.tile_ms = {6.0};
   telemetry.audio_vae.stage_ms = {7.0};
   telemetry.first_preview_ms = 8.0;
@@ -199,6 +201,12 @@ void TestPresetsAndReports() {
   Check(telemetry_json.find("\"denoiser_adaln_precompute_ms\": 5.000") !=
             std::string::npos,
         "telemetry records AdaLN precompute");
+  Check(telemetry_json.find("\"denoiser_core_gemm_plan_validations\": 4") !=
+            std::string::npos,
+        "telemetry records unique core GEMM plan validations");
+  Check(telemetry_json.find("\"denoiser_setup_ms\": 1234.500") !=
+            std::string::npos,
+        "telemetry records the overlapped denoiser setup wall time");
   Check(
       telemetry_json.find("\"denoiser_attention_kernel\": \"row_parallel\"") !=
           std::string::npos,

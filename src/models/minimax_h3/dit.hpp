@@ -28,6 +28,7 @@ struct DitBlockOptions {
   std::size_t rows{0};
   std::size_t modulation_rows{0};
   bool row_parallel_attention{true};
+  bool validate_gemm_plans{true};
 };
 
 struct DitBlockInput {
@@ -100,6 +101,7 @@ public:
   [[nodiscard]] std::uintptr_t scratch_address() const noexcept;
   [[nodiscard]] std::uint64_t weight_bytes() const noexcept;
   [[nodiscard]] std::uint64_t activation_bytes() const noexcept;
+  [[nodiscard]] std::uint64_t gemm_plan_validations() const noexcept;
   [[nodiscard]] double load_ms() const noexcept;
 
 private:

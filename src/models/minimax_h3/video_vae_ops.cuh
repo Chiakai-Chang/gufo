@@ -17,9 +17,32 @@ static __global__ void AddBiasKernel(float* values, const float* bias,
   }
 }
 
+static __global__ void AddBiasFloat4Kernel(float4* values, const float4* bias,
+                                           std::uint32_t rows,
+                                           std::uint32_t vectors) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row < rows && column < vectors) {
+    const std::size_t index = static_cast<std::size_t>(row) * vectors + column;
+    const float4 value = values[index];
+    const float4 offset = bias[column];
+    values[index] = {value.x + offset.x, value.y + offset.y,
+                     value.z + offset.z, value.w + offset.w};
+  }
+}
+
 inline void LaunchAddBias(float* values, const float* bias, std::uint32_t rows,
                           std::uint32_t width, hipStream_t stream) {
   constexpr std::uint32_t kThreads = 256;
+  if (width % 4U == 0U) {
+    const std::uint32_t vectors = width / 4U;
+    hipLaunchKernelGGL(
+        AddBiasFloat4Kernel,
+        dim3((vectors + kThreads - 1U) / kThreads, rows), dim3(kThreads), 0,
+        stream, reinterpret_cast<float4*>(values),
+        reinterpret_cast<const float4*>(bias), rows, vectors);
+    return;
+  }
   hipLaunchKernelGGL(AddBiasKernel,
                      dim3((width + kThreads - 1U) / kThreads, rows),
                      dim3(kThreads), 0, stream, values, bias, rows, width);
