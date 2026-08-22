@@ -174,6 +174,28 @@ Each required diagnostic is invoked once. A passing full route is not rerun,
 and a 50-step generation is never launched merely to obtain performance
 statistics.
 
+The retained 512x512 one-forward comparison admitted row-parallel attention:
+
+| Measurement | Scalar | Row-parallel |
+| --- | ---: | ---: |
+| full 50-block forward | 249.167 s | 145.167 s |
+| accounted peak | 58.8037 GiB | 58.8037 GiB |
+| process swap | 0 bytes | 0 bytes |
+
+The two policies produced byte-identical video and audio velocities. The
+`1.716x` speedup exceeds the 5% retention threshold without increasing peak
+memory. A separate existing row-path monitor capture supplied 704 power/clock
+samples, reached 2,900 MHz and 98.027 W, and recorded zero swap; because that
+generation was cancelled after two steps, those samples are diagnostics only,
+not latency or quality evidence.
+
+Historical scalar phase timing ranks the denoiser at 98.326% of complete
+latency, VisualVAE at 1.240%, prompt encoding at 0.163%, and AudioVAE at
+0.016%. After retaining row-parallel attention, the DiT forward remains the
+dominant target. Dense projection/MLP work and the conservative host-staged
+block boundary are the next candidates, but neither is authorized without a
+new focused profile.
+
 `tools/strix/h3_cache_control.py` provides the separate reproducible
 file-cache-cold preparation. It issues `POSIX_FADV_DONTNEED` for every regular,
 non-symlink file under the operator-supplied model root, using `O_NOFOLLOW` and

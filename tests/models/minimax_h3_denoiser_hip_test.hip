@@ -532,6 +532,116 @@ int CheckProductionShapeOracle() {
   return failures == 0 ? 0 : 1;
 }
 
+int CheckProductionAttentionBenchmark() {
+  const char* root = std::getenv("STRIX_H3_MODEL_ROOT");
+  const char* golden_value =
+      std::getenv("STRIX_H3_DENOISER_GOLDEN_512");
+  if (root == nullptr || golden_value == nullptr) {
+    std::cout << "SKIP: STRIX_H3_MODEL_ROOT or "
+                 "STRIX_H3_DENOISER_GOLDEN_512 unset\n";
+    return 77;
+  }
+  constexpr std::size_t kTextRows = 6;
+  constexpr std::size_t kVideoElements = 24 * 7 * 32 * 32;
+  constexpr std::size_t kAudioElements = 32 * 2 * 37;
+  const std::filesystem::path golden(golden_value);
+  const auto conditioning =
+      ReadBf16(golden / "conditioning.bf16",
+               kTextRows * h3::kH3TextConditionWidth);
+  const auto video_initial =
+      ReadF32(golden / "video_initial.f32", kVideoElements);
+  const auto audio_initial =
+      ReadF32(golden / "audio_initial.f32", kAudioElements);
+  CHECK(!conditioning.empty());
+  CHECK(!video_initial.empty());
+  CHECK(!audio_initial.empty());
+  if (failures != 0) {
+    return 1;
+  }
+
+  std::string error;
+  const auto inventory =
+      h3::ModelInventory::Inspect(root, STRIX_H3_SOURCE_MANIFEST, &error);
+  const auto geometry = h3::ResolveGenerationGeometry(512, 512, 22, &error);
+  CHECK(inventory.has_value());
+  CHECK(geometry.has_value());
+  if (!inventory || !geometry) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+
+  struct Observation {
+    h3::DenoiserVelocity velocity;
+    double forward_ms{0.0};
+    std::uint64_t peak_live_bytes{0};
+    std::uint64_t swap_bytes{0};
+  };
+  const auto run = [&](bool row_parallel, Observation* observation) {
+    h3::DenoiserTelemetry creation;
+    auto session = h3::DenoiserSession::Create(
+        *inventory,
+        {.geometry = *geometry,
+         .evaluations = 2,
+         .text_rows = kTextRows,
+         .row_parallel_attention = row_parallel},
+        {.layer50 = conditioning, .tags = {}}, nullptr, &creation, &error);
+    CHECK(session != nullptr);
+    if (session == nullptr) {
+      std::cerr << error << '\n';
+      return false;
+    }
+    h3::DenoiserTelemetry telemetry;
+    if (!session->Forward(0, video_initial, audio_initial, nullptr,
+                          &observation->velocity, &telemetry, &error) ||
+        telemetry.forward_ms.empty()) {
+      CHECK(false);
+      std::cerr << error << '\n';
+      return false;
+    }
+    observation->forward_ms = telemetry.forward_ms.back();
+    observation->peak_live_bytes = telemetry.peak_live_bytes;
+    observation->swap_bytes = telemetry.swap_bytes;
+    return true;
+  };
+
+  Observation scalar;
+  Observation row_parallel;
+  if (!run(false, &scalar) || !run(true, &row_parallel)) {
+    return 1;
+  }
+  CHECK(Finite(scalar.velocity.video));
+  CHECK(Finite(scalar.velocity.audio));
+  CHECK(scalar.velocity.video == row_parallel.velocity.video);
+  CHECK(scalar.velocity.audio == row_parallel.velocity.audio);
+  CHECK(scalar.swap_bytes == 0);
+  CHECK(row_parallel.swap_bytes == 0);
+  const double speedup = scalar.forward_ms / row_parallel.forward_ms;
+  const double peak_ratio =
+      static_cast<double>(row_parallel.peak_live_bytes) /
+      static_cast<double>(scalar.peak_live_bytes);
+  CHECK(speedup > 1.05);
+  CHECK(peak_ratio <= 1.02);
+  const auto bytes = [](std::span<const float> values) {
+    return std::span<const unsigned char>(
+        reinterpret_cast<const unsigned char*>(values.data()),
+        values.size_bytes());
+  };
+  std::cout << "H3 production attention benchmark rows=1872"
+            << " scalar_forward_ms=" << scalar.forward_ms
+            << " row_parallel_forward_ms=" << row_parallel.forward_ms
+            << " speedup=" << speedup << " scalar_peak_gib="
+            << static_cast<double>(scalar.peak_live_bytes) /
+                   (1024.0 * 1024.0 * 1024.0)
+            << " row_parallel_peak_gib="
+            << static_cast<double>(row_parallel.peak_live_bytes) /
+                   (1024.0 * 1024.0 * 1024.0)
+            << " peak_ratio=" << peak_ratio
+            << " video_sha256=" << h3::Sha256(bytes(row_parallel.velocity.video))
+            << " audio_sha256=" << h3::Sha256(bytes(row_parallel.velocity.audio))
+            << '\n';
+  return failures == 0 ? 0 : 1;
+}
+
 int CheckReuseSmoke() {
   const char* root = std::getenv("STRIX_H3_MODEL_ROOT");
   const char* conditioning_path = std::getenv("STRIX_H3_LAYER50_CONDITIONING");
@@ -650,9 +760,12 @@ int main(int argc, char** argv) {
   if (argc != 2 || (std::string_view(argv[1]) != "--smoke" &&
                     std::string_view(argv[1]) != "--oracle" &&
                     std::string_view(argv[1]) != "--oracle-512" &&
+                    std::string_view(argv[1]) !=
+                        "--benchmark-attention-512" &&
                     std::string_view(argv[1]) != "--reuse-smoke")) {
     std::cerr << "usage: " << argv[0]
-              << " --smoke|--oracle|--oracle-512|--reuse-smoke\n";
+              << " --smoke|--oracle|--oracle-512|"
+                 "--benchmark-attention-512|--reuse-smoke\n";
     return 2;
   }
   if (std::string_view(argv[1]) == "--oracle") {
@@ -660,6 +773,9 @@ int main(int argc, char** argv) {
   }
   if (std::string_view(argv[1]) == "--oracle-512") {
     return CheckProductionShapeOracle();
+  }
+  if (std::string_view(argv[1]) == "--benchmark-attention-512") {
+    return CheckProductionAttentionBenchmark();
   }
   if (std::string_view(argv[1]) == "--reuse-smoke") {
     return CheckReuseSmoke();

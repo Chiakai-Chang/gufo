@@ -506,6 +506,40 @@ optimization uses the 512x512 two-step denoiser oracle, production-sequence
 attention parity, and focused phase/kernel profiles. A complete 50-step
 generation is run only when explicitly requested after those gates pass.
 
+The retained issue #175 comparison is a manual one-forward benchmark, not a
+CTest target:
+
+```sh
+STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+STRIX_H3_DENOISER_GOLDEN_512=/var/llms/huggingface/strix-h3-oracles/\
+denoiser-512x512x22-2step-v1 \
+  ./build-h3-175/minimax_h3_denoiser_hip_test \
+    --benchmark-attention-512
+```
+
+It creates the same 512x512, 22-frame, 1,872-row, 50-block session twice,
+executes one step-0 forward with each attention policy, and requires
+byte-identical video/audio velocities:
+
+| Policy | Forward | Peak |
+| --- | ---: | ---: |
+| scalar | 249.167 s | 58.8037 GiB |
+| row-parallel | 145.167 s | 58.8037 GiB |
+
+Row-parallel attention is therefore `1.716x` faster for the fixed full-DiT
+forward, a 41.7% latency reduction, with unchanged peak memory and zero swap.
+The retained video and audio velocity SHA-256 values are respectively
+`2e87ce10c86fb9cc734f054f284e45a7885db4ca209353fe84b04da103daa9a6`
+and
+`b6ebaa26c519a1810936d83a4eb7c33b004a24442073c755d442277222a3c964`.
+
+Historical scalar phase timing, used only for bottleneck ranking because its
+delivered MP4 is invalid quality evidence, attributes 98.326% of complete
+latency to the denoiser, 1.240% to VisualVAE, 0.163% to prompt encoding, and
+0.016% to AudioVAE. The next optimization priority therefore remains the DiT
+forward. Dense projections/MLP and the host-staged block boundaries require
+focused profiling before any further change; VisualVAE is a distant second.
+
 The harness schedules each requested preset once, rejects `--rounds` values
 other than one, and requires an acknowledgement before it can launch a
 complete generation:
