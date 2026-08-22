@@ -269,7 +269,7 @@ testing.
 - Avoid repeated-lane loads that have shown unsafe behavior in generic
   gfx1151 Triton patterns.
 - Keep resource usage low enough to maintain useful occupancy on 40 CUs.
-- Tune thermal and sustained-clock behavior, not only short benchmark peaks.
+- Tune sustained-clock behavior, not only short benchmark peaks.
 
 ## Model Isolation
 
@@ -319,7 +319,7 @@ performance gates for every affected model.
 - Cancellation at scheduler commit boundaries.
 - No allocation during timed execution.
 - Scratch and graph lifetime accounting.
-- Long-duration thermal benchmarks.
+- Long-duration benchmarks.
 - rocprof kernel and memory traces for every promoted route.
 - Direct runtime versus server-path parity.
 - Model-private dependency-graph enforcement.

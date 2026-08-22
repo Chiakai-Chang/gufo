@@ -58,7 +58,7 @@ profile exists yet to justify direct system-memory reads. Read-only
 diagnostic mode: it succeeded on the target and avoids the 605 MB device copy,
 but its cold load was sensitive to page residency.
 
-Issue #175 must revisit this default using alternating, thermally balanced
+Issue #175 must revisit this default using alternating, balanced
 complete generations. A metadata or load-only microbenchmark is not an
 end-to-end performance claim.
 

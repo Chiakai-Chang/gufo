@@ -1,6 +1,6 @@
 ---
 name: optimize-kernel
-description: Workflow for GitHub optimization cards (gh issue opt-*) on Strix Halo gfx1151: assess a baseline, change one route behind a policy toggle, verify quality against the baseline, and retain or reject with evidence. Rejection with evidence is a valid card completion.
+description: Workflow for optimizing model inference kernels on Strix Halo gfx1151: assess a baseline, change one route behind a policy toggle, verify quality against the baseline, and retain or reject with evidence. Rejection with evidence is a valid card completion.
 metadata:
   origin: strix-halo.cpp
 ---
@@ -19,8 +19,6 @@ evidence is a valid card completion.
   are `gpu-test` (build) and `gpu-full` (test).
 - Register the equivalence test under the card's CTest label (add the label to
   the `qwen_gpu_ops_test` LABELS list in `CMakeLists.txt`).
-- Commit locally with jj, never push. Delete `task-on-going.md` before the
-  final summary.
 
 ## Task scratch file
 
@@ -32,7 +30,7 @@ only makes sense during the optimization.
 ## 1. Assess the baseline (before any change)
 
 1. Clean stage state: `git add .` (Nix sees only tracked files).
-2. Probe hardware + record revision/fingerprint: `./result/bin/strix`.
+2. Probe hardware + record revision/fingerprint: `nix build && ./result/bin/strix`.
 3. Build:
    - Release: `nix build` (produces `result/`). It builds fully-optimized
      binaries and `./result/bin/strix-server` runs significantly faster with
@@ -40,7 +38,7 @@ only makes sense during the optimization.
    - Fast incremental loop while editing:
      `nix develop -c cmake --build --preset gpu-test`.
    - Build after EVERY step that edits kernels or launchers; never batch
-     several uncommitted kernel edits before compiling.
+     several uncommitted kernel edits before compiling this allows to iterate faster and safer.
 4. Benchmark with `./result/bin/strix-server bench`, single reps (do NOT pass
    `--repetitions`; alternate baseline/candidate runs instead):
    - Combined headline: `-p 2048 -n 128`
@@ -49,10 +47,11 @@ only makes sense during the optimization.
    - Depth scaling: `--n-prompt 2048 --n-depth 0,4096,8192,16384`, plus
      `--n-gen 128 --n-depth 0,4096,8192,16384` for tg. Read
      `src/server/bench_cli.cpp` to interpret values before trusting them.
+   - Until the implementation works do NOT test with big numbers, focus on `--n-prompt 128 --n-gen 16`
 5. Logits comparison (correctness before performance counts):
    `--validate-prefill 1024 --n-prompt 1024 --n-gen 0`; record the envelope
    (current model: rmse `0.02007260`, cosine `0.99997753`, top-1 `198`). A
-   candidate must not regress it.
+   candidate must not regress it. Comparing logits can be extremely slow, do it ONLY at the end to verify end to end correctness of the change.
 6. Profiling (separate pass; tracing changes timing so never profile the
    headline run):
    ```
@@ -66,7 +65,7 @@ only makes sense during the optimization.
    always comes from an unprofiled run.
 
 Record the baseline artifact in `task-on-going.md` (fingerprint, revision,
-thermal, raw samples, register allocation, scratch, occupancy) before touching
+raw samples, register allocation, scratch, occupancy) before touching
 code.
 
 ## 2. Introduce the change
@@ -156,7 +155,7 @@ code.
    - `## Result: REJECTED/...` header with the one-line conclusion
    - Correctness (CTest label passing; validate-prefill envelope)
    - rocprofv3 kernel table (VGPR/SGPR/LDS/scratch/wgs/grid + notes)
-   - Interleaved A/B raw samples + medians, thermal range, memory placement
+   - Interleaved A/B raw samples + medians, memory placement
    - Mechanism / why
    - Decision sentence referencing the card contract
 3. Commit locally: `jj commit -m "perf(hip): evaluate <change> (#<issue>)"`,
@@ -186,33 +185,3 @@ code.
   `benchmarks/qwen3.8-27b/README.md`).
 - Baseline envelope: pp2048 ~335-341, tg128 3.72-3.74,
   validate rmse `0.02007260` / cosine `0.99997753` / top-1 `198`.
-
-## Commands that worked (append as you validate)
-
-- Baseline bench (no reps): see section 1.4.
-- Bench row parse: see section 3.3.
-- rocprofv3 invocation: see section 1.6.
-- rocprof sqlite aggregate (decode stats), devshell python3; table names carry
-  a per-session suffix so match by prefix and unwrap the 1-tuples:
-  ```python
-  import sqlite3
-  c = sqlite3.connect('/tmp/<prof>/homelab/*.db')
-  kd = [t[0] for t in c.execute("SELECT name FROM sqlite_master WHERE type='table'") if t[0].startswith('rocpd_kernel_dispatch')][0]
-  ks = [t[0] for t in c.execute("SELECT name FROM sqlite_master WHERE type='table'") if t[0].startswith('rocpd_info_kernel_symbol')][0]
-  q = f"SELECT ks.kernel_name, COUNT(*), SUM(kd.end-kd.start)/1000.0, AVG(kd.end-kd.start)/1000.0, "\
-      f"MAX(ks.arch_vgpr_count), MAX(ks.sgpr_count), MAX(ks.group_segment_size), "\
-      f"MAX(kd.private_segment_size), MAX(kd.workgroup_size_x), MAX(kd.grid_size_x) "\
-      f"FROM {kd} kd JOIN {ks} ks ON kd.kernel_id=ks.id GROUP BY ks.kernel_name ORDER BY 3 DESC"
-  for r in c.execute(q): print(r)
-  ```
-- Thermal during a run:
-  `(for i in $(seq 1 60); do cat /sys/class/drm/card1/device/hwmon/hwmon1/temp1_input; sleep 2; done > /tmp/thermal.log &)` then report min/max.
-
-## Tooling gotchas
-
-- The exec sandbox rejects `rm -f`/`rm -rf`: use `rm <file>`, and give
-  rocprof fresh output dirs (`/tmp/strix-profile-<tag>`) instead of clearing.
-- `apply_patch` works via shell heredoc: `apply_patch <<'PATCH' ... PATCH`.
-- `nix develop -c ctest --preset gpu-full -L '<label>'` reuses one build; the
-  label set is the filter, so a label typo silently runs nothing
-  (`--no-tests=error` catches it).

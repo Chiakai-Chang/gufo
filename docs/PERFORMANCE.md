@@ -16,7 +16,7 @@ The only production target is Linux x86-64 on AMD Strix Halo:
 - Nix-provided compilers, libraries, profilers, and test tools.
 
 Runtime probes, not assumed peak specifications, determine the available CUs,
-AIE columns, memory, firmware, power mode, and thermal state.
+AIE columns, memory, firmware, and power mode.
 
 ## Optimization Loop
 
@@ -31,7 +31,7 @@ AIE columns, memory, firmware, power mode, and thermal state.
 8. Record the current result, not the full experiment diary.
 
 Optimize end-to-end request behavior. A faster isolated kernel is not a win if
-packing, synchronization, state management, or thermals erase the gain.
+packing, synchronization, or state management erase the gain.
 
 ## Measurement Contract
 
@@ -45,9 +45,9 @@ Comparable runs use the same:
 - Warmup policy and repetition count.
 
 Alternate baseline and candidate runs on the same machine. Report medians and
-tail values rather than the best sample. Record the starting thermal state for
+tail values rather than the best sample. Record the starting state for
 long model runs; do not attribute an increasing-length sweep when the shared
-APU heats materially between cases.
+APU runs materially slower between cases.
 
 Headline latency comes from an unprofiled run. Use separate profiler runs for
 kernel timing, counters, occupancy, VGPR, LDS, and scratch because tracing

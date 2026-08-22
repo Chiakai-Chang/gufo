@@ -381,7 +381,6 @@ the corresponding end-to-end workload also improves.
 - Single-user and concurrent-request performance guards.
 - Full held-out quality suite.
 - Extended concurrency and soak tests.
-- Thermal steady-state performance.
 - Clean-machine install and model download.
 - Published artifact checksum verification.
 - API compatibility suite.
@@ -426,7 +425,7 @@ idea is not repeatedly rediscovered.
 ## Performance Method
 
 - Compare baseline and candidate in the same session where practical.
-- Alternate execution order to reduce thermal and clock bias.
+- Alternate execution order to reduce clock bias.
 - Warm both paths before measurement.
 - Use the same prompt tokens, output count, KV state, batching, and route.
 - Report median and tail latency, not only the best run.

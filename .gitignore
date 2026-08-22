@@ -103,6 +103,7 @@ llama.cpp*
 
 # Agent helpers
 .codegraph
+context.md
 
 # Uncommitted opt-in capability suites
 tests/quality/compsec.json

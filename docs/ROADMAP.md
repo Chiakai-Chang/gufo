@@ -103,14 +103,14 @@ docs/
 4. Add HIP allocation, copy, launch, event, and graph smoke tests.
 5. Add XRT device discovery, context, buffer, command, and completion smoke
    tests.
-6. Measure first-touch, page-fault, prefault, and sustained thermal behavior.
+6. Measure first-touch, page-fault, and prefault behavior.
 7. Produce a structured machine fingerprint used by every benchmark artifact.
 
 ### Exit criteria
 
 - Diagnostics identify `gfx1151` and XDNA2 correctly.
 - HIP and XRT can each execute a deterministic device program repeatedly.
-- Baseline bandwidth and thermal reports are retained.
+- Baseline bandwidth reports are retained.
 - Unsupported driver or firmware combinations fail with actionable errors.
 
 ## Milestone 2: Test Oracles and Model Contracts

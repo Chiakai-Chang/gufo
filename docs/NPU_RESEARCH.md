@@ -337,7 +337,7 @@ For each configuration record:
 - End-to-end throughput.
 - TTFT and inter-token p50/p95/p99 latency.
 - Actual GPU/NPU activity and memory bandwidth.
-- Power and thermal steady state.
+- Power steady state.
 - Dispatch and ownership-transition counts.
 - Firmware timeouts, resets, corruption, and recovery.
 
