@@ -204,8 +204,8 @@ void TestLayouts() {
     if (expected.layout_sha256 != nullptr) {
       const std::string layout_hash = PackedLayoutSha256(*layout);
       if (layout_hash != expected.layout_sha256) {
-        std::cerr << "layout " << expected.pixels
-                  << " SHA-256: " << layout_hash << '\n';
+        std::cerr << "layout " << expected.pixels << " SHA-256: " << layout_hash
+                  << '\n';
       }
       CHECK(layout_hash == expected.layout_sha256);
     }

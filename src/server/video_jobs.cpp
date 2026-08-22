@@ -76,8 +76,9 @@ void WipeString(std::string* value) noexcept {
   if (value == nullptr) {
     return;
   }
-  for (char& character : *value) {
-    *static_cast<volatile char*>(&character) = '\0';
+  volatile char* const data = value->data();
+  for (std::size_t index = 0; index < value->size(); ++index) {
+    data[index] = '\0';
   }
   value->clear();
 }

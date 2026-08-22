@@ -420,6 +420,9 @@
 
           # Canonical PR umbrella. Nix builds these independent derivations in
           # parallel and reuses their results across flake checks and PR runs.
+          # The ROCm PyTorch/LPIPS closure remains an explicit h3-ml-quality
+          # check: realizing its multi-gigabyte offline-evaluation toolchain on
+          # every hosted PR runner exhausts the runner disk before tests start.
           prCheck = pkgsSys.runCommand "check-pr" { } ''
             mkdir -p $out/bin
             cp "${self.packages.${system}.default}/bin/strix" $out/bin/strix
@@ -431,7 +434,6 @@
             cat "${docsCheck}/result.txt"
             cat "${h3ManifestCheck}/result.txt"
             cat "${h3QualityCheck}/result.txt"
-            cat "${h3MlQualityCheck}/result.txt"
             cat "${testCheck}/result.txt"
 
             cat <<EOF > $out/pr-summary.txt
@@ -447,8 +449,9 @@ Composed Gates:
   4. Documentation & Local Link Validation (check-docs.py)
   5. MiniMax H3 Source-Manifest Validation
   6. MiniMax H3 Quality-Oracle Validation
-  7. MiniMax H3 Pinned Teacher & Offline LPIPS Validation
-  8. CPU Build and Runtime/Unit Tests (CTest)
+  7. CPU Build and Runtime/Unit Tests (CTest)
+Explicit Offline Gate (not in hosted PR closure):
+  - MiniMax H3 Pinned Teacher & Offline LPIPS Validation
 Production Package Validation:
   - gfx1151 ROCm/HIP + XRT build
   - Installed strix-server version/help smoke

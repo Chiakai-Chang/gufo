@@ -1,8 +1,8 @@
 #include "src/server/video_api.hpp"
 
 #include <algorithm>
-#include <charconv>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -186,8 +186,7 @@ bool DecodeHeaderParameter(std::string_view value, std::string* output) {
 bool HeaderParameter(std::string_view value, std::string_view parameter,
                      std::string* output, bool* present) {
   bool valid = false;
-  const std::vector<std::string_view> segments =
-      HeaderSegments(value, &valid);
+  const std::vector<std::string_view> segments = HeaderSegments(value, &valid);
   if (!valid || segments.empty()) {
     return false;
   }
@@ -197,8 +196,7 @@ bool HeaderParameter(std::string_view value, std::string_view parameter,
     if (equals == std::string_view::npos) {
       return false;
     }
-    const std::string_view name =
-        TrimAscii(segments[index].substr(0, equals));
+    const std::string_view name = TrimAscii(segments[index].substr(0, equals));
     if (!EqualCaseInsensitive(name, parameter)) {
       continue;
     }
@@ -213,8 +211,8 @@ bool HeaderParameter(std::string_view value, std::string_view parameter,
 
 bool IsMultipartFormData(std::string_view content_type) {
   const std::size_t semicolon = content_type.find(';');
-  return EqualCaseInsensitive(
-      TrimAscii(content_type.substr(0, semicolon)), "multipart/form-data");
+  return EqualCaseInsensitive(TrimAscii(content_type.substr(0, semicolon)),
+                              "multipart/form-data");
 }
 
 std::optional<std::string> MultipartBoundary(std::string_view content_type) {
@@ -228,8 +226,8 @@ std::optional<std::string> MultipartBoundary(std::string_view content_type) {
   return boundary;
 }
 
-std::optional<json::Value> ParseMultipartBody(
-    const HttpRequest& request, std::string* error) {
+std::optional<json::Value> ParseMultipartBody(const HttpRequest& request,
+                                              std::string* error) {
   const auto boundary = MultipartBoundary(request.header("content-type"));
   if (!boundary.has_value()) {
     *error = "multipart video request has an invalid boundary";
@@ -283,8 +281,7 @@ std::optional<json::Value> ParseMultipartBody(
       const std::string_view value = TrimAscii(line.substr(colon + 1));
       if (EqualCaseInsensitive(name, "content-disposition")) {
         if (!content_disposition.empty()) {
-          *error =
-              "multipart video request repeats Content-Disposition";
+          *error = "multipart video request repeats Content-Disposition";
           return std::nullopt;
         }
         content_disposition = value;

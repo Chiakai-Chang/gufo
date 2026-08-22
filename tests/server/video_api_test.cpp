@@ -215,9 +215,8 @@ void TestLifecycleAndRange(const std::filesystem::path& root) {
 
   const std::string request =
       R"({"model":"minimax-h3-dev","prompt":"private fox prompt","size":"256x256","seconds":"1","strix":{"seed":7,"frames":22,"output_format":"ppm","selected_frame":4}})";
-  const HttpResponse created =
-      Send(service, "POST", "/v1/videos", request, {},
-           "application/json; charset=utf-8");
+  const HttpResponse created = Send(service, "POST", "/v1/videos", request, {},
+                                    "application/json; charset=utf-8");
   Check(created.status == 202 &&
             created.body.find("private fox prompt") == std::string::npos &&
             created.body.find("\"status\":\"queued\"") != std::string::npos,
@@ -310,9 +309,9 @@ void TestValidation(const std::filesystem::path& root) {
             duplicate_json.body.find("parse_error") != std::string::npos,
         "duplicate JSON fields fail closed");
 
-  const HttpResponse trailing_json = Send(
-      service, "POST", "/v1/videos",
-      R"({"model":"minimax-h3","prompt":"x","seconds":"1"} trailing)");
+  const HttpResponse trailing_json =
+      Send(service, "POST", "/v1/videos",
+           R"({"model":"minimax-h3","prompt":"x","seconds":"1"} trailing)");
   Check(trailing_json.status == 400 &&
             trailing_json.body.find("parse_error") != std::string::npos,
         "trailing JSON input fails closed");
@@ -344,35 +343,34 @@ void TestValidation(const std::filesystem::path& root) {
         "path traversal-like IDs fail closed");
 
   constexpr std::string_view kBoundary = "strix-openai-video-boundary";
-  const HttpResponse multipart = Send(
-      service, "POST", "/v1/videos",
-      Multipart(kBoundary,
-                {
-                    {"model", "minimax-h3-fast"},
-                    {"prompt", "A red fox walking through snow"},
-                    {"size", "512x512"},
-                    {"seconds", "1"},
-                }),
-      {}, "multipart/form-data; boundary=\"strix-openai-video-boundary\"");
+  const HttpResponse multipart =
+      Send(service, "POST", "/v1/videos",
+           Multipart(kBoundary,
+                     {
+                         {"model", "minimax-h3-fast"},
+                         {"prompt", "A red fox walking through snow"},
+                         {"size", "512x512"},
+                         {"seconds", "1"},
+                     }),
+           {}, "multipart/form-data; boundary=\"strix-openai-video-boundary\"");
   Check(multipart.status == 202,
         "OpenAI-style multipart text-to-video request is admitted");
   runner.WaitForCalls(1);
   Check(runner.latest().parameters.preset == "fast-384",
         "multipart request preserves the selected H3 mode");
 
-  const HttpResponse duplicate = Send(
-      service, "POST", "/v1/videos",
-      Multipart(kBoundary,
-                {
-                    {"model", "minimax-h3"},
-                    {"prompt", "first"},
-                    {"prompt", "second"},
-                    {"seconds", "1"},
-                }),
-      {}, "multipart/form-data; boundary=strix-openai-video-boundary");
+  const HttpResponse duplicate =
+      Send(service, "POST", "/v1/videos",
+           Multipart(kBoundary,
+                     {
+                         {"model", "minimax-h3"},
+                         {"prompt", "first"},
+                         {"prompt", "second"},
+                         {"seconds", "1"},
+                     }),
+           {}, "multipart/form-data; boundary=strix-openai-video-boundary");
   Check(duplicate.status == 400 &&
-            duplicate.body.find("invalid_multipart_form") !=
-                std::string::npos,
+            duplicate.body.find("invalid_multipart_form") != std::string::npos,
         "multipart duplicate fields fail closed");
 
   const std::string reference_body =
@@ -391,17 +389,17 @@ void TestValidation(const std::filesystem::path& root) {
       "Content-Type: image/png\r\n\r\n"
       "not-an-image\r\n"
       "--strix-openai-video-boundary--\r\n";
-  const HttpResponse multipart_reference = Send(
-      service, "POST", "/v1/videos", reference_body, {},
-      "multipart/form-data; boundary=strix-openai-video-boundary");
+  const HttpResponse multipart_reference =
+      Send(service, "POST", "/v1/videos", reference_body, {},
+           "multipart/form-data; boundary=strix-openai-video-boundary");
   Check(multipart_reference.status == 400 &&
             multipart_reference.body.find("unsupported_input_reference") !=
                 std::string::npos,
         "multipart first-frame conditioning remains explicit future work");
 
-  const HttpResponse unsupported_media = Send(
-      service, "POST", "/v1/videos", "model=minimax-h3", {},
-      "application/x-www-form-urlencoded");
+  const HttpResponse unsupported_media =
+      Send(service, "POST", "/v1/videos", "model=minimax-h3", {},
+           "application/x-www-form-urlencoded");
   Check(unsupported_media.status == 415 &&
             unsupported_media.body.find("unsupported_media_type") !=
                 std::string::npos,

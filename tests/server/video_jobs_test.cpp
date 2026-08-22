@@ -206,6 +206,14 @@ void TestQueueLifecycleAndRecovery(const std::filesystem::path& root) {
           "first video job is admitted");
     const std::string first_id = first.job->id;
     runner.WaitForCalls(1);
+    WaitUntil(
+        [&] {
+          const auto lookup = service.Get(first_id);
+          return lookup.job.has_value() &&
+                 lookup.job->status == VideoJobStatus::kInProgress &&
+                 lookup.job->progress >= 80;
+        },
+        "first job did not publish expected progress");
     const auto running = service.Get(first_id);
     Check(running.job.has_value() &&
               running.job->status == VideoJobStatus::kInProgress,
