@@ -648,8 +648,7 @@ static __global__ void FullAttentionRowParallelKernel(
     const std::size_t key_base =
         (static_cast<std::size_t>(key_row) * heads + head) * head_dimension;
     float dot = 0.0F;
-    for (std::uint32_t dimension = 0; dimension < head_dimension;
-         ++dimension) {
+    for (std::uint32_t dimension = 0; dimension < head_dimension; ++dimension) {
       dot = fmaf(Bf16ToFloat(query[query_base + dimension]),
                  Bf16ToFloat(key[key_base + dimension]), dot);
     }
@@ -688,8 +687,7 @@ static __global__ void FullAttentionRowParallelKernel(
   __syncthreads();
   for (std::uint32_t key_row = lane; key_row < sequence;
        key_row += blockDim.x) {
-    const float exponential =
-        key_row == 0 ? exponential_zero : scores[key_row];
+    const float exponential = key_row == 0 ? exponential_zero : scores[key_row];
     scores[key_row] = exponential * inverse_sum;
   }
   __syncthreads();
@@ -712,8 +710,7 @@ inline void LaunchFullAttention(const std::uint16_t* query,
                                 std::uint16_t* output, std::uint32_t sequence,
                                 std::uint32_t heads,
                                 std::uint32_t head_dimension, float scale,
-                                hipStream_t stream,
-                                bool row_parallel = true) {
+                                hipStream_t stream, bool row_parallel = true) {
   constexpr std::uint32_t kThreads = 128;
   const dim3 grid(sequence, heads);
   const dim3 block(kThreads);
@@ -728,6 +725,70 @@ inline void LaunchFullAttention(const std::uint16_t* query,
                        stream, query, key, value, output, sequence, heads,
                        head_dimension, scale);
   }
+}
+
+static __global__ void SoftmaxScoresToBf16Kernel(const float* scores,
+                                                 std::uint16_t* probabilities,
+                                                 std::uint32_t sequence,
+                                                 std::uint32_t heads) {
+  const std::uint32_t query_row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x;
+  if (query_row >= sequence || head >= heads) {
+    return;
+  }
+  extern __shared__ float row_scores[];
+  __shared__ float reduction[128];
+  const std::size_t base =
+      (static_cast<std::size_t>(head) * sequence + query_row) * sequence;
+  float local_maximum = -INFINITY;
+  for (std::uint32_t key_row = lane; key_row < sequence;
+       key_row += blockDim.x) {
+    const float score = scores[base + key_row];
+    row_scores[key_row] = score;
+    local_maximum = fmaxf(local_maximum, score);
+  }
+  reduction[lane] = local_maximum;
+  __syncthreads();
+  for (std::uint32_t offset = blockDim.x / 2U; offset > 0; offset /= 2U) {
+    if (lane < offset) {
+      reduction[lane] = fmaxf(reduction[lane], reduction[lane + offset]);
+    }
+    __syncthreads();
+  }
+  const float maximum = reduction[0];
+  float local_sum = 0.0F;
+  for (std::uint32_t key_row = lane; key_row < sequence;
+       key_row += blockDim.x) {
+    const float value = expf(row_scores[key_row] - maximum);
+    row_scores[key_row] = value;
+    local_sum += value;
+  }
+  reduction[lane] = local_sum;
+  __syncthreads();
+  for (std::uint32_t offset = blockDim.x / 2U; offset > 0; offset /= 2U) {
+    if (lane < offset) {
+      reduction[lane] += reduction[lane + offset];
+    }
+    __syncthreads();
+  }
+  const float inverse_sum = 1.0F / reduction[0];
+  for (std::uint32_t key_row = lane; key_row < sequence;
+       key_row += blockDim.x) {
+    probabilities[base + key_row] =
+        FloatToBf16(row_scores[key_row] * inverse_sum);
+  }
+}
+
+inline void LaunchSoftmaxScoresToBf16(const float* scores,
+                                      std::uint16_t* probabilities,
+                                      std::uint32_t sequence,
+                                      std::uint32_t heads, hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 128;
+  hipLaunchKernelGGL(SoftmaxScoresToBf16Kernel, dim3(sequence, heads),
+                     dim3(kThreads),
+                     static_cast<std::size_t>(sequence) * sizeof(float), stream,
+                     scores, probabilities, sequence, heads);
 }
 
 }  // namespace strix::minimax_h3::dit_ops

@@ -76,8 +76,10 @@ test-output/
 test-results/
 .cache/
 
-# Model artifacts, logit dumps, teacher captures (never commit weights/logits)
-artifacts/
+# Model artifacts, profiles, logit dumps, and teacher captures never belong in
+# source control. Keep the root anchored so similarly named fixture paths are
+# unaffected.
+/artifacts/
 /models/
 *.safetensors
 *.gguf

@@ -153,41 +153,50 @@ This evidence is retained; it is not rerun as a routine repetition gate.
 
 ## Development Measurement Protocol
 
-Issue #175 uses the 512x512, 22-frame, two-step independent denoiser oracle as
-its production-shape correctness gate. Focused phase and kernel profiles then
-measure the bottleneck that changed. The prompt conditioning, seed,
-model/source revisions, geometry, and arithmetic contract remain fixed; the
-candidate implementation is the intentional difference.
+Issue #175 uses one independently frozen 528-row block-0 teacher as its
+correctness gate and one deterministic 1,872-row block as its performance
+workload. Focused phase and kernel profiles measure only the bottleneck that
+changed. The model/source revisions, block weights, inputs, and arithmetic
+contract remain fixed; the candidate implementation is the intentional
+difference.
 
 Development evidence retains:
 
 - inspection bytes and time;
-- prompt weight bytes, load, prefetch wait, submit, GPU, dispatch, and peak
-  memory values;
-- text refiner, AdaLN precompute, core load, each fresh forward, sampler, and
-  denoiser memory values;
+- block load, GPU and wall time, output hash, and workspace bytes;
 - process storage I/O, RSS/HWM/swap, page faults, GPU clocks, and power when
   exposed by the kernel;
-- independent teacher/native velocity and final-latent errors at 1,872 rows.
+- independent teacher/native retained-boundary errors at 528 rows.
 
 Each required diagnostic is invoked once. A passing full route is not rerun,
 and a 50-step generation is never launched merely to obtain performance
 statistics.
 
-The retained 512x512 one-forward comparison admitted row-parallel attention:
+The original one-block profile identified dense attention as the actual
+bottleneck:
 
-| Measurement | Scalar | Row-parallel |
+| 1,872-row block measurement | Original | Retained batched path |
 | --- | ---: | ---: |
-| full 50-block forward | 249.167 s | 145.167 s |
-| accounted peak | 58.8037 GiB | 58.8037 GiB |
-| process swap | 0 bytes | 0 bytes |
+| block GPU time | 38.518 s | 1.076 s |
+| relative speedup | 1.00x | 35.79x |
 
-The two policies produced byte-identical video and audio velocities. The
-`1.716x` speedup exceeds the 5% retention threshold without increasing peak
-memory. A separate existing row-path monitor capture supplied 704 power/clock
-samples, reached 2,900 MHz and 98.027 W, and recorded zero swap; because that
-generation was cancelled after two steps, those samples are diagnostics only,
-not latency or quality evidence.
+The first profile attributed 31.640 of 32.226 profiled GPU seconds to the
+custom dense-attention kernel; all GEMMs together took 0.207 seconds.
+Replacing QK and PV with strided-batched rocBLAS GEMMs and keeping softmax
+explicit removes that bottleneck. The shared F32 score and BF16 probability
+workspaces total 1.097 GiB at 1,872 rows and are reused by every block.
+Parallelizing the per-row max, exponential, and sum then reduced the retained
+block from 3.477 seconds to 1.076 seconds.
+
+The retained 528-row teacher comparison measured final block-output relative
+L2 `0.00476406` and relative max `0.00956938`, both below the frozen `1e-2`
+limits. No 50-block forward or denoising evaluation was needed for this
+attention-local change.
+
+The final profile ranks parallel softmax at 435.7 ms (31.49% of captured
+kernel time), grouped QKV normalization/RoPE at 390.3 ms (28.21%), and rocBLAS
+GEMMs at 208.9 ms (15.10%). These measured phases define the next optimization
+order.
 
 Historical scalar phase timing ranks the denoiser at 98.326% of complete
 latency, VisualVAE at 1.240%, prompt encoding at 0.163%, and AudioVAE at
@@ -208,21 +217,19 @@ benchmark.
 
 ## First Optimization Retention Budget
 
-The row-parallel full-attention candidate is admitted only if the short
-production-shape comparison proves all of the following against the explicit
-scalar fallback:
+The batched full-attention candidate is admitted only if the focused
+single-block evidence proves all of the following against the retained
+baseline:
 
 - harness hash, kernel release, prompt hash, seed, immutable model/reference
   revisions, and the frozen `exact` preset parameters match;
 - binary, harness, prompt, and oracle identities are complete lowercase
   SHA-256 values rather than unvalidated labels;
-- analytic full-attention parity covers the production sequence shapes used
-  by dev (528 rows), aggressive (780), fast (1,088), and exact (1,872), and
-  the frozen preset contract tests pass;
-- the candidate improves its measured bottleneck and the fixed two-step
-  production-shape workload by at least 5%;
-- both successful observations contain the complete required timing, memory,
-  I/O, power, clock, swap, and energy telemetry;
+- the 528-row fallback parity test, independent block teacher, frozen preset
+  contract tests, and one 1,872-row retained-path profile pass;
+- the candidate improves its measured bottleneck and the fixed 1,872-row
+  block workload by at least 5%;
+- the retained observation contains the required timing and memory telemetry;
 - candidate accounted peak bytes and process high-water RSS do not regress by
   more than 2%, and process/system swap remain zero in both observations;
 - the candidate 10th-percentile GPU clock sampled under substantial GPU power
@@ -246,7 +253,8 @@ qualify: phase and kernel profiles must explain the latency improvement, and
 energy per completed generation remains visible in the report. The original
 scalar kernel remains selectable through
 `--attention-kernel scalar`; its policy is recorded in parameters and
-telemetry.
+telemetry. The scalar implementation remains available through the explicit
+`row_parallel_attention=false` diagnostic fallback.
 
 ## Regression Gates
 

@@ -24,8 +24,10 @@ nix build .#checks.x86_64-linux.h3-quality
 nix build .#checks.x86_64-linux.h3-ml-quality
 ```
 
-The generic host CTest suite does not import PyTorch. The canonical PR gate
-executes both of these derivations explicitly.
+The generic host CTest suite does not import PyTorch. The dependency-light
+`h3-quality` derivation is part of the canonical hosted PR gate. The
+multi-gigabyte ROCm PyTorch/LPIPS closure is an explicit offline gate so a
+GitHub-hosted runner does not exhaust its disk while realizing dependencies.
 
 ## Pinned Contract
 
@@ -180,20 +182,19 @@ On the supported gfx1151 route, the complete 528-row block measured:
 | Retained boundary | Relative L2 | Relative max |
 | --- | ---: | ---: |
 | attention AdaLN | `1.54491e-5` | `0.0015625` |
-| attention output | `0.000920278` | `0.00414938` |
-| MLP AdaLN | `0.00110717` | `0.00621118` |
-| block output | `0.00356519` | `0.00478469` |
+| attention output | `0.00186781` | `0.00414938` |
+| MLP AdaLN | `0.00219937` | `0.00621118` |
+| block output | `0.00476406` | `0.00956938` |
 
-Every value is below the frozen `1e-2` limits. A second execution on the same
-session produced byte-identical retained tensors and the same scratch address.
-The session rejects a pre-cancelled block, out-of-range row maps, changed
-tensor shapes, non-finite retained values, and a rocBLAS solution that fails a
-paired byte-repeat check.
+Every value is below the frozen `1e-2` limits. The session rejects a
+pre-cancelled block, out-of-range row maps, changed tensor shapes, non-finite
+retained values, and a rocBLAS solution that fails its construction-time
+validation.
 
-The diagnostic rocprof/ISA records in `artifacts/minimax_h3/issue-169/`
-identify the actual full-attention, grouped-QKV/RoPE, AdaLN, gate, SwiGLU, and
-gfx1151 rocBLAS kernels. They establish implementation identity, not a
-performance claim.
+Operator-local rocprof/ISA records identify the actual full-attention,
+grouped-QKV/RoPE, AdaLN, gate, SwiGLU, and gfx1151 rocBLAS kernels. Generated
+profiles remain outside Git; only their reviewed conclusions and immutable
+hashes belong in documentation or issue comments.
 
 ## Full Denoiser Frozen Evidence
 
@@ -330,9 +331,10 @@ filenames or directory placement. Teacher and native manifests must agree on
 the immutable model/reference revisions, seed, noise mode, internal geometry,
 evaluation count, active block count, reuse interval, and SHA-256 of the exact
 layer-50 BF16 conditioning payload. Only then are final video/audio latent
-metrics evaluated. The 512x512 gate deliberately uses two evaluations: it
-exercises the production 1,872-row shape while keeping the feedback loop
-short. There is no routine 50-step development gate.
+metrics evaluated. These gates are used when work crosses block, sampler, or
+schedule boundaries. Attention-local iterations use the frozen single-block
+teacher plus one 1,872-row block profile; they do not run 50 blocks or a
+denoising trajectory. There is no routine 50-step development gate.
 
 Complete 50-step `exact` generation belongs to end-user operation or rare,
 explicit release validation. The checkerboard MP4 captured from the older
@@ -379,7 +381,7 @@ Issues that add H3 runtime boundaries also add their retained artifact:
 - host sampler: schedules/layout/RNG/Euler fixtures;
 - DiT kernels: complete block artifact;
 - full denoiser: velocity plus 256x256 four-step and 512x512 two-step latent
-  artifacts;
+  artifacts, invoked only for changes crossing the denoiser boundary;
 - VisualVAE: selected and full frame artifacts;
 - AudioVAE: waveform, spectrogram, channel, duration, and sync artifacts;
 - presets/optimization/quantization: component and short production-shape

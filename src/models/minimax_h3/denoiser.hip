@@ -563,6 +563,8 @@ struct DenoiserSession::Impl {
   DeviceBuffer final_audio_weight;
   DeviceBuffer final_audio_bias;
   DeviceBuffer final_modulation;
+  DeviceBuffer attention_score_workspace;
+  DeviceBuffer attention_probability_workspace;
 
   DeviceBuffer video_sample;
   DeviceBuffer audio_sample;
@@ -1029,6 +1031,21 @@ struct DenoiserSession::Impl {
     if (!BuildRope(&rope_cos, &rope_sin, error)) {
       return false;
     }
+    if (row_parallel_attention) {
+      const std::size_t elements =
+          layout.rows() * layout.rows() * kDitAttentionHeads;
+      if (!attention_score_workspace.Allocate(elements * sizeof(float),
+                                              error) ||
+          !attention_probability_workspace.Allocate(
+              elements * sizeof(std::uint16_t), error)) {
+        return false;
+      }
+      base_telemetry.scratch_bytes += attention_score_workspace.bytes() +
+                                      attention_probability_workspace.bytes();
+      base_telemetry.cumulative_allocation_bytes +=
+          attention_score_workspace.bytes() +
+          attention_probability_workspace.bytes();
+    }
     blocks.reserve(static_cast<std::size_t>(active_blocks));
     std::vector<std::uint16_t> modulation;
     for (std::size_t block = 0; block < static_cast<std::size_t>(active_blocks);
@@ -1056,7 +1073,13 @@ struct DenoiserSession::Impl {
            .rows = layout.rows(),
            .modulation_rows =
                static_cast<std::size_t>(time_rows.time_rows) * kDitModalities,
-           .row_parallel_attention = row_parallel_attention},
+           .row_parallel_attention = row_parallel_attention,
+           .attention_score_workspace = attention_score_workspace.data(),
+           .attention_score_workspace_bytes = attention_score_workspace.bytes(),
+           .attention_probability_workspace =
+               attention_probability_workspace.data(),
+           .attention_probability_workspace_bytes =
+               attention_probability_workspace.bytes()},
           cancellation, error);
       if (session == nullptr ||
           !session->PrepareConstants(modulation, rope_cos, rope_sin,

@@ -502,36 +502,40 @@ numeric execution data.
 
 `tools/strix/h3_profile.py` drives the same public CLI route used by serving.
 It is a manual release tool, not a development or CI gate. Development
-optimization uses the 512x512 two-step denoiser oracle, production-sequence
-attention parity, and focused phase/kernel profiles. A complete 50-step
-generation is run only when explicitly requested after those gates pass.
+optimization uses one independently frozen 528-row DiT block oracle for
+correctness and one 1,872-row DiT block for performance and profiling. Neither
+iteration gate runs all 50 blocks or advances a denoising schedule. A complete
+50-step generation is run only when explicitly requested after those gates
+pass.
 
-The retained issue #175 comparison is a manual one-forward benchmark, not a
+The issue #175 performance workload is a manual single-block profile, not a
 CTest target:
 
 ```sh
 STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
-STRIX_H3_DENOISER_GOLDEN_512=/var/llms/huggingface/strix-h3-oracles/\
-denoiser-512x512x22-2step-v1 \
-  ./build-h3-175/minimax_h3_denoiser_hip_test \
-    --benchmark-attention-512
+  ./build/hardware-test/minimax_h3_dit_hip_test --profile-1872
 ```
 
-It creates the same 512x512, 22-frame, 1,872-row, 50-block session twice,
-executes one step-0 forward with each attention policy, and requires
-byte-identical video/audio velocities:
+It executes block 0 once with deterministic production-shape inputs. The
+original custom full-attention path and the retained batched-QK/softmax/PV
+path measured:
 
-| Policy | Forward | Peak |
-| --- | ---: | ---: |
-| scalar | 249.167 s | 58.8037 GiB |
-| row-parallel | 145.167 s | 58.8037 GiB |
+| Attention implementation | Block GPU time |
+| --- | ---: |
+| custom row-parallel baseline | 38.518 s |
+| batched rocBLAS QK/PV + parallel BF16 softmax | 1.076 s |
 
-Row-parallel attention is therefore `1.716x` faster for the fixed full-DiT
-forward, a 41.7% latency reduction, with unchanged peak memory and zero swap.
-The retained video and audio velocity SHA-256 values are respectively
-`2e87ce10c86fb9cc734f054f284e45a7885db4ca209353fe84b04da103daa9a6`
-and
-`b6ebaa26c519a1810936d83a4eb7c33b004a24442073c755d442277222a3c964`.
+The retained implementation is `35.79x` faster for that block, a 97.2%
+latency reduction. It allocates one shared F32 score matrix and one shared
+BF16 probability matrix for the denoiser, 1.097 GiB at 1,872 rows; all 50
+blocks reuse the same workspace rather than allocating per-block copies. The
+independent 528-row block oracle remains the quality gate and stays below its
+frozen 1% relative-error ceilings.
+
+The retained profile attributes 435.7 ms to parallel softmax, 390.3 ms to
+grouped QKV normalization/RoPE, and 208.9 ms to rocBLAS GEMMs. These are the
+next measured optimization candidates; no full denoiser run is needed to rank
+them.
 
 Historical scalar phase timing, used only for bottleneck ranking because its
 delivered MP4 is invalid quality evidence, attributes 98.326% of complete
@@ -638,12 +642,13 @@ field changes granularity. Both issue #175 generations use the default
 `first-observation` label rather than making an unsupported cache-state claim.
 
 During development, a kernel or residency candidate is retained only when it
-passes the independent component oracles, the 512x512 two-step latent gate,
-the frozen preset contracts, production-shape attention arithmetic parity,
-and a focused profile showing useful work. Fast and aggressive do not add
-full benchmark videos. Byte-identical complete MP4 comparison is reserved for
-an explicitly requested release validation, not every implementation
-iteration.
+passes the independent single-block oracle, the frozen preset contracts, and
+a single production-shape block profile showing useful work. A short
+multi-step latent gate is reserved for integration changes that cross the
+block, sampler, or schedule boundary; it is not rerun for an attention-kernel
+iteration. Fast and aggressive do not add full benchmark videos.
+Byte-identical complete MP4 comparison is reserved for an explicitly requested
+release validation, not every implementation iteration.
 
 ## Operator Attestation
 

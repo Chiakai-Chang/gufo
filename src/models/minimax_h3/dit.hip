@@ -28,6 +28,7 @@ using Clock = std::chrono::steady_clock;
 
 constexpr std::size_t kWeightStagingBytes = 16ULL << 20U;
 constexpr std::size_t kMaximumAttentionRows = 16'384;
+constexpr std::size_t kMaximumBatchedAttentionRows = 4'096;
 // Pinned by byte-repeat validation on gfx1151 with the repository's ROCm
 // 7.2.3 toolchain. A changed rocBLAS database fails session construction.
 constexpr rocblas_int kGfx1151RocblasBf16Solution = -1162085109;
@@ -399,6 +400,95 @@ private:
   std::vector<Plan> plans_;
 };
 
+class AttentionGemm {
+public:
+  AttentionGemm() {
+    if (rocblas_create_handle(&handle_) != rocblas_status_success) {
+      handle_ = nullptr;
+      return;
+    }
+    (void)rocblas_set_atomics_mode(handle_, rocblas_atomics_not_allowed);
+  }
+  ~AttentionGemm() {
+    if (handle_ != nullptr) {
+      (void)rocblas_destroy_handle(handle_);
+    }
+  }
+  AttentionGemm(const AttentionGemm&) = delete;
+  AttentionGemm& operator=(const AttentionGemm&) = delete;
+
+  bool Scores(const std::uint16_t* query, const std::uint16_t* key,
+              float* scores, std::size_t sequence, float scale,
+              hipStream_t stream, std::string* error) {
+    if (!SetStream(sequence, stream, error)) {
+      return false;
+    }
+    constexpr float beta = 0.0F;
+    const auto s = static_cast<rocblas_int>(sequence);
+    const auto row_stride =
+        static_cast<rocblas_int>(kDitAttentionHeads * kDitHeadDimension);
+    const auto head_stride = static_cast<rocblas_stride>(kDitHeadDimension);
+    const auto score_stride = static_cast<rocblas_stride>(sequence * sequence);
+    return Check(
+        rocblas_gemm_strided_batched_ex(
+            handle_, rocblas_operation_transpose, rocblas_operation_none, s, s,
+            kDitHeadDimension, &scale, key, rocblas_datatype_bf16_r, row_stride,
+            head_stride, query, rocblas_datatype_bf16_r, row_stride,
+            head_stride, &beta, scores, rocblas_datatype_f32_r, s, score_stride,
+            scores, rocblas_datatype_f32_r, s, score_stride, kDitAttentionHeads,
+            rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0),
+        "score", error);
+  }
+
+  bool Values(const std::uint16_t* value, const std::uint16_t* probabilities,
+              std::uint16_t* output, std::size_t sequence, hipStream_t stream,
+              std::string* error) {
+    if (!SetStream(sequence, stream, error)) {
+      return false;
+    }
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    const auto s = static_cast<rocblas_int>(sequence);
+    const auto row_stride =
+        static_cast<rocblas_int>(kDitAttentionHeads * kDitHeadDimension);
+    const auto head_stride = static_cast<rocblas_stride>(kDitHeadDimension);
+    const auto probability_stride =
+        static_cast<rocblas_stride>(sequence * sequence);
+    return Check(
+        rocblas_gemm_strided_batched_ex(
+            handle_, rocblas_operation_none, rocblas_operation_none,
+            kDitHeadDimension, s, s, &alpha, value, rocblas_datatype_bf16_r,
+            row_stride, head_stride, probabilities, rocblas_datatype_bf16_r, s,
+            probability_stride, &beta, output, rocblas_datatype_bf16_r,
+            row_stride, head_stride, output, rocblas_datatype_bf16_r,
+            row_stride, head_stride, kDitAttentionHeads, rocblas_datatype_f32_r,
+            rocblas_gemm_algo_standard, 0, 0),
+        "value", error);
+  }
+
+private:
+  bool SetStream(std::size_t sequence, hipStream_t stream, std::string* error) {
+    if (handle_ == nullptr || sequence == 0 ||
+        sequence > kMaximumBatchedAttentionRows ||
+        rocblas_set_stream(handle_, stream) != rocblas_status_success) {
+      SetError(error, "invalid rocBLAS H3 attention GEMM");
+      return false;
+    }
+    return true;
+  }
+  bool Check(rocblas_status status, std::string_view phase,
+             std::string* error) {
+    if (status == rocblas_status_success) {
+      return true;
+    }
+    SetError(error,
+             "rocBLAS H3 attention " + std::string(phase) +
+                 " GEMM failed: " + std::to_string(static_cast<int>(status)));
+    return false;
+  }
+  rocblas_handle handle_{nullptr};
+};
+
 bool CheckLaunch(std::string_view label, std::string* error) {
   const hipError_t status = hipPeekAtLastError();
   if (status == hipSuccess) {
@@ -435,6 +525,7 @@ struct DitBlockSession::Impl {
   hipEvent_t stop_event{nullptr};
   void* staging{nullptr};
   Bf16Gemm gemm;
+  AttentionGemm attention_gemm;
 
   LoadedWeight norm1;
   LoadedWeight norm2;
@@ -456,6 +547,11 @@ struct DitBlockSession::Impl {
   DeviceBuffer key;
   DeviceBuffer value;
   DeviceBuffer attention_heads;
+  DeviceBuffer owned_attention_scores;
+  DeviceBuffer owned_attention_probabilities;
+  float* attention_scores{nullptr};
+  std::uint16_t* attention_probabilities{nullptr};
+  std::size_t attention_workspace_bytes{0};
   DeviceBuffer attention_output;
   DeviceBuffer gated_attention;
   DeviceBuffer modulation_mlp;
@@ -599,6 +695,8 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   const std::size_t modulation_elements =
       options.modulation_rows * kDitModulationSlots * kDitHiddenSize;
   const std::size_t rope_elements = options.rows * kDitRopeHalf;
+  const std::size_t attention_matrix_elements =
+      options.rows * options.rows * kDitAttentionHeads;
   const auto allocate = [&](DeviceBuffer* buffer, std::size_t bytes) {
     if (!buffer->Allocate(bytes, error)) {
       return false;
@@ -627,6 +725,36 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
       !allocate(&impl->gemm_reference, bf16_bytes(fc1_elements)) ||
       !allocate(&impl->gemm_first_mismatch, sizeof(unsigned long long))) {
     return nullptr;
+  }
+  if (options.row_parallel_attention) {
+    if (options.rows > kMaximumBatchedAttentionRows) {
+      SetError(error, "MiniMax H3 batched attention row limit exceeded");
+      return nullptr;
+    }
+    const std::size_t score_bytes = attention_matrix_elements * sizeof(float);
+    const std::size_t probability_bytes =
+        attention_matrix_elements * sizeof(std::uint16_t);
+    if (options.attention_score_workspace != nullptr) {
+      if (options.attention_score_workspace_bytes < score_bytes ||
+          options.attention_probability_workspace == nullptr ||
+          options.attention_probability_workspace_bytes < probability_bytes) {
+        SetError(error, "MiniMax H3 shared attention workspace is too small");
+        return nullptr;
+      }
+      impl->attention_scores =
+          static_cast<float*>(options.attention_score_workspace);
+      impl->attention_probabilities =
+          static_cast<std::uint16_t*>(options.attention_probability_workspace);
+    } else {
+      if (!allocate(&impl->owned_attention_scores, score_bytes) ||
+          !allocate(&impl->owned_attention_probabilities, probability_bytes)) {
+        return nullptr;
+      }
+      impl->attention_scores = impl->owned_attention_scores.As<float>();
+      impl->attention_probabilities =
+          impl->owned_attention_probabilities.As<std::uint16_t>();
+    }
+    impl->attention_workspace_bytes = score_bytes + probability_bytes;
   }
   if (!impl->gemm.Prepare(options.rows, kDitAttentionWidth * 3U, kDitHiddenSize,
                           error) ||
@@ -815,7 +943,8 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
   *telemetry = {};
   telemetry->weight_bytes = impl_->weight_bytes;
   telemetry->activation_bytes = impl_->activation_bytes;
-  telemetry->gemm_workspace_bytes = impl_->gemm.workspace_bytes();
+  telemetry->gemm_workspace_bytes =
+      impl_->gemm.workspace_bytes() + impl_->attention_workspace_bytes;
   telemetry->load_ms = impl_->load_ms;
   telemetry->scratch_address =
       reinterpret_cast<std::uintptr_t>(impl_->qkv.data());
@@ -869,13 +998,33 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
   if (!CheckLaunch("H3 DiT grouped QKV norm/RoPE", error)) {
     return false;
   }
-  dit_ops::LaunchFullAttention(
-      impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
-      impl_->value.As<std::uint16_t>(),
-      impl_->attention_heads.As<std::uint16_t>(), rows, kDitAttentionHeads,
-      kDitHeadDimension,
-      1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)), impl_->stream,
-      impl_->row_parallel_attention);
+  if (impl_->row_parallel_attention) {
+    if (!impl_->attention_gemm.Scores(
+            impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
+            impl_->attention_scores, impl_->rows,
+            1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)),
+            impl_->stream, error)) {
+      return false;
+    }
+    dit_ops::LaunchSoftmaxScoresToBf16(impl_->attention_scores,
+                                       impl_->attention_probabilities, rows,
+                                       kDitAttentionHeads, impl_->stream);
+    if (!CheckLaunch("H3 DiT attention softmax", error) ||
+        !impl_->attention_gemm.Values(
+            impl_->value.As<std::uint16_t>(), impl_->attention_probabilities,
+            impl_->attention_heads.As<std::uint16_t>(), impl_->rows,
+            impl_->stream, error)) {
+      return false;
+    }
+  } else {
+    dit_ops::LaunchFullAttention(
+        impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
+        impl_->value.As<std::uint16_t>(),
+        impl_->attention_heads.As<std::uint16_t>(), rows, kDitAttentionHeads,
+        kDitHeadDimension,
+        1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)), impl_->stream,
+        false);
+  }
   if (!CheckLaunch("H3 DiT full SDPA", error) ||
       !impl_->gemm.Run(impl_->output_weight.storage.As<std::uint16_t>(),
                        impl_->attention_heads.As<std::uint16_t>(),
