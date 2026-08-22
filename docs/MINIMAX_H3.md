@@ -1,6 +1,6 @@
 # MiniMax H3 Integration Boundary
 
-Status: active engineering policy, 2026-08-21
+Status: active engineering policy, 2026-08-22
 
 ## Purpose
 
@@ -167,15 +167,449 @@ nix develop -c python3 tools/strix/h3_dit_golden.py \
 Run the analytic and external-model gates:
 
 ```sh
-./build-h3-169/minimax_h3_dit_hip_test --analytic
+./build-h3-173/minimax_h3_dit_hip_test --analytic
 
 STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
 STRIX_H3_DIT_GOLDEN=/var/llms/huggingface/strix-h3-oracles/dit-block0-528-v1 \
-  ./build-h3-169/minimax_h3_dit_hip_test --real
+  ./build-h3-173/minimax_h3_dit_hip_test --real
 ```
 
 Sparse attention, token reduction, cross-block fusion, reuse, layer thinning,
 and quantized DiT weights are not part of this baseline.
+
+## Complete BF16 Transformer and Denoiser
+
+`DenoiserSession` is the quality-first full FL2VA transformer route. Creation
+consumes the six-row layer-50 prompt tensor, refines it through
+`condition_proj` and both token-refiner blocks, precomputes the independent
+video/audio timestep schedule, and then admits all 50 dense core blocks.
+
+The memory lifecycle is explicit:
+
+1. prompt-encoder ownership ends before denoiser creation;
+2. timestep embedding weights are loaded, executed, and released;
+3. each block's 96,768-wide AdaLN projection is loaded, executed for all
+   unique timestep rows, copied into that block's persistent constants, and
+   released before the next projection;
+4. the corresponding core block and its pre-sized activation arena become
+   resident;
+5. the final AdaLN projection is released before patch and output heads are
+   admitted.
+
+Every core block uses the byte-validated BF16 projection policy from the
+one-block baseline. The current quality route keeps a separate fixed arena per
+block so setup can fail atomically and timed execution performs no device
+allocation. Between block streams, BF16 residual rows cross a preallocated
+host staging pair. This is synchronization and byte transport on the unified
+memory machine, not CPU tensor compute; all projection, normalization,
+attention, MLP, head, and Euler arithmetic remains on gfx1151.
+
+A fresh forward:
+
+- projects packed F32 audio/video latents to BF16 and packs refined text,
+  audio, then video rows;
+- executes all 50 blocks with full attention and the released modality row
+  maps;
+- applies final audio/video AdaLN and F32 output heads;
+- retains F32 velocities for diagnostics and BF16 velocity boundaries for the
+  device Euler update.
+
+The quality baseline uses all 50 blocks and one fresh evaluation per schedule
+step. The serving API also accepts an explicit active block prefix and
+whole-denoiser reuse interval. Skipped evaluations reuse the latest two BF16
+velocity boundaries with the frozen bounded extrapolation plan; the first and
+last schedule steps are always evaluated. Sparse attention, token reduction,
+core-residual reuse, and quantization remain disabled.
+
+Generate the independent four-step 256x256 teacher outside the repository:
+
+```sh
+nix develop -c python3 tools/strix/h3_denoiser_golden.py \
+  --model-root /var/llms/huggingface/MiniMax-H3 \
+  --conditioning /var/llms/huggingface/strix-h3-oracles/\
+fox-layer50-transformers.bf16 \
+  --output /var/llms/huggingface/strix-h3-oracles/\
+denoiser-256x256x22-4step-v1
+```
+
+Run the rapid 256x256 quality gate:
+
+```sh
+STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+STRIX_H3_DENOISER_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
+denoiser-256x256x22-4step-v1 \
+  ./build-h3-173/minimax_h3_denoiser_hip_test --oracle
+```
+
+Production-shape development coverage uses the real 512x512, 22-frame,
+1,872-row layout but only two denoising evaluations. This catches
+shape-dependent attention, patch-layout, and sampler errors without spending
+hours producing a delivery video:
+
+```sh
+nix develop -c python3 tools/strix/h3_denoiser_golden.py \
+  --model-root /var/llms/huggingface/MiniMax-H3 \
+  --conditioning /var/llms/huggingface/strix-h3-oracles/\
+fox-layer50-transformers.bf16 \
+  --output /var/llms/huggingface/strix-h3-oracles/\
+denoiser-512x512x22-2step-v1 \
+  --width 512 --height 512 --steps 2 --noise-mode seeded
+
+STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+STRIX_H3_DENOISER_GOLDEN_512=/var/llms/huggingface/strix-h3-oracles/\
+denoiser-512x512x22-2step-v1 \
+  ./build-h3-175/minimax_h3_denoiser_hip_test --oracle-512
+```
+
+There is deliberately no 50-step development test. The `exact` preset remains
+available to end users and for rare, explicitly requested release validation,
+but ordinary implementation, profiling, and CI use short component oracles.
+
+## VisualVAE and AudioVAE Output Phases
+
+The two released FL2VA output decoders are independent model-private phases.
+They consume only the final normalized latents, never overlap their complete
+weight inventories, and expose cancellation and memory telemetry separately
+from the denoiser.
+
+`VideoVaeDecoder` keeps the released F32 transformer arithmetic on gfx1151.
+It chooses deterministic 256–320 pixel tiles with at least 64 pixels of
+overlap, decodes legal seven-latent temporal chunks into 22-frame windows, and
+blends the released five-latent/17-frame stride. The selected-frame API still
+runs every complete model chunk needed by the requested global frame indexes;
+it omits unrelated chunks and RGB reconstruction/readback only. Spatial and
+temporal stitching are output composition, not CPU model inference.
+
+Generate and run the operator-owned VisualVAE oracle:
+
+```sh
+nix develop -c python3 tools/strix/h3_video_vae_golden.py \
+  --model-root /var/llms/huggingface/MiniMax-H3 \
+  --latent /var/llms/huggingface/strix-h3-oracles/\
+denoiser-256x256x22-4step-v1/video_final.f32 \
+  --output /var/llms/huggingface/strix-h3-oracles/\
+video-vae-256x256x22-v1
+
+STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+STRIX_H3_VIDEO_VAE_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
+video-vae-256x256x22-v1 \
+  ./build-h3-173/minimax_h3_video_vae_hip_test
+```
+
+`AudioVaeDecoder` accepts channel-major normalized F32 `[32,2,T]` audio
+latents and returns channel-major F32 `[2,T*800]` PCM at 32 kHz. The native
+route covers the released input projection, exact weight normalization,
+Conv1d, ConvTranspose1d, seven BigVGAN upsampling stages, 21 residual blocks,
+127 alias-free SnakeBeta activations, final clipping, and channel
+recombination. Left and right channels remain independent batches throughout.
+The unused audio encoder and its attention projection are not loaded into the
+text-to-video serving path.
+
+All 127 released alias-free upsample/downsample filters were checked
+byte-for-byte and are identical, so the runtime shares one resident pair
+without changing arithmetic. Model convolution and activation compute stays
+on gfx1151; host work is limited to checkpoint I/O, progress, final PCM
+readback, evaluation, and media output.
+
+Generate and run the operator-owned AudioVAE oracle:
+
+```sh
+nix develop -c python3 tools/strix/h3_audio_vae_golden.py \
+  --model-root /var/llms/huggingface/MiniMax-H3 \
+  --latent /var/llms/huggingface/strix-h3-oracles/\
+denoiser-256x256x22-4step-v1/audio_final.f32 \
+  --output /var/llms/huggingface/strix-h3-oracles/\
+audio-vae-256x256x22-v1
+
+STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+STRIX_H3_AUDIO_VAE_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
+audio-vae-256x256x22-v1 \
+  ./build-h3-173/minimax_h3_audio_vae_hip_test --real
+```
+
+The MP4 writer sends RGB24 and channel-major PCM to FFmpeg through two
+concurrent nonblocking pipes. Audio interleaving uses a bounded 4,096-sample
+chunk rather than a second full waveform. The child, both descriptors, and
+partial output are reclaimed on success, write failure, child failure, or
+cancellation. The pinned Nix package uses headless FFmpeg with H.264 and AAC;
+FFprobe validates codec, dimensions, 24 fps, stereo 32 kHz audio, duration,
+and start-time synchronization. When internal and output canvases differ,
+FFmpeg performs an explicit Lanczos scale before H.264 encoding. Media tools
+are runtime infrastructure only, not a CPU inference fallback.
+
+## Text-to-Video CLI and Frozen Presets
+
+`strix-server video` is the first complete text-only serving path. It requires
+an explicit operator-supplied model directory, validates the pinned manifest,
+tokenizes and encodes layer 50, denoises on gfx1151, decodes the released
+VisualVAE and AudioVAE, and atomically publishes either an audiovisual MP4 or
+selected diagnostic PPM frames. It never downloads weights and has no CPU
+model-inference fallback.
+
+The named preset contract is versioned as
+`strix.minimax-h3-text-generation.v1`:
+
+| Preset | Internal canvas | Output canvas | Steps | Active blocks | Denoiser reuse |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `exact` | 512x512 | 512x512 | 50 | 50 | 1 |
+| `fast` | 384x384 | 512x512 | 20 | 45 | 2 |
+| `aggressive` | 320x320 | 512x512 | 20 | 40 | 3 |
+| `dev` | 256x256 | selected 256x256 frames | 4 | 50 | 1 |
+
+Token reduction is false in every preset. The development preset decodes only
+frames 0, 11, and 21 and skips AudioVAE and muxing, so numerical work can
+iterate without waiting for a complete video.
+
+Rapid development example:
+
+```sh
+nix develop -c ./build-h3-173/strix-server video \
+  --model /var/llms/huggingface/MiniMax-H3 \
+  --preset dev \
+  --frames-dir /tmp/h3-fox-dev \
+  --profile \
+  "A red fox walking through snow"
+```
+
+Manual end-user or release exact output:
+
+```sh
+nix develop -c ./build-h3-173/strix-server video \
+  --model /var/llms/huggingface/MiniMax-H3 \
+  --preset exact \
+  --seed 42 \
+  --output /tmp/h3-fox-exact.mp4 \
+  --latents-dir /tmp/h3-fox-exact-latents \
+  --profile \
+  "A red fox walking through snow"
+```
+
+Every admitted request writes a parameter document containing the preset,
+prompt hash, seed, geometry, step/block/reuse values, and selected frames.
+Successful runs add a timing, memory, denoiser-evaluation-count, and swap
+report. Neither document contains the prompt text or model path. `SIGINT`
+propagates through the phase cancellation token; temporary frames and media
+are never published as final output.
+
+Advanced geometry, step, block, reuse, output-canvas, and selected-frame
+overrides exist for controlled experiments and are fully represented in the
+parameter document. `--latents-dir` atomically retains final F32 video/audio
+latents plus their shapes and hashes for an explicit teacher comparison. Its
+manifest also binds the model/reference revisions, seed, prompt hash, exact
+layer-50 conditioning hash, geometry, evaluation/block/reuse policy, and
+attention kernel. The comparison rejects provenance drift before applying a
+numeric tolerance. This diagnostic output is never enabled by the API.
+`--attention-kernel scalar` retains the original deterministic SDPA as an
+explicit profiling/rollback route; `row-parallel` is the named-preset default,
+and the selected policy is included in parameters and telemetry. First-frame,
+last-frame, and ordered-reference inputs are rejected until their future
+conditioning milestones land. No implicit conditioning/model cache is enabled
+in this CLI.
+
+Sparse attention is explicitly future work. It must not change these preset
+names or silently enter the exact route.
+
+## Asynchronous Video API
+
+`strix-server serve --video-model <DIR>` enables the versioned
+`strix.video-api.v1` text-to-video API. When `--model` is not also supplied,
+the process is video-only and does not load an unrelated text model:
+
+```sh
+nix develop -c ./build-h3-173/strix-server serve \
+  --host 127.0.0.1 \
+  --port 8080 \
+  --video-model /var/llms/huggingface/MiniMax-H3 \
+  --video-root /var/llms/huggingface/strix-h3-jobs \
+  --video-ttl 3600
+```
+
+Startup inspects the operator-supplied directory against the pinned source
+manifest before binding the listening socket. A missing, partial, or
+incompatible checkpoint therefore fails configuration rather than creating a
+job that is known to be unusable. There is no CPU inference fallback.
+
+The supported routes are:
+
+| Method | Path | Result |
+| --- | --- | --- |
+| `POST` | `/v1/videos` | Admit one asynchronous text-to-video job |
+| `GET` | `/v1/videos/{id}` | Read stable status, progress, and error fields |
+| `GET` | `/v1/videos/{id}/content` | Read completed MP4 or diagnostic PPM content |
+| `DELETE` | `/v1/videos/{id}` | Cancel or remove a job and reclaim its artifacts |
+
+`GET /v1/models` advertises `minimax-h3` and the
+`minimax-h3-{exact,fast,aggressive,dev}` aliases. An alias selects its matching
+frozen preset; if `strix.preset` is also present, the two must agree.
+
+Create accepts `application/json` and the `multipart/form-data` shape used by
+OpenAI video clients. JSON remains convenient for the nested Strix extension:
+
+```json
+{
+  "model": "minimax-h3-fast",
+  "prompt": "A red fox walking through snow",
+  "size": "512x512",
+  "seconds": "1",
+  "strix": {
+    "seed": 42,
+    "output_format": "mp4"
+  }
+}
+```
+
+The equivalent standard text-only form selects the mode through the model
+alias:
+
+```sh
+curl http://127.0.0.1:8080/v1/videos \
+  -F model=minimax-h3-fast \
+  -F 'prompt=A red fox walking through snow' \
+  -F size=512x512 \
+  -F seconds=1
+```
+
+Multipart duplicate fields and malformed boundaries fail closed. A multipart
+`input_reference` file is recognized but rejected explicitly until the
+first/last-frame conditioning milestone lands.
+
+Exact, fast, and aggressive deliberately support one-second, 22-frame,
+512x512 audiovisual MP4 files only. The development alias requires
+`size: "256x256"` and `output_format: "ppm"`; it accepts a released
+VisualVAE-decodable frame count through `strix.frames` (`22, 39, ... 362`) and
+exactly one diagnostic frame through `strix.selected_frame`. Although the
+denoiser geometry can represent five frames, the released VisualVAE's minimum
+valid temporal chunk is seven latents and 22 output frames. The development
+path therefore preserves the real 22-frame latent window while decoding and
+reading back only the requested preview frame. First-frame, last-frame,
+image-reference, and ordered-reference fields fail closed until their
+conditioning milestones land.
+
+One worker owns the H3 generation path and one additional request may wait in
+the bounded queue. Further admissions return HTTP 429 with `Retry-After`.
+Deleting the active job propagates cancellation through prompt encoding,
+denoising, both VAEs, and media publication. Completed content supports a
+single standard HTTP byte range and reports `Accept-Ranges: bytes`.
+
+Job status is persisted atomically. Completed artifacts survive process
+restart until their configured TTL; queued, interrupted, expired, deleted,
+and partial artifacts are reclaimed. Status documents never store the prompt
+or private filesystem paths. Parameter reports store only a SHA-256 prompt
+digest plus the reproducibility controls, and telemetry contains bounded
+numeric execution data.
+
+## Full-Route Profiling
+
+`tools/strix/h3_profile.py` drives the same public CLI route used by serving.
+It is a manual release tool, not a development or CI gate. Development
+optimization uses the 512x512 two-step denoiser oracle, production-sequence
+attention parity, and focused phase/kernel profiles. A complete 50-step
+generation is run only when explicitly requested after those gates pass.
+
+The harness schedules each requested preset once, rejects `--rounds` values
+other than one, and requires an acknowledgement before it can launch a
+complete generation:
+
+```sh
+nix develop -c python3 tools/strix/h3_profile.py \
+  --binary ./build-h3-173/strix-server \
+  --model /var/llms/huggingface/MiniMax-H3 \
+  --output-root /var/llms/huggingface/strix-h3-profiles/bf16-v1 \
+  --presets exact \
+  --rounds 1 \
+  --cooldown-seconds 0 \
+  --allow-full-generation
+```
+
+If a rare release comparison is requested, run the same command once for the
+candidate with its distinct binary and output root. Both observations use the
+same prompt, seed, model/reference revisions, and harness. No warm, repeated,
+or eviction-requested full video is added.
+
+The generated report combines the versioned parameter and runtime telemetry
+with wall time, process read/write throughput, peak total/anonymous/file-backed/
+shared-memory RSS, HWM/swap, and available AMDGPU power and selected-clock
+samples. Raw profiler captures may retain an available temperature sensor, but
+the comparison tool deliberately ignores it because ambient conditions differ
+between operators. It records the binary hash, profiling-harness hash,
+and kernel release while omitting prompt text, model paths, hostname, and the
+private command line. Successful comparison runs require complete lowercase
+SHA-256 identities for the binary, harness, prompt, and delivered output;
+malformed or abbreviated identity strings fail closed.
+The retained pre-selector scalar binary is identified by its pinned SHA-256.
+Its older parameter document may omit `attention_kernel`; report and delivery
+quality tools infer `scalar` only when the sibling profile binds that exact
+binary hash, parameter document, and delivered output hash. Unknown binaries
+with missing kernel provenance fail closed.
+Timestamped raw monitor samples are retained alongside the aggregate so later
+analysis can distinguish sustained behavior from a transient peak.
+Every admitted release-comparison run must contain the complete hard-gate
+telemetry set. The candidate's direct complete-generation latency, memory
+peaks, loaded-clock coverage, and swap are compared with the single scalar
+observation; no median or other repeated-run statistic is claimed.
+Power and integrated energy are diagnostics rather than efficiency ceilings.
+An optimized route may use the configured 120--140 W graphics envelope when
+that power performs useful work and reduces complete-generation latency.
+Sustained-clock throttling, swap, output quality, and evidence of busy-waiting,
+redundant transfer, or recomputation remain promotion gates. Temperature is
+neither required telemetry nor a comparison objective.
+
+`tools/strix/h3_cache_control.py` remains available for a separately requested
+cache diagnostic:
+
+```sh
+nix develop -c python3 tools/strix/h3_cache_control.py \
+  --model /var/llms/huggingface/MiniMax-H3 \
+  --output /var/llms/huggingface/strix-h3-profiles/cache-control.json
+```
+
+The cache-control artifact records files/bytes attempted, errors, memory
+snapshots, and elapsed time without private filenames. Each regular target is
+opened with `O_NOFOLLOW` and sized through the opened descriptor before the
+advisory request. Linux `POSIX_FADV_DONTNEED` is advisory, so the result is
+named `eviction-requested`, not asserted to be a physically cold cache. This
+utility does not trigger a generation.
+
+For a separately requested fast/aggressive delivery-quality study, compare a
+delivered preset MP4 with its matching exact output:
+
+```sh
+nix develop -c python3 tools/strix/h3_preset_quality.py \
+  --reference /var/llms/huggingface/strix-h3-profiles/bf16-v2/000-exact/output.mp4 \
+  --candidate /var/llms/huggingface/strix-h3-profiles/bf16-v2/001-fast/output.mp4 \
+  --candidate-label fast \
+  --output /var/llms/huggingface/strix-h3-profiles/bf16-v2/001-fast/quality.json
+```
+
+The versioned report hashes both MP4s and compares all decoded RGB frames,
+first/middle/last frames, adjacent-frame deltas, stereo waveform, deterministic
+spectrogram, frame/audio durations, and A/V duration delta. It contains no
+prompt, model path, hostname, or private command line. Promotion reports
+require both profile-style `parameters.json` siblings, embed and hash those
+privacy-safe documents, and reject mismatched provenance or preset contracts.
+Missing parameter documents are accepted only with the explicitly diagnostic
+`--allow-missing-parameters` switch. These delivery-level metrics supplement
+rather than replace the retained component oracles.
+
+The runtime telemetry separates model inspection, tokenizer work, prompt
+weight loading/prefetch wait/submission/GPU time, AdaLN precompute, core load,
+every fresh denoiser forward, sampler time, VisualVAE tiles, AudioVAE stages,
+media composition, VisualVAE frame-set availability (`first_preview_ms`),
+dispatch counts, page faults, swap, and phase memory peaks. That field is
+recorded when the requested selected/full frame set returns; it is not a
+streaming-first-frame claim. The single-observation comparison also derives
+denoiser non-forward time as denoiser wall time minus the sum of fresh
+forwards, so old and new binaries remain comparable even when a raw sampler
+field changes granularity. Both issue #175 generations use the default
+`first-observation` label rather than making an unsupported cache-state claim.
+
+During development, a kernel or residency candidate is retained only when it
+passes the independent component oracles, the 512x512 two-step latent gate,
+the frozen preset contracts, production-shape attention arithmetic parity,
+and a focused profile showing useful work. Fast and aggressive do not add
+full benchmark videos. Byte-identical complete MP4 comparison is reserved for
+an explicitly requested release validation, not every implementation
+iteration.
 
 ## Operator Attestation
 

@@ -9,6 +9,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(STRIX_VERSION "development" CACHE STRING "Strix build revision")
 include_directories(${CMAKE_SOURCE_DIR})
 find_package(ICU REQUIRED COMPONENTS uc)
+find_package(Threads REQUIRED)
+set(STRIX_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
+  "FFmpeg executable used for generated media")
+set(STRIX_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
+  "FFprobe executable used to validate generated media")
 
 # ROCm/HIP GPU backend — compiled natively for the Strix Halo gfx1151 target.
 option(ENGINE_ENABLE_HIP "Build strix with ROCm/HIP GPU backend" OFF)
@@ -39,7 +44,6 @@ if (ENGINE_ENABLE_HIP)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
   find_package(rocblas REQUIRED)
-  find_package(Threads REQUIRED)
   find_path(HIPCUB_INCLUDE_DIR hipcub/hipcub.hpp
     HINTS "$ENV{STRIX_HIPCUB_ROOT}/include"
     REQUIRED)
@@ -187,13 +191,18 @@ endif()
 add_library(strix_core STATIC
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
+  src/models/minimax_h3/audio_vae.cpp
+  src/models/minimax_h3/denoiser.cpp
   src/models/minimax_h3/dit.cpp
+  src/models/minimax_h3/generation.cpp
   src/models/minimax_h3/json.cpp
+  src/models/minimax_h3/media.cpp
   src/models/minimax_h3/prompt_encoder.cpp
   src/models/minimax_h3/runtime.cpp
   src/models/minimax_h3/sampling.cpp
   src/models/minimax_h3/sha256.cpp
   src/models/minimax_h3/tokenizer.cpp
+  src/models/minimax_h3/video_vae.cpp
   src/tokenization/qwen_tokenizer.cpp
   src/tokenization/qwen_chat_template.cpp
   src/models/qwen_oracles.cpp
@@ -208,7 +217,10 @@ add_library(strix_core STATIC
   src/core/quant/ggml_dequant.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(strix_core PUBLIC ICU::uc)
+target_compile_definitions(strix_core PRIVATE
+  STRIX_FFMPEG_EXECUTABLE="${STRIX_FFMPEG_EXECUTABLE}"
+  STRIX_FFPROBE_EXECUTABLE="${STRIX_FFPROBE_EXECUTABLE}")
+target_link_libraries(strix_core PUBLIC ICU::uc Threads::Threads)
 
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
@@ -228,10 +240,13 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/qwen_gpu_model_loader.cpp
     src/core/hip/qwen_gpu_prefill.cpp
     src/core/hip/qwen_mtp_gpu.cpp
+    src/models/minimax_h3/audio_vae.hip
+    src/models/minimax_h3/denoiser.hip
     src/models/minimax_h3/dit.hip
     src/models/minimax_h3/runtime_hip.cpp
     src/models/minimax_h3/prompt_encoder.hip
     src/models/minimax_h3/sampling.hip
+    src/models/minimax_h3/video_vae.hip
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
     src/core/speculative/prompt_lookup_backend.cpp
@@ -242,7 +257,7 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(strix_core SYSTEM PRIVATE
     ${COMPOSABLE_KERNEL_INCLUDE_DIR})
   target_link_libraries(strix_core PUBLIC hip::host roc::hipblas
-    roc::hipblaslt roc::rocblas Threads::Threads)
+    roc::hipblaslt roc::rocblas)
 endif()
 
 if (ENGINE_ENABLE_XRT)
@@ -267,10 +282,16 @@ add_executable(strix-server
   src/server/main.cpp
   src/server/bench_cli.cpp
   src/server/prompt_cli.cpp
+  src/server/video_api.cpp
+  src/server/video_jobs.cpp
+  src/server/video_cli.cpp
   src/server/inference_backend.cpp
   src/server/http_server.cpp
 )
 target_link_libraries(strix-server PRIVATE strix_diagnostics strix_core)
+target_compile_definitions(strix-server PRIVATE
+  STRIX_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+  STRIX_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/strix/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
 
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(strix-server PRIVATE strix_deepseek_v4_flash)
@@ -314,6 +335,8 @@ endif()
 include(CTest)
 
 if (BUILD_TESTING)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
   add_test(NAME strix_server_version COMMAND strix-server --version)
   set_tests_properties(strix_server_version PROPERTIES LABELS "cpu")
 
@@ -328,6 +351,10 @@ if (BUILD_TESTING)
 
   add_test(NAME strix_server_prompt_help COMMAND strix-server prompt --help)
   set_tests_properties(strix_server_prompt_help PROPERTIES LABELS "cpu;server;cli")
+
+  add_test(NAME strix_server_video_help COMMAND strix-server video --help)
+  set_tests_properties(strix_server_video_help PROPERTIES
+    LABELS "cpu;server;cli;minimax-h3")
 
   add_test(NAME strix_server_serve_help COMMAND strix-server serve --help)
   set_tests_properties(strix_server_serve_help PROPERTIES LABELS "cpu;server;cli")
@@ -358,6 +385,70 @@ if (BUILD_TESTING)
 
   add_test(NAME bench_cli_test COMMAND bench_cli_test)
   set_tests_properties(bench_cli_test PROPERTIES LABELS "cpu;server;cli")
+
+  add_executable(video_cli_test
+    tests/server/video_cli_test.cpp
+    src/server/video_cli.cpp
+  )
+  target_link_libraries(video_cli_test PRIVATE strix_core)
+  add_test(NAME video_cli_test COMMAND video_cli_test)
+  set_tests_properties(video_cli_test PROPERTIES
+    LABELS "cpu;server;cli;minimax-h3;quality")
+
+  add_executable(video_jobs_test
+    tests/server/video_jobs_test.cpp
+    src/server/video_jobs.cpp
+  )
+  target_link_libraries(video_jobs_test PRIVATE strix_core)
+  add_test(NAME video_jobs_test COMMAND video_jobs_test)
+  set_tests_properties(video_jobs_test PROPERTIES
+    LABELS "cpu;server;video;minimax-h3;queue;cancellation;quality")
+
+  add_executable(video_api_test
+    tests/server/video_api_test.cpp
+    src/server/video_api.cpp
+    src/server/video_jobs.cpp
+  )
+  target_link_libraries(video_api_test PRIVATE strix_core)
+  add_test(NAME video_api_test COMMAND video_api_test)
+  set_tests_properties(video_api_test PROPERTIES
+    LABELS "cpu;server;api;video;minimax-h3;quality")
+
+  add_test(NAME h3_profile_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/h3_profile_test.py)
+  set_tests_properties(h3_profile_test PROPERTIES
+    LABELS "cpu;profiling;video;minimax-h3;quality")
+
+  add_test(NAME h3_preset_quality_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/h3_preset_quality_test.py)
+  set_tests_properties(h3_preset_quality_test PROPERTIES
+    LABELS "cpu;tools;models;minimax-h3;quality;video;audio")
+
+  add_test(NAME h3_rng_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/h3_rng_test.py)
+  set_tests_properties(h3_rng_test PROPERTIES
+    LABELS "cpu;tools;models;minimax-h3;quality")
+
+  add_test(NAME h3_latent_quality_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/h3_latent_quality_test.py)
+  set_tests_properties(h3_latent_quality_test PROPERTIES
+    LABELS "cpu;tools;models;minimax-h3;quality")
+
+  add_test(NAME h3_cache_control_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/h3_cache_control_test.py)
+  set_tests_properties(h3_cache_control_test PROPERTIES
+    LABELS "cpu;tools;models;minimax-h3;profiling")
+
+  add_test(NAME h3_profile_report_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/h3_profile_report_test.py)
+  set_tests_properties(h3_profile_report_test PROPERTIES
+    LABELS "cpu;tools;models;minimax-h3;profiling")
 
   add_executable(bandwidth_test tests/diagnostics/bandwidth_test.cpp)
   target_compile_definitions(bandwidth_test PRIVATE TEST_FIXTURES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/diagnostics")
@@ -442,6 +533,30 @@ if (BUILD_TESTING)
   add_test(NAME minimax_h3_sampling_test COMMAND minimax_h3_sampling_test)
   set_tests_properties(minimax_h3_sampling_test PROPERTIES
     LABELS "cpu;models;minimax-h3;layout;schedule;rng;quality")
+
+  add_executable(minimax_h3_generation_test
+    tests/models/minimax_h3_generation_test.cpp)
+  target_link_libraries(minimax_h3_generation_test PRIVATE strix_core)
+  add_test(NAME minimax_h3_generation_test
+    COMMAND minimax_h3_generation_test)
+  set_tests_properties(minimax_h3_generation_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;generation;cli;quality;cancellation")
+
+  add_executable(minimax_h3_video_vae_test
+    tests/models/minimax_h3_video_vae_test.cpp)
+  target_link_libraries(minimax_h3_video_vae_test PRIVATE strix_core)
+  add_test(NAME minimax_h3_video_vae_plan
+    COMMAND minimax_h3_video_vae_test)
+  set_tests_properties(minimax_h3_video_vae_plan PROPERTIES
+    LABELS "cpu;models;minimax-h3;video;vae;tiling;chunking")
+
+  add_executable(minimax_h3_media_test
+    tests/models/minimax_h3_media_test.cpp)
+  target_link_libraries(minimax_h3_media_test PRIVATE strix_core)
+  add_test(NAME minimax_h3_media_test COMMAND minimax_h3_media_test)
+  set_tests_properties(minimax_h3_media_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;video;audio;ffmpeg;mux;quality"
+    SKIP_RETURN_CODE 77)
 
   add_executable(ggml_dequant_test tests/core/ggml_dequant_test.cpp)
   target_link_libraries(ggml_dequant_test PRIVATE strix_core)
@@ -580,6 +695,63 @@ if (BUILD_TESTING)
       COMMAND minimax_h3_dit_hip_test --real)
     set_tests_properties(minimax_h3_dit_block0_real PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;dit;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_denoiser_hip_test
+      tests/models/minimax_h3_denoiser_hip_test.hip)
+    target_compile_definitions(minimax_h3_denoiser_hip_test PRIVATE
+      STRIX_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+    target_link_libraries(minimax_h3_denoiser_hip_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME minimax_h3_denoiser_smoke
+      COMMAND minimax_h3_denoiser_hip_test --smoke)
+    set_tests_properties(minimax_h3_denoiser_smoke PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;dit;denoiser;external-model;slow"
+      SKIP_RETURN_CODE 77)
+    add_test(NAME minimax_h3_denoiser_oracle
+      COMMAND minimax_h3_denoiser_hip_test --oracle)
+    set_tests_properties(minimax_h3_denoiser_oracle PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;dit;denoiser;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
+    add_test(NAME minimax_h3_denoiser_production_shape_oracle
+      COMMAND minimax_h3_denoiser_hip_test --oracle-512)
+    set_tests_properties(minimax_h3_denoiser_production_shape_oracle PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;dit;denoiser;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
+    add_test(NAME minimax_h3_denoiser_reuse_smoke
+      COMMAND minimax_h3_denoiser_hip_test --reuse-smoke)
+    set_tests_properties(minimax_h3_denoiser_reuse_smoke PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;dit;denoiser;reuse;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_video_vae_hip_test
+      tests/models/minimax_h3_video_vae_hip_test.hip)
+    target_compile_definitions(minimax_h3_video_vae_hip_test PRIVATE
+      STRIX_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+      STRIX_H3_VIDEO_VAE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/minimax_h3/video-vae-oracle-v1.json")
+    target_link_libraries(minimax_h3_video_vae_hip_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME minimax_h3_video_vae_real
+      COMMAND minimax_h3_video_vae_hip_test)
+    set_tests_properties(minimax_h3_video_vae_real PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;video;vae;quality;external-model;very-slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_audio_vae_hip_test
+      tests/models/minimax_h3_audio_vae_hip_test.hip)
+    target_compile_definitions(minimax_h3_audio_vae_hip_test PRIVATE
+      STRIX_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+      STRIX_H3_AUDIO_VAE_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/minimax_h3/audio-vae-oracle-v1.json")
+    target_link_libraries(minimax_h3_audio_vae_hip_test PRIVATE
+      strix_core hip::host)
+    add_test(NAME minimax_h3_audio_vae_primitives
+      COMMAND minimax_h3_audio_vae_hip_test --primitives)
+    set_tests_properties(minimax_h3_audio_vae_primitives PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;audio;vae;analytic")
+    add_test(NAME minimax_h3_audio_vae_real
+      COMMAND minimax_h3_audio_vae_hip_test --real)
+    set_tests_properties(minimax_h3_audio_vae_real PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;audio;vae;quality;external-model;very-slow"
       SKIP_RETURN_CODE 77)
 
     add_executable(deepseek_v4_flash_engine_test

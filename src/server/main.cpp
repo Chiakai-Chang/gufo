@@ -1,6 +1,10 @@
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <span>
+#include <string>
 #include <string_view>
 
 #include "src/cli/diagnose.h"
@@ -8,6 +12,8 @@
 #include "src/server/http_server.hpp"
 #include "src/server/inference_backend.hpp"
 #include "src/server/prompt_cli.hpp"
+#include "src/server/video_cli.hpp"
+#include "src/server/video_jobs.hpp"
 
 namespace strix::server {
 namespace {
@@ -25,6 +31,7 @@ void print_help(std::string_view program_name) {
       << "  serve     Start the OpenAI-compatible server\n"
       << "  chat      Maintain an interactive conversation\n"
       << "  prompt    Execute one request and exit\n"
+      << "  video     Generate MiniMax H3 text-to-video on Strix Halo\n"
       << "  bench     Run inference throughput benchmarks\n"
       << "  diagnose  Run non-interactive system and hardware diagnostics\n\n"
       << "Options:\n"
@@ -43,6 +50,10 @@ void PrintServeHelp() {
          "(default: models/Qwen3.5-4B-BF16.gguf)\n"
       << "  -c, --context <N>  Maximum context tokens (default: 4096)\n"
       << "  -j, --sessions <N> Preallocated GPU request sessions (default: 1)\n"
+      << "  --video-model <DIR> Operator-supplied MiniMax H3 directory\n"
+      << "  --video-root <DIR>  Persistent video jobs (default: video-jobs)\n"
+      << "  --video-manifest <PATH> Pinned H3 manifest override\n"
+      << "  --video-ttl <SEC>   Completed-artifact TTL (default: 3600)\n"
       << "  -h, --help         Print this help\n";
 }
 
@@ -50,8 +61,13 @@ int RunServe(std::span<const char* const> args) {
   std::string host = "127.0.0.1";
   int port = 8080;
   std::string model = "models/Qwen3.5-4B-BF16.gguf";
+  bool text_model_explicit = false;
   std::uint32_t max_context = 4096;
   std::size_t session_count = 1;
+  std::filesystem::path video_model;
+  std::filesystem::path video_root = "video-jobs";
+  std::filesystem::path video_manifest = DefaultH3SourceManifest();
+  std::uint64_t video_ttl_seconds = 3600;
 
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string_view a = args[i];
@@ -67,6 +83,7 @@ int RunServe(std::span<const char* const> args) {
       ++i;
     } else if ((a == "-m" || a == "--model") && i + 1 < args.size()) {
       model = args[i + 1];
+      text_model_explicit = true;
       ++i;
     } else if ((a == "-c" || a == "--context") && i + 1 < args.size()) {
       max_context =
@@ -75,17 +92,60 @@ int RunServe(std::span<const char* const> args) {
     } else if ((a == "-j" || a == "--sessions") && i + 1 < args.size()) {
       session_count = std::stoul(std::string(args[i + 1]));
       ++i;
+    } else if (a == "--video-model" && i + 1 < args.size()) {
+      video_model = args[++i];
+    } else if (a == "--video-root" && i + 1 < args.size()) {
+      video_root = args[++i];
+    } else if (a == "--video-manifest" && i + 1 < args.size()) {
+      video_manifest = args[++i];
+    } else if (a == "--video-ttl" && i + 1 < args.size()) {
+      video_ttl_seconds = std::stoull(std::string(args[++i]));
+    } else {
+      std::cerr << "Error: unknown or incomplete serve option '" << a << "'\n";
+      PrintServeHelp();
+      return 2;
     }
   }
 
-  auto backend = std::make_shared<InferenceBackend>();
-  std::string err;
-  if (!backend->load(model, &err, max_context, session_count)) {
-    std::cerr << "Error loading model '" << model << "': " << err << "\n";
-    return 1;
+  if (video_ttl_seconds == 0 ||
+      video_ttl_seconds >
+          static_cast<std::uint64_t>(std::chrono::seconds::max().count())) {
+    std::cerr << "Error: --video-ttl must be a positive duration\n";
+    return 2;
   }
 
-  HttpServer server(host, port, backend);
+  std::shared_ptr<InferenceBackend> backend;
+  std::string err;
+  if (video_model.empty() || text_model_explicit) {
+    backend = std::make_shared<InferenceBackend>();
+    if (!backend->load(model, &err, max_context, session_count)) {
+      std::cerr << "Error loading model '" << model << "': " << err << "\n";
+      return 1;
+    }
+  }
+
+  std::shared_ptr<VideoJobService> video_jobs;
+  if (!video_model.empty()) {
+    video_jobs = std::make_shared<VideoJobService>(VideoJobServiceOptions{
+        .model_root = video_model,
+        .source_manifest = video_manifest,
+        .storage_root = video_root,
+        .queue_capacity = 1,
+        .artifact_ttl = std::chrono::seconds(
+            static_cast<std::chrono::seconds::rep>(video_ttl_seconds)),
+        .validate_model_inventory = true,
+        .id_factory = {},
+        .now = {},
+        .runner = {},
+    });
+    if (!video_jobs->ready()) {
+      std::cerr << "Error enabling MiniMax H3 video service: "
+                << video_jobs->initialization_error() << '\n';
+      return 1;
+    }
+  }
+
+  HttpServer server(host, port, backend, video_jobs);
   if (!server.start(&err)) {
     std::cerr << "Error starting HTTP server: " << err << "\n";
     return 1;
@@ -131,6 +191,10 @@ int run(std::span<const char* const> args) {
 
   if (first_arg == "prompt") {
     return RunPrompt(options.subspan(1));
+  }
+
+  if (first_arg == "video") {
+    return RunVideo(options.subspan(1));
   }
 
   if (first_arg == "chat") {

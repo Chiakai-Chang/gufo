@@ -1,6 +1,6 @@
 # OpenAI-Compatible Server
 
-Status: design draft, 2026-08-11
+Status: active implementation contract, 2026-08-22
 
 ## Purpose
 
@@ -51,11 +51,14 @@ The executable provides subcommands rather than separate inference binaries:
 strix-server serve
 strix-server chat
 strix-server prompt
+strix-server video
 ```
 
 `chat` and `prompt` are transport adapters over the same scheduler and may
-either load the runtime directly or connect to a running server. Their detailed
-contract is defined in [Command-Line Interface](CLI.md).
+either load the runtime directly or connect to a running server. `video`
+executes the direct MiniMax H3 route used by the asynchronous video worker.
+Their detailed contracts are defined in [Command-Line Interface](CLI.md) and
+[MiniMax H3 Integration Boundary](MINIMAX_H3.md).
 
 ### Current Single-Request HIP Path
 
@@ -176,9 +179,23 @@ state. I/O threads never wait synchronously for device completion.
 | `POST` | `/v1/audio/transcriptions` | An STT implementation is compiled and loaded |
 | `POST` | `/v1/audio/speech` | A TTS implementation is compiled and loaded |
 | `POST` | `/v1/images/generations` | An image implementation is compiled and loaded |
+| `POST` | `/v1/videos` | A validated operator-supplied MiniMax H3 checkpoint is configured |
+| `GET` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
+| `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
+| `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 
-Future video support must follow the then-current official API shape rather than
-freezing a speculative endpoint now.
+The MiniMax H3 subset follows the asynchronous OpenAI-style video resource
+shape and is versioned independently as `strix.video-api.v1`. Its supported
+fields, frozen presets, queue behavior, and deliberate conditioning
+omissions are documented in [MINIMAX_H3.md](MINIMAX_H3.md).
+Create requests accept both `application/json` and OpenAI-client-compatible
+`multipart/form-data`; duplicate form fields, malformed boundaries, unsupported
+media types, and reference-image parts fail explicitly.
+The bounded worker retains prompt text only in volatile queued or active
+request memory, persists only its SHA-256 digest, and wipes both source and
+active string storage after transfer and completion. Completed MP4s are probed
+for H.264/AAC codec, geometry, rates, duration, and A/V synchronization before
+atomic publication.
 
 ## Internal Request Model
 

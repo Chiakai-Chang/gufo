@@ -137,3 +137,25 @@ Notice Check Status: Verified on 2026-08-17. The pinned upstream source revision
 4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305 does not contain a top-level NOTICE file.
 Applicable copyright and license headers from CMakeLists.txt and source files are
 preserved in THIRD_PARTY_NOTICES.md.
+
+--------------------------------------------------------------------------------
+3. FFmpeg - Separate Runtime Executable
+--------------------------------------------------------------------------------
+Version: 8.1.2 from pinned Nixpkgs
+Upstream Repository: https://github.com/FFmpeg/FFmpeg
+
+MiniMax H3 media output invokes the headless ffmpeg and ffprobe executables as
+separate processes. No FFmpeg library is linked into Strix-Halo.cpp. The
+pinned Nix closure supplies FFmpeg's LGPL/GPL license texts and corresponding
+source metadata. See THIRD_PARTY_NOTICES.md for the exact relationship and
+enabled-license inventory.
+
+--------------------------------------------------------------------------------
+4. Evaluation-Only Python Quality Toolchain
+--------------------------------------------------------------------------------
+Pinned development environments include PyTorch ROCm 2.12.0, Torchvision
+0.27.0, and LPIPS 0.1.4 for independent teacher execution and perceptual
+quality evaluation. These BSD-licensed packages are not linked into or
+distributed with the production Strix binaries. Their upstream license texts
+and source metadata are supplied by the pinned Nix packages; exact
+relationships are recorded in THIRD_PARTY_NOTICES.md.

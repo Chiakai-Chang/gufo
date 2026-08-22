@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -400,12 +401,11 @@ void CheckGroupedQkvAndAttention() {
   }
 }
 
-void CheckProductionAttentionDeterminism() {
-  constexpr std::uint32_t kRows = 528;
+void CheckProductionAttentionDeterminism(std::uint32_t rows) {
   constexpr std::uint32_t kHeads = 56;
   constexpr std::uint32_t kDimension = 128;
   const std::size_t elements =
-      static_cast<std::size_t>(kRows) * kHeads * kDimension;
+      static_cast<std::size_t>(rows) * kHeads * kDimension;
   std::vector<std::uint16_t> query(elements);
   std::vector<std::uint16_t> key(elements);
   std::vector<std::uint16_t> value(elements);
@@ -420,20 +420,30 @@ void CheckProductionAttentionDeterminism() {
   DeviceArray<std::uint16_t> d_query(elements);
   DeviceArray<std::uint16_t> d_key(elements);
   DeviceArray<std::uint16_t> d_value(elements);
+  DeviceArray<std::uint16_t> d_scalar(elements);
   DeviceArray<std::uint16_t> d_first(elements);
   DeviceArray<std::uint16_t> d_second(elements);
   CHECK(d_query.CopyFrom(query));
   CHECK(d_key.CopyFrom(key));
   CHECK(d_value.CopyFrom(value));
-  ops::LaunchFullAttention(
-      d_query.get(), d_key.get(), d_value.get(), d_first.get(), kRows, kHeads,
-      kDimension, 1.0F / std::sqrt(static_cast<float>(kDimension)), nullptr);
-  ops::LaunchFullAttention(
-      d_query.get(), d_key.get(), d_value.get(), d_second.get(), kRows, kHeads,
-      kDimension, 1.0F / std::sqrt(static_cast<float>(kDimension)), nullptr);
-  CHECK(hipDeviceSynchronize() == hipSuccess);
+  const auto run = [&](std::uint16_t* output, bool row_parallel) {
+    const auto begin = std::chrono::steady_clock::now();
+    ops::LaunchFullAttention(
+        d_query.get(), d_key.get(), d_value.get(), output, rows, kHeads,
+        kDimension, 1.0F / std::sqrt(static_cast<float>(kDimension)), nullptr,
+        row_parallel);
+    CHECK(hipDeviceSynchronize() == hipSuccess);
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - begin)
+        .count();
+  };
+  const double scalar_ms = run(d_scalar.get(), false);
+  const double row_parallel_ms = run(d_first.get(), true);
+  (void)run(d_second.get(), true);
+  std::vector<std::uint16_t> scalar(elements);
   std::vector<std::uint16_t> first(elements);
   std::vector<std::uint16_t> second(elements);
+  CHECK(d_scalar.CopyTo(scalar));
   CHECK(d_first.CopyTo(first));
   CHECK(d_second.CopyTo(second));
   if (first != second) {
@@ -445,7 +455,25 @@ void CheckProductionAttentionDeterminism() {
               << " first=" << ToFloat(*mismatch.first)
               << " second=" << ToFloat(*mismatch.second) << '\n';
   }
+  if (scalar != first) {
+    const auto mismatch = std::mismatch(scalar.begin(), scalar.end(),
+                                        first.begin(), first.end());
+    const std::size_t index =
+        static_cast<std::size_t>(mismatch.first - scalar.begin());
+    std::cerr << "attention scalar/row-parallel mismatch index=" << index
+              << " scalar=" << ToFloat(*mismatch.first)
+              << " row_parallel=" << ToFloat(*mismatch.second) << '\n';
+  }
+  CHECK(scalar == first);
   CHECK(first == second);
+  const double speedup =
+      row_parallel_ms > 0.0
+          ? scalar_ms / row_parallel_ms
+          : std::numeric_limits<double>::infinity();
+  std::cout << "H3 attention scalar/row-parallel byte parity rows=" << rows
+            << " scalar_ms=" << scalar_ms
+            << " row_parallel_ms=" << row_parallel_ms
+            << " speedup=" << speedup << '\n';
 }
 
 bool HasGfx1151() {
@@ -466,7 +494,10 @@ int CheckAnalytic() {
   CheckAdaLnGateAndSwiGlu();
   CheckPatchAndFinalProjection();
   CheckGroupedQkvAndAttention();
-  CheckProductionAttentionDeterminism();
+  CheckProductionAttentionDeterminism(528);
+  CheckProductionAttentionDeterminism(780);
+  CheckProductionAttentionDeterminism(1088);
+  CheckProductionAttentionDeterminism(1872);
   if (failures != 0) {
     std::cerr << failures << " MiniMax H3 DiT analytic checks failed\n";
     return 1;

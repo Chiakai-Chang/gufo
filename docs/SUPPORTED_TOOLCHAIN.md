@@ -34,9 +34,10 @@ All userspace toolchain dependencies are locked via
 | **ROCm CLR** | ROCm `7.2.3` | `rocmPackages.clr` (`7.2.3`) | AMD ROCm Common Language Runtime |
 | **Device HIP Compiler** | AMD Clang `22.0.0` (`rocm-7.2.3`) | `rocmPackages.llvm.clang` / `hipClang` | Native device code generation for `gfx1151` |
 | **ROCm Libraries** | `hipblas` `7.2.3`, `hipblaslt` `7.2.3`, `rocblas` `7.2.3` | `rocmPackages.hipblas`, `rocmPackages.hipblaslt`, `rocmPackages.rocblas` | Tuned BF16 prefill GEMMs, BLAS baselines, and runtime utilities |
+| **FFmpeg / FFprobe** | `8.1.2` | `pkgs.ffmpeg-headless` | Bounded-pipe RGB24/F32 PCM encoding to H.264/AAC MP4 and deterministic A/V metadata validation |
 | **XRT Userspace Runtime** | Git commit `8661761775a266b11992a3bd6eb08209d88aa845` | `github:Xilinx/XRT` (`sha256-JrqJIGJoQiXTwXjZpqAXVaHx+6i09B1qtqkJzoRPZKw=`) | AMD XRT NPU runtime shim (`libxrt_coreutil.so`) |
 | **AMD XDNA Driver Plugin** | Git commit `4e5aed38f3b74a5a9a2c7a6222eaff1a8be54305` (Plugin `2.21.0`) | `github:amd/xdna-driver` (`sha256-YUiM9u9vtISttbThTt9fTtBB/w3d5UatGyVK5mAgWNM=`) | Userspace driver plugin (`libxrt_driver_xdna.so`) |
-| **Offline Python Toolchain** | Python `3.13` (`python313`) | `python313.withPackages` | Offline quantization and logit evaluation (`torchWithRocm`, `transformers`, `safetensors`, `numpy`, `scipy`, `zstandard`) |
+| **Offline Python Toolchain** | Python `3.13` (`python313`) | `python313.withPackages` | Offline quantization, logit evaluation, and H3 quality reports (`torchWithRocm`, ROCm-bound `torchvision` 0.27.0 and `lpips` 0.1.4, pinned AlexNet `7be5be79…dee02`, `transformers`, `safetensors`, `numpy`, `scipy`, `zstandard`) |
 | **MLIR-AIE / IRON** | `1.4.1` | `github:Xilinx/mlir-aie` release wheel | NPU2 array, DMA, and program generation |
 | **LLVM-AIE / Peano** | `21.0.0.2026080301+c9c5ecb7` | `github:Xilinx/llvm-aie` release wheel | AIE2P core compilation |
 | **AIEBU** | `27a302c5840773e79c79f0f2fc8a1832d6ab1774` | `github:Xilinx/aiebu` | AIE control-code ELF assembly |

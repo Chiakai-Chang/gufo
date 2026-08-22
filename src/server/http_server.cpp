@@ -16,11 +16,14 @@
 #include <iomanip>
 #include <iostream>
 #include <random>
+#include <ranges>
 #include <sstream>
 #include <thread>
 #include <utility>
 
 #include "src/server/json.hpp"
+#include "src/server/video_api.hpp"
+#include "src/server/video_jobs.hpp"
 #include "src/tokenization/qwen_chat_template.hpp"
 
 namespace strix::server {
@@ -123,14 +126,19 @@ std::string UrlDecode(std::string_view s) {
   return out;
 }
 
-std::size_t ParseContentLength(const std::string& headers) {
-  const std::string lower = ToLower(headers);
-  const auto pos = lower.find("content-length:");
-  if (pos == std::string::npos)
+std::size_t ParseContentLength(const HttpRequest& request) {
+  const std::string value = request.header("content-length");
+  if (value.empty()) {
     return 0;
-  const auto value_start = pos + std::string_view("content-length:").size();
-  return static_cast<std::size_t>(
-      std::strtoul(headers.c_str() + value_start, nullptr, 10));
+  }
+  return static_cast<std::size_t>(std::strtoull(value.c_str(), nullptr, 10));
+}
+
+bool HasHeader(const HttpResponse& response, std::string_view name) {
+  const std::string lowered = ToLower(name);
+  return std::ranges::any_of(response.headers, [&](const auto& header) {
+    return ToLower(header.first) == lowered;
+  });
 }
 
 std::string BuildResponse(const HttpResponse& resp) {
@@ -141,11 +149,13 @@ std::string BuildResponse(const HttpResponse& resp) {
   out += ' ';
   out += resp.reason;
   out += "\r\n";
-  out += "Content-Type: application/json\r\n";
+  if (!HasHeader(resp, "content-type")) {
+    out += "Content-Type: application/json\r\n";
+  }
   out += "Content-Length: " + std::to_string(resp.body.size()) + "\r\n";
   out += "Access-Control-Allow-Origin: *\r\n";
-  out += "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
-  out += "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+  out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
+  out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
   for (const auto& [name, value] : resp.headers) {
     out += name;
     out += ": ";
@@ -208,11 +218,6 @@ HttpResponse NotImplemented(const HttpRequest&, InferenceBackend&) {
              "not_implemented");
 }
 
-HttpResponse NotFound(const HttpRequest&, InferenceBackend&) {
-  return Err(404, "Not Found", "no route for this path",
-             "invalid_request_error", "not_found");
-}
-
 // Parse a role string into a ChatRole.
 tokenization::ChatRole RoleFrom(const std::string& r) {
   if (r == "system")
@@ -244,16 +249,40 @@ std::string ContentToString(const json::Value* content) {
 // Endpoint handlers
 // ---------------------------------------------------------------------------
 
-HttpResponse ListModels(const HttpRequest&, InferenceBackend& b) {
+HttpResponse ListModels(InferenceBackend* backend,
+                        const VideoJobService* video_jobs) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
-  json::Value m = json::Value::object();
-  m["id"] = b.model_id();
-  m["object"] = "model";
-  m["created"] = Now();
-  m["owned_by"] = "strix";
-  data.push_back(std::move(m));
+  if (backend != nullptr) {
+    json::Value model = json::Value::object();
+    model["id"] = backend->model_id();
+    model["object"] = "model";
+    model["created"] = Now();
+    model["owned_by"] = "strix";
+    data.push_back(std::move(model));
+  }
+  if (video_jobs != nullptr && video_jobs->ready()) {
+    json::Value root_model = json::Value::object();
+    root_model["id"] = "minimax-h3";
+    root_model["object"] = "model";
+    root_model["created"] = Now();
+    root_model["owned_by"] = "operator-supplied-minimax";
+    root_model["capability"] = "video";
+    data.push_back(std::move(root_model));
+    for (const std::string_view preset :
+         {"minimax-h3-exact", "minimax-h3-fast", "minimax-h3-aggressive",
+          "minimax-h3-dev"}) {
+      json::Value model = json::Value::object();
+      model["id"] = std::string(preset);
+      model["object"] = "model";
+      model["created"] = Now();
+      model["owned_by"] = "operator-supplied-minimax";
+      model["root"] = "minimax-h3";
+      model["capability"] = "video";
+      data.push_back(std::move(model));
+    }
+  }
   resp["data"] = std::move(data);
   return Ok(resp);
 }
@@ -602,8 +631,12 @@ std::string HttpRequest::query_param(const std::string& key) const {
 // ---------------------------------------------------------------------------
 
 HttpServer::HttpServer(std::string host, int port,
-                       std::shared_ptr<InferenceBackend> backend)
-    : host_(std::move(host)), port_(port), backend_(std::move(backend)) {
+                       std::shared_ptr<InferenceBackend> backend,
+                       std::shared_ptr<VideoJobService> video_jobs)
+    : host_(std::move(host)),
+      port_(port),
+      backend_(std::move(backend)),
+      video_jobs_(std::move(video_jobs)) {
   register_routes();
 }
 
@@ -613,9 +646,10 @@ void HttpServer::add(const std::string& method, const std::string& path,
 }
 
 void HttpServer::register_routes() {
+  if (backend_ == nullptr) {
+    return;
+  }
   // ---- OpenAI ----
-  add("GET", "/v1/models", ListModels);
-  add("GET", "/models", ListModels);
   add("POST", "/v1/completions", OpenAiCompletions);
   add("POST", "/v1/chat/completions", OpenAiChat);
   add("POST", "/v1/responses", OpenAiResponses);
@@ -684,7 +718,12 @@ bool HttpServer::start(std::string* error) {
 void HttpServer::run() {
   std::cout << "strix-server: listening on http://" << host_ << ":" << port_
             << "\n";
-  std::cout << "strix-server: model " << backend_->model_id() << "\n";
+  if (backend_ != nullptr) {
+    std::cout << "strix-server: text model " << backend_->model_id() << "\n";
+  }
+  if (video_jobs_ != nullptr && video_jobs_->ready()) {
+    std::cout << "strix-server: MiniMax H3 video API enabled\n";
+  }
   while (!stopped_.load()) {
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
     if (client_fd < 0)
@@ -702,12 +741,25 @@ void HttpServer::stop() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
+  if (req.method == "GET" &&
+      (req.path == "/v1/models" || req.path == "/models")) {
+    return ListModels(backend_.get(), video_jobs_.get());
+  }
+  if (IsVideoApiPath(req.path)) {
+    if (video_jobs_ == nullptr || !video_jobs_->ready()) {
+      return Err(503, "Service Unavailable",
+                 "MiniMax H3 video service is not configured", "server_error",
+                 "video_service_unavailable");
+    }
+    return HandleVideoApiRequest(req, *video_jobs_);
+  }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {
       return entry.second(req, *backend_);
     }
   }
-  return NotFound(req, *backend_);
+  return Err(404, "Not Found", "no route for this path",
+             "invalid_request_error", "not_found");
 }
 
 void HttpServer::handle_connection(int client_fd) {
@@ -718,6 +770,7 @@ void HttpServer::handle_connection(int client_fd) {
   try {
     HttpRequest req;
     bool ok = false;
+    bool payload_too_large = false;
     {
       std::string buffer;
       if (ReadUntil(buffer, client_fd, "\r\n\r\n")) {
@@ -743,18 +796,55 @@ void HttpServer::handle_connection(int client_fd) {
           req.path = target;
         }
 
-        const std::size_t content_length = ParseContentLength(headers);
+        std::size_t cursor =
+            eol == std::string::npos ? headers.size() : eol + 2;
+        while (cursor < headers.size()) {
+          const std::size_t next = headers.find("\r\n", cursor);
+          const std::size_t line_end =
+              next == std::string::npos ? headers.size() : next;
+          const std::string_view header_line(headers.data() + cursor,
+                                             line_end - cursor);
+          const std::size_t colon = header_line.find(':');
+          if (colon != std::string_view::npos) {
+            std::string name(header_line.substr(0, colon));
+            std::string_view raw_value = header_line.substr(colon + 1);
+            while (!raw_value.empty() &&
+                   std::isspace(
+                       static_cast<unsigned char>(raw_value.front())) != 0) {
+              raw_value.remove_prefix(1);
+            }
+            while (!raw_value.empty() &&
+                   std::isspace(static_cast<unsigned char>(raw_value.back())) !=
+                       0) {
+              raw_value.remove_suffix(1);
+            }
+            req.headers.emplace_back(std::move(name), std::string(raw_value));
+          }
+          if (next == std::string::npos) {
+            break;
+          }
+          cursor = next + 2;
+        }
+
+        const std::size_t content_length = ParseContentLength(req);
         const std::size_t remaining =
             content_length > body.size() ? content_length - body.size() : 0;
-        if (content_length > 0 &&
-            content_length < (static_cast<std::size_t>(64) * 1024 * 1024)) {
+        constexpr std::size_t kMaximumBodyBytes =
+            static_cast<std::size_t>(8) * 1024 * 1024;
+        if (content_length > kMaximumBodyBytes) {
+          payload_too_large = true;
+        } else if (content_length > 0) {
           if (remaining > 0) {
             ok = ReadN(body, client_fd, remaining);
           } else {
             ok = true;
           }
+          if (body.size() > content_length) {
+            body.resize(content_length);
+          }
         } else {
           ok = true;
+          body.clear();
         }
         if (ok) {
           req.body = std::move(body);
@@ -766,7 +856,10 @@ void HttpServer::handle_connection(int client_fd) {
     }
 
     HttpResponse resp;
-    if (!ok) {
+    if (payload_too_large) {
+      resp = Err(413, "Payload Too Large", "request body is too large",
+                 "invalid_request_error", "payload_too_large");
+    } else if (!ok) {
       resp = Err(400, "Bad Request", "malformed request",
                  "invalid_request_error", "bad_request");
     } else if (req.method == "OPTIONS") {

@@ -27,6 +27,7 @@ struct DitBlockOptions {
   std::size_t block_index{0};
   std::size_t rows{0};
   std::size_t modulation_rows{0};
+  bool row_parallel_attention{true};
 };
 
 struct DitBlockInput {
@@ -35,6 +36,11 @@ struct DitBlockInput {
   std::span<const std::uint32_t> row_map;
   std::span<const std::uint16_t> rope_cos;
   std::span<const std::uint16_t> rope_sin;
+};
+
+struct DitPreparedInput {
+  std::span<const std::uint16_t> hidden;
+  std::span<const std::uint32_t> row_map;
 };
 
 struct DitBlockRetained {
@@ -70,6 +76,18 @@ public:
       const ModelInventory& inventory, const DitBlockOptions& options,
       const CancellationToken* cancellation, std::string* error = nullptr);
 
+  [[nodiscard]] bool PrepareConstants(std::span<const std::uint16_t> modulation,
+                                      std::span<const std::uint16_t> rope_cos,
+                                      std::span<const std::uint16_t> rope_sin,
+                                      const CancellationToken* cancellation,
+                                      std::string* error = nullptr);
+
+  [[nodiscard]] bool RunPrepared(const DitPreparedInput& input,
+                                 const CancellationToken* cancellation,
+                                 std::span<std::uint16_t> output,
+                                 DitBlockTelemetry* telemetry,
+                                 std::string* error = nullptr);
+
   [[nodiscard]] bool Run(const DitBlockInput& input,
                          const CancellationToken* cancellation,
                          DitBlockRetained* retained,
@@ -79,10 +97,21 @@ public:
   [[nodiscard]] std::size_t rows() const noexcept;
   [[nodiscard]] std::size_t block_index() const noexcept;
   [[nodiscard]] std::uintptr_t scratch_address() const noexcept;
+  [[nodiscard]] std::uint64_t weight_bytes() const noexcept;
+  [[nodiscard]] std::uint64_t activation_bytes() const noexcept;
+  [[nodiscard]] double load_ms() const noexcept;
 
 private:
   struct Impl;
   explicit DitBlockSession(std::unique_ptr<Impl> impl);
+  [[nodiscard]] bool RunInternal(const DitPreparedInput& input,
+                                 const CancellationToken* cancellation,
+                                 std::span<std::uint16_t> modulation_attention,
+                                 std::span<std::uint16_t> attention_output,
+                                 std::span<std::uint16_t> modulation_mlp,
+                                 std::span<std::uint16_t> block_output,
+                                 DitBlockTelemetry* telemetry,
+                                 std::string* error);
   std::unique_ptr<Impl> impl_;
 };
 

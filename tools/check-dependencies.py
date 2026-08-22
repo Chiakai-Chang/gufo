@@ -30,6 +30,13 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "LLVM-AIE",
     "AIEBU",
     "ICU",
+    "FFmpeg",
+}
+
+REQUIRED_EVALUATION_COMPONENTS = {
+    "PyTorch",
+    "Torchvision",
+    "LPIPS",
 }
 
 
@@ -66,6 +73,7 @@ def parse_third_party_notices(notices_path: Path) -> Dict[str, Dict[str, str]]:
 def verify_dependencies(
     notices_file: Path,
     package_nix_file: Path,
+    flake_nix_file: Path,
     json_report_path: Path = None,
 ) -> int:
     errors: List[str] = []
@@ -75,16 +83,50 @@ def verify_dependencies(
     for req in REQUIRED_SHIPPED_COMPONENTS:
         if not any(req.lower() in name.lower() for name in components):
             errors.append(f"Required shipped dependency '{req}' is missing from {notices_file.name}")
+    for req in REQUIRED_EVALUATION_COMPONENTS:
+        if not any(req.lower() in name.lower() for name in components):
+            errors.append(
+                f"Required evaluation dependency '{req}' is missing from "
+                f"{notices_file.name}"
+            )
 
     # 2. Check package.nix inputs consistency
     if package_nix_file.is_file():
         pkg_content = package_nix_file.read_text(encoding="utf-8")
         # Check that rocmPackages, xrt, xrt-plugin-amdxdna, libuuid are wired
-        for dep in ["rocmPackages", "xrt", "xrt-plugin-amdxdna", "libuuid", "icu"]:
+        for dep in [
+            "rocmPackages",
+            "xrt",
+            "xrt-plugin-amdxdna",
+            "libuuid",
+            "icu",
+            "ffmpeg-headless",
+        ]:
             if dep not in pkg_content:
                 errors.append(f"Expected dependency '{dep}' missing from {package_nix_file.name}")
 
-    # 3. Check for invalid or empty SPDX licenses
+    # 3. Check evaluation-only dependencies in the pinned development shell.
+    if flake_nix_file.is_file():
+        flake_content = flake_nix_file.read_text(encoding="utf-8")
+        for dep in ("ps.torchWithRocm", "ps.torchvision", "ps.lpips"):
+            if dep not in flake_content:
+                errors.append(
+                    f"Expected evaluation dependency '{dep}' missing from "
+                    f"{flake_nix_file.name}"
+                )
+        for binding in (
+            "torch = ps.torchWithRocm",
+            "torchvision = torchvisionRocm",
+            "alexnet-owt-7be5be79.pth",
+            "TORCH_HOME",
+        ):
+            if binding not in flake_content:
+                errors.append(
+                    f"Expected ROCm evaluation binding '{binding}' missing "
+                    f"from {flake_nix_file.name}"
+                )
+
+    # 4. Check for invalid or empty SPDX licenses
     for name, info in components.items():
         spdx = info.get("spdx", "")
         if not spdx or spdx.lower() == "unknown" or spdx.lower() == "todo":
@@ -134,6 +176,11 @@ def main() -> int:
         help="Path to package.nix",
     )
     parser.add_argument(
+        "--flake-nix",
+        default="flake.nix",
+        help="Path to flake.nix",
+    )
+    parser.add_argument(
         "--json-report",
         help="Path to output machine-readable JSON inventory report",
     )
@@ -142,9 +189,12 @@ def main() -> int:
 
     notices_path = Path(args.notices)
     package_nix_path = Path(args.package_nix)
+    flake_nix_path = Path(args.flake_nix)
     report_path = Path(args.json_report) if args.json_report else None
 
-    return verify_dependencies(notices_path, package_nix_path, report_path)
+    return verify_dependencies(
+        notices_path, package_nix_path, flake_nix_path, report_path
+    )
 
 
 if __name__ == "__main__":

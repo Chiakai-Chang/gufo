@@ -1,0 +1,83 @@
+{
+  "schema": "strix.minimax-h3-denoiser-golden.v1",
+  "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+  "reference_revision": "8974cc055ea9c02fcd14cc27dfda3e1027c05153",
+  "geometry": {
+    "text_rows": 6,
+    "width": 256,
+    "height": 256,
+    "frames": 22,
+    "audio_rows": 74,
+    "video_rows": 448,
+    "rows": 528
+  },
+  "steps": 4,
+  "time_rows": 7,
+  "arithmetic": {
+    "weights": "released BF16/F32",
+    "activations": "BF16 at transformer operation boundaries",
+    "attention_accumulation": "FP32",
+    "final_head_accumulation": "FP32",
+    "euler_velocity": "BF16"
+  },
+  "quality_bounds": {
+    "refined_text": 0.02,
+    "block0_modulation": 0.02,
+    "video_velocity": 0.04,
+    "audio_velocity": 0.05,
+    "video_final_4step": 0.08,
+    "audio_final_4step": 0.08
+  },
+  "files": {
+    "conditioning.bf16": {
+      "bytes": 61440,
+      "shape": [6, 5120],
+      "sha256": "8015af1d2a551a0509bccc84372a30087f66721613f909c3f99e36ad7e269692"
+    },
+    "refined_text.bf16": {
+      "bytes": 64512,
+      "shape": [6, 5376],
+      "sha256": "be0d360ced628aa8778c95574a18f4593f938bdd0b72b292e1a8d452641e7aba"
+    },
+    "block0_modulation.bf16": {
+      "bytes": 1354752,
+      "shape": [21, 6, 5376],
+      "sha256": "8aeaefd51d570ed2a4e0527132a8eca5591fe6a392c3410f551ed0a0463c41cc"
+    },
+    "row_map_step0.u32": {
+      "bytes": 2112,
+      "shape": [528],
+      "sha256": "816629a33e18daef4f94301aba7b54ba832c50db86fd8ae16a66f86f8d03f5d0"
+    },
+    "video_initial.f32": {
+      "bytes": 172032,
+      "shape": [43008],
+      "sha256": "0e81b17167a0f768cbfebd6d6dca241c6b876a7b93b2f4d601efb945ae8ac056"
+    },
+    "audio_initial.f32": {
+      "bytes": 9472,
+      "shape": [2368],
+      "sha256": "6447c3a4ed7108e3994d753d08ec78180d9e41f80f2e16a8d5fedda050af55fc"
+    },
+    "video_velocity_step0.f32": {
+      "bytes": 172032,
+      "shape": [43008],
+      "sha256": "06183875c33ab88046827226feac1a843baf4b0686d978c9034f9416c0fac7f5"
+    },
+    "audio_velocity_step0.f32": {
+      "bytes": 9472,
+      "shape": [2368],
+      "sha256": "b659c241a6abbbb06c0ec255ed5e3185f70e28b787102799c9eb202dd33d6955"
+    },
+    "video_final.f32": {
+      "bytes": 172032,
+      "shape": [43008],
+      "sha256": "23411f438f351f96632884476def1d1f17513a6d2105b42ebf698a6d69d79d52"
+    },
+    "audio_final.f32": {
+      "bytes": 9472,
+      "shape": [2368],
+      "sha256": "f742e12e3f55d91886a1b4218e6e5a3e64efcd65bce63de6a6d42976f3b2e04c"
+    }
+  }
+}

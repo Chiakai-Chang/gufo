@@ -1,0 +1,44 @@
+{
+  "schema": "strix.minimax-h3-video-vae-golden.v1",
+  "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+  "reference_revision": "8974cc055ea9c02fcd14cc27dfda3e1027c05153",
+  "source_checkpoint": "FL2VA/video_vae/source/model.safetensors",
+  "source_checkpoint_sha256": "5f0c2e161d895a9fee7645ca32d4a7e3a22b90cacfcbeba62ec999cdbbefe0d3",
+  "source_latent_sha256": "23411f438f351f96632884476def1d1f17513a6d2105b42ebf698a6d69d79d52",
+  "geometry": {
+    "latent": [24, 7, 16, 16],
+    "frames": [22, 256, 256, 3],
+    "sequence": 1797
+  },
+  "selected_frame_indices": [0, 5, 11, 16, 21],
+  "arithmetic": {
+    "weights": "released F32",
+    "activations": "F32",
+    "attention_accumulation": "F32",
+    "rgb": "ImageNet de-normalization and clamp to [0,1]"
+  },
+  "quality_bounds": {
+    "relative_l2": 0.05,
+    "relative_max": 0.05
+  },
+  "files": {
+    "latent.f32": {
+      "bytes": 172032,
+      "dtype": "F32",
+      "shape": [24, 7, 16, 16],
+      "sha256": "23411f438f351f96632884476def1d1f17513a6d2105b42ebf698a6d69d79d52"
+    },
+    "frames.f32": {
+      "bytes": 17301504,
+      "dtype": "F32",
+      "shape": [22, 256, 256, 3],
+      "sha256": "36dd863ffcdf34c2f882f57f401d2c66d7fbc441f5185d32aa1b03db46ca24c1"
+    },
+    "selected_frames.f32": {
+      "bytes": 3932160,
+      "dtype": "F32",
+      "shape": [5, 256, 256, 3],
+      "sha256": "a6cc2b34da6b86f70d91dee8e152051ddc0bac0dc7cd5e1f8e605e7f37696ec7"
+    }
+  }
+}

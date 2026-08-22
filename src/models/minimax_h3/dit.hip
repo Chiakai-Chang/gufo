@@ -1,7 +1,5 @@
 #if defined(ENGINE_ENABLE_HIP)
 
-#include "src/models/minimax_h3/dit.hpp"
-
 #include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
@@ -20,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.cuh"
 
 namespace strix::minimax_h3 {
@@ -71,8 +70,7 @@ bool ValidateTarget(int* device, std::string* error) {
                  std::string(properties.gcnArchName));
     return false;
   }
-  if (properties.sharedMemPerBlock <
-      kMaximumAttentionRows * sizeof(float)) {
+  if (properties.sharedMemPerBlock < kMaximumAttentionRows * sizeof(float)) {
     SetError(error, "gfx1151 reports insufficient shared memory for H3 SDPA");
     return false;
   }
@@ -151,10 +149,9 @@ const TensorDescriptor* RequireTensor(
     SetError(error, "MiniMax H3 DiT tensor is missing: " + std::string(name));
     return nullptr;
   }
-  if (descriptor->phase != Phase::kDitCore ||
-      !HasShape(*descriptor, shape)) {
-    SetError(error, "MiniMax H3 DiT tensor contract differs: " +
-                        std::string(name));
+  if (descriptor->phase != Phase::kDitCore || !HasShape(*descriptor, shape)) {
+    SetError(error,
+             "MiniMax H3 DiT tensor contract differs: " + std::string(name));
     return nullptr;
   }
   return descriptor;
@@ -178,8 +175,7 @@ bool LoadWeight(const ModelInventory& inventory,
   if (!output->storage.Allocate(bytes, error)) {
     return false;
   }
-  const std::filesystem::path path =
-      inventory.model_root() / descriptor.shard;
+  const std::filesystem::path path = inventory.model_root() / descriptor.shard;
   const int file = open(path.c_str(), O_RDONLY | O_CLOEXEC);
   if (file < 0) {
     SetError(error, "cannot open MiniMax H3 DiT shard " + path.string());
@@ -196,14 +192,13 @@ bool LoadWeight(const ModelInventory& inventory,
     const std::size_t chunk = std::min(staging_bytes, bytes - copied);
     std::size_t read_bytes = 0;
     while (read_bytes < chunk) {
-      const ssize_t result =
-          pread(file, static_cast<std::byte*>(staging) + read_bytes,
-                chunk - read_bytes,
-                static_cast<off_t>(descriptor.file_offset + copied +
-                                   read_bytes));
+      const ssize_t result = pread(
+          file, static_cast<std::byte*>(staging) + read_bytes,
+          chunk - read_bytes,
+          static_cast<off_t>(descriptor.file_offset + copied + read_bytes));
       if (result <= 0) {
-        SetError(error, "short read loading MiniMax H3 DiT tensor " +
-                            descriptor.name);
+        SetError(error,
+                 "short read loading MiniMax H3 DiT tensor " + descriptor.name);
         success = false;
         break;
       }
@@ -269,12 +264,12 @@ public:
   bool Prepare(std::size_t batch, std::size_t rows, std::size_t columns,
                std::string* error) {
     if (handle_ == nullptr || batch == 0 || rows == 0 || columns == 0 ||
-        batch > static_cast<std::size_t>(
-                    std::numeric_limits<rocblas_int>::max()) ||
+        batch >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
         rows >
             static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
-        columns > static_cast<std::size_t>(
-                      std::numeric_limits<rocblas_int>::max())) {
+        columns >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max())) {
       SetError(error, "invalid rocBLAS BF16 DiT matmul dimensions");
       return false;
     }
@@ -285,11 +280,13 @@ public:
     return true;
   }
 
-  bool SelectDeterministic(
-      const std::uint16_t* weight, const std::uint16_t* input,
-      std::uint16_t* output, std::uint16_t* reference,
-      unsigned long long* first_mismatch, std::size_t batch, std::size_t rows,
-      std::size_t columns, hipStream_t stream, std::string* error) {
+  bool SelectDeterministic(const std::uint16_t* weight,
+                           const std::uint16_t* input, std::uint16_t* output,
+                           std::uint16_t* reference,
+                           unsigned long long* first_mismatch,
+                           std::size_t batch, std::size_t rows,
+                           std::size_t columns, hipStream_t stream,
+                           std::string* error) {
     if (!Prepare(batch, rows, columns, error) ||
         rocblas_set_stream(handle_, stream) != rocblas_status_success) {
       SetError(error, "cannot prepare deterministic rocBLAS DiT solution");
@@ -307,10 +304,9 @@ public:
                "pinned gfx1151 rocBLAS BF16 DiT solution is unavailable");
       return false;
     }
-    hipError_t hip_status =
-        hipMemcpyAsync(reference, output,
-                       output_elements * sizeof(std::uint16_t),
-                       hipMemcpyDeviceToDevice, stream);
+    hipError_t hip_status = hipMemcpyAsync(
+        reference, output, output_elements * sizeof(std::uint16_t),
+        hipMemcpyDeviceToDevice, stream);
     if (hip_status == hipSuccess &&
         Execute(weight, input, output, batch, rows, columns,
                 plan->solution_index) != rocblas_status_success) {
@@ -335,8 +331,8 @@ public:
       hip_status = hipStreamSynchronize(stream);
     }
     if (hip_status != hipSuccess) {
-      SetError(error, HipError("validate pinned rocBLAS DiT solution",
-                               hip_status));
+      SetError(error,
+               HipError("validate pinned rocBLAS DiT solution", hip_status));
       return false;
     }
     if (host_mismatch != std::numeric_limits<unsigned long long>::max()) {
@@ -360,9 +356,8 @@ public:
       SetError(error, "cannot set rocBLAS DiT stream");
       return false;
     }
-    const rocblas_status status =
-        Execute(weight, input, output, batch, rows, columns,
-                plan->solution_index);
+    const rocblas_status status = Execute(weight, input, output, batch, rows,
+                                          columns, plan->solution_index);
     if (status != rocblas_status_success) {
       SetError(error, "rocBLAS BF16 DiT matmul dispatch failed: " +
                           std::to_string(static_cast<int>(status)));
@@ -374,8 +369,7 @@ public:
 private:
   Plan* FindPlan(std::size_t batch, std::size_t rows, std::size_t columns) {
     for (Plan& plan : plans_) {
-      if (plan.batch == batch && plan.rows == rows &&
-          plan.columns == columns) {
+      if (plan.batch == batch && plan.rows == rows && plan.columns == columns) {
         return &plan;
       }
     }
@@ -395,8 +389,8 @@ private:
         static_cast<rocblas_int>(columns), &alpha, weight,
         rocblas_datatype_bf16_r, static_cast<rocblas_int>(columns), input,
         rocblas_datatype_bf16_r, static_cast<rocblas_int>(columns), &beta,
-        output, rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows),
-        output, rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows),
+        output, rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows), output,
+        rocblas_datatype_bf16_r, static_cast<rocblas_int>(rows),
         rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index,
         solution_index, 0);
   }
@@ -421,8 +415,8 @@ std::string FindFirstNonFinite(std::string_view name,
     float value = 0.0F;
     std::memcpy(&value, &bits, sizeof(value));
     if (!std::isfinite(value)) {
-      return std::string(name) + "[" + std::to_string(index) + "]=" +
-             std::to_string(value);
+      return std::string(name) + "[" + std::to_string(index) +
+             "]=" + std::to_string(value);
     }
   }
   return {};
@@ -434,6 +428,7 @@ struct DitBlockSession::Impl {
   std::size_t block_index{0};
   std::size_t rows{0};
   std::size_t modulation_rows{0};
+  bool row_parallel_attention{true};
   int device{0};
   hipStream_t stream{nullptr};
   hipEvent_t start_event{nullptr};
@@ -474,6 +469,7 @@ struct DitBlockSession::Impl {
   std::uint64_t weight_bytes{0};
   std::uint64_t activation_bytes{0};
   double load_ms{0.0};
+  bool constants_prepared{false};
 
   ~Impl() {
     if (staging != nullptr) {
@@ -518,6 +514,7 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   impl->block_index = options.block_index;
   impl->rows = options.rows;
   impl->modulation_rows = options.modulation_rows;
+  impl->row_parallel_attention = options.row_parallel_attention;
   if (!ValidateTarget(&impl->device, error)) {
     return nullptr;
   }
@@ -540,30 +537,26 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
 
   const std::string prefix =
       "blocks." + std::to_string(options.block_index) + ".";
-  const TensorDescriptor* norm1 =
-      RequireTensor(inventory, prefix + "norm1.weight", {kDitHiddenSize},
-                    error);
-  const TensorDescriptor* norm2 =
-      RequireTensor(inventory, prefix + "norm2.weight", {kDitHiddenSize},
-                    error);
-  const TensorDescriptor* qkv_weight = RequireTensor(
-      inventory, prefix + "attn.qkv_proj.weight",
-      {kDitAttentionWidth * 3U, kDitHiddenSize}, error);
-  const TensorDescriptor* query_norm =
-      RequireTensor(inventory, prefix + "attn.q_norm.weight",
-                    {kDitHeadDimension}, error);
-  const TensorDescriptor* key_norm =
-      RequireTensor(inventory, prefix + "attn.k_norm.weight",
-                    {kDitHeadDimension}, error);
-  const TensorDescriptor* output_weight = RequireTensor(
-      inventory, prefix + "attn.out_proj.weight",
-      {kDitHiddenSize, kDitAttentionWidth}, error);
-  const TensorDescriptor* fc1_weight = RequireTensor(
-      inventory, prefix + "mlp.fc1.weight",
-      {kDitFeedForwardSize * 2U, kDitHiddenSize}, error);
-  const TensorDescriptor* fc2_weight = RequireTensor(
-      inventory, prefix + "mlp.fc2.weight",
-      {kDitHiddenSize, kDitFeedForwardSize}, error);
+  const TensorDescriptor* norm1 = RequireTensor(
+      inventory, prefix + "norm1.weight", {kDitHiddenSize}, error);
+  const TensorDescriptor* norm2 = RequireTensor(
+      inventory, prefix + "norm2.weight", {kDitHiddenSize}, error);
+  const TensorDescriptor* qkv_weight =
+      RequireTensor(inventory, prefix + "attn.qkv_proj.weight",
+                    {kDitAttentionWidth * 3U, kDitHiddenSize}, error);
+  const TensorDescriptor* query_norm = RequireTensor(
+      inventory, prefix + "attn.q_norm.weight", {kDitHeadDimension}, error);
+  const TensorDescriptor* key_norm = RequireTensor(
+      inventory, prefix + "attn.k_norm.weight", {kDitHeadDimension}, error);
+  const TensorDescriptor* output_weight =
+      RequireTensor(inventory, prefix + "attn.out_proj.weight",
+                    {kDitHiddenSize, kDitAttentionWidth}, error);
+  const TensorDescriptor* fc1_weight =
+      RequireTensor(inventory, prefix + "mlp.fc1.weight",
+                    {kDitFeedForwardSize * 2U, kDitHiddenSize}, error);
+  const TensorDescriptor* fc2_weight =
+      RequireTensor(inventory, prefix + "mlp.fc2.weight",
+                    {kDitHiddenSize, kDitFeedForwardSize}, error);
   if (norm1 == nullptr || norm2 == nullptr || qkv_weight == nullptr ||
       query_norm == nullptr || key_norm == nullptr ||
       output_weight == nullptr || fc1_weight == nullptr ||
@@ -591,19 +584,18 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
     }
     impl->weight_bytes += descriptor->payload_bytes;
   }
+  (void)hipHostFree(impl->staging);
+  impl->staging = nullptr;
   impl->load_ms = Milliseconds(load_begin, Clock::now());
 
   const auto bf16_bytes = [](std::size_t elements) {
     return elements * sizeof(std::uint16_t);
   };
   const std::size_t hidden_elements = options.rows * kDitHiddenSize;
-  const std::size_t attention_elements =
-      options.rows * kDitAttentionWidth;
+  const std::size_t attention_elements = options.rows * kDitAttentionWidth;
   const std::size_t qkv_elements = attention_elements * 3U;
-  const std::size_t fc1_elements =
-      options.rows * kDitFeedForwardSize * 2U;
-  const std::size_t activated_elements =
-      options.rows * kDitFeedForwardSize;
+  const std::size_t fc1_elements = options.rows * kDitFeedForwardSize * 2U;
+  const std::size_t activated_elements = options.rows * kDitFeedForwardSize;
   const std::size_t modulation_elements =
       options.modulation_rows * kDitModulationSlots * kDitHiddenSize;
   const std::size_t rope_elements = options.rows * kDitRopeHalf;
@@ -616,8 +608,7 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   };
   if (!allocate(&impl->hidden, bf16_bytes(hidden_elements)) ||
       !allocate(&impl->modulation, bf16_bytes(modulation_elements)) ||
-      !allocate(&impl->row_map,
-                options.rows * sizeof(std::uint32_t)) ||
+      !allocate(&impl->row_map, options.rows * sizeof(std::uint32_t)) ||
       !allocate(&impl->rope_cos, bf16_bytes(rope_elements)) ||
       !allocate(&impl->rope_sin, bf16_bytes(rope_elements)) ||
       !allocate(&impl->modulation_attention, bf16_bytes(hidden_elements)) ||
@@ -634,26 +625,25 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
       !allocate(&impl->mlp_output, bf16_bytes(hidden_elements)) ||
       !allocate(&impl->block_output, bf16_bytes(hidden_elements)) ||
       !allocate(&impl->gemm_reference, bf16_bytes(fc1_elements)) ||
-      !allocate(&impl->gemm_first_mismatch,
-                sizeof(unsigned long long))) {
+      !allocate(&impl->gemm_first_mismatch, sizeof(unsigned long long))) {
     return nullptr;
   }
-  if (!impl->gemm.Prepare(options.rows, kDitAttentionWidth * 3U,
-                          kDitHiddenSize, error) ||
+  if (!impl->gemm.Prepare(options.rows, kDitAttentionWidth * 3U, kDitHiddenSize,
+                          error) ||
       !impl->gemm.Prepare(options.rows, kDitHiddenSize, kDitAttentionWidth,
                           error) ||
       !impl->gemm.Prepare(options.rows, kDitFeedForwardSize * 2U,
                           kDitHiddenSize, error) ||
-      !impl->gemm.Prepare(options.rows, kDitHiddenSize,
-                          kDitFeedForwardSize, error)) {
+      !impl->gemm.Prepare(options.rows, kDitHiddenSize, kDitFeedForwardSize,
+                          error)) {
     return nullptr;
   }
   // Select a concrete byte-deterministic rocBLAS solution for every fixed
   // orientation. This also performs all library initialization before Run.
   const auto fill = [&](DeviceBuffer* buffer, std::uint32_t seed) {
-    dit_ops::LaunchFillBf16Pattern(
-        buffer->As<std::uint16_t>(),
-        buffer->bytes() / sizeof(std::uint16_t), seed, impl->stream);
+    dit_ops::LaunchFillBf16Pattern(buffer->As<std::uint16_t>(),
+                                   buffer->bytes() / sizeof(std::uint16_t),
+                                   seed, impl->stream);
     return hipPeekAtLastError() == hipSuccess;
   };
   if (!fill(&impl->hidden, 0x169001U) ||
@@ -694,8 +684,67 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
     SetError(error, HipError("warm MiniMax H3 DiT GEMMs", status));
     return nullptr;
   }
-  return std::unique_ptr<DitBlockSession>(
-      new DitBlockSession(std::move(impl)));
+  impl->activation_bytes -=
+      impl->gemm_reference.bytes() + impl->gemm_first_mismatch.bytes();
+  impl->gemm_reference.Reset();
+  impl->gemm_first_mismatch.Reset();
+  return std::unique_ptr<DitBlockSession>(new DitBlockSession(std::move(impl)));
+}
+
+bool DitBlockSession::PrepareConstants(
+    std::span<const std::uint16_t> modulation,
+    std::span<const std::uint16_t> rope_cos,
+    std::span<const std::uint16_t> rope_sin,
+    const CancellationToken* cancellation, std::string* error) {
+  if (impl_ == nullptr) {
+    SetError(error, "invalid MiniMax H3 DiT constant preparation");
+    return false;
+  }
+  const std::size_t modulation_elements =
+      impl_->modulation_rows * kDitModulationSlots * kDitHiddenSize;
+  const std::size_t rope_elements = impl_->rows * kDitRopeHalf;
+  if (modulation.size() != modulation_elements ||
+      rope_cos.size() != rope_elements || rope_sin.size() != rope_elements) {
+    SetError(error, "MiniMax H3 DiT constant tensor size differs from session");
+    return false;
+  }
+  if (IsCancelled(cancellation)) {
+    SetError(error, "MiniMax H3 DiT constant preparation cancelled");
+    return false;
+  }
+  const auto copy = [&](void* target, const void* source, std::size_t bytes,
+                        std::string_view label) {
+    const hipError_t status = hipMemcpyAsync(
+        target, source, bytes, hipMemcpyHostToDevice, impl_->stream);
+    if (status != hipSuccess) {
+      SetError(error, HipError(label, status));
+      return false;
+    }
+    return true;
+  };
+  if (!copy(impl_->modulation.data(), modulation.data(),
+            modulation.size_bytes(), "copy H3 DiT modulation constant") ||
+      !copy(impl_->rope_cos.data(), rope_cos.data(), rope_cos.size_bytes(),
+            "copy H3 DiT RoPE cosine constant") ||
+      !copy(impl_->rope_sin.data(), rope_sin.data(), rope_sin.size_bytes(),
+            "copy H3 DiT RoPE sine constant")) {
+    return false;
+  }
+  const hipError_t status = hipStreamSynchronize(impl_->stream);
+  if (status != hipSuccess) {
+    SetError(error, HipError("synchronize H3 DiT constants", status));
+    return false;
+  }
+  impl_->constants_prepared = true;
+  return true;
+}
+
+bool DitBlockSession::RunPrepared(const DitPreparedInput& input,
+                                  const CancellationToken* cancellation,
+                                  std::span<std::uint16_t> output,
+                                  DitBlockTelemetry* telemetry,
+                                  std::string* error) {
+  return RunInternal(input, cancellation, {}, {}, {}, output, telemetry, error);
 }
 
 bool DitBlockSession::Run(const DitBlockInput& input,
@@ -707,15 +756,49 @@ bool DitBlockSession::Run(const DitBlockInput& input,
     return false;
   }
   const std::size_t hidden_elements = impl_->rows * kDitHiddenSize;
-  const std::size_t modulation_elements =
-      impl_->modulation_rows * kDitModulationSlots * kDitHiddenSize;
-  const std::size_t rope_elements = impl_->rows * kDitRopeHalf;
   if (input.hidden.size() != hidden_elements ||
-      input.modulation.size() != modulation_elements ||
       input.row_map.size() != impl_->rows ||
-      input.rope_cos.size() != rope_elements ||
-      input.rope_sin.size() != rope_elements) {
-    SetError(error, "MiniMax H3 DiT input tensor size differs from session");
+      !PrepareConstants(input.modulation, input.rope_cos, input.rope_sin,
+                        cancellation, error)) {
+    if (error != nullptr && error->empty()) {
+      *error = "MiniMax H3 DiT input tensor size differs from session";
+    }
+    return false;
+  }
+  retained->rows = impl_->rows;
+  retained->width = kDitHiddenSize;
+  retained->modulation_attention.resize(hidden_elements);
+  retained->attention_output.resize(hidden_elements);
+  retained->modulation_mlp.resize(hidden_elements);
+  retained->block_output.resize(hidden_elements);
+  return RunInternal({input.hidden, input.row_map}, cancellation,
+                     retained->modulation_attention, retained->attention_output,
+                     retained->modulation_mlp, retained->block_output,
+                     telemetry, error);
+}
+
+bool DitBlockSession::RunInternal(const DitPreparedInput& input,
+                                  const CancellationToken* cancellation,
+                                  std::span<std::uint16_t> modulation_attention,
+                                  std::span<std::uint16_t> attention_output,
+                                  std::span<std::uint16_t> modulation_mlp,
+                                  std::span<std::uint16_t> block_output,
+                                  DitBlockTelemetry* telemetry,
+                                  std::string* error) {
+  if (impl_ == nullptr || telemetry == nullptr || !impl_->constants_prepared) {
+    SetError(error, "MiniMax H3 DiT constants are not prepared");
+    return false;
+  }
+  const std::size_t hidden_elements = impl_->rows * kDitHiddenSize;
+  const auto valid_optional = [&](std::span<std::uint16_t> values) {
+    return values.empty() || values.size() == hidden_elements;
+  };
+  if (input.hidden.size() != hidden_elements ||
+      input.row_map.size() != impl_->rows ||
+      !valid_optional(modulation_attention) ||
+      !valid_optional(attention_output) || !valid_optional(modulation_mlp) ||
+      block_output.size() != hidden_elements) {
+    SetError(error, "MiniMax H3 DiT prepared input size differs from session");
     return false;
   }
   for (const std::uint32_t row : input.row_map) {
@@ -729,12 +812,6 @@ bool DitBlockSession::Run(const DitBlockInput& input,
     return false;
   }
 
-  retained->rows = impl_->rows;
-  retained->width = kDitHiddenSize;
-  retained->modulation_attention.resize(hidden_elements);
-  retained->attention_output.resize(hidden_elements);
-  retained->modulation_mlp.resize(hidden_elements);
-  retained->block_output.resize(hidden_elements);
   *telemetry = {};
   telemetry->weight_bytes = impl_->weight_bytes;
   telemetry->activation_bytes = impl_->activation_bytes;
@@ -753,20 +830,12 @@ bool DitBlockSession::Run(const DitBlockInput& input,
     }
     return true;
   };
-  if (!copy(impl_->hidden.data(), input.hidden.data(), input.hidden.size_bytes(),
-            hipMemcpyHostToDevice, "copy H3 DiT hidden") ||
-      !copy(impl_->modulation.data(), input.modulation.data(),
-            input.modulation.size_bytes(), hipMemcpyHostToDevice,
-            "copy H3 DiT modulation") ||
+  if (!copy(impl_->hidden.data(), input.hidden.data(),
+            input.hidden.size_bytes(), hipMemcpyHostToDevice,
+            "copy H3 DiT hidden") ||
       !copy(impl_->row_map.data(), input.row_map.data(),
             input.row_map.size_bytes(), hipMemcpyHostToDevice,
-            "copy H3 DiT row map") ||
-      !copy(impl_->rope_cos.data(), input.rope_cos.data(),
-            input.rope_cos.size_bytes(), hipMemcpyHostToDevice,
-            "copy H3 DiT rope cosine") ||
-      !copy(impl_->rope_sin.data(), input.rope_sin.data(),
-            input.rope_sin.size_bytes(), hipMemcpyHostToDevice,
-            "copy H3 DiT rope sine")) {
+            "copy H3 DiT row map")) {
     return false;
   }
 
@@ -776,9 +845,9 @@ bool DitBlockSession::Run(const DitBlockInput& input,
     return false;
   }
   dit_ops::LaunchAdaLn(
-      impl_->hidden.As<std::uint16_t>(), impl_->norm1.storage.As<std::uint16_t>(),
-      impl_->modulation.As<std::uint16_t>(),
-      impl_->row_map.As<std::uint32_t>(),
+      impl_->hidden.As<std::uint16_t>(),
+      impl_->norm1.storage.As<std::uint16_t>(),
+      impl_->modulation.As<std::uint16_t>(), impl_->row_map.As<std::uint32_t>(),
       impl_->modulation_attention.As<std::uint16_t>(), rows, kDitHiddenSize,
       kDitModulationSlots, 0, 1, kDitNormEpsilon, impl_->stream);
   if (!CheckLaunch("H3 DiT attention AdaLN", error) ||
@@ -805,7 +874,8 @@ bool DitBlockSession::Run(const DitBlockInput& input,
       impl_->value.As<std::uint16_t>(),
       impl_->attention_heads.As<std::uint16_t>(), rows, kDitAttentionHeads,
       kDitHeadDimension,
-      1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)), impl_->stream);
+      1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)), impl_->stream,
+      impl_->row_parallel_attention);
   if (!CheckLaunch("H3 DiT full SDPA", error) ||
       !impl_->gemm.Run(impl_->output_weight.storage.As<std::uint16_t>(),
                        impl_->attention_heads.As<std::uint16_t>(),
@@ -814,21 +884,19 @@ bool DitBlockSession::Run(const DitBlockInput& input,
                        error)) {
     return false;
   }
-  dit_ops::LaunchGate(
-      impl_->hidden.As<std::uint16_t>(),
-      impl_->attention_output.As<std::uint16_t>(),
-      impl_->modulation.As<std::uint16_t>(),
-      impl_->row_map.As<std::uint32_t>(),
-      impl_->gated_attention.As<std::uint16_t>(), rows, kDitHiddenSize,
-      kDitModulationSlots, 2, impl_->stream);
+  dit_ops::LaunchGate(impl_->hidden.As<std::uint16_t>(),
+                      impl_->attention_output.As<std::uint16_t>(),
+                      impl_->modulation.As<std::uint16_t>(),
+                      impl_->row_map.As<std::uint32_t>(),
+                      impl_->gated_attention.As<std::uint16_t>(), rows,
+                      kDitHiddenSize, kDitModulationSlots, 2, impl_->stream);
   if (!CheckLaunch("H3 DiT attention gated residual", error)) {
     return false;
   }
   dit_ops::LaunchAdaLn(
       impl_->gated_attention.As<std::uint16_t>(),
       impl_->norm2.storage.As<std::uint16_t>(),
-      impl_->modulation.As<std::uint16_t>(),
-      impl_->row_map.As<std::uint32_t>(),
+      impl_->modulation.As<std::uint16_t>(), impl_->row_map.As<std::uint32_t>(),
       impl_->modulation_mlp.As<std::uint16_t>(), rows, kDitHiddenSize,
       kDitModulationSlots, 3, 4, kDitNormEpsilon, impl_->stream);
   if (!CheckLaunch("H3 DiT MLP AdaLN", error) ||
@@ -850,13 +918,12 @@ bool DitBlockSession::Run(const DitBlockInput& input,
                        error)) {
     return false;
   }
-  dit_ops::LaunchGate(
-      impl_->gated_attention.As<std::uint16_t>(),
-      impl_->mlp_output.As<std::uint16_t>(),
-      impl_->modulation.As<std::uint16_t>(),
-      impl_->row_map.As<std::uint32_t>(),
-      impl_->block_output.As<std::uint16_t>(), rows, kDitHiddenSize,
-      kDitModulationSlots, 5, impl_->stream);
+  dit_ops::LaunchGate(impl_->gated_attention.As<std::uint16_t>(),
+                      impl_->mlp_output.As<std::uint16_t>(),
+                      impl_->modulation.As<std::uint16_t>(),
+                      impl_->row_map.As<std::uint32_t>(),
+                      impl_->block_output.As<std::uint16_t>(), rows,
+                      kDitHiddenSize, kDitModulationSlots, 5, impl_->stream);
   if (!CheckLaunch("H3 DiT MLP gated residual", error) ||
       hipEventRecord(impl_->stop_event, impl_->stream) != hipSuccess) {
     if (error != nullptr && error->empty()) {
@@ -865,19 +932,22 @@ bool DitBlockSession::Run(const DitBlockInput& input,
     return false;
   }
 
-  if (!copy(retained->modulation_attention.data(),
-            impl_->modulation_attention.data(),
-            retained->modulation_attention.size() * sizeof(std::uint16_t),
-            hipMemcpyDeviceToHost, "read H3 DiT attention modulation") ||
-      !copy(retained->attention_output.data(), impl_->attention_output.data(),
-            retained->attention_output.size() * sizeof(std::uint16_t),
-            hipMemcpyDeviceToHost, "read H3 DiT attention output") ||
-      !copy(retained->modulation_mlp.data(), impl_->modulation_mlp.data(),
-            retained->modulation_mlp.size() * sizeof(std::uint16_t),
-            hipMemcpyDeviceToHost, "read H3 DiT MLP modulation") ||
-      !copy(retained->block_output.data(), impl_->block_output.data(),
-            retained->block_output.size() * sizeof(std::uint16_t),
-            hipMemcpyDeviceToHost, "read H3 DiT block output")) {
+  const auto read_optional = [&](std::span<std::uint16_t> target,
+                                 const DeviceBuffer& source,
+                                 std::string_view label) {
+    return target.empty() ||
+           copy(target.data(), source.data(), target.size_bytes(),
+                hipMemcpyDeviceToHost, label);
+  };
+  if (!read_optional(modulation_attention, impl_->modulation_attention,
+                     "read H3 DiT attention modulation") ||
+      !read_optional(attention_output, impl_->attention_output,
+                     "read H3 DiT attention output") ||
+      !read_optional(modulation_mlp, impl_->modulation_mlp,
+                     "read H3 DiT MLP modulation") ||
+      !copy(block_output.data(), impl_->block_output.data(),
+            block_output.size_bytes(), hipMemcpyDeviceToHost,
+            "read H3 DiT block output")) {
     return false;
   }
   const hipError_t synchronize = hipStreamSynchronize(impl_->stream);
@@ -894,17 +964,18 @@ bool DitBlockSession::Run(const DitBlockInput& input,
   telemetry->gpu_ms = elapsed;
   telemetry->dispatches = 11;
 
-  const std::array<std::pair<std::string_view,
-                             const std::vector<std::uint16_t>*>,
-                   4>
+  const std::array<std::pair<std::string_view, std::span<std::uint16_t>>, 4>
       retained_tensors = {{
-          {"modulation_attention", &retained->modulation_attention},
-          {"attention_output", &retained->attention_output},
-          {"modulation_mlp", &retained->modulation_mlp},
-          {"block_output", &retained->block_output},
+          {"modulation_attention", modulation_attention},
+          {"attention_output", attention_output},
+          {"modulation_mlp", modulation_mlp},
+          {"block_output", block_output},
       }};
   for (const auto& [name, values] : retained_tensors) {
-    telemetry->first_non_finite = FindFirstNonFinite(name, *values);
+    if (values.empty()) {
+      continue;
+    }
+    telemetry->first_non_finite = FindFirstNonFinite(name, values);
     if (!telemetry->first_non_finite.empty()) {
       SetError(error, "MiniMax H3 DiT produced non-finite value at " +
                           telemetry->first_non_finite);
@@ -927,9 +998,20 @@ std::size_t DitBlockSession::block_index() const noexcept {
 }
 
 std::uintptr_t DitBlockSession::scratch_address() const noexcept {
-  return impl_ == nullptr
-             ? 0
-             : reinterpret_cast<std::uintptr_t>(impl_->qkv.data());
+  return impl_ == nullptr ? 0
+                          : reinterpret_cast<std::uintptr_t>(impl_->qkv.data());
+}
+
+std::uint64_t DitBlockSession::weight_bytes() const noexcept {
+  return impl_ == nullptr ? 0 : impl_->weight_bytes;
+}
+
+std::uint64_t DitBlockSession::activation_bytes() const noexcept {
+  return impl_ == nullptr ? 0 : impl_->activation_bytes;
+}
+
+double DitBlockSession::load_ms() const noexcept {
+  return impl_ == nullptr ? 0.0 : impl_->load_ms;
 }
 
 }  // namespace strix::minimax_h3

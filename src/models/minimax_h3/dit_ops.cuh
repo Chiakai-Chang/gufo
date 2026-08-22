@@ -71,8 +71,7 @@ static __global__ void FirstMismatchKernel(const std::uint16_t* left,
 
 inline void LaunchFirstMismatch(const std::uint16_t* left,
                                 const std::uint16_t* right,
-                                std::size_t elements,
-                                unsigned long long* first,
+                                std::size_t elements, unsigned long long* first,
                                 hipStream_t stream) {
   constexpr std::size_t kThreads = 256;
   hipLaunchKernelGGL(FirstMismatchKernel,
@@ -99,9 +98,8 @@ static __global__ void FillBf16PatternKernel(std::uint16_t* output,
   output[index] = FloatToBf16(scaled);
 }
 
-inline void LaunchFillBf16Pattern(std::uint16_t* output,
-                                  std::size_t elements, std::uint32_t seed,
-                                  hipStream_t stream) {
+inline void LaunchFillBf16Pattern(std::uint16_t* output, std::size_t elements,
+                                  std::uint32_t seed, hipStream_t stream) {
   constexpr std::size_t kThreads = 256;
   hipLaunchKernelGGL(FillBf16PatternKernel,
                      dim3((elements + kThreads - 1U) / kThreads),
@@ -122,19 +120,17 @@ static __global__ void AddSubtractKernel(const std::uint16_t* left,
 }
 
 inline void LaunchAddSubtract(const std::uint16_t* left,
-                              const std::uint16_t* right,
-                              std::uint16_t* output, std::size_t elements,
-                              bool subtract, hipStream_t stream) {
+                              const std::uint16_t* right, std::uint16_t* output,
+                              std::size_t elements, bool subtract,
+                              hipStream_t stream) {
   constexpr std::size_t kThreads = 256;
-  hipLaunchKernelGGL(AddSubtractKernel,
-                     dim3((elements + kThreads - 1U) / kThreads),
-                     dim3(kThreads), 0, stream, left, right, output, elements,
-                     subtract);
+  hipLaunchKernelGGL(
+      AddSubtractKernel, dim3((elements + kThreads - 1U) / kThreads),
+      dim3(kThreads), 0, stream, left, right, output, elements, subtract);
 }
 
 static __global__ void SiluKernel(const std::uint16_t* input,
-                                  std::uint16_t* output,
-                                  std::size_t elements) {
+                                  std::uint16_t* output, std::size_t elements) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index < elements) {
@@ -146,9 +142,77 @@ static __global__ void SiluKernel(const std::uint16_t* input,
 inline void LaunchSilu(const std::uint16_t* input, std::uint16_t* output,
                        std::size_t elements, hipStream_t stream) {
   constexpr std::size_t kThreads = 256;
-  hipLaunchKernelGGL(SiluKernel,
-                     dim3((elements + kThreads - 1U) / kThreads),
+  hipLaunchKernelGGL(SiluKernel, dim3((elements + kThreads - 1U) / kThreads),
                      dim3(kThreads), 0, stream, input, output, elements);
+}
+
+static __global__ void SiluF32Kernel(const float* input, float* output,
+                                     std::size_t elements) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    const float value = input[index];
+    output[index] = value / (1.0F + expf(-value));
+  }
+}
+
+inline void LaunchSiluF32(const float* input, float* output,
+                          std::size_t elements, hipStream_t stream) {
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(SiluF32Kernel, dim3((elements + kThreads - 1U) / kThreads),
+                     dim3(kThreads), 0, stream, input, output, elements);
+}
+
+static __global__ void AddBiasBf16Kernel(std::uint16_t* values,
+                                         const std::uint16_t* bias,
+                                         std::uint32_t rows,
+                                         std::uint32_t width) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row < rows && column < width) {
+    const std::size_t index = static_cast<std::size_t>(row) * width + column;
+    values[index] =
+        FloatToBf16(Bf16ToFloat(values[index]) + Bf16ToFloat(bias[column]));
+  }
+}
+
+inline void LaunchAddBiasBf16(std::uint16_t* values, const std::uint16_t* bias,
+                              std::uint32_t rows, std::uint32_t width,
+                              hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  hipLaunchKernelGGL(AddBiasBf16Kernel,
+                     dim3((width + kThreads - 1U) / kThreads, rows),
+                     dim3(kThreads), 0, stream, values, bias, rows, width);
+}
+
+static __global__ void F32ProjectionKernel(
+    const float* input, const float* weight, const float* bias, float* output,
+    std::uint32_t rows, std::uint32_t input_width, std::uint32_t output_width) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= output_width) {
+    return;
+  }
+  float sum = bias == nullptr ? 0.0F : bias[column];
+  const std::size_t input_base = static_cast<std::size_t>(row) * input_width;
+  const std::size_t weight_base =
+      static_cast<std::size_t>(column) * input_width;
+  for (std::uint32_t index = 0; index < input_width; ++index) {
+    sum = fmaf(input[input_base + index], weight[weight_base + index], sum);
+  }
+  output[static_cast<std::size_t>(row) * output_width + column] = sum;
+}
+
+inline void LaunchF32Projection(const float* input, const float* weight,
+                                const float* bias, float* output,
+                                std::uint32_t rows, std::uint32_t input_width,
+                                std::uint32_t output_width,
+                                hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  hipLaunchKernelGGL(F32ProjectionKernel,
+                     dim3((output_width + kThreads - 1U) / kThreads, rows),
+                     dim3(kThreads), 0, stream, input, weight, bias, output,
+                     rows, input_width, output_width);
 }
 
 static __global__ void PatchProjectionKernel(
@@ -173,8 +237,7 @@ static __global__ void PatchProjectionKernel(
 
 inline void LaunchPatchProjection(const float* input, const float* weight,
                                   const float* bias, std::uint16_t* output,
-                                  std::uint32_t rows,
-                                  std::uint32_t input_width,
+                                  std::uint32_t rows, std::uint32_t input_width,
                                   std::uint32_t output_width,
                                   hipStream_t stream) {
   constexpr std::uint32_t kThreads = 256;
@@ -184,10 +247,12 @@ inline void LaunchPatchProjection(const float* input, const float* weight,
                      rows, input_width, output_width);
 }
 
-static __global__ void FinalProjectionKernel(
-    const std::uint16_t* input, const float* weight, const float* bias,
-    float* output, std::uint32_t rows, std::uint32_t input_width,
-    std::uint32_t output_width) {
+static __global__ void FinalProjectionKernel(const std::uint16_t* input,
+                                             const float* weight,
+                                             const float* bias, float* output,
+                                             std::uint32_t rows,
+                                             std::uint32_t input_width,
+                                             std::uint32_t output_width) {
   const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t row = blockIdx.y;
   if (row >= rows || column >= output_width) {
@@ -218,8 +283,7 @@ inline void LaunchFinalProjection(const std::uint16_t* input,
 }
 
 static __global__ void SwiGluKernel(const std::uint16_t* fused,
-                                    std::uint16_t* output,
-                                    std::uint32_t rows,
+                                    std::uint16_t* output, std::uint32_t rows,
                                     std::uint32_t width) {
   const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t row = blockIdx.y;
@@ -244,8 +308,7 @@ inline void LaunchSwiGlu(const std::uint16_t* fused, std::uint16_t* output,
 
 static __global__ void RmsNormKernel(const std::uint16_t* input,
                                      const std::uint16_t* weight,
-                                     std::uint16_t* output,
-                                     std::uint32_t rows,
+                                     std::uint16_t* output, std::uint32_t rows,
                                      std::uint32_t width, float epsilon) {
   const std::uint32_t row = blockIdx.x;
   const std::uint32_t lane = threadIdx.x;
@@ -270,9 +333,8 @@ static __global__ void RmsNormKernel(const std::uint16_t* input,
   const float inverse =
       rsqrtf(reductions[0] / static_cast<float>(width) + epsilon);
   for (std::uint32_t column = lane; column < width; column += blockDim.x) {
-    output[base + column] =
-        FloatToBf16(Bf16ToFloat(input[base + column]) * inverse *
-                    Bf16ToFloat(weight[column]));
+    output[base + column] = FloatToBf16(Bf16ToFloat(input[base + column]) *
+                                        inverse * Bf16ToFloat(weight[column]));
   }
 }
 
@@ -288,8 +350,8 @@ static __global__ void LayerNormKernel(const std::uint16_t* input,
                                        const std::uint16_t* weight,
                                        const std::uint16_t* bias,
                                        std::uint16_t* output,
-                                       std::uint32_t rows,
-                                       std::uint32_t width, float epsilon) {
+                                       std::uint32_t rows, std::uint32_t width,
+                                       float epsilon) {
   const std::uint32_t row = blockIdx.x;
   const std::uint32_t lane = threadIdx.x;
   if (row >= rows) {
@@ -337,12 +399,14 @@ inline void LaunchLayerNorm(const std::uint16_t* input,
                      weight, bias, output, rows, width, epsilon);
 }
 
-static __global__ void AdaLnKernel(
-    const std::uint16_t* input, const std::uint16_t* weight,
-    const std::uint16_t* modulation, const std::uint32_t* row_map,
-    std::uint16_t* output, std::uint32_t rows, std::uint32_t width,
-    std::uint32_t slots, std::uint32_t scale_slot,
-    std::uint32_t shift_slot, float epsilon) {
+static __global__ void AdaLnKernel(const std::uint16_t* input,
+                                   const std::uint16_t* weight,
+                                   const std::uint16_t* modulation,
+                                   const std::uint32_t* row_map,
+                                   std::uint16_t* output, std::uint32_t rows,
+                                   std::uint32_t width, std::uint32_t slots,
+                                   std::uint32_t scale_slot,
+                                   std::uint32_t shift_slot, float epsilon) {
   const std::uint32_t row = blockIdx.x;
   const std::uint32_t lane = threadIdx.x;
   if (row >= rows) {
@@ -368,9 +432,8 @@ static __global__ void AdaLnKernel(
   const std::size_t modulation_base =
       static_cast<std::size_t>(row_map[row]) * slots * width;
   for (std::uint32_t column = lane; column < width; column += blockDim.x) {
-    const float normalized =
-        Bf16ToFloat(input[row_base + column]) * inverse *
-        Bf16ToFloat(weight[column]);
+    const float normalized = Bf16ToFloat(input[row_base + column]) * inverse *
+                             Bf16ToFloat(weight[column]);
     const float scale = Bf16ToFloat(
         modulation[modulation_base +
                    static_cast<std::size_t>(scale_slot) * width + column]);
@@ -382,8 +445,7 @@ static __global__ void AdaLnKernel(
   }
 }
 
-inline void LaunchAdaLn(const std::uint16_t* input,
-                        const std::uint16_t* weight,
+inline void LaunchAdaLn(const std::uint16_t* input, const std::uint16_t* weight,
                         const std::uint16_t* modulation,
                         const std::uint32_t* row_map, std::uint16_t* output,
                         std::uint32_t rows, std::uint32_t width,
@@ -395,11 +457,13 @@ inline void LaunchAdaLn(const std::uint16_t* input,
                      scale_slot, shift_slot, epsilon);
 }
 
-static __global__ void GateKernel(
-    const std::uint16_t* residual, const std::uint16_t* branch,
-    const std::uint16_t* modulation, const std::uint32_t* row_map,
-    std::uint16_t* output, std::uint32_t rows, std::uint32_t width,
-    std::uint32_t slots, std::uint32_t gate_slot) {
+static __global__ void GateKernel(const std::uint16_t* residual,
+                                  const std::uint16_t* branch,
+                                  const std::uint16_t* modulation,
+                                  const std::uint32_t* row_map,
+                                  std::uint16_t* output, std::uint32_t rows,
+                                  std::uint32_t width, std::uint32_t slots,
+                                  std::uint32_t gate_slot) {
   const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t row = blockIdx.y;
   if (row >= rows || column >= width) {
@@ -409,10 +473,9 @@ static __global__ void GateKernel(
   const std::size_t modulation_index =
       static_cast<std::size_t>(row_map[row]) * slots * width +
       static_cast<std::size_t>(gate_slot) * width + column;
-  output[index] =
-      FloatToBf16(Bf16ToFloat(residual[index]) +
-                  Bf16ToFloat(branch[index]) *
-                      Bf16ToFloat(modulation[modulation_index]));
+  output[index] = FloatToBf16(Bf16ToFloat(residual[index]) +
+                              Bf16ToFloat(branch[index]) *
+                                  Bf16ToFloat(modulation[modulation_index]));
 }
 
 inline void LaunchGate(const std::uint16_t* residual,
@@ -423,8 +486,7 @@ inline void LaunchGate(const std::uint16_t* residual,
                        std::uint32_t slots, std::uint32_t gate_slot,
                        hipStream_t stream) {
   constexpr std::uint32_t kThreads = 256;
-  hipLaunchKernelGGL(GateKernel,
-                     dim3((width + kThreads - 1U) / kThreads, rows),
+  hipLaunchKernelGGL(GateKernel, dim3((width + kThreads - 1U) / kThreads, rows),
                      dim3(kThreads), 0, stream, residual, branch, modulation,
                      row_map, output, rows, width, slots, gate_slot);
 }
@@ -432,10 +494,9 @@ inline void LaunchGate(const std::uint16_t* residual,
 static __global__ void GroupedQkvNormRopeKernel(
     const std::uint16_t* qkv, const std::uint16_t* query_weight,
     const std::uint16_t* key_weight, const std::uint16_t* rope_cos,
-    const std::uint16_t* rope_sin, std::uint16_t* query,
-    std::uint16_t* key, std::uint16_t* value, std::uint32_t sequence,
-    std::uint32_t heads, std::uint32_t head_dimension,
-    std::uint32_t rope_half, float epsilon) {
+    const std::uint16_t* rope_sin, std::uint16_t* query, std::uint16_t* key,
+    std::uint16_t* value, std::uint32_t sequence, std::uint32_t heads,
+    std::uint32_t head_dimension, std::uint32_t rope_half, float epsilon) {
   const std::uint32_t row = blockIdx.x;
   const std::uint32_t head = blockIdx.y;
   const std::uint32_t dimension = threadIdx.x;
@@ -470,24 +531,20 @@ static __global__ void GroupedQkvNormRopeKernel(
                     Bf16ToFloat(key_weight[dimension]);
   if (dimension < rope_half) {
     const std::uint32_t pair = dimension + rope_half;
-    const float paired_query =
-        Bf16ToFloat(qkv[query_base + pair]) * inverses[0] *
-        Bf16ToFloat(query_weight[pair]);
+    const float paired_query = Bf16ToFloat(qkv[query_base + pair]) *
+                               inverses[0] * Bf16ToFloat(query_weight[pair]);
     const float paired_key = Bf16ToFloat(qkv[key_base + pair]) * inverses[1] *
                              Bf16ToFloat(key_weight[pair]);
-    const float cosine =
-        Bf16ToFloat(rope_cos[static_cast<std::size_t>(row) * rope_half +
-                             dimension]);
-    const float sine =
-        Bf16ToFloat(rope_sin[static_cast<std::size_t>(row) * rope_half +
-                             dimension]);
+    const float cosine = Bf16ToFloat(
+        rope_cos[static_cast<std::size_t>(row) * rope_half + dimension]);
+    const float sine = Bf16ToFloat(
+        rope_sin[static_cast<std::size_t>(row) * rope_half + dimension]);
     query_value = query_value * cosine - paired_query * sine;
     key_value = key_value * cosine - paired_key * sine;
   } else if (dimension < rope_half * 2U) {
     const std::uint32_t pair = dimension - rope_half;
-    const float paired_query =
-        Bf16ToFloat(qkv[query_base + pair]) * inverses[0] *
-        Bf16ToFloat(query_weight[pair]);
+    const float paired_query = Bf16ToFloat(qkv[query_base + pair]) *
+                               inverses[0] * Bf16ToFloat(query_weight[pair]);
     const float paired_key = Bf16ToFloat(qkv[key_base + pair]) * inverses[1] *
                              Bf16ToFloat(key_weight[pair]);
     const float cosine =
@@ -508,21 +565,20 @@ static __global__ void GroupedQkvNormRopeKernel(
 inline void LaunchGroupedQkvNormRope(
     const std::uint16_t* qkv, const std::uint16_t* query_weight,
     const std::uint16_t* key_weight, const std::uint16_t* rope_cos,
-    const std::uint16_t* rope_sin, std::uint16_t* query,
-    std::uint16_t* key, std::uint16_t* value, std::uint32_t sequence,
-    std::uint32_t heads, std::uint32_t head_dimension,
-    std::uint32_t rope_half, float epsilon, hipStream_t stream) {
+    const std::uint16_t* rope_sin, std::uint16_t* query, std::uint16_t* key,
+    std::uint16_t* value, std::uint32_t sequence, std::uint32_t heads,
+    std::uint32_t head_dimension, std::uint32_t rope_half, float epsilon,
+    hipStream_t stream) {
   hipLaunchKernelGGL(GroupedQkvNormRopeKernel, dim3(sequence, heads),
                      dim3(head_dimension), 0, stream, qkv, query_weight,
                      key_weight, rope_cos, rope_sin, query, key, value,
                      sequence, heads, head_dimension, rope_half, epsilon);
 }
 
-static __global__ void FullAttentionKernel(
+static __global__ void FullAttentionScalarKernel(
     const std::uint16_t* query, const std::uint16_t* key,
-    const std::uint16_t* value, std::uint16_t* output,
-    std::uint32_t sequence, std::uint32_t heads,
-    std::uint32_t head_dimension, float scale) {
+    const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
+    std::uint32_t heads, std::uint32_t head_dimension, float scale) {
   const std::uint32_t query_row = blockIdx.x;
   const std::uint32_t head = blockIdx.y;
   const std::uint32_t lane = threadIdx.x;
@@ -570,17 +626,108 @@ static __global__ void FullAttentionKernel(
   }
 }
 
-inline void LaunchFullAttention(
+static __global__ void FullAttentionRowParallelKernel(
     const std::uint16_t* query, const std::uint16_t* key,
-    const std::uint16_t* value, std::uint16_t* output,
-    std::uint32_t sequence, std::uint32_t heads,
-    std::uint32_t head_dimension, float scale, hipStream_t stream) {
+    const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
+    std::uint32_t heads, std::uint32_t head_dimension, float scale) {
+  const std::uint32_t query_row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x;
+  if (query_row >= sequence || head >= heads) {
+    return;
+  }
+  extern __shared__ float scores[];
+  const std::size_t query_base =
+      (static_cast<std::size_t>(query_row) * heads + head) * head_dimension;
+  // Key rows are independent. Parallelizing only this outer loop preserves
+  // the released per-dot FMA order; lane 0 still performs the softmax
+  // max/sum/normalization in the original key-row order, and each output
+  // dimension retains its original V accumulation order.
+  for (std::uint32_t key_row = lane; key_row < sequence;
+       key_row += blockDim.x) {
+    const std::size_t key_base =
+        (static_cast<std::size_t>(key_row) * heads + head) * head_dimension;
+    float dot = 0.0F;
+    for (std::uint32_t dimension = 0; dimension < head_dimension;
+         ++dimension) {
+      dot = fmaf(Bf16ToFloat(query[query_base + dimension]),
+                 Bf16ToFloat(key[key_base + dimension]), dot);
+    }
+    scores[key_row] = dot * scale;
+  }
+  __syncthreads();
+  float score_zero = 0.0F;
+  if (lane == 0) {
+    score_zero = scores[0];
+    float maximum = -INFINITY;
+    for (std::uint32_t key_row = 0; key_row < sequence; ++key_row) {
+      maximum = fmaxf(maximum, scores[key_row]);
+    }
+    scores[0] = maximum;
+  }
+  __syncthreads();
+  const float maximum = scores[0];
+  __syncthreads();
+  for (std::uint32_t key_row = lane; key_row < sequence;
+       key_row += blockDim.x) {
+    const float score = key_row == 0 ? score_zero : scores[key_row];
+    scores[key_row] = expf(score - maximum);
+  }
+  __syncthreads();
+  float exponential_zero = 0.0F;
+  if (lane == 0) {
+    exponential_zero = scores[0];
+    float sum = 0.0F;
+    for (std::uint32_t key_row = 0; key_row < sequence; ++key_row) {
+      sum += scores[key_row];
+    }
+    scores[0] = 1.0F / sum;
+  }
+  __syncthreads();
+  const float inverse_sum = scores[0];
+  __syncthreads();
+  for (std::uint32_t key_row = lane; key_row < sequence;
+       key_row += blockDim.x) {
+    const float exponential =
+        key_row == 0 ? exponential_zero : scores[key_row];
+    scores[key_row] = exponential * inverse_sum;
+  }
+  __syncthreads();
+  for (std::uint32_t dimension = lane; dimension < head_dimension;
+       dimension += blockDim.x) {
+    float sum = 0.0F;
+    for (std::uint32_t key_row = 0; key_row < sequence; ++key_row) {
+      const std::size_t value_index =
+          (static_cast<std::size_t>(key_row) * heads + head) * head_dimension +
+          dimension;
+      sum = fmaf(scores[key_row], Bf16ToFloat(value[value_index]), sum);
+    }
+    output[query_base + dimension] = FloatToBf16(sum);
+  }
+}
+
+inline void LaunchFullAttention(const std::uint16_t* query,
+                                const std::uint16_t* key,
+                                const std::uint16_t* value,
+                                std::uint16_t* output, std::uint32_t sequence,
+                                std::uint32_t heads,
+                                std::uint32_t head_dimension, float scale,
+                                hipStream_t stream,
+                                bool row_parallel = true) {
   constexpr std::uint32_t kThreads = 128;
-  hipLaunchKernelGGL(FullAttentionKernel, dim3(sequence, heads),
-                     dim3(kThreads), static_cast<std::size_t>(sequence) *
-                                         sizeof(float),
-                     stream, query, key, value, output, sequence, heads,
-                     head_dimension, scale);
+  const dim3 grid(sequence, heads);
+  const dim3 block(kThreads);
+  const std::size_t shared_bytes =
+      static_cast<std::size_t>(sequence) * sizeof(float);
+  if (row_parallel) {
+    hipLaunchKernelGGL(FullAttentionRowParallelKernel, grid, block,
+                       shared_bytes, stream, query, key, value, output,
+                       sequence, heads, head_dimension, scale);
+  } else {
+    hipLaunchKernelGGL(FullAttentionScalarKernel, grid, block, shared_bytes,
+                       stream, query, key, value, output, sequence, heads,
+                       head_dimension, scale);
+  }
 }
 
 }  // namespace strix::minimax_h3::dit_ops

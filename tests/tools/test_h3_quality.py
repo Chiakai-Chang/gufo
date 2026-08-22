@@ -146,6 +146,15 @@ class TestH3Quality(unittest.TestCase):
             hashlib.sha256(SOURCE_MANIFEST_PATH.read_bytes()).hexdigest(),
         )
 
+    def test_end_to_end_contract_rejects_sampler_only_five_frames(self):
+        contract = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+        contract["retained_cases"][0]["frames"] = 5
+        contract["retained_cases"][0]["selected_frames"] = [0, 2, 4]
+        with self.assertRaisesRegex(
+            h3_quality.H3QualityError, "at least 22 frames"
+        ):
+            h3_quality.validate_contract(contract)
+
     def test_seal_verify_and_repeat_content_address(self):
         template = self._component_template()
         template_path = self.root / "template.json"
@@ -260,6 +269,7 @@ class TestH3Quality(unittest.TestCase):
         exact = h3_quality.frame_metrics(reference, reference)
         self.assertIsNone(exact["psnr_db_mean"])
         self.assertAlmostEqual(exact["ssim_global_mean"], 1.0)
+        self.assertAlmostEqual(exact["ssim_windowed_mean"], 1.0)
         self.assertEqual(exact["temporal_delta"]["relative_l2"], 0.0)
 
         candidate = reference.copy()
@@ -267,6 +277,7 @@ class TestH3Quality(unittest.TestCase):
         corrupted = h3_quality.frame_metrics(reference, candidate)
         self.assertGreater(corrupted["numeric"]["relative_l2"], 0.0)
         self.assertLess(corrupted["ssim_global_mean"], 1.0)
+        self.assertLess(corrupted["ssim_windowed_mean"], 1.0)
         self.assertGreater(
             corrupted["temporal_delta"]["relative_l2"], 0.0
         )
@@ -284,6 +295,7 @@ class TestH3Quality(unittest.TestCase):
         )
         self.assertEqual(exact["waveform"]["relative_l2"], 0.0)
         self.assertEqual(exact["spectrogram"]["relative_l2"], 0.0)
+        self.assertEqual(exact["spectrogram"]["shape"], [2, 513, 17])
         self.assertEqual(len(exact["channels"]), 2)
 
         swapped = reference[::-1].copy()
@@ -292,6 +304,16 @@ class TestH3Quality(unittest.TestCase):
         )
         self.assertGreater(corrupted["waveform"]["relative_l2"], 0.5)
         self.assertGreater(corrupted["channels"][0]["relative_l2"], 0.5)
+
+    def test_spectrogram_matches_centered_oracle_and_covers_tail(self):
+        reference = np.zeros((2, 29600), dtype=np.float32)
+        candidate = reference.copy()
+        candidate[1, -1] = 1.0
+        metrics = h3_quality.audio_metrics(
+            reference, candidate, sample_rate=32000
+        )
+        self.assertEqual(metrics["spectrogram"]["shape"], [2, 513, 116])
+        self.assertGreater(metrics["spectrogram"]["max_abs"], 0.0)
 
 
 if __name__ == "__main__":

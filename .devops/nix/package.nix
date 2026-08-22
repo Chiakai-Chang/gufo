@@ -5,6 +5,7 @@
   ninja,
   pkg-config,
   icu,
+  ffmpeg-headless,
   libuuid,
   rocmPackages,
   aie-qwen-mtp-eh-proj,
@@ -56,7 +57,10 @@ stdenv.mkDerivation (finalAttrs: {
   ]
   ++ lib.optional rocmSupport rocmPackages.clr;
 
-  buildInputs = [ icu ]
+  buildInputs = [
+    icu
+    ffmpeg-headless
+  ]
   ++ lib.optionals rocmSupport [
     rocmPackages.clr
     rocmPackages.hipblas
@@ -81,6 +85,8 @@ stdenv.mkDerivation (finalAttrs: {
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
     "-DBUILD_TESTING=OFF"
     "-DSTRIX_VERSION=${version}"
+    "-DSTRIX_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
+    "-DSTRIX_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
   ]
   ++ lib.optional rocmSupport "-DENGINE_ENABLE_HIP=ON"
   ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"

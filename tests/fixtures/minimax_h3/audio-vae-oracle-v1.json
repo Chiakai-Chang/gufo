@@ -1,0 +1,39 @@
+{
+  "schema": "strix.minimax-h3-audio-vae-golden.v1",
+  "model_revision": "42ed227ee7df40d41602854ae760620d6eb651fe",
+  "reference_revision": "8974cc055ea9c02fcd14cc27dfda3e1027c05153",
+  "source_checkpoint": "FL2VA/audio_vae/model.safetensors",
+  "source_checkpoint_sha256": "37dddc2f3e6d5d5139d823d5ea283bbf304dadcb885b1ccda818aa13dade5ea2",
+  "source_latent_sha256": "f742e12e3f55d91886a1b4218e6e5a3e64efcd65bce63de6a6d42976f3b2e04c",
+  "latent_frames": 37,
+  "samples": 29600,
+  "spectrogram_frames": 116,
+  "channels": 2,
+  "sample_rate": 32000,
+  "quality_bounds": {
+    "maximum_error": 0.001,
+    "relative_l2": 0.05,
+    "spectrogram_relative_l2": 0.08,
+    "spectrogram_relative_max": 0.1
+  },
+  "files": {
+    "audio_latent.f32": {
+      "bytes": 9472,
+      "dtype": "F32",
+      "shape": [32, 2, 37],
+      "sha256": "f742e12e3f55d91886a1b4218e6e5a3e64efcd65bce63de6a6d42976f3b2e04c"
+    },
+    "waveform.f32": {
+      "bytes": 236800,
+      "dtype": "F32",
+      "shape": [2, 29600],
+      "sha256": "ea122eb789d73424ff1c3bbe89719963dd407377165259a4f861f5dba55f837c"
+    },
+    "spectrogram.f32": {
+      "bytes": 476064,
+      "dtype": "F32",
+      "shape": [2, 513, 116],
+      "sha256": "20f3d1ca41c3b2a005654aec1c25313de6f849b7dbb7bf7b1ae5ffb92e100424"
+    }
+  }
+}

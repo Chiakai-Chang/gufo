@@ -19,6 +19,19 @@
         pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit version; }
       );
 
+      alexnetWeights = system:
+        pkgs.${system}.fetchurl {
+          url = "https://download.pytorch.org/models/alexnet-owt-7be5be79.pth";
+          hash = "sha256-e+W+eRFZRysfvzxpeW98sw3KethGbC33AFjDcRbN7gI=";
+        };
+
+      alexnetTorchHome = system:
+        pkgs.${system}.runCommand "torchvision-alexnet-cache" { } ''
+          mkdir -p "$out/hub/checkpoints"
+          ln -s ${alexnetWeights system} \
+            "$out/hub/checkpoints/alexnet-owt-7be5be79.pth"
+        '';
+
       # Offline model-conversion toolchain. Python-only; never a transitive
       # dependency of the server (see docs/QUANTIZATION.md "Offline Toolchain").
       # Unified python313 + torchWithRocm: every Strix Halo box ships ROCm, so
@@ -26,17 +39,33 @@
       # calibration forward alike. gfx1151 verified on this host.
       pythonTools = system:
         let pt = pkgs.${system}.python313; in
-        pt.withPackages (ps: [
-          ps.torchWithRocm
-          ps.transformers
-          ps.safetensors
-          ps.huggingface-hub
-          ps.numpy
-          ps.scipy
-          ps.pandas
-          ps.zstandard
-          strixPackages.${system}.hyperloom
-        ]);
+        pt.withPackages (
+          ps:
+          let
+            # Nixpkgs' default torchvision/lpips closures use CPU torch.
+            # Override both edges so evaluation has one ROCm torch derivation.
+            torchvisionRocm = ps.torchvision.override {
+              torch = ps.torchWithRocm;
+            };
+            lpipsRocm = ps.lpips.override {
+              torch = ps.torchWithRocm;
+              torchvision = torchvisionRocm;
+            };
+          in
+          [
+            ps.torchWithRocm
+            torchvisionRocm
+            ps.transformers
+            ps.safetensors
+            ps.huggingface-hub
+            lpipsRocm
+            ps.numpy
+            ps.scipy
+            ps.pandas
+            ps.zstandard
+            strixPackages.${system}.hyperloom
+          ]
+        );
     in
     {
       packages = forAllSystems (
@@ -69,6 +98,7 @@
             inputsFrom = [ self.packages.${system}.default ];
             packages = [
               (pythonTools system)
+              pkgs.${system}.ffmpeg-headless
               pkgs.${system}.rocmPackages.rocprofiler-sdk
             ];
             env = {
@@ -87,6 +117,7 @@
               STRIX_AIE_SMOKE_PROGRAM_DIR = "${strixPackages.${system}.aie-smoke}";
               STRIX_AIE_SMOKE_ROOT = "${strixPackages.${system}.aie-smoke}";
               XRT_PATH = "${strixPackages.${system}.xrt}/opt/xilinx/xrt";
+              TORCH_HOME = "${alexnetTorchHome system}";
             };
           };
 
@@ -143,6 +174,7 @@
                   directory:
                   relativePath == directory
                   || pkgsSys.lib.hasPrefix "${directory}/" relativePath
+                  || pkgsSys.lib.hasPrefix "${relativePath}/" directory
                 ) directories;
             };
 
@@ -171,6 +203,7 @@
               "cmake"
               "src"
               "tests"
+              "tools/strix"
             ];
             files = [
               ".clang-format"
@@ -195,6 +228,14 @@
             files = [
               "src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
               "tests/fixtures/minimax_h3/quality-contract-v1.json"
+              "tests/tools/h3_cache_control_test.py"
+              "tests/tools/h3_denoiser_golden_test.py"
+              "tests/tools/h3_latent_quality_test.py"
+              "tests/tools/h3_lpips_test.py"
+              "tests/tools/h3_preset_quality_test.py"
+              "tests/tools/h3_profile_test.py"
+              "tests/tools/h3_profile_report_test.py"
+              "tests/tools/h3_rng_test.py"
               "tests/tools/test_h3_quality.py"
               "tools/strix-h3-quality.py"
             ];
@@ -203,6 +244,7 @@
           dependencySource = mkFilteredSource {
             files = [
               ".devops/nix/package.nix"
+              "flake.nix"
               "THIRD_PARTY_NOTICES.md"
               "tools/check-dependencies.py"
             ];
@@ -313,8 +355,26 @@
           } ''
             cd "$src"
             python3 tests/tools/test_h3_quality.py
+            python3 tests/tools/h3_rng_test.py
+            python3 tests/tools/h3_cache_control_test.py
+            python3 tests/tools/h3_latent_quality_test.py
+            python3 tests/tools/h3_preset_quality_test.py
+            python3 tests/tools/h3_profile_test.py
+            python3 tests/tools/h3_profile_report_test.py
             mkdir -p $out
             echo "PASS: MiniMax H3 quality-oracle tests clean" > $out/result.txt
+          '';
+
+          h3MlQualityCheck = pkgsSys.runCommand "check-h3-ml-quality" {
+            nativeBuildInputs = [ (pythonTools system) ];
+            src = h3QualitySource;
+            TORCH_HOME = "${alexnetTorchHome system}";
+          } ''
+            cd "$src"
+            python3 tests/tools/h3_denoiser_golden_test.py
+            python3 tests/tools/h3_lpips_test.py
+            mkdir -p $out
+            echo "PASS: MiniMax H3 pinned teacher and offline LPIPS clean" > $out/result.txt
           '';
 
           testCheck = pkgsSys.runCommand "check-tests" {
@@ -323,6 +383,7 @@
               pkgsSys.ccache
               pkgsSys.cmake
               pkgsSys.ninja
+              (pkgsSys.python3.withPackages (ps: [ ps.numpy ]))
               pkgsSys.icu
             ];
             src = testSource;
@@ -358,7 +419,7 @@
           '';
 
           # Canonical PR umbrella. Nix builds these independent derivations in
-          # parallel and reuses their results across nix flake check and PR runs.
+          # parallel and reuses their results across flake checks and PR runs.
           prCheck = pkgsSys.runCommand "check-pr" { } ''
             mkdir -p $out/bin
             cp "${self.packages.${system}.default}/bin/strix" $out/bin/strix
@@ -370,6 +431,7 @@
             cat "${docsCheck}/result.txt"
             cat "${h3ManifestCheck}/result.txt"
             cat "${h3QualityCheck}/result.txt"
+            cat "${h3MlQualityCheck}/result.txt"
             cat "${testCheck}/result.txt"
 
             cat <<EOF > $out/pr-summary.txt
@@ -385,7 +447,8 @@ Composed Gates:
   4. Documentation & Local Link Validation (check-docs.py)
   5. MiniMax H3 Source-Manifest Validation
   6. MiniMax H3 Quality-Oracle Validation
-  7. CPU Build and Runtime/Unit Tests (CTest)
+  7. MiniMax H3 Pinned Teacher & Offline LPIPS Validation
+  8. CPU Build and Runtime/Unit Tests (CTest)
 Production Package Validation:
   - gfx1151 ROCm/HIP + XRT build
   - Installed strix-server version/help smoke
@@ -399,6 +462,7 @@ EOF
           docs = docsCheck;
           h3-manifest = h3ManifestCheck;
           h3-quality = h3QualityCheck;
+          h3-ml-quality = h3MlQualityCheck;
           tests = testCheck;
           pr = prCheck;
         }

@@ -1,6 +1,7 @@
 #ifndef STRIX_SERVER_JSON_HPP_
 #define STRIX_SERVER_JSON_HPP_
 
+#include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -311,6 +313,8 @@ struct Parser {
       if (i >= s.size() || s[i] != ':')
         fail("expected ':' after key");
       ++i;
+      if (v.contains(key))
+        fail("duplicate object key");
       v[key] = parse_value();
       skip_ws();
       if (i >= s.size())
@@ -444,23 +448,45 @@ struct Parser {
   }
   Value parse_number() {
     const std::size_t start = i;
-    if (i < s.size() && (s[i] == '-' || s[i] == '+'))
+    if (i < s.size() && s[i] == '-')
       ++i;
-    while (i < s.size()) {
-      const char c = s[i];
-      if ((c >= '0' && c <= '9') || c == '.' || c == 'e' || c == 'E' ||
-          c == '-' || c == '+') {
+    if (i >= s.size())
+      fail("bad number");
+    if (s[i] == '0') {
+      ++i;
+      if (i < s.size() && s[i] >= '0' && s[i] <= '9')
+        fail("bad number");
+    } else if (s[i] >= '1' && s[i] <= '9') {
+      while (i < s.size() && s[i] >= '0' && s[i] <= '9')
         ++i;
-      } else {
-        break;
-      }
-    }
-    const std::string tok(s.substr(start, i - start));
-    try {
-      return Value(std::stod(tok));
-    } catch (...) {
+    } else {
       fail("bad number");
     }
+    if (i < s.size() && s[i] == '.') {
+      ++i;
+      if (i >= s.size() || s[i] < '0' || s[i] > '9')
+        fail("bad number");
+      while (i < s.size() && s[i] >= '0' && s[i] <= '9')
+        ++i;
+    }
+    if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+      ++i;
+      if (i < s.size() && (s[i] == '-' || s[i] == '+'))
+        ++i;
+      if (i >= s.size() || s[i] < '0' || s[i] > '9')
+        fail("bad number");
+      while (i < s.size() && s[i] >= '0' && s[i] <= '9')
+        ++i;
+    }
+    const std::string tok(s.substr(start, i - start));
+    double value = 0.0;
+    const auto [end, error] =
+        std::from_chars(tok.data(), tok.data() + tok.size(), value);
+    if (error != std::errc{} || end != tok.data() + tok.size() ||
+        !std::isfinite(value)) {
+      fail("bad number");
+    }
+    return Value(value);
   }
 };
 }  // namespace detail
@@ -469,7 +495,11 @@ struct Parser {
 [[nodiscard]] inline Value parse(std::string_view text) {
   detail::Parser p;
   p.s = text;
-  return p.parse_value();
+  Value value = p.parse_value();
+  p.skip_ws();
+  if (p.i != text.size())
+    p.fail("trailing input");
+  return value;
 }
 
 }  // namespace strix::server::json

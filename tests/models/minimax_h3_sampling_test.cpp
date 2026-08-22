@@ -175,6 +175,8 @@ void TestLayouts() {
       {256, 528,
        "61be3a596b2670766a7e86b5a526e13438e89a68523d99eb5bdd9f2c8ca7f61a",
        "8574df4af41e95bb6ec35f3ec9459ceb88a319f68ad07e9ec70af5a84cb6a6e3"},
+      {320, 780, nullptr, nullptr},
+      {384, 1088, nullptr, nullptr},
       {512, 1872,
        "c3481ff47fabdf534823889a95df5655bd19ac11ff1755f5daa7b6e1655d00b0",
        "c95bbf9938ac6b5c2d901af8466d374f6e173953954872e19ec12ed82fec98a1"},
@@ -199,12 +201,14 @@ void TestLayouts() {
     CHECK(layout->segments[2].begin == 80);
     CHECK(layout->segments[2].end == expected.rows);
 
-    const std::string layout_hash = PackedLayoutSha256(*layout);
-    if (layout_hash != expected.layout_sha256) {
-      std::cerr << "layout " << expected.pixels << " SHA-256: " << layout_hash
-                << '\n';
+    if (expected.layout_sha256 != nullptr) {
+      const std::string layout_hash = PackedLayoutSha256(*layout);
+      if (layout_hash != expected.layout_sha256) {
+        std::cerr << "layout " << expected.pixels
+                  << " SHA-256: " << layout_hash << '\n';
+      }
+      CHECK(layout_hash == expected.layout_sha256);
     }
-    CHECK(layout_hash == expected.layout_sha256);
 
     auto schedule = BuildServingSchedule(20, &error);
     CHECK(schedule.has_value());
@@ -221,12 +225,14 @@ void TestLayouts() {
     if (!row_map.has_value()) {
       continue;
     }
-    const std::string row_map_hash = ModulationRowMapSha256(*row_map);
-    if (row_map_hash != expected.row_map_sha256) {
-      std::cerr << "row map " << expected.pixels << " SHA-256: " << row_map_hash
-                << '\n';
+    if (expected.row_map_sha256 != nullptr) {
+      const std::string row_map_hash = ModulationRowMapSha256(*row_map);
+      if (row_map_hash != expected.row_map_sha256) {
+        std::cerr << "row map " << expected.pixels
+                  << " SHA-256: " << row_map_hash << '\n';
+      }
+      CHECK(row_map_hash == expected.row_map_sha256);
     }
-    CHECK(row_map_hash == expected.row_map_sha256);
     CHECK((*row_map)[0] == time_rows->video_rows[7] * 3 + 1);
     CHECK((*row_map)[6] == time_rows->audio_rows[7] * 3 + 2);
     CHECK((*row_map)[80] == time_rows->video_rows[7] * 3);

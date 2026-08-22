@@ -376,7 +376,12 @@ def _validate_case(case: dict) -> tuple[str, str | None]:
             or case["height"] % 32
         ):
             raise H3QualityError("end-to-end canvas must use positive multiples of 32")
-        if case["frames"] < 5 or (case["frames"] - 5) % 17:
+        if case["frames"] < 22:
+            raise H3QualityError(
+                "end-to-end case requires at least 22 frames for the "
+                "released VisualVAE"
+            )
+        if (case["frames"] - 5) % 17:
             raise H3QualityError("case.frames violates H3 5+17*n alignment")
         if case["steps"] < 2 or not 1 <= case["blocks"] <= 50:
             raise H3QualityError("invalid end-to-end step or block count")
@@ -900,6 +905,101 @@ def global_ssim(
     return numerator / denominator
 
 
+def _gaussian_filter_valid(
+    values: np.ndarray, *, window_size: int, sigma: float
+) -> np.ndarray:
+    coordinates = np.arange(window_size, dtype=np.float64)
+    coordinates -= (window_size - 1) / 2.0
+    kernel = np.exp(-(coordinates * coordinates) / (2.0 * sigma * sigma))
+    kernel /= kernel.sum()
+    horizontal = np.lib.stride_tricks.sliding_window_view(
+        values, window_size, axis=1
+    )
+    horizontal = np.tensordot(horizontal, kernel, axes=([-1], [0]))
+    vertical = np.lib.stride_tricks.sliding_window_view(
+        horizontal, window_size, axis=0
+    )
+    return np.tensordot(vertical, kernel, axes=([-1], [0]))
+
+
+def windowed_ssim(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    *,
+    data_range: float,
+    window_size: int = 11,
+    sigma: float = 1.5,
+) -> float:
+    """Return deterministic Gaussian-window SSIM averaged over channels.
+
+    The arithmetic follows the population-covariance form of the canonical
+    SSIM metric. For fixtures smaller than the release 11x11 window, the
+    largest fitting odd window is used so corruption tests remain defined.
+    """
+
+    if not math.isfinite(data_range) or data_range <= 0:
+        raise H3QualityError("windowed SSIM data_range must be positive")
+    if window_size <= 0 or window_size % 2 == 0:
+        raise H3QualityError("windowed SSIM window must be positive and odd")
+    if not math.isfinite(sigma) or sigma <= 0:
+        raise H3QualityError("windowed SSIM sigma must be positive")
+    reference = np.asarray(reference, dtype=np.float64)
+    candidate = np.asarray(candidate, dtype=np.float64)
+    if reference.ndim != 3:
+        raise H3QualityError("windowed SSIM inputs must be [H,W,C]")
+    if reference.shape != candidate.shape:
+        raise H3QualityError("windowed SSIM inputs have different shapes")
+    if not np.isfinite(reference).all() or not np.isfinite(candidate).all():
+        raise H3QualityError("windowed SSIM inputs contain non-finite values")
+    fitting_window = min(window_size, reference.shape[0], reference.shape[1])
+    if fitting_window % 2 == 0:
+        fitting_window -= 1
+    if fitting_window < 1:
+        raise H3QualityError("windowed SSIM inputs have empty spatial axes")
+    mean_reference = _gaussian_filter_valid(
+        reference, window_size=fitting_window, sigma=sigma
+    )
+    mean_candidate = _gaussian_filter_valid(
+        candidate, window_size=fitting_window, sigma=sigma
+    )
+    mean_reference_squared = mean_reference * mean_reference
+    mean_candidate_squared = mean_candidate * mean_candidate
+    mean_product = mean_reference * mean_candidate
+    variance_reference = np.maximum(
+        0.0,
+        _gaussian_filter_valid(
+            reference * reference,
+            window_size=fitting_window,
+            sigma=sigma,
+        )
+        - mean_reference_squared,
+    )
+    variance_candidate = np.maximum(
+        0.0,
+        _gaussian_filter_valid(
+            candidate * candidate,
+            window_size=fitting_window,
+            sigma=sigma,
+        )
+        - mean_candidate_squared,
+    )
+    covariance = (
+        _gaussian_filter_valid(
+            reference * candidate,
+            window_size=fitting_window,
+            sigma=sigma,
+        )
+        - mean_product
+    )
+    c1 = (0.01 * data_range) ** 2
+    c2 = (0.03 * data_range) ** 2
+    numerator = (2.0 * mean_product + c1) * (2.0 * covariance + c2)
+    denominator = (
+        mean_reference_squared + mean_candidate_squared + c1
+    ) * (variance_reference + variance_candidate + c2)
+    return float(np.mean(numerator / denominator))
+
+
 def frame_metrics(
     reference: np.ndarray,
     candidate: np.ndarray,
@@ -926,6 +1026,11 @@ def frame_metrics(
                 "ssim_global": global_ssim(
                     reference[index], candidate[index], data_range=data_range
                 ),
+                "ssim_windowed": windowed_ssim(
+                    reference[index],
+                    candidate[index],
+                    data_range=data_range,
+                ),
             }
         )
     temporal = numeric_metrics(
@@ -945,6 +1050,9 @@ def frame_metrics(
         "ssim_global_mean": float(
             np.mean([item["ssim_global"] for item in per_frame])
         ),
+        "ssim_windowed_mean": float(
+            np.mean([item["ssim_windowed"] for item in per_frame])
+        ),
         "temporal_delta": temporal,
     }
 
@@ -952,24 +1060,30 @@ def frame_metrics(
 def _spectrogram(
     waveform: np.ndarray, *, window: int = 1024, hop: int = 256
 ) -> np.ndarray:
+    """Match the pinned torch.stft(center=True, pad_mode="reflect") oracle."""
+
     waveform = np.asarray(waveform, dtype=np.float64)
     if waveform.ndim != 2:
         raise H3QualityError("waveform must be [channels,samples]")
     if window <= 0 or hop <= 0:
         raise H3QualityError("spectrogram window and hop must be positive")
-    if waveform.shape[1] < window:
-        waveform = np.pad(
-            waveform, ((0, 0), (0, window - waveform.shape[1]))
+    padding = window // 2
+    if waveform.shape[1] <= padding:
+        raise H3QualityError(
+            "waveform is too short for centered reflect-padded spectrogram"
         )
-    frame_count = 1 + (waveform.shape[1] - window) // hop
-    windows = np.empty(
-        (waveform.shape[0], frame_count, window), dtype=np.float64
+    padded = np.pad(
+        waveform, ((0, 0), (padding, padding)), mode="reflect"
     )
-    for frame in range(frame_count):
-        start = frame * hop
-        windows[:, frame, :] = waveform[:, start : start + window]
-    windows *= np.hanning(window)[None, None, :]
-    return np.abs(np.fft.rfft(windows, axis=-1))
+    windows = np.lib.stride_tricks.sliding_window_view(
+        padded, window, axis=1
+    )[:, ::hop, :]
+    coordinates = np.arange(window, dtype=np.float64)
+    periodic_hann = 0.5 - 0.5 * np.cos(2.0 * np.pi * coordinates / window)
+    spectrum = np.abs(
+        np.fft.rfft(windows * periodic_hann[None, None, :], axis=-1)
+    )
+    return np.transpose(spectrum, (0, 2, 1))
 
 
 def audio_metrics(
@@ -994,13 +1108,15 @@ def audio_metrics(
     ]
     reference_spectrum = _spectrogram(reference)
     candidate_spectrum = _spectrogram(candidate)
+    spectrum_metrics = numeric_metrics(
+        reference_spectrum, candidate_spectrum
+    )
+    spectrum_metrics["shape"] = list(reference_spectrum.shape)
     return {
         "shape": list(reference.shape),
         "sample_rate": sample_rate,
         "duration_seconds": reference.shape[1] / sample_rate,
         "waveform": numeric_metrics(reference, candidate),
         "channels": channels,
-        "spectrogram": numeric_metrics(
-            reference_spectrum, candidate_spectrum
-        ),
+        "spectrogram": spectrum_metrics,
     }
