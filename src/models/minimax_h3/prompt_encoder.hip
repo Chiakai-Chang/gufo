@@ -176,11 +176,14 @@ private:
 
 struct LoadedTensor {
   const TensorDescriptor* descriptor{nullptr};
-  DeviceBuffer storage;
+  const std::uint16_t* data{nullptr};
 };
+
+struct HostMapping;
 
 struct LoadedBatch {
   std::vector<LoadedTensor> tensors;
+  std::vector<HostMapping> mappings;
   std::uint64_t bytes{0};
   std::uint64_t peak_registered_bytes{0};
   double load_ms{0.0};
@@ -188,7 +191,7 @@ struct LoadedBatch {
   [[nodiscard]] const std::uint16_t* Find(std::string_view name) const {
     for (const auto& tensor : tensors) {
       if (tensor.descriptor != nullptr && tensor.descriptor->name == name) {
-        return tensor.storage.As<std::uint16_t>();
+        return tensor.data;
       }
     }
     return nullptr;
@@ -206,6 +209,7 @@ struct HostMapping {
   void* host{nullptr};
   std::size_t bytes{0};
   std::uint64_t file_offset{0};
+  void* device{nullptr};
   bool registered{false};
 
   HostMapping() = default;
@@ -216,6 +220,7 @@ struct HostMapping {
         host(std::exchange(other.host, nullptr)),
         bytes(std::exchange(other.bytes, 0)),
         file_offset(other.file_offset),
+        device(std::exchange(other.device, nullptr)),
         registered(std::exchange(other.registered, false)) {}
   HostMapping& operator=(HostMapping&& other) noexcept {
     if (this != &other) {
@@ -224,6 +229,7 @@ struct HostMapping {
       host = std::exchange(other.host, nullptr);
       bytes = std::exchange(other.bytes, 0);
       file_offset = other.file_offset;
+      device = std::exchange(other.device, nullptr);
       registered = std::exchange(other.registered, false);
     }
     return *this;
@@ -240,6 +246,7 @@ struct HostMapping {
       (void)munmap(host, bytes);
       host = nullptr;
     }
+    device = nullptr;
     bytes = 0;
   }
 };
@@ -322,18 +329,6 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
     result.error = HipError("hipSetDevice", status);
     return result;
   }
-  hipStream_t stream = nullptr;
-  status = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
-  if (status != hipSuccess) {
-    result.error = HipError("hipStreamCreateWithFlags", status);
-    return result;
-  }
-  const auto destroy_stream = [&]() {
-    if (stream != nullptr) {
-      (void)hipStreamDestroy(stream);
-      stream = nullptr;
-    }
-  };
 
   try {
     LoadedBatch batch;
@@ -342,7 +337,6 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       if (IsCancelled(cancellation)) {
         result.error =
             "MiniMax H3 prompt encoder cancelled during file mapping";
-        destroy_stream();
         return result;
       }
       const auto path = inventory.model_root() / interval.shard;
@@ -350,14 +344,12 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       if (file < 0) {
         result.error = "cannot open H3 text shard " + path.string() + ": " +
                        std::strerror(errno);
-        destroy_stream();
         return result;
       }
       const std::uint64_t length64 = interval.end - interval.begin;
       if (length64 > std::numeric_limits<std::size_t>::max()) {
         close(file);
         result.error = "H3 text mapping is too large";
-        destroy_stream();
         return result;
       }
       const auto length = static_cast<std::size_t>(length64);
@@ -367,7 +359,6 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       if (host == MAP_FAILED) {
         result.error = "cannot map H3 text shard " + path.string() + ": " +
                        std::strerror(errno);
-        destroy_stream();
         return result;
       }
       (void)madvise(host, length, MADV_SEQUENTIAL);
@@ -380,10 +371,15 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
                                hipHostRegisterMapped | hipHostRegisterReadOnly);
       if (status != hipSuccess) {
         result.error = HipError("hipHostRegister(mapped|readonly)", status);
-        destroy_stream();
         return result;
       }
       mapping.registered = true;
+      status = hipHostGetDevicePointer(&mapping.device, host, 0);
+      if (status != hipSuccess) {
+        result.error = HipError("hipHostGetDevicePointer(H3 text weight)",
+                                status);
+        return result;
+      }
       const std::uint64_t registered =
           g_registered_host_bytes.fetch_add(length, std::memory_order_acq_rel) +
           length;
@@ -395,22 +391,14 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
     batch.tensors.reserve(descriptors.size());
     for (const TensorDescriptor* descriptor : descriptors) {
       if (IsCancelled(cancellation)) {
-        result.error = "MiniMax H3 prompt encoder cancelled during device copy";
-        destroy_stream();
+        result.error = "MiniMax H3 prompt encoder cancelled during weight map";
         return result;
       }
-      LoadedTensor tensor;
-      tensor.descriptor = descriptor;
       if (descriptor->payload_bytes > std::numeric_limits<std::size_t>::max()) {
         result.error = "H3 text tensor is too large";
-        destroy_stream();
         return result;
       }
       const auto bytes = static_cast<std::size_t>(descriptor->payload_bytes);
-      if (!tensor.storage.Allocate(bytes, &result.error)) {
-        destroy_stream();
-        return result;
-      }
       const HostMapping* mapping = nullptr;
       for (const auto& candidate : mappings) {
         if (candidate.shard == descriptor->shard &&
@@ -423,38 +411,25 @@ BatchLoadResult LoadBatch(const ModelInventory& inventory,
       }
       if (mapping == nullptr) {
         result.error = "H3 text tensor mapping was not found";
-        destroy_stream();
         return result;
       }
       const auto delta = static_cast<std::size_t>(descriptor->file_offset -
                                                   mapping->file_offset);
-      status =
-          hipMemcpyAsync(tensor.storage.data(),
-                         static_cast<const std::byte*>(mapping->host) + delta,
-                         bytes, hipMemcpyHostToDevice, stream);
-      if (status != hipSuccess) {
-        result.error = HipError("hipMemcpyAsync(H3 text weight)", status);
-        destroy_stream();
-        return result;
-      }
+      LoadedTensor tensor{
+          .descriptor = descriptor,
+          .data = reinterpret_cast<const std::uint16_t*>(
+              static_cast<const std::byte*>(mapping->device) + delta),
+      };
       batch.bytes += bytes;
       batch.tensors.push_back(std::move(tensor));
     }
-    status = hipStreamSynchronize(stream);
-    if (status != hipSuccess) {
-      result.error = HipError("hipStreamSynchronize(H3 text weights)", status);
-      destroy_stream();
-      return result;
-    }
-    mappings.clear();
-    destroy_stream();
+    batch.mappings = std::move(mappings);
     batch.load_ms = Milliseconds(begin, Clock::now());
     result.batch = std::move(batch);
     return result;
   } catch (const std::exception& exception) {
     result.error = "MiniMax H3 prompt weight load failed: " +
                    std::string(exception.what());
-    destroy_stream();
     return result;
   }
 }
@@ -675,6 +650,8 @@ struct Activations {
   DeviceBuffer norm;
   DeviceBuffer query;
   DeviceBuffer key;
+  DeviceBuffer rope_cosine;
+  DeviceBuffer rope_sine;
   DeviceBuffer value;
   DeviceBuffer attention;
   DeviceBuffer projection;
@@ -684,7 +661,8 @@ struct Activations {
 
   [[nodiscard]] std::uint64_t Bytes() const noexcept {
     return ids.bytes() + hidden.bytes() + norm.bytes() + query.bytes() +
-           key.bytes() + value.bytes() + attention.bytes() +
+           key.bytes() + rope_cosine.bytes() + rope_sine.bytes() +
+           value.bytes() + attention.bytes() +
            projection.bytes() + gate.bytes() + up.bytes() + mlp.bytes();
   }
 };
@@ -699,6 +677,13 @@ bool AllocateActivations(std::size_t tokens, Activations* activations,
     }
     return buffer->Allocate(elements * sizeof(std::uint16_t), error);
   };
+  const auto allocate_f32 = [&](DeviceBuffer* buffer, std::size_t elements) {
+    if (elements > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+      SetError(error, "H3 prompt activation size overflows");
+      return false;
+    }
+    return buffer->Allocate(elements * sizeof(float), error);
+  };
   return activations->ids.Allocate(tokens * sizeof(std::uint32_t), error) &&
          allocate_bf16(&activations->hidden,
                        tokens * kPromptEncoderHiddenSize) &&
@@ -707,6 +692,10 @@ bool AllocateActivations(std::size_t tokens, Activations* activations,
                                                 kPromptEncoderHeadDimension) &&
          allocate_bf16(&activations->key, tokens * kPromptEncoderKeyValueHeads *
                                               kPromptEncoderHeadDimension) &&
+         allocate_f32(&activations->rope_cosine,
+                      tokens * (kPromptEncoderHeadDimension / 2U)) &&
+         allocate_f32(&activations->rope_sine,
+                      tokens * (kPromptEncoderHeadDimension / 2U)) &&
          allocate_bf16(&activations->value, tokens *
                                                 kPromptEncoderKeyValueHeads *
                                                 kPromptEncoderHeadDimension) &&
@@ -750,7 +739,6 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
     SetError(error, "loaded H3 text layer is incomplete");
     return false;
   }
-
   hipEvent_t start_event = nullptr;
   hipEvent_t stop_event = nullptr;
   if (hipEventCreate(&start_event) != hipSuccess ||
@@ -790,9 +778,11 @@ bool RunLayer(const LoadedBatch& weights, std::size_t layer, std::size_t tokens,
                          token_count, kPromptEncoderKeyValueHeads,
                          kPromptEncoderHeadDimension, kRmsEpsilon, stream);
   ops::LaunchRope(activations->query.As<std::uint16_t>(),
-                  activations->key.As<std::uint16_t>(), token_count,
+                  activations->key.As<std::uint16_t>(),
+                  activations->rope_cosine.As<float>(),
+                  activations->rope_sine.As<float>(), token_count,
                   kPromptEncoderQueryHeads, kPromptEncoderKeyValueHeads,
-                  kPromptEncoderHeadDimension, kRopeTheta, stream);
+                  kPromptEncoderHeadDimension, stream);
   ops::LaunchCausalGqa(
       activations->query.As<std::uint16_t>(),
       activations->key.As<std::uint16_t>(),
@@ -954,6 +944,10 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
     destroy_stream();
     return false;
   }
+  ops::LaunchPrepareRope(
+      activations.rope_cosine.As<float>(), activations.rope_sine.As<float>(),
+      static_cast<std::uint32_t>(token_ids.size()),
+      kPromptEncoderHeadDimension, kRopeTheta, compute_stream);
 
   const TensorDescriptor* embedding_descriptor = RequireTensor(
       inventory, "model.language_model.embed_tokens.weight",

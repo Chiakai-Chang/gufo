@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <span>
 #include <string>
@@ -197,6 +198,8 @@ void CheckHeadNormRopeKernels() {
   DeviceArray<std::uint16_t> d_query(query.size());
   DeviceArray<std::uint16_t> d_key(key.size());
   DeviceArray<std::uint16_t> d_weight(weight.size());
+  DeviceArray<float> d_cosine(kSequence * (kHeadDimension / 2U));
+  DeviceArray<float> d_sine(kSequence * (kHeadDimension / 2U));
   CHECK(d_query.CopyFrom(query));
   CHECK(d_key.CopyFrom(key));
   CHECK(d_weight.CopyFrom(weight));
@@ -204,8 +207,11 @@ void CheckHeadNormRopeKernels() {
                            kQueryHeads, kHeadDimension, 1.0e-6F, nullptr);
   h3ops::LaunchHeadRmsNorm(d_key.get(), d_weight.get(), kSequence,
                            kKeyValueHeads, kHeadDimension, 1.0e-6F, nullptr);
-  h3ops::LaunchRope(d_query.get(), d_key.get(), kSequence, kQueryHeads,
-                    kKeyValueHeads, kHeadDimension, 5'000'000.0F, nullptr);
+  h3ops::LaunchPrepareRope(d_cosine.get(), d_sine.get(), kSequence,
+                           kHeadDimension, 5'000'000.0F, nullptr);
+  h3ops::LaunchRope(d_query.get(), d_key.get(), d_cosine.get(), d_sine.get(),
+                    kSequence, kQueryHeads, kKeyValueHeads, kHeadDimension,
+                    nullptr);
   CHECK(hipDeviceSynchronize() == hipSuccess);
   CHECK(d_query.CopyTo(query));
   CHECK(d_key.CopyTo(key));
@@ -289,10 +295,17 @@ int CheckReal() {
   Tokenizer tokenizer;
   CHECK(Tokenizer::Load(root / "FL2VA/tokenizer/tokenizer.json", &tokenizer,
                         &error));
+  const char* prompt_value = std::getenv("STRIX_H3_PROMPT_TEXT");
+  const std::string prompt =
+      prompt_value != nullptr && *prompt_value != '\0'
+          ? prompt_value
+          : "A red fox walking through snow";
   std::vector<std::uint32_t> ids;
-  CHECK(tokenizer.EncodePrompt("A red fox walking through snow", &ids, &error));
-  CHECK(ids ==
-        std::vector<std::uint32_t>({32, 2518, 38835, 11435, 1526, 11794}));
+  CHECK(tokenizer.EncodePrompt(prompt, &ids, &error));
+  if (prompt_value == nullptr || *prompt_value == '\0') {
+    CHECK(ids ==
+          std::vector<std::uint32_t>({32, 2518, 38835, 11435, 1526, 11794}));
+  }
 
   PromptEncoderOptions rejected;
   rejected.vision_inputs = true;
@@ -334,11 +347,17 @@ int CheckReal() {
   CHECK(telemetry.total_dispatches == options.layer_count * 17);
   CHECK(telemetry.live_registered_host_bytes_after == 0);
   CHECK(PromptEncoderLiveRegisteredHostBytes() == 0);
+  double layer_load_ms = 0.0;
+  double layer_gpu_ms = 0.0;
+  double layer_prefetch_wait_ms = 0.0;
   for (const auto& layer : telemetry.layers) {
     CHECK(layer.weight_bytes > 0);
     CHECK(layer.load_ms > 0.0);
     CHECK(layer.gpu_ms > 0.0);
     CHECK(layer.dispatches == 17);
+    layer_load_ms += layer.load_ms;
+    layer_gpu_ms += layer.gpu_ms;
+    layer_prefetch_wait_ms += layer.prefetch_wait_ms;
   }
   for (const std::uint16_t value : output.values) {
     CHECK(std::isfinite(ToFloat(value)));
@@ -347,7 +366,21 @@ int CheckReal() {
             << " seconds=" << seconds << " peak_device_gib="
             << static_cast<double>(telemetry.peak_device_bytes) /
                    (1024.0 * 1024.0 * 1024.0)
-            << " dispatches=" << telemetry.total_dispatches << '\n';
+            << " dispatches=" << telemetry.total_dispatches
+            << " tokens=" << output.tokens
+            << " layer_load_ms=" << layer_load_ms
+            << " layer_gpu_ms=" << layer_gpu_ms
+            << " prefetch_wait_ms=" << layer_prefetch_wait_ms << '\n';
+
+  if (const char* output_path = std::getenv("STRIX_H3_PROMPT_OUTPUT");
+      output_path != nullptr && *output_path != '\0') {
+    std::ofstream native_output(output_path, std::ios::binary);
+    native_output.write(
+        reinterpret_cast<const char*>(output.values.data()),
+        static_cast<std::streamsize>(output.values.size() *
+                                     sizeof(std::uint16_t)));
+    CHECK(native_output.good());
+  }
 
   if (golden_path != nullptr && *golden_path != '\0') {
     if (const char* expected_hash =
@@ -380,7 +413,7 @@ int CheckReal() {
         std::sqrt(squared_error / std::max(squared_expected, 1.0e-24));
     const double relative_max =
         maximum_error / std::max(maximum_expected, 1.0e-12);
-    std::cout << "golden relative_l2=" << relative_l2
+    std::cout << std::setprecision(9) << "golden relative_l2=" << relative_l2
               << " relative_max=" << relative_max << '\n';
     CHECK(relative_l2 < 0.05);
     CHECK(relative_max < 0.1);

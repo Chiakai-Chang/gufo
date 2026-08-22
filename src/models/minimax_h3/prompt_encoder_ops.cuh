@@ -139,13 +139,11 @@ inline void LaunchHeadRmsNorm(std::uint16_t* tensor,
                      epsilon);
 }
 
-static __global__ void RopeKernel(std::uint16_t* query, std::uint16_t* key,
-                                  std::uint32_t sequence,
-                                  std::uint32_t query_heads,
-                                  std::uint32_t key_value_heads,
-                                  std::uint32_t head_dimension, float theta) {
+static __global__ void PrepareRopeKernel(float* cosine, float* sine,
+                                         std::uint32_t sequence,
+                                         std::uint32_t head_dimension,
+                                         float theta) {
   const std::uint32_t row = blockIdx.x;
-  const std::uint32_t head = blockIdx.y;
   const std::uint32_t dimension = threadIdx.x;
   const std::uint32_t half = head_dimension / 2U;
   if (row >= sequence || dimension >= half) {
@@ -155,16 +153,46 @@ static __global__ void RopeKernel(std::uint16_t* query, std::uint16_t* key,
       expf(-logf(theta) * (2.0F * static_cast<float>(dimension) /
                            static_cast<float>(head_dimension)));
   const float angle = static_cast<float>(row) * inverse_frequency;
-  const float cosine = cosf(angle);
-  const float sine = sinf(angle);
+  const std::size_t index = static_cast<std::size_t>(row) * half + dimension;
+  cosine[index] = cosf(angle);
+  sine[index] = sinf(angle);
+}
+
+inline void LaunchPrepareRope(float* cosine, float* sine,
+                              std::uint32_t sequence,
+                              std::uint32_t head_dimension, float theta,
+                              hipStream_t stream) {
+  hipLaunchKernelGGL(PrepareRopeKernel, dim3(sequence),
+                     dim3(head_dimension / 2U), 0, stream, cosine, sine,
+                     sequence, head_dimension, theta);
+}
+
+static __global__ void RopeKernel(std::uint16_t* query, std::uint16_t* key,
+                                  const float* cosine, const float* sine,
+                                  std::uint32_t sequence,
+                                  std::uint32_t query_heads,
+                                  std::uint32_t key_value_heads,
+                                  std::uint32_t head_dimension) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t dimension = threadIdx.x;
+  const std::uint32_t half = head_dimension / 2U;
+  if (row >= sequence || dimension >= half) {
+    return;
+  }
+  const std::size_t rope_index =
+      static_cast<std::size_t>(row) * half + dimension;
+  const float cosine_value = cosine[rope_index];
+  const float sine_value = sine[rope_index];
   if (head < query_heads) {
     const std::size_t base =
         (static_cast<std::size_t>(row) * query_heads + head) * head_dimension;
     const float first = Bf16ToFloat(query[base + dimension]);
     const float second = Bf16ToFloat(query[base + half + dimension]);
-    query[base + dimension] = FloatToBf16(first * cosine - second * sine);
+    query[base + dimension] =
+        FloatToBf16(first * cosine_value - second * sine_value);
     query[base + half + dimension] =
-        FloatToBf16(second * cosine + first * sine);
+        FloatToBf16(second * cosine_value + first * sine_value);
   }
   if (head < key_value_heads) {
     const std::size_t base =
@@ -172,22 +200,24 @@ static __global__ void RopeKernel(std::uint16_t* query, std::uint16_t* key,
         head_dimension;
     const float first = Bf16ToFloat(key[base + dimension]);
     const float second = Bf16ToFloat(key[base + half + dimension]);
-    key[base + dimension] = FloatToBf16(first * cosine - second * sine);
-    key[base + half + dimension] = FloatToBf16(second * cosine + first * sine);
+    key[base + dimension] =
+        FloatToBf16(first * cosine_value - second * sine_value);
+    key[base + half + dimension] =
+        FloatToBf16(second * cosine_value + first * sine_value);
   }
 }
 
 inline void LaunchRope(std::uint16_t* query, std::uint16_t* key,
+                       const float* cosine, const float* sine,
                        std::uint32_t sequence, std::uint32_t query_heads,
                        std::uint32_t key_value_heads,
-                       std::uint32_t head_dimension, float theta,
-                       hipStream_t stream) {
+                       std::uint32_t head_dimension, hipStream_t stream) {
   hipLaunchKernelGGL(
       RopeKernel,
       dim3(sequence,
            query_heads > key_value_heads ? query_heads : key_value_heads),
-      dim3(head_dimension / 2U), 0, stream, query, key, sequence, query_heads,
-      key_value_heads, head_dimension, theta);
+      dim3(head_dimension / 2U), 0, stream, query, key, cosine, sine, sequence,
+      query_heads, key_value_heads, head_dimension);
 }
 
 static __global__ void CausalGqaKernel(
@@ -273,6 +303,156 @@ static __global__ void CausalGqaKernel(
   }
 }
 
+static __global__ void GroupedCausalGqaKernel(
+    const std::uint16_t* query, const std::uint16_t* key,
+    const std::uint16_t* value, std::uint16_t* output, std::uint32_t sequence,
+    std::uint32_t query_heads, std::uint32_t key_value_heads,
+    std::uint32_t head_dimension, float scale) {
+  constexpr std::uint32_t kMaximumGroupedHeads = 8;
+  constexpr std::uint32_t kLogicalLanes = 128;
+  const std::uint32_t query_row = blockIdx.x;
+  const std::uint32_t key_value_head = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x;
+  const std::uint32_t grouped_heads = query_heads / key_value_heads;
+  if (query_row >= sequence || key_value_head >= key_value_heads ||
+      grouped_heads == 0 || grouped_heads > kMaximumGroupedHeads) {
+    return;
+  }
+  extern __shared__ float shared[];
+  float* scores = shared;
+  float* shared_queries =
+      scores + static_cast<std::size_t>(grouped_heads) * sequence;
+  float* reductions =
+      shared_queries + static_cast<std::size_t>(grouped_heads) * head_dimension;
+  for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
+    const std::uint32_t query_head =
+        key_value_head * grouped_heads + grouped;
+    const std::size_t query_base =
+        (static_cast<std::size_t>(query_row) * query_heads + query_head) *
+        head_dimension;
+    for (std::uint32_t dimension = lane; dimension < head_dimension;
+         dimension += blockDim.x) {
+      shared_queries[static_cast<std::size_t>(grouped) * head_dimension +
+                     dimension] =
+          Bf16ToFloat(FloatToBf16(
+              Bf16ToFloat(query[query_base + dimension]) * scale));
+    }
+  }
+  __syncthreads();
+
+  const std::uint32_t key_count = query_row + 1U;
+  for (std::uint32_t logical_lane = lane; logical_lane < kLogicalLanes;
+       logical_lane += blockDim.x) {
+    for (std::uint32_t key_row = logical_lane; key_row < key_count;
+         key_row += kLogicalLanes) {
+      const std::size_t key_base =
+          (static_cast<std::size_t>(key_row) * key_value_heads +
+           key_value_head) *
+          head_dimension;
+      float dots[kMaximumGroupedHeads] = {};
+      for (std::uint32_t dimension = 0; dimension < head_dimension;
+           ++dimension) {
+        const float key_value = Bf16ToFloat(key[key_base + dimension]);
+        for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
+          dots[grouped] =
+              fmaf(shared_queries[static_cast<std::size_t>(grouped) *
+                                      head_dimension +
+                                  dimension],
+                   key_value, dots[grouped]);
+        }
+      }
+      for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
+        scores[static_cast<std::size_t>(grouped) * sequence + key_row] =
+            dots[grouped];
+      }
+    }
+  }
+  __syncthreads();
+
+  for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
+    float* grouped_scores =
+        scores + static_cast<std::size_t>(grouped) * sequence;
+    for (std::uint32_t logical_lane = lane; logical_lane < kLogicalLanes;
+         logical_lane += blockDim.x) {
+      float local_maximum = -INFINITY;
+      for (std::uint32_t key_row = logical_lane; key_row < key_count;
+           key_row += kLogicalLanes) {
+        local_maximum = fmaxf(local_maximum, grouped_scores[key_row]);
+      }
+      reductions[logical_lane] = local_maximum;
+    }
+    __syncthreads();
+    for (std::uint32_t stride = kLogicalLanes / 2U; stride != 0;
+         stride >>= 1U) {
+      if (lane < stride) {
+        reductions[lane] =
+            fmaxf(reductions[lane], reductions[lane + stride]);
+      }
+      __syncthreads();
+    }
+    const float maximum = reductions[0];
+    for (std::uint32_t logical_lane = lane; logical_lane < kLogicalLanes;
+         logical_lane += blockDim.x) {
+      float local_sum = 0.0F;
+      for (std::uint32_t key_row = logical_lane; key_row < key_count;
+           key_row += kLogicalLanes) {
+        const float probability = expf(grouped_scores[key_row] - maximum);
+        grouped_scores[key_row] = probability;
+        local_sum += probability;
+      }
+      reductions[logical_lane] = local_sum;
+    }
+    __syncthreads();
+    for (std::uint32_t stride = kLogicalLanes / 2U; stride != 0;
+         stride >>= 1U) {
+      if (lane < stride) {
+        reductions[lane] += reductions[lane + stride];
+      }
+      __syncthreads();
+    }
+    const float inverse_sum = 1.0F / reductions[0];
+    for (std::uint32_t logical_lane = lane; logical_lane < kLogicalLanes;
+         logical_lane += blockDim.x) {
+      for (std::uint32_t key_row = logical_lane; key_row < key_count;
+           key_row += kLogicalLanes) {
+        grouped_scores[key_row] *= inverse_sum;
+      }
+    }
+    __syncthreads();
+  }
+
+  for (std::uint32_t logical_lane = lane; logical_lane < kLogicalLanes;
+       logical_lane += blockDim.x) {
+    for (std::uint32_t dimension = logical_lane; dimension < head_dimension;
+         dimension += kLogicalLanes) {
+      float sums[kMaximumGroupedHeads] = {};
+      for (std::uint32_t key_row = 0; key_row < key_count; ++key_row) {
+        const std::size_t value_index =
+            (static_cast<std::size_t>(key_row) * key_value_heads +
+             key_value_head) *
+                head_dimension +
+            dimension;
+        const float value_element = Bf16ToFloat(value[value_index]);
+        for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
+          sums[grouped] =
+              fmaf(scores[static_cast<std::size_t>(grouped) * sequence +
+                          key_row],
+                   value_element, sums[grouped]);
+        }
+      }
+      for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
+        const std::uint32_t query_head =
+            key_value_head * grouped_heads + grouped;
+        const std::size_t output_index =
+            (static_cast<std::size_t>(query_row) * query_heads + query_head) *
+                head_dimension +
+            dimension;
+        output[output_index] = FloatToBf16(sums[grouped]);
+      }
+    }
+  }
+}
+
 inline void LaunchCausalGqa(const std::uint16_t* query,
                             const std::uint16_t* key,
                             const std::uint16_t* value, std::uint16_t* output,
@@ -280,6 +460,21 @@ inline void LaunchCausalGqa(const std::uint16_t* query,
                             std::uint32_t key_value_heads,
                             std::uint32_t head_dimension, float scale,
                             hipStream_t stream) {
+  const std::uint32_t grouped_heads =
+      key_value_heads == 0 ? 0 : query_heads / key_value_heads;
+  const std::size_t grouped_shared_bytes =
+      (static_cast<std::size_t>(sequence) * grouped_heads +
+       static_cast<std::size_t>(head_dimension) * grouped_heads + 128U) *
+      sizeof(float);
+  constexpr std::size_t kMaximumGroupedSharedBytes = 48U << 10U;
+  if (key_value_heads != 0 && query_heads % key_value_heads == 0 &&
+      grouped_heads <= 8 && grouped_shared_bytes <= kMaximumGroupedSharedBytes) {
+    hipLaunchKernelGGL(
+        GroupedCausalGqaKernel, dim3(sequence, key_value_heads), dim3(64),
+        grouped_shared_bytes, stream, query, key, value, output, sequence,
+        query_heads, key_value_heads, head_dimension, scale);
+    return;
+  }
   const std::size_t shared_bytes =
       (static_cast<std::size_t>(sequence) + head_dimension + 128U) *
       sizeof(float);
