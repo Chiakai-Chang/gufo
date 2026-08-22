@@ -696,6 +696,7 @@ int CheckReal() {
     std::cerr << error << '\n';
     return 1;
   }
+  CHECK(session->gemm_plan_validations() == 4);
   const std::uintptr_t scratch = session->scratch_address();
   h3::DitBlockRetained retained;
   h3::DitBlockTelemetry telemetry;

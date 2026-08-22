@@ -812,6 +812,7 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
   }
   output << "],\n"
          << "  \"denoiser_ms\": " << telemetry.denoiser_ms << ",\n"
+         << "  \"denoiser_setup_ms\": " << telemetry.denoiser.setup_ms << ",\n"
          << "  \"denoiser_text_refiner_ms\": "
          << telemetry.denoiser.text_refiner_ms << ",\n"
          << "  \"denoiser_adaln_precompute_ms\": "
@@ -839,6 +840,8 @@ std::string GenerationTelemetryJson(const GenerationTelemetry& telemetry) {
          << ",\n"
          << "  \"denoiser_cumulative_allocation_bytes\": "
          << telemetry.denoiser.cumulative_allocation_bytes << ",\n"
+         << "  \"denoiser_core_gemm_plan_validations\": "
+         << telemetry.denoiser.core_gemm_plan_validations << ",\n"
          << "  \"video_vae_ms\": " << telemetry.video_vae_ms << ",\n"
          << "  \"video_vae_load_ms\": " << telemetry.video_vae.load_ms << ",\n"
          << "  \"video_vae_decode_ms\": " << telemetry.video_vae.decode_ms

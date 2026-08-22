@@ -181,6 +181,7 @@ int CheckReal() {
         3 * 3 * h3::kDitModulationSlots * h3::kDitHiddenSize);
   CHECK(session->refined_text().size() == kTextRows * h3::kDitHiddenSize);
   CHECK(creation.core_weight_bytes > 0);
+  CHECK(creation.core_gemm_plan_validations == 4);
   CHECK(creation.core_weight_bytes < 4ULL * 1024ULL * 1024ULL * 1024ULL);
   CHECK(creation.peak_live_bytes < 8ULL * 1024ULL * 1024ULL * 1024ULL);
   CHECK(creation.scratch_address != 0);
@@ -308,6 +309,7 @@ int CheckOracle() {
     return 1;
   }
   CHECK(session->layout().rows() == 528);
+  CHECK(creation.core_gemm_plan_validations == 4);
   CheckBf16Boundary("refined_text", session->refined_text(), expected_refined,
                     0.02);
   CheckBf16Boundary("block0_modulation", session->block0_modulation(),
@@ -329,6 +331,7 @@ int CheckOracle() {
   CHECK(telemetry.forward_ms.size() == 1);
   CHECK(telemetry.swap_bytes == 0);
   std::cout << "H3 denoiser forward oracle rows=" << session->layout().rows()
+            << " setup_ms=" << telemetry.setup_ms
             << " load_ms=" << telemetry.core_load_ms
             << " adaln_ms=" << telemetry.adaln_precompute_ms << " peak_gib="
             << static_cast<double>(telemetry.peak_live_bytes) /
