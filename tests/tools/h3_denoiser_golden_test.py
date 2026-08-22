@@ -47,7 +47,7 @@ payload = video.numpy().astype("<f4", copy=False).tobytes()
 payload += audio.numpy().astype("<f4", copy=False).tobytes()
 check(
     hashlib.sha256(payload).hexdigest()
-    == "0b9e324f731605e8b6050b2c7cdc46a320b75609c426ea548adb35332204620d",
+    == "6318dbfea74c61415d470c12c019cda9df6a8491f86b075e403d1c2fc2403b4d",
     "serving noise identity",
 )
 

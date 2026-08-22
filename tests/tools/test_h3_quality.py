@@ -192,6 +192,23 @@ class TestH3Quality(unittest.TestCase):
         ):
             h3_quality.verify_artifact(artifact)
 
+    def test_single_capture_does_not_claim_repeatability(self):
+        template = self._component_template()
+        template["determinism"] = {
+            "capture_count": 1,
+            "byte_identical": False,
+        }
+        staging = self.root / "staging"
+        self._write_component_payloads(staging)
+        manifest = h3_quality.build_manifest(staging, template)
+        self.assertEqual(manifest["determinism"]["capture_count"], 1)
+
+        template["determinism"]["byte_identical"] = True
+        with self.assertRaisesRegex(
+            h3_quality.H3QualityError, "one non-repeated capture"
+        ):
+            h3_quality.build_manifest(staging, template)
+
     def test_prompt_or_artifact_id_tampering_is_rejected(self):
         staging = self.root / "staging"
         self._write_component_payloads(staging)

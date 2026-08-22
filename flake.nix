@@ -51,13 +51,18 @@
               torch = ps.torchWithRocm;
               torchvision = torchvisionRocm;
             };
+            accelerateRocm = ps.accelerate.override {
+              torch = ps.torchWithRocm;
+            };
           in
           [
             ps.torchWithRocm
             torchvisionRocm
             ps.transformers
+            accelerateRocm
             ps.safetensors
             ps.huggingface-hub
+            ps.requests
             lpipsRocm
             ps.numpy
             ps.scipy

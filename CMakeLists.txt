@@ -709,12 +709,12 @@ if (BUILD_TESTING)
       LABELS "gpu;hip;gfx1151;minimax-h3;dit;denoiser;external-model;slow"
       SKIP_RETURN_CODE 77)
     add_test(NAME minimax_h3_denoiser_oracle
-      COMMAND minimax_h3_denoiser_hip_test --oracle)
+      COMMAND minimax_h3_denoiser_hip_test --oracle-forward)
     set_tests_properties(minimax_h3_denoiser_oracle PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;dit;denoiser;quality;external-model;slow"
       SKIP_RETURN_CODE 77)
     add_test(NAME minimax_h3_denoiser_production_shape_oracle
-      COMMAND minimax_h3_denoiser_hip_test --oracle-512)
+      COMMAND minimax_h3_denoiser_hip_test --oracle-512-forward)
     set_tests_properties(minimax_h3_denoiser_production_shape_oracle PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;dit;denoiser;quality;external-model;slow"
       SKIP_RETURN_CODE 77)

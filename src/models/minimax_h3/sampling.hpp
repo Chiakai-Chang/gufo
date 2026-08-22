@@ -16,7 +16,7 @@ inline constexpr std::int64_t kH3MaximumPixels = 768LL * 1344LL;
 inline constexpr int kH3FramesPerSecond = 24;
 inline constexpr int kH3AudioLatentFramesPerSecond = 40;
 inline constexpr int kH3VaeSpatialRatio = 16;
-inline constexpr int kH3MaximumFrames = 362;
+inline constexpr int kH3MaximumFrames = 345;
 inline constexpr int kH3MaximumEvaluations = 1000;
 
 struct TemporalShape {
@@ -140,15 +140,18 @@ struct InitialNoise {
 };
 
 [[nodiscard]] std::optional<InitialNoise> BuildInitialNoise(
-    std::uint64_t seed, std::size_t video_elements, std::size_t audio_elements,
+    std::uint64_t seed, std::size_t video_elements, int audio_channels,
+    int audio_time,
     std::string* error = nullptr);
 
 struct EulerStepPlan {
   bool evaluate{false};
   int last_evaluated{-1};
   int previous_evaluated{-1};
-  float video_delta{0.0F};
-  float audio_delta{0.0F};
+  float video_sigma_from_timestep{0.0F};
+  float audio_sigma_from_timestep{0.0F};
+  float video_ratio{0.0F};
+  float audio_ratio{0.0F};
   float video_extrapolation{0.0F};
   float audio_extrapolation{0.0F};
 };
@@ -163,14 +166,15 @@ struct EulerStepPlan {
     const SigmaSchedule& schedule, int reuse_interval,
     std::string* error = nullptr);
 
-// sample_f32, last_bf16, and previous_bf16 must point to device memory.
+// sample_f32, last_f32, and previous_f32 must point to device memory.
 // stream is a hipStream_t passed opaquely to keep the public host header free
 // from ROCm headers. The update remains in device F32 between DiT evaluations.
 [[nodiscard]] bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
                                   std::size_t sample_offset,
-                                  const void* last_bf16,
-                                  const void* previous_bf16,
-                                  std::size_t velocity_elements, float delta,
+                                  const void* last_f32,
+                                  const void* previous_f32,
+                                  std::size_t velocity_elements,
+                                  float sigma_from_timestep, float ratio,
                                   float extrapolation, void* stream,
                                   std::string* error = nullptr);
 

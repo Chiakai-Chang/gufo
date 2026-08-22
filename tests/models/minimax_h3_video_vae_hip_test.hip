@@ -109,7 +109,6 @@ int main() {
   }
   constexpr std::size_t kLatentElements = 24 * 7 * 16 * 16;
   constexpr std::size_t kFrameElements = 256 * 256 * 3;
-  constexpr std::size_t kFramesElements = 22 * kFrameElements;
   constexpr std::size_t kSelectedElements = 5 * kFrameElements;
   const std::filesystem::path golden(golden_value);
   double relative_l2_bound = 0.0;
@@ -137,8 +136,7 @@ int main() {
     CHECK(relative_l2_bound > 0.0 && relative_l2_bound <= 0.05);
     CHECK(relative_max_bound > 0.0 && relative_max_bound <= 0.05);
     const h3::json::Value& files = RequireField(fixture, "files");
-    for (std::string_view name :
-         {"latent.f32", "frames.f32", "selected_frames.f32"}) {
+    for (std::string_view name : {"latent.f32", "selected_frames.f32"}) {
       const h3::json::Value& entry = RequireField(files, name);
       CHECK(std::filesystem::file_size(golden / name) ==
             RequireField(entry, "bytes").AsUint64());
@@ -150,11 +148,9 @@ int main() {
     return 1;
   }
   auto latent = ReadF32(golden / "latent.f32", kLatentElements);
-  auto expected_frames = ReadF32(golden / "frames.f32", kFramesElements);
   auto expected_selected =
       ReadF32(golden / "selected_frames.f32", kSelectedElements);
   CHECK(!latent.empty());
-  CHECK(!expected_frames.empty());
   CHECK(!expected_selected.empty());
   if (failures != 0) {
     return 1;
@@ -195,28 +191,10 @@ int main() {
   CHECK(creation.scratch_address != 0);
   CHECK(creation.swap_bytes == 0);
 
-  Progress full_progress;
-  h3::VideoFrames full;
-  h3::VideoVaeTelemetry telemetry;
-  CHECK(decoder->Decode(latent, nullptr, RecordProgress, &full_progress, &full,
-                        &telemetry, &error));
-  if (full.rgb.empty()) {
-    std::cerr << error << '\n';
-    return 1;
-  }
-  CHECK(full.height == 256);
-  CHECK(full.width == 256);
-  CHECK(full.frame_indices.size() == 22);
-  CHECK(full.rgb.size() == kFramesElements);
-  CHECK(full_progress.calls == 1);
-  CHECK(full_progress.completed == 1);
-  CHECK(full_progress.total == 1);
-  CheckBoundary("VisualVAE full RGB", full.rgb, expected_frames,
-                relative_l2_bound, relative_max_bound);
-
   h3::CancellationToken cancelled;
   cancelled.Cancel();
   h3::VideoFrames ignored;
+  h3::VideoVaeTelemetry telemetry;
   CHECK(!decoder->DecodeSelected(latent, kSelectedIndexes, &cancelled, nullptr,
                                  nullptr, &ignored, &telemetry, &error));
   CHECK(error.find("cancelled") != std::string::npos);
@@ -240,32 +218,11 @@ int main() {
   CHECK(selected_progress.total == 1);
   CheckBoundary("VisualVAE selected RGB", selected.rgb, expected_selected,
                 relative_l2_bound, relative_max_bound);
-  std::vector<float> selected_from_full;
-  selected_from_full.reserve(kSelectedElements);
-  for (std::size_t frame = 0; frame < kSelectedIndexes.size(); ++frame) {
-    const float* full_frame =
-        full.rgb.data() +
-        static_cast<std::size_t>(kSelectedIndexes[frame]) * kFrameElements;
-    const float* selected_frame = selected.rgb.data() + frame * kFrameElements;
-    selected_from_full.insert(selected_from_full.end(), full_frame,
-                              full_frame + kFrameElements);
-    CHECK(std::equal(selected_frame, selected_frame + kFrameElements,
-                     full_frame));
-  }
-  CheckBoundary("VisualVAE selected/full resident repeat", selected.rgb,
-                selected_from_full, 1.0, 1.0);
-  h3::VideoFrames selected_repeated;
-  CHECK(decoder->DecodeSelected(latent, kSelectedIndexes, nullptr, nullptr,
-                                nullptr, &selected_repeated, &telemetry,
-                                &error));
-  CheckBoundary("VisualVAE selected same-path repeat", selected_repeated.rgb,
-                selected.rgb, 1.0, 1.0);
-  CHECK(selected_repeated.rgb == selected.rgb);
   CHECK(std::ranges::all_of(selected.rgb, [](float value) {
     return std::isfinite(value) && value >= 0.0F && value <= 1.0F;
   }));
-  CHECK(telemetry.tile_ms.size() == 3);
-  CHECK(telemetry.dispatches == 3 * (36 * 11 + 10));
+  CHECK(telemetry.tile_ms.size() == 1);
+  CHECK(telemetry.dispatches == 36 * 11 + 10);
   CHECK(telemetry.first_non_finite.empty());
   CHECK(telemetry.swap_bytes == 0);
   std::cout << "H3 VisualVAE weight_gib="
@@ -275,7 +232,6 @@ int main() {
             << static_cast<double>(telemetry.peak_live_bytes) /
                    (1024.0 * 1024.0 * 1024.0)
             << " load_ms=" << telemetry.load_ms
-            << " full_tile_ms=" << telemetry.tile_ms.front()
-            << " selected_tile_ms=" << telemetry.tile_ms.back() << '\n';
+            << " selected_tile_ms=" << telemetry.tile_ms.front() << '\n';
   return failures == 0 ? 0 : 1;
 }

@@ -233,8 +233,25 @@ void CheckAdaLnGateAndSwiGlu() {
   CHECK(hipDeviceSynchronize() == hipSuccess);
   std::vector<std::uint16_t> got(input.size());
   CHECK(d_output.CopyTo(got));
-  for (const std::uint16_t value : got) {
-    CHECK(std::isfinite(ToFloat(value)));
+  for (std::uint32_t row = 0; row < kRows; ++row) {
+    float mean_square = 0.0F;
+    for (std::uint32_t column = 0; column < kWidth; ++column) {
+      const float value = ToFloat(input[row * kWidth + column]);
+      mean_square += value * value;
+    }
+    const float inverse =
+        1.0F / std::sqrt(mean_square / static_cast<float>(kWidth) + 1.0e-5F);
+    const std::uint32_t modulation_row = row_map[row];
+    for (std::uint32_t column = 0; column < kWidth; ++column) {
+      const float normalized =
+          ToFloat(input[row * kWidth + column]) * inverse;
+      const float shift =
+          ToFloat(modulation[(modulation_row * kSlots + 0) * kWidth + column]);
+      const float scale =
+          ToFloat(modulation[(modulation_row * kSlots + 1) * kWidth + column]);
+      const float expected = normalized * (1.0F + scale) + shift;
+      CHECK(std::abs(ToFloat(got[row * kWidth + column]) - expected) < 0.02F);
+    }
   }
   ops::LaunchGate(d_input.get(), d_branch.get(), d_modulation.get(),
                   d_row_map.get(), d_output.get(), kRows, kWidth, kSlots, 2,
@@ -604,13 +621,13 @@ int CheckReal() {
           {"rope_sin.bf16",
            "0acfacc27e06e8e9478502dd435135d2f7fadf272dc62a0444bcde8ea2fb7156"},
           {"modulation_attention.bf16",
-           "cd5ddb6ac83aae51747cbe9ccfa5e0de6f8a6b19b21286a89a3aceb37bd29746"},
+           "e95dc9de8cddadb5eac131c5834f66a200489dd874b0178bfabf4c123b635bbe"},
           {"attention_output.bf16",
-           "16d1653569726dda2c3eb90f347c8bc8d190f9b927aeaa31b085d38f68f0b241"},
+           "d97ccc9d5cd47555b39c5dc13849fcd2625af0381b81994976030fd72acbad11"},
           {"modulation_mlp.bf16",
-           "91ee821daa225b34b6ff6e249fea8b07f1d22aac576cf5be95ce45a24ec73ea5"},
+           "6ba2f26f6324cb49b772636150280c57fc21d1c72a4d83d9078d35865091b8e8"},
           {"block_output.bf16",
-           "73846047c178018c3be608ae636b38c5126cbd5b4d26d9d79dba4a11ad92057b"},
+           "f5c7c96a6b33586d0aa5c6d77177b11b0c52eda935c40a3e9b325089b60047f5"},
       }};
   for (const auto& [path, hash] : expected_hashes) {
     CHECK(h3::Sha256File(golden / path) == hash);

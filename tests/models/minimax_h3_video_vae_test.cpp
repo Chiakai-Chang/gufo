@@ -81,9 +81,9 @@ float Pixel(std::span<const float> rgb, int width, int height, int frame, int y,
 
 int main() {
   CheckPlan(256, 256, 22, 256, 1, 1, 22);
-  CheckPlan(288, 256, 22, 288, 1, 1, 22);
-  CheckPlan(512, 512, 22, 288, 2, 2, 22);
-  CheckPlan(1344, 768, 22, 320, 5, 3, 22);
+  CheckPlan(288, 256, 22, 256, 2, 1, 22);
+  CheckPlan(512, 512, 22, 256, 3, 3, 22);
+  CheckPlan(1344, 768, 22, 256, 7, 4, 22);
   CheckPlan(256, 256, 39, 256, 1, 1, 39);
 
   std::string error;
@@ -143,7 +143,7 @@ int main() {
           static_cast<std::size_t>(plan->y_axis.length) * plan->x_axis.length *
           3U;
       std::vector<std::vector<float>> tiles;
-      for (int value = 1; value <= 4; ++value) {
+      for (int value = 1; value <= 9; ++value) {
         tiles.emplace_back(2U * tile_elements, static_cast<float>(value));
         std::fill(
             tiles.back().begin() + static_cast<std::ptrdiff_t>(tile_elements),
@@ -155,19 +155,16 @@ int main() {
       CHECK(rgb.size() == 2U * 512U * 512U * 3U);
       if (!rgb.empty()) {
         CHECK(Pixel(rgb, 512, 512, 0, 100, 100) == 1.0F);
-        CHECK(Pixel(rgb, 512, 512, 0, 100, 224) == 1.0F);
-        CHECK(Pixel(rgb, 512, 512, 0, 100, 256) == 1.5F);
-        CHECK(Pixel(rgb, 512, 512, 0, 100, 288) == 2.0F);
-        CHECK(Pixel(rgb, 512, 512, 0, 224, 100) == 1.0F);
-        CHECK(Pixel(rgb, 512, 512, 0, 256, 100) == 2.0F);
-        CHECK(Pixel(rgb, 512, 512, 0, 288, 100) == 3.0F);
-        CHECK(Pixel(rgb, 512, 512, 0, 224, 224) == 3.0F);
-        CHECK(Pixel(rgb, 512, 512, 0, 224, 256) == 2.5F);
-        CHECK(Pixel(rgb, 512, 512, 0, 256, 256) == 3.0F);
-        CHECK(Pixel(rgb, 512, 512, 0, 288, 288) == 4.0F);
-        CHECK(Pixel(rgb, 512, 512, 1, 100, 256) == 11.5F);
-        CHECK(Pixel(rgb, 512, 512, 1, 224, 256) == 12.5F);
-        CHECK(Pixel(rgb, 512, 512, 1, 288, 288) == 14.0F);
+        CHECK(Pixel(rgb, 512, 512, 0, 100, 192) == 1.5F);
+        CHECK(Pixel(rgb, 512, 512, 0, 100, 320) == 2.5F);
+        CHECK(Pixel(rgb, 512, 512, 0, 192, 100) == 2.5F);
+        CHECK(Pixel(rgb, 512, 512, 0, 192, 192) == 3.75F);
+        CHECK(Pixel(rgb, 512, 512, 0, 256, 256) == 8.0F);
+        CHECK(Pixel(rgb, 512, 512, 0, 320, 100) == 5.5F);
+        CHECK(Pixel(rgb, 512, 512, 0, 511, 511) == 9.0F);
+        CHECK(Pixel(rgb, 512, 512, 1, 100, 192) == 11.5F);
+        CHECK(Pixel(rgb, 512, 512, 1, 192, 192) == 13.75F);
+        CHECK(Pixel(rgb, 512, 512, 1, 511, 511) == 19.0F);
       }
       tiles.back().pop_back();
       CHECK(!h3::StitchVideoVaeTiles(plan->y_axis, plan->x_axis, 2, tiles, &rgb,

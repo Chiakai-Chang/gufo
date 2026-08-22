@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -37,6 +38,14 @@ struct DenoiserVelocity {
   std::vector<float> video;
   std::vector<float> audio;
 };
+
+[[nodiscard]] std::optional<double> DenoiserGateScore(
+    std::span<const std::uint16_t> modulation, std::uint32_t time_rows,
+    std::string* error = nullptr);
+[[nodiscard]] std::optional<std::vector<std::size_t>>
+SelectGateRankedDenoiserBlocks(std::span<const double> gate_scores,
+                              int active_blocks,
+                              std::string* error = nullptr);
 
 struct DenoiserTelemetry {
   double text_refiner_ms{0.0};

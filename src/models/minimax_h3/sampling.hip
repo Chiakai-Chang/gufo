@@ -50,39 +50,52 @@ bool ValidateTarget(std::string* error) {
 }
 
 __global__ void EulerUpdateKernel(float* sample, std::size_t sample_offset,
-                                  const hip_bfloat16* last,
-                                  const hip_bfloat16* previous,
-                                  std::size_t elements, float delta,
+                                  const float* last, const float* previous,
+                                  std::size_t elements,
+                                  float sigma_from_timestep, float ratio,
                                   float extrapolation) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= elements) {
     return;
   }
-  const float last_value = static_cast<float>(last[index]);
-  const float velocity =
-      fmaf(extrapolation, last_value - static_cast<float>(previous[index]),
-           last_value);
+  const float last_value = last[index];
+  const float velocity_delta = last_value - previous[index];
+  const float extrapolated_delta = extrapolation * velocity_delta;
+  const float velocity = last_value + extrapolated_delta;
   const std::size_t sample_index = sample_offset + index;
-  sample[sample_index] = fmaf(delta, velocity, sample[sample_index]);
+  const float sample_value = sample[sample_index];
+  // Preserve the eager Diffusers float32 operation boundaries:
+  // denoised = sample + sigma_from_timestep * velocity
+  // next = ratio * sample + (1 - ratio) * denoised
+  const float denoised_delta = sigma_from_timestep * velocity;
+  const float denoised = sample_value + denoised_delta;
+  const float sample_term = ratio * sample_value;
+  const float denoised_weight = 1.0F - ratio;
+  const float denoised_term = denoised_weight * denoised;
+  sample[sample_index] = sample_term + denoised_term;
 }
 
 }  // namespace
 
 bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
-                    std::size_t sample_offset, const void* last_bf16,
-                    const void* previous_bf16, std::size_t velocity_elements,
-                    float delta, float extrapolation, void* stream,
-                    std::string* error) {
-  if (sample_f32 == nullptr || last_bf16 == nullptr ||
-      previous_bf16 == nullptr || velocity_elements == 0 ||
+                    std::size_t sample_offset, const void* last_f32,
+                    const void* previous_f32, std::size_t velocity_elements,
+                    float sigma_from_timestep, float ratio,
+                    float extrapolation, void* stream, std::string* error) {
+  if (sample_f32 == nullptr || last_f32 == nullptr ||
+      previous_f32 == nullptr || velocity_elements == 0 ||
       sample_offset > sample_elements ||
       velocity_elements > sample_elements - sample_offset ||
       velocity_elements >
           static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()) *
               256ULL ||
-      !std::isfinite(delta) || delta <= 0.0F || !std::isfinite(extrapolation) ||
-      extrapolation < -2.0F || extrapolation > 2.0F) {
+      !std::isfinite(sigma_from_timestep) || sigma_from_timestep <= 0.0F ||
+      !std::isfinite(ratio) || ratio < 0.0F || ratio >= 1.0F ||
+      !std::isfinite(extrapolation) || extrapolation < -2.0F ||
+      extrapolation > 2.0F) {
     SetError(error, "invalid MiniMax H3 HIP Euler update");
     return false;
   }
@@ -95,9 +108,10 @@ bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
   hipLaunchKernelGGL(EulerUpdateKernel, dim3(blocks), dim3(kThreads), 0,
                      static_cast<hipStream_t>(stream),
                      static_cast<float*>(sample_f32), sample_offset,
-                     static_cast<const hip_bfloat16*>(last_bf16),
-                     static_cast<const hip_bfloat16*>(previous_bf16),
-                     velocity_elements, delta, extrapolation);
+                     static_cast<const float*>(last_f32),
+                     static_cast<const float*>(previous_f32),
+                     velocity_elements, sigma_from_timestep, ratio,
+                     extrapolation);
   const hipError_t status = hipGetLastError();
   if (status != hipSuccess) {
     SetError(error, std::string("MiniMax H3 Euler kernel launch: ") +

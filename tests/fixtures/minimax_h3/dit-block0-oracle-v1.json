@@ -47,22 +47,22 @@
     "modulation_attention.bf16": {
       "bytes": 5677056,
       "shape": [528, 5376],
-      "sha256": "cd5ddb6ac83aae51747cbe9ccfa5e0de6f8a6b19b21286a89a3aceb37bd29746"
+      "sha256": "e95dc9de8cddadb5eac131c5834f66a200489dd874b0178bfabf4c123b635bbe"
     },
     "attention_output.bf16": {
       "bytes": 5677056,
       "shape": [528, 5376],
-      "sha256": "16d1653569726dda2c3eb90f347c8bc8d190f9b927aeaa31b085d38f68f0b241"
+      "sha256": "d97ccc9d5cd47555b39c5dc13849fcd2625af0381b81994976030fd72acbad11"
     },
     "modulation_mlp.bf16": {
       "bytes": 5677056,
       "shape": [528, 5376],
-      "sha256": "91ee821daa225b34b6ff6e249fea8b07f1d22aac576cf5be95ce45a24ec73ea5"
+      "sha256": "6ba2f26f6324cb49b772636150280c57fc21d1c72a4d83d9078d35865091b8e8"
     },
     "block_output.bf16": {
       "bytes": 5677056,
       "shape": [528, 5376],
-      "sha256": "73846047c178018c3be608ae636b38c5126cbd5b4d26d9d79dba4a11ad92057b"
+      "sha256": "f5c7c96a6b33586d0aa5c6d77177b11b0c52eda935c40a3e9b325089b60047f5"
     }
   }
 }

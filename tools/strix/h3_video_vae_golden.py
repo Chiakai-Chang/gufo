@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import math
@@ -50,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--compute-dtype",
+        choices=("float32", "float16"),
+        default="float32",
+        help=(
+            "float32 preserves the frozen component oracle; float16 mirrors "
+            "the released pipeline's autocast decode recipe"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -91,10 +101,11 @@ def read_f32(path: Path, shape: tuple[int, ...], device: torch.device):
 
 
 def rms(input_tensor: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    values = input_tensor.float()
     inverse = torch.rsqrt(
-        input_tensor.square().mean(dim=-1, keepdim=True) + EPSILON
+        values.square().mean(dim=-1, keepdim=True) + EPSILON
     )
-    return input_tensor * inverse * weight
+    return (values * inverse * weight.float()).to(input_tensor.dtype)
 
 
 def rope(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -125,8 +136,8 @@ def qkv_norm_rope(
     qkv: torch.Tensor, cosine: torch.Tensor, sine: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     grouped = qkv.view(qkv.shape[0], HEADS, 3, HEAD_DIMENSION)
-    query = grouped[:, :, 0, :]
-    key = grouped[:, :, 1, :]
+    query = grouped[:, :, 0, :].float()
+    key = grouped[:, :, 1, :].float()
     value = grouped[:, :, 2, :].contiguous()
     query = query * torch.rsqrt(
         query.square().mean(dim=-1, keepdim=True) + EPSILON
@@ -150,7 +161,7 @@ def qkv_norm_rope(
             dim=-1,
         )
 
-    return rotate(query), rotate(key), value
+    return rotate(query).to(qkv.dtype), rotate(key).to(qkv.dtype), value
 
 
 def full_attention(
@@ -236,7 +247,12 @@ def main() -> int:
         / "model.safetensors"
     )
     started = time.monotonic()
-    with torch.inference_mode(), safe_open(
+    autocast = (
+        torch.autocast(device_type=device.type, dtype=torch.float16)
+        if args.compute_dtype == "float16"
+        else contextlib.nullcontext()
+    )
+    with torch.inference_mode(), autocast, safe_open(
         checkpoint_path, framework="pt", device=args.device
     ) as checkpoint:
         rows = (
@@ -348,6 +364,7 @@ def main() -> int:
             "hip_version": torch.version.hip,
             "device": torch.cuda.get_device_name(device),
             "attention": "explicit-fp32-full-sdpa",
+            "compute_dtype": args.compute_dtype,
             "deterministic_algorithms": True,
             "tf32": False,
         },

@@ -94,7 +94,7 @@ void TestGeometry() {
       {22, 22, 7, 37},
       {39, 39, 12, 65},
       {56, 56, 17, 93},
-      {362, 362, 107, 603},
+      {345, 345, 102, 575},
   };
   for (const Case& expected : cases) {
     const GenerationGeometry geometry = Geometry(256, 256, expected.requested);
@@ -110,7 +110,7 @@ void TestGeometry() {
   CHECK(!ResolveGenerationGeometry(255, 256, 22, &error).has_value());
   CHECK(!ResolveGenerationGeometry(1344, 800, 22, &error).has_value());
   CHECK(!ResolveGenerationGeometry(256, 256, 4, &error).has_value());
-  CHECK(!ResolveGenerationGeometry(256, 256, 363, &error).has_value());
+  CHECK(!ResolveGenerationGeometry(256, 256, 346, &error).has_value());
   CHECK(!ResolveGenerationGeometry(256, 256, std::numeric_limits<int>::max(),
                                    &error)
              .has_value());
@@ -123,9 +123,9 @@ void TestSchedules() {
   };
   constexpr Case cases[] = {
       {4, "dee27052a1aa4aa508a7b81bbe39e6bb4b880dd2d61dd3953380c5d0da3eb686"},
-      {7, "cbd915b9d5fb117e3c35fb1e02771e0fdbe427736726dff0086de229ea01ffc0"},
-      {20, "f78a6b940322389481be761fb2dc503e869573f37c87c75e32e418e42b3b3e39"},
-      {50, "711fc5640698dec50ad677b604bd1cc95dcc3def734e0e7f88967c1d28ca2033"},
+      {7, "51488c2e9779388e9b62aa3e0981bd5d654c38ac1ce5358be5e317fb63213ffc"},
+      {19, "0f71f36f5f3066f0c1aece22ffb9dd2150cc85c3b52d3f15e6a0cec2bd593e9b"},
+      {49, "ddb451d3edad496ef895ce468774632a570434e23be3d7b05a3b326c9090099c"},
   };
   for (const Case& expected : cases) {
     std::string error;
@@ -201,6 +201,40 @@ void TestLayouts() {
     CHECK(layout->segments[2].begin == 80);
     CHECK(layout->segments[2].end == expected.rows);
 
+    const std::size_t video_begin = layout->segments[2].begin;
+    const std::size_t frame_columns =
+        static_cast<std::size_t>(geometry.latent_width / 2);
+    const double expected_step =
+        64.0 / std::sqrt(static_cast<double>(geometry.latent_height) *
+                         geometry.latent_width);
+    const double height_ratio =
+        geometry.latent_height /
+        std::sqrt(static_cast<double>(geometry.latent_height) *
+                  geometry.latent_width);
+    const double width_ratio =
+        geometry.latent_width /
+        std::sqrt(static_cast<double>(geometry.latent_height) *
+                  geometry.latent_width);
+    CHECK(std::abs(layout->positions[video_begin].height -
+                   (1.0 - height_ratio) * 16.0) <
+          1.0e-12);
+    CHECK(std::abs(layout->positions[video_begin].width -
+                   (1.0 - width_ratio) * 16.0) <
+          1.0e-12);
+    CHECK(std::abs(layout->positions[video_begin + 1].width -
+                   layout->positions[video_begin].width - expected_step) <
+          1.0e-12);
+    CHECK(std::abs(layout->positions[video_begin + frame_columns].height -
+                   layout->positions[video_begin].height - expected_step) <
+          1.0e-12);
+    if (expected.pixels == 256) {
+      CHECK(layout->positions[video_begin + 1].width == 4.0);
+      CHECK(layout->positions[video_begin + frame_columns].height == 4.0);
+    } else if (expected.pixels == 512) {
+      CHECK(layout->positions[video_begin + 1].width == 2.0);
+      CHECK(layout->positions[video_begin + frame_columns].height == 2.0);
+    }
+
     if (expected.layout_sha256 != nullptr) {
       const std::string layout_hash = PackedLayoutSha256(*layout);
       if (layout_hash != expected.layout_sha256) {
@@ -256,6 +290,27 @@ void TestLayouts() {
     }
     CHECK(std::abs(temporal_sum - 339.6666666666667) < 1.0e-10);
     CHECK(std::abs(temporal_weighted - 6498.0) < 1.0e-10);
+  }
+
+  auto rectangular =
+      BuildTextOnlyLayout(6, Geometry(1344, 768, 22), &error);
+  CHECK(rectangular.has_value());
+  if (rectangular.has_value()) {
+    const std::size_t begin = rectangular->segments[2].begin;
+    const std::size_t columns =
+        static_cast<std::size_t>(rectangular->latent_width / 2);
+    const double sqrt_area =
+        std::sqrt(static_cast<double>(rectangular->latent_height) *
+                  rectangular->latent_width);
+    const double step = 64.0 / sqrt_area;
+    CHECK(std::abs(rectangular->positions[begin + 1].width -
+                   rectangular->positions[begin].width - step) <
+          1.0e-12);
+    CHECK(std::abs(rectangular->positions[begin + columns].height -
+                   rectangular->positions[begin].height - step) <
+          1.0e-12);
+    CHECK(rectangular->positions[begin].height > 0.0);
+    CHECK(rectangular->positions[begin].width < 0.0);
   }
 
   GenerationGeometry invalid = Geometry(256, 256, 22);
@@ -329,11 +384,15 @@ void TestNoise() {
   const std::size_t video_elements =
       24ULL * geometry.temporal.video_latent_frames * geometry.latent_height *
       geometry.latent_width;
-  const std::size_t audio_elements =
-      32ULL * 2 * geometry.temporal.audio_latent_frames;
+  constexpr int audio_channels = 32;
+  const int audio_time = geometry.temporal.audio_latent_frames;
+  const std::size_t audio_elements = static_cast<std::size_t>(
+      audio_channels * 2 * audio_time);
   std::string error;
-  auto first = BuildInitialNoise(42, video_elements, audio_elements, &error);
-  auto second = BuildInitialNoise(42, video_elements, audio_elements, &error);
+  auto first = BuildInitialNoise(42, video_elements, audio_channels,
+                                 audio_time, &error);
+  auto second = BuildInitialNoise(42, video_elements, audio_channels,
+                                  audio_time, &error);
   CHECK(first.has_value());
   CHECK(second.has_value());
   if (!first.has_value() || !second.has_value()) {
@@ -341,16 +400,29 @@ void TestNoise() {
   }
   CHECK(first->video == second->video);
   CHECK(first->audio == second->audio);
-  CHECK(std::memcmp(first->video.data(), first->audio.data(),
-                    audio_elements * sizeof(float)) == 0);
+  std::vector<float> packed_audio(audio_elements);
+  CHECK(strix::minimax_h3::PackAudio(first->audio, audio_channels, audio_time,
+                                     packed_audio, &error));
+  CHECK(std::memcmp(first->video.data(), packed_audio.data(),
+                    audio_elements * sizeof(float)) != 0);
+  strix::minimax_h3::NormalRng sequential(42);
+  std::vector<float> expected_video(video_elements);
+  std::vector<float> expected_audio_rows(audio_elements);
+  sequential.Fill(expected_video);
+  sequential.Fill(expected_audio_rows);
+  CHECK(first->video == expected_video);
+  CHECK(packed_audio == expected_audio_rows);
   const std::string hash = NoiseSha256(first->video, first->audio);
   constexpr std::string_view expected_hash =
-      "0b9e324f731605e8b6050b2c7cdc46a320b75609c426ea548adb35332204620d";
+      "6318dbfea74c61415d470c12c019cda9df6a8491f86b075e403d1c2fc2403b4d";
   if (hash != expected_hash) {
     std::cerr << "noise 256x256x22 seed42 SHA-256: " << hash << '\n';
   }
   CHECK(hash == expected_hash);
-  CHECK(!BuildInitialNoise(42, 0, audio_elements, &error).has_value());
+  CHECK(!BuildInitialNoise(42, 0, audio_channels, audio_time, &error)
+             .has_value());
+  CHECK(!BuildInitialNoise(42, video_elements, 0, audio_time, &error)
+             .has_value());
 }
 
 void TestReuseAndEulerPlan() {
@@ -395,18 +467,65 @@ void TestReuseAndEulerPlan() {
   CHECK((*plan)[1].previous_evaluated == -1);
   CHECK((*plan)[4].last_evaluated == 3);
   CHECK((*plan)[4].previous_evaluated == 0);
-  for (const auto& step : *plan) {
-    CHECK(step.video_delta > 0.0F);
-    CHECK(step.audio_delta > 0.0F);
+  for (std::size_t index = 0; index < plan->size(); ++index) {
+    const auto& step = (*plan)[index];
+    const float video_timestep = 1.0F - schedule->video[index];
+    const float video_sigma_from_timestep = 1.0F - video_timestep;
+    const float video_ratio =
+        schedule->video[index + 1] / schedule->video[index];
+    const float audio_timestep = 1.0F - schedule->audio[index];
+    const float audio_sigma_from_timestep = 1.0F - audio_timestep;
+    const float audio_ratio =
+        schedule->audio[index + 1] / schedule->audio[index];
+    CHECK(std::bit_cast<std::uint32_t>(step.video_sigma_from_timestep) ==
+          std::bit_cast<std::uint32_t>(video_sigma_from_timestep));
+    CHECK(std::bit_cast<std::uint32_t>(step.audio_sigma_from_timestep) ==
+          std::bit_cast<std::uint32_t>(audio_sigma_from_timestep));
+    CHECK(std::bit_cast<std::uint32_t>(step.video_ratio) ==
+          std::bit_cast<std::uint32_t>(video_ratio));
+    CHECK(std::bit_cast<std::uint32_t>(step.audio_ratio) ==
+          std::bit_cast<std::uint32_t>(audio_ratio));
+    CHECK(step.video_sigma_from_timestep > 0.0F);
+    CHECK(step.audio_sigma_from_timestep > 0.0F);
+    CHECK(step.video_ratio >= 0.0F && step.video_ratio < 1.0F);
+    CHECK(step.audio_ratio >= 0.0F && step.audio_ratio < 1.0F);
     CHECK(step.video_extrapolation >= -2.0F);
     CHECK(step.video_extrapolation <= 2.0F);
     CHECK(step.audio_extrapolation >= -2.0F);
     CHECK(step.audio_extrapolation <= 2.0F);
   }
+  for (const int evaluations : {4, 19, 49}) {
+    auto preset_schedule = BuildServingSchedule(evaluations, &error);
+    CHECK(preset_schedule.has_value());
+    if (!preset_schedule.has_value()) {
+      continue;
+    }
+    auto preset_plan = BuildEulerPlan(*preset_schedule, 1, &error);
+    CHECK(preset_plan.has_value());
+    if (!preset_plan.has_value()) {
+      continue;
+    }
+    for (std::size_t index = 0; index < preset_plan->size(); ++index) {
+      const auto& item = (*preset_plan)[index];
+      const float video_timestep = 1.0F - preset_schedule->video[index];
+      const float audio_timestep = 1.0F - preset_schedule->audio[index];
+      CHECK(std::bit_cast<std::uint32_t>(item.video_sigma_from_timestep) ==
+            std::bit_cast<std::uint32_t>(1.0F - video_timestep));
+      CHECK(std::bit_cast<std::uint32_t>(item.audio_sigma_from_timestep) ==
+            std::bit_cast<std::uint32_t>(1.0F - audio_timestep));
+      CHECK(std::bit_cast<std::uint32_t>(item.video_ratio) ==
+            std::bit_cast<std::uint32_t>(preset_schedule->video[index + 1] /
+                                         preset_schedule->video[index]));
+      CHECK(std::bit_cast<std::uint32_t>(item.audio_ratio) ==
+            std::bit_cast<std::uint32_t>(preset_schedule->audio[index + 1] /
+                                         preset_schedule->audio[index]));
+    }
+  }
 
 #if !defined(ENGINE_ENABLE_HIP)
   CHECK(!strix::minimax_h3::HipEulerUpdate(nullptr, 0, 0, nullptr, nullptr, 0,
-                                           0.25F, 0.0F, nullptr, &error));
+                                           0.25F, 0.5F, 0.0F, nullptr,
+                                           &error));
   CHECK(error.find("ENGINE_ENABLE_HIP") != std::string::npos);
 #endif
 }

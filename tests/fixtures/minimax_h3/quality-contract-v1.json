@@ -53,12 +53,12 @@
       "class": "exact",
       "frames": 22,
       "height": 512,
-      "id": "fox-512x512x22-50",
+      "id": "fox-512x512x22-49",
       "prompt": "A red fox walking through snow",
       "prompt_sha256": "df0ff96bcdb3a350f115cc39daaf0d7523814258890aa90c06fa784e3ad06169",
       "reuse": 1,
       "seed": 42,
-      "steps": 50,
+      "steps": 49,
       "width": 512
     },
     {
@@ -66,12 +66,12 @@
       "class": "independent",
       "frames": 22,
       "height": 512,
-      "id": "mug-512x512x22-50",
+      "id": "mug-512x512x22-49",
       "prompt": "A single ceramic mug on a wooden table, static camera, soft daylight.",
       "prompt_sha256": "5e6eaa98796b071d51290f69446fbf08cd0b3a126fdb56c10f87916a9c4968c8",
       "reuse": 1,
       "seed": 314159,
-      "steps": 50,
+      "steps": 49,
       "width": 512
     }
   ],

@@ -1,7 +1,8 @@
-#include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
 #include <array>
+#include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
@@ -71,17 +72,13 @@ bool CopyToDevice(void* destination, const void* source, std::size_t bytes,
                         stream) == hipSuccess;
 }
 
-bool RunEulerCase(std::array<float, 7>* output) {
+bool RunEulerCase(float sigma_from_timestep, float ratio,
+                  std::array<float, 7>* output) {
   constexpr std::array<float, 7> sample = {-7.0F, -8.0F, 10.0F, 20.0F,
                                            30.0F, 40.0F, -9.0F};
-  constexpr std::array<float, 4> last_values = {1.0F, -2.0F, 0.5F, 4.0F};
-  constexpr std::array<float, 4> previous_values = {0.5F, -1.0F, 0.25F, 5.0F};
-  std::array<hip_bfloat16, 4> last{};
-  std::array<hip_bfloat16, 4> previous{};
-  for (std::size_t index = 0; index < last.size(); ++index) {
-    last[index] = hip_bfloat16(last_values[index]);
-    previous[index] = hip_bfloat16(previous_values[index]);
-  }
+  constexpr std::array<float, 4> last = {1.003F, -2.007F, 0.501F, 4.009F};
+  constexpr std::array<float, 4> previous = {0.499F, -1.011F, 0.249F,
+                                             5.013F};
 
   DeviceBuffer device_sample;
   DeviceBuffer device_last;
@@ -103,7 +100,8 @@ bool RunEulerCase(std::array<float, 7>* output) {
   if (!strix::minimax_h3::HipEulerUpdate(device_sample.data(), sample.size(), 2,
                                          device_last.data(),
                                          device_previous.data(), last.size(),
-                                         0.25F, 0.5F, stream.get(), &error)) {
+                                         sigma_from_timestep, ratio, 0.0F,
+                                         stream.get(), &error)) {
     std::cerr << error << '\n';
     return false;
   }
@@ -111,6 +109,69 @@ bool RunEulerCase(std::array<float, 7>* output) {
                      hipMemcpyDeviceToHost, stream.get()) != hipSuccess ||
       hipStreamSynchronize(stream.get()) != hipSuccess) {
     return false;
+  }
+  return true;
+}
+
+bool RunEulerTrajectory(
+    bool video,
+    const std::array<std::array<std::uint32_t, 4>, 4>& expected_bits) {
+  constexpr std::array<float, 4> initial = {0.125F, -1.5F, 3.25F, 7.0F};
+  constexpr std::array<std::array<float, 4>, 4> velocities = {{
+      {0.75F, -0.5F, 1.25F, -2.0F},
+      {-0.25F, 0.625F, -1.5F, 0.75F},
+      {1.125F, -0.875F, 0.5F, -0.375F},
+      {-0.625F, 1.75F, -0.125F, 0.5F},
+  }};
+  std::string error;
+  auto schedule = strix::minimax_h3::BuildServingSchedule(4, &error);
+  auto plan = schedule.has_value()
+                  ? strix::minimax_h3::BuildEulerPlan(*schedule, 1, &error)
+                  : std::nullopt;
+  if (!plan.has_value()) {
+    std::cerr << error << '\n';
+    return false;
+  }
+
+  DeviceBuffer device_sample;
+  DeviceBuffer device_velocity;
+  Stream stream;
+  if (!device_sample.Allocate(sizeof(initial)) ||
+      !device_velocity.Allocate(sizeof(initial)) || !stream.Create() ||
+      !CopyToDevice(device_sample.data(), initial.data(), sizeof(initial),
+                    stream.get())) {
+    return false;
+  }
+  std::array<float, 4> output{};
+  for (std::size_t step = 0; step < velocities.size(); ++step) {
+    const auto& item = (*plan)[step];
+    if (!CopyToDevice(device_velocity.data(), velocities[step].data(),
+                      sizeof(velocities[step]), stream.get()) ||
+        !strix::minimax_h3::HipEulerUpdate(
+            device_sample.data(), initial.size(), 0, device_velocity.data(),
+            device_velocity.data(), initial.size(),
+            video ? item.video_sigma_from_timestep
+                  : item.audio_sigma_from_timestep,
+            video ? item.video_ratio : item.audio_ratio, 0.0F, stream.get(),
+            &error) ||
+        hipMemcpyAsync(output.data(), device_sample.data(), sizeof(output),
+                       hipMemcpyDeviceToHost, stream.get()) != hipSuccess ||
+        hipStreamSynchronize(stream.get()) != hipSuccess) {
+      std::cerr << error << '\n';
+      return false;
+    }
+    for (std::size_t index = 0; index < output.size(); ++index) {
+      if (std::bit_cast<std::uint32_t>(output[index]) !=
+          expected_bits[step][index]) {
+        std::cerr << "MiniMax H3 " << (video ? "video" : "audio")
+                  << " trajectory differs from Diffusers at step " << step
+                  << ", element " << index << ": got 0x" << std::hex
+                  << std::bit_cast<std::uint32_t>(output[index])
+                  << ", expected 0x" << expected_bits[step][index] << std::dec
+                  << '\n';
+        return false;
+      }
+    }
   }
   return true;
 }
@@ -124,18 +185,46 @@ int main() {
   }
   std::array<float, 7> first{};
   std::array<float, 7> second{};
-  if (!RunEulerCase(&first) || !RunEulerCase(&second)) {
+  constexpr float kSigmaFromTimestep = 0.8648648858070374F;
+  constexpr float kRatio = 0.9765625F;
+  if (!RunEulerCase(kSigmaFromTimestep, kRatio, &first) ||
+      !RunEulerCase(kSigmaFromTimestep, kRatio, &second)) {
     std::cerr << "MiniMax H3 HIP Euler execution failed\n";
     return 1;
   }
-  constexpr std::array<float, 7> expected = {
-      -7.0F, -8.0F, 10.3125F, 19.375F, 30.15625F, 40.875F, -9.0F};
-  if (std::memcmp(first.data(), expected.data(), sizeof(expected)) != 0) {
-    std::cerr << "MiniMax H3 HIP Euler output differs from the pinned oracle\n";
-    return 1;
+  constexpr std::array<std::uint32_t, 7> expected_bits = {
+      0xc0e00000U, 0xc1000000U, 0x41205347U, 0x419facafU,
+      0x41f014ccU, 0x42205337U, 0xc1100000U};
+  for (std::size_t index = 0; index < first.size(); ++index) {
+    if (std::bit_cast<std::uint32_t>(first[index]) != expected_bits[index]) {
+      std::cerr << "MiniMax H3 HIP Euler output differs from the Diffusers "
+                   "float32 oracle at "
+                << index << ": got 0x" << std::hex
+                << std::bit_cast<std::uint32_t>(first[index])
+                << ", expected 0x" << expected_bits[index] << std::dec << '\n';
+      return 1;
+    }
   }
   if (std::memcmp(first.data(), second.data(), sizeof(first)) != 0) {
     std::cerr << "MiniMax H3 HIP Euler output is not byte stable\n";
+    return 1;
+  }
+  constexpr std::array<std::array<std::uint32_t, 4>, 4>
+      video_trajectory_bits = {{
+          {0x3e14c1baU, 0xbfc1bad0U, 0x40522984U, 0x40de4531U},
+          {0x3e07fbbdU, 0xbfbdbcf1U, 0x404d5f46U, 0x40df77c1U},
+          {0x3e8ae24dU, 0xbfcb85ceU, 0x40514f85U, 0x40ddfdaaU},
+          {0xbe6a3b66U, 0xbe4294d8U, 0x404ae91fU, 0x40eaca77U},
+      }};
+  constexpr std::array<std::array<std::uint32_t, 4>, 4>
+      audio_trajectory_bits = {{
+          {0x3e4cccceU, 0xbfc66666U, 0x40580000U, 0x40d99999U},
+          {0x3e266668U, 0xbfba6667U, 0x4049999aU, 0x40dd3332U},
+          {0x3ee33333U, 0xbfd66668U, 0x4051999aU, 0x40da3332U},
+          {0x3e066666U, 0xbf4cccd0U, 0x404d999aU, 0x40e23332U},
+      }};
+  if (!RunEulerTrajectory(true, video_trajectory_bits) ||
+      !RunEulerTrajectory(false, audio_trajectory_bits)) {
     return 1;
   }
   std::string error;
@@ -143,13 +232,13 @@ int main() {
       reinterpret_cast<void*>(std::uintptr_t{1});
   if (strix::minimax_h3::HipEulerUpdate(
           invalid_device_pointer, 1, 0, invalid_device_pointer,
-          invalid_device_pointer, 1, 0.0F, 0.0F, nullptr, &error)) {
-    std::cerr << "MiniMax H3 HIP Euler accepted a zero-delta step\n";
+          invalid_device_pointer, 1, 0.0F, 0.5F, 0.0F, nullptr, &error)) {
+    std::cerr << "MiniMax H3 HIP Euler accepted a zero-sigma step\n";
     return 1;
   }
   if (strix::minimax_h3::HipEulerUpdate(
           invalid_device_pointer, 1, 1, invalid_device_pointer,
-          invalid_device_pointer, 1, 0.25F, 0.0F, nullptr, &error)) {
+          invalid_device_pointer, 1, 0.25F, 0.5F, 0.0F, nullptr, &error)) {
     std::cerr << "MiniMax H3 HIP Euler accepted an out-of-bounds range\n";
     return 1;
   }

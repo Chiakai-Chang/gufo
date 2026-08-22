@@ -49,6 +49,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--frames", type=int, default=22)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--forward-only",
+        action="store_true",
+        help=(
+            "execute and retain only the first complete transformer forward; "
+            "do not advance the denoising schedule"
+        ),
+    )
+    parser.add_argument(
         "--text-rows",
         type=int,
         default=0,
@@ -228,9 +236,10 @@ def time_embedding(
         checkpoint.tensor("time_embedder.proj_out.weight"),
         checkpoint.tensor("time_embedder.proj_out.bias"),
     )
-    return functional.silu(projected.to(torch.bfloat16).float()).to(
-        torch.bfloat16
-    )
+    # The timestep MLP is F32. AdaLN applies SiLU before casting its input to
+    # the BF16 modulation projection; casting first coherently biases every
+    # block at every denoising evaluation.
+    return functional.silu(projected).to(torch.bfloat16)
 
 
 def modulation(
@@ -307,8 +316,16 @@ def production_positions(spec: dict[str, int]) -> torch.Tensor:
     positions: list[tuple[float, float, float]] = [
         (float(row), 0.0, 0.0) for row in range(spec["text_rows"])
     ]
+    sqrt_area = math.sqrt(spec["latent_height"] * spec["latent_width"])
+    height_ratio = spec["latent_height"] / sqrt_area
+    width_ratio = spec["latent_width"] / sqrt_area
+    height_left = (1.0 - height_ratio) / 2.0
+    width_left = (1.0 - width_ratio) / 2.0
     spatial = [
-        (row * 32.0 / frame_rows, column * 32.0 / frame_columns)
+        (
+            (height_left + row * height_ratio / frame_rows) * 32.0,
+            (width_left + column * width_ratio / frame_columns) * 32.0,
+        )
         for row in range(frame_rows)
         for column in range(frame_columns)
     ]
@@ -420,12 +437,19 @@ def initial_latents(
     )
     audio_count = 32 * 2 * spec["audio_latent_frames"]
     if mode == "seeded":
+        rng = NormalRng(seed)
         video = torch.from_numpy(
-            numpy.asarray(NormalRng(seed).fill(video_count), dtype="<f4")
+            numpy.asarray(rng.fill(video_count), dtype="<f4")
         ).to(device)
-        audio = torch.from_numpy(
-            numpy.asarray(NormalRng(seed).fill(audio_count), dtype="<f4")
+        audio_rows = torch.from_numpy(
+            numpy.asarray(rng.fill(audio_count), dtype="<f4")
         ).to(device)
+        audio = (
+            audio_rows.view(2, spec["audio_latent_frames"], AUDIO_WIDTH)
+            .permute(2, 0, 1)
+            .contiguous()
+            .view(-1)
+        )
         return video, audio
     video_index = torch.arange(video_count, dtype=torch.float32, device=device)
     audio_index = torch.arange(audio_count, dtype=torch.float32, device=device)
@@ -496,6 +520,11 @@ def unpack_audio(rows: torch.Tensor, spec: dict[str, int]) -> torch.Tensor:
 
 def main() -> int:
     args = parse_args()
+    if not args.forward_only:
+        raise ValueError(
+            "MiniMax H3 development teachers require --forward-only; "
+            "multi-step model execution is intentionally disabled"
+        )
     if args.steps < 2 or args.seed < 0 or args.seed > (1 << 64) - 1:
         raise ValueError("invalid MiniMax H3 teacher steps or seed")
     conditioning_bytes = args.conditioning.stat().st_size
@@ -563,10 +592,11 @@ def main() -> int:
         first_audio_velocity = None
         text_end = spec["text_rows"]
         audio_end = text_end + spec["audio_rows"]
-        for step in range(args.steps):
+        executed_forwards = 1
+        for step in range(executed_forwards):
             step_started = time.monotonic()
             print(
-                f"H3 denoiser teacher step {step + 1}/{args.steps} "
+                f"H3 denoiser teacher forward {step + 1}/{executed_forwards} "
                 f"rows={spec['rows']}",
                 flush=True,
             )
@@ -641,14 +671,8 @@ def main() -> int:
             if step == 0:
                 first_video_velocity = video_velocity.clone()
                 first_audio_velocity = audio_velocity.clone()
-            video_rows = video_rows + (
-                video_sigma[step] - video_sigma[step + 1]
-            ).to(device) * video_velocity.to(torch.bfloat16).float()
-            audio_rows = audio_rows + (
-                audio_sigma[step] - audio_sigma[step + 1]
-            ).to(device) * audio_velocity.to(torch.bfloat16).float()
             print(
-                f"H3 denoiser teacher step {step + 1}/{args.steps} "
+                f"H3 denoiser teacher forward {step + 1}/{executed_forwards} "
                 f"completed in {time.monotonic() - step_started:.3f}s",
                 flush=True,
             )
@@ -668,8 +692,6 @@ def main() -> int:
             unpack_audio(first_audio_velocity, spec),
             "F32",
         ),
-        "video_final.f32": (unpatch_video(video_rows, spec), "F32"),
-        "audio_final.f32": (unpack_audio(audio_rows, spec), "F32"),
         "row_map_step0.u32": (
             row_map(0, video_time_rows, audio_time_rows, spec, device),
             "U32",
@@ -696,8 +718,11 @@ def main() -> int:
             **spec,
         },
         "steps": args.steps,
+        "executed_forwards": executed_forwards,
+        "forward_only": True,
         "blocks": BLOCKS,
         "reuse_interval": 1,
+        "spatial_rope_scale": 1.0,
         "seed": args.seed if args.noise_mode == "seeded" else None,
         "noise_mode": args.noise_mode,
         "time_rows": len(times),
@@ -706,7 +731,7 @@ def main() -> int:
             "activations": "BF16 at transformer operation boundaries",
             "attention_accumulation": "FP32",
             "final_head_accumulation": "FP32",
-            "euler_velocity": "BF16",
+            "euler_velocity": "FP32",
         },
         "files": files,
         "elapsed_seconds": time.monotonic() - started,

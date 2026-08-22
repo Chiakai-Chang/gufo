@@ -59,7 +59,7 @@ diagnostic mode: it succeeded on the target and avoids the 605 MB device copy,
 but its cold load was sensitive to page residency.
 
 Issue #175 revisits this default through short production-shape numerical
-oracles and focused phase/kernel profiles. A complete 50-step video is not a
+oracles and focused phase/kernel profiles. A complete exact video is not a
 development benchmark. Metadata or load-only measurements remain scoped to
 their phase and are not complete-route performance claims.
 
@@ -77,13 +77,11 @@ For the six-token fox prompt on the same gfx1151 host:
 | Run | Layers | Wall time | Peak device bytes | Dispatches |
 | --- | ---: | ---: | ---: | ---: |
 | first boundary bring-up | 1 | 1.37 s | 1.45 GiB | 17 |
-| first complete run | 50 | 21.80 s | 1.88 GiB | 850 |
-| warmer complete run with oracle | 50 | 15.06 s | 1.88 GiB | 850 |
-| fully warm repeated validation | 50 | 5.83 s | 1.88 GiB | 850 |
+| current complete oracle invocation | 50 | 21.38 s | 1.88 GiB | 850 |
 
 Layer 1 and layer 50 were byte-identical to independent Transformers BF16
-oracles. The repeated complete execution retained stable output bytes and
-dispatch count, with zero registered host bytes after return.
+oracles. The current complete invocation left zero registered host bytes after
+return. Routine quality validation does not repeat this 50-layer phase.
 
 ## Full BF16 Denoiser Measurement
 
@@ -95,23 +93,18 @@ AdaLN/time weights are never admitted as a 24.35 GiB phase. The runtime keeps
 the small timestep embedding, then loads one block's 96,768x2,688 projection
 and bias, materializes all required schedule rows, transfers those constants
 into the matching core session, and releases the projection before proceeding.
-All 50 BF16 core blocks remain resident for repeated denoiser evaluations.
+All 50 BF16 core blocks remain resident for successive denoiser evaluations.
 
-For the six-token fox prompt, 256x256x22 geometry, and four evaluations:
+Current cross-block validation executes one forward only:
 
-| Measurement | Observed |
-| --- | ---: |
-| text refiner | 0.73–0.78 s |
-| AdaLN precompute | 7.30–9.02 s |
-| core load and deterministic setup | 8.65–12.66 s |
-| first 528-row full forward | 17.3–17.7 s |
-| four-step denoise | 67.4 s |
-| accounted peak live bytes | 42.41 GiB |
-| process swap | 0 bytes |
+| Geometry | Rows | AdaLN | Core load | Forward | Peak | Swap |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256x256x22 | 528 | 11.127 s | 21.981 s | 12.275 s | 42.50 GiB | 0 |
+| 512x512x22 | 1,872 | 5.839 s | 25.736 s | 57.265 s | 59.90 GiB | 0 |
 
 Each one-block session releases its 16 MiB pinned loader staging and its GEMM
-repeat-validation buffer before publication. Retaining either across 50
-blocks would waste substantial memory without benefiting timed execution.
+validation buffer before publication. Retaining either across 50 blocks would
+waste substantial memory without benefiting timed execution.
 
 The exact route currently uses preallocated host BF16 buffers to cross the 50
 independent block streams. No host tensor arithmetic is performed. This
@@ -120,13 +113,21 @@ failure cleanup explicit; issue #175 may replace it only after an end-to-end
 profile and unchanged quality evidence.
 
 The text-to-video serving presets retain the same phase ordering. `exact`
-keeps 50 blocks and 50 fresh evaluations. `fast` keeps 45 blocks and evaluates
-the 20-step schedule at reuse interval 2. `aggressive` keeps 40 blocks and
-uses interval 3. Reuse adds only one previous BF16 video velocity buffer and
-one previous BF16 audio velocity buffer; it does not retain another core or
-decoder phase. Complete exact observations belong here only after an
-explicitly requested release validation. They are not required for normal
-development iterations.
+keeps 50 blocks and performs 49 fresh evaluations over Diffusers' 50 sigma
+points including terminal zero. `fast` keeps 45 blocks and performs 19
+evaluations over 20 points at reuse interval 2. `aggressive` keeps 40 blocks
+and uses 19 evaluations with interval 3. The thinned routes score every
+candidate block's schedule-dependent AdaLN gates, protect blocks 0, 1, and 49,
+and retain the 45 or 40 highest-value blocks in original execution order.
+These are Diffusers-schedule serving modes with h3.c-inspired thinning and
+reuse; they are not exact reproductions of h3.c's 20-transition presets.
+For normal 19-evaluation schedules, at most 512 MiB of temporary host
+modulation data is retained to avoid recomputing selected projections; larger
+custom schedules use a bounded two-pass path. Reuse adds only one previous F32
+video velocity buffer and one previous F32 audio velocity buffer; it does not
+retain another core or decoder phase. Complete exact observations belong here
+only after an explicitly requested release validation. They are not required
+for normal development iterations.
 
 ## Rapid Diagnostic Route
 
@@ -169,7 +170,7 @@ Development evidence retains:
 - independent teacher/native retained-boundary errors at 528 rows.
 
 Each required diagnostic is invoked once. A passing full route is not rerun,
-and a 50-step generation is never launched merely to obtain performance
+and a full exact generation is never launched merely to obtain performance
 statistics.
 
 The original one-block profile identified dense attention as the actual
@@ -273,4 +274,4 @@ telemetry. The scalar implementation remains available through the explicit
 - Analytic gfx1151 tests cover RMSNorm, per-head Q/K normalization, RoPE,
   causal GQA, residual add, and SwiGLU.
 - External prompt tests cover selected and final layer boundaries, non-finite
-  rejection, stable repeated bytes/dispatches, and registered-page cleanup.
+  rejection, exact teacher bytes/dispatches, and registered-page cleanup.

@@ -24,7 +24,8 @@ void TestPresets() {
   Expect(options->request.parameters.internal_width == 384,
          "fast internal width");
   Expect(options->request.parameters.output_width == 512, "fast output width");
-  Expect(options->request.parameters.evaluations == 20, "fast steps");
+  Expect(options->request.parameters.evaluations == 19,
+         "fast denoiser evaluations");
   Expect(options->request.parameters.active_blocks == 45, "fast blocks");
   Expect(options->request.parameters.reuse_interval == 2, "fast reuse");
   const std::string parameters = strix::minimax_h3::GenerationParametersJson(

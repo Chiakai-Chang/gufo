@@ -7,7 +7,6 @@ namespace strix::minimax_h3 {
 namespace {
 
 constexpr int kMinimumTilePixels = 256;
-constexpr int kMaximumTilePixels = 320;
 constexpr int kTileOverlapMinimum = 64;
 constexpr int kSuffixRows = 5;
 
@@ -26,24 +25,6 @@ int TileCountForExtent(int extent, int tile_pixels) {
     ++count;
   }
   return count;
-}
-
-int SelectTilePixels(int pixel_height, int pixel_width) {
-  int best = kMinimumTilePixels;
-  std::uint64_t best_score = std::numeric_limits<std::uint64_t>::max();
-  for (int pixels = kMinimumTilePixels; pixels <= kMaximumTilePixels;
-       pixels += kH3VideoVaeSpatialRatio) {
-    const std::uint64_t tiles =
-        static_cast<std::uint64_t>(TileCountForExtent(pixel_height, pixels)) *
-        static_cast<std::uint64_t>(TileCountForExtent(pixel_width, pixels));
-    const std::uint64_t score = tiles * static_cast<std::uint64_t>(pixels) *
-                                static_cast<std::uint64_t>(pixels);
-    if (score < best_score) {
-      best = pixels;
-      best_score = score;
-    }
-  }
-  return best;
 }
 
 bool BuildTileAxis(int extent, int tile_pixels, VideoVaeTileAxis* axis,
@@ -104,7 +85,11 @@ std::optional<VideoVaePlan> ResolveVideoVaePlan(
              "MiniMax H3 VisualVAE temporal geometry differs from output");
     return std::nullopt;
   }
-  plan.tile_pixels = SelectTilePixels(geometry.height, geometry.width);
+  // The released Diffusers VisualVAE enables spatial tiling by default with a
+  // fixed 256-pixel tile. Tile geometry changes the decoder's attention
+  // context and therefore its pixels, so it is part of the quality contract
+  // rather than an allocator heuristic.
+  plan.tile_pixels = kMinimumTilePixels;
   if (!BuildTileAxis(geometry.height, plan.tile_pixels, &plan.y_axis, error) ||
       !BuildTileAxis(geometry.width, plan.tile_pixels, &plan.x_axis, error)) {
     return std::nullopt;

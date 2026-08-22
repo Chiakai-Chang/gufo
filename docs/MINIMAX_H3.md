@@ -106,7 +106,7 @@ The raw BF16 oracle and metadata remain outside Git.
 
 The initial FL2VA sampler boundary is model-private and text-only. It accepts
 checked 32-pixel canvas multiples within the released 768x1344 pixel-area
-limit, aligns requests to `5 + 17*n` frames through the 362-frame ceiling, and
+limit, aligns requests to `5 + 17*n` frames through the 345-frame ceiling, and
 derives the separate video and audio latent timelines at 24 fps.
 
 Before any large DiT allocation, the host planner freezes:
@@ -115,15 +115,24 @@ Before any large DiT allocation, the host planner freezes:
 - three-dimensional MM-RoPE coordinates and per-step AdaLN row maps;
 - 2x2 visual patch order and stereo audio row order;
 - independent video/audio shifted sigma grids with terminal zero;
-- independent PCG/Box-Muller generators initialized from the same request
-  seed;
+- one request PCG/Box-Muller stream, consumed by video first and then packed
+  channel-major audio before the audio layout is unpacked;
 - denoiser evaluation selection and bounded linear velocity extrapolation.
 
 This is host planning and input construction, not a CPU tensor-inference
 fallback. Euler sample state remains F32 in gfx1151 device memory. The HIP
-kernel reads the most recent and previous BF16 DiT velocities, applies the
-frozen extrapolation ratio, and updates only the requested device range with
-the same fused arithmetic as the pinned h3.c boundary.
+kernel reads the most recent and previous F32 DiT velocities, applies the
+frozen extrapolation ratio, and updates only the requested device range. Its
+velocity coefficient reconstructs sigma from the float32 model timestep while
+the Euler blend ratio uses the original sigma grid, matching the two-source
+Diffusers arithmetic instead of collapsing it to `sigma - sigma_next`.
+Keeping the final-head velocity in F32 matches the Diffusers Euler boundary
+and avoids a quality-changing BF16 round trip.
+
+The public API counts denoiser evaluations. Diffusers' nominal
+`num_inference_steps=50` schedule contains 50 sigma points including terminal
+zero and therefore executes 49 model forwards. The `exact` preset consequently
+uses 49 evaluations; the 20-point fast and aggressive schedules use 19.
 
 First/last-frame conditioning and ordered Ref2VA inputs are deliberately not
 accepted by this text-only layout API; their row kinds remain future work.
@@ -161,7 +170,7 @@ The independent oracle is generated outside production:
 ```sh
 nix develop -c python3 tools/strix/h3_dit_golden.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
-  --output /var/llms/huggingface/strix-h3-oracles/dit-block0-528-v1
+  --output /var/llms/huggingface/strix-h3-oracles/dit-block0-528-v2
 ```
 
 Run the analytic and external-model gates:
@@ -170,8 +179,8 @@ Run the analytic and external-model gates:
 ./build-h3-173/minimax_h3_dit_hip_test --analytic
 
 STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
-STRIX_H3_DIT_GOLDEN=/var/llms/huggingface/strix-h3-oracles/dit-block0-528-v1 \
-  ./build-h3-173/minimax_h3_dit_hip_test --real
+STRIX_H3_DIT_GOLDEN=/var/llms/huggingface/strix-h3-oracles/dit-block0-528-v2 \
+  ./build/hardware-test/minimax_h3_dit_hip_test --real
 ```
 
 Sparse attention, token reduction, cross-block fusion, reuse, layer thinning,
@@ -211,17 +220,26 @@ A fresh forward:
 - executes all 50 blocks with full attention and the released modality row
   maps;
 - applies final audio/video AdaLN and F32 output heads;
-- retains F32 velocities for diagnostics and BF16 velocity boundaries for the
-  device Euler update.
+- retains F32 velocity boundaries for diagnostics, reuse, extrapolation, and
+  the device Euler update.
 
 The quality baseline uses all 50 blocks and one fresh evaluation per schedule
-step. The serving API also accepts an explicit active block prefix and
-whole-denoiser reuse interval. Skipped evaluations reuse the latest two BF16
-velocity boundaries with the frozen bounded extrapolation plan; the first and
-last schedule steps are always evaluated. Sparse attention, token reduction,
-core-residual reuse, and quantization remain disabled.
+step. When fewer blocks are requested, the runtime scores AdaLN gate slots 2
+and 5 over every timestep row and modality, protects blocks 0, 1, and 49, and
+skips the lowest-scoring remaining blocks exactly as h3.c does. Selected
+blocks still execute in original residual-stream order. The serving API also
+accepts a whole-denoiser reuse interval. Skipped evaluations reuse the latest
+two F32 velocity boundaries with the frozen bounded extrapolation plan; the
+first and last schedule steps are always evaluated. Sparse attention, token
+reduction, core-residual reuse, and quantization remain disabled.
 
-Generate the independent four-step 256x256 teacher outside the repository:
+Preset authority is explicit: `exact` is the released Diffusers 50-point,
+49-evaluation BF16 route. `fast` and `aggressive` retain Diffusers' 20-point,
+19-evaluation grid and borrow only h3.c's gate ranking and velocity-reuse
+ideas. They are native serving modes, not exact reproductions of h3.c's
+20-transition schedules.
+
+Generate the independent single-forward 256x256 teacher outside the repository:
 
 ```sh
 nix develop -c python3 tools/strix/h3_denoiser_golden.py \
@@ -229,22 +247,24 @@ nix develop -c python3 tools/strix/h3_denoiser_golden.py \
   --conditioning /var/llms/huggingface/strix-h3-oracles/\
 fox-layer50-transformers.bf16 \
   --output /var/llms/huggingface/strix-h3-oracles/\
-denoiser-256x256x22-4step-v1
+denoiser-256x256x22-forward-v2 \
+  --noise-mode seeded --forward-only
 ```
 
-Run the rapid 256x256 quality gate:
+Run one complete 256x256 transformer forward, without advancing the sampler or
+decoding either VAE:
 
 ```sh
 STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
 STRIX_H3_DENOISER_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
-denoiser-256x256x22-4step-v1 \
-  ./build-h3-173/minimax_h3_denoiser_hip_test --oracle
+denoiser-256x256x22-forward-v2 \
+  ./build/hardware-test/minimax_h3_denoiser_hip_test --oracle-forward
 ```
 
 Production-shape development coverage uses the real 512x512, 22-frame,
-1,872-row layout but only two denoising evaluations. This catches
-shape-dependent attention, patch-layout, and sampler errors without spending
-hours producing a delivery video:
+1,872-row layout but executes only the first complete 50-block forward. This
+catches shape-dependent attention, patch-layout, and output-head errors without
+advancing the sampler, invoking a VAE, or producing a video:
 
 ```sh
 nix develop -c python3 tools/strix/h3_denoiser_golden.py \
@@ -252,18 +272,22 @@ nix develop -c python3 tools/strix/h3_denoiser_golden.py \
   --conditioning /var/llms/huggingface/strix-h3-oracles/\
 fox-layer50-transformers.bf16 \
   --output /var/llms/huggingface/strix-h3-oracles/\
-denoiser-512x512x22-2step-v1 \
-  --width 512 --height 512 --steps 2 --noise-mode seeded
+denoiser-512x512x22-forward-v2 \
+  --width 512 --height 512 --steps 2 --noise-mode seeded --forward-only
 
 STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
 STRIX_H3_DENOISER_GOLDEN_512=/var/llms/huggingface/strix-h3-oracles/\
-denoiser-512x512x22-2step-v1 \
-  ./build-h3-175/minimax_h3_denoiser_hip_test --oracle-512
+denoiser-512x512x22-forward-v2 \
+  ./build/hardware-test/minimax_h3_denoiser_hip_test --oracle-512-forward
 ```
 
-There is deliberately no 50-step development test. The `exact` preset remains
+There is deliberately no full-schedule development test. The `exact` preset remains
 available to end users and for rare, explicitly requested release validation,
-but ordinary implementation, profiling, and CI use short component oracles.
+but ordinary implementation, profiling, and CI use operator or single-block
+oracles. A complete one-forward oracle is reserved for changes that cross block
+boundaries. One deliberately short selected-frame decode may be used once as a
+visual smoke test after such a change passes parity; it is not a routine
+development gate.
 
 ## VisualVAE and AudioVAE Output Phases
 
@@ -273,7 +297,7 @@ weight inventories, and expose cancellation and memory telemetry separately
 from the denoiser.
 
 `VideoVaeDecoder` keeps the released F32 transformer arithmetic on gfx1151.
-It chooses deterministic 256–320 pixel tiles with at least 64 pixels of
+It uses the released fixed 256-pixel spatial tiles with at least 64 pixels of
 overlap, decodes legal seven-latent temporal chunks into 22-frame windows, and
 blends the released five-latent/17-frame stride. The selected-frame API still
 runs every complete model chunk needed by the requested global frame indexes;
@@ -293,8 +317,14 @@ video-vae-256x256x22-v1
 STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
 STRIX_H3_VIDEO_VAE_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
 video-vae-256x256x22-v1 \
-  ./build-h3-173/minimax_h3_video_vae_hip_test
+  ./build/hardware-test/minimax_h3_video_vae_hip_test
 ```
+
+The native development gate invokes `DecodeSelected` once for frames 0, 5,
+11, 16, and 21. It does not run an additional complete-frame decode or a
+repeatability pass. The selected path still executes the complete released
+model chunk required by those frames, so it validates the same decoder
+arithmetic and fixed 256-pixel tile context.
 
 `AudioVaeDecoder` accepts channel-major normalized F32 `[32,2,T]` audio
 latents and returns channel-major F32 `[2,T*800]` PCM at 32 kHz. The native
@@ -324,8 +354,12 @@ audio-vae-256x256x22-v1
 STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
 STRIX_H3_AUDIO_VAE_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
 audio-vae-256x256x22-v1 \
-  ./build-h3-173/minimax_h3_audio_vae_hip_test --real
+  ./build/hardware-test/minimax_h3_audio_vae_hip_test --real
 ```
+
+The real AudioVAE gate performs one decode and compares both the waveform and
+deterministic spectrogram. It does not repeat the waveform for statistical or
+byte-repeat evidence.
 
 The MP4 writer sends RGB24 and channel-major PCM to FFmpeg through two
 concurrent nonblocking pipes. Audio interleaving uses a bounded 4,096-sample
@@ -336,6 +370,8 @@ FFprobe validates codec, dimensions, 24 fps, stereo 32 kHz audio, duration,
 and start-time synchronization. When internal and output canvases differ,
 FFmpeg performs an explicit Lanczos scale before H.264 encoding. Media tools
 are runtime infrastructure only, not a CPU inference fallback.
+F32 RGB is quantized with explicit round-to-nearest, ties-to-even semantics,
+matching Diffusers' NumPy conversion and h3.c's `lrintf` behavior.
 
 ## Text-to-Video CLI and Frozen Presets
 
@@ -349,16 +385,18 @@ model-inference fallback.
 The named preset contract is versioned as
 `strix.minimax-h3-text-generation.v1`:
 
-| Preset | Internal canvas | Output canvas | Steps | Active blocks | Denoiser reuse |
+| Preset | Internal canvas | Output canvas | Sigma points / evaluations | Active blocks | Denoiser reuse |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `exact` | 512x512 | 512x512 | 50 | 50 | 1 |
-| `fast` | 384x384 | 512x512 | 20 | 45 | 2 |
-| `aggressive` | 320x320 | 512x512 | 20 | 40 | 3 |
-| `dev` | 256x256 | selected 256x256 frames | 4 | 50 | 1 |
+| `exact` | 512x512 | 512x512 | 50 / 49 | 50 | 1 |
+| `fast` | 384x384 | 512x512 | 20 / 19 | 45 | 2 |
+| `aggressive` | 320x320 | 512x512 | 20 / 19 | 40 | 3 |
+| `dev` | 256x256 | selected 256x256 frames | 5 / 4 | 50 | 1 |
 
 Token reduction is false in every preset. The development preset decodes only
 frames 0, 11, and 21 and skips AudioVAE and muxing, so numerical work can
 iterate without waiting for a complete video.
+The 45- and 40-block presets use schedule-dependent AdaLN gate ranking, not a
+prefix of the first 45 or 40 transformer blocks.
 
 Rapid development example:
 
@@ -476,7 +514,7 @@ first/last-frame conditioning milestone lands.
 Exact, fast, and aggressive deliberately support one-second, 22-frame,
 512x512 audiovisual MP4 files only. The development alias requires
 `size: "256x256"` and `output_format: "ppm"`; it accepts a released
-VisualVAE-decodable frame count through `strix.frames` (`22, 39, ... 362`) and
+VisualVAE-decodable frame count through `strix.frames` (`22, 39, ... 345`) and
 exactly one diagnostic frame through `strix.selected_frame`. Although the
 denoiser geometry can represent five frames, the released VisualVAE's minimum
 valid temporal chunk is seven latents and 22 output frames. The development
@@ -484,6 +522,12 @@ path therefore preserves the real 22-frame latent window while decoding and
 reading back only the requested preview frame. First-frame, last-frame,
 image-reference, and ordered-reference fields fail closed until their
 conditioning milestones land.
+
+The 22-frame route is a Strix development/serving extension for rapid
+iteration. The released Diffusers production pipeline admits aligned
+durations from 5 through 15 seconds; matching that production-duration
+envelope is tracked separately and does not remove the short native diagnostic
+route.
 
 One worker owns the H3 generation path and one additional request may wait in
 the bounded queue. Further admissions return HTTP 429 with `Retry-After`.
@@ -505,7 +549,7 @@ It is a manual release tool, not a development or CI gate. Development
 optimization uses one independently frozen 528-row DiT block oracle for
 correctness and one 1,872-row DiT block for performance and profiling. Neither
 iteration gate runs all 50 blocks or advances a denoising schedule. A complete
-50-step generation is run only when explicitly requested after those gates
+exact generation is run only when explicitly requested after those gates
 pass.
 
 The issue #175 performance workload is a manual single-block profile, not a
@@ -644,9 +688,11 @@ field changes granularity. Both issue #175 generations use the default
 During development, a kernel or residency candidate is retained only when it
 passes the independent single-block oracle, the frozen preset contracts, and
 a single production-shape block profile showing useful work. A short
-multi-step latent gate is reserved for integration changes that cross the
-block, sampler, or schedule boundary; it is not rerun for an attention-kernel
-iteration. Fast and aggressive do not add full benchmark videos.
+sampler analytic gate is used for integration changes that cross the sampler
+or schedule boundary; a block-stack change uses one complete forward and does
+not advance the denoising schedule. Neither gate is rerun for an
+attention-kernel iteration. Fast and aggressive do not add full benchmark
+videos.
 Byte-identical complete MP4 comparison is reserved for an explicitly requested
 release validation, not every implementation iteration.
 

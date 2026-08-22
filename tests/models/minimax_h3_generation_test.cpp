@@ -1,5 +1,9 @@
 #include <unistd.h>
 
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -28,6 +32,72 @@ void Check(bool condition, const std::string& message) {
   }
 }
 
+std::uint16_t ToBf16(float value) {
+  std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+  bits += 0x7FFFU + ((bits >> 16U) & 1U);
+  return static_cast<std::uint16_t>(bits >> 16U);
+}
+
+void TestGateRankedBlocks() {
+  constexpr std::size_t kRows = 1;
+  constexpr std::size_t kModalities = 3;
+  constexpr std::size_t kSlots = 6;
+  constexpr std::size_t kWidth = 5376;
+  std::vector<std::uint16_t> modulation(
+      kRows * kModalities * kSlots * kWidth, ToBf16(64.0F));
+  for (std::size_t modality = 0; modality < kModalities; ++modality) {
+    for (const std::size_t slot : {std::size_t{2}, std::size_t{5}}) {
+      const std::size_t base =
+          (modality * kSlots + slot) * kWidth;
+      for (std::size_t column = 0; column < kWidth; ++column) {
+        modulation[base + column] =
+            ToBf16((column & 1U) == 0U ? 2.0F : -2.0F);
+      }
+    }
+  }
+  std::string error;
+  const auto score = h3::DenoiserGateScore(modulation, kRows, &error);
+  Check(score.has_value() && *score == 2.0,
+        "gate score averages only AdaLN slots 2 and 5");
+  Check(!h3::DenoiserGateScore(
+             std::span<const std::uint16_t>(modulation).first(
+                 modulation.size() - 1),
+             kRows, &error)
+             .has_value(),
+        "gate score rejects malformed modulation");
+
+  std::array<double, 50> scores{};
+  for (std::size_t block = 0; block < scores.size(); ++block) {
+    scores[block] = static_cast<double>(block);
+  }
+  const auto fast =
+      h3::SelectGateRankedDenoiserBlocks(scores, 45, &error);
+  Check(fast.has_value() && fast->size() == 45,
+        "fast gate-ranked selection has 45 blocks");
+  if (fast.has_value()) {
+    Check(std::ranges::find(*fast, 0) != fast->end() &&
+              std::ranges::find(*fast, 1) != fast->end() &&
+              std::ranges::find(*fast, 49) != fast->end(),
+          "gate ranking protects blocks 0, 1, and 49");
+    for (std::size_t skipped = 2; skipped <= 6; ++skipped) {
+      Check(std::ranges::find(*fast, skipped) == fast->end(),
+            "fast gate ranking skips the five lowest candidate scores");
+    }
+  }
+
+  scores.fill(1.0);
+  scores[48] = 0.0;
+  const auto tied =
+      h3::SelectGateRankedDenoiserBlocks(scores, 48, &error);
+  Check(tied.has_value() &&
+            std::ranges::find(*tied, 48) == tied->end() &&
+            std::ranges::find(*tied, 3) == tied->end() &&
+            std::ranges::find(*tied, 2) != tied->end(),
+        "gate ranking reproduces h3.c selection-sort tie behavior");
+  Check(!h3::SelectGateRankedDenoiserBlocks(scores, 2, &error).has_value(),
+        "gate ranking rejects a count smaller than protected blocks");
+}
+
 bool HasPartial(const std::filesystem::path& target) {
   const std::filesystem::path parent = target.parent_path().empty()
                                            ? std::filesystem::path(".")
@@ -51,6 +121,9 @@ h3::VideoFrames SyntheticFrames() {
     frames.rgb[index] =
         static_cast<float>(index % 13U) / static_cast<float>(12U);
   }
+  frames.rgb[0] = 0.5F / 255.0F;
+  frames.rgb[1] = 1.5F / 255.0F;
+  frames.rgb[2] = 2.5F / 255.0F;
   return frames;
 }
 
@@ -61,13 +134,15 @@ void TestPresetsAndReports() {
   const auto aggressive = h3::ResolveGenerationPreset("aggressive", &error);
   const auto dev = h3::ResolveGenerationPreset("dev", &error);
   Check(exact && fast && aggressive && dev, "all frozen presets resolve");
-  Check(exact->evaluations == 50 && exact->active_blocks == 50 &&
+  Check(exact->evaluations == 49 && exact->active_blocks == 50 &&
             exact->reuse_interval == 1,
         "exact preset contract");
-  Check(fast->internal_width == 384 && fast->active_blocks == 45 &&
-            fast->reuse_interval == 2,
+  Check(fast->internal_width == 384 && fast->evaluations == 19 &&
+            fast->active_blocks == 45 && fast->reuse_interval == 2,
         "fast preset contract");
-  Check(aggressive->internal_width == 320 && aggressive->active_blocks == 40 &&
+  Check(aggressive->internal_width == 320 &&
+            aggressive->evaluations == 19 &&
+            aggressive->active_blocks == 40 &&
             aggressive->reuse_interval == 3,
         "aggressive preset contract");
   Check(!dev->mux && !dev->decode_audio &&
@@ -170,6 +245,20 @@ void TestAtomicFrames() {
     std::string magic = prefix;
     input.read(magic.data(), 2);
     Check(input.good() && magic == "P6", "PPM frame header");
+    if (frame == 0) {
+      input.seekg(0);
+      const std::string ppm{std::istreambuf_iterator<char>(input),
+                            std::istreambuf_iterator<char>()};
+      const std::size_t payload = ppm.find("\n255\n");
+      Check(payload != std::string::npos && ppm.size() >= payload + 8,
+            "PPM frame payload");
+      if (payload != std::string::npos && ppm.size() >= payload + 8) {
+        const auto* pixels = reinterpret_cast<const unsigned char*>(
+            ppm.data() + payload + 5);
+        Check(pixels[0] == 0 && pixels[1] == 2 && pixels[2] == 2,
+              "RGB halfway values use ties-to-even quantization");
+      }
+    }
   }
 
   Check(!h3::WriteDiagnosticFrames(target, frames, nullptr, &error),
@@ -234,6 +323,7 @@ void TestAtomicLatents() {
 }  // namespace
 
 int main() {
+  TestGateRankedBlocks();
   TestPresetsAndReports();
   TestAtomicFrames();
   TestAtomicLatents();

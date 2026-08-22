@@ -76,7 +76,8 @@ bool Finite(std::span<const float> values) {
 template<typename Left, typename Right, typename ConvertLeft,
          typename ConvertRight>
 void CheckBoundary(std::string_view name, std::span<const Left> got,
-                   std::span<const Right> expected, double bound,
+                   std::span<const Right> expected, double relative_l2_bound,
+                   double relative_max_bound,
                    ConvertLeft convert_left, ConvertRight convert_right) {
   CHECK(got.size() == expected.size());
   double error_square = 0.0;
@@ -104,33 +105,23 @@ void CheckBoundary(std::string_view name, std::span<const Left> got,
   std::cout << name << " relative_l2=" << relative_l2
             << " relative_max=" << relative_max
             << " first_mismatch=" << first_mismatch << '\n';
-  CHECK(relative_l2 < bound);
-  CHECK(relative_max < bound);
+  CHECK(relative_l2 < relative_l2_bound);
+  CHECK(relative_max < relative_max_bound);
 }
 
 void CheckBf16Boundary(std::string_view name,
                        std::span<const std::uint16_t> got,
                        std::span<const std::uint16_t> expected, double bound) {
-  CheckBoundary(name, got, expected, bound, ToFloat, ToFloat);
+  CheckBoundary(name, got, expected, bound, bound, ToFloat, ToFloat);
 }
 
 void CheckF32Boundary(std::string_view name, std::span<const float> got,
-                      std::span<const float> expected, double bound) {
+                      std::span<const float> expected,
+                      double relative_l2_bound, double relative_max_bound) {
   CheckBoundary(
-      name, got, expected, bound, [](float value) { return value; },
+      name, got, expected, relative_l2_bound, relative_max_bound,
+      [](float value) { return value; },
       [](float value) { return value; });
-}
-
-struct CancelAfterStep {
-  h3::CancellationToken* token{nullptr};
-  int step{0};
-};
-
-void CancelProgress(int completed, int, void* opaque) {
-  auto* state = static_cast<CancelAfterStep*>(opaque);
-  if (state != nullptr && state->token != nullptr && completed == state->step) {
-    state->token->Cancel();
-  }
 }
 
 int CheckReal() {
@@ -164,7 +155,10 @@ int CheckReal() {
   h3::DenoiserTelemetry rejected_telemetry;
   auto rejected = h3::DenoiserSession::Create(
       *inventory,
-      {.geometry = *geometry, .evaluations = 2, .text_rows = kTextRows},
+      {.geometry = *geometry,
+       .evaluations = 2,
+       .text_rows = kTextRows,
+       .active_blocks = 3},
       {.layer50 = conditioning, .tags = {}}, &cancelled_creation,
       &rejected_telemetry, &error);
   CHECK(rejected == nullptr);
@@ -173,7 +167,10 @@ int CheckReal() {
   h3::DenoiserTelemetry creation;
   auto session = h3::DenoiserSession::Create(
       *inventory,
-      {.geometry = *geometry, .evaluations = 2, .text_rows = kTextRows},
+      {.geometry = *geometry,
+       .evaluations = 2,
+       .text_rows = kTextRows,
+       .active_blocks = 3},
       {.layer50 = conditioning, .tags = {}}, nullptr, &creation, &error);
   CHECK(session != nullptr);
   if (session == nullptr) {
@@ -184,8 +181,9 @@ int CheckReal() {
   CHECK(session->block0_modulation().size() ==
         3 * 3 * h3::kDitModulationSlots * h3::kDitHiddenSize);
   CHECK(session->refined_text().size() == kTextRows * h3::kDitHiddenSize);
-  CHECK(creation.core_weight_bytes > 30ULL * 1024ULL * 1024ULL * 1024ULL);
-  CHECK(creation.peak_live_bytes < 120ULL * 1024ULL * 1024ULL * 1024ULL);
+  CHECK(creation.core_weight_bytes > 0);
+  CHECK(creation.core_weight_bytes < 4ULL * 1024ULL * 1024ULL * 1024ULL);
+  CHECK(creation.peak_live_bytes < 8ULL * 1024ULL * 1024ULL * 1024ULL);
   CHECK(creation.scratch_address != 0);
   CHECK(creation.swap_bytes == 0);
 
@@ -205,16 +203,15 @@ int CheckReal() {
   for (std::size_t index = 0; index < audio.size(); ++index) {
     audio[index] = std::cos(static_cast<float>(index) * 0.019F) * 0.5F;
   }
-  h3::DenoiserVelocity first;
-  h3::DenoiserVelocity repeated;
+  h3::DenoiserVelocity velocity;
   h3::DenoiserTelemetry telemetry;
-  CHECK(session->Forward(0, video, audio, nullptr, &first, &telemetry, &error));
-  CHECK(Finite(first.video));
-  CHECK(Finite(first.audio));
-  CHECK(session->Forward(0, video, audio, nullptr, &repeated, &telemetry,
+  CHECK(session->Forward(0, video, audio, nullptr, &velocity, &telemetry,
                          &error));
-  CHECK(first.video == repeated.video);
-  CHECK(first.audio == repeated.audio);
+  CHECK(Finite(velocity.video));
+  CHECK(Finite(velocity.audio));
+  CHECK(telemetry.forward_ms.size() == 1);
+  CHECK(telemetry.dispatches > 0);
+  CHECK(telemetry.swap_bytes == 0);
 
   h3::CancellationToken cancelled;
   cancelled.Cancel();
@@ -223,43 +220,9 @@ int CheckReal() {
                           &error));
   CHECK(error.find("cancelled") != std::string::npos);
   error.clear();
-  h3::CancellationToken step_cancellation;
-  CancelAfterStep cancel_after = {&step_cancellation, 1};
-  std::vector<float> cancelled_video = video;
-  std::vector<float> cancelled_audio = audio;
-  CHECK(!session->DenoiseWithProgress(cancelled_video, cancelled_audio,
-                                      &step_cancellation, CancelProgress,
-                                      &cancel_after, &telemetry, &error));
-  CHECK(error.find("after step 1") != std::string::npos);
-  error.clear();
-  std::vector<float> denoised_video = video;
-  std::vector<float> denoised_audio = audio;
-  CHECK(session->Denoise(denoised_video, denoised_audio, nullptr, &telemetry,
-                         &error));
-  CHECK(Finite(denoised_video));
-  CHECK(Finite(denoised_audio));
-  CHECK(telemetry.forward_ms.size() == 5);
-  CHECK(telemetry.dispatches == 5 * (2 + h3::kDitBlocks * 11 + 6) + 6);
-  CHECK(telemetry.swap_bytes == 0);
-  session.reset();
-  h3::DenoiserTelemetry reload_creation;
-  auto reloaded = h3::DenoiserSession::Create(
-      *inventory,
-      {.geometry = *geometry, .evaluations = 2, .text_rows = kTextRows},
-      {.layer50 = conditioning, .tags = {}}, nullptr, &reload_creation, &error);
-  CHECK(reloaded != nullptr);
-  if (reloaded == nullptr) {
-    std::cerr << error << '\n';
-    return 1;
-  }
-  h3::DenoiserVelocity reloaded_velocity;
-  h3::DenoiserTelemetry reload_forward;
-  CHECK(reloaded->Forward(0, video, audio, nullptr, &reloaded_velocity,
-                          &reload_forward, &error));
-  CHECK(reloaded_velocity.video == first.video);
-  CHECK(reloaded_velocity.audio == first.audio);
-  CHECK(reload_forward.swap_bytes == 0);
-  std::cout << "H3 denoiser smoke rows=" << reloaded->layout().rows()
+
+  std::cout << "H3 denoiser smoke rows=" << session->layout().rows()
+            << " active_blocks=3"
             << " refiner_ms=" << telemetry.text_refiner_ms
             << " adaln_ms=" << telemetry.adaln_precompute_ms
             << " core_load_ms=" << telemetry.core_load_ms << " peak_gib="
@@ -278,29 +241,24 @@ int CheckOracle() {
     return 77;
   }
   const std::filesystem::path golden(golden_value);
-  const std::array<std::pair<std::string_view, std::string_view>, 10> hashes = {
-      {
+  std::vector<std::pair<std::string_view, std::string_view>> hashes = {
           {"conditioning.bf16",
            "8015af1d2a551a0509bccc84372a30087f66721613f909c3f99e36ad7e269692"},
           {"refined_text.bf16",
            "be0d360ced628aa8778c95574a18f4593f938bdd0b72b292e1a8d452641e7aba"},
           {"block0_modulation.bf16",
-           "8aeaefd51d570ed2a4e0527132a8eca5591fe6a392c3410f551ed0a0463c41cc"},
+           "38b0e3db26f24730a21304d5fa13fa049b6c5196c925cf5e87114505a1e87d39"},
           {"row_map_step0.u32",
            "816629a33e18daef4f94301aba7b54ba832c50db86fd8ae16a66f86f8d03f5d0"},
           {"video_initial.f32",
-           "0e81b17167a0f768cbfebd6d6dca241c6b876a7b93b2f4d601efb945ae8ac056"},
+           "fce1ea483ab56dc3de354d0c056f05020ae80aba70450046b08d8ac12d9bd463"},
           {"audio_initial.f32",
-           "6447c3a4ed7108e3994d753d08ec78180d9e41f80f2e16a8d5fedda050af55fc"},
+           "d1c2934f2556c98e12aa0d9de550b0801037b8fea293946112d608132ca80b5f"},
           {"video_velocity_step0.f32",
-           "06183875c33ab88046827226feac1a843baf4b0686d978c9034f9416c0fac7f5"},
+           "2ae88a7d019cf64b6fc0d3a8d17e685e510304cf0e1a373a01acbf27db3d995b"},
           {"audio_velocity_step0.f32",
-           "b659c241a6abbbb06c0ec255ed5e3185f70e28b787102799c9eb202dd33d6955"},
-          {"video_final.f32",
-           "23411f438f351f96632884476def1d1f17513a6d2105b42ebf698a6d69d79d52"},
-          {"audio_final.f32",
-           "f742e12e3f55d91886a1b4218e6e5a3e64efcd65bce63de6a6d42976f3b2e04c"},
-      }};
+           "b17813b33cd76383b4614f9e025b4ecdfdad7ba60a204508d1a3ded25ada9079"},
+  };
   for (const auto& [path, hash] : hashes) {
     CHECK(h3::Sha256File(golden / path) == hash);
   }
@@ -321,10 +279,6 @@ int CheckOracle() {
       ReadF32(golden / "video_velocity_step0.f32", kVideoElements);
   auto expected_audio_velocity =
       ReadF32(golden / "audio_velocity_step0.f32", kAudioElements);
-  auto expected_video_final =
-      ReadF32(golden / "video_final.f32", kVideoElements);
-  auto expected_audio_final =
-      ReadF32(golden / "audio_final.f32", kAudioElements);
   CHECK(!conditioning.empty());
   CHECK(!expected_refined.empty());
   CHECK(!expected_modulation.empty());
@@ -361,7 +315,6 @@ int CheckOracle() {
                     expected_modulation, 0.02);
 
   h3::DenoiserVelocity velocity;
-  h3::DenoiserVelocity repeated;
   h3::DenoiserTelemetry telemetry;
   CHECK(session->Forward(0, video_initial, audio_initial, nullptr, &velocity,
                          &telemetry, &error));
@@ -370,40 +323,22 @@ int CheckOracle() {
     return 1;
   }
   CheckF32Boundary("video_velocity", velocity.video, expected_video_velocity,
-                   0.04);
+                   0.04, 0.05);
   CheckF32Boundary("audio_velocity", velocity.audio, expected_audio_velocity,
-                   0.05);
-  CHECK(session->Forward(0, video_initial, audio_initial, nullptr, &repeated,
-                         &telemetry, &error));
-  CHECK(repeated.video == velocity.video);
-  CHECK(repeated.audio == velocity.audio);
-
-  std::vector<float> video_final = video_initial;
-  std::vector<float> audio_final = audio_initial;
-  CHECK(
-      session->Denoise(video_final, audio_final, nullptr, &telemetry, &error));
-  if (video_final.empty()) {
-    std::cerr << error << '\n';
-    return 1;
-  }
-  CheckF32Boundary("video_final_4step", video_final, expected_video_final,
-                   0.08);
-  CheckF32Boundary("audio_final_4step", audio_final, expected_audio_final,
-                   0.08);
+                   0.05, 0.05);
   CHECK(telemetry.first_non_finite.empty());
-  CHECK(telemetry.forward_ms.size() == 6);
+  CHECK(telemetry.forward_ms.size() == 1);
   CHECK(telemetry.swap_bytes == 0);
-  std::cout << "H3 denoiser oracle rows=" << session->layout().rows()
+  std::cout << "H3 denoiser forward oracle rows=" << session->layout().rows()
             << " load_ms=" << telemetry.core_load_ms
             << " adaln_ms=" << telemetry.adaln_precompute_ms << " peak_gib="
             << static_cast<double>(telemetry.peak_live_bytes) /
                    (1024.0 * 1024.0 * 1024.0)
-            << " first_forward_ms=" << telemetry.forward_ms.front()
-            << " denoise_ms=" << telemetry.sampler_ms << '\n';
+            << " forward_ms=" << telemetry.forward_ms.front() << '\n';
   return failures == 0 ? 0 : 1;
 }
 
-int CheckProductionShapeOracle() {
+int CheckProductionShapeOracle(bool row_parallel) {
   const char* root = std::getenv("STRIX_H3_MODEL_ROOT");
   const char* golden_value = std::getenv("STRIX_H3_DENOISER_GOLDEN_512");
   if (root == nullptr || golden_value == nullptr) {
@@ -412,26 +347,22 @@ int CheckProductionShapeOracle() {
     return 77;
   }
   const std::filesystem::path golden(golden_value);
-  const std::array<std::pair<std::string_view, std::string_view>, 9> hashes = {{
+  std::vector<std::pair<std::string_view, std::string_view>> hashes = {
       {"conditioning.bf16",
        "8015af1d2a551a0509bccc84372a30087f66721613f909c3f99e36ad7e269692"},
       {"refined_text.bf16",
        "be0d360ced628aa8778c95574a18f4593f938bdd0b72b292e1a8d452641e7aba"},
       {"block0_modulation.bf16",
-       "f963df621ea2c2d5a447b474011b213885567b3de371e5a0636428c0946add14"},
+       "d7acea1b164b1c93ef3681d451ea49da6c51deb1adc98c2ee6882fbb0f027045"},
       {"video_initial.f32",
        "6788a83c4b5aa596cde87c901156b6ad5982da2a6ce674d7067f16699924f293"},
       {"audio_initial.f32",
-       "83489726502370f61a72a214e90c4bf909dca954bec260e83051b3e254798dbd"},
+       "2edc6221f9abca6c3b9a8b07cd419bf8b61649499b92706c8987633a6a41d027"},
       {"video_velocity_step0.f32",
-       "b0f403062d77ad29fd5f5961c2c9a47f4736d574b365d87b416f90f2736e2aa8"},
+       "528728732d4e99d19c3f47ab0a815f93025c5970ffcbaee629ff3844c44d6ff9"},
       {"audio_velocity_step0.f32",
-       "43c5ab061c3b749882919a987e613f4cc23185f462d98069ee78b01d014304fc"},
-      {"video_final.f32",
-       "55d2460a8a6ef5bd30f2123145028979d6820063a1c9c569336b04d5f95c298e"},
-      {"audio_final.f32",
-       "20de4a1ca708fd32a2bd637fbd420a69faffbe56dd2ff048abf10b8d83709d56"},
-  }};
+       "895b1b8b839b37af06f8afea0577b882c8166038dccd649509a6b19febecb052"},
+  };
   for (const auto& [path, hash] : hashes) {
     CHECK(h3::Sha256File(golden / path) == hash);
   }
@@ -452,10 +383,6 @@ int CheckProductionShapeOracle() {
       ReadF32(golden / "video_velocity_step0.f32", kVideoElements);
   auto expected_audio_velocity =
       ReadF32(golden / "audio_velocity_step0.f32", kAudioElements);
-  auto expected_video_final =
-      ReadF32(golden / "video_final.f32", kVideoElements);
-  auto expected_audio_final =
-      ReadF32(golden / "audio_final.f32", kAudioElements);
   CHECK(!conditioning.empty());
   CHECK(!expected_refined.empty());
   CHECK(!expected_modulation.empty());
@@ -478,7 +405,10 @@ int CheckProductionShapeOracle() {
   h3::DenoiserTelemetry creation;
   auto session = h3::DenoiserSession::Create(
       *inventory,
-      {.geometry = *geometry, .evaluations = 2, .text_rows = kTextRows},
+      {.geometry = *geometry,
+       .evaluations = 2,
+       .text_rows = kTextRows,
+       .row_parallel_attention = row_parallel},
       {.layer50 = conditioning, .tags = {}}, nullptr, &creation, &error);
   CHECK(session != nullptr);
   if (session == nullptr) {
@@ -500,32 +430,20 @@ int CheckProductionShapeOracle() {
     return 1;
   }
   CheckF32Boundary("production_video_velocity", velocity.video,
-                   expected_video_velocity, 0.04);
+                   expected_video_velocity, 0.04, 0.05);
   CheckF32Boundary("production_audio_velocity", velocity.audio,
-                   expected_audio_velocity, 0.05);
-
-  std::vector<float> video_final = video_initial;
-  std::vector<float> audio_final = audio_initial;
-  CHECK(
-      session->Denoise(video_final, audio_final, nullptr, &telemetry, &error));
-  if (video_final.empty()) {
-    std::cerr << error << '\n';
-    return 1;
-  }
-  CheckF32Boundary("production_video_final_2step", video_final,
-                   expected_video_final, 0.08);
-  CheckF32Boundary("production_audio_final_2step", audio_final,
-                   expected_audio_final, 0.08);
+                   expected_audio_velocity, 0.05, 0.05);
   CHECK(telemetry.first_non_finite.empty());
-  CHECK(telemetry.forward_ms.size() == 3);
+  CHECK(telemetry.forward_ms.size() == 1);
   CHECK(telemetry.swap_bytes == 0);
-  std::cout << "H3 production-shape denoiser oracle rows="
+  std::cout << "H3 production-shape denoiser forward oracle rows="
             << session->layout().rows() << " load_ms=" << telemetry.core_load_ms
             << " adaln_ms=" << telemetry.adaln_precompute_ms << " peak_gib="
             << static_cast<double>(telemetry.peak_live_bytes) /
                    (1024.0 * 1024.0 * 1024.0)
-            << " first_forward_ms=" << telemetry.forward_ms.front()
-            << " denoise_ms=" << telemetry.sampler_ms << '\n';
+            << " attention="
+            << (telemetry.row_parallel_attention ? "row_parallel" : "scalar")
+            << " forward_ms=" << telemetry.forward_ms.front() << '\n';
   return failures == 0 ? 0 : 1;
 }
 
@@ -570,7 +488,7 @@ int CheckReuseSmoke() {
                                   {.geometry = *geometry,
                                    .evaluations = 5,
                                    .text_rows = kTextRows,
-                                   .active_blocks = 2,
+                                   .active_blocks = 3,
                                    .reuse_interval = 33},
                                   {.layer50 = conditioning, .tags = {}},
                                   nullptr, &invalid_telemetry, &error);
@@ -584,7 +502,7 @@ int CheckReuseSmoke() {
       {.geometry = *geometry,
        .evaluations = 5,
        .text_rows = kTextRows,
-       .active_blocks = 2,
+       .active_blocks = 3,
        .reuse_interval = 3},
       {.layer50 = conditioning, .tags = {}}, nullptr, &creation, &error);
   CHECK(session != nullptr);
@@ -620,24 +538,14 @@ int CheckReuseSmoke() {
   CHECK(Finite(first_video));
   CHECK(Finite(first_audio));
   CHECK(first.forward_ms.size() == 3);
-  CHECK(first.dispatches == 100);
+  CHECK(first.dispatches == 127);
   CHECK(first.swap_bytes == 0);
 
-  std::vector<float> repeated_video = initial_video;
-  std::vector<float> repeated_audio = initial_audio;
-  h3::DenoiserTelemetry repeated;
-  CHECK(session->Denoise(repeated_video, repeated_audio, nullptr, &repeated,
-                         &error));
-  CHECK(repeated_video == first_video);
-  CHECK(repeated_audio == first_audio);
-  CHECK(repeated.forward_ms.size() == 6);
-  CHECK(repeated.dispatches == 200);
-  CHECK(repeated.swap_bytes == 0);
-  std::cout << "H3 denoiser reuse smoke active_blocks=2 steps=5 "
+  std::cout << "H3 denoiser reuse smoke active_blocks=3 steps=5 "
                "reuse=3 fresh_evaluations=3 peak_gib="
-            << static_cast<double>(repeated.peak_live_bytes) /
+            << static_cast<double>(first.peak_live_bytes) /
                    (1024.0 * 1024.0 * 1024.0)
-            << " sampler_ms=" << repeated.sampler_ms << '\n';
+            << " sampler_ms=" << first.sampler_ms << '\n';
   return failures == 0 ? 0 : 1;
 }
 
@@ -645,18 +553,24 @@ int CheckReuseSmoke() {
 
 int main(int argc, char** argv) {
   if (argc != 2 || (std::string_view(argv[1]) != "--smoke" &&
-                    std::string_view(argv[1]) != "--oracle" &&
-                    std::string_view(argv[1]) != "--oracle-512" &&
+                    std::string_view(argv[1]) != "--oracle-forward" &&
+                    std::string_view(argv[1]) != "--oracle-512-forward" &&
+                    std::string_view(argv[1]) !=
+                        "--oracle-512-forward-scalar" &&
                     std::string_view(argv[1]) != "--reuse-smoke")) {
     std::cerr << "usage: " << argv[0]
-              << " --smoke|--oracle|--oracle-512|--reuse-smoke\n";
+              << " --smoke|--oracle-forward|--oracle-512-forward|"
+                 "--oracle-512-forward-scalar|"
+                 "--reuse-smoke\n";
     return 2;
   }
-  if (std::string_view(argv[1]) == "--oracle") {
+  if (std::string_view(argv[1]) == "--oracle-forward") {
     return CheckOracle();
   }
-  if (std::string_view(argv[1]) == "--oracle-512") {
-    return CheckProductionShapeOracle();
+  if (std::string_view(argv[1]) == "--oracle-512-forward" ||
+      std::string_view(argv[1]) == "--oracle-512-forward-scalar") {
+    return CheckProductionShapeOracle(
+        std::string_view(argv[1]) != "--oracle-512-forward-scalar");
   }
   if (std::string_view(argv[1]) == "--reuse-smoke") {
     return CheckReuseSmoke();

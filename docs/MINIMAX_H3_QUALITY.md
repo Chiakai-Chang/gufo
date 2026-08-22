@@ -1,6 +1,6 @@
 # MiniMax H3 Quality Oracles
 
-Status: frozen foundation contract, 2026-08-22
+Status: audited foundation contract, 2026-08-22
 
 ## Rule
 
@@ -40,14 +40,20 @@ The committed contract is
 - the source-manifest SHA-256;
 - exact tokenizer IDs and special-token IDs from the operator-supplied
   checkpoint;
-- a rapid 256x256x22 four-evaluation fox case;
-- a retained 512x512x22 50-evaluation fox case;
-- an independent 512x512x22 50-evaluation ceramic-mug case;
+- a 256x256x22 fox artifact whose first complete 50-block forward is the
+  routine end-to-end denoiser gate;
+- release-only 512x512x22 fox and independent ceramic-mug cases configured for
+  the audited 49-evaluation exact route;
 - component parity ceilings inherited from the pinned upstream tests.
 
 Changing a prompt, seed, canvas, frame count, schedule, block count, reuse
 interval, metric, or ceiling creates a new contract version. A threshold is
 never loosened to admit a candidate.
+
+The pre-audit multi-step fox artifacts are historical only. They used reversed
+AdaLN shift/scale interpretation, restarted video/audio RNG streams, BF16
+Euler velocity boundaries, and the old preset counts. They are not promotion
+evidence and must not be compared with the audited native route.
 
 ## Oracle Pyramid
 
@@ -67,6 +73,10 @@ End-to-end artifacts retain initial and final latents, selected or complete
 frames, stereo audio, metrics, and human review. The rapid case decodes only
 frames 0, 11, and 21. H3 is still run with its legal 22-frame latent geometry;
 the selected-frame path is a development diagnostic, not a one-frame model.
+Generating that selected-frame artifact is reserved for a one-time visual
+smoke test after a cross-boundary change passes its operator, block, and
+single-forward parity gates; ordinary iterations do not advance a denoising
+schedule.
 
 The large artifacts are deliberately absent from Git. CI validates the schema,
 metrics, corruption behavior, and committed small fixtures but never
@@ -93,7 +103,8 @@ self-referential `artifact_id`. The manifest records:
 - prompt and prompt hash, seed, canvas, frames, evaluations, blocks, and reuse;
 - every payload's relative path, role, size, SHA-256, dtype, and shape;
 - measured metrics and their frozen threshold source;
-- at least two byte-identical captures.
+- the capture count, with byte identity claimed only when at least two
+  inexpensive captures were deliberately made.
 
 Absolute paths, parent traversal, symbolic links, unreferenced files,
 non-finite metrics, wrong hashes, and incomplete role sets fail closed.
@@ -135,8 +146,10 @@ For `A red fox walking through snow`, token IDs are
 | after layer 50 | 6x5120 | 61,440 | `8015af1d2a551a0509bccc84372a30087f66721613f909c3f99e36ad7e269692` |
 
 The gfx1151 HIP implementation matched both payloads byte-for-byte: measured
-relative max and relative L2 were zero. A repeated complete run produced the
-same output bytes, 850 dispatches, and zero live registered host bytes.
+relative max and relative L2 were zero. The retained layer-50 invocation took
+21.38 seconds, issued 850 dispatches, and left zero registered host bytes.
+Routine quality work invokes this boundary once; it does not repeat the
+complete 50-layer encoder for statistical evidence.
 
 ## Host Sampler Frozen Evidence
 
@@ -144,12 +157,12 @@ The text-only sampler tests freeze the exact released linear base grid after
 independent video shift 12 and audio shift 3. Concatenated little-endian F32
 video/audio arrays have these SHA-256 values:
 
-| Evaluations | Schedule SHA-256 |
+| Sigma points / evaluations | Schedule SHA-256 |
 | ---: | --- |
-| 4 | `dee27052a1aa4aa508a7b81bbe39e6bb4b880dd2d61dd3953380c5d0da3eb686` |
-| 7 | `cbd915b9d5fb117e3c35fb1e02771e0fdbe427736726dff0086de229ea01ffc0` |
-| 20 | `f78a6b940322389481be761fb2dc503e869573f37c87c75e32e418e42b3b3e39` |
-| 50 | `711fc5640698dec50ad677b604bd1cc95dcc3def734e0e7f88967c1d28ca2033` |
+| 5 / 4 | `dee27052a1aa4aa508a7b81bbe39e6bb4b880dd2d61dd3953380c5d0da3eb686` |
+| 8 / 7 | `51488c2e9779388e9b62aa3e0981bd5d654c38ac1ce5358be5e317fb63213ffc` |
+| 20 / 19 | `0f71f36f5f3066f0c1aece22ffb9dd2150cc85c3b52d3f15e6a0cec2bd593e9b` |
+| 50 / 49 | `ddb451d3edad496ef895ce468774632a570434e23be3d7b05a3b326c9090099c` |
 
 For six text rows and the 22-frame temporal shape, canonical packed-layout and
 step-7 modulation-map hashes are:
@@ -160,13 +173,19 @@ step-7 modulation-map hashes are:
 | 512x512 | 1,872 | `c3481ff47fabdf534823889a95df5655bd19ac11ff1755f5daa7b6e1655d00b0` | `c95bbf9938ac6b5c2d901af8466d374f6e173953954872e19ec12ed82fec98a1` |
 
 The 256x256x22 seed-42 initial video and audio noise payloads hash together to
-`0b9e324f731605e8b6050b2c7cdc46a320b75609c426ea548adb35332204620d`.
-Separate same-seed generators make the complete audio payload byte-identical
-to the corresponding video prefix.
+`6318dbfea74c61415d470c12c019cda9df6a8491f86b075e403d1c2fc2403b4d`.
+One request stream produces the video payload first and then packed
+channel-major audio rows. The rows are unpacked to `[32,2,T]`; audio is not a
+restarted copy of the video prefix.
 
-The gfx1151 analytic test keeps the sample in device F32 and matches the
-pinned four-element BF16-velocity Euler result byte-for-byte on repeated
-allocations. Zero-delta and out-of-range updates fail before launch.
+The gfx1151 analytic tests keep the sample in device F32 and match both a
+single transition and complete four-transition video/audio trajectories
+captured from the pinned `MiniMaxH3Scheduler`. They freeze Diffusers'
+two-stage float32 operation order: sigma for the velocity term is reconstructed
+as `1 - (1 - sigma)`, `denoised` is materialized, and the final blend uses the
+original sigma-grid ratio. This deliberately differs by a few final bits from
+direct `sigma - sigma_next` or a contracted update. Zero-scale and
+out-of-range updates fail before launch.
 
 ## DiT Block Frozen Evidence
 
@@ -181,10 +200,10 @@ On the supported gfx1151 route, the complete 528-row block measured:
 
 | Retained boundary | Relative L2 | Relative max |
 | --- | ---: | ---: |
-| attention AdaLN | `1.54491e-5` | `0.0015625` |
-| attention output | `0.00186781` | `0.00414938` |
-| MLP AdaLN | `0.00219937` | `0.00621118` |
-| block output | `0.00476406` | `0.00956938` |
+| attention AdaLN | `1.07122e-5` | `0.00170068` |
+| attention output | `0.0018584` | `0.00429185` |
+| MLP AdaLN | `0.00219367` | `0.00887574` |
+| block output | `0.00475081` | `0.00966184` |
 
 Every value is below the frozen `1e-2` limits. The session rejects a
 pre-cancelled block, out-of-range row maps, changed tensor shapes, non-finite
@@ -201,53 +220,90 @@ hashes belong in documentation or issue comments.
 The full-denoiser teacher is a direct ROCm PyTorch program. It does not call
 the native runtime. It independently executes condition projection, two text
 refiner blocks, F32 timestep embedding, all 50 released AdaLN projections,
-all 50 dense transformer blocks, modality-specific final heads, and four
-independent-schedule Euler updates.
+all 50 dense transformer blocks, and modality-specific final heads. The
+routine teacher stops after the first complete forward and never advances the
+denoising schedule.
 
 The raw 256x256x22 payloads remain operator-owned. Their shapes, hashes,
 arithmetic contract, and gates are frozen in
 `tests/fixtures/minimax_h3/denoiser-oracle-v1.json`.
+
+Before admission as the native oracle, the direct teacher was checked against
+the pinned official Diffusers transformer converted by its pinned conversion
+script. On the identical frozen conditioning and F32 video/audio inputs, the
+teacher differed from Diffusers by video relative L2 `0.0201796`, video
+relative max `0.0479220`, audio relative L2 `0.0112314`, and audio relative max
+`0.0273933`. All values are below the native oracle ceilings, and the converted
+checkpoint retained the released mixed-precision contract: F32 video/audio
+input projections, timestep MLP, and output heads; BF16 text projection and
+transformer blocks.
 
 Measured gfx1151 parity was:
 
 | Boundary | Relative L2 | Relative max | Frozen ceiling |
 | --- | ---: | ---: | ---: |
 | refined text | `0.00477293` | `0.00167411` | `0.02` |
-| block-0 AdaLN projection | `0.00228314` | `0.00478469` | `0.02` |
-| step-0 video velocity | `0.00497814` | `0.00734305` | `0.04` |
-| step-0 audio velocity | `0.019351` | `0.0473417` | `0.05` |
-| four-step video latent | `0.00447156` | `0.00575856` | `0.08` |
-| four-step audio latent | `0.00927884` | `0.0210095` | `0.08` |
+| block-0 AdaLN projection | `0.00227907` | `0.00478469` | `0.02` |
+| step-0 video velocity | `0.0334148` | `0.0426847` | L2 `0.04`, max `0.05` |
+| step-0 audio velocity | `0.0111732` | `0.0259974` | `0.05` |
 
-The first complete 528-row forward took 17.7 seconds with the deliberately
-scalar, deterministic full-attention baseline. Four denoising evaluations
-took 67.4 seconds. Peak accounted live memory was 42.41 GiB with zero process
-swap. These numbers identify the unoptimized exact route; they are not a
-performance target.
+The refreshed seed-42 artifact retains one forward only:
 
-Two repeated step-0 forwards produced byte-identical complete velocity arrays.
-The smoke gate also cancels before a forward and immediately after an Euler
-step, then reuses the same fully resident session successfully. It finally
-destroys and reloads the complete session and requires the fresh session to
-reproduce the original velocity bytes. Cancellation is checked before every
-block and after every sampler step.
+| Payload | SHA-256 |
+| --- | --- |
+| video initial | `fce1ea483ab56dc3de354d0c056f05020ae80aba70450046b08d8ac12d9bd463` |
+| audio initial | `d1c2934f2556c98e12aa0d9de550b0801037b8fea293946112d608132ca80b5f` |
+| block-0 modulation | `38b0e3db26f24730a21304d5fa13fa049b6c5196c925cf5e87114505a1e87d39` |
+| video velocity | `2ae88a7d019cf64b6fc0d3a8d17e685e510304cf0e1a373a01acbf27db3d995b` |
+| audio velocity | `b17813b33cd76383b4614f9e025b4ecdfdad7ba60a204508d1a3ded25ada9079` |
 
-### Retained 512x512 exact denoiser
+Sampler host/HIP tests validate the full sigma trajectory and Euler update
+without executing another 50-block model forward. Cancellation and resident
+session reuse remain targeted lifecycle tests rather than reasons to repeat
+an expensive quality run.
 
-The retained production-shape gate completed all 50 blocks and all 50 fresh
+### Production-shape single-forward evidence
+
+The current 512x512x22 gate uses the real 1,872-row layout and one complete
+50-block forward. It does not advance the sampler or invoke either VAE:
+
+| Boundary | Relative L2 | Relative max |
+| --- | ---: | ---: |
+| refined text | `0.00477293` | `0.00167411` |
+| block-0 AdaLN projection | `0.0022895` | `0.00478469` |
+| video velocity | `0.0117077` | `0.0136073` |
+| audio velocity | `0.0072865` | `0.0149824` |
+
+The native row-parallel forward took 57.265 seconds after 25.736 seconds of
+core loading and 5.839 seconds of AdaLN precompute. Accounted peak live memory
+was 59.90 GiB and process swap was zero.
+
+The refreshed seed-42 production-shape teacher hashes are:
+
+| Payload | SHA-256 |
+| --- | --- |
+| video initial | `6788a83c4b5aa596cde87c901156b6ad5982da2a6ce674d7067f16699924f293` |
+| audio initial | `2edc6221f9abca6c3b9a8b07cd419bf8b61649499b92706c8987633a6a41d027` |
+| block-0 modulation | `d7acea1b164b1c93ef3681d451ea49da6c51deb1adc98c2ee6882fbb0f027045` |
+| video velocity | `528728732d4e99d19c3f47ab0a815f93025c5970ffcbaee629ff3844c44d6ff9` |
+| audio velocity | `895b1b8b839b37af06f8afea0577b882c8166038dccd649509a6b19febecb052` |
+
+### Historical 512x512 exact denoiser
+
+The pre-audit production-shape run completed all 50 blocks and 50 fresh
 evaluations for 512x512x22. It measured 8.630 seconds of AdaLN precompute,
 18.696 seconds of core load, 12,496.600 seconds of denoising, a 59.67 GiB
-accounted peak, and zero swap. Repeated final latent payloads were
-byte-identical:
+accounted peak, and zero swap:
 
 | Payload | SHA-256 |
 | --- | --- |
 | final video latent | `0ebaf61b03ba48a5107ffce4ec04f7955e5c4966c9b85792d50acb9c09f8614b` |
 | final audio latent | `e1da6b038d0f664a250d600e6aca48e3b227dc2f1006256adf8bcac784e75921` |
 
-The separate reuse smoke ran five schedule positions with interval three,
-performed exactly three fresh evaluations, reused the resident session, and
-reproduced its repeated output bytes with zero swap.
+Those final latents predate the Diffusers audit and are retained only as a
+performance-history record. They are not current parity or quality evidence
+and will not be regenerated during ordinary development. The exact route now
+uses 49 evaluations over 50 sigma points.
 
 ## VisualVAE Frozen Evidence
 
@@ -260,13 +316,14 @@ and frames 0, 5, 11, 16, and 21:
 | full frames | 17,301,504 | `36dd863ffcdf34c2f882f57f401d2c66d7fbc441f5185d32aa1b03db46ca24c1` |
 | selected frames | 3,932,160 | `a6cc2b34da6b86f70d91dee8e152051ddc0bac0dc7cd5e1f8e605e7f37696ec7` |
 
-The gfx1151 decoder measured full-frame relative L2 `3.51369e-7` and relative
-max `9.93023e-7`; selected-frame relative L2 was `3.72615e-7` and relative max
-`9.74843e-7`. Full versus selected output was exactly equal, and a second
-selected decode was byte-identical. The final deterministic implementation
-uses the actual gfx1151 wave32 width for normalization and attention while
-each lane covers two dimensions of the released 64-wide head. It measured a
-9.38 GiB phase peak and zero swap.
+The bounded native gate decodes frames 0, 5, 11, 16, and 21 once. It measured
+selected-frame relative L2 `3.72615e-7`, relative max `9.74843e-7`, and maximum
+absolute error `7.15256e-7`. The deterministic implementation uses the actual
+gfx1151 wave32 width for normalization and attention while each lane covers
+two dimensions of the released 64-wide head. The single selected-frame pass
+took 146.916 seconds, measured a 9.38 GiB phase peak, and used zero swap. The
+complete-frame teacher payload remains available for offline analysis, but
+routine native validation does not execute a second full or repeated decode.
 
 ## AudioVAE Frozen Evidence
 
@@ -281,32 +338,27 @@ deterministic STFT magnitudes:
 
 The native decoder measured waveform maximum absolute error `5.93364e-5`,
 waveform relative L2 `1.10334e-5`, spectrogram relative L2 `3.84286e-6`, and
-spectrogram relative max `5.21096e-6`. Decode took 1.900 seconds with a
-0.251 GiB phase peak. Repeatability, phase residency, channel independence,
-and cancellation gates passed.
+spectrogram relative max `5.21096e-6`. The single decode took 60.846 seconds
+with a 0.251 GiB phase peak and zero major page faults. Channel independence,
+clipping, cancellation, and zero-swap gates passed; routine validation does
+not execute a second waveform decode.
 
 ## Rapid End-to-End Evidence
 
-Two independent development-preset runs used the real 256x256x22 latent
+The original two development-preset runs used the real 256x256x22 latent
 window, four fresh evaluations, all 50 blocks, and selected-frame decode. They
-completed in 159.4 and 163.7 seconds with zero swap. The three PPM files were
-byte-identical between runs:
+completed in 159.4 and 163.7 seconds with zero swap, but they predate the
+Diffusers audit and their checkerboard-like output is invalid quality
+evidence.
 
-| Frame | SHA-256 |
-| ---: | --- |
-| 0 | `d7dcba1ad32ddf2cc08193a0738b0a7eb076b6a3206e133547b1cdb03efd0d35` |
-| 11 | `2f057f85092cd4f6b2549e7960c8c5faf06f5023434c3289384a6e1dfc0276c9` |
-| 21 | `3c23a10b4cad0c2ae2c51bc6b8f74fcd690c88f1338df0ba0ad9fabec7a9368d` |
-
-A real asynchronous API job returned frame 11 with the same hash, proving
-direct CLI/server parity. Create, progress, full content, byte range, persisted
-privacy, restart recovery, delete, and artifact reclamation passed. A
-deterministic tiny media integration run produced byte-identical H.264/AAC
-MP4s; video was 24 fps, audio was stereo 32 kHz, and decoded duration differed
-by 11.3 milliseconds. Those two development-preset runs were a one-time
-determinism investigation, not a repetition policy. Current development uses
-one invocation of each needed short oracle and does not rerun a passing full
-route.
+After correcting AdaLN slot order, one intentionally low-cost 256x256,
+two-evaluation visual smoke produced a coherent subject without the full-frame
+grid. Selected frame 11 hashes to
+`5db8440d5cd2b71323c38c83eedaa612c2151f3619ea9f6b31ad4f19b8d37fea`.
+At only two evaluations it still has a localized striped/noisy edge and is a
+visual debugging artifact, not a semantic-quality baseline. Current
+development uses one invocation of each needed short oracle and does not rerun
+a passing full route.
 
 ## Numerical Gates
 
@@ -316,8 +368,8 @@ The initial upstream ceilings are strict inequalities:
 | --- | --- |
 | BF16 DiT block | relative max and relative L2 below `1e-2` |
 | Qwen layer-50 prompt output | relative max below `0.1`, relative L2 below `0.05` |
-| 256x256x22 semantic latent | relative max below `0.15`, relative L2 below `0.10` |
-| 512x512x22 two-step semantic latent | relative max and relative L2 below `0.08` |
+| 256x256x22 video velocity | relative max below `0.05`, relative L2 below `0.04` |
+| 256x256x22 audio velocity | relative max and relative L2 below `0.05` |
 | VisualVAE | relative max and relative L2 below `0.05` |
 | AudioVAE | max absolute below `1e-3`, relative L2 below `0.05` |
 | AudioVAE selected STFT magnitudes | relative max below `0.1`, relative L2 below `0.08` |
@@ -326,17 +378,24 @@ All numerical comparisons also require equal shapes and zero non-finite values.
 An implementation issue may freeze a tighter measured boundary, but not a
 looser one.
 
-The semantic-latent gates first verify provenance rather than relying on
-filenames or directory placement. Teacher and native manifests must agree on
-the immutable model/reference revisions, seed, noise mode, internal geometry,
-evaluation count, active block count, reuse interval, and SHA-256 of the exact
-layer-50 BF16 conditioning payload. Only then are final video/audio latent
-metrics evaluated. These gates are used when work crosses block, sampler, or
-schedule boundaries. Attention-local iterations use the frozen single-block
-teacher plus one 1,872-row block profile; they do not run 50 blocks or a
-denoising trajectory. There is no routine 50-step development gate.
+Teacher and native manifests first verify provenance rather than relying on
+filenames or directory placement. They must agree on the immutable
+model/reference revisions, seed, noise mode, internal geometry, evaluation
+count, active block count, reuse interval, and SHA-256 of the exact layer-50
+BF16 conditioning payload. Attention-local iterations use the frozen
+single-block teacher plus one 1,872-row block profile; they do not run 50
+blocks or a denoising trajectory. Cross-block work uses one full forward.
+Sampler and schedule changes use analytic host/HIP trajectory tests. There is
+no routine full-schedule development gate.
 
-Complete 50-step `exact` generation belongs to end-user operation or rare,
+For thinned presets, block count alone is not interpreted as a prefix.
+Candidate blocks 2 through 48 are ranked by mean absolute AdaLN gate magnitude
+over all schedule rows, modalities, hidden columns, and gate slots 2 and 5.
+Blocks 0, 1, and 49 are always retained, h3.c's strict comparison and
+selection-sort tie behavior are frozen by a host test, and the retained blocks
+execute in ascending model order.
+
+Complete `exact` generation belongs to end-user operation or rare,
 explicit release validation. The checkerboard MP4 captured from the older
 scalar binary is invalid quality evidence: its container is valid, but its
 frames are a 32x32 grid of 16-pixel VAE cells produced from a noise-like
@@ -380,9 +439,10 @@ Issues that add H3 runtime boundaries also add their retained artifact:
 - tokenizer/Qwen: exact IDs and layer-50 artifact;
 - host sampler: schedules/layout/RNG/Euler fixtures;
 - DiT kernels: complete block artifact;
-- full denoiser: velocity plus 256x256 four-step and 512x512 two-step latent
-  artifacts, invoked only for changes crossing the denoiser boundary;
-- VisualVAE: selected and full frame artifacts;
+- full denoiser: one-forward refined-text, modulation, and F32 video/audio
+  velocity artifacts, invoked only for changes crossing the denoiser boundary;
+- VisualVAE: one selected-frame native gate, with selected and archival full
+  teacher artifacts;
 - AudioVAE: waveform, spectrogram, channel, duration, and sync artifacts;
 - presets/optimization/quantization: component and short production-shape
   reports against BF16.

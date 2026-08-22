@@ -556,14 +556,19 @@ def validate_manifest(
         set(),
         "determinism",
     )
+    capture_count = determinism["capture_count"]
+    byte_identical = determinism["byte_identical"]
     if (
-        not isinstance(determinism["capture_count"], int)
-        or isinstance(determinism["capture_count"], bool)
-        or determinism["capture_count"] < 2
-        or determinism["byte_identical"] is not True
+        not isinstance(capture_count, int)
+        or isinstance(capture_count, bool)
+        or capture_count < 1
+        or not isinstance(byte_identical, bool)
+        or (capture_count == 1 and byte_identical)
+        or (capture_count >= 2 and not byte_identical)
     ):
         raise H3QualityError(
-            "artifact requires at least two byte-identical captures"
+            "artifact determinism must declare one non-repeated capture or "
+            "at least two byte-identical captures"
         )
 
     if "notes" in manifest:

@@ -260,7 +260,7 @@ void TestQueueLifecycleAndRecovery(const std::filesystem::path& root) {
       const auto& request = runner.requests.back();
       Check(request.parameters.internal_width == 384 &&
                 request.parameters.output_width == 512 &&
-                request.parameters.evaluations == 20 &&
+                request.parameters.evaluations == 19 &&
                 request.parameters.active_blocks == 45 &&
                 request.parameters.reuse_interval == 2 && request.seed == 42,
             "server request matches direct fast CLI parameters");

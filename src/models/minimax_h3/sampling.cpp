@@ -25,6 +25,17 @@ constexpr float kVideoSigmaShift = 12.0F;
 constexpr float kAudioSigmaShift = 3.0F;
 constexpr std::uint32_t kDitModalities = 3;
 
+float ShiftSigma(float base, float shift) noexcept {
+  // Diffusers evaluates these as distinct eager float32 tensor operations.
+  // Volatile temporaries prevent the host compiler from contracting the
+  // denominator multiply/add into an FMA.
+  volatile float numerator = shift * base;
+  volatile float shifted_offset = (shift - 1.0F) * base;
+  volatile float denominator = 1.0F + shifted_offset;
+  volatile float result = numerator / denominator;
+  return result;
+}
+
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
     *error = std::move(message);
@@ -141,8 +152,8 @@ std::optional<GenerationGeometry> ResolveGenerationGeometry(
   const int frames = AlignFrameCount(requested_frames);
   if (frames > kH3MaximumFrames) {
     SetError(error,
-             "MiniMax H3 aligned frame count exceeds the released 362-frame "
-             "limit");
+             "MiniMax H3 aligned frame count exceeds the released 15-second "
+             "limit (345 aligned frames)");
     return std::nullopt;
   }
   GenerationGeometry geometry;
@@ -173,13 +184,21 @@ std::optional<SigmaSchedule> BuildServingSchedule(int evaluations,
     SetError(error, "out of memory allocating MiniMax H3 sigma schedule");
     return std::nullopt;
   }
-  const float denominator = static_cast<float>(evaluations);
+  // Match torch.linspace(1, 0, evaluations + 1, dtype=float32), including its
+  // halfway split and fused multiply-add rounding. The split computes the
+  // second half from the exact endpoint, avoiding accumulated endpoint error.
+  const int points = evaluations + 1;
+  const int halfway = points / 2;
+  const float step = -1.0F / static_cast<float>(evaluations);
   for (int index = 0; index <= evaluations; ++index) {
-    const float base = 1.0F - static_cast<float>(index) / denominator;
+    const float base =
+        index < halfway
+            ? std::fma(step, static_cast<float>(index), 1.0F)
+            : std::fma(-step, static_cast<float>(evaluations - index), 0.0F);
     schedule.video[static_cast<std::size_t>(index)] =
-        kVideoSigmaShift * base / (1.0F + (kVideoSigmaShift - 1.0F) * base);
+        ShiftSigma(base, kVideoSigmaShift);
     schedule.audio[static_cast<std::size_t>(index)] =
-        kAudioSigmaShift * base / (1.0F + (kAudioSigmaShift - 1.0F) * base);
+        ShiftSigma(base, kAudioSigmaShift);
   }
   schedule.video.back() = 0.0F;
   schedule.audio.back() = 0.0F;
@@ -608,24 +627,36 @@ void NormalRng::Fill(std::span<float> output) noexcept {
 
 std::optional<InitialNoise> BuildInitialNoise(std::uint64_t seed,
                                               std::size_t video_elements,
-                                              std::size_t audio_elements,
+                                              int audio_channels,
+                                              int audio_time,
                                               std::string* error) {
-  if (video_elements == 0 || audio_elements == 0) {
+  std::size_t stereo_time = 0;
+  std::size_t audio_elements = 0;
+  if (video_elements == 0 || audio_channels < 1 || audio_time < 1 ||
+      !CheckedMultiply(2, static_cast<std::size_t>(audio_time),
+                       &stereo_time) ||
+      !CheckedMultiply(static_cast<std::size_t>(audio_channels), stereo_time,
+                       &audio_elements)) {
     SetError(error, "MiniMax H3 noise tensors must be non-empty");
     return std::nullopt;
   }
   InitialNoise noise;
+  std::vector<float> audio_rows;
   try {
     noise.video.resize(video_elements);
     noise.audio.resize(audio_elements);
+    audio_rows.resize(audio_elements);
   } catch (const std::exception&) {
     SetError(error, "out of memory allocating MiniMax H3 initial noise");
     return std::nullopt;
   }
-  NormalRng video_rng(seed);
-  NormalRng audio_rng(seed);
-  video_rng.Fill(noise.video);
-  audio_rng.Fill(noise.audio);
+  NormalRng rng(seed);
+  rng.Fill(noise.video);
+  rng.Fill(audio_rows);
+  if (!UnpackAudio(audio_rows, audio_channels, audio_time, noise.audio,
+                   error)) {
+    return std::nullopt;
+  }
   return noise;
 }
 
@@ -699,8 +730,22 @@ std::optional<std::vector<EulerStepPlan>> BuildEulerPlan(
     }
     item.last_evaluated = last_evaluated;
     item.previous_evaluated = previous_evaluated;
-    item.video_delta = schedule.video[index] - schedule.video[index + 1];
-    item.audio_delta = schedule.audio[index] - schedule.audio[index + 1];
+    const float video_timestep = 1.0F - schedule.video[index];
+    const float audio_timestep = 1.0F - schedule.audio[index];
+    item.video_sigma_from_timestep = 1.0F - video_timestep;
+    item.audio_sigma_from_timestep = 1.0F - audio_timestep;
+    item.video_ratio = schedule.video[index + 1] / schedule.video[index];
+    item.audio_ratio = schedule.audio[index + 1] / schedule.audio[index];
+    if (!std::isfinite(item.video_sigma_from_timestep) ||
+        item.video_sigma_from_timestep <= 0.0F ||
+        !std::isfinite(item.audio_sigma_from_timestep) ||
+        item.audio_sigma_from_timestep <= 0.0F ||
+        !std::isfinite(item.video_ratio) || item.video_ratio < 0.0F ||
+        item.video_ratio >= 1.0F || !std::isfinite(item.audio_ratio) ||
+        item.audio_ratio < 0.0F || item.audio_ratio >= 1.0F) {
+      SetError(error, "invalid MiniMax H3 Diffusers Euler coefficients");
+      return std::nullopt;
+    }
     if (!item.evaluate) {
       item.video_extrapolation = VelocityExtrapolationRatio(
           schedule.video[index],
@@ -723,17 +768,18 @@ std::optional<std::vector<EulerStepPlan>> BuildEulerPlan(
 
 #if !defined(ENGINE_ENABLE_HIP)
 bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
-                    std::size_t sample_offset, const void* last_bf16,
-                    const void* previous_bf16, std::size_t velocity_elements,
-                    float delta, float extrapolation, void* stream,
-                    std::string* error) {
+                    std::size_t sample_offset, const void* last_f32,
+                    const void* previous_f32, std::size_t velocity_elements,
+                    float sigma_from_timestep, float ratio,
+                    float extrapolation, void* stream, std::string* error) {
   (void)sample_f32;
   (void)sample_elements;
   (void)sample_offset;
-  (void)last_bf16;
-  (void)previous_bf16;
+  (void)last_f32;
+  (void)previous_f32;
   (void)velocity_elements;
-  (void)delta;
+  (void)sigma_from_timestep;
+  (void)ratio;
   (void)extrapolation;
   (void)stream;
   SetError(error,

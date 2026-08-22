@@ -33,6 +33,47 @@ The pinned source supplies the initial independent implementation contract for:
 - selected-frame development and audiovisual mux behavior;
 - exact, fast, and aggressive performance references.
 
+The released Hugging Face Diffusers implementation is the authoritative
+quality-parity reference for the model's Python pipeline:
+
+```text
+repository: huggingface/diffusers
+revision:   fe15005a333d1270b490e4885a6ea13b66b1092a
+```
+
+A line-by-line text-only audit covers the pipeline, transformer, scheduler,
+noise construction, VisualVAE, and AudioVAE. Where h3.c and Diffusers differ,
+the native exact path follows Diffusers when the difference changes model
+arithmetic or decoder context.
+
+### Audited implementation differences
+
+| Area | Pinned Diffusers authority | Pinned h3.c behavior | Native Strix Halo decision |
+| --- | --- | --- | --- |
+| exact schedule | 50 sigma points including terminal zero, 49 forwards | 20 transitions in its accelerated examples | `exact` is 50/49 |
+| fast/aggressive schedule | no released 45/40-block preset contract | ranks gates on a 21-point/20-transition schedule | native 20-point/19-forward serving modes borrow ranking/reuse only and never claim exact h3.c preset parity |
+| Euler arithmetic | F32 velocity, sigma reconstructed from F32 timestep, materialized denoised estimate and blend | BF16 velocity boundary and direct grid-delta arithmetic | F32 sample/velocity with Diffusers' two-stage operation order |
+| initial noise | one PyTorch generator consumed by video then channel-major audio | separate restarted PCG streams | one sequential PCG/Box-Muller stream; injected frozen tensors, not equal integer seeds, are the cross-runtime oracle because PCG values differ from PyTorch |
+| timestep embedding | F32 MLP and SiLU before BF16 AdaLN projection | BF16 boundary before the final activation | F32 through SiLU, then BF16 projection input |
+| spatial MM-RoPE | aspect-normalized released coordinates | applies a `0.5` spatial heuristic at 256x256 | standard Diffusers coordinates for every exact/native preset |
+| block thinning | full 50-block released model | protects blocks 0, 1, and 49 and gate-ranks the remainder | exact uses all 50; fast/aggressive reuse h3.c's ranking algorithm on their own declared schedule |
+| attention implementation | PyTorch SDPA | Metal full attention | native HIP row-parallel full attention, with scalar diagnostic fallback, bounded by the independent block/full-forward oracles |
+| VisualVAE spatial context | fixed 256-pixel tiles | dynamically selects 288/320-pixel tiles | fixed 256-pixel tiles in the quality route |
+| decoder precision | released CUDA VisualVAE uses FP16 autocast | F32 decoder implementation | F32 VisualVAE and AudioVAE quality route; comparisons use numerical bounds rather than byte identity with CUDA |
+| RGB quantization | NumPy ties-to-even | `lrintf`, ties-to-even under the default rounding mode | explicit deterministic ties-to-even; covered by a byte-level PPM test |
+| output resize | pipeline/output-processor dependent | vImage high-quality scaling | FFmpeg Lanczos for fast/aggressive output-canvas scaling; exact performs no resize |
+| request duration | released pipeline accepts aligned 5--15 second requests | short native development examples | native additionally supports a 22-frame diagnostic/serving extension; it is not described as the released request envelope |
+| prompt length | pipeline/model tokenizer contract | implementation-specific | text-only serving deliberately caps prompts at 4,096 tokens |
+| conditioning modes | FL2VA plus first/last/reference pipeline layouts | corresponding reference modes exist | only text-only FL2VA is admitted; first frame, last frame, ordered references, and Ref2VA remain explicit future work |
+
+The audit found no remaining semantic difference in prompt presentation and
+layer-50 capture; raw grouped-QKV head packing; the converter's deliberate
+SwiGLU half swap versus raw checkpoint gate/up order; packed text/audio/video
+row order and modality tags; video patchification; channel-major audio
+packing; temporal positions; VisualVAE temporal chunking/blending and
+ImageNet de-normalization; AudioVAE normalization, convolution, SnakeBeta,
+clipping, and stereo order; or MP4 audio interleaving and A/V validation.
+
 Metal, MPSGraph, Objective-C runtime integration, command-line presentation,
 and Apple-specific resource management are not imported into the Linux
 runtime.
@@ -82,8 +123,8 @@ Current sampler-boundary adaptations:
 | --- | --- | --- |
 | `h3_host.c`, `h3_host.h` | `sampling.cpp`, `sampling.hpp` | Semantic C++20 translation of checked geometry, temporal alignment, text-only MM-RoPE layout, shifted serving schedules, timestep rows, PCG/Box-Muller noise, and explicit ownership/error handling |
 | packing and reuse helpers in `h3_dit.c` | `sampling.cpp`, `sampling.hpp` | Exact visual/audio row order, reuse selection, and bounded extrapolation retained; Ref2VA and frame-anchor segment kinds deferred |
-| `h3_euler_bf16` in `h3_shaders.metal` | `sampling.hip` | Operation-boundary translation to one gfx1151 HIP kernel; F32 sample state, BF16 velocities, fused extrapolation/update, bounds validation, and no CPU tensor fallback |
-| `tests/test_h3.c`, `tests/test_bf16.c` | MiniMax H3 sampling host/HIP tests | Exact schedule/layout/row-map/noise hashes, temporal cases, overflow/malformed inputs, round trips, reuse masks, and repeated byte-exact device Euler coverage |
+| `h3_euler_bf16` in `h3_shaders.metal` plus Diffusers Euler update | `sampling.hip` | Operation-boundary translation to one gfx1151 HIP kernel; F32 sample state and final-head velocities, Diffusers' materialized denoised/blend operation order, bounded extrapolation, bounds validation, and no CPU tensor fallback |
+| `tests/test_h3.c`, `tests/test_bf16.c`, and pinned Diffusers scheduler | MiniMax H3 sampling host/HIP tests | Exact `torch.linspace` schedule/layout/row-map/noise hashes, temporal cases, overflow/malformed inputs, round trips, reuse masks, and byte-exact single-step plus complete short-trajectory device Euler coverage |
 
 Current DiT-boundary adaptations:
 
@@ -97,21 +138,21 @@ Current full-denoiser adaptations:
 
 | Upstream source | Local destination | Method and material changes |
 | --- | --- | --- |
-| `h3_dit_schedule.c` | `denoiser.hpp`, `denoiser.hip` | Independent C++/HIP implementation of unique video/audio timestep rows, F32 timestep embedding, streamed per-block AdaLN projection, final modulation, and explicit phase telemetry |
-| token refinement, patch packing, core loop, and final heads in `h3_dit.c` | `denoiser.hip` | Complete text-only 50-block BF16 route; all core weights resident, fixed activation arenas, full attention, modality maps, F32 final heads, BF16 velocity boundary, cancellation after every block/step, and no CPU tensor compute |
-| GPU Euler denoise path in `h3_dit.c` | `denoiser.hip`, `sampling.hip` | Explicit development/serving/exact evaluation counts, active block prefixes, whole-velocity reuse with two BF16 boundaries, independent video/audio deltas, bounded extrapolation, and device-resident F32 samples |
-| `tests/test_real_dit.c`, `tests/test_semantic_dit.c` | `minimax_h3_denoiser_hip_test.hip`, `tools/strix/h3_denoiser_golden.py` | Tiny lifecycle smoke, 528-row full velocity/four-step latent oracle, retained 512x512x22x50 route, byte-repeat, cancellation/reuse, memory, page-fault, and zero-swap evidence |
+| `h3_dit_schedule.c` | `denoiser.hpp`, `denoiser.cpp`, `denoiser.hip` | Independent C++/HIP implementation of unique video/audio timestep rows, F32 timestep embedding, streamed per-block AdaLN projection, h3.c-compatible gate scoring/ranking with protected boundary blocks, final modulation, and explicit phase telemetry |
+| token refinement, patch packing, core loop, and final heads in `h3_dit.c` | `denoiser.hip` | Complete text-only 50-block BF16 route; all core weights resident, fixed activation arenas, full attention, modality maps, F32 final heads and velocity boundaries, cancellation after every block/step, and no CPU tensor compute |
+| GPU Euler denoise path in `h3_dit.c` plus Diffusers scheduler semantics | `denoiser.hip`, `sampling.cpp`, `sampling.hip` | Diffusers 5/20/50-point grids driving 4/19/49 evaluations, gate-ranked active blocks, whole-velocity reuse with two F32 boundaries, independent video/audio coefficients and two-stage operation order, bounded extrapolation, and device-resident F32 samples |
+| `tests/test_real_dit.c`, `tests/test_semantic_dit.c` | `minimax_h3_denoiser_hip_test.hip`, `tools/strix/h3_denoiser_golden.py` | Tiny lifecycle smoke and one independently generated 528-row full velocity forward; sampler trajectories remain covered by analytic host/HIP tests rather than routine multi-step model execution |
 
 Current output-decoder adaptations:
 
 | Upstream source | Local destination | Method and material changes |
 | --- | --- | --- |
-| VisualVAE load, temporal chunk, tiling, and selected-frame paths in `h3_video_vae.c` | `video_vae.hpp`, `video_vae.cpp`, `video_vae.hip` | C++20/HIP phase with exact released F32 weights, deterministic 256–320 pixel tile planning, seven-latent/22-frame chunks, bounded spatial/temporal output composition, selected-frame pruning, cancellation, and reusable scratch |
+| VisualVAE load, temporal chunk, tiling, and selected-frame paths in `h3_video_vae.c` plus released Diffusers VisualVAE defaults | `video_vae.hpp`, `video_vae.cpp`, `video_vae.hip` | C++20/HIP phase with exact released F32 weights, fixed 256-pixel spatial tiles, seven-latent/22-frame chunks, bounded spatial/temporal output composition, selected-frame pruning, cancellation, and reusable scratch |
 | VisualVAE kernels in `h3_shaders.metal` | `video_vae_ops.cuh` | Independent HIP implementation of latent normalization, patch embedding, RMS/layer norm, QKV normalization/RoPE, full attention, SwiGLU, residual scaling, output projection, and selected RGB unpack |
-| `h3_audio_vae.c` decoder path | `audio_vae.hpp`, `audio_vae.cpp`, `audio_vae.hip` | Released F32 decoder only; exact tensor contracts, resident normalized convolution weights, stereo-as-batch execution, seven BigVGAN stages, cancellation, byte-repeat, and memory/fault/swap telemetry; unused encoder attention is excluded |
+| `h3_audio_vae.c` decoder path | `audio_vae.hpp`, `audio_vae.cpp`, `audio_vae.hip` | Released F32 decoder only; exact tensor contracts, resident normalized convolution weights, stereo-as-batch execution, seven BigVGAN stages, cancellation, and memory/fault/swap telemetry; unused encoder attention is excluded |
 | AudioVAE kernels in `h3_shaders.metal` | `audio_vae_ops.cuh` | Independent HIP implementation of latent normalization, weight normalization, Conv1d, ConvTranspose1d, fused alias-free SnakeBeta, residual accumulation, clipping, and channel-major PCM output |
 | `h3_ffmpeg.c`, `tests/test_av_mux.c` | `media.hpp`, `media.cpp`, `minimax_h3_media_test.cpp` | C++20 two-pipe FFmpeg process with bounded PCM interleave staging, nonblocking cancellation-aware writes, deterministic cleanup, headless Nix dependency, FFprobe codec/geometry/rate/duration/sync validation, and no temporary uncompressed media file |
-| `tests/test_real_video_vae.c`, `tests/test_real_audio_vae.c` | VisualVAE/AudioVAE HIP tests and direct PyTorch golden tools | Operator-owned frozen latent/frame/waveform/spectrogram payloads, analytic primitive fixtures, external hashes, selected/full parity, stereo separation, clipping, cancellation, repeatability, and zero-swap gates |
+| `tests/test_real_video_vae.c`, `tests/test_real_audio_vae.c` | VisualVAE/AudioVAE HIP tests and direct PyTorch golden tools | Operator-owned frozen latent/frame/waveform/spectrogram payloads, analytic primitive fixtures, external hashes, one selected-frame video decode, one stereo audio decode, clipping, cancellation, and zero-swap gates |
 
 Current text-only orchestration adaptations:
 

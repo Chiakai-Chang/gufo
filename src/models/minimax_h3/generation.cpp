@@ -29,6 +29,19 @@ std::uint64_t NextOutputNonce() {
   return nonce.fetch_add(1, std::memory_order_relaxed);
 }
 
+std::uint8_t QuantizeRgb(float source) {
+  const float value =
+      std::clamp(std::isfinite(source) ? source : 0.0F, 0.0F, 1.0F);
+  const float scaled = value * 255.0F;
+  const float lower = std::floor(scaled);
+  const float fraction = scaled - lower;
+  const bool round_up =
+      fraction > 0.5F ||
+      (fraction == 0.5F &&
+       static_cast<unsigned int>(lower) % 2U != 0U);
+  return static_cast<std::uint8_t>(lower + (round_up ? 1.0F : 0.0F));
+}
+
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
     *error = std::move(message);
@@ -184,9 +197,7 @@ bool WriteFramesAtomic(const std::filesystem::path& directory,
         ppm.data() + ppm.size() - frame_elements);
     const float* source = frames.rgb.data() + frame * frame_elements;
     for (std::size_t index = 0; index < frame_elements; ++index) {
-      const float value = std::clamp(
-          std::isfinite(source[index]) ? source[index] : 0.0F, 0.0F, 1.0F);
-      pixels[index] = static_cast<unsigned char>(std::lround(value * 255.0F));
+      pixels[index] = QuantizeRgb(source[index]);
     }
     std::ostringstream name;
     name << "frame-" << std::setw(4) << std::setfill('0')
@@ -349,9 +360,7 @@ std::vector<std::uint8_t> ToRgb24(const VideoFrames& frames) {
   std::vector<std::uint8_t> result(frames.rgb.size());
   std::transform(
       frames.rgb.begin(), frames.rgb.end(), result.begin(), [](float source) {
-        const float value =
-            std::clamp(std::isfinite(source) ? source : 0.0F, 0.0F, 1.0F);
-        return static_cast<std::uint8_t>(std::lround(value * 255.0F));
+        return QuantizeRgb(source);
       });
   return result;
 }
@@ -397,7 +406,7 @@ std::optional<GenerationParameters> ResolveGenerationPreset(
                   .output_width = 512,
                   .output_height = 512,
                   .frames = 22,
-                  .evaluations = 50,
+                  .evaluations = 49,
                   .active_blocks = 50,
                   .reuse_interval = 1,
                   .selected_frames = {}};
@@ -408,7 +417,7 @@ std::optional<GenerationParameters> ResolveGenerationPreset(
                   .output_width = 512,
                   .output_height = 512,
                   .frames = 22,
-                  .evaluations = 20,
+                  .evaluations = 19,
                   .active_blocks = 45,
                   .reuse_interval = 2,
                   .selected_frames = {}};
@@ -419,7 +428,7 @@ std::optional<GenerationParameters> ResolveGenerationPreset(
                   .output_width = 512,
                   .output_height = 512,
                   .frames = 22,
-                  .evaluations = 20,
+                  .evaluations = 19,
                   .active_blocks = 40,
                   .reuse_interval = 3,
                   .selected_frames = {}};
@@ -451,7 +460,7 @@ bool ValidateGenerationParameters(const GenerationParameters& parameters,
       parameters.output_height < 2 || (parameters.output_width & 1) != 0 ||
       (parameters.output_height & 1) != 0 || parameters.evaluations < 2 ||
       parameters.evaluations > kH3MaximumEvaluations ||
-      parameters.active_blocks < 1 || parameters.active_blocks > 50 ||
+      parameters.active_blocks < 3 || parameters.active_blocks > 50 ||
       parameters.reuse_interval < 1 || parameters.reuse_interval > 32) {
     SetError(error, "invalid MiniMax H3 generation parameters");
     return false;
@@ -625,11 +634,9 @@ bool GenerateTextVideo(const GenerationRequest& request,
       static_cast<std::size_t>(geometry->temporal.video_latent_frames) *
       static_cast<std::size_t>(geometry->latent_height) *
       static_cast<std::size_t>(geometry->latent_width);
-  const std::size_t audio_elements =
-      kH3AudioLatentChannels * kH3AudioTracks *
-      static_cast<std::size_t>(geometry->temporal.audio_latent_frames);
-  auto noise =
-      BuildInitialNoise(request.seed, video_elements, audio_elements, error);
+  auto noise = BuildInitialNoise(
+      request.seed, video_elements, kH3AudioLatentChannels,
+      geometry->temporal.audio_latent_frames, error);
   if (!noise.has_value()) {
     return false;
   }

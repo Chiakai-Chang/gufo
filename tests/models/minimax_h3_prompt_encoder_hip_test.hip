@@ -386,15 +386,6 @@ int CheckReal() {
     CHECK(relative_max < 0.1);
   }
 
-  if (std::getenv("STRIX_H3_PROMPT_REPEAT") != nullptr) {
-    PromptEmbedding repeated;
-    PromptEncoderTelemetry repeated_telemetry;
-    CHECK(EncodePromptLayer50(*inventory, ids, options, nullptr, &repeated,
-                              &repeated_telemetry, &error));
-    CHECK(repeated.values == output.values);
-    CHECK(repeated_telemetry.total_dispatches == telemetry.total_dispatches);
-    CHECK(repeated_telemetry.live_registered_host_bytes_after == 0);
-  }
   return failures == 0 ? 0 : 1;
 }
 

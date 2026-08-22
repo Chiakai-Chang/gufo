@@ -405,8 +405,8 @@ static __global__ void AdaLnKernel(const std::uint16_t* input,
                                    const std::uint32_t* row_map,
                                    std::uint16_t* output, std::uint32_t rows,
                                    std::uint32_t width, std::uint32_t slots,
-                                   std::uint32_t scale_slot,
-                                   std::uint32_t shift_slot, float epsilon) {
+                                   std::uint32_t shift_slot,
+                                   std::uint32_t scale_slot, float epsilon) {
   const std::uint32_t row = blockIdx.x;
   const std::uint32_t lane = threadIdx.x;
   if (row >= rows) {
@@ -449,12 +449,12 @@ inline void LaunchAdaLn(const std::uint16_t* input, const std::uint16_t* weight,
                         const std::uint16_t* modulation,
                         const std::uint32_t* row_map, std::uint16_t* output,
                         std::uint32_t rows, std::uint32_t width,
-                        std::uint32_t slots, std::uint32_t scale_slot,
-                        std::uint32_t shift_slot, float epsilon,
+                        std::uint32_t slots, std::uint32_t shift_slot,
+                        std::uint32_t scale_slot, float epsilon,
                         hipStream_t stream) {
   hipLaunchKernelGGL(AdaLnKernel, dim3(rows), dim3(256), 0, stream, input,
                      weight, modulation, row_map, output, rows, width, slots,
-                     scale_slot, shift_slot, epsilon);
+                     shift_slot, scale_slot, epsilon);
 }
 
 static __global__ void GateKernel(const std::uint16_t* residual,

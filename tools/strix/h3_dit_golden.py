@@ -138,8 +138,8 @@ def rms_adaln(
     weight: torch.Tensor,
     modulation: torch.Tensor,
     row_map: torch.Tensor,
-    scale_slot: int,
     shift_slot: int,
+    scale_slot: int,
 ) -> torch.Tensor:
     values = input_tensor.float()
     inverse = torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + EPSILON)
