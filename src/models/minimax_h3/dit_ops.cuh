@@ -282,9 +282,9 @@ inline void LaunchFinalProjection(const std::uint16_t* input,
                      rows, input_width, output_width);
 }
 
-static __global__ void SwiGluKernel(const std::uint16_t* fused,
-                                    std::uint16_t* output, std::uint32_t rows,
-                                    std::uint32_t width) {
+static __global__ void SwiGluKernel(const std::uint16_t* __restrict__ fused,
+                                    std::uint16_t* __restrict__ output,
+                                    std::uint32_t rows, std::uint32_t width) {
   const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t row = blockIdx.y;
   if (row >= rows || column >= width) {
@@ -297,13 +297,61 @@ static __global__ void SwiGluKernel(const std::uint16_t* fused,
       FloatToBf16(gate / (1.0F + expf(-gate)) * up);
 }
 
+static __global__ void SwiGluVector8Kernel(
+    const std::uint16_t* __restrict__ fused, std::uint16_t* __restrict__ output,
+    std::uint32_t rows, std::uint32_t width) {
+  constexpr std::uint32_t kValuesPerThread = 8;
+  const std::uint32_t vector_column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t column = vector_column * kValuesPerThread;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= width) {
+    return;
+  }
+  const std::size_t gate_base =
+      static_cast<std::size_t>(row) * width * 2U + column;
+  const std::size_t up_base = gate_base + width;
+  const std::size_t output_base =
+      static_cast<std::size_t>(row) * width + column;
+#pragma unroll 1
+  for (std::uint32_t offset = 0; offset < kValuesPerThread; offset += 2U) {
+    const std::uint32_t gate_pair =
+        *reinterpret_cast<const std::uint32_t*>(fused + gate_base + offset);
+    const std::uint32_t up_pair =
+        *reinterpret_cast<const std::uint32_t*>(fused + up_base + offset);
+    const float gate0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(gate_pair & 0xFFFFU));
+    const float gate1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(gate_pair >> 16U));
+    const float up0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(up_pair & 0xFFFFU));
+    const float up1 = Bf16ToFloat(static_cast<std::uint16_t>(up_pair >> 16U));
+    const std::uint32_t result =
+        static_cast<std::uint32_t>(
+            FloatToBf16(gate0 / (1.0F + __expf(-gate0)) * up0)) |
+        (static_cast<std::uint32_t>(
+             FloatToBf16(gate1 / (1.0F + __expf(-gate1)) * up1))
+         << 16U);
+    *reinterpret_cast<std::uint32_t*>(output + output_base + offset) = result;
+  }
+}
+
 inline void LaunchSwiGlu(const std::uint16_t* fused, std::uint16_t* output,
                          std::uint32_t rows, std::uint32_t width,
                          hipStream_t stream) {
-  constexpr std::uint32_t kThreads = 256;
-  hipLaunchKernelGGL(SwiGluKernel,
-                     dim3((width + kThreads - 1U) / kThreads, rows),
-                     dim3(kThreads), 0, stream, fused, output, rows, width);
+  if (width % 8U == 0U) {
+    constexpr std::uint32_t kThreads = 128;
+    constexpr std::uint32_t kValuesPerThread = 8;
+    hipLaunchKernelGGL(SwiGluVector8Kernel,
+                       dim3((width + kThreads * kValuesPerThread - 1U) /
+                                (kThreads * kValuesPerThread),
+                            rows),
+                       dim3(kThreads), 0, stream, fused, output, rows, width);
+  } else {
+    constexpr std::uint32_t kThreads = 256;
+    hipLaunchKernelGGL(SwiGluKernel,
+                       dim3((width + kThreads - 1U) / kThreads, rows),
+                       dim3(kThreads), 0, stream, fused, output, rows, width);
+  }
 }
 
 static __global__ void RmsNormKernel(const std::uint16_t* input,
@@ -457,12 +505,13 @@ inline void LaunchAdaLn(const std::uint16_t* input, const std::uint16_t* weight,
                      shift_slot, scale_slot, epsilon);
 }
 
-static __global__ void GateKernel(const std::uint16_t* residual,
-                                  const std::uint16_t* branch,
-                                  const std::uint16_t* modulation,
-                                  const std::uint32_t* row_map,
-                                  std::uint16_t* output, std::uint32_t rows,
-                                  std::uint32_t width, std::uint32_t slots,
+static __global__ void GateKernel(const std::uint16_t* __restrict__ residual,
+                                  const std::uint16_t* __restrict__ branch,
+                                  const std::uint16_t* __restrict__ modulation,
+                                  const std::uint32_t* __restrict__ row_map,
+                                  std::uint16_t* __restrict__ output,
+                                  std::uint32_t rows, std::uint32_t width,
+                                  std::uint32_t slots,
                                   std::uint32_t gate_slot) {
   const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
   const std::uint32_t row = blockIdx.y;
@@ -478,6 +527,55 @@ static __global__ void GateKernel(const std::uint16_t* residual,
                                   Bf16ToFloat(modulation[modulation_index]));
 }
 
+static __global__ void GateVector8Kernel(
+    const std::uint16_t* __restrict__ residual,
+    const std::uint16_t* __restrict__ branch,
+    const std::uint16_t* __restrict__ modulation,
+    const std::uint32_t* __restrict__ row_map,
+    std::uint16_t* __restrict__ output, std::uint32_t rows, std::uint32_t width,
+    std::uint32_t slots, std::uint32_t gate_slot) {
+  constexpr std::uint32_t kValuesPerThread = 8;
+  const std::uint32_t vector_column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t column = vector_column * kValuesPerThread;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= width) {
+    return;
+  }
+  const std::size_t row_base = static_cast<std::size_t>(row) * width + column;
+  const std::size_t modulation_base =
+      static_cast<std::size_t>(row_map[row]) * slots * width +
+      static_cast<std::size_t>(gate_slot) * width + column;
+#pragma unroll 1
+  for (std::uint32_t offset = 0; offset < kValuesPerThread; offset += 2U) {
+    const std::uint32_t residual_pair =
+        *reinterpret_cast<const std::uint32_t*>(residual + row_base + offset);
+    const std::uint32_t branch_pair =
+        *reinterpret_cast<const std::uint32_t*>(branch + row_base + offset);
+    const std::uint32_t modulation_pair =
+        *reinterpret_cast<const std::uint32_t*>(modulation + modulation_base +
+                                                offset);
+    const float residual0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(residual_pair & 0xFFFFU));
+    const float residual1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(residual_pair >> 16U));
+    const float branch0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(branch_pair & 0xFFFFU));
+    const float branch1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(branch_pair >> 16U));
+    const float modulation0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(modulation_pair & 0xFFFFU));
+    const float modulation1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(modulation_pair >> 16U));
+    const std::uint32_t result =
+        static_cast<std::uint32_t>(
+            FloatToBf16(residual0 + branch0 * modulation0)) |
+        (static_cast<std::uint32_t>(
+             FloatToBf16(residual1 + branch1 * modulation1))
+         << 16U);
+    *reinterpret_cast<std::uint32_t*>(output + row_base + offset) = result;
+  }
+}
+
 inline void LaunchGate(const std::uint16_t* residual,
                        const std::uint16_t* branch,
                        const std::uint16_t* modulation,
@@ -485,10 +583,22 @@ inline void LaunchGate(const std::uint16_t* residual,
                        std::uint32_t rows, std::uint32_t width,
                        std::uint32_t slots, std::uint32_t gate_slot,
                        hipStream_t stream) {
-  constexpr std::uint32_t kThreads = 256;
-  hipLaunchKernelGGL(GateKernel, dim3((width + kThreads - 1U) / kThreads, rows),
-                     dim3(kThreads), 0, stream, residual, branch, modulation,
-                     row_map, output, rows, width, slots, gate_slot);
+  if (width % 8U == 0U) {
+    constexpr std::uint32_t kThreads = 128;
+    constexpr std::uint32_t kValuesPerThread = 8;
+    hipLaunchKernelGGL(GateVector8Kernel,
+                       dim3((width + kThreads * kValuesPerThread - 1U) /
+                                (kThreads * kValuesPerThread),
+                            rows),
+                       dim3(kThreads), 0, stream, residual, branch, modulation,
+                       row_map, output, rows, width, slots, gate_slot);
+  } else {
+    constexpr std::uint32_t kThreads = 256;
+    hipLaunchKernelGGL(GateKernel,
+                       dim3((width + kThreads - 1U) / kThreads, rows),
+                       dim3(kThreads), 0, stream, residual, branch, modulation,
+                       row_map, output, rows, width, slots, gate_slot);
+  }
 }
 
 static __global__ void GroupedQkvNormRopeKernel(
@@ -509,28 +619,38 @@ static __global__ void GroupedQkvNormRopeKernel(
       row_base + static_cast<std::size_t>(head) * head_dimension * 3U;
   const std::size_t key_base = query_base + head_dimension;
   const std::size_t value_base = key_base + head_dimension;
+  const float raw_query = Bf16ToFloat(qkv[query_base + dimension]);
+  const float raw_key = Bf16ToFloat(qkv[key_base + dimension]);
+  __shared__ float query_sums[128];
+  __shared__ float key_sums[128];
   __shared__ float inverses[2];
-  if (dimension == 0) {
-    float query_sum = 0.0F;
-    float key_sum = 0.0F;
-    for (std::uint32_t index = 0; index < head_dimension; ++index) {
-      const float query_value = Bf16ToFloat(qkv[query_base + index]);
-      const float key_value = Bf16ToFloat(qkv[key_base + index]);
-      query_sum = fmaf(query_value, query_value, query_sum);
-      key_sum = fmaf(key_value, key_value, key_sum);
+  query_sums[dimension] = raw_query * raw_query;
+  key_sums[dimension] = raw_key * raw_key;
+  __syncthreads();
+  for (std::uint32_t offset = blockDim.x / 2U; offset > 0; offset /= 2U) {
+    if (dimension < offset) {
+      query_sums[dimension] += query_sums[dimension + offset];
+      key_sums[dimension] += key_sums[dimension + offset];
     }
+    __syncthreads();
+  }
+  if (dimension == 0) {
     inverses[0] =
-        rsqrtf(query_sum / static_cast<float>(head_dimension) + epsilon);
+        rsqrtf(query_sums[0] / static_cast<float>(head_dimension) + epsilon);
     inverses[1] =
-        rsqrtf(key_sum / static_cast<float>(head_dimension) + epsilon);
+        rsqrtf(key_sums[0] / static_cast<float>(head_dimension) + epsilon);
   }
   __syncthreads();
-  float query_value = Bf16ToFloat(qkv[query_base + dimension]) * inverses[0] *
-                      Bf16ToFloat(query_weight[dimension]);
-  float key_value = Bf16ToFloat(qkv[key_base + dimension]) * inverses[1] *
-                    Bf16ToFloat(key_weight[dimension]);
+  const std::size_t output =
+      (static_cast<std::size_t>(row) * heads + head) * head_dimension +
+      dimension;
+  value[output] = qkv[value_base + dimension];
   if (dimension < rope_half) {
     const std::uint32_t pair = dimension + rope_half;
+    const float query_value =
+        raw_query * inverses[0] * Bf16ToFloat(query_weight[dimension]);
+    const float key_value =
+        raw_key * inverses[1] * Bf16ToFloat(key_weight[dimension]);
     const float paired_query = Bf16ToFloat(qkv[query_base + pair]) *
                                inverses[0] * Bf16ToFloat(query_weight[pair]);
     const float paired_key = Bf16ToFloat(qkv[key_base + pair]) * inverses[1] *
@@ -539,27 +659,129 @@ static __global__ void GroupedQkvNormRopeKernel(
         rope_cos[static_cast<std::size_t>(row) * rope_half + dimension]);
     const float sine = Bf16ToFloat(
         rope_sin[static_cast<std::size_t>(row) * rope_half + dimension]);
-    query_value = query_value * cosine - paired_query * sine;
-    key_value = key_value * cosine - paired_key * sine;
-  } else if (dimension < rope_half * 2U) {
-    const std::uint32_t pair = dimension - rope_half;
-    const float paired_query = Bf16ToFloat(qkv[query_base + pair]) *
-                               inverses[0] * Bf16ToFloat(query_weight[pair]);
-    const float paired_key = Bf16ToFloat(qkv[key_base + pair]) * inverses[1] *
-                             Bf16ToFloat(key_weight[pair]);
-    const float cosine =
-        Bf16ToFloat(rope_cos[static_cast<std::size_t>(row) * rope_half + pair]);
-    const float sine =
-        Bf16ToFloat(rope_sin[static_cast<std::size_t>(row) * rope_half + pair]);
-    query_value = query_value * cosine + paired_query * sine;
-    key_value = key_value * cosine + paired_key * sine;
+    query[output] = FloatToBf16(query_value * cosine - paired_query * sine);
+    key[output] = FloatToBf16(key_value * cosine - paired_key * sine);
+    query[output + rope_half] =
+        FloatToBf16(paired_query * cosine + query_value * sine);
+    key[output + rope_half] =
+        FloatToBf16(paired_key * cosine + key_value * sine);
+  } else if (dimension >= rope_half * 2U) {
+    query[output] = FloatToBf16(raw_query * inverses[0] *
+                                Bf16ToFloat(query_weight[dimension]));
+    key[output] =
+        FloatToBf16(raw_key * inverses[1] * Bf16ToFloat(key_weight[dimension]));
   }
+}
+
+static __global__ void GroupedQkvNormRopeWaveKernel(
+    const std::uint16_t* qkv, const std::uint16_t* query_weight,
+    const std::uint16_t* key_weight, const std::uint16_t* rope_cos,
+    const std::uint16_t* rope_sin, std::uint16_t* query, std::uint16_t* key,
+    std::uint16_t* value, std::uint32_t sequence, std::uint32_t heads,
+    float epsilon) {
+  constexpr std::uint32_t kHeadDimension = 128;
+  constexpr std::uint32_t kRopeHalf = 48;
+  constexpr std::uint32_t kHeadsPerBlock = 4;
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t head = blockIdx.y * kHeadsPerBlock + wave;
+  if (row >= sequence || head >= heads) {
+    return;
+  }
+  const std::size_t inner = static_cast<std::size_t>(heads) * kHeadDimension;
+  const std::size_t row_base = static_cast<std::size_t>(row) * inner * 3U;
+  const std::size_t query_base =
+      row_base + static_cast<std::size_t>(head) * kHeadDimension * 3U;
+  const std::size_t key_base = query_base + kHeadDimension;
+  const std::size_t value_base = key_base + kHeadDimension;
+  const std::uint32_t dimension0 = lane;
+  const std::uint32_t dimension1 = lane + 32U;
+  const std::uint32_t dimension2 = lane + 64U;
+  const std::uint32_t dimension3 = lane + 96U;
+  const float raw_query0 = Bf16ToFloat(qkv[query_base + dimension0]);
+  const float raw_query1 = Bf16ToFloat(qkv[query_base + dimension1]);
+  const float raw_query2 = Bf16ToFloat(qkv[query_base + dimension2]);
+  const float raw_query3 = Bf16ToFloat(qkv[query_base + dimension3]);
+  const float raw_key0 = Bf16ToFloat(qkv[key_base + dimension0]);
+  const float raw_key1 = Bf16ToFloat(qkv[key_base + dimension1]);
+  const float raw_key2 = Bf16ToFloat(qkv[key_base + dimension2]);
+  const float raw_key3 = Bf16ToFloat(qkv[key_base + dimension3]);
+  float query_sum = 0.0F;
+  query_sum = fmaf(raw_query0, raw_query0, query_sum);
+  query_sum = fmaf(raw_query1, raw_query1, query_sum);
+  query_sum = fmaf(raw_query2, raw_query2, query_sum);
+  query_sum = fmaf(raw_query3, raw_query3, query_sum);
+  float key_sum = 0.0F;
+  key_sum = fmaf(raw_key0, raw_key0, key_sum);
+  key_sum = fmaf(raw_key1, raw_key1, key_sum);
+  key_sum = fmaf(raw_key2, raw_key2, key_sum);
+  key_sum = fmaf(raw_key3, raw_key3, key_sum);
+#pragma unroll
+  for (std::uint32_t offset = 16; offset > 0; offset /= 2U) {
+    query_sum += __shfl_down(query_sum, offset);
+    key_sum += __shfl_down(key_sum, offset);
+  }
+  const float query_inverse = rsqrtf(
+      __shfl(query_sum, 0) / static_cast<float>(kHeadDimension) + epsilon);
+  const float key_inverse =
+      rsqrtf(__shfl(key_sum, 0) / static_cast<float>(kHeadDimension) + epsilon);
+  const float query0 =
+      raw_query0 * query_inverse * Bf16ToFloat(query_weight[dimension0]);
+  const float query1 =
+      raw_query1 * query_inverse * Bf16ToFloat(query_weight[dimension1]);
+  const float query2 =
+      raw_query2 * query_inverse * Bf16ToFloat(query_weight[dimension2]);
+  const float query3 =
+      raw_query3 * query_inverse * Bf16ToFloat(query_weight[dimension3]);
+  const float key0 =
+      raw_key0 * key_inverse * Bf16ToFloat(key_weight[dimension0]);
+  const float key1 =
+      raw_key1 * key_inverse * Bf16ToFloat(key_weight[dimension1]);
+  const float key2 =
+      raw_key2 * key_inverse * Bf16ToFloat(key_weight[dimension2]);
+  const float key3 =
+      raw_key3 * key_inverse * Bf16ToFloat(key_weight[dimension3]);
+  const std::size_t rope_base = static_cast<std::size_t>(row) * kRopeHalf;
+  const float cosine0 = Bf16ToFloat(rope_cos[rope_base + dimension0]);
+  const float sine0 = Bf16ToFloat(rope_sin[rope_base + dimension0]);
+  const std::uint32_t peer_lane = lane ^ 16U;
+  const float paired_query0_from1 = __shfl(query1, peer_lane);
+  const float paired_query0_from2 = __shfl(query2, peer_lane);
+  const float paired_key0_from1 = __shfl(key1, peer_lane);
+  const float paired_key0_from2 = __shfl(key2, peer_lane);
+  const float paired_query0 =
+      lane < 16U ? paired_query0_from1 : paired_query0_from2;
+  const float paired_key0 = lane < 16U ? paired_key0_from1 : paired_key0_from2;
+  const float paired_query1 = __shfl(query2, peer_lane);
+  const float paired_key1 = __shfl(key2, peer_lane);
   const std::size_t output =
-      (static_cast<std::size_t>(row) * heads + head) * head_dimension +
-      dimension;
-  query[output] = FloatToBf16(query_value);
-  key[output] = FloatToBf16(key_value);
-  value[output] = qkv[value_base + dimension];
+      (static_cast<std::size_t>(row) * heads + head) * kHeadDimension;
+  query[output + dimension0] =
+      FloatToBf16(query0 * cosine0 - paired_query0 * sine0);
+  query[output + kRopeHalf + dimension0] =
+      FloatToBf16(paired_query0 * cosine0 + query0 * sine0);
+  key[output + dimension0] = FloatToBf16(key0 * cosine0 - paired_key0 * sine0);
+  key[output + kRopeHalf + dimension0] =
+      FloatToBf16(paired_key0 * cosine0 + key0 * sine0);
+  if (lane < 16U) {
+    const float cosine1 = Bf16ToFloat(rope_cos[rope_base + dimension1]);
+    const float sine1 = Bf16ToFloat(rope_sin[rope_base + dimension1]);
+    query[output + dimension1] =
+        FloatToBf16(query1 * cosine1 - paired_query1 * sine1);
+    query[output + kRopeHalf + dimension1] =
+        FloatToBf16(paired_query1 * cosine1 + query1 * sine1);
+    key[output + dimension1] =
+        FloatToBf16(key1 * cosine1 - paired_key1 * sine1);
+    key[output + kRopeHalf + dimension1] =
+        FloatToBf16(paired_key1 * cosine1 + key1 * sine1);
+  }
+  query[output + dimension3] = FloatToBf16(query3);
+  key[output + dimension3] = FloatToBf16(key3);
+  value[output + dimension0] = qkv[value_base + dimension0];
+  value[output + dimension1] = qkv[value_base + dimension1];
+  value[output + dimension2] = qkv[value_base + dimension2];
+  value[output + dimension3] = qkv[value_base + dimension3];
 }
 
 inline void LaunchGroupedQkvNormRope(
@@ -569,10 +791,19 @@ inline void LaunchGroupedQkvNormRope(
     std::uint16_t* value, std::uint32_t sequence, std::uint32_t heads,
     std::uint32_t head_dimension, std::uint32_t rope_half, float epsilon,
     hipStream_t stream) {
-  hipLaunchKernelGGL(GroupedQkvNormRopeKernel, dim3(sequence, heads),
-                     dim3(head_dimension), 0, stream, qkv, query_weight,
-                     key_weight, rope_cos, rope_sin, query, key, value,
-                     sequence, heads, head_dimension, rope_half, epsilon);
+  if (head_dimension == 128U && rope_half == 48U) {
+    constexpr std::uint32_t kHeadsPerBlock = 4;
+    hipLaunchKernelGGL(
+        GroupedQkvNormRopeWaveKernel,
+        dim3(sequence, (heads + kHeadsPerBlock - 1U) / kHeadsPerBlock),
+        dim3(128), 0, stream, qkv, query_weight, key_weight, rope_cos, rope_sin,
+        query, key, value, sequence, heads, epsilon);
+  } else {
+    hipLaunchKernelGGL(GroupedQkvNormRopeKernel, dim3(sequence, heads),
+                       dim3(head_dimension), 0, stream, qkv, query_weight,
+                       key_weight, rope_cos, rope_sin, query, key, value,
+                       sequence, heads, head_dimension, rope_half, epsilon);
+  }
 }
 
 static __global__ void FullAttentionScalarKernel(
@@ -727,10 +958,9 @@ inline void LaunchFullAttention(const std::uint16_t* query,
   }
 }
 
-static __global__ void SoftmaxScoresToBf16Kernel(const float* scores,
-                                                 std::uint16_t* probabilities,
-                                                 std::uint32_t sequence,
-                                                 std::uint32_t heads) {
+static __global__ void SoftmaxScoresToBf16SharedKernel(
+    const float* scores, std::uint16_t* probabilities, std::uint32_t sequence,
+    std::uint32_t heads) {
   const std::uint32_t query_row = blockIdx.x;
   const std::uint32_t head = blockIdx.y;
   const std::uint32_t lane = threadIdx.x;
@@ -780,15 +1010,263 @@ static __global__ void SoftmaxScoresToBf16Kernel(const float* scores,
   }
 }
 
-inline void LaunchSoftmaxScoresToBf16(const float* scores,
+template<std::uint32_t kWaves>
+__device__ __forceinline__ float SoftmaxBlockReduceMax(float value,
+                                                       float* wave_values) {
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+#pragma unroll
+  for (std::uint32_t offset = 16; offset > 0; offset /= 2U) {
+    value = fmaxf(value, __shfl_down(value, offset));
+  }
+  if (lane == 0) {
+    wave_values[wave] = value;
+  }
+  __syncthreads();
+  value = threadIdx.x < kWaves ? wave_values[lane] : -INFINITY;
+  if (wave == 0) {
+#pragma unroll
+    for (std::uint32_t offset = 16; offset > 0; offset /= 2U) {
+      value = fmaxf(value, __shfl_down(value, offset));
+    }
+    if (lane == 0) {
+      wave_values[0] = value;
+    }
+  }
+  __syncthreads();
+  return wave_values[0];
+}
+
+template<std::uint32_t kWaves>
+__device__ __forceinline__ float SoftmaxBlockReduceSum(float value,
+                                                       float* wave_values) {
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+#pragma unroll
+  for (std::uint32_t offset = 16; offset > 0; offset /= 2U) {
+    value += __shfl_down(value, offset);
+  }
+  if (lane == 0) {
+    wave_values[wave] = value;
+  }
+  __syncthreads();
+  value = threadIdx.x < kWaves ? wave_values[lane] : 0.0F;
+  if (wave == 0) {
+#pragma unroll
+    for (std::uint32_t offset = 16; offset > 0; offset /= 2U) {
+      value += __shfl_down(value, offset);
+    }
+    if (lane == 0) {
+      wave_values[0] = value;
+    }
+  }
+  __syncthreads();
+  return wave_values[0];
+}
+
+__device__ __forceinline__ float LoadSoftmaxScore(const float* scores,
+                                                  std::size_t base,
+                                                  std::uint32_t key_row,
+                                                  std::uint32_t sequence) {
+  return key_row < sequence ? scores[base + key_row] : -INFINITY;
+}
+
+__device__ __forceinline__ void StoreSoftmaxProbability(
+    std::uint16_t* probabilities, std::size_t base, std::uint32_t key_row,
+    std::uint32_t sequence, float value) {
+  if (key_row < sequence) {
+    probabilities[base + key_row] = FloatToBf16(value);
+  }
+}
+
+static __global__ void SoftmaxScoresToBf16Cached128Kernel(
+    const float* scores, std::uint16_t* probabilities, std::uint32_t sequence,
+    std::uint32_t heads) {
+  constexpr std::uint32_t kThreads = 128;
+  const std::uint32_t query_row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t lane = threadIdx.x;
+  if (query_row >= sequence || head >= heads) {
+    return;
+  }
+  const std::size_t base =
+      (static_cast<std::size_t>(head) * sequence + query_row) * sequence;
+  float4 score0 = {
+      LoadSoftmaxScore(scores, base, lane + 0U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 1U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 2U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 3U * kThreads, sequence)};
+  float4 score1 = {
+      LoadSoftmaxScore(scores, base, lane + 4U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 5U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 6U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 7U * kThreads, sequence)};
+  float4 score2 = {
+      LoadSoftmaxScore(scores, base, lane + 8U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 9U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 10U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 11U * kThreads, sequence)};
+  float4 score3 = {
+      LoadSoftmaxScore(scores, base, lane + 12U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 13U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 14U * kThreads, sequence),
+      LoadSoftmaxScore(scores, base, lane + 15U * kThreads, sequence)};
+  float local_maximum = -INFINITY;
+  local_maximum = fmaxf(local_maximum, score0.x);
+  local_maximum = fmaxf(local_maximum, score0.y);
+  local_maximum = fmaxf(local_maximum, score0.z);
+  local_maximum = fmaxf(local_maximum, score0.w);
+  local_maximum = fmaxf(local_maximum, score1.x);
+  local_maximum = fmaxf(local_maximum, score1.y);
+  local_maximum = fmaxf(local_maximum, score1.z);
+  local_maximum = fmaxf(local_maximum, score1.w);
+  local_maximum = fmaxf(local_maximum, score2.x);
+  local_maximum = fmaxf(local_maximum, score2.y);
+  local_maximum = fmaxf(local_maximum, score2.z);
+  local_maximum = fmaxf(local_maximum, score2.w);
+  local_maximum = fmaxf(local_maximum, score3.x);
+  local_maximum = fmaxf(local_maximum, score3.y);
+  local_maximum = fmaxf(local_maximum, score3.z);
+  local_maximum = fmaxf(local_maximum, score3.w);
+  __shared__ float wave_values[4];
+  const float maximum = SoftmaxBlockReduceMax<4>(local_maximum, wave_values);
+  score0.x = __expf(score0.x - maximum);
+  score0.y = __expf(score0.y - maximum);
+  score0.z = __expf(score0.z - maximum);
+  score0.w = __expf(score0.w - maximum);
+  score1.x = __expf(score1.x - maximum);
+  score1.y = __expf(score1.y - maximum);
+  score1.z = __expf(score1.z - maximum);
+  score1.w = __expf(score1.w - maximum);
+  score2.x = __expf(score2.x - maximum);
+  score2.y = __expf(score2.y - maximum);
+  score2.z = __expf(score2.z - maximum);
+  score2.w = __expf(score2.w - maximum);
+  score3.x = __expf(score3.x - maximum);
+  score3.y = __expf(score3.y - maximum);
+  score3.z = __expf(score3.z - maximum);
+  score3.w = __expf(score3.w - maximum);
+  float local_sum = 0.0F;
+  local_sum += score0.x;
+  local_sum += score0.y;
+  local_sum += score0.z;
+  local_sum += score0.w;
+  local_sum += score1.x;
+  local_sum += score1.y;
+  local_sum += score1.z;
+  local_sum += score1.w;
+  local_sum += score2.x;
+  local_sum += score2.y;
+  local_sum += score2.z;
+  local_sum += score2.w;
+  local_sum += score3.x;
+  local_sum += score3.y;
+  local_sum += score3.z;
+  local_sum += score3.w;
+  const float inverse_sum =
+      1.0F / SoftmaxBlockReduceSum<4>(local_sum, wave_values);
+  StoreSoftmaxProbability(probabilities, base, lane + 0U * kThreads, sequence,
+                          score0.x * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 1U * kThreads, sequence,
+                          score0.y * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 2U * kThreads, sequence,
+                          score0.z * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 3U * kThreads, sequence,
+                          score0.w * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 4U * kThreads, sequence,
+                          score1.x * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 5U * kThreads, sequence,
+                          score1.y * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 6U * kThreads, sequence,
+                          score1.z * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 7U * kThreads, sequence,
+                          score1.w * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 8U * kThreads, sequence,
+                          score2.x * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 9U * kThreads, sequence,
+                          score2.y * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 10U * kThreads, sequence,
+                          score2.z * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 11U * kThreads, sequence,
+                          score2.w * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 12U * kThreads, sequence,
+                          score3.x * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 13U * kThreads, sequence,
+                          score3.y * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 14U * kThreads, sequence,
+                          score3.z * inverse_sum);
+  StoreSoftmaxProbability(probabilities, base, lane + 15U * kThreads, sequence,
+                          score3.w * inverse_sum);
+}
+
+__device__ __forceinline__ float SoftmaxWaveReduceMax(float value) {
+#pragma unroll
+  for (std::uint32_t offset = 16; offset > 0; offset /= 2U) {
+    value = fmaxf(value, __shfl_down(value, offset));
+  }
+  return __shfl(value, 0);
+}
+
+__device__ __forceinline__ float SoftmaxWaveReduceSum(float value) {
+#pragma unroll
+  for (std::uint32_t offset = 16; offset > 0; offset /= 2U) {
+    value += __shfl_down(value, offset);
+  }
+  return __shfl(value, 0);
+}
+
+static __global__ void SoftmaxScoresToBf16WaveKernel(
+    float* scores, std::uint16_t* probabilities, std::uint32_t sequence,
+    std::uint32_t heads) {
+  constexpr std::uint32_t kRowsPerBlock = 4;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t query_row = blockIdx.x * kRowsPerBlock + wave;
+  const std::uint32_t head = blockIdx.y;
+  if (query_row >= sequence || head >= heads) {
+    return;
+  }
+  const std::size_t base =
+      (static_cast<std::size_t>(head) * sequence + query_row) * sequence;
+  float local_maximum = -INFINITY;
+  for (std::uint32_t key_row = lane; key_row < sequence; key_row += 32U) {
+    local_maximum = fmaxf(local_maximum, scores[base + key_row]);
+  }
+  const float maximum = SoftmaxWaveReduceMax(local_maximum);
+  float local_sum = 0.0F;
+  for (std::uint32_t key_row = lane; key_row < sequence; key_row += 32U) {
+    const float value = __expf(scores[base + key_row] - maximum);
+    scores[base + key_row] = value;
+    local_sum += value;
+  }
+  const float inverse_sum = 1.0F / SoftmaxWaveReduceSum(local_sum);
+  for (std::uint32_t key_row = lane; key_row < sequence; key_row += 32U) {
+    probabilities[base + key_row] =
+        FloatToBf16(scores[base + key_row] * inverse_sum);
+  }
+}
+
+inline void LaunchSoftmaxScoresToBf16(float* scores,
                                       std::uint16_t* probabilities,
                                       std::uint32_t sequence,
                                       std::uint32_t heads, hipStream_t stream) {
-  constexpr std::uint32_t kThreads = 128;
-  hipLaunchKernelGGL(SoftmaxScoresToBf16Kernel, dim3(sequence, heads),
-                     dim3(kThreads),
-                     static_cast<std::size_t>(sequence) * sizeof(float), stream,
-                     scores, probabilities, sequence, heads);
+  constexpr std::uint32_t kFallbackThreads = 128;
+  if (sequence <= 640U) {
+    constexpr std::uint32_t kRowsPerBlock = 4;
+    hipLaunchKernelGGL(
+        SoftmaxScoresToBf16WaveKernel,
+        dim3((sequence + kRowsPerBlock - 1U) / kRowsPerBlock, heads), dim3(128),
+        0, stream, scores, probabilities, sequence, heads);
+  } else if (sequence <= 128U * 16U) {
+    hipLaunchKernelGGL(SoftmaxScoresToBf16Cached128Kernel,
+                       dim3(sequence, heads), dim3(128), 0, stream, scores,
+                       probabilities, sequence, heads);
+  } else {
+    hipLaunchKernelGGL(SoftmaxScoresToBf16SharedKernel, dim3(sequence, heads),
+                       dim3(kFallbackThreads),
+                       static_cast<std::size_t>(sequence) * sizeof(float),
+                       stream, scores, probabilities, sequence, heads);
+  }
 }
 
 }  // namespace strix::minimax_h3::dit_ops

@@ -228,6 +228,8 @@ if (OpenMP_CXX_FOUND)
 endif()
 
 if (ENGINE_ENABLE_HIP)
+  set_property(SOURCE src/models/minimax_h3/dit.hip
+    APPEND PROPERTY COMPILE_OPTIONS -O3)
   target_sources(strix_core PRIVATE
     src/core/hip/qwen_gpu_attention.hip
     src/core/hip/qwen_gpu_batched_ssm.hip
@@ -254,6 +256,7 @@ if (ENGINE_ENABLE_HIP)
     src/core/heterogeneous/npu_drafter.cpp
   )
   target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_HIP=1)
+  target_compile_definitions(strix_core PRIVATE CK_ENABLE_BF16=1)
   target_include_directories(strix_core SYSTEM PRIVATE
     ${COMPOSABLE_KERNEL_INCLUDE_DIR})
   target_link_libraries(strix_core PUBLIC hip::host roc::hipblas

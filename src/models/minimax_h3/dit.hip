@@ -18,6 +18,11 @@
 #include <utility>
 #include <vector>
 
+#include "ck/ck.hpp"
+#include "ck/tensor_operation/gpu/device/gemm_specialization.hpp"
+#include "ck/tensor_operation/gpu/device/impl/device_batched_gemm_softmax_gemm_permute_wmma_cshuffle.hpp"
+#include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
+#include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.cuh"
 
@@ -32,6 +37,73 @@ constexpr std::size_t kMaximumBatchedAttentionRows = 4'096;
 // Pinned by byte-repeat validation on gfx1151 with the repository's ROCm
 // 7.2.3 toolchain. A changed rocBLAS database fails session construction.
 constexpr rocblas_int kGfx1151RocblasBf16Solution = -1162085109;
+
+template<ck::index_t... Values>
+using CkSequence = ck::Sequence<Values...>;
+
+using CkPassThrough = ck::tensor_operation::element_wise::PassThrough;
+using CkScale = ck::tensor_operation::element_wise::Scale;
+
+using H3FusedAttention = ck::tensor_operation::device::
+    DeviceBatchedGemmSoftmaxGemmPermute_Wmma_CShuffle<
+        2, 1, 1, 1, 1, ck::bhalf_t, ck::bhalf_t, ck::bhalf_t, ck::bhalf_t,
+        ck::Tuple<>, float, ck::Tuple<>, float, float, CkPassThrough,
+        CkPassThrough, CkScale, CkPassThrough, CkPassThrough,
+        ck::tensor_operation::device::GemmSpecialization::MNKOPadding,
+        ck::tensor_operation::device::TensorSpecialization::Default,
+        ck::tensor_operation::device::TensorSpecialization::Default,
+        ck::tensor_operation::device::TensorSpecialization::Default,
+        ck::tensor_operation::device::TensorSpecialization::Default, 1, 128, 64,
+        128, 80, 8, 8, 80, 64, 8, 16, 16, 16, 1, 8, 5, CkSequence<2, 64, 1>,
+        CkSequence<1, 0, 2>, CkSequence<1, 0, 2>, 2, 8, 8, true,
+        CkSequence<2, 64, 1>, CkSequence<1, 0, 2>, CkSequence<1, 0, 2>, 2, 8, 8,
+        true, CkSequence<2, 8, 8>, CkSequence<0, 2, 1>, CkSequence<0, 2, 1>, 1,
+        2, 1, false, 1, 1, CkSequence<1, 64, 1, 2>, 8,
+        ck::tensor_operation::device::MaskingSpecialization::MaskDisabled>;
+
+auto MakeH3FusedAttentionArgument(const std::uint16_t* query,
+                                  const std::uint16_t* key,
+                                  const std::uint16_t* value,
+                                  std::uint16_t* output, std::size_t sequence) {
+  H3FusedAttention operation;
+  return operation.MakeArgument(
+      reinterpret_cast<const ck::bhalf_t*>(query),
+      reinterpret_cast<const ck::bhalf_t*>(key),
+      reinterpret_cast<const ck::bhalf_t*>(value),
+      reinterpret_cast<ck::bhalf_t*>(output),
+      static_cast<ck::index_t>(sequence), static_cast<ck::index_t>(sequence),
+      static_cast<ck::index_t>(kDitHeadDimension),
+      static_cast<ck::index_t>(kDitHeadDimension), 1,
+      static_cast<ck::index_t>(kDitAttentionHeads),
+      1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)), true, true);
+}
+
+bool SupportsH3FusedAttention(std::size_t sequence) {
+  if (sequence == 0 || sequence > kMaximumBatchedAttentionRows) {
+    return false;
+  }
+  H3FusedAttention operation;
+  const auto argument = MakeH3FusedAttentionArgument(nullptr, nullptr, nullptr,
+                                                     nullptr, sequence);
+  return operation.IsSupportedArgument(argument);
+}
+
+bool LaunchH3FusedAttention(const std::uint16_t* query,
+                            const std::uint16_t* key,
+                            const std::uint16_t* value, std::uint16_t* output,
+                            std::size_t sequence, hipStream_t stream) {
+  H3FusedAttention operation;
+  const auto argument =
+      MakeH3FusedAttentionArgument(query, key, value, output, sequence);
+  if (!operation.IsSupportedArgument(argument)) {
+    return false;
+  }
+  StreamConfig config;
+  config.stream_id_ = stream;
+  config.time_kernel_ = false;
+  operation.MakeInvoker().Run(argument, config);
+  return true;
+}
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -519,6 +591,7 @@ struct DitBlockSession::Impl {
   std::size_t rows{0};
   std::size_t modulation_rows{0};
   bool row_parallel_attention{true};
+  bool fused_attention{false};
   int device{0};
   hipStream_t stream{nullptr};
   hipEvent_t start_event{nullptr};
@@ -614,6 +687,8 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   if (!ValidateTarget(&impl->device, error)) {
     return nullptr;
   }
+  impl->fused_attention =
+      options.row_parallel_attention && SupportsH3FusedAttention(options.rows);
   hipError_t status =
       hipStreamCreateWithFlags(&impl->stream, hipStreamNonBlocking);
   if (status == hipSuccess) {
@@ -726,7 +801,7 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
       !allocate(&impl->gemm_first_mismatch, sizeof(unsigned long long))) {
     return nullptr;
   }
-  if (options.row_parallel_attention) {
+  if (options.row_parallel_attention && !impl->fused_attention) {
     if (options.rows > kMaximumBatchedAttentionRows) {
       SetError(error, "MiniMax H3 batched attention row limit exceeded");
       return nullptr;
@@ -734,26 +809,13 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
     const std::size_t score_bytes = attention_matrix_elements * sizeof(float);
     const std::size_t probability_bytes =
         attention_matrix_elements * sizeof(std::uint16_t);
-    if (options.attention_score_workspace != nullptr) {
-      if (options.attention_score_workspace_bytes < score_bytes ||
-          options.attention_probability_workspace == nullptr ||
-          options.attention_probability_workspace_bytes < probability_bytes) {
-        SetError(error, "MiniMax H3 shared attention workspace is too small");
-        return nullptr;
-      }
-      impl->attention_scores =
-          static_cast<float*>(options.attention_score_workspace);
-      impl->attention_probabilities =
-          static_cast<std::uint16_t*>(options.attention_probability_workspace);
-    } else {
-      if (!allocate(&impl->owned_attention_scores, score_bytes) ||
-          !allocate(&impl->owned_attention_probabilities, probability_bytes)) {
-        return nullptr;
-      }
-      impl->attention_scores = impl->owned_attention_scores.As<float>();
-      impl->attention_probabilities =
-          impl->owned_attention_probabilities.As<std::uint16_t>();
+    if (!allocate(&impl->owned_attention_scores, score_bytes) ||
+        !allocate(&impl->owned_attention_probabilities, probability_bytes)) {
+      return nullptr;
     }
+    impl->attention_scores = impl->owned_attention_scores.As<float>();
+    impl->attention_probabilities =
+        impl->owned_attention_probabilities.As<std::uint16_t>();
     impl->attention_workspace_bytes = score_bytes + probability_bytes;
   }
   if (!impl->gemm.Prepare(options.rows, kDitAttentionWidth * 3U, kDitHiddenSize,
@@ -998,7 +1060,16 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
   if (!CheckLaunch("H3 DiT grouped QKV norm/RoPE", error)) {
     return false;
   }
-  if (impl_->row_parallel_attention) {
+  if (impl_->fused_attention) {
+    if (!LaunchH3FusedAttention(impl_->query.As<std::uint16_t>(),
+                                impl_->key.As<std::uint16_t>(),
+                                impl_->value.As<std::uint16_t>(),
+                                impl_->attention_heads.As<std::uint16_t>(),
+                                impl_->rows, impl_->stream)) {
+      SetError(error, "MiniMax H3 fused attention rejected the prepared shape");
+      return false;
+    }
+  } else if (impl_->row_parallel_attention) {
     if (!impl_->attention_gemm.Scores(
             impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
             impl_->attention_scores, impl_->rows,
@@ -1111,7 +1182,11 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
     return false;
   }
   telemetry->gpu_ms = elapsed;
-  telemetry->dispatches = 11;
+  telemetry->dispatches = impl_->fused_attention ? 9 : 11;
+  telemetry->attention_backend =
+      impl_->fused_attention
+          ? "ck_bf16_wmma_fused"
+          : (impl_->row_parallel_attention ? "rocblas_materialized" : "scalar");
 
   const std::array<std::pair<std::string_view, std::span<std::uint16_t>>, 4>
       retained_tensors = {{

@@ -103,6 +103,7 @@
             inputsFrom = [ self.packages.${system}.default ];
             packages = [
               (pythonTools system)
+              pkgs.${system}.clang-tools
               pkgs.${system}.ffmpeg-headless
               pkgs.${system}.rocmPackages.rocprofiler-sdk
             ];

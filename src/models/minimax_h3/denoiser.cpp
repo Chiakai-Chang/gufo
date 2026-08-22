@@ -40,11 +40,10 @@ std::optional<double> DenoiserGateScore(
   std::size_t samples = 0;
   for (std::size_t row = 0; row < time_rows; ++row) {
     for (std::size_t modality = 0; modality < kGateModalities; ++modality) {
-      for (std::size_t slot : {std::size_t{2}, std::size_t{5}}) {
-        const std::size_t base =
-            ((row * kGateModalities * kGateSlots +
-              modality * kGateSlots + slot) *
-             kDitHiddenSize);
+      for (const std::size_t slot : {std::size_t{2}, std::size_t{5}}) {
+        const std::size_t base = ((row * kGateModalities * kGateSlots +
+                                   modality * kGateSlots + slot) *
+                                  kDitHiddenSize);
         for (std::size_t column = 0; column < kDitHiddenSize; ++column) {
           const std::uint32_t bits =
               static_cast<std::uint32_t>(modulation[base + column]) << 16U;

@@ -216,11 +216,9 @@ void TestLayouts() {
         std::sqrt(static_cast<double>(geometry.latent_height) *
                   geometry.latent_width);
     CHECK(std::abs(layout->positions[video_begin].height -
-                   (1.0 - height_ratio) * 16.0) <
-          1.0e-12);
+                   (1.0 - height_ratio) * 16.0) < 1.0e-12);
     CHECK(std::abs(layout->positions[video_begin].width -
-                   (1.0 - width_ratio) * 16.0) <
-          1.0e-12);
+                   (1.0 - width_ratio) * 16.0) < 1.0e-12);
     CHECK(std::abs(layout->positions[video_begin + 1].width -
                    layout->positions[video_begin].width - expected_step) <
           1.0e-12);
@@ -292,8 +290,7 @@ void TestLayouts() {
     CHECK(std::abs(temporal_weighted - 6498.0) < 1.0e-10);
   }
 
-  auto rectangular =
-      BuildTextOnlyLayout(6, Geometry(1344, 768, 22), &error);
+  auto rectangular = BuildTextOnlyLayout(6, Geometry(1344, 768, 22), &error);
   CHECK(rectangular.has_value());
   if (rectangular.has_value()) {
     const std::size_t begin = rectangular->segments[2].begin;
@@ -304,11 +301,9 @@ void TestLayouts() {
                   rectangular->latent_width);
     const double step = 64.0 / sqrt_area;
     CHECK(std::abs(rectangular->positions[begin + 1].width -
-                   rectangular->positions[begin].width - step) <
-          1.0e-12);
+                   rectangular->positions[begin].width - step) < 1.0e-12);
     CHECK(std::abs(rectangular->positions[begin + columns].height -
-                   rectangular->positions[begin].height - step) <
-          1.0e-12);
+                   rectangular->positions[begin].height - step) < 1.0e-12);
     CHECK(rectangular->positions[begin].height > 0.0);
     CHECK(rectangular->positions[begin].width < 0.0);
   }
@@ -386,13 +381,13 @@ void TestNoise() {
       geometry.latent_width;
   constexpr int audio_channels = 32;
   const int audio_time = geometry.temporal.audio_latent_frames;
-  const std::size_t audio_elements = static_cast<std::size_t>(
-      audio_channels * 2 * audio_time);
+  const std::size_t audio_elements =
+      static_cast<std::size_t>(audio_channels * 2 * audio_time);
   std::string error;
-  auto first = BuildInitialNoise(42, video_elements, audio_channels,
-                                 audio_time, &error);
-  auto second = BuildInitialNoise(42, video_elements, audio_channels,
-                                  audio_time, &error);
+  auto first =
+      BuildInitialNoise(42, video_elements, audio_channels, audio_time, &error);
+  auto second =
+      BuildInitialNoise(42, video_elements, audio_channels, audio_time, &error);
   CHECK(first.has_value());
   CHECK(second.has_value());
   if (!first.has_value() || !second.has_value()) {
@@ -524,8 +519,7 @@ void TestReuseAndEulerPlan() {
 
 #if !defined(ENGINE_ENABLE_HIP)
   CHECK(!strix::minimax_h3::HipEulerUpdate(nullptr, 0, 0, nullptr, nullptr, 0,
-                                           0.25F, 0.5F, 0.0F, nullptr,
-                                           &error));
+                                           0.25F, 0.5F, 0.0F, nullptr, &error));
   CHECK(error.find("ENGINE_ENABLE_HIP") != std::string::npos);
 #endif
 }

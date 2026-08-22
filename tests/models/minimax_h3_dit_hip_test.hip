@@ -195,7 +195,7 @@ void CheckCastsElementwiseAndNorms() {
 
 void CheckAdaLnGateAndSwiGlu() {
   constexpr std::uint32_t kRows = 3;
-  constexpr std::uint32_t kWidth = 5;
+  constexpr std::uint32_t kWidth = 8;
   constexpr std::uint32_t kSlots = 6;
   constexpr std::uint32_t kModulationRows = 2;
   std::vector<std::uint16_t> input(kRows * kWidth);
@@ -243,8 +243,7 @@ void CheckAdaLnGateAndSwiGlu() {
         1.0F / std::sqrt(mean_square / static_cast<float>(kWidth) + 1.0e-5F);
     const std::uint32_t modulation_row = row_map[row];
     for (std::uint32_t column = 0; column < kWidth; ++column) {
-      const float normalized =
-          ToFloat(input[row * kWidth + column]) * inverse;
+      const float normalized = ToFloat(input[row * kWidth + column]) * inverse;
       const float shift =
           ToFloat(modulation[(modulation_row * kSlots + 0) * kWidth + column]);
       const float scale =
@@ -264,11 +263,16 @@ void CheckAdaLnGateAndSwiGlu() {
   }
 
   constexpr std::uint32_t kSwiRows = 2;
-  constexpr std::uint32_t kSwiWidth = 3;
-  const std::vector<std::uint16_t> fused = {
-      ToBf16(-1.0F), ToBf16(0.0F),  ToBf16(2.0F),  ToBf16(3.0F),
-      ToBf16(4.0F),  ToBf16(-0.5F), ToBf16(0.5F),  ToBf16(-2.0F),
-      ToBf16(1.0F),  ToBf16(-1.0F), ToBf16(0.25F), ToBf16(2.0F)};
+  constexpr std::uint32_t kSwiWidth = 8;
+  std::vector<std::uint16_t> fused(kSwiRows * kSwiWidth * 2U);
+  for (std::uint32_t row = 0; row < kSwiRows; ++row) {
+    for (std::uint32_t column = 0; column < kSwiWidth; ++column) {
+      fused[(row * 2U) * kSwiWidth + column] =
+          ToBf16((static_cast<float>(row * kSwiWidth + column) - 6.0F) / 4.0F);
+      fused[(row * 2U + 1U) * kSwiWidth + column] =
+          ToBf16((static_cast<float>(column) - 3.0F) / 5.0F);
+    }
+  }
   DeviceArray<std::uint16_t> d_fused(fused.size());
   DeviceArray<std::uint16_t> d_swiglu(kSwiRows * kSwiWidth);
   CHECK(d_fused.CopyFrom(fused));
@@ -277,8 +281,14 @@ void CheckAdaLnGateAndSwiGlu() {
   CHECK(hipDeviceSynchronize() == hipSuccess);
   got.resize(kSwiRows * kSwiWidth);
   CHECK(d_swiglu.CopyTo(got));
-  for (const std::uint16_t value : got) {
-    CHECK(std::isfinite(ToFloat(value)));
+  for (std::uint32_t row = 0; row < kSwiRows; ++row) {
+    for (std::uint32_t column = 0; column < kSwiWidth; ++column) {
+      const float gate = ToFloat(fused[(row * 2U) * kSwiWidth + column]);
+      const float up = ToFloat(fused[(row * 2U + 1U) * kSwiWidth + column]);
+      const float expected = gate / (1.0F + std::exp(-gate)) * up;
+      CHECK(std::abs(ToFloat(got[row * kSwiWidth + column]) - expected) <
+            0.02F);
+    }
   }
 }
 
@@ -512,6 +522,20 @@ int CheckAnalytic() {
   return 0;
 }
 
+int CheckFocusedOps() {
+  if (!HasGfx1151()) {
+    std::cout << "SKIP: integrated gfx1151 is unavailable\n";
+    return 77;
+  }
+  CheckAdaLnGateAndSwiGlu();
+  if (failures != 0) {
+    std::cerr << failures << " MiniMax H3 focused operation checks failed\n";
+    return 1;
+  }
+  std::cout << "MiniMax H3 focused operation checks passed\n";
+  return 0;
+}
+
 template<typename T>
 bool ReadBinary(const std::filesystem::path& path, std::vector<T>* output) {
   std::error_code error;
@@ -687,7 +711,8 @@ int CheckReal() {
     std::cerr << error << '\n';
     return 1;
   }
-  CHECK(telemetry.dispatches == 11);
+  CHECK(telemetry.dispatches == 9);
+  CHECK(telemetry.attention_backend == "ck_bf16_wmma_fused");
   CHECK(telemetry.weight_bytes > 700ULL * 1024ULL * 1024ULL);
   CHECK(telemetry.activation_bytes > 0);
   CHECK(telemetry.scratch_address == scratch);
@@ -794,6 +819,10 @@ int ProfileProductionBlock() {
       output.size() * sizeof(output.front()));
   std::cout << "H3 DiT production block profile rows=" << kRows
             << " gpu_ms=" << telemetry.gpu_ms << " wall_ms=" << wall_ms
+            << " attention_backend=" << telemetry.attention_backend
+            << " activation_mib="
+            << static_cast<double>(telemetry.activation_bytes) /
+                   (1024.0 * 1024.0)
             << " output_sha256=" << h3::Sha256(bytes) << '\n';
   return 0;
 }
@@ -802,10 +831,15 @@ int ProfileProductionBlock() {
 
 int main(int argc, char** argv) {
   if (argc != 2 || (std::string_view(argv[1]) != "--analytic" &&
+                    std::string_view(argv[1]) != "--ops" &&
                     std::string_view(argv[1]) != "--real" &&
                     std::string_view(argv[1]) != "--profile-1872")) {
-    std::cerr << "usage: " << argv[0] << " --analytic|--real|--profile-1872\n";
+    std::cerr << "usage: " << argv[0]
+              << " --analytic|--ops|--real|--profile-1872\n";
     return 2;
+  }
+  if (std::string_view(argv[1]) == "--ops") {
+    return CheckFocusedOps();
   }
   if (std::string_view(argv[1]) == "--real") {
     return CheckReal();

@@ -28,10 +28,6 @@ struct DitBlockOptions {
   std::size_t rows{0};
   std::size_t modulation_rows{0};
   bool row_parallel_attention{true};
-  void* attention_score_workspace{nullptr};
-  std::size_t attention_score_workspace_bytes{0};
-  void* attention_probability_workspace{nullptr};
-  std::size_t attention_probability_workspace_bytes{0};
 };
 
 struct DitBlockInput {
@@ -64,6 +60,7 @@ struct DitBlockTelemetry {
   double load_ms{0.0};
   double gpu_ms{0.0};
   std::uintptr_t scratch_address{0};
+  std::string attention_backend;
   std::string first_non_finite;
 };
 

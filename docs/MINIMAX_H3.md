@@ -561,25 +561,35 @@ STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
 ```
 
 It executes block 0 once with deterministic production-shape inputs. The
-original custom full-attention path and the retained batched-QK/softmax/PV
-path measured:
+retained progression measured:
 
 | Attention implementation | Block GPU time |
 | --- | ---: |
 | custom row-parallel baseline | 38.518 s |
 | batched rocBLAS QK/PV + parallel BF16 softmax | 1.076 s |
+| CK BF16 WMMA fused attention + optimized elementwise path | 88.279 ms |
 
-The retained implementation is `35.79x` faster for that block, a 97.2%
-latency reduction. It allocates one shared F32 score matrix and one shared
-BF16 probability matrix for the denoiser, 1.097 GiB at 1,872 rows; all 50
-blocks reuse the same workspace rather than allocating per-block copies. The
-independent 528-row block oracle remains the quality gate and stays below its
-frozen 1% relative-error ceilings.
+The final implementation is `436.32x` faster than the original block and
+`12.19x` faster than the first batched path, a 99.77% and 91.80% latency
+reduction respectively. The supported production shape fuses QK, scaled
+softmax, and PV without materializing the former 1.097 GiB F32-score and
+BF16-probability matrices. A checked fallback allocates those matrices only
+for unsupported shapes. Grouped Q/K normalization and RoPE use one wave per
+head; SwiGLU and residual gates process eight BF16 values per thread; the H3
+DiT translation unit is compiled at `-O3`.
 
-The retained profile attributes 435.7 ms to parallel softmax, 390.3 ms to
-grouped QKV normalization/RoPE, and 208.9 ms to rocBLAS GEMMs. These are the
-next measured optimization candidates; no full denoiser run is needed to rank
-them.
+The final trace's eleven timed dispatches sum to 88.225 ms. Dense projections
+now dominate: the two MLP GEMMs take 22.594 and 21.881 ms, QKV projection
+takes 17.022 ms, fused attention takes 16.428 ms, and output projection takes
+7.527 ms. The independent 528-row block oracle remains the quality gate and
+stays below its frozen 1% relative-error ceilings. Two alternate QKV layouts
+were measured and removed because they preserved quality but increased
+production-shape latency.
+
+The associated 92.494 ms wall-time capture peaked at 44 W and 1,192 MHz. Power
+is diagnostic here: this isolated block finishes before the APU can ramp
+toward its configured 120--140 W envelope. The benchmark is not extended or
+repeated merely to produce a larger wattage reading.
 
 Historical scalar phase timing, used only for bottleneck ranking because its
 delivered MP4 is invalid quality evidence, attributes 98.326% of complete

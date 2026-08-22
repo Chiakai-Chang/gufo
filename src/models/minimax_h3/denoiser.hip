@@ -565,8 +565,6 @@ struct DenoiserSession::Impl {
   DeviceBuffer final_audio_weight;
   DeviceBuffer final_audio_bias;
   DeviceBuffer final_modulation;
-  DeviceBuffer attention_score_workspace;
-  DeviceBuffer attention_probability_workspace;
 
   DeviceBuffer video_sample;
   DeviceBuffer audio_sample;
@@ -919,9 +917,9 @@ struct DenoiserSession::Impl {
         !activated.Allocate(hidden.bytes(), error) ||
         !projected.Allocate(
             time_rows.time_rows * kTimeOutputWidth * sizeof(float), error) ||
-        !output->Allocate(time_rows.time_rows * kTimeOutputWidth *
-                              sizeof(std::uint16_t),
-                          error) ||
+        !output->Allocate(
+            time_rows.time_rows * kTimeOutputWidth * sizeof(std::uint16_t),
+            error) ||
         !Load(*input_weight, &input_weight_device, cancellation, error) ||
         !Load(*input_bias, &input_bias_device, cancellation, error) ||
         !Load(*output_weight, &output_weight_device, cancellation, error) ||
@@ -950,8 +948,7 @@ struct DenoiserSession::Impl {
     // modulation bias in every transformer block.
     dit_ops::LaunchSiluF32(projected.As<float>(), hidden.As<float>(),
                            time_rows.time_rows * kTimeOutputWidth, stream);
-    dit_ops::LaunchF32ToBf16(hidden.As<float>(),
-                             output->As<std::uint16_t>(),
+    dit_ops::LaunchF32ToBf16(hidden.As<float>(), output->As<std::uint16_t>(),
                              time_rows.time_rows * kTimeOutputWidth, stream);
     if (!CheckLaunch("H3 timestep embedding", error)) {
       return false;
@@ -1034,21 +1031,6 @@ struct DenoiserSession::Impl {
     if (!BuildRope(&rope_cos, &rope_sin, error)) {
       return false;
     }
-    if (row_parallel_attention) {
-      const std::size_t elements =
-          layout.rows() * layout.rows() * kDitAttentionHeads;
-      if (!attention_score_workspace.Allocate(elements * sizeof(float),
-                                              error) ||
-          !attention_probability_workspace.Allocate(
-              elements * sizeof(std::uint16_t), error)) {
-        return false;
-      }
-      base_telemetry.scratch_bytes += attention_score_workspace.bytes() +
-                                      attention_probability_workspace.bytes();
-      base_telemetry.cumulative_allocation_bytes +=
-          attention_score_workspace.bytes() +
-          attention_probability_workspace.bytes();
-    }
     std::vector<std::size_t> selected_blocks;
     std::vector<std::vector<std::uint16_t>> ranked_modulations;
     std::vector<std::uint16_t> modulation;
@@ -1058,15 +1040,13 @@ struct DenoiserSession::Impl {
     } else {
       std::vector<double> gate_scores(kDitBlocks, 0.0);
       const std::size_t modulation_elements =
-          static_cast<std::size_t>(time_rows.time_rows) *
-          kBlockModulationWidth;
+          static_cast<std::size_t>(time_rows.time_rows) * kBlockModulationWidth;
       const std::size_t ranking_candidates = kDitBlocks - 3;
       const bool retain_modulations =
           modulation_elements <=
               std::numeric_limits<std::size_t>::max() /
                   (ranking_candidates * sizeof(std::uint16_t)) &&
-          modulation_elements * ranking_candidates *
-                  sizeof(std::uint16_t) <=
+          modulation_elements * ranking_candidates * sizeof(std::uint16_t) <=
               kMaximumRetainedGateRankingBytes;
       if (retain_modulations) {
         ranked_modulations.resize(kDitBlocks);
@@ -1146,13 +1126,7 @@ struct DenoiserSession::Impl {
            .rows = layout.rows(),
            .modulation_rows =
                static_cast<std::size_t>(time_rows.time_rows) * kDitModalities,
-           .row_parallel_attention = row_parallel_attention,
-           .attention_score_workspace = attention_score_workspace.data(),
-           .attention_score_workspace_bytes = attention_score_workspace.bytes(),
-           .attention_probability_workspace =
-               attention_probability_workspace.data(),
-           .attention_probability_workspace_bytes =
-               attention_probability_workspace.bytes()},
+           .row_parallel_attention = row_parallel_attention},
           cancellation, error);
       if (session == nullptr ||
           !session->PrepareConstants(modulation, rope_cos, rope_sin,
@@ -1271,11 +1245,10 @@ struct DenoiserSession::Impl {
                                       error) ||
         !video_velocity_f32.Allocate(video_elements * sizeof(float), error) ||
         !audio_velocity_f32.Allocate(audio_elements * sizeof(float), error) ||
-        (reuse_interval > 1 &&
-         (!previous_video_velocity_f32.Allocate(
-              video_elements * sizeof(float), error) ||
-          !previous_audio_velocity_f32.Allocate(
-              audio_elements * sizeof(float), error)))) {
+        (reuse_interval > 1 && (!previous_video_velocity_f32.Allocate(
+                                    video_elements * sizeof(float), error) ||
+                                !previous_audio_velocity_f32.Allocate(
+                                    audio_elements * sizeof(float), error)))) {
       return false;
     }
     hidden_a.resize(hidden_elements);
@@ -1394,6 +1367,7 @@ struct DenoiserSession::Impl {
                   static_cast<std::ptrdiff_t>(refined_text_host.size() +
                                               audio_projected_host.size()));
 
+    std::uint64_t block_dispatches = 0;
     for (std::size_t block = 0; block < blocks.size(); ++block) {
       if (IsCancelled(cancellation)) {
         SetError(error, "MiniMax H3 denoiser cancelled after block " +
@@ -1406,6 +1380,7 @@ struct DenoiserSession::Impl {
               cancellation, hidden_b, &block_telemetry, error)) {
         return false;
       }
+      block_dispatches += block_telemetry.dispatches;
       std::swap(hidden_a, hidden_b);
     }
 
@@ -1490,7 +1465,7 @@ struct DenoiserSession::Impl {
       return false;
     }
     forward_history.push_back(Milliseconds(begin, Clock::now()));
-    base_telemetry.dispatches += 2 + blocks.size() * 11 + 4;
+    base_telemetry.dispatches += 2 + block_dispatches + 4;
     return true;
   }
 
@@ -1690,27 +1665,25 @@ bool DenoiserSession::DenoiseWithProgress(
       }
       have_velocity = true;
     }
-    const void* previous_video =
-        impl_->reuse_interval > 1 ? impl_->previous_video_velocity_f32.data()
-                                  : impl_->video_velocity_f32.data();
-    const void* previous_audio =
-        impl_->reuse_interval > 1 ? impl_->previous_audio_velocity_f32.data()
-                                  : impl_->audio_velocity_f32.data();
+    const void* previous_video = impl_->reuse_interval > 1
+                                     ? impl_->previous_video_velocity_f32.data()
+                                     : impl_->video_velocity_f32.data();
+    const void* previous_audio = impl_->reuse_interval > 1
+                                     ? impl_->previous_audio_velocity_f32.data()
+                                     : impl_->audio_velocity_f32.data();
     const auto sampler_begin = Clock::now();
-    if (!HipEulerUpdate(
-            impl_->video_sample.data(),
-            impl_->video_sample.bytes() / sizeof(float), 0,
-            impl_->video_velocity_f32.data(), previous_video,
-            impl_->video_velocity_f32.bytes() / sizeof(float),
-            plan.video_sigma_from_timestep, plan.video_ratio,
-            plan.video_extrapolation, impl_->stream, error) ||
-        !HipEulerUpdate(
-            impl_->audio_sample.data(),
-            impl_->audio_sample.bytes() / sizeof(float), 0,
-            impl_->audio_velocity_f32.data(), previous_audio,
-            impl_->audio_velocity_f32.bytes() / sizeof(float),
-            plan.audio_sigma_from_timestep, plan.audio_ratio,
-            plan.audio_extrapolation, impl_->stream, error)) {
+    if (!HipEulerUpdate(impl_->video_sample.data(),
+                        impl_->video_sample.bytes() / sizeof(float), 0,
+                        impl_->video_velocity_f32.data(), previous_video,
+                        impl_->video_velocity_f32.bytes() / sizeof(float),
+                        plan.video_sigma_from_timestep, plan.video_ratio,
+                        plan.video_extrapolation, impl_->stream, error) ||
+        !HipEulerUpdate(impl_->audio_sample.data(),
+                        impl_->audio_sample.bytes() / sizeof(float), 0,
+                        impl_->audio_velocity_f32.data(), previous_audio,
+                        impl_->audio_velocity_f32.bytes() / sizeof(float),
+                        plan.audio_sigma_from_timestep, plan.audio_ratio,
+                        plan.audio_extrapolation, impl_->stream, error)) {
       return false;
     }
     const hipError_t status = hipStreamSynchronize(impl_->stream);

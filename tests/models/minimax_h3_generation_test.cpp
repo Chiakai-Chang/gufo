@@ -43,15 +43,13 @@ void TestGateRankedBlocks() {
   constexpr std::size_t kModalities = 3;
   constexpr std::size_t kSlots = 6;
   constexpr std::size_t kWidth = 5376;
-  std::vector<std::uint16_t> modulation(
-      kRows * kModalities * kSlots * kWidth, ToBf16(64.0F));
+  std::vector<std::uint16_t> modulation(kRows * kModalities * kSlots * kWidth,
+                                        ToBf16(64.0F));
   for (std::size_t modality = 0; modality < kModalities; ++modality) {
     for (const std::size_t slot : {std::size_t{2}, std::size_t{5}}) {
-      const std::size_t base =
-          (modality * kSlots + slot) * kWidth;
+      const std::size_t base = (modality * kSlots + slot) * kWidth;
       for (std::size_t column = 0; column < kWidth; ++column) {
-        modulation[base + column] =
-            ToBf16((column & 1U) == 0U ? 2.0F : -2.0F);
+        modulation[base + column] = ToBf16((column & 1U) == 0U ? 2.0F : -2.0F);
       }
     }
   }
@@ -59,10 +57,9 @@ void TestGateRankedBlocks() {
   const auto score = h3::DenoiserGateScore(modulation, kRows, &error);
   Check(score.has_value() && *score == 2.0,
         "gate score averages only AdaLN slots 2 and 5");
-  Check(!h3::DenoiserGateScore(
-             std::span<const std::uint16_t>(modulation).first(
-                 modulation.size() - 1),
-             kRows, &error)
+  Check(!h3::DenoiserGateScore(std::span<const std::uint16_t>(modulation)
+                                   .first(modulation.size() - 1),
+                               kRows, &error)
              .has_value(),
         "gate score rejects malformed modulation");
 
@@ -70,8 +67,7 @@ void TestGateRankedBlocks() {
   for (std::size_t block = 0; block < scores.size(); ++block) {
     scores[block] = static_cast<double>(block);
   }
-  const auto fast =
-      h3::SelectGateRankedDenoiserBlocks(scores, 45, &error);
+  const auto fast = h3::SelectGateRankedDenoiserBlocks(scores, 45, &error);
   Check(fast.has_value() && fast->size() == 45,
         "fast gate-ranked selection has 45 blocks");
   if (fast.has_value()) {
@@ -87,10 +83,8 @@ void TestGateRankedBlocks() {
 
   scores.fill(1.0);
   scores[48] = 0.0;
-  const auto tied =
-      h3::SelectGateRankedDenoiserBlocks(scores, 48, &error);
-  Check(tied.has_value() &&
-            std::ranges::find(*tied, 48) == tied->end() &&
+  const auto tied = h3::SelectGateRankedDenoiserBlocks(scores, 48, &error);
+  Check(tied.has_value() && std::ranges::find(*tied, 48) == tied->end() &&
             std::ranges::find(*tied, 3) == tied->end() &&
             std::ranges::find(*tied, 2) != tied->end(),
         "gate ranking reproduces h3.c selection-sort tie behavior");
@@ -140,10 +134,8 @@ void TestPresetsAndReports() {
   Check(fast->internal_width == 384 && fast->evaluations == 19 &&
             fast->active_blocks == 45 && fast->reuse_interval == 2,
         "fast preset contract");
-  Check(aggressive->internal_width == 320 &&
-            aggressive->evaluations == 19 &&
-            aggressive->active_blocks == 40 &&
-            aggressive->reuse_interval == 3,
+  Check(aggressive->internal_width == 320 && aggressive->evaluations == 19 &&
+            aggressive->active_blocks == 40 && aggressive->reuse_interval == 3,
         "aggressive preset contract");
   Check(!dev->mux && !dev->decode_audio &&
             dev->selected_frames == std::vector<int>({0, 11, 21}),
@@ -253,8 +245,8 @@ void TestAtomicFrames() {
       Check(payload != std::string::npos && ppm.size() >= payload + 8,
             "PPM frame payload");
       if (payload != std::string::npos && ppm.size() >= payload + 8) {
-        const auto* pixels = reinterpret_cast<const unsigned char*>(
-            ppm.data() + payload + 5);
+        const auto* pixels =
+            reinterpret_cast<const unsigned char*>(ppm.data() + payload + 5);
         Check(pixels[0] == 0 && pixels[1] == 2 && pixels[2] == 2,
               "RGB halfway values use ties-to-even quantization");
       }

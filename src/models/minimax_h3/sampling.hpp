@@ -141,8 +141,7 @@ struct InitialNoise {
 
 [[nodiscard]] std::optional<InitialNoise> BuildInitialNoise(
     std::uint64_t seed, std::size_t video_elements, int audio_channels,
-    int audio_time,
-    std::string* error = nullptr);
+    int audio_time, std::string* error = nullptr);
 
 struct EulerStepPlan {
   bool evaluate{false};
@@ -169,14 +168,11 @@ struct EulerStepPlan {
 // sample_f32, last_f32, and previous_f32 must point to device memory.
 // stream is a hipStream_t passed opaquely to keep the public host header free
 // from ROCm headers. The update remains in device F32 between DiT evaluations.
-[[nodiscard]] bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
-                                  std::size_t sample_offset,
-                                  const void* last_f32,
-                                  const void* previous_f32,
-                                  std::size_t velocity_elements,
-                                  float sigma_from_timestep, float ratio,
-                                  float extrapolation, void* stream,
-                                  std::string* error = nullptr);
+[[nodiscard]] bool HipEulerUpdate(
+    void* sample_f32, std::size_t sample_elements, std::size_t sample_offset,
+    const void* last_f32, const void* previous_f32,
+    std::size_t velocity_elements, float sigma_from_timestep, float ratio,
+    float extrapolation, void* stream, std::string* error = nullptr);
 
 }  // namespace strix::minimax_h3
 

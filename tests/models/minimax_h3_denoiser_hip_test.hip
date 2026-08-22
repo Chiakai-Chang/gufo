@@ -77,8 +77,8 @@ template<typename Left, typename Right, typename ConvertLeft,
          typename ConvertRight>
 void CheckBoundary(std::string_view name, std::span<const Left> got,
                    std::span<const Right> expected, double relative_l2_bound,
-                   double relative_max_bound,
-                   ConvertLeft convert_left, ConvertRight convert_right) {
+                   double relative_max_bound, ConvertLeft convert_left,
+                   ConvertRight convert_right) {
   CHECK(got.size() == expected.size());
   double error_square = 0.0;
   double value_square = 0.0;
@@ -116,12 +116,11 @@ void CheckBf16Boundary(std::string_view name,
 }
 
 void CheckF32Boundary(std::string_view name, std::span<const float> got,
-                      std::span<const float> expected,
-                      double relative_l2_bound, double relative_max_bound) {
+                      std::span<const float> expected, double relative_l2_bound,
+                      double relative_max_bound) {
   CheckBoundary(
       name, got, expected, relative_l2_bound, relative_max_bound,
-      [](float value) { return value; },
-      [](float value) { return value; });
+      [](float value) { return value; }, [](float value) { return value; });
 }
 
 int CheckReal() {
@@ -242,22 +241,22 @@ int CheckOracle() {
   }
   const std::filesystem::path golden(golden_value);
   std::vector<std::pair<std::string_view, std::string_view>> hashes = {
-          {"conditioning.bf16",
-           "8015af1d2a551a0509bccc84372a30087f66721613f909c3f99e36ad7e269692"},
-          {"refined_text.bf16",
-           "be0d360ced628aa8778c95574a18f4593f938bdd0b72b292e1a8d452641e7aba"},
-          {"block0_modulation.bf16",
-           "38b0e3db26f24730a21304d5fa13fa049b6c5196c925cf5e87114505a1e87d39"},
-          {"row_map_step0.u32",
-           "816629a33e18daef4f94301aba7b54ba832c50db86fd8ae16a66f86f8d03f5d0"},
-          {"video_initial.f32",
-           "fce1ea483ab56dc3de354d0c056f05020ae80aba70450046b08d8ac12d9bd463"},
-          {"audio_initial.f32",
-           "d1c2934f2556c98e12aa0d9de550b0801037b8fea293946112d608132ca80b5f"},
-          {"video_velocity_step0.f32",
-           "2ae88a7d019cf64b6fc0d3a8d17e685e510304cf0e1a373a01acbf27db3d995b"},
-          {"audio_velocity_step0.f32",
-           "b17813b33cd76383b4614f9e025b4ecdfdad7ba60a204508d1a3ded25ada9079"},
+      {"conditioning.bf16",
+       "8015af1d2a551a0509bccc84372a30087f66721613f909c3f99e36ad7e269692"},
+      {"refined_text.bf16",
+       "be0d360ced628aa8778c95574a18f4593f938bdd0b72b292e1a8d452641e7aba"},
+      {"block0_modulation.bf16",
+       "38b0e3db26f24730a21304d5fa13fa049b6c5196c925cf5e87114505a1e87d39"},
+      {"row_map_step0.u32",
+       "816629a33e18daef4f94301aba7b54ba832c50db86fd8ae16a66f86f8d03f5d0"},
+      {"video_initial.f32",
+       "fce1ea483ab56dc3de354d0c056f05020ae80aba70450046b08d8ac12d9bd463"},
+      {"audio_initial.f32",
+       "d1c2934f2556c98e12aa0d9de550b0801037b8fea293946112d608132ca80b5f"},
+      {"video_velocity_step0.f32",
+       "2ae88a7d019cf64b6fc0d3a8d17e685e510304cf0e1a373a01acbf27db3d995b"},
+      {"audio_velocity_step0.f32",
+       "b17813b33cd76383b4614f9e025b4ecdfdad7ba60a204508d1a3ded25ada9079"},
   };
   for (const auto& [path, hash] : hashes) {
     CHECK(h3::Sha256File(golden / path) == hash);
@@ -538,7 +537,7 @@ int CheckReuseSmoke() {
   CHECK(Finite(first_video));
   CHECK(Finite(first_audio));
   CHECK(first.forward_ms.size() == 3);
-  CHECK(first.dispatches == 127);
+  CHECK(first.dispatches == 109);
   CHECK(first.swap_bytes == 0);
 
   std::cout << "H3 denoiser reuse smoke active_blocks=3 steps=5 "
@@ -552,12 +551,12 @@ int CheckReuseSmoke() {
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 2 || (std::string_view(argv[1]) != "--smoke" &&
-                    std::string_view(argv[1]) != "--oracle-forward" &&
-                    std::string_view(argv[1]) != "--oracle-512-forward" &&
-                    std::string_view(argv[1]) !=
-                        "--oracle-512-forward-scalar" &&
-                    std::string_view(argv[1]) != "--reuse-smoke")) {
+  if (argc != 2 ||
+      (std::string_view(argv[1]) != "--smoke" &&
+       std::string_view(argv[1]) != "--oracle-forward" &&
+       std::string_view(argv[1]) != "--oracle-512-forward" &&
+       std::string_view(argv[1]) != "--oracle-512-forward-scalar" &&
+       std::string_view(argv[1]) != "--reuse-smoke")) {
     std::cerr << "usage: " << argv[0]
               << " --smoke|--oracle-forward|--oracle-512-forward|"
                  "--oracle-512-forward-scalar|"
@@ -569,8 +568,8 @@ int main(int argc, char** argv) {
   }
   if (std::string_view(argv[1]) == "--oracle-512-forward" ||
       std::string_view(argv[1]) == "--oracle-512-forward-scalar") {
-    return CheckProductionShapeOracle(
-        std::string_view(argv[1]) != "--oracle-512-forward-scalar");
+    return CheckProductionShapeOracle(std::string_view(argv[1]) !=
+                                      "--oracle-512-forward-scalar");
   }
   if (std::string_view(argv[1]) == "--reuse-smoke") {
     return CheckReuseSmoke();

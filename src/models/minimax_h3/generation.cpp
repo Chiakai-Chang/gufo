@@ -37,8 +37,7 @@ std::uint8_t QuantizeRgb(float source) {
   const float fraction = scaled - lower;
   const bool round_up =
       fraction > 0.5F ||
-      (fraction == 0.5F &&
-       static_cast<unsigned int>(lower) % 2U != 0U);
+      (fraction == 0.5F && static_cast<unsigned int>(lower) % 2U != 0U);
   return static_cast<std::uint8_t>(lower + (round_up ? 1.0F : 0.0F));
 }
 
@@ -358,10 +357,8 @@ bool WriteLatentsAtomic(const std::filesystem::path& directory,
 #if defined(ENGINE_ENABLE_HIP)
 std::vector<std::uint8_t> ToRgb24(const VideoFrames& frames) {
   std::vector<std::uint8_t> result(frames.rgb.size());
-  std::transform(
-      frames.rgb.begin(), frames.rgb.end(), result.begin(), [](float source) {
-        return QuantizeRgb(source);
-      });
+  std::transform(frames.rgb.begin(), frames.rgb.end(), result.begin(),
+                 [](float source) { return QuantizeRgb(source); });
   return result;
 }
 
@@ -634,9 +631,9 @@ bool GenerateTextVideo(const GenerationRequest& request,
       static_cast<std::size_t>(geometry->temporal.video_latent_frames) *
       static_cast<std::size_t>(geometry->latent_height) *
       static_cast<std::size_t>(geometry->latent_width);
-  auto noise = BuildInitialNoise(
-      request.seed, video_elements, kH3AudioLatentChannels,
-      geometry->temporal.audio_latent_frames, error);
+  auto noise =
+      BuildInitialNoise(request.seed, video_elements, kH3AudioLatentChannels,
+                        geometry->temporal.audio_latent_frames, error);
   if (!noise.has_value()) {
     return false;
   }

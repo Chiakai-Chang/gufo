@@ -29,10 +29,10 @@ float ShiftSigma(float base, float shift) noexcept {
   // Diffusers evaluates these as distinct eager float32 tensor operations.
   // Volatile temporaries prevent the host compiler from contracting the
   // denominator multiply/add into an FMA.
-  volatile float numerator = shift * base;
-  volatile float shifted_offset = (shift - 1.0F) * base;
-  volatile float denominator = 1.0F + shifted_offset;
-  volatile float result = numerator / denominator;
+  const volatile float numerator = shift * base;
+  const volatile float shifted_offset = (shift - 1.0F) * base;
+  const volatile float denominator = 1.0F + shifted_offset;
+  const volatile float result = numerator / denominator;
   return result;
 }
 
@@ -633,8 +633,7 @@ std::optional<InitialNoise> BuildInitialNoise(std::uint64_t seed,
   std::size_t stereo_time = 0;
   std::size_t audio_elements = 0;
   if (video_elements == 0 || audio_channels < 1 || audio_time < 1 ||
-      !CheckedMultiply(2, static_cast<std::size_t>(audio_time),
-                       &stereo_time) ||
+      !CheckedMultiply(2, static_cast<std::size_t>(audio_time), &stereo_time) ||
       !CheckedMultiply(static_cast<std::size_t>(audio_channels), stereo_time,
                        &audio_elements)) {
     SetError(error, "MiniMax H3 noise tensors must be non-empty");
@@ -770,8 +769,8 @@ std::optional<std::vector<EulerStepPlan>> BuildEulerPlan(
 bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
                     std::size_t sample_offset, const void* last_f32,
                     const void* previous_f32, std::size_t velocity_elements,
-                    float sigma_from_timestep, float ratio,
-                    float extrapolation, void* stream, std::string* error) {
+                    float sigma_from_timestep, float ratio, float extrapolation,
+                    void* stream, std::string* error) {
   (void)sample_f32;
   (void)sample_elements;
   (void)sample_offset;

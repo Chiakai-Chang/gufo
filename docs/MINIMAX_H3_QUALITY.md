@@ -201,14 +201,22 @@ On the supported gfx1151 route, the complete 528-row block measured:
 | Retained boundary | Relative L2 | Relative max |
 | --- | ---: | ---: |
 | attention AdaLN | `1.07122e-5` | `0.00170068` |
-| attention output | `0.0018584` | `0.00429185` |
-| MLP AdaLN | `0.00219367` | `0.00887574` |
-| block output | `0.00475081` | `0.00966184` |
+| attention output | `0.00174641` | `0.00429185` |
+| MLP AdaLN | `0.00206138` | `0.00887574` |
+| block output | `0.00461029` | `0.00483092` |
 
 Every value is below the frozen `1e-2` limits. The session rejects a
 pre-cancelled block, out-of-range row maps, changed tensor shapes, non-finite
 retained values, and a rocBLAS solution that fails its construction-time
 validation.
+
+The issue #175 retained performance route uses CK BF16 WMMA fused attention
+for the supported production shape and does not materialize full attention
+score or probability matrices. Its one 1,872-row profile measured 88.279 ms
+GPU time and 92.494 ms wall time with output SHA-256
+`b049f1cebca31e5416bba9252606746900fc7874a838d3a9ad0f98d5732e4b16`.
+That profile is performance evidence only; the independent 528-row teacher
+above remains the correctness gate.
 
 Operator-local rocprof/ISA records identify the actual full-attention,
 grouped-QKV/RoPE, AdaLN, gate, SwiGLU, and gfx1151 rocBLAS kernels. Generated

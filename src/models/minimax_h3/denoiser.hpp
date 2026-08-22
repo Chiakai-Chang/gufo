@@ -44,8 +44,7 @@ struct DenoiserVelocity {
     std::string* error = nullptr);
 [[nodiscard]] std::optional<std::vector<std::size_t>>
 SelectGateRankedDenoiserBlocks(std::span<const double> gate_scores,
-                              int active_blocks,
-                              std::string* error = nullptr);
+                               int active_blocks, std::string* error = nullptr);
 
 struct DenoiserTelemetry {
   double text_refiner_ms{0.0};
