@@ -222,7 +222,7 @@ int main() {
     return std::isfinite(value) && value >= 0.0F && value <= 1.0F;
   }));
   CHECK(telemetry.tile_ms.size() == 1);
-  CHECK(telemetry.dispatches == 36 * 11 + 10);
+  CHECK(telemetry.dispatches == 36 * 13 + 10);
   CHECK(telemetry.first_non_finite.empty());
   CHECK(telemetry.swap_bytes == 0);
   std::cout << "H3 VisualVAE weight_gib="

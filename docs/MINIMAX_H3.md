@@ -547,10 +547,11 @@ numeric execution data.
 `tools/strix/h3_profile.py` drives the same public CLI route used by serving.
 It is a manual release tool, not a development or CI gate. Development
 optimization uses one independently frozen 528-row DiT block oracle for
-correctness and one 1,872-row DiT block for performance and profiling. Neither
-iteration gate runs all 50 blocks or advances a denoising schedule. A complete
-exact generation is run only when explicitly requested after those gates
-pass.
+correctness and one 1,872-row DiT block for performance and profiling.
+Decoder-local work uses the independently frozen 256x256 selected-frame
+VisualVAE oracle. Neither iteration gate runs all 50 blocks or advances a
+denoising schedule. A complete exact generation is run only when explicitly
+requested after those gates pass.
 
 The issue #175 performance workload is a manual single-block profile, not a
 CTest target:
@@ -591,12 +592,27 @@ is diagnostic here: this isolated block finishes before the APU can ramp
 toward its configured 120--140 W envelope. The benchmark is not extended or
 repeated merely to produce a larger wattage reading.
 
-Historical scalar phase timing, used only for bottleneck ranking because its
-delivered MP4 is invalid quality evidence, attributes 98.326% of complete
-latency to the denoiser, 1.240% to VisualVAE, 0.163% to prompt encoding, and
-0.016% to AudioVAE. The next optimization priority therefore remains the DiT
-forward. Dense projections/MLP and the host-staged block boundaries require
-focused profiling before any further change; VisualVAE is a distant second.
+The explicitly requested post-retention aggressive smoke changed the phase
+ranking: VisualVAE consumed `188.650` of `229.382` seconds (`82.24%`), while
+the optimized denoiser consumed `12.158` seconds (`5.30%`). A single focused
+selected-frame profile then attributed `42.815` of `46.685` GPU seconds to the
+scalar VisualVAE full-attention kernel.
+
+The retained decoder path replaces that kernel with strided-batched F32
+rocBLAS QK/PV GEMMs and an in-place stable F32 softmax. Exact-shape gfx1151
+solution indices then reduce the QKV, output, and two MLP projections without
+changing their F32 inputs, outputs, or accumulation type. On the same frozen
+256x256 tile, profiled wall time fell from `46.6852` seconds to `4.79063`
+seconds after attention replacement and finally to `2.82558` seconds. The
+final route is `16.522x` faster than the scalar baseline and `1.695x` faster
+than the first batched route.
+
+Selected-frame relative L2 remains `8.15249e-7`, the phase peak rises from
+9.38 GiB to 9.77 GiB for the 394.2 MiB F32 attention matrix, and sampled
+package power reaches `134 W`. The final profile is 88.73% rocBLAS matrix
+work. A cached softmax and faster attention-GEMM solution indices were
+discarded after their changed reduction order failed the frozen quality gate.
+No second MP4 or complete denoising trajectory was run for retention.
 
 The harness schedules each requested preset once, rejects `--rounds` values
 other than one, and requires an acknowledgement before it can launch a

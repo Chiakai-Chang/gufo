@@ -106,6 +106,7 @@
               pkgs.${system}.clang-tools
               pkgs.${system}.ffmpeg-headless
               pkgs.${system}.rocmPackages.rocprofiler-sdk
+              pkgs.${system}.sqlite
             ];
             env = {
               ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";

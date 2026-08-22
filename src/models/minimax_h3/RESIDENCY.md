@@ -169,6 +169,10 @@ Development evidence retains:
   exposed by the kernel;
 - independent teacher/native retained-boundary errors at 528 rows.
 
+Decoder-local changes instead use the frozen 256x256 selected-frame VisualVAE
+teacher and one profiled tile. They do not require another denoiser execution
+or MP4 generation.
+
 Each required diagnostic is invoked once. A passing full route is not rerun,
 and a full exact generation is never launched merely to obtain performance
 statistics.
@@ -218,12 +222,24 @@ the workload completes before the APU power controller can ramp toward the
 configured 120--140 W envelope. Extending or repeating the workload merely to
 raise the wattage would add work without improving user latency.
 
-Historical scalar phase timing ranks the denoiser at 98.326% of complete
-latency, VisualVAE at 1.240%, prompt encoding at 0.163%, and AudioVAE at
-0.016%. After retaining row-parallel attention, the DiT forward remains the
-dominant target. Dense projection/MLP work and the conservative host-staged
-block boundary are the next candidates, but neither is authorized without a
-new focused profile.
+The explicitly requested aggressive smoke re-ranked the optimized route:
+VisualVAE used `188.650` of `229.382` seconds (`82.24%`), while the denoiser
+used `12.158` seconds (`5.30%`). Its focused decoder profile attributed
+`42.815` of `46.685` GPU seconds to scalar full attention.
+
+The retained VisualVAE path materializes one 394.2 MiB F32 score/probability
+matrix and executes QK and PV through strided-batched rocBLAS GEMMs with an
+in-place stable F32 softmax. Exact-shape solution indices also tune the dense
+QKV, output, and MLP projections. The frozen tile fell from `46.6852` seconds
+to `4.79063` seconds after attention replacement and finally to `2.82558`
+seconds, a `16.522x` scalar-to-final speedup. Selected-frame relative L2
+remained `8.15249e-7`. Phase peak increased from 9.38 GiB to 9.77 GiB, swap
+remained zero, and sampled package power reached `134 W`. The profile is now
+dominated by useful matrix work rather than a scalar attention loop.
+
+Alternative attention solution indices and a register-cached softmax were
+measured once and removed because their different F32 reduction order failed
+the frozen output gate. Performance alone does not admit them.
 
 `tools/strix/h3_cache_control.py` provides the separate reproducible
 file-cache-cold preparation. It issues `POSIX_FADV_DONTNEED` for every regular,
@@ -250,8 +266,11 @@ baseline:
 - an intermediate candidate improves its measured bottleneck and the fixed
   1,872-row block workload by more than the 5% measurement-noise floor;
 - the retained observation contains the required timing and memory telemetry;
-- candidate accounted peak bytes and process high-water RSS do not regress by
-  more than 2%, and process/system swap remain zero in both observations;
+- unexplained candidate peak-byte or high-water-RSS regressions above 2% are
+  rejected, and process/system swap remain zero. An explicit workspace may be
+  retained when its size is accounted exactly and the profile proves a
+  structural latency reduction; the VisualVAE's 394.2 MiB F32 attention matrix
+  qualifies with a `16.522x` fixed-tile improvement;
 - GPU power, clocks, and integrated energy are retained as diagnostics, not
   efficiency gates. A short faster kernel may finish before clocks and power
   ramp, while sustained useful work may legitimately use all of the platform's

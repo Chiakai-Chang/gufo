@@ -279,88 +279,62 @@ inline void LaunchVideoQkvRope(const float* qkv, const float* cosine,
                      epsilon);
 }
 
-// One workgroup owns one (query row, head). Scores are retained in dynamic
-// shared memory so the value reduction does not materialize an NxN matrix.
-static __global__ void FullAttentionKernel(const float* query, const float* key,
-                                           const float* value, float* output,
-                                           std::uint32_t rows,
-                                           std::uint32_t heads,
-                                           std::uint32_t head_dimension,
-                                           float scale) {
-  extern __shared__ float shared[];
-  float* scores = shared;
-  float* reduction = scores + rows;
-  const std::uint32_t lane = threadIdx.x;
-  const std::uint32_t query_row = blockIdx.x;
+__device__ __forceinline__ float SoftmaxWaveMaximum(float value) {
+#pragma unroll
+  for (std::uint32_t offset = 16; offset != 0; offset >>= 1U) {
+    value = fmaxf(value, __shfl_down(value, offset));
+  }
+  return __shfl(value, 0);
+}
+
+__device__ __forceinline__ float SoftmaxWaveSum(float value) {
+#pragma unroll
+  for (std::uint32_t offset = 16; offset != 0; offset >>= 1U) {
+    value += __shfl_down(value, offset);
+  }
+  return __shfl(value, 0);
+}
+
+// rocBLAS materializes one score matrix per head as
+// [head][query_row][key_row]. Four independent gfx1151 wavefronts normalize
+// four rows per workgroup and retain the probabilities in FP32 for the PV GEMM.
+static __global__ void SoftmaxScoresInPlaceKernel(float* scores,
+                                                  std::uint32_t rows,
+                                                  std::uint32_t heads) {
+  constexpr std::uint32_t kRowsPerBlock = 4;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t query_row = blockIdx.x * kRowsPerBlock + wave;
   const std::uint32_t head = blockIdx.y;
   if (query_row >= rows || head >= heads) {
     return;
   }
-  const std::size_t query_base =
-      (static_cast<std::size_t>(query_row) * heads + head) * head_dimension;
-  float local_max = -INFINITY;
-  for (std::uint32_t key_row = lane; key_row < rows; key_row += blockDim.x) {
-    const std::size_t key_base =
-        (static_cast<std::size_t>(key_row) * heads + head) * head_dimension;
-    float dot = 0.0F;
-    for (std::uint32_t dimension = 0; dimension < head_dimension; ++dimension) {
-      dot = fmaf(query[query_base + dimension], key[key_base + dimension], dot);
-    }
-    dot *= scale;
-    scores[key_row] = dot;
-    local_max = fmaxf(local_max, dot);
+  const std::size_t base =
+      (static_cast<std::size_t>(head) * rows + query_row) * rows;
+  float local_maximum = -INFINITY;
+  for (std::uint32_t key_row = lane; key_row < rows; key_row += 32U) {
+    local_maximum = fmaxf(local_maximum, scores[base + key_row]);
   }
-  reduction[lane] = local_max;
-  __syncthreads();
-  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
-    if (lane < stride) {
-      reduction[lane] = fmaxf(reduction[lane], reduction[lane + stride]);
-    }
-    __syncthreads();
-  }
-  const float maximum = reduction[0];
+  const float maximum = SoftmaxWaveMaximum(local_maximum);
   float local_sum = 0.0F;
-  for (std::uint32_t key_row = lane; key_row < rows; key_row += blockDim.x) {
-    const float probability = expf(scores[key_row] - maximum);
-    scores[key_row] = probability;
+  for (std::uint32_t key_row = lane; key_row < rows; key_row += 32U) {
+    const float probability = expf(scores[base + key_row] - maximum);
+    scores[base + key_row] = probability;
     local_sum += probability;
   }
-  reduction[lane] = local_sum;
-  __syncthreads();
-  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
-    if (lane < stride) {
-      reduction[lane] += reduction[lane + stride];
-    }
-    __syncthreads();
-  }
-  const float inverse_sum = 1.0F / reduction[0];
-  for (std::uint32_t dimension = lane; dimension < head_dimension;
-       dimension += blockDim.x) {
-    float accumulated = 0.0F;
-    for (std::uint32_t key_row = 0; key_row < rows; ++key_row) {
-      const std::size_t value_index =
-          (static_cast<std::size_t>(key_row) * heads + head) * head_dimension +
-          dimension;
-      accumulated =
-          fmaf(scores[key_row] * inverse_sum, value[value_index], accumulated);
-    }
-    output[query_base + dimension] = accumulated;
+  const float inverse_sum = 1.0F / SoftmaxWaveSum(local_sum);
+  for (std::uint32_t key_row = lane; key_row < rows; key_row += 32U) {
+    scores[base + key_row] *= inverse_sum;
   }
 }
 
-inline void LaunchFullAttention(const float* query, const float* key,
-                                const float* value, float* output,
-                                std::uint32_t rows, std::uint32_t heads,
-                                std::uint32_t head_dimension, float scale,
-                                hipStream_t stream) {
-  // gfx1151 uses 32-lane wavefronts. Keep the complete softmax reduction in one
-  // wavefront; each lane emits two dimensions of the 64-wide attention head.
-  constexpr std::uint32_t kThreads = 32;
-  const std::size_t shared_bytes =
-      (static_cast<std::size_t>(rows) + kThreads) * sizeof(float);
-  hipLaunchKernelGGL(FullAttentionKernel, dim3(rows, heads), dim3(kThreads),
-                     shared_bytes, stream, query, key, value, output, rows,
-                     heads, head_dimension, scale);
+inline void LaunchSoftmaxScoresInPlace(float* scores, std::uint32_t rows,
+                                       std::uint32_t heads,
+                                       hipStream_t stream) {
+  constexpr std::uint32_t kRowsPerBlock = 4;
+  hipLaunchKernelGGL(SoftmaxScoresInPlaceKernel,
+                     dim3((rows + kRowsPerBlock - 1U) / kRowsPerBlock, heads),
+                     dim3(128), 0, stream, scores, rows, heads);
 }
 
 static __global__ void SwiGluKernel(const float* fused, float* output,

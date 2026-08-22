@@ -40,7 +40,8 @@ constexpr std::uint32_t kRegisters = 4;
 constexpr std::uint32_t kRopeHalf = 24;
 constexpr std::uint32_t kOutputPatch = 3 * 4 * 16 * 16;
 constexpr float kNormEpsilon = 1.0e-5F;
-constexpr rocblas_int kGfx1151RocblasF32Solution = -1162086482;
+constexpr rocblas_int kGfx1151RocblasF32CompactSolution = -386;
+constexpr rocblas_int kGfx1151RocblasF32WideSolution = -387;
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -300,6 +301,11 @@ public:
     }
     constexpr float alpha = 1.0F;
     constexpr float beta = 0.0F;
+    const rocblas_int solution =
+        (rows == kFeedForward * 2U && columns == kHidden) ||
+                (rows == kHidden && columns == kFeedForward)
+            ? kGfx1151RocblasF32WideSolution
+            : kGfx1151RocblasF32CompactSolution;
     const rocblas_status status = rocblas_gemm_ex(
         handle_, rocblas_operation_transpose, rocblas_operation_none,
         static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
@@ -308,8 +314,7 @@ public:
         rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), &beta,
         output, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows), output,
         rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
-        rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index,
-        kGfx1151RocblasF32Solution, 0);
+        rocblas_datatype_f32_r, rocblas_gemm_algo_solution_index, solution, 0);
     if (status != rocblas_status_success) {
       SetError(error, "MiniMax H3 VisualVAE F32 GEMM failed: " +
                           std::to_string(static_cast<int>(status)));
@@ -319,6 +324,95 @@ public:
   }
 
 private:
+  rocblas_handle handle_{nullptr};
+};
+
+class AttentionGemm {
+public:
+  AttentionGemm() {
+    if (rocblas_create_handle(&handle_) != rocblas_status_success) {
+      handle_ = nullptr;
+      return;
+    }
+    (void)rocblas_set_atomics_mode(handle_, rocblas_atomics_not_allowed);
+  }
+  ~AttentionGemm() {
+    if (handle_ != nullptr) {
+      (void)rocblas_destroy_handle(handle_);
+    }
+  }
+  AttentionGemm(const AttentionGemm&) = delete;
+  AttentionGemm& operator=(const AttentionGemm&) = delete;
+
+  bool Scores(const float* query, const float* key, float* scores,
+              std::size_t sequence, float scale, hipStream_t stream,
+              std::string* error) {
+    if (!SetStream(sequence, stream, error)) {
+      return false;
+    }
+    constexpr float beta = 0.0F;
+    const auto rows = static_cast<rocblas_int>(sequence);
+    const auto token_stride = static_cast<rocblas_int>(kHeads * kHeadDimension);
+    const auto head_stride = static_cast<rocblas_stride>(kHeadDimension);
+    const auto score_stride = static_cast<rocblas_stride>(sequence * sequence);
+    return Check(rocblas_gemm_strided_batched_ex(
+                     handle_, rocblas_operation_transpose,
+                     rocblas_operation_none, rows, rows, kHeadDimension, &scale,
+                     key, rocblas_datatype_f32_r, token_stride, head_stride,
+                     query, rocblas_datatype_f32_r, token_stride, head_stride,
+                     &beta, scores, rocblas_datatype_f32_r, rows, score_stride,
+                     scores, rocblas_datatype_f32_r, rows, score_stride, kHeads,
+                     rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0),
+                 "score", error);
+  }
+
+  bool Values(const float* value, const float* probabilities, float* output,
+              std::size_t sequence, hipStream_t stream, std::string* error) {
+    if (!SetStream(sequence, stream, error)) {
+      return false;
+    }
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    const auto rows = static_cast<rocblas_int>(sequence);
+    const auto token_stride = static_cast<rocblas_int>(kHeads * kHeadDimension);
+    const auto head_stride = static_cast<rocblas_stride>(kHeadDimension);
+    const auto probability_stride =
+        static_cast<rocblas_stride>(sequence * sequence);
+    return Check(
+        rocblas_gemm_strided_batched_ex(
+            handle_, rocblas_operation_none, rocblas_operation_none,
+            kHeadDimension, rows, rows, &alpha, value, rocblas_datatype_f32_r,
+            token_stride, head_stride, probabilities, rocblas_datatype_f32_r,
+            rows, probability_stride, &beta, output, rocblas_datatype_f32_r,
+            token_stride, head_stride, output, rocblas_datatype_f32_r,
+            token_stride, head_stride, kHeads, rocblas_datatype_f32_r,
+            rocblas_gemm_algo_standard, 0, 0),
+        "value", error);
+  }
+
+private:
+  bool SetStream(std::size_t sequence, hipStream_t stream, std::string* error) {
+    if (handle_ == nullptr || sequence == 0 ||
+        sequence >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rocblas_set_stream(handle_, stream) != rocblas_status_success) {
+      SetError(error, "invalid MiniMax H3 VisualVAE attention GEMM");
+      return false;
+    }
+    return true;
+  }
+
+  bool Check(rocblas_status status, std::string_view phase,
+             std::string* error) {
+    if (status == rocblas_status_success) {
+      return true;
+    }
+    SetError(error,
+             "MiniMax H3 VisualVAE attention " + std::string(phase) +
+                 " GEMM failed: " + std::to_string(static_cast<int>(status)));
+    return false;
+  }
+
   rocblas_handle handle_{nullptr};
 };
 
@@ -404,6 +498,7 @@ struct VideoVaeDecoder::Impl {
   hipStream_t stream{nullptr};
   void* staging{nullptr};
   F32Gemm gemm;
+  AttentionGemm attention_gemm;
 
   DeviceBuffer latent_mean;
   DeviceBuffer latent_std;
@@ -428,6 +523,7 @@ struct VideoVaeDecoder::Impl {
   DeviceBuffer query;
   DeviceBuffer key;
   DeviceBuffer value;
+  DeviceBuffer attention_scores;
   DeviceBuffer attention_heads;
   DeviceBuffer branch;
   DeviceBuffer fc1;
@@ -581,6 +677,9 @@ struct VideoVaeDecoder::Impl {
             f32(static_cast<std::size_t>(sequence) * kAttentionWidth), error) ||
         !key.Allocate(query.bytes(), error) ||
         !value.Allocate(query.bytes(), error) ||
+        !attention_scores.Allocate(
+            f32(static_cast<std::size_t>(kHeads) * sequence * sequence),
+            error) ||
         !attention_heads.Allocate(query.bytes(), error) ||
         !branch.Allocate(hidden.bytes(), error) ||
         !fc1.Allocate(
@@ -619,13 +718,26 @@ struct VideoVaeDecoder::Impl {
       return false;
     }
     tile_rgb_host.resize(tile_rgb.bytes() / sizeof(float));
-    const std::array<const DeviceBuffer*, 19> runtime = {
-        &latent_mean,     &latent_std, &normalized_latent,
-        &latent_rows,     &post,       &patch_hidden,
-        &hidden,          &norm,       &qkv,
-        &query,           &key,        &value,
-        &attention_heads, &branch,     &fc1,
-        &activated,       &rope_cos,   &rope_sin,
+    const std::array<const DeviceBuffer*, 20> runtime = {
+        &latent_mean,
+        &latent_std,
+        &normalized_latent,
+        &latent_rows,
+        &post,
+        &patch_hidden,
+        &hidden,
+        &norm,
+        &qkv,
+        &query,
+        &key,
+        &value,
+        &attention_scores,
+        &attention_heads,
+        &branch,
+        &fc1,
+        &activated,
+        &rope_cos,
+        &rope_sin,
         &projected,
     };
     std::uint64_t runtime_bytes = 0;
@@ -721,11 +833,18 @@ struct VideoVaeDecoder::Impl {
           qkv.As<float>(), rope_cos.As<float>(), rope_sin.As<float>(),
           query.As<float>(), key.As<float>(), value.As<float>(), sequence,
           kHeads, kHeadDimension, kRopeHalf, kNormEpsilon, stream);
-      video_vae_ops::LaunchFullAttention(
-          query.As<float>(), key.As<float>(), value.As<float>(),
-          attention_heads.As<float>(), sequence, kHeads, kHeadDimension,
-          1.0F / std::sqrt(static_cast<float>(kHeadDimension)), stream);
-      if (!CheckLaunch("H3 VisualVAE attention", error) ||
+      if (!attention_gemm.Scores(
+              query.As<float>(), key.As<float>(), attention_scores.As<float>(),
+              sequence, 1.0F / std::sqrt(static_cast<float>(kHeadDimension)),
+              stream, error)) {
+        return false;
+      }
+      video_vae_ops::LaunchSoftmaxScoresInPlace(attention_scores.As<float>(),
+                                                sequence, kHeads, stream);
+      if (!CheckLaunch("H3 VisualVAE attention softmax", error) ||
+          !attention_gemm.Values(
+              value.As<float>(), attention_scores.As<float>(),
+              attention_heads.As<float>(), sequence, stream, error) ||
           !Linear(attention_heads, weight.output_weight, weight.output_bias,
                   &branch, sequence, kAttentionWidth, kHidden, error)) {
         return false;
@@ -759,7 +878,7 @@ struct VideoVaeDecoder::Impl {
         SetError(error, HipError("synchronize H3 VisualVAE block", status));
         return false;
       }
-      base_telemetry.dispatches += 11;
+      base_telemetry.dispatches += 13;
     }
     video_vae_ops::LaunchLayerNorm(
         hidden.As<float>(), final_norm_weight.As<float>(),

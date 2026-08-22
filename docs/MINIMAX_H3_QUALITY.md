@@ -324,14 +324,26 @@ and frames 0, 5, 11, 16, and 21:
 | full frames | 17,301,504 | `36dd863ffcdf34c2f882f57f401d2c66d7fbc441f5185d32aa1b03db46ca24c1` |
 | selected frames | 3,932,160 | `a6cc2b34da6b86f70d91dee8e152051ddc0bac0dc7cd5e1f8e605e7f37696ec7` |
 
-The bounded native gate decodes frames 0, 5, 11, 16, and 21 once. It measured
-selected-frame relative L2 `3.72615e-7`, relative max `9.74843e-7`, and maximum
-absolute error `7.15256e-7`. The deterministic implementation uses the actual
-gfx1151 wave32 width for normalization and attention while each lane covers
-two dimensions of the released 64-wide head. The single selected-frame pass
-took 146.916 seconds, measured a 9.38 GiB phase peak, and used zero swap. The
-complete-frame teacher payload remains available for offline analysis, but
-routine native validation does not execute a second full or repeated decode.
+The bounded native gate decodes frames 0, 5, 11, 16, and 21 once. The retained
+gfx1151 route uses strided-batched F32 rocBLAS QK and PV GEMMs around an
+explicit stable in-place F32 softmax, plus exact-shape gfx1151 solution indices
+for the dense projections. Its final combined quality/profile pass measured
+selected-frame relative L2 `8.15249e-7`, relative max `2.3838e-6`, and maximum
+absolute error `1.74902e-6`. The output remains effectively identical to the
+frozen teacher and far inside the declared `0.05` limits.
+
+The same fixed tile fell from `46.6852` seconds with scalar full attention to
+`4.79063` seconds with batched attention, then to `2.82558` seconds after dense
+projection tuning. The final route is `16.522x` faster than the scalar
+baseline and `1.695x` faster than the first batched route. The explicit
+score/probability workspace raises the phase peak from 9.38 GiB to 9.77 GiB;
+the process used zero swap.
+
+A register-cached softmax and faster QK/PV solution indices were measured once
+and rejected because their changed FP32 reduction order exceeded the quality
+gate. They are not present in the retained implementation. The complete-frame
+teacher payload remains available for offline analysis, but routine native
+validation does not execute a second full or repeated decode.
 
 ## AudioVAE Frozen Evidence
 
