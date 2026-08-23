@@ -1,6 +1,6 @@
 # MiniMax H3 BF16 Residency Baseline
 
-Status: initial gfx1151 loader decision, 2026-08-22
+Status: retained second-profile implementation, 2026-08-23
 
 ## Contract
 
@@ -119,7 +119,7 @@ and bias, materializes all required schedule rows, transfers those constants
 into the matching core session, and releases the projection before proceeding.
 All 50 BF16 core blocks remain resident for successive denoiser evaluations.
 
-Current cross-block validation executes one forward only:
+The pre-issue-175 cross-block validation executed one forward only:
 
 | Geometry | Rows | AdaLN | Core load | Forward | Peak | Swap |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -130,11 +130,13 @@ Each one-block session releases its 16 MiB pinned loader staging and its GEMM
 validation buffer before publication. Retaining either across 50 blocks would
 waste substantial memory without benefiting timed execution.
 
-The exact route currently uses preallocated host BF16 buffers to cross the 50
-independent block streams. No host tensor arithmetic is performed. This
-conservative boundary makes cancellation, stable scratch addresses, and
-failure cleanup explicit; issue #175 may replace it only after an end-to-end
-profile and unchanged quality evidence.
+The exact route now keeps the 50-block hidden state on one ordered HIP stream.
+Two reusable BF16 device buffers ping-pong between blocks, and one device row
+map is uploaded per evaluation. The block sessions still own independent,
+stable scratch arenas, but no longer copy the approximately 20 MiB hidden
+state to and from host memory or synchronize after every block. Cancellation
+is checked before each block submission, and the final velocity heads provide
+the single forward synchronization boundary.
 
 The text-to-video serving presets retain the same phase ordering. `exact`
 keeps 50 blocks and performs 49 fresh evaluations over Diffusers' 50 sigma
@@ -201,6 +203,99 @@ Each required diagnostic is invoked once. A passing full route is not rerun,
 and a full exact generation is never launched merely to obtain performance
 statistics.
 
+## Issue #184 Second Focused Profile
+
+The retained second pass used one fresh uninstrumented workload and one final
+profile for each affected phase. No complete generation, denoising trajectory,
+or statistical repetition was run.
+
+| Phase | Fresh baseline | Retained | Reduction | Speedup | Peak |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AudioVAE, 37 latent frames to stereo 29,600-sample PCM | 59.4383 s | 2.42326 s | 95.92% | 24.53x | 0.286 GiB |
+| VisualVAE, one 256x256x22 five-selected-frame tile | 8.60171 s | 6.12212 s | 28.83% | 1.405x | 9.766 GiB |
+| DiT, one 512x512x22 1,872-row 50-block forward | 9.02751 s | 5.49537 s | 39.13% | 1.643x | 58.880 GiB |
+
+All three retained invocations used zero swap. AudioVAE's peak grew from
+0.250887 GiB to 0.286173 GiB because one bounded, reusable im2col workspace
+replaces scalar convolution. VisualVAE's peak was unchanged. The denoiser's
+0.077 GiB increase is the two device-resident hidden buffers plus per-block
+normalization factors; it is 0.13% of the phase peak and replaces equivalent
+host activation storage.
+
+### AudioVAE convolution inventory
+
+The 37-frame decoder executes 129 Conv1d calls and seven ConvTranspose1d
+calls. Every convolution remains F32 input, weight, accumulation, and output.
+
+| Boundary | Output length | Channels | Kernel / stride | Conv1d calls |
+| --- | ---: | ---: | --- | ---: |
+| latent input projection | 37 | 32 -> 2,048 | 1 / 1 | 1 |
+| decoder pre-convolution | 37 | 2,048 -> 1,024 | 7 / 1 | 1 |
+| stage 0 | 185 | 1,024 -> 512 | transpose 9 / 5 | 18 |
+| stage 1 | 925 | 512 -> 256 | transpose 9 / 5 | 18 |
+| stage 2 | 1,850 | 256 -> 128 | transpose 4 / 2 | 18 |
+| stage 3 | 3,700 | 128 -> 64 | transpose 4 / 2 | 18 |
+| stage 4 | 7,400 | 64 -> 32 | transpose 4 / 2 | 18 |
+| stage 5 | 14,800 | 32 -> 16 | transpose 4 / 2 | 18 |
+| stage 6 | 29,600 | 16 -> 8 | transpose 4 / 2 | 18 |
+| decoder post-convolution | 29,600 | 8 -> 1 | 7 / 1 | 1 |
+
+Each stage's 18 residual convolutions are three blocks with kernels 3, 7, and
+11. Each block has three first convolutions at dilations 1, 3, and 5 and three
+unit-dilation second convolutions. The retained implementation lowers both
+normal and transposed convolutions to F32 im2col plus rocBLAS GEMM, reorders
+transposed weight normalization once at load, and reuses the maximum required
+column buffer. It also splits alias-free SnakeBeta into its released
+upsample/activation and downsample operations without changing the filter or
+sine sequence.
+
+The final AudioVAE profile is no longer convolution-dominated: SnakeBeta
+upsampling accounts for 43.93% of kernel time, im2col 24.36%, and SnakeBeta
+downsampling 18.23%. The waveform gate measured maximum error
+`6.03162e-5` and relative L2 `1.08936e-5`; the spectrogram gate measured
+relative L2 `3.62714e-6` and relative maximum `5.8276e-6`.
+
+### VisualVAE attention preparation
+
+VisualVAE now computes Q and K norm reductions once per head and broadcasts
+the factors. QKV and projection biases are folded into kernels only after the
+same F32 GEMM rounding boundary, output/MLP biases are fused into their
+existing residual/SwiGLU operations, and the stable F32 softmax reduction
+order remains unchanged. The final profile attributes 35.99% to stable
+softmax, 27.59% to GEMMs, and 8.69% to QKV preparation; vectorized SwiGLU fell
+to 0.241 s.
+
+The selected-frame gate measured relative L2 `8.14968e-7`, relative maximum
+`2.24925e-6`, and maximum absolute error `1.6503e-6`.
+
+### Device-resident DiT and split normalization
+
+The first retained denoiser candidate removed the per-block host round trips,
+but improved the full forward by only about 3%, proving that the custom
+normalization kernels were the larger problem. The profile showed the
+single-kernel grouped QKV path spilling 1,240 bytes per thread and AdaLN
+spilling 436 bytes per thread.
+
+The final path preserves the same F32 reduction order but separates factor
+calculation from BF16 application. Grouped Q/K inverse factors are produced by
+one wave per head and consumed by a no-spill RoPE/application kernel. AdaLN
+similarly uses a reduction kernel followed by a packed application kernel.
+The factors share one reusable F32 buffer per block. The DiT translation unit
+uses `-O2`; `-O3` was rejected because it retained the spill-heavy allocation,
+while the preset's unqualified compile mode was not optimized.
+
+In the final profile, grouped QKV factor and application kernels total
+0.140 s instead of 2.236 s, and core AdaLN reduction/application kernels total
+0.031 s instead of 1.584 s. The next profiled hotspots are SwiGLU, fused
+attention, and the dense GEMMs; they are not required to meet this issue's
+quality-preserving target.
+
+The production oracle remained green: refined text relative L2/max
+`0.00469088`/`0.00167411`, block-0 modulation
+`0.0022895`/`0.00478469`, video velocity
+`0.0132707`/`0.0154553`, and audio velocity
+`0.00731056`/`0.0149873`.
+
 The original one-block profile identified dense attention as the actual
 bottleneck. The retained progression is:
 
@@ -216,15 +311,15 @@ explicit first removed that bottleneck. Parallelizing the per-row max,
 exponential, and sum reduced the intermediate block from 3.477 seconds to
 1.076 seconds.
 
-The final gfx1151 path fuses QK, scaled softmax, and PV through Composable
+The issue #175 gfx1151 path fused QK, scaled softmax, and PV through Composable
 Kernel's BF16 WMMA attention kernel. It no longer materializes the 1.097 GiB
 F32-score/BF16-probability workspace for the supported production shape;
 unsupported shapes retain a checked fallback that owns those matrices only
-when selected. Grouped Q/K normalization and RoPE use one wave per head,
-SwiGLU and residual gates process eight BF16 values per thread, and the H3 DiT
-translation unit is compiled at `-O3`. Two alternative QKV layouts were
-rejected because they preserved the oracle but increased production-shape
-latency.
+when selected. SwiGLU and residual gates process eight BF16 values per thread.
+Two alternative QKV layouts were rejected because they preserved the oracle
+but increased production-shape latency. Issue #184 subsequently replaced the
+spill-heavy grouped QKV and AdaLN kernels and changed the translation unit to
+`-O2`, as recorded above.
 
 The final 528-row teacher comparison measured block-output relative L2
 `0.00461029` and relative max `0.00483092`, both below the frozen `1e-2`
@@ -232,12 +327,12 @@ limits. Its attention AdaLN, attention output, and MLP AdaLN boundaries also
 remain below their limits. No 50-block forward or denoising evaluation was
 needed for this block-local change.
 
-The final timed block contains eleven dispatches whose trace duration sums to
-88.225 ms, matching the 88.279 ms runtime event. The largest remaining
-dispatches are the second MLP GEMM at 22.594 ms, first MLP GEMM at 21.881 ms,
-QKV projection at 17.022 ms, fused attention at 16.428 ms, and output
-projection at 7.527 ms. All custom normalization, RoPE, SwiGLU, and gate
-dispatches together take about 3.0 ms. This shifts future work from scalar
+The historical issue #175 timed block contains eleven dispatches whose trace
+duration sums to 88.225 ms, matching the 88.279 ms runtime event. The largest
+remaining dispatches are the second MLP GEMM at 22.594 ms, first MLP GEMM at
+21.881 ms, QKV projection at 17.022 ms, fused attention at 16.428 ms, and
+output projection at 7.527 ms. All custom normalization, RoPE, SwiGLU, and
+gate dispatches together take about 3.0 ms. This shifted work from scalar
 attention arithmetic to dense-projection selection and block-level execution.
 
 The accompanying short power capture peaked at 44 W and 1,192 MHz. That is a

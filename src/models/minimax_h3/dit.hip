@@ -39,7 +39,7 @@ constexpr std::size_t kMaximumBatchedAttentionRows = 4'096;
 constexpr rocblas_int kGfx1151RocblasBf16Solution = -1162085109;
 
 rocblas_int PinnedBf16Solution(std::size_t batch, std::size_t rows,
-                              std::size_t columns) {
+                               std::size_t columns) {
   if (batch == 1872) {
     if (rows == 21504 && columns == 5376) {
       return -1162085131;
@@ -366,9 +366,8 @@ public:
       return false;
     }
     if (FindPlan(batch, rows, columns) == nullptr) {
-      plans_.push_back(
-          {batch, rows, columns, PinnedBf16Solution(batch, rows, columns),
-           false});
+      plans_.push_back({batch, rows, columns,
+                        PinnedBf16Solution(batch, rows, columns), false});
     }
     return true;
   }
@@ -653,6 +652,7 @@ struct DitBlockSession::Impl {
   DeviceBuffer query;
   DeviceBuffer key;
   DeviceBuffer value;
+  DeviceBuffer normalization_factors;
   DeviceBuffer attention_heads;
   DeviceBuffer owned_attention_scores;
   DeviceBuffer owned_attention_probabilities;
@@ -800,6 +800,8 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
   const std::size_t hidden_elements = options.rows * kDitHiddenSize;
   const std::size_t attention_elements = options.rows * kDitAttentionWidth;
   const std::size_t qkv_elements = attention_elements * 3U;
+  const std::size_t normalization_factor_elements =
+      options.rows * kDitAttentionHeads * 2U;
   const std::size_t fc1_elements = options.rows * kDitFeedForwardSize * 2U;
   const std::size_t activated_elements = options.rows * kDitFeedForwardSize;
   const std::size_t modulation_elements =
@@ -824,6 +826,8 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
       !allocate(&impl->query, bf16_bytes(attention_elements)) ||
       !allocate(&impl->key, bf16_bytes(attention_elements)) ||
       !allocate(&impl->value, bf16_bytes(attention_elements)) ||
+      !allocate(&impl->normalization_factors,
+                normalization_factor_elements * sizeof(float)) ||
       !allocate(&impl->attention_heads, bf16_bytes(attention_elements)) ||
       !allocate(&impl->attention_output, bf16_bytes(hidden_elements)) ||
       !allocate(&impl->gated_attention, bf16_bytes(hidden_elements)) ||
@@ -919,16 +923,16 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
         impl->gemm_reference.bytes() + impl->gemm_first_mismatch.bytes();
     impl->gemm_reference.Reset();
     impl->gemm_first_mismatch.Reset();
-  } else if (!impl->gemm.TrustPinnedSolution(
-                 options.rows, kDitAttentionWidth * 3U, kDitHiddenSize,
-                 error) ||
-             !impl->gemm.TrustPinnedSolution(
-                 options.rows, kDitHiddenSize, kDitAttentionWidth, error) ||
-             !impl->gemm.TrustPinnedSolution(
-                 options.rows, kDitFeedForwardSize * 2U, kDitHiddenSize,
-                 error) ||
-             !impl->gemm.TrustPinnedSolution(
-                 options.rows, kDitHiddenSize, kDitFeedForwardSize, error)) {
+  } else if (!impl->gemm.TrustPinnedSolution(options.rows,
+                                             kDitAttentionWidth * 3U,
+                                             kDitHiddenSize, error) ||
+             !impl->gemm.TrustPinnedSolution(options.rows, kDitHiddenSize,
+                                             kDitAttentionWidth, error) ||
+             !impl->gemm.TrustPinnedSolution(options.rows,
+                                             kDitFeedForwardSize * 2U,
+                                             kDitHiddenSize, error) ||
+             !impl->gemm.TrustPinnedSolution(options.rows, kDitHiddenSize,
+                                             kDitFeedForwardSize, error)) {
     return nullptr;
   }
   return std::unique_ptr<DitBlockSession>(new DitBlockSession(std::move(impl)));
@@ -990,6 +994,22 @@ bool DitBlockSession::RunPrepared(const DitPreparedInput& input,
   return RunInternal(input, cancellation, {}, {}, {}, output, telemetry, error);
 }
 
+bool DitBlockSession::RunPreparedDevice(const std::uint16_t* hidden_device,
+                                        const std::uint32_t* row_map_device,
+                                        std::uint16_t* output_device,
+                                        void* stream,
+                                        const CancellationToken* cancellation,
+                                        DitBlockTelemetry* telemetry,
+                                        std::string* error) {
+  if (hidden_device == nullptr || row_map_device == nullptr ||
+      output_device == nullptr || stream == nullptr) {
+    SetError(error, "invalid MiniMax H3 DiT device run arguments");
+    return false;
+  }
+  return RunInternal({}, cancellation, {}, {}, {}, {}, telemetry, error,
+                     hidden_device, row_map_device, output_device, stream);
+}
+
 bool DitBlockSession::Run(const DitBlockInput& input,
                           const CancellationToken* cancellation,
                           DitBlockRetained* retained,
@@ -1020,34 +1040,43 @@ bool DitBlockSession::Run(const DitBlockInput& input,
                      telemetry, error);
 }
 
-bool DitBlockSession::RunInternal(const DitPreparedInput& input,
-                                  const CancellationToken* cancellation,
-                                  std::span<std::uint16_t> modulation_attention,
-                                  std::span<std::uint16_t> attention_output,
-                                  std::span<std::uint16_t> modulation_mlp,
-                                  std::span<std::uint16_t> block_output,
-                                  DitBlockTelemetry* telemetry,
-                                  std::string* error) {
+bool DitBlockSession::RunInternal(
+    const DitPreparedInput& input, const CancellationToken* cancellation,
+    std::span<std::uint16_t> modulation_attention,
+    std::span<std::uint16_t> attention_output,
+    std::span<std::uint16_t> modulation_mlp,
+    std::span<std::uint16_t> block_output, DitBlockTelemetry* telemetry,
+    std::string* error, const std::uint16_t* hidden_device,
+    const std::uint32_t* row_map_device, std::uint16_t* output_device,
+    void* external_stream) {
   if (impl_ == nullptr || telemetry == nullptr || !impl_->constants_prepared) {
     SetError(error, "MiniMax H3 DiT constants are not prepared");
     return false;
   }
+  const bool device_run = external_stream != nullptr;
   const std::size_t hidden_elements = impl_->rows * kDitHiddenSize;
   const auto valid_optional = [&](std::span<std::uint16_t> values) {
     return values.empty() || values.size() == hidden_elements;
   };
-  if (input.hidden.size() != hidden_elements ||
-      input.row_map.size() != impl_->rows ||
+  if ((!device_run && (input.hidden.size() != hidden_elements ||
+                       input.row_map.size() != impl_->rows ||
+                       block_output.size() != hidden_elements)) ||
+      (device_run && (hidden_device == nullptr || row_map_device == nullptr ||
+                      output_device == nullptr)) ||
       !valid_optional(modulation_attention) ||
       !valid_optional(attention_output) || !valid_optional(modulation_mlp) ||
-      block_output.size() != hidden_elements) {
+      (device_run &&
+       (!modulation_attention.empty() || !attention_output.empty() ||
+        !modulation_mlp.empty() || !block_output.empty()))) {
     SetError(error, "MiniMax H3 DiT prepared input size differs from session");
     return false;
   }
-  for (const std::uint32_t row : input.row_map) {
-    if (row >= impl_->modulation_rows) {
-      SetError(error, "MiniMax H3 DiT row map exceeds modulation rows");
-      return false;
+  if (!device_run) {
+    for (const std::uint32_t row : input.row_map) {
+      if (row >= impl_->modulation_rows) {
+        SetError(error, "MiniMax H3 DiT row map exceeds modulation rows");
+        return false;
+      }
     }
   }
   if (IsCancelled(cancellation)) {
@@ -1074,42 +1103,54 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
     }
     return true;
   };
-  if (!copy(impl_->hidden.data(), input.hidden.data(),
-            input.hidden.size_bytes(), hipMemcpyHostToDevice,
-            "copy H3 DiT hidden") ||
-      !copy(impl_->row_map.data(), input.row_map.data(),
-            input.row_map.size_bytes(), hipMemcpyHostToDevice,
-            "copy H3 DiT row map")) {
-    return false;
+  if (!device_run) {
+    if (!copy(impl_->hidden.data(), input.hidden.data(),
+              input.hidden.size_bytes(), hipMemcpyHostToDevice,
+              "copy H3 DiT hidden") ||
+        !copy(impl_->row_map.data(), input.row_map.data(),
+              input.row_map.size_bytes(), hipMemcpyHostToDevice,
+              "copy H3 DiT row map")) {
+      return false;
+    }
   }
 
   const auto rows = static_cast<std::uint32_t>(impl_->rows);
-  if (hipEventRecord(impl_->start_event, impl_->stream) != hipSuccess) {
+  const hipStream_t run_stream =
+      device_run ? static_cast<hipStream_t>(external_stream) : impl_->stream;
+  const std::uint16_t* hidden =
+      device_run ? hidden_device : impl_->hidden.As<std::uint16_t>();
+  const std::uint32_t* row_map =
+      device_run ? row_map_device : impl_->row_map.As<std::uint32_t>();
+  std::uint16_t* block_target =
+      device_run ? output_device : impl_->block_output.As<std::uint16_t>();
+  if (!device_run &&
+      hipEventRecord(impl_->start_event, run_stream) != hipSuccess) {
     SetError(error, "cannot record MiniMax H3 DiT start event");
     return false;
   }
-  dit_ops::LaunchAdaLn(
-      impl_->hidden.As<std::uint16_t>(),
-      impl_->norm1.storage.As<std::uint16_t>(),
-      impl_->modulation.As<std::uint16_t>(), impl_->row_map.As<std::uint32_t>(),
-      impl_->modulation_attention.As<std::uint16_t>(), rows, kDitHiddenSize,
-      kDitModulationSlots, 0, 1, kDitNormEpsilon, impl_->stream);
+  dit_ops::LaunchAdaLnSplit(hidden, impl_->norm1.storage.As<std::uint16_t>(),
+                            impl_->modulation.As<std::uint16_t>(), row_map,
+                            impl_->normalization_factors.As<float>(),
+                            impl_->modulation_attention.As<std::uint16_t>(),
+                            rows, kDitHiddenSize, kDitModulationSlots, 0, 1,
+                            kDitNormEpsilon, run_stream);
   if (!CheckLaunch("H3 DiT attention AdaLN", error) ||
       !impl_->gemm.Run(impl_->qkv_weight.storage.As<std::uint16_t>(),
                        impl_->modulation_attention.As<std::uint16_t>(),
                        impl_->qkv.As<std::uint16_t>(), impl_->rows,
-                       kDitAttentionWidth * 3U, kDitHiddenSize, impl_->stream,
+                       kDitAttentionWidth * 3U, kDitHiddenSize, run_stream,
                        error)) {
     return false;
   }
-  dit_ops::LaunchGroupedQkvNormRope(
+  dit_ops::LaunchGroupedQkvNormRopeSplit(
       impl_->qkv.As<std::uint16_t>(),
       impl_->query_norm.storage.As<std::uint16_t>(),
       impl_->key_norm.storage.As<std::uint16_t>(),
       impl_->rope_cos.As<std::uint16_t>(), impl_->rope_sin.As<std::uint16_t>(),
+      impl_->normalization_factors.As<float>(),
       impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
       impl_->value.As<std::uint16_t>(), rows, kDitAttentionHeads,
-      kDitHeadDimension, kDitRopeHalf, kDitNormEpsilon, impl_->stream);
+      kDitNormEpsilon, run_stream);
   if (!CheckLaunch("H3 DiT grouped QKV norm/RoPE", error)) {
     return false;
   }
@@ -1118,7 +1159,7 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
                                 impl_->key.As<std::uint16_t>(),
                                 impl_->value.As<std::uint16_t>(),
                                 impl_->attention_heads.As<std::uint16_t>(),
-                                impl_->rows, impl_->stream)) {
+                                impl_->rows, run_stream)) {
       SetError(error, "MiniMax H3 fused attention rejected the prepared shape");
       return false;
     }
@@ -1126,18 +1167,18 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
     if (!impl_->attention_gemm.Scores(
             impl_->query.As<std::uint16_t>(), impl_->key.As<std::uint16_t>(),
             impl_->attention_scores, impl_->rows,
-            1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)),
-            impl_->stream, error)) {
+            1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)), run_stream,
+            error)) {
       return false;
     }
     dit_ops::LaunchSoftmaxScoresToBf16(impl_->attention_scores,
                                        impl_->attention_probabilities, rows,
-                                       kDitAttentionHeads, impl_->stream);
+                                       kDitAttentionHeads, run_stream);
     if (!CheckLaunch("H3 DiT attention softmax", error) ||
         !impl_->attention_gemm.Values(
             impl_->value.As<std::uint16_t>(), impl_->attention_probabilities,
-            impl_->attention_heads.As<std::uint16_t>(), impl_->rows,
-            impl_->stream, error)) {
+            impl_->attention_heads.As<std::uint16_t>(), impl_->rows, run_stream,
+            error)) {
       return false;
     }
   } else {
@@ -1146,59 +1187,66 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
         impl_->value.As<std::uint16_t>(),
         impl_->attention_heads.As<std::uint16_t>(), rows, kDitAttentionHeads,
         kDitHeadDimension,
-        1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)), impl_->stream,
+        1.0F / std::sqrt(static_cast<float>(kDitHeadDimension)), run_stream,
         false);
   }
   if (!CheckLaunch("H3 DiT full SDPA", error) ||
       !impl_->gemm.Run(impl_->output_weight.storage.As<std::uint16_t>(),
                        impl_->attention_heads.As<std::uint16_t>(),
                        impl_->attention_output.As<std::uint16_t>(), impl_->rows,
-                       kDitHiddenSize, kDitAttentionWidth, impl_->stream,
-                       error)) {
+                       kDitHiddenSize, kDitAttentionWidth, run_stream, error)) {
     return false;
   }
-  dit_ops::LaunchGate(impl_->hidden.As<std::uint16_t>(),
-                      impl_->attention_output.As<std::uint16_t>(),
-                      impl_->modulation.As<std::uint16_t>(),
-                      impl_->row_map.As<std::uint32_t>(),
+  dit_ops::LaunchGate(hidden, impl_->attention_output.As<std::uint16_t>(),
+                      impl_->modulation.As<std::uint16_t>(), row_map,
                       impl_->gated_attention.As<std::uint16_t>(), rows,
-                      kDitHiddenSize, kDitModulationSlots, 2, impl_->stream);
+                      kDitHiddenSize, kDitModulationSlots, 2, run_stream);
   if (!CheckLaunch("H3 DiT attention gated residual", error)) {
     return false;
   }
-  dit_ops::LaunchAdaLn(
-      impl_->gated_attention.As<std::uint16_t>(),
-      impl_->norm2.storage.As<std::uint16_t>(),
-      impl_->modulation.As<std::uint16_t>(), impl_->row_map.As<std::uint32_t>(),
-      impl_->modulation_mlp.As<std::uint16_t>(), rows, kDitHiddenSize,
-      kDitModulationSlots, 3, 4, kDitNormEpsilon, impl_->stream);
+  dit_ops::LaunchAdaLnSplit(impl_->gated_attention.As<std::uint16_t>(),
+                            impl_->norm2.storage.As<std::uint16_t>(),
+                            impl_->modulation.As<std::uint16_t>(), row_map,
+                            impl_->normalization_factors.As<float>(),
+                            impl_->modulation_mlp.As<std::uint16_t>(), rows,
+                            kDitHiddenSize, kDitModulationSlots, 3, 4,
+                            kDitNormEpsilon, run_stream);
   if (!CheckLaunch("H3 DiT MLP AdaLN", error) ||
       !impl_->gemm.Run(impl_->fc1_weight.storage.As<std::uint16_t>(),
                        impl_->modulation_mlp.As<std::uint16_t>(),
                        impl_->fc1.As<std::uint16_t>(), impl_->rows,
-                       kDitFeedForwardSize * 2U, kDitHiddenSize, impl_->stream,
+                       kDitFeedForwardSize * 2U, kDitHiddenSize, run_stream,
                        error)) {
     return false;
   }
   dit_ops::LaunchSwiGlu(impl_->fc1.As<std::uint16_t>(),
                         impl_->activated.As<std::uint16_t>(), rows,
-                        kDitFeedForwardSize, impl_->stream);
+                        kDitFeedForwardSize, run_stream);
   if (!CheckLaunch("H3 DiT SwiGLU", error) ||
       !impl_->gemm.Run(impl_->fc2_weight.storage.As<std::uint16_t>(),
                        impl_->activated.As<std::uint16_t>(),
                        impl_->mlp_output.As<std::uint16_t>(), impl_->rows,
-                       kDitHiddenSize, kDitFeedForwardSize, impl_->stream,
+                       kDitHiddenSize, kDitFeedForwardSize, run_stream,
                        error)) {
     return false;
   }
   dit_ops::LaunchGate(impl_->gated_attention.As<std::uint16_t>(),
                       impl_->mlp_output.As<std::uint16_t>(),
-                      impl_->modulation.As<std::uint16_t>(),
-                      impl_->row_map.As<std::uint32_t>(),
-                      impl_->block_output.As<std::uint16_t>(), rows,
-                      kDitHiddenSize, kDitModulationSlots, 5, impl_->stream);
-  if (!CheckLaunch("H3 DiT MLP gated residual", error) ||
-      hipEventRecord(impl_->stop_event, impl_->stream) != hipSuccess) {
+                      impl_->modulation.As<std::uint16_t>(), row_map,
+                      block_target, rows, kDitHiddenSize, kDitModulationSlots,
+                      5, run_stream);
+  if (!CheckLaunch("H3 DiT MLP gated residual", error)) {
+    return false;
+  }
+  telemetry->dispatches = impl_->fused_attention ? 12 : 14;
+  telemetry->attention_backend =
+      impl_->fused_attention
+          ? "ck_bf16_wmma_fused"
+          : (impl_->row_parallel_attention ? "rocblas_materialized" : "scalar");
+  if (device_run) {
+    return true;
+  }
+  if (hipEventRecord(impl_->stop_event, run_stream) != hipSuccess) {
     if (error != nullptr && error->empty()) {
       *error = "cannot record MiniMax H3 DiT stop event";
     }
@@ -1235,12 +1283,6 @@ bool DitBlockSession::RunInternal(const DitPreparedInput& input,
     return false;
   }
   telemetry->gpu_ms = elapsed;
-  telemetry->dispatches = impl_->fused_attention ? 9 : 11;
-  telemetry->attention_backend =
-      impl_->fused_attention
-          ? "ck_bf16_wmma_fused"
-          : (impl_->row_parallel_attention ? "rocblas_materialized" : "scalar");
-
   const std::array<std::pair<std::string_view, std::span<std::uint16_t>>, 4>
       retained_tensors = {{
           {"modulation_attention", modulation_attention},

@@ -505,6 +505,114 @@ inline void LaunchAdaLn(const std::uint16_t* input, const std::uint16_t* weight,
                      shift_slot, scale_slot, epsilon);
 }
 
+static __global__ void RmsInverseKernel(const std::uint16_t* input,
+                                        float* inverse, std::uint32_t rows,
+                                        std::uint32_t width, float epsilon) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float reductions[256];
+  const std::size_t row_base = static_cast<std::size_t>(row) * width;
+  float local = 0.0F;
+  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
+    const float value = Bf16ToFloat(input[row_base + column]);
+    local = fmaf(value, value, local);
+  }
+  reductions[lane] = local;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+    if (lane < stride) {
+      reductions[lane] += reductions[lane + stride];
+    }
+    __syncthreads();
+  }
+  if (lane == 0) {
+    inverse[row] = rsqrtf(reductions[0] / static_cast<float>(width) + epsilon);
+  }
+}
+
+static __global__ void AdaLnApplyVector8Kernel(
+    const std::uint16_t* __restrict__ input,
+    const std::uint16_t* __restrict__ weight,
+    const std::uint16_t* __restrict__ modulation,
+    const std::uint32_t* __restrict__ row_map,
+    const float* __restrict__ inverse, std::uint16_t* __restrict__ output,
+    std::uint32_t rows, std::uint32_t width, std::uint32_t slots,
+    std::uint32_t shift_slot, std::uint32_t scale_slot) {
+  constexpr std::uint32_t kValuesPerThread = 8;
+  const std::uint32_t vector_column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t column = vector_column * kValuesPerThread;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= width) {
+    return;
+  }
+  const std::size_t row_base = static_cast<std::size_t>(row) * width + column;
+  const std::size_t modulation_base =
+      static_cast<std::size_t>(row_map[row]) * slots * width;
+  const std::size_t shift_base =
+      modulation_base + static_cast<std::size_t>(shift_slot) * width + column;
+  const std::size_t scale_base =
+      modulation_base + static_cast<std::size_t>(scale_slot) * width + column;
+  const float row_inverse = inverse[row];
+#pragma unroll 1
+  for (std::uint32_t offset = 0; offset < kValuesPerThread; offset += 2U) {
+    const std::uint32_t input_pair =
+        *reinterpret_cast<const std::uint32_t*>(input + row_base + offset);
+    const std::uint32_t weight_pair =
+        *reinterpret_cast<const std::uint32_t*>(weight + column + offset);
+    const std::uint32_t shift_pair = *reinterpret_cast<const std::uint32_t*>(
+        modulation + shift_base + offset);
+    const std::uint32_t scale_pair = *reinterpret_cast<const std::uint32_t*>(
+        modulation + scale_base + offset);
+    const float normalized0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(input_pair & 0xFFFFU)) *
+        row_inverse *
+        Bf16ToFloat(static_cast<std::uint16_t>(weight_pair & 0xFFFFU));
+    const float normalized1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(input_pair >> 16U)) *
+        row_inverse *
+        Bf16ToFloat(static_cast<std::uint16_t>(weight_pair >> 16U));
+    const float scale0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(scale_pair & 0xFFFFU));
+    const float scale1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(scale_pair >> 16U));
+    const float shift0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(shift_pair & 0xFFFFU));
+    const float shift1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(shift_pair >> 16U));
+    const std::uint32_t result =
+        static_cast<std::uint32_t>(
+            FloatToBf16(normalized0 * (1.0F + scale0) + shift0)) |
+        (static_cast<std::uint32_t>(
+             FloatToBf16(normalized1 * (1.0F + scale1) + shift1))
+         << 16U);
+    *reinterpret_cast<std::uint32_t*>(output + row_base + offset) = result;
+  }
+}
+
+inline void LaunchAdaLnSplit(const std::uint16_t* input,
+                             const std::uint16_t* weight,
+                             const std::uint16_t* modulation,
+                             const std::uint32_t* row_map, float* inverse,
+                             std::uint16_t* output, std::uint32_t rows,
+                             std::uint32_t width, std::uint32_t slots,
+                             std::uint32_t shift_slot, std::uint32_t scale_slot,
+                             float epsilon, hipStream_t stream) {
+  hipLaunchKernelGGL(RmsInverseKernel, dim3(rows), dim3(256), 0, stream, input,
+                     inverse, rows, width, epsilon);
+  constexpr std::uint32_t kThreads = 128;
+  constexpr std::uint32_t kValuesPerThread = 8;
+  hipLaunchKernelGGL(AdaLnApplyVector8Kernel,
+                     dim3((width + kThreads * kValuesPerThread - 1U) /
+                              (kThreads * kValuesPerThread),
+                          rows),
+                     dim3(kThreads), 0, stream, input, weight, modulation,
+                     row_map, inverse, output, rows, width, slots, shift_slot,
+                     scale_slot);
+}
+
 static __global__ void GateKernel(const std::uint16_t* __restrict__ residual,
                                   const std::uint16_t* __restrict__ branch,
                                   const std::uint16_t* __restrict__ modulation,
@@ -784,6 +892,109 @@ static __global__ void GroupedQkvNormRopeWaveKernel(
   value[output + dimension3] = qkv[value_base + dimension3];
 }
 
+static __global__ void GroupedQkvNormFactorsKernel(
+    const std::uint16_t* __restrict__ qkv, float* __restrict__ inverse,
+    std::uint32_t sequence, std::uint32_t heads, float epsilon) {
+  constexpr std::uint32_t kHeadDimension = 128;
+  constexpr std::uint32_t kHeadsPerBlock = 4;
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t head = blockIdx.y * kHeadsPerBlock + wave;
+  if (row >= sequence || head >= heads) {
+    return;
+  }
+  const std::size_t inner = static_cast<std::size_t>(heads) * kHeadDimension;
+  const std::size_t row_base = static_cast<std::size_t>(row) * inner * 3U;
+  const std::size_t query_base =
+      row_base + static_cast<std::size_t>(head) * kHeadDimension * 3U;
+  const std::size_t key_base = query_base + kHeadDimension;
+  float query_sum = 0.0F;
+  float key_sum = 0.0F;
+#pragma unroll
+  for (std::uint32_t dimension = lane; dimension < kHeadDimension;
+       dimension += 32U) {
+    const float query_value = Bf16ToFloat(qkv[query_base + dimension]);
+    const float key_value = Bf16ToFloat(qkv[key_base + dimension]);
+    query_sum = fmaf(query_value, query_value, query_sum);
+    key_sum = fmaf(key_value, key_value, key_sum);
+  }
+#pragma unroll
+  for (std::uint32_t offset = 16; offset > 0; offset /= 2U) {
+    query_sum += __shfl_down(query_sum, offset);
+    key_sum += __shfl_down(key_sum, offset);
+  }
+  if (lane == 0) {
+    const std::size_t factor =
+        (static_cast<std::size_t>(row) * heads + head) * 2U;
+    inverse[factor] =
+        rsqrtf(query_sum / static_cast<float>(kHeadDimension) + epsilon);
+    inverse[factor + 1U] =
+        rsqrtf(key_sum / static_cast<float>(kHeadDimension) + epsilon);
+  }
+}
+
+static __global__ void GroupedQkvNormRopeApplyKernel(
+    const std::uint16_t* __restrict__ qkv,
+    const std::uint16_t* __restrict__ query_weight,
+    const std::uint16_t* __restrict__ key_weight,
+    const std::uint16_t* __restrict__ rope_cos,
+    const std::uint16_t* __restrict__ rope_sin,
+    const float* __restrict__ inverse, std::uint16_t* __restrict__ query,
+    std::uint16_t* __restrict__ key, std::uint16_t* __restrict__ value,
+    std::uint32_t sequence, std::uint32_t heads) {
+  constexpr std::uint32_t kHeadDimension = 128;
+  constexpr std::uint32_t kRopeHalf = 48;
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t dimension = threadIdx.x;
+  if (row >= sequence || head >= heads || dimension >= kHeadDimension) {
+    return;
+  }
+  const std::size_t inner = static_cast<std::size_t>(heads) * kHeadDimension;
+  const std::size_t row_base = static_cast<std::size_t>(row) * inner * 3U;
+  const std::size_t query_base =
+      row_base + static_cast<std::size_t>(head) * kHeadDimension * 3U;
+  const std::size_t key_base = query_base + kHeadDimension;
+  const std::size_t value_base = key_base + kHeadDimension;
+  const std::size_t output =
+      (static_cast<std::size_t>(row) * heads + head) * kHeadDimension +
+      dimension;
+  const std::size_t factor =
+      (static_cast<std::size_t>(row) * heads + head) * 2U;
+  const float query_inverse = inverse[factor];
+  const float key_inverse = inverse[factor + 1U];
+  value[output] = qkv[value_base + dimension];
+  if (dimension < kRopeHalf) {
+    const std::uint32_t pair = dimension + kRopeHalf;
+    const float query_value = Bf16ToFloat(qkv[query_base + dimension]) *
+                              query_inverse *
+                              Bf16ToFloat(query_weight[dimension]);
+    const float key_value = Bf16ToFloat(qkv[key_base + dimension]) *
+                            key_inverse * Bf16ToFloat(key_weight[dimension]);
+    const float paired_query = Bf16ToFloat(qkv[query_base + pair]) *
+                               query_inverse * Bf16ToFloat(query_weight[pair]);
+    const float paired_key = Bf16ToFloat(qkv[key_base + pair]) * key_inverse *
+                             Bf16ToFloat(key_weight[pair]);
+    const std::size_t rope =
+        static_cast<std::size_t>(row) * kRopeHalf + dimension;
+    const float cosine = Bf16ToFloat(rope_cos[rope]);
+    const float sine = Bf16ToFloat(rope_sin[rope]);
+    query[output] = FloatToBf16(query_value * cosine - paired_query * sine);
+    query[output + kRopeHalf] =
+        FloatToBf16(paired_query * cosine + query_value * sine);
+    key[output] = FloatToBf16(key_value * cosine - paired_key * sine);
+    key[output + kRopeHalf] =
+        FloatToBf16(paired_key * cosine + key_value * sine);
+  } else if (dimension >= kRopeHalf * 2U) {
+    query[output] =
+        FloatToBf16(Bf16ToFloat(qkv[query_base + dimension]) * query_inverse *
+                    Bf16ToFloat(query_weight[dimension]));
+    key[output] = FloatToBf16(Bf16ToFloat(qkv[key_base + dimension]) *
+                              key_inverse * Bf16ToFloat(key_weight[dimension]));
+  }
+}
+
 inline void LaunchGroupedQkvNormRope(
     const std::uint16_t* qkv, const std::uint16_t* query_weight,
     const std::uint16_t* key_weight, const std::uint16_t* rope_cos,
@@ -804,6 +1015,23 @@ inline void LaunchGroupedQkvNormRope(
                        key_weight, rope_cos, rope_sin, query, key, value,
                        sequence, heads, head_dimension, rope_half, epsilon);
   }
+}
+
+inline void LaunchGroupedQkvNormRopeSplit(
+    const std::uint16_t* qkv, const std::uint16_t* query_weight,
+    const std::uint16_t* key_weight, const std::uint16_t* rope_cos,
+    const std::uint16_t* rope_sin, float* inverse, std::uint16_t* query,
+    std::uint16_t* key, std::uint16_t* value, std::uint32_t sequence,
+    std::uint32_t heads, float epsilon, hipStream_t stream) {
+  constexpr std::uint32_t kHeadsPerBlock = 4;
+  hipLaunchKernelGGL(
+      GroupedQkvNormFactorsKernel,
+      dim3(sequence, (heads + kHeadsPerBlock - 1U) / kHeadsPerBlock), dim3(128),
+      0, stream, qkv, inverse, sequence, heads, epsilon);
+  hipLaunchKernelGGL(GroupedQkvNormRopeApplyKernel, dim3(sequence, heads),
+                     dim3(128), 0, stream, qkv, query_weight, key_weight,
+                     rope_cos, rope_sin, inverse, query, key, value, sequence,
+                     heads);
 }
 
 static __global__ void FullAttentionScalarKernel(

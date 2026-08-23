@@ -229,7 +229,7 @@ endif()
 
 if (ENGINE_ENABLE_HIP)
   set_property(SOURCE src/models/minimax_h3/dit.hip
-    APPEND PROPERTY COMPILE_OPTIONS -O3)
+    APPEND PROPERTY COMPILE_OPTIONS -O2)
   target_sources(strix_core PRIVATE
     src/core/hip/qwen_gpu_attention.hip
     src/core/hip/qwen_gpu_batched_ssm.hip

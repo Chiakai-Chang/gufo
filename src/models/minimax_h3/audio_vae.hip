@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <hip/hip_runtime.h>
+#include <rocblas/rocblas.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -269,6 +270,60 @@ bool LoadTensor(const ModelInventory& inventory,
   return success;
 }
 
+class F32ConvGemm {
+public:
+  F32ConvGemm() {
+    if (rocblas_create_handle(&handle_) != rocblas_status_success) {
+      handle_ = nullptr;
+      return;
+    }
+    (void)rocblas_set_atomics_mode(handle_, rocblas_atomics_not_allowed);
+  }
+  ~F32ConvGemm() {
+    if (handle_ != nullptr) {
+      (void)rocblas_destroy_handle(handle_);
+    }
+  }
+  F32ConvGemm(const F32ConvGemm&) = delete;
+  F32ConvGemm& operator=(const F32ConvGemm&) = delete;
+
+  bool Run(const float* weight, const float* columns, float* output,
+           std::size_t batch_rows, std::size_t output_channels,
+           std::size_t reduction, hipStream_t stream, std::string* error) {
+    constexpr std::size_t kMaxInt =
+        static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max());
+    if (handle_ == nullptr || batch_rows == 0 || output_channels == 0 ||
+        reduction == 0 || batch_rows > kMaxInt || output_channels > kMaxInt ||
+        reduction > kMaxInt ||
+        rocblas_set_stream(handle_, stream) != rocblas_status_success) {
+      SetError(error, "invalid MiniMax H3 AudioVAE F32 convolution GEMM");
+      return false;
+    }
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    const rocblas_status status = rocblas_gemm_ex(
+        handle_, rocblas_operation_transpose, rocblas_operation_none,
+        static_cast<rocblas_int>(output_channels),
+        static_cast<rocblas_int>(batch_rows),
+        static_cast<rocblas_int>(reduction), &alpha, weight,
+        rocblas_datatype_f32_r, static_cast<rocblas_int>(reduction), columns,
+        rocblas_datatype_f32_r, static_cast<rocblas_int>(reduction), &beta,
+        output, rocblas_datatype_f32_r,
+        static_cast<rocblas_int>(output_channels), output,
+        rocblas_datatype_f32_r, static_cast<rocblas_int>(output_channels),
+        rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+    if (status != rocblas_status_success) {
+      SetError(error, "MiniMax H3 AudioVAE F32 convolution GEMM failed: " +
+                          std::to_string(static_cast<int>(status)));
+      return false;
+    }
+    return true;
+  }
+
+private:
+  rocblas_handle handle_{nullptr};
+};
+
 struct ConvWeights {
   DeviceBuffer weight;
   DeviceBuffer bias;
@@ -330,8 +385,12 @@ struct AudioVaeDecoder::Impl {
   DeviceBuffer normalized_latent;
   DeviceBuffer latent_rows;
   std::array<DeviceBuffer, 5> scratch;
+  DeviceBuffer convolution_columns;
+  DeviceBuffer activation_upsampled;
   DeviceBuffer channel_major_output;
   std::size_t scratch_elements{0};
+  std::size_t convolution_column_elements{0};
+  F32ConvGemm convolution_gemm;
 
   AudioVaeTelemetry base_telemetry;
 
@@ -440,9 +499,15 @@ struct AudioVaeDecoder::Impl {
       return false;
     }
     base_telemetry.cumulative_allocation_bytes += vector.bytes();
-    audio_vae_ops::LaunchWeightNorm(vector.As<float>(), magnitude.As<float>(),
-                                    conv->weight.As<float>(), outer,
-                                    inner_channels * kernel, stream);
+    if (transpose) {
+      audio_vae_ops::LaunchWeightNormTranspose(
+          vector.As<float>(), magnitude.As<float>(), conv->weight.As<float>(),
+          input_channels, output_channels, kernel, stream);
+    } else {
+      audio_vae_ops::LaunchWeightNorm(vector.As<float>(), magnitude.As<float>(),
+                                      conv->weight.As<float>(), outer,
+                                      inner_channels * kernel, stream);
+    }
     if (!CheckLaunch("normalize MiniMax H3 AudioVAE convolution", error)) {
       return false;
     }
@@ -580,12 +645,29 @@ struct AudioVaeDecoder::Impl {
       const std::array<float, kH3AudioVaeLatentChannels>& deviation,
       std::string* error) {
     std::uint64_t length = static_cast<std::uint64_t>(latent_length);
+    const auto add_column_shape = [this](std::uint64_t output_length,
+                                         std::uint64_t input_channels,
+                                         std::uint64_t kernel) {
+      const std::uint64_t elements =
+          kH3AudioVaeStereoChannels * output_length * input_channels * kernel;
+      if (elements <= std::numeric_limits<std::size_t>::max()) {
+        convolution_column_elements = std::max(
+            convolution_column_elements, static_cast<std::size_t>(elements));
+      }
+    };
+    add_column_shape(length, kH3AudioVaeLatentChannels, 1);
+    add_column_shape(length, kLatentDimension, 7);
     scratch_elements = static_cast<std::size_t>(kH3AudioVaeStereoChannels) *
                        latent_length * kLatentDimension;
     std::uint32_t channels = kDecoderDimension;
     for (std::uint32_t stage = 0; stage < kStages; ++stage) {
+      const std::uint32_t input_channels = channels;
       length *= kUpsampleRates[stage];
       channels >>= 1U;
+      add_column_shape(length, input_channels, kUpsampleKernels[stage]);
+      for (std::uint32_t kernel : kResidualKernels) {
+        add_column_shape(length, channels, kernel);
+      }
       const std::uint64_t elements =
           static_cast<std::uint64_t>(kH3AudioVaeStereoChannels) * length *
           channels;
@@ -595,6 +677,11 @@ struct AudioVaeDecoder::Impl {
       }
       scratch_elements =
           std::max(scratch_elements, static_cast<std::size_t>(elements));
+    }
+    add_column_shape(length, 8, 7);
+    if (convolution_column_elements == 0) {
+      SetError(error, "MiniMax H3 AudioVAE convolution workspace overflows");
+      return false;
     }
     const auto f32 = [](std::size_t elements) {
       return elements * sizeof(float);
@@ -609,6 +696,9 @@ struct AudioVaeDecoder::Impl {
         !latent_std.Allocate(f32(deviation.size()), error) ||
         !normalized_latent.Allocate(f32(latent_elements), error) ||
         !latent_rows.Allocate(f32(row_elements), error) ||
+        !convolution_columns.Allocate(f32(convolution_column_elements),
+                                      error) ||
+        !activation_upsampled.Allocate(f32(scratch_elements * 2U), error) ||
         !channel_major_output.Allocate(
             f32(static_cast<std::size_t>(kH3AudioVaeStereoChannels) *
                 sample_count),
@@ -635,7 +725,8 @@ struct AudioVaeDecoder::Impl {
     }
     const std::uint64_t runtime_bytes =
         latent_mean.bytes() + latent_std.bytes() + normalized_latent.bytes() +
-        latent_rows.bytes() + channel_major_output.bytes() +
+        latent_rows.bytes() + convolution_columns.bytes() +
+        activation_upsampled.bytes() + channel_major_output.bytes() +
         static_cast<std::uint64_t>(scratch.size()) * scratch.front().bytes();
     base_telemetry.persistent_bytes = base_telemetry.weight_bytes +
                                       latent_mean.bytes() + latent_std.bytes() +
@@ -655,36 +746,69 @@ struct AudioVaeDecoder::Impl {
   bool RunConv(const ConvWeights& conv, const float* input, float* output,
                std::uint32_t input_length, std::uint32_t output_length,
                std::string* error) {
+    const std::size_t rows =
+        static_cast<std::size_t>(kH3AudioVaeStereoChannels) * output_length;
+    const std::size_t reduction =
+        static_cast<std::size_t>(conv.input_channels) * conv.kernel;
+    if (rows > std::numeric_limits<std::size_t>::max() / reduction ||
+        rows * reduction > convolution_column_elements) {
+      SetError(error, "MiniMax H3 AudioVAE convolution workspace is too small");
+      return false;
+    }
     if (conv.transpose) {
-      audio_vae_ops::LaunchConvTranspose1d(
-          input, conv.weight.As<float>(),
-          conv.bias.bytes() == 0 ? nullptr : conv.bias.As<float>(), output,
-          kH3AudioVaeStereoChannels, input_length, conv.input_channels,
-          output_length, conv.output_channels, conv.kernel, conv.stride,
-          conv.padding, stream);
+      audio_vae_ops::LaunchConvTranspose1dIm2Col(
+          input, convolution_columns.As<float>(), kH3AudioVaeStereoChannels,
+          input_length, conv.input_channels, output_length, conv.kernel,
+          conv.stride, conv.padding, stream);
     } else {
-      audio_vae_ops::LaunchConv1d(
-          input, conv.weight.As<float>(),
-          conv.bias.bytes() == 0 ? nullptr : conv.bias.As<float>(), output,
-          kH3AudioVaeStereoChannels, input_length, conv.input_channels,
-          output_length, conv.output_channels, conv.kernel, conv.padding,
-          conv.dilation, stream);
+      audio_vae_ops::LaunchConv1dIm2Col(
+          input, convolution_columns.As<float>(), kH3AudioVaeStereoChannels,
+          input_length, conv.input_channels, output_length, conv.kernel,
+          conv.padding, conv.dilation, stream);
     }
     ++base_telemetry.dispatches;
-    return CheckLaunch(conv.transpose ? "H3 AudioVAE transposed convolution"
-                                      : "H3 AudioVAE convolution",
-                       error);
+    if (!CheckLaunch(conv.transpose ? "H3 AudioVAE transposed im2col"
+                                    : "H3 AudioVAE im2col",
+                     error) ||
+        !convolution_gemm.Run(conv.weight.As<float>(),
+                              convolution_columns.As<float>(), output, rows,
+                              conv.output_channels, reduction, stream, error)) {
+      return false;
+    }
+    ++base_telemetry.dispatches;
+    if (conv.bias.bytes() != 0) {
+      audio_vae_ops::LaunchAddConvBias(output, conv.bias.As<float>(), rows,
+                                       conv.output_channels, stream);
+      ++base_telemetry.dispatches;
+      if (!CheckLaunch("H3 AudioVAE convolution bias", error)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   bool RunActivation(const ActivationWeights& activation, const float* input,
                      float* output, std::uint32_t length,
                      std::uint32_t channels, std::string* error) {
-    audio_vae_ops::LaunchAliasFreeSnake(
+    const std::size_t elements =
+        static_cast<std::size_t>(kH3AudioVaeStereoChannels) * length * channels;
+    if (elements > activation_upsampled.bytes() / (2U * sizeof(float))) {
+      SetError(error, "MiniMax H3 AudioVAE activation workspace is too small");
+      return false;
+    }
+    audio_vae_ops::LaunchAliasFreeSnakeUpsample(
         input, activation.alpha.As<float>(), activation.beta.As<float>(),
-        upsample_filter.As<float>(), downsample_filter.As<float>(), output,
+        upsample_filter.As<float>(), activation_upsampled.As<float>(),
         kH3AudioVaeStereoChannels, length, channels, stream);
     ++base_telemetry.dispatches;
-    return CheckLaunch("H3 AudioVAE alias-free SnakeBeta", error);
+    if (!CheckLaunch("H3 AudioVAE alias-free SnakeBeta upsample", error)) {
+      return false;
+    }
+    audio_vae_ops::LaunchAliasFreeSnakeDownsample(
+        activation_upsampled.As<float>(), downsample_filter.As<float>(), output,
+        kH3AudioVaeStereoChannels, length, channels, stream);
+    ++base_telemetry.dispatches;
+    return CheckLaunch("H3 AudioVAE alias-free SnakeBeta downsample", error);
   }
 
   bool RunStage(std::uint32_t stage_index, std::uint32_t* length,
