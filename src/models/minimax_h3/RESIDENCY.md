@@ -321,6 +321,24 @@ but increased production-shape latency. Issue #184 subsequently replaced the
 spill-heavy grouped QKV and AdaLN kernels and changed the translation unit to
 `-O2`, as recorded above.
 
+The 37,716-row full-resolution shape now has a separately retained gfx1151
+Triton attention kernel. The packaged AOTriton dispatch took `1,313.937 ms`
+and allocated 416 private bytes per thread in the captured trace. The
+shape-specialized 64x32 kernel took `1,268.501 ms`, a `3.46%` attention-kernel
+reduction, with 24,576 bytes of LDS and zero private scratch. It writes the
+row-major BF16 output consumed by the following projection directly. Other
+row counts and any module-load failure continue through the existing
+AOTriton/Composable Kernel paths, so lower-resolution behavior is unchanged.
+
+The build compiles and embeds the HSACO reproducibly from the tracked Triton
+source; generated binaries are not stored in Git. The compiler step rejects
+the kernel if AMDGPU metadata reports any VGPR/SGPR spill or private segment.
+Against the original full block, 5,379 of 202,761,216 BF16 elements differed
+(`0.002653%`), with relative L2 `2.19037e-5` and relative max `0.00125628`.
+The kernel result implies about `2.27 s` saved per 50-block forward, or about
+`111 s` across 49 evaluations; that extrapolation was not validated by
+running another full video generation.
+
 The final 528-row teacher comparison measured block-output relative L2
 `0.00461029` and relative max `0.00483092`, both below the frozen `1e-2`
 limits. Its attention AdaLN, attention output, and MLP AdaLN boundaries also

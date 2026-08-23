@@ -4,6 +4,7 @@
   cmake,
   ninja,
   pkg-config,
+  python313,
   icu,
   ffmpeg-headless,
   libuuid,
@@ -25,6 +26,7 @@
 
 let
   sourceRoot = ../..;
+  h3TritonCompiler = python313.withPackages (ps: [ ps.triton ]);
   productionSource = lib.cleanSourceWith {
     src = sourceRoot;
     filter =
@@ -42,7 +44,10 @@ let
       || lib.hasPrefix "src/" relativePath
       || relativePath == "tools"
       || relativePath == "tools/tune_hipblaslt.cpp"
-      || relativePath == "tools/benchmark_ssm_replay.cpp";
+      || relativePath == "tools/benchmark_ssm_replay.cpp"
+      || relativePath == "tools/strix"
+      || relativePath == "tools/strix/compile_h3_attention.py"
+      || relativePath == "tools/strix/h3_attention_kernel.py";
   };
 in
 stdenv.mkDerivation (finalAttrs: {
@@ -55,7 +60,10 @@ stdenv.mkDerivation (finalAttrs: {
     ninja
     pkg-config
   ]
-  ++ lib.optional rocmSupport rocmPackages.clr;
+  ++ lib.optionals rocmSupport [
+    rocmPackages.clr
+    h3TritonCompiler
+  ];
 
   buildInputs = [
     icu

@@ -40,6 +40,7 @@ endif()
 
 if (ENGINE_ENABLE_HIP)
   enable_language(HIP)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
   find_package(hip REQUIRED)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
@@ -60,6 +61,26 @@ if (ENGINE_ENABLE_HIP)
 
   message(STATUS "strix: ROCm/HIP enabled, architectures=${CMAKE_HIP_ARCHITECTURES}")
   message(STATUS "strix: ROCM_PATH=$ENV{ROCM_PATH}")
+
+  set(STRIX_H3_ATTENTION_GENERATED_DIR
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+  set(STRIX_H3_ATTENTION_GENERATED_HEADER
+    "${STRIX_H3_ATTENTION_GENERATED_DIR}/h3_attention_gfx1151.hpp")
+  add_custom_command(
+    OUTPUT "${STRIX_H3_ATTENTION_GENERATED_HEADER}"
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "HOME=${CMAKE_CURRENT_BINARY_DIR}/triton-home"
+      "XDG_CACHE_HOME=${CMAKE_CURRENT_BINARY_DIR}/triton-cache"
+      "TRITON_CACHE_DIR=${CMAKE_CURRENT_BINARY_DIR}/triton-cache"
+      "TRITON_F32_DEFAULT=ieee"
+      "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/strix/compile_h3_attention.py"
+      --output "${STRIX_H3_ATTENTION_GENERATED_HEADER}"
+    DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/strix/compile_h3_attention.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/tools/strix/h3_attention_kernel.py"
+    COMMENT "Compiling spill-free gfx1151 MiniMax H3 attention"
+    VERBATIM)
 endif()
 
 if (ENGINE_ENABLE_HIP)
@@ -250,6 +271,7 @@ if (ENGINE_ENABLE_HIP)
     src/models/minimax_h3/prompt_encoder.hip
     src/models/minimax_h3/sampling.hip
     src/models/minimax_h3/video_vae.hip
+    "${STRIX_H3_ATTENTION_GENERATED_HEADER}"
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
     src/core/speculative/prompt_lookup_backend.cpp
@@ -260,6 +282,8 @@ if (ENGINE_ENABLE_HIP)
   target_compile_definitions(strix_core PRIVATE CK_ENABLE_BF16=1)
   target_include_directories(strix_core SYSTEM PRIVATE
     ${COMPOSABLE_KERNEL_INCLUDE_DIR})
+  target_include_directories(strix_core PRIVATE
+    "${STRIX_H3_ATTENTION_GENERATED_DIR}")
   target_link_libraries(strix_core PUBLIC hip::host roc::hipblas
     roc::hipblaslt roc::rocblas aotriton_v2)
 endif()
