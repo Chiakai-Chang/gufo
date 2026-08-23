@@ -376,6 +376,58 @@ static __global__ void SwiGluVector8Kernel(
   }
 }
 
+static __global__ void Bf16SiluLookupKernel(float* __restrict__ lookup) {
+  const std::uint32_t bits = blockIdx.x * blockDim.x + threadIdx.x;
+  if (bits >= (1U << 16U)) {
+    return;
+  }
+  const float gate = Bf16ToFloat(static_cast<std::uint16_t>(bits));
+  lookup[bits] = gate / (1.0F + __expf(-gate));
+}
+
+inline void LaunchBf16SiluLookup(float* lookup, hipStream_t stream) {
+  constexpr std::uint32_t kEntries = 1U << 16U;
+  constexpr std::uint32_t kThreads = 256;
+  hipLaunchKernelGGL(Bf16SiluLookupKernel,
+                     dim3((kEntries + kThreads - 1U) / kThreads),
+                     dim3(kThreads), 0, stream, lookup);
+}
+
+static __global__ void SwiGluLookupVector8Kernel(
+    const std::uint16_t* __restrict__ fused, std::uint16_t* __restrict__ output,
+    const float* __restrict__ silu_lookup, std::uint32_t rows,
+    std::uint32_t width) {
+  constexpr std::uint32_t kValuesPerThread = 8;
+  const std::uint32_t vector_column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t column = vector_column * kValuesPerThread;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= width) {
+    return;
+  }
+  const std::size_t gate_base =
+      static_cast<std::size_t>(row) * width * 2U + column;
+  const std::size_t up_base = gate_base + width;
+  const std::size_t output_base =
+      static_cast<std::size_t>(row) * width + column;
+#pragma unroll 1
+  for (std::uint32_t offset = 0; offset < kValuesPerThread; offset += 2U) {
+    const std::uint32_t gate_pair =
+        *reinterpret_cast<const std::uint32_t*>(fused + gate_base + offset);
+    const std::uint32_t up_pair =
+        *reinterpret_cast<const std::uint32_t*>(fused + up_base + offset);
+    const auto gate0 = static_cast<std::uint16_t>(gate_pair & 0xFFFFU);
+    const auto gate1 = static_cast<std::uint16_t>(gate_pair >> 16U);
+    const float up0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(up_pair & 0xFFFFU));
+    const float up1 = Bf16ToFloat(static_cast<std::uint16_t>(up_pair >> 16U));
+    const std::uint32_t result =
+        static_cast<std::uint32_t>(FloatToBf16(silu_lookup[gate0] * up0)) |
+        (static_cast<std::uint32_t>(FloatToBf16(silu_lookup[gate1] * up1))
+         << 16U);
+    *reinterpret_cast<std::uint32_t*>(output + output_base + offset) = result;
+  }
+}
+
 inline void LaunchSwiGlu(const std::uint16_t* fused, std::uint16_t* output,
                          std::uint32_t rows, std::uint32_t width,
                          hipStream_t stream) {
@@ -396,6 +448,20 @@ inline void LaunchSwiGlu(const std::uint16_t* fused, std::uint16_t* output,
                        dim3((width + kThreads - 1U) / kThreads, rows),
                        dim3(kThreads), 0, stream, fused, output, rows, width);
   }
+}
+
+inline void LaunchSwiGluLookup(const std::uint16_t* fused,
+                               std::uint16_t* output, const float* silu_lookup,
+                               std::uint32_t rows, std::uint32_t width,
+                               hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  constexpr std::uint32_t kValuesPerThread = 8;
+  hipLaunchKernelGGL(SwiGluLookupVector8Kernel,
+                     dim3((width + kThreads * kValuesPerThread - 1U) /
+                              (kThreads * kValuesPerThread),
+                          rows),
+                     dim3(kThreads), 0, stream, fused, output, silu_lookup,
+                     rows, width);
 }
 
 static __global__ void RmsNormKernel(const std::uint16_t* input,

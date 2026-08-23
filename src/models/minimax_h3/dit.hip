@@ -774,6 +774,7 @@ struct DitBlockWorkspace::Impl {
   DeviceBuffer storage;
   DeviceBuffer rope_cos;
   DeviceBuffer rope_sin;
+  DeviceBuffer silu_lookup;
   std::mutex rope_mutex;
   std::vector<std::uint16_t> rope_cos_host;
   std::vector<std::uint16_t> rope_sin_host;
@@ -811,11 +812,37 @@ std::shared_ptr<DitBlockWorkspace> DitBlockWorkspace::Create(
                                 options.row_parallel_attention, error);
   const std::size_t rope_bytes =
       options.rows * kDitRopeHalf * sizeof(std::uint16_t);
+  constexpr std::size_t kBf16SiluLookupBytes = (1ULL << 16U) * sizeof(float);
   if (impl->layout.bytes == 0 ||
       !impl->storage.Allocate(impl->layout.bytes, error) ||
       !impl->rope_cos.Allocate(rope_bytes, error) ||
-      !impl->rope_sin.Allocate(rope_bytes, error)) {
+      !impl->rope_sin.Allocate(rope_bytes, error) ||
+      (options.rows >= 32'768 &&
+       !impl->silu_lookup.Allocate(kBf16SiluLookupBytes, error))) {
     return nullptr;
+  }
+  if (impl->silu_lookup.data() != nullptr) {
+    hipStream_t lookup_stream = nullptr;
+    hipError_t status =
+        hipStreamCreateWithFlags(&lookup_stream, hipStreamNonBlocking);
+    if (status == hipSuccess) {
+      dit_ops::LaunchBf16SiluLookup(impl->silu_lookup.As<float>(),
+                                    lookup_stream);
+      status = hipPeekAtLastError();
+    }
+    if (status == hipSuccess) {
+      status = hipStreamSynchronize(lookup_stream);
+    }
+    if (lookup_stream != nullptr) {
+      const hipError_t destroy_status = hipStreamDestroy(lookup_stream);
+      if (status == hipSuccess) {
+        status = destroy_status;
+      }
+    }
+    if (status != hipSuccess) {
+      SetError(error, HipError("initialize H3 BF16 SiLU lookup", status));
+      return nullptr;
+    }
   }
   return std::shared_ptr<DitBlockWorkspace>(
       new DitBlockWorkspace(std::move(impl)));
@@ -826,9 +853,10 @@ std::size_t DitBlockWorkspace::rows() const noexcept {
 }
 
 std::uint64_t DitBlockWorkspace::bytes() const noexcept {
-  return impl_ == nullptr ? 0
-                          : impl_->storage.bytes() + impl_->rope_cos.bytes() +
-                                impl_->rope_sin.bytes();
+  return impl_ == nullptr
+             ? 0
+             : impl_->storage.bytes() + impl_->rope_cos.bytes() +
+                   impl_->rope_sin.bytes() + impl_->silu_lookup.bytes();
 }
 
 struct DitBlockSession::Impl {
@@ -882,6 +910,7 @@ struct DitBlockSession::Impl {
   DeviceBuffer block_output;
   DeviceBuffer gemm_reference;
   DeviceBuffer gemm_first_mismatch;
+  const float* silu_lookup{nullptr};
 
   std::uint64_t weight_bytes{0};
   std::uint64_t activation_bytes{0};
@@ -1062,6 +1091,7 @@ std::unique_ptr<DitBlockSession> DitBlockSession::Create(
     return true;
   };
   DitBlockWorkspace::Impl* workspace_impl = impl->workspace->impl_.get();
+  impl->silu_lookup = workspace_impl->silu_lookup.As<float>();
   const auto alias_region = [&](DeviceBuffer* buffer,
                                 const WorkspaceRegion& region,
                                 std::size_t bytes) {
@@ -1567,9 +1597,15 @@ bool DitBlockSession::RunInternal(
                        error)) {
     return false;
   }
-  dit_ops::LaunchSwiGlu(impl_->fc1.As<std::uint16_t>(),
-                        impl_->activated.As<std::uint16_t>(), rows,
-                        kDitFeedForwardSize, run_stream);
+  if (impl_->silu_lookup != nullptr) {
+    dit_ops::LaunchSwiGluLookup(
+        impl_->fc1.As<std::uint16_t>(), impl_->activated.As<std::uint16_t>(),
+        impl_->silu_lookup, rows, kDitFeedForwardSize, run_stream);
+  } else {
+    dit_ops::LaunchSwiGlu(impl_->fc1.As<std::uint16_t>(),
+                          impl_->activated.As<std::uint16_t>(), rows,
+                          kDitFeedForwardSize, run_stream);
+  }
   if (!CheckLaunch("H3 DiT SwiGLU", error) ||
       !impl_->gemm.Run(impl_->fc2_weight.storage.As<std::uint16_t>(),
                        impl_->activated.As<std::uint16_t>(),

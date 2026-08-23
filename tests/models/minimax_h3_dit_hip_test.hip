@@ -291,6 +291,36 @@ void CheckAdaLnGateAndSwiGlu() {
             0.02F);
     }
   }
+
+  constexpr std::uint32_t kLookupRows = 256;
+  constexpr std::uint32_t kLookupWidth = 256;
+  constexpr std::size_t kLookupEntries = 1ULL << 16U;
+  std::vector<std::uint16_t> lookup_fused(kLookupEntries * 2U);
+  for (std::size_t index = 0; index < kLookupEntries; ++index) {
+    const std::size_t row = index / kLookupWidth;
+    const std::size_t column = index % kLookupWidth;
+    lookup_fused[(row * 2U) * kLookupWidth + column] =
+        static_cast<std::uint16_t>(index);
+    lookup_fused[(row * 2U + 1U) * kLookupWidth + column] =
+        ToBf16((static_cast<float>(index % 31U) - 15.0F) / 7.0F);
+  }
+  DeviceArray<std::uint16_t> d_lookup_fused(lookup_fused.size());
+  DeviceArray<std::uint16_t> d_lookup_reference(kLookupEntries);
+  DeviceArray<std::uint16_t> d_lookup_output(kLookupEntries);
+  DeviceArray<float> d_silu_lookup(kLookupEntries);
+  CHECK(d_lookup_fused.CopyFrom(lookup_fused));
+  ops::LaunchBf16SiluLookup(d_silu_lookup.get(), nullptr);
+  ops::LaunchSwiGlu(d_lookup_fused.get(), d_lookup_reference.get(), kLookupRows,
+                    kLookupWidth, nullptr);
+  ops::LaunchSwiGluLookup(d_lookup_fused.get(), d_lookup_output.get(),
+                          d_silu_lookup.get(), kLookupRows, kLookupWidth,
+                          nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> lookup_reference(kLookupEntries);
+  std::vector<std::uint16_t> lookup_output(kLookupEntries);
+  CHECK(d_lookup_reference.CopyTo(lookup_reference));
+  CHECK(d_lookup_output.CopyTo(lookup_output));
+  CHECK(lookup_output == lookup_reference);
 }
 
 void CheckPatchAndFinalProjection() {

@@ -671,6 +671,26 @@ target, followed by dense block GEMMs and SwiGLU. Decoder work is paid once
 per video, while this denoiser cost is paid for every schedule evaluation, so
 quality-neutral attention work has the largest remaining end-to-end leverage.
 
+### Full-resolution exact SwiGLU lookup pass
+
+The next profile showed that the vectorized full-resolution SwiGLU kernel still
+spent 350.440 ms per block evaluating the same activation for BF16 gate
+values. A BF16 gate has exactly 65,536 possible bit patterns. The retained
+path builds a 256 KiB F32 SiLU lookup once on the GPU with the existing
+`gate / (1 + __expf(-gate))` expression, then performs the unchanged F32
+multiply and BF16 rounding. An exhaustive GPU test covers all 65,536 gate bit
+patterns and requires byte-identical output from the original and lookup
+kernels.
+
+The lookup takes 0.012 ms to build and reduces full-resolution SwiGLU to
+15.776 ms per block. The released 37,716-row block falls from 3.279 to
+2.846 seconds while preserving output SHA-256
+`b448469ba8c57601e9f8bc3ca599e427528086a7149fc6946c3660f5d212da10`.
+One 50-block forward falls from 133.263 to 116.199 seconds, a 12.80%
+reduction. Across 49 exact evaluations this removes about 836 seconds
+(13.9 minutes) of denoising wall time. The lookup is enabled only at 32,768
+rows or above, so the 7,136-row path and Issue #184 kernels are unchanged.
+
 ### Issue #184 second focused pass
 
 The next retained pass profiles complete phase boundaries once rather than
