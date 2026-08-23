@@ -149,28 +149,25 @@ inline void LaunchRope(float* cosine, float* sine, std::uint32_t patches,
 static __global__ void RmsNormKernel(const float* input, const float* weight,
                                      float* output, std::uint32_t rows,
                                      std::uint32_t width, float epsilon) {
-  const std::uint32_t row = blockIdx.x;
-  const std::uint32_t lane = threadIdx.x;
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t row = blockIdx.x * kRowsPerBlock + wave;
   if (row >= rows) {
     return;
   }
-  __shared__ float reductions[256];
   const std::size_t base = static_cast<std::size_t>(row) * width;
   float local = 0.0F;
-  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
+  for (std::uint32_t column = lane; column < width; column += 32U) {
     local = fmaf(input[base + column], input[base + column], local);
   }
-  reductions[lane] = local;
-  __syncthreads();
-  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
-    if (lane < stride) {
-      reductions[lane] += reductions[lane + stride];
-    }
-    __syncthreads();
+#pragma unroll
+  for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U) {
+    local += __shfl_down(local, stride, 32);
   }
   const float inverse =
-      rsqrtf(reductions[0] / static_cast<float>(width) + epsilon);
-  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
+      rsqrtf(__shfl(local, 0, 32) / static_cast<float>(width) + epsilon);
+  for (std::uint32_t column = lane; column < width; column += 32U) {
     output[base + column] = input[base + column] * inverse * weight[column];
   }
 }
@@ -179,8 +176,11 @@ inline void LaunchRmsNorm(const float* input, const float* weight,
                           float* output, std::uint32_t rows,
                           std::uint32_t width, float epsilon,
                           hipStream_t stream) {
-  hipLaunchKernelGGL(RmsNormKernel, dim3(rows), dim3(32), 0, stream, input,
-                     weight, output, rows, width, epsilon);
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  hipLaunchKernelGGL(RmsNormKernel,
+                     dim3((rows + kRowsPerBlock - 1U) / kRowsPerBlock),
+                     dim3(kRowsPerBlock * 32U), 0, stream, input, weight,
+                     output, rows, width, epsilon);
 }
 
 static __global__ void LayerNormKernel(const float* input, const float* weight,
@@ -333,12 +333,13 @@ __device__ __forceinline__ float SoftmaxWaveSum(float value) {
 }
 
 // rocBLAS materializes one score matrix per head as
-// [head][query_row][key_row]. Four independent gfx1151 wavefronts normalize
-// four rows per workgroup and retain the probabilities in FP32 for the PV GEMM.
+// [head][query_row][key_row]. Eight independent gfx1151 wavefronts normalize
+// eight rows per workgroup and retain the probabilities in FP32 for the PV
+// GEMM. Each row keeps the same wave-local reduction order.
 static __global__ void SoftmaxScoresInPlaceKernel(float* scores,
                                                   std::uint32_t rows,
                                                   std::uint32_t heads) {
-  constexpr std::uint32_t kRowsPerBlock = 4;
+  constexpr std::uint32_t kRowsPerBlock = 8;
   const std::uint32_t lane = threadIdx.x & 31U;
   const std::uint32_t wave = threadIdx.x >> 5U;
   const std::uint32_t query_row = blockIdx.x * kRowsPerBlock + wave;
@@ -368,10 +369,10 @@ static __global__ void SoftmaxScoresInPlaceKernel(float* scores,
 inline void LaunchSoftmaxScoresInPlace(float* scores, std::uint32_t rows,
                                        std::uint32_t heads,
                                        hipStream_t stream) {
-  constexpr std::uint32_t kRowsPerBlock = 4;
+  constexpr std::uint32_t kRowsPerBlock = 8;
   hipLaunchKernelGGL(SoftmaxScoresInPlaceKernel,
                      dim3((rows + kRowsPerBlock - 1U) / kRowsPerBlock, heads),
-                     dim3(128), 0, stream, scores, rows, heads);
+                     dim3(256), 0, stream, scores, rows, heads);
 }
 
 static __global__ void SwiGluKernel(const float* fused, const float* bias,
@@ -447,11 +448,42 @@ static __global__ void ScaleAddKernel(float* residual, const float* branch,
   }
 }
 
+static __global__ void ScaleAddFloat4Kernel(
+    float4* residual, const float4* branch, const float4* bias,
+    const float4* scale, std::uint32_t rows, std::uint32_t vectors) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row >= rows || column >= vectors) {
+    return;
+  }
+  const std::size_t index = static_cast<std::size_t>(row) * vectors + column;
+  const float4 current = residual[index];
+  const float4 value = branch[index];
+  const float4 offset = bias[column];
+  const float4 multiplier = scale[column];
+  residual[index] = {
+      fmaf(value.x + offset.x, multiplier.x, current.x),
+      fmaf(value.y + offset.y, multiplier.y, current.y),
+      fmaf(value.z + offset.z, multiplier.z, current.z),
+      fmaf(value.w + offset.w, multiplier.w, current.w),
+  };
+}
+
 inline void LaunchScaleAdd(float* residual, const float* branch,
                            const float* bias, const float* scale,
                            std::uint32_t rows, std::uint32_t width,
                            hipStream_t stream) {
   constexpr std::uint32_t kThreads = 256;
+  if (width % 4U == 0U) {
+    const std::uint32_t vectors = width / 4U;
+    hipLaunchKernelGGL(
+        ScaleAddFloat4Kernel, dim3((vectors + kThreads - 1U) / kThreads, rows),
+        dim3(kThreads), 0, stream, reinterpret_cast<float4*>(residual),
+        reinterpret_cast<const float4*>(branch),
+        reinterpret_cast<const float4*>(bias),
+        reinterpret_cast<const float4*>(scale), rows, vectors);
+    return;
+  }
   hipLaunchKernelGGL(
       ScaleAddKernel, dim3((width + kThreads - 1U) / kThreads, rows),
       dim3(kThreads), 0, stream, residual, branch, bias, scale, rows, width);

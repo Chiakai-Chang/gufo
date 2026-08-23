@@ -57,6 +57,8 @@ void PrintVideoHelp(std::string_view program_name) {
       << "Quality presets:\n"
       << "  --preset exact             512, 50 sigma points / 49 evaluations, "
          "50 blocks, reuse 1\n"
+      << "  --preset exact-1344x768    Released 1344x768, 124 frames, 50 "
+         "sigma points / 49 evaluations, 50 blocks, reuse 1\n"
       << "  --preset fast              384->512, 20 sigma points / 19 "
          "evaluations, 45 blocks, reuse 2\n"
       << "  --preset aggressive        320->512, 20 sigma points / 19 "

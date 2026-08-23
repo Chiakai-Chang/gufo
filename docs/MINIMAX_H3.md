@@ -388,6 +388,7 @@ The named preset contract is versioned as
 | Preset | Internal canvas | Output canvas | Sigma points / evaluations | Active blocks | Denoiser reuse |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `exact` | 512x512 | 512x512 | 50 / 49 | 50 | 1 |
+| `exact-1344x768` | 1344x768 | 1344x768 | 50 / 49 | 50 | 1 |
 | `fast` | 384x384 | 512x512 | 20 / 19 | 45 | 2 |
 | `aggressive` | 320x320 | 512x512 | 20 / 19 | 40 | 3 |
 | `dev` | 256x256 | selected 256x256 frames | 5 / 4 | 50 | 1 |
@@ -420,6 +421,18 @@ nix develop -c ./build-h3-173/strix-server video \
   --latents-dir /tmp/h3-fox-exact-latents \
   --profile \
   "A red fox walking through snow"
+```
+
+Released five-second full-resolution output uses 124 aligned frames at 24 fps:
+
+```sh
+nix develop -c ./build/hardware-test/strix-server video \
+  --model /var/llms/huggingface/MiniMax-H3 \
+  --preset exact-1344x768 \
+  --seed 42 \
+  --output /tmp/h3-fullres.mp4 \
+  --profile \
+  "An anime soccer goalkeeper summons a giant cyan energy hand to catch an incoming shot."
 ```
 
 Every admitted request writes a parameter document containing the preset,
@@ -477,8 +490,8 @@ The supported routes are:
 | `DELETE` | `/v1/videos/{id}` | Cancel or remove a job and reclaim its artifacts |
 
 `GET /v1/models` advertises `minimax-h3` and the
-`minimax-h3-{exact,fast,aggressive,dev}` aliases. An alias selects its matching
-frozen preset; if `strix.preset` is also present, the two must agree.
+`minimax-h3-{exact,fast,aggressive,dev,fullres}` aliases. An alias selects its
+matching frozen preset; if `strix.preset` is also present, the two must agree.
 
 Create accepts `application/json` and the `multipart/form-data` shape used by
 OpenAI video clients. JSON remains convenient for the nested Strix extension:
@@ -489,6 +502,21 @@ OpenAI video clients. JSON remains convenient for the nested Strix extension:
   "prompt": "A red fox walking through snow",
   "size": "512x512",
   "seconds": "1",
+  "strix": {
+    "seed": 42,
+    "output_format": "mp4"
+  }
+}
+```
+
+The released full-resolution JSON request is:
+
+```json
+{
+  "model": "minimax-h3",
+  "prompt": "An anime soccer goalkeeper summons a giant cyan energy hand.",
+  "size": "1344x768",
+  "seconds": 5,
   "strix": {
     "seed": 42,
     "output_format": "mp4"
@@ -511,8 +539,9 @@ Multipart duplicate fields and malformed boundaries fail closed. A multipart
 `input_reference` file is recognized but rejected explicitly until the
 first/last-frame conditioning milestone lands.
 
-Exact, fast, and aggressive deliberately support one-second, 22-frame,
-512x512 audiovisual MP4 files only. The development alias requires
+Exact, fast, and aggressive support the rapid one-second, 22-frame, 512x512
+MP4 route. `exact-1344x768` additionally supports the released five-second,
+124-frame, 1344x768 audiovisual MP4 route. The development alias requires
 `size: "256x256"` and `output_format: "ppm"`; it accepts a released
 VisualVAE-decodable frame count through `strix.frames` (`22, 39, ... 345`) and
 exactly one diagnostic frame through `strix.selected_frame`. Although the
@@ -586,6 +615,22 @@ stays below its frozen 1% relative-error ceilings. Two alternate QKV layouts
 were measured and removed because they preserved quality but increased
 production-shape latency.
 
+The released 1344x768, 124-frame layout contains 37,716 rows. The former
+scalar fallback took 12,916.9 seconds for one block. CK BF16 WMMA reduced that
+to 36.13 seconds, and AOTriton with row-major interleaved heads reduced it to
+15.29 seconds. Writing normalized Q/K/V directly in contiguous head-major
+layout lets the native gfx1151 AOTriton FlashAttention image avoid a strided
+sequence walk. Pinned byte-equivalent rocBLAS projections, lifetime-aliased
+scratch, direct row-major attention output, and a fused gate/RMS handoff reduce
+the retained block to 3.29 seconds and 5,051 MiB of shared scratch while
+preserving output SHA-256
+`b448469ba8c57601e9f8bc3ca599e427528086a7149fc6946c3660f5d212da10`.
+A single 50-block forward takes 151.658 seconds, down from 157.155 seconds,
+with 43.1 GiB peak residency and zero swap. At 7,136 rows it remains within the
+frozen scalar parity budget (`relative_l2=0.003853`,
+`normalized_max=0.010417`) with no non-finite values. Sequences at or below
+4,096 rows continue to use the unchanged Issue #184 CK kernel.
+
 The associated 92.494 ms wall-time capture peaked at 44 W and 1,192 MHz. Power
 is diagnostic here: this isolated block finishes before the APU can ramp
 toward its configured 120--140 W envelope. The benchmark is not extended or
@@ -612,6 +657,14 @@ VisualVAE computes each Q/K norm once per head, broadcasts the factor, folds
 biases only across quality-equivalent F32 rounding boundaries, and vectorizes
 SwiGLU. Stable softmax retains its existing F32 reduction order. Peak memory
 remains 9.766 GiB and the selected-frame relative L2 is `8.14968e-7`.
+
+A subsequent exact-only decoder pass groups eight independent softmax and RMS
+rows per workgroup and uses aligned `float4` residual updates. The selected
+tile falls from 6.772 seconds to 5.735 seconds uninstrumented; the retained
+trace measures 5.786 seconds. RMS normalization falls from 365 to 138 ms and
+residual scale/add from 360 to 115 ms. The frozen selected-frame oracle metrics
+remain unchanged. A wave-grouped QKV/RoPE candidate was slower and changed the
+oracle slightly, so it was removed.
 
 The denoiser keeps the hidden state in two BF16 device buffers across all 50
 blocks instead of copying it through host memory and synchronizing per block.

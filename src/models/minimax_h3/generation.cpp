@@ -407,6 +407,17 @@ std::optional<GenerationParameters> ResolveGenerationPreset(
                   .active_blocks = 50,
                   .reuse_interval = 1,
                   .selected_frames = {}};
+  } else if (name == "exact-1344x768" || name == "fullres") {
+    parameters = {.preset = "exact-1344x768",
+                  .internal_width = 1344,
+                  .internal_height = 768,
+                  .output_width = 1344,
+                  .output_height = 768,
+                  .frames = 124,
+                  .evaluations = 49,
+                  .active_blocks = 50,
+                  .reuse_interval = 1,
+                  .selected_frames = {}};
   } else if (name == "fast" || name == "fast-384") {
     parameters = {.preset = "fast-384",
                   .internal_width = 384,
@@ -444,8 +455,8 @@ std::optional<GenerationParameters> ResolveGenerationPreset(
                   .selected_frames = {0, 11, 21}};
   } else {
     SetError(error,
-             "unknown MiniMax H3 preset; expected exact, fast, aggressive, or "
-             "dev");
+             "unknown MiniMax H3 preset; expected exact, exact-1344x768, "
+             "fast, aggressive, or dev");
     return std::nullopt;
   }
   return parameters;

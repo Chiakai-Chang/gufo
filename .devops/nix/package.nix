@@ -70,6 +70,7 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.rocwmma
     rocmPackages.rocblas
     rocmPackages.composable_kernel
+    rocmPackages.aotriton
     rocmPackages.rocprofiler-sdk
   ]
   ++ lib.optionals xrtSupport [

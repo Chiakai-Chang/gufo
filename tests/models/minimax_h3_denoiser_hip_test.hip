@@ -540,7 +540,7 @@ int CheckReuseSmoke() {
   CHECK(Finite(first_video));
   CHECK(Finite(first_audio));
   CHECK(first.forward_ms.size() == 3);
-  CHECK(first.dispatches == 136);
+  CHECK(first.dispatches == 121);
   CHECK(first.swap_bytes == 0);
 
   std::cout << "H3 denoiser reuse smoke active_blocks=3 steps=5 "
@@ -548,6 +548,83 @@ int CheckReuseSmoke() {
             << static_cast<double>(first.peak_live_bytes) /
                    (1024.0 * 1024.0 * 1024.0)
             << " sampler_ms=" << first.sampler_ms << '\n';
+  return failures == 0 ? 0 : 1;
+}
+
+int ProfileFullResolutionForward() {
+  const char* root = std::getenv("STRIX_H3_MODEL_ROOT");
+  const char* conditioning_path = std::getenv("STRIX_H3_LAYER50_CONDITIONING");
+  if (root == nullptr || conditioning_path == nullptr) {
+    std::cout << "SKIP: STRIX_H3_MODEL_ROOT or "
+                 "STRIX_H3_LAYER50_CONDITIONING unset\n";
+    return 77;
+  }
+  constexpr std::size_t kTextRows = 6;
+  auto conditioning =
+      ReadBf16(conditioning_path, kTextRows * h3::kH3TextConditionWidth);
+  std::string error;
+  auto inventory =
+      h3::ModelInventory::Inspect(root, STRIX_H3_SOURCE_MANIFEST, &error);
+  auto geometry = h3::ResolveGenerationGeometry(1344, 768, 124, &error);
+  CHECK(inventory.has_value());
+  CHECK(geometry.has_value());
+  CHECK(!conditioning.empty());
+  if (!inventory || !geometry || conditioning.empty()) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+
+  h3::DenoiserTelemetry creation;
+  auto session = h3::DenoiserSession::Create(
+      *inventory,
+      {.geometry = *geometry,
+       .evaluations = 2,
+       .text_rows = kTextRows,
+       .active_blocks = static_cast<int>(h3::kDitBlocks),
+       .reuse_interval = 1},
+      {.layer50 = conditioning, .tags = {}}, nullptr, &creation, &error);
+  CHECK(session != nullptr);
+  if (session == nullptr) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+  CHECK(session->layout().rows() == 37716);
+
+  const std::size_t video_elements =
+      h3::kH3VideoLatentChannels *
+      static_cast<std::size_t>(geometry->temporal.video_latent_frames) *
+      static_cast<std::size_t>(geometry->latent_height) *
+      static_cast<std::size_t>(geometry->latent_width);
+  const std::size_t audio_elements =
+      h3::kH3AudioLatentChannels * h3::kH3AudioTracks *
+      static_cast<std::size_t>(geometry->temporal.audio_latent_frames);
+  std::vector<float> video(video_elements, 0.0F);
+  std::vector<float> audio(audio_elements, 0.0F);
+  h3::DenoiserVelocity velocity;
+  h3::DenoiserTelemetry telemetry;
+  CHECK(session->Forward(0, video, audio, nullptr, &velocity, &telemetry,
+                         &error));
+  if (velocity.video.empty()) {
+    std::cerr << error << '\n';
+    return 1;
+  }
+  CHECK(Finite(velocity.video));
+  CHECK(Finite(velocity.audio));
+  CHECK(telemetry.first_non_finite.empty());
+  CHECK(telemetry.forward_ms.size() == 1);
+  std::cout << "H3 full-resolution denoiser profile rows="
+            << session->layout().rows() << " blocks=" << h3::kDitBlocks
+            << " core_load_ms=" << telemetry.core_load_ms
+            << " adaln_ms=" << telemetry.adaln_precompute_ms << " scratch_gib="
+            << static_cast<double>(telemetry.scratch_bytes) /
+                   (1024.0 * 1024.0 * 1024.0)
+            << " peak_gib="
+            << static_cast<double>(telemetry.peak_live_bytes) /
+                   (1024.0 * 1024.0 * 1024.0)
+            << " cumulative_gib="
+            << static_cast<double>(telemetry.cumulative_allocation_bytes) /
+                   (1024.0 * 1024.0 * 1024.0)
+            << " forward_ms=" << telemetry.forward_ms.front() << '\n';
   return failures == 0 ? 0 : 1;
 }
 
@@ -559,11 +636,12 @@ int main(int argc, char** argv) {
        std::string_view(argv[1]) != "--oracle-forward" &&
        std::string_view(argv[1]) != "--oracle-512-forward" &&
        std::string_view(argv[1]) != "--oracle-512-forward-scalar" &&
-       std::string_view(argv[1]) != "--reuse-smoke")) {
+       std::string_view(argv[1]) != "--reuse-smoke" &&
+       std::string_view(argv[1]) != "--profile-fullres-forward")) {
     std::cerr << "usage: " << argv[0]
               << " --smoke|--oracle-forward|--oracle-512-forward|"
                  "--oracle-512-forward-scalar|"
-                 "--reuse-smoke\n";
+                 "--reuse-smoke|--profile-fullres-forward\n";
     return 2;
   }
   if (std::string_view(argv[1]) == "--oracle-forward") {
@@ -576,6 +654,9 @@ int main(int argc, char** argv) {
   }
   if (std::string_view(argv[1]) == "--reuse-smoke") {
     return CheckReuseSmoke();
+  }
+  if (std::string_view(argv[1]) == "--profile-fullres-forward") {
+    return ProfileFullResolutionForward();
   }
   return CheckReal();
 }

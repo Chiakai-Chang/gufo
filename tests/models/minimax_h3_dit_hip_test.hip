@@ -744,7 +744,7 @@ int CheckReal() {
   return failures == 0 ? 0 : 1;
 }
 
-int ProfileProductionBlock() {
+int ProfileBlock(std::size_t rows, bool row_parallel) {
   if (!HasGfx1151()) {
     std::cout << "SKIP: integrated gfx1151 is unavailable\n";
     return 77;
@@ -755,14 +755,13 @@ int ProfileProductionBlock() {
     return 77;
   }
 
-  constexpr std::size_t kRows = 1872;
   constexpr std::size_t kModulationRows = 6;
-  std::vector<std::uint16_t> hidden(kRows * h3::kDitHiddenSize);
+  std::vector<std::uint16_t> hidden(rows * h3::kDitHiddenSize);
   std::vector<std::uint16_t> modulation(
       kModulationRows * h3::kDitModulationSlots * h3::kDitHiddenSize);
-  std::vector<std::uint32_t> row_map(kRows);
-  std::vector<std::uint16_t> rope_cos(kRows * h3::kDitRopeHalf);
-  std::vector<std::uint16_t> rope_sin(kRows * h3::kDitRopeHalf);
+  std::vector<std::uint32_t> row_map(rows);
+  std::vector<std::uint16_t> rope_cos(rows * h3::kDitRopeHalf);
+  std::vector<std::uint16_t> rope_sin(rows * h3::kDitRopeHalf);
   for (std::size_t index = 0; index < hidden.size(); ++index) {
     hidden[index] =
         ToBf16(std::sin(static_cast<float>(index) * 0.00013F) * 0.25F);
@@ -771,7 +770,7 @@ int ProfileProductionBlock() {
     modulation[index] =
         ToBf16(std::cos(static_cast<float>(index) * 0.00031F) * 0.04F);
   }
-  for (std::size_t row = 0; row < kRows; ++row) {
+  for (std::size_t row = 0; row < rows; ++row) {
     row_map[row] = static_cast<std::uint32_t>(row % kModulationRows);
     for (std::size_t frequency = 0; frequency < h3::kDitRopeHalf; ++frequency) {
       const float angle = static_cast<float>(row) *
@@ -792,9 +791,9 @@ int ProfileProductionBlock() {
   auto session =
       h3::DitBlockSession::Create(*inventory,
                                   {.block_index = 0,
-                                   .rows = kRows,
+                                   .rows = rows,
                                    .modulation_rows = kModulationRows,
-                                   .row_parallel_attention = true},
+                                   .row_parallel_attention = row_parallel},
                                   nullptr, &error);
   CHECK(session != nullptr);
   if (session == nullptr ||
@@ -819,7 +818,15 @@ int ProfileProductionBlock() {
   const auto bytes = std::span<const unsigned char>(
       reinterpret_cast<const unsigned char*>(output.data()),
       output.size() * sizeof(output.front()));
-  std::cout << "H3 DiT production block profile rows=" << kRows
+  if (const char* output_path = std::getenv("STRIX_H3_DIT_PROFILE_OUTPUT");
+      output_path != nullptr && *output_path != '\0') {
+    std::ofstream output_file(output_path, std::ios::binary);
+    output_file.write(
+        reinterpret_cast<const char*>(output.data()),
+        static_cast<std::streamsize>(output.size() * sizeof(output.front())));
+    CHECK(output_file.good());
+  }
+  std::cout << "H3 DiT production block profile rows=" << rows
             << " gpu_ms=" << telemetry.gpu_ms << " wall_ms=" << wall_ms
             << " attention_backend=" << telemetry.attention_backend
             << " activation_mib="
@@ -835,9 +842,14 @@ int main(int argc, char** argv) {
   if (argc != 2 || (std::string_view(argv[1]) != "--analytic" &&
                     std::string_view(argv[1]) != "--ops" &&
                     std::string_view(argv[1]) != "--real" &&
-                    std::string_view(argv[1]) != "--profile-1872")) {
+                    std::string_view(argv[1]) != "--profile-1872" &&
+                    std::string_view(argv[1]) != "--profile-7136-scalar" &&
+                    std::string_view(argv[1]) != "--profile-7136-fused" &&
+                    std::string_view(argv[1]) != "--profile-37716-fused")) {
     std::cerr << "usage: " << argv[0]
-              << " --analytic|--ops|--real|--profile-1872\n";
+              << " --analytic|--ops|--real|--profile-1872|"
+                 "--profile-7136-scalar|--profile-7136-fused|"
+                 "--profile-37716-fused\n";
     return 2;
   }
   if (std::string_view(argv[1]) == "--ops") {
@@ -847,7 +859,16 @@ int main(int argc, char** argv) {
     return CheckReal();
   }
   if (std::string_view(argv[1]) == "--profile-1872") {
-    return ProfileProductionBlock();
+    return ProfileBlock(1872, true);
+  }
+  if (std::string_view(argv[1]) == "--profile-7136-scalar") {
+    return ProfileBlock(7136, false);
+  }
+  if (std::string_view(argv[1]) == "--profile-7136-fused") {
+    return ProfileBlock(7136, true);
+  }
+  if (std::string_view(argv[1]) == "--profile-37716-fused") {
+    return ProfileBlock(37716, true);
   }
   return CheckAnalytic();
 }

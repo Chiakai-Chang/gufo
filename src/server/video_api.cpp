@@ -435,8 +435,9 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   if (seconds_value != nullptr && seconds_value->is_string()) {
     seconds = seconds_value->str();
   } else if (seconds_value != nullptr && seconds_value->is_number() &&
-             seconds_value->as_double() == 1.0) {
-    seconds = "1";
+             (seconds_value->as_double() == 1.0 ||
+              seconds_value->as_double() == 5.0)) {
+    seconds = seconds_value->as_double() == 5.0 ? "5" : "1";
   }
   if (model.empty() || prompt.empty() || seconds.empty()) {
     return Error(400, "Bad Request",
@@ -448,7 +449,8 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "video prompt exceeds 4096 UTF-8 bytes", "prompt_too_large");
   }
 
-  std::string preset = "exact";
+  std::string preset =
+      size == "1344x768" && seconds == "5" ? "exact-1344x768" : "exact";
   std::string model_preset;
   if (model == "minimax-h3-exact") {
     model_preset = "exact";
@@ -458,6 +460,8 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     model_preset = "aggressive";
   } else if (model == "minimax-h3-dev") {
     model_preset = "dev";
+  } else if (model == "minimax-h3-fullres") {
+    model_preset = "exact-1344x768";
   } else if (model != "minimax-h3") {
     return Error(400, "Bad Request", "unsupported video model",
                  "invalid_model");
@@ -541,16 +545,20 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     parameters->selected_frames = {
         selected_frame.value_or(parameters->frames / 2)};
   } else if (output_format == "mp4") {
-    if (!parameters->mux || selected_frame.has_value() || size != "512x512") {
+    const bool one_second = size == "512x512" && seconds == "1" &&
+                            parameters->frames == 22 &&
+                            (parameters->preset == "exact-512" ||
+                             parameters->preset == "fast-384" ||
+                             parameters->preset == "aggressive-320");
+    const bool released_full_resolution =
+        size == "1344x768" && seconds == "5" &&
+        parameters->preset == "exact-1344x768" && parameters->frames == 124;
+    if (!parameters->mux || selected_frame.has_value() ||
+        (!one_second && !released_full_resolution)) {
       return Error(400, "Bad Request",
-                   "MP4 output requires an exact, fast, or aggressive preset "
-                   "at size '512x512'",
+                   "MP4 output requires a supported preset, duration, and "
+                   "resolution combination",
                    "invalid_output_format");
-    }
-    if (parameters->frames != 22) {
-      return Error(400, "Bad Request",
-                   "one-second MP4 output requires exactly 22 frames",
-                   "invalid_frames");
     }
   } else {
     return Error(400, "Bad Request",

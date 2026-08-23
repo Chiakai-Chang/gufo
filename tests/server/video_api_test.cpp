@@ -265,6 +265,20 @@ void TestLifecycleAndRange(const std::filesystem::path& root) {
 void TestValidation(const std::filesystem::path& root) {
   FakeRunner runner;
   VideoJobService service(Options(root, &runner));
+  const HttpResponse fullres = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"A goalkeeper saves a shot","size":"1344x768","seconds":5})");
+  Check(fullres.status == 202, "released full-resolution API request accepted");
+  runner.WaitForCalls(1);
+  const h3::GenerationRequest fullres_generation = runner.latest();
+  Check(fullres_generation.parameters.preset == "exact-1344x768" &&
+            fullres_generation.parameters.internal_width == 1344 &&
+            fullres_generation.parameters.internal_height == 768 &&
+            fullres_generation.parameters.frames == 124 &&
+            fullres_generation.parameters.evaluations == 49,
+        "API maps 1344x768 five-second request to the exact preset");
+  WaitCompleted(service, CreatedId(fullres));
+
   const HttpResponse reference = Send(
       service, "POST", "/v1/videos",
       R"({"model":"minimax-h3","prompt":"x","seconds":"1","input_reference":"secret.png"})");
@@ -355,7 +369,7 @@ void TestValidation(const std::filesystem::path& root) {
            {}, "multipart/form-data; boundary=\"strix-openai-video-boundary\"");
   Check(multipart.status == 202,
         "OpenAI-style multipart text-to-video request is admitted");
-  runner.WaitForCalls(1);
+  runner.WaitForCalls(2);
   Check(runner.latest().parameters.preset == "fast-384",
         "multipart request preserves the selected H3 mode");
 

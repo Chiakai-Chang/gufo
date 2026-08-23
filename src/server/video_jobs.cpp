@@ -36,7 +36,7 @@ constexpr std::size_t kMaximumPromptBytes = 4096;
 bool IsH3Model(std::string_view model) {
   return model == "minimax-h3" || model == "minimax-h3-exact" ||
          model == "minimax-h3-fast" || model == "minimax-h3-aggressive" ||
-         model == "minimax-h3-dev";
+         model == "minimax-h3-dev" || model == "minimax-h3-fullres";
 }
 
 bool ModelMatchesPreset(std::string_view model, std::string_view preset) {
@@ -46,7 +46,8 @@ bool ModelMatchesPreset(std::string_view model, std::string_view preset) {
   return (model == "minimax-h3-exact" && preset == "exact-512") ||
          (model == "minimax-h3-fast" && preset == "fast-384") ||
          (model == "minimax-h3-aggressive" && preset == "aggressive-320") ||
-         (model == "minimax-h3-dev" && preset == "development-256");
+         (model == "minimax-h3-dev" && preset == "development-256") ||
+         (model == "minimax-h3-fullres" && preset == "exact-1344x768");
 }
 
 bool MatchesFrozenOutputContract(const VideoJobRequest& request) {
@@ -55,13 +56,20 @@ bool MatchesFrozenOutputContract(const VideoJobRequest& request) {
     return false;
   }
   if (request.output_format == "mp4") {
-    return request.size == "512x512" && parameters.output_width == 512 &&
-           parameters.output_height == 512 && parameters.frames == 22 &&
-           parameters.mux && parameters.decode_audio &&
-           parameters.selected_frames.empty() &&
-           (parameters.preset == "exact-512" ||
-            parameters.preset == "fast-384" ||
-            parameters.preset == "aggressive-320");
+    const bool one_second =
+        request.seconds == "1" && request.size == "512x512" &&
+        parameters.output_width == 512 && parameters.output_height == 512 &&
+        parameters.frames == 22 &&
+        (parameters.preset == "exact-512" || parameters.preset == "fast-384" ||
+         parameters.preset == "aggressive-320");
+    const bool released_full_resolution =
+        request.seconds == "5" && request.size == "1344x768" &&
+        parameters.preset == "exact-1344x768" &&
+        parameters.internal_width == 1344 &&
+        parameters.internal_height == 768 && parameters.output_width == 1344 &&
+        parameters.output_height == 768 && parameters.frames == 124;
+    return (one_second || released_full_resolution) && parameters.mux &&
+           parameters.decode_audio && parameters.selected_frames.empty();
   }
   return request.output_format == "ppm" && request.size == "256x256" &&
          parameters.preset == "development-256" &&
@@ -421,7 +429,8 @@ struct VideoJobService::Impl {
         const double expires_at = value.member_double("expires_at", -1);
         job->directory = entry.path();
         const bool valid_output = (job->snapshot.output_format == "mp4" &&
-                                   job->snapshot.size == "512x512") ||
+                                   (job->snapshot.size == "512x512" ||
+                                    job->snapshot.size == "1344x768")) ||
                                   (job->snapshot.output_format == "ppm" &&
                                    job->snapshot.size == "256x256");
         const bool valid_numbers =
@@ -441,7 +450,8 @@ struct VideoJobService::Impl {
                 static_cast<double>(std::numeric_limits<std::int64_t>::max());
         if (value.member_str("schema") != "strix.video-job.v1" ||
             !IsVideoId(job->snapshot.id) || job->snapshot.id != directory_id ||
-            !IsH3Model(job->snapshot.model) || job->snapshot.seconds != "1" ||
+            !IsH3Model(job->snapshot.model) ||
+            (job->snapshot.seconds != "1" && job->snapshot.seconds != "5") ||
             !valid_output || !valid_numbers ||
             expires_at <= static_cast<double>(now_value) ||
             value.member_str("status") != "completed") {
@@ -732,7 +742,7 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   if (!IsH3Model(request.model) || request.prompt.empty() ||
       request.prompt.size() > kMaximumPromptBytes ||
       request.prompt.find('\0') != std::string::npos ||
-      request.seconds != "1" ||
+      (request.seconds != "1" && request.seconds != "5") ||
       (request.output_format != "mp4" && request.output_format != "ppm") ||
       !minimax_h3::ValidateGenerationParameters(request.parameters, nullptr) ||
       !MatchesFrozenOutputContract(request)) {

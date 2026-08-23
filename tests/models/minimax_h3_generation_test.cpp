@@ -124,13 +124,19 @@ h3::VideoFrames SyntheticFrames() {
 void TestPresetsAndReports() {
   std::string error;
   const auto exact = h3::ResolveGenerationPreset("exact", &error);
+  const auto fullres = h3::ResolveGenerationPreset("exact-1344x768", &error);
   const auto fast = h3::ResolveGenerationPreset("fast", &error);
   const auto aggressive = h3::ResolveGenerationPreset("aggressive", &error);
   const auto dev = h3::ResolveGenerationPreset("dev", &error);
-  Check(exact && fast && aggressive && dev, "all frozen presets resolve");
+  Check(exact && fullres && fast && aggressive && dev,
+        "all frozen presets resolve");
   Check(exact->evaluations == 49 && exact->active_blocks == 50 &&
             exact->reuse_interval == 1,
         "exact preset contract");
+  Check(fullres->internal_width == 1344 && fullres->internal_height == 768 &&
+            fullres->frames == 124 && fullres->evaluations == 49 &&
+            fullres->active_blocks == 50 && fullres->reuse_interval == 1,
+        "released full-resolution exact preset contract");
   Check(fast->internal_width == 384 && fast->evaluations == 19 &&
             fast->active_blocks == 45 && fast->reuse_interval == 2,
         "fast preset contract");

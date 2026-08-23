@@ -272,7 +272,7 @@ HttpResponse ListModels(InferenceBackend* backend,
     data.push_back(std::move(root_model));
     for (const std::string_view preset :
          {"minimax-h3-exact", "minimax-h3-fast", "minimax-h3-aggressive",
-          "minimax-h3-dev"}) {
+          "minimax-h3-dev", "minimax-h3-fullres"}) {
       json::Value model = json::Value::object();
       model["id"] = std::string(preset);
       model["object"] = "model";

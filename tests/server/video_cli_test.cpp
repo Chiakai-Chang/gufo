@@ -46,6 +46,17 @@ void TestPresets() {
          "aggressive internal width");
   Expect(options->request.parameters.active_blocks == 40, "aggressive blocks");
   Expect(options->request.parameters.reuse_interval == 3, "aggressive reuse");
+
+  const std::array<const char*, 7> fullres = {
+      "--model",  "/models/h3", "--preset",    "exact-1344x768",
+      "--output", "out.mp4",    "A goalkeeper"};
+  options = strix::server::ParseVideoOptions(fullres, &error);
+  Expect(options.has_value(), "full-resolution exact preset parses");
+  Expect(options->request.parameters.internal_width == 1344 &&
+             options->request.parameters.internal_height == 768 &&
+             options->request.parameters.frames == 124 &&
+             options->request.parameters.evaluations == 49,
+         "full-resolution CLI contract");
 }
 
 void TestDevelopmentAndOverrides() {

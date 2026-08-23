@@ -191,6 +191,9 @@ omissions are documented in [MINIMAX_H3.md](MINIMAX_H3.md).
 Create requests accept both `application/json` and OpenAI-client-compatible
 `multipart/form-data`; duplicate form fields, malformed boundaries, unsupported
 media types, and reference-image parts fail explicitly.
+The production H3 contract supports both the rapid `512x512`, one-second MP4
+route and the released `1344x768`, five-second exact route (124 aligned frames
+at 24 fps).
 The bounded worker retains prompt text only in volatile queued or active
 request memory, persists only its SHA-256 digest, and wipes both source and
 active string storage after transfer and completion. Completed MP4s are probed

@@ -23,6 +23,34 @@ inline constexpr std::size_t kDitRopeHalf = 48;
 inline constexpr std::size_t kDitModulationSlots = 6;
 inline constexpr float kDitNormEpsilon = 1.0e-5F;
 
+struct DitBlockWorkspaceOptions {
+  std::size_t rows{0};
+  bool row_parallel_attention{true};
+};
+
+class DitBlockWorkspace {
+public:
+  ~DitBlockWorkspace();
+
+  DitBlockWorkspace(const DitBlockWorkspace&) = delete;
+  DitBlockWorkspace& operator=(const DitBlockWorkspace&) = delete;
+  DitBlockWorkspace(DitBlockWorkspace&&) = delete;
+  DitBlockWorkspace& operator=(DitBlockWorkspace&&) = delete;
+
+  [[nodiscard]] static std::shared_ptr<DitBlockWorkspace> Create(
+      const DitBlockWorkspaceOptions& options, std::string* error = nullptr);
+
+  [[nodiscard]] std::size_t rows() const noexcept;
+  [[nodiscard]] std::uint64_t bytes() const noexcept;
+
+private:
+  struct Impl;
+  explicit DitBlockWorkspace(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl_;
+
+  friend class DitBlockSession;
+};
+
 struct DitBlockOptions {
   std::size_t block_index{0};
   std::size_t rows{0};
@@ -77,6 +105,10 @@ public:
   [[nodiscard]] static std::unique_ptr<DitBlockSession> Create(
       const ModelInventory& inventory, const DitBlockOptions& options,
       const CancellationToken* cancellation, std::string* error = nullptr);
+  [[nodiscard]] static std::unique_ptr<DitBlockSession> Create(
+      const ModelInventory& inventory, const DitBlockOptions& options,
+      std::shared_ptr<DitBlockWorkspace> workspace,
+      const CancellationToken* cancellation, std::string* error = nullptr);
 
   [[nodiscard]] bool PrepareConstants(std::span<const std::uint16_t> modulation,
                                       std::span<const std::uint16_t> rope_cos,
@@ -93,13 +125,11 @@ public:
   // Device-resident production path. Pointers and stream must belong to the
   // current HIP device; execution is enqueued without synchronizing or
   // copying activations through host memory.
-  [[nodiscard]] bool RunPreparedDevice(const std::uint16_t* hidden_device,
-                                       const std::uint32_t* row_map_device,
-                                       std::uint16_t* output_device,
-                                       void* stream,
-                                       const CancellationToken* cancellation,
-                                       DitBlockTelemetry* telemetry,
-                                       std::string* error = nullptr);
+  [[nodiscard]] bool RunPreparedDevice(
+      const std::uint16_t* hidden_device, const std::uint32_t* row_map_device,
+      std::uint16_t* output_device, void* stream, bool input_rms_prepared,
+      bool output_rms_required, const CancellationToken* cancellation,
+      DitBlockTelemetry* telemetry, std::string* error = nullptr);
 
   [[nodiscard]] bool Run(const DitBlockInput& input,
                          const CancellationToken* cancellation,
@@ -126,7 +156,8 @@ private:
       std::span<std::uint16_t> block_output, DitBlockTelemetry* telemetry,
       std::string* error, const std::uint16_t* hidden_device = nullptr,
       const std::uint32_t* row_map_device = nullptr,
-      std::uint16_t* output_device = nullptr, void* external_stream = nullptr);
+      std::uint16_t* output_device = nullptr, void* external_stream = nullptr,
+      bool input_rms_prepared = false, bool output_rms_required = false);
   std::unique_ptr<Impl> impl_;
 };
 

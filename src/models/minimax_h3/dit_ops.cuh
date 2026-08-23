@@ -339,13 +339,16 @@ inline void LaunchSwiGlu(const std::uint16_t* fused, std::uint16_t* output,
                          std::uint32_t rows, std::uint32_t width,
                          hipStream_t stream) {
   if (width % 8U == 0U) {
-    constexpr std::uint32_t kThreads = 128;
+    constexpr std::uint32_t kShortSequenceThreads = 128;
+    constexpr std::uint32_t kLongSequenceThreads = 256;
     constexpr std::uint32_t kValuesPerThread = 8;
+    const std::uint32_t threads =
+        rows >= 32'768 ? kLongSequenceThreads : kShortSequenceThreads;
     hipLaunchKernelGGL(SwiGluVector8Kernel,
-                       dim3((width + kThreads * kValuesPerThread - 1U) /
-                                (kThreads * kValuesPerThread),
+                       dim3((width + threads * kValuesPerThread - 1U) /
+                                (threads * kValuesPerThread),
                             rows),
-                       dim3(kThreads), 0, stream, fused, output, rows, width);
+                       dim3(threads), 0, stream, fused, output, rows, width);
   } else {
     constexpr std::uint32_t kThreads = 256;
     hipLaunchKernelGGL(SwiGluKernel,
@@ -533,6 +536,46 @@ static __global__ void RmsInverseKernel(const std::uint16_t* input,
   }
 }
 
+static __global__ void RmsInverseLongKernel(const std::uint16_t* input,
+                                            float* inverse, std::uint32_t rows,
+                                            std::uint32_t width,
+                                            float epsilon) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float reductions[256];
+  const std::size_t row_base = static_cast<std::size_t>(row) * width;
+  float local = 0.0F;
+  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
+    const float value = Bf16ToFloat(input[row_base + column]);
+    local = fmaf(value, value, local);
+  }
+  reductions[lane] = local;
+  __syncthreads();
+  if (lane < 128U) {
+    reductions[lane] += reductions[lane + 128U];
+  }
+  __syncthreads();
+  if (lane < 64U) {
+    reductions[lane] += reductions[lane + 64U];
+  }
+  __syncthreads();
+  if (lane < 32U) {
+    float value = reductions[lane] + reductions[lane + 32U];
+    for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U) {
+      const float peer = __shfl_down(value, stride, 32);
+      if (lane < stride) {
+        value += peer;
+      }
+    }
+    if (lane == 0U) {
+      inverse[row] = rsqrtf(value / static_cast<float>(width) + epsilon);
+    }
+  }
+}
+
 static __global__ void AdaLnApplyVector8Kernel(
     const std::uint16_t* __restrict__ input,
     const std::uint16_t* __restrict__ weight,
@@ -592,6 +635,64 @@ static __global__ void AdaLnApplyVector8Kernel(
   }
 }
 
+static __global__ void AdaLnApplyRowKernel(
+    const std::uint16_t* __restrict__ input,
+    const std::uint16_t* __restrict__ weight,
+    const std::uint16_t* __restrict__ modulation,
+    const std::uint32_t* __restrict__ row_map,
+    const float* __restrict__ inverse, std::uint16_t* __restrict__ output,
+    std::uint32_t rows, std::uint32_t width, std::uint32_t slots,
+    std::uint32_t shift_slot, std::uint32_t scale_slot) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const std::size_t row_base = static_cast<std::size_t>(row) * width;
+  const std::size_t modulation_base =
+      static_cast<std::size_t>(row_map[row]) * slots * width;
+  const std::size_t shift_base =
+      modulation_base + static_cast<std::size_t>(shift_slot) * width;
+  const std::size_t scale_base =
+      modulation_base + static_cast<std::size_t>(scale_slot) * width;
+  const float row_inverse = inverse[row];
+#pragma unroll 1
+  for (std::uint32_t column = lane * 2U; column < width;
+       column += blockDim.x * 2U) {
+    const std::uint32_t input_pair =
+        *reinterpret_cast<const std::uint32_t*>(input + row_base + column);
+    const std::uint32_t weight_pair =
+        *reinterpret_cast<const std::uint32_t*>(weight + column);
+    const std::uint32_t shift_pair = *reinterpret_cast<const std::uint32_t*>(
+        modulation + shift_base + column);
+    const std::uint32_t scale_pair = *reinterpret_cast<const std::uint32_t*>(
+        modulation + scale_base + column);
+    const float normalized0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(input_pair & 0xFFFFU)) *
+        row_inverse *
+        Bf16ToFloat(static_cast<std::uint16_t>(weight_pair & 0xFFFFU));
+    const float normalized1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(input_pair >> 16U)) *
+        row_inverse *
+        Bf16ToFloat(static_cast<std::uint16_t>(weight_pair >> 16U));
+    const float scale0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(scale_pair & 0xFFFFU));
+    const float scale1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(scale_pair >> 16U));
+    const float shift0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(shift_pair & 0xFFFFU));
+    const float shift1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(shift_pair >> 16U));
+    const std::uint32_t result =
+        static_cast<std::uint32_t>(
+            FloatToBf16(normalized0 * (1.0F + scale0) + shift0)) |
+        (static_cast<std::uint32_t>(
+             FloatToBf16(normalized1 * (1.0F + scale1) + shift1))
+         << 16U);
+    *reinterpret_cast<std::uint32_t*>(output + row_base + column) = result;
+  }
+}
+
 inline void LaunchAdaLnSplit(const std::uint16_t* input,
                              const std::uint16_t* weight,
                              const std::uint16_t* modulation,
@@ -600,8 +701,43 @@ inline void LaunchAdaLnSplit(const std::uint16_t* input,
                              std::uint32_t width, std::uint32_t slots,
                              std::uint32_t shift_slot, std::uint32_t scale_slot,
                              float epsilon, hipStream_t stream) {
+  if (rows >= 32'768) {
+    constexpr std::uint32_t kReductionThreads = 256;
+    constexpr std::uint32_t kApplyThreads = 256;
+    hipLaunchKernelGGL(RmsInverseLongKernel, dim3(rows),
+                       dim3(kReductionThreads), 0, stream, input, inverse, rows,
+                       width, epsilon);
+    hipLaunchKernelGGL(AdaLnApplyRowKernel, dim3(rows), dim3(kApplyThreads), 0,
+                       stream, input, weight, modulation, row_map, inverse,
+                       output, rows, width, slots, shift_slot, scale_slot);
+    return;
+  }
   hipLaunchKernelGGL(RmsInverseKernel, dim3(rows), dim3(256), 0, stream, input,
                      inverse, rows, width, epsilon);
+  constexpr std::uint32_t kThreads = 128;
+  constexpr std::uint32_t kValuesPerThread = 8;
+  hipLaunchKernelGGL(AdaLnApplyVector8Kernel,
+                     dim3((width + kThreads * kValuesPerThread - 1U) /
+                              (kThreads * kValuesPerThread),
+                          rows),
+                     dim3(kThreads), 0, stream, input, weight, modulation,
+                     row_map, inverse, output, rows, width, slots, shift_slot,
+                     scale_slot);
+}
+
+inline void LaunchAdaLnApplyPrepared(
+    const std::uint16_t* input, const std::uint16_t* weight,
+    const std::uint16_t* modulation, const std::uint32_t* row_map,
+    const float* inverse, std::uint16_t* output, std::uint32_t rows,
+    std::uint32_t width, std::uint32_t slots, std::uint32_t shift_slot,
+    std::uint32_t scale_slot, hipStream_t stream) {
+  if (rows >= 32'768) {
+    constexpr std::uint32_t kThreads = 256;
+    hipLaunchKernelGGL(AdaLnApplyRowKernel, dim3(rows), dim3(kThreads), 0,
+                       stream, input, weight, modulation, row_map, inverse,
+                       output, rows, width, slots, shift_slot, scale_slot);
+    return;
+  }
   constexpr std::uint32_t kThreads = 128;
   constexpr std::uint32_t kValuesPerThread = 8;
   hipLaunchKernelGGL(AdaLnApplyVector8Kernel,
@@ -684,6 +820,119 @@ static __global__ void GateVector8Kernel(
   }
 }
 
+static __global__ void GateRowKernel(
+    const std::uint16_t* __restrict__ residual,
+    const std::uint16_t* __restrict__ branch,
+    const std::uint16_t* __restrict__ modulation,
+    const std::uint32_t* __restrict__ row_map,
+    std::uint16_t* __restrict__ output, std::uint32_t rows, std::uint32_t width,
+    std::uint32_t slots, std::uint32_t gate_slot) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const std::size_t row_base = static_cast<std::size_t>(row) * width;
+  const std::size_t modulation_base =
+      static_cast<std::size_t>(row_map[row]) * slots * width +
+      static_cast<std::size_t>(gate_slot) * width;
+#pragma unroll 1
+  for (std::uint32_t column = lane * 2U; column < width;
+       column += blockDim.x * 2U) {
+    const std::uint32_t residual_pair =
+        *reinterpret_cast<const std::uint32_t*>(residual + row_base + column);
+    const std::uint32_t branch_pair =
+        *reinterpret_cast<const std::uint32_t*>(branch + row_base + column);
+    const std::uint32_t modulation_pair =
+        *reinterpret_cast<const std::uint32_t*>(modulation + modulation_base +
+                                                column);
+    const float residual0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(residual_pair & 0xFFFFU));
+    const float residual1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(residual_pair >> 16U));
+    const float branch0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(branch_pair & 0xFFFFU));
+    const float branch1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(branch_pair >> 16U));
+    const float modulation0 =
+        Bf16ToFloat(static_cast<std::uint16_t>(modulation_pair & 0xFFFFU));
+    const float modulation1 =
+        Bf16ToFloat(static_cast<std::uint16_t>(modulation_pair >> 16U));
+    const std::uint32_t result =
+        static_cast<std::uint32_t>(
+            FloatToBf16(residual0 + branch0 * modulation0)) |
+        (static_cast<std::uint32_t>(
+             FloatToBf16(residual1 + branch1 * modulation1))
+         << 16U);
+    *reinterpret_cast<std::uint32_t*>(output + row_base + column) = result;
+  }
+}
+
+static __global__ void GateRmsInverseLongKernel(
+    const std::uint16_t* __restrict__ residual,
+    const std::uint16_t* __restrict__ branch,
+    const std::uint16_t* __restrict__ modulation,
+    const std::uint32_t* __restrict__ row_map,
+    std::uint16_t* __restrict__ output, float* __restrict__ inverse,
+    std::uint32_t rows, std::uint32_t width, std::uint32_t slots,
+    std::uint32_t gate_slot, float epsilon) {
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  __shared__ float reductions[256];
+  const std::size_t row_base = static_cast<std::size_t>(row) * width;
+  const std::size_t modulation_base =
+      static_cast<std::size_t>(row_map[row]) * slots * width +
+      static_cast<std::size_t>(gate_slot) * width;
+  float local = 0.0F;
+  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
+    const float gated = Bf16ToFloat(residual[row_base + column]) +
+                        Bf16ToFloat(branch[row_base + column]) *
+                            Bf16ToFloat(modulation[modulation_base + column]);
+    const std::uint16_t rounded = FloatToBf16(gated);
+    output[row_base + column] = rounded;
+    const float value = Bf16ToFloat(rounded);
+    local = fmaf(value, value, local);
+  }
+  reductions[lane] = local;
+  __syncthreads();
+  if (lane < 128U) {
+    reductions[lane] += reductions[lane + 128U];
+  }
+  __syncthreads();
+  if (lane < 64U) {
+    reductions[lane] += reductions[lane + 64U];
+  }
+  __syncthreads();
+  if (lane < 32U) {
+    float value = reductions[lane] + reductions[lane + 32U];
+    for (std::uint32_t stride = 16U; stride != 0U; stride >>= 1U) {
+      const float peer = __shfl_down(value, stride, 32);
+      if (lane < stride) {
+        value += peer;
+      }
+    }
+    if (lane == 0U) {
+      inverse[row] = rsqrtf(value / static_cast<float>(width) + epsilon);
+    }
+  }
+}
+
+inline void LaunchGateRmsInverse(const std::uint16_t* residual,
+                                 const std::uint16_t* branch,
+                                 const std::uint16_t* modulation,
+                                 const std::uint32_t* row_map,
+                                 std::uint16_t* output, float* inverse,
+                                 std::uint32_t rows, std::uint32_t width,
+                                 std::uint32_t slots, std::uint32_t gate_slot,
+                                 float epsilon, hipStream_t stream) {
+  hipLaunchKernelGGL(GateRmsInverseLongKernel, dim3(rows), dim3(256), 0, stream,
+                     residual, branch, modulation, row_map, output, inverse,
+                     rows, width, slots, gate_slot, epsilon);
+}
+
 inline void LaunchGate(const std::uint16_t* residual,
                        const std::uint16_t* branch,
                        const std::uint16_t* modulation,
@@ -692,6 +941,13 @@ inline void LaunchGate(const std::uint16_t* residual,
                        std::uint32_t slots, std::uint32_t gate_slot,
                        hipStream_t stream) {
   if (width % 8U == 0U) {
+    if (rows >= 32'768) {
+      constexpr std::uint32_t kThreads = 256;
+      hipLaunchKernelGGL(GateRowKernel, dim3(rows), dim3(kThreads), 0, stream,
+                         residual, branch, modulation, row_map, output, rows,
+                         width, slots, gate_slot);
+      return;
+    }
     constexpr std::uint32_t kThreads = 128;
     constexpr std::uint32_t kValuesPerThread = 8;
     hipLaunchKernelGGL(GateVector8Kernel,
@@ -942,7 +1198,7 @@ static __global__ void GroupedQkvNormRopeApplyKernel(
     const std::uint16_t* __restrict__ rope_sin,
     const float* __restrict__ inverse, std::uint16_t* __restrict__ query,
     std::uint16_t* __restrict__ key, std::uint16_t* __restrict__ value,
-    std::uint32_t sequence, std::uint32_t heads) {
+    std::uint32_t sequence, std::uint32_t heads, bool head_major) {
   constexpr std::uint32_t kHeadDimension = 128;
   constexpr std::uint32_t kRopeHalf = 48;
   const std::uint32_t row = blockIdx.x;
@@ -958,7 +1214,9 @@ static __global__ void GroupedQkvNormRopeApplyKernel(
   const std::size_t key_base = query_base + kHeadDimension;
   const std::size_t value_base = key_base + kHeadDimension;
   const std::size_t output =
-      (static_cast<std::size_t>(row) * heads + head) * kHeadDimension +
+      (head_major ? (static_cast<std::size_t>(head) * sequence + row)
+                  : (static_cast<std::size_t>(row) * heads + head)) *
+          kHeadDimension +
       dimension;
   const std::size_t factor =
       (static_cast<std::size_t>(row) * heads + head) * 2U;
@@ -1022,7 +1280,7 @@ inline void LaunchGroupedQkvNormRopeSplit(
     const std::uint16_t* key_weight, const std::uint16_t* rope_cos,
     const std::uint16_t* rope_sin, float* inverse, std::uint16_t* query,
     std::uint16_t* key, std::uint16_t* value, std::uint32_t sequence,
-    std::uint32_t heads, float epsilon, hipStream_t stream) {
+    std::uint32_t heads, float epsilon, bool head_major, hipStream_t stream) {
   constexpr std::uint32_t kHeadsPerBlock = 4;
   hipLaunchKernelGGL(
       GroupedQkvNormFactorsKernel,
@@ -1031,7 +1289,31 @@ inline void LaunchGroupedQkvNormRopeSplit(
   hipLaunchKernelGGL(GroupedQkvNormRopeApplyKernel, dim3(sequence, heads),
                      dim3(128), 0, stream, qkv, query_weight, key_weight,
                      rope_cos, rope_sin, inverse, query, key, value, sequence,
-                     heads);
+                     heads, head_major);
+}
+
+static __global__ void HeadMajorToRowMajorKernel(
+    const std::uint16_t* __restrict__ input, std::uint16_t* __restrict__ output,
+    std::uint32_t sequence, std::uint32_t heads) {
+  constexpr std::uint32_t kHeadDimension = 128;
+  const std::uint32_t row = blockIdx.x;
+  const std::uint32_t head = blockIdx.y;
+  const std::uint32_t dimension = threadIdx.x;
+  if (row >= sequence || head >= heads || dimension >= kHeadDimension) {
+    return;
+  }
+  output[(static_cast<std::size_t>(row) * heads + head) * kHeadDimension +
+         dimension] =
+      input[(static_cast<std::size_t>(head) * sequence + row) * kHeadDimension +
+            dimension];
+}
+
+inline void LaunchHeadMajorToRowMajor(const std::uint16_t* input,
+                                      std::uint16_t* output,
+                                      std::uint32_t sequence,
+                                      std::uint32_t heads, hipStream_t stream) {
+  hipLaunchKernelGGL(HeadMajorToRowMajorKernel, dim3(sequence, heads),
+                     dim3(128), 0, stream, input, output, sequence, heads);
 }
 
 static __global__ void FullAttentionScalarKernel(

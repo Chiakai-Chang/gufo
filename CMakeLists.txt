@@ -44,6 +44,7 @@ if (ENGINE_ENABLE_HIP)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
   find_package(rocblas REQUIRED)
+  find_package(aotriton CONFIG REQUIRED)
   find_path(HIPCUB_INCLUDE_DIR hipcub/hipcub.hpp
     HINTS "$ENV{STRIX_HIPCUB_ROOT}/include"
     REQUIRED)
@@ -260,7 +261,7 @@ if (ENGINE_ENABLE_HIP)
   target_include_directories(strix_core SYSTEM PRIVATE
     ${COMPOSABLE_KERNEL_INCLUDE_DIR})
   target_link_libraries(strix_core PUBLIC hip::host roc::hipblas
-    roc::hipblaslt roc::rocblas)
+    roc::hipblaslt roc::rocblas aotriton_v2)
 endif()
 
 if (ENGINE_ENABLE_XRT)

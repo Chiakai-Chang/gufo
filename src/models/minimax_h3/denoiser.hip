@@ -1035,6 +1035,14 @@ struct DenoiserSession::Impl {
     std::vector<std::size_t> selected_blocks;
     std::vector<std::vector<std::uint16_t>> ranked_modulations;
     std::vector<std::uint16_t> modulation;
+    auto block_workspace = DitBlockWorkspace::Create(
+        {.rows = layout.rows(),
+         .row_parallel_attention = row_parallel_attention},
+        error);
+    if (block_workspace == nullptr) {
+      return false;
+    }
+
     if (active_blocks == static_cast<int>(kDitBlocks)) {
       selected_blocks.resize(kDitBlocks);
       std::iota(selected_blocks.begin(), selected_blocks.end(), 0);
@@ -1110,6 +1118,7 @@ struct DenoiserSession::Impl {
           static_cast<std::size_t>(time_rows.time_rows) * kDitModalities;
       auto core_future = std::async(std::launch::async, [this, rows,
                                                          modulation_rows,
+                                                         block_workspace,
                                                          cancellation]() {
         CoreLoadResult result;
         const auto load_begin = Clock::now();
@@ -1143,7 +1152,7 @@ struct DenoiserSession::Impl {
                  .modulation_rows = modulation_rows,
                  .row_parallel_attention = row_parallel_attention,
                  .validate_gemm_plans = block == 0},
-                cancellation, &worker_result.error);
+                block_workspace, cancellation, &worker_result.error);
             if (session == nullptr) {
               break;
             }
@@ -1271,7 +1280,7 @@ struct DenoiserSession::Impl {
                static_cast<std::size_t>(time_rows.time_rows) * kDitModalities,
            .row_parallel_attention = row_parallel_attention,
            .validate_gemm_plans = blocks.empty()},
-          cancellation, error);
+          block_workspace, cancellation, error);
       if (session == nullptr ||
           !session->PrepareConstants(modulation, rope_cos, rope_sin,
                                      cancellation, error)) {
@@ -1526,7 +1535,8 @@ struct DenoiserSession::Impl {
       DitBlockTelemetry block_telemetry;
       if (!blocks[block]->RunPreparedDevice(
               hidden_input, block_row_map.As<std::uint32_t>(), hidden_output,
-              static_cast<void*>(stream), cancellation, &block_telemetry,
+              static_cast<void*>(stream), block != 0,
+              block + 1U < blocks.size(), cancellation, &block_telemetry,
               error)) {
         return false;
       }
