@@ -1,6 +1,6 @@
 ---
 name: optimize-kernel
-description: Workflow for optimizing model inference kernels on Strix Halo gfx1151: assess a baseline, change one route behind a policy toggle, verify quality against the baseline, and retain or reject with evidence. Rejection with evidence is a valid card completion.
+description: "Workflow for optimizing model inference kernels on Strix Halo gfx1151: assess a baseline, change one route behind a policy toggle, verify quality against the baseline, and retain or reject with evidence. Rejection with evidence is a valid card completion."
 metadata:
   origin: strix-halo.cpp
 ---
