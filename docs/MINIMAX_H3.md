@@ -575,9 +575,8 @@ The final implementation is `436.32x` faster than the original block and
 reduction respectively. The supported production shape fuses QK, scaled
 softmax, and PV without materializing the former 1.097 GiB F32-score and
 BF16-probability matrices. A checked fallback allocates those matrices only
-for unsupported shapes. Grouped Q/K normalization and RoPE use one wave per
-head; SwiGLU and residual gates process eight BF16 values per thread; the H3
-DiT translation unit is compiled at `-O3`.
+for unsupported shapes. SwiGLU and residual gates process eight BF16 values
+per thread.
 
 The final trace's eleven timed dispatches sum to 88.225 ms. Dense projections
 now dominate: the two MLP GEMMs take 22.594 and 21.881 ms, QKV projection
@@ -591,6 +590,42 @@ The associated 92.494 ms wall-time capture peaked at 44 W and 1,192 MHz. Power
 is diagnostic here: this isolated block finishes before the APU can ramp
 toward its configured 120--140 W envelope. The benchmark is not extended or
 repeated merely to produce a larger wattage reading.
+
+### Issue #184 second focused pass
+
+The next retained pass profiles complete phase boundaries once rather than
+extrapolating from a full generation:
+
+| Workload | Fresh baseline | Retained | Reduction |
+| --- | ---: | ---: | ---: |
+| 37-frame stereo AudioVAE decode | 59.4383 s | 2.42326 s | 95.92% |
+| five-selected-frame VisualVAE tile | 8.60171 s | 6.12212 s | 28.83% |
+| one 1,872-row, 50-block denoiser forward | 9.02751 s | 5.49537 s | 39.13% |
+
+AudioVAE replaces all 129 Conv1d and seven ConvTranspose1d scalar loops with a
+bounded reusable F32 im2col workspace and rocBLAS GEMM. Transposed weights are
+reordered once after released weight normalization, and alias-free SnakeBeta
+still executes the released upsample/filter/sine/downsample sequence. The
+waveform and deterministic spectrogram oracles remain green.
+
+VisualVAE computes each Q/K norm once per head, broadcasts the factor, folds
+biases only across quality-equivalent F32 rounding boundaries, and vectorizes
+SwiGLU. Stable softmax retains its existing F32 reduction order. Peak memory
+remains 9.766 GiB and the selected-frame relative L2 is `8.14968e-7`.
+
+The denoiser keeps the hidden state in two BF16 device buffers across all 50
+blocks instead of copying it through host memory and synchronizing per block.
+Its grouped QKV and AdaLN operations are split into F32 factor-reduction and
+packed BF16 application kernels. This preserves the previous reduction order
+while eliminating 1,240-byte/thread QKV spills and 436-byte/thread AdaLN
+spills. The DiT translation unit is compiled at `-O2`: `-O3` retained those
+spills, while an unqualified hardware-test compile was not optimized.
+
+The production single-forward oracle remains below every frozen ceiling, peak
+memory is 58.880 GiB, and swap remains zero. The final profile shifts the next
+denoiser opportunities to SwiGLU, fused attention, and dense GEMMs. They are
+future optimization work rather than justification for changing precision or
+quality in this pass.
 
 The explicitly requested post-retention aggressive smoke changed the phase
 ranking: VisualVAE consumed `188.650` of `229.382` seconds (`82.24%`), while

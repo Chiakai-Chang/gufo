@@ -221,15 +221,16 @@ void CheckAdaLnGateAndSwiGlu() {
   DeviceArray<std::uint16_t> d_weight(weight.size());
   DeviceArray<std::uint16_t> d_modulation(modulation.size());
   DeviceArray<std::uint32_t> d_row_map(row_map.size());
+  DeviceArray<float> d_inverse(kRows);
   DeviceArray<std::uint16_t> d_output(input.size());
   CHECK(d_input.CopyFrom(input));
   CHECK(d_branch.CopyFrom(branch));
   CHECK(d_weight.CopyFrom(weight));
   CHECK(d_modulation.CopyFrom(modulation));
   CHECK(d_row_map.CopyFrom(row_map));
-  ops::LaunchAdaLn(d_input.get(), d_weight.get(), d_modulation.get(),
-                   d_row_map.get(), d_output.get(), kRows, kWidth, kSlots, 0, 1,
-                   1.0e-5F, nullptr);
+  ops::LaunchAdaLnSplit(d_input.get(), d_weight.get(), d_modulation.get(),
+                        d_row_map.get(), d_inverse.get(), d_output.get(), kRows,
+                        kWidth, kSlots, 0, 1, 1.0e-5F, nullptr);
   CHECK(hipDeviceSynchronize() == hipSuccess);
   std::vector<std::uint16_t> got(input.size());
   CHECK(d_output.CopyTo(got));
@@ -712,7 +713,7 @@ int CheckReal() {
     std::cerr << error << '\n';
     return 1;
   }
-  CHECK(telemetry.dispatches == 9);
+  CHECK(telemetry.dispatches == 12);
   CHECK(telemetry.attention_backend == "ck_bf16_wmma_fused");
   CHECK(telemetry.weight_bytes > 700ULL * 1024ULL * 1024ULL);
   CHECK(telemetry.activation_bytes > 0);

@@ -541,10 +541,6 @@ struct DenoiserSession::Impl {
   std::vector<std::uint16_t> refined_text_host;
   std::vector<std::uint16_t> block0_modulation_host;
   std::vector<std::uint16_t> final_modulation_host;
-  std::vector<std::uint16_t> hidden_a;
-  std::vector<std::uint16_t> hidden_b;
-  std::vector<std::uint16_t> audio_projected_host;
-  std::vector<std::uint16_t> video_projected_host;
   std::vector<float> video_rows_host;
   std::vector<float> audio_rows_host;
   std::vector<std::uint32_t> final_video_map_host;
@@ -572,6 +568,9 @@ struct DenoiserSession::Impl {
   DeviceBuffer audio_sample;
   DeviceBuffer video_projected;
   DeviceBuffer audio_projected;
+  DeviceBuffer hidden_device_a;
+  DeviceBuffer hidden_device_b;
+  DeviceBuffer block_row_map;
   DeviceBuffer final_video_input;
   DeviceBuffer final_audio_input;
   DeviceBuffer final_video_norm;
@@ -1109,80 +1108,77 @@ struct DenoiserSession::Impl {
       const std::size_t rows = layout.rows();
       const std::size_t modulation_rows =
           static_cast<std::size_t>(time_rows.time_rows) * kDitModalities;
-      auto core_future = std::async(
-          std::launch::async,
-          [this, rows, modulation_rows, cancellation]() {
-            CoreLoadResult result;
-            const auto load_begin = Clock::now();
-            struct WorkerResult {
-              std::vector<std::pair<std::size_t,
-                                    std::unique_ptr<DitBlockSession>>>
-                  sessions;
-              std::uint64_t weight_bytes{0};
-              std::uint64_t scratch_bytes{0};
-              std::uint64_t cumulative_allocation_bytes{0};
-              std::uint64_t gemm_plan_validations{0};
-              std::string error;
-            };
-            std::atomic<std::size_t> next_block{0};
-            const auto worker = [&]() {
-              WorkerResult worker_result;
-              worker_result.sessions.reserve(kDitBlocks / 2U + 1U);
-              while (true) {
-                const std::size_t block =
-                    next_block.fetch_add(1, std::memory_order_relaxed);
-                if (block >= kDitBlocks) {
-                  break;
-                }
-                if (IsCancelled(cancellation)) {
-                  worker_result.error = "MiniMax H3 core load cancelled";
-                  break;
-                }
-                auto session = DitBlockSession::Create(
-                    *inventory,
-                    {.block_index = block,
-                     .rows = rows,
-                     .modulation_rows = modulation_rows,
-                     .row_parallel_attention = row_parallel_attention,
-                     .validate_gemm_plans = block == 0},
-                    cancellation, &worker_result.error);
-                if (session == nullptr) {
-                  break;
-                }
-                worker_result.weight_bytes += session->weight_bytes();
-                worker_result.scratch_bytes += session->activation_bytes();
-                worker_result.gemm_plan_validations +=
-                    session->gemm_plan_validations();
-                worker_result.cumulative_allocation_bytes +=
-                    session->weight_bytes() + session->activation_bytes();
-                worker_result.sessions.emplace_back(block, std::move(session));
-              }
-              return worker_result;
-            };
-            auto second_worker =
-                std::async(std::launch::async, worker);
-            WorkerResult first = worker();
-            WorkerResult second = second_worker.get();
-            result.sessions.resize(kDitBlocks);
-            const auto merge = [&](WorkerResult* worker_result) {
-              if (result.error.empty() && !worker_result->error.empty()) {
-                result.error = std::move(worker_result->error);
-              }
-              result.weight_bytes += worker_result->weight_bytes;
-              result.scratch_bytes += worker_result->scratch_bytes;
-              result.cumulative_allocation_bytes +=
-                  worker_result->cumulative_allocation_bytes;
-              result.gemm_plan_validations +=
-                  worker_result->gemm_plan_validations;
-              for (auto& [block, session] : worker_result->sessions) {
-                result.sessions[block] = std::move(session);
-              }
-            };
-            merge(&first);
-            merge(&second);
-            result.load_ms = Milliseconds(load_begin, Clock::now());
-            return result;
-          });
+      auto core_future = std::async(std::launch::async, [this, rows,
+                                                         modulation_rows,
+                                                         cancellation]() {
+        CoreLoadResult result;
+        const auto load_begin = Clock::now();
+        struct WorkerResult {
+          std::vector<std::pair<std::size_t, std::unique_ptr<DitBlockSession>>>
+              sessions;
+          std::uint64_t weight_bytes{0};
+          std::uint64_t scratch_bytes{0};
+          std::uint64_t cumulative_allocation_bytes{0};
+          std::uint64_t gemm_plan_validations{0};
+          std::string error;
+        };
+        std::atomic<std::size_t> next_block{0};
+        const auto worker = [&]() {
+          WorkerResult worker_result;
+          worker_result.sessions.reserve(kDitBlocks / 2U + 1U);
+          while (true) {
+            const std::size_t block =
+                next_block.fetch_add(1, std::memory_order_relaxed);
+            if (block >= kDitBlocks) {
+              break;
+            }
+            if (IsCancelled(cancellation)) {
+              worker_result.error = "MiniMax H3 core load cancelled";
+              break;
+            }
+            auto session = DitBlockSession::Create(
+                *inventory,
+                {.block_index = block,
+                 .rows = rows,
+                 .modulation_rows = modulation_rows,
+                 .row_parallel_attention = row_parallel_attention,
+                 .validate_gemm_plans = block == 0},
+                cancellation, &worker_result.error);
+            if (session == nullptr) {
+              break;
+            }
+            worker_result.weight_bytes += session->weight_bytes();
+            worker_result.scratch_bytes += session->activation_bytes();
+            worker_result.gemm_plan_validations +=
+                session->gemm_plan_validations();
+            worker_result.cumulative_allocation_bytes +=
+                session->weight_bytes() + session->activation_bytes();
+            worker_result.sessions.emplace_back(block, std::move(session));
+          }
+          return worker_result;
+        };
+        auto second_worker = std::async(std::launch::async, worker);
+        WorkerResult first = worker();
+        WorkerResult second = second_worker.get();
+        result.sessions.resize(kDitBlocks);
+        const auto merge = [&](WorkerResult* worker_result) {
+          if (result.error.empty() && !worker_result->error.empty()) {
+            result.error = std::move(worker_result->error);
+          }
+          result.weight_bytes += worker_result->weight_bytes;
+          result.scratch_bytes += worker_result->scratch_bytes;
+          result.cumulative_allocation_bytes +=
+              worker_result->cumulative_allocation_bytes;
+          result.gemm_plan_validations += worker_result->gemm_plan_validations;
+          for (auto& [block, session] : worker_result->sessions) {
+            result.sessions[block] = std::move(session);
+          }
+        };
+        merge(&first);
+        merge(&second);
+        result.load_ms = Milliseconds(load_begin, Clock::now());
+        return result;
+      });
 
       ranked_modulations.resize(kDitBlocks);
       for (const std::size_t block : selected_blocks) {
@@ -1212,10 +1208,9 @@ struct DenoiserSession::Impl {
           Milliseconds(final_begin, Clock::now());
 
       CoreLoadResult loaded = core_future.get();
-      const bool missing_block =
-          std::ranges::any_of(loaded.sessions, [](const auto& session) {
-            return session == nullptr;
-          });
+      const bool missing_block = std::ranges::any_of(
+          loaded.sessions,
+          [](const auto& session) { return session == nullptr; });
       if (!loaded.error.empty() || missing_block) {
         SetError(error, loaded.error.empty()
                             ? "MiniMax H3 core load did not return every block"
@@ -1225,8 +1220,7 @@ struct DenoiserSession::Impl {
       base_telemetry.core_load_ms += loaded.load_ms;
       base_telemetry.core_weight_bytes += loaded.weight_bytes;
       base_telemetry.scratch_bytes += loaded.scratch_bytes;
-      base_telemetry.core_gemm_plan_validations +=
-          loaded.gemm_plan_validations;
+      base_telemetry.core_gemm_plan_validations += loaded.gemm_plan_validations;
       base_telemetry.cumulative_allocation_bytes +=
           loaded.cumulative_allocation_bytes;
       blocks = std::move(loaded.sessions);
@@ -1387,6 +1381,9 @@ struct DenoiserSession::Impl {
         !audio_sample.Allocate(audio_elements * sizeof(float), error) ||
         !video_projected.Allocate(bf16(video_rows * kDitHiddenSize), error) ||
         !audio_projected.Allocate(bf16(audio_rows * kDitHiddenSize), error) ||
+        !hidden_device_a.Allocate(bf16(hidden_elements), error) ||
+        !hidden_device_b.Allocate(bf16(hidden_elements), error) ||
+        !block_row_map.Allocate(layout.rows() * sizeof(std::uint32_t), error) ||
         !final_video_input.Allocate(bf16(video_rows * kDitHiddenSize), error) ||
         !final_audio_input.Allocate(bf16(audio_rows * kDitHiddenSize), error) ||
         !final_video_norm.Allocate(bf16(video_rows * kDitHiddenSize), error) ||
@@ -1403,21 +1400,20 @@ struct DenoiserSession::Impl {
                                     audio_elements * sizeof(float), error)))) {
       return false;
     }
-    hidden_a.resize(hidden_elements);
-    hidden_b.resize(hidden_elements);
-    video_projected_host.resize(video_rows * kDitHiddenSize);
-    audio_projected_host.resize(audio_rows * kDitHiddenSize);
     video_rows_host.resize(video_elements);
     audio_rows_host.resize(audio_elements);
     final_video_map_host.resize(video_rows);
     final_audio_map_host.resize(audio_rows);
     forward_history.reserve(static_cast<std::size_t>(schedule.evaluations()) +
                             16U);
-    const std::array<const DeviceBuffer*, 14> buffers = {
+    const std::array<const DeviceBuffer*, 17> buffers = {
         &video_sample,
         &audio_sample,
         &video_projected,
         &audio_projected,
+        &hidden_device_a,
+        &hidden_device_b,
+        &block_row_map,
         &final_video_input,
         &final_audio_input,
         &final_video_norm,
@@ -1495,31 +1491,32 @@ struct DenoiserSession::Impl {
         audio_patch_bias.As<float>(), audio_projected.As<std::uint16_t>(),
         static_cast<std::uint32_t>(layout.audio_target_rows),
         kH3AudioLatentChannels, kDitHiddenSize, stream);
+    const std::size_t text_bytes =
+        refined_text_host.size() * sizeof(std::uint16_t);
+    const std::size_t audio_offset_bytes = text_bytes;
+    const std::size_t video_offset_bytes =
+        audio_offset_bytes + audio_projected.bytes();
     if (!CheckLaunch("H3 patch projections", error) ||
-        !CopyAsync(video_projected_host.data(), video_projected.data(),
-                   video_projected.bytes(), hipMemcpyDeviceToHost,
-                   "read H3 video projection", error) ||
-        !CopyAsync(audio_projected_host.data(), audio_projected.data(),
-                   audio_projected.bytes(), hipMemcpyDeviceToHost,
-                   "read H3 audio projection", error)) {
+        !CopyAsync(hidden_device_a.data(), refined_text_host.data(), text_bytes,
+                   hipMemcpyHostToDevice, "copy H3 refined text", error) ||
+        !CopyAsync(static_cast<std::byte*>(hidden_device_a.data()) +
+                       audio_offset_bytes,
+                   audio_projected.data(), audio_projected.bytes(),
+                   hipMemcpyDeviceToDevice, "compose H3 audio tokens", error) ||
+        !CopyAsync(static_cast<std::byte*>(hidden_device_a.data()) +
+                       video_offset_bytes,
+                   video_projected.data(), video_projected.bytes(),
+                   hipMemcpyDeviceToDevice, "compose H3 video tokens", error) ||
+        !CopyAsync(block_row_map.data(),
+                   row_maps[static_cast<std::size_t>(step)].data(),
+                   block_row_map.bytes(), hipMemcpyHostToDevice,
+                   "copy H3 block row map", error)) {
       return false;
     }
-    hipError_t status = hipStreamSynchronize(stream);
-    if (status != hipSuccess) {
-      SetError(error, HipError("synchronize H3 patch projections", status));
-      return false;
-    }
-    std::copy(refined_text_host.begin(), refined_text_host.end(),
-              hidden_a.begin());
-    std::copy(audio_projected_host.begin(), audio_projected_host.end(),
-              hidden_a.begin() +
-                  static_cast<std::ptrdiff_t>(refined_text_host.size()));
-    std::copy(video_projected_host.begin(), video_projected_host.end(),
-              hidden_a.begin() +
-                  static_cast<std::ptrdiff_t>(refined_text_host.size() +
-                                              audio_projected_host.size()));
 
     std::uint64_t block_dispatches = 0;
+    std::uint16_t* hidden_input = hidden_device_a.As<std::uint16_t>();
+    std::uint16_t* hidden_output = hidden_device_b.As<std::uint16_t>();
     for (std::size_t block = 0; block < blocks.size(); ++block) {
       if (IsCancelled(cancellation)) {
         SetError(error, "MiniMax H3 denoiser cancelled after block " +
@@ -1527,13 +1524,14 @@ struct DenoiserSession::Impl {
         return false;
       }
       DitBlockTelemetry block_telemetry;
-      if (!blocks[block]->RunPrepared(
-              {hidden_a, row_maps[static_cast<std::size_t>(step)]},
-              cancellation, hidden_b, &block_telemetry, error)) {
+      if (!blocks[block]->RunPreparedDevice(
+              hidden_input, block_row_map.As<std::uint32_t>(), hidden_output,
+              static_cast<void*>(stream), cancellation, &block_telemetry,
+              error)) {
         return false;
       }
       block_dispatches += block_telemetry.dispatches;
-      std::swap(hidden_a, hidden_b);
+      std::swap(hidden_input, hidden_output);
     }
 
     const std::size_t audio_offset = layout.text_rows * kDitHiddenSize;
@@ -1543,11 +1541,11 @@ struct DenoiserSession::Impl {
               time_rows.audio_rows[step]);
     std::fill(final_video_map_host.begin(), final_video_map_host.end(),
               time_rows.video_rows[step]);
-    if (!CopyAsync(final_audio_input.data(), hidden_a.data() + audio_offset,
-                   final_audio_input.bytes(), hipMemcpyHostToDevice,
+    if (!CopyAsync(final_audio_input.data(), hidden_input + audio_offset,
+                   final_audio_input.bytes(), hipMemcpyDeviceToDevice,
                    "copy H3 final audio input", error) ||
-        !CopyAsync(final_video_input.data(), hidden_a.data() + video_offset,
-                   final_video_input.bytes(), hipMemcpyHostToDevice,
+        !CopyAsync(final_video_input.data(), hidden_input + video_offset,
+                   final_video_input.bytes(), hipMemcpyDeviceToDevice,
                    "copy H3 final video input", error) ||
         !CopyAsync(final_audio_row_map.data(), final_audio_map_host.data(),
                    final_audio_row_map.bytes(), hipMemcpyHostToDevice,
@@ -1604,7 +1602,7 @@ struct DenoiserSession::Impl {
         return false;
       }
     }
-    status = hipStreamSynchronize(stream);
+    const hipError_t status = hipStreamSynchronize(stream);
     if (status != hipSuccess) {
       SetError(error, HipError("synchronize H3 full forward", status));
       return false;

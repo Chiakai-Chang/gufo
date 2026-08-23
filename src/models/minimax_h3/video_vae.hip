@@ -763,14 +763,21 @@ struct VideoVaeDecoder::Impl {
               const DeviceBuffer& bias, DeviceBuffer* output, std::size_t rows,
               std::size_t input_width, std::size_t output_width,
               std::string* error) {
-    if (!gemm.Run(weight.As<float>(), input.As<float>(), output->As<float>(),
-                  rows, output_width, input_width, stream, error)) {
+    if (!Matmul(input, weight, output, rows, input_width, output_width,
+                error)) {
       return false;
     }
     video_vae_ops::LaunchAddBias(
         output->As<float>(), bias.As<float>(), static_cast<std::uint32_t>(rows),
         static_cast<std::uint32_t>(output_width), stream);
     return CheckLaunch("H3 VisualVAE linear bias", error);
+  }
+
+  bool Matmul(const DeviceBuffer& input, const DeviceBuffer& weight,
+              DeviceBuffer* output, std::size_t rows, std::size_t input_width,
+              std::size_t output_width, std::string* error) {
+    return gemm.Run(weight.As<float>(), input.As<float>(), output->As<float>(),
+                    rows, output_width, input_width, stream, error);
   }
 
   bool RunTile(int chunk, int tile_y, int tile_x,
@@ -825,14 +832,15 @@ struct VideoVaeDecoder::Impl {
       video_vae_ops::LaunchRmsNorm(hidden.As<float>(), weight.norm1.As<float>(),
                                    norm.As<float>(), sequence, kHidden,
                                    kNormEpsilon, stream);
-      if (!Linear(norm, weight.qkv_weight, weight.qkv_bias, &qkv, sequence,
-                  kHidden, kAttentionWidth * 3U, error)) {
+      if (!Matmul(norm, weight.qkv_weight, &qkv, sequence, kHidden,
+                  kAttentionWidth * 3U, error)) {
         return false;
       }
       video_vae_ops::LaunchVideoQkvRope(
-          qkv.As<float>(), rope_cos.As<float>(), rope_sin.As<float>(),
-          query.As<float>(), key.As<float>(), value.As<float>(), sequence,
-          kHeads, kHeadDimension, kRopeHalf, kNormEpsilon, stream);
+          qkv.As<float>(), weight.qkv_bias.As<float>(), rope_cos.As<float>(),
+          rope_sin.As<float>(), query.As<float>(), key.As<float>(),
+          value.As<float>(), sequence, kHeads, kHeadDimension, kRopeHalf,
+          kNormEpsilon, stream);
       if (!attention_gemm.Scores(
               query.As<float>(), key.As<float>(), attention_scores.As<float>(),
               sequence, 1.0F / std::sqrt(static_cast<float>(kHeadDimension)),
@@ -845,31 +853,33 @@ struct VideoVaeDecoder::Impl {
           !attention_gemm.Values(
               value.As<float>(), attention_scores.As<float>(),
               attention_heads.As<float>(), sequence, stream, error) ||
-          !Linear(attention_heads, weight.output_weight, weight.output_bias,
-                  &branch, sequence, kAttentionWidth, kHidden, error)) {
+          !Matmul(attention_heads, weight.output_weight, &branch, sequence,
+                  kAttentionWidth, kHidden, error)) {
         return false;
       }
       video_vae_ops::LaunchScaleAdd(hidden.As<float>(), branch.As<float>(),
+                                    weight.output_bias.As<float>(),
                                     weight.scale1.As<float>(), sequence,
                                     kHidden, stream);
       video_vae_ops::LaunchRmsNorm(hidden.As<float>(), weight.norm2.As<float>(),
                                    norm.As<float>(), sequence, kHidden,
                                    kNormEpsilon, stream);
       if (!CheckLaunch("H3 VisualVAE attention residual/norm", error) ||
-          !Linear(norm, weight.fc1_weight, weight.fc1_bias, &fc1, sequence,
-                  kHidden, kFeedForward * 2U, error)) {
+          !Matmul(norm, weight.fc1_weight, &fc1, sequence, kHidden,
+                  kFeedForward * 2U, error)) {
         return false;
       }
-      video_vae_ops::LaunchSwiGlu(fc1.As<float>(), activated.As<float>(),
-                                  sequence, kFeedForward, stream);
+      video_vae_ops::LaunchSwiGlu(fc1.As<float>(), weight.fc1_bias.As<float>(),
+                                  activated.As<float>(), sequence, kFeedForward,
+                                  stream);
       if (!CheckLaunch("H3 VisualVAE SwiGLU", error) ||
-          !Linear(activated, weight.fc2_weight, weight.fc2_bias, &branch,
-                  sequence, kFeedForward, kHidden, error)) {
+          !Matmul(activated, weight.fc2_weight, &branch, sequence, kFeedForward,
+                  kHidden, error)) {
         return false;
       }
-      video_vae_ops::LaunchScaleAdd(hidden.As<float>(), branch.As<float>(),
-                                    weight.scale2.As<float>(), sequence,
-                                    kHidden, stream);
+      video_vae_ops::LaunchScaleAdd(
+          hidden.As<float>(), branch.As<float>(), weight.fc2_bias.As<float>(),
+          weight.scale2.As<float>(), sequence, kHidden, stream);
       if (!CheckLaunch("H3 VisualVAE MLP residual", error)) {
         return false;
       }
@@ -878,7 +888,7 @@ struct VideoVaeDecoder::Impl {
         SetError(error, HipError("synchronize H3 VisualVAE block", status));
         return false;
       }
-      base_telemetry.dispatches += 13;
+      base_telemetry.dispatches += 9;
     }
     video_vae_ops::LaunchLayerNorm(
         hidden.As<float>(), final_norm_weight.As<float>(),

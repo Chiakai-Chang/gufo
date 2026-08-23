@@ -277,14 +277,17 @@ The current 512x512x22 gate uses the real 1,872-row layout and one complete
 
 | Boundary | Relative L2 | Relative max |
 | --- | ---: | ---: |
-| refined text | `0.00477293` | `0.00167411` |
+| refined text | `0.00469088` | `0.00167411` |
 | block-0 AdaLN projection | `0.0022895` | `0.00478469` |
-| video velocity | `0.0117077` | `0.0136073` |
-| audio velocity | `0.0072865` | `0.0149824` |
+| video velocity | `0.0132707` | `0.0154553` |
+| audio velocity | `0.00731056` | `0.0149873` |
 
-The native row-parallel forward took 57.265 seconds after 25.736 seconds of
-core loading and 5.839 seconds of AdaLN precompute. Accounted peak live memory
-was 59.90 GiB and process swap was zero.
+The issue #184 retained row-parallel forward took 5.49537 seconds after
+10.870 seconds of core loading and 12.744 seconds of AdaLN precompute.
+Accounted peak live memory was 58.880 GiB and process swap was zero. The fresh
+#183 baseline for the same one-forward workload was 9.02751 seconds, so the
+device-resident block chain and split no-spill QKV/AdaLN path reduce forward
+latency by 39.13% without changing the oracle boundaries.
 
 The refreshed seed-42 production-shape teacher hashes are:
 
@@ -327,10 +330,13 @@ and frames 0, 5, 11, 16, and 21:
 The bounded native gate decodes frames 0, 5, 11, 16, and 21 once. The retained
 gfx1151 route uses strided-batched F32 rocBLAS QK and PV GEMMs around an
 explicit stable in-place F32 softmax, plus exact-shape gfx1151 solution indices
-for the dense projections. Its final combined quality/profile pass measured
-selected-frame relative L2 `8.15249e-7`, relative max `2.3838e-6`, and maximum
-absolute error `1.74902e-6`. The output remains effectively identical to the
-frozen teacher and far inside the declared `0.05` limits.
+for the dense projections. The issue #184 pass computes Q/K norm reductions
+once per head, preserves GEMM-round-then-bias behavior in fused epilogues, and
+vectorizes SwiGLU without changing the softmax reduction order. Its final
+quality pass measured selected-frame relative L2 `8.14968e-7`, relative max
+`2.24925e-6`, and maximum absolute error `1.6503e-6`. The output remains
+effectively identical to the frozen teacher and far inside the declared
+`0.05` limits.
 
 The same fixed tile fell from `46.6852` seconds with scalar full attention to
 `4.79063` seconds with batched attention, then to `2.82558` seconds after dense
@@ -338,6 +344,11 @@ projection tuning. The final route is `16.522x` faster than the scalar
 baseline and `1.695x` faster than the first batched route. The explicit
 score/probability workspace raises the phase peak from 9.38 GiB to 9.77 GiB;
 the process used zero swap.
+
+Those issue #175 measurements predate the later parity and setup changes.
+Against the fresh issue #184 revision, the same five-selected-frame gate fell
+from 8.60171 seconds to 6.12212 seconds, a further 28.83% reduction, while the
+9.766 GiB peak and zero-swap result remained unchanged.
 
 A register-cached softmax and faster QK/PV solution indices were measured once
 and rejected because their changed FP32 reduction order exceeded the quality
@@ -356,10 +367,14 @@ deterministic STFT magnitudes:
 | waveform | `[2,29600]` | `ea122eb789d73424ff1c3bbe89719963dd407377165259a4f861f5dba55f837c` |
 | spectrogram | `[2,513,116]` | `20f3d1ca41c3b2a005654aec1c25313de6f849b7dbb7bf7b1ae5ffb92e100424` |
 
-The native decoder measured waveform maximum absolute error `5.93364e-5`,
-waveform relative L2 `1.10334e-5`, spectrogram relative L2 `3.84286e-6`, and
-spectrogram relative max `5.21096e-6`. The single decode took 60.846 seconds
-with a 0.251 GiB phase peak and zero major page faults. Channel independence,
+The issue #184 native decoder measured waveform maximum absolute error
+`6.03162e-5`, waveform relative L2 `1.08936e-5`, spectrogram relative L2
+`3.62714e-6`, and spectrogram relative max `5.8276e-6`. The single decode took
+2.42326 seconds with a 0.286 GiB phase peak and zero major page faults, versus
+59.4383 seconds and 0.251 GiB for the fresh scalar-convolution baseline. The
+24.53x speedup uses one bounded reusable im2col workspace and F32 rocBLAS GEMM;
+inputs, weights, accumulation, outputs, released transposed-convolution
+arithmetic, and alias-free SnakeBeta order are unchanged. Channel independence,
 clipping, cancellation, and zero-swap gates passed; routine validation does
 not execute a second waveform decode.
 

@@ -90,6 +90,17 @@ public:
                                  DitBlockTelemetry* telemetry,
                                  std::string* error = nullptr);
 
+  // Device-resident production path. Pointers and stream must belong to the
+  // current HIP device; execution is enqueued without synchronizing or
+  // copying activations through host memory.
+  [[nodiscard]] bool RunPreparedDevice(const std::uint16_t* hidden_device,
+                                       const std::uint32_t* row_map_device,
+                                       std::uint16_t* output_device,
+                                       void* stream,
+                                       const CancellationToken* cancellation,
+                                       DitBlockTelemetry* telemetry,
+                                       std::string* error = nullptr);
+
   [[nodiscard]] bool Run(const DitBlockInput& input,
                          const CancellationToken* cancellation,
                          DitBlockRetained* retained,
@@ -107,14 +118,15 @@ public:
 private:
   struct Impl;
   explicit DitBlockSession(std::unique_ptr<Impl> impl);
-  [[nodiscard]] bool RunInternal(const DitPreparedInput& input,
-                                 const CancellationToken* cancellation,
-                                 std::span<std::uint16_t> modulation_attention,
-                                 std::span<std::uint16_t> attention_output,
-                                 std::span<std::uint16_t> modulation_mlp,
-                                 std::span<std::uint16_t> block_output,
-                                 DitBlockTelemetry* telemetry,
-                                 std::string* error);
+  [[nodiscard]] bool RunInternal(
+      const DitPreparedInput& input, const CancellationToken* cancellation,
+      std::span<std::uint16_t> modulation_attention,
+      std::span<std::uint16_t> attention_output,
+      std::span<std::uint16_t> modulation_mlp,
+      std::span<std::uint16_t> block_output, DitBlockTelemetry* telemetry,
+      std::string* error, const std::uint16_t* hidden_device = nullptr,
+      const std::uint32_t* row_map_device = nullptr,
+      std::uint16_t* output_device = nullptr, void* external_stream = nullptr);
   std::unique_ptr<Impl> impl_;
 };
 

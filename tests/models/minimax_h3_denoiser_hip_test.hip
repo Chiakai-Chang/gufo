@@ -540,7 +540,7 @@ int CheckReuseSmoke() {
   CHECK(Finite(first_video));
   CHECK(Finite(first_audio));
   CHECK(first.forward_ms.size() == 3);
-  CHECK(first.dispatches == 109);
+  CHECK(first.dispatches == 136);
   CHECK(first.swap_bytes == 0);
 
   std::cout << "H3 denoiser reuse smoke active_blocks=3 steps=5 "

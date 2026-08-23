@@ -84,6 +84,187 @@ inline void LaunchWeightNorm(const float* vector, const float* magnitude,
                      vector, magnitude, output, outer, inner);
 }
 
+static __global__ void WeightNormTransposeKernel(const float* vector,
+                                                 const float* magnitude,
+                                                 float* output,
+                                                 std::uint32_t input_channels,
+                                                 std::uint32_t output_channels,
+                                                 std::uint32_t kernel) {
+  const std::uint32_t input_channel = blockIdx.x;
+  const std::uint32_t lane = threadIdx.x;
+  if (input_channel >= input_channels) {
+    return;
+  }
+  __shared__ float reduction[256];
+  const std::uint32_t inner = output_channels * kernel;
+  const std::size_t base = static_cast<std::size_t>(input_channel) * inner;
+  float local = 0.0F;
+  for (std::uint32_t index = lane; index < inner; index += blockDim.x) {
+    const float value = vector[base + index];
+    local = fmaf(value, value, local);
+  }
+  reduction[lane] = local;
+  __syncthreads();
+  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+    if (lane < stride) {
+      reduction[lane] += reduction[lane + stride];
+    }
+    __syncthreads();
+  }
+  const float scale = magnitude[input_channel] * rsqrtf(reduction[0]);
+  for (std::uint32_t index = lane; index < inner; index += blockDim.x) {
+    const std::uint32_t output_channel = index / kernel;
+    const std::uint32_t tap = index % kernel;
+    const std::size_t target =
+        (static_cast<std::size_t>(output_channel) * input_channels +
+         input_channel) *
+            kernel +
+        tap;
+    output[target] = vector[base + index] * scale;
+  }
+}
+
+inline void LaunchWeightNormTranspose(const float* vector,
+                                      const float* magnitude, float* output,
+                                      std::uint32_t input_channels,
+                                      std::uint32_t output_channels,
+                                      std::uint32_t kernel,
+                                      hipStream_t stream) {
+  hipLaunchKernelGGL(WeightNormTransposeKernel, dim3(input_channels), dim3(256),
+                     0, stream, vector, magnitude, output, input_channels,
+                     output_channels, kernel);
+}
+
+static __global__ void Conv1dIm2ColKernel(
+    const float* input, float* columns, std::uint32_t batch,
+    std::uint32_t input_length, std::uint32_t input_channels,
+    std::uint32_t output_length, std::uint32_t kernel, std::uint32_t padding,
+    std::uint32_t dilation) {
+  const std::size_t column_width =
+      static_cast<std::size_t>(input_channels) * kernel;
+  const std::size_t count =
+      static_cast<std::size_t>(batch) * output_length * column_width;
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const std::uint32_t tap = static_cast<std::uint32_t>(index % kernel);
+  std::size_t remaining = index / kernel;
+  const std::uint32_t input_channel =
+      static_cast<std::uint32_t>(remaining % input_channels);
+  remaining /= input_channels;
+  const std::uint32_t output_time =
+      static_cast<std::uint32_t>(remaining % output_length);
+  const std::uint32_t batch_index =
+      static_cast<std::uint32_t>(remaining / output_length);
+  const std::int64_t input_time = static_cast<std::int64_t>(output_time) -
+                                  padding +
+                                  static_cast<std::int64_t>(tap) * dilation;
+  if (input_time < 0 || input_time >= static_cast<std::int64_t>(input_length)) {
+    columns[index] = 0.0F;
+    return;
+  }
+  const std::size_t source =
+      (static_cast<std::size_t>(batch_index) * input_length +
+       static_cast<std::uint32_t>(input_time)) *
+          input_channels +
+      input_channel;
+  columns[index] = input[source];
+}
+
+inline void LaunchConv1dIm2Col(const float* input, float* columns,
+                               std::uint32_t batch, std::uint32_t input_length,
+                               std::uint32_t input_channels,
+                               std::uint32_t output_length,
+                               std::uint32_t kernel, std::uint32_t padding,
+                               std::uint32_t dilation, hipStream_t stream) {
+  const std::size_t count =
+      static_cast<std::size_t>(batch) * output_length * input_channels * kernel;
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(Conv1dIm2ColKernel,
+                     dim3((count + kThreads - 1U) / kThreads), dim3(kThreads),
+                     0, stream, input, columns, batch, input_length,
+                     input_channels, output_length, kernel, padding, dilation);
+}
+
+static __global__ void ConvTranspose1dIm2ColKernel(
+    const float* input, float* columns, std::uint32_t batch,
+    std::uint32_t input_length, std::uint32_t input_channels,
+    std::uint32_t output_length, std::uint32_t kernel, std::uint32_t stride,
+    std::uint32_t padding) {
+  const std::size_t column_width =
+      static_cast<std::size_t>(input_channels) * kernel;
+  const std::size_t count =
+      static_cast<std::size_t>(batch) * output_length * column_width;
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const std::uint32_t tap = static_cast<std::uint32_t>(index % kernel);
+  std::size_t remaining = index / kernel;
+  const std::uint32_t input_channel =
+      static_cast<std::uint32_t>(remaining % input_channels);
+  remaining /= input_channels;
+  const std::uint32_t output_time =
+      static_cast<std::uint32_t>(remaining % output_length);
+  const std::uint32_t batch_index =
+      static_cast<std::uint32_t>(remaining / output_length);
+  const std::int64_t numerator =
+      static_cast<std::int64_t>(output_time) + padding - tap;
+  if (numerator < 0 || numerator % stride != 0) {
+    columns[index] = 0.0F;
+    return;
+  }
+  const std::int64_t input_time = numerator / stride;
+  if (input_time >= static_cast<std::int64_t>(input_length)) {
+    columns[index] = 0.0F;
+    return;
+  }
+  const std::size_t source =
+      (static_cast<std::size_t>(batch_index) * input_length +
+       static_cast<std::uint32_t>(input_time)) *
+          input_channels +
+      input_channel;
+  columns[index] = input[source];
+}
+
+inline void LaunchConvTranspose1dIm2Col(
+    const float* input, float* columns, std::uint32_t batch,
+    std::uint32_t input_length, std::uint32_t input_channels,
+    std::uint32_t output_length, std::uint32_t kernel, std::uint32_t stride,
+    std::uint32_t padding, hipStream_t stream) {
+  const std::size_t count =
+      static_cast<std::size_t>(batch) * output_length * input_channels * kernel;
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(ConvTranspose1dIm2ColKernel,
+                     dim3((count + kThreads - 1U) / kThreads), dim3(kThreads),
+                     0, stream, input, columns, batch, input_length,
+                     input_channels, output_length, kernel, stride, padding);
+}
+
+static __global__ void AddConvBiasKernel(float* output, const float* bias,
+                                         std::size_t rows,
+                                         std::uint32_t columns) {
+  const std::size_t count = rows * columns;
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < count) {
+    output[index] += bias[index % columns];
+  }
+}
+
+inline void LaunchAddConvBias(float* output, const float* bias,
+                              std::size_t rows, std::uint32_t columns,
+                              hipStream_t stream) {
+  const std::size_t count = rows * columns;
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(AddConvBiasKernel,
+                     dim3((count + kThreads - 1U) / kThreads), dim3(kThreads),
+                     0, stream, output, bias, rows, columns);
+}
+
 static __global__ void Conv1dKernel(
     const float* input, const float* weight, const float* bias, float* output,
     std::uint32_t batch, std::uint32_t input_length,
@@ -268,6 +449,102 @@ inline void LaunchAliasFreeSnake(const float* input, const float* alpha_log,
                      dim3((count + kThreads - 1U) / kThreads), dim3(kThreads),
                      0, stream, input, alpha_log, beta_log, upsample_filter,
                      downsample_filter, output, batch, length, channels);
+}
+
+static __global__ void AliasFreeSnakeUpsampleKernel(
+    const float* input, const float* alpha_log, const float* beta_log,
+    const float* upsample_filter, float* activated, std::uint32_t batch,
+    std::uint32_t length, std::uint32_t channels) {
+  const std::uint32_t upsampled_length = length * 2U;
+  const std::size_t count =
+      static_cast<std::size_t>(batch) * upsampled_length * channels;
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const std::uint32_t channel = static_cast<std::uint32_t>(index % channels);
+  std::size_t remaining = index / channels;
+  const std::uint32_t upsampled_time =
+      static_cast<std::uint32_t>(remaining % upsampled_length);
+  const std::uint32_t batch_index =
+      static_cast<std::uint32_t>(remaining / upsampled_length);
+  const int raw_time = static_cast<int>(upsampled_time) + 15;
+  float upsampled = 0.0F;
+  for (int tap = 0; tap < 12; ++tap) {
+    const int numerator = raw_time - tap;
+    if (numerator < 0 || (numerator & 1) != 0) {
+      continue;
+    }
+    int source_time = numerator / 2 - 5;
+    source_time = max(0, min(source_time, static_cast<int>(length) - 1));
+    const std::size_t source = (static_cast<std::size_t>(batch_index) * length +
+                                static_cast<std::uint32_t>(source_time)) *
+                                   channels +
+                               channel;
+    upsampled = fmaf(input[source], 2.0F * upsample_filter[tap], upsampled);
+  }
+  const float alpha = expf(alpha_log[channel]);
+  const float beta = expf(beta_log[channel]);
+  const float sine = sinf(alpha * upsampled);
+  activated[index] = upsampled + sine * sine / (beta + 1.0e-9F);
+}
+
+inline void LaunchAliasFreeSnakeUpsample(
+    const float* input, const float* alpha_log, const float* beta_log,
+    const float* upsample_filter, float* activated, std::uint32_t batch,
+    std::uint32_t length, std::uint32_t channels, hipStream_t stream) {
+  const std::size_t count =
+      static_cast<std::size_t>(batch) * length * 2U * channels;
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(AliasFreeSnakeUpsampleKernel,
+                     dim3((count + kThreads - 1U) / kThreads), dim3(kThreads),
+                     0, stream, input, alpha_log, beta_log, upsample_filter,
+                     activated, batch, length, channels);
+}
+
+static __global__ void AliasFreeSnakeDownsampleKernel(
+    const float* activated, const float* downsample_filter, float* output,
+    std::uint32_t batch, std::uint32_t length, std::uint32_t channels) {
+  const std::size_t count = static_cast<std::size_t>(batch) * length * channels;
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= count) {
+    return;
+  }
+  const std::uint32_t channel = static_cast<std::uint32_t>(index % channels);
+  std::size_t remaining = index / channels;
+  const std::uint32_t time = static_cast<std::uint32_t>(remaining % length);
+  const std::uint32_t batch_index =
+      static_cast<std::uint32_t>(remaining / length);
+  const std::uint32_t upsampled_length = length * 2U;
+  float result = 0.0F;
+  for (int tap = 0; tap < 12; ++tap) {
+    int upsampled_time = static_cast<int>(time * 2U) + tap - 5;
+    upsampled_time =
+        max(0, min(upsampled_time, static_cast<int>(upsampled_length) - 1));
+    const std::size_t source =
+        (static_cast<std::size_t>(batch_index) * upsampled_length +
+         static_cast<std::uint32_t>(upsampled_time)) *
+            channels +
+        channel;
+    result = fmaf(activated[source], downsample_filter[tap], result);
+  }
+  output[index] = result;
+}
+
+inline void LaunchAliasFreeSnakeDownsample(const float* activated,
+                                           const float* downsample_filter,
+                                           float* output, std::uint32_t batch,
+                                           std::uint32_t length,
+                                           std::uint32_t channels,
+                                           hipStream_t stream) {
+  const std::size_t count = static_cast<std::size_t>(batch) * length * channels;
+  constexpr std::size_t kThreads = 256;
+  hipLaunchKernelGGL(AliasFreeSnakeDownsampleKernel,
+                     dim3((count + kThreads - 1U) / kThreads), dim3(kThreads),
+                     0, stream, activated, downsample_filter, output, batch,
+                     length, channels);
 }
 
 static __global__ void CopyKernel(const float* input, float* output,
