@@ -636,6 +636,41 @@ is diagnostic here: this isolated block finishes before the APU can ramp
 toward its configured 120--140 W envelope. The benchmark is not extended or
 repeated merely to produce a larger wattage reading.
 
+### Full-resolution boundary projection pass
+
+A focused kernel trace of one released 1344x768, 124-frame, 37,716-row,
+50-block forward attributed the original 154.171-second forward as follows:
+
+| Work | GPU time | Forward share |
+| --- | ---: | ---: |
+| AOTriton full attention | 65.100 s | 42.2% |
+| dense rocBLAS block GEMMs | 47.403 s | 30.7% |
+| SwiGLU | 23.161 s | 15.0% |
+| scalar patch and final projections | 16.651 s | 10.8% |
+| remaining elementwise and transfer work | 1.856 s | 1.2% |
+
+The patch and final heads were still one-thread-per-output scalar F32 dot
+products. The retained path uses an atomics-disabled gfx1151 rocBLAS F32 GEMM,
+keeps F32 inputs, weights, accumulation, and final-head outputs, preserves the
+released BF16 boundary after patch projection, and applies the same F32 biases
+after GEMM. One reusable F32 scratch allocation serves video and audio
+sequentially.
+
+The focused full-resolution forward falls from 154.171 to 133.263 seconds, a
+13.56% reduction. Across the released 49-evaluation exact schedule this
+removes about 1,024 seconds (17.1 minutes) of denoising wall time. Peak
+residency rises from 42.77 to 43.52 GiB, with zero swap. The frozen 1,872-row
+oracle remains green: video velocity relative L2/max are
+`0.0108984`/`0.0133581`, and audio velocity relative L2/max are
+`0.00867719`/`0.0188007`. The independent 528-row oracle also remains green:
+video velocity relative L2/max are `0.0193639`/`0.0458577`, and audio velocity
+relative L2/max are `0.0112591`/`0.0216204`.
+
+The post-fix ranking leaves full attention as the primary full-resolution
+target, followed by dense block GEMMs and SwiGLU. Decoder work is paid once
+per video, while this denoiser cost is paid for every schedule evaluation, so
+quality-neutral attention work has the largest remaining end-to-end leverage.
+
 ### Issue #184 second focused pass
 
 The next retained pass profiles complete phase boundaries once rather than

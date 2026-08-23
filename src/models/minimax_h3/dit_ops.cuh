@@ -58,6 +58,47 @@ inline void LaunchBf16ToF32(const std::uint16_t* input, float* output,
                      dim3(kThreads), 0, stream, input, output, elements);
 }
 
+static __global__ void AddBiasF32Kernel(float* values, const float* bias,
+                                        std::uint32_t rows,
+                                        std::uint32_t width) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row < rows && column < width) {
+    values[static_cast<std::size_t>(row) * width + column] += bias[column];
+  }
+}
+
+inline void LaunchAddBiasF32(float* values, const float* bias,
+                             std::uint32_t rows, std::uint32_t width,
+                             hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  hipLaunchKernelGGL(AddBiasF32Kernel,
+                     dim3((width + kThreads - 1U) / kThreads, rows),
+                     dim3(kThreads), 0, stream, values, bias, rows, width);
+}
+
+static __global__ void AddBiasF32ToBf16Kernel(const float* input,
+                                              const float* bias,
+                                              std::uint16_t* output,
+                                              std::uint32_t rows,
+                                              std::uint32_t width) {
+  const std::uint32_t column = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t row = blockIdx.y;
+  if (row < rows && column < width) {
+    const std::size_t index = static_cast<std::size_t>(row) * width + column;
+    output[index] = FloatToBf16(input[index] + bias[column]);
+  }
+}
+
+inline void LaunchAddBiasF32ToBf16(const float* input, const float* bias,
+                                   std::uint16_t* output, std::uint32_t rows,
+                                   std::uint32_t width, hipStream_t stream) {
+  constexpr std::uint32_t kThreads = 256;
+  hipLaunchKernelGGL(
+      AddBiasF32ToBf16Kernel, dim3((width + kThreads - 1U) / kThreads, rows),
+      dim3(kThreads), 0, stream, input, bias, output, rows, width);
+}
+
 static __global__ void FirstMismatchKernel(const std::uint16_t* left,
                                            const std::uint16_t* right,
                                            std::size_t elements,

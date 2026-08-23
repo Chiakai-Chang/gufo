@@ -459,6 +459,60 @@ private:
   std::vector<Plan> plans_;
 };
 
+class F32Gemm {
+public:
+  F32Gemm() {
+    if (rocblas_create_handle(&handle_) != rocblas_status_success) {
+      handle_ = nullptr;
+      return;
+    }
+    (void)rocblas_set_atomics_mode(handle_, rocblas_atomics_not_allowed);
+  }
+  ~F32Gemm() {
+    if (handle_ != nullptr) {
+      (void)rocblas_destroy_handle(handle_);
+    }
+  }
+  F32Gemm(const F32Gemm&) = delete;
+  F32Gemm& operator=(const F32Gemm&) = delete;
+
+  bool Run(const float* weight, const float* input, float* output,
+           std::size_t batch, std::size_t rows, std::size_t columns,
+           hipStream_t stream, std::string* error) {
+    if (handle_ == nullptr || batch == 0 || rows == 0 || columns == 0 ||
+        batch >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rows >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        columns >
+            static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max()) ||
+        rocblas_set_stream(handle_, stream) != rocblas_status_success) {
+      SetError(error, "invalid MiniMax H3 F32 projection GEMM");
+      return false;
+    }
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    const rocblas_status status = rocblas_gemm_ex(
+        handle_, rocblas_operation_transpose, rocblas_operation_none,
+        static_cast<rocblas_int>(rows), static_cast<rocblas_int>(batch),
+        static_cast<rocblas_int>(columns), &alpha, weight,
+        rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), input,
+        rocblas_datatype_f32_r, static_cast<rocblas_int>(columns), &beta,
+        output, rocblas_datatype_f32_r, static_cast<rocblas_int>(rows), output,
+        rocblas_datatype_f32_r, static_cast<rocblas_int>(rows),
+        rocblas_datatype_f32_r, rocblas_gemm_algo_standard, 0, 0);
+    if (status != rocblas_status_success) {
+      SetError(error, "MiniMax H3 F32 projection GEMM failed: " +
+                          std::to_string(static_cast<int>(status)));
+      return false;
+    }
+    return true;
+  }
+
+private:
+  rocblas_handle handle_{nullptr};
+};
+
 struct RefinerWeights {
   DeviceBuffer norm1;
   DeviceBuffer norm2;
@@ -552,6 +606,7 @@ struct DenoiserSession::Impl {
   hipStream_t stream{nullptr};
   void* staging{nullptr};
   Bf16Gemm gemm;
+  F32Gemm projection_gemm;
 
   DeviceBuffer video_patch_weight;
   DeviceBuffer video_patch_bias;
@@ -566,6 +621,7 @@ struct DenoiserSession::Impl {
 
   DeviceBuffer video_sample;
   DeviceBuffer audio_sample;
+  DeviceBuffer projection_scratch_f32;
   DeviceBuffer video_projected;
   DeviceBuffer audio_projected;
   DeviceBuffer hidden_device_a;
@@ -1383,11 +1439,15 @@ struct DenoiserSession::Impl {
     const std::size_t video_rows = layout.video_target_rows;
     const std::size_t audio_rows = layout.audio_target_rows;
     const std::size_t hidden_elements = layout.rows() * kDitHiddenSize;
+    const std::size_t maximum_projection_rows =
+        std::max(video_rows, audio_rows);
     const auto bf16 = [](std::size_t elements) {
       return elements * sizeof(std::uint16_t);
     };
     if (!video_sample.Allocate(video_elements * sizeof(float), error) ||
         !audio_sample.Allocate(audio_elements * sizeof(float), error) ||
+        !projection_scratch_f32.Allocate(
+            maximum_projection_rows * kDitHiddenSize * sizeof(float), error) ||
         !video_projected.Allocate(bf16(video_rows * kDitHiddenSize), error) ||
         !audio_projected.Allocate(bf16(audio_rows * kDitHiddenSize), error) ||
         !hidden_device_a.Allocate(bf16(hidden_elements), error) ||
@@ -1415,9 +1475,10 @@ struct DenoiserSession::Impl {
     final_audio_map_host.resize(audio_rows);
     forward_history.reserve(static_cast<std::size_t>(schedule.evaluations()) +
                             16U);
-    const std::array<const DeviceBuffer*, 17> buffers = {
+    const std::array<const DeviceBuffer*, 18> buffers = {
         &video_sample,
         &audio_sample,
+        &projection_scratch_f32,
         &video_projected,
         &audio_projected,
         &hidden_device_a,
@@ -1490,16 +1551,28 @@ struct DenoiserSession::Impl {
       return false;
     }
     const auto begin = Clock::now();
-    dit_ops::LaunchPatchProjection(
-        video_sample.As<float>(), video_patch_weight.As<float>(),
-        video_patch_bias.As<float>(), video_projected.As<std::uint16_t>(),
-        static_cast<std::uint32_t>(layout.video_target_rows),
-        kH3VideoPatchWidth, kDitHiddenSize, stream);
-    dit_ops::LaunchPatchProjection(
-        audio_sample.As<float>(), audio_patch_weight.As<float>(),
-        audio_patch_bias.As<float>(), audio_projected.As<std::uint16_t>(),
-        static_cast<std::uint32_t>(layout.audio_target_rows),
-        kH3AudioLatentChannels, kDitHiddenSize, stream);
+    if (!projection_gemm.Run(
+            video_patch_weight.As<float>(), video_sample.As<float>(),
+            projection_scratch_f32.As<float>(), layout.video_target_rows,
+            kDitHiddenSize, kH3VideoPatchWidth, stream, error)) {
+      return false;
+    }
+    dit_ops::LaunchAddBiasF32ToBf16(
+        projection_scratch_f32.As<float>(), video_patch_bias.As<float>(),
+        video_projected.As<std::uint16_t>(),
+        static_cast<std::uint32_t>(layout.video_target_rows), kDitHiddenSize,
+        stream);
+    if (!projection_gemm.Run(
+            audio_patch_weight.As<float>(), audio_sample.As<float>(),
+            projection_scratch_f32.As<float>(), layout.audio_target_rows,
+            kDitHiddenSize, kH3AudioLatentChannels, stream, error)) {
+      return false;
+    }
+    dit_ops::LaunchAddBiasF32ToBf16(
+        projection_scratch_f32.As<float>(), audio_patch_bias.As<float>(),
+        audio_projected.As<std::uint16_t>(),
+        static_cast<std::uint32_t>(layout.audio_target_rows), kDitHiddenSize,
+        stream);
     const std::size_t text_bytes =
         refined_text_host.size() * sizeof(std::uint16_t);
     const std::size_t audio_offset_bytes = text_bytes;
@@ -1581,15 +1654,33 @@ struct DenoiserSession::Impl {
                          static_cast<std::uint32_t>(layout.video_target_rows),
                          kDitHiddenSize, kFinalModulationSlots, 0, 1,
                          kDitNormEpsilon, stream);
-    dit_ops::LaunchFinalProjection(
-        final_audio_norm.As<std::uint16_t>(), final_audio_weight.As<float>(),
-        final_audio_bias.As<float>(), audio_velocity_f32.As<float>(),
-        static_cast<std::uint32_t>(layout.audio_target_rows), kDitHiddenSize,
+    dit_ops::LaunchBf16ToF32(final_audio_norm.As<std::uint16_t>(),
+                             projection_scratch_f32.As<float>(),
+                             layout.audio_target_rows * kDitHiddenSize, stream);
+    if (!CheckLaunch("H3 final audio projection conversion", error) ||
+        !projection_gemm.Run(
+            final_audio_weight.As<float>(), projection_scratch_f32.As<float>(),
+            audio_velocity_f32.As<float>(), layout.audio_target_rows,
+            kH3AudioLatentChannels, kDitHiddenSize, stream, error)) {
+      return false;
+    }
+    dit_ops::LaunchAddBiasF32(
+        audio_velocity_f32.As<float>(), final_audio_bias.As<float>(),
+        static_cast<std::uint32_t>(layout.audio_target_rows),
         kH3AudioLatentChannels, stream);
-    dit_ops::LaunchFinalProjection(
-        final_video_norm.As<std::uint16_t>(), final_video_weight.As<float>(),
-        final_video_bias.As<float>(), video_velocity_f32.As<float>(),
-        static_cast<std::uint32_t>(layout.video_target_rows), kDitHiddenSize,
+    dit_ops::LaunchBf16ToF32(final_video_norm.As<std::uint16_t>(),
+                             projection_scratch_f32.As<float>(),
+                             layout.video_target_rows * kDitHiddenSize, stream);
+    if (!CheckLaunch("H3 final video projection conversion", error) ||
+        !projection_gemm.Run(
+            final_video_weight.As<float>(), projection_scratch_f32.As<float>(),
+            video_velocity_f32.As<float>(), layout.video_target_rows,
+            kH3VideoPatchWidth, kDitHiddenSize, stream, error)) {
+      return false;
+    }
+    dit_ops::LaunchAddBiasF32(
+        video_velocity_f32.As<float>(), final_video_bias.As<float>(),
+        static_cast<std::uint32_t>(layout.video_target_rows),
         kH3VideoPatchWidth, stream);
     if (!CheckLaunch("H3 final velocity heads", error)) {
       return false;
