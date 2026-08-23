@@ -1,0 +1,70 @@
+{
+  "schema": "strix.qwen3-tts-reference-contract.v1",
+  "reference_commit": "022e286b98fbec7e1e916cb940cdf532cd9f488e",
+  "model": "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+  "speaker": "vivian",
+  "language": "english",
+  "text": "The boy who lived. Mr. and Mrs. Dursley, of number four, Privet Drive, were proud to say that they were perfectly normal, thank you very much. They were the last people you'd expect to be involved in anything strange or mysterious, because they just didn't hold with such nonsense.",
+  "greedy": {
+    "device": "cpu",
+    "max_new_tokens": 6,
+    "sample_rate": 24000,
+    "samples": 9600,
+    "code_steps": 5,
+    "code_groups": 16,
+    "talker_codes_sha256": "1868c45d6a6785445f822e7e0305ce43265f3bc302589fae5293b6f65895a510",
+    "waveform_sha256": "221839afa8b8d934906531a87773bffc3ab980455437f5dee38d93bf1f937f1c",
+    "first_codes": [
+      [1995, 1159, 355, 22, 1174, 1093],
+      [1028, 1836, 568, 89, 1191, 84],
+      [899, 1937, 453, 1626, 674, 1345],
+      [1546, 1473, 177, 1881, 1621, 408],
+      [1546, 1114, 544, 807, 1621, 1605]
+    ]
+  },
+  "rocm_greedy": {
+    "device": "cuda:0",
+    "max_new_tokens": 6,
+    "sample_rate": 24000,
+    "samples": 9600,
+    "code_steps": 5,
+    "code_groups": 16,
+    "talker_codes_sha256": "f5b28336739125a434115b19dc613d0695394a113c83bedb8500f63c68d08e61",
+    "waveform_sha256": "9370c0066ddcc5c2c28d0fc955ab00cd6e88f8d5aae7ae62a9de7cfc32834a67",
+    "first_codes": [
+      [1995, 1159, 355, 22, 1174, 1093],
+      [1028, 1836, 568, 89, 1191, 84],
+      [899, 1752, 293, 1651, 453, 1998],
+      [1546, 1473, 1705, 1039, 162, 436],
+      [1546, 1291, 101, 1227, 1462, 1208]
+    ]
+  },
+  "rocm_sampled": {
+    "device": "cuda:0",
+    "max_new_tokens": 2048,
+    "sample_rate": 24000,
+    "samples": 524160,
+    "code_steps": 273,
+    "code_groups": 16,
+    "talker_codes_sha256": "62668804d7e8a6d45e7bc0c09f8bfefd28e3e25c6b74418f20259f8701df690b",
+    "waveform_sha256": "82d7205f467266d90706c75bbfcefceacc1b85a2bdfd95ba3b84391835325870",
+    "first_codes": [
+      [1995, 1159, 355, 22, 1174, 1093],
+      [1028, 66, 737, 486, 1191, 1608],
+      [696, 465, 1975, 1798, 772, 1834],
+      [1358, 1222, 1726, 273, 1362, 1532],
+      [698, 112, 1503, 201, 1549, 100]
+    ]
+  },
+  "prefill": {
+    "tokens": 75,
+    "hidden_size": 2048,
+    "logits": 3072,
+    "inputs_embeds_sha256": "463e8ca52746c48537e82432486777879fe4b5f5cea4d9969e49d29f912a8920",
+    "layer0_output_sha256": "20f04320289e46cd71ed3c61faf6d03e34b9eddc7d56733df4a1459306a29f4d",
+    "layer27_output_sha256": "5e3b245170848a095153b59e075851fa4ad631736e6b51db4611ba23b8346fd8",
+    "logits_sha256": "bda5c2bf73c5695d77c258f9bc12178cff1fed1a39912ea8412c7707e054803a",
+    "predictor_codes_sha256": "29927ac66ff657446c2966985600660520789b359e514c84365fa719fb5e620c",
+    "predictor_logits_sha256": "d6cf30340bd90468400e1b5d728e4d8f1fb8e6a046605698df8054361b5d6462"
+  }
+}

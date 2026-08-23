@@ -12,6 +12,7 @@
 #include "src/server/http_server.hpp"
 #include "src/server/inference_backend.hpp"
 #include "src/server/prompt_cli.hpp"
+#include "src/server/tts_service.hpp"
 #include "src/server/video_cli.hpp"
 #include "src/server/video_jobs.hpp"
 
@@ -54,6 +55,9 @@ void PrintServeHelp() {
       << "  --video-root <DIR>  Persistent video jobs (default: video-jobs)\n"
       << "  --video-manifest <PATH> Pinned H3 manifest override\n"
       << "  --video-ttl <SEC>   Completed-artifact TTL (default: 3600)\n"
+      << "  --tts-model <DIR>   Qwen3-TTS 12Hz CustomVoice model directory\n"
+      << "  --tts-context <N>   Native prompt+generation capacity "
+         "(default: 4096)\n"
       << "  -h, --help         Print this help\n";
 }
 
@@ -68,6 +72,8 @@ int RunServe(std::span<const char* const> args) {
   std::filesystem::path video_root = "video-jobs";
   std::filesystem::path video_manifest = DefaultH3SourceManifest();
   std::uint64_t video_ttl_seconds = 3600;
+  std::filesystem::path tts_model;
+  std::size_t tts_context_tokens = 4096;
 
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string_view a = args[i];
@@ -100,6 +106,10 @@ int RunServe(std::span<const char* const> args) {
       video_manifest = args[++i];
     } else if (a == "--video-ttl" && i + 1 < args.size()) {
       video_ttl_seconds = std::stoull(std::string(args[++i]));
+    } else if (a == "--tts-model" && i + 1 < args.size()) {
+      tts_model = args[++i];
+    } else if (a == "--tts-context" && i + 1 < args.size()) {
+      tts_context_tokens = std::stoul(std::string(args[++i]));
     } else {
       std::cerr << "Error: unknown or incomplete serve option '" << a << "'\n";
       PrintServeHelp();
@@ -116,7 +126,7 @@ int RunServe(std::span<const char* const> args) {
 
   std::shared_ptr<InferenceBackend> backend;
   std::string err;
-  if (video_model.empty() || text_model_explicit) {
+  if ((video_model.empty() && tts_model.empty()) || text_model_explicit) {
     backend = std::make_shared<InferenceBackend>();
     if (!backend->load(model, &err, max_context, session_count)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
@@ -145,7 +155,24 @@ int RunServe(std::span<const char* const> args) {
     }
   }
 
-  HttpServer server(host, port, backend, video_jobs);
+  std::shared_ptr<TtsService> tts;
+  if (!tts_model.empty()) {
+    tts = std::make_shared<TtsService>(TtsServiceOptions{
+        .model_root = tts_model,
+        .native_context_tokens = tts_context_tokens,
+        .validate_model = true,
+        .model_id = "qwen3-tts-12hz-1.7b-customvoice",
+        .voices = {},
+        .runner = {},
+    });
+    if (!tts->ready()) {
+      std::cerr << "Error enabling Qwen3-TTS audio service: "
+                << tts->initialization_error() << '\n';
+      return 1;
+    }
+  }
+
+  HttpServer server(host, port, backend, video_jobs, tts);
   if (!server.start(&err)) {
     std::cerr << "Error starting HTTP server: " << err << "\n";
     return 1;

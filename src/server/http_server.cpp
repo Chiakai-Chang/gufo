@@ -21,7 +21,9 @@
 #include <thread>
 #include <utility>
 
+#include "src/server/audio_tts_api.hpp"
 #include "src/server/json.hpp"
+#include "src/server/tts_service.hpp"
 #include "src/server/video_api.hpp"
 #include "src/server/video_jobs.hpp"
 #include "src/tokenization/qwen_chat_template.hpp"
@@ -250,7 +252,8 @@ std::string ContentToString(const json::Value* content) {
 // ---------------------------------------------------------------------------
 
 HttpResponse ListModels(InferenceBackend* backend,
-                        const VideoJobService* video_jobs) {
+                        const VideoJobService* video_jobs,
+                        const TtsService* tts) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
@@ -282,6 +285,15 @@ HttpResponse ListModels(InferenceBackend* backend,
       model["capability"] = "video";
       data.push_back(std::move(model));
     }
+  }
+  if (tts != nullptr && tts->ready()) {
+    json::Value model = json::Value::object();
+    model["id"] = tts->model_id();
+    model["object"] = "model";
+    model["created"] = Now();
+    model["owned_by"] = "operator-supplied-qwen";
+    model["capability"] = "audio_tts";
+    data.push_back(std::move(model));
   }
   resp["data"] = std::move(data);
   return Ok(resp);
@@ -632,11 +644,13 @@ std::string HttpRequest::query_param(const std::string& key) const {
 
 HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<InferenceBackend> backend,
-                       std::shared_ptr<VideoJobService> video_jobs)
+                       std::shared_ptr<VideoJobService> video_jobs,
+                       std::shared_ptr<TtsService> tts)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
-      video_jobs_(std::move(video_jobs)) {
+      video_jobs_(std::move(video_jobs)),
+      tts_(std::move(tts)) {
   register_routes();
 }
 
@@ -654,9 +668,7 @@ void HttpServer::register_routes() {
   add("POST", "/v1/chat/completions", OpenAiChat);
   add("POST", "/v1/responses", OpenAiResponses);
   add("POST", "/v1/embeddings", NotImplemented);
-  add("POST", "/v1/audio/speech", NotImplemented);
   add("POST", "/v1/audio/transcriptions", NotImplemented);
-  add("GET", "/v1/audio/voices", NotImplemented);
   add("POST", "/v1/images/generations", NotImplemented);
   add("POST", "/v1/images/edits", NotImplemented);
 
@@ -724,6 +736,9 @@ void HttpServer::run() {
   if (video_jobs_ != nullptr && video_jobs_->ready()) {
     std::cout << "strix-server: MiniMax H3 video API enabled\n";
   }
+  if (tts_ != nullptr && tts_->ready()) {
+    std::cout << "strix-server: Qwen3-TTS audio API enabled\n";
+  }
   while (!stopped_.load()) {
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
     if (client_fd < 0)
@@ -743,7 +758,7 @@ void HttpServer::stop() {
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
-    return ListModels(backend_.get(), video_jobs_.get());
+    return ListModels(backend_.get(), video_jobs_.get(), tts_.get());
   }
   if (IsVideoApiPath(req.path)) {
     if (video_jobs_ == nullptr || !video_jobs_->ready()) {
@@ -752,6 +767,14 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
                  "video_service_unavailable");
     }
     return HandleVideoApiRequest(req, *video_jobs_);
+  }
+  if (IsAudioTtsApiPath(req.path)) {
+    if (tts_ == nullptr || !tts_->ready()) {
+      return Err(503, "Service Unavailable",
+                 "Qwen3-TTS audio service is not configured", "server_error",
+                 "tts_service_unavailable");
+    }
+    return HandleAudioTtsApiRequest(req, *tts_);
   }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {

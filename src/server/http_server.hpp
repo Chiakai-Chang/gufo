@@ -15,6 +15,7 @@
 namespace strix::server {
 
 class VideoJobService;
+class TtsService;
 
 struct HttpRequest {
   std::string method;  // "GET" / "POST" / ...
@@ -66,7 +67,8 @@ class HttpServer {
 public:
   HttpServer(std::string host, int port,
              std::shared_ptr<InferenceBackend> backend,
-             std::shared_ptr<VideoJobService> video_jobs = nullptr);
+             std::shared_ptr<VideoJobService> video_jobs = nullptr,
+             std::shared_ptr<TtsService> tts = nullptr);
 
   void add(const std::string& method, const std::string& path, Handler handler);
 
@@ -87,6 +89,7 @@ private:
   int port_;
   std::shared_ptr<InferenceBackend> backend_;
   std::shared_ptr<VideoJobService> video_jobs_;
+  std::shared_ptr<TtsService> tts_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::vector<std::pair<std::pair<std::string, std::string>, Handler>> routes_;

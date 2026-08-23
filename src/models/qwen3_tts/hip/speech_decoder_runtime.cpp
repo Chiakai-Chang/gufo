@@ -1,0 +1,1037 @@
+#include "src/models/qwen3_tts/hip/speech_decoder_runtime.hpp"
+
+#include <utility>
+
+#if defined(ENGINE_ENABLE_HIP)
+
+#include <hip/hip_runtime.h>
+#include <rocblas/rocblas.h>
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <initializer_list>
+#include <limits>
+#include <memory>
+#include <ranges>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "src/models/qwen3_tts/hip/speech_decoder_ops.hpp"
+#include "src/models/qwen3_tts/loader.hpp"
+
+namespace strix::models::qwen3_tts::hip {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+constexpr std::size_t kCodeGroups = 16;
+constexpr std::size_t kCodebookDimension = 256;
+constexpr std::size_t kSamplesPerCode = 1920;
+constexpr std::size_t kChunkFrames = 300;
+constexpr std::size_t kLeftContextFrames = 25;
+
+void SetError(std::string* error, std::string message) {
+  if (error != nullptr) {
+    *error = std::move(message);
+  }
+}
+
+void RequireHip(hipError_t status, std::string_view operation) {
+  if (status != hipSuccess) {
+    throw std::runtime_error(std::string(operation) + ": " +
+                             hipGetErrorString(status));
+  }
+}
+
+void RequireRocblas(rocblas_status status, std::string_view operation) {
+  if (status != rocblas_status_success) {
+    throw std::runtime_error(std::string(operation) + ": status " +
+                             std::to_string(static_cast<int>(status)));
+  }
+}
+
+template<typename Element>
+class DeviceBuffer {
+public:
+  DeviceBuffer() = default;
+  explicit DeviceBuffer(std::size_t count) { Reset(count); }
+  ~DeviceBuffer() { Reset(); }
+
+  DeviceBuffer(const DeviceBuffer&) = delete;
+  DeviceBuffer& operator=(const DeviceBuffer&) = delete;
+
+  DeviceBuffer(DeviceBuffer&& other) noexcept
+      : data_(std::exchange(other.data_, nullptr)),
+        count_(std::exchange(other.count_, 0)) {}
+
+  DeviceBuffer& operator=(DeviceBuffer&& other) noexcept {
+    if (this != &other) {
+      Reset();
+      data_ = std::exchange(other.data_, nullptr);
+      count_ = std::exchange(other.count_, 0);
+    }
+    return *this;
+  }
+
+  void Reset(std::size_t count = 0) {
+    if (data_ != nullptr) {
+      (void)hipFree(data_);
+      data_ = nullptr;
+      count_ = 0;
+    }
+    if (count == 0) {
+      return;
+    }
+    if (count > std::numeric_limits<std::size_t>::max() / sizeof(Element)) {
+      throw std::overflow_error("Qwen3-TTS speech decoder buffer overflow");
+    }
+    RequireHip(
+        hipMalloc(reinterpret_cast<void**>(&data_), count * sizeof(Element)),
+        "hipMalloc Qwen3-TTS speech decoder");
+    count_ = count;
+  }
+
+  [[nodiscard]] Element* get() const noexcept { return data_; }
+  [[nodiscard]] std::size_t size() const noexcept { return count_; }
+
+private:
+  Element* data_{nullptr};
+  std::size_t count_{0};
+};
+
+enum class WeightMode {
+  kAuto,
+  kMapped,
+  kCopy,
+};
+
+WeightMode GetWeightMode() {
+  const char* value = std::getenv("STRIX_QWEN3_TTS_WEIGHT_MODE");
+  if (value == nullptr) {
+    return WeightMode::kAuto;
+  }
+  const std::string_view mode(value);
+  if (mode == "mapped") {
+    return WeightMode::kMapped;
+  }
+  if (mode == "copy") {
+    return WeightMode::kCopy;
+  }
+  return WeightMode::kAuto;
+}
+
+class DeviceRegion {
+public:
+  DeviceRegion() = default;
+  ~DeviceRegion() {
+    if (owns_device_ && device_ != nullptr) {
+      (void)hipFree(device_);
+    }
+    if (registered_ && host_ != nullptr) {
+      (void)hipHostUnregister(const_cast<std::byte*>(host_));
+    }
+  }
+
+  DeviceRegion(const DeviceRegion&) = delete;
+  DeviceRegion& operator=(const DeviceRegion&) = delete;
+
+  bool Initialize(MappedRegion region, std::string* error) {
+    host_ = region.data;
+    size_ = region.size;
+    hipDeviceProp_t properties{};
+    int device = 0;
+    const bool integrated =
+        hipGetDevice(&device) == hipSuccess &&
+        hipGetDeviceProperties(&properties, device) == hipSuccess &&
+        properties.integrated != 0;
+    const WeightMode mode = GetWeightMode();
+    const bool prefer_mapped = mode == WeightMode::kMapped ||
+                               (mode == WeightMode::kAuto && integrated);
+    if (prefer_mapped && TryMap()) {
+      return true;
+    }
+    if (mode != WeightMode::kMapped && TryCopy()) {
+      return true;
+    }
+    if (!prefer_mapped && mode == WeightMode::kAuto && TryMap()) {
+      return true;
+    }
+    SetError(error,
+             "cannot make Qwen3-TTS speech-tokenizer weights GPU-visible");
+    return false;
+  }
+
+  [[nodiscard]] const void* Resolve(const std::byte* pointer) const {
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    const auto base = reinterpret_cast<std::uintptr_t>(host_);
+    if (address < base || address - base >= size_) {
+      return nullptr;
+    }
+    return static_cast<const std::byte*>(device_) + (address - base);
+  }
+
+private:
+  bool TryMap() {
+    if (hipHostRegister(const_cast<std::byte*>(host_), size_,
+                        hipHostRegisterMapped | hipHostRegisterReadOnly) !=
+        hipSuccess) {
+      return false;
+    }
+    registered_ = true;
+    if (hipHostGetDevicePointer(&device_, const_cast<std::byte*>(host_), 0) ==
+        hipSuccess) {
+      return true;
+    }
+    (void)hipHostUnregister(const_cast<std::byte*>(host_));
+    registered_ = false;
+    device_ = nullptr;
+    return false;
+  }
+
+  bool TryCopy() {
+    if (hipMalloc(&device_, size_) != hipSuccess) {
+      device_ = nullptr;
+      return false;
+    }
+    owns_device_ = true;
+    if (hipMemcpy(device_, host_, size_, hipMemcpyHostToDevice) == hipSuccess) {
+      return true;
+    }
+    (void)hipFree(device_);
+    device_ = nullptr;
+    owns_device_ = false;
+    return false;
+  }
+
+  const std::byte* host_{nullptr};
+  void* device_{nullptr};
+  std::size_t size_{0};
+  bool owns_device_{false};
+  bool registered_{false};
+};
+
+const Tensor& RequireF32Tensor(const TensorStore& store, std::string_view name,
+                               std::span<const std::uint64_t> shape) {
+  const Tensor* tensor = store.Find(name);
+  if (tensor == nullptr) {
+    throw std::runtime_error("missing Qwen3-TTS speech tensor: " +
+                             std::string(name));
+  }
+  if (tensor->dtype != DType::kF32 ||
+      !std::ranges::equal(tensor->shape, shape)) {
+    throw std::runtime_error("unexpected Qwen3-TTS speech tensor layout: " +
+                             std::string(name));
+  }
+  return *tensor;
+}
+
+const float* ResolveF32(const TensorStore& store, const DeviceRegion& region,
+                        std::string_view name,
+                        std::span<const std::uint64_t> shape) {
+  const Tensor& tensor = RequireF32Tensor(store, name, shape);
+  const void* pointer = region.Resolve(tensor.data);
+  if (pointer == nullptr) {
+    throw std::runtime_error(
+        "Qwen3-TTS speech tensor is outside mapped file: " + std::string(name));
+  }
+  return static_cast<const float*>(pointer);
+}
+
+class F32Gemm {
+public:
+  F32Gemm() {
+    RequireRocblas(rocblas_create_handle(&handle_), "rocblas_create_handle");
+    RequireRocblas(
+        rocblas_set_atomics_mode(handle_, rocblas_atomics_not_allowed),
+        "rocblas_set_atomics_mode");
+  }
+
+  ~F32Gemm() {
+    if (handle_ != nullptr) {
+      (void)rocblas_destroy_handle(handle_);
+    }
+  }
+
+  F32Gemm(const F32Gemm&) = delete;
+  F32Gemm& operator=(const F32Gemm&) = delete;
+
+  void Run(const float* weight, const float* input, float* output,
+           std::size_t rows, std::size_t output_columns, std::size_t reduction,
+           hipStream_t stream) {
+    constexpr std::size_t max_int =
+        static_cast<std::size_t>(std::numeric_limits<rocblas_int>::max());
+    if (rows == 0 || output_columns == 0 || reduction == 0 || rows > max_int ||
+        output_columns > max_int || reduction > max_int) {
+      throw std::length_error("invalid Qwen3-TTS speech decoder GEMM shape");
+    }
+    RequireRocblas(rocblas_set_stream(handle_, stream), "rocblas_set_stream");
+    constexpr float alpha = 1.0F;
+    constexpr float beta = 0.0F;
+    RequireRocblas(
+        rocblas_gemm_ex(
+            handle_, rocblas_operation_transpose, rocblas_operation_none,
+            static_cast<rocblas_int>(output_columns),
+            static_cast<rocblas_int>(rows), static_cast<rocblas_int>(reduction),
+            &alpha, weight, rocblas_datatype_f32_r,
+            static_cast<rocblas_int>(reduction), input, rocblas_datatype_f32_r,
+            static_cast<rocblas_int>(reduction), &beta, output,
+            rocblas_datatype_f32_r, static_cast<rocblas_int>(output_columns),
+            output, rocblas_datatype_f32_r,
+            static_cast<rocblas_int>(output_columns), rocblas_datatype_f32_r,
+            rocblas_gemm_algo_standard, 0, 0),
+        "Qwen3-TTS speech decoder GEMM");
+  }
+
+private:
+  rocblas_handle handle_{nullptr};
+};
+
+struct LinearWeights {
+  const float* weight{nullptr};
+  const float* bias{nullptr};
+  std::size_t input_columns{0};
+  std::size_t output_columns{0};
+};
+
+struct ConvWeights {
+  const float* weight{nullptr};
+  const float* bias{nullptr};
+  std::size_t input_channels{0};
+  std::size_t output_channels{0};
+  std::size_t kernel{0};
+  std::size_t dilation{1};
+  std::size_t stride{1};
+  bool depthwise{false};
+  bool transpose{false};
+  DeviceBuffer<float> transformed_weight;
+};
+
+struct CodebookWeights {
+  const float* embedding_sum{nullptr};
+  const float* cluster_usage{nullptr};
+};
+
+struct TransformerLayerWeights {
+  const float* input_norm{nullptr};
+  const float* post_norm{nullptr};
+  const float* attention_scale{nullptr};
+  const float* mlp_scale{nullptr};
+  LinearWeights query;
+  LinearWeights key;
+  LinearWeights value;
+  LinearWeights attention_output;
+  LinearWeights gate;
+  LinearWeights up;
+  LinearWeights down;
+};
+
+struct ConvNeXtWeights {
+  ConvWeights depthwise;
+  const float* norm_weight{nullptr};
+  const float* norm_bias{nullptr};
+  LinearWeights pointwise1;
+  LinearWeights pointwise2;
+  const float* gamma{nullptr};
+};
+
+struct UpsampleStageWeights {
+  ConvWeights upsample;
+  ConvNeXtWeights convnext;
+};
+
+struct ResidualUnitWeights {
+  const float* alpha1{nullptr};
+  const float* beta1{nullptr};
+  ConvWeights conv1;
+  const float* alpha2{nullptr};
+  const float* beta2{nullptr};
+  ConvWeights conv2;
+};
+
+struct DecoderBlockWeights {
+  const float* alpha{nullptr};
+  const float* beta{nullptr};
+  ConvWeights upsample;
+  std::array<ResidualUnitWeights, 3> residuals;
+};
+
+struct Workspace {
+  std::size_t capacity_frames{0};
+  DeviceBuffer<std::uint32_t> codes;
+  std::array<DeviceBuffer<float>, 6> scratch;
+  DeviceBuffer<float> columns;
+
+  void Ensure(std::size_t frames) {
+    if (frames <= capacity_frames) {
+      return;
+    }
+    if (frames >
+        std::numeric_limits<std::size_t>::max() / (kSamplesPerCode * 96U)) {
+      throw std::overflow_error("Qwen3-TTS speech decoder frame overflow");
+    }
+    const std::size_t scratch_elements = frames * kSamplesPerCode * 96U;
+    const std::size_t column_elements = frames * kSamplesPerCode * 96U * 7U;
+    codes.Reset(frames * kCodeGroups);
+    for (auto& buffer : scratch) {
+      buffer.Reset(scratch_elements);
+    }
+    columns.Reset(column_elements);
+    capacity_frames = frames;
+  }
+};
+
+std::string TransformerName(std::size_t layer, std::string_view suffix) {
+  return "decoder.pre_transformer.layers." + std::to_string(layer) + "." +
+         std::string(suffix);
+}
+
+float* FindScratch(Workspace& workspace,
+                   std::initializer_list<const float*> excluded) {
+  for (auto& buffer : workspace.scratch) {
+    if (std::ranges::find(excluded, buffer.get()) == excluded.end()) {
+      return buffer.get();
+    }
+  }
+  throw std::runtime_error("Qwen3-TTS speech decoder scratch exhaustion");
+}
+
+}  // namespace
+
+struct SpeechDecoderHipRuntime::Impl {
+  explicit Impl(LoadResult loaded) : model(std::move(loaded)) {
+    int device = 0;
+    RequireHip(hipGetDevice(&device), "hipGetDevice");
+    hipDeviceProp_t properties{};
+    RequireHip(hipGetDeviceProperties(&properties, device),
+               "hipGetDeviceProperties");
+    if (!std::string_view(properties.gcnArchName).starts_with("gfx1151") ||
+        properties.integrated == 0) {
+      throw std::runtime_error(
+          "Qwen3-TTS speech decoder supports integrated gfx1151 Strix Halo");
+    }
+    if (model.mapped_regions.size() < 2) {
+      throw std::runtime_error(
+          "Qwen3-TTS speech-tokenizer safetensors mapping is missing");
+    }
+    RequireHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+               "hipStreamCreateWithFlags");
+    if (!speech_weights.Initialize(model.mapped_regions[1], nullptr)) {
+      throw std::runtime_error(
+          "cannot initialize Qwen3-TTS speech weight mapping");
+    }
+    LoadWeights();
+    RequireHip(hipStreamSynchronize(stream),
+               "synchronize Qwen3-TTS speech weights");
+  }
+
+  ~Impl() {
+    if (stream != nullptr) {
+      (void)hipStreamDestroy(stream);
+    }
+  }
+
+  LinearWeights LoadLinear(std::string_view prefix, std::size_t input_columns,
+                           std::size_t output_columns, bool bias = true) {
+    const TensorStore& store = *model.store;
+    const std::array<std::uint64_t, 2> weight_shape{
+        static_cast<std::uint64_t>(output_columns),
+        static_cast<std::uint64_t>(input_columns)};
+    LinearWeights result{
+        .weight = ResolveF32(store, speech_weights,
+                             std::string(prefix) + ".weight", weight_shape),
+        .bias = nullptr,
+        .input_columns = input_columns,
+        .output_columns = output_columns,
+    };
+    if (bias) {
+      const std::array<std::uint64_t, 1> bias_shape{
+          static_cast<std::uint64_t>(output_columns)};
+      result.bias = ResolveF32(store, speech_weights,
+                               std::string(prefix) + ".bias", bias_shape);
+    }
+    return result;
+  }
+
+  ConvWeights LoadConv(std::string_view prefix, std::size_t input_channels,
+                       std::size_t output_channels, std::size_t kernel,
+                       std::size_t dilation = 1, bool depthwise = false) {
+    const TensorStore& store = *model.store;
+    const std::array<std::uint64_t, 3> weight_shape{
+        static_cast<std::uint64_t>(output_channels),
+        static_cast<std::uint64_t>(depthwise ? 1 : input_channels),
+        static_cast<std::uint64_t>(kernel)};
+    const std::array<std::uint64_t, 1> bias_shape{
+        static_cast<std::uint64_t>(output_channels)};
+    return {
+        .weight = ResolveF32(store, speech_weights,
+                             std::string(prefix) + ".weight", weight_shape),
+        .bias = ResolveF32(store, speech_weights, std::string(prefix) + ".bias",
+                           bias_shape),
+        .input_channels = input_channels,
+        .output_channels = output_channels,
+        .kernel = kernel,
+        .dilation = dilation,
+        .stride = 1,
+        .depthwise = depthwise,
+        .transpose = false,
+    };
+  }
+
+  ConvWeights LoadTransposeConv(std::string_view prefix,
+                                std::size_t input_channels,
+                                std::size_t output_channels, std::size_t kernel,
+                                std::size_t stride) {
+    const TensorStore& store = *model.store;
+    const std::array<std::uint64_t, 3> weight_shape{
+        static_cast<std::uint64_t>(input_channels),
+        static_cast<std::uint64_t>(output_channels),
+        static_cast<std::uint64_t>(kernel)};
+    const std::array<std::uint64_t, 1> bias_shape{
+        static_cast<std::uint64_t>(output_channels)};
+    ConvWeights result{
+        .weight = nullptr,
+        .bias = ResolveF32(store, speech_weights, std::string(prefix) + ".bias",
+                           bias_shape),
+        .input_channels = input_channels,
+        .output_channels = output_channels,
+        .kernel = kernel,
+        .dilation = 1,
+        .stride = stride,
+        .depthwise = false,
+        .transpose = true,
+    };
+    const float* source = ResolveF32(
+        store, speech_weights, std::string(prefix) + ".weight", weight_shape);
+    result.transformed_weight.Reset(input_channels * output_channels * kernel);
+    LaunchTransposeConvWeight(source, result.transformed_weight.get(),
+                              input_channels, output_channels, kernel, stream);
+    result.weight = result.transformed_weight.get();
+    return result;
+  }
+
+  const float* LoadVector(std::string_view name, std::size_t size) {
+    const std::array<std::uint64_t, 1> shape{static_cast<std::uint64_t>(size)};
+    return ResolveF32(*model.store, speech_weights, name, shape);
+  }
+
+  void LoadWeights() {
+    const auto& config = model.config.speech_tokenizer;
+    if (config.num_quantizers != kCodeGroups ||
+        config.codebook_dim != 2 * kCodebookDimension ||
+        config.upsample_rates != std::vector<std::uint32_t>({8, 5, 4, 3}) ||
+        config.upsampling_ratios != std::vector<std::uint32_t>({2, 2})) {
+      throw std::runtime_error(
+          "unsupported Qwen3-TTS speech decoder configuration");
+    }
+    const TensorStore& store = *model.store;
+    const auto load_codebook = [&](const std::string& prefix) {
+      const std::array<std::uint64_t, 2> embedding_shape{config.codebook_size,
+                                                         kCodebookDimension};
+      const std::array<std::uint64_t, 1> usage_shape{config.codebook_size};
+      return CodebookWeights{
+          .embedding_sum = ResolveF32(
+              store, speech_weights, prefix + "embedding_sum", embedding_shape),
+          .cluster_usage = ResolveF32(store, speech_weights,
+                                      prefix + "cluster_usage", usage_shape),
+      };
+    };
+    semantic_codebook =
+        load_codebook("decoder.quantizer.rvq_first.vq.layers.0._codebook.");
+    acoustic_codebooks.reserve(kCodeGroups - 1);
+    for (std::size_t group = 0; group + 1 < kCodeGroups; ++group) {
+      acoustic_codebooks.push_back(
+          load_codebook("decoder.quantizer.rvq_rest.vq.layers." +
+                        std::to_string(group) + "._codebook."));
+    }
+    semantic_projection =
+        LoadConvProjection("decoder.quantizer.rvq_first.output_proj");
+    acoustic_projection =
+        LoadConvProjection("decoder.quantizer.rvq_rest.output_proj");
+    pre_conv = LoadConv("decoder.pre_conv.conv", 512, 1024, 3);
+
+    transformer_input =
+        LoadLinear("decoder.pre_transformer.input_proj", 1024, 512);
+    transformer_layers.reserve(config.num_hidden_layers);
+    for (std::size_t layer = 0; layer < config.num_hidden_layers; ++layer) {
+      const std::string prefix =
+          "decoder.pre_transformer.layers." + std::to_string(layer);
+      transformer_layers.push_back({
+          .input_norm = LoadVector(prefix + ".input_layernorm.weight", 512),
+          .post_norm =
+              LoadVector(prefix + ".post_attention_layernorm.weight", 512),
+          .attention_scale =
+              LoadVector(prefix + ".self_attn_layer_scale.scale", 512),
+          .mlp_scale = LoadVector(prefix + ".mlp_layer_scale.scale", 512),
+          .query = LoadLinear(prefix + ".self_attn.q_proj", 512, 1024, false),
+          .key = LoadLinear(prefix + ".self_attn.k_proj", 512, 1024, false),
+          .value = LoadLinear(prefix + ".self_attn.v_proj", 512, 1024, false),
+          .attention_output =
+              LoadLinear(prefix + ".self_attn.o_proj", 1024, 512, false),
+          .gate = LoadLinear(prefix + ".mlp.gate_proj", 512, 1024, false),
+          .up = LoadLinear(prefix + ".mlp.up_proj", 512, 1024, false),
+          .down = LoadLinear(prefix + ".mlp.down_proj", 1024, 512, false),
+      });
+    }
+    transformer_norm = LoadVector("decoder.pre_transformer.norm.weight", 512);
+    transformer_output =
+        LoadLinear("decoder.pre_transformer.output_proj", 512, 1024);
+
+    upsample_stages.reserve(2);
+    for (std::size_t stage = 0; stage < 2; ++stage) {
+      const std::string prefix = "decoder.upsample." + std::to_string(stage);
+      UpsampleStageWeights weights;
+      weights.upsample =
+          LoadTransposeConv(prefix + ".0.conv", 1024, 1024, 2, 2);
+      weights.convnext.depthwise =
+          LoadConv(prefix + ".1.dwconv.conv", 1024, 1024, 7, 1, true);
+      weights.convnext.norm_weight =
+          LoadVector(prefix + ".1.norm.weight", 1024);
+      weights.convnext.norm_bias = LoadVector(prefix + ".1.norm.bias", 1024);
+      weights.convnext.pointwise1 =
+          LoadLinear(prefix + ".1.pwconv1", 1024, 4096);
+      weights.convnext.pointwise2 =
+          LoadLinear(prefix + ".1.pwconv2", 4096, 1024);
+      weights.convnext.gamma = LoadVector(prefix + ".1.gamma", 1024);
+      upsample_stages.push_back(std::move(weights));
+    }
+
+    decoder_input = LoadConv("decoder.decoder.0.conv", 1024, 1536, 7);
+    const std::array<std::size_t, 4> rates{8, 5, 4, 3};
+    std::size_t input_channels = 1536;
+    for (std::size_t block = 0; block < rates.size(); ++block) {
+      const std::size_t output_channels = input_channels / 2;
+      const std::string prefix =
+          "decoder.decoder." + std::to_string(block + 1) + ".block";
+      DecoderBlockWeights weights;
+      weights.alpha = LoadVector(prefix + ".0.alpha", input_channels);
+      weights.beta = LoadVector(prefix + ".0.beta", input_channels);
+      weights.upsample =
+          LoadTransposeConv(prefix + ".1.conv", input_channels, output_channels,
+                            rates[block] * 2, rates[block]);
+      const std::array<std::size_t, 3> dilations{1, 3, 9};
+      for (std::size_t unit = 0; unit < weights.residuals.size(); ++unit) {
+        const std::string unit_prefix = prefix + "." + std::to_string(unit + 2);
+        auto& residual = weights.residuals[unit];
+        residual.alpha1 =
+            LoadVector(unit_prefix + ".act1.alpha", output_channels);
+        residual.beta1 =
+            LoadVector(unit_prefix + ".act1.beta", output_channels);
+        residual.conv1 = LoadConv(unit_prefix + ".conv1.conv", output_channels,
+                                  output_channels, 7, dilations[unit]);
+        residual.alpha2 =
+            LoadVector(unit_prefix + ".act2.alpha", output_channels);
+        residual.beta2 =
+            LoadVector(unit_prefix + ".act2.beta", output_channels);
+        residual.conv2 = LoadConv(unit_prefix + ".conv2.conv", output_channels,
+                                  output_channels, 1);
+      }
+      decoder_blocks.push_back(std::move(weights));
+      input_channels = output_channels;
+    }
+    output_alpha = LoadVector("decoder.decoder.5.alpha", 96);
+    output_beta = LoadVector("decoder.decoder.5.beta", 96);
+    output_conv = LoadConv("decoder.decoder.6.conv", 96, 1, 7);
+  }
+
+  LinearWeights LoadConvProjection(std::string_view prefix) {
+    const std::array<std::uint64_t, 3> shape{512, 256, 1};
+    return {
+        .weight = ResolveF32(*model.store, speech_weights,
+                             std::string(prefix) + ".weight", shape),
+        .bias = nullptr,
+        .input_columns = 256,
+        .output_columns = 512,
+    };
+  }
+
+  void RunLinear(const LinearWeights& weights, const float* input,
+                 float* output, std::size_t rows) {
+    gemm.Run(weights.weight, input, output, rows, weights.output_columns,
+             weights.input_columns, stream);
+    if (weights.bias != nullptr) {
+      LaunchAddBias(output, weights.bias, rows, weights.output_columns, stream);
+    }
+  }
+
+  void RunConv(const ConvWeights& weights, const float* input, float* output,
+               std::size_t input_length, std::size_t output_length) {
+    if (weights.depthwise) {
+      if (input_length != output_length ||
+          weights.input_channels != weights.output_channels) {
+        throw std::length_error(
+            "invalid Qwen3-TTS depthwise convolution shape");
+      }
+      LaunchCausalDepthwiseConv1d(input, weights.weight, weights.bias, output,
+                                  input_length, weights.input_channels,
+                                  weights.kernel, weights.dilation, stream);
+      return;
+    }
+    if (weights.transpose) {
+      if (output_length != input_length * weights.stride) {
+        throw std::length_error(
+            "invalid Qwen3-TTS transposed convolution length");
+      }
+      const std::size_t expanded_columns =
+          weights.output_channels * weights.kernel;
+      gemm.Run(weights.weight, input, workspace.columns.get(), input_length,
+               expanded_columns, weights.input_channels, stream);
+      LaunchAssembleCausalConvTranspose1d(
+          workspace.columns.get(), weights.bias, output, input_length,
+          output_length, weights.output_channels, weights.kernel,
+          weights.stride, stream);
+      return;
+    }
+    if (input_length != output_length) {
+      throw std::length_error("invalid Qwen3-TTS causal convolution length");
+    }
+    const std::size_t reduction = weights.input_channels * weights.kernel;
+    LaunchCausalConv1dIm2Col(input, workspace.columns.get(), input_length,
+                             weights.input_channels, output_length,
+                             weights.kernel, weights.dilation, stream);
+    gemm.Run(weights.weight, workspace.columns.get(), output, output_length,
+             weights.output_channels, reduction, stream);
+    LaunchAddBias(output, weights.bias, output_length, weights.output_channels,
+                  stream);
+  }
+
+  void Capture(const float* device, std::size_t elements,
+               std::vector<float>* output) {
+    output->resize(elements);
+    RequireHip(hipMemcpyAsync(output->data(), device, elements * sizeof(float),
+                              hipMemcpyDeviceToHost, stream),
+               "copy Qwen3-TTS speech decoder trace");
+    RequireHip(hipStreamSynchronize(stream),
+               "synchronize Qwen3-TTS speech decoder trace");
+  }
+
+  std::vector<float> DecodeChunk(std::span<const std::uint32_t> codes,
+                                 std::size_t frames,
+                                 SpeechDecoderTrace* trace) {
+    workspace.Ensure(frames);
+    RequireHip(
+        hipMemcpyAsync(workspace.codes.get(), codes.data(), codes.size_bytes(),
+                       hipMemcpyHostToDevice, stream),
+        "copy Qwen3-TTS codec frames");
+
+    float* semantic = workspace.scratch[0].get();
+    float* acoustic = workspace.scratch[1].get();
+    LaunchDecodeCodebook(workspace.codes.get(), kCodeGroups, 0,
+                         semantic_codebook.embedding_sum,
+                         semantic_codebook.cluster_usage, semantic, frames,
+                         kCodebookDimension, true, stream);
+    for (std::size_t group = 1; group < kCodeGroups; ++group) {
+      const CodebookWeights& codebook = acoustic_codebooks[group - 1];
+      LaunchDecodeCodebook(workspace.codes.get(), kCodeGroups, group,
+                           codebook.embedding_sum, codebook.cluster_usage,
+                           acoustic, frames, kCodebookDimension, group == 1,
+                           stream);
+    }
+    float* semantic_projected = workspace.scratch[2].get();
+    float* acoustic_projected = workspace.scratch[3].get();
+    RunLinear(semantic_projection, semantic, semantic_projected, frames);
+    RunLinear(acoustic_projection, acoustic, acoustic_projected, frames);
+    float* hidden = workspace.scratch[0].get();
+    LaunchAdd(semantic_projected, acoustic_projected, hidden, frames * 512,
+              stream);
+    if (trace != nullptr) {
+      Capture(hidden, frames * 512, &trace->quantizer_output);
+    }
+
+    float* pre_conv_output = workspace.scratch[1].get();
+    RunConv(pre_conv, hidden, pre_conv_output, frames, frames);
+    if (trace != nullptr) {
+      Capture(pre_conv_output, frames * 1024, &trace->pre_conv_output);
+    }
+
+    hidden = workspace.scratch[0].get();
+    RunLinear(transformer_input, pre_conv_output, hidden, frames);
+    for (const TransformerLayerWeights& layer : transformer_layers) {
+      float* normalized = FindScratch(workspace, {hidden});
+      LaunchRmsNorm(hidden, layer.input_norm, normalized, frames, 512,
+                    model.config.speech_tokenizer.rms_norm_eps, stream);
+      float* query = FindScratch(workspace, {hidden, normalized});
+      float* key = FindScratch(workspace, {hidden, normalized, query});
+      float* value = FindScratch(workspace, {hidden, normalized, query, key});
+      RunLinear(layer.query, normalized, query, frames);
+      RunLinear(layer.key, normalized, key, frames);
+      RunLinear(layer.value, normalized, value, frames);
+      LaunchRope(query, key, frames,
+                 model.config.speech_tokenizer.num_attention_heads,
+                 model.config.speech_tokenizer.head_dim,
+                 model.config.speech_tokenizer.rope_theta, stream);
+      float* attention =
+          FindScratch(workspace, {hidden, normalized, query, key, value});
+      LaunchSlidingCausalAttention(
+          query, key, value, attention, frames,
+          model.config.speech_tokenizer.num_attention_heads,
+          model.config.speech_tokenizer.head_dim,
+          model.config.speech_tokenizer.sliding_window, stream);
+      RunLinear(layer.attention_output, attention, normalized, frames);
+      LaunchAddScaledChannels(hidden, normalized, layer.attention_scale, frames,
+                              512, stream);
+
+      LaunchRmsNorm(hidden, layer.post_norm, normalized, frames, 512,
+                    model.config.speech_tokenizer.rms_norm_eps, stream);
+      float* gate = query;
+      float* up = key;
+      float* activation = value;
+      RunLinear(layer.gate, normalized, gate, frames);
+      RunLinear(layer.up, normalized, up, frames);
+      LaunchSwiGlu(gate, up, activation, frames * 1024, stream);
+      RunLinear(layer.down, activation, normalized, frames);
+      LaunchAddScaledChannels(hidden, normalized, layer.mlp_scale, frames, 512,
+                              stream);
+    }
+    float* normalized = FindScratch(workspace, {hidden});
+    LaunchRmsNorm(hidden, transformer_norm, normalized, frames, 512,
+                  model.config.speech_tokenizer.rms_norm_eps, stream);
+    float* transformer = FindScratch(workspace, {hidden, normalized});
+    RunLinear(transformer_output, normalized, transformer, frames);
+    if (trace != nullptr) {
+      Capture(transformer, frames * 1024, &trace->transformer_output);
+      trace->upsample_outputs.clear();
+      trace->decoder_outputs.clear();
+    }
+
+    std::size_t length = frames;
+    hidden = transformer;
+    for (const UpsampleStageWeights& stage : upsample_stages) {
+      const std::size_t output_length = length * stage.upsample.stride;
+      float* upsampled = FindScratch(workspace, {hidden});
+      RunConv(stage.upsample, hidden, upsampled, length, output_length);
+      if (trace != nullptr) {
+        trace->upsample_outputs.emplace_back();
+        Capture(upsampled, output_length * 1024,
+                &trace->upsample_outputs.back());
+      }
+      float* depthwise = FindScratch(workspace, {hidden, upsampled});
+      RunConv(stage.convnext.depthwise, upsampled, depthwise, output_length,
+              output_length);
+      float* normed = FindScratch(workspace, {hidden, upsampled, depthwise});
+      LaunchLayerNorm(depthwise, stage.convnext.norm_weight,
+                      stage.convnext.norm_bias, normed, output_length, 1024,
+                      1.0e-6F, stream);
+      float* wide =
+          FindScratch(workspace, {hidden, upsampled, depthwise, normed});
+      RunLinear(stage.convnext.pointwise1, normed, wide, output_length);
+      LaunchGelu(wide, output_length * 4096, stream);
+      RunLinear(stage.convnext.pointwise2, wide, depthwise, output_length);
+      LaunchAddScaledChannels(upsampled, depthwise, stage.convnext.gamma,
+                              output_length, 1024, stream);
+      if (trace != nullptr) {
+        trace->upsample_outputs.emplace_back();
+        Capture(upsampled, output_length * 1024,
+                &trace->upsample_outputs.back());
+      }
+      hidden = upsampled;
+      length = output_length;
+    }
+
+    float* decoder_hidden = FindScratch(workspace, {hidden});
+    RunConv(decoder_input, hidden, decoder_hidden, length, length);
+    if (trace != nullptr) {
+      trace->decoder_outputs.emplace_back();
+      Capture(decoder_hidden, length * 1536, &trace->decoder_outputs.back());
+    }
+    hidden = decoder_hidden;
+    std::size_t channels = 1536;
+    for (const DecoderBlockWeights& block : decoder_blocks) {
+      float* activated = FindScratch(workspace, {hidden});
+      LaunchSnakeBeta(hidden, block.alpha, block.beta, activated, length,
+                      channels, stream);
+      const std::size_t output_length = length * block.upsample.stride;
+      float* upsampled = FindScratch(workspace, {hidden, activated});
+      RunConv(block.upsample, activated, upsampled, length, output_length);
+      channels /= 2;
+      for (const ResidualUnitWeights& residual : block.residuals) {
+        float* branch = FindScratch(workspace, {hidden, activated, upsampled});
+        LaunchSnakeBeta(upsampled, residual.alpha1, residual.beta1, branch,
+                        output_length, channels, stream);
+        float* work =
+            FindScratch(workspace, {hidden, activated, upsampled, branch});
+        RunConv(residual.conv1, branch, work, output_length, output_length);
+        LaunchSnakeBeta(work, residual.alpha2, residual.beta2, branch,
+                        output_length, channels, stream);
+        RunConv(residual.conv2, branch, work, output_length, output_length);
+        LaunchAdd(upsampled, work, upsampled, output_length * channels, stream);
+      }
+      hidden = upsampled;
+      length = output_length;
+      if (trace != nullptr) {
+        trace->decoder_outputs.emplace_back();
+        Capture(hidden, length * channels, &trace->decoder_outputs.back());
+      }
+    }
+
+    float* activated = FindScratch(workspace, {hidden});
+    LaunchSnakeBeta(hidden, output_alpha, output_beta, activated, length, 96,
+                    stream);
+    if (trace != nullptr) {
+      trace->decoder_outputs.emplace_back();
+      Capture(activated, length * 96, &trace->decoder_outputs.back());
+    }
+    float* waveform = FindScratch(workspace, {hidden, activated});
+    RunConv(output_conv, activated, waveform, length, length);
+    if (trace != nullptr) {
+      trace->decoder_outputs.emplace_back();
+      Capture(waveform, length, &trace->decoder_outputs.back());
+    }
+    LaunchClamp(waveform, length, -1.0F, 1.0F, stream);
+    std::vector<float> samples(length);
+    RequireHip(
+        hipMemcpyAsync(samples.data(), waveform, samples.size() * sizeof(float),
+                       hipMemcpyDeviceToHost, stream),
+        "copy Qwen3-TTS waveform");
+    RequireHip(hipStreamSynchronize(stream),
+               "synchronize Qwen3-TTS speech decoder");
+    RequireHip(hipGetLastError(), "Qwen3-TTS speech decoder");
+    return samples;
+  }
+
+  LoadResult model;
+  DeviceRegion speech_weights;
+  hipStream_t stream{nullptr};
+  F32Gemm gemm;
+  Workspace workspace;
+
+  CodebookWeights semantic_codebook;
+  std::vector<CodebookWeights> acoustic_codebooks;
+  LinearWeights semantic_projection;
+  LinearWeights acoustic_projection;
+  ConvWeights pre_conv;
+  LinearWeights transformer_input;
+  std::vector<TransformerLayerWeights> transformer_layers;
+  const float* transformer_norm{nullptr};
+  LinearWeights transformer_output;
+  std::vector<UpsampleStageWeights> upsample_stages;
+  ConvWeights decoder_input;
+  std::vector<DecoderBlockWeights> decoder_blocks;
+  const float* output_alpha{nullptr};
+  const float* output_beta{nullptr};
+  ConvWeights output_conv;
+};
+
+SpeechDecoderHipRuntime::SpeechDecoderHipRuntime(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+SpeechDecoderHipRuntime::~SpeechDecoderHipRuntime() = default;
+
+std::unique_ptr<SpeechDecoderHipRuntime> SpeechDecoderHipRuntime::Create(
+    const std::string& model_root, std::string* error) {
+  try {
+    LoadResult loaded = LoadModelDirectory(model_root);
+    if (!loaded.ok) {
+      SetError(error, loaded.error);
+      return nullptr;
+    }
+    return std::unique_ptr<SpeechDecoderHipRuntime>(
+        new SpeechDecoderHipRuntime(std::make_unique<Impl>(std::move(loaded))));
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return nullptr;
+  }
+}
+
+bool SpeechDecoderHipRuntime::Decode(std::span<const std::uint32_t> codes,
+                                     std::size_t frames,
+                                     SpeechDecoderOutput* output,
+                                     SpeechDecoderTrace* trace,
+                                     std::string* error) {
+  if (output == nullptr) {
+    SetError(error, "Qwen3-TTS speech decoder output is null");
+    return false;
+  }
+  if (frames == 0 ||
+      frames > std::numeric_limits<std::size_t>::max() / kCodeGroups ||
+      codes.size() != frames * kCodeGroups) {
+    SetError(error, "Qwen3-TTS speech decoder expects [frames,16] codes");
+    return false;
+  }
+  for (const std::uint32_t code : codes) {
+    if (code >= impl_->model.config.speech_tokenizer.codebook_size) {
+      SetError(error, "Qwen3-TTS speech decoder code is out of range");
+      return false;
+    }
+  }
+  if (trace != nullptr && frames > kChunkFrames) {
+    SetError(error,
+             "Qwen3-TTS speech decoder trace supports at most 300 frames");
+    return false;
+  }
+  try {
+    const auto begin = Clock::now();
+    output->samples.clear();
+    output->samples.reserve(frames * kSamplesPerCode);
+    for (std::size_t start = 0; start < frames; start += kChunkFrames) {
+      const std::size_t end = std::min(start + kChunkFrames, frames);
+      const std::size_t context = std::min(start, kLeftContextFrames);
+      const std::size_t chunk_start = start - context;
+      const std::size_t chunk_frames = end - chunk_start;
+      const auto chunk_codes =
+          codes.subspan(chunk_start * kCodeGroups, chunk_frames * kCodeGroups);
+      std::vector<float> decoded =
+          impl_->DecodeChunk(chunk_codes, chunk_frames, trace);
+      const std::size_t drop = context * kSamplesPerCode;
+      const std::size_t keep = (end - start) * kSamplesPerCode;
+      if (drop > decoded.size() || keep > decoded.size() - drop) {
+        throw std::runtime_error(
+            "Qwen3-TTS speech decoder chunk output is truncated");
+      }
+      output->samples.insert(
+          output->samples.end(),
+          decoded.begin() + static_cast<std::ptrdiff_t>(drop),
+          decoded.begin() + static_cast<std::ptrdiff_t>(drop + keep));
+    }
+    output->sample_rate =
+        impl_->model.config.speech_tokenizer.output_sample_rate;
+    output->code_frames = frames;
+    output->decode_milliseconds =
+        std::chrono::duration<double, std::milli>(Clock::now() - begin).count();
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+}  // namespace strix::models::qwen3_tts::hip
+
+#else
+
+namespace strix::models::qwen3_tts::hip {
+
+struct SpeechDecoderHipRuntime::Impl {};
+
+SpeechDecoderHipRuntime::SpeechDecoderHipRuntime(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+SpeechDecoderHipRuntime::~SpeechDecoderHipRuntime() = default;
+
+std::unique_ptr<SpeechDecoderHipRuntime> SpeechDecoderHipRuntime::Create(
+    const std::string&, std::string* error) {
+  if (error != nullptr) {
+    *error = "Qwen3-TTS speech decoder requires a HIP-enabled build";
+  }
+  return nullptr;
+}
+
+bool SpeechDecoderHipRuntime::Decode(std::span<const std::uint32_t>,
+                                     std::size_t, SpeechDecoderOutput*,
+                                     SpeechDecoderTrace*, std::string* error) {
+  if (error != nullptr) {
+    *error = "Qwen3-TTS speech decoder requires a HIP-enabled build";
+  }
+  return false;
+}
+
+}  // namespace strix::models::qwen3_tts::hip
+
+#endif

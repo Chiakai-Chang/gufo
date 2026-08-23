@@ -87,6 +87,9 @@ if (ENGINE_ENABLE_HIP)
   add_subdirectory(src/models/deepseek_v4_flash)
 endif()
 
+# Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
+add_subdirectory(src/models/qwen3_tts)
+
 # XRT NPU shim — AMD XDNA2 userspace runtime over the amdxdna kernel driver.
 option(ENGINE_ENABLE_XRT "Build strix with the XRT NPU shim" OFF)
 
@@ -243,6 +246,7 @@ target_compile_definitions(strix_core PRIVATE
   STRIX_FFMPEG_EXECUTABLE="${STRIX_FFMPEG_EXECUTABLE}"
   STRIX_FFPROBE_EXECUTABLE="${STRIX_FFPROBE_EXECUTABLE}")
 target_link_libraries(strix_core PUBLIC ICU::uc Threads::Threads)
+target_link_libraries(strix_qwen3_tts PUBLIC strix_core)
 
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
@@ -310,6 +314,8 @@ add_executable(strix-server
   src/server/main.cpp
   src/server/bench_cli.cpp
   src/server/prompt_cli.cpp
+  src/server/audio_tts_api.cpp
+  src/server/tts_service.cpp
   src/server/video_api.cpp
   src/server/video_jobs.cpp
   src/server/video_cli.cpp
@@ -319,11 +325,14 @@ add_executable(strix-server
 target_link_libraries(strix-server PRIVATE strix_diagnostics strix_core)
 target_compile_definitions(strix-server PRIVATE
   STRIX_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
-  STRIX_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/strix/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
+  STRIX_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/strix/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+  STRIX_QWEN3_TTS_REFERENCE_RUNNER="${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen3_tts/reference/run_official.py"
+  STRIX_QWEN3_TTS_INSTALLED_REFERENCE_RUNNER="${CMAKE_INSTALL_PREFIX}/share/strix/models/qwen3_tts/run_official.py")
 
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(strix-server PRIVATE strix_deepseek_v4_flash)
 endif()
+target_link_libraries(strix-server PRIVATE strix_qwen3_tts)
 add_library(strix_kernel_bench_support STATIC
   src/bench/kernel_bench.cpp
 )
@@ -354,6 +363,9 @@ install(TARGETS strix strix-server DESTINATION bin)
 install(FILES
   src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json
   DESTINATION share/strix/models/minimax_h3)
+install(FILES
+  src/models/qwen3_tts/reference/run_official.py
+  DESTINATION share/strix/models/qwen3_tts)
 if (ENGINE_ENABLE_HIP)
   install(TARGETS strix-kernel-bench tune_hipblaslt benchmark_ssm_replay
     DESTINATION bin)
@@ -548,6 +560,48 @@ if (BUILD_TESTING)
   set_tests_properties(minimax_h3_runtime_test PROPERTIES
     LABELS "cpu;models;minimax-h3;safetensors;residency;failure-injection")
 
+  add_executable(qwen3_tts_loader_test
+    tests/models/qwen3_tts/loader_test.cpp)
+  target_link_libraries(qwen3_tts_loader_test PRIVATE strix_qwen3_tts)
+  add_test(NAME qwen3_tts_loader_test COMMAND qwen3_tts_loader_test)
+  set_tests_properties(qwen3_tts_loader_test PROPERTIES
+    LABELS "cpu;models;qwen3-tts;loader;safetensors"
+    SKIP_RETURN_CODE 77)
+
+  add_executable(qwen3_tts_audio_api_test
+    tests/models/qwen3_tts/audio_api_test.cpp
+    src/server/audio_tts_api.cpp
+    src/server/tts_service.cpp)
+  target_link_libraries(qwen3_tts_audio_api_test PRIVATE strix_qwen3_tts)
+  add_test(NAME qwen3_tts_audio_api_test COMMAND qwen3_tts_audio_api_test)
+  set_tests_properties(qwen3_tts_audio_api_test PROPERTIES
+    LABELS "cpu;models;qwen3-tts;server;api;audio;quality")
+
+  add_executable(qwen3_tts_config_test
+    tests/models/qwen3_tts/config_test.cpp)
+  target_link_libraries(qwen3_tts_config_test PRIVATE strix_qwen3_tts)
+  add_test(NAME qwen3_tts_config_test COMMAND qwen3_tts_config_test)
+
+  add_executable(qwen3_tts_tokenizer_test
+    tests/models/qwen3_tts/tokenizer_test.cpp)
+  target_link_libraries(qwen3_tts_tokenizer_test PRIVATE strix_qwen3_tts)
+  add_test(NAME qwen3_tts_tokenizer_test COMMAND qwen3_tts_tokenizer_test)
+  set_tests_properties(qwen3_tts_tokenizer_test PROPERTIES
+    SKIP_RETURN_CODE 77)
+  set_tests_properties(qwen3_tts_config_test PROPERTIES
+    LABELS "cpu;models;qwen3-tts;config;quality")
+
+  add_test(NAME qwen3_tts_reference_artifacts_test
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/qwen3_tts/reference/verify_artifacts.py
+      --contract
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/qwen3_tts/reference_contract.json
+      --artifacts
+      ${CMAKE_CURRENT_SOURCE_DIR}/artifacts/qwen3_tts)
+  set_tests_properties(qwen3_tts_reference_artifacts_test PROPERTIES
+    LABELS "cpu;models;qwen3-tts;reference;quality;exact"
+    SKIP_RETURN_CODE 77)
+
   add_executable(minimax_h3_tokenizer_test
     tests/models/minimax_h3_tokenizer_test.cpp)
   target_link_libraries(minimax_h3_tokenizer_test PRIVATE strix_core)
@@ -673,6 +727,26 @@ if (BUILD_TESTING)
     LABELS "cpu;hipblaslt;cache")
 
   if (ENGINE_ENABLE_HIP)
+    add_executable(qwen3_tts_speech_decoder_hip_test
+      tests/models/qwen3_tts/speech_decoder_hip_test.cpp)
+    target_link_libraries(qwen3_tts_speech_decoder_hip_test PRIVATE
+      strix_qwen3_tts hip::host)
+    add_test(NAME qwen3_tts_speech_decoder_hip_test
+      COMMAND qwen3_tts_speech_decoder_hip_test)
+    set_tests_properties(qwen3_tts_speech_decoder_hip_test PROPERTIES
+      LABELS "hip;gpu;gfx1151;models;qwen3-tts;speech-decoder;audio;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(qwen3_tts_talker_hip_prefill_test
+      tests/models/qwen3_tts/talker_hip_prefill_test.cpp)
+    target_link_libraries(qwen3_tts_talker_hip_prefill_test PRIVATE
+      strix_qwen3_tts hip::host)
+    add_test(NAME qwen3_tts_talker_hip_prefill_test
+      COMMAND qwen3_tts_talker_hip_prefill_test)
+    set_tests_properties(qwen3_tts_talker_hip_prefill_test PROPERTIES
+      LABELS "hip;gpu;gfx1151;models;qwen3-tts;talker;prefill;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
     add_executable(minimax_h3_runtime_hip_test
       tests/models/minimax_h3_runtime_hip_test.cpp)
     target_link_libraries(minimax_h3_runtime_hip_test PRIVATE

@@ -105,6 +105,7 @@
               (pythonTools system)
               pkgs.${system}.clang-tools
               pkgs.${system}.ffmpeg-headless
+              pkgs.${system}.sox
               pkgs.${system}.rocmPackages.rocprofiler-sdk
               pkgs.${system}.sqlite
             ];
@@ -125,6 +126,10 @@
               STRIX_AIE_SMOKE_ROOT = "${strixPackages.${system}.aie-smoke}";
               XRT_PATH = "${strixPackages.${system}.xrt}/opt/xilinx/xrt";
               TORCH_HOME = "${alexnetTorchHome system}";
+              LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
+                pkgs.${system}.stdenv.cc.cc.lib
+                pkgs.${system}.zlib
+              ];
             };
           };
 
