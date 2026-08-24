@@ -12,8 +12,8 @@
 #include <memory>
 #include <optional>
 #include <ranges>
-#include <sstream>
 #include <span>
+#include <sstream>
 #include <string>
 #include <tuple>
 #include <type_traits>
@@ -91,9 +91,8 @@ struct HipblasLtPlan {
   return result_count - 1;
 }
 
-[[nodiscard]] bool IsUsable(
-    const hipblasLtMatmulHeuristicResult_t& result,
-    std::size_t workspace_capacity) noexcept {
+[[nodiscard]] bool IsUsable(const hipblasLtMatmulHeuristicResult_t& result,
+                            std::size_t workspace_capacity) noexcept {
   return result.state == HIPBLAS_STATUS_SUCCESS &&
          result.workspaceSize <= workspace_capacity;
 }
@@ -147,8 +146,7 @@ struct HipblasLtPlan {
               << "|asic=" << properties.asicRevision;
   return {
       .hardware_fingerprint = fingerprint.str(),
-      .hip_runtime_version =
-          static_cast<std::uint32_t>(hip_runtime_version),
+      .hip_runtime_version = static_cast<std::uint32_t>(hip_runtime_version),
       .hipblaslt_version = static_cast<std::uint32_t>(hipblaslt_version),
   };
 }
@@ -170,8 +168,8 @@ struct HipblasLtPlan {
 
 [[nodiscard]] bool RestorePersistedAlgorithm(
     hipblasLtHandle_t handle, HipblasLtPlan& plan,
-    const detail::HipblasLtPlanRecord& record,
-    std::size_t workspace_capacity, bool* solution_library_ready) {
+    const detail::HipblasLtPlanRecord& record, std::size_t workspace_capacity,
+    bool* solution_library_ready) {
   static_assert(std::is_trivially_copyable_v<hipblasLtMatmulAlgo_t>);
   if (record.algorithm_blob.size() != sizeof(hipblasLtMatmulAlgo_t)) {
     plan.persistent_cache_status = "invalid_descriptor";
@@ -237,7 +235,6 @@ struct HipblasLtPlan {
 [[nodiscard]] bool SelectHeuristicAlgorithm(hipblasLtHandle_t handle,
                                             HipblasLtPlan& plan,
                                             std::size_t workspace_capacity) {
-
   hipblasLtMatmulPreference_t preference = nullptr;
   if (hipblasLtMatmulPreferenceCreate(&preference) != HIPBLAS_STATUS_SUCCESS) {
     return false;
@@ -264,9 +261,8 @@ struct HipblasLtPlan {
 
   const auto result_span =
       std::span(results.data(), static_cast<std::size_t>(result_count));
-  const auto preferred_rank =
-      SelectHipblasLtHeuristicRank(plan.batch_size, plan.m, plan.k,
-                                   result_span.size());
+  const auto preferred_rank = SelectHipblasLtHeuristicRank(
+      plan.batch_size, plan.m, plan.k, result_span.size());
   if (preferred_rank < result_span.size() &&
       IsUsable(result_span[preferred_rank], workspace_capacity)) {
     plan.algorithm = result_span[preferred_rank].algo;
@@ -274,10 +270,9 @@ struct HipblasLtPlan {
     return true;
   }
 
-  const auto fallback =
-      std::ranges::find_if(result_span, [&](const auto& result) {
-        return IsUsable(result, workspace_capacity);
-      });
+  const auto fallback = std::ranges::find_if(
+      result_span,
+      [&](const auto& result) { return IsUsable(result, workspace_capacity); });
   if (fallback == result_span.end()) {
     return false;
   }
@@ -300,16 +295,13 @@ struct HipblasLtPlan {
 
   if (database != nullptr) {
     const auto* record = detail::FindHipblasLtPlanRecord(
-        *database, batch_size, m, k,
-        detail::HipblasLtPlanDataType::kBfloat16);
+        *database, batch_size, m, k, detail::HipblasLtPlanDataType::kBfloat16);
     if (record != nullptr &&
-        RestorePersistedAlgorithm(handle, *plan, *record,
-                                  workspace_capacity,
+        RestorePersistedAlgorithm(handle, *plan, *record, workspace_capacity,
                                   solution_library_ready)) {
-      plan->resolution_us =
-          std::chrono::duration<double, std::micro>(
-              std::chrono::steady_clock::now() - start)
-              .count();
+      plan->resolution_us = std::chrono::duration<double, std::micro>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
       return plan;
     }
     if (record == nullptr) {
@@ -325,10 +317,9 @@ struct HipblasLtPlan {
       hipblaslt_ext::getSolutionNameFromAlgo(handle, plan->algorithm);
   plan->kernel_name =
       hipblaslt_ext::getKernelNameFromAlgo(handle, plan->algorithm);
-  plan->resolution_us =
-      std::chrono::duration<double, std::micro>(
-          std::chrono::steady_clock::now() - start)
-          .count();
+  plan->resolution_us = std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
   return plan;
 }
 
@@ -369,14 +360,12 @@ struct HipblasLtGemm::Impl {
       auto loaded =
           detail::LoadHipblasLtPlanDatabase(database_path, database_key);
       database_status = DatabaseLoadStatusName(loaded.status);
-      if (loaded.status ==
-          detail::HipblasLtPlanDatabaseLoadStatus::kLoaded) {
+      if (loaded.status == detail::HipblasLtPlanDatabaseLoadStatus::kLoaded) {
         database = std::move(loaded.database);
         database_loaded = true;
         for (const auto& record : database.records) {
-          requested_workspace =
-              std::max<std::size_t>(requested_workspace,
-                                    record.workspace_bytes);
+          requested_workspace = std::max<std::size_t>(requested_workspace,
+                                                      record.workspace_bytes);
         }
       }
     }
@@ -462,8 +451,7 @@ bool HipblasLtGemm::RunBf16(const void* a_bf16, const void* x_bf16, float* y,
           .solution_name = lookup.plan->solution_name,
           .kernel_name = lookup.plan->kernel_name,
           .plan_source = lookup.plan->source,
-          .persistent_cache_status =
-              lookup.plan->persistent_cache_status,
+          .persistent_cache_status = lookup.plan->persistent_cache_status,
           .workspace_bytes = lookup.plan->workspace_bytes,
           .plan_resolution_us = lookup.plan->resolution_us,
           .plan_cache_hit = lookup.cache_hit,
@@ -478,11 +466,12 @@ bool HipblasLtGemm::RunBf16(const void* a_bf16, const void* x_bf16, float* y,
   return true;
 }
 
-bool HipblasLtGemm::TuneBf16(
-    const void* a_bf16, const void* x_bf16, float* y,
-    std::size_t batch_size, std::size_t m, std::size_t k,
-    const HipblasLtTuningOptions& options, HipblasLtTuningResult* result,
-    hipStream_t stream) {
+bool HipblasLtGemm::TuneBf16(const void* a_bf16, const void* x_bf16, float* y,
+                             std::size_t batch_size, std::size_t m,
+                             std::size_t k,
+                             const HipblasLtTuningOptions& options,
+                             HipblasLtTuningResult* result,
+                             hipStream_t stream) {
   if (impl_ == nullptr || impl_->handle == nullptr || a_bf16 == nullptr ||
       x_bf16 == nullptr || y == nullptr || batch_size == 0 || m == 0 ||
       k == 0 || options.repetitions == 0 || options.max_algorithms == 0) {
@@ -495,10 +484,9 @@ bool HipblasLtGemm::TuneBf16(
   }
   std::vector<hipblasLtMatmulHeuristicResult_t> algorithms;
   if (hipblaslt_ext::getAllAlgos(
-          impl_->handle, hipblaslt_ext::GemmType::HIPBLASLT_GEMM,
-          HIPBLAS_OP_T, HIPBLAS_OP_N, HIP_R_16BF, HIP_R_16BF, HIP_R_32F,
-          HIP_R_32F, HIPBLAS_COMPUTE_32F,
-          algorithms) != HIPBLAS_STATUS_SUCCESS) {
+          impl_->handle, hipblaslt_ext::GemmType::HIPBLASLT_GEMM, HIPBLAS_OP_T,
+          HIPBLAS_OP_N, HIP_R_16BF, HIP_R_16BF, HIP_R_32F, HIP_R_32F,
+          HIPBLAS_COMPUTE_32F, algorithms) != HIPBLAS_STATUS_SUCCESS) {
     return false;
   }
   impl_->solution_library_ready = true;
@@ -519,11 +507,11 @@ bool HipblasLtGemm::TuneBf16(
       [&](hipblasLtMatmulAlgo_t& algorithm,
           std::size_t workspace_bytes) -> std::optional<double> {
     if (hipEventRecord(start_event, stream) != hipSuccess ||
-        hipblasLtMatmul(
-            impl_->handle, plan->operation, &alpha, a_bf16, plan->a_layout,
-            x_bf16, plan->x_layout, &beta, y, plan->y_layout, y,
-            plan->y_layout, &algorithm, impl_->workspace, workspace_bytes,
-            stream) != HIPBLAS_STATUS_SUCCESS ||
+        hipblasLtMatmul(impl_->handle, plan->operation, &alpha, a_bf16,
+                        plan->a_layout, x_bf16, plan->x_layout, &beta, y,
+                        plan->y_layout, y, plan->y_layout, &algorithm,
+                        impl_->workspace, workspace_bytes,
+                        stream) != HIPBLAS_STATUS_SUCCESS ||
         hipEventRecord(stop_event, stream) != hipSuccess ||
         hipEventSynchronize(stop_event) != hipSuccess) {
       return std::nullopt;
@@ -536,14 +524,13 @@ bool HipblasLtGemm::TuneBf16(
     return static_cast<double>(elapsed_ms) * 1000.0;
   };
   const auto warm_up = [&](hipblasLtMatmulAlgo_t& algorithm,
-                           std::size_t workspace_bytes,
-                           std::uint32_t warmups) {
+                           std::size_t workspace_bytes, std::uint32_t warmups) {
     for (std::uint32_t warmup = 0; warmup < warmups; ++warmup) {
-      if (hipblasLtMatmul(
-              impl_->handle, plan->operation, &alpha, a_bf16, plan->a_layout,
-              x_bf16, plan->x_layout, &beta, y, plan->y_layout, y,
-              plan->y_layout, &algorithm, impl_->workspace, workspace_bytes,
-              stream) != HIPBLAS_STATUS_SUCCESS) {
+      if (hipblasLtMatmul(impl_->handle, plan->operation, &alpha, a_bf16,
+                          plan->a_layout, x_bf16, plan->x_layout, &beta, y,
+                          plan->y_layout, y, plan->y_layout, &algorithm,
+                          impl_->workspace, workspace_bytes,
+                          stream) != HIPBLAS_STATUS_SUCCESS) {
         return false;
       }
     }
@@ -561,8 +548,7 @@ bool HipblasLtGemm::TuneBf16(
     }
     std::vector<double> samples;
     samples.reserve(repetitions);
-    for (std::uint32_t repetition = 0; repetition < repetitions;
-         ++repetition) {
+    for (std::uint32_t repetition = 0; repetition < repetitions; ++repetition) {
       const auto sample = measure_once(algorithm, workspace_bytes);
       if (!sample.has_value()) {
         return std::nullopt;
@@ -628,8 +614,8 @@ bool HipblasLtGemm::TuneBf16(
           std::max<std::uint32_t>(options.repetitions, 7);
       bool verified =
           warm_up(best_algorithm, best_workspace_bytes, options.warmup) &&
-          warm_up(heuristic_plan->algorithm,
-                  heuristic_plan->workspace_bytes, options.warmup);
+          warm_up(heuristic_plan->algorithm, heuristic_plan->workspace_bytes,
+                  options.warmup);
       std::vector<double> best_samples;
       std::vector<double> heuristic_samples;
       best_samples.reserve(verification_repetitions);
@@ -637,16 +623,14 @@ bool HipblasLtGemm::TuneBf16(
       for (std::uint32_t repetition = 0;
            verified && repetition < verification_repetitions; ++repetition) {
         const bool best_first = (repetition % 2) == 0;
-        const auto first = best_first
-                               ? measure_once(best_algorithm,
-                                              best_workspace_bytes)
-                               : measure_once(heuristic_plan->algorithm,
-                                              heuristic_plan->workspace_bytes);
-        const auto second = best_first
-                                ? measure_once(heuristic_plan->algorithm,
-                                               heuristic_plan->workspace_bytes)
-                                : measure_once(best_algorithm,
-                                               best_workspace_bytes);
+        const auto first =
+            best_first ? measure_once(best_algorithm, best_workspace_bytes)
+                       : measure_once(heuristic_plan->algorithm,
+                                      heuristic_plan->workspace_bytes);
+        const auto second =
+            best_first ? measure_once(heuristic_plan->algorithm,
+                                      heuristic_plan->workspace_bytes)
+                       : measure_once(best_algorithm, best_workspace_bytes);
         verified = first.has_value() && second.has_value();
         if (verified) {
           best_samples.push_back(best_first ? *first : *second);
@@ -660,8 +644,8 @@ bool HipblasLtGemm::TuneBf16(
             best_median_us < heuristic_median_us * kTuningPromotionRatio;
       } else {
         const auto fallback_median =
-            measure(heuristic_plan->algorithm,
-                    heuristic_plan->workspace_bytes, options.repetitions);
+            measure(heuristic_plan->algorithm, heuristic_plan->workspace_bytes,
+                    options.repetitions);
         if (fallback_median.has_value()) {
           heuristic_median_us = *fallback_median;
         }
@@ -706,18 +690,16 @@ bool HipblasLtGemm::TuneBf16(
 
   if (result != nullptr) {
     *result = {
-        .algorithm_id =
-            hipblaslt_ext::getIndexFromAlgo(installed->algorithm),
+        .algorithm_id = hipblaslt_ext::getIndexFromAlgo(installed->algorithm),
         .heuristic_algorithm_id = heuristic_algorithm_id,
         .solution_name = installed->solution_name,
         .kernel_name = installed->kernel_name,
         .workspace_bytes = installed->workspace_bytes,
         .median_us = best_median_us,
         .heuristic_median_us = heuristic_median_us,
-        .verified_speedup =
-            heuristic_median_us > 0.0
-                ? heuristic_median_us / best_median_us
-                : 1.0,
+        .verified_speedup = heuristic_median_us > 0.0
+                                ? heuristic_median_us / best_median_us
+                                : 1.0,
         .supported_algorithms = supported_algorithms,
         .measured_algorithms = measured_algorithms,
         .retained_tuned_algorithm = retained_tuned_algorithm,
@@ -741,8 +723,7 @@ bool HipblasLtGemm::SavePlans(const std::string& path,
   };
   database.records.reserve(impl_->plans.size());
   for (const auto& plan : impl_->plans) {
-    const int algorithm_id =
-        hipblaslt_ext::getIndexFromAlgo(plan->algorithm);
+    const int algorithm_id = hipblaslt_ext::getIndexFromAlgo(plan->algorithm);
     if (algorithm_id < 0) {
       continue;
     }
@@ -752,11 +733,10 @@ bool HipblasLtGemm::SavePlans(const std::string& path,
         .k = plan->k,
         .data_type = detail::HipblasLtPlanDataType::kBfloat16,
         .algorithm_id = algorithm_id,
-        .algorithm_blob =
-            std::vector<std::uint8_t>(
-                reinterpret_cast<const std::uint8_t*>(&plan->algorithm),
-                reinterpret_cast<const std::uint8_t*>(&plan->algorithm) +
-                    sizeof(plan->algorithm)),
+        .algorithm_blob = std::vector<std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(&plan->algorithm),
+            reinterpret_cast<const std::uint8_t*>(&plan->algorithm) +
+                sizeof(plan->algorithm)),
         .workspace_bytes = plan->workspace_bytes,
         .median_nanoseconds = plan->median_nanoseconds,
         .solution_name = plan->solution_name,
@@ -769,7 +749,6 @@ bool HipblasLtGemm::SavePlans(const std::string& path,
   });
   return detail::SaveHipblasLtPlanDatabase(path, database, error);
 }
-
 
 }  // namespace strix::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -1,5 +1,6 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
+
 #include <cmath>
 #include <cstddef>
 #include <cstdint>

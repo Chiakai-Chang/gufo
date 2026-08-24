@@ -13,7 +13,8 @@
 namespace strix::hip {
 
 __global__ void EmbeddingLookupKernel(const void* __restrict__ table,
-                                      core::GgmlType type, std::uint32_t token_id,
+                                      core::GgmlType type,
+                                      std::uint32_t token_id,
                                       float* __restrict__ out_hidden,
                                       std::size_t hidden_size) {
   const std::size_t idx = blockIdx.x * blockDim.x + threadIdx.x;

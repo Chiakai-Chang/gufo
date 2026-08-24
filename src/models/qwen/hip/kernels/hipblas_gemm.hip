@@ -62,6 +62,5 @@ void LaunchHipblasGEMMBF16(hipblasHandle_t handle, const void* A_bf16,
       HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
 }
 
-
 }  // namespace strix::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

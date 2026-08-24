@@ -13,8 +13,8 @@
 #include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace strix::hip {
@@ -47,7 +47,6 @@ __global__ void SyncTiledAttentionKvPrefixKernel(
   v_cache_f16[f16_cache_offset] = __float2half_rn(v_cache[f32_cache_offset]);
 }
 
-
 constexpr std::uint32_t kTileAttentionHeadDim = detail::kTiledAttentionHeadDim;
 constexpr std::uint32_t kTileAttentionQueryHeads =
     detail::kTiledAttentionQueryHeads;
@@ -69,7 +68,6 @@ constexpr std::uint32_t kTileAttentionKeyRowStride =
 static_assert((kTileAttentionKeyRowStride % 2) == 1,
               "Wave32 key rows require an odd stride across 32 LDS banks");
 
-
 __device__ __forceinline__ float TileWaveReduceMax(float value) {
 #pragma unroll
   for (int offset = 16; offset > 0; offset /= 2) {
@@ -77,7 +75,6 @@ __device__ __forceinline__ float TileWaveReduceMax(float value) {
   }
   return __shfl(value, 0);
 }
-
 
 __device__ __forceinline__ float TileWaveReduceSum(float value) {
 #pragma unroll
@@ -87,14 +84,12 @@ __device__ __forceinline__ float TileWaveReduceSum(float value) {
   return __shfl(value, 0);
 }
 
-
 __device__ __forceinline__ void TileHalf2Dot(float& accumulator, __half2 lhs,
                                              __half2 rhs) {
   asm volatile("v_dot2_f32_f16 %0, %1, %2, %0"
                : "+v"(accumulator)
                : "v"(lhs), "v"(rhs));
 }
-
 
 __global__ void PackTiledAttentionKvKernel(
     const float* __restrict__ k, const float* __restrict__ v,
@@ -132,7 +127,6 @@ __global__ void PackTiledAttentionKvKernel(
   k_cache[f32_cache_offset] = key;
   v_cache[f32_cache_offset] = value;
 }
-
 
 __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
@@ -384,7 +378,6 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
   }
 }
 
-
 bool LaunchBatchedAttentionTile(
     const float* q, const float* k, const float* v, const float* gate,
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
@@ -440,7 +433,6 @@ bool LaunchBatchedAttentionTile(
       q, gate, layer_k, layer_v, out_context, start_pos, batch_size);
   return true;
 }
-
 
 }  // namespace strix::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

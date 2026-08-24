@@ -38,8 +38,7 @@ __global__ void BatchedEmbeddingLookupKernel(
     out_row[tid] = table_f32[row_off + tid];
   } else {
     const auto* q8 = static_cast<const Q8_0Block*>(table);
-    const Q8_0Block& wblk =
-        q8[row_off / kQ8_0BlockSize + tid / kQ8_0BlockSize];
+    const Q8_0Block& wblk = q8[row_off / kQ8_0BlockSize + tid / kQ8_0BlockSize];
     out_row[tid] = __half2float(wblk.d) *
                    static_cast<float>(wblk.qs[tid % kQ8_0BlockSize]);
   }

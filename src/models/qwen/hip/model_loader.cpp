@@ -5,6 +5,7 @@
 
 #include "src/models/qwen/hip/detail/weight_regions.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen/hip/ops/gemm.hpp"
 
 namespace strix::hip {
 namespace detail {
@@ -250,6 +251,56 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     }
     return nullptr;
   }
+
+  const auto pre_dequantize = [&](models::QwenTensorRef& tensor) {
+    if (tensor.empty()) {
+      return true;
+    }
+    if (tensor.type == core::GgmlType::kQ6_K ||
+        tensor.type == core::GgmlType::kQ5_K ||
+        tensor.type == core::GgmlType::kQ8_K) {
+      void* d_bf16 = nullptr;
+      const std::size_t n_bytes = tensor.num_elements * sizeof(hip_bfloat16);
+      if (hipMalloc(&d_bf16, n_bytes) != hipSuccess) {
+        return false;
+      }
+      LaunchDequantizeToBf16(tensor.type, tensor.data,
+                             static_cast<hip_bfloat16*>(d_bf16),
+                             tensor.num_elements, nullptr);
+      weight_regions.push_back({
+          .host_data = nullptr,
+          .device_data = d_bf16,
+          .size = n_bytes,
+          .owns_device_memory = true,
+          .host_registered = false,
+      });
+      tensor.data = d_bf16;
+      tensor.type = core::GgmlType::kBF16;
+      tensor.available_bytes = n_bytes;
+    }
+    return true;
+  };
+
+  bool dequant_ok = pre_dequantize(weights_opt->output);
+  for (auto& layer : weights_opt->layers) {
+    dequant_ok =
+        dequant_ok && pre_dequantize(layer.attn_q) &&
+        pre_dequantize(layer.attn_k) && pre_dequantize(layer.attn_v) &&
+        pre_dequantize(layer.attn_output) && pre_dequantize(layer.attn_qkv) &&
+        pre_dequantize(layer.attn_gate) && pre_dequantize(layer.ssm_out) &&
+        pre_dequantize(layer.ssm_alpha) && pre_dequantize(layer.ssm_beta) &&
+        pre_dequantize(layer.ffn_gate) && pre_dequantize(layer.ffn_up) &&
+        pre_dequantize(layer.ffn_down);
+  }
+  if (!dequant_ok) {
+    ReleaseWeightRegions(weight_regions);
+    if (error_msg != nullptr) {
+      *error_msg =
+          "Failed to pre-dequantize non-Q8_0 weight tensors to GPU BF16";
+    }
+    return nullptr;
+  }
+  (void)hipDeviceSynchronize();
 
   std::shared_ptr<const tokenization::QwenTokenizer> shared_tokenizer(
       std::move(tokenizer));

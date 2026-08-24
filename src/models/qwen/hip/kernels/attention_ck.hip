@@ -13,8 +13,8 @@
 #include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace strix::hip {
@@ -50,7 +50,6 @@ using CkGqaOperation =
         false, 1, 1, CkSequence<1, 128, 1, 2>, 8,
         ck::tensor_operation::device::MaskingSpecialization::
             MaskOutUpperTriangle>;
-
 
 __global__ void PackCkAttentionInputsKernel(
     const float* __restrict__ q, const float* __restrict__ k,
@@ -113,7 +112,6 @@ __global__ void ApplyCkAttentionGateKernel(const float* __restrict__ gate,
   const float gate_value = gate[index];
   output[index] *= 1.0F / (1.0F + expf(-gate_value));
 }
-
 
 bool LaunchBatchedAttentionCk(const float* q, const float* k, const float* v,
                               const float* gate, float* k_cache, float* v_cache,
@@ -184,7 +182,6 @@ bool LaunchBatchedAttentionCk(const float* q, const float* k, const float* v,
   }
   return true;
 }
-
 
 }  // namespace strix::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

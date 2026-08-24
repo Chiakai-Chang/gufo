@@ -351,8 +351,8 @@ void ExecuteDenseGemv(models::qwen::QwenGemmRoute route, const void* A,
   constexpr std::uint32_t kWavesPerBlock = 4;
   constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
   if (route == models::qwen::QwenGemmRoute::kHipBf16Wave32Single) {
-    detail::EmitGemvDispatch(
-        M, K, true, models::qwen::QwenGemmRouteName(route));
+    detail::EmitGemvDispatch(M, K, true,
+                             models::qwen::QwenGemmRouteName(route));
     const auto* A_bf16 = static_cast<const hip_bfloat16*>(A);
     const std::size_t grid = (M + kWavesPerBlock - 1) / kWavesPerBlock;
     Wave32GEMVKernel_1Row<kWavesPerBlock>
@@ -377,11 +377,7 @@ void LaunchGEMV(const void* A, core::GgmlType a_type, const float* x, float* y,
                 std::size_t M, std::size_t K, hipStream_t stream,
                 models::qwen::QwenGemmMode mode) {
   const auto resolution = models::qwen::ResolveQwenGemmRoute(
-      {.type = a_type,
-       .batch_size = 1,
-       .m = M,
-       .k = K,
-       .mode = mode});
+      {.type = a_type, .batch_size = 1, .m = M, .k = K, .mode = mode});
   switch (resolution.route) {
     case models::qwen::QwenGemmRoute::kHipQuantDirect:
       LaunchQ8KBlockGEMV(A, a_type, x, y, M, K, stream);

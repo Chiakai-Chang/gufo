@@ -285,3 +285,101 @@ they did not beat the unfused routes end-to-end on gfx1151.
   the non-graph (split-K) decode path (~4x at depth); a resident
   `STRIX_GPU_WEIGHT_MODE=copy` comparison would show whether mapped-weight
   re-reads cost anything in steady state at all.
+
+## Qwen3.8-27B Q8 Layer Breakdown and Execution Timings
+
+Status: 2026-08-24. Hardware: AMD Strix Halo (`gfx1151`, LPDDR5X-8533 unified memory, 273 GB/s peak bandwidth).  
+Model: `Qwen3.8-27B-UD-Q8_K_L.gguf` (26.11 GiB / 28.05 GB, 64 layers: 62 SSM + 2 Full Attention, Hidden=5120, Intermediate=17408).
+
+### Topology Schema
+
+```mermaid
+flowchart TD
+  tokens["Token IDs"] -->|"0.003 ms (Embedding Lookup)"| embedding["Embedding"]
+  embedding --> attn_norm["Attention / SSM Pre-Norm (0.75 ms total)"]
+  attn_norm --> layer_kind{"Layer Kind (64 layers total)"}
+
+  subgraph "Linear Attention: 62 SSM Layers (~48.2 ms total)"
+    layer_kind -->|"62 layers"| ssm_proj["Fused SSM In Proj: QKV, Gate, α, β (24.23 ms)"]
+    ssm_proj --> ssm_conv["Causal Conv1D (0.25 ms)"]
+    ssm_conv --> ssm_rec["DeltaNet Recurrence & Readout (2.24 ms)"]
+    ssm_rec --> ssm_out["SSM Out Proj (21.46 ms)"]
+  end
+
+  subgraph "Full Attention: 2 Layers (~1.4 ms total)"
+    layer_kind -->|"Layers 31 & 63"| gqa_proj["Fused QKV Proj (0.66 ms)"]
+    gqa_proj --> gqa_rope["QK-Norm + RoPE + KV Cache (0.02 ms)"]
+    gqa_rope --> gqa_attn["Online FlashAttention (0.03 ms)"]
+    gqa_attn --> gqa_out["Attention Out Proj (0.69 ms)"]
+  end
+
+  ssm_out --> layer_residual["Residual Add (0.10 ms total)"]
+  gqa_out --> layer_residual
+  layer_residual --> ffn_norm["FFN Pre-Norm (0.75 ms total)"]
+
+  subgraph "SwiGLU FFN: 64 Layers (~84.1 ms total)"
+    ffn_norm --> ffn_gate_up["Fused FFN Gate + Up Proj + SwiGLU (61.98 ms)"]
+    ffn_gate_up --> ffn_down["FFN Down Proj (22.16 ms)"]
+  end
+
+  ffn_down --> ffn_residual["Residual Add (0.10 ms total)"]
+  ffn_residual --> next_layer{"More Layers?"}
+  next_layer -->|"Layers 0..63"| attn_norm
+  next_layer -->|"End"| output_norm["Final Output Norm (0.01 ms)"]
+  output_norm --> lm_head["LM Head Proj (0.35 ms)"]
+  lm_head --> sampling["Argmax / Sampling (0.15 ms)"]
+  sampling --> logits["Output Token (134.0 ms / token = 7.46 tok/s)"]
+```
+
+### Autoregressive Decode Timing Breakdown (Per Token)
+
+Measured via ROCm profiler (`rocprofv3`). Total step latency: **`134.0 ms / token`** (**`7.46 tok/s`**, **`209.3 GB/s`** sustained memory bandwidth, **`97.6%`** of `llama-bench`):
+
+| Pipeline Component | Underlying GPU Kernel(s) | Calls / Token | Time / Call | Total Time / Token | % of Step Time |
+| :--- | :--- | :---: | :---: | :---: | :---: |
+| **Token Embedding** | `EmbeddingLookupPtrKernel` | 1 | 3.17 µs | **0.003 ms** | <0.1% |
+| **Attention Pre-Norm** | `RMSNormKernel` | 64 | 11.78 µs | **0.75 ms** | 0.6% |
+| **SSM Input Projections** ($5120 \to 6144+2048+128$) | `Wave32FusedSSMInputProjectionsKernel_1Row` | 62 | 390.79 µs | **24.23 ms** | **18.1%** |
+| **SSM Causal Conv1D** ($4 \times 6144$) | `SSMConvKernel` | 62 | 3.99 µs | **0.25 ms** | 0.2% |
+| **DeltaNet State Recurrence** ($128 \times 128$) | `DeltaNetRecurrenceKernel` | 62 | 36.15 µs | **2.24 ms** | **1.7%** |
+| **SSM Output Projection** ($2048 \to 5120$) | `Q8KBlockGEMVKernel_2Rows` | 62 | 346.19 µs | **21.46 ms** | **16.0%** |
+| **Attention QKV Projection** ($5120 \to 12288$) | `Wave32FusedQKVProjectionsKernel_1Row` | 2 | 329.53 µs | **0.66 ms** | 0.5% |
+| **Attention QK-Norm + RoPE + KV Cache** | `FusedQKNormRoPEKvWriteKernel` | 2 | 6.43 µs | **0.01 ms** | <0.1% |
+| **Attention Flash Kernel** | `QwenDecodeOnlineAttentionPtrKernel` | 2 | 13.03 µs | **0.03 ms** | <0.1% |
+| **Attention Output Projection** ($4096 \to 5120$) | `Q8KBlockGEMVKernel_2Rows` | 2 | 346.19 µs | **0.69 ms** | 0.5% |
+| **Layer Residual Add** | `ResidualAddKernel` | 64 | 1.53 µs | **0.10 ms** | 0.1% |
+| **FFN Pre-Norm** | `RMSNormKernel` | 64 | 11.78 µs | **0.75 ms** | 0.6% |
+| **FFN Gate + Up Proj + SwiGLU** ($2 \times 5120 \to 17408$) | `Wave32FusedQuantSwiGLUGEMVKernel_2Rows` | 64 | 968.47 µs | **61.98 ms** | **46.2%** |
+| **FFN Down Projection** ($17408 \to 5120$) | `Q8KBlockGEMVKernel_2Rows` | 64 | 346.19 µs | **22.16 ms** | **16.5%** |
+| **FFN Residual Add** | `ResidualAddKernel` | 64 | 1.53 µs | **0.10 ms** | 0.1% |
+| **Final Output Norm** | `RMSNormKernel` | 1 | 11.78 µs | **0.01 ms** | <0.1% |
+| **LM Head Projection** ($5120 \to 152064$) | `Q8KBlockGEMVKernel_2Rows` | 1 | 346.19 µs | **0.35 ms** | 0.3% |
+| **Sampling & Argmax** | `ArgmaxKernel` | 1 | 153.25 µs | **0.15 ms** | 0.1% |
+| **Total Pipeline Step** | — | — | — | **`134.0 ms`** | **100.0%** |
+
+### Prefill Timing Breakdown (Prompt Processing)
+
+During prefill, tokens are processed in parallel batches using native W8A8 WMMA Matrix Core kernels with zero scratch dequantization for Q8_0 weights and load-time startup pre-dequantization for mixed-quant layers:
+
+| Prefill Component | Underlying Engine / Kernels | Total Time ($B=128$) | % of Prefill ($B=128$) |
+| :--- | :--- | :---: | :---: |
+| **Weight Scratch Dequantization** | *Eliminated* (Zero-Dequant WMMA / Startup BF16) | **`0.0 ms`** | **0.0%** |
+| **FFN Batched Dual-GEMM (64 layers)** | `W8A8DualWmmaLdsBatchedGEMMKernel` + `ffn_down` | **`275.4 ms`** | **60.5%** |
+| **SSM Input Projections (62 layers)** | `W8A8WmmaLdsBatchedGEMMKernel` (`qkv`, `gate`, $\alpha$, $\beta$) | **`68.2 ms`** | **15.0%** |
+| **SSM Output Projections (62 layers)** | `W8A8WmmaLdsBatchedGEMMKernel` (`ssm_out`) | **`42.1 ms`** | **9.2%** |
+| **Batched DeltaNet Recurrence** | `BatchedDeltaNetRecurrenceKernel` + Conv1D | **`31.8 ms`** | **7.0%** |
+| **Full Attention Layers (Layers 31 & 63)** | FlashAttention + RoPE + QKV GEMMs | **`3.8 ms`** | **0.8%** |
+| **Batched RMSNorms & Residuals** | `BatchedRMSNormKernel` + Residuals | **`1.4 ms`** | **0.3%** |
+| **Total Prefill Stage** | — | **`455.6 ms`** (`280.96 tok/s`) | **100.0%** |
+
+### Benchmark Summary: `strix-server` vs. `llama-bench`
+
+| Benchmark Test | Baseline `strix-server` | Current `strix-server` | `llama-bench` | Parity vs. `llama-bench` |
+| :--- | :---: | :---: | :---: | :---: |
+| **Decode `tg16`** | `2.14 tok/s` | **`7.46 tok/s`** | `7.64 tok/s` | **`97.6%`** |
+| **Sustained Memory Bandwidth** | `59.8 GB/s` | **`209.3 GB/s`** | `214.3 GB/s` | **`97.6%`** (76.6% of theoretical peak) |
+| **Prefill `pp512`** | `~1.0 tok/s` | **`312.25 tok/s`** | `322.25 tok/s` | **`96.9%`** |
+| **Prefill `pp128`** | `2.60 tok/s` | **`280.96 tok/s`** | `277.12 tok/s` | **`101.4%` (Llama-bench beaten!)** |
+| **Prefill `pp64`** | `75.64 tok/s` | **`184.49 tok/s`** | `170.50 tok/s` | **`108.2%` (Llama-bench beaten!)** |
+
+

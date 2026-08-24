@@ -13,8 +13,8 @@
 #include "ck/tensor_operation/gpu/device/tensor_specialization.hpp"
 #include "ck/tensor_operation/gpu/element/element_wise_operation.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
-#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
 namespace strix::hip {
@@ -62,7 +62,6 @@ __global__ void WriteBatchedKVCacheKernel(
     }
   }
 }
-
 
 __global__ void BatchedAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
@@ -200,7 +199,6 @@ __global__ void BatchedAttentionKernel(
   }
 }
 
-
 void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             const float* gate, float* k_cache, float* v_cache,
                             void* k_cache_f16, void* v_cache_f16,
@@ -225,7 +223,6 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
       q, gate, k_cache, v_cache, out_context, layer_idx, start_pos, batch_size,
       max_context, num_heads, num_kv_heads, head_dim);
 }
-
 
 __global__ void CausalSoftmaxKernel(float* __restrict__ scores,
                                     std::uint32_t start_pos,
@@ -282,7 +279,6 @@ __global__ void CausalSoftmaxKernel(float* __restrict__ scores,
   }
 }
 
-
 __global__ void ApplyAttentionGateKernel(const float* __restrict__ gate,
                                          float* __restrict__ out,
                                          std::size_t num_elements) {
@@ -293,7 +289,6 @@ __global__ void ApplyAttentionGateKernel(const float* __restrict__ gate,
   const float value = gate[index];
   out[index] *= 1.0F / (1.0F + expf(-value));
 }
-
 
 void LaunchBatchedAttentionGemm(
     hipblasHandle_t handle, const float* q, const float* k, const float* v,
@@ -410,7 +405,6 @@ void LaunchBatchedAttentionGemm(
         gate, out_context, num_elements);
   }
 }
-
 
 }  // namespace strix::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

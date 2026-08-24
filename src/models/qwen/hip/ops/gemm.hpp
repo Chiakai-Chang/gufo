@@ -146,6 +146,40 @@ void LaunchBatchedQuantGEMM(core::GgmlType type, const void* w,
                             std::size_t m, std::size_t k,
                             hipStream_t stream = nullptr);
 
+/// Quantizes BF16 activation tensor X[B, K] to block_q8_1 activation blocks
+void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
+                                  std::size_t batch, std::size_t k,
+                                  hipStream_t stream = nullptr);
+
+/// Quantizes FP32 activation tensor X[B, K] to block_q8_1 activation blocks
+void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
+                                          std::size_t batch, std::size_t k,
+                                          hipStream_t stream = nullptr);
+
+/// Fuses SwiGLU activation (SiLU(gate) * up) with Q8_1 quantization into one
+/// kernel
+void LaunchBatchedFusedSwiGLUQuantizeQ8_1(const float* gate, const float* up,
+                                          void* q8_1_out, std::size_t batch,
+                                          std::size_t k,
+                                          hipStream_t stream = nullptr);
+
+/// Directly computes Y[B, M] = X_q8_1[B, K] * W_q8_0[M, K]^T using LDS-staged
+/// Matrix Core (WMMA) operations with pre-quantized activation blocks.
+void LaunchBatchedQuantGEMMPreQuantized(core::GgmlType type, const void* w,
+                                        const void* q8_1_x, float* y,
+                                        std::size_t batch, std::size_t m,
+                                        std::size_t k,
+                                        hipStream_t stream = nullptr);
+
+/// Directly computes dual GEMM:
+///   Y_gate[B, M] = X_q8_1[B, K] * W_gate[M, K]^T
+///   Y_up[B, M]   = X_q8_1[B, K] * W_up[M, K]^T
+/// in a single fused kernel pass sharing activation memory reads and registers.
+void LaunchBatchedDualQuantGEMMPreQuantized(
+    core::GgmlType type, const void* w_gate, const void* w_up,
+    const void* q8_1_x, float* y_gate, float* y_up, std::size_t batch,
+    std::size_t m, std::size_t k, hipStream_t stream = nullptr);
+
 /// Batched GEMM: Y[B, M] = X[B, K] * A[M, K]^T
 void LaunchBatchedGEMM(const void* A, bool is_bf16, const float* X, float* Y,
                        std::size_t batch_size, std::size_t M, std::size_t K,

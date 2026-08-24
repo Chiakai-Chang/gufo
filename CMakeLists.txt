@@ -324,6 +324,15 @@ if (ENGINE_ENABLE_HIP)
 
   add_executable(benchmark_ssm_replay tools/benchmark_ssm_replay.cpp)
   target_link_libraries(benchmark_ssm_replay PRIVATE strix_core hip::host)
+
+  option(STRIX_BUILD_DIAG_TOOLS "Build standalone diagnostic tools" OFF)
+  if(STRIX_BUILD_DIAG_TOOLS)
+    add_executable(gguf_dump_types tools/gguf_dump_types.cpp)
+    target_link_libraries(gguf_dump_types PRIVATE strix_core)
+
+    add_executable(wmma_layout_test tools/wmma_layout_test.hip)
+    target_link_libraries(wmma_layout_test PRIVATE strix_core hip::device)
+  endif()
 endif()
 
 install(TARGETS strix strix-server DESTINATION bin)

@@ -9,10 +9,12 @@
 
 namespace strix::hip {
 
-__global__ void BatchedSSMConvKernel(
-    const float* __restrict__ qkv_in, const float* __restrict__ conv_weights,
-    float* __restrict__ conv_state, float* __restrict__ conv_out,
-    std::size_t batch_size, std::size_t qkv_dim);
+__global__ void BatchedSSMConvKernel(const float* __restrict__ qkv_in,
+                                     const float* __restrict__ conv_weights,
+                                     float* __restrict__ conv_state,
+                                     float* __restrict__ conv_out,
+                                     std::size_t batch_size,
+                                     std::size_t qkv_dim);
 
 // opt-c010-ssm-gate-residual: batched DeltaNet recurrence with the per-head
 // post-RMSNorm + SiLU gate folded into the token epilogue. Replaces the
@@ -220,8 +222,7 @@ __global__ void BatchedDeltaNetRecurrenceNormGateKernel(
       for (std::size_t warp = 0; warp < 8; ++warp) {
         total_o_sq += s_warp_rms[warp];
       }
-      s_inv_rms =
-          rsqrtf((total_o_sq / static_cast<float>(val_dim)) + 1e-6F);
+      s_inv_rms = rsqrtf((total_o_sq / static_cast<float>(val_dim)) + 1e-6F);
     }
     __syncthreads();
 
@@ -301,8 +302,6 @@ __global__ void BatchedSSMPostNormGateKernel(
     o_h[tid] = val;
   }
 }
-
-
 
 // opt-c010-ssm-gate-residual: batched SSM Conv1D + DeltaNet recurrence with
 // the per-head post-RMSNorm + SiLU gate folded into the recurrence epilogue.

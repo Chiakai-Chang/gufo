@@ -195,6 +195,7 @@ public:
   float* d_split_k_attention{nullptr};
   hip_bfloat16* d_weights_bf16{nullptr};
   hip_bfloat16* d_weights_bf16_aux{nullptr};
+  void* d_scratch_q8_act{nullptr};
 
   [[nodiscard]] std::uint32_t GetMaxBatch() const noexcept {
     return max_batch_;

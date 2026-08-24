@@ -62,7 +62,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
   // runtime fallback to hipBLAS, not as resolver state.
   const auto gemm_weight = [&](const models::QwenTensorRef& w,
                                const void* bf16_input, const float* fp32_input,
-                               float* output, std::size_t m, std::size_t k) {
+                               float* output, std::size_t m, std::size_t k,
+                               const void* q8_act = nullptr) {
     const auto resolution = models::qwen::ResolveQwenGemmRoute(
         {.type = w.type,
          .batch_size = batch_size,
@@ -92,7 +93,18 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         return;
       case models::qwen::QwenGemmRoute::kHipPrefillQuantDirect: {
         const auto tg0 = std::chrono::high_resolution_clock::now();
-        if (batch_size > 1) {
+        // Route Q8_0 weights through the native W8A8 WMMA matrix-core kernel
+        // (zero scratch dequantization). Other quant types (Q6_K / Q5_K) and
+        // batch==1 decode path keep their proven routes.
+        if (w.type == core::GgmlType::kQ8_0) {
+          if (q8_act != nullptr) {
+            LaunchBatchedQuantGEMMPreQuantized(w.type, w.data, q8_act, output,
+                                               batch_size, m, k, arena_.stream);
+          } else {
+            LaunchBatchedQuantGEMM(w.type, w.data, bf16_input, output,
+                                   batch_size, m, k, arena_.stream);
+          }
+        } else if (batch_size > 1) {
           const auto td0 = std::chrono::high_resolution_clock::now();
           LaunchDequantizeToBf16(w.type, w.data, arena_.d_weights_bf16, m * k,
                                  arena_.stream);
@@ -159,12 +171,16 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     }
 
     if (layer.is_full_attention) {
+      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                   arena_.d_scratch_q8_act, batch_size,
+                                   hidden_size, arena_.stream);
       gemm_weight(layer.attn_q, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_ssm_qkv, q_projection_size, hidden_size);
+                  arena_.d_ssm_qkv, q_projection_size, hidden_size,
+                  arena_.d_scratch_q8_act);
       gemm_weight(layer.attn_k, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_k, kv_size, hidden_size);
+                  arena_.d_k, kv_size, hidden_size, arena_.d_scratch_q8_act);
       gemm_weight(layer.attn_v, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_v, kv_size, hidden_size);
+                  arena_.d_v, kv_size, hidden_size, arena_.d_scratch_q8_act);
 
       LaunchBatchedUnpackQG(arena_.d_ssm_qkv, arena_.d_q, arena_.d_ssm_gate,
                             batch_size, config.num_attention_heads,
@@ -291,8 +307,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
 
       LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
                             batch_size * attention_size, arena_.stream);
+      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                   arena_.d_scratch_q8_act, batch_size,
+                                   attention_size, arena_.stream);
       gemm_weight(layer.attn_output, arena_.d_scratch_bf16, arena_.d_ssm_out,
-                  arena_.d_attn_out, hidden_size, attention_size);
+                  arena_.d_attn_out, hidden_size, attention_size,
+                  arena_.d_scratch_q8_act);
       if (do_profile) {
         HIP_CHECK(hipStreamSynchronize(arena_.stream));
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -301,14 +321,21 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         t0 = t1;
       }
     } else {
+      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                   arena_.d_scratch_q8_act, batch_size,
+                                   hidden_size, arena_.stream);
       gemm_weight(layer.attn_qkv, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_ssm_qkv, ssm_qkv_size, hidden_size);
+                  arena_.d_ssm_qkv, ssm_qkv_size, hidden_size,
+                  arena_.d_scratch_q8_act);
       gemm_weight(layer.attn_gate, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_ssm_gate, ssm_inner_size, hidden_size);
+                  arena_.d_ssm_gate, ssm_inner_size, hidden_size,
+                  arena_.d_scratch_q8_act);
       gemm_weight(layer.ssm_alpha, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_alpha_buf, time_step_rank, hidden_size);
+                  arena_.d_alpha_buf, time_step_rank, hidden_size,
+                  arena_.d_scratch_q8_act);
       gemm_weight(layer.ssm_beta, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_beta_buf, time_step_rank, hidden_size);
+                  arena_.d_beta_buf, time_step_rank, hidden_size,
+                  arena_.d_scratch_q8_act);
       if (do_profile) {
         HIP_CHECK(hipStreamSynchronize(arena_.stream));
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -355,8 +382,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
 
       LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
                             batch_size * ssm_inner_size, arena_.stream);
+      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                   arena_.d_scratch_q8_act, batch_size,
+                                   ssm_inner_size, arena_.stream);
       gemm_weight(layer.ssm_out, arena_.d_scratch_bf16, arena_.d_ssm_out,
-                  arena_.d_attn_out, hidden_size, ssm_inner_size);
+                  arena_.d_attn_out, hidden_size, ssm_inner_size,
+                  arena_.d_scratch_q8_act);
       if (do_profile) {
         HIP_CHECK(hipStreamSynchronize(arena_.stream));
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -399,19 +430,36 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           arena_.d_ffn_act, arena_.d_scratch_bf16, batch_size,
           intermediate_size, hidden_size, arena_.stream);
     } else {
-      gemm_weight(layer.ffn_gate, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_ffn_gate, intermediate_size, hidden_size);
+      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                   arena_.d_scratch_q8_act, batch_size,
+                                   hidden_size, arena_.stream);
+      if (layer.ffn_gate.type == core::GgmlType::kQ8_0 &&
+          layer.ffn_up.type == core::GgmlType::kQ8_0) {
+        LaunchBatchedDualQuantGEMMPreQuantized(
+            layer.ffn_gate.type, layer.ffn_gate.data, layer.ffn_up.data,
+            arena_.d_scratch_q8_act, arena_.d_ffn_gate, arena_.d_ffn_up,
+            batch_size, intermediate_size, hidden_size, arena_.stream);
+      } else {
+        gemm_weight(layer.ffn_gate, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_ffn_gate, intermediate_size, hidden_size,
+                    arena_.d_scratch_q8_act);
 
-      gemm_weight(layer.ffn_up, arena_.d_scratch_bf16, arena_.d_normed,
-                  arena_.d_ffn_up, intermediate_size, hidden_size);
+        gemm_weight(layer.ffn_up, arena_.d_scratch_bf16, arena_.d_normed,
+                    arena_.d_ffn_up, intermediate_size, hidden_size,
+                    arena_.d_scratch_q8_act);
+      }
 
       LaunchBatchedSwiGLUActivation(
           arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act,
           arena_.d_scratch_bf16, batch_size * intermediate_size, arena_.stream);
+      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                   arena_.d_scratch_q8_act, batch_size,
+                                   intermediate_size, arena_.stream);
     }
 
     gemm_weight(layer.ffn_down, arena_.d_scratch_bf16, arena_.d_ffn_act,
-                arena_.d_ffn_out, hidden_size, intermediate_size);
+                arena_.d_ffn_out, hidden_size, intermediate_size,
+                arena_.d_scratch_q8_act);
 
     LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_ffn_out, arena_.d_hidden,
                              batch_size, hidden_size, arena_.stream);

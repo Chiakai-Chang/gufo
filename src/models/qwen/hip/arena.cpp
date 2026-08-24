@@ -68,6 +68,10 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
                    ssm_qkv_size + ssm_inner_size + (2 * time_step_rank)});
   HIP_CHECK(
       hipMalloc(&d_scratch_bf16, scratch_elements * sizeof(hip_bfloat16)));
+  const std::size_t scratch_q8_bytes = ((scratch_elements + 31) / 32) *
+                                       sizeof(float) *
+                                       9;  // 36 bytes per 32 elems
+  HIP_CHECK(hipMalloc(&d_scratch_q8_act, scratch_q8_bytes));
   const std::size_t split_k_elements = detail::DecodeAttentionScratchElements(
       config_.num_attention_heads, config_.head_dim);
   HIP_CHECK(hipMalloc(&d_split_k_attention, split_k_elements * sizeof(float)));
@@ -206,8 +210,10 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   hipblas_handle = other.hipblas_handle;
   hipblaslt_gemm = std::move(other.hipblaslt_gemm);
   d_scratch_bf16 = other.d_scratch_bf16;
+  d_scratch_q8_act = other.d_scratch_q8_act;
   d_split_k_attention = other.d_split_k_attention;
   d_weights_bf16 = other.d_weights_bf16;
+  d_weights_bf16_aux = other.d_weights_bf16_aux;
   d_saved_ssm_conv_state_ = other.d_saved_ssm_conv_state_;
   d_saved_ssm_deltanet_state_ = other.d_saved_ssm_deltanet_state_;
   d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
@@ -247,8 +253,10 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.prefetch_event = nullptr;
   other.hipblas_handle = nullptr;
   other.d_scratch_bf16 = nullptr;
+  other.d_scratch_q8_act = nullptr;
   other.d_split_k_attention = nullptr;
   other.d_weights_bf16 = nullptr;
+  other.d_weights_bf16_aux = nullptr;
   other.d_saved_ssm_conv_state_ = nullptr;
   other.d_saved_ssm_deltanet_state_ = nullptr;
   other.d_ssm_replay_qkv_ = nullptr;
@@ -296,8 +304,10 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     hipblas_handle = other.hipblas_handle;
     hipblaslt_gemm = std::move(other.hipblaslt_gemm);
     d_scratch_bf16 = other.d_scratch_bf16;
+    d_scratch_q8_act = other.d_scratch_q8_act;
     d_split_k_attention = other.d_split_k_attention;
     d_weights_bf16 = other.d_weights_bf16;
+    d_weights_bf16_aux = other.d_weights_bf16_aux;
     d_saved_ssm_conv_state_ = other.d_saved_ssm_conv_state_;
     d_saved_ssm_deltanet_state_ = other.d_saved_ssm_deltanet_state_;
     d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
@@ -337,8 +347,10 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.prefetch_event = nullptr;
     other.hipblas_handle = nullptr;
     other.d_scratch_bf16 = nullptr;
+    other.d_scratch_q8_act = nullptr;
     other.d_split_k_attention = nullptr;
     other.d_weights_bf16 = nullptr;
+    other.d_weights_bf16_aux = nullptr;
     other.d_saved_ssm_conv_state_ = nullptr;
     other.d_saved_ssm_deltanet_state_ = nullptr;
     other.d_ssm_replay_qkv_ = nullptr;
@@ -431,6 +443,8 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_prompt_tokens));
   if (d_scratch_bf16 != nullptr)
     HIP_CHECK(hipFree(d_scratch_bf16));
+  if (d_scratch_q8_act != nullptr)
+    HIP_CHECK(hipFree(d_scratch_q8_act));
   if (d_split_k_attention != nullptr)
     HIP_CHECK(hipFree(d_split_k_attention));
   if (d_weights_bf16 != nullptr)
