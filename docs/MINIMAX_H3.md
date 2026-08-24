@@ -744,15 +744,43 @@ retried:
 - **Pre-transposed projection weights** so the GEMM reads `op(A) = none`.
   Slower on all four shapes, by up to 1.7x on the output projection.
 
-One anomaly is measured but not addressed. FC2, at 5,376 x 14,336, sustains
-about 18 TFLOPS where the other three projections reach 35-43, even though the
-output projection at the same `M` and half the `K` reaches 37. Splitting its
-`K` into two halves recovers 1.45x, which would be about 6% of the forward, but
-it changes the accumulation order and needs either a BF16 intermediate or an
-811 MiB F32 accumulator. Both conflict with the retained byte-equivalence
-policy and the 2% peak-memory ceiling, and a reduction-order change is what
-disqualified the earlier cached-softmax candidate. It is recorded as the
-largest remaining projection opportunity rather than taken.
+A second pass, run without the peak-memory constraint, closed off the remaining
+projection and attention avenues. All measured at 37,716 rows.
+
+**Attention is bounded by the register file, not by tuning.** Beyond the 72
+tile/warp/stage combinations, all 128 combinations of `kpack`,
+`matrix_instr_nonkdim` and `waves_per_eu` were compiled and timed at the
+retained tile and its three nearest neighbours. The spread is 0.1%: the
+retained configuration is 1281.8 ms against 1283.1 ms for the best alternative.
+The reason `BLOCK_M` cannot grow is arithmetic: a `BLOCK_M` x `HEAD_DIM` F32
+accumulator at 64 x 128 is 8,192 floats, which is 256 VGPRs per lane across a
+wave32 and already the whole register file. Every `BLOCK_M = 128` variant
+spills, which is why the query dimension cannot be widened to amortize the
+K/V re-reads. 31.8 TFLOPS is the ceiling for a head-dimension-128 FlashAttention
+on this part, not a tuning gap.
+
+**FC2 resisted seven approaches.** At 5,376 x 14,336 it sustains about 17
+TFLOPS where its siblings reach 36-43, and the output projection at the same `M`
+with half the `K` reaches 37:
+
+| Candidate | Result |
+| --- | --- |
+| N-split into 2/4/8/16 column chunks | Byte-identical and no faster (1.00x to 0.93x) |
+| K-split, BF16 accumulation | 1.45x, but rounds the partial sums to BF16 |
+| K-split, F32 accumulator via rocBLAS | 0.16x; there is no good BF16-in/F32-out kernel |
+| K-split, F32 accumulator via hipBLASLt | About 1.14x after the cast, not worth 811 MiB |
+| Transposed orientation, computing C^T | 1.00x, so operand orientation is not the cause |
+| hipBLASLt directly, 32 heuristic algorithms | 0.84x |
+| A purpose-built BF16 WMMA kernel | 0.75x at best across seven tilings |
+
+The N-split result is the informative one: chunking the token dimension is
+numerically free and provably byte-identical, and it changes nothing. So the
+shape is not suffering from working-set effects that blocking can fix. The
+custom WMMA kernel reached 12.9 TFLOPS against rocBLAS's 17.3 even before its
+fragment layout was correct, and rocBLAS reaches 42.7 on the sibling shapes, so
+closing that gap is specialist GEMM work rather than a tuning exercise. FC2
+remains the largest single opportunity in the forward at about 8%, and it needs
+either a competitive hand-written GEMM or acceptance of BF16 partial sums.
 
 ### Issue #184 second focused pass
 
