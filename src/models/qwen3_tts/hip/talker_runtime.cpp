@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <ranges>
 #include <span>
@@ -340,35 +341,12 @@ const void* ResolveVector(const TensorStore& store, const DeviceRegion& region,
   return result;
 }
 
-float RoundBfloat16(float value) {
-  std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
-  if ((bits & 0x7F800000U) != 0x7F800000U) {
-    bits += 0x7FFFU + ((bits >> 16U) & 1U);
-  }
-  return std::bit_cast<float>(bits & 0xFFFF0000U);
-}
-
 std::string AsciiLower(std::string_view value) {
   std::string result(value);
   std::ranges::transform(result, result.begin(), [](unsigned char character) {
     return static_cast<char>(std::tolower(character));
   });
   return result;
-}
-
-void AppendRows(std::vector<float>* destination, std::span<const float> rows) {
-  destination->insert(destination->end(), rows.begin(), rows.end());
-}
-
-void AppendAddedRow(std::vector<float>* destination,
-                    std::span<const float> left, std::span<const float> right) {
-  if (left.size() != right.size()) {
-    throw std::runtime_error("Qwen3-TTS prompt row shape mismatch");
-  }
-  destination->reserve(destination->size() + left.size());
-  for (std::size_t index = 0; index < left.size(); ++index) {
-    destination->push_back(RoundBfloat16(left[index] + right[index]));
-  }
 }
 
 struct TokenScore {
@@ -483,6 +461,9 @@ struct TalkerHipRuntime::Impl {
             model.config.code_predictor.head_dim),
         logits(model.config.talker.vocab_size),
         prompt_ids(token_capacity),
+        reference_code_ids(token_capacity *
+                           model.config.talker.num_code_groups),
+        codec_embedding_tables(model.config.talker.num_code_groups),
         predictor_token(1) {
     if (model.mapped_regions.empty() ||
         !main_weights.Initialize(model.mapped_regions.front(), nullptr)) {
@@ -493,6 +474,12 @@ struct TalkerHipRuntime::Impl {
                "hipStreamCreateWithFlags");
     RequireHipblas(hipblasCreate(&blas), "hipblasCreate");
     RequireHipblas(hipblasSetStream(blas, stream), "hipblasSetStream");
+    // Prefill is the one projection that still runs through the batched GEMM,
+    // and its split-K reduction is only reproducible without atomics. Top-k
+    // sampling sorts near-equal candidates, so a last-bit prefill difference
+    // permutes the distribution and changes the drawn codec token.
+    RequireHipblas(hipblasSetAtomicsMode(blas, HIPBLAS_ATOMICS_NOT_ALLOWED),
+                   "hipblasSetAtomicsMode");
     LoadWeights();
   }
 
@@ -641,6 +628,16 @@ struct TalkerHipRuntime::Impl {
           "talker.code_predictor.lm_head." + std::to_string(group) + ".weight",
           predictor.vocab_size, predictor.hidden_size));
     }
+    std::vector<const void*> embedding_tables;
+    embedding_tables.reserve(model.config.talker.num_code_groups);
+    embedding_tables.push_back(codec_embedding);
+    embedding_tables.insert(embedding_tables.end(),
+                            predictor_embeddings.begin(),
+                            predictor_embeddings.end());
+    RequireHip(hipMemcpy(codec_embedding_tables.get(), embedding_tables.data(),
+                         embedding_tables.size() * sizeof(const void*),
+                         hipMemcpyHostToDevice),
+               "hipMemcpy codec embedding table pointers");
   }
 
   [[nodiscard]] std::size_t talker_code_groups() const {
@@ -660,19 +657,40 @@ struct TalkerHipRuntime::Impl {
                                       batch, rows, columns, stream);
   }
 
+  /// Runs projections that share one input. The grouped GEMV produces the same
+  /// values as the per-projection calls, so this only trades dispatches; when
+  /// it declines the shape, each group runs on its own.
+  void GemmGrouped(std::span<const Bfloat16GemvGroup> groups,
+                   const void* inputs_bfloat16, std::size_t batch,
+                   std::size_t columns) {
+    if (LaunchBfloat16GemvGrouped(groups.data(), groups.size(), inputs_bfloat16,
+                                  batch, columns, stream)) {
+      return;
+    }
+    for (const Bfloat16GemvGroup& group : groups) {
+      Gemm(group.weights_bfloat16, inputs_bfloat16, group.output, batch,
+           group.rows, columns);
+    }
+  }
+
   /// Normalizes and rotates q/k and rounds v in one launch where the head fits
   /// a workgroup, otherwise falls back to the separate kernels.
-  void NormalizeRotateQkv(float* q_values, float* k_values, float* v_values,
-                          const float* q_weight, const float* k_weight,
-                          std::size_t batch_size, std::uint32_t q_heads,
-                          std::uint32_t kv_heads, std::uint32_t head_dim,
-                          std::uint32_t start_position, float rope_theta,
-                          float epsilon) {
-    if (LaunchBfloat16QkNormRoPE(q_values, k_values, v_values, q_weight,
-                                 k_weight, batch_size, q_heads, kv_heads,
-                                 head_dim, start_position, rope_theta, epsilon,
-                                 stream)) {
-      return;
+  /// Returns true when the fused kernel also filled the attention cache, which
+  /// lets the caller skip the standalone cache-write launch.
+  [[nodiscard]] bool NormalizeRotateQkv(
+      float* q_values, float* k_values, float* v_values, const float* q_weight,
+      const float* k_weight, std::size_t batch_size, std::uint32_t q_heads,
+      std::uint32_t kv_heads, std::uint32_t head_dim,
+      std::uint32_t start_position, float rope_theta, float epsilon,
+      float* key_cache_values, float* value_cache_values,
+      std::size_t layer_index, std::size_t max_context) {
+    if (LaunchBfloat16QkNormRoPE(
+            q_values, k_values, v_values, q_weight, k_weight, batch_size,
+            q_heads, kv_heads, head_dim, start_position, rope_theta, epsilon,
+            key_cache_values, value_cache_values,
+            static_cast<std::uint32_t>(layer_index),
+            static_cast<std::uint32_t>(max_context), stream)) {
+      return key_cache_values != nullptr;
     }
     LaunchBfloat16PerHeadRMSNorm(q_values, q_weight, batch_size, q_heads,
                                  head_dim, epsilon, stream);
@@ -681,6 +699,7 @@ struct TalkerHipRuntime::Impl {
     LaunchBfloat16RoPEAndRoundV(q_values, k_values, v_values, batch_size,
                                 q_heads, kv_heads, head_dim, start_position,
                                 rope_theta, stream);
+    return false;
   }
 
   void RmsNormToBfloat16(const float* input, const float* weight,
@@ -808,34 +827,36 @@ struct TalkerHipRuntime::Impl {
                         tokens, config.hidden_size, config.rms_norm_eps);
       for (std::size_t layer = 0; layer < predictor_layers.size(); ++layer) {
         const PredictorLayerWeights& weights = predictor_layers[layer];
-        Gemm(weights.q, bfloat16_scratch.get(), q.get(), tokens,
-             config.num_attention_heads * config.head_dim, config.hidden_size);
-        Gemm(weights.k, bfloat16_scratch.get(), k.get(), tokens,
-             config.num_key_value_heads * config.head_dim, config.hidden_size);
-        Gemm(weights.v, bfloat16_scratch.get(), v.get(), tokens,
-             config.num_key_value_heads * config.head_dim, config.hidden_size);
-        NormalizeRotateQkv(
+        const std::array<Bfloat16GemvGroup, 3> qkv{{
+            {weights.q, q.get(), config.num_attention_heads * config.head_dim},
+            {weights.k, k.get(), config.num_key_value_heads * config.head_dim},
+            {weights.v, v.get(), config.num_key_value_heads * config.head_dim},
+        }};
+        GemmGrouped(qkv, bfloat16_scratch.get(), tokens, config.hidden_size);
+        const bool cached = NormalizeRotateQkv(
             q.get(), k.get(), v.get(), weights.q_norm.values.get(),
             weights.k_norm.values.get(), tokens, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim, start_position,
-            config.rope_theta, config.rms_norm_eps);
+            config.rope_theta, config.rms_norm_eps, predictor_key_cache.get(),
+            predictor_value_cache.get(), layer, context);
         strix::hip::LaunchBatchedAttention(
             q.get(), k.get(), v.get(), nullptr, predictor_key_cache.get(),
             predictor_value_cache.get(), nullptr, nullptr, attention.get(),
             static_cast<std::uint32_t>(layer), start_position, tokens,
             static_cast<std::uint32_t>(context), config.num_attention_heads,
-            config.num_key_value_heads, config.head_dim, stream);
-        strix::hip::LaunchFloatToBfloat16(
-            attention.get(), bfloat16_scratch.get(), q_elements, stream);
+            config.num_key_value_heads, config.head_dim, stream, cached,
+            bfloat16_scratch.get());
         Gemm(weights.o, bfloat16_scratch.get(), attention_output.get(), tokens,
              config.hidden_size, config.num_attention_heads * config.head_dim);
         ResidualAddNormToBfloat16(attention_output.get(),
                                   weights.post_norm.values.get(), tokens,
                                   config.hidden_size, config.rms_norm_eps);
-        Gemm(weights.gate, bfloat16_scratch.get(), gate.get(), tokens,
-             config.intermediate_size, config.hidden_size);
-        Gemm(weights.up, bfloat16_scratch.get(), up.get(), tokens,
-             config.intermediate_size, config.hidden_size);
+        const std::array<Bfloat16GemvGroup, 2> gate_up{{
+            {weights.gate, gate.get(), config.intermediate_size},
+            {weights.up, up.get(), config.intermediate_size},
+        }};
+        GemmGrouped(gate_up, bfloat16_scratch.get(), tokens,
+                    config.hidden_size);
         LaunchBfloat16SwiGlu(gate.get(), up.get(), nullptr,
                              bfloat16_scratch.get(), ffn_elements, stream);
         Gemm(weights.down, bfloat16_scratch.get(), feed_forward_output.get(),
@@ -906,18 +927,19 @@ struct TalkerHipRuntime::Impl {
                       tokens, config.hidden_size, config.rms_norm_eps);
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
       const LayerWeights& weights = layers[layer];
-      Gemm(weights.q, bfloat16_scratch.get(), q.get(), tokens,
-           config.num_attention_heads * config.head_dim, config.hidden_size);
-      Gemm(weights.k, bfloat16_scratch.get(), k.get(), tokens,
-           config.num_key_value_heads * config.head_dim, config.hidden_size);
-      Gemm(weights.v, bfloat16_scratch.get(), v.get(), tokens,
-           config.num_key_value_heads * config.head_dim, config.hidden_size);
-      NormalizeRotateQkv(q.get(), k.get(), v.get(), weights.q_norm.values.get(),
-                         weights.k_norm.values.get(), tokens,
-                         config.num_attention_heads, config.num_key_value_heads,
-                         config.head_dim,
-                         static_cast<std::uint32_t>(talker_cache_tokens),
-                         config.rope_theta, config.rms_norm_eps);
+      const std::array<Bfloat16GemvGroup, 3> qkv{{
+          {weights.q, q.get(), config.num_attention_heads * config.head_dim},
+          {weights.k, k.get(), config.num_key_value_heads * config.head_dim},
+          {weights.v, v.get(), config.num_key_value_heads * config.head_dim},
+      }};
+      GemmGrouped(qkv, bfloat16_scratch.get(), tokens, config.hidden_size);
+      const bool cached = NormalizeRotateQkv(
+          q.get(), k.get(), v.get(), weights.q_norm.values.get(),
+          weights.k_norm.values.get(), tokens, config.num_attention_heads,
+          config.num_key_value_heads, config.head_dim,
+          static_cast<std::uint32_t>(talker_cache_tokens), config.rope_theta,
+          config.rms_norm_eps, key_cache.get(), value_cache.get(), layer,
+          maximum_tokens);
       strix::hip::LaunchBatchedAttention(
           q.get(), k.get(), v.get(), nullptr, key_cache.get(),
           value_cache.get(), nullptr, nullptr, attention.get(),
@@ -925,18 +947,17 @@ struct TalkerHipRuntime::Impl {
           static_cast<std::uint32_t>(talker_cache_tokens), tokens,
           static_cast<std::uint32_t>(maximum_tokens),
           config.num_attention_heads, config.num_key_value_heads,
-          config.head_dim, stream);
-      strix::hip::LaunchFloatToBfloat16(attention.get(), bfloat16_scratch.get(),
-                                        q_elements, stream);
+          config.head_dim, stream, cached, bfloat16_scratch.get());
       Gemm(weights.o, bfloat16_scratch.get(), attention_output.get(), tokens,
            config.hidden_size, config.num_attention_heads * config.head_dim);
       ResidualAddNormToBfloat16(attention_output.get(),
                                 weights.post_norm.values.get(), tokens,
                                 config.hidden_size, config.rms_norm_eps);
-      Gemm(weights.gate, bfloat16_scratch.get(), gate.get(), tokens,
-           config.intermediate_size, config.hidden_size);
-      Gemm(weights.up, bfloat16_scratch.get(), up.get(), tokens,
-           config.intermediate_size, config.hidden_size);
+      const std::array<Bfloat16GemvGroup, 2> gate_up{{
+          {weights.gate, gate.get(), config.intermediate_size},
+          {weights.up, up.get(), config.intermediate_size},
+      }};
+      GemmGrouped(gate_up, bfloat16_scratch.get(), tokens, config.hidden_size);
       LaunchBfloat16SwiGlu(gate.get(), up.get(), nullptr,
                            bfloat16_scratch.get(), ffn_elements, stream);
       Gemm(weights.down, bfloat16_scratch.get(), feed_forward_output.get(),
@@ -975,22 +996,51 @@ struct TalkerHipRuntime::Impl {
   void PrepareCodeFrameEmbedding(std::span<const std::uint32_t> codes,
                                  std::span<const float> text_embedding) {
     const auto& talker = model.config.talker;
-    for (std::size_t group = 0; group < codes.size(); ++group) {
-      const std::uint32_t code = codes[group];
-      const void* table =
-          group == 0 ? codec_embedding : predictor_embeddings[group - 1];
-      strix::hip::LaunchEmbeddingLookup(
-          table, core::GgmlType::kBF16, code,
-          attention_output.get() + (group * talker.hidden_size),
-          talker.hidden_size, stream);
+    if (codes.size() != talker.num_code_groups) {
+      throw std::length_error("Qwen3-TTS codec frame group count is invalid");
     }
     RequireHip(hipMemcpyAsync(feed_forward_output.get(), text_embedding.data(),
                               talker.hidden_size * sizeof(float),
                               hipMemcpyHostToDevice, stream),
                "hipMemcpyAsync trailing text embedding");
-    LaunchSumCodecEmbeddings(attention_output.get(), feed_forward_output.get(),
-                             hidden.get(), talker.num_code_groups,
-                             talker.hidden_size, stream);
+    // One dispatch replaces a lookup per code group plus the summing pass. The
+    // accumulation walks the groups in the same order, so the rounded row is
+    // unchanged.
+    RequireHip(hipMemcpyAsync(reference_code_ids.get(), codes.data(),
+                              codes.size() * sizeof(std::uint32_t),
+                              hipMemcpyHostToDevice, stream),
+               "hipMemcpyAsync codec frame codes");
+    LaunchBatchedCodecEmbeddingSum(
+        codec_embedding_tables.get(), reference_code_ids.get(),
+        feed_forward_output.get(), hidden.get(), 1, talker.num_code_groups,
+        talker.hidden_size, stream);
+  }
+
+  std::vector<float> BuildReferenceCodecEmbeddings(
+      std::span<const std::uint32_t> codes, std::size_t frames) {
+    const auto& talker = model.config.talker;
+    if (frames == 0 || frames > maximum_tokens ||
+        codes.size() != frames * talker.num_code_groups) {
+      throw std::length_error(
+          "Qwen3-TTS reference codec embedding shape is invalid");
+    }
+    RequireHip(hipMemcpyAsync(reference_code_ids.get(), codes.data(),
+                              codes.size() * sizeof(std::uint32_t),
+                              hipMemcpyHostToDevice, stream),
+               "hipMemcpyAsync reference codec codes");
+    LaunchBatchedCodecEmbeddingSum(codec_embedding_tables.get(),
+                                   reference_code_ids.get(), nullptr,
+                                   hidden.get(), frames, talker.num_code_groups,
+                                   talker.hidden_size, stream);
+    std::vector<float> result(frames * talker.hidden_size);
+    RequireHip(hipMemcpyAsync(result.data(), hidden.get(),
+                              result.size() * sizeof(float),
+                              hipMemcpyDeviceToHost, stream),
+               "hipMemcpyAsync reference codec embeddings");
+    RequireHip(hipStreamSynchronize(stream),
+               "hipStreamSynchronize reference codec embeddings");
+    RequireHip(hipGetLastError(), "Qwen3-TTS reference codec embeddings");
+    return result;
   }
 
   LoadResult model;
@@ -1031,6 +1081,8 @@ struct TalkerHipRuntime::Impl {
   DeviceBuffer<float> predictor_value_cache;
   DeviceBuffer<float> logits;
   DeviceBuffer<std::uint32_t> prompt_ids;
+  DeviceBuffer<std::uint32_t> reference_code_ids;
+  DeviceBuffer<const void*> codec_embedding_tables;
   DeviceBuffer<std::uint32_t> predictor_token;
   std::mt19937* sampling_rng{nullptr};
   std::size_t predictor_top_k{50};
@@ -1114,41 +1166,43 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
                              tokens, config.hidden_size, config.rms_norm_eps);
     for (std::size_t layer = 0; layer < impl_->layers.size(); ++layer) {
       const LayerWeights& weights = impl_->layers[layer];
-      impl_->Gemm(weights.q, impl_->bfloat16_scratch.get(), impl_->q.get(),
-                  tokens, config.num_attention_heads * config.head_dim,
-                  config.hidden_size);
-      impl_->Gemm(weights.k, impl_->bfloat16_scratch.get(), impl_->k.get(),
-                  tokens, config.num_key_value_heads * config.head_dim,
-                  config.hidden_size);
-      impl_->Gemm(weights.v, impl_->bfloat16_scratch.get(), impl_->v.get(),
-                  tokens, config.num_key_value_heads * config.head_dim,
-                  config.hidden_size);
-      impl_->NormalizeRotateQkv(
+      const std::array<Bfloat16GemvGroup, 3> qkv{{
+          {weights.q, impl_->q.get(),
+           config.num_attention_heads * config.head_dim},
+          {weights.k, impl_->k.get(),
+           config.num_key_value_heads * config.head_dim},
+          {weights.v, impl_->v.get(),
+           config.num_key_value_heads * config.head_dim},
+      }};
+      impl_->GemmGrouped(qkv, impl_->bfloat16_scratch.get(), tokens,
+                         config.hidden_size);
+      const bool cached = impl_->NormalizeRotateQkv(
           impl_->q.get(), impl_->k.get(), impl_->v.get(),
           weights.q_norm.values.get(), weights.k_norm.values.get(), tokens,
           config.num_attention_heads, config.num_key_value_heads,
-          config.head_dim, 0, config.rope_theta, config.rms_norm_eps);
+          config.head_dim, 0, config.rope_theta, config.rms_norm_eps,
+          impl_->key_cache.get(), impl_->value_cache.get(), layer,
+          impl_->maximum_tokens);
       strix::hip::LaunchBatchedAttention(
           impl_->q.get(), impl_->k.get(), impl_->v.get(), nullptr,
           impl_->key_cache.get(), impl_->value_cache.get(), nullptr, nullptr,
           impl_->attention.get(), static_cast<std::uint32_t>(layer), 0, tokens,
           static_cast<std::uint32_t>(impl_->maximum_tokens),
           config.num_attention_heads, config.num_key_value_heads,
-          config.head_dim, impl_->stream);
-      strix::hip::LaunchFloatToBfloat16(impl_->attention.get(),
-                                        impl_->bfloat16_scratch.get(),
-                                        q_elements, impl_->stream);
+          config.head_dim, impl_->stream, cached,
+          impl_->bfloat16_scratch.get());
       impl_->Gemm(weights.o, impl_->bfloat16_scratch.get(),
                   impl_->attention_output.get(), tokens, config.hidden_size,
                   config.num_attention_heads * config.head_dim);
       impl_->ResidualAddNormToBfloat16(impl_->attention_output.get(),
                                        weights.post_norm.values.get(), tokens,
                                        config.hidden_size, config.rms_norm_eps);
-      impl_->Gemm(weights.gate, impl_->bfloat16_scratch.get(),
-                  impl_->gate.get(), tokens, config.intermediate_size,
-                  config.hidden_size);
-      impl_->Gemm(weights.up, impl_->bfloat16_scratch.get(), impl_->up.get(),
-                  tokens, config.intermediate_size, config.hidden_size);
+      const std::array<Bfloat16GemvGroup, 2> gate_up{{
+          {weights.gate, impl_->gate.get(), config.intermediate_size},
+          {weights.up, impl_->up.get(), config.intermediate_size},
+      }};
+      impl_->GemmGrouped(gate_up, impl_->bfloat16_scratch.get(), tokens,
+                         config.hidden_size);
       LaunchBfloat16SwiGlu(impl_->gate.get(), impl_->up.get(), nullptr,
                            impl_->bfloat16_scratch.get(), ffn_elements,
                            impl_->stream);
@@ -1209,6 +1263,23 @@ bool TalkerHipRuntime::BuildCustomVoicePrompt(
     std::span<const std::uint32_t> instruction_ids, std::string_view speaker,
     std::string_view language, CustomVoicePromptOutput* output,
     std::string* error) {
+  return BuildConditionedPrompt(input_ids, instruction_ids, speaker, language,
+                                true, output, error);
+}
+
+bool TalkerHipRuntime::BuildVoiceDesignPrompt(
+    std::span<const std::uint32_t> input_ids,
+    std::span<const std::uint32_t> instruction_ids, std::string_view language,
+    TalkerPromptOutput* output, std::string* error) {
+  return BuildConditionedPrompt(input_ids, instruction_ids, {}, language, false,
+                                output, error);
+}
+
+bool TalkerHipRuntime::BuildConditionedPrompt(
+    std::span<const std::uint32_t> input_ids,
+    std::span<const std::uint32_t> instruction_ids, std::string_view speaker,
+    std::string_view language, bool include_speaker, TalkerPromptOutput* output,
+    std::string* error) {
   if (output == nullptr) {
     SetError(error, "Qwen3-TTS prompt output must not be null");
     return false;
@@ -1221,21 +1292,26 @@ bool TalkerHipRuntime::BuildCustomVoicePrompt(
     return false;
   }
   try {
-    std::string normalized_speaker = AsciiLower(speaker);
-    const auto speaker_id = talker.spk_id.find(normalized_speaker);
-    if (speaker_id == talker.spk_id.end()) {
-      throw std::invalid_argument("unsupported Qwen3-TTS speaker: " +
-                                  std::string(speaker));
-    }
-
     std::string normalized_language = AsciiLower(language);
     if (normalized_language.empty()) {
       normalized_language = "auto";
     }
-    if (normalized_language == "chinese" || normalized_language == "auto") {
-      const auto dialect = talker.spk_dialect.find(normalized_speaker);
-      if (dialect != talker.spk_dialect.end() && dialect->second.has_value()) {
-        normalized_language = *dialect->second;
+
+    std::optional<std::uint32_t> speaker_token;
+    if (include_speaker) {
+      const std::string normalized_speaker = AsciiLower(speaker);
+      const auto speaker_id = talker.spk_id.find(normalized_speaker);
+      if (speaker_id == talker.spk_id.end()) {
+        throw std::invalid_argument("unsupported Qwen3-TTS speaker: " +
+                                    std::string(speaker));
+      }
+      speaker_token = speaker_id->second;
+      if (normalized_language == "chinese" || normalized_language == "auto") {
+        const auto dialect = talker.spk_dialect.find(normalized_speaker);
+        if (dialect != talker.spk_dialect.end() &&
+            dialect->second.has_value()) {
+          normalized_language = *dialect->second;
+        }
       }
     }
 
@@ -1253,7 +1329,9 @@ bool TalkerHipRuntime::BuildCustomVoicePrompt(
       codec_ids = {talker.codec_think_id, talker.codec_think_bos_id,
                    language_id->second, talker.codec_think_eos_id};
     }
-    codec_ids.push_back(speaker_id->second);
+    if (speaker_token.has_value()) {
+      codec_ids.push_back(*speaker_token);
+    }
     codec_ids.push_back(talker.codec_pad_id);
     codec_ids.push_back(talker.codec_bos_id);
 
@@ -1265,51 +1343,170 @@ bool TalkerHipRuntime::BuildCustomVoicePrompt(
     const std::span<const float> tts_bos(special.data(), hidden);
     const std::span<const float> tts_eos(special.data() + hidden, hidden);
     const std::span<const float> tts_pad(special.data() + (2 * hidden), hidden);
-    output->tts_pad.assign(tts_pad.begin(), tts_pad.end());
-    output->trailing_text = output->tts_pad;
 
+    std::vector<float> instruction;
     if (!instruction_ids.empty()) {
-      const std::vector<float> instruction =
-          impl_->ProjectText(instruction_ids);
-      AppendRows(&output->embeddings, instruction);
+      instruction = impl_->ProjectText(instruction_ids);
     }
     const std::vector<float> role = impl_->ProjectText(input_ids.first(3));
-    AppendRows(&output->embeddings, role);
-
     const std::vector<float> codec = impl_->LookupCodec(codec_ids);
-    const std::size_t codec_rows = codec_ids.size();
-    if (codec_rows < 2) {
-      throw std::runtime_error("Qwen3-TTS codec prompt is too short");
-    }
-    for (std::size_t row = 0; row + 2 < codec_rows; ++row) {
-      AppendAddedRow(
-          &output->embeddings, tts_pad,
-          std::span<const float>(codec.data() + (row * hidden), hidden));
-    }
-    AppendAddedRow(&output->embeddings, tts_bos,
-                   std::span<const float>(
-                       codec.data() + ((codec_rows - 2) * hidden), hidden));
-
     const auto text_ids = input_ids.subspan(3, input_ids.size() - 8);
     const std::vector<float> text = impl_->ProjectText(text_ids);
     const std::array<std::uint32_t, 1> codec_pad{talker.codec_pad_id};
     const std::vector<float> codec_pad_embedding =
         impl_->LookupCodec(codec_pad);
-    for (std::size_t row = 0; row < text_ids.size(); ++row) {
-      AppendAddedRow(
-          &output->embeddings,
-          std::span<const float>(text.data() + (row * hidden), hidden),
-          codec_pad_embedding);
+    const NonIclPromptInput prompt_input{
+        .hidden_size = hidden,
+        .instruction = instruction,
+        .role = role,
+        .codec = codec,
+        .text = text,
+        .tts_bos = tts_bos,
+        .tts_eos = tts_eos,
+        .tts_pad = tts_pad,
+        .codec_pad = codec_pad_embedding,
+    };
+    if (!BuildNonIclPrompt(prompt_input, output, error)) {
+      return false;
     }
-    AppendAddedRow(&output->embeddings, tts_eos, codec_pad_embedding);
-    AppendAddedRow(&output->embeddings, tts_pad,
-                   std::span<const float>(
-                       codec.data() + ((codec_rows - 1) * hidden), hidden));
+    if (output->tokens == 0 || output->tokens > impl_->maximum_tokens) {
+      throw std::length_error("Qwen3-TTS prompt exceeds runtime capacity");
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    *output = {};
+    return false;
+  }
+}
 
-    if (output->embeddings.size() % hidden != 0) {
-      throw std::runtime_error("Qwen3-TTS prompt embedding shape mismatch");
+bool TalkerHipRuntime::BuildVoiceClonePrompt(const VoiceClonePromptInput& input,
+                                             TalkerPromptOutput* output,
+                                             std::string* error) {
+  if (output == nullptr) {
+    SetError(error, "Qwen3-TTS prompt output must not be null");
+    return false;
+  }
+  *output = {};
+  const auto& config = impl_->model.config;
+  const auto& talker = config.talker;
+  if (input.input_ids.size() < 8) {
+    SetError(error, "Qwen3-TTS assistant prompt is too short");
+    return false;
+  }
+  if (input.speaker_embedding.size() != talker.hidden_size) {
+    SetError(error, "Qwen3-TTS speaker embedding shape is invalid");
+    return false;
+  }
+  if (input.icl_mode &&
+      (input.reference_ids.size() < 5 || input.reference_frames == 0 ||
+       input.reference_codes.size() !=
+           input.reference_frames * talker.num_code_groups)) {
+    SetError(error, "Qwen3-TTS reference prompt is invalid");
+    return false;
+  }
+  try {
+    std::string normalized_language = AsciiLower(input.language);
+    if (normalized_language.empty()) {
+      normalized_language = "auto";
     }
-    output->tokens = output->embeddings.size() / hidden;
+    std::vector<std::uint32_t> codec_ids;
+    if (normalized_language == "auto") {
+      codec_ids = {talker.codec_nothink_id, talker.codec_think_bos_id,
+                   talker.codec_think_eos_id};
+    } else {
+      const auto language_id =
+          talker.codec_language_id.find(normalized_language);
+      if (language_id == talker.codec_language_id.end()) {
+        throw std::invalid_argument("unsupported Qwen3-TTS language: " +
+                                    std::string(input.language));
+      }
+      codec_ids = {talker.codec_think_id, talker.codec_think_bos_id,
+                   language_id->second, talker.codec_think_eos_id};
+    }
+
+    const std::array<std::uint32_t, 3> special_ids{config.tts_bos_token_id,
+                                                   config.tts_eos_token_id,
+                                                   config.tts_pad_token_id};
+    const std::vector<float> special = impl_->ProjectText(special_ids);
+    const std::size_t hidden = talker.hidden_size;
+    const std::span<const float> tts_bos(special.data(), hidden);
+    const std::span<const float> tts_eos(special.data() + hidden, hidden);
+    const std::span<const float> tts_pad(special.data() + (2 * hidden), hidden);
+    const std::vector<float> role =
+        impl_->ProjectText(input.input_ids.first(3));
+
+    std::vector<float> codec = impl_->LookupCodec(codec_ids);
+    codec.insert(codec.end(), input.speaker_embedding.begin(),
+                 input.speaker_embedding.end());
+    const std::array<std::uint32_t, 2> codec_suffix{talker.codec_pad_id,
+                                                    talker.codec_bos_id};
+    const std::vector<float> suffix = impl_->LookupCodec(codec_suffix);
+    codec.insert(codec.end(), suffix.begin(), suffix.end());
+
+    const auto target_ids =
+        input.input_ids.subspan(3, input.input_ids.size() - 8);
+    if (!input.icl_mode) {
+      const std::vector<float> text = impl_->ProjectText(target_ids);
+      const std::array<std::uint32_t, 1> codec_pad{talker.codec_pad_id};
+      const std::vector<float> codec_pad_embedding =
+          impl_->LookupCodec(codec_pad);
+      const NonIclPromptInput prompt_input{
+          .hidden_size = hidden,
+          .role = role,
+          .codec = codec,
+          .text = text,
+          .tts_bos = tts_bos,
+          .tts_eos = tts_eos,
+          .tts_pad = tts_pad,
+          .codec_pad = codec_pad_embedding,
+      };
+      if (!BuildNonIclPrompt(prompt_input, output, error)) {
+        return false;
+      }
+    } else {
+      const auto reference_text_ids =
+          input.reference_ids.subspan(3, input.reference_ids.size() - 5);
+      std::vector<std::uint32_t> combined_ids(reference_text_ids.begin(),
+                                              reference_text_ids.end());
+      combined_ids.insert(combined_ids.end(), target_ids.begin(),
+                          target_ids.end());
+      const std::vector<float> combined_text = impl_->ProjectText(combined_ids);
+
+      const std::array<std::uint32_t, 1> reference_bos{talker.codec_bos_id};
+      std::vector<float> reference_codec = impl_->LookupCodec(reference_bos);
+      for (std::size_t frame_index = 0; frame_index < input.reference_frames;
+           ++frame_index) {
+        const auto codes = input.reference_codes.subspan(
+            frame_index * talker.num_code_groups, talker.num_code_groups);
+        for (std::size_t group = 0; group < codes.size(); ++group) {
+          const std::uint32_t vocabulary =
+              group == 0 ? talker.vocab_size : config.code_predictor.vocab_size;
+          if (codes[group] >= vocabulary) {
+            throw std::out_of_range(
+                "Qwen3-TTS reference codec token is out of range");
+          }
+        }
+      }
+      const std::vector<float> frame_embeddings =
+          impl_->BuildReferenceCodecEmbeddings(input.reference_codes,
+                                               input.reference_frames);
+      reference_codec.insert(reference_codec.end(), frame_embeddings.begin(),
+                             frame_embeddings.end());
+      const IclPromptInput prompt_input{
+          .hidden_size = hidden,
+          .role = role,
+          .codec = codec,
+          .combined_text = combined_text,
+          .reference_codec = reference_codec,
+          .tts_bos = tts_bos,
+          .tts_eos = tts_eos,
+          .tts_pad = tts_pad,
+      };
+      if (!BuildIclPrompt(prompt_input, output, error)) {
+        return false;
+      }
+    }
     if (output->tokens == 0 || output->tokens > impl_->maximum_tokens) {
       throw std::length_error("Qwen3-TTS prompt exceeds runtime capacity");
     }
@@ -1638,6 +1835,26 @@ bool TalkerHipRuntime::BuildCustomVoicePrompt(std::span<const std::uint32_t>,
                                               std::string_view,
                                               CustomVoicePromptOutput*,
                                               std::string* error) {
+  if (error != nullptr) {
+    *error = "Qwen3-TTS HIP support is not enabled";
+  }
+  return false;
+}
+
+bool TalkerHipRuntime::BuildVoiceDesignPrompt(std::span<const std::uint32_t>,
+                                              std::span<const std::uint32_t>,
+                                              std::string_view,
+                                              TalkerPromptOutput*,
+                                              std::string* error) {
+  if (error != nullptr) {
+    *error = "Qwen3-TTS HIP support is not enabled";
+  }
+  return false;
+}
+
+bool TalkerHipRuntime::BuildVoiceClonePrompt(const VoiceClonePromptInput&,
+                                             TalkerPromptOutput*,
+                                             std::string* error) {
   if (error != nullptr) {
     *error = "Qwen3-TTS HIP support is not enabled";
   }

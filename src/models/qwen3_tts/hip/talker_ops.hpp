@@ -27,6 +27,11 @@ void LaunchBfloat16RoPEAndRoundV(float* query, float* key, float* value,
 /// launch. Equivalent to the standalone per-head RMSNorm and RoPE kernels,
 /// including every intermediate BF16 rounding.
 ///
+/// When `key_cache` is non-null this also stores the rotated key and the
+/// rounded value at `start_position` of the shared attention cache, writing the
+/// same bytes as the standalone cache-write kernel. The caller then asks the
+/// attention launcher to skip its own write.
+///
 /// Returns false without launching when `head_dim` exceeds one workgroup, so
 /// the caller can fall back to the separate launches.
 [[nodiscard]] bool LaunchBfloat16QkNormRoPE(
@@ -34,7 +39,8 @@ void LaunchBfloat16RoPEAndRoundV(float* query, float* key, float* value,
     const float* key_weight, std::size_t batch_size, std::uint32_t num_heads,
     std::uint32_t num_key_value_heads, std::uint32_t head_dim,
     std::uint32_t start_position, float rope_theta, float epsilon,
-    hipStream_t stream);
+    float* key_cache, float* value_cache, std::uint32_t layer_index,
+    std::uint32_t max_context, hipStream_t stream);
 
 /// Adds `update` into `hidden` and writes the RMS-normalized BF16 result, in
 /// one launch. Matches the standalone residual-add and RMSNorm kernels bit for
@@ -69,10 +75,17 @@ void LaunchBfloat16Bias(const float* input, const void* bias_bfloat16,
                         float* output, std::size_t rows, std::size_t columns,
                         hipStream_t stream);
 
-void LaunchSumCodecEmbeddings(const float* embeddings,
-                              const float* text_embedding, float* output,
-                              std::size_t groups, std::size_t hidden_size,
-                              hipStream_t stream);
+/// Looks up every code in a frame-major `[frames, groups]` tensor and writes
+/// the BF16-rounded sum of its group-specific codec embeddings as
+/// frame-major `[frames, hidden_size]`.
+///
+/// `text_embedding` is optional. When present it holds one `hidden_size` row
+/// that is added to every frame before the BF16 rounding, which reproduces the
+/// per-group lookup followed by the summing pass in one dispatch.
+void LaunchBatchedCodecEmbeddingSum(
+    const void* const* embedding_tables_bfloat16, const std::uint32_t* codes,
+    const float* text_embedding, float* output, std::size_t frames,
+    std::size_t groups, std::size_t hidden_size, hipStream_t stream);
 
 /// Computes `output[(b * rows) + m] = sum_k weights[(m * columns) + k] *
 /// inputs[(b * columns) + k]` for the decode-time projections, accumulating in
@@ -92,6 +105,36 @@ void LaunchSumCodecEmbeddings(const float* embeddings,
                                       float* output, std::size_t batch,
                                       std::size_t rows, std::size_t columns,
                                       hipStream_t stream);
+
+/// One projection of a grouped GEMV: a `rows x columns` BF16 weight matrix and
+/// where its `batch x rows` float32 result goes.
+struct Bfloat16GemvGroup {
+  const void* weights_bfloat16{nullptr};
+  float* output{nullptr};
+  std::size_t rows{0};
+};
+
+/// Largest number of projections a single grouped launch can cover. Decode
+/// needs three (query, key, value) and two (gate, up).
+constexpr std::size_t kBfloat16GemvMaxGroups = 3;
+
+/// Runs several projections that share one input in a single dispatch.
+///
+/// Each workgroup still reduces exactly one output row with the same fixed
+/// order as `LaunchBfloat16Gemv`, so the results are bit-identical to invoking
+/// that function once per group; only the launch count changes. Decode issues
+/// well over a thousand kernels per codec frame, and at the measured ~2.4 us
+/// gfx1151 dispatch gap that count, not the arithmetic, is what the projections
+/// still have to spare.
+///
+/// Returns false without launching when the group count, batch, or layout is
+/// not supported, so the caller can fall back to per-group launches.
+[[nodiscard]] bool LaunchBfloat16GemvGrouped(const Bfloat16GemvGroup* groups,
+                                             std::size_t group_count,
+                                             const void* inputs_bfloat16,
+                                             std::size_t batch,
+                                             std::size_t columns,
+                                             hipStream_t stream);
 
 }  // namespace strix::models::qwen3_tts::hip
 #endif

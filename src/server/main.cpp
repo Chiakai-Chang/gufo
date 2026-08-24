@@ -55,7 +55,7 @@ void PrintServeHelp() {
       << "  --video-root <DIR>  Persistent video jobs (default: video-jobs)\n"
       << "  --video-manifest <PATH> Pinned H3 manifest override\n"
       << "  --video-ttl <SEC>   Completed-artifact TTL (default: 3600)\n"
-      << "  --tts-model <DIR>   Qwen3-TTS 12Hz CustomVoice model directory\n"
+      << "  --tts-model <DIR>   Qwen3-TTS 12Hz 1.7B model directory\n"
       << "  --tts-context <N>   Native prompt+generation capacity "
          "(default: 4096)\n"
       << "  -h, --help         Print this help\n";
@@ -161,7 +161,7 @@ int RunServe(std::span<const char* const> args) {
         .model_root = tts_model,
         .native_context_tokens = tts_context_tokens,
         .validate_model = true,
-        .model_id = "qwen3-tts-12hz-1.7b-customvoice",
+        .model_id = {},
         .voices = {},
         .runner = {},
     });

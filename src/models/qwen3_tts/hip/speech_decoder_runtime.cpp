@@ -128,12 +128,17 @@ WeightMode GetWeightMode() {
   return WeightMode::kAuto;
 }
 
+bool ShouldPrecomputeSnakeBeta() {
+  const char* value = std::getenv("STRIX_QWEN3_TTS_PRECOMPUTE_SNAKE");
+  return value != nullptr && std::string_view(value) == "1";
+}
+
 class DeviceRegion {
 public:
   DeviceRegion() = default;
   ~DeviceRegion() {
-    if (owns_device_ && device_ != nullptr) {
-      (void)hipFree(device_);
+    if (owns_device_ && allocation_ != nullptr) {
+      (void)hipFree(allocation_);
     }
     if (registered_ && host_ != nullptr) {
       (void)hipHostUnregister(const_cast<std::byte*>(host_));
@@ -146,23 +151,22 @@ public:
   bool Initialize(MappedRegion region, std::string* error) {
     host_ = region.data;
     size_ = region.size;
-    hipDeviceProp_t properties{};
-    int device = 0;
-    const bool integrated =
-        hipGetDevice(&device) == hipSuccess &&
-        hipGetDeviceProperties(&properties, device) == hipSuccess &&
-        properties.integrated != 0;
+    payload_offset_ = region.payload_offset;
     const WeightMode mode = GetWeightMode();
-    const bool prefer_mapped = mode == WeightMode::kMapped ||
-                               (mode == WeightMode::kAuto && integrated);
-    if (prefer_mapped && TryMap()) {
-      return true;
-    }
-    if (mode != WeightMode::kMapped && TryCopy()) {
-      return true;
-    }
-    if (!prefer_mapped && mode == WeightMode::kAuto && TryMap()) {
-      return true;
+    // The supported gfx1151 APU shares physical memory with the CPU, but
+    // hipMalloc uses coarse-grained pages that the GPU caches and streams
+    // faster than host-registered safetensors pages.
+    if (mode == WeightMode::kMapped) {
+      if (TryMap()) {
+        return true;
+      }
+    } else {
+      if (TryCopy()) {
+        return true;
+      }
+      if (mode == WeightMode::kAuto && TryMap()) {
+        return true;
+      }
     }
     SetError(error,
              "cannot make Qwen3-TTS speech-tokenizer weights GPU-visible");
@@ -197,15 +201,21 @@ private:
   }
 
   bool TryCopy() {
-    if (hipMalloc(&device_, size_) != hipSuccess) {
-      device_ = nullptr;
+    constexpr std::size_t kLoadAlignment = 16;
+    const std::size_t shift =
+        (kLoadAlignment - (payload_offset_ % kLoadAlignment)) % kLoadAlignment;
+    void* allocation = nullptr;
+    if (hipMalloc(&allocation, size_ + shift) != hipSuccess) {
       return false;
     }
+    allocation_ = allocation;
     owns_device_ = true;
+    device_ = static_cast<std::byte*>(allocation) + shift;
     if (hipMemcpy(device_, host_, size_, hipMemcpyHostToDevice) == hipSuccess) {
       return true;
     }
-    (void)hipFree(device_);
+    (void)hipFree(allocation_);
+    allocation_ = nullptr;
     device_ = nullptr;
     owns_device_ = false;
     return false;
@@ -213,7 +223,9 @@ private:
 
   const std::byte* host_{nullptr};
   void* device_{nullptr};
+  void* allocation_{nullptr};
   std::size_t size_{0};
+  std::size_t payload_offset_{0};
   bool owns_device_{false};
   bool registered_{false};
 };
@@ -314,6 +326,13 @@ struct ConvWeights {
   DeviceBuffer<float> transformed_weight;
 };
 
+struct SnakeBetaWeights {
+  const float* alpha{nullptr};
+  const float* beta{nullptr};
+  DeviceBuffer<float> alpha_exp;
+  DeviceBuffer<float> beta_exp;
+};
+
 struct CodebookWeights {
   const float* embedding_sum{nullptr};
   const float* cluster_usage{nullptr};
@@ -348,17 +367,14 @@ struct UpsampleStageWeights {
 };
 
 struct ResidualUnitWeights {
-  const float* alpha1{nullptr};
-  const float* beta1{nullptr};
+  SnakeBetaWeights activation1;
   ConvWeights conv1;
-  const float* alpha2{nullptr};
-  const float* beta2{nullptr};
+  SnakeBetaWeights activation2;
   ConvWeights conv2;
 };
 
 struct DecoderBlockWeights {
-  const float* alpha{nullptr};
-  const float* beta{nullptr};
+  SnakeBetaWeights activation;
   ConvWeights upsample;
   std::array<ResidualUnitWeights, 3> residuals;
 };
@@ -522,6 +538,22 @@ struct SpeechDecoderHipRuntime::Impl {
     return ResolveF32(*model.store, speech_weights, name, shape);
   }
 
+  SnakeBetaWeights LoadSnakeBeta(std::string_view alpha_name,
+                                 std::string_view beta_name,
+                                 std::size_t channels) {
+    SnakeBetaWeights result{
+        .alpha = LoadVector(alpha_name, channels),
+        .beta = LoadVector(beta_name, channels),
+    };
+    if (precompute_snake_beta) {
+      result.alpha_exp.Reset(channels);
+      result.beta_exp.Reset(channels);
+      LaunchPrepareSnakeBeta(result.alpha, result.beta, result.alpha_exp.get(),
+                             result.beta_exp.get(), channels, stream);
+    }
+    return result;
+  }
+
   void LoadWeights() {
     const auto& config = model.config.speech_tokenizer;
     if (config.num_quantizers != kCodeGroups ||
@@ -611,8 +643,8 @@ struct SpeechDecoderHipRuntime::Impl {
       const std::string prefix =
           "decoder.decoder." + std::to_string(block + 1) + ".block";
       DecoderBlockWeights weights;
-      weights.alpha = LoadVector(prefix + ".0.alpha", input_channels);
-      weights.beta = LoadVector(prefix + ".0.beta", input_channels);
+      weights.activation = LoadSnakeBeta(prefix + ".0.alpha",
+                                         prefix + ".0.beta", input_channels);
       weights.upsample =
           LoadTransposeConv(prefix + ".1.conv", input_channels, output_channels,
                             rates[block] * 2, rates[block]);
@@ -620,24 +652,22 @@ struct SpeechDecoderHipRuntime::Impl {
       for (std::size_t unit = 0; unit < weights.residuals.size(); ++unit) {
         const std::string unit_prefix = prefix + "." + std::to_string(unit + 2);
         auto& residual = weights.residuals[unit];
-        residual.alpha1 =
-            LoadVector(unit_prefix + ".act1.alpha", output_channels);
-        residual.beta1 =
-            LoadVector(unit_prefix + ".act1.beta", output_channels);
+        residual.activation1 =
+            LoadSnakeBeta(unit_prefix + ".act1.alpha",
+                          unit_prefix + ".act1.beta", output_channels);
         residual.conv1 = LoadConv(unit_prefix + ".conv1.conv", output_channels,
                                   output_channels, 7, dilations[unit]);
-        residual.alpha2 =
-            LoadVector(unit_prefix + ".act2.alpha", output_channels);
-        residual.beta2 =
-            LoadVector(unit_prefix + ".act2.beta", output_channels);
+        residual.activation2 =
+            LoadSnakeBeta(unit_prefix + ".act2.alpha",
+                          unit_prefix + ".act2.beta", output_channels);
         residual.conv2 = LoadConv(unit_prefix + ".conv2.conv", output_channels,
                                   output_channels, 1);
       }
       decoder_blocks.push_back(std::move(weights));
       input_channels = output_channels;
     }
-    output_alpha = LoadVector("decoder.decoder.5.alpha", 96);
-    output_beta = LoadVector("decoder.decoder.5.beta", 96);
+    output_activation =
+        LoadSnakeBeta("decoder.decoder.5.alpha", "decoder.decoder.5.beta", 96);
     output_conv = LoadConv("decoder.decoder.6.conv", 96, 1, 7);
   }
 
@@ -659,6 +689,19 @@ struct SpeechDecoderHipRuntime::Impl {
     if (weights.bias != nullptr) {
       LaunchAddBias(output, weights.bias, rows, weights.output_columns, stream);
     }
+  }
+
+  void RunSnakeBeta(const SnakeBetaWeights& weights, const float* input,
+                    float* output, std::size_t rows,
+                    std::size_t columns) const {
+    if (precompute_snake_beta) {
+      LaunchPreparedSnakeBeta(input, weights.alpha_exp.get(),
+                              weights.beta_exp.get(), output, rows, columns,
+                              stream);
+      return;
+    }
+    LaunchSnakeBeta(input, weights.alpha, weights.beta, output, rows, columns,
+                    stream);
   }
 
   void RunConv(const ConvWeights& weights, const float* input, float* output,
@@ -845,21 +888,20 @@ struct SpeechDecoderHipRuntime::Impl {
     std::size_t channels = 1536;
     for (const DecoderBlockWeights& block : decoder_blocks) {
       float* activated = FindScratch(workspace, {hidden});
-      LaunchSnakeBeta(hidden, block.alpha, block.beta, activated, length,
-                      channels, stream);
+      RunSnakeBeta(block.activation, hidden, activated, length, channels);
       const std::size_t output_length = length * block.upsample.stride;
       float* upsampled = FindScratch(workspace, {hidden, activated});
       RunConv(block.upsample, activated, upsampled, length, output_length);
       channels /= 2;
       for (const ResidualUnitWeights& residual : block.residuals) {
         float* branch = FindScratch(workspace, {hidden, activated, upsampled});
-        LaunchSnakeBeta(upsampled, residual.alpha1, residual.beta1, branch,
-                        output_length, channels, stream);
+        RunSnakeBeta(residual.activation1, upsampled, branch, output_length,
+                     channels);
         float* work =
             FindScratch(workspace, {hidden, activated, upsampled, branch});
         RunConv(residual.conv1, branch, work, output_length, output_length);
-        LaunchSnakeBeta(work, residual.alpha2, residual.beta2, branch,
-                        output_length, channels, stream);
+        RunSnakeBeta(residual.activation2, work, branch, output_length,
+                     channels);
         RunConv(residual.conv2, branch, work, output_length, output_length);
         LaunchAdd(upsampled, work, upsampled, output_length * channels, stream);
       }
@@ -872,8 +914,7 @@ struct SpeechDecoderHipRuntime::Impl {
     }
 
     float* activated = FindScratch(workspace, {hidden});
-    LaunchSnakeBeta(hidden, output_alpha, output_beta, activated, length, 96,
-                    stream);
+    RunSnakeBeta(output_activation, hidden, activated, length, 96);
     if (trace != nullptr) {
       trace->decoder_outputs.emplace_back();
       Capture(activated, length * 96, &trace->decoder_outputs.back());
@@ -897,6 +938,7 @@ struct SpeechDecoderHipRuntime::Impl {
   }
 
   LoadResult model;
+  bool precompute_snake_beta{ShouldPrecomputeSnakeBeta()};
   DeviceRegion speech_weights;
   hipStream_t stream{nullptr};
   F32Gemm gemm;
@@ -914,8 +956,7 @@ struct SpeechDecoderHipRuntime::Impl {
   std::vector<UpsampleStageWeights> upsample_stages;
   ConvWeights decoder_input;
   std::vector<DecoderBlockWeights> decoder_blocks;
-  const float* output_alpha{nullptr};
-  const float* output_beta{nullptr};
+  SnakeBetaWeights output_activation;
   ConvWeights output_conv;
 };
 

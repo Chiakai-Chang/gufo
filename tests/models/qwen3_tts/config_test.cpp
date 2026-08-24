@@ -55,7 +55,8 @@ int main() {
   })");
   Check(config.has_value(), "valid configuration parses");
   Check(config->model_type == "qwen3_tts" &&
-            config->tts_model_type == "custom_voice",
+            config->tts_model_type == "custom_voice" &&
+            config->variant == qwen3_tts::ModelVariant::kCustomVoice,
         "model identity is preserved");
   Check(config->talker.spk_id.at("vivian") == 3065,
         "speaker token is preserved");
@@ -70,6 +71,48 @@ int main() {
         "code predictor dimensions are independent");
   Check(!qwen3_tts::ParseModelConfig("{").has_value(),
         "malformed JSON fails closed");
+
+  const auto voice_design = qwen3_tts::ParseModelConfig(R"({
+    "model_type": "qwen3_tts",
+    "tokenizer_type": "qwen3_tts_tokenizer_12hz",
+    "tts_model_size": "1b7",
+    "tts_model_type": "voice_design"
+  })");
+  Check(voice_design.has_value() &&
+            voice_design->variant == qwen3_tts::ModelVariant::kVoiceDesign &&
+            qwen3_tts::IsSupportedModelConfig(*voice_design),
+        "1.7B VoiceDesign is supported");
+
+  const auto base = qwen3_tts::ParseModelConfig(R"({
+    "model_type": "qwen3_tts",
+    "tokenizer_type": "qwen3_tts_tokenizer_12hz",
+    "tts_model_size": "1b7",
+    "tts_model_type": "base",
+    "speaker_encoder_config": {"enc_dim": 2048, "sample_rate": 24000}
+  })");
+  Check(base.has_value() && base->variant == qwen3_tts::ModelVariant::kBase &&
+            base->speaker_encoder.has_value() &&
+            base->speaker_encoder->embedding_dim == 2048 &&
+            qwen3_tts::IsSupportedModelConfig(*base),
+        "1.7B Base speaker encoder is parsed and supported");
+
+  const auto small = qwen3_tts::ParseModelConfig(R"({
+    "model_type": "qwen3_tts",
+    "tokenizer_type": "qwen3_tts_tokenizer_12hz",
+    "tts_model_size": "0b6",
+    "tts_model_type": "voice_design"
+  })");
+  Check(small.has_value() && !qwen3_tts::IsSupportedModelConfig(*small),
+        "0.6B variants stay excluded");
+
+  const auto fast = qwen3_tts::ParseModelConfig(R"({
+    "model_type": "qwen3_tts",
+    "tokenizer_type": "qwen3_tts_tokenizer_25hz",
+    "tts_model_size": "1b7",
+    "tts_model_type": "voice_design"
+  })");
+  Check(fast.has_value() && !qwen3_tts::IsSupportedModelConfig(*fast),
+        "unqualified 25 Hz variants stay excluded");
 
   std::cout << "PASS qwen3_tts_config_test\n";
   return 0;

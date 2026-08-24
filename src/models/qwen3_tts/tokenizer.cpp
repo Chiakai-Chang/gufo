@@ -564,4 +564,13 @@ bool Tokenizer::EncodeInstructionPrompt(std::string_view instruction,
   return Encode(prompt, ids, error);
 }
 
+bool Tokenizer::EncodeReferencePrompt(std::string_view text,
+                                      std::vector<std::uint32_t>* ids,
+                                      std::string* error) const {
+  std::string prompt = "<|im_start|>assistant\n";
+  prompt.append(text);
+  prompt.append("<|im_end|>\n");
+  return Encode(prompt, ids, error);
+}
+
 }  // namespace strix::models::qwen3_tts

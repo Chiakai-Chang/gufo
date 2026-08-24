@@ -33,7 +33,7 @@ struct LoadResult {
   std::vector<MappedRegion> mapped_regions;
 };
 
-/// Loads a Qwen3-TTS 12Hz CustomVoice model directory.
+/// Loads a quality-qualified Qwen3-TTS 12.5 Hz 1.7B model directory.
 ///
 /// Layout expected:
 ///   <dir>/config.json
@@ -41,7 +41,7 @@ struct LoadResult {
 ///   <dir>/speech_tokenizer/model.safetensors
 [[nodiscard]] LoadResult LoadModelDirectory(const std::string& model_dir);
 
-/// True if `model_dir/config.json` has model_type "qwen3_tts".
+/// True if `model_dir/config.json` is a supported 1.7B Qwen3-TTS variant.
 [[nodiscard]] bool LooksLikeQwen3Tts(const std::string& model_dir);
 
 }  // namespace strix::models::qwen3_tts

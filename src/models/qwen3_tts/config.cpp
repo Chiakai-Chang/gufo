@@ -153,7 +153,76 @@ void ParseCodePredictor(CodePredictorConfig& out, const json::Value& config) {
   }
 }
 
+void ParseSpeechEncoder(SpeechTokenizerConfig& out,
+                        const json::Value& encoder) {
+  ParseU32(encoder, "audio_channels", out.encoder_audio_channels);
+  ParseU32(encoder, "codebook_dim", out.encoder_codebook_dim);
+  ParseU32(encoder, "codebook_size", out.encoder_codebook_size);
+  ParseU32(encoder, "hidden_size", out.encoder_hidden_size);
+  ParseU32(encoder, "intermediate_size", out.encoder_intermediate_size);
+  ParseU32(encoder, "head_dim", out.encoder_head_dim);
+  ParseU32(encoder, "num_attention_heads", out.encoder_num_attention_heads);
+  ParseU32(encoder, "num_hidden_layers", out.encoder_num_hidden_layers);
+  ParseU32(encoder, "num_key_value_heads", out.encoder_num_key_value_heads);
+  ParseU32(encoder, "num_quantizers", out.encoder_num_quantizers);
+  ParseU32(encoder, "num_semantic_quantizers",
+           out.encoder_num_semantic_quantizers);
+  ParseU32(encoder, "num_filters", out.encoder_num_filters);
+  ParseU32(encoder, "num_residual_layers", out.encoder_num_residual_layers);
+  ParseU32(encoder, "kernel_size", out.encoder_kernel_size);
+  ParseU32(encoder, "last_kernel_size", out.encoder_last_kernel_size);
+  ParseU32(encoder, "residual_kernel_size", out.encoder_residual_kernel_size);
+  ParseU32(encoder, "compress", out.encoder_compress);
+  ParseU32(encoder, "dilation_growth_rate", out.encoder_dilation_growth_rate);
+  ParseU32(encoder, "sliding_window", out.encoder_sliding_window);
+  if (const json::Value* scale = encoder.find("layer_scale_initial_scale");
+      scale != nullptr && scale->is_number()) {
+    out.encoder_layer_scale_initial_scale = static_cast<float>(
+        scale->as_double(out.encoder_layer_scale_initial_scale));
+  }
+  if (const json::Value* eps = encoder.find("norm_eps");
+      eps != nullptr && eps->is_number()) {
+    out.encoder_norm_eps =
+        static_cast<float>(eps->as_double(out.encoder_norm_eps));
+  }
+  if (const json::Value* theta = encoder.find("rope_theta");
+      theta != nullptr && theta->is_number()) {
+    out.encoder_rope_theta =
+        static_cast<float>(theta->as_double(out.encoder_rope_theta));
+  }
+  if (const json::Value* ratios = encoder.find("upsampling_ratios")) {
+    auto parsed = ParseU32Array(*ratios);
+    if (!parsed.empty()) {
+      out.encoder_upsampling_ratios = std::move(parsed);
+    }
+  }
+}
+
 }  // namespace
+
+ModelVariant ParseModelVariant(std::string_view model_type) {
+  if (model_type == "base") {
+    return ModelVariant::kBase;
+  }
+  if (model_type == "voice_design") {
+    return ModelVariant::kVoiceDesign;
+  }
+  if (model_type == "custom_voice") {
+    return ModelVariant::kCustomVoice;
+  }
+  return ModelVariant::kUnsupported;
+}
+
+bool IsSupportedModelConfig(const ModelConfig& config) {
+  if (config.model_type != "qwen3_tts" ||
+      config.tokenizer_type != "qwen3_tts_tokenizer_12hz" ||
+      config.tts_model_size != "1b7" ||
+      config.variant == ModelVariant::kUnsupported) {
+    return false;
+  }
+  return config.variant != ModelVariant::kBase ||
+         config.speaker_encoder.has_value();
+}
 
 std::optional<ModelConfig> ParseModelConfig(const std::string& json_contents) {
   json::Value root;
@@ -171,6 +240,7 @@ std::optional<ModelConfig> ParseModelConfig(const std::string& json_contents) {
   config.tokenizer_type = root.member_str("tokenizer_type");
   config.tts_model_size = root.member_str("tts_model_size");
   config.tts_model_type = root.member_str("tts_model_type");
+  config.variant = ParseModelVariant(config.tts_model_type);
   ParseU32(root, "im_start_token_id", config.im_start_token_id);
   ParseU32(root, "im_end_token_id", config.im_end_token_id);
   ParseU32(root, "tts_pad_token_id", config.tts_pad_token_id);
@@ -183,6 +253,13 @@ std::optional<ModelConfig> ParseModelConfig(const std::string& json_contents) {
             FindPath(root, {"talker_config", "code_predictor_config"})) {
       ParseCodePredictor(config.code_predictor, *predictor);
     }
+  }
+  if (const auto* speaker = FindPath(root, {"speaker_encoder_config"});
+      speaker != nullptr && speaker->is_object()) {
+    SpeakerEncoderConfig parsed;
+    ParseU32(*speaker, "enc_dim", parsed.embedding_dim);
+    ParseU32(*speaker, "sample_rate", parsed.sample_rate);
+    config.speaker_encoder = parsed;
   }
   return config;
 }
@@ -227,6 +304,9 @@ bool LoadSpeechTokenizerConfigFromPath(const std::string& model_dir,
     ParseU32(root, "input_sample_rate", config->input_sample_rate);
     ParseU32(root, "output_sample_rate", config->output_sample_rate);
     ParseU32(root, "decode_upsample_rate", config->decode_upsample_rate);
+    ParseU32(root, "encode_downsample_rate", config->encode_downsample_rate);
+    ParseU32(root, "encoder_valid_num_quantizers",
+             config->encoder_valid_num_quantizers);
     if (const json::Value* decoder = root.find("decoder_config");
         decoder != nullptr && decoder->is_object()) {
       ParseU32(*decoder, "latent_dim", config->latent_dim);
@@ -270,6 +350,10 @@ bool LoadSpeechTokenizerConfigFromPath(const std::string& model_dir,
           config->upsampling_ratios = std::move(parsed);
         }
       }
+    }
+    if (const json::Value* encoder = root.find("encoder_config");
+        encoder != nullptr && encoder->is_object()) {
+      ParseSpeechEncoder(*config, *encoder);
     }
     return true;
   } catch (const std::exception&) {

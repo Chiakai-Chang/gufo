@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "src/models/qwen3_tts/prompt.hpp"
+
 namespace strix::models::qwen3_tts::hip {
 
 struct TalkerPrefillOutput {
@@ -17,11 +19,18 @@ struct TalkerPrefillOutput {
   std::vector<float> layer0_output;
 };
 
-struct CustomVoicePromptOutput {
-  std::vector<float> embeddings;
-  std::vector<float> trailing_text;
-  std::vector<float> tts_pad;
-  std::size_t tokens{0};
+using TalkerPromptOutput = ::strix::models::qwen3_tts::PromptOutput;
+using CustomVoicePromptOutput = TalkerPromptOutput;
+
+struct VoiceClonePromptInput {
+  std::span<const std::uint32_t> input_ids;
+  std::span<const std::uint32_t> reference_ids;
+  // Frame-major [reference_frames, 16].
+  std::span<const std::uint32_t> reference_codes;
+  std::span<const float> speaker_embedding;
+  std::size_t reference_frames{0};
+  std::string_view language{"auto"};
+  bool icl_mode{true};
 };
 
 struct TalkerGenerationOutput {
@@ -71,6 +80,20 @@ public:
       std::string_view language, CustomVoicePromptOutput* output,
       std::string* error = nullptr);
 
+  /// Builds the official VoiceDesign prompt. A non-empty instruction is
+  /// required by the service even though the low-level builder accepts an
+  /// empty row set for exact upstream compatibility.
+  [[nodiscard]] bool BuildVoiceDesignPrompt(
+      std::span<const std::uint32_t> input_ids,
+      std::span<const std::uint32_t> instruction_ids, std::string_view language,
+      TalkerPromptOutput* output, std::string* error = nullptr);
+
+  /// Builds the Base model voice-clone prompt in full ICL or
+  /// speaker-embedding-only mode.
+  [[nodiscard]] bool BuildVoiceClonePrompt(const VoiceClonePromptInput& input,
+                                           TalkerPromptOutput* output,
+                                           std::string* error = nullptr);
+
   /// Greedily expands one first-codebook token into all codec groups.
   [[nodiscard]] bool PredictCodeFrame(std::span<const float> talker_hidden,
                                       std::uint32_t first_code,
@@ -94,13 +117,13 @@ public:
       std::span<const float> text_embedding, std::vector<float>* embedding,
       std::string* error = nullptr);
 
-  [[nodiscard]] bool GenerateGreedy(const CustomVoicePromptOutput& prompt,
+  [[nodiscard]] bool GenerateGreedy(const TalkerPromptOutput& prompt,
                                     std::size_t maximum_new_tokens,
                                     TalkerGenerationOutput* output,
                                     std::string* error = nullptr);
 
   /// Generates with the checkpoint's native top-k sampling policy by default.
-  [[nodiscard]] bool Generate(const CustomVoicePromptOutput& prompt,
+  [[nodiscard]] bool Generate(const TalkerPromptOutput& prompt,
                               std::size_t maximum_new_tokens,
                               const TalkerSamplingOptions& sampling,
                               TalkerGenerationOutput* output,
@@ -116,6 +139,12 @@ private:
                                   std::uint32_t first_code,
                                   CodePredictorOutput* output,
                                   bool collect_logits, std::string* error);
+
+  [[nodiscard]] bool BuildConditionedPrompt(
+      std::span<const std::uint32_t> input_ids,
+      std::span<const std::uint32_t> instruction_ids, std::string_view speaker,
+      std::string_view language, bool include_speaker,
+      TalkerPromptOutput* output, std::string* error);
 
   std::unique_ptr<Impl> impl_;
 };

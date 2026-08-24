@@ -174,7 +174,9 @@ __launch_bounds__(ThreadsPerBlock) __global__ void Bfloat16QkNormRoPEKernel(
     float* query, float* key, float* value, const float* query_weight,
     const float* key_weight, std::size_t batch_size, std::uint32_t num_heads,
     std::uint32_t num_key_value_heads, std::uint32_t head_dim,
-    std::uint32_t start_position, float rope_theta, float epsilon) {
+    std::uint32_t start_position, float rope_theta, float epsilon,
+    float* key_cache, float* value_cache, std::uint32_t layer_index,
+    std::uint32_t max_context) {
   const std::size_t batch = blockIdx.y;
   const std::uint32_t head = blockIdx.x;
   if (batch >= batch_size) {
@@ -201,10 +203,21 @@ __launch_bounds__(ThreadsPerBlock) __global__ void Bfloat16QkNormRoPEKernel(
         (batch * stride) + (static_cast<std::size_t>(head) * head_dim);
     NormalizeAndRotateHead(key + offset, key_weight, head_dim, epsilon,
                            position, rope_theta, shared_sum, normalized);
+    const std::size_t cache_offset =
+        ((((static_cast<std::size_t>(layer_index) * num_key_value_heads) +
+           head) *
+              max_context +
+          position) *
+         head_dim);
     for (std::uint32_t index = threadIdx.x; index < head_dim;
          index += blockDim.x) {
-      value[offset + index] =
+      const float rounded =
           static_cast<float>(hip_bfloat16(value[offset + index]));
+      value[offset + index] = rounded;
+      if (key_cache != nullptr) {
+        key_cache[cache_offset + index] = key[offset + index];
+        value_cache[cache_offset + index] = rounded;
+      }
     }
   }
 }
@@ -325,19 +338,27 @@ __global__ void Bfloat16BiasKernel(const float* input, const hip_bfloat16* bias,
   }
 }
 
-__global__ void SumCodecEmbeddingsKernel(const float* embeddings,
-                                         const float* text_embedding,
-                                         float* output, std::size_t groups,
-                                         std::size_t hidden_size) {
-  const std::size_t dimension = (blockIdx.x * blockDim.x) + threadIdx.x;
-  if (dimension < hidden_size) {
-    float sum = 0.0F;
-    for (std::size_t group = 0; group < groups; ++group) {
-      sum += embeddings[(group * hidden_size) + dimension];
-    }
-    output[dimension] =
-        static_cast<float>(hip_bfloat16(sum + text_embedding[dimension]));
+__global__ void BatchedCodecEmbeddingSumKernel(
+    const hip_bfloat16* const* embedding_tables, const std::uint32_t* codes,
+    const float* text_embedding, float* output, std::size_t elements,
+    std::size_t groups, std::size_t hidden_size) {
+  const std::size_t index = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (index >= elements) {
+    return;
   }
+  const std::size_t frame = index / hidden_size;
+  const std::size_t dimension = index % hidden_size;
+  float sum = 0.0F;
+  for (std::size_t group = 0; group < groups; ++group) {
+    const std::uint32_t code = codes[(frame * groups) + group];
+    sum += static_cast<float>(
+        embedding_tables[group][(static_cast<std::size_t>(code) * hidden_size) +
+                                dimension]);
+  }
+  if (text_embedding != nullptr) {
+    sum += text_embedding[dimension];
+  }
+  output[index] = static_cast<float>(hip_bfloat16(sum));
 }
 
 __device__ __forceinline__ float LowBfloat16(std::uint32_t word) {
@@ -426,6 +447,76 @@ __launch_bounds__(kGemvWaves* kGemvWavefront) __global__
   }
 }
 
+/// Weight matrices and destinations of a grouped GEMV, passed by value so the
+/// kernel resolves its group from registers instead of a second memory load.
+template<typename Packed, unsigned int kGroups>
+struct GemvGroupedArgs {
+  const Packed* weights[kGroups];
+  float* outputs[kGroups];
+  // Exclusive prefix sums of the per-group row counts, so `row_end[kGroups -
+  // 1]` is the grid width.
+  std::uint32_t row_end[kGroups];
+  std::uint32_t rows[kGroups];
+};
+
+/// Grouped form of `Bfloat16GemvKernel`. The per-row reduction is character for
+/// character the same, which is what keeps the fused launch bit-identical to
+/// the separate ones; only the row-to-matrix mapping is new.
+template<typename Packed, unsigned int kGroups, unsigned int kVectors>
+__launch_bounds__(kGemvWaves* kGemvWavefront) __global__
+    void Bfloat16GemvGroupedKernel(GemvGroupedArgs<Packed, kGroups> args,
+                                   const Packed* __restrict__ inputs,
+                                   std::uint32_t packed_columns) {
+  unsigned int group = 0;
+#pragma unroll
+  for (unsigned int boundary = 1; boundary < kGroups; ++boundary) {
+    group += blockIdx.x >= args.row_end[boundary - 1] ? 1U : 0U;
+  }
+  const std::uint32_t row =
+      blockIdx.x - (group == 0U ? 0U : args.row_end[group - 1]);
+
+  __shared__ float wave_sums[kVectors][kGemvWaves];
+  const unsigned int lane = threadIdx.x & (kGemvWavefront - 1U);
+  const unsigned int wave = threadIdx.x >> 5U;
+  const Packed* weight_row =
+      args.weights[group] + (static_cast<std::size_t>(row) * packed_columns);
+
+  float sums[kVectors];
+#pragma unroll
+  for (unsigned int vector = 0; vector < kVectors; ++vector) {
+    sums[vector] = 0.0F;
+  }
+  for (std::uint32_t index = (wave * kGemvWavefront) + lane;
+       index < packed_columns; index += kGemvWaves * kGemvWavefront) {
+    const Packed weight = weight_row[index];
+#pragma unroll
+    for (unsigned int vector = 0; vector < kVectors; ++vector) {
+      sums[vector] +=
+          PackedDot(weight, inputs[(vector * packed_columns) + index]);
+    }
+  }
+#pragma unroll
+  for (unsigned int vector = 0; vector < kVectors; ++vector) {
+    float sum = sums[vector];
+#pragma unroll
+    for (int offset = kGemvWavefront / 2; offset > 0; offset >>= 1) {
+      sum += __shfl_down(sum, offset, kGemvWavefront);
+    }
+    if (lane == 0) {
+      wave_sums[vector][wave] = sum;
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x < kVectors) {
+    float total = 0.0F;
+#pragma unroll
+    for (unsigned int index = 0; index < kGemvWaves; ++index) {
+      total += wave_sums[threadIdx.x][index];
+    }
+    args.outputs[group][(threadIdx.x * args.rows[group]) + row] = total;
+  }
+}
+
 dim3 Grid(std::size_t count) {
   constexpr unsigned int block_size = 256;
   return dim3(static_cast<unsigned int>((count + block_size - 1) / block_size));
@@ -472,24 +563,28 @@ void LaunchBfloat16RoPEAndRoundV(float* query, float* key, float* value,
       start_position, rope_theta);
 }
 
-bool LaunchBfloat16QkNormRoPE(float* query, float* key, float* value,
-                              const float* query_weight,
-                              const float* key_weight, std::size_t batch_size,
-                              std::uint32_t num_heads,
-                              std::uint32_t num_key_value_heads,
-                              std::uint32_t head_dim,
-                              std::uint32_t start_position, float rope_theta,
-                              float epsilon, hipStream_t stream) {
+bool LaunchBfloat16QkNormRoPE(
+    float* query, float* key, float* value, const float* query_weight,
+    const float* key_weight, std::size_t batch_size, std::uint32_t num_heads,
+    std::uint32_t num_key_value_heads, std::uint32_t head_dim,
+    std::uint32_t start_position, float rope_theta, float epsilon,
+    float* key_cache, float* value_cache, std::uint32_t layer_index,
+    std::uint32_t max_context, hipStream_t stream) {
   constexpr std::uint32_t kThreads = 128;
   if (batch_size == 0 || num_heads == 0 || num_key_value_heads == 0 ||
       head_dim == 0 || head_dim > kThreads || head_dim % 2 != 0) {
+    return false;
+  }
+  if (key_cache != nullptr &&
+      (value_cache == nullptr || start_position + batch_size > max_context)) {
     return false;
   }
   const dim3 grid(std::max(num_heads, num_key_value_heads),
                   static_cast<unsigned int>(batch_size));
   Bfloat16QkNormRoPEKernel<kThreads><<<grid, kThreads, 0, stream>>>(
       query, key, value, query_weight, key_weight, batch_size, num_heads,
-      num_key_value_heads, head_dim, start_position, rope_theta, epsilon);
+      num_key_value_heads, head_dim, start_position, rope_theta, epsilon,
+      key_cache, value_cache, layer_index, max_context);
   return true;
 }
 
@@ -570,15 +665,17 @@ void LaunchBfloat16Bias(const float* input, const void* bias_bfloat16,
       columns);
 }
 
-void LaunchSumCodecEmbeddings(const float* embeddings,
-                              const float* text_embedding, float* output,
-                              std::size_t groups, std::size_t hidden_size,
-                              hipStream_t stream) {
-  if (groups == 0 || hidden_size == 0) {
+void LaunchBatchedCodecEmbeddingSum(
+    const void* const* embedding_tables_bfloat16, const std::uint32_t* codes,
+    const float* text_embedding, float* output, std::size_t frames,
+    std::size_t groups, std::size_t hidden_size, hipStream_t stream) {
+  const std::size_t elements = frames * hidden_size;
+  if (elements == 0 || groups == 0) {
     return;
   }
-  SumCodecEmbeddingsKernel<<<Grid(hidden_size), 256, 0, stream>>>(
-      embeddings, text_embedding, output, groups, hidden_size);
+  BatchedCodecEmbeddingSumKernel<<<Grid(elements), 256, 0, stream>>>(
+      reinterpret_cast<const hip_bfloat16* const*>(embedding_tables_bfloat16),
+      codes, text_embedding, output, elements, groups, hidden_size);
 }
 
 bool LaunchBfloat16Gemv(const void* weights_bfloat16,
@@ -637,6 +734,96 @@ bool LaunchBfloat16Gemv(const void* weights_bfloat16,
     default:
       return false;
   }
+}
+
+bool LaunchBfloat16GemvGrouped(const Bfloat16GemvGroup* groups,
+                               std::size_t group_count,
+                               const void* inputs_bfloat16, std::size_t batch,
+                               std::size_t columns, hipStream_t stream) {
+  if (groups == nullptr || group_count < 2 ||
+      group_count > kBfloat16GemvMaxGroups || batch == 0 ||
+      batch > kGemvMaxBatch || columns == 0) {
+    return false;
+  }
+  std::size_t total_rows = 0;
+  for (std::size_t group = 0; group < group_count; ++group) {
+    if (groups[group].weights_bfloat16 == nullptr ||
+        groups[group].output == nullptr || groups[group].rows == 0) {
+      return false;
+    }
+    total_rows += groups[group].rows;
+  }
+  if (total_rows > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+
+  // Every group has to use the same load width, so the narrowest alignment in
+  // the set decides for all of them.
+  const auto aligned = [&](std::size_t bytes) {
+    if (reinterpret_cast<std::uintptr_t>(inputs_bfloat16) % bytes != 0 ||
+        (columns * sizeof(std::uint16_t)) % bytes != 0) {
+      return false;
+    }
+    for (std::size_t group = 0; group < group_count; ++group) {
+      if (reinterpret_cast<std::uintptr_t>(groups[group].weights_bfloat16) %
+              bytes !=
+          0) {
+        return false;
+      }
+    }
+    return true;
+  };
+  const std::size_t lanes = aligned(sizeof(uint4))   ? 8
+                            : aligned(sizeof(uint2)) ? 4
+                                                     : 0;
+  if (lanes == 0) {
+    return false;
+  }
+
+  const unsigned int block = kGemvWaves * kGemvWavefront;
+  const auto grid = static_cast<unsigned int>(total_rows);
+  const auto packed = static_cast<std::uint32_t>(columns / lanes);
+
+  const auto launch =
+      [&]<typename Packed, unsigned int kGroups, unsigned int kVectors>() {
+        GemvGroupedArgs<Packed, kGroups> args{};
+        std::uint32_t offset = 0;
+        for (unsigned int group = 0; group < kGroups; ++group) {
+          args.weights[group] =
+              static_cast<const Packed*>(groups[group].weights_bfloat16);
+          args.outputs[group] = groups[group].output;
+          args.rows[group] = static_cast<std::uint32_t>(groups[group].rows);
+          offset += args.rows[group];
+          args.row_end[group] = offset;
+        }
+        Bfloat16GemvGroupedKernel<Packed, kGroups, kVectors>
+            <<<grid, block, 0, stream>>>(
+                args, static_cast<const Packed*>(inputs_bfloat16), packed);
+      };
+  const auto dispatch_vectors = [&]<typename Packed, unsigned int kGroups>() {
+    switch (batch) {
+      case 1:
+        launch.template operator()<Packed, kGroups, 1>();
+        return true;
+      case 2:
+        launch.template operator()<Packed, kGroups, 2>();
+        return true;
+      case 3:
+        launch.template operator()<Packed, kGroups, 3>();
+        return true;
+      case 4:
+        launch.template operator()<Packed, kGroups, 4>();
+        return true;
+      default:
+        return false;
+    }
+  };
+  const auto dispatch_groups = [&]<typename Packed>() {
+    return group_count == 2 ? dispatch_vectors.template operator()<Packed, 2>()
+                            : dispatch_vectors.template operator()<Packed, 3>();
+  };
+  return lanes == 8 ? dispatch_groups.template operator()<uint4>()
+                    : dispatch_groups.template operator()<uint2>();
 }
 
 }  // namespace strix::models::qwen3_tts::hip

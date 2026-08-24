@@ -11,6 +11,7 @@
 #include <string>
 #include <utility>
 
+#include "src/models/qwen3_tts/audio.hpp"
 #include "src/server/json.hpp"
 
 namespace strix::server {
@@ -143,7 +144,8 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
   if (!body.is_object() ||
       !HasOnlyMembers(
           body, {"model", "input", "voice", "response_format", "speed",
-                 "language", "instruct", "seed", "max_new_tokens", "greedy"})) {
+                 "language", "instruct", "seed", "max_new_tokens", "greedy",
+                 "reference_audio", "reference_text", "voice_clone_mode"})) {
     return Error(400, "Bad Request",
                  "request contains unsupported audio speech fields",
                  "unsupported_field");
@@ -152,9 +154,10 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
   const json::Value* input = body.find("input");
   const json::Value* voice = body.find("voice");
   if (model == nullptr || !model->is_string() || input == nullptr ||
-      !input->is_string() || voice == nullptr || !voice->is_string()) {
+      !input->is_string() || (voice != nullptr && !voice->is_string())) {
     return Error(400, "Bad Request",
-                 "'model', 'input', and 'voice' must be strings",
+                 "'model' and 'input' must be strings; 'voice' must be a "
+                 "string when supplied",
                  "invalid_parameter_type");
   }
   if (model->str() != service.model_id() && model->str() != "qwen3-tts") {
@@ -171,9 +174,74 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
                  "input_too_large");
   }
   const std::vector<std::string> voices = service.voices();
-  if (std::ranges::find(voices, voice->str()) == voices.end()) {
+  if (service.variant() == models::qwen3_tts::ModelVariant::kCustomVoice &&
+      voice == nullptr) {
+    return Error(400, "Bad Request",
+                 "CustomVoice requests require a 'voice' speaker",
+                 "missing_voice");
+  }
+  const std::string selected_voice =
+      voice != nullptr ? voice->str()
+                       : (voices.empty() ? std::string{} : voices.front());
+  if (std::ranges::find(voices, selected_voice) == voices.end()) {
     return Error(400, "Bad Request", "unsupported Qwen3-TTS voice",
                  "invalid_voice");
+  }
+  if (service.variant() == models::qwen3_tts::ModelVariant::kVoiceDesign &&
+      body.member_str("instruct").empty()) {
+    return Error(400, "Bad Request",
+                 "VoiceDesign requests require a non-empty 'instruct'",
+                 "missing_instruction");
+  }
+  models::qwen3_tts::AudioBuffer reference_audio;
+  std::string reference_text;
+  bool speaker_embedding_only = false;
+  if (service.variant() == models::qwen3_tts::ModelVariant::kBase) {
+    const json::Value* encoded_audio = body.find("reference_audio");
+    const json::Value* clone_text = body.find("reference_text");
+    const json::Value* clone_mode = body.find("voice_clone_mode");
+    if (encoded_audio == nullptr || !encoded_audio->is_string()) {
+      return Error(400, "Bad Request",
+                   "Base voice cloning requires base64 WAV "
+                   "'reference_audio'",
+                   "missing_reference_audio");
+    }
+    if (clone_mode != nullptr &&
+        (!clone_mode->is_string() ||
+         (clone_mode->str() != "icl" &&
+          clone_mode->str() != "speaker_embedding_only"))) {
+      return Error(400, "Bad Request",
+                   "'voice_clone_mode' must be 'icl' or "
+                   "'speaker_embedding_only'",
+                   "invalid_voice_clone_mode");
+    }
+    speaker_embedding_only =
+        clone_mode != nullptr && clone_mode->str() == "speaker_embedding_only";
+    if (!speaker_embedding_only &&
+        (clone_text == nullptr || !clone_text->is_string() ||
+         clone_text->str().empty())) {
+      return Error(400, "Bad Request",
+                   "Base ICL voice cloning requires non-empty "
+                   "'reference_text'",
+                   "missing_reference_text");
+    }
+    if (clone_text != nullptr && !clone_text->is_string()) {
+      return Error(400, "Bad Request", "'reference_text' must be a string",
+                   "invalid_parameter_type");
+    }
+    std::string audio_error;
+    if (!models::qwen3_tts::DecodeBase64Wav(encoded_audio->str(),
+                                            &reference_audio, &audio_error)) {
+      return Error(400, "Bad Request", std::move(audio_error),
+                   "invalid_reference_audio");
+    }
+    reference_text = clone_text == nullptr ? std::string{} : clone_text->str();
+  } else if (body.find("reference_audio") != nullptr ||
+             body.find("reference_text") != nullptr ||
+             body.find("voice_clone_mode") != nullptr) {
+    return Error(400, "Bad Request",
+                 "reference audio fields are valid only for the Base model",
+                 "unsupported_field");
   }
   if (const json::Value* format = body.find("response_format");
       format != nullptr && (!format->is_string() || format->str() != "wav")) {
@@ -219,9 +287,12 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
 
   const models::qwen3_tts::SynthesisRequest synthesis{
       .text = input->str(),
-      .speaker = voice->str(),
+      .speaker = selected_voice,
       .language = body.member_str("language", "english"),
       .instruct = body.member_str("instruct"),
+      .reference_audio = std::move(reference_audio),
+      .reference_text = std::move(reference_text),
+      .speaker_embedding_only = speaker_embedding_only,
       .max_new_tokens = max_new_tokens,
       .seed = static_cast<std::uint32_t>(seed),
       .greedy = greedy,

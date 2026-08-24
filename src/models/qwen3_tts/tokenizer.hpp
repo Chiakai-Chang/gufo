@@ -33,6 +33,10 @@ public:
       std::string_view instruction, std::vector<std::uint32_t>* ids,
       std::string* error = nullptr) const;
 
+  [[nodiscard]] bool EncodeReferencePrompt(std::string_view text,
+                                           std::vector<std::uint32_t>* ids,
+                                           std::string* error = nullptr) const;
+
   [[nodiscard]] std::size_t vocabulary_size() const noexcept {
     return vocab_.size() + added_tokens_.size();
   }

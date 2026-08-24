@@ -271,6 +271,17 @@ __global__ void GeluKernel(float* values, std::size_t elements) {
   }
 }
 
+__global__ void PrepareSnakeBetaKernel(const float* alpha, const float* beta,
+                                       float* alpha_exp, float* beta_exp,
+                                       std::size_t columns) {
+  const std::size_t channel =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (channel < columns) {
+    alpha_exp[channel] = expf(alpha[channel]);
+    beta_exp[channel] = expf(beta[channel]);
+  }
+}
+
 __global__ void SnakeBetaKernel(const float* input, const float* alpha,
                                 const float* beta, float* output,
                                 std::size_t elements, std::size_t columns) {
@@ -282,6 +293,20 @@ __global__ void SnakeBetaKernel(const float* input, const float* alpha,
     const float beta_exp = expf(beta[channel]);
     const float sine = sinf(input[index] * alpha_exp);
     output[index] = input[index] + sine * sine / (beta_exp + 1.0e-9F);
+  }
+}
+
+__global__ void PreparedSnakeBetaKernel(const float* input,
+                                        const float* alpha_exp,
+                                        const float* beta_exp, float* output,
+                                        std::size_t elements,
+                                        std::size_t columns) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) {
+    const std::size_t channel = index % columns;
+    const float sine = sinf(input[index] * alpha_exp[channel]);
+    output[index] = input[index] + sine * sine / (beta_exp[channel] + 1.0e-9F);
   }
 }
 
@@ -484,12 +509,30 @@ void LaunchGelu(float* values, std::size_t elements, hipStream_t stream) {
                      stream, values, elements);
 }
 
+void LaunchPrepareSnakeBeta(const float* alpha, const float* beta,
+                            float* alpha_exp, float* beta_exp,
+                            std::size_t columns, hipStream_t stream) {
+  hipLaunchKernelGGL(PrepareSnakeBetaKernel, dim3(Blocks(columns)),
+                     dim3(kThreads), 0, stream, alpha, beta, alpha_exp,
+                     beta_exp, columns);
+}
+
 void LaunchSnakeBeta(const float* input, const float* alpha, const float* beta,
                      float* output, std::size_t rows, std::size_t columns,
                      hipStream_t stream) {
   const std::size_t elements = rows * columns;
   hipLaunchKernelGGL(SnakeBetaKernel, dim3(Blocks(elements)), dim3(kThreads), 0,
                      stream, input, alpha, beta, output, elements, columns);
+}
+
+void LaunchPreparedSnakeBeta(const float* input, const float* alpha_exp,
+                             const float* beta_exp, float* output,
+                             std::size_t rows, std::size_t columns,
+                             hipStream_t stream) {
+  const std::size_t elements = rows * columns;
+  hipLaunchKernelGGL(PreparedSnakeBetaKernel, dim3(Blocks(elements)),
+                     dim3(kThreads), 0, stream, input, alpha_exp, beta_exp,
+                     output, elements, columns);
 }
 
 void LaunchCausalConv1dIm2Col(const float* input, float* columns,

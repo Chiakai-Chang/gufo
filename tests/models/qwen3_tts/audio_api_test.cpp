@@ -62,6 +62,38 @@ TtsService MakeService(FakeRunner* runner) {
   });
 }
 
+TtsService MakeVoiceDesignService(FakeRunner* runner) {
+  return TtsService(TtsServiceOptions{
+      .model_root = {},
+      .validate_model = false,
+      .variant = qwen3_tts::ModelVariant::kVoiceDesign,
+      .model_id = {},
+      .voices = {},
+      .runner =
+          [runner](const qwen3_tts::SynthesisRequest& request,
+                   const qwen3_tts::CancellationCheck& cancelled,
+                   qwen3_tts::SynthesisResult* result, std::string* error) {
+            return runner->Run(request, cancelled, result, error);
+          },
+  });
+}
+
+TtsService MakeBaseService(FakeRunner* runner) {
+  return TtsService(TtsServiceOptions{
+      .model_root = {},
+      .validate_model = false,
+      .variant = qwen3_tts::ModelVariant::kBase,
+      .model_id = {},
+      .voices = {},
+      .runner =
+          [runner](const qwen3_tts::SynthesisRequest& request,
+                   const qwen3_tts::CancellationCheck& cancelled,
+                   qwen3_tts::SynthesisResult* result, std::string* error) {
+            return runner->Run(request, cancelled, result, error);
+          },
+  });
+}
+
 HttpResponse Send(TtsService& service, std::string method, std::string path,
                   std::string body = {}) {
   return HandleAudioTtsApiRequest(
@@ -145,11 +177,84 @@ void TestValidationAndVoices() {
   Check(runner.calls == 0, "invalid requests never invoke inference");
 }
 
+void TestVoiceDesignContract() {
+  FakeRunner runner;
+  TtsService service = MakeVoiceDesignService(&runner);
+  Check(service.ready() &&
+            service.model_id() == "qwen3-tts-12hz-1.7b-voice-design",
+        "VoiceDesign service derives its model identity");
+
+  const HttpResponse response = Send(
+      service, "POST", "/v1/audio/speech",
+      R"({"model":"qwen3-tts","input":"A lantern in the rain.","language":"english","instruct":"A calm, warm adult voice."})");
+  Check(response.status == 200 && runner.calls == 1 &&
+            runner.latest.speaker == "voice-design" &&
+            runner.latest.instruct == "A calm, warm adult voice.",
+        "VoiceDesign uses instructions without CustomVoice speaker semantics");
+
+  Check(Send(service, "POST", "/v1/audio/speech",
+             R"({"model":"qwen3-tts","input":"x"})")
+                .status == 400,
+        "VoiceDesign rejects a missing instruction");
+  Check(
+      Send(
+          service, "POST", "/v1/audio/speech",
+          R"({"model":"qwen3-tts","input":"x","voice":"vivian","instruct":"calm"})")
+              .status == 400,
+      "VoiceDesign rejects CustomVoice speaker names");
+}
+
+void TestBaseContract() {
+  constexpr std::string_view kReferenceWav =
+      "UklGRiwAAABXQVZFZm10IBAAAAABAAEAwF0AAIC7AAACABAAZGF0YQgAAAAAAOgD"
+      "GPwAAA==";
+  FakeRunner runner;
+  TtsService service = MakeBaseService(&runner);
+  Check(service.ready() && service.model_id() == "qwen3-tts-12hz-1.7b-base",
+        "Base service derives its model identity");
+
+  const HttpResponse response = Send(
+      service, "POST", "/v1/audio/speech",
+      std::string(
+          R"({"model":"qwen3-tts","input":"Clone me.","reference_audio":")") +
+          std::string(kReferenceWav) +
+          R"(","reference_text":"Reference phrase.","language":"auto"})");
+  Check(response.status == 200 && runner.calls == 1 &&
+            runner.latest.speaker == "voice-clone" &&
+            runner.latest.reference_audio.sample_rate == 24000 &&
+            runner.latest.reference_audio.channels == 1 &&
+            runner.latest.reference_audio.samples.size() == 4 &&
+            runner.latest.reference_text == "Reference phrase." &&
+            !runner.latest.speaker_embedding_only,
+        "Base ICL reference audio reaches the synthesis contract");
+
+  Check(Send(service, "POST", "/v1/audio/speech",
+             R"({"model":"qwen3-tts","input":"x"})")
+                .status == 400,
+        "Base rejects a missing reference WAV");
+  Check(Send(service, "POST", "/v1/audio/speech",
+             std::string(
+                 R"({"model":"qwen3-tts","input":"x","reference_audio":")") +
+                 std::string(kReferenceWav) + R"("})")
+                .status == 400,
+        "Base ICL rejects missing reference text");
+  Check(Send(service, "POST", "/v1/audio/speech",
+             std::string(
+                 R"({"model":"qwen3-tts","input":"x","reference_audio":")") +
+                 std::string(kReferenceWav) +
+                 R"(","voice_clone_mode":"speaker_embedding_only"})")
+                    .status == 200 &&
+            runner.latest.speaker_embedding_only,
+        "Base speaker-embedding-only mode does not require reference text");
+}
+
 }  // namespace
 
 int main() {
   TestSpeech();
   TestValidationAndVoices();
+  TestVoiceDesignContract();
+  TestBaseContract();
   std::cout << "PASS qwen3_tts_audio_api_test\n";
   return 0;
 }

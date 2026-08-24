@@ -538,6 +538,13 @@ if (BUILD_TESTING)
   set_tests_properties(qwen3_tts_config_test PROPERTIES
     LABELS "cpu;models;qwen3-tts;config;quality")
 
+  add_executable(qwen3_tts_prompt_test
+    tests/models/qwen3_tts/prompt_test.cpp)
+  target_link_libraries(qwen3_tts_prompt_test PRIVATE strix_qwen3_tts)
+  add_test(NAME qwen3_tts_prompt_test COMMAND qwen3_tts_prompt_test)
+  set_tests_properties(qwen3_tts_prompt_test PROPERTIES
+    LABELS "cpu;models;qwen3-tts;prompt;quality;exact")
+
   add_test(NAME qwen3_tts_reference_artifacts_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/models/qwen3_tts/reference/verify_artifacts.py
@@ -630,7 +637,20 @@ if (BUILD_TESTING)
     add_test(NAME qwen3_tts_speech_decoder_hip_test
       COMMAND qwen3_tts_speech_decoder_hip_test)
     set_tests_properties(qwen3_tts_speech_decoder_hip_test PROPERTIES
-      LABELS "hip;gpu;gfx1151;models;qwen3-tts;speech-decoder;audio;quality;external-model;slow"
+      LABELS "hip;gpu;gfx1151;models;qwen3-tts;speech-decoder;audio;quality;external-model;slow;opt-qwen3-tts-device-copy"
+      SKIP_RETURN_CODE 77)
+    add_test(NAME qwen3_tts_speech_decoder_mapped_hip_test
+      COMMAND qwen3_tts_speech_decoder_hip_test)
+    set_tests_properties(qwen3_tts_speech_decoder_mapped_hip_test PROPERTIES
+      ENVIRONMENT "STRIX_QWEN3_TTS_WEIGHT_MODE=mapped"
+      LABELS "hip;gpu;gfx1151;models;qwen3-tts;speech-decoder;audio;quality;external-model;slow;opt-qwen3-tts-device-copy;reference"
+      SKIP_RETURN_CODE 77)
+    add_test(NAME qwen3_tts_speech_decoder_precomputed_snake_hip_test
+      COMMAND qwen3_tts_speech_decoder_hip_test)
+    set_tests_properties(
+      qwen3_tts_speech_decoder_precomputed_snake_hip_test PROPERTIES
+      ENVIRONMENT "STRIX_QWEN3_TTS_PRECOMPUTE_SNAKE=1"
+      LABELS "hip;gpu;gfx1151;models;qwen3-tts;speech-decoder;audio;quality;external-model;slow;opt-qwen3-tts-snake;rejected"
       SKIP_RETURN_CODE 77)
 
     add_executable(qwen3_tts_talker_hip_prefill_test
@@ -641,6 +661,26 @@ if (BUILD_TESTING)
       COMMAND qwen3_tts_talker_hip_prefill_test)
     set_tests_properties(qwen3_tts_talker_hip_prefill_test PROPERTIES
       LABELS "hip;gpu;gfx1151;models;qwen3-tts;talker;prefill;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(qwen3_tts_variant_talker_hip_test
+      tests/models/qwen3_tts/variant_talker_hip_test.cpp)
+    target_link_libraries(qwen3_tts_variant_talker_hip_test PRIVATE
+      strix_qwen3_tts hip::host)
+    add_test(NAME qwen3_tts_variant_talker_hip_test
+      COMMAND qwen3_tts_variant_talker_hip_test)
+    set_tests_properties(qwen3_tts_variant_talker_hip_test PROPERTIES
+      LABELS "hip;gpu;gfx1151;models;qwen3-tts;talker;voice-design;base;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(qwen3_tts_base_encoders_hip_test
+      tests/models/qwen3_tts/base_encoders_hip_test.cpp)
+    target_link_libraries(qwen3_tts_base_encoders_hip_test PRIVATE
+      strix_qwen3_tts hip::host)
+    add_test(NAME qwen3_tts_base_encoders_hip_test
+      COMMAND qwen3_tts_base_encoders_hip_test)
+    set_tests_properties(qwen3_tts_base_encoders_hip_test PROPERTIES
+      LABELS "hip;gpu;gfx1151;models;qwen3-tts;base;speech-encoder;speaker-encoder;quality;external-model;slow"
       SKIP_RETURN_CODE 77)
 
     add_executable(minimax_h3_runtime_hip_test

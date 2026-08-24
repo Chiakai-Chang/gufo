@@ -49,9 +49,18 @@ void LaunchSwiGlu(const float* gate, const float* up, float* output,
 
 void LaunchGelu(float* values, std::size_t elements, hipStream_t stream);
 
+void LaunchPrepareSnakeBeta(const float* alpha, const float* beta,
+                            float* alpha_exp, float* beta_exp,
+                            std::size_t columns, hipStream_t stream);
+
 void LaunchSnakeBeta(const float* input, const float* alpha, const float* beta,
                      float* output, std::size_t rows, std::size_t columns,
                      hipStream_t stream);
+
+void LaunchPreparedSnakeBeta(const float* input, const float* alpha_exp,
+                             const float* beta_exp, float* output,
+                             std::size_t rows, std::size_t columns,
+                             hipStream_t stream);
 
 void LaunchCausalConv1dIm2Col(const float* input, float* columns,
                               std::size_t input_length,

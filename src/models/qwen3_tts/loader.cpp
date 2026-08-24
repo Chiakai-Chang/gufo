@@ -199,10 +199,10 @@ LoadResult LoadModelDirectory(const std::string& model_dir) {
     return result;
   }
   result.config = *config;
-  if (result.config.model_type != "qwen3_tts" ||
-      result.config.tokenizer_type != "qwen3_tts_tokenizer_12hz" ||
-      result.config.tts_model_type != "custom_voice") {
-    result.error = "qwen3_tts: expected a 12Hz CustomVoice model configuration";
+  if (!IsSupportedModelConfig(result.config)) {
+    result.error =
+        "qwen3_tts: expected a supported 12Hz 1.7B CustomVoice, "
+        "VoiceDesign, or Base model configuration";
     return result;
   }
 
@@ -227,7 +227,7 @@ LoadResult LoadModelDirectory(const std::string& model_dir) {
 
 bool LooksLikeQwen3Tts(const std::string& model_dir) {
   const auto config = LoadModelConfigFromPath(model_dir);
-  return config.has_value() && config->model_type == "qwen3_tts";
+  return config.has_value() && IsSupportedModelConfig(*config);
 }
 
 }  // namespace strix::models::qwen3_tts
