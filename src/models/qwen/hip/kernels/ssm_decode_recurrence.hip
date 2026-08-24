@@ -105,66 +105,117 @@ __global__ void DeltaNetRecurrenceKernel(
   const float alpha_h = expf(alpha_softplus * a_val);
   const float beta_h = 1.0F / (1.0F + expf(-beta_in));
 
-  // 2. Normalize key ||k_h||_2 and query ||q_h||_2
+  // 2. Normalize key ||k_h||_2 and query ||q_h||_2 in parallel
+  __shared__ float s_k[128];
+  __shared__ float s_q[128];
   __shared__ float s_norm[2];
+  __shared__ float s_warp_k[8];
+  __shared__ float s_warp_q[8];
+
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+
+  float local_k_sq = 0.0F;
+  float local_q_sq = 0.0F;
+  if (tid < key_dim) {
+    const float kv = k_h[tid];
+    const float qv = q_h[tid];
+    s_k[tid] = kv;
+    s_q[tid] = qv;
+    local_k_sq = kv * kv;
+    local_q_sq = qv * qv;
+  }
+  for (int off = 16; off > 0; off >>= 1) {
+    local_k_sq += __shfl_xor(local_k_sq, off);
+    local_q_sq += __shfl_xor(local_q_sq, off);
+  }
+  if (lane_id == 0) {
+    s_warp_k[warp_id] = local_k_sq;
+    s_warp_q[warp_id] = local_q_sq;
+  }
+  __syncthreads();
+
   if (tid == 0) {
-    float k_sq = 0.0F;
-    float q_sq = 0.0F;
-    for (std::uint32_t i = 0; i < key_dim; ++i) {
-      k_sq += k_h[i] * k_h[i];
-      q_sq += q_h[i] * q_h[i];
+    float k_sq = 0.0F, q_sq = 0.0F;
+    const std::size_t num_warps = blockDim.x >> 5u;
+    for (std::size_t w = 0; w < num_warps; ++w) {
+      k_sq += s_warp_k[w];
+      q_sq += s_warp_q[w];
     }
     s_norm[0] = 1.0F / sqrtf(k_sq + 1e-6F);
     s_norm[1] = 1.0F / sqrtf(q_sq + 1e-6F);
   }
   __syncthreads();
-  const float q_scale = (1.0F / sqrtf(static_cast<float>(key_dim))) * s_norm[1];
-  const float inv_k_norm = s_norm[0];
 
-  // 3. Associative retrieval: u_j = sum_i S[j, i] * (k[i] * inv_k_norm)
+  const float inv_k_norm = s_norm[0];
+  const float q_scale = (1.0F / sqrtf(static_cast<float>(key_dim))) * s_norm[1];
+  if (tid < key_dim) {
+    s_k[tid] *= inv_k_norm;
+    s_q[tid] *= q_scale;
+  }
+  __syncthreads();
+
+  // 3. Associative retrieval & state update with vectorized float4
   if (tid < val_dim) {
     const std::size_t j = tid;
     float* s_row = s_matrix + (j * key_dim);
+    const float4* s_row4 = reinterpret_cast<const float4*>(s_row);
+    float4* s_row4_out = reinterpret_cast<float4*>(s_row);
+    const float4* k4 = reinterpret_cast<const float4*>(s_k);
+    const float4* q4 = reinterpret_cast<const float4*>(s_q);
 
-    // Decay state while computing the retrieval. Keeping the decayed value
-    // live avoids a second full read of the state row.
+    const std::size_t key_vec = key_dim / 4;
+
     float u_j = 0.0F;
-    for (std::size_t i = 0; i < key_dim; ++i) {
-      const float state = s_row[i] * alpha_h;
-      s_row[i] = state;
-      u_j += state * (k_h[i] * inv_k_norm);
+#pragma unroll
+    for (std::size_t vi = 0; vi < key_vec; ++vi) {
+      const float4 st = s_row4[vi];
+      const float4 kv = k4[vi];
+      u_j += (st.x * alpha_h) * kv.x + (st.y * alpha_h) * kv.y +
+             (st.z * alpha_h) * kv.z + (st.w * alpha_h) * kv.w;
     }
     const float d_j = (v_h[j] - u_j) * beta_h;
 
-    // Apply the delta and compute the query readout from the same updated
-    // value, avoiding another full read of the state row.
     float o_j = 0.0F;
-    for (std::size_t i = 0; i < key_dim; ++i) {
-      const float state = s_row[i] + d_j * (k_h[i] * inv_k_norm);
-      s_row[i] = state;
-      o_j += state * (q_h[i] * q_scale);
+#pragma unroll
+    for (std::size_t vi = 0; vi < key_vec; ++vi) {
+      float4 st = s_row4[vi];
+      const float4 kv = k4[vi];
+      const float4 qv = q4[vi];
+      st.x = (st.x * alpha_h) + (d_j * kv.x);
+      st.y = (st.y * alpha_h) + (d_j * kv.y);
+      st.z = (st.z * alpha_h) + (d_j * kv.z);
+      st.w = (st.w * alpha_h) + (d_j * kv.w);
+      s_row4_out[vi] = st;
+      o_j += st.x * qv.x + st.y * qv.y + st.z * qv.z + st.w * qv.w;
     }
     o_h[j] = o_j;
   }
   __syncthreads();
 
-  // 4. Per-head RMSNorm on o_h (val_dim = 256 or 128 elements)
-  __shared__ float s_sum[256];
-  if (tid < val_dim) {
-    s_sum[tid] = o_h[tid] * o_h[tid];
-  } else {
-    s_sum[tid] = 0.0F;
+  // 4. Per-head RMSNorm on o_h with warp reductions
+  float val_sq = (tid < val_dim) ? (o_h[tid] * o_h[tid]) : 0.0F;
+  for (int off = 16; off > 0; off >>= 1) {
+    val_sq += __shfl_xor(val_sq, off);
   }
-  __syncthreads();
-  for (std::size_t s = blockDim.x / 2; s > 0; s /= 2) {
-    if (tid < s)
-      s_sum[tid] += s_sum[tid + s];
-    __syncthreads();
+  __shared__ float s_val_warp[8];
+  if (lane_id == 0) {
+    s_val_warp[warp_id] = val_sq;
   }
-  const float mean_sq = s_sum[0] / static_cast<float>(val_dim);
-  const float rms = rsqrtf(mean_sq + 1e-6F);
   __syncthreads();
 
+  if (tid == 0) {
+    float total_sq = 0.0F;
+    const std::size_t num_warps = blockDim.x >> 5u;
+    for (std::size_t w = 0; w < num_warps; ++w) {
+      total_sq += s_val_warp[w];
+    }
+    const float mean_sq = total_sq / static_cast<float>(val_dim);
+    s_norm[0] = rsqrtf(mean_sq + 1e-6F);
+  }
+  __syncthreads();
+
+  const float rms = s_norm[0];
   if (tid < val_dim) {
     const float w = (ssm_norm != nullptr) ? ssm_norm[tid] : 1.0F;
     float val = o_h[tid] * rms * w;

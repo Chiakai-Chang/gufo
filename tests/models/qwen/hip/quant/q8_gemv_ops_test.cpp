@@ -160,33 +160,6 @@ void TestQ8_0BlockGEMVEquivalence() {
     return static_cast<std::uint16_t>(
         sign | (static_cast<std::uint32_t>(exp) << 10) | mant);
   };
-  auto half_to_float = [](std::uint16_t h) -> float {
-    const std::uint32_t sign = (h >> 15) & 1u;
-    const std::uint32_t exp = (h >> 10) & 0x1Fu;
-    const std::uint32_t mant = h & 0x3FFu;
-    std::uint32_t f;
-    if (exp == 0) {
-      if (mant == 0) {
-        f = sign << 31;
-      } else {
-        std::uint32_t e = 0;
-        std::uint32_t m = mant;
-        while ((m & 0x400u) == 0) {
-          m <<= 1;
-          ++e;
-        }
-        m &= 0x3FFu;
-        f = (sign << 31) | ((127 - 15 - e) << 23) | (m << 13);
-      }
-    } else if (exp == 31) {
-      f = (sign << 31) | 0x7F800000u | (mant << 13);
-    } else {
-      f = (sign << 31) | ((exp - 15 + 127) << 23) | (mant << 13);
-    }
-    float r;
-    std::memcpy(&r, &f, sizeof(r));
-    return r;
-  };
 
   // Synthetic Q8_0 weights: qs in [-127,127], d (as fp16) in ~[-2,2]; x is fp32
   // in [-1,1].

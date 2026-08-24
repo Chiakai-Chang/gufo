@@ -8,13 +8,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
+#include "src/models/qwen/hip/kernels/common.hip"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
-#include "src/core/gguf_reader.hpp"
-
-#include "src/models/qwen/hip/kernels/common.hip"
 
 namespace strix::hip {
 
@@ -94,12 +93,24 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     for (std::size_t k = (K_vec * 8) + lane_id; k < hidden_size; k += 32) {
       dot += static_cast<float>(row[k]) * x[k];
     }
+  } else if (weight_type == core::GgmlType::kQ8_0) {
+    const std::size_t num_blocks = hidden_size / kQ8_0BlockSize;
+    const auto* row_blocks =
+        static_cast<const Q8_0Block*>(A) + (row_idx * num_blocks);
+    for (std::size_t b = lane_id; b < num_blocks; b += 32) {
+      const float* xb = x + (b * kQ8_0BlockSize);
+      const Q8_0Block& wblk = row_blocks[b];
+      const float d = __half2float(wblk.d);
+      float blk_dot = 0.0F;
+#pragma unroll
+      for (int i = 0; i < 32; ++i) {
+        blk_dot += static_cast<float>(wblk.qs[i]) * xb[i];
+      }
+      dot += d * blk_dot;
+    }
   } else if (weight_type != core::GgmlType::kF32) {
-    // Quantized weight: route via QuantWarpBlockDot (block_q8_K now; Q8_0/Q5_K/
-    // Q6_K wired in later tasks). All 32 lanes cooperate on the row's blocks;
-    // lane 0 returns the warp's partial row-dot and the warp reduction below
-    // (num_warps == 1) broadcasts the single correct value.
-    dot = QuantWarpBlockDot(weight_type, A, row_idx, x, hidden_size, lane_id, 0, 1);
+    dot = QuantWarpBlockDot(weight_type, A, row_idx, x, hidden_size, lane_id, 0,
+                            1);
   } else {
     const auto* row = static_cast<const float*>(A) + (row_idx * hidden_size);
     const std::size_t K_vec = hidden_size / 4;
@@ -116,8 +127,12 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     }
   }
 
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    dot += __shfl_xor(dot, offset);
+  if (weight_type == core::GgmlType::kBF16 ||
+      weight_type == core::GgmlType::kF32 ||
+      weight_type == core::GgmlType::kQ8_0) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_xor(dot, offset);
+    }
   }
 
   if (lane_id == 0) {
@@ -132,9 +147,8 @@ __global__ void FusedSSMInputProjectionsKernel(
     const void* __restrict__ beta_w, core::GgmlType beta_type,
     const float* __restrict__ x, float* __restrict__ qkv_out,
     float* __restrict__ gate_out, float* __restrict__ alpha_out,
-    float* __restrict__ beta_out, std::size_t hidden_size,
-    std::size_t qkv_size, std::size_t inner_size,
-    std::size_t time_step_rank) {
+    float* __restrict__ beta_out, std::size_t hidden_size, std::size_t qkv_size,
+    std::size_t inner_size, std::size_t time_step_rank) {
   const std::size_t m = blockIdx.x;
   const std::size_t gate_end = qkv_size + inner_size;
   const std::size_t alpha_end = gate_end + time_step_rank;
@@ -389,9 +403,9 @@ void LaunchFusedSSMInputProjections(
   }
 
   FusedSSMInputProjectionsKernel<<<total_rows, 128, 0, stream>>>(
-      qkv_w, qkv_type, gate_w, gate_type, alpha_w, alpha_type, beta_w, beta_type,
-      x, qkv_out, gate_out, alpha_out, beta_out, hidden_size, qkv_size,
-      inner_size, time_step_rank);
+      qkv_w, qkv_type, gate_w, gate_type, alpha_w, alpha_type, beta_w,
+      beta_type, x, qkv_out, gate_out, alpha_out, beta_out, hidden_size,
+      qkv_size, inner_size, time_step_rank);
 }
 
 void LaunchFusedRMSNormSSMInputProjections(

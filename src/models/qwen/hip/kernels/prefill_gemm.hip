@@ -139,14 +139,21 @@ void LaunchFloatToBfloat16(const float* in, void* out, std::size_t num_elements,
 __global__ void DequantizeQ8KToBf16Kernel(const void* __restrict__ w,
                                           hip_bfloat16* __restrict__ out,
                                           std::size_t n_blocks) {
-  const std::size_t b = blockIdx.x;
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t b = (blockIdx.x * (blockDim.x >> 5u)) + warp_id;
   if (b >= n_blocks) {
     return;
   }
-  const std::size_t j = threadIdx.x;
   const auto* blk = static_cast<const Q8KBlock*>(w) + b;
-  out[(b * kQ8KBlockSize) + j] =
-      hip_bfloat16(blk->d * static_cast<float>(blk->qs[j]));
+  const float d = blk->d;
+  hip_bfloat16* out_blk = out + (b * kQ8KBlockSize);
+#pragma unroll
+  for (std::size_t k = 0; k < 8; ++k) {
+    const std::size_t j = lane_id + (32u * k);
+    out_blk[j] = hip_bfloat16(d * static_cast<float>(blk->qs[j]));
+  }
 }
 
 void LaunchDequantizeQ8KToBf16(const void* w, hip_bfloat16* out,
@@ -159,26 +166,27 @@ void LaunchDequantizeQ8KToBf16(const void* w, hip_bfloat16* out,
     return;
   }
   const std::size_t n_blocks = n_elems / kQ8KBlockSize;
-  DequantizeQ8KToBf16Kernel<<<static_cast<unsigned int>(n_blocks),
-                              static_cast<unsigned int>(kQ8KBlockSize), 0,
+  constexpr unsigned int block_threads = 256;
+  constexpr unsigned int warps_per_block = block_threads / 32;
+  const std::size_t grid = (n_blocks + warps_per_block - 1U) / warps_per_block;
+  DequantizeQ8KToBf16Kernel<<<static_cast<unsigned int>(grid), block_threads, 0,
                               stream>>>(w, out, n_blocks);
 }
 
 // Per-value dequant helpers (fp32), matching the CPU oracles
 // Q5Value/Q6Value/DequantizeQ8_0 in ggml_dequant.cpp. GetQKScaleMin (used by
 // Q5KValueFp) is defined in the shared quant_ops.hpp header.
-__device__ float Q5KValueFp(const Q5KBlock& block,
-                            std::size_t index) noexcept {
-  const std::size_t gg = index / 64;   // 0..3
-  const std::size_t wv = index % 64;   // 0..63
-  const std::size_t lane = wv % 32;    // 0..31
+__device__ float Q5KValueFp(const Q5KBlock& block, std::size_t index) noexcept {
+  const std::size_t gg = index / 64;  // 0..3
+  const std::size_t wv = index % 64;  // 0..63
+  const std::size_t lane = wv % 32;   // 0..31
   const bool lohalf = (wv < 32);
   const std::uint8_t qb = block.qs[(gg * 32) + lane];
   const std::uint8_t quant4 = lohalf ? (qb & 0x0FU) : (qb >> 4U);
   const int bit = static_cast<int>(2 * gg) + (lohalf ? 0 : 1);  // 0..7
   const std::uint8_t quant = static_cast<std::uint8_t>(
       quant4 + (((block.qh[lane] >> bit) & 1U) ? 16U : 0U));  // 0..31
-  const std::size_t sis = (2 * gg) + (lohalf ? 0 : 1);  // 0..7
+  const std::size_t sis = (2 * gg) + (lohalf ? 0 : 1);        // 0..7
   std::uint8_t sc = 0;
   std::uint8_t m = 0;
   GetQKScaleMin(sis, block.scales, sc, m);
@@ -187,8 +195,7 @@ __device__ float Q5KValueFp(const Q5KBlock& block,
          __half2float(block.dmin) * static_cast<float>(m);
 }
 
-__device__ float Q6KValueFp(const Q6KBlock& block,
-                            std::size_t index) noexcept {
+__device__ float Q6KValueFp(const Q6KBlock& block, std::size_t index) noexcept {
   const std::size_t half = index / 128;
   const std::size_t within = index % 128;
   const std::size_t segment = within / 32;
@@ -227,72 +234,94 @@ __device__ float Q8_0ValueFp(const Q8_0Block& block,
   return __half2float(block.d) * static_cast<float>(block.qs[index]);
 }
 
-// Type-dispatched dequant-to-BF16 kernels. One block per quant block, one
-// thread per element; out[b*qk + j] = (hip_bfloat16)(per_value_dequant).
+// Type-dispatched dequant-to-BF16 kernels.
 __global__ void DequantizeQ8_0ToBf16Kernel(const void* __restrict__ w,
                                            hip_bfloat16* __restrict__ out,
                                            std::size_t n_blocks) {
-  const std::size_t b = blockIdx.x;
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t blk_in_warp = lane_id >> 2u;     // 0..7
+  const std::size_t elem_off = (lane_id & 3u) * 8u;  // 0, 8, 16, 24
+  const std::size_t b =
+      (blockIdx.x * ((blockDim.x >> 5u) * 8u)) + (warp_id * 8u) + blk_in_warp;
   if (b >= n_blocks) {
     return;
   }
-  const std::size_t j = threadIdx.x;
-  if (j >= kQ8_0BlockSize) {
-    return;
-  }
   const auto* blk = static_cast<const Q8_0Block*>(w) + b;
-  out[(b * kQ8_0BlockSize) + j] = hip_bfloat16(Q8_0ValueFp(*blk, j));
+  const float d = __half2float(blk->d);
+  const auto q8_raw = *reinterpret_cast<const uint64_t*>(blk->qs + elem_off);
+  const auto* qs = reinterpret_cast<const int8_t*>(&q8_raw);
+
+  hip_bfloat16 bf[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    bf[i] = hip_bfloat16(d * static_cast<float>(qs[i]));
+  }
+
+  *reinterpret_cast<uint4*>(&out[(b * kQ8_0BlockSize) + elem_off]) =
+      *reinterpret_cast<const uint4*>(bf);
 }
 
 __global__ void DequantizeQ5KToBf16Kernel(const void* __restrict__ w,
                                           hip_bfloat16* __restrict__ out,
                                           std::size_t n_blocks) {
-  const std::size_t b = blockIdx.x;
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t b = (blockIdx.x * (blockDim.x >> 5u)) + warp_id;
   if (b >= n_blocks) {
     return;
   }
-  const std::size_t j = threadIdx.x;
-  if (j >= kQ5KBlockSize) {
-    return;
-  }
   const auto* blk = static_cast<const Q5KBlock*>(w) + b;
-  out[(b * kQ5KBlockSize) + j] = hip_bfloat16(Q5KValueFp(*blk, j));
+  hip_bfloat16* out_blk = out + (b * kQ5KBlockSize);
+#pragma unroll
+  for (std::size_t k = 0; k < 8; ++k) {
+    const std::size_t j = lane_id + (32u * k);
+    out_blk[j] = hip_bfloat16(Q5KValueFp(*blk, j));
+  }
 }
 
 __global__ void DequantizeQ6KToBf16Kernel(const void* __restrict__ w,
                                           hip_bfloat16* __restrict__ out,
                                           std::size_t n_blocks) {
-  const std::size_t b = blockIdx.x;
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t b = (blockIdx.x * (blockDim.x >> 5u)) + warp_id;
   if (b >= n_blocks) {
     return;
   }
-  const std::size_t j = threadIdx.x;
-  if (j >= kQ6KBlockSize) {
-    return;
-  }
   const auto* blk = static_cast<const Q6KBlock*>(w) + b;
-  out[(b * kQ6KBlockSize) + j] = hip_bfloat16(Q6KValueFp(*blk, j));
+  hip_bfloat16* out_blk = out + (b * kQ6KBlockSize);
+#pragma unroll
+  for (std::size_t k = 0; k < 8; ++k) {
+    const std::size_t j = lane_id + (32u * k);
+    out_blk[j] = hip_bfloat16(Q6KValueFp(*blk, j));
+  }
 }
 
 // opt-c162-q8k-prefill-dequant (extended): type-dispatched entry point that
 // converts a quantized weight region (Q8_0/Q5_K/Q6_K/Q8_K) into a BF16 scratch
-// for the prefill hipblas GEMM path. Q8_0 uses a 32-thread block (QK=32);
-// Q5_K/Q6_K/Q8_K use a 256-thread block (QK=256). Requires n_elems to be a
-// whole number of blocks. Unsupported types and non-multiple sizes are no-ops.
+// for the prefill hipblas GEMM path.
 void LaunchDequantizeToBf16(core::GgmlType type, const void* w,
                             hip_bfloat16* out, std::size_t n_elems,
                             hipStream_t stream) {
   if (n_elems == 0) {
     return;
   }
+  constexpr unsigned int block_threads = 256;
+  constexpr unsigned int warps_per_block = block_threads / 32;
+
   if (type == core::GgmlType::kQ8_0) {
     if (n_elems % kQ8_0BlockSize != 0) {
       return;
     }
     const std::size_t n_blocks = n_elems / kQ8_0BlockSize;
-    DequantizeQ8_0ToBf16Kernel<<<static_cast<unsigned int>(n_blocks),
-                                 static_cast<unsigned int>(kQ8_0BlockSize), 0,
-                                 stream>>>(w, out, n_blocks);
+    constexpr unsigned int blocks_per_tb = warps_per_block * 8u;
+    const std::size_t grid = (n_blocks + blocks_per_tb - 1U) / blocks_per_tb;
+    DequantizeQ8_0ToBf16Kernel<<<static_cast<unsigned int>(grid), block_threads,
+                                 0, stream>>>(w, out, n_blocks);
     return;
   }
   if (type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ6_K ||
@@ -301,16 +330,15 @@ void LaunchDequantizeToBf16(core::GgmlType type, const void* w,
       return;
     }
     const std::size_t n_blocks = n_elems / kQ5KBlockSize;
+    const std::size_t grid =
+        (n_blocks + warps_per_block - 1U) / warps_per_block;
     if (type == core::GgmlType::kQ5_K) {
-      DequantizeQ5KToBf16Kernel<<<static_cast<unsigned int>(n_blocks),
-                                  static_cast<unsigned int>(kQ5KBlockSize), 0,
-                                  stream>>>(w, out, n_blocks);
+      DequantizeQ5KToBf16Kernel<<<static_cast<unsigned int>(grid),
+                                  block_threads, 0, stream>>>(w, out, n_blocks);
     } else if (type == core::GgmlType::kQ6_K) {
-      DequantizeQ6KToBf16Kernel<<<static_cast<unsigned int>(n_blocks),
-                                  static_cast<unsigned int>(kQ6KBlockSize), 0,
-                                  stream>>>(w, out, n_blocks);
+      DequantizeQ6KToBf16Kernel<<<static_cast<unsigned int>(grid),
+                                  block_threads, 0, stream>>>(w, out, n_blocks);
     } else {
-      // kQ8_K: reuse the existing single-type kernel (one implementation).
       LaunchDequantizeQ8KToBf16(w, out, n_elems, stream);
     }
     return;
@@ -318,12 +346,118 @@ void LaunchDequantizeToBf16(core::GgmlType type, const void* w,
   // Unsupported quant type: no-op.
 }
 
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void TiledBatchedQ8_0GEMMKernel(const void* __restrict__ w,
+                                    const hip_bfloat16* __restrict__ x,
+                                    float* __restrict__ y, std::size_t batch,
+                                    std::size_t m, std::size_t k) {
+  constexpr std::size_t kRowsPerWave = 4;
+  constexpr std::size_t kTokensPerWave = 8;
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+
+  const std::size_t row_base =
+      (blockIdx.x * WavesPerBlock + warp_id) * kRowsPerWave;
+  const std::size_t tok_base = blockIdx.y * kTokensPerWave;
+  if (row_base >= m || tok_base >= batch) {
+    return;
+  }
+
+  const std::size_t num_blocks = k / kQ8_0BlockSize;
+  const auto* w_blocks = static_cast<const Q8_0Block*>(w);
+
+  const auto* row0 = w_blocks + ((row_base + 0) * num_blocks);
+  const auto* row1 =
+      (row_base + 1 < m) ? (w_blocks + ((row_base + 1) * num_blocks)) : nullptr;
+  const auto* row2 =
+      (row_base + 2 < m) ? (w_blocks + ((row_base + 2) * num_blocks)) : nullptr;
+  const auto* row3 =
+      (row_base + 3 < m) ? (w_blocks + ((row_base + 3) * num_blocks)) : nullptr;
+
+  float acc[4][8] = {0.0F};
+
+  for (std::size_t b = 0; b < num_blocks; ++b) {
+    const std::size_t k_idx = (b * kQ8_0BlockSize) + lane_id;
+
+    float xv[8] = {0.0F};
+#pragma unroll
+    for (std::size_t t = 0; t < 8; ++t) {
+      if (tok_base + t < batch) {
+        xv[t] = static_cast<float>(x[((tok_base + t) * k) + k_idx]);
+      }
+    }
+
+    const Q8_0Block& b0 = row0[b];
+    const float d0 = __half2float(b0.d);
+    const float s0 = d0 * static_cast<float>(b0.qs[lane_id]);
+#pragma unroll
+    for (std::size_t t = 0; t < 8; ++t) {
+      acc[0][t] += s0 * xv[t];
+    }
+
+    if (row1 != nullptr) {
+      const Q8_0Block& b1 = row1[b];
+      const float d1 = __half2float(b1.d);
+      const float s1 = d1 * static_cast<float>(b1.qs[lane_id]);
+#pragma unroll
+      for (std::size_t t = 0; t < 8; ++t) {
+        acc[1][t] += s1 * xv[t];
+      }
+    }
+
+    if (row2 != nullptr) {
+      const Q8_0Block& b2 = row2[b];
+      const float d2 = __half2float(b2.d);
+      const float s2 = d2 * static_cast<float>(b2.qs[lane_id]);
+#pragma unroll
+      for (std::size_t t = 0; t < 8; ++t) {
+        acc[2][t] += s2 * xv[t];
+      }
+    }
+
+    if (row3 != nullptr) {
+      const Q8_0Block& b3 = row3[b];
+      const float d3 = __half2float(b3.d);
+      const float s3 = d3 * static_cast<float>(b3.qs[lane_id]);
+#pragma unroll
+      for (std::size_t t = 0; t < 8; ++t) {
+        acc[3][t] += s3 * xv[t];
+      }
+    }
+  }
+
+  for (int off = 16; off > 0; off >>= 1) {
+#pragma unroll
+    for (std::size_t r = 0; r < 4; ++r) {
+#pragma unroll
+      for (std::size_t t = 0; t < 8; ++t) {
+        acc[r][t] += __shfl_xor(acc[r][t], off);
+      }
+    }
+  }
+
+  if (lane_id == 0) {
+#pragma unroll
+    for (std::size_t r = 0; r < 4; ++r) {
+      const std::size_t row = row_base + r;
+      if (row < m) {
+#pragma unroll
+        for (std::size_t t = 0; t < 8; ++t) {
+          const std::size_t tok = tok_base + t;
+          if (tok < batch) {
+            y[(tok * m) + row] = acc[r][t];
+          }
+        }
+      }
+    }
+  }
+}
+
 // opt-c162-prefill-quant-direct: batched prefill projection that computes the
 // matmul DIRECTLY on quantized weights (block_q8_0 / block_q8_K / block_q5_K /
-// block_q6_K) with NO dequantize-to-BF16 and NO BF16 GEMM. One warp per output
-// row; each warp reads the row's quant blocks and the bf16 activation and
-// reduces via QuantWarpBlockDot (num_warps=1 => full row dot in lane 0).
-// Output y[b*m + row] = qdot(weights[row], x[b]).
+// block_q6_K) with NO dequantize-to-BF16 and NO BF16 GEMM.
 __global__ void BatchedQuantGEMVKernel(core::GgmlType type,
                                        const void* __restrict__ w,
                                        const hip_bfloat16* __restrict__ x,
@@ -340,8 +474,8 @@ __global__ void BatchedQuantGEMVKernel(core::GgmlType type,
     return;
   }
 
-  const float dot = QuantWarpBlockDot<hip_bfloat16>(type, w, row, x + (b * k),
-                                                    k, lane, 0, 1);
+  const float dot =
+      QuantWarpBlockDot<hip_bfloat16>(type, w, row, x + (b * k), k, lane, 0, 1);
   if (lane == 0) {
     y[(b * m) + row] = dot;
   }
@@ -356,6 +490,24 @@ void LaunchBatchedQuantGEMM(core::GgmlType type, const void* w,
   if (type == core::GgmlType::kBF16 || type == core::GgmlType::kF32) {
     return;
   }
+  if (type == core::GgmlType::kQ8_0) {
+    constexpr std::uint32_t kWavesPerBlock = 4;
+    constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+    constexpr std::size_t kRowsPerWave = 4;
+    constexpr std::size_t kTokensPerWave = 8;
+    constexpr std::size_t kRowsPerBlock = kWavesPerBlock * kRowsPerWave;
+
+    const std::size_t grid_x = (m + kRowsPerBlock - 1) / kRowsPerBlock;
+    const std::size_t grid_y = (batch + kTokensPerWave - 1) / kTokensPerWave;
+    const dim3 grid(static_cast<unsigned int>(grid_x),
+                    static_cast<unsigned int>(grid_y));
+
+    TiledBatchedQ8_0GEMMKernel<kWavesPerBlock>
+        <<<grid, kBlockThreads, 0, stream>>>(
+            w, reinterpret_cast<const hip_bfloat16*>(bf16_x), y, batch, m, k);
+    return;
+  }
+
   constexpr std::size_t kWarp = 32;
   const std::size_t warps_per_block = 8;
   const std::size_t rows_per_block = warps_per_block;  // one row per warp

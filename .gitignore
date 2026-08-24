@@ -63,6 +63,8 @@ result-*
 *.log
 *.bak
 *.swp
+*.db
+homelab/
 
 # vcpkg
 vcpkg_installed/

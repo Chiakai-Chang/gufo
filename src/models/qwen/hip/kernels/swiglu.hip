@@ -403,34 +403,43 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     float sum_g0 = 0.0F, sum_u0 = 0.0F;
     float sum_g1 = 0.0F, sum_u1 = 0.0F;
 
-    for (std::size_t b = 0; b < num_blocks; ++b) {
-      const float xv = x[(b * kQ8_0BlockSize) + lane_id];
+    for (std::size_t b = lane_id; b < num_blocks; b += 32) {
+      const float* xb = x + (b * kQ8_0BlockSize);
       const Q8_0Block& gb0 = g0_blocks[b];
       const Q8_0Block& ub0 = u0_blocks[b];
-      float dot_g0 = static_cast<float>(gb0.qs[lane_id]) * xv;
-      float dot_u0 = static_cast<float>(ub0.qs[lane_id]) * xv;
-      float dot_g1 = 0.0F, dot_u1 = 0.0F;
+      const float dg0 = __half2float(gb0.d);
+      const float du0 = __half2float(ub0.d);
+
+      float blk_g0 = 0.0F, blk_u0 = 0.0F;
+#pragma unroll
+      for (int i = 0; i < 32; ++i) {
+        blk_g0 += static_cast<float>(gb0.qs[i]) * xb[i];
+        blk_u0 += static_cast<float>(ub0.qs[i]) * xb[i];
+      }
+      sum_g0 += dg0 * blk_g0;
+      sum_u0 += du0 * blk_u0;
 
       if (g1_blocks != nullptr && u1_blocks != nullptr) {
         const Q8_0Block& gb1 = g1_blocks[b];
         const Q8_0Block& ub1 = u1_blocks[b];
-        dot_g1 = static_cast<float>(gb1.qs[lane_id]) * xv;
-        dot_u1 = static_cast<float>(ub1.qs[lane_id]) * xv;
+        const float dg1 = __half2float(gb1.d);
+        const float du1 = __half2float(ub1.d);
+        float blk_g1 = 0.0F, blk_u1 = 0.0F;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+          blk_g1 += static_cast<float>(gb1.qs[i]) * xb[i];
+          blk_u1 += static_cast<float>(ub1.qs[i]) * xb[i];
+        }
+        sum_g1 += dg1 * blk_g1;
+        sum_u1 += du1 * blk_u1;
       }
+    }
 
-      for (int off = 16; off > 0; off >>= 1) {
-        dot_g0 += __shfl_xor(dot_g0, off);
-        dot_u0 += __shfl_xor(dot_u0, off);
-        dot_g1 += __shfl_xor(dot_g1, off);
-        dot_u1 += __shfl_xor(dot_u1, off);
-      }
-
-      sum_g0 += __half2float(gb0.d) * dot_g0;
-      sum_u0 += __half2float(ub0.d) * dot_u0;
-      if (g1_blocks != nullptr && u1_blocks != nullptr) {
-        sum_g1 += __half2float(g1_blocks[b].d) * dot_g1;
-        sum_u1 += __half2float(u1_blocks[b].d) * dot_u1;
-      }
+    for (int off = 16; off > 0; off >>= 1) {
+      sum_g0 += __shfl_xor(sum_g0, off);
+      sum_u0 += __shfl_xor(sum_u0, off);
+      sum_g1 += __shfl_xor(sum_g1, off);
+      sum_u1 += __shfl_xor(sum_u1, off);
     }
 
     if (lane_id == 0) {

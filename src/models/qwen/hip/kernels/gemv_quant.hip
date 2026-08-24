@@ -58,23 +58,32 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     float sum0 = 0.0F;
     float sum1 = 0.0F;
 
-    for (std::size_t b = 0; b < num_blocks; ++b) {
-      const float xv = x[(b * kQ8_0BlockSize) + lane_id];
+    for (std::size_t b = lane_id; b < num_blocks; b += 32) {
+      const float* xb = x + (b * kQ8_0BlockSize);
       const Q8_0Block& wblk0 = row0_blocks[b];
-      float dot0 = static_cast<float>(wblk0.qs[lane_id]) * xv;
-      for (int off = 16; off > 0; off >>= 1) {
-        dot0 += __shfl_xor(dot0, off);
+      const float d0 = __half2float(wblk0.d);
+      float blk_dot0 = 0.0F;
+#pragma unroll
+      for (int i = 0; i < 32; ++i) {
+        blk_dot0 += static_cast<float>(wblk0.qs[i]) * xb[i];
       }
-      sum0 += __half2float(wblk0.d) * dot0;
+      sum0 += d0 * blk_dot0;
 
       if (row1_blocks != nullptr) {
         const Q8_0Block& wblk1 = row1_blocks[b];
-        float dot1 = static_cast<float>(wblk1.qs[lane_id]) * xv;
-        for (int off = 16; off > 0; off >>= 1) {
-          dot1 += __shfl_xor(dot1, off);
+        const float d1 = __half2float(wblk1.d);
+        float blk_dot1 = 0.0F;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+          blk_dot1 += static_cast<float>(wblk1.qs[i]) * xb[i];
         }
-        sum1 += __half2float(wblk1.d) * dot1;
+        sum1 += d1 * blk_dot1;
       }
+    }
+
+    for (int off = 16; off > 0; off >>= 1) {
+      sum0 += __shfl_xor(sum0, off);
+      sum1 += __shfl_xor(sum1, off);
     }
 
     if (lane_id == 0) {
@@ -114,12 +123,13 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
           dot1 += static_cast<float>(wblk1->qs[idx]) * xv;
         }
       }
-      for (int off = 16; off > 0; off >>= 1) {
-        dot0 += __shfl_xor(dot0, off);
-        dot1 += __shfl_xor(dot1, off);
-      }
       sum0 += d_w0 * dot0;
       sum1 += d_w1 * dot1;
+    }
+
+    for (int off = 16; off > 0; off >>= 1) {
+      sum0 += __shfl_xor(sum0, off);
+      sum1 += __shfl_xor(sum1, off);
     }
 
     if (lane_id == 0) {

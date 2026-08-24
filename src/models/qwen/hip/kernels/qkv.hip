@@ -8,13 +8,12 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
+#include "src/models/qwen/hip/kernels/common.hip"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
-#include "src/core/gguf_reader.hpp"
-
-#include "src/models/qwen/hip/kernels/common.hip"
 
 namespace strix::hip {
 
@@ -84,12 +83,24 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     for (std::size_t k = (K_vec * 8) + lane_id; k < hidden_size; k += 32) {
       dot += static_cast<float>(row[k]) * x[k];
     }
+  } else if (weight_type == core::GgmlType::kQ8_0) {
+    const std::size_t num_blocks = hidden_size / kQ8_0BlockSize;
+    const auto* row_blocks =
+        static_cast<const Q8_0Block*>(A) + (row_idx * num_blocks);
+    for (std::size_t b = lane_id; b < num_blocks; b += 32) {
+      const float* xb = x + (b * kQ8_0BlockSize);
+      const Q8_0Block& wblk = row_blocks[b];
+      const float d = __half2float(wblk.d);
+      float blk_dot = 0.0F;
+#pragma unroll
+      for (int i = 0; i < 32; ++i) {
+        blk_dot += static_cast<float>(wblk.qs[i]) * xb[i];
+      }
+      dot += d * blk_dot;
+    }
   } else if (weight_type != core::GgmlType::kF32) {
-    // Quantized weight: route via QuantWarpBlockDot (block_q8_K now; Q8_0/Q5_K/
-    // Q6_K wired in later tasks). All 32 lanes cooperate on the row's blocks;
-    // lane 0 returns the warp's partial row-dot and the warp reduction below
-    // (num_warps == 1) broadcasts the single correct value.
-    dot = QuantWarpBlockDot(weight_type, A, row_idx, x, hidden_size, lane_id, 0, 1);
+    dot = QuantWarpBlockDot(weight_type, A, row_idx, x, hidden_size, lane_id, 0,
+                            1);
   } else {
     const auto* row = static_cast<const float*>(A) + (row_idx * hidden_size);
     const std::size_t K_vec = hidden_size / 4;
@@ -106,8 +117,12 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
     }
   }
 
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    dot += __shfl_xor(dot, offset);
+  if (weight_type == core::GgmlType::kBF16 ||
+      weight_type == core::GgmlType::kF32 ||
+      weight_type == core::GgmlType::kQ8_0) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_xor(dot, offset);
+    }
   }
 
   if (lane_id == 0) {
@@ -351,9 +366,9 @@ void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
     constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
     const std::size_t grid = (total_rows + kWavesPerBlock - 1) / kWavesPerBlock;
     Wave32FusedQKVProjectionsKernel_1Row<kWavesPerBlock>
-        <<<grid, kBlockThreads, 0, stream>>>(
-            q_w, q_type, k_w, k_type, v_w, v_type, x, q_out, k_out, v_out,
-            q_dim, kv_dim, hidden_size);
+        <<<grid, kBlockThreads, 0, stream>>>(q_w, q_type, k_w, k_type, v_w,
+                                             v_type, x, q_out, k_out, v_out,
+                                             q_dim, kv_dim, hidden_size);
     return;
   }
 

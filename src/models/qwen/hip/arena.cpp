@@ -20,7 +20,7 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       max_batch_(std::min(max_context_, kMaxPromptBatch)) {
   HIP_CHECK(hipStreamCreate(&stream));
   HIP_CHECK(hipStreamCreate(&prefetch_stream));
-  HIP_CHECK(hipEventCreateWithFlags(&prefetch_event, hipEventDisableTiming));
+  HIP_CHECK(hipEventCreate(&prefetch_event));
   HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
   HIPBLAS_CHECK(hipblasSetStream(hipblas_handle, stream));
   hipblaslt_gemm = std::make_unique<HipblasLtGemm>();
@@ -81,6 +81,8 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
                              time_step_rank});
   HIP_CHECK(
       hipMalloc(&d_weights_bf16, max_weight_elems * sizeof(hip_bfloat16)));
+  HIP_CHECK(
+      hipMalloc(&d_weights_bf16_aux, max_weight_elems * sizeof(hip_bfloat16)));
 
   const std::size_t total_kv = config_.FullAttentionLayerCount() *
                                num_kv_heads * max_context_ * head_dim;
@@ -433,6 +435,8 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_split_k_attention));
   if (d_weights_bf16 != nullptr)
     HIP_CHECK(hipFree(d_weights_bf16));
+  if (d_weights_bf16_aux != nullptr)
+    HIP_CHECK(hipFree(d_weights_bf16_aux));
   if (d_saved_ssm_conv_state_ != nullptr)
     HIP_CHECK(hipFree(d_saved_ssm_conv_state_));
   if (d_saved_ssm_deltanet_state_ != nullptr)
@@ -480,6 +484,7 @@ void QwenGpuArena::FreeAll() noexcept {
   d_scratch_bf16 = nullptr;
   d_split_k_attention = nullptr;
   d_weights_bf16 = nullptr;
+  d_weights_bf16_aux = nullptr;
   d_saved_ssm_conv_state_ = nullptr;
   d_saved_ssm_deltanet_state_ = nullptr;
   d_ssm_replay_qkv_ = nullptr;
