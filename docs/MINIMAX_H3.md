@@ -691,6 +691,69 @@ reduction. Across 49 exact evaluations this removes about 836 seconds
 (13.9 minutes) of denoising wall time. The lookup is enabled only at 32,768
 rows or above, so the 7,136-row path and Issue #184 kernels are unchanged.
 
+### Full-resolution attention admission pass
+
+The retained gfx1151 Triton attention kernel was admitted only at exactly
+37,716 rows. That row count is 37,710 non-text rows plus the text rows, so it
+required a prompt of exactly six tokens. The released example prompt tokenizes
+to 16, which produces 37,726 rows, and `LaunchH3TritonAttention` returned false
+and fell through to AOTriton without reporting anything. A kernel trace of the
+released 1344x768, 124-frame layout with that prompt showed `attn_fwd`, the
+AOTriton image, and no `h3_attention_forward` at all: the specialized kernel
+was unreachable for every realistic prompt.
+
+The kernel never required a fixed length. It masks its query rows, peels a
+separately instantiated masked key tail, and derives every offset from the
+runtime `sequence` argument. Admission is now bounded by the two properties
+that do constrain it: the materialized-attention threshold below which the CK
+fused kernel is selected, and the signed 32-bit pointer range the kernel is
+compiled with, which bounds `heads * sequence * head_dim` and is what keeps it
+spill-free.
+
+Measured on the released layout at 37,726 rows with three active blocks, two
+evaluations, one binary and an execution toggle:
+
+| Attention image | Forward (3 blocks) | Per block |
+| --- | ---: | ---: |
+| AOTriton (previous behaviour) | 6752.816 ms | 2250.9 ms |
+| Retained Triton kernel | 6533.234 ms | 2177.7 ms |
+
+That is 3.25% of the full-resolution forward, about 3.7 seconds per evaluation
+and 179 seconds across 49 exact evaluations. A standalone check confirms the
+kernel is equally accurate and equally fast away from the pinned length:
+relative L2 against an F32 reference is `2.32e-3` at both 37,716 and 37,726
+rows, and throughput stays within 31.8-32.4 TFLOPS for 8,192 to 41,806 rows,
+including every non-multiple of `BLOCK_M`. No repository gate exercises
+full-resolution attention, so that standalone comparison is the evidence; the
+528-row block boundary is byte-identical to the previous implementation and the
+1,872-row production forward oracle remains inside every frozen ceiling.
+
+### Rejected full-resolution candidates
+
+Measured on the released 37,716-row shape and retained here so they are not
+retried:
+
+- **Attention tile and warp retuning.** All 72 combinations of
+  `BLOCK_M` in {32, 64, 128}, `BLOCK_N` in {16, 32, 64, 128}, 2/4/8 warps and
+  1/2 stages were compiled and timed. The retained `64/32/4/1` configuration is
+  the fastest of all of them at 31.7 TFLOPS; every larger tile either spills or
+  is slower. Attention is at a genuine local optimum for this kernel shape.
+- **hipBLASLt for the four block projections.** Slower than the pinned rocBLAS
+  solutions on every shape: 26.7 against 42.7 TFLOPS on QKV, 21.0 against 37.0
+  on the output projection, 26.8 against 42.7 on FC1, 14.6 against 17.9 on FC2.
+- **Pre-transposed projection weights** so the GEMM reads `op(A) = none`.
+  Slower on all four shapes, by up to 1.7x on the output projection.
+
+One anomaly is measured but not addressed. FC2, at 5,376 x 14,336, sustains
+about 18 TFLOPS where the other three projections reach 35-43, even though the
+output projection at the same `M` and half the `K` reaches 37. Splitting its
+`K` into two halves recovers 1.45x, which would be about 6% of the forward, but
+it changes the accumulation order and needs either a BF16 intermediate or an
+811 MiB F32 accumulator. Both conflict with the retained byte-equivalence
+policy and the 2% peak-memory ceiling, and a reduction-order change is what
+disqualified the earlier cached-softmax candidate. It is recorded as the
+largest remaining projection opportunity rather than taken.
+
 ### Issue #184 second focused pass
 
 The next retained pass profiles complete phase boundaries once rather than

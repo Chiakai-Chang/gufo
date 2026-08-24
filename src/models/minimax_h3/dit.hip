@@ -39,7 +39,16 @@ constexpr std::size_t kWeightStagingBytes = 16ULL << 20U;
 constexpr std::size_t kMaximumAttentionRows = 131'072;
 constexpr std::size_t kMaximumScalarAttentionRows = 16'384;
 constexpr std::size_t kMaximumMaterializedAttentionRows = 4'096;
-constexpr std::size_t kGfx1151TritonAttentionRows = 37'716;
+// Below the materialized-attention threshold the CK fused kernel is selected
+// instead, so the Triton kernel only needs to cover the long sequences.
+constexpr std::size_t kMinimumTritonAttentionRows =
+    kMaximumMaterializedAttentionRows + 1;
+// The kernel is compiled with `tt.pointer_range = 32`, which is what keeps it
+// spill-free. Head 55 addresses `heads * sequence * head_dim` elements, so that
+// product must stay inside a signed 32-bit offset.
+constexpr std::size_t kMaximumTritonAttentionRows =
+    static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()) /
+    (kDitAttentionHeads * kDitHeadDimension);
 // Pinned by byte-repeat validation on gfx1151 with the repository's ROCm
 // 7.2.3 toolchain. A changed rocBLAS database fails session construction.
 constexpr rocblas_int kGfx1151RocblasBf16Solution = -1162085109;
@@ -209,7 +218,12 @@ bool LaunchH3TritonAttention(const std::uint16_t* query,
                              const std::uint16_t* key,
                              const std::uint16_t* value, std::uint16_t* output,
                              std::size_t sequence, hipStream_t stream) {
-  if (sequence != kGfx1151TritonAttentionRows) {
+  // The kernel masks its query rows and peels a separately instantiated masked
+  // key tail, so it is correct for any length, not just the released canvas.
+  // Pinning it to one row count meant a prompt of any length other than six
+  // tokens silently fell back to the generic kernel.
+  if (sequence < kMinimumTritonAttentionRows ||
+      sequence > kMaximumTritonAttentionRows) {
     return false;
   }
   static H3TritonAttentionKernel kernel;
