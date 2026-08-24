@@ -1,4 +1,5 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
@@ -66,7 +67,8 @@ __global__ void WriteBatchedKVCacheKernel(
 __global__ void BatchedAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
-    float* __restrict__ out_context, std::uint32_t layer_idx,
+    float* __restrict__ out_context,
+    hip_bfloat16* __restrict__ out_context_bf16, std::uint32_t layer_idx,
     std::uint32_t start_pos, std::size_t batch_size, std::uint32_t max_context,
     std::uint32_t num_heads, std::uint32_t num_kv_heads,
     std::uint32_t head_dim) {
@@ -194,8 +196,13 @@ __global__ void BatchedAttentionKernel(
       const float sig = 1.0F / (1.0F + expf(-g));
       ctx *= sig;
     }
-    out_context[(t * num_heads * head_dim) +
-                (static_cast<std::size_t>(h) * head_dim) + tid] = ctx;
+    const std::size_t out_index = (t * num_heads * head_dim) +
+                                  (static_cast<std::size_t>(h) * head_dim) +
+                                  tid;
+    out_context[out_index] = ctx;
+    if (out_context_bf16 != nullptr) {
+      out_context_bf16[out_index] = hip_bfloat16(ctx);
+    }
   }
 }
 
@@ -206,7 +213,8 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
                             std::uint32_t start_pos, std::size_t batch_size,
                             std::uint32_t max_context, std::uint32_t num_heads,
                             std::uint32_t num_kv_heads, std::uint32_t head_dim,
-                            hipStream_t stream, bool skip_kv_write) {
+                            hipStream_t stream, bool skip_kv_write,
+                            void* out_context_bf16) {
   const dim3 kv_grid(num_kv_heads, static_cast<unsigned int>(batch_size));
   if (!skip_kv_write) {
     WriteBatchedKVCacheKernel<<<kv_grid, 256, 0, stream>>>(
@@ -220,8 +228,9 @@ void LaunchBatchedAttention(const float* q, const float* k, const float* v,
       static_cast<std::size_t>(start_pos) + batch_size;
   const std::size_t shared_scores_bytes = max_seq_len * sizeof(float);
   BatchedAttentionKernel<<<attn_grid, 256, shared_scores_bytes, stream>>>(
-      q, gate, k_cache, v_cache, out_context, layer_idx, start_pos, batch_size,
-      max_context, num_heads, num_kv_heads, head_dim);
+      q, gate, k_cache, v_cache, out_context,
+      static_cast<hip_bfloat16*>(out_context_bf16), layer_idx, start_pos,
+      batch_size, max_context, num_heads, num_kv_heads, head_dim);
 }
 
 __global__ void CausalSoftmaxKernel(float* __restrict__ scores,
