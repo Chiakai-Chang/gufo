@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace strix::quant {
 
@@ -35,32 +36,9 @@ float Fp16ToFloat(std::uint16_t h) noexcept {
   return f;
 }
 
-#pragma pack(push, 1)
-struct block_q4_K {
-  std::uint16_t d;
-  std::uint16_t dmin;
-  std::uint8_t scales[12];
-  std::uint8_t qs[128];
-};
-
-struct block_q6_K {
-  std::uint8_t ql[128];
-  std::uint8_t qh[64];
-  std::int8_t scales[16];
-  std::uint16_t d;
-};
-
-struct block_q3_K {
-  std::uint8_t hmask[32];
-  std::uint8_t qs[64];
-  std::uint8_t scales[12];
-  std::uint16_t d;
-};
-#pragma pack(pop)
-
-static_assert(sizeof(block_q4_K) == 144);
-static_assert(sizeof(block_q6_K) == 210);
-static_assert(sizeof(block_q3_K) == 110);
+// Block layouts (block_q4_K, block_q5_K, block_q6_K, block_q3_K,
+// block_q8_K, block_q8_0) now live in the header; they are the canonical
+// layout source. Definitions removed here to avoid ODR redefinition.
 
 namespace {
 
@@ -103,6 +81,26 @@ float Q4Value(const block_q4_K& block, std::size_t index) noexcept {
   return Fp16ToFloat(block.d) * static_cast<float>(scale) *
              static_cast<float>(quant) -
          Fp16ToFloat(block.dmin) * static_cast<float>(minimum);
+}
+
+float Q5Value(const block_q5_K& block, std::size_t index) noexcept {
+  const std::size_t gg = index / 64;  // 0..3
+  const std::size_t wv = index % 64;  // 0..63
+  const std::size_t lane = wv % 32;   // 0..31
+  const bool lohalf = (wv < 32);
+  const std::uint8_t qb = block.qs[(gg * 32) + lane];
+  const std::uint8_t quant4 = lohalf ? (qb & 0x0FU) : (qb >> 4U);
+  const std::uint8_t qhb = block.qh[lane];
+  const int bit = static_cast<int>(2 * gg) + (lohalf ? 0 : 1);  // 0..7
+  const std::uint8_t quant = static_cast<std::uint8_t>(
+      quant4 + (((qhb >> bit) & 1U) ? 16U : 0U));       // 0..31
+  const std::size_t sis = (2 * gg) + (lohalf ? 0 : 1);  // 0..7
+  std::uint8_t sc = 0;
+  std::uint8_t m = 0;
+  GetQ4ScaleMin(sis, block.scales, sc, m);
+  return Fp16ToFloat(block.d) * static_cast<float>(sc) *
+             static_cast<float>(quant) -
+         Fp16ToFloat(block.dmin) * static_cast<float>(m);
 }
 
 float Q6Value(const block_q6_K& block, std::size_t index) noexcept {
@@ -165,19 +163,57 @@ float Q3Value(const block_q3_K& block,
 
 std::size_t QuantizedRowBytes(core::GgmlType type,
                               std::size_t elements) noexcept {
-  if ((elements % 256U) != 0) {
-    return 0;
-  }
-  const std::size_t blocks = elements / 256U;
+  const std::size_t block_qk = QuantizedBlockElements(type);
+  std::size_t block_bytes = 0;
   switch (type) {
     case core::GgmlType::kQ3_K:
-      return blocks * sizeof(block_q3_K);
+      block_bytes = sizeof(block_q3_K);
+      break;
     case core::GgmlType::kQ4_K:
-      return blocks * sizeof(block_q4_K);
+      block_bytes = sizeof(block_q4_K);
+      break;
+    case core::GgmlType::kQ5_K:
+      block_bytes = sizeof(block_q5_K);
+      break;
     case core::GgmlType::kQ6_K:
-      return blocks * sizeof(block_q6_K);
+      block_bytes = sizeof(block_q6_K);
+      break;
+    case core::GgmlType::kQ8_K:
+      block_bytes = sizeof(block_q8_K);
+      break;
+    case core::GgmlType::kQ8_0:
+      block_bytes = sizeof(block_q8_0);
+      break;
     default:
       return 0;
+  }
+  if ((elements % block_qk) != 0) {
+    return 0;
+  }
+  const std::size_t blocks = elements / block_qk;
+  if (blocks > std::numeric_limits<std::size_t>::max() / block_bytes) {
+    return 0;
+  }
+  return blocks * block_bytes;
+}
+
+std::size_t EncodedSizeBytes(core::GgmlType type,
+                             std::size_t elements) noexcept {
+  switch (type) {
+    case core::GgmlType::kF32:
+      if (elements > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+        return 0;
+      }
+      return elements * sizeof(float);
+    case core::GgmlType::kF16:
+    case core::GgmlType::kBF16:
+      if (elements >
+          std::numeric_limits<std::size_t>::max() / sizeof(std::uint16_t)) {
+        return 0;
+      }
+      return elements * sizeof(std::uint16_t);
+    default:
+      return QuantizedRowBytes(type, elements);
   }
 }
 
@@ -188,6 +224,17 @@ void DequantizeQ4_K(const void* src, float* dst, std::size_t k) {
   for (std::size_t b = 0; b < nb; ++b) {
     for (std::size_t i = 0; i < 256; ++i) {
       dst[(b * 256) + i] = Q4Value(blocks[b], i);
+    }
+  }
+}
+
+void DequantizeQ5_K(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_q5_K*>(src);
+  const std::size_t nb = k / 256;
+
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t i = 0; i < 256; ++i) {
+      dst[(b * 256) + i] = Q5Value(blocks[b], i);
     }
   }
 }
@@ -215,6 +262,17 @@ void DequantizeQ3_K(const void* src, float* dst, std::size_t k) {
   }
 }
 
+void DequantizeQ8_K(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_q8_K*>(src);
+  const std::size_t nb = k / 256;
+
+  for (std::size_t b = 0; b < nb; ++b) {
+    for (std::size_t i = 0; i < 256; ++i) {
+      dst[(b * 256) + i] = blocks[b].d * static_cast<float>(blocks[b].qs[i]);
+    }
+  }
+}
+
 float DotProductQ4_K(const void* row_data, std::span<const float> vec,
                      std::size_t k) {
   const auto* blocks = static_cast<const block_q4_K*>(row_data);
@@ -226,6 +284,22 @@ float DotProductQ4_K(const void* row_data, std::span<const float> vec,
 
     for (std::size_t i = 0; i < 256; ++i) {
       sum += Q4Value(blocks[b], i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductQ5_K(const void* row_data, std::span<const float> vec,
+                     std::size_t k) {
+  const auto* blocks = static_cast<const block_q5_K*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + b * 256;
+
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += Q5Value(blocks[b], i) * v[i];
     }
   }
   return sum;
@@ -259,6 +333,51 @@ float DotProductQ3_K(const void* row_data, std::span<const float> vec,
 
     for (std::size_t i = 0; i < 256; ++i) {
       sum += Q3Value(blocks[b], scales, i) * v[i];
+    }
+  }
+  return sum;
+}
+
+float DotProductQ8_K(const void* row_data, std::span<const float> vec,
+                     std::size_t k) {
+  const auto* blocks = static_cast<const block_q8_K*>(row_data);
+  const std::size_t nb = k / 256;
+  float sum = 0.0F;
+
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float* v = vec.data() + b * 256;
+
+    for (std::size_t i = 0; i < 256; ++i) {
+      sum += blocks[b].d * static_cast<float>(blocks[b].qs[i]) * v[i];
+    }
+  }
+  return sum;
+}
+
+void DequantizeQ8_0(const void* src, float* dst, std::size_t k) {
+  const auto* blocks = static_cast<const block_q8_0*>(src);
+  const std::size_t nb = k / 32;
+
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = Fp16ToFloat(blocks[b].d);
+    for (std::size_t i = 0; i < 32; ++i) {
+      dst[(b * 32) + i] = d * static_cast<float>(blocks[b].qs[i]);
+    }
+  }
+}
+
+float DotProductQ8_0(const void* row_data, std::span<const float> vec,
+                     std::size_t k) {
+  const auto* blocks = static_cast<const block_q8_0*>(row_data);
+  const std::size_t nb = k / 32;
+  float sum = 0.0F;
+
+  for (std::size_t b = 0; b < nb; ++b) {
+    const float d = Fp16ToFloat(blocks[b].d);
+    const float* v = vec.data() + b * 32;
+
+    for (std::size_t i = 0; i < 32; ++i) {
+      sum += d * static_cast<float>(blocks[b].qs[i]) * v[i];
     }
   }
   return sum;

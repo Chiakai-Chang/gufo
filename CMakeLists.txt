@@ -228,24 +228,20 @@ add_library(strix_core STATIC
   src/models/minimax_h3/sha256.cpp
   src/models/minimax_h3/tokenizer.cpp
   src/models/minimax_h3/video_vae.cpp
-  src/tokenization/qwen_tokenizer.cpp
-  src/tokenization/qwen_chat_template.cpp
-  src/models/qwen_oracles.cpp
-  src/models/qwen_state.cpp
-  src/models/qwen_ssm.cpp
-  src/models/qwen_forward.cpp
-  src/models/qwen_generator.cpp
-  src/core/speculative/qwen_mtp_reference.cpp
   src/testing/compare/logit_comparator.cpp
   src/eval/regrade.cpp
   src/core/hip/hipblaslt_plan_database.cpp
   src/core/quant/ggml_dequant.cpp
+  src/core/quant/ggml_gemm.cpp
 )
 target_include_directories(strix_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_definitions(strix_core PRIVATE
   STRIX_FFMPEG_EXECUTABLE="${STRIX_FFMPEG_EXECUTABLE}"
   STRIX_FFPROBE_EXECUTABLE="${STRIX_FFPROBE_EXECUTABLE}")
 target_link_libraries(strix_core PUBLIC ICU::uc Threads::Threads)
+
+add_subdirectory(src/models/qwen)
+
 target_link_libraries(strix_qwen3_tts PUBLIC strix_core)
 
 find_package(OpenMP)
@@ -257,17 +253,6 @@ if (ENGINE_ENABLE_HIP)
   set_property(SOURCE src/models/minimax_h3/dit.hip
     APPEND PROPERTY COMPILE_OPTIONS -O2)
   target_sources(strix_core PRIVATE
-    src/core/hip/qwen_gpu_attention.hip
-    src/core/hip/qwen_gpu_batched_ssm.hip
-    src/core/hip/qwen_gpu_blas.hip
-    src/core/hip/qwen_gpu_decode_ops.hip
-    src/core/hip/qwen_gpu_prefill_ops.hip
-    src/core/hip/qwen_gpu_arena.cpp
-    src/core/hip/qwen_gpu_decode.cpp
-    src/core/hip/qwen_gpu_executor.cpp
-    src/core/hip/qwen_gpu_model_loader.cpp
-    src/core/hip/qwen_gpu_prefill.cpp
-    src/core/hip/qwen_mtp_gpu.cpp
     src/models/minimax_h3/audio_vae.hip
     src/models/minimax_h3/denoiser.hip
     src/models/minimax_h3/dit.hip
@@ -290,24 +275,6 @@ if (ENGINE_ENABLE_HIP)
     "${STRIX_H3_ATTENTION_GENERATED_DIR}")
   target_link_libraries(strix_core PUBLIC hip::host roc::hipblas
     roc::hipblaslt roc::rocblas aotriton_v2)
-endif()
-
-if (ENGINE_ENABLE_XRT)
-  target_sources(strix_core PRIVATE
-    src/core/xdna2/qwen_mtp_eh_proj.cpp
-    src/core/xdna2/qwen_mtp_rmsnorm.cpp)
-  target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_XRT=1)
-  target_compile_definitions(strix_core PRIVATE
-    STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
-    STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
-  target_include_directories(strix_core SYSTEM PUBLIC
-    ${XRT_INCLUDE_DIR}
-    ${STRIX_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR}
-    ${STRIX_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR})
-  target_link_libraries(strix_core PUBLIC
-    strix_diagnostics
-    ${XRT_COREUTIL_LIB}
-    ${UUID_LIBRARY})
 endif()
 
 add_executable(strix-server
@@ -376,6 +343,8 @@ include(CTest)
 
 if (BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+  add_subdirectory(tests/models/qwen)
 
   add_test(NAME strix_server_version COMMAND strix-server --version)
   set_tests_properties(strix_server_version PROPERTIES LABELS "cpu")
@@ -507,38 +476,7 @@ if (BUILD_TESTING)
     set_tests_properties(xdna2_xrt_program_test PROPERTIES
       LABELS "npu;xdna2;xrt;xrt-hardware")
 
-    add_executable(qwen_mtp_xdna2_rmsnorm_test
-      tests/device/qwen_mtp_xdna2_rmsnorm_test.cpp)
-    target_compile_definitions(qwen_mtp_xdna2_rmsnorm_test PRIVATE
-      STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
-    target_link_libraries(qwen_mtp_xdna2_rmsnorm_test PRIVATE
-      strix_core
-      strix_diagnostics)
-    add_test(NAME qwen_mtp_xdna2_rmsnorm_test
-      COMMAND qwen_mtp_xdna2_rmsnorm_test)
-    set_tests_properties(qwen_mtp_xdna2_rmsnorm_test PROPERTIES
-      LABELS "npu;xdna2;xrt;xrt-hardware;qwen;mtp;rmsnorm")
-
-    add_executable(qwen_mtp_xdna2_eh_proj_test
-      tests/device/qwen_mtp_xdna2_eh_proj_test.cpp)
-    target_compile_definitions(qwen_mtp_xdna2_eh_proj_test PRIVATE
-      STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}")
-    target_link_libraries(qwen_mtp_xdna2_eh_proj_test PRIVATE
-      strix_core
-      strix_diagnostics)
-    add_test(NAME qwen_mtp_xdna2_eh_proj_test
-      COMMAND qwen_mtp_xdna2_eh_proj_test)
-    set_tests_properties(qwen_mtp_xdna2_eh_proj_test PROPERTIES
-      LABELS "npu;xdna2;xrt;xrt-hardware;qwen;mtp;gemv")
   endif()
-
-  add_executable(qwen_aie2p_w4a8_pack_test
-    tests/kernels/qwen38_27b/test_aie2p_w4a8.cpp)
-  target_link_libraries(qwen_aie2p_w4a8_pack_test PRIVATE strix_core)
-  add_test(NAME qwen_aie2p_w4a8_pack_test
-    COMMAND qwen_aie2p_w4a8_pack_test)
-  set_tests_properties(qwen_aie2p_w4a8_pack_test PROPERTIES
-    LABELS "cpu;qwen;mtp;w4a8;quantization")
 
   add_executable(gguf_reader_test tests/core/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strix_core)
@@ -646,55 +584,11 @@ if (BUILD_TESTING)
   add_test(NAME ggml_dequant_test COMMAND ggml_dequant_test)
   set_tests_properties(ggml_dequant_test PROPERTIES LABELS "cpu;core;quant")
 
-  add_executable(qwen_mtp_reference_test
-    tests/core/qwen_mtp_reference_test.cpp)
-  target_link_libraries(qwen_mtp_reference_test PRIVATE strix_core)
+  add_executable(ggml_gemm_parity_test tests/core/ggml_gemm_parity_test.cpp)
+  target_link_libraries(ggml_gemm_parity_test PRIVATE strix_core)
 
-  add_test(NAME qwen_mtp_reference_test COMMAND qwen_mtp_reference_test)
-  set_tests_properties(qwen_mtp_reference_test PROPERTIES
-    LABELS "cpu;core;qwen;mtp;external-model"
-    SKIP_RETURN_CODE 77)
-
-  add_executable(qwen_tokenizer_test tests/tokenization/qwen_tokenizer_test.cpp)
-  target_link_libraries(qwen_tokenizer_test PRIVATE strix_core)
-
-  add_test(NAME qwen_tokenizer_test COMMAND qwen_tokenizer_test)
-  set_tests_properties(qwen_tokenizer_test PROPERTIES LABELS "cpu;tokenization;qwen")
-
-  add_executable(qwen_chat_template_test tests/tokenization/qwen_chat_template_test.cpp)
-  target_link_libraries(qwen_chat_template_test PRIVATE strix_core)
-
-  add_test(NAME qwen_chat_template_test COMMAND qwen_chat_template_test)
-  set_tests_properties(qwen_chat_template_test PROPERTIES LABELS "cpu;tokenization;chat_template")
-
-  add_executable(qwen_cpu_oracles_test tests/models/qwen_cpu_oracles_test.cpp)
-  target_link_libraries(qwen_cpu_oracles_test PRIVATE strix_core)
-
-  add_test(NAME qwen_cpu_oracles_test COMMAND qwen_cpu_oracles_test)
-  set_tests_properties(qwen_cpu_oracles_test PROPERTIES LABELS "cpu;models;oracles")
-
-  add_executable(qwen_forward_test tests/models/qwen_forward_test.cpp)
-  target_link_libraries(qwen_forward_test PRIVATE strix_core)
-
-  add_test(NAME qwen_forward_test COMMAND qwen_forward_test)
-  set_tests_properties(qwen_forward_test PROPERTIES LABELS "cpu;models;forward")
-
-  add_executable(qwen_generator_test tests/models/qwen_generator_test.cpp)
-  target_link_libraries(qwen_generator_test PRIVATE strix_core)
-
-  add_test(NAME qwen_generator_test COMMAND qwen_generator_test)
-  set_tests_properties(qwen_generator_test PROPERTIES LABELS "cpu;models;generator")
-
-  add_executable(qwen_ssm_test tests/models/qwen_ssm_test.cpp)
-  target_link_libraries(qwen_ssm_test PRIVATE strix_core)
-
-  add_test(NAME qwen_ssm_test COMMAND qwen_ssm_test)
-  set_tests_properties(qwen_ssm_test PROPERTIES LABELS "cpu;models;ssm")
-
-  add_executable(qwen_oracle_test tests/models/qwen_oracle_test.cpp)
-  target_link_libraries(qwen_oracle_test PRIVATE strix_core)
-  add_test(NAME qwen_oracle_test COMMAND qwen_oracle_test)
-  set_tests_properties(qwen_oracle_test PROPERTIES LABELS "cpu;models;oracles")
+  add_test(NAME ggml_gemm_parity_test COMMAND ggml_gemm_parity_test)
+  set_tests_properties(ggml_gemm_parity_test PROPERTIES LABELS "cpu;core;quant")
 
   add_executable(exact_token_test tests/quality/exact_token_test.cpp)
   target_link_libraries(exact_token_test PRIVATE strix_core)
@@ -705,13 +599,6 @@ if (BUILD_TESTING)
   target_link_libraries(eval_regrade_test PRIVATE strix_core)
   add_test(NAME eval_regrade_test COMMAND eval_regrade_test)
   set_tests_properties(eval_regrade_test PROPERTIES LABELS "cpu;quality;eval")
-
-  add_executable(qwen_attention_policy_test
-    tests/kernels/qwen_attention_policy_test.cpp)
-  target_link_libraries(qwen_attention_policy_test PRIVATE strix_core)
-  add_test(NAME qwen_attention_policy_test COMMAND qwen_attention_policy_test)
-  set_tests_properties(qwen_attention_policy_test PROPERTIES
-    LABELS "cpu;models;attention;dispatch")
 
   add_executable(kernel_bench_test tests/benchmarks/kernel_bench_test.cpp)
   target_link_libraries(kernel_bench_test PRIVATE strix_kernel_bench_support)
@@ -866,14 +753,6 @@ if (BUILD_TESTING)
       LABELS "gpu;hip;gfx1151;deepseek-v4-flash;external-model;slow"
       SKIP_RETURN_CODE 77)
 
-    add_executable(qwen_mtp_gpu_test
-      tests/kernels/qwen_mtp_gpu_test.cpp)
-    target_link_libraries(qwen_mtp_gpu_test PRIVATE strix_core)
-    add_test(NAME qwen_mtp_gpu_test COMMAND qwen_mtp_gpu_test)
-    set_tests_properties(qwen_mtp_gpu_test PROPERTIES
-      LABELS "gpu;hip;gfx1151;qwen;mtp;external-model"
-      SKIP_RETURN_CODE 77)
-
     add_executable(hipblaslt_runtime_cache_test
       tests/kernels/hipblaslt_runtime_cache_test.cpp)
     target_link_libraries(hipblaslt_runtime_cache_test PRIVATE
@@ -882,12 +761,6 @@ if (BUILD_TESTING)
       COMMAND hipblaslt_runtime_cache_test)
     set_tests_properties(hipblaslt_runtime_cache_test PROPERTIES
       LABELS "hip;gpu;hipblaslt;cache")
-
-    add_executable(qwen_gpu_ops_test tests/kernels/qwen_gpu_ops_test.cpp)
-    target_link_libraries(qwen_gpu_ops_test PRIVATE strix_core hip::host roc::hipblas roc::rocblas)
-    add_test(NAME qwen_gpu_ops_test COMMAND qwen_gpu_ops_test)
-    set_tests_properties(qwen_gpu_ops_test PROPERTIES
-      LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;opt-c010-qk-rope-kv;opt-c010-residual-rmsnorm;opt-c010-ffn-swiglu;opt-c010-ssm-gate-residual;opt-c010-rmsnorm-projection;opt-c014-layer-prefetch")
 
     add_executable(persistent_deltanet_test
       tests/kernels/persistent_deltanet_test.cpp)
