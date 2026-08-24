@@ -180,7 +180,9 @@ bool LoadSafetensorsFile(const std::string& path, TensorStore* store,
     return false;
   }
   mapped_regions->push_back(
-      {.data = bytes, .size = static_cast<std::size_t>(mapped->size())});
+      {.data = bytes,
+       .size = static_cast<std::size_t>(mapped->size()),
+       .payload_offset = static_cast<std::size_t>(payload_offset)});
   mappings->push_back(std::move(mapped));
   return true;
 }

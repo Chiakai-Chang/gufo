@@ -109,6 +109,14 @@ public:
 private:
   struct Impl;
   explicit TalkerHipRuntime(std::unique_ptr<Impl> impl);
+
+  /// Shared body of the two frame predictors. `collect_logits` retains the
+  /// per-sub-codebook logit rows, which only the trace entry point needs.
+  [[nodiscard]] bool PredictFrame(std::span<const float> talker_hidden,
+                                  std::uint32_t first_code,
+                                  CodePredictorOutput* output,
+                                  bool collect_logits, std::string* error);
+
   std::unique_ptr<Impl> impl_;
 };
 

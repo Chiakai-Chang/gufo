@@ -15,6 +15,9 @@ namespace strix::models::qwen3_tts {
 struct MappedRegion {
   const std::byte* data = nullptr;
   std::size_t size = 0;
+  // Byte offset of the safetensors payload. Tensor offsets are relative to it,
+  // so a device copy can restore vectorized-load alignment by shifting here.
+  std::size_t payload_offset = 0;
 };
 
 /// Result of loading the model directory. `tensors` payload pointers stay

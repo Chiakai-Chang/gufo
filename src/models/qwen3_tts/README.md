@@ -108,49 +108,79 @@ generators.
 
 For the required sentence, speaker `vivian`, English, seed 42:
 
-- Talker prompt cosine: `1.0`; prefill-logit cosine: `0.999935`; cached-logit
-  cosine: `0.999977`.
+- Talker prompt cosine: `1.0`; prefill-logit cosine: `0.999938`; cached-logit
+  cosine: `0.99997`; both greedy argmax boundaries match the frozen reference.
 - The native speech decoder matches the official ROCm waveform with mean
   absolute error `1.33e-7` and maximum absolute error `1.28e-6`.
-- Native sampled audio contains 243 codec frames / 19.44 seconds and completes
-  through the HIP-only server in 31.69 seconds.
+- Decode costs `32.4` ms per codec frame, measured on a fixed 200-frame greedy
+  request. The canonical sampled request returns 289 frames / 23.12 seconds of
+  audio in `9.46` seconds, which is `2.44x` faster than playback.
 - The official ROCm safetensors implementation contains 273 frames / 21.84
-  seconds and takes 98.00 seconds after model load. Native wall time is 3.09x
-  lower and generated-audio throughput is 2.75x higher.
+  seconds and takes 98.00 seconds after model load. Native generated-audio
+  throughput is `10.9x` higher.
 - A shared Whisper tiny.en intelligibility check reports 1.96% WER for native
-  audio versus 7.84% for the upstream sampled artifact, with 96.83% compact
-  transcript LCS agreement.
+  audio and 100% compact transcript LCS against the retained release baseline.
 
 Sampled codec frames are not expected to be byte-identical because PyTorch
 ROCm and the native backend use different random-number generators. Stable
 implementation boundaries are guarded by exact tokens, tensor/logit metrics,
-near-exact decoder waveform comparison, fixed-seed native reproducibility, and
-the end-to-end intelligibility gate.
+near-exact decoder waveform comparison, and the end-to-end intelligibility gate.
+
+Fixed-seed identity holds for the bounded eight-frame test but not across a
+full-length request: rocBLAS prefill leaves enough run-to-run variation that a
+sampled draw eventually diverges, so a full request has no stable byte hash.
+This predates the decode work and applies equally to the previous release, so
+optimization A/B tests compare per-frame cost and the intelligibility report
+rather than output hashes.
 
 ### Decode optimization
 
-The production path retains hipBLAS/rocBLAS BF16 GEMM for every content-bearing
-projection. A model-private wave32 GEMV was faster, but changed sampled speech
-and regressed the strict Whisper intelligibility gate, so it is not retained.
+Decode is bound by DRAM bandwidth, not arithmetic. Each codec frame streams
+about `5.2` GB of BF16 weights: `2.7` GB for one pass over the 28-layer talker
+and `2.5` GB because the 15 code-predictor heads are sequentially dependent and
+each re-reads all five predictor layers. A pure streaming read reaches
+`242` GB/s on this part, so that traffic sets a floor near `21` ms per frame.
 
-The permanent gfx1151 optimizations preserve the frozen tensors, logits, codec
-tokens, and decoded waveform:
+hipBLAS reached only 40-60 GB/s on these projections: decode presents a single
+token, and the batched kernel pads that one column into a 128x32 macro tile with
+a split-K reduction. The retained optimizations close the gap to the floor:
 
-- redundant standalone BF16 round launches are removed when the following
-  consumer already performs the same conversion;
-- q/k input rounding, per-head RMSNorm, and output rounding are fused in a
-  128-thread workgroup sized for the model's 128-element heads;
-- q/k RoPE output rounding and V rounding share one model-private launch;
+- a model-private GEMV reduces one output row per workgroup, so eight
+  wavefronts each walk the row with an independent coalesced stream. It sustains
+  208-242 GB/s across every decode shape, accumulates in float32 with a fixed
+  reduction order, and is *more* accurate than the batched path it replaces
+  (maximum relative error `1.95e-4` against an fp64 reference, versus `2.35e-4`);
+- the GEMV shares one pass over the weights across up to four input columns, so
+  the two-token predictor step costs the same memory traffic as a single token;
+- weights are copied into device-resident coarse-grained pages instead of
+  host-registered ones. gfx1151 shares one physical memory pool, but the
+  registered pages do not cache the same way and measured 12% slower. The copy
+  is shifted so the safetensors payload lands 16-byte aligned, which is what
+  makes the widest packed loads legal; memory-mapped weights fall back to
+  8-byte loads and remain supported via `STRIX_QWEN3_TTS_WEIGHT_MODE=mapped`;
+- q/k per-head RMSNorm, the q/k rotation and V rounding share one launch, and
+  each residual add folds into the RMSNorm that follows it. Both keep every
+  intermediate BF16 rounding, so the arithmetic is unchanged;
 - top-k sampling partially sorts only the requested candidates while preserving
   the comparator, candidate order, probability distribution, and RNG sequence;
-- safetensor weights are registered and mapped directly on integrated gfx1151
-  unified memory instead of being copied or explicitly prefetched.
+- the repetition-penalty test uses a per-vocabulary flag instead of scanning the
+  generated codes, which had made every frame cost more than the one before it.
 
-The retained launch fusions remove 15,141 GPU dispatches per canonical run.
-Warm release A/B measurements reduced the 243-frame Dursley workload from
-33.03 seconds to 31.69 seconds (4.1%) without quality drift. Experimental
-hipBLASLt, direct rocBLAS, graph capture, attention, GEMV, and additional fusion
-routes were rejected when they were neutral, slower, or failed exactness.
+Warm release A/B measurements reduced per-frame decode from `129.7` ms to
+`32.4` ms (`4.0x`). All new kernels report zero scratch, zero register spills,
+and 16 waves/SIMD.
+
+HIP graph replay was implemented and measured before being rejected: back-to-back
+dispatch on gfx1151 costs about `2` us whether kernels are launched individually
+or replayed from a graph (`2.03` us versus `1.82` us in isolation), and capturing
+the predictor changed nothing end to end. Reducing launch count by fusing is
+what helps. Experimental hipBLASLt, direct rocBLAS, and attention routes were
+rejected when they were neutral, slower, or failed exactness.
+
+The remaining budget per frame is roughly `22` ms of weight streaming already at
+the bandwidth roofline, plus about `10` ms of dispatch overhead and short-kernel
+execution. Going meaningfully faster requires moving fewer bytes, which means
+trading weight precision, so it is deliberately not attempted here.
 
 ## Key ids (CustomVoice)
 

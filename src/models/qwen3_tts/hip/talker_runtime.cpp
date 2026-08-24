@@ -139,8 +139,8 @@ class DeviceRegion {
 public:
   DeviceRegion() = default;
   ~DeviceRegion() {
-    if (owns_device_ && device_ != nullptr) {
-      (void)hipFree(device_);
+    if (owns_device_ && allocation_ != nullptr) {
+      (void)hipFree(allocation_);
     }
     if (registered_ && host_ != nullptr) {
       (void)hipHostUnregister(const_cast<std::byte*>(host_));
@@ -153,23 +153,23 @@ public:
   bool Initialize(MappedRegion region, std::string* error) {
     host_ = region.data;
     size_ = region.size;
-    hipDeviceProp_t properties{};
-    int device = 0;
-    const bool integrated =
-        hipGetDevice(&device) == hipSuccess &&
-        hipGetDeviceProperties(&properties, device) == hipSuccess &&
-        properties.integrated != 0;
+    payload_offset_ = region.payload_offset;
     const WeightMode mode = GetWeightMode();
-    const bool prefer_mapped = mode == WeightMode::kMapped ||
-                               (mode == WeightMode::kAuto && integrated);
-    if (prefer_mapped && TryMap()) {
-      return true;
-    }
-    if (mode != WeightMode::kMapped && TryCopy()) {
-      return true;
-    }
-    if (!prefer_mapped && mode == WeightMode::kAuto && TryMap()) {
-      return true;
+    // gfx1151 shares one physical memory pool with the host, but
+    // device-resident weights still use coarse-grained pages the GPU caches and
+    // streams far faster than host-registered pages, so decode prefers the
+    // copy.
+    if (mode == WeightMode::kMapped) {
+      if (TryMap()) {
+        return true;
+      }
+    } else {
+      if (TryCopy()) {
+        return true;
+      }
+      if (mode == WeightMode::kAuto && TryMap()) {
+        return true;
+      }
     }
     SetError(error, "cannot make Qwen3-TTS safetensors GPU-visible");
     return false;
@@ -204,23 +204,34 @@ private:
   }
 
   bool TryCopy() {
-    if (hipMalloc(&device_, size_) != hipSuccess) {
-      device_ = nullptr;
+    // Safetensors headers are an arbitrary length, so the payload rarely starts
+    // on a 16-byte boundary. Padding the copy by that much lets every tensor
+    // land where the widest packed loads are legal.
+    constexpr std::size_t kLoadAlignment = 16;
+    const std::size_t shift =
+        (kLoadAlignment - (payload_offset_ % kLoadAlignment)) % kLoadAlignment;
+    void* allocation = nullptr;
+    if (hipMalloc(&allocation, size_ + shift) != hipSuccess) {
       return false;
     }
+    allocation_ = allocation;
     owns_device_ = true;
+    device_ = static_cast<std::byte*>(allocation) + shift;
     if (hipMemcpy(device_, host_, size_, hipMemcpyHostToDevice) == hipSuccess) {
       return true;
     }
-    (void)hipFree(device_);
+    (void)hipFree(allocation_);
     owns_device_ = false;
+    allocation_ = nullptr;
     device_ = nullptr;
     return false;
   }
 
   const std::byte* host_{nullptr};
   void* device_{nullptr};
+  void* allocation_{nullptr};
   std::size_t size_{0};
+  std::size_t payload_offset_{0};
   bool owns_device_{false};
   bool registered_{false};
 };
@@ -365,7 +376,9 @@ struct TokenScore {
   float score;
 };
 
-std::uint32_t SelectTopKCode(std::vector<TokenScore> candidates,
+/// Reduces `candidates` in place so the caller keeps its capacity between
+/// steps.
+std::uint32_t SelectTopKCode(std::vector<TokenScore>& candidates,
                              std::size_t top_k, float temperature,
                              std::mt19937* random) {
   if (candidates.empty()) {
@@ -401,10 +414,12 @@ std::uint32_t SelectTopKCode(std::vector<TokenScore> candidates,
 
 std::uint32_t SelectMainCode(
     std::span<const float> logits,
-    std::span<const std::uint32_t> generated_first_codes,
+    std::span<const std::uint8_t> generated_first_codes,
     std::size_t generation_step, std::uint32_t eos_token,
-    const TalkerSamplingOptions& sampling, std::mt19937* random) {
-  std::vector<TokenScore> candidates;
+    const TalkerSamplingOptions& sampling, std::mt19937* random,
+    std::vector<TokenScore>* scratch) {
+  std::vector<TokenScore>& candidates = *scratch;
+  candidates.clear();
   candidates.reserve(2049);
   for (std::uint32_t token = 0; token < logits.size(); ++token) {
     if ((token >= 2048 && token != eos_token) ||
@@ -412,16 +427,18 @@ std::uint32_t SelectMainCode(
       continue;
     }
     float score = logits[token];
-    const bool repeated = std::ranges::find(generated_first_codes, token) !=
-                          generated_first_codes.end();
-    if (repeated) {
+    // A flag per vocabulary entry keeps the penalty test constant time;
+    // scanning the generated codes made every frame cost more than the one
+    // before it.
+    if (token < generated_first_codes.size() &&
+        generated_first_codes[token] != 0) {
       score = score < 0.0F ? score * sampling.repetition_penalty
                            : score / sampling.repetition_penalty;
     }
     candidates.push_back({token, score});
   }
-  return SelectTopKCode(std::move(candidates), sampling.top_k,
-                        sampling.temperature, random);
+  return SelectTopKCode(candidates, sampling.top_k, sampling.temperature,
+                        random);
 }
 
 }  // namespace
@@ -441,7 +458,6 @@ struct TalkerHipRuntime::Impl {
         attention_output(token_capacity * model.config.talker.hidden_size),
         gate(token_capacity * model.config.talker.intermediate_size),
         up(token_capacity * model.config.talker.intermediate_size),
-        activation(token_capacity * model.config.talker.intermediate_size),
         feed_forward_output(token_capacity * model.config.talker.hidden_size),
         bfloat16_scratch(token_capacity *
                          std::max(model.config.talker.hidden_size,
@@ -633,24 +649,35 @@ struct TalkerHipRuntime::Impl {
 
   void Gemm(const void* weights, const void* inputs_bfloat16, float* output,
             std::size_t batch, std::size_t rows, std::size_t columns) {
+    // Decode drives one or two tokens at a time, where the batched GEMM pads
+    // the few columns into a tile and reaches only a fraction of DRAM
+    // bandwidth. The model-private GEMV streams each weight row instead.
+    if (LaunchBfloat16Gemv(weights, inputs_bfloat16, output, batch, rows,
+                           columns, stream)) {
+      return;
+    }
     strix::hip::LaunchHipblasGEMMBF16(blas, weights, inputs_bfloat16, output,
                                       batch, rows, columns, stream);
   }
 
-  void NormalizeQk(float* q_values, float* k_values, const float* q_weight,
-                   const float* k_weight, std::size_t batch_size,
-                   std::uint32_t q_heads, std::uint32_t kv_heads,
-                   std::uint32_t head_dim, float epsilon) {
+  /// Normalizes and rotates q/k and rounds v in one launch where the head fits
+  /// a workgroup, otherwise falls back to the separate kernels.
+  void NormalizeRotateQkv(float* q_values, float* k_values, float* v_values,
+                          const float* q_weight, const float* k_weight,
+                          std::size_t batch_size, std::uint32_t q_heads,
+                          std::uint32_t kv_heads, std::uint32_t head_dim,
+                          std::uint32_t start_position, float rope_theta,
+                          float epsilon) {
+    if (LaunchBfloat16QkNormRoPE(q_values, k_values, v_values, q_weight,
+                                 k_weight, batch_size, q_heads, kv_heads,
+                                 head_dim, start_position, rope_theta, epsilon,
+                                 stream)) {
+      return;
+    }
     LaunchBfloat16PerHeadRMSNorm(q_values, q_weight, batch_size, q_heads,
                                  head_dim, epsilon, stream);
     LaunchBfloat16PerHeadRMSNorm(k_values, k_weight, batch_size, kv_heads,
                                  head_dim, epsilon, stream);
-  }
-
-  void ApplyRoPEAndRoundQkv(float* q_values, float* k_values, float* v_values,
-                            std::size_t batch_size, std::uint32_t q_heads,
-                            std::uint32_t kv_heads, std::uint32_t head_dim,
-                            std::uint32_t start_position, float rope_theta) {
     LaunchBfloat16RoPEAndRoundV(q_values, k_values, v_values, batch_size,
                                 q_heads, kv_heads, head_dim, start_position,
                                 rope_theta, stream);
@@ -660,6 +687,17 @@ struct TalkerHipRuntime::Impl {
                          std::size_t batch_size, std::size_t dimension,
                          float epsilon) {
     strix::hip::LaunchBatchedRMSNorm(input, weight, normalized.get(),
+                                     bfloat16_scratch.get(), batch_size,
+                                     dimension, epsilon, stream);
+  }
+
+  /// Folds a residual add into the RMSNorm that always follows it. The float
+  /// normalization output is unused inside the layers, so only the BF16 GEMM
+  /// input is produced.
+  void ResidualAddNormToBfloat16(const float* update, const float* weight,
+                                 std::size_t batch_size, std::size_t dimension,
+                                 float epsilon) {
+    LaunchBfloat16ResidualAddRMSNorm(hidden.get(), update, weight,
                                      bfloat16_scratch.get(), batch_size,
                                      dimension, epsilon, stream);
   }
@@ -765,24 +803,22 @@ struct TalkerHipRuntime::Impl {
     const std::size_t ffn_elements = tokens * config.intermediate_size;
 
     const auto launch_predictor = [&] {
+      RmsNormToBfloat16(hidden.get(),
+                        predictor_layers.front().input_norm.values.get(),
+                        tokens, config.hidden_size, config.rms_norm_eps);
       for (std::size_t layer = 0; layer < predictor_layers.size(); ++layer) {
         const PredictorLayerWeights& weights = predictor_layers[layer];
-        RmsNormToBfloat16(hidden.get(), weights.input_norm.values.get(), tokens,
-                          config.hidden_size, config.rms_norm_eps);
         Gemm(weights.q, bfloat16_scratch.get(), q.get(), tokens,
              config.num_attention_heads * config.head_dim, config.hidden_size);
         Gemm(weights.k, bfloat16_scratch.get(), k.get(), tokens,
              config.num_key_value_heads * config.head_dim, config.hidden_size);
         Gemm(weights.v, bfloat16_scratch.get(), v.get(), tokens,
              config.num_key_value_heads * config.head_dim, config.hidden_size);
-        NormalizeQk(q.get(), k.get(), weights.q_norm.values.get(),
-                    weights.k_norm.values.get(), tokens,
-                    config.num_attention_heads, config.num_key_value_heads,
-                    config.head_dim, config.rms_norm_eps);
-        ApplyRoPEAndRoundQkv(q.get(), k.get(), v.get(), tokens,
-                             config.num_attention_heads,
-                             config.num_key_value_heads, config.head_dim,
-                             start_position, config.rope_theta);
+        NormalizeRotateQkv(
+            q.get(), k.get(), v.get(), weights.q_norm.values.get(),
+            weights.k_norm.values.get(), tokens, config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, start_position,
+            config.rope_theta, config.rms_norm_eps);
         strix::hip::LaunchBatchedAttention(
             q.get(), k.get(), v.get(), nullptr, predictor_key_cache.get(),
             predictor_value_cache.get(), nullptr, nullptr, attention.get(),
@@ -793,24 +829,27 @@ struct TalkerHipRuntime::Impl {
             attention.get(), bfloat16_scratch.get(), q_elements, stream);
         Gemm(weights.o, bfloat16_scratch.get(), attention_output.get(), tokens,
              config.hidden_size, config.num_attention_heads * config.head_dim);
-        LaunchBfloat16ResidualAdd(hidden.get(), attention_output.get(),
-                                  hidden.get(), hidden_elements, stream);
-        RmsNormToBfloat16(hidden.get(), weights.post_norm.values.get(), tokens,
-                          config.hidden_size, config.rms_norm_eps);
+        ResidualAddNormToBfloat16(attention_output.get(),
+                                  weights.post_norm.values.get(), tokens,
+                                  config.hidden_size, config.rms_norm_eps);
         Gemm(weights.gate, bfloat16_scratch.get(), gate.get(), tokens,
              config.intermediate_size, config.hidden_size);
         Gemm(weights.up, bfloat16_scratch.get(), up.get(), tokens,
              config.intermediate_size, config.hidden_size);
-        LaunchBfloat16SwiGlu(gate.get(), up.get(), activation.get(),
+        LaunchBfloat16SwiGlu(gate.get(), up.get(), nullptr,
                              bfloat16_scratch.get(), ffn_elements, stream);
         Gemm(weights.down, bfloat16_scratch.get(), feed_forward_output.get(),
              tokens, config.hidden_size, config.intermediate_size);
-        LaunchBfloat16ResidualAdd(hidden.get(), feed_forward_output.get(),
-                                  hidden.get(), hidden_elements, stream);
+        // The next layer opens with an RMSNorm, so the trailing residual folds
+        // into it; the last layer folds into the predictor's final norm.
+        ResidualAddNormToBfloat16(
+            feed_forward_output.get(),
+            layer + 1 < predictor_layers.size()
+                ? predictor_layers[layer + 1].input_norm.values.get()
+                : predictor_norm.values.get(),
+            tokens, config.hidden_size, config.rms_norm_eps);
       }
 
-      RmsNormToBfloat16(hidden.get(), predictor_norm.values.get(), tokens,
-                        config.hidden_size, config.rms_norm_eps);
       const auto* last_hidden_bfloat16 =
           bfloat16_scratch.get() + ((tokens - 1) * config.hidden_size);
       Gemm(predictor_heads[head_index], last_hidden_bfloat16, logits.get(), 1,
@@ -819,11 +858,9 @@ struct TalkerHipRuntime::Impl {
     };
 
     launch_predictor();
-    std::vector<float> sampled_logits;
     std::vector<float>* host_logits = trace_logits;
     if (sampling_rng != nullptr && host_logits == nullptr) {
-      sampled_logits.resize(config.vocab_size);
-      host_logits = &sampled_logits;
+      host_logits = &predictor_logit_scratch;
     }
     if (host_logits != nullptr) {
       host_logits->resize(config.vocab_size);
@@ -836,12 +873,12 @@ struct TalkerHipRuntime::Impl {
       RequireHip(hipStreamSynchronize(stream),
                  "hipStreamSynchronize predictor sampling");
       RequireHip(hipGetLastError(), "Qwen3-TTS code predictor sampling");
-      std::vector<TokenScore> candidates;
-      candidates.reserve(host_logits->size());
+      candidate_scratch.clear();
+      candidate_scratch.reserve(host_logits->size());
       for (std::uint32_t token = 0; token < host_logits->size(); ++token) {
-        candidates.push_back({token, (*host_logits)[token]});
+        candidate_scratch.push_back({token, (*host_logits)[token]});
       }
-      return SelectTopKCode(std::move(candidates), predictor_top_k,
+      return SelectTopKCode(candidate_scratch, predictor_top_k,
                             predictor_temperature, sampling_rng);
     }
     strix::hip::LaunchGPUArgmax(logits.get(), predictor_token.get(),
@@ -865,24 +902,22 @@ struct TalkerHipRuntime::Impl {
     const std::size_t q_elements = config.num_attention_heads * config.head_dim;
     const std::size_t ffn_elements = config.intermediate_size;
 
+    RmsNormToBfloat16(hidden.get(), layers.front().input_norm.values.get(),
+                      tokens, config.hidden_size, config.rms_norm_eps);
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
       const LayerWeights& weights = layers[layer];
-      RmsNormToBfloat16(hidden.get(), weights.input_norm.values.get(), tokens,
-                        config.hidden_size, config.rms_norm_eps);
       Gemm(weights.q, bfloat16_scratch.get(), q.get(), tokens,
            config.num_attention_heads * config.head_dim, config.hidden_size);
       Gemm(weights.k, bfloat16_scratch.get(), k.get(), tokens,
            config.num_key_value_heads * config.head_dim, config.hidden_size);
       Gemm(weights.v, bfloat16_scratch.get(), v.get(), tokens,
            config.num_key_value_heads * config.head_dim, config.hidden_size);
-      NormalizeQk(q.get(), k.get(), weights.q_norm.values.get(),
-                  weights.k_norm.values.get(), tokens,
-                  config.num_attention_heads, config.num_key_value_heads,
-                  config.head_dim, config.rms_norm_eps);
-      ApplyRoPEAndRoundQkv(
-          q.get(), k.get(), v.get(), tokens, config.num_attention_heads,
-          config.num_key_value_heads, config.head_dim,
-          static_cast<std::uint32_t>(talker_cache_tokens), config.rope_theta);
+      NormalizeRotateQkv(q.get(), k.get(), v.get(), weights.q_norm.values.get(),
+                         weights.k_norm.values.get(), tokens,
+                         config.num_attention_heads, config.num_key_value_heads,
+                         config.head_dim,
+                         static_cast<std::uint32_t>(talker_cache_tokens),
+                         config.rope_theta, config.rms_norm_eps);
       strix::hip::LaunchBatchedAttention(
           q.get(), k.get(), v.get(), nullptr, key_cache.get(),
           value_cache.get(), nullptr, nullptr, attention.get(),
@@ -895,24 +930,26 @@ struct TalkerHipRuntime::Impl {
                                         q_elements, stream);
       Gemm(weights.o, bfloat16_scratch.get(), attention_output.get(), tokens,
            config.hidden_size, config.num_attention_heads * config.head_dim);
-      LaunchBfloat16ResidualAdd(hidden.get(), attention_output.get(),
-                                hidden.get(), hidden_elements, stream);
-      RmsNormToBfloat16(hidden.get(), weights.post_norm.values.get(), tokens,
-                        config.hidden_size, config.rms_norm_eps);
+      ResidualAddNormToBfloat16(attention_output.get(),
+                                weights.post_norm.values.get(), tokens,
+                                config.hidden_size, config.rms_norm_eps);
       Gemm(weights.gate, bfloat16_scratch.get(), gate.get(), tokens,
            config.intermediate_size, config.hidden_size);
       Gemm(weights.up, bfloat16_scratch.get(), up.get(), tokens,
            config.intermediate_size, config.hidden_size);
-      LaunchBfloat16SwiGlu(gate.get(), up.get(), activation.get(),
+      LaunchBfloat16SwiGlu(gate.get(), up.get(), nullptr,
                            bfloat16_scratch.get(), ffn_elements, stream);
       Gemm(weights.down, bfloat16_scratch.get(), feed_forward_output.get(),
            tokens, config.hidden_size, config.intermediate_size);
-      LaunchBfloat16ResidualAdd(hidden.get(), feed_forward_output.get(),
-                                hidden.get(), hidden_elements, stream);
+      // The next layer opens with an RMSNorm, so the trailing residual folds
+      // into it; the last layer folds into the talker's final norm.
+      ResidualAddNormToBfloat16(
+          feed_forward_output.get(),
+          layer + 1 < layers.size() ? layers[layer + 1].input_norm.values.get()
+                                    : final_norm.values.get(),
+          tokens, config.hidden_size, config.rms_norm_eps);
     }
 
-    RmsNormToBfloat16(hidden.get(), final_norm.values.get(), tokens,
-                      config.hidden_size, config.rms_norm_eps);
     Gemm(codec_head, bfloat16_scratch.get(), logits.get(), 1, config.vocab_size,
          config.hidden_size);
     LaunchRoundBfloat16InPlace(logits.get(), config.vocab_size, stream);
@@ -986,7 +1023,6 @@ struct TalkerHipRuntime::Impl {
   DeviceBuffer<float> attention_output;
   DeviceBuffer<float> gate;
   DeviceBuffer<float> up;
-  DeviceBuffer<float> activation;
   DeviceBuffer<float> feed_forward_output;
   DeviceBuffer<hip_bfloat16> bfloat16_scratch;
   DeviceBuffer<float> key_cache;
@@ -999,6 +1035,11 @@ struct TalkerHipRuntime::Impl {
   std::mt19937* sampling_rng{nullptr};
   std::size_t predictor_top_k{50};
   float predictor_temperature{0.9F};
+  // Reused across the sixteen sampling steps of every frame so that decode does
+  // not allocate per step.
+  std::vector<float> predictor_logit_scratch;
+  std::vector<TokenScore> candidate_scratch;
+  std::vector<std::uint8_t> generated_first_code_flags;
 };
 
 TalkerHipRuntime::TalkerHipRuntime(std::unique_ptr<Impl> impl)
@@ -1068,11 +1109,11 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
                        impl_->stream),
         "hipMemsetAsync value cache");
 
+    impl_->RmsNormToBfloat16(impl_->hidden.get(),
+                             impl_->layers.front().input_norm.values.get(),
+                             tokens, config.hidden_size, config.rms_norm_eps);
     for (std::size_t layer = 0; layer < impl_->layers.size(); ++layer) {
       const LayerWeights& weights = impl_->layers[layer];
-      impl_->RmsNormToBfloat16(impl_->hidden.get(),
-                               weights.input_norm.values.get(), tokens,
-                               config.hidden_size, config.rms_norm_eps);
       impl_->Gemm(weights.q, impl_->bfloat16_scratch.get(), impl_->q.get(),
                   tokens, config.num_attention_heads * config.head_dim,
                   config.hidden_size);
@@ -1082,14 +1123,11 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
       impl_->Gemm(weights.v, impl_->bfloat16_scratch.get(), impl_->v.get(),
                   tokens, config.num_key_value_heads * config.head_dim,
                   config.hidden_size);
-      impl_->NormalizeQk(
-          impl_->q.get(), impl_->k.get(), weights.q_norm.values.get(),
-          weights.k_norm.values.get(), tokens, config.num_attention_heads,
-          config.num_key_value_heads, config.head_dim, config.rms_norm_eps);
-      impl_->ApplyRoPEAndRoundQkv(
-          impl_->q.get(), impl_->k.get(), impl_->v.get(), tokens,
+      impl_->NormalizeRotateQkv(
+          impl_->q.get(), impl_->k.get(), impl_->v.get(),
+          weights.q_norm.values.get(), weights.k_norm.values.get(), tokens,
           config.num_attention_heads, config.num_key_value_heads,
-          config.head_dim, 0, config.rope_theta);
+          config.head_dim, 0, config.rope_theta, config.rms_norm_eps);
       strix::hip::LaunchBatchedAttention(
           impl_->q.get(), impl_->k.get(), impl_->v.get(), nullptr,
           impl_->key_cache.get(), impl_->value_cache.get(), nullptr, nullptr,
@@ -1103,26 +1141,28 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
       impl_->Gemm(weights.o, impl_->bfloat16_scratch.get(),
                   impl_->attention_output.get(), tokens, config.hidden_size,
                   config.num_attention_heads * config.head_dim);
-      LaunchBfloat16ResidualAdd(
-          impl_->hidden.get(), impl_->attention_output.get(),
-          impl_->hidden.get(), hidden_elements, impl_->stream);
-      impl_->RmsNormToBfloat16(impl_->hidden.get(),
-                               weights.post_norm.values.get(), tokens,
-                               config.hidden_size, config.rms_norm_eps);
+      impl_->ResidualAddNormToBfloat16(impl_->attention_output.get(),
+                                       weights.post_norm.values.get(), tokens,
+                                       config.hidden_size, config.rms_norm_eps);
       impl_->Gemm(weights.gate, impl_->bfloat16_scratch.get(),
                   impl_->gate.get(), tokens, config.intermediate_size,
                   config.hidden_size);
       impl_->Gemm(weights.up, impl_->bfloat16_scratch.get(), impl_->up.get(),
                   tokens, config.intermediate_size, config.hidden_size);
-      LaunchBfloat16SwiGlu(
-          impl_->gate.get(), impl_->up.get(), impl_->activation.get(),
-          impl_->bfloat16_scratch.get(), ffn_elements, impl_->stream);
+      LaunchBfloat16SwiGlu(impl_->gate.get(), impl_->up.get(), nullptr,
+                           impl_->bfloat16_scratch.get(), ffn_elements,
+                           impl_->stream);
       impl_->Gemm(weights.down, impl_->bfloat16_scratch.get(),
                   impl_->feed_forward_output.get(), tokens, config.hidden_size,
                   config.intermediate_size);
-      LaunchBfloat16ResidualAdd(
-          impl_->hidden.get(), impl_->feed_forward_output.get(),
-          impl_->hidden.get(), hidden_elements, impl_->stream);
+      // The next layer opens with an RMSNorm, so the trailing residual folds
+      // into it; the last layer folds into the talker's final norm.
+      impl_->ResidualAddNormToBfloat16(
+          impl_->feed_forward_output.get(),
+          layer + 1 < impl_->layers.size()
+              ? impl_->layers[layer + 1].input_norm.values.get()
+              : impl_->final_norm.values.get(),
+          tokens, config.hidden_size, config.rms_norm_eps);
 
       if (layer == 0) {
         output->layer0_output.resize(hidden_elements);
@@ -1134,9 +1174,6 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
       }
     }
 
-    impl_->RmsNormToBfloat16(impl_->hidden.get(),
-                             impl_->final_norm.values.get(), tokens,
-                             config.hidden_size, config.rms_norm_eps);
     const auto* last_hidden_bfloat16 =
         impl_->bfloat16_scratch.get() + ((tokens - 1) * config.hidden_size);
     impl_->Gemm(impl_->codec_head, last_hidden_bfloat16, impl_->logits.get(), 1,
@@ -1293,7 +1330,7 @@ bool TalkerHipRuntime::PredictCodeFrame(std::span<const float> talker_hidden,
     return false;
   }
   CodePredictorOutput output;
-  if (!PredictCodeFrameTrace(talker_hidden, first_code, &output, error)) {
+  if (!PredictFrame(talker_hidden, first_code, &output, false, error)) {
     codes->clear();
     return false;
   }
@@ -1304,6 +1341,13 @@ bool TalkerHipRuntime::PredictCodeFrame(std::span<const float> talker_hidden,
 bool TalkerHipRuntime::PredictCodeFrameTrace(
     std::span<const float> talker_hidden, std::uint32_t first_code,
     CodePredictorOutput* output, std::string* error) {
+  return PredictFrame(talker_hidden, first_code, output, true, error);
+}
+
+bool TalkerHipRuntime::PredictFrame(std::span<const float> talker_hidden,
+                                    std::uint32_t first_code,
+                                    CodePredictorOutput* output,
+                                    bool collect_logits, std::string* error) {
   if (output == nullptr) {
     SetError(error, "Qwen3-TTS predictor output must not be null");
     return false;
@@ -1343,12 +1387,20 @@ bool TalkerHipRuntime::PredictCodeFrameTrace(
     impl_->ProjectPredictorInput(impl_->attention_output.get(), 2);
 
     output->codes.reserve(talker.num_code_groups);
-    output->logits.reserve((talker.num_code_groups - 1) * predictor.vocab_size);
     output->codes.push_back(first_code);
     std::vector<float> head_logits;
-    std::uint32_t code = impl_->RunPredictor(2, 0, 0, &head_logits);
-    output->logits.insert(output->logits.end(), head_logits.begin(),
-                          head_logits.end());
+    // Generation only needs the codes, so the per-head logit rows are copied
+    // out for the trace entry point alone.
+    std::vector<float>* trace = collect_logits ? &head_logits : nullptr;
+    if (collect_logits) {
+      output->logits.reserve((talker.num_code_groups - 1) *
+                             predictor.vocab_size);
+    }
+    std::uint32_t code = impl_->RunPredictor(2, 0, 0, trace);
+    if (collect_logits) {
+      output->logits.insert(output->logits.end(), head_logits.begin(),
+                            head_logits.end());
+    }
     output->codes.push_back(code);
     for (std::size_t head = 1; head < impl_->predictor_heads.size(); ++head) {
       strix::hip::LaunchEmbeddingLookup(
@@ -1356,14 +1408,17 @@ bool TalkerHipRuntime::PredictCodeFrameTrace(
           impl_->attention_output.get(), talker.hidden_size, impl_->stream);
       impl_->ProjectPredictorInput(impl_->attention_output.get(), 1);
       code = impl_->RunPredictor(1, static_cast<std::uint32_t>(head + 1), head,
-                                 &head_logits);
-      output->logits.insert(output->logits.end(), head_logits.begin(),
-                            head_logits.end());
+                                 trace);
+      if (collect_logits) {
+        output->logits.insert(output->logits.end(), head_logits.begin(),
+                              head_logits.end());
+      }
       output->codes.push_back(code);
     }
     if (output->codes.size() != talker.num_code_groups ||
-        output->logits.size() !=
-            (talker.num_code_groups - 1) * predictor.vocab_size) {
+        (collect_logits &&
+         output->logits.size() !=
+             (talker.num_code_groups - 1) * predictor.vocab_size)) {
       throw std::runtime_error(
           "Qwen3-TTS code predictor output shape mismatch");
     }
@@ -1504,19 +1559,20 @@ bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
     }
     output->code_groups = config.num_code_groups;
     output->codes.reserve(maximum_new_tokens * config.num_code_groups);
-    std::vector<std::uint32_t> generated_first_codes;
-    generated_first_codes.reserve(maximum_new_tokens);
+    std::vector<std::uint8_t>& generated_first_codes =
+        impl_->generated_first_code_flags;
+    generated_first_codes.assign(config.vocab_size, 0);
     const std::size_t trailing_rows =
         prompt.trailing_text.size() / config.hidden_size;
     for (std::size_t step = 0; step < maximum_new_tokens; ++step) {
-      const std::uint32_t first_code =
-          SelectMainCode(current.logits, generated_first_codes, step,
-                         config.codec_eos_token_id, sampling,
-                         sampling.sample ? &random : nullptr);
+      const std::uint32_t first_code = SelectMainCode(
+          current.logits, generated_first_codes, step,
+          config.codec_eos_token_id, sampling,
+          sampling.sample ? &random : nullptr, &impl_->candidate_scratch);
       if (first_code == config.codec_eos_token_id) {
         break;
       }
-      generated_first_codes.push_back(first_code);
+      generated_first_codes[first_code] = 1;
       std::vector<std::uint32_t> frame;
       if (!PredictCodeFrame(current.last_hidden, first_code, &frame, error)) {
         return false;
