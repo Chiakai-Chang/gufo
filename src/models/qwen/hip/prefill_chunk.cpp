@@ -92,8 +92,30 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         return;
       case models::qwen::QwenGemmRoute::kHipPrefillQuantDirect: {
         const auto tg0 = std::chrono::high_resolution_clock::now();
-        LaunchBatchedQuantGEMM(w.type, w.data, bf16_input, output, batch_size,
-                               m, k, arena_.stream);
+        if (batch_size > 1) {
+          const auto td0 = std::chrono::high_resolution_clock::now();
+          LaunchDequantizeToBf16(w.type, w.data, arena_.d_weights_bf16, m * k,
+                                 arena_.stream);
+          if (do_profile) {
+            HIP_CHECK(hipStreamSynchronize(arena_.stream));
+            time_dequant += std::chrono::duration<double, std::milli>(
+                                std::chrono::high_resolution_clock::now() - td0)
+                                .count();
+          }
+          if (arena_.hipblaslt_gemm != nullptr && m >= 1024 && k >= 1024 &&
+              arena_.hipblaslt_gemm->RunBf16(arena_.d_weights_bf16, bf16_input,
+                                             output, batch_size, m, k,
+                                             arena_.stream)) {
+            // hipBLASLt executed successfully
+          } else {
+            LaunchHipblasGEMMBF16(arena_.hipblas_handle, arena_.d_weights_bf16,
+                                  bf16_input, output, batch_size, m, k,
+                                  arena_.stream);
+          }
+        } else {
+          LaunchBatchedQuantGEMM(w.type, w.data, bf16_input, output, batch_size,
+                                 m, k, arena_.stream);
+        }
         if (do_profile) {
           HIP_CHECK(hipStreamSynchronize(arena_.stream));
           time_gemm += std::chrono::duration<double, std::milli>(

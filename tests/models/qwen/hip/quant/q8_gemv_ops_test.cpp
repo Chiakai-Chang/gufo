@@ -92,36 +92,8 @@ void TestQ8KBlockGEMVEquivalence() {
     }
   }
 
-  // Check 1 (PRIMARY, tight): CPU reference replicating the integer-Q8
-  // arithmetic (max|x| -> scale, xq clamp, int32 MAC, end scale).
-  std::vector<float> y_q8_ref(M, 0.0F);
-  for (std::size_t m = 0; m < M; ++m) {
-    float sumf = 0.0F;
-    for (std::size_t b = 0; b < num_blocks; ++b) {
-      const Q8KBlockTest& wblk = h_A[m * num_blocks + b];
-      const float d_w = wblk.d;
-      const float* xb = h_x.data() + b * QK;
-      float local_max = 0.0F;
-      for (std::size_t i = 0; i < QK; ++i) {
-        local_max = std::max(local_max, std::abs(xb[i]));
-      }
-      const float scale = (local_max > 0.0F) ? (local_max / 127.0F) : 0.0F;
-      int acc = 0;
-      for (std::size_t i = 0; i < QK; ++i) {
-        const float xv = (scale > 0.0F) ? (xb[i] / scale) : 0.0F;
-        int xq = static_cast<int>(std::round(xv));
-        xq = (xq > 127) ? 127 : xq;
-        xq = (xq < -127) ? -127 : xq;
-        acc += static_cast<int>(wblk.qs[i]) * xq;
-      }
-      sumf += d_w * scale * static_cast<float>(acc);
-    }
-    y_q8_ref[m] = sumf;
-  }
-
-  // Check 2 (SANITY, loose): CPU DotProductQ8_K (exact fp dequant dot of the
-  // weights against the raw x, no activation quant) vs GPU. The difference is
-  // the activation-quantization error, expected ~1%, not a sign/index bug.
+  // Primary check: CPU DotProductQ8_K (exact fp dequant dot of weights against
+  // x).
   std::vector<float> y_dequant_ref(M, 0.0F);
   for (std::size_t m = 0; m < M; ++m) {
     y_dequant_ref[m] = strix::quant::DotProductQ8_K(
@@ -129,30 +101,18 @@ void TestQ8KBlockGEMVEquivalence() {
   }
 
   float primary_max_rel = 0.0F, primary_max_abs = 0.0F;
-  float sanity_max_rel = 0.0F, sanity_max_abs = 0.0F;
   for (std::size_t m = 0; m < M; ++m) {
-    const float abs_q8 = std::abs(y_gpu[m] - y_q8_ref[m]);
-    const float rel_q8 = abs_q8 / std::max(1e-6F, std::abs(y_q8_ref[m]));
-    primary_max_rel = std::max(primary_max_rel, rel_q8);
-    primary_max_abs = std::max(primary_max_abs, abs_q8);
-
-    const float abs_san = std::abs(y_gpu[m] - y_dequant_ref[m]);
-    const float rel_san = abs_san / std::max(1e-3F, std::abs(y_dequant_ref[m]));
-    sanity_max_rel = std::max(sanity_max_rel, rel_san);
-    sanity_max_abs = std::max(sanity_max_abs, abs_san);
+    const float abs_diff = std::abs(y_gpu[m] - y_dequant_ref[m]);
+    const float rel_diff =
+        abs_diff / std::max(1e-4F, std::abs(y_dequant_ref[m]));
+    primary_max_rel = std::max(primary_max_rel, rel_diff);
+    primary_max_abs = std::max(primary_max_abs, abs_diff);
   }
 
-  std::cout << "Q8K GEMV PRIMARY (int-Q8 vs GPU): max_rel=" << primary_max_rel
+  std::cout << "Q8K GEMV vs CPU oracle: max_rel=" << primary_max_rel
             << " max_abs=" << primary_max_abs << "\n";
-  std::cout << "Q8K GEMV SANITY (dequant vs GPU): max_rel=" << sanity_max_rel
-            << " max_abs=" << sanity_max_abs << "\n";
   if (primary_max_rel >= 1e-3F || primary_max_abs >= 1e-3F) {
-    std::cerr << "Q8K GEMV integer-dot mismatch (primary)\n";
-    std::abort();
-  }
-  if (sanity_max_rel >= 2e-2F) {
-    std::cerr
-        << "Q8K GEMV dequant delta out of the expected quantization band\n";
+    std::cerr << "Q8K GEMV mismatch against CPU oracle\n";
     std::abort();
   }
 
@@ -269,36 +229,8 @@ void TestQ8_0BlockGEMVEquivalence() {
     }
   }
 
-  // Check 1 (PRIMARY, tight): CPU reference replicating the integer-Q8
-  // arithmetic (max|x| -> scale, xq clamp, int32 MAC, end scale).
-  std::vector<float> y_q8_ref(M, 0.0F);
-  for (std::size_t m = 0; m < M; ++m) {
-    float sumf = 0.0F;
-    for (std::size_t b = 0; b < num_blocks; ++b) {
-      const Q8_0BlockTest& wblk = h_A[m * num_blocks + b];
-      const float d_w = half_to_float(wblk.d);
-      const float* xb = h_x.data() + b * QK;
-      float local_max = 0.0F;
-      for (std::size_t i = 0; i < QK; ++i) {
-        local_max = std::max(local_max, std::abs(xb[i]));
-      }
-      const float scale = (local_max > 0.0F) ? (local_max / 127.0F) : 0.0F;
-      int acc = 0;
-      for (std::size_t i = 0; i < QK; ++i) {
-        const float xv = (scale > 0.0F) ? (xb[i] / scale) : 0.0F;
-        int xq = static_cast<int>(std::round(xv));
-        xq = (xq > 127) ? 127 : xq;
-        xq = (xq < -127) ? -127 : xq;
-        acc += static_cast<int>(wblk.qs[i]) * xq;
-      }
-      sumf += d_w * scale * static_cast<float>(acc);
-    }
-    y_q8_ref[m] = sumf;
-  }
-
-  // Check 2 (SANITY, loose): CPU DotProductQ8_0 (exact fp dequant dot, no
-  // activation quant) vs GPU. The difference is the activation-quantization
-  // error, expected ~1%.
+  // Primary check: CPU DotProductQ8_0 (exact fp dequant dot of weights against
+  // x).
   std::vector<float> y_dequant_ref(M, 0.0F);
   for (std::size_t m = 0; m < M; ++m) {
     y_dequant_ref[m] = strix::quant::DotProductQ8_0(
@@ -306,30 +238,18 @@ void TestQ8_0BlockGEMVEquivalence() {
   }
 
   float primary_max_rel = 0.0F, primary_max_abs = 0.0F;
-  float sanity_max_rel = 0.0F, sanity_max_abs = 0.0F;
   for (std::size_t m = 0; m < M; ++m) {
-    const float abs_q8 = std::abs(y_gpu[m] - y_q8_ref[m]);
-    const float rel_q8 = abs_q8 / std::max(1e-6F, std::abs(y_q8_ref[m]));
-    primary_max_rel = std::max(primary_max_rel, rel_q8);
-    primary_max_abs = std::max(primary_max_abs, abs_q8);
-
-    const float abs_san = std::abs(y_gpu[m] - y_dequant_ref[m]);
-    const float rel_san = abs_san / std::max(1e-3F, std::abs(y_dequant_ref[m]));
-    sanity_max_rel = std::max(sanity_max_rel, rel_san);
-    sanity_max_abs = std::max(sanity_max_abs, abs_san);
+    const float abs_diff = std::abs(y_gpu[m] - y_dequant_ref[m]);
+    const float rel_diff =
+        abs_diff / std::max(1e-4F, std::abs(y_dequant_ref[m]));
+    primary_max_rel = std::max(primary_max_rel, rel_diff);
+    primary_max_abs = std::max(primary_max_abs, abs_diff);
   }
 
-  std::cout << "Q8_0 GEMV PRIMARY (int-Q8 vs GPU): max_rel=" << primary_max_rel
+  std::cout << "Q8_0 GEMV vs CPU oracle: max_rel=" << primary_max_rel
             << " max_abs=" << primary_max_abs << "\n";
-  std::cout << "Q8_0 GEMV SANITY (dequant vs GPU): max_rel=" << sanity_max_rel
-            << " max_abs=" << sanity_max_abs << "\n";
   if (primary_max_rel >= 1e-3F || primary_max_abs >= 1e-3F) {
-    std::cerr << "Q8_0 GEMV integer-dot mismatch (primary)\n";
-    std::abort();
-  }
-  if (sanity_max_rel >= 2e-2F) {
-    std::cerr
-        << "Q8_0 GEMV dequant delta out of the expected quantization band\n";
+    std::cerr << "Q8_0 GEMV mismatch against CPU oracle\n";
     std::abort();
   }
 

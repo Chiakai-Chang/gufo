@@ -8,12 +8,11 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/core/gguf_reader.hpp"
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/detail/gemv_dispatcher.hpp"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
-#include "src/core/gguf_reader.hpp"
-
 
 namespace strix::hip {
 
@@ -195,11 +194,13 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
   }
 }
 
-__global__ void FastFusedSwiGLUGEMVBlockKernel(
-    const void* __restrict__ gate_w, core::GgmlType gate_type,
-    const void* __restrict__ up_w, core::GgmlType up_type,
-    const float* __restrict__ x, float* __restrict__ out, std::size_t M,
-    std::size_t K) {
+__global__ void FastFusedSwiGLUGEMVBlockKernel(const void* __restrict__ gate_w,
+                                               core::GgmlType gate_type,
+                                               const void* __restrict__ up_w,
+                                               core::GgmlType up_type,
+                                               const float* __restrict__ x,
+                                               float* __restrict__ out,
+                                               std::size_t M, std::size_t K) {
   const std::size_t m = blockIdx.x;
   if (m >= M)
     return;
@@ -340,6 +341,130 @@ __global__ void FastFusedSwiGLUGEMVBlockKernel(
   }
 }
 
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32FusedQuantSwiGLUGEMVKernel_1Row(const void* __restrict__ gate_w,
+                                               core::GgmlType gate_type,
+                                               const void* __restrict__ up_w,
+                                               core::GgmlType up_type,
+                                               const float* __restrict__ x,
+                                               float* __restrict__ out,
+                                               std::size_t M, std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t m = (blockIdx.x * WavesPerBlock) + warp_id;
+  if (m >= M) {
+    return;
+  }
+
+  const float dot_gate =
+      QuantWarpBlockDot(gate_type, gate_w, m, x, K, lane_id, 0, 1);
+  const float dot_up = QuantWarpBlockDot(up_type, up_w, m, x, K, lane_id, 0, 1);
+
+  if (lane_id == 0) {
+    const float sig_g = 1.0F / (1.0F + expf(-dot_gate));
+    out[m] = (dot_gate * sig_g) * dot_up;
+  }
+}
+
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void Wave32FusedQuantSwiGLUGEMVKernel_2Rows(const void* __restrict__ gate_w,
+                                                core::GgmlType gate_type,
+                                                const void* __restrict__ up_w,
+                                                core::GgmlType up_type,
+                                                const float* __restrict__ x,
+                                                float* __restrict__ out,
+                                                std::size_t M, std::size_t K) {
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+  const std::size_t pair_idx = (blockIdx.x * WavesPerBlock) + warp_id;
+  const std::size_t m0 = pair_idx * 2;
+  const std::size_t m1 = m0 + 1;
+  if (m0 >= M) {
+    return;
+  }
+
+  if (gate_type == core::GgmlType::kQ8_0 && up_type == core::GgmlType::kQ8_0) {
+    const std::size_t num_blocks = K / kQ8_0BlockSize;
+    const auto* g0_blocks =
+        static_cast<const Q8_0Block*>(gate_w) + (m0 * num_blocks);
+    const auto* u0_blocks =
+        static_cast<const Q8_0Block*>(up_w) + (m0 * num_blocks);
+    const auto* g1_blocks =
+        (m1 < M) ? (static_cast<const Q8_0Block*>(gate_w) + (m1 * num_blocks))
+                 : nullptr;
+    const auto* u1_blocks =
+        (m1 < M) ? (static_cast<const Q8_0Block*>(up_w) + (m1 * num_blocks))
+                 : nullptr;
+
+    float sum_g0 = 0.0F, sum_u0 = 0.0F;
+    float sum_g1 = 0.0F, sum_u1 = 0.0F;
+
+    for (std::size_t b = 0; b < num_blocks; ++b) {
+      const float xv = x[(b * kQ8_0BlockSize) + lane_id];
+      const Q8_0Block& gb0 = g0_blocks[b];
+      const Q8_0Block& ub0 = u0_blocks[b];
+      float dot_g0 = static_cast<float>(gb0.qs[lane_id]) * xv;
+      float dot_u0 = static_cast<float>(ub0.qs[lane_id]) * xv;
+      float dot_g1 = 0.0F, dot_u1 = 0.0F;
+
+      if (g1_blocks != nullptr && u1_blocks != nullptr) {
+        const Q8_0Block& gb1 = g1_blocks[b];
+        const Q8_0Block& ub1 = u1_blocks[b];
+        dot_g1 = static_cast<float>(gb1.qs[lane_id]) * xv;
+        dot_u1 = static_cast<float>(ub1.qs[lane_id]) * xv;
+      }
+
+      for (int off = 16; off > 0; off >>= 1) {
+        dot_g0 += __shfl_xor(dot_g0, off);
+        dot_u0 += __shfl_xor(dot_u0, off);
+        dot_g1 += __shfl_xor(dot_g1, off);
+        dot_u1 += __shfl_xor(dot_u1, off);
+      }
+
+      sum_g0 += __half2float(gb0.d) * dot_g0;
+      sum_u0 += __half2float(ub0.d) * dot_u0;
+      if (g1_blocks != nullptr && u1_blocks != nullptr) {
+        sum_g1 += __half2float(g1_blocks[b].d) * dot_g1;
+        sum_u1 += __half2float(u1_blocks[b].d) * dot_u1;
+      }
+    }
+
+    if (lane_id == 0) {
+      const float sig_g0 = 1.0F / (1.0F + expf(-sum_g0));
+      out[m0] = (sum_g0 * sig_g0) * sum_u0;
+      if (m1 < M) {
+        const float sig_g1 = 1.0F / (1.0F + expf(-sum_g1));
+        out[m1] = (sum_g1 * sig_g1) * sum_u1;
+      }
+    }
+    return;
+  }
+
+  const float dot_g0 =
+      QuantWarpBlockDot(gate_type, gate_w, m0, x, K, lane_id, 0, 1);
+  const float dot_u0 =
+      QuantWarpBlockDot(up_type, up_w, m0, x, K, lane_id, 0, 1);
+  const float dot_g1 =
+      (m1 < M) ? QuantWarpBlockDot(gate_type, gate_w, m1, x, K, lane_id, 0, 1)
+               : 0.0F;
+  const float dot_u1 =
+      (m1 < M) ? QuantWarpBlockDot(up_type, up_w, m1, x, K, lane_id, 0, 1)
+               : 0.0F;
+
+  if (lane_id == 0) {
+    const float sig_g0 = 1.0F / (1.0F + expf(-dot_g0));
+    out[m0] = (dot_g0 * sig_g0) * dot_u0;
+    if (m1 < M) {
+      const float sig_g1 = 1.0F / (1.0F + expf(-dot_g1));
+      out[m1] = (dot_g1 * sig_g1) * dot_u1;
+    }
+  }
+}
+
 void LaunchFusedSwiGLUGEMV(const void* gate_w, core::GgmlType gate_type,
                            const void* up_w, core::GgmlType up_type,
                            const float* x, float* out,
@@ -369,6 +494,30 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, core::GgmlType gate_type,
             static_cast<const hip_bfloat16*>(gate_w),
             static_cast<const hip_bfloat16*>(up_w), x, out, intermediate_size,
             hidden_size);
+    return;
+  }
+
+  if (gate_type != core::GgmlType::kF32 && up_type != core::GgmlType::kF32) {
+    constexpr std::uint32_t kWavesPerBlock = 4;
+    constexpr std::uint32_t kBlockThreads = kWavesPerBlock * 32;
+
+    if (intermediate_size >= 2 && (intermediate_size % 2 == 0)) {
+      const std::size_t num_pairs = intermediate_size / 2;
+      const std::size_t grid =
+          (num_pairs + kWavesPerBlock - 1) / kWavesPerBlock;
+      Wave32FusedQuantSwiGLUGEMVKernel_2Rows<kWavesPerBlock>
+          <<<grid, kBlockThreads, 0, stream>>>(gate_w, gate_type, up_w, up_type,
+                                               x, out, intermediate_size,
+                                               hidden_size);
+      return;
+    }
+
+    const std::size_t grid =
+        (intermediate_size + kWavesPerBlock - 1) / kWavesPerBlock;
+    Wave32FusedQuantSwiGLUGEMVKernel_1Row<kWavesPerBlock>
+        <<<grid, kBlockThreads, 0, stream>>>(gate_w, gate_type, up_w, up_type,
+                                             x, out, intermediate_size,
+                                             hidden_size);
     return;
   }
 

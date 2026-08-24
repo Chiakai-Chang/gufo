@@ -215,19 +215,12 @@ __device__ inline float QuantWarpBlockDot(
         const Q8_0Block& wblk = row_blocks[b];
         const float d_w = __half2float(wblk.d);
         const TX* xb = x + (b * kQ8_0BlockSize);
-        float local_max = fabsf(static_cast<float>(xb[lane_id]));
-        for (int off = 16; off > 0; off >>= 1)
-          local_max = fmaxf(local_max, __shfl_xor(local_max, off));
-        const float scale = (local_max > 0.0F) ? (local_max / 127.0F) : 0.0F;
-        const float xv =
-            (scale > 0.0F) ? (static_cast<float>(xb[lane_id]) / scale) : 0.0F;
-        int xq = static_cast<int>(roundf(xv));
-        xq = (xq > 127) ? 127 : xq;
-        xq = (xq < -127) ? -127 : xq;
-        int acc = static_cast<int>(wblk.qs[lane_id]) * xq;
-        for (int off = 16; off > 0; off >>= 1)
-          acc += __shfl_xor(acc, off);
-        sumf += d_w * scale * static_cast<float>(acc);
+        float dot = static_cast<float>(wblk.qs[lane_id]) *
+                    static_cast<float>(xb[lane_id]);
+        for (int off = 16; off > 0; off >>= 1) {
+          dot += __shfl_xor(dot, off);
+        }
+        sumf += d_w * dot;
       }
       break;
     }
@@ -237,28 +230,16 @@ __device__ inline float QuantWarpBlockDot(
         const Q8KBlock& wblk = row_blocks[b];
         const float d_w = wblk.d;
         const TX* xb = x + (b * kQ8KBlockSize);
-        float local_max = 0.0F;
-#pragma unroll
-        for (std::size_t k = 0; k < 8; ++k)
-          local_max = fmaxf(local_max,
-                            fabsf(static_cast<float>(xb[lane_id + (32 * k)])));
-        for (int off = 16; off > 0; off >>= 1)
-          local_max = fmaxf(local_max, __shfl_xor(local_max, off));
-        const float scale = (local_max > 0.0F) ? (local_max / 127.0F) : 0.0F;
-        int acc = 0;
+        float dot = 0.0F;
 #pragma unroll
         for (std::size_t k = 0; k < 8; ++k) {
           const std::size_t idx = lane_id + (32 * k);
-          const float xv =
-              (scale > 0.0F) ? (static_cast<float>(xb[idx]) / scale) : 0.0F;
-          int xq = static_cast<int>(roundf(xv));
-          xq = (xq > 127) ? 127 : xq;
-          xq = (xq < -127) ? -127 : xq;
-          acc += static_cast<int>(wblk.qs[idx]) * xq;
+          dot += static_cast<float>(wblk.qs[idx]) * static_cast<float>(xb[idx]);
         }
-        for (int off = 16; off > 0; off >>= 1)
-          acc += __shfl_xor(acc, off);
-        sumf += d_w * scale * static_cast<float>(acc);
+        for (int off = 16; off > 0; off >>= 1) {
+          dot += __shfl_xor(dot, off);
+        }
+        sumf += d_w * dot;
       }
       break;
     }
