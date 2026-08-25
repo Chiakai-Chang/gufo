@@ -425,10 +425,15 @@ Same build, same model, same session. `llama-bench` run as
 
 | Benchmark Test | Before `opt-c163` | Current `strix-server` | `llama-bench` | Parity vs. `llama-bench` |
 | :--- | :---: | :---: | :---: | :---: |
-| **Decode `tg16`** | `7.46 tok/s` | `7.46 tok/s` | `7.64 tok/s` | `97.6%` |
+| **Decode `tg16`** | `7.15 tok/s` | `7.15 tok/s` | `7.15 tok/s` | `100%` |
 | **Sustained Memory Bandwidth** | `209.3 GB/s` | `209.3 GB/s` | `214.3 GB/s` | `97.6%` (86.8% of the measured 241 GB/s read ceiling) |
-| **Prefill `pp512`** | `317.47 tok/s` | **`474.60 tok/s`** | `308.49 tok/s` | **`153.8%`** |
-| **Prefill `pp2048`** | `314.09 tok/s` | **`490.59 tok/s`** | `350.54 tok/s` | **`140.0%`** |
+| **Prefill `pp512`** | `317.47 tok/s` | **`474.75 +/- 0.32 tok/s`** | `308.49 tok/s` | **`153.9%`** |
+| **Prefill `pp2048`** | `314.09 tok/s` | **`488.73 +/- 2.06 tok/s`** | `354.47 tok/s` | **`137.9%`** |
+
+Decode is unchanged by this work: none of it touches the decode kernels. The
+`7.46` figure recorded earlier was measured in a cooler session -- re-measuring
+both engines back to back in this session gives `7.15` for *both*, so decode is
+at exact parity rather than 97.6%.
 
 `pp2048` at 490.59 tok/s is 37% of the 1338 tok/s arithmetic ceiling the INT8
 WMMA rate imposes.
