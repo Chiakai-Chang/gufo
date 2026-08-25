@@ -13,15 +13,72 @@
 
 namespace strix::hip {
 
-struct Q8_1ActivationBlock {
-  float d;
-  std::int8_t qs[32];
-};
+using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
+using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+
+// Tiled Q8_1 activation layout (opt-c163-blocked-w8a8).
+//
+// Activations are written straight into WMMA B-fragment order so both the LDS
+// staging copy and the fragment reads are contiguous:
+//
+//   tile(tt, kb) = [b0: 16 tokens x 16 bytes]   offset   0
+//                  [b1: 16 tokens x 16 bytes]   offset 256
+//                  [16 fp32 token scales    ]   offset 512
+//
+// with tt = token / 16 and kb the 32-element K block. The 576-byte stride keeps
+// every fragment and scale vector 16-byte aligned. For a token count that is a
+// multiple of 16 this is exactly the same total size as the previous row-major
+// block_q8_1 buffer (36 bytes per 32 elements), so arena sizing is unchanged.
+constexpr std::size_t kQ8ActTileTokens = 16;
+constexpr std::size_t kQ8ActTileBytes = 576;
+constexpr std::size_t kQ8ActScaleOffset = 512;
+
+/// Byte size of the tiled Q8_1 activation buffer for a [batch, k] tensor.
+__host__ __device__ inline std::size_t Q8ActTiledBytes(std::size_t batch,
+                                                       std::size_t k) {
+  const std::size_t tiles =
+      (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
+  return tiles * (k / 32) * kQ8ActTileBytes;
+}
+
+__device__ __forceinline__ std::int8_t* Q8ActTile(void* base,
+                                                  std::size_t num_blocks,
+                                                  std::size_t tt,
+                                                  std::size_t kb) {
+  return static_cast<std::int8_t*>(base) +
+         (((tt * num_blocks) + kb) * kQ8ActTileBytes);
+}
+
+__device__ __forceinline__ const std::int8_t* Q8ActTile(
+    const void* base, std::size_t num_blocks, std::size_t tt, std::size_t kb) {
+  return static_cast<const std::int8_t*>(base) +
+         (((tt * num_blocks) + kb) * kQ8ActTileBytes);
+}
+
+/// Writes one lane's quantized byte and (lane 0) the block scale into the tiled
+/// layout. `lane_id` is the element index inside the 32-element block.
+__device__ __forceinline__ void StoreQ8ActLane(void* y, std::size_t num_blocks,
+                                               std::size_t tok,
+                                               std::size_t blk,
+                                               std::size_t lane_id, float d,
+                                               std::int8_t q) {
+  const std::size_t tt = tok / kQ8ActTileTokens;
+  const std::size_t tl = tok % kQ8ActTileTokens;
+  std::int8_t* tile = Q8ActTile(y, num_blocks, tt, blk);
+  const std::size_t half = lane_id >> 4u;
+  const std::size_t pos = lane_id & 15u;
+  tile[(half * 256) + (tl * 16) + pos] = q;
+  if (lane_id == 0) {
+    *reinterpret_cast<float*>(tile + kQ8ActScaleOffset + (tl * sizeof(float))) =
+        d;
+  }
+}
 
 template<typename T>
-__global__ void QuantizeActivationToQ8_1Kernel(
-    const T* __restrict__ x, Q8_1ActivationBlock* __restrict__ y,
-    std::size_t batch, std::size_t k) {
+__global__ void QuantizeActivationToQ8_1Kernel(const T* __restrict__ x,
+                                               void* __restrict__ y,
+                                               std::size_t batch,
+                                               std::size_t k) {
   const std::size_t num_blocks = k / 32;
   const std::size_t b_idx =
       (blockIdx.x * (blockDim.x >> 5u)) + (threadIdx.x >> 5u);
@@ -46,15 +103,35 @@ __global__ void QuantizeActivationToQ8_1Kernel(
   const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
   const int8_t q = static_cast<int8_t>(roundf(val * id));
 
-  if (lane_id == 0) {
-    y[b_idx].d = d;
+  StoreQ8ActLane(y, num_blocks, tok, blk, lane_id, d, q);
+}
+
+/// Zeroes the tail of the last token tile so a batch that is not a multiple of
+/// 16 cannot feed uninitialized scales into the GEMM epilogue.
+__global__ void ZeroQ8ActTailKernel(void* __restrict__ y, std::size_t batch,
+                                    std::size_t num_blocks) {
+  const std::size_t tail = batch % kQ8ActTileTokens;
+  if (tail == 0) {
+    return;
   }
-  y[b_idx].qs[lane_id] = q;
+  const std::size_t tt = batch / kQ8ActTileTokens;
+  const std::size_t idx = (blockIdx.x * blockDim.x) + threadIdx.x;
+  const std::size_t lanes = kQ8ActTileTokens - tail;
+  if (idx >= num_blocks * lanes) {
+    return;
+  }
+  const std::size_t kb = idx / lanes;
+  const std::size_t tl = tail + (idx % lanes);
+  std::int8_t* tile = Q8ActTile(y, num_blocks, tt, kb);
+  reinterpret_cast<int32x4_t*>(tile + (tl * 16))[0] = {};
+  reinterpret_cast<int32x4_t*>(tile + 256 + (tl * 16))[0] = {};
+  *reinterpret_cast<float*>(tile + kQ8ActScaleOffset + (tl * sizeof(float))) =
+      0.0F;
 }
 
 __global__ void BatchedFusedSwiGLUQuantizeQ8_1Kernel(
     const float* __restrict__ gate, const float* __restrict__ up,
-    Q8_1ActivationBlock* __restrict__ y, std::size_t batch, std::size_t k) {
+    void* __restrict__ y, std::size_t batch, std::size_t k) {
   const std::size_t num_blocks = k / 32;
   const std::size_t b_idx =
       (blockIdx.x * (blockDim.x >> 5u)) + (threadIdx.x >> 5u);
@@ -83,14 +160,8 @@ __global__ void BatchedFusedSwiGLUQuantizeQ8_1Kernel(
   const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
   const int8_t q = static_cast<int8_t>(roundf(val * id));
 
-  if (lane_id == 0) {
-    y[b_idx].d = d;
-  }
-  y[b_idx].qs[lane_id] = q;
+  StoreQ8ActLane(y, num_blocks, tok, blk, lane_id, d, q);
 }
-
-using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
-using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
 
 template<bool SubOpsel>
 __device__ __forceinline__ int32x8_t Wmma_16x16x16_iu8(int32x4_t a, int32x4_t b,
@@ -110,119 +181,206 @@ struct LdsWeight8Blocks {
   float dw[8][16];
 };
 
-__launch_bounds__(256, 4) __global__ void W8A8WmmaLdsBatchedGEMMKernel(
-    const void* __restrict__ w,
-    const Q8_1ActivationBlock* __restrict__ x_blocks, float* __restrict__ y,
-    std::size_t batch, std::size_t m, std::size_t k) {
-  __shared__ LdsWeight8Blocks s_w;
+// Two-dimensionally blocked W8A8 WMMA GEMM (opt-c163-blocked-w8a8).
+//
+// Traffic per multiply-accumulate is 34/(32*BN) bytes of weight and
+// 36/(32*BM) bytes of activation. The previous 16-row macro tile therefore
+// re-read the whole activation panel m/16 times (1088x, ~12.8 GB for the FFN
+// shape at batch 2048), which dominated everything else. Blocking both
+// dimensions at 128 cuts that to m/128 and lifts the kernel from 35% to 58% of
+// the measured 55.07 TOPS WMMA int8 ceiling.
+//
+//   block = BM rows x BN tokens, BK 32-element K blocks per LDS stage
+//   waves = WM row groups x WN token groups (WM*WN == 8)
+//   wave  = (BM/WM) rows x (BN/WN) tokens
+//
+// Weights are read from the production row-major block_q8_0 layout, so no
+// second copy of the model is needed; activations arrive in the tiled layout
+// the quantize kernel emits. Accumulation order over K blocks is unchanged from
+// the 16-row kernel, so results are bit-identical.
+template<int BM, int BN, int BK, int WM, int WN>
+__launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
+    const void* __restrict__ w, const void* __restrict__ x_blocks,
+    float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k) {
+  static_assert(WM * WN == 8, "256 threads is 8 waves");
+  static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
+  constexpr int kRowTiles = BM / 16;
+  constexpr int kTokTiles = BN / 16;
+  constexpr int kWaveRowTiles = kRowTiles / WM;
+  constexpr int kWaveTokTiles = kTokTiles / WN;
 
-  const std::size_t num_blocks = k / 32;
+  __shared__ int32x4_t s_a[BK][kRowTiles][32];
+  __shared__ float s_dw[BK][kRowTiles][16];
+  __shared__ int32x4_t s_b[BK][kTokTiles][32];
+  __shared__ float s_dx[BK][kTokTiles][16];
+
   const auto* w_blocks = static_cast<const Q8_0Block*>(w);
+  const std::size_t num_blocks = k / 32;
 
-  const std::size_t tid = threadIdx.x;
-  const std::size_t wave_id =
-      tid >> 5u;  // 0..7 (8 waves compute 128 tokens total)
-  const std::size_t lane_id = tid & 31u;  // 0..31
+  const int tid = static_cast<int>(threadIdx.x);
+  const int wave_id = tid >> 5;
+  const int lane_id = tid & 31;
+  const int sub_lane = lane_id & 15;
+  const int half_id = lane_id >> 4;
+  const int wave_row = wave_id / WN;
+  const int wave_tok = wave_id % WN;
 
-  const std::size_t r_base = blockIdx.x * 16;
-  const std::size_t t_base = (blockIdx.y * 128) + (wave_id * 16);
+  const std::size_t r_block = static_cast<std::size_t>(blockIdx.y) * BM;
+  const std::size_t t_block = static_cast<std::size_t>(blockIdx.x) * BN;
+  const std::size_t tt_block = t_block / kQ8ActTileTokens;
 
-  const std::size_t sub_lane = lane_id % 16u;
-  const std::size_t half_id = lane_id / 16u;
-
-  const std::size_t tok = t_base + sub_lane;
-
-  float acc[8] = {0.0F};
-
-  const auto* tok_x = (tok < batch) ? (x_blocks + (tok * num_blocks)) : nullptr;
-
-  const std::size_t block_sub =
-      tid / 32;  // 0..7 (all 256 threads participate in 1 pass)
-  const std::size_t lane_sub = tid % 32;  // 0..31
-
-  for (std::size_t b = 0; b < num_blocks; b += 8) {
-    const std::size_t b_curr = b + block_sub;
-    if (lane_sub < 16) {
-      const std::size_t r = r_base + lane_sub;
-      if (r < m && b_curr < num_blocks) {
-        const Q8_0Block& blk = w_blocks[(r * num_blocks) + b_curr];
-        s_w.dw[block_sub][lane_sub] = __half2float(blk.d);
-        __builtin_memcpy(&s_w.a0[block_sub][lane_sub], blk.qs + 0, 16);
-      } else {
-        s_w.dw[block_sub][lane_sub] = 0.0F;
-        s_w.a0[block_sub][lane_sub] = {0, 0, 0, 0};
+  float acc[kWaveRowTiles][kWaveTokTiles][8];
+#pragma unroll
+  for (int i = 0; i < kWaveRowTiles; ++i) {
+#pragma unroll
+    for (int j = 0; j < kWaveTokTiles; ++j) {
+#pragma unroll
+      for (int l = 0; l < 8; ++l) {
+        acc[i][j][l] = 0.0F;
       }
-    } else {
-      const std::size_t lane_idx = lane_sub - 16;
-      const std::size_t r = r_base + lane_idx;
-      if (r < m && b_curr < num_blocks) {
-        const Q8_0Block& blk = w_blocks[(r * num_blocks) + b_curr];
-        __builtin_memcpy(&s_w.a1[block_sub][lane_idx], blk.qs + 16, 16);
+    }
+  }
+
+  for (std::size_t kb0 = 0; kb0 < num_blocks; kb0 += BK) {
+    // Weights: one (row, k-block) pair per thread, consecutive threads walking
+    // consecutive k-blocks of a row so the 34-byte blocks stay contiguous.
+#pragma unroll
+    for (int p = 0; p < (BM * BK) / 256; ++p) {
+      const int idx = (p * 256) + tid;
+      const int rr = idx / BK;
+      const int kk = idx % BK;
+      const int rs = rr / 16;
+      const int rl = rr % 16;
+      const int slot = (rl % 2 == 0) ? (rl / 2) : (8 + (rl / 2));
+      const std::size_t r = r_block + static_cast<std::size_t>(rr);
+      const std::size_t kb = kb0 + static_cast<std::size_t>(kk);
+      if (r < m && kb < num_blocks) {
+        const Q8_0Block& blk = w_blocks[(r * num_blocks) + kb];
+        __builtin_memcpy(&s_a[kk][rs][rl], blk.qs + 0, 16);
+        __builtin_memcpy(&s_a[kk][rs][16 + rl], blk.qs + 16, 16);
+        s_dw[kk][rs][slot] = __half2float(blk.d);
       } else {
-        s_w.a1[block_sub][lane_idx] = {0, 0, 0, 0};
+        s_a[kk][rs][rl] = int32x4_t{0, 0, 0, 0};
+        s_a[kk][rs][16 + rl] = int32x4_t{0, 0, 0, 0};
+        s_dw[kk][rs][slot] = 0.0F;
+      }
+    }
+
+    // Activations: already in fragment order, so this is a contiguous copy.
+#pragma unroll
+    for (int t = wave_id; t < kTokTiles; t += 8) {
+#pragma unroll
+      for (int i = 0; i < BK; ++i) {
+        const std::size_t kb = kb0 + static_cast<std::size_t>(i);
+        if (kb < num_blocks) {
+          const auto* src = reinterpret_cast<const int32x4_t*>(Q8ActTile(
+              x_blocks, num_blocks, tt_block + static_cast<std::size_t>(t), kb));
+          s_b[i][t][lane_id] = src[lane_id];
+          if (lane_id < 16) {
+            s_dx[i][t][lane_id] = reinterpret_cast<const float*>(
+                reinterpret_cast<const std::int8_t*>(src) +
+                kQ8ActScaleOffset)[lane_id];
+          }
+        } else {
+          s_b[i][t][lane_id] = int32x4_t{0, 0, 0, 0};
+          if (lane_id < 16) {
+            s_dx[i][t][lane_id] = 0.0F;
+          }
+        }
       }
     }
     __syncthreads();
 
-    int32x4_t act_b0[8] = {};
-    int32x4_t act_b1[8] = {};
-    float act_dx[8] = {0.0F};
-
-    if (tok_x != nullptr) {
 #pragma unroll
-      for (int step = 0; step < 8; ++step) {
-        const std::size_t b_step = b + static_cast<std::size_t>(step);
-        if (b_step < num_blocks) {
-          const auto& blk_x = tok_x[b_step];
-          act_dx[step] = blk_x.d;
-          act_b0[step] = *reinterpret_cast<const int32x4_t*>(blk_x.qs + 0);
-          act_b1[step] = *reinterpret_cast<const int32x4_t*>(blk_x.qs + 16);
+    for (int kb = 0; kb < BK; ++kb) {
+      int32x4_t a0[kWaveRowTiles];
+      int32x4_t a1[kWaveRowTiles];
+      float dw[kWaveRowTiles][8];
+#pragma unroll
+      for (int i = 0; i < kWaveRowTiles; ++i) {
+        const int rs = (wave_row * kWaveRowTiles) + i;
+        a0[i] = s_a[kb][rs][sub_lane];
+        a1[i] = s_a[kb][rs][16 + sub_lane];
+        const float4 lo =
+            *reinterpret_cast<const float4*>(&s_dw[kb][rs][half_id * 8]);
+        const float4 up =
+            *reinterpret_cast<const float4*>(&s_dw[kb][rs][(half_id * 8) + 4]);
+        dw[i][0] = lo.x;
+        dw[i][1] = lo.y;
+        dw[i][2] = lo.z;
+        dw[i][3] = lo.w;
+        dw[i][4] = up.x;
+        dw[i][5] = up.y;
+        dw[i][6] = up.z;
+        dw[i][7] = up.w;
+      }
+      int32x4_t b0[kWaveTokTiles];
+      int32x4_t b1[kWaveTokTiles];
+      float dx[kWaveTokTiles];
+#pragma unroll
+      for (int j = 0; j < kWaveTokTiles; ++j) {
+        const int ts = (wave_tok * kWaveTokTiles) + j;
+        b0[j] = s_b[kb][ts][sub_lane];
+        b1[j] = s_b[kb][ts][16 + sub_lane];
+        dx[j] = s_dx[kb][ts][sub_lane];
+      }
+
+#pragma unroll
+      for (int i = 0; i < kWaveRowTiles; ++i) {
+#pragma unroll
+        for (int j = 0; j < kWaveTokTiles; ++j) {
+          int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
+          c = Wmma_16x16x16_iu8<true>(a0[i], b0[j], c);
+          c = Wmma_16x16x16_iu8<true>(a1[i], b1[j], c);
+#pragma unroll
+          for (int l = 0; l < 8; ++l) {
+            acc[i][j][l] += (dw[i][l] * dx[j]) * static_cast<float>(c[l]);
+          }
         }
       }
     }
-
-#pragma unroll
-    for (int step = 0; step < 8; ++step) {
-      const std::size_t b_step = b + static_cast<std::size_t>(step);
-      if (b_step < num_blocks) {
-        const int32x4_t a0 = s_w.a0[step][sub_lane];
-        const int32x4_t a1 = s_w.a1[step][sub_lane];
-
-        int32x8_t c_frag = {0, 0, 0, 0, 0, 0, 0, 0};
-        c_frag = Wmma_16x16x16_iu8<true>(a0, act_b0[step], c_frag);
-        c_frag = Wmma_16x16x16_iu8<true>(a1, act_b1[step], c_frag);
-
-        const float dx = act_dx[step];
-#pragma unroll
-        for (int l = 0; l < 8; ++l) {
-          const std::size_t row_idx =
-              (2u * static_cast<std::size_t>(l)) + half_id;
-          const float dw = s_w.dw[step][row_idx];
-          acc[l] += (dw * dx) * static_cast<float>(c_frag[l]);
-        }
-      }
-    }
-
     __syncthreads();
   }
 
-  if (tok < batch) {
+  // Transpose each 16x16 result tile through LDS so the global stores cover 16
+  // consecutive rows of one token instead of 16 separate cache lines.
+  __syncthreads();
+  float* tile_scratch =
+      reinterpret_cast<float*>(&s_a[0][0][0]) + (wave_id * 256);
 #pragma unroll
-    for (int l = 0; l < 8; ++l) {
-      const std::size_t r =
-          r_base + (2u * static_cast<std::size_t>(l)) + half_id;
-      if (r < m) {
-        y[(tok * m) + r] = acc[l];
+  for (int i = 0; i < kWaveRowTiles; ++i) {
+#pragma unroll
+    for (int j = 0; j < kWaveTokTiles; ++j) {
+#pragma unroll
+      for (int l = 0; l < 8; ++l) {
+        tile_scratch[(sub_lane * 16) + (2 * l) + half_id] = acc[i][j][l];
       }
+      __builtin_amdgcn_wave_barrier();
+      const std::size_t r0 =
+          r_block +
+          static_cast<std::size_t>((((wave_row * kWaveRowTiles) + i) * 16));
+      const std::size_t t0 =
+          t_block +
+          static_cast<std::size_t>((((wave_tok * kWaveTokTiles) + j) * 16));
+#pragma unroll
+      for (int s = 0; s < 8; ++s) {
+        const int flat = (s * 32) + lane_id;
+        const std::size_t tok = t0 + static_cast<std::size_t>(flat / 16);
+        const std::size_t r = r0 + static_cast<std::size_t>(flat % 16);
+        if (tok < batch && r < m) {
+          y[(tok * m) + r] = tile_scratch[flat];
+        }
+      }
+      __builtin_amdgcn_wave_barrier();
     }
   }
 }
 
 __launch_bounds__(256, 4) __global__ void W8A8DualWmmaLdsBatchedGEMMKernel(
     const void* __restrict__ w_gate, const void* __restrict__ w_up,
-    const Q8_1ActivationBlock* __restrict__ x_blocks,
-    float* __restrict__ y_gate, float* __restrict__ y_up, std::size_t batch,
-    std::size_t m, std::size_t k) {
+    const void* __restrict__ x_blocks, float* __restrict__ y_gate,
+    float* __restrict__ y_up, std::size_t batch, std::size_t m,
+    std::size_t k) {
   __shared__ LdsWeight8Blocks s_w_gate;
   __shared__ LdsWeight8Blocks s_w_up;
 
@@ -246,7 +404,9 @@ __launch_bounds__(256, 4) __global__ void W8A8DualWmmaLdsBatchedGEMMKernel(
   float acc_gate[8] = {0.0F};
   float acc_up[8] = {0.0F};
 
-  const auto* tok_x = (tok < batch) ? (x_blocks + (tok * num_blocks)) : nullptr;
+  const std::size_t tok_tile = tok / kQ8ActTileTokens;
+  const std::size_t tok_lane = tok % kQ8ActTileTokens;
+  const bool tok_valid = tok < batch;
 
   const std::size_t block_sub = tid / 32;  // 0..7
   const std::size_t lane_sub = tid % 32;   // 0..31
@@ -287,15 +447,19 @@ __launch_bounds__(256, 4) __global__ void W8A8DualWmmaLdsBatchedGEMMKernel(
     int32x4_t act_b1[8] = {};
     float act_dx[8] = {0.0F};
 
-    if (tok_x != nullptr) {
+    if (tok_valid) {
 #pragma unroll
       for (int step = 0; step < 8; ++step) {
         const std::size_t b_step = b + static_cast<std::size_t>(step);
         if (b_step < num_blocks) {
-          const auto& blk_x = tok_x[b_step];
-          act_dx[step] = blk_x.d;
-          act_b0[step] = *reinterpret_cast<const int32x4_t*>(blk_x.qs + 0);
-          act_b1[step] = *reinterpret_cast<const int32x4_t*>(blk_x.qs + 16);
+          const std::int8_t* tile =
+              Q8ActTile(x_blocks, num_blocks, tok_tile, b_step);
+          act_dx[step] = *reinterpret_cast<const float*>(
+              tile + kQ8ActScaleOffset + (tok_lane * sizeof(float)));
+          act_b0[step] =
+              *reinterpret_cast<const int32x4_t*>(tile + (tok_lane * 16));
+          act_b1[step] = *reinterpret_cast<const int32x4_t*>(
+              tile + 256 + (tok_lane * 16));
         }
       }
     }
@@ -532,6 +696,22 @@ __global__ void BatchedQuantGEMVKernel(core::GgmlType type,
   }
 }
 
+namespace {
+
+void LaunchZeroQ8ActTail(void* q8_1_out, std::size_t batch, std::size_t k,
+                         hipStream_t stream) {
+  const std::size_t tail = batch % kQ8ActTileTokens;
+  if (tail == 0) {
+    return;
+  }
+  const std::size_t num_blocks = k / 32;
+  const std::size_t work = num_blocks * (kQ8ActTileTokens - tail);
+  ZeroQ8ActTailKernel<<<static_cast<unsigned int>((work + 255) / 256), 256, 0,
+                        stream>>>(q8_1_out, batch, num_blocks);
+}
+
+}  // namespace
+
 void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
                                   std::size_t batch, std::size_t k,
                                   hipStream_t stream) {
@@ -546,8 +726,8 @@ void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
       (total_x_blocks + warps_per_tb - 1) / warps_per_tb;
   QuantizeActivationToQ8_1Kernel<<<static_cast<unsigned int>(quant_grid),
                                    quant_threads, 0, stream>>>(
-      reinterpret_cast<const hip_bfloat16*>(bf16_x),
-      reinterpret_cast<Q8_1ActivationBlock*>(q8_1_out), batch, k);
+      reinterpret_cast<const hip_bfloat16*>(bf16_x), q8_1_out, batch, k);
+  LaunchZeroQ8ActTail(q8_1_out, batch, k, stream);
 }
 
 void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
@@ -563,8 +743,9 @@ void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
   const std::size_t quant_grid =
       (total_x_blocks + warps_per_tb - 1) / warps_per_tb;
   QuantizeActivationToQ8_1Kernel<<<static_cast<unsigned int>(quant_grid),
-                                   quant_threads, 0, stream>>>(
-      fp32_x, reinterpret_cast<Q8_1ActivationBlock*>(q8_1_out), batch, k);
+                                   quant_threads, 0, stream>>>(fp32_x, q8_1_out,
+                                                               batch, k);
+  LaunchZeroQ8ActTail(q8_1_out, batch, k, stream);
 }
 
 void LaunchBatchedFusedSwiGLUQuantizeQ8_1(const float* gate, const float* up,
@@ -581,7 +762,8 @@ void LaunchBatchedFusedSwiGLUQuantizeQ8_1(const float* gate, const float* up,
       (total_x_blocks + warps_per_tb - 1) / warps_per_tb;
   BatchedFusedSwiGLUQuantizeQ8_1Kernel<<<static_cast<unsigned int>(quant_grid),
                                          quant_threads, 0, stream>>>(
-      gate, up, reinterpret_cast<Q8_1ActivationBlock*>(q8_1_out), batch, k);
+      gate, up, q8_1_out, batch, k);
+  LaunchZeroQ8ActTail(q8_1_out, batch, k, stream);
 }
 
 void LaunchBatchedQuantGEMMPreQuantized(core::GgmlType type, const void* w,
@@ -591,12 +773,25 @@ void LaunchBatchedQuantGEMMPreQuantized(core::GgmlType type, const void* w,
   if (m == 0 || k == 0 || batch == 0) {
     return;
   }
-  if (type == core::GgmlType::kQ8_0) {
-    const dim3 grid(static_cast<unsigned int>((m + 15) / 16),
-                    static_cast<unsigned int>((batch + 127) / 128));
-    W8A8WmmaLdsBatchedGEMMKernel<<<grid, 256, 0, stream>>>(
-        w, reinterpret_cast<const Q8_1ActivationBlock*>(q8_1_x), y, batch, m,
-        k);
+  if (type != core::GgmlType::kQ8_0) {
+    return;
+  }
+  // A 128-token macro tile is the throughput configuration; short prompt chunks
+  // would leave most of it idle, so they take the 64-token variant.
+  if (batch >= 96) {
+    constexpr int kBM = 128;
+    constexpr int kBN = 128;
+    const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
+                    static_cast<unsigned int>((m + kBM - 1) / kBM));
+    W8A8BlockedWmmaGEMMKernel<kBM, kBN, 4, 4, 2><<<grid, 256, 0, stream>>>(
+        w, q8_1_x, y, batch, m, k);
+  } else {
+    constexpr int kBM = 128;
+    constexpr int kBN = 64;
+    const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
+                    static_cast<unsigned int>((m + kBM - 1) / kBM));
+    W8A8BlockedWmmaGEMMKernel<kBM, kBN, 4, 8, 1><<<grid, 256, 0, stream>>>(
+        w, q8_1_x, y, batch, m, k);
   }
 }
 
@@ -611,8 +806,7 @@ void LaunchBatchedDualQuantGEMMPreQuantized(
     const dim3 grid(static_cast<unsigned int>((m + 15) / 16),
                     static_cast<unsigned int>((batch + 127) / 128));
     W8A8DualWmmaLdsBatchedGEMMKernel<<<grid, 256, 0, stream>>>(
-        w_gate, w_up, reinterpret_cast<const Q8_1ActivationBlock*>(q8_1_x),
-        y_gate, y_up, batch, m, k);
+        w_gate, w_up, q8_1_x, y_gate, y_up, batch, m, k);
   }
 }
 
@@ -629,9 +823,7 @@ void LaunchBatchedQuantGEMM(core::GgmlType type, const void* w,
     static thread_local void* s_act_q8_scratch = nullptr;
     static thread_local std::size_t s_act_q8_scratch_bytes = 0;
 
-    const std::size_t num_blocks = k / 32;
-    const std::size_t total_x_blocks = batch * num_blocks;
-    const std::size_t req_bytes = total_x_blocks * sizeof(Q8_1ActivationBlock);
+    const std::size_t req_bytes = Q8ActTiledBytes(batch, k);
     if (s_act_q8_scratch_bytes < req_bytes) {
       if (s_act_q8_scratch != nullptr) {
         (void)hipFree(s_act_q8_scratch);

@@ -288,8 +288,8 @@ they did not beat the unfused routes end-to-end on gfx1151.
 
 ## Qwen3.8-27B Q8 Layer Breakdown and Execution Timings
 
-Status: 2026-08-24. Hardware: AMD Strix Halo (`gfx1151`, LPDDR5X-8533 unified memory, 273 GB/s peak bandwidth).  
-Model: `Qwen3.8-27B-UD-Q8_K_L.gguf` (26.11 GiB / 28.05 GB, 64 layers: 62 SSM + 2 Full Attention, Hidden=5120, Intermediate=17408).
+Status: 2026-08-25. Hardware: AMD Strix Halo (`gfx1151`, LPDDR5X-8533 unified memory, 273 GB/s peak bandwidth).  
+Model: `Qwen3.8-27B-UD-Q8_K_XL.gguf` (29.30 GiB / 31.46 GB, 64 layers: 62 SSM + 2 Full Attention, Hidden=5120, Intermediate=17408).
 
 ### Topology Schema
 
@@ -372,14 +372,82 @@ During prefill, tokens are processed in parallel batches using native W8A8 WMMA 
 | **Batched RMSNorms & Residuals** | `BatchedRMSNormKernel` + Residuals | **`1.4 ms`** | **0.3%** |
 | **Total Prefill Stage** | — | **`455.6 ms`** (`280.96 tok/s`) | **100.0%** |
 
+### Measured gfx1151 roofline
+
+Every Q8 experiment below is scored against these measured ceilings rather than
+spec-sheet numbers. Reproduce with
+`nix develop -c tools/bench/build.sh gfx1151_peak && /tmp/gfx1151_peak`.
+
+| Ceiling | Measured | Note |
+| :--- | ---: | :--- |
+| WMMA INT8 `16x16x16` | **55.07 TOPS** | 93% of the 512 ops/clk/CU theoretical at 2.9 GHz |
+| WMMA BF16 `16x16x16` | **55.05 TFLOPS** | RDNA3.5 runs INT8 at the *same* rate as BF16, not 2x |
+| VALU FP32 FMA | 27.08 TFLOPS | ~90% of the dual-issue rate |
+| DRAM read / write / copy | 241 / 220 / 209 GB/s | unified LPDDR5X |
+| hipBLASLt BF16 GEMM, `17408x5120x2048` | 25.75 TFLOPS (47%) | the tuned-library bar our kernels must beat |
+| hipBLAS (rocBLAS) BF16, same shape | 4.14 TFLOPS (8%) | unusable for these shapes |
+
+The INT8-equals-BF16 rate is the single most important constraint: prompt
+processing needs `2 * 27.32e9 * n_prompt` operations, so `pp2048` cannot exceed
+about **1338 tok/s** on this part no matter how good the kernels are.
+
+### Optimization Experiment Log
+
+Ordered newest first. Each entry records the hypothesis, what was measured, and
+the decision, so rejected directions are not retried.
+
+| ID | Experiment | Result | Status |
+| :--- | :--- | :--- | :--- |
+| `opt-c163-blocked-w8a8` | Block the prefill W8A8 WMMA GEMM in both dimensions (128 rows x 128 tokens, 4 K-blocks per LDS stage, 4x2 waves) instead of 16 rows x 128 tokens, and emit activations directly in WMMA fragment order | Single-GEMM shapes 19.4 -> 31.7 TOPS (35% -> 58% of peak); `pp512` 317 -> 371 tok/s, `pp2048` 314 -> 388 tok/s. Bit-identical output | **Retained** |
+| `opt-c163-actlayout` | Tiled Q8_1 activation layout (16 tokens x 32 K per 576-byte tile, fragment-ordered, scales at +512) | Same buffer size as row-major `block_q8_1`; makes the LDS stage a contiguous copy | **Retained** (part of the above) |
+| `opt-c163-weight-repack` | Repack Q8_0 weights at load time into WMMA-native 16-row x 32-K tiles so weight loads are fully coalesced | 19.79 vs 19.39 TOPS -- within noise. Weight loading was never the limit, and a second weight copy would cost ~29 GB of unified memory | **Rejected** |
+| `opt-c163-gridswap` | Swap the GEMM grid so token tiles vary fastest, to keep the weight tile resident across token blocks | 13.22 vs 19.39 TOPS. With a 16-row macro tile each output cache line is only half written per block, so distant row tiles turn the stores into partial-line traffic | **Rejected** |
+| `opt-c163-blocked-dual` | Blocked dual gate/up GEMM (one shared activation stage feeding two weight matrices), 512 threads | 24.42 ms for both matrices vs 23.04 ms for two blocked singles and 24.26 ms for the current 16-row dual. Once BM is 128 the activation panel is already cheap, so sharing it buys nothing while doubling LDS and halving occupancy | **Rejected** as a throughput win; revisit only as a carrier for a fused SwiGLU epilogue |
+| `opt-c163-pipeline` | Prefetch the next K stage's weight blocks into registers so their global latency overlaps the WMMA work | 32.29 vs 31.69 TOPS (+1.9%), bit-identical, +14 VGPRs | **Candidate** -- small but free |
+| `opt-c163-coarse-dx` | One activation scale per LDS K stage (128 elements) instead of per 32-element block, so the epilogue drops from 3 to 2 VALU ops per output element | 33.99 vs 31.69 TOPS (+7%). Changes numerics: needs a prefill-validation and eval-quality gate before it can be considered | **Open** |
+
+Ablations on the retained kernel (`ffn_gate/up`, batch 2048) that bound what is
+left: removing the dequant epilogue reaches 63% of peak and removing the weight
+load reaches 47%, so the remaining gap to the ~70% issue-bound ceiling is split
+between the per-block scale application and LDS/global traffic.
+
 ### Benchmark Summary: `strix-server` vs. `llama-bench`
 
-| Benchmark Test | Baseline `strix-server` | Current `strix-server` | `llama-bench` | Parity vs. `llama-bench` |
+Same build, same model, same session. `llama-bench` run as
+`-ngl 99 -fa auto -b 4096 -ub 4096 -t 32 --load-mode mmap`.
+
+| Benchmark Test | Before `opt-c163` | Current `strix-server` | `llama-bench` | Parity vs. `llama-bench` |
 | :--- | :---: | :---: | :---: | :---: |
-| **Decode `tg16`** | `2.14 tok/s` | **`7.46 tok/s`** | `7.64 tok/s` | **`97.6%`** |
-| **Sustained Memory Bandwidth** | `59.8 GB/s` | **`209.3 GB/s`** | `214.3 GB/s` | **`97.6%`** (76.6% of theoretical peak) |
-| **Prefill `pp512`** | `~1.0 tok/s` | **`312.25 tok/s`** | `322.25 tok/s` | **`96.9%`** |
-| **Prefill `pp128`** | `2.60 tok/s` | **`280.96 tok/s`** | `277.12 tok/s` | **`101.4%` (Llama-bench beaten!)** |
-| **Prefill `pp64`** | `75.64 tok/s` | **`184.49 tok/s`** | `170.50 tok/s` | **`108.2%` (Llama-bench beaten!)** |
+| **Decode `tg16`** | `7.46 tok/s` | `7.46 tok/s` | `7.64 tok/s` | `97.6%` |
+| **Sustained Memory Bandwidth** | `209.3 GB/s` | `209.3 GB/s` | `214.3 GB/s` | `97.6%` (86.8% of the measured 241 GB/s read ceiling) |
+| **Prefill `pp512`** | `317.47 tok/s` | **`370.54 tok/s`** | `308.49 tok/s` | **`120.1%`** |
+| **Prefill `pp1024`** | -- | **`390.05 tok/s`** | -- | -- |
+| **Prefill `pp2048`** | `314.09 tok/s` | **`387.66 tok/s`** | `350.54 tok/s` | **`110.6%`** |
+
+Prefill numerical envelope for this artifact, batched versus sequential over the
+complete final-token vocabulary. `opt-c163-blocked-w8a8` is bit-identical to the
+kernel it replaced, so these are unchanged by it and are the reference for
+future experiments:
+
+| Prompt | Matching top-1 | RMSE | Cosine similarity |
+| ---: | ---: | ---: | ---: |
+| 1024 tokens | 198 | 0.11404289 | 0.99923891 |
+
+### Prefill stage budget (`pp2048`, per pass)
+
+Captured with `nix develop -c python3 tools/prof.py run -- ./result/bin/strix-server bench ...`.
+Idle time inside the dispatch span is 2.2%, so prompt processing is GPU bound,
+not launch bound.
+
+| Stage | ms/pass | % | Note |
+| :--- | ---: | ---: | :--- |
+| GEMM: FFN gate+up (dual, 16-row) | 2329 | 42.6% | 30.1 TOPS, 55% of peak |
+| GEMM: blocked W8A8 (all other projections) | 1782 | 32.6% | ~58% of peak |
+| SSM: DeltaNet recurrence | 365 | 6.7% | 48-block grid on 40 CUs; serial token scan |
+| GEMM: hipBLASLt BF16 (BF16 tensors) | 208 | 3.8% | 47% of peak |
+| Attention (2 full-attention layers) | 190 | 3.5% | ~4.5 TFLOPS, 8% of peak -- worst kernel, and quadratic in depth |
+| Quantize activations | 139 | 2.5% | bandwidth bound |
+| FFN SwiGLU | 138 | 2.5% | bandwidth bound |
+| RMSNorm / residual / convert / SSM epilogue | 257 | 4.8% | bandwidth bound |
 
 
