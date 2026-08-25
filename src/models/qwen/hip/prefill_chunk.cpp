@@ -171,9 +171,15 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     }
 
     if (layer.is_full_attention) {
-      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
-                                   arena_.d_scratch_q8_act, batch_size,
-                                   hidden_size, arena_.stream);
+      // The quantized activation is read only by Q8_0 projections; when q/k/v
+      // are all BF16 (as in the Q8_K_XL artifact) nothing consumes it.
+      if (layer.attn_q.type == core::GgmlType::kQ8_0 ||
+          layer.attn_k.type == core::GgmlType::kQ8_0 ||
+          layer.attn_v.type == core::GgmlType::kQ8_0) {
+        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                     arena_.d_scratch_q8_act, batch_size,
+                                     hidden_size, arena_.stream);
+      }
       gemm_weight(layer.attn_q, arena_.d_scratch_bf16, arena_.d_normed,
                   arena_.d_ssm_qkv, q_projection_size, hidden_size,
                   arena_.d_scratch_q8_act);
@@ -349,11 +355,22 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         }
       }
 
-      LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
-                            batch_size * attention_size, arena_.stream);
-      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
-                                   arena_.d_scratch_q8_act, batch_size,
-                                   attention_size, arena_.stream);
+      // opt-c172-fp32-quant: the Q8_0 route reads only the quantized
+      // activation, so the BF16 staging buffer is dead. Quantizing straight
+      // from FP32 drops one launch and one round trip (about 75 MB per layer
+      // at batch 2048) and keeps the activation's full precision going into the
+      // Q8_1 codes instead of rounding to BF16 first.
+      if (layer.attn_output.type == core::GgmlType::kQ8_0) {
+        LaunchQuantizeActivationQ8_1FromFp32(
+            arena_.d_ssm_out, arena_.d_scratch_q8_act, batch_size,
+            attention_size, arena_.stream);
+      } else {
+        LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
+                              batch_size * attention_size, arena_.stream);
+        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                     arena_.d_scratch_q8_act, batch_size,
+                                     attention_size, arena_.stream);
+      }
       gemm_weight(layer.attn_output, arena_.d_scratch_bf16, arena_.d_ssm_out,
                   arena_.d_attn_out, hidden_size, attention_size,
                   arena_.d_scratch_q8_act);
@@ -447,11 +464,17 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         t0 = t1;
       }
 
-      LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
-                            batch_size * ssm_inner_size, arena_.stream);
-      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
-                                   arena_.d_scratch_q8_act, batch_size,
-                                   ssm_inner_size, arena_.stream);
+      if (layer.ssm_out.type == core::GgmlType::kQ8_0) {
+        LaunchQuantizeActivationQ8_1FromFp32(
+            arena_.d_ssm_out, arena_.d_scratch_q8_act, batch_size,
+            ssm_inner_size, arena_.stream);
+      } else {
+        LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,
+                              batch_size * ssm_inner_size, arena_.stream);
+        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                     arena_.d_scratch_q8_act, batch_size,
+                                     ssm_inner_size, arena_.stream);
+      }
       gemm_weight(layer.ssm_out, arena_.d_scratch_bf16, arena_.d_ssm_out,
                   arena_.d_attn_out, hidden_size, ssm_inner_size,
                   arena_.d_scratch_q8_act);
