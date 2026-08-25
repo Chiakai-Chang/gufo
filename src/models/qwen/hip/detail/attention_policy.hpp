@@ -220,12 +220,21 @@ enum class SsmRecurrencePreference : std::uint8_t {
   return shape_supported && scratch_ready;
 }
 
-/// Prefill attention backend preference. The production order is tiled, then
-/// Composable Kernel, then baseline; `STRIX_PREFILL_ATTENTION` pins one backend
-/// so the alternatives stay measurable in the same binary instead of only being
-/// reachable when the preferred one rejects a shape.
+/// opt-c177-attn-wmma: the masked WMMA kernel covers the whole visible range in
+/// one pass and beats the tiled kernel by 3.5x at depth 0 and the tiled
+/// diagonal plus AOTriton prefix by 1.3-1.4x at depth, so it is the production
+/// route and the split path is no longer used. `STRIX_PREFILL_ATTENTION=split`
+/// (or `tile`, `ck`, `baseline`) pins an alternative for comparison.
+[[nodiscard]] inline bool ShouldUseWmmaPrefillAttention();
+
+/// Prefill attention backend preference. The fallback order behind the WMMA
+/// kernel is tiled, then Composable Kernel, then baseline;
+/// `STRIX_PREFILL_ATTENTION` pins one backend so the alternatives stay
+/// measurable in the same binary instead of only being reachable when the
+/// preferred one rejects a shape.
 enum class PrefillAttentionPreference : std::uint8_t {
   kAuto,
+  kWmma,
   kTiled,
   kComposableKernel,
   kBaseline,
@@ -238,6 +247,9 @@ ResolvePrefillAttentionPreference(const char* value) noexcept {
     return PrefillAttentionPreference::kAuto;
   }
   const std::string_view text{value};
+  if (text == "wmma") {
+    return PrefillAttentionPreference::kWmma;
+  }
   if (text == "tile" || text == "tiled") {
     return PrefillAttentionPreference::kTiled;
   }
@@ -260,6 +272,13 @@ PrefillAttentionPreferenceFromEnv() {
   return preference;
 }
 
+[[nodiscard]] inline bool ShouldUseWmmaPrefillAttention() {
+  const PrefillAttentionPreference preference =
+      PrefillAttentionPreferenceFromEnv();
+  return preference == PrefillAttentionPreference::kAuto ||
+         preference == PrefillAttentionPreference::kWmma;
+}
+
 inline constexpr std::size_t kPrefillAttentionSplitMinPrefix{1024};
 
 /// The split prefill attention (AOTriton non-causal prefix plus the tiled
@@ -278,10 +297,9 @@ inline constexpr std::size_t kPrefillAttentionSplitMinPrefix{1024};
   if (preference == PrefillAttentionPreference::kSplit) {
     return start_pos > 0 && batch_size > 0;
   }
-  if (preference != PrefillAttentionPreference::kAuto) {
-    return false;
-  }
-  return IsPrefillAttentionSplitProfitable(start_pos, batch_size);
+  // Not auto-selected any more: the WMMA kernel covers the same work in one
+  // pass and is faster at every depth.
+  return false;
 }
 
 /// Executes the existing prefill attention fallback chain without virtual

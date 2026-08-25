@@ -279,8 +279,28 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // attention work and needs no causal mask, so it goes through AOTriton's
       // pretuned flash attention while the tiled kernel keeps only the N x N
       // diagonal. The two partial softmaxes merge exactly by log-sum-exp.
-      bool split_attention = false;
-      if (detail::ShouldUsePrefillAttentionSplit(start_pos, batch_size)) {
+      // opt-c177-attn-wmma: one masked WMMA pass over the whole visible range,
+      // which replaces both the tiled kernel and the AOTriton prefix plus merge
+      // that the split path used. Falls through to the previous routes when the
+      // shape is unsupported or an alternative is pinned.
+      bool wmma_attention = false;
+      if (detail::ShouldUseWmmaPrefillAttention()) {
+        wmma_attention = LaunchQwenWmmaAttention(
+            arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+            arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+            arena_.d_attention_kv_f16,
+            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+            arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
+            arena_.GetMaxContext(), config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, arena_.stream);
+        if (wmma_attention) {
+          detail::EmitAttentionDispatch("prefill_wmma", "");
+        }
+      }
+
+      bool split_attention = wmma_attention;
+      if (!wmma_attention &&
+          detail::ShouldUsePrefillAttentionSplit(start_pos, batch_size)) {
         LaunchConvertQueriesToHalf(arena_.d_q, arena_.d_attn_q_f16,
                                    batch_size * attention_size, arena_.stream);
         auto* layer_k_f16 =

@@ -115,6 +115,21 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
 /// Non-causal attention of every query in the chunk against the first
 /// `prefix_length` cached keys, through AOTriton's pretuned gfx11xx flash
 /// attention. Returns false if AOTriton rejects the shape.
+/// Masked prefill attention on the WMMA matrix cores
+/// (opt-c177-attn-wmma). Same contract as LaunchBatchedAttentionTile -- it
+/// packs the FP16 K/V cache unless `skip_kv_write`, masks keys in
+/// [`key_begin`, min(context_end, query position]), and emits the partial
+/// log-sum-exp into `lse_out` (suppressing the gate) when that is non-null.
+/// Returns false when the shape is unsupported, so the caller can fall back.
+[[nodiscard]] bool LaunchQwenWmmaAttention(
+    const float* q, const float* k, const float* v, const float* gate,
+    float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
+    float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
+    std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    hipStream_t stream = nullptr, float* lse_out = nullptr,
+    std::uint32_t key_begin = 0, bool skip_kv_write = false);
+
 [[nodiscard]] bool LaunchQwenAotritonPrefixAttention(
     const __half* q_half, const void* k_cache_f16, const void* v_cache_f16,
     __half* out_prefix, float* lse_prefix, std::size_t batch_size,
