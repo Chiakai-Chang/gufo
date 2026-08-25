@@ -55,6 +55,7 @@ STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
         ("QKNormRoPE", "attention: qk-norm+rope+kv"),
         ("RoPE", "attention: rope"),
         ("PackTiledAttentionKv", "attention: kv pack"),
+        ("FusedRMSNormQuantize", "norm+quantize (fused)"),
         ("SwiGLU", "ffn: swiglu"),
         ("Quantize", "quantize: activations"),
         ("RMSNorm", "norm"),

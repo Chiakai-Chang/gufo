@@ -152,6 +152,21 @@ void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
                                   hipStream_t stream = nullptr);
 
 /// Quantizes FP32 activation tensor X[B, K] to block_q8_1 activation blocks
+/// True when the fused RMSNorm + Q8_1 quantize kernel can take this row length.
+[[nodiscard]] bool IsFusedRMSNormQuantizeQ8_1Supported(
+    std::size_t dim) noexcept;
+
+/// Optional residual add + RMSNorm + tiled Q8_1 quantize in one pass
+/// (opt-c173-norm-quant). Use when every projection reading the norm is Q8_0,
+/// so neither the FP32 normed row nor the BF16 staging copy is needed. With
+/// `residual` non-null the sum `x + residual` is normalized and also written to
+/// `sum_out` for the next residual link. The normed values are bit-identical to
+/// LaunchBatchedResidualAdd followed by LaunchBatchedRMSNorm.
+void LaunchBatchedFusedRMSNormQuantizeQ8_1(
+    const float* x, const float* residual, const float* weight, float* sum_out,
+    void* q8_1_out, std::size_t batch_size, std::size_t dim, float eps,
+    hipStream_t stream = nullptr);
+
 void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
                                           std::size_t batch, std::size_t k,
                                           hipStream_t stream = nullptr);

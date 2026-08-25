@@ -311,6 +311,131 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   HIP_CHECK(hipFree(d_y2));
 }
 
+// opt-c173-norm-quant: the fused RMSNorm + Q8_1 quantize kernel keeps the exact
+// reduction loop and tree of BatchedRMSNormKernel and quantizes the same FP32
+// normed values, so it must be *bit-identical* to running the two kernels in
+// sequence -- not merely close. Comparing whole Q8_1 buffers makes that an
+// exact test, including the per-block scales and the tail-tile zeroing.
+void RunFusedNormQuantizeCase(std::size_t batch, std::size_t dim,
+                              bool with_residual) {
+  std::cout << "fused RMSNorm+Q8_1: batch=" << batch << " dim=" << dim
+            << " residual=" << (with_residual ? "yes" : "no") << "\n";
+
+  std::vector<float> h_x(batch * dim);
+  std::vector<float> h_r(batch * dim);
+  std::vector<float> h_w(dim);
+  for (std::size_t i = 0; i < h_x.size(); ++i) {
+    h_x[i] = 0.7F * std::sin(0.013F * static_cast<float>(i % 691)) +
+             0.3F * std::cos(0.0037F * static_cast<float>(i % 47));
+    h_r[i] = 0.4F * std::cos(0.019F * static_cast<float>(i % 523));
+  }
+  for (std::size_t i = 0; i < dim; ++i) {
+    h_w[i] = 0.85F + 0.06F * static_cast<float>(i % 19);
+  }
+
+  const std::size_t num_blocks = dim / 32;
+  const std::size_t q8_bytes = (((batch + 15) / 16) * num_blocks * 576) + 4096;
+
+  float* d_x = nullptr;
+  float* d_r = nullptr;
+  float* d_hidden_ref = nullptr;
+  float* d_hidden_got = nullptr;
+  float* d_w = nullptr;
+  float* d_normed = nullptr;
+  void* d_ref = nullptr;
+  void* d_got = nullptr;
+  HIP_CHECK(hipMalloc(&d_x, h_x.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_r, h_r.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_hidden_ref, h_x.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_hidden_got, h_x.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_normed, h_x.size() * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ref, q8_bytes));
+  HIP_CHECK(hipMalloc(&d_got, q8_bytes));
+  HIP_CHECK(hipMemcpy(d_x, h_x.data(), h_x.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_r, h_r.data(), h_r.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_hidden_ref, h_x.data(), h_x.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_hidden_got, h_x.data(), h_x.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_w, h_w.data(), h_w.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  // Both buffers start identical so any byte the fused kernel fails to write is
+  // still compared rather than hidden by matching garbage.
+  HIP_CHECK(hipMemset(d_ref, 0xA5, q8_bytes));
+  HIP_CHECK(hipMemset(d_got, 0xA5, q8_bytes));
+
+  if (!strix::hip::IsFusedRMSNormQuantizeQ8_1Supported(dim)) {
+    std::cerr << "fused RMSNorm+Q8_1 rejected a supported row length\n";
+    std::abort();
+  }
+
+  // Reference: the separate chain the fused kernel replaces.
+  if (with_residual) {
+    strix::hip::LaunchBatchedResidualAdd(d_hidden_ref, d_r, d_hidden_ref, batch,
+                                         dim);
+  }
+  strix::hip::LaunchBatchedRMSNorm(with_residual ? d_hidden_ref : d_x, d_w,
+                                   d_normed, nullptr, batch, dim, 1e-6F);
+  strix::hip::LaunchQuantizeActivationQ8_1FromFp32(d_normed, d_ref, batch, dim);
+  strix::hip::LaunchBatchedFusedRMSNormQuantizeQ8_1(
+      with_residual ? d_hidden_got : d_x, with_residual ? d_r : nullptr, d_w,
+      with_residual ? d_hidden_got : nullptr, d_got, batch, dim, 1e-6F);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<std::uint8_t> ref(q8_bytes);
+  std::vector<std::uint8_t> got(q8_bytes);
+  HIP_CHECK(hipMemcpy(ref.data(), d_ref, q8_bytes, hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(got.data(), d_got, q8_bytes, hipMemcpyDeviceToHost));
+
+  std::size_t mismatches = 0;
+  std::size_t first = 0;
+  for (std::size_t i = 0; i < q8_bytes; ++i) {
+    if (ref[i] != got[i]) {
+      if (mismatches == 0) {
+        first = i;
+      }
+      ++mismatches;
+    }
+  }
+  std::cout << "  mismatching bytes: " << mismatches << " of " << q8_bytes
+            << "\n";
+  if (mismatches != 0) {
+    std::cerr << "fused RMSNorm+Q8_1 differs from RMSNorm + FP32 quantize at "
+                 "byte "
+              << first << "\n";
+    std::abort();
+  }
+
+  if (with_residual) {
+    // The residual sum has to reach the next link exactly as the separate add
+    // would have written it.
+    std::vector<float> hid_ref(h_x.size());
+    std::vector<float> hid_got(h_x.size());
+    HIP_CHECK(hipMemcpy(hid_ref.data(), d_hidden_ref,
+                        hid_ref.size() * sizeof(float), hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(hid_got.data(), d_hidden_got,
+                        hid_got.size() * sizeof(float), hipMemcpyDeviceToHost));
+    if (std::memcmp(hid_ref.data(), hid_got.data(),
+                    hid_ref.size() * sizeof(float)) != 0) {
+      std::cerr << "fused RMSNorm+Q8_1 residual sum differs from "
+                   "LaunchBatchedResidualAdd\n";
+      std::abort();
+    }
+  }
+
+  HIP_CHECK(hipFree(d_x));
+  HIP_CHECK(hipFree(d_r));
+  HIP_CHECK(hipFree(d_hidden_ref));
+  HIP_CHECK(hipFree(d_hidden_got));
+  HIP_CHECK(hipFree(d_w));
+  HIP_CHECK(hipFree(d_normed));
+  HIP_CHECK(hipFree(d_ref));
+  HIP_CHECK(hipFree(d_got));
+}
+
 }  // namespace
 
 #endif  // defined(ENGINE_ENABLE_HIP)
@@ -334,6 +459,15 @@ int main() {
   RunCase(96, 64, 128, false);
   // Dual gate/up path.
   RunCase(128, 256, 256, true);
+
+  // Fused RMSNorm + Q8_1 quantize: the production hidden size, a batch that is
+  // not a multiple of the 16-token tile, and a short row.
+  RunFusedNormQuantizeCase(128, 5120, false);
+  RunFusedNormQuantizeCase(100, 5120, false);
+  RunFusedNormQuantizeCase(48, 256, false);
+  // With the residual add folded in.
+  RunFusedNormQuantizeCase(128, 5120, true);
+  RunFusedNormQuantizeCase(100, 5120, true);
 
   std::cout << "Qwen prefill quant GEMM ops test passed on gfx1151.\n";
   return 0;

@@ -157,11 +157,40 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     }
     auto t0 = std::chrono::high_resolution_clock::now();
 
+    const auto is_q8 = [](const models::QwenTensorRef& w) {
+      return w.type == core::GgmlType::kQ8_0;
+    };
+    // opt-c173-norm-quant: when every projection reading a norm is Q8_0 the
+    // FP32 normed row and the BF16 staging copy are both dead, so the norm can
+    // write the tiled Q8_1 activation directly and skip two round trips.
+    const bool norm_feeds_q8_only =
+        IsFusedRMSNormQuantizeQ8_1Supported(hidden_size) &&
+        (layer.is_full_attention
+             ? (is_q8(layer.attn_q) && is_q8(layer.attn_k) &&
+                is_q8(layer.attn_v))
+             : (is_q8(layer.attn_qkv) && is_q8(layer.attn_gate) &&
+                is_q8(layer.ssm_alpha) && is_q8(layer.ssm_beta)));
+    // Where these hold, the BF16 and FP32 buffers passed to gemm_weight below
+    // are stale: the route for a Q8_0 tensor always reads the quantized
+    // activation, and the flags are exactly the condition that every consumer
+    // is Q8_0, so no route can reach them.
+    const bool ffn_feeds_q8_only =
+        IsFusedRMSNormQuantizeQ8_1Supported(hidden_size) &&
+        !route_plan.fuse_ffn_swiglu && is_q8(layer.ffn_gate) &&
+        is_q8(layer.ffn_up);
+
     // Pre-layer RMSNorm (generates BF16 into d_scratch_bf16 directly)
-    LaunchBatchedRMSNorm(arena_.d_hidden,
-                         static_cast<const float*>(layer.attn_norm.data),
-                         arena_.d_normed, arena_.d_scratch_bf16, batch_size,
-                         hidden_size, eps, arena_.stream);
+    if (norm_feeds_q8_only) {
+      LaunchBatchedFusedRMSNormQuantizeQ8_1(
+          arena_.d_hidden, /*residual=*/nullptr,
+          static_cast<const float*>(layer.attn_norm.data), /*sum_out=*/nullptr,
+          arena_.d_scratch_q8_act, batch_size, hidden_size, eps, arena_.stream);
+    } else {
+      LaunchBatchedRMSNorm(arena_.d_hidden,
+                           static_cast<const float*>(layer.attn_norm.data),
+                           arena_.d_normed, arena_.d_scratch_bf16, batch_size,
+                           hidden_size, eps, arena_.stream);
+    }
 
     if (do_profile) {
       HIP_CHECK(hipStreamSynchronize(arena_.stream));
@@ -172,10 +201,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
 
     if (layer.is_full_attention) {
       // The quantized activation is read only by Q8_0 projections; when q/k/v
-      // are all BF16 (as in the Q8_K_XL artifact) nothing consumes it.
-      if (layer.attn_q.type == core::GgmlType::kQ8_0 ||
-          layer.attn_k.type == core::GgmlType::kQ8_0 ||
-          layer.attn_v.type == core::GgmlType::kQ8_0) {
+      // are all BF16 (as in the Q8_K_XL artifact) nothing consumes it, and when
+      // they are all Q8_0 the fused norm already wrote it.
+      if (!norm_feeds_q8_only && (layer.attn_q.type == core::GgmlType::kQ8_0 ||
+                                  layer.attn_k.type == core::GgmlType::kQ8_0 ||
+                                  layer.attn_v.type == core::GgmlType::kQ8_0)) {
         LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
                                      arena_.d_scratch_q8_act, batch_size,
                                      hidden_size, arena_.stream);
@@ -382,9 +412,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         t0 = t1;
       }
     } else {
-      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
-                                   arena_.d_scratch_q8_act, batch_size,
-                                   hidden_size, arena_.stream);
+      if (!norm_feeds_q8_only) {
+        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                     arena_.d_scratch_q8_act, batch_size,
+                                     hidden_size, arena_.stream);
+      }
       gemm_weight(layer.attn_qkv, arena_.d_scratch_bf16, arena_.d_normed,
                   arena_.d_ssm_qkv, ssm_qkv_size, hidden_size,
                   arena_.d_scratch_q8_act);
@@ -495,6 +527,14 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           arena_.d_hidden, arena_.d_attn_out, arena_.d_hidden,
           static_cast<const float*>(layer.ffn_norm.data), arena_.d_normed,
           arena_.d_scratch_bf16, batch_size, hidden_size, eps, arena_.stream);
+    } else if (ffn_feeds_q8_only) {
+      // The post-attention residual add folds into the norm: one pass reads the
+      // hidden state and the attention output, writes the updated hidden state
+      // for the next residual link, and emits the Q8_1 activation.
+      LaunchBatchedFusedRMSNormQuantizeQ8_1(
+          arena_.d_hidden, arena_.d_attn_out,
+          static_cast<const float*>(layer.ffn_norm.data), arena_.d_hidden,
+          arena_.d_scratch_q8_act, batch_size, hidden_size, eps, arena_.stream);
     } else {
       LaunchBatchedResidualAdd(arena_.d_hidden, arena_.d_attn_out,
                                arena_.d_hidden, batch_size, hidden_size,
@@ -520,9 +560,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           arena_.d_ffn_act, arena_.d_scratch_bf16, batch_size,
           intermediate_size, hidden_size, arena_.stream);
     } else {
-      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
-                                   arena_.d_scratch_q8_act, batch_size,
-                                   hidden_size, arena_.stream);
+      if (!ffn_feeds_q8_only) {
+        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                     arena_.d_scratch_q8_act, batch_size,
+                                     hidden_size, arena_.stream);
+      }
       if (layer.ffn_gate.type == core::GgmlType::kQ8_0 &&
           layer.ffn_up.type == core::GgmlType::kQ8_0) {
         LaunchBatchedDualQuantGEMMPreQuantized(

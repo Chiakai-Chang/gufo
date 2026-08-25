@@ -106,6 +106,94 @@ __global__ void QuantizeActivationToQ8_1Kernel(const T* __restrict__ x,
   StoreQ8ActLane(y, num_blocks, tok, blk, lane_id, d, q);
 }
 
+// opt-c173-norm-quant: optional residual add, RMSNorm, and the tiled Q8_1
+// quantization in one pass.
+//
+// Every projection reading the SSM pre-norm and the FFN norm is Q8_0, so the
+// FP32 normed row and the BF16 staging copy the old chain produced were both
+// dead: RMSNorm wrote 42 MB + 21 MB per layer at batch 2048 and the quantizer
+// read the 21 MB straight back. Staging the row in LDS removes the rest of the
+// traffic -- the reduction and the normalization share one global read, and
+// with `residual` the preceding ResidualAdd pass disappears as well. Per norm
+// at batch 2048 that is 221 MB of round trips down to 137 MB.
+//
+// The sum-of-squares reduction is the same loop and the same tree as
+// BatchedRMSNormKernel, and folding the residual in registers gives the same
+// FP32 value the separate add would have stored, so `inv_rms` and every normed
+// value are bit-identical to the unfused chain. Only the quantization input
+// changes, from BF16 to the FP32 value it was rounded from, which strictly
+// narrows the quantization error -- the same trade `opt-c164-swiglu-quant` and
+// `opt-c172-fp32-quant` made.
+__global__ void BatchedFusedRMSNormQuantizeQ8_1Kernel(
+    const float* __restrict__ x, const float* __restrict__ residual,
+    const float* __restrict__ weight, float* __restrict__ sum_out,
+    void* __restrict__ q8_out, std::size_t batch_size, std::size_t dim,
+    float eps) {
+  extern __shared__ float s_row[];
+  const std::size_t b = blockIdx.x;
+  if (b >= batch_size) {
+    return;
+  }
+
+  const std::size_t tid = threadIdx.x;
+  const std::size_t block_size = blockDim.x;
+  const float* in_row = x + (b * dim);
+  const float* res_row = (residual != nullptr) ? residual + (b * dim) : nullptr;
+  float* sum_row = (sum_out != nullptr) ? sum_out + (b * dim) : nullptr;
+
+  // Single pass over global memory: the row is staged in LDS so neither the
+  // reduction nor the normalization re-reads it.
+  float sum_sq = 0.0F;
+  for (std::size_t i = tid; i < dim; i += block_size) {
+    float val = in_row[i];
+    if (res_row != nullptr) {
+      val += res_row[i];
+      if (sum_row != nullptr) {
+        sum_row[i] = val;
+      }
+    }
+    s_row[i] = val;
+    sum_sq += val * val;
+  }
+
+  __shared__ float s_sum[256];
+  s_sum[tid] = sum_sq;
+  __syncthreads();
+  for (std::size_t stride = block_size / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+      s_sum[tid] += s_sum[tid + stride];
+    }
+    __syncthreads();
+  }
+
+  const float mean_sq = s_sum[0] / static_cast<float>(dim);
+  const float inv_rms = rsqrtf(mean_sq + eps);
+
+  for (std::size_t i = tid; i < dim; i += block_size) {
+    const float w = (weight != nullptr) ? weight[i] : 1.0F;
+    s_row[i] = (s_row[i] * inv_rms) * w;
+  }
+  __syncthreads();
+
+  // One wave per 32-element quantization block, matching
+  // QuantizeActivationToQ8_1Kernel's per-block scale and rounding exactly.
+  const std::size_t num_blocks = dim / 32;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t wave_id = tid >> 5u;
+  const std::size_t waves = block_size >> 5u;
+  for (std::size_t blk = wave_id; blk < num_blocks; blk += waves) {
+    const float val = s_row[(blk * 32) + lane_id];
+    float max_abs = fabsf(val);
+    for (int off = 16; off > 0; off >>= 1) {
+      max_abs = fmaxf(max_abs, __shfl_xor(max_abs, off));
+    }
+    const float d = max_abs / 127.0F;
+    const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
+    const std::int8_t q = static_cast<std::int8_t>(roundf(val * id));
+    StoreQ8ActLane(q8_out, num_blocks, b, blk, lane_id, d, q);
+  }
+}
+
 /// Zeroes the tail of the last token tile so a batch that is not a multiple of
 /// 16 cannot feed uninitialized scales into the GEMM epilogue.
 __global__ void ZeroQ8ActTailKernel(void* __restrict__ y, std::size_t batch,
@@ -621,6 +709,27 @@ void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
                                    quant_threads, 0, stream>>>(
       reinterpret_cast<const hip_bfloat16*>(bf16_x), q8_1_out, batch, k);
   LaunchZeroQ8ActTail(q8_1_out, batch, k, stream);
+}
+
+bool IsFusedRMSNormQuantizeQ8_1Supported(std::size_t dim) noexcept {
+  // The normed row is staged in LDS, so the row has to fit the 32 KiB a block
+  // can hold alongside the reduction scratch, and the quantizer needs whole
+  // 32-element blocks.
+  return dim != 0 && (dim % 32) == 0 && (dim * sizeof(float)) <= 32768;
+}
+
+void LaunchBatchedFusedRMSNormQuantizeQ8_1(
+    const float* x, const float* residual, const float* weight, float* sum_out,
+    void* q8_1_out, std::size_t batch_size, std::size_t dim, float eps,
+    hipStream_t stream) {
+  if (batch_size == 0 || dim == 0) {
+    return;
+  }
+  const unsigned int lds_bytes = static_cast<unsigned int>(dim * sizeof(float));
+  BatchedFusedRMSNormQuantizeQ8_1Kernel<<<static_cast<unsigned int>(batch_size),
+                                          256, lds_bytes, stream>>>(
+      x, residual, weight, sum_out, q8_1_out, batch_size, dim, eps);
+  LaunchZeroQ8ActTail(q8_1_out, batch_size, dim, stream);
 }
 
 void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
