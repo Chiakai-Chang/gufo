@@ -10,12 +10,23 @@
 // Covered: a depth-0 chunk, a batch that is not a multiple of the 32-query
 // block, a chunk at depth, a depth that is not a multiple of the 16-key tile,
 // and the log-sum-exp output path.
+//
+// `opt-c178-attn-prefetch` reads tile i+1's K and V into a second register set
+// while tile i computes, so the cases below also cover the loop lengths where
+// that can come apart -- a visible range of exactly one key tile, where the
+// prefetch never fires, and of exactly two, where it fires once and the tail
+// guard has to suppress it. Every case additionally runs the kernel twice and
+// requires the two outputs to be byte-identical, which is what would fail if a
+// prefetched register were consumed for the wrong tile or read before it was
+// written: stale register contents differ between dispatches, an arithmetic
+// mistake would not.
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <vector>
 
@@ -175,6 +186,32 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
                       hipMemcpyDeviceToHost));
   Compare("context", got, ref, 2e-3);
 
+  // Same launch again: the prefetch must not let a register from one tile reach
+  // another, which would show up here as run-to-run drift.
+  HIP_CHECK(hipMemset(d_out_new, 0, q_elements * sizeof(float)));
+  if (!strix::hip::LaunchQwenWmmaAttention(
+          d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
+          d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
+          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, 0,
+          /*skip_kv_write=*/true)) {
+    std::cerr << "WMMA attention rejected the production shape on replay\n";
+    std::abort();
+  }
+  HIP_CHECK(hipDeviceSynchronize());
+  std::vector<float> again(q_elements);
+  HIP_CHECK(hipMemcpy(again.data(), d_out_new, q_elements * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  if (std::memcmp(again.data(), got.data(), q_elements * sizeof(float)) != 0) {
+    std::size_t differing = 0;
+    for (std::size_t i = 0; i < q_elements; ++i) {
+      differing += (again[i] != got[i]) ? 1 : 0;
+    }
+    std::cerr << "WMMA prefill attention is not deterministic: " << differing
+              << " of " << q_elements << " elements differ between two runs\n";
+    std::abort();
+  }
+  std::cout << "  replay: byte-identical over " << q_elements << " elements\n";
+
   if (want_lse) {
     std::vector<float> lref(lse_elements);
     std::vector<float> lgot(lse_elements);
@@ -209,6 +246,10 @@ int main() {
   // Not a multiple of the 32-query block, so the last block is partly out of
   // range.
   RunCase(0, 100, false);
+  // Exactly one key tile visible, so the prefetch never fires.
+  RunCase(0, 16, false);
+  // Exactly two, so it fires once and then has to be suppressed.
+  RunCase(0, 32, false);
   // At depth: the whole visible range, prefix and diagonal, in one pass.
   RunCase(1024, 512, false);
   // A depth that is not a multiple of the 16-key tile.

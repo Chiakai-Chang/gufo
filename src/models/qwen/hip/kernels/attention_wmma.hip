@@ -39,13 +39,42 @@
 //     of a wave on LDS rows kVtStride halves apart, which is a single bank and
 //     a 32-way conflict. Giving each lane one key instead costs a strided
 //     global read but makes the LDS writes conflict-free, and was worth 1.8x.
-//   * V's global load is issued at the top of the key-tile iteration rather
-//   than
-//     at its point of use. Behind the barriers it needs, its latency is
-//     otherwise fully exposed.
+//   * V's global load must not sit at its point of use, behind the barriers it
+//     needs, where its latency is fully exposed. Hoisting it to the top of the
+//     same key-tile iteration was worth 1.14x; `opt-c178-attn-prefetch` below
+//     goes further and moves it a whole tile ahead.
 //
-// Barriers are not a cost here: removing all four per key tile changes nothing
-// measurable.
+// Barriers are not a cost here in the sense of bank or issue cost: removing all
+// four per key tile changes nothing measurable at depth 0. They do serialize
+// the phases, which is a different and real cost -- see the latency note below.
+//
+// opt-c178-attn-prefetch. What the ablations above actually price is *exposed
+// latency*, not work. Per SIMD the kernel issued one WMMA every 223 cycles
+// against a ~64-cycle issue cost, so the SIMD sat idle 71% of the time: 23 KB
+// of LDS fits only two blocks per CU, giving four waves per SIMD to cover a
+// dependency chain that all eight waves of a block walk in lockstep, and whose
+// head is a global load. Loading tile i+1's K and V into a second set of
+// registers immediately after tile i's staging barrier puts that load behind
+// tile i's S, softmax and PV phases instead of in front of them, for 16 VGPRs
+// and 16 v_mov per tile. One layer call at batch 2048, interleaved with the
+// unpipelined kernel to cancel APU throttling:
+//
+//   depth      before    after   speedup
+//       0       3.250    2.500     1.30x
+//    4096      15.082   13.022     1.16x
+//    8192      27.026   23.955     1.13x
+//   16384      51.595   46.107     1.12x
+//
+// 15.9 -> 20.6 TFLOPS at depth 0 and 17.2 -> 19.4 at depth 8192. The staged
+// bytes, their order and the WMMA sequence are all unchanged, so the result is
+// bit-identical, which the oracle test asserts directly.
+//
+// Two things measured alongside it and rejected, both recorded in the model
+// card: remapping V's global read so four lanes cover 32 contiguous dims of one
+// key (fewer, fully-used line requests, and it lets the transpose write 8
+// packed dwords instead of 16 halves) is 4% faster at depth 0 but 30% *slower*
+// at depth 16384; and dropping the V^T row padding to fit three blocks per CU
+// costs more in fragment-read bank conflicts than the occupancy returns.
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
@@ -116,6 +145,12 @@ constexpr std::uint32_t kWmmaKSteps = kHeadDim / 16;
 // Row padding keeps a 16-byte-per-lane fragment read off a single bank group.
 constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
 
+}  // namespace
+
+// External linkage on purpose: an anonymous-namespace kernel is dispatched with
+// an empty name, and rocprofv3 then merges it into an unattributed "other"
+// bucket -- 7.3% of a depth-8192 profile in this kernel's case.
+//
 // kQueryRows queries x kWmmaHeads heads form (kQueryRows / 16) * kWmmaHeads
 // 16-row blocks, and kKeys keys form kKeys / 16 key blocks. Their product is
 // pinned to 4 so the eight waves split as four S tiles x two halves of the head
@@ -221,46 +256,73 @@ __launch_bounds__(256, 2) __global__
   const std::uint32_t max_visible =
       min(context_end, start_pos + query_start + kQueryRows);
 
+  // One key per lane for V, a 16-dim slice per thread. This costs a strided
+  // global read but makes the transpose's LDS writes conflict-free, which is
+  // worth 1.8x; a coalesced remapping was measured and is slower at depth.
+  constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
+  constexpr std::uint32_t kKRegs = (kKeys * (kHeadDim / 8)) / 256;
+  static_assert(kKRegs * 256 == kKeys * (kHeadDim / 8), "K stages evenly");
+  const std::uint32_t v_key = lane % kKeys;
+  const std::uint32_t v_slice = (tid / kKeys) * (kVRegs * 8);
+  const auto* v_base =
+      v_cache_f16 + (static_cast<std::size_t>(kv_head) * kHeadDim) + v_slice;
+  const auto* k_base =
+      k_cache_f16 + (static_cast<std::size_t>(kv_head) * kHeadDim);
+
+  const auto load_v = [&](std::uint32_t key_start, uint4* dst) {
+    const std::uint32_t key_position = key_start + v_key;
+    const auto* src =
+        v_base + (static_cast<std::size_t>(key_position) * kKvWidth);
+    const bool live = key_position < context_end;
+#pragma unroll
+    for (std::uint32_t j = 0; j < kVRegs; ++j) {
+      dst[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
+                    : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+  // Coalesced: a wave reads one key row's 512 contiguous bytes.
+  const auto load_k = [&](std::uint32_t key_start, uint4* dst) {
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      const std::uint32_t idx = tid + (n * 256);
+      const std::uint32_t key_position = key_start + (idx / (kHeadDim / 8));
+      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+      dst[n] =
+          (key_position < context_end)
+              ? *reinterpret_cast<const uint4*>(
+                    k_base +
+                    (static_cast<std::size_t>(key_position) * kKvWidth) + d8)
+              : make_uint4(0u, 0u, 0u, 0u);
+    }
+  };
+
+  uint4 k_cur[kKRegs];
+  uint4 v_cur[kVRegs];
+  uint4 k_pre[kKRegs];
+  uint4 v_pre[kVRegs];
+  load_k(key_begin, k_cur);
+  load_v(key_begin, v_cur);
+
   for (std::uint32_t key_start = key_begin; key_start < max_visible;
        key_start += kKeys) {
-    // V's global load is issued before the K staging and the whole S phase, and
-    // parked in registers until the transpose. Issued at its point of use it
-    // sits behind two barriers with nothing able to cover its latency.
-    constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
-    uint4 v_raw[kVRegs];
-    {
-      const std::uint32_t v_key = lane % kKeys;
-      const std::uint32_t v_slice = ((tid / kKeys) * (kVRegs * 8));
-      const std::uint32_t key_position = key_start + v_key;
-      const auto* src =
-          v_cache_f16 + (static_cast<std::size_t>(key_position) * kKvWidth) +
-          (static_cast<std::size_t>(kv_head) * kHeadDim) + v_slice;
-      const bool live = key_position < context_end;
-#pragma unroll
-      for (std::uint32_t j = 0; j < kVRegs; ++j) {
-        v_raw[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
-                        : make_uint4(0u, 0u, 0u, 0u);
-      }
-    }
-
-    // --- stage K (coalesced: a wave reads one key row's 512 contiguous bytes)
+    // --- stage K from the registers the previous iteration prefetched
     __syncthreads();
-    for (std::uint32_t idx = tid; idx < kKeys * (kHeadDim / 8); idx += 256) {
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      const std::uint32_t idx = tid + (n * 256);
       const std::uint32_t key_row = idx / (kHeadDim / 8);
       const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
-      const std::uint32_t key_position = key_start + key_row;
-      __half packed[8] = {};
-      if (key_position < context_end) {
-        const auto* src = k_cache_f16 +
-                          (static_cast<std::size_t>(key_position) * kKvWidth) +
-                          (static_cast<std::size_t>(kv_head) * kHeadDim) + d8;
-        *reinterpret_cast<uint4*>(packed) =
-            *reinterpret_cast<const uint4*>(src);
-      }
       *reinterpret_cast<uint4*>(&kv_lds[(key_row * kWmmaKStride) + d8]) =
-          *reinterpret_cast<const uint4*>(packed);
+          k_cur[n];
     }
     __syncthreads();
+
+    // --- prefetch the next key tile. Everything below covers its latency.
+    const std::uint32_t next_start = key_start + kKeys;
+    if (next_start < max_visible) {
+      load_k(next_start, k_pre);
+      load_v(next_start, v_pre);
+    }
 
     // --- S = Q K^T ---
     {
@@ -363,11 +425,9 @@ __launch_bounds__(256, 2) __global__
     // lanes on rows kVtStride halves apart, which is one bank, and costs a
     // 32-way conflict on every write.
     {
-      const std::uint32_t v_key = lane % kKeys;
-      const std::uint32_t v_slice = ((tid / kKeys) * (kVRegs * 8));
 #pragma unroll
       for (std::uint32_t j = 0; j < kVRegs; ++j) {
-        const auto* packed = reinterpret_cast<const __half*>(&v_raw[j]);
+        const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
 #pragma unroll
         for (std::uint32_t i = 0; i < 8; ++i) {
           kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
@@ -394,6 +454,15 @@ __launch_bounds__(256, 2) __global__
           o_acc[rb][t] = Wmma(p_frag, v_frag[kb], o_acc[rb][t]);
         }
       }
+    }
+
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      k_cur[n] = k_pre[n];
+    }
+#pragma unroll
+    for (std::uint32_t n = 0; n < kVRegs; ++n) {
+      v_cur[n] = v_pre[n];
     }
   }
   __syncthreads();
@@ -442,8 +511,6 @@ __launch_bounds__(256, 2) __global__
     }
   }
 }
-
-}  // namespace
 
 bool LaunchQwenWmmaAttention(const float* q, const float* k, const float* v,
                              const float* gate, float* k_cache, float* v_cache,

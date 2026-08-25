@@ -749,6 +749,423 @@ __launch_bounds__(kWaves * 32, 1) __global__
 }
 
 // ---------------------------------------------------------------------------
+// Pipelined variant
+// ---------------------------------------------------------------------------
+//
+// The ablations above price the two dominant costs of the shipped kernel at
+// batch 2048, depth 8192: the K/V global loads at 33% (27.25 -> 18.32 ms with
+// them removed) and V's LDS transpose at 23% (-> 20.94). Neither is a bandwidth
+// or a bank-cycle limit. Per SIMD the kernel issues one WMMA every 223 cycles
+// against a ~64-cycle issue cost, so the SIMD is idle 71% of the time: with
+// 23296 bytes of LDS only two blocks fit per CU, giving four waves per SIMD to
+// cover a per-key-tile dependency chain that runs
+//
+//   global load -> barrier -> stage K -> barrier -> S -> barrier -> softmax
+//   -> barrier -> transpose V -> barrier -> PV
+//
+// and all eight waves of a block walk it in lockstep. Three changes here, each
+// aimed at that chain rather than at instruction count:
+//
+//   * Both K and V for tile i+1 are loaded into registers immediately after
+//     tile i's staging barrier, so their latency is covered by tile i's S,
+//     softmax and PV phases instead of standing at the head of the chain. Costs
+//     16 VGPRs of second buffer and 16 v_mov per tile.
+//   * V's global read is remapped so four lanes cover 32 contiguous dims of one
+//     key. Each instruction's eight key pairs then land on eight fully used
+//     64-byte lines; the shipped mapping (one key per lane) issues 16 half-used
+//     line requests per instruction for the same bytes.
+//   * Each thread holds the same 8 dims of *two* adjacent keys, which are
+//     adjacent columns of V^T, so the transpose writes 8 packed dwords instead
+//     of 16 halves. A 16-half pad every 8 dims (`kVtSwizzle`) then spreads
+//     those writes over all 32 banks: without it the four lane groups differ
+//     only in dim, and 8 dims x 12 dwords is 0 mod 32, so they collide 4 ways.
+template<std::uint32_t kVtStride, std::uint32_t kVtSwizzle>
+__device__ __forceinline__ constexpr std::uint32_t VtRow(std::uint32_t d) {
+  return (d * kVtStride) + ((d / 8) * kVtSwizzle);
+}
+
+template<std::uint32_t kQueryRows, std::uint32_t kKeys, std::uint32_t kWaves,
+         std::uint32_t kVtSwizzle, bool kPipeline, bool kPackedV = true,
+         std::uint32_t kVtPad = 8, int kAblate = 0>
+__launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
+    const float* __restrict__ q, const float* __restrict__ gate,
+    const __half* __restrict__ k_cache_f16,
+    const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
+    std::uint32_t start_pos, std::size_t batch_size,
+    float* __restrict__ lse_out, std::uint32_t key_begin) {
+  constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
+  constexpr std::uint32_t kKeyBlocks = kKeys / 16;
+  constexpr std::uint32_t kThreads = kWaves * 32;
+  constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
+  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / (kWaves / kSTiles);
+  constexpr std::uint32_t kRows = kRowBlocks * 16;
+  constexpr std::uint32_t kDimTilesPerWave = kWmmaKSteps / kWaves;
+  constexpr std::uint32_t kSoftmaxLanes = kThreads / kRows;
+  constexpr std::uint32_t kVtStride = kKeys + kVtPad;
+  constexpr std::uint32_t kKRegs = (kKeys * kHeadDim) / (kThreads * 8);
+  constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (kThreads * 8);
+  static_assert(kSTiles * 2 == kWaves, "waves cover S tiles in two halves");
+  static_assert(!kPackedV || (kKeys == 16 && kWaves == 8 && kHeadDim == 256),
+                "the coalesced V mapping assumes 4 lanes x 32 dims per key");
+  static_assert(kVtStride % 8 == 0 && kVtSwizzle % 8 == 0,
+                "fragment rows stay 16-byte aligned");
+
+  const std::uint32_t tid = threadIdx.x;
+  const std::uint32_t lane = tid & 31u;
+  const std::uint32_t wave = tid >> 5u;
+  const std::uint32_t sub = lane & 15u;
+  const std::uint32_t half_id = lane >> 4u;
+
+  const std::uint32_t query_start = blockIdx.x * kQueryRows;
+  const std::uint32_t head_pair = blockIdx.y;
+  const std::uint32_t kv_head = head_pair / (kGqa / kWmmaHeads);
+  const std::uint32_t pair_in_group = head_pair % (kGqa / kWmmaHeads);
+  const std::uint32_t first_query_head =
+      (kv_head * kGqa) + (pair_in_group * kWmmaHeads);
+  constexpr float attention_scale = 1.0F / 16.0F;
+
+  const auto row_block_head = [&](std::uint32_t rb) {
+    return first_query_head + (rb % kWmmaHeads);
+  };
+  const auto row_block_offset = [&](std::uint32_t rb) {
+    return (rb / kWmmaHeads) * 16;
+  };
+
+  constexpr std::uint32_t kVtHalves =
+      VtRow<kVtStride, kVtSwizzle>(kHeadDim - 1) + kKeys;
+  constexpr std::uint32_t kKvLdsHalves =
+      (kKeys * kWmmaKStride > kVtHalves) ? (kKeys * kWmmaKStride) : kVtHalves;
+  __shared__ __half kv_lds[kKvLdsHalves];
+  __shared__ float s_lds[2][kSTiles][16][16];
+  __shared__ __half p_lds[kRows][kKeys];
+  __shared__ float row_max[kRows];
+  __shared__ float row_sum[kRows];
+  __shared__ float row_scale[kRows];
+
+  const std::uint32_t s_tile = wave % kSTiles;
+  const std::uint32_t s_kh = wave / kSTiles;
+  const std::uint32_t s_rb = s_tile % kRowBlocks;
+  const std::uint32_t s_kb = s_tile / kRowBlocks;
+
+  v16h q_frag[kKStepsPerWave];
+  {
+    const std::uint32_t local_query =
+        query_start + row_block_offset(s_rb) + sub;
+    const bool live = local_query < batch_size;
+    const float* q_row =
+        q + (static_cast<std::size_t>(local_query) * kAttnWidth) +
+        (static_cast<std::size_t>(row_block_head(s_rb)) * kHeadDim);
+#pragma unroll
+    for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+      const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
+      const auto* qp = reinterpret_cast<const float4*>(q_row + d0);
+#pragma unroll
+      for (std::uint32_t v = 0; v < 4; ++v) {
+        const float4 f = live ? qp[v] : make_float4(0.0F, 0.0F, 0.0F, 0.0F);
+        q_frag[ks][(v * 4) + 0] = static_cast<_Float16>(f.x * attention_scale);
+        q_frag[ks][(v * 4) + 1] = static_cast<_Float16>(f.y * attention_scale);
+        q_frag[ks][(v * 4) + 2] = static_cast<_Float16>(f.z * attention_scale);
+        q_frag[ks][(v * 4) + 3] = static_cast<_Float16>(f.w * attention_scale);
+      }
+    }
+  }
+
+  v8f o_acc[kRowBlocks][kDimTilesPerWave] = {};
+  for (std::uint32_t r = tid; r < kRows; r += kThreads) {
+    row_max[r] = -INFINITY;
+    row_sum[r] = 0.0F;
+  }
+
+  const std::uint32_t context_end =
+      start_pos + static_cast<std::uint32_t>(batch_size);
+  const std::uint32_t max_visible =
+      min(context_end, start_pos + query_start + kQueryRows);
+
+  // V: lane L holds dims [wave*32 + (L%4)*8, +8) of keys 2*(L/4) and 2*(L/4)+1.
+  const std::uint32_t v_pair = lane >> 2u;
+  const std::uint32_t v_dim = (wave * 32u) + ((lane & 3u) * 8u);
+  const auto* v_base =
+      v_cache_f16 + (static_cast<std::size_t>(kv_head) * kHeadDim) + v_dim;
+  const auto* k_base =
+      k_cache_f16 + (static_cast<std::size_t>(kv_head) * kHeadDim);
+
+  // The shipped mapping, kept so the coalesced read can be priced on its own:
+  // one key per lane, each thread a 16-dim slice.
+  const std::uint32_t s_key = lane % kKeys;
+  const std::uint32_t s_dim = (tid / kKeys) * (kVRegs * 8);
+
+  const auto load_v = [&](std::uint32_t key_start, uint4* dst) {
+    if constexpr (kPackedV) {
+#pragma unroll
+      for (std::uint32_t j = 0; j < 2; ++j) {
+        const std::uint32_t key_position = key_start + (2 * v_pair) + j;
+        dst[j] = (key_position < context_end)
+                     ? *reinterpret_cast<const uint4*>(
+                           v_base +
+                           (static_cast<std::size_t>(key_position) * kKvWidth))
+                     : make_uint4(0u, 0u, 0u, 0u);
+      }
+    } else {
+      const std::uint32_t key_position = key_start + s_key;
+      const auto* src = v_cache_f16 +
+                        (static_cast<std::size_t>(key_position) * kKvWidth) +
+                        (static_cast<std::size_t>(kv_head) * kHeadDim) + s_dim;
+      const bool live = key_position < context_end;
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVRegs; ++j) {
+        dst[j] = (kAblate == 5)
+                     ? make_uint4(key_start + j, lane, wave, j)
+                     : (live ? *reinterpret_cast<const uint4*>(src + (j * 8))
+                             : make_uint4(0u, 0u, 0u, 0u));
+      }
+    }
+  };
+  const auto load_k = [&](std::uint32_t key_start, uint4* dst) {
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      const std::uint32_t idx = tid + (n * kThreads);
+      const std::uint32_t key_position = key_start + (idx / (kHeadDim / 8));
+      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+      dst[n] =
+          (kAblate == 5)
+              ? make_uint4(idx, d8, key_position, 1u)
+              : ((key_position < context_end)
+                     ? *reinterpret_cast<const uint4*>(
+                           k_base +
+                           (static_cast<std::size_t>(key_position) * kKvWidth) +
+                           d8)
+                     : make_uint4(0u, 0u, 0u, 0u));
+    }
+  };
+
+  constexpr std::uint32_t kVBuf = kPackedV ? 2 : kVRegs;
+  uint4 k_cur[kKRegs];
+  uint4 v_cur[kVBuf];
+  uint4 k_pre[kKRegs];
+  uint4 v_pre[kVBuf];
+  load_k(key_begin, k_cur);
+  load_v(key_begin, v_cur);
+
+  for (std::uint32_t key_start = key_begin; key_start < max_visible;
+       key_start += kKeys) {
+    // --- stage K from the registers the previous iteration prefetched
+    __syncthreads();
+#pragma unroll
+    for (std::uint32_t n = 0; n < kKRegs; ++n) {
+      const std::uint32_t idx = tid + (n * kThreads);
+      const std::uint32_t key_row = idx / (kHeadDim / 8);
+      const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
+      *reinterpret_cast<uint4*>(&kv_lds[(key_row * kWmmaKStride) + d8]) =
+          k_cur[n];
+    }
+    __syncthreads();
+
+    // --- prefetch the next tile. Everything below covers its latency.
+    const std::uint32_t next_start = key_start + kKeys;
+    if (kPipeline && next_start < max_visible) {
+      load_k(next_start, k_pre);
+      load_v(next_start, v_pre);
+    }
+
+    // --- S = Q K^T ---
+    {
+      v8f s_acc = {};
+#pragma unroll
+      for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
+        const std::uint32_t d0 = ((s_kh * kKStepsPerWave) + ks) * 16;
+        const v16h k_frag =
+            LoadFrag(&kv_lds[(((s_kb * 16) + sub) * kWmmaKStride) + d0]);
+        if (kAblate != 3) {
+          s_acc = Wmma(q_frag[ks], k_frag, s_acc);
+        }
+      }
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        s_lds[s_kh][s_tile][(2 * i) + half_id][sub] = s_acc[i];
+      }
+    }
+    __syncthreads();
+
+    // --- online softmax ---
+    if (kAblate != 2) {
+      const std::uint32_t rg = tid / kSoftmaxLanes;
+      const std::uint32_t seg = tid % kSoftmaxLanes;
+      constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
+      const std::uint32_t rb = rg / 16;
+      const std::uint32_t row = rg % 16;
+      const std::uint32_t local_query =
+          query_start + row_block_offset(rb) + row;
+      const std::uint32_t absolute_query = start_pos + local_query;
+      float part_max = -INFINITY;
+      float vals[kPerLane];
+#pragma unroll
+      for (std::uint32_t m = 0; m < kPerLane; ++m) {
+        const std::uint32_t col = (seg * kPerLane) + m;
+        const std::uint32_t key_position = key_start + col;
+        const bool valid = local_query < batch_size &&
+                           key_position <= absolute_query &&
+                           key_position < context_end;
+        const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
+        vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
+                           s_lds[1][tile][row][col % 16])
+                        : -INFINITY;
+        part_max = fmaxf(part_max, vals[m]);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+        part_max = fmaxf(part_max, __shfl_xor(part_max, off));
+      }
+      const float prev_max = row_max[rg];
+      const float next_max = fmaxf(prev_max, part_max);
+      const float prior_scale =
+          isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
+      float part_sum = 0.0F;
+#pragma unroll
+      for (std::uint32_t m = 0; m < kPerLane; ++m) {
+        const float w = isfinite(vals[m]) ? __expf(vals[m] - next_max) : 0.0F;
+        part_sum += w;
+        p_lds[rg][(seg * kPerLane) + m] = static_cast<__half>(w);
+      }
+#pragma unroll
+      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+        part_sum += __shfl_xor(part_sum, off);
+      }
+      if (seg == 0) {
+        row_max[rg] = next_max;
+        row_sum[rg] = (row_sum[rg] * prior_scale) + part_sum;
+        row_scale[rg] = prior_scale;
+      }
+    }
+    __syncthreads();
+
+    // --- rescale the running O ---
+#pragma unroll
+    for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+      float scale[8];
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        scale[i] = row_scale[(rb * 16) + (2 * i) + half_id];
+      }
+#pragma unroll
+      for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          o_acc[rb][t][i] *= scale[i];
+        }
+      }
+    }
+
+    // --- transpose V: 8 packed dwords, two adjacent V^T columns each
+    if (kAblate == 1) {
+      // priced out
+    } else if constexpr (kPackedV) {
+      const auto* lo = reinterpret_cast<const __half*>(&v_cur[0]);
+      const auto* hi = reinterpret_cast<const __half*>(&v_cur[1]);
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        const std::uint32_t packed =
+            static_cast<std::uint32_t>(__half_as_ushort(lo[i])) |
+            (static_cast<std::uint32_t>(__half_as_ushort(hi[i])) << 16);
+        *reinterpret_cast<std::uint32_t*>(
+            &kv_lds[VtRow<kVtStride, kVtSwizzle>(v_dim + i) + (2 * v_pair)]) =
+            packed;
+      }
+    } else {
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVRegs; ++j) {
+        const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          kv_lds[VtRow<kVtStride, kVtSwizzle>(s_dim + (j * 8) + i) + s_key] =
+              packed[i];
+        }
+      }
+    }
+    __syncthreads();
+
+    // --- O += P V ---
+#pragma unroll
+    for (std::uint32_t t = 0; (kAblate != 4) && t < kDimTilesPerWave; ++t) {
+      const std::uint32_t dim_tile = wave + (t * kWaves);
+      v16h v_frag[kKeyBlocks];
+#pragma unroll
+      for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
+        v_frag[kb] = LoadFrag(
+            &kv_lds[VtRow<kVtStride, kVtSwizzle>((dim_tile * 16) + sub) +
+                    (kb * 16)]);
+      }
+#pragma unroll
+      for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+#pragma unroll
+        for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
+          const v16h p_frag = LoadFrag(&p_lds[(rb * 16) + sub][kb * 16]);
+          o_acc[rb][t] = Wmma(p_frag, v_frag[kb], o_acc[rb][t]);
+        }
+      }
+    }
+
+    if (kPipeline) {
+#pragma unroll
+      for (std::uint32_t n = 0; n < kKRegs; ++n) {
+        k_cur[n] = k_pre[n];
+      }
+#pragma unroll
+      for (std::uint32_t n = 0; n < kVBuf; ++n) {
+        v_cur[n] = v_pre[n];
+      }
+    } else {
+      load_k(next_start, k_cur);
+      load_v(next_start, v_cur);
+    }
+  }
+  __syncthreads();
+
+  // --- epilogue ---
+#pragma unroll
+  for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
+    const std::uint32_t query_head = row_block_head(rb);
+    const std::uint32_t row_offset = row_block_offset(rb);
+#pragma unroll
+    for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
+      const std::uint32_t dim_tile = wave + (t * kWaves);
+#pragma unroll
+      for (std::uint32_t i = 0; i < 8; ++i) {
+        const std::uint32_t row = (2 * i) + half_id;
+        const std::uint32_t local_query = query_start + row_offset + row;
+        if (local_query >= batch_size) {
+          continue;
+        }
+        const float denominator = row_sum[(rb * 16) + row];
+        const std::size_t offset =
+            (static_cast<std::size_t>(local_query) * kAttnWidth) +
+            (static_cast<std::size_t>(query_head) * kHeadDim) +
+            (dim_tile * 16) + sub;
+        float value =
+            (denominator > 0.0F) ? (o_acc[rb][t][i] / denominator) : 0.0F;
+        if (gate != nullptr && lse_out == nullptr) {
+          value *= 1.0F / (1.0F + __expf(-gate[offset]));
+        }
+        out_context[offset] = value;
+      }
+    }
+  }
+  if (lse_out != nullptr && wave == 0) {
+    for (std::uint32_t rg = lane; rg < kRows; rg += 32) {
+      const std::uint32_t rb = rg / 16;
+      const std::uint32_t local_query =
+          query_start + row_block_offset(rb) + (rg % 16);
+      if (local_query >= batch_size) {
+        continue;
+      }
+      const float denominator = row_sum[rg];
+      lse_out[(static_cast<std::size_t>(row_block_head(rb)) * batch_size) +
+              local_query] =
+          (denominator > 0.0F) ? (row_max[rg] + logf(denominator)) : -INFINITY;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
 
@@ -836,6 +1253,10 @@ int main(int argc, char** argv) {
   int iters = 3;
   bool check = false;
   bool whole_range = false;
+  // At depth 16384 a full sweep is long enough to thermally throttle the APU,
+  // which penalizes whichever variant runs last by up to 45%. `-v` runs one
+  // variant so a caller can interleave candidates with cooldowns between them.
+  std::string only;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "-b" && i + 1 < argc) {
@@ -845,6 +1266,8 @@ int main(int argc, char** argv) {
           static_cast<std::uint32_t>(std::strtoul(argv[++i], nullptr, 10));
     } else if (arg == "-i" && i + 1 < argc) {
       iters = std::atoi(argv[++i]);
+    } else if (arg == "-v" && i + 1 < argc) {
+      only = argv[++i];
     } else if (arg == "-c") {
       check = true;
     } else if (arg == "-k") {
@@ -989,30 +1412,92 @@ int main(int argc, char** argv) {
     ref = cpu;  // hold the kernels to the CPU reference when checking
   }
 
-  report("tiled (production)", TimeMs(iters, run_tiled), d_out_ref,
-         check ? &ref : nullptr);
-  report("wmma 32 rows/block", TimeMs(iters, run_wmma), d_out_new, &ref);
-  report("wmma 64 rows/block", TimeMs(iters, run_wmma32), d_out_new, &ref);
-  report("wmma 128 rows/block",
-         TimeMs(iters,
-                [&] {
-                  WmmaCausalAttention<64, 16, 16, 0><<<wmma_grid64, 512>>>(
-                      d_q, nullptr, d_k, d_v, d_out_new, start_pos, batch,
-                      d_lse_new, key_begin);
-                }),
-         d_out_new, &ref);
+  const auto bench = [&](const char* name, auto&& fn, float* d_out,
+                         const std::vector<float>* against) {
+    if (!only.empty() && std::string(name).find(only) == std::string::npos) {
+      return;
+    }
+    report(name, TimeMs(iters, fn), d_out, against);
+  };
+
+  bench("tiled (production)", run_tiled, d_out_ref, check ? &ref : nullptr);
+  bench("wmma 32 rows/block", run_wmma, d_out_new, &ref);
+  bench("wmma 64 rows/block", run_wmma32, d_out_new, &ref);
+  bench(
+      "wmma 128 rows/block",
+      [&] {
+        WmmaCausalAttention<64, 16, 16, 0>
+            <<<wmma_grid64, 512>>>(d_q, nullptr, d_k, d_v, d_out_new, start_pos,
+                                   batch, d_lse_new, key_begin);
+      },
+      d_out_new, &ref);
+
+  // Pipelined 64-row variants: coalesced V read plus packed transpose writes,
+  // with and without the prefetch and the bank swizzle, so the three changes
+  // can be priced apart.
+#define PIPE(SWIZZLE, PIPELINE, PACKED, PAD, NAME)                          \
+  bench(                                                                    \
+      NAME,                                                                 \
+      [&] {                                                                 \
+        WmmaCausalAttentionPipe<32, 16, 8, SWIZZLE, PIPELINE, PACKED, PAD>  \
+            <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,       \
+                                   start_pos, batch, d_lse_new, key_begin); \
+      },                                                                    \
+      d_out_new, &ref)
+  PIPE(0, false, true, 8, "pipe: packed V only");
+  PIPE(16, false, true, 8, "pipe: packed+swizzle");
+  PIPE(0, true, false, 8, "pipe: prefetch only");
+  PIPE(0, true, true, 8, "pipe: packed+prefetch");
+  PIPE(16, true, true, 8, "pipe: all three");
+  // kVtPad 0 drops the V^T row padding, so LDS falls under a third of the 64 KB
+  // and three blocks fit per CU instead of two. The swizzle keeps the packed
+  // writes conflict-free without it.
+  PIPE(16, true, true, 0, "pipe: all three, 3 blk/CU");
+  PIPE(16, true, false, 0, "pipe: prefetch, 3 blk/CU");
+  PIPE(0, true, false, 0, "pipe: prefetch, pad0");
+#undef PIPE
+
+  // A 32-key tile halves the number of dependency-chain traversals per unit of
+  // work. The eight-wave split cannot hold it, so this is 16 waves / 512
+  // threads at the same 64 query rows per block, hence the same K/V traffic.
+  bench(
+      "pipe: 32 keys, 16 waves",
+      [&] {
+        WmmaCausalAttentionPipe<32, 32, 16, 0, true, false, 8>
+            <<<wmma_grid32, 512>>>(d_q, nullptr, d_k, d_v, d_out_new, start_pos,
+                                   batch, d_lse_new, key_begin);
+      },
+      d_out_new, &ref);
+
+  // Phase pricing again, this time on the pipelined kernel, to show where the
+  // critical path went after the prefetch.
+#define PABLATE(N, NAME)                                                    \
+  bench(                                                                    \
+      NAME,                                                                 \
+      [&] {                                                                 \
+        WmmaCausalAttentionPipe<32, 16, 8, 0, true, false, 8, N>            \
+            <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,       \
+                                   start_pos, batch, d_lse_new, key_begin); \
+      },                                                                    \
+      d_out_new, nullptr)
+  PABLATE(1, "  pipe ablate: no V transpose");
+  PABLATE(2, "  pipe ablate: no softmax");
+  PABLATE(3, "  pipe ablate: no S wmma");
+  PABLATE(4, "  pipe ablate: no PV wmma");
+  PABLATE(5, "  pipe ablate: no K/V global");
+#undef PABLATE
 
   // Phase pricing. These are deliberately incorrect; only the time is
   // meaningful.
-#define ABLATE(N, NAME)                                                    \
-  report(NAME,                                                             \
-         TimeMs(iters,                                                     \
-                [&] {                                                      \
-                  WmmaCausalAttention<32, 16, 8, N><<<wmma_grid32, 256>>>( \
-                      d_q, nullptr, d_k, d_v, d_out_new, start_pos, batch, \
-                      d_lse_new, key_begin);                               \
-                }),                                                        \
-         d_out_new, nullptr)
+#define ABLATE(N, NAME)                                                     \
+  bench(                                                                    \
+      NAME,                                                                 \
+      [&] {                                                                 \
+        WmmaCausalAttention<32, 16, 8, N>                                   \
+            <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,       \
+                                   start_pos, batch, d_lse_new, key_begin); \
+      },                                                                    \
+      d_out_new, nullptr)
   ABLATE(1, "  ablate: no V transpose");
   ABLATE(2, "  ablate: no softmax");
   ABLATE(3, "  ablate: no PV wmma");
