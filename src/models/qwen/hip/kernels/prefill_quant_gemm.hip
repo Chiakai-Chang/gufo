@@ -36,8 +36,7 @@ constexpr std::size_t kQ8ActScaleOffset = 512;
 /// Byte size of the tiled Q8_1 activation buffer for a [batch, k] tensor.
 __host__ __device__ inline std::size_t Q8ActTiledBytes(std::size_t batch,
                                                        std::size_t k) {
-  const std::size_t tiles =
-      (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
+  const std::size_t tiles = (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
   return tiles * (k / 32) * kQ8ActTileBytes;
 }
 
@@ -49,8 +48,10 @@ __device__ __forceinline__ std::int8_t* Q8ActTile(void* base,
          (((tt * num_blocks) + kb) * kQ8ActTileBytes);
 }
 
-__device__ __forceinline__ const std::int8_t* Q8ActTile(
-    const void* base, std::size_t num_blocks, std::size_t tt, std::size_t kb) {
+__device__ __forceinline__ const std::int8_t* Q8ActTile(const void* base,
+                                                        std::size_t num_blocks,
+                                                        std::size_t tt,
+                                                        std::size_t kb) {
   return static_cast<const std::int8_t*>(base) +
          (((tt * num_blocks) + kb) * kQ8ActTileBytes);
 }
@@ -58,8 +59,7 @@ __device__ __forceinline__ const std::int8_t* Q8ActTile(
 /// Writes one lane's quantized byte and (lane 0) the block scale into the tiled
 /// layout. `lane_id` is the element index inside the 32-element block.
 __device__ __forceinline__ void StoreQ8ActLane(void* y, std::size_t num_blocks,
-                                               std::size_t tok,
-                                               std::size_t blk,
+                                               std::size_t tok, std::size_t blk,
                                                std::size_t lane_id, float d,
                                                std::int8_t q) {
   const std::size_t tt = tok / kQ8ActTileTokens;
@@ -193,12 +193,15 @@ __device__ __forceinline__ int32x8_t Wmma_16x16x16_iu8(int32x4_t a, int32x4_t b,
 // the quantize kernel emits. Accumulation order over K blocks is unchanged from
 // the 16-row kernel, so results are bit-identical.
 template<int BM, int BN, int BK, int WM, int WN>
-__launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
-    const void* __restrict__ w, const void* __restrict__ x_blocks,
-    float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k) {
+__launch_bounds__(256) __global__
+    void W8A8BlockedWmmaGEMMKernel(const void* __restrict__ w,
+                                   const void* __restrict__ x_blocks,
+                                   float* __restrict__ y, std::size_t batch,
+                                   std::size_t m, std::size_t k) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
-  static_assert(BN / 16 <= 8, "the activation stage assigns one wave per token subtile");
+  static_assert(BN / 16 <= 8,
+                "the activation stage assigns one wave per token subtile");
   constexpr int kRowTiles = BM / 16;
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = kRowTiles / WM;
@@ -673,15 +676,15 @@ void LaunchBatchedQuantGEMMPreQuantized(core::GgmlType type, const void* w,
     constexpr int kBN = 128;
     const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
                     static_cast<unsigned int>((m + kBM - 1) / kBM));
-    W8A8BlockedWmmaGEMMKernel<kBM, kBN, 4, 4, 2><<<grid, 256, 0, stream>>>(
-        w, q8_1_x, y, batch, m, k);
+    W8A8BlockedWmmaGEMMKernel<kBM, kBN, 4, 4, 2>
+        <<<grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
   } else {
     constexpr int kBM = 128;
     constexpr int kBN = 64;
     const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
                     static_cast<unsigned int>((m + kBM - 1) / kBM));
-    W8A8BlockedWmmaGEMMKernel<kBM, kBN, 4, 8, 1><<<grid, 256, 0, stream>>>(
-        w, q8_1_x, y, batch, m, k);
+    W8A8BlockedWmmaGEMMKernel<kBM, kBN, 4, 8, 1>
+        <<<grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
   }
 }
 

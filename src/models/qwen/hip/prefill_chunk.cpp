@@ -265,8 +265,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         if (diagonal &&
             LaunchQwenAotritonPrefixAttention(
                 static_cast<const __half*>(arena_.d_attn_q_f16), layer_k_f16,
-                layer_v_f16,
-                static_cast<__half*>(arena_.d_attn_prefix_f16),
+                layer_v_f16, static_cast<__half*>(arena_.d_attn_prefix_f16),
                 arena_.d_attn_lse_prefix, batch_size, start_pos,
                 config.num_attention_heads, config.num_key_value_heads,
                 config.head_dim, arena_.stream)) {
@@ -281,71 +280,72 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       }
 
       if (!split_attention) {
-      detail::DispatchPrefillAttention(
-          visible_context,
-          [&] {
-            const bool launched = LaunchBatchedAttentionTile(
-                arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-                arena_.d_kv_cache, arena_.d_kv_cache + total_k,
-                arena_.d_attention_kv_f16,
-                static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
-                    total_k,
-                arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
-                arena_.GetMaxContext(), config.num_attention_heads,
-                config.num_key_value_heads, config.head_dim, arena_.stream);
-            selected_attention = launched ? SelectedAttention::kTiled
-                                          : SelectedAttention::kBaseline;
-            tiled_rejected = !launched;
-            return launched;
-          },
-          [&] {
-            const bool launched = LaunchBatchedAttentionCk(
-                arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-                arena_.d_kv_cache, arena_.d_kv_cache + total_k,
-                arena_.d_attention_kv_f16,
-                static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
-                    total_k,
-                arena_.d_scratch_bf16, arena_.d_ssm_out, attn_layer_idx,
-                start_pos, batch_size, arena_.GetMaxContext(),
-                config.num_attention_heads, config.num_key_value_heads,
-                config.head_dim, arena_.stream);
-            selected_attention = launched ? SelectedAttention::kComposableKernel
-                                          : SelectedAttention::kBaseline;
-            ck_rejected = !launched;
-            return launched;
-          },
-          [&] {
-            selected_attention = SelectedAttention::kBaseline;
-            LaunchBatchedAttention(
-                arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-                arena_.d_kv_cache, arena_.d_kv_cache + total_k,
-                arena_.d_attention_kv_f16,
-                static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
-                    total_k,
-                arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
-                arena_.GetMaxContext(), config.num_attention_heads,
-                config.num_key_value_heads, config.head_dim, arena_.stream,
-                fused_qknorm_rope_kv);
-          });
-      if (selected_attention == SelectedAttention::kTiled) {
-        detail::EmitAttentionDispatch("prefill_tiled", "");
-      } else if (selected_attention == SelectedAttention::kComposableKernel) {
-        detail::EmitAttentionDispatch(
-            "prefill_composable_kernel",
-            tiled_rejected ? "prefill_tiled: rejected" : "");
-      } else if (!detail::ShouldAttemptOptimizedAttention(visible_context)) {
-        detail::EmitAttentionDispatch(
-            "prefill_baseline",
-            "prefill_tiled: below_threshold; prefill_composable_kernel: "
-            "below_threshold");
-      } else {
-        detail::EmitAttentionDispatch(
-            "prefill_baseline",
-            tiled_rejected && ck_rejected
-                ? "prefill_tiled: rejected; prefill_composable_kernel: "
-                  "rejected"
-                : "optimized_attention: rejected");
-      }
+        detail::DispatchPrefillAttention(
+            visible_context,
+            [&] {
+              const bool launched = LaunchBatchedAttentionTile(
+                  arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+                  arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+                  arena_.d_attention_kv_f16,
+                  static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
+                      total_k,
+                  arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
+                  arena_.GetMaxContext(), config.num_attention_heads,
+                  config.num_key_value_heads, config.head_dim, arena_.stream);
+              selected_attention = launched ? SelectedAttention::kTiled
+                                            : SelectedAttention::kBaseline;
+              tiled_rejected = !launched;
+              return launched;
+            },
+            [&] {
+              const bool launched = LaunchBatchedAttentionCk(
+                  arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+                  arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+                  arena_.d_attention_kv_f16,
+                  static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
+                      total_k,
+                  arena_.d_scratch_bf16, arena_.d_ssm_out, attn_layer_idx,
+                  start_pos, batch_size, arena_.GetMaxContext(),
+                  config.num_attention_heads, config.num_key_value_heads,
+                  config.head_dim, arena_.stream);
+              selected_attention = launched
+                                       ? SelectedAttention::kComposableKernel
+                                       : SelectedAttention::kBaseline;
+              ck_rejected = !launched;
+              return launched;
+            },
+            [&] {
+              selected_attention = SelectedAttention::kBaseline;
+              LaunchBatchedAttention(
+                  arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+                  arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+                  arena_.d_attention_kv_f16,
+                  static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
+                      total_k,
+                  arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
+                  arena_.GetMaxContext(), config.num_attention_heads,
+                  config.num_key_value_heads, config.head_dim, arena_.stream,
+                  fused_qknorm_rope_kv);
+            });
+        if (selected_attention == SelectedAttention::kTiled) {
+          detail::EmitAttentionDispatch("prefill_tiled", "");
+        } else if (selected_attention == SelectedAttention::kComposableKernel) {
+          detail::EmitAttentionDispatch(
+              "prefill_composable_kernel",
+              tiled_rejected ? "prefill_tiled: rejected" : "");
+        } else if (!detail::ShouldAttemptOptimizedAttention(visible_context)) {
+          detail::EmitAttentionDispatch(
+              "prefill_baseline",
+              "prefill_tiled: below_threshold; prefill_composable_kernel: "
+              "below_threshold");
+        } else {
+          detail::EmitAttentionDispatch(
+              "prefill_baseline",
+              tiled_rejected && ck_rejected
+                  ? "prefill_tiled: rejected; prefill_composable_kernel: "
+                    "rejected"
+                  : "optimized_attention: rejected");
+        }
       }
 
       LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,

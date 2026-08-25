@@ -1,16 +1,16 @@
 // Oracle test for the batched prefill W8A8 WMMA GEMM (opt-c163-blocked-w8a8).
 //
-// Covers the blocked macro-tile kernel behind LaunchBatchedQuantGEMMPreQuantized
-// and the dual gate/up kernel, against an independent CPU reference that
-// reproduces the exact Q8_0 x Q8_1 block dot product the kernels compute. Both
-// the 128-token throughput configuration and the 64-token short-prompt
-// configuration are exercised, along with shapes whose row count and batch are
-// not multiples of the macro tile.
+// Covers the blocked macro-tile kernel behind
+// LaunchBatchedQuantGEMMPreQuantized and the dual gate/up kernel, against an
+// independent CPU reference that reproduces the exact Q8_0 x Q8_1 block dot
+// product the kernels compute. Both the 128-token throughput configuration and
+// the 64-token short-prompt configuration are exercised, along with shapes
+// whose row count and batch are not multiples of the macro tile.
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -64,13 +64,13 @@ std::uint16_t FloatToFp16(float f) {
     exp = 15;
     man = 0x7FFFFFu;
   }
-  return static_cast<std::uint16_t>((sign << 15u) |
-                                    (static_cast<std::uint32_t>(exp + 15) << 10u) |
-                                    (man >> 13u));
+  return static_cast<std::uint16_t>(
+      (sign << 15u) | (static_cast<std::uint32_t>(exp + 15) << 10u) |
+      (man >> 13u));
 }
 
 class Rng {
- public:
+public:
   explicit Rng(std::uint32_t seed) : state_(seed) {}
   std::uint32_t Next() {
     state_ = (state_ * 1664525U) + 1013904223U;
@@ -84,7 +84,7 @@ class Rng {
     return static_cast<std::int8_t>(static_cast<int>(Next() % 255U) - 127);
   }
 
- private:
+private:
   std::uint32_t state_;
 };
 
@@ -104,8 +104,9 @@ std::vector<float> ReferenceGemm(const std::vector<HostQ8_0Block>& w,
         const HostQ8_0Block& blk = w[(r * num_blocks) + b];
         std::int32_t dot = 0;
         for (std::size_t j = 0; j < 32; ++j) {
-          dot += static_cast<std::int32_t>(blk.qs[j]) *
-                 static_cast<std::int32_t>(x_q[(((t * num_blocks) + b) * 32) + j]);
+          dot +=
+              static_cast<std::int32_t>(blk.qs[j]) *
+              static_cast<std::int32_t>(x_q[(((t * num_blocks) + b) * 32) + j]);
         }
         // The device epilogue contracts the scale multiply and the accumulate
         // into a single fma, so the reference must too.
@@ -134,8 +135,8 @@ void Compare(const char* label, const std::vector<float>& got,
     scale = std::fmax(scale, std::fabs(static_cast<double>(want[i])));
   }
   const double rel = (scale > 0.0) ? (max_abs / scale) : max_abs;
-  std::cout << "  " << label << ": max_abs=" << max_abs << " magnitude=" << scale
-            << " rel_to_magnitude=" << rel << "\n";
+  std::cout << "  " << label << ": max_abs=" << max_abs
+            << " magnitude=" << scale << " rel_to_magnitude=" << rel << "\n";
   if (rel >= 1e-5) {
     std::cerr << label << ": prefill quant GEMM mismatch against CPU oracle\n";
     std::abort();
@@ -202,7 +203,8 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   std::cout << "prefill quant GEMM: batch=" << batch << " m=" << m << " k=" << k
             << (dual ? " dual" : " single") << "\n";
   const std::size_t num_blocks = k / 32;
-  Rng rng(0x9E3779B9U ^ static_cast<std::uint32_t>((batch * 131) + (m * 17) + k));
+  Rng rng(0x9E3779B9U ^
+          static_cast<std::uint32_t>((batch * 131) + (m * 17) + k));
 
   std::vector<HostQ8_0Block> h_w(m * num_blocks);
   std::vector<HostQ8_0Block> h_w2(m * num_blocks);
@@ -233,8 +235,7 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   void* d_q8 = nullptr;
   float* d_y = nullptr;
   float* d_y2 = nullptr;
-  const std::size_t q8_bytes =
-      (((batch + 15) / 16) * num_blocks * 576) + 4096;
+  const std::size_t q8_bytes = (((batch + 15) / 16) * num_blocks * 576) + 4096;
   HIP_CHECK(hipMalloc(&d_w, h_w.size() * sizeof(HostQ8_0Block)));
   HIP_CHECK(hipMalloc(&d_w2, h_w2.size() * sizeof(HostQ8_0Block)));
   HIP_CHECK(hipMalloc(&d_x_bf16, h_x_bf16.size() * sizeof(std::uint16_t)));
@@ -272,7 +273,8 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
                                                  static_cast<int>(ref_q[i])));
     }
     for (std::size_t i = 0; i < ref_scale.size(); ++i) {
-      worst_scale = std::fmax(worst_scale, std::fabs(x_scale[i] - ref_scale[i]));
+      worst_scale =
+          std::fmax(worst_scale, std::fabs(x_scale[i] - ref_scale[i]));
     }
     std::cout << "  quantizer: max_code_delta=" << worst_code
               << " max_scale_delta=" << worst_scale << "\n";
@@ -286,8 +288,8 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
     strix::hip::LaunchBatchedDualQuantGEMMPreQuantized(
         strix::core::GgmlType::kQ8_0, d_w, d_w2, d_q8, d_y, d_y2, batch, m, k);
   } else {
-    strix::hip::LaunchBatchedQuantGEMMPreQuantized(
-        strix::core::GgmlType::kQ8_0, d_w, d_q8, d_y, batch, m, k);
+    strix::hip::LaunchBatchedQuantGEMMPreQuantized(strix::core::GgmlType::kQ8_0,
+                                                   d_w, d_q8, d_y, batch, m, k);
   }
   HIP_CHECK(hipDeviceSynchronize());
 

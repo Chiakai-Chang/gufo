@@ -2,10 +2,10 @@
 //
 // The split path computes attention for a prefill chunk at depth as two
 // partial softmaxes -- an AOTriton non-causal pass over the fully visible
-// prefix and the tiled causal kernel over the N x N diagonal -- then merges them
-// by log-sum-exp. The merge is exact in real arithmetic, so the whole path must
-// agree with the unsplit tiled kernel over the same key range to within the
-// FP16 precision the two halves share.
+// prefix and the tiled causal kernel over the N x N diagonal -- then merges
+// them by log-sum-exp. The merge is exact in real arithmetic, so the whole path
+// must agree with the unsplit tiled kernel over the same key range to within
+// the FP16 precision the two halves share.
 //
 // This exercises production shapes (24 query heads over 4 KV heads, head
 // dimension 256) at several depths, including a depth that is not a multiple of
@@ -34,7 +34,7 @@ constexpr std::uint32_t kHeadDim = 256;
 constexpr std::uint32_t kMaxContext = 16384;
 
 class Rng {
- public:
+public:
   explicit Rng(std::uint32_t seed) : state_(seed) {}
   float Uniform(float lo, float hi) {
     state_ = (state_ * 1664525U) + 1013904223U;
@@ -42,7 +42,7 @@ class Rng {
     return lo + (u * (hi - lo));
   }
 
- private:
+private:
   std::uint32_t state_;
 };
 
@@ -72,7 +72,7 @@ void Compare(const char* label, const std::vector<float>& got,
       continue;
     }
     max_abs = std::fmax(max_abs, std::fabs(static_cast<double>(got[i]) -
-                                          static_cast<double>(want[i])));
+                                           static_cast<double>(want[i])));
     magnitude = std::fmax(magnitude, std::fabs(static_cast<double>(want[i])));
   }
   const double rel = (magnitude > 0.0) ? (max_abs / magnitude) : max_abs;
@@ -80,7 +80,8 @@ void Compare(const char* label, const std::vector<float>& got,
             << " magnitude=" << magnitude << " rel=" << rel
             << " non_finite=" << non_finite << "\n";
   if (non_finite != 0 || rel > tolerance) {
-    std::cerr << label << ": split prefill attention disagrees with the "
+    std::cerr << label
+              << ": split prefill attention disagrees with the "
                  "unsplit tiled kernel\n";
     std::abort();
   }
@@ -92,13 +93,13 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size) {
 
   const std::size_t attention_size =
       static_cast<std::size_t>(kNumHeads) * kHeadDim;
-  const std::size_t kv_size =
-      static_cast<std::size_t>(kNumKvHeads) * kHeadDim;
+  const std::size_t kv_size = static_cast<std::size_t>(kNumKvHeads) * kHeadDim;
   const std::size_t total_kv =
       static_cast<std::size_t>(kNumKvHeads) * kMaxContext * kHeadDim;
   const std::size_t q_elements = batch_size * attention_size;
 
-  Rng rng(0xC0FFEEU ^ (start_pos * 31U) ^ static_cast<std::uint32_t>(batch_size));
+  Rng rng(0xC0FFEEU ^ (start_pos * 31U) ^
+          static_cast<std::uint32_t>(batch_size));
   std::vector<float> h_q(q_elements);
   std::vector<float> h_gate(q_elements);
   std::vector<float> h_k(batch_size * kv_size);
@@ -144,21 +145,20 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size) {
                       hipMemcpyHostToDevice));
   HIP_CHECK(hipMemcpy(b.v, h_v.data(), batch_size * kv_size * sizeof(float),
                       hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(b.kv_cache, h_cache.data(),
-                      total_kv * 2 * sizeof(float), hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(b.kv_cache, h_cache.data(), total_kv * 2 * sizeof(float),
+                      hipMemcpyHostToDevice));
   HIP_CHECK(hipMemset(b.kv_f16, 0, total_kv * 2 * sizeof(std::uint16_t)));
 
   auto* v_cache = b.kv_cache + total_kv;
-  auto* kv_f16_v =
-      static_cast<std::uint16_t*>(b.kv_f16) + total_kv;
+  auto* kv_f16_v = static_cast<std::uint16_t*>(b.kv_f16) + total_kv;
 
   // Reference: the unsplit tiled kernel over the whole visible range. This also
   // packs the new K/V into both caches and refreshes the FP16 prefix mirror.
   HIP_CHECK(hipMemset(b.out, 0, q_elements * sizeof(float)));
   if (!strix::hip::LaunchBatchedAttentionTile(
-          b.q, b.k, b.v, b.gate, b.kv_cache, v_cache, b.kv_f16, kv_f16_v,
-          b.out, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
-          kNumHeads, kNumKvHeads, kHeadDim)) {
+          b.q, b.k, b.v, b.gate, b.kv_cache, v_cache, b.kv_f16, kv_f16_v, b.out,
+          /*layer_idx=*/0, start_pos, batch_size, kMaxContext, kNumHeads,
+          kNumKvHeads, kHeadDim)) {
     std::cerr << "tiled attention rejected the production shape\n";
     std::abort();
   }
@@ -237,7 +237,8 @@ int main() {
   std::cout << "Qwen split prefill attention ops test passed on gfx1151.\n";
   return 0;
 #else
-  std::cout << "HIP disabled, skipping Qwen split prefill attention ops test.\n";
+  std::cout
+      << "HIP disabled, skipping Qwen split prefill attention ops test.\n";
   return 77;
 #endif
 }

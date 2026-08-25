@@ -11,8 +11,8 @@
 // WindowedAttention are compiled into the shipped images, and every
 // WindowedAttention encoding returns success while writing nothing.
 //
-// So the prefix goes through AOTriton with no mask, the N x N diagonal keeps the
-// tiled kernel, and the two partial softmaxes are combined exactly:
+// So the prefix goes through AOTriton with no mask, the N x N diagonal keeps
+// the tiled kernel, and the two partial softmaxes are combined exactly:
 //
 //   m  = max(lse_a, lse_b)
 //   wa = exp(lse_a - m), wb = exp(lse_b - m)
@@ -20,8 +20,8 @@
 //
 // which is the standard flash-attention partition merge. Both halves return
 // normalized outputs and their log-sum-exp, so this is algebraically identical
-// to one softmax over the union of the key ranges. The SiLU gate is applied once
-// on the merged result, matching the unsplit kernel's epilogue.
+// to one softmax over the union of the key ranges. The SiLU gate is applied
+// once on the merged result, matching the unsplit kernel's epilogue.
 #if defined(ENGINE_ENABLE_HIP)
 #include <aotriton/flash.h>
 #include <aotriton/runtime.h>
@@ -55,11 +55,10 @@ __global__ void ConvertQueriesToHalfKernel(const float* __restrict__ q,
 // `lse_prefix` / `lse_diag` are [num_heads, batch] as AOTriton lays them out;
 // the tiled kernel writes the same shape.
 __global__ void MergeSplitAttentionKernel(
-    const __half* __restrict__ out_prefix,
-    const float* __restrict__ lse_prefix, const float* __restrict__ out_diag,
-    const float* __restrict__ lse_diag, const float* __restrict__ gate,
-    float* __restrict__ out, std::size_t batch, std::uint32_t num_heads,
-    std::uint32_t head_dim) {
+    const __half* __restrict__ out_prefix, const float* __restrict__ lse_prefix,
+    const float* __restrict__ out_diag, const float* __restrict__ lse_diag,
+    const float* __restrict__ gate, float* __restrict__ out, std::size_t batch,
+    std::uint32_t num_heads, std::uint32_t head_dim) {
   const std::uint32_t head = blockIdx.y;
   const std::size_t token = blockIdx.x;
   if (token >= batch || head >= num_heads) {
@@ -67,8 +66,8 @@ __global__ void MergeSplitAttentionKernel(
   }
   const std::size_t attention_width =
       static_cast<std::size_t>(num_heads) * head_dim;
-  const std::size_t row = (token * attention_width) +
-                          (static_cast<std::size_t>(head) * head_dim);
+  const std::size_t row =
+      (token * attention_width) + (static_cast<std::size_t>(head) * head_dim);
   const std::size_t stat = (static_cast<std::size_t>(head) * batch) + token;
 
   const float la = lse_prefix[stat];
@@ -125,10 +124,11 @@ bool LaunchQwenAotritonPrefixAttention(
   const std::uint64_t kv_width = heads_kv * dim;
 
   // Q and the output are [token][head][dim]; the FP16 KV cache is
-  // [position][kv_head][dim]. Both are expressed to AOTriton as strides over its
-  // canonical {batch, head, seqlen, dim} view.
+  // [position][kv_head][dim]. Both are expressed to AOTriton as strides over
+  // its canonical {batch, head, seqlen, dim} view.
   const std::array<std::uint64_t, 4> q_sizes{1, heads_q, seq_q, dim};
-  const std::array<std::uint64_t, 4> q_strides{seq_q * q_width, dim, q_width, 1};
+  const std::array<std::uint64_t, 4> q_strides{seq_q * q_width, dim, q_width,
+                                               1};
   const std::array<std::uint64_t, 4> kv_sizes{1, heads_kv, seq_k, dim};
   const std::array<std::uint64_t, 4> kv_strides{seq_k * kv_width, dim, kv_width,
                                                 1};
@@ -151,9 +151,8 @@ bool LaunchQwenAotritonPrefixAttention(
   params.Max_seqlen_k = static_cast<std::int32_t>(seq_k);
   params.dropout_p = 0.0F;
   params.encoded_softmax = TensorView<4>::get_null_tensor(DType::kFloat32);
-  params.persistent_atomic_counter =
-      TensorView<0>(reinterpret_cast<intptr_t>(AtomicCounter()),
-                    DType::kUInt32);
+  params.persistent_atomic_counter = TensorView<0>(
+      reinterpret_cast<intptr_t>(AtomicCounter()), DType::kUInt32);
   // The whole prefix is visible to every query in the chunk, so no mask.
   params.causal_type = aotriton::v3::flash::CausalType::None;
   params.varlen_type = aotriton::v3::flash::VarlenType::None;

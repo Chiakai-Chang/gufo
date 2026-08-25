@@ -103,8 +103,8 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   // Split prefill attention scratch (opt-c165-attn-split). Only the FP16
   // query/prefix planes are per-token; the log-sum-exp planes are tiny.
   const std::size_t attention_elements = batch * attention_size;
-  HIP_CHECK(hipMalloc(&d_attn_q_f16,
-                      attention_elements * sizeof(std::uint16_t)));
+  HIP_CHECK(
+      hipMalloc(&d_attn_q_f16, attention_elements * sizeof(std::uint16_t)));
   HIP_CHECK(hipMalloc(&d_attn_prefix_f16,
                       attention_elements * sizeof(std::uint16_t)));
   HIP_CHECK(hipMalloc(&d_attn_prefix_out, attention_elements * sizeof(float)));
@@ -472,11 +472,16 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_logits));
   if (d_attention_kv_f16 != nullptr)
     HIP_CHECK(hipFree(d_attention_kv_f16));
-  if (d_attn_lse_diag != nullptr) HIP_CHECK(hipFree(d_attn_lse_diag));
-  if (d_attn_lse_prefix != nullptr) HIP_CHECK(hipFree(d_attn_lse_prefix));
-  if (d_attn_prefix_out != nullptr) HIP_CHECK(hipFree(d_attn_prefix_out));
-  if (d_attn_prefix_f16 != nullptr) HIP_CHECK(hipFree(d_attn_prefix_f16));
-  if (d_attn_q_f16 != nullptr) HIP_CHECK(hipFree(d_attn_q_f16));
+  if (d_attn_lse_diag != nullptr)
+    HIP_CHECK(hipFree(d_attn_lse_diag));
+  if (d_attn_lse_prefix != nullptr)
+    HIP_CHECK(hipFree(d_attn_lse_prefix));
+  if (d_attn_prefix_out != nullptr)
+    HIP_CHECK(hipFree(d_attn_prefix_out));
+  if (d_attn_prefix_f16 != nullptr)
+    HIP_CHECK(hipFree(d_attn_prefix_f16));
+  if (d_attn_q_f16 != nullptr)
+    HIP_CHECK(hipFree(d_attn_q_f16));
   if (d_kv_cache != nullptr)
     HIP_CHECK(hipFree(d_kv_cache));
   if (d_ssm_conv_state != nullptr)
