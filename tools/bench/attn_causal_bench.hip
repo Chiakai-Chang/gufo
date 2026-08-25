@@ -410,12 +410,15 @@ constexpr std::uint32_t kWmmaKStride = kHeadDim + 8;
 
 // kQueryRows queries x kWmmaHeads heads form (kQueryRows / 16) * kWmmaHeads
 // 16-row blocks, and kKeys keys form kKeys / 16 key blocks. Their product is
-// pinned to 4 so the eight waves split as four S tiles x two halves of the head
-// dimension, which is what keeps Q in registers at 64 VGPRs. Growing kQueryRows
-// and shrinking kKeys in step therefore trades nothing in the tiling but halves
-// the K/V bytes each block pulls per query row -- the dominant cost.
-template<std::uint32_t kQueryRows, std::uint32_t kKeys, int kAblate>
-__launch_bounds__(256, 2) __global__
+// pinned to half the wave count, so the waves split as one S tile each over two
+// halves of the head dimension, which is what keeps Q in registers at 64 VGPRs.
+// Growing kQueryRows and shrinking kKeys in step therefore trades nothing in
+// the tiling but halves the K/V bytes each block pulls per query row -- the
+// dominant cost. Raising kWaves alongside kQueryRows keeps the O accumulator
+// per lane fixed while doing the same.
+template<std::uint32_t kQueryRows, std::uint32_t kKeys, std::uint32_t kWaves,
+         int kAblate>
+__launch_bounds__(kWaves * 32, 1) __global__
     void WmmaCausalAttention(const float* __restrict__ q,
                              const float* __restrict__ gate,
                              const __half* __restrict__ k_cache_f16,
@@ -426,16 +429,17 @@ __launch_bounds__(256, 2) __global__
                              std::uint32_t key_begin) {
   constexpr std::uint32_t kRowBlocks = (kQueryRows / 16) * kWmmaHeads;
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
+  constexpr std::uint32_t kThreads = kWaves * 32;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
-  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / (8 / kSTiles);
+  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / (kWaves / kSTiles);
   constexpr std::uint32_t kRows = kRowBlocks * 16;
-  constexpr std::uint32_t kOTilesPerWave = (kRowBlocks * kWmmaKSteps) / 8;
-  constexpr std::uint32_t kSoftmaxLanes = 256 / kRows;
+  constexpr std::uint32_t kDimTilesPerWave = kWmmaKSteps / kWaves;
+  constexpr std::uint32_t kSoftmaxLanes = kThreads / kRows;
   constexpr std::uint32_t kVtStride = kKeys + 8;
-  static_assert(kSTiles == 4, "eight waves cover four S tiles in two halves");
-  static_assert(kOTilesPerWave == 2 * kRowBlocks, "O tiles per wave");
+  static_assert(kSTiles * 2 == kWaves,
+                "the waves cover the S tiles in two head-dimension halves");
   static_assert(kKeys % 16 == 0 && kQueryRows % 16 == 0, "16-row WMMA tiles");
-  static_assert(kKStepsPerWave * 8 / kSTiles == kWmmaKSteps, "k split");
+  static_assert(kKStepsPerWave * (kWaves / kSTiles) == kWmmaKSteps, "k split");
   static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0,
                 "fragment rows must start on a 16-byte boundary");
   static_assert(kSoftmaxLanes * (kKeys / kSoftmaxLanes) == kKeys, "softmax");
@@ -502,8 +506,8 @@ __launch_bounds__(256, 2) __global__
 
   // This wave owns dim tiles `wave` and `wave + 8` for every row block, so both
   // halves of the head dimension stay evenly loaded.
-  v8f o_acc[kRowBlocks][2] = {};
-  for (std::uint32_t r = tid; r < kRows; r += 256) {
+  v8f o_acc[kRowBlocks][kDimTilesPerWave] = {};
+  for (std::uint32_t r = tid; r < kRows; r += kThreads) {
     row_max[r] = -INFINITY;
     row_sum[r] = 0.0F;
   }
@@ -518,7 +522,7 @@ __launch_bounds__(256, 2) __global__
     // V's global load is issued before the K staging and the whole S phase, and
     // parked in registers until the transpose. Issued at its point of use it
     // sits behind two barriers with nothing able to cover its latency.
-    constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (256 * 8);
+    constexpr std::uint32_t kVRegs = (kKeys * kHeadDim) / (kThreads * 8);
     uint4 v_raw[kVRegs];
     {
       const std::uint32_t v_key = lane % kKeys;
@@ -541,7 +545,8 @@ __launch_bounds__(256, 2) __global__
 
     // --- stage K (coalesced: a wave reads one key row's 512 contiguous bytes)
     ABLATE_SYNC();
-    for (std::uint32_t idx = tid; idx < kKeys * (kHeadDim / 8); idx += 256) {
+    for (std::uint32_t idx = tid; idx < kKeys * (kHeadDim / 8);
+         idx += kThreads) {
       const std::uint32_t key_row = idx / (kHeadDim / 8);
       const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
       const std::uint32_t key_position = key_start + key_row;
@@ -644,7 +649,7 @@ __launch_bounds__(256, 2) __global__
         scale[i] = row_scale[(rb * 16) + (2 * i) + half_id];
       }
 #pragma unroll
-      for (std::uint32_t t = 0; t < 2; ++t) {
+      for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
 #pragma unroll
         for (std::uint32_t i = 0; i < 8; ++i) {
           o_acc[rb][t][i] *= scale[i];
@@ -678,8 +683,8 @@ __launch_bounds__(256, 2) __global__
 
     // --- O += P V ---
 #pragma unroll
-    for (std::uint32_t t = 0; (kAblate != 3) && t < 2; ++t) {
-      const std::uint32_t dim_tile = wave + (t * 8);
+    for (std::uint32_t t = 0; (kAblate != 3) && t < kDimTilesPerWave; ++t) {
+      const std::uint32_t dim_tile = wave + (t * kWaves);
       v16h v_frag[kKeyBlocks];
 #pragma unroll
       for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
@@ -704,8 +709,8 @@ __launch_bounds__(256, 2) __global__
     const std::uint32_t query_head = row_block_head(rb);
     const std::uint32_t row_offset = row_block_offset(rb);
 #pragma unroll
-    for (std::uint32_t t = 0; t < 2; ++t) {
-      const std::uint32_t dim_tile = wave + (t * 8);
+    for (std::uint32_t t = 0; t < kDimTilesPerWave; ++t) {
+      const std::uint32_t dim_tile = wave + (t * kWaves);
 #pragma unroll
       for (std::uint32_t i = 0; i < 8; ++i) {
         const std::uint32_t row = (2 * i) + half_id;
@@ -893,6 +898,7 @@ int main(int argc, char** argv) {
   const dim3 tiled_block(32, 8);
   const dim3 wmma_grid16((batch + 15) / 16, kKvHeads * (kGqa / kWmmaHeads));
   const dim3 wmma_grid32((batch + 31) / 32, kKvHeads * (kGqa / kWmmaHeads));
+  const dim3 wmma_grid64((batch + 63) / 64, kKvHeads * (kGqa / kWmmaHeads));
 
   const auto run_tiled = [&] {
     TiledAttention<<<tiled_grid, tiled_block>>>(d_q, nullptr, d_k, d_v,
@@ -900,12 +906,12 @@ int main(int argc, char** argv) {
                                                 d_lse_ref, key_begin);
   };
   const auto run_wmma = [&] {
-    WmmaCausalAttention<16, 32, 0>
+    WmmaCausalAttention<16, 32, 8, 0>
         <<<wmma_grid16, 256>>>(d_q, nullptr, d_k, d_v, d_out_new, start_pos,
                                batch, d_lse_new, key_begin);
   };
   const auto run_wmma32 = [&] {
-    WmmaCausalAttention<32, 16, 0>
+    WmmaCausalAttention<32, 16, 8, 0>
         <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new, start_pos,
                                batch, d_lse_new, key_begin);
   };
@@ -987,6 +993,14 @@ int main(int argc, char** argv) {
          check ? &ref : nullptr);
   report("wmma 32 rows/block", TimeMs(iters, run_wmma), d_out_new, &ref);
   report("wmma 64 rows/block", TimeMs(iters, run_wmma32), d_out_new, &ref);
+  report("wmma 128 rows/block",
+         TimeMs(iters,
+                [&] {
+                  WmmaCausalAttention<64, 16, 16, 0><<<wmma_grid64, 512>>>(
+                      d_q, nullptr, d_k, d_v, d_out_new, start_pos, batch,
+                      d_lse_new, key_begin);
+                }),
+         d_out_new, &ref);
 
   // Phase pricing. These are deliberately incorrect; only the time is
   // meaningful.
@@ -994,7 +1008,7 @@ int main(int argc, char** argv) {
   report(NAME,                                                             \
          TimeMs(iters,                                                     \
                 [&] {                                                      \
-                  WmmaCausalAttention<32, 16, N><<<wmma_grid32, 256>>>(    \
+                  WmmaCausalAttention<32, 16, 8, N><<<wmma_grid32, 256>>>( \
                       d_q, nullptr, d_k, d_v, d_out_new, start_pos, batch, \
                       d_lse_new, key_begin);                               \
                 }),                                                        \
