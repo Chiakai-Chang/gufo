@@ -45,11 +45,13 @@ STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
         ("QuantGEMV", "gemm: quant gemv"),
         ("GEMVKernel", "gemm: gemv"),
         ("hipblas", "gemm: hipblas"),
+        ("DeltaNetPrep", "ssm: deltanet prologue"),
         ("DeltaNet", "ssm: deltanet recurrence"),
         ("SSMConv", "ssm: conv1d"),
         ("SSMPostNormGate", "ssm: post-norm gate"),
         ("SSM", "ssm: other"),
         ("Attention", "attention"),
+        ("attn_fwd", "attention: aotriton prefix"),
         ("QKNormRoPE", "attention: qk-norm+rope+kv"),
         ("RoPE", "attention: rope"),
         ("PackTiledAttentionKv", "attention: kv pack"),
@@ -76,6 +78,12 @@ def stage_of(name: str, stages: list[tuple[str, str]]) -> str:
 
 
 def short(name: str) -> str:
+    # A __global__ function with internal linkage (anonymous namespace) can reach
+    # the database with an empty display_name, which would otherwise silently
+    # collapse several kernels into one nameless row. Surface that instead of
+    # hiding it -- the fix belongs in the kernel, not here.
+    if not name or not name.strip():
+        return "<unnamed: internal-linkage kernel>"
     name = name.split("(")[0]
     for prefix in ("void ", "strix::hip::", "strix::"):
         name = name.replace(prefix, "")

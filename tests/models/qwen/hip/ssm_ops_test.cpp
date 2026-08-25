@@ -278,6 +278,176 @@ void TestBatchedSSMRecurrenceNormGateEquivalence() {
   HIP_CHECK(hipFree(d_out_fus));
 }
 
+// opt-c170-deltanet-rowsplit: the row-split recurrence spreads the 128 state
+// rows of a head over 16 waves and applies the k/q normalization scales to the
+// reduced dot products instead of to the 128-wide vectors. That is the same
+// arithmetic reassociated, so it must agree with the single-block kernel to
+// FP32 rounding over a full chunk -- including the carried state, which is what
+// accumulates any real error across tokens.
+//
+// Both register tiles are exercised: the launcher picks the 32-key/one-row tile
+// at or below 2048 tokens and the two-row prefetching tile above it.
+void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
+  constexpr std::uint32_t num_key_heads = 16;
+  constexpr std::uint32_t num_heads = 48;
+  constexpr std::uint32_t key_dim = 128;
+  constexpr std::uint32_t val_dim = 128;
+  constexpr std::size_t qkv_dim =
+      (2 * num_key_heads * key_dim) + (num_heads * val_dim);
+  constexpr std::size_t inner_size = num_heads * val_dim;
+  const std::size_t delta_size =
+      static_cast<std::size_t>(num_heads) * key_dim * val_dim;
+
+  std::cout << "Batched SSM row-split recurrence: batch=" << batch << "\n";
+
+  std::vector<float> h_qkv(batch * qkv_dim);
+  for (std::size_t i = 0; i < h_qkv.size(); ++i) {
+    h_qkv[i] = 0.6F * std::sin(0.017F * static_cast<float>(i % 997)) +
+               0.2F * std::cos(0.003F * static_cast<float>(i % 31));
+  }
+  std::vector<float> h_weights(qkv_dim * 4);
+  for (std::size_t i = 0; i < h_weights.size(); ++i) {
+    h_weights[i] = 0.2F + 0.05F * static_cast<float>(i % 7);
+  }
+  // Non-trivial decay and beta gates: with alpha and beta pinned to zero the
+  // recurrence degenerates to one decay value and the state carry is not
+  // tested.
+  std::vector<float> h_alpha(batch * num_heads);
+  std::vector<float> h_beta(batch * num_heads);
+  for (std::size_t i = 0; i < h_alpha.size(); ++i) {
+    h_alpha[i] = 1.5F + 0.5F * std::sin(0.011F * static_cast<float>(i % 401));
+    h_beta[i] = 0.3F * std::cos(0.007F * static_cast<float>(i % 211));
+  }
+  std::vector<float> h_ssm_a(num_heads);
+  std::vector<float> h_ssm_dt(num_heads);
+  for (std::uint32_t i = 0; i < num_heads; ++i) {
+    h_ssm_a[i] = -0.04F - 0.01F * static_cast<float>(i % 5);
+    h_ssm_dt[i] = 0.1F * static_cast<float>(i % 3);
+  }
+  std::vector<float> h_ssm_norm(val_dim);
+  for (std::size_t i = 0; i < val_dim; ++i) {
+    h_ssm_norm[i] = 0.9F + 0.05F * static_cast<float>(i % 23);
+  }
+  std::vector<float> h_gate(batch * inner_size);
+  for (std::size_t i = 0; i < h_gate.size(); ++i) {
+    h_gate[i] = 0.5F * std::sin(0.013F * static_cast<float>(i + 1));
+  }
+  // A non-zero starting state so the decay path is live from the first token.
+  std::vector<float> h_delta0(delta_size);
+  for (std::size_t i = 0; i < h_delta0.size(); ++i) {
+    h_delta0[i] = 0.01F * std::sin(0.013F * static_cast<float>(i % 577));
+  }
+
+  float *d_qkv = nullptr, *d_w = nullptr;
+  float *d_state_ref = nullptr, *d_state_new = nullptr;
+  float *d_conv_ref = nullptr, *d_conv_new = nullptr;
+  float *d_delta_ref = nullptr, *d_delta_new = nullptr;
+  float *d_alpha = nullptr, *d_beta = nullptr;
+  float *d_ssm_a = nullptr, *d_ssm_dt = nullptr, *d_ssm_norm = nullptr;
+  float* d_gate = nullptr;
+  float *d_out_ref = nullptr, *d_out_new = nullptr;
+  float *d_kq = nullptr, *d_ab = nullptr;
+
+  HIP_CHECK(hipMalloc(&d_qkv, batch * qkv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_w, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_state_ref, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_state_new, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_conv_ref, batch * qkv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_conv_new, batch * qkv_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_delta_ref, delta_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_delta_new, delta_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_alpha, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_beta, batch * num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_a, num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_dt, num_heads * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_norm, val_dim * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_gate, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_ref, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_out_new, batch * inner_size * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_kq, batch * num_key_heads * 3 * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ab, batch * num_heads * 2 * sizeof(float)));
+
+  const auto upload = [](float* dst, const std::vector<float>& src) {
+    HIP_CHECK(hipMemcpy(dst, src.data(), src.size() * sizeof(float),
+                        hipMemcpyHostToDevice));
+  };
+  upload(d_qkv, h_qkv);
+  upload(d_w, h_weights);
+  upload(d_alpha, h_alpha);
+  upload(d_beta, h_beta);
+  upload(d_ssm_a, h_ssm_a);
+  upload(d_ssm_dt, h_ssm_dt);
+  upload(d_ssm_norm, h_ssm_norm);
+  upload(d_gate, h_gate);
+  upload(d_delta_ref, h_delta0);
+  upload(d_delta_new, h_delta0);
+  HIP_CHECK(hipMemset(d_state_ref, 0, qkv_dim * 4 * sizeof(float)));
+  HIP_CHECK(hipMemset(d_state_new, 0, qkv_dim * 4 * sizeof(float)));
+
+  strix::hip::LaunchBatchedSSMConvRecurrence(
+      d_qkv, d_w, d_state_ref, d_conv_ref, d_delta_ref, d_alpha, d_beta,
+      d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_ref, 0, batch, qkv_dim,
+      num_key_heads, num_heads, key_dim, val_dim);
+
+  if (!strix::hip::IsDeltaNetRowSplitSupported(key_dim, val_dim)) {
+    std::cerr << "row-split recurrence rejected the production state shape\n";
+    std::abort();
+  }
+  strix::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
+      d_qkv, d_w, d_state_new, d_conv_new, d_delta_new, d_alpha, d_beta,
+      d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_new, d_kq, d_ab, 0, batch,
+      qkv_dim, num_key_heads, num_heads, key_dim, val_dim);
+
+  HIP_CHECK(hipDeviceSynchronize());
+
+  const auto download = [](std::vector<float>& dst, const float* src) {
+    HIP_CHECK(hipMemcpy(dst.data(), src, dst.size() * sizeof(float),
+                        hipMemcpyDeviceToHost));
+  };
+  std::vector<float> out_ref(batch * inner_size);
+  std::vector<float> out_new(batch * inner_size);
+  std::vector<float> delta_ref(delta_size);
+  std::vector<float> delta_new(delta_size);
+  download(out_ref, d_out_ref);
+  download(out_new, d_out_new);
+  download(delta_ref, d_delta_ref);
+  download(delta_new, d_delta_new);
+
+  const auto compare = [](const char* label, const std::vector<float>& want,
+                          const std::vector<float>& got) {
+    double max_abs = 0.0;
+    double magnitude = 0.0;
+    std::size_t non_finite = 0;
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      if (!std::isfinite(got[i])) {
+        ++non_finite;
+        continue;
+      }
+      max_abs = std::fmax(max_abs, std::fabs(static_cast<double>(got[i]) -
+                                             static_cast<double>(want[i])));
+      magnitude = std::fmax(magnitude, std::fabs(static_cast<double>(want[i])));
+    }
+    const double rel = (magnitude > 0.0) ? (max_abs / magnitude) : max_abs;
+    std::cout << "  " << label << ": max_abs=" << max_abs
+              << " magnitude=" << magnitude << " rel=" << rel
+              << " non_finite=" << non_finite << "\n";
+    if (non_finite != 0 || rel > 1e-5) {
+      std::cerr << label
+                << ": row-split recurrence disagrees with the single-block "
+                   "kernel\n";
+      std::abort();
+    }
+  };
+  compare("gated output", out_ref, out_new);
+  compare("carried state", delta_ref, delta_new);
+
+  for (float* p : {d_qkv, d_w, d_state_ref, d_state_new, d_conv_ref, d_conv_new,
+                   d_delta_ref, d_delta_new, d_alpha, d_beta, d_ssm_a, d_ssm_dt,
+                   d_ssm_norm, d_gate, d_out_ref, d_out_new, d_kq, d_ab}) {
+    HIP_CHECK(hipFree(p));
+  }
+}
+
 void TestFusedRMSNormSSMInputProjectionsEquivalence() {
   constexpr std::size_t hidden_size = 1024;
   constexpr std::size_t qkv_size = 2048;
@@ -433,6 +603,10 @@ int main() {
 
   TestBatchedSSMConvEquivalence();
   TestBatchedSSMRecurrenceNormGateEquivalence();
+  TestBatchedSSMRowSplitRecurrenceEquivalence(96);
+  // Above the launcher's 2048-token crossover, so the two-row prefetching tile
+  // runs too.
+  TestBatchedSSMRowSplitRecurrenceEquivalence(2080);
   TestFusedRMSNormSSMInputProjectionsEquivalence();
   std::cout << "Qwen ssm ops test passed on gfx1151.\n";
   return 0;

@@ -179,6 +179,11 @@ public:
   float* d_ssm_out{nullptr};
   float* d_alpha_buf{nullptr};
   float* d_beta_buf{nullptr};
+  // opt-c170-deltanet-rowsplit prologue scratch: 3 floats per (token, key head)
+  // for the k/q norms and the unnormalized k . q, and 2 floats per (token,
+  // value head) for the decay and beta gates.
+  float* d_ssm_kq_scales{nullptr};
+  float* d_ssm_alpha_beta{nullptr};
   float* d_logits{nullptr};
   void* d_attention_kv_f16{nullptr};
   float* d_kv_cache{nullptr};

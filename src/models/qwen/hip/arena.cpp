@@ -58,6 +58,10 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   HIP_CHECK(hipMalloc(&d_ssm_out, batch * recurrent_width * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_alpha_buf, batch * time_step_rank * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_beta_buf, batch * time_step_rank * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_kq_scales,
+                      batch * config_.ssm_group_count * 3 * sizeof(float)));
+  HIP_CHECK(
+      hipMalloc(&d_ssm_alpha_beta, batch * time_step_rank * 2 * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_logits, vocab_size * sizeof(float)));
   HIP_CHECK(hipMalloc(&d_prompt_tokens,
                       std::max<std::size_t>(batch, 2) * sizeof(std::uint32_t)));
@@ -217,6 +221,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ssm_out = other.d_ssm_out;
   d_alpha_buf = other.d_alpha_buf;
   d_beta_buf = other.d_beta_buf;
+  d_ssm_kq_scales = other.d_ssm_kq_scales;
+  d_ssm_alpha_beta = other.d_ssm_alpha_beta;
   d_logits = other.d_logits;
   d_attention_kv_f16 = other.d_attention_kv_f16;
   d_attn_lse_diag = other.d_attn_lse_diag;
@@ -266,6 +272,8 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_ssm_out = nullptr;
   other.d_alpha_buf = nullptr;
   other.d_beta_buf = nullptr;
+  other.d_ssm_kq_scales = nullptr;
+  other.d_ssm_alpha_beta = nullptr;
   other.d_logits = nullptr;
   other.d_attention_kv_f16 = nullptr;
   other.d_attn_lse_diag = nullptr;
@@ -321,6 +329,8 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ssm_out = other.d_ssm_out;
     d_alpha_buf = other.d_alpha_buf;
     d_beta_buf = other.d_beta_buf;
+    d_ssm_kq_scales = other.d_ssm_kq_scales;
+    d_ssm_alpha_beta = other.d_ssm_alpha_beta;
     d_logits = other.d_logits;
     d_attention_kv_f16 = other.d_attention_kv_f16;
     d_attn_lse_diag = other.d_attn_lse_diag;
@@ -370,6 +380,8 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_ssm_out = nullptr;
     other.d_alpha_buf = nullptr;
     other.d_beta_buf = nullptr;
+    other.d_ssm_kq_scales = nullptr;
+    other.d_ssm_alpha_beta = nullptr;
     other.d_logits = nullptr;
     other.d_attention_kv_f16 = nullptr;
     other.d_attn_lse_diag = nullptr;
@@ -468,6 +480,10 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_alpha_buf));
   if (d_beta_buf != nullptr)
     HIP_CHECK(hipFree(d_beta_buf));
+  if (d_ssm_kq_scales != nullptr)
+    HIP_CHECK(hipFree(d_ssm_kq_scales));
+  if (d_ssm_alpha_beta != nullptr)
+    HIP_CHECK(hipFree(d_ssm_alpha_beta));
   if (d_logits != nullptr)
     HIP_CHECK(hipFree(d_logits));
   if (d_attention_kv_f16 != nullptr)
@@ -538,6 +554,8 @@ void QwenGpuArena::FreeAll() noexcept {
   d_ssm_out = nullptr;
   d_alpha_buf = nullptr;
   d_beta_buf = nullptr;
+  d_ssm_kq_scales = nullptr;
+  d_ssm_alpha_beta = nullptr;
   d_logits = nullptr;
   d_attention_kv_f16 = nullptr;
   d_attn_lse_diag = nullptr;

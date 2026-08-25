@@ -8,10 +8,10 @@
 //       tools/bench/bf16_gemm_bench.hip -lhipblas -lhipblaslt \
 //       -o /tmp/bf16_gemm_bench
 //
-#include <hipblas/hipblas.h>
-#include <hipblaslt/hipblaslt.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
+#include <hipblaslt/hipblaslt.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -29,14 +29,14 @@
     }                                                                   \
   } while (0)
 
-#define BLAS_OK(expr)                                                       \
-  do {                                                                      \
-    hipblasStatus_t st_ = (expr);                                           \
-    if (st_ != HIPBLAS_STATUS_SUCCESS) {                                    \
-      std::fprintf(stderr, "%s:%d hipblas error %d\n", __FILE__, __LINE__,  \
-                   static_cast<int>(st_));                                  \
-      std::exit(1);                                                         \
-    }                                                                       \
+#define BLAS_OK(expr)                                                      \
+  do {                                                                     \
+    hipblasStatus_t st_ = (expr);                                          \
+    if (st_ != HIPBLAS_STATUS_SUCCESS) {                                   \
+      std::fprintf(stderr, "%s:%d hipblas error %d\n", __FILE__, __LINE__, \
+                   static_cast<int>(st_));                                 \
+      std::exit(1);                                                        \
+    }                                                                      \
   } while (0)
 
 template<typename Launch>
@@ -82,6 +82,10 @@ int main(int argc, char** argv) {
       {"ffn_down", 5120, 17408},
       {"ssm_qkv", 6144, 5120},
       {"ssm_out", 5120, 2048},
+      // The three tensors the Q8_K_XL artifact keeps at BF16, so these are the
+      // only shapes where the library GEMM is actually on the production path.
+      {"attn_q", 12288, 5120},
+      {"attn_k/v", 1024, 5120},
   };
 
   hipblasHandle_t blas = nullptr;
@@ -164,8 +168,8 @@ int main(int argc, char** argv) {
           const float ms = BenchMs(
               [&] {
                 hipblasLtMatmul(lt, op, &alpha, d_w, la, d_x, lb, &beta, d_y,
-                                lc, d_y, lc, &heur[i].algo, lt_ws,
-                                lt_ws_bytes, nullptr);
+                                lc, d_y, lc, &heur[i].algo, lt_ws, lt_ws_bytes,
+                                nullptr);
               },
               iters);
           if (ms < best) {
@@ -173,10 +177,10 @@ int main(int argc, char** argv) {
             best_i = i;
           }
         }
-        std::printf("%-13s %-14s %9.3f %9.2f %6.0f%%   (best of %d algos, #%d)\n",
-                    c.name, "hipblaslt", best, flops / (best * 1e-3) / 1e12,
-                    100.0 * (flops / (best * 1e-3) / 1e12) / kPeak, found,
-                    best_i);
+        std::printf(
+            "%-13s %-14s %9.3f %9.2f %6.0f%%   (best of %d algos, #%d)\n",
+            c.name, "hipblaslt", best, flops / (best * 1e-3) / 1e12,
+            100.0 * (flops / (best * 1e-3) / 1e12) / kPeak, found, best_i);
       } else {
         std::printf("%-13s %-14s      no heuristic\n", c.name, "hipblaslt");
       }

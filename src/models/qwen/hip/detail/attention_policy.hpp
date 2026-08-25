@@ -177,6 +177,49 @@ struct AttentionSupportParams {
          params.has_v_cache_f16 && params.has_scratch_f16;
 }
 
+/// Prefill DeltaNet recurrence backend preference. The production route is the
+/// row-split kernel (opt-c170-deltanet-rowsplit);
+/// `STRIX_SSM_RECURRENCE=baseline` pins the previous single-block kernel so it
+/// stays measurable in the same binary rather than only being reachable when a
+/// shape is unsupported.
+enum class SsmRecurrencePreference : std::uint8_t {
+  kAuto,
+  kRowSplit,
+  kBaseline,
+};
+
+[[nodiscard]] inline SsmRecurrencePreference ResolveSsmRecurrencePreference(
+    const char* value) noexcept {
+  if (value == nullptr) {
+    return SsmRecurrencePreference::kAuto;
+  }
+  const std::string_view text{value};
+  if (text == "rowsplit" || text == "row_split") {
+    return SsmRecurrencePreference::kRowSplit;
+  }
+  if (text == "baseline") {
+    return SsmRecurrencePreference::kBaseline;
+  }
+  return SsmRecurrencePreference::kAuto;
+}
+
+[[nodiscard]] inline SsmRecurrencePreference SsmRecurrencePreferenceFromEnv() {
+  static const SsmRecurrencePreference preference =
+      ResolveSsmRecurrencePreference(std::getenv("STRIX_SSM_RECURRENCE"));
+  return preference;
+}
+
+/// The row-split recurrence needs its two prologue scratch planes and the
+/// 128 x 128 per-head state tile the kernel's register geometry is built for.
+[[nodiscard]] inline bool ShouldUseSsmRowSplitRecurrence(bool shape_supported,
+                                                         bool scratch_ready) {
+  const SsmRecurrencePreference preference = SsmRecurrencePreferenceFromEnv();
+  if (preference == SsmRecurrencePreference::kBaseline) {
+    return false;
+  }
+  return shape_supported && scratch_ready;
+}
+
 /// Prefill attention backend preference. The production order is tiled, then
 /// Composable Kernel, then baseline; `STRIX_PREFILL_ATTENTION` pins one backend
 /// so the alternatives stay measurable in the same binary instead of only being

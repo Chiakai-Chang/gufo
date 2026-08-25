@@ -252,6 +252,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             (static_cast<std::size_t>(attn_layer_idx) * arena_.GetMaxContext() *
              kv_size);
         auto* layer_v_f16 = layer_k_f16 + total_k;
+
         // The tiled launcher owns the KV pack/sync, so run the diagonal first.
         const bool diagonal = LaunchBatchedAttentionTile(
             arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
@@ -391,7 +392,30 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // gate into the DeltaNet recurrence epilogue (one launch, no raw_out
       // global round trip). The unfused chain (recurrence +
       // BatchedSSMPostNormGateKernel) stays wired as the reference.
-      if (route_plan.fuse_ssm_epilogue) {
+      // opt-c170-deltanet-rowsplit: the recurrence is serial in the token index
+      // but independent across state rows, so hoisting the row-uniform k/q
+      // norms and gates into two tiny prologue kernels lets the 128 rows of a
+      // head spread over 16 waves instead of being pinned to one block behind
+      // four barriers per token. The previous single-block kernel stays wired
+      // as the reference and is selectable with STRIX_SSM_RECURRENCE=baseline.
+      const bool ssm_row_split = detail::ShouldUseSsmRowSplitRecurrence(
+          IsDeltaNetRowSplitSupported(config.ssm_state_size,
+                                      config.SsmValueSize()),
+          arena_.d_ssm_kq_scales != nullptr &&
+              arena_.d_ssm_alpha_beta != nullptr);
+      if (ssm_row_split) {
+        LaunchBatchedSSMConvRecurrenceRowSplit(
+            arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
+            arena_.d_ssm_conv_state, arena_.d_conv_out,
+            arena_.d_ssm_deltanet_state, arena_.d_alpha_buf, arena_.d_beta_buf,
+            static_cast<const float*>(layer.ssm_a.data),
+            static_cast<const float*>(layer.ssm_dt.data),
+            static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
+            arena_.d_ssm_out, arena_.d_ssm_kq_scales, arena_.d_ssm_alpha_beta,
+            l, batch_size, ssm_qkv_size, config.ssm_group_count,
+            config.ssm_time_step_rank, config.ssm_state_size,
+            config.SsmValueSize(), arena_.stream);
+      } else if (route_plan.fuse_ssm_epilogue) {
         LaunchBatchedSSMConvRecurrenceNormGate(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
             arena_.d_ssm_conv_state, arena_.d_conv_out,

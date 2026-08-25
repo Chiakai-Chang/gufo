@@ -47,6 +47,7 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_decode_recurrence.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_recurrence.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_row_split.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/swiglu.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/swiglu_rmsnorm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_batched.hip
