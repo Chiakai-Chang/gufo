@@ -1,5 +1,10 @@
 # Offline conversion toolchain (tools/)
 
+This page covers the offline weight-conversion and quantization pipeline only.
+The GPU performance tooling that also lives under `tools/` -- `tools/bench/`,
+`tools/prof.py`, and `tools/isa_mix.py` -- is documented in
+[docs/PERFORMANCE.md](../docs/PERFORMANCE.md) under "Commands".
+
 Python-only, torch-free serving. Never a transitive dependency of the server.
 Run inside `nix develop` (flake adds torch, transformers, safetensors,
 huggingface-hub, numpy, scipy, zstandard).

@@ -176,7 +176,78 @@ List cases, then run the smallest relevant matrix:
 The report includes raw HIP-event samples, summary latency, correctness
 sentinels, dispatch choices, and the privacy-safe machine fingerprint.
 
+### Roofline calibration
+
+Score every kernel against measured ceilings, not spec-sheet numbers. Build the
+standalone microbenchmarks and run the calibrator:
+
+```sh
+nix develop -c tools/bench/build.sh              # all of tools/bench/*.hip -> /tmp
+nix develop -c tools/bench/build.sh gfx1151_peak # or one by name
+/tmp/gfx1151_peak
+```
+
+It reports WMMA INT8/BF16 matrix rates, the VALU FP32 FMA rate, LDS read
+bandwidth, and DRAM read/write/copy, all from register-resident loops so the
+numbers reflect sustained clocks. The current values are recorded in
+[`benchmarks/qwen3.8-27b/README.md`](../benchmarks/qwen3.8-27b/README.md). The
+one that most often surprises: on RDNA3.5 **INT8 WMMA runs at the same rate as
+BF16**, so an INT8 kernel gets no matrix-rate advantage, only half the weight
+bytes.
+
+`tools/bench/build.sh` exists because `hipcc` invokes the raw HIP clang++ rather
+than the Nix cc wrapper, so it forwards the include and library paths that
+`nix develop` exports through `NIX_CFLAGS_COMPILE` / `NIX_LDFLAGS`. It also
+prints per-kernel VGPR, occupancy, spill, and LDS usage into
+`/tmp/<name>.res.txt`.
+
+### Kernel design iteration
+
+`tools/bench/` holds self-contained microbenchmarks with no repository headers,
+so a kernel variant compiles in seconds instead of through a full `nix build`.
+Each one carries an ablation harness: variants are measured against a reference
+implementation in the same binary and report both throughput and correctness, so
+a change is never promoted on speed alone.
+
+```sh
+nix develop -c tools/bench/build.sh w8a8_gemm_bench
+/tmp/w8a8_gemm_bench -b 2048 -i 5            # all shapes
+/tmp/w8a8_gemm_bench -b 2048 -c ffn_gate/up  # one shape
+
+/tmp/bf16_gemm_bench -b 2048     # hipBLAS / hipBLASLt bar to beat
+/tmp/aotriton_attn_bench -i 5    # AOTriton flash-attention capability probe
+```
+
+The `maxrel` column is relative error against the production kernel in the same
+run; `0.0e+00` means bit-identical. Winning variants are then ported into
+`src/` and re-validated through `nix build` plus their CTest oracle.
+
 ### Profiling
+
+`tools/prof.py` wraps `rocprofv3` and answers the three questions a flat kernel
+table cannot: which pipeline stage owns the time, whether the GPU is actually
+busy, and what changed between two runs.
+
+```sh
+# profile a command and analyze in one step
+nix develop -c python3 tools/prof.py run --stages qwen -- \
+  ./result/bin/strix-server bench --model "$MODEL" -p 2048 -n 0 -r 1
+
+# re-analyze an existing database
+nix develop -c python3 tools/prof.py show /tmp/prof/prof_results.db --top 20
+
+# A/B two runs, per stage and per kernel
+nix develop -c python3 tools/prof.py diff before_results.db after_results.db
+```
+
+`run` and `show` print a pipeline-stage rollup (kernel names grouped by model
+stage), a per-kernel table with launch geometry, GPU-busy-versus-wall-span with
+the idle percentage, and the largest idle gaps attributed to the dispatch on
+either side. A large idle share means launch- or host-bound; a small one means
+the remaining work is genuinely in the kernels. `--stages ''` disables grouping
+for a non-Qwen workload; `--json` emits the same data for scripting.
+
+For raw rocprofv3 with counters or ROCTx markers:
 
 ```sh
 nix develop -c rocprofv3 \
@@ -195,6 +266,25 @@ nix develop -c rocprofv3 \
 
 Use the emitted ROCTx case marker to isolate the measured region. Add selected
 PMC counters only in a separate diagnostic pass.
+
+### Instruction mix
+
+When a kernel is off its roofline, the instruction mix says why. `tools/isa_mix.py`
+groups one kernel's emitted instructions into matrix, VALU, LDS, global memory,
+and wait/barrier categories:
+
+```sh
+nix develop -c hipcc -O3 --offload-arch=gfx1151 -std=c++20 \
+  --cuda-device-only -S -o /tmp/k.s tools/bench/w8a8_gemm_bench.hip
+nix develop -c python3 tools/isa_mix.py /tmp/k.s            # list kernels
+nix develop -c python3 tools/isa_mix.py /tmp/k.s BlockedW8A8 # one kernel
+```
+
+Read the counts with care: the listing covers a whole kernel, so a once-per-block
+store epilogue is counted alongside the K loop that repeats hundreds of times.
+Attributing epilogue instructions to the inner loop led to one rejected
+experiment (`opt-c163-lowoverhead`); confirm a hypothesis with an ablation in the
+microbenchmark before acting on the mix.
 
 ### Offline tuning and replay
 
