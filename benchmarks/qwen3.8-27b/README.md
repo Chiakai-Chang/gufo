@@ -442,6 +442,7 @@ same effect at ambient scale.
 | `opt-c179-gemm-addressing` | Take the ISA mix of the blocked W8A8 GEMM -- 76% of prefill -- and remove whatever is not WMMA. Only **64 of its 2752 instructions** were `v_wmma`: about 309 were exec-mask manipulation (`s_and_saveexec_b32` 101, `s_or_b32` 100, `s_and_b32` 108) from per-thread bounds guards, and about 265 were 64-bit address arithmetic (`v_mad_u64_u32` 93, `v_add_co_u32` 86, `v_add_co_ci_u32_e64` 86) from recomputing `(r * num_blocks) + kb` every stage. Hoist every 64-bit base out of the K loop so a stage advance is a 32-bit add; clamp out-of-range rows and K blocks instead of branching, zeroing their *scale* so they contribute exactly zero; and make the tile store one uniform branch per 16x16 tile instead of eight per-lane predicates | Bit-identical -- the oracle reports `max_abs=0` on every shape, because `0 * dx * float(c)` is zero for any finite `c`, which is what zero-filling the operands produced before. Microbenchmark, three interleaved rounds at batch 2048: `ffn_gate/up` 11.415 -> 11.153 ms, `ffn_down` 11.525 -> 11.428, `ssm_qkv` 4.137 -> 3.938. Note the honest reading: removing 21% of the instruction stream buys about 2% in the microbenchmark, so this kernel is *not* instruction-issue bound. End to end the pair of `opt-c179` changes is worth much more than the microbenchmark predicted, and most of it lands on the short chunk: same-session A/B alternating builds twice, `pp512` 531.46 -> 549.81 (**+3.45%**) and `pp2048` 543.63 -> 549.17 (+1.02%). The gap is occupancy -- 6 to 8 waves per SIMD matters most where there are fewest blocks to hide latency with | **Retained** |
 | `opt-c179-gemm-bk2` | Halve the LDS stage to two K blocks. The four stage buffers drop from 36864 to 18432 bytes and occupancy rises from 6 to 8 waves per SIMD | Only reachable after the register pressure above was freed, and one more change: reading the token-tile operands one tile at a time inside the `j` loop instead of hoisting all four. Hoisting held 4 x (2 int32x4 + 1 float) = 36 extra VGPRs live across the whole WMMA block, and at BK=2 that tipped the kernel into **500 bytes/lane of scratch and a 4.3x regression** (47.9 vs 11.4 ms) -- measured, not predicted. With the loop restructured: 180 VGPRs, zero scratch, 8 waves/SIMD. Bit-identical, since the accumulation order over K blocks does not depend on how many of them a stage holds | **Retained** |
 | `opt-c178-attn-repriced` | Re-ablate the phases *after* the prefetch, to see what the kernel is limited by now | The limit moved and it is now depth-dependent. At depth 0 (2.527 ms) the K/V global loads have collapsed from 29% of the call to **7.2%**, and the two WMMA phases are 46% against a 0.94 ms arithmetic floor for the 51.56 GFLOP -- so the shallow case is close to genuinely WMMA-issue-bound, at 37% of the ceiling. At depth 8192 (23.745 ms) it inverts: removing the S WMMA saves only 9% and the PV WMMA 4.6%, while the global loads are 22% and V's LDS transpose about 19% (its ablation also dead-codes V's load, so the two must be read together). Softmax is 6.5% shallow and 1.6% at depth | **Retained** as the current picture; the remaining items are each under 20% with no clean fix |
+| `opt-c178-attn-depth2` | Prefetch two key tiles ahead instead of one. At depth the K/V reads miss the MALL, and the repricing above still puts the global loads at 22% of the call, so one tile of compute may not cover the latency | Worse at every depth: 2.82 vs 2.53 ms at depth 0, 24.8 vs 24.0 at 8192, 47.2 vs 45.2 at 16384. Three tiles ahead spills and halves throughput (5.13 ms at depth 0). The second buffer takes VGPRs 220 -> 253 and adds a second rotation copy per tile, and that costs more than the extra latency coverage returns. One tile ahead is the optimum | **Rejected** |
 | `opt-c178-attn-32key` | Double the key tile to 32, halving the number of times a block walks the per-key-tile dependency chain for the same K/V traffic. The eight-wave split cannot hold it, so 16 waves and 512 threads at the same 64 query rows | Decisively slower at every depth and stable across interleaved rounds: 4.27 vs 2.51 ms at depth 0, 36.1 vs 24.0 at 8192, 70.5 vs 70.5 against 45.8 at 16384. Doubling the key tile doubles the partial-score staging *and* the P tile, taking LDS to 41712 bytes -- one block per CU -- while every barrier now synchronizes 16 waves instead of 8. Fewer, more expensive traversals is the wrong trade | **Rejected** |
 | `opt-c178-attn-rows-bound` | Establish why K/V traffic per query row cannot be cut further, since that is what `opt-c177-attn-tiling` identified as the dominant cost and `opt-c177-attn-wide` failed to exploit | Paper, and it closes the family. Every block re-reads K and V for its visible range, so traffic falls only with more query rows per block -- and the O accumulator is 64 rows x 256 dims x 4 B = 64 KB per block, exactly 64 VGPRs per lane at 256 threads. Doubling the rows costs either occupancy (128 rows at 256 threads needs 128 VGPRs of O plus 64 of Q, and LDS then allows one block per CU) or LDS (128 rows at 512 threads doubles the partial-score staging to 16 KiB). Merging the three head-pairs of one KV head into one block, which would cut traffic 1.5x, needs three sets of O and Q simultaneously -- 384 VGPRs. And the eight-wave split only admits 2 query heads per block, because `kWaves = 2 * kSTiles` forces a power of two while GQA is 6, so 384- and 768-thread variants also break the even K/V staging. 64 rows per block is a register-file bound, not a tuning choice | **Rejected** as a direction |
 | `opt-c178-attn-occupancy` | Drop the V^T row padding so LDS falls from 23296 to 20192 bytes and three blocks fit per CU instead of two, buying 6 waves/SIMD against 4 | Slower at every depth (2.518 vs 2.500 ms at 0, 66.9-70.1 vs 46.1-51.6 at 16384). Without the 8-half pad a V fragment row starts every 16 halves, so the 16 lanes of a fragment read hit only 4 banks -- a 4-way conflict on the PV operand fetch, paid twice per wave per key tile. The padding is worth more than the extra resident waves | **Rejected** |
@@ -489,15 +490,21 @@ Same build, same model, same session. `llama-bench` run as
 | :--- | :---: | :---: | :---: | :---: |
 | **Decode `tg16`** | `7.15 tok/s` | `7.15 tok/s` | `7.15 tok/s` | `100%` |
 | **Sustained Memory Bandwidth** | `209.3 GB/s` | `209.3 GB/s` | `214.3 GB/s` | `97.6%` (86.8% of the measured 241 GB/s read ceiling) |
-| **Prefill `pp512`** | `317.47 tok/s` | **`535.12 +/- 0.79 tok/s`** | `308.49 tok/s` | **`173.5%`** |
-| **Prefill `pp2048`** | `314.09 tok/s` | **`544.03 +/- 2.88 tok/s`** | `354.47 tok/s` | **`153.5%`** |
+| **Prefill `pp512`** | `317.47 tok/s` | **`550.14 +/- 0.47 tok/s`** | `342.91 tok/s` | **`160.4%`** |
+| **Prefill `pp2048`** | `314.09 tok/s` | **`547.01 +/- 3.31 tok/s`** | `339.26 tok/s` | **`161.2%`** |
 
 Decode is unchanged by this work: none of it touches the decode kernels. The
 `7.46` figure recorded earlier was measured in a cooler session -- re-measuring
 both engines back to back in this session gives `7.15` for *both*, so decode is
 at exact parity rather than 97.6%.
 
-`pp2048` at 530.07 tok/s is 40% of the 1338 tok/s arithmetic ceiling the INT8
+Both engines were re-measured together for this row after `opt-c179`, which is
+why `llama-bench` moved too (308.49 -> 342.91 on `pp512`, 354.47 -> 339.26 on
+`pp2048`): its earlier numbers came from a different session, and the parity
+column is only meaningful when both sides are measured back to back. See the
+throttling note under the experiment log.
+
+`pp2048` at 547.01 tok/s is 41% of the 1338 tok/s arithmetic ceiling the INT8
 WMMA rate imposes.
 
 ### Context depth, Q8 artifact
@@ -509,22 +516,35 @@ prefix off the `v_dot2` kernel.
 
 | Depth | Strix `pp2048` | llama.cpp `pp2048` | Strix / llama.cpp |
 | ---: | ---: | ---: | ---: |
-| 0 | 546.68 | 354.47 | **1.54x** |
-| 4K | 515.10 | 331.43 | **1.55x** |
-| 8K | 489.65 | 309.21 | **1.58x** |
-| 16K | 441.38 | 259.73 | **1.70x** |
+| 0 | 547.01 | 339.26 | **1.61x** |
+| 4K | 519.53 | 313.41 | **1.66x** |
+| 8K | 495.87 | 308.34 | **1.61x** |
+| 16K | 452.41 | 269.01 | **1.68x** |
 
-Depth 0 to 16K costs 19.3% of throughput, against 27% for llama.cpp.
+Depth 0 to 16K costs **17.3%** of throughput, against 20.7% for llama.cpp in the
+same session.
 
-The slope is worth being precise about. It briefly widened to 20.0% after
-`opt-c170`, because the DeltaNet recurrence is depth-independent and speeding it
-up lifts depth 0 by more than depth 16K in relative terms. `opt-c177-attn-wmma`
-brought it back to 19.3% while raising every absolute number, because it replaces
-the depth-linear AOTriton prefix as well as the depth-independent diagonal: at
-depth 16384 the attention cost per layer falls 64.1 -> 50.48 ms, so the
-depth-dependent part of the curve shrinks along with the base. Flattening it much
-further means beating 17.4 TFLOPS on the prefix, which is now our own kernel's
-number rather than a third party's.
+Both sides are the better of two passes. The first depth point of a fresh process
+reads about 55% low (234 against 513 tok/s at 4K) because the KV cache allocation
+and its first touch land inside the timed run, and at 16K the two passes differ by
+4% on Strix and 5% on llama.cpp from APU throttling, so a single `-r 1` sweep is
+not a reliable absolute.
+
+The slope is worth being precise about. It was 19.5% before this session's work,
+briefly widened to 20.0% after `opt-c170` -- the DeltaNet recurrence is
+depth-independent, so speeding it up lifts depth 0 more than depth 16K in relative
+terms -- came back to 19.3% with `opt-c177-attn-wmma`, and reached 17.3% with
+`opt-c178-attn-prefetch`, whose gain rises monotonically with depth (+0.94% at 4K,
++1.47% at 8K, +1.69% at 16K) because that is where the attention stage is. Note
+`opt-c179` pushes the other way: it is depth-independent, so it lifts the whole
+curve and slightly *steepens* the relative slope while raising every absolute
+number.
+
+Flattening it further means beating 19.4 TFLOPS on the masked attention at depth,
+where the repricing in `opt-c178-attn-repriced` puts V's LDS transpose at ~19% and
+the global reads at ~22% of the call. Every structural alternative tried so far --
+more query rows, a bigger key tile, a coalesced V read, a deeper prefetch -- is
+recorded as rejected in the log above.
 
 Prefill numerical envelope for this artifact, batched versus sequential over the
 complete final-token vocabulary. `opt-c163-blocked-w8a8` is bit-identical to the
@@ -573,32 +593,44 @@ The model is 48 SSM + 16 full-attention layers (`full_attention_interval` 4),
 not 62 + 2: `BatchedSSMConvKernel` runs 48 times and
 `BatchedFusedQKNormRoPEKvWriteKernel` 16 times per pass.
 
-| Stage | ms/pass | % | Note |
+| Stage | d0 % | d8192 % | Note |
 | :--- | ---: | ---: | :--- |
-| GEMM: blocked W8A8 (every Q8_0 projection) | 3073 | 76.4% | ~59% of the 55.07 TOPS ceiling |
-| GEMM: hipBLASLt BF16 (`attn_q`, `attn_k`, `attn_v`) | 138 | 3.4% | 48-57% of peak, so nearly no headroom |
-| Attention (16 full-attention layers) | 126 | 3.1% | 4.36 TFLOPS, 8% of peak; ~12% of prefill at depth 8192 |
-| RMSNorm + residual + Q8_1 quantize | 111 | 2.8% | one fused pass where the consumers are Q8_0 |
-| SSM: DeltaNet recurrence + prologue | 81 | 2.0% | was 370 / 8.5% before `opt-c170-deltanet-rowsplit` |
-| FFN SwiGLU + Q8_1 quantize (fused) | 66 | 1.6% | bandwidth bound |
-| SSM conv1d | 26 | 0.7% | the post-norm gate is now part of the quantize pass |
+| GEMM: blocked W8A8 (every Q8_0 projection) | **80.1%** | **75.7%** | ~60% of the 55.07 TOPS ceiling after `opt-c179` |
+| GEMM: hipBLASLt BF16 (`attn_q`, `attn_k`, `attn_v`) | 5.4% | 5.3% | 48-57% of peak, so nearly no headroom |
+| Attention (16 full-attention layers) | 1.3% | 6.8% | 20.6 TFLOPS at d0, 19.4 at d8192; 35-37% of the WMMA ceiling |
+| SSM: DeltaNet recurrence + prologue | 3.2% | 3.0% | was 8.5% before `opt-c170-deltanet-rowsplit` |
+| FFN SwiGLU + Q8_1 quantize (fused) | 2.6% | 2.4% | bandwidth bound |
+| RMSNorm + residual + Q8_1 quantize | 2.3% | 2.1% | one fused pass where the consumers are Q8_0 |
+| SSM: post-norm gate + Q8_1 quantize | 1.5% | 1.4% | fused into the quantize pass by `opt-c174` |
+| SSM conv1d | 1.0% | 1.0% | |
+| Residual add | 0.8% | 0.9% | the one add left unfused |
+| Q/K norm + RoPE + KV write | 0.5% | 0.4% | |
 
-Total GPU kernel time for the pass fell 8.1% across `opt-c170`, `opt-c172` and
-`opt-c173`, which is why every surviving stage's *share* rose even where its
-absolute cost did not move. The FP32-to-BF16 convert stage is gone entirely.
+Captured with `tools/prof.py run` on the Q8_K_XL artifact, `-p 2048 -n 0 -r 1`,
+after `opt-c178` and `opt-c179`. Both profiles also contain one decode pass --
+the `W8A8BlockedWmmaGEMMKernel<128, 64, 4, 8, 1>` dispatches with a single token
+block, 2.1% of the depth-0 kernel time -- which is not part of the reported
+`pp2048`. Subtract them before reading a stage share as a fraction of prefill.
 
-At depth 8192 the pre-split profile put attention at 18.0%, which is why the
-depth lever and the depth-0 lever are different kernels.
+The model is 48 SSM + 16 full-attention layers (`full_attention_interval` 4), not
+62 + 2: `BatchedSSMConvKernel` runs 48 times and
+`BatchedFusedQKNormRoPEKvWriteKernel` 16 times per pass.
 
-Remaining ranked headroom at depth 0, from the profile above:
+Prompt processing is **not** launch bound. The raw idle figure is 8.9% of the
+depth-0 span, but 734 ms of the 755 ms sits in two gaps -- 610 ms between two
+`fillBufferAligned` calls and 124 ms at the model-load boundary -- both before
+steady state. Real inter-kernel idle during prefill is 0.25%, and at depth 8192
+the whole span is 1.3% idle.
+
+Remaining ranked headroom, from the profile above:
 
 | Candidate | Share | Note |
 | :--- | ---: | :--- |
-| Blocked W8A8 GEMM beyond 59% of peak | 76.1% | Appears to be a genuine plateau. Removing the dequant epilogue entirely only reaches 64%, occupancy is already 6 waves/SIMD (LDS limited, 128 KB per WGP), and both a wider macro tile and an addressing/guard rewrite were neutral or worse. The per-K-block scale application is the structural cost: about 128 VALU ops per 16 WMMA ops, forced by the Q8_0 per-32-element scale |
-| Prefill attention beyond 17.4 TFLOPS | 1.4% at depth 0, ~13% at 16K | Done once (`opt-c177-attn-wmma`, 4.58 -> 17.4 TFLOPS) and still the depth lever. 29-32% of the WMMA ceiling; ablation says the remaining cost is global request count, so the next steps are a V cache stored transposed, removing the 4x request inflation the transpose forces, or more than 64 query rows per block, which needs a wave assignment that keeps Q out of registers |
-| `opt-c163-coarse-dx` | -- | +7% on the GEMM for one activation scale per 128 elements instead of 32; gated on a quality run that does not exist yet |
+| Blocked W8A8 GEMM beyond 60% of peak | 75-80% | A genuine plateau, and `opt-c179` pinned why. The `-epi` ablation that reaches 64% removes only the 8 `dw * dx` multiplies of the 24 epilogue VALU ops per tile per K block, so that 6.7% *is* the price of a per-32-element activation scale on top of the per-32 weight scale. Two independent scale factors need two multiplies per output element, and no reassociation removes one: `(dw*dx)*c`, `dw*(dx*c)` and pre-multiplying all cost the same 64 products per K block. The only lever is a coarser activation scale, which is `opt-c163-coarse-dx` and a real precision change |
+| Prefill attention beyond 19-21 TFLOPS | 1.3% at d0, 6.8% at d8192 | 35-37% of the WMMA ceiling after `opt-c177` and `opt-c178`. The limit is now depth-dependent (`opt-c178-attn-repriced`): shallow it is close to WMMA-issue bound, at depth the V transpose (~19%) and the global reads (~22%) dominate. Rows per block is a register-file bound (`opt-c178-attn-rows-bound`), a bigger key tile is worse (`opt-c178-attn-32key`), and a coalesced V read regresses at depth (`opt-c178-attn-coalesced-v`) |
+| `opt-c163-coarse-dx` | -- | +7% on the GEMM, so about +5% of prefill, for one activation scale per stage instead of per 32 elements. Unlike every retained change so far this is a systematic precision reduction rather than a reassociation, so it needs an explicit quality decision, not just the envelope check |
 | DeltaNet recurrence beyond 2567 cycles/token | 3.0% | Now within 2.1x of the 1229-cycle FP32 VALU floor. The remaining gap is k/q cache traffic against register pressure, and the two obvious reformulations are both rejected above |
-| Folding the post-FFN residual into the next layer's pre-norm | 2.8% | The one residual add left unfused, because its consumer is the *next* layer's norm rather than one inside the same iteration. Worth about the 0.5% the post-attention fold was |
-| BF16 attention Q/K/V | 4.9% | Closed: hipBLASLt is already at 48-57% of peak here, so a hand-written kernel is worth about 0.8% of prefill (`opt-c172-bf16-gemm-ceiling`) |
+| BF16 attention Q/K/V | 5.3% | hipBLASLt is already at 48-57% of peak here, so a hand-written blocked BF16 kernel reaching the W8A8 kernel's 60% is worth about 0.3-1.3% of prefill (`opt-c172-bf16-gemm-ceiling`) |
+| Folding the post-FFN residual into the next layer's pre-norm | 0.9% | Measured and rejected (`opt-c175-residual-defer`): inside noise, because it trades a fast streaming pass for an LDS-limited one |
 
 

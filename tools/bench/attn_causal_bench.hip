@@ -786,7 +786,8 @@ __device__ __forceinline__ constexpr std::uint32_t VtRow(std::uint32_t d) {
 
 template<std::uint32_t kQueryRows, std::uint32_t kKeys, std::uint32_t kWaves,
          std::uint32_t kVtSwizzle, bool kPipeline, bool kPackedV = true,
-         std::uint32_t kVtPad = 8, int kAblate = 0>
+         std::uint32_t kVtPad = 8, int kAblate = 0,
+         std::uint32_t kDepth = 1>
 __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache_f16,
@@ -938,13 +939,20 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
     }
   };
 
+  // kDepth is how many key tiles ahead the K/V loads run. At depth the reads
+  // miss the MALL, so one tile of compute may not cover the latency; kDepth 2
+  // gives two, for one more pair of register buffers.
   constexpr std::uint32_t kVBuf = kPackedV ? 2 : kVRegs;
-  uint4 k_cur[kKRegs];
-  uint4 v_cur[kVBuf];
-  uint4 k_pre[kKRegs];
-  uint4 v_pre[kVBuf];
-  load_k(key_begin, k_cur);
-  load_v(key_begin, v_cur);
+  uint4 k_buf[kDepth + 1][kKRegs];
+  uint4 v_buf[kDepth + 1][kVBuf];
+#pragma unroll
+  for (std::uint32_t d = 0; d <= kDepth; ++d) {
+    const std::uint32_t start = key_begin + (d * kKeys);
+    if (d == 0 || start < max_visible) {
+      load_k(start, k_buf[d]);
+      load_v(start, v_buf[d]);
+    }
+  }
 
   for (std::uint32_t key_start = key_begin; key_start < max_visible;
        key_start += kKeys) {
@@ -956,15 +964,15 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
       const std::uint32_t key_row = idx / (kHeadDim / 8);
       const std::uint32_t d8 = (idx % (kHeadDim / 8)) * 8;
       *reinterpret_cast<uint4*>(&kv_lds[(key_row * kWmmaKStride) + d8]) =
-          k_cur[n];
+          k_buf[0][n];
     }
     __syncthreads();
 
-    // --- prefetch the next tile. Everything below covers its latency.
-    const std::uint32_t next_start = key_start + kKeys;
+    // --- prefetch kDepth tiles ahead. Everything below covers the latency.
+    const std::uint32_t next_start = key_start + (kDepth * kKeys);
     if (kPipeline && next_start < max_visible) {
-      load_k(next_start, k_pre);
-      load_v(next_start, v_pre);
+      load_k(next_start, k_buf[kDepth]);
+      load_v(next_start, v_buf[kDepth]);
     }
 
     // --- S = Q K^T ---
@@ -1059,8 +1067,8 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
     if (kAblate == 1) {
       // priced out
     } else if constexpr (kPackedV) {
-      const auto* lo = reinterpret_cast<const __half*>(&v_cur[0]);
-      const auto* hi = reinterpret_cast<const __half*>(&v_cur[1]);
+      const auto* lo = reinterpret_cast<const __half*>(&v_buf[0][0]);
+      const auto* hi = reinterpret_cast<const __half*>(&v_buf[0][1]);
 #pragma unroll
       for (std::uint32_t i = 0; i < 8; ++i) {
         const std::uint32_t packed =
@@ -1073,7 +1081,7 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
     } else {
 #pragma unroll
       for (std::uint32_t j = 0; j < kVRegs; ++j) {
-        const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
+        const auto* packed = reinterpret_cast<const __half*>(&v_buf[0][j]);
 #pragma unroll
         for (std::uint32_t i = 0; i < 8; ++i) {
           kv_lds[VtRow<kVtStride, kVtSwizzle>(s_dim + (j * 8) + i) + s_key] =
@@ -1106,16 +1114,19 @@ __launch_bounds__(kWaves * 32, 1) __global__ void WmmaCausalAttentionPipe(
 
     if (kPipeline) {
 #pragma unroll
-      for (std::uint32_t n = 0; n < kKRegs; ++n) {
-        k_cur[n] = k_pre[n];
-      }
+      for (std::uint32_t d = 0; d < kDepth; ++d) {
 #pragma unroll
-      for (std::uint32_t n = 0; n < kVBuf; ++n) {
-        v_cur[n] = v_pre[n];
+        for (std::uint32_t n = 0; n < kKRegs; ++n) {
+          k_buf[d][n] = k_buf[d + 1][n];
+        }
+#pragma unroll
+        for (std::uint32_t n = 0; n < kVBuf; ++n) {
+          v_buf[d][n] = v_buf[d + 1][n];
+        }
       }
     } else {
-      load_k(next_start, k_cur);
-      load_v(next_start, v_cur);
+      load_k(key_start + kKeys, k_buf[0]);
+      load_v(key_start + kKeys, v_buf[0]);
     }
   }
   __syncthreads();
@@ -1456,6 +1467,22 @@ int main(int argc, char** argv) {
   PIPE(16, true, false, 0, "pipe: prefetch, 3 blk/CU");
   PIPE(0, true, false, 0, "pipe: prefetch, pad0");
 #undef PIPE
+
+  // Prefetch distance. At depth the K/V reads miss the MALL, so one key tile of
+  // compute may not be enough to cover the latency.
+#define DEPTH(D, NAME)                                                   \
+  bench(                                                                 \
+      NAME,                                                              \
+      [&] {                                                              \
+        WmmaCausalAttentionPipe<32, 16, 8, 0, true, false, 8, 0, D>       \
+            <<<wmma_grid32, 256>>>(d_q, nullptr, d_k, d_v, d_out_new,     \
+                                   start_pos, batch, d_lse_new,          \
+                                   key_begin);                           \
+      },                                                                 \
+      d_out_new, &ref)
+  DEPTH(2, "pipe: prefetch depth 2");
+  DEPTH(3, "pipe: prefetch depth 3");
+#undef DEPTH
 
   // A 32-key tile halves the number of dependency-chain traversals per unit of
   // work. The eight-wave split cannot hold it, so this is 16 waves / 512
