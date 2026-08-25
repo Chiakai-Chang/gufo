@@ -194,6 +194,83 @@ __global__ void BatchedFusedRMSNormQuantizeQ8_1Kernel(
   }
 }
 
+// opt-c174-ssm-epilogue-quant: the SSM per-head post-RMSNorm + SiLU gate
+// writing the tiled Q8_1 activation directly.
+//
+// The gated output's only consumer is the Q8_0 `ssm_out` projection, so the
+// FP32 row was written and read straight back by the quantizer: 214 MB of round
+// trips per layer at batch 2048 against 114 MB for one pass. The head's value
+// dimension is a multiple of 32, so a block that owns one (head, token) already
+// owns whole quantization blocks and needs no extra communication.
+//
+// The RMS reduction is the same warp butterfly, the same four-way cross-warp
+// sum in the same order, and the same epsilon as BatchedSSMPostNormGateKernel,
+// so every gated value is bit-identical to that kernel; only the quantization
+// input changes from a re-read FP32 store to the register it came from, which
+// is the same value.
+__global__ void BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel(
+    const float* __restrict__ raw_out, const float* __restrict__ ssm_norm,
+    const float* __restrict__ gate, void* __restrict__ q8_out,
+    std::size_t batch_size, std::size_t inner_size, std::uint32_t num_heads,
+    std::uint32_t val_dim) {
+  const std::size_t h = blockIdx.x;
+  const std::size_t t = blockIdx.y;
+  if (h >= num_heads || t >= batch_size) {
+    return;
+  }
+
+  const std::size_t tid = threadIdx.x;
+  const std::size_t lane_id = tid & 31u;
+  const std::size_t warp_id = tid >> 5u;
+
+  const float* in_h = raw_out + (t * inner_size) + (h * val_dim);
+
+  const float in_val = (tid < val_dim) ? in_h[tid] : 0.0F;
+  float o_sq = in_val * in_val;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    o_sq += __shfl_xor(o_sq, offset);
+  }
+
+  __shared__ float s_warp_rms[4];
+  if (lane_id == 0) {
+    s_warp_rms[warp_id] = o_sq;
+  }
+  __syncthreads();
+
+  __shared__ float s_inv_rms;
+  if (tid == 0) {
+    const float total_o_sq =
+        s_warp_rms[0] + s_warp_rms[1] + s_warp_rms[2] + s_warp_rms[3];
+    const float mean_sq = total_o_sq / static_cast<float>(val_dim);
+    s_inv_rms = rsqrtf(mean_sq + 1e-6F);
+  }
+  __syncthreads();
+
+  if (tid >= val_dim) {
+    return;
+  }
+  const float normed = in_val * s_inv_rms;
+  const float w = (ssm_norm != nullptr) ? ssm_norm[tid] : 1.0F;
+  float val = normed * w;
+  if (gate != nullptr) {
+    const float g = (gate + (t * inner_size))[(h * val_dim) + tid];
+    const float sig = 1.0F / (1.0F + expf(-g));
+    val *= (g * sig);
+  }
+
+  // Each wave of the block owns one whole 32-element quantization block.
+  const std::size_t num_blocks = inner_size / 32;
+  const std::size_t blk = ((h * val_dim) + tid) / 32;
+  float max_abs = fabsf(val);
+  for (int off = 16; off > 0; off >>= 1) {
+    max_abs = fmaxf(max_abs, __shfl_xor(max_abs, off));
+  }
+  const float d = max_abs / 127.0F;
+  const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
+  const std::int8_t q = static_cast<std::int8_t>(roundf(val * id));
+  StoreQ8ActLane(q8_out, num_blocks, t, blk, lane_id, d, q);
+}
+
 /// Zeroes the tail of the last token tile so a batch that is not a multiple of
 /// 16 cannot feed uninitialized scales into the GEMM epilogue.
 __global__ void ZeroQ8ActTailKernel(void* __restrict__ y, std::size_t batch,
@@ -709,6 +786,29 @@ void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
                                    quant_threads, 0, stream>>>(
       reinterpret_cast<const hip_bfloat16*>(bf16_x), q8_1_out, batch, k);
   LaunchZeroQ8ActTail(q8_1_out, batch, k, stream);
+}
+
+bool IsFusedSSMEpilogueQuantizeQ8_1Supported(std::uint32_t val_dim,
+                                             std::size_t inner_size) noexcept {
+  // One block owns one (head, token) and quantizes its own whole blocks, so the
+  // value dimension has to be a multiple of 32 and fit the 128-thread block the
+  // RMS reduction is written for.
+  return val_dim != 0 && val_dim <= 128 && (val_dim % 32) == 0 &&
+         (inner_size % 32) == 0;
+}
+
+void LaunchBatchedFusedSSMPostNormGateQuantizeQ8_1(
+    const float* raw_out, const float* ssm_norm, const float* gate,
+    void* q8_1_out, std::size_t batch_size, std::size_t inner_size,
+    std::uint32_t num_heads, std::uint32_t val_dim, hipStream_t stream) {
+  if (batch_size == 0 || num_heads == 0 || val_dim == 0) {
+    return;
+  }
+  const dim3 grid(num_heads, static_cast<unsigned int>(batch_size));
+  BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel<<<grid, 128, 0, stream>>>(
+      raw_out, ssm_norm, gate, q8_1_out, batch_size, inner_size, num_heads,
+      val_dim);
+  LaunchZeroQ8ActTail(q8_1_out, batch_size, inner_size, stream);
 }
 
 bool IsFusedRMSNormQuantizeQ8_1Supported(std::size_t dim) noexcept {

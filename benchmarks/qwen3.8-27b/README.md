@@ -398,6 +398,7 @@ the decision, so rejected directions are not retried.
 
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
+| `opt-c174-ssm-epilogue-quant` | Have the SSM per-head post-RMSNorm + SiLU gate write the tiled Q8_1 activation directly. The head's value dimension is 128, a multiple of the 32-element quantization block, so the block that owns one (head, token) already owns whole blocks and needs no extra communication | The gated row's only consumer is the Q8_0 `ssm_out` projection, so the FP32 store was written and read straight back: 214 MB of round trips per layer at batch 2048 down to 114 MB. `pp512` 509.38 -> 513.17, `pp2048` 526.46 -> 530.07. Bit-identical to the FP32 epilogue plus a separate quantize -- 0 differing bytes of 14.4 M over a whole chunk, and the end-to-end prefill validation is byte-for-byte unchanged | **Retained** |
 | `opt-c173-norm-quant` | Have RMSNorm write the tiled Q8_1 activation directly, staging the row in LDS so one global read serves both the reduction and the normalization, and fold the post-attention residual add into the same pass. Enabled per layer only where every projection reading that norm is Q8_0, which is the SSM pre-norm and the FFN norm on this artifact | The FP32 normed row and the BF16 staging copy were both dead there: 221 MB of round trips per norm at batch 2048 down to 137 MB. `norm` stage 154 -> 19 ms, `residual` 137 -> 64 ms, against +98 ms in the fused kernel; `pp512` 502.32 -> 509.38, `pp2048` 516.42 -> 526.46. Bit-identical to `ResidualAdd` + `RMSNorm` + FP32 quantize, verified byte-for-byte over whole Q8_1 buffers including the per-block scales and the tail-tile zeroing, at batches on and off the 16-token tile | **Retained** |
 | `opt-c170-deltanet-rowsplit` | Split the DeltaNet state rows across blocks. The recurrence is serial in the token index but independent across state rows, so the k/q L2 norms and the decay/beta gates -- the only row-uniform work -- move into two tiny prologue kernels, and the recurrence itself becomes barrier-free. Scales are applied to the two reduced dot products instead of to the 128-wide vectors, so the kernel works on raw k and q | One layer pass at batch 2048: 7.40 -> 1.99 ms (3.72x), 9540 -> 2567 cycles/token against a 1229-cycle VALU floor. End to end `pp512` 477.66 -> 503.71, `pp2048` 491.52 -> 514.66 (+4.7%), total GPU kernel time -7.1%. Oracle agrees with the previous kernel at 2.9e-7 on the output and 2.6e-7 on the carried state; 200-token greedy output is token-identical | **Retained** |
 | `opt-c170-deltanet-tiles` | Sweep the per-lane register tile (keys per lane x rows per lane) and the block geometry | 32 keys / 1 row wins to 2048 tokens (2209-2567 cycles/token) and 32 keys / 2 rows with prefetch wins above it (2976-3017), because past a few thousand tokens the blocks drift far enough apart in the token index that halving the k/q traffic beats the extra registers. 64 keys/lane spills 140 VGPRs and costs 10x. Explicit prefetch *hurts* the small tile: with block-uniform addressing the compiler already schedules the loads, and the prefetch registers only cut occupancy | **Retained** as a two-tile launcher with the crossover at 2048 |
@@ -436,15 +437,15 @@ Same build, same model, same session. `llama-bench` run as
 | :--- | :---: | :---: | :---: | :---: |
 | **Decode `tg16`** | `7.15 tok/s` | `7.15 tok/s` | `7.15 tok/s` | `100%` |
 | **Sustained Memory Bandwidth** | `209.3 GB/s` | `209.3 GB/s` | `214.3 GB/s` | `97.6%` (86.8% of the measured 241 GB/s read ceiling) |
-| **Prefill `pp512`** | `317.47 tok/s` | **`509.38 +/- 0.33 tok/s`** | `308.49 tok/s` | **`165.1%`** |
-| **Prefill `pp2048`** | `314.09 tok/s` | **`526.46 +/- 3.46 tok/s`** | `354.47 tok/s` | **`148.5%`** |
+| **Prefill `pp512`** | `317.47 tok/s` | **`513.17 +/- 0.29 tok/s`** | `308.49 tok/s` | **`166.4%`** |
+| **Prefill `pp2048`** | `314.09 tok/s` | **`530.07 +/- 4.12 tok/s`** | `354.47 tok/s` | **`149.5%`** |
 
 Decode is unchanged by this work: none of it touches the decode kernels. The
 `7.46` figure recorded earlier was measured in a cooler session -- re-measuring
 both engines back to back in this session gives `7.15` for *both*, so decode is
 at exact parity rather than 97.6%.
 
-`pp2048` at 526.46 tok/s is 39% of the 1338 tok/s arithmetic ceiling the INT8
+`pp2048` at 530.07 tok/s is 40% of the 1338 tok/s arithmetic ceiling the INT8
 WMMA rate imposes.
 
 ### Context depth, Q8 artifact
@@ -456,10 +457,10 @@ prefix off the `v_dot2` kernel.
 
 | Depth | Strix `pp2048` | llama.cpp `pp2048` | Strix / llama.cpp |
 | ---: | ---: | ---: | ---: |
-| 0 | 524.63 | 354.47 | **1.48x** |
-| 4K | 484.06 | 331.43 | **1.46x** |
-| 8K | 459.56 | 309.21 | **1.49x** |
-| 16K | 419.98 | 259.73 | **1.62x** |
+| 0 | 532.20 | 354.47 | **1.50x** |
+| 4K | 494.25 | 331.43 | **1.49x** |
+| 8K | 468.63 | 309.21 | **1.52x** |
+| 16K | 425.70 | 259.73 | **1.64x** |
 
 Depth 0 to 16K costs 20% of throughput, against 27% for llama.cpp.
 
@@ -521,7 +522,7 @@ not 62 + 2: `BatchedSSMConvKernel` runs 48 times and
 | RMSNorm + residual + Q8_1 quantize | 111 | 2.8% | one fused pass where the consumers are Q8_0 |
 | SSM: DeltaNet recurrence + prologue | 81 | 2.0% | was 370 / 8.5% before `opt-c170-deltanet-rowsplit` |
 | FFN SwiGLU + Q8_1 quantize (fused) | 66 | 1.6% | bandwidth bound |
-| SSM post-norm gate / conv1d | 91 | 2.2% | |
+| SSM conv1d | 26 | 0.7% | the post-norm gate is now part of the quantize pass |
 
 Total GPU kernel time for the pass fell 8.1% across `opt-c170`, `opt-c172` and
 `opt-c173`, which is why every surviving stage's *share* rose even where its

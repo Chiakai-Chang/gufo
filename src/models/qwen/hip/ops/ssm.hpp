@@ -90,15 +90,18 @@ void LaunchBatchedSSMConvRecurrenceNormGate(
 /// post-RMSNorm/SiLU gate (opt-c170-deltanet-rowsplit). `kq_scales` holds
 /// 3 floats per (token, key head) and `alpha_beta` 2 floats per (token, value
 /// head); both are pure scratch. `out_buf` carries the recurrence output and is
-/// then normalized and gated in place.
+/// then normalized and gated in place. When `q8_out` is non-null the epilogue
+/// writes the tiled Q8_1 activation there instead of the FP32 row, which is
+/// valid only when nothing else reads the FP32 form.
 void LaunchBatchedSSMConvRecurrenceRowSplit(
     const float* qkv_in, const float* conv_weights, float* conv_state,
     float* conv_out, float* deltanet_state, const float* alpha_buf,
     const float* beta_buf, const float* ssm_a, const float* ssm_dt,
-    const float* ssm_norm, const float* gate, float* out_buf, float* kq_scales,
-    float* alpha_beta, std::uint32_t layer_idx, std::size_t batch_size,
-    std::size_t qkv_size, std::uint32_t num_key_heads, std::uint32_t num_heads,
-    std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream = nullptr);
+    const float* ssm_norm, const float* gate, float* out_buf, void* q8_out,
+    float* kq_scales, float* alpha_beta, std::uint32_t layer_idx,
+    std::size_t batch_size, std::size_t qkv_size, std::uint32_t num_key_heads,
+    std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
+    hipStream_t stream = nullptr);
 
 }  // namespace strix::hip
 

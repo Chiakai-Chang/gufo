@@ -395,8 +395,9 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
   }
   strix::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
       d_qkv, d_w, d_state_new, d_conv_new, d_delta_new, d_alpha, d_beta,
-      d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_new, d_kq, d_ab, 0, batch,
-      qkv_dim, num_key_heads, num_heads, key_dim, val_dim);
+      d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_new, /*q8_out=*/nullptr,
+      d_kq, d_ab, 0, batch, qkv_dim, num_key_heads, num_heads, key_dim,
+      val_dim);
 
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -440,6 +441,73 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
   };
   compare("gated output", out_ref, out_new);
   compare("carried state", delta_ref, delta_new);
+
+  // opt-c174-ssm-epilogue-quant: with a Q8_1 destination the epilogue quantizes
+  // the gated row in the same pass instead of storing FP32 for the quantizer to
+  // read back. That has to be byte-for-byte identical to the FP32 path followed
+  // by an FP32 quantize, including the per-block scales and the tail-tile
+  // zeros.
+  if (strix::hip::IsFusedSSMEpilogueQuantizeQ8_1Supported(val_dim,
+                                                          inner_size)) {
+    const std::size_t num_blocks = inner_size / 32;
+    const std::size_t q8_bytes =
+        ((((batch + 15) / 16) * num_blocks * 576)) + 4096;
+    void* d_q8_ref = nullptr;
+    void* d_q8_got = nullptr;
+    float* d_state_q8 = nullptr;
+    float* d_conv_q8 = nullptr;
+    float* d_delta_q8 = nullptr;
+    float* d_out_q8 = nullptr;
+    HIP_CHECK(hipMalloc(&d_q8_ref, q8_bytes));
+    HIP_CHECK(hipMalloc(&d_q8_got, q8_bytes));
+    HIP_CHECK(hipMalloc(&d_state_q8, qkv_dim * 4 * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_conv_q8, batch * qkv_dim * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_delta_q8, delta_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_out_q8, batch * inner_size * sizeof(float)));
+    HIP_CHECK(hipMemset(d_q8_ref, 0xA5, q8_bytes));
+    HIP_CHECK(hipMemset(d_q8_got, 0xA5, q8_bytes));
+
+    // Reference: the FP32 epilogue that just ran, quantized separately.
+    strix::hip::LaunchQuantizeActivationQ8_1FromFp32(d_out_new, d_q8_ref, batch,
+                                                     inner_size);
+
+    // Candidate: the same recurrence from the same starting state, but with the
+    // epilogue writing Q8_1.
+    HIP_CHECK(hipMemset(d_state_q8, 0, qkv_dim * 4 * sizeof(float)));
+    upload(d_delta_q8, h_delta0);
+    strix::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
+        d_qkv, d_w, d_state_q8, d_conv_q8, d_delta_q8, d_alpha, d_beta, d_ssm_a,
+        d_ssm_dt, d_ssm_norm, d_gate, d_out_q8, d_q8_got, d_kq, d_ab, 0, batch,
+        qkv_dim, num_key_heads, num_heads, key_dim, val_dim);
+    HIP_CHECK(hipDeviceSynchronize());
+
+    std::vector<std::uint8_t> q8_ref(q8_bytes);
+    std::vector<std::uint8_t> q8_got(q8_bytes);
+    HIP_CHECK(
+        hipMemcpy(q8_ref.data(), d_q8_ref, q8_bytes, hipMemcpyDeviceToHost));
+    HIP_CHECK(
+        hipMemcpy(q8_got.data(), d_q8_got, q8_bytes, hipMemcpyDeviceToHost));
+    std::size_t mismatches = 0;
+    for (std::size_t i = 0; i < q8_bytes; ++i) {
+      if (q8_ref[i] != q8_got[i]) {
+        ++mismatches;
+      }
+    }
+    std::cout << "  fused Q8_1 epilogue mismatching bytes: " << mismatches
+              << " of " << q8_bytes << "\n";
+    if (mismatches != 0) {
+      std::cerr << "fused SSM Q8_1 epilogue differs from the FP32 epilogue "
+                   "plus a separate quantize\n";
+      std::abort();
+    }
+
+    HIP_CHECK(hipFree(d_q8_ref));
+    HIP_CHECK(hipFree(d_q8_got));
+    HIP_CHECK(hipFree(d_state_q8));
+    HIP_CHECK(hipFree(d_conv_q8));
+    HIP_CHECK(hipFree(d_delta_q8));
+    HIP_CHECK(hipFree(d_out_q8));
+  }
 
   for (float* p : {d_qkv, d_w, d_state_ref, d_state_new, d_conv_ref, d_conv_new,
                    d_delta_ref, d_delta_new, d_alpha, d_beta, d_ssm_a, d_ssm_dt,

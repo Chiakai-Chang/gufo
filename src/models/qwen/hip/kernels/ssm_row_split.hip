@@ -52,6 +52,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
 namespace strix::hip {
@@ -352,10 +353,11 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     const float* qkv_in, const float* conv_weights, float* conv_state,
     float* conv_out, float* deltanet_state, const float* alpha_buf,
     const float* beta_buf, const float* ssm_a, const float* ssm_dt,
-    const float* ssm_norm, const float* gate, float* out_buf, float* kq_scales,
-    float* alpha_beta, std::uint32_t layer_idx, std::size_t batch_size,
-    std::size_t qkv_size, std::uint32_t num_key_heads, std::uint32_t num_heads,
-    std::uint32_t key_dim, std::uint32_t val_dim, hipStream_t stream) {
+    const float* ssm_norm, const float* gate, float* out_buf, void* q8_out,
+    float* kq_scales, float* alpha_beta, std::uint32_t layer_idx,
+    std::size_t batch_size, std::size_t qkv_size, std::uint32_t num_key_heads,
+    std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
+    hipStream_t stream) {
   const std::size_t block_size = 256;
   const std::size_t grid_x = (qkv_size + block_size - 1) / block_size;
   const dim3 conv_grid(static_cast<unsigned int>(grid_x),
@@ -400,12 +402,21 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
         batch_i, qkv_i, inner_i, kh_i, h_i);
   }
 
-  // In place, matching the unfused launcher: the post-norm kernel reads its
-  // input into registers before the block reduction, so no copy is needed.
-  const dim3 post_grid(num_heads, static_cast<unsigned int>(batch_size));
-  BatchedSSMPostNormGateKernel<<<post_grid, 128, 0, stream>>>(
-      out_buf, ssm_norm, gate, out_buf, batch_size, inner_size, num_heads,
-      val_dim);
+  // opt-c174-ssm-epilogue-quant: when the gated row's only consumer is the Q8_0
+  // ssm_out projection, the epilogue writes the quantized activation directly
+  // and the FP32 store plus its read-back disappear. Otherwise the post-norm
+  // gate runs in place, which is safe because it reads its input into registers
+  // before the block reduction.
+  if (q8_out != nullptr) {
+    LaunchBatchedFusedSSMPostNormGateQuantizeQ8_1(
+        out_buf, ssm_norm, gate, q8_out, batch_size, inner_size, num_heads,
+        val_dim, stream);
+  } else {
+    const dim3 post_grid(num_heads, static_cast<unsigned int>(batch_size));
+    BatchedSSMPostNormGateKernel<<<post_grid, 128, 0, stream>>>(
+        out_buf, ssm_norm, gate, out_buf, batch_size, inner_size, num_heads,
+        val_dim);
+  }
 }
 
 }  // namespace strix::hip

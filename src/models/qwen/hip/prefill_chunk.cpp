@@ -447,6 +447,13 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // head spread over 16 waves instead of being pinned to one block behind
       // four barriers per token. The previous single-block kernel stays wired
       // as the reference and is selectable with STRIX_SSM_RECURRENCE=baseline.
+      // opt-c174-ssm-epilogue-quant: the gated SSM row feeds only the Q8_0
+      // ssm_out projection, so the epilogue can emit the quantized activation
+      // and skip the FP32 round trip.
+      const bool ssm_epilogue_q8 =
+          layer.ssm_out.type == core::GgmlType::kQ8_0 &&
+          IsFusedSSMEpilogueQuantizeQ8_1Supported(config.SsmValueSize(),
+                                                  ssm_inner_size);
       const bool ssm_row_split = detail::ShouldUseSsmRowSplitRecurrence(
           IsDeltaNetRowSplitSupported(config.ssm_state_size,
                                       config.SsmValueSize()),
@@ -460,10 +467,11 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             static_cast<const float*>(layer.ssm_a.data),
             static_cast<const float*>(layer.ssm_dt.data),
             static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
-            arena_.d_ssm_out, arena_.d_ssm_kq_scales, arena_.d_ssm_alpha_beta,
-            l, batch_size, ssm_qkv_size, config.ssm_group_count,
-            config.ssm_time_step_rank, config.ssm_state_size,
-            config.SsmValueSize(), arena_.stream);
+            arena_.d_ssm_out,
+            ssm_epilogue_q8 ? arena_.d_scratch_q8_act : nullptr,
+            arena_.d_ssm_kq_scales, arena_.d_ssm_alpha_beta, l, batch_size,
+            ssm_qkv_size, config.ssm_group_count, config.ssm_time_step_rank,
+            config.ssm_state_size, config.SsmValueSize(), arena_.stream);
       } else if (route_plan.fuse_ssm_epilogue) {
         LaunchBatchedSSMConvRecurrenceNormGate(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -496,7 +504,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         t0 = t1;
       }
 
-      if (layer.ssm_out.type == core::GgmlType::kQ8_0) {
+      if (ssm_row_split && ssm_epilogue_q8) {
+        // The recurrence epilogue already wrote the quantized activation.
+      } else if (layer.ssm_out.type == core::GgmlType::kQ8_0) {
         LaunchQuantizeActivationQ8_1FromFp32(
             arena_.d_ssm_out, arena_.d_scratch_q8_act, batch_size,
             ssm_inner_size, arena_.stream);
