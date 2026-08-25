@@ -449,12 +449,25 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                     arena_.d_scratch_q8_act);
       }
 
-      LaunchBatchedSwiGLUActivation(
-          arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_ffn_act,
-          arena_.d_scratch_bf16, batch_size * intermediate_size, arena_.stream);
-      LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
-                                   arena_.d_scratch_q8_act, batch_size,
-                                   intermediate_size, arena_.stream);
+      // opt-c164-swiglu-quant: when ffn_down reads Q8_0 the only consumer of
+      // the activation is the quantized buffer, so SwiGLU can write it
+      // directly. That drops the FP32 activation and BF16 scratch round trips
+      // (about 500 MB per layer at batch 2048) and one kernel launch. Other
+      // ffn_down formats still need the FP32/BF16 forms, so they keep the
+      // unfused chain.
+      if (layer.ffn_down.type == core::GgmlType::kQ8_0) {
+        LaunchBatchedFusedSwiGLUQuantizeQ8_1(
+            arena_.d_ffn_gate, arena_.d_ffn_up, arena_.d_scratch_q8_act,
+            batch_size, intermediate_size, arena_.stream);
+      } else {
+        LaunchBatchedSwiGLUActivation(arena_.d_ffn_gate, arena_.d_ffn_up,
+                                      arena_.d_ffn_act, arena_.d_scratch_bf16,
+                                      batch_size * intermediate_size,
+                                      arena_.stream);
+        LaunchQuantizeActivationQ8_1(arena_.d_scratch_bf16,
+                                     arena_.d_scratch_q8_act, batch_size,
+                                     intermediate_size, arena_.stream);
+      }
     }
 
     gemm_weight(layer.ffn_down, arena_.d_scratch_bf16, arena_.d_ffn_act,

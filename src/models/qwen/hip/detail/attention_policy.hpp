@@ -3,6 +3,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <string_view>
 #include <utility>
 
 #include "src/models/qwen/hip/execution_policy.hpp"
@@ -175,6 +177,42 @@ struct AttentionSupportParams {
          params.has_v_cache_f16 && params.has_scratch_f16;
 }
 
+/// Prefill attention backend preference. The production order is tiled, then
+/// Composable Kernel, then baseline; `STRIX_PREFILL_ATTENTION` pins one backend
+/// so the alternatives stay measurable in the same binary instead of only being
+/// reachable when the preferred one rejects a shape.
+enum class PrefillAttentionPreference : std::uint8_t {
+  kAuto,
+  kTiled,
+  kComposableKernel,
+  kBaseline,
+};
+
+[[nodiscard]] inline PrefillAttentionPreference
+ResolvePrefillAttentionPreference(const char* value) noexcept {
+  if (value == nullptr) {
+    return PrefillAttentionPreference::kAuto;
+  }
+  const std::string_view text{value};
+  if (text == "tile" || text == "tiled") {
+    return PrefillAttentionPreference::kTiled;
+  }
+  if (text == "ck" || text == "composable_kernel") {
+    return PrefillAttentionPreference::kComposableKernel;
+  }
+  if (text == "baseline") {
+    return PrefillAttentionPreference::kBaseline;
+  }
+  return PrefillAttentionPreference::kAuto;
+}
+
+[[nodiscard]] inline PrefillAttentionPreference
+PrefillAttentionPreferenceFromEnv() {
+  static const PrefillAttentionPreference preference =
+      ResolvePrefillAttentionPreference(std::getenv("STRIX_PREFILL_ATTENTION"));
+  return preference;
+}
+
 /// Executes the existing prefill attention fallback chain without virtual
 /// dispatch: tiled, then Composable Kernel, then the baseline implementation.
 template<typename TiledLauncher, typename CkLauncher, typename BaselineLauncher>
@@ -182,11 +220,16 @@ inline void DispatchPrefillAttention(std::size_t visible_context,
                                      TiledLauncher&& launch_tiled,
                                      CkLauncher&& launch_ck,
                                      BaselineLauncher&& launch_baseline) {
-  if (ShouldAttemptOptimizedAttention(visible_context)) {
-    if (std::forward<TiledLauncher>(launch_tiled)()) {
+  const PrefillAttentionPreference preference =
+      PrefillAttentionPreferenceFromEnv();
+  if (preference != PrefillAttentionPreference::kBaseline &&
+      ShouldAttemptOptimizedAttention(visible_context)) {
+    if (preference != PrefillAttentionPreference::kComposableKernel &&
+        std::forward<TiledLauncher>(launch_tiled)()) {
       return;
     }
-    if (std::forward<CkLauncher>(launch_ck)()) {
+    if (preference != PrefillAttentionPreference::kTiled &&
+        std::forward<CkLauncher>(launch_ck)()) {
       return;
     }
   }

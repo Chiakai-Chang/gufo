@@ -403,7 +403,11 @@ the decision, so rejected directions are not retried.
 | `opt-c163-weight-repack` | Repack Q8_0 weights at load time into WMMA-native 16-row x 32-K tiles so weight loads are fully coalesced | 19.79 vs 19.39 TOPS -- within noise. Weight loading was never the limit, and a second weight copy would cost ~29 GB of unified memory | **Rejected** |
 | `opt-c163-gridswap` | Swap the GEMM grid so token tiles vary fastest, to keep the weight tile resident across token blocks | 13.22 vs 19.39 TOPS. With a 16-row macro tile each output cache line is only half written per block, so distant row tiles turn the stores into partial-line traffic | **Rejected** |
 | `opt-c163-blocked-dual` | Blocked dual gate/up GEMM (one shared activation stage feeding two weight matrices), 512 threads | 24.42 ms for both matrices vs 23.04 ms for two blocked singles and 24.26 ms for the current 16-row dual. Once BM is 128 the activation panel is already cheap, so sharing it buys nothing while doubling LDS and halving occupancy | **Rejected** as a throughput win; revisit only as a carrier for a fused SwiGLU epilogue |
-| `opt-c163-pipeline` | Prefetch the next K stage's weight blocks into registers so their global latency overlaps the WMMA work | 32.29 vs 31.69 TOPS (+1.9%), bit-identical, +14 VGPRs | **Candidate** -- small but free |
+| `opt-c163-pipeline` | Prefetch the next K stage's weight blocks into registers so their global latency overlaps the WMMA work | 32.29 vs 31.69 TOPS (+1.9%), bit-identical | **Retained** |
+| `opt-c163-dual-retire` | Route the FFN gate/up pair through two blocked single GEMMs and delete the 16-row dual kernel | Larger than the microbench predicted: the second launch reads the same 40 MB activation buffer straight out of MALL. Part of the +27% below | **Retained** |
+| `opt-c164-swiglu-quant` | Let SwiGLU write the tiled Q8_1 activation directly when `ffn_down` is Q8_0, instead of FP32 activation -> BF16 scratch -> quantize | Removes ~500 MB/layer of round-trip traffic and one launch per layer; SwiGLU stage 138 -> 99 ms/pass | **Retained** |
+| `opt-c165-aotriton-attn` | Replace the `v_dot2_f32_f16` prefill attention with AOTriton `v2::flash::attn_fwd` | GQA (24/4), head_dim 256, fp16 and bf16 all work and match a reference at 3e-4, but **`is_causal` is rejected on gfx11xx**: only `causal_type` None and WindowedAttention are compiled, and every WindowedAttention encoding tried returns success while writing zeros. Non-causal reaches 14.8-15.6 TFLOPS vs the tiled kernel's 4.36 on the causal half -- 3.2x even doing the full square | **Blocked** on causal; usable only via a non-causal prefix + causal diagonal split with an LSE merge |
+| `opt-c165-attn-ceiling` | Establish what prefill attention can reach at all | `v_dot2_f32_f16` peaks at 29.7 TFLOPS on this part, so the tiled kernel is at 15% of its *own* instruction ceiling, not just losing to WMMA. AOTriton (autotuned WMMA) reaches 15.6. Both paths converge near 15-20 TFLOPS, i.e. ~3.5-4.5x | **Paper** -- sets the target for a rewrite |
 | `opt-c163-coarse-dx` | One activation scale per LDS K stage (128 elements) instead of per 32-element block, so the epilogue drops from 3 to 2 VALU ops per output element | 33.99 vs 31.69 TOPS (+7%). Changes numerics: needs a prefill-validation and eval-quality gate before it can be considered | **Open** |
 
 Ablations on the retained kernel (`ffn_gate/up`, batch 2048) that bound what is
@@ -420,18 +424,29 @@ Same build, same model, same session. `llama-bench` run as
 | :--- | :---: | :---: | :---: | :---: |
 | **Decode `tg16`** | `7.46 tok/s` | `7.46 tok/s` | `7.64 tok/s` | `97.6%` |
 | **Sustained Memory Bandwidth** | `209.3 GB/s` | `209.3 GB/s` | `214.3 GB/s` | `97.6%` (86.8% of the measured 241 GB/s read ceiling) |
-| **Prefill `pp512`** | `317.47 tok/s` | **`370.54 tok/s`** | `308.49 tok/s` | **`120.1%`** |
-| **Prefill `pp1024`** | -- | **`390.05 tok/s`** | -- | -- |
-| **Prefill `pp2048`** | `314.09 tok/s` | **`387.66 tok/s`** | `350.54 tok/s` | **`110.6%`** |
+| **Prefill `pp512`** | `317.47 tok/s` | **`474.60 tok/s`** | `308.49 tok/s` | **`153.8%`** |
+| **Prefill `pp2048`** | `314.09 tok/s` | **`490.59 tok/s`** | `350.54 tok/s` | **`140.0%`** |
+
+Prefill is now 1.4-1.5x llama.cpp at depth 0, up from parity. `pp2048` at 490.59
+tok/s is 37% of the 1338 tok/s arithmetic ceiling the INT8 WMMA rate imposes.
 
 Prefill numerical envelope for this artifact, batched versus sequential over the
 complete final-token vocabulary. `opt-c163-blocked-w8a8` is bit-identical to the
 kernel it replaced, so these are unchanged by it and are the reference for
 future experiments:
 
-| Prompt | Matching top-1 | RMSE | Cosine similarity |
-| ---: | ---: | ---: | ---: |
-| 1024 tokens | 198 | 0.11404289 | 0.99923891 |
+| Revision | Matching top-1 | RMSE | Cosine similarity |
+| :--- | ---: | ---: | ---: |
+| before `opt-c163` | 198 | 0.11404289 | 0.99923891 |
+| after `opt-c163` (bit-identical GEMM) | 198 | 0.11404289 | 0.99923891 |
+| after `opt-c164-swiglu-quant` | 198 | 0.12026943 | 0.99917269 |
+
+`opt-c164-swiglu-quant` moves the envelope by 6e-5 in cosine because it removes
+the BF16 round trip the old chain put between SwiGLU and quantization. Top-1 is
+still identical on all 198 matching entries and every logit is finite, so it
+meets the acceptance contract; the direction of the change cannot be called an
+improvement or a regression from this metric alone, because the sequential
+reference is itself approximate.
 
 ### Prefill stage budget (`pp2048`, per pass)
 
@@ -439,15 +454,22 @@ Captured with `nix develop -c python3 tools/prof.py run -- ./result/bin/strix-se
 Idle time inside the dispatch span is 2.2%, so prompt processing is GPU bound,
 not launch bound.
 
+The model is 48 SSM + 16 full-attention layers (`full_attention_interval` 4),
+not 62 + 2: `BatchedSSMConvKernel` runs 48 times and
+`BatchedFusedQKNormRoPEKvWriteKernel` 16 times per pass.
+
 | Stage | ms/pass | % | Note |
 | :--- | ---: | ---: | :--- |
-| GEMM: FFN gate+up (dual, 16-row) | 2329 | 42.6% | 30.1 TOPS, 55% of peak |
-| GEMM: blocked W8A8 (all other projections) | 1782 | 32.6% | ~58% of peak |
-| SSM: DeltaNet recurrence | 365 | 6.7% | 48-block grid on 40 CUs; serial token scan |
-| GEMM: hipBLASLt BF16 (BF16 tensors) | 208 | 3.8% | 47% of peak |
-| Attention (2 full-attention layers) | 190 | 3.5% | ~4.5 TFLOPS, 8% of peak -- worst kernel, and quadratic in depth |
-| Quantize activations | 139 | 2.5% | bandwidth bound |
-| FFN SwiGLU | 138 | 2.5% | bandwidth bound |
-| RMSNorm / residual / convert / SSM epilogue | 257 | 4.8% | bandwidth bound |
+| GEMM: blocked W8A8 (every Q8_0 projection) | 3086 | 71.2% | ~59% of the 55.07 TOPS ceiling |
+| SSM: DeltaNet recurrence | 370 | 8.5% | 48-block grid on 40 CUs; serial token scan |
+| GEMM: hipBLASLt BF16 (BF16 tensors) | 210 | 4.8% | 47% of peak |
+| Attention (16 full-attention layers) | 190 | 4.4% | 4.36 TFLOPS, 8% of peak; 18% of prefill at depth 8192 |
+| FFN SwiGLU + Q8_1 quantize (fused) | 99 | 2.3% | bandwidth bound |
+| RMSNorm / residual / quantize / convert | 235 | 5.4% | bandwidth bound; fusion candidates |
+| SSM post-norm gate / conv1d | 88 | 2.0% | |
+
+At depth 8192 the same profile puts attention at 18.0% and the blocked GEMM at
+28.0% with the (then still 16-row) FFN dual at 35.9%, so attention is the depth
+lever and the GEMMs are the depth-0 lever.
 
 
