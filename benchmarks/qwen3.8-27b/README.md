@@ -406,7 +406,9 @@ the decision, so rejected directions are not retried.
 | `opt-c163-pipeline` | Prefetch the next K stage's weight blocks into registers so their global latency overlaps the WMMA work | 32.29 vs 31.69 TOPS (+1.9%), bit-identical | **Retained** |
 | `opt-c163-dual-retire` | Route the FFN gate/up pair through two blocked single GEMMs and delete the 16-row dual kernel | Larger than the microbench predicted: the second launch reads the same 40 MB activation buffer straight out of MALL. Part of the +27% below | **Retained** |
 | `opt-c164-swiglu-quant` | Let SwiGLU write the tiled Q8_1 activation directly when `ffn_down` is Q8_0, instead of FP32 activation -> BF16 scratch -> quantize | Removes ~500 MB/layer of round-trip traffic and one launch per layer; SwiGLU stage 138 -> 99 ms/pass | **Retained** |
-| `opt-c165-aotriton-attn` | Replace the `v_dot2_f32_f16` prefill attention with AOTriton `v2::flash::attn_fwd` | GQA (24/4), head_dim 256, fp16 and bf16 all work and match a reference at 3e-4, but **`is_causal` is rejected on gfx11xx**: only `causal_type` None and WindowedAttention are compiled, and every WindowedAttention encoding tried returns success while writing zeros. Non-causal reaches 14.8-15.6 TFLOPS vs the tiled kernel's 4.36 on the causal half -- 3.2x even doing the full square | **Blocked** on causal; usable only via a non-causal prefix + causal diagonal split with an LSE merge |
+| `opt-c165-attn-split` | Compute a prefill chunk at depth as two partial softmaxes -- AOTriton non-causal over the fully visible prefix plus the tiled causal kernel over the N x N diagonal -- merged exactly by log-sum-exp, with the SiLU gate applied once on the merged result | `pp2048 @ d8192` 345 -> 437 tok/s (+26.7%). Oracle test agrees with the unsplit kernel at 3e-4 relative across depths 1024/1500/4096, including a depth that is not a multiple of the 64-key tile | **Retained**, auto-enabled at prefix >= 1024 |
+| `opt-c165-aotriton-attn` | Replace the whole prefill attention with AOTriton `v2::flash::attn_fwd` | GQA (24/4), head_dim 256, fp16 and bf16 all work and match a reference at 3e-4, but **`is_causal` is rejected on gfx11xx**: only `causal_type` None and WindowedAttention are compiled, and every WindowedAttention encoding tried (including all six forced backend indices) returns success while writing zeros. Non-causal reaches 14.8-15.6 TFLOPS vs the tiled kernel's 4.36 on the causal half -- 3.2x even doing the full square | **Rejected** as a whole-kernel replacement; the usable part became `opt-c165-attn-split` |
+| `opt-c163-lowoverhead` | Hoist weight row pointers so the K loop is 32-bit, clamp out-of-range rows instead of branching, and make the store guard one uniform branch per tile | Neutral: 32.14 vs 32.10 TOPS. The address arithmetic and exec-mask instructions an ISA dump showed were in the store epilogue, which runs once per block, not in the K loop. Only `ssm_out` (the shortest K) gained, +8% | **Rejected** |
 | `opt-c165-attn-ceiling` | Establish what prefill attention can reach at all | `v_dot2_f32_f16` peaks at 29.7 TFLOPS on this part, so the tiled kernel is at 15% of its *own* instruction ceiling, not just losing to WMMA. AOTriton (autotuned WMMA) reaches 15.6. Both paths converge near 15-20 TFLOPS, i.e. ~3.5-4.5x | **Paper** -- sets the target for a rewrite |
 | `opt-c163-coarse-dx` | One activation scale per LDS K stage (128 elements) instead of per 32-element block, so the epilogue drops from 3 to 2 VALU ops per output element | 33.99 vs 31.69 TOPS (+7%). Changes numerics: needs a prefill-validation and eval-quality gate before it can be considered | **Open** |
 
@@ -427,8 +429,24 @@ Same build, same model, same session. `llama-bench` run as
 | **Prefill `pp512`** | `317.47 tok/s` | **`474.60 tok/s`** | `308.49 tok/s` | **`153.8%`** |
 | **Prefill `pp2048`** | `314.09 tok/s` | **`490.59 tok/s`** | `350.54 tok/s` | **`140.0%`** |
 
-Prefill is now 1.4-1.5x llama.cpp at depth 0, up from parity. `pp2048` at 490.59
-tok/s is 37% of the 1338 tok/s arithmetic ceiling the INT8 WMMA rate imposes.
+`pp2048` at 490.59 tok/s is 37% of the 1338 tok/s arithmetic ceiling the INT8
+WMMA rate imposes.
+
+### Context depth, Q8 artifact
+
+Same session, `-p 2048 -n 0 -r 1`. This replaces the earlier BF16-artifact depth
+table, where llama.cpp was 1.15-1.34x *faster*; that gap is now reversed at every
+depth, and the margin grows with depth because `opt-c165-attn-split` moves the
+prefix off the `v_dot2` kernel.
+
+| Depth | Strix `pp2048` | llama.cpp `pp2048` | Strix / llama.cpp |
+| ---: | ---: | ---: | ---: |
+| 0 | 487.15 | 354.47 | **1.37x** |
+| 4K | 456.07 | 331.43 | **1.38x** |
+| 8K | 434.83 | 309.21 | **1.41x** |
+| 16K | 399.77 | 259.73 | **1.54x** |
+
+Depth 0 to 16K costs only 18% of throughput, against 27% for llama.cpp.
 
 Prefill numerical envelope for this artifact, batched versus sequential over the
 complete final-token vocabulary. `opt-c163-blocked-w8a8` is bit-identical to the
@@ -468,8 +486,17 @@ not 62 + 2: `BatchedSSMConvKernel` runs 48 times and
 | RMSNorm / residual / quantize / convert | 235 | 5.4% | bandwidth bound; fusion candidates |
 | SSM post-norm gate / conv1d | 88 | 2.0% | |
 
-At depth 8192 the same profile puts attention at 18.0% and the blocked GEMM at
-28.0% with the (then still 16-row) FFN dual at 35.9%, so attention is the depth
-lever and the GEMMs are the depth-0 lever.
+At depth 8192 the pre-split profile put attention at 18.0%, which is why the
+depth lever and the depth-0 lever are different kernels.
+
+Remaining ranked headroom at depth 0, from the profile above:
+
+| Candidate | Share | Note |
+| :--- | ---: | :--- |
+| Blocked W8A8 GEMM 59% -> 70% of peak | 71.2% | Stall bound at 1 block/CU on 36 KB LDS, not issue bound: removing the epilogue entirely only reaches 64%. Needs an LDS reduction to fit 2 blocks/CU |
+| DeltaNet recurrence | 8.5% | 48-block grid, 7280 cycles/token against a ~200 cycle compute floor. Needs the chunkwise-parallel form to become matmul work |
+| `opt-c163-coarse-dx` | -- | +7% on the GEMM for one activation scale per 128 elements instead of 32; gated on a quality run |
+| BF16 attention Q/K/V through hipBLASLt | 4.8% | 47% of peak; a blocked BF16 WMMA kernel would be ~1.25x |
+| RMSNorm / residual / quantize / convert | 5.4% | Bandwidth bound; fuse RMSNorm directly into the tiled Q8_1 write |
 
 

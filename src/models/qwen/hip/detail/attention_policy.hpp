@@ -186,6 +186,7 @@ enum class PrefillAttentionPreference : std::uint8_t {
   kTiled,
   kComposableKernel,
   kBaseline,
+  kSplit,
 };
 
 [[nodiscard]] inline PrefillAttentionPreference
@@ -203,6 +204,9 @@ ResolvePrefillAttentionPreference(const char* value) noexcept {
   if (text == "baseline") {
     return PrefillAttentionPreference::kBaseline;
   }
+  if (text == "split") {
+    return PrefillAttentionPreference::kSplit;
+  }
   return PrefillAttentionPreference::kAuto;
 }
 
@@ -211,6 +215,30 @@ PrefillAttentionPreferenceFromEnv() {
   static const PrefillAttentionPreference preference =
       ResolvePrefillAttentionPreference(std::getenv("STRIX_PREFILL_ATTENTION"));
   return preference;
+}
+
+inline constexpr std::size_t kPrefillAttentionSplitMinPrefix{1024};
+
+/// The split prefill attention (AOTriton non-causal prefix plus the tiled
+/// causal diagonal) only pays off once the prefix is a meaningful share of the
+/// work: it costs one extra kernel plus an FP16 query conversion and a merge
+/// pass. Below the threshold, or with no prefix at all, the unsplit chain wins.
+[[nodiscard]] constexpr bool IsPrefillAttentionSplitProfitable(
+    std::uint32_t start_pos, std::size_t batch_size) noexcept {
+  return start_pos >= kPrefillAttentionSplitMinPrefix && batch_size >= 64;
+}
+
+[[nodiscard]] inline bool ShouldUsePrefillAttentionSplit(
+    std::uint32_t start_pos, std::size_t batch_size) {
+  const PrefillAttentionPreference preference =
+      PrefillAttentionPreferenceFromEnv();
+  if (preference == PrefillAttentionPreference::kSplit) {
+    return start_pos > 0 && batch_size > 0;
+  }
+  if (preference != PrefillAttentionPreference::kAuto) {
+    return false;
+  }
+  return IsPrefillAttentionSplitProfitable(start_pos, batch_size);
 }
 
 /// Executes the existing prefill attention fallback chain without virtual

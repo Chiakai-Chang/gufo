@@ -128,6 +128,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_attention_fusion_ops_test
     tests/models/qwen/hip/attention/qk_rope_kv_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;fusion;opt-c010-qk-rope-kv")
+  add_qwen_hip_test(qwen_attention_split_prefill_ops_test
+    tests/models/qwen/hip/attention/split_prefill_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;prefill;opt-c165-attn-split")
   add_qwen_hip_test(qwen_attention_projection_ops_test
     tests/models/qwen/hip/attention/projection_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;attention;ssm;projection;opt-c010-rmsnorm-projection")

@@ -196,6 +196,13 @@ public:
   hip_bfloat16* d_weights_bf16{nullptr};
   hip_bfloat16* d_weights_bf16_aux{nullptr};
   void* d_scratch_q8_act{nullptr};
+  // opt-c165-attn-split scratch: FP16 queries, the FP16 prefix attention
+  // result, and the two partial log-sum-exp planes.
+  void* d_attn_q_f16{nullptr};
+  void* d_attn_prefix_f16{nullptr};
+  float* d_attn_prefix_out{nullptr};
+  float* d_attn_lse_prefix{nullptr};
+  float* d_attn_lse_diag{nullptr};
 
   [[nodiscard]] std::uint32_t GetMaxBatch() const noexcept {
     return max_batch_;

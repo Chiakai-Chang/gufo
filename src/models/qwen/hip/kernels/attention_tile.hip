@@ -132,7 +132,8 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache_f16,
     const __half* __restrict__ v_cache_f16, float* __restrict__ out_context,
-    std::uint32_t start_pos, std::size_t batch_size) {
+    std::uint32_t start_pos, std::size_t batch_size,
+    float* __restrict__ lse_out, std::uint32_t key_begin) {
   const std::uint32_t lane = threadIdx.x;
   const std::uint32_t wave = threadIdx.y;
   const std::uint32_t query_start = blockIdx.x * kTileAttentionQueryRows;
@@ -199,7 +200,7 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
       start_pos + static_cast<std::uint32_t>(batch_size);
   const std::uint32_t max_visible =
       min(context_end, start_pos + query_start + kTileAttentionQueryRows);
-  for (std::uint32_t key_start = 0; key_start < max_visible;
+  for (std::uint32_t key_start = key_begin; key_start < max_visible;
        key_start += kTileAttentionKeyRows) {
     float scores[columns_per_wave][2] = {};
 #pragma unroll
@@ -355,7 +356,31 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
         first_query_head + (tiled_column % kTileAttentionHeadsPerBlock);
     const std::uint32_t local_query_position = query_start + query_offset;
     const float denominator = TileWaveReduceSum(running_sum[column]);
-    if (local_query_position >= batch_size || denominator == 0.0F) {
+    if (local_query_position >= batch_size) {
+      continue;
+    }
+    if (lse_out != nullptr && lane == 0) {
+      // log-sum-exp of this partial, in the [head, token] layout AOTriton uses.
+      lse_out[(static_cast<std::size_t>(query_head) * batch_size) +
+              local_query_position] =
+          (denominator > 0.0F) ? (running_max[column] + logf(denominator))
+                               : -INFINITY;
+    }
+    if (denominator == 0.0F) {
+      if (lse_out != nullptr) {
+#pragma unroll
+        for (std::uint32_t slot = 0; slot < kTileAttentionHalf2Dim / 32;
+             ++slot) {
+          const std::uint32_t dimension = 2 * (lane + (slot * 32));
+          const std::size_t output_offset =
+              (static_cast<std::size_t>(local_query_position) *
+               attention_width) +
+              (static_cast<std::size_t>(query_head) * kTileAttentionHeadDim) +
+              dimension;
+          out_context[output_offset] = 0.0F;
+          out_context[output_offset + 1] = 0.0F;
+        }
+      }
       continue;
     }
 #pragma unroll
@@ -367,9 +392,12 @@ __launch_bounds__(256, 3) __global__ void QwenTiledAttentionKernel(
           (static_cast<std::size_t>(query_head) * kTileAttentionHeadDim) +
           dimension;
       const float2 result = output[column][slot];
-      const float gate0 =
-          gate == nullptr ? 1.0F : 1.0F / (1.0F + expf(-gate[output_offset]));
-      const float gate1 = gate == nullptr
+      // When this is one half of a split the gate is applied once on the merged
+      // result instead, so only normalize here.
+      const float gate0 = (gate == nullptr || lse_out != nullptr)
+                              ? 1.0F
+                              : 1.0F / (1.0F + expf(-gate[output_offset]));
+      const float gate1 = (gate == nullptr || lse_out != nullptr)
                               ? 1.0F
                               : 1.0F / (1.0F + expf(-gate[output_offset + 1]));
       out_context[output_offset] = (result.x / denominator) * gate0;
@@ -383,7 +411,8 @@ bool LaunchBatchedAttentionTile(
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
     std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream) {
+    std::uint32_t num_kv_heads, std::uint32_t head_dim, hipStream_t stream,
+    float* lse_out, std::uint32_t key_begin, bool skip_kv_write) {
   const detail::AttentionSupportParams support_params{
       .batch_size = batch_size,
       .start_pos = start_pos,
@@ -409,7 +438,8 @@ bool LaunchBatchedAttentionTile(
   const dim3 pack_grid(
       static_cast<unsigned int>((kv_width + block_size - 1) / block_size),
       static_cast<unsigned int>(batch_size));
-  if (start_pos > 0 && k_cache != nullptr && v_cache != nullptr) {
+  if (!skip_kv_write && start_pos > 0 && k_cache != nullptr &&
+      v_cache != nullptr) {
     const dim3 sync_grid(
         static_cast<unsigned int>((kv_width + block_size - 1) / block_size),
         static_cast<unsigned int>(start_pos));
@@ -418,10 +448,12 @@ bool LaunchBatchedAttentionTile(
         static_cast<__half*>(v_cache_f16), layer_idx, start_pos, max_context,
         num_kv_heads, head_dim);
   }
-  PackTiledAttentionKvKernel<<<pack_grid, block_size, 0, stream>>>(
-      k, v, static_cast<__half*>(k_cache_f16),
-      static_cast<__half*>(v_cache_f16), k_cache, v_cache, layer_idx, start_pos,
-      batch_size, max_context);
+  if (!skip_kv_write) {
+    PackTiledAttentionKvKernel<<<pack_grid, block_size, 0, stream>>>(
+        k, v, static_cast<__half*>(k_cache_f16),
+        static_cast<__half*>(v_cache_f16), k_cache, v_cache, layer_idx,
+        start_pos, batch_size, max_context);
+  }
 
   const dim3 attention_grid(
       static_cast<unsigned int>((batch_size + kTileAttentionQueryRows - 1) /
@@ -430,7 +462,8 @@ bool LaunchBatchedAttentionTile(
           (kTileAttentionGqa / kTileAttentionHeadsPerBlock));
   const dim3 attention_block(32, 8);
   QwenTiledAttentionKernel<<<attention_grid, attention_block, 0, stream>>>(
-      q, gate, layer_k, layer_v, out_context, start_pos, batch_size);
+      q, gate, layer_k, layer_v, out_context, start_pos, batch_size, lse_out,
+      key_begin);
   return true;
 }
 

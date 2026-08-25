@@ -7,6 +7,7 @@
 #include "src/core/gguf_reader.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
@@ -98,13 +99,42 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
 /// Qwen3.8-specific causal GQA tile for gfx1151. The kernel processes 16 query
 /// positions and two query heads per block while reusing one FP16 K/V tile.
 /// Returns false for unsupported model shapes.
+/// `lse_out`, when non-null, makes this one half of a split attention: the
+/// kernel starts at `key_begin`, writes the partial log-sum-exp per
+/// [head, token], and leaves the SiLU gate to the merge step. `skip_kv_write`
+/// suppresses the KV-cache pack/sync when another half already did it.
 [[nodiscard]] bool LaunchBatchedAttentionTile(
     const float* q, const float* k, const float* v, const float* gate,
     float* k_cache, float* v_cache, void* k_cache_f16, void* v_cache_f16,
     float* out_context, std::uint32_t layer_idx, std::uint32_t start_pos,
     std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    hipStream_t stream = nullptr, float* lse_out = nullptr,
+    std::uint32_t key_begin = 0, bool skip_kv_write = false);
+
+/// Non-causal attention of every query in the chunk against the first
+/// `prefix_length` cached keys, through AOTriton's pretuned gfx11xx flash
+/// attention. Returns false if AOTriton rejects the shape.
+[[nodiscard]] bool LaunchQwenAotritonPrefixAttention(
+    const __half* q_half, const void* k_cache_f16, const void* v_cache_f16,
+    __half* out_prefix, float* lse_prefix, std::size_t batch_size,
+    std::uint32_t prefix_length, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
     hipStream_t stream = nullptr);
+
+/// Converts FP32 queries to FP16 in place-compatible [token][head][dim] order.
+void LaunchConvertQueriesToHalf(const float* q, void* q_half,
+                                std::size_t num_elements,
+                                hipStream_t stream = nullptr);
+
+/// Combines the prefix and diagonal partial attentions by log-sum-exp and
+/// applies the SiLU gate to the merged result.
+void LaunchMergeSplitAttention(const void* out_prefix, const float* lse_prefix,
+                               const float* out_diag, const float* lse_diag,
+                               const float* gate, float* out,
+                               std::size_t batch_size, std::uint32_t num_heads,
+                               std::uint32_t head_dim,
+                               hipStream_t stream = nullptr);
 
 /// Causal GQA through ROCm Composable Kernel. Inputs and outputs remain FP32
 /// at the executor boundary; the fused attention operator uses FP16 tiles with

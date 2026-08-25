@@ -239,6 +239,48 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       SelectedAttention selected_attention = SelectedAttention::kBaseline;
       bool tiled_rejected = false;
       bool ck_rejected = false;
+      // opt-c165-attn-split: at depth, the fully visible prefix is most of the
+      // attention work and needs no causal mask, so it goes through AOTriton's
+      // pretuned flash attention while the tiled kernel keeps only the N x N
+      // diagonal. The two partial softmaxes merge exactly by log-sum-exp.
+      bool split_attention = false;
+      if (detail::ShouldUsePrefillAttentionSplit(start_pos, batch_size)) {
+        LaunchConvertQueriesToHalf(arena_.d_q, arena_.d_attn_q_f16,
+                                   batch_size * attention_size, arena_.stream);
+        auto* layer_k_f16 =
+            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
+            (static_cast<std::size_t>(attn_layer_idx) * arena_.GetMaxContext() *
+             kv_size);
+        auto* layer_v_f16 = layer_k_f16 + total_k;
+        // The tiled launcher owns the KV pack/sync, so run the diagonal first.
+        const bool diagonal = LaunchBatchedAttentionTile(
+            arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
+            arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+            arena_.d_attention_kv_f16,
+            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+            arena_.d_attn_prefix_out, attn_layer_idx, start_pos, batch_size,
+            arena_.GetMaxContext(), config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, arena_.stream,
+            arena_.d_attn_lse_diag, start_pos, false);
+        if (diagonal &&
+            LaunchQwenAotritonPrefixAttention(
+                static_cast<const __half*>(arena_.d_attn_q_f16), layer_k_f16,
+                layer_v_f16,
+                static_cast<__half*>(arena_.d_attn_prefix_f16),
+                arena_.d_attn_lse_prefix, batch_size, start_pos,
+                config.num_attention_heads, config.num_key_value_heads,
+                config.head_dim, arena_.stream)) {
+          LaunchMergeSplitAttention(
+              arena_.d_attn_prefix_f16, arena_.d_attn_lse_prefix,
+              arena_.d_attn_prefix_out, arena_.d_attn_lse_diag,
+              arena_.d_ssm_gate, arena_.d_ssm_out, batch_size,
+              config.num_attention_heads, config.head_dim, arena_.stream);
+          split_attention = true;
+          detail::EmitAttentionDispatch("prefill_split_aotriton", "");
+        }
+      }
+
+      if (!split_attention) {
       detail::DispatchPrefillAttention(
           visible_context,
           [&] {
@@ -303,6 +345,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                 ? "prefill_tiled: rejected; prefill_composable_kernel: "
                   "rejected"
                 : "optimized_attention: rejected");
+      }
       }
 
       LaunchFloatToBfloat16(arena_.d_ssm_out, arena_.d_scratch_bf16,

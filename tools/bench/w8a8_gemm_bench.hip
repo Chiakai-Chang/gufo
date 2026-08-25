@@ -819,6 +819,224 @@ __launch_bounds__(256) __global__ void BlockedW8A8Pipe(
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Same blocking as BlockedW8A8Pipe, with the instruction overhead removed.
+//
+// An ISA dump of the pipelined kernel showed only 64 of 2669 instructions were
+// WMMA: the loop was dominated by 64-bit address arithmetic (v_mad_u64_u32 /
+// v_add_co pairs) and by exec-mask manipulation from per-thread bounds guards
+// (~300 s_and_saveexec / s_or / s_and). Two changes remove almost all of it:
+//
+//   * Row base pointers are hoisted out of the K loop and the in-loop index is
+//     32-bit, so a stage advance is a single 32-bit add.
+//   * Out-of-range weight rows are CLAMPED instead of branched, and their scale
+//     is zeroed with a select, so an out-of-range row contributes exactly zero
+//     with no divergence. The store keeps a guard, but as one uniform branch
+//     per 16x16 tile instead of eight per-lane predicates.
+// ---------------------------------------------------------------------------
+
+template<int BM, int BN, int BK, int WM, int WN>
+__launch_bounds__(256) __global__ void BlockedW8A8Fast(
+    const Q8_0Block* __restrict__ w, const std::int8_t* __restrict__ xq,
+    const float* __restrict__ xd, float* __restrict__ y, std::size_t batch_in,
+    std::size_t m_in, std::size_t k_in) {
+  static_assert(WM * WN == 8);
+  static_assert(BN / 16 <= 8);
+  constexpr int RS = BM / 16;
+  constexpr int TS = BN / 16;
+  constexpr int WRS = RS / WM;
+  constexpr int WTS = TS / WN;
+  constexpr int PF = (BM * BK) / 256;
+
+  __shared__ int32x4_t s_a[BK][RS][32];
+  __shared__ float s_dw[BK][RS][16];
+  __shared__ int32x4_t s_b[BK][TS][32];
+  __shared__ float s_dx[BK][TS][16];
+
+  const int batch = static_cast<int>(batch_in);
+  const int m = static_cast<int>(m_in);
+  const int num_kb = static_cast<int>(k_in / 32);
+
+  const int tid = static_cast<int>(threadIdx.x);
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int sl = lane & 15;
+  const int hi = lane >> 4;
+  const int wr = wave / WN;
+  const int wt = wave % WN;
+
+  const int r_block = static_cast<int>(blockIdx.y) * BM;
+  const int t_block = static_cast<int>(blockIdx.x) * BN;
+  const int tt_block = t_block / 16;
+
+  float acc[WRS][WTS][8];
+#pragma unroll
+  for (int i = 0; i < WRS; ++i) {
+#pragma unroll
+    for (int j = 0; j < WTS; ++j) {
+#pragma unroll
+      for (int l = 0; l < 8; ++l) {
+        acc[i][j][l] = 0.0F;
+      }
+    }
+  }
+
+  // Hoisted 64-bit bases: everything inside the K loop is a 32-bit offset.
+  const Q8_0Block* w_row[PF];
+  float row_live[PF];
+#pragma unroll
+  for (int p = 0; p < PF; ++p) {
+    const int rr = ((p * 256) + tid) / BK;
+    const int r = r_block + rr;
+    const int r_clamped = (r < m) ? r : (m - 1);
+    w_row[p] = w + (static_cast<std::size_t>(r_clamped) * num_kb);
+    row_live[p] = (r < m) ? 1.0F : 0.0F;
+  }
+  const int b_tile = wave;
+  const std::int8_t* b_base =
+      xq + (static_cast<std::size_t>(tt_block + b_tile) * num_kb * kTileBytes);
+  const float* bx_base =
+      xd + (static_cast<std::size_t>(tt_block + b_tile) * num_kb * kTileScales);
+  const bool b_live = b_tile < TS;
+
+  int32x4_t r_q0[PF];
+  int32x4_t r_q1[PF];
+  float r_dw[PF];
+  int32x4_t r_b[BK];
+  float r_dx[BK];
+
+  const auto fetch = [&](int kb0) {
+#pragma unroll
+    for (int p = 0; p < PF; ++p) {
+      const int kk = ((p * 256) + tid) % BK;
+      const int kb = kb0 + kk;
+      const int kb_clamped = (kb < num_kb) ? kb : (num_kb - 1);
+      const Q8_0Block& blk = w_row[p][kb_clamped];
+      __builtin_memcpy(&r_q0[p], blk.qs + 0, 16);
+      __builtin_memcpy(&r_q1[p], blk.qs + 16, 16);
+      const float live = (kb < num_kb) ? row_live[p] : 0.0F;
+      r_dw[p] = __half2float(blk.d) * live;
+    }
+    if (b_live) {
+#pragma unroll
+      for (int i = 0; i < BK; ++i) {
+        const int kb = kb0 + i;
+        const int kb_clamped = (kb < num_kb) ? kb : (num_kb - 1);
+        const auto* src = reinterpret_cast<const int32x4_t*>(
+            b_base + (static_cast<std::size_t>(kb_clamped) * kTileBytes));
+        r_b[i] = src[lane];
+        r_dx[i] = ((kb < num_kb) ? 1.0F : 0.0F) *
+                  bx_base[(kb_clamped * kTileScales) + (lane & 15)];
+      }
+    }
+  };
+
+  const auto commit = [&]() {
+#pragma unroll
+    for (int p = 0; p < PF; ++p) {
+      const int idx = (p * 256) + tid;
+      const int rr = idx / BK;
+      const int kk = idx % BK;
+      const int rs = rr / 16;
+      const int rl = rr % 16;
+      s_a[kk][rs][rl] = r_q0[p];
+      s_a[kk][rs][16 + rl] = r_q1[p];
+      s_dw[kk][rs][(rl % 2 == 0) ? (rl / 2) : (8 + (rl / 2))] = r_dw[p];
+    }
+    if (b_live) {
+#pragma unroll
+      for (int i = 0; i < BK; ++i) {
+        s_b[i][b_tile][lane] = r_b[i];
+        if (lane < 16) {
+          s_dx[i][b_tile][lane] = r_dx[i];
+        }
+      }
+    }
+  };
+
+  fetch(0);
+  for (int kb0 = 0; kb0 < num_kb; kb0 += BK) {
+    commit();
+    __syncthreads();
+    if (kb0 + BK < num_kb) {
+      fetch(kb0 + BK);
+    }
+#pragma unroll
+    for (int kb = 0; kb < BK; ++kb) {
+      int32x4_t a0[WRS];
+      int32x4_t a1[WRS];
+      float dw[WRS][8];
+#pragma unroll
+      for (int i = 0; i < WRS; ++i) {
+        const int rs = (wr * WRS) + i;
+        a0[i] = s_a[kb][rs][sl];
+        a1[i] = s_a[kb][rs][16 + sl];
+        const float4 lo = *reinterpret_cast<const float4*>(&s_dw[kb][rs][hi * 8]);
+        const float4 up =
+            *reinterpret_cast<const float4*>(&s_dw[kb][rs][(hi * 8) + 4]);
+        dw[i][0] = lo.x; dw[i][1] = lo.y; dw[i][2] = lo.z; dw[i][3] = lo.w;
+        dw[i][4] = up.x; dw[i][5] = up.y; dw[i][6] = up.z; dw[i][7] = up.w;
+      }
+#pragma unroll
+      for (int j = 0; j < WTS; ++j) {
+        const int ts = (wt * WTS) + j;
+        const int32x4_t b0 = s_b[kb][ts][sl];
+        const int32x4_t b1 = s_b[kb][ts][16 + sl];
+        const float dxv = s_dx[kb][ts][sl];
+#pragma unroll
+        for (int i = 0; i < WRS; ++i) {
+          int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
+          c = Wmma(a0[i], b0, c);
+          c = Wmma(a1[i], b1, c);
+#pragma unroll
+          for (int l = 0; l < 8; ++l) {
+            acc[i][j][l] += (dw[i][l] * dxv) * static_cast<float>(c[l]);
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  float* scratch = reinterpret_cast<float*>(&s_a[0][0][0]) + (wave * 256);
+#pragma unroll
+  for (int i = 0; i < WRS; ++i) {
+#pragma unroll
+    for (int j = 0; j < WTS; ++j) {
+#pragma unroll
+      for (int l = 0; l < 8; ++l) {
+        scratch[(sl * 16) + (2 * l) + hi] = acc[i][j][l];
+      }
+      __builtin_amdgcn_wave_barrier();
+      const int r0 = r_block + (((wr * WRS) + i) * 16);
+      const int t0 = t_block + (((wt * WTS) + j) * 16);
+      const std::size_t out_base =
+          (static_cast<std::size_t>(t0) * m) + static_cast<std::size_t>(r0);
+      // One uniform branch per tile instead of eight per-lane predicates.
+      if (t0 + 16 <= batch && r0 + 16 <= m) {
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+          const int flat = (s * 32) + lane;
+          y[out_base + (static_cast<std::size_t>(flat >> 4) * m) + (flat & 15)] =
+              scratch[flat];
+        }
+      } else {
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+          const int flat = (s * 32) + lane;
+          const int tok = t0 + (flat >> 4);
+          const int r = r0 + (flat & 15);
+          if (tok < batch && r < m) {
+            y[(static_cast<std::size_t>(tok) * m) + r] = scratch[flat];
+          }
+        }
+      }
+      __builtin_amdgcn_wave_barrier();
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Blocked dual GEMM: gate and up share one staged activation tile.
 //
@@ -1253,8 +1471,28 @@ int main(int argc, char** argv) {
            1);                                                               \
   }
     RUN_PIPE(128, 128, 4, 4, 2)
-    RUN_PIPE(128, 128, 2, 4, 2)
 #undef RUN_PIPE
+
+#define RUN_FAST(BM, BN, BK, WM, WN)                                         \
+  if (m % (BM) == 0) {                                                       \
+    const dim3 grid(static_cast<unsigned>((batch + (BN) - 1) / (BN)),         \
+                    static_cast<unsigned>((m + (BM) - 1) / (BM)));           \
+    char nm[64];                                                             \
+    std::snprintf(nm, sizeof(nm), "FAST %dx%dx%d w%dx%d", (BM), (BN), (BK),  \
+                  (WM), (WN));                                               \
+    report(nm,                                                               \
+           BenchMs(                                                          \
+               [&] {                                                         \
+                 BlockedW8A8Fast<(BM), (BN), (BK), (WM), (WN)>                \
+                     <<<grid, 256>>>(static_cast<const Q8_0Block*>(d_w),      \
+                                     d_xq, d_xd, d_y, batch, m, k);          \
+               },                                                            \
+               iters),                                                       \
+           1);                                                               \
+  }
+    RUN_FAST(128, 128, 4, 4, 2)
+    RUN_FAST(128, 128, 4, 2, 4)
+#undef RUN_FAST
 
     // Dual gate/up: one shared activation stage feeds two weight matrices.
     // Reported ms/TOPS are for BOTH matrices, so compare against 2x a single.
