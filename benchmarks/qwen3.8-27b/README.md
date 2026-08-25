@@ -421,6 +421,19 @@ about **1338 tok/s** on this part no matter how good the kernels are.
 Ordered newest first. Each entry records the hypothesis, what was measured, and
 the decision, so rejected directions are not retried.
 
+One measurement rule, learned the expensive way in `opt-c178`. A microbenchmark
+sweep that runs several variants back to back at depth 16384 heats the APU enough
+to penalize whichever variant runs last by **up to 45%**: across three rounds one
+variant read 59.2, 68.9 and 76.4 ms purely from its position in the list, while
+the variant that always ran first was stable to 2%. Any comparison whose variants
+are not interleaved -- and any single-shot before/after across two sessions -- is
+measuring the cooler on the left. Interleave candidates, take the minimum of
+several rounds, and A/B end-to-end changes by alternating the two *builds* rather
+than trusting a number recorded earlier. `tools/bench/attn_causal_bench.hip -v
+<name>` runs one variant for exactly this reason. This session's baseline read
+1-1.5% below the numbers in the tables below for the same commit, which is the
+same effect at ambient scale.
+
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
 | `opt-c178-attn-latency` | Find what the *WMMA* attention kernel is limited by, now that it has replaced the `v_dot2` one, by re-ablating each phase at depth | Exposed latency, not work or bandwidth. At batch 2048 depth 8192 the K/V global loads price at 33% of a 27.25 ms call and V's LDS transpose at 23%, but neither is a capacity limit: the kernel issues one WMMA per SIMD every 223 cycles against a ~64-cycle issue cost, so the SIMD is **idle 71% of the time**. 23 KB of LDS fits only two blocks per CU, which gives four waves per SIMD to cover a per-key-tile dependency chain (global load, barrier, stage K, barrier, S, barrier, softmax, barrier, transpose V, barrier, PV) that all eight waves of a block walk in lockstep, and whose head is a global load | **Retained** as the diagnosis that produced `opt-c178-attn-prefetch` |
