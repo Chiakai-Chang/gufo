@@ -1471,6 +1471,9 @@ int main(int argc, char** argv) {
            1);                                                               \
   }
     RUN_PIPE(128, 128, 4, 4, 2)
+    // The production kernel is this shape. BK=2 is the same structure with half
+    // the LDS stage, which is the one-template-argument version of the change.
+    RUN_PIPE(128, 128, 2, 4, 2)
 #undef RUN_PIPE
 
 #define RUN_FAST(BM, BN, BK, WM, WN, TH)                                     \
@@ -1493,6 +1496,15 @@ int main(int argc, char** argv) {
     RUN_FAST(128, 128, 4, 4, 2, 256)
     RUN_FAST(128, 256, 4, 4, 4, 512)
     RUN_FAST(256, 128, 4, 8, 2, 512)
+    // BK is the one parameter never swept, and it is what sets the LDS
+    // footprint: at BK=4 the four stage buffers are 36864 bytes, so few blocks
+    // fit per WGP and there is little to hide the WMMA -> convert -> fma chain
+    // behind. BK=2 halves the two int8 buffers, to 20480 bytes total, for a
+    // shallower prefetch.
+    // 128 rows over 512 threads needs BK >= 4 for a whole prefetch register per
+    // thread, so that combination is not expressible here.
+    RUN_FAST(128, 128, 2, 4, 2, 256)
+    RUN_FAST(256, 128, 2, 8, 2, 512)
 #undef RUN_FAST
 
     // Dual gate/up: one shared activation stage feeds two weight matrices.

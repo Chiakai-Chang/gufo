@@ -415,39 +415,57 @@ __launch_bounds__(256) __global__
   float r_dx[BK];
   const int b_tile = wave_id;  // one wave per token subtile
 
-  const auto fetch_stage = [&](std::size_t kb0) {
+  // opt-c179-gemm-addressing. An ISA dump of this kernel put only 64 of its
+  // 2752 instructions in WMMA: ~309 were exec-mask manipulation
+  // (`s_and_saveexec_b32` / `s_or_b32` / `s_and_b32`) from the per-thread
+  // bounds guards below, and ~265 were 64-bit address arithmetic
+  // (`v_mad_u64_u32`, `v_add_co_u32`) from recomputing `(r * num_blocks) + kb`
+  // per stage. Both go away here:
+  //
+  //   * Every 64-bit base is hoisted out of the K loop, so a stage advance is a
+  //     32-bit add.
+  //   * Out-of-range rows and K blocks are CLAMPED rather than branched, and
+  //     their *scale* is zeroed with a multiply. The epilogue then multiplies
+  //     by dw = 0, so an out-of-range row contributes exactly zero with no
+  //     divergence -- bit-identical to zero-filling the operands, because
+  //     0 * dx * float(c) is 0 for any finite c.
+  const int num_kb = static_cast<int>(num_blocks);
+  const int m_i = static_cast<int>(m);
+  const Q8_0Block* w_row[kPrefetch];
+  float row_live[kPrefetch];
+#pragma unroll
+  for (int p = 0; p < kPrefetch; ++p) {
+    const int r = static_cast<int>(r_block) + (((p * 256) + tid) / BK);
+    const int r_clamped = (r < m_i) ? r : (m_i - 1);
+    w_row[p] = w_blocks + (static_cast<std::size_t>(r_clamped) * num_blocks);
+    row_live[p] = (r < m_i) ? 1.0F : 0.0F;
+  }
+  const auto* b_base = reinterpret_cast<const std::int8_t*>(x_blocks) +
+                       ((tt_block + static_cast<std::size_t>(b_tile)) *
+                        num_blocks * kQ8ActTileBytes);
+  const bool b_live = b_tile < kTokTiles;
+
+  const auto fetch_stage = [&](int kb0) {
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
-      const int idx = (p * 256) + tid;
-      const std::size_t r = r_block + static_cast<std::size_t>(idx / BK);
-      const std::size_t kb = kb0 + static_cast<std::size_t>(idx % BK);
-      if (r < m && kb < num_blocks) {
-        const Q8_0Block& blk = w_blocks[(r * num_blocks) + kb];
-        __builtin_memcpy(&r_q0[p], blk.qs + 0, 16);
-        __builtin_memcpy(&r_q1[p], blk.qs + 16, 16);
-        r_dw[p] = __half2float(blk.d);
-      } else {
-        r_q0[p] = int32x4_t{0, 0, 0, 0};
-        r_q1[p] = int32x4_t{0, 0, 0, 0};
-        r_dw[p] = 0.0F;
-      }
+      const int kb = kb0 + (((p * 256) + tid) % BK);
+      const int kb_clamped = (kb < num_kb) ? kb : (num_kb - 1);
+      const Q8_0Block& blk = w_row[p][kb_clamped];
+      __builtin_memcpy(&r_q0[p], blk.qs + 0, 16);
+      __builtin_memcpy(&r_q1[p], blk.qs + 16, 16);
+      r_dw[p] = __half2float(blk.d) * ((kb < num_kb) ? row_live[p] : 0.0F);
     }
-    if (b_tile < kTokTiles) {
+    if (b_live) {
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
-        const std::size_t kb = kb0 + static_cast<std::size_t>(i);
-        if (kb < num_blocks) {
-          const auto* src = reinterpret_cast<const int32x4_t*>(
-              Q8ActTile(x_blocks, num_blocks,
-                        tt_block + static_cast<std::size_t>(b_tile), kb));
-          r_b[i] = src[lane_id];
-          r_dx[i] = reinterpret_cast<const float*>(
-              reinterpret_cast<const std::int8_t*>(src) +
-              kQ8ActScaleOffset)[lane_id & 15];
-        } else {
-          r_b[i] = int32x4_t{0, 0, 0, 0};
-          r_dx[i] = 0.0F;
-        }
+        const int kb = kb0 + i;
+        const int kb_clamped = (kb < num_kb) ? kb : (num_kb - 1);
+        const auto* tile =
+            b_base + (static_cast<std::size_t>(kb_clamped) * kQ8ActTileBytes);
+        r_b[i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
+        r_dx[i] = ((kb < num_kb) ? 1.0F : 0.0F) *
+                  reinterpret_cast<const float*>(
+                      tile + kQ8ActScaleOffset)[lane_id & 15];
       }
     }
   };
@@ -464,7 +482,7 @@ __launch_bounds__(256) __global__
       s_a[kk][rs][16 + rl] = r_q1[p];
       s_dw[kk][rs][(rl % 2 == 0) ? (rl / 2) : (8 + (rl / 2))] = r_dw[p];
     }
-    if (b_tile < kTokTiles) {
+    if (b_live) {
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
         s_b[i][b_tile][lane_id] = r_b[i];
@@ -476,10 +494,10 @@ __launch_bounds__(256) __global__
   };
 
   fetch_stage(0);
-  for (std::size_t kb0 = 0; kb0 < num_blocks; kb0 += BK) {
+  for (int kb0 = 0; kb0 < num_kb; kb0 += BK) {
     commit_stage();
     __syncthreads();
-    if (kb0 + BK < num_blocks) {
+    if (kb0 + BK < num_kb) {
       fetch_stage(kb0 + BK);
     }
 
@@ -506,27 +524,25 @@ __launch_bounds__(256) __global__
         dw[i][6] = up.z;
         dw[i][7] = up.w;
       }
-      int32x4_t b0[kWaveTokTiles];
-      int32x4_t b1[kWaveTokTiles];
-      float dx[kWaveTokTiles];
+      // The token-tile operands are read one tile at a time, inside the j loop,
+      // rather than all kWaveTokTiles of them up front. Hoisting them held
+      // 4 x (2 int32x4 + 1 float) = 36 extra VGPRs live across the whole WMMA
+      // block, which is what pushed a BK=2 stage into 500 bytes/lane of
+      // scratch.
 #pragma unroll
       for (int j = 0; j < kWaveTokTiles; ++j) {
         const int ts = (wave_tok * kWaveTokTiles) + j;
-        b0[j] = s_b[kb][ts][sub_lane];
-        b1[j] = s_b[kb][ts][16 + sub_lane];
-        dx[j] = s_dx[kb][ts][sub_lane];
-      }
-
+        const int32x4_t b0 = s_b[kb][ts][sub_lane];
+        const int32x4_t b1 = s_b[kb][ts][16 + sub_lane];
+        const float dx = s_dx[kb][ts][sub_lane];
 #pragma unroll
-      for (int i = 0; i < kWaveRowTiles; ++i) {
-#pragma unroll
-        for (int j = 0; j < kWaveTokTiles; ++j) {
+        for (int i = 0; i < kWaveRowTiles; ++i) {
           int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
-          c = Wmma_16x16x16_iu8<true>(a0[i], b0[j], c);
-          c = Wmma_16x16x16_iu8<true>(a1[i], b1[j], c);
+          c = Wmma_16x16x16_iu8<true>(a0[i], b0, c);
+          c = Wmma_16x16x16_iu8<true>(a1[i], b1, c);
 #pragma unroll
           for (int l = 0; l < 8; ++l) {
-            acc[i][j][l] += (dw[i][l] * dx[j]) * static_cast<float>(c[l]);
+            acc[i][j][l] += (dw[i][l] * dx) * static_cast<float>(c[l]);
           }
         }
       }
@@ -554,13 +570,25 @@ __launch_bounds__(256) __global__
       const std::size_t t0 =
           t_block +
           static_cast<std::size_t>((((wave_tok * kWaveTokTiles) + j) * 16));
+      // One uniform branch per 16x16 tile instead of eight per-lane predicates,
+      // which is where most of the kernel's exec-mask traffic came from.
+      if (t0 + 16 <= batch && r0 + 16 <= m) {
+        const std::size_t out_base = (t0 * m) + r0;
 #pragma unroll
-      for (int s = 0; s < 8; ++s) {
-        const int flat = (s * 32) + lane_id;
-        const std::size_t tok = t0 + static_cast<std::size_t>(flat / 16);
-        const std::size_t r = r0 + static_cast<std::size_t>(flat % 16);
-        if (tok < batch && r < m) {
-          y[(tok * m) + r] = tile_scratch[flat];
+        for (int s = 0; s < 8; ++s) {
+          const int flat = (s * 32) + lane_id;
+          y[out_base + (static_cast<std::size_t>(flat >> 4) * m) +
+            static_cast<std::size_t>(flat & 15)] = tile_scratch[flat];
+        }
+      } else {
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+          const int flat = (s * 32) + lane_id;
+          const std::size_t tok = t0 + static_cast<std::size_t>(flat >> 4);
+          const std::size_t r = r0 + static_cast<std::size_t>(flat & 15);
+          if (tok < batch && r < m) {
+            y[(tok * m) + r] = tile_scratch[flat];
+          }
         }
       }
       __builtin_amdgcn_wave_barrier();
@@ -885,7 +913,12 @@ void LaunchBatchedQuantGEMMPreQuantized(core::GgmlType type, const void* w,
     constexpr int kBN = 128;
     const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
                     static_cast<unsigned int>((m + kBM - 1) / kBM));
-    W8A8BlockedWmmaGEMMKernel<kBM, kBN, 4, 4, 2>
+    // Two K blocks per LDS stage, not four: the stage buffers drop from 36864
+    // to 18432 bytes and occupancy rises from 6 to 8 waves per SIMD. This is
+    // only reachable with the register pressure the addressing rewrite and the
+    // one-token-tile-at-a-time compute loop freed up -- at BK=2 the previous
+    // body needed 500 bytes/lane of scratch and ran 4.3x slower.
+    W8A8BlockedWmmaGEMMKernel<kBM, kBN, 2, 4, 2>
         <<<grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
   } else {
     constexpr int kBM = 128;
