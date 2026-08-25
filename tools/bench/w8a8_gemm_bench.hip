@@ -836,18 +836,18 @@ __launch_bounds__(256) __global__ void BlockedW8A8Pipe(
 //     per 16x16 tile instead of eight per-lane predicates.
 // ---------------------------------------------------------------------------
 
-template<int BM, int BN, int BK, int WM, int WN>
-__launch_bounds__(256) __global__ void BlockedW8A8Fast(
+template<int BM, int BN, int BK, int WM, int WN, int THREADS = 256>
+__launch_bounds__(THREADS) __global__ void BlockedW8A8Fast(
     const Q8_0Block* __restrict__ w, const std::int8_t* __restrict__ xq,
     const float* __restrict__ xd, float* __restrict__ y, std::size_t batch_in,
     std::size_t m_in, std::size_t k_in) {
-  static_assert(WM * WN == 8);
-  static_assert(BN / 16 <= 8);
+  static_assert(WM * WN == THREADS / 32);
+  static_assert(BN / 16 <= THREADS / 32);
   constexpr int RS = BM / 16;
   constexpr int TS = BN / 16;
   constexpr int WRS = RS / WM;
   constexpr int WTS = TS / WN;
-  constexpr int PF = (BM * BK) / 256;
+  constexpr int PF = (BM * BK) / THREADS;
 
   __shared__ int32x4_t s_a[BK][RS][32];
   __shared__ float s_dw[BK][RS][16];
@@ -909,7 +909,7 @@ __launch_bounds__(256) __global__ void BlockedW8A8Fast(
   const auto fetch = [&](int kb0) {
 #pragma unroll
     for (int p = 0; p < PF; ++p) {
-      const int kk = ((p * 256) + tid) % BK;
+      const int kk = ((p * THREADS) + tid) % BK;
       const int kb = kb0 + kk;
       const int kb_clamped = (kb < num_kb) ? kb : (num_kb - 1);
       const Q8_0Block& blk = w_row[p][kb_clamped];
@@ -935,7 +935,7 @@ __launch_bounds__(256) __global__ void BlockedW8A8Fast(
   const auto commit = [&]() {
 #pragma unroll
     for (int p = 0; p < PF; ++p) {
-      const int idx = (p * 256) + tid;
+      const int idx = (p * THREADS) + tid;
       const int rr = idx / BK;
       const int kk = idx % BK;
       const int rs = rr / 16;
@@ -1473,25 +1473,26 @@ int main(int argc, char** argv) {
     RUN_PIPE(128, 128, 4, 4, 2)
 #undef RUN_PIPE
 
-#define RUN_FAST(BM, BN, BK, WM, WN)                                         \
+#define RUN_FAST(BM, BN, BK, WM, WN, TH)                                     \
   if (m % (BM) == 0) {                                                       \
     const dim3 grid(static_cast<unsigned>((batch + (BN) - 1) / (BN)),         \
                     static_cast<unsigned>((m + (BM) - 1) / (BM)));           \
     char nm[64];                                                             \
-    std::snprintf(nm, sizeof(nm), "FAST %dx%dx%d w%dx%d", (BM), (BN), (BK),  \
-                  (WM), (WN));                                               \
+    std::snprintf(nm, sizeof(nm), "FAST %dx%dx%d w%dx%d t%d", (BM), (BN),     \
+                  (BK), (WM), (WN), (TH));                                   \
     report(nm,                                                               \
            BenchMs(                                                          \
                [&] {                                                         \
-                 BlockedW8A8Fast<(BM), (BN), (BK), (WM), (WN)>                \
-                     <<<grid, 256>>>(static_cast<const Q8_0Block*>(d_w),      \
-                                     d_xq, d_xd, d_y, batch, m, k);          \
+                 BlockedW8A8Fast<(BM), (BN), (BK), (WM), (WN), (TH)>          \
+                     <<<grid, (TH)>>>(static_cast<const Q8_0Block*>(d_w),     \
+                                      d_xq, d_xd, d_y, batch, m, k);         \
                },                                                            \
                iters),                                                       \
            1);                                                               \
   }
-    RUN_FAST(128, 128, 4, 4, 2)
-    RUN_FAST(128, 128, 4, 2, 4)
+    RUN_FAST(128, 128, 4, 4, 2, 256)
+    RUN_FAST(128, 256, 4, 4, 4, 512)
+    RUN_FAST(256, 128, 4, 8, 2, 512)
 #undef RUN_FAST
 
     // Dual gate/up: one shared activation stage feeds two weight matrices.
