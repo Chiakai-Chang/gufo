@@ -492,39 +492,50 @@ Same build, same model, same session. `llama-bench` run as
 | :--- | :---: | :---: | :---: | :---: |
 | **Decode `tg16`** | `7.15 tok/s` | `7.15 tok/s` | `7.15 tok/s` | `100%` |
 | **Sustained Memory Bandwidth** | `209.3 GB/s` | `209.3 GB/s` | `214.3 GB/s` | `97.6%` (86.8% of the measured 241 GB/s read ceiling) |
-| **Prefill `pp512`** | `317.47 tok/s` | **`550.14 +/- 0.47 tok/s`** | `342.91 tok/s` | **`160.4%`** |
-| **Prefill `pp2048`** | `314.09 tok/s` | **`547.01 +/- 3.31 tok/s`** | `339.26 tok/s` | **`161.2%`** |
+| **Prefill `pp512`** | `317.47 tok/s` | **`549.05 +/- 1.52 tok/s`** | `345.72 tok/s` | **`158.8%`** |
+| **Prefill `pp2048`** | `314.09 tok/s` | **`545.15 +/- 3.29 tok/s`** | `352.80 tok/s` | **`154.5%`** |
 
 Decode is unchanged by this work: none of it touches the decode kernels. The
 `7.46` figure recorded earlier was measured in a cooler session -- re-measuring
 both engines back to back in this session gives `7.15` for *both*, so decode is
 at exact parity rather than 97.6%.
 
-Both engines were re-measured together for this row after `opt-c179`, which is
-why `llama-bench` moved too (308.49 -> 342.91 on `pp512`, 354.47 -> 339.26 on
-`pp2048`): its earlier numbers came from a different session, and the parity
-column is only meaningful when both sides are measured back to back. See the
+Both engines were re-measured together at this revision, which is why
+`llama-bench` moved too: the parity column is only meaningful when both sides are
+measured back to back. `llama-bench` is the noisier of the two here -- its
+`pp2048` read 354.47, then 339.26, then 352.80 across three sessions on the same
+build, and two passes of one sweep differ by 7% at depth 8192 -- so treat the
+parity figures as approximate and the Strix column as the controlled one. See the
 throttling note under the experiment log.
 
-`pp2048` at 547.01 tok/s is 41% of the 1338 tok/s arithmetic ceiling the INT8
+`pp2048` at 545.15 tok/s is 41% of the 1338 tok/s arithmetic ceiling the INT8
 WMMA rate imposes.
 
 ### Context depth, Q8 artifact
 
-Same session, `-p 2048 -n 0 -r 1`. This replaces the earlier BF16-artifact depth
-table, where llama.cpp was 1.15-1.34x *faster*; that gap is now reversed at every
-depth, and the margin grows with depth because `opt-c165-attn-split` moves the
-prefix off the `v_dot2` kernel.
+Both engines re-measured back to back, `-p 2048 -n 0 -r 1`. This replaces the
+earlier BF16-artifact depth table, where llama.cpp was 1.15-1.34x *faster*; that
+gap is now reversed at every depth.
+
+The ratio does widen with depth, 1.55x to 1.66x, because llama.cpp's slope over
+the same range is 23.5% against our 18.0%. Do not read much into the shape of that
+curve, though: llama.cpp's own numbers move 4% between sessions and 7% between two
+passes of one sweep, which is the same order as the spread across the column. The
+mechanism credited here previously, `opt-c165-attn-split`, no longer exists --
+`opt-c177-attn-wmma` retired the AOTriton prefix and the log-sum-exp merge for one
+masked WMMA pass over the whole visible range, and `opt-c178-attn-prefetch` is
+what shrinks the slope now.
 
 | Depth | Strix `pp2048` | llama.cpp `pp2048` | Strix / llama.cpp |
 | ---: | ---: | ---: | ---: |
-| 0 | 547.01 | 339.26 | **1.61x** |
-| 4K | 519.53 | 313.41 | **1.66x** |
-| 8K | 495.87 | 308.34 | **1.61x** |
-| 16K | 452.41 | 269.01 | **1.68x** |
+| 0 | 545.15 | 352.80 | **1.55x** |
+| 4K | 524.11 | 331.70 | **1.58x** |
+| 8K | 498.94 | 309.75 | **1.61x** |
+| 16K | 446.94 | 270.00 | **1.66x** |
 
-Depth 0 to 16K costs **17.3%** of throughput, against 20.7% for llama.cpp in the
-same session.
+Depth 0 to 16K costs **18.0%** of throughput, against 23.5% for llama.cpp in the
+same session. The Strix slope reads 17.3-18.0% across two sweeps of the same code,
+so take a fraction of a point as measurement spread rather than signal.
 
 Both sides are the better of two passes. The first depth point of a fresh process
 reads about 55% low (234 against 513 tok/s at 4K) because the KV cache allocation
@@ -535,9 +546,11 @@ not a reliable absolute.
 The slope is worth being precise about. It was 19.5% before this session's work,
 briefly widened to 20.0% after `opt-c170` -- the DeltaNet recurrence is
 depth-independent, so speeding it up lifts depth 0 more than depth 16K in relative
-terms -- came back to 19.3% with `opt-c177-attn-wmma`, and reached 17.3% with
+terms -- came back to 19.3% with `opt-c177-attn-wmma`, and reached 17.3-18.0% with
 `opt-c178-attn-prefetch`, whose gain rises monotonically with depth (+0.94% at 4K,
-+1.47% at 8K, +1.69% at 16K) because that is where the attention stage is. Note
++1.47% at 8K, +1.69% at 16K) because that is where the attention stage is. Those
+three deltas are the trustworthy part: they come from an interleaved A/B of the
+two builds, not from differencing two sweeps. Note
 `opt-c179` pushes the other way: it is depth-independent, so it lifts the whole
 curve and slightly *steepens* the relative slope while raising every absolute
 number.
