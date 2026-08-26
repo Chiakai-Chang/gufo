@@ -386,7 +386,7 @@ depth. Read the Q8 section for the current state of the engine.
 | Area | Retained | Rejected |
 | --- | --- | --- |
 | Projection | Shape-specific hipBLASLt plans and tuned decode GEMV | Blanket algorithm overrides and concurrent gate/up launches |
-| Exact small-batch Q8 projection | Shared-weight FP32 Q8_0/Q8_K kernels for physical C=2/C=4/C=8, with masked C=3/C=5/C=6 and structural C=1 fallback (`opt-c206-q8-small-batch`) | Standalone Q8_K-only promotion on the current Q8_K_XL artifact; C=1 Q8_0 one-row/two-row specialization, four rows per wave, and eight-wave workgroups were neutral or regressive (`opt-c206-q8-c1`) |
+| Exact small-batch Q8 projection | Shared-weight FP32 Q8_0/Q8_K kernels for physical W=2/W=4/W=8, with masked C=3/C=5/C=6, structural C=1 fallback, and the measured smallest-covering selector (`opt-c206-q8-small-batch`) | Standalone Q8_K-only promotion on the current Q8_K_XL artifact; C=1 Q8_0 one-row/two-row specialization, four rows per wave, and eight-wave workgroups; capped W=4 composition and a native W=6 specialization were neutral or regressive (`opt-c206-q8-c1`, #206) |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
@@ -415,6 +415,31 @@ end-to-end improvement:
 Final production requalification measured C=1, `pp2048` at 557.91 tok/s and
 C=1, `tg128` at 7.15 tok/s.
 
+### Real C=5/C=6 plan qualification
+
+Independent OpenAI-compatible HTTP requests, eight request sessions, context
+capacity 512, an 8-token prompt, and 16 greedy output tokens per request:
+
+| Traffic | Production plan | Median wall | Aggregate output | Alternative | Alternative output | Decision |
+| --- | --- | ---: | ---: | --- | ---: | --- |
+| C=5 | masked W=8 | 7.833172 s | 10.212976 tok/s | capped W=4 round-robin | 9.931977 tok/s | keep W=8; W=4 is 2.75% slower |
+| C=6 | masked W=8 | 9.238383 s | 10.391429 tok/s | capped W=4 round-robin | 9.914539 tok/s | keep W=8; W=4 is 4.59% slower |
+| C=5 | masked W=8 | 7.832381 s | 10.214008 tok/s | native exact W=6 | 10.207103 tok/s | reject W=6; -0.07% |
+| C=6 | masked W=8 | 9.241200 s | 10.388261 tok/s | native exact W=6 | 10.382500 tok/s | reject W=6; -0.06% |
+
+All requests produced the same isolated greedy output. A second real C=6 case
+used prompt lengths 8, 16, 32, 56, 104, and 168 tokens: aggregate output was
+9.775538-9.787655 tok/s, and every concurrent output matched its isolated
+trajectory. At context 512, seven additional sessions added about 244,340 KiB
+RSS, or 34.1 MiB per session.
+
+The profile explains both rejected alternatives. W=8, W=4, and W=2 exact Q8
+projections average 777.338, 506.807, and 335.239 us respectively, so W=4+W=2
+costs more than W=8. The W=6 specialization retained the same 72 VGPR and
+zero-scratch resource shape as W=8 and averaged 778.701 us. A generic runtime
+cost table would therefore reproduce the existing smallest-covering choice for
+every measured C=1 through C=6 workload while adding no performance.
+
 This table records only decisions that affect the current direction. Detailed
 profiling data belongs in issue discussions or local artifacts, not in this
 status page.
@@ -426,10 +451,10 @@ they did not beat the unfused routes end-to-end on gfx1151.
 
 ## TODOs
 
-- Feed the measured exact-Q8 C=2/C=4/C=8 and masked C=3/C=5/C=6 costs into
-  the physical-plan selector, then qualify useful tokens/s and per-request
-  latency under real staggered server traffic before claiming arbitrary-width
-  scheduling.
+- Revisit a runtime physical-plan cost table only when a new native or composed
+  route beats the measured smallest-covering W=2/W=4/W=8 policy. Capped W=4
+  and native W=6 both lost under real C=5/C=6 server traffic, so encoding their
+  costs would currently add machinery without changing a decision.
 - Revisit exact C=1 Q8 decode only with a materially different weight/data
   layout or instruction path. Type specialization and workgroup/row-count
   tuning moved the 128-token kernel timeline by at most 0.05% or regressed it.
