@@ -1,5 +1,6 @@
 #include "src/cli/serve/inference_backend.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <iomanip>
 #include <iostream>
@@ -12,7 +13,9 @@
 #include <utility>
 
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -51,10 +54,10 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
   std::clog << line.str() << '\n';
 }
 
-class QwenContinuationState final : public ContinuationState {
+class QwenTextRunnerState final : public TextRunnerState {
 public:
-  QwenContinuationState(std::shared_ptr<const hip::QwenGpuModel> model,
-                        std::uint32_t max_context) {
+  QwenTextRunnerState(std::shared_ptr<const hip::QwenGpuModel> model,
+                      std::uint32_t max_context) {
     std::string error;
     executor_ =
         hip::QwenGpuExecutor::Create(std::move(model), &error, max_context);
@@ -63,12 +66,178 @@ public:
     }
   }
 
-  void Invalidate() noexcept override { executor_->Reset(); }
+  void Invalidate() noexcept override {
+    executor_->Reset();
+    position_ = 0;
+    frontier_.reset();
+  }
 
   [[nodiscard]] hip::QwenGpuExecutor& executor() const { return *executor_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+  [[nodiscard]] const std::optional<TextRunnerToken>& frontier()
+      const noexcept {
+    return frontier_;
+  }
+  void set_frontier(TextRunnerToken frontier) noexcept { frontier_ = frontier; }
 
 private:
   std::unique_ptr<hip::QwenGpuExecutor> executor_;
+  std::size_t position_{0};
+  std::optional<TextRunnerToken> frontier_;
+};
+
+QwenTextRunnerState& RequireQwenState(TextRunnerState& state) {
+  auto* qwen = dynamic_cast<QwenTextRunnerState*>(&state);
+  if (qwen == nullptr) {
+    throw std::logic_error("text runner state is not Qwen");
+  }
+  return *qwen;
+}
+
+const QwenTextRunnerState& RequireQwenState(const TextRunnerState& state) {
+  const auto* qwen = dynamic_cast<const QwenTextRunnerState*>(&state);
+  if (qwen == nullptr) {
+    throw std::logic_error("text runner state is not Qwen");
+  }
+  return *qwen;
+}
+
+class QwenTextRunner final : public TextModelRunner {
+public:
+  QwenTextRunner(std::shared_ptr<const hip::QwenGpuModel> model,
+                 std::uint32_t max_context)
+      : model_(std::move(model)), max_context_(max_context) {}
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->GetConfig().model_name,
+        .state_abi = "qwen-gfx1151-state-v1",
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = false,
+                .fork = false,
+            },
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    return {
+        .resident_weights_bytes = std::nullopt,
+        .state_capacity_bytes = std::nullopt,
+        .per_request_state_bytes = std::nullopt,
+        .temporary_scratch_bytes = std::nullopt,
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{
+        .kind = TextExecutionPlanKind::kSerial,
+        .physical_width = 1,
+    }};
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return model_->GetTokenizer().Encode(text);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    tokenization::ChatTemplateOptions options;
+    options.require_tool_call =
+        request.tool_choice == ChatRequest::ToolChoice::kRequired;
+    return tokenization::QwenChatTemplate::RenderAndTokenize(
+        model_->GetTokenizer(), request.messages,
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const tokenization::ChatTool>{}
+            : std::span<const tokenization::ChatTool>{request.tools},
+        options);
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return model_->GetTokenizer().Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<QwenTextRunnerState>(model_, max_context_);
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& qwen = RequireQwenState(state);
+    if (offset != qwen.position()) {
+      throw std::logic_error(
+          "Qwen prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error("Qwen prefill has no remaining input");
+    }
+
+    const std::size_t consumed =
+        std::min(max_input_tokens, prompt.size() - offset);
+    const bool decode_ready = offset + consumed == prompt.size();
+    const auto frontier = qwen.executor().ForwardPromptBatch(
+        prompt.subspan(offset, consumed), static_cast<std::uint32_t>(offset),
+        decode_ready);
+    qwen.set_position(offset + consumed);
+    if (decode_ready) {
+      qwen.set_frontier(frontier);
+    }
+    return {
+        .consumed_tokens = consumed,
+        .decode_ready = decode_ready,
+    };
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(TextRunnerState& state, float,
+                                               std::uint64_t*) const override {
+    const auto& qwen = RequireQwenState(state);
+    if (!qwen.frontier().has_value()) {
+      throw std::logic_error("Qwen state has no next-token frontier");
+    }
+
+    const TextRunnerToken token = *qwen.frontier();
+    if (token == model_->GetTokenizer().GetEosTokenId() || token == 151643U ||
+        token == 248044U || token == 248046U) {
+      return {
+          .stop = true,
+          .token = 0,
+          .piece = {},
+      };
+    }
+    return {
+        .stop = false,
+        .token = token,
+        .piece = std::string(model_->GetTokenizer().DecodeToken(token)),
+    };
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    auto& qwen = RequireQwenState(state);
+    if (!qwen.frontier().has_value() || token != *qwen.frontier()) {
+      throw std::logic_error(
+          "Qwen decode token does not match the retained frontier");
+    }
+    const auto frontier = qwen.executor().ForwardToken(
+        token, static_cast<std::uint32_t>(qwen.position()));
+    qwen.set_position(qwen.position() + 1);
+    qwen.set_frontier(frontier);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireQwenState(state).position();
+  }
+
+private:
+  std::shared_ptr<const hip::QwenGpuModel> model_;
+  std::uint32_t max_context_;
 };
 
 class DeepSeekContinuationState final : public ContinuationState {
@@ -95,14 +264,6 @@ public:
 private:
   std::unique_ptr<models::deepseek_v4_flash::Session> session_;
 };
-
-QwenContinuationState& RequireQwenState(ContinuationState& state) {
-  auto* qwen = dynamic_cast<QwenContinuationState*>(&state);
-  if (qwen == nullptr) {
-    throw std::logic_error("continuation state is not Qwen");
-  }
-  return *qwen;
-}
 
 DeepSeekContinuationState& RequireDeepSeekState(ContinuationState& state) {
   auto* deepseek = dynamic_cast<DeepSeekContinuationState*>(&state);
@@ -210,8 +371,7 @@ struct InferenceBackend::Impl {
     };
 
     Kind kind = Kind::kQwen;
-    std::shared_ptr<const hip::QwenGpuModel> qwen_model;
-    std::shared_ptr<ContinuationCache> qwen_continuations;
+    std::shared_ptr<TextRunnerPool> qwen_requests;
     std::shared_ptr<models::deepseek_v4_flash::Model> deepseek_model;
     std::shared_ptr<ContinuationCache> deepseek_continuations;
     std::string model_id;
@@ -224,7 +384,7 @@ struct InferenceBackend::Impl {
   }
 
   Result GenerateQwen(std::shared_ptr<const State> current,
-                      std::span<const tokenization::TokenId> prompt_tokens,
+                      std::vector<TextRunnerToken> prompt_tokens,
                       Clock::time_point request_start, std::size_t max_tokens,
                       float temperature, const CancellationCheck& is_cancelled,
                       const TokenCallback& on_token) const {
@@ -239,63 +399,71 @@ struct InferenceBackend::Impl {
       return result;
     }
 
-    auto lease =
-        current->qwen_continuations->Acquire(prompt_tokens, is_cancelled);
-    if (!lease) {
+    auto request =
+        current->qwen_requests->Acquire(std::move(prompt_tokens), is_cancelled);
+    if (!request) {
       result.cancelled = true;
       EmitRequestMetrics(result, "cancelled");
       return result;
     }
-    result.cache_hit = lease.cache_hit();
-    result.cached_prompt_tokens = lease.cached_tokens();
+    result.cache_hit = request.cache_hit();
+    result.cached_prompt_tokens = request.cached_prompt_tokens();
     if (is_cancelled && is_cancelled()) {
       result.cancelled = true;
       EmitRequestMetrics(result, "cancelled");
       return result;
     }
 
-    models::GenerationOptions options;
-    options.max_new_tokens = max_tokens > 0 ? max_tokens : 1;
-    options.temperature = temperature;
-
     std::optional<Clock::time_point> previous_token;
     std::chrono::duration<double, std::milli> inter_token_total{0};
     std::size_t inter_token_samples = 0;
     try {
-      result.tokens =
-          RequireQwenState(lease.state())
-              .executor()
-              .GenerateFromPrefix(
-                  prompt_tokens, result.cached_prompt_tokens, options,
-                  [&](tokenization::TokenId, std::string_view piece) {
-                    const auto now = Clock::now();
-                    if (!previous_token.has_value()) {
-                      result.ttft_ms =
-                          std::chrono::duration<double, std::milli>(
-                              now - request_start)
-                              .count();
-                    } else {
-                      inter_token_total += now - *previous_token;
-                      ++inter_token_samples;
-                    }
-                    previous_token = now;
-                    if (is_cancelled && is_cancelled()) {
-                      result.cancelled = true;
-                      return false;
-                    }
-                    if (on_token && !on_token(piece)) {
-                      result.cancelled = true;
-                      return false;
-                    }
-                    return true;
-                  });
+      if (!request.prefill_complete()) {
+        (void)request.Prefill(request.prompt_tokens() -
+                              request.cached_prompt_tokens());
+      }
+
+      const std::size_t token_limit = max_tokens > 0 ? max_tokens : 1;
+      for (std::size_t index = 0; index < token_limit; ++index) {
+        if (is_cancelled && is_cancelled()) {
+          result.cancelled = true;
+          break;
+        }
+
+        const auto selection = request.SelectNext(temperature);
+        if (selection.stop) {
+          break;
+        }
+
+        const auto now = Clock::now();
+        if (!previous_token.has_value()) {
+          result.ttft_ms =
+              std::chrono::duration<double, std::milli>(now - request_start)
+                  .count();
+        } else {
+          inter_token_total += now - *previous_token;
+          ++inter_token_samples;
+        }
+        previous_token = now;
+        result.tokens.push_back(selection.token);
+
+        if (is_cancelled && is_cancelled()) {
+          result.cancelled = true;
+          break;
+        }
+        if (on_token && !on_token(selection.piece)) {
+          result.cancelled = true;
+          break;
+        }
+        request.Advance();
+      }
     } catch (...) {
       EmitRequestMetrics(result, "error");
       throw;
     }
 
     result.completion_tokens = result.tokens.size();
-    result.text = current->qwen_model->GetTokenizer().Decode(result.tokens);
+    result.text = current->qwen_requests->runner().Decode(result.tokens);
     result.finish_reason =
         result.cancelled
             ? FinishReason::kCancelled
@@ -306,11 +474,7 @@ struct InferenceBackend::Impl {
           inter_token_total.count() / static_cast<double>(inter_token_samples);
     }
     if (!result.cancelled) {
-      std::vector<ContinuationToken> checkpoint(prompt_tokens.begin(),
-                                                prompt_tokens.end());
-      checkpoint.insert(checkpoint.end(), result.tokens.begin(),
-                        result.tokens.end());
-      lease.Commit(std::move(checkpoint));
+      request.Commit();
     }
     EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
     return result;
@@ -505,12 +669,11 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
   try {
     auto new_state = std::make_shared<Impl::State>();
     new_state->kind = Impl::State::Kind::kQwen;
-    new_state->qwen_model = std::move(model);
-    new_state->qwen_continuations = std::make_shared<ContinuationCache>(
-        session_count, [model = new_state->qwen_model, max_context] {
-          return std::make_unique<QwenContinuationState>(model, max_context);
-        });
-    new_state->model_id = new_state->qwen_model->GetConfig().model_name;
+    auto runner =
+        std::make_shared<QwenTextRunner>(std::move(model), max_context);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->qwen_requests =
+        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -637,9 +800,9 @@ InferenceBackend::Result InferenceBackend::complete(
                                    max_tokens, temperature, is_cancelled,
                                    on_token);
   }
-  const auto prompt_tokens = state->qwen_model->GetTokenizer().Encode(prompt);
-  return impl_->GenerateQwen(state, prompt_tokens, request_start, max_tokens,
-                             temperature, is_cancelled, on_token);
+  auto prompt_tokens = state->qwen_requests->runner().Tokenize(prompt);
+  return impl_->GenerateQwen(state, std::move(prompt_tokens), request_start,
+                             max_tokens, temperature, is_cancelled, on_token);
 #else
   (void)prompt;
   (void)max_tokens;
@@ -697,20 +860,13 @@ InferenceBackend::Result InferenceBackend::chat(
                                    max_tokens, temperature, is_cancelled,
                                    on_token);
   }
-  tokenization::ChatTemplateOptions template_options;
-  template_options.require_tool_call =
-      request.tool_choice == ChatRequest::ToolChoice::kRequired;
-  const auto prompt_tokens = tokenization::QwenChatTemplate::RenderAndTokenize(
-      state->qwen_model->GetTokenizer(), request.messages,
-      request.tool_choice == ChatRequest::ToolChoice::kNone
-          ? std::span<const tokenization::ChatTool>{}
-          : std::span<const tokenization::ChatTool>{request.tools},
-      template_options);
+  auto prompt_tokens =
+      state->qwen_requests->runner().RenderAndTokenize(request);
   if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
     return {};
   }
-  return impl_->GenerateQwen(state, *prompt_tokens, request_start, max_tokens,
-                             temperature, is_cancelled, on_token);
+  return impl_->GenerateQwen(state, std::move(*prompt_tokens), request_start,
+                             max_tokens, temperature, is_cancelled, on_token);
 #else
   (void)request;
   (void)max_tokens;
@@ -737,7 +893,7 @@ std::size_t InferenceBackend::count_tokens(std::string_view text) const {
   if (state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
     return state->deepseek_model->Tokenize(text).size();
   }
-  return state->qwen_model->GetTokenizer().Encode(text).size();
+  return state->qwen_requests->runner().Tokenize(text).size();
 #else
   (void)text;
   return 0;
