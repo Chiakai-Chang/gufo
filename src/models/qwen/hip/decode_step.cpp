@@ -386,6 +386,14 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     // Residual Add
     strix::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
                                      ffn_scratch.out);
+
+    if (const auto tap_index = arena.GetTargetLayerCaptureIndex(l);
+        tap_index.has_value()) {
+      (void)hipMemcpyAsync(
+          arena.d_target_layer_features + (*tap_index * hidden_size),
+          decode_scratch.hidden.data(), hidden_size * sizeof(float),
+          hipMemcpyDeviceToDevice, arena.stream);
+    }
   }
 
   if (compute_logits) {

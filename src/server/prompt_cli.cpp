@@ -23,6 +23,7 @@
 #include "src/core/speculative/prompt_lookup_backend.hpp"
 #include "src/core/speculative/self_speculative.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #endif
@@ -54,10 +55,16 @@ void PrintPromptHelp(std::string_view program_name) {
          "greedy)\n"
       << "  --system <PROMPT>       Custom system prompt\n"
       << "  --raw                   Disable chat template framing\n"
-      << "  --speculative <MODE>    Draft backend: mtp, mtp-npu, npu, pld, "
-         "or self\n"
+      << "  --speculative, --speculative-decoding <MODE>\n"
+      << "                          Draft backend: dflash, dflash2, mtp, "
+         "mtp-npu, npu, pld, self, or off\n"
+      << "  --dflash-model <PATH>   Quantized Qwen DFlash/DFlash-2 GGUF\n"
       << "  --mtp-model <PATH>      Quantized Qwen MTP GGUF for mtp modes\n"
-      << "  --draft-tokens <N>      Maximum speculative block length\n"
+      << "  --draft-tokens <N>      Maximum speculative block length "
+         "(default: 7)\n"
+      << "  --draft-policy <MODE>   fixed, rolling, or accepted-ema "
+         "(default: rolling)\n"
+      << "  --min-draft-tokens <N>  Adaptive draft floor (default: 1)\n"
       << "  -v, --verbose           Print detailed timing and token metrics\n"
       << "  -h, --help              Print help\n";
 }
@@ -271,14 +278,20 @@ std::optional<PromptOptions> ParsePromptOptions(
       continue;
     }
 
-    if (arg == "--speculative") {
+    if (arg == "--speculative" || arg == "--speculative-decoding") {
       if (i + 1 >= args.size()) {
         if (error_msg != nullptr) {
-          *error_msg = "Missing argument for --speculative";
+          *error_msg = "Missing argument for " + std::string(arg);
         }
         return std::nullopt;
       }
-      opt.speculative_backend = args[i + 1];
+      const std::string_view mode = args[i + 1];
+      if (mode == "none" || mode == "off" || mode == "false" ||
+          mode == "disabled") {
+        opt.speculative_backend = "";
+      } else {
+        opt.speculative_backend = std::string(mode);
+      }
       skip_next = true;
       continue;
     }
@@ -295,6 +308,18 @@ std::optional<PromptOptions> ParsePromptOptions(
       continue;
     }
 
+    if (arg == "--dflash-model") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --dflash-model";
+        }
+        return std::nullopt;
+      }
+      opt.dflash_model_path = args[i + 1];
+      skip_next = true;
+      continue;
+    }
+
     if (arg == "--draft-tokens") {
       if (i + 1 >= args.size()) {
         if (error_msg != nullptr) {
@@ -304,15 +329,58 @@ std::optional<PromptOptions> ParsePromptOptions(
       }
       const std::string_view val = args[i + 1];
       std::size_t num = 0;
-      const auto res =
+      const auto [ptr, ec] =
           std::from_chars(val.data(), val.data() + val.size(), num);
-      if (res.ec != std::errc{}) {
+      if (ec != std::errc{} || ptr != val.data() + val.size() || num == 0) {
         if (error_msg != nullptr) {
           *error_msg = "Invalid integer for draft-tokens: " + std::string(val);
         }
         return std::nullopt;
       }
       opt.draft_tokens = num;
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "--draft-policy") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --draft-policy";
+        }
+        return std::nullopt;
+      }
+      const std::string_view policy = args[i + 1];
+      if (policy != "fixed" && policy != "rolling" &&
+          policy != "accepted-ema") {
+        if (error_msg != nullptr) {
+          *error_msg = "Invalid draft policy: " + std::string(policy);
+        }
+        return std::nullopt;
+      }
+      opt.draft_policy = policy;
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "--min-draft-tokens") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --min-draft-tokens";
+        }
+        return std::nullopt;
+      }
+      const std::string_view val = args[i + 1];
+      std::size_t num = 0;
+      const auto [ptr, ec] =
+          std::from_chars(val.data(), val.data() + val.size(), num);
+      if (ec != std::errc{} || ptr != val.data() + val.size() || num == 0) {
+        if (error_msg != nullptr) {
+          *error_msg =
+              "Invalid integer for min-draft-tokens: " + std::string(val);
+        }
+        return std::nullopt;
+      }
+      opt.min_draft_tokens = num;
       skip_next = true;
       continue;
     }
@@ -327,6 +395,13 @@ std::optional<PromptOptions> ParsePromptOptions(
 
     if (error_msg != nullptr) {
       *error_msg = "Unknown option: " + std::string(arg);
+    }
+    return std::nullopt;
+  }
+
+  if (opt.min_draft_tokens > opt.draft_tokens) {
+    if (error_msg != nullptr) {
+      *error_msg = "min-draft-tokens cannot exceed draft-tokens";
     }
     return std::nullopt;
   }
@@ -430,13 +505,36 @@ int RunPrompt(std::span<const char* const> args) {
       gen_opts.max_new_tokens = opt.max_tokens;
       gen_opts.temperature = opt.temperature;
 
-      const auto start_time = std::chrono::steady_clock::now();
+      auto start_time = std::chrono::steady_clock::now();
       std::size_t generated_count = 0;
 
       if (!opt.speculative_backend.empty()) {
         const auto& config = gpu_exec->GetConfig();
         std::unique_ptr<speculative::IDraftBackend> draft_backend;
-        if (opt.speculative_backend == "npu") {
+        if (opt.speculative_backend == "dflash" ||
+            opt.speculative_backend == "dflash2" ||
+            opt.speculative_backend == "dflash-2") {
+          std::string dflash_path = opt.dflash_model_path;
+          if (dflash_path.empty()) {
+            if (const char* environment = std::getenv("STRIX_DFLASH_MODEL");
+                environment != nullptr) {
+              dflash_path = environment;
+            }
+          }
+          if (dflash_path.empty()) {
+            dflash_path = opt.model_path;
+          }
+          hip::QwenDFlashGpuDraftConfig cfg{
+              .max_context = gpu_exec->GetMaxContext(),
+              .max_draft_tokens = static_cast<std::uint32_t>(opt.draft_tokens),
+          };
+          draft_backend = hip::QwenDFlashGpuDraftBackend::CreateFromGguf(
+              dflash_path, gpu_exec->GetSharedModel(), cfg, &err);
+          if (draft_backend == nullptr) {
+            std::cerr << "Failed to initialize DFlash backend: " << err << '\n';
+            return 1;
+          }
+        } else if (opt.speculative_backend == "npu") {
           heterogeneous::NpuDrafterConfig cfg;
           cfg.max_draft_tokens = opt.draft_tokens;
           cfg.vocab_size = config.vocab_size;
@@ -486,10 +584,31 @@ int RunPrompt(std::span<const char* const> args) {
         if (draft_backend) {
           speculative::SpeculativeOptions s_opts;
           s_opts.max_draft_tokens = opt.draft_tokens;
+          s_opts.min_draft_tokens = opt.min_draft_tokens;
           s_opts.initial_draft_tokens = opt.draft_tokens;
+          if (opt.draft_policy == "fixed") {
+            s_opts.enable_adaptive_draft_length = false;
+          } else if (opt.draft_policy == "accepted-ema") {
+            s_opts.adaptive_draft_policy =
+                speculative::AdaptiveDraftPolicy::kAcceptedTokenEma;
+          }
+          if (opt.speculative_backend == "dflash" ||
+              opt.speculative_backend == "dflash2" ||
+              opt.speculative_backend == "dflash-2") {
+            s_opts.use_batched_verification = true;
+            s_opts.use_batched_lm_head = true;
+            s_opts.target_bf16_from_layer = 48;
+          } else if (opt.speculative_backend == "mtp" ||
+                     opt.speculative_backend == "mtp-npu") {
+            s_opts.use_batched_verification = true;
+            s_opts.use_batched_lm_head = true;
+            s_opts.target_bf16_from_layer = 0;
+            s_opts.target_fp32_from_layer = 63;
+          }
           speculative::SpeculativeVerifier spec_verifier(
               *gpu_exec, std::move(draft_backend), s_opts);
 
+          start_time = std::chrono::steady_clock::now();
           (void)spec_verifier.Generate(
               prompt_tokens, gen_opts,
               [&](tokenization::TokenId, std::string_view piece) -> bool {
@@ -497,8 +616,18 @@ int RunPrompt(std::span<const char* const> args) {
                 ++generated_count;
                 return true;
               });
+          if (opt.verbose) {
+            const auto& stats = spec_verifier.GetStats();
+            std::cerr << "\n[Speculative]: acceptance="
+                      << stats.AcceptanceRate()
+                      << " drafted=" << stats.total_draft_tokens
+                      << " accepted=" << stats.total_accepted_tokens
+                      << " verification_steps="
+                      << stats.total_verification_steps << '\n';
+          }
         }
       } else {
+        start_time = std::chrono::steady_clock::now();
         gpu_exec->Generate(
             prompt_tokens, gen_opts,
             [&](tokenization::TokenId, std::string_view piece) -> bool {

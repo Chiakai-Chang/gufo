@@ -29,6 +29,7 @@
 #include "src/core/speculative/prompt_lookup_backend.hpp"
 #include "src/core/speculative/self_speculative.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
 #endif
@@ -50,31 +51,37 @@ void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
 }
 
 void PrintBenchHelp(std::string_view program_name) {
-  std::cout << "Usage: " << program_name << " bench [options]\n\n"
-            << "Benchmark prompt processing (pp) and token generation (tg) "
-               "throughput.\n\n"
-            << "Options:\n"
-            << "  -h, --help                  Print help\n"
-            << "  -m, --model <PATH>          Path to GGUF model file "
-               "(default: models/Qwen3.5-4B-BF16.gguf)\n"
-            << "  -p, --n-prompt <n,n,...>    Prompt token lengths to "
-               "benchmark (default: 64,128,512)\n"
-            << "  -n, --n-gen <n,n,...>       Number of text generation tokens "
-               "(default: 128)\n"
-            << "  -d, --n-depth <n,n,...>     Context depths prepared outside "
-               "the timed region (default: 0)\n"
-            << "  -r, --repetitions <N>       Number of repetitions per test "
-               "(default: 1)\n"
-            << "  --validate-prefill <N>      Compare batched logits against "
-               "sequential prefill\n"
-            << "  --speculative <MODE>        Draft backend: mtp, mtp-npu, "
-               "npu, pld, or self\n"
-            << "  --mtp-model <PATH>          Quantized Qwen MTP GGUF\n"
-            << "  --draft-tokens <N>          Maximum speculative block "
-               "length\n"
-            << "  -ngl, --n-gpu-layers <N>    Number of layers offloaded to "
-               "GPU (default: 99)\n"
-            << "  -v, --verbose               Verbose progress output\n";
+  std::cout
+      << "Usage: " << program_name << " bench [options]\n\n"
+      << "Benchmark prompt processing (pp) and token generation (tg) "
+         "throughput.\n\n"
+      << "Options:\n"
+      << "  -h, --help                  Print help\n"
+      << "  -m, --model <PATH>          Path to GGUF model file "
+         "(default: models/Qwen3.5-4B-BF16.gguf)\n"
+      << "  -p, --n-prompt <n,n,...>    Prompt token lengths to "
+         "benchmark (default: 64,128,512)\n"
+      << "  -n, --n-gen <n,n,...>       Number of text generation tokens "
+         "(default: 128)\n"
+      << "  -d, --n-depth <n,n,...>     Context depths prepared outside "
+         "the timed region (default: 0)\n"
+      << "  -r, --repetitions <N>       Number of repetitions per test "
+         "(default: 1)\n"
+      << "  --validate-prefill <N>      Compare batched logits against "
+         "sequential prefill\n"
+      << "  --speculative, --speculative-decoding <MODE>\n"
+      << "                              Draft backend: dflash, dflash2, "
+         "mtp, mtp-npu, npu, pld, self, or off\n"
+      << "  --dflash-model <PATH>       Quantized Qwen DFlash/DFlash-2 GGUF\n"
+      << "  --mtp-model <PATH>          Quantized Qwen MTP GGUF\n"
+      << "  --draft-tokens <N>          Maximum speculative block "
+         "length (default: 7)\n"
+      << "  --draft-policy <MODE>       fixed, rolling, or accepted-ema "
+         "(default: rolling)\n"
+      << "  --min-draft-tokens <N>      Adaptive draft floor (default: 1)\n"
+      << "  -ngl, --n-gpu-layers <N>    Number of layers offloaded to "
+         "GPU (default: 99)\n"
+      << "  -v, --verbose               Verbose progress output\n";
 }
 
 std::vector<std::size_t> ParseCommaSeparatedSizes(std::string_view str,
@@ -545,14 +552,20 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       continue;
     }
 
-    if (arg == "--speculative") {
+    if (arg == "--speculative" || arg == "--speculative-decoding") {
       if (i + 1 >= args.size()) {
         if (error_msg != nullptr) {
-          *error_msg = "Missing argument for --speculative";
+          *error_msg = "Missing argument for " + std::string(arg);
         }
         return std::nullopt;
       }
-      opt.speculative_backend = std::string(args[i + 1]);
+      const std::string_view mode = args[i + 1];
+      if (mode == "none" || mode == "off" || mode == "false" ||
+          mode == "disabled") {
+        opt.speculative_backend = "";
+      } else {
+        opt.speculative_backend = std::string(mode);
+      }
       skip_next = true;
       continue;
     }
@@ -569,6 +582,18 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       continue;
     }
 
+    if (arg == "--dflash-model") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --dflash-model";
+        }
+        return std::nullopt;
+      }
+      opt.dflash_model_path = std::string(args[i + 1]);
+      skip_next = true;
+      continue;
+    }
+
     if (arg == "--draft-tokens") {
       if (i + 1 >= args.size()) {
         if (error_msg != nullptr) {
@@ -578,9 +603,55 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       }
       std::uint32_t k = 0;
       const std::string_view val = args[i + 1];
-      std::from_chars(val.data(), val.data() + val.size(), k);
-      if (k > 0) {
-        opt.draft_tokens = k;
+      const auto [ptr, ec] =
+          std::from_chars(val.data(), val.data() + val.size(), k);
+      if (ec != std::errc{} || ptr != val.data() + val.size() || k == 0) {
+        if (error_msg != nullptr) {
+          *error_msg = "Invalid argument for --draft-tokens";
+        }
+        return std::nullopt;
+      }
+      opt.draft_tokens = k;
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "--draft-policy") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --draft-policy";
+        }
+        return std::nullopt;
+      }
+      const std::string_view policy = args[i + 1];
+      if (policy != "fixed" && policy != "rolling" &&
+          policy != "accepted-ema") {
+        if (error_msg != nullptr) {
+          *error_msg = "Invalid draft policy: " + std::string(policy);
+        }
+        return std::nullopt;
+      }
+      opt.draft_policy = policy;
+      skip_next = true;
+      continue;
+    }
+
+    if (arg == "--min-draft-tokens") {
+      if (i + 1 >= args.size()) {
+        if (error_msg != nullptr) {
+          *error_msg = "Missing argument for --min-draft-tokens";
+        }
+        return std::nullopt;
+      }
+      const std::string_view val = args[i + 1];
+      const auto [ptr, ec] = std::from_chars(
+          val.data(), val.data() + val.size(), opt.min_draft_tokens);
+      if (ec != std::errc{} || ptr != val.data() + val.size() ||
+          opt.min_draft_tokens == 0) {
+        if (error_msg != nullptr) {
+          *error_msg = "Invalid argument for --min-draft-tokens";
+        }
+        return std::nullopt;
       }
       skip_next = true;
       continue;
@@ -601,6 +672,13 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     opt.n_gens.clear();
   } else if (!explicit_p && explicit_n) {
     opt.n_prompts.clear();
+  }
+
+  if (opt.min_draft_tokens > opt.draft_tokens) {
+    if (error_msg != nullptr) {
+      *error_msg = "min-draft-tokens cannot exceed draft-tokens";
+    }
+    return std::nullopt;
   }
 
   return opt;
@@ -892,8 +970,30 @@ int RunBench(std::span<const char* const> args) {
 
         std::unique_ptr<speculative::IDraftBackend> draft_backend;
         hip::QwenMtpGpuDraftBackend* mtp_backend = nullptr;
-        if (opt.speculative_backend == "mtp" ||
-            opt.speculative_backend == "mtp-npu") {
+        if (opt.speculative_backend == "dflash" ||
+            opt.speculative_backend == "dflash2" ||
+            opt.speculative_backend == "dflash-2") {
+          std::string dflash_path = opt.dflash_model_path;
+          if (dflash_path.empty()) {
+            if (const char* env = std::getenv("STRIX_DFLASH_MODEL");
+                env != nullptr) {
+              dflash_path = env;
+            }
+          }
+          if (dflash_path.empty()) {
+            dflash_path = opt.model_path;
+          }
+          hip::QwenDFlashGpuDraftConfig cfg{
+              .max_context = static_cast<std::uint32_t>(required_context),
+              .max_draft_tokens = opt.draft_tokens,
+          };
+          draft_backend = hip::QwenDFlashGpuDraftBackend::CreateFromGguf(
+              dflash_path, gpu_exec->GetSharedModel(), cfg, &err);
+          if (draft_backend == nullptr) {
+            throw std::runtime_error("DFlash initialization failed: " + err);
+          }
+        } else if (opt.speculative_backend == "mtp" ||
+                   opt.speculative_backend == "mtp-npu") {
           hip::QwenMtpGpuDraftConfig cfg{
               .max_context = static_cast<std::uint32_t>(required_context),
               .max_draft_tokens = opt.draft_tokens,
@@ -933,7 +1033,27 @@ int RunBench(std::span<const char* const> args) {
         if (draft_backend) {
           speculative::SpeculativeOptions s_opts;
           s_opts.max_draft_tokens = opt.draft_tokens;
+          s_opts.min_draft_tokens = opt.min_draft_tokens;
           s_opts.initial_draft_tokens = opt.draft_tokens;
+          if (opt.draft_policy == "fixed") {
+            s_opts.enable_adaptive_draft_length = false;
+          } else if (opt.draft_policy == "accepted-ema") {
+            s_opts.adaptive_draft_policy =
+                speculative::AdaptiveDraftPolicy::kAcceptedTokenEma;
+          }
+          if (opt.speculative_backend == "dflash" ||
+              opt.speculative_backend == "dflash2" ||
+              opt.speculative_backend == "dflash-2") {
+            s_opts.use_batched_verification = true;
+            s_opts.use_batched_lm_head = true;
+            s_opts.target_bf16_from_layer = 48;
+          } else if (opt.speculative_backend == "mtp" ||
+                     opt.speculative_backend == "mtp-npu") {
+            s_opts.use_batched_verification = true;
+            s_opts.use_batched_lm_head = true;
+            s_opts.target_bf16_from_layer = 0;
+            s_opts.target_fp32_from_layer = 63;
+          }
           spec_verifier = std::make_unique<speculative::SpeculativeVerifier>(
               *gpu_exec, std::move(draft_backend), s_opts);
         }

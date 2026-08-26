@@ -23,7 +23,10 @@ struct PromptOptions {
   bool force_cpu = false;
   std::string speculative_backend;
   std::string mtp_model_path;
-  std::size_t draft_tokens = 3;
+  std::string dflash_model_path;
+  std::size_t draft_tokens = 7;
+  std::string draft_policy = "rolling";
+  std::size_t min_draft_tokens = 1;
 };
 
 /// Parses command line options for `strix-server prompt`.

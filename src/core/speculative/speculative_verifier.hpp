@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -19,6 +20,11 @@
 
 namespace strix::speculative {
 
+enum class AdaptiveDraftPolicy {
+  kRollingAcceptanceRate,
+  kAcceptedTokenEma,
+};
+
 struct SpeculativeOptions {
   std::uint32_t max_draft_tokens{4};
   std::uint32_t min_draft_tokens{1};
@@ -26,6 +32,12 @@ struct SpeculativeOptions {
   std::size_t rolling_window{16};
   float target_acceptance_rate{0.70F};
   bool enable_adaptive_draft_length{true};
+  AdaptiveDraftPolicy adaptive_draft_policy{
+      AdaptiveDraftPolicy::kRollingAcceptanceRate};
+  bool use_batched_verification{false};
+  bool use_batched_lm_head{false};
+  int target_bf16_from_layer{-1};
+  int target_fp32_from_layer{-1};
 };
 
 struct SpeculativeStats {
@@ -43,6 +55,12 @@ struct SpeculativeStats {
 
 #if defined(ENGINE_ENABLE_HIP)
 
+struct VerificationChunkResult {
+  std::vector<tokenization::TokenId> predictions;
+  std::vector<float> hidden_states;
+  std::size_t hidden_width{0};
+};
+
 class ISpeculativeTargetExecutor {
 public:
   virtual ~ISpeculativeTargetExecutor() = default;
@@ -55,12 +73,51 @@ public:
       bool compute_logits = true) = 0;
   virtual void SaveState(std::uint32_t valid_context) = 0;
   virtual void RestoreState() = 0;
-  virtual void SetPromptHiddenCapture(bool enabled) { (void)enabled; }
+  virtual void SetPromptHiddenCapture(
+      bool enabled, std::span<const std::uint32_t> target_layer_ids = {}) {
+    (void)enabled;
+    (void)target_layer_ids;
+  }
   [[nodiscard]] virtual std::span<const float> GetPromptHiddenStates()
       const noexcept {
     return {};
   }
   [[nodiscard]] virtual std::span<const float> CopyLastHidden() { return {}; }
+  [[nodiscard]] virtual VerificationChunkResult ForwardVerificationChunk(
+      std::span<const tokenization::TokenId> candidate_tokens,
+      std::uint32_t start_pos, bool capture_hidden) {
+    VerificationChunkResult result;
+    result.predictions.reserve(candidate_tokens.size());
+    std::uint32_t pos = start_pos;
+    for (auto tok : candidate_tokens) {
+      result.predictions.push_back(ForwardToken(tok, pos++));
+      if (!capture_hidden) {
+        continue;
+      }
+      const auto hidden = CopyLastHidden();
+      if (hidden.empty()) {
+        throw std::runtime_error(
+            "target executor did not capture a verification hidden state");
+      }
+      if (result.hidden_width == 0) {
+        result.hidden_width = hidden.size();
+      } else if (result.hidden_width != hidden.size()) {
+        throw std::runtime_error(
+            "verification hidden-state width changed within a chunk");
+      }
+      result.hidden_states.insert(result.hidden_states.end(), hidden.begin(),
+                                  hidden.end());
+    }
+    return result;
+  }
+  virtual void CommitVerificationChunk(
+      std::span<const tokenization::TokenId> committed_tokens,
+      std::uint32_t start_pos) {
+    std::uint32_t pos = start_pos;
+    for (const auto token : committed_tokens) {
+      (void)ForwardToken(token, pos++, false);
+    }
+  }
   [[nodiscard]] virtual tokenization::TokenId GetEosTokenId()
       const noexcept = 0;
   [[nodiscard]] virtual std::string_view DecodeToken(
@@ -115,6 +172,8 @@ public:
   void Reset() noexcept;
 
 private:
+  void ConfigureAdaptiveDraftPolicy();
+  void ResetAdaptiveDraftLength() noexcept;
   void UpdateDraftTargetHidden();
   void UpdateAdaptiveDraftLength(std::size_t accepted, std::size_t drafted);
 
@@ -125,6 +184,8 @@ private:
   SpeculativeStats stats_;
   std::uint32_t current_draft_length_{3};
   std::deque<float> rolling_acceptance_;
+  float accepted_token_ema_{2.0F};
+  bool use_batched_verification_{false};
 };
 
 #endif  // defined(ENGINE_ENABLE_HIP)
