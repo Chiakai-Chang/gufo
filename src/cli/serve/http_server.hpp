@@ -5,12 +5,13 @@
 #include <cctype>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/inference_backend.hpp"
+#include "src/cli/serve/text_generation_backend.hpp"
 
 namespace strix::server {
 
@@ -23,7 +24,7 @@ struct HttpRequest {
   std::string query;   // raw query string (no leading '?')
   std::string body;
   std::vector<std::pair<std::string, std::string>> headers;
-  InferenceBackend::CancellationCheck is_cancelled;
+  TextGenerationBackend::CancellationCheck is_cancelled;
 
   /// URL-decoded value of a query param, or "" if absent.
   std::string query_param(const std::string& key) const;
@@ -52,23 +53,32 @@ struct HttpRequest {
 };
 
 struct HttpResponse {
+  using BodyWriter = std::function<bool(std::string_view)>;
+  using StreamingBody = std::function<void(const BodyWriter&)>;
+
   int status = 200;
   std::string reason = "OK";
   std::string body;
   std::vector<std::pair<std::string, std::string>> headers;
+  StreamingBody streaming_body;
 };
 
 using Handler =
-    std::function<HttpResponse(const HttpRequest&, InferenceBackend&)>;
+    std::function<HttpResponse(const HttpRequest&, TextGenerationBackend&)>;
 
-/// Minimal single-process HTTP/1.1 server. One detached worker thread is
-/// spawned per accepted connection.
+/// Minimal bounded HTTP/1.1 server for trusted-LAN model serving.
 class HttpServer {
 public:
   HttpServer(std::string host, int port,
-             std::shared_ptr<InferenceBackend> backend,
+             std::shared_ptr<TextGenerationBackend> backend,
              std::shared_ptr<VideoJobService> video_jobs = nullptr,
              std::shared_ptr<TtsService> tts = nullptr);
+  ~HttpServer();
+
+  HttpServer(const HttpServer&) = delete;
+  HttpServer& operator=(const HttpServer&) = delete;
+  HttpServer(HttpServer&&) = delete;
+  HttpServer& operator=(HttpServer&&) = delete;
 
   void add(const std::string& method, const std::string& path, Handler handler);
 
@@ -80,18 +90,25 @@ public:
 
   void stop();
 
+  [[nodiscard]] int port() const noexcept { return port_; }
+
 private:
+  struct ConnectionWorker;
+
   HttpResponse handle_request(const HttpRequest& req);
   void handle_connection(int client_fd);
+  void reap_workers();
   void register_routes();
 
   std::string host_;
   int port_;
-  std::shared_ptr<InferenceBackend> backend_;
+  std::shared_ptr<TextGenerationBackend> backend_;
   std::shared_ptr<VideoJobService> video_jobs_;
   std::shared_ptr<TtsService> tts_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
+  std::mutex workers_mutex_;
+  std::vector<std::unique_ptr<ConnectionWorker>> workers_;
   std::vector<std::pair<std::pair<std::string, std::string>, Handler>> routes_;
 };
 

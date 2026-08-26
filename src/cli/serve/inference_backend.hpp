@@ -9,8 +9,7 @@
 #include <string_view>
 #include <vector>
 
-#include "src/models/qwen/chat_template.hpp"
-#include "src/models/qwen/tokenizer.hpp"
+#include "src/cli/serve/text_generation_backend.hpp"
 
 namespace strix::hip {
 class QwenGpuModel;
@@ -24,22 +23,10 @@ namespace strix::server {
 
 /// Thread-safe HTTP inference facade over shared immutable GPU model resources
 /// and a bounded pool of request-owned executor sessions.
-class InferenceBackend {
+class InferenceBackend final : public TextGenerationBackend {
 public:
-  using CancellationCheck = std::function<bool()>;
-
-  struct Result {
-    std::string text;
-    std::vector<tokenization::TokenId> tokens;
-    std::size_t prompt_tokens = 0;
-    std::size_t completion_tokens = 0;
-    double ttft_ms = 0.0;
-    double mean_inter_token_ms = 0.0;
-    bool cancelled = false;
-  };
-
   InferenceBackend();
-  ~InferenceBackend();
+  ~InferenceBackend() override;
 
   InferenceBackend(const InferenceBackend&) = delete;
   InferenceBackend& operator=(const InferenceBackend&) = delete;
@@ -62,20 +49,26 @@ public:
 #endif
 
   /// Stable model identifier used in API responses.
-  std::string model_id() const;
+  [[nodiscard]] std::string model_id() const override;
+  [[nodiscard]] bool ready() const override;
+  void set_model_id(const std::string& model_id);
 
   /// Plain text completion (no chat framing).
   Result complete(std::string_view prompt, std::size_t max_tokens,
-                  float temperature,
-                  const CancellationCheck& is_cancelled = {});
+                  float temperature, const CancellationCheck& is_cancelled = {},
+                  const TokenCallback& on_token = {}) override;
 
   /// Framed chat conversation; returns the assistant reply.
+  Result chat(const ChatRequest& request, std::size_t max_tokens,
+              float temperature, const CancellationCheck& is_cancelled = {},
+              const TokenCallback& on_token = {}) override;
+
   Result chat(const std::vector<tokenization::ChatMessage>& messages,
               std::size_t max_tokens, float temperature,
               const CancellationCheck& is_cancelled = {});
 
   /// Token count of raw text (no generation).
-  std::size_t count_tokens(std::string_view text) const;
+  [[nodiscard]] std::size_t count_tokens(std::string_view text) const override;
 
 private:
   struct Impl;

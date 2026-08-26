@@ -65,6 +65,7 @@ void PrintServeHelp(std::string_view program_name,
 
   if (subcommand == "llm") {
     std::string model = "models/Qwen3.5-4B-BF16.gguf";
+    std::string served_model_name;
     std::uint32_t max_context = 4096;
     std::string system_prompt =
         "You are a helpful, respectful, and honest assistant.";
@@ -94,6 +95,9 @@ void PrintServeHelp(std::string_view program_name,
         "-m", "--model", "PATH",
         "Path to GGUF model file (default: models/Qwen3.5-4B-BF16.gguf)",
         "Model", &model);
+    parser.AddOption("", "--served-model-name", "ID",
+                     "Model identifier exposed by the OpenAI API", "Model",
+                     &served_model_name);
     parser.AddOption("-c", "--context", "N",
                      "Maximum context tokens (default: 4096)", "Model",
                      &max_context);
@@ -389,6 +393,7 @@ int RunServe(std::span<const char* const> args) {
   } else {
     // Default to LLM server
     std::string model = "models/Qwen3.5-4B-BF16.gguf";
+    std::string served_model_name;
     std::uint32_t max_context = 4096;
     std::string system_prompt =
         "You are a helpful, respectful, and honest assistant.";
@@ -416,6 +421,9 @@ int RunServe(std::span<const char* const> args) {
         "-m", "--model", "PATH",
         "Path to GGUF model file (default: models/Qwen3.5-4B-BF16.gguf)",
         "Model", &model);
+    llm_parser.AddOption("", "--served-model-name", "ID",
+                         "Model identifier exposed by the OpenAI API", "Model",
+                         &served_model_name);
     llm_parser.AddOption("-c", "--context", "N",
                          "Maximum context tokens (default: 4096)", "Model",
                          &max_context);
@@ -505,6 +513,7 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
+    backend->set_model_id(served_model_name);
   }
 
   server::HttpServer server(host, port, backend, video_jobs, tts);

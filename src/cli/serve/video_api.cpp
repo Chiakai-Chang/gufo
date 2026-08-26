@@ -39,6 +39,7 @@ HttpResponse Error(int status, std::string reason, std::string message,
       .reason = std::move(reason),
       .body = root.dump(),
       .headers = {},
+      .streaming_body = {},
   };
 }
 
@@ -82,6 +83,7 @@ HttpResponse SnapshotResponse(int status, std::string reason,
       .reason = std::move(reason),
       .body = SnapshotValue(snapshot).dump(),
       .headers = {},
+      .streaming_body = {},
   };
 }
 
@@ -720,6 +722,7 @@ HttpResponse VideoContent(std::string_view id, const HttpRequest& request,
                "attachment; filename=\"" + std::string(id) +
                    (content.media_type == "video/mp4" ? ".mp4\"" : ".ppm\"")},
           },
+      .streaming_body = {},
   };
   if (partial) {
     response.headers.emplace_back("Content-Range",
@@ -744,6 +747,7 @@ HttpResponse DeleteVideo(std::string_view id, VideoJobService& service) {
       .reason = "OK",
       .body = root.dump(),
       .headers = {},
+      .streaming_body = {},
   };
 }
 

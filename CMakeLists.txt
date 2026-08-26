@@ -276,6 +276,7 @@ add_executable(strix
   src/cli/serve/video_jobs.cpp
   src/cli/serve/inference_backend.cpp
   src/cli/serve/http_server.cpp
+  src/cli/serve/openai_chat.cpp
 )
 target_link_libraries(strix PRIVATE strix_diagnostics strix_core)
 target_compile_definitions(strix PRIVATE
@@ -382,6 +383,15 @@ if (BUILD_TESTING)
   target_link_libraries(arg_parser_test PRIVATE strix_core)
   add_test(NAME arg_parser_test COMMAND arg_parser_test)
   set_tests_properties(arg_parser_test PROPERTIES LABELS "cpu;cli")
+
+  add_executable(openai_chat_test
+    tests/cli/openai_chat_test.cpp
+    src/cli/serve/openai_chat.cpp
+  )
+  target_link_libraries(openai_chat_test PRIVATE strix_core)
+  add_test(NAME openai_chat_test COMMAND openai_chat_test)
+  set_tests_properties(openai_chat_test PROPERTIES
+    LABELS "cpu;server;api;openai;streaming;tools")
 
   add_executable(prompt_cli_test
     tests/cli/prompt_test.cpp

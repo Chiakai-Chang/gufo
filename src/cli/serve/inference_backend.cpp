@@ -256,6 +256,63 @@ std::string_view ChatRoleName(tokenization::ChatRole role) {
   return "user";
 }
 
+std::string DeepSeekToolsPrompt(const ChatRequest& request) {
+  if (request.tools.empty() ||
+      request.tool_choice == ChatRequest::ToolChoice::kNone) {
+    return {};
+  }
+
+  std::ostringstream prompt;
+  prompt
+      << "\n\n## Tools\n\n"
+      << "You have access to tools. Invoke them with this exact DSML syntax:\n"
+      << "<｜DSML｜tool_calls>\n"
+      << "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
+      << "<｜DSML｜parameter name=\"$PARAMETER_NAME\" "
+         "string=\"true|false\">$PARAMETER_VALUE"
+         "</｜DSML｜parameter>\n"
+      << "</｜DSML｜invoke>\n"
+      << "</｜DSML｜tool_calls>\n\n"
+      << "Available tool schemas:\n";
+  for (const auto& tool : request.tools) {
+    prompt << "{\"type\":\"function\",\"function\":{\"name\":"
+           << std::quoted(tool.name)
+           << ",\"description\":" << std::quoted(tool.description)
+           << ",\"parameters\":"
+           << (tool.parameters_json.empty() ? "{}" : tool.parameters_json)
+           << "}}\n";
+  }
+  if (request.tool_choice == ChatRequest::ToolChoice::kRequired) {
+    prompt << "\nYou must call at least one available tool.";
+  }
+  return prompt.str();
+}
+
+void AppendDeepSeekToolCalls(
+    std::string& content,
+    std::span<const tokenization::ChatMessage::ToolCall> calls) {
+  if (calls.empty()) {
+    return;
+  }
+  content.append("\n<｜DSML｜tool_calls>\n");
+  for (const auto& call : calls) {
+    content.append("<｜DSML｜invoke name=\"");
+    content.append(call.name);
+    content.append("\">\n");
+    for (const auto& argument : call.arguments) {
+      content.append("<｜DSML｜parameter name=\"");
+      content.append(argument.name);
+      content.append("\" string=\"");
+      content.append(argument.is_string ? "true" : "false");
+      content.append("\">");
+      content.append(argument.value);
+      content.append("</｜DSML｜parameter>\n");
+    }
+    content.append("</｜DSML｜invoke>\n");
+  }
+  content.append("</｜DSML｜tool_calls>");
+}
+
 #endif
 
 }  // namespace
@@ -284,8 +341,8 @@ struct InferenceBackend::Impl {
   Result GenerateQwen(std::shared_ptr<const State> current,
                       std::span<const tokenization::TokenId> prompt_tokens,
                       Clock::time_point request_start, std::size_t max_tokens,
-                      float temperature,
-                      const CancellationCheck& is_cancelled) const {
+                      float temperature, const CancellationCheck& is_cancelled,
+                      const TokenCallback& on_token) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     if (current == nullptr || prompt_tokens.empty()) {
@@ -318,7 +375,8 @@ struct InferenceBackend::Impl {
     std::size_t inter_token_samples = 0;
     try {
       result.tokens = lease.Get().Generate(
-          prompt_tokens, options, [&](tokenization::TokenId, std::string_view) {
+          prompt_tokens, options,
+          [&](tokenization::TokenId, std::string_view piece) {
             const auto now = Clock::now();
             if (!previous_token.has_value()) {
               result.ttft_ms =
@@ -333,6 +391,10 @@ struct InferenceBackend::Impl {
               result.cancelled = true;
               return false;
             }
+            if (on_token && !on_token(piece)) {
+              result.cancelled = true;
+              return false;
+            }
             return true;
           });
     } catch (...) {
@@ -342,6 +404,11 @@ struct InferenceBackend::Impl {
 
     result.completion_tokens = result.tokens.size();
     result.text = current->qwen_model->GetTokenizer().Decode(result.tokens);
+    result.finish_reason =
+        result.cancelled
+            ? FinishReason::kCancelled
+            : (result.completion_tokens >= max_tokens ? FinishReason::kLength
+                                                      : FinishReason::kStop);
     if (inter_token_samples > 0) {
       result.mean_inter_token_ms =
           inter_token_total.count() / static_cast<double>(inter_token_samples);
@@ -354,7 +421,8 @@ struct InferenceBackend::Impl {
                           std::span<const int> prompt_tokens,
                           Clock::time_point request_start,
                           std::size_t max_tokens, float temperature,
-                          const CancellationCheck& is_cancelled) const {
+                          const CancellationCheck& is_cancelled,
+                          const TokenCallback& on_token) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     if (current == nullptr || prompt_tokens.empty()) {
@@ -419,7 +487,12 @@ struct InferenceBackend::Impl {
       }
       previous_token = now;
       result.tokens.push_back(static_cast<tokenization::TokenId>(token));
-      result.text += current->deepseek_model->DecodeToken(token);
+      const std::string piece = current->deepseek_model->DecodeToken(token);
+      result.text += piece;
+      if (on_token && !on_token(piece)) {
+        result.cancelled = true;
+        break;
+      }
 
       if (index + 1 < max_tokens && !lease.Get().Evaluate(token, &error)) {
         if (is_cancelled && is_cancelled()) {
@@ -432,6 +505,11 @@ struct InferenceBackend::Impl {
     }
 
     result.completion_tokens = result.tokens.size();
+    result.finish_reason =
+        result.cancelled
+            ? FinishReason::kCancelled
+            : (result.completion_tokens >= max_tokens ? FinishReason::kLength
+                                                      : FinishReason::kStop);
     if (inter_token_samples > 0) {
       result.mean_inter_token_ms =
           inter_token_total.count() / static_cast<double>(inter_token_samples);
@@ -569,9 +647,34 @@ std::string InferenceBackend::model_id() const {
 #endif
 }
 
+bool InferenceBackend::ready() const {
+#if defined(ENGINE_ENABLE_HIP)
+  return impl_->Snapshot() != nullptr;
+#else
+  return false;
+#endif
+}
+
+void InferenceBackend::set_model_id(const std::string& model_id) {
+#if defined(ENGINE_ENABLE_HIP)
+  if (model_id.empty()) {
+    return;
+  }
+  const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+  if (impl_->state == nullptr) {
+    return;
+  }
+  auto updated = std::make_shared<Impl::State>(*impl_->state);
+  updated->model_id = model_id;
+  impl_->state = std::move(updated);
+#else
+  (void)model_id;
+#endif
+}
+
 InferenceBackend::Result InferenceBackend::complete(
     std::string_view prompt, std::size_t max_tokens, float temperature,
-    const CancellationCheck& is_cancelled) {
+    const CancellationCheck& is_cancelled, const TokenCallback& on_token) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
@@ -581,24 +684,25 @@ InferenceBackend::Result InferenceBackend::complete(
   if (state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
     const auto prompt_tokens = state->deepseek_model->Tokenize(prompt);
     return impl_->GenerateDeepSeek(state, prompt_tokens, request_start,
-                                   max_tokens, temperature, is_cancelled);
+                                   max_tokens, temperature, is_cancelled,
+                                   on_token);
   }
   const auto prompt_tokens = state->qwen_model->GetTokenizer().Encode(prompt);
   return impl_->GenerateQwen(state, prompt_tokens, request_start, max_tokens,
-                             temperature, is_cancelled);
+                             temperature, is_cancelled, on_token);
 #else
   (void)prompt;
   (void)max_tokens;
   (void)temperature;
   (void)is_cancelled;
+  (void)on_token;
   return {};
 #endif
 }
 
 InferenceBackend::Result InferenceBackend::chat(
-    const std::vector<tokenization::ChatMessage>& messages,
-    std::size_t max_tokens, float temperature,
-    const CancellationCheck& is_cancelled) {
+    const ChatRequest& request, std::size_t max_tokens, float temperature,
+    const CancellationCheck& is_cancelled, const TokenCallback& on_token) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
@@ -607,32 +711,71 @@ InferenceBackend::Result InferenceBackend::chat(
   }
   if (state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
     std::vector<models::deepseek_v4_flash::ChatMessage> deepseek_messages;
-    deepseek_messages.reserve(messages.size());
-    for (const auto& message : messages) {
+    deepseek_messages.reserve(request.messages.size() + 1);
+    const std::string tools_prompt = DeepSeekToolsPrompt(request);
+    bool tools_rendered = tools_prompt.empty();
+    if (!tools_rendered &&
+        (request.messages.empty() ||
+         (request.messages.front().role != tokenization::ChatRole::kSystem &&
+          request.messages.front().role !=
+              tokenization::ChatRole::kDeveloper))) {
+      deepseek_messages.push_back({
+          .role = "system",
+          .content = tools_prompt,
+      });
+      tools_rendered = true;
+    }
+    for (const auto& message : request.messages) {
+      std::string content = message.content;
+      if (!tools_rendered &&
+          (message.role == tokenization::ChatRole::kSystem ||
+           message.role == tokenization::ChatRole::kDeveloper)) {
+        content += tools_prompt;
+        tools_rendered = true;
+      }
+      if (message.role == tokenization::ChatRole::kAssistant) {
+        AppendDeepSeekToolCalls(content, message.tool_calls);
+      }
       deepseek_messages.push_back({
           .role = std::string(ChatRoleName(message.role)),
-          .content = message.content,
+          .content = std::move(content),
       });
     }
     const auto prompt_tokens =
         state->deepseek_model->EncodeChat(deepseek_messages);
     return impl_->GenerateDeepSeek(state, prompt_tokens, request_start,
-                                   max_tokens, temperature, is_cancelled);
+                                   max_tokens, temperature, is_cancelled,
+                                   on_token);
   }
+  tokenization::ChatTemplateOptions template_options;
+  template_options.require_tool_call =
+      request.tool_choice == ChatRequest::ToolChoice::kRequired;
   const auto prompt_tokens = tokenization::QwenChatTemplate::RenderAndTokenize(
-      state->qwen_model->GetTokenizer(), messages);
+      state->qwen_model->GetTokenizer(), request.messages,
+      request.tool_choice == ChatRequest::ToolChoice::kNone
+          ? std::span<const tokenization::ChatTool>{}
+          : std::span<const tokenization::ChatTool>{request.tools},
+      template_options);
   if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
     return {};
   }
   return impl_->GenerateQwen(state, *prompt_tokens, request_start, max_tokens,
-                             temperature, is_cancelled);
+                             temperature, is_cancelled, on_token);
 #else
-  (void)messages;
+  (void)request;
   (void)max_tokens;
   (void)temperature;
   (void)is_cancelled;
+  (void)on_token;
   return {};
 #endif
+}
+
+InferenceBackend::Result InferenceBackend::chat(
+    const std::vector<tokenization::ChatMessage>& messages,
+    std::size_t max_tokens, float temperature,
+    const CancellationCheck& is_cancelled) {
+  return chat(ChatRequest{messages}, max_tokens, temperature, is_cancelled);
 }
 
 std::size_t InferenceBackend::count_tokens(std::string_view text) const {

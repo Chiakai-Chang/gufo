@@ -1,0 +1,960 @@
+#include "src/cli/serve/openai_chat.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cctype>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <ctime>
+#include <iomanip>
+#include <limits>
+#include <optional>
+#include <random>
+#include <ranges>
+#include <span>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#include "src/cli/serve/json.hpp"
+
+namespace strix::server {
+namespace {
+
+struct ParsedChatRequest {
+  ChatRequest chat;
+  std::string model;
+  std::size_t max_tokens{128};
+  float temperature{0.7F};
+  bool stream{false};
+  bool include_usage{false};
+};
+
+struct ParsedToolCall {
+  std::string id;
+  std::string name;
+  std::vector<tokenization::ChatMessage::ToolArgument> arguments;
+};
+
+struct ParsedGeneration {
+  std::string text;
+  std::vector<ParsedToolCall> tool_calls;
+};
+
+constexpr std::array<std::string_view, 4> kToolMarkers{
+    "<tool_call>",
+    "<｜DSML｜tool_calls>",
+    "<DSML｜tool_calls>",
+    "<tool_calls>",
+};
+
+long long Now() {
+  return static_cast<long long>(std::time(nullptr));
+}
+
+std::string RandomId(std::string_view prefix) {
+  static constexpr std::string_view kCharacters =
+      "abcdefghijklmnopqrstuvwxyz0123456789";
+  static thread_local std::mt19937 generator(std::random_device{}());
+  std::uniform_int_distribution<std::size_t> distribution{
+      0, kCharacters.size() - 1};
+
+  std::string result(prefix);
+  result.reserve(prefix.size() + 20);
+  for (int index = 0; index < 20; ++index) {
+    result.push_back(kCharacters[distribution(generator)]);
+  }
+  return result;
+}
+
+HttpResponse Error(int status, const char* reason, std::string message,
+                   const char* code) {
+  json::Value response = json::Value::object();
+  json::Value error = json::Value::object();
+  error["message"] = std::move(message);
+  error["type"] = "invalid_request_error";
+  error["code"] = code;
+  response["error"] = std::move(error);
+  return {status, reason, response.dump(), {}, {}};
+}
+
+bool IsKnownRole(std::string_view role) {
+  return role == "system" || role == "developer" || role == "user" ||
+         role == "assistant" || role == "tool";
+}
+
+tokenization::ChatRole ParseRole(std::string_view role) {
+  if (role == "system") {
+    return tokenization::ChatRole::kSystem;
+  }
+  if (role == "developer") {
+    return tokenization::ChatRole::kDeveloper;
+  }
+  if (role == "assistant") {
+    return tokenization::ChatRole::kAssistant;
+  }
+  if (role == "tool") {
+    return tokenization::ChatRole::kTool;
+  }
+  return tokenization::ChatRole::kUser;
+}
+
+bool ParseContent(const json::Value* content, std::string* output,
+                  std::string* error) {
+  if (content == nullptr || content->is_null()) {
+    return true;
+  }
+  if (content->is_string()) {
+    *output = content->get_str();
+    return true;
+  }
+  if (!content->is_array()) {
+    *error = "message content must be a string, null, or text-part array";
+    return false;
+  }
+
+  for (const auto& part : content->items()) {
+    if (!part.is_object()) {
+      *error = "message content parts must be objects";
+      return false;
+    }
+    const std::string type = part.member_str("type", "text");
+    if (type != "text" && type != "input_text") {
+      *error = "only text message content is supported";
+      return false;
+    }
+    const json::Value* text = part.find("text");
+    if (text == nullptr || !text->is_string()) {
+      *error = "text message content parts require a string 'text'";
+      return false;
+    }
+    output->append(text->get_str());
+  }
+  return true;
+}
+
+bool ParseArguments(std::string_view arguments,
+                    std::vector<tokenization::ChatMessage::ToolArgument>* out,
+                    std::string* error) {
+  json::Value parsed;
+  try {
+    parsed = json::parse(arguments);
+  } catch (const std::exception& exception) {
+    *error =
+        std::string("tool arguments are not valid JSON: ") + exception.what();
+    return false;
+  }
+  if (!parsed.is_object()) {
+    *error = "tool arguments must encode a JSON object";
+    return false;
+  }
+  for (const auto& [name, value] : parsed.members()) {
+    out->push_back({
+        .name = name,
+        .value = value.is_string() ? value.get_str() : value.dump(),
+        .is_string = value.is_string(),
+    });
+  }
+  return true;
+}
+
+bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
+                  std::string* error) {
+  if (!value.is_object()) {
+    *error = "each message must be an object";
+    return false;
+  }
+  const std::string role = value.member_str("role");
+  if (!IsKnownRole(role)) {
+    *error = "message role must be system, developer, user, assistant, or tool";
+    return false;
+  }
+  message->role = ParseRole(role);
+  message->name = value.member_str("name");
+  message->tool_call_id = value.member_str("tool_call_id");
+  if (!ParseContent(value.find("content"), &message->content, error)) {
+    return false;
+  }
+
+  const json::Value* tool_calls = value.find("tool_calls");
+  if (tool_calls == nullptr) {
+    return true;
+  }
+  if (message->role != tokenization::ChatRole::kAssistant ||
+      !tool_calls->is_array()) {
+    *error = "'tool_calls' is only valid as an array on assistant messages";
+    return false;
+  }
+  for (const auto& item : tool_calls->items()) {
+    if (!item.is_object() ||
+        item.member_str("type", "function") != "function") {
+      *error = "only function tool calls are supported";
+      return false;
+    }
+    const json::Value* function = item.find("function");
+    if (function == nullptr || !function->is_object()) {
+      *error = "assistant tool calls require a function object";
+      return false;
+    }
+    tokenization::ChatMessage::ToolCall call;
+    call.id = item.member_str("id");
+    call.name = function->member_str("name");
+    const std::string arguments = function->member_str("arguments");
+    if (call.name.empty() || arguments.empty() ||
+        !ParseArguments(arguments, &call.arguments, error)) {
+      if (error->empty()) {
+        *error = "assistant tool calls require a name and JSON arguments";
+      }
+      return false;
+    }
+    message->tool_calls.push_back(std::move(call));
+  }
+  return true;
+}
+
+bool ParseTools(const json::Value* tools,
+                std::vector<tokenization::ChatTool>* output,
+                std::string* error) {
+  if (tools == nullptr) {
+    return true;
+  }
+  if (!tools->is_array()) {
+    *error = "'tools' must be an array";
+    return false;
+  }
+  for (const auto& item : tools->items()) {
+    if (!item.is_object() || item.member_str("type") != "function") {
+      *error = "only function tools are supported";
+      return false;
+    }
+    const json::Value* function = item.find("function");
+    if (function == nullptr || !function->is_object()) {
+      *error = "function tools require a function object";
+      return false;
+    }
+    tokenization::ChatTool tool;
+    tool.name = function->member_str("name");
+    tool.description = function->member_str("description");
+    const json::Value* parameters = function->find("parameters");
+    if (tool.name.empty() || parameters == nullptr ||
+        !parameters->is_object()) {
+      *error = "function tools require a name and object parameters schema";
+      return false;
+    }
+    tool.parameters_json = parameters->dump();
+    output->push_back(std::move(tool));
+  }
+  return true;
+}
+
+bool ParseToolChoice(const json::Value* value, ParsedChatRequest* request,
+                     std::string* error) {
+  if (value == nullptr) {
+    return true;
+  }
+  if (value->is_string()) {
+    const std::string choice = value->get_str();
+    if (choice == "auto") {
+      request->chat.tool_choice = ChatRequest::ToolChoice::kAuto;
+      return true;
+    }
+    if (choice == "none") {
+      request->chat.tool_choice = ChatRequest::ToolChoice::kNone;
+      return true;
+    }
+    if (choice == "required") {
+      request->chat.tool_choice = ChatRequest::ToolChoice::kRequired;
+      return true;
+    }
+  }
+  *error = "'tool_choice' must be auto, none, or required";
+  return false;
+}
+
+std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
+                                         TextGenerationBackend& backend,
+                                         ParsedChatRequest* output) {
+  json::Value body;
+  try {
+    body = json::parse(request.body);
+  } catch (const std::exception& exception) {
+    return Error(400, "Bad Request", exception.what(), "parse_error");
+  }
+  if (!body.is_object()) {
+    return Error(400, "Bad Request", "request body must be a JSON object",
+                 "invalid_body");
+  }
+
+  output->model = body.member_str("model");
+  if (output->model.empty()) {
+    return Error(400, "Bad Request", "'model' is required", "missing_model");
+  }
+  if (output->model != backend.model_id()) {
+    return Error(404, "Not Found",
+                 "model '" + output->model + "' is not served by this process",
+                 "model_not_found");
+  }
+
+  const json::Value* messages = body.find("messages");
+  if (messages == nullptr || !messages->is_array() || messages->empty()) {
+    return Error(400, "Bad Request", "'messages' must be a non-empty array",
+                 "missing_messages");
+  }
+  for (const auto& item : messages->items()) {
+    tokenization::ChatMessage message;
+    std::string parse_error;
+    if (!ParseMessage(item, &message, &parse_error)) {
+      return Error(400, "Bad Request", std::move(parse_error),
+                   "invalid_messages");
+    }
+    output->chat.messages.push_back(std::move(message));
+  }
+
+  std::string parse_error;
+  if (!ParseTools(body.find("tools"), &output->chat.tools, &parse_error) ||
+      !ParseToolChoice(body.find("tool_choice"), output, &parse_error)) {
+    return Error(400, "Bad Request", std::move(parse_error), "invalid_tools");
+  }
+  if (output->chat.tool_choice == ChatRequest::ToolChoice::kRequired &&
+      output->chat.tools.empty()) {
+    return Error(400, "Bad Request",
+                 "'tool_choice' cannot be required without tools",
+                 "invalid_tool_choice");
+  }
+
+  if (const json::Value* stream = body.find("stream")) {
+    if (!stream->is_bool()) {
+      return Error(400, "Bad Request", "'stream' must be a boolean",
+                   "invalid_stream");
+    }
+    output->stream = stream->as_bool();
+  }
+  if (const json::Value* options = body.find("stream_options")) {
+    if (!options->is_object()) {
+      return Error(400, "Bad Request", "'stream_options' must be an object",
+                   "invalid_stream_options");
+    }
+    if (const json::Value* include_usage = options->find("include_usage")) {
+      if (!include_usage->is_bool()) {
+        return Error(400, "Bad Request",
+                     "'stream_options.include_usage' must be a boolean",
+                     "invalid_stream_options");
+      }
+      output->include_usage = include_usage->as_bool();
+    }
+  }
+
+  const json::Value* max_tokens = body.find("max_completion_tokens");
+  if (max_tokens == nullptr) {
+    max_tokens = body.find("max_tokens");
+  }
+  if (max_tokens != nullptr) {
+    const double value =
+        max_tokens->is_number() ? max_tokens->as_double() : 0.0;
+    if (!max_tokens->is_number() || !std::isfinite(value) ||
+        std::floor(value) != value || value < 1.0 ||
+        value >
+            static_cast<double>(std::numeric_limits<std::uint32_t>::max())) {
+      return Error(400, "Bad Request",
+                   "'max_tokens' must be a positive integer",
+                   "invalid_max_tokens");
+    }
+    output->max_tokens = max_tokens->as_size();
+  }
+
+  if (const json::Value* temperature = body.find("temperature")) {
+    if (!temperature->is_number() || temperature->as_double() < 0.0 ||
+        temperature->as_double() > 2.0) {
+      return Error(400, "Bad Request", "'temperature' must be between 0 and 2",
+                   "invalid_temperature");
+    }
+    output->temperature = static_cast<float>(temperature->as_double());
+  }
+
+  if (const json::Value* choices = body.find("n");
+      choices != nullptr && (!choices->is_number() || choices->as_int() != 1)) {
+    return Error(400, "Bad Request", "only n=1 is supported", "unsupported_n");
+  }
+  if (const json::Value* top_p = body.find("top_p");
+      top_p != nullptr &&
+      (!top_p->is_number() || std::fabs(top_p->as_double() - 1.0) > 1e-9)) {
+    return Error(400, "Bad Request", "non-default 'top_p' is not implemented",
+                 "unsupported_top_p");
+  }
+  for (const std::string_view unsupported :
+       {"logprobs", "top_logprobs", "logit_bias", "stop", "response_format",
+        "modalities", "audio"}) {
+    if (body.contains(std::string(unsupported))) {
+      return Error(
+          400, "Bad Request",
+          "request field '" + std::string(unsupported) + "' is not implemented",
+          "unsupported_field");
+    }
+  }
+  return std::nullopt;
+}
+
+std::string_view Trim(std::string_view value) {
+  while (!value.empty() &&
+         std::isspace(static_cast<unsigned char>(value.front())) != 0) {
+    value.remove_prefix(1);
+  }
+  while (!value.empty() &&
+         std::isspace(static_cast<unsigned char>(value.back())) != 0) {
+    value.remove_suffix(1);
+  }
+  return value;
+}
+
+std::optional<json::Value> TryParseJson(std::string_view value) noexcept {
+  try {
+    return json::parse(value);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::size_t EarliestMarker(std::string_view text,
+                           std::string_view* marker = nullptr) {
+  std::size_t earliest = std::string_view::npos;
+  for (const auto candidate : kToolMarkers) {
+    const std::size_t position = text.find(candidate);
+    if (position < earliest) {
+      earliest = position;
+      if (marker != nullptr) {
+        *marker = candidate;
+      }
+    }
+  }
+  return earliest;
+}
+
+std::size_t HeldMarkerPrefix(std::string_view text) {
+  const std::size_t maximum = std::min(
+      text.size(), std::string_view{"<｜DSML｜tool_calls>"}.size() - 1);
+  for (std::size_t length = maximum; length > 0; --length) {
+    const std::string_view suffix = text.substr(text.size() - length);
+    if (std::ranges::any_of(kToolMarkers, [&](std::string_view marker) {
+          return marker.starts_with(suffix);
+        })) {
+      return length;
+    }
+  }
+  return 0;
+}
+
+std::string ArgumentsJson(
+    std::span<const tokenization::ChatMessage::ToolArgument> arguments) {
+  json::Value object = json::Value::object();
+  for (const auto& argument : arguments) {
+    if (argument.is_string) {
+      object[argument.name] = argument.value;
+      continue;
+    }
+    try {
+      object[argument.name] = json::parse(argument.value);
+    } catch (...) {
+      object[argument.name] = argument.value;
+    }
+  }
+  return object.dump();
+}
+
+void ParseQwenCalls(std::string_view text, std::vector<ParsedToolCall>* calls) {
+  std::size_t cursor = 0;
+  while ((cursor = text.find("<tool_call>", cursor)) !=
+         std::string_view::npos) {
+    const std::size_t block_end = text.find("</tool_call>", cursor);
+    if (block_end == std::string_view::npos) {
+      return;
+    }
+    const std::string_view block = text.substr(
+        cursor, block_end + std::string_view{"</tool_call>"}.size() - cursor);
+    const std::size_t function = block.find("<function=");
+    if (function == std::string_view::npos) {
+      const std::size_t payload_start =
+          block.find('>', std::string_view{"<tool_call"}.size());
+      if (payload_start != std::string_view::npos) {
+        const std::string_view payload =
+            Trim(block.substr(payload_start + 1,
+                              block.rfind("</tool_call>") - payload_start - 1));
+        const auto parsed = TryParseJson(payload);
+        if (parsed.has_value()) {
+          ParsedToolCall call;
+          call.id = RandomId("call_");
+          call.name = parsed->member_str("name");
+          const json::Value* arguments = parsed->find("arguments");
+          if (!call.name.empty() && arguments != nullptr &&
+              arguments->is_object()) {
+            for (const auto& [name, value] : arguments->members()) {
+              call.arguments.push_back({
+                  .name = name,
+                  .value = value.is_string() ? value.get_str() : value.dump(),
+                  .is_string = value.is_string(),
+              });
+            }
+            calls->push_back(std::move(call));
+          }
+        }
+      }
+      cursor = block_end + std::string_view{"</tool_call>"}.size();
+      continue;
+    }
+    const std::size_t name_start =
+        function + std::string_view{"<function="}.size();
+    const std::size_t name_end = block.find('>', name_start);
+    const std::size_t function_end = block.find("</function>", name_end);
+    if (name_end == std::string_view::npos ||
+        function_end == std::string_view::npos) {
+      return;
+    }
+
+    ParsedToolCall call;
+    call.id = RandomId("call_");
+    call.name =
+        std::string(Trim(block.substr(name_start, name_end - name_start)));
+    std::size_t parameter_cursor = name_end + 1;
+    while ((parameter_cursor = block.find("<parameter=", parameter_cursor)) !=
+           std::string_view::npos) {
+      if (parameter_cursor >= function_end) {
+        break;
+      }
+      const std::size_t parameter_name_start =
+          parameter_cursor + std::string_view{"<parameter="}.size();
+      const std::size_t parameter_name_end =
+          block.find('>', parameter_name_start);
+      const std::size_t parameter_end =
+          block.find("</parameter>", parameter_name_end);
+      if (parameter_name_end == std::string_view::npos ||
+          parameter_end == std::string_view::npos ||
+          parameter_end > function_end) {
+        break;
+      }
+      const std::string_view value = Trim(block.substr(
+          parameter_name_end + 1, parameter_end - parameter_name_end - 1));
+      const bool is_string = !TryParseJson(value).has_value();
+      call.arguments.push_back({
+          .name = std::string(
+              Trim(block.substr(parameter_name_start,
+                                parameter_name_end - parameter_name_start))),
+          .value = std::string(value),
+          .is_string = is_string,
+      });
+      parameter_cursor =
+          parameter_end + std::string_view{"</parameter>"}.size();
+    }
+    if (!call.name.empty()) {
+      calls->push_back(std::move(call));
+    }
+    cursor = block_end + std::string_view{"</tool_call>"}.size();
+  }
+}
+
+std::optional<std::string> Attribute(std::string_view tag,
+                                     std::string_view name) {
+  const std::string prefix = std::string(name) + "=\"";
+  const std::size_t start = tag.find(prefix);
+  if (start == std::string_view::npos) {
+    return std::nullopt;
+  }
+  const std::size_t value_start = start + prefix.size();
+  const std::size_t end = tag.find('"', value_start);
+  if (end == std::string_view::npos) {
+    return std::nullopt;
+  }
+  return std::string(tag.substr(value_start, end - value_start));
+}
+
+void ParseDsmlCalls(std::string_view text, std::vector<ParsedToolCall>* calls) {
+  constexpr std::array<std::string_view, 4> kInvokeStarts{
+      "<｜DSML｜invoke",
+      "<DSML｜invoke",
+      "<｜DS｜invoke",
+      "<DS｜invoke",
+  };
+  constexpr std::array<std::string_view, 4> kInvokeEnds{
+      "</｜DSML｜invoke>",
+      "</DSML｜invoke>",
+      "</｜DS｜invoke>",
+      "</DS｜invoke>",
+  };
+  constexpr std::array<std::string_view, 4> kParameterStarts{
+      "<｜DSML｜parameter",
+      "<DSML｜parameter",
+      "<｜DS｜parameter",
+      "<DS｜parameter",
+  };
+  constexpr std::array<std::string_view, 4> kParameterEnds{
+      "</｜DSML｜parameter>",
+      "</DSML｜parameter>",
+      "</｜DS｜parameter>",
+      "</DS｜parameter>",
+  };
+
+  std::size_t cursor = 0;
+  while (cursor < text.size()) {
+    std::size_t invoke_start = std::string_view::npos;
+    std::size_t syntax = 0;
+    for (std::size_t index = 0; index < kInvokeStarts.size(); ++index) {
+      const std::size_t position = text.find(kInvokeStarts[index], cursor);
+      if (position < invoke_start) {
+        invoke_start = position;
+        syntax = index;
+      }
+    }
+    if (invoke_start == std::string_view::npos) {
+      break;
+    }
+    const std::size_t tag_end = text.find('>', invoke_start);
+    const std::size_t invoke_end = text.find(kInvokeEnds[syntax], tag_end);
+    if (tag_end == std::string_view::npos ||
+        invoke_end == std::string_view::npos) {
+      break;
+    }
+    ParsedToolCall call;
+    call.id = RandomId("call_");
+    const auto name = Attribute(
+        text.substr(invoke_start, tag_end - invoke_start + 1), "name");
+    call.name = name.value_or("");
+
+    std::size_t parameter_cursor = tag_end + 1;
+    while (parameter_cursor < invoke_end) {
+      const std::size_t parameter_start =
+          text.find(kParameterStarts[syntax], parameter_cursor);
+      if (parameter_start == std::string_view::npos ||
+          parameter_start >= invoke_end) {
+        break;
+      }
+      const std::size_t parameter_tag_end = text.find('>', parameter_start);
+      const std::size_t parameter_end =
+          text.find(kParameterEnds[syntax], parameter_tag_end);
+      if (parameter_tag_end == std::string_view::npos ||
+          parameter_end == std::string_view::npos ||
+          parameter_end > invoke_end) {
+        break;
+      }
+      const std::string_view tag =
+          text.substr(parameter_start, parameter_tag_end - parameter_start + 1);
+      const auto parameter_name = Attribute(tag, "name");
+      const auto string_value = Attribute(tag, "string");
+      if (parameter_name.has_value()) {
+        call.arguments.push_back({
+            .name = *parameter_name,
+            .value = std::string(Trim(text.substr(
+                parameter_tag_end + 1, parameter_end - parameter_tag_end - 1))),
+            .is_string = string_value.value_or("true") != "false",
+        });
+      }
+      parameter_cursor = parameter_end + kParameterEnds[syntax].size();
+    }
+    if (!call.name.empty()) {
+      calls->push_back(std::move(call));
+    }
+    cursor = invoke_end + kInvokeEnds[syntax].size();
+  }
+}
+
+ParsedGeneration ParseGeneration(std::string_view raw) {
+  ParsedGeneration parsed;
+  const std::size_t marker = EarliestMarker(raw);
+  if (marker == std::string_view::npos) {
+    parsed.text = std::string(raw);
+    return parsed;
+  }
+  parsed.text = std::string(raw.substr(0, marker));
+  ParseQwenCalls(raw.substr(marker), &parsed.tool_calls);
+  ParseDsmlCalls(raw.substr(marker), &parsed.tool_calls);
+  if (parsed.tool_calls.empty()) {
+    parsed.text = std::string(raw);
+  }
+  return parsed;
+}
+
+const char* FinishReason(const TextGenerationBackend::Result& result,
+                         bool has_tool_calls) {
+  if (has_tool_calls) {
+    return "tool_calls";
+  }
+  if (result.finish_reason == TextGenerationBackend::FinishReason::kLength) {
+    return "length";
+  }
+  return "stop";
+}
+
+json::Value Usage(const TextGenerationBackend::Result& result) {
+  json::Value usage = json::Value::object();
+  usage["prompt_tokens"] = result.prompt_tokens;
+  usage["completion_tokens"] = result.completion_tokens;
+  usage["total_tokens"] = result.prompt_tokens + result.completion_tokens;
+  return usage;
+}
+
+json::Value ToolCallsJson(std::span<const ParsedToolCall> calls) {
+  json::Value output = json::Value::array();
+  for (const auto& call : calls) {
+    json::Value item = json::Value::object();
+    item["id"] = call.id;
+    item["type"] = "function";
+    json::Value function = json::Value::object();
+    function["name"] = call.name;
+    function["arguments"] = ArgumentsJson(call.arguments);
+    item["function"] = std::move(function);
+    output.push_back(std::move(item));
+  }
+  return output;
+}
+
+std::string Sse(const json::Value& value) {
+  return "data: " + value.dump() + "\n\n";
+}
+
+json::Value BaseChunk(std::string_view id, long long created,
+                      std::string_view model) {
+  json::Value chunk = json::Value::object();
+  chunk["id"] = std::string(id);
+  chunk["object"] = "chat.completion.chunk";
+  chunk["created"] = created;
+  chunk["model"] = std::string(model);
+  return chunk;
+}
+
+json::Value ChoiceChunk(std::string_view id, long long created,
+                        std::string_view model, json::Value delta,
+                        const char* finish_reason = nullptr) {
+  json::Value chunk = BaseChunk(id, created, model);
+  json::Value choices = json::Value::array();
+  json::Value choice = json::Value::object();
+  choice["index"] = 0;
+  choice["delta"] = std::move(delta);
+  if (finish_reason == nullptr) {
+    choice["finish_reason"] = json::Value();
+  } else {
+    choice["finish_reason"] = finish_reason;
+  }
+  choices.push_back(std::move(choice));
+  chunk["choices"] = std::move(choices);
+  return chunk;
+}
+
+class StreamingTextFilter {
+public:
+  explicit StreamingTextFilter(std::function<bool(std::string_view)> emit_text)
+      : emit_text_(std::move(emit_text)) {}
+
+  bool Push(std::string_view piece) {
+    raw_.append(piece);
+    if (tool_mode_) {
+      hidden_.append(piece);
+      return true;
+    }
+    pending_.append(piece);
+    const std::size_t marker = EarliestMarker(pending_);
+    if (marker != std::string::npos) {
+      if (marker > 0 && !emit_text_(pending_.substr(0, marker))) {
+        return false;
+      }
+      hidden_ = pending_.substr(marker);
+      pending_.clear();
+      tool_mode_ = true;
+      return true;
+    }
+
+    const std::size_t held = HeldMarkerPrefix(pending_);
+    const std::size_t ready = pending_.size() - held;
+    if (ready > 0 && !emit_text_(pending_.substr(0, ready))) {
+      return false;
+    }
+    pending_.erase(0, ready);
+    return true;
+  }
+
+  bool Finish(bool valid_tool_calls) {
+    if (!tool_mode_) {
+      const bool emitted = pending_.empty() || emit_text_(pending_);
+      pending_.clear();
+      return emitted;
+    }
+    if (!valid_tool_calls && !hidden_.empty()) {
+      return emit_text_(hidden_);
+    }
+    return true;
+  }
+
+  [[nodiscard]] std::string_view raw() const noexcept { return raw_; }
+
+private:
+  std::function<bool(std::string_view)> emit_text_;
+  std::string raw_;
+  std::string pending_;
+  std::string hidden_;
+  bool tool_mode_{false};
+};
+
+HttpResponse NonStreamingResponse(const ParsedChatRequest& request,
+                                  TextGenerationBackend& backend,
+                                  const HttpRequest& http_request) {
+  const auto result =
+      backend.chat(request.chat, request.max_tokens, request.temperature,
+                   http_request.is_cancelled);
+  const ParsedGeneration generated = ParseGeneration(result.text);
+
+  json::Value response = json::Value::object();
+  response["id"] = RandomId("chatcmpl-");
+  response["object"] = "chat.completion";
+  response["created"] = Now();
+  response["model"] = backend.model_id();
+  json::Value choices = json::Value::array();
+  json::Value choice = json::Value::object();
+  choice["index"] = 0;
+  json::Value message = json::Value::object();
+  message["role"] = "assistant";
+  if (generated.text.empty() && !generated.tool_calls.empty()) {
+    message["content"] = json::Value();
+  } else {
+    message["content"] = generated.text;
+  }
+  if (!generated.tool_calls.empty()) {
+    message["tool_calls"] = ToolCallsJson(generated.tool_calls);
+  }
+  choice["message"] = std::move(message);
+  choice["finish_reason"] = FinishReason(result, !generated.tool_calls.empty());
+  choices.push_back(std::move(choice));
+  response["choices"] = std::move(choices);
+  response["usage"] = Usage(result);
+
+  std::ostringstream timing;
+  timing << std::fixed << std::setprecision(3) << "ttft;dur=" << result.ttft_ms
+         << ", inter_token;dur=" << result.mean_inter_token_ms;
+  return {
+      .status = 200,
+      .reason = "OK",
+      .body = response.dump(),
+      .headers = {{"Server-Timing", timing.str()}},
+      .streaming_body = {},
+  };
+}
+
+HttpResponse StreamingResponse(const ParsedChatRequest& request,
+                               TextGenerationBackend& backend,
+                               const HttpRequest& http_request) {
+  const std::string id = RandomId("chatcmpl-");
+  const long long created = Now();
+  const std::string model = backend.model_id();
+  return {
+      .status = 200,
+      .reason = "OK",
+      .body = {},
+      .headers =
+          {
+              {"Content-Type", "text/event-stream"},
+              {"Cache-Control", "no-cache"},
+              {"X-Accel-Buffering", "no"},
+          },
+      .streaming_body =
+          [request, &backend, cancellation = http_request.is_cancelled, id,
+           created, model](const HttpResponse::BodyWriter& writer) {
+            json::Value role_delta = json::Value::object();
+            role_delta["role"] = "assistant";
+            if (!writer(Sse(
+                    ChoiceChunk(id, created, model, std::move(role_delta))))) {
+              return;
+            }
+
+            bool connected = true;
+            StreamingTextFilter filter([&](std::string_view text) {
+              if (text.empty()) {
+                return true;
+              }
+              json::Value delta = json::Value::object();
+              delta["content"] = std::string(text);
+              connected = writer(
+                  Sse(ChoiceChunk(id, created, model, std::move(delta))));
+              return connected;
+            });
+
+            try {
+              const auto result = backend.chat(
+                  request.chat, request.max_tokens, request.temperature,
+                  [&] {
+                    return !connected || (cancellation && cancellation());
+                  },
+                  [&](std::string_view piece) {
+                    return connected && filter.Push(piece);
+                  });
+              if (!connected || result.cancelled) {
+                return;
+              }
+
+              const ParsedGeneration generated = ParseGeneration(filter.raw());
+              if (!filter.Finish(!generated.tool_calls.empty())) {
+                return;
+              }
+              for (std::size_t index = 0; index < generated.tool_calls.size();
+                   ++index) {
+                const auto& call = generated.tool_calls[index];
+                json::Value delta = json::Value::object();
+                json::Value tool_calls = json::Value::array();
+                json::Value item = json::Value::object();
+                item["index"] = index;
+                item["id"] = call.id;
+                item["type"] = "function";
+                json::Value function = json::Value::object();
+                function["name"] = call.name;
+                function["arguments"] = ArgumentsJson(call.arguments);
+                item["function"] = std::move(function);
+                tool_calls.push_back(std::move(item));
+                delta["tool_calls"] = std::move(tool_calls);
+                if (!writer(Sse(
+                        ChoiceChunk(id, created, model, std::move(delta))))) {
+                  return;
+                }
+              }
+
+              json::Value terminal_delta = json::Value::object();
+              if (!writer(Sse(ChoiceChunk(
+                      id, created, model, std::move(terminal_delta),
+                      FinishReason(result, !generated.tool_calls.empty()))))) {
+                return;
+              }
+              if (request.include_usage) {
+                json::Value usage_chunk = BaseChunk(id, created, model);
+                usage_chunk["choices"] = json::Value::array();
+                usage_chunk["usage"] = Usage(result);
+                if (!writer(Sse(usage_chunk))) {
+                  return;
+                }
+              }
+              (void)writer("data: [DONE]\n\n");
+            } catch (const std::exception&) {
+              json::Value error = json::Value::object();
+              json::Value detail = json::Value::object();
+              detail["message"] = "generation failed";
+              detail["type"] = "server_error";
+              detail["code"] = "generation_failed";
+              error["error"] = std::move(detail);
+              (void)writer(Sse(error));
+              (void)writer("data: [DONE]\n\n");
+            }
+          },
+  };
+}
+
+}  // namespace
+
+HttpResponse HandleOpenAiChat(const HttpRequest& request,
+                              TextGenerationBackend& backend) {
+  ParsedChatRequest parsed;
+  if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
+    return std::move(*error);
+  }
+  if (parsed.stream) {
+    return StreamingResponse(parsed, backend, request);
+  }
+  return NonStreamingResponse(parsed, backend, request);
+}
+
+}  // namespace strix::server

@@ -55,6 +55,7 @@ HttpResponse Error(int status, std::string reason, std::string message,
       .reason = std::move(reason),
       .body = root.dump(),
       .headers = {},
+      .streaming_body = {},
   };
 }
 
@@ -130,6 +131,7 @@ HttpResponse Voices(TtsService& service) {
       .reason = "OK",
       .body = root.dump(),
       .headers = {},
+      .streaming_body = {},
   };
 }
 
@@ -325,6 +327,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
                std::to_string(result.codes.size() /
                               std::max<std::uint32_t>(1, result.code_groups))},
           },
+      .streaming_body = {},
   };
 }
 

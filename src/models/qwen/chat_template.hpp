@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
@@ -41,16 +42,46 @@ enum class ChatRole : std::uint8_t {
 
 /// A structured input message for chat formatting.
 struct ChatMessage {
+  ChatMessage() = default;
+  ChatMessage(ChatRole message_role, std::string message_content,
+              std::string message_name = {}, std::string message_thought = {})
+      : role(message_role),
+        content(std::move(message_content)),
+        name(std::move(message_name)),
+        thought(std::move(message_thought)) {}
+
   ChatRole role{ChatRole::kUser};
   std::string content;
   std::string name;     ///< Optional function/tool name
   std::string thought;  ///< Optional thinking/reasoning prefix
+  std::string tool_call_id;
+
+  struct ToolArgument {
+    std::string name;
+    std::string value;
+    bool is_string{true};
+  };
+
+  struct ToolCall {
+    std::string id;
+    std::string name;
+    std::vector<ToolArgument> arguments;
+  };
+
+  std::vector<ToolCall> tool_calls;
+};
+
+struct ChatTool {
+  std::string name;
+  std::string description;
+  std::string parameters_json{"{}"};
 };
 
 /// Formatting options for rendering a conversation into a text prompt.
 struct ChatTemplateOptions {
   bool add_generation_prompt{true};
   bool enable_thinking{false};
+  bool require_tool_call{false};
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
 };
 
@@ -83,11 +114,21 @@ public:
       const ChatTemplateOptions& options = {},
       std::string* error_msg = nullptr);
 
+  [[nodiscard]] static std::optional<std::string> Render(
+      std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
+      const ChatTemplateOptions& options = {},
+      std::string* error_msg = nullptr);
+
   /// Formats messages and tokenizes the rendered prompt with the given
   /// tokenizer.
   [[nodiscard]] static std::optional<std::vector<TokenId>> RenderAndTokenize(
       const QwenTokenizer& tokenizer, std::span<const ChatMessage> messages,
       const ChatTemplateOptions& options = {},
+      std::string* error_msg = nullptr);
+
+  [[nodiscard]] static std::optional<std::vector<TokenId>> RenderAndTokenize(
+      const QwenTokenizer& tokenizer, std::span<const ChatMessage> messages,
+      std::span<const ChatTool> tools, const ChatTemplateOptions& options = {},
       std::string* error_msg = nullptr);
 
 private:

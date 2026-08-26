@@ -234,8 +234,9 @@ void TestChatCorpusConformance() {
     Expect(res.has_value() &&
                *res ==
                    "<|im_start|>user\nFetch "
-                   "weather.<|im_end|>\n<|im_start|>tool\n{\"temp\": 22, "
-                   "\"city\": \"Rome\"}<|im_end|>\n<|im_start|>assistant\n",
+                   "weather.<|im_end|>\n<|im_start|>user\n<tool_response>\n"
+                   "{\"temp\": 22, \"city\": \"Rome\"}\n</tool_response>"
+                   "<|im_end|>\n<|im_start|>assistant\n",
            "Case 2 tool_message matches golden");
   }
 
@@ -253,6 +254,55 @@ void TestChatCorpusConformance() {
   }
 }
 
+void TestToolRendering() {
+  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+
+  strix::tokenization::ChatMessage assistant{
+      strix::tokenization::ChatRole::kAssistant, "", "", ""};
+  assistant.tool_calls.push_back({
+      .id = "call_weather",
+      .name = "get_weather",
+      .arguments =
+          {
+              {
+                  .name = "city",
+                  .value = "Rome",
+                  .is_string = true,
+              },
+          },
+  });
+  const std::vector<strix::tokenization::ChatMessage> messages = {
+      {strix::tokenization::ChatRole::kSystem, "Be concise.", "", ""},
+      {strix::tokenization::ChatRole::kUser, "What is the weather?", "", ""},
+      std::move(assistant),
+  };
+  const std::vector<strix::tokenization::ChatTool> tools = {
+      {
+          .name = "get_weather",
+          .description = "Return current weather",
+          .parameters_json =
+              R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})",
+      },
+  };
+
+  strix::tokenization::ChatTemplateOptions options;
+  options.require_tool_call = true;
+  const auto rendered = tpl->Render(messages, tools, options);
+  Expect(rendered.has_value(), "Tool-aware render succeeds");
+  Expect(rendered->find("# Tools") != std::string::npos,
+         "Tool prompt is rendered");
+  Expect(rendered->find(R"("name":"get_weather")") != std::string::npos,
+         "Tool schema is rendered");
+  Expect(rendered->find("<function=get_weather>") != std::string::npos,
+         "Assistant tool call uses native Qwen syntax");
+  Expect(rendered->find("<parameter=city>\nRome\n</parameter>") !=
+             std::string::npos,
+         "Tool arguments use native Qwen syntax");
+  Expect(rendered->find("You must call at least one available function") !=
+             std::string::npos,
+         "Required tool choice is included in the model prompt");
+}
+
 }  // namespace
 
 int main() {
@@ -263,6 +313,7 @@ int main() {
   TestGgufTemplateExtraction();
   TestRenderAndTokenize();
   TestChatCorpusConformance();
+  TestToolRendering();
   std::cout << "All QwenChatTemplate tests passed successfully!\n";
   return 0;
 }

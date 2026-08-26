@@ -15,14 +15,17 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <random>
 #include <ranges>
 #include <sstream>
+#include <system_error>
 #include <thread>
 #include <utility>
 
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/json.hpp"
+#include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -143,9 +146,10 @@ bool HasHeader(const HttpResponse& response, std::string_view name) {
   });
 }
 
-std::string BuildResponse(const HttpResponse& resp) {
+std::string BuildResponseHead(const HttpResponse& resp,
+                              std::optional<std::size_t> content_length) {
   std::string out;
-  out.reserve(resp.body.size() + 256);
+  out.reserve(256);
   out += "HTTP/1.1 ";
   out += std::to_string(resp.status);
   out += ' ';
@@ -154,7 +158,9 @@ std::string BuildResponse(const HttpResponse& resp) {
   if (!HasHeader(resp, "content-type")) {
     out += "Content-Type: application/json\r\n";
   }
-  out += "Content-Length: " + std::to_string(resp.body.size()) + "\r\n";
+  if (content_length.has_value()) {
+    out += "Content-Length: " + std::to_string(*content_length) + "\r\n";
+  }
   out += "Access-Control-Allow-Origin: *\r\n";
   out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
   out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
@@ -165,6 +171,11 @@ std::string BuildResponse(const HttpResponse& resp) {
     out += "\r\n";
   }
   out += "Connection: close\r\n\r\n";
+  return out;
+}
+
+std::string BuildResponse(const HttpResponse& resp) {
+  std::string out = BuildResponseHead(resp, resp.body.size());
   out += resp.body;
   return out;
 }
@@ -191,11 +202,11 @@ std::string RandomId() {
 }
 
 HttpResponse Ok(const json::Value& v) {
-  return {200, "OK", v.dump(), {}};
+  return {200, "OK", v.dump(), {}, {}};
 }
 
 HttpResponse WithTiming(HttpResponse response,
-                        const InferenceBackend::Result& result) {
+                        const TextGenerationBackend::Result& result) {
   std::ostringstream value;
   value << std::fixed << std::setprecision(3) << "ttft;dur=" << result.ttft_ms
         << ", inter_token;dur=" << result.mean_inter_token_ms;
@@ -211,10 +222,10 @@ HttpResponse Err(int status, const char* reason, const char* message,
   obj["type"] = type;
   obj["code"] = code;
   e["error"] = std::move(obj);
-  return {status, reason, e.dump(), {}};
+  return {status, reason, e.dump(), {}, {}};
 }
 
-HttpResponse NotImplemented(const HttpRequest&, InferenceBackend&) {
+HttpResponse NotImplemented(const HttpRequest&, TextGenerationBackend&) {
   return Err(501, "Not Implemented",
              "endpoint not implemented on this text model", "server_error",
              "not_implemented");
@@ -251,7 +262,7 @@ std::string ContentToString(const json::Value* content) {
 // Endpoint handlers
 // ---------------------------------------------------------------------------
 
-HttpResponse ListModels(InferenceBackend* backend,
+HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts) {
   json::Value resp = json::Value::object();
@@ -299,7 +310,8 @@ HttpResponse ListModels(InferenceBackend* backend,
   return Ok(resp);
 }
 
-HttpResponse OpenAiCompletions(const HttpRequest& req, InferenceBackend& b) {
+HttpResponse OpenAiCompletions(const HttpRequest& req,
+                               TextGenerationBackend& b) {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -350,61 +362,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req, InferenceBackend& b) {
   return WithTiming(Ok(resp), res);
 }
 
-HttpResponse OpenAiChat(const HttpRequest& req, InferenceBackend& b) {
-  json::Value body;
-  try {
-    body = json::parse(req.body);
-  } catch (const std::exception& e) {
-    return Err(400, "Bad Request", e.what(), "invalid_request_error",
-               "parse_error");
-  }
-
-  std::vector<tokenization::ChatMessage> messages;
-  if (const json::Value* msgs = body.find("messages")) {
-    if (msgs->is_array()) {
-      for (const auto& it : msgs->items()) {
-        tokenization::ChatMessage m;
-        m.role = RoleFrom(it.member_str("role", "user"));
-        m.content = ContentToString(it.find("content"));
-        messages.push_back(std::move(m));
-      }
-    }
-  }
-  if (messages.empty()) {
-    return Err(400, "Bad Request", "'messages' is required",
-               "invalid_request_error", "missing_messages");
-  }
-
-  const std::size_t max_tokens = body.member_size("max_tokens", 128);
-  const float temperature =
-      static_cast<float>(body.member_double("temperature", 0.7));
-
-  const auto res = b.chat(messages, max_tokens, temperature, req.is_cancelled);
-
-  json::Value resp = json::Value::object();
-  resp["id"] = "chatcmpl-" + RandomId();
-  resp["object"] = "chat.completion";
-  resp["created"] = Now();
-  resp["model"] = b.model_id();
-  json::Value choices = json::Value::array();
-  json::Value c = json::Value::object();
-  c["index"] = 0;
-  json::Value msg = json::Value::object();
-  msg["role"] = "assistant";
-  msg["content"] = res.text;
-  c["message"] = std::move(msg);
-  c["finish_reason"] = "stop";
-  choices.push_back(std::move(c));
-  resp["choices"] = std::move(choices);
-  json::Value usage = json::Value::object();
-  usage["prompt_tokens"] = res.prompt_tokens;
-  usage["completion_tokens"] = res.completion_tokens;
-  usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
-  resp["usage"] = std::move(usage);
-  return WithTiming(Ok(resp), res);
-}
-
-HttpResponse OpenAiResponses(const HttpRequest& req, InferenceBackend& b) {
+HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -439,7 +397,8 @@ HttpResponse OpenAiResponses(const HttpRequest& req, InferenceBackend& b) {
   const float temperature =
       static_cast<float>(body.member_double("temperature", 0.7));
 
-  const auto res = b.chat(messages, max_tokens, temperature, req.is_cancelled);
+  const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
+                          temperature, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "resp_" + RandomId();
@@ -467,7 +426,8 @@ HttpResponse OpenAiResponses(const HttpRequest& req, InferenceBackend& b) {
   return WithTiming(Ok(resp), res);
 }
 
-HttpResponse AnthropicMessages(const HttpRequest& req, InferenceBackend& b) {
+HttpResponse AnthropicMessages(const HttpRequest& req,
+                               TextGenerationBackend& b) {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -498,7 +458,8 @@ HttpResponse AnthropicMessages(const HttpRequest& req, InferenceBackend& b) {
   const float temperature =
       static_cast<float>(body.member_double("temperature", 1.0));
 
-  const auto res = b.chat(messages, max_tokens, temperature, req.is_cancelled);
+  const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
+                          temperature, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "msg_" + RandomId();
@@ -520,7 +481,8 @@ HttpResponse AnthropicMessages(const HttpRequest& req, InferenceBackend& b) {
   return WithTiming(Ok(resp), res);
 }
 
-HttpResponse AnthropicCountTokens(const HttpRequest& req, InferenceBackend& b) {
+HttpResponse AnthropicCountTokens(const HttpRequest& req,
+                                  TextGenerationBackend& b) {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -553,7 +515,7 @@ HttpResponse AnthropicCountTokens(const HttpRequest& req, InferenceBackend& b) {
   return Ok(resp);
 }
 
-HttpResponse LlamaCompletion(const HttpRequest& req, InferenceBackend& b) {
+HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -583,7 +545,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req, InferenceBackend& b) {
   return WithTiming(Ok(resp), res);
 }
 
-HttpResponse LlamaInfill(const HttpRequest& req, InferenceBackend& b) {
+HttpResponse LlamaInfill(const HttpRequest& req, TextGenerationBackend& b) {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -606,7 +568,7 @@ HttpResponse LlamaInfill(const HttpRequest& req, InferenceBackend& b) {
   return WithTiming(Ok(resp), res);
 }
 
-HttpResponse LlamaProps(const HttpRequest& req, InferenceBackend&) {
+HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend&) {
   const std::string model = req.query_param("model");
   if (model.empty()) {
     return Err(400, "Bad Request", "'model' query parameter is required",
@@ -642,8 +604,14 @@ std::string HttpRequest::query_param(const std::string& key) const {
 // HttpServer
 // ---------------------------------------------------------------------------
 
+struct HttpServer::ConnectionWorker {
+  std::atomic<int> fd{-1};
+  std::atomic<bool> done{false};
+  std::jthread thread;
+};
+
 HttpServer::HttpServer(std::string host, int port,
-                       std::shared_ptr<InferenceBackend> backend,
+                       std::shared_ptr<TextGenerationBackend> backend,
                        std::shared_ptr<VideoJobService> video_jobs,
                        std::shared_ptr<TtsService> tts)
     : host_(std::move(host)),
@@ -652,6 +620,10 @@ HttpServer::HttpServer(std::string host, int port,
       video_jobs_(std::move(video_jobs)),
       tts_(std::move(tts)) {
   register_routes();
+}
+
+HttpServer::~HttpServer() {
+  stop();
 }
 
 void HttpServer::add(const std::string& method, const std::string& path,
@@ -665,7 +637,7 @@ void HttpServer::register_routes() {
   }
   // ---- OpenAI ----
   add("POST", "/v1/completions", OpenAiCompletions);
-  add("POST", "/v1/chat/completions", OpenAiChat);
+  add("POST", "/v1/chat/completions", HandleOpenAiChat);
   add("POST", "/v1/responses", OpenAiResponses);
   add("POST", "/v1/embeddings", NotImplemented);
   add("POST", "/v1/audio/transcriptions", NotImplemented);
@@ -724,38 +696,133 @@ bool HttpServer::start(std::string* error) {
     listen_fd_ = -1;
     return false;
   }
+  if (port_ == 0) {
+    sockaddr_in bound{};
+    socklen_t length = sizeof(bound);
+    if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound),
+                      &length) != 0) {
+      if (error != nullptr) {
+        *error = "getsockname() failed";
+      }
+      ::close(listen_fd_);
+      listen_fd_ = -1;
+      return false;
+    }
+    port_ = ntohs(bound.sin_port);
+  }
   return true;
 }
 
 void HttpServer::run() {
-  std::cout << "strix-server: listening on http://" << host_ << ":" << port_
-            << "\n";
+  std::cout << "strix: listening on http://" << host_ << ":" << port_ << "\n";
   if (backend_ != nullptr) {
-    std::cout << "strix-server: text model " << backend_->model_id() << "\n";
+    std::cout << "strix: text model " << backend_->model_id() << "\n";
   }
   if (video_jobs_ != nullptr && video_jobs_->ready()) {
-    std::cout << "strix-server: MiniMax H3 video API enabled\n";
+    std::cout << "strix: MiniMax H3 video API enabled\n";
   }
   if (tts_ != nullptr && tts_->ready()) {
-    std::cout << "strix-server: Qwen3-TTS audio API enabled\n";
+    std::cout << "strix: Qwen3-TTS audio API enabled\n";
   }
-  while (!stopped_.load()) {
+  constexpr std::size_t kMaximumConnections = 16;
+  while (!stopped_.load(std::memory_order_acquire)) {
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
-    if (client_fd < 0)
+    if (client_fd < 0) {
+      if (stopped_.load(std::memory_order_acquire)) {
+        break;
+      }
       continue;
-    std::thread([this, client_fd] { handle_connection(client_fd); }).detach();
+    }
+    if (stopped_.load(std::memory_order_acquire)) {
+      ::close(client_fd);
+      break;
+    }
+
+    reap_workers();
+    auto worker = std::make_unique<ConnectionWorker>();
+    ConnectionWorker* const worker_ptr = worker.get();
+    bool overloaded = false;
+    {
+      const std::lock_guard<std::mutex> lock(workers_mutex_);
+      overloaded = stopped_.load(std::memory_order_acquire) ||
+                   workers_.size() >= kMaximumConnections;
+      if (!overloaded) {
+        worker_ptr->fd.store(client_fd, std::memory_order_release);
+        worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
+          handle_connection(client_fd);
+          worker_ptr->fd.store(-1, std::memory_order_release);
+          worker_ptr->done.store(true, std::memory_order_release);
+        });
+        workers_.push_back(std::move(worker));
+      }
+    }
+    if (overloaded) {
+      HttpResponse response =
+          Err(503, "Service Unavailable", "connection limit reached",
+              "server_error", "overloaded");
+      response.headers.emplace_back("Retry-After", "1");
+      (void)SendAll(client_fd, BuildResponse(response));
+      ::close(client_fd);
+    }
   }
+  reap_workers();
 }
 
 void HttpServer::stop() {
-  stopped_.store(true);
-  if (listen_fd_ >= 0) {
-    ::close(listen_fd_);
-    listen_fd_ = -1;
+  const bool was_stopped = stopped_.exchange(true, std::memory_order_acq_rel);
+  if (!was_stopped) {
+    const int listen_fd = std::exchange(listen_fd_, -1);
+    if (listen_fd >= 0) {
+      (void)::shutdown(listen_fd, SHUT_RDWR);
+      ::close(listen_fd);
+    }
+  }
+
+  std::vector<std::unique_ptr<ConnectionWorker>> workers;
+  {
+    const std::lock_guard<std::mutex> lock(workers_mutex_);
+    workers = std::move(workers_);
+  }
+  for (const auto& worker : workers) {
+    const int fd = worker->fd.load(std::memory_order_acquire);
+    if (fd >= 0) {
+      (void)::shutdown(fd, SHUT_RDWR);
+    }
+  }
+}
+
+void HttpServer::reap_workers() {
+  std::vector<std::unique_ptr<ConnectionWorker>> finished;
+  {
+    const std::lock_guard<std::mutex> lock(workers_mutex_);
+    auto iterator = workers_.begin();
+    while (iterator != workers_.end()) {
+      if ((*iterator)->done.load(std::memory_order_acquire)) {
+        finished.push_back(std::move(*iterator));
+        iterator = workers_.erase(iterator);
+      } else {
+        ++iterator;
+      }
+    }
   }
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
+  if (req.method == "GET" && req.path == "/health") {
+    json::Value body = json::Value::object();
+    body["status"] = "ok";
+    return Ok(body);
+  }
+  if (req.method == "GET" && req.path == "/ready") {
+    if (backend_ == nullptr || !backend_->ready()) {
+      return Err(503, "Service Unavailable", "text model is not ready",
+                 "server_error", "not_ready");
+    }
+    json::Value body = json::Value::object();
+    body["status"] = "ready";
+    body["model"] = backend_->model_id();
+    return Ok(body);
+  }
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get());
@@ -886,21 +953,29 @@ void HttpServer::handle_connection(int client_fd) {
       resp = Err(400, "Bad Request", "malformed request",
                  "invalid_request_error", "bad_request");
     } else if (req.method == "OPTIONS") {
-      resp = {204, "No Content", "", {}};
+      resp = {204, "No Content", "", {}, {}};
     } else {
       resp = handle_request(req);
     }
 
-    SendAll(client_fd, BuildResponse(resp));
+    if (resp.streaming_body) {
+      if (SendAll(client_fd, BuildResponseHead(resp, std::nullopt))) {
+        resp.streaming_body([client_fd](std::string_view chunk) {
+          return SendAll(client_fd, chunk);
+        });
+      }
+    } else {
+      (void)SendAll(client_fd, BuildResponse(resp));
+    }
   } catch (const std::exception& e) {
     const HttpResponse resp = Err(500, "Internal Server Error", e.what(),
                                   "internal_error", "server_exception");
-    SendAll(client_fd, BuildResponse(resp));
+    (void)SendAll(client_fd, BuildResponse(resp));
   } catch (...) {
     const HttpResponse resp =
         Err(500, "Internal Server Error", "unknown server error",
             "internal_error", "server_exception");
-    SendAll(client_fd, BuildResponse(resp));
+    (void)SendAll(client_fd, BuildResponse(resp));
   }
   ::close(client_fd);
 }
