@@ -334,9 +334,11 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "invalid_request_error", "missing_prompt");
   }
 
-  const std::size_t max_tokens = body.member_size("max_tokens", 128);
-  const float temperature =
-      static_cast<float>(body.member_double("temperature", 0.7));
+  const auto defaults = b.sampling_defaults();
+  const std::size_t max_tokens =
+      body.member_size("max_tokens", defaults.max_tokens);
+  const float temperature = static_cast<float>(
+      body.member_double("temperature", defaults.temperature));
 
   const auto res =
       b.complete(prompt, max_tokens, temperature, req.is_cancelled);
@@ -388,14 +390,15 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
     }
   }
 
-  std::size_t max_tokens = 256;
+  const auto defaults = b.sampling_defaults();
+  std::size_t max_tokens = defaults.max_tokens;
   if (body.contains("max_output_tokens")) {
-    max_tokens = body.member_size("max_output_tokens", 256);
+    max_tokens = body.member_size("max_output_tokens", defaults.max_tokens);
   } else if (body.contains("max_tokens")) {
-    max_tokens = body.member_size("max_tokens", 256);
+    max_tokens = body.member_size("max_tokens", defaults.max_tokens);
   }
-  const float temperature =
-      static_cast<float>(body.member_double("temperature", 0.7));
+  const float temperature = static_cast<float>(
+      body.member_double("temperature", defaults.temperature));
 
   const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
                           temperature, req.is_cancelled);
@@ -454,9 +457,11 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
     }
   }
 
-  const std::size_t max_tokens = body.member_size("max_tokens", 1024);
-  const float temperature =
-      static_cast<float>(body.member_double("temperature", 1.0));
+  const auto defaults = b.sampling_defaults();
+  const std::size_t max_tokens =
+      body.member_size("max_tokens", defaults.max_tokens);
+  const float temperature = static_cast<float>(
+      body.member_double("temperature", defaults.temperature));
 
   const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
                           temperature, req.is_cancelled);
@@ -525,9 +530,11 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   }
 
   const std::string prompt = body.member_str("prompt", "");
-  const std::size_t max_tokens = body.member_size("n_predict", 128);
-  const float temperature =
-      static_cast<float>(body.member_double("temperature", 0.8));
+  const auto defaults = b.sampling_defaults();
+  const std::size_t max_tokens =
+      body.member_size("n_predict", defaults.max_tokens);
+  const float temperature = static_cast<float>(
+      body.member_double("temperature", defaults.temperature));
 
   const auto res =
       b.complete(prompt, max_tokens, temperature, req.is_cancelled);
@@ -556,9 +563,11 @@ HttpResponse LlamaInfill(const HttpRequest& req, TextGenerationBackend& b) {
   // Best effort: the engine only completes forward, so infill runs a plain
   // completion on the prefix (suffix is ignored by the text model).
   const std::string prompt = body.member_str("input_prefix", "");
-  const std::size_t max_tokens = body.member_size("n_predict", 128);
-  const float temperature =
-      static_cast<float>(body.member_double("temperature", 0.7));
+  const auto defaults = b.sampling_defaults();
+  const std::size_t max_tokens =
+      body.member_size("n_predict", defaults.max_tokens);
+  const float temperature = static_cast<float>(
+      body.member_double("temperature", defaults.temperature));
 
   const auto res =
       b.complete(prompt, max_tokens, temperature, req.is_cancelled);

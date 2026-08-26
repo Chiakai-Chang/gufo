@@ -284,6 +284,17 @@ public:
       const std::function<bool(tokenization::TokenId, std::string_view)>&
           on_token = nullptr);
 
+  /// Continues generation from an exact retained prompt prefix.
+  ///
+  /// The executor state must represent prompt_tokens[0:cached_prefix_tokens].
+  /// A zero prefix is a cold prefill over the complete prompt.
+  std::vector<tokenization::TokenId> GenerateFromPrefix(
+      std::span<const tokenization::TokenId> prompt_tokens,
+      std::size_t cached_prefix_tokens,
+      const models::GenerationOptions& options,
+      const std::function<bool(tokenization::TokenId, std::string_view)>&
+          on_token = nullptr);
+
   [[nodiscard]] const core::ModelConfig& GetConfig() const noexcept {
     return weights_.config;
   }
@@ -385,6 +396,7 @@ private:
   std::size_t last_hidden_offset_{0};
   float* d_target_layer_features_{nullptr};
   QwenVerificationPolicy verification_policy_;
+  std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
   bool verification_chunk_active_{false};
   bool replaying_ssm_state_{false};

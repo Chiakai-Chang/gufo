@@ -1,6 +1,7 @@
 #include "src/cli/serve/serve.hpp"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -506,6 +507,12 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("strix", "llm");
       return 0;
     }
+    if (max_tokens == 0 || !std::isfinite(temperature) || temperature < 0.0F ||
+        temperature > 2.0F) {
+      std::cerr << "Error: sampling defaults require max tokens > 0 and "
+                   "temperature in [0, 2]\n";
+      return 2;
+    }
 
     std::string err;
     backend = std::make_shared<server::InferenceBackend>();
@@ -514,6 +521,7 @@ int RunServe(std::span<const char* const> args) {
       return 1;
     }
     backend->set_model_id(served_model_name);
+    backend->set_sampling_defaults(max_tokens, temperature);
   }
 
   server::HttpServer server(host, port, backend, video_jobs, tts);

@@ -303,6 +303,46 @@ void TestToolRendering() {
          "Required tool choice is included in the model prompt");
 }
 
+void TestToolReplayPreservesGeneratedPrefix() {
+  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+
+  constexpr std::string_view kGeneratedText =
+      "<think>\nI should read the requested file.\n</think>\n\n";
+  strix::tokenization::ChatMessage assistant{
+      strix::tokenization::ChatRole::kAssistant, std::string(kGeneratedText),
+      "", ""};
+  assistant.tool_calls.push_back({
+      .id = "call_read",
+      .name = "read",
+      .arguments =
+          {
+              {
+                  .name = "path",
+                  .value = "/etc/hostname",
+                  .is_string = true,
+              },
+          },
+  });
+
+  const std::vector<strix::tokenization::ChatMessage> messages = {
+      std::move(assistant),
+  };
+  strix::tokenization::ChatTemplateOptions options;
+  options.add_generation_prompt = false;
+
+  const auto rendered = tpl->Render(messages, options);
+  Expect(rendered.has_value(), "Assistant tool replay renders");
+
+  const std::string generated =
+      std::string(kGeneratedText) +
+      "<tool_call>\n<function=read>\n<parameter=path>\n/etc/hostname\n"
+      "</parameter>\n</function>\n</tool_call>";
+  const std::string expected =
+      "<|im_start|>assistant\n" + generated + "<|im_end|>\n";
+  Expect(*rendered == expected,
+         "Structured tool replay is byte-identical to generated syntax");
+}
+
 }  // namespace
 
 int main() {
@@ -314,6 +354,7 @@ int main() {
   TestRenderAndTokenize();
   TestChatCorpusConformance();
   TestToolRendering();
+  TestToolReplayPreservesGeneratedPrefix();
   std::cout << "All QwenChatTemplate tests passed successfully!\n";
   return 0;
 }

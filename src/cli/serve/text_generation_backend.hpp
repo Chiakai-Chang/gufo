@@ -46,14 +46,21 @@ public:
     kCancelled,
   };
 
+  struct SamplingDefaults {
+    std::size_t max_tokens{128};
+    float temperature{0.0F};
+  };
+
   struct Result {
     std::string text;
     std::vector<tokenization::TokenId> tokens;
     std::size_t prompt_tokens{0};
+    std::size_t cached_prompt_tokens{0};
     std::size_t completion_tokens{0};
     double ttft_ms{0.0};
     double mean_inter_token_ms{0.0};
     FinishReason finish_reason{FinishReason::kStop};
+    bool cache_hit{false};
     bool cancelled{false};
   };
 
@@ -67,6 +74,9 @@ public:
 
   [[nodiscard]] virtual std::string model_id() const = 0;
   [[nodiscard]] virtual bool ready() const = 0;
+  [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
+    return {};
+  }
 
   virtual Result complete(std::string_view prompt, std::size_t max_tokens,
                           float temperature,

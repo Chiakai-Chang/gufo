@@ -89,6 +89,7 @@ void ds4_session_snapshot_free(ds4_session_snapshot *snapshot);
 void ds4_session_set_cancel(ds4_session *session,
                             ds4_session_cancel_fn callback,
                             void *user_data);
+void ds4_session_invalidate(ds4_session *session);
 int ds4_session_pos(const ds4_session *session);
 int ds4_session_ctx(const ds4_session *session);
 uint64_t ds4_session_payload_bytes(const ds4_session *session);

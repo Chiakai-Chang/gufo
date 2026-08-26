@@ -87,8 +87,13 @@ void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools,
 
 void AppendToolCalls(std::string& output,
                      std::span<const ChatMessage::ToolCall> calls) {
+  bool first_call = true;
   for (const auto& call : calls) {
-    output.append("\n<tool_call>\n<function=");
+    if (!first_call) {
+      output.push_back('\n');
+    }
+    first_call = false;
+    output.append("<tool_call>\n<function=");
     output.append(call.name);
     output.append(">\n");
     for (const auto& argument : call.arguments) {

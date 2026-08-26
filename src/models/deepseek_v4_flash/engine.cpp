@@ -200,6 +200,10 @@ bool Session::Sync(std::span<const int> prompt, std::string* error_msg) {
   return true;
 }
 
+void Session::Invalidate() noexcept {
+  ds4_session_invalidate(session_);
+}
+
 int Session::SelectNext(float temperature, std::uint64_t* rng_state, int top_k,
                         float top_p, float min_p) const {
   if (temperature <= 0.0F) {

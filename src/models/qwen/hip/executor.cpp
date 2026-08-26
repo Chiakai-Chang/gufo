@@ -99,6 +99,7 @@ void QwenGpuExecutor::EnsureVerificationLogits(std::size_t batch_size) {
 
 void QwenGpuExecutor::Reset() noexcept {
   replaying_ssm_state_ = false;
+  next_token_.reset();
   h_prompt_hidden_.clear();
   h_verification_hidden_.clear();
   h_last_hidden_.clear();
@@ -201,15 +202,35 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::Generate(
     const models::GenerationOptions& options,
     const std::function<bool(tokenization::TokenId, std::string_view)>&
         on_token) {
+  next_token_.reset();
+  arena_.Reset();
+  return GenerateFromPrefix(prompt_tokens, 0, options, on_token);
+}
+
+std::vector<tokenization::TokenId> QwenGpuExecutor::GenerateFromPrefix(
+    std::span<const tokenization::TokenId> prompt_tokens,
+    std::size_t cached_prefix_tokens, const models::GenerationOptions& options,
+    const std::function<bool(tokenization::TokenId, std::string_view)>&
+        on_token) {
   std::vector<tokenization::TokenId> output_tokens;
   if (prompt_tokens.empty()) {
     return output_tokens;
   }
+  if (cached_prefix_tokens > prompt_tokens.size()) {
+    throw std::invalid_argument(
+        "cached Qwen prefix exceeds the rendered prompt");
+  }
 
-  arena_.Reset();
-
-  // 1. Batched GPU prompt prefill
-  tokenization::TokenId next_token = ForwardPromptBatch(prompt_tokens);
+  tokenization::TokenId next_token = 0;
+  if (cached_prefix_tokens < prompt_tokens.size()) {
+    next_token =
+        ForwardPromptBatch(prompt_tokens.subspan(cached_prefix_tokens),
+                           static_cast<std::uint32_t>(cached_prefix_tokens));
+  } else if (next_token_.has_value()) {
+    next_token = *next_token_;
+  } else {
+    throw std::logic_error("Qwen retained prefix has no next-token frontier");
+  }
 
   std::size_t cur_pos = prompt_tokens.size();
   const auto eos_id = tokenizer_->GetEosTokenId();
@@ -233,6 +254,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::Generate(
     ++cur_pos;
   }
 
+  next_token_ = next_token;
   return output_tokens;
 }
 

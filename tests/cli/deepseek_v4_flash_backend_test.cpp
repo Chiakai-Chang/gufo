@@ -91,6 +91,30 @@ int main() {
         GenerateDirect(model, model->EncodeChat(direct_messages), 2);
     const auto http_chat = backend.chat(messages, 2, 0.0F);
     Expect(http_chat.tokens == direct_chat, "chat direct/HTTP token parity");
+    Expect(!http_chat.cache_hit, "first chat request is a cache miss");
+
+    auto continued_messages = messages;
+    continued_messages.emplace_back(strix::tokenization::ChatRole::kAssistant,
+                                    http_chat.text);
+    continued_messages.emplace_back(strix::tokenization::ChatRole::kUser,
+                                    "Name a different primary color.");
+    auto continued_direct_messages = direct_messages;
+    continued_direct_messages.push_back(
+        {.role = "assistant", .content = http_chat.text});
+    continued_direct_messages.push_back(
+        {.role = "user", .content = "Name a different primary color."});
+    const auto direct_continuation =
+        GenerateDirect(model, model->EncodeChat(continued_direct_messages), 2);
+    const auto http_continuation = backend.chat(continued_messages, 2, 0.0F);
+    Expect(http_continuation.cache_hit,
+           "continued chat reuses the retained DeepSeek state");
+    Expect(http_continuation.cached_prompt_tokens > 0,
+           "DeepSeek cache reports reused tokens");
+    Expect(http_continuation.cached_prompt_tokens <
+               http_continuation.prompt_tokens,
+           "continued DeepSeek chat prefills only a suffix");
+    Expect(http_continuation.tokens == direct_continuation,
+           "cached DeepSeek continuation differs from cold full prefill");
 
     std::size_t cancellation_checks = 0;
     const auto cancelled =
@@ -103,6 +127,8 @@ int main() {
 
     const auto recovered = backend.complete(raw_prompt, 2, 0.0F);
     Expect(recovered.tokens == direct_raw, "session reuse after cancellation");
+    Expect(!recovered.cache_hit,
+           "cancelled DeepSeek state must not remain cached");
 
     std::cout << "DeepSeek V4 Flash HTTP parity test passed\n";
     return 0;

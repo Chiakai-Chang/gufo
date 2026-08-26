@@ -274,6 +274,7 @@ add_executable(strix
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
+  src/cli/serve/continuation_cache.cpp
   src/cli/serve/inference_backend.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/openai_chat.cpp
@@ -392,6 +393,14 @@ if (BUILD_TESTING)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(continuation_cache_test
+    tests/cli/continuation_cache_test.cpp
+    src/cli/serve/continuation_cache.cpp)
+  target_link_libraries(continuation_cache_test PRIVATE strix_core)
+  add_test(NAME continuation_cache_test COMMAND continuation_cache_test)
+  set_tests_properties(continuation_cache_test PROPERTIES
+    LABELS "cpu;server;cache;state;lifecycle")
 
   add_executable(prompt_cli_test
     tests/cli/prompt_test.cpp
@@ -835,6 +844,7 @@ if (BUILD_TESTING)
 
     add_executable(inference_backend_gpu_test
       tests/cli/inference_backend_gpu_test.cpp
+      src/cli/serve/continuation_cache.cpp
       src/cli/serve/inference_backend.cpp)
     target_link_libraries(inference_backend_gpu_test PRIVATE
       strix_core strix_deepseek_v4_flash hip::host)
@@ -845,6 +855,7 @@ if (BUILD_TESTING)
 
     add_executable(deepseek_v4_flash_backend_test
       tests/cli/deepseek_v4_flash_backend_test.cpp
+      src/cli/serve/continuation_cache.cpp
       src/cli/serve/inference_backend.cpp)
     target_link_libraries(deepseek_v4_flash_backend_test PRIVATE
       strix_core strix_deepseek_v4_flash hip::host)

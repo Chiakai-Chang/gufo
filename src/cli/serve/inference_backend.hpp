@@ -51,7 +51,9 @@ public:
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;
   [[nodiscard]] bool ready() const override;
+  [[nodiscard]] SamplingDefaults sampling_defaults() const override;
   void set_model_id(const std::string& model_id);
+  void set_sampling_defaults(std::size_t max_tokens, float temperature);
 
   /// Plain text completion (no chat framing).
   Result complete(std::string_view prompt, std::size_t max_tokens,

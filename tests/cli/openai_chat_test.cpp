@@ -27,20 +27,27 @@ class FakeBackend final : public strix::server::TextGenerationBackend {
 public:
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
   [[nodiscard]] bool ready() const override { return true; }
+  [[nodiscard]] SamplingDefaults sampling_defaults() const override {
+    return defaults;
+  }
 
   Result complete(std::string_view, std::size_t, float,
                   const CancellationCheck&, const TokenCallback&) override {
     return {};
   }
 
-  Result chat(const strix::server::ChatRequest& request, std::size_t, float,
-              const CancellationCheck& is_cancelled,
+  Result chat(const strix::server::ChatRequest& request, std::size_t max_tokens,
+              float temperature, const CancellationCheck& is_cancelled,
               const TokenCallback& on_token) override {
     ++chat_calls;
     last_request = request;
+    last_max_tokens = max_tokens;
+    last_temperature = temperature;
 
     Result result;
     result.prompt_tokens = 7;
+    result.cached_prompt_tokens = 5;
+    result.cache_hit = true;
     for (const std::string& piece : pieces) {
       if ((is_cancelled && is_cancelled()) || (on_token && !on_token(piece))) {
         result.cancelled = true;
@@ -90,6 +97,9 @@ public:
   std::atomic<bool> completed{false};
   std::atomic<int> chat_calls{0};
   strix::server::ChatRequest last_request;
+  SamplingDefaults defaults;
+  std::size_t last_max_tokens{0};
+  float last_temperature{0.0F};
 
 private:
   std::mutex mutex;
@@ -162,6 +172,8 @@ void TestStreamingIsLive() {
          "Token limit is reported as finish_reason length");
   Expect(output.find(R"("prompt_tokens":7)") != std::string::npos,
          "Usage is emitted when requested");
+  Expect(output.find(R"("cached_tokens":5)") != std::string::npos,
+         "Usage reports transparently reused prompt tokens");
   Expect(output.ends_with("data: [DONE]\n\n"),
          "Stream terminates with the OpenAI DONE sentinel");
 }
@@ -211,12 +223,12 @@ void TestToolCallsAreStructured() {
 void TestDeepSeekToolCallsAreStructured() {
   FakeBackend backend;
   backend.pieces = {
-      "<｜DSML｜tool_calls>\n"
+      "<｜DSML｜tool_calls｜>\n"
       "<｜DS｜invoke name=\"read\">\n"
       "<｜DS｜parameter name=\"path\" string=\"true\">"
       "/etc/hostname</｜DS｜parameter>\n"
       "</｜DS｜invoke>\n"
-      "</｜DSML｜tool_calls>",
+      "</｜DSML｜tool_calls｜>",
   };
 
   const auto response = strix::server::HandleOpenAiChat(Request(R"({
@@ -249,6 +261,38 @@ void TestDeepSeekToolCallsAreStructured() {
       "Hybrid DeepSeek tool arguments are translated");
 }
 
+void TestBackendSamplingDefaults() {
+  FakeBackend backend;
+  backend.defaults = {
+      .max_tokens = 37,
+      .temperature = 0.25F,
+  };
+
+  const auto default_response = strix::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"hello"}]
+      })"),
+                                                                backend);
+  Expect(default_response.status == 200, "Defaulted request is accepted");
+  Expect(backend.last_max_tokens == 37,
+         "Backend max-token default reaches generation");
+  Expect(backend.last_temperature > 0.24F && backend.last_temperature < 0.26F,
+         "Backend temperature default reaches generation");
+
+  const auto override_response = strix::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "max_tokens":11,
+        "temperature":0
+      })"),
+                                                                 backend);
+  Expect(override_response.status == 200, "Sampling override is accepted");
+  Expect(backend.last_max_tokens == 11,
+         "Explicit max tokens override the backend default");
+  Expect(backend.last_temperature == 0.0F,
+         "Explicit temperature overrides the backend default");
+}
+
 void TestWrongModelIsRejected() {
   FakeBackend backend;
   const auto response = strix::server::HandleOpenAiChat(Request(R"({
@@ -268,6 +312,7 @@ void TestWrongModelIsRejected() {
 
 int main() {
   TestStreamingIsLive();
+  TestBackendSamplingDefaults();
   TestToolCallsAreStructured();
   TestDeepSeekToolCallsAreStructured();
   TestWrongModelIsRejected();

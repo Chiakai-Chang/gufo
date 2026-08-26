@@ -1,7 +1,6 @@
 #include "src/cli/serve/inference_backend.hpp"
 
 #include <chrono>
-#include <condition_variable>
 #include <iomanip>
 #include <iostream>
 #include <mutex>
@@ -12,6 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "src/cli/serve/continuation_cache.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/generator.hpp"
 
@@ -39,6 +39,10 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
   line << std::fixed << std::setprecision(3)
        << "{\"event\":\"http_inference\",\"status\":\"" << status
        << "\",\"prompt_tokens\":" << result.prompt_tokens
+       << ",\"cache_hit\":" << (result.cache_hit ? "true" : "false")
+       << ",\"cached_prompt_tokens\":" << result.cached_prompt_tokens
+       << ",\"uncached_prompt_tokens\":"
+       << (result.prompt_tokens - result.cached_prompt_tokens)
        << ",\"completion_tokens\":" << result.completion_tokens
        << ",\"ttft_ms\":" << result.ttft_ms
        << ",\"mean_inter_token_ms\":" << result.mean_inter_token_ms
@@ -47,198 +51,79 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
   std::clog << line.str() << '\n';
 }
 
-class GpuSessionPool {
+class QwenContinuationState final : public ContinuationState {
 public:
-  class Lease {
-  public:
-    Lease() = default;
-    ~Lease() { Release(); }
-
-    Lease(const Lease&) = delete;
-    Lease& operator=(const Lease&) = delete;
-
-    Lease(Lease&& other) noexcept
-        : pool_(std::exchange(other.pool_, nullptr)),
-          index_(std::exchange(other.index_, 0)) {}
-
-    Lease& operator=(Lease&& other) noexcept {
-      if (this != &other) {
-        Release();
-        pool_ = std::exchange(other.pool_, nullptr);
-        index_ = std::exchange(other.index_, 0);
-      }
-      return *this;
-    }
-
-    [[nodiscard]] explicit operator bool() const noexcept {
-      return pool_ != nullptr;
-    }
-
-    [[nodiscard]] hip::QwenGpuExecutor& Get() const {
-      if (pool_ == nullptr) {
-        throw std::logic_error("GPU session lease is empty");
-      }
-      return *pool_->sessions_.at(index_);
-    }
-
-  private:
-    friend class GpuSessionPool;
-
-    Lease(GpuSessionPool* pool, std::size_t index)
-        : pool_(pool), index_(index) {}
-
-    void Release() noexcept {
-      if (pool_ != nullptr) {
-        pool_->Release(index_);
-        pool_ = nullptr;
-      }
-    }
-
-    GpuSessionPool* pool_{nullptr};
-    std::size_t index_{0};
-  };
-
-  GpuSessionPool(std::shared_ptr<const hip::QwenGpuModel> model,
-                 std::uint32_t max_context, std::size_t session_count) {
-    sessions_.reserve(session_count);
-    available_.reserve(session_count);
-    for (std::size_t index = 0; index < session_count; ++index) {
-      std::string error;
-      auto session = hip::QwenGpuExecutor::Create(model, &error, max_context);
-      if (session == nullptr) {
-        throw std::runtime_error("Failed to create GPU session: " + error);
-      }
-      sessions_.push_back(std::move(session));
-      available_.push_back(index);
+  QwenContinuationState(std::shared_ptr<const hip::QwenGpuModel> model,
+                        std::uint32_t max_context) {
+    std::string error;
+    executor_ =
+        hip::QwenGpuExecutor::Create(std::move(model), &error, max_context);
+    if (executor_ == nullptr) {
+      throw std::runtime_error("Failed to create GPU session: " + error);
     }
   }
 
-  [[nodiscard]] Lease Acquire(
-      const InferenceBackend::CancellationCheck& is_cancelled) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    while (available_.empty()) {
-      if (is_cancelled && is_cancelled()) {
-        return {};
-      }
-      condition_.wait_for(lock, std::chrono::milliseconds(10));
-    }
+  void Invalidate() noexcept override { executor_->Reset(); }
 
-    const auto index = available_.back();
-    available_.pop_back();
-    return Lease(this, index);
+  [[nodiscard]] hip::QwenGpuExecutor& executor() const { return *executor_; }
+
+private:
+  std::unique_ptr<hip::QwenGpuExecutor> executor_;
+};
+
+class DeepSeekContinuationState final : public ContinuationState {
+public:
+  DeepSeekContinuationState(
+      const std::shared_ptr<models::deepseek_v4_flash::Model>& model,
+      std::uint32_t max_context) {
+    std::string error;
+    session_ = model->CreateSession(max_context, &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create DeepSeek session: " + error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    session_->SetCancellationCheck({});
+    session_->Invalidate();
+  }
+
+  [[nodiscard]] models::deepseek_v4_flash::Session& session() const {
+    return *session_;
   }
 
 private:
-  void Release(std::size_t index) noexcept {
-    sessions_[index]->Reset();
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      available_.push_back(index);
-    }
-    condition_.notify_one();
-  }
-
-  std::vector<std::unique_ptr<hip::QwenGpuExecutor>> sessions_;
-  std::vector<std::size_t> available_;
-  std::mutex mutex_;
-  std::condition_variable condition_;
+  std::unique_ptr<models::deepseek_v4_flash::Session> session_;
 };
 
-class DeepSeekSessionPool {
-public:
-  class Lease {
-  public:
-    Lease() = default;
-    ~Lease() { Release(); }
-
-    Lease(const Lease&) = delete;
-    Lease& operator=(const Lease&) = delete;
-
-    Lease(Lease&& other) noexcept
-        : pool_(std::exchange(other.pool_, nullptr)),
-          index_(std::exchange(other.index_, 0)) {}
-
-    Lease& operator=(Lease&& other) noexcept {
-      if (this != &other) {
-        Release();
-        pool_ = std::exchange(other.pool_, nullptr);
-        index_ = std::exchange(other.index_, 0);
-      }
-      return *this;
-    }
-
-    [[nodiscard]] explicit operator bool() const noexcept {
-      return pool_ != nullptr;
-    }
-
-    [[nodiscard]] models::deepseek_v4_flash::Session& Get() const {
-      if (pool_ == nullptr) {
-        throw std::logic_error("DeepSeek session lease is empty");
-      }
-      return *pool_->sessions_.at(index_);
-    }
-
-  private:
-    friend class DeepSeekSessionPool;
-
-    Lease(DeepSeekSessionPool* pool, std::size_t index)
-        : pool_(pool), index_(index) {}
-
-    void Release() noexcept {
-      if (pool_ != nullptr) {
-        pool_->Release(index_);
-        pool_ = nullptr;
-      }
-    }
-
-    DeepSeekSessionPool* pool_{nullptr};
-    std::size_t index_{0};
-  };
-
-  DeepSeekSessionPool(std::shared_ptr<models::deepseek_v4_flash::Model> model,
-                      std::uint32_t max_context, std::size_t session_count) {
-    sessions_.reserve(session_count);
-    available_.reserve(session_count);
-    for (std::size_t index = 0; index < session_count; ++index) {
-      std::string error;
-      auto session = model->CreateSession(max_context, &error);
-      if (session == nullptr) {
-        throw std::runtime_error("Failed to create DeepSeek session: " + error);
-      }
-      sessions_.push_back(std::move(session));
-      available_.push_back(index);
-    }
+QwenContinuationState& RequireQwenState(ContinuationState& state) {
+  auto* qwen = dynamic_cast<QwenContinuationState*>(&state);
+  if (qwen == nullptr) {
+    throw std::logic_error("continuation state is not Qwen");
   }
+  return *qwen;
+}
 
-  [[nodiscard]] Lease Acquire(
-      const InferenceBackend::CancellationCheck& is_cancelled) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    while (available_.empty()) {
-      if (is_cancelled && is_cancelled()) {
-        return {};
-      }
-      condition_.wait_for(lock, std::chrono::milliseconds(10));
-    }
-    const auto index = available_.back();
-    available_.pop_back();
-    return Lease(this, index);
+DeepSeekContinuationState& RequireDeepSeekState(ContinuationState& state) {
+  auto* deepseek = dynamic_cast<DeepSeekContinuationState*>(&state);
+  if (deepseek == nullptr) {
+    throw std::logic_error("continuation state is not DeepSeek");
   }
+  return *deepseek;
+}
 
-private:
-  void Release(std::size_t index) noexcept {
-    sessions_[index]->SetCancellationCheck({});
-    {
-      const std::lock_guard<std::mutex> lock(mutex_);
-      available_.push_back(index);
+std::vector<ContinuationToken> DeepSeekContinuationTokens(
+    std::span<const int> tokens) {
+  std::vector<ContinuationToken> converted;
+  converted.reserve(tokens.size());
+  for (const int token : tokens) {
+    if (token < 0) {
+      throw std::invalid_argument("DeepSeek token ID must not be negative");
     }
-    condition_.notify_one();
+    converted.push_back(static_cast<ContinuationToken>(token));
   }
-
-  std::vector<std::unique_ptr<models::deepseek_v4_flash::Session>> sessions_;
-  std::vector<std::size_t> available_;
-  std::mutex mutex_;
-  std::condition_variable condition_;
-};
+  return converted;
+}
 
 std::string_view ChatRoleName(tokenization::ChatRole role) {
   switch (role) {
@@ -263,17 +148,16 @@ std::string DeepSeekToolsPrompt(const ChatRequest& request) {
   }
 
   std::ostringstream prompt;
-  prompt
-      << "\n\n## Tools\n\n"
-      << "You have access to tools. Invoke them with this exact DSML syntax:\n"
-      << "<｜DSML｜tool_calls>\n"
-      << "<｜DSML｜invoke name=\"$TOOL_NAME\">\n"
-      << "<｜DSML｜parameter name=\"$PARAMETER_NAME\" "
-         "string=\"true|false\">$PARAMETER_VALUE"
-         "</｜DSML｜parameter>\n"
-      << "</｜DSML｜invoke>\n"
-      << "</｜DSML｜tool_calls>\n\n"
-      << "Available tool schemas:\n";
+  prompt << "\n\n## Tools\n\n"
+         << "You have access to tools. Invoke them with this exact syntax:\n"
+         << "<｜DSML｜tool_calls｜>\n"
+         << "<｜DS｜invoke name=\"$TOOL_NAME\">\n"
+         << "<｜DS｜parameter name=\"$PARAMETER_NAME\" "
+            "string=\"true|false\">$PARAMETER_VALUE"
+            "</｜DS｜parameter>\n"
+         << "</｜DS｜invoke>\n"
+         << "</｜DSML｜tool_calls｜>\n\n"
+         << "Available tool schemas:\n";
   for (const auto& tool : request.tools) {
     prompt << "{\"type\":\"function\",\"function\":{\"name\":"
            << std::quoted(tool.name)
@@ -294,23 +178,23 @@ void AppendDeepSeekToolCalls(
   if (calls.empty()) {
     return;
   }
-  content.append("\n<｜DSML｜tool_calls>\n");
+  content.append("<｜DSML｜tool_calls｜>\n");
   for (const auto& call : calls) {
-    content.append("<｜DSML｜invoke name=\"");
+    content.append("<｜DS｜invoke name=\"");
     content.append(call.name);
     content.append("\">\n");
     for (const auto& argument : call.arguments) {
-      content.append("<｜DSML｜parameter name=\"");
+      content.append("<｜DS｜parameter name=\"");
       content.append(argument.name);
       content.append("\" string=\"");
       content.append(argument.is_string ? "true" : "false");
       content.append("\">");
       content.append(argument.value);
-      content.append("</｜DSML｜parameter>\n");
+      content.append("</｜DS｜parameter>\n");
     }
-    content.append("</｜DSML｜invoke>\n");
+    content.append("</｜DS｜invoke>\n");
   }
-  content.append("</｜DSML｜tool_calls>");
+  content.append("</｜DSML｜tool_calls｜>");
 }
 
 #endif
@@ -327,10 +211,11 @@ struct InferenceBackend::Impl {
 
     Kind kind = Kind::kQwen;
     std::shared_ptr<const hip::QwenGpuModel> qwen_model;
-    std::shared_ptr<GpuSessionPool> qwen_sessions;
+    std::shared_ptr<ContinuationCache> qwen_continuations;
     std::shared_ptr<models::deepseek_v4_flash::Model> deepseek_model;
-    std::shared_ptr<DeepSeekSessionPool> deepseek_sessions;
+    std::shared_ptr<ContinuationCache> deepseek_continuations;
     std::string model_id;
+    SamplingDefaults sampling_defaults;
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
@@ -354,12 +239,15 @@ struct InferenceBackend::Impl {
       return result;
     }
 
-    auto lease = current->qwen_sessions->Acquire(is_cancelled);
+    auto lease =
+        current->qwen_continuations->Acquire(prompt_tokens, is_cancelled);
     if (!lease) {
       result.cancelled = true;
       EmitRequestMetrics(result, "cancelled");
       return result;
     }
+    result.cache_hit = lease.cache_hit();
+    result.cached_prompt_tokens = lease.cached_tokens();
     if (is_cancelled && is_cancelled()) {
       result.cancelled = true;
       EmitRequestMetrics(result, "cancelled");
@@ -374,29 +262,33 @@ struct InferenceBackend::Impl {
     std::chrono::duration<double, std::milli> inter_token_total{0};
     std::size_t inter_token_samples = 0;
     try {
-      result.tokens = lease.Get().Generate(
-          prompt_tokens, options,
-          [&](tokenization::TokenId, std::string_view piece) {
-            const auto now = Clock::now();
-            if (!previous_token.has_value()) {
-              result.ttft_ms =
-                  std::chrono::duration<double, std::milli>(now - request_start)
-                      .count();
-            } else {
-              inter_token_total += now - *previous_token;
-              ++inter_token_samples;
-            }
-            previous_token = now;
-            if (is_cancelled && is_cancelled()) {
-              result.cancelled = true;
-              return false;
-            }
-            if (on_token && !on_token(piece)) {
-              result.cancelled = true;
-              return false;
-            }
-            return true;
-          });
+      result.tokens =
+          RequireQwenState(lease.state())
+              .executor()
+              .GenerateFromPrefix(
+                  prompt_tokens, result.cached_prompt_tokens, options,
+                  [&](tokenization::TokenId, std::string_view piece) {
+                    const auto now = Clock::now();
+                    if (!previous_token.has_value()) {
+                      result.ttft_ms =
+                          std::chrono::duration<double, std::milli>(
+                              now - request_start)
+                              .count();
+                    } else {
+                      inter_token_total += now - *previous_token;
+                      ++inter_token_samples;
+                    }
+                    previous_token = now;
+                    if (is_cancelled && is_cancelled()) {
+                      result.cancelled = true;
+                      return false;
+                    }
+                    if (on_token && !on_token(piece)) {
+                      result.cancelled = true;
+                      return false;
+                    }
+                    return true;
+                  });
     } catch (...) {
       EmitRequestMetrics(result, "error");
       throw;
@@ -412,6 +304,13 @@ struct InferenceBackend::Impl {
     if (inter_token_samples > 0) {
       result.mean_inter_token_ms =
           inter_token_total.count() / static_cast<double>(inter_token_samples);
+    }
+    if (!result.cancelled) {
+      std::vector<ContinuationToken> checkpoint(prompt_tokens.begin(),
+                                                prompt_tokens.end());
+      checkpoint.insert(checkpoint.end(), result.tokens.begin(),
+                        result.tokens.end());
+      lease.Commit(std::move(checkpoint));
     }
     EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
     return result;
@@ -434,16 +333,21 @@ struct InferenceBackend::Impl {
       return result;
     }
 
-    auto lease = current->deepseek_sessions->Acquire(is_cancelled);
+    auto continuation_prompt = DeepSeekContinuationTokens(prompt_tokens);
+    auto lease = current->deepseek_continuations->Acquire(continuation_prompt,
+                                                          is_cancelled);
     if (!lease) {
       result.cancelled = true;
       EmitRequestMetrics(result, "cancelled");
       return result;
     }
-    lease.Get().SetCancellationCheck(is_cancelled);
+    result.cache_hit = lease.cache_hit();
+    result.cached_prompt_tokens = lease.cached_tokens();
+    auto& session = RequireDeepSeekState(lease.state()).session();
+    session.SetCancellationCheck(is_cancelled);
 
     std::string error;
-    if (!lease.Get().Sync(prompt_tokens, &error)) {
+    if (!session.Sync(prompt_tokens, &error)) {
       if (is_cancelled && is_cancelled()) {
         result.cancelled = true;
         EmitRequestMetrics(result, "cancelled");
@@ -460,14 +364,13 @@ struct InferenceBackend::Impl {
     std::uint64_t rng_state =
         (static_cast<std::uint64_t>(random_device()) << 32U) ^
         static_cast<std::uint64_t>(random_device());
-
     for (std::size_t index = 0; index < max_tokens; ++index) {
       if (is_cancelled && is_cancelled()) {
         result.cancelled = true;
         break;
       }
       const int token =
-          lease.Get().SelectNext(temperature, &rng_state, 0, 1.0F, 0.05F);
+          session.SelectNext(temperature, &rng_state, 0, 1.0F, 0.05F);
       if (token < 0) {
         EmitRequestMetrics(result, "error");
         throw std::runtime_error("DeepSeek token selection failed");
@@ -494,7 +397,7 @@ struct InferenceBackend::Impl {
         break;
       }
 
-      if (index + 1 < max_tokens && !lease.Get().Evaluate(token, &error)) {
+      if (index + 1 < max_tokens && !session.Evaluate(token, &error)) {
         if (is_cancelled && is_cancelled()) {
           result.cancelled = true;
           break;
@@ -513,6 +416,20 @@ struct InferenceBackend::Impl {
     if (inter_token_samples > 0) {
       result.mean_inter_token_ms =
           inter_token_total.count() / static_cast<double>(inter_token_samples);
+    }
+    session.SetCancellationCheck({});
+    if (!result.cancelled) {
+      continuation_prompt.insert(continuation_prompt.end(),
+                                 result.tokens.begin(), result.tokens.end());
+      const int checkpoint_position = session.Position();
+      if (checkpoint_position < 0 ||
+          static_cast<std::size_t>(checkpoint_position) >
+              continuation_prompt.size()) {
+        throw std::runtime_error(
+            "DeepSeek checkpoint position exceeds generated token history");
+      }
+      continuation_prompt.resize(static_cast<std::size_t>(checkpoint_position));
+      lease.Commit(std::move(continuation_prompt));
     }
     EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
     return result;
@@ -589,8 +506,10 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     auto new_state = std::make_shared<Impl::State>();
     new_state->kind = Impl::State::Kind::kQwen;
     new_state->qwen_model = std::move(model);
-    new_state->qwen_sessions = std::make_shared<GpuSessionPool>(
-        new_state->qwen_model, max_context, session_count);
+    new_state->qwen_continuations = std::make_shared<ContinuationCache>(
+        session_count, [model = new_state->qwen_model, max_context] {
+          return std::make_unique<QwenContinuationState>(model, max_context);
+        });
     new_state->model_id = new_state->qwen_model->GetConfig().model_name;
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
@@ -623,8 +542,11 @@ bool InferenceBackend::load(
     auto new_state = std::make_shared<Impl::State>();
     new_state->kind = Impl::State::Kind::kDeepSeekV4Flash;
     new_state->deepseek_model = std::move(model);
-    new_state->deepseek_sessions = std::make_shared<DeepSeekSessionPool>(
-        new_state->deepseek_model, max_context, session_count);
+    new_state->deepseek_continuations = std::make_shared<ContinuationCache>(
+        session_count, [model = new_state->deepseek_model, max_context] {
+          return std::make_unique<DeepSeekContinuationState>(model,
+                                                             max_context);
+        });
     new_state->model_id = new_state->deepseek_model->ModelName();
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
@@ -655,6 +577,15 @@ bool InferenceBackend::ready() const {
 #endif
 }
 
+InferenceBackend::SamplingDefaults InferenceBackend::sampling_defaults() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->sampling_defaults : SamplingDefaults{};
+#else
+  return {};
+#endif
+}
+
 void InferenceBackend::set_model_id(const std::string& model_id) {
 #if defined(ENGINE_ENABLE_HIP)
   if (model_id.empty()) {
@@ -669,6 +600,25 @@ void InferenceBackend::set_model_id(const std::string& model_id) {
   impl_->state = std::move(updated);
 #else
   (void)model_id;
+#endif
+}
+
+void InferenceBackend::set_sampling_defaults(std::size_t max_tokens,
+                                             float temperature) {
+#if defined(ENGINE_ENABLE_HIP)
+  const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+  if (impl_->state == nullptr) {
+    return;
+  }
+  auto updated = std::make_shared<Impl::State>(*impl_->state);
+  updated->sampling_defaults = {
+      .max_tokens = max_tokens,
+      .temperature = temperature,
+  };
+  impl_->state = std::move(updated);
+#else
+  (void)max_tokens;
+  (void)temperature;
 #endif
 }
 

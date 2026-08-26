@@ -96,6 +96,32 @@ int main(int argc, const char* const* argv) {
     const auto http_chat = backend.chat(messages, 2, 0.0F);
     Expect(http_chat.tokens == direct_chat,
            "chat HTTP and direct executor tokens differ");
+    Expect(!http_chat.cache_hit, "first chat request must be a cache miss");
+
+    auto continued_messages = messages;
+    continued_messages.emplace_back(strix::tokenization::ChatRole::kAssistant,
+                                    http_chat.text);
+    continued_messages.emplace_back(strix::tokenization::ChatRole::kUser,
+                                    "Name a different primary color.");
+    const auto rendered_continuation =
+        strix::tokenization::QwenChatTemplate::Render(continued_messages);
+    Expect(rendered_continuation.has_value(),
+           "continued chat prompt rendering");
+    const auto continuation_prompt =
+        model->GetTokenizer().Encode(*rendered_continuation);
+    const auto direct_continuation =
+        GenerateDirect(*direct, continuation_prompt, 2);
+    const auto http_continuation = backend.chat(continued_messages, 2, 0.0F);
+    Expect(http_continuation.cache_hit,
+           "continued chat must reuse the retained Qwen state");
+    Expect(http_continuation.cached_prompt_tokens ==
+               chat_prompt.size() + http_chat.tokens.size(),
+           "Qwen cache reports the exact executed prefix");
+    Expect(http_continuation.cached_prompt_tokens <
+               http_continuation.prompt_tokens,
+           "continued Qwen chat prefills only a suffix");
+    Expect(http_continuation.tokens == direct_continuation,
+           "cached Qwen continuation differs from cold full prefill");
 
     std::size_t free_before = 0;
     std::size_t total_memory = 0;
@@ -130,6 +156,8 @@ int main(int argc, const char* const* argv) {
     const auto recovered = backend.complete(raw_prompt, 2, 0.0F);
     Expect(recovered.tokens == direct_raw,
            "session was not reusable after cancellation and error");
+    Expect(!recovered.cache_hit,
+           "cancelled or failed Qwen state must not remain cached");
 
     HIP_CHECK(hipDeviceSynchronize());
     std::size_t free_after = 0;

@@ -90,6 +90,7 @@ public:
   [[nodiscard]] bool RestoreSnapshot(const SessionSnapshot& snapshot,
                                      std::string* error_msg = nullptr);
   void SetCancellationCheck(CancellationCheck is_cancelled);
+  void Invalidate() noexcept;
 
   [[nodiscard]] int Position() const;
   [[nodiscard]] int ContextSize() const;

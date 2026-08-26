@@ -28,8 +28,8 @@ namespace {
 struct ParsedChatRequest {
   ChatRequest chat;
   std::string model;
-  std::size_t max_tokens{128};
-  float temperature{0.7F};
+  std::size_t max_tokens{0};
+  float temperature{0.0F};
   bool stream{false};
   bool include_usage{false};
 };
@@ -45,10 +45,9 @@ struct ParsedGeneration {
   std::vector<ParsedToolCall> tool_calls;
 };
 
-constexpr std::array<std::string_view, 4> kToolMarkers{
-    "<tool_call>",
-    "<｜DSML｜tool_calls>",
-    "<DSML｜tool_calls>",
+constexpr std::array<std::string_view, 7> kToolMarkers{
+    "<tool_call>",          "<｜DSML｜tool_calls｜>", "<｜DSML｜tool_calls>",
+    "<DSML｜tool_calls｜>", "<DSML｜tool_calls>",     "<tool_calls｜>",
     "<tool_calls>",
 };
 
@@ -434,8 +433,12 @@ std::size_t EarliestMarker(std::string_view text,
 }
 
 std::size_t HeldMarkerPrefix(std::string_view text) {
-  const std::size_t maximum = std::min(
-      text.size(), std::string_view{"<｜DSML｜tool_calls>"}.size() - 1);
+  std::size_t maximum_marker = 0;
+  for (const auto marker : kToolMarkers) {
+    maximum_marker = std::max(maximum_marker, marker.size());
+  }
+  const std::size_t maximum =
+      std::min(text.size(), maximum_marker > 0 ? maximum_marker - 1 : 0);
   for (std::size_t length = maximum; length > 0; --length) {
     const std::string_view suffix = text.substr(text.size() - length);
     if (std::ranges::any_of(kToolMarkers, [&](std::string_view marker) {
@@ -690,6 +693,9 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   usage["prompt_tokens"] = result.prompt_tokens;
   usage["completion_tokens"] = result.completion_tokens;
   usage["total_tokens"] = result.prompt_tokens + result.completion_tokens;
+  json::Value prompt_details = json::Value::object();
+  prompt_details["cached_tokens"] = result.cached_prompt_tokens;
+  usage["prompt_tokens_details"] = std::move(prompt_details);
   return usage;
 }
 
@@ -948,6 +954,9 @@ HttpResponse StreamingResponse(const ParsedChatRequest& request,
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend) {
   ParsedChatRequest parsed;
+  const auto defaults = backend.sampling_defaults();
+  parsed.max_tokens = defaults.max_tokens;
+  parsed.temperature = defaults.temperature;
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }

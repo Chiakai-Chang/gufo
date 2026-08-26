@@ -85,6 +85,11 @@ void ds4_session_set_cancel(ds4_session *session,
     session->cancel_user_data = user_data;
 }
 
+void ds4_session_invalidate(ds4_session *session) {
+    if (!session) return;
+    session->checkpoint_valid = false;
+}
+
 int ds4_session_sync(ds4_session *session,
                      const ds4_tokens *prompt,
                      char *error,
