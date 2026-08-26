@@ -62,12 +62,12 @@ int main(int argc, const char* const* argv) {
     Expect(model->GetWeightRegionCount() == reader->GetMappedRegions().size(),
            "every mapped GGUF shard must have one shared GPU region");
 
-    constexpr std::uint32_t context = 512;
+    constexpr std::uint32_t context = 256;
     auto direct = strix::hip::QwenGpuExecutor::Create(model, &error, context);
     Expect(direct != nullptr, error);
 
     strix::server::InferenceBackend backend;
-    Expect(backend.load(model, &error, context, 1), error);
+    Expect(backend.load(model, &error, context, 2), error);
     Expect(backend.model_id() == model->GetConfig().model_name,
            "HTTP model identifier");
 
@@ -122,6 +122,42 @@ int main(int argc, const char* const* argv) {
            "continued Qwen chat prefills only a suffix");
     Expect(http_continuation.tokens == direct_continuation,
            "cached Qwen continuation differs from cold full prefill");
+
+    strix::server::ChatRequest concurrent_a({
+        {strix::tokenization::ChatRole::kUser,
+         "Continue this sequence with a few words: one, two, three,", "", ""},
+    });
+    concurrent_a.client_id = "batch-a";
+    strix::server::ChatRequest concurrent_b({
+        {strix::tokenization::ChatRole::kUser,
+         "Complete this phrase with a few words: red, green, blue,", "", ""},
+    });
+    concurrent_b.client_id = "batch-b";
+    const auto rendered_a =
+        strix::tokenization::QwenChatTemplate::Render(concurrent_a.messages);
+    const auto rendered_b =
+        strix::tokenization::QwenChatTemplate::Render(concurrent_b.messages);
+    Expect(rendered_a.has_value() && rendered_b.has_value(),
+           "concurrent chat prompt rendering");
+    const auto direct_a =
+        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_a), 4);
+    const auto direct_b =
+        GenerateDirect(*direct, model->GetTokenizer().Encode(*rendered_b), 4);
+
+    auto pending_a = backend.start_chat(concurrent_a, 4, 0.0F);
+    auto pending_b = backend.start_chat(concurrent_b, 4, 0.0F);
+    const auto concurrent_result_a = pending_a->Wait();
+    const auto concurrent_result_b = pending_b->Wait();
+    Expect(concurrent_result_a.tokens == direct_a,
+           "concurrent Qwen request A differs from isolated execution");
+    Expect(concurrent_result_b.tokens == direct_b,
+           "concurrent Qwen request B differs from isolated execution");
+    Expect(concurrent_result_a.physical_execution_width == 2 &&
+               concurrent_result_b.physical_execution_width == 2,
+           "concurrent Qwen requests did not execute through W=2");
+    Expect(concurrent_result_a.execution_plan == "batched-w2" &&
+               concurrent_result_b.execution_plan == "batched-w2",
+           "concurrent Qwen requests did not report the W=2 plan");
 
     std::size_t free_before = 0;
     std::size_t total_memory = 0;

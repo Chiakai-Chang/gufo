@@ -31,6 +31,7 @@ using strix::server::TextPrefillPolicy;
 using strix::server::TextPrefillStep;
 using strix::server::TextRequestMetadata;
 using strix::server::TextRequestPhase;
+using strix::server::TextRunnerAdvance;
 using strix::server::TextRunnerCapabilities;
 using strix::server::TextRunnerDescriptor;
 using strix::server::TextRunnerPool;
@@ -117,9 +118,16 @@ struct FakeControl {
     return events;
   }
 
+  [[nodiscard]] std::vector<std::vector<TextRunnerToken>> AdvanceBatches()
+      const {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return advance_batches;
+  }
+
   mutable std::mutex mutex;
   std::condition_variable condition;
   std::vector<Event> events;
+  std::vector<std::vector<TextRunnerToken>> advance_batches;
   std::optional<TextRunnerToken> block_advance_label;
   std::optional<TextRunnerToken> block_prefill_label;
   std::optional<TextRunnerToken> throw_advance_label;
@@ -132,6 +140,7 @@ struct FakeControl {
   std::atomic<std::size_t> invalidations{0};
   std::atomic<std::size_t> states_created{0};
   bool incremental_prefill{true};
+  bool supports_batched_advance{false};
 };
 
 class FakeState final : public TextRunnerState {
@@ -198,10 +207,21 @@ public:
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
-    return {{
+    std::vector<TextExecutionPlan> plans{{
         .kind = TextExecutionPlanKind::kSerial,
         .physical_width = 1,
     }};
+    if (control_->supports_batched_advance) {
+      plans.push_back({
+          .kind = TextExecutionPlanKind::kBatched,
+          .physical_width = 2,
+      });
+      plans.push_back({
+          .kind = TextExecutionPlanKind::kBatched,
+          .physical_width = 4,
+      });
+    }
+    return plans;
   }
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
@@ -320,6 +340,22 @@ public:
     ++fake.position;
     ++fake.decode_count;
     fake.frontier = token + 1;
+  }
+
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    std::vector<TextRunnerToken> labels;
+    labels.reserve(advances.size());
+    for (const auto& advance : advances) {
+      labels.push_back(RequireFakeState(advance.state.get()).label);
+    }
+    {
+      const std::lock_guard<std::mutex> lock(control_->mutex);
+      control_->advance_batches.push_back(std::move(labels));
+    }
+    for (const auto& advance : advances) {
+      Advance(advance.state.get(), advance.token);
+    }
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(
@@ -744,6 +780,37 @@ void TestMidGenerationAdmissionAndIsolatedTrajectories() {
          "request B begins prefill before request A completes");
 }
 
+void TestMidGenerationRequestJoinsNextDecodeBatch() {
+  auto control = std::make_shared<FakeControl>();
+  control->supports_batched_advance = true;
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 2);
+
+  auto request_a = scheduler->Submit({1}, 8, 0.0F);
+  control->WaitForAdvance(1);
+  auto request_b = scheduler->Submit({2}, 4, 0.0F);
+  control->ReleaseAdvance();
+
+  const auto result_a = request_a.Wait();
+  const auto result_b = request_b.Wait();
+  Expect(result_a.tokens == ExpectedTokens(1, 8) &&
+             result_b.tokens == ExpectedTokens(2, 4),
+         "dynamic batching preserves both isolated trajectories");
+
+  bool joined = false;
+  for (const auto& labels : control->AdvanceBatches()) {
+    joined = joined || labels == std::vector<TextRunnerToken>({1, 2}) ||
+             labels == std::vector<TextRunnerToken>({2, 1});
+  }
+  Expect(joined,
+         "request B joins request A at a decode boundary after prefill");
+  Expect(result_a.physical_execution_width == 2 &&
+             result_b.physical_execution_width == 2 &&
+             result_a.execution_plan == "batched-w2" &&
+             result_b.execution_plan == "batched-w2",
+         "joined requests report the real W=2 execution plan");
+}
+
 void TestFifoReplacementAdmissionWithOneSlot() {
   auto control = std::make_shared<FakeControl>();
   control->block_advance_label = 1;
@@ -892,6 +959,7 @@ int main() {
   TestSlowConsumerOutputIsBoundedAndReclaimed();
   TestGeneratedOutputLimitAppliesWithoutStreaming();
   TestMidGenerationAdmissionAndIsolatedTrajectories();
+  TestMidGenerationRequestJoinsNextDecodeBatch();
   TestFifoReplacementAdmissionWithOneSlot();
   TestQueuedAndPrefillCancellation();
   TestDecodeCancellationAndStateReclamation();

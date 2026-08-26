@@ -178,10 +178,24 @@ public:
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
-    return {{
-        .kind = TextExecutionPlanKind::kSerial,
-        .physical_width = 1,
-    }};
+    return {
+        {
+            .kind = TextExecutionPlanKind::kSerial,
+            .physical_width = 1,
+        },
+        {
+            .kind = TextExecutionPlanKind::kBatched,
+            .physical_width = 2,
+        },
+        {
+            .kind = TextExecutionPlanKind::kBatched,
+            .physical_width = 4,
+        },
+        {
+            .kind = TextExecutionPlanKind::kBatched,
+            .physical_width = 8,
+        },
+    };
   }
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
@@ -272,6 +286,42 @@ public:
         token, static_cast<std::uint32_t>(qwen.position()));
     qwen.set_position(qwen.position() + 1);
     qwen.set_frontier(frontier);
+  }
+
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    if (advances.size() < 2 || advances.size() > 8) {
+      throw std::invalid_argument(
+          "Qwen batched decode requires two to eight sessions");
+    }
+
+    std::vector<hip::QwenGpuBatchItem> items;
+    std::vector<QwenTextRunnerState*> states;
+    items.reserve(advances.size());
+    states.reserve(advances.size());
+    for (const auto& advance : advances) {
+      auto& qwen = RequireQwenState(advance.state.get());
+      if (!qwen.frontier().has_value() || advance.token != *qwen.frontier()) {
+        throw std::logic_error(
+            "Qwen batched token does not match a retained frontier");
+      }
+      states.push_back(&qwen);
+      items.push_back({
+          .executor = &qwen.executor(),
+          .token_id = advance.token,
+          .position = static_cast<std::uint32_t>(qwen.position()),
+      });
+    }
+
+    const auto frontiers = hip::QwenGpuExecutor::ForwardTokenBatch(items);
+    if (frontiers.size() != states.size()) {
+      throw std::runtime_error(
+          "Qwen batched decode returned an invalid frontier count");
+    }
+    for (std::size_t index = 0; index < states.size(); ++index) {
+      states[index]->set_position(states[index]->position() + 1);
+      states[index]->set_frontier(frontiers[index]);
+    }
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(

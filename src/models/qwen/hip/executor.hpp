@@ -30,6 +30,13 @@
 namespace strix::hip {
 
 class HipblasLtGemm;
+class QwenGpuExecutor;
+
+struct QwenGpuBatchItem {
+  QwenGpuExecutor* executor{nullptr};
+  tokenization::TokenId token_id{0};
+  std::uint32_t position{0};
+};
 
 struct QwenVerificationPolicy {
   bool batched_lm_head{false};
@@ -321,6 +328,12 @@ public:
   [[nodiscard]] tokenization::TokenId ForwardToken(
       tokenization::TokenId token_id, std::uint32_t pos,
       bool compute_logits = true);
+
+  /// Advances two to eight independent retained sessions in one
+  /// layer-synchronous decode step. Stateless projections share weight reads;
+  /// every row still addresses its own KV cache and recurrent state.
+  [[nodiscard]] static std::vector<tokenization::TokenId> ForwardTokenBatch(
+      std::span<const QwenGpuBatchItem> items);
 
   /// Runs batched prompt prefill on GPU, returning the first predicted token
   /// ID.

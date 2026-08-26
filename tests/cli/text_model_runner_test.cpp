@@ -1,6 +1,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -20,6 +21,7 @@ using strix::server::TextExecutionPlan;
 using strix::server::TextExecutionPlanKind;
 using strix::server::TextModelRunner;
 using strix::server::TextPrefillStep;
+using strix::server::TextRunnerAdvance;
 using strix::server::TextRunnerCapabilities;
 using strix::server::TextRunnerDescriptor;
 using strix::server::TextRunnerPool;
@@ -39,6 +41,7 @@ struct FakeStats {
   std::size_t invalidations{0};
   std::vector<std::size_t> prefill_spans;
   std::vector<TextRunnerToken> advanced_tokens;
+  std::vector<std::vector<TextRunnerToken>> advanced_batches;
 };
 
 class FakeState final : public TextRunnerState {
@@ -114,10 +117,20 @@ public:
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
-    return {{
-        .kind = TextExecutionPlanKind::kSerial,
-        .physical_width = 1,
-    }};
+    return {
+        {
+            .kind = TextExecutionPlanKind::kSerial,
+            .physical_width = 1,
+        },
+        {
+            .kind = TextExecutionPlanKind::kBatched,
+            .physical_width = 2,
+        },
+        {
+            .kind = TextExecutionPlanKind::kBatched,
+            .physical_width = 4,
+        },
+    };
   }
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
@@ -201,6 +214,19 @@ public:
     ++fake.decode_count;
   }
 
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    std::vector<TextRunnerToken> tokens;
+    tokens.reserve(advances.size());
+    for (const auto& advance : advances) {
+      tokens.push_back(advance.token);
+    }
+    stats_->advanced_batches.push_back(std::move(tokens));
+    for (const auto& advance : advances) {
+      Advance(advance.state.get(), advance.token);
+    }
+  }
+
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireFakeState(state).position;
@@ -282,6 +308,37 @@ void TestAbandonedRequestRollsBackState() {
   retry.Invalidate();
 }
 
+void TestBatchedAdvancePreservesIndependentRequests() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<FakeRunner>(stats);
+  TextRunnerPool pool(runner, 2);
+
+  auto first = pool.Acquire({1});
+  auto second = pool.Acquire({2});
+  Expect(first.Prefill(1).decode_ready && second.Prefill(1).decode_ready,
+         "independent requests reach their decode frontiers");
+  Expect(
+      first.SelectNext(0.0F).token == 90 && second.SelectNext(0.0F).token == 90,
+      "independent requests select their pending tokens");
+
+  const auto plan = pool.SelectDecodePlan(2);
+  Expect(
+      plan.kind == TextExecutionPlanKind::kBatched && plan.physical_width == 2,
+      "two ready requests select W=2");
+
+  std::array<TextRunnerPool::Request*, 2> requests{&first, &second};
+  pool.AdvanceBatch(requests, plan);
+  Expect(stats->advanced_batches ==
+             std::vector<std::vector<TextRunnerToken>>{{90, 90}},
+         "one batched runner call receives both request tokens");
+
+  Expect(
+      first.SelectNext(0.0F).token == 91 && second.SelectNext(0.0F).token == 91,
+      "batched advance independently updates both request states");
+  first.Invalidate();
+  second.Invalidate();
+}
+
 void TestResourceClaimsAreValidatedBeforeAllocation() {
   auto stats = std::make_shared<FakeStats>();
   bool rejected = false;
@@ -315,6 +372,7 @@ void TestMeasuredStateIsReconciledWithClaim() {
 int main() {
   TestBoundedPrefillDecodeAndPrefixReuse();
   TestAbandonedRequestRollsBackState();
+  TestBatchedAdvancePreservesIndependentRequests();
   TestResourceClaimsAreValidatedBeforeAllocation();
   TestMeasuredStateIsReconciledWithClaim();
   std::cout << "All text model runner tests passed\n";

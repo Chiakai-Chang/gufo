@@ -20,6 +20,7 @@ using TextRunnerToken = ContinuationToken;
 
 enum class TextExecutionPlanKind : std::uint8_t {
   kSerial,
+  kBatched,
 };
 
 struct TextExecutionPlan {
@@ -76,6 +77,11 @@ public:
   }
 };
 
+struct TextRunnerAdvance {
+  std::reference_wrapper<TextRunnerState> state;
+  TextRunnerToken token{0};
+};
+
 /// Coarse text-model adapter used by cache, scheduling, and HTTP layers.
 ///
 /// Prefill and Advance are the only model execution work units. SelectNext
@@ -112,6 +118,7 @@ public:
       TextRunnerState& state, float temperature,
       std::uint64_t* rng_state) const = 0;
   virtual void Advance(TextRunnerState& state, TextRunnerToken token) const = 0;
+  virtual void AdvanceBatch(std::span<const TextRunnerAdvance> advances) const;
   [[nodiscard]] virtual std::size_t CheckpointPosition(
       const TextRunnerState& state) const = 0;
 };
@@ -164,6 +171,10 @@ public:
 
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  [[nodiscard]] TextExecutionPlan SelectDecodePlan(
+      std::size_t ready_requests) const;
+  void AdvanceBatch(std::span<Request*> requests,
+                    const TextExecutionPlan& plan);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
 

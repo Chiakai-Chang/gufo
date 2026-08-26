@@ -54,10 +54,24 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
         "text runner must expose at least one execution plan");
   }
   bool supports_serial_single = false;
-  for (const auto& plan : plans) {
+  for (std::size_t index = 0; index < plans.size(); ++index) {
+    const auto& plan = plans[index];
     if (plan.physical_width == 0) {
       throw std::invalid_argument(
           "text runner execution plan width must be at least one");
+    }
+    if ((plan.kind == TextExecutionPlanKind::kSerial &&
+         plan.physical_width != 1) ||
+        (plan.kind == TextExecutionPlanKind::kBatched &&
+         plan.physical_width < 2)) {
+      throw std::invalid_argument(
+          "text runner execution plan kind and width are inconsistent");
+    }
+    for (std::size_t previous = 0; previous < index; ++previous) {
+      if (plans[previous] == plan) {
+        throw std::invalid_argument(
+            "text runner execution plans must be unique");
+      }
     }
     supports_serial_single = supports_serial_single ||
                              (plan.kind == TextExecutionPlanKind::kSerial &&
@@ -95,6 +109,13 @@ std::uint64_t MakeRngState() {
 }
 
 }  // namespace
+
+void TextModelRunner::AdvanceBatch(
+    std::span<const TextRunnerAdvance> advances) const {
+  for (const auto& advance : advances) {
+    Advance(advance.state.get(), advance.token);
+  }
+}
 
 struct TextRunnerPool::Impl {
   Impl(std::shared_ptr<TextModelRunner> model_runner, std::size_t state_count)
@@ -295,6 +316,87 @@ const TextModelRunner& TextRunnerPool::runner() const noexcept {
 
 std::size_t TextRunnerPool::capacity() const noexcept {
   return impl_->cache.capacity();
+}
+
+TextExecutionPlan TextRunnerPool::SelectDecodePlan(
+    std::size_t ready_requests) const {
+  if (ready_requests == 0) {
+    throw std::invalid_argument(
+        "decode plan requires at least one ready request");
+  }
+
+  const auto serial =
+      std::find_if(impl_->validated.plans.begin(), impl_->validated.plans.end(),
+                   [](const TextExecutionPlan& plan) {
+                     return plan.kind == TextExecutionPlanKind::kSerial &&
+                            plan.physical_width == 1;
+                   });
+  if (ready_requests == 1) {
+    return *serial;
+  }
+
+  const TextExecutionPlan* smallest_covering = nullptr;
+  const TextExecutionPlan* widest_available = nullptr;
+  for (const auto& plan : impl_->validated.plans) {
+    if (plan.kind != TextExecutionPlanKind::kBatched) {
+      continue;
+    }
+    if (widest_available == nullptr ||
+        plan.physical_width > widest_available->physical_width) {
+      widest_available = &plan;
+    }
+    if (plan.physical_width >= ready_requests &&
+        (smallest_covering == nullptr ||
+         plan.physical_width < smallest_covering->physical_width)) {
+      smallest_covering = &plan;
+    }
+  }
+  if (smallest_covering != nullptr) {
+    return *smallest_covering;
+  }
+  if (widest_available != nullptr) {
+    return *widest_available;
+  }
+  return *serial;
+}
+
+void TextRunnerPool::AdvanceBatch(std::span<Request*> requests,
+                                  const TextExecutionPlan& plan) {
+  if (plan.kind != TextExecutionPlanKind::kBatched || requests.size() < 2 ||
+      requests.size() > plan.physical_width) {
+    throw std::invalid_argument("invalid batched text execution plan");
+  }
+  if (std::find(impl_->validated.plans.begin(), impl_->validated.plans.end(),
+                plan) == impl_->validated.plans.end()) {
+    throw std::invalid_argument(
+        "text runner does not support the requested batched plan");
+  }
+
+  std::vector<TextRunnerAdvance> advances;
+  advances.reserve(requests.size());
+  for (std::size_t index = 0; index < requests.size(); ++index) {
+    auto* request = requests[index];
+    if (request == nullptr || !*request ||
+        request->impl_->runner != impl_->validated.runner ||
+        !request->impl_->pending_selection.has_value()) {
+      throw std::logic_error("invalid request in batched text advance");
+    }
+    const auto previous_requests = requests.first(index);
+    if (std::find(previous_requests.begin(), previous_requests.end(),
+                  request) != previous_requests.end()) {
+      throw std::invalid_argument(
+          "batched text advance contains a duplicate request");
+    }
+    advances.push_back({
+        .state = dynamic_cast<TextRunnerState&>(request->impl_->lease.state()),
+        .token = request->impl_->pending_selection->token,
+    });
+  }
+
+  impl_->validated.runner->AdvanceBatch(advances);
+  for (auto* request : requests) {
+    request->impl_->pending_selection.reset();
+  }
 }
 
 TextRunnerPool::Request TextRunnerPool::Acquire(
