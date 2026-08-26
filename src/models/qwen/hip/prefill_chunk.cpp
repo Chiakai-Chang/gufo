@@ -283,6 +283,15 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // which replaces both the tiled kernel and the AOTriton prefix plus merge
       // that the split path used. Falls through to the previous routes when the
       // shape is unsupported or an alternative is pinned.
+      // opt-c180-kv-resync: the fused QK-norm/RoPE kernel above already wrote
+      // this chunk's K and V into *both* the FP32 cache and its FP16 mirror,
+      // and earlier chunks did the same for the prefix, as do all three decode
+      // paths. So the attention launcher's own pack pass rewrites identical
+      // bytes, and its prefix sync re-converts a prefix that already matches --
+      // work that grows linearly with depth. The unfused fallback below only
+      // applies RoPE in place and never touches the cache, so it still needs
+      // the pack.
+      const bool kv_already_written = fused_qknorm_rope_kv;
       bool wmma_attention = false;
       if (detail::ShouldUseWmmaPrefillAttention()) {
         wmma_attention = LaunchQwenWmmaAttention(
@@ -292,7 +301,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
             arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
             arena_.GetMaxContext(), config.num_attention_heads,
-            config.num_key_value_heads, config.head_dim, arena_.stream);
+            config.num_key_value_heads, config.head_dim, arena_.stream,
+            /*lse_out=*/nullptr, /*key_begin=*/0,
+            /*skip_kv_write=*/kv_already_written);
         if (wmma_attention) {
           detail::EmitAttentionDispatch("prefill_wmma", "");
         }
