@@ -6,8 +6,8 @@
 namespace strix::server {
 
 /// Handles the supported OpenAI Chat Completions subset. Streaming responses
-/// use HttpResponse::streaming_body and apply socket backpressure directly to
-/// model generation.
+/// consume scheduler-published token pieces from HttpResponse::streaming_body;
+/// socket writes never own or execute model state.
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend);
 

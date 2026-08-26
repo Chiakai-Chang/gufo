@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "src/cli/serve/continuation_cache.hpp"
+#include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -371,7 +372,7 @@ struct InferenceBackend::Impl {
     };
 
     Kind kind = Kind::kQwen;
-    std::shared_ptr<TextRunnerPool> qwen_requests;
+    std::shared_ptr<TextGenerationScheduler> qwen_scheduler;
     std::shared_ptr<models::deepseek_v4_flash::Model> deepseek_model;
     std::shared_ptr<ContinuationCache> deepseek_continuations;
     std::string model_id;
@@ -399,83 +400,16 @@ struct InferenceBackend::Impl {
       return result;
     }
 
-    auto request =
-        current->qwen_requests->Acquire(std::move(prompt_tokens), is_cancelled);
-    if (!request) {
-      result.cancelled = true;
-      EmitRequestMetrics(result, "cancelled");
-      return result;
-    }
-    result.cache_hit = request.cache_hit();
-    result.cached_prompt_tokens = request.cached_prompt_tokens();
-    if (is_cancelled && is_cancelled()) {
-      result.cancelled = true;
-      EmitRequestMetrics(result, "cancelled");
-      return result;
-    }
-
-    std::optional<Clock::time_point> previous_token;
-    std::chrono::duration<double, std::milli> inter_token_total{0};
-    std::size_t inter_token_samples = 0;
     try {
-      if (!request.prefill_complete()) {
-        (void)request.Prefill(request.prompt_tokens() -
-                              request.cached_prompt_tokens());
-      }
-
-      const std::size_t token_limit = max_tokens > 0 ? max_tokens : 1;
-      for (std::size_t index = 0; index < token_limit; ++index) {
-        if (is_cancelled && is_cancelled()) {
-          result.cancelled = true;
-          break;
-        }
-
-        const auto selection = request.SelectNext(temperature);
-        if (selection.stop) {
-          break;
-        }
-
-        const auto now = Clock::now();
-        if (!previous_token.has_value()) {
-          result.ttft_ms =
-              std::chrono::duration<double, std::milli>(now - request_start)
-                  .count();
-        } else {
-          inter_token_total += now - *previous_token;
-          ++inter_token_samples;
-        }
-        previous_token = now;
-        result.tokens.push_back(selection.token);
-
-        if (is_cancelled && is_cancelled()) {
-          result.cancelled = true;
-          break;
-        }
-        if (on_token && !on_token(selection.piece)) {
-          result.cancelled = true;
-          break;
-        }
-        request.Advance();
-      }
+      auto request = current->qwen_scheduler->Submit(
+          std::move(prompt_tokens), max_tokens, temperature, is_cancelled,
+          static_cast<bool>(on_token), request_start);
+      result = request.Wait(on_token);
     } catch (...) {
       EmitRequestMetrics(result, "error");
       throw;
     }
 
-    result.completion_tokens = result.tokens.size();
-    result.text = current->qwen_requests->runner().Decode(result.tokens);
-    result.finish_reason =
-        result.cancelled
-            ? FinishReason::kCancelled
-            : (result.completion_tokens >= max_tokens ? FinishReason::kLength
-                                                      : FinishReason::kStop);
-    if (inter_token_samples > 0) {
-      result.mean_inter_token_ms =
-          inter_token_total.count() / static_cast<double>(inter_token_samples);
-    }
-    if (!result.cancelled) {
-      request.Commit();
-    }
     EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
     return result;
   }
@@ -672,8 +606,10 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     auto runner =
         std::make_shared<QwenTextRunner>(std::move(model), max_context);
     new_state->model_id = runner->Descriptor().model_id;
-    new_state->qwen_requests =
+    auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);
+    new_state->qwen_scheduler =
+        std::make_shared<TextGenerationScheduler>(std::move(runner_pool));
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -800,7 +736,7 @@ InferenceBackend::Result InferenceBackend::complete(
                                    max_tokens, temperature, is_cancelled,
                                    on_token);
   }
-  auto prompt_tokens = state->qwen_requests->runner().Tokenize(prompt);
+  auto prompt_tokens = state->qwen_scheduler->runner().Tokenize(prompt);
   return impl_->GenerateQwen(state, std::move(prompt_tokens), request_start,
                              max_tokens, temperature, is_cancelled, on_token);
 #else
@@ -861,7 +797,7 @@ InferenceBackend::Result InferenceBackend::chat(
                                    on_token);
   }
   auto prompt_tokens =
-      state->qwen_requests->runner().RenderAndTokenize(request);
+      state->qwen_scheduler->runner().RenderAndTokenize(request);
   if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
     return {};
   }
@@ -893,7 +829,7 @@ std::size_t InferenceBackend::count_tokens(std::string_view text) const {
   if (state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
     return state->deepseek_model->Tokenize(text).size();
   }
-  return state->qwen_requests->runner().Tokenize(text).size();
+  return state->qwen_scheduler->runner().Tokenize(text).size();
 #else
   (void)text;
   return 0;

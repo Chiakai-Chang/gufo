@@ -276,6 +276,7 @@ add_executable(strix
   src/cli/serve/video_jobs.cpp
   src/cli/serve/continuation_cache.cpp
   src/cli/serve/text_model_runner.cpp
+  src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
   src/cli/serve/http_server.cpp
   src/cli/serve/openai_chat.cpp
@@ -411,6 +412,17 @@ if (BUILD_TESTING)
   add_test(NAME text_model_runner_test COMMAND text_model_runner_test)
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
+
+  add_executable(text_generation_scheduler_test
+    tests/cli/text_generation_scheduler_test.cpp
+    src/cli/serve/continuation_cache.cpp
+    src/cli/serve/text_model_runner.cpp
+    src/cli/serve/text_generation_scheduler.cpp)
+  target_link_libraries(text_generation_scheduler_test PRIVATE strix_core)
+  add_test(NAME text_generation_scheduler_test
+    COMMAND text_generation_scheduler_test)
+  set_tests_properties(text_generation_scheduler_test PROPERTIES
+    LABELS "cpu;server;scheduler;queue;state;lifecycle;cancellation")
 
   add_executable(prompt_cli_test
     tests/cli/prompt_test.cpp
@@ -856,6 +868,7 @@ if (BUILD_TESTING)
       tests/cli/inference_backend_gpu_test.cpp
       src/cli/serve/continuation_cache.cpp
       src/cli/serve/text_model_runner.cpp
+      src/cli/serve/text_generation_scheduler.cpp
       src/cli/serve/inference_backend.cpp)
     target_link_libraries(inference_backend_gpu_test PRIVATE
       strix_core strix_deepseek_v4_flash hip::host)
@@ -868,6 +881,7 @@ if (BUILD_TESTING)
       tests/cli/deepseek_v4_flash_backend_test.cpp
       src/cli/serve/continuation_cache.cpp
       src/cli/serve/text_model_runner.cpp
+      src/cli/serve/text_generation_scheduler.cpp
       src/cli/serve/inference_backend.cpp)
     target_link_libraries(deepseek_v4_flash_backend_test PRIVATE
       strix_core strix_deepseek_v4_flash hip::host)
