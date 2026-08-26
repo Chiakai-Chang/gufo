@@ -115,18 +115,28 @@ Release-package qualification used distinct raw prompts, 16 greedy output
 tokens per request, a 512-token context, and isolated replays of every
 concurrent request:
 
-| Workload | Aggregate output throughput | Result |
-| --- | ---: | --- |
-| C=1 | 11.51 tok/s | +1.5% against the prior 11.35 tok/s steady baseline |
-| C=2 | 11.18-11.20 tok/s | Both outputs exactly match isolated execution |
-| C=4 | 11.21-11.22 tok/s | All outputs exactly match isolated execution |
+| Workload | Decode rate after TTFT | Whole-request aggregate | Result |
+| --- | ---: | ---: | --- |
+| C=1 | 16.47 tok/s | 11.50-11.53 tok/s | +1.3% decode rate against the prior 16.25 tok/s baseline |
+| C=2 | Width-one serialized | 11.18-11.20 tok/s | Both outputs exactly match isolated execution |
+| C=4 | Width-one serialized | 11.21-11.22 tok/s | All outputs exactly match isolated execution |
 
-The C=1 row is the median of four steady samples after graph warmup. The C=2
-and C=4 rows are two steady concurrent samples after graph warmup. These are
-real end-to-end HTTP results, not kernel-width projections. Aggregate
-throughput does not yet scale with concurrency because every physical model
-advance remains width one; the current benefit is resident state, overlap,
-fair scheduling, cancellation, and prefix reuse without reloading the model.
+The C=1 decode rate is the reciprocal of the 60.73 ms median inter-token
+latency across four steady samples after graph warmup. It is the number
+comparable to `tg` throughput and is consistent with the 15-16 tok/s
+longer-context results above. The previous direct-server baseline had a
+61.54 ms steady inter-token latency, or 16.25 tok/s.
+
+The 11.x tok/s values are a different metric: generated tokens divided by
+whole HTTP wall time, including roughly 477-532 ms of prompt prefill per short
+request. The C=2 and C=4 rows are two steady concurrent samples after graph
+warmup. They are useful end-to-end workload measurements, but must not be
+reported as DeepSeek decode or `tg` throughput.
+
+Whole-request aggregate throughput does not yet scale with concurrency because
+every physical model advance remains width one; the current benefit is
+resident state, overlap, fair scheduling, cancellation, and prefix reuse
+without reloading the model.
 
 Clean server startup measurements reported about 89.4, 90.0, and 90.2 GiB of
 consumed system-available memory at C=1, C=2, and C=4 respectively. Thus the
