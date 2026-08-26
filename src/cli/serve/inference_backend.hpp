@@ -50,7 +50,9 @@ public:
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,
             std::string* error, std::uint32_t max_context = 4096,
-            std::size_t session_count = 1);
+            std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {});
 #endif
 
   /// Stable model identifier used in API responses.

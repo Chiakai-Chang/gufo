@@ -39,6 +39,8 @@ void Expect(bool condition, std::string_view message) {
 struct FakeStats {
   std::size_t states_created{0};
   std::size_t invalidations{0};
+  std::size_t cancellation_bindings{0};
+  std::size_t cancellation_clears{0};
   std::vector<std::size_t> prefill_spans;
   std::vector<TextRunnerToken> advanced_tokens;
   std::vector<std::vector<TextRunnerToken>> advanced_batches;
@@ -48,6 +50,14 @@ class FakeState final : public TextRunnerState {
 public:
   FakeState(std::shared_ptr<FakeStats> stats, std::size_t measured_bytes)
       : stats_(std::move(stats)), measured_bytes_(measured_bytes) {}
+
+  void SetCancellationCheck(const CancellationCheck& is_cancelled) override {
+    if (is_cancelled) {
+      ++stats_->cancellation_bindings;
+    } else {
+      ++stats_->cancellation_clears;
+    }
+  }
 
   void Invalidate() noexcept override {
     ++stats_->invalidations;
@@ -308,6 +318,19 @@ void TestAbandonedRequestRollsBackState() {
   retry.Invalidate();
 }
 
+void TestRequestBindsAndClearsCancellation() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<FakeRunner>(stats);
+  TextRunnerPool pool(runner, 1);
+
+  auto request = pool.Acquire({4, 5, 6}, [] { return false; });
+  Expect(stats->cancellation_bindings == 1,
+         "request binds its cancellation check to opaque state");
+  request.Invalidate();
+  Expect(stats->cancellation_clears == 1,
+         "request clears its cancellation check before releasing state");
+}
+
 void TestBatchedAdvancePreservesIndependentRequests() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<FakeRunner>(stats);
@@ -372,6 +395,7 @@ void TestMeasuredStateIsReconciledWithClaim() {
 int main() {
   TestBoundedPrefillDecodeAndPrefixReuse();
   TestAbandonedRequestRollsBackState();
+  TestRequestBindsAndClearsCancellation();
   TestBatchedAdvancePreservesIndependentRequests();
   TestResourceClaimsAreValidatedBeforeAllocation();
   TestMeasuredStateIsReconciledWithClaim();

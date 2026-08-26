@@ -139,8 +139,11 @@ struct FakeControl {
   bool release_prefill{false};
   std::atomic<std::size_t> invalidations{0};
   std::atomic<std::size_t> states_created{0};
+  std::atomic<std::size_t> decode_calls{0};
   bool incremental_prefill{true};
   bool supports_batched_advance{false};
+  bool final_token_advance_required{true};
+  bool incremental_text_is_exact{false};
 };
 
 class FakeState final : public TextRunnerState {
@@ -192,6 +195,10 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = control_->incremental_prefill,
+                .final_token_advance_required =
+                    control_->final_token_advance_required,
+                .incremental_text_is_exact =
+                    control_->incremental_text_is_exact,
             },
     };
   }
@@ -236,6 +243,7 @@ public:
 
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override {
+    control_->decode_calls.fetch_add(1, std::memory_order_relaxed);
     std::string text;
     for (const TextRunnerToken token : tokens) {
       if (!text.empty()) {
@@ -427,6 +435,37 @@ void TestIdlePrefillUsesBulkWorkUnit() {
              result.physical_execution_width == 1 &&
              result.execution_plan == "serial-c1",
          "C=1 telemetry reports immediate serial dispatch");
+}
+
+void TestRunnerCanSkipUnusedFinalAdvance() {
+  auto control = std::make_shared<FakeControl>();
+  control->final_token_advance_required = false;
+  auto scheduler = MakeScheduler(control, 1);
+
+  const auto result = scheduler->Submit({7}, 2, 0.0F).Wait();
+  Expect(result.tokens == ExpectedTokens(7, 2),
+         "skipped final advance preserves emitted tokens");
+
+  std::size_t advances = 0;
+  for (const auto& event : control->Events()) {
+    if (event.kind == EventKind::kAdvance && event.label == 7) {
+      ++advances;
+    }
+  }
+  Expect(advances == 1,
+         "runner skips the unused frontier computation after the final token");
+}
+
+void TestRunnerCanReuseExactIncrementalText() {
+  auto control = std::make_shared<FakeControl>();
+  control->incremental_text_is_exact = true;
+  auto scheduler = MakeScheduler(control, 1);
+
+  const auto result = scheduler->Submit({7}, 2, 0.0F).Wait();
+  Expect(result.text == "700701",
+         "exact incremental pieces form the final response text");
+  Expect(control->decode_calls.load(std::memory_order_relaxed) == 0,
+         "exact incremental text avoids duplicate final decoding");
 }
 
 void TestMultiResidentPrefillUsesBoundedWorkUnits() {
@@ -949,6 +988,8 @@ void TestRunnerFailureInvalidatesAndDoesNotPoisonReplacement() {
 
 int main() {
   TestIdlePrefillUsesBulkWorkUnit();
+  TestRunnerCanSkipUnusedFinalAdvance();
+  TestRunnerCanReuseExactIncrementalText();
   TestMultiResidentPrefillUsesBoundedWorkUnits();
   TestDecodeActivePrefillIsBounded();
   TestPrefillYieldsToEveryDueDecoder();

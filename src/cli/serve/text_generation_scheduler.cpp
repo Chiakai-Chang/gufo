@@ -200,6 +200,13 @@ struct TextGenerationScheduler::Impl {
     }
     incremental_prefill_supported =
         runner_pool->runner().Descriptor().capabilities.incremental_prefill;
+    final_token_advance_required =
+        runner_pool->runner()
+            .Descriptor()
+            .capabilities.final_token_advance_required;
+    incremental_text_is_exact = runner_pool->runner()
+                                    .Descriptor()
+                                    .capabilities.incremental_text_is_exact;
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
   }
@@ -278,7 +285,10 @@ struct TextGenerationScheduler::Impl {
           request->inter_token_total.count() /
           static_cast<double>(request->inter_token_samples);
     }
-    request->result.text = runner_pool->runner().Decode(request->result.tokens);
+    if (!incremental_text_is_exact) {
+      request->result.text =
+          runner_pool->runner().Decode(request->result.tokens);
+    }
   }
 
   void CompleteCancelled(
@@ -370,10 +380,12 @@ struct TextGenerationScheduler::Impl {
           continue;
         }
 
+        const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request =
-            runner_pool->Acquire(std::move(request->prompt), [request] {
-              return request->cancellation_requested.load(
-                  std::memory_order_acquire);
+            runner_pool->Acquire(std::move(request->prompt), [weak_request] {
+              const auto request = weak_request.lock();
+              return request == nullptr || CancellationRequested(request) ||
+                     DeadlineExceeded(request);
             });
         if (!request->runner_request) {
           CompleteCancelled(request);
@@ -456,7 +468,10 @@ struct TextGenerationScheduler::Impl {
                                              : TextRequestPhase::kPrefilling,
                            std::memory_order_release);
     } catch (...) {
-      CompleteFailure(request, std::current_exception());
+      const auto failure = std::current_exception();
+      if (!CompleteIfStopped(request)) {
+        CompleteFailure(request, failure);
+      }
     }
   }
 
@@ -510,7 +525,18 @@ struct TextGenerationScheduler::Impl {
                           "text generation buffered output limit exceeded")));
       return std::nullopt;
     }
+    if (incremental_text_is_exact) {
+      request->result.text += selection.piece;
+    }
     if (CompleteIfStopped(request)) {
+      return std::nullopt;
+    }
+    if (!final_token_advance_required &&
+        request->result.tokens.size() >= request->token_limit) {
+      request->result.decode_ms +=
+          std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
+              .count();
+      CompleteSuccess(request, TextGenerationBackend::FinishReason::kLength);
       return std::nullopt;
     }
     return decode_start;
@@ -539,7 +565,10 @@ struct TextGenerationScheduler::Impl {
       request->runner_request.Advance();
       FinishAdvanced(request, *decode_start);
     } catch (...) {
-      CompleteFailure(request, std::current_exception());
+      const auto failure = std::current_exception();
+      if (!CompleteIfStopped(request)) {
+        CompleteFailure(request, failure);
+      }
     }
   }
 
@@ -757,6 +786,8 @@ struct TextGenerationScheduler::Impl {
   TextSchedulerPolicy scheduler_policy;
   std::shared_ptr<OutputBudget> output_budget;
   bool incremental_prefill_supported{false};
+  bool final_token_advance_required{true};
+  bool incremental_text_is_exact{false};
   mutable std::mutex queue_mutex;
   std::condition_variable queue_condition;
   std::deque<PendingClient> queued_clients;

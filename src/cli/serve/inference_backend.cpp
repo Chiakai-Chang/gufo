@@ -4,15 +4,14 @@
 #include <chrono>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <mutex>
 #include <optional>
-#include <random>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
 
-#include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_reader.hpp"
@@ -334,48 +333,26 @@ private:
   std::uint32_t max_context_;
 };
 
-class DeepSeekContinuationState final : public ContinuationState {
-public:
-  DeepSeekContinuationState(
-      const std::shared_ptr<models::deepseek_v4_flash::Model>& model,
-      std::uint32_t max_context) {
-    std::string error;
-    session_ = model->CreateSession(max_context, &error);
-    if (session_ == nullptr) {
-      throw std::runtime_error("Failed to create DeepSeek session: " + error);
-    }
-  }
-
-  void Invalidate() noexcept override {
-    session_->SetCancellationCheck({});
-    session_->Invalidate();
-  }
-
-  [[nodiscard]] models::deepseek_v4_flash::Session& session() const {
-    return *session_;
-  }
-
-private:
-  std::unique_ptr<models::deepseek_v4_flash::Session> session_;
-};
-
-DeepSeekContinuationState& RequireDeepSeekState(ContinuationState& state) {
-  auto* deepseek = dynamic_cast<DeepSeekContinuationState*>(&state);
-  if (deepseek == nullptr) {
-    throw std::logic_error("continuation state is not DeepSeek");
-  }
-  return *deepseek;
-}
-
-std::vector<ContinuationToken> DeepSeekContinuationTokens(
-    std::span<const int> tokens) {
-  std::vector<ContinuationToken> converted;
+std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {
+  std::vector<TextRunnerToken> converted;
   converted.reserve(tokens.size());
   for (const int token : tokens) {
     if (token < 0) {
       throw std::invalid_argument("DeepSeek token ID must not be negative");
     }
-    converted.push_back(static_cast<ContinuationToken>(token));
+    converted.push_back(static_cast<TextRunnerToken>(token));
+  }
+  return converted;
+}
+
+std::vector<int> DeepSeekEngineTokens(std::span<const TextRunnerToken> tokens) {
+  std::vector<int> converted;
+  converted.reserve(tokens.size());
+  for (const TextRunnerToken token : tokens) {
+    if (token > static_cast<TextRunnerToken>(std::numeric_limits<int>::max())) {
+      throw std::invalid_argument("DeepSeek token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<int>(token));
   }
   return converted;
 }
@@ -452,6 +429,239 @@ void AppendDeepSeekToolCalls(
   content.append("</｜DSML｜tool_calls｜>");
 }
 
+class DeepSeekTextRunnerState final : public TextRunnerState {
+public:
+  DeepSeekTextRunnerState(
+      const std::shared_ptr<models::deepseek_v4_flash::Model>& model,
+      std::uint32_t max_context) {
+    std::string error;
+    session_ = model->CreateSession(max_context, &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create DeepSeek session: " + error);
+    }
+  }
+
+  void SetCancellationCheck(const CancellationCheck& is_cancelled) override {
+    session_->SetCancellationCheck(is_cancelled);
+  }
+
+  void Invalidate() noexcept override {
+    session_->SetCancellationCheck({});
+    session_->Invalidate();
+    position_ = 0;
+  }
+
+  [[nodiscard]] std::optional<std::size_t> MeasuredStateBytes()
+      const noexcept override {
+    const std::uint64_t bytes = session_->PayloadBytes();
+    if (bytes == 0 || bytes > static_cast<std::uint64_t>(
+                                  std::numeric_limits<std::size_t>::max())) {
+      return std::nullopt;
+    }
+    return static_cast<std::size_t>(bytes);
+  }
+
+  [[nodiscard]] models::deepseek_v4_flash::Session& session() const {
+    return *session_;
+  }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+private:
+  std::unique_ptr<models::deepseek_v4_flash::Session> session_;
+  std::size_t position_{0};
+};
+
+DeepSeekTextRunnerState& RequireDeepSeekState(TextRunnerState& state) {
+  auto* deepseek = dynamic_cast<DeepSeekTextRunnerState*>(&state);
+  if (deepseek == nullptr) {
+    throw std::logic_error("text runner state is not DeepSeek");
+  }
+  return *deepseek;
+}
+
+const DeepSeekTextRunnerState& RequireDeepSeekState(
+    const TextRunnerState& state) {
+  const auto* deepseek = dynamic_cast<const DeepSeekTextRunnerState*>(&state);
+  if (deepseek == nullptr) {
+    throw std::logic_error("text runner state is not DeepSeek");
+  }
+  return *deepseek;
+}
+
+class DeepSeekTextRunner final : public TextModelRunner {
+public:
+  DeepSeekTextRunner(std::shared_ptr<models::deepseek_v4_flash::Model> model,
+                     std::uint32_t max_context)
+      : model_(std::move(model)), max_context_(max_context) {}
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->ModelName(),
+        .state_abi = "deepseek-v4-flash-gfx1151-state-v1",
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = false,
+                .fork = false,
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+            },
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    return {
+        .resident_weights_bytes = std::nullopt,
+        .state_capacity_bytes = std::nullopt,
+        .per_request_state_bytes = std::nullopt,
+        .temporary_scratch_bytes = std::nullopt,
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{
+        .kind = TextExecutionPlanKind::kSerial,
+        .physical_width = 1,
+    }};
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return DeepSeekRunnerTokens(model_->Tokenize(text));
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    std::vector<models::deepseek_v4_flash::ChatMessage> messages;
+    messages.reserve(request.messages.size() + 1);
+    const std::string tools_prompt = DeepSeekToolsPrompt(request);
+    bool tools_rendered = tools_prompt.empty();
+    if (!tools_rendered &&
+        (request.messages.empty() ||
+         (request.messages.front().role != tokenization::ChatRole::kSystem &&
+          request.messages.front().role !=
+              tokenization::ChatRole::kDeveloper))) {
+      messages.push_back({
+          .role = "system",
+          .content = tools_prompt,
+      });
+      tools_rendered = true;
+    }
+    for (const auto& message : request.messages) {
+      std::string content = message.content;
+      if (!tools_rendered &&
+          (message.role == tokenization::ChatRole::kSystem ||
+           message.role == tokenization::ChatRole::kDeveloper)) {
+        content += tools_prompt;
+        tools_rendered = true;
+      }
+      if (message.role == tokenization::ChatRole::kAssistant) {
+        AppendDeepSeekToolCalls(content, message.tool_calls);
+      }
+      messages.push_back({
+          .role = std::string(ChatRoleName(message.role)),
+          .content = std::move(content),
+      });
+    }
+    auto tokens = DeepSeekRunnerTokens(model_->EncodeChat(messages));
+    if (tokens.empty()) {
+      return std::nullopt;
+    }
+    return tokens;
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    std::string text;
+    for (const TextRunnerToken token : tokens) {
+      if (token >
+          static_cast<TextRunnerToken>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument("DeepSeek token ID exceeds engine range");
+      }
+      text += model_->DecodeToken(static_cast<int>(token));
+    }
+    return text;
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<DeepSeekTextRunnerState>(model_, max_context_);
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& deepseek = RequireDeepSeekState(state);
+    if (offset != deepseek.position()) {
+      throw std::logic_error(
+          "DeepSeek prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error("DeepSeek prefill has no remaining input");
+    }
+
+    const std::size_t consumed =
+        std::min(max_input_tokens, prompt.size() - offset);
+    const std::size_t next_position = offset + consumed;
+    const auto prefix = DeepSeekEngineTokens(prompt.first(next_position));
+    std::string error;
+    if (!deepseek.session().Sync(prefix, &error)) {
+      throw std::runtime_error("DeepSeek prefill failed: " + error);
+    }
+    deepseek.set_position(next_position);
+    return {
+        .consumed_tokens = consumed,
+        .decode_ready = next_position == prompt.size(),
+    };
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, float temperature,
+      std::uint64_t* rng_state) const override {
+    auto& deepseek = RequireDeepSeekState(state);
+    const int token =
+        deepseek.session().SelectNext(temperature, rng_state, 0, 1.0F, 0.05F);
+    if (token < 0) {
+      throw std::runtime_error("DeepSeek token selection failed");
+    }
+    if (model_->IsStopToken(token)) {
+      return {
+          .stop = true,
+          .token = 0,
+          .piece = {},
+      };
+    }
+    return {
+        .stop = false,
+        .token = static_cast<TextRunnerToken>(token),
+        .piece = model_->DecodeToken(token),
+    };
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    if (token > static_cast<TextRunnerToken>(std::numeric_limits<int>::max())) {
+      throw std::invalid_argument("DeepSeek token ID exceeds engine range");
+    }
+    auto& deepseek = RequireDeepSeekState(state);
+    std::string error;
+    if (!deepseek.session().Evaluate(static_cast<int>(token), &error)) {
+      throw std::runtime_error("DeepSeek decode failed: " + error);
+    }
+    deepseek.set_position(deepseek.position() + 1);
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireDeepSeekState(state).position();
+  }
+
+private:
+  std::shared_ptr<models::deepseek_v4_flash::Model> model_;
+  std::uint32_t max_context_;
+};
+
 #endif
 
 }  // namespace
@@ -459,24 +669,16 @@ void AppendDeepSeekToolCalls(
 struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
-    enum class Kind : std::uint8_t {
-      kQwen,
-      kDeepSeekV4Flash,
-    };
-
-    Kind kind = Kind::kQwen;
-    std::shared_ptr<TextGenerationScheduler> qwen_scheduler;
-    std::shared_ptr<models::deepseek_v4_flash::Model> deepseek_model;
-    std::shared_ptr<ContinuationCache> deepseek_continuations;
+    std::shared_ptr<TextGenerationScheduler> scheduler;
     std::string model_id;
     SamplingDefaults sampling_defaults;
   };
 
-  class QwenGenerationRequest final : public GenerationRequest {
+  class ScheduledGenerationRequest final : public GenerationRequest {
   public:
-    QwenGenerationRequest(std::shared_ptr<const State> model_state,
-                          TextGenerationScheduler::Request scheduled_request,
-                          Result error_result)
+    ScheduledGenerationRequest(
+        std::shared_ptr<const State> model_state,
+        TextGenerationScheduler::Request scheduled_request, Result error_result)
         : state_(std::move(model_state)),
           request_(std::move(scheduled_request)),
           error_result_(std::move(error_result)) {}
@@ -508,12 +710,13 @@ struct InferenceBackend::Impl {
     return state;
   }
 
-  Result GenerateQwen(std::shared_ptr<const State> current,
-                      std::vector<TextRunnerToken> prompt_tokens,
-                      Clock::time_point request_start, std::size_t max_tokens,
-                      float temperature, const CancellationCheck& is_cancelled,
-                      const TokenCallback& on_token,
-                      std::string client_id) const {
+  Result GenerateScheduled(std::shared_ptr<const State> current,
+                           std::vector<TextRunnerToken> prompt_tokens,
+                           Clock::time_point request_start,
+                           std::size_t max_tokens, float temperature,
+                           const CancellationCheck& is_cancelled,
+                           const TokenCallback& on_token,
+                           std::string client_id) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -527,7 +730,7 @@ struct InferenceBackend::Impl {
     }
 
     try {
-      auto request = current->qwen_scheduler->Submit(
+      auto request = current->scheduler->Submit(
           std::move(prompt_tokens), max_tokens, temperature, is_cancelled,
           static_cast<bool>(on_token),
           TextRequestMetadata{
@@ -541,125 +744,6 @@ struct InferenceBackend::Impl {
       throw;
     }
 
-    EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
-    return result;
-  }
-
-  Result GenerateDeepSeek(std::shared_ptr<const State> current,
-                          std::span<const int> prompt_tokens,
-                          Clock::time_point request_start,
-                          std::size_t max_tokens, float temperature,
-                          const CancellationCheck& is_cancelled,
-                          const TokenCallback& on_token) const {
-    Result result;
-    result.prompt_tokens = prompt_tokens.size();
-    if (current == nullptr || prompt_tokens.empty()) {
-      return result;
-    }
-    if (is_cancelled && is_cancelled()) {
-      result.cancelled = true;
-      EmitRequestMetrics(result, "cancelled");
-      return result;
-    }
-
-    auto continuation_prompt = DeepSeekContinuationTokens(prompt_tokens);
-    auto lease = current->deepseek_continuations->Acquire(continuation_prompt,
-                                                          is_cancelled);
-    if (!lease) {
-      result.cancelled = true;
-      EmitRequestMetrics(result, "cancelled");
-      return result;
-    }
-    result.cache_hit = lease.cache_hit();
-    result.cached_prompt_tokens = lease.cached_tokens();
-    auto& session = RequireDeepSeekState(lease.state()).session();
-    session.SetCancellationCheck(is_cancelled);
-
-    std::string error;
-    if (!session.Sync(prompt_tokens, &error)) {
-      if (is_cancelled && is_cancelled()) {
-        result.cancelled = true;
-        EmitRequestMetrics(result, "cancelled");
-        return result;
-      }
-      EmitRequestMetrics(result, "error");
-      throw std::runtime_error("DeepSeek prefill failed: " + error);
-    }
-
-    std::optional<Clock::time_point> previous_token;
-    std::chrono::duration<double, std::milli> inter_token_total{0};
-    std::size_t inter_token_samples = 0;
-    std::random_device random_device;
-    std::uint64_t rng_state =
-        (static_cast<std::uint64_t>(random_device()) << 32U) ^
-        static_cast<std::uint64_t>(random_device());
-    for (std::size_t index = 0; index < max_tokens; ++index) {
-      if (is_cancelled && is_cancelled()) {
-        result.cancelled = true;
-        break;
-      }
-      const int token =
-          session.SelectNext(temperature, &rng_state, 0, 1.0F, 0.05F);
-      if (token < 0) {
-        EmitRequestMetrics(result, "error");
-        throw std::runtime_error("DeepSeek token selection failed");
-      }
-      if (current->deepseek_model->IsStopToken(token)) {
-        break;
-      }
-
-      const auto now = Clock::now();
-      if (!previous_token.has_value()) {
-        result.ttft_ms =
-            std::chrono::duration<double, std::milli>(now - request_start)
-                .count();
-      } else {
-        inter_token_total += now - *previous_token;
-        ++inter_token_samples;
-      }
-      previous_token = now;
-      result.tokens.push_back(static_cast<tokenization::TokenId>(token));
-      const std::string piece = current->deepseek_model->DecodeToken(token);
-      result.text += piece;
-      if (on_token && !on_token(piece)) {
-        result.cancelled = true;
-        break;
-      }
-
-      if (index + 1 < max_tokens && !session.Evaluate(token, &error)) {
-        if (is_cancelled && is_cancelled()) {
-          result.cancelled = true;
-          break;
-        }
-        EmitRequestMetrics(result, "error");
-        throw std::runtime_error("DeepSeek decode failed: " + error);
-      }
-    }
-
-    result.completion_tokens = result.tokens.size();
-    result.finish_reason =
-        result.cancelled
-            ? FinishReason::kCancelled
-            : (result.completion_tokens >= max_tokens ? FinishReason::kLength
-                                                      : FinishReason::kStop);
-    if (inter_token_samples > 0) {
-      result.mean_inter_token_ms =
-          inter_token_total.count() / static_cast<double>(inter_token_samples);
-    }
-    session.SetCancellationCheck({});
-    if (!result.cancelled) {
-      continuation_prompt.insert(continuation_prompt.end(),
-                                 result.tokens.begin(), result.tokens.end());
-      const int checkpoint_position = session.Position();
-      if (checkpoint_position < 0 ||
-          static_cast<std::size_t>(checkpoint_position) >
-              continuation_prompt.size()) {
-        throw std::runtime_error(
-            "DeepSeek checkpoint position exceeds generated token history");
-      }
-      continuation_prompt.resize(static_cast<std::size_t>(checkpoint_position));
-      lease.Commit(std::move(continuation_prompt));
-    }
     EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
     return result;
   }
@@ -687,10 +771,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
-    if (session_count != 1) {
-      SetError(error, "DeepSeek V4 Flash currently supports one HTTP session");
-      return false;
-    }
     auto model = models::deepseek_v4_flash::Model::Load(
         model_path,
         models::deepseek_v4_flash::ModelOptions{
@@ -703,7 +783,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       SetError(error, "Failed to create DeepSeek model: " + load_error);
       return false;
     }
-    return load(std::move(model), error, max_context, session_count);
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy);
   }
   auto model = hip::QwenGpuModel::CreateFromGguf(reader, &load_error);
   if (model == nullptr) {
@@ -740,13 +821,12 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
 
   try {
     auto new_state = std::make_shared<Impl::State>();
-    new_state->kind = Impl::State::Kind::kQwen;
     auto runner =
         std::make_shared<QwenTextRunner>(std::move(model), max_context);
     new_state->model_id = runner->Descriptor().model_id;
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);
-    new_state->qwen_scheduler = std::make_shared<TextGenerationScheduler>(
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
@@ -761,13 +841,14 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
 
 bool InferenceBackend::load(
     std::shared_ptr<models::deepseek_v4_flash::Model> model, std::string* error,
-    std::uint32_t max_context, std::size_t session_count) {
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy) {
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
     return false;
   }
-  if (session_count != 1) {
-    SetError(error, "DeepSeek V4 Flash currently supports one HTTP session");
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
     return false;
   }
   if (max_context > model->MaxContext()) {
@@ -777,14 +858,13 @@ bool InferenceBackend::load(
 
   try {
     auto new_state = std::make_shared<Impl::State>();
-    new_state->kind = Impl::State::Kind::kDeepSeekV4Flash;
-    new_state->deepseek_model = std::move(model);
-    new_state->deepseek_continuations = std::make_shared<ContinuationCache>(
-        session_count, [model = new_state->deepseek_model, max_context] {
-          return std::make_unique<DeepSeekContinuationState>(model,
-                                                             max_context);
-        });
-    new_state->model_id = new_state->deepseek_model->ModelName();
+    auto runner =
+        std::make_shared<DeepSeekTextRunner>(std::move(model), max_context);
+    new_state->model_id = runner->Descriptor().model_id;
+    auto runner_pool =
+        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -868,16 +948,10 @@ InferenceBackend::Result InferenceBackend::complete(
   if (state == nullptr) {
     return {};
   }
-  if (state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
-    const auto prompt_tokens = state->deepseek_model->Tokenize(prompt);
-    return impl_->GenerateDeepSeek(state, prompt_tokens, request_start,
-                                   max_tokens, temperature, is_cancelled,
-                                   on_token);
-  }
-  auto prompt_tokens = state->qwen_scheduler->runner().Tokenize(prompt);
-  return impl_->GenerateQwen(state, std::move(prompt_tokens), request_start,
-                             max_tokens, temperature, is_cancelled, on_token,
-                             "anonymous");
+  auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
+  return impl_->GenerateScheduled(state, std::move(prompt_tokens),
+                                  request_start, max_tokens, temperature,
+                                  is_cancelled, on_token, "anonymous");
 #else
   (void)prompt;
   (void)max_tokens;
@@ -897,52 +971,13 @@ InferenceBackend::Result InferenceBackend::chat(
   if (state == nullptr) {
     return {};
   }
-  if (state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
-    std::vector<models::deepseek_v4_flash::ChatMessage> deepseek_messages;
-    deepseek_messages.reserve(request.messages.size() + 1);
-    const std::string tools_prompt = DeepSeekToolsPrompt(request);
-    bool tools_rendered = tools_prompt.empty();
-    if (!tools_rendered &&
-        (request.messages.empty() ||
-         (request.messages.front().role != tokenization::ChatRole::kSystem &&
-          request.messages.front().role !=
-              tokenization::ChatRole::kDeveloper))) {
-      deepseek_messages.push_back({
-          .role = "system",
-          .content = tools_prompt,
-      });
-      tools_rendered = true;
-    }
-    for (const auto& message : request.messages) {
-      std::string content = message.content;
-      if (!tools_rendered &&
-          (message.role == tokenization::ChatRole::kSystem ||
-           message.role == tokenization::ChatRole::kDeveloper)) {
-        content += tools_prompt;
-        tools_rendered = true;
-      }
-      if (message.role == tokenization::ChatRole::kAssistant) {
-        AppendDeepSeekToolCalls(content, message.tool_calls);
-      }
-      deepseek_messages.push_back({
-          .role = std::string(ChatRoleName(message.role)),
-          .content = std::move(content),
-      });
-    }
-    const auto prompt_tokens =
-        state->deepseek_model->EncodeChat(deepseek_messages);
-    return impl_->GenerateDeepSeek(state, prompt_tokens, request_start,
-                                   max_tokens, temperature, is_cancelled,
-                                   on_token);
-  }
-  auto prompt_tokens =
-      state->qwen_scheduler->runner().RenderAndTokenize(request);
+  auto prompt_tokens = state->scheduler->runner().RenderAndTokenize(request);
   if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
     return {};
   }
-  return impl_->GenerateQwen(state, std::move(*prompt_tokens), request_start,
-                             max_tokens, temperature, is_cancelled, on_token,
-                             request.client_id);
+  return impl_->GenerateScheduled(state, std::move(*prompt_tokens),
+                                  request_start, max_tokens, temperature,
+                                  is_cancelled, on_token, request.client_id);
 #else
   (void)request;
   (void)max_tokens;
@@ -961,13 +996,12 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
-  if (state == nullptr || state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
+  if (state == nullptr) {
     return TextGenerationBackend::start_chat(request, max_tokens, temperature,
                                              is_cancelled, stream_output);
   }
 
-  auto prompt_tokens =
-      state->qwen_scheduler->runner().RenderAndTokenize(request);
+  auto prompt_tokens = state->scheduler->runner().RenderAndTokenize(request);
   if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
     return TextGenerationBackend::start_chat(request, max_tokens, temperature,
                                              is_cancelled, stream_output);
@@ -978,14 +1012,14 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   error_result.client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   auto scheduled_request =
-      state->qwen_scheduler->Submit(std::move(*prompt_tokens), max_tokens,
-                                    temperature, is_cancelled, stream_output,
-                                    TextRequestMetadata{
-                                        .client_id = error_result.client_id,
-                                        .deadline = std::nullopt,
-                                        .request_start = request_start,
-                                    });
-  return std::make_shared<Impl::QwenGenerationRequest>(
+      state->scheduler->Submit(std::move(*prompt_tokens), max_tokens,
+                               temperature, is_cancelled, stream_output,
+                               TextRequestMetadata{
+                                   .client_id = error_result.client_id,
+                                   .deadline = std::nullopt,
+                                   .request_start = request_start,
+                               });
+  return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), std::move(error_result));
 #else
   return TextGenerationBackend::start_chat(request, max_tokens, temperature,
@@ -1006,10 +1040,7 @@ std::size_t InferenceBackend::count_tokens(std::string_view text) const {
   if (state == nullptr) {
     return 0;
   }
-  if (state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
-    return state->deepseek_model->Tokenize(text).size();
-  }
-  return state->qwen_scheduler->runner().Tokenize(text).size();
+  return state->scheduler->runner().Tokenize(text).size();
 #else
   (void)text;
   return 0;

@@ -136,13 +136,17 @@ struct TextRunnerPool::Impl {
 struct TextRunnerPool::Request::Impl {
   Impl(std::shared_ptr<TextModelRunner> model_runner,
        ContinuationCache::Lease state_lease,
-       std::vector<TextRunnerToken> prompt_tokens)
+       std::vector<TextRunnerToken> prompt_tokens,
+       const CancellationCheck& is_cancelled)
       : runner(std::move(model_runner)),
         lease(std::move(state_lease)),
         prompt(std::move(prompt_tokens)),
         prefill_offset(lease.cached_tokens()),
         decode_ready(prefill_offset == prompt.size()),
-        rng_state(MakeRngState()) {}
+        rng_state(MakeRngState()) {
+    dynamic_cast<TextRunnerState&>(lease.state())
+        .SetCancellationCheck(is_cancelled);
+  }
 
   std::shared_ptr<TextModelRunner> runner;
   ContinuationCache::Lease lease;
@@ -279,15 +283,19 @@ void TextRunnerPool::Request::Commit() {
         "text runner cannot commit before prefill completes");
   }
   if (impl_->pending_selection.has_value()) {
-    throw std::logic_error(
-        "text runner cannot commit an unadvanced decode token");
+    if (impl_->runner->Descriptor().capabilities.final_token_advance_required) {
+      throw std::logic_error(
+          "text runner cannot commit an unadvanced decode token");
+    }
+    impl_->pending_selection.reset();
   }
 
+  auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
+  state.SetCancellationCheck({});
   std::vector<ContinuationToken> checkpoint = impl_->prompt;
   checkpoint.insert(checkpoint.end(), impl_->generated.begin(),
                     impl_->generated.end());
-  const std::size_t position = impl_->runner->CheckpointPosition(
-      dynamic_cast<const TextRunnerState&>(impl_->lease.state()));
+  const std::size_t position = impl_->runner->CheckpointPosition(state);
   if (position < impl_->lease.cached_tokens() || position > checkpoint.size()) {
     throw std::runtime_error(
         "text runner checkpoint is outside executed token history");
@@ -299,6 +307,8 @@ void TextRunnerPool::Request::Commit() {
 
 void TextRunnerPool::Request::Invalidate() noexcept {
   if (impl_ != nullptr) {
+    dynamic_cast<TextRunnerState&>(impl_->lease.state())
+        .SetCancellationCheck({});
     impl_->lease.Invalidate();
     impl_.reset();
   }
@@ -413,8 +423,9 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   if (!lease) {
     return {};
   }
-  return Request(std::make_unique<Request::Impl>(
-      impl_->validated.runner, std::move(lease), std::move(prompt)));
+  return Request(
+      std::make_unique<Request::Impl>(impl_->validated.runner, std::move(lease),
+                                      std::move(prompt), is_cancelled));
 }
 
 }  // namespace strix::server

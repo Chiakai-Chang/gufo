@@ -1,9 +1,13 @@
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
@@ -66,7 +70,7 @@ int main() {
     Expect(model != nullptr, error);
 
     strix::server::InferenceBackend backend;
-    Expect(backend.load(model, &error, 512, 1), error);
+    Expect(backend.load(model, &error, 512, 2), error);
     Expect(backend.model_id() == model->ModelName(), "HTTP model identifier");
 
     const std::string raw_prompt = "The capital of France is";
@@ -115,6 +119,100 @@ int main() {
            "continued DeepSeek chat prefills only a suffix");
     Expect(http_continuation.tokens == direct_continuation,
            "cached DeepSeek continuation differs from cold full prefill");
+
+    strix::server::ChatRequest concurrent_a({
+        {strix::tokenization::ChatRole::kUser,
+         "Continue this sequence with four short items: one, two, three,", "",
+         ""},
+    });
+    concurrent_a.client_id = "deepseek-a";
+    strix::server::ChatRequest concurrent_b({
+        {strix::tokenization::ChatRole::kUser,
+         "Continue this sequence with four short items: red, green, blue,", "",
+         ""},
+    });
+    concurrent_b.client_id = "deepseek-b";
+    const std::vector<strix::models::deepseek_v4_flash::ChatMessage>
+        direct_a_messages = {
+            {.role = "user",
+             .content =
+                 "Continue this sequence with four short items: one, two, "
+                 "three,"},
+        };
+    const std::vector<strix::models::deepseek_v4_flash::ChatMessage>
+        direct_b_messages = {
+            {.role = "user",
+             .content =
+                 "Continue this sequence with four short items: red, green, "
+                 "blue,"},
+        };
+    const auto direct_a =
+        GenerateDirect(model, model->EncodeChat(direct_a_messages), 4);
+    const auto direct_b =
+        GenerateDirect(model, model->EncodeChat(direct_b_messages), 4);
+
+    auto pending_a = backend.start_chat(concurrent_a, 4, 0.0F, {}, true);
+    auto pending_b = backend.start_chat(concurrent_b, 4, 0.0F, {}, true);
+    Expect(pending_a != nullptr && pending_b != nullptr,
+           "concurrent DeepSeek requests are admitted");
+
+    std::mutex event_mutex;
+    std::vector<char> events;
+    strix::server::InferenceBackend::Result concurrent_result_a;
+    strix::server::InferenceBackend::Result concurrent_result_b;
+    std::exception_ptr failure_a;
+    std::exception_ptr failure_b;
+    std::jthread waiter_a([&] {
+      try {
+        concurrent_result_a = pending_a->Wait([&](std::string_view) {
+          const std::lock_guard<std::mutex> lock(event_mutex);
+          events.push_back('a');
+          return true;
+        });
+      } catch (...) {
+        failure_a = std::current_exception();
+      }
+    });
+    std::jthread waiter_b([&] {
+      try {
+        concurrent_result_b = pending_b->Wait([&](std::string_view) {
+          const std::lock_guard<std::mutex> lock(event_mutex);
+          events.push_back('b');
+          return true;
+        });
+      } catch (...) {
+        failure_b = std::current_exception();
+      }
+    });
+    waiter_a.join();
+    waiter_b.join();
+    if (failure_a != nullptr) {
+      std::rethrow_exception(failure_a);
+    }
+    if (failure_b != nullptr) {
+      std::rethrow_exception(failure_b);
+    }
+
+    Expect(concurrent_result_a.tokens == direct_a,
+           "concurrent DeepSeek request A differs from isolated execution");
+    Expect(concurrent_result_b.tokens == direct_b,
+           "concurrent DeepSeek request B differs from isolated execution");
+    Expect(concurrent_result_a.requested_logical_concurrency == 2 &&
+               concurrent_result_b.requested_logical_concurrency == 2,
+           "DeepSeek scheduler reports two logical sessions");
+    Expect(concurrent_result_a.physical_execution_width == 1 &&
+               concurrent_result_b.physical_execution_width == 1 &&
+               concurrent_result_a.execution_plan == "serial-fallback" &&
+               concurrent_result_b.execution_plan == "serial-fallback",
+           "DeepSeek reports exact serialized fallback");
+    const auto first_a = std::find(events.begin(), events.end(), 'a');
+    const auto first_b = std::find(events.begin(), events.end(), 'b');
+    const auto last_a = std::find(events.rbegin(), events.rend(), 'a').base();
+    const auto last_b = std::find(events.rbegin(), events.rend(), 'b').base();
+    Expect(first_a != events.end() && first_b != events.end(),
+           "both DeepSeek sessions stream output");
+    Expect(first_b < last_a && first_a < last_b,
+           "both DeepSeek sessions make progress before the other completes");
 
     std::size_t cancellation_checks = 0;
     const auto cancelled =

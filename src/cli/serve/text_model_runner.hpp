@@ -34,6 +34,8 @@ struct TextRunnerCapabilities {
   bool incremental_prefill{false};
   bool snapshot{false};
   bool fork{false};
+  bool final_token_advance_required{true};
+  bool incremental_text_is_exact{false};
 };
 
 struct TextRunnerDescriptor {
@@ -70,6 +72,13 @@ struct TextDecodeSelection {
 /// Model-private state driven only through TextModelRunner work units.
 class TextRunnerState : public ContinuationState {
 public:
+  using CancellationCheck = std::function<bool()>;
+
+  /// Installs a request-scoped cancellation check for model calls that can
+  /// yield internally. Implementations that only yield between work units may
+  /// keep the default no-op behavior.
+  virtual void SetCancellationCheck(const CancellationCheck&) {}
+
   /// Actual request-state allocation when the provider can measure it.
   [[nodiscard]] virtual std::optional<std::size_t> MeasuredStateBytes()
       const noexcept {

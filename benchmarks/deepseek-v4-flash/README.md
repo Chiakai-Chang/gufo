@@ -1,6 +1,6 @@
 # DeepSeek V4 Flash Q2-imatrix on Strix Halo
 
-Status: 2026-08-21. This page is the current functional and performance
+Status: 2026-08-26. This page is the current functional and performance
 snapshot, not an optimization history.
 
 ## Model
@@ -104,6 +104,37 @@ wave32 kernel uses 80 VGPRs, 57,992 bytes LDS, zero scratch, and 32 waves per
 workgroup. The mirror adds about 21, 42, 84, 168, and 336 MiB at 4K, 8K, 16K,
 32K, and 64K respectively, while snapshot payloads remain unchanged.
 
+### Resident server scheduling
+
+The OpenAI-compatible server keeps independent DeepSeek sessions resident in
+the common text scheduler. DeepSeek currently advertises physical width one,
+so C=2 and C=4 requests make fair round-robin progress through an exact serial
+fallback rather than a native batched decode kernel.
+
+Release-package qualification used distinct raw prompts, 16 greedy output
+tokens per request, a 512-token context, and isolated replays of every
+concurrent request:
+
+| Workload | Aggregate output throughput | Result |
+| --- | ---: | --- |
+| C=1 | 11.51 tok/s | +1.5% against the prior 11.35 tok/s steady baseline |
+| C=2 | 11.18-11.20 tok/s | Both outputs exactly match isolated execution |
+| C=4 | 11.21-11.22 tok/s | All outputs exactly match isolated execution |
+
+The C=1 row is the median of four steady samples after graph warmup. The C=2
+and C=4 rows are two steady concurrent samples after graph warmup. These are
+real end-to-end HTTP results, not kernel-width projections. Aggregate
+throughput does not yet scale with concurrency because every physical model
+advance remains width one; the current benefit is resident state, overlap,
+fair scheduling, cancellation, and prefix reuse without reloading the model.
+
+Clean server startup measurements reported about 89.4, 90.0, and 90.2 GiB of
+consumed system-available memory at C=1, C=2, and C=4 respectively. Thus the
+incremental resident-session cost was about 0.60 GiB at C=2 and 0.82 GiB at
+C=4 relative to C=1, while the 80.76 GiB model tensor cache remained shared.
+A short 20-token state snapshot contained 14.1 MiB after prefill and 15.2 MiB
+after generation.
+
 ## Quality and Integration
 
 - The pinned upstream DS4 CLI and packaged Strix CLI produce the exact same
@@ -180,5 +211,5 @@ workgroup. The mirror adds about 21, 42, 84, 168, and 336 MiB at 4K, 8K, 16K,
 - Add DSpark speculative decoding under #156.
 - Add model-owned offline calibration/imatrix tooling only when a new
   quantization recipe requires it.
-- Add multi-session scheduling and restart-safe SSD state reuse through the
-  serving milestones.
+- Add native concurrent decode batching and restart-safe SSD state reuse
+  through the serving milestones.
