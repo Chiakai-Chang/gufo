@@ -5,7 +5,9 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -74,6 +76,18 @@ public:
     return result;
   }
 
+  std::shared_ptr<GenerationRequest> start_chat(
+      const strix::server::ChatRequest& request, std::size_t max_tokens,
+      float temperature, const CancellationCheck& is_cancelled,
+      bool stream_output) override {
+    if (reject_on_start.has_value()) {
+      throw strix::server::TextGenerationError(*reject_on_start,
+                                               "injected admission rejection");
+    }
+    return TextGenerationBackend::start_chat(request, max_tokens, temperature,
+                                             is_cancelled, stream_output);
+  }
+
   [[nodiscard]] std::size_t count_tokens(std::string_view text) const override {
     return text.size();
   }
@@ -100,6 +114,7 @@ public:
   SamplingDefaults defaults;
   std::size_t last_max_tokens{0};
   float last_temperature{0.0F};
+  std::optional<strix::server::TextGenerationErrorCode> reject_on_start;
 
 private:
   std::mutex mutex;
@@ -108,13 +123,15 @@ private:
   bool released{false};
 };
 
-strix::server::HttpRequest Request(std::string body) {
+strix::server::HttpRequest Request(
+    std::string body,
+    std::vector<std::pair<std::string, std::string>> headers = {}) {
   return {
       .method = "POST",
       .path = "/v1/chat/completions",
       .query = {},
       .body = std::move(body),
-      .headers = {},
+      .headers = std::move(headers),
       .is_cancelled = {},
   };
 }
@@ -308,6 +325,62 @@ void TestWrongModelIsRejected() {
          "Rejected request never reaches the backend");
 }
 
+void TestClientIdentityReachesBackend() {
+  FakeBackend backend;
+  backend.pieces = {"ok"};
+  const auto response =
+      strix::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"hello"}]
+      })",
+                                              {{"X-Client-ID", "pi-agent-2"}}),
+                                      backend);
+
+  Expect(response.status == 200, "identified request is accepted");
+  Expect(backend.last_request.client_id == "pi-agent-2",
+         "validated client identity reaches scheduling backend");
+}
+
+void TestInvalidClientIdentityIsRejected() {
+  FakeBackend backend;
+  const auto response = strix::server::HandleOpenAiChat(
+      Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"hello"}]
+      })",
+              {{"X-Client-ID", "contains spaces"}}),
+      backend);
+
+  Expect(response.status == 400, "invalid client identity is rejected");
+  Expect(response.body.find("invalid_client_id") != std::string::npos,
+         "invalid client identity returns a stable code");
+  Expect(backend.chat_calls.load() == 0,
+         "invalid identity never reaches generation");
+}
+
+void TestStreamingOverloadIsRejectedBeforeHeaders() {
+  FakeBackend backend;
+  backend.reject_on_start = strix::server::TextGenerationErrorCode::kQueueFull;
+  const auto response = strix::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "stream":true
+      })"),
+                                                        backend);
+
+  Expect(response.status == 429,
+         "streaming overload is rejected synchronously");
+  Expect(!response.streaming_body,
+         "overloaded stream does not commit successful SSE headers");
+  Expect(response.body.find("queue_full") != std::string::npos,
+         "overload response carries a stable retry code");
+  bool retry_after = false;
+  for (const auto& [name, value] : response.headers) {
+    retry_after = retry_after || (name == "Retry-After" && value == "1");
+  }
+  Expect(retry_after, "retryable overload advertises Retry-After");
+}
+
 }  // namespace
 
 int main() {
@@ -316,6 +389,9 @@ int main() {
   TestToolCallsAreStructured();
   TestDeepSeekToolCallsAreStructured();
   TestWrongModelIsRejected();
+  TestClientIdentityReachesBackend();
+  TestInvalidClientIdentityIsRejected();
+  TestStreamingOverloadIsRejectedBeforeHeaders();
   std::cout << "All OpenAI chat protocol tests passed\n";
   return 0;
 }

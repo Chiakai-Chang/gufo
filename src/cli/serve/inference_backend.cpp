@@ -36,13 +36,25 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
+std::uint64_t ClientLabel(std::string_view client_id) noexcept {
+  constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
+  constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
+  std::uint64_t hash = kFnvOffset;
+  for (const unsigned char character : client_id) {
+    hash ^= character;
+    hash *= kFnvPrime;
+  }
+  return hash;
+}
+
 void EmitRequestMetrics(const InferenceBackend::Result& result,
                         std::string_view status) {
   static std::mutex output_mutex;
   std::ostringstream line;
   line << std::fixed << std::setprecision(3)
        << "{\"event\":\"http_inference\",\"status\":\"" << status
-       << "\",\"prompt_tokens\":" << result.prompt_tokens
+       << "\",\"client_label\":\"" << std::hex << ClientLabel(result.client_id)
+       << std::dec << "\",\"prompt_tokens\":" << result.prompt_tokens
        << ",\"cache_hit\":" << (result.cache_hit ? "true" : "false")
        << ",\"cached_prompt_tokens\":" << result.cached_prompt_tokens
        << ",\"uncached_prompt_tokens\":"
@@ -56,6 +68,17 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
        << result.max_consecutive_active_prefill_chunks
        << ",\"configured_active_prefill_tokens\":"
        << result.configured_active_prefill_tokens
+       << ",\"queue_depth_at_submit\":" << result.queue_depth_at_submit
+       << ",\"client_queue_depth_at_submit\":"
+       << result.client_queue_depth_at_submit
+       << ",\"resident_requests_at_admission\":"
+       << result.resident_requests_at_admission
+       << ",\"queue_ms\":" << result.queue_ms
+       << ",\"requested_logical_concurrency\":"
+       << result.requested_logical_concurrency
+       << ",\"physical_execution_width\":" << result.physical_execution_width
+       << ",\"execution_plan\":\"" << result.execution_plan << '"'
+       << ",\"max_buffered_output_bytes\":" << result.max_buffered_output_bytes
        << ",\"incremental_prefill_supported\":"
        << (result.incremental_prefill_supported ? "true" : "false")
        << ",\"prefill_fallback_reason\":";
@@ -399,6 +422,37 @@ struct InferenceBackend::Impl {
     SamplingDefaults sampling_defaults;
   };
 
+  class QwenGenerationRequest final : public GenerationRequest {
+  public:
+    QwenGenerationRequest(std::shared_ptr<const State> model_state,
+                          TextGenerationScheduler::Request scheduled_request,
+                          Result error_result)
+        : state_(std::move(model_state)),
+          request_(std::move(scheduled_request)),
+          error_result_(std::move(error_result)) {}
+
+    Result Wait(const TokenCallback& on_token) override {
+      try {
+        Result result = request_.Wait(on_token);
+        EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
+        return result;
+      } catch (const TextGenerationError& exception) {
+        EmitRequestMetrics(error_result_, exception.stable_code());
+        throw;
+      } catch (...) {
+        EmitRequestMetrics(error_result_, "error");
+        throw;
+      }
+    }
+
+    void Cancel() noexcept override { request_.Cancel(); }
+
+  private:
+    std::shared_ptr<const State> state_;
+    TextGenerationScheduler::Request request_;
+    Result error_result_;
+  };
+
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
     const std::lock_guard<std::mutex> lock(state_mutex);
     return state;
@@ -408,9 +462,11 @@ struct InferenceBackend::Impl {
                       std::vector<TextRunnerToken> prompt_tokens,
                       Clock::time_point request_start, std::size_t max_tokens,
                       float temperature, const CancellationCheck& is_cancelled,
-                      const TokenCallback& on_token) const {
+                      const TokenCallback& on_token,
+                      std::string client_id) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
+    result.client_id = client_id.empty() ? "anonymous" : client_id;
     if (current == nullptr || prompt_tokens.empty()) {
       return result;
     }
@@ -423,7 +479,12 @@ struct InferenceBackend::Impl {
     try {
       auto request = current->qwen_scheduler->Submit(
           std::move(prompt_tokens), max_tokens, temperature, is_cancelled,
-          static_cast<bool>(on_token), request_start);
+          static_cast<bool>(on_token),
+          TextRequestMetadata{
+              .client_id = std::move(client_id),
+              .deadline = std::nullopt,
+              .request_start = request_start,
+          });
       result = request.Wait(on_token);
     } catch (...) {
       EmitRequestMetrics(result, "error");
@@ -565,7 +626,8 @@ InferenceBackend::~InferenceBackend() = default;
 bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             std::uint32_t max_context,
                             std::size_t session_count,
-                            TextPrefillPolicy prefill_policy) {
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy) {
 #if defined(ENGINE_ENABLE_HIP)
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
@@ -599,12 +661,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   return load(std::move(model), error, max_context, session_count,
-              prefill_policy);
+              prefill_policy, scheduler_policy);
 #else
   (void)model_path;
   (void)max_context;
   (void)session_count;
   (void)prefill_policy;
+  (void)scheduler_policy;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -614,7 +677,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
 bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             std::string* error, std::uint32_t max_context,
                             std::size_t session_count,
-                            TextPrefillPolicy prefill_policy) {
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -633,7 +697,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);
     new_state->qwen_scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy);
+        std::move(runner_pool), prefill_policy, scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -762,7 +826,8 @@ InferenceBackend::Result InferenceBackend::complete(
   }
   auto prompt_tokens = state->qwen_scheduler->runner().Tokenize(prompt);
   return impl_->GenerateQwen(state, std::move(prompt_tokens), request_start,
-                             max_tokens, temperature, is_cancelled, on_token);
+                             max_tokens, temperature, is_cancelled, on_token,
+                             "anonymous");
 #else
   (void)prompt;
   (void)max_tokens;
@@ -826,7 +891,8 @@ InferenceBackend::Result InferenceBackend::chat(
     return {};
   }
   return impl_->GenerateQwen(state, std::move(*prompt_tokens), request_start,
-                             max_tokens, temperature, is_cancelled, on_token);
+                             max_tokens, temperature, is_cancelled, on_token,
+                             request.client_id);
 #else
   (void)request;
   (void)max_tokens;
@@ -834,6 +900,46 @@ InferenceBackend::Result InferenceBackend::chat(
   (void)is_cancelled;
   (void)on_token;
   return {};
+#endif
+}
+
+std::shared_ptr<InferenceBackend::GenerationRequest>
+InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
+                             float temperature,
+                             const CancellationCheck& is_cancelled,
+                             bool stream_output) {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto request_start = Clock::now();
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->kind == Impl::State::Kind::kDeepSeekV4Flash) {
+    return TextGenerationBackend::start_chat(request, max_tokens, temperature,
+                                             is_cancelled, stream_output);
+  }
+
+  auto prompt_tokens =
+      state->qwen_scheduler->runner().RenderAndTokenize(request);
+  if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
+    return TextGenerationBackend::start_chat(request, max_tokens, temperature,
+                                             is_cancelled, stream_output);
+  }
+
+  Result error_result;
+  error_result.prompt_tokens = prompt_tokens->size();
+  error_result.client_id =
+      request.client_id.empty() ? "anonymous" : request.client_id;
+  auto scheduled_request =
+      state->qwen_scheduler->Submit(std::move(*prompt_tokens), max_tokens,
+                                    temperature, is_cancelled, stream_output,
+                                    TextRequestMetadata{
+                                        .client_id = error_result.client_id,
+                                        .deadline = std::nullopt,
+                                        .request_start = request_start,
+                                    });
+  return std::make_shared<Impl::QwenGenerationRequest>(
+      state, std::move(scheduled_request), std::move(error_result));
+#else
+  return TextGenerationBackend::start_chat(request, max_tokens, temperature,
+                                           is_cancelled, stream_output);
 #endif
 }
 

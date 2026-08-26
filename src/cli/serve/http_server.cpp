@@ -19,6 +19,7 @@
 #include <random>
 #include <ranges>
 #include <sstream>
+#include <stdexcept>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -163,7 +164,9 @@ std::string BuildResponseHead(const HttpResponse& resp,
   }
   out += "Access-Control-Allow-Origin: *\r\n";
   out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
-  out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
+  out +=
+      "Access-Control-Allow-Headers: Content-Type, Authorization, Range, "
+      "X-Client-ID\r\n";
   for (const auto& [name, value] : resp.headers) {
     out += name;
     out += ": ";
@@ -623,12 +626,16 @@ struct HttpServer::ConnectionWorker {
 HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<TextGenerationBackend> backend,
                        std::shared_ptr<VideoJobService> video_jobs,
-                       std::shared_ptr<TtsService> tts)
+                       std::shared_ptr<TtsService> tts, HttpServerLimits limits)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
       video_jobs_(std::move(video_jobs)),
-      tts_(std::move(tts)) {
+      tts_(std::move(tts)),
+      limits_(limits) {
+  if (limits_.max_request_body_bytes == 0 || limits_.max_connections == 0) {
+    throw std::invalid_argument("HTTP server limits must be positive");
+  }
   register_routes();
 }
 
@@ -734,7 +741,6 @@ void HttpServer::run() {
   if (tts_ != nullptr && tts_->ready()) {
     std::cout << "strix: Qwen3-TTS audio API enabled\n";
   }
-  constexpr std::size_t kMaximumConnections = 16;
   while (!stopped_.load(std::memory_order_acquire)) {
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
     if (client_fd < 0) {
@@ -755,7 +761,7 @@ void HttpServer::run() {
     {
       const std::lock_guard<std::mutex> lock(workers_mutex_);
       overloaded = stopped_.load(std::memory_order_acquire) ||
-                   workers_.size() >= kMaximumConnections;
+                   workers_.size() >= limits_.max_connections;
       if (!overloaded) {
         worker_ptr->fd.store(client_fd, std::memory_order_release);
         worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
@@ -929,9 +935,7 @@ void HttpServer::handle_connection(int client_fd) {
         const std::size_t content_length = ParseContentLength(req);
         const std::size_t remaining =
             content_length > body.size() ? content_length - body.size() : 0;
-        constexpr std::size_t kMaximumBodyBytes =
-            static_cast<std::size_t>(8) * 1024 * 1024;
-        if (content_length > kMaximumBodyBytes) {
+        if (content_length > limits_.max_request_body_bytes) {
           payload_too_large = true;
         } else if (content_length > 0) {
           if (remaining > 0) {
@@ -977,6 +981,19 @@ void HttpServer::handle_connection(int client_fd) {
     } else {
       (void)SendAll(client_fd, BuildResponse(resp));
     }
+  } catch (const TextGenerationError& exception) {
+    const char* reason = "Service Unavailable";
+    if (exception.http_status() == 408) {
+      reason = "Request Timeout";
+    } else if (exception.http_status() == 429) {
+      reason = "Too Many Requests";
+    }
+    HttpResponse resp = Err(exception.http_status(), reason, exception.what(),
+                            "server_error", exception.stable_code());
+    if (exception.retryable()) {
+      resp.headers.emplace_back("Retry-After", "1");
+    }
+    (void)SendAll(client_fd, BuildResponse(resp));
   } catch (const std::exception& e) {
     const HttpResponse resp = Err(500, "Internal Server Error", e.what(),
                                   "internal_error", "server_exception");

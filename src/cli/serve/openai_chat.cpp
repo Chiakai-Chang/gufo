@@ -9,6 +9,7 @@
 #include <ctime>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <random>
 #include <ranges>
@@ -79,6 +80,47 @@ HttpResponse Error(int status, const char* reason, std::string message,
   error["code"] = code;
   response["error"] = std::move(error);
   return {status, reason, response.dump(), {}, {}};
+}
+
+const char* StatusReason(int status) noexcept {
+  switch (status) {
+    case 408:
+      return "Request Timeout";
+    case 429:
+      return "Too Many Requests";
+    case 503:
+      return "Service Unavailable";
+    default:
+      return "Internal Server Error";
+  }
+}
+
+HttpResponse GenerationError(const TextGenerationError& exception) {
+  json::Value response = json::Value::object();
+  json::Value error = json::Value::object();
+  error["message"] = exception.what();
+  error["type"] = "server_error";
+  error["code"] = exception.stable_code();
+  response["error"] = std::move(error);
+  HttpResponse output{
+      .status = exception.http_status(),
+      .reason = StatusReason(exception.http_status()),
+      .body = response.dump(),
+      .headers = {},
+      .streaming_body = {},
+  };
+  if (exception.retryable()) {
+    output.headers.emplace_back("Retry-After", "1");
+  }
+  return output;
+}
+
+bool ValidClientId(std::string_view client_id) {
+  return !client_id.empty() && client_id.size() <= 64 &&
+         std::ranges::all_of(client_id, [](unsigned char character) {
+           return std::isalnum(character) != 0 || character == '-' ||
+                  character == '_' || character == '.' || character == ':';
+         });
 }
 
 bool IsKnownRole(std::string_view role) {
@@ -296,6 +338,17 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(404, "Not Found",
                  "model '" + output->model + "' is not served by this process",
                  "model_not_found");
+  }
+
+  const std::string client_id = request.header("X-Client-ID");
+  if (!client_id.empty()) {
+    if (!ValidClientId(client_id)) {
+      return Error(400, "Bad Request",
+                   "'X-Client-ID' must contain 1-64 letters, digits, '.', "
+                   "'_', '-', or ':'",
+                   "invalid_client_id");
+    }
+    output->chat.client_id = client_id;
   }
 
   const json::Value* messages = body.find("messages");
@@ -800,12 +853,11 @@ private:
   bool tool_mode_{false};
 };
 
-HttpResponse NonStreamingResponse(const ParsedChatRequest& request,
-                                  TextGenerationBackend& backend,
-                                  const HttpRequest& http_request) {
-  const auto result =
-      backend.chat(request.chat, request.max_tokens, request.temperature,
-                   http_request.is_cancelled);
+HttpResponse NonStreamingResponse(
+    TextGenerationBackend& backend,
+    const std::shared_ptr<TextGenerationBackend::GenerationRequest>&
+        generation) {
+  const auto result = generation->Wait();
   const ParsedGeneration generated = ParseGeneration(result.text);
 
   json::Value response = json::Value::object();
@@ -845,9 +897,9 @@ HttpResponse NonStreamingResponse(const ParsedChatRequest& request,
   };
 }
 
-HttpResponse StreamingResponse(const ParsedChatRequest& request,
-                               TextGenerationBackend& backend,
-                               const HttpRequest& http_request) {
+HttpResponse StreamingResponse(
+    const ParsedChatRequest& request, TextGenerationBackend& backend,
+    std::shared_ptr<TextGenerationBackend::GenerationRequest> generation) {
   const std::string id = RandomId("chatcmpl-");
   const long long created = Now();
   const std::string model = backend.model_id();
@@ -862,12 +914,13 @@ HttpResponse StreamingResponse(const ParsedChatRequest& request,
               {"X-Accel-Buffering", "no"},
           },
       .streaming_body =
-          [request, &backend, cancellation = http_request.is_cancelled, id,
-           created, model](const HttpResponse::BodyWriter& writer) {
+          [request, generation = std::move(generation), id, created,
+           model](const HttpResponse::BodyWriter& writer) {
             json::Value role_delta = json::Value::object();
             role_delta["role"] = "assistant";
             if (!writer(Sse(
                     ChoiceChunk(id, created, model, std::move(role_delta))))) {
+              generation->Cancel();
               return;
             }
 
@@ -884,14 +937,9 @@ HttpResponse StreamingResponse(const ParsedChatRequest& request,
             });
 
             try {
-              const auto result = backend.chat(
-                  request.chat, request.max_tokens, request.temperature,
-                  [&] {
-                    return !connected || (cancellation && cancellation());
-                  },
-                  [&](std::string_view piece) {
-                    return connected && filter.Push(piece);
-                  });
+              const auto result = generation->Wait([&](std::string_view piece) {
+                return connected && filter.Push(piece);
+              });
               if (!connected || result.cancelled) {
                 return;
               }
@@ -936,6 +984,15 @@ HttpResponse StreamingResponse(const ParsedChatRequest& request,
                 }
               }
               (void)writer("data: [DONE]\n\n");
+            } catch (const TextGenerationError& exception) {
+              json::Value error = json::Value::object();
+              json::Value detail = json::Value::object();
+              detail["message"] = exception.what();
+              detail["type"] = "server_error";
+              detail["code"] = exception.stable_code();
+              error["error"] = std::move(detail);
+              (void)writer(Sse(error));
+              (void)writer("data: [DONE]\n\n");
             } catch (const std::exception&) {
               json::Value error = json::Value::object();
               json::Value detail = json::Value::object();
@@ -961,10 +1018,17 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
-  if (parsed.stream) {
-    return StreamingResponse(parsed, backend, request);
+  try {
+    auto generation =
+        backend.start_chat(parsed.chat, parsed.max_tokens, parsed.temperature,
+                           request.is_cancelled, parsed.stream);
+    if (parsed.stream) {
+      return StreamingResponse(parsed, backend, std::move(generation));
+    }
+    return NonStreamingResponse(backend, generation);
+  } catch (const TextGenerationError& exception) {
+    return GenerationError(exception);
   }
-  return NonStreamingResponse(parsed, backend, request);
 }
 
 }  // namespace strix::server

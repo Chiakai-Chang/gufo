@@ -1,9 +1,12 @@
 #ifndef STRIX_SERVER_TEXT_GENERATION_BACKEND_HPP_
 #define STRIX_SERVER_TEXT_GENERATION_BACKEND_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -13,6 +16,60 @@
 #include "src/models/qwen/tokenizer.hpp"
 
 namespace strix::server {
+
+enum class TextGenerationErrorCode : std::uint8_t {
+  kQueueFull,
+  kClientQueueFull,
+  kDeadlineExceeded,
+  kOutputLimit,
+  kOutputBackpressure,
+  kSchedulerStopping,
+};
+
+class TextGenerationError final : public std::runtime_error {
+public:
+  TextGenerationError(TextGenerationErrorCode code, const std::string& message)
+      : std::runtime_error(message), code_(code) {}
+
+  [[nodiscard]] TextGenerationErrorCode code() const noexcept { return code_; }
+  [[nodiscard]] int http_status() const noexcept {
+    switch (code_) {
+      case TextGenerationErrorCode::kQueueFull:
+      case TextGenerationErrorCode::kClientQueueFull:
+        return 429;
+      case TextGenerationErrorCode::kDeadlineExceeded:
+        return 408;
+      case TextGenerationErrorCode::kOutputLimit:
+      case TextGenerationErrorCode::kOutputBackpressure:
+      case TextGenerationErrorCode::kSchedulerStopping:
+        return 503;
+    }
+    return 500;
+  }
+  [[nodiscard]] const char* stable_code() const noexcept {
+    switch (code_) {
+      case TextGenerationErrorCode::kQueueFull:
+        return "queue_full";
+      case TextGenerationErrorCode::kClientQueueFull:
+        return "client_queue_full";
+      case TextGenerationErrorCode::kDeadlineExceeded:
+        return "deadline_exceeded";
+      case TextGenerationErrorCode::kOutputLimit:
+        return "output_limit";
+      case TextGenerationErrorCode::kOutputBackpressure:
+        return "output_backpressure";
+      case TextGenerationErrorCode::kSchedulerStopping:
+        return "scheduler_stopping";
+    }
+    return "generation_error";
+  }
+  [[nodiscard]] bool retryable() const noexcept {
+    return code_ != TextGenerationErrorCode::kOutputLimit;
+  }
+
+private:
+  TextGenerationErrorCode code_;
+};
 
 struct ChatRequest {
   enum class ToolChoice : std::uint8_t {
@@ -27,6 +84,7 @@ struct ChatRequest {
 
   std::vector<tokenization::ChatMessage> messages;
   std::vector<tokenization::ChatTool> tools;
+  std::string client_id{"anonymous"};
   ToolChoice tool_choice{ToolChoice::kAuto};
 };
 
@@ -63,16 +121,39 @@ public:
     std::size_t max_prefill_chunk_tokens{0};
     std::size_t max_consecutive_active_prefill_chunks{0};
     std::size_t configured_active_prefill_tokens{0};
+    std::size_t queue_depth_at_submit{0};
+    std::size_t client_queue_depth_at_submit{0};
+    std::size_t resident_requests_at_admission{0};
+    std::size_t requested_logical_concurrency{1};
+    std::size_t physical_execution_width{1};
+    std::size_t max_buffered_output_bytes{0};
+    double queue_ms{0.0};
     double ttft_ms{0.0};
     double mean_inter_token_ms{0.0};
     double max_inter_token_ms{0.0};
     double prefill_ms{0.0};
     double decode_ms{0.0};
+    std::string client_id{"anonymous"};
+    std::string execution_plan{"serial-c1"};
     std::string prefill_fallback_reason;
     FinishReason finish_reason{FinishReason::kStop};
     bool incremental_prefill_supported{false};
     bool cache_hit{false};
     bool cancelled{false};
+  };
+
+  class GenerationRequest {
+  public:
+    GenerationRequest() = default;
+    virtual ~GenerationRequest() = default;
+
+    GenerationRequest(const GenerationRequest&) = delete;
+    GenerationRequest& operator=(const GenerationRequest&) = delete;
+    GenerationRequest(GenerationRequest&&) = delete;
+    GenerationRequest& operator=(GenerationRequest&&) = delete;
+
+    virtual Result Wait(const TokenCallback& on_token = {}) = 0;
+    virtual void Cancel() noexcept = 0;
   };
 
   TextGenerationBackend() = default;
@@ -99,9 +180,66 @@ public:
                       const CancellationCheck& is_cancelled = {},
                       const TokenCallback& on_token = {}) = 0;
 
+  /// Reserves admission before a streaming response commits successful headers.
+  ///
+  /// Backends with an asynchronous scheduler override this. The default
+  /// request defers the existing blocking chat call until Wait().
+  virtual std::shared_ptr<GenerationRequest> start_chat(
+      const ChatRequest& request, std::size_t max_tokens, float temperature,
+      const CancellationCheck& is_cancelled = {}, bool stream_output = false);
+
   [[nodiscard]] virtual std::size_t count_tokens(
       std::string_view text) const = 0;
 };
+
+inline std::shared_ptr<TextGenerationBackend::GenerationRequest>
+TextGenerationBackend::start_chat(const ChatRequest& request,
+                                  std::size_t max_tokens, float temperature,
+                                  const CancellationCheck& is_cancelled,
+                                  bool stream_output) {
+  (void)stream_output;
+  class DeferredGenerationRequest final : public GenerationRequest {
+  public:
+    DeferredGenerationRequest(TextGenerationBackend& backend,
+                              ChatRequest chat_request, std::size_t token_limit,
+                              float sampling_temperature,
+                              CancellationCheck external_cancellation)
+        : backend_(backend),
+          request_(std::move(chat_request)),
+          max_tokens_(token_limit),
+          temperature_(sampling_temperature),
+          external_cancellation_(std::move(external_cancellation)) {}
+
+    Result Wait(const TokenCallback& on_token) override {
+      if (waited_.exchange(true, std::memory_order_acq_rel)) {
+        throw std::logic_error("generation request was already consumed");
+      }
+      return backend_.chat(
+          request_, max_tokens_, temperature_,
+          [this] {
+            return cancelled_.load(std::memory_order_acquire) ||
+                   (external_cancellation_ && external_cancellation_());
+          },
+          on_token);
+    }
+
+    void Cancel() noexcept override {
+      cancelled_.store(true, std::memory_order_release);
+    }
+
+  private:
+    TextGenerationBackend& backend_;
+    ChatRequest request_;
+    std::size_t max_tokens_;
+    float temperature_;
+    CancellationCheck external_cancellation_;
+    std::atomic<bool> waited_{false};
+    std::atomic<bool> cancelled_{false};
+  };
+
+  return std::make_shared<DeferredGenerationRequest>(*this, request, max_tokens,
+                                                     temperature, is_cancelled);
+}
 
 }  // namespace strix::server
 

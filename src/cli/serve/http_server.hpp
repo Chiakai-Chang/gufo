@@ -66,13 +66,19 @@ struct HttpResponse {
 using Handler =
     std::function<HttpResponse(const HttpRequest&, TextGenerationBackend&)>;
 
+struct HttpServerLimits {
+  std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
+  std::size_t max_connections{16};
+};
+
 /// Minimal bounded HTTP/1.1 server for trusted-LAN model serving.
 class HttpServer {
 public:
   HttpServer(std::string host, int port,
              std::shared_ptr<TextGenerationBackend> backend,
              std::shared_ptr<VideoJobService> video_jobs = nullptr,
-             std::shared_ptr<TtsService> tts = nullptr);
+             std::shared_ptr<TtsService> tts = nullptr,
+             HttpServerLimits limits = {});
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
@@ -105,6 +111,7 @@ private:
   std::shared_ptr<TextGenerationBackend> backend_;
   std::shared_ptr<VideoJobService> video_jobs_;
   std::shared_ptr<TtsService> tts_;
+  HttpServerLimits limits_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::mutex workers_mutex_;

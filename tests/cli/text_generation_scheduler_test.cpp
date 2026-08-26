@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -22,10 +23,13 @@ using strix::server::ChatRequest;
 using strix::server::TextDecodeSelection;
 using strix::server::TextExecutionPlan;
 using strix::server::TextExecutionPlanKind;
+using strix::server::TextGenerationError;
+using strix::server::TextGenerationErrorCode;
 using strix::server::TextGenerationScheduler;
 using strix::server::TextModelRunner;
 using strix::server::TextPrefillPolicy;
 using strix::server::TextPrefillStep;
+using strix::server::TextRequestMetadata;
 using strix::server::TextRequestPhase;
 using strix::server::TextRunnerCapabilities;
 using strix::server::TextRunnerDescriptor;
@@ -33,6 +37,7 @@ using strix::server::TextRunnerPool;
 using strix::server::TextRunnerResourceClaim;
 using strix::server::TextRunnerState;
 using strix::server::TextRunnerToken;
+using strix::server::TextSchedulerPolicy;
 
 constexpr auto kTestTimeout = std::chrono::seconds{5};
 
@@ -94,6 +99,19 @@ struct FakeControl {
     condition.notify_all();
   }
 
+  void RecordInvalidation() {
+    invalidations.fetch_add(1, std::memory_order_relaxed);
+    condition.notify_all();
+  }
+
+  void WaitForInvalidations(std::size_t count) {
+    std::unique_lock<std::mutex> lock(mutex);
+    const bool reached = condition.wait_for(lock, kTestTimeout, [&] {
+      return invalidations.load(std::memory_order_relaxed) >= count;
+    });
+    Expect(reached, "timed out waiting for state invalidation");
+  }
+
   [[nodiscard]] std::vector<Event> Events() const {
     const std::lock_guard<std::mutex> lock(mutex);
     return events;
@@ -122,7 +140,7 @@ public:
       : control_(std::move(control)) {}
 
   void Invalidate() noexcept override {
-    control_->invalidations.fetch_add(1, std::memory_order_relaxed);
+    control_->RecordInvalidation();
     label = 0;
     position = 0;
     decode_count = 0;
@@ -315,11 +333,12 @@ private:
 
 std::unique_ptr<TextGenerationScheduler> MakeScheduler(
     const std::shared_ptr<FakeControl>& control, std::size_t capacity,
-    TextPrefillPolicy prefill_policy = {}) {
+    TextPrefillPolicy prefill_policy = {},
+    TextSchedulerPolicy scheduler_policy = {}) {
   auto runner = std::make_shared<FakeRunner>(control);
   auto pool = std::make_shared<TextRunnerPool>(std::move(runner), capacity);
-  return std::make_unique<TextGenerationScheduler>(std::move(pool),
-                                                   prefill_policy);
+  return std::make_unique<TextGenerationScheduler>(
+      std::move(pool), prefill_policy, scheduler_policy);
 }
 
 std::size_t EventIndex(std::span<const Event> events, EventKind kind,
@@ -346,6 +365,14 @@ std::vector<TextRunnerToken> ExpectedTokens(TextRunnerToken label,
   return tokens;
 }
 
+TextRequestMetadata ClientMetadata(std::string client_id) {
+  return {
+      .client_id = std::move(client_id),
+      .deadline = std::nullopt,
+      .request_start = TextGenerationScheduler::Clock::now(),
+  };
+}
+
 void TestIdlePrefillUsesBulkWorkUnit() {
   auto control = std::make_shared<FakeControl>();
   auto scheduler = MakeScheduler(control, 1, {.decode_active_tokens = 2});
@@ -360,6 +387,30 @@ void TestIdlePrefillUsesBulkWorkUnit() {
          "decode-idle prefill metrics report one bulk work unit");
   Expect(result.active_decode_prefill_chunks == 0,
          "decode-idle prefill is not counted as active-decode work");
+  Expect(result.requested_logical_concurrency == 1 &&
+             result.physical_execution_width == 1 &&
+             result.execution_plan == "serial-c1",
+         "C=1 telemetry reports immediate serial dispatch");
+}
+
+void TestMultiResidentPrefillUsesBoundedWorkUnits() {
+  auto control = std::make_shared<FakeControl>();
+  auto scheduler = MakeScheduler(control, 2, {.decode_active_tokens = 2});
+
+  const auto result =
+      scheduler->Submit({7, 70, 71, 72, 73, 74, 75}, 2, 0.0F).Wait();
+
+  std::size_t chunks = 0;
+  for (const auto& event : control->Events()) {
+    if (event.kind == EventKind::kPrefill && event.label == 7) {
+      Expect(event.count <= 2,
+             "multi-resident prefill respects the fairness budget");
+      ++chunks;
+    }
+  }
+  Expect(chunks == 4 && result.prefill_chunks == 4 &&
+             result.active_decode_prefill_chunks == 0,
+         "multi-resident prefill yields between bounded work units");
 }
 
 void TestDecodeActivePrefillIsBounded() {
@@ -475,6 +526,186 @@ void TestNonIncrementalRunnerFallsBackSafely() {
           result_b.max_prefill_chunk_tokens == 5 &&
           result_b.prefill_fallback_reason == "incremental_prefill_unavailable",
       "non-incremental runners report their full-prefill fallback");
+}
+
+void TestPendingLimitsRejectBeforeStateAdmission() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .max_pending_requests = 1,
+                                     .max_pending_requests_per_client = 1,
+                                 });
+
+  auto active = scheduler->Submit({1}, 4, 0.0F, {}, false,
+                                  ClientMetadata("active-client"));
+  control->WaitForAdvance(1);
+  auto queued = scheduler->Submit({2}, 1, 0.0F, {}, false,
+                                  ClientMetadata("queued-client"));
+
+  bool rejected = false;
+  try {
+    (void)scheduler->Submit({3}, 1, 0.0F, {}, false,
+                            ClientMetadata("third-client"));
+  } catch (const TextGenerationError& error) {
+    rejected = error.code() == TextGenerationErrorCode::kQueueFull;
+  }
+  Expect(rejected, "full pending queue rejects before admission");
+  Expect(control->states_created.load(std::memory_order_relaxed) == 1,
+         "rejected request cannot allocate another runner state");
+
+  control->ReleaseAdvance();
+  Expect(active.Wait().tokens == ExpectedTokens(1, 4) &&
+             queued.Wait().tokens == ExpectedTokens(2, 1),
+         "accepted work survives a queue rejection");
+}
+
+void TestPendingClientsAreRoundRobinAndIndividuallyBounded() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .max_pending_requests = 4,
+                                     .max_pending_requests_per_client = 2,
+                                 });
+
+  auto active = scheduler->Submit({1}, 3, 0.0F, {}, false,
+                                  ClientMetadata("active-client"));
+  control->WaitForAdvance(1);
+  auto client_a_first =
+      scheduler->Submit({2}, 1, 0.0F, {}, false, ClientMetadata("client-a"));
+  auto client_a_second =
+      scheduler->Submit({3}, 1, 0.0F, {}, false, ClientMetadata("client-a"));
+  auto client_b =
+      scheduler->Submit({4}, 1, 0.0F, {}, false, ClientMetadata("client-b"));
+
+  bool client_rejected = false;
+  try {
+    (void)scheduler->Submit({5}, 1, 0.0F, {}, false,
+                            ClientMetadata("client-a"));
+  } catch (const TextGenerationError& error) {
+    client_rejected = error.code() == TextGenerationErrorCode::kClientQueueFull;
+  }
+  Expect(client_rejected, "one client cannot monopolize the pending queue");
+
+  control->ReleaseAdvance();
+  (void)active.Wait();
+  (void)client_a_first.Wait();
+  (void)client_a_second.Wait();
+  (void)client_b.Wait();
+
+  const auto events = control->Events();
+  const std::size_t a_first = EventIndex(events, EventKind::kPrefill, 2);
+  const std::size_t a_second = EventIndex(events, EventKind::kPrefill, 3);
+  const std::size_t b_first = EventIndex(events, EventKind::kPrefill, 4);
+  Expect(a_first < b_first && b_first < a_second,
+         "pending clients rotate before one client receives another admission");
+}
+
+void TestExpiredQueuedRequestNeverConsumesState() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 1);
+
+  auto active = scheduler->Submit({1}, 3, 0.0F);
+  control->WaitForAdvance(1);
+  auto expired = scheduler->Submit(
+      {2}, 1, 0.0F, {}, false,
+      TextRequestMetadata{
+          .client_id = "expired-client",
+          .deadline = TextGenerationScheduler::Clock::now() -
+                      std::chrono::milliseconds{1},
+          .request_start = TextGenerationScheduler::Clock::now(),
+      });
+  control->ReleaseAdvance();
+
+  bool deadline_reported = false;
+  try {
+    (void)expired.Wait();
+  } catch (const TextGenerationError& error) {
+    deadline_reported =
+        error.code() == TextGenerationErrorCode::kDeadlineExceeded;
+  }
+  Expect(deadline_reported, "expired queued work reports a stable deadline");
+  Expect(active.Wait().tokens == ExpectedTokens(1, 3),
+         "expired queued work does not disturb active generation");
+  Expect(control->states_created.load(std::memory_order_relaxed) == 1,
+         "expired queued work never creates or acquires another state");
+}
+
+void TestSlowConsumerOutputIsBoundedAndReclaimed() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 5;
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .max_buffered_output_bytes_per_request = 4,
+                                     .max_buffered_output_bytes_total = 4,
+                                 });
+
+  auto request = scheduler->Submit({5}, 5, 0.0F, {}, true);
+  std::mutex callback_mutex;
+  std::condition_variable callback_condition;
+  bool callback_entered = false;
+  bool release_callback = false;
+  bool backpressure_reported = false;
+  std::jthread consumer([&] {
+    try {
+      (void)request.Wait([&](std::string_view) {
+        std::unique_lock<std::mutex> lock(callback_mutex);
+        callback_entered = true;
+        control->ReleaseAdvance();
+        callback_condition.notify_all();
+        callback_condition.wait(lock, [&] { return release_callback; });
+        return true;
+      });
+    } catch (const TextGenerationError& error) {
+      backpressure_reported =
+          error.code() == TextGenerationErrorCode::kOutputBackpressure;
+    }
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(callback_mutex);
+    const bool entered = callback_condition.wait_for(
+        lock, kTestTimeout, [&] { return callback_entered; });
+    Expect(entered, "slow consumer receives its first output piece");
+  }
+  control->WaitForInvalidations(1);
+  {
+    const std::lock_guard<std::mutex> lock(callback_mutex);
+    release_callback = true;
+  }
+  callback_condition.notify_all();
+  consumer.join();
+
+  Expect(backpressure_reported,
+         "bounded output queue fails a persistently slow consumer");
+  Expect(scheduler->buffered_output_bytes() == 0,
+         "failed slow-consumer output is fully reclaimed");
+  Expect(scheduler->max_buffered_output_bytes() <= 4,
+         "server-wide buffered output never exceeds its declared limit");
+
+  const auto replacement = scheduler->Submit({6}, 2, 0.0F).Wait();
+  Expect(replacement.tokens == ExpectedTokens(6, 2),
+         "state is reusable after output backpressure cancellation");
+}
+
+void TestGeneratedOutputLimitAppliesWithoutStreaming() {
+  auto control = std::make_shared<FakeControl>();
+  auto scheduler = MakeScheduler(control, 1, {},
+                                 {
+                                     .max_output_bytes_per_request = 4,
+                                 });
+
+  bool output_limit_reported = false;
+  try {
+    (void)scheduler->Submit({7}, 3, 0.0F).Wait();
+  } catch (const TextGenerationError& error) {
+    output_limit_reported =
+        error.code() == TextGenerationErrorCode::kOutputLimit;
+  }
+  Expect(output_limit_reported,
+         "non-streaming generation obeys its output byte limit");
 }
 
 void TestMidGenerationAdmissionAndIsolatedTrajectories() {
@@ -619,6 +850,10 @@ void TestFourResidentRequestsMakeProgress() {
     Expect(result.tokens ==
                ExpectedTokens(static_cast<TextRunnerToken>(index + 1), 3),
            "C=4 serial fallback preserves isolated output");
+    Expect(result.requested_logical_concurrency == 4 &&
+               result.physical_execution_width == 1 &&
+               result.execution_plan == "serial-fallback",
+           "C=4 telemetry exposes the physical serial fallback");
   }
 }
 
@@ -647,9 +882,15 @@ void TestRunnerFailureInvalidatesAndDoesNotPoisonReplacement() {
 
 int main() {
   TestIdlePrefillUsesBulkWorkUnit();
+  TestMultiResidentPrefillUsesBoundedWorkUnits();
   TestDecodeActivePrefillIsBounded();
   TestPrefillYieldsToEveryDueDecoder();
   TestNonIncrementalRunnerFallsBackSafely();
+  TestPendingLimitsRejectBeforeStateAdmission();
+  TestPendingClientsAreRoundRobinAndIndividuallyBounded();
+  TestExpiredQueuedRequestNeverConsumesState();
+  TestSlowConsumerOutputIsBoundedAndReclaimed();
+  TestGeneratedOutputLimitAppliesWithoutStreaming();
   TestMidGenerationAdmissionAndIsolatedTrajectories();
   TestFifoReplacementAdmissionWithOneSlot();
   TestQueuedAndPrefillCancellation();
