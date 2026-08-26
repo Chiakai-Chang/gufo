@@ -22,6 +22,12 @@ enum class TextRequestPhase : std::uint8_t {
   kTerminal,
 };
 
+inline constexpr std::size_t kDefaultDecodeActivePrefillTokens = 512;
+
+struct TextPrefillPolicy {
+  std::size_t decode_active_tokens{kDefaultDecodeActivePrefillTokens};
+};
+
 /// Single-owner scheduler for opaque text-model runner states.
 ///
 /// Submitters never execute model code. One scheduler thread owns admission,
@@ -60,7 +66,8 @@ public:
     std::unique_ptr<Impl> impl_;
   };
 
-  explicit TextGenerationScheduler(std::shared_ptr<TextRunnerPool> runner_pool);
+  explicit TextGenerationScheduler(std::shared_ptr<TextRunnerPool> runner_pool,
+                                   TextPrefillPolicy prefill_policy = {});
   ~TextGenerationScheduler();
 
   TextGenerationScheduler(const TextGenerationScheduler&) = delete;

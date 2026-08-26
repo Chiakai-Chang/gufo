@@ -24,6 +24,7 @@ using strix::server::TextExecutionPlan;
 using strix::server::TextExecutionPlanKind;
 using strix::server::TextGenerationScheduler;
 using strix::server::TextModelRunner;
+using strix::server::TextPrefillPolicy;
 using strix::server::TextPrefillStep;
 using strix::server::TextRequestPhase;
 using strix::server::TextRunnerCapabilities;
@@ -51,6 +52,7 @@ struct Event {
   EventKind kind;
   TextRunnerToken label;
   std::size_t index;
+  std::size_t count;
 };
 
 struct FakeControl {
@@ -111,6 +113,7 @@ struct FakeControl {
   bool release_prefill{false};
   std::atomic<std::size_t> invalidations{0};
   std::atomic<std::size_t> states_created{0};
+  bool incremental_prefill{true};
 };
 
 class FakeState final : public TextRunnerState {
@@ -161,7 +164,7 @@ public:
         .max_context = 128,
         .capabilities =
             TextRunnerCapabilities{
-                .incremental_prefill = true,
+                .incremental_prefill = control_->incremental_prefill,
             },
     };
   }
@@ -218,6 +221,8 @@ public:
       throw std::logic_error("invalid scheduler fake prefill");
     }
     fake.label = prompt.front();
+    const std::size_t consumed =
+        std::min(max_input_tokens, prompt.size() - offset);
 
     {
       std::unique_lock<std::mutex> lock(control_->mutex);
@@ -225,6 +230,7 @@ public:
           .kind = EventKind::kPrefill,
           .label = fake.label,
           .index = fake.position,
+          .count = consumed,
       });
       if (control_->block_prefill_label == fake.label &&
           !control_->prefill_gate_entered) {
@@ -239,8 +245,6 @@ public:
       }
     }
 
-    const std::size_t consumed =
-        std::min(max_input_tokens, prompt.size() - offset);
     fake.position += consumed;
     const bool ready = fake.position == prompt.size();
     if (ready) {
@@ -291,6 +295,7 @@ public:
           .kind = EventKind::kAdvance,
           .label = fake.label,
           .index = fake.decode_count,
+          .count = 1,
       });
     }
 
@@ -309,10 +314,12 @@ private:
 };
 
 std::unique_ptr<TextGenerationScheduler> MakeScheduler(
-    const std::shared_ptr<FakeControl>& control, std::size_t capacity) {
+    const std::shared_ptr<FakeControl>& control, std::size_t capacity,
+    TextPrefillPolicy prefill_policy = {}) {
   auto runner = std::make_shared<FakeRunner>(control);
   auto pool = std::make_shared<TextRunnerPool>(std::move(runner), capacity);
-  return std::make_unique<TextGenerationScheduler>(std::move(pool));
+  return std::make_unique<TextGenerationScheduler>(std::move(pool),
+                                                   prefill_policy);
 }
 
 std::size_t EventIndex(std::span<const Event> events, EventKind kind,
@@ -337,6 +344,137 @@ std::vector<TextRunnerToken> ExpectedTokens(TextRunnerToken label,
     tokens.push_back(label * 100 + static_cast<TextRunnerToken>(index));
   }
   return tokens;
+}
+
+void TestIdlePrefillUsesBulkWorkUnit() {
+  auto control = std::make_shared<FakeControl>();
+  auto scheduler = MakeScheduler(control, 1, {.decode_active_tokens = 2});
+
+  const auto result = scheduler->Submit({7, 70, 71, 72, 73}, 2, 0.0F).Wait();
+
+  const auto events = control->Events();
+  Expect(events.front().kind == EventKind::kPrefill &&
+             events.front().label == 7 && events.front().count == 5,
+         "decode-idle prefill consumes the complete prompt");
+  Expect(result.prefill_chunks == 1 && result.prefill_tokens == 5,
+         "decode-idle prefill metrics report one bulk work unit");
+  Expect(result.active_decode_prefill_chunks == 0,
+         "decode-idle prefill is not counted as active-decode work");
+}
+
+void TestDecodeActivePrefillIsBounded() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 2, {.decode_active_tokens = 2});
+
+  auto request_a = scheduler->Submit({1}, 10, 0.0F);
+  control->WaitForAdvance(1);
+  auto request_b = scheduler->Submit({2, 20, 21, 22, 23, 24, 25}, 2, 0.0F);
+  control->ReleaseAdvance();
+
+  const auto result_a = request_a.Wait();
+  const auto result_b = request_b.Wait();
+  Expect(result_a.tokens == ExpectedTokens(1, 10),
+         "active decoder preserves its isolated trajectory");
+  Expect(result_b.tokens == ExpectedTokens(2, 2),
+         "chunked prefill preserves the new request trajectory");
+
+  const auto events = control->Events();
+  std::size_t previous_b_prefill = events.size();
+  std::size_t b_prefill_chunks = 0;
+  for (std::size_t index = 0; index < events.size(); ++index) {
+    if (events[index].kind != EventKind::kPrefill || events[index].label != 2) {
+      continue;
+    }
+    Expect(events[index].count <= 2,
+           "active-decode prefill respects its token budget");
+    if (previous_b_prefill != events.size()) {
+      bool a_advanced = false;
+      for (std::size_t between = previous_b_prefill + 1; between < index;
+           ++between) {
+        a_advanced =
+            a_advanced || (events[between].kind == EventKind::kAdvance &&
+                           events[between].label == 1);
+      }
+      Expect(a_advanced, "an active decoder advances between prefill chunks");
+    }
+    previous_b_prefill = index;
+    ++b_prefill_chunks;
+  }
+  Expect(b_prefill_chunks == 4,
+         "long active-decode prompt is split into bounded chunks");
+  Expect(result_b.prefill_chunks == 4 && result_b.prefill_tokens == 7 &&
+             result_b.active_decode_prefill_chunks == 4 &&
+             result_b.max_prefill_chunk_tokens == 2 &&
+             result_b.max_consecutive_active_prefill_chunks == 1,
+         "chunk metrics capture the selected active-decode policy");
+}
+
+void TestPrefillYieldsToEveryDueDecoder() {
+  auto control = std::make_shared<FakeControl>();
+  control->block_advance_label = 2;
+  auto scheduler = MakeScheduler(control, 3, {.decode_active_tokens = 2});
+
+  auto request_a = scheduler->Submit({1}, 10, 0.0F);
+  auto request_b = scheduler->Submit({2}, 10, 0.0F);
+  control->WaitForAdvance(2);
+  auto request_c = scheduler->Submit({3, 30, 31, 32, 33, 34, 35}, 2, 0.0F);
+  control->ReleaseAdvance();
+
+  const auto result_a = request_a.Wait();
+  const auto result_b = request_b.Wait();
+  const auto result_c = request_c.Wait();
+  Expect(result_a.tokens == ExpectedTokens(1, 10) &&
+             result_b.tokens == ExpectedTokens(2, 10) &&
+             result_c.tokens == ExpectedTokens(3, 2),
+         "all mixed prefill/decode trajectories remain isolated");
+
+  const auto events = control->Events();
+  std::size_t previous_c_prefill = events.size();
+  for (std::size_t index = 0; index < events.size(); ++index) {
+    if (events[index].kind != EventKind::kPrefill || events[index].label != 3) {
+      continue;
+    }
+    if (previous_c_prefill != events.size()) {
+      bool a_advanced = false;
+      bool b_advanced = false;
+      for (std::size_t between = previous_c_prefill + 1; between < index;
+           ++between) {
+        if (events[between].kind == EventKind::kAdvance) {
+          a_advanced = a_advanced || events[between].label == 1;
+          b_advanced = b_advanced || events[between].label == 2;
+        }
+      }
+      Expect(a_advanced && b_advanced,
+             "every due decoder advances before another prefill chunk");
+    }
+    previous_c_prefill = index;
+  }
+  Expect(result_c.max_consecutive_active_prefill_chunks == 1,
+         "scheduler never runs consecutive chunks while decode is due");
+}
+
+void TestNonIncrementalRunnerFallsBackSafely() {
+  auto control = std::make_shared<FakeControl>();
+  control->incremental_prefill = false;
+  control->block_advance_label = 1;
+  auto scheduler = MakeScheduler(control, 2, {.decode_active_tokens = 2});
+
+  auto request_a = scheduler->Submit({1}, 8, 0.0F);
+  control->WaitForAdvance(1);
+  auto request_b = scheduler->Submit({2, 20, 21, 22, 23}, 2, 0.0F);
+  control->ReleaseAdvance();
+
+  Expect(request_a.Wait().tokens == ExpectedTokens(1, 8),
+         "fallback preserves the active decoder trajectory");
+  const auto result_b = request_b.Wait();
+  Expect(result_b.tokens == ExpectedTokens(2, 2),
+         "fallback preserves the admitted request trajectory");
+  Expect(
+      !result_b.incremental_prefill_supported && result_b.prefill_chunks == 1 &&
+          result_b.max_prefill_chunk_tokens == 5 &&
+          result_b.prefill_fallback_reason == "incremental_prefill_unavailable",
+      "non-incremental runners report their full-prefill fallback");
 }
 
 void TestMidGenerationAdmissionAndIsolatedTrajectories() {
@@ -423,16 +561,22 @@ void TestQueuedAndPrefillCancellation() {
 
   {
     auto control = std::make_shared<FakeControl>();
+    control->block_advance_label = 1;
     control->block_prefill_label = 4;
-    auto scheduler = MakeScheduler(control, 1);
+    auto scheduler = MakeScheduler(control, 2, {.decode_active_tokens = 2});
 
-    auto request = scheduler->Submit({4, 40}, 2, 0.0F);
+    auto active = scheduler->Submit({1}, 4, 0.0F);
+    control->WaitForAdvance(1);
+    auto request = scheduler->Submit({4, 40, 41, 42}, 2, 0.0F);
+    control->ReleaseAdvance();
     control->WaitForPrefill(4);
     request.Cancel();
     control->ReleasePrefill();
 
     const auto result = request.Wait();
-    Expect(result.cancelled, "prefilling request cancellation is reported");
+    Expect(!active.Wait().cancelled,
+           "active decoder survives another request cancellation");
+    Expect(result.cancelled, "active-decode prefill cancellation is reported");
     Expect(EventIndex(control->Events(), EventKind::kAdvance, 4) ==
                control->Events().size(),
            "cancelled prefill never advances decode");
@@ -502,6 +646,10 @@ void TestRunnerFailureInvalidatesAndDoesNotPoisonReplacement() {
 }  // namespace
 
 int main() {
+  TestIdlePrefillUsesBulkWorkUnit();
+  TestDecodeActivePrefillIsBounded();
+  TestPrefillYieldsToEveryDueDecoder();
+  TestNonIncrementalRunnerFallsBackSafely();
   TestMidGenerationAdmissionAndIsolatedTrajectories();
   TestFifoReplacementAdmissionWithOneSlot();
   TestQueuedAndPrefillCancellation();

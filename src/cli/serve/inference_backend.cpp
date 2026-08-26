@@ -47,9 +47,29 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
        << ",\"cached_prompt_tokens\":" << result.cached_prompt_tokens
        << ",\"uncached_prompt_tokens\":"
        << (result.prompt_tokens - result.cached_prompt_tokens)
+       << ",\"prefill_tokens\":" << result.prefill_tokens
+       << ",\"prefill_chunks\":" << result.prefill_chunks
+       << ",\"active_decode_prefill_chunks\":"
+       << result.active_decode_prefill_chunks
+       << ",\"max_prefill_chunk_tokens\":" << result.max_prefill_chunk_tokens
+       << ",\"max_consecutive_active_prefill_chunks\":"
+       << result.max_consecutive_active_prefill_chunks
+       << ",\"configured_active_prefill_tokens\":"
+       << result.configured_active_prefill_tokens
+       << ",\"incremental_prefill_supported\":"
+       << (result.incremental_prefill_supported ? "true" : "false")
+       << ",\"prefill_fallback_reason\":";
+  if (result.prefill_fallback_reason.empty()) {
+    line << "null";
+  } else {
+    line << '"' << result.prefill_fallback_reason << '"';
+  }
+  line << ",\"prefill_ms\":" << result.prefill_ms
        << ",\"completion_tokens\":" << result.completion_tokens
        << ",\"ttft_ms\":" << result.ttft_ms
        << ",\"mean_inter_token_ms\":" << result.mean_inter_token_ms
+       << ",\"max_inter_token_ms\":" << result.max_inter_token_ms
+       << ",\"decode_ms\":" << result.decode_ms
        << ",\"cancelled\":" << (result.cancelled ? "true" : "false") << "}";
   const std::lock_guard<std::mutex> lock(output_mutex);
   std::clog << line.str() << '\n';
@@ -544,7 +564,8 @@ InferenceBackend::~InferenceBackend() = default;
 
 bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             std::uint32_t max_context,
-                            std::size_t session_count) {
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy) {
 #if defined(ENGINE_ENABLE_HIP)
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
@@ -577,11 +598,13 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, "Failed to create GPU model: " + load_error);
     return false;
   }
-  return load(std::move(model), error, max_context, session_count);
+  return load(std::move(model), error, max_context, session_count,
+              prefill_policy);
 #else
   (void)model_path;
   (void)max_context;
   (void)session_count;
+  (void)prefill_policy;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -590,7 +613,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
 #if defined(ENGINE_ENABLE_HIP)
 bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             std::string* error, std::uint32_t max_context,
-                            std::size_t session_count) {
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -608,8 +632,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     new_state->model_id = runner->Descriptor().model_id;
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);
-    new_state->qwen_scheduler =
-        std::make_shared<TextGenerationScheduler>(std::move(runner_pool));
+    new_state->qwen_scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);

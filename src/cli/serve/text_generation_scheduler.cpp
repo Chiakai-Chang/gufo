@@ -33,6 +33,7 @@ struct ScheduledRequest {
   std::optional<TextGenerationScheduler::Clock::time_point> previous_token;
   std::chrono::duration<double, std::milli> inter_token_total{0};
   std::size_t inter_token_samples{0};
+  bool decode_due{false};
 
   std::mutex output_mutex;
   std::condition_variable output_condition;
@@ -92,12 +93,20 @@ struct TextGenerationScheduler::Request::Impl {
 };
 
 struct TextGenerationScheduler::Impl {
-  explicit Impl(std::shared_ptr<TextRunnerPool> model_runner_pool)
-      : runner_pool(std::move(model_runner_pool)) {
+  Impl(std::shared_ptr<TextRunnerPool> model_runner_pool,
+       TextPrefillPolicy model_prefill_policy)
+      : runner_pool(std::move(model_runner_pool)),
+        prefill_policy(model_prefill_policy) {
     if (runner_pool == nullptr) {
       throw std::invalid_argument(
           "text generation scheduler runner pool must not be null");
     }
+    if (prefill_policy.decode_active_tokens == 0) {
+      throw std::invalid_argument(
+          "active-decode prefill budget must be at least one token");
+    }
+    incremental_prefill_supported =
+        runner_pool->runner().Descriptor().capabilities.incremental_prefill;
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
   }
@@ -202,8 +211,9 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
-  void Admit(std::deque<std::shared_ptr<ScheduledRequest>>& active) {
-    while (active.size() < runner_pool->capacity()) {
+  void Admit(std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+             std::deque<std::shared_ptr<ScheduledRequest>>& decoding) {
+    while (prefilling.size() + decoding.size() < runner_pool->capacity()) {
       auto request = PopQueued();
       if (request == nullptr) {
         return;
@@ -227,41 +237,95 @@ struct TextGenerationScheduler::Impl {
         request->result.cache_hit = request->runner_request.cache_hit();
         request->result.cached_prompt_tokens =
             request->runner_request.cached_prompt_tokens();
+        request->result.incremental_prefill_supported =
+            incremental_prefill_supported;
         request->phase.store(TextRequestPhase::kAdmitted,
                              std::memory_order_release);
         request->phase.store(request->runner_request.prefill_complete()
                                  ? TextRequestPhase::kDecodeReady
                                  : TextRequestPhase::kPrefilling,
                              std::memory_order_release);
-        active.push_back(std::move(request));
+        if (request->runner_request.prefill_complete()) {
+          request->decode_due = true;
+          decoding.push_back(std::move(request));
+        } else {
+          prefilling.push_back(std::move(request));
+        }
       } catch (...) {
         CompleteFailure(request, std::current_exception());
       }
     }
   }
 
-  void Step(const std::shared_ptr<ScheduledRequest>& request) {
+  void StepPrefill(const std::shared_ptr<ScheduledRequest>& request,
+                   bool decoder_runnable) {
     try {
       if (CancellationRequested(request)) {
         CompleteCancelled(request);
         return;
       }
 
-      if (!request->runner_request.prefill_complete()) {
-        request->phase.store(TextRequestPhase::kPrefilling,
-                             std::memory_order_release);
-        (void)request->runner_request.Prefill(
-            request->runner_request.prompt_tokens());
-        request->phase.store(TextRequestPhase::kDecodeReady,
-                             std::memory_order_release);
+      request->phase.store(TextRequestPhase::kPrefilling,
+                           std::memory_order_release);
+      const bool bounded_active_prefill =
+          decoder_runnable && incremental_prefill_supported;
+      const std::size_t budget = bounded_active_prefill
+                                     ? prefill_policy.decode_active_tokens
+                                     : request->runner_request.prompt_tokens();
+      if (decoder_runnable && !incremental_prefill_supported) {
+        request->result.prefill_fallback_reason =
+            "incremental_prefill_unavailable";
+      }
+      const auto start = Clock::now();
+      const auto step = request->runner_request.Prefill(budget);
+      request->result.prefill_ms +=
+          std::chrono::duration<double, std::milli>(Clock::now() - start)
+              .count();
+      request->result.prefill_tokens += step.consumed_tokens;
+      ++request->result.prefill_chunks;
+      request->result.max_prefill_chunk_tokens = std::max(
+          request->result.max_prefill_chunk_tokens, step.consumed_tokens);
+
+      if (decoder_runnable) {
+        ++request->result.active_decode_prefill_chunks;
+        ++consecutive_active_prefill_chunks;
+        request->result.max_consecutive_active_prefill_chunks =
+            std::max(request->result.max_consecutive_active_prefill_chunks,
+                     consecutive_active_prefill_chunks);
+      } else {
+        consecutive_active_prefill_chunks = 0;
+      }
+
+      if (CancellationRequested(request)) {
+        CompleteCancelled(request);
+        return;
+      }
+
+      request->phase.store(step.decode_ready ? TextRequestPhase::kDecodeReady
+                                             : TextRequestPhase::kPrefilling,
+                           std::memory_order_release);
+    } catch (...) {
+      CompleteFailure(request, std::current_exception());
+    }
+  }
+
+  void StepDecode(const std::shared_ptr<ScheduledRequest>& request) {
+    consecutive_active_prefill_chunks = 0;
+    try {
+      if (CancellationRequested(request)) {
+        CompleteCancelled(request);
         return;
       }
 
       request->phase.store(TextRequestPhase::kDecoding,
                            std::memory_order_release);
+      const auto decode_start = Clock::now();
       const auto selection =
           request->runner_request.SelectNext(request->temperature);
       if (selection.stop) {
+        request->result.decode_ms += std::chrono::duration<double, std::milli>(
+                                         Clock::now() - decode_start)
+                                         .count();
         CompleteSuccess(request, TextGenerationBackend::FinishReason::kStop);
         return;
       }
@@ -272,7 +336,11 @@ struct TextGenerationScheduler::Impl {
                                       now - request->request_start)
                                       .count();
       } else {
-        request->inter_token_total += now - *request->previous_token;
+        const auto inter_token = now - *request->previous_token;
+        request->inter_token_total += inter_token;
+        request->result.max_inter_token_ms = std::max(
+            request->result.max_inter_token_ms,
+            std::chrono::duration<double, std::milli>(inter_token).count());
         ++request->inter_token_samples;
       }
       request->previous_token = now;
@@ -284,6 +352,9 @@ struct TextGenerationScheduler::Impl {
         return;
       }
       request->runner_request.Advance();
+      request->result.decode_ms +=
+          std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
+              .count();
       if (CancellationRequested(request)) {
         CompleteCancelled(request);
         return;
@@ -296,8 +367,39 @@ struct TextGenerationScheduler::Impl {
     }
   }
 
+  [[nodiscard]] static bool HasDueDecoder(
+      const std::deque<std::shared_ptr<ScheduledRequest>>& decoding) {
+    return std::any_of(decoding.begin(), decoding.end(),
+                       [](const auto& request) { return request->decode_due; });
+  }
+
+  static void MarkAllDecodersDue(
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding) {
+    for (const auto& request : decoding) {
+      request->decode_due = true;
+    }
+  }
+
+  [[nodiscard]] static std::shared_ptr<ScheduledRequest> PopDecoder(
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+      bool require_due) {
+    const std::size_t candidates = decoding.size();
+    for (std::size_t index = 0; index < candidates; ++index) {
+      auto request = std::move(decoding.front());
+      decoding.pop_front();
+      if (!require_due || request->decode_due) {
+        return request;
+      }
+      decoding.push_back(std::move(request));
+    }
+    auto request = std::move(decoding.front());
+    decoding.pop_front();
+    return request;
+  }
+
   void CancelRemaining(
-      std::deque<std::shared_ptr<ScheduledRequest>>& active) noexcept {
+      std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
+      std::deque<std::shared_ptr<ScheduledRequest>>& decoding) noexcept {
     std::deque<std::shared_ptr<ScheduledRequest>> remaining_queued;
     {
       const std::lock_guard<std::mutex> lock(queue_mutex);
@@ -306,19 +408,24 @@ struct TextGenerationScheduler::Impl {
     for (const auto& request : remaining_queued) {
       CompleteCancelled(request);
     }
-    for (const auto& request : active) {
+    for (const auto& request : prefilling) {
       CompleteCancelled(request);
     }
-    active.clear();
+    for (const auto& request : decoding) {
+      CompleteCancelled(request);
+    }
+    prefilling.clear();
+    decoding.clear();
   }
 
   void Run(const std::stop_token& stop_token) noexcept {
-    std::deque<std::shared_ptr<ScheduledRequest>> active;
+    std::deque<std::shared_ptr<ScheduledRequest>> prefilling;
+    std::deque<std::shared_ptr<ScheduledRequest>> decoding;
     while (!stop_token.stop_requested()) {
       ProcessQueuedCancellations();
-      Admit(active);
+      Admit(prefilling, decoding);
 
-      if (active.empty()) {
+      if (prefilling.empty() && decoding.empty()) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         queue_condition.wait(lock, [&] {
           return stop_token.stop_requested() || stopping || !queued.empty();
@@ -326,21 +433,55 @@ struct TextGenerationScheduler::Impl {
         continue;
       }
 
-      auto request = std::move(active.front());
-      active.pop_front();
-      Step(request);
+      const bool due_decoder = HasDueDecoder(decoding);
+      if (!prefilling.empty() && !decoding.empty() && !due_decoder) {
+        auto request = std::move(prefilling.front());
+        prefilling.pop_front();
+        StepPrefill(request, true);
+        if (!IsTerminal(request)) {
+          if (request->runner_request.prefill_complete()) {
+            decoding.push_back(std::move(request));
+          } else {
+            prefilling.push_back(std::move(request));
+          }
+        }
+        MarkAllDecodersDue(decoding);
+        continue;
+      }
+
+      if (!decoding.empty()) {
+        auto request = PopDecoder(decoding, due_decoder);
+        request->decode_due = false;
+        StepDecode(request);
+        if (!IsTerminal(request)) {
+          decoding.push_back(std::move(request));
+        }
+        continue;
+      }
+
+      auto request = std::move(prefilling.front());
+      prefilling.pop_front();
+      StepPrefill(request, false);
       if (!IsTerminal(request)) {
-        active.push_back(std::move(request));
+        if (request->runner_request.prefill_complete()) {
+          request->decode_due = true;
+          decoding.push_back(std::move(request));
+        } else {
+          prefilling.push_back(std::move(request));
+        }
       }
     }
-    CancelRemaining(active);
+    CancelRemaining(prefilling, decoding);
   }
 
   std::shared_ptr<TextRunnerPool> runner_pool;
+  TextPrefillPolicy prefill_policy;
+  bool incremental_prefill_supported{false};
   mutable std::mutex queue_mutex;
   std::condition_variable queue_condition;
   std::deque<std::shared_ptr<ScheduledRequest>> queued;
   bool stopping{false};
+  std::size_t consecutive_active_prefill_chunks{0};
   std::atomic<std::uint64_t> next_request_id{1};
   std::jthread worker;
 };
@@ -452,8 +593,9 @@ void TextGenerationScheduler::Request::Cancel() noexcept {
 }
 
 TextGenerationScheduler::TextGenerationScheduler(
-    std::shared_ptr<TextRunnerPool> runner_pool)
-    : impl_(std::make_unique<Impl>(std::move(runner_pool))) {}
+    std::shared_ptr<TextRunnerPool> runner_pool,
+    TextPrefillPolicy prefill_policy)
+    : impl_(std::make_unique<Impl>(std::move(runner_pool), prefill_policy)) {}
 
 TextGenerationScheduler::~TextGenerationScheduler() = default;
 
@@ -476,6 +618,8 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   auto request = std::make_shared<ScheduledRequest>();
   request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
   request->result.prompt_tokens = prompt.size();
+  request->result.configured_active_prefill_tokens =
+      impl_->prefill_policy.decode_active_tokens;
   request->prompt = std::move(prompt);
   request->token_limit = max_tokens > 0 ? max_tokens : 1;
   request->temperature = temperature;

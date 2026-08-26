@@ -209,7 +209,8 @@ HttpResponse WithTiming(HttpResponse response,
                         const TextGenerationBackend::Result& result) {
   std::ostringstream value;
   value << std::fixed << std::setprecision(3) << "ttft;dur=" << result.ttft_ms
-        << ", inter_token;dur=" << result.mean_inter_token_ms;
+        << ", inter_token;dur=" << result.mean_inter_token_ms
+        << ", max_inter_token;dur=" << result.max_inter_token_ms;
   response.headers.emplace_back("Server-Timing", value.str());
   return response;
 }

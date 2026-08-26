@@ -85,6 +85,8 @@ void PrintServeHelp(std::string_view program_name,
     std::string speculative_backend;
     std::string mtp_model_path;
     std::size_t draft_tokens = 3;
+    std::size_t prefill_chunk_tokens =
+        server::kDefaultDecodeActivePrefillTokens;
     bool force_cpu = false;
 
     strix::cli::ArgParser parser(
@@ -170,6 +172,10 @@ void PrintServeHelp(std::string_view program_name,
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 3)",
         "Speculative", &draft_tokens);
+    parser.AddOption(
+        "", "--prefill-chunk", "N",
+        "Maximum prompt tokens between active decode rounds (default: 512)",
+        "Scheduling", &prefill_chunk_tokens);
     parser.AddFlag("", "--cpu",
                    "Force CPU OpenMP execution fallback instead of GPU ROCm",
                    "Hardware", &force_cpu);
@@ -413,6 +419,8 @@ int RunServe(std::span<const char* const> args) {
     std::string speculative_backend;
     std::string mtp_model_path;
     std::size_t draft_tokens = 3;
+    std::size_t prefill_chunk_tokens =
+        server::kDefaultDecodeActivePrefillTokens;
     bool force_cpu = false;
 
     strix::cli::ArgParser llm_parser(
@@ -494,6 +502,10 @@ int RunServe(std::span<const char* const> args) {
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 3)",
         "Speculative", &draft_tokens);
+    llm_parser.AddOption(
+        "", "--prefill-chunk", "N",
+        "Maximum prompt tokens between active decode rounds (default: 512)",
+        "Scheduling", &prefill_chunk_tokens);
     llm_parser.AddFlag(
         "", "--cpu", "Force CPU OpenMP execution fallback instead of GPU ROCm",
         "Hardware", &force_cpu);
@@ -507,16 +519,20 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("strix", "llm");
       return 0;
     }
-    if (max_tokens == 0 || !std::isfinite(temperature) || temperature < 0.0F ||
+    if (max_tokens == 0 || prefill_chunk_tokens == 0 ||
+        !std::isfinite(temperature) || temperature < 0.0F ||
         temperature > 2.0F) {
       std::cerr << "Error: sampling defaults require max tokens > 0 and "
-                   "temperature in [0, 2]\n";
+                   "temperature in [0, 2], and prefill chunk > 0\n";
       return 2;
     }
 
     std::string err;
     backend = std::make_shared<server::InferenceBackend>();
-    if (!backend->load(model, &err, max_context, session_count)) {
+    if (!backend->load(model, &err, max_context, session_count,
+                       server::TextPrefillPolicy{
+                           .decode_active_tokens = prefill_chunk_tokens,
+                       })) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

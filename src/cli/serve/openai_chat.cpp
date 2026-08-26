@@ -834,7 +834,8 @@ HttpResponse NonStreamingResponse(const ParsedChatRequest& request,
 
   std::ostringstream timing;
   timing << std::fixed << std::setprecision(3) << "ttft;dur=" << result.ttft_ms
-         << ", inter_token;dur=" << result.mean_inter_token_ms;
+         << ", inter_token;dur=" << result.mean_inter_token_ms
+         << ", max_inter_token;dur=" << result.max_inter_token_ms;
   return {
       .status = 200,
       .reason = "OK",
