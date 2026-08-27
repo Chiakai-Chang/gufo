@@ -79,7 +79,7 @@ HttpResponse Error(int status, const char* reason, std::string message,
   error["type"] = "invalid_request_error";
   error["code"] = code;
   response["error"] = std::move(error);
-  return {status, reason, response.dump(), {}, {}};
+  return {.status = status, .reason = reason, .body = response.dump()};
 }
 
 const char* StatusReason(int status) noexcept {
@@ -741,6 +741,41 @@ const char* FinishReason(const TextGenerationBackend::Result& result,
   return "stop";
 }
 
+json::Value Timings(const TextGenerationBackend::Result& result) {
+  json::Value timings = json::Value::object();
+  const double prompt_per_second =
+      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
+          ? (static_cast<double>(result.prompt_tokens) /
+             (result.prefill_ms / 1000.0))
+          : 0.0;
+  const double predicted_per_second =
+      (result.decode_ms > 0.0 && result.completion_tokens > 0)
+          ? (static_cast<double>(result.completion_tokens) /
+             (result.decode_ms / 1000.0))
+          : 0.0;
+  const double prompt_per_token_ms =
+      (result.prompt_tokens > 0)
+          ? (result.prefill_ms / static_cast<double>(result.prompt_tokens))
+          : 0.0;
+  const double predicted_per_token_ms =
+      (result.completion_tokens > 0)
+          ? (result.decode_ms / static_cast<double>(result.completion_tokens))
+          : 0.0;
+
+  timings["prompt_n"] = result.prompt_tokens;
+  timings["prompt_ms"] = result.prefill_ms;
+  timings["prompt_per_token_ms"] = prompt_per_token_ms;
+  timings["prompt_per_second"] = prompt_per_second;
+  timings["predicted_n"] = result.completion_tokens;
+  timings["predicted_ms"] = result.decode_ms;
+  timings["predicted_per_token_ms"] = predicted_per_token_ms;
+  timings["predicted_per_second"] = predicted_per_second;
+  timings["cache_n"] = result.cached_prompt_tokens;
+  timings["draft_n"] = result.draft_tokens;
+  timings["draft_n_accepted"] = result.draft_accepted_tokens;
+  return timings;
+}
+
 json::Value Usage(const TextGenerationBackend::Result& result) {
   json::Value usage = json::Value::object();
   usage["prompt_tokens"] = result.prompt_tokens;
@@ -749,6 +784,23 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   json::Value prompt_details = json::Value::object();
   prompt_details["cached_tokens"] = result.cached_prompt_tokens;
   usage["prompt_tokens_details"] = std::move(prompt_details);
+
+  const double prompt_per_second =
+      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
+          ? (static_cast<double>(result.prompt_tokens) /
+             (result.prefill_ms / 1000.0))
+          : 0.0;
+  const double predicted_per_second =
+      (result.decode_ms > 0.0 && result.completion_tokens > 0)
+          ? (static_cast<double>(result.completion_tokens) /
+             (result.decode_ms / 1000.0))
+          : 0.0;
+
+  usage["cached_tokens"] = result.cached_prompt_tokens;
+  usage["prompt_tokens_per_second"] = prompt_per_second;
+  usage["completion_tokens_per_second"] = predicted_per_second;
+  usage["draft_tokens"] = result.draft_tokens;
+  usage["draft_tokens_accepted"] = result.draft_accepted_tokens;
 
   json::Value metrics = json::Value::object();
   metrics["cache_hit"] = result.cache_hit;
@@ -905,17 +957,58 @@ HttpResponse NonStreamingResponse(
   choices.push_back(std::move(choice));
   response["choices"] = std::move(choices);
   response["usage"] = Usage(result);
+  response["timings"] = Timings(result);
 
   std::ostringstream timing;
   timing << std::fixed << std::setprecision(3) << "ttft;dur=" << result.ttft_ms
          << ", inter_token;dur=" << result.mean_inter_token_ms
          << ", max_inter_token;dur=" << result.max_inter_token_ms;
+
+  std::ostringstream details;
+  const double prompt_per_second =
+      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
+          ? (static_cast<double>(result.prompt_tokens) /
+             (result.prefill_ms / 1000.0))
+          : 0.0;
+  const double tok_per_sec =
+      (result.decode_ms > 0.0 && result.completion_tokens > 0)
+          ? (static_cast<double>(result.completion_tokens) /
+             (result.decode_ms / 1000.0))
+          : 0.0;
+
+  details << result.prompt_tokens << " prompt tok";
+  if (prompt_per_second > 0.0) {
+    details << " (" << std::fixed << std::setprecision(1) << prompt_per_second
+            << " tok/s)";
+  }
+  details << " | " << result.completion_tokens << " gen tok";
+  if (tok_per_sec > 0.0) {
+    details << " (" << std::fixed << std::setprecision(1) << tok_per_sec
+            << " tok/s)";
+  }
+  if (result.cached_prompt_tokens > 0) {
+    details << " | cache: " << result.cached_prompt_tokens << " tok";
+  }
+  if (result.draft_tokens > 0) {
+    const double accept_pct =
+        (static_cast<double>(result.draft_accepted_tokens) * 100.0) /
+        static_cast<double>(result.draft_tokens);
+    details << " | draft: " << result.draft_accepted_tokens << "/"
+            << result.draft_tokens << " (" << std::fixed << std::setprecision(1)
+            << accept_pct << "%)";
+  }
+  if (result.ttft_ms > 0.0) {
+    details << " | TTFT: " << std::fixed << std::setprecision(1)
+            << result.ttft_ms << "ms";
+  }
+
   return {
       .status = 200,
       .reason = "OK",
       .body = response.dump(),
       .headers = {{"Server-Timing", timing.str()}},
       .streaming_body = {},
+      .log_details = details.str(),
   };
 }
 
@@ -1001,6 +1094,7 @@ HttpResponse StreamingResponse(
                 json::Value usage_chunk = BaseChunk(id, created, model);
                 usage_chunk["choices"] = json::Value::array();
                 usage_chunk["usage"] = Usage(result);
+                usage_chunk["timings"] = Timings(result);
                 if (!writer(Sse(usage_chunk))) {
                   return;
                 }

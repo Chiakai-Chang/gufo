@@ -26,6 +26,7 @@
 
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/json.hpp"
+#include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_api.hpp"
@@ -205,7 +206,70 @@ std::string RandomId() {
 }
 
 HttpResponse Ok(const json::Value& v) {
-  return {200, "OK", v.dump(), {}, {}};
+  return {.status = 200, .reason = "OK", .body = v.dump()};
+}
+
+json::Value TimingsJson(const TextGenerationBackend::Result& result) {
+  json::Value timings = json::Value::object();
+  const double prompt_per_second =
+      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
+          ? (static_cast<double>(result.prompt_tokens) /
+             (result.prefill_ms / 1000.0))
+          : 0.0;
+  const double predicted_per_second =
+      (result.decode_ms > 0.0 && result.completion_tokens > 0)
+          ? (static_cast<double>(result.completion_tokens) /
+             (result.decode_ms / 1000.0))
+          : 0.0;
+  const double prompt_per_token_ms =
+      (result.prompt_tokens > 0)
+          ? (result.prefill_ms / static_cast<double>(result.prompt_tokens))
+          : 0.0;
+  const double predicted_per_token_ms =
+      (result.completion_tokens > 0)
+          ? (result.decode_ms / static_cast<double>(result.completion_tokens))
+          : 0.0;
+
+  timings["prompt_n"] = result.prompt_tokens;
+  timings["prompt_ms"] = result.prefill_ms;
+  timings["prompt_per_token_ms"] = prompt_per_token_ms;
+  timings["prompt_per_second"] = prompt_per_second;
+  timings["predicted_n"] = result.completion_tokens;
+  timings["predicted_ms"] = result.decode_ms;
+  timings["predicted_per_token_ms"] = predicted_per_token_ms;
+  timings["predicted_per_second"] = predicted_per_second;
+  timings["cache_n"] = result.cached_prompt_tokens;
+  timings["draft_n"] = result.draft_tokens;
+  timings["draft_n_accepted"] = result.draft_accepted_tokens;
+  return timings;
+}
+
+json::Value UsageJson(const TextGenerationBackend::Result& result) {
+  json::Value usage = json::Value::object();
+  usage["prompt_tokens"] = result.prompt_tokens;
+  usage["completion_tokens"] = result.completion_tokens;
+  usage["total_tokens"] = result.prompt_tokens + result.completion_tokens;
+  json::Value prompt_details = json::Value::object();
+  prompt_details["cached_tokens"] = result.cached_prompt_tokens;
+  usage["prompt_tokens_details"] = std::move(prompt_details);
+
+  const double prompt_per_second =
+      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
+          ? (static_cast<double>(result.prompt_tokens) /
+             (result.prefill_ms / 1000.0))
+          : 0.0;
+  const double predicted_per_second =
+      (result.decode_ms > 0.0 && result.completion_tokens > 0)
+          ? (static_cast<double>(result.completion_tokens) /
+             (result.decode_ms / 1000.0))
+          : 0.0;
+
+  usage["cached_tokens"] = result.cached_prompt_tokens;
+  usage["prompt_tokens_per_second"] = prompt_per_second;
+  usage["completion_tokens_per_second"] = predicted_per_second;
+  usage["draft_tokens"] = result.draft_tokens;
+  usage["draft_tokens_accepted"] = result.draft_accepted_tokens;
+  return usage;
 }
 
 HttpResponse WithTiming(HttpResponse response,
@@ -215,6 +279,44 @@ HttpResponse WithTiming(HttpResponse response,
         << ", inter_token;dur=" << result.mean_inter_token_ms
         << ", max_inter_token;dur=" << result.max_inter_token_ms;
   response.headers.emplace_back("Server-Timing", value.str());
+
+  std::ostringstream details;
+  const double prompt_per_second =
+      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
+          ? (static_cast<double>(result.prompt_tokens) /
+             (result.prefill_ms / 1000.0))
+          : 0.0;
+  const double tok_per_sec =
+      (result.decode_ms > 0.0 && result.completion_tokens > 0)
+          ? (static_cast<double>(result.completion_tokens) /
+             (result.decode_ms / 1000.0))
+          : 0.0;
+  details << result.prompt_tokens << " prompt tok";
+  if (prompt_per_second > 0.0) {
+    details << " (" << std::fixed << std::setprecision(1) << prompt_per_second
+            << " tok/s)";
+  }
+  details << " | " << result.completion_tokens << " gen tok";
+  if (tok_per_sec > 0.0) {
+    details << " (" << std::fixed << std::setprecision(1) << tok_per_sec
+            << " tok/s)";
+  }
+  if (result.cached_prompt_tokens > 0) {
+    details << " | cache: " << result.cached_prompt_tokens << " tok";
+  }
+  if (result.draft_tokens > 0) {
+    const double accept_pct =
+        (static_cast<double>(result.draft_accepted_tokens) * 100.0) /
+        static_cast<double>(result.draft_tokens);
+    details << " | draft: " << result.draft_accepted_tokens << "/"
+            << result.draft_tokens << " (" << std::fixed << std::setprecision(1)
+            << accept_pct << "%)";
+  }
+  if (result.ttft_ms > 0.0) {
+    details << " | TTFT: " << std::fixed << std::setprecision(1)
+            << result.ttft_ms << "ms";
+  }
+  response.log_details = details.str();
   return response;
 }
 
@@ -226,7 +328,7 @@ HttpResponse Err(int status, const char* reason, const char* message,
   obj["type"] = type;
   obj["code"] = code;
   e["error"] = std::move(obj);
-  return {status, reason, e.dump(), {}, {}};
+  return {.status = status, .reason = reason, .body = e.dump()};
 }
 
 HttpResponse NotImplemented(const HttpRequest&, TextGenerationBackend&) {
@@ -360,11 +462,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   c["finish_reason"] = "stop";
   choices.push_back(std::move(c));
   resp["choices"] = std::move(choices);
-  json::Value usage = json::Value::object();
-  usage["prompt_tokens"] = res.prompt_tokens;
-  usage["completion_tokens"] = res.completion_tokens;
-  usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
-  resp["usage"] = std::move(usage);
+  resp["usage"] = UsageJson(res);
+  resp["timings"] = TimingsJson(res);
   return WithTiming(Ok(resp), res);
 }
 
@@ -429,7 +528,11 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
   usage["input_tokens"] = res.prompt_tokens;
   usage["output_tokens"] = res.completion_tokens;
   usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
+  json::Value input_details = json::Value::object();
+  input_details["cached_tokens"] = res.cached_prompt_tokens;
+  usage["input_token_details"] = std::move(input_details);
   resp["usage"] = std::move(usage);
+  resp["timings"] = TimingsJson(res);
   return WithTiming(Ok(resp), res);
 }
 
@@ -486,7 +589,10 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   json::Value usage = json::Value::object();
   usage["input_tokens"] = res.prompt_tokens;
   usage["output_tokens"] = res.completion_tokens;
+  usage["cache_creation_input_tokens"] = 0;
+  usage["cache_read_input_tokens"] = res.cached_prompt_tokens;
   resp["usage"] = std::move(usage);
+  resp["timings"] = TimingsJson(res);
   return WithTiming(Ok(resp), res);
 }
 
@@ -553,6 +659,9 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   resp["stopping_word"] = "";
   resp["tokens_predicted"] = res.completion_tokens;
   resp["tokens_evaluated"] = res.prompt_tokens;
+  resp["tokens_cached"] = res.cached_prompt_tokens;
+  resp["timings"] = TimingsJson(res);
+  resp["usage"] = UsageJson(res);
   return WithTiming(Ok(resp), res);
 }
 
@@ -578,6 +687,11 @@ HttpResponse LlamaInfill(const HttpRequest& req, TextGenerationBackend& b) {
 
   json::Value resp = json::Value::object();
   resp["content"] = res.text;
+  resp["tokens_predicted"] = res.completion_tokens;
+  resp["tokens_evaluated"] = res.prompt_tokens;
+  resp["tokens_cached"] = res.cached_prompt_tokens;
+  resp["timings"] = TimingsJson(res);
+  resp["usage"] = UsageJson(res);
   return WithTiming(Ok(resp), res);
 }
 
@@ -592,6 +706,19 @@ HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend&) {
   resp["template"] = "";
   json::Value model_info = json::Value::object();
   resp["model_info"] = std::move(model_info);
+  return Ok(resp);
+}
+
+HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
+  json::Value resp = json::Value::array();
+  json::Value slot = json::Value::object();
+  slot["id"] = 0;
+  slot["task_id"] = 0;
+  slot["state"] = 0;
+  slot["prompt"] = "";
+  slot["next_token"] = json::Value();
+  slot["model"] = b.model_id();
+  resp.push_back(std::move(slot));
   return Ok(resp);
 }
 
@@ -672,6 +799,8 @@ void HttpServer::register_routes() {
   add("POST", "/infill", LlamaInfill);
   add("POST", "/completion", LlamaCompletion);
   add("GET", "/props", LlamaProps);
+  add("GET", "/slots", LlamaSlots);
+  add("GET", "/v1/slots", LlamaSlots);
 
   // ---- sdapi ----
   add("POST", "/sdapi/v1/txt2img", NotImplemented);
@@ -731,15 +860,16 @@ bool HttpServer::start(std::string* error) {
 }
 
 void HttpServer::run() {
-  std::cout << "strix: listening on http://" << host_ << ":" << port_ << "\n";
+  Logger::Info("server",
+               "Listening on http://" + host_ + ":" + std::to_string(port_));
   if (backend_ != nullptr) {
-    std::cout << "strix: text model " << backend_->model_id() << "\n";
+    Logger::Info("engine", "Loaded text model: " + backend_->model_id());
   }
   if (video_jobs_ != nullptr && video_jobs_->ready()) {
-    std::cout << "strix: MiniMax H3 video API enabled\n";
+    Logger::Info("video", "MiniMax H3 video API enabled");
   }
   if (tts_ != nullptr && tts_->ready()) {
-    std::cout << "strix: Qwen3-TTS audio API enabled\n";
+    Logger::Info("audio", "Qwen3-TTS audio API enabled");
   }
   while (!stopped_.load(std::memory_order_acquire)) {
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
@@ -873,8 +1003,9 @@ void HttpServer::handle_connection(int client_fd) {
   ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
+  const auto start_time = std::chrono::steady_clock::now();
+  HttpRequest req;
   try {
-    HttpRequest req;
     bool ok = false;
     bool payload_too_large = false;
     {
@@ -967,10 +1098,17 @@ void HttpServer::handle_connection(int client_fd) {
       resp = Err(400, "Bad Request", "malformed request",
                  "invalid_request_error", "bad_request");
     } else if (req.method == "OPTIONS") {
-      resp = {204, "No Content", "", {}, {}};
+      resp = {.status = 204, .reason = "No Content"};
     } else {
       resp = handle_request(req);
     }
+
+    const auto duration_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start_time)
+                                 .count();
+    Logger::LogRequest(req.method.empty() ? "UNKNOWN" : req.method,
+                       req.path.empty() ? "/" : req.path, resp.status,
+                       resp.reason, duration_ms, resp.log_details);
 
     if (resp.streaming_body) {
       if (SendAll(client_fd, BuildResponseHead(resp, std::nullopt))) {
@@ -982,6 +1120,9 @@ void HttpServer::handle_connection(int client_fd) {
       (void)SendAll(client_fd, BuildResponse(resp));
     }
   } catch (const TextGenerationError& exception) {
+    const auto duration_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start_time)
+                                 .count();
     const char* reason = "Service Unavailable";
     if (exception.http_status() == 408) {
       reason = "Request Timeout";
@@ -993,15 +1134,30 @@ void HttpServer::handle_connection(int client_fd) {
     if (exception.retryable()) {
       resp.headers.emplace_back("Retry-After", "1");
     }
+    Logger::LogRequest(req.method.empty() ? "UNKNOWN" : req.method,
+                       req.path.empty() ? "/" : req.path, resp.status,
+                       resp.reason, duration_ms, exception.what());
     (void)SendAll(client_fd, BuildResponse(resp));
   } catch (const std::exception& e) {
+    const auto duration_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start_time)
+                                 .count();
     const HttpResponse resp = Err(500, "Internal Server Error", e.what(),
                                   "internal_error", "server_exception");
+    Logger::LogRequest(req.method.empty() ? "UNKNOWN" : req.method,
+                       req.path.empty() ? "/" : req.path, resp.status,
+                       resp.reason, duration_ms, e.what());
     (void)SendAll(client_fd, BuildResponse(resp));
   } catch (...) {
+    const auto duration_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - start_time)
+                                 .count();
     const HttpResponse resp =
         Err(500, "Internal Server Error", "unknown server error",
             "internal_error", "server_exception");
+    Logger::LogRequest(req.method.empty() ? "UNKNOWN" : req.method,
+                       req.path.empty() ? "/" : req.path, resp.status,
+                       resp.reason, duration_ms, "unknown server error");
     (void)SendAll(client_fd, BuildResponse(resp));
   }
   ::close(client_fd);

@@ -48,6 +48,10 @@ std::uint64_t ClientLabel(std::string_view client_id) noexcept {
 
 void EmitRequestMetrics(const InferenceBackend::Result& result,
                         std::string_view status) {
+  static const bool enabled = (std::getenv("STRIX_DEBUG_METRICS") != nullptr);
+  if (!enabled) {
+    return;
+  }
   static std::mutex output_mutex;
   std::ostringstream line;
   line << std::fixed << std::setprecision(3)

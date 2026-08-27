@@ -61,6 +61,7 @@ struct HttpResponse {
   std::string body;
   std::vector<std::pair<std::string, std::string>> headers;
   StreamingBody streaming_body;
+  std::string log_details;
 };
 
 using Handler =

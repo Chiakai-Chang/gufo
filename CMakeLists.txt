@@ -279,6 +279,7 @@ add_executable(strix
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
   src/cli/serve/http_server.cpp
+  src/cli/serve/logging.cpp
   src/cli/serve/openai_chat.cpp
 )
 target_link_libraries(strix PRIVATE strix_diagnostics strix_core)
