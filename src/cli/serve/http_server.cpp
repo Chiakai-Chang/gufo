@@ -272,8 +272,22 @@ json::Value UsageJson(const TextGenerationBackend::Result& result) {
   return usage;
 }
 
+json::Value MetricsJson(const TextGenerationBackend::Result& result) {
+  json::Value metrics = json::Value::object();
+  metrics["time_to_first_token_ms"] = result.ttft_ms;
+  metrics["generation_time_ms"] = result.decode_ms;
+  metrics["queue_time_ms"] = result.queue_ms;
+  metrics["mean_itl_ms"] = result.mean_inter_token_ms;
+  metrics["prompt_tokens"] = result.prompt_tokens;
+  metrics["completion_tokens"] = result.completion_tokens;
+  metrics["cached_tokens"] = result.cached_prompt_tokens;
+  return metrics;
+}
+
 HttpResponse WithTiming(HttpResponse response,
                         const TextGenerationBackend::Result& result) {
+  RecordServerMetrics(result);
+
   std::ostringstream value;
   value << std::fixed << std::setprecision(3) << "ttft;dur=" << result.ttft_ms
         << ", inter_token;dur=" << result.mean_inter_token_ms
@@ -291,6 +305,7 @@ HttpResponse WithTiming(HttpResponse response,
           ? (static_cast<double>(result.completion_tokens) /
              (result.decode_ms / 1000.0))
           : 0.0;
+
   details << result.prompt_tokens << " prompt tok";
   if (prompt_per_second > 0.0) {
     details << " (" << std::fixed << std::setprecision(1) << prompt_per_second
@@ -722,6 +737,35 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
   return Ok(resp);
 }
 
+HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend&) {
+  std::ostringstream out;
+  out << "# HELP llamacpp:prompt_tokens_total Total prompt tokens processed\n"
+      << "# TYPE llamacpp:prompt_tokens_total counter\n"
+      << "llamacpp:prompt_tokens_total "
+      << detail::TotalPromptTokens().load(std::memory_order_relaxed) << "\n"
+      << "# HELP llamacpp:tokens_predicted_total Total tokens generated\n"
+      << "# TYPE llamacpp:tokens_predicted_total counter\n"
+      << "llamacpp:tokens_predicted_total "
+      << detail::TotalGenTokens().load(std::memory_order_relaxed) << "\n"
+      << "# HELP llamacpp:prompt_tokens_seconds Prompt processing speed in "
+         "tokens per second\n"
+      << "# TYPE llamacpp:prompt_tokens_seconds gauge\n"
+      << "llamacpp:prompt_tokens_seconds "
+      << detail::LastPromptSpeed().load(std::memory_order_relaxed) << "\n"
+      << "# HELP llamacpp:predicted_tokens_seconds Generation speed in tokens "
+         "per second\n"
+      << "# TYPE llamacpp:predicted_tokens_seconds gauge\n"
+      << "llamacpp:predicted_tokens_seconds "
+      << detail::LastGenSpeed().load(std::memory_order_relaxed) << "\n"
+      << "# HELP llamacpp:kv_cache_usage_ratio KV cache usage ratio\n"
+      << "# TYPE llamacpp:kv_cache_usage_ratio gauge\n"
+      << "llamacpp:kv_cache_usage_ratio 0.0\n";
+  return {.status = 200,
+          .reason = "OK",
+          .body = out.str(),
+          .headers = {{"Content-Type", "text/plain; version=0.0.4"}}};
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -801,6 +845,8 @@ void HttpServer::register_routes() {
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);
   add("GET", "/v1/slots", LlamaSlots);
+  add("GET", "/metrics", LlamaMetrics);
+  add("GET", "/v1/metrics", LlamaMetrics);
 
   // ---- sdapi ----
   add("POST", "/sdapi/v1/txt2img", NotImplemented);

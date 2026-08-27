@@ -806,6 +806,18 @@ json::Value Timings(const TextGenerationBackend::Result& result) {
   return timings;
 }
 
+json::Value Metrics(const TextGenerationBackend::Result& result) {
+  json::Value metrics = json::Value::object();
+  metrics["time_to_first_token_ms"] = result.ttft_ms;
+  metrics["generation_time_ms"] = result.decode_ms;
+  metrics["queue_time_ms"] = result.queue_ms;
+  metrics["mean_itl_ms"] = result.mean_inter_token_ms;
+  metrics["prompt_tokens"] = result.prompt_tokens;
+  metrics["completion_tokens"] = result.completion_tokens;
+  metrics["cached_tokens"] = result.cached_prompt_tokens;
+  return metrics;
+}
+
 json::Value Usage(const TextGenerationBackend::Result& result) {
   json::Value usage = json::Value::object();
   usage["prompt_tokens"] = result.prompt_tokens;
@@ -1062,6 +1074,8 @@ HttpResponse NonStreamingResponse(
   response["choices"] = std::move(choices);
   response["usage"] = Usage(result);
   response["timings"] = Timings(result);
+  response["metrics"] = Metrics(result);
+  RecordServerMetrics(result);
 
   std::ostringstream timing;
   timing << std::fixed << std::setprecision(3) << "ttft;dur=" << result.ttft_ms
@@ -1199,14 +1213,14 @@ HttpResponse StreamingResponse(
                       FinishReason(result, !generated.tool_calls.empty()))))) {
                 return;
               }
-              if (request.include_usage) {
-                json::Value usage_chunk = BaseChunk(id, created, model);
-                usage_chunk["choices"] = json::Value::array();
-                usage_chunk["usage"] = Usage(result);
-                usage_chunk["timings"] = Timings(result);
-                if (!writer(Sse(usage_chunk))) {
-                  return;
-                }
+              json::Value usage_chunk = BaseChunk(id, created, model);
+              usage_chunk["choices"] = json::Value::array();
+              usage_chunk["usage"] = Usage(result);
+              usage_chunk["timings"] = Timings(result);
+              usage_chunk["metrics"] = Metrics(result);
+              RecordServerMetrics(result);
+              if (!writer(Sse(usage_chunk))) {
+                return;
               }
               (void)writer("data: [DONE]\n\n");
             } catch (const TextGenerationError& exception) {

@@ -83,7 +83,7 @@ void Logger::Log(LogLevel level, std::string_view component,
   }
 
   const std::lock_guard<std::mutex> lock(LogMutex());
-  std::cout << out.str() << '\n';
+  std::cout << out.str() << "\n" << std::flush;
 }
 
 void Logger::LogRequest(std::string_view method, std::string_view path,
@@ -129,7 +129,7 @@ void Logger::LogRequest(std::string_view method, std::string_view path,
   }
 
   const std::lock_guard<std::mutex> lock(LogMutex());
-  std::cout << out.str() << '\n';
+  std::cout << out.str() << "\n" << std::flush;
 }
 
 }  // namespace strix::server

@@ -258,6 +258,11 @@ void PrintServeHelp(std::string_view program_name,
 }
 
 int RunServe(std::span<const char* const> args) {
+  (void)std::setvbuf(stdout, nullptr, _IONBF, 0);
+  (void)std::setvbuf(stderr, nullptr, _IONBF, 0);
+  std::cout.setf(std::ios::unitbuf);
+  std::cerr.setf(std::ios::unitbuf);
+
   std::string host = "127.0.0.1";
   if (const char* env_host = std::getenv("HOST");
       env_host != nullptr && *env_host != '\0') {

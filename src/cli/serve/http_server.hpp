@@ -120,6 +120,51 @@ private:
   std::vector<std::pair<std::pair<std::string, std::string>, Handler>> routes_;
 };
 
+namespace detail {
+inline std::atomic<std::uint64_t>& TotalPromptTokens() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<std::uint64_t>& TotalGenTokens() {
+  static std::atomic<std::uint64_t> count{0};
+  return count;
+}
+inline std::atomic<double>& LastPromptSpeed() {
+  static std::atomic<double> val{0.0};
+  return val;
+}
+inline std::atomic<double>& LastGenSpeed() {
+  static std::atomic<double> val{0.0};
+  return val;
+}
+}  // namespace detail
+
+inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
+  detail::TotalPromptTokens().fetch_add(result.prompt_tokens,
+                                        std::memory_order_relaxed);
+  detail::TotalGenTokens().fetch_add(result.completion_tokens,
+                                     std::memory_order_relaxed);
+
+  const double prompt_per_second =
+      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
+          ? (static_cast<double>(result.prompt_tokens) /
+             (result.prefill_ms / 1000.0))
+          : 0.0;
+  const double tok_per_sec =
+      (result.decode_ms > 0.0 && result.completion_tokens > 0)
+          ? (static_cast<double>(result.completion_tokens) /
+             (result.decode_ms / 1000.0))
+          : 0.0;
+
+  if (prompt_per_second > 0.0) {
+    detail::LastPromptSpeed().store(prompt_per_second,
+                                    std::memory_order_relaxed);
+  }
+  if (tok_per_sec > 0.0) {
+    detail::LastGenSpeed().store(tok_per_sec, std::memory_order_relaxed);
+  }
+}
+
 }  // namespace strix::server
 
 #endif  // STRIX_SERVER_HTTP_SERVER_HPP_
