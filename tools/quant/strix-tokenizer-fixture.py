@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import sys
 
-CORPUS_PATH = Path(__file__).resolve().parent.parent / "tests/fixtures/tokenization/qwen-corpus.json"
+CORPUS_PATH = Path(__file__).resolve().parents[2] / "tests/fixtures/tokenization/qwen-corpus.json"
 
 TEST_CASES = [
     {

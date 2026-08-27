@@ -9,7 +9,7 @@ excerpt fetched on demand from:
 Run from the repository root:
 
 ```sh
-nix develop --command tools/run_ref_tts_quality.sh
+nix develop --command tools/audio/run_ref_tts_quality.sh
 ```
 
 The fetch requests only the beginning of the source and retains at most 2,200

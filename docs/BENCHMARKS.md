@@ -15,34 +15,34 @@ has one utility; a benchmark consumes the artifacts the earlier steps produce:
 ```bash
 # 1. download safetensors + tokenizer -> artifacts/source
 # 2. validate safetensors, write source manifest
-tools/strix-inspect.py --source artifacts/source --revision <sha> \
+tools/quant/strix-inspect.py --source artifacts/source --revision <sha> \
   --out artifacts/work/source-manifest.json
 
 # 3. capture full-precision teacher logits + perplexity (matched-token)
-tools/strix-capture.py --source artifacts/source \
-  --suite tools/suites/teacher.json --out artifacts/teacher
+tools/quant/strix-capture.py --source artifacts/source \
+  --suite tools/quant/suites/teacher.json --out artifacts/teacher
 
 # 4. quantize LM linear projections to SHQ4-T16 U4Z G64
-tools/strix-quantize.py --source artifacts/source \
+tools/quant/strix-quantize.py --source artifacts/source \
   --out artifacts/quant --plan artifacts/work/quantization-plan.json
 
 # 5. benchmark: candidate-vs-teacher quality + prefill/decode speed
-tools/strix-bench.py --source artifacts/source --quant artifacts/quant \
-  --suite tools/suites/teacher.json --teacher-artifact artifacts/teacher
+tools/quant/strix-bench.py --source artifacts/source --quant artifacts/quant \
+  --suite tools/quant/suites/teacher.json --teacher-artifact artifacts/teacher
 ```
 
 Key utilities and their roles:
 
-- `strix-capture.py` — teacher-forced full-precision logit dump. Logits are
+- `tools/quant/strix-capture.py` — teacher-forced full-precision logit dump. Logits are
   chunked by position, zstd-compressed, checksummed into an artifact dir
   (`manifest.json`, `tokens.u32`, `logits-*.f32.zst`, `metrics.json`).
   This is the teacher oracle; it is captured once and reused.
-- `strix-quantize.py` — deterministic SHQ4 conversion. Records per-tensor
+- `tools/quant/strix-quantize.py` — deterministic SHQ4 conversion. Records per-tensor
   reconstruction stats (max abs err, rmse, mean abs err) in the plan.
-- `strix-bench.py` — the benchmark itself. Runs the candidate forward pass,
+- `tools/quant/strix-bench.py` — the benchmark itself. Runs the candidate forward pass,
   compares candidate logits against the captured teacher artifact, and times
   prefill/decode on both.
-- `tools/suites/<model>.json` — prompt suite (schema `strix.suite.v1`):
+- `tools/quant/suites/<model>.json` — prompt suite (schema `strix.suite.v1`):
   a small fixed set of prompts, tokenized once with the pinned tokenizer.
 
 ## Quality method (matched-token, per position)
@@ -150,7 +150,7 @@ promotion rules.
 
 ## Serving benchmark
 
-`tools/strix-serving-bench.py` is the canonical HTTP serving harness. It sends
+`tools/serving/strix-serving-bench.py` is the canonical HTTP serving harness. It sends
 synchronized streamed Chat Completions requests at C=1, C=2, and C=4 by
 default. Its `strix.serving-benchmark.v1` artifact reports direct server-stage
 prefill/decode throughput, scheduler and client TTFT, token ITL, whole-request

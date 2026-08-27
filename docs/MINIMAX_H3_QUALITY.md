@@ -112,7 +112,7 @@ non-finite metrics, wrong hashes, and incomplete role sets fail closed.
 Seal a completed staging directory atomically:
 
 ```sh
-nix develop -c python3 tools/strix-h3-quality.py seal \
+nix develop -c python3 tools/h3/strix-h3-quality.py seal \
   --staging /var/llms/h3-oracles/staging/fox-layer50 \
   --template /var/llms/h3-oracles/specs/fox-layer50.json \
   --store /var/llms/h3-oracles/sha256
@@ -121,7 +121,7 @@ nix develop -c python3 tools/strix-h3-quality.py seal \
 Verify without executing the model:
 
 ```sh
-nix develop -c python3 tools/strix-h3-quality.py verify \
+nix develop -c python3 tools/h3/strix-h3-quality.py verify \
   --artifact /var/llms/h3-oracles/sha256/<sha256>
 ```
 

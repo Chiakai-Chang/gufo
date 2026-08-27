@@ -255,7 +255,7 @@
             ];
             files = [
               "tests/tools/test_h3_manifest.py"
-              "tools/strix-h3-manifest.py"
+              "tools/h3/strix-h3-manifest.py"
             ];
           };
 
@@ -275,7 +275,7 @@
               "tests/tools/h3_profile_report_test.py"
               "tests/tools/h3_rng_test.py"
               "tests/tools/test_h3_quality.py"
-              "tools/strix-h3-quality.py"
+              "tools/h3/strix-h3-quality.py"
             ];
           };
 
@@ -284,7 +284,7 @@
               ".devops/nix/package.nix"
               "flake.nix"
               "THIRD_PARTY_NOTICES.md"
-              "tools/check-dependencies.py"
+              "tools/ci/check-dependencies.py"
             ];
           };
 
@@ -361,7 +361,7 @@
           } ''
             cd "$src"
             mkdir -p $out
-            python3 tools/check-dependencies.py --json-report $out/dependency-inventory.json
+            python3 tools/ci/check-dependencies.py --json-report $out/dependency-inventory.json
             echo "PASS: Dependency inventory clean" > $out/result.txt
           '';
 
@@ -371,7 +371,7 @@
           } ''
             cd "$src"
             mkdir -p $out
-            python3 tools/check-docs.py --root "$src"
+            python3 tools/ci/check-docs.py --root "$src"
             echo "PASS: Documentation check clean" > $out/result.txt
           '';
 

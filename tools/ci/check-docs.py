@@ -32,7 +32,8 @@ REQUIRED_DOC_FILES = [
 ]
 
 EXCLUDE_DIRS = {
-    ".git", ".jj", ".direnv", "build", "Build", "result", "node_modules", ".cache"
+    ".git", ".jj", ".direnv", "build", "Build", "result", "node_modules", ".cache",
+    "hrx-system", "llama.cpp", "ds4"
 }
 
 # Regex to extract Markdown links: [label](target)

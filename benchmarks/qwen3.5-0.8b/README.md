@@ -11,9 +11,9 @@ Methodology: `docs/BENCHMARKS.md` (matched-token, per position; utilities
 
 Source: `Qwen/Qwen3.5-0.8B` @ `2fc06364715b967f1860aea9cf38778875588b17`, bf16.
 
-Teacher suite: `tools/suites/teacher.json`, 78 scored positions,
+Teacher suite: `tools/quant/suites/teacher.json`, 78 scored positions,
 SHA-256 `b33862883e78e7500cc8553cffe68ec8c44ca5ac1ceca8cbccb3070f6d42b131`.
-Calibration suite: `tools/suites/calib.json`, SHA-256
+Calibration suite: `tools/quant/suites/calib.json`, SHA-256
 `f1314e80685482cd80c99a6093054ce44ec2b326fa2edc7c87065dc249a1b37e`.
 
 Candidate: all LM linear projections (qkv/z/out/mlp/full-attn/mtp) quantized
@@ -77,7 +77,7 @@ Both quants are scored against the same bf16 source, tensor by tensor:
 
 ```bash
 nix develop
-tools/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf \
+tools/quant/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf \
   --recon --bf16-source artifacts/source \
   --plan artifacts/work/quantization-plan.json
 ```
@@ -133,7 +133,7 @@ unsloth 1.85% ours 9.97%`, `ssm_out Q5_K 5.50bpw unsloth 4.05% ours 10.32%`).
 | candidate perplexity | 4.259 | 3.942 |
 
 `range` = min/max scale search; `imatrix` = importance-weighted scale search
-calibrated on `tools/suites/calib.json` (666 tokens, disjoint from this eval
+calibrated on `tools/quant/suites/calib.json` (666 tokens, disjoint from this eval
 suite). Calibrating on the eval suite itself changed nothing (KL 0.172) —
 the disjoint calibration set is what unlocks imatrix.
 
@@ -172,8 +172,8 @@ across presets show:
 - Port SHQ4/SHQ8 decode GEMV to HIP (gfx1151) and XDNA2 (AIE2P); consume the
   packed planes directly (no dequant-to-bf16). SHQ8 shares the SHQ4 T16 tile
   layout, so it needs no separate kernel family.
-- Imatrix scale search is DONE and validated: `tools/strix-calibrate.py` +
-  `--imatrix` with the disjoint 666-token `tools/suites/calib.json` drops
+- Imatrix scale search is DONE and validated: `tools/quant/strix-calibrate.py` +
+  `--imatrix` with the disjoint 666-token `tools/quant/suites/calib.json` drops
   logit KL mean 0.172 -> 0.117, top-1 0.821 -> 0.872, ppl 4.259 -> 3.942
   (measured on this eval suite; calibration set disjoint). Self-calibrating
   on the eval suite is a documented anti-pattern — it changes nothing.

@@ -317,18 +317,18 @@ if (ENGINE_ENABLE_HIP)
     strix_core
     ${ROCTX_LIBRARY})
 
-  add_executable(tune_hipblaslt tools/tune_hipblaslt.cpp)
+  add_executable(tune_hipblaslt tools/bench/tune_hipblaslt.cpp)
   target_link_libraries(tune_hipblaslt PRIVATE strix_core hip::host)
 
-  add_executable(benchmark_ssm_replay tools/benchmark_ssm_replay.cpp)
+  add_executable(benchmark_ssm_replay tools/bench/benchmark_ssm_replay.cpp)
   target_link_libraries(benchmark_ssm_replay PRIVATE strix_core hip::host)
 
   option(STRIX_BUILD_DIAG_TOOLS "Build standalone diagnostic tools" OFF)
   if(STRIX_BUILD_DIAG_TOOLS)
-    add_executable(gguf_dump_types tools/gguf_dump_types.cpp)
+    add_executable(gguf_dump_types tools/quant/gguf_dump_types.cpp)
     target_link_libraries(gguf_dump_types PRIVATE strix_core)
 
-    add_executable(wmma_layout_test tools/wmma_layout_test.hip)
+    add_executable(wmma_layout_test tools/bench/wmma_layout_test.hip)
     target_link_libraries(wmma_layout_test PRIVATE strix_core hip::device)
   endif()
 endif()

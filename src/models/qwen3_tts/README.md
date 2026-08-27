@@ -216,9 +216,9 @@ Regenerate the oracle artifacts, which land gitignored in
 `artifacts/qwen3_tts/`:
 
 ```sh
-nix develop --command tools/run_ref_tts.sh           # sampled quality, seed 42
-nix develop --command tools/run_ref_tts.sh greedy    # five-frame exactness
-nix develop --command tools/run_ref_tts_quality.sh   # opt-in long-form fixture
+nix develop --command tools/audio/run_ref_tts.sh           # sampled quality, seed 42
+nix develop --command tools/audio/run_ref_tts.sh greedy    # five-frame exactness
+nix develop --command tools/audio/run_ref_tts_quality.sh   # opt-in long-form fixture
 ```
 
 | Artifact | Contents | Determinism |

@@ -43,8 +43,12 @@ let
       || relativePath == "src"
       || lib.hasPrefix "src/" relativePath
       || relativePath == "tools"
-      || relativePath == "tools/tune_hipblaslt.cpp"
-      || relativePath == "tools/benchmark_ssm_replay.cpp"
+      || relativePath == "tools/bench"
+      || relativePath == "tools/bench/tune_hipblaslt.cpp"
+      || relativePath == "tools/bench/benchmark_ssm_replay.cpp"
+      || relativePath == "tools/bench/wmma_layout_test.hip"
+      || relativePath == "tools/quant"
+      || relativePath == "tools/quant/gguf_dump_types.cpp"
       || relativePath == "tools/strix"
       || relativePath == "tools/strix/compile_h3_attention.py"
       || relativePath == "tools/strix/h3_attention_kernel.py";

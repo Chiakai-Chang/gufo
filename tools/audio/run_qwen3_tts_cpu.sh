@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 build_root="${QWEN3_TTS_BUILD_ROOT:-}"
 if [[ -z "$build_root" ]]; then
   build_root="$(mktemp -d /tmp/strix-qwen3-tts-cpu.XXXXXX)"

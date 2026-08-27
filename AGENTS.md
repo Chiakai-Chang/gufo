@@ -34,9 +34,9 @@ Performance tooling lives in `tools/` and is documented in
   harness that reports correctness next to throughput.
 - `tools/bench/gfx1151_peak.hip` measures the roofline ceilings every kernel is
   scored against. Do not use spec-sheet numbers.
-- `tools/prof.py` wraps `rocprofv3` with a pipeline-stage rollup, GPU-busy versus
+- `tools/prof/prof.py` wraps `rocprofv3` with a pipeline-stage rollup, GPU-busy versus
   wall-span, and an A/B `diff` mode.
-- `tools/isa_mix.py` summarizes one kernel's instruction mix from an assembly
+- `tools/prof/isa_mix.py` summarizes one kernel's instruction mix from an assembly
   listing.
 
 ## Development

@@ -19,7 +19,7 @@ import sys
 import os
 from pathlib import Path
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/strix/..")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from strix import recipe as recipe_mod
 
 
@@ -38,6 +38,7 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
+    this_dir = Path(__file__).resolve().parent
     presets = [p.strip() for p in args.presets.split(",")]
     env = dict(os.environ)
     results = {}
@@ -50,7 +51,7 @@ def main(argv=None):
               "--recipe", preset]
         if args.imatrix:
             qa += ["--imatrix", args.imatrix]
-        run([sys.executable, "tools/strix-quantize.py"] + qa)
+        run([sys.executable, str(this_dir / "strix-quantize.py")] + qa)
 
         # artifact bytes
         total = 0
@@ -59,7 +60,7 @@ def main(argv=None):
         mb = total / 1e6
 
         env["STRIX_PLAN"] = plan
-        r = run([sys.executable, "tools/strix-bench.py",
+        r = run([sys.executable, str(this_dir / "strix-bench.py"),
                  "--source", args.source, "--quant", qdir,
                  "--suite", args.suite, "--teacher-artifact", args.teacher_artifact,
                  "--repeats", str(args.repeats), "--json"], env=env)

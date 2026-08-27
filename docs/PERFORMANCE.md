@@ -178,7 +178,7 @@ MODEL=models/<model>/<artifact>.gguf
 In another shell, run the canonical C=1/C=2/C=4 harness:
 
 ```sh
-tools/strix-serving-bench.py \
+tools/serving/strix-serving-bench.py \
   --base-url http://127.0.0.1:8080 \
   --concurrency 1,2,4 \
   --warmup 1 \
@@ -276,20 +276,20 @@ run; `0.0e+00` means bit-identical. Winning variants are then ported into
 
 ### Profiling
 
-`tools/prof.py` wraps `rocprofv3` and answers the three questions a flat kernel
+`tools/prof/prof.py` wraps `rocprofv3` and answers the three questions a flat kernel
 table cannot: which pipeline stage owns the time, whether the GPU is actually
 busy, and what changed between two runs.
 
 ```sh
 # profile a command and analyze in one step
-nix develop -c python3 tools/prof.py run --stages qwen -- \
+nix develop -c python3 tools/prof/prof.py run --stages qwen -- \
   ./result/bin/strix bench --model "$MODEL" -p 2048 -n 0 -r 1
 
 # re-analyze an existing database
-nix develop -c python3 tools/prof.py show /tmp/prof/prof_results.db --top 20
+nix develop -c python3 tools/prof/prof.py show /tmp/prof/prof_results.db --top 20
 
 # A/B two runs, per stage and per kernel
-nix develop -c python3 tools/prof.py diff before_results.db after_results.db
+nix develop -c python3 tools/prof/prof.py diff before_results.db after_results.db
 ```
 
 `run` and `show` print a pipeline-stage rollup (kernel names grouped by model
@@ -321,15 +321,15 @@ PMC counters only in a separate diagnostic pass.
 
 ### Instruction mix
 
-When a kernel is off its roofline, the instruction mix says why. `tools/isa_mix.py`
+When a kernel is off its roofline, the instruction mix says why. `tools/prof/isa_mix.py`
 groups one kernel's emitted instructions into matrix, VALU, LDS, global memory,
 and wait/barrier categories:
 
 ```sh
 nix develop -c hipcc -O3 --offload-arch=gfx1151 -std=c++20 \
   --cuda-device-only -S -o /tmp/k.s tools/bench/w8a8_gemm_bench.hip
-nix develop -c python3 tools/isa_mix.py /tmp/k.s            # list kernels
-nix develop -c python3 tools/isa_mix.py /tmp/k.s BlockedW8A8 # one kernel
+nix develop -c python3 tools/prof/isa_mix.py /tmp/k.s            # list kernels
+nix develop -c python3 tools/prof/isa_mix.py /tmp/k.s BlockedW8A8 # one kernel
 ```
 
 Read the counts with care: the listing covers a whole kernel, so a once-per-block

@@ -42,7 +42,7 @@ The native inventory tool parses JSON and safetensors metadata directly. It
 does not import or execute Python supplied by the model repository:
 
 ```sh
-nix develop -c python3 tools/strix-h3-manifest.py \
+nix develop -c python3 tools/h3/strix-h3-manifest.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
   --verify src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json
 ```

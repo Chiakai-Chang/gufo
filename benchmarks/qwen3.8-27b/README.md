@@ -239,13 +239,13 @@ TARGET=models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf
 DFLASH=models/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q8_0.gguf
 MTP_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf
 
-nix develop -c python3 tools/speculative-corpus.py \
+nix develop -c python3 tools/quant/speculative-corpus.py \
   --binary ./result/bin/strix-server \
   --model "$TARGET" \
   --draft-model "$DFLASH" \
   --backend dflash2
 
-nix develop -c python3 tools/speculative-corpus.py \
+nix develop -c python3 tools/quant/speculative-corpus.py \
   --binary ./result/bin/strix-server \
   --model "$TARGET" \
   --draft-model "$MTP_MODEL" \
@@ -277,7 +277,7 @@ the accepted count. `--min-draft-tokens 3` applies the floor recommended by
 that implementation:
 
 ```sh
-nix develop -c python3 tools/speculative-corpus.py \
+nix develop -c python3 tools/quant/speculative-corpus.py \
   --binary ./result/bin/strix-server \
   --model "$TARGET" \
   --draft-model "$DFLASH" \
@@ -796,7 +796,7 @@ that was never needed.
 
 ### Prefill stage budget (`pp2048`, per pass)
 
-Captured with `nix develop -c python3 tools/prof.py run -- ./result/bin/strix bench ...`.
+Captured with `nix develop -c python3 tools/prof/prof.py run -- ./result/bin/strix bench ...`.
 The bench emits one token per repetition, so a profile of `-p 2048 -n 0` also
 contains one decode pass: the `W8A8BlockedWmmaGEMMKernel<128, 64, 4, 8, 1>`
 dispatches with a single token block are that decode, about 1.9% of the recorded
@@ -822,7 +822,7 @@ not 62 + 2: `BatchedSSMConvKernel` runs 48 times and
 | Residual add | 0.8% | 0.9% | the one add left unfused |
 | Q/K norm + RoPE + KV write | 0.5% | 0.4% | |
 
-Captured with `tools/prof.py run` on the Q8_K_XL artifact, `-p 2048 -n 0 -r 1`,
+Captured with `tools/prof/prof.py run` on the Q8_K_XL artifact, `-p 2048 -n 0 -r 1`,
 after `opt-c178` and `opt-c179`. Both profiles also contain one decode pass --
 the `W8A8BlockedWmmaGEMMKernel<128, 64, 4, 8, 1>` dispatches with a single token
 block, 2.1% of the depth-0 kernel time -- which is not part of the reported
