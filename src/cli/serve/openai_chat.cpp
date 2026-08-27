@@ -43,6 +43,7 @@ struct ParsedToolCall {
 
 struct ParsedGeneration {
   std::string text;
+  std::string reasoning_content;
   std::vector<ParsedToolCall> tool_calls;
 };
 
@@ -716,16 +717,45 @@ void ParseDsmlCalls(std::string_view text, std::vector<ParsedToolCall>* calls) {
 
 ParsedGeneration ParseGeneration(std::string_view raw) {
   ParsedGeneration parsed;
-  const std::size_t marker = EarliestMarker(raw);
-  if (marker == std::string_view::npos) {
-    parsed.text = std::string(raw);
-    return parsed;
+  const std::string_view content = raw;
+
+  constexpr std::string_view kThinkStart = "<think>";
+  constexpr std::string_view kThinkEnd = "</think>";
+  const std::size_t think_start = content.find(kThinkStart);
+  if (think_start != std::string_view::npos) {
+    const std::size_t think_content_start = think_start + kThinkStart.size();
+    const std::size_t think_end = content.find(kThinkEnd, think_content_start);
+    if (think_end != std::string_view::npos) {
+      parsed.reasoning_content = std::string(Trim(content.substr(
+          think_content_start, think_end - think_content_start)));
+      std::string_view remaining = content.substr(think_end + kThinkEnd.size());
+      if (remaining.starts_with("\n")) {
+        remaining.remove_prefix(1);
+      }
+      if (think_start > 0) {
+        parsed.text = std::string(content.substr(0, think_start)) +
+                      std::string(remaining);
+      } else {
+        parsed.text = std::string(remaining);
+      }
+    } else {
+      parsed.reasoning_content =
+          std::string(Trim(content.substr(think_content_start)));
+      parsed.text = "";
+    }
+  } else {
+    parsed.text = std::string(content);
   }
-  parsed.text = std::string(raw.substr(0, marker));
-  ParseQwenCalls(raw.substr(marker), &parsed.tool_calls);
-  ParseDsmlCalls(raw.substr(marker), &parsed.tool_calls);
-  if (parsed.tool_calls.empty()) {
-    parsed.text = std::string(raw);
+
+  const std::size_t marker = EarliestMarker(parsed.text);
+  if (marker != std::string_view::npos) {
+    const std::string text_before_tools = parsed.text.substr(0, marker);
+    const std::string text_from_tools = parsed.text.substr(marker);
+    ParseQwenCalls(text_from_tools, &parsed.tool_calls);
+    ParseDsmlCalls(text_from_tools, &parsed.tool_calls);
+    if (!parsed.tool_calls.empty()) {
+      parsed.text = text_before_tools;
+    }
   }
   return parsed;
 }
@@ -875,8 +905,11 @@ json::Value ChoiceChunk(std::string_view id, long long created,
 
 class StreamingTextFilter {
 public:
-  explicit StreamingTextFilter(std::function<bool(std::string_view)> emit_text)
-      : emit_text_(std::move(emit_text)) {}
+  using EmitCallback =
+      std::function<bool(std::string_view piece, bool is_reasoning)>;
+
+  explicit StreamingTextFilter(EmitCallback emit_piece)
+      : emit_piece_(std::move(emit_piece)) {}
 
   bool Push(std::string_view piece) {
     raw_.append(piece);
@@ -885,34 +918,95 @@ public:
       return true;
     }
     pending_.append(piece);
-    const std::size_t marker = EarliestMarker(pending_);
-    if (marker != std::string::npos) {
-      if (marker > 0 && !emit_text_(pending_.substr(0, marker))) {
+
+    if (state_ == State::kInitial) {
+      constexpr std::string_view kThinkStart = "<think>";
+      std::string_view view = pending_;
+      while (!view.empty() &&
+             std::isspace(static_cast<unsigned char>(view.front())) != 0) {
+        view.remove_prefix(1);
+      }
+      if (view.empty()) {
+        return true;
+      }
+      if (kThinkStart.starts_with(view)) {
+        if (view == kThinkStart) {
+          state_ = State::kThinking;
+          pending_.clear();
+        }
+        return true;
+      }
+      state_ = State::kContent;
+    }
+
+    if (state_ == State::kThinking) {
+      constexpr std::string_view kThinkEnd = "</think>";
+      const std::size_t end_pos = pending_.find(kThinkEnd);
+      if (end_pos != std::string::npos) {
+        if (end_pos > 0 && !emit_piece_(pending_.substr(0, end_pos), true)) {
+          return false;
+        }
+        std::string_view remaining = pending_;
+        remaining.remove_prefix(end_pos + kThinkEnd.size());
+        if (!remaining.empty() && remaining.front() == '\n') {
+          remaining.remove_prefix(1);
+        }
+        pending_ = std::string(remaining);
+        state_ = State::kContent;
+      } else {
+        std::size_t held = 0;
+        for (std::size_t len = std::min(pending_.size(), kThinkEnd.size() - 1);
+             len > 0; --len) {
+          if (kThinkEnd.starts_with(pending_.substr(pending_.size() - len))) {
+            held = len;
+            break;
+          }
+        }
+        const std::size_t ready = pending_.size() - held;
+        if (ready > 0 && !emit_piece_(pending_.substr(0, ready), true)) {
+          return false;
+        }
+        pending_.erase(0, ready);
+        return true;
+      }
+    }
+
+    if (state_ == State::kContent) {
+      const std::size_t marker = EarliestMarker(pending_);
+      if (marker != std::string::npos) {
+        if (marker > 0 && !emit_piece_(pending_.substr(0, marker), false)) {
+          return false;
+        }
+        hidden_ = pending_.substr(marker);
+        pending_.clear();
+        tool_mode_ = true;
+        return true;
+      }
+
+      const std::size_t held = HeldMarkerPrefix(pending_);
+      const std::size_t ready = pending_.size() - held;
+      if (ready > 0 && !emit_piece_(pending_.substr(0, ready), false)) {
         return false;
       }
-      hidden_ = pending_.substr(marker);
-      pending_.clear();
-      tool_mode_ = true;
+      pending_.erase(0, ready);
       return true;
     }
 
-    const std::size_t held = HeldMarkerPrefix(pending_);
-    const std::size_t ready = pending_.size() - held;
-    if (ready > 0 && !emit_text_(pending_.substr(0, ready))) {
-      return false;
-    }
-    pending_.erase(0, ready);
     return true;
   }
 
   bool Finish(bool valid_tool_calls) {
     if (!tool_mode_) {
-      const bool emitted = pending_.empty() || emit_text_(pending_);
-      pending_.clear();
-      return emitted;
+      if (!pending_.empty()) {
+        const bool is_reasoning = (state_ == State::kThinking);
+        const bool emitted = emit_piece_(pending_, is_reasoning);
+        pending_.clear();
+        return emitted;
+      }
+      return true;
     }
     if (!valid_tool_calls && !hidden_.empty()) {
-      return emit_text_(hidden_);
+      return emit_piece_(hidden_, false);
     }
     return true;
   }
@@ -920,10 +1014,17 @@ public:
   [[nodiscard]] std::string_view raw() const noexcept { return raw_; }
 
 private:
-  std::function<bool(std::string_view)> emit_text_;
+  enum class State : std::uint8_t {
+    kInitial,
+    kThinking,
+    kContent,
+  };
+
+  EmitCallback emit_piece_;
   std::string raw_;
   std::string pending_;
   std::string hidden_;
+  State state_{State::kInitial};
   bool tool_mode_{false};
 };
 
@@ -944,6 +1045,9 @@ HttpResponse NonStreamingResponse(
   choice["index"] = 0;
   json::Value message = json::Value::object();
   message["role"] = "assistant";
+  if (!generated.reasoning_content.empty()) {
+    message["reasoning_content"] = generated.reasoning_content;
+  }
   if (generated.text.empty() && !generated.tool_calls.empty()) {
     message["content"] = json::Value();
   } else {
@@ -1040,16 +1144,21 @@ HttpResponse StreamingResponse(
             }
 
             bool connected = true;
-            StreamingTextFilter filter([&](std::string_view text) {
-              if (text.empty()) {
-                return true;
-              }
-              json::Value delta = json::Value::object();
-              delta["content"] = std::string(text);
-              connected = writer(
-                  Sse(ChoiceChunk(id, created, model, std::move(delta))));
-              return connected;
-            });
+            StreamingTextFilter filter(
+                [&](std::string_view text, bool is_reasoning) {
+                  if (text.empty()) {
+                    return true;
+                  }
+                  json::Value delta = json::Value::object();
+                  if (is_reasoning) {
+                    delta["reasoning_content"] = std::string(text);
+                  } else {
+                    delta["content"] = std::string(text);
+                  }
+                  connected = writer(
+                      Sse(ChoiceChunk(id, created, model, std::move(delta))));
+                  return connected;
+                });
 
             try {
               const auto result = generation->Wait([&](std::string_view piece) {
