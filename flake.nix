@@ -73,6 +73,32 @@
         );
     in
     {
+      lib = {
+        mkStrixServe =
+          {
+            pkgs ? null,
+            system ? pkgs.system or "x86_64-linux",
+            strix ? self.packages.${system}.default,
+            ...
+          }@args:
+          let
+            targetScope = strixPackages.${system};
+            mkServeFn = targetScope.mkServe.override {
+              inherit strix;
+            };
+            fnArgs = builtins.removeAttrs args [ "pkgs" "system" "strix" ];
+          in
+          mkServeFn fnArgs;
+        mkServe = self.lib.mkStrixServe;
+      } // forAllSystems (system: {
+        mkStrixServe =
+          args:
+          self.lib.mkStrixServe (args // { inherit system; });
+        mkServe =
+          args:
+          self.lib.mkStrixServe (args // { inherit system; });
+      });
+
       packages = forAllSystems (
         system:
         let
@@ -430,6 +456,29 @@
             echo "PASS: CPU build and CTest suite passed" > $out/result.txt
           '';
 
+          mkServeCheck =
+            let
+              testRunner = self.lib.${system}.mkStrixServe {
+                model = "/var/models/qwen.gguf";
+                context = 4096;
+                servedModelName = "qwen-test";
+                speculative = "mtp";
+                draftModel = "/var/models/qwen-draft.gguf";
+                port = 9000;
+              };
+            in
+            pkgsSys.runCommand "check-mk-serve" { } ''
+              # Verify the generated wrapper script contains the expected flags and strix invocation
+              grep -F "/var/models/qwen.gguf" "${testRunner}/bin/strix-serve-llm"
+              grep -F -- "--context 4096" "${testRunner}/bin/strix-serve-llm"
+              grep -F -- "--served-model-name qwen-test" "${testRunner}/bin/strix-serve-llm"
+              grep -F -- "--speculative mtp" "${testRunner}/bin/strix-serve-llm"
+              grep -F -- "--mtp-model /var/models/qwen-draft.gguf" "${testRunner}/bin/strix-serve-llm"
+              grep -F -- "--port 9000" "${testRunner}/bin/strix-serve-llm"
+              mkdir -p $out
+              echo "PASS: mkStrixServe wrapper check passed" > $out/result.txt
+            '';
+
           # Canonical PR umbrella. Nix builds these independent derivations in
           # parallel and reuses their results across flake checks and PR runs.
           # The ROCm PyTorch/LPIPS closure remains an explicit h3-ml-quality
@@ -447,6 +496,7 @@
             cat "${h3ManifestCheck}/result.txt"
             cat "${h3QualityCheck}/result.txt"
             cat "${testCheck}/result.txt"
+            cat "${mkServeCheck}/result.txt"
 
             cat <<EOF > $out/pr-summary.txt
 PR Check Summary
@@ -462,6 +512,7 @@ Composed Gates:
   5. MiniMax H3 Source-Manifest Validation
   6. MiniMax H3 Quality-Oracle Validation
   7. CPU Build and Runtime/Unit Tests (CTest)
+  8. Declarative Server Wrapper Generation (mkStrixServe)
 Explicit Offline Gate (not in hosted PR closure):
   - MiniMax H3 Pinned Teacher & Offline LPIPS Validation
 Production Package Validation:
@@ -479,6 +530,7 @@ EOF
           h3-quality = h3QualityCheck;
           h3-ml-quality = h3MlQualityCheck;
           tests = testCheck;
+          mk-serve = mkServeCheck;
           pr = prCheck;
         }
       );

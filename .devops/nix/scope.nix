@@ -42,4 +42,5 @@ lib.makeScope newScope (self: {
   mlir-aie = self.callPackage ./mlir-aie.nix { };
   hrx-system = self.callPackage ./hrx-system.nix { };
   hyperloom = self.callPackage ./hyperloom.nix { };
+  mkServe = self.callPackage ./mk-serve.nix { };
 })
