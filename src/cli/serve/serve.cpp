@@ -1,5 +1,6 @@
 #include "src/cli/serve/serve.hpp"
 
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -83,8 +84,11 @@ void PrintServeHelp(std::string_view program_name,
     std::string reasoning_mode = "auto";
     std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
+    std::string dflash_model_path;
     std::string mtp_model_path;
-    std::size_t draft_tokens = 3;
+    std::size_t draft_tokens = 7;
+    std::string draft_policy = "rolling";
+    std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
@@ -170,16 +174,27 @@ void PrintServeHelp(std::string_view program_name,
                      "Reasoning Defaults", &reasoning_budget);
 
     // Speculative & Hardware
-    parser.AddOption("", "--speculative", "MODE",
-                     "Draft backend: mtp, mtp-npu, npu, pld, or self",
-                     "Speculative", &speculative_backend);
+    parser.AddOption(
+        "", "--speculative", "MODE",
+        "Draft backend: dflash, dflash2, mtp, mtp-npu, npu, pld, self, or off",
+        "Speculative", &speculative_backend);
+    parser.AddOption("", "--dflash-model", "PATH",
+                     "Path to quantized Qwen DFlash/DFlash-2 GGUF file",
+                     "Speculative", &dflash_model_path);
     parser.AddOption("", "--mtp-model", "PATH",
                      "Path to quantized Qwen MTP draft head GGUF file",
                      "Speculative", &mtp_model_path);
     parser.AddOption(
         "-d", "--draft-tokens", "N",
-        "Maximum speculative draft tokens evaluated per step (default: 3)",
+        "Maximum speculative draft tokens evaluated per step (default: 7)",
         "Speculative", &draft_tokens);
+    parser.AddOption(
+        "", "--draft-policy", "MODE",
+        "Draft sizing: fixed, rolling, or accepted-ema (default: rolling)",
+        "Speculative", &draft_policy);
+    parser.AddOption("", "--min-draft-tokens", "N",
+                     "Adaptive draft floor (default: 1)", "Speculative",
+                     &min_draft_tokens);
     parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -244,7 +259,35 @@ void PrintServeHelp(std::string_view program_name,
 
 int RunServe(std::span<const char* const> args) {
   std::string host = "127.0.0.1";
+  if (const char* env_host = std::getenv("HOST");
+      env_host != nullptr && *env_host != '\0') {
+    host = env_host;
+  } else if (const char* env_strix_host = std::getenv("STRIX_HOST");
+             env_strix_host != nullptr && *env_strix_host != '\0') {
+    host = env_strix_host;
+  }
+
   int port = 8080;
+  if (const char* env_port = std::getenv("PORT");
+      env_port != nullptr && *env_port != '\0') {
+    const std::string_view sv(env_port);
+    int parsed_port = 0;
+    auto [ptr, ec] =
+        std::from_chars(sv.data(), sv.data() + sv.size(), parsed_port);
+    if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
+      port = parsed_port;
+    }
+  } else if (const char* env_strix_port = std::getenv("STRIX_PORT");
+             env_strix_port != nullptr && *env_strix_port != '\0') {
+    const std::string_view sv(env_strix_port);
+    int parsed_port = 0;
+    auto [ptr, ec] =
+        std::from_chars(sv.data(), sv.data() + sv.size(), parsed_port);
+    if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
+      port = parsed_port;
+    }
+  }
+
   std::size_t session_count = 1;
   std::size_t max_connections = 16;
   std::size_t max_request_body_bytes =
@@ -474,8 +517,11 @@ int RunServe(std::span<const char* const> args) {
     std::string reasoning_mode = "auto";
     std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
+    std::string dflash_model_path;
     std::string mtp_model_path;
-    std::size_t draft_tokens = 3;
+    std::size_t draft_tokens = 7;
+    std::string draft_policy = "rolling";
+    std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
@@ -557,16 +603,27 @@ int RunServe(std::span<const char* const> args) {
         "Default token cap for thinking traces (default: -1 = unlimited) "
         "(TODO: qwen, deepseek)",
         "Reasoning Defaults", &reasoning_budget);
-    llm_parser.AddOption("", "--speculative", "MODE",
-                         "Draft backend: mtp, mtp-npu, npu, pld, or self",
-                         "Speculative", &speculative_backend);
+    llm_parser.AddOption(
+        "", "--speculative", "MODE",
+        "Draft backend: dflash, dflash2, mtp, mtp-npu, npu, pld, self, or off",
+        "Speculative", &speculative_backend);
+    llm_parser.AddOption("", "--dflash-model", "PATH",
+                         "Path to quantized Qwen DFlash/DFlash-2 GGUF file",
+                         "Speculative", &dflash_model_path);
     llm_parser.AddOption("", "--mtp-model", "PATH",
                          "Path to quantized Qwen MTP draft head GGUF file",
                          "Speculative", &mtp_model_path);
     llm_parser.AddOption(
         "-d", "--draft-tokens", "N",
-        "Maximum speculative draft tokens evaluated per step (default: 3)",
+        "Maximum speculative draft tokens evaluated per step (default: 7)",
         "Speculative", &draft_tokens);
+    llm_parser.AddOption(
+        "", "--draft-policy", "MODE",
+        "Draft sizing: fixed, rolling, or accepted-ema (default: rolling)",
+        "Speculative", &draft_policy);
+    llm_parser.AddOption("", "--min-draft-tokens", "N",
+                         "Adaptive draft floor (default: 1)", "Speculative",
+                         &min_draft_tokens);
     llm_parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",

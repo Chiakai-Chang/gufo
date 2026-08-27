@@ -458,25 +458,27 @@
 
           mkServeCheck =
             let
-              testRunner = self.lib.${system}.mkStrixServe {
+              cmd = self.lib.${system}.mkStrixServe {
                 model = "/var/models/qwen.gguf";
                 context = 4096;
                 servedModelName = "qwen-test";
-                speculative = "mtp";
+                speculative = "dflash2";
                 draftModel = "/var/models/qwen-draft.gguf";
                 port = 9000;
               };
             in
             pkgsSys.runCommand "check-mk-serve" { } ''
-              # Verify the generated wrapper script contains the expected flags and strix invocation
-              grep -F "/var/models/qwen.gguf" "${testRunner}/bin/strix-serve-llm"
-              grep -F -- "--context 4096" "${testRunner}/bin/strix-serve-llm"
-              grep -F -- "--served-model-name qwen-test" "${testRunner}/bin/strix-serve-llm"
-              grep -F -- "--speculative mtp" "${testRunner}/bin/strix-serve-llm"
-              grep -F -- "--mtp-model /var/models/qwen-draft.gguf" "${testRunner}/bin/strix-serve-llm"
-              grep -F -- "--port 9000" "${testRunner}/bin/strix-serve-llm"
+              # Verify the synthesized CLI string contains expected flags and binary path
+              cmd_str="${cmd}"
+              echo "$cmd_str" | grep -F "/bin/strix serve"
+              echo "$cmd_str" | grep -F -- "--model /var/models/qwen.gguf"
+              echo "$cmd_str" | grep -F -- "--context 4096"
+              echo "$cmd_str" | grep -F -- "--served-model-name qwen-test"
+              echo "$cmd_str" | grep -F -- "--speculative dflash2"
+              echo "$cmd_str" | grep -F -- "--dflash-model /var/models/qwen-draft.gguf"
+              echo "$cmd_str" | grep -F -- "--port 9000"
               mkdir -p $out
-              echo "PASS: mkStrixServe wrapper check passed" > $out/result.txt
+              echo "PASS: mkStrixServe CLI string check passed" > $out/result.txt
             '';
 
           # Canonical PR umbrella. Nix builds these independent derivations in

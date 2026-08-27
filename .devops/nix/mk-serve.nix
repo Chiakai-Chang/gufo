@@ -1,17 +1,15 @@
 {
   lib,
-  writeShellApplication,
-  strix,
+  strix ? null,
 }:
 
 {
-  name ? "strix-serve-${modality}",
   modality ? "llm", # "llm", "video", or "audio"
   model, # path, derivation, or string to GGUF model or weights directory
 
   # Server Options
-  host ? "127.0.0.1",
-  port ? 8080,
+  host ? null,
+  port ? null,
   sessions ? null,
   maxConnections ? null,
   maxRequestBytes ? null,
@@ -21,24 +19,34 @@
   # LLM Options
   servedModelName ? null,
   context ? null,
+  batchSize ? null, # alias for context
   maxTokens ? null,
   temperature ? null,
+  temp ? null, # alias for temperature
   topP ? null,
   topK ? null,
   minP ? null,
   seed ? null,
   repeatPenalty ? null,
   repeatLastN ? null,
+  presencePenalty ? null,
   system ? null,
   raw ? false,
   chatTemplate ? null,
   think ? null, # "on", "off", "auto"
   reasoningBudget ? null,
-  speculative ? null, # "mtp", "mtp-npu", "npu", "pld", "self"
-  draftModel ? null, # mtp-model path / derivation
-  mtpModel ? draftModel,
+  speculative ? null, # "dflash", "dflash2", "mtp", "mtp-npu", "npu", "pld", "self", "off"
+  specType ? null, # alias for speculative ("draft-mtp" -> "mtp", etc.)
+  draftModel ? null, # generic draft model path / derivation
+  dflashModel ? null,
+  mtpModel ? null,
   draftTokens ? null,
+  specDraftNMax ? null, # alias for draftTokens
+  draftPolicy ? null, # "fixed", "rolling", "accepted-ema"
+  minDraftTokens ? null,
+  specDraftPMin ? null, # alias for speculative confidence / floor
   prefillChunk ? null,
+  ubatchSize ? null, # alias for prefillChunk
   maxPending ? null,
   maxPendingPerClient ? null,
   requestTimeoutMs ? null,
@@ -58,6 +66,33 @@
 }:
 
 let
+  finalContext = if context != null then context else batchSize;
+  finalTemperature = if temperature != null then temperature else temp;
+  finalDraftTokens = if draftTokens != null then draftTokens else specDraftNMax;
+  finalPrefillChunk = if prefillChunk != null then prefillChunk else ubatchSize;
+  finalSpeculative =
+    if specType == "draft-mtp" then
+      "mtp"
+    else if specType == "draft-dflash" then
+      "dflash2"
+    else if specType != null then
+      specType
+    else
+      speculative;
+  finalDflashModel =
+    if dflashModel != null then
+      dflashModel
+    else if (finalSpeculative == "dflash" || finalSpeculative == "dflash2") then
+      draftModel
+    else
+      null;
+  finalMtpModel =
+    if mtpModel != null then
+      mtpModel
+    else if (finalSpeculative != null && finalSpeculative != "dflash" && finalSpeculative != "dflash2" && finalSpeculative != "off") then
+      draftModel
+    else
+      null;
   validModalities = [
     "llm"
     "video"
@@ -69,17 +104,24 @@ let
     "auto"
   ];
   validSpeculativeModes = [
+    "dflash"
+    "dflash2"
     "mtp"
     "mtp-npu"
     "npu"
     "pld"
     "self"
+    "off"
   ];
 
+  isRawEnvVar = val: builtins.isString val && lib.hasPrefix "$" val;
+
   serverArgs =
-    [
+    lib.optionals (host != null && !isRawEnvVar host) [
       "--host"
       host
+    ]
+    ++ lib.optionals (port != null && !isRawEnvVar port) [
       "--port"
       (toString port)
     ]
@@ -111,17 +153,17 @@ let
         "--served-model-name"
         servedModelName
       ]
-      ++ lib.optionals (context != null) [
+      ++ lib.optionals (finalContext != null) [
         "--context"
-        (toString context)
+        (toString finalContext)
       ]
       ++ lib.optionals (maxTokens != null) [
         "--max-tokens"
         (toString maxTokens)
       ]
-      ++ lib.optionals (temperature != null) [
+      ++ lib.optionals (finalTemperature != null) [
         "--temperature"
-        (toString temperature)
+        (toString finalTemperature)
       ]
       ++ lib.optionals (topP != null) [
         "--top-p"
@@ -164,21 +206,33 @@ let
         "--reasoning-budget"
         (toString reasoningBudget)
       ]
-      ++ lib.optionals (speculative != null) [
+      ++ lib.optionals (finalSpeculative != null) [
         "--speculative"
-        speculative
+        finalSpeculative
       ]
-      ++ lib.optionals (mtpModel != null) [
+      ++ lib.optionals (finalDflashModel != null) [
+        "--dflash-model"
+        (toString finalDflashModel)
+      ]
+      ++ lib.optionals (finalMtpModel != null && finalDflashModel == null) [
         "--mtp-model"
-        (toString mtpModel)
+        (toString finalMtpModel)
       ]
-      ++ lib.optionals (draftTokens != null) [
+      ++ lib.optionals (finalDraftTokens != null) [
         "--draft-tokens"
-        (toString draftTokens)
+        (toString finalDraftTokens)
       ]
-      ++ lib.optionals (prefillChunk != null) [
+      ++ lib.optionals (draftPolicy != null) [
+        "--draft-policy"
+        draftPolicy
+      ]
+      ++ lib.optionals (minDraftTokens != null) [
+        "--min-draft-tokens"
+        (toString minDraftTokens)
+      ]
+      ++ lib.optionals (finalPrefillChunk != null) [
         "--prefill-chunk"
-        (toString prefillChunk)
+        (toString finalPrefillChunk)
       ]
       ++ lib.optionals (maxPending != null) [
         "--max-pending"
@@ -221,12 +275,20 @@ let
       ]
     )
     ++ lib.optionals (modality == "audio") (
-      lib.optionals (context != null) [
+      lib.optionals (finalContext != null) [
         "--context"
-        (toString context)
+        (toString finalContext)
       ]
     )
     ++ extraArgs;
+
+  bin = if strixPackage != null then "${strixPackage}/bin/strix" else "strix";
+  escapedServerArgs = lib.escapeShellArgs serverArgs;
+  escapedModalityArgs = lib.escapeShellArgs modalityArgs;
+  rawHostStr = if (host != null && isRawEnvVar host) then " --host ${host}" else "";
+  rawPortStr = if (port != null && isRawEnvVar port) then " --port ${port}" else "";
+  serverStr = if (escapedServerArgs != "") then " " + escapedServerArgs else "";
+  modalityStr = if (escapedModalityArgs != "") then " " + escapedModalityArgs else "";
 in
 assert lib.assertMsg (lib.elem modality validModalities)
   "strix.mkServe: 'modality' must be one of ${lib.generators.toJSON { } validModalities}, got '${modality}'";
@@ -234,12 +296,6 @@ assert lib.assertMsg (model != null && model != "")
   "strix.mkServe: 'model' must be specified (cannot be empty)";
 assert lib.assertMsg (think == null || lib.elem think validThinkModes)
   "strix.mkServe: 'think' must be one of ${lib.generators.toJSON { } validThinkModes}, got '${toString think}'";
-assert lib.assertMsg (speculative == null || lib.elem speculative validSpeculativeModes)
-  "strix.mkServe: 'speculative' must be one of ${lib.generators.toJSON { } validSpeculativeModes}, got '${toString speculative}'";
-writeShellApplication {
-  inherit name;
-  runtimeInputs = [ strixPackage ];
-  text = ''
-    exec ${strixPackage}/bin/strix serve ${lib.escapeShellArgs serverArgs} ${modality} ${lib.escapeShellArgs modalityArgs} "$@"
-  '';
-}
+assert lib.assertMsg (finalSpeculative == null || lib.elem finalSpeculative validSpeculativeModes)
+  "strix.mkServe: 'speculative' must be one of ${lib.generators.toJSON { } validSpeculativeModes}, got '${toString finalSpeculative}'";
+"${bin} serve${serverStr}${rawHostStr}${rawPortStr} ${modality}${modalityStr}"
