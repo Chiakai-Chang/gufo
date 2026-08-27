@@ -23,7 +23,18 @@ struct FakeState final : gufo::server::ContinuationState {
   void Invalidate() noexcept override { ++invalidation_counts->at(id); }
 
   std::size_t id;
+  std::size_t value{0};
   std::vector<std::size_t>* invalidation_counts;
+};
+
+struct FakeSnapshot final : gufo::server::ContinuationSnapshot {
+  explicit FakeSnapshot(std::size_t value) : value(value) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return sizeof(value);
+  }
+
+  std::size_t value;
 };
 
 void TestColdMissThenExactExtensionHit() {
@@ -137,6 +148,55 @@ void TestWaitingAcquireCanBeCancelled() {
   held.Commit({1, 2, 3});
 }
 
+void TestSnapshotCanBranchIntoTwoIndependentStateSlots() {
+  std::vector<std::size_t> invalidations(2);
+  std::size_t next_id = 0;
+  gufo::server::ContinuationCache cache(
+      2, [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+      {
+          .restore =
+              [](gufo::server::ContinuationState& state,
+                 const gufo::server::ContinuationSnapshot& snapshot) {
+                auto& fake = dynamic_cast<FakeState&>(state);
+                const auto& saved = dynamic_cast<const FakeSnapshot&>(snapshot);
+                fake.value = saved.value;
+              },
+      });
+
+  {
+    auto root =
+        cache.Acquire(std::vector<gufo::server::ContinuationToken>{1, 2, 3});
+    dynamic_cast<FakeState&>(root.state()).value = 7;
+    root.Commit({1, 2, 3}, std::make_unique<FakeSnapshot>(7));
+  }
+
+  auto first =
+      cache.Acquire(std::vector<gufo::server::ContinuationToken>{1, 2, 3, 4});
+  auto second =
+      cache.Acquire(std::vector<gufo::server::ContinuationToken>{1, 2, 3, 5});
+  Expect(first.cache_hit() && second.cache_hit(),
+         "one snapshot can satisfy two simultaneous leases");
+  auto& first_state = dynamic_cast<FakeState&>(first.state());
+  auto& second_state = dynamic_cast<FakeState&>(second.state());
+  Expect(first_state.id != second_state.id,
+         "snapshot branches use different mutable state slots");
+  Expect(first_state.value == 7 && second_state.value == 7,
+         "both mutable states restore the root payload");
+
+  first_state.value = 8;
+  second_state.value = 9;
+  first.Commit({1, 2, 3, 4}, std::make_unique<FakeSnapshot>(8));
+  second.Commit({1, 2, 3, 5}, std::make_unique<FakeSnapshot>(9));
+
+  auto root_again =
+      cache.Acquire(std::vector<gufo::server::ContinuationToken>{1, 2, 3, 6});
+  Expect(root_again.cache_hit() && root_again.cached_tokens() == 3,
+         "branch commits preserve the shared root snapshot");
+  Expect(dynamic_cast<FakeState&>(root_again.state()).value == 7,
+         "branch mutation never changes the immutable root payload");
+  root_again.Invalidate();
+}
+
 }  // namespace
 
 int main() {
@@ -145,6 +205,7 @@ int main() {
   TestUncommittedLeaseIsInvalidated();
   TestLongestAvailablePrefixWins();
   TestWaitingAcquireCanBeCancelled();
+  TestSnapshotCanBranchIntoTwoIndependentStateSlots();
   std::cout << "All continuation cache tests passed\n";
   return 0;
 }

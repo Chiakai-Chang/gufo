@@ -336,6 +336,34 @@ void TestBackendSamplingDefaults() {
          "Explicit temperature overrides the backend default");
 }
 
+void TestAssistantReasoningContentReachesBackend() {
+  FakeBackend backend;
+  backend.pieces = {"Blue"};
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[
+          {"role":"user","content":"Name one color."},
+          {
+            "role":"assistant",
+            "reasoning_content":"I should answer concisely.",
+            "content":"Red"
+          },
+          {"role":"user","content":"Name another."}
+        ],
+        "max_tokens":1
+      })"),
+                                                       backend);
+
+  Expect(response.status == 200, "Assistant reasoning history is accepted");
+  Expect(backend.last_request.messages.size() == 3,
+         "Complete reasoning history reaches the backend");
+  Expect(
+      backend.last_request.messages[1].thought == "I should answer concisely.",
+      "Assistant reasoning_content reaches the model template");
+  Expect(backend.last_request.messages[1].content == "Red",
+         "Assistant visible content remains separate from reasoning");
+}
+
 void TestWrongModelIsRejected() {
   FakeBackend backend;
   const auto response = gufo::server::HandleOpenAiChat(Request(R"({
@@ -412,6 +440,7 @@ void TestStreamingOverloadIsRejectedBeforeHeaders() {
 int main() {
   TestStreamingIsLive();
   TestBackendSamplingDefaults();
+  TestAssistantReasoningContentReachesBackend();
   TestToolCallsAreStructured();
   TestDeepSeekToolCallsAreStructured();
   TestWrongModelIsRejected();

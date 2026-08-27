@@ -153,25 +153,94 @@ int main(int argc, const char* const* argv) {
                                     http_chat.text);
     continued_messages.emplace_back(gufo::tokenization::ChatRole::kUser,
                                     "Name a different primary color.");
+    auto forked_messages = messages;
+    forked_messages.emplace_back(gufo::tokenization::ChatRole::kAssistant,
+                                 http_chat.text);
+    forked_messages.emplace_back(gufo::tokenization::ChatRole::kUser,
+                                 "Name one warm primary color.");
     const auto rendered_continuation =
         gufo::tokenization::QwenChatTemplate::Render(continued_messages);
+    const auto rendered_fork =
+        gufo::tokenization::QwenChatTemplate::Render(forked_messages);
     Expect(rendered_continuation.has_value(),
            "continued chat prompt rendering");
+    Expect(rendered_fork.has_value(), "forked chat prompt rendering");
     const auto continuation_prompt =
         model->GetTokenizer().Encode(*rendered_continuation);
+    const auto fork_prompt = model->GetTokenizer().Encode(*rendered_fork);
+
+    {
+      const auto snapshot_root = GenerateDirect(*direct, chat_prompt, 2);
+      Expect(snapshot_root == direct_chat,
+             "Qwen direct snapshot root is not deterministic");
+      const auto root_tokens = chat_prompt.size() + snapshot_root.size();
+      auto snapshot =
+          direct->SaveSnapshot(static_cast<std::uint32_t>(root_tokens));
+      Expect(snapshot->PayloadBytes() ==
+                 direct->GetMemoryUsage().request_state_bytes,
+             "full-copy Qwen snapshot accounts the complete request state");
+      gufo::models::GenerationOptions options;
+      options.max_new_tokens = 2;
+      options.temperature = 0.0F;
+      const auto live_continuation =
+          direct->GenerateFromPrefix(continuation_prompt, root_tokens, options);
+      const auto cold_continuation =
+          GenerateDirect(*direct, continuation_prompt, 2);
+      Expect(live_continuation == cold_continuation,
+             "Qwen live prefix plus divergent suffix differs from cold "
+             "prefill");
+
+      auto restored =
+          gufo::hip::QwenGpuExecutor::Create(model, &error, context);
+      Expect(restored != nullptr, error);
+      restored->RestoreSnapshot(*snapshot);
+      const auto restored_continuation = restored->GenerateFromPrefix(
+          continuation_prompt, root_tokens, options);
+      const auto restored_cold_continuation =
+          GenerateDirect(*direct, continuation_prompt, 2);
+      Expect(restored_continuation == restored_cold_continuation,
+             "Qwen snapshot plus divergent suffix differs from cold prefill");
+    }
+
     const auto direct_continuation =
         GenerateDirect(*direct, continuation_prompt, 2);
-    const auto http_continuation = backend.chat(continued_messages, 2, 0.0F);
-    Expect(http_continuation.cache_hit,
-           "continued chat must reuse the retained Qwen state");
-    Expect(http_continuation.cached_prompt_tokens ==
-               chat_prompt.size() + http_chat.tokens.size(),
-           "Qwen cache reports the exact executed prefix");
-    Expect(http_continuation.cached_prompt_tokens <
-               http_continuation.prompt_tokens,
-           "continued Qwen chat prefills only a suffix");
+    const auto direct_fork = GenerateDirect(*direct, fork_prompt, 2);
+
+    gufo::server::ChatRequest continuation_request(continued_messages);
+    continuation_request.client_id = "qwen-snapshot-branch-a";
+    gufo::server::ChatRequest fork_request(forked_messages);
+    fork_request.client_id = "qwen-snapshot-branch-b";
+    auto pending_continuation =
+        backend.start_chat(continuation_request, 2, 0.0F);
+    auto pending_fork = backend.start_chat(fork_request, 2, 0.0F);
+    Expect(pending_continuation != nullptr && pending_fork != nullptr,
+           "concurrent Qwen snapshot branches are admitted");
+    const auto http_continuation = pending_continuation->Wait();
+    const auto http_fork = pending_fork->Wait();
+
+    const auto root_tokens = chat_prompt.size() + http_chat.tokens.size();
+    for (const auto* result : {&http_continuation, &http_fork}) {
+      Expect(result->cache_hit,
+             "concurrent Qwen branch must restore the retained root");
+      Expect(result->cached_prompt_tokens == root_tokens,
+             "Qwen branches report the exact shared root");
+      Expect(result->cached_prompt_tokens < result->prompt_tokens,
+             "Qwen branches prefill only their suffix");
+      Expect(
+          result->cache_restore_bytes > 0 && result->cache_snapshot_bytes > 0,
+          "Qwen branches account snapshot copy bytes");
+      Expect(result->cache_restore_ms > 0.0 && result->cache_snapshot_ms > 0.0,
+             "Qwen branches account snapshot copy time");
+      Expect(result->cache_shared_bytes == 0,
+             "full-copy Qwen snapshots do not claim shared bytes");
+    }
+    Expect(
+        http_continuation.cache_restore_bytes == http_fork.cache_restore_bytes,
+        "Qwen branches restore the same root payload");
     Expect(http_continuation.tokens == direct_continuation,
            "cached Qwen continuation differs from cold full prefill");
+    Expect(http_fork.tokens == direct_fork,
+           "forked Qwen continuation differs from cold full prefill");
 
     gufo::server::ChatRequest concurrent_a({
         {gufo::tokenization::ChatRole::kUser,

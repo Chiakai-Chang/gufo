@@ -1,6 +1,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <random>
 #include <stdexcept>
@@ -127,6 +128,29 @@ void ReconcileStateBytes(const TextRunnerResourceClaim& resources,
   }
 }
 
+ContinuationCache::SnapshotSupport MakeSnapshotSupport(
+    ValidatedRunner* validated) {
+  if (validated == nullptr || !validated->descriptor.capabilities.snapshot ||
+      !validated->descriptor.capabilities.fork) {
+    return {};
+  }
+  return {
+      .restore =
+          [validated](ContinuationState& state,
+                      const ContinuationSnapshot& snapshot) {
+            auto* text_snapshot =
+                dynamic_cast<const TextRunnerSnapshot*>(&snapshot);
+            if (text_snapshot == nullptr) {
+              throw std::invalid_argument(
+                  "continuation snapshot is not a text runner snapshot");
+            }
+            auto& text_state = dynamic_cast<TextRunnerState&>(state);
+            validated->runner->RestoreOrFork(text_state, *text_snapshot);
+            ReconcileStateBytes(validated->resources, text_state);
+          },
+  };
+}
+
 std::uint64_t MakeRngState() {
   std::random_device random_device;
   return (static_cast<std::uint64_t>(random_device()) << 32U) ^
@@ -171,22 +195,26 @@ std::unique_ptr<TextRunnerSnapshot> TextModelRunner::Snapshot(
   throw std::logic_error("text runner does not support snapshots");
 }
 
-std::unique_ptr<TextRunnerState> TextModelRunner::RestoreOrFork(
-    const TextRunnerSnapshot&) const {
+void TextModelRunner::RestoreOrFork(TextRunnerState&,
+                                    const TextRunnerSnapshot&) const {
   throw std::logic_error("text runner does not support snapshot restore/fork");
 }
 
 struct TextRunnerPool::Impl {
   Impl(std::shared_ptr<TextModelRunner> model_runner, std::size_t state_count)
       : validated(ValidateRunner(std::move(model_runner), state_count)),
-        cache(state_count, [this] {
-          auto state = validated.runner->CreateState();
-          if (state == nullptr) {
-            throw std::runtime_error("text runner state factory returned null");
-          }
-          ReconcileStateBytes(validated.resources, *state);
-          return state;
-        }) {}
+        cache(
+            state_count,
+            [this] {
+              auto state = validated.runner->CreateState();
+              if (state == nullptr) {
+                throw std::runtime_error(
+                    "text runner state factory returned null");
+              }
+              ReconcileStateBytes(validated.resources, *state);
+              return state;
+            },
+            MakeSnapshotSupport(&validated)) {}
 
   ValidatedRunner validated;
   ContinuationCache cache;
@@ -240,6 +268,14 @@ bool TextRunnerPool::Request::cache_hit() const noexcept {
 
 std::size_t TextRunnerPool::Request::cached_prompt_tokens() const noexcept {
   return impl_ != nullptr ? impl_->lease.cached_tokens() : 0;
+}
+
+std::size_t TextRunnerPool::Request::cache_restore_bytes() const noexcept {
+  return impl_ != nullptr ? impl_->lease.restored_snapshot_bytes() : 0;
+}
+
+double TextRunnerPool::Request::cache_restore_ms() const noexcept {
+  return impl_ != nullptr ? impl_->lease.restore_ms() : 0.0;
 }
 
 std::size_t TextRunnerPool::Request::prompt_tokens() const noexcept {
@@ -372,7 +408,7 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens,
   return step;
 }
 
-void TextRunnerPool::Request::Commit() {
+TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
   }
@@ -393,7 +429,7 @@ void TextRunnerPool::Request::Commit() {
   if (!impl_->runner->Descriptor().capabilities.prefix_reuse) {
     impl_->lease.Invalidate();
     impl_.reset();
-    return;
+    return {};
   }
   std::vector<ContinuationToken> checkpoint = impl_->prompt;
   checkpoint.insert(checkpoint.end(), impl_->generated.begin(),
@@ -404,8 +440,23 @@ void TextRunnerPool::Request::Commit() {
         "text runner checkpoint is outside executed token history");
   }
   checkpoint.resize(position);
-  impl_->lease.Commit(std::move(checkpoint));
+  std::unique_ptr<ContinuationSnapshot> snapshot;
+  CommitMetrics metrics;
+  const auto capabilities = impl_->runner->Descriptor().capabilities;
+  if (capabilities.snapshot && capabilities.fork) {
+    const auto snapshot_start = std::chrono::steady_clock::now();
+    snapshot = impl_->runner->Snapshot(state);
+    metrics.snapshot_ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - snapshot_start)
+                              .count();
+    if (snapshot == nullptr) {
+      throw std::runtime_error("text runner returned an empty snapshot");
+    }
+    metrics.snapshot_bytes = snapshot->PayloadBytes();
+  }
+  impl_->lease.Commit(std::move(checkpoint), std::move(snapshot));
   impl_.reset();
+  return metrics;
 }
 
 void TextRunnerPool::Request::Invalidate() noexcept {

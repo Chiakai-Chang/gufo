@@ -104,17 +104,15 @@ public:
 ///
 /// Common serving code may account for the payload but must not inspect or
 /// reinterpret its bytes.
-class TextRunnerSnapshot {
+class TextRunnerSnapshot : public ContinuationSnapshot {
 public:
   TextRunnerSnapshot() = default;
-  virtual ~TextRunnerSnapshot() = default;
+  ~TextRunnerSnapshot() override = default;
 
   TextRunnerSnapshot(const TextRunnerSnapshot&) = delete;
   TextRunnerSnapshot& operator=(const TextRunnerSnapshot&) = delete;
   TextRunnerSnapshot(TextRunnerSnapshot&&) = delete;
   TextRunnerSnapshot& operator=(TextRunnerSnapshot&&) = delete;
-
-  [[nodiscard]] virtual std::size_t PayloadBytes() const noexcept = 0;
 };
 
 struct TextRunnerAdvance {
@@ -171,8 +169,8 @@ public:
   /// advertise the corresponding capabilities.
   [[nodiscard]] virtual std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const;
-  [[nodiscard]] virtual std::unique_ptr<TextRunnerState> RestoreOrFork(
-      const TextRunnerSnapshot& snapshot) const;
+  virtual void RestoreOrFork(TextRunnerState& state,
+                             const TextRunnerSnapshot& snapshot) const;
 };
 
 /// Bounded pool of opaque runner states with exact-prefix continuation reuse.
@@ -182,6 +180,11 @@ public:
 
   class Request {
   public:
+    struct CommitMetrics {
+      std::size_t snapshot_bytes{0};
+      double snapshot_ms{0.0};
+    };
+
     Request();
     ~Request();
 
@@ -193,6 +196,8 @@ public:
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] bool cache_hit() const noexcept;
     [[nodiscard]] std::size_t cached_prompt_tokens() const noexcept;
+    [[nodiscard]] std::size_t cache_restore_bytes() const noexcept;
+    [[nodiscard]] double cache_restore_ms() const noexcept;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;
     [[nodiscard]] bool prefill_complete() const noexcept;
 
@@ -203,7 +208,7 @@ public:
                                             float temperature);
 
     /// Publishes the model state at its reported checkpoint boundary.
-    void Commit();
+    CommitMetrics Commit();
     void Invalidate() noexcept;
 
   private:

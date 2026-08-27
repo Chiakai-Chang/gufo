@@ -30,6 +30,20 @@ public:
   virtual void Invalidate() noexcept = 0;
 };
 
+/// Immutable model-private continuation payload.
+class ContinuationSnapshot {
+public:
+  ContinuationSnapshot() = default;
+  virtual ~ContinuationSnapshot() = default;
+
+  ContinuationSnapshot(const ContinuationSnapshot&) = delete;
+  ContinuationSnapshot& operator=(const ContinuationSnapshot&) = delete;
+  ContinuationSnapshot(ContinuationSnapshot&&) = delete;
+  ContinuationSnapshot& operator=(ContinuationSnapshot&&) = delete;
+
+  [[nodiscard]] virtual std::size_t PayloadBytes() const noexcept = 0;
+};
+
 /// Bounded exact-prefix cache over opaque model continuation states.
 ///
 /// The first deployment uses one entry. Supporting a bounded entry count here
@@ -38,6 +52,12 @@ class ContinuationCache {
 public:
   using StateFactory = std::function<std::unique_ptr<ContinuationState>()>;
   using CancellationCheck = std::function<bool()>;
+  using SnapshotRestore =
+      std::function<void(ContinuationState&, const ContinuationSnapshot&)>;
+
+  struct SnapshotSupport {
+    SnapshotRestore restore;
+  };
 
   class Lease {
   public:
@@ -57,9 +77,14 @@ public:
     [[nodiscard]] std::size_t cached_tokens() const noexcept {
       return cached_tokens_;
     }
+    [[nodiscard]] std::size_t restored_snapshot_bytes() const noexcept {
+      return restored_snapshot_bytes_;
+    }
+    [[nodiscard]] double restore_ms() const noexcept { return restore_ms_; }
 
     /// Atomically publishes the state and the exact tokens it represents.
-    void Commit(std::vector<ContinuationToken> tokens);
+    void Commit(std::vector<ContinuationToken> tokens,
+                std::unique_ptr<ContinuationSnapshot> snapshot = nullptr);
 
     /// Explicitly discards partial state. The destructor does the same if a
     /// lease is not committed.
@@ -69,15 +94,20 @@ public:
     friend class ContinuationCache;
 
     Lease(ContinuationCache* cache, std::size_t index, bool cache_hit,
-          std::size_t cached_tokens) noexcept;
+          std::size_t cached_tokens, std::size_t source_index,
+          std::size_t restored_snapshot_bytes, double restore_ms) noexcept;
 
     ContinuationCache* cache_{nullptr};
     std::size_t index_{0};
     bool cache_hit_{false};
     std::size_t cached_tokens_{0};
+    std::size_t source_index_{0};
+    std::size_t restored_snapshot_bytes_{0};
+    double restore_ms_{0.0};
   };
 
-  ContinuationCache(std::size_t capacity, const StateFactory& factory);
+  ContinuationCache(std::size_t capacity, const StateFactory& factory,
+                    SnapshotSupport snapshot_support = {});
   ~ContinuationCache();
 
   ContinuationCache(const ContinuationCache&) = delete;
@@ -94,7 +124,9 @@ private:
   struct Entry;
 
   [[nodiscard]] ContinuationState& StateAt(std::size_t index);
-  void Commit(std::size_t index, std::vector<ContinuationToken> tokens);
+  void Commit(std::size_t index, std::size_t source_index,
+              std::vector<ContinuationToken> tokens,
+              std::unique_ptr<ContinuationSnapshot> snapshot);
   void Invalidate(std::size_t index) noexcept;
 
   struct Impl;

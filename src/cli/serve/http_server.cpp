@@ -239,6 +239,8 @@ json::Value TimingsJson(const TextGenerationBackend::Result& result) {
   timings["predicted_per_token_ms"] = predicted_per_token_ms;
   timings["predicted_per_second"] = predicted_per_second;
   timings["cache_n"] = result.cached_prompt_tokens;
+  timings["cache_restore_ms"] = result.cache_restore_ms;
+  timings["cache_snapshot_ms"] = result.cache_snapshot_ms;
   timings["draft_n"] = result.draft_tokens;
   timings["draft_n_accepted"] = result.draft_accepted_tokens;
   return timings;
@@ -281,6 +283,11 @@ json::Value MetricsJson(const TextGenerationBackend::Result& result) {
   metrics["prompt_tokens"] = result.prompt_tokens;
   metrics["completion_tokens"] = result.completion_tokens;
   metrics["cached_tokens"] = result.cached_prompt_tokens;
+  metrics["cache_restore_bytes"] = result.cache_restore_bytes;
+  metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
+  metrics["cache_shared_bytes"] = result.cache_shared_bytes;
+  metrics["cache_restore_ms"] = result.cache_restore_ms;
+  metrics["cache_snapshot_ms"] = result.cache_snapshot_ms;
   return metrics;
 }
 

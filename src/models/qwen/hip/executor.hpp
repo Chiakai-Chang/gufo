@@ -131,6 +131,7 @@ private:
   std::size_t deltanet_elements_{0};
   std::uint32_t attention_layers_{0};
   std::uint32_t kv_width_{0};
+  std::uint32_t max_context_{0};
   std::uint32_t valid_context_{0};
   std::size_t payload_bytes_{0};
 

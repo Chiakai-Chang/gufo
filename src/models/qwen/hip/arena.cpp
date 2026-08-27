@@ -177,9 +177,10 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   auto snapshot = std::unique_ptr<QwenGpuSnapshot>(new QwenGpuSnapshot());
   snapshot->attention_layers_ = config_.FullAttentionLayerCount();
   snapshot->kv_width_ = config_.num_key_value_heads * config_.head_dim;
+  snapshot->max_context_ = max_context_;
   snapshot->valid_context_ = valid_context;
   snapshot->kv_elements_per_plane_ = CheckedMultiply(
-      CheckedMultiply(snapshot->attention_layers_, valid_context),
+      CheckedMultiply(snapshot->attention_layers_, max_context_),
       snapshot->kv_width_);
   snapshot->conv_elements_ =
       CheckedMultiply(CheckedMultiply(config_.num_layers, config_.SsmQkvSize()),
@@ -215,44 +216,15 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   ThrowOnHipError(hipMalloc(&snapshot->d_ssm_deltanet_, deltanet_bytes),
                   "failed to allocate Qwen DeltaNet snapshot");
 
-  const std::size_t live_layer_elements =
-      CheckedMultiply(max_context_, snapshot->kv_width_);
-  const std::size_t snapshot_layer_elements =
-      CheckedMultiply(valid_context, snapshot->kv_width_);
-  const std::size_t live_plane_elements =
-      CheckedMultiply(snapshot->attention_layers_, live_layer_elements);
-  for (std::size_t layer = 0; layer < snapshot->attention_layers_; ++layer) {
-    const std::size_t live_offset = layer * live_layer_elements;
-    const std::size_t compact_offset = layer * snapshot_layer_elements;
-    const std::size_t layer_f32_bytes = snapshot_layer_elements * sizeof(float);
-    const std::size_t layer_f16_bytes =
-        snapshot_layer_elements * sizeof(std::uint16_t);
-    auto* compact_f32 = static_cast<float*>(snapshot->d_kv_f32_);
-    auto* compact_f16 = static_cast<std::uint16_t*>(snapshot->d_kv_f16_);
-    const auto* live_f16 =
-        static_cast<const std::uint16_t*>(d_attention_kv_f16);
-    if (layer_f32_bytes != 0) {
-      ThrowOnHipError(
-          hipMemcpyAsync(compact_f32 + compact_offset, d_kv_cache + live_offset,
-                         layer_f32_bytes, hipMemcpyDeviceToDevice, stream),
-          "failed to capture Qwen K snapshot");
-      ThrowOnHipError(
-          hipMemcpyAsync(
-              compact_f32 + snapshot->kv_elements_per_plane_ + compact_offset,
-              d_kv_cache + live_plane_elements + live_offset, layer_f32_bytes,
-              hipMemcpyDeviceToDevice, stream),
-          "failed to capture Qwen V snapshot");
-      ThrowOnHipError(
-          hipMemcpyAsync(compact_f16 + compact_offset, live_f16 + live_offset,
-                         layer_f16_bytes, hipMemcpyDeviceToDevice, stream),
-          "failed to capture Qwen FP16 K snapshot");
-      ThrowOnHipError(
-          hipMemcpyAsync(
-              compact_f16 + snapshot->kv_elements_per_plane_ + compact_offset,
-              live_f16 + live_plane_elements + live_offset, layer_f16_bytes,
-              hipMemcpyDeviceToDevice, stream),
-          "failed to capture Qwen FP16 V snapshot");
-    }
+  if (kv_f32_bytes != 0) {
+    ThrowOnHipError(
+        hipMemcpyAsync(snapshot->d_kv_f32_, d_kv_cache, kv_f32_bytes,
+                       hipMemcpyDeviceToDevice, stream),
+        "failed to capture Qwen FP32 KV snapshot");
+    ThrowOnHipError(
+        hipMemcpyAsync(snapshot->d_kv_f16_, d_attention_kv_f16, kv_f16_bytes,
+                       hipMemcpyDeviceToDevice, stream),
+        "failed to capture Qwen FP16 KV snapshot");
   }
   ThrowOnHipError(hipMemcpyAsync(snapshot->d_ssm_conv_, d_ssm_conv_state,
                                  conv_bytes, hipMemcpyDeviceToDevice, stream),
@@ -279,51 +251,26 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
       config_.SsmValueSize());
   if (snapshot.valid_context_ > max_context_ ||
       snapshot.attention_layers_ != attention_layers ||
-      snapshot.kv_width_ != kv_width ||
+      snapshot.kv_width_ != kv_width || snapshot.max_context_ != max_context_ ||
       snapshot.conv_elements_ != conv_elements ||
       snapshot.deltanet_elements_ != deltanet_elements) {
     throw std::invalid_argument("Qwen snapshot is incompatible with the arena");
   }
 
   Reset();
-  const std::size_t live_layer_elements =
-      CheckedMultiply(max_context_, snapshot.kv_width_);
-  const std::size_t snapshot_layer_elements =
-      CheckedMultiply(snapshot.valid_context_, snapshot.kv_width_);
-  const std::size_t live_plane_elements =
-      CheckedMultiply(snapshot.attention_layers_, live_layer_elements);
-  for (std::size_t layer = 0; layer < snapshot.attention_layers_; ++layer) {
-    const std::size_t live_offset = layer * live_layer_elements;
-    const std::size_t compact_offset = layer * snapshot_layer_elements;
-    const std::size_t layer_f32_bytes = snapshot_layer_elements * sizeof(float);
-    const std::size_t layer_f16_bytes =
-        snapshot_layer_elements * sizeof(std::uint16_t);
-    const auto* compact_f32 = static_cast<const float*>(snapshot.d_kv_f32_);
-    const auto* compact_f16 =
-        static_cast<const std::uint16_t*>(snapshot.d_kv_f16_);
-    auto* live_f16 = static_cast<std::uint16_t*>(d_attention_kv_f16);
-    if (layer_f32_bytes != 0) {
-      ThrowOnHipError(
-          hipMemcpyAsync(d_kv_cache + live_offset, compact_f32 + compact_offset,
-                         layer_f32_bytes, hipMemcpyDeviceToDevice, stream),
-          "failed to restore Qwen K snapshot");
-      ThrowOnHipError(
-          hipMemcpyAsync(
-              d_kv_cache + live_plane_elements + live_offset,
-              compact_f32 + snapshot.kv_elements_per_plane_ + compact_offset,
-              layer_f32_bytes, hipMemcpyDeviceToDevice, stream),
-          "failed to restore Qwen V snapshot");
-      ThrowOnHipError(
-          hipMemcpyAsync(live_f16 + live_offset, compact_f16 + compact_offset,
-                         layer_f16_bytes, hipMemcpyDeviceToDevice, stream),
-          "failed to restore Qwen FP16 K snapshot");
-      ThrowOnHipError(
-          hipMemcpyAsync(
-              live_f16 + live_plane_elements + live_offset,
-              compact_f16 + snapshot.kv_elements_per_plane_ + compact_offset,
-              layer_f16_bytes, hipMemcpyDeviceToDevice, stream),
-          "failed to restore Qwen FP16 V snapshot");
-    }
+  const std::size_t kv_f32_bytes = CheckedMultiply(
+      CheckedMultiply(snapshot.kv_elements_per_plane_, 2), sizeof(float));
+  const std::size_t kv_f16_bytes =
+      CheckedMultiply(CheckedMultiply(snapshot.kv_elements_per_plane_, 2),
+                      sizeof(std::uint16_t));
+  if (kv_f32_bytes != 0) {
+    ThrowOnHipError(hipMemcpyAsync(d_kv_cache, snapshot.d_kv_f32_, kv_f32_bytes,
+                                   hipMemcpyDeviceToDevice, stream),
+                    "failed to restore Qwen FP32 KV snapshot");
+    ThrowOnHipError(
+        hipMemcpyAsync(d_attention_kv_f16, snapshot.d_kv_f16_, kv_f16_bytes,
+                       hipMemcpyDeviceToDevice, stream),
+        "failed to restore Qwen FP16 KV snapshot");
   }
   ThrowOnHipError(hipMemcpyAsync(d_ssm_conv_state, snapshot.d_ssm_conv_,
                                  snapshot.conv_elements_ * sizeof(float),

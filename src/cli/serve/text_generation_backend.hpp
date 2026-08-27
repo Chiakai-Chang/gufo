@@ -114,6 +114,9 @@ public:
     std::vector<tokenization::TokenId> tokens;
     std::size_t prompt_tokens{0};
     std::size_t cached_prompt_tokens{0};
+    std::size_t cache_restore_bytes{0};
+    std::size_t cache_snapshot_bytes{0};
+    std::size_t cache_shared_bytes{0};
     std::size_t completion_tokens{0};
     std::size_t draft_tokens{0};
     std::size_t draft_accepted_tokens{0};
@@ -130,6 +133,8 @@ public:
     std::size_t physical_execution_width{1};
     std::size_t max_buffered_output_bytes{0};
     double queue_ms{0.0};
+    double cache_restore_ms{0.0};
+    double cache_snapshot_ms{0.0};
     double ttft_ms{0.0};
     double mean_inter_token_ms{0.0};
     double max_inter_token_ms{0.0};

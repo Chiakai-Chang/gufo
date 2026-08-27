@@ -221,6 +221,17 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
   if (!ParseContent(value.find("content"), &message->content, error)) {
     return false;
   }
+  if (const json::Value* reasoning = value.find("reasoning_content");
+      reasoning != nullptr && !reasoning->is_null()) {
+    if (message->role != tokenization::ChatRole::kAssistant ||
+        !reasoning->is_string()) {
+      *error =
+          "'reasoning_content' is only valid as a string on assistant "
+          "messages";
+      return false;
+    }
+    message->thought = reasoning->get_str();
+  }
 
   const json::Value* tool_calls = value.find("tool_calls");
   if (tool_calls == nullptr) {
@@ -801,6 +812,8 @@ json::Value Timings(const TextGenerationBackend::Result& result) {
   timings["predicted_per_token_ms"] = predicted_per_token_ms;
   timings["predicted_per_second"] = predicted_per_second;
   timings["cache_n"] = result.cached_prompt_tokens;
+  timings["cache_restore_ms"] = result.cache_restore_ms;
+  timings["cache_snapshot_ms"] = result.cache_snapshot_ms;
   timings["draft_n"] = result.draft_tokens;
   timings["draft_n_accepted"] = result.draft_accepted_tokens;
   return timings;
@@ -815,6 +828,11 @@ json::Value Metrics(const TextGenerationBackend::Result& result) {
   metrics["prompt_tokens"] = result.prompt_tokens;
   metrics["completion_tokens"] = result.completion_tokens;
   metrics["cached_tokens"] = result.cached_prompt_tokens;
+  metrics["cache_restore_bytes"] = result.cache_restore_bytes;
+  metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
+  metrics["cache_shared_bytes"] = result.cache_shared_bytes;
+  metrics["cache_restore_ms"] = result.cache_restore_ms;
+  metrics["cache_snapshot_ms"] = result.cache_snapshot_ms;
   return metrics;
 }
 
@@ -846,6 +864,11 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
 
   json::Value metrics = json::Value::object();
   metrics["cache_hit"] = result.cache_hit;
+  metrics["cache_restore_bytes"] = result.cache_restore_bytes;
+  metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
+  metrics["cache_shared_bytes"] = result.cache_shared_bytes;
+  metrics["cache_restore_ms"] = result.cache_restore_ms;
+  metrics["cache_snapshot_ms"] = result.cache_snapshot_ms;
   metrics["prefill_tokens"] = result.prefill_tokens;
   metrics["prefill_chunks"] = result.prefill_chunks;
   metrics["active_decode_prefill_chunks"] = result.active_decode_prefill_chunks;

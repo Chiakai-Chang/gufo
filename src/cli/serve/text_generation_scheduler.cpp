@@ -344,7 +344,9 @@ struct TextGenerationScheduler::Impl {
   void CompleteSuccess(const std::shared_ptr<ScheduledRequest>& request,
                        TextGenerationBackend::FinishReason finish_reason) {
     FinalizeResult(request, finish_reason);
-    request->runner_request.Commit();
+    const auto cache_commit = request->runner_request.Commit();
+    request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
+    request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
     PublishTerminal(request);
   }
 
@@ -397,6 +399,10 @@ struct TextGenerationScheduler::Impl {
         request->result.cache_hit = request->runner_request.cache_hit();
         request->result.cached_prompt_tokens =
             request->runner_request.cached_prompt_tokens();
+        request->result.cache_restore_bytes =
+            request->runner_request.cache_restore_bytes();
+        request->result.cache_restore_ms =
+            request->runner_request.cache_restore_ms();
         request->result.incremental_prefill_supported =
             incremental_prefill_supported;
         request->result.queue_ms = std::chrono::duration<double, std::milli>(

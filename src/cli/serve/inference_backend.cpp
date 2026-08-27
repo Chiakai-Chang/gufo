@@ -65,6 +65,11 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
        << ",\"cached_prompt_tokens\":" << result.cached_prompt_tokens
        << ",\"uncached_prompt_tokens\":"
        << (result.prompt_tokens - result.cached_prompt_tokens)
+       << ",\"cache_restore_bytes\":" << result.cache_restore_bytes
+       << ",\"cache_snapshot_bytes\":" << result.cache_snapshot_bytes
+       << ",\"cache_shared_bytes\":" << result.cache_shared_bytes
+       << ",\"cache_restore_ms\":" << result.cache_restore_ms
+       << ",\"cache_snapshot_ms\":" << result.cache_snapshot_ms
        << ",\"prefill_tokens\":" << result.prefill_tokens
        << ",\"prefill_chunks\":" << result.prefill_chunks
        << ",\"active_decode_prefill_chunks\":"
@@ -549,8 +554,8 @@ public:
         qwen.position(), qwen.frontier());
   }
 
-  [[nodiscard]] std::unique_ptr<TextRunnerState> RestoreOrFork(
-      const TextRunnerSnapshot& snapshot) const override {
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
     if (dflash_model_ != nullptr) {
       throw std::logic_error(
           "Qwen DFlash sessions do not support snapshot restore");
@@ -564,12 +569,14 @@ public:
       throw std::invalid_argument(
           "Qwen snapshot does not belong to this model");
     }
-    auto restored = std::make_unique<QwenTextRunnerState>(
-        model_, max_context_, nullptr, speculative::SpeculativeOptions{});
-    restored->executor().RestoreSnapshot(*qwen_snapshot->snapshot);
-    restored->set_position(qwen_snapshot->position);
-    restored->set_frontier(*qwen_snapshot->frontier);
-    return restored;
+    auto& restored = RequireQwenState(state);
+    if (restored.speculative()) {
+      throw std::invalid_argument(
+          "Qwen snapshot cannot restore into a speculative state");
+    }
+    restored.executor().RestoreSnapshot(*qwen_snapshot->snapshot);
+    restored.set_position(qwen_snapshot->position);
+    restored.set_frontier(*qwen_snapshot->frontier);
   }
 
 private:
@@ -825,6 +832,10 @@ public:
     }
     for (const auto& message : request.messages) {
       std::string content = message.content;
+      if (message.role == tokenization::ChatRole::kAssistant &&
+          !message.thought.empty()) {
+        content = "<think>\n" + message.thought + "\n</think>\n" + content;
+      }
       if (!tools_rendered &&
           (message.role == tokenization::ChatRole::kSystem ||
            message.role == tokenization::ChatRole::kDeveloper)) {
@@ -942,8 +953,8 @@ public:
         model_, std::move(snapshot), deepseek.position());
   }
 
-  [[nodiscard]] std::unique_ptr<TextRunnerState> RestoreOrFork(
-      const TextRunnerSnapshot& snapshot) const override {
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
     const auto* deepseek_snapshot =
         dynamic_cast<const DeepSeekTextRunnerSnapshot*>(&snapshot);
     if (deepseek_snapshot == nullptr ||
@@ -952,15 +963,13 @@ public:
       throw std::invalid_argument(
           "DeepSeek snapshot does not belong to this model");
     }
-    auto restored =
-        std::make_unique<DeepSeekTextRunnerState>(model_, max_context_);
+    auto& restored = RequireDeepSeekState(state);
     std::string error;
-    if (!restored->session().RestoreSnapshot(*deepseek_snapshot->snapshot,
-                                             &error)) {
+    if (!restored.session().RestoreSnapshot(*deepseek_snapshot->snapshot,
+                                            &error)) {
       throw std::runtime_error("DeepSeek snapshot restore failed: " + error);
     }
-    restored->set_position(deepseek_snapshot->position);
-    return restored;
+    restored.set_position(deepseek_snapshot->position);
   }
 
 private:

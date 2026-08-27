@@ -41,6 +41,7 @@ void Expect(bool condition, std::string_view message) {
 struct FakeStats {
   std::size_t states_created{0};
   std::size_t invalidations{0};
+  std::size_t snapshot_restores{0};
   std::size_t cancellation_bindings{0};
   std::size_t cancellation_clears{0};
   std::vector<std::size_t> prefill_spans;
@@ -247,7 +248,7 @@ public:
     return RequireFakeState(state).position;
   }
 
-private:
+protected:
   std::shared_ptr<FakeStats> stats_;
   std::size_t measured_bytes_;
   std::size_t state_capacity_bytes_;
@@ -383,13 +384,17 @@ void TestResourceClaimsAreValidatedBeforeAllocation() {
 
 class FakeSnapshot final : public TextRunnerSnapshot {
 public:
-  explicit FakeSnapshot(std::size_t position) : position(position) {}
+  FakeSnapshot(std::size_t position, std::size_t decode_count,
+               std::optional<TextRunnerToken> frontier)
+      : position(position), decode_count(decode_count), frontier(frontier) {}
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    return sizeof(position);
+    return sizeof(FakeSnapshot);
   }
 
   std::size_t position;
+  std::size_t decode_count;
+  std::optional<TextRunnerToken> frontier;
 };
 
 class SnapshotRunner final : public FakeRunner {
@@ -405,18 +410,22 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
-    return std::make_unique<FakeSnapshot>(RequireFakeState(state).position);
+    const auto& fake = RequireFakeState(state);
+    return std::make_unique<FakeSnapshot>(fake.position, fake.decode_count,
+                                          fake.frontier);
   }
 
-  [[nodiscard]] std::unique_ptr<TextRunnerState> RestoreOrFork(
-      const TextRunnerSnapshot& snapshot) const override {
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
     const auto* fake = dynamic_cast<const FakeSnapshot*>(&snapshot);
     if (fake == nullptr) {
       throw std::invalid_argument("snapshot type mismatch");
     }
-    auto state = CreateState();
-    RequireFakeState(*state).position = fake->position;
-    return state;
+    auto& restored = RequireFakeState(state);
+    restored.position = fake->position;
+    restored.decode_count = fake->decode_count;
+    restored.frontier = fake->frontier;
+    ++stats_->snapshot_restores;
   }
 };
 
@@ -425,11 +434,15 @@ void TestSnapshotForkAndUnsupportedCapabilities() {
   SnapshotRunner runner(stats);
   auto state = runner.CreateState();
   RequireFakeState(*state).position = 7;
+  RequireFakeState(*state).frontier = 90;
   auto snapshot = runner.Snapshot(*state);
-  Expect(snapshot != nullptr && snapshot->PayloadBytes() == sizeof(std::size_t),
-         "snapshot reports its opaque payload bytes");
-  auto fork = runner.RestoreOrFork(*snapshot);
-  Expect(RequireFakeState(*fork).position == 7,
+  Expect(
+      snapshot != nullptr && snapshot->PayloadBytes() == sizeof(FakeSnapshot),
+      "snapshot reports its opaque payload bytes");
+  auto fork = runner.CreateState();
+  runner.RestoreOrFork(*fork, *snapshot);
+  Expect(RequireFakeState(*fork).position == 7 &&
+             RequireFakeState(*fork).frontier == 90,
          "fork restores the exact runner-owned boundary");
 
   FakeRunner unsupported(stats);
@@ -440,6 +453,54 @@ void TestSnapshotForkAndUnsupportedCapabilities() {
     snapshot_rejected = true;
   }
   Expect(snapshot_rejected, "unsupported snapshots fail explicitly");
+}
+
+void TestSnapshotCacheBranchesOnePrefixIntoIndependentStates() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<SnapshotRunner>(stats);
+  TextRunnerPool pool(runner, 2);
+
+  {
+    auto root = pool.Acquire({1, 2, 3, 4});
+    Expect(root.Prefill(4).decode_ready,
+           "root prefix reaches its snapshot boundary");
+    const auto commit = root.Commit();
+    Expect(commit.snapshot_bytes == sizeof(FakeSnapshot) &&
+               commit.snapshot_ms >= 0.0,
+           "root commit reports retained full-copy snapshot cost");
+  }
+
+  auto first = pool.Acquire({1, 2, 3, 4, 5});
+  auto second = pool.Acquire({1, 2, 3, 4, 6});
+  Expect(first.cache_hit() && second.cache_hit(),
+         "two simultaneous requests restore one retained snapshot");
+  Expect(
+      first.cached_prompt_tokens() == 4 && second.cached_prompt_tokens() == 4,
+      "both branches report the same immutable root prefix");
+  Expect(first.cache_restore_bytes() == sizeof(FakeSnapshot) &&
+             second.cache_restore_bytes() == sizeof(FakeSnapshot) &&
+             first.cache_restore_ms() >= 0.0 &&
+             second.cache_restore_ms() >= 0.0,
+         "both branches report full-copy restore bytes and latency");
+  Expect(stats->snapshot_restores == 2,
+         "the root snapshot is copied into two mutable states");
+  Expect(stats->states_created == 2,
+         "snapshot branching reuses preallocated request states");
+
+  Expect(first.Prefill(1).decode_ready && second.Prefill(1).decode_ready,
+         "each branch prefills only its divergent suffix");
+  Expect(
+      first.SelectNext(0.0F).token == 90 && second.SelectNext(0.0F).token == 90,
+      "both restored branches retain an exact frontier");
+  first.Advance();
+  second.Advance();
+  first.Commit();
+  second.Commit();
+
+  auto third = pool.Acquire({1, 2, 3, 4, 7});
+  Expect(third.cache_hit() && third.cached_prompt_tokens() == 4,
+         "branch commits preserve the shared root while capacity permits");
+  third.Invalidate();
 }
 
 void TestMeasuredStateIsReconciledWithClaim() {
@@ -465,6 +526,7 @@ int main() {
   TestBatchedAdvancePreservesIndependentRequests();
   TestResourceClaimsAreValidatedBeforeAllocation();
   TestSnapshotForkAndUnsupportedCapabilities();
+  TestSnapshotCacheBranchesOnePrefixIntoIndependentStates();
   TestMeasuredStateIsReconciledWithClaim();
   std::cout << "All text model runner tests passed\n";
   return 0;
