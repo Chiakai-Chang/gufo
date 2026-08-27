@@ -42,21 +42,21 @@ nix build
 MODEL=models/Qwen3.8-27B-GGUF/BF16/Qwen3.8-27B-BF16-00001-of-00002.gguf
 ```
 
-Measure Strix prompt processing, shallow decode, and context depth:
+Measure Gufo prompt processing, shallow decode, and context depth:
 
 ```sh
-./result/bin/strix bench \
+./result/bin/gufo bench \
   --model "$MODEL" \
   --n-prompt 32,64,128,256,512,1024,2048,4096 \
   --n-gen 0 \
   --repetitions 3
 
-./result/bin/strix bench \
+./result/bin/gufo bench \
   --model "$MODEL" \
   --n-gen 8,128 \
   --repetitions 3
 
-./result/bin/strix bench \
+./result/bin/gufo bench \
   --model "$MODEL" \
   --n-prompt 2048 \
   --n-gen 128 \
@@ -67,7 +67,7 @@ Measure Strix prompt processing, shallow decode, and context depth:
 Check the complete final-token vocabulary against sequential execution:
 
 ```sh
-./result/bin/strix bench \
+./result/bin/gufo bench \
   --model "$MODEL" \
   --validate-prefill 1024 \
   --n-prompt 1024 \
@@ -128,7 +128,7 @@ build 10173 at commit `e9fa078`.
 
 ### Shallow prompt and decode
 
-| Test | Strix HIP | llama.cpp ROCm | Strix vs llama.cpp |
+| Test | Gufo HIP | llama.cpp ROCm | Gufo vs llama.cpp |
 | --- | ---: | ---: | ---: |
 | `pp32` | 79.28 +/- 0.14 tok/s | 74.90 +/- 1.18 tok/s | +5.8% |
 | `pp64` | 148.49 +/- 0.31 tok/s | 111.40 +/- 1.36 tok/s | +33.3% |
@@ -146,7 +146,7 @@ build 10173 at commit `e9fa078`.
 Prompt rows are the controlled comparison. Decode rows include the current
 split-K route; the 12K decode point has not yet been rerun.
 
-| Depth | Strix `pp2048` | llama `pp2048` | llama / Strix | Strix `tg128` | llama `tg128` | llama / Strix |
+| Depth | Gufo `pp2048` | llama `pp2048` | llama / Gufo | Gufo `tg128` | llama `tg128` | llama / Gufo |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 4K | 296.00 | 363.72 | 1.23x | 3.70 | 3.97 | 1.07x |
 | 8K | 252.78 | 289.56 | 1.15x | 3.67 | 3.94 | 1.07x |
@@ -180,14 +180,14 @@ verification.
 ```sh
 MTP_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf
 
-./result/bin/strix bench --model "$MODEL" \
+./result/bin/gufo bench --model "$MODEL" \
   --n-prompt 1 --n-gen 128 --repetitions 1
 
-./result/bin/strix bench --model "$MODEL" \
+./result/bin/gufo bench --model "$MODEL" \
   --n-prompt 1 --n-gen 128 --repetitions 1 \
   --speculative mtp --mtp-model "$MTP_MODEL" --draft-tokens 2
 
-./result/bin/strix bench --model "$MODEL" \
+./result/bin/gufo bench --model "$MODEL" \
   --n-prompt 1 --n-gen 128 --repetitions 1 \
   --speculative mtp-npu --mtp-model "$MTP_MODEL" --draft-tokens 2 --verbose
 ```
@@ -240,13 +240,13 @@ DFLASH=models/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q8_0.gguf
 MTP_MODEL=/path/to/mtp-Qwen3.8-27B-Q4_0.gguf
 
 nix develop -c python3 tools/quant/speculative-corpus.py \
-  --binary ./result/bin/strix-server \
+  --binary ./result/bin/gufo \
   --model "$TARGET" \
   --draft-model "$DFLASH" \
   --backend dflash2
 
 nix develop -c python3 tools/quant/speculative-corpus.py \
-  --binary ./result/bin/strix-server \
+  --binary ./result/bin/gufo \
   --model "$TARGET" \
   --draft-model "$MTP_MODEL" \
   --backend mtp
@@ -278,7 +278,7 @@ that implementation:
 
 ```sh
 nix develop -c python3 tools/quant/speculative-corpus.py \
-  --binary ./result/bin/strix-server \
+  --binary ./result/bin/gufo \
   --model "$TARGET" \
   --draft-model "$DFLASH" \
   --backend dflash2 \
@@ -486,7 +486,7 @@ they did not beat the unfused routes end-to-end on gfx1151.
   instead of a full-layer page-touch: the full-layer variant re-reads the whole
   ~1.06 GiB layer every token and its per-layer cross-stream join serializes
   the non-graph (split-K) decode path (~4x at depth); a resident
-  `STRIX_GPU_WEIGHT_MODE=copy` comparison would show whether mapped-weight
+  `GUFO_GPU_WEIGHT_MODE=copy` comparison would show whether mapped-weight
   re-reads cost anything in steady state at all.
 
 ## Qwen3.8-27B Q8 Layer Breakdown and Execution Timings
@@ -651,7 +651,7 @@ same effect at ambient scale.
 | `opt-c178-attn-occupancy` | Drop the V^T row padding so LDS falls from 23296 to 20192 bytes and three blocks fit per CU instead of two, buying 6 waves/SIMD against 4 | Slower at every depth (2.518 vs 2.500 ms at 0, 66.9-70.1 vs 46.1-51.6 at 16384). Without the 8-half pad a V fragment row starts every 16 halves, so the 16 lanes of a fragment read hit only 4 banks -- a 4-way conflict on the PV operand fetch, paid twice per wave per key tile. The padding is worth more than the extra resident waves | **Rejected** |
 | `opt-c176-attn-bandwidth` | Decide whether a hand-written masked WMMA kernel can actually beat the tiled `v_dot2` diagonal, before writing one | Paper, from the depth-0 profile: the tiled kernel re-reads K and V per query block, which at batch 2048 is 12 head-pairs x 135168 key rows x 1 KiB = 1.62 GiB per layer call. Against its measured 11.6 ms that is only 140 GB/s of request bandwidth, well under the 241 GB/s DRAM ceiling and far under the 32 MiB MALL the 8 MiB working set fits in. So the kernel is instruction bound at 4.58 TFLOPS, not traffic bound, and the traffic floor for the same access pattern is roughly 4 ms -- a WMMA rewrite has about 2.5x of real headroom on the diagonal, worth ~2% of prefill at depth 0 and ~4% at depth 8192 | **Closed** by `opt-c177-attn-wmma`, which delivered 3.52x on the diagonal rather than the 2.5x this bounded |
 | `opt-c175-residual-defer` | Defer the post-FFN residual add and fold it into the *next* layer's pre-norm, the way `opt-c173` folds the post-attention add into the FFN norm | Real but unmeasurable: `residual` stage 64 -> 17 ms against +32 ms in the fused norm, so 15 ms of 8010 ms of kernel time, and `pp2048` 530.07 -> 528.95 -- inside the +/-3.5 noise. The mechanism is that the fused norm is LDS-occupancy-limited to 3 blocks per CU while a standalone ResidualAdd is trivially parallel and already streams at close to peak bandwidth, so moving traffic into the fused kernel trades a fast streaming pass for a slow one and gives back most of what the removed round trip saves. Bit-identical, and it removes 48 launches per pass | **Rejected**: does not clear the "improves outside measurement noise" gate, and it costs a deferred-write invariant in the layer loop |
-| `opt-c177-attn-wmma` | Write the masked prefill attention by hand on the WMMA matrix cores, covering the whole visible range in one pass, and retire both the tiled `v_dot2` kernel and the AOTriton prefix plus log-sum-exp merge | One layer call at batch 2048: depth 0 11.40 -> 3.24 ms (**3.52x**), depth 8192 37.6 -> 27.26 ms (1.38x), depth 16384 64.1 -> 50.48 ms (1.27x); 4.58 -> 15.9-17.4 TFLOPS, or 29-32% of the WMMA ceiling against AOTriton's 15.6 on the easier unmasked shapes. Same session A/B against the split path it replaces: `pp2048` 527.05 -> 546.68 (+3.7%), `pp2048 @ d8192` 466.78 -> 489.65 (+4.9%). Agrees with the tiled kernel to 1.3e-4 across five shapes including partial query blocks and a depth off the key tile, and both sit at 2.1e-4 against a CPU double-precision reference, so this is FP16 operand precision, not a regression. 200-token greedy output is token-identical | **Retained**; the split path and AOTriton are no longer on the prefill route and are reachable with `STRIX_PREFILL_ATTENTION=split` |
+| `opt-c177-attn-wmma` | Write the masked prefill attention by hand on the WMMA matrix cores, covering the whole visible range in one pass, and retire both the tiled `v_dot2` kernel and the AOTriton prefix plus log-sum-exp merge | One layer call at batch 2048: depth 0 11.40 -> 3.24 ms (**3.52x**), depth 8192 37.6 -> 27.26 ms (1.38x), depth 16384 64.1 -> 50.48 ms (1.27x); 4.58 -> 15.9-17.4 TFLOPS, or 29-32% of the WMMA ceiling against AOTriton's 15.6 on the easier unmasked shapes. Same session A/B against the split path it replaces: `pp2048` 527.05 -> 546.68 (+3.7%), `pp2048 @ d8192` 466.78 -> 489.65 (+4.9%). Agrees with the tiled kernel to 1.3e-4 across five shapes including partial query blocks and a depth off the key tile, and both sit at 2.1e-4 against a CPU double-precision reference, so this is FP16 operand precision, not a regression. 200-token greedy output is token-identical | **Retained**; the split path and AOTriton are no longer on the prefill route and are reachable with `GUFO_PREFILL_ATTENTION=split` |
 | `opt-c177-attn-wide` | Push the attention tile to 128 query rows per block with 16 waves and 512 threads, halving the K/V traffic once more | Slower, 3.92 vs 3.28 ms at depth 0 and 35.5 vs 27.2 ms at depth 8192, and correct. Eight S tiles instead of four doubles the partial-score staging to 16 KiB, which takes total LDS to 42.5 KiB and leaves one workgroup per WGP; the traffic saved is worth less than the resident-wave count lost. 64 rows per block is the tile | **Rejected** |
 | `opt-c177-attn-tiling` | Find what the WMMA kernel is actually limited by, by ablating each phase | Global *request count*, not bytes and not barriers. Removing the K/V loads cuts a 5.03 ms call to 2.61 ms while removing all four barriers per key tile changes nothing, and the ratio holds from batch 256 to 4096, so it is not a capacity or bandwidth wall. Every block re-reads K and V for its key range, so cost per query row falls as a block covers more rows: 32 rows/block spends 2.43 ms on global memory, 64 rows/block 0.94 ms, taking the call from 5.03 to 3.24 ms. 64 is the most the eight-wave split holds without spilling. Two other ablation-found fixes were worth 1.8x and 1.14x: giving each lane one key rather than 8 contiguous dims when writing the transposed V (the natural mapping puts all 32 lanes of a wave on one LDS bank, a 32-way conflict), and issuing V's global load at the top of the key-tile iteration instead of behind the barriers at its point of use | **Retained** as the production tile |
 | `opt-c174-ssm-epilogue-quant` | Have the SSM per-head post-RMSNorm + SiLU gate write the tiled Q8_1 activation directly. The head's value dimension is 128, a multiple of the 32-element quantization block, so the block that owns one (head, token) already owns whole blocks and needs no extra communication | The gated row's only consumer is the Q8_0 `ssm_out` projection, so the FP32 store was written and read straight back: 214 MB of round trips per layer at batch 2048 down to 114 MB. `pp512` 509.38 -> 513.17, `pp2048` 526.46 -> 530.07. Bit-identical to the FP32 epilogue plus a separate quantize -- 0 differing bytes of 14.4 M over a whole chunk, and the end-to-end prefill validation is byte-for-byte unchanged | **Retained** |
@@ -672,7 +672,7 @@ same effect at ambient scale.
 | `opt-c163-pipeline` | Prefetch the next K stage's weight blocks into registers so their global latency overlaps the WMMA work | 32.29 vs 31.69 TOPS (+1.9%), bit-identical | **Retained** |
 | `opt-c163-dual-retire` | Route the FFN gate/up pair through two blocked single GEMMs and delete the 16-row dual kernel | Larger than the microbench predicted: the second launch reads the same 40 MB activation buffer straight out of MALL. Part of the +27% below | **Retained** |
 | `opt-c164-swiglu-quant` | Let SwiGLU write the tiled Q8_1 activation directly when `ffn_down` is Q8_0, instead of FP32 activation -> BF16 scratch -> quantize | Removes ~500 MB/layer of round-trip traffic and one launch per layer; SwiGLU stage 138 -> 99 ms/pass | **Retained** |
-| `opt-c165-attn-split` | Compute a prefill chunk at depth as two partial softmaxes -- AOTriton non-causal over the fully visible prefix plus the tiled causal kernel over the N x N diagonal -- merged exactly by log-sum-exp, with the SiLU gate applied once on the merged result | `pp2048 @ d8192` 345 -> 437 tok/s (+26.7%). Oracle test agrees with the unsplit kernel at 3e-4 relative across depths 1024/1500/4096, including a depth that is not a multiple of the 64-key tile | **Superseded** by `opt-c177-attn-wmma`, which does the same work in one masked pass; still reachable with `STRIX_PREFILL_ATTENTION=split` |
+| `opt-c165-attn-split` | Compute a prefill chunk at depth as two partial softmaxes -- AOTriton non-causal over the fully visible prefix plus the tiled causal kernel over the N x N diagonal -- merged exactly by log-sum-exp, with the SiLU gate applied once on the merged result | `pp2048 @ d8192` 345 -> 437 tok/s (+26.7%). Oracle test agrees with the unsplit kernel at 3e-4 relative across depths 1024/1500/4096, including a depth that is not a multiple of the 64-key tile | **Superseded** by `opt-c177-attn-wmma`, which does the same work in one masked pass; still reachable with `GUFO_PREFILL_ATTENTION=split` |
 | `opt-c165-aotriton-attn` | Replace the whole prefill attention with AOTriton `v2::flash::attn_fwd` | GQA (24/4), head_dim 256, fp16 and bf16 all work and match a reference at 3e-4, but **`is_causal` is rejected on gfx11xx**: only `causal_type` None and WindowedAttention are compiled, and every WindowedAttention encoding tried (including all six forced backend indices) returns success while writing zeros. Non-causal reaches 14.8-15.6 TFLOPS vs the tiled kernel's 4.36 on the causal half -- 3.2x even doing the full square | **Rejected** as a whole-kernel replacement; the usable part became `opt-c165-attn-split` |
 | `opt-c163-wide-bn` | Widen the macro tile to 128x256 or 256x128 with 512 threads, halving weight re-reads and raising LDS-limited occupancy from 6 to 7 waves/SIMD | Slower: 52-54% of peak vs 59%. The kernel is not weight-traffic bound, so a wider BN only buys LDS pressure. `128x128x4 w4x2` with 256 threads stays the best configuration | **Rejected** |
 | `opt-c163-lowoverhead` | Hoist weight row pointers so the K loop is 32-bit, clamp out-of-range rows instead of branching, and make the store guard one uniform branch per tile | Neutral: 32.14 vs 32.10 TOPS. The address arithmetic and exec-mask instructions an ISA dump showed were in the store epilogue, which runs once per block, not in the K loop. Only `ssm_out` (the shortest K) gained, +8% | **Rejected** |
@@ -684,12 +684,12 @@ left: removing the dequant epilogue reaches 63% of peak and removing the weight
 load reaches 47%, so the remaining gap to the ~70% issue-bound ceiling is split
 between the per-block scale application and LDS/global traffic.
 
-### Benchmark Summary: `strix-server` vs. `llama-bench`
+### Benchmark Summary: `gufo serve` vs. `llama-bench`
 
 Same build, same model, same session. `llama-bench` run as
 `-ngl 99 -fa auto -b 4096 -ub 4096 -t 32 --load-mode mmap`.
 
-| Benchmark Test | Before `opt-c163` | Current `strix-server` | `llama-bench` | Parity vs. `llama-bench` |
+| Benchmark Test | Before `opt-c163` | Current `gufo serve` | `llama-bench` | Parity vs. `llama-bench` |
 | :--- | :---: | :---: | :---: | :---: |
 | **Decode `tg16`** | `7.15 tok/s` | `7.15 tok/s` | `7.15 tok/s` | `100%` |
 | **Sustained Memory Bandwidth** | `209.3 GB/s` | `209.3 GB/s` | `214.3 GB/s` | `97.6%` (86.8% of the measured 241 GB/s read ceiling) |
@@ -706,7 +706,7 @@ Both engines were re-measured together at this revision, which is why
 measured back to back. `llama-bench` is the noisier of the two here -- its
 `pp2048` read 354.47, then 339.26, then 352.80 across three sessions on the same
 build, and two passes of one sweep differ by 7% at depth 8192 -- so treat the
-parity figures as approximate and the Strix column as the controlled one. See the
+parity figures as approximate and the Gufo column as the controlled one. See the
 throttling note under the experiment log.
 
 `pp2048` at 545.15 tok/s is 41% of the 1338 tok/s arithmetic ceiling the INT8
@@ -727,7 +727,7 @@ mechanism credited here previously, `opt-c165-attn-split`, no longer exists --
 masked WMMA pass over the whole visible range, and `opt-c178-attn-prefetch` is
 what shrinks the slope now.
 
-| Depth | Strix `pp2048` | llama.cpp `pp2048` | Strix / llama.cpp |
+| Depth | Gufo `pp2048` | llama.cpp `pp2048` | Gufo / llama.cpp |
 | ---: | ---: | ---: | ---: |
 | 0 | 545.15 | 352.80 | **1.55x** |
 | 4K | 524.11 | 331.70 | **1.58x** |
@@ -735,13 +735,13 @@ what shrinks the slope now.
 | 16K | 446.94 | 270.00 | **1.66x** |
 
 Depth 0 to 16K costs **18.0%** of throughput, against 23.5% for llama.cpp in the
-same session. The Strix slope reads 17.3-18.0% across two sweeps of the same code,
+same session. The Gufo slope reads 17.3-18.0% across two sweeps of the same code,
 so take a fraction of a point as measurement spread rather than signal.
 
 Both sides are the better of two passes. The first depth point of a fresh process
 reads about 55% low (234 against 513 tok/s at 4K) because the KV cache allocation
 and its first touch land inside the timed run, and at 16K the two passes differ by
-4% on Strix and 5% on llama.cpp from APU throttling, so a single `-r 1` sweep is
+4% on Gufo and 5% on llama.cpp from APU throttling, so a single `-r 1` sweep is
 not a reliable absolute.
 
 The slope is worth being precise about. It was 19.5% before this session's work,
@@ -796,7 +796,7 @@ that was never needed.
 
 ### Prefill stage budget (`pp2048`, per pass)
 
-Captured with `nix develop -c python3 tools/prof/prof.py run -- ./result/bin/strix bench ...`.
+Captured with `nix develop -c python3 tools/prof/prof.py run -- ./result/bin/gufo bench ...`.
 The bench emits one token per repetition, so a profile of `-p 2048 -n 0` also
 contains one decode pass: the `W8A8BlockedWmmaGEMMKernel<128, 64, 4, 8, 1>`
 dispatches with a single token block are that decode, about 1.9% of the recorded

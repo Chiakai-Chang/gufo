@@ -77,7 +77,7 @@ void TestLongContextDecodeAttention() {
   HIP_CHECK(hipMalloc(&d_out, attention_width * sizeof(float)));
   HIP_CHECK(hipMalloc(
       &d_split_k_scratch,
-      strix::hip::detail::DecodeAttentionScratchElements(num_heads, head_dim) *
+      gufo::hip::detail::DecodeAttentionScratchElements(num_heads, head_dim) *
           sizeof(float)));
 
   HIP_CHECK(hipMemcpy(d_q, h_q.data(), attention_width * sizeof(float),
@@ -97,10 +97,10 @@ void TestLongContextDecodeAttention() {
     HIP_CHECK(hipMemcpy(d_v_cache, h_cache.data(),
                         cache_elements * sizeof(float), hipMemcpyHostToDevice));
 
-    strix::hip::LaunchAttention(d_q, d_k, d_v, d_gate, d_k_cache, d_v_cache,
-                                nullptr, nullptr, d_out, 0, position,
-                                max_context, num_heads, num_kv_heads, head_dim,
-                                nullptr, d_split_k_scratch);
+    gufo::hip::LaunchAttention(d_q, d_k, d_v, d_gate, d_k_cache, d_v_cache,
+                               nullptr, nullptr, d_out, 0, position,
+                               max_context, num_heads, num_kv_heads, head_dim,
+                               nullptr, d_split_k_scratch);
     HIP_CHECK(hipGetLastError());
     HIP_CHECK(hipDeviceSynchronize());
     HIP_CHECK(hipMemcpy(output.data(), d_out, attention_width * sizeof(float),
@@ -247,18 +247,18 @@ void TestBaselineToTiledKvCacheTransition() {
 
   // 1. Golden sequential reference token-by-token
   for (std::size_t token = 0; token < total_batch; ++token) {
-    strix::hip::LaunchAttention(d_q + token * attention_width,
-                                d_k + token * kv_width, d_v + token * kv_width,
-                                d_gate + token * attention_width, d_cache_seq,
-                                d_cache_seq + cache_elements, nullptr, nullptr,
-                                d_out_seq + token * attention_width, 0,
-                                static_cast<std::uint32_t>(token), max_context,
-                                num_heads, num_kv_heads, head_dim);
+    gufo::hip::LaunchAttention(d_q + token * attention_width,
+                               d_k + token * kv_width, d_v + token * kv_width,
+                               d_gate + token * attention_width, d_cache_seq,
+                               d_cache_seq + cache_elements, nullptr, nullptr,
+                               d_out_seq + token * attention_width, 0,
+                               static_cast<std::uint32_t>(token), max_context,
+                               num_heads, num_kv_heads, head_dim);
   }
 
   // 2. Incremental transition:
   // Chunk 0 (0..512): LaunchBatchedAttention (Baseline)
-  strix::hip::LaunchBatchedAttention(
+  gufo::hip::LaunchBatchedAttention(
       d_q, d_k, d_v, d_gate, d_cache_trans, d_cache_trans + cache_elements,
       d_cache_trans_f16,
       static_cast<std::uint16_t*>(d_cache_trans_f16) + cache_elements,
@@ -267,7 +267,7 @@ void TestBaselineToTiledKvCacheTransition() {
 
   // Chunk 1 (512..1536): LaunchBatchedAttentionTile (Tiled FP16 at start_pos =
   // 512)
-  const bool chunk1_ok = strix::hip::LaunchBatchedAttentionTile(
+  const bool chunk1_ok = gufo::hip::LaunchBatchedAttentionTile(
       d_q + chunk0_size * attention_width, d_k + chunk0_size * kv_width,
       d_v + chunk0_size * kv_width, d_gate + chunk0_size * attention_width,
       d_cache_trans, d_cache_trans + cache_elements, d_cache_trans_f16,
@@ -275,8 +275,8 @@ void TestBaselineToTiledKvCacheTransition() {
       d_out_trans + chunk0_size * attention_width, 0,
       static_cast<std::uint32_t>(chunk0_size), chunk1_size, max_context,
       num_heads, num_kv_heads, head_dim);
-  strix::test::Expect(chunk1_ok,
-                      "long-context tiled attention launch was rejected");
+  gufo::test::Expect(chunk1_ok,
+                     "long-context tiled attention launch was rejected");
 
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -307,8 +307,8 @@ done_diff:
     max_diff = std::max(max_diff, std::abs(golden[i] - transition[i]));
   }
   std::cout << "Baseline-to-Tiled transition max diff: " << max_diff << "\n";
-  strix::test::Expect(max_diff < 5e-3F,
-                      "baseline-to-tiled attention transition mismatch");
+  gufo::test::Expect(max_diff < 5e-3F,
+                     "baseline-to-tiled attention transition mismatch");
 
   HIP_CHECK(hipFree(d_q));
   HIP_CHECK(hipFree(d_k));
@@ -326,9 +326,9 @@ done_diff:
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen long-context attention ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen long-context attention ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

@@ -13,7 +13,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 constexpr std::size_t kPackChunkRows = 32;
@@ -335,5 +335,5 @@ std::shared_ptr<const QwenDFlashGpuModel> QwenDFlashGpuModel::Create(
   }
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -42,7 +42,7 @@ constexpr std::array<int, 128> kPinnedDs4Trajectory{
 };
 
 void CheckPinnedTrajectory(
-    const std::shared_ptr<strix::models::deepseek_v4_flash::Model>& model) {
+    const std::shared_ptr<gufo::models::deepseek_v4_flash::Model>& model) {
   std::string error;
   const auto prompt = model->Tokenize(kTrajectoryPrompt);
   Expect(!prompt.empty(), "trajectory prompt tokenization");
@@ -85,7 +85,7 @@ void CheckPinnedTrajectory(
 }
 
 void CheckBatchedPrefill(
-    const std::shared_ptr<strix::models::deepseek_v4_flash::Model>& model) {
+    const std::shared_ptr<gufo::models::deepseek_v4_flash::Model>& model) {
   constexpr int kTrajectoryRepetitions = 2;
 
   std::string error;
@@ -172,14 +172,14 @@ void CheckBatchedPrefill(
 }  // namespace
 
 int main() {
-  const char* model_path = std::getenv("STRIX_DEEPSEEK_V4_FLASH_MODEL");
+  const char* model_path = std::getenv("GUFO_DEEPSEEK_V4_FLASH_MODEL");
   if (model_path == nullptr || model_path[0] == '\0') {
-    std::cout << "SKIP: STRIX_DEEPSEEK_V4_FLASH_MODEL is not set\n";
+    std::cout << "SKIP: GUFO_DEEPSEEK_V4_FLASH_MODEL is not set\n";
     return 77;
   }
 
-  using strix::models::deepseek_v4_flash::Model;
-  using strix::models::deepseek_v4_flash::ModelOptions;
+  using gufo::models::deepseek_v4_flash::Model;
+  using gufo::models::deepseek_v4_flash::ModelOptions;
 
   std::string error;
   const auto model = Model::Load(model_path,

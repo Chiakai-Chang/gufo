@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_DATA_INTERNAL_H_
-#define STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_DATA_INTERNAL_H_
+#ifndef GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_DATA_INTERNAL_H_
+#define GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_DATA_INTERNAL_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -143,4 +143,4 @@ uint64_t ds4_align_up(uint64_t value, uint64_t alignment);
 const char *ds4_tensor_type_name(uint32_t type);
 uint64_t ds4_routed_expert_row_bytes(const ds4_tensor *tensor);
 
-#endif  // STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_DATA_INTERNAL_H_
+#endif  // GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_DATA_INTERNAL_H_

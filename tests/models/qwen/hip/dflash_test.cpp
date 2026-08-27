@@ -38,30 +38,30 @@ int main(int argc, const char* const* argv) {
     }
 
     std::string error;
-    auto base_owner = strix::core::GgufReader::OpenFile(argv[1], &error);
+    auto base_owner = gufo::core::GgufReader::OpenFile(argv[1], &error);
     Expect(base_owner != nullptr, error);
-    auto dflash_owner = strix::core::GgufReader::OpenFile(argv[2], &error);
+    auto dflash_owner = gufo::core::GgufReader::OpenFile(argv[2], &error);
     Expect(dflash_owner != nullptr, error);
 
-    std::shared_ptr<const strix::core::GgufReader> base_reader(
+    std::shared_ptr<const gufo::core::GgufReader> base_reader(
         std::move(base_owner));
-    std::shared_ptr<const strix::core::GgufReader> dflash_reader(
+    std::shared_ptr<const gufo::core::GgufReader> dflash_reader(
         std::move(dflash_owner));
 
     auto target_model =
-        strix::hip::QwenGpuModel::CreateFromGguf(base_reader, &error);
+        gufo::hip::QwenGpuModel::CreateFromGguf(base_reader, &error);
     Expect(target_model != nullptr, error);
 
-    auto dflash_model = strix::hip::QwenDFlashGpuModel::Create(
+    auto dflash_model = gufo::hip::QwenDFlashGpuModel::Create(
         dflash_reader, target_model, &error);
     Expect(dflash_model != nullptr, error);
 
-    strix::hip::QwenDFlashGpuDraftConfig config{
+    gufo::hip::QwenDFlashGpuDraftConfig config{
         .max_context = 512,
         .max_draft_tokens = 8,
     };
-    auto backend = strix::hip::QwenDFlashGpuDraftBackend::Create(
-        dflash_model, config, &error);
+    auto backend = gufo::hip::QwenDFlashGpuDraftBackend::Create(dflash_model,
+                                                                config, &error);
     Expect(backend != nullptr, error);
 
     Expect(backend->RequiresTargetHiddenStates(), "RequiresTargetHiddenStates");

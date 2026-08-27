@@ -1,11 +1,11 @@
-// Copyright (C) 2026 Strix Engine contributors
+// Copyright (C) 2026 Gufo Engine contributors
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // CPU-side W4A8 SHQ4-T16 packing and reference tests for the Qwen3.8-27B MTP
 // family (issue #35).
 //
 // CPU oracle gates (no XRT required):
-//   - BF16 RNE ties-to-even rounding (matches tools/strix/shq.py)
+//   - BF16 RNE ties-to-even rounding (matches tools/gufo/shq.py)
 //   - exhaustive uint4 nibble decode and record round trip
 //   - SHQ4 U4Z and S4 plane -> AIE weight-record transposition and semantics
 //   - Q4_K lossless record packing vs DotProductQ4_K oracle
@@ -33,7 +33,7 @@
 
 namespace {
 
-using namespace strix::xdna2::w4a8;
+using namespace gufo::xdna2::w4a8;
 
 void Expect(bool condition, std::string_view message) {
   if (!condition) {
@@ -53,7 +53,7 @@ void ExpectNear(float actual, float expected, float tolerance,
 }
 
 // ---------------------------------------------------------------------------
-// BF16 RNE rounding (datapoints from tools/strix/conformance.py)
+// BF16 RNE rounding (datapoints from tools/gufo/conformance.py)
 // ---------------------------------------------------------------------------
 
 void TestBf16Rne() {
@@ -508,7 +508,7 @@ void TestQ4kLosslessVsDotProduct() {
     for (std::uint32_t n_row = 0; n_row < n; ++n_row) {
       std::vector<float> dequant(k);
       for (std::uint32_t block = 0; block < blocks; ++block) {
-        strix::quant::DequantizeQ4_K(
+        gufo::quant::DequantizeQ4_K(
             bytes.data() + (static_cast<std::size_t>(n_row) * blocks + block) *
                                sizeof(BlockQ4KTest),
             dequant.data() + static_cast<std::size_t>(block) * kBlockElements,

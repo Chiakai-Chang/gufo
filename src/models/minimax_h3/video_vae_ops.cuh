@@ -1,12 +1,12 @@
-#ifndef STRIX_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_
-#define STRIX_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_
+#ifndef GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_
+#define GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_
 
 #include <hip/hip_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
 
-namespace strix::minimax_h3::video_vae_ops {
+namespace gufo::minimax_h3::video_vae_ops {
 
 static __global__ void AddBiasKernel(float* values, const float* bias,
                                      std::uint32_t rows, std::uint32_t width) {
@@ -551,6 +551,6 @@ inline void LaunchUnpackRgb(const float* projected, const std::int32_t* frames,
                      frame_count, tile_height, tile_width, output_frames);
 }
 
-}  // namespace strix::minimax_h3::video_vae_ops
+}  // namespace gufo::minimax_h3::video_vae_ops
 
-#endif  // STRIX_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_
+#endif  // GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_

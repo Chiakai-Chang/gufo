@@ -16,10 +16,10 @@
 
 #include "src/models/qwen3_tts/json.hpp"
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 namespace {
 
-namespace json = strix::models::qwen3_tts::json;
+namespace json = gufo::models::qwen3_tts::json;
 
 /// RAII mmap holder; moved into LoadResult::mappings.
 class MappedFile {
@@ -230,4 +230,4 @@ bool LooksLikeQwen3Tts(const std::string& model_dir) {
   return config.has_value() && IsSupportedModelConfig(*config);
 }
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts

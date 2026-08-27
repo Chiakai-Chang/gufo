@@ -1,5 +1,5 @@
 {
-  "schema": "strix.eval-provenance.v1",
+  "schema": "gufo.eval-provenance.v1",
   "suites": {
     "gpqa": {
       "name": "GPQA Diamond (25 curated items)",

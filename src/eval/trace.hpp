@@ -1,11 +1,11 @@
-#ifndef STRIX_EVAL_TRACE_HPP_
-#define STRIX_EVAL_TRACE_HPP_
+#ifndef GUFO_EVAL_TRACE_HPP_
+#define GUFO_EVAL_TRACE_HPP_
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace strix::eval {
+namespace gufo::eval {
 
 struct EvalCaseTrace {
   std::string case_id;
@@ -24,6 +24,6 @@ struct EvalTraceReport {
   std::vector<EvalCaseTrace> cases;
 };
 
-}  // namespace strix::eval
+}  // namespace gufo::eval
 
-#endif  // STRIX_EVAL_TRACE_HPP_
+#endif  // GUFO_EVAL_TRACE_HPP_

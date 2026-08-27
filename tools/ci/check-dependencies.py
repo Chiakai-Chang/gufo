@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-check-dependencies.py — Third-party dependency inventory consistency checker for Strix-Halo.cpp
+check-dependencies.py — Third-party dependency inventory consistency checker for gufo
 
 Validates that:
 1. Every shipped/linked runtime dependency in Nix/CMake is documented in THIRD_PARTY_NOTICES.md and NOTICE.

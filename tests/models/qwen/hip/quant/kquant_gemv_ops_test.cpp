@@ -34,7 +34,7 @@ void TestQ5KBlockGEMVEquivalence() {
   constexpr std::size_t K = 256;  // K % 256 == 0 required by the kernel
   constexpr std::size_t num_blocks = K / QK;
 
-  using Q5KBlockTest = strix::quant::block_q5_K;
+  using Q5KBlockTest = gufo::quant::block_q5_K;
   static_assert(sizeof(Q5KBlockTest) == 176, "Q5_K block must be 176 bytes");
 
   auto float_to_half_bits = [](float f) -> std::uint16_t {
@@ -93,8 +93,8 @@ void TestQ5KBlockGEMVEquivalence() {
   HIP_CHECK(
       hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
 
-  strix::hip::LaunchQ8KBlockGEMV(d_A, strix::core::GgmlType::kQ5_K, d_x, d_y, M,
-                                 K, nullptr);
+  gufo::hip::LaunchQ8KBlockGEMV(d_A, gufo::core::GgmlType::kQ5_K, d_x, d_y, M,
+                                K, nullptr);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<float> y_gpu(M);
@@ -104,7 +104,7 @@ void TestQ5KBlockGEMVEquivalence() {
   // CPU oracle: exact fp dequant + dot (no activation quantization).
   std::vector<float> y_ref(M, 0.0F);
   for (std::size_t m = 0; m < M; ++m) {
-    y_ref[m] = strix::quant::DotProductQ5_K(
+    y_ref[m] = gufo::quant::DotProductQ5_K(
         &h_A[m * num_blocks], std::span<const float>(h_x.data(), K), K);
   }
 
@@ -137,7 +137,7 @@ void TestQ6KBlockGEMVEquivalence() {
   constexpr std::size_t K = 256;  // K % 256 == 0 required by the kernel
   constexpr std::size_t num_blocks = K / QK;
 
-  using Q6KBlockTest = strix::quant::block_q6_K;
+  using Q6KBlockTest = gufo::quant::block_q6_K;
   static_assert(sizeof(Q6KBlockTest) == 210, "Q6_K block must be 210 bytes");
 
   auto float_to_half_bits = [](float f) -> std::uint16_t {
@@ -192,8 +192,8 @@ void TestQ6KBlockGEMVEquivalence() {
   HIP_CHECK(
       hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
 
-  strix::hip::LaunchQ8KBlockGEMV(d_A, strix::core::GgmlType::kQ6_K, d_x, d_y, M,
-                                 K, nullptr);
+  gufo::hip::LaunchQ8KBlockGEMV(d_A, gufo::core::GgmlType::kQ6_K, d_x, d_y, M,
+                                K, nullptr);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<float> y_gpu(M);
@@ -203,7 +203,7 @@ void TestQ6KBlockGEMVEquivalence() {
   // CPU oracle: exact fp dequant + dot (no activation quantization).
   std::vector<float> y_ref(M, 0.0F);
   for (std::size_t m = 0; m < M; ++m) {
-    y_ref[m] = strix::quant::DotProductQ6_K(
+    y_ref[m] = gufo::quant::DotProductQ6_K(
         &h_A[m * num_blocks], std::span<const float>(h_x.data(), K), K);
   }
 
@@ -235,9 +235,9 @@ void TestQ6KBlockGEMVEquivalence() {
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen K-quant GEMV ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen K-quant GEMV ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

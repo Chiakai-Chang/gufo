@@ -55,12 +55,12 @@ void TestFusedResidualAddRMSNormEquivalence() {
       hipMemcpy(d_w, h_w.data(), dim * sizeof(float), hipMemcpyHostToDevice));
 
   // Unfused reference chain.
-  strix::hip::LaunchResidualAdd(d_a, d_b, d_sum_ref, dim);
-  strix::hip::LaunchRMSNorm(d_sum_ref, d_w, d_out_ref, dim, 1e-6F);
+  gufo::hip::LaunchResidualAdd(d_a, d_b, d_sum_ref, dim);
+  gufo::hip::LaunchRMSNorm(d_sum_ref, d_w, d_out_ref, dim, 1e-6F);
 
   // Fused kernel.
-  strix::hip::LaunchFusedResidualAddRMSNorm(d_a, d_b, d_sum_fus, d_w, d_out_fus,
-                                            dim, 1e-6F);
+  gufo::hip::LaunchFusedResidualAddRMSNorm(d_a, d_b, d_sum_fus, d_w, d_out_fus,
+                                           dim, 1e-6F);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<float> res_sum_ref(dim), res_sum_fus(dim);
@@ -130,12 +130,12 @@ void TestBatchedFusedResidualAddRMSNormEquivalence() {
       hipMemcpy(d_w, h_w.data(), dim * sizeof(float), hipMemcpyHostToDevice));
 
   // Unfused reference chain.
-  strix::hip::LaunchBatchedResidualAdd(d_a, d_b, d_sum_ref, batch, dim);
-  strix::hip::LaunchBatchedRMSNorm(d_sum_ref, d_w, d_out_ref, d_out_bf16_ref,
-                                   batch, dim, 1e-6F);
+  gufo::hip::LaunchBatchedResidualAdd(d_a, d_b, d_sum_ref, batch, dim);
+  gufo::hip::LaunchBatchedRMSNorm(d_sum_ref, d_w, d_out_ref, d_out_bf16_ref,
+                                  batch, dim, 1e-6F);
 
   // Fused kernel.
-  strix::hip::LaunchBatchedFusedResidualAddRMSNorm(
+  gufo::hip::LaunchBatchedFusedResidualAddRMSNorm(
       d_a, d_b, d_sum_fus, d_w, d_out_fus, d_out_bf16_fus, batch, dim, 1e-6F);
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -196,7 +196,7 @@ void TestGEMVResidualEquivalence() {
   std::vector<float> h_x(K);
   std::vector<float> h_res(M);
   for (std::size_t i = 0; i < M * K; ++i) {
-    h_A[i] = strix::test::FloatToBf16Bits(
+    h_A[i] = gufo::test::FloatToBf16Bits(
         0.01F * std::sin(static_cast<float>(i) * 0.0007F));
   }
   for (std::size_t i = 0; i < K; ++i) {
@@ -221,10 +221,10 @@ void TestGEMVResidualEquivalence() {
   HIP_CHECK(
       hipMemcpy(d_res, h_res.data(), M * sizeof(float), hipMemcpyHostToDevice));
 
-  strix::hip::LaunchGEMV(d_A, strix::core::GgmlType::kBF16, d_x, d_y_ref, M, K);
-  strix::hip::LaunchResidualAdd(d_res, d_y_ref, d_y_ref, M);
-  strix::hip::LaunchGEMVResidual(d_A, strix::core::GgmlType::kBF16, d_x,
-                                 d_y_fus, d_res, M, K);
+  gufo::hip::LaunchGEMV(d_A, gufo::core::GgmlType::kBF16, d_x, d_y_ref, M, K);
+  gufo::hip::LaunchResidualAdd(d_res, d_y_ref, d_y_ref, M);
+  gufo::hip::LaunchGEMVResidual(d_A, gufo::core::GgmlType::kBF16, d_x, d_y_fus,
+                                d_res, M, K);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<float> ref(M);
@@ -282,11 +282,11 @@ void TestGEMVResidualEquivalence() {
   HIP_CHECK(hipMemcpy(d_res2, h_res2.data(), M2 * sizeof(float),
                       hipMemcpyHostToDevice));
 
-  strix::hip::LaunchGEMV(d_A2, strix::core::GgmlType::kF32, d_x2, d_y_ref2, M2,
-                         K2);
-  strix::hip::LaunchResidualAdd(d_res2, d_y_ref2, d_y_ref2, M2);
-  strix::hip::LaunchGEMVResidual(d_A2, strix::core::GgmlType::kF32, d_x2,
-                                 d_y_fus2, d_res2, M2, K2);
+  gufo::hip::LaunchGEMV(d_A2, gufo::core::GgmlType::kF32, d_x2, d_y_ref2, M2,
+                        K2);
+  gufo::hip::LaunchResidualAdd(d_res2, d_y_ref2, d_y_ref2, M2);
+  gufo::hip::LaunchGEMVResidual(d_A2, gufo::core::GgmlType::kF32, d_x2,
+                                d_y_fus2, d_res2, M2, K2);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<float> ref2(M2);
@@ -320,9 +320,9 @@ void TestGEMVResidualEquivalence() {
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen FFN residual ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen FFN residual ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

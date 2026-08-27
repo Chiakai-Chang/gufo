@@ -9,11 +9,11 @@
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/core/hip/hip_utils.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 bool IsSsmReplayEnabled() noexcept {
-  const char* value = std::getenv("STRIX_DISABLE_SSM_REPLAY");
+  const char* value = std::getenv("GUFO_DISABLE_SSM_REPLAY");
   if (value == nullptr) {
     return true;
   }
@@ -274,5 +274,5 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::GenerateFromPrefix(
   return output_tokens;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

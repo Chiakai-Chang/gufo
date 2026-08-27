@@ -34,8 +34,8 @@ The focused AudioVAE residency case covers 605,306,340 tensor bytes plus two
 16 MiB arenas.
 
 ```sh
-STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
-STRIX_H3_SOURCE_MANIFEST=src/models/minimax_h3/\
+GUFO_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+GUFO_H3_SOURCE_MANIFEST=src/models/minimax_h3/\
 MINIMAX_H3_FL2VA_BF16.source-manifest.json \
 ./build-h3-166-hip/minimax_h3_runtime_hip_test
 ```
@@ -378,7 +378,7 @@ Alternative attention solution indices and a register-cached softmax were
 measured once and removed because their different F32 reduction order failed
 the frozen output gate. Performance alone does not admit them.
 
-`tools/strix/h3_cache_control.py` provides the separate reproducible
+`tools/gufo/h3_cache_control.py` provides the separate reproducible
 file-cache-cold preparation. It issues `POSIX_FADV_DONTNEED` for every regular,
 non-symlink file under the operator-supplied model root, using `O_NOFOLLOW` and
 the opened descriptor's size. It records attempted file/byte counts, errors,

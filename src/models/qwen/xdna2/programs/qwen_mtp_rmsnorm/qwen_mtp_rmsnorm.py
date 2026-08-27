@@ -1,4 +1,4 @@
-# Copyright (C) 2026 Strix Engine contributors
+# Copyright (C) 2026 Gufo Engine contributors
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 
 """Build the Qwen3.8 MTP hidden-width RMSNorm program for XDNA2."""

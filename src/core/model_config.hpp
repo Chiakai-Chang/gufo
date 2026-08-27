@@ -1,11 +1,11 @@
-#ifndef STRIX_CORE_MODEL_CONFIG_HPP_
-#define STRIX_CORE_MODEL_CONFIG_HPP_
+#ifndef GUFO_CORE_MODEL_CONFIG_HPP_
+#define GUFO_CORE_MODEL_CONFIG_HPP_
 
 #include <cstdint>
 #include <string>
 #include <string_view>
 
-namespace strix::core {
+namespace gufo::core {
 
 /// Unified architectural configuration parsed dynamically from GGUF metadata or
 /// JSON.
@@ -67,6 +67,6 @@ struct ModelConfig {
   }
 };
 
-}  // namespace strix::core
+}  // namespace gufo::core
 
-#endif  // STRIX_CORE_MODEL_CONFIG_HPP_
+#endif  // GUFO_CORE_MODEL_CONFIG_HPP_

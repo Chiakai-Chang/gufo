@@ -8,7 +8,7 @@ Project track execution; this document defines ordering and exit criteria.
 
 ## Objective
 
-Build Strix-Halo.cpp incrementally from a deterministic, testable vertical slice.
+Build gufo incrementally from a deterministic, testable vertical slice.
 Do not begin with the complete server, continuous batching, and heterogeneous
 execution simultaneously.
 
@@ -89,14 +89,14 @@ docs/
 
 - A clean checkout configures and builds on the supported Strix Halo Linux
   environment.
-- A placeholder `strix --version` runs.
+- A placeholder `gufo --version` runs.
 - The PR test command succeeds from one documented entry point.
 
 ## Milestone 1: Hardware Diagnostics and Baselines
 
 ### Tasks
 
-1. Implement `strix diagnose`.
+1. Implement `gufo diagnose`.
 2. Record CPU, memory, GPU, NPU, driver, runtime, firmware, clock, and power
    information.
 3. Measure sustained CPU, GPU, and NPU-visible memory bandwidth.
@@ -207,9 +207,9 @@ complete model.
 5. Implement request-owned model and sampling state.
 6. Implement the capability evaluation drift gate, trace format, and offline
    regrade (EVAL.md).
-7. Implement `strix prompt` in direct greedy mode.
+7. Implement `gufo prompt` in direct greedy mode.
 8. Add exact-token fixtures comparing the native CLI with the pinned reference.
-9. Add sampling and `strix chat` only after the greedy slice passes.
+9. Add sampling and `gufo chat` only after the greedy slice passes.
 10. Add eager execution first; add HIP graphs only after correctness.
 
 Start with BF16 or SHQ8 where it simplifies bring-up, then introduce SHQ4
@@ -228,9 +228,9 @@ tensor by tensor. Do not debug every low-bit kernel simultaneously.
 
 ### Tasks
 
-1. Implement `strix-inspect`.
+1. Implement `gufo-inspect`.
 2. Implement deterministic imatrix and activation calibration.
-3. Implement `strix-plan-quant`.
+3. Implement `gufo-plan-quant`.
 4. Implement streaming, resumable SHQ4-T16, SHQ6-T16, and SHQ8-T16
    conversion.
 5. Implement mixed Q4/Q6/Q8/BF16 tensor selection.
@@ -424,8 +424,8 @@ Do not place the following on the critical path for the first production model:
 The first concrete issues should be opened in this order:
 
 1. Add the MIT license and repository skeleton.
-2. Create CMake presets and build `strix --version`.
-3. Implement `strix diagnose`.
+2. Create CMake presets and build `gufo --version`.
+3. Implement `gufo diagnose`.
 4. Add HIP and XRT smoke programs.
 5. Define tensor descriptors and checked byte arithmetic.
 6. Implement safetensors inspection.

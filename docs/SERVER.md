@@ -42,16 +42,16 @@ not be required to serve requests.
 
 ## Single Executable and Model Configuration
 
-The deployed product is one `strix` executable. Supported model graphs,
+The deployed product is one `gufo` executable. Supported model graphs,
 tokenizers, HIP kernels, and AIE programs are compiled into it.
 
 The executable provides subcommands rather than separate inference binaries:
 
 ```text
-strix serve
-strix chat
-strix prompt
-strix video
+gufo serve
+gufo chat
+gufo prompt
+gufo video
 ```
 
 `chat` and `prompt` are transport adapters over the same scheduler and may
@@ -71,7 +71,7 @@ continuous batching.
 ```sh
 nix build
 
-./result/bin/strix serve \
+./result/bin/gufo serve \
   --host 127.0.0.1 \
   --port 8080 \
   --sessions 1 \
@@ -89,9 +89,9 @@ Server-Timing: ttft;dur=<milliseconds>, inter_token;dur=<milliseconds>
 ```
 
 When `stream_options.include_usage` is enabled, the terminal Chat Completions
-usage chunk also includes a namespaced `usage.strix` object. It reports
+usage chunk also includes a namespaced `usage.gufo` object. It reports
 privacy-safe scheduler and stage metrics used by
-`tools/serving/strix-serving-bench.py`: queue, prefill, decode, TTFT and ITL timing;
+`tools/serving/gufo-serving-bench.py`: queue, prefill, decode, TTFT and ITL timing;
 actual prefill work; cache use; logical concurrency; physical execution width;
 and the executed plan. Prompts, generated text, local paths, request IDs, and
 token IDs are excluded.
@@ -109,14 +109,14 @@ memory_policy = "guaranteed"
 [[models]]
 alias = "qwen-current-27b"
 kind = "QWEN38_27B_TEXT"
-weights = "/models/qwen-current/strix-manifest.json"
+weights = "/models/qwen-current/gufo-manifest.json"
 enable_gpu = true
 enable_npu = true
 
 [[models]]
 alias = "deepseek-flash"
 kind = "DEEPSEEK_V4_FLASH"
-weights = "/models/deepseek-flash/strix-manifest.json"
+weights = "/models/deepseek-flash/gufo-manifest.json"
 enable_gpu = true
 enable_npu = true
 ```
@@ -137,7 +137,7 @@ Model artifacts cannot provide:
 - Tokenizer plugins.
 - Executable chat templates.
 
-Adding another model architecture requires rebuilding `strix`.
+Adding another model architecture requires rebuilding `gufo`.
 Changing weights for an already supported kind does not.
 
 ## Process and State Ownership
@@ -194,7 +194,7 @@ state. I/O threads never wait synchronously for device completion.
 | `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 
 The MiniMax H3 subset follows the asynchronous OpenAI-style video resource
-shape and is versioned independently as `strix.video-api.v1`. Its supported
+shape and is versioned independently as `gufo.video-api.v1`. Its supported
 fields, frozen presets, queue behavior, and deliberate conditioning
 omissions are documented in [MINIMAX_H3.md](MINIMAX_H3.md).
 Create requests accept both `application/json` and OpenAI-client-compatible
@@ -306,7 +306,7 @@ extension:
   "object": "model",
   "created": 0,
   "owned_by": "local",
-  "strix": {
+  "gufo": {
     "artifact_id": "qwen-27b-shq-t16-4p42bpw",
     "context_length": 131072,
     "quantization": "SHQ-T16",
@@ -330,7 +330,7 @@ qwen-27b-6.1bpw
 ```
 
 Aliases are configuration choices; compatibility depends on the immutable
-artifact ID returned in the `strix` metadata.
+artifact ID returned in the `gufo` metadata.
 
 ## Errors
 
@@ -376,7 +376,7 @@ terminated by a local reverse proxy, though native TLS may be added later.
 
 Prompt and generated text logging is disabled by default.
 
-Tool definitions and generated tool calls are treated as data. `strix`
+Tool definitions and generated tool calls are treated as data. `gufo`
 never executes tools, shell commands, URLs, or generated code.
 
 Browser access requires an explicit CORS origin allowlist. Do not enable a

@@ -24,17 +24,17 @@ SPECULATIVE_RE = re.compile(
     r"\s+verification_steps=(?P<steps>\d+)"
 )
 CONTROLLED_ENV = {
-    "STRIX_DFLASH_GEMM",
-    "STRIX_DFLASH_PREWARM",
-    "STRIX_DFLASH_SELECTOR",
-    "STRIX_PREFILL_SMALL_BATCH_BF16_FROM_LAYER",
-    "STRIX_PREFILL_SMALL_BATCH_BF16_TILE",
-    "STRIX_PREFILL_SMALL_BATCH_FP32_FROM_LAYER",
-    "STRIX_PREFILL_SMALL_BATCH_QUANT",
-    "STRIX_PREFILL_SMALL_BATCH_W8A8_TILE",
-    "STRIX_SPEC_BATCH_LM_HEAD",
-    "STRIX_SPEC_BATCH_VERIFY",
-    "STRIX_SPEC_BATCH_VERIFY_CHECK",
+    "GUFO_DFLASH_GEMM",
+    "GUFO_DFLASH_PREWARM",
+    "GUFO_DFLASH_SELECTOR",
+    "GUFO_PREFILL_SMALL_BATCH_BF16_FROM_LAYER",
+    "GUFO_PREFILL_SMALL_BATCH_BF16_TILE",
+    "GUFO_PREFILL_SMALL_BATCH_FP32_FROM_LAYER",
+    "GUFO_PREFILL_SMALL_BATCH_QUANT",
+    "GUFO_PREFILL_SMALL_BATCH_W8A8_TILE",
+    "GUFO_SPEC_BATCH_LM_HEAD",
+    "GUFO_SPEC_BATCH_VERIFY",
+    "GUFO_SPEC_BATCH_VERIFY_CHECK",
 }
 
 
@@ -43,21 +43,21 @@ def verification_environment(profile: str, backend: str) -> dict[str, str]:
     if profile == "production":
         return result
     if backend.startswith("dflash"):
-        result["STRIX_DFLASH_GEMM"] = "hipblaslt"
-        result["STRIX_DFLASH_PREWARM"] = "1"
+        result["GUFO_DFLASH_GEMM"] = "hipblaslt"
+        result["GUFO_DFLASH_PREWARM"] = "1"
     if profile == "sequential":
-        result["STRIX_SPEC_BATCH_VERIFY"] = "0"
+        result["GUFO_SPEC_BATCH_VERIFY"] = "0"
         return result
-    result["STRIX_SPEC_BATCH_VERIFY"] = "1"
-    result["STRIX_SPEC_BATCH_LM_HEAD"] = "1"
+    result["GUFO_SPEC_BATCH_VERIFY"] = "1"
+    result["GUFO_SPEC_BATCH_LM_HEAD"] = "1"
     if profile == "bf16":
-        result["STRIX_PREFILL_SMALL_BATCH_QUANT"] = "bf16"
+        result["GUFO_PREFILL_SMALL_BATCH_QUANT"] = "bf16"
     elif profile == "fp32":
-        result["STRIX_PREFILL_SMALL_BATCH_QUANT"] = "fp32"
+        result["GUFO_PREFILL_SMALL_BATCH_QUANT"] = "fp32"
     elif profile == "fp32-tail":
-        result["STRIX_PREFILL_SMALL_BATCH_FP32_FROM_LAYER"] = "62"
+        result["GUFO_PREFILL_SMALL_BATCH_FP32_FROM_LAYER"] = "62"
     elif profile == "w8a8":
-        result["STRIX_PREFILL_SMALL_BATCH_BF16_FROM_LAYER"] = "64"
+        result["GUFO_PREFILL_SMALL_BATCH_BF16_FROM_LAYER"] = "64"
     return result
 
 

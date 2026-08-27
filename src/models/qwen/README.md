@@ -1,7 +1,7 @@
 # Qwen model implementation
 
 This directory contains the Qwen mixed-attention model implementation used by
-Strix. It is not a generic implementation of every Qwen architecture: the main
+Gufo. It is not a generic implementation of every Qwen architecture: the main
 GGUF path expects a repeating mixture of full grouped-query attention and
 Gated DeltaNet/SSM layers, and the MTP path implements the separate single-layer
 Qwen3.8 draft graph.
@@ -205,12 +205,12 @@ environment variables are read by the current source:
 
 | Variable | Current meaning |
 |---|---|
-| `STRIX_DISPATCH_TELEMETRY` | Enables JSON-line dispatch events unless set to `0`, `false`, `OFF`, or `off`. Events include Qwen policy, per-layer route/rejection mask, graph eligibility, graph cache identity, attention, GEMV, and hipBLASLt data. |
-| `STRIX_ENABLE_HIP_GRAPH` | Graph capture is enabled by default; the same false spellings disable it. |
-| `STRIX_PROFILE` | Presence enables prefill timing output. It is diagnostic output, not a stable benchmark harness. |
-| `STRIX_DISABLE_SSM_REPLAY` | Presence with a value other than `0`, `false`, or `off` disables SSM replay. |
-| `STRIX_GPU_WEIGHT_MODE` | `mapped`, `copy`, or automatic GPU visibility selection. |
-| `STRIX_HIPBLASLT_PLAN_CACHE` | Path used by hipBLASLt plan persistence when its caller has not supplied one. |
+| `GUFO_DISPATCH_TELEMETRY` | Enables JSON-line dispatch events unless set to `0`, `false`, `OFF`, or `off`. Events include Qwen policy, per-layer route/rejection mask, graph eligibility, graph cache identity, attention, GEMV, and hipBLASLt data. |
+| `GUFO_ENABLE_HIP_GRAPH` | Graph capture is enabled by default; the same false spellings disable it. |
+| `GUFO_PROFILE` | Presence enables prefill timing output. It is diagnostic output, not a stable benchmark harness. |
+| `GUFO_DISABLE_SSM_REPLAY` | Presence with a value other than `0`, `false`, or `off` disables SSM replay. |
+| `GUFO_GPU_WEIGHT_MODE` | `mapped`, `copy`, or automatic GPU visibility selection. |
+| `GUFO_HIPBLASLT_PLAN_CACHE` | Path used by hipBLASLt plan persistence when its caller has not supplied one. |
 
 Record the policy fingerprint, resolved route fingerprints/rejections, graph
 identity, model/shape, device, and revision with experiment results. Numeric
@@ -384,7 +384,7 @@ Qwen production sources are registered explicitly from this directory's
 [`CMakeLists.txt`](CMakeLists.txt). Classic Qwen tests are registered from
 [`tests/models/qwen/CMakeLists.txt`](../../../tests/models/qwen/CMakeLists.txt).
 Do not add documentation to a source list and do not replace explicit lists with
-globbing. Public targets such as `strix_core` remain repository-owned even
+globbing. Public targets such as `gufo_core` remain repository-owned even
 though their Qwen sources are attached locally.
 
 The test layout, focused CTest names, labels, and integration limitations are
@@ -399,7 +399,7 @@ Use Nix for supported validation:
 ```sh
 git add <new-files>                    # Nix only sees tracked files
 nix build                              # optimized gfx1151 + XRT package
-./result/bin/strix                     # hardware probe
+./result/bin/gufo                     # hardware probe
 nix build .#checks.x86_64-linux.pr     # canonical PR gate
 ```
 
@@ -417,7 +417,7 @@ nix develop -c ctest --test-dir build/gpu-test \
 Run model quality and performance only with the optimized `nix build` binaries:
 
 ```sh
-./result/bin/strix-server bench --model <model.gguf> -p 128 -n 16 \
+./result/bin/gufo bench --model <model.gguf> -p 128 -n 16 \
   --validate-prefill 128
 ```
 
@@ -443,7 +443,7 @@ When adding or changing a route:
    tests, synthetic integration, graph smoke, real-model logits/tokens, then an
    optimized production-binary benchmark on Strix Halo.
 7. **Measure before claiming improvement.** Use interleaved A/B measurements;
-   debug-tree timings and one-off `STRIX_PROFILE` output are not performance
+   debug-tree timings and one-off `GUFO_PROFILE` output are not performance
    evidence.
 
 ## Known limitations and deferred work
@@ -467,5 +467,5 @@ When adding or changing a route:
   intentionally cohesive because they each own private cache/session or packed
   ABI state that must change together.
 - Model-local CMake registration improves ownership, but Qwen still attaches to
-  the shared `strix_core` target; finer object-library build boundaries are
+  the shared `gufo_core` target; finer object-library build boundaries are
   deferred.

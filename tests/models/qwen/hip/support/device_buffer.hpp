@@ -1,5 +1,5 @@
-#ifndef STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_BUFFER_HPP_
-#define STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_BUFFER_HPP_
+#ifndef GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_BUFFER_HPP_
+#define GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_BUFFER_HPP_
 
 #include <cstddef>
 #include <cstdlib>
@@ -12,7 +12,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 
-namespace strix::test {
+namespace gufo::test {
 
 /// Small move-only owner for test-only HIP allocations.
 template<typename T>
@@ -86,7 +86,7 @@ private:
   std::size_t size_{0};
 };
 
-}  // namespace strix::test
+}  // namespace gufo::test
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_BUFFER_HPP_
+#endif  // GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_BUFFER_HPP_

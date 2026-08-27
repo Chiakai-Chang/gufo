@@ -11,7 +11,7 @@
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void BatchedSwiGLUActivationKernel(
     const float* __restrict__ gate, const float* __restrict__ up,
@@ -152,5 +152,5 @@ void LaunchBatchedFusedSwiGLUGEMM(const void* gate_w, bool gate_is_bf16,
       static_cast<hip_bfloat16*>(out_bf16), batch_size, intermediate_size,
       hidden_size);
 }
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

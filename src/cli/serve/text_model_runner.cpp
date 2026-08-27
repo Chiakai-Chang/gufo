@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace strix::server {
+namespace gufo::server {
 namespace {
 
 struct ValidatedRunner {
@@ -463,4 +463,4 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
                                       std::move(prompt), is_cancelled));
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

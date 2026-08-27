@@ -4,7 +4,7 @@ Status: design draft, 2026-08-11
 
 ## Purpose
 
-Strix Engine is math-heavy, stateful, and hardware-specific. A change can
+Gufo Engine is math-heavy, stateful, and hardware-specific. A change can
 compile, launch, produce plausible text, and benchmark faster while still
 corrupting logits, KV state, routing decisions, or speculative commits.
 
@@ -27,7 +27,7 @@ Use precise names in reports:
   BF16, FP16, or FP32 storage type using the pinned reference runtime.
 - High-precision CPU oracle: an analytic implementation using FP32, FP64, or
   wider integer accumulation for small fixtures.
-- Canonical backend: the currently promoted Strix implementation for a given
+- Canonical backend: the currently promoted Gufo implementation for a given
   model artifact and execution route.
 - Candidate: the implementation or quantization under test.
 - Golden artifact: a retained output produced by an identified oracle.
@@ -63,7 +63,7 @@ Use the most independent practical oracle:
 
 1. Hand-checkable analytic or high-precision CPU implementation.
 2. Full-quality source checkpoint in a pinned external reference runtime.
-3. Existing promoted Strix implementation with the same arithmetic contract.
+3. Existing promoted Gufo implementation with the same arithmetic contract.
 4. Small committed golden fixture generated from one of the above.
 
 A new HIP or AIE kernel must not be its own oracle. Cross-device agreement is
@@ -213,7 +213,7 @@ Run on every change:
 
 - Manifest and schema validation.
 - Tensor name, dtype, shape, offset, alignment, and checksum checks.
-- Safetensors and Strix-container corruption rejection.
+- Safetensors and Gufo-container corruption rejection.
 - Unsupported layout and architecture rejection.
 - Deterministic model-kind and model-local dispatch resolution.
 
@@ -441,15 +441,15 @@ without violating correctness, quality, latency, memory, or fairness budgets.
 The initial command set should be:
 
 ```text
-strix-test-fixtures   Run CPU and small deterministic fixtures
-strix-test-kernel     Compare one HIP or AIE kernel with a CPU oracle
-strix-capture         Capture layer boundaries or full logits
-strix-compare         Compare exact, tolerant, or distribution artifacts
-strix-quality         Run teacher-forced logits, perplexity, and task suites
+gufo-test-fixtures   Run CPU and small deterministic fixtures
+gufo-test-kernel     Compare one HIP or AIE kernel with a CPU oracle
+gufo-capture         Capture layer boundaries or full logits
+gufo-compare         Compare exact, tolerant, or distribution artifacts
+gufo-quality         Run teacher-forced logits, perplexity, and task suites
                       (task suites defined in EVAL.md)
-strix-stress          Run concurrency, cancellation, and lifecycle tests
-strix bench    Produce correctness-linked performance artifacts
-strix-report          Validate JSON artifacts and render summaries
+gufo-stress          Run concurrency, cancellation, and lifecycle tests
+gufo bench    Produce correctness-linked performance artifacts
+gufo-report          Validate JSON artifacts and render summaries
 ```
 
 All utilities support machine-readable JSON output and return nonzero status
@@ -522,7 +522,7 @@ package hashes only production sources and builds with `BUILD_TESTING=OFF`;
 CTest compiles and runs from a separate test derivation.
 
 The production package remains a dependency of the PR gate. Its build and
-install checks execute `strix --version` and `--help`.
+install checks execute `gufo --version` and `--help`.
 
 ## Hardware Test Tiers
 

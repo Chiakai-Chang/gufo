@@ -15,21 +15,21 @@
 
 namespace {
 
-using strix::server::ChatRequest;
-using strix::server::TextDecodeSelection;
-using strix::server::TextExecutionPlan;
-using strix::server::TextExecutionPlanKind;
-using strix::server::TextModelRunner;
-using strix::server::TextPrefillStep;
-using strix::server::TextRunnerAdvance;
-using strix::server::TextRunnerCapabilities;
-using strix::server::TextRunnerDescriptor;
-using strix::server::TextRunnerMeasuredResources;
-using strix::server::TextRunnerPool;
-using strix::server::TextRunnerResourceClaim;
-using strix::server::TextRunnerSnapshot;
-using strix::server::TextRunnerState;
-using strix::server::TextRunnerToken;
+using gufo::server::ChatRequest;
+using gufo::server::TextDecodeSelection;
+using gufo::server::TextExecutionPlan;
+using gufo::server::TextExecutionPlanKind;
+using gufo::server::TextModelRunner;
+using gufo::server::TextPrefillStep;
+using gufo::server::TextRunnerAdvance;
+using gufo::server::TextRunnerCapabilities;
+using gufo::server::TextRunnerDescriptor;
+using gufo::server::TextRunnerMeasuredResources;
+using gufo::server::TextRunnerPool;
+using gufo::server::TextRunnerResourceClaim;
+using gufo::server::TextRunnerSnapshot;
+using gufo::server::TextRunnerState;
+using gufo::server::TextRunnerToken;
 
 void Expect(bool condition, std::string_view message) {
   if (!condition) {

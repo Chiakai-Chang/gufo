@@ -11,7 +11,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace strix::tokenization {
+namespace gufo::tokenization {
 
 namespace {
 
@@ -270,4 +270,4 @@ std::optional<std::vector<TokenId>> QwenChatTemplate::RenderAndTokenize(
   return tokenizer.Encode(*rendered, tok_opts);
 }
 
-}  // namespace strix::tokenization
+}  // namespace gufo::tokenization

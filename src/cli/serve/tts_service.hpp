@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_TTS_SERVICE_HPP_
-#define STRIX_SERVER_TTS_SERVICE_HPP_
+#ifndef GUFO_SERVER_TTS_SERVICE_HPP_
+#define GUFO_SERVER_TTS_SERVICE_HPP_
 
 #include <cstddef>
 #include <filesystem>
@@ -12,7 +12,7 @@
 #include "src/models/qwen3_tts/config.hpp"
 #include "src/models/qwen3_tts/synthesis.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 
 struct TtsServiceOptions {
   using Runner =
@@ -59,6 +59,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_TTS_SERVICE_HPP_
+#endif  // GUFO_SERVER_TTS_SERVICE_HPP_

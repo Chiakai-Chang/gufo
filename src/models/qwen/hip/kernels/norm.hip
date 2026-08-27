@@ -7,7 +7,7 @@
 
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void RMSNormKernel(const float* __restrict__ x,
                               const float* __restrict__ weight,
@@ -87,5 +87,5 @@ void LaunchPerHeadRMSNorm(const float* x, const float* weight, float* out,
   PerHeadRMSNormKernel<<<num_heads, 256, 0, stream>>>(x, weight, out, num_heads,
                                                       head_dim, eps);
 }
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

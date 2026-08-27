@@ -39,10 +39,10 @@ int main(int argc, char** argv) {
     return 77;
   }
 
-  strix::models::qwen3_tts::Tokenizer tokenizer;
+  gufo::models::qwen3_tts::Tokenizer tokenizer;
   std::string error;
   Check(
-      strix::models::qwen3_tts::Tokenizer::Load(model_root, &tokenizer, &error),
+      gufo::models::qwen3_tts::Tokenizer::Load(model_root, &tokenizer, &error),
       error);
   std::vector<std::uint32_t> ids;
   Check(tokenizer.EncodeAssistantPrompt(kText, &ids, &error), error);

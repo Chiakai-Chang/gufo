@@ -134,20 +134,20 @@ changes.
 ```sh
 MODEL=models/<model>/<artifact>.gguf
 
-./result/bin/strix bench \
+./result/bin/gufo bench \
   --model "$MODEL" \
   --n-prompt 128,512,1024,2048,4096 \
   --n-gen 0 \
   --repetitions 3
 
-./result/bin/strix bench \
+./result/bin/gufo bench \
   --model "$MODEL" \
   --n-prompt 2048 \
   --n-gen 128 \
   --n-depth 4096,8192,12288,16384 \
   --repetitions 1
 
-./result/bin/strix bench \
+./result/bin/gufo bench \
   --model "$MODEL" \
   --validate-prefill 1024 \
   --n-prompt 1024 \
@@ -166,7 +166,7 @@ largest requested concurrency:
 ```sh
 MODEL=models/<model>/<artifact>.gguf
 
-./result/bin/strix serve \
+./result/bin/gufo serve \
   --host 127.0.0.1 \
   --port 8080 \
   --sessions 4 \
@@ -178,7 +178,7 @@ MODEL=models/<model>/<artifact>.gguf
 In another shell, run the canonical C=1/C=2/C=4 harness:
 
 ```sh
-tools/serving/strix-serving-bench.py \
+tools/serving/gufo-serving-bench.py \
   --base-url http://127.0.0.1:8080 \
   --concurrency 1,2,4 \
   --warmup 1 \
@@ -186,7 +186,7 @@ tools/serving/strix-serving-bench.py \
   --max-tokens 128 \
   --output artifacts/serving/benchmark.json
 
-./result/bin/strix diagnose \
+./result/bin/gufo diagnose \
   --validate-artifact artifacts/serving/benchmark.json
 ```
 
@@ -206,7 +206,7 @@ The report keeps these metrics separate:
 
 Raw per-request samples and p50/p95/p99 summaries are retained. Endpoint hosts,
 prompt text, generated text, model paths, timestamps, and token IDs are never
-written to the artifact. `strix bench` remains the direct model-path
+written to the artifact. `gufo bench` remains the direct model-path
 microbenchmark; use this serving harness for TTFT, ITL, queueing, and
 concurrency decisions.
 
@@ -215,9 +215,9 @@ concurrency decisions.
 List cases, then run the smallest relevant matrix:
 
 ```sh
-./result/bin/strix-kernel-bench --list
+./result/bin/gufo-kernel-bench --list
 
-./result/bin/strix-kernel-bench \
+./result/bin/gufo-kernel-bench \
   --case decode-attention \
   --context 4096,8192,12288,16384 \
   --warmup 5 \
@@ -283,7 +283,7 @@ busy, and what changed between two runs.
 ```sh
 # profile a command and analyze in one step
 nix develop -c python3 tools/prof/prof.py run --stages qwen -- \
-  ./result/bin/strix bench --model "$MODEL" -p 2048 -n 0 -r 1
+  ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 0 -r 1
 
 # re-analyze an existing database
 nix develop -c python3 tools/prof/prof.py show /tmp/prof/prof_results.db --top 20
@@ -308,8 +308,8 @@ nix develop -c rocprofv3 \
   --scratch-memory-trace \
   --stats \
   --summary \
-  --output-directory /tmp/strix-profile \
-  -- ./result/bin/strix-kernel-bench \
+  --output-directory /tmp/gufo-profile \
+  -- ./result/bin/gufo-kernel-bench \
     --case decode-attention \
     --context 16384 \
     --warmup 1 \
@@ -342,12 +342,12 @@ microbenchmark before acting on the mix.
 
 ```sh
 ./result/bin/tune_hipblaslt \
-  --out /tmp/strix-hipblaslt-plans.bin \
+  --out /tmp/gufo-hipblaslt-plans.bin \
   --warmup 3 \
   --repetitions 10
 
-STRIX_HIPBLASLT_PLAN_CACHE=/tmp/strix-hipblaslt-plans.bin \
-  ./result/bin/strix bench ...
+GUFO_HIPBLASLT_PLAN_CACHE=/tmp/gufo-hipblaslt-plans.bin \
+  ./result/bin/gufo bench ...
 
 ./result/bin/benchmark_ssm_replay \
   --model "$MODEL" \
@@ -360,7 +360,7 @@ Generated profiler, plan, and replay artifacts stay outside the repository.
 ### Dispatch telemetry
 
 ```sh
-STRIX_DISPATCH_TELEMETRY=1 ./result/bin/strix-kernel-bench ...
+GUFO_DISPATCH_TELEMETRY=1 ./result/bin/gufo-kernel-bench ...
 ```
 
 Telemetry is diagnostic JSONL. It records semantic dispatch decisions and

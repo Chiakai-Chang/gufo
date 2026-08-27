@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_KERNELS_DFLASH_KERNELS_HPP_
-#define STRIX_MODELS_QWEN_HIP_KERNELS_DFLASH_KERNELS_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_KERNELS_DFLASH_KERNELS_HPP_
+#define GUFO_MODELS_QWEN_HIP_KERNELS_DFLASH_KERNELS_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-namespace strix::hip::kernels {
+namespace gufo::hip::kernels {
 
 void LaunchDFlashRMSNorm(const float* input, const float* weight, float* output,
                          std::uint32_t dim, float eps, hipStream_t stream);
@@ -40,7 +40,7 @@ void LaunchDFlashSelectorStep(
     std::uint32_t vocab_size, std::uint32_t selector_rank,
     std::uint32_t selector_top_k, hipStream_t stream);
 
-}  // namespace strix::hip::kernels
+}  // namespace gufo::hip::kernels
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_KERNELS_DFLASH_KERNELS_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_KERNELS_DFLASH_KERNELS_HPP_

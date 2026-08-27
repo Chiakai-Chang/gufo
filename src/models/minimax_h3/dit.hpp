@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_MINIMAX_H3_DIT_HPP_
-#define STRIX_MODELS_MINIMAX_H3_DIT_HPP_
+#ifndef GUFO_MODELS_MINIMAX_H3_DIT_HPP_
+#define GUFO_MODELS_MINIMAX_H3_DIT_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +10,7 @@
 
 #include "src/models/minimax_h3/runtime.hpp"
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 
 inline constexpr std::size_t kDitBlocks = 50;
 inline constexpr std::size_t kDitHiddenSize = 5376;
@@ -161,6 +161,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3
 
-#endif  // STRIX_MODELS_MINIMAX_H3_DIT_HPP_
+#endif  // GUFO_MODELS_MINIMAX_H3_DIT_HPP_

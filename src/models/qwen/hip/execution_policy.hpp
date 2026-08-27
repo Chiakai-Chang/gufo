@@ -1,9 +1,9 @@
-#ifndef STRIX_MODELS_QWEN_HIP_EXECUTION_POLICY_HPP_
-#define STRIX_MODELS_QWEN_HIP_EXECUTION_POLICY_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_EXECUTION_POLICY_HPP_
+#define GUFO_MODELS_QWEN_HIP_EXECUTION_POLICY_HPP_
 
 #include <cstdint>
 
-namespace strix::hip {
+namespace gufo::hip {
 
 /// Immutable route policy for one Qwen GPU executor. Resolve this before HIP
 /// graph capture and create a separate executor for each A/B candidate.
@@ -218,6 +218,6 @@ constexpr QwenGraphRejection& operator|=(QwenGraphRejection& lhs,
   return rejected;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 
-#endif  // STRIX_MODELS_QWEN_HIP_EXECUTION_POLICY_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_EXECUTION_POLICY_HPP_

@@ -10,7 +10,7 @@
 #include <sstream>
 #include <vector>
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 namespace {
 
@@ -328,4 +328,4 @@ BandwidthReport RunBandwidthBenchmark(const BandwidthOptions& options,
   return report;
 }
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics

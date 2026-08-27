@@ -11,7 +11,7 @@
 #include <unordered_set>
 #include <utility>
 
-namespace strix::hip::detail {
+namespace gufo::hip::detail {
 namespace {
 
 constexpr std::array<char, 8> kMagic = {'S', 'T', 'R', 'I',
@@ -319,4 +319,4 @@ const HipblasLtPlanRecord* FindHipblasLtPlanRecord(
   return found == database.records.end() ? nullptr : &*found;
 }
 
-}  // namespace strix::hip::detail
+}  // namespace gufo::hip::detail

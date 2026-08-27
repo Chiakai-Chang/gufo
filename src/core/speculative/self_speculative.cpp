@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 SelfSpeculativeBackend::SelfSpeculativeBackend(SelfSpeculativeConfig config)
     : config_(config) {}
@@ -79,4 +79,4 @@ void SelfSpeculativeBackend::AcceptFeedback(
   history_.push_back(correction_token);
 }
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative

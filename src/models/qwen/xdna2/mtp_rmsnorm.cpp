@@ -18,7 +18,7 @@
 #include "src/core/diagnostics/fingerprint.h"
 
 #ifdef ENGINE_ENABLE_XRT
-#include <strix/aie_qwen_mtp_rmsnorm_manifest.h>
+#include <gufo/aie_qwen_mtp_rmsnorm_manifest.h>
 #include <xrt/experimental/xrt_elf.h>
 #include <xrt/experimental/xrt_ext.h>
 #include <xrt/experimental/xrt_module.h>
@@ -28,7 +28,7 @@
 #include <xrt/xrt_kernel.h>
 #endif
 
-namespace strix::xdna2 {
+namespace gufo::xdna2 {
 
 namespace {
 
@@ -55,8 +55,8 @@ void ClearFailure(QwenMtpRmsNormFailure* failure) {
 #ifdef ENGINE_ENABLE_XRT
 
 std::filesystem::path DefaultProgramDir() {
-#ifdef STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
-  return STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR;
+#ifdef GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
+  return GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR;
 #else
   return {};
 #endif
@@ -429,4 +429,4 @@ bool QwenMtpRmsNormSession::Run(std::span<const std::uint16_t> input_bf16,
 #endif
 }
 
-}  // namespace strix::xdna2
+}  // namespace gufo::xdna2

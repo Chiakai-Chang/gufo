@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_MINIMAX_H3_GENERATION_HPP_
-#define STRIX_MODELS_MINIMAX_H3_GENERATION_HPP_
+#ifndef GUFO_MODELS_MINIMAX_H3_GENERATION_HPP_
+#define GUFO_MODELS_MINIMAX_H3_GENERATION_HPP_
 
 #include <cstdint>
 #include <filesystem>
@@ -16,10 +16,10 @@
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/video_vae.hpp"
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 
 inline constexpr std::string_view kH3GenerationSchema =
-    "strix.minimax-h3-text-generation.v1";
+    "gufo.minimax-h3-text-generation.v1";
 
 struct GenerationParameters {
   std::string preset;
@@ -99,6 +99,6 @@ using GenerationProgress = void (*)(std::string_view phase, int completed,
 [[nodiscard]] std::string GenerationTelemetryJson(
     const GenerationTelemetry& telemetry);
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3
 
-#endif  // STRIX_MODELS_MINIMAX_H3_GENERATION_HPP_
+#endif  // GUFO_MODELS_MINIMAX_H3_GENERATION_HPP_

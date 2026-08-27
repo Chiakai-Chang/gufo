@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_DEEPSEEK_V4_FLASH_ROCM_RESIDENT_API_H_
-#define STRIX_MODELS_DEEPSEEK_V4_FLASH_ROCM_RESIDENT_API_H_
+#ifndef GUFO_MODELS_DEEPSEEK_V4_FLASH_ROCM_RESIDENT_API_H_
+#define GUFO_MODELS_DEEPSEEK_V4_FLASH_ROCM_RESIDENT_API_H_
 
 #include <cstdint>
 
@@ -89,4 +89,4 @@ int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *da
 }  // extern "C"
 #endif
 
-#endif  // STRIX_MODELS_DEEPSEEK_V4_FLASH_ROCM_RESIDENT_API_H_
+#endif  // GUFO_MODELS_DEEPSEEK_V4_FLASH_ROCM_RESIDENT_API_H_

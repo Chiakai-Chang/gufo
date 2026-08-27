@@ -1,12 +1,12 @@
-#ifndef STRIX_CORE_DIAGNOSTICS_ARTIFACT_VALIDATOR_H_
-#define STRIX_CORE_DIAGNOSTICS_ARTIFACT_VALIDATOR_H_
+#ifndef GUFO_CORE_DIAGNOSTICS_ARTIFACT_VALIDATOR_H_
+#define GUFO_CORE_DIAGNOSTICS_ARTIFACT_VALIDATOR_H_
 
 #include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 struct ValidationResult {
   bool is_valid{true};
@@ -25,6 +25,6 @@ struct ValidationResult {
 [[nodiscard]] ValidationResult ValidateArtifactFile(
     const std::filesystem::path& file_path);
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics
 
-#endif  // STRIX_CORE_DIAGNOSTICS_ARTIFACT_VALIDATOR_H_
+#endif  // GUFO_CORE_DIAGNOSTICS_ARTIFACT_VALIDATOR_H_

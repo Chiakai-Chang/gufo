@@ -20,7 +20,7 @@
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 template<typename T>
@@ -29,19 +29,19 @@ void AllocateBuffer(T*& pointer, std::size_t elements) {
 }
 
 [[nodiscard]] bool DFlashDebugEnabled() noexcept {
-  static const bool enabled = std::getenv("STRIX_DFLASH_DEBUG") != nullptr;
+  static const bool enabled = std::getenv("GUFO_DFLASH_DEBUG") != nullptr;
   return enabled;
 }
 
 [[nodiscard]] bool DFlashTraceEnabled() noexcept {
   static const bool enabled =
-      DFlashDebugEnabled() || std::getenv("STRIX_DFLASH_TRACE") != nullptr;
+      DFlashDebugEnabled() || std::getenv("GUFO_DFLASH_TRACE") != nullptr;
   return enabled;
 }
 
 [[nodiscard]] bool DFlashPrewarmEnabled() noexcept {
   static const bool enabled = [] {
-    const char* value = std::getenv("STRIX_DFLASH_PREWARM");
+    const char* value = std::getenv("GUFO_DFLASH_PREWARM");
     if (value == nullptr) {
       return true;
     }
@@ -59,7 +59,7 @@ enum class DFlashGemmMode {
 
 [[nodiscard]] DFlashGemmMode GetDFlashGemmMode() noexcept {
   static const DFlashGemmMode mode = [] {
-    const char* value = std::getenv("STRIX_DFLASH_GEMM");
+    const char* value = std::getenv("GUFO_DFLASH_GEMM");
     if (value == nullptr) {
       return DFlashGemmMode::kHipblasLt;
     }
@@ -725,5 +725,5 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   return tokens;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

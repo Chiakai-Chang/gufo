@@ -8,14 +8,14 @@
 
 namespace {
 
-using strix::core::GgmlType;
-using strix::models::qwen::DescribeQwenGemmFormat;
-using strix::models::qwen::QwenGemmCapabilities;
-using strix::models::qwen::QwenGemmMode;
-using strix::models::qwen::QwenGemmRejection;
-using strix::models::qwen::QwenGemmRequest;
-using strix::models::qwen::QwenGemmRoute;
-using strix::models::qwen::ResolveQwenGemmRoute;
+using gufo::core::GgmlType;
+using gufo::models::qwen::DescribeQwenGemmFormat;
+using gufo::models::qwen::QwenGemmCapabilities;
+using gufo::models::qwen::QwenGemmMode;
+using gufo::models::qwen::QwenGemmRejection;
+using gufo::models::qwen::QwenGemmRequest;
+using gufo::models::qwen::QwenGemmRoute;
+using gufo::models::qwen::ResolveQwenGemmRoute;
 
 void Check(bool condition, const char* message) {
   if (!condition) {

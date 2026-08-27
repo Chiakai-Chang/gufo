@@ -18,15 +18,15 @@
 #include "src/cli/arg_parser.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
-#ifndef STRIX_H3_SOURCE_MANIFEST
-#define STRIX_H3_SOURCE_MANIFEST \
-  "share/strix/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+#ifndef GUFO_H3_SOURCE_MANIFEST
+#define GUFO_H3_SOURCE_MANIFEST \
+  "share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
 #endif
-#ifndef STRIX_H3_INSTALLED_SOURCE_MANIFEST
-#define STRIX_H3_INSTALLED_SOURCE_MANIFEST STRIX_H3_SOURCE_MANIFEST
+#ifndef GUFO_H3_INSTALLED_SOURCE_MANIFEST
+#define GUFO_H3_INSTALLED_SOURCE_MANIFEST GUFO_H3_SOURCE_MANIFEST
 #endif
 
-namespace strix::cli {
+namespace gufo::cli {
 
 void PrintVideoHelp(std::string_view program_name) {
   std::filesystem::path model_dir;
@@ -52,7 +52,7 @@ void PrintVideoHelp(std::string_view program_name) {
   std::filesystem::path report_path;
   bool profile = false;
 
-  strix::cli::ArgParser parser(
+  gufo::cli::ArgParser parser(
       std::string(program_name) + " video [OPTIONS] <PROMPT>",
       "Generate MiniMax H3 text-to-video on a Strix Halo gfx1151 GPU.\n"
       "There is no CPU inference fallback and weights are never downloaded.");
@@ -210,7 +210,7 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
                         filesystem_error.message());
     return false;
   }
-  const std::filesystem::path partial = path.string() + ".strix-partial-" +
+  const std::filesystem::path partial = path.string() + ".gufo-partial-" +
                                         std::to_string(getpid()) + "-" +
                                         std::to_string(NextReportNonce());
   {
@@ -258,12 +258,12 @@ void PrintProgress(std::string_view phase, int completed, int total,
 }  // namespace
 
 std::filesystem::path DefaultH3SourceManifest() {
-  std::filesystem::path build_path = STRIX_H3_SOURCE_MANIFEST;
+  std::filesystem::path build_path = GUFO_H3_SOURCE_MANIFEST;
   std::error_code error;
   if (std::filesystem::is_regular_file(build_path, error)) {
     return build_path;
   }
-  return STRIX_H3_INSTALLED_SOURCE_MANIFEST;
+  return GUFO_H3_INSTALLED_SOURCE_MANIFEST;
 }
 
 std::optional<VideoCliOptions> ParseVideoOptions(
@@ -471,11 +471,11 @@ int RunVideo(std::span<const char* const> args) {
   auto options = ParseVideoOptions(args, &error);
   if (!options.has_value()) {
     if (help && error.empty()) {
-      PrintVideoHelp("strix-server");
+      PrintVideoHelp("gufo");
       return 0;
     }
     std::cerr << "Error: " << error << '\n';
-    PrintVideoHelp("strix-server");
+    PrintVideoHelp("gufo");
     return 2;
   }
   if (!WriteAtomic(options->parameters_path,
@@ -526,4 +526,4 @@ int RunVideo(std::span<const char* const> args) {
   return 0;
 }
 
-}  // namespace strix::cli
+}  // namespace gufo::cli

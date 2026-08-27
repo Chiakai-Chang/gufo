@@ -6,7 +6,7 @@
 #include <vector>
 
 void TestQwenSsmConvRecurrence() {
-  strix::core::ModelConfig config;
+  gufo::core::ModelConfig config;
   config.num_layers = 64;
   config.hidden_size = 5120;
   config.intermediate_size = 17408;
@@ -25,9 +25,9 @@ void TestQwenSsmConvRecurrence() {
   const std::uint32_t key_dim = config.ssm_state_size;
   const std::uint32_t val_dim = config.SsmValueSize();
 
-  strix::models::QwenSsmCache cache(num_layers, conv_channels,
-                                    config.ssm_conv_kernel, num_heads, key_dim,
-                                    val_dim);
+  gufo::models::QwenSsmCache cache(num_layers, conv_channels,
+                                   config.ssm_conv_kernel, num_heads, key_dim,
+                                   val_dim);
 
   // Check state sizes
   auto conv = cache.GetConvState(0);
@@ -40,7 +40,7 @@ void TestQwenSsmConvRecurrence() {
   assert(deltanet[0] == 0.0F);
 
   // Create dummy layer
-  strix::models::QwenLayerWeights layer;
+  gufo::models::QwenLayerWeights layer;
   layer.is_full_attention = false;
 
   std::vector<float> in(config.hidden_size, 0.1F);
@@ -49,8 +49,8 @@ void TestQwenSsmConvRecurrence() {
   std::vector<float> out_buf(config.ssm_inner_size, 0.0F);
   std::vector<float> out(config.hidden_size, 0.0F);
 
-  strix::models::ForwardSSM(in, layer, config, cache, 0, qkv_buf, gate_buf,
-                            out_buf, out);
+  gufo::models::ForwardSSM(in, layer, config, cache, 0, qkv_buf, gate_buf,
+                           out_buf, out);
 
   // After 1 step, cache is updated
   assert(cache.GetConvState(0).size() ==

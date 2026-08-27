@@ -1,9 +1,9 @@
-# Qwen3-TTS 12Hz 1.7B — strix port
+# Qwen3-TTS 12Hz 1.7B — gufo port
 
 Status: **IMPLEMENTED** — CustomVoice, VoiceDesign, and Base.
 
 A model-private HIP implementation of the Qwen3-TTS 12 Hz 1.7B family for
-gfx1151. `strix-server` serves every request from this implementation; the
+gfx1151. `gufo serve` serves every request from this implementation; the
 upstream Python package is used only offline, as the oracle the tests compare
 against. Decode runs at `31.0` ms per codec frame, or `2.55x` faster than
 playback, with the talker projections at 98% of the measured DRAM roofline.
@@ -239,8 +239,8 @@ Runtime switches, all defaulting off or to the fast path:
 
 | Variable | Effect |
 |---|---|
-| `STRIX_QWEN3_TTS_WEIGHT_MODE=mapped` | memory-map decoder weights instead of copying them |
-| `STRIX_QWEN3_TTS_PRECOMPUTE_SNAKE=1` | precompute SnakeBeta exponents (measured slower) |
+| `GUFO_QWEN3_TTS_WEIGHT_MODE=mapped` | memory-map decoder weights instead of copying them |
+| `GUFO_QWEN3_TTS_PRECOMPUTE_SNAKE=1` | precompute SnakeBeta exponents (measured slower) |
 
 ## Appendix
 

@@ -157,7 +157,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
 
   // Reference: the tiled kernel, which also packs the FP16 cache.
   HIP_CHECK(hipMemset(d_out_ref, 0, q_elements * sizeof(float)));
-  if (!strix::hip::LaunchBatchedAttentionTile(
+  if (!gufo::hip::LaunchBatchedAttentionTile(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
           d_out_ref, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
           kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_ref, 0, false)) {
@@ -168,7 +168,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
   // Candidate: the WMMA kernel over the same range. The cache is already
   // packed, so suppress the write and prove it reads the same bytes.
   HIP_CHECK(hipMemset(d_out_new, 0, q_elements * sizeof(float)));
-  if (!strix::hip::LaunchQwenWmmaAttention(
+  if (!gufo::hip::LaunchQwenWmmaAttention(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
           d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
           kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, 0,
@@ -189,7 +189,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
   // Same launch again: the prefetch must not let a register from one tile reach
   // another, which would show up here as run-to-run drift.
   HIP_CHECK(hipMemset(d_out_new, 0, q_elements * sizeof(float)));
-  if (!strix::hip::LaunchQwenWmmaAttention(
+  if (!gufo::hip::LaunchQwenWmmaAttention(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
           d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
           kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, 0,
@@ -236,9 +236,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen WMMA prefill attention ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen WMMA prefill attention ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

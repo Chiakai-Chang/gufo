@@ -10,7 +10,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::string err;
-  auto reader = strix::core::GgufReader::OpenFile(argv[1], &err);
+  auto reader = gufo::core::GgufReader::OpenFile(argv[1], &err);
   if (!reader) {
     std::fprintf(stderr, "open failed: %s\n", err.c_str());
     return 1;
@@ -22,22 +22,22 @@ int main(int argc, char** argv) {
     auto& e = by_type[(unsigned)t.type];
     e.first++;
     e.second += t.ElementCount();
-    if (t.type == strix::core::GgmlType::kQ8_0)
+    if (t.type == gufo::core::GgmlType::kQ8_0)
       q8_0 += t.ElementCount();
-    if (t.type == strix::core::GgmlType::kQ6_K)
+    if (t.type == gufo::core::GgmlType::kQ6_K)
       q6_k += t.ElementCount();
-    if (t.type == strix::core::GgmlType::kQ8_K)
+    if (t.type == gufo::core::GgmlType::kQ8_K)
       q8_k += t.ElementCount();
-    if (t.type == strix::core::GgmlType::kQ4_K)
+    if (t.type == gufo::core::GgmlType::kQ4_K)
       q4_k += t.ElementCount();
-    if (t.type == strix::core::GgmlType::kBF16)
+    if (t.type == gufo::core::GgmlType::kBF16)
       bf16 += t.ElementCount();
   }
   std::printf("\n--- type histogram (raw enum) ---\n");
   for (auto& [v, e] : by_type)
     std::printf(
         "enum=%-4u name=%-10s tensors=%-4d elements=%llu\n", v,
-        std::string(strix::core::ToString((strix::core::GgmlType)v)).c_str(),
+        std::string(gufo::core::ToString((gufo::core::GgmlType)v)).c_str(),
         e.first, e.second);
   std::printf(
       "\nproj elements: Q8_0=%llu Q6_K=%llu Q8_K=%llu Q4_K=%llu BF16=%llu\n",
@@ -49,7 +49,7 @@ int main(int argc, char** argv) {
       break;
     std::printf("%-48s enum=%-4u %-8s dims=[", std::string(t.name).c_str(),
                 (unsigned)t.type,
-                std::string(strix::core::ToString(t.type)).c_str());
+                std::string(gufo::core::ToString(t.type)).c_str());
     for (std::size_t d = 0; d < t.dimensions.size(); ++d)
       std::printf("%llu%s", (unsigned long long)t.dimensions[d],
                   d + 1 < t.dimensions.size() ? "," : "");

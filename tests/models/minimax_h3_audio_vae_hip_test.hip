@@ -22,24 +22,24 @@
 #include "src/models/minimax_h3/runtime.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
-#ifndef STRIX_H3_SOURCE_MANIFEST
-#define STRIX_H3_SOURCE_MANIFEST ""
+#ifndef GUFO_H3_SOURCE_MANIFEST
+#define GUFO_H3_SOURCE_MANIFEST ""
 #endif
 
-#ifndef STRIX_H3_AUDIO_VAE_FIXTURE
-#define STRIX_H3_AUDIO_VAE_FIXTURE ""
+#ifndef GUFO_H3_AUDIO_VAE_FIXTURE
+#define GUFO_H3_AUDIO_VAE_FIXTURE ""
 #endif
 
 namespace {
 
-using strix::minimax_h3::AudioVaeDecoder;
-using strix::minimax_h3::AudioVaeTelemetry;
-using strix::minimax_h3::AudioWaveform;
-using strix::minimax_h3::CancellationToken;
-using strix::minimax_h3::ModelInventory;
-using strix::minimax_h3::Sha256File;
-namespace audio_ops = strix::minimax_h3::audio_vae_ops;
-namespace json = strix::minimax_h3::json;
+using gufo::minimax_h3::AudioVaeDecoder;
+using gufo::minimax_h3::AudioVaeTelemetry;
+using gufo::minimax_h3::AudioWaveform;
+using gufo::minimax_h3::CancellationToken;
+using gufo::minimax_h3::ModelInventory;
+using gufo::minimax_h3::Sha256File;
+namespace audio_ops = gufo::minimax_h3::audio_vae_ops;
+namespace json = gufo::minimax_h3::json;
 
 [[noreturn]] void Fail(const std::string& message) {
   std::cerr << "FAIL minimax_h3_audio_vae_hip_test: " << message << '\n';
@@ -413,18 +413,18 @@ void CheckSpectrogram(std::span<const float> waveform,
 }
 
 int RealTest() {
-  const char* model_root = std::getenv("STRIX_H3_MODEL_ROOT");
-  const char* golden_value = std::getenv("STRIX_H3_AUDIO_VAE_GOLDEN");
-  const std::filesystem::path fixture = STRIX_H3_AUDIO_VAE_FIXTURE;
+  const char* model_root = std::getenv("GUFO_H3_MODEL_ROOT");
+  const char* golden_value = std::getenv("GUFO_H3_AUDIO_VAE_GOLDEN");
+  const std::filesystem::path fixture = GUFO_H3_AUDIO_VAE_FIXTURE;
   if (model_root == nullptr || *model_root == '\0' || golden_value == nullptr ||
       *golden_value == '\0') {
-    std::cout << "SKIP: set STRIX_H3_MODEL_ROOT and "
-                 "STRIX_H3_AUDIO_VAE_GOLDEN\n";
+    std::cout << "SKIP: set GUFO_H3_MODEL_ROOT and "
+                 "GUFO_H3_AUDIO_VAE_GOLDEN\n";
     return 77;
   }
   const json::Value contract = json::ParseFile(fixture, 1U << 20U);
   if (Required(contract, "schema").AsString() !=
-          "strix.minimax-h3-audio-vae-golden.v1" ||
+          "gufo.minimax-h3-audio-vae-golden.v1" ||
       Required(contract, "model_revision").AsString() !=
           "42ed227ee7df40d41602854ae760620d6eb651fe" ||
       Required(contract, "reference_revision").AsString() !=
@@ -459,7 +459,7 @@ int RealTest() {
               static_cast<std::size_t>(2 * 513 * spectrogram_frames));
   std::string error;
   auto inventory =
-      ModelInventory::Inspect(model_root, STRIX_H3_SOURCE_MANIFEST, &error);
+      ModelInventory::Inspect(model_root, GUFO_H3_SOURCE_MANIFEST, &error);
   if (!inventory.has_value()) {
     Fail(error);
   }

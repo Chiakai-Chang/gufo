@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_OPS_TOKEN_HPP_
-#define STRIX_MODELS_QWEN_HIP_OPS_TOKEN_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_OPS_TOKEN_HPP_
+#define GUFO_MODELS_QWEN_HIP_OPS_TOKEN_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-namespace strix::hip {
+namespace gufo::hip {
 
 /// Asynchronously copies embedding row for token_id into out_hidden
 void LaunchEmbeddingLookup(const void* table, core::GgmlType type,
@@ -71,8 +71,8 @@ void LaunchBatchedRoPE(float* q, float* k, std::size_t batch_size,
                        std::uint32_t start_pos, float rope_theta,
                        hipStream_t stream = nullptr);
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_OPS_TOKEN_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_OPS_TOKEN_HPP_

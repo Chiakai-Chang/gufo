@@ -10,7 +10,7 @@
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void EmbeddingLookupKernel(const void* __restrict__ table,
                                       core::GgmlType type,
@@ -84,5 +84,5 @@ void LaunchEmbeddingLookup(const void* table, core::GgmlType type,
       table, type, d_token_id, out_hidden, hidden_size);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif

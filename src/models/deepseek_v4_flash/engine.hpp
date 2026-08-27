@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
-#define STRIX_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
+#ifndef GUFO_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
+#define GUFO_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +12,7 @@
 
 #include "src/models/deepseek_v4_flash/runtime/model.h"
 
-namespace strix::models::deepseek_v4_flash {
+namespace gufo::models::deepseek_v4_flash {
 
 struct ModelOptions {
   std::uint32_t max_context = 4096;
@@ -125,6 +125,6 @@ private:
   friend class Session;
 };
 
-}  // namespace strix::models::deepseek_v4_flash
+}  // namespace gufo::models::deepseek_v4_flash
 
-#endif  // STRIX_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_
+#endif  // GUFO_MODELS_DEEPSEEK_V4_FLASH_ENGINE_HPP_

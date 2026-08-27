@@ -18,7 +18,7 @@
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
 
-namespace strix::cli {
+namespace gufo::cli {
 
 void PrintServeHelp(std::string_view program_name,
                     std::string_view subcommand) {
@@ -28,7 +28,7 @@ void PrintServeHelp(std::string_view program_name,
     std::filesystem::path video_manifest = DefaultH3SourceManifest();
     std::uint64_t video_ttl_seconds = 3600;
 
-    strix::cli::ArgParser parser(
+    gufo::cli::ArgParser parser(
         std::string(program_name) + " serve video",
         "Start the MiniMax H3 text-to-video HTTP generation server.");
     parser.AddOption("-m", "--model", "DIR",
@@ -51,7 +51,7 @@ void PrintServeHelp(std::string_view program_name,
     std::filesystem::path tts_model;
     std::size_t tts_context_tokens = 4096;
 
-    strix::cli::ArgParser parser(
+    gufo::cli::ArgParser parser(
         std::string(program_name) + " serve audio",
         "Start the Qwen3-TTS text-to-speech HTTP synthesis server.");
     parser.AddOption("-m", "--model", "DIR",
@@ -101,7 +101,7 @@ void PrintServeHelp(std::string_view program_name,
         server::kDefaultMaxBufferedOutputBytesTotal;
     bool force_cpu = false;
 
-    strix::cli::ArgParser parser(
+    gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
 
@@ -267,7 +267,7 @@ int RunServe(std::span<const char* const> args) {
   if (const char* env_host = std::getenv("HOST");
       env_host != nullptr && *env_host != '\0') {
     host = env_host;
-  } else if (const char* env_strix_host = std::getenv("STRIX_HOST");
+  } else if (const char* env_strix_host = std::getenv("GUFO_HOST");
              env_strix_host != nullptr && *env_strix_host != '\0') {
     host = env_strix_host;
   }
@@ -282,7 +282,7 @@ int RunServe(std::span<const char* const> args) {
     if (ec == std::errc{} && ptr == sv.data() + sv.size()) {
       port = parsed_port;
     }
-  } else if (const char* env_strix_port = std::getenv("STRIX_PORT");
+  } else if (const char* env_strix_port = std::getenv("GUFO_PORT");
              env_strix_port != nullptr && *env_strix_port != '\0') {
     const std::string_view sv(env_strix_port);
     int parsed_port = 0;
@@ -314,14 +314,14 @@ int RunServe(std::span<const char* const> args) {
       }
       if (arg == "help") {
         if (i + 1 < args.size()) {
-          PrintServeHelp("strix", args[i + 1]);
+          PrintServeHelp("gufo", args[i + 1]);
         } else {
-          PrintServeHelp("strix");
+          PrintServeHelp("gufo");
         }
         return 0;
       }
       if (arg == "-h" || arg == "--help") {
-        PrintServeHelp("strix");
+        PrintServeHelp("gufo");
         return 0;
       }
       // Check for server-specific flags
@@ -361,8 +361,8 @@ int RunServe(std::span<const char* const> args) {
   }
 
   // Parse server options
-  strix::cli::ArgParser server_parser(
-      "strix serve", "Start the OpenAI-compatible HTTP server.");
+  gufo::cli::ArgParser server_parser(
+      "gufo serve", "Start the OpenAI-compatible HTTP server.");
   server_parser.AddOption("-i", "--host", "IP", "Bind address", "Server",
                           &host);
   server_parser.AddOption("-p", "--port", "N", "Port to listen on", "Server",
@@ -384,7 +384,7 @@ int RunServe(std::span<const char* const> args) {
   std::string parse_err;
   if (!server_parser.Parse(server_args, &parse_err)) {
     std::cerr << "Error: " << parse_err << "\n";
-    PrintServeHelp("strix");
+    PrintServeHelp("gufo");
     return 2;
   }
   if (session_count == 0 || max_connections == 0 ||
@@ -403,8 +403,8 @@ int RunServe(std::span<const char* const> args) {
     std::filesystem::path video_manifest = DefaultH3SourceManifest();
     std::uint64_t video_ttl_seconds = 3600;
 
-    strix::cli::ArgParser video_parser(
-        "strix serve video", "Start the MiniMax H3 video generation server.");
+    gufo::cli::ArgParser video_parser(
+        "gufo serve video", "Start the MiniMax H3 video generation server.");
     video_parser.AddOption("-m", "--model", "DIR",
                            "Operator-supplied MiniMax H3 directory", "Model",
                            &video_model);
@@ -420,11 +420,11 @@ int RunServe(std::span<const char* const> args) {
 
     if (!video_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
-      PrintServeHelp("strix", "video");
+      PrintServeHelp("gufo", "video");
       return 2;
     }
     if (video_parser.IsHelpRequested()) {
-      PrintServeHelp("strix", "video");
+      PrintServeHelp("gufo", "video");
       return 0;
     }
 
@@ -437,7 +437,7 @@ int RunServe(std::span<const char* const> args) {
 
     if (video_model.empty()) {
       std::cerr << "Error: --model <DIR> is required for video server\n";
-      PrintServeHelp("strix", "video");
+      PrintServeHelp("gufo", "video");
       return 2;
     }
 
@@ -463,8 +463,8 @@ int RunServe(std::span<const char* const> args) {
     std::filesystem::path tts_model;
     std::size_t tts_context_tokens = 4096;
 
-    strix::cli::ArgParser audio_parser(
-        "strix serve audio", "Start the Qwen3-TTS audio synthesis server.");
+    gufo::cli::ArgParser audio_parser(
+        "gufo serve audio", "Start the Qwen3-TTS audio synthesis server.");
     audio_parser.AddOption("-m", "--model", "DIR",
                            "Qwen3-TTS 12Hz 1.7B model directory", "Model",
                            &tts_model);
@@ -475,17 +475,17 @@ int RunServe(std::span<const char* const> args) {
 
     if (!audio_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
-      PrintServeHelp("strix", "audio");
+      PrintServeHelp("gufo", "audio");
       return 2;
     }
     if (audio_parser.IsHelpRequested()) {
-      PrintServeHelp("strix", "audio");
+      PrintServeHelp("gufo", "audio");
       return 0;
     }
 
     if (tts_model.empty()) {
       std::cerr << "Error: --model <DIR> is required for audio server\n";
-      PrintServeHelp("strix", "audio");
+      PrintServeHelp("gufo", "audio");
       return 2;
     }
 
@@ -539,8 +539,8 @@ int RunServe(std::span<const char* const> args) {
         server::kDefaultMaxBufferedOutputBytesTotal;
     bool force_cpu = false;
 
-    strix::cli::ArgParser llm_parser(
-        "strix serve llm",
+    gufo::cli::ArgParser llm_parser(
+        "gufo serve llm",
         "Start the OpenAI/Anthropic-compatible text LLM HTTP server.");
     llm_parser.AddOption(
         "-m", "--model", "PATH",
@@ -661,11 +661,11 @@ int RunServe(std::span<const char* const> args) {
 
     if (!llm_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
-      PrintServeHelp("strix", "llm");
+      PrintServeHelp("gufo", "llm");
       return 2;
     }
     if (llm_parser.IsHelpRequested()) {
-      PrintServeHelp("strix", "llm");
+      PrintServeHelp("gufo", "llm");
       return 0;
     }
     if (max_tokens == 0 || prefill_chunk_tokens == 0 ||
@@ -723,4 +723,4 @@ int RunServe(std::span<const char* const> args) {
   return 0;
 }
 
-}  // namespace strix::cli
+}  // namespace gufo::cli

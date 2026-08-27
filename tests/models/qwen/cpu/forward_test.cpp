@@ -15,10 +15,10 @@ void TestEmbeddingLookup() {
   };
   std::vector<float> hidden(hidden_size, 0.0F);
 
-  const strix::models::QwenTensorRef ref = {.data = table.data(),
-                                            .type = strix::core::GgmlType::kF32,
-                                            .num_elements = table.size()};
-  strix::models::ForwardEmbedding(1, ref, hidden_size, hidden);
+  const gufo::models::QwenTensorRef ref = {.data = table.data(),
+                                           .type = gufo::core::GgmlType::kF32,
+                                           .num_elements = table.size()};
+  gufo::models::ForwardEmbedding(1, ref, hidden_size, hidden);
   assert(hidden[0] == 5.0F);
   assert(hidden[1] == 6.0F);
   assert(hidden[2] == 7.0F);
@@ -27,7 +27,7 @@ void TestEmbeddingLookup() {
 
 void TestQ8_0EmbeddingLookup() {
   constexpr std::size_t hidden_size = 32;
-  std::vector<strix::quant::block_q8_0> table(2);
+  std::vector<gufo::quant::block_q8_0> table(2);
   for (std::size_t token = 0; token < table.size(); ++token) {
     table[token].d = 0x3C00;  // fp16 1.0
     for (std::size_t i = 0; i < hidden_size; ++i) {
@@ -36,11 +36,11 @@ void TestQ8_0EmbeddingLookup() {
   }
 
   std::vector<float> hidden(hidden_size, 0.0F);
-  const strix::models::QwenTensorRef ref = {
+  const gufo::models::QwenTensorRef ref = {
       .data = table.data(),
-      .type = strix::core::GgmlType::kQ8_0,
+      .type = gufo::core::GgmlType::kQ8_0,
       .num_elements = table.size() * hidden_size};
-  strix::models::ForwardEmbedding(1, ref, hidden_size, hidden);
+  gufo::models::ForwardEmbedding(1, ref, hidden_size, hidden);
 
   for (std::size_t i = 0; i < hidden_size; ++i) {
     assert(hidden[i] == static_cast<float>(32 + i));
@@ -55,8 +55,8 @@ void TestRoPEPreservation() {
   std::vector<float> k = {1.0F, 1.0F, 1.0F, 1.0F};
 
   const float norm_before = std::sqrt(q[0] * q[0] + q[2] * q[2]);
-  strix::models::ForwardRoPE(q, k, num_heads, num_kv_heads, head_dim, head_dim,
-                             5, 10000.0F);
+  gufo::models::ForwardRoPE(q, k, num_heads, num_kv_heads, head_dim, head_dim,
+                            5, 10000.0F);
   const float norm_after = std::sqrt(q[0] * q[0] + q[2] * q[2]);
 
   assert(std::abs(norm_before - norm_after) < 1e-5F);
@@ -70,17 +70,17 @@ void TestSwiGLUFFN() {
   const std::vector<float> up_w = {1.0F, 0.0F, 0.0F, 1.0F};    // identity
   const std::vector<float> down_w = {1.0F, 0.0F, 0.0F, 1.0F};  // identity
 
-  const strix::models::QwenTensorRef gate_ref = {
+  const gufo::models::QwenTensorRef gate_ref = {
       .data = gate_w.data(),
-      .type = strix::core::GgmlType::kF32,
+      .type = gufo::core::GgmlType::kF32,
       .num_elements = gate_w.size()};
-  const strix::models::QwenTensorRef up_ref = {
+  const gufo::models::QwenTensorRef up_ref = {
       .data = up_w.data(),
-      .type = strix::core::GgmlType::kF32,
+      .type = gufo::core::GgmlType::kF32,
       .num_elements = up_w.size()};
-  const strix::models::QwenTensorRef down_ref = {
+  const gufo::models::QwenTensorRef down_ref = {
       .data = down_w.data(),
-      .type = strix::core::GgmlType::kF32,
+      .type = gufo::core::GgmlType::kF32,
       .num_elements = down_w.size()};
 
   std::vector<float> gate_sc(intermediate_size);
@@ -88,8 +88,8 @@ void TestSwiGLUFFN() {
   std::vector<float> act_sc(intermediate_size);
   std::vector<float> ffn_out(hidden_size);
 
-  strix::models::ForwardFFN(x, gate_ref, up_ref, down_ref, hidden_size,
-                            intermediate_size, gate_sc, up_sc, act_sc, ffn_out);
+  gufo::models::ForwardFFN(x, gate_ref, up_ref, down_ref, hidden_size,
+                           intermediate_size, gate_sc, up_sc, act_sc, ffn_out);
 
   // gate = [1.0, 2.0], up = [1.0, 2.0]
   // silu(1.0) * 1.0 = (1 / (1 + exp(-1))) * 1.0 ~= 0.731058
@@ -98,7 +98,7 @@ void TestSwiGLUFFN() {
 
 void TestGreedyArgmax() {
   const std::vector<float> logits = {0.1F, -2.5F, 14.8F, 3.2F, 12.0F};
-  const auto best = strix::models::GreedyArgmax(logits);
+  const auto best = gufo::models::GreedyArgmax(logits);
   assert(best == 2);
 }
 
@@ -106,7 +106,7 @@ void TestAttentionWithKvCache() {
   const std::uint32_t num_heads = 2;
   const std::uint32_t num_kv_heads = 2;
   const std::uint32_t head_dim = 4;
-  strix::models::QwenKvCache kv_cache(1, num_kv_heads, 16, head_dim);
+  gufo::models::QwenKvCache kv_cache(1, num_kv_heads, 16, head_dim);
 
   std::vector<float> q = {1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F};
   std::vector<float> k = {1.0F, 0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F};
@@ -114,8 +114,8 @@ void TestAttentionWithKvCache() {
   std::vector<float> scores(16, 0.0F);
   std::vector<float> out(8, 0.0F);
 
-  strix::models::ForwardAttention(q, k, v, {}, {}, kv_cache, 0, 0, num_heads,
-                                  num_kv_heads, head_dim, 8, scores, out);
+  gufo::models::ForwardAttention(q, k, v, {}, {}, kv_cache, 0, 0, num_heads,
+                                 num_kv_heads, head_dim, 8, scores, out);
 
   // Since pos=0, softmax weight is 1.0, out should equal value vectors
   assert(std::abs(out[0] - 2.0F) < 1e-5F);

@@ -3,7 +3,7 @@
 #include <limits>
 #include <utility>
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 namespace {
 
 constexpr int kMinimumTilePixels = 256;
@@ -320,4 +320,4 @@ int VideoVaeDecoder::tile_pixels() const noexcept {
 
 #endif
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3

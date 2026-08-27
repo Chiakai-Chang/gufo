@@ -34,14 +34,14 @@ public:
 
   void AddMetadataString(std::string_view key, std::string_view val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kString));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kString));
     AppendString(val);
     metadata_count_++;
   }
 
   void AddMetadataUint32(std::string_view key, std::uint32_t val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kUint32));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kUint32));
     AppendPod(val);
     metadata_count_++;
   }
@@ -49,8 +49,8 @@ public:
   void AddMetadataStringArray(std::string_view key,
                               const std::vector<std::string>& arr) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kArray));
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kString));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kArray));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kString));
     AppendPod(static_cast<std::uint64_t>(arr.size()));
     for (const auto& s : arr) {
       AppendString(s);
@@ -120,14 +120,14 @@ void TestDirectVocabularyTokenizer() {
       "W o",    "r d", "Wo r", "Wor d", "W orld",
   };
 
-  std::unordered_map<std::string, strix::tokenization::TokenId> specials = {
+  std::unordered_map<std::string, gufo::tokenization::TokenId> specials = {
       {"<|endoftext|>", 0},
       {"<|im_start|>", 1},
       {"<|im_end|>", 2},
   };
 
   std::string err;
-  auto tok = strix::tokenization::QwenTokenizer::CreateFromVocabulary(
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
       tokens, merges, specials, &err);
   Expect(tok != nullptr, "CreateFromVocabulary succeeds: " + err);
   Expect(tok->GetVocabSize() == tokens.size(), "Vocab size matches");
@@ -139,7 +139,7 @@ void TestDirectVocabularyTokenizer() {
   Expect(!tok->IsSpecialToken(3), "Token 3 is not special");
 
   // Encode with special tokens
-  strix::tokenization::TokenizerOptions opts;
+  gufo::tokenization::TokenizerOptions opts;
   opts.parse_special_tokens = true;
 
   auto encoded = tok->Encode("<|im_start|>Hello World<|im_end|>", opts);
@@ -176,10 +176,10 @@ void TestGgufTokenizerLoading() {
 
   std::string err;
   auto reader =
-      strix::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
   Expect(reader != nullptr, "Reader open succeeds: " + err);
 
-  auto tok = strix::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &err);
   Expect(tok != nullptr, "Tokenizer created from GGUF: " + err);
   Expect(tok->GetEosTokenId() == 151645U, "EOS token ID matches");
   Expect(tok->GetPadTokenId() == 151643U, "PAD token ID matches");
@@ -195,11 +195,11 @@ void TestEmptyAndSpecialEdgeCases() {
   std::vector<std::string> tokens = {"<|endoftext|>", "a", "b", "c"};
   std::vector<std::string> merges = {};
   std::string err;
-  auto tok = strix::tokenization::QwenTokenizer::CreateFromVocabulary(
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
       tokens, merges, {{"<|endoftext|>", 0}}, &err);
   Expect(tok != nullptr, "Tokenizer initialized");
 
-  strix::tokenization::TokenizerOptions opts;
+  gufo::tokenization::TokenizerOptions opts;
   opts.add_bos = false;
   opts.add_eos = false;
   auto empty_encoded = tok->Encode("", opts);
@@ -221,13 +221,13 @@ void TestCorpusConformance() {
   vocab.emplace_back("<think>");
   vocab.emplace_back("</think>");
 
-  std::unordered_map<std::string, strix::tokenization::TokenId> specials = {
+  std::unordered_map<std::string, gufo::tokenization::TokenId> specials = {
       {"<|im_start|>", 256}, {"<|im_end|>", 257}, {"<|endoftext|>", 258},
       {"<think>", 259},      {"</think>", 260},
   };
 
   std::string err;
-  auto tok = strix::tokenization::QwenTokenizer::CreateFromVocabulary(
+  auto tok = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
       vocab, {}, specials, &err);
   Expect(tok != nullptr, "Tokenizer initialized for corpus conformance");
 
@@ -245,7 +245,7 @@ void TestCorpusConformance() {
       "3.1415926535 0xDEADBEEF 128*1024=131072",
   };
 
-  strix::tokenization::TokenizerOptions opts;
+  gufo::tokenization::TokenizerOptions opts;
   opts.parse_special_tokens = true;
 
   for (const auto& text : test_strings) {

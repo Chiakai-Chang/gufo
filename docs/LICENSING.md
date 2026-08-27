@@ -13,7 +13,7 @@ release.
 
 ## Project License
 
-Original Strix-Halo.cpp source code is licensed under:
+Original gufo source code is licensed under:
 
 ```text
 MIT License
@@ -37,7 +37,7 @@ document does not replace that file.
 
 The relevant components have different licenses:
 
-| Component | License | Effect on Strix-Halo.cpp |
+| Component | License | Effect on gufo |
 | --- | --- | --- |
 | XRT userspace runtime | Apache-2.0 | Compatible with an MIT server; retain XRT's Apache notices when distributing it |
 | AMD XDNA XRT userspace shim | Apache-2.0 | Compatible with an MIT server; retained or adapted shim code remains Apache-2.0 |
@@ -65,13 +65,13 @@ SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note
 
 ## Kernel Boundary
 
-Running Strix-Halo.cpp against the installed GPL-licensed `amdxdna` kernel driver
-does not require Strix-Halo.cpp to use the GPL. The server remains an independent
+Running gufo against the installed GPL-licensed `amdxdna` kernel driver
+does not require gufo to use the GPL. The server remains an independent
 userspace program communicating through the documented kernel UAPI.
 
 Do not:
 
-- Copy GPL kernel-driver implementation code into `strix`.
+- Copy GPL kernel-driver implementation code into `gufo`.
 - Compile kernel implementation files into a userspace library.
 - Treat an internal kernel function as a stable userspace interface.
 - Remove SPDX identifiers or copyright notices from copied UAPI material.
@@ -82,8 +82,8 @@ obligations.
 
 ## Linking XRT
 
-Strix-Halo.cpp may dynamically or statically link Apache-2.0 XRT userspace
-components without changing the MIT license of original Strix-Halo.cpp code. The
+gufo may dynamically or statically link Apache-2.0 XRT userspace
+components without changing the MIT license of original gufo code. The
 combined distribution contains components under both licenses; it is not
 accurate to relabel XRT itself as MIT.
 
@@ -100,7 +100,7 @@ the number of third-party binary artifacts distributed by the project.
 
 ## Firmware
 
-NPU firmware is not covered by the Strix-Halo.cpp MIT license.
+NPU firmware is not covered by the gufo MIT license.
 
 The AMD XDNA repository includes a `LICENSE.amdnpu` file that permits
 redistribution of covered software only in unmodified binary form and includes
@@ -110,7 +110,7 @@ Apache-2.0.
 
 The initial distribution policy is:
 
-- Do not bundle AMD NPU firmware with Strix-Halo.cpp.
+- Do not bundle AMD NPU firmware with gufo.
 - Require firmware supplied by the Linux distribution or an AMD package.
 - Detect missing or incompatible firmware at startup.
 - Document the tested firmware version without copying the firmware.
@@ -118,7 +118,7 @@ The initial distribution policy is:
 If future installation packages bundle firmware, review the exact artifact and
 its accompanying license before every release.
 
-Strix-owned AIE overlays and `ctrlcode` compiled from original MIT
+Gufo-owned AIE overlays and `ctrlcode` compiled from original MIT
 project source may be distributed with the server, subject to the licenses of
 the compiler, headers, and libraries used to produce them.
 
@@ -147,7 +147,7 @@ project in design documentation but should not copy source expression.
 The engine license does not grant rights to model weights, tokenizers,
 calibration corpora, benchmark datasets, or generated quantized artifacts.
 
-Strix-Halo.cpp follows a bring-your-own-weights policy:
+gufo follows a bring-your-own-weights policy:
 
 - The engine never downloads a gated model at build or runtime.
 - Model weights and derived quantized artifacts are excluded from source and
@@ -177,7 +177,7 @@ Every published model artifact must record:
 - License or terms applied to the converted artifact.
 
 Hugging Face publication must include the model license independently from the
-Strix-Halo.cpp engine license.
+gufo engine license.
 
 MiniMax H3 weights and derived H3 quantized artifacts are not publication
 targets for this repository. Changing that boundary requires a separate
@@ -193,7 +193,7 @@ THIRD_PARTY_NOTICES.md
 ```
 
 When an included Apache-2.0 dependency has a `NOTICE` file, preserve the
-applicable contents in the binary distribution. A top-level Strix-Halo.cpp
+applicable contents in the binary distribution. A top-level gufo
 `NOTICE` file is not required by MIT itself.
 
 `THIRD_PARTY_NOTICES.md` records at least:

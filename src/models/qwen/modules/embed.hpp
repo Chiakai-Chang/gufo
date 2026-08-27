@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_MODULES_EMBED_HPP_
-#define STRIX_MODELS_QWEN_MODULES_EMBED_HPP_
+#ifndef GUFO_MODELS_QWEN_MODULES_EMBED_HPP_
+#define GUFO_MODELS_QWEN_MODULES_EMBED_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -8,13 +8,13 @@
 #include "src/models/qwen/modules/module_ctx.hpp"
 #include "src/models/qwen/state.hpp"
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 /// Token embedding lookup: copies the embedding row for token_id into out.
 void EmbedForward(const CpuModuleContext& ctx, std::uint32_t token_id,
                   const QwenTensorRef& token_embd, std::size_t hidden_size,
                   std::span<float> out) noexcept;
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen
 
-#endif  // STRIX_MODELS_QWEN_MODULES_EMBED_HPP_
+#endif  // GUFO_MODELS_QWEN_MODULES_EMBED_HPP_

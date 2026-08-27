@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_DFLASH_REFERENCE_HPP_
-#define STRIX_MODELS_QWEN_DFLASH_REFERENCE_HPP_
+#ifndef GUFO_MODELS_QWEN_DFLASH_REFERENCE_HPP_
+#define GUFO_MODELS_QWEN_DFLASH_REFERENCE_HPP_
 
 #include <algorithm>
 #include <cstddef>
@@ -14,7 +14,7 @@
 #include "src/models/qwen/state.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 /// Configuration for a DFlash-2 block-diffusion drafting model.
 struct QwenDFlashConfig {
@@ -179,6 +179,6 @@ private:
   std::vector<float> logits_scratch_;
 };
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative
 
-#endif  // STRIX_MODELS_QWEN_DFLASH_REFERENCE_HPP_
+#endif  // GUFO_MODELS_QWEN_DFLASH_REFERENCE_HPP_

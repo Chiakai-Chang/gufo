@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strix::hip {
+namespace gufo::hip {
 // opt-c010-rmsnorm-projection: computes the layer RMSNorm scale exactly like
 // RMSNormKernel (256-thread strided partition over dim, tree reduction with
 // stride 128..1 over s_sum[256]) so inv_rms is bit-identical to the unfused
@@ -32,5 +32,5 @@ __device__ inline float FusedRMSNormInvScale(const float* __restrict__ x,
   const float mean_sq = s_sum[0] / static_cast<float>(dim);
   return rsqrtf(mean_sq + eps);
 }
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

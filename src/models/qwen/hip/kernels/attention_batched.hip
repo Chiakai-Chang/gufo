@@ -18,7 +18,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void WriteBatchedKVCacheKernel(
     const float* __restrict__ k, const float* __restrict__ v,
@@ -415,5 +415,5 @@ void LaunchBatchedAttentionGemm(
   }
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

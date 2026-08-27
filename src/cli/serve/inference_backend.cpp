@@ -23,7 +23,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #endif
 
-namespace strix::server {
+namespace gufo::server {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -48,7 +48,7 @@ std::uint64_t ClientLabel(std::string_view client_id) noexcept {
 
 void EmitRequestMetrics(const InferenceBackend::Result& result,
                         std::string_view status) {
-  static const bool enabled = (std::getenv("STRIX_DEBUG_METRICS") != nullptr);
+  static const bool enabled = (std::getenv("GUFO_DEBUG_METRICS") != nullptr);
   if (!enabled) {
     return;
   }
@@ -1184,4 +1184,4 @@ std::size_t InferenceBackend::count_tokens(std::string_view text) const {
 #endif
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

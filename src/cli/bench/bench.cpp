@@ -35,11 +35,11 @@
 #include "src/models/qwen/hip/mtp.hpp"
 #endif
 
-namespace strix::cli {
+namespace gufo::cli {
 
 void PrintBenchHelp(std::string_view program_name) {
   BenchOptions opt;
-  strix::cli::ArgParser parser(
+  gufo::cli::ArgParser parser(
       std::string(program_name) + " bench",
       "Benchmark prompt processing (pp) and token generation (tg) throughput.");
 
@@ -462,8 +462,8 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
   bool explicit_p = false;
   bool explicit_n = false;
 
-  strix::cli::ArgParser parser(
-      "strix bench",
+  gufo::cli::ArgParser parser(
+      "gufo bench",
       "Benchmark prompt processing (pp) and token generation (tg) "
       "throughput.");
   parser.AddOption(
@@ -648,10 +648,10 @@ int RunBench(std::span<const char* const> args) {
   if (!opt_res.has_value()) {
     if (!parse_err.empty()) {
       std::cerr << "Error: " << parse_err << "\n";
-      PrintBenchHelp("strix");
+      PrintBenchHelp("gufo");
       return 2;
     }
-    PrintBenchHelp("strix");
+    PrintBenchHelp("gufo");
     return 0;
   }
 
@@ -659,14 +659,14 @@ int RunBench(std::span<const char* const> args) {
 
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
-  auto reader_owner = strix::core::GgufReader::OpenFile(opt.model_path, &err);
+  auto reader_owner = gufo::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader_owner) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
-  const std::shared_ptr<const strix::core::GgufReader> reader(
+  const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -725,7 +725,7 @@ int RunBench(std::span<const char* const> args) {
       opt.speculative_backend == "mtp-npu") {
     std::string mtp_path = opt.mtp_model_path;
     if (mtp_path.empty()) {
-      if (const char* environment = std::getenv("STRIX_MTP_MODEL");
+      if (const char* environment = std::getenv("GUFO_MTP_MODEL");
           environment != nullptr) {
         mtp_path = environment;
       }
@@ -933,7 +933,7 @@ int RunBench(std::span<const char* const> args) {
             opt.speculative_backend == "dflash-2") {
           std::string dflash_path = opt.dflash_model_path;
           if (dflash_path.empty()) {
-            if (const char* env = std::getenv("STRIX_DFLASH_MODEL");
+            if (const char* env = std::getenv("GUFO_DFLASH_MODEL");
                 env != nullptr) {
               dflash_path = env;
             }
@@ -1125,10 +1125,10 @@ int RunBench(std::span<const char* const> args) {
   std::cout << "\n";
   return 0;
 #else
-  std::cerr << "Error: Strix GPU benchmark requires ENGINE_ENABLE_HIP=ON\n";
+  std::cerr << "Error: Gufo GPU benchmark requires ENGINE_ENABLE_HIP=ON\n";
   PrintModelLoadTime(model_load_start, false);
   return 1;
 #endif
 }
 
-}  // namespace strix::cli
+}  // namespace gufo::cli

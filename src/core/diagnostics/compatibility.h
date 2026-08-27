@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_DIAGNOSTICS_COMPATIBILITY_H_
-#define STRIX_CORE_DIAGNOSTICS_COMPATIBILITY_H_
+#ifndef GUFO_CORE_DIAGNOSTICS_COMPATIBILITY_H_
+#define GUFO_CORE_DIAGNOSTICS_COMPATIBILITY_H_
 
 #include <cstdint>
 #include <string>
@@ -8,7 +8,7 @@
 
 #include "src/core/diagnostics/system_inventory.h"
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 enum class CompatibilityVerdict : std::uint8_t {
   kSupported,
@@ -38,6 +38,6 @@ struct CompatibilityReport {
 [[nodiscard]] CompatibilityReport EvaluateCompatibility(
     const SystemInventory& inventory, std::string_view section = "all");
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics
 
-#endif  // STRIX_CORE_DIAGNOSTICS_COMPATIBILITY_H_
+#endif  // GUFO_CORE_DIAGNOSTICS_COMPATIBILITY_H_

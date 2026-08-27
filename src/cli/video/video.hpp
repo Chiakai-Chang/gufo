@@ -1,5 +1,5 @@
-#ifndef STRIX_CLI_VIDEO_HPP_
-#define STRIX_CLI_VIDEO_HPP_
+#ifndef GUFO_CLI_VIDEO_HPP_
+#define GUFO_CLI_VIDEO_HPP_
 
 #include <filesystem>
 #include <optional>
@@ -9,7 +9,7 @@
 
 #include "src/models/minimax_h3/generation.hpp"
 
-namespace strix::cli {
+namespace gufo::cli {
 
 struct VideoCliOptions {
   minimax_h3::GenerationRequest request;
@@ -24,6 +24,6 @@ void PrintVideoHelp(std::string_view program_name);
     std::span<const char* const> args, std::string* error = nullptr);
 [[nodiscard]] int RunVideo(std::span<const char* const> args);
 
-}  // namespace strix::cli
+}  // namespace gufo::cli
 
-#endif  // STRIX_CLI_VIDEO_HPP_
+#endif  // GUFO_CLI_VIDEO_HPP_

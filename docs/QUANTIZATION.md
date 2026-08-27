@@ -652,7 +652,7 @@ Inspection creates `source-manifest.json`:
 
 ```json
 {
-  "schema": "strix.source.v1",
+  "schema": "gufo.source.v1",
   "repository": "organization/model",
   "revision": "<immutable-commit>",
   "architecture": "<supported-model-kind>",
@@ -751,7 +751,7 @@ Support both native calibration artifacts and compatible llama.cpp imatrix
 imports. Imported data is accepted only when tensor dimensions and the source
 model identity match.
 
-#### Calibration compute (strix-calibrate)
+#### Calibration compute (gufo-calibrate)
 
 The imatrix reduction `h[j] = E[x_j^2]` is always accumulated in float64. The
 corpus is forwarded in token-budgeted batches (`--max-tokens`, default 4096);
@@ -851,13 +851,13 @@ tokenizer.json
 tokenizer_config.json
 special_tokens_map.json
 chat_template.jinja
-strix-manifest.json
+gufo-manifest.json
 source-manifest.json
 quantization.json
 quantization-plan.json
-model-00001-of-000NN.strix
-model-00002-of-000NN.strix
-model.strix.index.json
+model-00001-of-000NN.gufo
+model-00002-of-000NN.gufo
+model.gufo.index.json
 checksums.sha256
 evals/quality.json
 evals/performance-gfx1151-xdna2.json
@@ -866,7 +866,7 @@ evals/performance-gfx1151-xdna2.json
 Only files present in the source are copied from the optional tokenizer and
 generation-config list. The package must not invent tokenizer defaults.
 
-`strix-manifest.json` is the runtime entry point. It references immutable shard
+`gufo-manifest.json` is the runtime entry point. It references immutable shard
 checksums, model kind, model-state contract version, layout version, required
 `gfx1151` and XDNA2 capabilities, quantization recipe, and tokenizer identity.
 It cannot name or supply executable host or device code.
@@ -907,13 +907,13 @@ The first tool surface should be:
 
 | Utility | Responsibility |
 | --- | --- |
-| `strix-inspect` | Resolve and validate source safetensors and write source inventory |
-| `strix-calibrate` | Capture imatrix, activation ranges, layer samples, and router data |
-| `strix-plan-quant` | Search mixed-precision choices and write a reviewable plan |
-| `strix-quantize` | Deterministically convert and pack resumable output shards |
-| `strix-validate` | Run tensor, layer, logit, perplexity, and task gates |
-| `strix-package` | Assemble manifests, tokenizer assets, reports, and model card |
-| `strix-upload` | Stage, upload, verify, and optionally publish a Hub artifact |
+| `gufo-inspect` | Resolve and validate source safetensors and write source inventory |
+| `gufo-calibrate` | Capture imatrix, activation ranges, layer samples, and router data |
+| `gufo-plan-quant` | Search mixed-precision choices and write a reviewable plan |
+| `gufo-quantize` | Deterministically convert and pack resumable output shards |
+| `gufo-validate` | Run tensor, layer, logit, perplexity, and task gates |
+| `gufo-package` | Assemble manifests, tokenizer assets, reports, and model card |
+| `gufo-upload` | Stage, upload, verify, and optionally publish a Hub artifact |
 
 These are proposed interfaces for implementation, not commands that already
 exist.
@@ -921,52 +921,52 @@ exist.
 Example flow:
 
 ```bash
-strix-inspect \
+gufo-inspect \
   --source organization/model \
   --revision <immutable-commit> \
   --out work/source-manifest.json
 
-strix-calibrate \
+gufo-calibrate \
   --source-manifest work/source-manifest.json \
   --suite calibration/suite.json \
   --out work/calibration/
 
-strix-plan-quant \
+gufo-plan-quant \
   --source-manifest work/source-manifest.json \
   --calibration work/calibration/manifest.json \
   --target-bytes 18000000000 \
   --out work/quantization-plan.json
 
-strix-quantize \
+gufo-quantize \
   --source-manifest work/source-manifest.json \
   --plan work/quantization-plan.json \
   --out work/model/
 
-strix-validate \
+gufo-validate \
   --teacher work/teacher/manifest.json \
-  --candidate work/model/strix-manifest.json \
+  --candidate work/model/gufo-manifest.json \
   --suite quality/release-suite.json \
   --out work/validation/
 
-strix-package \
+gufo-package \
   --model work/model/ \
   --validation work/validation/ \
   --out release/model-shq-t16-4p4bpw/
 
-strix-upload \
+gufo-upload \
   --directory release/model-shq-t16-4p4bpw/ \
-  --repo-id organization/model-SHQ-T16-4p4bpw-Strix-Halo \
+  --repo-id organization/model-SHQ-T16-4p4bpw-gufo \
   --private \
   --dry-run
 
-strix-upload \
+gufo-upload \
   --directory release/model-shq-t16-4p4bpw/ \
-  --repo-id organization/model-SHQ-T16-4p4bpw-Strix-Halo \
+  --repo-id organization/model-SHQ-T16-4p4bpw-gufo \
   --private \
   --execute
 ```
 
-`--dry-run` is a Strix wrapper feature. It validates the file inventory,
+`--dry-run` is a Gufo wrapper feature. It validates the file inventory,
 license, sizes, checksums, authentication state, destination, and release
 report without uploading.
 
@@ -985,20 +985,20 @@ Every utility supports:
 
 ## Hugging Face Model Card
 
-The package `README.md` must clearly state that the weights are a Strix Engine
+The package `README.md` must clearly state that the weights are a Gufo Engine
 deployment format and are not standard Transformers safetensors.
 
 Recommended metadata includes:
 
 ```yaml
 ---
-library_name: strix-engine
+library_name: gufo
 pipeline_tag: text-generation
 base_model: organization/source-model
 base_model_relation: quantized
 license: <upstream-license-id>
 tags:
-  - strix-halo
+  - gufo
   - gfx1151
   - xdna2
   - quantized
@@ -1013,7 +1013,7 @@ The model card also records:
 - Imatrix and recipe hashes.
 - Full-quality teacher dtype and reference runtime.
 - Logit, KL, perplexity, task, and performance reports.
-- Required Strix Engine version and model kind.
+- Required Gufo Engine version and model kind.
 - Supported context and KV-cache formats.
 - Known limitations.
 - Upstream license, attribution, and use restrictions.

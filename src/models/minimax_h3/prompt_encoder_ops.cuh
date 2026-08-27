@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
-#define STRIX_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
+#ifndef GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
+#define GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
 
 // BF16 text-encoder operation boundaries translated from antirez/h3.c
 // h3_shaders.metal at 8974cc055ea9c02fcd14cc27dfda3e1027c05153 (MIT).
@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-namespace strix::minimax_h3::ops {
+namespace gufo::minimax_h3::ops {
 
 __device__ __forceinline__ float Bf16ToFloat(std::uint16_t value) {
   return __uint_as_float(static_cast<std::uint32_t>(value) << 16U);
@@ -523,6 +523,6 @@ inline void LaunchSwiGlu(const std::uint16_t* gate, const std::uint16_t* up,
                      dim3(kThreads), 0, stream, gate, up, output, elements);
 }
 
-}  // namespace strix::minimax_h3::ops
+}  // namespace gufo::minimax_h3::ops
 
-#endif  // STRIX_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
+#endif  // GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_

@@ -124,7 +124,7 @@ void TestQ4() {
   const std::array<std::uint8_t, 8> minima{0, 1, 2, 3, 4, 5, 6, 7};
   const auto block = MakeQ4Block(scales, minima);
   std::array<float, kBlockElements> actual{};
-  strix::quant::DequantizeQ4_K(block.data(), actual.data(), actual.size());
+  gufo::quant::DequantizeQ4_K(block.data(), actual.data(), actual.size());
 
   std::array<float, kBlockElements> expected{};
   for (std::size_t index = 0; index < expected.size(); ++index) {
@@ -143,7 +143,7 @@ void TestQ4() {
   std::iota(vector.begin(), vector.end(), -0.5F);
   const float expected_dot = std::inner_product(
       expected.begin(), expected.end(), vector.begin(), 0.0F);
-  ExpectNear(strix::quant::DotProductQ4_K(block.data(), vector, vector.size()),
+  ExpectNear(gufo::quant::DotProductQ4_K(block.data(), vector, vector.size()),
              expected_dot, "Q4_K dot product");
 }
 
@@ -152,7 +152,7 @@ void TestQ6() {
                                            1,  2,  3,  4,  5,  6,  7,  8};
   const auto block = MakeQ6Block(scales);
   std::array<float, kBlockElements> actual{};
-  strix::quant::DequantizeQ6_K(block.data(), actual.data(), actual.size());
+  gufo::quant::DequantizeQ6_K(block.data(), actual.data(), actual.size());
 
   std::array<float, kBlockElements> expected{};
   for (std::size_t index = 0; index < expected.size(); ++index) {
@@ -172,7 +172,7 @@ void TestQ6() {
   std::iota(vector.begin(), vector.end(), -0.25F);
   const float expected_dot = std::inner_product(
       expected.begin(), expected.end(), vector.begin(), 0.0F);
-  ExpectNear(strix::quant::DotProductQ6_K(block.data(), vector, vector.size()),
+  ExpectNear(gufo::quant::DotProductQ6_K(block.data(), vector, vector.size()),
              expected_dot, "Q6_K dot product");
 }
 
@@ -181,7 +181,7 @@ void TestQ3() {
                                            12,  18,  23,  27, 29, 30, 31, -16};
   const auto block = MakeQ3Block(scales);
   std::array<float, kBlockElements> actual{};
-  strix::quant::DequantizeQ3_K(block.data(), actual.data(), actual.size());
+  gufo::quant::DequantizeQ3_K(block.data(), actual.data(), actual.size());
 
   std::array<float, kBlockElements> expected{};
   for (std::size_t index = 0; index < expected.size(); ++index) {
@@ -200,7 +200,7 @@ void TestQ3() {
   std::iota(vector.begin(), vector.end(), 0.125F);
   const float expected_dot = std::inner_product(
       expected.begin(), expected.end(), vector.begin(), 0.0F);
-  ExpectNear(strix::quant::DotProductQ3_K(block.data(), vector, vector.size()),
+  ExpectNear(gufo::quant::DotProductQ3_K(block.data(), vector, vector.size()),
              expected_dot, "Q3_K dot product");
 }
 
@@ -218,7 +218,7 @@ void TestQ8() {
   }
 
   std::array<float, kBlockElements> actual{};
-  strix::quant::DequantizeQ8_K(&block, actual.data(), actual.size());
+  gufo::quant::DequantizeQ8_K(&block, actual.data(), actual.size());
 
   std::array<float, kBlockElements> expected{};
   for (std::size_t index = 0; index < kBlockElements; ++index) {
@@ -230,7 +230,7 @@ void TestQ8() {
   std::iota(vector.begin(), vector.end(), -0.75F);
   const float expected_dot = std::inner_product(
       expected.begin(), expected.end(), vector.begin(), 0.0F);
-  ExpectNear(strix::quant::DotProductQ8_K(&block, vector, vector.size()),
+  ExpectNear(gufo::quant::DotProductQ8_K(&block, vector, vector.size()),
              expected_dot, "Q8_K dot product");
 }
 
@@ -248,12 +248,12 @@ void TestQ8_0() {
   }
 
   std::array<float, kQ8_0Elements> actual{};
-  strix::quant::DequantizeQ8_0(&block, actual.data(), actual.size());
+  gufo::quant::DequantizeQ8_0(&block, actual.data(), actual.size());
 
   std::array<float, kQ8_0Elements> expected{};
   for (std::size_t index = 0; index < kQ8_0Elements; ++index) {
-    expected[index] = strix::quant::Fp16ToFloat(block.d) *
-                      static_cast<float>(block.qs[index]);
+    expected[index] =
+        gufo::quant::Fp16ToFloat(block.d) * static_cast<float>(block.qs[index]);
     ExpectNear(actual[index], expected[index], "Q8_0 dequant value");
   }
 
@@ -261,7 +261,7 @@ void TestQ8_0() {
   std::iota(vector.begin(), vector.end(), -0.75F);
   const float expected_dot = std::inner_product(
       expected.begin(), expected.end(), vector.begin(), 0.0F);
-  ExpectNear(strix::quant::DotProductQ8_0(&block, vector, vector.size()),
+  ExpectNear(gufo::quant::DotProductQ8_0(&block, vector, vector.size()),
              expected_dot, "Q8_0 dot product");
 }
 
@@ -278,15 +278,13 @@ void TestQ5_K() {
 
   // QuantizedRowBytes covers every packed projection/embedding format used by
   // Qwen, including both Q8 layouts.
-  if (strix::quant::QuantizedRowBytes(strix::core::GgmlType::kQ5_K,
-                                      kQ5Elements) != 176 ||
-      strix::quant::QuantizedRowBytes(strix::core::GgmlType::kQ8_K, 256) !=
-          292 ||
-      strix::quant::QuantizedRowBytes(strix::core::GgmlType::kQ8_0, 32) != 34 ||
-      strix::quant::EncodedSizeBytes(strix::core::GgmlType::kF32, 8) != 32 ||
-      strix::quant::EncodedSizeBytes(strix::core::GgmlType::kBF16, 8) != 16 ||
-      strix::quant::EncodedSizeBytes(strix::core::GgmlType::kQ8_K, 256) !=
-          292) {
+  if (gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kQ5_K,
+                                     kQ5Elements) != 176 ||
+      gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kQ8_K, 256) != 292 ||
+      gufo::quant::QuantizedRowBytes(gufo::core::GgmlType::kQ8_0, 32) != 34 ||
+      gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kF32, 8) != 32 ||
+      gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kBF16, 8) != 16 ||
+      gufo::quant::EncodedSizeBytes(gufo::core::GgmlType::kQ8_K, 256) != 292) {
     std::cerr << "Assertion failed: QuantizedRowBytes contract\n";
     std::exit(1);
   }
@@ -321,7 +319,7 @@ void TestQ5_K() {
 
   const auto check_block = [](const Q5Block& block, bool high_bits) {
     std::array<float, kQ5Elements> actual{};
-    strix::quant::DequantizeQ5_K(&block, actual.data(), actual.size());
+    gufo::quant::DequantizeQ5_K(&block, actual.data(), actual.size());
 
     std::array<float, kQ5Elements> expected{};
     for (std::size_t index = 0; index < kQ5Elements; ++index) {
@@ -337,7 +335,7 @@ void TestQ5_K() {
     unit.fill(1.0F);
     const float expected_dot =
         std::accumulate(expected.begin(), expected.end(), 0.0F);
-    ExpectNear(strix::quant::DotProductQ5_K(&block, unit, unit.size()),
+    ExpectNear(gufo::quant::DotProductQ5_K(&block, unit, unit.size()),
                expected_dot, "Q5_K dot product");
   };
 
@@ -350,8 +348,8 @@ struct ModelSample {
   float value;
 };
 
-void TestModelRow(const strix::core::GgufReader& reader, std::string_view name,
-                  strix::core::GgmlType expected_type, std::size_t expected_k,
+void TestModelRow(const gufo::core::GgufReader& reader, std::string_view name,
+                  gufo::core::GgmlType expected_type, std::size_t expected_k,
                   std::span<const ModelSample> samples, double expected_dot) {
   const auto* tensor = reader.FindTensor(name);
   if (tensor == nullptr || tensor->data == nullptr ||
@@ -367,11 +365,11 @@ void TestModelRow(const strix::core::GgufReader& reader, std::string_view name,
 
   std::vector<float> row(expected_k);
   switch (tensor->type) {
-    case strix::core::GgmlType::kQ4_K:
-      strix::quant::DequantizeQ4_K(tensor->data, row.data(), row.size());
+    case gufo::core::GgmlType::kQ4_K:
+      gufo::quant::DequantizeQ4_K(tensor->data, row.data(), row.size());
       break;
-    case strix::core::GgmlType::kQ6_K:
-      strix::quant::DequantizeQ6_K(tensor->data, row.data(), row.size());
+    case gufo::core::GgmlType::kQ6_K:
+      gufo::quant::DequantizeQ6_K(tensor->data, row.data(), row.size());
       break;
     default:
       std::cerr << "Assertion failed: unsupported model tensor type " << name
@@ -390,16 +388,16 @@ void TestModelRow(const strix::core::GgufReader& reader, std::string_view name,
         static_cast<float>(static_cast<int>(index % 257) - 128) / 64.0F;
   }
   const float actual_dot =
-      tensor->type == strix::core::GgmlType::kQ4_K
-          ? strix::quant::DotProductQ4_K(tensor->data, input, input.size())
-          : strix::quant::DotProductQ6_K(tensor->data, input, input.size());
+      tensor->type == gufo::core::GgmlType::kQ4_K
+          ? gufo::quant::DotProductQ4_K(tensor->data, input, input.size())
+          : gufo::quant::DotProductQ6_K(tensor->data, input, input.size());
   ExpectNear(actual_dot, static_cast<float>(expected_dot),
              "real GGUF dot product", 5.0e-4F);
 }
 
 void TestModelRows(const std::filesystem::path& model_path) {
   std::string error;
-  const auto reader = strix::core::GgufReader::OpenFile(model_path, &error);
+  const auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
   if (reader == nullptr) {
     std::cerr << "Assertion failed: MTP GGUF opens: " << error << '\n';
     std::exit(1);
@@ -424,7 +422,7 @@ void TestModelRows(const std::filesystem::path& model_path) {
       {5119, -0.0033974647521972656F},
   }};
   TestModelRow(*reader, "blk.64.nextn.eh_proj.weight",
-               strix::core::GgmlType::kQ4_K, 10240, kQ4Samples,
+               gufo::core::GgmlType::kQ4_K, 10240, kQ4Samples,
                1.1511284159496427);
 
   constexpr std::array<ModelSample, 16> kQ6Samples{{
@@ -445,7 +443,7 @@ void TestModelRows(const std::filesystem::path& model_path) {
       {4095, 0.02767181396484375F},
       {5119, -0.012220144271850586F},
   }};
-  TestModelRow(*reader, "blk.64.attn_q.weight", strix::core::GgmlType::kQ6_K,
+  TestModelRow(*reader, "blk.64.attn_q.weight", gufo::core::GgmlType::kQ6_K,
                5120, kQ6Samples, 0.5780322588980198);
 }
 
@@ -458,7 +456,7 @@ int main() {
   TestQ8();
   TestQ8_0();
   TestQ5_K();
-  if (const char* model = std::getenv("STRIX_MTP_MODEL");
+  if (const char* model = std::getenv("GUFO_MTP_MODEL");
       model != nullptr && std::string_view(model).size() > 0) {
     TestModelRows(model);
   }

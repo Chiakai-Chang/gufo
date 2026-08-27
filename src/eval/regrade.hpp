@@ -1,9 +1,9 @@
-#ifndef STRIX_EVAL_REGRADE_HPP_
-#define STRIX_EVAL_REGRADE_HPP_
+#ifndef GUFO_EVAL_REGRADE_HPP_
+#define GUFO_EVAL_REGRADE_HPP_
 
 #include "src/eval/trace.hpp"
 
-namespace strix::eval {
+namespace gufo::eval {
 
 struct RegradeSummary {
   std::size_t total_cases{0};
@@ -17,6 +17,6 @@ struct RegradeSummary {
 [[nodiscard]] RegradeSummary RegradeTrace(
     const EvalTraceReport& report) noexcept;
 
-}  // namespace strix::eval
+}  // namespace gufo::eval
 
-#endif  // STRIX_EVAL_REGRADE_HPP_
+#endif  // GUFO_EVAL_REGRADE_HPP_

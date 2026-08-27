@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_GGUF_READER_HPP_
-#define STRIX_CORE_GGUF_READER_HPP_
+#ifndef GUFO_CORE_GGUF_READER_HPP_
+#define GUFO_CORE_GGUF_READER_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -16,7 +16,7 @@
 
 #include "src/core/model_config.hpp"
 
-namespace strix::core {
+namespace gufo::core {
 
 /// GGML tensor types including standard GGML and custom Strix Halo layouts.
 enum class GgmlType : std::uint16_t {
@@ -79,11 +79,11 @@ enum class GgmlType : std::uint16_t {
     case GgmlType::kBF16:
       return "BF16";
     case GgmlType::kStrixSHQ4_T16:
-      return "STRIX_SHQ4_T16";
+      return "GUFO_SHQ4_T16";
     case GgmlType::kStrixSHQ6_T16:
-      return "STRIX_SHQ6_T16";
+      return "GUFO_SHQ6_T16";
     case GgmlType::kStrixSHQ8_T16:
-      return "STRIX_SHQ8_T16";
+      return "GUFO_SHQ8_T16";
   }
   return "UNKNOWN";
 }
@@ -243,6 +243,6 @@ private:
   std::vector<std::unique_ptr<GgufReader>> shards_;
 };
 
-}  // namespace strix::core
+}  // namespace gufo::core
 
-#endif  // STRIX_CORE_GGUF_READER_HPP_
+#endif  // GUFO_CORE_GGUF_READER_HPP_

@@ -1,6 +1,6 @@
 # Benchmark Methodology
 
-How Strix benchmarks are computed, and which utilities produce them. This
+How Gufo benchmarks are computed, and which utilities produce them. This
 file documents the method; per-model results live in `benchmarks/<model>/`
 (readmes), never as raw committed artifacts (`artifacts/` is gitignored).
 This method is teacher-forced and matched-token; it is not free-running
@@ -15,34 +15,34 @@ has one utility; a benchmark consumes the artifacts the earlier steps produce:
 ```bash
 # 1. download safetensors + tokenizer -> artifacts/source
 # 2. validate safetensors, write source manifest
-tools/quant/strix-inspect.py --source artifacts/source --revision <sha> \
+tools/quant/gufo-inspect.py --source artifacts/source --revision <sha> \
   --out artifacts/work/source-manifest.json
 
 # 3. capture full-precision teacher logits + perplexity (matched-token)
-tools/quant/strix-capture.py --source artifacts/source \
+tools/quant/gufo-capture.py --source artifacts/source \
   --suite tools/quant/suites/teacher.json --out artifacts/teacher
 
 # 4. quantize LM linear projections to SHQ4-T16 U4Z G64
-tools/quant/strix-quantize.py --source artifacts/source \
+tools/quant/gufo-quantize.py --source artifacts/source \
   --out artifacts/quant --plan artifacts/work/quantization-plan.json
 
 # 5. benchmark: candidate-vs-teacher quality + prefill/decode speed
-tools/quant/strix-bench.py --source artifacts/source --quant artifacts/quant \
+tools/quant/gufo-bench.py --source artifacts/source --quant artifacts/quant \
   --suite tools/quant/suites/teacher.json --teacher-artifact artifacts/teacher
 ```
 
 Key utilities and their roles:
 
-- `tools/quant/strix-capture.py` — teacher-forced full-precision logit dump. Logits are
+- `tools/quant/gufo-capture.py` — teacher-forced full-precision logit dump. Logits are
   chunked by position, zstd-compressed, checksummed into an artifact dir
   (`manifest.json`, `tokens.u32`, `logits-*.f32.zst`, `metrics.json`).
   This is the teacher oracle; it is captured once and reused.
-- `tools/quant/strix-quantize.py` — deterministic SHQ4 conversion. Records per-tensor
+- `tools/quant/gufo-quantize.py` — deterministic SHQ4 conversion. Records per-tensor
   reconstruction stats (max abs err, rmse, mean abs err) in the plan.
-- `tools/quant/strix-bench.py` — the benchmark itself. Runs the candidate forward pass,
+- `tools/quant/gufo-bench.py` — the benchmark itself. Runs the candidate forward pass,
   compares candidate logits against the captured teacher artifact, and times
   prefill/decode on both.
-- `tools/quant/suites/<model>.json` — prompt suite (schema `strix.suite.v1`):
+- `tools/quant/suites/<model>.json` — prompt suite (schema `gufo.suite.v1`):
   a small fixed set of prompts, tokenized once with the pinned tokenizer.
 
 ## Quality method (matched-token, per position)
@@ -79,7 +79,7 @@ teacher + candidate perplexity.
 
 `positions` in a report equals the total number of scored next-token positions
 across all suite prompts. The captured teacher logit artifact follows the
-`strix.logit-artifact.v1` schema with chunked zstd compression, dynamic
+`gufo.logit-artifact.v1` schema with chunked zstd compression, dynamic
 vocabulary extraction for Qwen3.5-4B and Qwen3.8-27B, and SHA-256 chunk
 manifest validation.
 
@@ -100,7 +100,7 @@ The first slice measures whole-model, whole-prompt quality: one KL per scored
 position, aggregated model-wide. It does not isolate which layer or tensor
 contributes the KL tail. Per-layer and per-tensor attribution (layer-output
 error, per-layer KL, first-divergent-layer search) is a planned refinement;
-`strix-quantize.py` already records per-tensor reconstruction stats, and
+`gufo-quantize.py` already records per-tensor reconstruction stats, and
 `docs/TESTING.md` T3 documents layer-boundary capture. Imatrix search was
 implemented before this planned prerequisite; per-layer attribution is now a
 required catch-up gate before selecting the Qwen3.8-27B production recipe or
@@ -117,20 +117,20 @@ Speed is measured only after logits are comparable
   timed with `time.perf_counter`, median of `--repeats` runs (default 2).
 
 Important: candidate speed here is the reference runtime after
-dequant-reload-to-bf16 — it measures SHQ4 dequant cost, not Strix kernels.
+dequant-reload-to-bf16 — it measures SHQ4 dequant cost, not Gufo kernels.
 Real kernel speed (HIP gfx1151 / XDNA2 AIE2P consuming packed planes
 directly) is a separate, later milestone. Kernel benchmarks will record the
 backend and kernel name per timing row.
 
 ## Focused GPU kernel benchmarks
 
-`strix-kernel-bench` measures production HIP entry points without loading a
+`gufo-kernel-bench` measures production HIP entry points without loading a
 model. It covers matrix operations, attention, DeltaNet, normalization, and
 elementwise kernels. Correctness sentinels run outside the timed interval.
 
 ```sh
-./result/bin/strix-kernel-bench --list
-./result/bin/strix-kernel-bench \
+./result/bin/gufo-kernel-bench --list
+./result/bin/gufo-kernel-bench \
   --case decode-attention \
   --context 4096,8192,12288,16384 \
   --warmup 5 \
@@ -150,14 +150,14 @@ promotion rules.
 
 ## Serving benchmark
 
-`tools/serving/strix-serving-bench.py` is the canonical HTTP serving harness. It sends
+`tools/serving/gufo-serving-bench.py` is the canonical HTTP serving harness. It sends
 synchronized streamed Chat Completions requests at C=1, C=2, and C=4 by
-default. Its `strix.serving-benchmark.v1` artifact reports direct server-stage
+default. Its `gufo.serving-benchmark.v1` artifact reports direct server-stage
 prefill/decode throughput, scheduler and client TTFT, token ITL, whole-request
 throughput, and aggregate concurrency throughput as distinct metrics.
 
-The harness consumes the terminal `usage.strix` metrics emitted by
-`strix serve llm`, retains every request and round sample, and summarizes
+The harness consumes the terminal `usage.gufo` metrics emitted by
+`gufo serve llm`, retains every request and round sample, and summarizes
 median, p95, and p99 behavior. It embeds the canonical machine fingerprint and
 source revision while excluding endpoint hosts, prompts, generated text, local
 paths, raw token IDs, and timestamps.
@@ -171,7 +171,7 @@ and its SHA-256 identifier (`fingerprintId`):
   XDNA2 NPU identity, kernel drivers (`amdgpu`, `amdxdna`), ROCm/HIP, and XRT toolchain pins.
 - **Privacy Redaction**: Hostnames, usernames, process secrets, timestamps, and local
   user paths are strictly excluded from the canonical identity and forbidden in benchmark artifacts.
-- **Validation**: Artifacts can be validated with `strix diagnose --validate-artifact <path>`,
+- **Validation**: Artifacts can be validated with `gufo diagnose --validate-artifact <path>`,
   which checks schema compliance (`schemaVersion: 1.0.0`), re-hashes canonical fields,
   and rejects mismatched fingerprints or incompatible architectures.
 

@@ -1,10 +1,10 @@
-#ifndef STRIX_CORE_HIP_DETAIL_GEMV_DISPATCHER_HPP_
-#define STRIX_CORE_HIP_DETAIL_GEMV_DISPATCHER_HPP_
+#ifndef GUFO_CORE_HIP_DETAIL_GEMV_DISPATCHER_HPP_
+#define GUFO_CORE_HIP_DETAIL_GEMV_DISPATCHER_HPP_
 
 #include <cstdint>
 #include <string_view>
 
-namespace strix::hip::detail {
+namespace gufo::hip::detail {
 
 enum class GemvStrategy : std::uint8_t {
   kBaselineBlock = 0,
@@ -22,6 +22,6 @@ enum class GemvStrategy : std::uint8_t {
   return "unknown";
 }
 
-}  // namespace strix::hip::detail
+}  // namespace gufo::hip::detail
 
-#endif  // STRIX_CORE_HIP_DETAIL_GEMV_DISPATCHER_HPP_
+#endif  // GUFO_CORE_HIP_DETAIL_GEMV_DISPATCHER_HPP_

@@ -1,5 +1,5 @@
-#ifndef STRIX_TOKENIZATION_QWEN_TOKENIZER_HPP_
-#define STRIX_TOKENIZATION_QWEN_TOKENIZER_HPP_
+#ifndef GUFO_TOKENIZATION_QWEN_TOKENIZER_HPP_
+#define GUFO_TOKENIZATION_QWEN_TOKENIZER_HPP_
 
 #include <array>
 #include <cstddef>
@@ -13,11 +13,11 @@
 #include <utility>
 #include <vector>
 
-namespace strix::core {
+namespace gufo::core {
 class GgufReader;
 }
 
-namespace strix::tokenization {
+namespace gufo::tokenization {
 
 using TokenId = std::uint32_t;
 
@@ -108,6 +108,6 @@ private:
   TokenId pad_token_id_{kDefaultQwenEndoftextId};
 };
 
-}  // namespace strix::tokenization
+}  // namespace gufo::tokenization
 
-#endif  // STRIX_TOKENIZATION_QWEN_TOKENIZER_HPP_
+#endif  // GUFO_TOKENIZATION_QWEN_TOKENIZER_HPP_

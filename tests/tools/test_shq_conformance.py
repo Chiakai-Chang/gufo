@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from tools.strix import conformance
+from tools.gufo import conformance
 
 
 class TestShqConformance(unittest.TestCase):

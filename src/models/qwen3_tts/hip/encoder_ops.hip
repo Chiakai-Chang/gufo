@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 namespace {
 
 constexpr std::size_t kThreads = 256;
@@ -456,6 +456,6 @@ void LaunchQuantizeCodebook(float* residual, const float* embedding,
                      codebook_size, code_groups, group_index, update_residual);
 }
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
 #endif

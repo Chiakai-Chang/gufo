@@ -10,11 +10,11 @@ without ONNX Runtime, PyTorch, or a Python runtime in the serving process.
 The backend is a separate source module with no dependency on HIP headers:
 
 ```text
-strix
+gufo
   core/xdna2/
 ```
 
-The NPU module is statically linked into `strix`. The core runtime may
+The NPU module is statically linked into `gufo`. The core runtime may
 initialize both GPU and NPU backends.
 
 ## Current Status
@@ -55,7 +55,7 @@ Reference:
 https://github.com/ypapadop-amd/ggml/tree/hsa-backend/src/ggml-hsa
 
 Do not make that ggml backend a required runtime dependency. Reuse its proven
-integration patterns where useful behind a Strix-owned backend API. Do not make
+integration patterns where useful behind a Gufo-owned backend API. Do not make
 production NPU support depend on undocumented HSA packets or agent behavior.
 
 ## Driver Stack
@@ -63,9 +63,9 @@ production NPU support depend on undocumented HSA packets or agent behavior.
 The intended stack is:
 
 ```text
-Strix scheduler/model implementation
+Gufo scheduler/model implementation
             |
-      Strix XDNA backend
+      Gufo XDNA backend
             |
        XRT NPU shim
             |
@@ -84,7 +84,7 @@ same allocation, synchronization, reset, performance, and compatibility tests
 as XRT.
 
 Raw driver ioctls are a last resort and must be isolated in one translation
-unit. The rest of the runtime uses Strix-owned context, buffer, command, and
+unit. The rest of the runtime uses Gufo-owned context, buffer, command, and
 completion abstractions rather than XRT or HSA types.
 
 ## Backend Objects
@@ -181,7 +181,7 @@ The XDNA2 array is partitioned at column boundaries. The `amdxdna` resource
 solver may allocate spatial partitions or time-share columns between workload
 contexts and other processes.
 
-Consequences for Strix:
+Consequences for Gufo:
 
 - A program declares its required column count in immutable metadata.
 - Context creation may receive fewer available resources than the physical
@@ -192,7 +192,7 @@ Consequences for Strix:
   to the GPU without corrupting request state.
 - Context creation and destruction stay outside latency-critical request paths.
 
-Current upstream documentation describes a 4 x 8 Strix-class array, up to 16
+Current upstream documentation describes a 4 x 8 Gufo-class array, up to 16
 concurrent workload contexts, and a 64 MiB host-resident instruction buffer per
 context. Treat these as capability values queried and validated at startup,
 not constants embedded in memory accounting.
@@ -245,7 +245,7 @@ Programs are compiled ahead of time for fixed shape families:
 - Model-specific fused operations.
 
 JIT compilation is a development feature only. Production builds contain
-content-addressed artifacts embedded in `strix` and built by a pinned
+content-addressed artifacts embedded in `gufo` and built by a pinned
 compiler toolchain.
 
 ## Model Isolation
@@ -316,7 +316,7 @@ Reference:
 https://github.com/Xilinx/aie_api/blob/main/include/aie_api/detail/aie2p/mmul_8_4.hpp
 
 The current ggml-HSA GEMM interface accepts one shared input dtype and therefore
-does not expose this path. Strix must provide separate A and B types, a custom
+does not expose this path. Gufo must provide separate A and B types, a custom
 microkernel, and a fused group-scale epilogue.
 
 ## Work Suited to the NPU

@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_XDNA2_QWEN_MTP_EH_PROJ_H_
-#define STRIX_CORE_XDNA2_QWEN_MTP_EH_PROJ_H_
+#ifndef GUFO_CORE_XDNA2_QWEN_MTP_EH_PROJ_H_
+#define GUFO_CORE_XDNA2_QWEN_MTP_EH_PROJ_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -11,7 +11,7 @@
 #include "src/core/xdna2/device.h"
 #include "src/models/qwen/state.hpp"
 
-namespace strix::xdna2 {
+namespace gufo::xdna2 {
 
 inline constexpr std::size_t kQwenMtpEhProjInputElements = 10240;
 inline constexpr std::size_t kQwenMtpEhProjOutputElements = 5120;
@@ -104,6 +104,6 @@ private:
   bool quarantined_{false};
 };
 
-}  // namespace strix::xdna2
+}  // namespace gufo::xdna2
 
-#endif  // STRIX_CORE_XDNA2_QWEN_MTP_EH_PROJ_H_
+#endif  // GUFO_CORE_XDNA2_QWEN_MTP_EH_PROJ_H_

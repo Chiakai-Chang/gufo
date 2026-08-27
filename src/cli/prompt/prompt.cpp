@@ -30,12 +30,12 @@
 #include "src/models/qwen/hip/mtp.hpp"
 #endif
 
-namespace strix::cli {
+namespace gufo::cli {
 
 void PrintPromptHelp(std::string_view program_name) {
   PromptOptions opt;
-  strix::cli::ArgParser parser(std::string(program_name) + " prompt",
-                               "Execute one prompt request and exit.");
+  gufo::cli::ArgParser parser(std::string(program_name) + " prompt",
+                              "Execute one prompt request and exit.");
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
   parser.AddOption("-p", "--prompt", "TEXT", "Direct input prompt text",
@@ -127,7 +127,7 @@ void PrintPromptHelp(std::string_view program_name) {
 
 void PrintChatHelp(std::string_view program_name) {
   PromptOptions opt;
-  strix::cli::ArgParser parser(
+  gufo::cli::ArgParser parser(
       std::string(program_name) + " chat",
       "Start an interactive conversation session in the terminal.");
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
@@ -306,8 +306,8 @@ int RunDeepSeekPrompt(const PromptOptions& opt,
 std::optional<PromptOptions> ParsePromptOptions(
     std::span<const char* const> args, std::string* error_msg) {
   PromptOptions opt;
-  strix::cli::ArgParser parser("strix prompt",
-                               "Execute one prompt request and exit.");
+  gufo::cli::ArgParser parser("gufo prompt",
+                              "Execute one prompt request and exit.");
   // Model
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
@@ -482,10 +482,10 @@ int RunPrompt(std::span<const char* const> args) {
   if (!opt_res.has_value()) {
     if (!parse_err.empty()) {
       std::cerr << "Error: " << parse_err << "\n";
-      PrintPromptHelp("strix");
+      PrintPromptHelp("gufo");
       return 2;
     }
-    PrintPromptHelp("strix");
+    PrintPromptHelp("gufo");
     return 0;
   }
 
@@ -508,27 +508,27 @@ int RunPrompt(std::span<const char* const> args) {
   }
 
   if (opt.prompt_text.empty() && opt.model_path.empty()) {
-    PrintPromptHelp("strix");
+    PrintPromptHelp("gufo");
     return 0;
   }
 
   if (opt.model_path.empty()) {
     std::cout
-        << "strix prompt: prompt received: \"" << opt.prompt_text << "\"\n"
+        << "gufo prompt: prompt received: \"" << opt.prompt_text << "\"\n"
         << "(Specify --model <PATH.gguf> to execute local model generation)\n";
     return 0;
   }
 
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
-  auto reader_owner = strix::core::GgufReader::OpenFile(opt.model_path, &err);
+  auto reader_owner = gufo::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader_owner) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
     PrintModelLoadTime(model_load_start, false);
     return 1;
   }
-  const std::shared_ptr<const strix::core::GgufReader> reader(
+  const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -562,7 +562,7 @@ int RunPrompt(std::span<const char* const> args) {
   int dev_count = 0;
   if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
       dev_count > 0) {
-    auto gpu_exec = strix::hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
+    auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
     if (gpu_exec) {
       PrintModelLoadTime(model_load_start);
       const auto prompt_tokens =
@@ -605,7 +605,7 @@ int RunPrompt(std::span<const char* const> args) {
             opt.speculative_backend == "dflash-2") {
           std::string dflash_path = opt.dflash_model_path;
           if (dflash_path.empty()) {
-            if (const char* environment = std::getenv("STRIX_DFLASH_MODEL");
+            if (const char* environment = std::getenv("GUFO_DFLASH_MODEL");
                 environment != nullptr) {
               dflash_path = environment;
             }
@@ -638,7 +638,7 @@ int RunPrompt(std::span<const char* const> args) {
                    opt.speculative_backend == "mtp-npu") {
           std::string mtp_path = opt.mtp_model_path;
           if (mtp_path.empty()) {
-            if (const char* environment = std::getenv("STRIX_MTP_MODEL");
+            if (const char* environment = std::getenv("GUFO_MTP_MODEL");
                 environment != nullptr) {
               mtp_path = environment;
             }
@@ -807,23 +807,23 @@ int RunChat(std::span<const char* const> args) {
   if (!opt_res.has_value()) {
     if (!parse_err.empty()) {
       std::cerr << "Error: " << parse_err << "\n";
-      PrintChatHelp("strix");
+      PrintChatHelp("gufo");
       return 2;
     }
-    PrintChatHelp("strix");
+    PrintChatHelp("gufo");
     return 0;
   }
 
   const auto& opt = *opt_res;
   if (opt.model_path.empty()) {
-    std::cout << "strix chat: interactive conversation mode\n"
+    std::cout << "gufo chat: interactive conversation mode\n"
               << "(Specify --model <PATH.gguf> to load model weights)\n";
     return 0;
   }
 
   const auto model_load_start = std::chrono::steady_clock::now();
   std::string err;
-  const auto reader = strix::core::GgufReader::OpenFile(opt.model_path, &err);
+  const auto reader = gufo::core::GgufReader::OpenFile(opt.model_path, &err);
   if (!reader) {
     std::cerr << "Error loading GGUF model '" << opt.model_path << "': " << err
               << "\n";
@@ -839,7 +839,7 @@ int RunChat(std::span<const char* const> args) {
   }
   PrintModelLoadTime(model_load_start);
 
-  std::cout << "=== Strix Halo Interactive Chat ("
+  std::cout << "=== Gufo Interactive Chat ("
             << generator->GetConfig().architecture << ") ===\n"
             << "Type 'exit' or Ctrl+D to quit.\n\n";
 
@@ -902,4 +902,4 @@ int RunChat(std::span<const char* const> args) {
   return 0;
 }
 
-}  // namespace strix::cli
+}  // namespace gufo::cli

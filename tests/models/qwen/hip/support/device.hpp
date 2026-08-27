@@ -1,5 +1,5 @@
-#ifndef STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_HPP_
-#define STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_HPP_
+#ifndef GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_HPP_
+#define GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_HPP_
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -8,7 +8,7 @@
 #include <iostream>
 #include <string_view>
 
-namespace strix::test {
+namespace gufo::test {
 
 enum class HipDeviceRequirement { kOptional, kRequired };
 
@@ -51,7 +51,7 @@ inline constexpr int kCtestSkipReturnCode = 77;
   return result;
 }
 
-}  // namespace strix::test
+}  // namespace gufo::test
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_HPP_
+#endif  // GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_DEVICE_HPP_

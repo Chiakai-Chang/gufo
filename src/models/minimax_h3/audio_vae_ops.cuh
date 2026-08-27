@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_MINIMAX_H3_AUDIO_VAE_OPS_CUH_
-#define STRIX_MODELS_MINIMAX_H3_AUDIO_VAE_OPS_CUH_
+#ifndef GUFO_MODELS_MINIMAX_H3_AUDIO_VAE_OPS_CUH_
+#define GUFO_MODELS_MINIMAX_H3_AUDIO_VAE_OPS_CUH_
 
 #include <hip/hip_runtime.h>
 
@@ -8,7 +8,7 @@
 
 #include "src/models/minimax_h3/audio_vae.hpp"
 
-namespace strix::minimax_h3::audio_vae_ops {
+namespace gufo::minimax_h3::audio_vae_ops {
 
 static __global__ void PrepareLatentKernel(const float* normalized,
                                            const float* mean,
@@ -607,6 +607,6 @@ inline void LaunchClipAndReorder(const float* input, float* channel_major,
                      0, stream, input, channel_major, samples);
 }
 
-}  // namespace strix::minimax_h3::audio_vae_ops
+}  // namespace gufo::minimax_h3::audio_vae_ops
 
-#endif  // STRIX_MODELS_MINIMAX_H3_AUDIO_VAE_OPS_CUH_
+#endif  // GUFO_MODELS_MINIMAX_H3_AUDIO_VAE_OPS_CUH_

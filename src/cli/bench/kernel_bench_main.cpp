@@ -29,8 +29,8 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 
-#ifndef STRIX_VERSION
-#define STRIX_VERSION "development"
+#ifndef GUFO_VERSION
+#define GUFO_VERSION "development"
 #endif
 
 namespace {
@@ -376,9 +376,9 @@ std::vector<double> MeasureKernel(const CommandLineOptions& options,
   return samples_us;
 }
 
-strix::bench::KernelBenchResult FinalizeResult(
-    strix::bench::KernelBenchResult result, std::vector<double> samples_us) {
-  result.timing = strix::bench::ComputeKernelBenchStatistics(samples_us);
+gufo::bench::KernelBenchResult FinalizeResult(
+    gufo::bench::KernelBenchResult result, std::vector<double> samples_us) {
+  result.timing = gufo::bench::ComputeKernelBenchStatistics(samples_us);
   if (result.tokens_per_iteration != 0) {
     result.tokens_per_second =
         (static_cast<double>(result.tokens_per_iteration) * 1'000'000.0) /
@@ -405,7 +405,7 @@ std::uint64_t EstimateDecodeAttentionBytes(std::size_t context) {
   return cache_reads + query_gate_and_output + cache_writes;
 }
 
-strix::bench::KernelBenchResult BenchmarkDecodeAttention(
+gufo::bench::KernelBenchResult BenchmarkDecodeAttention(
     std::size_t context, const CommandLineOptions& options,
     hipStream_t stream) {
   const std::size_t query_elements =
@@ -424,8 +424,8 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
   HipBuffer<std::uint16_t> value_cache_f16(cache_elements);
   HipBuffer<float> output(query_elements);
   HipBuffer<float> split_k_scratch(
-      strix::hip::detail::DecodeAttentionScratchElements(kAttentionHeads,
-                                                         kAttentionHeadDim));
+      gufo::hip::detail::DecodeAttentionScratchElements(kAttentionHeads,
+                                                        kAttentionHeadDim));
 
   FillBytes(query, 0x3c, stream);
   FillBytes(gate, 0x3c, stream);
@@ -438,8 +438,8 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
   HIP_CHECK(hipStreamSynchronize(stream));
 
   const std::uint32_t split_count =
-      strix::hip::detail::SelectDecodeAttentionSplitCount(context);
-  const bool use_split_k = strix::hip::detail::IsSplitKDecodeAttentionSupported(
+      gufo::hip::detail::SelectDecodeAttentionSplitCount(context);
+  const bool use_split_k = gufo::hip::detail::IsSplitKDecodeAttentionSupported(
       context, kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim);
   const std::string backend = use_split_k ? "split_k_fp32" : "online_fp32";
   const std::string marker =
@@ -447,7 +447,7 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
       "/heads=24/kv_heads=4/head_dim=256/backend=" + backend +
       "/splits=" + std::to_string(split_count);
   const auto launch = [&] {
-    strix::hip::LaunchAttention(
+    gufo::hip::LaunchAttention(
         query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
         value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
         output.Get(), 0, static_cast<std::uint32_t>(context - 1),
@@ -457,7 +457,7 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
   auto samples_us = MeasureKernel(options, marker, stream, launch);
   VerifyFiniteNonzero(output);
 
-  strix::bench::KernelBenchResult result;
+  gufo::bench::KernelBenchResult result;
   result.kernel = "decode_attention";
   result.backend = backend;
   result.marker = marker;
@@ -474,8 +474,8 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
   if (use_split_k) {
     result.estimated_bytes_per_iteration +=
         2U *
-        strix::hip::detail::DecodeAttentionScratchElements(kAttentionHeads,
-                                                           kAttentionHeadDim) *
+        gufo::hip::detail::DecodeAttentionScratchElements(kAttentionHeads,
+                                                          kAttentionHeadDim) *
         sizeof(float);
     result.dispatch.selected_attention_backend = "decode_split_k_fp32";
   } else {
@@ -486,26 +486,26 @@ strix::bench::KernelBenchResult BenchmarkDecodeAttention(
   return FinalizeResult(std::move(result), std::move(samples_us));
 }
 
-strix::bench::KernelBenchResult BenchmarkGemv(const CommandLineOptions& options,
-                                              hipStream_t stream) {
+gufo::bench::KernelBenchResult BenchmarkGemv(const CommandLineOptions& options,
+                                             hipStream_t stream) {
   const bool is_bf16 = options.data_type == "bf16";
   HipBuffer<float> input(options.k);
   HipBuffer<float> output(options.m);
   FillBytes(input, 0x3c, stream);
 
   const auto weight_type =
-      is_bf16 ? strix::core::GgmlType::kBF16 : strix::core::GgmlType::kF32;
-  const auto resolution = strix::models::qwen::ResolveQwenGemmRoute(
+      is_bf16 ? gufo::core::GgmlType::kBF16 : gufo::core::GgmlType::kF32;
+  const auto resolution = gufo::models::qwen::ResolveQwenGemmRoute(
       {.type = weight_type,
        .batch_size = 1,
        .m = options.m,
        .k = options.k,
-       .mode = strix::models::qwen::QwenGemmMode::kHipDecode});
+       .mode = gufo::models::qwen::QwenGemmMode::kHipDecode});
   if (!resolution.accepted()) {
     throw std::invalid_argument("unsupported Qwen GEMV benchmark route");
   }
   const std::string strategy(
-      strix::models::qwen::QwenGemmRouteName(resolution.route));
+      gufo::models::qwen::QwenGemmRouteName(resolution.route));
   const std::string marker = "gemv/m=" + std::to_string(options.m) +
                              "/k=" + std::to_string(options.k) +
                              "/type=" + options.data_type +
@@ -517,18 +517,18 @@ strix::bench::KernelBenchResult BenchmarkGemv(const CommandLineOptions& options,
     FillBytes(weights, 0x3f, stream);
     weight_value = Bf16FromBits(kBf16PatternBits);
     samples_us = MeasureKernel(options, marker, stream, [&] {
-      strix::hip::LaunchGEMV(weights.Get(), strix::core::GgmlType::kBF16,
-                             input.Get(), output.Get(), options.m, options.k,
-                             stream);
+      gufo::hip::LaunchGEMV(weights.Get(), gufo::core::GgmlType::kBF16,
+                            input.Get(), output.Get(), options.m, options.k,
+                            stream);
     });
   } else {
     HipBuffer<float> weights(options.m * options.k);
     FillBytes(weights, 0x3c, stream);
     weight_value = FloatFromBits(kFloatPatternBits);
     samples_us = MeasureKernel(options, marker, stream, [&] {
-      strix::hip::LaunchGEMV(weights.Get(), strix::core::GgmlType::kF32,
-                             input.Get(), output.Get(), options.m, options.k,
-                             stream);
+      gufo::hip::LaunchGEMV(weights.Get(), gufo::core::GgmlType::kF32,
+                            input.Get(), output.Get(), options.m, options.k,
+                            stream);
     });
   }
 
@@ -543,7 +543,7 @@ strix::bench::KernelBenchResult BenchmarkGemv(const CommandLineOptions& options,
       (static_cast<std::uint64_t>(options.k) * sizeof(float)) +
       (static_cast<std::uint64_t>(options.m) * sizeof(float));
 
-  strix::bench::KernelBenchResult result;
+  gufo::bench::KernelBenchResult result;
   result.kernel = "gemv";
   result.backend = "custom_hip";
   result.marker = marker;
@@ -560,13 +560,13 @@ strix::bench::KernelBenchResult BenchmarkGemv(const CommandLineOptions& options,
   return FinalizeResult(std::move(result), std::move(samples_us));
 }
 
-strix::bench::KernelBenchResult BenchmarkGemm(std::size_t batch_size,
-                                              const CommandLineOptions& options,
-                                              hipStream_t stream) {
+gufo::bench::KernelBenchResult BenchmarkGemm(std::size_t batch_size,
+                                             const CommandLineOptions& options,
+                                             hipStream_t stream) {
   const bool is_bf16 = options.data_type == "bf16";
   HipBuffer<float> output(batch_size * options.m);
   HipblasHandle hipblas;
-  strix::hip::HipblasLtDispatchInfo dispatch_info;
+  gufo::hip::HipblasLtDispatchInfo dispatch_info;
   bool used_hipblaslt = false;
   bool hipblaslt_rejected = false;
   bool dispatch_captured = false;
@@ -583,9 +583,9 @@ strix::bench::KernelBenchResult BenchmarkGemm(std::size_t batch_size,
     FillBytes(weights, 0x3f, stream);
     FillBytes(input, 0x3f, stream);
     operand_value = Bf16FromBits(kBf16PatternBits);
-    strix::hip::HipblasLtGemm hipblaslt;
+    gufo::hip::HipblasLtGemm hipblaslt;
     samples_us = MeasureKernel(options, marker, stream, [&] {
-      strix::hip::HipblasLtDispatchInfo current_info;
+      gufo::hip::HipblasLtDispatchInfo current_info;
       auto* current_info_ptr = dispatch_captured ? nullptr : &current_info;
       if (hipblaslt.RunBf16(weights.Get(), input.Get(), output.Get(),
                             batch_size, options.m, options.k, stream,
@@ -597,9 +597,9 @@ strix::bench::KernelBenchResult BenchmarkGemm(std::size_t batch_size,
         }
       } else {
         hipblaslt_rejected = true;
-        strix::hip::LaunchHipblasGEMMBF16(hipblas.Get(), weights.Get(),
-                                          input.Get(), output.Get(), batch_size,
-                                          options.m, options.k, stream);
+        gufo::hip::LaunchHipblasGEMMBF16(hipblas.Get(), weights.Get(),
+                                         input.Get(), output.Get(), batch_size,
+                                         options.m, options.k, stream);
       }
     });
   } else {
@@ -609,9 +609,9 @@ strix::bench::KernelBenchResult BenchmarkGemm(std::size_t batch_size,
     FillBytes(input, 0x3c, stream);
     operand_value = FloatFromBits(kFloatPatternBits);
     samples_us = MeasureKernel(options, marker, stream, [&] {
-      strix::hip::LaunchHipblasGEMM(hipblas.Get(), weights.Get(), false,
-                                    input.Get(), output.Get(), batch_size,
-                                    options.m, options.k, nullptr, stream);
+      gufo::hip::LaunchHipblasGEMM(hipblas.Get(), weights.Get(), false,
+                                   input.Get(), output.Get(), batch_size,
+                                   options.m, options.k, nullptr, stream);
     });
   }
 
@@ -625,7 +625,7 @@ strix::bench::KernelBenchResult BenchmarkGemm(std::size_t batch_size,
       (static_cast<std::uint64_t>(batch_size) * options.k * element_bytes) +
       (static_cast<std::uint64_t>(batch_size) * options.m * sizeof(float));
 
-  strix::bench::KernelDispatchTelemetry dispatch;
+  gufo::bench::KernelDispatchTelemetry dispatch;
   if (used_hipblaslt) {
     dispatch.hipblaslt_algorithm_id = dispatch_info.algorithm_id;
     dispatch.hipblaslt_solution_name = dispatch_info.solution_name;
@@ -642,7 +642,7 @@ strix::bench::KernelBenchResult BenchmarkGemm(std::size_t batch_size,
     dispatch.persistent_plan_cache_status = "miss";
   }
 
-  strix::bench::KernelBenchResult result;
+  gufo::bench::KernelBenchResult result;
   result.kernel = "gemm";
   result.backend = used_hipblaslt ? "hipblaslt" : "hipblas";
   result.marker = marker;
@@ -677,7 +677,7 @@ std::uint64_t EstimateBatchedAttentionBytes(std::size_t context,
          (sequence_pairs * attention_width * 2U * cache_element_bytes);
 }
 
-strix::bench::KernelBenchResult BenchmarkBatchedAttention(
+gufo::bench::KernelBenchResult BenchmarkBatchedAttention(
     std::size_t context, const CommandLineOptions& options,
     hipStream_t stream) {
   const std::size_t attention_width =
@@ -713,16 +713,16 @@ strix::bench::KernelBenchResult BenchmarkBatchedAttention(
       "batched_attention/context=" + std::to_string(context) +
       "/heads=24/kv_heads=4/head_dim=256/backend=auto";
   const auto launch = [&] {
-    if (!strix::hip::detail::ShouldAttemptOptimizedAttention(context)) {
+    if (!gufo::hip::detail::ShouldAttemptOptimizedAttention(context)) {
       selected_backend = "baseline";
-      strix::hip::LaunchBatchedAttention(
+      gufo::hip::LaunchBatchedAttention(
           query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
           value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
           output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
           kAttentionHeads, kAttentionKvHeads, kAttentionHeadDim, stream);
       return;
     }
-    if (strix::hip::LaunchBatchedAttentionTile(
+    if (gufo::hip::LaunchBatchedAttentionTile(
             query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
             value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
             output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
@@ -734,7 +734,7 @@ strix::bench::KernelBenchResult BenchmarkBatchedAttention(
         rejected_fast_paths.end()) {
       rejected_fast_paths.emplace_back("tiled: rejected");
     }
-    if (strix::hip::LaunchBatchedAttentionCk(
+    if (gufo::hip::LaunchBatchedAttentionCk(
             query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
             value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
             scratch_f16.Get(), output.Get(), 0, 0, context,
@@ -748,7 +748,7 @@ strix::bench::KernelBenchResult BenchmarkBatchedAttention(
       rejected_fast_paths.emplace_back("composable_kernel: rejected");
     }
     selected_backend = "baseline";
-    strix::hip::LaunchBatchedAttention(
+    gufo::hip::LaunchBatchedAttention(
         query.Get(), key.Get(), value.Get(), gate.Get(), key_cache.Get(),
         value_cache.Get(), key_cache_f16.Get(), value_cache_f16.Get(),
         output.Get(), 0, 0, context, static_cast<std::uint32_t>(context),
@@ -757,7 +757,7 @@ strix::bench::KernelBenchResult BenchmarkBatchedAttention(
   auto samples_us = MeasureKernel(options, marker, stream, launch);
   VerifyFiniteNonzero(output);
 
-  if (!strix::hip::detail::ShouldAttemptOptimizedAttention(context)) {
+  if (!gufo::hip::detail::ShouldAttemptOptimizedAttention(context)) {
     rejected_fast_paths = {
         "tiled: below optimized-attention threshold",
         "composable_kernel: below optimized-attention threshold",
@@ -765,7 +765,7 @@ strix::bench::KernelBenchResult BenchmarkBatchedAttention(
   }
   const bool uses_f16_cache =
       selected_backend == "tiled" || selected_backend == "composable_kernel";
-  strix::bench::KernelBenchResult result;
+  gufo::bench::KernelBenchResult result;
   result.kernel = "batched_attention";
   result.backend = selected_backend;
   result.marker = marker;
@@ -785,10 +785,10 @@ strix::bench::KernelBenchResult BenchmarkBatchedAttention(
   return FinalizeResult(std::move(result), std::move(samples_us));
 }
 
-strix::bench::KernelBenchResult BenchmarkDeltaNet(
+gufo::bench::KernelBenchResult BenchmarkDeltaNet(
     std::size_t batch_size, const CommandLineOptions& options,
     hipStream_t stream) {
-  const strix::core::ModelConfig config;
+  const gufo::core::ModelConfig config;
   const std::uint32_t num_key_heads = config.ssm_group_count;
   const std::uint32_t num_heads = config.ssm_time_step_rank;
   const std::uint32_t key_dim = config.ssm_state_size;
@@ -832,7 +832,7 @@ strix::bench::KernelBenchResult BenchmarkDeltaNet(
                              "/key_dim=" + std::to_string(key_dim) +
                              "/val_dim=" + std::to_string(val_dim);
   auto samples_us = MeasureKernel(options, marker, stream, [&] {
-    strix::hip::LaunchBatchedSSMConvRecurrence(
+    gufo::hip::LaunchBatchedSSMConvRecurrence(
         qkv.Get(), conv_weights.Get(), conv_state.Get(), conv_output.Get(),
         deltanet_state.Get(), alpha.Get(), beta.Get(), ssm_a.Get(),
         ssm_dt.Get(), ssm_norm.Get(), gate.Get(), output.Get(), 0, batch_size,
@@ -847,7 +847,7 @@ strix::bench::KernelBenchResult BenchmarkDeltaNet(
   const std::uint64_t persistent_elements =
       (static_cast<std::uint64_t>(qkv_size) * config.ssm_conv_kernel * 2U) +
       (static_cast<std::uint64_t>(delta_size) * 2U);
-  strix::bench::KernelBenchResult result;
+  gufo::bench::KernelBenchResult result;
   result.kernel = "deltanet_recurrence";
   result.backend = "batched_gpu";
   result.marker = marker;
@@ -867,7 +867,7 @@ strix::bench::KernelBenchResult BenchmarkDeltaNet(
   return FinalizeResult(std::move(result), std::move(samples_us));
 }
 
-strix::bench::KernelBenchResult BenchmarkRmsNorm(
+gufo::bench::KernelBenchResult BenchmarkRmsNorm(
     std::size_t batch_size, const CommandLineOptions& options,
     hipStream_t stream) {
   const std::size_t elements = batch_size * options.k;
@@ -881,16 +881,16 @@ strix::bench::KernelBenchResult BenchmarkRmsNorm(
   const std::string marker = "rmsnorm/batch=" + std::to_string(batch_size) +
                              "/dim=" + std::to_string(options.k);
   auto samples_us = MeasureKernel(options, marker, stream, [&] {
-    strix::hip::LaunchBatchedRMSNorm(input.Get(), weight.Get(), output.Get(),
-                                     nullptr, batch_size, options.k, 1e-6F,
-                                     stream);
+    gufo::hip::LaunchBatchedRMSNorm(input.Get(), weight.Get(), output.Get(),
+                                    nullptr, batch_size, options.k, 1e-6F,
+                                    stream);
   });
   const float input_value = FloatFromBits(kFloatPatternBits);
   const float expected =
       (input_value / std::sqrt((input_value * input_value) + 1e-6F)) * 1.25F;
   VerifyUniformOutput(output, expected, 2e-3F, 2e-3F);
 
-  strix::bench::KernelBenchResult result;
+  gufo::bench::KernelBenchResult result;
   result.kernel = "rmsnorm";
   result.backend = "batched_gpu";
   result.marker = marker;
@@ -908,7 +908,7 @@ strix::bench::KernelBenchResult BenchmarkRmsNorm(
   return FinalizeResult(std::move(result), std::move(samples_us));
 }
 
-strix::bench::KernelBenchResult BenchmarkResidualAdd(
+gufo::bench::KernelBenchResult BenchmarkResidualAdd(
     std::size_t batch_size, const CommandLineOptions& options,
     hipStream_t stream) {
   const std::size_t elements = batch_size * options.k;
@@ -922,14 +922,14 @@ strix::bench::KernelBenchResult BenchmarkResidualAdd(
       "residual_add/batch=" + std::to_string(batch_size) +
       "/dim=" + std::to_string(options.k);
   auto samples_us = MeasureKernel(options, marker, stream, [&] {
-    strix::hip::LaunchBatchedResidualAdd(a.Get(), b.Get(), output.Get(),
-                                         batch_size, options.k, stream);
+    gufo::hip::LaunchBatchedResidualAdd(a.Get(), b.Get(), output.Get(),
+                                        batch_size, options.k, stream);
   });
   const float expected =
       FloatFromBits(kFloatPatternBits) + FloatFromBits(0x3d3d3d3dU);
   VerifyUniformOutput(output, expected);
 
-  strix::bench::KernelBenchResult result;
+  gufo::bench::KernelBenchResult result;
   result.kernel = "residual_add";
   result.backend = "batched_gpu";
   result.marker = marker;
@@ -946,7 +946,7 @@ strix::bench::KernelBenchResult BenchmarkResidualAdd(
   return FinalizeResult(std::move(result), std::move(samples_us));
 }
 
-strix::bench::KernelBenchResult BenchmarkSwiGlu(
+gufo::bench::KernelBenchResult BenchmarkSwiGlu(
     std::size_t batch_size, const CommandLineOptions& options,
     hipStream_t stream) {
   const std::size_t elements = batch_size * options.k;
@@ -959,8 +959,8 @@ strix::bench::KernelBenchResult BenchmarkSwiGlu(
   const std::string marker = "swiglu/batch=" + std::to_string(batch_size) +
                              "/dim=" + std::to_string(options.k);
   auto samples_us = MeasureKernel(options, marker, stream, [&] {
-    strix::hip::LaunchBatchedSwiGLUActivation(
-        gate.Get(), up.Get(), output.Get(), nullptr, elements, stream);
+    gufo::hip::LaunchBatchedSwiGLUActivation(gate.Get(), up.Get(), output.Get(),
+                                             nullptr, elements, stream);
   });
   const float gate_value = FloatFromBits(kFloatPatternBits);
   const float up_value = FloatFromBits(0x3d3d3d3dU);
@@ -968,7 +968,7 @@ strix::bench::KernelBenchResult BenchmarkSwiGlu(
       (gate_value / (1.0F + std::exp(-gate_value))) * up_value;
   VerifyUniformOutput(output, expected);
 
-  strix::bench::KernelBenchResult result;
+  gufo::bench::KernelBenchResult result;
   result.kernel = "swiglu";
   result.backend = "batched_gpu";
   result.marker = marker;
@@ -985,7 +985,7 @@ strix::bench::KernelBenchResult BenchmarkSwiGlu(
   return FinalizeResult(std::move(result), std::move(samples_us));
 }
 
-void AppendKernelResults(strix::bench::KernelBenchReport& report,
+void AppendKernelResults(gufo::bench::KernelBenchReport& report,
                          const CommandLineOptions& options,
                          hipStream_t stream) {
   for (const auto& kernel : options.kernels) {
@@ -1035,16 +1035,16 @@ int Run(std::span<const char* const> args) {
   HIP_CHECK(hipGetDeviceProperties(&properties, device));
   if (std::string_view(properties.gcnArchName).find("gfx1151") ==
       std::string_view::npos) {
-    throw std::runtime_error("strix-kernel-bench requires gfx1151");
+    throw std::runtime_error("gufo-kernel-bench requires gfx1151");
   }
 
-  const auto inventory = strix::diagnostics::CollectSystemInventory();
+  const auto inventory = gufo::diagnostics::CollectSystemInventory();
   const auto fingerprint =
-      strix::diagnostics::GenerateMachineFingerprint(inventory);
+      gufo::diagnostics::GenerateMachineFingerprint(inventory);
 
-  strix::bench::KernelBenchReport report;
+  gufo::bench::KernelBenchReport report;
   report.fingerprint_id = fingerprint.fingerprint_id;
-  report.engine_revision = STRIX_VERSION;
+  report.engine_revision = GUFO_VERSION;
   report.device_name = properties.name;
   report.gpu_architecture = properties.gcnArchName;
   report.compute_units = properties.multiProcessorCount;
@@ -1076,7 +1076,7 @@ int main(int argc, char* argv[]) {
     return Run(
         std::span<const char* const>(argv, static_cast<std::size_t>(argc)));
   } catch (const std::exception& error) {
-    std::cerr << "strix-kernel-bench: " << error.what() << "\n";
+    std::cerr << "gufo-kernel-bench: " << error.what() << "\n";
     return 1;
   }
 }

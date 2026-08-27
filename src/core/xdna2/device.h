@@ -1,12 +1,12 @@
-#ifndef STRIX_CORE_XDNA2_DEVICE_H_
-#define STRIX_CORE_XDNA2_DEVICE_H_
+#ifndef GUFO_CORE_XDNA2_DEVICE_H_
+#define GUFO_CORE_XDNA2_DEVICE_H_
 
 #include <cstdint>
 #include <string>
 
 #include "src/core/diagnostics/system_inventory.h"
 
-namespace strix::xdna2 {
+namespace gufo::xdna2 {
 
 struct XrtDeviceInfo {
   bool available{false};
@@ -25,6 +25,6 @@ struct XrtDeviceInfo {
 [[nodiscard]] XrtDeviceInfo DiscoverXrtDevice(
     std::uint32_t device_index, const diagnostics::SystemInventory& inventory);
 
-}  // namespace strix::xdna2
+}  // namespace gufo::xdna2
 
-#endif  // STRIX_CORE_XDNA2_DEVICE_H_
+#endif  // GUFO_CORE_XDNA2_DEVICE_H_

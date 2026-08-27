@@ -112,7 +112,7 @@ non-finite metrics, wrong hashes, and incomplete role sets fail closed.
 Seal a completed staging directory atomically:
 
 ```sh
-nix develop -c python3 tools/h3/strix-h3-quality.py seal \
+nix develop -c python3 tools/h3/gufo-h3-quality.py seal \
   --staging /var/llms/h3-oracles/staging/fox-layer50 \
   --template /var/llms/h3-oracles/specs/fox-layer50.json \
   --store /var/llms/h3-oracles/sha256
@@ -121,7 +121,7 @@ nix develop -c python3 tools/h3/strix-h3-quality.py seal \
 Verify without executing the model:
 
 ```sh
-nix develop -c python3 tools/h3/strix-h3-quality.py verify \
+nix develop -c python3 tools/h3/gufo-h3-quality.py verify \
   --artifact /var/llms/h3-oracles/sha256/<sha256>
 ```
 
@@ -449,9 +449,9 @@ End-to-end reports include:
 - subject, count, anatomy, motion, composition, color, and prompt-adherence
   review.
 
-`tools/strix/h3_quality.py` includes dependency-light numerical, global-SSIM,
+`tools/gufo/h3_quality.py` includes dependency-light numerical, global-SSIM,
 Gaussian-window SSIM, temporal, and spectrogram diagnostics used by CI
-corruption tests. `tools/strix/h3_preset_quality.py` additionally evaluates
+corruption tests. `tools/gufo/h3_preset_quality.py` additionally evaluates
 AlexNet LPIPS from the pinned Nix toolchain. Every promoted report records the
 NumPy/LPIPS/Torch/Torchvision versions and a canonical SHA-256 of the loaded
 LPIPS module state. The Nix shell also pins the official Torchvision AlexNet

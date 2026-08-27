@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_HIP_DETAIL_HIP_GRAPH_DECODE_EXECUTOR_HPP_
-#define STRIX_CORE_HIP_DETAIL_HIP_GRAPH_DECODE_EXECUTOR_HPP_
+#ifndef GUFO_CORE_HIP_DETAIL_HIP_GRAPH_DECODE_EXECUTOR_HPP_
+#define GUFO_CORE_HIP_DETAIL_HIP_GRAPH_DECODE_EXECUTOR_HPP_
 
 #include <hip/hip_runtime.h>
 
@@ -10,7 +10,7 @@
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 
-namespace strix::hip::detail {
+namespace gufo::hip::detail {
 
 struct HipGraphCaptureKey {
   std::uint64_t execution_identity{0};
@@ -23,7 +23,7 @@ struct HipGraphCaptureKey {
 class HipGraphDecodeExecutor {
 public:
   HipGraphDecodeExecutor() {
-    const char* env = std::getenv("STRIX_ENABLE_HIP_GRAPH");
+    const char* env = std::getenv("GUFO_ENABLE_HIP_GRAPH");
     if (env != nullptr) {
       const std::string_view val(env);
       if (val == "0" || val == "false" || val == "OFF" || val == "off") {
@@ -142,6 +142,6 @@ private:
   bool is_enabled_{true};
 };
 
-}  // namespace strix::hip::detail
+}  // namespace gufo::hip::detail
 
-#endif  // STRIX_CORE_HIP_DETAIL_HIP_GRAPH_DECODE_EXECUTOR_HPP_
+#endif  // GUFO_CORE_HIP_DETAIL_HIP_GRAPH_DECODE_EXECUTOR_HPP_

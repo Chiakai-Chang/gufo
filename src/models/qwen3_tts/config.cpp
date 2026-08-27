@@ -9,10 +9,10 @@
 
 #include "src/models/qwen3_tts/json.hpp"
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 namespace {
 
-namespace json = strix::models::qwen3_tts::json;
+namespace json = gufo::models::qwen3_tts::json;
 
 const json::Value* FindPath(const json::Value& root,
                             std::initializer_list<std::string_view> path) {
@@ -361,4 +361,4 @@ bool LoadSpeechTokenizerConfigFromPath(const std::string& model_dir,
   }
 }
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts

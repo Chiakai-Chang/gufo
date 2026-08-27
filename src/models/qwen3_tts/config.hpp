@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_CONFIG_HPP_
-#define STRIX_MODELS_QWEN3_TTS_CONFIG_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_CONFIG_HPP_
+#define GUFO_MODELS_QWEN3_TTS_CONFIG_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 
 enum class ModelVariant : std::uint8_t {
   kBase,
@@ -159,6 +159,6 @@ struct ModelConfig {
 [[nodiscard]] bool LoadSpeechTokenizerConfigFromPath(
     const std::string& model_dir, SpeechTokenizerConfig* config);
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts
 
-#endif  // STRIX_MODELS_QWEN3_TTS_CONFIG_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_CONFIG_HPP_

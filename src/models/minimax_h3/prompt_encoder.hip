@@ -33,7 +33,7 @@
 #include "src/models/minimax_h3/prompt_encoder.hpp"
 #include "src/models/minimax_h3/prompt_encoder_ops.cuh"
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -1116,6 +1116,6 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
   return true;
 }
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3
 
 #endif

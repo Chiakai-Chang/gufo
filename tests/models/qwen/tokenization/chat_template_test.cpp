@@ -35,7 +35,7 @@ public:
 
   void AddMetadataString(std::string_view key, std::string_view val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kString));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kString));
     AppendString(val);
     metadata_count_++;
   }
@@ -74,16 +74,16 @@ private:
 };
 
 void TestBasicChatRendering() {
-  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+  auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
   Expect(tpl != nullptr, "CreateDefault succeeds");
 
-  std::vector<strix::tokenization::ChatMessage> messages = {
-      {strix::tokenization::ChatRole::kSystem, "You are a concise assistant.",
+  std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kSystem, "You are a concise assistant.",
        "", ""},
-      {strix::tokenization::ChatRole::kUser, "What is 2+2?", "", ""},
+      {gufo::tokenization::ChatRole::kUser, "What is 2+2?", "", ""},
   };
 
-  strix::tokenization::ChatTemplateOptions opts;
+  gufo::tokenization::ChatTemplateOptions opts;
   opts.add_generation_prompt = true;
   opts.enable_thinking = false;
 
@@ -100,15 +100,15 @@ void TestBasicChatRendering() {
 }
 
 void TestThinkingFraming() {
-  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+  auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
 
-  std::vector<strix::tokenization::ChatMessage> messages = {
-      {strix::tokenization::ChatRole::kUser, "Solve this equation.", "", ""},
-      {strix::tokenization::ChatRole::kAssistant, "The roots are 2 and 3.", "",
+  std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kUser, "Solve this equation.", "", ""},
+      {gufo::tokenization::ChatRole::kAssistant, "The roots are 2 and 3.", "",
        "First let's factor the polynomial."},
   };
 
-  strix::tokenization::ChatTemplateOptions opts;
+  gufo::tokenization::ChatTemplateOptions opts;
   opts.add_generation_prompt = true;
   opts.enable_thinking = true;
 
@@ -127,13 +127,13 @@ void TestThinkingFraming() {
 }
 
 void TestBoundedOutputLimit() {
-  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+  auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
 
-  std::vector<strix::tokenization::ChatMessage> messages = {
-      {strix::tokenization::ChatRole::kUser, std::string(2000, 'A'), "", ""},
+  std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kUser, std::string(2000, 'A'), "", ""},
   };
 
-  strix::tokenization::ChatTemplateOptions opts;
+  gufo::tokenization::ChatTemplateOptions opts;
   opts.max_output_bytes = 100;  // Intentionally tiny limit
 
   std::string err;
@@ -154,11 +154,11 @@ void TestGgufTemplateExtraction() {
 
   std::string err;
   auto reader =
-      strix::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
   Expect(reader != nullptr, "Reader open succeeds");
 
   auto tpl =
-      strix::tokenization::QwenChatTemplate::CreateFromGguf(*reader, &err);
+      gufo::tokenization::QwenChatTemplate::CreateFromGguf(*reader, &err);
   Expect(tpl != nullptr, "Template extracted from GGUF");
   Expect(tpl->GetTemplateString().find("{% for m in messages %}") !=
              std::string_view::npos,
@@ -166,7 +166,7 @@ void TestGgufTemplateExtraction() {
 }
 
 void TestRenderAndTokenize() {
-  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+  auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
 
   std::vector<std::string> vocab;
   for (int i = 0; i < 256; ++i) {
@@ -177,7 +177,7 @@ void TestRenderAndTokenize() {
   vocab.emplace_back("<think>");
   vocab.emplace_back("</think>");
 
-  std::unordered_map<std::string, strix::tokenization::TokenId> specials = {
+  std::unordered_map<std::string, gufo::tokenization::TokenId> specials = {
       {"<|im_start|>", 256},
       {"<|im_end|>", 257},
       {"<think>", 258},
@@ -185,15 +185,15 @@ void TestRenderAndTokenize() {
   };
 
   std::string err;
-  auto tokenizer = strix::tokenization::QwenTokenizer::CreateFromVocabulary(
+  auto tokenizer = gufo::tokenization::QwenTokenizer::CreateFromVocabulary(
       vocab, {}, specials, &err);
   Expect(tokenizer != nullptr, "Tokenizer initialized");
 
-  std::vector<strix::tokenization::ChatMessage> messages = {
-      {strix::tokenization::ChatRole::kUser, "Hello", "", ""},
+  std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kUser, "Hello", "", ""},
   };
 
-  strix::tokenization::ChatTemplateOptions opts;
+  gufo::tokenization::ChatTemplateOptions opts;
   opts.add_generation_prompt = true;
 
   auto token_ids = tpl->RenderAndTokenize(*tokenizer, messages, opts, &err);
@@ -207,13 +207,13 @@ void TestRenderAndTokenize() {
 }
 
 void TestChatCorpusConformance() {
-  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+  auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
 
   // Test Case 1: single turn user
   {
-    std::vector<strix::tokenization::ChatMessage> msgs = {
-        {strix::tokenization::ChatRole::kUser, "Hello, Strix Halo!", "", ""}};
-    strix::tokenization::ChatTemplateOptions opts;
+    std::vector<gufo::tokenization::ChatMessage> msgs = {
+        {gufo::tokenization::ChatRole::kUser, "Hello, Strix Halo!", "", ""}};
+    gufo::tokenization::ChatTemplateOptions opts;
     opts.add_generation_prompt = true;
     auto res = tpl->Render(msgs, opts);
     Expect(res.has_value() && *res ==
@@ -224,11 +224,11 @@ void TestChatCorpusConformance() {
 
   // Test Case 2: tool message
   {
-    std::vector<strix::tokenization::ChatMessage> msgs = {
-        {strix::tokenization::ChatRole::kUser, "Fetch weather.", "", ""},
-        {strix::tokenization::ChatRole::kTool,
+    std::vector<gufo::tokenization::ChatMessage> msgs = {
+        {gufo::tokenization::ChatRole::kUser, "Fetch weather.", "", ""},
+        {gufo::tokenization::ChatRole::kTool,
          "{\"temp\": 22, \"city\": \"Rome\"}", "", ""}};
-    strix::tokenization::ChatTemplateOptions opts;
+    gufo::tokenization::ChatTemplateOptions opts;
     opts.add_generation_prompt = true;
     auto res = tpl->Render(msgs, opts);
     Expect(res.has_value() &&
@@ -242,9 +242,9 @@ void TestChatCorpusConformance() {
 
   // Test Case 3: Unicode CJK
   {
-    std::vector<strix::tokenization::ChatMessage> msgs = {
-        {strix::tokenization::ChatRole::kUser, "你好，世界！🚀", "", ""}};
-    strix::tokenization::ChatTemplateOptions opts;
+    std::vector<gufo::tokenization::ChatMessage> msgs = {
+        {gufo::tokenization::ChatRole::kUser, "你好，世界！🚀", "", ""}};
+    gufo::tokenization::ChatTemplateOptions opts;
     opts.add_generation_prompt = true;
     auto res = tpl->Render(msgs, opts);
     Expect(res.has_value() && *res ==
@@ -255,10 +255,10 @@ void TestChatCorpusConformance() {
 }
 
 void TestToolRendering() {
-  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+  auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
 
-  strix::tokenization::ChatMessage assistant{
-      strix::tokenization::ChatRole::kAssistant, "", "", ""};
+  gufo::tokenization::ChatMessage assistant{
+      gufo::tokenization::ChatRole::kAssistant, "", "", ""};
   assistant.tool_calls.push_back({
       .id = "call_weather",
       .name = "get_weather",
@@ -271,12 +271,12 @@ void TestToolRendering() {
               },
           },
   });
-  const std::vector<strix::tokenization::ChatMessage> messages = {
-      {strix::tokenization::ChatRole::kSystem, "Be concise.", "", ""},
-      {strix::tokenization::ChatRole::kUser, "What is the weather?", "", ""},
+  const std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kSystem, "Be concise.", "", ""},
+      {gufo::tokenization::ChatRole::kUser, "What is the weather?", "", ""},
       std::move(assistant),
   };
-  const std::vector<strix::tokenization::ChatTool> tools = {
+  const std::vector<gufo::tokenization::ChatTool> tools = {
       {
           .name = "get_weather",
           .description = "Return current weather",
@@ -285,7 +285,7 @@ void TestToolRendering() {
       },
   };
 
-  strix::tokenization::ChatTemplateOptions options;
+  gufo::tokenization::ChatTemplateOptions options;
   options.require_tool_call = true;
   const auto rendered = tpl->Render(messages, tools, options);
   Expect(rendered.has_value(), "Tool-aware render succeeds");
@@ -304,13 +304,13 @@ void TestToolRendering() {
 }
 
 void TestToolReplayPreservesGeneratedPrefix() {
-  auto tpl = strix::tokenization::QwenChatTemplate::CreateDefault();
+  auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
 
   constexpr std::string_view kGeneratedText =
       "<think>\nI should read the requested file.\n</think>\n\n";
-  strix::tokenization::ChatMessage assistant{
-      strix::tokenization::ChatRole::kAssistant, std::string(kGeneratedText),
-      "", ""};
+  gufo::tokenization::ChatMessage assistant{
+      gufo::tokenization::ChatRole::kAssistant, std::string(kGeneratedText), "",
+      ""};
   assistant.tool_calls.push_back({
       .id = "call_read",
       .name = "read",
@@ -324,10 +324,10 @@ void TestToolReplayPreservesGeneratedPrefix() {
           },
   });
 
-  const std::vector<strix::tokenization::ChatMessage> messages = {
+  const std::vector<gufo::tokenization::ChatMessage> messages = {
       std::move(assistant),
   };
-  strix::tokenization::ChatTemplateOptions options;
+  gufo::tokenization::ChatTemplateOptions options;
   options.add_generation_prompt = false;
 
   const auto rendered = tpl->Render(messages, options);

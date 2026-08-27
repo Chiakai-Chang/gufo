@@ -23,7 +23,7 @@
 
 #include "src/cli/serve/json.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 namespace {
 
 struct ParsedChatRequest {
@@ -864,7 +864,7 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   metrics["mean_inter_token_ms"] = result.mean_inter_token_ms;
   metrics["max_inter_token_ms"] = result.max_inter_token_ms;
   metrics["execution_plan"] = result.execution_plan;
-  usage["strix"] = std::move(metrics);
+  usage["gufo"] = std::move(metrics);
   return usage;
 }
 
@@ -1270,4 +1270,4 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   }
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

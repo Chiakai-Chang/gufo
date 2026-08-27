@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_DIAGNOSTICS_SYSTEM_INVENTORY_H_
-#define STRIX_CORE_DIAGNOSTICS_SYSTEM_INVENTORY_H_
+#ifndef GUFO_CORE_DIAGNOSTICS_SYSTEM_INVENTORY_H_
+#define GUFO_CORE_DIAGNOSTICS_SYSTEM_INVENTORY_H_
 
 #include <cstdint>
 #include <map>
@@ -8,7 +8,7 @@
 
 #include "src/core/diagnostics/linux_sysfs.h"
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 struct CpuInventory {
   std::string model_name;
@@ -83,6 +83,6 @@ struct SystemInventory {
 [[nodiscard]] SystemInventory CollectSystemInventory(
     const LinuxSysfs& sysfs = LinuxSysfs());
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics
 
-#endif  // STRIX_CORE_DIAGNOSTICS_SYSTEM_INVENTORY_H_
+#endif  // GUFO_CORE_DIAGNOSTICS_SYSTEM_INVENTORY_H_

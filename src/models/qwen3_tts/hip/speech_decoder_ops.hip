@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <limits>
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 namespace {
 
 constexpr std::size_t kThreads = 256;
@@ -587,6 +587,6 @@ void LaunchClamp(float* values, std::size_t elements, float minimum,
                      stream, values, elements, minimum, maximum);
 }
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
 #endif

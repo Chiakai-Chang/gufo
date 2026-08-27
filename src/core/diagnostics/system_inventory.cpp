@@ -12,7 +12,7 @@
 #include <xrt/xrt_device.h>
 #endif
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 namespace {
 
@@ -295,4 +295,4 @@ std::string SystemInventory::ToHuman() const {
   return oss.str();
 }
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics

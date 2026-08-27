@@ -9,7 +9,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace strix::speculative {
+namespace gufo::speculative {
 namespace {
 
 [[nodiscard]] bool CheckBatchedVerification() noexcept;
@@ -166,7 +166,7 @@ bool IsStopToken(tokenization::TokenId token,
 }
 
 [[nodiscard]] bool CheckBatchedVerification() noexcept {
-  const char* value = std::getenv("STRIX_SPEC_BATCH_VERIFY_CHECK");
+  const char* value = std::getenv("GUFO_SPEC_BATCH_VERIFY_CHECK");
   if (value == nullptr) {
     return false;
   }
@@ -186,7 +186,7 @@ SpeculativeVerifier::SpeculativeVerifier(
       options_(options),
       current_draft_length_(options_.initial_draft_tokens),
       use_batched_verification_(ResolveFlag(
-          "STRIX_SPEC_BATCH_VERIFY", options_.use_batched_verification)) {
+          "GUFO_SPEC_BATCH_VERIFY", options_.use_batched_verification)) {
   target_executor.SetVerificationPolicy({
       .batched_lm_head = options_.use_batched_lm_head,
       .bf16_from_layer = options_.target_bf16_from_layer,
@@ -203,7 +203,7 @@ SpeculativeVerifier::SpeculativeVerifier(
       options_(options),
       current_draft_length_(options_.initial_draft_tokens),
       use_batched_verification_(ResolveFlag(
-          "STRIX_SPEC_BATCH_VERIFY", options_.use_batched_verification)) {
+          "GUFO_SPEC_BATCH_VERIFY", options_.use_batched_verification)) {
   ConfigureAdaptiveDraftPolicy();
 }
 
@@ -603,5 +603,5 @@ tokenization::TokenId SpeculativeVerifier::Prime(
   return first_token;
 }
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -19,8 +19,8 @@
 
 namespace {
 
-namespace qwen3_tts = strix::models::qwen3_tts;
-namespace qwen3_tts_hip = strix::models::qwen3_tts::hip;
+namespace qwen3_tts = gufo::models::qwen3_tts;
+namespace qwen3_tts_hip = gufo::models::qwen3_tts::hip;
 
 [[noreturn]] void Fail(const std::string& message) {
   std::cerr << "FAIL qwen3_tts_base_encoders_hip_test: " << message << '\n';
@@ -251,7 +251,7 @@ int main() {
   const std::filesystem::path model_root =
       "/home/fbozzo/projects/audio.cpp/models/Qwen3-TTS-12Hz-1.7B-Base";
   const std::filesystem::path artifacts =
-      "/home/fbozzo/projects/strix-halo.cpp/artifacts/qwen3_tts/base";
+      "/home/fbozzo/projects/gufo/artifacts/qwen3_tts/base";
   if (!std::filesystem::is_regular_file(model_root / "model.safetensors") ||
       !std::filesystem::is_regular_file(artifacts / "reference.wav")) {
     std::cerr << "SKIP qwen3_tts_base_encoders_hip_test: model or artifacts "

@@ -80,29 +80,27 @@ int main(int argc, const char* const* argv) {
     }
 
     std::string error;
-    auto base_owner = strix::core::GgufReader::OpenFile(argv[1], &error);
+    auto base_owner = gufo::core::GgufReader::OpenFile(argv[1], &error);
     Expect(base_owner != nullptr, error);
-    auto mtp_owner = strix::core::GgufReader::OpenFile(argv[2], &error);
+    auto mtp_owner = gufo::core::GgufReader::OpenFile(argv[2], &error);
     Expect(mtp_owner != nullptr, error);
-    std::shared_ptr<const strix::core::GgufReader> base_reader(
+    std::shared_ptr<const gufo::core::GgufReader> base_reader(
         std::move(base_owner));
-    std::shared_ptr<const strix::core::GgufReader> mtp_reader(
+    std::shared_ptr<const gufo::core::GgufReader> mtp_reader(
         std::move(mtp_owner));
 
-    auto reference =
-        strix::speculative::QwenMtpReference::CreateWithTiedWeights(
-            mtp_reader, base_reader, 8, &error);
+    auto reference = gufo::speculative::QwenMtpReference::CreateWithTiedWeights(
+        mtp_reader, base_reader, 8, &error);
     Expect(reference != nullptr, error);
     auto target_model =
-        strix::hip::QwenGpuModel::CreateFromGguf(base_reader, &error);
+        gufo::hip::QwenGpuModel::CreateFromGguf(base_reader, &error);
     Expect(target_model != nullptr, error);
 
     const auto pack_start = std::chrono::steady_clock::now();
     auto mtp_model =
-        strix::hip::QwenMtpGpuModel::Create(mtp_reader, target_model, &error);
+        gufo::hip::QwenMtpGpuModel::Create(mtp_reader, target_model, &error);
     Expect(mtp_model != nullptr, error);
-    auto executor =
-        strix::hip::QwenMtpGpuExecutor::Create(mtp_model, 8, &error);
+    auto executor = gufo::hip::QwenMtpGpuExecutor::Create(mtp_model, 8, &error);
     Expect(executor != nullptr, error);
     const double setup_seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() -
@@ -138,9 +136,9 @@ int main(int argc, const char* const* argv) {
     Expect(max_logit_error < 2.0F, "selected logit error");
 
 #if defined(ENGINE_ENABLE_XRT)
-    auto hybrid_executor = strix::hip::QwenMtpGpuExecutor::Create(
+    auto hybrid_executor = gufo::hip::QwenMtpGpuExecutor::Create(
         mtp_model, 8, &error,
-        strix::hip::QwenMtpExecutionMode::kHybridNpuEhProj);
+        gufo::hip::QwenMtpExecutionMode::kHybridNpuEhProj);
     Expect(hybrid_executor != nullptr, error);
     const auto hybrid_token =
         hybrid_executor->ForwardTargetHidden(17, target_hidden, 0, true);
@@ -183,21 +181,21 @@ int main(int argc, const char* const* argv) {
     Expect(repeated_token == token, "reset token determinism");
     Expect(repeat_comparison.rmse == 0.0, "reset hidden determinism");
 
-    strix::hip::QwenMtpGpuDraftConfig draft_config{
+    gufo::hip::QwenMtpGpuDraftConfig draft_config{
         .max_context = 8,
         .max_draft_tokens = 2,
     };
-    auto draft_backend = strix::hip::QwenMtpGpuDraftBackend::Create(
+    auto draft_backend = gufo::hip::QwenMtpGpuDraftBackend::Create(
         mtp_model, draft_config, &error);
     Expect(draft_backend != nullptr, error);
-    const std::array<strix::tokenization::TokenId, 2> prompt_tokens{5, 17};
+    const std::array<gufo::tokenization::TokenId, 2> prompt_tokens{5, 17};
     std::vector<float> prompt_hidden(target_hidden.size() * 2);
     std::ranges::copy(target_hidden, prompt_hidden.begin());
     for (std::size_t index = 0; index < target_hidden.size(); ++index) {
       prompt_hidden[target_hidden.size() + index] =
           target_hidden[index] * 0.75F;
     }
-    const strix::speculative::DraftTargetContext draft_context{
+    const gufo::speculative::DraftTargetContext draft_context{
         .prompt_tokens = prompt_tokens,
         .prompt_hidden_states = prompt_hidden,
         .hidden_size = target_hidden.size(),
@@ -206,11 +204,11 @@ int main(int argc, const char* const* argv) {
     Expect(draft_backend->PrimeTargetContext(draft_context),
            draft_backend->GetLastError());
 
-    std::vector<strix::tokenization::TokenId> sequence{prompt_tokens[0],
-                                                       prompt_tokens[1], token};
+    std::vector<gufo::tokenization::TokenId> sequence{prompt_tokens[0],
+                                                      prompt_tokens[1], token};
     const auto first_proposal = draft_backend->Propose(sequence, 2, 2);
     Expect(first_proposal.tokens.size() == 2, "first GPU MTP proposal size");
-    draft_backend->AcceptFeedback(std::span<const strix::tokenization::TokenId>(
+    draft_backend->AcceptFeedback(std::span<const gufo::tokenization::TokenId>(
                                       first_proposal.tokens.data(), 1),
                                   42);
 

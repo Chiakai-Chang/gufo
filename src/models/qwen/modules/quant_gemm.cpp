@@ -9,7 +9,7 @@
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #endif
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 void QuantGemm(const CpuModuleContext&, const QwenTensorRef& A,
                std::span<const float> x, std::size_t M, std::size_t K,
@@ -31,9 +31,9 @@ void QuantGemm(const HipModuleContext& ctx, const QwenTensorRef& A,
       A.num_elements < M * K) {
     std::abort();
   }
-  ::strix::hip::LaunchGEMV(A.data, A.type, x.data(), y.data(), M, K,
-                           static_cast<hipStream_t>(ctx.Stream()));
+  ::gufo::hip::LaunchGEMV(A.data, A.type, x.data(), y.data(), M, K,
+                          static_cast<hipStream_t>(ctx.Stream()));
 }
 #endif
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen

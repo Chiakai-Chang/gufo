@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_JSON_HPP_
-#define STRIX_SERVER_JSON_HPP_
+#ifndef GUFO_SERVER_JSON_HPP_
+#define GUFO_SERVER_JSON_HPP_
 
 #include <charconv>
 #include <cmath>
@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace strix::server::json {
+namespace gufo::server::json {
 
 /// Minimal, ordered JSON value with a recursive-descent parser and serializer.
 /// Object member order is preserved via a vector of (key, value) pairs.
@@ -502,6 +502,6 @@ struct Parser {
   return value;
 }
 
-}  // namespace strix::server::json
+}  // namespace gufo::server::json
 
-#endif  // STRIX_SERVER_JSON_HPP_
+#endif  // GUFO_SERVER_JSON_HPP_

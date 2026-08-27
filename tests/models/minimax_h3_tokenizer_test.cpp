@@ -11,7 +11,7 @@
 
 namespace {
 
-using strix::minimax_h3::Tokenizer;
+using gufo::minimax_h3::Tokenizer;
 
 int failures = 0;
 
@@ -171,9 +171,9 @@ void CheckSynthetic(const std::filesystem::path& directory) {
 }
 
 void CheckPinnedCheckpoint() {
-  const char* root = std::getenv("STRIX_H3_MODEL_ROOT");
+  const char* root = std::getenv("GUFO_H3_MODEL_ROOT");
   if (root == nullptr || *root == '\0') {
-    std::cout << "SKIP pinned tokenizer corpus: STRIX_H3_MODEL_ROOT unset\n";
+    std::cout << "SKIP pinned tokenizer corpus: GUFO_H3_MODEL_ROOT unset\n";
     return;
   }
   const auto path =
@@ -195,13 +195,13 @@ void CheckPinnedCheckpoint() {
 
 void CheckNoCpuTensorFallback() {
 #if !defined(ENGINE_ENABLE_HIP)
-  strix::minimax_h3::ModelInventory inventory;
+  gufo::minimax_h3::ModelInventory inventory;
   const std::vector<std::uint32_t> ids = {Tokenizer::kPadTokenId};
-  strix::minimax_h3::PromptEmbedding output;
-  strix::minimax_h3::PromptEncoderTelemetry telemetry;
+  gufo::minimax_h3::PromptEmbedding output;
+  gufo::minimax_h3::PromptEncoderTelemetry telemetry;
   std::string error;
-  CHECK(!strix::minimax_h3::EncodePromptLayer50(inventory, ids, {}, nullptr,
-                                                &output, &telemetry, &error));
+  CHECK(!gufo::minimax_h3::EncodePromptLayer50(inventory, ids, {}, nullptr,
+                                               &output, &telemetry, &error));
   CHECK(error == "MiniMax H3 prompt encoder requires ENGINE_ENABLE_HIP");
 #endif
 }
@@ -210,7 +210,7 @@ void CheckNoCpuTensorFallback() {
 
 int main() {
   const auto directory =
-      std::filesystem::temp_directory_path() / "strix-h3-tokenizer-test";
+      std::filesystem::temp_directory_path() / "gufo-h3-tokenizer-test";
   std::error_code filesystem_error;
   std::filesystem::remove_all(directory, filesystem_error);
   std::filesystem::create_directories(directory, filesystem_error);

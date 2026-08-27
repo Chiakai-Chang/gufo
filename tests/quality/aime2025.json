@@ -1,5 +1,5 @@
 {
-  "schema": "strix.eval-cases.v1",
+  "schema": "gufo.eval-cases.v1",
   "suite": "aime2025",
   "license": "MIT",
   "cases": [

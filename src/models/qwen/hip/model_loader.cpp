@@ -8,7 +8,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace detail {
 
 void ReleaseWeightRegions(std::vector<QwenGpuWeightRegion>& regions) noexcept {
@@ -38,7 +38,7 @@ enum class WeightMappingMode {
 };
 
 [[nodiscard]] WeightMappingMode GetWeightMappingMode() noexcept {
-  const char* value = std::getenv("STRIX_GPU_WEIGHT_MODE");
+  const char* value = std::getenv("GUFO_GPU_WEIGHT_MODE");
   if (value == nullptr) {
     return WeightMappingMode::kAuto;
   }
@@ -355,5 +355,5 @@ std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::CreateFromGguf(
   return Create(std::move(model), error_msg, max_context, policy);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

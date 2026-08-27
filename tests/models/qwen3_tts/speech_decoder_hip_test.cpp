@@ -17,7 +17,7 @@
 
 namespace {
 
-namespace qwen3_tts_hip = strix::models::qwen3_tts::hip;
+namespace qwen3_tts_hip = gufo::models::qwen3_tts::hip;
 
 struct NpyFloat {
   std::vector<std::size_t> shape;
@@ -181,7 +181,7 @@ int main(int argc, char** argv) {
                : "/home/fbozzo/projects/Qwen3-TTS-12Hz-1.7B-CustomVoice";
   const std::filesystem::path artifacts =
       argc > 2 ? argv[2]
-               : "/home/fbozzo/projects/strix-halo.cpp/artifacts/qwen3_tts/"
+               : "/home/fbozzo/projects/gufo/artifacts/qwen3_tts/"
                  "speech_decoder_f32_rocm";
   if (!std::filesystem::is_regular_file(model_root / "model.safetensors") ||
       !std::filesystem::is_regular_file(artifacts / "waveform.npy")) {

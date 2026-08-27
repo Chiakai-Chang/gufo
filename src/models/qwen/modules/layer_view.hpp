@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_MODULES_LAYER_VIEW_HPP_
-#define STRIX_MODELS_QWEN_MODULES_LAYER_VIEW_HPP_
+#ifndef GUFO_MODELS_QWEN_MODULES_LAYER_VIEW_HPP_
+#define GUFO_MODELS_QWEN_MODULES_LAYER_VIEW_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #include "src/models/qwen/ssm.hpp"
 #include "src/models/qwen/state.hpp"
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 // Lightweight per-module views over QwenLayerWeights.
 //
@@ -109,6 +109,6 @@ inline FfnLayerView MakeFfnView(const QwenLayerWeights& w,
                       c.intermediate_size};
 }
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen
 
-#endif  // STRIX_MODELS_QWEN_MODULES_LAYER_VIEW_HPP_
+#endif  // GUFO_MODELS_QWEN_MODULES_LAYER_VIEW_HPP_

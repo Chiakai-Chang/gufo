@@ -2,11 +2,11 @@
 
 Emits:
   - talker_codes.npy : discrete codec token book (T x num_code_groups), the exact
-    discrete output a strix engine must reproduce
+    discrete output a gufo engine must reproduce
   - waveform.npy     : decoded float32 waveform @ 24 kHz  (deterministic seed)
   - meta.json        : sample rate / shape metadata
 
-Used for accuracy validation against strix-halo.cpp.
+Used for accuracy validation against gufo.
 """
 import argparse
 import hashlib
@@ -40,7 +40,7 @@ def main():
         ),
     )
     ap.add_argument("--model", default="/home/fbozzo/projects/Qwen3-TTS-12Hz-1.7B-CustomVoice")
-    ap.add_argument("--out", default="/home/fbozzo/projects/strix-halo.cpp/artifacts/qwen3_tts")
+    ap.add_argument("--out", default="/home/fbozzo/projects/gufo/artifacts/qwen3_tts")
     ap.add_argument("--speaker", default="vivian")
     ap.add_argument("--language", default="english")
     ap.add_argument(
@@ -158,7 +158,7 @@ def main():
     with open(os.path.join(args.out, f"meta_{mode}.json"), "w") as f:
         json.dump(
             {
-                "schema": "strix.qwen3-tts-reference.v1",
+                "schema": "gufo.qwen3-tts-reference.v1",
                 "reference_commit": reference_commit,
                 "text": text,
                 "sample_rate": fs,

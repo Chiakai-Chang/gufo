@@ -9,7 +9,7 @@
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void WriteKVCachePtrKernel(
     const float* __restrict__ k, const float* __restrict__ v,
@@ -173,5 +173,5 @@ void LaunchAttention(const float* q, const float* k, const float* v,
   }
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

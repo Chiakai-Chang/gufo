@@ -6,7 +6,7 @@
 #include <string_view>
 #include <vector>
 
-namespace strix::core {
+namespace gufo::core {
 
 namespace {
 
@@ -192,4 +192,4 @@ bool ModelRegistry::ValidateArtifactClaim(std::string_view claimed_kind,
   return model->kind == expected_kind;
 }
 
-}  // namespace strix::core
+}  // namespace gufo::core

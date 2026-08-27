@@ -33,7 +33,7 @@ static uint32_t ds4_default_prefill_cap_for_prompt(int prompt_len) {
     if (prompt_len <= 0) return 1;
     uint32_t capacity = (uint32_t)prompt_len;
 
-    const char *env = getenv("STRIX_DEEPSEEK_ROCM_PREFILL_CHUNK");
+    const char *env = getenv("GUFO_DEEPSEEK_ROCM_PREFILL_CHUNK");
     if (env && env[0]) {
         char *end = NULL;
         const long value = strtol(env, &end, 10);
@@ -693,7 +693,7 @@ static uint32_t rocm_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *
     static uint32_t cached = 0;
     if (parsed < 0) {
         parsed = 0;
-        const char *env = getenv("STRIX_DEEPSEEK_ROCM_DECODE_INDEXER_SPARSE_THRESHOLD");
+        const char *env = getenv("GUFO_DEEPSEEK_ROCM_DECODE_INDEXER_SPARSE_THRESHOLD");
         if (env && env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(env, &end, 10);
@@ -705,7 +705,7 @@ static uint32_t rocm_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *
                 parsed = 1;
             } else {
                 fprintf(stderr,
-                        "ds4: invalid STRIX_DEEPSEEK_ROCM_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
+                        "ds4: invalid GUFO_DEEPSEEK_ROCM_DECODE_INDEXER_SPARSE_THRESHOLD=%s; "
                         "expected 64, 128, 256, 512, 1024, 2048, or 4096\n",
                         env);
             }
@@ -728,7 +728,7 @@ static uint32_t rocm_graph_decode_indexer_sparse_threshold(const ds4_gpu_graph *
  *
  * The normal generation path uses the fused helpers below.  The older unfused
  * kernels remain available as diagnostic reference paths selected only by the
- * STRIX_DEEPSEEK_ROCM_DISABLE_*_FUSION environment switches.
+ * GUFO_DEEPSEEK_ROCM_DISABLE_*_FUSION environment switches.
  */
 
 static bool rocm_graph_env_flag(const char *name, int *cache) {
@@ -741,37 +741,37 @@ static bool rocm_graph_env_flag(const char *name, int *cache) {
 
 static bool rocm_graph_use_reference_hc_decode(void) {
     static int cache = -1;
-    return rocm_graph_env_flag("STRIX_DEEPSEEK_ROCM_DISABLE_HC_FUSION", &cache);
+    return rocm_graph_env_flag("GUFO_DEEPSEEK_ROCM_DISABLE_HC_FUSION", &cache);
 }
 
 static bool rocm_graph_use_reference_kv_decode(void) {
     static int cache = -1;
-    return rocm_graph_env_flag("STRIX_DEEPSEEK_ROCM_DISABLE_KV_FUSION", &cache);
+    return rocm_graph_env_flag("GUFO_DEEPSEEK_ROCM_DISABLE_KV_FUSION", &cache);
 }
 
 static bool rocm_graph_use_reference_qkv_norm(void) {
     static int cache = -1;
-    return rocm_graph_env_flag("STRIX_DEEPSEEK_ROCM_DISABLE_QKV_NORM_FUSION", &cache);
+    return rocm_graph_env_flag("GUFO_DEEPSEEK_ROCM_DISABLE_QKV_NORM_FUSION", &cache);
 }
 
 static bool rocm_graph_use_reference_compressor_pair_proj(void) {
     static int cache = -1;
-    return rocm_graph_env_flag("STRIX_DEEPSEEK_ROCM_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
+    return rocm_graph_env_flag("GUFO_DEEPSEEK_ROCM_DISABLE_COMPRESSOR_PAIR_PROJ", &cache);
 }
 
 static bool rocm_graph_use_reference_hc_norm_decode(void) {
     static int cache = -1;
-    return rocm_graph_env_flag("STRIX_DEEPSEEK_ROCM_DISABLE_HC_NORM_FUSION", &cache);
+    return rocm_graph_env_flag("GUFO_DEEPSEEK_ROCM_DISABLE_HC_NORM_FUSION", &cache);
 }
 
 static bool rocm_graph_use_reference_shared_down_hc(void) {
     static int cache = -1;
-    return rocm_graph_env_flag("STRIX_DEEPSEEK_ROCM_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
+    return rocm_graph_env_flag("GUFO_DEEPSEEK_ROCM_DISABLE_SHARED_DOWN_HC_FUSION", &cache);
 }
 
 static bool rocm_graph_use_reference_attn_out_hc(void) {
     static int cache = -1;
-    return rocm_graph_env_flag("STRIX_DEEPSEEK_ROCM_DISABLE_ATTN_OUT_HC_FUSION", &cache);
+    return rocm_graph_env_flag("GUFO_DEEPSEEK_ROCM_DISABLE_ATTN_OUT_HC_FUSION", &cache);
 }
 
 static bool rocm_graph_decode_hc_pre(
@@ -1004,9 +1004,9 @@ static bool rocm_graph_encode_decode_layer(
     const bool qkv_rms_fused = !rocm_graph_use_reference_qkv_norm();
 
     bool ok = true;
-    const bool decode_stage_profile = getenv("STRIX_DEEPSEEK_ROCM_DECODE_STAGE_PROFILE") != NULL;
+    const bool decode_stage_profile = getenv("GUFO_DEEPSEEK_ROCM_DECODE_STAGE_PROFILE") != NULL;
     double decode_stage_t0 = decode_stage_profile ? ds4_now_seconds() : 0.0;
-#define STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE(name) do { \
+#define GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE(name) do { \
         if (ok && decode_stage_profile) { \
             ok = rocm_graph_layer_stage_profile_boundary("decode", (name), il, pos, 1, &decode_stage_t0); \
         } \
@@ -1042,7 +1042,7 @@ static bool rocm_graph_encode_decode_layer(
                                        layer->hc_attn_scale->abs_offset,
                                        layer->hc_attn_base->abs_offset);
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attn_hc_pre");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attn_hc_pre");
     if (ok) {
     }
     if (ok) {
@@ -1051,7 +1051,7 @@ static bool rocm_graph_encode_decode_layer(
                                                                    model->map, model->size,
                                                                    layer->attn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attn_norm");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attn_norm");
     if (ok) {
     }
     if (ok) ok = ds4_gpu_matmul_q8_0_tensor(g->qr, model->map, model->size,
@@ -1103,7 +1103,7 @@ static bool rocm_graph_encode_decode_layer(
                                             compressed ? (uint32_t)DS4_ROPE_ORIG_CTX : 0,
                                             false, freq_base, freq_scale, ext_factor, attn_factor,
                                             DS4_ROPE_YARN_BETA_FAST, DS4_ROPE_YARN_BETA_SLOW) != 0;
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("q_path");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("q_path");
     if (ok) {
     }
     if (!qkv_rms_fused) {
@@ -1131,7 +1131,7 @@ static bool rocm_graph_encode_decode_layer(
      * starts after that, where FP8 KV quantization and raw-cache storage can
      * share one pass without changing the trigonometric path. */
     if (ok) ok = rocm_graph_decode_kv_store(g->kv, raw_cache, raw_cap, raw_row);
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("kv_path");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("kv_path");
     if (ok) {
     }
 
@@ -1140,7 +1140,7 @@ static bool rocm_graph_encode_decode_layer(
     ds4_gpu_tensor *comp_selected = NULL;
     uint32_t n_selected = 0;
     double decode_index_stage_t0 = 0.0;
-    const bool decode_index_stage_profile = getenv("STRIX_DEEPSEEK_ROCM_INDEXER_STAGE_PROFILE") != NULL;
+    const bool decode_index_stage_profile = getenv("GUFO_DEEPSEEK_ROCM_INDEXER_STAGE_PROFILE") != NULL;
     if (ok && compressed) {
         const uint32_t ratio = ds4_layer_compress_ratio(il);
         const uint32_t coff = ratio == 4 ? 2u : 1u;
@@ -1432,7 +1432,7 @@ static bool rocm_graph_encode_decode_layer(
         n_comp = g->layer_n_comp[il];
         comp_cache = g->layer_attn_comp_cache[il];
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("compressor_indexer");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("compressor_indexer");
 
     if (ok) {
         const uint32_t raw_start = rocm_graph_raw_start_for_span(g, pos, n_raw);
@@ -1481,7 +1481,7 @@ static bool rocm_graph_encode_decode_layer(
                                                          DS4_N_HEAD, DS4_N_HEAD_DIM) != 0;
         }
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attention");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attention");
     if (ok) {
     }
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->heads,
@@ -1535,7 +1535,7 @@ static bool rocm_graph_encode_decode_layer(
                                                         n_groups, DS4_N_EMBD,
                                                         g->heads, 1) != 0;
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attn_output");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attn_output");
     if (ok) {
     }
     if (ok) {
@@ -1544,7 +1544,7 @@ static bool rocm_graph_encode_decode_layer(
         ok = ds4_gpu_hc_expand_tensor(g->after_attn_hc, g->attn_out, g->cur_hc,
                                         g->hc_post, g->hc_comb, DS4_N_EMBD, DS4_N_HC) != 0;
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attn_hc_post");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("attn_hc_post");
     if (ok) {
     }
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
@@ -1575,7 +1575,7 @@ static bool rocm_graph_encode_decode_layer(
                                        layer->hc_ffn_scale->abs_offset,
                                        layer->hc_ffn_base->abs_offset);
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("ffn_hc_pre");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("ffn_hc_pre");
     if (ok) {
     }
     if (ok) {
@@ -1584,7 +1584,7 @@ static bool rocm_graph_encode_decode_layer(
                                                                    model->map, model->size,
                                                                    layer->ffn_norm->abs_offset,
                                                                    DS4_N_EMBD, DS4_RMS_EPS) != 0;
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("ffn_norm");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("ffn_norm");
     if (ok) {
     }
     const uint64_t gate_row_bytes = ds4_routed_expert_row_bytes(layer->ffn_gate_exps);
@@ -1607,7 +1607,7 @@ static bool rocm_graph_encode_decode_layer(
                                                 layer->ffn_exp_probs_b != NULL,
                                                 layer->ffn_gate_tid2eid != NULL,
                                                 g->router_logits) != 0;
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("router");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("router");
     if (ok) {
     }
     if (ok) ok = ds4_gpu_routed_moe_one_tensor(g->routed_out,
@@ -1634,9 +1634,9 @@ static bool rocm_graph_encode_decode_layer(
                                                  NULL,
                                                  il,
                                                  false) != 0;
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("routed_moe");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("routed_moe");
     const bool fuse_shared_gate_up =
-        getenv("STRIX_DEEPSEEK_ROCM_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
+        getenv("GUFO_DEEPSEEK_ROCM_DISABLE_SHARED_GATE_UP_SWIGLU_FUSION") == NULL;
     if (ok && fuse_shared_gate_up) {
         ok = ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(g->shared_gate,
                                                          g->shared_up,
@@ -1661,7 +1661,7 @@ static bool rocm_graph_encode_decode_layer(
         if (ok) ok = ds4_gpu_swiglu_tensor(g->shared_mid, g->shared_gate, g->shared_up,
                                            shared_dim, DS4_SWIGLU_CLAMP_EXP, 1.0f) != 0;
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("shared_gate_up");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("shared_gate_up");
     const bool fuse_shared_down_hc =
         !rocm_graph_use_reference_shared_down_hc();
     if (ok && fuse_shared_down_hc) {
@@ -1684,7 +1684,7 @@ static bool rocm_graph_encode_decode_layer(
                                           shared_dim, DS4_N_EMBD,
                                           g->shared_mid, 1) != 0;
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("shared_down");
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("shared_down");
     if (ok) {
     }
     if (ok && !fuse_shared_down_hc) {
@@ -1696,8 +1696,8 @@ static bool rocm_graph_encode_decode_layer(
                                                   DS4_N_EMBD,
                                                   DS4_N_HC) != 0;
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("ffn_hc_post");
-#undef STRIX_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE
+    GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE("ffn_hc_post");
+#undef GUFO_DEEPSEEK_ROCM_PROFILE_DECODE_STAGE
     if (ok) {
     }
     return ok;
@@ -1847,7 +1847,7 @@ static bool rocm_graph_encode_token_raw_swa(
      * starving the second command buffer.
      */
     uint32_t split_after_layers = 4;
-    const char *split_env = getenv("STRIX_DEEPSEEK_ROCM_GRAPH_TOKEN_SPLIT_LAYERS");
+    const char *split_env = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_TOKEN_SPLIT_LAYERS");
     if (split_env && split_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(split_env, &end, 10);
@@ -2010,7 +2010,7 @@ static bool rocm_graph_warmup_prefill_kernels(
         const ds4_weights *weights,
         uint32_t           n_tokens) {
     static bool warmed = false;
-    if (warmed || getenv("STRIX_DEEPSEEK_ROCM_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
+    if (warmed || getenv("GUFO_DEEPSEEK_ROCM_NO_PREFILL_KERNEL_WARMUP") != NULL) return true;
 
     /*
      * The first batched F16 matmul can pay ROCm's one-time pipeline execution
@@ -2132,17 +2132,17 @@ static bool rocm_graph_encode_layer_attention_batch(
     const uint32_t ratio = ds4_layer_compress_ratio(il);
     const bool compressed = ratio != 0;
     const bool zero_prefix = pos0 == 0;
-    const bool index_stage_profile = getenv("STRIX_DEEPSEEK_ROCM_INDEXER_STAGE_PROFILE") != NULL;
-    const bool layer_stage_profile = getenv("STRIX_DEEPSEEK_ROCM_LAYER_STAGE_PROFILE") != NULL;
-    const bool q_stage_profile = getenv("STRIX_DEEPSEEK_ROCM_Q_STAGE_PROFILE") != NULL;
+    const bool index_stage_profile = getenv("GUFO_DEEPSEEK_ROCM_INDEXER_STAGE_PROFILE") != NULL;
+    const bool layer_stage_profile = getenv("GUFO_DEEPSEEK_ROCM_LAYER_STAGE_PROFILE") != NULL;
+    const bool q_stage_profile = getenv("GUFO_DEEPSEEK_ROCM_Q_STAGE_PROFILE") != NULL;
     double layer_stage_t0 = layer_stage_profile ? ds4_now_seconds() : 0.0;
     double q_stage_t0 = q_stage_profile ? ds4_now_seconds() : 0.0;
-#define STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE(name) do { \
+#define GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE(name) do { \
         if (ok && layer_stage_profile) { \
             ok = rocm_graph_layer_stage_profile_boundary("attn", (name), il, pos0, n_tokens, &layer_stage_t0); \
         } \
     } while (0)
-#define STRIX_DEEPSEEK_ROCM_PROFILE_Q_STAGE(name) do { \
+#define GUFO_DEEPSEEK_ROCM_PROFILE_Q_STAGE(name) do { \
         if (ok && q_stage_profile) { \
             ok = rocm_graph_q_stage_profile_boundary((name), il, pos0, n_tokens, &q_stage_t0); \
         } \
@@ -2216,7 +2216,7 @@ static bool rocm_graph_encode_layer_attention_batch(
     }
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("hc_pre");
+    GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("hc_pre");
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
                                                        g->batch_attn_cur,
                                                        model->map,
@@ -2227,8 +2227,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                        DS4_RMS_EPS) != 0;
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("norm");
-    STRIX_DEEPSEEK_ROCM_PROFILE_Q_STAGE("pre_q");
+    GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("norm");
+    GUFO_DEEPSEEK_ROCM_PROFILE_Q_STAGE("pre_q");
     if (ok) ok = rocm_graph_matmul_q8_0_named_tensor("attn_q_a",
                                                       il,
                                                       pos0,
@@ -2241,7 +2241,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                       n_tokens);
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_Q_STAGE("q_a");
+    GUFO_DEEPSEEK_ROCM_PROFILE_Q_STAGE("q_a");
     if (qkv_rms_fused) {
         if (ok) ok = rocm_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
@@ -2281,7 +2281,7 @@ static bool rocm_graph_encode_layer_attention_batch(
     }
     if (qkv_rms_fused && ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_Q_STAGE("q_a_norm");
+    GUFO_DEEPSEEK_ROCM_PROFILE_Q_STAGE("q_a_norm");
     if (ok) ok = rocm_graph_matmul_q8_0_named_tensor("attn_q_b",
                                                       il,
                                                       pos0,
@@ -2294,7 +2294,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                       n_tokens);
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_Q_STAGE("q_b");
+    GUFO_DEEPSEEK_ROCM_PROFILE_Q_STAGE("q_b");
     if (ok) ok = ds4_gpu_head_rms_norm_tensor(g->batch_q,
                                                 n_tokens,
                                                 DS4_N_HEAD,
@@ -2302,7 +2302,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                 DS4_RMS_EPS) != 0;
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_Q_STAGE("head_norm");
+    GUFO_DEEPSEEK_ROCM_PROFILE_Q_STAGE("head_norm");
     if (ok) ok = ds4_gpu_rope_tail_tensor(g->batch_q,
                                             n_tokens,
                                             DS4_N_HEAD,
@@ -2319,8 +2319,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_Q_STAGE("rope");
-    STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("q_path");
+    GUFO_DEEPSEEK_ROCM_PROFILE_Q_STAGE("rope");
+    GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("q_path");
     if (!qkv_rms_fused) {
         if (ok) ok = rocm_graph_matmul_q8_0_named_tensor("attn_kv",
                                                           il,
@@ -2367,7 +2367,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                        DS4_N_ROT) != 0;
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("kv_path");
+    GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("kv_path");
     /*
      * Static graph order is q, kv, cpy_k(raw SWA), then attention. For a
      * zero-prefix batch it is safe to store the whole batch at once: attention
@@ -2686,7 +2686,7 @@ static bool rocm_graph_encode_layer_attention_batch(
             }
             n_comp = g->layer_n_comp[il];
         }
-        STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("compressor");
+        GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("compressor");
 
         if (ok && ratio == 4) {
             const uint32_t index_width = coff * DS4_N_INDEXER_HEAD_DIM;
@@ -2940,7 +2940,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                 }
             }
         }
-        if (ratio == 4) STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("indexer_setup");
+        if (ratio == 4) GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("indexer_setup");
 
         if (ok && !zero_prefix && n_tokens <= g->raw_cap) {
             const uint32_t n_raw = rocm_graph_raw_span_for_batch(g, pos0, n_tokens);
@@ -3293,7 +3293,7 @@ static bool rocm_graph_encode_layer_attention_batch(
             }
         }
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("attention");
+    GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("attention");
 
     if (ok) {
     }
@@ -3313,7 +3313,7 @@ static bool rocm_graph_encode_layer_attention_batch(
                                             DS4_ROPE_YARN_BETA_SLOW) != 0;
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("inv_rope");
+    GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("inv_rope");
     if (ok) {
         ok = ds4_gpu_attention_output_q8_batch_tensor(g->batch_attn_out,
                                                         g->batch_attn_low,
@@ -3334,7 +3334,7 @@ static bool rocm_graph_encode_layer_attention_batch(
     }
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("output_proj");
+    GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("output_proj");
     if (ok) ok = ds4_gpu_hc_expand_split_tensor(after_attn_hc_view,
                                                   g->batch_attn_out,
                                                   g->batch_cur_hc,
@@ -3343,15 +3343,15 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                   DS4_N_HC) != 0;
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("hc_post");
+    GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE("hc_post");
     ds4_gpu_tensor_free(after_attn_hc_view);
     ds4_gpu_tensor_free(attn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
     free(index_counts);
     free(comp_counts);
-#undef STRIX_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE
-#undef STRIX_DEEPSEEK_ROCM_PROFILE_Q_STAGE
+#undef GUFO_DEEPSEEK_ROCM_PROFILE_ATTN_STAGE
+#undef GUFO_DEEPSEEK_ROCM_PROFILE_Q_STAGE
     return ok;
 }
 
@@ -3377,9 +3377,9 @@ static bool rocm_graph_encode_layer_ffn_batch(
     const uint64_t gate_expert_bytes = expert_mid_dim * gate_row_bytes;
     const uint64_t down_row_bytes = ds4_routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes = routed_out_dim * down_row_bytes;
-    const bool layer_stage_profile = getenv("STRIX_DEEPSEEK_ROCM_LAYER_STAGE_PROFILE") != NULL;
+    const bool layer_stage_profile = getenv("GUFO_DEEPSEEK_ROCM_LAYER_STAGE_PROFILE") != NULL;
     double layer_stage_t0 = layer_stage_profile ? ds4_now_seconds() : 0.0;
-#define STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE(name) do { \
+#define GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE(name) do { \
         if (ok && layer_stage_profile) { \
             ok = rocm_graph_layer_stage_profile_boundary("ffn", (name), il, pos0, n_tokens, &layer_stage_t0); \
         } \
@@ -3438,7 +3438,7 @@ static bool rocm_graph_encode_layer_ffn_batch(
     }
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("hc_pre");
+    GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("hc_pre");
     if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_ffn_norm,
                                                        g->batch_ffn_cur,
                                                        model->map,
@@ -3449,7 +3449,7 @@ static bool rocm_graph_encode_layer_ffn_batch(
                                                        DS4_RMS_EPS) != 0;
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("norm");
+    GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("norm");
     if (ok) ok = ds4_gpu_matmul_f16_tensor(g->batch_router_logits,
                                              model->map,
                                              model->size,
@@ -3479,7 +3479,7 @@ static bool rocm_graph_encode_layer_ffn_batch(
                                                       n_tokens) != 0;
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("router");
+    GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("router");
 
     if (ok) {
         ok = ds4_gpu_routed_moe_batch_tensor(g->batch_routed_out,
@@ -3524,7 +3524,7 @@ static bool rocm_graph_encode_layer_ffn_batch(
     }
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("routed_moe");
+    GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("routed_moe");
     if (ok) ok = rocm_graph_matmul_q8_0_named_tensor("shared_gate",
                                                       il,
                                                       pos0,
@@ -3545,7 +3545,7 @@ static bool rocm_graph_encode_layer_ffn_batch(
                                                       shared_dim,
                                                       g->batch_ffn_norm,
                                                       n_tokens);
-    STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("shared_gate_up");
+    GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("shared_gate_up");
     if (ok) ok = ds4_gpu_swiglu_tensor(g->batch_shared_mid,
                                          g->batch_shared_gate,
                                          g->batch_shared_up,
@@ -3562,7 +3562,7 @@ static bool rocm_graph_encode_layer_ffn_batch(
                                                       DS4_N_EMBD,
                                                       g->batch_shared_mid,
                                                       n_tokens);
-    STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("shared_down");
+    GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("shared_down");
     if (ok) {
     }
 
@@ -3577,12 +3577,12 @@ static bool rocm_graph_encode_layer_ffn_batch(
     }
     if (ok) {
     }
-    STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("hc_post");
+    GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE("hc_post");
     ds4_gpu_tensor_free(next_hc_view);
     ds4_gpu_tensor_free(ffn_cur_view);
     ds4_gpu_tensor_free(hc_split_view);
     ds4_gpu_tensor_free(hc_mix_view);
-#undef STRIX_DEEPSEEK_ROCM_PROFILE_FFN_STAGE
+#undef GUFO_DEEPSEEK_ROCM_PROFILE_FFN_STAGE
     return ok;
 }
 
@@ -3612,7 +3612,7 @@ static bool rocm_graph_eval_token_raw_swa(
         int                    token,
         uint32_t               pos,
         float                 *logits) {
-    const bool profile = getenv("STRIX_DEEPSEEK_ROCM_GRAPH_TOKEN_PROFILE") != NULL;
+    const bool profile = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_TOKEN_PROFILE") != NULL;
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? ds4_now_seconds() : 0.0;
 
@@ -3691,7 +3691,7 @@ static bool rocm_graph_prefill_layer_major(
 
     if (!rocm_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
 
-    const bool split_profile = getenv("STRIX_DEEPSEEK_ROCM_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
+    const bool split_profile = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_PREFILL_SPLIT_PROFILE") != NULL;
     /*
      * A full long-prompt prefill can keep the GPU busy long enough for macOS
      * to watchdog the desktop. Split long prefills into completed command
@@ -3699,7 +3699,7 @@ static bool rocm_graph_prefill_layer_major(
      */
     const bool throttle = graph_power_throttle_enabled(g);
     const bool split_commands = split_profile || throttle || n_tokens > 2048;
-    const bool profile = getenv("STRIX_DEEPSEEK_ROCM_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
+    const bool profile = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_PREFILL_PROFILE") != NULL || split_profile;
     const double t0 = profile ? ds4_now_seconds() : 0.0;
     double encode_s = 0.0;
     double execute_s = 0.0;
@@ -3728,7 +3728,7 @@ static bool rocm_graph_prefill_layer_major(
         if (show_progress) fputc('\n', stderr);
         const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
         uint32_t output_row = (uint32_t)n_tokens - 1u;
-        const char *output_row_env = getenv("STRIX_DEEPSEEK_ROCM_GRAPH_OUTPUT_ROW");
+        const char *output_row_env = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_OUTPUT_ROW");
         if (output_row_env && output_row_env[0]) {
             char *end = NULL;
             unsigned long v = strtoul(output_row_env, &end, 10);
@@ -3885,7 +3885,7 @@ static bool rocm_graph_prefill_layer_major(
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     uint32_t output_row = (uint32_t)n_tokens - 1u;
-    const char *output_row_env = getenv("STRIX_DEEPSEEK_ROCM_GRAPH_OUTPUT_ROW");
+    const char *output_row_env = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_OUTPUT_ROW");
     if (output_row_env && output_row_env[0]) {
         char *end = NULL;
         unsigned long v = strtoul(output_row_env, &end, 10);
@@ -3985,7 +3985,7 @@ static bool rocm_graph_prefill_chunked_range(
     if (start != 0 && chunk_cap > g->raw_cap) chunk_cap = g->raw_cap;
     if (chunk_cap == 0) return false;
 
-    const bool profile = getenv("STRIX_DEEPSEEK_ROCM_GRAPH_PREFILL_PROFILE") != NULL;
+    const bool profile = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_PREFILL_PROFILE") != NULL;
     const double t0 = profile ? ds4_now_seconds() : 0.0;
     const uint32_t end = start + n_tokens;
 
@@ -4073,7 +4073,7 @@ static uint32_t rocm_graph_raw_cap_for_context(int ctx_size, uint32_t prefill_ca
     uint32_t raw_cap = (uint32_t)wanted;
     if (raw_cap < raw_window) raw_cap = raw_window;
 
-    const char *env = getenv("STRIX_DEEPSEEK_ROCM_GRAPH_RAW_CAP");
+    const char *env = getenv("GUFO_DEEPSEEK_ROCM_GRAPH_RAW_CAP");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);
@@ -4097,7 +4097,7 @@ static uint32_t rocm_graph_prefill_cap_for_prompt(int prompt_len) {
 /* Extend shared prefixes with batched prefill once the suffix is large enough
  * to amortize batch setup. */
 static uint32_t rocm_graph_resume_prefill_min_tokens(void) {
-    const char *env = getenv("STRIX_DEEPSEEK_ROCM_RESUME_PREFILL_MIN");
+    const char *env = getenv("GUFO_DEEPSEEK_ROCM_RESUME_PREFILL_MIN");
     if (env && env[0]) {
         char *endp = NULL;
         const long v = strtol(env, &endp, 10);

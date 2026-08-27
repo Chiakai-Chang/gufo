@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_TENSOR_HPP_
-#define STRIX_MODELS_QWEN3_TTS_TENSOR_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_TENSOR_HPP_
+#define GUFO_MODELS_QWEN3_TTS_TENSOR_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 
 enum class DType : std::uint8_t {
   kF32,
@@ -48,6 +48,6 @@ private:
   std::vector<Tensor> tensors_;
 };
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts
 
-#endif  // STRIX_MODELS_QWEN3_TTS_TENSOR_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_TENSOR_HPP_

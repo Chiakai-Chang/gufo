@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_GEMM_ROUTE_HPP_
-#define STRIX_MODELS_QWEN_GEMM_ROUTE_HPP_
+#ifndef GUFO_MODELS_QWEN_GEMM_ROUTE_HPP_
+#define GUFO_MODELS_QWEN_GEMM_ROUTE_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 enum class QwenGemmMode : std::uint8_t {
   kCpu,
@@ -70,20 +70,20 @@ struct QwenGemmFormatCapabilities {
       return {.dense = true, .cpu_direct = true};
     case core::GgmlType::kQ8_0:
       return {.quantized = true,
-              .block_elements = ::strix::quant::QuantizedBlockElements(type),
+              .block_elements = ::gufo::quant::QuantizedBlockElements(type),
               .cpu_direct = true,
               .hip_decode_direct = true,
               .hip_prefill_direct = true};
     case core::GgmlType::kQ3_K:
     case core::GgmlType::kQ4_K:
       return {.quantized = true,
-              .block_elements = ::strix::quant::QuantizedBlockElements(type),
+              .block_elements = ::gufo::quant::QuantizedBlockElements(type),
               .cpu_direct = true};
     case core::GgmlType::kQ5_K:
     case core::GgmlType::kQ6_K:
     case core::GgmlType::kQ8_K:
       return {.quantized = true,
-              .block_elements = ::strix::quant::QuantizedBlockElements(type),
+              .block_elements = ::gufo::quant::QuantizedBlockElements(type),
               .cpu_direct = true,
               .hip_decode_direct = true,
               .hip_prefill_direct = true};
@@ -255,6 +255,6 @@ struct QwenGemmResolution {
                                       : QwenGemmRoute::kHipBf16Baseline256};
 }
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen
 
-#endif  // STRIX_MODELS_QWEN_GEMM_ROUTE_HPP_
+#endif  // GUFO_MODELS_QWEN_GEMM_ROUTE_HPP_

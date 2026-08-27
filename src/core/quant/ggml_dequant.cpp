@@ -5,7 +5,7 @@
 #include <cstring>
 #include <limits>
 
-namespace strix::quant {
+namespace gufo::quant {
 
 // Standard half-precision float to single-precision float conversion
 float Fp16ToFloat(std::uint16_t h) noexcept {
@@ -383,4 +383,4 @@ float DotProductQ8_0(const void* row_data, std::span<const float> vec,
   return sum;
 }
 
-}  // namespace strix::quant
+}  // namespace gufo::quant

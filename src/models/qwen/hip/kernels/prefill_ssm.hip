@@ -11,7 +11,7 @@
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void BatchedFusedSSMInputProjectionsKernel(
     const void* __restrict__ qkv_w, bool qkv_is_bf16,
@@ -146,5 +146,5 @@ void LaunchBatchedFusedSSMInputProjections(
       beta_is_bf16, X, qkv_out, gate_out, alpha_out, beta_out, batch_size,
       hidden_size, qkv_size, inner_size, time_step_rank);
 }
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

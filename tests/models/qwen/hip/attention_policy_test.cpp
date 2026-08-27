@@ -23,7 +23,7 @@ void Check(bool condition, std::string_view message) {
 }
 
 void TestDispatchThresholdAndFallbackOrder() {
-  using strix::hip::detail::DispatchPrefillAttention;
+  using gufo::hip::detail::DispatchPrefillAttention;
 
   std::vector<Attempt> attempts;
   DispatchPrefillAttention(
@@ -88,9 +88,9 @@ void TestDispatchThresholdAndFallbackOrder() {
 }
 
 void TestBackendSupportPredicates() {
-  using strix::hip::detail::AttentionSupportParams;
-  using strix::hip::detail::IsCkAttentionSupported;
-  using strix::hip::detail::IsTiledAttentionSupported;
+  using gufo::hip::detail::AttentionSupportParams;
+  using gufo::hip::detail::IsCkAttentionSupported;
+  using gufo::hip::detail::IsTiledAttentionSupported;
 
   AttentionSupportParams params{
       .batch_size = 1024,
@@ -181,10 +181,10 @@ void TestBackendSupportPredicates() {
 }
 
 void TestDecodeSplitPolicy() {
-  using strix::hip::detail::DecodeAttentionScratchElements;
-  using strix::hip::detail::IsFusedQkNormSupported;
-  using strix::hip::detail::IsSplitKDecodeAttentionSupported;
-  using strix::hip::detail::SelectDecodeAttentionSplitCount;
+  using gufo::hip::detail::DecodeAttentionScratchElements;
+  using gufo::hip::detail::IsFusedQkNormSupported;
+  using gufo::hip::detail::IsSplitKDecodeAttentionSupported;
+  using gufo::hip::detail::SelectDecodeAttentionSplitCount;
 
   Check(SelectDecodeAttentionSplitCount(1024) == 1,
         "1K decode uses one online-softmax partition");
@@ -218,9 +218,9 @@ void TestDecodeSplitPolicy() {
         "fused Q/K norm rejects larger head dimensions");
 }
 
-static_assert(!strix::hip::detail::ShouldAttemptOptimizedAttention(1023));
-static_assert(strix::hip::detail::ShouldAttemptOptimizedAttention(1024));
-static_assert(strix::hip::detail::SelectDecodeAttentionSplitCount(32768) == 32);
+static_assert(!gufo::hip::detail::ShouldAttemptOptimizedAttention(1023));
+static_assert(gufo::hip::detail::ShouldAttemptOptimizedAttention(1024));
+static_assert(gufo::hip::detail::SelectDecodeAttentionSplitCount(32768) == 32);
 
 }  // namespace
 

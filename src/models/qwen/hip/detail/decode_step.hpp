@@ -1,15 +1,15 @@
-#ifndef STRIX_MODELS_QWEN_HIP_DETAIL_DECODE_STEP_HPP_
-#define STRIX_MODELS_QWEN_HIP_DETAIL_DECODE_STEP_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_DETAIL_DECODE_STEP_HPP_
+#define GUFO_MODELS_QWEN_HIP_DETAIL_DECODE_STEP_HPP_
 
 #include <cstdint>
 
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace strix::models {
+namespace gufo::models {
 struct QwenModelWeights;
 }
 
-namespace strix::hip {
+namespace gufo::hip {
 
 class QwenGpuArena;
 struct QwenExecutionPolicy;
@@ -26,6 +26,6 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                        tokenization::TokenId token_id, std::uint32_t pos,
                        bool compute_logits);
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 
-#endif  // STRIX_MODELS_QWEN_HIP_DETAIL_DECODE_STEP_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_DETAIL_DECODE_STEP_HPP_

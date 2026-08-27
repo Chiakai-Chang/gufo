@@ -10,7 +10,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 constexpr std::uint32_t kMaxPromptBatch = 4096;
@@ -947,5 +947,5 @@ void QwenGpuArena::FreeAll() noexcept {
   prefetch_event = nullptr;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

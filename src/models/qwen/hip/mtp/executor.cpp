@@ -17,7 +17,7 @@
 #include "src/core/xdna2/device.h"
 #endif
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 template<typename T>
@@ -365,5 +365,5 @@ std::span<const float> QwenMtpGpuExecutor::CopyLastLogits() {
   return h_logits_;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

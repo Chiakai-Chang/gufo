@@ -49,13 +49,13 @@ let
       || relativePath == "tools/bench/wmma_layout_test.hip"
       || relativePath == "tools/quant"
       || relativePath == "tools/quant/gguf_dump_types.cpp"
-      || relativePath == "tools/strix"
-      || relativePath == "tools/strix/compile_h3_attention.py"
-      || relativePath == "tools/strix/h3_attention_kernel.py";
+      || relativePath == "tools/gufo"
+      || relativePath == "tools/gufo/compile_h3_attention.py"
+      || relativePath == "tools/gufo/h3_attention_kernel.py";
   };
 in
 stdenv.mkDerivation (finalAttrs: {
-  pname = "strix";
+  pname = "gufo";
   inherit version;
   src = productionSource;
 
@@ -97,9 +97,9 @@ stdenv.mkDerivation (finalAttrs: {
   cmakeFlags = [
     "-DCMAKE_BUILD_TYPE=RelWithDebInfo"
     "-DBUILD_TESTING=OFF"
-    "-DSTRIX_VERSION=${version}"
-    "-DSTRIX_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
-    "-DSTRIX_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
+    "-DGUFO_VERSION=${version}"
+    "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
+    "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
   ]
   ++ lib.optional rocmSupport "-DENGINE_ENABLE_HIP=ON"
   ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
@@ -108,20 +108,20 @@ stdenv.mkDerivation (finalAttrs: {
   ++ lib.optional rocmSupport "-DROCPRIM_INCLUDE_DIR=${rocmPackages.rocprim}/include"
   ++ lib.optional rocmSupport "-DROCWMMA_INCLUDE_DIR=${rocmPackages.rocwmma}/include"
   ++ lib.optional xrtSupport "-DENGINE_ENABLE_XRT=ON"
-  ++ lib.optional xrtSupport "-DSTRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/qwen-mtp-eh-proj"
-  ++ lib.optional xrtSupport "-DSTRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/qwen-mtp-rmsnorm"
-  ++ lib.optional xrtSupport "-DSTRIX_AIE_SMOKE_PROGRAM_DIR=${placeholder "out"}/share/strix/aie/smoke";
+  ++ lib.optional xrtSupport "-DGUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR=${placeholder "out"}/share/gufo/aie/qwen-mtp-eh-proj"
+  ++ lib.optional xrtSupport "-DGUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR=${placeholder "out"}/share/gufo/aie/qwen-mtp-rmsnorm"
+  ++ lib.optional xrtSupport "-DGUFO_AIE_SMOKE_PROGRAM_DIR=${placeholder "out"}/share/gufo/aie/smoke";
 
   env = lib.optionalAttrs rocmSupport {
     ROCM_PATH = "${rocmPackages.clr}";
-    STRIX_HIPCUB_ROOT = "${rocmPackages.hipcub}";
-    STRIX_ROCPRIM_ROOT = "${rocmPackages.rocprim}";
-    STRIX_ROCWMMA_ROOT = "${rocmPackages.rocwmma}";
+    GUFO_HIPCUB_ROOT = "${rocmPackages.hipcub}";
+    GUFO_ROCPRIM_ROOT = "${rocmPackages.rocprim}";
+    GUFO_ROCWMMA_ROOT = "${rocmPackages.rocwmma}";
   }
   // lib.optionalAttrs xrtSupport {
-    STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT = "${aie-qwen-mtp-eh-proj}";
-    STRIX_AIE_QWEN_MTP_RMSNORM_ROOT = "${aie-qwen-mtp-rmsnorm}";
-    STRIX_AIE_SMOKE_ROOT = "${aie-smoke}";
+    GUFO_AIE_QWEN_MTP_EH_PROJ_ROOT = "${aie-qwen-mtp-eh-proj}";
+    GUFO_AIE_QWEN_MTP_RMSNORM_ROOT = "${aie-qwen-mtp-rmsnorm}";
+    GUFO_AIE_SMOKE_ROOT = "${aie-smoke}";
     XRT_PATH = "${xrt}/opt/xilinx/xrt";
     # Combined NPU lib dir so XRT can discover the amdxdna plugin at runtime.
     LD_LIBRARY_PATH = "${xrt}/opt/xilinx/xrt/lib:${xrt-plugin-amdxdna}/opt/xilinx/xrt/lib";
@@ -131,16 +131,16 @@ stdenv.mkDerivation (finalAttrs: {
     runHook preInstall
 
     mkdir -p $out/bin
-    cp strix $out/bin/strix
-    ln -sf strix $out/bin/strix-server
-    mkdir -p $out/share/strix/models/qwen3_tts
+    cp gufo $out/bin/gufo
+    ln -sf gufo $out/bin/gufo-server
+    mkdir -p $out/share/gufo/models/qwen3_tts
     cp $src/src/models/qwen3_tts/reference/run_official.py \
-      $out/share/strix/models/qwen3_tts/
-    mkdir -p $out/share/strix/models/minimax_h3
+      $out/share/gufo/models/qwen3_tts/
+    mkdir -p $out/share/gufo/models/minimax_h3
     cp $src/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json \
-      $out/share/strix/models/minimax_h3/
-    if [ -f strix-kernel-bench ]; then
-      cp strix-kernel-bench $out/bin/strix-kernel-bench
+      $out/share/gufo/models/minimax_h3/
+    if [ -f gufo-kernel-bench ]; then
+      cp gufo-kernel-bench $out/bin/gufo-kernel-bench
     fi
     if [ -f tune_hipblaslt ]; then
       cp tune_hipblaslt $out/bin/tune_hipblaslt
@@ -149,15 +149,15 @@ stdenv.mkDerivation (finalAttrs: {
       cp benchmark_ssm_replay $out/bin/benchmark_ssm_replay
     fi
     if [ -d ${aie-smoke} ]; then
-      mkdir -p $out/share/strix/aie/smoke
+      mkdir -p $out/share/gufo/aie/smoke
       cp ${aie-smoke}/smoke.xclbin ${aie-smoke}/smoke.insts.elf \
         ${aie-smoke}/smoke.insts.bin ${aie-smoke}/smoke.pdi \
         ${aie-smoke}/smoke.aie-partition.json \
         ${aie-smoke}/manifest.json ${aie-smoke}/SHA256SUMS \
-        $out/share/strix/aie/smoke/
+        $out/share/gufo/aie/smoke/
     fi
     if [ -d ${aie-qwen-mtp-rmsnorm} ]; then
-      mkdir -p $out/share/strix/aie/qwen-mtp-rmsnorm
+      mkdir -p $out/share/gufo/aie/qwen-mtp-rmsnorm
       cp ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.xclbin \
         ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.insts.elf \
         ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.insts.bin \
@@ -165,10 +165,10 @@ stdenv.mkDerivation (finalAttrs: {
         ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.aie-partition.json \
         ${aie-qwen-mtp-rmsnorm}/manifest.json \
         ${aie-qwen-mtp-rmsnorm}/SHA256SUMS \
-        $out/share/strix/aie/qwen-mtp-rmsnorm/
+        $out/share/gufo/aie/qwen-mtp-rmsnorm/
     fi
     if [ -d ${aie-qwen-mtp-eh-proj} ]; then
-      mkdir -p $out/share/strix/aie/qwen-mtp-eh-proj
+      mkdir -p $out/share/gufo/aie/qwen-mtp-eh-proj
       cp ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.xclbin \
         ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.insts.elf \
         ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj_insts.bin \
@@ -176,7 +176,7 @@ stdenv.mkDerivation (finalAttrs: {
         ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.aie-partition.json \
         ${aie-qwen-mtp-eh-proj}/manifest.json \
         ${aie-qwen-mtp-eh-proj}/SHA256SUMS \
-        $out/share/strix/aie/qwen-mtp-eh-proj/
+        $out/share/gufo/aie/qwen-mtp-eh-proj/
     fi
     chmod +x $out/bin/*
 
@@ -187,12 +187,12 @@ stdenv.mkDerivation (finalAttrs: {
   installCheckPhase = ''
     runHook preInstallCheck
 
-    $out/bin/strix --version
-    $out/bin/strix --help >/dev/null
-    $out/bin/strix-server --version
-    $out/bin/strix-server --help >/dev/null
-    if [ -x $out/bin/strix-kernel-bench ]; then
-      $out/bin/strix-kernel-bench --help >/dev/null
+    $out/bin/gufo --version
+    $out/bin/gufo --help >/dev/null
+    $out/bin/gufo-server --version
+    $out/bin/gufo-server --help >/dev/null
+    if [ -x $out/bin/gufo-kernel-bench ]; then
+      $out/bin/gufo-kernel-bench --help >/dev/null
     fi
     if [ -x $out/bin/tune_hipblaslt ]; then
       $out/bin/tune_hipblaslt --help >/dev/null
@@ -220,10 +220,10 @@ stdenv.mkDerivation (finalAttrs: {
   };
 
   meta = with lib; {
-    description = "Strix Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
+    description = "Gufo Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
     homepage = "https://github.com/";
     license = licenses.mit;
     platforms = [ "x86_64-linux" ];
-    mainProgram = "strix";
+    mainProgram = "gufo";
   };
 })

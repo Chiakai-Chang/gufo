@@ -1,12 +1,12 @@
-#ifndef STRIX_CORE_MODEL_KIND_HPP_
-#define STRIX_CORE_MODEL_KIND_HPP_
+#ifndef GUFO_CORE_MODEL_KIND_HPP_
+#define GUFO_CORE_MODEL_KIND_HPP_
 
 #include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>
 
-namespace strix::core {
+namespace gufo::core {
 
 /// Implementation families grouping models sharing kernel architectures,
 /// recurring layer patterns, and execution graphs.
@@ -164,6 +164,6 @@ struct ModelDescriptor {
   ArchitectureParameters arch;
 };
 
-}  // namespace strix::core
+}  // namespace gufo::core
 
-#endif  // STRIX_CORE_MODEL_KIND_HPP_
+#endif  // GUFO_CORE_MODEL_KIND_HPP_

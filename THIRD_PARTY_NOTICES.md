@@ -1,7 +1,7 @@
 # Third-Party Notices and Inventory
 
 This document records the complete inventory of third-party software, libraries, drivers,
-and system components used, linked, or required by **Strix-Halo.cpp**.
+and system components used, linked, or required by **gufo**.
 
 For design policy details regarding licensing boundaries, see [docs/LICENSING.md](docs/LICENSING.md).
 
@@ -128,7 +128,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
 - **Component Name**: ROCprofiler SDK / ROCTx
 - **Upstream URL**: https://github.com/ROCm/rocprofiler-sdk
 - **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.rocprofiler-sdk`)
-- **Component Used**: The `rocprofv3` diagnostic profiler and the lightweight ROCTx marker library linked only by `strix-kernel-bench`
+- **Component Used**: The `rocprofv3` diagnostic profiler and the lightweight ROCTx marker library linked only by `gufo-kernel-bench`
 - **SPDX License Identifier**: `MIT`
 - **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
 - **Relationship**: Benchmark marker library / profiling tool; the inference server does not link the profiler SDK
@@ -160,7 +160,7 @@ For design policy details regarding licensing boundaries, see [docs/LICENSING.md
   `GPL-2.0-or-later`; the pinned Nix derivation also declares
   `LGPL-3.0-or-later` and `GPL-3.0-or-later` for enabled optional components
 - **Relationship**: Spawned as a separate runtime process through pipes.
-  Strix does not link FFmpeg libraries or copy FFmpeg source into the engine.
+  Gufo does not link FFmpeg libraries or copy FFmpeg source into the engine.
 - **Corresponding-Source Location**: https://github.com/FFmpeg/FFmpeg
   (via Nix derivation `ffmpeg-headless`)
 
@@ -192,7 +192,7 @@ license.
   and DS4 contributors; the upstream license is retained under
   `src/models/deepseek_v4_flash/vendor/antirez/LICENSE`.
 - **Relationship**: Vendored and adapted into a model-private ROCm backend.
-  Strix does not import the upstream command-line interface, HTTP server,
+  Gufo does not import the upstream command-line interface, HTTP server,
   agent, evaluator, or disk-cache frontend.
 - **Corresponding-Source Location**:
   https://github.com/antirez/ds4/tree/84cc882352757baf628a1776badf7cc54d584e28
@@ -205,7 +205,7 @@ license.
 - **Component Used**: Dynamic library for Universally Unique Identifier (UUID) generation
 - **SPDX License Identifier**: `BSD-3-Clause` / `LGPL-2.1-or-later`
 - **Copyright / Notice Source**: Copyright (C) 1996, 1997, 1998 Theodore Ts'o.
-- **Relationship**: Linked (Dynamic runtime library dependency required by XRT and strix)
+- **Relationship**: Linked (Dynamic runtime library dependency required by XRT and gufo)
 - **Corresponding-Source Location**: https://git.kernel.org/pub/scm/utils/util-linux/util-linux.git
 
 ### 1.14 MLIR-AIE / IRON
@@ -260,7 +260,7 @@ retains that notice. See
 
 ## 2. System Boundary Dependencies (Non-Distributed)
 
-The following components are required from the host environment or system kernel. They are **not** bundled, copied, or distributed by Strix-Halo.cpp.
+The following components are required from the host environment or system kernel. They are **not** bundled, copied, or distributed by gufo.
 
 ### 2.1 Upstream Linux `amdxdna` Kernel Driver
 
@@ -270,7 +270,7 @@ The following components are required from the host environment or system kernel
 - **Component Used**: System device driver providing character device node `/dev/accel/accel*`
 - **SPDX License Identifier**: `GPL-2.0-only`
 - **Copyright / Notice Source**: Copyright (C) Advanced Micro Devices, Inc.
-- **Relationship**: System (Non-distributed system kernel driver. Strix-Halo.cpp runs as an independent userspace process communicating via the standard kernel UAPI boundary without copying kernel implementation code).
+- **Relationship**: System (Non-distributed system kernel driver. gufo runs as an independent userspace process communicating via the standard kernel UAPI boundary without copying kernel implementation code).
 - **Corresponding-Source Location**: Host OS Linux kernel package / distribution kernel source tree
 
 ### 2.2 `amdxdna` Kernel UAPI Headers
@@ -292,14 +292,14 @@ The following components are required from the host environment or system kernel
 - **Component Used**: Binary firmware blobs loaded into hardware NPU tiles by the kernel driver
 - **SPDX License Identifier**: Proprietary Redistribution License (`LICENSE.amdnpu`)
 - **Copyright / Notice Source**: Copyright (C) 2023-2024 Advanced Micro Devices, Inc. All Rights Reserved.
-- **Relationship**: System (Host system dependency. Strix-Halo.cpp does **not** bundle or redistribute NPU firmware binaries; firmware must be provided by the host Linux distribution).
+- **Relationship**: System (Host system dependency. gufo does **not** bundle or redistribute NPU firmware binaries; firmware must be provided by the host Linux distribution).
 - **Corresponding-Source Location**: Host OS `linux-firmware` package / AMD hardware driver packages
 
 ---
 
 ## 3. External Model Artifacts (Non-Distributed)
 
-Model checkpoints are not part of the Strix-Halo.cpp source or binary
+Model checkpoints are not part of the gufo source or binary
 distribution. Operators obtain them directly from their publisher and remain
 responsible for the terms governing their location and use.
 
@@ -318,10 +318,10 @@ responsible for the terms governing their location and use.
 - **Copyright / Notice Source**: Copyright © 2026 MiniMax. All Rights Reserved.
 - **Relationship**: External, access-controlled, operator-supplied runtime
   artifact. It is never committed, packaged, mirrored, automatically
-  downloaded, or redistributed by Strix-Halo.cpp.
+  downloaded, or redistributed by gufo.
 - **Operational Boundary**: Every operator must independently obtain access
   from MiniMax, accept or obtain the terms applicable to that operator, and
-  configure a local checkpoint path. Possession of the Strix-Halo.cpp source
+  configure a local checkpoint path. Possession of the gufo source
   does not grant model rights.
 - **Serving Boundary**: The engine supplies numerical execution only. Anyone
   exposing H3 through an API is responsible for the publisher's user terms,
@@ -341,7 +341,7 @@ determination about a downstream operator.
 - **Component Used**: H3 prompt encoder through layer 50
 - **SPDX License Identifier**: `Apache-2.0`
 - **Relationship**: External model component within the operator-supplied H3
-  checkpoint; not distributed by Strix-Halo.cpp
+  checkpoint; not distributed by gufo
 
 See [docs/MINIMAX_H3.md](docs/MINIMAX_H3.md) for the acquisition, release, and
 runtime boundary.
@@ -352,7 +352,7 @@ runtime boundary.
 
 The following packages are present only in the pinned Nix development shell.
 They are not linked into, copied into, or distributed with the production
-`strix` or `strix-server` package.
+`gufo` package.
 
 ### 4.1 PyTorch ROCm
 
@@ -389,7 +389,7 @@ They are not linked into, copied into, or distributed with the production
 - **Relationship**: Evaluation-only tool; absent from the production package
   closure
 - **Model Boundary**: Feature-network parameters are not committed or
-  redistributed by Strix-Halo.cpp. Each promoted quality report records a
+  redistributed by gufo. Each promoted quality report records a
   canonical SHA-256 of the loaded module state and the exact
   LPIPS/PyTorch/Torchvision versions.
 

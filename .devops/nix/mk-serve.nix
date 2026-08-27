@@ -1,6 +1,6 @@
 {
   lib,
-  strix ? null,
+  gufo ? null,
 }:
 
 {
@@ -60,8 +60,8 @@
   manifest ? null,
   ttl ? null,
 
-  # Custom strix package override
-  strixPackage ? strix,
+  # Custom gufo package override
+  gufoPackage ? gufo,
   extraArgs ? [ ],
 }:
 
@@ -282,7 +282,7 @@ let
     )
     ++ extraArgs;
 
-  bin = if strixPackage != null then "${strixPackage}/bin/strix" else "strix";
+  bin = if gufoPackage != null then "${gufoPackage}/bin/gufo" else "gufo";
   escapedServerArgs = lib.escapeShellArgs serverArgs;
   escapedModalityArgs = lib.escapeShellArgs modalityArgs;
   rawHostStr = if (host != null && isRawEnvVar host) then " --host ${host}" else "";
@@ -291,11 +291,11 @@ let
   modalityStr = if (escapedModalityArgs != "") then " " + escapedModalityArgs else "";
 in
 assert lib.assertMsg (lib.elem modality validModalities)
-  "strix.mkServe: 'modality' must be one of ${lib.generators.toJSON { } validModalities}, got '${modality}'";
+  "gufo.mkServe: 'modality' must be one of ${lib.generators.toJSON { } validModalities}, got '${modality}'";
 assert lib.assertMsg (model != null && model != "")
-  "strix.mkServe: 'model' must be specified (cannot be empty)";
+  "gufo.mkServe: 'model' must be specified (cannot be empty)";
 assert lib.assertMsg (think == null || lib.elem think validThinkModes)
-  "strix.mkServe: 'think' must be one of ${lib.generators.toJSON { } validThinkModes}, got '${toString think}'";
+  "gufo.mkServe: 'think' must be one of ${lib.generators.toJSON { } validThinkModes}, got '${toString think}'";
 assert lib.assertMsg (finalSpeculative == null || lib.elem finalSpeculative validSpeculativeModes)
-  "strix.mkServe: 'speculative' must be one of ${lib.generators.toJSON { } validSpeculativeModes}, got '${toString finalSpeculative}'";
+  "gufo.mkServe: 'speculative' must be one of ${lib.generators.toJSON { } validSpeculativeModes}, got '${toString finalSpeculative}'";
 "${bin} serve${serverStr}${rawHostStr}${rawPortStr} ${modality}${modalityStr}"

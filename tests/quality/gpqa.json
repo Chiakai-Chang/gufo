@@ -1,5 +1,5 @@
 {
-  "schema": "strix.eval-cases.v1",
+  "schema": "gufo.eval-cases.v1",
   "suite": "gpqa",
   "license": "CC BY 4.0",
   "cases": [

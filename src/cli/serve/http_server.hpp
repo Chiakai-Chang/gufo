@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_HTTP_SERVER_HPP_
-#define STRIX_SERVER_HTTP_SERVER_HPP_
+#ifndef GUFO_SERVER_HTTP_SERVER_HPP_
+#define GUFO_SERVER_HTTP_SERVER_HPP_
 
 #include <atomic>
 #include <cctype>
@@ -13,7 +13,7 @@
 
 #include "src/cli/serve/text_generation_backend.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 
 class VideoJobService;
 class TtsService;
@@ -165,6 +165,6 @@ inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
   }
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_HTTP_SERVER_HPP_
+#endif  // GUFO_SERVER_HTTP_SERVER_HPP_

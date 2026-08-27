@@ -15,7 +15,7 @@ import numpy as np
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
-from strix import h3_quality  # noqa: E402
+from gufo import h3_quality  # noqa: E402
 
 
 CONTRACT_PATH = (

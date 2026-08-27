@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_MTP_HPP_
-#define STRIX_MODELS_QWEN_HIP_MTP_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_MTP_HPP_
+#define GUFO_MODELS_QWEN_HIP_MTP_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -19,7 +19,7 @@
 #include "src/models/qwen/xdna2/mtp_eh_proj.h"
 #endif
 
-namespace strix::hip {
+namespace gufo::hip {
 
 enum class QwenMtpExecutionMode : std::uint8_t {
   kGpu,
@@ -244,7 +244,7 @@ private:
   std::string last_error_;
 };
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_MTP_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_MTP_HPP_

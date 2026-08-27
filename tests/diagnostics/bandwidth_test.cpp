@@ -41,13 +41,13 @@ std::filesystem::path FindFixturesRoot() {
 }
 
 void TestCpuBandwidthCorrectness() {
-  strix::diagnostics::BandwidthOptions opts;
+  gufo::diagnostics::BandwidthOptions opts;
   opts.backends = {"cpu"};
   opts.warmup = 1;
   opts.repetitions = 3;
   opts.working_set_bytes = 16ULL * 1024ULL * 1024ULL;  // 16 MiB for fast test
 
-  const auto results = strix::diagnostics::MeasureCpuBandwidth(opts);
+  const auto results = gufo::diagnostics::MeasureCpuBandwidth(opts);
   Expect(results.size() == 3,
          "Expected 3 CPU bandwidth paths (copy, read, write)");
 
@@ -64,16 +64,16 @@ void TestCpuBandwidthCorrectness() {
 }
 
 void TestBandwidthReportJsonStructure() {
-  const auto inv = strix::diagnostics::CollectSystemInventory();
-  const auto fp = strix::diagnostics::GenerateMachineFingerprint(inv);
+  const auto inv = gufo::diagnostics::CollectSystemInventory();
+  const auto fp = gufo::diagnostics::GenerateMachineFingerprint(inv);
 
-  strix::diagnostics::BandwidthOptions opts;
+  gufo::diagnostics::BandwidthOptions opts;
   opts.backends = {"cpu"};
   opts.warmup = 1;
   opts.repetitions = 2;
   opts.working_set_bytes = 8ULL * 1024ULL * 1024ULL;
 
-  const auto report = strix::diagnostics::RunBandwidthBenchmark(opts, fp);
+  const auto report = gufo::diagnostics::RunBandwidthBenchmark(opts, fp);
   const std::string json = report.ToJson();
 
   Expect(json.find("\"schemaVersion\": \"1.0.0\"") != std::string::npos,
@@ -87,7 +87,7 @@ void TestBandwidthReportJsonStructure() {
          "Has rawRepetitionsGbps");
 
   // Validate artifact
-  const auto val_res = strix::diagnostics::ValidateArtifactContent(json);
+  const auto val_res = gufo::diagnostics::ValidateArtifactContent(json);
   Expect(val_res.is_valid, "BandwidthReport JSON is valid artifact");
 }
 

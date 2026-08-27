@@ -27,7 +27,7 @@
 #include "src/models/qwen3_tts/hip/speech_decoder_ops.hpp"
 #include "src/models/qwen3_tts/loader.hpp"
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -114,7 +114,7 @@ enum class WeightMode {
 };
 
 WeightMode GetWeightMode() {
-  const char* value = std::getenv("STRIX_QWEN3_TTS_WEIGHT_MODE");
+  const char* value = std::getenv("GUFO_QWEN3_TTS_WEIGHT_MODE");
   if (value == nullptr) {
     return WeightMode::kAuto;
   }
@@ -129,7 +129,7 @@ WeightMode GetWeightMode() {
 }
 
 bool ShouldPrecomputeSnakeBeta() {
-  const char* value = std::getenv("STRIX_QWEN3_TTS_PRECOMPUTE_SNAKE");
+  const char* value = std::getenv("GUFO_QWEN3_TTS_PRECOMPUTE_SNAKE");
   return value != nullptr && std::string_view(value) == "1";
 }
 
@@ -1043,11 +1043,11 @@ bool SpeechDecoderHipRuntime::Decode(std::span<const std::uint32_t> codes,
   }
 }
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
 #else
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 
 struct SpeechDecoderHipRuntime::Impl {};
 
@@ -1073,6 +1073,6 @@ bool SpeechDecoderHipRuntime::Decode(std::span<const std::uint32_t>,
   return false;
 }
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
 #endif

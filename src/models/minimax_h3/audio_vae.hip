@@ -23,7 +23,7 @@
 #include "src/models/minimax_h3/audio_vae_ops.cuh"
 #include "src/models/minimax_h3/json.hpp"
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -86,7 +86,7 @@ bool ValidateTarget(int* device, std::string* error) {
   if (!std::string_view(properties.gcnArchName).starts_with("gfx1151") ||
       properties.integrated == 0) {
     SetError(error,
-             "MiniMax H3 AudioVAE supports only integrated gfx1151 Strix "
+             "MiniMax H3 AudioVAE supports only integrated gfx1151 Gufo "
              "Halo; detected " +
                  std::string(properties.gcnArchName));
     return false;
@@ -1094,6 +1094,6 @@ int AudioVaeDecoder::samples() const noexcept {
   return impl_ == nullptr ? 0 : impl_->sample_count;
 }
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3
 
 #endif

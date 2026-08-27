@@ -14,7 +14,7 @@
 #include "src/cli/serve/json.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 namespace {
 
 constexpr std::string_view kSpeechPath = "/v1/audio/speech";
@@ -321,9 +321,9 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
       .headers =
           {
               {"Content-Type", "audio/wav"},
-              {"X-Strix-Schema", std::string(kAudioTtsApiSchema)},
-              {"X-Strix-TTS-Backend", service.backend_name()},
-              {"X-Strix-Codec-Steps",
+              {"X-Gufo-Schema", std::string(kAudioTtsApiSchema)},
+              {"X-Gufo-TTS-Backend", service.backend_name()},
+              {"X-Gufo-Codec-Steps",
                std::to_string(result.codes.size() /
                               std::max<std::uint32_t>(1, result.code_groups))},
           },
@@ -350,4 +350,4 @@ HttpResponse HandleAudioTtsApiRequest(const HttpRequest& request,
                "method_not_allowed");
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

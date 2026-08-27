@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_XDNA2_QWEN_MTP_RMSNORM_H_
-#define STRIX_CORE_XDNA2_QWEN_MTP_RMSNORM_H_
+#ifndef GUFO_CORE_XDNA2_QWEN_MTP_RMSNORM_H_
+#define GUFO_CORE_XDNA2_QWEN_MTP_RMSNORM_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +10,7 @@
 
 #include "src/core/xdna2/device.h"
 
-namespace strix::xdna2 {
+namespace gufo::xdna2 {
 
 inline constexpr std::size_t kQwenMtpRmsNormElements = 5120;
 
@@ -104,6 +104,6 @@ private:
   bool quarantined_{false};
 };
 
-}  // namespace strix::xdna2
+}  // namespace gufo::xdna2
 
-#endif  // STRIX_CORE_XDNA2_QWEN_MTP_RMSNORM_H_
+#endif  // GUFO_CORE_XDNA2_QWEN_MTP_RMSNORM_H_

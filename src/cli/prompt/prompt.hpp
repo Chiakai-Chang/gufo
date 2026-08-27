@@ -1,5 +1,5 @@
-#ifndef STRIX_CLI_PROMPT_HPP_
-#define STRIX_CLI_PROMPT_HPP_
+#ifndef GUFO_CLI_PROMPT_HPP_
+#define GUFO_CLI_PROMPT_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -8,9 +8,9 @@
 #include <string>
 #include <string_view>
 
-namespace strix::cli {
+namespace gufo::cli {
 
-/// Options for `strix prompt` and `strix chat` execution.
+/// Options for `gufo prompt` and `gufo chat` execution.
 struct PromptOptions {
   std::string model_path;
   std::string prompt_text;
@@ -40,13 +40,13 @@ struct PromptOptions {
   std::size_t min_draft_tokens = 1;
 };
 
-/// Prints help for `strix prompt`.
+/// Prints help for `gufo prompt`.
 void PrintPromptHelp(std::string_view program_name);
 
-/// Prints help for `strix chat`.
+/// Prints help for `gufo chat`.
 void PrintChatHelp(std::string_view program_name);
 
-/// Parses command line options for `strix prompt`.
+/// Parses command line options for `gufo prompt`.
 [[nodiscard]] std::optional<PromptOptions> ParsePromptOptions(
     std::span<const char* const> args, std::string* error_msg = nullptr);
 
@@ -56,6 +56,6 @@ void PrintChatHelp(std::string_view program_name);
 /// Executes the interactive multi-turn terminal chat workflow.
 [[nodiscard]] int RunChat(std::span<const char* const> args);
 
-}  // namespace strix::cli
+}  // namespace gufo::cli
 
-#endif  // STRIX_CLI_PROMPT_HPP_
+#endif  // GUFO_CLI_PROMPT_HPP_

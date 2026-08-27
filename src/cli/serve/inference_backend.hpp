@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_INFERENCE_BACKEND_HPP_
-#define STRIX_SERVER_INFERENCE_BACKEND_HPP_
+#ifndef GUFO_SERVER_INFERENCE_BACKEND_HPP_
+#define GUFO_SERVER_INFERENCE_BACKEND_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -12,15 +12,15 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 class QwenGpuModel;
 }
 
-namespace strix::models::deepseek_v4_flash {
+namespace gufo::models::deepseek_v4_flash {
 class Model;
 }
 
-namespace strix::server {
+namespace gufo::server {
 
 /// Thread-safe HTTP inference facade over shared immutable GPU model resources
 /// and a bounded pool of request-owned executor sessions.
@@ -89,6 +89,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_INFERENCE_BACKEND_HPP_
+#endif  // GUFO_SERVER_INFERENCE_BACKEND_HPP_

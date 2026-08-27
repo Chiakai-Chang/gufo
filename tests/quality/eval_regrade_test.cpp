@@ -5,26 +5,26 @@
 #include "src/eval/trace.hpp"
 
 void TestEvalRegradeAllPass() {
-  strix::eval::EvalTraceReport report;
+  gufo::eval::EvalTraceReport report;
   report.model_id = "qwen35-4b";
   report.route_identity = "GPU_ONLY:gfx1151";
   report.suite_hash = "sha256:abcd1234";
 
-  strix::eval::EvalCaseTrace c1;
+  gufo::eval::EvalCaseTrace c1;
   c1.case_id = "c1";
   c1.expected_answer = "Paris";
   c1.extracted_answer = "Paris";
   c1.passed = true;
   report.cases.push_back(c1);
 
-  strix::eval::EvalCaseTrace c2;
+  gufo::eval::EvalCaseTrace c2;
   c2.case_id = "c2";
   c2.expected_answer = "Tokyo";
   c2.extracted_answer = "Tokyo";
   c2.passed = true;
   report.cases.push_back(c2);
 
-  const auto summary = strix::eval::RegradeTrace(report);
+  const auto summary = gufo::eval::RegradeTrace(report);
   assert(summary.total_cases == 2);
   assert(summary.passed_cases == 2);
   assert(summary.failed_cases == 0);
@@ -32,24 +32,24 @@ void TestEvalRegradeAllPass() {
 }
 
 void TestEvalRegradePartialPass() {
-  strix::eval::EvalTraceReport report;
+  gufo::eval::EvalTraceReport report;
   report.model_id = "qwen35-4b";
 
-  strix::eval::EvalCaseTrace c1;
+  gufo::eval::EvalCaseTrace c1;
   c1.case_id = "c1";
   c1.expected_answer = "Paris";
   c1.extracted_answer = "London";
   c1.passed = false;
   report.cases.push_back(c1);
 
-  strix::eval::EvalCaseTrace c2;
+  gufo::eval::EvalCaseTrace c2;
   c2.case_id = "c2";
   c2.expected_answer = "Tokyo";
   c2.extracted_answer = "Tokyo";
   c2.passed = true;
   report.cases.push_back(c2);
 
-  const auto summary = strix::eval::RegradeTrace(report);
+  const auto summary = gufo::eval::RegradeTrace(report);
   assert(summary.total_cases == 2);
   assert(summary.passed_cases == 1);
   assert(summary.failed_cases == 1);

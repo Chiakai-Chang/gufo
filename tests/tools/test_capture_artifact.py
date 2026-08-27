@@ -10,7 +10,7 @@ import unittest
 import numpy as np
 import zstandard
 
-from tools.strix import manifest as strix_manifest
+from tools.gufo import manifest as gufo_manifest
 
 
 class TestCaptureArtifact(unittest.TestCase):
@@ -60,7 +60,7 @@ class TestCaptureArtifact(unittest.TestCase):
         }
         (self.artifact_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), "utf-8")
 
-        strix_manifest.write_logit_manifest(
+        gufo_manifest.write_logit_manifest(
             self.artifact_dir,
             model_family="qwen35",
             model_tag="qwen3.5-synthetic",
@@ -85,8 +85,8 @@ class TestCaptureArtifact(unittest.TestCase):
 
     def test_valid_artifact_validation(self):
         self._create_synthetic_artifact(vocab_size=64, num_prompts=3)
-        manifest = strix_manifest.validate_logit_artifact(self.artifact_dir)
-        self.assertEqual(manifest["schema"], "strix.logit-artifact.v1")
+        manifest = gufo_manifest.validate_logit_artifact(self.artifact_dir)
+        self.assertEqual(manifest["schema"], "gufo.logit-artifact.v1")
         self.assertEqual(manifest["vocab_size"], 64)
         self.assertEqual(manifest["chunk_count"], 3)
 
@@ -99,7 +99,7 @@ class TestCaptureArtifact(unittest.TestCase):
         chunk_path.write_bytes(bytes(corrupted))
 
         with self.assertRaises(ValueError):
-            strix_manifest.validate_logit_artifact(self.artifact_dir)
+            gufo_manifest.validate_logit_artifact(self.artifact_dir)
 
     def test_missing_chunk_detection(self):
         self._create_synthetic_artifact(vocab_size=64, num_prompts=2)
@@ -107,7 +107,7 @@ class TestCaptureArtifact(unittest.TestCase):
         (self.artifact_dir / "logits-00001.f32.zst").unlink()
 
         with self.assertRaises(FileNotFoundError):
-            strix_manifest.validate_logit_artifact(self.artifact_dir)
+            gufo_manifest.validate_logit_artifact(self.artifact_dir)
 
 
 if __name__ == "__main__":

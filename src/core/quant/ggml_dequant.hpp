@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_QUANT_GGML_DEQUANT_HPP_
-#define STRIX_CORE_QUANT_GGML_DEQUANT_HPP_
+#ifndef GUFO_CORE_QUANT_GGML_DEQUANT_HPP_
+#define GUFO_CORE_QUANT_GGML_DEQUANT_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -8,7 +8,7 @@
 
 #include "src/core/gguf_reader.hpp"
 
-namespace strix::quant {
+namespace gufo::quant {
 
 // Canonical quantized block layouts. These are the authoritative field
 // layouts for the dequant/dot paths. Relocated verbatim from the internal
@@ -134,6 +134,6 @@ void DequantizeQ8_0(const void* src, float* dst, std::size_t k);
 float DotProductQ8_0(const void* row_data, std::span<const float> vec,
                      std::size_t k);
 
-}  // namespace strix::quant
+}  // namespace gufo::quant
 
-#endif  // STRIX_CORE_QUANT_GGML_DEQUANT_HPP_
+#endif  // GUFO_CORE_QUANT_GGML_DEQUANT_HPP_

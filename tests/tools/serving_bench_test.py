@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 
-from strix import serving_bench
+from gufo import serving_bench
 
 
 def check(condition, message):
@@ -55,7 +55,7 @@ class FakeResponse:
                     "completion_tokens": 2,
                     "total_tokens": 14,
                     "prompt_tokens_details": {"cached_tokens": 2},
-                    "strix": {
+                    "gufo": {
                         "cache_hit": True,
                         "prefill_tokens": 10,
                         "prefill_ms": 20.0,
@@ -126,7 +126,7 @@ finally:
     serving_bench.urllib.request.urlopen = original_urlopen
 
 check(report["artifactType"] == "servingBenchmark", "artifact type")
-check(report["benchmarkSchema"] == "strix.serving-benchmark.v1", "schema")
+check(report["benchmarkSchema"] == "gufo.serving-benchmark.v1", "schema")
 check(
     sorted(report["results"]) == ["c1", "c2", "c4"],
     "C=1/C=2/C=4 summaries",

@@ -8,7 +8,7 @@
 #include <sstream>
 #include <string_view>
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 namespace {
 
@@ -268,4 +268,4 @@ std::vector<SysfsNpuDevice> LinuxSysfs::QueryAccelNpuDevices() const {
   return devices;
 }
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics

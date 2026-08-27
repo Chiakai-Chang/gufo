@@ -25,7 +25,7 @@ provides a fused causal GQA fallback for shapes not handled by a native tile.
 Use CMake with C++20 and HIP as first-class languages:
 
 ```cmake
-project(strix LANGUAGES CXX HIP)
+project(gufo LANGUAGES CXX HIP)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_HIP_ARCHITECTURES gfx1151)
 ```
@@ -46,10 +46,10 @@ git add .
 nix build
 
 ./result/bin/tune_hipblaslt \
-  --out "$HOME/.cache/strix/hipblaslt-plans.bin"
+  --out "$HOME/.cache/gufo/hipblaslt-plans.bin"
 
-STRIX_HIPBLASLT_PLAN_CACHE="$HOME/.cache/strix/hipblaslt-plans.bin" \
-  ./result/bin/strix prompt --model "$MODEL" "Hello"
+GUFO_HIPBLASLT_PLAN_CACHE="$HOME/.cache/gufo/hipblaslt-plans.bin" \
+  ./result/bin/gufo prompt --model "$MODEL" "Hello"
 ```
 
 The tuner covers the seven Qwen3.8 projection shapes at prompt batches
@@ -216,7 +216,7 @@ QKV/alpha/beta inputs in a 16-position device ring. After a rejection,
 accepted positions call the same decode recurrence kernels with those recorded
 inputs instead of rerunning embeddings, attention, FFN, and LM-head
 projections. Draft windows larger than 16 or incomplete captures use the
-original full-model replay path. Set `STRIX_DISABLE_SSM_REPLAY=1` only for
+original full-model replay path. Set `GUFO_DISABLE_SSM_REPLAY=1` only for
 fallback diagnosis or benchmark comparison.
 
 ### MoE
@@ -281,7 +281,7 @@ models/<model>/gpu/gfx1151/
 
 Each model is compiled as an independent object target with unique host and
 device symbol prefixes. The final link places all targets in the single
-`strix` executable, but does not merge their kernel ownership.
+`gufo` executable, but does not merge their kernel ownership.
 
 There is no global numerical kernel registry or production `common/kernels`
 directory. A model binds its tensors to its own dispatch table during load.

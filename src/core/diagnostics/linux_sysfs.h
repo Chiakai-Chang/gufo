@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_DIAGNOSTICS_LINUX_SYSFS_H_
-#define STRIX_CORE_DIAGNOSTICS_LINUX_SYSFS_H_
+#ifndef GUFO_CORE_DIAGNOSTICS_LINUX_SYSFS_H_
+#define GUFO_CORE_DIAGNOSTICS_LINUX_SYSFS_H_
 
 #include <cstdint>
 #include <filesystem>
@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 struct HostUnameInfo {
   std::string sysname;
@@ -73,6 +73,6 @@ private:
   std::filesystem::path proc_root_;
 };
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics
 
-#endif  // STRIX_CORE_DIAGNOSTICS_LINUX_SYSFS_H_
+#endif  // GUFO_CORE_DIAGNOSTICS_LINUX_SYSFS_H_

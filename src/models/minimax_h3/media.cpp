@@ -23,12 +23,12 @@
 #include <utility>
 #include <vector>
 
-#ifndef STRIX_FFMPEG_EXECUTABLE
-#define STRIX_FFMPEG_EXECUTABLE "ffmpeg"
+#ifndef GUFO_FFMPEG_EXECUTABLE
+#define GUFO_FFMPEG_EXECUTABLE "ffmpeg"
 #endif
 
-#ifndef STRIX_FFPROBE_EXECUTABLE
-#define STRIX_FFPROBE_EXECUTABLE "ffprobe"
+#ifndef GUFO_FFPROBE_EXECUTABLE
+#define GUFO_FFPROBE_EXECUTABLE "ffprobe"
 #endif
 
 // POSIX requires the process environment through a mutable-pointer ABI even
@@ -36,7 +36,7 @@
 extern char**
     environ;  // NOLINT(cppcoreguidelines-avoid-non-const-global-variables)
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 namespace {
 
 constexpr std::size_t kIoChunkBytes = 4U << 20U;
@@ -70,22 +70,22 @@ void SetError(std::string* error, std::string message) {
 }
 
 const char* FfmpegProgram() {
-  const char* override = std::getenv("STRIX_FFMPEG");
+  const char* override = std::getenv("GUFO_FFMPEG");
   return override != nullptr && *override != '\0' ? override
-                                                  : STRIX_FFMPEG_EXECUTABLE;
+                                                  : GUFO_FFMPEG_EXECUTABLE;
 }
 
 const char* FfprobeProgram() {
-  const char* override = std::getenv("STRIX_FFPROBE");
+  const char* override = std::getenv("GUFO_FFPROBE");
   return override != nullptr && *override != '\0' ? override
-                                                  : STRIX_FFPROBE_EXECUTABLE;
+                                                  : GUFO_FFPROBE_EXECUTABLE;
 }
 
 std::filesystem::path PartialMediaPath(
     const std::filesystem::path& destination) {
   static std::atomic<std::uint64_t> sequence{0};
   const std::string name =
-      destination.filename().string() + ".strix-partial-" +
+      destination.filename().string() + ".gufo-partial-" +
       std::to_string(static_cast<std::uint64_t>(getpid())) + "-" +
       std::to_string(sequence.fetch_add(1, std::memory_order_relaxed)) + ".mp4";
   return destination.parent_path() / name;
@@ -750,4 +750,4 @@ bool ProbeMediaFile(const std::filesystem::path& path, MediaProbe* probe,
   return true;
 }
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3

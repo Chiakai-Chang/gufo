@@ -23,32 +23,32 @@ The `tools/` directory is organized into domain-specific subdirectories:
 - `tools/h3/` — Multimodal & diffusion (MiniMax H3) manifest and quality verification
 - `tools/audio/` — TTS reference runners and audio quality evaluation
 - `tools/ci/` — Repository verification, dependency license audit, and docs checking
-- `tools/strix/` — Shared Python library (`shq`, `safetensors`, `recipe`, `model`, `quality`, `manifest`, `h3_*`)
+- `tools/gufo/` — Shared Python library (`shq`, `safetensors`, `recipe`, `model`, `quality`, `manifest`, `h3_*`)
 
 ## Commands
 
 ```bash
 # 1. download safetensors + tokenizer to artifacts/source
 # 2. validate safetensors, write source manifest
-tools/quant/strix-inspect.py --source artifacts/source --revision <sha> \
+tools/quant/gufo-inspect.py --source artifacts/source --revision <sha> \
   --out artifacts/work/source-manifest.json
 
 # 3. capture full-precision teacher logits + perplexity (matched-token)
-tools/quant/strix-capture.py --source artifacts/source \
+tools/quant/gufo-capture.py --source artifacts/source \
   --suite tools/quant/suites/teacher.json --out artifacts/teacher
 
 # 3b. capture per-input-channel imatrix (E[x^2]) for imatrix-weighted scale search
 #   (calibration suite MUST be disjoint from the eval suite; see tools/quant/suites/calib.json)
 #   CPU default; batched -> fast, exact fp64 reduction, bit-reproducible:
-#   tools/quant/strix-calibrate.py --source artifacts/source \
+#   tools/quant/gufo-calibrate.py --source artifacts/source \
 #     --suite tools/quant/suites/calib.json --out artifacts/calib
 #   GPU (gfx1151 ROCm torch, default shell) for big corpora:
-#   tools/quant/strix-calibrate.py --source artifacts/source \
+#   tools/quant/gufo-calibrate.py --source artifacts/source \
 #     --suite tools/quant/suites/calib.json --out artifacts/calib --device cuda
 #   --max-tokens N bounds real tokens per batched forward; --max-tokens 1
 #   reproduces the legacy one-prompt-at-a-time result. --reference DIR
 #   cross-checks against a prior artifact.
-tools/quant/strix-calibrate.py --source artifacts/source \
+tools/quant/gufo-calibrate.py --source artifacts/source \
   --suite tools/quant/suites/calib.json --out artifacts/calib
 
 # 4. quantize to a mixed-precision research recipe (tool default embed_ffn:
@@ -59,46 +59,46 @@ tools/quant/strix-calibrate.py --source artifacts/source \
 #   --recipe NAME selects a preset (bulk_g64/embed_only/embed_ffn/ffn_only/
 #   embed_attn/mirror_no_lin/unsloth_mirror/shq6_ffn/shq6_mirror/full_shq8)
 #   or a JSON rule file; tiers SHQ4-G64/G32, SHQ6-G64, SHQ8-G64, BF16
-tools/quant/strix-quantize.py --source artifacts/source \
+tools/quant/gufo-quantize.py --source artifacts/source \
   --out artifacts/quant --plan artifacts/work/quantization-plan.json --imatrix artifacts/calib
 # 4b. sweep mixed-precision presets, benchmark each, print comparison table
-tools/quant/strix-mp-experiment.py --source artifacts/source \
+tools/quant/gufo-mp-experiment.py --source artifacts/source \
   --suite tools/quant/suites/teacher.json --teacher-artifact artifacts/teacher \
   --imatrix artifacts/calib --json
 # 5. benchmark: candidate-vs-teacher quality + prefill/decode speed
-tools/quant/strix-bench.py --source artifacts/source --quant artifacts/quant \
+tools/quant/gufo-bench.py --source artifacts/source --quant artifacts/quant \
   --suite tools/quant/suites/teacher.json --teacher-artifact artifacts/teacher
 
 # 6. inspect an external GGUF (e.g. unsloth) and score it vs bf16, cross-quant
-tools/quant/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --card
+tools/quant/gufo-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --card
 # per-tensor retention vs bf16, side-by-side with our SHQ4 (from the plan)
-tools/quant/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --recon \
+tools/quant/gufo-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf --recon \
   --bf16-source artifacts/source --plan artifacts/work/quantization-plan.json
 ```
 
 ## Modules
 
-- `strix/safetensors.py` — safetensors validation + lazy read (Source Contract)
-- `strix/shq.py` — SHQ4-T16 / SHQ6-T16 / SHQ8-T16 quantize/pack/dequant (candidate contract; portable v1 not yet frozen)
-- `strix/conformance.py` — byte-exact conformance vectors (T1)
-- `strix/manifest.py` — source-manifest / quantization-plan writers
-- `strix/model.py` — Qwen3.5 teacher/candidate load + logit extraction
-- `strix/quality.py` — KL, perplexity, top-k agreement
-- `tools/quant/strix-capture.py` — teacher logit artifact (chunked zstd)
-- `tools/quant/strix-calibrate.py` — per-input-channel E[x^2] imatrix artifact
-- `strix/recipe.py` — SHQ-T16 mixed-precision recipe presets (per-tensor tiers)
-- `tools/quant/strix-quantize.py` — deterministic conversion (recipe + range/imatrix search)
-- `tools/quant/strix-mp-experiment.py` — quantize+bench sweep across presets (comparison table)
-- `tools/quant/strix-bench.py` — correctness-linked benchmark
-- `tools/serving/strix-serving-bench.py` — canonical C=1/C=2/C=4 HTTP serving benchmark
-- `tools/quant/strix-gguf.py` — GGUF header/tensor-info inspection + Q4-family dequant
+- `gufo/safetensors.py` — safetensors validation + lazy read (Source Contract)
+- `gufo/shq.py` — SHQ4-T16 / SHQ6-T16 / SHQ8-T16 quantize/pack/dequant (candidate contract; portable v1 not yet frozen)
+- `gufo/conformance.py` — byte-exact conformance vectors (T1)
+- `gufo/manifest.py` — source-manifest / quantization-plan writers
+- `gufo/model.py` — Qwen3.5 teacher/candidate load + logit extraction
+- `gufo/quality.py` — KL, perplexity, top-k agreement
+- `tools/quant/gufo-capture.py` — teacher logit artifact (chunked zstd)
+- `tools/quant/gufo-calibrate.py` — per-input-channel E[x^2] imatrix artifact
+- `gufo/recipe.py` — SHQ-T16 mixed-precision recipe presets (per-tensor tiers)
+- `tools/quant/gufo-quantize.py` — deterministic conversion (recipe + range/imatrix search)
+- `tools/quant/gufo-mp-experiment.py` — quantize+bench sweep across presets (comparison table)
+- `tools/quant/gufo-bench.py` — correctness-linked benchmark
+- `tools/serving/gufo-serving-bench.py` — canonical C=1/C=2/C=4 HTTP serving benchmark
+- `tools/quant/gufo-gguf.py` — GGUF header/tensor-info inspection + Q4-family dequant
   (`--card` model card, `--recon` per-tensor retention vs bf16 with our SHQ4
   stats merged from the quantization plan; see `benchmarks/qwen3.5-0.8b/`)
 
 ## Conformance tests
 
 ```bash
-python3 -c "import sys; sys.path.insert(0,'tools'); from strix.conformance import run_all; run_all()"
+python3 -c "import sys; sys.path.insert(0,'tools'); from gufo.conformance import run_all; run_all()"
 ```
 
 ## Layout contract (SHQ4-T16)
@@ -121,12 +121,12 @@ Planes are byte-identical in layout for both modes; only s/z/q values differ.
 
 ## Performance
 
-`strix-shq` is fully batch-vectorized and chunk-parallel. Scale/zero/code
+`gufo-shq` is fully batch-vectorized and chunk-parallel. Scale/zero/code
 selection and packing run as numpy ops on one `[B,16,G]` block array;
 chunks fan out across threads (numpy releases the GIL in its C loops, so
 elementwise/bandwidth-bound work parallelizes). Threads default to
 `min(4, cores)` (memory-bandwidth bound past 4); override with
-`STRIX_QUANT_THREADS`, fixed chunk size with `STRIX_QUANT_CHUNK`.
+`GUFO_QUANT_THREADS`, fixed chunk size with `GUFO_QUANT_CHUNK`.
 `dequant_shq4` is batch-vectorized too.
 
 Whole-model Qwen3.5-0.8B (158 tensors, G64) rough timings on this box:

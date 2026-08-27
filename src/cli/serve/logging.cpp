@@ -8,7 +8,7 @@
 #include <iostream>
 #include <mutex>
 
-namespace strix::server {
+namespace gufo::server {
 
 namespace {
 
@@ -132,4 +132,4 @@ void Logger::LogRequest(std::string_view method, std::string_view path,
   std::cout << out.str() << "\n" << std::flush;
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

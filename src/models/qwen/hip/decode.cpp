@@ -7,7 +7,7 @@
 #include "src/models/qwen/hip/detail/decode_step.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 tokenization::TokenId QwenGpuExecutor::ForwardToken(
     tokenization::TokenId token_id, std::uint32_t pos, bool compute_logits) {
@@ -92,5 +92,5 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
   return next_token_id;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -22,7 +22,7 @@
 #include "src/core/quant/ggml_dequant.hpp"
 
 #ifdef ENGINE_ENABLE_XRT
-#include <strix/aie_qwen_mtp_eh_proj_manifest.h>
+#include <gufo/aie_qwen_mtp_eh_proj_manifest.h>
 #include <xrt/experimental/xrt_elf.h>
 #include <xrt/experimental/xrt_ext.h>
 #include <xrt/experimental/xrt_module.h>
@@ -32,7 +32,7 @@
 #include <xrt/xrt_kernel.h>
 #endif
 
-namespace strix::xdna2 {
+namespace gufo::xdna2 {
 namespace {
 
 constexpr std::size_t kBlockElements = 256;
@@ -255,8 +255,8 @@ double PackActivations(std::span<const float> input, std::uint8_t* packed) {
 #ifdef ENGINE_ENABLE_XRT
 
 std::filesystem::path DefaultProgramDir() {
-#ifdef STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR
-  return STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR;
+#ifdef GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR
+  return GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR;
 #else
   return {};
 #endif
@@ -621,4 +621,4 @@ bool QwenMtpEhProjSession::Run(std::span<const float> input,
 #endif
 }
 
-}  // namespace strix::xdna2
+}  // namespace gufo::xdna2

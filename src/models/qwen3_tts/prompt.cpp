@@ -7,7 +7,7 @@
 #include <string>
 #include <utility>
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 namespace {
 
 void SetError(std::string* error, std::string message) {
@@ -183,4 +183,4 @@ bool BuildIclPrompt(const IclPromptInput& input, PromptOutput* output,
   }
 }
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts

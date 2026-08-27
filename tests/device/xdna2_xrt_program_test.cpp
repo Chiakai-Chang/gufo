@@ -23,36 +23,36 @@ void Expect(bool condition, std::string_view message) {
 }  // namespace
 
 int main() {
-  const auto inventory = strix::diagnostics::CollectSystemInventory(
-      strix::diagnostics::LinuxSysfs());
+  const auto inventory = gufo::diagnostics::CollectSystemInventory(
+      gufo::diagnostics::LinuxSysfs());
   const auto fingerprint =
-      strix::diagnostics::GenerateMachineFingerprint(inventory);
+      gufo::diagnostics::GenerateMachineFingerprint(inventory);
 
   auto unsupported_driver_inventory = inventory;
   unsupported_driver_inventory.npu.driver_name = "unsupported";
   const auto unsupported_driver =
-      strix::xdna2::DiscoverXrtDevice(0, unsupported_driver_inventory);
+      gufo::xdna2::DiscoverXrtDevice(0, unsupported_driver_inventory);
   Expect(unsupported_driver.error_category == "driver_unsupported",
          "unsupported drivers are distinguished");
 
   auto unsupported_firmware_inventory = inventory;
   unsupported_firmware_inventory.npu.firmware_version = "unsupported";
   const auto unsupported_firmware =
-      strix::xdna2::DiscoverXrtDevice(0, unsupported_firmware_inventory);
+      gufo::xdna2::DiscoverXrtDevice(0, unsupported_firmware_inventory);
   Expect(unsupported_firmware.error_category == "firmware_unsupported",
          "unsupported firmware is distinguished");
 
-  strix::xdna2::XrtSmokeOptions options;
+  gufo::xdna2::XrtSmokeOptions options;
   options.iterations = 2;
   options.timeout_ms = 30000;
-#ifdef STRIX_AIE_SMOKE_PROGRAM_DIR
-  options.program_dir = STRIX_AIE_SMOKE_PROGRAM_DIR;
+#ifdef GUFO_AIE_SMOKE_PROGRAM_DIR
+  options.program_dir = GUFO_AIE_SMOKE_PROGRAM_DIR;
 #endif
 
   auto invalid_options = options;
   invalid_options.iterations = 0;
   const auto invalid_report =
-      strix::xdna2::RunXrtSmoke(invalid_options, inventory, fingerprint);
+      gufo::xdna2::RunXrtSmoke(invalid_options, inventory, fingerprint);
   Expect(invalid_report.failure.category == "invalid_options",
          "zero iterations fail with invalid_options");
 
@@ -60,16 +60,15 @@ int main() {
   missing_program.iterations = 1;
   missing_program.program_dir =
       std::filesystem::temp_directory_path() /
-      ("strix-xdna2-program-missing-" +
+      ("gufo-xdna2-program-missing-" +
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
   const auto missing_report =
-      strix::xdna2::RunXrtSmoke(missing_program, inventory, fingerprint);
+      gufo::xdna2::RunXrtSmoke(missing_program, inventory, fingerprint);
   Expect(missing_report.failure.category == "program_missing",
          "missing artifacts fail with program_missing");
 
-  const auto report =
-      strix::xdna2::RunXrtSmoke(options, inventory, fingerprint);
+  const auto report = gufo::xdna2::RunXrtSmoke(options, inventory, fingerprint);
   if (!report.Success()) {
     std::cerr << report.ToHuman();
     return 1;
@@ -86,7 +85,7 @@ int main() {
   Expect(!report.first_mismatch.has_value(), "output matched exactly");
 
   const auto validation =
-      strix::diagnostics::ValidateArtifactContent(report.ToJson());
+      gufo::diagnostics::ValidateArtifactContent(report.ToJson());
   Expect(validation.is_valid, "XDNA2 program JSON validates");
 
   std::cout << report.ToHuman();

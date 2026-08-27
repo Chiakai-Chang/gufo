@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_XDNA2_SMOKE_H_
-#define STRIX_CORE_XDNA2_SMOKE_H_
+#ifndef GUFO_CORE_XDNA2_SMOKE_H_
+#define GUFO_CORE_XDNA2_SMOKE_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +12,7 @@
 #include "src/core/diagnostics/system_inventory.h"
 #include "src/core/xdna2/device.h"
 
-namespace strix::xdna2 {
+namespace gufo::xdna2 {
 
 struct XrtSmokeOptions {
   std::uint32_t iterations{100};
@@ -72,6 +72,6 @@ struct XrtSmokeReport {
     const diagnostics::SystemInventory& inventory,
     const diagnostics::MachineFingerprint& fingerprint);
 
-}  // namespace strix::xdna2
+}  // namespace gufo::xdna2
 
-#endif  // STRIX_CORE_XDNA2_SMOKE_H_
+#endif  // GUFO_CORE_XDNA2_SMOKE_H_

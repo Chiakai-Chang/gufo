@@ -6,7 +6,7 @@
 
 #include "src/core/diagnostics/fingerprint.h"
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 namespace {
 
@@ -315,4 +315,4 @@ std::string ValidationResult::ToHuman() const {
   return oss.str();
 }
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics

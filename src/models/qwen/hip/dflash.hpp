@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_DFLASH_HPP_
-#define STRIX_MODELS_QWEN_HIP_DFLASH_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_DFLASH_HPP_
+#define GUFO_MODELS_QWEN_HIP_DFLASH_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -18,7 +18,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-namespace strix::hip {
+namespace gufo::hip {
 
 /// Immutable GPU-visible DFlash / DFlash-2 model weights and topology.
 class QwenDFlashGpuModel final {
@@ -215,7 +215,7 @@ private:
   std::string last_error_;
 };
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_DFLASH_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_DFLASH_HPP_

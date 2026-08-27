@@ -33,7 +33,7 @@
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -394,7 +394,7 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["id"] = backend->model_id();
     model["object"] = "model";
     model["created"] = Now();
-    model["owned_by"] = "strix";
+    model["owned_by"] = "gufo";
     data.push_back(std::move(model));
   }
   if (video_jobs != nullptr && video_jobs->ready()) {
@@ -1209,4 +1209,4 @@ void HttpServer::handle_connection(int client_fd) {
   ::close(client_fd);
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

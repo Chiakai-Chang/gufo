@@ -17,7 +17,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void SyncTiledAttentionKvPrefixKernel(
     const float* __restrict__ k_cache, const float* __restrict__ v_cache,
@@ -467,5 +467,5 @@ bool LaunchBatchedAttentionTile(
   return true;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

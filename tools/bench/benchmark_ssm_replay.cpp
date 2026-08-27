@@ -20,7 +20,7 @@
 
 namespace {
 
-using strix::tokenization::TokenId;
+using gufo::tokenization::TokenId;
 
 struct Options {
   std::string model_path;
@@ -49,7 +49,7 @@ std::vector<std::size_t> ParseDraftLengths(std::string_view value) {
         separator == std::string_view::npos ? value.size() : separator;
     const auto length =
         ParsePositiveU32(value.substr(begin, end - begin), "--draft-lengths");
-    if (length > strix::hip::kSsmReplayCapacity) {
+    if (length > gufo::hip::kSsmReplayCapacity) {
       throw std::invalid_argument("draft length exceeds replay capacity");
     }
     lengths.push_back(length);
@@ -98,13 +98,13 @@ int main(int argc, const char* const* argv) {
     const auto options = ParseOptions({argv, static_cast<std::size_t>(argc)});
     std::string error;
     auto reader_owner =
-        strix::core::GgufReader::OpenFile(options.model_path, &error);
+        gufo::core::GgufReader::OpenFile(options.model_path, &error);
     if (!reader_owner) {
       throw std::runtime_error(error);
     }
-    const std::shared_ptr<const strix::core::GgufReader> reader(
+    const std::shared_ptr<const gufo::core::GgufReader> reader(
         std::move(reader_owner));
-    auto executor = strix::hip::QwenGpuExecutor::CreateFromGguf(
+    auto executor = gufo::hip::QwenGpuExecutor::CreateFromGguf(
         reader, &error, options.context_tokens + 32);
     if (!executor) {
       throw std::runtime_error(error);
@@ -119,10 +119,10 @@ int main(int argc, const char* const* argv) {
 
     std::vector<TokenId> replay_inputs;
     std::vector<TokenId> expected_predictions;
-    replay_inputs.reserve(strix::hip::kSsmReplayCapacity + 1);
-    expected_predictions.reserve(strix::hip::kSsmReplayCapacity + 1);
+    replay_inputs.reserve(gufo::hip::kSsmReplayCapacity + 1);
+    expected_predictions.reserve(gufo::hip::kSsmReplayCapacity + 1);
     replay_inputs.push_back(current_token);
-    for (std::size_t offset = 0; offset < strix::hip::kSsmReplayCapacity;
+    for (std::size_t offset = 0; offset < gufo::hip::kSsmReplayCapacity;
          ++offset) {
       const auto prediction = executor->ForwardToken(
           replay_inputs.back(),

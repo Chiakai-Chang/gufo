@@ -16,26 +16,26 @@ void Check(bool condition, const char* message) {
 }
 
 void TestHipDeviceGateDecisions() {
-  using strix::test::HipDeviceRequirement;
-  using strix::test::ResolveHipDeviceGate;
+  using gufo::test::HipDeviceRequirement;
+  using gufo::test::ResolveHipDeviceGate;
 
   Check(ResolveHipDeviceGate(hipSuccess, 1, HipDeviceRequirement::kOptional) ==
-            strix::test::kHipTestSuccess,
+            gufo::test::kHipTestSuccess,
         "visible device must pass");
   Check(ResolveHipDeviceGate(hipSuccess, 0, HipDeviceRequirement::kOptional) ==
-            strix::test::kCtestSkipReturnCode,
+            gufo::test::kCtestSkipReturnCode,
         "zero optional devices must skip");
   Check(ResolveHipDeviceGate(hipErrorNoDevice, 0,
                              HipDeviceRequirement::kOptional) ==
-            strix::test::kCtestSkipReturnCode,
+            gufo::test::kCtestSkipReturnCode,
         "hipErrorNoDevice must skip an optional test");
   Check(ResolveHipDeviceGate(hipErrorNoDevice, 0,
                              HipDeviceRequirement::kRequired) ==
-            strix::test::kHipTestFailure,
+            gufo::test::kHipTestFailure,
         "hipErrorNoDevice must fail a required test");
   Check(ResolveHipDeviceGate(hipErrorInvalidValue, 0,
                              HipDeviceRequirement::kOptional) ==
-            strix::test::kHipTestFailure,
+            gufo::test::kHipTestFailure,
         "other HIP discovery errors must fail");
 }
 

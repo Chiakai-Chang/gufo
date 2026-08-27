@@ -6,7 +6,7 @@
 
 #include "src/models/qwen/hip/ops/token.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void ArgmaxKernel(const float* __restrict__ logits,
                              std::uint32_t* __restrict__ out_token,
@@ -97,5 +97,5 @@ void LaunchBatchedGPUArgmax(const float* logits, std::uint32_t* out_tokens,
                         stream>>>(logits, out_tokens, vocab_size);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif

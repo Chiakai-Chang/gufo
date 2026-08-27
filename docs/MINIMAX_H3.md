@@ -4,7 +4,7 @@ Status: active engineering policy, 2026-08-22
 
 ## Purpose
 
-This document defines how Strix-Halo.cpp may integrate an operator-supplied
+This document defines how gufo may integrate an operator-supplied
 MiniMax H3 checkpoint without distributing model weights or treating the
 engine's MIT license as permission to use the model.
 
@@ -42,7 +42,7 @@ The native inventory tool parses JSON and safetensors metadata directly. It
 does not import or execute Python supplied by the model repository:
 
 ```sh
-nix develop -c python3 tools/h3/strix-h3-manifest.py \
+nix develop -c python3 tools/h3/gufo-h3-manifest.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
   --verify src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json
 ```
@@ -93,10 +93,10 @@ The offline teacher capture is reproducible but not part of the production
 package:
 
 ```sh
-nix develop -c python tools/strix/h3_prompt_golden.py \
+nix develop -c python tools/gufo/h3_prompt_golden.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
   --layers 50 \
-  --output /var/llms/huggingface/strix-h3-oracles/\
+  --output /var/llms/huggingface/gufo-h3-oracles/\
 fox-layer50-transformers.bf16
 ```
 
@@ -168,9 +168,9 @@ the same retained boundaries.
 The independent oracle is generated outside production:
 
 ```sh
-nix develop -c python3 tools/strix/h3_dit_golden.py \
+nix develop -c python3 tools/gufo/h3_dit_golden.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
-  --output /var/llms/huggingface/strix-h3-oracles/dit-block0-528-v2
+  --output /var/llms/huggingface/gufo-h3-oracles/dit-block0-528-v2
 ```
 
 Run the analytic and external-model gates:
@@ -178,8 +178,8 @@ Run the analytic and external-model gates:
 ```sh
 ./build-h3-173/minimax_h3_dit_hip_test --analytic
 
-STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
-STRIX_H3_DIT_GOLDEN=/var/llms/huggingface/strix-h3-oracles/dit-block0-528-v2 \
+GUFO_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+GUFO_H3_DIT_GOLDEN=/var/llms/huggingface/gufo-h3-oracles/dit-block0-528-v2 \
   ./build/hardware-test/minimax_h3_dit_hip_test --real
 ```
 
@@ -242,11 +242,11 @@ ideas. They are native serving modes, not exact reproductions of h3.c's
 Generate the independent single-forward 256x256 teacher outside the repository:
 
 ```sh
-nix develop -c python3 tools/strix/h3_denoiser_golden.py \
+nix develop -c python3 tools/gufo/h3_denoiser_golden.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
-  --conditioning /var/llms/huggingface/strix-h3-oracles/\
+  --conditioning /var/llms/huggingface/gufo-h3-oracles/\
 fox-layer50-transformers.bf16 \
-  --output /var/llms/huggingface/strix-h3-oracles/\
+  --output /var/llms/huggingface/gufo-h3-oracles/\
 denoiser-256x256x22-forward-v2 \
   --noise-mode seeded --forward-only
 ```
@@ -255,8 +255,8 @@ Run one complete 256x256 transformer forward, without advancing the sampler or
 decoding either VAE:
 
 ```sh
-STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
-STRIX_H3_DENOISER_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
+GUFO_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+GUFO_H3_DENOISER_GOLDEN=/var/llms/huggingface/gufo-h3-oracles/\
 denoiser-256x256x22-forward-v2 \
   ./build/hardware-test/minimax_h3_denoiser_hip_test --oracle-forward
 ```
@@ -267,16 +267,16 @@ catches shape-dependent attention, patch-layout, and output-head errors without
 advancing the sampler, invoking a VAE, or producing a video:
 
 ```sh
-nix develop -c python3 tools/strix/h3_denoiser_golden.py \
+nix develop -c python3 tools/gufo/h3_denoiser_golden.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
-  --conditioning /var/llms/huggingface/strix-h3-oracles/\
+  --conditioning /var/llms/huggingface/gufo-h3-oracles/\
 fox-layer50-transformers.bf16 \
-  --output /var/llms/huggingface/strix-h3-oracles/\
+  --output /var/llms/huggingface/gufo-h3-oracles/\
 denoiser-512x512x22-forward-v2 \
   --width 512 --height 512 --steps 2 --noise-mode seeded --forward-only
 
-STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
-STRIX_H3_DENOISER_GOLDEN_512=/var/llms/huggingface/strix-h3-oracles/\
+GUFO_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+GUFO_H3_DENOISER_GOLDEN_512=/var/llms/huggingface/gufo-h3-oracles/\
 denoiser-512x512x22-forward-v2 \
   ./build/hardware-test/minimax_h3_denoiser_hip_test --oracle-512-forward
 ```
@@ -307,15 +307,15 @@ temporal stitching are output composition, not CPU model inference.
 Generate and run the operator-owned VisualVAE oracle:
 
 ```sh
-nix develop -c python3 tools/strix/h3_video_vae_golden.py \
+nix develop -c python3 tools/gufo/h3_video_vae_golden.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
-  --latent /var/llms/huggingface/strix-h3-oracles/\
+  --latent /var/llms/huggingface/gufo-h3-oracles/\
 denoiser-256x256x22-4step-v1/video_final.f32 \
-  --output /var/llms/huggingface/strix-h3-oracles/\
+  --output /var/llms/huggingface/gufo-h3-oracles/\
 video-vae-256x256x22-v1
 
-STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
-STRIX_H3_VIDEO_VAE_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
+GUFO_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+GUFO_H3_VIDEO_VAE_GOLDEN=/var/llms/huggingface/gufo-h3-oracles/\
 video-vae-256x256x22-v1 \
   ./build/hardware-test/minimax_h3_video_vae_hip_test
 ```
@@ -344,15 +344,15 @@ readback, evaluation, and media output.
 Generate and run the operator-owned AudioVAE oracle:
 
 ```sh
-nix develop -c python3 tools/strix/h3_audio_vae_golden.py \
+nix develop -c python3 tools/gufo/h3_audio_vae_golden.py \
   --model-root /var/llms/huggingface/MiniMax-H3 \
-  --latent /var/llms/huggingface/strix-h3-oracles/\
+  --latent /var/llms/huggingface/gufo-h3-oracles/\
 denoiser-256x256x22-4step-v1/audio_final.f32 \
-  --output /var/llms/huggingface/strix-h3-oracles/\
+  --output /var/llms/huggingface/gufo-h3-oracles/\
 audio-vae-256x256x22-v1
 
-STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
-STRIX_H3_AUDIO_VAE_GOLDEN=/var/llms/huggingface/strix-h3-oracles/\
+GUFO_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+GUFO_H3_AUDIO_VAE_GOLDEN=/var/llms/huggingface/gufo-h3-oracles/\
 audio-vae-256x256x22-v1 \
   ./build/hardware-test/minimax_h3_audio_vae_hip_test --real
 ```
@@ -375,7 +375,7 @@ matching Diffusers' NumPy conversion and h3.c's `lrintf` behavior.
 
 ## Text-to-Video CLI and Frozen Presets
 
-`strix video` is the first complete text-only serving path. It requires
+`gufo video` is the first complete text-only serving path. It requires
 an explicit operator-supplied model directory, validates the pinned manifest,
 tokenizes and encodes layer 50, denoises on gfx1151, decodes the released
 VisualVAE and AudioVAE, and atomically publishes either an audiovisual MP4 or
@@ -383,7 +383,7 @@ selected diagnostic PPM frames. It never downloads weights and has no CPU
 model-inference fallback.
 
 The named preset contract is versioned as
-`strix.minimax-h3-text-generation.v1`:
+`gufo.minimax-h3-text-generation.v1`:
 
 | Preset | Internal canvas | Output canvas | Sigma points / evaluations | Active blocks | Denoiser reuse |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -402,7 +402,7 @@ prefix of the first 45 or 40 transformer blocks.
 Rapid development example:
 
 ```sh
-nix develop -c ./build-h3-173/strix video \
+nix develop -c ./build-h3-173/gufo video \
   --model /var/llms/huggingface/MiniMax-H3 \
   --preset dev \
   --frames-dir /tmp/h3-fox-dev \
@@ -413,7 +413,7 @@ nix develop -c ./build-h3-173/strix video \
 Manual end-user or release exact output:
 
 ```sh
-nix develop -c ./build-h3-173/strix video \
+nix develop -c ./build-h3-173/gufo video \
   --model /var/llms/huggingface/MiniMax-H3 \
   --preset exact \
   --seed 42 \
@@ -426,7 +426,7 @@ nix develop -c ./build-h3-173/strix video \
 Released five-second full-resolution output uses 124 aligned frames at 24 fps:
 
 ```sh
-nix develop -c ./build/hardware-test/strix video \
+nix develop -c ./build/hardware-test/gufo video \
   --model /var/llms/huggingface/MiniMax-H3 \
   --preset exact-1344x768 \
   --seed 42 \
@@ -462,16 +462,16 @@ names or silently enter the exact route.
 
 ## Asynchronous Video API
 
-`strix serve --video-model <DIR>` enables the versioned
-`strix.video-api.v1` text-to-video API. When `--model` is not also supplied,
+`gufo serve --video-model <DIR>` enables the versioned
+`gufo.video-api.v1` text-to-video API. When `--model` is not also supplied,
 the process is video-only and does not load an unrelated text model:
 
 ```sh
-nix develop -c ./build-h3-173/strix serve \
+nix develop -c ./build-h3-173/gufo serve \
   --host 127.0.0.1 \
   --port 8080 \
   --video-model /var/llms/huggingface/MiniMax-H3 \
-  --video-root /var/llms/huggingface/strix-h3-jobs \
+  --video-root /var/llms/huggingface/gufo-h3-jobs \
   --video-ttl 3600
 ```
 
@@ -491,10 +491,10 @@ The supported routes are:
 
 `GET /v1/models` advertises `minimax-h3` and the
 `minimax-h3-{exact,fast,aggressive,dev,fullres}` aliases. An alias selects its
-matching frozen preset; if `strix.preset` is also present, the two must agree.
+matching frozen preset; if `gufo.preset` is also present, the two must agree.
 
 Create accepts `application/json` and the `multipart/form-data` shape used by
-OpenAI video clients. JSON remains convenient for the nested Strix extension:
+OpenAI video clients. JSON remains convenient for the nested Gufo extension:
 
 ```json
 {
@@ -502,7 +502,7 @@ OpenAI video clients. JSON remains convenient for the nested Strix extension:
   "prompt": "A red fox walking through snow",
   "size": "512x512",
   "seconds": "1",
-  "strix": {
+  "gufo": {
     "seed": 42,
     "output_format": "mp4"
   }
@@ -517,7 +517,7 @@ The released full-resolution JSON request is:
   "prompt": "An anime soccer goalkeeper summons a giant cyan energy hand.",
   "size": "1344x768",
   "seconds": 5,
-  "strix": {
+  "gufo": {
     "seed": 42,
     "output_format": "mp4"
   }
@@ -543,8 +543,8 @@ Exact, fast, and aggressive support the rapid one-second, 22-frame, 512x512
 MP4 route. `exact-1344x768` additionally supports the released five-second,
 124-frame, 1344x768 audiovisual MP4 route. The development alias requires
 `size: "256x256"` and `output_format: "ppm"`; it accepts a released
-VisualVAE-decodable frame count through `strix.frames` (`22, 39, ... 345`) and
-exactly one diagnostic frame through `strix.selected_frame`. Although the
+VisualVAE-decodable frame count through `gufo.frames` (`22, 39, ... 345`) and
+exactly one diagnostic frame through `gufo.selected_frame`. Although the
 denoiser geometry can represent five frames, the released VisualVAE's minimum
 valid temporal chunk is seven latents and 22 output frames. The development
 path therefore preserves the real 22-frame latent window while decoding and
@@ -552,7 +552,7 @@ reading back only the requested preview frame. First-frame, last-frame,
 image-reference, and ordered-reference fields fail closed until their
 conditioning milestones land.
 
-The 22-frame route is a Strix development/serving extension for rapid
+The 22-frame route is a Gufo development/serving extension for rapid
 iteration. The released Diffusers production pipeline admits aligned
 durations from 5 through 15 seconds; matching that production-duration
 envelope is tracked separately and does not remove the short native diagnostic
@@ -573,7 +573,7 @@ numeric execution data.
 
 ## Full-Route Profiling
 
-`tools/strix/h3_profile.py` drives the same public CLI route used by serving.
+`tools/gufo/h3_profile.py` drives the same public CLI route used by serving.
 It is a manual release tool, not a development or CI gate. Development
 optimization uses one independently frozen 528-row DiT block oracle for
 correctness and one 1,872-row DiT block for performance and profiling.
@@ -586,7 +586,7 @@ The issue #175 performance workload is a manual single-block profile, not a
 CTest target:
 
 ```sh
-STRIX_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
+GUFO_H3_MODEL_ROOT=/var/llms/huggingface/MiniMax-H3 \
   ./build/hardware-test/minimax_h3_dit_hip_test --profile-1872
 ```
 
@@ -853,10 +853,10 @@ other than one, and requires an acknowledgement before it can launch a
 complete generation:
 
 ```sh
-nix develop -c python3 tools/strix/h3_profile.py \
-  --binary ./build-h3-173/strix \
+nix develop -c python3 tools/gufo/h3_profile.py \
+  --binary ./build-h3-173/gufo \
   --model /var/llms/huggingface/MiniMax-H3 \
-  --output-root /var/llms/huggingface/strix-h3-profiles/bf16-v1 \
+  --output-root /var/llms/huggingface/gufo-h3-profiles/bf16-v1 \
   --presets exact \
   --rounds 1 \
   --cooldown-seconds 0 \
@@ -896,13 +896,13 @@ Sustained-clock throttling, swap, output quality, and evidence of busy-waiting,
 redundant transfer, or recomputation remain promotion gates. Temperature is
 neither required telemetry nor a comparison objective.
 
-`tools/strix/h3_cache_control.py` remains available for a separately requested
+`tools/gufo/h3_cache_control.py` remains available for a separately requested
 cache diagnostic:
 
 ```sh
-nix develop -c python3 tools/strix/h3_cache_control.py \
+nix develop -c python3 tools/gufo/h3_cache_control.py \
   --model /var/llms/huggingface/MiniMax-H3 \
-  --output /var/llms/huggingface/strix-h3-profiles/cache-control.json
+  --output /var/llms/huggingface/gufo-h3-profiles/cache-control.json
 ```
 
 The cache-control artifact records files/bytes attempted, errors, memory
@@ -916,11 +916,11 @@ For a separately requested fast/aggressive delivery-quality study, compare a
 delivered preset MP4 with its matching exact output:
 
 ```sh
-nix develop -c python3 tools/strix/h3_preset_quality.py \
-  --reference /var/llms/huggingface/strix-h3-profiles/bf16-v2/000-exact/output.mp4 \
-  --candidate /var/llms/huggingface/strix-h3-profiles/bf16-v2/001-fast/output.mp4 \
+nix develop -c python3 tools/gufo/h3_preset_quality.py \
+  --reference /var/llms/huggingface/gufo-h3-profiles/bf16-v2/000-exact/output.mp4 \
+  --candidate /var/llms/huggingface/gufo-h3-profiles/bf16-v2/001-fast/output.mp4 \
   --candidate-label fast \
-  --output /var/llms/huggingface/strix-h3-profiles/bf16-v2/001-fast/quality.json
+  --output /var/llms/huggingface/gufo-h3-profiles/bf16-v2/001-fast/quality.json
 ```
 
 The versioned report hashes both MP4s and compares all decoded RGB frames,
@@ -963,7 +963,7 @@ the required MiniMax H3 terms or authorization have been obtained and accepted
 for this work. The checkpoint is retained only on that operator-controlled
 machine.
 
-Strix-Halo.cpp does not attempt to adjudicate the operator's authorization,
+gufo does not attempt to adjudicate the operator's authorization,
 store private license documents, or transmit credentials. Each downstream
 operator must independently obtain the checkpoint from MiniMax and satisfy the
 terms applicable to their territory, deployment, users, and outputs.
@@ -981,12 +981,12 @@ terms applicable to their territory, deployment, users, and outputs.
 - Derived quantized weights remain local and are not publication artifacts.
 
 The official Hugging Face acceptance flow or a separate MiniMax authorization
-is the source of access. A Strix command-line flag or configuration entry must
+is the source of access. A Gufo command-line flag or configuration entry must
 never pretend to replace that external process.
 
 ## Distribution and Serving Boundary
 
-Strix-Halo.cpp distributes numerical engine source and binaries only. It does
+gufo distributes numerical engine source and binaries only. It does
 not distribute the H3 checkpoint, tokenizer, converted weights, or a hosted H3
 service.
 

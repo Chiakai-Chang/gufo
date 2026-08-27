@@ -18,8 +18,8 @@
 
 namespace {
 
-namespace qwen3_tts_hip = strix::models::qwen3_tts::hip;
-namespace qwen3_tts = strix::models::qwen3_tts;
+namespace qwen3_tts_hip = gufo::models::qwen3_tts::hip;
+namespace qwen3_tts = gufo::models::qwen3_tts;
 
 constexpr std::string_view kText =
     "The boy who lived. Mr. and Mrs. Dursley, of number four, Privet Drive, "
@@ -200,8 +200,7 @@ int main(int argc, char** argv) {
       argc > 1 ? argv[1]
                : "/home/fbozzo/projects/Qwen3-TTS-12Hz-1.7B-CustomVoice";
   const std::filesystem::path artifacts =
-      argc > 2 ? argv[2]
-               : "/home/fbozzo/projects/strix-halo.cpp/artifacts/qwen3_tts";
+      argc > 2 ? argv[2] : "/home/fbozzo/projects/gufo/artifacts/qwen3_tts";
   const std::filesystem::path embeddings_path =
       artifacts / "internals" / "prefill_inputs_embeds.npy";
   if (!std::filesystem::is_regular_file(model_root / "model.safetensors") ||

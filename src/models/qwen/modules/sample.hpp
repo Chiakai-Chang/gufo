@@ -1,17 +1,17 @@
-#ifndef STRIX_MODELS_QWEN_MODULES_SAMPLE_HPP_
-#define STRIX_MODELS_QWEN_MODULES_SAMPLE_HPP_
+#ifndef GUFO_MODELS_QWEN_MODULES_SAMPLE_HPP_
+#define GUFO_MODELS_QWEN_MODULES_SAMPLE_HPP_
 
 #include <cstdint>
 #include <span>
 
 #include "src/models/qwen/modules/module_ctx.hpp"
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 /// Greedy argmax over a logit distribution (sampling-policy module seam).
 std::uint32_t SampleForward(const CpuModuleContext& ctx,
                             std::span<const float> logits) noexcept;
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen
 
-#endif  // STRIX_MODELS_QWEN_MODULES_SAMPLE_HPP_
+#endif  // GUFO_MODELS_QWEN_MODULES_SAMPLE_HPP_

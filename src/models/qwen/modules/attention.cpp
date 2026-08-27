@@ -7,7 +7,7 @@
 
 #include "src/models/qwen/forward.hpp"  // TensorGEMV, ForwardRMSNorm, ForwardRoPE, ForwardAttention
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 void AttnForward(const CpuLayerContext& ctx, const AttnLayerView& view,
                  std::span<const float> x, QwenKvCache& kv, std::uint32_t pos,
@@ -81,4 +81,4 @@ void AttnForward(const CpuLayerContext& ctx, const AttnLayerView& view,
                    config.head_dim, hidden_size, arena.attn_scores, out);
 }
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen

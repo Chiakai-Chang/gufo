@@ -7,7 +7,7 @@
 
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void BatchedSSMConvKernel(const float* __restrict__ qkv_in,
                                      const float* __restrict__ conv_weights,
@@ -333,5 +333,5 @@ void LaunchBatchedSSMConvRecurrenceNormGate(
       key_dim, val_dim);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

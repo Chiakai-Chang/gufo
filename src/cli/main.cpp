@@ -9,12 +9,12 @@
 #include "src/cli/serve/serve.hpp"
 #include "src/cli/video/video.hpp"
 
-constexpr std::string_view kStrixVersion = "0.1.0";
+constexpr std::string_view kGufoVersion = "0.1.0";
 
 namespace {
 
 void print_version() {
-  std::cout << "strix version " << kStrixVersion << "\n";
+  std::cout << "gufo version " << kGufoVersion << "\n";
 }
 
 void print_help(std::string_view program_name) {
@@ -40,7 +40,7 @@ void print_help(std::string_view program_name) {
 int run(std::span<const char* const> args) {
   if (args.empty()) {
     std::cerr << "Error: missing command or option\n";
-    print_help("strix");
+    print_help("gufo");
     return 2;
   }
 
@@ -74,24 +74,24 @@ int run(std::span<const char* const> args) {
       if (options.size() > 2) {
         const std::array<const char*, 2> serve_help_flags = {options[2],
                                                              "--help"};
-        return strix::cli::RunServe(serve_help_flags);
+        return gufo::cli::RunServe(serve_help_flags);
       }
-      return strix::cli::RunServe(help_flag);
+      return gufo::cli::RunServe(help_flag);
     }
     if (sub == "prompt") {
-      return strix::cli::RunPrompt(help_flag);
+      return gufo::cli::RunPrompt(help_flag);
     }
     if (sub == "bench") {
-      return strix::cli::RunBench(help_flag);
+      return gufo::cli::RunBench(help_flag);
     }
     if (sub == "video") {
-      return strix::cli::RunVideo(help_flag);
+      return gufo::cli::RunVideo(help_flag);
     }
     if (sub == "chat") {
-      return strix::cli::RunChat(help_flag);
+      return gufo::cli::RunChat(help_flag);
     }
     if (sub == "diagnose" || sub == "probe" || sub == "info") {
-      return strix::cli::RunDiagnose(help_flag);
+      return gufo::cli::RunDiagnose(help_flag);
     }
     std::cerr << "Error: unknown help topic '" << sub << "'\n";
     print_help(program_name);
@@ -99,37 +99,37 @@ int run(std::span<const char* const> args) {
   }
 
   if (first_arg == "probe") {
-    return strix::cli::RunProbe(options.subspan(1));
+    return gufo::cli::RunProbe(options.subspan(1));
   }
 
   if (first_arg == "diagnose" || first_arg == "info") {
-    return strix::cli::RunDiagnose(options);
+    return gufo::cli::RunDiagnose(options);
   }
 
   if (first_arg == "bench") {
-    return strix::cli::RunBench(options.subspan(1));
+    return gufo::cli::RunBench(options.subspan(1));
   }
 
   if (first_arg == "prompt") {
-    return strix::cli::RunPrompt(options.subspan(1));
+    return gufo::cli::RunPrompt(options.subspan(1));
   }
 
   if (first_arg == "video") {
-    return strix::cli::RunVideo(options.subspan(1));
+    return gufo::cli::RunVideo(options.subspan(1));
   }
 
   if (first_arg == "chat") {
-    return strix::cli::RunChat(options.subspan(1));
+    return gufo::cli::RunChat(options.subspan(1));
   }
 
   if (first_arg == "serve") {
-    return strix::cli::RunServe(options.subspan(1));
+    return gufo::cli::RunServe(options.subspan(1));
   }
 
   // If invoked as legacy binary name or flag passed directly, route to serve
-  if (program_name.ends_with("strix-server") ||
-      program_name.ends_with("/strix-server")) {
-    return strix::cli::RunServe(options);
+  if (program_name.ends_with("gufo-server") ||
+      program_name.ends_with("/gufo-server")) {
+    return gufo::cli::RunServe(options);
   }
 
   std::cerr << "Error: unknown command '" << first_arg << "'\n";

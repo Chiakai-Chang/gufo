@@ -2,8 +2,8 @@
 
 Status: experimental, development-only
 
-Hyperloom is available in the Strix development shell as an agentic profiling,
-benchmarking, and optimization tool. It is not linked into `strix`, installed by
+Hyperloom is available in the Gufo development shell as an agentic profiling,
+benchmarking, and optimization tool. It is not linked into `gufo`, installed by
 the production package, or required at runtime.
 
 The Nix derivation pins:
@@ -27,7 +27,7 @@ quantization-agent
 
 ## Enter the Development Shell
 
-From the Strix repository:
+From the Gufo repository:
 
 ```bash
 nix develop
@@ -71,7 +71,7 @@ in
 ## Development-Only Boundary
 
 Hyperloom is included through the development Python environment in
-`flake.nix`. The production package remains `strix` with ROCm/HIP and XRT
+`flake.nix`. The production package remains `gufo` with ROCm/HIP and XRT
 inputs only.
 
 After building the production package, confirm that Hyperloom is not in its
@@ -121,8 +121,8 @@ Create a dedicated worktree and workspace:
 
 ```bash
 repo_root="$(git rev-parse --show-toplevel)"
-worktree=/tmp/strix-hyperloom-worktree
-workspace=/tmp/strix-hyperloom-workspace
+worktree=/tmp/gufo-hyperloom-worktree
+workspace=/tmp/gufo-hyperloom-workspace
 
 rm -rf "$worktree" "$workspace"
 git worktree add --detach "$worktree" HEAD
@@ -189,17 +189,17 @@ Before running setup:
 - record any external dependency revision used by a benchmark;
 - do not allow setup to modify the production package definition silently.
 
-## Intended Strix Integration
+## Intended Gufo Integration
 
-Strix is not a shipped Hyperloom framework, so the appropriate integration is
+Gufo is not a shipped Hyperloom framework, so the appropriate integration is
 Hyperloom's custom, server-less workload path.
 
 The custom path requires:
 
-| Input | Hyperloom flag | Strix value |
+| Input | Hyperloom flag | Gufo value |
 | --- | --- | --- |
-| Candidate checkout | `--framework-path` | Dedicated Strix worktree |
-| Benchmark adapter directory | `--benchmark-scripts-dir` | Strix-specific scripts |
+| Candidate checkout | `--framework-path` | Dedicated Gufo worktree |
+| Benchmark adapter directory | `--benchmark-scripts-dir` | Gufo-specific scripts |
 | Model weights | `--model` | Pinned GGUF/model fixture |
 | Hardware identity | `--gpu-type` | Future validated Strix Halo identity |
 | Search budget | `--max-hours` | Start with a short bounded run |
@@ -217,9 +217,9 @@ the Strix Halo identity. Once gfx1151 support exists, the command shape is:
 python -m hyperloom.inference_optimizer.cli -v optimize \
   --framework custom \
   --framework-path "$worktree" \
-  --benchmark-scripts-dir /path/to/strix-hyperloom-adapter \
+  --benchmark-scripts-dir /path/to/gufo-hyperloom-adapter \
   --model /path/to/pinned/model \
-  --gpu-type <validated-strix-halo-identity> \
+  --gpu-type <validated-gufo-identity> \
   --tp 1 \
   --max-hours 2
 ```
@@ -257,7 +257,7 @@ Minimal result shape:
   "output_throughput": 0.0,
   "quality_gate": {
     "passed": false,
-    "reason": "replace with measured Strix correctness evidence"
+    "reason": "replace with measured Gufo correctness evidence"
   }
 }
 ```
@@ -265,7 +265,7 @@ Minimal result shape:
 `output_throughput` is maximized. The `quality_gate` is mandatory and
 fail-closed: a missing or invalid gate rejects every candidate.
 
-A Strix adapter should:
+A Gufo adapter should:
 
 1. build through Nix only;
 2. add new candidate files to the disposable worktree index before a Nix build,
@@ -363,7 +363,7 @@ When changing the pin in `.devops/nix/hyperloom.nix`:
 4. run import and CLI help smoke tests;
 5. review new runtime dependencies and setup behavior;
 6. rerun gfx1151 compatibility checks;
-7. keep the production Strix closure free of Hyperloom.
+7. keep the production Gufo closure free of Hyperloom.
 
 The package is intentionally exposed from `.devops/nix/scope.nix` and consumed
 only by the development Python environment in `flake.nix`.

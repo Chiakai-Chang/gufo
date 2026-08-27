@@ -1,12 +1,12 @@
-#ifndef STRIX_MODELS_QWEN_MODULES_NORM_HPP_
-#define STRIX_MODELS_QWEN_MODULES_NORM_HPP_
+#ifndef GUFO_MODELS_QWEN_MODULES_NORM_HPP_
+#define GUFO_MODELS_QWEN_MODULES_NORM_HPP_
 
 #include <span>
 
 #include "src/models/qwen/modules/layer_view.hpp"
 #include "src/models/qwen/modules/module_ctx.hpp"
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 /// Layer norm (attn pre-norm, ffn pre-norm, final output norm):
 /// out = (x / rms(x) + eps) * weight.
@@ -18,6 +18,6 @@ void NormForward(const CpuModuleContext& ctx, const NormLayerView& view,
 void NormForward(const HipModuleContext& ctx, const NormLayerView& view,
                  std::span<const float> x, std::span<float> out) noexcept;
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen
 
-#endif  // STRIX_MODELS_QWEN_MODULES_NORM_HPP_
+#endif  // GUFO_MODELS_QWEN_MODULES_NORM_HPP_

@@ -59,23 +59,23 @@ std::vector<float> MakeTargetHidden(std::size_t size) {
 }  // namespace
 
 int main() {
-  const char* model_path = std::getenv("STRIX_MTP_MODEL");
+  const char* model_path = std::getenv("GUFO_MTP_MODEL");
   if (model_path == nullptr || std::string_view(model_path).empty()) {
     std::cout << "qwen_mtp_reference_test: skipped "
-                 "(STRIX_MTP_MODEL not set)\n";
+                 "(GUFO_MTP_MODEL not set)\n";
     return kSkipped;
   }
 
   std::string error;
-  auto reader = strix::core::GgufReader::OpenFile(model_path, &error);
+  auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
   if (reader == nullptr) {
     std::cerr << "Failed to open MTP model: " << error << '\n';
     return 1;
   }
-  std::shared_ptr<const strix::core::GgufReader> shared_reader{
+  std::shared_ptr<const gufo::core::GgufReader> shared_reader{
       std::move(reader)};
   auto reference =
-      strix::speculative::QwenMtpReference::Create(shared_reader, 16, &error);
+      gufo::speculative::QwenMtpReference::Create(shared_reader, 16, &error);
   if (reference == nullptr) {
     std::cerr << "Failed to create MTP reference: " << error << '\n';
     return 1;

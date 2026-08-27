@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Strix Engine contributors
+// Copyright (C) 2026 Gufo Engine contributors
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 #include <aie_api/aie.hpp>

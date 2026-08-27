@@ -8,7 +8,7 @@
 #include <sstream>
 #include <system_error>
 
-namespace strix::minimax_h3::json {
+namespace gufo::minimax_h3::json {
 
 namespace {
 
@@ -474,4 +474,4 @@ Value ParseFile(const std::filesystem::path& path, std::size_t maximum_bytes) {
   return Parse(bytes);
 }
 
-}  // namespace strix::minimax_h3::json
+}  // namespace gufo::minimax_h3::json

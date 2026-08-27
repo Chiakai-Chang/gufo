@@ -35,16 +35,16 @@ void TestGpuRMSNorm() {
   const std::vector<float> host_input(dim, 1.0F);
   const std::vector<float> host_weight(dim, 2.0F);
   const std::vector<float> expected(dim, 2.0F);
-  strix::test::DeviceBuffer<float> input(host_input);
-  strix::test::DeviceBuffer<float> weight(host_weight);
-  strix::test::DeviceBuffer<float> output(dim);
+  gufo::test::DeviceBuffer<float> input(host_input);
+  gufo::test::DeviceBuffer<float> weight(host_weight);
+  gufo::test::DeviceBuffer<float> output(dim);
 
-  strix::hip::LaunchRMSNorm(input.data(), weight.data(), output.data(), dim,
-                            1e-6F);
+  gufo::hip::LaunchRMSNorm(input.data(), weight.data(), output.data(), dim,
+                           1e-6F);
   HIP_CHECK(hipDeviceSynchronize());
 
   const auto actual = output.CopyToHost();
-  strix::test::ExpectSpanNear(expected, actual, 1e-4F, "GPU RMSNorm output");
+  gufo::test::ExpectSpanNear(expected, actual, 1e-4F, "GPU RMSNorm output");
 }
 
 void TestGpuResidualAdd() {
@@ -52,16 +52,16 @@ void TestGpuResidualAdd() {
   const std::vector<float> host_lhs(dim, 3.5F);
   const std::vector<float> host_rhs(dim, 1.5F);
   const std::vector<float> expected(dim, 5.0F);
-  strix::test::DeviceBuffer<float> lhs(host_lhs);
-  strix::test::DeviceBuffer<float> rhs(host_rhs);
-  strix::test::DeviceBuffer<float> output(dim);
+  gufo::test::DeviceBuffer<float> lhs(host_lhs);
+  gufo::test::DeviceBuffer<float> rhs(host_rhs);
+  gufo::test::DeviceBuffer<float> output(dim);
 
-  strix::hip::LaunchResidualAdd(lhs.data(), rhs.data(), output.data(), dim);
+  gufo::hip::LaunchResidualAdd(lhs.data(), rhs.data(), output.data(), dim);
   HIP_CHECK(hipDeviceSynchronize());
 
   const auto actual = output.CopyToHost();
-  strix::test::ExpectSpanNear(expected, actual, 1e-5F,
-                              "GPU residual-add output");
+  gufo::test::ExpectSpanNear(expected, actual, 1e-5F,
+                             "GPU residual-add output");
 }
 
 #endif  // defined(ENGINE_ENABLE_HIP)
@@ -69,9 +69,9 @@ void TestGpuResidualAdd() {
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen elementwise GPU ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen elementwise GPU ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

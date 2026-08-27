@@ -8,7 +8,7 @@
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/modules/modules.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 [[nodiscard]] constexpr bool SupportsDenseFusedProjection(
@@ -115,7 +115,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
     const auto& layer = weights.layers[l];
     const auto route_plan = ResolveQwenLayerRoute(
         policy, QwenExecutionMode::kDecode, layer.is_full_attention);
-    const strix::models::qwen::HipModuleContext module_ctx(
+    const gufo::models::qwen::HipModuleContext module_ctx(
         static_cast<void*>(arena.stream), l, pos);
     const bool fuse_ffn_norm_swiglu =
         route_plan.fuse_ffn_swiglu &&
@@ -155,8 +155,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       // kernel, same args, same arena slices (d_hidden in, d_normed out);
       // behavior identical to the former inline `LaunchRMSNorm` call.
       const auto norm_view =
-          strix::models::qwen::MakeAttnNormView(layer, config);
-      strix::models::qwen::NormForward(
+          gufo::models::qwen::MakeAttnNormView(layer, config);
+      gufo::models::qwen::NormForward(
           module_ctx, norm_view, decode_scratch.hidden, decode_scratch.normed);
     }
 
@@ -268,7 +268,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       // Output projection, routed through the quant_gemm module (HIP
       // backend). Same kernel, same args, same arena slices (d_ssm_out in,
       // d_attn_out out); behavior-identical to the former inline `LaunchGEMV`.
-      strix::models::qwen::QuantGemm(
+      gufo::models::qwen::QuantGemm(
           module_ctx, layer.attn_output, ssm_scratch.out.first(attention_size),
           hidden_size, attention_size, attention_scratch.output);
     } else {
@@ -347,8 +347,8 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
           static_cast<const float*>(layer.ffn_norm.data),
           decode_scratch.normed.data(), hidden_size, 1e-6F, arena.stream);
     } else {
-      strix::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
-                                       attention_scratch.output);
+      gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
+                                      attention_scratch.output);
 
       if (!fuse_ffn_norm_swiglu) {
         // FFN Pre-RMSNorm
@@ -377,15 +377,15 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
       // same down GEMV as the former inline calls; behavior identical. The
       // module reads the arena device spans (x = d_normed, act_scratch =
       // d_ffn_act, out = d_ffn_out) directly.
-      const auto ffn_view = strix::models::qwen::MakeFfnView(layer, config);
-      strix::models::qwen::FfnForward(
+      const auto ffn_view = gufo::models::qwen::MakeFfnView(layer, config);
+      gufo::models::qwen::FfnForward(
           module_ctx, ffn_view, decode_scratch.normed, ffn_scratch.activation,
           ffn_scratch.activation, ffn_scratch.activation, ffn_scratch.out);
     }
 
     // Residual Add
-    strix::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
-                                     ffn_scratch.out);
+    gufo::models::qwen::ResidualAdd(module_ctx, decode_scratch.hidden,
+                                    ffn_scratch.out);
 
     if (const auto tap_index = arena.GetTargetLayerCaptureIndex(l);
         tap_index.has_value()) {
@@ -414,5 +414,5 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
   }
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

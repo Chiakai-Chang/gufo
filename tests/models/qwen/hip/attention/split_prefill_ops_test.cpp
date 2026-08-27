@@ -155,7 +155,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size) {
   // Reference: the unsplit tiled kernel over the whole visible range. This also
   // packs the new K/V into both caches and refreshes the FP16 prefix mirror.
   HIP_CHECK(hipMemset(b.out, 0, q_elements * sizeof(float)));
-  if (!strix::hip::LaunchBatchedAttentionTile(
+  if (!gufo::hip::LaunchBatchedAttentionTile(
           b.q, b.k, b.v, b.gate, b.kv_cache, v_cache, b.kv_f16, kv_f16_v, b.out,
           /*layer_idx=*/0, start_pos, batch_size, kMaxContext, kNumHeads,
           kNumKvHeads, kHeadDim)) {
@@ -170,9 +170,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size) {
   // Candidate: diagonal through the tiled kernel with its partial statistics,
   // prefix through AOTriton, merged by log-sum-exp. The KV caches are already
   // packed by the reference call above, so suppress the write.
-  strix::hip::LaunchConvertQueriesToHalf(b.q, b.q_f16, q_elements);
+  gufo::hip::LaunchConvertQueriesToHalf(b.q, b.q_f16, q_elements);
   HIP_CHECK(hipMemset(b.diag_out, 0, q_elements * sizeof(float)));
-  if (!strix::hip::LaunchBatchedAttentionTile(
+  if (!gufo::hip::LaunchBatchedAttentionTile(
           b.q, b.k, b.v, b.gate, b.kv_cache, v_cache, b.kv_f16, kv_f16_v,
           b.diag_out, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
           kNumHeads, kNumKvHeads, kHeadDim, nullptr, b.lse_diag, start_pos,
@@ -180,7 +180,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size) {
     std::cerr << "tiled attention rejected the diagonal half\n";
     std::abort();
   }
-  if (!strix::hip::LaunchQwenAotritonPrefixAttention(
+  if (!gufo::hip::LaunchQwenAotritonPrefixAttention(
           static_cast<const __half*>(b.q_f16), b.kv_f16, kv_f16_v,
           static_cast<__half*>(b.prefix_f16), b.lse_prefix, batch_size,
           start_pos, kNumHeads, kNumKvHeads, kHeadDim)) {
@@ -188,9 +188,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size) {
     std::abort();
   }
   HIP_CHECK(hipMemset(b.out, 0, q_elements * sizeof(float)));
-  strix::hip::LaunchMergeSplitAttention(b.prefix_f16, b.lse_prefix, b.diag_out,
-                                        b.lse_diag, b.gate, b.out, batch_size,
-                                        kNumHeads, kHeadDim);
+  gufo::hip::LaunchMergeSplitAttention(b.prefix_f16, b.lse_prefix, b.diag_out,
+                                       b.lse_diag, b.gate, b.out, batch_size,
+                                       kNumHeads, kHeadDim);
   HIP_CHECK(hipDeviceSynchronize());
   std::vector<float> got(q_elements);
   HIP_CHECK(hipMemcpy(got.data(), b.out, q_elements * sizeof(float),
@@ -222,9 +222,9 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size) {
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen split prefill attention ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen split prefill attention ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

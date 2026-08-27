@@ -1,12 +1,12 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_PROMPT_HPP_
-#define STRIX_MODELS_QWEN3_TTS_PROMPT_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_PROMPT_HPP_
+#define GUFO_MODELS_QWEN3_TTS_PROMPT_HPP_
 
 #include <cstddef>
 #include <span>
 #include <string>
 #include <vector>
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 
 struct PromptOutput {
   std::vector<float> embeddings;
@@ -53,6 +53,6 @@ struct IclPromptInput {
                                   PromptOutput* output,
                                   std::string* error = nullptr);
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts
 
-#endif  // STRIX_MODELS_QWEN3_TTS_PROMPT_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_PROMPT_HPP_

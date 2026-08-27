@@ -1,10 +1,10 @@
-#ifndef STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_BFLOAT16_HPP_
-#define STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_BFLOAT16_HPP_
+#ifndef GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_BFLOAT16_HPP_
+#define GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_BFLOAT16_HPP_
 
 #include <cstdint>
 #include <cstring>
 
-namespace strix::test {
+namespace gufo::test {
 
 [[nodiscard]] inline std::uint16_t FloatToBf16Bits(float value) noexcept {
   std::uint32_t bits = 0;
@@ -19,6 +19,6 @@ namespace strix::test {
   return value;
 }
 
-}  // namespace strix::test
+}  // namespace gufo::test
 
-#endif  // STRIX_TESTS_MODELS_QWEN_HIP_SUPPORT_BFLOAT16_HPP_
+#endif  // GUFO_TESTS_MODELS_QWEN_HIP_SUPPORT_BFLOAT16_HPP_

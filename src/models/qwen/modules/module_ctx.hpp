@@ -1,12 +1,12 @@
-#ifndef STRIX_MODELS_QWEN_MODULES_MODULE_CTX_HPP_
-#define STRIX_MODELS_QWEN_MODULES_MODULE_CTX_HPP_
+#ifndef GUFO_MODELS_QWEN_MODULES_MODULE_CTX_HPP_
+#define GUFO_MODELS_QWEN_MODULES_MODULE_CTX_HPP_
 
 #include <cstdint>
 
 #include "src/core/model_config.hpp"
 #include "src/models/qwen/state.hpp"
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 /// Capability token for stateless CPU module calls.
 struct CpuModuleContext final {};
@@ -57,6 +57,6 @@ private:
   std::uint32_t position_;
 };
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen
 
-#endif  // STRIX_MODELS_QWEN_MODULES_MODULE_CTX_HPP_
+#endif  // GUFO_MODELS_QWEN_MODULES_MODULE_CTX_HPP_

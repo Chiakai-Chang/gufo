@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_TEXT_MODEL_RUNNER_HPP_
-#define STRIX_SERVER_TEXT_MODEL_RUNNER_HPP_
+#ifndef GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
+#define GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +14,7 @@
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 
 using TextRunnerToken = ContinuationToken;
 
@@ -223,6 +223,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_TEXT_MODEL_RUNNER_HPP_
+#endif  // GUFO_SERVER_TEXT_MODEL_RUNNER_HPP_

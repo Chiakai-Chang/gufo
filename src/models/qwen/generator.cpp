@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-namespace strix::models {
+namespace gufo::models {
 
 QwenGenerator::QwenGenerator(
     QwenModelWeights weights,
@@ -105,4 +105,4 @@ std::string QwenGenerator::GenerateText(std::string_view prompt,
   return tokenizer_->Decode(generated_tokens);
 }
 
-}  // namespace strix::models
+}  // namespace gufo::models

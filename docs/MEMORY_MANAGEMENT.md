@@ -9,7 +9,7 @@ GPU, and NPU. Physical unification does not imply that every allocation has the
 same virtual address, access permissions, cache behavior, residency, or
 performance on every agent.
 
-One broker in `strix` owns global memory policy. HIP, XDNA2, model
+One broker in `gufo` owns global memory policy. HIP, XDNA2, model
 implementations, KV cache, graphs, persistence, and future modalities request
 memory from that broker instead of maintaining unrelated capacity estimates.
 
@@ -162,7 +162,7 @@ platform-tested minimum without an unsafe-development flag.
 
 The `amdxdna` driver may create workload contexts, assign a subset of AIE
 columns, and allocate driver-managed host buffers. These bytes and resources
-must be included even when they are not returned by the Strix allocator.
+must be included even when they are not returned by the Gufo allocator.
 
 Track:
 

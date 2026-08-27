@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_H_
-#define STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_H_
+#ifndef GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_H_
+#define GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -94,4 +94,4 @@ int ds4_session_pos(const ds4_session *session);
 int ds4_session_ctx(const ds4_session *session);
 uint64_t ds4_session_payload_bytes(const ds4_session *session);
 
-#endif  // STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_H_
+#endif  // GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_H_

@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_HIP_HIP_UTILS_HPP_
-#define STRIX_CORE_HIP_HIP_UTILS_HPP_
+#ifndef GUFO_CORE_HIP_HIP_UTILS_HPP_
+#define GUFO_CORE_HIP_HIP_UTILS_HPP_
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -33,4 +33,4 @@
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_CORE_HIP_HIP_UTILS_HPP_
+#endif  // GUFO_CORE_HIP_HIP_UTILS_HPP_

@@ -12,7 +12,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 constexpr std::size_t kMaxDecodeBatch = 8;
@@ -355,5 +355,5 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
           host_frontiers.begin() + static_cast<std::ptrdiff_t>(batch_size)};
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

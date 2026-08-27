@@ -7,7 +7,7 @@
 
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void CaptureBatchedSsmReplayKernel(
     const float* __restrict__ qkv, const float* __restrict__ alpha,
@@ -311,5 +311,5 @@ void LaunchSSMConvRecurrence(
       replay_capture);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -11,7 +11,7 @@
 #include <xrt/xrt_device.h>
 #endif
 
-namespace strix::xdna2 {
+namespace gufo::xdna2 {
 
 namespace {
 
@@ -39,7 +39,7 @@ void SetDiscoveryFailure(XrtDeviceInfo& info, std::string message) {
   } else {
     info.error_category = "discovery_error";
     info.remediation =
-        "Run strix-server diagnose --section npu and inspect XRT diagnostics";
+        "Run gufo diagnose --section npu and inspect XRT diagnostics";
   }
 }
 
@@ -123,4 +123,4 @@ XrtDeviceInfo DiscoverXrtDevice(std::uint32_t device_index,
 #endif
 }
 
-}  // namespace strix::xdna2
+}  // namespace gufo::xdna2

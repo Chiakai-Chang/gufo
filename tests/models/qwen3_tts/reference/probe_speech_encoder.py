@@ -32,14 +32,14 @@ def main():
     parser.add_argument(
         "--audio",
         default=(
-            "/home/fbozzo/projects/strix-halo.cpp/"
+            "/home/fbozzo/projects/gufo/"
             "artifacts/qwen3_tts/base/reference.wav"
         ),
     )
     parser.add_argument(
         "--out",
         default=(
-            "/home/fbozzo/projects/strix-halo.cpp/"
+            "/home/fbozzo/projects/gufo/"
             "artifacts/qwen3_tts/base/speech_encoder"
         ),
     )

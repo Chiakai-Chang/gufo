@@ -9,7 +9,7 @@
 
 #include "src/models/minimax_h3/dit.hpp"
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 namespace {
 
 constexpr std::size_t kGateModalities = 3;
@@ -187,4 +187,4 @@ std::span<const std::uint16_t> DenoiserSession::refined_text() const noexcept {
 
 #endif
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3

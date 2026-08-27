@@ -17,7 +17,7 @@ void Expect(bool condition, const char* message) {
 
 void TestDefaultOptions() {
   const std::array<const char*, 0> args{};
-  const auto options = strix::cli::ParseBenchOptions(args);
+  const auto options = gufo::cli::ParseBenchOptions(args);
   Expect(options.has_value(), "default options parse");
   Expect(options->n_depths == std::vector<std::size_t>{0},
          "default depth is zero");
@@ -32,7 +32,7 @@ void TestDepthOptions() {
       "--n-prompt",    "2048",      "--n-gen",
       "128",           "--n-depth", "4096,8192,12288,16384",
       "--repetitions", "1"};
-  const auto options = strix::cli::ParseBenchOptions(args);
+  const auto options = gufo::cli::ParseBenchOptions(args);
   Expect(options.has_value(), "depth options parse");
   Expect(options->n_prompts == std::vector<std::size_t>{2048},
          "prompt length parsed");
@@ -49,7 +49,7 @@ void TestHybridMtpOptions() {
       "--speculative",      "mtp-npu", "--mtp-model",    "mtp.gguf",
       "--draft-tokens",     "2",       "--draft-policy", "fixed",
       "--min-draft-tokens", "2",       "--n-gen",        "128"};
-  const auto options = strix::cli::ParseBenchOptions(args);
+  const auto options = gufo::cli::ParseBenchOptions(args);
   Expect(options.has_value(), "hybrid MTP options parse");
   Expect(options->speculative_backend == "mtp-npu", "hybrid MTP mode parsed");
   Expect(options->mtp_model_path == "mtp.gguf", "MTP model path parsed");
@@ -61,17 +61,17 @@ void TestHybridMtpOptions() {
 void TestInvalidDepth() {
   std::string error;
   const std::array<const char*, 2> args = {"--n-depth", "invalid"};
-  Expect(!strix::cli::ParseBenchOptions(args, &error).has_value(),
+  Expect(!gufo::cli::ParseBenchOptions(args, &error).has_value(),
          "invalid depth rejected");
   Expect(!error.empty(), "invalid depth reports an error");
 
   const std::array<const char*, 2> policy_args = {"--draft-policy", "unknown"};
-  Expect(!strix::cli::ParseBenchOptions(policy_args, &error).has_value(),
+  Expect(!gufo::cli::ParseBenchOptions(policy_args, &error).has_value(),
          "invalid draft policy rejected");
 
   const std::array<const char*, 4> range_args = {"--draft-tokens", "3",
                                                  "--min-draft-tokens", "4"};
-  Expect(!strix::cli::ParseBenchOptions(range_args, &error).has_value(),
+  Expect(!gufo::cli::ParseBenchOptions(range_args, &error).has_value(),
          "invalid draft range rejected");
 }
 

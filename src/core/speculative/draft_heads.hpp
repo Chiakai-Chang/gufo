@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_SPECULATIVE_DRAFT_HEADS_HPP_
-#define STRIX_CORE_SPECULATIVE_DRAFT_HEADS_HPP_
+#ifndef GUFO_CORE_SPECULATIVE_DRAFT_HEADS_HPP_
+#define GUFO_CORE_SPECULATIVE_DRAFT_HEADS_HPP_
 
 #include <cstdint>
 #include <memory>
@@ -9,7 +9,7 @@
 
 #include "src/core/speculative/draft_backend.hpp"
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 /// Configuration for multi-token prediction (MTP) / Medusa draft heads
 struct MtpDraftHeadConfig {
@@ -45,6 +45,6 @@ private:
   std::vector<tokenization::TokenId> last_drafted_;
 };
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative
 
-#endif  // STRIX_CORE_SPECULATIVE_DRAFT_HEADS_HPP_
+#endif  // GUFO_CORE_SPECULATIVE_DRAFT_HEADS_HPP_

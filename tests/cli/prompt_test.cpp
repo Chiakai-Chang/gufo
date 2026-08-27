@@ -8,7 +8,7 @@
 
 void TestDefaultOptions() {
   const std::array<const char*, 2> args = {"Hello", "world"};
-  const auto opt = strix::cli::ParsePromptOptions(args);
+  const auto opt = gufo::cli::ParsePromptOptions(args);
   assert(opt.has_value());
   assert(opt->prompt_text == "Hello world");
   assert(opt->max_tokens == 128);
@@ -24,7 +24,7 @@ void TestExplicitFlags() {
   const std::array<const char*, 10> args = {
       "--model", "model.gguf", "-n", "256",  "--temperature",
       "0.7",     "--raw",      "-v", "Test", "prompt"};
-  const auto opt = strix::cli::ParsePromptOptions(args);
+  const auto opt = gufo::cli::ParsePromptOptions(args);
   assert(opt.has_value());
   assert(opt->model_path == "model.gguf");
   assert(opt->max_tokens == 256);
@@ -39,7 +39,7 @@ void TestHybridMtpFlags() {
       "--speculative",      "mtp-npu", "--mtp-model",    "mtp.gguf",
       "--draft-tokens",     "2",       "--draft-policy", "fixed",
       "--min-draft-tokens", "2",       "Prompt"};
-  const auto opt = strix::cli::ParsePromptOptions(args);
+  const auto opt = gufo::cli::ParsePromptOptions(args);
   assert(opt.has_value());
   assert(opt->speculative_backend == "mtp-npu");
   assert(opt->mtp_model_path == "mtp.gguf");
@@ -51,21 +51,21 @@ void TestHybridMtpFlags() {
 void TestInvalidFlags() {
   std::string err;
   const std::array<const char*, 1> args1 = {"--model"};
-  assert(!strix::cli::ParsePromptOptions(args1, &err).has_value());
+  assert(!gufo::cli::ParsePromptOptions(args1, &err).has_value());
   assert(!err.empty());
 
   const std::array<const char*, 2> args2 = {"-n", "not_a_number"};
-  assert(!strix::cli::ParsePromptOptions(args2, &err).has_value());
+  assert(!gufo::cli::ParsePromptOptions(args2, &err).has_value());
 
   const std::array<const char*, 2> args3 = {"-t", "invalid_float"};
-  assert(!strix::cli::ParsePromptOptions(args3, &err).has_value());
+  assert(!gufo::cli::ParsePromptOptions(args3, &err).has_value());
 
   const std::array<const char*, 2> args4 = {"--draft-policy", "unknown"};
-  assert(!strix::cli::ParsePromptOptions(args4, &err).has_value());
+  assert(!gufo::cli::ParsePromptOptions(args4, &err).has_value());
 
   const std::array<const char*, 4> args5 = {"--draft-tokens", "3",
                                             "--min-draft-tokens", "4"};
-  assert(!strix::cli::ParsePromptOptions(args5, &err).has_value());
+  assert(!gufo::cli::ParsePromptOptions(args5, &err).has_value());
 }
 
 void TestSamplingAndReasoningFlags() {
@@ -92,7 +92,7 @@ void TestSamplingAndReasoningFlags() {
                                             "--no-display-prompt",
                                             "-p",
                                             "Explicit prompt text"};
-  const auto opt = strix::cli::ParsePromptOptions(args);
+  const auto opt = gufo::cli::ParsePromptOptions(args);
   assert(opt.has_value());
   assert(opt->model_path == "model.gguf");
   assert(opt->top_p > 0.89F && opt->top_p < 0.91F);

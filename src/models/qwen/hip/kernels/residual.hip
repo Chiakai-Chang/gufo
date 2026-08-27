@@ -7,7 +7,7 @@
 
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void ResidualAddKernel(const float* __restrict__ a,
                                   const float* __restrict__ b,
@@ -70,5 +70,5 @@ void LaunchFusedResidualAddRMSNorm(const float* a, const float* b,
                                                        out, dim, eps);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif

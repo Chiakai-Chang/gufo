@@ -6,7 +6,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace strix::models::deepseek_v4_flash {
+namespace gufo::models::deepseek_v4_flash {
 namespace {
 
 constexpr std::size_t kErrorCapacity = 512;
@@ -310,4 +310,4 @@ std::uint64_t SessionSnapshot::SizeBytes() const noexcept {
   return snapshot_.len;
 }
 
-}  // namespace strix::models::deepseek_v4_flash
+}  // namespace gufo::models::deepseek_v4_flash

@@ -40,42 +40,42 @@ public:
 
   void AddMetadataString(std::string_view key, std::string_view val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kString));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kString));
     AppendString(val);
     metadata_count_++;
   }
 
   void AddMetadataUint32(std::string_view key, std::uint32_t val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kUint32));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kUint32));
     AppendPod(val);
     metadata_count_++;
   }
 
   void AddMetadataUint64(std::string_view key, std::uint64_t val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kUint64));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kUint64));
     AppendPod(val);
     metadata_count_++;
   }
 
   void AddMetadataInt32(std::string_view key, std::int32_t val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kInt32));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kInt32));
     AppendPod(val);
     metadata_count_++;
   }
 
   void AddMetadataFloat32(std::string_view key, float val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kFloat32));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kFloat32));
     AppendPod(val);
     metadata_count_++;
   }
 
   void AddMetadataBool(std::string_view key, bool val) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kBool));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kBool));
     std::uint8_t b = val ? 1 : 0;
     AppendPod(b);
     metadata_count_++;
@@ -84,8 +84,8 @@ public:
   void AddMetadataInt32Array(std::string_view key,
                              const std::vector<std::int32_t>& values) {
     AppendString(key);
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kArray));
-    AppendPod(static_cast<std::uint32_t>(strix::core::GgufValueType::kInt32));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kArray));
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kInt32));
     AppendPod(static_cast<std::uint64_t>(values.size()));
     for (const auto value : values) {
       AppendPod(value);
@@ -94,7 +94,7 @@ public:
   }
 
   void AddTensor(std::string_view name, const std::vector<std::uint64_t>& dims,
-                 strix::core::GgmlType type, std::uint64_t offset) {
+                 gufo::core::GgmlType type, std::uint64_t offset) {
     tensors_to_write_.push_back({std::string(name), dims, type, offset});
   }
 
@@ -133,7 +133,7 @@ private:
   struct TensorRecord {
     std::string name;
     std::vector<std::uint64_t> dims;
-    strix::core::GgmlType type;
+    gufo::core::GgmlType type;
     std::uint64_t offset;
   };
 
@@ -177,17 +177,17 @@ void TestBasicGgufParsing() {
                                 {64, 0, 0, 0});
 
   builder.AddTensor("token_embd.weight", {248320, 2560},
-                    strix::core::GgmlType::kBF16, 0);
+                    gufo::core::GgmlType::kBF16, 0);
   builder.AddTensor("blk.0.attn_q.weight", {2560, 2560},
-                    strix::core::GgmlType::kStrixSHQ4_T16, 64);
+                    gufo::core::GgmlType::kStrixSHQ4_T16, 64);
   builder.AddTensor("mtp.0.proj.weight", {2560, 2560},
-                    strix::core::GgmlType::kStrixSHQ8_T16, 128);
+                    gufo::core::GgmlType::kStrixSHQ8_T16, 128);
 
   auto binary = builder.Build(512);
 
   std::string err;
   auto reader =
-      strix::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
   Expect(reader != nullptr, "Reader open succeeds: " + err);
   Expect(reader->GetVersion() == 3, "GGUF version 3");
   Expect(reader->GetTensorCount() == 3, "3 tensors parsed");
@@ -215,13 +215,13 @@ void TestBasicGgufParsing() {
   Expect(t0->dimensions.size() == 2, "2 dimensions");
   Expect(t0->dimensions[0] == 248320 && t0->dimensions[1] == 2560,
          "Dimensions match");
-  Expect(t0->type == strix::core::GgmlType::kBF16, "BF16 type");
+  Expect(t0->type == gufo::core::GgmlType::kBF16, "BF16 type");
   Expect(t0->data != nullptr, "Valid memory mapped data pointer");
 
   const auto* t1 = reader->FindTensor("blk.0.attn_q.weight");
   Expect(t1 != nullptr, "blk.0.attn_q.weight found");
-  Expect(t1->type == strix::core::GgmlType::kStrixSHQ4_T16,
-         "Strix SHQ4_T16 type");
+  Expect(t1->type == gufo::core::GgmlType::kStrixSHQ4_T16,
+         "Gufo SHQ4_T16 type");
 
   // MTP presence
   Expect(reader->HasMtpTensors(), "MTP tensors detected");
@@ -261,19 +261,19 @@ void TestQwen38_27BParsing() {
   builder.AddMetadataFloat32("qwen35.rope.freq_base", 10000000.0F);
 
   builder.AddTensor("token_embd.weight", {248320, 5120},
-                    strix::core::GgmlType::kBF16, 0);
+                    gufo::core::GgmlType::kBF16, 0);
   builder.AddTensor("blk.3.attn_q.weight", {12288, 5120},
-                    strix::core::GgmlType::kStrixSHQ4_T16, 64);
+                    gufo::core::GgmlType::kStrixSHQ4_T16, 64);
   builder.AddTensor("blk.63.ffn_gate.weight", {17408, 5120},
-                    strix::core::GgmlType::kStrixSHQ4_T16, 128);
+                    gufo::core::GgmlType::kStrixSHQ4_T16, 128);
   builder.AddTensor("blk.64.nextn.enorm.weight", {5120},
-                    strix::core::GgmlType::kStrixSHQ8_T16, 192);
+                    gufo::core::GgmlType::kStrixSHQ8_T16, 192);
 
   auto binary = builder.Build(512);
 
   std::string err;
   auto reader =
-      strix::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
   Expect(reader != nullptr, "Reader open succeeds: " + err);
   Expect(reader->GetTensorCount() == 4, "4 tensors parsed for 27B");
 
@@ -310,7 +310,7 @@ void WriteBinaryFile(const std::filesystem::path& path,
 void TestSplitGgufDiscovery() {
   const auto temp_dir =
       std::filesystem::temp_directory_path() /
-      ("strix-gguf-reader-" + std::to_string(static_cast<long>(getpid())));
+      ("gufo-gguf-reader-" + std::to_string(static_cast<long>(getpid())));
   std::filesystem::create_directories(temp_dir);
   const auto first_path = temp_dir / "model-00001-of-00002.gguf";
   const auto second_path = temp_dir / "model-00002-of-00002.gguf";
@@ -320,19 +320,19 @@ void TestSplitGgufDiscovery() {
   first.AddMetadataUint32("split.no", 0);
   first.AddMetadataUint32("split.count", 2);
   first.AddMetadataInt32("split.tensors.count", 2);
-  first.AddTensor("token_embd.weight", {8, 4}, strix::core::GgmlType::kBF16, 0);
+  first.AddTensor("token_embd.weight", {8, 4}, gufo::core::GgmlType::kBF16, 0);
 
   GgufBuilder second;
   second.AddMetadataUint32("split.no", 1);
   second.AddMetadataUint32("split.count", 2);
   second.AddMetadataInt32("split.tensors.count", 2);
-  second.AddTensor("output_norm.weight", {4}, strix::core::GgmlType::kF32, 0);
+  second.AddTensor("output_norm.weight", {4}, gufo::core::GgmlType::kF32, 0);
 
   WriteBinaryFile(first_path, first.Build(128));
   WriteBinaryFile(second_path, second.Build(128));
 
   std::string err;
-  const auto reader = strix::core::GgufReader::OpenFile(second_path, &err);
+  const auto reader = gufo::core::GgufReader::OpenFile(second_path, &err);
   Expect(reader != nullptr, "Split reader opens from any shard: " + err);
   Expect(reader->GetTensorCount() == 2, "Split reader merges tensor indexes");
   Expect(reader->FindTensor("token_embd.weight") != nullptr,
@@ -359,13 +359,13 @@ void TestVisionExclusionValidation() {
 
   // Add vision encoder tensor
   builder.AddTensor("model.visual.patch_embed.weight", {768, 3, 14, 14},
-                    strix::core::GgmlType::kF16, 0);
+                    gufo::core::GgmlType::kF16, 0);
 
   auto binary = builder.Build();
 
   std::string err;
   auto reader =
-      strix::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
   Expect(reader != nullptr, "Reader open succeeds");
   Expect(reader->HasVisionTensors(), "Vision tensors detected");
 
@@ -382,13 +382,13 @@ void TestMalformedGgufRejection() {
   const std::uint8_t bad_magic[24] = {'N', 'O', 'P', 'E', 3, 0, 0, 0};
   std::string err;
   auto r1 =
-      strix::core::GgufReader::OpenMemory(bad_magic, sizeof(bad_magic), &err);
+      gufo::core::GgufReader::OpenMemory(bad_magic, sizeof(bad_magic), &err);
   Expect(r1 == nullptr, "Bad magic rejected");
 
   // Truncated buffer
   const std::uint8_t truncated[10] = {'G', 'G', 'U', 'F'};
   auto r2 =
-      strix::core::GgufReader::OpenMemory(truncated, sizeof(truncated), &err);
+      gufo::core::GgufReader::OpenMemory(truncated, sizeof(truncated), &err);
   Expect(r2 == nullptr, "Truncated buffer rejected");
 }
 

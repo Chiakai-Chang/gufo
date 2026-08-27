@@ -17,7 +17,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 constexpr ck::index_t kCkNumKvHeads = detail::kCkAttentionKvHeads;
 
@@ -183,5 +183,5 @@ bool LaunchBatchedAttentionCk(const float* q, const float* k, const float* v,
   return true;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

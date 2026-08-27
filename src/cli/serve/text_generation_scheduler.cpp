@@ -14,7 +14,7 @@
 #include <thread>
 #include <utility>
 
-namespace strix::server {
+namespace gufo::server {
 namespace {
 
 struct OutputBudget {
@@ -1017,4 +1017,4 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   return Request(std::make_unique<Request::Impl>(std::move(request)));
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

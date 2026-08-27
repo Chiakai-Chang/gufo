@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_QUANT_OPS_HPP_
-#define STRIX_MODELS_QWEN_HIP_QUANT_OPS_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_QUANT_OPS_HPP_
+#define GUFO_MODELS_QWEN_HIP_QUANT_OPS_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -12,7 +12,7 @@
 
 #include <cmath>
 
-namespace strix::hip {
+namespace gufo::hip {
 
 // Shared quantized block layouts + quant row-dot helpers for the decode and
 // prefill GPU paths. Layouts/values are numerically identical to the
@@ -283,8 +283,8 @@ __device__ inline float QuantWarpBlockDot(
   return sumf;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_QUANT_OPS_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_QUANT_OPS_HPP_

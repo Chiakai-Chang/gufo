@@ -23,7 +23,7 @@
 
 #include "src/models/qwen3_tts/json.hpp"
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 namespace {
 
 void SetError(std::string* error, std::string message) {
@@ -40,7 +40,7 @@ class TemporaryDirectory {
 public:
   TemporaryDirectory() {
     std::array<char, 64> pattern{};
-    const std::string prefix = "/tmp/strix-qwen3-tts-XXXXXX";
+    const std::string prefix = "/tmp/gufo-qwen3-tts-XXXXXX";
     std::copy(prefix.begin(), prefix.end(), pattern.begin());
     if (const char* created = mkdtemp(pattern.data()); created != nullptr) {
       path_ = created;
@@ -309,4 +309,4 @@ bool OfficialReferenceRunner::Generate(const SynthesisRequest& request,
   }
 }
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts

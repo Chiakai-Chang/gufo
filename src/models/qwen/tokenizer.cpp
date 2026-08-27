@@ -17,7 +17,7 @@
 
 #include "src/core/gguf_reader.hpp"
 
-namespace strix::tokenization {
+namespace gufo::tokenization {
 
 namespace {
 
@@ -534,4 +534,4 @@ bool QwenTokenizer::IsSpecialToken(TokenId id) const noexcept {
   return is_special_token_.contains(id);
 }
 
-}  // namespace strix::tokenization
+}  // namespace gufo::tokenization

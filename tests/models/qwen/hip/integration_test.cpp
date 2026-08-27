@@ -34,18 +34,18 @@
 
 namespace {
 
-using strix::core::GgmlType;
-using strix::core::ModelConfig;
-using strix::models::QwenTensorRef;
-using strix::models::qwen::build_synthetic_qwen_weights;
-using strix::models::qwen::HipModuleContext;
-using strix::models::qwen::make_small_qwen_config;
-using strix::models::qwen::NormForward;
-using strix::models::qwen::NormLayerView;
-using strix::models::qwen::QuantGemm;
-using strix::models::qwen::ResidualAdd;
-using strix::test::make_random_tensor;
-using strix::test::make_seeded_rng;
+using gufo::core::GgmlType;
+using gufo::core::ModelConfig;
+using gufo::models::QwenTensorRef;
+using gufo::models::qwen::build_synthetic_qwen_weights;
+using gufo::models::qwen::HipModuleContext;
+using gufo::models::qwen::make_small_qwen_config;
+using gufo::models::qwen::NormForward;
+using gufo::models::qwen::NormLayerView;
+using gufo::models::qwen::QuantGemm;
+using gufo::models::qwen::ResidualAdd;
+using gufo::test::make_random_tensor;
+using gufo::test::make_seeded_rng;
 
 // Copies a host F32 QwenTensorRef into a freshly-allocated device buffer.
 void ToDevice(const QwenTensorRef& host, float** dptr) {

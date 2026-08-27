@@ -25,7 +25,7 @@ void Expect(bool condition, std::string_view message) {
   }
 }
 
-class FakeBackend final : public strix::server::TextGenerationBackend {
+class FakeBackend final : public gufo::server::TextGenerationBackend {
 public:
   [[nodiscard]] std::string model_id() const override { return "test-model"; }
   [[nodiscard]] bool ready() const override { return true; }
@@ -38,7 +38,7 @@ public:
     return {};
   }
 
-  Result chat(const strix::server::ChatRequest& request, std::size_t max_tokens,
+  Result chat(const gufo::server::ChatRequest& request, std::size_t max_tokens,
               float temperature, const CancellationCheck& is_cancelled,
               const TokenCallback& on_token) override {
     ++chat_calls;
@@ -72,7 +72,7 @@ public:
       }
       result.text += piece;
       result.tokens.push_back(
-          static_cast<strix::tokenization::TokenId>(result.tokens.size()));
+          static_cast<gufo::tokenization::TokenId>(result.tokens.size()));
       if (block_after_first_piece &&
           result.tokens.size() == static_cast<std::size_t>(1)) {
         {
@@ -91,12 +91,12 @@ public:
   }
 
   std::shared_ptr<GenerationRequest> start_chat(
-      const strix::server::ChatRequest& request, std::size_t max_tokens,
+      const gufo::server::ChatRequest& request, std::size_t max_tokens,
       float temperature, const CancellationCheck& is_cancelled,
       bool stream_output) override {
     if (reject_on_start.has_value()) {
-      throw strix::server::TextGenerationError(*reject_on_start,
-                                               "injected admission rejection");
+      throw gufo::server::TextGenerationError(*reject_on_start,
+                                              "injected admission rejection");
     }
     return TextGenerationBackend::start_chat(request, max_tokens, temperature,
                                              is_cancelled, stream_output);
@@ -124,11 +124,11 @@ public:
   bool block_after_first_piece{false};
   std::atomic<bool> completed{false};
   std::atomic<int> chat_calls{0};
-  strix::server::ChatRequest last_request;
+  gufo::server::ChatRequest last_request;
   SamplingDefaults defaults;
   std::size_t last_max_tokens{0};
   float last_temperature{0.0F};
-  std::optional<strix::server::TextGenerationErrorCode> reject_on_start;
+  std::optional<gufo::server::TextGenerationErrorCode> reject_on_start;
 
 private:
   std::mutex mutex;
@@ -137,7 +137,7 @@ private:
   bool released{false};
 };
 
-strix::server::HttpRequest Request(
+gufo::server::HttpRequest Request(
     std::string body,
     std::vector<std::pair<std::string, std::string>> headers = {}) {
   return {
@@ -154,17 +154,17 @@ void TestStreamingIsLive() {
   FakeBackend backend;
   backend.pieces = {"Hel", "lo"};
   backend.finish_reason =
-      strix::server::TextGenerationBackend::FinishReason::kLength;
+      gufo::server::TextGenerationBackend::FinishReason::kLength;
   backend.block_after_first_piece = true;
 
-  auto response = strix::server::HandleOpenAiChat(Request(R"({
+  auto response = gufo::server::HandleOpenAiChat(Request(R"({
         "model":"test-model",
         "messages":[{"role":"user","content":"hello"}],
         "max_tokens":2,
         "stream":true,
         "stream_options":{"include_usage":true}
       })"),
-                                                  backend);
+                                                 backend);
   Expect(response.status == 200, "Streaming request is accepted");
   Expect(static_cast<bool>(response.streaming_body),
          "Streaming request returns a streaming body");
@@ -228,7 +228,7 @@ void TestToolCallsAreStructured() {
       "</parameter>\n</function>\n</tool_call>",
   };
 
-  const auto response = strix::server::HandleOpenAiChat(Request(R"({
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
         "model":"test-model",
         "messages":[{"role":"user","content":"weather in Rome"}],
         "tools":[{
@@ -246,7 +246,7 @@ void TestToolCallsAreStructured() {
         "tool_choice":"required",
         "stream":false
       })"),
-                                                        backend);
+                                                       backend);
 
   Expect(response.status == 200, "Tool request is accepted");
   Expect(response.body.find(R"("finish_reason":"tool_calls")") !=
@@ -259,7 +259,7 @@ void TestToolCallsAreStructured() {
   Expect(backend.last_request.tools.size() == 1,
          "Tool schema reaches the model backend");
   Expect(backend.last_request.tool_choice ==
-             strix::server::ChatRequest::ToolChoice::kRequired,
+             gufo::server::ChatRequest::ToolChoice::kRequired,
          "Required tool choice reaches the model backend");
 }
 
@@ -274,7 +274,7 @@ void TestDeepSeekToolCallsAreStructured() {
       "</｜DSML｜tool_calls｜>",
   };
 
-  const auto response = strix::server::HandleOpenAiChat(Request(R"({
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
         "model":"test-model",
         "messages":[{"role":"user","content":"read the hostname"}],
         "tools":[{
@@ -291,7 +291,7 @@ void TestDeepSeekToolCallsAreStructured() {
         }],
         "stream":false
       })"),
-                                                        backend);
+                                                       backend);
 
   Expect(response.status == 200, "DeepSeek tool request is accepted");
   Expect(response.body.find(R"("finish_reason":"tool_calls")") !=
@@ -311,24 +311,24 @@ void TestBackendSamplingDefaults() {
       .temperature = 0.25F,
   };
 
-  const auto default_response = strix::server::HandleOpenAiChat(Request(R"({
+  const auto default_response = gufo::server::HandleOpenAiChat(Request(R"({
         "model":"test-model",
         "messages":[{"role":"user","content":"hello"}]
       })"),
-                                                                backend);
+                                                               backend);
   Expect(default_response.status == 200, "Defaulted request is accepted");
   Expect(backend.last_max_tokens == 37,
          "Backend max-token default reaches generation");
   Expect(backend.last_temperature > 0.24F && backend.last_temperature < 0.26F,
          "Backend temperature default reaches generation");
 
-  const auto override_response = strix::server::HandleOpenAiChat(Request(R"({
+  const auto override_response = gufo::server::HandleOpenAiChat(Request(R"({
         "model":"test-model",
         "messages":[{"role":"user","content":"hello"}],
         "max_tokens":11,
         "temperature":0
       })"),
-                                                                 backend);
+                                                                backend);
   Expect(override_response.status == 200, "Sampling override is accepted");
   Expect(backend.last_max_tokens == 11,
          "Explicit max tokens override the backend default");
@@ -338,11 +338,11 @@ void TestBackendSamplingDefaults() {
 
 void TestWrongModelIsRejected() {
   FakeBackend backend;
-  const auto response = strix::server::HandleOpenAiChat(Request(R"({
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
         "model":"wrong-model",
         "messages":[{"role":"user","content":"hello"}]
       })"),
-                                                        backend);
+                                                       backend);
 
   Expect(response.status == 404, "Unknown model is rejected");
   Expect(response.body.find("model_not_found") != std::string::npos,
@@ -355,12 +355,12 @@ void TestClientIdentityReachesBackend() {
   FakeBackend backend;
   backend.pieces = {"ok"};
   const auto response =
-      strix::server::HandleOpenAiChat(Request(R"({
+      gufo::server::HandleOpenAiChat(Request(R"({
         "model":"test-model",
         "messages":[{"role":"user","content":"hello"}]
       })",
-                                              {{"X-Client-ID", "pi-agent-2"}}),
-                                      backend);
+                                             {{"X-Client-ID", "pi-agent-2"}}),
+                                     backend);
 
   Expect(response.status == 200, "identified request is accepted");
   Expect(backend.last_request.client_id == "pi-agent-2",
@@ -369,7 +369,7 @@ void TestClientIdentityReachesBackend() {
 
 void TestInvalidClientIdentityIsRejected() {
   FakeBackend backend;
-  const auto response = strix::server::HandleOpenAiChat(
+  const auto response = gufo::server::HandleOpenAiChat(
       Request(R"({
         "model":"test-model",
         "messages":[{"role":"user","content":"hello"}]
@@ -386,13 +386,13 @@ void TestInvalidClientIdentityIsRejected() {
 
 void TestStreamingOverloadIsRejectedBeforeHeaders() {
   FakeBackend backend;
-  backend.reject_on_start = strix::server::TextGenerationErrorCode::kQueueFull;
-  const auto response = strix::server::HandleOpenAiChat(Request(R"({
+  backend.reject_on_start = gufo::server::TextGenerationErrorCode::kQueueFull;
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
         "model":"test-model",
         "messages":[{"role":"user","content":"hello"}],
         "stream":true
       })"),
-                                                        backend);
+                                                       backend);
 
   Expect(response.status == 429,
          "streaming overload is rejected synchronously");

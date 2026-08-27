@@ -11,7 +11,7 @@
 
 #include "src/models/qwen3_tts/hip/talker_ops.hpp"
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 namespace {
 
 template<std::uint32_t ThreadsPerBlock>
@@ -826,6 +826,6 @@ bool LaunchBfloat16GemvGrouped(const Bfloat16GemvGroup* groups,
                     : dispatch_groups.template operator()<uint2>();
 }
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)

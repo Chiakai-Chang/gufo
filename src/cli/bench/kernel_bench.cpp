@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string_view>
 
-namespace strix::bench {
+namespace gufo::bench {
 namespace {
 
 double Percentile(const std::vector<double>& sorted, double quantile) {
@@ -269,4 +269,4 @@ std::string KernelBenchReport::ToHuman() const {
   return output.str();
 }
 
-}  // namespace strix::bench
+}  // namespace gufo::bench

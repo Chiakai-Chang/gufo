@@ -17,7 +17,7 @@ let
   mlirAieRoot = "${mlir-aie}/${sitePackages}/mlir_aie";
   peanoRoot = "${llvm-aie}/${sitePackages}/llvm-aie";
 in
-runCommand "strix-aie-qwen-mtp-rmsnorm-program" {
+runCommand "gufo-aie-qwen-mtp-rmsnorm-program" {
   nativeBuildInputs = [
     aiebu
     pythonEnv
@@ -82,14 +82,14 @@ PY
       qwen_mtp_rmsnorm.insts.elf qwen_mtp_rmsnorm.pdi >SHA256SUMS
   )
 
-  mkdir -p "$out/include/strix"
-  cat >"$out/include/strix/aie_qwen_mtp_rmsnorm_manifest.h" <<EOF
-#ifndef STRIX_AIE_QWEN_MTP_RMSNORM_MANIFEST_H_
-#define STRIX_AIE_QWEN_MTP_RMSNORM_MANIFEST_H_
+  mkdir -p "$out/include/gufo"
+  cat >"$out/include/gufo/aie_qwen_mtp_rmsnorm_manifest.h" <<EOF
+#ifndef GUFO_AIE_QWEN_MTP_RMSNORM_MANIFEST_H_
+#define GUFO_AIE_QWEN_MTP_RMSNORM_MANIFEST_H_
 
 #include <string_view>
 
-namespace strix::xdna2::generated {
+namespace gufo::xdna2::generated {
 
 inline constexpr std::string_view kQwenMtpRmsNormTarget = "npu2";
 inline constexpr std::string_view kQwenMtpRmsNormAbi = "xrt-elf-v1";
@@ -116,9 +116,9 @@ inline constexpr std::string_view kQwenMtpRmsNormInstructionSha256 =
 inline constexpr std::string_view kQwenMtpRmsNormElfSha256 = "$elf_sha";
 inline constexpr std::string_view kQwenMtpRmsNormPdiSha256 = "$pdi_sha";
 
-}  // namespace strix::xdna2::generated
+}  // namespace gufo::xdna2::generated
 
-#endif  // STRIX_AIE_QWEN_MTP_RMSNORM_MANIFEST_H_
+#endif  // GUFO_AIE_QWEN_MTP_RMSNORM_MANIFEST_H_
 EOF
 
   cat >"$out/manifest.json" <<EOF

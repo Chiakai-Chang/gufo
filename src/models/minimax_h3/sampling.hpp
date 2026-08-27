@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_MINIMAX_H3_SAMPLING_HPP_
-#define STRIX_MODELS_MINIMAX_H3_SAMPLING_HPP_
+#ifndef GUFO_MODELS_MINIMAX_H3_SAMPLING_HPP_
+#define GUFO_MODELS_MINIMAX_H3_SAMPLING_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 
 inline constexpr int kH3CanvasMultiple = 32;
 inline constexpr std::int64_t kH3MaximumPixels = 768LL * 1344LL;
@@ -174,6 +174,6 @@ struct EulerStepPlan {
     std::size_t velocity_elements, float sigma_from_timestep, float ratio,
     float extrapolation, void* stream, std::string* error = nullptr);
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3
 
-#endif  // STRIX_MODELS_MINIMAX_H3_SAMPLING_HPP_
+#endif  // GUFO_MODELS_MINIMAX_H3_SAMPLING_HPP_

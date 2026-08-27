@@ -11,7 +11,7 @@
 #endif
 
 void TestHardwareAcceptanceAccounting() {
-  strix::core::ModelConfig config;
+  gufo::core::ModelConfig config;
   config.architecture = "qwen35";
   config.num_layers = 32;
   config.hidden_size = 2560;

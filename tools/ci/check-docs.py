@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-check-docs.py — Documentation integrity, local link, and syntax validator for Strix-Halo.cpp
+check-docs.py — Documentation integrity, local link, and syntax validator for gufo
 
 Validates:
 1. Presence of required documentation files (ROADMAP, LICENSING, NOTICE, etc.)

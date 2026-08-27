@@ -3,10 +3,10 @@
 Status: first vertical slice, 2026-08-11. CPU-only reference path (torch
 fallback for linear attention; no flash-linear-attention/causal-conv1d fast
 path). Measures OUR SHQ4 quantization quality; speed here is the reference
-runtime, not Strix kernels yet.
+runtime, not Gufo kernels yet.
 
 Methodology: `docs/BENCHMARKS.md` (matched-token, per position; utilities
-`strix-capture.py` / `strix-bench.py`). Raw artifacts gitignored under
+`gufo-capture.py` / `gufo-bench.py`). Raw artifacts gitignored under
 `artifacts/`.
 
 Source: `Qwen/Qwen3.5-0.8B` @ `2fc06364715b967f1860aea9cf38778875588b17`, bf16.
@@ -40,7 +40,7 @@ hf download unsloth/Qwen3.5-0.8B-GGUF Qwen3.5-0.8B-Q4_K_M.gguf \
 ```
 
 `hf download` is the `huggingface-hub` CLI (same lib that
-`strix-inspect.py` uses). Pin the source revision — the benchmark is only
+`gufo-inspect.py` uses). Pin the source revision — the benchmark is only
 comparable against the same revision, suite, tokenizer, and reference
 runtime. Other 4-bit resolutions available on the unsloth repo: `Q4_K_S`,
 `IQ4_XS`, `IQ4_NL`, `Q4_0`, `UD-Q4_K_XL` (dynamic). We compare against
@@ -65,7 +65,7 @@ Component map (24 blocks; layers 0-2 linear, 3 full, repeating per
 `mtp_num_hidden_layers: 1` (model card: "MTP: trained with multi-steps"), and
 the safetensors carry `mtp.layers.0.*` + `mtp.fc`. Our candidate quantizes the
 MTP head to SHQ4 (`artifacts/quant/mtp/`). The unsloth GGUF has zero MTP
-tensors (`strix-gguf.py` reports `MTP tensors present: False`) — the llama.cpp
+tensors (`gufo-gguf.py` reports `MTP tensors present: False`) — the llama.cpp
 `qwen35` conversion drops the speculative head. MTP is a multi-token draft
 head, not part of the single-token NLL/KL benchmark above, so the two files
 are comparable on the shared LM body; only our build carries the MTP head
@@ -77,14 +77,14 @@ Both quants are scored against the same bf16 source, tensor by tensor:
 
 ```bash
 nix develop
-tools/quant/strix-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf \
+tools/quant/gufo-gguf.py --gguf artifacts/gguf/Qwen3.5-0.8B-Q4_K_M.gguf \
   --recon --bf16-source artifacts/source \
   --plan artifacts/work/quantization-plan.json
 ```
 
-`strix-gguf.py` parses the GGUF header/tensor-info, dequants the Q4 family
+`gufo-gguf.py` parses the GGUF header/tensor-info, dequants the Q4 family
 (Q4_0/Q4_K/Q5_K/Q6_K/Q8_0), and reports per-tensor `rel_mae` (mean abs error
-/ mean |w|) — the same scale `strix-quantize.py` records for our SHQ4, merged
+/ mean |w|) — the same scale `gufo-quantize.py` records for our SHQ4, merged
 from `quantization-plan.json`. Weight reconstruction is a per-component proxy;
 the logit-level matched-token KL above stays the authoritative whole-model
 metric (per-layer logit attribution is still a planned slice).
@@ -172,7 +172,7 @@ across presets show:
 - Port SHQ4/SHQ8 decode GEMV to HIP (gfx1151) and XDNA2 (AIE2P); consume the
   packed planes directly (no dequant-to-bf16). SHQ8 shares the SHQ4 T16 tile
   layout, so it needs no separate kernel family.
-- Imatrix scale search is DONE and validated: `tools/quant/strix-calibrate.py` +
+- Imatrix scale search is DONE and validated: `tools/quant/gufo-calibrate.py` +
   `--imatrix` with the disjoint 666-token `tools/quant/suites/calib.json` drops
   logit KL mean 0.172 -> 0.117, top-1 0.821 -> 0.872, ppl 4.259 -> 3.942
   (measured on this eval suite; calibration set disjoint). Self-calibrating
@@ -183,5 +183,5 @@ across presets show:
   choices; then re-run the retention table.
 - G32 quality groups for sensitive attention tensors.
 - Per-layer quality breakdown (see `docs/BENCHMARKS.md`).
-- GGUF cross-quant matrix: run `strix-gguf.py --recon` on `Q4_K_S`, `Q4_0`,
+- GGUF cross-quant matrix: run `gufo-gguf.py --recon` on `Q4_K_S`, `Q4_0`,
   `IQ4_XS`, `Q6_K` and tabulate retention per layer across resolutions.

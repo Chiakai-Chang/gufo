@@ -32,7 +32,7 @@ MODEL=/path/to/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatr
 Run a terminal prompt:
 
 ```sh
-./result/bin/strix prompt \
+./result/bin/gufo prompt \
   --model "$MODEL" \
   --raw \
   --prompt 'The capital of France is' \
@@ -45,7 +45,7 @@ prepared depth, and each generation row produces 128 autoregressive tokens.
 Frontiers are extended incrementally and restored from in-memory snapshots.
 
 ```sh
-./result/bin/strix bench \
+./result/bin/gufo bench \
   --model "$MODEL" \
   --n-prompt 2048 \
   --n-gen 128 \
@@ -58,7 +58,7 @@ The same artifact can be served through the existing OpenAI-compatible
 completion and chat endpoints:
 
 ```sh
-./result/bin/strix serve \
+./result/bin/gufo serve \
   --host 127.0.0.1 \
   --port 8080 \
   llm \
@@ -67,12 +67,12 @@ completion and chat endpoints:
 
 ## Current Results
 
-The Strix rows use the release package, one repetition, a 2K prompt suffix, and
+The Gufo rows use the release package, one repetition, a 2K prompt suffix, and
 128 generated tokens. The DS4 reference is the supplied same-machine result
 for the same artifact. Prompt rows compare the final context after adding the
 2K suffix; generation rows compare the prepared depth.
 
-| Prepared depth | Strix `pp2048` | DS4 `pp2048` | Delta | Strix `tg128` | DS4 `tg128` | Delta | Snapshot bytes |
+| Prepared depth | Gufo `pp2048` | DS4 `pp2048` | Delta | Gufo `tg128` | DS4 `tg128` | Delta | Snapshot bytes |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 2K | 206.33 | 205.49 | +0.4% | 15.63 | 14.76 | +5.9% | 52,184,460 |
 | 8K | 204.22 | 197.13 | +3.6% | 14.65 | 13.87 | +5.6% | 136,750,476 |
@@ -147,7 +147,7 @@ after generation.
 
 ## Quality and Integration
 
-- The pinned upstream DS4 CLI and packaged Strix CLI produce the exact same
+- The pinned upstream DS4 CLI and packaged Gufo CLI produce the exact same
   four-token greedy continuation, ` Paris. It is`, for the same raw prompt and
   artifact.
 - A pinned 128-token teacher-forced trajectory keeps at least 116/128 reference
@@ -176,7 +176,7 @@ after generation.
   implementations from the production closure.
 - Converted the private fork to native ROCm/HIP naming and APIs.
 - Kept DeepSeek code, kernels, state, and dispatch isolated from Qwen.
-- Reused the existing Strix CLI, benchmark, and OpenAI-compatible server.
+- Reused the existing Gufo CLI, benchmark, and OpenAI-compatible server.
 - Matched the DS4 state payload sizes and stayed close to or ahead of the
   supplied throughput curve through 64K.
 - Reduced the six-expert Q2-down kernel by 7.8% with a two-way compiler unroll;
@@ -196,7 +196,7 @@ after generation.
 - Automatic CMake discovery was not reliable for the header-only ROCm
   dependencies in a clean Nix sandbox. Explicit flake-provided include roots
   are retained.
-- The upstream DS4 frontend build is not imported. Strix owns CLI, HTTP,
+- The upstream DS4 frontend build is not imported. Gufo owns CLI, HTTP,
   benchmarking, cancellation, and session pooling.
 - Q8 projection row grouping (`1/2/4/8`) and high-compression row grouping
   (`8/16/32`) produced no repeatable end-to-end improvement.
@@ -216,7 +216,7 @@ after generation.
 
 - Add model-owned thinking/reasoning mode and effort controls; the current chat
   template intentionally uses the no-thinking path.
-- Run the compact `strix-eval` qualification suite when #153 is implemented.
+- Run the compact `gufo-eval` qualification suite when #153 is implemented.
 - Profile and optimize the model-owned gfx1151 kernels under #155.
 - Add DSpark speculative decoding under #156.
 - Add model-owned offline calibration/imatrix tooling only when a new

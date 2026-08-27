@@ -26,9 +26,9 @@ namespace {
 constexpr std::size_t kBlockElements = 256;
 constexpr std::size_t kGroupElements = 32;
 constexpr std::size_t kBlocksPerRow =
-    strix::xdna2::kQwenMtpEhProjInputElements / kBlockElements;
+    gufo::xdna2::kQwenMtpEhProjInputElements / kBlockElements;
 
-using BlockQ4K = strix::quant::block_q4_K;
+using BlockQ4K = gufo::quant::block_q4_K;
 
 static_assert(sizeof(BlockQ4K) == 144);
 
@@ -70,12 +70,12 @@ void SetQuant(BlockQ4K& block, std::size_t index, std::uint8_t value) {
 }
 
 std::vector<BlockQ4K> MakeIdentityWeights() {
-  std::vector<BlockQ4K> blocks(strix::xdna2::kQwenMtpEhProjOutputElements *
+  std::vector<BlockQ4K> blocks(gufo::xdna2::kQwenMtpEhProjOutputElements *
                                kBlocksPerRow);
-  for (std::size_t row = 0; row < strix::xdna2::kQwenMtpEhProjOutputElements;
+  for (std::size_t row = 0; row < gufo::xdna2::kQwenMtpEhProjOutputElements;
        ++row) {
     const std::size_t input_index =
-        row % strix::xdna2::kQwenMtpEhProjInputElements;
+        row % gufo::xdna2::kQwenMtpEhProjInputElements;
     const std::size_t block_index = input_index / kBlockElements;
     const std::size_t within_block = input_index % kBlockElements;
     auto& block = blocks[(row * kBlocksPerRow) + block_index];
@@ -87,7 +87,7 @@ std::vector<BlockQ4K> MakeIdentityWeights() {
 }
 
 std::vector<float> MakeRepresentableInput() {
-  std::vector<float> input(strix::xdna2::kQwenMtpEhProjInputElements);
+  std::vector<float> input(gufo::xdna2::kQwenMtpEhProjInputElements);
   for (std::size_t group_start = 0; group_start < input.size();
        group_start += kGroupElements) {
     for (std::size_t lane = 0; lane < kGroupElements; ++lane) {
@@ -130,43 +130,43 @@ Comparison Compare(std::span<const float> actual,
   };
 }
 
-std::unique_ptr<strix::xdna2::QwenMtpEhProjSession> CreateSession(
-    const strix::models::QwenTensorRef& weights,
-    const strix::xdna2::XrtDeviceInfo& device, std::string_view context) {
-  strix::xdna2::QwenMtpEhProjFailure failure;
-  auto session = strix::xdna2::QwenMtpEhProjSession::Create(
-      {.program_dir = STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}, device, weights,
+std::unique_ptr<gufo::xdna2::QwenMtpEhProjSession> CreateSession(
+    const gufo::models::QwenTensorRef& weights,
+    const gufo::xdna2::XrtDeviceInfo& device, std::string_view context) {
+  gufo::xdna2::QwenMtpEhProjFailure failure;
+  auto session = gufo::xdna2::QwenMtpEhProjSession::Create(
+      {.program_dir = GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}, device, weights,
       &failure);
   Expect(session != nullptr, std::string(context) + ": " + failure.category +
                                  ": " + failure.message);
   return session;
 }
 
-void TestSynthetic(const strix::xdna2::XrtDeviceInfo& device) {
+void TestSynthetic(const gufo::xdna2::XrtDeviceInfo& device) {
   const auto session_count =
-      strix::xdna2::QwenMtpEhProjSession::ActiveSessionCountForDiagnostics();
+      gufo::xdna2::QwenMtpEhProjSession::ActiveSessionCountForDiagnostics();
   const auto bo_count =
-      strix::xdna2::QwenMtpEhProjSession::ActiveBoCountForDiagnostics();
+      gufo::xdna2::QwenMtpEhProjSession::ActiveBoCountForDiagnostics();
   const auto blocks = MakeIdentityWeights();
-  const strix::models::QwenTensorRef weights{
+  const gufo::models::QwenTensorRef weights{
       .data = blocks.data(),
-      .type = strix::core::GgmlType::kQ4_K,
-      .num_elements = strix::xdna2::kQwenMtpEhProjOutputElements *
-                      strix::xdna2::kQwenMtpEhProjInputElements,
+      .type = gufo::core::GgmlType::kQ4_K,
+      .num_elements = gufo::xdna2::kQwenMtpEhProjOutputElements *
+                      gufo::xdna2::kQwenMtpEhProjInputElements,
   };
   auto session = CreateSession(weights, device, "synthetic session");
   Expect(
-      strix::xdna2::QwenMtpEhProjSession::ActiveSessionCountForDiagnostics() ==
+      gufo::xdna2::QwenMtpEhProjSession::ActiveSessionCountForDiagnostics() ==
           session_count + 1,
       "session counter increments");
-  Expect(strix::xdna2::QwenMtpEhProjSession::ActiveBoCountForDiagnostics() ==
+  Expect(gufo::xdna2::QwenMtpEhProjSession::ActiveBoCountForDiagnostics() ==
              bo_count + 3,
          "BO counter increments");
 
   const auto input = MakeRepresentableInput();
-  std::vector<float> output(strix::xdna2::kQwenMtpEhProjOutputElements);
-  strix::xdna2::QwenMtpEhProjRunMetrics metrics;
-  strix::xdna2::QwenMtpEhProjFailure failure;
+  std::vector<float> output(gufo::xdna2::kQwenMtpEhProjOutputElements);
+  gufo::xdna2::QwenMtpEhProjRunMetrics metrics;
+  gufo::xdna2::QwenMtpEhProjFailure failure;
   for (std::size_t iteration = 0; iteration < 3; ++iteration) {
     Expect(session->Run(input, output, &metrics, &failure),
            failure.category + ": " + failure.message);
@@ -192,49 +192,48 @@ void TestSynthetic(const strix::xdna2::XrtDeviceInfo& device) {
             << " max_abs=" << max_absolute << '\n';
   session.reset();
   Expect(
-      strix::xdna2::QwenMtpEhProjSession::ActiveSessionCountForDiagnostics() ==
+      gufo::xdna2::QwenMtpEhProjSession::ActiveSessionCountForDiagnostics() ==
           session_count,
       "session counter returns to baseline");
-  Expect(strix::xdna2::QwenMtpEhProjSession::ActiveBoCountForDiagnostics() ==
+  Expect(gufo::xdna2::QwenMtpEhProjSession::ActiveBoCountForDiagnostics() ==
              bo_count,
          "BO counter returns to baseline");
 }
 
-void TestRealModel(const strix::xdna2::XrtDeviceInfo& device) {
-  const char* model_path = std::getenv("STRIX_MTP_MODEL");
+void TestRealModel(const gufo::xdna2::XrtDeviceInfo& device) {
+  const char* model_path = std::getenv("GUFO_MTP_MODEL");
   if (model_path == nullptr || std::string_view(model_path).empty()) {
     std::cout << "qwen_mtp_eh_proj_real: skipped "
-                 "(STRIX_MTP_MODEL not set)\n";
+                 "(GUFO_MTP_MODEL not set)\n";
     return;
   }
   std::string error;
-  auto reader_owner = strix::core::GgufReader::OpenFile(model_path, &error);
+  auto reader_owner = gufo::core::GgufReader::OpenFile(model_path, &error);
   Expect(reader_owner != nullptr, error);
-  std::shared_ptr<const strix::core::GgufReader> reader(
-      std::move(reader_owner));
+  std::shared_ptr<const gufo::core::GgufReader> reader(std::move(reader_owner));
   const auto weights =
-      strix::speculative::QwenMtpWeights::LoadFromGguf(*reader, &error);
+      gufo::speculative::QwenMtpWeights::LoadFromGguf(*reader, &error);
   Expect(weights.has_value(), error);
   auto session =
       CreateSession(weights->fusion_projection, device, "real model session");
 
   const auto input = MakeRepresentableInput();
-  std::vector<float> output(strix::xdna2::kQwenMtpEhProjOutputElements);
-  strix::xdna2::QwenMtpEhProjRunMetrics metrics;
-  strix::xdna2::QwenMtpEhProjFailure failure;
+  std::vector<float> output(gufo::xdna2::kQwenMtpEhProjOutputElements);
+  gufo::xdna2::QwenMtpEhProjRunMetrics metrics;
+  gufo::xdna2::QwenMtpEhProjFailure failure;
   Expect(session->Run(input, output, &metrics, &failure),
          failure.category + ": " + failure.message);
 
   std::vector<float> expected(output.size());
   const auto* rows =
       static_cast<const std::uint8_t*>(weights->fusion_projection.data);
-  const std::size_t row_bytes = strix::quant::QuantizedRowBytes(
-      weights->fusion_projection.type,
-      strix::xdna2::kQwenMtpEhProjInputElements);
+  const std::size_t row_bytes =
+      gufo::quant::QuantizedRowBytes(weights->fusion_projection.type,
+                                     gufo::xdna2::kQwenMtpEhProjInputElements);
   for (std::size_t row = 0; row < expected.size(); ++row) {
     expected[row] =
-        strix::quant::DotProductQ4_K(rows + (row * row_bytes), input,
-                                     strix::xdna2::kQwenMtpEhProjInputElements);
+        gufo::quant::DotProductQ4_K(rows + (row * row_bytes), input,
+                                    gufo::xdna2::kQwenMtpEhProjInputElements);
   }
   std::size_t nonfinite_output = 0;
   std::size_t nonfinite_expected = 0;
@@ -264,8 +263,8 @@ void TestRealModel(const strix::xdna2::XrtDeviceInfo& device) {
 
 int main() {
   try {
-    const auto inventory = strix::diagnostics::CollectSystemInventory();
-    const auto device = strix::xdna2::DiscoverXrtDevice(0, inventory);
+    const auto inventory = gufo::diagnostics::CollectSystemInventory();
+    const auto device = gufo::xdna2::DiscoverXrtDevice(0, inventory);
     Expect(device.available, device.error_category +
                                  ": detected=" + device.detected +
                                  " required=" + device.required);

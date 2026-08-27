@@ -8,7 +8,7 @@
 #include "src/models/qwen/hip/kernels/common.hip"
 #include "src/models/qwen/hip/ops/swiglu.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __launch_bounds__(256, 4) __global__ void FusedRMSNormSwiGLUGEMVKernel(
     const float* __restrict__ x, const float* __restrict__ norm_w, float eps,
@@ -145,5 +145,5 @@ void LaunchFusedRMSNormSwiGLUGEMV(const float* x, const float* norm_w,
       hidden_size);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -20,7 +20,7 @@
 
 namespace {
 
-using TokenId = strix::tokenization::TokenId;
+using TokenId = gufo::tokenization::TokenId;
 
 void Expect(bool condition, std::string_view message) {
   if (!condition) {
@@ -28,10 +28,10 @@ void Expect(bool condition, std::string_view message) {
   }
 }
 
-std::vector<TokenId> GenerateDirect(strix::hip::QwenGpuExecutor& executor,
+std::vector<TokenId> GenerateDirect(gufo::hip::QwenGpuExecutor& executor,
                                     std::span<const TokenId> prompt_tokens,
                                     std::size_t max_tokens) {
-  strix::models::GenerationOptions options;
+  gufo::models::GenerationOptions options;
   options.max_new_tokens = max_tokens;
   options.temperature = 0.0F;
   return executor.Generate(prompt_tokens, options);
@@ -53,20 +53,20 @@ int main(int argc, const char* const* argv) {
     }
 
     std::string error;
-    auto reader_owner = strix::core::GgufReader::OpenFile(argv[1], &error);
+    auto reader_owner = gufo::core::GgufReader::OpenFile(argv[1], &error);
     Expect(reader_owner != nullptr, error);
-    const std::shared_ptr<const strix::core::GgufReader> reader(
+    const std::shared_ptr<const gufo::core::GgufReader> reader(
         std::move(reader_owner));
-    auto model = strix::hip::QwenGpuModel::CreateFromGguf(reader, &error);
+    auto model = gufo::hip::QwenGpuModel::CreateFromGguf(reader, &error);
     Expect(model != nullptr, error);
     Expect(model->GetWeightRegionCount() == reader->GetMappedRegions().size(),
            "every mapped GGUF shard must have one shared GPU region");
 
     constexpr std::uint32_t context = 256;
-    auto direct = strix::hip::QwenGpuExecutor::Create(model, &error, context);
+    auto direct = gufo::hip::QwenGpuExecutor::Create(model, &error, context);
     Expect(direct != nullptr, error);
 
-    strix::server::InferenceBackend backend;
+    gufo::server::InferenceBackend backend;
     Expect(backend.load(model, &error, context, 2), error);
     Expect(backend.model_id() == model->GetConfig().model_name,
            "HTTP model identifier");
@@ -76,7 +76,7 @@ int main(int argc, const char* const* argv) {
 
     {
       auto snapshot_source =
-          strix::hip::QwenGpuExecutor::Create(model, &error, context);
+          gufo::hip::QwenGpuExecutor::Create(model, &error, context);
       Expect(snapshot_source != nullptr, error);
       const auto frontier =
           snapshot_source->ForwardPromptBatch(raw_prompt_tokens);
@@ -88,7 +88,7 @@ int main(int argc, const char* const* argv) {
           frontier, static_cast<std::uint32_t>(raw_prompt_tokens.size()));
 
       for (int fork_index = 0; fork_index < 2; ++fork_index) {
-        auto fork = strix::hip::QwenGpuExecutor::Create(model, &error, context);
+        auto fork = gufo::hip::QwenGpuExecutor::Create(model, &error, context);
         Expect(fork != nullptr, error);
         fork->RestoreSnapshot(*snapshot);
         const auto forked = fork->ForwardToken(
@@ -106,14 +106,14 @@ int main(int argc, const char* const* argv) {
            "raw HTTP text must decode the exact generated tokens");
     Expect(http_raw.ttft_ms > 0.0, "raw HTTP TTFT must be reported");
 
-    const std::vector<strix::tokenization::ChatMessage> messages = {
-        {strix::tokenization::ChatRole::kSystem,
+    const std::vector<gufo::tokenization::ChatMessage> messages = {
+        {gufo::tokenization::ChatRole::kSystem,
          "Answer with one short sentence.", "", ""},
-        {strix::tokenization::ChatRole::kUser, "Name one primary color.", "",
+        {gufo::tokenization::ChatRole::kUser, "Name one primary color.", "",
          ""},
     };
     const auto rendered_chat =
-        strix::tokenization::QwenChatTemplate::Render(messages);
+        gufo::tokenization::QwenChatTemplate::Render(messages);
     Expect(rendered_chat.has_value() && !rendered_chat->empty(),
            "CLI chat prompt rendering");
     const auto chat_prompt = model->GetTokenizer().Encode(*rendered_chat);
@@ -124,12 +124,12 @@ int main(int argc, const char* const* argv) {
     Expect(!http_chat.cache_hit, "first chat request must be a cache miss");
 
     auto continued_messages = messages;
-    continued_messages.emplace_back(strix::tokenization::ChatRole::kAssistant,
+    continued_messages.emplace_back(gufo::tokenization::ChatRole::kAssistant,
                                     http_chat.text);
-    continued_messages.emplace_back(strix::tokenization::ChatRole::kUser,
+    continued_messages.emplace_back(gufo::tokenization::ChatRole::kUser,
                                     "Name a different primary color.");
     const auto rendered_continuation =
-        strix::tokenization::QwenChatTemplate::Render(continued_messages);
+        gufo::tokenization::QwenChatTemplate::Render(continued_messages);
     Expect(rendered_continuation.has_value(),
            "continued chat prompt rendering");
     const auto continuation_prompt =
@@ -148,20 +148,20 @@ int main(int argc, const char* const* argv) {
     Expect(http_continuation.tokens == direct_continuation,
            "cached Qwen continuation differs from cold full prefill");
 
-    strix::server::ChatRequest concurrent_a({
-        {strix::tokenization::ChatRole::kUser,
+    gufo::server::ChatRequest concurrent_a({
+        {gufo::tokenization::ChatRole::kUser,
          "Continue this sequence with a few words: one, two, three,", "", ""},
     });
     concurrent_a.client_id = "batch-a";
-    strix::server::ChatRequest concurrent_b({
-        {strix::tokenization::ChatRole::kUser,
+    gufo::server::ChatRequest concurrent_b({
+        {gufo::tokenization::ChatRole::kUser,
          "Complete this phrase with a few words: red, green, blue,", "", ""},
     });
     concurrent_b.client_id = "batch-b";
     const auto rendered_a =
-        strix::tokenization::QwenChatTemplate::Render(concurrent_a.messages);
+        gufo::tokenization::QwenChatTemplate::Render(concurrent_a.messages);
     const auto rendered_b =
-        strix::tokenization::QwenChatTemplate::Render(concurrent_b.messages);
+        gufo::tokenization::QwenChatTemplate::Render(concurrent_b.messages);
     Expect(rendered_a.has_value() && rendered_b.has_value(),
            "concurrent chat prompt rendering");
     const auto direct_a =

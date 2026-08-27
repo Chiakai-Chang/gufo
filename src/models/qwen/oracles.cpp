@@ -5,7 +5,7 @@
 #include <cstddef>
 #include <span>
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 void ReferenceRMSNorm(std::span<const float> x, std::span<const float> weight,
                       float eps, std::span<float> out) noexcept {
@@ -95,4 +95,4 @@ void ReferenceGEMV(std::span<const float> matrix, std::span<const float> x,
   }
 }
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen

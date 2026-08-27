@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_LOADER_HPP_
-#define STRIX_MODELS_QWEN3_TTS_LOADER_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_LOADER_HPP_
+#define GUFO_MODELS_QWEN3_TTS_LOADER_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -10,7 +10,7 @@
 #include "src/models/qwen3_tts/config.hpp"
 #include "src/models/qwen3_tts/tensor.hpp"
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 
 struct MappedRegion {
   const std::byte* data = nullptr;
@@ -44,6 +44,6 @@ struct LoadResult {
 /// True if `model_dir/config.json` is a supported 1.7B Qwen3-TTS variant.
 [[nodiscard]] bool LooksLikeQwen3Tts(const std::string& model_dir);
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts
 
-#endif  // STRIX_MODELS_QWEN3_TTS_LOADER_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_LOADER_HPP_

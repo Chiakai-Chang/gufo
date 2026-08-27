@@ -18,7 +18,7 @@
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/forward.hpp"
 
-namespace strix::speculative {
+namespace gufo::speculative {
 namespace {
 
 models::QwenTensorRef TensorRef(const core::GgufReader& reader,
@@ -324,7 +324,7 @@ std::optional<QwenDFlashWeights> QwenDFlashWeights::LoadFromGguf(
   }
 
   // GGUF target_layers are layer-input indices (the convention used by the
-  // converter). Strix taps layer outputs, so normalize N to zero-based N - 1.
+  // converter). Gufo taps layer outputs, so normalize N to zero-based N - 1.
   const auto encoded_target_layers =
       GetNonnegativeIntegerArray(reader, prefix + "target_layers");
   if (!encoded_target_layers.has_value()) {
@@ -1068,4 +1068,4 @@ std::vector<tokenization::TokenId> QwenDFlashReference::ForwardBlock(
   return tokens;
 }
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative

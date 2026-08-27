@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_SPECULATIVE_PROMPT_LOOKUP_BACKEND_HPP_
-#define STRIX_CORE_SPECULATIVE_PROMPT_LOOKUP_BACKEND_HPP_
+#ifndef GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_BACKEND_HPP_
+#define GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_BACKEND_HPP_
 
 #include <cstdint>
 #include <span>
@@ -8,7 +8,7 @@
 
 #include "src/core/speculative/draft_backend.hpp"
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 struct PromptLookupConfig {
   std::size_t max_ngram_size{3};
@@ -41,6 +41,6 @@ private:
   std::size_t fallbacks_{0};
 };
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative
 
-#endif  // STRIX_CORE_SPECULATIVE_PROMPT_LOOKUP_BACKEND_HPP_
+#endif  // GUFO_CORE_SPECULATIVE_PROMPT_LOOKUP_BACKEND_HPP_

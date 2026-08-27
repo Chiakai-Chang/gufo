@@ -8,7 +8,7 @@
 #include <stdexcept>
 #include <utility>
 
-namespace strix::server {
+namespace gufo::server {
 
 namespace {
 
@@ -213,4 +213,4 @@ void ContinuationCache::Invalidate(std::size_t index) noexcept {
   impl_->condition.notify_one();
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

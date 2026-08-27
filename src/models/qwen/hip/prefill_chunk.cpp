@@ -14,11 +14,11 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 [[nodiscard]] bool UseDirectSmallBatchQuantGemm() noexcept {
-  const char* value = std::getenv("STRIX_PREFILL_SMALL_BATCH_QUANT");
+  const char* value = std::getenv("GUFO_PREFILL_SMALL_BATCH_QUANT");
   if (value == nullptr) {
     return false;
   }
@@ -27,7 +27,7 @@ namespace {
 }
 
 [[nodiscard]] bool UseBf16SmallBatchQuantGemm() noexcept {
-  const char* value = std::getenv("STRIX_PREFILL_SMALL_BATCH_QUANT");
+  const char* value = std::getenv("GUFO_PREFILL_SMALL_BATCH_QUANT");
   return value != nullptr && std::string_view{value} == "bf16";
 }
 
@@ -47,23 +47,23 @@ namespace {
 
 [[nodiscard]] int Bf16SmallBatchStartLayer() noexcept {
   static const int start_layer =
-      SmallBatchStartLayer("STRIX_PREFILL_SMALL_BATCH_BF16_FROM_LAYER");
+      SmallBatchStartLayer("GUFO_PREFILL_SMALL_BATCH_BF16_FROM_LAYER");
   return start_layer;
 }
 
 [[nodiscard]] bool UseFp32SmallBatchQuantGemm() noexcept {
-  const char* value = std::getenv("STRIX_PREFILL_SMALL_BATCH_QUANT");
+  const char* value = std::getenv("GUFO_PREFILL_SMALL_BATCH_QUANT");
   return value != nullptr && std::string_view{value} == "fp32";
 }
 
 [[nodiscard]] int Fp32SmallBatchStartLayer() noexcept {
   static const int start_layer =
-      SmallBatchStartLayer("STRIX_PREFILL_SMALL_BATCH_FP32_FROM_LAYER");
+      SmallBatchStartLayer("GUFO_PREFILL_SMALL_BATCH_FP32_FROM_LAYER");
   return start_layer;
 }
 
 [[nodiscard]] bool UseBatchedVerificationLmHead(bool fallback) noexcept {
-  const char* value = std::getenv("STRIX_SPEC_BATCH_LM_HEAD");
+  const char* value = std::getenv("GUFO_SPEC_BATCH_LM_HEAD");
   if (value == nullptr) {
     return fallback;
   }
@@ -118,7 +118,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       scratch.decode.prompt_tokens.data(), scratch.decode.hidden.data(),
       batch_size, hidden_size, arena_.stream);
 
-  const bool do_profile = (std::getenv("STRIX_PROFILE") != nullptr);
+  const bool do_profile = (std::getenv("GUFO_PROFILE") != nullptr);
   auto t_start = std::chrono::high_resolution_clock::now();
   double time_attn_proj = 0, time_ssm_recur = 0, time_ssm_out = 0;
   double time_ffn = 0, time_norm = 0;
@@ -590,7 +590,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // norms and gates into two tiny prologue kernels lets the 128 rows of a
       // head spread over 16 waves instead of being pinned to one block behind
       // four barriers per token. The previous single-block kernel stays wired
-      // as the reference and is selectable with STRIX_SSM_RECURRENCE=baseline.
+      // as the reference and is selectable with GUFO_SSM_RECURRENCE=baseline.
       // opt-c174-ssm-epilogue-quant: the gated SSM row feeds only the Q8_0
       // ssm_out projection, so the epilogue can emit the quantized activation
       // and skip the FP32 round trip.
@@ -798,7 +798,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     auto t_end = std::chrono::high_resolution_clock::now();
     double total_ms =
         std::chrono::duration<double, std::milli>(t_end - t_start).count();
-    std::cout << "\n[STRIX_PROFILE B=" << batch_size << "] Total: " << total_ms
+    std::cout << "\n[GUFO_PROFILE B=" << batch_size << "] Total: " << total_ms
               << " ms (" << (batch_size / (total_ms / 1000.0)) << " tok/s)\n"
               << "  - Norms:      " << time_norm << " ms\n"
               << "  - Input Proj: " << time_attn_proj << " ms\n"
@@ -991,5 +991,5 @@ void QwenGpuExecutor::CommitVerificationChunk(
   capture_prompt_hidden_ = capture_hidden;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

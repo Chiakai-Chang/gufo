@@ -1,5 +1,5 @@
 {
-  "schema": "strix.suite.v1",
+  "schema": "gufo.suite.v1",
   "model": "Qwen/Qwen3.5-0.8B",
   "prompts": [
     "Write a haiku about autumn leaves falling in a city park.",

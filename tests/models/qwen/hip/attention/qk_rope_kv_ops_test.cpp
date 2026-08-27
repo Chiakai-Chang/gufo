@@ -125,28 +125,28 @@ void TestFusedQKNormRoPEKvWriteEquivalence() {
   HIP_CHECK(hipMemset(d_vc16_fus, 0, f16_cache_elems * sizeof(std::uint16_t)));
 
   // Unfused reference chain
-  strix::hip::LaunchPerHeadRMSNorm(d_q_ref, d_wq, d_q_ref, num_heads, head_dim,
-                                   eps);
-  strix::hip::LaunchPerHeadRMSNorm(d_k_ref, d_wk, d_k_ref, num_kv_heads,
-                                   head_dim, eps);
-  strix::hip::LaunchRoPE(d_q_ref, d_k_ref, num_heads, num_kv_heads, head_dim,
-                         rotary_dim, d_pos, rope_theta);
-  strix::hip::LaunchAttention(d_q_ref, d_k_ref, d_v_ref, d_gate, d_kc_ref,
-                              d_vc_ref, d_kc16_ref, d_vc16_ref, d_out_ref,
-                              layer_idx, d_pos, max_context, num_heads,
-                              num_kv_heads, head_dim, nullptr,
-                              /*skip_kv_write=*/false);
+  gufo::hip::LaunchPerHeadRMSNorm(d_q_ref, d_wq, d_q_ref, num_heads, head_dim,
+                                  eps);
+  gufo::hip::LaunchPerHeadRMSNorm(d_k_ref, d_wk, d_k_ref, num_kv_heads,
+                                  head_dim, eps);
+  gufo::hip::LaunchRoPE(d_q_ref, d_k_ref, num_heads, num_kv_heads, head_dim,
+                        rotary_dim, d_pos, rope_theta);
+  gufo::hip::LaunchAttention(d_q_ref, d_k_ref, d_v_ref, d_gate, d_kc_ref,
+                             d_vc_ref, d_kc16_ref, d_vc16_ref, d_out_ref,
+                             layer_idx, d_pos, max_context, num_heads,
+                             num_kv_heads, head_dim, nullptr,
+                             /*skip_kv_write=*/false);
 
   // Fused chain
-  strix::hip::LaunchFusedQKNormRoPEKvWrite(
+  gufo::hip::LaunchFusedQKNormRoPEKvWrite(
       d_q_fus, d_k_fus, d_v_fus, d_wq, d_wk, d_q_fus, d_k_fus, d_kc_fus,
       d_vc_fus, d_kc16_fus, d_vc16_fus, layer_idx, d_pos, max_context,
       num_heads, num_kv_heads, head_dim, rotary_dim, rope_theta, eps);
-  strix::hip::LaunchAttention(d_q_fus, d_k_fus, d_v_fus, d_gate, d_kc_fus,
-                              d_vc_fus, d_kc16_fus, d_vc16_fus, d_out_fus,
-                              layer_idx, d_pos, max_context, num_heads,
-                              num_kv_heads, head_dim, nullptr,
-                              /*skip_kv_write=*/true);
+  gufo::hip::LaunchAttention(d_q_fus, d_k_fus, d_v_fus, d_gate, d_kc_fus,
+                             d_vc_fus, d_kc16_fus, d_vc16_fus, d_out_fus,
+                             layer_idx, d_pos, max_context, num_heads,
+                             num_kv_heads, head_dim, nullptr,
+                             /*skip_kv_write=*/true);
 
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -352,17 +352,17 @@ void TestBatchedFusedQKNormRoPEKvWriteEquivalence() {
 
   // Per-token unfused reference chain
   for (std::size_t t = 0; t < batch; ++t) {
-    strix::hip::LaunchPerHeadRMSNorm(d_q_ref + t * head_total, d_wq,
-                                     d_q_ref + t * head_total, num_heads,
-                                     head_dim, eps);
-    strix::hip::LaunchPerHeadRMSNorm(d_k_ref + t * kv_total, d_wk,
-                                     d_k_ref + t * kv_total, num_kv_heads,
-                                     head_dim, eps);
-    strix::hip::LaunchRoPE(d_q_ref + t * head_total, d_k_ref + t * kv_total,
-                           num_heads, num_kv_heads, head_dim, rotary_dim,
-                           static_cast<std::uint32_t>(start_pos + t),
-                           rope_theta);
-    strix::hip::LaunchAttention(
+    gufo::hip::LaunchPerHeadRMSNorm(d_q_ref + t * head_total, d_wq,
+                                    d_q_ref + t * head_total, num_heads,
+                                    head_dim, eps);
+    gufo::hip::LaunchPerHeadRMSNorm(d_k_ref + t * kv_total, d_wk,
+                                    d_k_ref + t * kv_total, num_kv_heads,
+                                    head_dim, eps);
+    gufo::hip::LaunchRoPE(d_q_ref + t * head_total, d_k_ref + t * kv_total,
+                          num_heads, num_kv_heads, head_dim, rotary_dim,
+                          static_cast<std::uint32_t>(start_pos + t),
+                          rope_theta);
+    gufo::hip::LaunchAttention(
         d_q_ref + t * head_total, d_k_ref + t * kv_total,
         d_v_ref + t * kv_total, d_gate + t * head_total, d_kc_ref, d_vc_ref,
         d_kc16_ref, d_vc16_ref, d_out_ref + t * head_total, layer_idx,
@@ -371,16 +371,16 @@ void TestBatchedFusedQKNormRoPEKvWriteEquivalence() {
   }
 
   // Batched fused chain
-  strix::hip::LaunchBatchedFusedQKNormRoPEKvWrite(
+  gufo::hip::LaunchBatchedFusedQKNormRoPEKvWrite(
       d_q_fus, d_k_fus, d_v_fus, d_wq, d_wk, d_q_fus, d_k_fus, d_kc_fus,
       d_vc_fus, d_kc16_fus, d_vc16_fus, layer_idx, start_pos, batch,
       max_context, num_heads, num_kv_heads, head_dim, rotary_dim, rope_theta,
       eps);
-  strix::hip::LaunchBatchedAttention(
-      d_q_fus, d_k_fus, d_v_fus, d_gate, d_kc_fus, d_vc_fus, d_kc16_fus,
-      d_vc16_fus, d_out_fus, layer_idx, start_pos, batch, max_context,
-      num_heads, num_kv_heads, head_dim, nullptr,
-      /*skip_kv_write=*/true);
+  gufo::hip::LaunchBatchedAttention(d_q_fus, d_k_fus, d_v_fus, d_gate, d_kc_fus,
+                                    d_vc_fus, d_kc16_fus, d_vc16_fus, d_out_fus,
+                                    layer_idx, start_pos, batch, max_context,
+                                    num_heads, num_kv_heads, head_dim, nullptr,
+                                    /*skip_kv_write=*/true);
 
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -493,9 +493,9 @@ void TestBatchedFusedQKNormRoPEKvWriteEquivalence() {
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen QK/RoPE/KV fusion ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen QK/RoPE/KV fusion ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

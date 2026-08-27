@@ -86,7 +86,7 @@ def short(name: str) -> str:
     if not name or not name.strip():
         return "<unnamed: internal-linkage kernel>"
     name = name.split("(")[0]
-    for prefix in ("void ", "strix::hip::", "strix::"):
+    for prefix in ("void ", "gufo::hip::", "gufo::"):
         name = name.replace(prefix, "")
     return name
 

@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_OPS_SSM_HPP_
-#define STRIX_MODELS_QWEN_HIP_OPS_SSM_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_OPS_SSM_HPP_
+#define GUFO_MODELS_QWEN_HIP_OPS_SSM_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-namespace strix::hip {
+namespace gufo::hip {
 
 inline constexpr std::size_t kSsmReplayCapacity = 16;
 
@@ -112,8 +112,8 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
     hipStream_t stream = nullptr);
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_OPS_SSM_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_OPS_SSM_HPP_

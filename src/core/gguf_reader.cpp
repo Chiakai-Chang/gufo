@@ -21,7 +21,7 @@
 #include <variant>
 #include <vector>
 
-namespace strix::core {
+namespace gufo::core {
 
 namespace {
 
@@ -838,4 +838,4 @@ std::optional<ModelConfig> GgufReader::ExtractModelConfig(
   return config;
 }
 
-}  // namespace strix::core
+}  // namespace gufo::core

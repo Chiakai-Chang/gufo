@@ -37,7 +37,7 @@
 #include "src/core/hip/hip_utils.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 namespace {
 
 // One thread per (token, query head, dim) element.
@@ -190,5 +190,5 @@ void LaunchMergeSplitAttention(const void* out_prefix, const float* lse_prefix,
       gate, out, batch_size, num_heads, head_dim);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

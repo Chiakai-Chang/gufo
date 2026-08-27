@@ -1,10 +1,10 @@
-#ifndef STRIX_SERVER_LOGGING_HPP_
-#define STRIX_SERVER_LOGGING_HPP_
+#ifndef GUFO_SERVER_LOGGING_HPP_
+#define GUFO_SERVER_LOGGING_HPP_
 
 #include <cstdint>
 #include <string_view>
 
-namespace strix::server {
+namespace gufo::server {
 
 enum class LogLevel : std::uint8_t {
   kInfo,
@@ -40,6 +40,6 @@ public:
   }
 };
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_LOGGING_HPP_
+#endif  // GUFO_SERVER_LOGGING_HPP_

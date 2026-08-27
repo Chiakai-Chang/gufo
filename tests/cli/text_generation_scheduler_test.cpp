@@ -19,26 +19,26 @@
 
 namespace {
 
-using strix::server::ChatRequest;
-using strix::server::TextDecodeSelection;
-using strix::server::TextExecutionPlan;
-using strix::server::TextExecutionPlanKind;
-using strix::server::TextGenerationError;
-using strix::server::TextGenerationErrorCode;
-using strix::server::TextGenerationScheduler;
-using strix::server::TextModelRunner;
-using strix::server::TextPrefillPolicy;
-using strix::server::TextPrefillStep;
-using strix::server::TextRequestMetadata;
-using strix::server::TextRequestPhase;
-using strix::server::TextRunnerAdvance;
-using strix::server::TextRunnerCapabilities;
-using strix::server::TextRunnerDescriptor;
-using strix::server::TextRunnerPool;
-using strix::server::TextRunnerResourceClaim;
-using strix::server::TextRunnerState;
-using strix::server::TextRunnerToken;
-using strix::server::TextSchedulerPolicy;
+using gufo::server::ChatRequest;
+using gufo::server::TextDecodeSelection;
+using gufo::server::TextExecutionPlan;
+using gufo::server::TextExecutionPlanKind;
+using gufo::server::TextGenerationError;
+using gufo::server::TextGenerationErrorCode;
+using gufo::server::TextGenerationScheduler;
+using gufo::server::TextModelRunner;
+using gufo::server::TextPrefillPolicy;
+using gufo::server::TextPrefillStep;
+using gufo::server::TextRequestMetadata;
+using gufo::server::TextRequestPhase;
+using gufo::server::TextRunnerAdvance;
+using gufo::server::TextRunnerCapabilities;
+using gufo::server::TextRunnerDescriptor;
+using gufo::server::TextRunnerPool;
+using gufo::server::TextRunnerResourceClaim;
+using gufo::server::TextRunnerState;
+using gufo::server::TextRunnerToken;
+using gufo::server::TextSchedulerPolicy;
 
 constexpr auto kTestTimeout = std::chrono::seconds{5};
 

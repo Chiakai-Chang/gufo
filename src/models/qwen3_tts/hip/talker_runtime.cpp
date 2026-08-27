@@ -32,7 +32,7 @@
 #include "src/models/qwen3_tts/hip/talker_ops.hpp"
 #include "src/models/qwen3_tts/loader.hpp"
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 namespace {
 
 void SetError(std::string* error, std::string message) {
@@ -122,7 +122,7 @@ enum class WeightMode {
 };
 
 WeightMode GetWeightMode() {
-  const char* value = std::getenv("STRIX_QWEN3_TTS_WEIGHT_MODE");
+  const char* value = std::getenv("GUFO_QWEN3_TTS_WEIGHT_MODE");
   if (value == nullptr) {
     return WeightMode::kAuto;
   }
@@ -653,8 +653,8 @@ struct TalkerHipRuntime::Impl {
                            columns, stream)) {
       return;
     }
-    strix::hip::LaunchHipblasGEMMBF16(blas, weights, inputs_bfloat16, output,
-                                      batch, rows, columns, stream);
+    gufo::hip::LaunchHipblasGEMMBF16(blas, weights, inputs_bfloat16, output,
+                                     batch, rows, columns, stream);
   }
 
   /// Runs projections that share one input. The grouped GEMV produces the same
@@ -705,9 +705,9 @@ struct TalkerHipRuntime::Impl {
   void RmsNormToBfloat16(const float* input, const float* weight,
                          std::size_t batch_size, std::size_t dimension,
                          float epsilon) {
-    strix::hip::LaunchBatchedRMSNorm(input, weight, normalized.get(),
-                                     bfloat16_scratch.get(), batch_size,
-                                     dimension, epsilon, stream);
+    gufo::hip::LaunchBatchedRMSNorm(input, weight, normalized.get(),
+                                    bfloat16_scratch.get(), batch_size,
+                                    dimension, epsilon, stream);
   }
 
   /// Folds a residual add into the RMSNorm that always follows it. The float
@@ -739,11 +739,11 @@ struct TalkerHipRuntime::Impl {
                               token_ids.size() * sizeof(std::uint32_t),
                               hipMemcpyHostToDevice, stream),
                "hipMemcpyAsync text token ids");
-    strix::hip::LaunchBatchedEmbeddingLookup(
+    gufo::hip::LaunchBatchedEmbeddingLookup(
         text_embedding, core::GgmlType::kBF16, prompt_ids.get(), hidden.get(),
         token_ids.size(), config.text_hidden_size, stream);
-    strix::hip::LaunchFloatToBfloat16(hidden.get(), bfloat16_scratch.get(),
-                                      elements, stream);
+    gufo::hip::LaunchFloatToBfloat16(hidden.get(), bfloat16_scratch.get(),
+                                     elements, stream);
     Gemm(text_projection_fc1, bfloat16_scratch.get(), normalized.get(),
          token_ids.size(), config.text_hidden_size, config.text_hidden_size);
     LaunchBfloat16BiasSilu(normalized.get(), text_projection_fc1_bias,
@@ -780,7 +780,7 @@ struct TalkerHipRuntime::Impl {
                               token_ids.size() * sizeof(std::uint32_t),
                               hipMemcpyHostToDevice, stream),
                "hipMemcpyAsync codec token ids");
-    strix::hip::LaunchBatchedEmbeddingLookup(
+    gufo::hip::LaunchBatchedEmbeddingLookup(
         codec_embedding, core::GgmlType::kBF16, prompt_ids.get(), hidden.get(),
         token_ids.size(), config.hidden_size, stream);
     std::vector<float> result(token_ids.size() * config.hidden_size);
@@ -799,8 +799,8 @@ struct TalkerHipRuntime::Impl {
     if (rows == 0 || rows > talker.num_code_groups) {
       throw std::length_error("Qwen3-TTS predictor input shape is invalid");
     }
-    strix::hip::LaunchFloatToBfloat16(input, bfloat16_scratch.get(),
-                                      rows * talker.hidden_size, stream);
+    gufo::hip::LaunchFloatToBfloat16(input, bfloat16_scratch.get(),
+                                     rows * talker.hidden_size, stream);
     Gemm(predictor_projection, bfloat16_scratch.get(), hidden.get(), rows,
          predictor.hidden_size, talker.hidden_size);
     LaunchBfloat16Bias(hidden.get(), predictor_projection_bias, hidden.get(),
@@ -839,7 +839,7 @@ struct TalkerHipRuntime::Impl {
             config.num_key_value_heads, config.head_dim, start_position,
             config.rope_theta, config.rms_norm_eps, predictor_key_cache.get(),
             predictor_value_cache.get(), layer, context);
-        strix::hip::LaunchBatchedAttention(
+        gufo::hip::LaunchBatchedAttention(
             q.get(), k.get(), v.get(), nullptr, predictor_key_cache.get(),
             predictor_value_cache.get(), nullptr, nullptr, attention.get(),
             static_cast<std::uint32_t>(layer), start_position, tokens,
@@ -902,8 +902,8 @@ struct TalkerHipRuntime::Impl {
       return SelectTopKCode(candidate_scratch, predictor_top_k,
                             predictor_temperature, sampling_rng);
     }
-    strix::hip::LaunchGPUArgmax(logits.get(), predictor_token.get(),
-                                config.vocab_size, stream);
+    gufo::hip::LaunchGPUArgmax(logits.get(), predictor_token.get(),
+                               config.vocab_size, stream);
     std::uint32_t token = 0;
     RequireHip(hipMemcpyAsync(&token, predictor_token.get(), sizeof(token),
                               hipMemcpyDeviceToHost, stream),
@@ -940,7 +940,7 @@ struct TalkerHipRuntime::Impl {
           static_cast<std::uint32_t>(talker_cache_tokens), config.rope_theta,
           config.rms_norm_eps, key_cache.get(), value_cache.get(), layer,
           maximum_tokens);
-      strix::hip::LaunchBatchedAttention(
+      gufo::hip::LaunchBatchedAttention(
           q.get(), k.get(), v.get(), nullptr, key_cache.get(),
           value_cache.get(), nullptr, nullptr, attention.get(),
           static_cast<std::uint32_t>(layer),
@@ -1183,7 +1183,7 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
           config.head_dim, 0, config.rope_theta, config.rms_norm_eps,
           impl_->key_cache.get(), impl_->value_cache.get(), layer,
           impl_->maximum_tokens);
-      strix::hip::LaunchBatchedAttention(
+      gufo::hip::LaunchBatchedAttention(
           impl_->q.get(), impl_->k.get(), impl_->v.get(), nullptr,
           impl_->key_cache.get(), impl_->value_cache.get(), nullptr, nullptr,
           impl_->attention.get(), static_cast<std::uint32_t>(layer), 0, tokens,
@@ -1577,7 +1577,7 @@ bool TalkerHipRuntime::PredictFrame(std::span<const float> talker_hidden,
                        talker.hidden_size * sizeof(float),
                        hipMemcpyHostToDevice, impl_->stream),
         "hipMemcpyAsync predictor talker hidden");
-    strix::hip::LaunchEmbeddingLookup(
+    gufo::hip::LaunchEmbeddingLookup(
         impl_->codec_embedding, core::GgmlType::kBF16, first_code,
         impl_->attention_output.get() + talker.hidden_size, talker.hidden_size,
         impl_->stream);
@@ -1600,7 +1600,7 @@ bool TalkerHipRuntime::PredictFrame(std::span<const float> talker_hidden,
     }
     output->codes.push_back(code);
     for (std::size_t head = 1; head < impl_->predictor_heads.size(); ++head) {
-      strix::hip::LaunchEmbeddingLookup(
+      gufo::hip::LaunchEmbeddingLookup(
           impl_->predictor_embeddings[head - 1], core::GgmlType::kBF16, code,
           impl_->attention_output.get(), talker.hidden_size, impl_->stream);
       impl_->ProjectPredictorInput(impl_->attention_output.get(), 1);
@@ -1799,11 +1799,11 @@ bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
   }
 }
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
 #else
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 
 struct TalkerHipRuntime::Impl {};
 
@@ -1918,6 +1918,6 @@ bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput&, std::size_t,
   return false;
 }
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -20,7 +20,7 @@
 
 #include "src/models/qwen3_tts/json.hpp"
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 namespace {
 
 constexpr char kPairSeparator = '\0';
@@ -573,4 +573,4 @@ bool Tokenizer::EncodeReferencePrompt(std::string_view text,
   return Encode(prompt, ids, error);
 }
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts

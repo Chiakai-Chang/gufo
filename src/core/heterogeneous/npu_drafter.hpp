@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_HETEROGENEOUS_NPU_DRAFTER_HPP_
-#define STRIX_CORE_HETEROGENEOUS_NPU_DRAFTER_HPP_
+#ifndef GUFO_CORE_HETEROGENEOUS_NPU_DRAFTER_HPP_
+#define GUFO_CORE_HETEROGENEOUS_NPU_DRAFTER_HPP_
 
 #include <cstdint>
 #include <memory>
@@ -17,7 +17,7 @@
 #include <xrt/xrt_device.h>
 #endif
 
-namespace strix::heterogeneous {
+namespace gufo::heterogeneous {
 
 struct NpuDrafterConfig {
   std::string mtp_model_path{
@@ -72,6 +72,6 @@ private:
   std::vector<tokenization::TokenId> history_;
 };
 
-}  // namespace strix::heterogeneous
+}  // namespace gufo::heterogeneous
 
-#endif  // STRIX_CORE_HETEROGENEOUS_NPU_DRAFTER_HPP_
+#endif  // GUFO_CORE_HETEROGENEOUS_NPU_DRAFTER_HPP_

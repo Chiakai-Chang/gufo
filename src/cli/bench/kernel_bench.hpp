@@ -1,12 +1,12 @@
-#ifndef STRIX_BENCH_KERNEL_BENCH_HPP_
-#define STRIX_BENCH_KERNEL_BENCH_HPP_
+#ifndef GUFO_BENCH_KERNEL_BENCH_HPP_
+#define GUFO_BENCH_KERNEL_BENCH_HPP_
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace strix::bench {
+namespace gufo::bench {
 
 struct KernelBenchOptions {
   std::uint32_t warmup{3};
@@ -90,6 +90,6 @@ struct KernelBenchReport {
 [[nodiscard]] KernelBenchStatistics ComputeKernelBenchStatistics(
     const std::vector<double>& samples_us);
 
-}  // namespace strix::bench
+}  // namespace gufo::bench
 
-#endif  // STRIX_BENCH_KERNEL_BENCH_HPP_
+#endif  // GUFO_BENCH_KERNEL_BENCH_HPP_

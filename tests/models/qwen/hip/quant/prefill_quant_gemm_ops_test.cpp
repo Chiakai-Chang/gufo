@@ -225,8 +225,8 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   // values, not the original fp32 ones.
   std::vector<std::uint16_t> h_x_bf16(h_x.size());
   for (std::size_t i = 0; i < h_x.size(); ++i) {
-    h_x_bf16[i] = strix::test::FloatToBf16Bits(h_x[i]);
-    h_x[i] = strix::test::Bf16BitsToFloat(h_x_bf16[i]);
+    h_x_bf16[i] = gufo::test::FloatToBf16Bits(h_x[i]);
+    h_x[i] = gufo::test::Bf16BitsToFloat(h_x_bf16[i]);
   }
 
   void* d_w = nullptr;
@@ -252,7 +252,7 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   HIP_CHECK(hipMemset(d_y, 0, batch * m * sizeof(float)));
   HIP_CHECK(hipMemset(d_y2, 0, batch * m * sizeof(float)));
 
-  strix::hip::LaunchQuantizeActivationQ8_1(d_x_bf16, d_q8, batch, k);
+  gufo::hip::LaunchQuantizeActivationQ8_1(d_x_bf16, d_q8, batch, k);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<std::uint8_t> h_q8(q8_bytes);
@@ -285,11 +285,11 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   }
 
   if (dual) {
-    strix::hip::LaunchBatchedDualQuantGEMMPreQuantized(
-        strix::core::GgmlType::kQ8_0, d_w, d_w2, d_q8, d_y, d_y2, batch, m, k);
+    gufo::hip::LaunchBatchedDualQuantGEMMPreQuantized(
+        gufo::core::GgmlType::kQ8_0, d_w, d_w2, d_q8, d_y, d_y2, batch, m, k);
   } else {
-    strix::hip::LaunchBatchedQuantGEMMPreQuantized(strix::core::GgmlType::kQ8_0,
-                                                   d_w, d_q8, d_y, batch, m, k);
+    gufo::hip::LaunchBatchedQuantGEMMPreQuantized(gufo::core::GgmlType::kQ8_0,
+                                                  d_w, d_q8, d_y, batch, m, k);
   }
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -367,20 +367,20 @@ void RunFusedNormQuantizeCase(std::size_t batch, std::size_t dim,
   HIP_CHECK(hipMemset(d_ref, 0xA5, q8_bytes));
   HIP_CHECK(hipMemset(d_got, 0xA5, q8_bytes));
 
-  if (!strix::hip::IsFusedRMSNormQuantizeQ8_1Supported(dim)) {
+  if (!gufo::hip::IsFusedRMSNormQuantizeQ8_1Supported(dim)) {
     std::cerr << "fused RMSNorm+Q8_1 rejected a supported row length\n";
     std::abort();
   }
 
   // Reference: the separate chain the fused kernel replaces.
   if (with_residual) {
-    strix::hip::LaunchBatchedResidualAdd(d_hidden_ref, d_r, d_hidden_ref, batch,
-                                         dim);
+    gufo::hip::LaunchBatchedResidualAdd(d_hidden_ref, d_r, d_hidden_ref, batch,
+                                        dim);
   }
-  strix::hip::LaunchBatchedRMSNorm(with_residual ? d_hidden_ref : d_x, d_w,
-                                   d_normed, nullptr, batch, dim, 1e-6F);
-  strix::hip::LaunchQuantizeActivationQ8_1FromFp32(d_normed, d_ref, batch, dim);
-  strix::hip::LaunchBatchedFusedRMSNormQuantizeQ8_1(
+  gufo::hip::LaunchBatchedRMSNorm(with_residual ? d_hidden_ref : d_x, d_w,
+                                  d_normed, nullptr, batch, dim, 1e-6F);
+  gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(d_normed, d_ref, batch, dim);
+  gufo::hip::LaunchBatchedFusedRMSNormQuantizeQ8_1(
       with_residual ? d_hidden_got : d_x, with_residual ? d_r : nullptr, d_w,
       with_residual ? d_hidden_got : nullptr, d_got, batch, dim, 1e-6F);
   HIP_CHECK(hipDeviceSynchronize());
@@ -443,9 +443,9 @@ void RunFusedNormQuantizeCase(std::size_t batch, std::size_t dim,
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen prefill quant GEMM ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen prefill quant GEMM ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

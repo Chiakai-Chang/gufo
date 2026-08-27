@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_REFERENCE_RUNNER_HPP_
-#define STRIX_MODELS_QWEN3_TTS_REFERENCE_RUNNER_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_REFERENCE_RUNNER_HPP_
+#define GUFO_MODELS_QWEN3_TTS_REFERENCE_RUNNER_HPP_
 
 #include <cstddef>
 #include <filesystem>
@@ -7,7 +7,7 @@
 
 #include "src/models/qwen3_tts/synthesis.hpp"
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 struct OfficialReferenceOptions {
   std::filesystem::path model_root;
   std::filesystem::path reference_root;
@@ -20,7 +20,7 @@ struct OfficialReferenceOptions {
 /// HIP implementation.
 class OfficialReferenceRunner {
 public:
-  using CancellationCheck = ::strix::models::qwen3_tts::CancellationCheck;
+  using CancellationCheck = ::gufo::models::qwen3_tts::CancellationCheck;
 
   explicit OfficialReferenceRunner(OfficialReferenceOptions options);
 
@@ -38,6 +38,6 @@ private:
   OfficialReferenceOptions options_;
 };
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts
 
-#endif  // STRIX_MODELS_QWEN3_TTS_REFERENCE_RUNNER_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_REFERENCE_RUNNER_HPP_

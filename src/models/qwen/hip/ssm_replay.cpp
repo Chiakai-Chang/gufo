@@ -7,7 +7,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 void QwenGpuArena::AllocateRecurrentSnapshot() {
   if (d_saved_ssm_conv_state_ != nullptr) {
@@ -177,5 +177,5 @@ const float* QwenGpuArena::GetReplayBeta(std::uint32_t layer,
   return d_ssm_replay_beta_ + offset;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

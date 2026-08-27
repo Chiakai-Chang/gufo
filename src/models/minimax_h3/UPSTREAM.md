@@ -9,7 +9,7 @@ partition:  FL2VA
 ```
 
 The checkpoint is an external operator-supplied artifact and is not
-distributed by Strix-Halo.cpp. Its public license metadata and acquisition
+distributed by gufo. Its public license metadata and acquisition
 boundary are recorded in `docs/MINIMAX_H3.md` and
 `THIRD_PARTY_NOTICES.md`.
 
@@ -132,7 +132,7 @@ Current DiT-boundary adaptations:
 | --- | --- | --- |
 | `h3_dit.c` block load/run paths | `dit.hpp`, `dit.cpp`, `dit.hip` | One-block BF16 session with model-private tensor contracts, direct shard loading, atomics-disabled rocBLAS projections warmed before execution, fixed activation storage, explicit stream/cancellation/telemetry, and no allocation during block execution |
 | DiT kernels in `h3_shaders.metal` | `dit_ops.cuh` | Operation-boundary HIP translation for casts, residual arithmetic, SiLU/SwiGLU, RMS/layer/AdaLN, gated residuals, grouped QKV interpretation, per-head Q/K norm, partial 3D MM-RoPE, and full SDPA |
-| `tests/test_real_dit_block.c` | `minimax_h3_dit_hip_test.hip`, `tools/strix/h3_dit_golden.py` | Odd-tail analytic fixtures plus an operator-owned 528-row block-0 oracle produced by direct ROCm PyTorch formulas; retained payloads are never committed |
+| `tests/test_real_dit_block.c` | `minimax_h3_dit_hip_test.hip`, `tools/gufo/h3_dit_golden.py` | Odd-tail analytic fixtures plus an operator-owned 528-row block-0 oracle produced by direct ROCm PyTorch formulas; retained payloads are never committed |
 
 Current full-denoiser adaptations:
 
@@ -141,7 +141,7 @@ Current full-denoiser adaptations:
 | `h3_dit_schedule.c` | `denoiser.hpp`, `denoiser.cpp`, `denoiser.hip` | Independent C++/HIP implementation of unique video/audio timestep rows, F32 timestep embedding, streamed per-block AdaLN projection, h3.c-compatible gate scoring/ranking with protected boundary blocks, final modulation, and explicit phase telemetry |
 | token refinement, patch packing, core loop, and final heads in `h3_dit.c` | `denoiser.hip` | Complete text-only 50-block BF16 route; all core weights resident, device-resident hidden-state ping-pong on one ordered stream, fixed per-block scratch arenas, full attention, modality maps, F32 final heads and velocity boundaries, cancellation after every block/step, and no CPU tensor compute |
 | GPU Euler denoise path in `h3_dit.c` plus Diffusers scheduler semantics | `denoiser.hip`, `sampling.cpp`, `sampling.hip` | Diffusers 5/20/50-point grids driving 4/19/49 evaluations, gate-ranked active blocks, whole-velocity reuse with two F32 boundaries, independent video/audio coefficients and two-stage operation order, bounded extrapolation, and device-resident F32 samples |
-| `tests/test_real_dit.c`, `tests/test_semantic_dit.c` | `minimax_h3_denoiser_hip_test.hip`, `tools/strix/h3_denoiser_golden.py` | Tiny lifecycle smoke and one independently generated 528-row full velocity forward; sampler trajectories remain covered by analytic host/HIP tests rather than routine multi-step model execution |
+| `tests/test_real_dit.c`, `tests/test_semantic_dit.c` | `minimax_h3_denoiser_hip_test.hip`, `tools/gufo/h3_denoiser_golden.py` | Tiny lifecycle smoke and one independently generated 528-row full velocity forward; sampler trajectories remain covered by analytic host/HIP tests rather than routine multi-step model execution |
 
 Current output-decoder adaptations:
 

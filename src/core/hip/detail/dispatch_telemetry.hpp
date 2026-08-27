@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_HIP_DETAIL_DISPATCH_TELEMETRY_HPP_
-#define STRIX_CORE_HIP_DETAIL_DISPATCH_TELEMETRY_HPP_
+#ifndef GUFO_CORE_HIP_DETAIL_DISPATCH_TELEMETRY_HPP_
+#define GUFO_CORE_HIP_DETAIL_DISPATCH_TELEMETRY_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,11 +9,11 @@
 #include <sstream>
 #include <string_view>
 
-namespace strix::hip::detail {
+namespace gufo::hip::detail {
 
 [[nodiscard]] inline bool DispatchTelemetryEnabled() noexcept {
   static const bool enabled = [] {
-    const char* value = std::getenv("STRIX_DISPATCH_TELEMETRY");
+    const char* value = std::getenv("GUFO_DISPATCH_TELEMETRY");
     if (value == nullptr) {
       return false;
     }
@@ -47,7 +47,7 @@ inline void EmitDispatchTelemetry(std::string_view event, Writer&& writer) {
   }
 
   std::ostringstream output;
-  output << "{\"component\":\"strix.dispatch\",\"event\":\"" << event << '"';
+  output << "{\"component\":\"gufo.dispatch\",\"event\":\"" << event << '"';
   writer(output);
   output << "}\n";
 
@@ -135,6 +135,6 @@ inline void EmitQwenGraphEligibility(std::uint64_t policy_fingerprint,
       });
 }
 
-}  // namespace strix::hip::detail
+}  // namespace gufo::hip::detail
 
-#endif  // STRIX_CORE_HIP_DETAIL_DISPATCH_TELEMETRY_HPP_
+#endif  // GUFO_CORE_HIP_DETAIL_DISPATCH_TELEMETRY_HPP_

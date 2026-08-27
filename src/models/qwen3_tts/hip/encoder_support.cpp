@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 namespace {
 
 float RoundBfloat16(float value) {
@@ -163,6 +163,6 @@ void EncoderF32Gemm::Run(const float* weight, const float* input, float* output,
       "Qwen3-TTS encoder GEMM");
 }
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
 #endif

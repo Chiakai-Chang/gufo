@@ -75,8 +75,8 @@
       "width": 512
     }
   ],
-  "schema": "strix.minimax-h3-quality-contract.v1",
-  "source_manifest_sha256": "8776014efafac996761041c0e3df740b41667275ed12a1e021cf8b49faf9b009",
+  "schema": "gufo.minimax-h3-quality-contract.v1",
+  "source_manifest_sha256": "00a83367b87017f1f3d5547a963b20567a46d7aea44f0aac495c816147720d89",
   "thresholds": {
     "audio_vae": {
       "max_abs": 0.001,

@@ -1,6 +1,6 @@
-# Strix-Halo.cpp
+# gufo
 
-Strix-Halo.cpp is a local inference runtime built specifically for AMD Strix
+gufo is a local inference runtime built specifically for AMD Strix
 Halo systems with a `gfx1151` RDNA 3.5 GPU, an XDNA2 NPU, and up to 128 GiB of
 unified memory.
 
@@ -15,7 +15,7 @@ memory layout will be extremely tailored for Strix Halo.
 
 The native C++ runtime supports model-owned ROCm inference paths for
 Qwen3.8-27B BF16 and DeepSeek V4 Flash Q2-imatrix. Both models run through the
-terminal `strix prompt` command, `strix bench`, and `strix serve`.
+terminal `gufo prompt` command, `gufo bench`, and `gufo serve`.
 DeepSeek uses its own graph, state, quantized layouts, and kernels under
 `src/models/deepseek_v4_flash`; it does not call Qwen compute code.
 
@@ -43,8 +43,8 @@ Build with Nix only; direct host builds are unsupported:
 
 ```sh
 nix build                          # build default package (gfx1151 + XRT)
-./result/bin/strix diagnose        # run hardware probe & diagnostics
-./result/bin/strix serve           # run server
+./result/bin/gufo diagnose        # run hardware probe & diagnostics
+./result/bin/gufo serve           # run server
 nix build .#checks.x86_64-linux.pr # canonical PR test command (all gates)
 ```
 
@@ -94,8 +94,8 @@ nix develop -c ctest --preset hardware-full --output-on-failure
 ```
 
 Hardware presets label tests so unavailable devices skip normally during development. Strict presence validation can be enforced with:
-- `STRIX_REQUIRE_HIP=1` (or `STRIX_REQUIRE_GPU=1`)
-- `STRIX_REQUIRE_XDNA2=1` (or `STRIX_REQUIRE_NPU=1`)
+- `GUFO_REQUIRE_HIP=1` (or `GUFO_REQUIRE_GPU=1`)
+- `GUFO_REQUIRE_XDNA2=1` (or `GUFO_REQUIRE_NPU=1`)
 
 ## Reference Projects
 

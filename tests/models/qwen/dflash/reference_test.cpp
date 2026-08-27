@@ -48,9 +48,9 @@ void TestGroupedDynamicCausalConv() {
       0.0F, 0.0F, 0.0F, 0.0F,  // side 1, tap 0
       0.0F, 0.0F, 0.0F, 0.0F,  // side 1, tap 1
   };
-  strix::models::QwenTensorRef base_ref{
+  gufo::models::QwenTensorRef base_ref{
       .data = base.data(),
-      .type = strix::core::GgmlType::kF32,
+      .type = gufo::core::GgmlType::kF32,
       .num_elements = base.size(),
       .available_bytes = base.size() * sizeof(float)};
 
@@ -66,7 +66,7 @@ void TestGroupedDynamicCausalConv() {
   dynamic[8 + 2] = 0.25F;
   std::vector<float> output(sequence.size());
 
-  strix::speculative::QwenDFlashReference::ApplyGroupedDynamicCausalConv(
+  gufo::speculative::QwenDFlashReference::ApplyGroupedDynamicCausalConv(
       sequence, dynamic, kTokens, kHidden, kKernel, kGroupSize,
       /*side=*/0, base_ref, output);
 
@@ -115,25 +115,25 @@ void TestCandidatePathSelector() {
       1.0F,
   };
 
-  strix::models::QwenTensorRef predecessor_ref{
+  gufo::models::QwenTensorRef predecessor_ref{
       .data = predecessor.data(),
-      .type = strix::core::GgmlType::kF32,
+      .type = gufo::core::GgmlType::kF32,
       .num_elements = predecessor.size(),
       .available_bytes = predecessor.size() * sizeof(float)};
-  strix::models::QwenTensorRef successor_ref{
+  gufo::models::QwenTensorRef successor_ref{
       .data = successor.data(),
-      .type = strix::core::GgmlType::kF32,
+      .type = gufo::core::GgmlType::kF32,
       .num_elements = successor.size(),
       .available_bytes = successor.size() * sizeof(float)};
-  strix::models::QwenTensorRef hidden_projection_ref{
+  gufo::models::QwenTensorRef hidden_projection_ref{
       .data = hidden_projection.data(),
-      .type = strix::core::GgmlType::kF32,
+      .type = gufo::core::GgmlType::kF32,
       .num_elements = hidden_projection.size(),
       .available_bytes = hidden_projection.size() * sizeof(float)};
 
-  std::vector<strix::tokenization::TokenId> tokens;
+  std::vector<gufo::tokenization::TokenId> tokens;
   std::vector<float> confidences;
-  strix::speculative::QwenDFlashReference::SelectCandidatePath(
+  gufo::speculative::QwenDFlashReference::SelectCandidatePath(
       hidden, logits, kNumTokens, kHidden, kVocabSize, kRank, kTopK,
       predecessor_ref, successor_ref, hidden_projection_ref,
       /*anchor_token=*/1, tokens, &confidences);
@@ -155,10 +155,10 @@ int main(int argc, const char* const* argv) {
     if (argc > 1 && argv[1] != nullptr &&
         std::string_view(argv[1]).size() > 0) {
       std::string error;
-      auto reader = strix::core::GgufReader::OpenFile(argv[1], &error);
+      auto reader = gufo::core::GgufReader::OpenFile(argv[1], &error);
       if (reader != nullptr) {
-        auto ref = strix::speculative::QwenDFlashReference::Create(
-            std::shared_ptr<const strix::core::GgufReader>(std::move(reader)),
+        auto ref = gufo::speculative::QwenDFlashReference::Create(
+            std::shared_ptr<const gufo::core::GgufReader>(std::move(reader)),
             16, &error);
         Expect(ref != nullptr, error);
         const auto& config = ref->GetConfig();

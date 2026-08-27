@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <iostream>
 
-namespace strix::heterogeneous {
+namespace gufo::heterogeneous {
 
 NpuDraftBackend::NpuDraftBackend(NpuDrafterConfig config) : config_(config) {
   LoadMtpGguf();
@@ -143,4 +143,4 @@ void NpuDraftBackend::AcceptFeedback(
   history_.push_back(correction_token);
 }
 
-}  // namespace strix::heterogeneous
+}  // namespace gufo::heterogeneous

@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import unittest
 
-from tools.strix import eval_extract
+from tools.gufo import eval_extract
 
 
 class TestEvalExtract(unittest.TestCase):
@@ -66,7 +66,7 @@ class TestEvalExtract(unittest.TestCase):
         provenance_path = self.quality_dir / "provenance.json"
         self.assertTrue(provenance_path.exists())
         data = json.loads(provenance_path.read_text("utf-8"))
-        self.assertEqual(data["schema"], "strix.eval-provenance.v1")
+        self.assertEqual(data["schema"], "gufo.eval-provenance.v1")
         self.assertIn("gpqa", data["suites"])
         self.assertIn("supergpqa", data["suites"])
         self.assertIn("aime2025", data["suites"])

@@ -28,7 +28,7 @@
 #include "src/cli/serve/json.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 namespace {
 
 constexpr std::size_t kMaximumPromptBytes = 4096;
@@ -176,7 +176,7 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
     }
     return false;
   }
-  const std::filesystem::path partial = path.string() + ".strix-partial-" +
+  const std::filesystem::path partial = path.string() + ".gufo-partial-" +
                                         std::to_string(getpid()) + "-" +
                                         std::to_string(NextFileNonce());
   {
@@ -205,7 +205,7 @@ bool WriteAtomic(const std::filesystem::path& path, std::string_view contents,
 
 std::string SnapshotJson(const VideoJobSnapshot& snapshot) {
   json::Value root = json::Value::object();
-  root["schema"] = "strix.video-job.v1";
+  root["schema"] = "gufo.video-job.v1";
   root["id"] = snapshot.id;
   root["status"] = std::string(ToString(snapshot.status));
   root["progress"] = snapshot.progress;
@@ -400,7 +400,7 @@ struct VideoJobService::Impl {
         if (filesystem_error) {
           break;
         }
-        if (child.path().filename().string().find(".strix-partial-") !=
+        if (child.path().filename().string().find(".gufo-partial-") !=
             std::string::npos) {
           std::filesystem::remove_all(child.path(), filesystem_error);
           filesystem_error.clear();
@@ -448,7 +448,7 @@ struct VideoJobService::Impl {
             expires_at > completed_at &&
             expires_at <=
                 static_cast<double>(std::numeric_limits<std::int64_t>::max());
-        if (value.member_str("schema") != "strix.video-job.v1" ||
+        if (value.member_str("schema") != "gufo.video-job.v1" ||
             !IsVideoId(job->snapshot.id) || job->snapshot.id != directory_id ||
             !IsH3Model(job->snapshot.model) ||
             (job->snapshot.seconds != "1" && job->snapshot.seconds != "5") ||
@@ -904,4 +904,4 @@ VideoJobLookupResult VideoJobService::Delete(std::string_view id) {
       .result = VideoJobResult::kOk, .job = std::move(snapshot), .error = {}};
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server

@@ -1,5 +1,5 @@
-#ifndef STRIX_CLI_BENCH_HPP_
-#define STRIX_CLI_BENCH_HPP_
+#ifndef GUFO_CLI_BENCH_HPP_
+#define GUFO_CLI_BENCH_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-namespace strix::cli {
+namespace gufo::cli {
 
 struct BenchOptions {
   std::string model_path{"models/Qwen3.5-4B-BF16.gguf"};
@@ -33,6 +33,6 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
                                               std::string* error_msg = nullptr);
 int RunBench(std::span<const char* const> args);
 
-}  // namespace strix::cli
+}  // namespace gufo::cli
 
-#endif  // STRIX_CLI_BENCH_HPP_
+#endif  // GUFO_CLI_BENCH_HPP_

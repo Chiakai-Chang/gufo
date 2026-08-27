@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_HIP_TALKER_RUNTIME_HPP_
-#define STRIX_MODELS_QWEN3_TTS_HIP_TALKER_RUNTIME_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_HIP_TALKER_RUNTIME_HPP_
+#define GUFO_MODELS_QWEN3_TTS_HIP_TALKER_RUNTIME_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -11,7 +11,7 @@
 
 #include "src/models/qwen3_tts/prompt.hpp"
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 
 struct TalkerPrefillOutput {
   std::vector<float> logits;
@@ -19,7 +19,7 @@ struct TalkerPrefillOutput {
   std::vector<float> layer0_output;
 };
 
-using TalkerPromptOutput = ::strix::models::qwen3_tts::PromptOutput;
+using TalkerPromptOutput = ::gufo::models::qwen3_tts::PromptOutput;
 using CustomVoicePromptOutput = TalkerPromptOutput;
 
 struct VoiceClonePromptInput {
@@ -149,6 +149,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
-#endif  // STRIX_MODELS_QWEN3_TTS_HIP_TALKER_RUNTIME_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_HIP_TALKER_RUNTIME_HPP_

@@ -11,7 +11,7 @@
 #include "src/models/qwen/hip/ops/norm_residual.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void BatchedResidualAddKernel(const float* __restrict__ a,
                                          const float* __restrict__ b,
@@ -100,5 +100,5 @@ void LaunchBatchedFusedResidualAddRMSNorm(const float* a, const float* b,
       a, b, out_sum, weight, out, static_cast<hip_bfloat16*>(out_bf16),
       batch_size, dim, eps);
 }
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

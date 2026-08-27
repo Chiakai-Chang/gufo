@@ -33,14 +33,14 @@ This document retains the hardware memory bandwidth baseline measurements for AM
 ## Reproduction Command
 
 ```sh
-./result/bin/strix diagnose \
+./result/bin/gufo diagnose \
   --benchmark bandwidth \
   --backends cpu,hip,xrt \
   --warmup 3 \
   --repetitions 10 \
   --duration-ms 2000 \
   --json \
-  --output /tmp/strix-bandwidth.json
+  --output /tmp/gufo-bandwidth.json
 
-./result/bin/strix diagnose --validate-artifact /tmp/strix-bandwidth.json
+./result/bin/gufo diagnose --validate-artifact /tmp/gufo-bandwidth.json
 ```

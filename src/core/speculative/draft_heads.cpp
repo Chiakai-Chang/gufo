@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 MtpDraftBackend::MtpDraftBackend(MtpDraftHeadConfig config) : config_(config) {
   head_projections_.resize(config_.num_heads);
@@ -79,4 +79,4 @@ void MtpDraftBackend::AcceptFeedback(
   (void)correction_token;
 }
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative

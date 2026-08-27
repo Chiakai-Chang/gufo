@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_GENERATOR_HPP_
-#define STRIX_MODELS_QWEN_GENERATOR_HPP_
+#ifndef GUFO_MODELS_QWEN_GENERATOR_HPP_
+#define GUFO_MODELS_QWEN_GENERATOR_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +15,7 @@
 #include "src/models/qwen/state.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace strix::models {
+namespace gufo::models {
 
 /// Generation parameters for controlling the auto-regressive decode loop.
 struct GenerationOptions {
@@ -71,6 +71,6 @@ private:
   QwenScratchArena arena_;
 };
 
-}  // namespace strix::models
+}  // namespace gufo::models
 
-#endif  // STRIX_MODELS_QWEN_GENERATOR_HPP_
+#endif  // GUFO_MODELS_QWEN_GENERATOR_HPP_

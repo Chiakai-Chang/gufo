@@ -14,7 +14,7 @@
 #include <xrt/xrt_device.h>
 #endif
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 #ifdef ENGINE_ENABLE_XRT
 
@@ -184,4 +184,4 @@ std::vector<BandwidthPathResult> MeasureXrtBandwidth(
 
 #endif
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics

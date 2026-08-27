@@ -82,17 +82,17 @@ void TestBatchedFusedProjectionsEquivalence() {
 
   // Sequential
   for (std::size_t t = 0; t < batch; ++t) {
-    strix::hip::LaunchFusedSSMInputProjections(
-        d_qkv_w, strix::core::GgmlType::kF32, d_gate_w,
-        strix::core::GgmlType::kF32, d_alpha_w, strix::core::GgmlType::kF32,
-        d_beta_w, strix::core::GgmlType::kF32, d_x + t * hidden_size,
+    gufo::hip::LaunchFusedSSMInputProjections(
+        d_qkv_w, gufo::core::GgmlType::kF32, d_gate_w,
+        gufo::core::GgmlType::kF32, d_alpha_w, gufo::core::GgmlType::kF32,
+        d_beta_w, gufo::core::GgmlType::kF32, d_x + t * hidden_size,
         d_qkv_seq + t * qkv_size, d_gate_seq + t * inner_size,
         d_alpha_seq + t * time_step_rank, d_beta_seq + t * time_step_rank,
         hidden_size, qkv_size, inner_size, time_step_rank);
   }
 
   // Batched
-  strix::hip::LaunchBatchedFusedSSMInputProjections(
+  gufo::hip::LaunchBatchedFusedSSMInputProjections(
       d_qkv_w, false, d_gate_w, false, d_alpha_w, false, d_beta_w, false, d_x,
       d_qkv_batch, d_gate_batch, d_alpha_batch, d_beta_batch, batch,
       hidden_size, qkv_size, inner_size, time_step_rank);
@@ -127,14 +127,14 @@ void TestBatchedFusedProjectionsEquivalence() {
                       beta_batch.size() * sizeof(float),
                       hipMemcpyDeviceToHost));
 
-  strix::test::ExpectSpanNear(qkv_seq, qkv_batch, 1e-4F,
-                              "batched SSM QKV projection mismatch");
-  strix::test::ExpectSpanNear(gate_seq, gate_batch, 1e-4F,
-                              "batched SSM gate projection mismatch");
-  strix::test::ExpectSpanNear(alpha_seq, alpha_batch, 1e-4F,
-                              "batched SSM alpha projection mismatch");
-  strix::test::ExpectSpanNear(beta_seq, beta_batch, 1e-4F,
-                              "batched SSM beta projection mismatch");
+  gufo::test::ExpectSpanNear(qkv_seq, qkv_batch, 1e-4F,
+                             "batched SSM QKV projection mismatch");
+  gufo::test::ExpectSpanNear(gate_seq, gate_batch, 1e-4F,
+                             "batched SSM gate projection mismatch");
+  gufo::test::ExpectSpanNear(alpha_seq, alpha_batch, 1e-4F,
+                             "batched SSM alpha projection mismatch");
+  gufo::test::ExpectSpanNear(beta_seq, beta_batch, 1e-4F,
+                             "batched SSM beta projection mismatch");
 
   HIP_CHECK(hipFree(d_x));
   HIP_CHECK(hipFree(d_qkv_w));
@@ -167,13 +167,13 @@ void TestFusedRMSNormQKVProjectionsEquivalence() {
   std::vector<std::uint16_t> h_kw(kv_dim * hidden_size);
   std::vector<std::uint16_t> h_vw(kv_dim * hidden_size);
   for (std::size_t i = 0; i < q_dim * hidden_size; ++i) {
-    h_qw[i] = strix::test::FloatToBf16Bits(
+    h_qw[i] = gufo::test::FloatToBf16Bits(
         0.01F * std::sin(static_cast<float>(i) * 0.0021F));
   }
   for (std::size_t i = 0; i < kv_dim * hidden_size; ++i) {
-    h_kw[i] = strix::test::FloatToBf16Bits(
+    h_kw[i] = gufo::test::FloatToBf16Bits(
         0.013F * std::cos(static_cast<float>(i) * 0.0017F));
-    h_vw[i] = strix::test::FloatToBf16Bits(
+    h_vw[i] = gufo::test::FloatToBf16Bits(
         0.011F * std::sin(static_cast<float>(i) * 0.0013F));
   }
 
@@ -207,12 +207,12 @@ void TestFusedRMSNormQKVProjectionsEquivalence() {
                       kv_dim * hidden_size * sizeof(std::uint16_t),
                       hipMemcpyHostToDevice));
 
-  strix::hip::LaunchRMSNorm(d_x, d_w, d_normed, hidden_size, eps);
-  strix::hip::LaunchFusedQKVProjections(
-      d_qw, strix::core::GgmlType::kBF16, d_kw, strix::core::GgmlType::kBF16,
-      d_vw, strix::core::GgmlType::kBF16, d_normed, d_q_ref, d_k_ref, d_v_ref,
+  gufo::hip::LaunchRMSNorm(d_x, d_w, d_normed, hidden_size, eps);
+  gufo::hip::LaunchFusedQKVProjections(
+      d_qw, gufo::core::GgmlType::kBF16, d_kw, gufo::core::GgmlType::kBF16,
+      d_vw, gufo::core::GgmlType::kBF16, d_normed, d_q_ref, d_k_ref, d_v_ref,
       q_dim, kv_dim, hidden_size);
-  strix::hip::LaunchFusedRMSNormQKVProjections(
+  gufo::hip::LaunchFusedRMSNormQKVProjections(
       d_x, d_w, eps, d_qw, true, d_kw, true, d_vw, true, d_q_fus, d_k_fus,
       d_v_fus, q_dim, kv_dim, hidden_size);
   HIP_CHECK(hipDeviceSynchronize());
@@ -265,9 +265,9 @@ void TestFusedRMSNormQKVProjectionsEquivalence() {
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen attention projection ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen attention projection ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

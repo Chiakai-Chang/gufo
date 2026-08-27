@@ -24,12 +24,12 @@
 
 namespace {
 
-namespace h3 = strix::minimax_h3;
-using strix::server::HandleVideoApiRequest;
-using strix::server::HttpRequest;
-using strix::server::HttpResponse;
-using strix::server::VideoJobService;
-using strix::server::VideoJobServiceOptions;
+namespace h3 = gufo::minimax_h3;
+using gufo::server::HandleVideoApiRequest;
+using gufo::server::HttpRequest;
+using gufo::server::HttpResponse;
+using gufo::server::VideoJobService;
+using gufo::server::VideoJobServiceOptions;
 
 [[noreturn]] void Fail(const std::string& message) {
   std::cerr << "FAIL video_api_test: " << message << '\n';
@@ -190,7 +190,7 @@ std::string Multipart(
 }
 
 std::string CreatedId(const HttpResponse& response) {
-  const auto body = strix::server::json::parse(response.body);
+  const auto body = gufo::server::json::parse(response.body);
   return body.member_str("id");
 }
 
@@ -214,7 +214,7 @@ void TestLifecycleAndRange(const std::filesystem::path& root) {
   Check(service.ready(), service.initialization_error());
 
   const std::string request =
-      R"({"model":"minimax-h3-dev","prompt":"private fox prompt","size":"256x256","seconds":"1","strix":{"seed":7,"frames":22,"output_format":"ppm","selected_frame":4}})";
+      R"({"model":"minimax-h3-dev","prompt":"private fox prompt","size":"256x256","seconds":"1","gufo":{"seed":7,"frames":22,"output_format":"ppm","selected_frame":4}})";
   const HttpResponse created = Send(service, "POST", "/v1/videos", request, {},
                                     "application/json; charset=utf-8");
   Check(created.status == 202 &&
@@ -289,20 +289,20 @@ void TestValidation(const std::filesystem::path& root) {
 
   const HttpResponse bad_output = Send(
       service, "POST", "/v1/videos",
-      R"({"model":"minimax-h3","prompt":"x","size":"512x512","seconds":"1","strix":{"preset":"dev","output_format":"mp4"}})");
+      R"({"model":"minimax-h3","prompt":"x","size":"512x512","seconds":"1","gufo":{"preset":"dev","output_format":"mp4"}})");
   Check(bad_output.status == 400,
         "development preset cannot silently produce MP4");
 
   const HttpResponse mismatch = Send(
       service, "POST", "/v1/videos",
-      R"({"model":"minimax-h3-fast","prompt":"x","size":"512x512","seconds":"1","strix":{"preset":"exact"}})");
+      R"({"model":"minimax-h3-fast","prompt":"x","size":"512x512","seconds":"1","gufo":{"preset":"exact"}})");
   Check(mismatch.status == 400 &&
             mismatch.body.find("preset_model_mismatch") != std::string::npos,
         "model aliases cannot drift from the frozen preset");
 
   const HttpResponse too_short = Send(
       service, "POST", "/v1/videos",
-      R"({"model":"minimax-h3-dev","prompt":"x","size":"256x256","seconds":"1","strix":{"frames":5,"output_format":"ppm","selected_frame":4}})");
+      R"({"model":"minimax-h3-dev","prompt":"x","size":"256x256","seconds":"1","gufo":{"frames":5,"output_format":"ppm","selected_frame":4}})");
   Check(too_short.status == 400 &&
             too_short.body.find("invalid_frames") != std::string::npos &&
             too_short.body.find("at least 22 aligned frames") !=
@@ -332,7 +332,7 @@ void TestValidation(const std::filesystem::path& root) {
 
   const HttpResponse malformed_number = Send(
       service, "POST", "/v1/videos",
-      R"({"model":"minimax-h3","prompt":"x","seconds":"1","strix":{"seed":1e}})");
+      R"({"model":"minimax-h3","prompt":"x","seconds":"1","gufo":{"seed":1e}})");
   Check(malformed_number.status == 400 &&
             malformed_number.body.find("parse_error") != std::string::npos,
         "malformed JSON numbers fail closed");
@@ -356,7 +356,7 @@ void TestValidation(const std::filesystem::path& root) {
   Check(Send(service, "GET", "/v1/videos/../../private").status == 404,
         "path traversal-like IDs fail closed");
 
-  constexpr std::string_view kBoundary = "strix-openai-video-boundary";
+  constexpr std::string_view kBoundary = "gufo-openai-video-boundary";
   const HttpResponse multipart =
       Send(service, "POST", "/v1/videos",
            Multipart(kBoundary,
@@ -366,7 +366,7 @@ void TestValidation(const std::filesystem::path& root) {
                          {"size", "512x512"},
                          {"seconds", "1"},
                      }),
-           {}, "multipart/form-data; boundary=\"strix-openai-video-boundary\"");
+           {}, "multipart/form-data; boundary=\"gufo-openai-video-boundary\"");
   Check(multipart.status == 202,
         "OpenAI-style multipart text-to-video request is admitted");
   runner.WaitForCalls(2);
@@ -382,30 +382,30 @@ void TestValidation(const std::filesystem::path& root) {
                          {"prompt", "second"},
                          {"seconds", "1"},
                      }),
-           {}, "multipart/form-data; boundary=strix-openai-video-boundary");
+           {}, "multipart/form-data; boundary=gufo-openai-video-boundary");
   Check(duplicate.status == 400 &&
             duplicate.body.find("invalid_multipart_form") != std::string::npos,
         "multipart duplicate fields fail closed");
 
   const std::string reference_body =
-      "--strix-openai-video-boundary\r\n"
+      "--gufo-openai-video-boundary\r\n"
       "Content-Disposition: form-data; name=\"model\"\r\n\r\n"
       "minimax-h3\r\n"
-      "--strix-openai-video-boundary\r\n"
+      "--gufo-openai-video-boundary\r\n"
       "Content-Disposition: form-data; name=\"prompt\"\r\n\r\n"
       "x\r\n"
-      "--strix-openai-video-boundary\r\n"
+      "--gufo-openai-video-boundary\r\n"
       "Content-Disposition: form-data; name=\"seconds\"\r\n\r\n"
       "1\r\n"
-      "--strix-openai-video-boundary\r\n"
+      "--gufo-openai-video-boundary\r\n"
       "Content-Disposition: form-data; name=\"input_reference\"; "
       "filename=\"frame.png\"\r\n"
       "Content-Type: image/png\r\n\r\n"
       "not-an-image\r\n"
-      "--strix-openai-video-boundary--\r\n";
+      "--gufo-openai-video-boundary--\r\n";
   const HttpResponse multipart_reference =
       Send(service, "POST", "/v1/videos", reference_body, {},
-           "multipart/form-data; boundary=strix-openai-video-boundary");
+           "multipart/form-data; boundary=gufo-openai-video-boundary");
   Check(multipart_reference.status == 400 &&
             multipart_reference.body.find("unsupported_input_reference") !=
                 std::string::npos,
@@ -424,7 +424,7 @@ void TestQueueSaturation(const std::filesystem::path& root) {
   FakeRunner runner(true);
   VideoJobService service(Options(root, &runner));
   const std::string body =
-      R"({"model":"minimax-h3","prompt":"x","size":"512x512","seconds":"1","strix":{"preset":"fast"}})";
+      R"({"model":"minimax-h3","prompt":"x","size":"512x512","seconds":"1","gufo":{"preset":"fast"}})";
   const HttpResponse first = Send(service, "POST", "/v1/videos", body);
   runner.WaitForCalls(1);
   const HttpResponse second = Send(service, "POST", "/v1/videos", body);
@@ -446,7 +446,7 @@ void TestQueueSaturation(const std::filesystem::path& root) {
 int main() {
   const std::filesystem::path base =
       std::filesystem::temp_directory_path() /
-      ("strix-video-api-test-" + std::to_string(getpid()));
+      ("gufo-video-api-test-" + std::to_string(getpid()));
   std::error_code ignored;
   std::filesystem::remove_all(base, ignored);
   std::filesystem::create_directories(base);

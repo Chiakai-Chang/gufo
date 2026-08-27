@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_EXECUTOR_HPP_
-#define STRIX_MODELS_QWEN_HIP_EXECUTOR_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
+#define GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -27,7 +27,7 @@
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 class HipblasLtGemm;
 class QwenGpuExecutor;
@@ -475,8 +475,8 @@ private:
   bool replaying_ssm_state_{false};
 };
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_EXECUTOR_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_EXECUTOR_HPP_

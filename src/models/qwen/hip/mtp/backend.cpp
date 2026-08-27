@@ -9,7 +9,7 @@
 
 #include "src/models/qwen/hip/mtp.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 QwenMtpGpuDraftBackend::QwenMtpGpuDraftBackend(
     std::unique_ptr<QwenMtpGpuExecutor> executor, QwenMtpGpuDraftConfig config)
@@ -170,5 +170,5 @@ void QwenMtpGpuDraftBackend::Reset() noexcept {
   last_error_.clear();
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

@@ -4,7 +4,7 @@
 
 #include "src/models/qwen/hip/executor.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
     std::span<const tokenization::TokenId> prompt_tokens,
     std::uint32_t start_pos, bool compute_logits) {
@@ -41,5 +41,5 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
   return next_token;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

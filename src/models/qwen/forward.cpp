@@ -21,7 +21,7 @@
 #include "src/models/qwen/modules/unembed.hpp"
 #include "src/models/qwen/oracles.hpp"
 
-namespace strix::models {
+namespace gufo::models {
 namespace {
 
 const void* QuantizedRow(const QwenTensorRef& tensor, std::size_t row,
@@ -333,4 +333,4 @@ std::uint32_t GreedyArgmax(std::span<const float> logits) noexcept {
   return static_cast<std::uint32_t>(best_idx);
 }
 
-}  // namespace strix::models
+}  // namespace gufo::models

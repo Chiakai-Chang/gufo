@@ -55,7 +55,7 @@
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 // Defined in kernels/ssm_recurrence.hip and hip/batched_ssm.hip respectively;
 // the row-split route reuses both unchanged.
@@ -419,5 +419,5 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
   }
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

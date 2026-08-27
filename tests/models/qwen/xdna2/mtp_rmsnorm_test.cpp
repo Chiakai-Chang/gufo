@@ -33,7 +33,7 @@ void Expect(bool condition, std::string_view message) {
 }
 
 std::vector<float> MakeInput(std::size_t iteration) {
-  std::vector<float> input(strix::xdna2::kQwenMtpRmsNormElements);
+  std::vector<float> input(gufo::xdna2::kQwenMtpRmsNormElements);
   for (std::size_t index = 0; index < input.size(); ++index) {
     const float phase =
         static_cast<float>((iteration * input.size()) + index) * 0.013F;
@@ -43,7 +43,7 @@ std::vector<float> MakeInput(std::size_t iteration) {
 }
 
 std::vector<float> MakeSyntheticWeight() {
-  std::vector<float> weight(strix::xdna2::kQwenMtpRmsNormElements);
+  std::vector<float> weight(gufo::xdna2::kQwenMtpRmsNormElements);
   for (std::size_t index = 0; index < weight.size(); ++index) {
     weight[index] = 0.25F + (static_cast<float>(index % 257) / 512.0F);
   }
@@ -52,29 +52,29 @@ std::vector<float> MakeSyntheticWeight() {
 
 std::vector<float> LoadModelWeight(const std::filesystem::path& model_path) {
   std::string error;
-  const auto reader = strix::core::GgufReader::OpenFile(model_path, &error);
+  const auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
   Expect(reader != nullptr, "MTP GGUF opens: " + error);
   const auto* tensor = reader->FindTensor("blk.64.nextn.enorm.weight");
   Expect(tensor != nullptr, "nextn.enorm weight exists");
-  Expect(tensor->type == strix::core::GgmlType::kF32,
+  Expect(tensor->type == gufo::core::GgmlType::kF32,
          "nextn.enorm weight is F32");
-  Expect(tensor->ElementCount() == strix::xdna2::kQwenMtpRmsNormElements,
+  Expect(tensor->ElementCount() == gufo::xdna2::kQwenMtpRmsNormElements,
          "nextn.enorm weight has 5120 elements");
   const auto* data = static_cast<const float*>(tensor->data);
-  return std::vector<float>(data, data + strix::xdna2::kQwenMtpRmsNormElements);
+  return std::vector<float>(data, data + gufo::xdna2::kQwenMtpRmsNormElements);
 }
 
 std::vector<std::uint16_t> ToBf16(std::span<const float> values) {
   std::vector<std::uint16_t> result(values.size());
   std::ranges::transform(values, result.begin(),
-                         strix::models::qwen::FloatToBf16);
+                         gufo::models::qwen::FloatToBf16);
   return result;
 }
 
 std::vector<float> FromBf16(std::span<const std::uint16_t> values) {
   std::vector<float> result(values.size());
   std::ranges::transform(values, result.begin(),
-                         strix::models::qwen::Bf16ToFloat);
+                         gufo::models::qwen::Bf16ToFloat);
   return result;
 }
 
@@ -110,19 +110,19 @@ ErrorMetrics Compare(std::span<const float> actual,
   return metrics;
 }
 
-void RunCase(const strix::xdna2::XrtDeviceInfo& device_info,
+void RunCase(const gufo::xdna2::XrtDeviceInfo& device_info,
              std::span<const float> weight, std::string_view label) {
   const auto weight_bf16 = ToBf16(weight);
   const auto rounded_weight = FromBf16(weight_bf16);
 
-  strix::xdna2::QwenMtpRmsNormOptions options;
+  gufo::xdna2::QwenMtpRmsNormOptions options;
   options.timeout_ms = 30000;
-#ifdef STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
-  options.program_dir = STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR;
+#ifdef GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
+  options.program_dir = GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR;
 #endif
 
-  strix::xdna2::QwenMtpRmsNormFailure failure;
-  auto session = strix::xdna2::QwenMtpRmsNormSession::Create(
+  gufo::xdna2::QwenMtpRmsNormFailure failure;
+  auto session = gufo::xdna2::QwenMtpRmsNormSession::Create(
       options, device_info, weight_bf16, &failure);
   Expect(session != nullptr, "RMSNorm session opens: " + failure.message);
   Expect(session->ProgramInfo().bo_allocations == 3,
@@ -153,12 +153,11 @@ void RunCase(const strix::xdna2::XrtDeviceInfo& device_info,
   Expect(!session->ProgramInfo().resource_evidence.empty(),
          "partition evidence is recorded");
   Expect(
-      strix::xdna2::QwenMtpRmsNormSession::ActiveSessionCountForDiagnostics() ==
+      gufo::xdna2::QwenMtpRmsNormSession::ActiveSessionCountForDiagnostics() ==
           1,
       "one session is live");
-  Expect(
-      strix::xdna2::QwenMtpRmsNormSession::ActiveBoCountForDiagnostics() == 3,
-      "three BO wrappers are live");
+  Expect(gufo::xdna2::QwenMtpRmsNormSession::ActiveBoCountForDiagnostics() == 3,
+         "three BO wrappers are live");
 
   std::vector<double> command_us;
   std::vector<double> submission_us;
@@ -170,10 +169,10 @@ void RunCase(const strix::xdna2::XrtDeviceInfo& device_info,
     const auto rounded_input = FromBf16(input_bf16);
     std::vector<std::uint16_t> output_bf16(input.size());
     std::vector<float> expected(input.size());
-    strix::models::qwen::ReferenceRMSNorm(rounded_input, rounded_weight,
-                                          kEpsilon, expected);
+    gufo::models::qwen::ReferenceRMSNorm(rounded_input, rounded_weight,
+                                         kEpsilon, expected);
 
-    strix::xdna2::QwenMtpRmsNormRunMetrics run_metrics;
+    gufo::xdna2::QwenMtpRmsNormRunMetrics run_metrics;
     Expect(session->Run(input_bf16, output_bf16, &run_metrics, &failure),
            "RMSNorm command completes: " + failure.message);
     Expect(!run_metrics.quarantined, "session remains usable");
@@ -205,12 +204,11 @@ void RunCase(const strix::xdna2::XrtDeviceInfo& device_info,
   const auto teardown_start = std::chrono::steady_clock::now();
   session.reset();
   Expect(
-      strix::xdna2::QwenMtpRmsNormSession::ActiveSessionCountForDiagnostics() ==
+      gufo::xdna2::QwenMtpRmsNormSession::ActiveSessionCountForDiagnostics() ==
           0,
       "session count returns to baseline");
-  Expect(
-      strix::xdna2::QwenMtpRmsNormSession::ActiveBoCountForDiagnostics() == 0,
-      "BO count returns to baseline");
+  Expect(gufo::xdna2::QwenMtpRmsNormSession::ActiveBoCountForDiagnostics() == 0,
+         "BO count returns to baseline");
   const double teardown_ms =
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - teardown_start)
@@ -232,23 +230,23 @@ void RunCase(const strix::xdna2::XrtDeviceInfo& device_info,
             << " cosine=" << worst.cosine << "\n";
 }
 
-void TestFailureCategories(const strix::xdna2::XrtDeviceInfo& device_info,
+void TestFailureCategories(const gufo::xdna2::XrtDeviceInfo& device_info,
                            std::span<const std::uint16_t> weight_bf16) {
-  strix::xdna2::QwenMtpRmsNormOptions invalid_options;
+  gufo::xdna2::QwenMtpRmsNormOptions invalid_options;
   invalid_options.timeout_ms = 0;
-  strix::xdna2::QwenMtpRmsNormFailure failure;
-  auto session = strix::xdna2::QwenMtpRmsNormSession::Create(
+  gufo::xdna2::QwenMtpRmsNormFailure failure;
+  auto session = gufo::xdna2::QwenMtpRmsNormSession::Create(
       invalid_options, device_info, weight_bf16, &failure);
   Expect(session == nullptr && failure.category == "invalid_options",
          "zero timeout is categorized");
 
-  strix::xdna2::QwenMtpRmsNormOptions missing_program;
+  gufo::xdna2::QwenMtpRmsNormOptions missing_program;
   missing_program.program_dir =
       std::filesystem::temp_directory_path() /
-      ("strix-qwen-mtp-rmsnorm-missing-" +
+      ("gufo-qwen-mtp-rmsnorm-missing-" +
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
-  session = strix::xdna2::QwenMtpRmsNormSession::Create(
+  session = gufo::xdna2::QwenMtpRmsNormSession::Create(
       missing_program, device_info, weight_bf16, &failure);
   Expect(session == nullptr && failure.category == "program_missing",
          "missing program is categorized");
@@ -256,21 +254,21 @@ void TestFailureCategories(const strix::xdna2::XrtDeviceInfo& device_info,
   auto unavailable_device = device_info;
   unavailable_device.available = false;
   unavailable_device.error_category = "firmware_unsupported";
-  strix::xdna2::QwenMtpRmsNormOptions valid_options;
-  session = strix::xdna2::QwenMtpRmsNormSession::Create(
+  gufo::xdna2::QwenMtpRmsNormOptions valid_options;
+  session = gufo::xdna2::QwenMtpRmsNormSession::Create(
       valid_options, unavailable_device, weight_bf16, &failure);
   Expect(session == nullptr && failure.category == "firmware_unsupported",
          "device compatibility failure is preserved");
 
-#ifdef STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
+#ifdef GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
   const auto substituted_dir =
       std::filesystem::temp_directory_path() /
-      ("strix-qwen-mtp-rmsnorm-substituted-" +
+      ("gufo-qwen-mtp-rmsnorm-substituted-" +
        std::to_string(
            std::chrono::steady_clock::now().time_since_epoch().count()));
   std::filesystem::create_directories(substituted_dir);
   const auto source_dir =
-      std::filesystem::path(STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR);
+      std::filesystem::path(GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR);
   std::filesystem::copy_file(source_dir / "qwen_mtp_rmsnorm.xclbin",
                              substituted_dir / "qwen_mtp_rmsnorm.xclbin");
   std::filesystem::copy_file(source_dir / "qwen_mtp_rmsnorm.insts.elf",
@@ -290,9 +288,9 @@ void TestFailureCategories(const strix::xdna2::XrtDeviceInfo& device_info,
                                         "qwen_mtp_rmsnorm.insts.elf") +
                  1,
          "substituted ELF size differs from reviewed artifact");
-  strix::xdna2::QwenMtpRmsNormOptions substituted_program;
+  gufo::xdna2::QwenMtpRmsNormOptions substituted_program;
   substituted_program.program_dir = substituted_dir;
-  session = strix::xdna2::QwenMtpRmsNormSession::Create(
+  session = gufo::xdna2::QwenMtpRmsNormSession::Create(
       substituted_program, device_info, weight_bf16, &failure);
   Expect(session == nullptr && failure.category == "program_incompatible",
          "substituted program is rejected by content hash: category=" +
@@ -301,34 +299,34 @@ void TestFailureCategories(const strix::xdna2::XrtDeviceInfo& device_info,
 #endif
 }
 
-void TestRepeatedLifecycle(const strix::xdna2::XrtDeviceInfo& device_info,
+void TestRepeatedLifecycle(const gufo::xdna2::XrtDeviceInfo& device_info,
                            std::span<const std::uint16_t> weight_bf16) {
-  strix::xdna2::QwenMtpRmsNormOptions options;
-#ifdef STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
-  options.program_dir = STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR;
+  gufo::xdna2::QwenMtpRmsNormOptions options;
+#ifdef GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
+  options.program_dir = GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR;
 #endif
   const auto input_bf16 = ToBf16(MakeInput(0));
   std::vector<std::uint16_t> output_bf16(input_bf16.size());
   for (std::size_t cycle = 0; cycle < 3; ++cycle) {
-    Expect(strix::xdna2::QwenMtpRmsNormSession::
+    Expect(gufo::xdna2::QwenMtpRmsNormSession::
                    ActiveSessionCountForDiagnostics() == 0,
            "lifecycle starts at the session baseline");
     Expect(
-        strix::xdna2::QwenMtpRmsNormSession::ActiveBoCountForDiagnostics() == 0,
+        gufo::xdna2::QwenMtpRmsNormSession::ActiveBoCountForDiagnostics() == 0,
         "lifecycle starts at the BO baseline");
-    strix::xdna2::QwenMtpRmsNormFailure failure;
-    auto session = strix::xdna2::QwenMtpRmsNormSession::Create(
+    gufo::xdna2::QwenMtpRmsNormFailure failure;
+    auto session = gufo::xdna2::QwenMtpRmsNormSession::Create(
         options, device_info, weight_bf16, &failure);
     Expect(session != nullptr,
            "repeated RMSNorm session opens: " + failure.message);
     Expect(session->Run(input_bf16, output_bf16, nullptr, &failure),
            "repeated RMSNorm command completes: " + failure.message);
     session.reset();
-    Expect(strix::xdna2::QwenMtpRmsNormSession::
+    Expect(gufo::xdna2::QwenMtpRmsNormSession::
                    ActiveSessionCountForDiagnostics() == 0,
            "lifecycle returns to the session baseline");
     Expect(
-        strix::xdna2::QwenMtpRmsNormSession::ActiveBoCountForDiagnostics() == 0,
+        gufo::xdna2::QwenMtpRmsNormSession::ActiveBoCountForDiagnostics() == 0,
         "lifecycle returns to the BO baseline");
   }
 }
@@ -336,9 +334,9 @@ void TestRepeatedLifecycle(const strix::xdna2::XrtDeviceInfo& device_info,
 }  // namespace
 
 int main() {
-  const auto inventory = strix::diagnostics::CollectSystemInventory(
-      strix::diagnostics::LinuxSysfs());
-  const auto device_info = strix::xdna2::DiscoverXrtDevice(0, inventory);
+  const auto inventory = gufo::diagnostics::CollectSystemInventory(
+      gufo::diagnostics::LinuxSysfs());
+  const auto device_info = gufo::xdna2::DiscoverXrtDevice(0, inventory);
   Expect(device_info.available, "compatible XDNA2 device is available");
 
   const auto synthetic_weight = MakeSyntheticWeight();
@@ -347,13 +345,13 @@ int main() {
   TestRepeatedLifecycle(device_info, synthetic_weight_bf16);
   RunCase(device_info, synthetic_weight, "synthetic");
 
-  if (const char* model = std::getenv("STRIX_MTP_MODEL");
+  if (const char* model = std::getenv("GUFO_MTP_MODEL");
       model != nullptr && std::string_view(model).size() > 0) {
     const auto model_weight = LoadModelWeight(model);
     RunCase(device_info, model_weight, "qwen3.8-mtp");
   } else {
     std::cout << "qwen3.8-mtp XDNA2 RMSNorm: skipped "
-                 "(STRIX_MTP_MODEL not set)\n";
+                 "(GUFO_MTP_MODEL not set)\n";
   }
   return 0;
 }

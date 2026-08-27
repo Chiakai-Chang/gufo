@@ -1,4 +1,4 @@
-target_sources(strix_core PRIVATE
+target_sources(gufo_core PRIVATE
   ${PROJECT_SOURCE_DIR}/src/models/qwen/tokenizer.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/chat_template.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/oracles.cpp
@@ -21,7 +21,7 @@ target_sources(strix_core PRIVATE
    ${PROJECT_SOURCE_DIR}/src/models/qwen/dflash_reference.cpp)
 
 if (ENGINE_ENABLE_HIP)
-  target_sources(strix_core PRIVATE
+  target_sources(gufo_core PRIVATE
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/attention.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_ssm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_ops.hip
@@ -79,19 +79,19 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (ENGINE_ENABLE_XRT)
-  target_sources(strix_core PRIVATE
+  target_sources(gufo_core PRIVATE
     ${PROJECT_SOURCE_DIR}/src/models/qwen/xdna2/mtp_eh_proj.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/xdna2/mtp_rmsnorm.cpp)
-  target_compile_definitions(strix_core PUBLIC ENGINE_ENABLE_XRT=1)
-  target_compile_definitions(strix_core PRIVATE
-    STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
-    STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
-  target_include_directories(strix_core SYSTEM PUBLIC
+  target_compile_definitions(gufo_core PUBLIC ENGINE_ENABLE_XRT=1)
+  target_compile_definitions(gufo_core PRIVATE
+    GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
+    GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
+  target_include_directories(gufo_core SYSTEM PUBLIC
     ${XRT_INCLUDE_DIR}
-    ${STRIX_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR}
-    ${STRIX_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR})
-  target_link_libraries(strix_core PUBLIC
-    strix_diagnostics
+    ${GUFO_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR}
+    ${GUFO_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR})
+  target_link_libraries(gufo_core PUBLIC
+    gufo_diagnostics
     ${XRT_COREUTIL_LIB}
     ${UUID_LIBRARY})
 endif()

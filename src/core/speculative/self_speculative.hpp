@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_SPECULATIVE_SELF_SPECULATIVE_HPP_
-#define STRIX_CORE_SPECULATIVE_SELF_SPECULATIVE_HPP_
+#ifndef GUFO_CORE_SPECULATIVE_SELF_SPECULATIVE_HPP_
+#define GUFO_CORE_SPECULATIVE_SELF_SPECULATIVE_HPP_
 
 #include <cstdint>
 #include <memory>
@@ -9,7 +9,7 @@
 
 #include "src/core/speculative/draft_backend.hpp"
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 /// Configuration for layer-skipping self-speculative draft proposal
 struct SelfSpeculativeConfig {
@@ -46,6 +46,6 @@ private:
   std::vector<tokenization::TokenId> history_;
 };
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative
 
-#endif  // STRIX_CORE_SPECULATIVE_SELF_SPECULATIVE_HPP_
+#endif  // GUFO_CORE_SPECULATIVE_SELF_SPECULATIVE_HPP_

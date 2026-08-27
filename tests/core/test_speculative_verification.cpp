@@ -16,7 +16,7 @@
 
 namespace {
 
-using strix::tokenization::TokenId;
+using gufo::tokenization::TokenId;
 
 void Expect(bool condition, std::string_view message) {
   if (!condition) {
@@ -25,7 +25,7 @@ void Expect(bool condition, std::string_view message) {
 }
 
 class ScriptedTargetExecutor final
-    : public strix::speculative::ISpeculativeTargetExecutor {
+    : public gufo::speculative::ISpeculativeTargetExecutor {
 public:
   ScriptedTargetExecutor(std::vector<TokenId> generated_tokens, TokenId eos_id)
       : generated_tokens_(std::move(generated_tokens)), eos_id_(eos_id) {}
@@ -126,7 +126,7 @@ private:
   bool hidden_capture_enabled_{false};
 };
 
-class HiddenAwareDraftBackend final : public strix::speculative::IDraftBackend {
+class HiddenAwareDraftBackend final : public gufo::speculative::IDraftBackend {
 public:
   [[nodiscard]] std::string_view Name() const noexcept override {
     return "HiddenAwareDraftBackend";
@@ -137,7 +137,7 @@ public:
   }
 
   [[nodiscard]] bool PrimeTargetContext(
-      const strix::speculative::DraftTargetContext& context) override {
+      const gufo::speculative::DraftTargetContext& context) override {
     primed_prompt_.assign(context.prompt_tokens.begin(),
                           context.prompt_tokens.end());
     primed_hidden_.assign(context.prompt_hidden_states.begin(),
@@ -149,11 +149,11 @@ public:
                context.prompt_tokens.size() * context.hidden_size;
   }
 
-  [[nodiscard]] strix::speculative::DraftProposal Propose(
+  [[nodiscard]] gufo::speculative::DraftProposal Propose(
       std::span<const TokenId> prompt_tokens, std::uint32_t current_pos,
       std::uint32_t max_tokens) override {
     (void)prompt_tokens;
-    strix::speculative::DraftProposal proposal;
+    gufo::speculative::DraftProposal proposal;
     proposal.start_pos = current_pos;
     if (max_tokens > 0) {
       proposal.tokens.push_back(11);
@@ -200,7 +200,7 @@ private:
 };
 
 class ScriptedAcceptanceDraftBackend final
-    : public strix::speculative::IDraftBackend {
+    : public gufo::speculative::IDraftBackend {
 public:
   ScriptedAcceptanceDraftBackend(std::vector<TokenId> target_tokens,
                                  std::size_t prompt_size,
@@ -213,7 +213,7 @@ public:
     return "ScriptedAcceptanceDraftBackend";
   }
 
-  [[nodiscard]] strix::speculative::DraftProposal Propose(
+  [[nodiscard]] gufo::speculative::DraftProposal Propose(
       std::span<const TokenId> prompt_tokens, std::uint32_t current_pos,
       std::uint32_t max_tokens) override {
     (void)prompt_tokens;
@@ -229,7 +229,7 @@ public:
     const std::size_t available = target_tokens_.size() - target_start;
     const std::size_t count = std::min<std::size_t>(max_tokens, available);
 
-    strix::speculative::DraftProposal proposal;
+    gufo::speculative::DraftProposal proposal;
     proposal.start_pos = current_pos;
     proposal.tokens.reserve(count);
     for (std::size_t index = 0; index < count; ++index) {
@@ -252,9 +252,9 @@ private:
   std::vector<std::uint32_t> requested_lengths_;
 };
 
-strix::models::GenerationOptions GenerationOptions(std::size_t max_tokens,
-                                                   TokenId eos_id) {
-  strix::models::GenerationOptions options;
+gufo::models::GenerationOptions GenerationOptions(std::size_t max_tokens,
+                                                  TokenId eos_id) {
+  gufo::models::GenerationOptions options;
   options.max_new_tokens = max_tokens;
   options.eos_token_id = eos_id;
   return options;
@@ -262,7 +262,7 @@ strix::models::GenerationOptions GenerationOptions(std::size_t max_tokens,
 
 void TestSpeculativeDraftBackendInterface() {
   std::vector<TokenId> pool = {101, 102, 103, 104};
-  strix::speculative::MockDraftBackend backend(pool);
+  gufo::speculative::MockDraftBackend backend(pool);
 
   Expect(backend.Name() == "MockDraftBackend", "mock backend name");
 
@@ -277,7 +277,7 @@ void TestSpeculativeDraftBackendInterface() {
 }
 
 void TestSpeculativeStats() {
-  strix::speculative::SpeculativeStats stats;
+  gufo::speculative::SpeculativeStats stats;
   Expect(stats.AcceptanceRate() == 0.0F, "empty acceptance rate");
 
   stats.total_draft_tokens = 10;
@@ -289,9 +289,9 @@ void TestSpeculativeStats() {
 void TestFullAcceptanceProducesTargetBonusToken() {
   constexpr TokenId eos_id = 900;
   ScriptedTargetExecutor target({10, 11, 12, 13}, eos_id);
-  auto backend = std::make_unique<strix::speculative::MockDraftBackend>(
+  auto backend = std::make_unique<gufo::speculative::MockDraftBackend>(
       std::vector<TokenId>{11, 12});
-  strix::speculative::SpeculativeVerifier verifier(target, std::move(backend));
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend));
   const std::vector<TokenId> prompt = {1, 2, 3};
 
   const auto output = verifier.Generate(prompt, GenerationOptions(4, eos_id));
@@ -312,7 +312,7 @@ void TestHiddenAwareBackendReceivesCommittedTargetState() {
   ScriptedTargetExecutor target({10, 11, 12}, eos_id);
   auto backend = std::make_unique<HiddenAwareDraftBackend>();
   auto* backend_view = backend.get();
-  strix::speculative::SpeculativeVerifier verifier(target, std::move(backend));
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend));
   const std::vector<TokenId> prompt = {1, 2, 3};
 
   const auto output = verifier.Generate(prompt, GenerationOptions(3, eos_id));
@@ -341,9 +341,9 @@ void TestHiddenAwareBackendReceivesCommittedTargetState() {
 void TestPartialRejectionRestoresAndReplaysState() {
   constexpr TokenId eos_id = 900;
   ScriptedTargetExecutor target({10, 11, 12}, eos_id);
-  auto backend = std::make_unique<strix::speculative::MockDraftBackend>(
+  auto backend = std::make_unique<gufo::speculative::MockDraftBackend>(
       std::vector<TokenId>{11, 99});
-  strix::speculative::SpeculativeVerifier verifier(target, std::move(backend));
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend));
   const std::vector<TokenId> prompt = {1, 2, 3};
 
   const auto output = verifier.Generate(prompt, GenerationOptions(3, eos_id));
@@ -358,9 +358,9 @@ void TestPartialRejectionRestoresAndReplaysState() {
 void TestImmediateRejectionRestoresGreedyState() {
   constexpr TokenId eos_id = 900;
   ScriptedTargetExecutor target({10, 11}, eos_id);
-  auto backend = std::make_unique<strix::speculative::MockDraftBackend>(
+  auto backend = std::make_unique<gufo::speculative::MockDraftBackend>(
       std::vector<TokenId>{99, 98});
-  strix::speculative::SpeculativeVerifier verifier(target, std::move(backend));
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend));
   const std::vector<TokenId> prompt = {1, 2, 3};
 
   const auto output = verifier.Generate(prompt, GenerationOptions(2, eos_id));
@@ -386,14 +386,14 @@ void TestAcceptedTokenEmaDraftPolicy() {
       generated_tokens, prompt.size(), std::vector<std::size_t>{3, 3, 1, 3});
   auto* backend_view = backend.get();
 
-  strix::speculative::SpeculativeOptions options;
+  gufo::speculative::SpeculativeOptions options;
   options.max_draft_tokens = 7;
   options.min_draft_tokens = 3;
   options.initial_draft_tokens = 7;
   options.adaptive_draft_policy =
-      strix::speculative::AdaptiveDraftPolicy::kAcceptedTokenEma;
-  strix::speculative::SpeculativeVerifier verifier(target, std::move(backend),
-                                                   options);
+      gufo::speculative::AdaptiveDraftPolicy::kAcceptedTokenEma;
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend),
+                                                  options);
 
   const auto output = verifier.Generate(prompt, GenerationOptions(15, eos_id));
   const std::vector<TokenId> expected(generated_tokens.begin(),
@@ -409,9 +409,9 @@ void TestAcceptedTokenEmaDraftPolicy() {
 void TestFirstPrefillTokenHonorsBudgetAndCallback() {
   constexpr TokenId eos_id = 900;
   ScriptedTargetExecutor target({10, 11}, eos_id);
-  auto backend = std::make_unique<strix::speculative::MockDraftBackend>(
+  auto backend = std::make_unique<gufo::speculative::MockDraftBackend>(
       std::vector<TokenId>{11});
-  strix::speculative::SpeculativeVerifier verifier(target, std::move(backend));
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend));
   const std::vector<TokenId> prompt = {1, 2, 3};
   std::vector<TokenId> callback_tokens;
 
@@ -432,9 +432,9 @@ void TestFirstPrefillTokenHonorsBudgetAndCallback() {
 void TestFirstPrefillEosIsNotEmitted() {
   constexpr TokenId eos_id = 900;
   ScriptedTargetExecutor target({eos_id}, eos_id);
-  auto backend = std::make_unique<strix::speculative::MockDraftBackend>(
+  auto backend = std::make_unique<gufo::speculative::MockDraftBackend>(
       std::vector<TokenId>{1});
-  strix::speculative::SpeculativeVerifier verifier(target, std::move(backend));
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend));
   const std::vector<TokenId> prompt = {1, 2, 3};
   std::size_t callback_count = 0;
 

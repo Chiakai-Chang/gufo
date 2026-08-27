@@ -15,7 +15,7 @@
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 template<std::uint32_t WavesPerBlock>
 __launch_bounds__(WavesPerBlock * 32, 4) __global__
@@ -388,5 +388,5 @@ void LaunchFusedRMSNormQKVProjections(
       x, norm_w, eps, q_w, q_is_bf16, k_w, k_is_bf16, v_w, v_is_bf16, q_out,
       k_out, v_out, q_dim, kv_dim, hidden_size);
 }
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

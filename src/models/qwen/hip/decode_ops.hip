@@ -14,7 +14,7 @@
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 namespace {
 
@@ -61,5 +61,5 @@ void LaunchLayerWeightPrefetch(const void* data, std::size_t bytes,
   LayerWeightPrefetchKernel<<<grid, 256, 0, stream>>>(data, bytes);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

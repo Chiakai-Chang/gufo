@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_MODEL_REGISTRY_HPP_
-#define STRIX_CORE_MODEL_REGISTRY_HPP_
+#ifndef GUFO_CORE_MODEL_REGISTRY_HPP_
+#define GUFO_CORE_MODEL_REGISTRY_HPP_
 
 #include <optional>
 #include <span>
@@ -8,7 +8,7 @@
 
 #include "src/core/model_kind.hpp"
 
-namespace strix::core {
+namespace gufo::core {
 
 /// Thread-safe, immutable compiled model registry.
 /// Dynamic or arbitrary architecture loading is rejected; all supported
@@ -68,6 +68,6 @@ GetRegisteredModels() noexcept {
   return ModelRegistry::GetAllModels();
 }
 
-}  // namespace strix::core
+}  // namespace gufo::core
 
-#endif  // STRIX_CORE_MODEL_REGISTRY_HPP_
+#endif  // GUFO_CORE_MODEL_REGISTRY_HPP_

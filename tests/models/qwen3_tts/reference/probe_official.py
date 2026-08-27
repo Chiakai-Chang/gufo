@@ -51,7 +51,7 @@ def main():
         ),
     )
     ap.add_argument("--model", default="/home/fbozzo/projects/Qwen3-TTS-12Hz-1.7B-CustomVoice")
-    ap.add_argument("--out", default="/home/fbozzo/projects/strix-halo.cpp/artifacts/qwen3_tts/internals")
+    ap.add_argument("--out", default="/home/fbozzo/projects/gufo/artifacts/qwen3_tts/internals")
     ap.add_argument("--speaker", default="vivian")
     ap.add_argument("--language", default="english")
     ap.add_argument(
@@ -251,7 +251,7 @@ def main():
     ).stdout.strip()
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump({
-            "schema": "strix.qwen3-tts-probe.v1",
+            "schema": "gufo.qwen3-tts-probe.v1",
             "reference_commit": reference_commit,
             "text": TEXT,
             "speaker": args.speaker,

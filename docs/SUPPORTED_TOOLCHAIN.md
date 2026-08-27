@@ -4,9 +4,9 @@ Status: active specification, updated 2026-08-17
 
 ## Objective
 
-This document defines the single supported Linux, compiler, ROCm, XRT, `amdxdna`, firmware, and AIE toolchain matrix for Strix-Halo.cpp.
+This document defines the single supported Linux, compiler, ROCm, XRT, `amdxdna`, firmware, and AIE toolchain matrix for gufo.
 
-Strix-Halo.cpp exclusively targets **AMD Strix Halo** systems on **Linux x86-64**. All build-time and runtime dependencies are pinned immutably through Nix. Direct host builds, ambient `/usr` path lookups, and unpinned dependencies are unsupported.
+gufo exclusively targets **AMD Strix Halo** systems on **Linux x86-64**. All build-time and runtime dependencies are pinned immutably through Nix. Direct host builds, ambient `/usr` path lookups, and unpinned dependencies are unsupported.
 
 ---
 

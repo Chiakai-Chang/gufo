@@ -16,7 +16,7 @@
 
 #include "src/models/minimax_h3/json.hpp"
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 namespace {
 
 constexpr std::size_t kMaximumTokenizerBytes = 32U << 20U;
@@ -649,4 +649,4 @@ bool Tokenizer::Decode(const std::vector<std::uint32_t>& ids, std::string* text,
   return true;
 }
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3

@@ -13,7 +13,7 @@
 #include "src/models/qwen/gemm_route.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 template<std::uint32_t WavesPerBlock>
 __launch_bounds__(WavesPerBlock * 32, 4) __global__
@@ -422,5 +422,5 @@ void LaunchGEMVResidual(const void* A, core::GgmlType a_type, const float* x,
   }
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif

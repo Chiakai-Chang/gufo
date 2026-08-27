@@ -10,8 +10,8 @@ import unittest
 import numpy as np
 import zstandard
 
-from tools.strix import manifest as strix_manifest
-from tools.strix import quality
+from tools.gufo import manifest as gufo_manifest
+from tools.gufo import quality
 
 
 class TestLogitCompare(unittest.TestCase):
@@ -49,7 +49,7 @@ class TestLogitCompare(unittest.TestCase):
         metrics = {"positions": len(tokens), "prompts": 1, "vocab_size": vocab_size}
         (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), "utf-8")
 
-        strix_manifest.write_logit_manifest(
+        gufo_manifest.write_logit_manifest(
             out_dir,
             model_family="qwen35",
             model_tag=tag,

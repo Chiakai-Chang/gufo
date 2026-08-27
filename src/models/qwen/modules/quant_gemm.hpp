@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_MODULES_QUANT_GEMM_HPP_
-#define STRIX_MODELS_QWEN_MODULES_QUANT_GEMM_HPP_
+#ifndef GUFO_MODELS_QWEN_MODULES_QUANT_GEMM_HPP_
+#define GUFO_MODELS_QWEN_MODULES_QUANT_GEMM_HPP_
 
 #include <cstddef>
 #include <span>
@@ -7,7 +7,7 @@
 #include "src/models/qwen/modules/module_ctx.hpp"
 #include "src/models/qwen/state.hpp"  // QwenTensorRef
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 /// GEMV dispatch: y = A @ x.
 ///
@@ -28,6 +28,6 @@ void QuantGemm(const HipModuleContext& ctx, const QwenTensorRef& A,
                std::span<const float> x, std::size_t M, std::size_t K,
                std::span<float> y) noexcept;
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen
 
-#endif  // STRIX_MODELS_QWEN_MODULES_QUANT_GEMM_HPP_
+#endif  // GUFO_MODELS_QWEN_MODULES_QUANT_GEMM_HPP_

@@ -14,16 +14,16 @@ void Expect(bool condition, std::string_view message) {
 }
 
 void TestMiniMaxH3Descriptor() {
-  using strix::core::ModelFamily;
-  using strix::core::ModelKind;
-  using strix::core::ModelRegistry;
-  using strix::core::ModelRole;
+  using gufo::core::ModelFamily;
+  using gufo::core::ModelKind;
+  using gufo::core::ModelRegistry;
+  using gufo::core::ModelRole;
 
-  const auto parsed = strix::core::ParseModelKind("minimax-h3-fl2va-bf16");
+  const auto parsed = gufo::core::ParseModelKind("minimax-h3-fl2va-bf16");
   Expect(parsed == ModelKind::kMiniMaxH3Fl2vaBf16, "MiniMax H3 kind parses");
-  Expect(strix::core::ToString(*parsed) == "minimax-h3-fl2va-bf16",
+  Expect(gufo::core::ToString(*parsed) == "minimax-h3-fl2va-bf16",
          "MiniMax H3 kind round trips");
-  Expect(strix::core::ParseModelFamily("minimax-h3") == ModelFamily::kMiniMaxH3,
+  Expect(gufo::core::ParseModelFamily("minimax-h3") == ModelFamily::kMiniMaxH3,
          "MiniMax H3 family parses");
 
   const auto* descriptor =
@@ -64,14 +64,13 @@ void TestMiniMaxH3Descriptor() {
 }
 
 void TestRegistryIsClosed() {
-  const auto models = strix::core::ModelRegistry::GetAllModels();
+  const auto models = gufo::core::ModelRegistry::GetAllModels();
   Expect(models.size() == 3, "Exactly three compiled model kinds are present");
-  Expect(strix::core::ParseModelKind("minimax-h3-ref2va-bf16") == std::nullopt,
+  Expect(gufo::core::ParseModelKind("minimax-h3-ref2va-bf16") == std::nullopt,
          "Ref2VA is not a compiled model kind");
-  Expect(
-      strix::core::ParseModelKind("minimax-h3-regenerate-2k") == std::nullopt,
-      "2K regeneration is not a compiled model kind");
-  Expect(strix::core::ParseModelKind("minimax-h3") == std::nullopt,
+  Expect(gufo::core::ParseModelKind("minimax-h3-regenerate-2k") == std::nullopt,
+         "2K regeneration is not a compiled model kind");
+  Expect(gufo::core::ParseModelKind("minimax-h3") == std::nullopt,
          "Ambiguous H3 artifact names are rejected");
 }
 

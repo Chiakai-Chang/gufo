@@ -1,5 +1,5 @@
 {
-  description = "strix-halo.cpp - Strix Engine for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
+  description = "gufo - Gufo Engine for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -14,7 +14,7 @@
 
       pkgs = forAllSystems (system: import nixpkgs { inherit system; });
 
-      strixPackages = forAllSystems (
+      gufoPackages = forAllSystems (
         system:
         pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit version; }
       );
@@ -68,41 +68,41 @@
             ps.scipy
             ps.pandas
             ps.zstandard
-            strixPackages.${system}.hyperloom
+            gufoPackages.${system}.hyperloom
           ]
         );
     in
     {
       lib = {
-        mkStrixServe =
+        mkGufoServe =
           {
             pkgs ? null,
             system ? pkgs.system or "x86_64-linux",
-            strix ? self.packages.${system}.default,
+            gufo ? self.packages.${system}.default,
             ...
           }@args:
           let
-            targetScope = strixPackages.${system};
+            targetScope = gufoPackages.${system};
             mkServeFn = targetScope.mkServe.override {
-              inherit strix;
+              inherit gufo;
             };
-            fnArgs = builtins.removeAttrs args [ "pkgs" "system" "strix" ];
+            fnArgs = builtins.removeAttrs args [ "pkgs" "system" "gufo" ];
           in
           mkServeFn fnArgs;
-        mkServe = self.lib.mkStrixServe;
+        mkServe = self.lib.mkGufoServe;
       } // forAllSystems (system: {
-        mkStrixServe =
+        mkGufoServe =
           args:
-          self.lib.mkStrixServe (args // { inherit system; });
+          self.lib.mkGufoServe (args // { inherit system; });
         mkServe =
           args:
-          self.lib.mkStrixServe (args // { inherit system; });
+          self.lib.mkGufoServe (args // { inherit system; });
       });
 
       packages = forAllSystems (
         system:
         let
-          base = strixPackages.${system}.strix;
+          base = gufoPackages.${system}.gufo;
         in
         {
           # The only package we ship: ROCm/HIP compiled for gfx1151 + XRT NPU
@@ -113,10 +113,10 @@
             rocmGpuTargets = [ "gfx1151" ];
           };
           aie-qwen-mtp-eh-proj =
-            strixPackages.${system}.aie-qwen-mtp-eh-proj;
+            gufoPackages.${system}.aie-qwen-mtp-eh-proj;
           aie-qwen-mtp-rmsnorm =
-            strixPackages.${system}.aie-qwen-mtp-rmsnorm;
-          aie-smoke = strixPackages.${system}.aie-smoke;
+            gufoPackages.${system}.aie-qwen-mtp-rmsnorm;
+          aie-smoke = gufoPackages.${system}.aie-smoke;
         }
       );
 
@@ -137,20 +137,20 @@
             ];
             env = {
               ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";
-              STRIX_HIPCUB_ROOT = "${pkgs.${system}.rocmPackages.hipcub}";
-              STRIX_ROCPRIM_ROOT = "${pkgs.${system}.rocmPackages.rocprim}";
-              STRIX_ROCWMMA_ROOT = "${pkgs.${system}.rocmPackages.rocwmma}";
-              STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
-                "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
-              STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT =
-                "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
-              STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
-                "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
-              STRIX_AIE_QWEN_MTP_RMSNORM_ROOT =
-                "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
-              STRIX_AIE_SMOKE_PROGRAM_DIR = "${strixPackages.${system}.aie-smoke}";
-              STRIX_AIE_SMOKE_ROOT = "${strixPackages.${system}.aie-smoke}";
-              XRT_PATH = "${strixPackages.${system}.xrt}/opt/xilinx/xrt";
+              GUFO_HIPCUB_ROOT = "${pkgs.${system}.rocmPackages.hipcub}";
+              GUFO_ROCPRIM_ROOT = "${pkgs.${system}.rocmPackages.rocprim}";
+              GUFO_ROCWMMA_ROOT = "${pkgs.${system}.rocmPackages.rocwmma}";
+              GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
+                "${gufoPackages.${system}.aie-qwen-mtp-eh-proj}";
+              GUFO_AIE_QWEN_MTP_EH_PROJ_ROOT =
+                "${gufoPackages.${system}.aie-qwen-mtp-eh-proj}";
+              GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
+                "${gufoPackages.${system}.aie-qwen-mtp-rmsnorm}";
+              GUFO_AIE_QWEN_MTP_RMSNORM_ROOT =
+                "${gufoPackages.${system}.aie-qwen-mtp-rmsnorm}";
+              GUFO_AIE_SMOKE_PROGRAM_DIR = "${gufoPackages.${system}.aie-smoke}";
+              GUFO_AIE_SMOKE_ROOT = "${gufoPackages.${system}.aie-smoke}";
+              XRT_PATH = "${gufoPackages.${system}.xrt}/opt/xilinx/xrt";
               TORCH_HOME = "${alexnetTorchHome system}";
               LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
                 pkgs.${system}.stdenv.cc.cc.lib
@@ -163,23 +163,23 @@
           # prevents MLIR-AIE's NumPy ABI from leaking into pythonTools.
           aie = pkgs.${system}.mkShell {
             packages = [
-              strixPackages.${system}.aiebu
-              strixPackages.${system}.llvm-aie
-              strixPackages.${system}.mlir-aie
+              gufoPackages.${system}.aiebu
+              gufoPackages.${system}.llvm-aie
+              gufoPackages.${system}.mlir-aie
             ];
             env = {
-              MLIR_AIE_INSTALL_DIR = "${strixPackages.${system}.mlir-aie}/${pkgs.${system}.python312.sitePackages}/mlir_aie";
-              PEANO_INSTALL_DIR = "${strixPackages.${system}.llvm-aie}/${pkgs.${system}.python312.sitePackages}/llvm-aie";
-              STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
-                "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
-              STRIX_AIE_QWEN_MTP_EH_PROJ_ROOT =
-                "${strixPackages.${system}.aie-qwen-mtp-eh-proj}";
-              STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
-                "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
-              STRIX_AIE_QWEN_MTP_RMSNORM_ROOT =
-                "${strixPackages.${system}.aie-qwen-mtp-rmsnorm}";
-              STRIX_AIE_SMOKE_PROGRAM_DIR = "${strixPackages.${system}.aie-smoke}";
-              XRT_PATH = "${strixPackages.${system}.xrt}/opt/xilinx/xrt";
+              MLIR_AIE_INSTALL_DIR = "${gufoPackages.${system}.mlir-aie}/${pkgs.${system}.python312.sitePackages}/mlir_aie";
+              PEANO_INSTALL_DIR = "${gufoPackages.${system}.llvm-aie}/${pkgs.${system}.python312.sitePackages}/llvm-aie";
+              GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
+                "${gufoPackages.${system}.aie-qwen-mtp-eh-proj}";
+              GUFO_AIE_QWEN_MTP_EH_PROJ_ROOT =
+                "${gufoPackages.${system}.aie-qwen-mtp-eh-proj}";
+              GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
+                "${gufoPackages.${system}.aie-qwen-mtp-rmsnorm}";
+              GUFO_AIE_QWEN_MTP_RMSNORM_ROOT =
+                "${gufoPackages.${system}.aie-qwen-mtp-rmsnorm}";
+              GUFO_AIE_SMOKE_PROGRAM_DIR = "${gufoPackages.${system}.aie-smoke}";
+              XRT_PATH = "${gufoPackages.${system}.xrt}/opt/xilinx/xrt";
             };
           };
         }
@@ -241,7 +241,7 @@
               "cmake"
               "src"
               "tests"
-              "tools/strix"
+              "tools/gufo"
             ];
             files = [
               ".clang-format"
@@ -251,17 +251,17 @@
 
           h3ManifestSource = mkFilteredSource {
             directories = [
-              "tools/strix"
+              "tools/gufo"
             ];
             files = [
               "tests/tools/test_h3_manifest.py"
-              "tools/h3/strix-h3-manifest.py"
+              "tools/h3/gufo-h3-manifest.py"
             ];
           };
 
           h3QualitySource = mkFilteredSource {
             directories = [
-              "tools/strix"
+              "tools/gufo"
             ];
             files = [
               "src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
@@ -275,7 +275,7 @@
               "tests/tools/h3_profile_report_test.py"
               "tests/tools/h3_rng_test.py"
               "tests/tools/test_h3_quality.py"
-              "tools/h3/strix-h3-quality.py"
+              "tools/h3/gufo-h3-quality.py"
             ];
           };
 
@@ -430,7 +430,7 @@
             set -euo pipefail
 
             ccache_launcher=
-            ccache_dir=/tmp/strix-ccache
+            ccache_dir=/tmp/gufo-ccache
             if [[ -d "$ccache_dir" && -w "$ccache_dir" ]]; then
               export CCACHE_DIR="$ccache_dir"
               export CCACHE_BASEDIR="$src"
@@ -458,7 +458,7 @@
 
           mkServeCheck =
             let
-              cmd = self.lib.${system}.mkStrixServe {
+              cmd = self.lib.${system}.mkGufoServe {
                 model = "/var/models/qwen.gguf";
                 context = 4096;
                 servedModelName = "qwen-test";
@@ -470,7 +470,7 @@
             pkgsSys.runCommand "check-mk-serve" { } ''
               # Verify the synthesized CLI string contains expected flags and binary path
               cmd_str="${cmd}"
-              echo "$cmd_str" | grep -F "/bin/strix serve"
+              echo "$cmd_str" | grep -F "/bin/gufo serve"
               echo "$cmd_str" | grep -F -- "--model /var/models/qwen.gguf"
               echo "$cmd_str" | grep -F -- "--context 4096"
               echo "$cmd_str" | grep -F -- "--served-model-name qwen-test"
@@ -478,7 +478,7 @@
               echo "$cmd_str" | grep -F -- "--dflash-model /var/models/qwen-draft.gguf"
               echo "$cmd_str" | grep -F -- "--port 9000"
               mkdir -p $out
-              echo "PASS: mkStrixServe CLI string check passed" > $out/result.txt
+              echo "PASS: mkGufoServe CLI string check passed" > $out/result.txt
             '';
 
           # Canonical PR umbrella. Nix builds these independent derivations in
@@ -488,8 +488,8 @@
           # every hosted PR runner exhausts the runner disk before tests start.
           prCheck = pkgsSys.runCommand "check-pr" { } ''
             mkdir -p $out/bin
-            cp "${self.packages.${system}.default}/bin/strix" $out/bin/strix
-            ln -sf strix $out/bin/strix-server
+            cp "${self.packages.${system}.default}/bin/gufo" $out/bin/gufo
+            ln -sf gufo $out/bin/gufo-server
 
             cat "${formatCheck}/result.txt"
             cat "${staticAnalysisCheck}/result.txt"
@@ -514,12 +514,12 @@ Composed Gates:
   5. MiniMax H3 Source-Manifest Validation
   6. MiniMax H3 Quality-Oracle Validation
   7. CPU Build and Runtime/Unit Tests (CTest)
-  8. Declarative Server Wrapper Generation (mkStrixServe)
+  8. Declarative Server Wrapper Generation (mkGufoServe)
 Explicit Offline Gate (not in hosted PR closure):
   - MiniMax H3 Pinned Teacher & Offline LPIPS Validation
 Production Package Validation:
   - gfx1151 ROCm/HIP + XRT build
-  - Installed strix-server version/help smoke
+  - Installed gufo-server version/help smoke
 EOF
           '';
         in

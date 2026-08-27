@@ -2,7 +2,7 @@
 
 Status: research record, 2026-08-17
 
-This document preserves the evidence behind Strix's XDNA2 interoperability and
+This document preserves the evidence behind Gufo's XDNA2 interoperability and
 routing decisions. It is not a claim that every referenced API combination is
 supported on every ROCm, XRT, firmware, or kernel revision. Production support
 is established only by the probes and promotion gates below on the pinned
@@ -66,7 +66,7 @@ XRT/amdxdna PRIME FD -> hipExternalMemoryHandleTypeOpaqueFd -> gfx1151
 ```
 
 The interfaces align, but that exact cross-driver combination remains a
-platform capability to prove. The first Strix experiment therefore uses:
+platform capability to prove. The first Gufo experiment therefore uses:
 
 ```text
 XRT BO
@@ -77,7 +77,7 @@ XRT BO
   -> gfx1151 pointer
 ```
 
-The public XRT export-handle representation is implementation-specific. Strix
+The public XRT export-handle representation is implementation-specific. Gufo
 must isolate Linux-FD extraction behind a version-checked adapter rather than
 exposing that assumption throughout the runtime.
 
@@ -101,7 +101,7 @@ command waits for the other device.
 `amdxdna` uses dma reservation objects, job fences, DRM sync objects, and
 timeline points. The research did not establish a complete automatic chain in
 which amdgpu publishes an implicit fence and `amdxdna` reliably waits on it, or
-the reverse. Implicit cross-driver fencing is therefore not part of Strix's
+the reverse. Implicit cross-driver fencing is therefore not part of Gufo's
 initial correctness model.
 
 The initial handoff protocol is:
@@ -144,7 +144,7 @@ Driver synchronization evidence:
 
 ### Positive evidence
 
-The community `Strix-Halo-Linux-NPU-Concurrency` experiment runs an NPU probe
+The community `gufo-Linux-NPU-Concurrency` experiment runs an NPU probe
 while a ROCm llama.cpp workload keeps the iGPU near 87 percent utilization. It
 reports roughly 1.7–1.9x aggregate throughput compared with fully sequential
 multi-tier serving.
@@ -155,7 +155,7 @@ same improvement.
 
 Source:
 
-- <https://github.com/LucRoot/Strix-Halo-Linux-NPU-Concurrency/blob/main/README.md>
+- <https://github.com/LucRoot/gufo-Linux-NPU-Concurrency/blob/main/README.md>
 
 ### Stability risk
 
@@ -222,7 +222,7 @@ average improvements for column-major B were approximately:
 | BF16 to BF16 | 8.7% |
 
 The implementation uses multidimensional DMA addressing to transform normal
-DRAM layouts into AIE-consumable tiles. Strix should therefore measure both its
+DRAM layouts into AIE-consumable tiles. Gufo should therefore measure both its
 canonical T16 representation and a lossless backend view. It should not assume
 that source tensors must be permanently pre-tiled in an AIE-only layout.
 
@@ -267,7 +267,7 @@ Sources:
 - IRON README and operator inventory:
   <https://github.com/amd/IRON/blob/devel/README.md>
 
-## 5. Routing Implications for Strix
+## 5. Routing Implications for Gufo
 
 The initial protected route is:
 

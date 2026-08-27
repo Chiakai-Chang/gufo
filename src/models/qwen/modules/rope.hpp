@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_MODULES_ROPE_HPP_
-#define STRIX_MODELS_QWEN_MODULES_ROPE_HPP_
+#ifndef GUFO_MODELS_QWEN_MODULES_ROPE_HPP_
+#define GUFO_MODELS_QWEN_MODULES_ROPE_HPP_
 
 #include <cstdint>
 #include <span>
@@ -7,7 +7,7 @@
 #include "src/models/qwen/modules/layer_view.hpp"
 #include "src/models/qwen/modules/module_ctx.hpp"
 
-namespace strix::models::qwen {
+namespace gufo::models::qwen {
 
 /// RoPE rotation on Q and K heads for the given position.
 ///
@@ -18,6 +18,6 @@ void RopeForward(const CpuModuleContext& ctx, const RopeLayerView& view,
                  std::span<float> q, std::span<float> k,
                  std::uint32_t pos) noexcept;
 
-}  // namespace strix::models::qwen
+}  // namespace gufo::models::qwen
 
-#endif  // STRIX_MODELS_QWEN_MODULES_ROPE_HPP_
+#endif  // GUFO_MODELS_QWEN_MODULES_ROPE_HPP_

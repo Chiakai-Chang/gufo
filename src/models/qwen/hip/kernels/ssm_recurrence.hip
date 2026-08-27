@@ -6,7 +6,7 @@
 
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 // Batched Causal SSM Conv1D + token-serial DeltaNet recurrence (pure recurrence
 // unit). The fused per-head post-RMSNorm + gate epilogue lives in
@@ -286,5 +286,5 @@ void LaunchBatchedSSMConvRecurrence(
       val_dim);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

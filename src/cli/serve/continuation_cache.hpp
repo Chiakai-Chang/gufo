@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_CONTINUATION_CACHE_HPP_
-#define STRIX_SERVER_CONTINUATION_CACHE_HPP_
+#ifndef GUFO_SERVER_CONTINUATION_CACHE_HPP_
+#define GUFO_SERVER_CONTINUATION_CACHE_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -8,7 +8,7 @@
 #include <span>
 #include <vector>
 
-namespace strix::server {
+namespace gufo::server {
 
 using ContinuationToken = std::uint32_t;
 
@@ -101,6 +101,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_CONTINUATION_CACHE_HPP_
+#endif  // GUFO_SERVER_CONTINUATION_CACHE_HPP_

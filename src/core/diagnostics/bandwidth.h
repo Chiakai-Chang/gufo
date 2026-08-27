@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_DIAGNOSTICS_BANDWIDTH_H_
-#define STRIX_CORE_DIAGNOSTICS_BANDWIDTH_H_
+#ifndef GUFO_CORE_DIAGNOSTICS_BANDWIDTH_H_
+#define GUFO_CORE_DIAGNOSTICS_BANDWIDTH_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 
 #include "src/core/diagnostics/fingerprint.h"
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 struct BandwidthOptions {
   std::vector<std::string> backends{"cpu", "hip", "xrt"};
@@ -61,6 +61,6 @@ struct BandwidthReport {
 [[nodiscard]] BandwidthReport RunBandwidthBenchmark(
     const BandwidthOptions& options, const MachineFingerprint& fingerprint);
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics
 
-#endif  // STRIX_CORE_DIAGNOSTICS_BANDWIDTH_H_
+#endif  // GUFO_CORE_DIAGNOSTICS_BANDWIDTH_H_

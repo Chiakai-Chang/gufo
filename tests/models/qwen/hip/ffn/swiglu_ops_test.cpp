@@ -60,16 +60,16 @@ void TestBatchedFusedSwiGLUEquivalence() {
 
   // Sequential
   for (std::size_t t = 0; t < batch; ++t) {
-    strix::hip::LaunchFusedSwiGLUGEMV(
-        d_gate_w, strix::core::GgmlType::kF32, d_up_w,
-        strix::core::GgmlType::kF32, d_x + t * hidden_size,
+    gufo::hip::LaunchFusedSwiGLUGEMV(
+        d_gate_w, gufo::core::GgmlType::kF32, d_up_w,
+        gufo::core::GgmlType::kF32, d_x + t * hidden_size,
         d_out_seq + t * intermediate_size, intermediate_size, hidden_size);
   }
 
   // Batched
-  strix::hip::LaunchBatchedFusedSwiGLUGEMM(d_gate_w, false, d_up_w, false, d_x,
-                                           d_out_batch, nullptr, batch,
-                                           intermediate_size, hidden_size);
+  gufo::hip::LaunchBatchedFusedSwiGLUGEMM(d_gate_w, false, d_up_w, false, d_x,
+                                          d_out_batch, nullptr, batch,
+                                          intermediate_size, hidden_size);
 
   HIP_CHECK(hipDeviceSynchronize());
 
@@ -89,7 +89,7 @@ void TestBatchedFusedSwiGLUEquivalence() {
       max_diff = d;
   }
   std::cout << "Fused SwiGLU Seq vs Batch max diff: " << max_diff << "\n";
-  strix::test::Expect(max_diff < 1e-4F, "batched fused SwiGLU result mismatch");
+  gufo::test::Expect(max_diff < 1e-4F, "batched fused SwiGLU result mismatch");
 
   HIP_CHECK(hipFree(d_x));
   HIP_CHECK(hipFree(d_gate_w));
@@ -110,9 +110,9 @@ void TestBatchedFusedSwiGLUProductionEquivalence() {
     h_x[i] = 0.5F * std::sin(static_cast<float>(i + 1) * 0.037F);
   }
   for (std::size_t i = 0; i < intermediate_size * hidden_size; ++i) {
-    h_gate_w[i] = strix::test::FloatToBf16Bits(
+    h_gate_w[i] = gufo::test::FloatToBf16Bits(
         0.012F * std::cos(static_cast<float>(i + 1) * 0.0021F));
-    h_up_w[i] = strix::test::FloatToBf16Bits(
+    h_up_w[i] = gufo::test::FloatToBf16Bits(
         0.017F * std::sin(static_cast<float>(i + 1) * 0.0017F));
   }
 
@@ -143,23 +143,23 @@ void TestBatchedFusedSwiGLUProductionEquivalence() {
   HIP_CHECK(hipMemcpy(d_up_w, h_up_w.data(),
                       intermediate_size * hidden_size * sizeof(std::uint16_t),
                       hipMemcpyHostToDevice));
-  strix::hip::LaunchFloatToBfloat16(d_x, d_x_bf16, batch * hidden_size);
+  gufo::hip::LaunchFloatToBfloat16(d_x, d_x_bf16, batch * hidden_size);
 
   hipblasHandle_t handle = nullptr;
   HIPBLAS_CHECK(hipblasCreate(&handle));
 
   // Unfused production chain: gate GEMM, up GEMM, SwiGLU activation.
-  strix::hip::LaunchHipblasGEMMBF16(handle, d_gate_w, d_x_bf16, d_gate, batch,
-                                    intermediate_size, hidden_size);
-  strix::hip::LaunchHipblasGEMMBF16(handle, d_up_w, d_x_bf16, d_up, batch,
-                                    intermediate_size, hidden_size);
-  strix::hip::LaunchBatchedSwiGLUActivation(
+  gufo::hip::LaunchHipblasGEMMBF16(handle, d_gate_w, d_x_bf16, d_gate, batch,
+                                   intermediate_size, hidden_size);
+  gufo::hip::LaunchHipblasGEMMBF16(handle, d_up_w, d_x_bf16, d_up, batch,
+                                   intermediate_size, hidden_size);
+  gufo::hip::LaunchBatchedSwiGLUActivation(
       d_gate, d_up, d_out_ref, d_out_bf16_ref, batch * intermediate_size);
 
   // Fused kernel (consumes the FP32 normed input).
-  strix::hip::LaunchBatchedFusedSwiGLUGEMM(d_gate_w, true, d_up_w, true, d_x,
-                                           d_out_fus, d_out_bf16_fus, batch,
-                                           intermediate_size, hidden_size);
+  gufo::hip::LaunchBatchedFusedSwiGLUGEMM(d_gate_w, true, d_up_w, true, d_x,
+                                          d_out_fus, d_out_bf16_fus, batch,
+                                          intermediate_size, hidden_size);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<float> res_ref(batch * intermediate_size);
@@ -184,8 +184,8 @@ void TestBatchedFusedSwiGLUProductionEquivalence() {
     const float d = std::abs(res_ref[i] - res_fus[i]);
     max_diff = std::max(max_diff, d);
     mean_diff += d;
-    const float db = std::abs(strix::test::Bf16BitsToFloat(res_bf16_ref[i]) -
-                              strix::test::Bf16BitsToFloat(res_bf16_fus[i]));
+    const float db = std::abs(gufo::test::Bf16BitsToFloat(res_bf16_ref[i]) -
+                              gufo::test::Bf16BitsToFloat(res_bf16_fus[i]));
     max_bf16_diff = std::max(max_bf16_diff, db);
   }
   mean_diff /= static_cast<float>(batch * intermediate_size);
@@ -226,9 +226,9 @@ void TestFusedRMSNormSwiGLUEquivalence() {
   std::vector<std::uint16_t> h_gate_w(intermediate_size * hidden_size);
   std::vector<std::uint16_t> h_up_w(intermediate_size * hidden_size);
   for (std::size_t i = 0; i < intermediate_size * hidden_size; ++i) {
-    h_gate_w[i] = strix::test::FloatToBf16Bits(
+    h_gate_w[i] = gufo::test::FloatToBf16Bits(
         0.012F * std::cos(static_cast<float>(i) * 0.0021F));
-    h_up_w[i] = strix::test::FloatToBf16Bits(
+    h_up_w[i] = gufo::test::FloatToBf16Bits(
         0.017F * std::sin(static_cast<float>(i) * 0.0017F));
   }
 
@@ -255,14 +255,14 @@ void TestFusedRMSNormSwiGLUEquivalence() {
                       intermediate_size * hidden_size * sizeof(std::uint16_t),
                       hipMemcpyHostToDevice));
 
-  strix::hip::LaunchRMSNorm(d_x, d_w, d_normed, hidden_size, eps);
-  strix::hip::LaunchFusedSwiGLUGEMV(d_gate_w, strix::core::GgmlType::kBF16,
-                                    d_up_w, strix::core::GgmlType::kBF16,
-                                    d_normed, d_out_ref, intermediate_size,
-                                    hidden_size);
-  strix::hip::LaunchFusedRMSNormSwiGLUGEMV(d_x, d_w, eps, d_gate_w, d_up_w,
-                                           d_out_fus, intermediate_size,
-                                           hidden_size);
+  gufo::hip::LaunchRMSNorm(d_x, d_w, d_normed, hidden_size, eps);
+  gufo::hip::LaunchFusedSwiGLUGEMV(d_gate_w, gufo::core::GgmlType::kBF16,
+                                   d_up_w, gufo::core::GgmlType::kBF16,
+                                   d_normed, d_out_ref, intermediate_size,
+                                   hidden_size);
+  gufo::hip::LaunchFusedRMSNormSwiGLUGEMV(d_x, d_w, eps, d_gate_w, d_up_w,
+                                          d_out_fus, intermediate_size,
+                                          hidden_size);
   HIP_CHECK(hipDeviceSynchronize());
 
   std::vector<float> ref(intermediate_size);
@@ -294,9 +294,9 @@ void TestFusedRMSNormSwiGLUEquivalence() {
 
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
-  const int device_status = strix::test::GateHipDevice(
-      strix::test::HipDeviceRequirement::kOptional, "Qwen SwiGLU ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+  const int device_status = gufo::test::GateHipDevice(
+      gufo::test::HipDeviceRequirement::kOptional, "Qwen SwiGLU ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

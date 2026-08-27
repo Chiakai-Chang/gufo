@@ -30,7 +30,7 @@ lib.makeScope newScope (self: {
       ;
   };
   aiebu = self.callPackage ./aiebu.nix { };
-  strix = self.callPackage ./package.nix {
+  gufo = self.callPackage ./package.nix {
     inherit version;
     inherit (self) aie-qwen-mtp-eh-proj aie-qwen-mtp-rmsnorm aie-smoke;
   };

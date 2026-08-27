@@ -13,7 +13,7 @@
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "STRIX_ENABLE_WARNINGS": "ON"
+        "GUFO_ENABLE_WARNINGS": "ON"
       }
     },
     {
@@ -48,7 +48,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "BUILD_TESTING": "ON",
-        "STRIX_ENABLE_SANITIZERS": "ON",
+        "GUFO_ENABLE_SANITIZERS": "ON",
         "ENGINE_ENABLE_HIP": "OFF",
         "ENGINE_ENABLE_XRT": "OFF"
       }

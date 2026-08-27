@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_TEXT_GENERATION_SCHEDULER_HPP_
-#define STRIX_SERVER_TEXT_GENERATION_SCHEDULER_HPP_
+#ifndef GUFO_SERVER_TEXT_GENERATION_SCHEDULER_HPP_
+#define GUFO_SERVER_TEXT_GENERATION_SCHEDULER_HPP_
 
 #include <chrono>
 #include <cstddef>
@@ -13,7 +13,7 @@
 #include "src/cli/serve/text_generation_backend.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 
 enum class TextRequestPhase : std::uint8_t {
   kQueued,
@@ -124,6 +124,6 @@ private:
 
 using TextRequestMetadata = TextGenerationScheduler::RequestMetadata;
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_TEXT_GENERATION_SCHEDULER_HPP_
+#endif  // GUFO_SERVER_TEXT_GENERATION_SCHEDULER_HPP_

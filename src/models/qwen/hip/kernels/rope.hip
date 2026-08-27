@@ -8,7 +8,7 @@
 
 #include "src/models/qwen/hip/ops/token.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 __global__ void RoPEKernel(float* __restrict__ q, float* __restrict__ k,
                            std::uint32_t num_heads, std::uint32_t num_kv_heads,
@@ -150,5 +150,5 @@ void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
       q, k, num_heads, num_kv_heads, head_dim, rotary_dim, d_pos, rope_theta);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif

@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_HIP_SPEECH_DECODER_OPS_HPP_
-#define STRIX_MODELS_QWEN3_TTS_HIP_SPEECH_DECODER_OPS_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_HIP_SPEECH_DECODER_OPS_HPP_
+#define GUFO_MODELS_QWEN3_TTS_HIP_SPEECH_DECODER_OPS_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 
 void LaunchDecodeCodebook(const std::uint32_t* codes, std::uint32_t code_groups,
                           std::uint32_t group_index, const float* embedding_sum,
@@ -90,7 +90,7 @@ void LaunchAssembleCausalConvTranspose1d(const float* expanded,
 void LaunchClamp(float* values, std::size_t elements, float minimum,
                  float maximum, hipStream_t stream);
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 #endif
 
-#endif  // STRIX_MODELS_QWEN3_TTS_HIP_SPEECH_DECODER_OPS_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_HIP_SPEECH_DECODER_OPS_HPP_

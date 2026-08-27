@@ -14,12 +14,12 @@
 
 namespace {
 
-using strix::minimax_h3::CancellationToken;
-using strix::minimax_h3::MediaMuxTelemetry;
-using strix::minimax_h3::MediaProbe;
-using strix::minimax_h3::MediaVideoOptions;
-using strix::minimax_h3::ProbeMediaFile;
-using strix::minimax_h3::WriteSynchronizedMp4;
+using gufo::minimax_h3::CancellationToken;
+using gufo::minimax_h3::MediaMuxTelemetry;
+using gufo::minimax_h3::MediaProbe;
+using gufo::minimax_h3::MediaVideoOptions;
+using gufo::minimax_h3::ProbeMediaFile;
+using gufo::minimax_h3::WriteSynchronizedMp4;
 
 [[noreturn]] void Fail(const std::string& message) {
   std::cerr << "FAIL minimax_h3_media_test: " << message << '\n';
@@ -73,7 +73,7 @@ bool HasSentinel(const std::filesystem::path& path) {
 }
 
 bool HasPartialFor(const std::filesystem::path& path) {
-  const std::string prefix = path.filename().string() + ".strix-partial-";
+  const std::string prefix = path.filename().string() + ".gufo-partial-";
   for (const std::filesystem::directory_entry& entry :
        std::filesystem::directory_iterator(path.parent_path())) {
     if (entry.path().filename().string().starts_with(prefix)) {
@@ -93,15 +93,15 @@ int main() {
   constexpr int kOutputHeight = 48;
   constexpr int kSamples = 29600;
   const std::filesystem::path output =
-      std::filesystem::temp_directory_path() / "strix-h3-media-test.mp4";
+      std::filesystem::temp_directory_path() / "gufo-h3-media-test.mp4";
   const std::filesystem::path cancelled_output =
       std::filesystem::temp_directory_path() /
-      "strix-h3-media-cancelled-test.mp4";
+      "gufo-h3-media-cancelled-test.mp4";
   const std::filesystem::path error_output =
-      std::filesystem::temp_directory_path() / "strix-h3-media-error-test.mp4";
+      std::filesystem::temp_directory_path() / "gufo-h3-media-error-test.mp4";
   const std::filesystem::path probe_error_output =
       std::filesystem::temp_directory_path() /
-      "strix-h3-media-probe-error-test.mp4";
+      "gufo-h3-media-probe-error-test.mp4";
   std::error_code ignored;
   std::filesystem::remove(output, ignored);
   std::filesystem::remove(cancelled_output, ignored);
@@ -183,35 +183,35 @@ int main() {
   }
   std::filesystem::remove(cancelled_output, ignored);
 
-  const char* saved = std::getenv("STRIX_FFMPEG");
+  const char* saved = std::getenv("GUFO_FFMPEG");
   const std::string saved_value = saved == nullptr ? "" : saved;
   WriteSentinel(error_output);
-  setenv("STRIX_FFMPEG", "/bin/false", 1);
+  setenv("GUFO_FFMPEG", "/bin/false", 1);
   const bool error_result = WriteSynchronizedMp4(
       error_output, frames, kFrames, kWidth, kHeight, 24, pcm, kSamples, 2,
       32000, nullptr, &telemetry, &error);
   if (saved == nullptr) {
-    unsetenv("STRIX_FFMPEG");
+    unsetenv("GUFO_FFMPEG");
   } else {
-    setenv("STRIX_FFMPEG", saved_value.c_str(), 1);
+    setenv("GUFO_FFMPEG", saved_value.c_str(), 1);
   }
   if (error_result || !HasSentinel(error_output) ||
       HasPartialFor(error_output)) {
     Fail("FFmpeg child error did not preserve the prior output");
   }
 
-  const char* saved_probe = std::getenv("STRIX_FFPROBE");
+  const char* saved_probe = std::getenv("GUFO_FFPROBE");
   const std::string saved_probe_value =
       saved_probe == nullptr ? "" : saved_probe;
   WriteSentinel(probe_error_output);
-  setenv("STRIX_FFPROBE", "/bin/false", 1);
+  setenv("GUFO_FFPROBE", "/bin/false", 1);
   const bool probe_error_result = WriteSynchronizedMp4(
       probe_error_output, frames, kFrames, kWidth, kHeight, 24, pcm, kSamples,
       2, 32000, nullptr, &telemetry, &error);
   if (saved_probe == nullptr) {
-    unsetenv("STRIX_FFPROBE");
+    unsetenv("GUFO_FFPROBE");
   } else {
-    setenv("STRIX_FFPROBE", saved_probe_value.c_str(), 1);
+    setenv("GUFO_FFPROBE", saved_probe_value.c_str(), 1);
   }
   if (probe_error_result || !HasSentinel(probe_error_output) ||
       HasPartialFor(probe_error_output)) {

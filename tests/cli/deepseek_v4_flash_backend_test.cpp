@@ -16,8 +16,8 @@
 
 namespace {
 
-using Model = strix::models::deepseek_v4_flash::Model;
-using ModelOptions = strix::models::deepseek_v4_flash::ModelOptions;
+using Model = gufo::models::deepseek_v4_flash::Model;
+using ModelOptions = gufo::models::deepseek_v4_flash::ModelOptions;
 
 void Expect(bool condition, std::string_view message) {
   if (!condition) {
@@ -25,7 +25,7 @@ void Expect(bool condition, std::string_view message) {
   }
 }
 
-std::vector<strix::tokenization::TokenId> GenerateDirect(
+std::vector<gufo::tokenization::TokenId> GenerateDirect(
     const std::shared_ptr<Model>& model, std::span<const int> prompt,
     std::size_t max_tokens) {
   std::string error;
@@ -33,7 +33,7 @@ std::vector<strix::tokenization::TokenId> GenerateDirect(
   Expect(session != nullptr, error);
   Expect(session->Sync(prompt, &error), error);
 
-  std::vector<strix::tokenization::TokenId> result;
+  std::vector<gufo::tokenization::TokenId> result;
   result.reserve(max_tokens);
   for (std::size_t index = 0; index < max_tokens; ++index) {
     const int token = session->SelectNext(0.0F, nullptr);
@@ -41,7 +41,7 @@ std::vector<strix::tokenization::TokenId> GenerateDirect(
     if (model->IsStopToken(token)) {
       break;
     }
-    result.push_back(static_cast<strix::tokenization::TokenId>(token));
+    result.push_back(static_cast<gufo::tokenization::TokenId>(token));
     if (index + 1 < max_tokens) {
       Expect(session->Evaluate(token, &error), error);
     }
@@ -53,9 +53,9 @@ std::vector<strix::tokenization::TokenId> GenerateDirect(
 
 int main() {
   try {
-    const char* model_path = std::getenv("STRIX_DEEPSEEK_V4_FLASH_MODEL");
+    const char* model_path = std::getenv("GUFO_DEEPSEEK_V4_FLASH_MODEL");
     if (model_path == nullptr || model_path[0] == '\0') {
-      std::cout << "SKIP: STRIX_DEEPSEEK_V4_FLASH_MODEL is not set\n";
+      std::cout << "SKIP: GUFO_DEEPSEEK_V4_FLASH_MODEL is not set\n";
       return 77;
     }
 
@@ -69,7 +69,7 @@ int main() {
                              &error);
     Expect(model != nullptr, error);
 
-    strix::server::InferenceBackend backend;
+    gufo::server::InferenceBackend backend;
     Expect(backend.load(model, &error, 512, 2), error);
     Expect(backend.model_id() == model->ModelName(), "HTTP model identifier");
 
@@ -80,13 +80,13 @@ int main() {
     Expect(http_raw.tokens == direct_raw, "raw direct/HTTP token parity");
     Expect(http_raw.ttft_ms > 0.0, "raw TTFT");
 
-    const std::vector<strix::tokenization::ChatMessage> messages = {
-        {strix::tokenization::ChatRole::kSystem,
+    const std::vector<gufo::tokenization::ChatMessage> messages = {
+        {gufo::tokenization::ChatRole::kSystem,
          "Answer with one short sentence.", "", ""},
-        {strix::tokenization::ChatRole::kUser, "Name one primary color.", "",
+        {gufo::tokenization::ChatRole::kUser, "Name one primary color.", "",
          ""},
     };
-    const std::vector<strix::models::deepseek_v4_flash::ChatMessage>
+    const std::vector<gufo::models::deepseek_v4_flash::ChatMessage>
         direct_messages = {
             {.role = "system", .content = "Answer with one short sentence."},
             {.role = "user", .content = "Name one primary color."},
@@ -98,9 +98,9 @@ int main() {
     Expect(!http_chat.cache_hit, "first chat request is a cache miss");
 
     auto continued_messages = messages;
-    continued_messages.emplace_back(strix::tokenization::ChatRole::kAssistant,
+    continued_messages.emplace_back(gufo::tokenization::ChatRole::kAssistant,
                                     http_chat.text);
-    continued_messages.emplace_back(strix::tokenization::ChatRole::kUser,
+    continued_messages.emplace_back(gufo::tokenization::ChatRole::kUser,
                                     "Name a different primary color.");
     auto continued_direct_messages = direct_messages;
     continued_direct_messages.push_back(
@@ -120,26 +120,26 @@ int main() {
     Expect(http_continuation.tokens == direct_continuation,
            "cached DeepSeek continuation differs from cold full prefill");
 
-    strix::server::ChatRequest concurrent_a({
-        {strix::tokenization::ChatRole::kUser,
+    gufo::server::ChatRequest concurrent_a({
+        {gufo::tokenization::ChatRole::kUser,
          "Continue this sequence with four short items: one, two, three,", "",
          ""},
     });
     concurrent_a.client_id = "deepseek-a";
-    strix::server::ChatRequest concurrent_b({
-        {strix::tokenization::ChatRole::kUser,
+    gufo::server::ChatRequest concurrent_b({
+        {gufo::tokenization::ChatRole::kUser,
          "Continue this sequence with four short items: red, green, blue,", "",
          ""},
     });
     concurrent_b.client_id = "deepseek-b";
-    const std::vector<strix::models::deepseek_v4_flash::ChatMessage>
+    const std::vector<gufo::models::deepseek_v4_flash::ChatMessage>
         direct_a_messages = {
             {.role = "user",
              .content =
                  "Continue this sequence with four short items: one, two, "
                  "three,"},
         };
-    const std::vector<strix::models::deepseek_v4_flash::ChatMessage>
+    const std::vector<gufo::models::deepseek_v4_flash::ChatMessage>
         direct_b_messages = {
             {.role = "user",
              .content =
@@ -158,8 +158,8 @@ int main() {
 
     std::mutex event_mutex;
     std::vector<char> events;
-    strix::server::InferenceBackend::Result concurrent_result_a;
-    strix::server::InferenceBackend::Result concurrent_result_b;
+    gufo::server::InferenceBackend::Result concurrent_result_a;
+    gufo::server::InferenceBackend::Result concurrent_result_b;
     std::exception_ptr failure_a;
     std::exception_ptr failure_b;
     std::jthread waiter_a([&] {

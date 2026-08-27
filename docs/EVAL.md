@@ -143,7 +143,7 @@ runtime.
 The proposed interface is a single evaluation tool:
 
 ```text
-strix-eval -m <model> [options]
+gufo-eval -m <model> [options]
 
   --plain               Disable the interactive UI; print the report.
   --cases <n>           Run only the first n cases.
@@ -215,7 +215,7 @@ A small fixed gate detects generation drift from any change that touches
 sampling, kernels, routing, or rendering:
 
 ```text
-strix-eval --plain --cases 4 --tokens 2048 --greedy
+gufo-eval --plain --cases 4 --tokens 2048 --greedy
 ```
 
 The baseline table records expected verdict and exact generated-token count

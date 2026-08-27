@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_SPECULATIVE_DRAFT_BACKEND_HPP_
-#define STRIX_CORE_SPECULATIVE_DRAFT_BACKEND_HPP_
+#ifndef GUFO_CORE_SPECULATIVE_DRAFT_BACKEND_HPP_
+#define GUFO_CORE_SPECULATIVE_DRAFT_BACKEND_HPP_
 
 #include <algorithm>
 #include <cstddef>
@@ -11,7 +11,7 @@
 
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 /// Represents a speculative draft proposal block
 struct DraftProposal {
@@ -109,6 +109,6 @@ private:
   std::vector<tokenization::TokenId> candidate_pool_;
 };
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative
 
-#endif  // STRIX_CORE_SPECULATIVE_DRAFT_BACKEND_HPP_
+#endif  // GUFO_CORE_SPECULATIVE_DRAFT_BACKEND_HPP_

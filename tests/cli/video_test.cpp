@@ -19,7 +19,7 @@ void TestPresets() {
                                            "fast",    "--output",   "out.mp4",
                                            "A fox"};
   std::string error;
-  auto options = strix::cli::ParseVideoOptions(fast, &error);
+  auto options = gufo::cli::ParseVideoOptions(fast, &error);
   Expect(options.has_value(), "fast preset parses");
   Expect(options->request.parameters.internal_width == 384,
          "fast internal width");
@@ -28,10 +28,10 @@ void TestPresets() {
          "fast denoiser evaluations");
   Expect(options->request.parameters.active_blocks == 45, "fast blocks");
   Expect(options->request.parameters.reuse_interval == 2, "fast reuse");
-  const std::string parameters = strix::minimax_h3::GenerationParametersJson(
+  const std::string parameters = gufo::minimax_h3::GenerationParametersJson(
       options->request.parameters, 42,
       "df0ff96bcdb3a350f115cc39daaf0d7523814258890aa90c06fa784e3ad06169");
-  Expect(parameters.find("strix.minimax-h3-text-generation.v1") !=
+  Expect(parameters.find("gufo.minimax-h3-text-generation.v1") !=
              std::string::npos,
          "versioned parameter schema");
   Expect(parameters.find("\"token_reduction\": false") != std::string::npos,
@@ -40,7 +40,7 @@ void TestPresets() {
   const std::array<const char*, 7> aggressive = {
       "--model",  "/models/h3", "--preset", "aggressive",
       "--output", "out.mp4",    "A fox"};
-  options = strix::cli::ParseVideoOptions(aggressive, &error);
+  options = gufo::cli::ParseVideoOptions(aggressive, &error);
   Expect(options.has_value(), "aggressive preset parses");
   Expect(options->request.parameters.internal_width == 320,
          "aggressive internal width");
@@ -50,7 +50,7 @@ void TestPresets() {
   const std::array<const char*, 7> fullres = {
       "--model",  "/models/h3", "--preset",    "exact-1344x768",
       "--output", "out.mp4",    "A goalkeeper"};
-  options = strix::cli::ParseVideoOptions(fullres, &error);
+  options = gufo::cli::ParseVideoOptions(fullres, &error);
   Expect(options.has_value(), "full-resolution exact preset parses");
   Expect(options->request.parameters.internal_width == 1344 &&
              options->request.parameters.internal_height == 768 &&
@@ -64,7 +64,7 @@ void TestDevelopmentAndOverrides() {
       "--model", "/models/h3", "--preset", "dev",  "--frames-dir",
       "frames",  "--seed",     "123",      "A fox"};
   std::string error;
-  auto options = strix::cli::ParseVideoOptions(args, &error);
+  auto options = gufo::cli::ParseVideoOptions(args, &error);
   Expect(options.has_value(), "development preset parses");
   Expect(!options->request.parameters.mux, "development skips mux");
   Expect(!options->request.parameters.decode_audio, "development skips audio");
@@ -92,7 +92,7 @@ void TestDevelopmentAndOverrides() {
                                               "--attention-kernel",
                                               "scalar",
                                               "A fox"};
-  options = strix::cli::ParseVideoOptions(custom, &error);
+  options = gufo::cli::ParseVideoOptions(custom, &error);
   Expect(options.has_value(), "custom controls parse");
   Expect(options->request.parameters.internal_width == 320, "width override");
   Expect(options->request.parameters.evaluations == 7, "step override");
@@ -109,7 +109,7 @@ void TestSelectedFramesAndFailures() {
       "--frames-dir", "frames",     "--selected-frames", "last,first,middle",
       "A fox"};
   std::string error;
-  auto options = strix::cli::ParseVideoOptions(selected, &error);
+  auto options = gufo::cli::ParseVideoOptions(selected, &error);
   Expect(options.has_value(), "symbolic selected frames parse");
   Expect(options->request.parameters.selected_frames ==
              std::vector<int>({0, 11, 21}),
@@ -117,14 +117,14 @@ void TestSelectedFramesAndFailures() {
 
   const std::array<const char*, 5> unsupported = {
       "--model", "/models/h3", "--first-frame", "input.png", "A fox"};
-  Expect(!strix::cli::ParseVideoOptions(unsupported, &error).has_value(),
+  Expect(!gufo::cli::ParseVideoOptions(unsupported, &error).has_value(),
          "first-frame input rejected");
   Expect(error.find("not implemented") != std::string::npos,
          "future input error is explicit");
 
   const std::array<const char*, 4> no_audio = {"--model", "/models/h3",
                                                "--no-audio", "A fox"};
-  Expect(!strix::cli::ParseVideoOptions(no_audio, &error).has_value(),
+  Expect(!gufo::cli::ParseVideoOptions(no_audio, &error).has_value(),
          "audio cannot be disabled while muxing");
 }
 

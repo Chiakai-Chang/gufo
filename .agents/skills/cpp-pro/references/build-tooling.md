@@ -351,13 +351,13 @@ BENCHMARK_MAIN();
 ```bash
 # Profile Strix Halo HIP kernels with the repository-pinned profiler.
 nix develop -c rocprofv3 \
-  --output-directory /tmp/strix-rocprof \
+  --output-directory /tmp/gufo-rocprof \
   --output-format csv \
   --kernel-trace \
   --stats \
   --summary \
   --summary-units msec \
-  -- ./result/bin/strix-server bench \
+  -- ./result/bin/gufo-server bench \
     --model /path/to/model.gguf \
     --n-prompt 512 \
     --n-gen 0 \
@@ -365,13 +365,13 @@ nix develop -c rocprofv3 \
 
 # Add this when private-memory traffic or register pressure is suspected.
 nix develop -c rocprofv3 \
-  --output-directory /tmp/strix-rocprof-scratch \
+  --output-directory /tmp/gufo-rocprof-scratch \
   --output-format csv \
   --kernel-trace \
   --scratch-memory-trace \
   --stats \
   --summary \
-  -- ./result/bin/strix-server bench \
+  -- ./result/bin/gufo-server bench \
     --model /path/to/model.gguf \
     --n-prompt 512 \
     --n-gen 0 \

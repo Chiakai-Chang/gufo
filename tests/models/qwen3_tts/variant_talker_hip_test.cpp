@@ -19,8 +19,8 @@
 
 namespace {
 
-namespace qwen3_tts = strix::models::qwen3_tts;
-namespace qwen3_tts_hip = strix::models::qwen3_tts::hip;
+namespace qwen3_tts = gufo::models::qwen3_tts;
+namespace qwen3_tts_hip = gufo::models::qwen3_tts::hip;
 
 struct NpyHeader {
   std::vector<std::size_t> shape;
@@ -318,7 +318,7 @@ int main() {
   const std::filesystem::path base_root =
       "/home/fbozzo/projects/audio.cpp/models/Qwen3-TTS-12Hz-1.7B-Base";
   const std::filesystem::path artifact_root =
-      "/home/fbozzo/projects/strix-halo.cpp/artifacts/qwen3_tts";
+      "/home/fbozzo/projects/gufo/artifacts/qwen3_tts";
   if (!std::filesystem::is_regular_file(voice_design_root /
                                         "model.safetensors") ||
       !std::filesystem::is_regular_file(base_root / "model.safetensors") ||

@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_NATIVE_INTERNAL_H_
-#define STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_NATIVE_INTERNAL_H_
+#ifndef GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_NATIVE_INTERNAL_H_
+#define GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_NATIVE_INTERNAL_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -118,4 +118,4 @@ int ds4_rocm_graph_load_snapshot(ds4_rocm_graph *graph,
                                  char *error,
                                  size_t error_capacity);
 
-#endif  // STRIX_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_NATIVE_INTERNAL_H_
+#endif  // GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_NATIVE_INTERNAL_H_

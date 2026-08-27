@@ -9,7 +9,7 @@
 
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
 
-namespace strix::hip::kernels {
+namespace gufo::hip::kernels {
 
 __global__ void dflash_rmsnorm_kernel(const float* __restrict__ input,
                                       const float* __restrict__ weight,
@@ -540,7 +540,7 @@ void LaunchDFlashSelectorStep(
     std::uint32_t vocab_size, std::uint32_t selector_rank,
     std::uint32_t selector_top_k, hipStream_t stream) {
   static const bool use_parallel = [] {
-    const char* value = std::getenv("STRIX_DFLASH_SELECTOR");
+    const char* value = std::getenv("GUFO_DFLASH_SELECTOR");
     if (value == nullptr) {
       return true;
     }
@@ -571,5 +571,5 @@ void LaunchDFlashSelectorStep(
       selector_rank, selector_top_k);
 }
 
-}  // namespace strix::hip::kernels
+}  // namespace gufo::hip::kernels
 #endif  // defined(ENGINE_ENABLE_HIP)

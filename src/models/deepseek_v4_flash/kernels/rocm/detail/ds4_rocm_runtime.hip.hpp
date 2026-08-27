@@ -269,7 +269,7 @@ static const ds4_rocm_runtime_config *hip_runtime_config(void) {
         g_rocm_cfg.attention_output_hipblas_all = 1;
         g_rocm_cfg.shared_down_hipblas = 1;
         const char *sharedx_env =
-            getenv("STRIX_DEEPSEEK_ROCM_Q8_DECODE_SHAREDX_64K");
+            getenv("GUFO_DEEPSEEK_ROCM_Q8_DECODE_SHAREDX_64K");
         g_rocm_cfg.q8_decode_sharedx_64k =
             sharedx_env == NULL || hip_env_present(sharedx_env);
         g_rocm_cfg.q8_decode_rpb = 1u;

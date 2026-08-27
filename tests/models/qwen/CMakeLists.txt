@@ -2,10 +2,10 @@ if (ENGINE_ENABLE_XRT)
   add_executable(qwen_mtp_xdna2_rmsnorm_test
     ${PROJECT_SOURCE_DIR}/tests/models/qwen/xdna2/mtp_rmsnorm_test.cpp)
   target_compile_definitions(qwen_mtp_xdna2_rmsnorm_test PRIVATE
-    STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
+    GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
   target_link_libraries(qwen_mtp_xdna2_rmsnorm_test PRIVATE
-    strix_core
-    strix_diagnostics)
+    gufo_core
+    gufo_diagnostics)
   add_test(NAME qwen_mtp_xdna2_rmsnorm_test
     COMMAND qwen_mtp_xdna2_rmsnorm_test)
   set_tests_properties(qwen_mtp_xdna2_rmsnorm_test PROPERTIES
@@ -14,10 +14,10 @@ if (ENGINE_ENABLE_XRT)
   add_executable(qwen_mtp_xdna2_eh_proj_test
     ${PROJECT_SOURCE_DIR}/tests/models/qwen/xdna2/mtp_eh_proj_test.cpp)
   target_compile_definitions(qwen_mtp_xdna2_eh_proj_test PRIVATE
-    STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${STRIX_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}")
+    GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}")
   target_link_libraries(qwen_mtp_xdna2_eh_proj_test PRIVATE
-    strix_core
-    strix_diagnostics)
+    gufo_core
+    gufo_diagnostics)
   add_test(NAME qwen_mtp_xdna2_eh_proj_test
     COMMAND qwen_mtp_xdna2_eh_proj_test)
   set_tests_properties(qwen_mtp_xdna2_eh_proj_test PROPERTIES
@@ -26,7 +26,7 @@ endif()
 
 add_executable(qwen_aie2p_w4a8_pack_test
   ${PROJECT_SOURCE_DIR}/tests/kernels/qwen38_27b/test_aie2p_w4a8.cpp)
-target_link_libraries(qwen_aie2p_w4a8_pack_test PRIVATE strix_core)
+target_link_libraries(qwen_aie2p_w4a8_pack_test PRIVATE gufo_core)
 add_test(NAME qwen_aie2p_w4a8_pack_test
   COMMAND qwen_aie2p_w4a8_pack_test)
 set_tests_properties(qwen_aie2p_w4a8_pack_test PROPERTIES
@@ -34,7 +34,7 @@ set_tests_properties(qwen_aie2p_w4a8_pack_test PROPERTIES
 
 function(add_qwen_cpu_test target source labels)
   add_executable(${target} ${PROJECT_SOURCE_DIR}/${source})
-  target_link_libraries(${target} PRIVATE strix_core)
+  target_link_libraries(${target} PRIVATE gufo_core)
   add_test(NAME ${target} COMMAND ${target})
   set_tests_properties(${target} PROPERTIES LABELS "${labels}")
 endfunction()
@@ -96,7 +96,7 @@ add_qwen_cpu_test(qwen_dflash_reference_test
 if (ENGINE_ENABLE_HIP)
   add_executable(qwen_mtp_gpu_test
     ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/mtp_test.cpp)
-  target_link_libraries(qwen_mtp_gpu_test PRIVATE strix_core)
+  target_link_libraries(qwen_mtp_gpu_test PRIVATE gufo_core)
   add_test(NAME qwen_mtp_gpu_test COMMAND qwen_mtp_gpu_test)
   set_tests_properties(qwen_mtp_gpu_test PROPERTIES
     LABELS "gpu;hip;gfx1151;qwen;mtp;external-model"
@@ -104,7 +104,7 @@ if (ENGINE_ENABLE_HIP)
 
   add_executable(qwen_dflash_gpu_test
     ${PROJECT_SOURCE_DIR}/tests/models/qwen/hip/dflash_test.cpp)
-  target_link_libraries(qwen_dflash_gpu_test PRIVATE strix_core)
+  target_link_libraries(qwen_dflash_gpu_test PRIVATE gufo_core)
   add_test(NAME qwen_dflash_gpu_test COMMAND qwen_dflash_gpu_test)
   set_tests_properties(qwen_dflash_gpu_test PROPERTIES
     LABELS "gpu;hip;gfx1151;qwen;dflash;dflash2;external-model"
@@ -113,7 +113,7 @@ if (ENGINE_ENABLE_HIP)
   function(add_qwen_hip_test target source labels)
     add_executable(${target} ${PROJECT_SOURCE_DIR}/${source})
     target_link_libraries(${target} PRIVATE
-      strix_core hip::host roc::hipblas roc::rocblas)
+      gufo_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME ${target} COMMAND ${target})
     set_tests_properties(${target} PROPERTIES
       LABELS "${labels}"

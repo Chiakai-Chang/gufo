@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_MTP_REFERENCE_HPP_
-#define STRIX_MODELS_QWEN_MTP_REFERENCE_HPP_
+#ifndef GUFO_MODELS_QWEN_MTP_REFERENCE_HPP_
+#define GUFO_MODELS_QWEN_MTP_REFERENCE_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +14,7 @@
 #include "src/models/qwen/state.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 struct QwenMtpWeights {
   core::ModelConfig config;
@@ -79,6 +79,6 @@ private:
   std::vector<float> feedback_hidden_;
 };
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative
 
-#endif  // STRIX_MODELS_QWEN_MTP_REFERENCE_HPP_
+#endif  // GUFO_MODELS_QWEN_MTP_REFERENCE_HPP_

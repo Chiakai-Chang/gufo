@@ -1,4 +1,4 @@
-// Copyright (C) 2026 Strix Engine contributors
+// Copyright (C) 2026 Gufo Engine contributors
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Pure-CPU W4A8 SHQ4-T16 packing and reference kernels for the Qwen3.8-27B
@@ -35,8 +35,8 @@
 //   q4k:  Q4_K lossless: codes = Q4_K nibbles, wscale = d*scale6 FP32 exact,
 //         zcorr = dmin*min6 FP32 exact
 
-#ifndef STRIX_CORE_XDNA2_QWEN_AIE2P_W4A8_PACK_H_
-#define STRIX_CORE_XDNA2_QWEN_AIE2P_W4A8_PACK_H_
+#ifndef GUFO_CORE_XDNA2_QWEN_AIE2P_W4A8_PACK_H_
+#define GUFO_CORE_XDNA2_QWEN_AIE2P_W4A8_PACK_H_
 
 #include <algorithm>
 #include <array>
@@ -49,7 +49,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace strix::xdna2::w4a8 {
+namespace gufo::xdna2::w4a8 {
 
 template<typename T>
 concept RecordScalar = std::is_trivially_copyable_v<T>;
@@ -119,7 +119,7 @@ struct Shape {
 };
 
 // ---------------------------------------------------------------------------
-// BF16 helpers (RNE, ties-to-even -- matches tools/strix/shq.py)
+// BF16 helpers (RNE, ties-to-even -- matches tools/gufo/shq.py)
 // ---------------------------------------------------------------------------
 
 inline std::uint16_t RoundToBf16Rne(float value) noexcept {
@@ -396,7 +396,7 @@ inline void DecodeQ4KRowIntoSpec(const std::uint8_t* src_row_block,
 // ---------------------------------------------------------------------------
 // SHQ4 (U4Z/S4) planes -> record.
 //
-// SHQ4 plane layouts (docs/QUANTIZATION.md, tools/strix/shq.py):
+// SHQ4 plane layouts (docs/QUANTIZATION.md, tools/gufo/shq.py):
 //   codes[nt][kg][k16][lane][kp8]: byte = ((gidx*k16_per + k16)*16 + lane)*8
 //                                  + kp, low nibble = k = kp*2, high = kp*2+1
 //   scales u16 BF16[gidx*16 + lane]
@@ -641,6 +641,6 @@ inline void ReferenceGemm(std::span<const float> activations, Shape shape,
   }
 }
 
-}  // namespace strix::xdna2::w4a8
+}  // namespace gufo::xdna2::w4a8
 
-#endif  // STRIX_CORE_XDNA2_QWEN_AIE2P_W4A8_PACK_H_
+#endif  // GUFO_CORE_XDNA2_QWEN_AIE2P_W4A8_PACK_H_

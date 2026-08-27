@@ -30,7 +30,7 @@
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.cuh"
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -1804,6 +1804,6 @@ double DitBlockSession::load_ms() const noexcept {
   return impl_ == nullptr ? 0.0 : impl_->load_ms;
 }
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3
 
 #endif

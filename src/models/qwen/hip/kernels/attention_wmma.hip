@@ -86,7 +86,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 // Defined in kernels/attention_tile.hip; the WMMA route reuses the same FP16
 // cache and the same pack/sync pair unchanged.
@@ -571,5 +571,5 @@ bool LaunchQwenWmmaAttention(const float* q, const float* k, const float* v,
   return true;
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

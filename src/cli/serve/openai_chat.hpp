@@ -1,9 +1,9 @@
-#ifndef STRIX_SERVER_OPENAI_CHAT_HPP_
-#define STRIX_SERVER_OPENAI_CHAT_HPP_
+#ifndef GUFO_SERVER_OPENAI_CHAT_HPP_
+#define GUFO_SERVER_OPENAI_CHAT_HPP_
 
 #include "src/cli/serve/http_server.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 
 /// Handles the supported OpenAI Chat Completions subset. Streaming responses
 /// consume scheduler-published token pieces from HttpResponse::streaming_body;
@@ -11,6 +11,6 @@ namespace strix::server {
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend);
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_OPENAI_CHAT_HPP_
+#endif  // GUFO_SERVER_OPENAI_CHAT_HPP_

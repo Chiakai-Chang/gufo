@@ -1,5 +1,5 @@
-#ifndef STRIX_TOKENIZATION_QWEN_CHAT_TEMPLATE_HPP_
-#define STRIX_TOKENIZATION_QWEN_CHAT_TEMPLATE_HPP_
+#ifndef GUFO_TOKENIZATION_QWEN_CHAT_TEMPLATE_HPP_
+#define GUFO_TOKENIZATION_QWEN_CHAT_TEMPLATE_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -14,7 +14,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace strix::tokenization {
+namespace gufo::tokenization {
 
 /// Chat message roles supported by the Qwen chat template.
 enum class ChatRole : std::uint8_t {
@@ -138,6 +138,6 @@ private:
   std::string template_string_;
 };
 
-}  // namespace strix::tokenization
+}  // namespace gufo::tokenization
 
-#endif  // STRIX_TOKENIZATION_QWEN_CHAT_TEMPLATE_HPP_
+#endif  // GUFO_TOKENIZATION_QWEN_CHAT_TEMPLATE_HPP_

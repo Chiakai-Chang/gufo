@@ -15,7 +15,7 @@
 
 #include "src/models/minimax_h3/sampling.hpp"
 
-namespace strix::minimax_h3 {
+namespace gufo::minimax_h3 {
 namespace {
 
 void SetError(std::string* error, std::string message) {
@@ -121,6 +121,6 @@ bool HipEulerUpdate(void* sample_f32, std::size_t sample_elements,
   return true;
 }
 
-}  // namespace strix::minimax_h3
+}  // namespace gufo::minimax_h3
 
 #endif  // ENGINE_ENABLE_HIP

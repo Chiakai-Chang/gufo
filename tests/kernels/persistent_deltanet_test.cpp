@@ -63,7 +63,7 @@ std::vector<T> CopyToHost(const T* source, std::size_t elements) {
 }
 
 void TestArenaRestoresOnlyMutableRecurrentState() {
-  strix::core::ModelConfig config;
+  gufo::core::ModelConfig config;
   config.num_layers = 4;
   config.hidden_size = 64;
   config.intermediate_size = 64;
@@ -78,7 +78,7 @@ void TestArenaRestoresOnlyMutableRecurrentState() {
   config.ssm_inner_size = 64;
   config.rotary_dim = 32;
 
-  strix::hip::QwenGpuArena arena(config, config.context_length);
+  gufo::hip::QwenGpuArena arena(config, config.context_length);
   const std::size_t conv_elements =
       static_cast<std::size_t>(config.num_layers) * config.SsmQkvSize() *
       config.ssm_conv_kernel;
@@ -182,9 +182,9 @@ void TestCapturedInputsReplayBitExactly() {
   HipBuffer<float> d_delta_capture(deltanet_state_size);
   HipBuffer<float> d_conv_out(qkv_size);
   HipBuffer<float> d_output(output_size);
-  HipBuffer<float> d_log_qkv(strix::hip::kSsmReplayCapacity * qkv_size);
-  HipBuffer<float> d_log_alpha(strix::hip::kSsmReplayCapacity * num_heads);
-  HipBuffer<float> d_log_beta(strix::hip::kSsmReplayCapacity * num_heads);
+  HipBuffer<float> d_log_qkv(gufo::hip::kSsmReplayCapacity * qkv_size);
+  HipBuffer<float> d_log_alpha(gufo::hip::kSsmReplayCapacity * num_heads);
+  HipBuffer<float> d_log_beta(gufo::hip::kSsmReplayCapacity * num_heads);
   HipBuffer<std::uint32_t> d_position(1);
   HipBuffer<std::uint32_t> d_enabled(1);
 
@@ -206,7 +206,7 @@ void TestCapturedInputsReplayBitExactly() {
                       hipMemcpyHostToDevice));
 
   for (std::size_t token = 0; token < token_count; ++token) {
-    strix::hip::LaunchSSMConvRecurrence(
+    gufo::hip::LaunchSSMConvRecurrence(
         d_qkv.Get() + token * qkv_size, d_weights.Get(), d_conv_golden.Get(),
         d_conv_out.Get(), d_delta_golden.Get(),
         d_alpha.Get() + token * num_heads, d_beta.Get() + token * num_heads,
@@ -214,7 +214,7 @@ void TestCapturedInputsReplayBitExactly() {
         qkv_size, num_key_heads, num_heads, key_dim, val_dim);
   }
 
-  const strix::hip::SsmReplayCapture capture{
+  const gufo::hip::SsmReplayCapture capture{
       .qkv = d_log_qkv.Get(),
       .alpha = d_log_alpha.Get(),
       .beta = d_log_beta.Get(),
@@ -225,7 +225,7 @@ void TestCapturedInputsReplayBitExactly() {
     const auto position = start_position + static_cast<std::uint32_t>(token);
     HIP_CHECK(hipMemcpy(d_position.Get(), &position, sizeof(position),
                         hipMemcpyHostToDevice));
-    strix::hip::LaunchSSMConvRecurrence(
+    gufo::hip::LaunchSSMConvRecurrence(
         d_qkv.Get() + token * qkv_size, d_weights.Get(), d_conv_capture.Get(),
         d_conv_out.Get(), d_delta_capture.Get(),
         d_alpha.Get() + token * num_heads, d_beta.Get() + token * num_heads,
@@ -248,7 +248,7 @@ void TestCapturedInputsReplayBitExactly() {
   for (std::size_t token = 0; token < token_count; ++token) {
     const auto position = start_position + static_cast<std::uint32_t>(token);
     const std::size_t slot =
-        static_cast<std::size_t>(position) % strix::hip::kSsmReplayCapacity;
+        static_cast<std::size_t>(position) % gufo::hip::kSsmReplayCapacity;
     const float* replay_qkv = d_log_qkv.Get() + slot * qkv_size;
     const float* replay_alpha = d_log_alpha.Get() + slot * num_heads;
     const float* replay_beta = d_log_beta.Get() + slot * num_heads;
@@ -264,7 +264,7 @@ void TestCapturedInputsReplayBitExactly() {
                std::vector<float>(beta.begin() + token * num_heads,
                                   beta.begin() + (token + 1) * num_heads),
            "captured beta input");
-    strix::hip::LaunchSSMConvRecurrence(
+    gufo::hip::LaunchSSMConvRecurrence(
         replay_qkv, d_weights.Get(), d_conv_capture.Get(), d_conv_out.Get(),
         d_delta_capture.Get(), replay_alpha, replay_beta, d_ssm_a.Get(),
         d_ssm_dt.Get(), nullptr, nullptr, d_output.Get(), layer, qkv_size,

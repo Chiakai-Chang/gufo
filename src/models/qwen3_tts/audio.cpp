@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-namespace strix::models::qwen3_tts {
+namespace gufo::models::qwen3_tts {
 namespace {
 
 constexpr std::size_t kMaximumEncodedBytes = 12U << 20U;
@@ -260,4 +260,4 @@ std::vector<float> ResampleMono(const AudioBuffer& audio,
   return result;
 }
 
-}  // namespace strix::models::qwen3_tts
+}  // namespace gufo::models::qwen3_tts

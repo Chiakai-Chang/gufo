@@ -7,7 +7,7 @@
 #include <vector>
 
 void TestBasicFlagsAndOptions() {
-  strix::cli::ArgParser parser("test_app", "A test application");
+  gufo::cli::ArgParser parser("test_app", "A test application");
   bool verbose = false;
   std::string model = "default.gguf";
   int threads = 4;
@@ -32,7 +32,7 @@ void TestBasicFlagsAndOptions() {
 }
 
 void TestListParsing() {
-  strix::cli::ArgParser parser("test_bench");
+  gufo::cli::ArgParser parser("test_bench");
   std::vector<std::size_t> depths;
   parser.AddOption("", "--n-depth", "LIST", "List of depths", "Bench", &depths);
 
@@ -47,7 +47,7 @@ void TestListParsing() {
 }
 
 void TestPositionals() {
-  strix::cli::ArgParser parser("test_prompt");
+  gufo::cli::ArgParser parser("test_prompt");
   std::string prompt;
   std::string model;
   parser.AddOption("-m", "--model", "PATH", "Model path", "Model", &model);
@@ -62,7 +62,7 @@ void TestPositionals() {
 }
 
 void TestHelpFormatting() {
-  strix::cli::ArgParser parser("strix run", "Run inference on Strix Halo");
+  gufo::cli::ArgParser parser("gufo run", "Run inference on Strix Halo");
   std::string model;
   bool interactive = false;
   parser.AddOption("-m", "--model", "PATH", "Model file", "Model", &model);
@@ -70,7 +70,7 @@ void TestHelpFormatting() {
                  &interactive);
 
   std::string help = parser.FormatHelp();
-  assert(help.find("Usage: strix run [OPTIONS]") != std::string::npos);
+  assert(help.find("Usage: gufo run [OPTIONS]") != std::string::npos);
   assert(help.find("Model:") != std::string::npos);
   assert(help.find("Execution:") != std::string::npos);
   assert(help.find("--model") != std::string::npos);

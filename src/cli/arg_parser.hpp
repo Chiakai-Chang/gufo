@@ -1,5 +1,5 @@
-#ifndef STRIX_CLI_ARG_PARSER_HPP_
-#define STRIX_CLI_ARG_PARSER_HPP_
+#ifndef GUFO_CLI_ARG_PARSER_HPP_
+#define GUFO_CLI_ARG_PARSER_HPP_
 
 #include <charconv>
 #include <cstddef>
@@ -17,7 +17,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace strix::cli {
+namespace gufo::cli {
 
 /// A lightweight, type-safe C++20 command-line argument parser.
 class ArgParser {
@@ -400,6 +400,6 @@ private:
   mutable bool help_requested_ = false;
 };
 
-}  // namespace strix::cli
+}  // namespace gufo::cli
 
-#endif  // STRIX_CLI_ARG_PARSER_HPP_
+#endif  // GUFO_CLI_ARG_PARSER_HPP_

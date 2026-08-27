@@ -89,7 +89,7 @@ void TestBatchedAttentionEquivalence() {
 
   // Sequential
   for (std::size_t t = 0; t < batch; ++t) {
-    strix::hip::LaunchAttention(
+    gufo::hip::LaunchAttention(
         d_q + t * num_heads * head_dim, d_k + t * num_kv_heads * head_dim,
         d_v + t * num_kv_heads * head_dim, d_gate + t * num_heads * head_dim,
         d_cache_seq, d_cache_seq + total_k, nullptr, nullptr,
@@ -98,11 +98,11 @@ void TestBatchedAttentionEquivalence() {
   }
 
   // Batched
-  strix::hip::LaunchBatchedAttention(d_q, d_k, d_v, d_gate, d_cache_batch,
-                                     d_cache_batch + total_k, nullptr, nullptr,
-                                     d_out_batch, 0, 0, batch, max_context,
-                                     num_heads, num_kv_heads, head_dim);
-  strix::hip::LaunchBatchedAttentionGemm(
+  gufo::hip::LaunchBatchedAttention(d_q, d_k, d_v, d_gate, d_cache_batch,
+                                    d_cache_batch + total_k, nullptr, nullptr,
+                                    d_out_batch, 0, 0, batch, max_context,
+                                    num_heads, num_kv_heads, head_dim);
+  gufo::hip::LaunchBatchedAttentionGemm(
       hipblas_handle, d_q, d_k, d_v, d_gate, d_cache_gemm,
       d_cache_gemm + total_k, nullptr, nullptr, d_scores, d_out_gemm, 0, 0,
       batch, max_context, num_heads, num_kv_heads, head_dim);
@@ -215,15 +215,15 @@ void TestAttentionBackendEquivalence() {
       hipMemset(d_cache_ck_f16, 0, 2 * cache_elements * sizeof(hip_bfloat16)));
 
   for (std::size_t token = 0; token < batch; ++token) {
-    strix::hip::LaunchAttention(d_q + token * attention_width,
-                                d_k + token * kv_width, d_v + token * kv_width,
-                                d_gate + token * attention_width, d_cache_seq,
-                                d_cache_seq + cache_elements, nullptr, nullptr,
-                                d_out_seq + token * attention_width, 0,
-                                static_cast<std::uint32_t>(token), max_context,
-                                num_heads, num_kv_heads, head_dim);
+    gufo::hip::LaunchAttention(d_q + token * attention_width,
+                               d_k + token * kv_width, d_v + token * kv_width,
+                               d_gate + token * attention_width, d_cache_seq,
+                               d_cache_seq + cache_elements, nullptr, nullptr,
+                               d_out_seq + token * attention_width, 0,
+                               static_cast<std::uint32_t>(token), max_context,
+                               num_heads, num_kv_heads, head_dim);
   }
-  const bool tile_launched = strix::hip::LaunchBatchedAttentionTile(
+  const bool tile_launched = gufo::hip::LaunchBatchedAttentionTile(
       d_q, d_k, d_v, d_gate, d_cache_tile, d_cache_tile + cache_elements,
       d_cache_tile_f16,
       static_cast<std::uint16_t*>(d_cache_tile_f16) + cache_elements,
@@ -232,7 +232,7 @@ void TestAttentionBackendEquivalence() {
     std::cerr << "Tiled attention rejected the Qwen shape\n";
     std::abort();
   }
-  const bool launched = strix::hip::LaunchBatchedAttentionCk(
+  const bool launched = gufo::hip::LaunchBatchedAttentionCk(
       d_q, d_k, d_v, d_gate, d_cache_ck, d_cache_ck + cache_elements,
       d_cache_ck_f16,
       static_cast<std::uint16_t*>(d_cache_ck_f16) + cache_elements,
@@ -298,13 +298,13 @@ void TestAttentionBackendEquivalence() {
                       2 * cache_elements * sizeof(hip_bfloat16)));
   HIP_CHECK(hipMemset(d_out_tile, 0, q_size * sizeof(float)));
   constexpr std::size_t chunk_size = batch / 2;
-  const bool first_chunk_launched = strix::hip::LaunchBatchedAttentionTile(
+  const bool first_chunk_launched = gufo::hip::LaunchBatchedAttentionTile(
       d_q, d_k, d_v, d_gate, d_cache_tile, d_cache_tile + cache_elements,
       d_cache_tile_f16,
       static_cast<std::uint16_t*>(d_cache_tile_f16) + cache_elements,
       d_out_tile, 0, 0, chunk_size, max_context, num_heads, num_kv_heads,
       head_dim);
-  const bool second_chunk_launched = strix::hip::LaunchBatchedAttentionTile(
+  const bool second_chunk_launched = gufo::hip::LaunchBatchedAttentionTile(
       d_q + chunk_size * attention_width, d_k + chunk_size * kv_width,
       d_v + chunk_size * kv_width, d_gate + chunk_size * attention_width,
       d_cache_tile, d_cache_tile + cache_elements, d_cache_tile_f16,
@@ -362,9 +362,9 @@ void TestAttentionBackendEquivalence() {
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
   const int device_status =
-      strix::test::GateHipDevice(strix::test::HipDeviceRequirement::kOptional,
-                                 "Qwen attention backend ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+      gufo::test::GateHipDevice(gufo::test::HipDeviceRequirement::kOptional,
+                                "Qwen attention backend ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

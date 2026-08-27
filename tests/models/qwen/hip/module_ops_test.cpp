@@ -46,17 +46,17 @@ void TestGpuNormForwardModule() {
   HIP_CHECK(
       hipMemcpy(d_w, h_w.data(), dim * sizeof(float), hipMemcpyHostToDevice));
 
-  const strix::models::qwen::HipModuleContext ctx;  // default HIP stream
+  const gufo::models::qwen::HipModuleContext ctx;  // default HIP stream
 
-  strix::models::qwen::NormLayerView view;
+  gufo::models::qwen::NormLayerView view;
   view.weight.data = d_w;
-  view.weight.type = strix::core::GgmlType::kF32;
+  view.weight.type = gufo::core::GgmlType::kF32;
   view.weight.num_elements = dim;
   view.eps = 1e-6F;
 
   std::span<const float> x_span(d_x, dim);
   std::span<float> out_span(d_out, dim);
-  strix::models::qwen::NormForward(ctx, view, x_span, out_span);
+  gufo::models::qwen::NormForward(ctx, view, x_span, out_span);
   HIP_CHECK(hipDeviceSynchronize());
 
   HIP_CHECK(hipMemcpy(h_out.data(), d_out, dim * sizeof(float),
@@ -88,7 +88,7 @@ void TestGpuResidualAddModule() {
   HIP_CHECK(
       hipMemcpy(d_b, h_b.data(), dim * sizeof(float), hipMemcpyHostToDevice));
 
-  const strix::models::qwen::HipModuleContext ctx;
+  const gufo::models::qwen::HipModuleContext ctx;
 
   // ResidualAdd is in-place on dst: dst = a, src = b => dst = a + b.
   std::span<float> dst(d_dst, dim);
@@ -97,7 +97,7 @@ void TestGpuResidualAddModule() {
   std::vector<float> h_dst(h_a);
   HIP_CHECK(hipMemcpy(d_dst, h_dst.data(), dim * sizeof(float),
                       hipMemcpyHostToDevice));
-  strix::models::qwen::ResidualAdd(ctx, dst, src);
+  gufo::models::qwen::ResidualAdd(ctx, dst, src);
   HIP_CHECK(hipDeviceSynchronize());
 
   HIP_CHECK(hipMemcpy(h_out.data(), d_dst, dim * sizeof(float),
@@ -129,16 +129,16 @@ void TestGpuQuantGemmModule() {
   HIP_CHECK(
       hipMemcpy(d_x, h_x.data(), K * sizeof(float), hipMemcpyHostToDevice));
 
-  const strix::models::qwen::HipModuleContext ctx;
+  const gufo::models::qwen::HipModuleContext ctx;
 
-  strix::models::QwenTensorRef A;
+  gufo::models::QwenTensorRef A;
   A.data = d_A;
-  A.type = strix::core::GgmlType::kF32;
+  A.type = gufo::core::GgmlType::kF32;
   A.num_elements = M * K;
 
   std::span<const float> x(d_x, K);
   std::span<float> y(d_y, M);
-  strix::models::qwen::QuantGemm(ctx, A, x, M, K, y);
+  gufo::models::qwen::QuantGemm(ctx, A, x, M, K, y);
   HIP_CHECK(hipDeviceSynchronize());
 
   HIP_CHECK(
@@ -156,9 +156,9 @@ void TestGpuQuantGemmModule() {
 
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
-  const int device_status = strix::test::GateHipDevice(
-      strix::test::HipDeviceRequirement::kOptional, "Qwen module ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+  const int device_status = gufo::test::GateHipDevice(
+      gufo::test::HipDeviceRequirement::kOptional, "Qwen module ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

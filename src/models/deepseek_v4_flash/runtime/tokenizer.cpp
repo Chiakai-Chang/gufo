@@ -583,7 +583,7 @@ void ds4_vocab_destroy(ds4_vocab *vocab) {
     free(vocab);
 }
 
-/* Build the production chat prompt used by Strix. */
+/* Build the production chat prompt used by Gufo. */
 static void encode_chat_prompt(
         const ds4_vocab *vocab,
         const char      *system,

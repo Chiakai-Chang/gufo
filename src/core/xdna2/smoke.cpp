@@ -16,7 +16,7 @@
 #include <vector>
 
 #ifdef ENGINE_ENABLE_XRT
-#include <strix/aie_smoke_manifest.h>
+#include <gufo/aie_smoke_manifest.h>
 #include <xrt/experimental/xrt_elf.h>
 #include <xrt/experimental/xrt_ext.h>
 #include <xrt/experimental/xrt_module.h>
@@ -26,7 +26,7 @@
 #include <xrt/xrt_kernel.h>
 #endif
 
-namespace strix::xdna2 {
+namespace gufo::xdna2 {
 
 namespace {
 
@@ -112,8 +112,8 @@ void ComputeCommandStatistics(XrtSmokeReport& report) {
 }
 
 std::filesystem::path DefaultProgramDir() {
-#ifdef STRIX_AIE_SMOKE_PROGRAM_DIR
-  return STRIX_AIE_SMOKE_PROGRAM_DIR;
+#ifdef GUFO_AIE_SMOKE_PROGRAM_DIR
+  return GUFO_AIE_SMOKE_PROGRAM_DIR;
 #else
   return {};
 #endif
@@ -425,4 +425,4 @@ XrtSmokeReport RunXrtSmoke(const XrtSmokeOptions& options,
 #endif
 }
 
-}  // namespace strix::xdna2
+}  // namespace gufo::xdna2

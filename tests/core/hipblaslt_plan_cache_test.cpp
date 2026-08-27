@@ -8,11 +8,11 @@
 
 namespace {
 
-using strix::hip::detail::HipblasLtPlanDatabase;
-using strix::hip::detail::HipblasLtPlanDatabaseKey;
-using strix::hip::detail::HipblasLtPlanDatabaseLoadStatus;
-using strix::hip::detail::HipblasLtPlanDataType;
-using strix::hip::detail::HipblasLtPlanRecord;
+using gufo::hip::detail::HipblasLtPlanDatabase;
+using gufo::hip::detail::HipblasLtPlanDatabaseKey;
+using gufo::hip::detail::HipblasLtPlanDatabaseLoadStatus;
+using gufo::hip::detail::HipblasLtPlanDataType;
+using gufo::hip::detail::HipblasLtPlanRecord;
 
 void Expect(bool condition, const std::string& message) {
   if (!condition) {
@@ -51,37 +51,37 @@ HipblasLtPlanDatabase MakeDatabase() {
 
 int main() {
   const auto temporary_directory =
-      std::filesystem::temp_directory_path() / "strix-hipblaslt-cache-test";
+      std::filesystem::temp_directory_path() / "gufo-hipblaslt-cache-test";
   std::filesystem::create_directories(temporary_directory);
   const auto database_path = temporary_directory / "plans.bin";
   const auto truncated_path = temporary_directory / "truncated.bin";
 
   const auto expected = MakeDatabase();
   std::string error;
-  Expect(strix::hip::detail::SaveHipblasLtPlanDatabase(database_path, expected,
-                                                       &error),
+  Expect(gufo::hip::detail::SaveHipblasLtPlanDatabase(database_path, expected,
+                                                      &error),
          "save database: " + error);
 
-  const auto loaded = strix::hip::detail::LoadHipblasLtPlanDatabase(
-      database_path, expected.key);
+  const auto loaded =
+      gufo::hip::detail::LoadHipblasLtPlanDatabase(database_path, expected.key);
   Expect(loaded.status == HipblasLtPlanDatabaseLoadStatus::kLoaded,
          "load compatible database");
   Expect(loaded.database.key == expected.key, "round-trip database key");
   Expect(loaded.database.records == expected.records,
          "round-trip database records");
 
-  const auto* record = strix::hip::detail::FindHipblasLtPlanRecord(
+  const auto* record = gufo::hip::detail::FindHipblasLtPlanRecord(
       loaded.database, 128, 17408, 5120, HipblasLtPlanDataType::kBfloat16);
   Expect(record != nullptr && record->algorithm_id == 42,
          "lookup exact GEMM shape");
-  Expect(strix::hip::detail::FindHipblasLtPlanRecord(
+  Expect(gufo::hip::detail::FindHipblasLtPlanRecord(
              loaded.database, 256, 17408, 5120,
              HipblasLtPlanDataType::kBfloat16) == nullptr,
          "reject unrecorded GEMM shape");
 
   auto incompatible_key = expected.key;
   ++incompatible_key.hip_runtime_version;
-  const auto incompatible = strix::hip::detail::LoadHipblasLtPlanDatabase(
+  const auto incompatible = gufo::hip::detail::LoadHipblasLtPlanDatabase(
       database_path, incompatible_key);
   Expect(incompatible.status == HipblasLtPlanDatabaseLoadStatus::kIncompatible,
          "detect ROCm runtime change");
@@ -90,14 +90,14 @@ int main() {
     std::ofstream truncated(truncated_path, std::ios::binary);
     truncated.write("STRIXLT", 7);
   }
-  const auto invalid = strix::hip::detail::LoadHipblasLtPlanDatabase(
+  const auto invalid = gufo::hip::detail::LoadHipblasLtPlanDatabase(
       truncated_path, expected.key);
   Expect(invalid.status == HipblasLtPlanDatabaseLoadStatus::kInvalid,
          "reject truncated database");
 
   auto duplicate = expected;
   duplicate.records.push_back(duplicate.records.front());
-  Expect(!strix::hip::detail::SaveHipblasLtPlanDatabase(
+  Expect(!gufo::hip::detail::SaveHipblasLtPlanDatabase(
              temporary_directory / "duplicate.bin", duplicate, &error),
          "reject duplicate shape records");
 

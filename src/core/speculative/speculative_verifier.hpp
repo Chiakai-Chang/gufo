@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_SPECULATIVE_SPECULATIVE_VERIFIER_HPP_
-#define STRIX_CORE_SPECULATIVE_SPECULATIVE_VERIFIER_HPP_
+#ifndef GUFO_CORE_SPECULATIVE_SPECULATIVE_VERIFIER_HPP_
+#define GUFO_CORE_SPECULATIVE_SPECULATIVE_VERIFIER_HPP_
 
 #include <cstdint>
 #include <deque>
@@ -18,7 +18,7 @@
 #include "src/models/qwen/hip/executor.hpp"
 #endif
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 enum class AdaptiveDraftPolicy {
   kRollingAcceptanceRate,
@@ -190,6 +190,6 @@ private:
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative
 
-#endif  // STRIX_CORE_SPECULATIVE_SPECULATIVE_VERIFIER_HPP_
+#endif  // GUFO_CORE_SPECULATIVE_SPECULATIVE_VERIFIER_HPP_

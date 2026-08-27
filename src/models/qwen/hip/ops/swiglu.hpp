@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_OPS_SWIGLU_HPP_
-#define STRIX_MODELS_QWEN_HIP_OPS_SWIGLU_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_OPS_SWIGLU_HPP_
+#define GUFO_MODELS_QWEN_HIP_OPS_SWIGLU_HPP_
 
 #include <cstddef>
 
@@ -8,7 +8,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-namespace strix::hip {
+namespace gufo::hip {
 
 /// Computes Fused SwiGLU GEMV: out = SiLU(W_gate * x) * (W_up * x)
 void LaunchFusedSwiGLUGEMV(const void* gate_w, core::GgmlType gate_type,
@@ -43,8 +43,8 @@ void LaunchBatchedFusedSwiGLUGEMM(const void* gate_w, bool gate_is_bf16,
                                   std::size_t hidden_size,
                                   hipStream_t stream = nullptr);
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_OPS_SWIGLU_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_OPS_SWIGLU_HPP_

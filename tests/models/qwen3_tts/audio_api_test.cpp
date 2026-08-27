@@ -11,12 +11,12 @@
 
 namespace {
 
-namespace qwen3_tts = strix::models::qwen3_tts;
-using strix::server::HandleAudioTtsApiRequest;
-using strix::server::HttpRequest;
-using strix::server::HttpResponse;
-using strix::server::TtsService;
-using strix::server::TtsServiceOptions;
+namespace qwen3_tts = gufo::models::qwen3_tts;
+using gufo::server::HandleAudioTtsApiRequest;
+using gufo::server::HttpRequest;
+using gufo::server::HttpResponse;
+using gufo::server::TtsService;
+using gufo::server::TtsServiceOptions;
 
 [[noreturn]] void Fail(const std::string& message) {
   std::cerr << "FAIL qwen3_tts_audio_api_test: " << message << '\n';
@@ -129,7 +129,7 @@ void TestSpeech() {
         "response is a mono PCM16 WAV");
   Check(HasHeader(response, "Content-Type", "audio/wav"),
         "WAV content type is explicit");
-  Check(HasHeader(response, "X-Strix-Codec-Steps", "2"),
+  Check(HasHeader(response, "X-Gufo-Codec-Steps", "2"),
         "codec step count is exposed");
   Check(runner.calls == 1 && runner.latest.text == "The boy who lived." &&
             runner.latest.speaker == "vivian" &&

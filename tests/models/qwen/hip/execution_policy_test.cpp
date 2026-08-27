@@ -30,18 +30,18 @@
 
 namespace {
 
-using strix::core::ModelConfig;
-using strix::models::qwen::build_synthetic_qwen_weights;
-using strix::models::qwen::CpuLayerContext;
-using strix::models::qwen::CpuModuleContext;
-using strix::models::qwen::HipModuleContext;
-using strix::models::qwen::make_small_qwen_config;
-using strix::models::qwen::MakeAttnNormView;
-using strix::models::qwen::NormForward;
-using strix::models::qwen::NormLayerView;
-using strix::models::qwen::ResidualAdd;
-using strix::models::qwen::RopeForward;
-using strix::models::qwen::RopeLayerView;
+using gufo::core::ModelConfig;
+using gufo::models::qwen::build_synthetic_qwen_weights;
+using gufo::models::qwen::CpuLayerContext;
+using gufo::models::qwen::CpuModuleContext;
+using gufo::models::qwen::HipModuleContext;
+using gufo::models::qwen::make_small_qwen_config;
+using gufo::models::qwen::MakeAttnNormView;
+using gufo::models::qwen::NormForward;
+using gufo::models::qwen::NormLayerView;
+using gufo::models::qwen::ResidualAdd;
+using gufo::models::qwen::RopeForward;
+using gufo::models::qwen::RopeLayerView;
 
 void Check(bool condition) {
   if (!condition) {
@@ -55,122 +55,122 @@ static_assert(!std::is_default_constructible_v<CpuLayerContext>);
 static_assert(!std::is_convertible_v<CpuModuleContext, HipModuleContext>);
 
 #if defined(ENGINE_ENABLE_HIP)
-static_assert(std::is_trivially_copyable_v<strix::hip::QwenDecodeScratch>);
-static_assert(std::is_trivially_copyable_v<strix::hip::QwenAttentionScratch>);
-static_assert(std::is_trivially_copyable_v<strix::hip::QwenSsmScratch>);
-static_assert(std::is_trivially_copyable_v<strix::hip::QwenFfnScratch>);
-static_assert(std::is_trivially_copyable_v<strix::hip::QwenGpuScratchView>);
+static_assert(std::is_trivially_copyable_v<gufo::hip::QwenDecodeScratch>);
+static_assert(std::is_trivially_copyable_v<gufo::hip::QwenAttentionScratch>);
+static_assert(std::is_trivially_copyable_v<gufo::hip::QwenSsmScratch>);
+static_assert(std::is_trivially_copyable_v<gufo::hip::QwenFfnScratch>);
+static_assert(std::is_trivially_copyable_v<gufo::hip::QwenGpuScratchView>);
 static_assert(
-    std::is_same_v<decltype(strix::hip::QwenDecodeScratch::sampled_token),
+    std::is_same_v<decltype(gufo::hip::QwenDecodeScratch::sampled_token),
                    std::span<std::uint32_t>>);
 #endif
 
-// --- 1. Fusion-toggle routing values (strix::hip::detail, host constexpr) ---
+// --- 1. Fusion-toggle routing values (gufo::hip::detail, host constexpr) ---
 void TestFusionToggleValues() {
   // Q/K norm + RoPE + KV write: ENABLED -> decode uses the fused kernel.
-  Check(strix::hip::detail::ShouldFuseQKNormRoPEKvWrite() == true);
+  Check(gufo::hip::detail::ShouldFuseQKNormRoPEKvWrite() == true);
 
   // The cross-module fusions below are DISABLED -> decode uses the unfused
   // module fallback. Each must stay consistent with the composition layer's
   // choice.
-  Check(strix::hip::detail::ShouldFuseResidualAddRMSNorm() == false);
-  Check(strix::hip::detail::ShouldFuseSSMGateResidual() == false);
-  Check(strix::hip::detail::ShouldFuseRMSNormProjection() == false);
-  Check(strix::hip::detail::ShouldFuseFFNSwiGLU() == false);
-  Check(strix::hip::detail::ShouldPrefetchNextLayer() == false);
+  Check(gufo::hip::detail::ShouldFuseResidualAddRMSNorm() == false);
+  Check(gufo::hip::detail::ShouldFuseSSMGateResidual() == false);
+  Check(gufo::hip::detail::ShouldFuseRMSNormProjection() == false);
+  Check(gufo::hip::detail::ShouldFuseFFNSwiGLU() == false);
+  Check(gufo::hip::detail::ShouldPrefetchNextLayer() == false);
 
-  auto candidate = strix::hip::QwenExecutionPolicy::Production();
+  auto candidate = gufo::hip::QwenExecutionPolicy::Production();
   candidate.fuse_decode_ssm_output_residual = true;
   candidate.prefetch_next_layer = true;
-  Check(strix::hip::detail::ShouldFuseDecodeSSMOutputResidual(candidate));
-  Check(strix::hip::detail::ShouldPrefetchNextLayer(candidate));
+  Check(gufo::hip::detail::ShouldFuseDecodeSSMOutputResidual(candidate));
+  Check(gufo::hip::detail::ShouldPrefetchNextLayer(candidate));
   Check(candidate.Fingerprint() ==
         ((1ULL << 0U) | (1ULL << 4U) | (1ULL << 7U)));
 
-  const auto decode_plan = strix::hip::ResolveQwenLayerRoute(
-      candidate, strix::hip::QwenExecutionMode::kDecode, false);
-  const auto prefill_plan = strix::hip::ResolveQwenLayerRoute(
-      candidate, strix::hip::QwenExecutionMode::kPrefill, false);
+  const auto decode_plan = gufo::hip::ResolveQwenLayerRoute(
+      candidate, gufo::hip::QwenExecutionMode::kDecode, false);
+  const auto prefill_plan = gufo::hip::ResolveQwenLayerRoute(
+      candidate, gufo::hip::QwenExecutionMode::kPrefill, false);
   Check(decode_plan.fuse_ssm_epilogue);
   Check(decode_plan.prefetch_next_layer);
   Check(!prefill_plan.fuse_ssm_epilogue);
   Check(!prefill_plan.prefetch_next_layer);
   Check(decode_plan.Fingerprint() != prefill_plan.Fingerprint());
 
-  auto ffn_candidate = strix::hip::QwenExecutionPolicy::Production();
+  auto ffn_candidate = gufo::hip::QwenExecutionPolicy::Production();
   ffn_candidate.fuse_decode_rmsnorm_projection = true;
-  auto ffn_plan = strix::hip::ResolveQwenLayerRoute(
-      ffn_candidate, strix::hip::QwenExecutionMode::kDecode, true);
+  auto ffn_plan = gufo::hip::ResolveQwenLayerRoute(
+      ffn_candidate, gufo::hip::QwenExecutionMode::kDecode, true);
   Check(ffn_plan.fuse_rmsnorm_projection);
   Check(!ffn_plan.fuse_ffn_swiglu);
 
   ffn_candidate.fuse_decode_rmsnorm_swiglu = true;
-  ffn_plan = strix::hip::ResolveQwenLayerRoute(
-      ffn_candidate, strix::hip::QwenExecutionMode::kDecode, true);
+  ffn_plan = gufo::hip::ResolveQwenLayerRoute(
+      ffn_candidate, gufo::hip::QwenExecutionMode::kDecode, true);
   Check(ffn_plan.fuse_rmsnorm_projection);
   Check(ffn_plan.fuse_ffn_swiglu);
 
-  const auto production_ssm = strix::hip::ResolveQwenLayerRouteWithReasons(
-      strix::hip::QwenExecutionPolicy::Production(),
-      strix::hip::QwenExecutionMode::kDecode, false);
-  Check(strix::hip::HasQwenRouteRejection(
+  const auto production_ssm = gufo::hip::ResolveQwenLayerRouteWithReasons(
+      gufo::hip::QwenExecutionPolicy::Production(),
+      gufo::hip::QwenExecutionMode::kDecode, false);
+  Check(gufo::hip::HasQwenRouteRejection(
       production_ssm.rejected,
-      strix::hip::QwenRouteRejection::kQkNormRopeKvRequiresAttention));
+      gufo::hip::QwenRouteRejection::kQkNormRopeKvRequiresAttention));
 
-  auto all_routes = strix::hip::QwenExecutionPolicy::Production();
+  auto all_routes = gufo::hip::QwenExecutionPolicy::Production();
   all_routes.fuse_prefill_ffn_swiglu = true;
   all_routes.fuse_decode_rmsnorm_swiglu = true;
   all_routes.fuse_decode_ssm_output_residual = true;
   all_routes.fuse_prefill_ssm_post_norm_gate = true;
   all_routes.fuse_decode_rmsnorm_projection = true;
   all_routes.prefetch_next_layer = true;
-  const auto decode_attention = strix::hip::ResolveQwenLayerRouteWithReasons(
-      all_routes, strix::hip::QwenExecutionMode::kDecode, true);
-  Check(strix::hip::HasQwenRouteRejection(
+  const auto decode_attention = gufo::hip::ResolveQwenLayerRouteWithReasons(
+      all_routes, gufo::hip::QwenExecutionMode::kDecode, true);
+  Check(gufo::hip::HasQwenRouteRejection(
       decode_attention.rejected,
-      strix::hip::QwenRouteRejection::kSsmEpilogueRequiresSsm));
-  Check(strix::hip::HasQwenRouteRejection(
+      gufo::hip::QwenRouteRejection::kSsmEpilogueRequiresSsm));
+  Check(gufo::hip::HasQwenRouteRejection(
       decode_attention.rejected,
-      strix::hip::QwenRouteRejection::kPrefillFfnSwiGluRequiresPrefill));
-  Check(strix::hip::HasQwenRouteRejection(
+      gufo::hip::QwenRouteRejection::kPrefillFfnSwiGluRequiresPrefill));
+  Check(gufo::hip::HasQwenRouteRejection(
       decode_attention.rejected,
-      strix::hip::QwenRouteRejection::kPrefillSsmEpilogueRequiresPrefill));
+      gufo::hip::QwenRouteRejection::kPrefillSsmEpilogueRequiresPrefill));
 
-  const auto prefill_ssm = strix::hip::ResolveQwenLayerRouteWithReasons(
-      all_routes, strix::hip::QwenExecutionMode::kPrefill, false);
-  Check(strix::hip::HasQwenRouteRejection(
+  const auto prefill_ssm = gufo::hip::ResolveQwenLayerRouteWithReasons(
+      all_routes, gufo::hip::QwenExecutionMode::kPrefill, false);
+  Check(gufo::hip::HasQwenRouteRejection(
       prefill_ssm.rejected,
-      strix::hip::QwenRouteRejection::kDecodeFfnSwiGluRequiresDecode));
-  Check(strix::hip::HasQwenRouteRejection(
+      gufo::hip::QwenRouteRejection::kDecodeFfnSwiGluRequiresDecode));
+  Check(gufo::hip::HasQwenRouteRejection(
       prefill_ssm.rejected,
-      strix::hip::QwenRouteRejection::kDecodeSsmEpilogueRequiresDecode));
-  Check(strix::hip::HasQwenRouteRejection(
+      gufo::hip::QwenRouteRejection::kDecodeSsmEpilogueRequiresDecode));
+  Check(gufo::hip::HasQwenRouteRejection(
       prefill_ssm.rejected,
-      strix::hip::QwenRouteRejection::kRmsNormProjectionRequiresDecode));
-  Check(strix::hip::HasQwenRouteRejection(
+      gufo::hip::QwenRouteRejection::kRmsNormProjectionRequiresDecode));
+  Check(gufo::hip::HasQwenRouteRejection(
       prefill_ssm.rejected,
-      strix::hip::QwenRouteRejection::kPrefetchRequiresDecode));
+      gufo::hip::QwenRouteRejection::kPrefetchRequiresDecode));
 
   const auto graph_rejections =
-      strix::hip::ResolveQwenGraphRejections(false, true, true, false);
-  Check(strix::hip::HasQwenGraphRejection(
-      graph_rejections, strix::hip::QwenGraphRejection::kLogitsNotRequested));
-  Check(strix::hip::HasQwenGraphRejection(
+      gufo::hip::ResolveQwenGraphRejections(false, true, true, false);
+  Check(gufo::hip::HasQwenGraphRejection(
+      graph_rejections, gufo::hip::QwenGraphRejection::kLogitsNotRequested));
+  Check(gufo::hip::HasQwenGraphRejection(
       graph_rejections,
-      strix::hip::QwenGraphRejection::kSplitKAttentionRequired));
-  Check(strix::hip::HasQwenGraphRejection(
-      graph_rejections, strix::hip::QwenGraphRejection::kLayerPrefetchEnabled));
-  Check(strix::hip::HasQwenGraphRejection(
-      graph_rejections, strix::hip::QwenGraphRejection::kGraphDisabled));
-  Check(strix::hip::ResolveQwenGraphRejections(true, false, false, true) ==
-        strix::hip::QwenGraphRejection::kNone);
+      gufo::hip::QwenGraphRejection::kSplitKAttentionRequired));
+  Check(gufo::hip::HasQwenGraphRejection(
+      graph_rejections, gufo::hip::QwenGraphRejection::kLayerPrefetchEnabled));
+  Check(gufo::hip::HasQwenGraphRejection(
+      graph_rejections, gufo::hip::QwenGraphRejection::kGraphDisabled));
+  Check(gufo::hip::ResolveQwenGraphRejections(true, false, false, true) ==
+        gufo::hip::QwenGraphRejection::kNone);
 
-  const auto workload_seed = strix::hip::BeginQwenGraphWorkloadIdentity();
-  const auto workload_a = strix::hip::ExtendQwenGraphWorkloadIdentity(
+  const auto workload_seed = gufo::hip::BeginQwenGraphWorkloadIdentity();
+  const auto workload_a = gufo::hip::ExtendQwenGraphWorkloadIdentity(
       workload_seed, decode_plan.Fingerprint());
-  const auto workload_a_repeat = strix::hip::ExtendQwenGraphWorkloadIdentity(
+  const auto workload_a_repeat = gufo::hip::ExtendQwenGraphWorkloadIdentity(
       workload_seed, decode_plan.Fingerprint());
-  const auto workload_b = strix::hip::ExtendQwenGraphWorkloadIdentity(
+  const auto workload_b = gufo::hip::ExtendQwenGraphWorkloadIdentity(
       workload_seed, prefill_plan.Fingerprint());
   Check(workload_a == workload_a_repeat);
   Check(workload_a != workload_b);
@@ -184,9 +184,9 @@ void TestUnfusedFallback_Norm() {
   const auto& layer = sw.weights.layers[0];
   const std::size_t hidden = config.hidden_size;
 
-  std::mt19937 rng = strix::test::make_seeded_rng(0xF0U);
+  std::mt19937 rng = gufo::test::make_seeded_rng(0xF0U);
   std::vector<float> x =
-      strix::test::make_random_tensor(hidden, rng, -1.0F, 1.0F);
+      gufo::test::make_random_tensor(hidden, rng, -1.0F, 1.0F);
 
   NormLayerView view = MakeAttnNormView(layer, config);
   const CpuModuleContext ctx;
@@ -208,7 +208,7 @@ void TestUnfusedFallback_Norm() {
                                 static_cast<double>(w[i]));
   }
 
-  auto res = strix::test::compare_module_logits(ref, out);
+  auto res = gufo::test::compare_module_logits(ref, out);
   Check(res.match);
   Check(res.finite);
 }

@@ -10,7 +10,7 @@
 
 #include "src/models/qwen/hip/dflash.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 QwenDFlashGpuDraftBackend::QwenDFlashGpuDraftBackend(
     std::unique_ptr<QwenDFlashGpuExecutor> executor,
@@ -178,5 +178,5 @@ void QwenDFlashGpuDraftBackend::Reset() noexcept {
   last_error_.clear();
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

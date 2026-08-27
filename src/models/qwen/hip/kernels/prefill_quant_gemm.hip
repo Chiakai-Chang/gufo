@@ -13,14 +13,14 @@
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
-namespace strix::hip {
+namespace gufo::hip {
 
 using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
 
 [[nodiscard]] bool UseCompactBf16SmallBatchTile() noexcept {
   static const bool enabled = [] {
-    const char* value = std::getenv("STRIX_PREFILL_SMALL_BATCH_BF16_TILE");
+    const char* value = std::getenv("GUFO_PREFILL_SMALL_BATCH_BF16_TILE");
     if (value == nullptr) {
       return true;
     }
@@ -33,7 +33,7 @@ using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
 
 [[nodiscard]] bool UseCompactW8A8SmallBatchTile() noexcept {
   static const bool enabled = [] {
-    const char* value = std::getenv("STRIX_PREFILL_SMALL_BATCH_W8A8_TILE");
+    const char* value = std::getenv("GUFO_PREFILL_SMALL_BATCH_W8A8_TILE");
     if (value == nullptr) {
       return true;
     }
@@ -46,7 +46,7 @@ using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
 
 [[nodiscard]] bool UseExactSharedQ8SmallBatchFp32() noexcept {
   static const bool enabled = [] {
-    const char* value = std::getenv("STRIX_Q8_SMALL_BATCH_EXACT_SHARED");
+    const char* value = std::getenv("GUFO_Q8_SMALL_BATCH_EXACT_SHARED");
     if (value == nullptr) {
       return true;
     }
@@ -1305,5 +1305,5 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
       <<<grid, block, 0, stream>>>(type, w, fp32_x, y, m, k);
 }
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 #endif  // defined(ENGINE_ENABLE_HIP)

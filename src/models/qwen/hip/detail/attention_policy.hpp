@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_DETAIL_ATTENTION_POLICY_HPP_
-#define STRIX_MODELS_QWEN_HIP_DETAIL_ATTENTION_POLICY_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_DETAIL_ATTENTION_POLICY_HPP_
+#define GUFO_MODELS_QWEN_HIP_DETAIL_ATTENTION_POLICY_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,7 +9,7 @@
 
 #include "src/models/qwen/hip/execution_policy.hpp"
 
-namespace strix::hip::detail {
+namespace gufo::hip::detail {
 
 inline constexpr std::size_t kOptimizedAttentionMinBatch{1024};
 inline constexpr std::uint32_t kTiledAttentionQueryHeads{24};
@@ -179,7 +179,7 @@ struct AttentionSupportParams {
 
 /// Prefill DeltaNet recurrence backend preference. The production route is the
 /// row-split kernel (opt-c170-deltanet-rowsplit);
-/// `STRIX_SSM_RECURRENCE=baseline` pins the previous single-block kernel so it
+/// `GUFO_SSM_RECURRENCE=baseline` pins the previous single-block kernel so it
 /// stays measurable in the same binary rather than only being reachable when a
 /// shape is unsupported.
 enum class SsmRecurrencePreference : std::uint8_t {
@@ -205,7 +205,7 @@ enum class SsmRecurrencePreference : std::uint8_t {
 
 [[nodiscard]] inline SsmRecurrencePreference SsmRecurrencePreferenceFromEnv() {
   static const SsmRecurrencePreference preference =
-      ResolveSsmRecurrencePreference(std::getenv("STRIX_SSM_RECURRENCE"));
+      ResolveSsmRecurrencePreference(std::getenv("GUFO_SSM_RECURRENCE"));
   return preference;
 }
 
@@ -223,13 +223,13 @@ enum class SsmRecurrencePreference : std::uint8_t {
 /// opt-c177-attn-wmma: the masked WMMA kernel covers the whole visible range in
 /// one pass and beats the tiled kernel by 3.5x at depth 0 and the tiled
 /// diagonal plus AOTriton prefix by 1.3-1.4x at depth, so it is the production
-/// route and the split path is no longer used. `STRIX_PREFILL_ATTENTION=split`
+/// route and the split path is no longer used. `GUFO_PREFILL_ATTENTION=split`
 /// (or `tile`, `ck`, `baseline`) pins an alternative for comparison.
 [[nodiscard]] inline bool ShouldUseWmmaPrefillAttention();
 
 /// Prefill attention backend preference. The fallback order behind the WMMA
 /// kernel is tiled, then Composable Kernel, then baseline;
-/// `STRIX_PREFILL_ATTENTION` pins one backend so the alternatives stay
+/// `GUFO_PREFILL_ATTENTION` pins one backend so the alternatives stay
 /// measurable in the same binary instead of only being reachable when the
 /// preferred one rejects a shape.
 enum class PrefillAttentionPreference : std::uint8_t {
@@ -268,7 +268,7 @@ ResolvePrefillAttentionPreference(const char* value) noexcept {
 [[nodiscard]] inline PrefillAttentionPreference
 PrefillAttentionPreferenceFromEnv() {
   static const PrefillAttentionPreference preference =
-      ResolvePrefillAttentionPreference(std::getenv("STRIX_PREFILL_ATTENTION"));
+      ResolvePrefillAttentionPreference(std::getenv("GUFO_PREFILL_ATTENTION"));
   return preference;
 }
 
@@ -325,6 +325,6 @@ inline void DispatchPrefillAttention(std::size_t visible_context,
   std::forward<BaselineLauncher>(launch_baseline)();
 }
 
-}  // namespace strix::hip::detail
+}  // namespace gufo::hip::detail
 
-#endif  // STRIX_MODELS_QWEN_HIP_DETAIL_ATTENTION_POLICY_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_DETAIL_ATTENTION_POLICY_HPP_

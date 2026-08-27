@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-namespace strix::speculative {
+namespace gufo::speculative {
 
 void PromptLookupDraftBackend::Reset() noexcept {
   matches_found_ = 0;
@@ -73,4 +73,4 @@ void PromptLookupDraftBackend::AcceptFeedback(
   (void)correction_token;
 }
 
-}  // namespace strix::speculative
+}  // namespace gufo::speculative

@@ -2,7 +2,7 @@
 name: optimize-kernel
 description: "Workflow for optimizing model inference kernels on Strix Halo gfx1151: assess a baseline, change one route behind a policy toggle, verify quality against the baseline, and retain or reject with evidence. Rejection with evidence is a valid card completion."
 metadata:
-  origin: strix-halo.cpp
+  origin: gufo
 ---
 
 # Optimize Kernel (Agent Skill)
@@ -32,16 +32,16 @@ only makes sense during the optimization.
 ## 1. Assess the baseline (before any change)
 
 1. Clean stage state: `git add .` (Nix sees only tracked files).
-2. Probe hardware + record revision/fingerprint: `nix build && ./result/bin/strix`.
+2. Probe hardware + record revision/fingerprint: `nix build && ./result/bin/gufo`.
 3. Build:
    - Release: `nix build` (produces `result/`). It builds fully-optimized
-     binaries and `./result/bin/strix-server` runs significantly faster with
+     binaries and `./result/bin/gufo-server` runs significantly faster with
      consistent performance.
    - Fast incremental loop while editing:
      `nix develop -c cmake --build --preset gpu-test`.
    - Build after EVERY step that edits kernels or launchers; never batch
      several uncommitted kernel edits before compiling this allows to iterate faster and safer.
-4. Benchmark with `./result/bin/strix-server bench`, single reps (do NOT pass
+4. Benchmark with `./result/bin/gufo-server bench`, single reps (do NOT pass
    `--repetitions`; alternate baseline/candidate runs instead):
    - Combined headline: `-p 2048 -n 128`
    - Decode only: `--n-prompt 0 --n-gen 128`
@@ -59,8 +59,8 @@ only makes sense during the optimization.
    ```
    nix develop -c rocprofv3 \
      --kernel-trace --scratch-memory-trace --summary \
-     --output-directory /tmp/strix-profile-<tag> \
-     -- ./result/bin/strix-server bench --model "$MODEL" --n-prompt 0 --n-gen 128
+     --output-directory /tmp/gufo-profile-<tag> \
+     -- ./result/bin/gufo-server bench --model "$MODEL" --n-prompt 0 --n-gen 128
    ```
    Collect per-kernel launch count, elapsed time, memory traffic, and resource
    table (VGPR, SGPR, LDS, scratch, occupancy, waves/SIMD). Headline latency
@@ -92,7 +92,7 @@ code.
 - Register the equivalence test under the card's CTest label.
 - Graph-capture awareness (decode): if the change touches launch structure,
   verify capture still succeeds with
-  `STRIX_DISPATCH_TELEMETRY=1 ./build/gpu-test/strix-server bench -p 16 -n 16`
+  `GUFO_DISPATCH_TELEMETRY=1 ./build/gpu-test/gufo-server bench -p 16 -n 16`
   -> expect `hip_graph` `miss_captured` then `hit`. Cross-stream rules:
   - Only the side-stream-records -> main-stream-waits direction is
     capture-compatible; the reverse fails `hipStreamEndCapture`
@@ -118,7 +118,7 @@ code.
 3. End-to-end interleaved A/B with release binaries. Keep
    `result-base`/`result-cand` symlinks and alternate binaries:
    ```
-   val=$(./result-<tag>/bin/strix-server bench --model "$MODEL" --n-prompt 0 --n-gen 128 2>/dev/null \
+   val=$(./result-<tag>/bin/gufo-server bench --model "$MODEL" --n-prompt 0 --n-gen 128 2>/dev/null \
      | rg '\| *tg128' | sed -E 's/.*\|\s*([0-9.]+) ±.*/\1/')
    ```
    Depth rows are named `tg128@d4096` etc. Report medians, tail, and raw
@@ -129,7 +129,7 @@ code.
 4. Always A/B BOTH paths: decode silently switches to split-K (non-graph) at
    context >= 4K, and a regression can hide in one path only. Test `tg128`
    (graph) and `tg@depth 4K/8K/16K` (split-K); to force the non-graph path at
-   shallow depth run `STRIX_ENABLE_HIP_GRAPH=0`.
+   shallow depth run `GUFO_ENABLE_HIP_GRAPH=0`.
 5. rocprofv3 with the same command as baseline; compare launch count,
    eliminated memory traffic, layer latency, VGPR/LDS/scratch, occupancy,
    waves/SIMD, and raw repetitions (sqlite query below).
@@ -176,7 +176,7 @@ code.
   the default on the integrated APU). The shard is fully page-cached, so
   steady-state decode is DRAM-bandwidth bound (~85 GB/s re-reading ~10-24 GiB
   of weights per token). Page-touch prefetch only re-reads the same DRAM.
-  `STRIX_GPU_WEIGHT_MODE=copy` makes weights device-resident (slow H2D load).
+  `GUFO_GPU_WEIGHT_MODE=copy` makes weights device-resident (slow H2D load).
 - Decode hot kernels (tg128): `Wave32FusedSwiGLUGEMV_2Rows`,
   `FastGEMVBlockKernel`, `Wave32GEMVKernel_1Row`,
   `Wave32FusedSSMInputProjections`, `DeltaNetRecurrenceKernel`.

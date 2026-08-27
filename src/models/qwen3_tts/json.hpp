@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_JSON_HPP_
-#define STRIX_MODELS_QWEN3_TTS_JSON_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_JSON_HPP_
+#define GUFO_MODELS_QWEN3_TTS_JSON_HPP_
 
 #include <charconv>
 #include <cmath>
@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-namespace strix::models::qwen3_tts::json {
+namespace gufo::models::qwen3_tts::json {
 
 /// Minimal, ordered JSON value with a recursive-descent parser and serializer.
 /// Object member order is preserved via a vector of (key, value) pairs.
@@ -502,6 +502,6 @@ struct Parser {
   return value;
 }
 
-}  // namespace strix::models::qwen3_tts::json
+}  // namespace gufo::models::qwen3_tts::json
 
-#endif  // STRIX_MODELS_QWEN3_TTS_JSON_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_JSON_HPP_

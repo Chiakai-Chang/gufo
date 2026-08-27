@@ -1,10 +1,10 @@
-Strix-Halo.cpp
-Copyright (c) 2026 Strix-Halo.cpp contributors
+gufo
+Copyright (c) 2026 gufo contributors
 
-This product includes software developed by the Strix-Halo.cpp project and
+This product includes software developed by the gufo project and
 third-party open source projects.
 
-The original Strix-Halo.cpp source code is licensed under the MIT License.
+The original gufo source code is licensed under the MIT License.
 See the LICENSE file in the root of this distribution for the full license text.
 
 For detailed third-party dependency provenance, component breakdown, SPDX identifiers,
@@ -145,7 +145,7 @@ Version: 8.1.2 from pinned Nixpkgs
 Upstream Repository: https://github.com/FFmpeg/FFmpeg
 
 MiniMax H3 media output invokes the headless ffmpeg and ffprobe executables as
-separate processes. No FFmpeg library is linked into Strix-Halo.cpp. The
+separate processes. No FFmpeg library is linked into gufo. The
 pinned Nix closure supplies FFmpeg's LGPL/GPL license texts and corresponding
 source metadata. See THIRD_PARTY_NOTICES.md for the exact relationship and
 enabled-license inventory.
@@ -156,6 +156,6 @@ enabled-license inventory.
 Pinned development environments include PyTorch ROCm 2.12.0, Torchvision
 0.27.0, and LPIPS 0.1.4 for independent teacher execution and perceptual
 quality evaluation. These BSD-licensed packages are not linked into or
-distributed with the production Strix binaries. Their upstream license texts
+distributed with the production Gufo binaries. Their upstream license texts
 and source metadata are supplied by the pinned Nix packages; exact
 relationships are recorded in THIRD_PARTY_NOTICES.md.

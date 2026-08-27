@@ -4,7 +4,7 @@ Status: design draft, 2026-08-11
 
 ## Purpose
 
-The `strix` executable also provides terminal interfaces for:
+The `gufo` executable also provides terminal interfaces for:
 
 - Interactive conversations.
 - One-shot prompt testing.
@@ -19,10 +19,10 @@ contain a second inference path.
 ## Commands
 
 ```text
-strix serve
-strix chat
-strix prompt
-strix diagnose
+gufo serve
+gufo chat
+gufo prompt
+gufo diagnose
 ```
 
 `serve` starts the OpenAI-compatible server. `chat` maintains an interactive
@@ -41,8 +41,8 @@ combinations return an error instead of being ignored.
 Direct mode loads the configured model in the current process:
 
 ```bash
-strix prompt \
-  --config strix.toml \
+gufo prompt \
+  --config gufo.toml \
   --model qwen-current-27b \
   --prompt "Explain wave32 in three sentences."
 ```
@@ -53,10 +53,10 @@ logit checks, and isolating HTTP from inference failures.
 
 ### Client mode
 
-Client mode sends a request to a running Strix-Halo.cpp server:
+Client mode sends a request to a running gufo server:
 
 ```bash
-strix prompt \
+gufo prompt \
   --connect http://127.0.0.1:8080 \
   --model qwen-current-27b \
   --prompt "Explain wave32 in three sentences."
@@ -73,14 +73,14 @@ used, but the effective mode must be printed by verbose diagnostics.
 The prompt may be supplied as a named option:
 
 ```bash
-strix prompt --config strix.toml --model qwen-current-27b \
+gufo prompt --config gufo.toml --model qwen-current-27b \
   --prompt "Write a JSON object with the keys name and value."
 ```
 
 It may also be the final positional argument:
 
 ```bash
-strix prompt --config strix.toml --model qwen-current-27b \
+gufo prompt --config gufo.toml --model qwen-current-27b \
   "Summarize how paged KV caches work."
 ```
 
@@ -89,11 +89,11 @@ The two forms are mutually exclusive.
 Additional input forms:
 
 ```bash
-strix prompt --config strix.toml --model qwen-current-27b \
+gufo prompt --config gufo.toml --model qwen-current-27b \
   --prompt-file prompt.txt
 
 printf '%s\n' "Explain INT4 zero points." |
-  strix prompt --config strix.toml --model qwen-current-27b --stdin
+  gufo prompt --config gufo.toml --model qwen-current-27b --stdin
 ```
 
 Exactly one of the following may provide the user prompt:
@@ -111,13 +111,13 @@ for a model-specific test.
 Start a direct interactive session:
 
 ```bash
-strix chat --config strix.toml --model qwen-current-27b
+gufo chat --config gufo.toml --model qwen-current-27b
 ```
 
 Or connect to a running server:
 
 ```bash
-strix chat \
+gufo chat \
   --connect http://127.0.0.1:8080 \
   --model qwen-current-27b
 ```
@@ -209,7 +209,7 @@ stdout is redirected.
     "input_tokens": 12,
     "output_tokens": 8
   },
-  "strix": {
+  "gufo": {
     "route": "GPU_ONLY",
     "time_to_first_token_ms": 18.2,
     "tokens_per_second": 21.4
@@ -250,18 +250,18 @@ Direct mode reports:
 
 ## System Diagnostics
 
-`strix diagnose` executes non-interactive platform, system, toolchain,
+`gufo diagnose` executes non-interactive platform, system, toolchain,
 GPU, and NPU diagnostics without starting a server or loading a model:
 
 ```bash
-strix diagnose
-strix diagnose --json
-strix diagnose --json --section inventory
-strix diagnose --fingerprint --json --output /tmp/strix-fingerprint.json
-strix diagnose --validate-artifact /tmp/strix-fingerprint.json
-strix diagnose --benchmark bandwidth --backends cpu,hip,xrt --output /tmp/strix-bandwidth.json
-strix diagnose --smoke xrt --iterations 100 --timeout-ms 30000 \
-  --json --output /tmp/strix-xrt-smoke.json
+gufo diagnose
+gufo diagnose --json
+gufo diagnose --json --section inventory
+gufo diagnose --fingerprint --json --output /tmp/gufo-fingerprint.json
+gufo diagnose --validate-artifact /tmp/gufo-fingerprint.json
+gufo diagnose --benchmark bandwidth --backends cpu,hip,xrt --output /tmp/gufo-bandwidth.json
+gufo diagnose --smoke xrt --iterations 100 --timeout-ms 30000 \
+  --json --output /tmp/gufo-xrt-smoke.json
 ```
 
 ### Machine Fingerprint and Artifact Validation
@@ -342,7 +342,7 @@ raw KV data:
 
 ```json
 {
-  "format": "strix-conversation-v1",
+  "format": "gufo-conversation-v1",
   "model": "qwen-current-27b",
   "chat_template_id": "qwen38-chat-v1",
   "system": "You are concise.",

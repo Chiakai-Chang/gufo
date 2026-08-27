@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN_HIP_OPS_NORM_RESIDUAL_HPP_
-#define STRIX_MODELS_QWEN_HIP_OPS_NORM_RESIDUAL_HPP_
+#ifndef GUFO_MODELS_QWEN_HIP_OPS_NORM_RESIDUAL_HPP_
+#define GUFO_MODELS_QWEN_HIP_OPS_NORM_RESIDUAL_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -7,7 +7,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-namespace strix::hip {
+namespace gufo::hip {
 
 /// Computes RMSNorm on GPU: out = (x / sqrt(mean(x^2) + eps)) * weight
 void LaunchRMSNorm(const float* x, const float* weight, float* out,
@@ -61,8 +61,8 @@ void LaunchBatchedFusedResidualAddRMSNorm(const float* a, const float* b,
                                           std::size_t dim, float eps = 1e-6F,
                                           hipStream_t stream = nullptr);
 
-}  // namespace strix::hip
+}  // namespace gufo::hip
 
 #endif  // defined(ENGINE_ENABLE_HIP)
 
-#endif  // STRIX_MODELS_QWEN_HIP_OPS_NORM_RESIDUAL_HPP_
+#endif  // GUFO_MODELS_QWEN_HIP_OPS_NORM_RESIDUAL_HPP_

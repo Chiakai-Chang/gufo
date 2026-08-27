@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_VIDEO_JOBS_HPP_
-#define STRIX_SERVER_VIDEO_JOBS_HPP_
+#ifndef GUFO_SERVER_VIDEO_JOBS_HPP_
+#define GUFO_SERVER_VIDEO_JOBS_HPP_
 
 #include <chrono>
 #include <cstddef>
@@ -13,7 +13,7 @@
 
 #include "src/models/minimax_h3/generation.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 
 enum class VideoJobStatus : std::uint8_t {
   kQueued,
@@ -122,6 +122,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_VIDEO_JOBS_HPP_
+#endif  // GUFO_SERVER_VIDEO_JOBS_HPP_

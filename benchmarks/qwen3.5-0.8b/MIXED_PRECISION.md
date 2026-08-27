@@ -90,7 +90,7 @@ is verified at the format level:
 
 ## Tooling
 
-`tools/strix/recipe.py` defines presets; `strix-quantize.py --recipe <name>`
-converts; `strix-mp-experiment.py` quantizes + benches each preset and prints
+`tools/gufo/recipe.py` defines presets; `gufo-quantize.py --recipe <name>`
+converts; `gufo-mp-experiment.py` quantizes + benches each preset and prints
 the comparison table. Plans in `artifacts/work/plan-<preset>.json`,
 shards in `artifacts/quant-<preset>/`.

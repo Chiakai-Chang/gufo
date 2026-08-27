@@ -97,7 +97,7 @@ void TestBatchedSSMConvEquivalence() {
 
   // Sequential
   for (std::size_t t = 0; t < batch; ++t) {
-    strix::hip::LaunchSSMConvRecurrence(
+    gufo::hip::LaunchSSMConvRecurrence(
         d_qkv + t * qkv_dim, d_w, d_state_seq, d_conv_out_seq + t * qkv_dim,
         d_delta_seq, d_alpha + t * num_heads, d_beta + t * num_heads, d_ssm_a,
         d_ssm_dt, d_ssm_norm, d_gate + t * inner_size,
@@ -106,7 +106,7 @@ void TestBatchedSSMConvEquivalence() {
   }
 
   // Batched
-  strix::hip::LaunchBatchedSSMConvRecurrence(
+  gufo::hip::LaunchBatchedSSMConvRecurrence(
       d_qkv, d_w, d_state_batch, d_conv_out_batch, d_delta_batch, d_alpha,
       d_beta, d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_batch, 0, batch,
       qkv_dim, num_key_heads, num_heads, key_dim, val_dim);
@@ -225,13 +225,13 @@ void TestBatchedSSMRecurrenceNormGateEquivalence() {
                       hipMemcpyHostToDevice));
 
   // Unfused reference chain: conv + recurrence + post-norm gate.
-  strix::hip::LaunchBatchedSSMConvRecurrence(
+  gufo::hip::LaunchBatchedSSMConvRecurrence(
       d_qkv, d_w, d_state_ref, d_conv_out_ref, d_delta_ref, d_alpha, d_beta,
       d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_ref, 0, batch, qkv_dim,
       num_key_heads, num_heads, key_dim, val_dim);
 
   // Fused: conv + recurrence with the norm+gate in the epilogue.
-  strix::hip::LaunchBatchedSSMConvRecurrenceNormGate(
+  gufo::hip::LaunchBatchedSSMConvRecurrenceNormGate(
       d_qkv, d_w, d_state_fus, d_conv_out_fus, d_delta_fus, d_alpha, d_beta,
       d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_fus, 0, batch, qkv_dim,
       num_key_heads, num_heads, key_dim, val_dim);
@@ -384,16 +384,16 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
   HIP_CHECK(hipMemset(d_state_ref, 0, qkv_dim * 4 * sizeof(float)));
   HIP_CHECK(hipMemset(d_state_new, 0, qkv_dim * 4 * sizeof(float)));
 
-  strix::hip::LaunchBatchedSSMConvRecurrence(
+  gufo::hip::LaunchBatchedSSMConvRecurrence(
       d_qkv, d_w, d_state_ref, d_conv_ref, d_delta_ref, d_alpha, d_beta,
       d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_ref, 0, batch, qkv_dim,
       num_key_heads, num_heads, key_dim, val_dim);
 
-  if (!strix::hip::IsDeltaNetRowSplitSupported(key_dim, val_dim)) {
+  if (!gufo::hip::IsDeltaNetRowSplitSupported(key_dim, val_dim)) {
     std::cerr << "row-split recurrence rejected the production state shape\n";
     std::abort();
   }
-  strix::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
+  gufo::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
       d_qkv, d_w, d_state_new, d_conv_new, d_delta_new, d_alpha, d_beta,
       d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_new, /*q8_out=*/nullptr,
       d_kq, d_ab, 0, batch, qkv_dim, num_key_heads, num_heads, key_dim,
@@ -447,8 +447,7 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
   // read back. That has to be byte-for-byte identical to the FP32 path followed
   // by an FP32 quantize, including the per-block scales and the tail-tile
   // zeros.
-  if (strix::hip::IsFusedSSMEpilogueQuantizeQ8_1Supported(val_dim,
-                                                          inner_size)) {
+  if (gufo::hip::IsFusedSSMEpilogueQuantizeQ8_1Supported(val_dim, inner_size)) {
     const std::size_t num_blocks = inner_size / 32;
     const std::size_t q8_bytes =
         ((((batch + 15) / 16) * num_blocks * 576)) + 4096;
@@ -468,14 +467,14 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
     HIP_CHECK(hipMemset(d_q8_got, 0xA5, q8_bytes));
 
     // Reference: the FP32 epilogue that just ran, quantized separately.
-    strix::hip::LaunchQuantizeActivationQ8_1FromFp32(d_out_new, d_q8_ref, batch,
-                                                     inner_size);
+    gufo::hip::LaunchQuantizeActivationQ8_1FromFp32(d_out_new, d_q8_ref, batch,
+                                                    inner_size);
 
     // Candidate: the same recurrence from the same starting state, but with the
     // epilogue writing Q8_1.
     HIP_CHECK(hipMemset(d_state_q8, 0, qkv_dim * 4 * sizeof(float)));
     upload(d_delta_q8, h_delta0);
-    strix::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
+    gufo::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
         d_qkv, d_w, d_state_q8, d_conv_q8, d_delta_q8, d_alpha, d_beta, d_ssm_a,
         d_ssm_dt, d_ssm_norm, d_gate, d_out_q8, d_q8_got, d_kq, d_ab, 0, batch,
         qkv_dim, num_key_heads, num_heads, key_dim, val_dim);
@@ -534,17 +533,17 @@ void TestFusedRMSNormSSMInputProjectionsEquivalence() {
   std::vector<std::uint16_t> h_alpha(time_step_rank * hidden_size);
   std::vector<std::uint16_t> h_beta(time_step_rank * hidden_size);
   for (std::size_t i = 0; i < qkv_size * hidden_size; ++i) {
-    h_qkv[i] = strix::test::FloatToBf16Bits(
+    h_qkv[i] = gufo::test::FloatToBf16Bits(
         0.009F * std::cos(static_cast<float>(i) * 0.0019F));
   }
   for (std::size_t i = 0; i < inner_size * hidden_size; ++i) {
-    h_gate[i] = strix::test::FloatToBf16Bits(
+    h_gate[i] = gufo::test::FloatToBf16Bits(
         0.012F * std::sin(static_cast<float>(i) * 0.0011F));
   }
   for (std::size_t i = 0; i < time_step_rank * hidden_size; ++i) {
-    h_alpha[i] = strix::test::FloatToBf16Bits(
+    h_alpha[i] = gufo::test::FloatToBf16Bits(
         0.007F * std::cos(static_cast<float>(i) * 0.0023F));
-    h_beta[i] = strix::test::FloatToBf16Bits(
+    h_beta[i] = gufo::test::FloatToBf16Bits(
         0.006F * std::sin(static_cast<float>(i) * 0.0029F));
   }
 
@@ -590,14 +589,13 @@ void TestFusedRMSNormSSMInputProjectionsEquivalence() {
                       time_step_rank * hidden_size * sizeof(std::uint16_t),
                       hipMemcpyHostToDevice));
 
-  strix::hip::LaunchRMSNorm(d_x, d_w, d_normed, hidden_size, eps);
-  strix::hip::LaunchFusedSSMInputProjections(
-      d_qkv, strix::core::GgmlType::kBF16, d_gate, strix::core::GgmlType::kBF16,
-      d_alpha, strix::core::GgmlType::kBF16, d_beta,
-      strix::core::GgmlType::kBF16, d_normed, d_qkv_ref, d_gate_ref,
-      d_alpha_ref, d_beta_ref, hidden_size, qkv_size, inner_size,
-      time_step_rank);
-  strix::hip::LaunchFusedRMSNormSSMInputProjections(
+  gufo::hip::LaunchRMSNorm(d_x, d_w, d_normed, hidden_size, eps);
+  gufo::hip::LaunchFusedSSMInputProjections(
+      d_qkv, gufo::core::GgmlType::kBF16, d_gate, gufo::core::GgmlType::kBF16,
+      d_alpha, gufo::core::GgmlType::kBF16, d_beta, gufo::core::GgmlType::kBF16,
+      d_normed, d_qkv_ref, d_gate_ref, d_alpha_ref, d_beta_ref, hidden_size,
+      qkv_size, inner_size, time_step_rank);
+  gufo::hip::LaunchFusedRMSNormSSMInputProjections(
       d_x, d_w, eps, d_qkv, true, d_gate, true, d_alpha, true, d_beta, true,
       d_qkv_fus, d_gate_fus, d_alpha_fus, d_beta_fus, hidden_size, qkv_size,
       inner_size, time_step_rank);
@@ -663,9 +661,9 @@ void TestFusedRMSNormSSMInputProjectionsEquivalence() {
 
 int main() {
 #if defined(ENGINE_ENABLE_HIP)
-  const int device_status = strix::test::GateHipDevice(
-      strix::test::HipDeviceRequirement::kOptional, "Qwen SSM ops test");
-  if (device_status != strix::test::kHipTestSuccess) {
+  const int device_status = gufo::test::GateHipDevice(
+      gufo::test::HipDeviceRequirement::kOptional, "Qwen SSM ops test");
+  if (device_status != gufo::test::kHipTestSuccess) {
     return device_status;
   }
 

@@ -1,5 +1,5 @@
-#ifndef STRIX_MODELS_QWEN3_TTS_HIP_SPEAKER_ENCODER_RUNTIME_HPP_
-#define STRIX_MODELS_QWEN3_TTS_HIP_SPEAKER_ENCODER_RUNTIME_HPP_
+#ifndef GUFO_MODELS_QWEN3_TTS_HIP_SPEAKER_ENCODER_RUNTIME_HPP_
+#define GUFO_MODELS_QWEN3_TTS_HIP_SPEAKER_ENCODER_RUNTIME_HPP_
 
 #include <cstddef>
 #include <memory>
@@ -8,7 +8,7 @@
 
 #include "src/models/qwen3_tts/audio.hpp"
 
-namespace strix::models::qwen3_tts::hip {
+namespace gufo::models::qwen3_tts::hip {
 
 struct SpeakerEncoderOutput {
   std::vector<float> embedding;
@@ -52,6 +52,6 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-}  // namespace strix::models::qwen3_tts::hip
+}  // namespace gufo::models::qwen3_tts::hip
 
-#endif  // STRIX_MODELS_QWEN3_TTS_HIP_SPEAKER_ENCODER_RUNTIME_HPP_
+#endif  // GUFO_MODELS_QWEN3_TTS_HIP_SPEAKER_ENCODER_RUNTIME_HPP_

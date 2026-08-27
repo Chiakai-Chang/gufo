@@ -1,5 +1,5 @@
-#ifndef STRIX_SERVER_TEXT_GENERATION_BACKEND_HPP_
-#define STRIX_SERVER_TEXT_GENERATION_BACKEND_HPP_
+#ifndef GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_
+#define GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_
 
 #include <atomic>
 #include <cstddef>
@@ -15,7 +15,7 @@
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace strix::server {
+namespace gufo::server {
 
 enum class TextGenerationErrorCode : std::uint8_t {
   kQueueFull,
@@ -243,6 +243,6 @@ TextGenerationBackend::start_chat(const ChatRequest& request,
                                                      temperature, is_cancelled);
 }
 
-}  // namespace strix::server
+}  // namespace gufo::server
 
-#endif  // STRIX_SERVER_TEXT_GENERATION_BACKEND_HPP_
+#endif  // GUFO_SERVER_TEXT_GENERATION_BACKEND_HPP_

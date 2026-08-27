@@ -1,5 +1,5 @@
-#ifndef STRIX_CORE_DIAGNOSTICS_FINGERPRINT_H_
-#define STRIX_CORE_DIAGNOSTICS_FINGERPRINT_H_
+#ifndef GUFO_CORE_DIAGNOSTICS_FINGERPRINT_H_
+#define GUFO_CORE_DIAGNOSTICS_FINGERPRINT_H_
 
 #include <cstdint>
 #include <string>
@@ -7,7 +7,7 @@
 
 #include "src/core/diagnostics/system_inventory.h"
 
-namespace strix::diagnostics {
+namespace gufo::diagnostics {
 
 struct CanonicalFingerprint {
   std::string schema_version{"1.0.0"};
@@ -50,6 +50,6 @@ struct MachineFingerprint {
 
 [[nodiscard]] std::string ComputeSha256Hex(std::string_view data);
 
-}  // namespace strix::diagnostics
+}  // namespace gufo::diagnostics
 
-#endif  // STRIX_CORE_DIAGNOSTICS_FINGERPRINT_H_
+#endif  // GUFO_CORE_DIAGNOSTICS_FINGERPRINT_H_
