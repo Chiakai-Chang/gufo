@@ -207,6 +207,8 @@ struct TextGenerationScheduler::Impl {
     incremental_text_is_exact = runner_pool->runner()
                                     .Descriptor()
                                     .capabilities.incremental_text_is_exact;
+    multi_token_decode =
+        runner_pool->runner().Descriptor().capabilities.multi_token_decode;
     worker = std::jthread(
         [this](const std::stop_token& stop_token) { Run(stop_token); });
   }
@@ -494,6 +496,23 @@ struct TextGenerationScheduler::Impl {
       return std::nullopt;
     }
 
+    if (!PublishSelection(request, selection)) {
+      return std::nullopt;
+    }
+    if (!final_token_advance_required &&
+        request->result.tokens.size() >= request->token_limit) {
+      request->result.decode_ms +=
+          std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
+              .count();
+      CompleteSuccess(request, TextGenerationBackend::FinishReason::kLength);
+      return std::nullopt;
+    }
+    return decode_start;
+  }
+
+  [[nodiscard]] bool PublishSelection(
+      const std::shared_ptr<ScheduledRequest>& request,
+      const TextDecodeSelection& selection) {
     const auto now = Clock::now();
     if (!request->previous_token.has_value()) {
       request->result.ttft_ms = std::chrono::duration<double, std::milli>(
@@ -514,7 +533,7 @@ struct TextGenerationScheduler::Impl {
                       std::make_exception_ptr(TextGenerationError(
                           TextGenerationErrorCode::kOutputLimit,
                           "text generation output byte limit exceeded")));
-      return std::nullopt;
+      return false;
     }
     request->generated_output_bytes += selection.piece.size();
     request->result.tokens.push_back(selection.token);
@@ -523,23 +542,15 @@ struct TextGenerationScheduler::Impl {
                       std::make_exception_ptr(TextGenerationError(
                           TextGenerationErrorCode::kOutputBackpressure,
                           "text generation buffered output limit exceeded")));
-      return std::nullopt;
+      return false;
     }
     if (incremental_text_is_exact) {
       request->result.text += selection.piece;
     }
     if (CompleteIfStopped(request)) {
-      return std::nullopt;
+      return false;
     }
-    if (!final_token_advance_required &&
-        request->result.tokens.size() >= request->token_limit) {
-      request->result.decode_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
-              .count();
-      CompleteSuccess(request, TextGenerationBackend::FinishReason::kLength);
-      return std::nullopt;
-    }
-    return decode_start;
+    return true;
   }
 
   void FinishAdvanced(const std::shared_ptr<ScheduledRequest>& request,
@@ -557,6 +568,10 @@ struct TextGenerationScheduler::Impl {
 
   void StepDecode(const std::shared_ptr<ScheduledRequest>& request) {
     consecutive_active_prefill_chunks = 0;
+    if (multi_token_decode) {
+      StepMultiTokenDecode(request);
+      return;
+    }
     try {
       const auto decode_start = PrepareDecode(request);
       if (!decode_start.has_value()) {
@@ -564,6 +579,46 @@ struct TextGenerationScheduler::Impl {
       }
       request->runner_request.Advance();
       FinishAdvanced(request, *decode_start);
+    } catch (...) {
+      const auto failure = std::current_exception();
+      if (!CompleteIfStopped(request)) {
+        CompleteFailure(request, failure);
+      }
+    }
+  }
+
+  void StepMultiTokenDecode(const std::shared_ptr<ScheduledRequest>& request) {
+    try {
+      if (CompleteIfStopped(request)) {
+        return;
+      }
+
+      request->phase.store(TextRequestPhase::kDecoding,
+                           std::memory_order_release);
+      const std::size_t remaining =
+          request->token_limit - request->result.tokens.size();
+      const auto decode_start = Clock::now();
+      const auto step =
+          request->runner_request.DecodeStep(remaining, request->temperature);
+      request->result.draft_tokens += step.draft_tokens;
+      request->result.draft_accepted_tokens += step.draft_accepted_tokens;
+
+      for (const auto& selection : step.selections) {
+        if (!PublishSelection(request, selection)) {
+          return;
+        }
+      }
+
+      request->result.decode_ms +=
+          std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
+              .count();
+      if (step.stop) {
+        CompleteSuccess(request, TextGenerationBackend::FinishReason::kStop);
+        return;
+      }
+      if (request->result.tokens.size() >= request->token_limit) {
+        CompleteSuccess(request, TextGenerationBackend::FinishReason::kLength);
+      }
     } catch (...) {
       const auto failure = std::current_exception();
       if (!CompleteIfStopped(request)) {
@@ -747,7 +802,7 @@ struct TextGenerationScheduler::Impl {
                 : decoding.size();
         const auto plan = runner_pool->SelectDecodePlan(candidate_count);
         const std::size_t batch_size =
-            plan.kind == TextExecutionPlanKind::kBatched
+            !multi_token_decode && plan.kind == TextExecutionPlanKind::kBatched
                 ? std::min(candidate_count, plan.physical_width)
                 : 1;
         std::vector<std::shared_ptr<ScheduledRequest>> batch;
@@ -788,6 +843,7 @@ struct TextGenerationScheduler::Impl {
   bool incremental_prefill_supported{false};
   bool final_token_advance_required{true};
   bool incremental_text_is_exact{false};
+  bool multi_token_decode{false};
   mutable std::mutex queue_mutex;
   std::condition_variable queue_condition;
   std::deque<PendingClient> queued_clients;

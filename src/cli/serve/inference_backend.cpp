@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -19,7 +20,9 @@
 #include "src/models/qwen/generator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
+#include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #endif
 
@@ -92,6 +95,8 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
   }
   line << ",\"prefill_ms\":" << result.prefill_ms
        << ",\"completion_tokens\":" << result.completion_tokens
+       << ",\"draft_tokens\":" << result.draft_tokens
+       << ",\"draft_tokens_accepted\":" << result.draft_accepted_tokens
        << ",\"ttft_ms\":" << result.ttft_ms
        << ",\"mean_inter_token_ms\":" << result.mean_inter_token_ms
        << ",\"max_inter_token_ms\":" << result.max_inter_token_ms
@@ -101,22 +106,50 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
   std::clog << line.str() << '\n';
 }
 
+bool IsQwenStopToken(const tokenization::QwenTokenizer& tokenizer,
+                     TextRunnerToken token) noexcept {
+  return token == tokenizer.GetEosTokenId() ||
+         token == tokenization::kDefaultQwenEndoftextId || token == 248044U ||
+         token == 248046U;
+}
+
 class QwenTextRunnerState final : public TextRunnerState {
 public:
-  QwenTextRunnerState(std::shared_ptr<const hip::QwenGpuModel> model,
-                      std::uint32_t max_context) {
+  QwenTextRunnerState(
+      std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
+      std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model,
+      speculative::SpeculativeOptions speculative_options)
+      : model_(std::move(model)) {
     std::string error;
-    executor_ =
-        hip::QwenGpuExecutor::Create(std::move(model), &error, max_context);
+    executor_ = hip::QwenGpuExecutor::Create(model_, &error, max_context);
     if (executor_ == nullptr) {
       throw std::runtime_error("Failed to create GPU session: " + error);
+    }
+    if (dflash_model != nullptr) {
+      auto draft_backend = hip::QwenDFlashGpuDraftBackend::Create(
+          std::move(dflash_model),
+          hip::QwenDFlashGpuDraftConfig{
+              .max_context = max_context,
+              .max_draft_tokens = speculative_options.max_draft_tokens,
+          },
+          &error);
+      if (draft_backend == nullptr) {
+        throw std::runtime_error("Failed to create DFlash session: " + error);
+      }
+      verifier_ = std::make_unique<speculative::SpeculativeVerifier>(
+          *executor_, std::move(draft_backend), speculative_options);
     }
   }
 
   void Invalidate() noexcept override {
+    if (verifier_ != nullptr) {
+      verifier_->Reset();
+    }
     executor_->Reset();
+    sequence_.clear();
     position_ = 0;
     frontier_.reset();
+    frontier_published_ = false;
   }
 
   [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
@@ -132,6 +165,78 @@ public:
     }
   }
 
+  [[nodiscard]] bool speculative() const noexcept {
+    return verifier_ != nullptr;
+  }
+
+  void PrimeSpeculative(std::span<const TextRunnerToken> prompt) {
+    if (verifier_ == nullptr) {
+      throw std::logic_error("Qwen state has no speculative verifier");
+    }
+    frontier_ = verifier_->Prime(prompt);
+    sequence_.assign(prompt.begin(), prompt.end());
+    position_ = prompt.size();
+    frontier_published_ = false;
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeSpeculative(std::size_t max_tokens) {
+    if (verifier_ == nullptr || !frontier_.has_value()) {
+      throw std::logic_error("Qwen speculative state has no frontier");
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "Qwen speculative decode budget must be at least one token");
+    }
+
+    TextDecodeStep result;
+    const auto append_selection = [&](TextRunnerToken token) {
+      if (IsQwenStopToken(model_->GetTokenizer(), token)) {
+        result.stop = true;
+        return false;
+      }
+      result.selections.push_back({
+          .stop = false,
+          .token = token,
+          .piece = std::string(model_->GetTokenizer().DecodeToken(token)),
+      });
+      sequence_.push_back(token);
+      return true;
+    };
+
+    if (!frontier_published_) {
+      if (!append_selection(*frontier_)) {
+        return result;
+      }
+      frontier_published_ = true;
+      if (result.selections.size() == max_tokens) {
+        return result;
+      }
+    }
+
+    const auto stats_before = verifier_->GetStats();
+    const std::size_t remaining = max_tokens - result.selections.size();
+    const auto verification = verifier_->VerifyStep(
+        sequence_, static_cast<std::uint32_t>(position_), *frontier_,
+        model_->GetTokenizer().GetEosTokenId(),
+        static_cast<std::uint32_t>(std::min<std::size_t>(
+            remaining, std::numeric_limits<std::uint32_t>::max())));
+    const auto stats_after = verifier_->GetStats();
+    result.draft_tokens =
+        stats_after.total_draft_tokens - stats_before.total_draft_tokens;
+    result.draft_accepted_tokens =
+        stats_after.total_accepted_tokens - stats_before.total_accepted_tokens;
+
+    for (const TextRunnerToken token : verification.emitted_tokens) {
+      if (!append_selection(token)) {
+        break;
+      }
+      ++position_;
+    }
+    frontier_ = verification.next_token;
+    frontier_published_ = !result.stop;
+    return result;
+  }
+
   [[nodiscard]] hip::QwenGpuExecutor& executor() const { return *executor_; }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
@@ -142,9 +247,13 @@ public:
   void set_frontier(TextRunnerToken frontier) noexcept { frontier_ = frontier; }
 
 private:
+  std::shared_ptr<const hip::QwenGpuModel> model_;
   std::unique_ptr<hip::QwenGpuExecutor> executor_;
+  std::unique_ptr<speculative::SpeculativeVerifier> verifier_;
+  std::vector<TextRunnerToken> sequence_;
   std::size_t position_{0};
   std::optional<TextRunnerToken> frontier_;
+  bool frontier_published_{false};
 };
 
 class QwenTextRunnerSnapshot final : public TextRunnerSnapshot {
@@ -186,20 +295,30 @@ const QwenTextRunnerState& RequireQwenState(const TextRunnerState& state) {
 
 class QwenTextRunner final : public TextModelRunner {
 public:
-  QwenTextRunner(std::shared_ptr<const hip::QwenGpuModel> model,
-                 std::uint32_t max_context)
-      : model_(std::move(model)), max_context_(max_context) {}
+  QwenTextRunner(
+      std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
+      std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model = nullptr,
+      speculative::SpeculativeOptions speculative_options = {})
+      : model_(std::move(model)),
+        dflash_model_(std::move(dflash_model)),
+        max_context_(max_context),
+        speculative_options_(speculative_options) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    const bool speculative_enabled = dflash_model_ != nullptr;
     return {
         .model_id = model_->GetConfig().model_name,
-        .state_abi = "qwen-gfx1151-state-v1",
+        .state_abi = speculative_enabled ? "qwen-gfx1151-dflash-state-v1"
+                                         : "qwen-gfx1151-state-v1",
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
-                .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
+                .incremental_prefill = !speculative_enabled,
+                .snapshot = !speculative_enabled,
+                .fork = !speculative_enabled,
+                .final_token_advance_required = !speculative_enabled,
+                .multi_token_decode = speculative_enabled,
+                .prefix_reuse = !speculative_enabled,
             },
     };
   }
@@ -223,6 +342,12 @@ public:
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    if (dflash_model_ != nullptr) {
+      return {{
+          .kind = TextExecutionPlanKind::kSerial,
+          .physical_width = 1,
+      }};
+    }
     return {
         {
             .kind = TextExecutionPlanKind::kSerial,
@@ -267,7 +392,8 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<QwenTextRunnerState>(model_, max_context_);
+    return std::make_unique<QwenTextRunnerState>(
+        model_, max_context_, dflash_model_, speculative_options_);
   }
 
   [[nodiscard]] TextPrefillStep Prefill(
@@ -280,6 +406,17 @@ public:
     }
     if (offset >= prompt.size()) {
       throw std::logic_error("Qwen prefill has no remaining input");
+    }
+    if (qwen.speculative()) {
+      if (offset != 0 || max_input_tokens < prompt.size()) {
+        throw std::logic_error(
+            "Qwen DFlash prefill requires the complete cold prompt");
+      }
+      qwen.PrimeSpeculative(prompt);
+      return {
+          .consumed_tokens = prompt.size(),
+          .decode_ready = true,
+      };
     }
 
     const std::size_t consumed =
@@ -301,13 +438,16 @@ public:
   [[nodiscard]] TextDecodeSelection SelectNext(TextRunnerState& state, float,
                                                std::uint64_t*) const override {
     const auto& qwen = RequireQwenState(state);
+    if (qwen.speculative()) {
+      throw std::logic_error(
+          "Qwen DFlash decoding requires a multi-token decode step");
+    }
     if (!qwen.frontier().has_value()) {
       throw std::logic_error("Qwen state has no next-token frontier");
     }
 
     const TextRunnerToken token = *qwen.frontier();
-    if (token == model_->GetTokenizer().GetEosTokenId() || token == 151643U ||
-        token == 248044U || token == 248046U) {
+    if (IsQwenStopToken(model_->GetTokenizer(), token)) {
       return {
           .stop = true,
           .token = 0,
@@ -323,6 +463,10 @@ public:
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
     auto& qwen = RequireQwenState(state);
+    if (qwen.speculative()) {
+      throw std::logic_error(
+          "Qwen DFlash decoding requires a multi-token decode step");
+    }
     if (!qwen.frontier().has_value() || token != *qwen.frontier()) {
       throw std::logic_error(
           "Qwen decode token does not match the retained frontier");
@@ -333,8 +477,23 @@ public:
     qwen.set_frontier(frontier);
   }
 
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens, float temperature,
+      std::uint64_t* rng_state) const override {
+    auto& qwen = RequireQwenState(state);
+    if (!qwen.speculative()) {
+      return TextModelRunner::DecodeStep(state, max_tokens, temperature,
+                                         rng_state);
+    }
+    return qwen.DecodeSpeculative(max_tokens);
+  }
+
   void AdvanceBatch(
       std::span<const TextRunnerAdvance> advances) const override {
+    if (dflash_model_ != nullptr) {
+      throw std::logic_error(
+          "Qwen DFlash sessions do not support batch advance");
+    }
     if (advances.size() < 2 || advances.size() > 8) {
       throw std::invalid_argument(
           "Qwen batched decode requires two to eight sessions");
@@ -376,6 +535,9 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
+    if (dflash_model_ != nullptr) {
+      throw std::logic_error("Qwen DFlash sessions do not support snapshots");
+    }
     const auto& qwen = RequireQwenState(state);
     if (!qwen.frontier().has_value()) {
       throw std::logic_error("Qwen state has no exact frontier to snapshot");
@@ -389,6 +551,10 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> RestoreOrFork(
       const TextRunnerSnapshot& snapshot) const override {
+    if (dflash_model_ != nullptr) {
+      throw std::logic_error(
+          "Qwen DFlash sessions do not support snapshot restore");
+    }
     const auto* qwen_snapshot =
         dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
     if (qwen_snapshot == nullptr ||
@@ -398,7 +564,8 @@ public:
       throw std::invalid_argument(
           "Qwen snapshot does not belong to this model");
     }
-    auto restored = std::make_unique<QwenTextRunnerState>(model_, max_context_);
+    auto restored = std::make_unique<QwenTextRunnerState>(
+        model_, max_context_, nullptr, speculative::SpeculativeOptions{});
     restored->executor().RestoreSnapshot(*qwen_snapshot->snapshot);
     restored->set_position(qwen_snapshot->position);
     restored->set_frontier(*qwen_snapshot->frontier);
@@ -407,7 +574,9 @@ public:
 
 private:
   std::shared_ptr<const hip::QwenGpuModel> model_;
+  std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
   std::uint32_t max_context_;
+  speculative::SpeculativeOptions speculative_options_;
 };
 
 std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {
@@ -898,7 +1067,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             std::uint32_t max_context,
                             std::size_t session_count,
                             TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy) {
+                            TextSchedulerPolicy scheduler_policy,
+                            const TextSpeculativeConfig& speculative_config) {
 #if defined(ENGINE_ENABLE_HIP)
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
@@ -908,6 +1078,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
+      SetError(error,
+               "Speculative decoding is only supported by Qwen HTTP models");
+      return false;
+    }
     auto model = models::deepseek_v4_flash::Model::Load(
         model_path,
         models::deepseek_v4_flash::ModelOptions{
@@ -929,13 +1104,14 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   return load(std::move(model), error, max_context, session_count,
-              prefill_policy, scheduler_policy);
+              prefill_policy, scheduler_policy, speculative_config);
 #else
   (void)model_path;
   (void)max_context;
   (void)session_count;
   (void)prefill_policy;
   (void)scheduler_policy;
+  (void)speculative_config;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -946,7 +1122,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             std::string* error, std::uint32_t max_context,
                             std::size_t session_count,
                             TextPrefillPolicy prefill_policy,
-                            TextSchedulerPolicy scheduler_policy) {
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
@@ -955,11 +1132,70 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     SetError(error, "HTTP session count must be at least one");
     return false;
   }
+  if (speculative_config.max_draft_tokens == 0 ||
+      speculative_config.min_draft_tokens == 0 ||
+      speculative_config.min_draft_tokens >
+          speculative_config.max_draft_tokens) {
+    SetError(error, "HTTP speculative draft limits are invalid");
+    return false;
+  }
 
   try {
+    std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model;
+    speculative::SpeculativeOptions speculative_options;
+    if (speculative_config.backend == TextSpeculativeBackend::kDFlash) {
+      if (speculative_config.draft_model_path.empty()) {
+        if (const char* environment = std::getenv("GUFO_DFLASH_MODEL");
+            environment != nullptr && *environment != '\0') {
+          speculative_config.draft_model_path = environment;
+        }
+      }
+      if (speculative_config.draft_model_path.empty()) {
+        SetError(error, "DFlash HTTP decoding requires --dflash-model");
+        return false;
+      }
+      std::string dflash_error;
+      auto dflash_reader_owner = core::GgufReader::OpenFile(
+          speculative_config.draft_model_path, &dflash_error);
+      if (dflash_reader_owner == nullptr) {
+        SetError(error, "Failed to open DFlash GGUF: " + dflash_error);
+        return false;
+      }
+      std::shared_ptr<const core::GgufReader> dflash_reader(
+          std::move(dflash_reader_owner));
+      dflash_model = hip::QwenDFlashGpuModel::Create(std::move(dflash_reader),
+                                                     model, &dflash_error);
+      if (dflash_model == nullptr) {
+        SetError(error, "Failed to create DFlash model: " + dflash_error);
+        return false;
+      }
+
+      speculative_options.max_draft_tokens =
+          speculative_config.max_draft_tokens;
+      speculative_options.min_draft_tokens =
+          speculative_config.min_draft_tokens;
+      speculative_options.initial_draft_tokens =
+          speculative_config.max_draft_tokens;
+      speculative_options.use_batched_verification = true;
+      speculative_options.use_batched_lm_head = true;
+      speculative_options.target_bf16_from_layer = 48;
+      switch (speculative_config.draft_policy) {
+        case TextDraftPolicy::kFixed:
+          speculative_options.enable_adaptive_draft_length = false;
+          break;
+        case TextDraftPolicy::kRollingAcceptance:
+          break;
+        case TextDraftPolicy::kAcceptedTokenEma:
+          speculative_options.adaptive_draft_policy =
+              speculative::AdaptiveDraftPolicy::kAcceptedTokenEma;
+          break;
+      }
+    }
+
     auto new_state = std::make_shared<Impl::State>();
-    auto runner =
-        std::make_shared<QwenTextRunner>(std::move(model), max_context);
+    auto runner = std::make_shared<QwenTextRunner>(
+        std::move(model), max_context, std::move(dflash_model),
+        speculative_options);
     new_state->model_id = runner->Descriptor().model_id;
     auto runner_pool =
         std::make_shared<TextRunnerPool>(std::move(runner), session_count);

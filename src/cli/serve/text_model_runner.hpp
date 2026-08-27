@@ -36,6 +36,8 @@ struct TextRunnerCapabilities {
   bool fork{false};
   bool final_token_advance_required{true};
   bool incremental_text_is_exact{false};
+  bool multi_token_decode{false};
+  bool prefix_reuse{true};
 };
 
 struct TextRunnerDescriptor {
@@ -72,6 +74,13 @@ struct TextDecodeSelection {
   bool stop{false};
   TextRunnerToken token{0};
   std::string piece;
+};
+
+struct TextDecodeStep {
+  std::vector<TextDecodeSelection> selections;
+  std::size_t draft_tokens{0};
+  std::size_t draft_accepted_tokens{0};
+  bool stop{false};
 };
 
 /// Model-private state driven only through TextModelRunner work units.
@@ -149,6 +158,9 @@ public:
       TextRunnerState& state, float temperature,
       std::uint64_t* rng_state) const = 0;
   virtual void Advance(TextRunnerState& state, TextRunnerToken token) const = 0;
+  [[nodiscard]] virtual TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens, float temperature,
+      std::uint64_t* rng_state) const;
   virtual void AdvanceBatch(std::span<const TextRunnerAdvance> advances) const;
   [[nodiscard]] virtual std::size_t CheckpointPosition(
       const TextRunnerState& state) const = 0;
@@ -187,6 +199,8 @@ public:
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
     [[nodiscard]] TextDecodeSelection SelectNext(float temperature);
     void Advance();
+    [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens,
+                                            float temperature);
 
     /// Publishes the model state at its reported checkpoint boundary.
     void Commit();

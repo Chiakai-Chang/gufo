@@ -106,6 +106,31 @@ int main(int argc, const char* const* argv) {
            "raw HTTP text must decode the exact generated tokens");
     Expect(http_raw.ttft_ms > 0.0, "raw HTTP TTFT must be reported");
 
+    if (argc >= 3) {
+      gufo::server::InferenceBackend speculative_backend;
+      Expect(speculative_backend.load(
+                 model, &error, context, 1, {}, {},
+                 gufo::server::TextSpeculativeConfig{
+                     .backend = gufo::server::TextSpeculativeBackend::kDFlash,
+                     .draft_model_path = argv[2],
+                     .max_draft_tokens = 7,
+                     .min_draft_tokens = 1,
+                     .draft_policy =
+                         gufo::server::TextDraftPolicy::kRollingAcceptance,
+                 }),
+             error);
+      const auto direct_spec = GenerateDirect(*direct, raw_prompt_tokens, 8);
+      const auto http_spec = speculative_backend.complete(raw_prompt, 8, 0.0F);
+      Expect(http_spec.tokens == direct_spec,
+             "DFlash HTTP and direct greedy tokens differ");
+      Expect(http_spec.draft_tokens > 0,
+             "DFlash HTTP request did not draft any tokens");
+      Expect(http_spec.draft_accepted_tokens <= http_spec.draft_tokens,
+             "DFlash HTTP acceptance metrics are invalid");
+      Expect(!http_spec.cache_hit,
+             "DFlash HTTP state must not use target-only prefix snapshots");
+    }
+
     const std::vector<gufo::tokenization::ChatMessage> messages = {
         {gufo::tokenization::ChatRole::kSystem,
          "Answer with one short sentence.", "", ""},

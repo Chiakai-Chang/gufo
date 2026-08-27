@@ -22,6 +22,25 @@ class Model;
 
 namespace gufo::server {
 
+enum class TextSpeculativeBackend : std::uint8_t {
+  kDisabled,
+  kDFlash,
+};
+
+enum class TextDraftPolicy : std::uint8_t {
+  kFixed,
+  kRollingAcceptance,
+  kAcceptedTokenEma,
+};
+
+struct TextSpeculativeConfig {
+  TextSpeculativeBackend backend{TextSpeculativeBackend::kDisabled};
+  std::string draft_model_path;
+  std::uint32_t max_draft_tokens{7};
+  std::uint32_t min_draft_tokens{1};
+  TextDraftPolicy draft_policy{TextDraftPolicy::kRollingAcceptance};
+};
+
 /// Thread-safe HTTP inference facade over shared immutable GPU model resources
 /// and a bounded pool of request-owned executor sessions.
 class InferenceBackend final : public TextGenerationBackend {
@@ -38,14 +57,16 @@ public:
   bool load(const std::string& model_path, std::string* error,
             std::uint32_t max_context = 4096, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {});
+            TextSchedulerPolicy scheduler_policy = {},
+            const TextSpeculativeConfig& speculative_config = {});
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
   bool load(std::shared_ptr<const hip::QwenGpuModel> model, std::string* error,
             std::uint32_t max_context = 4096, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {});
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {});
 
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,

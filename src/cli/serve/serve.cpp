@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -174,10 +175,9 @@ void PrintServeHelp(std::string_view program_name,
                      "Reasoning Defaults", &reasoning_budget);
 
     // Speculative & Hardware
-    parser.AddOption(
-        "", "--speculative", "MODE",
-        "Draft backend: dflash, dflash2, mtp, mtp-npu, npu, pld, self, or off",
-        "Speculative", &speculative_backend);
+    parser.AddOption("", "--speculative", "MODE",
+                     "HTTP draft backend: dflash, dflash2, or off",
+                     "Speculative", &speculative_backend);
     parser.AddOption("", "--dflash-model", "PATH",
                      "Path to quantized Qwen DFlash/DFlash-2 GGUF file",
                      "Speculative", &dflash_model_path);
@@ -608,10 +608,9 @@ int RunServe(std::span<const char* const> args) {
         "Default token cap for thinking traces (default: -1 = unlimited) "
         "(TODO: qwen, deepseek)",
         "Reasoning Defaults", &reasoning_budget);
-    llm_parser.AddOption(
-        "", "--speculative", "MODE",
-        "Draft backend: dflash, dflash2, mtp, mtp-npu, npu, pld, self, or off",
-        "Speculative", &speculative_backend);
+    llm_parser.AddOption("", "--speculative", "MODE",
+                         "HTTP draft backend: dflash, dflash2, or off",
+                         "Speculative", &speculative_backend);
     llm_parser.AddOption("", "--dflash-model", "PATH",
                          "Path to quantized Qwen DFlash/DFlash-2 GGUF file",
                          "Speculative", &dflash_model_path);
@@ -680,6 +679,43 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: sampling and scheduling limits are invalid\n";
       return 2;
     }
+    if (draft_tokens == 0 || min_draft_tokens == 0 ||
+        min_draft_tokens > draft_tokens ||
+        draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
+      std::cerr << "Error: speculative draft limits are invalid\n";
+      return 2;
+    }
+
+    server::TextSpeculativeConfig speculative_config;
+    if (speculative_backend.empty() || speculative_backend == "off") {
+      speculative_config.backend = server::TextSpeculativeBackend::kDisabled;
+    } else if (speculative_backend == "dflash" ||
+               speculative_backend == "dflash2" ||
+               speculative_backend == "dflash-2") {
+      speculative_config.backend = server::TextSpeculativeBackend::kDFlash;
+    } else {
+      std::cerr << "Error: speculative backend '" << speculative_backend
+                << "' is not supported by the HTTP server\n";
+      return 2;
+    }
+    speculative_config.draft_model_path = dflash_model_path;
+    speculative_config.max_draft_tokens =
+        static_cast<std::uint32_t>(draft_tokens);
+    speculative_config.min_draft_tokens =
+        static_cast<std::uint32_t>(min_draft_tokens);
+    if (draft_policy == "fixed") {
+      speculative_config.draft_policy = server::TextDraftPolicy::kFixed;
+    } else if (draft_policy == "rolling") {
+      speculative_config.draft_policy =
+          server::TextDraftPolicy::kRollingAcceptance;
+    } else if (draft_policy == "accepted-ema") {
+      speculative_config.draft_policy =
+          server::TextDraftPolicy::kAcceptedTokenEma;
+    } else {
+      std::cerr << "Error: unknown speculative draft policy '" << draft_policy
+                << "'\n";
+      return 2;
+    }
 
     std::string err;
     backend = std::make_shared<server::InferenceBackend>();
@@ -700,9 +736,16 @@ int RunServe(std::span<const char* const> args) {
                                std::chrono::milliseconds{
                                    static_cast<std::chrono::milliseconds::rep>(
                                        request_timeout_ms)},
-                       })) {
+                       },
+                       speculative_config)) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
+    }
+    if (speculative_config.backend == server::TextSpeculativeBackend::kDFlash) {
+      std::cout << "[Speculative]: DFlash enabled (max_draft_tokens="
+                << speculative_config.max_draft_tokens
+                << ", min_draft_tokens=" << speculative_config.min_draft_tokens
+                << ")\n";
     }
     backend->set_model_id(served_model_name);
     backend->set_sampling_defaults(max_tokens, temperature);

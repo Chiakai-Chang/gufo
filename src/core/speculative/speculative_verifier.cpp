@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string_view>
@@ -299,7 +300,23 @@ void SpeculativeVerifier::UpdateDraftTargetHidden() {
 SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     std::vector<tokenization::TokenId>& current_sequence, std::uint32_t cur_pos,
     tokenization::TokenId current_token, tokenization::TokenId eos_id) {
-  if (draft_backend_ == nullptr || current_draft_length_ == 0) {
+  return VerifyStep(current_sequence, cur_pos, current_token, eos_id,
+                    std::numeric_limits<std::uint32_t>::max());
+}
+
+SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
+    std::vector<tokenization::TokenId>& current_sequence, std::uint32_t cur_pos,
+    tokenization::TokenId current_token, tokenization::TokenId eos_id,
+    std::uint32_t max_emitted_tokens) {
+  if (max_emitted_tokens == 0) {
+    throw std::invalid_argument(
+        "speculative verification must emit at least one token");
+  }
+  const std::uint32_t max_draft_tokens =
+      max_emitted_tokens > 1
+          ? std::min(current_draft_length_, max_emitted_tokens - 1)
+          : 0;
+  if (draft_backend_ == nullptr || max_draft_tokens == 0) {
     const auto next = target_executor_->ForwardToken(current_token, cur_pos);
     UpdateDraftTargetHidden();
     ++stats_.total_verification_steps;
@@ -314,7 +331,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
 
   // 1. Propose draft tokens
   const auto proposal =
-      draft_backend_->Propose(current_sequence, cur_pos, current_draft_length_);
+      draft_backend_->Propose(current_sequence, cur_pos, max_draft_tokens);
   if (proposal.tokens.empty()) {
     const auto next = target_executor_->ForwardToken(current_token, cur_pos);
     UpdateDraftTargetHidden();

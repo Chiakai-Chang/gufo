@@ -160,6 +160,11 @@ public:
                         std::uint32_t cur_pos,
                         tokenization::TokenId current_token,
                         tokenization::TokenId eos_id);
+  StepResult VerifyStep(std::vector<tokenization::TokenId>& current_sequence,
+                        std::uint32_t cur_pos,
+                        tokenization::TokenId current_token,
+                        tokenization::TokenId eos_id,
+                        std::uint32_t max_emitted_tokens);
 
   [[nodiscard]] const SpeculativeStats& GetStats() const noexcept {
     return stats_;

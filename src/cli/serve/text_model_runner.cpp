@@ -142,6 +142,30 @@ void TextModelRunner::AdvanceBatch(
   }
 }
 
+TextDecodeStep TextModelRunner::DecodeStep(TextRunnerState& state,
+                                           std::size_t max_tokens,
+                                           float temperature,
+                                           std::uint64_t* rng_state) const {
+  if (max_tokens == 0) {
+    throw std::invalid_argument(
+        "text runner decode step budget must be at least one token");
+  }
+  auto selection = SelectNext(state, temperature, rng_state);
+  if (selection.stop) {
+    return {
+        .selections = {},
+        .draft_tokens = 0,
+        .draft_accepted_tokens = 0,
+        .stop = true,
+    };
+  }
+  const TextRunnerToken token = selection.token;
+  Advance(state, token);
+  return {
+      .selections = {std::move(selection)},
+  };
+}
+
 std::unique_ptr<TextRunnerSnapshot> TextModelRunner::Snapshot(
     const TextRunnerState&) const {
   throw std::logic_error("text runner does not support snapshots");
@@ -309,6 +333,45 @@ void TextRunnerPool::Request::Advance() {
   impl_->pending_selection.reset();
 }
 
+TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens,
+                                                   float temperature) {
+  if (!*this) {
+    throw std::logic_error("text runner request is empty");
+  }
+  if (!impl_->decode_ready) {
+    throw std::logic_error(
+        "text runner cannot decode before prefill completes");
+  }
+  if (impl_->pending_selection.has_value()) {
+    throw std::logic_error(
+        "text runner cannot decode a step with a pending token");
+  }
+  if (impl_->stopped) {
+    throw std::logic_error("text runner request already stopped");
+  }
+  if (max_tokens == 0) {
+    throw std::invalid_argument(
+        "text runner decode step budget must be at least one token");
+  }
+
+  auto step = impl_->runner->DecodeStep(
+      dynamic_cast<TextRunnerState&>(impl_->lease.state()), max_tokens,
+      temperature, &impl_->rng_state);
+  if (step.selections.size() > max_tokens ||
+      (step.selections.empty() && !step.stop)) {
+    throw std::runtime_error("text runner returned an invalid decode step");
+  }
+  for (const auto& selection : step.selections) {
+    if (selection.stop) {
+      throw std::runtime_error(
+          "text runner decode step contains an embedded stop selection");
+    }
+    impl_->generated.push_back(selection.token);
+  }
+  impl_->stopped = step.stop;
+  return step;
+}
+
 void TextRunnerPool::Request::Commit() {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
@@ -327,6 +390,11 @@ void TextRunnerPool::Request::Commit() {
 
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   state.SetCancellationCheck({});
+  if (!impl_->runner->Descriptor().capabilities.prefix_reuse) {
+    impl_->lease.Invalidate();
+    impl_.reset();
+    return;
+  }
   std::vector<ContinuationToken> checkpoint = impl_->prompt;
   checkpoint.insert(checkpoint.end(), impl_->generated.begin(),
                     impl_->generated.end());

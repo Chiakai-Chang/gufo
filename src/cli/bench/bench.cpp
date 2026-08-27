@@ -1052,7 +1052,8 @@ int RunBench(std::span<const char* const> args) {
           while (emitted < g_len) {
             const auto step_res = spec_verifier->VerifyStep(
                 speculative_sequence, speculative_current_pos,
-                speculative_current_token, 999999);
+                speculative_current_token, 999999,
+                static_cast<std::uint32_t>(g_len - emitted));
             for (const auto t : step_res.emitted_tokens) {
               speculative_sequence.push_back(t);
               ++speculative_current_pos;
