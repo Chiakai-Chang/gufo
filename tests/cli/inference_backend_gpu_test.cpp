@@ -1,7 +1,11 @@
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
 #include <span>
@@ -42,6 +46,39 @@ void ExpectStableGpuMemory(std::size_t before, std::size_t after) {
   Expect(after + tolerance >= before,
          "request cleanup leaked more than 16 MiB of GPU memory");
 }
+
+class TemporaryDirectory {
+public:
+  TemporaryDirectory() {
+    std::array<char, 96> pattern{};
+    const std::string path =
+        (std::filesystem::temp_directory_path() / "gufo-qwen-disk-cache-XXXXXX")
+            .string();
+    Expect(path.size() + 1 <= pattern.size(),
+           "temporary Qwen cache path fits fixed buffer");
+    std::copy(path.begin(), path.end(), pattern.begin());
+    const char* created = ::mkdtemp(pattern.data());
+    if (created == nullptr) {
+      throw std::runtime_error("failed to create Qwen cache directory");
+    }
+    path_ = created;
+  }
+
+  ~TemporaryDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+
+  TemporaryDirectory(const TemporaryDirectory&) = delete;
+  TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
+
+  [[nodiscard]] const std::filesystem::path& path() const noexcept {
+    return path_;
+  }
+
+private:
+  std::filesystem::path path_;
+};
 
 }  // namespace
 
@@ -279,6 +316,79 @@ int main(int argc, const char* const* argv) {
     const auto direct_continuation =
         GenerateDirect(*direct, continuation_prompt, 2);
     const auto direct_fork = GenerateDirect(*direct, fork_prompt, 2);
+
+    {
+      TemporaryDirectory cache_directory;
+      const gufo::server::TextDiskCacheConfig disk_cache{
+          .directory = cache_directory.path(),
+          .capacity_bytes = 1024ULL * 1024ULL * 1024ULL,
+          .staging_capacity_bytes = 512ULL * 1024ULL * 1024ULL,
+          .model_artifact_fingerprint = std::string(64, 'a'),
+      };
+      {
+        gufo::server::InferenceBackend writer;
+        Expect(writer.load(model, &error, context, 1, {}, {}, {}, disk_cache),
+               error);
+        const auto persistent_root = writer.chat(messages, 2, 0.0F);
+        Expect(persistent_root.tokens == direct_chat,
+               "Qwen disk writer differs from cold target execution");
+        Expect(persistent_root.text == http_chat.text,
+               "Qwen disk writer produced a different reusable root");
+        Expect(persistent_root.cache_disk_write_bytes > 0,
+               "Qwen disk writer did not publish a compact snapshot");
+      }
+
+      gufo::server::InferenceBackend restarted;
+      Expect(restarted.load(model, &error, context, 1, {}, {}, {}, disk_cache),
+             error);
+      const auto restored_continuation =
+          restarted.chat(continued_messages, 2, 0.0F);
+      Expect(restored_continuation.cache_hit &&
+                 restored_continuation.cache_disk_hit,
+             "fresh Qwen backend did not restore its disk prefix");
+      Expect(restored_continuation.cached_prompt_tokens ==
+                     chat_prompt.size() + direct_chat.size() &&
+                 restored_continuation.cached_prompt_tokens <
+                     restored_continuation.prompt_tokens,
+             "Qwen disk restore did not report its exact reusable prefix");
+      Expect(restored_continuation.cache_restore_bytes > 0,
+             "Qwen disk restore did not report restored bytes");
+      Expect(restored_continuation.tokens == direct_continuation,
+             "Qwen disk continuation differs from cold full prefill");
+
+      auto incompatible_cache = disk_cache;
+      incompatible_cache.model_artifact_fingerprint = std::string(64, 'b');
+      gufo::server::InferenceBackend incompatible;
+      Expect(incompatible.load(model, &error, context, 1, {}, {}, {},
+                               incompatible_cache),
+             error);
+      const auto incompatible_result =
+          incompatible.chat(continued_messages, 2, 0.0F);
+      Expect(
+          !incompatible_result.cache_hit && !incompatible_result.cache_disk_hit,
+          "changed Qwen artifact fingerprint must be a cold miss");
+      Expect(incompatible_result.tokens == direct_continuation,
+             "Qwen compatibility miss changed cold execution");
+
+      if (argc >= 3) {
+        gufo::server::InferenceBackend speculative_disk;
+        error.clear();
+        const bool loaded = speculative_disk.load(
+            model, &error, context, 1, {}, {},
+            gufo::server::TextSpeculativeConfig{
+                .backend = gufo::server::TextSpeculativeBackend::kDFlash,
+                .draft_model_path = argv[2],
+                .max_draft_tokens = 7,
+                .min_draft_tokens = 1,
+                .draft_policy =
+                    gufo::server::TextDraftPolicy::kRollingAcceptance,
+            },
+            disk_cache);
+        Expect(!loaded && error.find("does not yet support speculative") !=
+                              std::string::npos,
+               "Qwen disk cache must reject DFlash until draft reprime exists");
+      }
+    }
 
     gufo::server::ChatRequest continuation_request(continued_messages);
     continuation_request.client_id = "qwen-snapshot-branch-a";

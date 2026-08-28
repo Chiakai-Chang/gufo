@@ -1,8 +1,10 @@
 #include "src/cli/serve/inference_backend.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -11,6 +13,7 @@
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include "src/cli/serve/text_generation_scheduler.hpp"
@@ -42,6 +45,10 @@ void SetError(std::string* error, std::string message) {
 #if defined(ENGINE_ENABLE_HIP)
 constexpr std::string_view kDeepSeekStateAbi =
     "deepseek-v4-flash-gfx1151-state-v1";
+constexpr std::array<std::uint8_t, 8> kQwenPersistentSnapshotMagic = {
+    'G', 'Q', 'W', 'R', 'U', 'N', '0', '1'};
+constexpr std::uint32_t kQwenPersistentPayloadVersion = 1;
+constexpr std::size_t kQwenPersistentSnapshotHeaderBytes = 64;
 
 constexpr std::string_view QwenStateAbi(bool speculative,
                                         bool fp16_attention_kv,
@@ -94,6 +101,77 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
            << "adapters=none\n";
   const std::string canonical = identity.str();
   return {canonical.begin(), canonical.end()};
+}
+
+std::vector<std::uint8_t> QwenCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::uint32_t max_context,
+    const hip::QwenExecutionPolicy& execution_policy) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "Qwen disk cache requires a SHA-256 artifact fingerprint");
+  }
+  const std::string_view state_abi =
+      QwenStateAbi(false, execution_policy.UsesFp16AttentionKv(),
+                   execution_policy.UsesBf16RecurrentState());
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v1\n"
+           << "model_kind=qwen3.8\n"
+           << "artifact_sha256=" << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact-sha256\n"
+           << "chat_template=embedded-in-artifact-plus-gufo-tools-v1\n"
+           << "state_abi=" << state_abi << '\n'
+           << "payload_layout=qwen-gfx1151-live-prefix-v1\n"
+           << "kv_storage="
+           << (execution_policy.UsesFp16AttentionKv() ? "fp16" : "fp32") << '\n'
+           << "recurrent_storage="
+           << (execution_policy.UsesBf16RecurrentState() ? "bf16" : "fp32")
+           << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "rope_window_policy=qwen-gguf-config-v1\n"
+           << "adapters=none\n";
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
+template<typename T>
+  requires(std::is_unsigned_v<T>)
+void PutLittleEndian(std::span<std::uint8_t> destination, std::size_t offset,
+                     T value) {
+  if (offset > destination.size() || sizeof(T) > destination.size() - offset) {
+    throw std::length_error("Qwen persistent snapshot header is truncated");
+  }
+  for (std::size_t byte = 0; byte < sizeof(T); ++byte) {
+    destination[offset + byte] =
+        static_cast<std::uint8_t>(value >> (byte * 8U));
+  }
+}
+
+template<typename T>
+  requires(std::is_unsigned_v<T>)
+T GetLittleEndian(std::span<const std::uint8_t> source, std::size_t offset) {
+  if (offset > source.size() || sizeof(T) > source.size() - offset) {
+    throw std::invalid_argument("Qwen persistent snapshot header is truncated");
+  }
+  T value = 0;
+  for (std::size_t byte = 0; byte < sizeof(T); ++byte) {
+    value |= static_cast<T>(source[offset + byte]) << (byte * 8U);
+  }
+  return value;
+}
+
+std::size_t CheckedPersistentAdd(std::size_t left, std::size_t right) {
+  if (right > std::numeric_limits<std::size_t>::max() - left) {
+    throw std::overflow_error("Qwen persistent snapshot size overflows");
+  }
+  return left + right;
+}
+
+std::size_t PersistentSizeFromU64(std::uint64_t value) {
+  if (value > std::numeric_limits<std::size_t>::max()) {
+    throw std::overflow_error("Qwen persistent snapshot size overflows");
+  }
+  return static_cast<std::size_t>(value);
 }
 
 std::uint64_t ClientLabel(std::string_view client_id) noexcept {
@@ -478,12 +556,21 @@ public:
   QwenTextRunner(
       std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
       std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model = nullptr,
-      speculative::SpeculativeOptions speculative_options = {})
+      speculative::SpeculativeOptions speculative_options = {},
+      std::string artifact_fingerprint = {})
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
         speculative_options_(speculative_options),
-        execution_policy_(hip::QwenExecutionPolicy::Runtime()) {}
+        execution_policy_(hip::QwenExecutionPolicy::Runtime()) {
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity = QwenCompatibilityIdentity(
+              artifact_fingerprint, max_context_, execution_policy_),
+          .payload_version = kQwenPersistentPayloadVersion,
+      };
+    }
+  }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     const bool speculative_enabled = dflash_model_ != nullptr;
@@ -502,7 +589,7 @@ public:
                 .multi_token_decode = speculative_enabled,
                 .prefix_reuse = true,
             },
-        .persistence = std::nullopt,
+        .persistence = speculative_enabled ? std::nullopt : persistence_,
     };
   }
 
@@ -780,12 +867,141 @@ public:
     }
   }
 
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    const auto* qwen_snapshot =
+        dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
+    if (qwen_snapshot == nullptr ||
+        qwen_snapshot->model.get() != model_.get() ||
+        qwen_snapshot->snapshot == nullptr ||
+        !qwen_snapshot->frontier.has_value() ||
+        qwen_snapshot->verifier_snapshot != nullptr ||
+        qwen_snapshot->position != qwen_snapshot->snapshot->ValidContext() ||
+        qwen_snapshot->frontier_logits.size() !=
+            model_->GetConfig().vocab_size) {
+      throw std::invalid_argument(
+          "Qwen persistent snapshot does not belong to this plain model");
+    }
+    const std::size_t logits_bytes = CheckedPersistentAdd(
+        0, qwen_snapshot->frontier_logits.size() * sizeof(float));
+    return CheckedPersistentAdd(
+        CheckedPersistentAdd(kQwenPersistentSnapshotHeaderBytes,
+                             qwen_snapshot->snapshot->CompactPayloadBytes()),
+        logits_bytes);
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto* qwen_snapshot =
+        dynamic_cast<const QwenTextRunnerSnapshot*>(&snapshot);
+    const std::size_t expected_bytes = PersistentSnapshotPayloadBytes(snapshot);
+    if (qwen_snapshot == nullptr || destination.size() != expected_bytes) {
+      throw std::invalid_argument(
+          "Qwen persistent snapshot destination size is invalid");
+    }
+    const std::size_t gpu_payload_bytes =
+        qwen_snapshot->snapshot->CompactPayloadBytes();
+    const std::size_t logits_bytes =
+        qwen_snapshot->frontier_logits.size() * sizeof(float);
+    std::fill(destination.begin(), destination.end(), std::uint8_t{0});
+    std::copy(kQwenPersistentSnapshotMagic.begin(),
+              kQwenPersistentSnapshotMagic.end(), destination.begin());
+    PutLittleEndian<std::uint32_t>(destination, 8,
+                                   kQwenPersistentPayloadVersion);
+    PutLittleEndian<std::uint32_t>(
+        destination, 12,
+        static_cast<std::uint32_t>(kQwenPersistentSnapshotHeaderBytes));
+    PutLittleEndian<std::uint64_t>(
+        destination, 16, static_cast<std::uint64_t>(qwen_snapshot->position));
+    PutLittleEndian<std::uint32_t>(destination, 24, *qwen_snapshot->frontier);
+    PutLittleEndian<std::uint64_t>(
+        destination, 32,
+        static_cast<std::uint64_t>(qwen_snapshot->frontier_logits.size()));
+    PutLittleEndian<std::uint64_t>(
+        destination, 40, static_cast<std::uint64_t>(gpu_payload_bytes));
+    PutLittleEndian<std::uint64_t>(destination, 48,
+                                   static_cast<std::uint64_t>(expected_bytes));
+    const std::size_t gpu_offset = kQwenPersistentSnapshotHeaderBytes;
+    const std::size_t logits_offset =
+        CheckedPersistentAdd(gpu_offset, gpu_payload_bytes);
+    const std::size_t written = qwen_snapshot->snapshot->SerializeCompact(
+        destination.subspan(gpu_offset, gpu_payload_bytes));
+    if (written != gpu_payload_bytes) {
+      throw std::runtime_error(
+          "Qwen compact snapshot serializer returned the wrong byte count");
+    }
+    std::memcpy(destination.data() + logits_offset,
+                qwen_snapshot->frontier_logits.data(), logits_bytes);
+    return destination.size();
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& restored = RequireQwenState(state);
+    if (restored.speculative()) {
+      throw std::invalid_argument(
+          "cannot restore a plain Qwen snapshot into a speculative session");
+    }
+    if (payload.size() < kQwenPersistentSnapshotHeaderBytes ||
+        !std::equal(kQwenPersistentSnapshotMagic.begin(),
+                    kQwenPersistentSnapshotMagic.end(), payload.begin()) ||
+        GetLittleEndian<std::uint32_t>(payload, 8) !=
+            kQwenPersistentPayloadVersion ||
+        GetLittleEndian<std::uint32_t>(payload, 12) !=
+            kQwenPersistentSnapshotHeaderBytes ||
+        GetLittleEndian<std::uint32_t>(payload, 28) != 0 ||
+        GetLittleEndian<std::uint64_t>(payload, 56) != 0) {
+      throw std::invalid_argument("Qwen persistent snapshot header is invalid");
+    }
+    const std::size_t position =
+        PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 16));
+    const TextRunnerToken frontier =
+        GetLittleEndian<std::uint32_t>(payload, 24);
+    const std::size_t logits_count =
+        PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 32));
+    const std::size_t gpu_payload_bytes =
+        PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 40));
+    const std::size_t total_bytes =
+        PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 48));
+    if (position == 0 || position > max_context_ ||
+        position > std::numeric_limits<std::uint32_t>::max() ||
+        frontier >= model_->GetConfig().vocab_size ||
+        logits_count != model_->GetConfig().vocab_size ||
+        logits_count >
+            std::numeric_limits<std::size_t>::max() / sizeof(float) ||
+        gpu_payload_bytes == 0 || total_bytes != payload.size()) {
+      throw std::invalid_argument(
+          "Qwen persistent snapshot metadata is invalid");
+    }
+    const std::size_t logits_bytes = logits_count * sizeof(float);
+    const std::size_t gpu_offset = kQwenPersistentSnapshotHeaderBytes;
+    const std::size_t logits_offset =
+        CheckedPersistentAdd(gpu_offset, gpu_payload_bytes);
+    if (CheckedPersistentAdd(logits_offset, logits_bytes) != payload.size()) {
+      throw std::invalid_argument(
+          "Qwen persistent snapshot payload size is invalid");
+    }
+
+    std::vector<float> frontier_logits(logits_count);
+    std::memcpy(frontier_logits.data(), payload.data() + logits_offset,
+                logits_bytes);
+    restored.executor().RestoreCompactSnapshot(
+        payload.subspan(gpu_offset, gpu_payload_bytes),
+        static_cast<std::uint32_t>(position));
+    restored.set_position(position);
+    restored.set_frontier(frontier);
+    restored.RestoreFrontierLogits(std::move(frontier_logits));
+  }
+
 private:
   std::shared_ptr<const hip::QwenGpuModel> model_;
   std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
   std::uint32_t max_context_;
   speculative::SpeculativeOptions speculative_options_;
   hip::QwenExecutionPolicy execution_policy_;
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
 std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {
@@ -1404,6 +1620,17 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     SetError(error, "Failed to create GPU model: " + load_error);
     return false;
   }
+  if (DiskCacheEnabled(resolved_disk_cache_config) &&
+      resolved_disk_cache_config.model_artifact_fingerprint.empty()) {
+    try {
+      resolved_disk_cache_config.model_artifact_fingerprint =
+          crypto::Sha256FileHex(model_path);
+    } catch (const std::exception& exception) {
+      SetError(error, std::string("Failed to fingerprint Qwen GGUF: ") +
+                          exception.what());
+      return false;
+    }
+  }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
               std::move(resolved_disk_cache_config));
@@ -1436,10 +1663,18 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     SetError(error, "HTTP session count must be at least one");
     return false;
   }
-  if (DiskCacheEnabled(disk_cache_config)) {
+  if (DiskCacheEnabled(disk_cache_config) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       disk_cache_config.capacity_bytes == 0 ||
+       disk_cache_config.staging_capacity_bytes == 0)) {
+    SetError(error, "Qwen persistent disk cache configuration is invalid");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config) &&
+      speculative_config.backend != TextSpeculativeBackend::kDisabled) {
     SetError(error,
-             "Persistent disk continuation caching is not yet supported for "
-             "Qwen");
+             "Qwen persistent disk cache does not yet support speculative "
+             "decoding");
     return false;
   }
   if (speculative_config.max_draft_tokens == 0 ||
@@ -1506,10 +1741,18 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     auto new_state = std::make_shared<Impl::State>();
     auto runner = std::make_shared<QwenTextRunner>(
         std::move(model), max_context, std::move(dflash_model),
-        speculative_options);
+        speculative_options, disk_cache_config.model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
-    auto runner_pool =
-        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (DiskCacheEnabled(disk_cache_config)) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::move(runner_disk_cache));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

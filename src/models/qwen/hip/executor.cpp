@@ -128,6 +128,21 @@ void QwenGpuExecutor::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
   graph_executor_.Reset();
 }
 
+void QwenGpuExecutor::RestoreCompactSnapshot(
+    std::span<const std::uint8_t> payload,
+    std::uint32_t expected_valid_context) {
+  replaying_ssm_state_ = false;
+  next_token_.reset();
+  h_prompt_hidden_.clear();
+  h_verification_hidden_.clear();
+  h_verification_logits_.clear();
+  h_last_hidden_.clear();
+  last_verification_rows_ = 0;
+  last_hidden_offset_ = 0;
+  arena_.RestoreCompactSnapshot(payload, expected_valid_context);
+  graph_executor_.Reset();
+}
+
 void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
   replaying_ssm_state_ = false;
   arena_.SaveState(valid_context);

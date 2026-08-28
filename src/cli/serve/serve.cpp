@@ -104,7 +104,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_disk_bytes =
         static_cast<std::size_t>(4) * 1024U * 1024U * 1024U;
     std::size_t cache_disk_staging_bytes =
-        static_cast<std::size_t>(256) * 1024U * 1024U;
+        static_cast<std::size_t>(512) * 1024U * 1024U;
     bool force_cpu = false;
 
     gufo::cli::ArgParser parser(
@@ -224,17 +224,16 @@ void PrintServeHelp(std::string_view program_name,
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
-    parser.AddOption(
-        "", "--cache-disk", "DIR",
-        "Opt-in restart-safe continuation cache directory (DeepSeek first)",
-        "Cache", &cache_disk_directory);
+    parser.AddOption("", "--cache-disk", "DIR",
+                     "Opt-in restart-safe continuation cache directory",
+                     "Cache", &cache_disk_directory);
     parser.AddOption(
         "", "--cache-disk-bytes", "N",
         "Total retained disk-cache byte budget (default: 4294967296)", "Cache",
         &cache_disk_bytes);
     parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
-        "Single-operation RAM staging byte limit (default: 268435456)", "Cache",
+        "Single-operation RAM staging byte limit (default: 536870912)", "Cache",
         &cache_disk_staging_bytes);
     parser.AddFlag("", "--cpu",
                    "Force CPU OpenMP execution fallback instead of GPU ROCm",
@@ -558,7 +557,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_bytes =
         static_cast<std::size_t>(4) * 1024U * 1024U * 1024U;
     std::size_t cache_disk_staging_bytes =
-        static_cast<std::size_t>(256) * 1024U * 1024U;
+        static_cast<std::size_t>(512) * 1024U * 1024U;
     bool force_cpu = false;
 
     gufo::cli::ArgParser llm_parser(
@@ -676,17 +675,16 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
-    llm_parser.AddOption(
-        "", "--cache-disk", "DIR",
-        "Opt-in restart-safe continuation cache directory (DeepSeek first)",
-        "Cache", &cache_disk_directory);
+    llm_parser.AddOption("", "--cache-disk", "DIR",
+                         "Opt-in restart-safe continuation cache directory",
+                         "Cache", &cache_disk_directory);
     llm_parser.AddOption(
         "", "--cache-disk-bytes", "N",
         "Total retained disk-cache byte budget (default: 4294967296)", "Cache",
         &cache_disk_bytes);
     llm_parser.AddOption(
         "", "--cache-disk-staging-bytes", "N",
-        "Single-operation RAM staging byte limit (default: 268435456)", "Cache",
+        "Single-operation RAM staging byte limit (default: 536870912)", "Cache",
         &cache_disk_staging_bytes);
     llm_parser.AddFlag(
         "", "--cpu", "Force CPU OpenMP execution fallback instead of GPU ROCm",

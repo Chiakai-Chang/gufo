@@ -128,6 +128,151 @@ void TestCanonicalMemoryAccountingAndSnapshot() {
          "snapshot payload must account one canonical state representation");
 }
 
+void TestCompactPersistentSnapshotRoundTrip() {
+  const auto config = gufo::models::qwen::make_small_qwen_config();
+  constexpr std::uint32_t context = 32;
+  constexpr std::uint32_t valid_context = 7;
+  constexpr std::size_t header_bytes = 80;
+  const auto policy = Fp16Policy();
+  QwenGpuArena source(config, context, policy);
+
+  const std::size_t attention_layers = config.FullAttentionLayerCount();
+  const std::size_t kv_width =
+      static_cast<std::size_t>(config.num_key_value_heads) * config.head_dim;
+  const std::size_t full_kv_elements_per_plane =
+      attention_layers * context * kv_width;
+  const std::size_t live_kv_elements_per_plane =
+      attention_layers * valid_context * kv_width;
+  std::vector<std::uint16_t> source_kv(2U * full_kv_elements_per_plane);
+  for (std::size_t index = 0; index < source_kv.size(); ++index) {
+    source_kv[index] = static_cast<std::uint16_t>(0x1000U + (index % 0x0FFFU));
+  }
+
+  const std::size_t conv_elements =
+      static_cast<std::size_t>(config.num_layers) * config.SsmQkvSize() *
+      config.ssm_conv_kernel;
+  const std::size_t deltanet_elements =
+      static_cast<std::size_t>(config.num_layers) * config.ssm_time_step_rank *
+      config.ssm_state_size * config.SsmValueSize();
+  const std::size_t recurrent_layers =
+      config.num_layers - config.FullAttentionLayerCount();
+  const std::size_t conv_elements_per_layer =
+      config.SsmQkvSize() * config.ssm_conv_kernel;
+  const std::size_t deltanet_elements_per_layer =
+      static_cast<std::size_t>(config.ssm_time_step_rank) *
+      config.ssm_state_size * config.SsmValueSize();
+  std::vector<float> source_conv(conv_elements);
+  std::vector<float> source_deltanet(deltanet_elements);
+  for (std::size_t index = 0; index < source_conv.size(); ++index) {
+    source_conv[index] = static_cast<float>(index + 1U) * 0.000125F;
+  }
+  for (std::size_t index = 0; index < source_deltanet.size(); ++index) {
+    source_deltanet[index] =
+        static_cast<float>((index % 257U) + 1U) * -0.00025F;
+  }
+
+  HIP_CHECK(hipMemcpy(source.d_attention_kv_f16, source_kv.data(),
+                      source_kv.size() * sizeof(std::uint16_t),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(source.d_ssm_conv_state, source_conv.data(),
+                      source_conv.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(source.d_ssm_deltanet_state, source_deltanet.data(),
+                      source_deltanet.size() * sizeof(float),
+                      hipMemcpyHostToDevice));
+
+  auto snapshot = source.SaveSnapshot(valid_context);
+  const std::size_t expected_compact_bytes =
+      header_bytes + 2U * live_kv_elements_per_plane * sizeof(std::uint16_t) +
+      recurrent_layers * conv_elements_per_layer * sizeof(float) +
+      recurrent_layers * deltanet_elements_per_layer * sizeof(float);
+  Expect(snapshot->CompactPayloadBytes() == expected_compact_bytes,
+         "compact snapshot must contain only live KV rows and recurrent state");
+  Expect(snapshot->CompactPayloadBytes() < snapshot->PayloadBytes(),
+         "compact snapshot must omit the unused KV tail");
+
+  std::vector<std::uint8_t> payload(snapshot->CompactPayloadBytes());
+  Expect(snapshot->SerializeCompact(payload) == payload.size(),
+         "compact snapshot serializer byte count");
+
+  QwenGpuArena restored(config, context, policy);
+  restored.RestoreCompactSnapshot(payload, valid_context);
+  std::vector<std::uint16_t> restored_kv(source_kv.size());
+  std::vector<float> restored_conv(source_conv.size());
+  std::vector<float> restored_deltanet(source_deltanet.size());
+  HIP_CHECK(hipMemcpy(restored_kv.data(), restored.d_attention_kv_f16,
+                      restored_kv.size() * sizeof(std::uint16_t),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(restored_conv.data(), restored.d_ssm_conv_state,
+                      restored_conv.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(restored_deltanet.data(), restored.d_ssm_deltanet_state,
+                      restored_deltanet.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+
+  for (std::size_t plane = 0; plane < 2; ++plane) {
+    for (std::size_t layer = 0; layer < attention_layers; ++layer) {
+      for (std::size_t position = 0; position < context; ++position) {
+        for (std::size_t column = 0; column < kv_width; ++column) {
+          const std::size_t index = plane * full_kv_elements_per_plane +
+                                    layer * context * kv_width +
+                                    position * kv_width + column;
+          if (position < valid_context) {
+            Expect(restored_kv[index] == source_kv[index],
+                   "compact snapshot changed a live KV element");
+          } else {
+            Expect(restored_kv[index] == 0,
+                   "compact snapshot restored an unused KV-tail element");
+          }
+        }
+      }
+    }
+  }
+  for (std::size_t layer = 0; layer < config.num_layers; ++layer) {
+    const bool full_attention =
+        ((layer + 1U) % config.full_attention_interval) == 0;
+    for (std::size_t column = 0; column < conv_elements_per_layer; ++column) {
+      const std::size_t index = layer * conv_elements_per_layer + column;
+      Expect(
+          restored_conv[index] == (full_attention ? 0.0F : source_conv[index]),
+          "compact snapshot changed convolution state");
+    }
+    for (std::size_t column = 0; column < deltanet_elements_per_layer;
+         ++column) {
+      const std::size_t index = layer * deltanet_elements_per_layer + column;
+      Expect(restored_deltanet[index] ==
+                 (full_attention ? 0.0F : source_deltanet[index]),
+             "compact snapshot changed DeltaNet state");
+    }
+  }
+
+  const auto retained_kv = restored_kv;
+  auto truncated = payload;
+  truncated.pop_back();
+  bool rejected = false;
+  try {
+    restored.RestoreCompactSnapshot(truncated, valid_context);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  Expect(rejected, "truncated compact snapshot must be rejected");
+  HIP_CHECK(hipMemcpy(restored_kv.data(), restored.d_attention_kv_f16,
+                      restored_kv.size() * sizeof(std::uint16_t),
+                      hipMemcpyDeviceToHost));
+  Expect(restored_kv == retained_kv,
+         "truncated compact snapshot mutated the destination arena");
+
+  auto incompatible = payload;
+  incompatible[24] ^= 1U;
+  rejected = false;
+  try {
+    restored.RestoreCompactSnapshot(incompatible, valid_context);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  Expect(rejected, "incompatible compact snapshot must be rejected");
+}
+
 void FillDecodeInputs(std::vector<float>* query, std::vector<float>* key,
                       std::vector<float>* value, std::vector<float>* gate,
                       std::size_t positions, std::uint32_t num_heads,
@@ -391,6 +536,7 @@ int main() {
   }
   TestProductionMemoryScaling();
   TestCanonicalMemoryAccountingAndSnapshot();
+  TestCompactPersistentSnapshotRoundTrip();
   TestOnlineAndGraphDecodeFp16Equivalence();
   TestSplitKDecodeFp16Equivalence();
   std::cout << "Qwen FP16 KV storage tests passed.\n";

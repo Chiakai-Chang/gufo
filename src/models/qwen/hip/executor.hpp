@@ -125,6 +125,9 @@ public:
       const noexcept {
     return recurrent_state_storage_;
   }
+  [[nodiscard]] std::size_t CompactPayloadBytes() const;
+  [[nodiscard]] std::size_t SerializeCompact(
+      std::span<std::uint8_t> destination) const;
 
 private:
   QwenGpuSnapshot() = default;
@@ -136,7 +139,11 @@ private:
   std::size_t kv_elements_per_plane_{0};
   std::size_t conv_elements_{0};
   std::size_t deltanet_elements_{0};
+  std::size_t conv_elements_per_layer_{0};
+  std::size_t deltanet_elements_per_layer_{0};
+  std::uint32_t num_layers_{0};
   std::uint32_t attention_layers_{0};
+  std::uint32_t full_attention_interval_{0};
   std::uint32_t kv_width_{0};
   std::uint32_t max_context_{0};
   std::uint32_t valid_context_{0};
@@ -306,6 +313,8 @@ public:
   [[nodiscard]] std::unique_ptr<QwenGpuSnapshot> SaveSnapshot(
       std::uint32_t valid_context);
   void RestoreSnapshot(const QwenGpuSnapshot& snapshot);
+  void RestoreCompactSnapshot(std::span<const std::uint8_t> payload,
+                              std::uint32_t expected_valid_context);
   [[nodiscard]] QwenGpuScratchView GetScratchView(
       std::size_t batch_size = 1) noexcept;
   void SetTargetLayerCapture(std::span<const std::uint32_t> target_layer_ids);
@@ -468,6 +477,8 @@ public:
   [[nodiscard]] std::unique_ptr<QwenGpuSnapshot> SaveSnapshot(
       std::uint32_t valid_context);
   void RestoreSnapshot(const QwenGpuSnapshot& snapshot);
+  void RestoreCompactSnapshot(std::span<const std::uint8_t> payload,
+                              std::uint32_t expected_valid_context);
 
   /// Resets GPU cache and recurrent states in the arena.
   void Reset() noexcept;
