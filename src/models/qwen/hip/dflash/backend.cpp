@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <ranges>
 #include <stdexcept>
 #include <string>
@@ -224,6 +225,15 @@ void QwenDFlashGpuDraftBackend::UpdateTargetHidden(
   }
   pending_target_features_.insert(pending_target_features_.end(),
                                   hidden.begin(), hidden.end());
+}
+
+std::size_t QwenDFlashGpuDraftBackend::SnapshotPayloadBytes() const {
+  const std::size_t gpu_bytes = executor_->SnapshotPayloadBytes();
+  if (pending_target_features_.size() >
+      (std::numeric_limits<std::size_t>::max() - gpu_bytes) / sizeof(float)) {
+    throw std::overflow_error("DFlash snapshot size overflows");
+  }
+  return gpu_bytes + pending_target_features_.size() * sizeof(float);
 }
 
 std::unique_ptr<speculative::IDraftBackendSnapshot>

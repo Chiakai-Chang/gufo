@@ -214,6 +214,7 @@ public:
         .state_capacity_bytes = 8 * 64,
         .per_request_state_bytes = 64,
         .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = 0,
         .requires_device_runtime_lock = true,
     };
   }

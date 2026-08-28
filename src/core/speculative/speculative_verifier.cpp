@@ -783,6 +783,28 @@ std::size_t SpeculativeVerifierSnapshot::PayloadBytes() const noexcept {
          sizeof(current_draft_length_) + sizeof(accepted_token_ema_);
 }
 
+std::size_t SpeculativeVerifier::SnapshotPayloadBytes() const {
+  if (draft_backend_ == nullptr) {
+    throw std::logic_error("speculative verifier has no draft backend to size");
+  }
+  std::size_t bytes = draft_backend_->SnapshotPayloadBytes();
+  const auto checked_add = [&bytes](std::size_t value) {
+    if (value > std::numeric_limits<std::size_t>::max() - bytes) {
+      throw std::overflow_error("speculative snapshot size overflows");
+    }
+    bytes += value;
+  };
+  if (rolling_acceptance_.size() >
+      std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+    throw std::overflow_error("speculative snapshot size overflows");
+  }
+  checked_add(rolling_acceptance_.size() * sizeof(float));
+  checked_add(sizeof(stats_));
+  checked_add(sizeof(current_draft_length_));
+  checked_add(sizeof(accepted_token_ema_));
+  return bytes;
+}
+
 std::unique_ptr<SpeculativeVerifierSnapshot> SpeculativeVerifier::Snapshot()
     const {
   if (draft_backend_ == nullptr) {

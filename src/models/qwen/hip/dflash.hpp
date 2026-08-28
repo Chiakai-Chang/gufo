@@ -128,6 +128,7 @@ public:
   [[nodiscard]] std::unique_ptr<QwenDFlashGpuSnapshot> SaveSnapshot() const;
   void RestoreSnapshot(const QwenDFlashGpuSnapshot& snapshot);
   [[nodiscard]] std::size_t StateBytes() const noexcept;
+  [[nodiscard]] std::size_t SnapshotPayloadBytes() const noexcept;
 
   [[nodiscard]] std::size_t GetHiddenSize() const noexcept {
     return model_->GetConfig().hidden_size;
@@ -244,6 +245,7 @@ public:
   void AcceptFeedback(std::span<const tokenization::TokenId> accepted,
                       tokenization::TokenId correction_token) override;
 
+  [[nodiscard]] std::size_t SnapshotPayloadBytes() const override;
   [[nodiscard]] std::unique_ptr<speculative::IDraftBackendSnapshot> Snapshot()
       const override;
   void RestoreSnapshot(

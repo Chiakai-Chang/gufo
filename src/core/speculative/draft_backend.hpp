@@ -106,6 +106,12 @@ public:
     (void)correction_token;
   }
 
+  /// Exact payload bytes that Snapshot() will allocate at the current
+  /// committed boundary.
+  [[nodiscard]] virtual std::size_t SnapshotPayloadBytes() const {
+    throw std::logic_error("draft backend does not support snapshot sizing");
+  }
+
   [[nodiscard]] virtual std::unique_ptr<IDraftBackendSnapshot> Snapshot()
       const {
     throw std::logic_error("draft backend does not support snapshots");

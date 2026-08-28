@@ -42,6 +42,8 @@ struct FakeStats {
   std::size_t states_created{0};
   std::size_t invalidations{0};
   std::size_t snapshot_restores{0};
+  std::size_t snapshot_size_queries{0};
+  std::size_t snapshot_captures{0};
   std::size_t cancellation_bindings{0};
   std::size_t cancellation_clears{0};
   std::vector<std::vector<TextRunnerToken>> prepared_prefixes;
@@ -106,10 +108,12 @@ const FakeState& RequireFakeState(const TextRunnerState& state) {
 class FakeRunner : public TextModelRunner {
 public:
   FakeRunner(std::shared_ptr<FakeStats> stats, std::size_t measured_bytes = 64,
-             std::size_t state_capacity_bytes = 256)
+             std::size_t state_capacity_bytes = 256,
+             std::size_t retained_snapshot_capacity_bytes = 256)
       : stats_(std::move(stats)),
         measured_bytes_(measured_bytes),
-        state_capacity_bytes_(state_capacity_bytes) {}
+        state_capacity_bytes_(state_capacity_bytes),
+        retained_snapshot_capacity_bytes_(retained_snapshot_capacity_bytes) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -129,6 +133,7 @@ public:
         .state_capacity_bytes = state_capacity_bytes_,
         .per_request_state_bytes = 64,
         .temporary_scratch_bytes = 16,
+        .retained_snapshot_capacity_bytes = retained_snapshot_capacity_bytes_,
         .requires_device_runtime_lock = false,
     };
   }
@@ -263,6 +268,7 @@ protected:
   std::shared_ptr<FakeStats> stats_;
   std::size_t measured_bytes_;
   std::size_t state_capacity_bytes_;
+  std::size_t retained_snapshot_capacity_bytes_;
 };
 
 void TestBoundedPrefillDecodeAndPrefixReuse() {
@@ -412,7 +418,7 @@ public:
   std::optional<TextRunnerToken> frontier;
 };
 
-class SnapshotRunner final : public FakeRunner {
+class SnapshotRunner : public FakeRunner {
 public:
   using FakeRunner::FakeRunner;
 
@@ -423,8 +429,15 @@ public:
     return descriptor;
   }
 
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState&) const override {
+    ++stats_->snapshot_size_queries;
+    return sizeof(FakeSnapshot);
+  }
+
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const override {
+    ++stats_->snapshot_captures;
     const auto& fake = RequireFakeState(state);
     return std::make_unique<FakeSnapshot>(fake.position, fake.decode_count,
                                           fake.frontier);
@@ -501,6 +514,8 @@ void TestSnapshotCacheBranchesOnePrefixIntoIndependentStates() {
          "the root snapshot is copied into two mutable states");
   Expect(stats->states_created == 2,
          "snapshot branching reuses preallocated request states");
+  Expect(stats->snapshot_size_queries == 1 && stats->snapshot_captures == 1,
+         "root snapshot reserves its exact payload before capture");
 
   Expect(first.Prefill(1).decode_ready && second.Prefill(1).decode_ready,
          "each branch prefills only its divergent suffix");
@@ -532,6 +547,72 @@ void TestMeasuredStateIsReconciledWithClaim() {
          "measured resource check runs immediately after allocation");
 }
 
+void TestSnapshotBudgetRefusalDoesNotFailCompletedRequest() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<SnapshotRunner>(stats, 64, 256,
+                                                 sizeof(FakeSnapshot) - 1);
+  TextRunnerPool pool(runner, 1);
+
+  auto request = pool.Acquire({1, 2, 3});
+  Expect(request.Prefill(3).decode_ready,
+         "request completes before optional snapshot retention");
+  const auto commit = request.Commit();
+  Expect(commit.snapshot_bytes == 0 && commit.snapshot_ms == 0.0,
+         "budget refusal succeeds without reporting a retained snapshot");
+  Expect(stats->snapshot_size_queries == 1 && stats->snapshot_captures == 0,
+         "cache admission happens before snapshot allocation");
+
+  auto extension = pool.Acquire({1, 2, 3, 4});
+  Expect(!extension.cache_hit(),
+         "a refused snapshot becomes an ordinary deterministic miss");
+  extension.Invalidate();
+}
+
+class FlakySnapshotRunner final : public SnapshotRunner {
+public:
+  using SnapshotRunner::SnapshotRunner;
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    ++stats_->snapshot_captures;
+    if (stats_->snapshot_captures == 1) {
+      throw std::runtime_error("synthetic snapshot capture failure");
+    }
+    const auto& fake = RequireFakeState(state);
+    return std::make_unique<FakeSnapshot>(fake.position, fake.decode_count,
+                                          fake.frontier);
+  }
+};
+
+void TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<FlakySnapshotRunner>(stats);
+  TextRunnerPool pool(runner, 1);
+
+  {
+    auto first = pool.Acquire({1, 2, 3});
+    Expect(first.Prefill(3).decode_ready, "first request reaches checkpoint");
+    const auto commit = first.Commit();
+    Expect(commit.snapshot_bytes == 0 && commit.snapshot_ms >= 0.0,
+           "snapshot exception does not fail the completed request");
+  }
+
+  {
+    auto second = pool.Acquire({4, 5});
+    Expect(!second.cache_hit(), "failed capture retained no partial entry");
+    Expect(second.Prefill(2).decode_ready,
+           "second request executes normally after capture failure");
+    const auto commit = second.Commit();
+    Expect(commit.snapshot_bytes == sizeof(FakeSnapshot),
+           "released reservation admits a later successful snapshot");
+  }
+
+  auto extension = pool.Acquire({4, 5, 6});
+  Expect(extension.cache_hit() && extension.cached_prompt_tokens() == 2,
+         "later retained snapshot restores after the failed attempt");
+  extension.Invalidate();
+}
+
 }  // namespace
 
 int main() {
@@ -543,6 +624,8 @@ int main() {
   TestSnapshotForkAndUnsupportedCapabilities();
   TestSnapshotCacheBranchesOnePrefixIntoIndependentStates();
   TestMeasuredStateIsReconciledWithClaim();
+  TestSnapshotBudgetRefusalDoesNotFailCompletedRequest();
+  TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful();
   std::cout << "All text model runner tests passed\n";
   return 0;
 }

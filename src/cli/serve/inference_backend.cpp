@@ -323,6 +323,27 @@ public:
   SaveVerifierSnapshot() const {
     return verifier_ != nullptr ? verifier_->Snapshot() : nullptr;
   }
+  [[nodiscard]] std::size_t SnapshotPayloadBytes() const {
+    std::size_t bytes = executor_->GetMemoryUsage().request_state_bytes;
+    const auto checked_add = [&bytes](std::size_t value) {
+      if (value > std::numeric_limits<std::size_t>::max() - bytes) {
+        throw std::overflow_error("Qwen snapshot size overflows");
+      }
+      bytes += value;
+    };
+    const std::size_t logits_count = frontier_logits_.empty()
+                                         ? executor_->CopyLastLogits().size()
+                                         : frontier_logits_.size();
+    if (logits_count >
+        std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+      throw std::overflow_error("Qwen snapshot size overflows");
+    }
+    checked_add(logits_count * sizeof(float));
+    if (verifier_ != nullptr) {
+      checked_add(verifier_->SnapshotPayloadBytes());
+    }
+    return bytes;
+  }
   void RestoreVerifierSnapshot(
       const speculative::SpeculativeVerifierSnapshot& snapshot) {
     if (verifier_ == nullptr) {
@@ -434,6 +455,7 @@ public:
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = usage.request_state_bytes,
         .temporary_scratch_bytes = usage.temporary_scratch_bytes,
+        .retained_snapshot_capacity_bytes = capacity,
         .requires_device_runtime_lock = true,
     };
   }
@@ -645,6 +667,11 @@ public:
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireQwenState(state).position();
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    return RequireQwenState(state).SnapshotPayloadBytes();
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
@@ -900,11 +927,18 @@ public:
   }
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      capacity = free_bytes;
+    }
     return {
         .resident_weights_bytes = std::nullopt,
-        .state_capacity_bytes = std::nullopt,
+        .state_capacity_bytes = capacity,
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
+        .retained_snapshot_capacity_bytes = capacity,
         .requires_device_runtime_lock = true,
     };
   }
@@ -1047,6 +1081,17 @@ public:
   [[nodiscard]] std::size_t CheckpointPosition(
       const TextRunnerState& state) const override {
     return RequireDeepSeekState(state).position();
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    const std::uint64_t bytes =
+        RequireDeepSeekState(state).session().PayloadBytes();
+    if (bytes == 0 || bytes > static_cast<std::uint64_t>(
+                                  std::numeric_limits<std::size_t>::max())) {
+      throw std::overflow_error("DeepSeek snapshot size is unavailable");
+    }
+    return static_cast<std::size_t>(bytes);
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(

@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iostream>
 #include <limits>
+#include <mutex>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -128,6 +131,52 @@ void ReconcileStateBytes(const TextRunnerResourceClaim& resources,
   }
 }
 
+std::string_view SnapshotEventActionName(SnapshotEventAction action) noexcept {
+  switch (action) {
+    case SnapshotEventAction::kRemoved:
+      return "removed";
+    case SnapshotEventAction::kSkipped:
+      return "skipped";
+  }
+  return "unknown";
+}
+
+std::string_view SnapshotEventReasonName(SnapshotEventReason reason) noexcept {
+  switch (reason) {
+    case SnapshotEventReason::kByteCapacity:
+      return "byte_capacity";
+    case SnapshotEventReason::kEntryCapacity:
+      return "entry_capacity";
+    case SnapshotEventReason::kExactReplacement:
+      return "exact_replacement";
+    case SnapshotEventReason::kCaptureFailure:
+      return "capture_failure";
+    case SnapshotEventReason::kReservationMismatch:
+      return "reservation_mismatch";
+  }
+  return "unknown";
+}
+
+void EmitSnapshotEvent(const SnapshotEvent& event) noexcept {
+  try {
+    std::ostringstream line;
+    line << "{\"event\":\"continuation_snapshot\",\"action\":\""
+         << SnapshotEventActionName(event.action) << "\",\"reason\":\""
+         << SnapshotEventReasonName(event.reason)
+         << "\",\"bytes\":" << event.snapshot_bytes
+         << ",\"token_count\":" << event.token_count
+         << ",\"retained_bytes\":" << event.retained_snapshot_bytes
+         << ",\"reserved_bytes\":" << event.reserved_snapshot_bytes
+         << ",\"capacity_bytes\":" << event.capacity_bytes << "}";
+    static std::mutex output_mutex;
+    const std::lock_guard<std::mutex> lock(output_mutex);
+    std::clog << line.str() << '\n';
+  } catch (...) {
+    // Optional cache logging must not affect request execution.
+    return;
+  }
+}
+
 ContinuationCache::SnapshotSupport MakeSnapshotSupport(
     ValidatedRunner* validated) {
   if (validated == nullptr || !validated->descriptor.capabilities.snapshot ||
@@ -148,6 +197,12 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
             validated->runner->RestoreOrFork(text_state, *text_snapshot);
             ReconcileStateBytes(validated->resources, text_state);
           },
+      .capacity_bytes =
+          [validated] {
+            const auto resources = validated->runner->ResourceClaim();
+            return resources.retained_snapshot_capacity_bytes.value_or(0);
+          },
+      .on_event = EmitSnapshotEvent,
   };
 }
 
@@ -193,6 +248,11 @@ TextDecodeStep TextModelRunner::DecodeStep(TextRunnerState& state,
 std::unique_ptr<TextRunnerSnapshot> TextModelRunner::Snapshot(
     const TextRunnerState&) const {
   throw std::logic_error("text runner does not support snapshots");
+}
+
+std::size_t TextModelRunner::SnapshotPayloadBytes(
+    const TextRunnerState&) const {
+  throw std::logic_error("text runner does not support snapshot sizing");
 }
 
 void TextModelRunner::RestoreOrFork(TextRunnerState&,
@@ -449,17 +509,50 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
   CommitMetrics metrics;
   const auto capabilities = impl_->runner->Descriptor().capabilities;
   if (capabilities.snapshot && capabilities.fork) {
-    const auto snapshot_start = std::chrono::steady_clock::now();
-    snapshot = impl_->runner->Snapshot(state);
-    metrics.snapshot_ms = std::chrono::duration<double, std::milli>(
-                              std::chrono::steady_clock::now() - snapshot_start)
-                              .count();
-    if (snapshot == nullptr) {
-      throw std::runtime_error("text runner returned an empty snapshot");
+    std::size_t snapshot_bytes = 0;
+    try {
+      snapshot_bytes = impl_->runner->SnapshotPayloadBytes(state);
+    } catch (...) {
+      impl_->lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, 0,
+                                checkpoint.size());
+      impl_->lease.Commit(std::move(checkpoint));
+      impl_.reset();
+      return metrics;
     }
-    metrics.snapshot_bytes = snapshot->PayloadBytes();
+    if (!impl_->lease.TryReserveSnapshot(snapshot_bytes, checkpoint.size())) {
+      impl_->lease.Commit(std::move(checkpoint));
+      impl_.reset();
+      return metrics;
+    }
+
+    const auto snapshot_start = std::chrono::steady_clock::now();
+    try {
+      snapshot = impl_->runner->Snapshot(state);
+      metrics.snapshot_ms =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - snapshot_start)
+              .count();
+    } catch (...) {
+      metrics.snapshot_ms =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - snapshot_start)
+              .count();
+      impl_->lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure,
+                                snapshot_bytes, checkpoint.size());
+      impl_->lease.Commit(std::move(checkpoint));
+      impl_.reset();
+      return metrics;
+    }
+    if (snapshot == nullptr) {
+      impl_->lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure,
+                                snapshot_bytes, checkpoint.size());
+      impl_->lease.Commit(std::move(checkpoint));
+      impl_.reset();
+      return metrics;
+    }
   }
-  impl_->lease.Commit(std::move(checkpoint), std::move(snapshot));
+  metrics.snapshot_bytes =
+      impl_->lease.Commit(std::move(checkpoint), std::move(snapshot));
   impl_.reset();
   return metrics;
 }

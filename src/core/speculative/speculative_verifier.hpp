@@ -240,6 +240,7 @@ public:
     return current_draft_length_;
   }
 
+  [[nodiscard]] std::size_t SnapshotPayloadBytes() const;
   void Reset() noexcept;
 
 private:

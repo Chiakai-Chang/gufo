@@ -422,6 +422,14 @@ std::size_t QwenDFlashGpuExecutor::StateBytes() const noexcept {
          sizeof(float);
 }
 
+std::size_t QwenDFlashGpuExecutor::SnapshotPayloadBytes() const noexcept {
+  const std::size_t kv_width =
+      static_cast<std::size_t>(model_->GetConfig().num_key_value_heads) *
+      model_->GetConfig().head_dim;
+  return 2U * model_->GetDFlashConfig().num_layers * injected_context_len_ *
+         kv_width * sizeof(float);
+}
+
 std::unique_ptr<QwenDFlashGpuSnapshot> QwenDFlashGpuExecutor::SaveSnapshot()
     const {
   const std::size_t kv_width =
@@ -440,7 +448,7 @@ std::unique_ptr<QwenDFlashGpuSnapshot> QwenDFlashGpuExecutor::SaveSnapshot()
   snapshot->kv_width_ = static_cast<std::uint32_t>(kv_width);
   snapshot->max_context_ = max_context_;
   snapshot->valid_context_ = injected_context_len_;
-  snapshot->payload_bytes_ = 2U * bytes;
+  snapshot->payload_bytes_ = SnapshotPayloadBytes();
 
   if (bytes == 0) {
     return snapshot;

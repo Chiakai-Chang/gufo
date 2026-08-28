@@ -57,6 +57,10 @@ struct TextRunnerResourceClaim {
   std::optional<std::size_t> state_capacity_bytes;
   std::optional<std::size_t> per_request_state_bytes;
   std::optional<std::size_t> temporary_scratch_bytes;
+  /// Aggregate bytes currently available for immutable retained snapshots.
+  ///
+  /// The pool queries this again after creating all mutable request states.
+  std::optional<std::size_t> retained_snapshot_capacity_bytes;
   bool requires_device_runtime_lock{false};
 };
 
@@ -174,6 +178,8 @@ public:
   ///
   /// The default implementations fail explicitly for runners that do not
   /// advertise the corresponding capabilities.
+  [[nodiscard]] virtual std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const;
   [[nodiscard]] virtual std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const;
   virtual void RestoreOrFork(TextRunnerState& state,
