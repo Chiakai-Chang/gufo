@@ -43,6 +43,20 @@ public:
   IDraftBackendSnapshot& operator=(IDraftBackendSnapshot&&) = delete;
 
   [[nodiscard]] virtual std::size_t PayloadBytes() const noexcept = 0;
+
+  /// Stable model-owned byte payload used by persistent continuation caches.
+  [[nodiscard]] virtual std::size_t PersistentPayloadBytes() const {
+    throw std::logic_error(
+        "draft backend snapshot does not support persistent sizing");
+  }
+
+  /// Serializes the persistent payload into an exactly sized destination.
+  [[nodiscard]] virtual std::size_t SerializePersistent(
+      std::span<std::uint8_t> destination) const {
+    (void)destination;
+    throw std::logic_error(
+        "draft backend snapshot does not support persistence");
+  }
 };
 
 /// Provider-neutral interface for draft token generators (NPU, MTP heads, small
@@ -119,6 +133,14 @@ public:
 
   virtual void RestoreSnapshot(const IDraftBackendSnapshot&) {
     throw std::logic_error("draft backend does not support snapshot restore");
+  }
+
+  /// Restores a stable model-owned payload into this backend.
+  virtual void RestorePersistentSnapshot(
+      std::span<const std::uint8_t> payload) {
+    (void)payload;
+    throw std::logic_error(
+        "draft backend does not support persistent snapshot restore");
   }
 
   /// Resets internal draft generator state

@@ -35,6 +35,9 @@ public:
   [[nodiscard]] std::uint32_t ValidContext() const noexcept {
     return valid_context_;
   }
+  [[nodiscard]] std::size_t PersistentPayloadBytes() const;
+  [[nodiscard]] std::size_t SerializePersistent(
+      std::span<std::uint8_t> destination) const;
 
 private:
   QwenDFlashGpuSnapshot() = default;
@@ -127,6 +130,7 @@ public:
 
   [[nodiscard]] std::unique_ptr<QwenDFlashGpuSnapshot> SaveSnapshot() const;
   void RestoreSnapshot(const QwenDFlashGpuSnapshot& snapshot);
+  void RestorePersistentSnapshot(std::span<const std::uint8_t> payload);
   [[nodiscard]] std::size_t StateBytes() const noexcept;
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const noexcept;
 
@@ -250,6 +254,8 @@ public:
       const override;
   void RestoreSnapshot(
       const speculative::IDraftBackendSnapshot& snapshot) override;
+  void RestorePersistentSnapshot(
+      std::span<const std::uint8_t> payload) override;
 
   void Reset() noexcept override;
 

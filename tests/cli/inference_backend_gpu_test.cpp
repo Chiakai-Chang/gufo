@@ -324,6 +324,7 @@ int main(int argc, const char* const* argv) {
           .capacity_bytes = 1024ULL * 1024ULL * 1024ULL,
           .staging_capacity_bytes = 512ULL * 1024ULL * 1024ULL,
           .model_artifact_fingerprint = std::string(64, 'a'),
+          .draft_model_artifact_fingerprint = {},
       };
       {
         gufo::server::InferenceBackend writer;
@@ -371,22 +372,85 @@ int main(int argc, const char* const* argv) {
              "Qwen compatibility miss changed cold execution");
 
       if (argc >= 3) {
-        gufo::server::InferenceBackend speculative_disk;
-        error.clear();
-        const bool loaded = speculative_disk.load(
-            model, &error, context, 1, {}, {},
-            gufo::server::TextSpeculativeConfig{
-                .backend = gufo::server::TextSpeculativeBackend::kDFlash,
-                .draft_model_path = argv[2],
-                .max_draft_tokens = 7,
-                .min_draft_tokens = 1,
-                .draft_policy =
-                    gufo::server::TextDraftPolicy::kRollingAcceptance,
-            },
-            disk_cache);
-        Expect(!loaded && error.find("does not yet support speculative") !=
-                              std::string::npos,
-               "Qwen disk cache must reject DFlash until draft reprime exists");
+        const gufo::server::TextSpeculativeConfig dflash_config{
+            .backend = gufo::server::TextSpeculativeBackend::kDFlash,
+            .draft_model_path = argv[2],
+            .max_draft_tokens = 7,
+            .min_draft_tokens = 1,
+            .draft_policy = gufo::server::TextDraftPolicy::kRollingAcceptance,
+        };
+        auto dflash_disk_cache = disk_cache;
+        dflash_disk_cache.draft_model_artifact_fingerprint =
+            std::string(64, 'c');
+        const auto direct_dflash_continuation =
+            GenerateDirect(*direct, continuation_prompt, 8);
+
+        gufo::server::InferenceBackend warm_dflash;
+        Expect(
+            warm_dflash.load(model, &error, context, 1, {}, {}, dflash_config),
+            error);
+        const auto warm_dflash_root = warm_dflash.chat(messages, 2, 0.0F);
+        const auto warm_dflash_continuation =
+            warm_dflash.chat(continued_messages, 8, 0.0F);
+        Expect(warm_dflash_continuation.cache_hit &&
+                   !warm_dflash_continuation.cache_disk_hit,
+               "warm DFlash reference restores its in-memory prefix");
+        Expect(warm_dflash_continuation.tokens == direct_dflash_continuation,
+               "warm DFlash continuation differs from cold target execution");
+        Expect(warm_dflash_continuation.draft_tokens > 0,
+               "warm DFlash continuation did not exercise drafting");
+
+        {
+          gufo::server::InferenceBackend dflash_writer;
+          Expect(dflash_writer.load(model, &error, context, 1, {}, {},
+                                    dflash_config, dflash_disk_cache),
+                 error);
+          const auto persistent_dflash_root =
+              dflash_writer.chat(messages, 2, 0.0F);
+          Expect(persistent_dflash_root.tokens == warm_dflash_root.tokens,
+                 "DFlash disk writer root differs from warm execution");
+          Expect(persistent_dflash_root.cache_disk_write_bytes > 0,
+                 "DFlash disk writer did not publish a compact snapshot");
+        }
+
+        gufo::server::InferenceBackend restarted_dflash;
+        Expect(restarted_dflash.load(model, &error, context, 1, {}, {},
+                                     dflash_config, dflash_disk_cache),
+               error);
+        const auto restored_dflash_continuation =
+            restarted_dflash.chat(continued_messages, 8, 0.0F);
+        Expect(restored_dflash_continuation.cache_hit &&
+                   restored_dflash_continuation.cache_disk_hit,
+               "fresh DFlash backend did not restore its disk prefix");
+        Expect(restored_dflash_continuation.cached_prompt_tokens ==
+                       warm_dflash_continuation.cached_prompt_tokens &&
+                   restored_dflash_continuation.cached_prompt_tokens <
+                       restored_dflash_continuation.prompt_tokens,
+               "DFlash disk restore did not report its exact prefix");
+        Expect(restored_dflash_continuation.tokens ==
+                   warm_dflash_continuation.tokens,
+               "DFlash disk restore changed continuation tokens");
+        Expect(restored_dflash_continuation.draft_tokens ==
+                       warm_dflash_continuation.draft_tokens &&
+                   restored_dflash_continuation.draft_accepted_tokens ==
+                       warm_dflash_continuation.draft_accepted_tokens,
+               "DFlash disk restore changed the speculative trajectory");
+
+        auto incompatible_dflash_cache = dflash_disk_cache;
+        incompatible_dflash_cache.draft_model_artifact_fingerprint =
+            std::string(64, 'd');
+        gufo::server::InferenceBackend incompatible_dflash;
+        Expect(
+            incompatible_dflash.load(model, &error, context, 1, {}, {},
+                                     dflash_config, incompatible_dflash_cache),
+            error);
+        const auto incompatible_dflash_result =
+            incompatible_dflash.chat(continued_messages, 8, 0.0F);
+        Expect(!incompatible_dflash_result.cache_hit &&
+                   !incompatible_dflash_result.cache_disk_hit,
+               "changed DFlash artifact fingerprint must be a cold miss");
+        Expect(incompatible_dflash_result.tokens == direct_dflash_continuation,
+               "DFlash compatibility miss changed cold execution");
       }
     }
 

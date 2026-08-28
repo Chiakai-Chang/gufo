@@ -347,6 +347,124 @@ private:
   std::array<float, 2> probabilities_;
 };
 
+class PersistentDraftSnapshot final
+    : public gufo::speculative::IDraftBackendSnapshot {
+public:
+  explicit PersistentDraftSnapshot(std::uint32_t marker) : marker_(marker) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    return sizeof(marker_);
+  }
+
+  [[nodiscard]] std::size_t PersistentPayloadBytes() const override {
+    return sizeof(marker_);
+  }
+
+  [[nodiscard]] std::size_t SerializePersistent(
+      std::span<std::uint8_t> destination) const override {
+    if (destination.size() != sizeof(marker_)) {
+      throw std::invalid_argument(
+          "persistent draft test destination size is invalid");
+    }
+    for (std::size_t byte = 0; byte < sizeof(marker_); ++byte) {
+      destination[byte] = static_cast<std::uint8_t>(marker_ >> (byte * 8U));
+    }
+    return destination.size();
+  }
+
+  [[nodiscard]] std::uint32_t Marker() const noexcept { return marker_; }
+
+private:
+  std::uint32_t marker_;
+};
+
+class PersistentDraftBackend final : public gufo::speculative::IDraftBackend {
+public:
+  PersistentDraftBackend(std::vector<TokenId> target_tokens,
+                         std::size_t prompt_size)
+      : target_tokens_(std::move(target_tokens)), prompt_size_(prompt_size) {}
+
+  [[nodiscard]] std::string_view Name() const noexcept override {
+    return "PersistentDraftBackend";
+  }
+
+  [[nodiscard]] bool RequiresTargetHiddenStates() const noexcept override {
+    return true;
+  }
+
+  [[nodiscard]] std::span<const std::uint32_t> TargetHiddenLayerIds()
+      const noexcept override {
+    static constexpr std::array<std::uint32_t, 1> target_layers = {7};
+    return target_layers;
+  }
+
+  [[nodiscard]] gufo::speculative::DraftProposal Propose(
+      std::span<const TokenId>, std::uint32_t current_pos,
+      std::uint32_t max_tokens) override {
+    Expect(current_pos >= prompt_size_, "persistent draft position");
+    ++marker_;
+    gufo::speculative::DraftProposal proposal;
+    proposal.start_pos = current_pos;
+    const std::size_t target_start =
+        static_cast<std::size_t>(current_pos) - prompt_size_ + 1U;
+    if (target_start >= target_tokens_.size()) {
+      return proposal;
+    }
+    const std::size_t count =
+        std::min<std::size_t>(max_tokens, target_tokens_.size() - target_start);
+    proposal.tokens.insert(
+        proposal.tokens.end(),
+        target_tokens_.begin() + static_cast<std::ptrdiff_t>(target_start),
+        target_tokens_.begin() +
+            static_cast<std::ptrdiff_t>(target_start + count));
+    return proposal;
+  }
+
+  void AcceptFeedback(std::span<const TokenId> accepted,
+                      TokenId correction_token) override {
+    marker_ += static_cast<std::uint32_t>(accepted.size());
+    marker_ ^= correction_token;
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes() const override {
+    return sizeof(marker_);
+  }
+
+  [[nodiscard]] std::unique_ptr<gufo::speculative::IDraftBackendSnapshot>
+  Snapshot() const override {
+    return std::make_unique<PersistentDraftSnapshot>(marker_);
+  }
+
+  void RestoreSnapshot(
+      const gufo::speculative::IDraftBackendSnapshot& snapshot) override {
+    const auto* persistent =
+        dynamic_cast<const PersistentDraftSnapshot*>(&snapshot);
+    if (persistent == nullptr) {
+      throw std::invalid_argument("persistent draft test snapshot type");
+    }
+    marker_ = persistent->Marker();
+  }
+
+  void RestorePersistentSnapshot(
+      std::span<const std::uint8_t> payload) override {
+    if (payload.size() != sizeof(marker_)) {
+      throw std::invalid_argument("persistent draft test payload size");
+    }
+    std::uint32_t restored = 0;
+    for (std::size_t byte = 0; byte < sizeof(restored); ++byte) {
+      restored |= static_cast<std::uint32_t>(payload[byte]) << (byte * 8U);
+    }
+    marker_ = restored;
+  }
+
+  [[nodiscard]] std::uint32_t Marker() const noexcept { return marker_; }
+
+private:
+  std::vector<TokenId> target_tokens_;
+  std::size_t prompt_size_;
+  std::uint32_t marker_{0};
+};
+
 gufo::models::GenerationOptions GenerationOptions(std::size_t max_tokens,
                                                   TokenId eos_id) {
   gufo::models::GenerationOptions options;
@@ -598,6 +716,81 @@ void TestSampledSpeculationMatchesTargetDistribution() {
          "positive-temperature verification continues to use drafts");
 }
 
+void TestPersistentVerifierSnapshotRoundTrip() {
+  constexpr TokenId eos_id = 900;
+  const std::vector<TokenId> prompt = {1, 2, 3};
+  const std::vector<TokenId> generated = {10, 11, 12, 13, 14, 15, 16};
+  ScriptedTargetExecutor source_target(generated, eos_id);
+  auto source_backend =
+      std::make_unique<PersistentDraftBackend>(generated, prompt.size());
+  auto* source_backend_view = source_backend.get();
+  gufo::speculative::SpeculativeOptions options;
+  options.max_draft_tokens = 4;
+  options.min_draft_tokens = 1;
+  options.initial_draft_tokens = 2;
+  options.rolling_window = 4;
+  gufo::speculative::SpeculativeVerifier source(
+      source_target, std::move(source_backend), options);
+
+  const auto generated_tokens =
+      source.Generate(prompt, GenerationOptions(6, eos_id));
+  Expect(generated_tokens ==
+             std::vector<TokenId>(generated.begin(), generated.begin() + 6),
+         "persistent verifier source output");
+  const auto source_stats = source.GetStats();
+  const auto source_draft_length = source.GetCurrentDraftLength();
+  const auto source_marker = source_backend_view->Marker();
+  auto snapshot = source.Snapshot();
+  std::vector<std::uint8_t> payload(snapshot->PersistentPayloadBytes());
+  Expect(snapshot->SerializePersistent(payload) == payload.size(),
+         "persistent verifier byte count");
+
+  ScriptedTargetExecutor restored_target(generated, eos_id);
+  auto restored_backend =
+      std::make_unique<PersistentDraftBackend>(generated, prompt.size());
+  auto* restored_backend_view = restored_backend.get();
+  gufo::speculative::SpeculativeVerifier restored(
+      restored_target, std::move(restored_backend), options);
+
+  auto corrupt = payload;
+  corrupt.front() ^= 0xFFU;
+  bool rejected_corruption = false;
+  try {
+    restored.RestorePersistentSnapshot(corrupt);
+  } catch (const std::invalid_argument&) {
+    rejected_corruption = true;
+  }
+  Expect(rejected_corruption, "persistent verifier rejects a malformed header");
+  Expect(restored_backend_view->Marker() == 0,
+         "malformed verifier payload does not mutate draft state");
+
+  restored.RestorePersistentSnapshot(payload);
+  const auto restored_stats = restored.GetStats();
+  Expect(restored_target.HiddenCaptureEnabled(),
+         "persistent verifier restore re-enables target hidden capture");
+  Expect(restored_stats.total_draft_tokens == source_stats.total_draft_tokens &&
+             restored_stats.total_accepted_tokens ==
+                 source_stats.total_accepted_tokens &&
+             restored_stats.total_verification_steps ==
+                 source_stats.total_verification_steps &&
+             restored_stats.total_emitted_tokens ==
+                 source_stats.total_emitted_tokens,
+         "persistent verifier restores exact counters");
+  Expect(restored.GetCurrentDraftLength() == source_draft_length,
+         "persistent verifier restores adaptive draft length");
+  Expect(restored_backend_view->Marker() == source_marker,
+         "persistent verifier restores provider state");
+
+  auto restored_snapshot = restored.Snapshot();
+  std::vector<std::uint8_t> restored_payload(
+      restored_snapshot->PersistentPayloadBytes());
+  Expect(restored_snapshot->SerializePersistent(restored_payload) ==
+             restored_payload.size(),
+         "restored persistent verifier byte count");
+  Expect(restored_payload == payload,
+         "persistent verifier round trip is byte exact");
+}
+
 }  // namespace
 
 int main() {
@@ -612,6 +805,7 @@ int main() {
   TestFirstPrefillTokenHonorsBudgetAndCallback();
   TestFirstPrefillEosIsNotEmitted();
   TestSampledSpeculationMatchesTargetDistribution();
+  TestPersistentVerifierSnapshotRoundTrip();
   std::cout << "All speculative verification tests passed.\n";
   return 0;
 }

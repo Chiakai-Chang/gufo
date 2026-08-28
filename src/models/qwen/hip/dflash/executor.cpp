@@ -1,5 +1,6 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -22,6 +24,53 @@
 
 namespace gufo::hip {
 namespace {
+
+constexpr std::array<std::uint8_t, 8> kDFlashGpuPersistentMagic = {
+    'G', 'D', 'F', 'G', 'P', 'U', '0', '1'};
+constexpr std::uint32_t kDFlashGpuPersistentVersion = 1;
+constexpr std::size_t kDFlashGpuPersistentHeaderBytes = 64;
+
+template<typename T>
+  requires(std::is_unsigned_v<T>)
+void PutLittleEndian(std::span<std::uint8_t> destination, std::size_t offset,
+                     T value) {
+  if (offset > destination.size() || sizeof(T) > destination.size() - offset) {
+    throw std::length_error("DFlash GPU persistent header is truncated");
+  }
+  for (std::size_t byte = 0; byte < sizeof(T); ++byte) {
+    destination[offset + byte] =
+        static_cast<std::uint8_t>(value >> (byte * 8U));
+  }
+}
+
+template<typename T>
+  requires(std::is_unsigned_v<T>)
+[[nodiscard]] T GetLittleEndian(std::span<const std::uint8_t> source,
+                                std::size_t offset) {
+  if (offset > source.size() || sizeof(T) > source.size() - offset) {
+    throw std::invalid_argument("DFlash GPU persistent header is truncated");
+  }
+  T value = 0;
+  for (std::size_t byte = 0; byte < sizeof(T); ++byte) {
+    value |= static_cast<T>(source[offset + byte]) << (byte * 8U);
+  }
+  return value;
+}
+
+[[nodiscard]] std::size_t CheckedPersistentAdd(std::size_t left,
+                                               std::size_t right) {
+  if (right > std::numeric_limits<std::size_t>::max() - left) {
+    throw std::overflow_error("DFlash GPU persistent size overflows");
+  }
+  return left + right;
+}
+
+[[nodiscard]] std::size_t PersistentSizeFromU64(std::uint64_t value) {
+  if (value > std::numeric_limits<std::size_t>::max()) {
+    throw std::overflow_error("DFlash GPU persistent size overflows");
+  }
+  return static_cast<std::size_t>(value);
+}
 
 template<typename T>
 void AllocateBuffer(T*& pointer, std::size_t elements) {
@@ -126,6 +175,69 @@ QwenDFlashGpuSnapshot::~QwenDFlashGpuSnapshot() {
   if (d_v_ != nullptr) {
     (void)hipFree(d_v_);
   }
+}
+
+std::size_t QwenDFlashGpuSnapshot::PersistentPayloadBytes() const {
+  return CheckedPersistentAdd(kDFlashGpuPersistentHeaderBytes, payload_bytes_);
+}
+
+std::size_t QwenDFlashGpuSnapshot::SerializePersistent(
+    std::span<std::uint8_t> destination) const {
+  const std::size_t expected_bytes = PersistentPayloadBytes();
+  if (destination.size() != expected_bytes) {
+    throw std::invalid_argument(
+        "DFlash GPU persistent destination size is invalid");
+  }
+  if (valid_context_ > max_context_ ||
+      (kv_width_ != 0 &&
+       valid_context_ > std::numeric_limits<std::size_t>::max() / kv_width_) ||
+      elements_per_layer_ !=
+          static_cast<std::size_t>(valid_context_) * kv_width_ ||
+      (elements_per_layer_ != 0 &&
+       num_layers_ >
+           std::numeric_limits<std::size_t>::max() / elements_per_layer_)) {
+    throw std::invalid_argument("DFlash GPU snapshot metadata is malformed");
+  }
+  const std::size_t total_elements =
+      static_cast<std::size_t>(num_layers_) * elements_per_layer_;
+  if (total_elements >
+      std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+    throw std::overflow_error("DFlash GPU persistent size overflows");
+  }
+  const std::size_t bytes_per_kind = total_elements * sizeof(float);
+  if (bytes_per_kind >
+          std::numeric_limits<std::size_t>::max() - bytes_per_kind ||
+      payload_bytes_ != bytes_per_kind + bytes_per_kind ||
+      (bytes_per_kind != 0 && (d_k_ == nullptr || d_v_ == nullptr))) {
+    throw std::invalid_argument("DFlash GPU snapshot payload is malformed");
+  }
+
+  std::fill(destination.begin(), destination.end(), std::uint8_t{0});
+  std::copy(kDFlashGpuPersistentMagic.begin(), kDFlashGpuPersistentMagic.end(),
+            destination.begin());
+  PutLittleEndian<std::uint32_t>(destination, 8, kDFlashGpuPersistentVersion);
+  PutLittleEndian<std::uint32_t>(
+      destination, 12,
+      static_cast<std::uint32_t>(kDFlashGpuPersistentHeaderBytes));
+  PutLittleEndian<std::uint32_t>(destination, 16, num_layers_);
+  PutLittleEndian<std::uint32_t>(destination, 20, kv_width_);
+  PutLittleEndian<std::uint32_t>(destination, 24, max_context_);
+  PutLittleEndian<std::uint32_t>(destination, 28, valid_context_);
+  PutLittleEndian<std::uint64_t>(
+      destination, 32, static_cast<std::uint64_t>(elements_per_layer_));
+  PutLittleEndian<std::uint64_t>(destination, 40,
+                                 static_cast<std::uint64_t>(payload_bytes_));
+  PutLittleEndian<std::uint64_t>(destination, 48,
+                                 static_cast<std::uint64_t>(expected_bytes));
+
+  if (bytes_per_kind != 0) {
+    HIP_CHECK(hipMemcpy(destination.data() + kDFlashGpuPersistentHeaderBytes,
+                        d_k_, bytes_per_kind, hipMemcpyDeviceToHost));
+    HIP_CHECK(hipMemcpy(
+        destination.data() + kDFlashGpuPersistentHeaderBytes + bytes_per_kind,
+        d_v_, bytes_per_kind, hipMemcpyDeviceToHost));
+  }
+  return destination.size();
 }
 
 QwenDFlashGpuExecutor::QwenDFlashGpuExecutor(
@@ -505,6 +617,83 @@ void QwenDFlashGpuExecutor::RestoreSnapshot(
   }
   HIP_CHECK(hipStreamSynchronize(stream_));
   injected_context_len_ = snapshot.valid_context_;
+}
+
+void QwenDFlashGpuExecutor::RestorePersistentSnapshot(
+    std::span<const std::uint8_t> payload) {
+  if (payload.size() < kDFlashGpuPersistentHeaderBytes ||
+      !std::equal(kDFlashGpuPersistentMagic.begin(),
+                  kDFlashGpuPersistentMagic.end(), payload.begin()) ||
+      GetLittleEndian<std::uint32_t>(payload, 8) !=
+          kDFlashGpuPersistentVersion ||
+      GetLittleEndian<std::uint32_t>(payload, 12) !=
+          kDFlashGpuPersistentHeaderBytes ||
+      GetLittleEndian<std::uint64_t>(payload, 56) != 0) {
+    throw std::invalid_argument("DFlash GPU persistent header is invalid");
+  }
+  const std::uint32_t num_layers = GetLittleEndian<std::uint32_t>(payload, 16);
+  const std::uint32_t kv_width = GetLittleEndian<std::uint32_t>(payload, 20);
+  const std::uint32_t max_context = GetLittleEndian<std::uint32_t>(payload, 24);
+  const std::uint32_t valid_context =
+      GetLittleEndian<std::uint32_t>(payload, 28);
+  const std::size_t elements_per_layer =
+      PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 32));
+  const std::size_t payload_bytes =
+      PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 40));
+  const std::size_t total_bytes =
+      PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 48));
+
+  const std::size_t expected_kv_width =
+      static_cast<std::size_t>(model_->GetConfig().num_key_value_heads) *
+      model_->GetConfig().head_dim;
+  if (expected_kv_width > std::numeric_limits<std::uint32_t>::max() ||
+      num_layers != model_->GetDFlashConfig().num_layers ||
+      kv_width != expected_kv_width || max_context != max_context_ ||
+      valid_context > max_context_ ||
+      (kv_width != 0 &&
+       valid_context > std::numeric_limits<std::size_t>::max() / kv_width) ||
+      elements_per_layer !=
+          static_cast<std::size_t>(valid_context) * kv_width ||
+      (elements_per_layer != 0 &&
+       num_layers >
+           std::numeric_limits<std::size_t>::max() / elements_per_layer)) {
+    throw std::invalid_argument(
+        "DFlash GPU persistent metadata is incompatible");
+  }
+  const std::size_t total_elements =
+      static_cast<std::size_t>(num_layers) * elements_per_layer;
+  if (total_elements >
+      std::numeric_limits<std::size_t>::max() / sizeof(float)) {
+    throw std::overflow_error("DFlash GPU persistent size overflows");
+  }
+  const std::size_t bytes_per_kind = total_elements * sizeof(float);
+  if (bytes_per_kind >
+          std::numeric_limits<std::size_t>::max() - bytes_per_kind ||
+      payload_bytes != bytes_per_kind + bytes_per_kind ||
+      total_bytes != payload.size() ||
+      CheckedPersistentAdd(kDFlashGpuPersistentHeaderBytes, payload_bytes) !=
+          payload.size()) {
+    throw std::invalid_argument(
+        "DFlash GPU persistent payload size is invalid");
+  }
+
+  for (std::size_t layer = 0; layer < num_layers; ++layer) {
+    if (elements_per_layer == 0) {
+      continue;
+    }
+    const std::size_t layer_bytes = elements_per_layer * sizeof(float);
+    const std::size_t layer_offset = layer * layer_bytes;
+    HIP_CHECK(hipMemcpyAsync(
+        d_injected_k_[layer],
+        payload.data() + kDFlashGpuPersistentHeaderBytes + layer_offset,
+        layer_bytes, hipMemcpyHostToDevice, stream_));
+    HIP_CHECK(hipMemcpyAsync(d_injected_v_[layer],
+                             payload.data() + kDFlashGpuPersistentHeaderBytes +
+                                 bytes_per_kind + layer_offset,
+                             layer_bytes, hipMemcpyHostToDevice, stream_));
+  }
+  HIP_CHECK(hipStreamSynchronize(stream_));
+  injected_context_len_ = valid_context;
 }
 
 void QwenDFlashGpuExecutor::Reset() noexcept {

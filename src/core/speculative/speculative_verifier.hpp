@@ -158,6 +158,9 @@ public:
   ~SpeculativeVerifierSnapshot() = default;
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept;
+  [[nodiscard]] std::size_t PersistentPayloadBytes() const;
+  [[nodiscard]] std::size_t SerializePersistent(
+      std::span<std::uint8_t> destination) const;
 
 private:
   SpeculativeVerifierSnapshot() = default;
@@ -231,6 +234,7 @@ public:
 
   [[nodiscard]] std::unique_ptr<SpeculativeVerifierSnapshot> Snapshot() const;
   void RestoreSnapshot(const SpeculativeVerifierSnapshot& snapshot);
+  void RestorePersistentSnapshot(std::span<const std::uint8_t> payload);
 
   [[nodiscard]] const SpeculativeStats& GetStats() const noexcept {
     return stats_;

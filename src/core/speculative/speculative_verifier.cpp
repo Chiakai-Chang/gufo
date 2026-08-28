@@ -2,6 +2,8 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
@@ -10,11 +12,61 @@
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 
 #include "src/core/sampling.hpp"
 
 namespace gufo::speculative {
 namespace {
+
+constexpr std::array<std::uint8_t, 8> kVerifierPersistentMagic = {
+    'G', 'S', 'P', 'V', 'E', 'R', '0', '1'};
+constexpr std::uint32_t kVerifierPersistentVersion = 1;
+constexpr std::size_t kVerifierPersistentHeaderBytes = 96;
+
+template<typename T>
+  requires(std::is_unsigned_v<T>)
+void PutLittleEndian(std::span<std::uint8_t> destination, std::size_t offset,
+                     T value) {
+  if (offset > destination.size() || sizeof(T) > destination.size() - offset) {
+    throw std::length_error(
+        "speculative verifier persistent header is truncated");
+  }
+  for (std::size_t byte = 0; byte < sizeof(T); ++byte) {
+    destination[offset + byte] =
+        static_cast<std::uint8_t>(value >> (byte * 8U));
+  }
+}
+
+template<typename T>
+  requires(std::is_unsigned_v<T>)
+[[nodiscard]] T GetLittleEndian(std::span<const std::uint8_t> source,
+                                std::size_t offset) {
+  if (offset > source.size() || sizeof(T) > source.size() - offset) {
+    throw std::invalid_argument(
+        "speculative verifier persistent header is truncated");
+  }
+  T value = 0;
+  for (std::size_t byte = 0; byte < sizeof(T); ++byte) {
+    value |= static_cast<T>(source[offset + byte]) << (byte * 8U);
+  }
+  return value;
+}
+
+[[nodiscard]] std::size_t CheckedPersistentAdd(std::size_t left,
+                                               std::size_t right) {
+  if (right > std::numeric_limits<std::size_t>::max() - left) {
+    throw std::overflow_error("speculative verifier persistent size overflows");
+  }
+  return left + right;
+}
+
+[[nodiscard]] std::size_t PersistentSizeFromU64(std::uint64_t value) {
+  if (value > std::numeric_limits<std::size_t>::max()) {
+    throw std::overflow_error("speculative verifier persistent size overflows");
+  }
+  return static_cast<std::size_t>(value);
+}
 
 [[nodiscard]] bool CheckBatchedVerification() noexcept;
 
@@ -783,6 +835,78 @@ std::size_t SpeculativeVerifierSnapshot::PayloadBytes() const noexcept {
          sizeof(current_draft_length_) + sizeof(accepted_token_ema_);
 }
 
+std::size_t SpeculativeVerifierSnapshot::PersistentPayloadBytes() const {
+  if (draft_snapshot_ == nullptr) {
+    throw std::logic_error(
+        "speculative verifier snapshot has no draft payload");
+  }
+  if (rolling_acceptance_.size() >
+      std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t)) {
+    throw std::overflow_error("speculative verifier persistent size overflows");
+  }
+  const std::size_t rolling_bytes =
+      rolling_acceptance_.size() * sizeof(std::uint32_t);
+  return CheckedPersistentAdd(
+      CheckedPersistentAdd(kVerifierPersistentHeaderBytes, rolling_bytes),
+      draft_snapshot_->PersistentPayloadBytes());
+}
+
+std::size_t SpeculativeVerifierSnapshot::SerializePersistent(
+    std::span<std::uint8_t> destination) const {
+  const std::size_t expected_bytes = PersistentPayloadBytes();
+  if (destination.size() != expected_bytes) {
+    throw std::invalid_argument(
+        "speculative verifier persistent destination size is invalid");
+  }
+  const std::size_t draft_payload_bytes =
+      draft_snapshot_->PersistentPayloadBytes();
+  const std::size_t rolling_bytes =
+      rolling_acceptance_.size() * sizeof(std::uint32_t);
+  const std::size_t draft_offset =
+      CheckedPersistentAdd(kVerifierPersistentHeaderBytes, rolling_bytes);
+
+  std::fill(destination.begin(), destination.end(), std::uint8_t{0});
+  std::copy(kVerifierPersistentMagic.begin(), kVerifierPersistentMagic.end(),
+            destination.begin());
+  PutLittleEndian<std::uint32_t>(destination, 8, kVerifierPersistentVersion);
+  PutLittleEndian<std::uint32_t>(
+      destination, 12,
+      static_cast<std::uint32_t>(kVerifierPersistentHeaderBytes));
+  PutLittleEndian<std::uint64_t>(
+      destination, 16, static_cast<std::uint64_t>(draft_payload_bytes));
+  PutLittleEndian<std::uint64_t>(
+      destination, 24, static_cast<std::uint64_t>(rolling_acceptance_.size()));
+  PutLittleEndian<std::uint64_t>(
+      destination, 32, static_cast<std::uint64_t>(stats_.total_draft_tokens));
+  PutLittleEndian<std::uint64_t>(
+      destination, 40,
+      static_cast<std::uint64_t>(stats_.total_accepted_tokens));
+  PutLittleEndian<std::uint64_t>(
+      destination, 48,
+      static_cast<std::uint64_t>(stats_.total_verification_steps));
+  PutLittleEndian<std::uint64_t>(
+      destination, 56, static_cast<std::uint64_t>(stats_.total_emitted_tokens));
+  PutLittleEndian<std::uint32_t>(destination, 64, current_draft_length_);
+  PutLittleEndian<std::uint32_t>(
+      destination, 68, std::bit_cast<std::uint32_t>(accepted_token_ema_));
+  PutLittleEndian<std::uint64_t>(destination, 72,
+                                 static_cast<std::uint64_t>(expected_bytes));
+
+  std::size_t rolling_offset = kVerifierPersistentHeaderBytes;
+  for (const float rate : rolling_acceptance_) {
+    PutLittleEndian<std::uint32_t>(destination, rolling_offset,
+                                   std::bit_cast<std::uint32_t>(rate));
+    rolling_offset += sizeof(std::uint32_t);
+  }
+  const std::size_t written = draft_snapshot_->SerializePersistent(
+      destination.subspan(draft_offset, draft_payload_bytes));
+  if (written != draft_payload_bytes) {
+    throw std::runtime_error(
+        "draft persistent serializer returned the wrong byte count");
+  }
+  return destination.size();
+}
+
 std::size_t SpeculativeVerifier::SnapshotPayloadBytes() const {
   if (draft_backend_ == nullptr) {
     throw std::logic_error("speculative verifier has no draft backend to size");
@@ -826,11 +950,111 @@ void SpeculativeVerifier::RestoreSnapshot(
   if (draft_backend_ == nullptr || snapshot.draft_snapshot_ == nullptr) {
     throw std::invalid_argument("speculative verifier snapshot is incomplete");
   }
+  const bool capture_hidden = draft_backend_->RequiresTargetHiddenStates();
+  const auto target_layer_ids = capture_hidden
+                                    ? draft_backend_->TargetHiddenLayerIds()
+                                    : std::span<const std::uint32_t>{};
+  target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
   draft_backend_->RestoreSnapshot(*snapshot.draft_snapshot_);
   stats_ = snapshot.stats_;
   current_draft_length_ = snapshot.current_draft_length_;
   rolling_acceptance_ = snapshot.rolling_acceptance_;
   accepted_token_ema_ = snapshot.accepted_token_ema_;
+}
+
+void SpeculativeVerifier::RestorePersistentSnapshot(
+    std::span<const std::uint8_t> payload) {
+  if (draft_backend_ == nullptr) {
+    throw std::logic_error(
+        "speculative verifier has no draft backend to restore");
+  }
+  if (payload.size() < kVerifierPersistentHeaderBytes ||
+      !std::equal(kVerifierPersistentMagic.begin(),
+                  kVerifierPersistentMagic.end(), payload.begin()) ||
+      GetLittleEndian<std::uint32_t>(payload, 8) !=
+          kVerifierPersistentVersion ||
+      GetLittleEndian<std::uint32_t>(payload, 12) !=
+          kVerifierPersistentHeaderBytes ||
+      GetLittleEndian<std::uint64_t>(payload, 80) != 0 ||
+      GetLittleEndian<std::uint64_t>(payload, 88) != 0) {
+    throw std::invalid_argument(
+        "speculative verifier persistent header is invalid");
+  }
+
+  const std::size_t draft_payload_bytes =
+      PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 16));
+  const std::size_t rolling_count =
+      PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 24));
+  const auto total_draft_tokens = GetLittleEndian<std::uint64_t>(payload, 32);
+  const auto total_accepted_tokens =
+      GetLittleEndian<std::uint64_t>(payload, 40);
+  const auto total_verification_steps =
+      GetLittleEndian<std::uint64_t>(payload, 48);
+  const auto total_emitted_tokens = GetLittleEndian<std::uint64_t>(payload, 56);
+  const std::uint32_t current_draft_length =
+      GetLittleEndian<std::uint32_t>(payload, 64);
+  const float accepted_token_ema =
+      std::bit_cast<float>(GetLittleEndian<std::uint32_t>(payload, 68));
+  const std::size_t total_bytes =
+      PersistentSizeFromU64(GetLittleEndian<std::uint64_t>(payload, 72));
+
+  if (rolling_count >
+          std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t) ||
+      rolling_count > options_.rolling_window ||
+      total_accepted_tokens > total_draft_tokens ||
+      total_draft_tokens > std::numeric_limits<std::size_t>::max() ||
+      total_accepted_tokens > std::numeric_limits<std::size_t>::max() ||
+      total_verification_steps > std::numeric_limits<std::size_t>::max() ||
+      total_emitted_tokens > std::numeric_limits<std::size_t>::max() ||
+      current_draft_length < options_.min_draft_tokens ||
+      current_draft_length > options_.max_draft_tokens ||
+      !std::isfinite(accepted_token_ema) || accepted_token_ema < 0.0F ||
+      accepted_token_ema >
+          std::max(2.0F, static_cast<float>(options_.max_draft_tokens)) ||
+      total_bytes != payload.size()) {
+    throw std::invalid_argument(
+        "speculative verifier persistent metadata is invalid");
+  }
+
+  const std::size_t rolling_bytes = rolling_count * sizeof(std::uint32_t);
+  const std::size_t draft_offset =
+      CheckedPersistentAdd(kVerifierPersistentHeaderBytes, rolling_bytes);
+  if (CheckedPersistentAdd(draft_offset, draft_payload_bytes) !=
+      payload.size()) {
+    throw std::invalid_argument(
+        "speculative verifier persistent payload size is invalid");
+  }
+
+  std::deque<float> rolling_acceptance;
+  std::size_t rolling_offset = kVerifierPersistentHeaderBytes;
+  for (std::size_t index = 0; index < rolling_count; ++index) {
+    const float rate = std::bit_cast<float>(
+        GetLittleEndian<std::uint32_t>(payload, rolling_offset));
+    if (!std::isfinite(rate) || rate < 0.0F || rate > 1.0F) {
+      throw std::invalid_argument(
+          "speculative verifier rolling acceptance is invalid");
+    }
+    rolling_acceptance.push_back(rate);
+    rolling_offset += sizeof(std::uint32_t);
+  }
+
+  const bool capture_hidden = draft_backend_->RequiresTargetHiddenStates();
+  const auto target_layer_ids = capture_hidden
+                                    ? draft_backend_->TargetHiddenLayerIds()
+                                    : std::span<const std::uint32_t>{};
+  target_executor_->SetPromptHiddenCapture(capture_hidden, target_layer_ids);
+  draft_backend_->RestorePersistentSnapshot(
+      payload.subspan(draft_offset, draft_payload_bytes));
+  stats_ = {
+      .total_draft_tokens = static_cast<std::size_t>(total_draft_tokens),
+      .total_accepted_tokens = static_cast<std::size_t>(total_accepted_tokens),
+      .total_verification_steps =
+          static_cast<std::size_t>(total_verification_steps),
+      .total_emitted_tokens = static_cast<std::size_t>(total_emitted_tokens),
+  };
+  current_draft_length_ = current_draft_length;
+  rolling_acceptance_ = std::move(rolling_acceptance);
+  accepted_token_ema_ = accepted_token_ema;
 }
 
 std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
