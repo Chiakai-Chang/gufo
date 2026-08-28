@@ -100,6 +100,11 @@ void PrintServeHelp(std::string_view program_name,
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
+    std::filesystem::path cache_disk_directory;
+    std::size_t cache_disk_bytes =
+        static_cast<std::size_t>(4) * 1024U * 1024U * 1024U;
+    std::size_t cache_disk_staging_bytes =
+        static_cast<std::size_t>(256) * 1024U * 1024U;
     bool force_cpu = false;
 
     gufo::cli::ArgParser parser(
@@ -219,6 +224,18 @@ void PrintServeHelp(std::string_view program_name,
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    parser.AddOption(
+        "", "--cache-disk", "DIR",
+        "Opt-in restart-safe continuation cache directory (DeepSeek first)",
+        "Cache", &cache_disk_directory);
+    parser.AddOption(
+        "", "--cache-disk-bytes", "N",
+        "Total retained disk-cache byte budget (default: 4294967296)", "Cache",
+        &cache_disk_bytes);
+    parser.AddOption(
+        "", "--cache-disk-staging-bytes", "N",
+        "Single-operation RAM staging byte limit (default: 268435456)", "Cache",
+        &cache_disk_staging_bytes);
     parser.AddFlag("", "--cpu",
                    "Force CPU OpenMP execution fallback instead of GPU ROCm",
                    "Hardware", &force_cpu);
@@ -537,6 +554,11 @@ int RunServe(std::span<const char* const> args) {
         server::kDefaultMaxBufferedOutputBytes;
     std::size_t max_buffered_output_bytes_total =
         server::kDefaultMaxBufferedOutputBytesTotal;
+    std::filesystem::path cache_disk_directory;
+    std::size_t cache_disk_bytes =
+        static_cast<std::size_t>(4) * 1024U * 1024U * 1024U;
+    std::size_t cache_disk_staging_bytes =
+        static_cast<std::size_t>(256) * 1024U * 1024U;
     bool force_cpu = false;
 
     gufo::cli::ArgParser llm_parser(
@@ -654,6 +676,18 @@ int RunServe(std::span<const char* const> args) {
         "", "--max-buffered-output-total", "N",
         "Maximum queued stream bytes across requests (default: 262144)",
         "Scheduling", &max_buffered_output_bytes_total);
+    llm_parser.AddOption(
+        "", "--cache-disk", "DIR",
+        "Opt-in restart-safe continuation cache directory (DeepSeek first)",
+        "Cache", &cache_disk_directory);
+    llm_parser.AddOption(
+        "", "--cache-disk-bytes", "N",
+        "Total retained disk-cache byte budget (default: 4294967296)", "Cache",
+        &cache_disk_bytes);
+    llm_parser.AddOption(
+        "", "--cache-disk-staging-bytes", "N",
+        "Single-operation RAM staging byte limit (default: 268435456)", "Cache",
+        &cache_disk_staging_bytes);
     llm_parser.AddFlag(
         "", "--cpu", "Force CPU OpenMP execution fallback instead of GPU ROCm",
         "Hardware", &force_cpu);
@@ -672,6 +706,8 @@ int RunServe(std::span<const char* const> args) {
         max_pending_requests_per_client > max_pending_requests ||
         max_output_bytes == 0 || max_buffered_output_bytes == 0 ||
         max_buffered_output_bytes_total == 0 ||
+        (!cache_disk_directory.empty() &&
+         (cache_disk_bytes == 0 || cache_disk_staging_bytes == 0)) ||
         request_timeout_ms > static_cast<std::uint64_t>(
                                  std::chrono::milliseconds::max().count()) ||
         !std::isfinite(temperature) || temperature < 0.0F ||
@@ -737,7 +773,13 @@ int RunServe(std::span<const char* const> args) {
                                    static_cast<std::chrono::milliseconds::rep>(
                                        request_timeout_ms)},
                        },
-                       speculative_config)) {
+                       speculative_config,
+                       server::TextDiskCacheConfig{
+                           .directory = cache_disk_directory,
+                           .capacity_bytes = cache_disk_bytes,
+                           .staging_capacity_bytes = cache_disk_staging_bytes,
+                           .model_artifact_fingerprint = {},
+                       })) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }

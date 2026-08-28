@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -17,6 +18,12 @@
 namespace gufo::server {
 
 using TextRunnerToken = ContinuationToken;
+
+struct TextRunnerDiskCacheOptions {
+  std::filesystem::path directory;
+  std::size_t capacity_bytes{0};
+  std::size_t staging_capacity_bytes{0};
+};
 
 enum class TextExecutionPlanKind : std::uint8_t {
   kSerial,
@@ -40,11 +47,25 @@ struct TextRunnerCapabilities {
   bool prefix_reuse{true};
 };
 
+/// Model-owned compatibility identity for restart-safe snapshots.
+///
+/// The bytes are canonical and opaque to serving code. They must cover every
+/// model, tokenizer, template, layout, precision, context-policy, and adapter
+/// property that can change restored continuation semantics. Executable
+/// revisions are intentionally excluded when they retain the same state ABI.
+struct TextRunnerPersistenceDescriptor {
+  std::vector<std::uint8_t> compatibility_identity;
+  std::uint32_t payload_version{0};
+
+  bool operator==(const TextRunnerPersistenceDescriptor&) const = default;
+};
+
 struct TextRunnerDescriptor {
   std::string model_id;
   std::string state_abi;
   std::uint32_t max_context{0};
   TextRunnerCapabilities capabilities;
+  std::optional<TextRunnerPersistenceDescriptor> persistence;
 };
 
 /// Optional byte claims made before state allocation.
@@ -184,6 +205,26 @@ public:
       const TextRunnerState& state) const;
   virtual void RestoreOrFork(TextRunnerState& state,
                              const TextRunnerSnapshot& snapshot) const;
+
+  /// Returns the exact serialized bytes required by a persistent snapshot.
+  ///
+  /// Persistent serialization is separate from the in-memory snapshot layout:
+  /// a provider may retain GPU-private state in RAM while exposing a compact,
+  /// versioned disk representation.
+  [[nodiscard]] virtual std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const;
+
+  /// Serializes one immutable snapshot into exactly-sized common-store staging.
+  ///
+  /// Returns the number of initialized bytes. It must equal
+  /// PersistentSnapshotPayloadBytes(snapshot).
+  [[nodiscard]] virtual std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const;
+
+  /// Restores a version-compatible serialized payload into an existing state.
+  virtual void RestorePersistentSnapshot(
+      TextRunnerState& state, std::span<const std::uint8_t> payload) const;
 };
 
 /// Bounded pool of opaque runner states with exact-prefix continuation reuse.
@@ -196,6 +237,8 @@ public:
     struct CommitMetrics {
       std::size_t snapshot_bytes{0};
       double snapshot_ms{0.0};
+      std::size_t disk_write_bytes{0};
+      double disk_write_ms{0.0};
     };
 
     Request();
@@ -211,6 +254,7 @@ public:
     [[nodiscard]] std::size_t cached_prompt_tokens() const noexcept;
     [[nodiscard]] std::size_t cache_restore_bytes() const noexcept;
     [[nodiscard]] double cache_restore_ms() const noexcept;
+    [[nodiscard]] bool cache_disk_hit() const noexcept;
     [[nodiscard]] std::size_t prompt_tokens() const noexcept;
     [[nodiscard]] bool prefill_complete() const noexcept;
 
@@ -232,8 +276,9 @@ public:
     std::unique_ptr<Impl> impl_;
   };
 
-  TextRunnerPool(std::shared_ptr<TextModelRunner> runner,
-                 std::size_t state_count);
+  TextRunnerPool(
+      std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
+      std::optional<TextRunnerDiskCacheOptions> disk_cache = std::nullopt);
   ~TextRunnerPool();
 
   TextRunnerPool(const TextRunnerPool&) = delete;

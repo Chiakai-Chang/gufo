@@ -814,6 +814,7 @@ json::Value Timings(const TextGenerationBackend::Result& result) {
   timings["cache_n"] = result.cached_prompt_tokens;
   timings["cache_restore_ms"] = result.cache_restore_ms;
   timings["cache_snapshot_ms"] = result.cache_snapshot_ms;
+  timings["cache_disk_write_ms"] = result.cache_disk_write_ms;
   timings["draft_n"] = result.draft_tokens;
   timings["draft_n_accepted"] = result.draft_accepted_tokens;
   return timings;
@@ -830,9 +831,12 @@ json::Value Metrics(const TextGenerationBackend::Result& result) {
   metrics["cached_tokens"] = result.cached_prompt_tokens;
   metrics["cache_restore_bytes"] = result.cache_restore_bytes;
   metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
+  metrics["cache_disk_write_bytes"] = result.cache_disk_write_bytes;
   metrics["cache_shared_bytes"] = result.cache_shared_bytes;
   metrics["cache_restore_ms"] = result.cache_restore_ms;
   metrics["cache_snapshot_ms"] = result.cache_snapshot_ms;
+  metrics["cache_disk_write_ms"] = result.cache_disk_write_ms;
+  metrics["cache_disk_hit"] = result.cache_disk_hit;
   return metrics;
 }
 
@@ -866,9 +870,12 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   metrics["cache_hit"] = result.cache_hit;
   metrics["cache_restore_bytes"] = result.cache_restore_bytes;
   metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
+  metrics["cache_disk_write_bytes"] = result.cache_disk_write_bytes;
   metrics["cache_shared_bytes"] = result.cache_shared_bytes;
   metrics["cache_restore_ms"] = result.cache_restore_ms;
   metrics["cache_snapshot_ms"] = result.cache_snapshot_ms;
+  metrics["cache_disk_write_ms"] = result.cache_disk_write_ms;
+  metrics["cache_disk_hit"] = result.cache_disk_hit;
   metrics["prefill_tokens"] = result.prefill_tokens;
   metrics["prefill_chunks"] = result.prefill_chunks;
   metrics["active_decode_prefill_chunks"] = result.active_decode_prefill_chunks;

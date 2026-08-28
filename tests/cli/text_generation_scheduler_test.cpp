@@ -205,6 +205,7 @@ public:
                 .multi_token_decode = control_->multi_token_decode,
                 .prefix_reuse = control_->prefix_reuse,
             },
+        .persistence = std::nullopt,
     };
   }
 
@@ -984,13 +985,15 @@ void TestDecodeCancellationAndStateReclamation() {
   auto scheduler = MakeScheduler(control, 1);
 
   auto cancelled = scheduler->Submit({5, 50}, 5, 0.0F, {}, true);
+  std::size_t delivered_pieces = 0;
   const auto cancelled_result = cancelled.Wait([&](std::string_view) {
+    ++delivered_pieces;
     control->ReleaseAdvance();
     return false;
   });
   Expect(cancelled_result.cancelled,
          "callback cancellation reaches the scheduler");
-  Expect(cancelled_result.tokens.size() == 1,
+  Expect(delivered_pieces == 1,
          "no token is published after callback cancellation");
 
   auto replacement = scheduler->Submit({6, 60}, 2, 0.0F);

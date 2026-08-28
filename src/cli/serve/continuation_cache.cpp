@@ -94,6 +94,7 @@ ContinuationCache::Lease::Lease(Lease&& other) noexcept
       restored_snapshot_bytes_(
           std::exchange(other.restored_snapshot_bytes_, 0)),
       restore_ms_(std::exchange(other.restore_ms_, 0.0)),
+      restored_from_disk_(std::exchange(other.restored_from_disk_, false)),
       reserved_snapshot_bytes_(
           std::exchange(other.reserved_snapshot_bytes_, 0)) {}
 
@@ -108,6 +109,7 @@ ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     source_index_ = std::exchange(other.source_index_, 0);
     restored_snapshot_bytes_ = std::exchange(other.restored_snapshot_bytes_, 0);
     restore_ms_ = std::exchange(other.restore_ms_, 0.0);
+    restored_from_disk_ = std::exchange(other.restored_from_disk_, false);
     reserved_snapshot_bytes_ = std::exchange(other.reserved_snapshot_bytes_, 0);
   }
   return *this;
@@ -118,6 +120,24 @@ ContinuationState& ContinuationCache::Lease::state() const {
     throw std::logic_error("continuation cache lease is empty");
   }
   return cache_->StateAt(index_);
+}
+
+void ContinuationCache::Lease::AdoptRestoredPrefix(std::size_t cached_tokens,
+                                                   std::size_t restored_bytes,
+                                                   double restore_ms) {
+  if (cache_ == nullptr) {
+    throw std::logic_error("continuation cache lease is empty");
+  }
+  if (cache_hit_ || cached_tokens == 0 || restored_bytes == 0 ||
+      restore_ms < 0.0) {
+    throw std::invalid_argument(
+        "invalid lower-tier continuation restore metrics");
+  }
+  cache_hit_ = true;
+  cached_tokens_ = cached_tokens;
+  restored_snapshot_bytes_ = restored_bytes;
+  restore_ms_ = restore_ms;
+  restored_from_disk_ = true;
 }
 
 bool ContinuationCache::Lease::TryReserveSnapshot(std::size_t snapshot_bytes,

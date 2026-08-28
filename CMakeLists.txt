@@ -202,6 +202,7 @@ if (ENGINE_ENABLE_XRT)
 endif()
 
 add_library(gufo_core STATIC
+  src/core/crypto/sha256.cpp
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
   src/models/minimax_h3/audio_vae.cpp
@@ -279,6 +280,7 @@ add_executable(gufo
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
   src/cli/serve/continuation_cache.cpp
+  src/cli/serve/continuation_disk_store.cpp
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
@@ -419,11 +421,23 @@ if (BUILD_TESTING)
   add_executable(text_model_runner_test
     tests/cli/text_model_runner_test.cpp
     src/cli/serve/continuation_cache.cpp
+    src/cli/serve/continuation_disk_store.cpp
     src/cli/serve/text_model_runner.cpp)
   target_link_libraries(text_model_runner_test PRIVATE gufo_core)
   add_test(NAME text_model_runner_test COMMAND text_model_runner_test)
   set_tests_properties(text_model_runner_test PROPERTIES
     LABELS "cpu;server;runner;cache;state;lifecycle")
+
+  add_executable(continuation_disk_store_test
+    tests/cli/continuation_disk_store_test.cpp
+    src/cli/serve/continuation_disk_store.cpp
+    src/cli/serve/text_model_runner.cpp
+    src/cli/serve/continuation_cache.cpp)
+  target_link_libraries(continuation_disk_store_test PRIVATE gufo_core)
+  add_test(NAME continuation_disk_store_test
+    COMMAND continuation_disk_store_test)
+  set_tests_properties(continuation_disk_store_test PROPERTIES
+    LABELS "cpu;server;cache;disk;state;lifecycle")
 
   add_executable(logit_sampler_test tests/cli/logit_sampler_test.cpp)
   target_link_libraries(logit_sampler_test PRIVATE gufo_core)
@@ -434,6 +448,7 @@ if (BUILD_TESTING)
   add_executable(text_generation_scheduler_test
     tests/cli/text_generation_scheduler_test.cpp
     src/cli/serve/continuation_cache.cpp
+    src/cli/serve/continuation_disk_store.cpp
     src/cli/serve/text_model_runner.cpp
     src/cli/serve/text_generation_scheduler.cpp)
   target_link_libraries(text_generation_scheduler_test PRIVATE gufo_core)
@@ -913,6 +928,7 @@ if (BUILD_TESTING)
     add_executable(inference_backend_gpu_test
       tests/cli/inference_backend_gpu_test.cpp
       src/cli/serve/continuation_cache.cpp
+      src/cli/serve/continuation_disk_store.cpp
       src/cli/serve/text_model_runner.cpp
       src/cli/serve/text_generation_scheduler.cpp
       src/cli/serve/inference_backend.cpp)
@@ -926,6 +942,7 @@ if (BUILD_TESTING)
     add_executable(deepseek_v4_flash_backend_test
       tests/cli/deepseek_v4_flash_backend_test.cpp
       src/cli/serve/continuation_cache.cpp
+      src/cli/serve/continuation_disk_store.cpp
       src/cli/serve/text_model_runner.cpp
       src/cli/serve/text_generation_scheduler.cpp
       src/cli/serve/inference_backend.cpp)

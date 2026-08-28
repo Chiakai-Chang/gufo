@@ -347,6 +347,8 @@ struct TextGenerationScheduler::Impl {
     const auto cache_commit = request->runner_request.Commit();
     request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
     request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
+    request->result.cache_disk_write_bytes = cache_commit.disk_write_bytes;
+    request->result.cache_disk_write_ms = cache_commit.disk_write_ms;
     PublishTerminal(request);
   }
 
@@ -403,6 +405,8 @@ struct TextGenerationScheduler::Impl {
             request->runner_request.cache_restore_bytes();
         request->result.cache_restore_ms =
             request->runner_request.cache_restore_ms();
+        request->result.cache_disk_hit =
+            request->runner_request.cache_disk_hit();
         request->result.incremental_prefill_supported =
             incremental_prefill_supported;
         request->result.queue_ms = std::chrono::duration<double, std::milli>(

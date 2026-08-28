@@ -116,6 +116,7 @@ public:
     std::size_t cached_prompt_tokens{0};
     std::size_t cache_restore_bytes{0};
     std::size_t cache_snapshot_bytes{0};
+    std::size_t cache_disk_write_bytes{0};
     std::size_t cache_shared_bytes{0};
     std::size_t completion_tokens{0};
     std::size_t draft_tokens{0};
@@ -135,6 +136,7 @@ public:
     double queue_ms{0.0};
     double cache_restore_ms{0.0};
     double cache_snapshot_ms{0.0};
+    double cache_disk_write_ms{0.0};
     double ttft_ms{0.0};
     double mean_inter_token_ms{0.0};
     double max_inter_token_ms{0.0};
@@ -146,6 +148,7 @@ public:
     FinishReason finish_reason{FinishReason::kStop};
     bool incremental_prefill_supported{false};
     bool cache_hit{false};
+    bool cache_disk_hit{false};
     bool cancelled{false};
   };
 

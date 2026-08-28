@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <string>
@@ -41,6 +42,15 @@ struct TextSpeculativeConfig {
   TextDraftPolicy draft_policy{TextDraftPolicy::kRollingAcceptance};
 };
 
+struct TextDiskCacheConfig {
+  std::filesystem::path directory;
+  std::size_t capacity_bytes{static_cast<std::size_t>(4) * 1024U * 1024U *
+                             1024U};
+  std::size_t staging_capacity_bytes{static_cast<std::size_t>(256) * 1024U *
+                                     1024U};
+  std::string model_artifact_fingerprint;
+};
+
 /// Thread-safe HTTP inference facade over shared immutable GPU model resources
 /// and a bounded pool of request-owned executor sessions.
 class InferenceBackend final : public TextGenerationBackend {
@@ -58,7 +68,8 @@ public:
             std::uint32_t max_context = 4096, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
-            const TextSpeculativeConfig& speculative_config = {});
+            const TextSpeculativeConfig& speculative_config = {},
+            const TextDiskCacheConfig& disk_cache_config = {});
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.
@@ -66,14 +77,16 @@ public:
             std::uint32_t max_context = 4096, std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
-            TextSpeculativeConfig speculative_config = {});
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {});
 
   /// Installs a previously loaded DeepSeek model with request-owned sessions.
   bool load(std::shared_ptr<models::deepseek_v4_flash::Model> model,
             std::string* error, std::uint32_t max_context = 4096,
             std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
-            TextSchedulerPolicy scheduler_policy = {});
+            TextSchedulerPolicy scheduler_policy = {},
+            TextDiskCacheConfig disk_cache_config = {});
 #endif
 
   /// Stable model identifier used in API responses.

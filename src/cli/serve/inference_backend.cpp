@@ -15,6 +15,7 @@
 
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -39,6 +40,42 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
+constexpr std::string_view kDeepSeekStateAbi =
+    "deepseek-v4-flash-gfx1151-state-v1";
+
+bool DiskCacheEnabled(const TextDiskCacheConfig& config) noexcept {
+  return !config.directory.empty();
+}
+
+bool IsSha256Hex(std::string_view value) noexcept {
+  return value.size() == 64 && std::ranges::all_of(value, [](char character) {
+           return (character >= '0' && character <= '9') ||
+                  (character >= 'a' && character <= 'f');
+         });
+}
+
+std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::uint32_t max_context) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "DeepSeek disk cache requires a SHA-256 artifact fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v1\n"
+           << "model_kind=deepseek4\n"
+           << "artifact_sha256=" << artifact_fingerprint << '\n'
+           << "tokenizer=joyai-byte-bpe-v1\n"
+           << "chat_template=gufo-deepseek-tools-v1\n"
+           << "state_abi=" << kDeepSeekStateAbi << '\n'
+           << "payload_layout=ds4-rocm-v2-f32-live-prefix-fp16-mirror\n"
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "rope_window_policy=deepseek4-compiled-v1\n"
+           << "adapters=none\n";
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
 std::uint64_t ClientLabel(std::string_view client_id) noexcept {
   constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
   constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -68,9 +105,12 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
        << (result.prompt_tokens - result.cached_prompt_tokens)
        << ",\"cache_restore_bytes\":" << result.cache_restore_bytes
        << ",\"cache_snapshot_bytes\":" << result.cache_snapshot_bytes
+       << ",\"cache_disk_write_bytes\":" << result.cache_disk_write_bytes
        << ",\"cache_shared_bytes\":" << result.cache_shared_bytes
        << ",\"cache_restore_ms\":" << result.cache_restore_ms
        << ",\"cache_snapshot_ms\":" << result.cache_snapshot_ms
+       << ",\"cache_disk_write_ms\":" << result.cache_disk_write_ms
+       << ",\"cache_disk_hit\":" << (result.cache_disk_hit ? "true" : "false")
        << ",\"prefill_tokens\":" << result.prefill_tokens
        << ",\"prefill_chunks\":" << result.prefill_chunks
        << ",\"active_decode_prefill_chunks\":"
@@ -438,6 +478,7 @@ public:
                 .multi_token_decode = speculative_enabled,
                 .prefix_reuse = true,
             },
+        .persistence = std::nullopt,
     };
   }
 
@@ -907,13 +948,22 @@ const DeepSeekTextRunnerState& RequireDeepSeekState(
 class DeepSeekTextRunner final : public TextModelRunner {
 public:
   DeepSeekTextRunner(std::shared_ptr<models::deepseek_v4_flash::Model> model,
-                     std::uint32_t max_context)
-      : model_(std::move(model)), max_context_(max_context) {}
+                     std::uint32_t max_context,
+                     std::string artifact_fingerprint = {})
+      : model_(std::move(model)), max_context_(max_context) {
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity =
+              DeepSeekCompatibilityIdentity(artifact_fingerprint, max_context_),
+          .payload_version = DS4_SESSION_PAYLOAD_VERSION,
+      };
+    }
+  }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
         .model_id = model_->ModelName(),
-        .state_abi = "deepseek-v4-flash-gfx1151-state-v1",
+        .state_abi = std::string(kDeepSeekStateAbi),
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
@@ -923,6 +973,7 @@ public:
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
             },
+        .persistence = persistence_,
     };
   }
 
@@ -1125,9 +1176,57 @@ public:
     restored.set_position(deepseek_snapshot->position);
   }
 
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    const auto* deepseek_snapshot =
+        dynamic_cast<const DeepSeekTextRunnerSnapshot*>(&snapshot);
+    if (deepseek_snapshot == nullptr ||
+        deepseek_snapshot->model.get() != model_.get() ||
+        deepseek_snapshot->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "DeepSeek persistent snapshot does not belong to this model");
+    }
+    return deepseek_snapshot->PayloadBytes();
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto* deepseek_snapshot =
+        dynamic_cast<const DeepSeekTextRunnerSnapshot*>(&snapshot);
+    if (deepseek_snapshot == nullptr ||
+        deepseek_snapshot->model.get() != model_.get() ||
+        deepseek_snapshot->snapshot == nullptr ||
+        destination.size() != deepseek_snapshot->PayloadBytes() ||
+        !deepseek_snapshot->snapshot->CopyTo(destination)) {
+      throw std::invalid_argument(
+          "DeepSeek persistent snapshot serialization failed");
+    }
+    return destination.size();
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& restored = RequireDeepSeekState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(payload, &error)) {
+      throw std::runtime_error("DeepSeek persistent snapshot restore failed: " +
+                               error);
+    }
+    const int position = restored.session().Position();
+    if (position <= 0 || static_cast<std::uint64_t>(position) > max_context_) {
+      restored.session().Invalidate();
+      throw std::runtime_error(
+          "DeepSeek persistent snapshot restored an invalid position");
+    }
+    restored.set_position(static_cast<std::size_t>(position));
+  }
+
 private:
   std::shared_ptr<models::deepseek_v4_flash::Model> model_;
   std::uint32_t max_context_;
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
 #endif
@@ -1230,8 +1329,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             std::size_t session_count,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
-                            const TextSpeculativeConfig& speculative_config) {
+                            const TextSpeculativeConfig& speculative_config,
+                            const TextDiskCacheConfig& disk_cache_config) {
 #if defined(ENGINE_ENABLE_HIP)
+  TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
   auto reader_owner = core::GgufReader::OpenFile(model_path, &load_error);
   if (reader_owner == nullptr) {
@@ -1257,8 +1358,20 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       SetError(error, "Failed to create DeepSeek model: " + load_error);
       return false;
     }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        resolved_disk_cache_config.model_artifact_fingerprint.empty()) {
+      try {
+        resolved_disk_cache_config.model_artifact_fingerprint =
+            crypto::Sha256FileHex(model_path);
+      } catch (const std::exception& exception) {
+        SetError(error, std::string("Failed to fingerprint DeepSeek GGUF: ") +
+                            exception.what());
+        return false;
+      }
+    }
     return load(std::move(model), error, max_context, session_count,
-                prefill_policy, scheduler_policy);
+                prefill_policy, scheduler_policy,
+                std::move(resolved_disk_cache_config));
   }
   auto model = hip::QwenGpuModel::CreateFromGguf(reader, &load_error);
   if (model == nullptr) {
@@ -1266,7 +1379,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   return load(std::move(model), error, max_context, session_count,
-              prefill_policy, scheduler_policy, speculative_config);
+              prefill_policy, scheduler_policy, speculative_config,
+              std::move(resolved_disk_cache_config));
 #else
   (void)model_path;
   (void)max_context;
@@ -1274,6 +1388,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)prefill_policy;
   (void)scheduler_policy;
   (void)speculative_config;
+  (void)disk_cache_config;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -1285,13 +1400,20 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
                             std::size_t session_count,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
-                            TextSpeculativeConfig speculative_config) {
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen GPU model must not be null");
     return false;
   }
   if (session_count == 0) {
     SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config)) {
+    SetError(error,
+             "Persistent disk continuation caching is not yet supported for "
+             "Qwen");
     return false;
   }
   if (speculative_config.max_draft_tokens == 0 ||
@@ -1378,7 +1500,8 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
 bool InferenceBackend::load(
     std::shared_ptr<models::deepseek_v4_flash::Model> model, std::string* error,
     std::uint32_t max_context, std::size_t session_count,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy) {
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextDiskCacheConfig disk_cache_config) {
   if (model == nullptr) {
     SetError(error, "DeepSeek model must not be null");
     return false;
@@ -1391,14 +1514,30 @@ bool InferenceBackend::load(
     SetError(error, "HTTP context exceeds the loaded DeepSeek model context");
     return false;
   }
+  if (DiskCacheEnabled(disk_cache_config) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       disk_cache_config.capacity_bytes == 0 ||
+       disk_cache_config.staging_capacity_bytes == 0)) {
+    SetError(error, "DeepSeek persistent disk cache configuration is invalid");
+    return false;
+  }
 
   try {
     auto new_state = std::make_shared<Impl::State>();
-    auto runner =
-        std::make_shared<DeepSeekTextRunner>(std::move(model), max_context);
+    auto runner = std::make_shared<DeepSeekTextRunner>(
+        std::move(model), max_context,
+        disk_cache_config.model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
-    auto runner_pool =
-        std::make_shared<TextRunnerPool>(std::move(runner), session_count);
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (DiskCacheEnabled(disk_cache_config)) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::move(runner_disk_cache));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

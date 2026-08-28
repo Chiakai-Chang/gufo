@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <utility>
 
+#include "src/cli/serve/continuation_disk_store.hpp"
+
 namespace gufo::server {
 namespace {
 
@@ -58,6 +60,20 @@ ValidatedRunner ValidateRunner(std::shared_ptr<TextModelRunner> runner,
   if (descriptor.capabilities.fork && !descriptor.capabilities.snapshot) {
     throw std::invalid_argument(
         "text runner fork capability requires snapshot support");
+  }
+  if (descriptor.persistence.has_value()) {
+    if (!descriptor.capabilities.snapshot || !descriptor.capabilities.fork) {
+      throw std::invalid_argument(
+          "text runner persistence requires snapshot and fork support");
+    }
+    if (descriptor.persistence->compatibility_identity.empty()) {
+      throw std::invalid_argument(
+          "text runner persistence identity must not be empty");
+    }
+    if (descriptor.persistence->payload_version == 0) {
+      throw std::invalid_argument(
+          "text runner persistence payload version must be nonzero");
+    }
   }
 
   auto resources = runner->ResourceClaim();
@@ -177,6 +193,77 @@ void EmitSnapshotEvent(const SnapshotEvent& event) noexcept {
   }
 }
 
+std::string_view DiskEventActionName(
+    ContinuationDiskEventAction action) noexcept {
+  switch (action) {
+    case ContinuationDiskEventAction::kStored:
+      return "stored";
+    case ContinuationDiskEventAction::kRestored:
+      return "restored";
+    case ContinuationDiskEventAction::kMiss:
+      return "miss";
+    case ContinuationDiskEventAction::kRemoved:
+      return "removed";
+    case ContinuationDiskEventAction::kSkipped:
+      return "skipped";
+  }
+  return "unknown";
+}
+
+std::string_view DiskEventReasonName(
+    ContinuationDiskEventReason reason) noexcept {
+  switch (reason) {
+    case ContinuationDiskEventReason::kSaved:
+      return "saved";
+    case ContinuationDiskEventReason::kHit:
+      return "hit";
+    case ContinuationDiskEventReason::kNotFound:
+      return "not_found";
+    case ContinuationDiskEventReason::kUnsupported:
+      return "unsupported";
+    case ContinuationDiskEventReason::kByteCapacity:
+      return "byte_capacity";
+    case ContinuationDiskEventReason::kStagingCapacity:
+      return "staging_capacity";
+    case ContinuationDiskEventReason::kLru:
+      return "lru";
+    case ContinuationDiskEventReason::kExactReplacement:
+      return "exact_replacement";
+    case ContinuationDiskEventReason::kCorrupt:
+      return "corrupt";
+    case ContinuationDiskEventReason::kChecksumMismatch:
+      return "checksum_mismatch";
+    case ContinuationDiskEventReason::kUnsafeFile:
+      return "unsafe_file";
+    case ContinuationDiskEventReason::kIoFailure:
+      return "io_failure";
+    case ContinuationDiskEventReason::kSerializationFailure:
+      return "serialization_failure";
+    case ContinuationDiskEventReason::kRestoreFailure:
+      return "restore_failure";
+  }
+  return "unknown";
+}
+
+void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
+  try {
+    std::ostringstream line;
+    line << "{\"event\":\"continuation_disk_cache\",\"action\":\""
+         << DiskEventActionName(event.action) << "\",\"reason\":\""
+         << DiskEventReasonName(event.reason)
+         << "\",\"file_bytes\":" << event.file_bytes
+         << ",\"payload_bytes\":" << event.payload_bytes
+         << ",\"token_count\":" << event.token_count
+         << ",\"retained_bytes\":" << event.retained_bytes
+         << ",\"capacity_bytes\":" << event.capacity_bytes << "}";
+    static std::mutex output_mutex;
+    const std::lock_guard<std::mutex> lock(output_mutex);
+    std::clog << line.str() << '\n';
+  } catch (...) {
+    return;
+  }
+}
+
 ContinuationCache::SnapshotSupport MakeSnapshotSupport(
     ValidatedRunner* validated) {
   if (validated == nullptr || !validated->descriptor.capabilities.snapshot ||
@@ -260,8 +347,24 @@ void TextModelRunner::RestoreOrFork(TextRunnerState&,
   throw std::logic_error("text runner does not support snapshot restore/fork");
 }
 
+std::size_t TextModelRunner::PersistentSnapshotPayloadBytes(
+    const TextRunnerSnapshot&) const {
+  throw std::logic_error("text runner does not support persistent snapshots");
+}
+
+std::size_t TextModelRunner::SerializePersistentSnapshot(
+    const TextRunnerSnapshot&, std::span<std::uint8_t>) const {
+  throw std::logic_error("text runner does not support persistent snapshots");
+}
+
+void TextModelRunner::RestorePersistentSnapshot(
+    TextRunnerState&, std::span<const std::uint8_t>) const {
+  throw std::logic_error("text runner does not support persistent snapshots");
+}
+
 struct TextRunnerPool::Impl {
-  Impl(std::shared_ptr<TextModelRunner> model_runner, std::size_t state_count)
+  Impl(std::shared_ptr<TextModelRunner> model_runner, std::size_t state_count,
+       std::optional<TextRunnerDiskCacheOptions> disk_cache_options)
       : validated(ValidateRunner(std::move(model_runner), state_count)),
         cache(
             state_count,
@@ -274,18 +377,36 @@ struct TextRunnerPool::Impl {
               ReconcileStateBytes(validated.resources, *state);
               return state;
             },
-            MakeSnapshotSupport(&validated)) {}
+            MakeSnapshotSupport(&validated)) {
+    if (disk_cache_options.has_value()) {
+      if (!validated.descriptor.persistence.has_value()) {
+        throw std::invalid_argument(
+            "text runner does not support persistent snapshots");
+      }
+      disk_store = std::make_shared<ContinuationDiskStore>(
+          ContinuationDiskStoreOptions{
+              .directory = std::move(disk_cache_options->directory),
+              .capacity_bytes = disk_cache_options->capacity_bytes,
+              .staging_capacity_bytes =
+                  disk_cache_options->staging_capacity_bytes,
+          },
+          EmitDiskEvent);
+    }
+  }
 
   ValidatedRunner validated;
   ContinuationCache cache;
+  std::shared_ptr<ContinuationDiskStore> disk_store;
 };
 
 struct TextRunnerPool::Request::Impl {
   Impl(std::shared_ptr<TextModelRunner> model_runner,
+       std::shared_ptr<ContinuationDiskStore> persistent_store,
        ContinuationCache::Lease state_lease,
        std::vector<TextRunnerToken> prompt_tokens,
        const CancellationCheck& is_cancelled)
       : runner(std::move(model_runner)),
+        disk_store(std::move(persistent_store)),
         lease(std::move(state_lease)),
         prompt(std::move(prompt_tokens)),
         prefill_offset(lease.cached_tokens()),
@@ -301,6 +422,7 @@ struct TextRunnerPool::Request::Impl {
   }
 
   std::shared_ptr<TextModelRunner> runner;
+  std::shared_ptr<ContinuationDiskStore> disk_store;
   ContinuationCache::Lease lease;
   std::vector<TextRunnerToken> prompt;
   std::vector<TextRunnerToken> generated;
@@ -341,6 +463,10 @@ std::size_t TextRunnerPool::Request::cache_restore_bytes() const noexcept {
 
 double TextRunnerPool::Request::cache_restore_ms() const noexcept {
   return impl_ != nullptr ? impl_->lease.restore_ms() : 0.0;
+}
+
+bool TextRunnerPool::Request::cache_disk_hit() const noexcept {
+  return impl_ != nullptr && impl_->lease.restored_from_disk();
 }
 
 std::size_t TextRunnerPool::Request::prompt_tokens() const noexcept {
@@ -505,7 +631,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
         "text runner checkpoint is outside executed token history");
   }
   checkpoint.resize(position);
-  std::unique_ptr<ContinuationSnapshot> snapshot;
+  std::unique_ptr<TextRunnerSnapshot> snapshot;
   CommitMetrics metrics;
   const auto capabilities = impl_->runner->Descriptor().capabilities;
   if (capabilities.snapshot && capabilities.fork) {
@@ -519,7 +645,9 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
       impl_.reset();
       return metrics;
     }
-    if (!impl_->lease.TryReserveSnapshot(snapshot_bytes, checkpoint.size())) {
+    const bool retain_snapshot =
+        impl_->lease.TryReserveSnapshot(snapshot_bytes, checkpoint.size());
+    if (!retain_snapshot && impl_->disk_store == nullptr) {
       impl_->lease.Commit(std::move(checkpoint));
       impl_.reset();
       return metrics;
@@ -537,18 +665,38 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
           std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - snapshot_start)
               .count();
-      impl_->lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure,
-                                snapshot_bytes, checkpoint.size());
+      if (retain_snapshot) {
+        impl_->lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure,
+                                  snapshot_bytes, checkpoint.size());
+      }
       impl_->lease.Commit(std::move(checkpoint));
       impl_.reset();
       return metrics;
     }
     if (snapshot == nullptr) {
-      impl_->lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure,
-                                snapshot_bytes, checkpoint.size());
+      if (retain_snapshot) {
+        impl_->lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure,
+                                  snapshot_bytes, checkpoint.size());
+      }
       impl_->lease.Commit(std::move(checkpoint));
       impl_.reset();
       return metrics;
+    }
+    if (impl_->disk_store != nullptr) {
+      const auto disk_start = std::chrono::steady_clock::now();
+      try {
+        const auto saved =
+            impl_->disk_store->Save(*impl_->runner, checkpoint, *snapshot);
+        metrics.disk_write_bytes = saved.file_bytes;
+      } catch (...) {
+        metrics.disk_write_bytes = 0;
+      }
+      metrics.disk_write_ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - disk_start)
+                                  .count();
+    }
+    if (!retain_snapshot) {
+      snapshot.reset();
     }
   }
   metrics.snapshot_bytes =
@@ -566,9 +714,11 @@ void TextRunnerPool::Request::Invalidate() noexcept {
   }
 }
 
-TextRunnerPool::TextRunnerPool(std::shared_ptr<TextModelRunner> runner,
-                               std::size_t state_count)
-    : impl_(std::make_unique<Impl>(std::move(runner), state_count)) {}
+TextRunnerPool::TextRunnerPool(
+    std::shared_ptr<TextModelRunner> runner, std::size_t state_count,
+    std::optional<TextRunnerDiskCacheOptions> disk_cache)
+    : impl_(std::make_unique<Impl>(std::move(runner), state_count,
+                                   std::move(disk_cache))) {}
 
 TextRunnerPool::~TextRunnerPool() = default;
 
@@ -675,9 +825,27 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   if (!lease) {
     return {};
   }
-  return Request(
-      std::make_unique<Request::Impl>(impl_->validated.runner, std::move(lease),
-                                      std::move(prompt), is_cancelled));
+  if (!lease.cache_hit() && impl_->disk_store != nullptr &&
+      !(is_cancelled && is_cancelled())) {
+    const auto restore_start = std::chrono::steady_clock::now();
+    try {
+      const auto restored = impl_->disk_store->RestoreLongestPrefix(
+          *impl_->validated.runner,
+          dynamic_cast<TextRunnerState&>(lease.state()), prompt);
+      if (restored.restored) {
+        lease.AdoptRestoredPrefix(
+            restored.token_count, restored.file_bytes,
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - restore_start)
+                .count());
+      }
+    } catch (...) {
+      lease.state().Invalidate();
+    }
+  }
+  return Request(std::make_unique<Request::Impl>(
+      impl_->validated.runner, impl_->disk_store, std::move(lease),
+      std::move(prompt), is_cancelled));
 }
 
 }  // namespace gufo::server

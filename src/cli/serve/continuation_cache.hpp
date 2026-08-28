@@ -111,6 +111,13 @@ public:
       return restored_snapshot_bytes_;
     }
     [[nodiscard]] double restore_ms() const noexcept { return restore_ms_; }
+    [[nodiscard]] bool restored_from_disk() const noexcept {
+      return restored_from_disk_;
+    }
+
+    /// Records a successful restore performed by an optional lower cache tier.
+    void AdoptRestoredPrefix(std::size_t cached_tokens,
+                             std::size_t restored_bytes, double restore_ms);
 
     /// Reserves aggregate retained-snapshot capacity before model allocation.
     ///
@@ -148,6 +155,7 @@ public:
     std::size_t source_index_{0};
     std::size_t restored_snapshot_bytes_{0};
     double restore_ms_{0.0};
+    bool restored_from_disk_{false};
     std::size_t reserved_snapshot_bytes_{0};
   };
 
