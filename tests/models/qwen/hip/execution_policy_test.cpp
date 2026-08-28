@@ -67,6 +67,21 @@ static_assert(
 
 // --- 1. Fusion-toggle routing values (gufo::hip::detail, host constexpr) ---
 void TestFusionToggleValues() {
+  Check(gufo::hip::QwenExecutionPolicy::Production().kv_cache_storage ==
+        gufo::hip::QwenKvCacheStorage::kFp16);
+  Check(gufo::hip::ResolveQwenKvCacheStorage(nullptr) ==
+        gufo::hip::QwenKvCacheStorage::kFp16);
+  Check(gufo::hip::ResolveQwenKvCacheStorage("fp16") ==
+        gufo::hip::QwenKvCacheStorage::kFp16);
+  Check(gufo::hip::ResolveQwenKvCacheStorage("half") ==
+        gufo::hip::QwenKvCacheStorage::kFp16);
+  Check(gufo::hip::ResolveQwenKvCacheStorage("fp32") ==
+        gufo::hip::QwenKvCacheStorage::kFp32);
+  Check(gufo::hip::ResolveQwenKvCacheStorage("float") ==
+        gufo::hip::QwenKvCacheStorage::kFp32);
+  Check(gufo::hip::ResolveQwenKvCacheStorage("invalid") ==
+        gufo::hip::QwenKvCacheStorage::kFp16);
+
   // Q/K norm + RoPE + KV write: ENABLED -> decode uses the fused kernel.
   Check(gufo::hip::detail::ShouldFuseQKNormRoPEKvWrite() == true);
 
@@ -85,7 +100,13 @@ void TestFusionToggleValues() {
   Check(gufo::hip::detail::ShouldFuseDecodeSSMOutputResidual(candidate));
   Check(gufo::hip::detail::ShouldPrefetchNextLayer(candidate));
   Check(candidate.Fingerprint() ==
-        ((1ULL << 0U) | (1ULL << 4U) | (1ULL << 7U)));
+        ((1ULL << 0U) | (1ULL << 4U) | (1ULL << 7U) | (1ULL << 8U)));
+
+  auto fp32_fallback = candidate;
+  fp32_fallback.kv_cache_storage = gufo::hip::QwenKvCacheStorage::kFp32;
+  Check(!fp32_fallback.UsesFp16AttentionKv());
+  Check(fp32_fallback.Fingerprint() ==
+        (candidate.Fingerprint() & ~(1ULL << 8U)));
 
   const auto decode_plan = gufo::hip::ResolveQwenLayerRoute(
       candidate, gufo::hip::QwenExecutionMode::kDecode, false);

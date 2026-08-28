@@ -64,7 +64,8 @@ QwenGpuSnapshot::~QwenGpuSnapshot() {
 }
 
 QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
-    const core::ModelConfig& config, std::uint32_t max_context) {
+    const core::ModelConfig& config, std::uint32_t max_context,
+    QwenExecutionPolicy policy) {
   const std::size_t context = std::max(max_context, 1U);
   const std::size_t batch = std::min<std::size_t>(context, kMaxPromptBatch);
   const std::size_t hidden = config.hidden_size;
@@ -150,8 +151,10 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
       CheckedMultiply(CheckedMultiply(config.FullAttentionLayerCount(), kv),
                       context),
       1);
-  AddAllocation(CheckedMultiply(total_kv, 2), sizeof(float), &state);
-  AddAllocation(CheckedMultiply(total_kv, 2), sizeof(std::uint16_t), &state);
+  AddAllocation(
+      CheckedMultiply(total_kv, 2),
+      policy.UsesFp16AttentionKv() ? sizeof(std::uint16_t) : sizeof(float),
+      &state);
 
   const std::size_t total_conv = CheckedMultiply(
       CheckedMultiply(config.num_layers, ssm_qkv), config.ssm_conv_kernel);
@@ -165,7 +168,7 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
 }
 
 QwenGpuMemoryUsage QwenGpuArena::GetMemoryUsage() const {
-  return EstimateMemoryUsage(config_, max_context_);
+  return EstimateMemoryUsage(config_, max_context_, policy_);
 }
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
@@ -179,6 +182,7 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   snapshot->kv_width_ = config_.num_key_value_heads * config_.head_dim;
   snapshot->max_context_ = max_context_;
   snapshot->valid_context_ = valid_context;
+  snapshot->kv_storage_ = policy_.kv_cache_storage;
   snapshot->kv_elements_per_plane_ = CheckedMultiply(
       CheckedMultiply(snapshot->attention_layers_, max_context_),
       snapshot->kv_width_);
@@ -200,16 +204,19 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
       CheckedMultiply(snapshot->conv_elements_, sizeof(float));
   const std::size_t deltanet_bytes =
       CheckedMultiply(snapshot->deltanet_elements_, sizeof(float));
-  CheckedAdd(kv_f32_bytes, &snapshot->payload_bytes_);
-  CheckedAdd(kv_f16_bytes, &snapshot->payload_bytes_);
+  CheckedAdd(policy_.UsesFp16AttentionKv() ? kv_f16_bytes : kv_f32_bytes,
+             &snapshot->payload_bytes_);
   CheckedAdd(conv_bytes, &snapshot->payload_bytes_);
   CheckedAdd(deltanet_bytes, &snapshot->payload_bytes_);
 
   if (kv_f32_bytes != 0) {
-    ThrowOnHipError(hipMalloc(&snapshot->d_kv_f32_, kv_f32_bytes),
-                    "failed to allocate Qwen FP32 snapshot KV");
-    ThrowOnHipError(hipMalloc(&snapshot->d_kv_f16_, kv_f16_bytes),
-                    "failed to allocate Qwen FP16 snapshot KV");
+    if (policy_.UsesFp16AttentionKv()) {
+      ThrowOnHipError(hipMalloc(&snapshot->d_kv_f16_, kv_f16_bytes),
+                      "failed to allocate Qwen FP16 snapshot KV");
+    } else {
+      ThrowOnHipError(hipMalloc(&snapshot->d_kv_f32_, kv_f32_bytes),
+                      "failed to allocate Qwen FP32 snapshot KV");
+    }
   }
   ThrowOnHipError(hipMalloc(&snapshot->d_ssm_conv_, conv_bytes),
                   "failed to allocate Qwen convolution snapshot");
@@ -217,14 +224,17 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
                   "failed to allocate Qwen DeltaNet snapshot");
 
   if (kv_f32_bytes != 0) {
-    ThrowOnHipError(
-        hipMemcpyAsync(snapshot->d_kv_f32_, d_kv_cache, kv_f32_bytes,
-                       hipMemcpyDeviceToDevice, stream),
-        "failed to capture Qwen FP32 KV snapshot");
-    ThrowOnHipError(
-        hipMemcpyAsync(snapshot->d_kv_f16_, d_attention_kv_f16, kv_f16_bytes,
-                       hipMemcpyDeviceToDevice, stream),
-        "failed to capture Qwen FP16 KV snapshot");
+    if (policy_.UsesFp16AttentionKv()) {
+      ThrowOnHipError(
+          hipMemcpyAsync(snapshot->d_kv_f16_, d_attention_kv_f16, kv_f16_bytes,
+                         hipMemcpyDeviceToDevice, stream),
+          "failed to capture Qwen FP16 KV snapshot");
+    } else {
+      ThrowOnHipError(
+          hipMemcpyAsync(snapshot->d_kv_f32_, d_kv_cache, kv_f32_bytes,
+                         hipMemcpyDeviceToDevice, stream),
+          "failed to capture Qwen FP32 KV snapshot");
+    }
   }
   ThrowOnHipError(hipMemcpyAsync(snapshot->d_ssm_conv_, d_ssm_conv_state,
                                  conv_bytes, hipMemcpyDeviceToDevice, stream),
@@ -252,6 +262,7 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
   if (snapshot.valid_context_ > max_context_ ||
       snapshot.attention_layers_ != attention_layers ||
       snapshot.kv_width_ != kv_width || snapshot.max_context_ != max_context_ ||
+      snapshot.kv_storage_ != policy_.kv_cache_storage ||
       snapshot.conv_elements_ != conv_elements ||
       snapshot.deltanet_elements_ != deltanet_elements) {
     throw std::invalid_argument("Qwen snapshot is incompatible with the arena");
@@ -264,13 +275,17 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
       CheckedMultiply(CheckedMultiply(snapshot.kv_elements_per_plane_, 2),
                       sizeof(std::uint16_t));
   if (kv_f32_bytes != 0) {
-    ThrowOnHipError(hipMemcpyAsync(d_kv_cache, snapshot.d_kv_f32_, kv_f32_bytes,
-                                   hipMemcpyDeviceToDevice, stream),
-                    "failed to restore Qwen FP32 KV snapshot");
-    ThrowOnHipError(
-        hipMemcpyAsync(d_attention_kv_f16, snapshot.d_kv_f16_, kv_f16_bytes,
-                       hipMemcpyDeviceToDevice, stream),
-        "failed to restore Qwen FP16 KV snapshot");
+    if (policy_.UsesFp16AttentionKv()) {
+      ThrowOnHipError(
+          hipMemcpyAsync(d_attention_kv_f16, snapshot.d_kv_f16_, kv_f16_bytes,
+                         hipMemcpyDeviceToDevice, stream),
+          "failed to restore Qwen FP16 KV snapshot");
+    } else {
+      ThrowOnHipError(
+          hipMemcpyAsync(d_kv_cache, snapshot.d_kv_f32_, kv_f32_bytes,
+                         hipMemcpyDeviceToDevice, stream),
+          "failed to restore Qwen FP32 KV snapshot");
+    }
   }
   ThrowOnHipError(hipMemcpyAsync(d_ssm_conv_state, snapshot.d_ssm_conv_,
                                  snapshot.conv_elements_ * sizeof(float),
@@ -285,10 +300,12 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
 }
 
 QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
-                           std::uint32_t max_context)
+                           std::uint32_t max_context,
+                           QwenExecutionPolicy policy)
     : config_(config),
       max_context_(std::max(max_context, 1U)),
-      max_batch_(std::min(max_context_, kMaxPromptBatch)) {
+      max_batch_(std::min(max_context_, kMaxPromptBatch)),
+      policy_(policy) {
   HIP_CHECK(hipStreamCreate(&stream));
   HIP_CHECK(hipStreamCreate(&prefetch_stream));
   HIP_CHECK(hipEventCreate(&prefetch_event));
@@ -373,9 +390,12 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
 
   const std::size_t total_kv = config_.FullAttentionLayerCount() *
                                num_kv_heads * max_context_ * head_dim;
-  HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
-  HIP_CHECK(
-      hipMalloc(&d_attention_kv_f16, total_kv * sizeof(std::uint16_t) * 2));
+  if (policy_.UsesFp16AttentionKv()) {
+    HIP_CHECK(
+        hipMalloc(&d_attention_kv_f16, total_kv * sizeof(std::uint16_t) * 2));
+  } else {
+    HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
+  }
 
   // Split prefill attention scratch (opt-c165-attn-split). Only the FP16
   // query/prefix planes are per-token; the log-sum-exp planes are tiny.
@@ -501,6 +521,7 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
     : config_(other.config_),
       max_context_(other.max_context_),
       max_batch_(other.max_batch_),
+      policy_(other.policy_),
       target_layer_ids_(std::move(other.target_layer_ids_)) {
   d_hidden = other.d_hidden;
   d_normed = other.d_normed;
@@ -612,6 +633,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     config_ = other.config_;
     max_context_ = other.max_context_;
     max_batch_ = other.max_batch_;
+    policy_ = other.policy_;
     target_layer_ids_ = std::move(other.target_layer_ids_);
     d_hidden = other.d_hidden;
     d_normed = other.d_normed;
@@ -733,6 +755,10 @@ void QwenGpuArena::Reset() noexcept {
 
   if (d_kv_cache != nullptr) {
     HIP_CHECK(hipMemsetAsync(d_kv_cache, 0, total_kv * sizeof(float), stream));
+  }
+  if (d_attention_kv_f16 != nullptr) {
+    HIP_CHECK(hipMemsetAsync(d_attention_kv_f16, 0,
+                             total_kv * sizeof(std::uint16_t), stream));
   }
   if (d_ssm_conv_state != nullptr) {
     HIP_CHECK(hipMemsetAsync(d_ssm_conv_state, 0, total_conv * sizeof(float),

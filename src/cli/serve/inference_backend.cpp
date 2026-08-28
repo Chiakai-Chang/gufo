@@ -43,6 +43,16 @@ void SetError(std::string* error, std::string message) {
 constexpr std::string_view kDeepSeekStateAbi =
     "deepseek-v4-flash-gfx1151-state-v1";
 
+constexpr std::string_view QwenStateAbi(bool speculative,
+                                        bool fp16_attention_kv) noexcept {
+  if (speculative) {
+    return fp16_attention_kv ? "qwen-gfx1151-dflash-state-v3-fp16-kv"
+                             : "qwen-gfx1151-dflash-state-v3-fp32-kv";
+  }
+  return fp16_attention_kv ? "qwen-gfx1151-state-v2-fp16-kv"
+                           : "qwen-gfx1151-state-v2-fp32-kv";
+}
+
 bool DiskCacheEnabled(const TextDiskCacheConfig& config) noexcept {
   return !config.directory.empty();
 }
@@ -164,10 +174,12 @@ public:
   QwenTextRunnerState(
       std::shared_ptr<const hip::QwenGpuModel> model, std::uint32_t max_context,
       std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model,
-      speculative::SpeculativeOptions speculative_options)
+      speculative::SpeculativeOptions speculative_options,
+      hip::QwenExecutionPolicy execution_policy)
       : model_(std::move(model)) {
     std::string error;
-    executor_ = hip::QwenGpuExecutor::Create(model_, &error, max_context);
+    executor_ = hip::QwenGpuExecutor::Create(model_, &error, max_context,
+                                             execution_policy);
     if (executor_ == nullptr) {
       throw std::runtime_error("Failed to create GPU session: " + error);
     }
@@ -460,14 +472,15 @@ public:
       : model_(std::move(model)),
         dflash_model_(std::move(dflash_model)),
         max_context_(max_context),
-        speculative_options_(speculative_options) {}
+        speculative_options_(speculative_options),
+        execution_policy_(hip::QwenExecutionPolicy::Runtime()) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     const bool speculative_enabled = dflash_model_ != nullptr;
     return {
         .model_id = model_->GetConfig().model_name,
-        .state_abi = speculative_enabled ? "qwen-gfx1151-dflash-state-v2"
-                                         : "qwen-gfx1151-state-v1",
+        .state_abi = std::string(QwenStateAbi(
+            speculative_enabled, execution_policy_.UsesFp16AttentionKv())),
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{
@@ -484,7 +497,7 @@ public:
 
   [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
     const auto usage = hip::QwenGpuExecutor::EstimateMemoryUsage(
-        model_->GetConfig(), max_context_);
+        model_->GetConfig(), max_context_, execution_policy_);
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     std::optional<std::size_t> capacity;
@@ -553,7 +566,8 @@ public:
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
     return std::make_unique<QwenTextRunnerState>(
-        model_, max_context_, dflash_model_, speculative_options_);
+        model_, max_context_, dflash_model_, speculative_options_,
+        execution_policy_);
   }
 
   void PreparePrefixReuse(
@@ -760,6 +774,7 @@ private:
   std::shared_ptr<const hip::QwenDFlashGpuModel> dflash_model_;
   std::uint32_t max_context_;
   speculative::SpeculativeOptions speculative_options_;
+  hip::QwenExecutionPolicy execution_policy_;
 };
 
 std::vector<TextRunnerToken> DeepSeekRunnerTokens(std::span<const int> tokens) {

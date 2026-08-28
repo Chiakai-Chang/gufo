@@ -2,8 +2,27 @@
 #define GUFO_MODELS_QWEN_HIP_EXECUTION_POLICY_HPP_
 
 #include <cstdint>
+#include <cstdlib>
+#include <string_view>
 
 namespace gufo::hip {
+
+enum class QwenKvCacheStorage : std::uint8_t {
+  kFp32,
+  kFp16,
+};
+
+[[nodiscard]] inline QwenKvCacheStorage ResolveQwenKvCacheStorage(
+    const char* value) noexcept {
+  if (value == nullptr) {
+    return QwenKvCacheStorage::kFp16;
+  }
+  const std::string_view storage{value};
+  if (storage == "fp32" || storage == "float") {
+    return QwenKvCacheStorage::kFp32;
+  }
+  return QwenKvCacheStorage::kFp16;
+}
 
 /// Immutable route policy for one Qwen GPU executor. Resolve this before HIP
 /// graph capture and create a separate executor for each A/B candidate.
@@ -21,9 +40,21 @@ struct QwenExecutionPolicy {
   bool fuse_prefill_ssm_post_norm_gate{false};
   bool fuse_decode_rmsnorm_projection{false};
   bool prefetch_next_layer{false};
+  QwenKvCacheStorage kv_cache_storage{QwenKvCacheStorage::kFp16};
 
   [[nodiscard]] static constexpr QwenExecutionPolicy Production() noexcept {
     return {};
+  }
+
+  [[nodiscard]] static QwenExecutionPolicy Runtime() noexcept {
+    auto policy = Production();
+    policy.kv_cache_storage =
+        ResolveQwenKvCacheStorage(std::getenv("GUFO_QWEN_KV_CACHE"));
+    return policy;
+  }
+
+  [[nodiscard]] constexpr bool UsesFp16AttentionKv() const noexcept {
+    return kv_cache_storage == QwenKvCacheStorage::kFp16;
   }
 
   /// Stable bit fingerprint suitable for telemetry and graph-cache identity.
@@ -35,7 +66,8 @@ struct QwenExecutionPolicy {
            (static_cast<std::uint64_t>(fuse_decode_ssm_output_residual) << 4U) |
            (static_cast<std::uint64_t>(fuse_prefill_ssm_post_norm_gate) << 5U) |
            (static_cast<std::uint64_t>(fuse_decode_rmsnorm_projection) << 6U) |
-           (static_cast<std::uint64_t>(prefetch_next_layer) << 7U);
+           (static_cast<std::uint64_t>(prefetch_next_layer) << 7U) |
+           (static_cast<std::uint64_t>(UsesFp16AttentionKv()) << 8U);
   }
 };
 

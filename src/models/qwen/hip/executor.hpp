@@ -118,6 +118,9 @@ public:
   [[nodiscard]] std::uint32_t ValidContext() const noexcept {
     return valid_context_;
   }
+  [[nodiscard]] QwenKvCacheStorage KvStorage() const noexcept {
+    return kv_storage_;
+  }
 
 private:
   QwenGpuSnapshot() = default;
@@ -134,6 +137,7 @@ private:
   std::uint32_t max_context_{0};
   std::uint32_t valid_context_{0};
   std::size_t payload_bytes_{0};
+  QwenKvCacheStorage kv_storage_{QwenKvCacheStorage::kFp32};
 
   friend class QwenGpuArena;
 };
@@ -194,11 +198,18 @@ static_assert(std::is_trivially_copyable_v<QwenGpuScratchView>);
 static_assert(std::is_same_v<decltype(QwenDecodeScratch::sampled_token),
                              std::span<std::uint32_t>>);
 
+template<typename T>
+[[nodiscard]] constexpr T* OffsetIfPresent(T* pointer,
+                                           std::size_t offset) noexcept {
+  return pointer == nullptr ? nullptr : pointer + offset;
+}
+
 /// Preallocated, zero-allocation GPU execution arena on gfx1151.
 class QwenGpuArena {
 public:
-  explicit QwenGpuArena(const core::ModelConfig& config,
-                        std::uint32_t max_context = 4096);
+  explicit QwenGpuArena(
+      const core::ModelConfig& config, std::uint32_t max_context = 4096,
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Runtime());
   ~QwenGpuArena();
 
   QwenGpuArena(const QwenGpuArena&) = delete;
@@ -279,7 +290,8 @@ public:
     return max_context_;
   }
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
-      const core::ModelConfig& config, std::uint32_t max_context);
+      const core::ModelConfig& config, std::uint32_t max_context,
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Runtime());
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
   [[nodiscard]] std::unique_ptr<QwenGpuSnapshot> SaveSnapshot(
       std::uint32_t valid_context);
@@ -302,6 +314,7 @@ private:
   core::ModelConfig config_;
   std::uint32_t max_context_;
   std::uint32_t max_batch_;
+  QwenExecutionPolicy policy_;
   std::vector<std::uint32_t> target_layer_ids_;
   float* d_saved_ssm_conv_state_{nullptr};
   float* d_saved_ssm_deltanet_state_{nullptr};
@@ -322,18 +335,18 @@ public:
   explicit QwenGpuExecutor(
       std::shared_ptr<const QwenGpuModel> model,
       std::uint32_t max_context = 4096,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Runtime());
   ~QwenGpuExecutor();
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> Create(
       std::shared_ptr<const QwenGpuModel> model,
       std::string* error_msg = nullptr, std::uint32_t max_context = 4096,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Runtime());
 
   [[nodiscard]] static std::unique_ptr<QwenGpuExecutor> CreateFromGguf(
       std::shared_ptr<const core::GgufReader> reader,
       std::string* error_msg = nullptr, std::uint32_t max_context = 4096,
-      QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Runtime());
 
   /// Generates tokens auto-regressively on GPU with streaming callback.
   std::vector<tokenization::TokenId> Generate(
@@ -435,8 +448,9 @@ public:
     return arena_.GetMaxContext();
   }
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
-      const core::ModelConfig& config, std::uint32_t max_context) {
-    return QwenGpuArena::EstimateMemoryUsage(config, max_context);
+      const core::ModelConfig& config, std::uint32_t max_context,
+      QwenExecutionPolicy policy = QwenExecutionPolicy::Runtime()) {
+    return QwenGpuArena::EstimateMemoryUsage(config, max_context, policy);
   }
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const {
     return arena_.GetMemoryUsage();

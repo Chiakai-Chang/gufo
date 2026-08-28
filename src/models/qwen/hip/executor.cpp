@@ -71,7 +71,7 @@ QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
       weights_(RequireModel(model_).GetWeights()),
       tokenizer_(&model_->GetTokenizer()),
       policy_(policy),
-      arena_(weights_.config, max_context),
+      arena_(weights_.config, max_context, policy_),
       graph_key_(BuildGraphCaptureKey(weights_, policy_, max_context)),
       h_logits_(weights_.config.vocab_size, 0.0F) {
   detail::EmitQwenExecutionPolicy(policy_.Fingerprint());

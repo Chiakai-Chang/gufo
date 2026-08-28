@@ -331,9 +331,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             arena_.d_q, arena_.d_k, arena_.d_v,
             static_cast<const float*>(layer.attn_q_norm.data),
             static_cast<const float*>(layer.attn_k_norm.data), arena_.d_q,
-            arena_.d_k, arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+            arena_.d_k, arena_.d_kv_cache,
+            OffsetIfPresent(arena_.d_kv_cache, total_k),
             arena_.d_attention_kv_f16,
-            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+            OffsetIfPresent(
+                static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
+                total_k),
             attn_layer_idx, start_pos, batch_size, arena_.GetMaxContext(),
             config.num_attention_heads, config.num_key_value_heads,
             config.head_dim, config.rotary_dim, config.rope_theta, eps,
@@ -377,21 +380,23 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       // that the split path used. Falls through to the previous routes when the
       // shape is unsupported or an alternative is pinned.
       // opt-c180-kv-resync: the fused QK-norm/RoPE kernel above already wrote
-      // this chunk's K and V into *both* the FP32 cache and its FP16 mirror,
-      // and earlier chunks did the same for the prefix, as do all three decode
-      // paths. So the attention launcher's own pack pass rewrites identical
-      // bytes, and its prefix sync re-converts a prefix that already matches --
-      // work that grows linearly with depth. The unfused fallback below only
-      // applies RoPE in place and never touches the cache, so it still needs
-      // the pack.
+      // this chunk's K and V into the selected canonical cache plane. Earlier
+      // chunks and all three decode paths maintain that same plane. The
+      // attention launcher's own pack pass would therefore rewrite identical
+      // bytes, and an FP16 prefix sync would reconvert a prefix that already
+      // matches -- work that grows linearly with depth. The unfused fallback
+      // below only applies RoPE in place and never touches the cache, so it
+      // still needs the pack.
       const bool kv_already_written = fused_qknorm_rope_kv;
       bool wmma_attention = false;
       if (detail::ShouldUseWmmaPrefillAttention()) {
         wmma_attention = LaunchQwenWmmaAttention(
             arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-            arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+            arena_.d_kv_cache, OffsetIfPresent(arena_.d_kv_cache, total_k),
             arena_.d_attention_kv_f16,
-            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+            OffsetIfPresent(
+                static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
+                total_k),
             arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
             arena_.GetMaxContext(), config.num_attention_heads,
             config.num_key_value_heads, config.head_dim, arena_.stream,
@@ -407,18 +412,20 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           detail::ShouldUsePrefillAttentionSplit(start_pos, batch_size)) {
         LaunchConvertQueriesToHalf(arena_.d_q, arena_.d_attn_q_f16,
                                    batch_size * attention_size, arena_.stream);
-        auto* layer_k_f16 =
-            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
-            (static_cast<std::size_t>(attn_layer_idx) * arena_.GetMaxContext() *
-             kv_size);
-        auto* layer_v_f16 = layer_k_f16 + total_k;
+        auto* layer_k_f16 = OffsetIfPresent(
+            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
+            static_cast<std::size_t>(attn_layer_idx) * arena_.GetMaxContext() *
+                kv_size);
+        auto* layer_v_f16 = OffsetIfPresent(layer_k_f16, total_k);
 
         // The tiled launcher owns the KV pack/sync, so run the diagonal first.
         const bool diagonal = LaunchBatchedAttentionTile(
             arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-            arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+            arena_.d_kv_cache, OffsetIfPresent(arena_.d_kv_cache, total_k),
             arena_.d_attention_kv_f16,
-            static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) + total_k,
+            OffsetIfPresent(
+                static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
+                total_k),
             arena_.d_attn_prefix_out, attn_layer_idx, start_pos, batch_size,
             arena_.GetMaxContext(), config.num_attention_heads,
             config.num_key_value_heads, config.head_dim, arena_.stream,
@@ -446,10 +453,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             [&] {
               const bool launched = LaunchBatchedAttentionTile(
                   arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-                  arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+                  arena_.d_kv_cache,
+                  OffsetIfPresent(arena_.d_kv_cache, total_k),
                   arena_.d_attention_kv_f16,
-                  static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
-                      total_k,
+                  OffsetIfPresent(
+                      static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
+                      total_k),
                   arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
                   arena_.GetMaxContext(), config.num_attention_heads,
                   config.num_key_value_heads, config.head_dim, arena_.stream);
@@ -461,10 +470,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             [&] {
               const bool launched = LaunchBatchedAttentionCk(
                   arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-                  arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+                  arena_.d_kv_cache,
+                  OffsetIfPresent(arena_.d_kv_cache, total_k),
                   arena_.d_attention_kv_f16,
-                  static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
-                      total_k,
+                  OffsetIfPresent(
+                      static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
+                      total_k),
                   arena_.d_scratch_bf16, arena_.d_ssm_out, attn_layer_idx,
                   start_pos, batch_size, arena_.GetMaxContext(),
                   config.num_attention_heads, config.num_key_value_heads,
@@ -479,10 +490,12 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
               selected_attention = SelectedAttention::kBaseline;
               LaunchBatchedAttention(
                   arena_.d_q, arena_.d_k, arena_.d_v, arena_.d_ssm_gate,
-                  arena_.d_kv_cache, arena_.d_kv_cache + total_k,
+                  arena_.d_kv_cache,
+                  OffsetIfPresent(arena_.d_kv_cache, total_k),
                   arena_.d_attention_kv_f16,
-                  static_cast<std::uint16_t*>(arena_.d_attention_kv_f16) +
-                      total_k,
+                  OffsetIfPresent(
+                      static_cast<std::uint16_t*>(arena_.d_attention_kv_f16),
+                      total_k),
                   arena_.d_ssm_out, attn_layer_idx, start_pos, batch_size,
                   arena_.GetMaxContext(), config.num_attention_heads,
                   config.num_key_value_heads, config.head_dim, arena_.stream,
