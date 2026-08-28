@@ -12,6 +12,7 @@
 
 #include "src/core/sampling.hpp"
 #include "src/core/speculative/draft_backend.hpp"
+#include "src/core/speculative/draft_policy.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -793,6 +794,24 @@ void TestPersistentVerifierSnapshotRoundTrip() {
 
 }  // namespace
 
+void TestDraftPolicyResolution() {
+  using gufo::speculative::ResolveDraftPolicy;
+  // `auto` follows the measured best per backend: DFlash-2 verification batches
+  // cost about one decode step at every width, so the block maximum wins, while
+  // other backends keep the rolling controller.
+  Expect(ResolveDraftPolicy("auto", true) == "fixed",
+         "auto resolves to fixed for a block-diffusion draft");
+  Expect(ResolveDraftPolicy("auto", false) == "rolling",
+         "auto resolves to rolling for other backends");
+  // An explicit request always wins over the default.
+  Expect(ResolveDraftPolicy("rolling", true) == "rolling",
+         "explicit rolling survives resolution");
+  Expect(ResolveDraftPolicy("accepted-ema", true) == "accepted-ema",
+         "explicit accepted-ema survives resolution");
+  Expect(ResolveDraftPolicy("fixed", false) == "fixed",
+         "explicit fixed survives resolution");
+}
+
 int main() {
   TestSpeculativeDraftBackendInterface();
   TestSpeculativeStats();
@@ -806,6 +825,7 @@ int main() {
   TestFirstPrefillEosIsNotEmitted();
   TestSampledSpeculationMatchesTargetDistribution();
   TestPersistentVerifierSnapshotRoundTrip();
+  TestDraftPolicyResolution();
   std::cout << "All speculative verification tests passed.\n";
   return 0;
 }

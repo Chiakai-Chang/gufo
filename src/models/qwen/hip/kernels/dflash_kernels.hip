@@ -8,8 +8,56 @@
 #include <string_view>
 
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
+#include "src/models/qwen/hip/quant_ops.hpp"
 
 namespace gufo::hip::kernels {
+
+// The DFlash-2 draft head is the target LM head, which the Q8 target keeps in
+// BF16 at 2.54 GB -- half of everything the draft graph reads. Drafting is
+// purely weight-bandwidth bound, and the draft only steers which tokens the
+// target verifies, so a draft-private Q8_0 copy cannot change an emitted token:
+// the verifier still runs the target's BF16 head.
+__global__ void dflash_quantize_bf16_to_q8_0_kernel(
+    const hip_bfloat16* __restrict__ source,
+    Q8_0Block* __restrict__ destination, uint64_t total_blocks) {
+  const uint64_t block =
+      static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (block >= total_blocks) {
+    return;
+  }
+  const hip_bfloat16* values = source + (block * kQ8_0BlockSize);
+  float absolute_max = 0.0F;
+  for (uint32_t index = 0; index < kQ8_0BlockSize; ++index) {
+    absolute_max =
+        fmaxf(absolute_max, fabsf(static_cast<float>(values[index])));
+  }
+  const float scale = absolute_max / 127.0F;
+  const float inverse = scale > 0.0F ? 1.0F / scale : 0.0F;
+  Q8_0Block& out = destination[block];
+  out.d = __float2half(scale);
+  for (uint32_t index = 0; index < kQ8_0BlockSize; ++index) {
+    const float quantized = roundf(static_cast<float>(values[index]) * inverse);
+    out.qs[index] =
+        static_cast<int8_t>(fminf(fmaxf(quantized, -127.0F), 127.0F));
+  }
+}
+
+void LaunchDFlashQuantizeBf16ToQ8_0(const void* bf16_source,
+                                    void* q8_destination,
+                                    std::size_t total_elements,
+                                    hipStream_t stream) {
+  if (bf16_source == nullptr || q8_destination == nullptr ||
+      total_elements % kQ8_0BlockSize != 0) {
+    return;
+  }
+  const std::uint64_t total_blocks = total_elements / kQ8_0BlockSize;
+  constexpr std::uint32_t kThreads = 256;
+  const std::uint64_t grid = (total_blocks + kThreads - 1) / kThreads;
+  dflash_quantize_bf16_to_q8_0_kernel<<<static_cast<unsigned int>(grid),
+                                        kThreads, 0, stream>>>(
+      static_cast<const hip_bfloat16*>(bf16_source),
+      static_cast<Q8_0Block*>(q8_destination), total_blocks);
+}
 
 __global__ void dflash_rmsnorm_kernel(const float* __restrict__ input,
                                       const float* __restrict__ weight,
@@ -217,6 +265,9 @@ __global__ void dflash_noncausal_attention_kernel(
 constexpr uint32_t kSelectorThreads = 128;
 constexpr uint32_t kMaxSelectorTopK = 16;
 constexpr uint32_t kSelectorTokensPerBlock = 2048;
+/// Threads that cooperate on one candidate's low-rank transition score.
+constexpr uint32_t kSelectorTransitionLanes =
+    kSelectorThreads / kMaxSelectorTopK;
 
 __device__ __forceinline__ void InsertSelectorCandidate(
     float score, uint32_t id, float* scores, uint32_t* ids,
@@ -232,6 +283,49 @@ __device__ __forceinline__ void InsertSelectorCandidate(
   }
   scores[insertion] = score;
   ids[insertion] = id;
+}
+
+/// Tree-merges the per-thread descending top-k lists held in shared memory into
+/// slot zero. The previous implementation had thread zero fold all
+/// kSelectorThreads lists serially, which dominated both selector kernels; a
+/// pairwise merge does the same work in log2(threads) rounds. Ties keep the
+/// lower slot, which is the same preference the serial fold had.
+__device__ void MergeSelectorLists(float* scores, uint32_t* ids,
+                                   uint32_t selector_top_k) {
+  for (uint32_t stride = kSelectorThreads / 2U; stride > 0U; stride >>= 1U) {
+    __syncthreads();
+    if (threadIdx.x < stride) {
+      float* mine_scores = scores + (threadIdx.x * kMaxSelectorTopK);
+      uint32_t* mine_ids = ids + (threadIdx.x * kMaxSelectorTopK);
+      const float* other_scores =
+          scores + ((threadIdx.x + stride) * kMaxSelectorTopK);
+      const uint32_t* other_ids =
+          ids + ((threadIdx.x + stride) * kMaxSelectorTopK);
+      float merged_scores[kMaxSelectorTopK];
+      uint32_t merged_ids[kMaxSelectorTopK];
+      uint32_t mine = 0;
+      uint32_t other = 0;
+      for (uint32_t index = 0; index < selector_top_k; ++index) {
+        const bool take_mine =
+            other >= selector_top_k ||
+            (mine < selector_top_k && mine_scores[mine] >= other_scores[other]);
+        if (take_mine) {
+          merged_scores[index] = mine_scores[mine];
+          merged_ids[index] = mine_ids[mine];
+          ++mine;
+        } else {
+          merged_scores[index] = other_scores[other];
+          merged_ids[index] = other_ids[other];
+          ++other;
+        }
+      }
+      for (uint32_t index = 0; index < selector_top_k; ++index) {
+        mine_scores[index] = merged_scores[index];
+        mine_ids[index] = merged_ids[index];
+      }
+    }
+  }
+  __syncthreads();
 }
 
 __global__ void dflash_selector_partial_topk_kernel(
@@ -263,30 +357,14 @@ __global__ void dflash_selector_partial_topk_kernel(
     shared_scores[shared_offset + index] = local_scores[index];
     shared_ids[shared_offset + index] = local_ids[index];
   }
-  __syncthreads();
 
-  if (threadIdx.x != 0U) {
-    return;
-  }
-  float top_scores[kMaxSelectorTopK];
-  uint32_t top_ids[kMaxSelectorTopK];
-#pragma unroll
-  for (uint32_t index = 0; index < kMaxSelectorTopK; ++index) {
-    top_scores[index] = -INFINITY;
-    top_ids[index] = 0;
-  }
-  for (uint32_t thread = 0; thread < kSelectorThreads; ++thread) {
-    for (uint32_t index = 0; index < selector_top_k; ++index) {
-      const uint32_t shared_index = thread * kMaxSelectorTopK + index;
-      InsertSelectorCandidate(shared_scores[shared_index],
-                              shared_ids[shared_index], top_scores, top_ids,
-                              selector_top_k);
-    }
-  }
+  MergeSelectorLists(shared_scores, shared_ids, selector_top_k);
+
   const uint32_t output_offset = blockIdx.x * kMaxSelectorTopK;
-  for (uint32_t index = 0; index < selector_top_k; ++index) {
-    partial_scores[output_offset + index] = top_scores[index];
-    partial_ids[output_offset + index] = top_ids[index];
+  for (uint32_t index = threadIdx.x; index < selector_top_k;
+       index += blockDim.x) {
+    partial_scores[output_offset + index] = shared_scores[index];
+    partial_ids[output_offset + index] = shared_ids[index];
   }
 }
 
@@ -304,6 +382,8 @@ __global__ void dflash_selector_finalize_kernel(
     uint32_t selector_rank, uint32_t selector_top_k) {
   __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
   __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
+  __shared__ float
+      shared_transition[kMaxSelectorTopK * kSelectorTransitionLanes];
 
   float local_scores[kMaxSelectorTopK];
   uint32_t local_ids[kMaxSelectorTopK];
@@ -325,43 +405,57 @@ __global__ void dflash_selector_finalize_kernel(
     shared_scores[shared_offset + index] = local_scores[index];
     shared_ids[shared_offset + index] = local_ids[index];
   }
+
+  MergeSelectorLists(shared_scores, shared_ids, selector_top_k);
+
+  const uint32_t predecessor = *predecessor_token;
+  const hip_bfloat16* predecessor_row =
+      predecessor_codebook + (uint64_t)predecessor * selector_rank;
+
+  // Score the low-rank transitions in parallel: kSelectorTransitionLanes
+  // threads share each candidate and reduce through shared memory. Thread zero
+  // used to walk all selector_top_k x selector_rank products by itself.
+  {
+    const uint32_t candidate_index = threadIdx.x / kSelectorTransitionLanes;
+    const uint32_t part = threadIdx.x % kSelectorTransitionLanes;
+    if (candidate_index < selector_top_k) {
+      const uint32_t candidate = shared_ids[candidate_index];
+      const hip_bfloat16* successor_row =
+          successor_codebook + (uint64_t)candidate * selector_rank;
+      float partial = 0.0F;
+      for (uint32_t rank = part; rank < selector_rank;
+           rank += kSelectorTransitionLanes) {
+        partial += static_cast<float>(predecessor_row[rank]) *
+                   projected_hidden[rank] *
+                   static_cast<float>(successor_row[rank]);
+      }
+      shared_transition[(candidate_index * kSelectorTransitionLanes) + part] =
+          partial;
+    }
+  }
   __syncthreads();
+
   if (threadIdx.x != 0U) {
     return;
   }
 
   float top_scores[kMaxSelectorTopK];
   uint32_t top_ids[kMaxSelectorTopK];
-#pragma unroll
-  for (uint32_t index = 0; index < kMaxSelectorTopK; ++index) {
-    top_scores[index] = -INFINITY;
-    top_ids[index] = 0;
-  }
-  for (uint32_t thread = 0; thread < kSelectorThreads; ++thread) {
-    for (uint32_t index = 0; index < selector_top_k; ++index) {
-      const uint32_t index_in_shared = thread * kMaxSelectorTopK + index;
-      InsertSelectorCandidate(shared_scores[index_in_shared],
-                              shared_ids[index_in_shared], top_scores, top_ids,
-                              selector_top_k);
-    }
+  for (uint32_t index = 0; index < selector_top_k; ++index) {
+    top_scores[index] = shared_scores[index];
+    top_ids[index] = shared_ids[index];
   }
 
-  const uint32_t predecessor = *predecessor_token;
-  const hip_bfloat16* predecessor_row =
-      predecessor_codebook + (uint64_t)predecessor * selector_rank;
   float best_score = -INFINITY;
   uint32_t best_index = 0;
   float path_scores[kMaxSelectorTopK];
   for (uint32_t candidate_index = 0; candidate_index < selector_top_k;
        ++candidate_index) {
-    const uint32_t candidate = top_ids[candidate_index];
-    const hip_bfloat16* successor_row =
-        successor_codebook + (uint64_t)candidate * selector_rank;
     float transition = 0.0F;
-    for (uint32_t rank = 0; rank < selector_rank; ++rank) {
-      transition += static_cast<float>(predecessor_row[rank]) *
-                    projected_hidden[rank] *
-                    static_cast<float>(successor_row[rank]);
+    for (uint32_t part = 0; part < kSelectorTransitionLanes; ++part) {
+      transition +=
+          shared_transition[(candidate_index * kSelectorTransitionLanes) +
+                            part];
     }
     const float score = top_scores[candidate_index] + transition;
     path_scores[candidate_index] = score;

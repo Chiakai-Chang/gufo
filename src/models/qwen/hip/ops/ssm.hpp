@@ -51,6 +51,23 @@ void LaunchFusedRMSNormSSMInputProjections(
     std::size_t inner_size, std::size_t time_step_rank,
     hipStream_t stream = nullptr);
 
+/// Runs `rows` consecutive verification rows through the conv and DeltaNet
+/// recurrence in a single pair of launches. Each row's arithmetic and its order
+/// are identical to the one-row-per-launch form, so the result is bit-exact;
+/// what it removes is the launch serialization of 2 x rows dispatches per
+/// layer.
+void LaunchSSMConvRecurrenceRows(
+    const float* qkv_in, const float* conv_weights, float* conv_state,
+    float* conv_out, void* deltanet_state, const float* alpha_buf,
+    const float* beta_buf, const float* ssm_a, const float* ssm_dt,
+    const float* ssm_norm, const float* gate, float* out_buf,
+    std::uint32_t layer_idx, std::size_t qkv_size, std::uint32_t num_key_heads,
+    std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
+    std::uint32_t rows, std::size_t projection_row_stride,
+    std::size_t inner_row_stride, hipStream_t stream = nullptr,
+    SsmReplayCapture replay_capture = {},
+    QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32);
+
 void LaunchSSMConvRecurrence(
     const float* qkv_in, const float* conv_weights, float* conv_state,
     float* conv_out, void* deltanet_state, const float* alpha_buf,

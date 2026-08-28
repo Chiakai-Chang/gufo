@@ -33,8 +33,6 @@ CONTROLLED_ENV = {
     "GUFO_PREFILL_SMALL_BATCH_FP32_FROM_LAYER",
     "GUFO_PREFILL_SMALL_BATCH_QUANT",
     "GUFO_PREFILL_SMALL_BATCH_W8A8_TILE",
-    "GUFO_Q8_SMALL_BATCH_EXACT_LDS8",
-    "GUFO_Q8_SMALL_BATCH_EXACT_PACKED",
     "GUFO_SPEC_BATCH_LM_HEAD",
     "GUFO_SPEC_BATCH_VERIFY",
     "GUFO_SPEC_BATCH_VERIFY_CHECK",
@@ -235,8 +233,8 @@ def main() -> int:
     parser.add_argument("--draft-tokens", type=int, default=7)
     parser.add_argument(
         "--draft-policy",
-        choices=("fixed", "rolling", "accepted-ema"),
-        default="rolling",
+        choices=("auto", "fixed", "rolling", "accepted-ema"),
+        default="auto",
     )
     parser.add_argument("--min-draft-tokens", type=int, default=1)
     parser.add_argument("--repetitions", type=int, default=1)

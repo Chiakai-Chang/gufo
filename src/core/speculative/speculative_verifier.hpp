@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/core/speculative/draft_backend.hpp"
+#include "src/core/speculative/draft_policy.hpp"
 #include "src/models/qwen/generator.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 

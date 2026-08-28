@@ -36,7 +36,7 @@ struct PromptOptions {
   std::string mtp_model_path;
   std::string dflash_model_path;
   std::size_t draft_tokens = 7;
-  std::string draft_policy = "rolling";
+  std::string draft_policy = "auto";
   std::size_t min_draft_tokens = 1;
 };
 

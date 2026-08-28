@@ -18,6 +18,7 @@
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
+#include "src/core/speculative/draft_policy.hpp"
 
 namespace gufo::cli {
 
@@ -88,7 +89,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string dflash_model_path;
     std::string mtp_model_path;
     std::size_t draft_tokens = 7;
-    std::string draft_policy = "rolling";
+    std::string draft_policy = "auto";
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
@@ -195,7 +196,8 @@ void PrintServeHelp(std::string_view program_name,
         "Speculative", &draft_tokens);
     parser.AddOption(
         "", "--draft-policy", "MODE",
-        "Draft sizing: fixed, rolling, or accepted-ema (default: rolling)",
+        "Draft sizing: auto, fixed, rolling, or accepted-ema (default: auto, "
+        "which is fixed for DFlash-2 and rolling otherwise)",
         "Speculative", &draft_policy);
     parser.AddOption("", "--min-draft-tokens", "N",
                      "Adaptive draft floor (default: 1)", "Speculative",
@@ -541,7 +543,7 @@ int RunServe(std::span<const char* const> args) {
     std::string dflash_model_path;
     std::string mtp_model_path;
     std::size_t draft_tokens = 7;
-    std::string draft_policy = "rolling";
+    std::string draft_policy = "auto";
     std::size_t min_draft_tokens = 1;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
@@ -644,7 +646,8 @@ int RunServe(std::span<const char* const> args) {
         "Speculative", &draft_tokens);
     llm_parser.AddOption(
         "", "--draft-policy", "MODE",
-        "Draft sizing: fixed, rolling, or accepted-ema (default: rolling)",
+        "Draft sizing: auto, fixed, rolling, or accepted-ema (default: auto, "
+        "which is fixed for DFlash-2 and rolling otherwise)",
         "Speculative", &draft_policy);
     llm_parser.AddOption("", "--min-draft-tokens", "N",
                          "Adaptive draft floor (default: 1)", "Speculative",
@@ -737,12 +740,15 @@ int RunServe(std::span<const char* const> args) {
         static_cast<std::uint32_t>(draft_tokens);
     speculative_config.min_draft_tokens =
         static_cast<std::uint32_t>(min_draft_tokens);
-    if (draft_policy == "fixed") {
+    // `auto` follows the measured best per backend; see ResolveDraftPolicy.
+    const std::string_view resolved_draft_policy =
+        speculative::ResolveDraftPolicy(draft_policy, true);
+    if (resolved_draft_policy == "fixed") {
       speculative_config.draft_policy = server::TextDraftPolicy::kFixed;
-    } else if (draft_policy == "rolling") {
+    } else if (resolved_draft_policy == "rolling") {
       speculative_config.draft_policy =
           server::TextDraftPolicy::kRollingAcceptance;
-    } else if (draft_policy == "accepted-ema") {
+    } else if (resolved_draft_policy == "accepted-ema") {
       speculative_config.draft_policy =
           server::TextDraftPolicy::kAcceptedTokenEma;
     } else {

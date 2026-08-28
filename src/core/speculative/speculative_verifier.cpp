@@ -4,11 +4,13 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string_view>
@@ -253,6 +255,82 @@ bool IsStopToken(tokenization::TokenId token,
   return setting != "0" && setting != "false" && setting != "off";
 }
 
+[[nodiscard]] bool SpecTimingEnabled() noexcept {
+  static const bool enabled = std::getenv("GUFO_SPEC_TIMING") != nullptr;
+  return enabled;
+}
+
+/// Wall-clock phase rollup for one speculative decode session, printed at
+/// process exit when GUFO_SPEC_TIMING is set. The target executor already
+/// synchronizes at every phase boundary, so no extra barriers are needed.
+struct SpecPhaseTimings {
+  double propose_ms{0.0};
+  double save_state_ms{0.0};
+  double verify_chunk_ms{0.0};
+  double rollback_ms{0.0};
+  double hidden_ms{0.0};
+  std::uint64_t steps{0};
+  std::uint64_t rollbacks{0};
+  std::uint64_t emitted{0};
+
+  ~SpecPhaseTimings() {
+    if (!SpecTimingEnabled() || steps == 0) {
+      return;
+    }
+    const double n = static_cast<double>(steps);
+    const double total =
+        propose_ms + save_state_ms + verify_chunk_ms + rollback_ms + hidden_ms;
+    std::cerr << "\n[SPEC_TIMING] steps=" << steps << " rollbacks=" << rollbacks
+              << " emitted=" << emitted << '\n'
+              << "  total          " << total << " ms  (" << (total / n)
+              << " ms/step)\n"
+              << "    propose      " << propose_ms << " ms  ("
+              << (propose_ms / n) << ")\n"
+              << "    save state   " << save_state_ms << " ms  ("
+              << (save_state_ms / n) << ")\n"
+              << "    verify chunk " << verify_chunk_ms << " ms  ("
+              << (verify_chunk_ms / n) << ")\n"
+              << "    rollback     " << rollback_ms << " ms  ("
+              << (rollback_ms / n) << ")\n"
+              << "    draft hidden " << hidden_ms << " ms  (" << (hidden_ms / n)
+              << ")\n";
+  }
+};
+
+[[nodiscard]] SpecPhaseTimings& PhaseTimings() {
+  static SpecPhaseTimings timings;
+  return timings;
+}
+
+/// Accumulates the wall time of one verifier phase when timing is enabled.
+class PhaseTimer {
+public:
+  explicit PhaseTimer(double* sink)
+      : sink_(SpecTimingEnabled() ? sink : nullptr) {
+    if (sink_ != nullptr) {
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  PhaseTimer(const PhaseTimer&) = delete;
+  PhaseTimer& operator=(const PhaseTimer&) = delete;
+  PhaseTimer(PhaseTimer&&) = delete;
+  PhaseTimer& operator=(PhaseTimer&&) = delete;
+
+  ~PhaseTimer() {
+    if (sink_ == nullptr) {
+      return;
+    }
+    *sink_ += std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - start_)
+                  .count();
+  }
+
+private:
+  double* sink_{nullptr};
+  std::chrono::steady_clock::time_point start_{};
+};
+
 }  // namespace
 
 SpeculativeVerifier::SpeculativeVerifier(
@@ -438,8 +516,14 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
   }
 
   // 1. Propose draft tokens
-  const auto proposal =
-      draft_backend_->Propose(current_sequence, cur_pos, max_draft_tokens);
+  auto& phases = PhaseTimings();
+  std::optional<speculative::DraftProposal> proposal_holder;
+  {
+    PhaseTimer propose_timer(&phases.propose_ms);
+    proposal_holder =
+        draft_backend_->Propose(current_sequence, cur_pos, max_draft_tokens);
+  }
+  const auto proposal = std::move(*proposal_holder);
   if (proposal.tokens.empty()) {
     const auto next = target_executor_->ForwardToken(current_token, cur_pos);
     std::vector<float> next_logits;
@@ -474,9 +558,16 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
                                proposal.tokens.begin(), proposal.tokens.end());
 
     // Candidate route: verify [current, draft...] in one target prefill batch.
-    target_executor_->SaveState(cur_pos);
-    auto verification = target_executor_->ForwardVerificationChunk(
-        verification_inputs, cur_pos, capture_target_hidden, false);
+    {
+      PhaseTimer save_timer(&phases.save_state_ms);
+      target_executor_->SaveState(cur_pos);
+    }
+    VerificationChunkResult verification;
+    {
+      PhaseTimer verify_timer(&phases.verify_chunk_ms);
+      verification = target_executor_->ForwardVerificationChunk(
+          verification_inputs, cur_pos, capture_target_hidden, false);
+    }
     if (verification.predictions.size() != verification_inputs.size()) {
       throw std::runtime_error(
           "target executor returned an incomplete verification chunk");
@@ -505,6 +596,10 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     // recurrent snapshot and rebuilds only the committed input prefix.
     const std::size_t committed_input_count = accepted_count + 1;
     if (accepted_count != num_draft) {
+      PhaseTimer rollback_timer(&phases.rollback_ms);
+      if (SpecTimingEnabled()) {
+        ++phases.rollbacks;
+      }
       target_executor_->RestoreState();
       target_executor_->CommitVerificationChunk(
           std::span<const tokenization::TokenId>(verification_inputs.data(),
@@ -513,6 +608,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     }
 
     if (capture_target_hidden) {
+      PhaseTimer hidden_timer(&phases.hidden_ms);
       for (std::size_t row = 0; row < committed_input_count; ++row) {
         draft_backend_->UpdateTargetHidden(
             std::span<const float>(verification.hidden_states.data() +
@@ -633,6 +729,10 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
   stats_.total_accepted_tokens += accepted_count;
   stats_.total_verification_steps += 1;
   stats_.total_emitted_tokens += result.emitted_tokens.size();
+  if (SpecTimingEnabled()) {
+    ++phases.steps;
+    phases.emitted += result.emitted_tokens.size();
+  }
 
   UpdateAdaptiveDraftLength(accepted_count, num_draft);
 

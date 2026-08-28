@@ -157,6 +157,9 @@ private:
   void RunBlockGemm(const models::QwenTensorRef& weight, const float* input,
                     float* output, std::size_t batch_size,
                     std::size_t output_size, std::size_t input_size);
+  void RunInjectGemm(const models::QwenTensorRef& weight, const float* input,
+                     float* output, std::size_t num_tokens,
+                     std::size_t output_size, std::size_t input_size);
 
   std::shared_ptr<const QwenDFlashGpuModel> model_;
   std::uint32_t max_context_{4096};

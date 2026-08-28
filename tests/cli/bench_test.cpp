@@ -23,7 +23,7 @@ void TestDefaultOptions() {
          "default depth is zero");
   Expect(options->repetitions == 1, "default is one repetition");
   Expect(options->draft_tokens == 7, "default draft ceiling is seven");
-  Expect(options->draft_policy == "rolling", "default draft policy is rolling");
+  Expect(options->draft_policy == "auto", "default draft policy is auto");
   Expect(options->min_draft_tokens == 1, "default minimum draft is one");
 }
 

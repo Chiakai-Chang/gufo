@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -123,6 +124,106 @@ enum class DFlashGemmMode {
   }();
   return mode;
 }
+
+/// Widest batch the shared small-batch GEMM routes accept.
+constexpr std::size_t kDFlashMaxSharedBatch = 8;
+
+[[nodiscard]] bool DFlashTimingEnabled() noexcept {
+  static const bool enabled = std::getenv("GUFO_DFLASH_TIMING") != nullptr;
+  return enabled;
+}
+
+/// Wall-clock stage rollup for the draft graph, printed at process exit when
+/// GUFO_DFLASH_TIMING is set. Each stage boundary synchronizes the draft
+/// stream, so the accounting is only wired up under the environment flag.
+struct DFlashStageTimings {
+  double inject_ms{0.0};
+  double embed_ms{0.0};
+  double layer_norm_conv_ms{0.0};
+  double layer_gemm_ms{0.0};
+  double layer_attention_ms{0.0};
+  double head_ms{0.0};
+  double selector_ms{0.0};
+  double download_ms{0.0};
+  std::uint64_t inject_calls{0};
+  std::uint64_t inject_tokens{0};
+  std::uint64_t block_calls{0};
+
+  ~DFlashStageTimings() {
+    if (!DFlashTimingEnabled() || block_calls == 0) {
+      return;
+    }
+    const double blocks = static_cast<double>(block_calls);
+    const double total = embed_ms + layer_norm_conv_ms + layer_gemm_ms +
+                         layer_attention_ms + head_ms + selector_ms +
+                         download_ms;
+    std::cerr << std::fixed << std::setprecision(3)
+              << "\n[DFLASH_TIMING] blocks=" << block_calls
+              << " inject_calls=" << inject_calls
+              << " inject_tokens=" << inject_tokens << '\n'
+              << "  inject          " << inject_ms << " ms\n"
+              << "  block total     " << total << " ms  (" << (total / blocks)
+              << " ms/block)\n"
+              << "    embed         " << embed_ms << " ms  ("
+              << (embed_ms / blocks) << ")\n"
+              << "    norm+conv     " << layer_norm_conv_ms << " ms  ("
+              << (layer_norm_conv_ms / blocks) << ")\n"
+              << "    gemm          " << layer_gemm_ms << " ms  ("
+              << (layer_gemm_ms / blocks) << ")\n"
+              << "    attention     " << layer_attention_ms << " ms  ("
+              << (layer_attention_ms / blocks) << ")\n"
+              << "    lm head       " << head_ms << " ms  ("
+              << (head_ms / blocks) << ")\n"
+              << "    selector      " << selector_ms << " ms  ("
+              << (selector_ms / blocks) << ")\n"
+              << "    download      " << download_ms << " ms  ("
+              << (download_ms / blocks) << ")\n";
+  }
+};
+
+[[nodiscard]] DFlashStageTimings& StageTimings() {
+  static DFlashStageTimings timings;
+  return timings;
+}
+
+/// Scoped stage accumulator. Synchronizes on both ends so a stage total is the
+/// device time of its dispatches rather than their launch cost.
+class StageTimer {
+public:
+  StageTimer(double* sink, hipStream_t stream) : sink_(sink), stream_(stream) {
+    if (!DFlashTimingEnabled()) {
+      sink_ = nullptr;
+      return;
+    }
+    (void)hipStreamSynchronize(stream_);
+    start_ = std::chrono::steady_clock::now();
+  }
+
+  StageTimer(const StageTimer&) = delete;
+  StageTimer& operator=(const StageTimer&) = delete;
+  StageTimer(StageTimer&&) = delete;
+  StageTimer& operator=(StageTimer&&) = delete;
+
+  ~StageTimer() { Stop(); }
+
+  /// Closes the stage early. Idempotent, so the destructor is a no-op after an
+  /// explicit stop.
+  void Stop() {
+    if (sink_ == nullptr) {
+      return;
+    }
+    (void)hipStreamSynchronize(stream_);
+    *sink_ += std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - start_)
+                  .count();
+    sink_ = nullptr;
+  }
+
+private:
+  double* sink_{nullptr};
+  hipStream_t stream_{nullptr};
+  std::chrono::steady_clock::time_point start_{};
+};
 
 void DebugDeviceTensor(std::string_view name, const float* device,
                        std::size_t elements, hipStream_t stream) {
@@ -425,6 +526,15 @@ void QwenDFlashGpuExecutor::RunBlockGemm(const models::QwenTensorRef& weight,
                                          std::size_t output_size,
                                          std::size_t input_size) {
   if (weight.type == core::GgmlType::kQ8_0) {
+    // The FP32-activation route streams each quantized weight row once for the
+    // whole block and needs no BF16 activation round trip. It also beat the
+    // matrix-core W8A8 route once the shared kernel read activations as float4
+    // (11.3 vs 12.2 ms per draft block), so there is one route here.
+    if (batch_size <= kDFlashMaxSharedBatch) {
+      LaunchBatchedQuantGEMMFp32(weight.type, weight.data, input, output,
+                                 batch_size, output_size, input_size, stream_);
+      return;
+    }
     LaunchFloatToBfloat16(input, d_bf16_input_, batch_size * input_size,
                           stream_);
     LaunchBatchedQuantGEMMBf16(weight.type, weight.data, d_bf16_input_, output,
@@ -448,6 +558,44 @@ void QwenDFlashGpuExecutor::RunBlockGemm(const models::QwenTensorRef& weight,
   }
   LaunchHipblasGEMMBF16(hipblas_handle_, weight.data, d_bf16_input_, output,
                         batch_size, output_size, input_size, stream_);
+}
+
+void QwenDFlashGpuExecutor::RunInjectGemm(const models::QwenTensorRef& weight,
+                                          const float* input, float* output,
+                                          std::size_t num_tokens,
+                                          std::size_t output_size,
+                                          std::size_t input_size) {
+  if (weight.data == nullptr || num_tokens == 0) {
+    return;
+  }
+  // The dense batched GEMM reads every weight row once per token because its
+  // grid carries the batch on the y axis. Injection therefore streams the
+  // encoder and K/V matrices `num_tokens` times. Feeding the shared small-batch
+  // kernels in chunks reads them once per chunk instead, which is the same
+  // arithmetic per row but up to eight times less weight traffic.
+  const bool is_bf16 = weight.type == core::GgmlType::kBF16;
+  if (!is_bf16 && weight.type != core::GgmlType::kQ8_0) {
+    LaunchBatchedGEMM(weight.data, is_bf16, input, output, num_tokens,
+                      output_size, input_size, stream_);
+    return;
+  }
+
+  for (std::size_t offset = 0; offset < num_tokens;
+       offset += kDFlashMaxSharedBatch) {
+    const std::size_t chunk =
+        std::min(kDFlashMaxSharedBatch, num_tokens - offset);
+    const float* chunk_input = input + (offset * input_size);
+    float* chunk_output = output + (offset * output_size);
+    if (is_bf16) {
+      LaunchExactBf16GEMMFp32SmallBatch(weight.data, chunk_input, chunk_output,
+                                        chunk, output_size, input_size,
+                                        stream_);
+    } else {
+      LaunchBatchedQuantGEMMFp32(weight.type, weight.data, chunk_input,
+                                 chunk_output, chunk, output_size, input_size,
+                                 stream_);
+    }
+  }
 }
 
 void QwenDFlashGpuExecutor::Free() noexcept {
@@ -724,11 +872,16 @@ bool QwenDFlashGpuExecutor::InjectTargetContext(
   const std::size_t enc_in_dim = GetTargetFeaturesSize();
   const std::size_t kv_dim =
       static_cast<std::size_t>(cfg.num_key_value_heads) * cfg.head_dim;
-  const bool is_bf16 = (weights.fc_projection.type == core::GgmlType::kBF16);
 
   if (target_features.size() != num_tokens * enc_in_dim ||
       position + num_tokens > max_context_) {
     return false;
+  }
+
+  StageTimer inject_timer(&StageTimings().inject_ms, stream_);
+  if (DFlashTimingEnabled()) {
+    ++StageTimings().inject_calls;
+    StageTimings().inject_tokens += num_tokens;
   }
 
   // Upload target features
@@ -743,11 +896,8 @@ bool QwenDFlashGpuExecutor::InjectTargetContext(
                     num_tokens * enc_in_dim, stream_);
 
   // FC Projection & Norm
-  if (weights.fc_projection.data != nullptr) {
-    LaunchBatchedGEMM(weights.fc_projection.data, is_bf16, d_target_features_,
-                      d_fused_features_, num_tokens, hidden_size, enc_in_dim,
-                      stream_);
-  }
+  RunInjectGemm(weights.fc_projection, d_target_features_, d_fused_features_,
+                num_tokens, hidden_size, enc_in_dim);
   DebugDeviceTensor("encoder.fc_out", d_fused_features_,
                     num_tokens * hidden_size, stream_);
   LaunchBatchedRMSNorm(
@@ -760,10 +910,10 @@ bool QwenDFlashGpuExecutor::InjectTargetContext(
   for (std::size_t i = 0; i < weights.layers.size(); ++i) {
     const auto& layer = weights.layers[i].transformer;
     if (layer.attn_k.data != nullptr && layer.attn_v.data != nullptr) {
-      LaunchBatchedGEMM(layer.attn_k.data, is_bf16, d_block_normed_, d_k_block_,
-                        num_tokens, kv_dim, hidden_size, stream_);
-      LaunchBatchedGEMM(layer.attn_v.data, is_bf16, d_block_normed_, d_v_block_,
-                        num_tokens, kv_dim, hidden_size, stream_);
+      RunInjectGemm(layer.attn_k, d_block_normed_, d_k_block_, num_tokens,
+                    kv_dim, hidden_size);
+      RunInjectGemm(layer.attn_v, d_block_normed_, d_v_block_, num_tokens,
+                    kv_dim, hidden_size);
     }
 
     if (layer.attn_k_norm.data != nullptr) {
@@ -845,64 +995,88 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     return {};
   }
   const std::uint32_t block_count = draft_count + 1U;
+  auto& timings = StageTimings();
+  if (DFlashTimingEnabled()) {
+    ++timings.block_calls;
+  }
 
-  // Slot zero is the committed anchor; all proposal slots are masks.
-  if (weights.token_embedding.data != nullptr) {
-    LaunchEmbeddingLookup(weights.token_embedding.data,
-                          weights.token_embedding.type, anchor_token,
-                          d_block_hidden_, hidden_size, stream_);
-    for (std::size_t t = 1; t < block_count; ++t) {
+  {
+    StageTimer embed_timer(&timings.embed_ms, stream_);
+    // Slot zero is the committed anchor; all proposal slots are masks.
+    if (weights.token_embedding.data != nullptr) {
       LaunchEmbeddingLookup(weights.token_embedding.data,
-                            weights.token_embedding.type, df_cfg.mask_token_id,
-                            d_block_hidden_ + t * hidden_size, hidden_size,
-                            stream_);
+                            weights.token_embedding.type, anchor_token,
+                            d_block_hidden_, hidden_size, stream_);
+      for (std::size_t t = 1; t < block_count; ++t) {
+        LaunchEmbeddingLookup(
+            weights.token_embedding.data, weights.token_embedding.type,
+            df_cfg.mask_token_id, d_block_hidden_ + t * hidden_size,
+            hidden_size, stream_);
+      }
     }
   }
   DebugDeviceTensor("decoder.inp_noise_embd", d_block_hidden_,
                     block_count * hidden_size, stream_);
+
+  // Stage accounting is only wired up under GUFO_DFLASH_TIMING; otherwise each
+  // StageTimer is inert and the dispatch order is unchanged.
+  const auto timed = [&](double* sink, auto&& body) {
+    StageTimer timer(sink, stream_);
+    body();
+  };
 
   // Five DFlash-2 decoder blocks.
   for (std::size_t i = 0; i < df_cfg.num_layers; ++i) {
     const auto& dflash_layer = weights.layers[i];
     const auto& layer = dflash_layer.transformer;
 
-    LaunchBatchedRMSNorm(
-        d_block_hidden_, static_cast<const float*>(layer.attn_norm.data),
-        d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
+    timed(&timings.layer_norm_conv_ms, [&] {
+      LaunchBatchedRMSNorm(
+          d_block_hidden_, static_cast<const float*>(layer.attn_norm.data),
+          d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
+    });
     DebugDeviceTensor("decoder.noise_norm-" + std::to_string(i),
                       d_block_normed_, block_count * hidden_size, stream_);
 
-    RunBlockGemm(dflash_layer.attention_conv_projection, d_block_normed_,
-                 d_dynamic_coefficients_, block_count, dynamic_size,
-                 hidden_size);
-    kernels::LaunchDFlashGroupedDynamicConv(
-        d_block_normed_, d_dynamic_coefficients_,
-        static_cast<const float*>(dflash_layer.attention_conv_base.data),
-        d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
-        df_cfg.conv_group_size, 0, stream_);
+    timed(&timings.layer_gemm_ms, [&] {
+      RunBlockGemm(dflash_layer.attention_conv_projection, d_block_normed_,
+                   d_dynamic_coefficients_, block_count, dynamic_size,
+                   hidden_size);
+    });
+    timed(&timings.layer_norm_conv_ms, [&] {
+      kernels::LaunchDFlashGroupedDynamicConv(
+          d_block_normed_, d_dynamic_coefficients_,
+          static_cast<const float*>(dflash_layer.attention_conv_base.data),
+          d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
+          df_cfg.conv_group_size, 0, stream_);
+    });
     DebugDeviceTensor("decoder.attn_conv_in-" + std::to_string(i),
                       d_conv_hidden_, block_count * hidden_size, stream_);
 
-    RunBlockGemm(layer.attn_q, d_conv_hidden_, d_q_, block_count, q_dim,
-                 hidden_size);
-    RunBlockGemm(layer.attn_k, d_conv_hidden_, d_k_block_, block_count, kv_dim,
-                 hidden_size);
-    RunBlockGemm(layer.attn_v, d_conv_hidden_, d_v_block_, block_count, kv_dim,
-                 hidden_size);
+    timed(&timings.layer_gemm_ms, [&] {
+      RunBlockGemm(layer.attn_q, d_conv_hidden_, d_q_, block_count, q_dim,
+                   hidden_size);
+      RunBlockGemm(layer.attn_k, d_conv_hidden_, d_k_block_, block_count,
+                   kv_dim, hidden_size);
+      RunBlockGemm(layer.attn_v, d_conv_hidden_, d_v_block_, block_count,
+                   kv_dim, hidden_size);
+    });
 
-    LaunchBatchedPerHeadRMSNorm(
-        d_q_, static_cast<const float*>(layer.attn_q_norm.data), d_q_,
-        block_count, num_q_heads, head_dim, 1e-6F, stream_);
-    LaunchBatchedPerHeadRMSNorm(
-        d_k_block_, static_cast<const float*>(layer.attn_k_norm.data),
-        d_k_block_, block_count, num_kv_heads, head_dim, 1e-6F, stream_);
+    timed(&timings.layer_norm_conv_ms, [&] {
+      LaunchBatchedPerHeadRMSNorm(
+          d_q_, static_cast<const float*>(layer.attn_q_norm.data), d_q_,
+          block_count, num_q_heads, head_dim, 1e-6F, stream_);
+      LaunchBatchedPerHeadRMSNorm(
+          d_k_block_, static_cast<const float*>(layer.attn_k_norm.data),
+          d_k_block_, block_count, num_kv_heads, head_dim, 1e-6F, stream_);
 
-    for (std::size_t t = 0; t < block_count; ++t) {
-      LaunchRoPE(d_q_ + t * q_dim, d_k_block_ + t * kv_dim, num_q_heads,
-                 num_kv_heads, head_dim, cfg.rotary_dim,
-                 current_pos + static_cast<std::uint32_t>(t), cfg.rope_theta,
-                 stream_);
-    }
+      for (std::size_t t = 0; t < block_count; ++t) {
+        LaunchRoPE(d_q_ + t * q_dim, d_k_block_ + t * kv_dim, num_q_heads,
+                   num_kv_heads, head_dim, cfg.rotary_dim,
+                   current_pos + static_cast<std::uint32_t>(t), cfg.rope_theta,
+                   stream_);
+      }
+    });
     DebugDeviceTensor("decoder.Qcur-" + std::to_string(i), d_q_,
                       block_count * q_dim, stream_);
     DebugDeviceTensor("decoder.Kcur-" + std::to_string(i), d_k_block_,
@@ -910,90 +1084,112 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     DebugDeviceTensor("decoder.Vcur-" + std::to_string(i), d_v_block_,
                       block_count * kv_dim, stream_);
 
-    kernels::LaunchDFlashNonCausalAttention(
-        d_q_, d_injected_k_[i], d_injected_v_[i], d_k_block_, d_v_block_,
-        d_attn_out_, current_pos, std::min(current_pos, injected_context_len_),
-        block_count, df_cfg.sliding_window,
-        static_cast<std::uint32_t>(num_q_heads),
-        static_cast<std::uint32_t>(num_kv_heads),
-        static_cast<std::uint32_t>(head_dim), scale, stream_);
+    timed(&timings.layer_attention_ms, [&] {
+      kernels::LaunchDFlashNonCausalAttention(
+          d_q_, d_injected_k_[i], d_injected_v_[i], d_k_block_, d_v_block_,
+          d_attn_out_, current_pos,
+          std::min(current_pos, injected_context_len_), block_count,
+          df_cfg.sliding_window, static_cast<std::uint32_t>(num_q_heads),
+          static_cast<std::uint32_t>(num_kv_heads),
+          static_cast<std::uint32_t>(head_dim), scale, stream_);
+    });
 
-    RunBlockGemm(layer.attn_output, d_attn_out_, d_fused_features_, block_count,
-                 hidden_size, q_dim);
-    kernels::LaunchDFlashGroupedDynamicConv(
-        d_fused_features_, d_dynamic_coefficients_,
-        static_cast<const float*>(dflash_layer.attention_conv_base.data),
-        d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
-        df_cfg.conv_group_size, 1, stream_);
-    DebugDeviceTensor("decoder.attn_conv_out-" + std::to_string(i),
-                      d_conv_hidden_, block_count * hidden_size, stream_);
-    LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
-                             block_count, hidden_size, stream_);
-    DebugDeviceTensor("decoder.ffn_inp-" + std::to_string(i), d_block_hidden_,
-                      block_count * hidden_size, stream_);
+    timed(&timings.layer_gemm_ms, [&] {
+      RunBlockGemm(layer.attn_output, d_attn_out_, d_fused_features_,
+                   block_count, hidden_size, q_dim);
+    });
+    timed(&timings.layer_norm_conv_ms, [&] {
+      kernels::LaunchDFlashGroupedDynamicConv(
+          d_fused_features_, d_dynamic_coefficients_,
+          static_cast<const float*>(dflash_layer.attention_conv_base.data),
+          d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
+          df_cfg.conv_group_size, 1, stream_);
+      DebugDeviceTensor("decoder.attn_conv_out-" + std::to_string(i),
+                        d_conv_hidden_, block_count * hidden_size, stream_);
+      LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
+                               block_count, hidden_size, stream_);
+      DebugDeviceTensor("decoder.ffn_inp-" + std::to_string(i), d_block_hidden_,
+                        block_count * hidden_size, stream_);
 
-    LaunchBatchedRMSNorm(
-        d_block_hidden_, static_cast<const float*>(layer.ffn_norm.data),
-        d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
+      LaunchBatchedRMSNorm(
+          d_block_hidden_, static_cast<const float*>(layer.ffn_norm.data),
+          d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
+    });
     DebugDeviceTensor("decoder.ffn_norm-" + std::to_string(i), d_block_normed_,
                       block_count * hidden_size, stream_);
 
-    RunBlockGemm(dflash_layer.ffn_conv_projection, d_block_normed_,
-                 d_dynamic_coefficients_, block_count, dynamic_size,
-                 hidden_size);
-    kernels::LaunchDFlashGroupedDynamicConv(
-        d_block_normed_, d_dynamic_coefficients_,
-        static_cast<const float*>(dflash_layer.ffn_conv_base.data),
-        d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
-        df_cfg.conv_group_size, 0, stream_);
+    timed(&timings.layer_gemm_ms, [&] {
+      RunBlockGemm(dflash_layer.ffn_conv_projection, d_block_normed_,
+                   d_dynamic_coefficients_, block_count, dynamic_size,
+                   hidden_size);
+    });
+    timed(&timings.layer_norm_conv_ms, [&] {
+      kernels::LaunchDFlashGroupedDynamicConv(
+          d_block_normed_, d_dynamic_coefficients_,
+          static_cast<const float*>(dflash_layer.ffn_conv_base.data),
+          d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
+          df_cfg.conv_group_size, 0, stream_);
+    });
     DebugDeviceTensor("decoder.ffn_conv_in-" + std::to_string(i),
                       d_conv_hidden_, block_count * hidden_size, stream_);
 
-    RunBlockGemm(layer.ffn_gate, d_conv_hidden_, d_ffn_gate_, block_count,
-                 intermediate_size, hidden_size);
-    RunBlockGemm(layer.ffn_up, d_conv_hidden_, d_ffn_up_, block_count,
-                 intermediate_size, hidden_size);
-    kernels::LaunchDFlashSiLUMul(d_ffn_gate_, d_ffn_up_,
-                                 block_count * intermediate_size, stream_);
-    RunBlockGemm(layer.ffn_down, d_ffn_gate_, d_ffn_down_, block_count,
-                 hidden_size, intermediate_size);
+    timed(&timings.layer_gemm_ms, [&] {
+      RunBlockGemm(layer.ffn_gate, d_conv_hidden_, d_ffn_gate_, block_count,
+                   intermediate_size, hidden_size);
+      RunBlockGemm(layer.ffn_up, d_conv_hidden_, d_ffn_up_, block_count,
+                   intermediate_size, hidden_size);
+    });
+    timed(&timings.layer_norm_conv_ms, [&] {
+      kernels::LaunchDFlashSiLUMul(d_ffn_gate_, d_ffn_up_,
+                                   block_count * intermediate_size, stream_);
+    });
+    timed(&timings.layer_gemm_ms, [&] {
+      RunBlockGemm(layer.ffn_down, d_ffn_gate_, d_ffn_down_, block_count,
+                   hidden_size, intermediate_size);
+    });
     DebugDeviceTensor("decoder.ffn_out-" + std::to_string(i), d_ffn_down_,
                       block_count * hidden_size, stream_);
-    kernels::LaunchDFlashGroupedDynamicConv(
-        d_ffn_down_, d_dynamic_coefficients_,
-        static_cast<const float*>(dflash_layer.ffn_conv_base.data),
-        d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
-        df_cfg.conv_group_size, 1, stream_);
-    DebugDeviceTensor("decoder.ffn_conv_out-" + std::to_string(i),
-                      d_conv_hidden_, block_count * hidden_size, stream_);
-    LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
-                             block_count, hidden_size, stream_);
+    timed(&timings.layer_norm_conv_ms, [&] {
+      kernels::LaunchDFlashGroupedDynamicConv(
+          d_ffn_down_, d_dynamic_coefficients_,
+          static_cast<const float*>(dflash_layer.ffn_conv_base.data),
+          d_conv_hidden_, block_count, hidden_size, df_cfg.conv_kernel_size,
+          df_cfg.conv_group_size, 1, stream_);
+      DebugDeviceTensor("decoder.ffn_conv_out-" + std::to_string(i),
+                        d_conv_hidden_, block_count * hidden_size, stream_);
+      LaunchBatchedResidualAdd(d_block_hidden_, d_conv_hidden_, d_block_hidden_,
+                               block_count, hidden_size, stream_);
+    });
     DebugDeviceTensor("decoder.l_out-" + std::to_string(i), d_block_hidden_,
                       block_count * hidden_size, stream_);
   }
 
-  LaunchBatchedRMSNorm(
-      d_block_hidden_, static_cast<const float*>(weights.output_norm.data),
-      d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
+  timed(&timings.layer_norm_conv_ms, [&] {
+    LaunchBatchedRMSNorm(
+        d_block_hidden_, static_cast<const float*>(weights.output_norm.data),
+        d_block_normed_, nullptr, block_count, hidden_size, 1e-6F, stream_);
+  });
   DebugDeviceTensor("decoder.result_norm", d_block_normed_,
                     block_count * hidden_size, stream_);
 
-  RunBlockGemm(weights.selector_hidden, d_block_normed_ + hidden_size,
-               d_selector_hidden_, draft_count, df_cfg.selector_rank,
-               hidden_size);
-
   std::vector<tokenization::TokenId> tokens(draft_count, 0);
-  if (GetDFlashGemmMode() == DFlashGemmMode::kBaseline) {
-    for (std::size_t proposal = 0; proposal < draft_count; ++proposal) {
-      LaunchGEMV(weights.output.data, weights.output.type,
-                 d_block_normed_ + ((proposal + 1U) * hidden_size),
-                 d_logits_ + (proposal * vocab_size), vocab_size, hidden_size,
-                 stream_, models::qwen::QwenGemmMode::kHipMtp);
+  timed(&timings.head_ms, [&] {
+    RunBlockGemm(weights.selector_hidden, d_block_normed_ + hidden_size,
+                 d_selector_hidden_, draft_count, df_cfg.selector_rank,
+                 hidden_size);
+
+    if (GetDFlashGemmMode() == DFlashGemmMode::kBaseline) {
+      for (std::size_t proposal = 0; proposal < draft_count; ++proposal) {
+        LaunchGEMV(weights.output.data, weights.output.type,
+                   d_block_normed_ + ((proposal + 1U) * hidden_size),
+                   d_logits_ + (proposal * vocab_size), vocab_size, hidden_size,
+                   stream_, models::qwen::QwenGemmMode::kHipMtp);
+      }
+    } else {
+      RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
+                   draft_count, vocab_size, hidden_size);
     }
-  } else {
-    RunBlockGemm(weights.output, d_block_normed_ + hidden_size, d_logits_,
-                 draft_count, vocab_size, hidden_size);
-  }
+  });
   DebugDeviceTensor("decoder.result_output", d_logits_,
                     draft_count * vocab_size, stream_);
 
@@ -1011,6 +1207,7 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
       throw std::runtime_error("DFlash GPU sampling upload failed");
     }
   }
+  StageTimer selector_timer(&timings.selector_ms, stream_);
   for (std::size_t proposal = 0; proposal < draft_count; ++proposal) {
     const std::size_t candidate_offset = proposal * df_cfg.selector_top_k;
     kernels::LaunchDFlashSelectorStep(
@@ -1028,7 +1225,9 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
             : nullptr,
         vocab_size, df_cfg.selector_rank, df_cfg.selector_top_k, stream_);
   }
+  selector_timer.Stop();
 
+  StageTimer download_timer(&timings.download_ms, stream_);
   const auto token_copy =
       hipMemcpyAsync(tokens.data(), d_out_token_ + 1U,
                      draft_count * sizeof(tokenization::TokenId),

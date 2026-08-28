@@ -1,9 +1,11 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <iostream>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -41,6 +43,84 @@ constexpr std::size_t kMaxDecodeBatch = 8;
   return enabled;
 }
 
+[[nodiscard]] bool VerifyTimingEnabled() noexcept {
+  static const bool enabled = std::getenv("GUFO_VERIFY_TIMING") != nullptr;
+  return enabled;
+}
+
+/// Stage rollup for the decode-equivalent verification chunk, printed at
+/// process exit when GUFO_VERIFY_TIMING is set. Stage boundaries synchronize,
+/// so the accounting is only wired up under the flag.
+struct VerifyStageTimings {
+  double projections_ms{0.0};
+  double ssm_recurrence_ms{0.0};
+  double attention_ms{0.0};
+  double ffn_ms{0.0};
+  double head_ms{0.0};
+  double other_ms{0.0};
+  std::uint64_t chunks{0};
+
+  ~VerifyStageTimings() {
+    if (!VerifyTimingEnabled() || chunks == 0) {
+      return;
+    }
+    const double n = static_cast<double>(chunks);
+    const double total = projections_ms + ssm_recurrence_ms + attention_ms +
+                         ffn_ms + head_ms + other_ms;
+    std::cerr << "\n[VERIFY_TIMING] chunks=" << chunks << '\n'
+              << "  total          " << total << " ms  (" << (total / n)
+              << " ms/chunk)\n"
+              << "    projections  " << projections_ms << " ms  ("
+              << (projections_ms / n) << ")\n"
+              << "    ssm recur    " << ssm_recurrence_ms << " ms  ("
+              << (ssm_recurrence_ms / n) << ")\n"
+              << "    attention    " << attention_ms << " ms  ("
+              << (attention_ms / n) << ")\n"
+              << "    ffn          " << ffn_ms << " ms  (" << (ffn_ms / n)
+              << ")\n"
+              << "    lm head      " << head_ms << " ms  (" << (head_ms / n)
+              << ")\n"
+              << "    other        " << other_ms << " ms  (" << (other_ms / n)
+              << ")\n";
+  }
+};
+
+[[nodiscard]] VerifyStageTimings& VerifyTimings() {
+  static VerifyStageTimings timings;
+  return timings;
+}
+
+class VerifyStageTimer {
+public:
+  VerifyStageTimer(double* sink, hipStream_t stream)
+      : sink_(VerifyTimingEnabled() ? sink : nullptr), stream_(stream) {
+    if (sink_ != nullptr) {
+      (void)hipStreamSynchronize(stream_);
+      start_ = std::chrono::steady_clock::now();
+    }
+  }
+
+  VerifyStageTimer(const VerifyStageTimer&) = delete;
+  VerifyStageTimer& operator=(const VerifyStageTimer&) = delete;
+  VerifyStageTimer(VerifyStageTimer&&) = delete;
+  VerifyStageTimer& operator=(VerifyStageTimer&&) = delete;
+
+  ~VerifyStageTimer() {
+    if (sink_ == nullptr) {
+      return;
+    }
+    (void)hipStreamSynchronize(stream_);
+    *sink_ += std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - start_)
+                  .count();
+  }
+
+private:
+  double* sink_{nullptr};
+  hipStream_t stream_{nullptr};
+  std::chrono::steady_clock::time_point start_{};
+};
+
 void LaunchProjection(const models::QwenTensorRef& weight, const float* input,
                       float* output, std::size_t batch_size,
                       std::size_t output_size, std::size_t input_size,
@@ -50,10 +130,10 @@ void LaunchProjection(const models::QwenTensorRef& weight, const float* input,
                                batch_size, output_size, input_size, stream);
     return;
   }
-  if (weight.type == core::GgmlType::kBF16 && batch_size == 8 &&
+  if (weight.type == core::GgmlType::kBF16 && batch_size <= kMaxDecodeBatch &&
       UseExactBf16Lds8Projection()) {
-    LaunchExactBf16GEMMFp32Batch8(weight.data, input, output, output_size,
-                                  input_size, stream);
+    LaunchExactBf16GEMMFp32SmallBatch(weight.data, input, output, batch_size,
+                                      output_size, input_size, stream);
     return;
   }
 
@@ -401,6 +481,10 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
 
   replaying_ssm_state_ = false;
   last_verification_rows_ = batch_size;
+  auto& stages = VerifyTimings();
+  if (VerifyTimingEnabled()) {
+    ++stages.chunks;
+  }
   h_verification_hidden_.clear();
   h_verification_logits_.clear();
 
@@ -462,15 +546,18 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
 
     bool ssm_residual_folded = false;
     if (layer.is_full_attention) {
-      LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, q_projection_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
-                       scratch.attention.k.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
-                       scratch.attention.v.data(), batch_size, kv_size,
-                       hidden_size, arena_.stream);
+      {
+        VerifyStageTimer timer(&stages.projections_ms, arena_.stream);
+        LaunchProjection(layer.attn_q, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, q_projection_size,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.attn_k, scratch.decode.normed.data(),
+                         scratch.attention.k.data(), batch_size, kv_size,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.attn_v, scratch.decode.normed.data(),
+                         scratch.attention.v.data(), batch_size, kv_size,
+                         hidden_size, arena_.stream);
+      }
       LaunchBatchedUnpackQG(scratch.ssm.qkv.data(), scratch.attention.q.data(),
                             scratch.ssm.gate.data(), batch_size,
                             config.num_attention_heads, config.head_dim,
@@ -503,6 +590,7 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
         }
       }
 
+      VerifyStageTimer attention_timer(&stages.attention_ms, arena_.stream);
       for (std::size_t row = 0; row < batch_size; ++row) {
         float* const query =
             scratch.attention.q.data() + (row * attention_size);
@@ -553,38 +641,45 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
                        scratch.attention.output.data(), batch_size, hidden_size,
                        attention_size, arena_.stream);
     } else {
-      LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
-                       scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
-                       scratch.ssm.gate.data(), batch_size, ssm_inner_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.ssm_alpha, scratch.decode.normed.data(),
-                       scratch.ssm.alpha.data(), batch_size, time_step_rank,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.ssm_beta, scratch.decode.normed.data(),
-                       scratch.ssm.beta.data(), batch_size, time_step_rank,
-                       hidden_size, arena_.stream);
+      {
+        VerifyStageTimer timer(&stages.projections_ms, arena_.stream);
+        LaunchProjection(layer.attn_qkv, scratch.decode.normed.data(),
+                         scratch.ssm.qkv.data(), batch_size, ssm_qkv_size,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.attn_gate, scratch.decode.normed.data(),
+                         scratch.ssm.gate.data(), batch_size, ssm_inner_size,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.ssm_alpha, scratch.decode.normed.data(),
+                         scratch.ssm.alpha.data(), batch_size, time_step_rank,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.ssm_beta, scratch.decode.normed.data(),
+                         scratch.ssm.beta.data(), batch_size, time_step_rank,
+                         hidden_size, arena_.stream);
+      }
 
-      for (std::size_t row = 0; row < batch_size; ++row) {
+      {
+        // One pair of launches walks the whole verification batch. The rows are
+        // still applied in order with identical arithmetic, so this is
+        // bit-exact; it removes 2 x batch_size dispatches per SSM layer, which
+        // dominated the stage at width 8.
+        VerifyStageTimer ssm_timer(&stages.ssm_recurrence_ms, arena_.stream);
         auto replay_capture = arena_.GetSsmReplayCapture();
-        replay_capture.position = scratch.decode.prompt_tokens.data() + row;
-        LaunchSSMConvRecurrence(
-            scratch.ssm.qkv.data() + (row * ssm_qkv_size),
+        replay_capture.position = scratch.decode.prompt_tokens.data();
+        LaunchSSMConvRecurrenceRows(
+            scratch.ssm.qkv.data(),
             static_cast<const float*>(layer.ssm_conv1d.data),
-            arena_.d_ssm_conv_state,
-            scratch.ssm.conv_out.data() + (row * ssm_qkv_size),
-            arena_.d_ssm_deltanet_state,
-            scratch.ssm.alpha.data() + (row * time_step_rank),
-            scratch.ssm.beta.data() + (row * time_step_rank),
+            arena_.d_ssm_conv_state, scratch.ssm.conv_out.data(),
+            arena_.d_ssm_deltanet_state, scratch.ssm.alpha.data(),
+            scratch.ssm.beta.data(),
             static_cast<const float*>(layer.ssm_a.data),
             static_cast<const float*>(layer.ssm_dt.data),
             static_cast<const float*>(layer.ssm_norm.data),
-            scratch.ssm.gate.data() + (row * ssm_inner_size),
-            scratch.ssm.out.data() + (row * ssm_inner_size), layer_index,
+            scratch.ssm.gate.data(), scratch.ssm.out.data(), layer_index,
             ssm_qkv_size, config.ssm_group_count, config.ssm_time_step_rank,
-            config.ssm_state_size, config.SsmValueSize(), arena_.stream,
-            replay_capture, arena_.GetRecurrentStateStorage());
+            config.ssm_state_size, config.SsmValueSize(),
+            static_cast<std::uint32_t>(batch_size), time_step_rank,
+            ssm_inner_size, arena_.stream, replay_capture,
+            arena_.GetRecurrentStateStorage());
       }
 
       ssm_residual_folded = route_plan.fuse_ssm_epilogue &&
@@ -631,33 +726,36 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
       }
     }
 
-    if (fuse_ffn_norm_swiglu) {
-      for (std::size_t row = 0; row < batch_size; ++row) {
-        LaunchFusedRMSNormSwiGLUGEMV(
-            scratch.decode.hidden.data() + (row * hidden_size),
-            static_cast<const float*>(layer.ffn_norm.data), 1e-6F,
-            layer.ffn_gate.data, layer.ffn_up.data,
-            scratch.ffn.activation.data() + (row * intermediate_size),
-            intermediate_size, hidden_size, arena_.stream);
+    {
+      VerifyStageTimer ffn_timer(&stages.ffn_ms, arena_.stream);
+      if (fuse_ffn_norm_swiglu) {
+        for (std::size_t row = 0; row < batch_size; ++row) {
+          LaunchFusedRMSNormSwiGLUGEMV(
+              scratch.decode.hidden.data() + (row * hidden_size),
+              static_cast<const float*>(layer.ffn_norm.data), 1e-6F,
+              layer.ffn_gate.data, layer.ffn_up.data,
+              scratch.ffn.activation.data() + (row * intermediate_size),
+              intermediate_size, hidden_size, arena_.stream);
+        }
+      } else {
+        LaunchProjection(layer.ffn_gate, scratch.decode.normed.data(),
+                         scratch.ffn.gate.data(), batch_size, intermediate_size,
+                         hidden_size, arena_.stream);
+        LaunchProjection(layer.ffn_up, scratch.decode.normed.data(),
+                         scratch.ffn.up.data(), batch_size, intermediate_size,
+                         hidden_size, arena_.stream);
+        LaunchBatchedSwiGLUActivation(
+            scratch.ffn.gate.data(), scratch.ffn.up.data(),
+            scratch.ffn.activation.data(), nullptr,
+            batch_size * intermediate_size, arena_.stream);
       }
-    } else {
-      LaunchProjection(layer.ffn_gate, scratch.decode.normed.data(),
-                       scratch.ffn.gate.data(), batch_size, intermediate_size,
-                       hidden_size, arena_.stream);
-      LaunchProjection(layer.ffn_up, scratch.decode.normed.data(),
-                       scratch.ffn.up.data(), batch_size, intermediate_size,
-                       hidden_size, arena_.stream);
-      LaunchBatchedSwiGLUActivation(
-          scratch.ffn.gate.data(), scratch.ffn.up.data(),
-          scratch.ffn.activation.data(), nullptr,
-          batch_size * intermediate_size, arena_.stream);
+      LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
+                       scratch.ffn.out.data(), batch_size, hidden_size,
+                       intermediate_size, arena_.stream);
+      LaunchBatchedResidualAdd(
+          scratch.decode.hidden.data(), scratch.ffn.out.data(),
+          scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
     }
-    LaunchProjection(layer.ffn_down, scratch.ffn.activation.data(),
-                     scratch.ffn.out.data(), batch_size, hidden_size,
-                     intermediate_size, arena_.stream);
-    LaunchBatchedResidualAdd(
-        scratch.decode.hidden.data(), scratch.ffn.out.data(),
-        scratch.decode.hidden.data(), batch_size, hidden_size, arena_.stream);
 
     if (capture_prompt_hidden_) {
       if (const auto tap = arena_.GetTargetLayerCaptureIndex(layer_index);
@@ -687,6 +785,7 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
   }
   last_hidden_offset_ = (batch_size - 1) * hidden_size;
 
+  VerifyStageTimer head_timer(&stages.head_ms, arena_.stream);
   LaunchBatchedRMSNorm(scratch.decode.hidden.data(),
                        static_cast<const float*>(weights_.output_norm.data),
                        scratch.decode.normed.data(), nullptr, batch_size,

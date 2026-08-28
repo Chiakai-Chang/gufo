@@ -110,8 +110,8 @@ void PrintPromptHelp(std::string_view program_name) {
                    "(default: 7)",
                    "Speculative", &opt.draft_tokens);
   parser.AddOption("", "--draft-policy", "MODE",
-                   "Draft sizing: fixed, rolling, or accepted-ema (default: "
-                   "rolling)",
+                   "Draft sizing: auto, fixed, rolling, or accepted-ema "
+                   "(default: auto, fixed for DFlash-2)",
                    "Speculative", &opt.draft_policy);
   parser.AddOption("", "--min-draft-tokens", "N",
                    "Adaptive draft floor (default: 1)", "Speculative",
@@ -420,11 +420,13 @@ std::optional<PromptOptions> ParsePromptOptions(
       });
   parser.AddCustomOption(
       "", "--draft-policy", "MODE",
-      "Draft sizing: fixed, rolling, or accepted-ema (default: rolling)",
+      "Draft sizing: auto, fixed, rolling, or accepted-ema (default: auto, "
+      "which is fixed for DFlash-2 and rolling otherwise)",
       "Speculative",
       [&opt](std::string_view, std::string_view value,
              std::string* error) -> bool {
-        if (value != "fixed" && value != "rolling" && value != "accepted-ema") {
+        if (value != "auto" && value != "fixed" && value != "rolling" &&
+            value != "accepted-ema") {
           if (error != nullptr) {
             *error = "Invalid draft policy: " + std::string(value);
           }
@@ -675,9 +677,15 @@ int RunPrompt(std::span<const char* const> args) {
           s_opts.max_draft_tokens = opt.draft_tokens;
           s_opts.min_draft_tokens = opt.min_draft_tokens;
           s_opts.initial_draft_tokens = opt.draft_tokens;
-          if (opt.draft_policy == "fixed") {
+          const bool block_diffusion_draft =
+              opt.speculative_backend == "dflash" ||
+              opt.speculative_backend == "dflash2" ||
+              opt.speculative_backend == "dflash-2";
+          const auto resolved_policy = speculative::ResolveDraftPolicy(
+              opt.draft_policy, block_diffusion_draft);
+          if (resolved_policy == "fixed") {
             s_opts.enable_adaptive_draft_length = false;
-          } else if (opt.draft_policy == "accepted-ema") {
+          } else if (resolved_policy == "accepted-ema") {
             s_opts.adaptive_draft_policy =
                 speculative::AdaptiveDraftPolicy::kAcceptedTokenEma;
           }

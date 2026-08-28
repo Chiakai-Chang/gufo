@@ -16,7 +16,7 @@ void TestDefaultOptions() {
   assert(opt->use_chat_template);
   assert(!opt->verbose);
   assert(opt->draft_tokens == 7);
-  assert(opt->draft_policy == "rolling");
+  assert(opt->draft_policy == "auto");
   assert(opt->min_draft_tokens == 1);
 }
 
