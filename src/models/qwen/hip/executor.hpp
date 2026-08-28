@@ -121,6 +121,10 @@ public:
   [[nodiscard]] QwenKvCacheStorage KvStorage() const noexcept {
     return kv_storage_;
   }
+  [[nodiscard]] QwenRecurrentStateStorage RecurrentStateStorage()
+      const noexcept {
+    return recurrent_state_storage_;
+  }
 
 private:
   QwenGpuSnapshot() = default;
@@ -138,6 +142,8 @@ private:
   std::uint32_t valid_context_{0};
   std::size_t payload_bytes_{0};
   QwenKvCacheStorage kv_storage_{QwenKvCacheStorage::kFp32};
+  QwenRecurrentStateStorage recurrent_state_storage_{
+      QwenRecurrentStateStorage::kFp32};
 
   friend class QwenGpuArena;
 };
@@ -261,7 +267,7 @@ public:
   void* d_attention_kv_f16{nullptr};
   float* d_kv_cache{nullptr};
   float* d_ssm_conv_state{nullptr};
-  float* d_ssm_deltanet_state{nullptr};
+  void* d_ssm_deltanet_state{nullptr};
   std::uint32_t* d_prompt_tokens{nullptr};
   float* d_target_layer_features{nullptr};
 
@@ -288,6 +294,10 @@ public:
   }
   [[nodiscard]] std::uint32_t GetMaxContext() const noexcept {
     return max_context_;
+  }
+  [[nodiscard]] QwenRecurrentStateStorage GetRecurrentStateStorage()
+      const noexcept {
+    return policy_.recurrent_state_storage;
   }
   [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
       const core::ModelConfig& config, std::uint32_t max_context,
@@ -317,7 +327,7 @@ private:
   QwenExecutionPolicy policy_;
   std::vector<std::uint32_t> target_layer_ids_;
   float* d_saved_ssm_conv_state_{nullptr};
-  float* d_saved_ssm_deltanet_state_{nullptr};
+  void* d_saved_ssm_deltanet_state_{nullptr};
   float* d_ssm_replay_qkv_{nullptr};
   float* d_ssm_replay_alpha_{nullptr};
   float* d_ssm_replay_beta_{nullptr};

@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/hip/detail/recurrent_state.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
 namespace gufo::hip {
@@ -110,8 +111,9 @@ __global__ void SSMConvKernel(const float* __restrict__ qkv_in,
   conv_out[c] = dot * sig;
 }
 
+template<detail::QwenRecurrentStateElement StateT>
 __global__ void DeltaNetRecurrenceKernel(
-    const float* __restrict__ conv_out, float* __restrict__ deltanet_state,
+    const float* __restrict__ conv_out, StateT* __restrict__ deltanet_state,
     const float* __restrict__ alpha_buf, const float* __restrict__ beta_buf,
     const float* __restrict__ ssm_a, const float* __restrict__ ssm_dt,
     const float* __restrict__ ssm_norm, const float* __restrict__ gate,
@@ -134,7 +136,7 @@ __global__ void DeltaNetRecurrenceKernel(
   const float* v_h = v_ptr + (h * val_dim);
   float* o_h = out_buf + (h * val_dim);
 
-  float* s_matrix =
+  StateT* s_matrix =
       deltanet_state + ((static_cast<std::size_t>(layer_idx) * num_heads + h) *
                         key_dim * val_dim);
 
@@ -218,9 +220,7 @@ __global__ void DeltaNetRecurrenceKernel(
   // 3. Associative retrieval & state update with vectorized float4
   if (tid < val_dim) {
     const std::size_t j = tid;
-    float* s_row = s_matrix + (j * key_dim);
-    const float4* s_row4 = reinterpret_cast<const float4*>(s_row);
-    float4* s_row4_out = reinterpret_cast<float4*>(s_row);
+    StateT* s_row = s_matrix + (j * key_dim);
     const float4* k4 = reinterpret_cast<const float4*>(s_k);
     const float4* q4 = reinterpret_cast<const float4*>(s_q);
 
@@ -229,7 +229,7 @@ __global__ void DeltaNetRecurrenceKernel(
     float u_j = 0.0F;
 #pragma unroll
     for (std::size_t vi = 0; vi < key_vec; ++vi) {
-      const float4 st = s_row4[vi];
+      const float4 st = detail::LoadRecurrentState4(s_row, vi);
       const float4 kv = k4[vi];
       u_j += (st.x * alpha_h) * kv.x + (st.y * alpha_h) * kv.y +
              (st.z * alpha_h) * kv.z + (st.w * alpha_h) * kv.w;
@@ -239,14 +239,14 @@ __global__ void DeltaNetRecurrenceKernel(
     float o_j = 0.0F;
 #pragma unroll
     for (std::size_t vi = 0; vi < key_vec; ++vi) {
-      float4 st = s_row4[vi];
+      float4 st = detail::LoadRecurrentState4(s_row, vi);
       const float4 kv = k4[vi];
       const float4 qv = q4[vi];
       st.x = (st.x * alpha_h) + (d_j * kv.x);
       st.y = (st.y * alpha_h) + (d_j * kv.y);
       st.z = (st.z * alpha_h) + (d_j * kv.z);
       st.w = (st.w * alpha_h) + (d_j * kv.w);
-      s_row4_out[vi] = st;
+      detail::StoreRecurrentState4(s_row, vi, st);
       o_j += st.x * qv.x + st.y * qv.y + st.z * qv.z + st.w * qv.w;
     }
     o_h[j] = o_j;
@@ -290,12 +290,13 @@ __global__ void DeltaNetRecurrenceKernel(
 
 void LaunchSSMConvRecurrence(
     const float* qkv_in, const float* conv_weights, float* conv_state,
-    float* conv_out, float* deltanet_state, const float* alpha_buf,
+    float* conv_out, void* deltanet_state, const float* alpha_buf,
     const float* beta_buf, const float* ssm_a, const float* ssm_dt,
     const float* ssm_norm, const float* gate, float* out_buf,
     std::uint32_t layer_idx, std::size_t qkv_size, std::uint32_t num_key_heads,
     std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
-    hipStream_t stream, SsmReplayCapture replay_capture) {
+    hipStream_t stream, SsmReplayCapture replay_capture,
+    QwenRecurrentStateStorage state_storage) {
   const std::size_t block_size = 256;
   const std::size_t grid_size = (qkv_size + block_size - 1) / block_size;
   float* conv_layer_state =
@@ -305,10 +306,17 @@ void LaunchSSMConvRecurrence(
       qkv_in, conv_weights, conv_layer_state, conv_out, qkv_size, layer_idx,
       replay_capture);
 
-  DeltaNetRecurrenceKernel<<<num_heads, 256, 0, stream>>>(
-      conv_out, deltanet_state, alpha_buf, beta_buf, ssm_a, ssm_dt, ssm_norm,
-      gate, out_buf, layer_idx, num_key_heads, num_heads, key_dim, val_dim,
-      replay_capture);
+  if (state_storage == QwenRecurrentStateStorage::kBf16) {
+    DeltaNetRecurrenceKernel<<<num_heads, 256, 0, stream>>>(
+        conv_out, static_cast<hip_bfloat16*>(deltanet_state), alpha_buf,
+        beta_buf, ssm_a, ssm_dt, ssm_norm, gate, out_buf, layer_idx,
+        num_key_heads, num_heads, key_dim, val_dim, replay_capture);
+  } else {
+    DeltaNetRecurrenceKernel<<<num_heads, 256, 0, stream>>>(
+        conv_out, static_cast<float*>(deltanet_state), alpha_buf, beta_buf,
+        ssm_a, ssm_dt, ssm_norm, gate, out_buf, layer_idx, num_key_heads,
+        num_heads, key_dim, val_dim, replay_capture);
+  }
 }
 
 }  // namespace gufo::hip

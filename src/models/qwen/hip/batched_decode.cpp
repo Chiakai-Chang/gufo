@@ -255,7 +255,8 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
             scratch.ssm.out.data() + (row * ssm_inner_size), layer_index,
             ssm_qkv_size, config.ssm_group_count, config.ssm_time_step_rank,
             config.ssm_state_size, config.SsmValueSize(), arena.stream,
-            state_arena.GetSsmReplayCapture());
+            state_arena.GetSsmReplayCapture(),
+            state_arena.GetRecurrentStateStorage());
       }
 
       ssm_residual_folded = route_plan.fuse_ssm_epilogue &&
@@ -583,7 +584,7 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
             scratch.ssm.out.data() + (row * ssm_inner_size), layer_index,
             ssm_qkv_size, config.ssm_group_count, config.ssm_time_step_rank,
             config.ssm_state_size, config.SsmValueSize(), arena_.stream,
-            replay_capture);
+            replay_capture, arena_.GetRecurrentStateStorage());
       }
 
       ssm_residual_folded = route_plan.fuse_ssm_epilogue &&

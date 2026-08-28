@@ -44,7 +44,17 @@ constexpr std::string_view kDeepSeekStateAbi =
     "deepseek-v4-flash-gfx1151-state-v1";
 
 constexpr std::string_view QwenStateAbi(bool speculative,
-                                        bool fp16_attention_kv) noexcept {
+                                        bool fp16_attention_kv,
+                                        bool bf16_recurrent_state) noexcept {
+  if (bf16_recurrent_state) {
+    if (speculative) {
+      return fp16_attention_kv
+                 ? "qwen-gfx1151-dflash-state-v4-fp16-kv-bf16-recurrent"
+                 : "qwen-gfx1151-dflash-state-v4-fp32-kv-bf16-recurrent";
+    }
+    return fp16_attention_kv ? "qwen-gfx1151-state-v3-fp16-kv-bf16-recurrent"
+                             : "qwen-gfx1151-state-v3-fp32-kv-bf16-recurrent";
+  }
   if (speculative) {
     return fp16_attention_kv ? "qwen-gfx1151-dflash-state-v3-fp16-kv"
                              : "qwen-gfx1151-dflash-state-v3-fp32-kv";
@@ -480,7 +490,8 @@ public:
     return {
         .model_id = model_->GetConfig().model_name,
         .state_abi = std::string(QwenStateAbi(
-            speculative_enabled, execution_policy_.UsesFp16AttentionKv())),
+            speculative_enabled, execution_policy_.UsesFp16AttentionKv(),
+            execution_policy_.UsesBf16RecurrentState())),
         .max_context = max_context_,
         .capabilities =
             TextRunnerCapabilities{

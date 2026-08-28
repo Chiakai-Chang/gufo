@@ -163,7 +163,9 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
       CheckedMultiply(CheckedMultiply(config.num_layers, time_step),
                       config.ssm_state_size),
       config.SsmValueSize());
-  AddAllocation(total_deltanet, sizeof(float), &state);
+  AddAllocation(total_deltanet,
+                QwenRecurrentStateElementBytes(policy.recurrent_state_storage),
+                &state);
   return usage;
 }
 
@@ -183,6 +185,7 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   snapshot->max_context_ = max_context_;
   snapshot->valid_context_ = valid_context;
   snapshot->kv_storage_ = policy_.kv_cache_storage;
+  snapshot->recurrent_state_storage_ = policy_.recurrent_state_storage;
   snapshot->kv_elements_per_plane_ = CheckedMultiply(
       CheckedMultiply(snapshot->attention_layers_, max_context_),
       snapshot->kv_width_);
@@ -202,8 +205,9 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
                       sizeof(std::uint16_t));
   const std::size_t conv_bytes =
       CheckedMultiply(snapshot->conv_elements_, sizeof(float));
-  const std::size_t deltanet_bytes =
-      CheckedMultiply(snapshot->deltanet_elements_, sizeof(float));
+  const std::size_t deltanet_bytes = CheckedMultiply(
+      snapshot->deltanet_elements_,
+      QwenRecurrentStateElementBytes(snapshot->recurrent_state_storage_));
   CheckedAdd(policy_.UsesFp16AttentionKv() ? kv_f16_bytes : kv_f32_bytes,
              &snapshot->payload_bytes_);
   CheckedAdd(conv_bytes, &snapshot->payload_bytes_);
@@ -263,6 +267,7 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
       snapshot.attention_layers_ != attention_layers ||
       snapshot.kv_width_ != kv_width || snapshot.max_context_ != max_context_ ||
       snapshot.kv_storage_ != policy_.kv_cache_storage ||
+      snapshot.recurrent_state_storage_ != policy_.recurrent_state_storage ||
       snapshot.conv_elements_ != conv_elements ||
       snapshot.deltanet_elements_ != deltanet_elements) {
     throw std::invalid_argument("Qwen snapshot is incompatible with the arena");
@@ -292,7 +297,9 @@ void QwenGpuArena::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
                                  hipMemcpyDeviceToDevice, stream),
                   "failed to restore Qwen convolution snapshot");
   ThrowOnHipError(hipMemcpyAsync(d_ssm_deltanet_state, snapshot.d_ssm_deltanet_,
-                                 snapshot.deltanet_elements_ * sizeof(float),
+                                 snapshot.deltanet_elements_ *
+                                     QwenRecurrentStateElementBytes(
+                                         policy_.recurrent_state_storage),
                                  hipMemcpyDeviceToDevice, stream),
                   "failed to restore Qwen DeltaNet snapshot");
   ThrowOnHipError(hipStreamSynchronize(stream),
@@ -417,7 +424,9 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   const std::size_t total_deltanet = num_layers * time_step_rank *
                                      config_.ssm_state_size *
                                      config_.SsmValueSize();
-  HIP_CHECK(hipMalloc(&d_ssm_deltanet_state, total_deltanet * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ssm_deltanet_state,
+                      total_deltanet * QwenRecurrentStateElementBytes(
+                                           policy_.recurrent_state_storage)));
 
   Reset();
 }
@@ -765,8 +774,11 @@ void QwenGpuArena::Reset() noexcept {
                              stream));
   }
   if (d_ssm_deltanet_state != nullptr) {
-    HIP_CHECK(hipMemsetAsync(d_ssm_deltanet_state, 0,
-                             total_deltanet * sizeof(float), stream));
+    HIP_CHECK(hipMemsetAsync(
+        d_ssm_deltanet_state, 0,
+        total_deltanet *
+            QwenRecurrentStateElementBytes(policy_.recurrent_state_storage),
+        stream));
   }
   DisableSsmReplayCapture();
   saved_context_ = 0;

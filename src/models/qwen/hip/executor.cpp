@@ -161,7 +161,8 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position) {
         static_cast<const float*>(layer.ssm_dt.data), nullptr, nullptr,
         scratch.ssm.out.data(), layer_idx, config.SsmQkvSize(),
         config.ssm_group_count, config.ssm_time_step_rank,
-        config.ssm_state_size, config.SsmValueSize(), arena_.stream);
+        config.ssm_state_size, config.SsmValueSize(), arena_.stream, {},
+        arena_.GetRecurrentStateStorage());
   }
 }
 

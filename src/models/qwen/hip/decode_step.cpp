@@ -314,7 +314,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
           ssm_scratch.gate.data(), ssm_scratch.out.data(), l, ssm_qkv_size,
           config.ssm_group_count, config.ssm_time_step_rank,
           config.ssm_state_size, config.SsmValueSize(), arena.stream,
-          arena.GetSsmReplayCapture());
+          arena.GetSsmReplayCapture(), arena.GetRecurrentStateStorage());
 
       // opt-c010-ssm-gate-residual: fold the post-SSM residual add into the
       // ssm_out GEMV epilogue (y = A*x + hidden). The unfused chain (GEMV

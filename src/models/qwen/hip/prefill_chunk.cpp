@@ -620,7 +620,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             ssm_epilogue_q8 ? arena_.d_scratch_q8_act : nullptr,
             arena_.d_ssm_kq_scales, arena_.d_ssm_alpha_beta, l, batch_size,
             ssm_qkv_size, config.ssm_group_count, config.ssm_time_step_rank,
-            config.ssm_state_size, config.SsmValueSize(), arena_.stream);
+            config.ssm_state_size, config.SsmValueSize(), arena_.stream,
+            arena_.GetRecurrentStateStorage());
       } else if (route_plan.fuse_ssm_epilogue) {
         LaunchBatchedSSMConvRecurrenceNormGate(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -631,7 +632,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
             arena_.d_ssm_out, l, batch_size, ssm_qkv_size,
             config.ssm_group_count, config.ssm_time_step_rank,
-            config.ssm_state_size, config.SsmValueSize(), arena_.stream);
+            config.ssm_state_size, config.SsmValueSize(), arena_.stream,
+            arena_.GetRecurrentStateStorage());
       } else {
         LaunchBatchedSSMConvRecurrence(
             arena_.d_ssm_qkv, static_cast<const float*>(layer.ssm_conv1d.data),
@@ -642,7 +644,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             static_cast<const float*>(layer.ssm_norm.data), arena_.d_ssm_gate,
             arena_.d_ssm_out, l, batch_size, ssm_qkv_size,
             config.ssm_group_count, config.ssm_time_step_rank,
-            config.ssm_state_size, config.SsmValueSize(), arena_.stream);
+            config.ssm_state_size, config.SsmValueSize(), arena_.stream,
+            arena_.GetRecurrentStateStorage());
       }
 
       if (do_profile) {

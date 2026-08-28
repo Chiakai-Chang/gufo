@@ -81,6 +81,25 @@ void TestFusionToggleValues() {
         gufo::hip::QwenKvCacheStorage::kFp32);
   Check(gufo::hip::ResolveQwenKvCacheStorage("invalid") ==
         gufo::hip::QwenKvCacheStorage::kFp16);
+  Check(gufo::hip::QwenExecutionPolicy::Production().recurrent_state_storage ==
+        gufo::hip::QwenRecurrentStateStorage::kFp32);
+  Check(gufo::hip::ResolveQwenRecurrentStateStorage(nullptr) ==
+        gufo::hip::QwenRecurrentStateStorage::kFp32);
+  Check(gufo::hip::ResolveQwenRecurrentStateStorage("fp32") ==
+        gufo::hip::QwenRecurrentStateStorage::kFp32);
+  Check(gufo::hip::ResolveQwenRecurrentStateStorage("float") ==
+        gufo::hip::QwenRecurrentStateStorage::kFp32);
+  Check(gufo::hip::ResolveQwenRecurrentStateStorage("bf16") ==
+        gufo::hip::QwenRecurrentStateStorage::kBf16);
+  Check(gufo::hip::ResolveQwenRecurrentStateStorage("bfloat16") ==
+        gufo::hip::QwenRecurrentStateStorage::kBf16);
+  Check(gufo::hip::ResolveQwenRecurrentStateStorage("invalid") ==
+        gufo::hip::QwenRecurrentStateStorage::kFp32);
+  Check(gufo::hip::QwenRecurrentStateElementBytes(
+            gufo::hip::QwenRecurrentStateStorage::kFp32) == sizeof(float));
+  Check(gufo::hip::QwenRecurrentStateElementBytes(
+            gufo::hip::QwenRecurrentStateStorage::kBf16) ==
+        sizeof(std::uint16_t));
 
   // Q/K norm + RoPE + KV write: ENABLED -> decode uses the fused kernel.
   Check(gufo::hip::detail::ShouldFuseQKNormRoPEKvWrite() == true);
@@ -107,6 +126,13 @@ void TestFusionToggleValues() {
   Check(!fp32_fallback.UsesFp16AttentionKv());
   Check(fp32_fallback.Fingerprint() ==
         (candidate.Fingerprint() & ~(1ULL << 8U)));
+
+  auto bf16_recurrent = candidate;
+  bf16_recurrent.recurrent_state_storage =
+      gufo::hip::QwenRecurrentStateStorage::kBf16;
+  Check(bf16_recurrent.UsesBf16RecurrentState());
+  Check(bf16_recurrent.Fingerprint() ==
+        (candidate.Fingerprint() | (1ULL << 9U)));
 
   const auto decode_plan = gufo::hip::ResolveQwenLayerRoute(
       candidate, gufo::hip::QwenExecutionMode::kDecode, false);
