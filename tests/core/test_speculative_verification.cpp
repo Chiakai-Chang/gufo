@@ -625,6 +625,7 @@ void TestAcceptedTokenEmaDraftPolicy() {
   options.initial_draft_tokens = 7;
   options.adaptive_draft_policy =
       gufo::speculative::AdaptiveDraftPolicy::kAcceptedTokenEma;
+  options.draft_headroom_tokens = 0;
   gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend),
                                                   options);
 
@@ -637,6 +638,46 @@ void TestAcceptedTokenEmaDraftPolicy() {
              std::vector<std::uint32_t>({3, 3, 4, 3}),
          "EMA policy must probe after full acceptance and back off after a "
          "partial block");
+}
+
+void TestAcceptedTokenEmaHeadroomDraftsAboveTheMean() {
+  constexpr TokenId eos_id = 900;
+  const std::vector<TokenId> prompt = {1, 2, 3};
+  std::vector<TokenId> generated_tokens;
+  generated_tokens.reserve(48);
+  for (TokenId token = 10; token < 58; ++token) {
+    generated_tokens.push_back(token);
+  }
+
+  ScriptedTargetExecutor target(generated_tokens, eos_id);
+  auto backend = std::make_unique<ScriptedAcceptanceDraftBackend>(
+      generated_tokens, prompt.size(), std::vector<std::size_t>{4, 1, 1, 1});
+  auto* backend_view = backend.get();
+
+  gufo::speculative::SpeculativeOptions options;
+  options.max_draft_tokens = 7;
+  options.min_draft_tokens = 1;
+  options.initial_draft_tokens = 7;
+  options.adaptive_draft_policy =
+      gufo::speculative::AdaptiveDraftPolicy::kAcceptedTokenEma;
+  options.draft_headroom_tokens = 2;
+  gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend),
+                                                  options);
+
+  const auto output = verifier.Generate(prompt, GenerationOptions(20, eos_id));
+  const std::vector<TokenId> expected(generated_tokens.begin(),
+                                      generated_tokens.begin() + 20);
+  Expect(output == expected, "EMA headroom must preserve target output");
+
+  // A mean-tracking controller would settle on the accepted count itself (1
+  // here, floored at min_draft_tokens); headroom keeps the width two tokens
+  // above it so the nearly free tail of the verification batch stays covered.
+  const auto& requested = backend_view->RequestedLengths();
+  Expect(requested.size() >= 4, "EMA headroom must issue four drafts");
+  Expect(std::vector<std::uint32_t>(requested.begin(), requested.begin() + 4) ==
+             std::vector<std::uint32_t>({4, 5, 5, 4}),
+         "EMA headroom must start above the mean, probe on full acceptance, "
+         "and decay toward the mean plus headroom");
 }
 
 void TestFirstPrefillTokenHonorsBudgetAndCallback() {
@@ -819,6 +860,7 @@ int main() {
   TestPartialRejectionRestoresAndReplaysState();
   TestImmediateRejectionRestoresGreedyState();
   TestAcceptedTokenEmaDraftPolicy();
+  TestAcceptedTokenEmaHeadroomDraftsAboveTheMean();
   TestHiddenAwareBackendReceivesCommittedTargetState();
   TestRetainedPrefixAdvanceUpdatesTargetAndDraftState();
   TestFirstPrefillTokenHonorsBudgetAndCallback();

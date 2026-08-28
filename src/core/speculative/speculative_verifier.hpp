@@ -32,6 +32,18 @@ struct SpeculativeOptions {
   std::uint32_t initial_draft_tokens{3};
   std::size_t rolling_window{16};
   float target_acceptance_rate{0.70F};
+  /// Tokens drafted above the accepted-token EMA.
+  ///
+  /// The EMA estimates the *mean* number of draft tokens the target accepts.
+  /// Drafting exactly that many is the throughput optimum only when a wider
+  /// verification batch costs proportionally more. On DFlash-2 it does not: a
+  /// verification chunk costs 1.06x a single autoregressive token at every
+  /// width in 2..8, so a marginal drafted token is nearly free while a token
+  /// the target would have accepted but we never proposed is lost outright.
+  /// The optimum therefore sits above the mean, covering the upper tail of the
+  /// acceptance distribution rather than its centre. Zero reproduces a
+  /// mean-tracking controller.
+  std::uint32_t draft_headroom_tokens{2};
   bool enable_adaptive_draft_length{true};
   AdaptiveDraftPolicy adaptive_draft_policy{
       AdaptiveDraftPolicy::kRollingAcceptanceRate};
@@ -250,6 +262,7 @@ public:
 
 private:
   void ConfigureAdaptiveDraftPolicy();
+  [[nodiscard]] std::uint32_t DraftLengthForEma() const noexcept;
   void ResetAdaptiveDraftLength() noexcept;
   void UpdateDraftTargetHidden();
   void UpdateAdaptiveDraftLength(std::size_t accepted, std::size_t drafted);

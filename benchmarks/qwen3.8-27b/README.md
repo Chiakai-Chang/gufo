@@ -320,6 +320,74 @@ not, always drafting the block maximum wins. Both the 300-token stress suite and
 the 10-case corpus agree (corpus at 128 tokens: 18.64 tok/s fixed against 16.40
 rolling).
 
+#### Draft width and policy on DFlash-2
+
+The controller table above says which policy wins but not why, so the underlying
+width curve is measured directly here. `json_schedule` at 128 tokens, greedy,
+exact against autoregressive in every arm, widths run interleaved so thermal
+drift is spread across them rather than biasing the last arm:
+
+| Fixed width | Acceptance | Accepted per step | Emitted per step | Speculative |
+| ---: | ---: | ---: | ---: | ---: |
+| 2 | 69.8% | 1.40 | 2.40 | 14.08 tok/s |
+| 3 | 65.9% | 1.98 | 2.98 | 16.94 tok/s |
+| 4 | 57.7% | 2.31 | 3.31 | **18.36 tok/s** |
+| 5 | 46.7% | 2.34 | 3.34 | 17.73 tok/s |
+| 6 | 40.8% | 2.45 | 3.45 | 17.75 tok/s |
+| 7 | 36.3% | 2.54 | 3.54 | 17.95 tok/s |
+
+Two properties of this drafter follow, and together they decide the default.
+Accepted tokens per step increase monotonically with width -- the block drafter
+never degrades enough that a narrower block accepts *more* -- so no controller
+can find a width that emits more than the ceiling does. And throughput over
+widths 4..7 is a plateau inside the 2% run-to-run band, so the reward for
+picking width correctly is smaller than the measurement noise while the penalty
+for picking low is not: below width 4 the drafter's fixed per-step cost stops
+being amortized and width 2 gives up 22%.
+
+Ported the upstream `--spec-draft-adaptive` controller (`LaurentZuijdwijk/llama.cpp`
+`ca26169`) to check the reported ~32% structured-output gain. Full corpus at 128
+tokens, 10/10 exact in both arms:
+
+| Policy | Aggregate | Speedup | Acceptance | Average draft |
+| --- | ---: | ---: | ---: | ---: |
+| **fixed 7** (`auto`) | **18.63 tok/s** | **2.66x** | 37.6% | 7.00 |
+| accepted-EMA + headroom | 17.85 tok/s | 2.55x | 50.7% | 4.53 |
+
+The gain does not reproduce, and the per-case split shows why: structured
+`+2.4%` and repetitive `+0.6%` against code `-10.6%` and reasoning `-10.5%`.
+Prompts that accept deeply are exactly the ones a controller trimming toward the
+mean accepted count hurts most. Upstream's own fixed-width arms agree with ours
+within noise (their width 3 and width 7 land at 2.61x and 2.56x against our
+2.42x and 2.56x); only their adaptive arm diverges, and it is inconsistent with
+their own fixed-arm acceptance data, since choosing a width cannot raise
+acceptance at that width above what the fixed arm measures there. Their README
+also records the same configuration moving 65.6 to 55.0 tok/s on power state
+alone, a 19% swing wider than the effect claimed.
+
+Because the accepted-token EMA targets the *mean* acceptance depth, it
+systematically under-drafts a nearly free batch tail; `draft_headroom_tokens`
+(default 2) offsets the width above that mean so the upper tail of the
+acceptance distribution stays covered. On structured output this moves the
+opt-in `accepted-ema` policy from 16.78 to 18.38 tok/s, and it removes the
+regression on repetitive text by letting the EMA saturate at the ceiling, where
+the policy degenerates to fixed width. It is not enough to overtake `fixed`, so
+`auto` still resolves to fixed width 7 for DFlash-2.
+
+Extending past one block was considered and rejected. Only `repetition_sequence`
+is clipped by the drafter's `block_size - 1` ceiling of 7, accepting 96.6% of
+seven drafted tokens and 100% once a controller narrows it. It is a synthetic
+pattern-continuation prompt and no representative class approaches it -- the
+next deepest, reasoning, accepts 4.2 of 7 and has ceiling to spare. Chaining a
+second DFlash block would need the draft path to build K/V for unverified draft
+tokens from draft hidden states rather than target features, and would pay a
+second draft pass on every step to benefit one unrepresentative prompt.
+
+Neither direction moves the aggregate, so DFlash-2 throughput is not left in the
+draft width. The step budget above locates it instead: verification is 151.7 ms
+of a 177.8 ms step, so the remaining wins are in the target verification chunk
+and, at depth, in the draft attention and injection costs noted below.
+
 Two measured follow-ups remain, both in the draft graph and both only visible at
 depth. At a 4,096-token context the draft's non-causal attention is **16.26 ms
 per block**, against 0.34 ms at a 128-token context, which makes it the largest

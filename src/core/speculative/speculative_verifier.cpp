@@ -382,6 +382,17 @@ void SpeculativeVerifier::ConfigureAdaptiveDraftPolicy() {
   ResetAdaptiveDraftLength();
 }
 
+std::uint32_t SpeculativeVerifier::DraftLengthForEma() const noexcept {
+  const auto target =
+      static_cast<std::int64_t>(std::lround(accepted_token_ema_)) +
+      static_cast<std::int64_t>(options_.draft_headroom_tokens);
+  const auto floor_width = static_cast<std::int64_t>(options_.min_draft_tokens);
+  const auto ceiling_width =
+      static_cast<std::int64_t>(options_.max_draft_tokens);
+  return static_cast<std::uint32_t>(
+      std::clamp(target, floor_width, ceiling_width));
+}
+
 void SpeculativeVerifier::ResetAdaptiveDraftLength() noexcept {
   constexpr float initial_accepted_token_ema = 2.0F;
   rolling_acceptance_.clear();
@@ -389,9 +400,7 @@ void SpeculativeVerifier::ResetAdaptiveDraftLength() noexcept {
   if (options_.enable_adaptive_draft_length &&
       options_.adaptive_draft_policy ==
           AdaptiveDraftPolicy::kAcceptedTokenEma) {
-    current_draft_length_ =
-        std::clamp(static_cast<std::uint32_t>(std::lround(accepted_token_ema_)),
-                   options_.min_draft_tokens, options_.max_draft_tokens);
+    current_draft_length_ = DraftLengthForEma();
     return;
   }
   current_draft_length_ = options_.initial_draft_tokens;
@@ -407,6 +416,12 @@ void SpeculativeVerifier::UpdateAdaptiveDraftLength(std::size_t accepted,
       AdaptiveDraftPolicy::kAcceptedTokenEma) {
     constexpr float ema_alpha = 0.25F;
     constexpr float full_accept_probe = 1.0F;
+    // Accepting every drafted token censors the observation: the target would
+    // have taken at least `drafted`, but how much further is unknown, so
+    // averaging that lower bound would ratchet the width down and strand it.
+    // Probe upward instead. A partial accept saw the exact stopping point and
+    // is averaged. Headroom makes full accepts rare, so most observations are
+    // uncensored and the EMA tracks the true acceptance depth directly.
     if (accepted >= drafted) {
       accepted_token_ema_ += full_accept_probe;
     } else {
@@ -415,9 +430,7 @@ void SpeculativeVerifier::UpdateAdaptiveDraftLength(std::size_t accepted,
     }
     accepted_token_ema_ = std::min(
         accepted_token_ema_, static_cast<float>(options_.max_draft_tokens));
-    current_draft_length_ =
-        std::clamp(static_cast<std::uint32_t>(std::lround(accepted_token_ema_)),
-                   options_.min_draft_tokens, options_.max_draft_tokens);
+    current_draft_length_ = DraftLengthForEma();
     return;
   }
 
