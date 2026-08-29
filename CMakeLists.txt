@@ -46,6 +46,7 @@ if (ENGINE_ENABLE_HIP)
   find_package(hipblas REQUIRED)
   find_package(hipblaslt REQUIRED)
   find_package(rocblas REQUIRED)
+  find_package(miopen REQUIRED)
   find_package(aotriton CONFIG REQUIRED)
   find_path(HIPCUB_INCLUDE_DIR hipcub/hipcub.hpp
     HINTS "$ENV{GUFO_HIPCUB_ROOT}/include"
@@ -90,6 +91,9 @@ endif()
 
 # Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
 add_subdirectory(src/models/qwen3_tts)
+
+# Qwen3-ASR — model-private 1.7B speech recognition runtime.
+add_subdirectory(src/models/qwen3_asr)
 
 # XRT NPU shim — AMD XDNA2 userspace runtime over the amdxdna kernel driver.
 option(ENGINE_ENABLE_XRT "Build gufo with the XRT NPU shim" OFF)
@@ -235,6 +239,7 @@ target_link_libraries(gufo_core PUBLIC ICU::uc Threads::Threads)
 add_subdirectory(src/models/qwen)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
+target_link_libraries(gufo_qwen3_asr PUBLIC gufo_core)
 
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
@@ -276,8 +281,11 @@ add_executable(gufo
   src/cli/bench/bench.cpp
   src/cli/eval/eval.cpp
   src/cli/prompt/prompt.cpp
+  src/cli/transcribe/transcribe.cpp
   src/cli/video/video.cpp
   src/cli/serve/serve.cpp
+  src/cli/serve/audio_asr_api.cpp
+  src/cli/serve/asr_service.cpp
   src/cli/serve/audio_tts_api.cpp
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
@@ -305,7 +313,7 @@ target_compile_definitions(gufo PRIVATE
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_deepseek_v4_flash)
 endif()
-target_link_libraries(gufo PRIVATE gufo_qwen3_tts)
+target_link_libraries(gufo PRIVATE gufo_qwen3_tts gufo_qwen3_asr)
 
 add_custom_target(gufo-server ALL
   COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server
@@ -354,6 +362,10 @@ install(FILES
   src/models/qwen3_tts/reference/run_official.py
   DESTINATION share/gufo/models/qwen3_tts)
 install(FILES
+  src/models/qwen3_asr/reference/run_official.py
+  src/models/qwen3_asr/tools/benchmark.py
+  DESTINATION share/gufo/models/qwen3_asr)
+install(FILES
   tests/quality/antirez-ds4.json
   DESTINATION share/gufo/eval)
 if (ENGINE_ENABLE_HIP)
@@ -368,6 +380,7 @@ if (BUILD_TESTING)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
   add_subdirectory(tests/models/qwen)
+  gufo_qwen3_asr_register_tests()
 
   add_test(NAME gufo_version COMMAND gufo --version)
   set_tests_properties(gufo_version PROPERTIES LABELS "cpu")
@@ -390,6 +403,14 @@ if (BUILD_TESTING)
   add_test(NAME strix_video_help COMMAND gufo video --help)
   set_tests_properties(strix_video_help PROPERTIES
     LABELS "cpu;server;cli;minimax-h3")
+
+  add_test(NAME gufo_transcribe_help COMMAND gufo transcribe --help)
+  set_tests_properties(gufo_transcribe_help PROPERTIES
+    LABELS "cpu;server;cli;qwen3-asr")
+
+  add_test(NAME gufo_serve_asr_help COMMAND gufo serve asr --help)
+  set_tests_properties(gufo_serve_asr_help PROPERTIES
+    LABELS "cpu;server;cli;qwen3-asr")
 
   add_test(NAME strix_serve_help COMMAND gufo serve --help)
   set_tests_properties(strix_serve_help PROPERTIES LABELS "cpu;server;cli")

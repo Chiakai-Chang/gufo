@@ -14,6 +14,7 @@
 
 #include "src/cli/arg_parser.hpp"
 #include "src/cli/sampling_options.hpp"
+#include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/tts_service.hpp"
@@ -64,6 +65,23 @@ void PrintServeHelp(std::string_view program_name,
         "-c", "--context", "N",
         "Native prompt+generation context capacity (default: 4096)", "Model",
         &tts_context_tokens);
+    parser.PrintHelp();
+    return;
+  }
+
+  if (subcommand == "asr" || subcommand == "stt") {
+    std::filesystem::path asr_model;
+    std::size_t asr_context_tokens = 1024;
+
+    gufo::cli::ArgParser parser(
+        std::string(program_name) + " serve asr",
+        "Start the Qwen3-ASR speech-to-text HTTP transcription server.");
+    parser.AddOption("-m", "--model", "DIR", "Qwen3-ASR-1.7B model directory",
+                     "Model", &asr_model);
+    parser.AddOption(
+        "-c", "--context", "N",
+        "Native prompt+generation context capacity (default: 1024)", "Model",
+        &asr_context_tokens);
     parser.PrintHelp();
     return;
   }
@@ -237,6 +255,8 @@ void PrintServeHelp(std::string_view program_name,
          "(/v1/video/generations)\n"
       << "  audio     Serve Qwen3-TTS text-to-speech endpoint "
          "(/v1/audio/speech)\n\n"
+      << "  asr       Serve Qwen3-ASR speech-to-text endpoint "
+         "(/v1/audio/transcriptions)\n\n"
       << "Server Options:\n"
       << "  -i, --host <IP>        Bind address (default: 127.0.0.1)\n"
       << "  -p, --port <N>         Port to listen on (default: 8080)\n"
@@ -307,7 +327,8 @@ int RunServe(std::span<const char* const> args) {
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string_view arg = args[i];
     if (subcommand.empty()) {
-      if (arg == "llm" || arg == "video" || arg == "audio" || arg == "tts") {
+      if (arg == "llm" || arg == "video" || arg == "audio" || arg == "tts" ||
+          arg == "asr" || arg == "stt") {
         subcommand = arg;
         continue;
       }
@@ -395,6 +416,7 @@ int RunServe(std::span<const char* const> args) {
   std::shared_ptr<server::InferenceBackend> backend;
   std::shared_ptr<server::VideoJobService> video_jobs;
   std::shared_ptr<server::TtsService> tts;
+  std::shared_ptr<server::AsrService> asr;
 
   if (subcommand == "video") {
     std::filesystem::path video_model;
@@ -499,6 +521,48 @@ int RunServe(std::span<const char* const> args) {
     if (!tts->ready()) {
       std::cerr << "Error enabling Qwen3-TTS service: "
                 << tts->initialization_error() << '\n';
+      return 1;
+    }
+  } else if (subcommand == "asr" || subcommand == "stt") {
+    std::filesystem::path asr_model;
+    std::size_t asr_context_tokens = 1024;
+
+    gufo::cli::ArgParser asr_parser(
+        "gufo serve asr",
+        "Start the Qwen3-ASR speech-to-text transcription server.");
+    asr_parser.AddOption("-m", "--model", "DIR",
+                         "Qwen3-ASR-1.7B model directory", "Model", &asr_model);
+    asr_parser.AddOption(
+        "-c", "--context", "N",
+        "Native prompt+generation context capacity (default: 1024)", "Model",
+        &asr_context_tokens);
+
+    if (!asr_parser.Parse(sub_args, &parse_err)) {
+      std::cerr << "Error: " << parse_err << "\n";
+      PrintServeHelp("gufo", "asr");
+      return 2;
+    }
+    if (asr_parser.IsHelpRequested()) {
+      PrintServeHelp("gufo", "asr");
+      return 0;
+    }
+    if (asr_model.empty() || asr_context_tokens < 32U) {
+      std::cerr << "Error: --model <DIR> and a context of at least 32 are "
+                   "required for ASR server\n";
+      PrintServeHelp("gufo", "asr");
+      return 2;
+    }
+
+    asr = std::make_shared<server::AsrService>(server::AsrServiceOptions{
+        .model_root = asr_model,
+        .native_context_tokens = asr_context_tokens,
+        .validate_model = true,
+        .model_id = {},
+        .runner = {},
+    });
+    if (!asr->ready()) {
+      std::cerr << "Error enabling Qwen3-ASR service: "
+                << asr->initialization_error() << '\n';
       return 1;
     }
   } else {
@@ -766,7 +830,7 @@ int RunServe(std::span<const char* const> args) {
   }
 
   server::HttpServer server(
-      host, port, backend, video_jobs, tts,
+      host, port, backend, video_jobs, tts, asr,
       server::HttpServerLimits{
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,

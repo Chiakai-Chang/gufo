@@ -83,6 +83,7 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.hipblas
     rocmPackages.hipblaslt
     rocmPackages.hipcub
+    rocmPackages.miopen
     rocmPackages.rocprim
     rocmPackages.rocwmma
     rocmPackages.rocblas
