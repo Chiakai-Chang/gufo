@@ -309,8 +309,8 @@ public:
     };
   }
 
-  [[nodiscard]] TextDecodeSelection SelectNext(TextRunnerState& state, float,
-                                               std::uint64_t*) const override {
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, gufo::sampling::SamplerState&) const override {
     const auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no frontier");
@@ -358,11 +358,10 @@ public:
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
-      TextRunnerState& state, std::size_t max_tokens, float temperature,
-      std::uint64_t* rng_state) const override {
+      TextRunnerState& state, std::size_t max_tokens,
+      gufo::sampling::SamplerState& sampler) const override {
     if (!control_->multi_token_decode) {
-      return TextModelRunner::DecodeStep(state, max_tokens, temperature,
-                                         rng_state);
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {

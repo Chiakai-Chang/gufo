@@ -56,7 +56,7 @@ struct ScheduledRequest {
   std::string client_id{"anonymous"};
   std::vector<TextRunnerToken> prompt;
   std::size_t token_limit{1};
-  float temperature{0.0F};
+  sampling::SamplingConfig sampling;
   TextGenerationScheduler::CancellationCheck external_cancellation;
   bool publish_token_pieces{false};
   TextGenerationScheduler::Clock::time_point request_start;
@@ -387,8 +387,8 @@ struct TextGenerationScheduler::Impl {
         }
 
         const std::weak_ptr<ScheduledRequest> weak_request = request;
-        request->runner_request =
-            runner_pool->Acquire(std::move(request->prompt), [weak_request] {
+        request->runner_request = runner_pool->Acquire(
+            std::move(request->prompt), request->sampling, [weak_request] {
               const auto request = weak_request.lock();
               return request == nullptr || CancellationRequested(request) ||
                      DeadlineExceeded(request);
@@ -496,8 +496,7 @@ struct TextGenerationScheduler::Impl {
     request->phase.store(TextRequestPhase::kDecoding,
                          std::memory_order_release);
     const auto decode_start = Clock::now();
-    const auto selection =
-        request->runner_request.SelectNext(request->temperature);
+    const auto selection = request->runner_request.SelectNext();
     if (selection.stop) {
       request->result.decode_ms +=
           std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
@@ -608,8 +607,7 @@ struct TextGenerationScheduler::Impl {
       const std::size_t remaining =
           request->token_limit - request->result.tokens.size();
       const auto decode_start = Clock::now();
-      const auto step =
-          request->runner_request.DecodeStep(remaining, request->temperature);
+      const auto step = request->runner_request.DecodeStep(remaining);
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
 
@@ -1002,19 +1000,21 @@ std::size_t TextGenerationScheduler::max_buffered_output_bytes()
 
 TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
-    float temperature, const CancellationCheck& is_cancelled,
-    bool publish_token_pieces) {
-  return Submit(std::move(prompt), max_tokens, temperature, is_cancelled,
+    const sampling::SamplingConfig& sampling,
+    const CancellationCheck& is_cancelled, bool publish_token_pieces) {
+  return Submit(std::move(prompt), max_tokens, sampling, is_cancelled,
                 publish_token_pieces, RequestMetadata{});
 }
 
 TextGenerationScheduler::Request TextGenerationScheduler::Submit(
     std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
-    float temperature, const CancellationCheck& is_cancelled,
-    bool publish_token_pieces, RequestMetadata metadata) {
+    const sampling::SamplingConfig& sampling,
+    const CancellationCheck& is_cancelled, bool publish_token_pieces,
+    RequestMetadata metadata) {
   if (prompt.empty()) {
     throw std::invalid_argument("text scheduler prompt must not be empty");
   }
+  sampling.Validate();
 
   auto request = std::make_shared<ScheduledRequest>();
   request->id = impl_->next_request_id.fetch_add(1, std::memory_order_relaxed);
@@ -1030,7 +1030,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       impl_->runner_pool->capacity() == 1 ? "serial-c1" : "serial-fallback";
   request->prompt = std::move(prompt);
   request->token_limit = max_tokens > 0 ? max_tokens : 1;
-  request->temperature = temperature;
+  request->sampling = sampling;
   request->external_cancellation = is_cancelled;
   request->publish_token_pieces = publish_token_pieces;
   request->request_start = metadata.request_start;
@@ -1081,6 +1081,26 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   }
   impl_->queue_condition.notify_one();
   return Request(std::make_unique<Request::Impl>(std::move(request)));
+}
+
+TextGenerationScheduler::Request TextGenerationScheduler::Submit(
+    std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
+    float temperature, const CancellationCheck& is_cancelled,
+    bool publish_token_pieces) {
+  sampling::SamplingConfig config;
+  config.temperature = temperature;
+  return Submit(std::move(prompt), max_tokens, config, is_cancelled,
+                publish_token_pieces);
+}
+
+TextGenerationScheduler::Request TextGenerationScheduler::Submit(
+    std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
+    float temperature, const CancellationCheck& is_cancelled,
+    bool publish_token_pieces, RequestMetadata metadata) {
+  sampling::SamplingConfig config;
+  config.temperature = temperature;
+  return Submit(std::move(prompt), max_tokens, config, is_cancelled,
+                publish_token_pieces, std::move(metadata));
 }
 
 }  // namespace gufo::server

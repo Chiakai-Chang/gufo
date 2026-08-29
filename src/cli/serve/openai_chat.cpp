@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "src/cli/serve/json.hpp"
+#include "src/cli/serve/sampling_request.hpp"
 
 namespace gufo::server {
 namespace {
@@ -30,7 +31,7 @@ struct ParsedChatRequest {
   ChatRequest chat;
   std::string model;
   std::size_t max_tokens{0};
-  float temperature{0.0F};
+  sampling::SamplingConfig sampling;
   bool stream{false};
   bool include_usage{false};
 };
@@ -430,24 +431,21 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     output->max_tokens = max_tokens->as_size();
   }
 
-  if (const json::Value* temperature = body.find("temperature")) {
-    if (!temperature->is_number() || temperature->as_double() < 0.0 ||
-        temperature->as_double() > 2.0) {
-      return Error(400, "Bad Request", "'temperature' must be between 0 and 2",
-                   "invalid_temperature");
-    }
-    output->temperature = static_cast<float>(temperature->as_double());
+  sampling::SamplingConfig parsed_sampling;
+  if (const auto sampling_error =
+          ParseSamplingConfig(body, output->sampling, &parsed_sampling)) {
+    return Error(400, "Bad Request", sampling_error->message,
+                 sampling_error->code.c_str());
   }
+  if (parsed_sampling.temperature > 2.0F) {
+    return Error(400, "Bad Request", "'temperature' must be between 0 and 2",
+                 "invalid_temperature");
+  }
+  output->sampling = parsed_sampling;
 
   if (const json::Value* choices = body.find("n");
       choices != nullptr && (!choices->is_number() || choices->as_int() != 1)) {
     return Error(400, "Bad Request", "only n=1 is supported", "unsupported_n");
-  }
-  if (const json::Value* top_p = body.find("top_p");
-      top_p != nullptr &&
-      (!top_p->is_number() || std::fabs(top_p->as_double() - 1.0) > 1e-9)) {
-    return Error(400, "Bad Request", "non-default 'top_p' is not implemented",
-                 "unsupported_top_p");
   }
   for (const std::string_view unsupported :
        {"logprobs", "top_logprobs", "logit_bias", "stop", "response_format",
@@ -1283,13 +1281,13 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
   ParsedChatRequest parsed;
   const auto defaults = backend.sampling_defaults();
   parsed.max_tokens = defaults.max_tokens;
-  parsed.temperature = defaults.temperature;
+  parsed.sampling = defaults.sampling;
   if (auto error = ParseRequest(request, backend, &parsed); error.has_value()) {
     return std::move(*error);
   }
   try {
     auto generation =
-        backend.start_chat(parsed.chat, parsed.max_tokens, parsed.temperature,
+        backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,
                            request.is_cancelled, parsed.stream);
     if (parsed.stream) {
       return StreamingResponse(parsed, backend, std::move(generation));

@@ -25,6 +25,8 @@ void TestDefaultOptions() {
   Expect(options->draft_tokens == 7, "default draft ceiling is seven");
   Expect(options->draft_policy == "auto", "default draft policy is auto");
   Expect(options->min_draft_tokens == 1, "default minimum draft is one");
+  Expect(options->draft_p_min == 0.0F,
+         "default draft confidence threshold is disabled");
 }
 
 void TestDepthOptions() {
@@ -45,10 +47,20 @@ void TestDepthOptions() {
 }
 
 void TestHybridMtpOptions() {
-  const std::array<const char*, 12> args = {
-      "--speculative",      "mtp-npu", "--mtp-model",    "mtp.gguf",
-      "--draft-tokens",     "2",       "--draft-policy", "fixed",
-      "--min-draft-tokens", "2",       "--n-gen",        "128"};
+  const std::array<const char*, 14> args = {"--speculative",
+                                            "mtp-npu",
+                                            "--mtp-model",
+                                            "mtp.gguf",
+                                            "--spec-draft-n-max",
+                                            "2",
+                                            "--draft-policy",
+                                            "fixed",
+                                            "--spec-draft-n-min",
+                                            "2",
+                                            "--spec-draft-p-min",
+                                            "0.75",
+                                            "--n-gen",
+                                            "128"};
   const auto options = gufo::cli::ParseBenchOptions(args);
   Expect(options.has_value(), "hybrid MTP options parse");
   Expect(options->speculative_backend == "mtp-npu", "hybrid MTP mode parsed");
@@ -56,6 +68,8 @@ void TestHybridMtpOptions() {
   Expect(options->draft_tokens == 2, "draft token count parsed");
   Expect(options->draft_policy == "fixed", "fixed draft policy parsed");
   Expect(options->min_draft_tokens == 2, "minimum draft count parsed");
+  Expect(options->draft_p_min > 0.74F && options->draft_p_min < 0.76F,
+         "draft confidence threshold parsed");
 }
 
 void TestInvalidDepth() {
@@ -73,6 +87,11 @@ void TestInvalidDepth() {
                                                  "--min-draft-tokens", "4"};
   Expect(!gufo::cli::ParseBenchOptions(range_args, &error).has_value(),
          "invalid draft range rejected");
+
+  const std::array<const char*, 2> probability_args = {"--spec-draft-p-min",
+                                                       "1.1"};
+  Expect(!gufo::cli::ParseBenchOptions(probability_args, &error).has_value(),
+         "invalid draft confidence threshold rejected");
 }
 
 }  // namespace

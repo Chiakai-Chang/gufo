@@ -205,6 +205,9 @@ private:
 struct QwenDFlashGpuDraftConfig {
   std::uint32_t max_context{4096};
   std::uint32_t max_draft_tokens{16};
+  /// Stop the proposal at the first draft token whose selected probability is
+  /// below this confidence threshold. Zero disables confidence filtering.
+  float draft_p_min{0.0F};
 };
 
 /// Adapts the GPU DFlash executor to the repository's IDraftBackend speculative
@@ -248,6 +251,9 @@ public:
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
       std::uint64_t* rng_state) override;
+  [[nodiscard]] bool SupportsSampledProposals() const noexcept override {
+    return true;
+  }
 
   void AcceptFeedback(std::span<const tokenization::TokenId> accepted,
                       tokenization::TokenId correction_token) override;

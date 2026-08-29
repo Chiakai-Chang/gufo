@@ -88,6 +88,12 @@ public:
         "draft backend does not support lossless sampled proposals");
   }
 
+  /// Returns true when ProposeSampled returns the exact proposal
+  /// probabilities required by lossless speculative rejection sampling.
+  [[nodiscard]] virtual bool SupportsSampledProposals() const noexcept {
+    return false;
+  }
+
   /// Returns true when the backend consumes target-model hidden states.
   [[nodiscard]] virtual bool RequiresTargetHiddenStates() const noexcept {
     return false;

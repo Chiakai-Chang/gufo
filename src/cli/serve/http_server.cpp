@@ -28,6 +28,7 @@
 #include "src/cli/serve/json.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
+#include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
@@ -465,11 +466,15 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   const auto defaults = b.sampling_defaults();
   const std::size_t max_tokens =
       body.member_size("max_tokens", defaults.max_tokens);
-  const float temperature = static_cast<float>(
-      body.member_double("temperature", defaults.temperature));
+  sampling::SamplingConfig sampling_config;
+  if (const auto error =
+          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
+  }
 
   const auto res =
-      b.complete(prompt, max_tokens, temperature, req.is_cancelled);
+      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "cmpl-" + RandomId();
@@ -522,11 +527,15 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
   } else if (body.contains("max_tokens")) {
     max_tokens = body.member_size("max_tokens", defaults.max_tokens);
   }
-  const float temperature = static_cast<float>(
-      body.member_double("temperature", defaults.temperature));
+  sampling::SamplingConfig sampling_config;
+  if (const auto error =
+          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
+  }
 
   const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
-                          temperature, req.is_cancelled);
+                          sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "resp_" + RandomId();
@@ -589,11 +598,15 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   const auto defaults = b.sampling_defaults();
   const std::size_t max_tokens =
       body.member_size("max_tokens", defaults.max_tokens);
-  const float temperature = static_cast<float>(
-      body.member_double("temperature", defaults.temperature));
+  sampling::SamplingConfig sampling_config;
+  if (const auto error =
+          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
+  }
 
   const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
-                          temperature, req.is_cancelled);
+                          sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "msg_" + RandomId();
@@ -665,11 +678,15 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   const auto defaults = b.sampling_defaults();
   const std::size_t max_tokens =
       body.member_size("n_predict", defaults.max_tokens);
-  const float temperature = static_cast<float>(
-      body.member_double("temperature", defaults.temperature));
+  sampling::SamplingConfig sampling_config;
+  if (const auto error =
+          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
+  }
 
   const auto res =
-      b.complete(prompt, max_tokens, temperature, req.is_cancelled);
+      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["content"] = res.text;
@@ -701,11 +718,15 @@ HttpResponse LlamaInfill(const HttpRequest& req, TextGenerationBackend& b) {
   const auto defaults = b.sampling_defaults();
   const std::size_t max_tokens =
       body.member_size("n_predict", defaults.max_tokens);
-  const float temperature = static_cast<float>(
-      body.member_double("temperature", defaults.temperature));
+  sampling::SamplingConfig sampling_config;
+  if (const auto error =
+          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
+  }
 
   const auto res =
-      b.complete(prompt, max_tokens, temperature, req.is_cancelled);
+      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["content"] = res.text;

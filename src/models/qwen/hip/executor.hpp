@@ -26,6 +26,7 @@
 #include "src/models/qwen/hip/execution_policy.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
+#include "src/models/qwen/hip/ops/token.hpp"
 
 namespace gufo::hip {
 
@@ -42,6 +43,11 @@ struct QwenVerificationPolicy {
   bool batched_lm_head{false};
   int bf16_from_layer{-1};
   int fp32_from_layer{-1};
+};
+
+struct QwenSampledVerificationResult {
+  tokenization::TokenId token{0};
+  bool accepted{false};
 };
 
 struct QwenGpuWeightRegion {
@@ -444,6 +450,23 @@ public:
   /// Copies the logits produced by the most recent forward pass to host memory.
   [[nodiscard]] std::span<const float> CopyLastLogits();
 
+  /// Samples the most recent device-resident logit row and transfers one token.
+  [[nodiscard]] tokenization::TokenId SampleLastLogits(
+      sampling::SamplerState& sampler);
+
+  /// Samples one row from the most recent verification batch without copying
+  /// its vocabulary-sized logits to the host.
+  [[nodiscard]] tokenization::TokenId SampleVerificationLogits(
+      std::size_t row, sampling::SamplerState& sampler);
+
+  /// Performs one exact sampled-speculation accept/residual decision on the
+  /// GPU, returning only the decision and selected token.
+  [[nodiscard]] QwenSampledVerificationResult VerifySampledToken(
+      std::size_t row, tokenization::TokenId draft_token,
+      std::span<const tokenization::TokenId> draft_candidate_ids,
+      std::span<const float> draft_candidate_probabilities,
+      double draft_token_probability, sampling::SamplerState& sampler);
+
   /// Enables host capture of every final-layer prompt hidden state. Disabled
   /// by default so ordinary prefill does not incur device-to-host copies.
   void SetPromptHiddenCapture(
@@ -488,6 +511,8 @@ public:
 private:
   void ReplaySsmState(std::uint32_t position);
   void EnsureVerificationLogits(std::size_t batch_size);
+  [[nodiscard]] GpuSamplingParameters PrepareGpuSamplingParameters(
+      const sampling::SamplerState& sampler);
 
   [[nodiscard]] tokenization::TokenId ForwardPromptChunk(
       std::span<const tokenization::TokenId> prompt_tokens,
@@ -514,6 +539,9 @@ private:
   std::size_t last_verification_rows_{0};
   std::size_t last_hidden_offset_{0};
   float* d_target_layer_features_{nullptr};
+  GpuSamplingWorkspace sampling_workspace_;
+  std::vector<std::uint32_t> h_penalty_tokens_;
+  std::vector<std::uint32_t> h_penalty_counts_;
   QwenVerificationPolicy verification_policy_;
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};

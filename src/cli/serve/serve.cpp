@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/tts_service.hpp"
@@ -76,13 +77,7 @@ void PrintServeHelp(std::string_view program_name,
     std::string chat_template;
     bool use_chat_template = true;
     std::size_t max_tokens = 128;
-    float temperature = 0.0F;
-    float top_p = 1.0F;
-    std::int32_t top_k = 0;
-    float min_p = 0.0F;
-    std::int64_t seed = -1;
-    float repeat_penalty = 1.0F;
-    std::size_t repeat_last_n = 64;
+    sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
     std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
@@ -91,6 +86,7 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t draft_tokens = 7;
     std::string draft_policy = "auto";
     std::size_t min_draft_tokens = 1;
+    float draft_p_min = 0.0F;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
@@ -128,35 +124,7 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("-n", "--max-tokens", "N",
                      "Default maximum new tokens per response (default: 128)",
                      "Sampling Defaults", &max_tokens);
-    parser.AddOption("-t", "--temperature", "T",
-                     "Default sampling temperature (default: 0.0 = greedy)",
-                     "Sampling Defaults", &temperature);
-    parser.AddOption(
-        "", "--top-p", "P",
-        "Default nucleus sampling probability cutoff (default: 1.0) "
-        "(TODO: qwen)",
-        "Sampling Defaults", &top_p);
-    parser.AddOption(
-        "", "--top-k", "K",
-        "Default Top-K token cutoff (default: 0 = disabled) (TODO: "
-        "qwen)",
-        "Sampling Defaults", &top_k);
-    parser.AddOption("", "--min-p", "P",
-                     "Default Min-P threshold relative to top token (default: "
-                     "0.0) (TODO: qwen)",
-                     "Sampling Defaults", &min_p);
-    parser.AddOption("-s", "--seed", "N",
-                     "Default RNG seed for generation (default: -1 = random)",
-                     "Sampling Defaults", &seed);
-    parser.AddOption(
-        "", "--repeat-penalty", "N",
-        "Default repetition penalty multiplier (default: 1.0 = off) "
-        "(TODO: qwen, deepseek)",
-        "Sampling Defaults", &repeat_penalty);
-    parser.AddOption("", "--repeat-last-n", "N",
-                     "Default lookback window for repetition penalty (default: "
-                     "64) (TODO: qwen, deepseek)",
-                     "Sampling Defaults", &repeat_last_n);
+    RegisterSamplingOptions(parser, &sampling_config, "Sampling Defaults");
 
     // Prompt Defaults
     parser.AddOption("", "--system", "PROMPT",
@@ -194,6 +162,9 @@ void PrintServeHelp(std::string_view program_name,
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
         "Speculative", &draft_tokens);
+    parser.AddOption("", "--spec-draft-n-max", "N",
+                     "llama.cpp-compatible alias for --draft-tokens",
+                     "Speculative", &draft_tokens);
     parser.AddOption(
         "", "--draft-policy", "MODE",
         "Draft sizing: auto, fixed, rolling, or accepted-ema (default: auto, "
@@ -202,6 +173,16 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--min-draft-tokens", "N",
                      "Adaptive draft floor (default: 1)", "Speculative",
                      &min_draft_tokens);
+    parser.AddOption("", "--spec-draft-n-min", "N",
+                     "llama.cpp-compatible alias for --min-draft-tokens",
+                     "Speculative", &min_draft_tokens);
+    parser.AddOption(
+        "", "--spec-draft-p-min", "P",
+        "Stop at the first draft token below confidence P; 0 disables "
+        "(default: 0)",
+        "Speculative", &draft_p_min);
+    parser.AddOption("", "--draft-p-min", "P", "Alias for --spec-draft-p-min",
+                     "Speculative", &draft_p_min);
     parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -530,13 +511,7 @@ int RunServe(std::span<const char* const> args) {
     std::string chat_template;
     bool use_chat_template = true;
     std::size_t max_tokens = 128;
-    float temperature = 0.0F;
-    float top_p = 1.0F;
-    std::int32_t top_k = 0;
-    float min_p = 0.0F;
-    std::int64_t seed = -1;
-    float repeat_penalty = 1.0F;
-    std::size_t repeat_last_n = 64;
+    sampling::SamplingConfig sampling_config;
     std::string reasoning_mode = "auto";
     std::int64_t reasoning_budget = -1;
     std::string speculative_backend;
@@ -545,6 +520,7 @@ int RunServe(std::span<const char* const> args) {
     std::size_t draft_tokens = 7;
     std::string draft_policy = "auto";
     std::size_t min_draft_tokens = 1;
+    float draft_p_min = 0.0F;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
@@ -579,37 +555,7 @@ int RunServe(std::span<const char* const> args) {
         "-n", "--max-tokens", "N",
         "Default maximum new tokens per response (default: 128)",
         "Sampling Defaults", &max_tokens);
-    llm_parser.AddOption("-t", "--temperature", "T",
-                         "Default sampling temperature (default: 0.0 = greedy)",
-                         "Sampling Defaults", &temperature);
-    llm_parser.AddOption(
-        "", "--top-p", "P",
-        "Default nucleus sampling probability cutoff (default: 1.0) "
-        "(TODO: qwen)",
-        "Sampling Defaults", &top_p);
-    llm_parser.AddOption(
-        "", "--top-k", "K",
-        "Default Top-K token cutoff (default: 0 = disabled) (TODO: qwen)",
-        "Sampling Defaults", &top_k);
-    llm_parser.AddOption(
-        "", "--min-p", "P",
-        "Default Min-P threshold relative to top token (default: 0.0) (TODO: "
-        "qwen)",
-        "Sampling Defaults", &min_p);
-    llm_parser.AddOption(
-        "-s", "--seed", "N",
-        "Default RNG seed for generation (default: -1 = random)",
-        "Sampling Defaults", &seed);
-    llm_parser.AddOption(
-        "", "--repeat-penalty", "N",
-        "Default repetition penalty multiplier (default: 1.0 = off) (TODO: "
-        "qwen, deepseek)",
-        "Sampling Defaults", &repeat_penalty);
-    llm_parser.AddOption(
-        "", "--repeat-last-n", "N",
-        "Default lookback window for repetition penalty (default: 64) (TODO: "
-        "qwen, deepseek)",
-        "Sampling Defaults", &repeat_last_n);
+    RegisterSamplingOptions(llm_parser, &sampling_config, "Sampling Defaults");
     llm_parser.AddOption(
         "", "--system", "PROMPT",
         "Default system instructions (default: helpful assistant)",
@@ -644,6 +590,9 @@ int RunServe(std::span<const char* const> args) {
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
         "Speculative", &draft_tokens);
+    llm_parser.AddOption("", "--spec-draft-n-max", "N",
+                         "llama.cpp-compatible alias for --draft-tokens",
+                         "Speculative", &draft_tokens);
     llm_parser.AddOption(
         "", "--draft-policy", "MODE",
         "Draft sizing: auto, fixed, rolling, or accepted-ema (default: auto, "
@@ -652,6 +601,17 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--min-draft-tokens", "N",
                          "Adaptive draft floor (default: 1)", "Speculative",
                          &min_draft_tokens);
+    llm_parser.AddOption("", "--spec-draft-n-min", "N",
+                         "llama.cpp-compatible alias for --min-draft-tokens",
+                         "Speculative", &min_draft_tokens);
+    llm_parser.AddOption(
+        "", "--spec-draft-p-min", "P",
+        "Stop at the first draft token below confidence P; 0 disables "
+        "(default: 0)",
+        "Speculative", &draft_p_min);
+    llm_parser.AddOption("", "--draft-p-min", "P",
+                         "Alias for --spec-draft-p-min", "Speculative",
+                         &draft_p_min);
     llm_parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -702,6 +662,12 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("gufo", "llm");
       return 0;
     }
+    bool sampling_valid = true;
+    try {
+      sampling_config.Validate();
+    } catch (const std::invalid_argument&) {
+      sampling_valid = false;
+    }
     if (max_tokens == 0 || prefill_chunk_tokens == 0 ||
         max_pending_requests == 0 || max_pending_requests_per_client == 0 ||
         max_pending_requests_per_client > max_pending_requests ||
@@ -711,14 +677,15 @@ int RunServe(std::span<const char* const> args) {
          (cache_disk_bytes == 0 || cache_disk_staging_bytes == 0)) ||
         request_timeout_ms > static_cast<std::uint64_t>(
                                  std::chrono::milliseconds::max().count()) ||
-        !std::isfinite(temperature) || temperature < 0.0F ||
-        temperature > 2.0F) {
+        !sampling_valid || sampling_config.temperature > 2.0F) {
       std::cerr << "Error: sampling and scheduling limits are invalid\n";
       return 2;
     }
     if (draft_tokens == 0 || min_draft_tokens == 0 ||
         min_draft_tokens > draft_tokens ||
-        draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
+        draft_tokens > std::numeric_limits<std::uint32_t>::max() ||
+        !std::isfinite(draft_p_min) || draft_p_min < 0.0F ||
+        draft_p_min > 1.0F) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
@@ -740,6 +707,7 @@ int RunServe(std::span<const char* const> args) {
         static_cast<std::uint32_t>(draft_tokens);
     speculative_config.min_draft_tokens =
         static_cast<std::uint32_t>(min_draft_tokens);
+    speculative_config.draft_p_min = draft_p_min;
     // `auto` follows the measured best per backend; see ResolveDraftPolicy.
     const std::string_view resolved_draft_policy =
         speculative::ResolveDraftPolicy(draft_policy, true);
@@ -791,10 +759,10 @@ int RunServe(std::span<const char* const> args) {
       std::cout << "[Speculative]: DFlash enabled (max_draft_tokens="
                 << speculative_config.max_draft_tokens
                 << ", min_draft_tokens=" << speculative_config.min_draft_tokens
-                << ")\n";
+                << ", draft_p_min=" << speculative_config.draft_p_min << ")\n";
     }
     backend->set_model_id(served_model_name);
-    backend->set_sampling_defaults(max_tokens, temperature);
+    backend->set_sampling_defaults(max_tokens, sampling_config);
   }
 
   server::HttpServer server(

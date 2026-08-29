@@ -221,8 +221,8 @@ public:
     };
   }
 
-  [[nodiscard]] TextDecodeSelection SelectNext(TextRunnerState& state, float,
-                                               std::uint64_t*) const override {
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, gufo::sampling::SamplerState&) const override {
     auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {
       throw std::logic_error("fake state has no decode frontier");
@@ -297,15 +297,15 @@ void TestBoundedPrefillDecodeAndPrefixReuse() {
     Expect(second.consumed_tokens == 2 && second.decode_ready,
            "second prefill reaches the decode frontier");
 
-    const auto token_0 = request.SelectNext(0.0F);
+    const auto token_0 = request.SelectNext();
     Expect(!token_0.stop && token_0.token == 90,
            "first frontier token is selected");
     request.Advance();
-    const auto token_1 = request.SelectNext(0.0F);
+    const auto token_1 = request.SelectNext();
     Expect(!token_1.stop && token_1.token == 91,
            "second frontier token is selected");
     request.Advance();
-    Expect(request.SelectNext(0.0F).stop,
+    Expect(request.SelectNext().stop,
            "runner reports an explicit stop boundary");
     request.Commit();
   }
@@ -370,9 +370,8 @@ void TestBatchedAdvancePreservesIndependentRequests() {
   auto second = pool.Acquire({2});
   Expect(first.Prefill(1).decode_ready && second.Prefill(1).decode_ready,
          "independent requests reach their decode frontiers");
-  Expect(
-      first.SelectNext(0.0F).token == 90 && second.SelectNext(0.0F).token == 90,
-      "independent requests select their pending tokens");
+  Expect(first.SelectNext().token == 90 && second.SelectNext().token == 90,
+         "independent requests select their pending tokens");
 
   const auto plan = pool.SelectDecodePlan(2);
   Expect(
@@ -385,9 +384,8 @@ void TestBatchedAdvancePreservesIndependentRequests() {
              std::vector<std::vector<TextRunnerToken>>{{90, 90}},
          "one batched runner call receives both request tokens");
 
-  Expect(
-      first.SelectNext(0.0F).token == 91 && second.SelectNext(0.0F).token == 91,
-      "batched advance independently updates both request states");
+  Expect(first.SelectNext().token == 91 && second.SelectNext().token == 91,
+         "batched advance independently updates both request states");
   first.Invalidate();
   second.Invalidate();
 }
@@ -635,9 +633,8 @@ void TestSnapshotCacheBranchesOnePrefixIntoIndependentStates() {
 
   Expect(first.Prefill(1).decode_ready && second.Prefill(1).decode_ready,
          "each branch prefills only its divergent suffix");
-  Expect(
-      first.SelectNext(0.0F).token == 90 && second.SelectNext(0.0F).token == 90,
-      "both restored branches retain an exact frontier");
+  Expect(first.SelectNext().token == 90 && second.SelectNext().token == 90,
+         "both restored branches retain an exact frontier");
   first.Advance();
   second.Advance();
   first.Commit();

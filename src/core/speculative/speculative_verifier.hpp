@@ -32,6 +32,7 @@ struct SpeculativeOptions {
   std::uint32_t initial_draft_tokens{3};
   std::size_t rolling_window{16};
   float target_acceptance_rate{0.70F};
+  float draft_p_min{0.0F};
   /// Tokens drafted above the accepted-token EMA.
   ///
   /// The EMA estimates the *mean* number of draft tokens the target accepts.
@@ -77,6 +78,11 @@ struct VerificationChunkResult {
   std::size_t vocab_size{0};
 };
 
+struct SampledVerificationResult {
+  tokenization::TokenId token{0};
+  bool accepted{false};
+};
+
 class ISpeculativeTargetExecutor {
 public:
   virtual ~ISpeculativeTargetExecutor() = default;
@@ -104,6 +110,51 @@ public:
       std::size_t row) {
     (void)row;
     return {};
+  }
+  [[nodiscard]] virtual bool SupportsDeviceResidentSampling() const noexcept {
+    return false;
+  }
+  [[nodiscard]] virtual tokenization::TokenId SampleLastLogits(
+      sampling::SamplerState& sampler) {
+    const auto logits = CopyLastLogits();
+    if (logits.empty()) {
+      throw std::runtime_error(
+          "target executor did not retain sampled decode logits");
+    }
+    return sampler.Sample(logits);
+  }
+  [[nodiscard]] virtual tokenization::TokenId SampleVerificationLogits(
+      std::size_t row, sampling::SamplerState& sampler) {
+    const auto logits = CopyVerificationLogits(row);
+    if (logits.empty()) {
+      throw std::runtime_error(
+          "target executor did not retain verification logits");
+    }
+    return sampler.Sample(logits);
+  }
+  [[nodiscard]] virtual SampledVerificationResult VerifySampledToken(
+      std::size_t row, tokenization::TokenId draft_token,
+      std::span<const tokenization::TokenId> draft_candidate_ids,
+      std::span<const float> draft_candidate_probabilities,
+      double draft_token_probability, sampling::SamplerState& sampler) {
+    const auto logits = CopyVerificationLogits(row);
+    if (logits.empty()) {
+      throw std::runtime_error(
+          "target executor did not retain verification logits");
+    }
+    const auto target_distribution = sampler.Distribution(logits);
+    const double target_probability =
+        target_distribution.probability(draft_token);
+    if (sampler.Uniform() * draft_token_probability < target_probability) {
+      sampler.Accept(draft_token);
+      return {.token = draft_token, .accepted = true};
+    }
+    return {
+        .token = target_distribution.SampleResidual(
+            draft_candidate_ids, draft_candidate_probabilities,
+            sampler.mutable_rng_state()),
+        .accepted = false,
+    };
   }
   [[nodiscard]] virtual VerificationChunkResult ForwardVerificationChunk(
       std::span<const tokenization::TokenId> candidate_tokens,
@@ -244,6 +295,12 @@ public:
                         tokenization::TokenId eos_id,
                         std::uint32_t max_emitted_tokens, float temperature,
                         std::uint64_t* rng_state);
+  StepResult VerifyStep(std::vector<tokenization::TokenId>& current_sequence,
+                        std::uint32_t cur_pos,
+                        tokenization::TokenId current_token,
+                        tokenization::TokenId eos_id,
+                        std::uint32_t max_emitted_tokens,
+                        sampling::SamplerState& sampler);
 
   [[nodiscard]] std::unique_ptr<SpeculativeVerifierSnapshot> Snapshot() const;
   void RestoreSnapshot(const SpeculativeVerifierSnapshot& snapshot);
@@ -270,7 +327,7 @@ private:
       std::vector<tokenization::TokenId>& current_sequence,
       std::uint32_t cur_pos, tokenization::TokenId current_token,
       tokenization::TokenId eos_id, std::uint32_t max_emitted_tokens,
-      float temperature, std::uint64_t* rng_state);
+      sampling::SamplerState& sampler);
 
   std::unique_ptr<ISpeculativeTargetExecutor> owned_target_executor_;
   ISpeculativeTargetExecutor* target_executor_;

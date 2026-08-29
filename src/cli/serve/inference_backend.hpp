@@ -39,6 +39,7 @@ struct TextSpeculativeConfig {
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
+  float draft_p_min{0.0F};
   TextDraftPolicy draft_policy{TextDraftPolicy::kRollingAcceptance};
 };
 
@@ -56,6 +57,10 @@ struct TextDiskCacheConfig {
 /// and a bounded pool of request-owned executor sessions.
 class InferenceBackend final : public TextGenerationBackend {
 public:
+  using TextGenerationBackend::chat;
+  using TextGenerationBackend::complete;
+  using TextGenerationBackend::start_chat;
+
   InferenceBackend();
   ~InferenceBackend() override;
 
@@ -95,25 +100,29 @@ public:
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
   void set_model_id(const std::string& model_id);
-  void set_sampling_defaults(std::size_t max_tokens, float temperature);
+  void set_sampling_defaults(std::size_t max_tokens,
+                             const sampling::SamplingConfig& sampling);
 
   /// Plain text completion (no chat framing).
   Result complete(std::string_view prompt, std::size_t max_tokens,
-                  float temperature, const CancellationCheck& is_cancelled = {},
+                  const sampling::SamplingConfig& sampling,
+                  const CancellationCheck& is_cancelled = {},
                   const TokenCallback& on_token = {}) override;
 
   /// Framed chat conversation; returns the assistant reply.
   Result chat(const ChatRequest& request, std::size_t max_tokens,
-              float temperature, const CancellationCheck& is_cancelled = {},
+              const sampling::SamplingConfig& sampling,
+              const CancellationCheck& is_cancelled = {},
               const TokenCallback& on_token = {}) override;
 
   std::shared_ptr<GenerationRequest> start_chat(
-      const ChatRequest& request, std::size_t max_tokens, float temperature,
+      const ChatRequest& request, std::size_t max_tokens,
+      const sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled = {},
       bool stream_output = false) override;
 
   Result chat(const std::vector<tokenization::ChatMessage>& messages,
-              std::size_t max_tokens, float temperature,
+              std::size_t max_tokens, const sampling::SamplingConfig& sampling,
               const CancellationCheck& is_cancelled = {});
 
   /// Token count of raw text (no generation).

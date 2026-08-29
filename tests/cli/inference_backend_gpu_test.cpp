@@ -37,7 +37,7 @@ std::vector<TokenId> GenerateDirect(gufo::hip::QwenGpuExecutor& executor,
                                     std::size_t max_tokens) {
   gufo::models::GenerationOptions options;
   options.max_new_tokens = max_tokens;
-  options.temperature = 0.0F;
+  options.sampling.temperature = 0.0F;
   return executor.Generate(prompt_tokens, options);
 }
 
@@ -292,7 +292,7 @@ int main(int argc, const char* const* argv) {
              "full-copy Qwen snapshot accounts the complete request state");
       gufo::models::GenerationOptions options;
       options.max_new_tokens = 2;
-      options.temperature = 0.0F;
+      options.sampling.temperature = 0.0F;
       const auto live_continuation =
           direct->GenerateFromPrefix(continuation_prompt, root_tokens, options);
       const auto cold_continuation =

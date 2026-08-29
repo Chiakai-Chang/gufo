@@ -221,8 +221,8 @@ public:
     throw std::logic_error("fake persistence test does not prefill");
   }
 
-  [[nodiscard]] TextDecodeSelection SelectNext(TextRunnerState&, float,
-                                               std::uint64_t*) const override {
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState&, gufo::sampling::SamplerState&) const override {
     throw std::logic_error("fake persistence test does not decode");
   }
 

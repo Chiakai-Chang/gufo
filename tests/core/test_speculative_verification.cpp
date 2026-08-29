@@ -344,6 +344,8 @@ public:
     return proposal;
   }
 
+  bool SupportsSampledProposals() const noexcept override { return true; }
+
 private:
   std::array<float, 2> probabilities_;
 };
@@ -758,6 +760,58 @@ void TestSampledSpeculationMatchesTargetDistribution() {
          "positive-temperature verification continues to use drafts");
 }
 
+void TestFilteredSampledSpeculationMatchesTargetDistribution() {
+  constexpr std::size_t trials = 4096;
+  const std::vector<float> target_logits = {-INFINITY, std::log(0.40F),
+                                            std::log(0.60F)};
+  gufo::sampling::SamplingConfig config;
+  config.temperature = 0.8F;
+  config.top_k = 2;
+  config.top_p = 0.95F;
+  config.min_p = 0.05F;
+  config.min_keep = 1;
+  config.repeat_penalty = 1.2F;
+  config.repeat_last_n = 2;
+  config.frequency_penalty = 0.1F;
+  config.presence_penalty = 0.05F;
+
+  const std::vector<TokenId> initial_sequence = {1, 0};
+  const double expected_second_probability =
+      gufo::sampling::BuildDistribution(target_logits, config, initial_sequence)
+          .probability(2);
+  std::size_t second_token_count = 0;
+  std::size_t drafted_count = 0;
+
+  for (std::uint64_t seed = 1; seed <= trials; ++seed) {
+    SampledTargetExecutor target(target_logits);
+    auto backend = std::make_unique<BinarySampledDraftBackend>(0.80F, 0.20F);
+    gufo::speculative::SpeculativeOptions options;
+    options.max_draft_tokens = 1;
+    options.min_draft_tokens = 1;
+    options.initial_draft_tokens = 1;
+    options.enable_adaptive_draft_length = false;
+    gufo::speculative::SpeculativeVerifier verifier(target, std::move(backend),
+                                                    options);
+    const std::vector<TokenId> prompt = {1};
+    const TokenId current = verifier.Prime(prompt);
+    std::vector<TokenId> sequence = {prompt.front(), current};
+    config.seed = static_cast<std::int64_t>(seed);
+    gufo::sampling::SamplerState sampler(config, sequence);
+    const auto result =
+        verifier.VerifyStep(sequence, 1, current, 99, 2, sampler);
+    Expect(!result.emitted_tokens.empty(),
+           "filtered speculation emits a target-distributed token");
+    second_token_count += result.emitted_tokens.front() == 2 ? 1 : 0;
+    drafted_count += result.draft_count;
+  }
+
+  const double observed = static_cast<double>(second_token_count) / trials;
+  Expect(std::abs(observed - expected_second_probability) < 0.035,
+         "filtered rejection sampling preserves the target distribution");
+  Expect(drafted_count == trials,
+         "top-k/top-p/min-p/penalty requests continue to use drafts");
+}
+
 void TestPersistentVerifierSnapshotRoundTrip() {
   constexpr TokenId eos_id = 900;
   const std::vector<TokenId> prompt = {1, 2, 3};
@@ -866,6 +920,7 @@ int main() {
   TestFirstPrefillTokenHonorsBudgetAndCallback();
   TestFirstPrefillEosIsNotEmitted();
   TestSampledSpeculationMatchesTargetDistribution();
+  TestFilteredSampledSpeculationMatchesTargetDistribution();
   TestPersistentVerifierSnapshotRoundTrip();
   TestDraftPolicyResolution();
   std::cout << "All speculative verification tests passed.\n";

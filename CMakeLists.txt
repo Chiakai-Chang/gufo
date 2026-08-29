@@ -205,6 +205,7 @@ add_library(gufo_core STATIC
   src/core/crypto/sha256.cpp
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
+  src/core/sampling.cpp
   src/models/minimax_h3/audio_vae.cpp
   src/models/minimax_h3/denoiser.cpp
   src/models/minimax_h3/dit.cpp
@@ -261,7 +262,9 @@ if (ENGINE_ENABLE_HIP)
   target_compile_definitions(gufo_core PUBLIC ENGINE_ENABLE_HIP=1)
   target_compile_definitions(gufo_core PRIVATE CK_ENABLE_BF16=1)
   target_include_directories(gufo_core SYSTEM PRIVATE
-    ${COMPOSABLE_KERNEL_INCLUDE_DIR})
+    ${COMPOSABLE_KERNEL_INCLUDE_DIR}
+    ${HIPCUB_INCLUDE_DIR}
+    ${ROCPRIM_INCLUDE_DIR})
   target_include_directories(gufo_core PRIVATE
     "${GUFO_H3_ATTENTION_GENERATED_DIR}")
   target_link_libraries(gufo_core PUBLIC hip::host roc::hipblas
@@ -917,6 +920,14 @@ if (BUILD_TESTING)
       COMMAND hipblaslt_runtime_cache_test)
     set_tests_properties(hipblaslt_runtime_cache_test PROPERTIES
       LABELS "hip;gpu;hipblaslt;cache")
+
+    add_executable(qwen_sampling_hip_test
+      tests/kernels/qwen_sampling_hip_test.hip)
+    target_link_libraries(qwen_sampling_hip_test PRIVATE gufo_core hip::host)
+    add_test(NAME qwen_sampling_hip_test COMMAND qwen_sampling_hip_test)
+    set_tests_properties(qwen_sampling_hip_test PROPERTIES
+      LABELS "hip;gpu;qwen;sampling;correctness"
+      SKIP_RETURN_CODE 77)
 
     add_executable(persistent_deltanet_test
       tests/kernels/persistent_deltanet_test.cpp)

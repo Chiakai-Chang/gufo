@@ -85,6 +85,9 @@ void PrintBenchHelp(std::string_view program_name) {
       "", "--draft-tokens", "N",
       "Maximum speculative draft tokens per verification step (default: 7)",
       "Speculative", &opt.draft_tokens);
+  parser.AddOption("", "--spec-draft-n-max", "N",
+                   "llama.cpp-compatible alias for --draft-tokens",
+                   "Speculative", &opt.draft_tokens);
   parser.AddOption("", "--draft-policy", "MODE",
                    "Draft sizing: auto, fixed, rolling, or accepted-ema "
                    "(default: auto, fixed for DFlash-2)",
@@ -92,6 +95,16 @@ void PrintBenchHelp(std::string_view program_name) {
   parser.AddOption("", "--min-draft-tokens", "N",
                    "Adaptive draft floor (default: 1)", "Speculative",
                    &opt.min_draft_tokens);
+  parser.AddOption("", "--spec-draft-n-min", "N",
+                   "llama.cpp-compatible alias for --min-draft-tokens",
+                   "Speculative", &opt.min_draft_tokens);
+  parser.AddOption(
+      "", "--spec-draft-p-min", "P",
+      "Stop at the first draft token below confidence P; 0 disables "
+      "(default: 0)",
+      "Speculative", &opt.draft_p_min);
+  parser.AddOption("", "--draft-p-min", "P", "Alias for --spec-draft-p-min",
+                   "Speculative", &opt.draft_p_min);
 
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
@@ -611,6 +624,19 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
         opt.min_draft_tokens = count;
         return true;
       });
+  parser.AddOption("", "--spec-draft-n-max", "N",
+                   "llama.cpp-compatible alias for --draft-tokens",
+                   "Speculative", &opt.draft_tokens);
+  parser.AddOption("", "--spec-draft-n-min", "N",
+                   "llama.cpp-compatible alias for --min-draft-tokens",
+                   "Speculative", &opt.min_draft_tokens);
+  parser.AddOption(
+      "", "--spec-draft-p-min", "P",
+      "Stop at the first draft token below confidence P; 0 disables "
+      "(default: 0)",
+      "Speculative", &opt.draft_p_min);
+  parser.AddOption("", "--draft-p-min", "P", "Alias for --spec-draft-p-min",
+                   "Speculative", &opt.draft_p_min);
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
@@ -634,9 +660,17 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     opt.n_prompts.clear();
   }
 
-  if (opt.min_draft_tokens > opt.draft_tokens) {
+  if (opt.draft_tokens == 0 || opt.min_draft_tokens == 0 ||
+      opt.min_draft_tokens > opt.draft_tokens) {
     if (error_msg != nullptr) {
       *error_msg = "min-draft-tokens cannot exceed draft-tokens";
+    }
+    return std::nullopt;
+  }
+  if (!std::isfinite(opt.draft_p_min) || opt.draft_p_min < 0.0F ||
+      opt.draft_p_min > 1.0F) {
+    if (error_msg != nullptr) {
+      *error_msg = "spec-draft-p-min must be in [0, 1]";
     }
     return std::nullopt;
   }
@@ -946,6 +980,7 @@ int RunBench(std::span<const char* const> args) {
           hip::QwenDFlashGpuDraftConfig cfg{
               .max_context = static_cast<std::uint32_t>(required_context),
               .max_draft_tokens = opt.draft_tokens,
+              .draft_p_min = opt.draft_p_min,
           };
           draft_backend = hip::QwenDFlashGpuDraftBackend::CreateFromGguf(
               dflash_path, gpu_exec->GetSharedModel(), cfg, &err);

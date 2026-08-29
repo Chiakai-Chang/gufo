@@ -147,6 +147,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
         << "draft_min_tokens=" << speculative_options.min_draft_tokens << '\n'
         << "draft_initial_tokens=" << speculative_options.initial_draft_tokens
         << '\n'
+        << "draft_p_min=" << speculative_options.draft_p_min << '\n'
         << "draft_rolling_window=" << speculative_options.rolling_window << '\n'
         << std::setprecision(std::numeric_limits<float>::max_digits10)
         << "draft_target_acceptance="
@@ -317,6 +318,7 @@ public:
           hip::QwenDFlashGpuDraftConfig{
               .max_context = max_context,
               .max_draft_tokens = speculative_options.max_draft_tokens,
+              .draft_p_min = speculative_options.draft_p_min,
           },
           &error);
       if (draft_backend == nullptr) {
@@ -399,23 +401,22 @@ public:
     frontier_published_ = false;
   }
 
-  [[nodiscard]] TextRunnerToken SelectFrontier(float temperature,
-                                               std::uint64_t* rng_state) const {
+  [[nodiscard]] TextRunnerToken SelectFrontier(
+      sampling::SamplerState& sampler) const {
     if (!frontier_.has_value()) {
       throw std::logic_error("Qwen state has no next-token frontier");
     }
-    if (temperature == 0.0F) {
+    if (sampler.config().can_use_unmodified_argmax()) {
       return *frontier_;
     }
-    const std::span<const float> logits =
-        frontier_logits_.empty() ? executor_->CopyLastLogits()
-                                 : std::span<const float>(frontier_logits_);
-    return sampling::SampleLogits(logits, temperature, rng_state);
+    if (frontier_logits_.empty()) {
+      return executor_->SampleLastLogits(sampler);
+    }
+    return sampler.Sample(frontier_logits_);
   }
 
-  [[nodiscard]] TextDecodeStep DecodeSpeculative(std::size_t max_tokens,
-                                                 float temperature,
-                                                 std::uint64_t* rng_state) {
+  [[nodiscard]] TextDecodeStep DecodeSpeculative(
+      std::size_t max_tokens, sampling::SamplerState& sampler) {
     if (verifier_ == nullptr || !frontier_.has_value()) {
       throw std::logic_error("Qwen speculative state has no frontier");
     }
@@ -425,6 +426,7 @@ public:
     }
 
     TextDecodeStep result;
+    sampling::SamplerState working_sampler = sampler;
     const auto append_selection = [&](TextRunnerToken token) {
       if (IsQwenStopToken(model_->GetTokenizer(), token)) {
         result.stop = true;
@@ -436,18 +438,21 @@ public:
           .piece = std::string(model_->GetTokenizer().DecodeToken(token)),
       });
       sequence_.push_back(token);
+      working_sampler.Accept(token);
       return true;
     };
 
     if (!frontier_published_) {
-      if (temperature > 0.0F) {
-        frontier_ = SelectFrontier(temperature, rng_state);
+      if (!working_sampler.config().can_use_unmodified_argmax()) {
+        frontier_ = SelectFrontier(working_sampler);
       }
       if (!append_selection(*frontier_)) {
+        sampler.SetRngState(working_sampler.rng_state());
         return result;
       }
       frontier_published_ = true;
       if (result.selections.size() == max_tokens) {
+        sampler.SetRngState(working_sampler.rng_state());
         return result;
       }
     }
@@ -459,7 +464,7 @@ public:
         model_->GetTokenizer().GetEosTokenId(),
         static_cast<std::uint32_t>(std::min<std::size_t>(
             remaining, std::numeric_limits<std::uint32_t>::max())),
-        temperature, rng_state);
+        working_sampler);
     const auto stats_after = verifier_->GetStats();
     result.draft_tokens =
         stats_after.total_draft_tokens - stats_before.total_draft_tokens;
@@ -475,6 +480,7 @@ public:
     frontier_ = verification.next_token;
     frontier_logits_ = verification.next_token_logits;
     frontier_published_ = !result.stop;
+    sampler.SetRngState(working_sampler.rng_state());
     return result;
   }
 
@@ -782,14 +788,13 @@ public:
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
-      TextRunnerState& state, float temperature,
-      std::uint64_t* rng_state) const override {
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& qwen = RequireQwenState(state);
     if (qwen.speculative()) {
       throw std::logic_error(
           "Qwen DFlash decoding requires a multi-token decode step");
     }
-    const TextRunnerToken token = qwen.SelectFrontier(temperature, rng_state);
+    const TextRunnerToken token = qwen.SelectFrontier(sampler);
     if (IsQwenStopToken(model_->GetTokenizer(), token)) {
       return {
           .stop = true,
@@ -820,14 +825,13 @@ public:
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
-      TextRunnerState& state, std::size_t max_tokens, float temperature,
-      std::uint64_t* rng_state) const override {
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
     auto& qwen = RequireQwenState(state);
     if (!qwen.speculative()) {
-      return TextModelRunner::DecodeStep(state, max_tokens, temperature,
-                                         rng_state);
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
-    return qwen.DecodeSpeculative(max_tokens, temperature, rng_state);
+    return qwen.DecodeSpeculative(max_tokens, sampler);
   }
 
   void AdvanceBatch(
@@ -1427,14 +1431,14 @@ public:
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
-      TextRunnerState& state, float temperature,
-      std::uint64_t* rng_state) const override {
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& deepseek = RequireDeepSeekState(state);
-    const int token =
-        deepseek.session().SelectNext(temperature, rng_state, 0, 1.0F, 0.05F);
-    if (token < 0) {
-      throw std::runtime_error("DeepSeek token selection failed");
+    std::string error;
+    const auto logits = deepseek.session().CopyLogits(&error);
+    if (logits.empty()) {
+      throw std::runtime_error("DeepSeek token selection failed: " + error);
     }
+    const int token = static_cast<int>(sampler.Sample(logits));
     if (model_->IsStopToken(token)) {
       return {
           .stop = true,
@@ -1612,7 +1616,8 @@ struct InferenceBackend::Impl {
   Result GenerateScheduled(std::shared_ptr<const State> current,
                            std::vector<TextRunnerToken> prompt_tokens,
                            Clock::time_point request_start,
-                           std::size_t max_tokens, float temperature,
+                           std::size_t max_tokens,
+                           const sampling::SamplingConfig& sampling,
                            const CancellationCheck& is_cancelled,
                            const TokenCallback& on_token,
                            std::string client_id) const {
@@ -1630,7 +1635,7 @@ struct InferenceBackend::Impl {
 
     try {
       auto request = current->scheduler->Submit(
-          std::move(prompt_tokens), max_tokens, temperature, is_cancelled,
+          std::move(prompt_tokens), max_tokens, sampling, is_cancelled,
           static_cast<bool>(on_token),
           TextRequestMetadata{
               .client_id = std::move(client_id),
@@ -1765,7 +1770,10 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
   if (speculative_config.max_draft_tokens == 0 ||
       speculative_config.min_draft_tokens == 0 ||
       speculative_config.min_draft_tokens >
-          speculative_config.max_draft_tokens) {
+          speculative_config.max_draft_tokens ||
+      !std::isfinite(speculative_config.draft_p_min) ||
+      speculative_config.draft_p_min < 0.0F ||
+      speculative_config.draft_p_min > 1.0F) {
     SetError(error, "HTTP speculative draft limits are invalid");
     return false;
   }
@@ -1824,6 +1832,7 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
           speculative_config.min_draft_tokens;
       speculative_options.initial_draft_tokens =
           speculative_config.max_draft_tokens;
+      speculative_options.draft_p_min = speculative_config.draft_p_min;
       speculative_options.use_batched_verification = true;
       speculative_options.use_batched_lm_head = true;
       speculative_options.retain_frontier_logits = true;
@@ -1968,9 +1977,10 @@ void InferenceBackend::set_model_id(const std::string& model_id) {
 #endif
 }
 
-void InferenceBackend::set_sampling_defaults(std::size_t max_tokens,
-                                             float temperature) {
+void InferenceBackend::set_sampling_defaults(
+    std::size_t max_tokens, const sampling::SamplingConfig& sampling_config) {
 #if defined(ENGINE_ENABLE_HIP)
+  sampling_config.Validate();
   const std::lock_guard<std::mutex> lock(impl_->state_mutex);
   if (impl_->state == nullptr) {
     return;
@@ -1978,17 +1988,18 @@ void InferenceBackend::set_sampling_defaults(std::size_t max_tokens,
   auto updated = std::make_shared<Impl::State>(*impl_->state);
   updated->sampling_defaults = {
       .max_tokens = max_tokens,
-      .temperature = temperature,
+      .sampling = sampling_config,
   };
   impl_->state = std::move(updated);
 #else
   (void)max_tokens;
-  (void)temperature;
+  (void)sampling_config;
 #endif
 }
 
 InferenceBackend::Result InferenceBackend::complete(
-    std::string_view prompt, std::size_t max_tokens, float temperature,
+    std::string_view prompt, std::size_t max_tokens,
+    const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, const TokenCallback& on_token) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
@@ -1998,12 +2009,12 @@ InferenceBackend::Result InferenceBackend::complete(
   }
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
   return impl_->GenerateScheduled(state, std::move(prompt_tokens),
-                                  request_start, max_tokens, temperature,
+                                  request_start, max_tokens, sampling_config,
                                   is_cancelled, on_token, "anonymous");
 #else
   (void)prompt;
   (void)max_tokens;
-  (void)temperature;
+  (void)sampling_config;
   (void)is_cancelled;
   (void)on_token;
   return {};
@@ -2011,7 +2022,8 @@ InferenceBackend::Result InferenceBackend::complete(
 }
 
 InferenceBackend::Result InferenceBackend::chat(
-    const ChatRequest& request, std::size_t max_tokens, float temperature,
+    const ChatRequest& request, std::size_t max_tokens,
+    const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled, const TokenCallback& on_token) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
@@ -2024,12 +2036,12 @@ InferenceBackend::Result InferenceBackend::chat(
     return {};
   }
   return impl_->GenerateScheduled(state, std::move(*prompt_tokens),
-                                  request_start, max_tokens, temperature,
+                                  request_start, max_tokens, sampling_config,
                                   is_cancelled, on_token, request.client_id);
 #else
   (void)request;
   (void)max_tokens;
-  (void)temperature;
+  (void)sampling_config;
   (void)is_cancelled;
   (void)on_token;
   return {};
@@ -2038,21 +2050,21 @@ InferenceBackend::Result InferenceBackend::chat(
 
 std::shared_ptr<InferenceBackend::GenerationRequest>
 InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
-                             float temperature,
+                             const sampling::SamplingConfig& sampling_config,
                              const CancellationCheck& is_cancelled,
                              bool stream_output) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
   if (state == nullptr) {
-    return TextGenerationBackend::start_chat(request, max_tokens, temperature,
-                                             is_cancelled, stream_output);
+    return TextGenerationBackend::start_chat(
+        request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
   auto prompt_tokens = state->scheduler->runner().RenderAndTokenize(request);
   if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
-    return TextGenerationBackend::start_chat(request, max_tokens, temperature,
-                                             is_cancelled, stream_output);
+    return TextGenerationBackend::start_chat(
+        request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
   Result error_result;
@@ -2061,7 +2073,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
       request.client_id.empty() ? "anonymous" : request.client_id;
   auto scheduled_request =
       state->scheduler->Submit(std::move(*prompt_tokens), max_tokens,
-                               temperature, is_cancelled, stream_output,
+                               sampling_config, is_cancelled, stream_output,
                                TextRequestMetadata{
                                    .client_id = error_result.client_id,
                                    .deadline = std::nullopt,
@@ -2070,16 +2082,16 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), std::move(error_result));
 #else
-  return TextGenerationBackend::start_chat(request, max_tokens, temperature,
+  return TextGenerationBackend::start_chat(request, max_tokens, sampling_config,
                                            is_cancelled, stream_output);
 #endif
 }
 
 InferenceBackend::Result InferenceBackend::chat(
     const std::vector<tokenization::ChatMessage>& messages,
-    std::size_t max_tokens, float temperature,
+    std::size_t max_tokens, const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled) {
-  return chat(ChatRequest{messages}, max_tokens, temperature, is_cancelled);
+  return chat(ChatRequest{messages}, max_tokens, sampling_config, is_cancelled);
 }
 
 std::size_t InferenceBackend::count_tokens(std::string_view text) const {

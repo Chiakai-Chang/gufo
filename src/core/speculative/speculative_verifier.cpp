@@ -11,7 +11,6 @@
 #include <limits>
 #include <numeric>
 #include <optional>
-#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -116,6 +115,31 @@ public:
   std::span<const float> CopyVerificationLogits(std::size_t row) override {
     return executor_.CopyVerificationLogits(row);
   }
+
+  bool SupportsDeviceResidentSampling() const noexcept override { return true; }
+
+  tokenization::TokenId SampleLastLogits(
+      sampling::SamplerState& sampler) override {
+    return executor_.SampleLastLogits(sampler);
+  }
+
+  tokenization::TokenId SampleVerificationLogits(
+      std::size_t row, sampling::SamplerState& sampler) override {
+    return executor_.SampleVerificationLogits(row, sampler);
+  }
+
+  SampledVerificationResult VerifySampledToken(
+      std::size_t row, tokenization::TokenId draft_token,
+      std::span<const tokenization::TokenId> draft_candidate_ids,
+      std::span<const float> draft_candidate_probabilities,
+      double draft_token_probability,
+      sampling::SamplerState& sampler) override {
+    const auto result = executor_.VerifySampledToken(
+        row, draft_token, draft_candidate_ids, draft_candidate_probabilities,
+        draft_token_probability, sampler);
+    return {.token = result.token, .accepted = result.accepted};
+  }
+
   VerificationChunkResult ForwardVerificationChunk(
       std::span<const tokenization::TokenId> candidate_tokens,
       std::uint32_t start_pos, bool capture_hidden,
@@ -497,9 +521,33 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
     throw std::invalid_argument(
         "speculative temperature must be finite and nonnegative");
   }
-  if (temperature > 0.0F) {
+  if (temperature > 0.0F && rng_state == nullptr) {
+    throw std::invalid_argument("sampled speculation requires RNG state");
+  }
+  sampling::SamplingConfig config;
+  config.temperature = temperature;
+  config.seed = 0;
+  sampling::SamplerState sampler(config, current_sequence);
+  if (rng_state != nullptr) {
+    sampler.SetRngState(*rng_state);
+  }
+  auto result = VerifyStep(current_sequence, cur_pos, current_token, eos_id,
+                           max_emitted_tokens, sampler);
+  if (rng_state != nullptr) {
+    *rng_state = sampler.rng_state();
+  }
+  return result;
+}
+
+SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
+    std::vector<tokenization::TokenId>& current_sequence, std::uint32_t cur_pos,
+    tokenization::TokenId current_token, tokenization::TokenId eos_id,
+    std::uint32_t max_emitted_tokens, sampling::SamplerState& sampler) {
+  sampler.config().Validate();
+  if (sampler.config().uses_random_sampling() ||
+      sampler.config().penalties_enabled()) {
     return VerifySampledStep(current_sequence, cur_pos, current_token, eos_id,
-                             max_emitted_tokens, temperature, rng_state);
+                             max_emitted_tokens, sampler);
   }
   if (max_emitted_tokens == 0) {
     throw std::invalid_argument(
@@ -759,24 +807,22 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
 SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySampledStep(
     std::vector<tokenization::TokenId>& current_sequence, std::uint32_t cur_pos,
     tokenization::TokenId current_token, tokenization::TokenId eos_id,
-    std::uint32_t max_emitted_tokens, float temperature,
-    std::uint64_t* rng_state) {
+    std::uint32_t max_emitted_tokens, sampling::SamplerState& sampler) {
   if (max_emitted_tokens == 0) {
     throw std::invalid_argument(
         "speculative verification must emit at least one token");
   }
-  if (rng_state == nullptr) {
-    throw std::invalid_argument("sampled speculation requires RNG state");
-  }
+  sampling::SamplerState working_sampler = sampler;
 
   const auto target_only_step = [&]() {
     (void)target_executor_->ForwardToken(current_token, cur_pos);
-    const auto logits = target_executor_->CopyLastLogits();
-    if (logits.empty()) {
-      throw std::runtime_error(
-          "target executor did not retain sampled decode logits");
+    const auto next = target_executor_->SampleLastLogits(working_sampler);
+    std::vector<float> next_logits;
+    if (options_.retain_frontier_logits) {
+      const auto logits = target_executor_->CopyLastLogits();
+      next_logits.assign(logits.begin(), logits.end());
     }
-    const auto next = sampling::SampleLogits(logits, temperature, rng_state);
+    sampler.SetRngState(working_sampler.rng_state());
     UpdateDraftTargetHidden();
     ++stats_.total_verification_steps;
     ++stats_.total_emitted_tokens;
@@ -785,13 +831,15 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySampledStep(
         .accepted_count = 0,
         .draft_count = 0,
         .next_token = next,
-        .next_token_logits = {logits.begin(), logits.end()},
+        .next_token_logits = std::move(next_logits),
         .hit_eos = IsStopToken(next, eos_id),
     };
   };
 
   const std::uint32_t max_draft_tokens =
-      max_emitted_tokens > 1
+      max_emitted_tokens > 1 && sampler.config().uses_random_sampling() &&
+              draft_backend_ != nullptr &&
+              draft_backend_->SupportsSampledProposals()
           ? std::min(current_draft_length_, max_emitted_tokens - 1)
           : 0;
   if (draft_backend_ == nullptr || max_draft_tokens == 0) {
@@ -799,7 +847,8 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySampledStep(
   }
 
   const auto proposal = draft_backend_->ProposeSampled(
-      current_sequence, cur_pos, max_draft_tokens, temperature, rng_state);
+      current_sequence, cur_pos, max_draft_tokens, sampler.config().temperature,
+      working_sampler.mutable_rng_state());
   if (proposal.tokens.empty()) {
     return target_only_step();
   }
@@ -855,12 +904,16 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySampledStep(
 
   const bool capture_target_hidden =
       draft_backend_->RequiresTargetHiddenStates();
+  const bool device_resident_sampling =
+      target_executor_->SupportsDeviceResidentSampling();
   target_executor_->SaveState(cur_pos);
   auto verification = target_executor_->ForwardVerificationChunk(
-      verification_inputs, cur_pos, capture_target_hidden, true);
-  if (verification.vocab_size == 0 ||
-      verification.logits.size() !=
-          verification_inputs.size() * verification.vocab_size) {
+      verification_inputs, cur_pos, capture_target_hidden,
+      !device_resident_sampling);
+  if (!device_resident_sampling &&
+      (verification.vocab_size == 0 ||
+       verification.logits.size() !=
+           verification_inputs.size() * verification.vocab_size)) {
     throw std::runtime_error(
         "target executor returned incomplete verification logits");
   }
@@ -875,32 +928,46 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySampledStep(
   std::size_t accepted_count = 0;
   tokenization::TokenId correction_token = 0;
   for (; accepted_count < num_draft; ++accepted_count) {
+    const double draft_probability = draft_token_probability(accepted_count);
+    const auto [candidate_ids, candidate_probabilities] =
+        proposal_row(accepted_count);
+    if (device_resident_sampling) {
+      const auto decision = target_executor_->VerifySampledToken(
+          accepted_count, proposal.tokens[accepted_count], candidate_ids,
+          candidate_probabilities, draft_probability, working_sampler);
+      if (decision.accepted) {
+        continue;
+      }
+      correction_token = decision.token;
+      break;
+    }
+
     const auto target_row = std::span<const float>(
         verification.logits.data() + (accepted_count * verification.vocab_size),
         verification.vocab_size);
-    const double target_probability = sampling::TokenProbability(
-        target_row, temperature, proposal.tokens[accepted_count]);
-    const double draft_probability = draft_token_probability(accepted_count);
-    if (sampling::Uniform(rng_state) * draft_probability < target_probability) {
+    const auto target_distribution = working_sampler.Distribution(target_row);
+    const double target_probability =
+        target_distribution.probability(proposal.tokens[accepted_count]);
+    if (working_sampler.Uniform() * draft_probability < target_probability) {
+      working_sampler.Accept(proposal.tokens[accepted_count]);
       continue;
     }
-    const auto [candidate_ids, candidate_probabilities] =
-        proposal_row(accepted_count);
-    correction_token =
-        sampling::SampleResidual(target_row, temperature, candidate_ids,
-                                 candidate_probabilities, rng_state);
+    correction_token = target_distribution.SampleResidual(
+        candidate_ids, candidate_probabilities,
+        working_sampler.mutable_rng_state());
     break;
   }
   if (accepted_count == num_draft) {
-    const auto bonus_row = std::span<const float>(
-        verification.logits.data() + (num_draft * verification.vocab_size),
-        verification.vocab_size);
-    correction_token =
-        sampling::SampleLogits(bonus_row, temperature, rng_state);
+    if (device_resident_sampling) {
+      correction_token = target_executor_->SampleVerificationLogits(
+          num_draft, working_sampler);
+    } else {
+      const auto bonus_row = std::span<const float>(
+          verification.logits.data() + (num_draft * verification.vocab_size),
+          verification.vocab_size);
+      correction_token = working_sampler.Sample(bonus_row);
+    }
   }
-  const auto correction_row = std::span<const float>(
-      verification.logits.data() + (accepted_count * verification.vocab_size),
-      verification.vocab_size);
 
   const std::size_t committed_input_count = accepted_count + 1;
   if (accepted_count != num_draft) {
@@ -926,7 +993,21 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySampledStep(
       proposal.tokens.begin() + static_cast<std::ptrdiff_t>(accepted_count));
   result.emitted_tokens.push_back(correction_token);
   result.next_token = correction_token;
-  result.next_token_logits.assign(correction_row.begin(), correction_row.end());
+  if (options_.retain_frontier_logits) {
+    if (device_resident_sampling) {
+      const auto correction_row =
+          target_executor_->CopyVerificationLogits(accepted_count);
+      result.next_token_logits.assign(correction_row.begin(),
+                                      correction_row.end());
+    } else {
+      const auto correction_row =
+          std::span<const float>(verification.logits.data() +
+                                     (accepted_count * verification.vocab_size),
+                                 verification.vocab_size);
+      result.next_token_logits.assign(correction_row.begin(),
+                                      correction_row.end());
+    }
+  }
   result.hit_eos = std::any_of(
       result.emitted_tokens.begin(), result.emitted_tokens.end(),
       [&](tokenization::TokenId token) { return IsStopToken(token, eos_id); });
@@ -936,6 +1017,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySampledStep(
   ++stats_.total_verification_steps;
   stats_.total_emitted_tokens += result.emitted_tokens.size();
   UpdateAdaptiveDraftLength(accepted_count, num_draft);
+  sampler.SetRngState(working_sampler.rng_state());
   draft_backend_->AcceptFeedback(std::span<const tokenization::TokenId>(
                                      proposal.tokens.data(), accepted_count),
                                  correction_token);
@@ -1179,24 +1261,13 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
   if (prompt_tokens.empty()) {
     return output_tokens;
   }
-  if (!std::isfinite(options.temperature) || options.temperature < 0.0F) {
-    throw std::invalid_argument(
-        "generation temperature must be finite and nonnegative");
-  }
+  options.sampling.Validate();
 
   tokenization::TokenId first_token = Prime(prompt_tokens);
-  std::uint64_t rng_state = 0;
-  if (options.temperature > 0.0F) {
-    if (options.seed >= 0) {
-      rng_state = static_cast<std::uint64_t>(options.seed);
-    } else {
-      std::random_device random_device;
-      rng_state = (static_cast<std::uint64_t>(random_device()) << 32U) ^
-                  static_cast<std::uint64_t>(random_device());
-    }
+  sampling::SamplerState sampler(options.sampling, prompt_tokens);
+  if (!options.sampling.can_use_unmodified_argmax()) {
     const auto logits = target_executor_->CopyLastLogits();
-    first_token =
-        sampling::SampleLogits(logits, options.temperature, &rng_state);
+    first_token = sampler.Sample(logits);
   }
   const auto eos_id = target_executor_->GetEosTokenId();
   if (options.max_new_tokens == 0 || IsStopToken(first_token, eos_id)) {
@@ -1210,6 +1281,7 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
   tokenization::TokenId next_token = first_token;
 
   output_tokens.push_back(first_token);
+  sampler.Accept(first_token);
   if (on_token) {
     const auto piece = target_executor_->DecodeToken(first_token);
     if (!on_token(first_token, piece)) {
@@ -1219,17 +1291,14 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
 
   // Speculative decode generation loop.
   while (output_tokens.size() < options.max_new_tokens) {
-    StepResult step_res;
-    if (options.temperature > 0.0F) {
-      const auto remaining = options.max_new_tokens - output_tokens.size();
-      step_res =
-          VerifyStep(current_sequence, cur_pos, next_token, eos_id,
-                     static_cast<std::uint32_t>(std::min<std::size_t>(
-                         remaining, std::numeric_limits<std::uint32_t>::max())),
-                     options.temperature, &rng_state);
-    } else {
-      step_res = VerifyStep(current_sequence, cur_pos, next_token, eos_id);
-    }
+    const auto remaining = options.max_new_tokens - output_tokens.size();
+    const std::uint32_t verification_budget =
+        options.sampling.can_use_unmodified_argmax()
+            ? std::numeric_limits<std::uint32_t>::max()
+            : static_cast<std::uint32_t>(std::min<std::size_t>(
+                  remaining, std::numeric_limits<std::uint32_t>::max()));
+    StepResult step_res = VerifyStep(current_sequence, cur_pos, next_token,
+                                     eos_id, verification_budget, sampler);
 
     bool should_stop = false;
     for (const auto tok : step_res.emitted_tokens) {
@@ -1239,6 +1308,7 @@ std::vector<tokenization::TokenId> SpeculativeVerifier::Generate(
       }
 
       output_tokens.push_back(tok);
+      sampler.Accept(tok);
       current_sequence.push_back(tok);
       ++cur_pos;
 

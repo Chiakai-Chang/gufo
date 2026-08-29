@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
@@ -106,7 +107,7 @@ public:
 
   struct SamplingDefaults {
     std::size_t max_tokens{128};
-    float temperature{0.0F};
+    sampling::SamplingConfig sampling;
   };
 
   struct Result {
@@ -181,22 +182,47 @@ public:
   }
 
   virtual Result complete(std::string_view prompt, std::size_t max_tokens,
-                          float temperature,
+                          const sampling::SamplingConfig& sampling,
                           const CancellationCheck& is_cancelled = {},
                           const TokenCallback& on_token = {}) = 0;
 
   virtual Result chat(const ChatRequest& request, std::size_t max_tokens,
-                      float temperature,
+                      const sampling::SamplingConfig& sampling,
                       const CancellationCheck& is_cancelled = {},
                       const TokenCallback& on_token = {}) = 0;
+
+  Result complete(std::string_view prompt, std::size_t max_tokens,
+                  float temperature, const CancellationCheck& is_cancelled = {},
+                  const TokenCallback& on_token = {}) {
+    sampling::SamplingConfig config;
+    config.temperature = temperature;
+    return complete(prompt, max_tokens, config, is_cancelled, on_token);
+  }
+
+  Result chat(const ChatRequest& request, std::size_t max_tokens,
+              float temperature, const CancellationCheck& is_cancelled = {},
+              const TokenCallback& on_token = {}) {
+    sampling::SamplingConfig config;
+    config.temperature = temperature;
+    return chat(request, max_tokens, config, is_cancelled, on_token);
+  }
 
   /// Reserves admission before a streaming response commits successful headers.
   ///
   /// Backends with an asynchronous scheduler override this. The default
   /// request defers the existing blocking chat call until Wait().
   virtual std::shared_ptr<GenerationRequest> start_chat(
-      const ChatRequest& request, std::size_t max_tokens, float temperature,
+      const ChatRequest& request, std::size_t max_tokens,
+      const sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled = {}, bool stream_output = false);
+
+  std::shared_ptr<GenerationRequest> start_chat(
+      const ChatRequest& request, std::size_t max_tokens, float temperature,
+      const CancellationCheck& is_cancelled = {}, bool stream_output = false) {
+    sampling::SamplingConfig config;
+    config.temperature = temperature;
+    return start_chat(request, max_tokens, config, is_cancelled, stream_output);
+  }
 
   [[nodiscard]] virtual std::size_t count_tokens(
       std::string_view text) const = 0;
@@ -204,7 +230,8 @@ public:
 
 inline std::shared_ptr<TextGenerationBackend::GenerationRequest>
 TextGenerationBackend::start_chat(const ChatRequest& request,
-                                  std::size_t max_tokens, float temperature,
+                                  std::size_t max_tokens,
+                                  const sampling::SamplingConfig& sampling,
                                   const CancellationCheck& is_cancelled,
                                   bool stream_output) {
   (void)stream_output;
@@ -212,12 +239,12 @@ TextGenerationBackend::start_chat(const ChatRequest& request,
   public:
     DeferredGenerationRequest(TextGenerationBackend& backend,
                               ChatRequest chat_request, std::size_t token_limit,
-                              float sampling_temperature,
+                              sampling::SamplingConfig sampling_config,
                               CancellationCheck external_cancellation)
         : backend_(backend),
           request_(std::move(chat_request)),
           max_tokens_(token_limit),
-          temperature_(sampling_temperature),
+          sampling_(sampling_config),
           external_cancellation_(std::move(external_cancellation)) {}
 
     Result Wait(const TokenCallback& on_token) override {
@@ -225,7 +252,7 @@ TextGenerationBackend::start_chat(const ChatRequest& request,
         throw std::logic_error("generation request was already consumed");
       }
       return backend_.chat(
-          request_, max_tokens_, temperature_,
+          request_, max_tokens_, sampling_,
           [this] {
             return cancelled_.load(std::memory_order_acquire) ||
                    (external_cancellation_ && external_cancellation_());
@@ -241,14 +268,14 @@ TextGenerationBackend::start_chat(const ChatRequest& request,
     TextGenerationBackend& backend_;
     ChatRequest request_;
     std::size_t max_tokens_;
-    float temperature_;
+    sampling::SamplingConfig sampling_;
     CancellationCheck external_cancellation_;
     std::atomic<bool> waited_{false};
     std::atomic<bool> cancelled_{false};
   };
 
   return std::make_shared<DeferredGenerationRequest>(*this, request, max_tokens,
-                                                     temperature, is_cancelled);
+                                                     sampling, is_cancelled);
 }
 
 }  // namespace gufo::server

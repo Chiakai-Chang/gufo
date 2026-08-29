@@ -5,7 +5,6 @@
 #include <iostream>
 #include <limits>
 #include <mutex>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -293,12 +292,6 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
   };
 }
 
-std::uint64_t MakeRngState() {
-  std::random_device random_device;
-  return (static_cast<std::uint64_t>(random_device()) << 32U) ^
-         static_cast<std::uint64_t>(random_device());
-}
-
 }  // namespace
 
 void TextModelRunner::AdvanceBatch(
@@ -308,15 +301,14 @@ void TextModelRunner::AdvanceBatch(
   }
 }
 
-TextDecodeStep TextModelRunner::DecodeStep(TextRunnerState& state,
-                                           std::size_t max_tokens,
-                                           float temperature,
-                                           std::uint64_t* rng_state) const {
+TextDecodeStep TextModelRunner::DecodeStep(
+    TextRunnerState& state, std::size_t max_tokens,
+    sampling::SamplerState& sampler) const {
   if (max_tokens == 0) {
     throw std::invalid_argument(
         "text runner decode step budget must be at least one token");
   }
-  auto selection = SelectNext(state, temperature, rng_state);
+  auto selection = SelectNext(state, sampler);
   if (selection.stop) {
     return {
         .selections = {},
@@ -404,6 +396,7 @@ struct TextRunnerPool::Request::Impl {
        std::shared_ptr<ContinuationDiskStore> persistent_store,
        ContinuationCache::Lease state_lease,
        std::vector<TextRunnerToken> prompt_tokens,
+       const sampling::SamplingConfig& sampling_config,
        const CancellationCheck& is_cancelled)
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
@@ -411,7 +404,7 @@ struct TextRunnerPool::Request::Impl {
         prompt(std::move(prompt_tokens)),
         prefill_offset(lease.cached_tokens()),
         decode_ready(prefill_offset == prompt.size()),
-        rng_state(MakeRngState()) {
+        sampler(sampling_config, prompt) {
     auto& state = dynamic_cast<TextRunnerState&>(lease.state());
     state.SetCancellationCheck(is_cancelled);
     if (lease.cache_hit()) {
@@ -430,7 +423,7 @@ struct TextRunnerPool::Request::Impl {
   bool decode_ready{false};
   bool stopped{false};
   std::optional<TextDecodeSelection> pending_selection;
-  std::uint64_t rng_state{0};
+  sampling::SamplerState sampler;
 };
 
 TextRunnerPool::Request::Request() = default;
@@ -519,7 +512,7 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
   return step;
 }
 
-TextDecodeSelection TextRunnerPool::Request::SelectNext(float temperature) {
+TextDecodeSelection TextRunnerPool::Request::SelectNext() {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
   }
@@ -536,12 +529,12 @@ TextDecodeSelection TextRunnerPool::Request::SelectNext(float temperature) {
   }
 
   auto selection = impl_->runner->SelectNext(
-      dynamic_cast<TextRunnerState&>(impl_->lease.state()), temperature,
-      &impl_->rng_state);
+      dynamic_cast<TextRunnerState&>(impl_->lease.state()), impl_->sampler);
   if (selection.stop) {
     impl_->stopped = true;
     return selection;
   }
+  impl_->sampler.Accept(selection.token);
   impl_->generated.push_back(selection.token);
   impl_->pending_selection = selection;
   return selection;
@@ -560,8 +553,7 @@ void TextRunnerPool::Request::Advance() {
   impl_->pending_selection.reset();
 }
 
-TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens,
-                                                   float temperature) {
+TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens) {
   if (!*this) {
     throw std::logic_error("text runner request is empty");
   }
@@ -583,7 +575,7 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens,
 
   auto step = impl_->runner->DecodeStep(
       dynamic_cast<TextRunnerState&>(impl_->lease.state()), max_tokens,
-      temperature, &impl_->rng_state);
+      impl_->sampler);
   if (step.selections.size() > max_tokens ||
       (step.selections.empty() && !step.stop)) {
     throw std::runtime_error("text runner returned an invalid decode step");
@@ -593,6 +585,7 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens,
       throw std::runtime_error(
           "text runner decode step contains an embedded stop selection");
     }
+    impl_->sampler.Accept(selection.token);
     impl_->generated.push_back(selection.token);
   }
   impl_->stopped = step.stop;
@@ -813,7 +806,9 @@ void TextRunnerPool::AdvanceBatch(std::span<Request*> requests,
 
 TextRunnerPool::Request TextRunnerPool::Acquire(
     std::vector<TextRunnerToken> prompt,
+    const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled) {
+  sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
   }
@@ -845,7 +840,13 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   }
   return Request(std::make_unique<Request::Impl>(
       impl_->validated.runner, impl_->disk_store, std::move(lease),
-      std::move(prompt), is_cancelled));
+      std::move(prompt), sampling_config, is_cancelled));
+}
+
+TextRunnerPool::Request TextRunnerPool::Acquire(
+    std::vector<TextRunnerToken> prompt,
+    const CancellationCheck& is_cancelled) {
+  return Acquire(std::move(prompt), sampling::SamplingConfig{}, is_cancelled);
 }
 
 }  // namespace gufo::server

@@ -14,6 +14,7 @@
 
 #include "src/cli/serve/continuation_cache.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
+#include "src/core/sampling.hpp"
 
 namespace gufo::server {
 
@@ -185,12 +186,11 @@ public:
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
       std::size_t offset, std::size_t max_input_tokens) const = 0;
   [[nodiscard]] virtual TextDecodeSelection SelectNext(
-      TextRunnerState& state, float temperature,
-      std::uint64_t* rng_state) const = 0;
+      TextRunnerState& state, sampling::SamplerState& sampler) const = 0;
   virtual void Advance(TextRunnerState& state, TextRunnerToken token) const = 0;
   [[nodiscard]] virtual TextDecodeStep DecodeStep(
-      TextRunnerState& state, std::size_t max_tokens, float temperature,
-      std::uint64_t* rng_state) const;
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const;
   virtual void AdvanceBatch(std::span<const TextRunnerAdvance> advances) const;
   [[nodiscard]] virtual std::size_t CheckpointPosition(
       const TextRunnerState& state) const = 0;
@@ -259,10 +259,9 @@ public:
     [[nodiscard]] bool prefill_complete() const noexcept;
 
     [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
-    [[nodiscard]] TextDecodeSelection SelectNext(float temperature);
+    [[nodiscard]] TextDecodeSelection SelectNext();
     void Advance();
-    [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens,
-                                            float temperature);
+    [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);
 
     /// Publishes the model state at its reported checkpoint boundary.
     CommitMetrics Commit();
@@ -292,6 +291,9 @@ public:
       std::size_t ready_requests) const;
   void AdvanceBatch(std::span<Request*> requests,
                     const TextExecutionPlan& plan);
+  [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
+                                const sampling::SamplingConfig& sampling,
+                                const CancellationCheck& is_cancelled = {});
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
 
