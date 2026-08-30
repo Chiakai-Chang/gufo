@@ -160,6 +160,61 @@ enum class KQuantSmallBatchRows : std::uint8_t {
   return rows;
 }
 
+// opt-q4kxl-actsum: Q4_K/Q5_K blocked WMMA needs the sum of each quantized
+// 32-element activation block for its minimum correction. Computing it in the
+// kernel costs eight `sudot4` per token tile per K block, and every row tile in
+// the block recomputes the same value. Storing it once beside the unchanged
+// tiled Q8_1 layout is retained as the default.
+//
+// Measured on the UD-Q4_K_XL shard, four interleaved single-repetition pairs:
+//
+//   pp2048 reference 471.09/467.44/465.74/461.76 (median 466.59)
+//   pp2048 staged    472.29/469.54/468.55/465.62 (median 469.05, +0.53%)
+//   pp2048 direct    459.04/456.61/452.41/453.34 (median 454.98, -2.49%)
+//
+// Staged wins every pair, direct loses every pair. `direct` re-reads the
+// sidecar from global memory inside the innermost token-tile loop, so each row
+// tile pays the load again instead of sharing one LDS read -- it is kept
+// selectable because it is the natural alternative and the measurement is the
+// only thing that separates them. The producers write the sidecar on the decode
+// path too, where nothing reads it; that was checked and costs nothing
+// (tg128 11.60/11.61/11.61 against 11.60/11.61/11.62, and tg128-dflash2 is
+// 3/3 pairs slightly ahead at 18.76/18.76/18.75 against 18.72/18.74/18.72).
+//
+// `0` pins the independent in-kernel `sudot4` reference route.
+enum class KQuantActivationSumMode : std::uint8_t {
+  kReference,
+  kStaged,
+  kDirect,
+};
+
+[[nodiscard]] inline KQuantActivationSumMode ResolveKQuantActivationSums(
+    const char* value) noexcept {
+  if (value == nullptr) {
+    return KQuantActivationSumMode::kStaged;
+  }
+  const std::string_view text{value};
+  if (text == "direct") {
+    return KQuantActivationSumMode::kDirect;
+  }
+  return text == "1" || text == "true" || text == "on" || text == "sidecar" ||
+                 text == "staged"
+             ? KQuantActivationSumMode::kStaged
+             : KQuantActivationSumMode::kReference;
+}
+
+[[nodiscard]] inline KQuantActivationSumMode
+KQuantActivationSumModeFromEnv() noexcept {
+  static const KQuantActivationSumMode mode =
+      ResolveKQuantActivationSums(std::getenv("GUFO_KQUANT_ACTIVATION_SUMS"));
+  return mode;
+}
+
+[[nodiscard]] inline bool ShouldStoreKQuantActivationSums() noexcept {
+  return KQuantActivationSumModeFromEnv() !=
+         KQuantActivationSumMode::kReference;
+}
+
 [[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
     std::size_t sequence_length) noexcept {
   if (sequence_length < kSplitKDecodeAttentionMinContext) {

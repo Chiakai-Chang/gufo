@@ -74,12 +74,35 @@ using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
 constexpr std::size_t kQ8ActTileTokens = 16;
 constexpr std::size_t kQ8ActTileBytes = 576;
 constexpr std::size_t kQ8ActScaleOffset = 512;
+constexpr std::size_t kQ8ActSumTileBytes = kQ8ActTileTokens * sizeof(float);
 
 /// Byte size of the tiled Q8_1 activation buffer for a [batch, k] tensor.
 __host__ __device__ inline std::size_t Q8ActTiledBytes(std::size_t batch,
                                                        std::size_t k) {
   const std::size_t tiles = (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
   return tiles * (k / 32) * kQ8ActTileBytes;
+}
+
+/// Byte size of the optional per-token activation-sum sidecar. Keeping it
+/// after the tiled payload leaves the Q8_1 layout and every Q8 kernel
+/// unchanged.
+__host__ __device__ inline std::size_t Q8ActSumBytes(std::size_t batch,
+                                                     std::size_t k) {
+  const std::size_t tiles = (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
+  return tiles * (k / 32) * kQ8ActSumTileBytes;
+}
+
+__device__ __forceinline__ float* Q8ActSumSidecar(void* base, std::size_t batch,
+                                                  std::size_t k) {
+  return reinterpret_cast<float*>(static_cast<std::uint8_t*>(base) +
+                                  Q8ActTiledBytes(batch, k));
+}
+
+__device__ __forceinline__ const float* Q8ActSumSidecar(const void* base,
+                                                        std::size_t batch,
+                                                        std::size_t k) {
+  return reinterpret_cast<const float*>(static_cast<const std::uint8_t*>(base) +
+                                        Q8ActTiledBytes(batch, k));
 }
 
 __device__ __forceinline__ std::int8_t* Q8ActTile(void* base,
@@ -100,7 +123,9 @@ __device__ __forceinline__ const std::int8_t* Q8ActTile(const void* base,
 
 /// Writes one lane's quantized byte and (lane 0) the block scale into the tiled
 /// layout. `lane_id` is the element index inside the 32-element block.
-__device__ __forceinline__ void StoreQ8ActLane(void* y, std::size_t num_blocks,
+template<bool StoreActivationSum>
+__device__ __forceinline__ void StoreQ8ActLane(void* y, std::size_t batch,
+                                               std::size_t num_blocks,
                                                std::size_t tok, std::size_t blk,
                                                std::size_t lane_id, float d,
                                                std::int8_t q) {
@@ -114,9 +139,20 @@ __device__ __forceinline__ void StoreQ8ActLane(void* y, std::size_t num_blocks,
     *reinterpret_cast<float*>(tile + kQ8ActScaleOffset + (tl * sizeof(float))) =
         d;
   }
+  if constexpr (StoreActivationSum) {
+    int qsum = static_cast<int>(q);
+    for (int off = 16; off > 0; off >>= 1) {
+      qsum += __shfl_xor(qsum, off);
+    }
+    if (lane_id == 0) {
+      float* sums = Q8ActSumSidecar(y, batch, num_blocks * 32);
+      sums[(((tt * num_blocks) + blk) * kQ8ActTileTokens) + tl] =
+          d * static_cast<float>(qsum);
+    }
+  }
 }
 
-template<typename T>
+template<bool StoreActivationSum, typename T>
 __global__ void QuantizeActivationToQ8_1Kernel(const T* __restrict__ x,
                                                void* __restrict__ y,
                                                std::size_t batch,
@@ -145,7 +181,8 @@ __global__ void QuantizeActivationToQ8_1Kernel(const T* __restrict__ x,
   const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
   const int8_t q = static_cast<int8_t>(roundf(val * id));
 
-  StoreQ8ActLane(y, num_blocks, tok, blk, lane_id, d, q);
+  StoreQ8ActLane<StoreActivationSum>(y, batch, num_blocks, tok, blk, lane_id, d,
+                                     q);
 }
 
 // opt-c173-norm-quant: optional residual add, RMSNorm, and the tiled Q8_1
@@ -166,6 +203,7 @@ __global__ void QuantizeActivationToQ8_1Kernel(const T* __restrict__ x,
 // changes, from BF16 to the FP32 value it was rounded from, which strictly
 // narrows the quantization error -- the same trade `opt-c164-swiglu-quant` and
 // `opt-c172-fp32-quant` made.
+template<bool StoreActivationSum>
 __global__ void BatchedFusedRMSNormQuantizeQ8_1Kernel(
     const float* __restrict__ x, const float* __restrict__ residual,
     const float* __restrict__ weight, float* __restrict__ sum_out,
@@ -232,7 +270,8 @@ __global__ void BatchedFusedRMSNormQuantizeQ8_1Kernel(
     const float d = max_abs / 127.0F;
     const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
     const std::int8_t q = static_cast<std::int8_t>(roundf(val * id));
-    StoreQ8ActLane(q8_out, num_blocks, b, blk, lane_id, d, q);
+    StoreQ8ActLane<StoreActivationSum>(q8_out, batch_size, num_blocks, b, blk,
+                                       lane_id, d, q);
   }
 }
 
@@ -250,6 +289,7 @@ __global__ void BatchedFusedRMSNormQuantizeQ8_1Kernel(
 // so every gated value is bit-identical to that kernel; only the quantization
 // input changes from a re-read FP32 store to the register it came from, which
 // is the same value.
+template<bool StoreActivationSum>
 __global__ void BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel(
     const float* __restrict__ raw_out, const float* __restrict__ ssm_norm,
     const float* __restrict__ gate, void* __restrict__ q8_out,
@@ -310,11 +350,13 @@ __global__ void BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel(
   const float d = max_abs / 127.0F;
   const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
   const std::int8_t q = static_cast<std::int8_t>(roundf(val * id));
-  StoreQ8ActLane(q8_out, num_blocks, t, blk, lane_id, d, q);
+  StoreQ8ActLane<StoreActivationSum>(q8_out, batch_size, num_blocks, t, blk,
+                                     lane_id, d, q);
 }
 
 /// Zeroes the tail of the last token tile so a batch that is not a multiple of
 /// 16 cannot feed uninitialized scales into the GEMM epilogue.
+template<bool StoreActivationSum>
 __global__ void ZeroQ8ActTailKernel(void* __restrict__ y, std::size_t batch,
                                     std::size_t num_blocks) {
   const std::size_t tail = batch % kQ8ActTileTokens;
@@ -334,8 +376,13 @@ __global__ void ZeroQ8ActTailKernel(void* __restrict__ y, std::size_t batch,
   reinterpret_cast<int32x4_t*>(tile + 256 + (tl * 16))[0] = {};
   *reinterpret_cast<float*>(tile + kQ8ActScaleOffset + (tl * sizeof(float))) =
       0.0F;
+  if constexpr (StoreActivationSum) {
+    float* sums = Q8ActSumSidecar(y, batch, num_blocks * 32);
+    sums[(((tt * num_blocks) + kb) * kQ8ActTileTokens) + tl] = 0.0F;
+  }
 }
 
+template<bool StoreActivationSum>
 __global__ void BatchedFusedSwiGLUQuantizeQ8_1Kernel(
     const float* __restrict__ gate, const float* __restrict__ up,
     void* __restrict__ y, std::size_t batch, std::size_t k) {
@@ -367,7 +414,8 @@ __global__ void BatchedFusedSwiGLUQuantizeQ8_1Kernel(
   const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
   const int8_t q = static_cast<int8_t>(roundf(val * id));
 
-  StoreQ8ActLane(y, num_blocks, tok, blk, lane_id, d, q);
+  StoreQ8ActLane<StoreActivationSum>(y, batch, num_blocks, tok, blk, lane_id, d,
+                                     q);
 }
 
 template<bool SubOpsel>
@@ -684,7 +732,8 @@ __launch_bounds__(256) __global__
 // from 462.7 to 412.9 t/s. The rematerialization the allocator inserts into the
 // inner loop to hit the register target costs more than the extra wave returns,
 // so this kernel is latency-bound rather than occupancy-bound.
-template<int BM, int BN, int BK, int WM, int WN, core::GgmlType WType>
+template<int BM, int BN, int BK, int WM, int WN, core::GgmlType WType,
+         bool UsePrecomputedSums, bool StagePrecomputedSums>
 __launch_bounds__(256) __global__
     void WKQuantA8BlockedWmmaGEMMKernel(const void* __restrict__ w,
                                         const void* __restrict__ x_blocks,
@@ -697,6 +746,7 @@ __launch_bounds__(256) __global__
       WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K;
   constexpr bool HasOffset =
       WType == core::GgmlType::kQ4_K || WType == core::GgmlType::kQ5_K;
+  static_assert(!StagePrecomputedSums || UsePrecomputedSums);
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(BN / 16 <= 8,
@@ -713,6 +763,8 @@ __launch_bounds__(256) __global__
   __shared__ float s_off[BK][kOffRowTiles][16];
   __shared__ int32x4_t s_b[BK][kTokTiles][32];
   __shared__ float s_dx[BK][kTokTiles][16];
+  __shared__ float s_sx[StagePrecomputedSums && HasOffset ? BK : 1][kTokTiles]
+                       [16];
 
   const std::size_t num_blocks = k / 32;
   const std::size_t row_bytes = QuantRowBytes(WType, k);
@@ -749,6 +801,7 @@ __launch_bounds__(256) __global__
   float r_off[kPrefetch];
   int32x4_t r_b[BK];
   float r_dx[BK];
+  float r_sx[StagePrecomputedSums && HasOffset ? BK : 1];
   const int b_tile = wave_id;
 
   // Row bases and liveness are hoisted exactly as in the Q8_0 kernel: an
@@ -770,6 +823,7 @@ __launch_bounds__(256) __global__
                        ((tt_block + static_cast<std::size_t>(b_tile)) *
                         num_blocks * kQ8ActTileBytes);
   const bool b_live = b_tile < kTokTiles;
+  const float* activation_sums = Q8ActSumSidecar(x_blocks, batch, k);
 
   const auto fetch_stage = [&](int kb0) {
 #pragma unroll
@@ -802,6 +856,15 @@ __launch_bounds__(256) __global__
         r_dx[i] = ((kb < num_kb) ? 1.0F : 0.0F) *
                   reinterpret_cast<const float*>(
                       tile + kQ8ActScaleOffset)[lane_id & 15];
+        if constexpr (StagePrecomputedSums && HasOffset) {
+          const std::size_t token_tile =
+              tt_block + static_cast<std::size_t>(b_tile);
+          r_sx[i] = ((kb < num_kb) ? 1.0F : 0.0F) *
+                    activation_sums[(((token_tile * num_blocks) +
+                                      static_cast<std::size_t>(kb_clamped)) *
+                                     kQ8ActTileTokens) +
+                                    static_cast<std::size_t>(lane_id & 15)];
+        }
       }
     }
   };
@@ -831,6 +894,9 @@ __launch_bounds__(256) __global__
         s_b[i][b_tile][lane_id] = r_b[i];
         if (lane_id < 16) {
           s_dx[i][b_tile][lane_id] = r_dx[i];
+          if constexpr (StagePrecomputedSums && HasOffset) {
+            s_sx[i][b_tile][lane_id] = r_sx[i];
+          }
         }
       }
     }
@@ -912,18 +978,34 @@ __launch_bounds__(256) __global__
         // belongs to, so this needs no cross-lane traffic.
         float sx = 0.0F;
         if constexpr (HasOffset) {
-          // gfx1151 exposes V_DOT4_I32_IU8 (`sudot4`) but not the dot1-insts
-          // `sdot4`; the activation codes are signed and the ones vector is
-          // unsigned, which is exactly the mixed form sudot4 takes.
-          int qsum = 0;
+          if constexpr (UsePrecomputedSums) {
+            if constexpr (StagePrecomputedSums) {
+              sx = s_sx[kb][ts][sub_lane];
+            } else {
+              const std::size_t token_tile =
+                  tt_block + static_cast<std::size_t>(ts);
+              const int global_kb = kb0 + kb;
+              const std::size_t activation_block = static_cast<std::size_t>(
+                  global_kb < num_kb ? global_kb : num_kb - 1);
+              sx = activation_sums[(((token_tile * num_blocks) +
+                                     activation_block) *
+                                    kQ8ActTileTokens) +
+                                   static_cast<std::size_t>(sub_lane)];
+            }
+          } else {
+            // gfx1151 exposes V_DOT4_I32_IU8 (`sudot4`) but not the dot1-insts
+            // `sdot4`; the activation codes are signed and the ones vector is
+            // unsigned, which is exactly the mixed form sudot4 takes.
+            int qsum = 0;
 #pragma unroll
-          for (int v = 0; v < 4; ++v) {
-            qsum = __builtin_amdgcn_sudot4(true, b0[v], false, 0x01010101, qsum,
-                                           false);
-            qsum = __builtin_amdgcn_sudot4(true, b1[v], false, 0x01010101, qsum,
-                                           false);
+            for (int v = 0; v < 4; ++v) {
+              qsum = __builtin_amdgcn_sudot4(true, b0[v], false, 0x01010101,
+                                             qsum, false);
+              qsum = __builtin_amdgcn_sudot4(true, b1[v], false, 0x01010101,
+                                             qsum, false);
+            }
+            sx = dx * static_cast<float>(qsum);
           }
-          sx = dx * static_cast<float>(qsum);
         }
 #pragma unroll
         for (int i = 0; i < kWaveRowTiles; ++i) {
@@ -1433,6 +1515,7 @@ __launch_bounds__(WavesPerBlock * 32, 4) __global__
 
 namespace {
 
+template<bool StoreActivationSum>
 void LaunchZeroQ8ActTail(void* q8_1_out, std::size_t batch, std::size_t k,
                          hipStream_t stream) {
   const std::size_t tail = batch % kQ8ActTileTokens;
@@ -1441,8 +1524,9 @@ void LaunchZeroQ8ActTail(void* q8_1_out, std::size_t batch, std::size_t k,
   }
   const std::size_t num_blocks = k / 32;
   const std::size_t work = num_blocks * (kQ8ActTileTokens - tail);
-  ZeroQ8ActTailKernel<<<static_cast<unsigned int>((work + 255) / 256), 256, 0,
-                        stream>>>(q8_1_out, batch, num_blocks);
+  ZeroQ8ActTailKernel<StoreActivationSum>
+      <<<static_cast<unsigned int>((work + 255) / 256), 256, 0, stream>>>(
+          q8_1_out, batch, num_blocks);
 }
 
 }  // namespace
@@ -1459,10 +1543,17 @@ void LaunchQuantizeActivationQ8_1(const void* bf16_x, void* q8_1_out,
   constexpr unsigned int warps_per_tb = quant_threads / 32;
   const std::size_t quant_grid =
       (total_x_blocks + warps_per_tb - 1) / warps_per_tb;
-  QuantizeActivationToQ8_1Kernel<<<static_cast<unsigned int>(quant_grid),
-                                   quant_threads, 0, stream>>>(
-      reinterpret_cast<const hip_bfloat16*>(bf16_x), q8_1_out, batch, k);
-  LaunchZeroQ8ActTail(q8_1_out, batch, k, stream);
+  if (detail::ShouldStoreKQuantActivationSums()) {
+    QuantizeActivationToQ8_1Kernel<true>
+        <<<static_cast<unsigned int>(quant_grid), quant_threads, 0, stream>>>(
+            reinterpret_cast<const hip_bfloat16*>(bf16_x), q8_1_out, batch, k);
+    LaunchZeroQ8ActTail<true>(q8_1_out, batch, k, stream);
+  } else {
+    QuantizeActivationToQ8_1Kernel<false>
+        <<<static_cast<unsigned int>(quant_grid), quant_threads, 0, stream>>>(
+            reinterpret_cast<const hip_bfloat16*>(bf16_x), q8_1_out, batch, k);
+    LaunchZeroQ8ActTail<false>(q8_1_out, batch, k, stream);
+  }
 }
 
 bool IsFusedSSMEpilogueQuantizeQ8_1Supported(std::uint32_t val_dim,
@@ -1482,10 +1573,17 @@ void LaunchBatchedFusedSSMPostNormGateQuantizeQ8_1(
     return;
   }
   const dim3 grid(num_heads, static_cast<unsigned int>(batch_size));
-  BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel<<<grid, 128, 0, stream>>>(
-      raw_out, ssm_norm, gate, q8_1_out, batch_size, inner_size, num_heads,
-      val_dim);
-  LaunchZeroQ8ActTail(q8_1_out, batch_size, inner_size, stream);
+  if (detail::ShouldStoreKQuantActivationSums()) {
+    BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel<true>
+        <<<grid, 128, 0, stream>>>(raw_out, ssm_norm, gate, q8_1_out,
+                                   batch_size, inner_size, num_heads, val_dim);
+    LaunchZeroQ8ActTail<true>(q8_1_out, batch_size, inner_size, stream);
+  } else {
+    BatchedFusedSSMPostNormGateQuantizeQ8_1Kernel<false>
+        <<<grid, 128, 0, stream>>>(raw_out, ssm_norm, gate, q8_1_out,
+                                   batch_size, inner_size, num_heads, val_dim);
+    LaunchZeroQ8ActTail<false>(q8_1_out, batch_size, inner_size, stream);
+  }
 }
 
 bool IsFusedRMSNormQuantizeQ8_1Supported(std::size_t dim) noexcept {
@@ -1503,10 +1601,17 @@ void LaunchBatchedFusedRMSNormQuantizeQ8_1(
     return;
   }
   const unsigned int lds_bytes = static_cast<unsigned int>(dim * sizeof(float));
-  BatchedFusedRMSNormQuantizeQ8_1Kernel<<<static_cast<unsigned int>(batch_size),
-                                          256, lds_bytes, stream>>>(
-      x, residual, weight, sum_out, q8_1_out, batch_size, dim, eps);
-  LaunchZeroQ8ActTail(q8_1_out, batch_size, dim, stream);
+  if (detail::ShouldStoreKQuantActivationSums()) {
+    BatchedFusedRMSNormQuantizeQ8_1Kernel<true>
+        <<<static_cast<unsigned int>(batch_size), 256, lds_bytes, stream>>>(
+            x, residual, weight, sum_out, q8_1_out, batch_size, dim, eps);
+    LaunchZeroQ8ActTail<true>(q8_1_out, batch_size, dim, stream);
+  } else {
+    BatchedFusedRMSNormQuantizeQ8_1Kernel<false>
+        <<<static_cast<unsigned int>(batch_size), 256, lds_bytes, stream>>>(
+            x, residual, weight, sum_out, q8_1_out, batch_size, dim, eps);
+    LaunchZeroQ8ActTail<false>(q8_1_out, batch_size, dim, stream);
+  }
 }
 
 void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
@@ -1521,10 +1626,17 @@ void LaunchQuantizeActivationQ8_1FromFp32(const float* fp32_x, void* q8_1_out,
   constexpr unsigned int warps_per_tb = quant_threads / 32;
   const std::size_t quant_grid =
       (total_x_blocks + warps_per_tb - 1) / warps_per_tb;
-  QuantizeActivationToQ8_1Kernel<<<static_cast<unsigned int>(quant_grid),
-                                   quant_threads, 0, stream>>>(fp32_x, q8_1_out,
-                                                               batch, k);
-  LaunchZeroQ8ActTail(q8_1_out, batch, k, stream);
+  if (detail::ShouldStoreKQuantActivationSums()) {
+    QuantizeActivationToQ8_1Kernel<true>
+        <<<static_cast<unsigned int>(quant_grid), quant_threads, 0, stream>>>(
+            fp32_x, q8_1_out, batch, k);
+    LaunchZeroQ8ActTail<true>(q8_1_out, batch, k, stream);
+  } else {
+    QuantizeActivationToQ8_1Kernel<false>
+        <<<static_cast<unsigned int>(quant_grid), quant_threads, 0, stream>>>(
+            fp32_x, q8_1_out, batch, k);
+    LaunchZeroQ8ActTail<false>(q8_1_out, batch, k, stream);
+  }
 }
 
 void LaunchBatchedFusedSwiGLUQuantizeQ8_1(const float* gate, const float* up,
@@ -1539,14 +1651,21 @@ void LaunchBatchedFusedSwiGLUQuantizeQ8_1(const float* gate, const float* up,
   constexpr unsigned int warps_per_tb = quant_threads / 32;
   const std::size_t quant_grid =
       (total_x_blocks + warps_per_tb - 1) / warps_per_tb;
-  BatchedFusedSwiGLUQuantizeQ8_1Kernel<<<static_cast<unsigned int>(quant_grid),
-                                         quant_threads, 0, stream>>>(
-      gate, up, q8_1_out, batch, k);
-  LaunchZeroQ8ActTail(q8_1_out, batch, k, stream);
+  if (detail::ShouldStoreKQuantActivationSums()) {
+    BatchedFusedSwiGLUQuantizeQ8_1Kernel<true>
+        <<<static_cast<unsigned int>(quant_grid), quant_threads, 0, stream>>>(
+            gate, up, q8_1_out, batch, k);
+    LaunchZeroQ8ActTail<true>(q8_1_out, batch, k, stream);
+  } else {
+    BatchedFusedSwiGLUQuantizeQ8_1Kernel<false>
+        <<<static_cast<unsigned int>(quant_grid), quant_threads, 0, stream>>>(
+            gate, up, q8_1_out, batch, k);
+    LaunchZeroQ8ActTail<false>(q8_1_out, batch, k, stream);
+  }
 }
 
 std::size_t QuantizedActivationBytes(std::size_t batch, std::size_t k) {
-  return Q8ActTiledBytes(batch, k);
+  return Q8ActTiledBytes(batch, k) + Q8ActSumBytes(batch, k);
 }
 
 // opt-q4kxl: exact small-batch K-quant GEMM for speculative verification.
@@ -1813,18 +1932,21 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
 // opt-q4kxl: tile-configuration dispatch for WKQuantA8BlockedWmmaGEMMKernel.
 // The configurations mirror the Q8_0 launcher exactly so the two paths share
 // the same occupancy tuning.
-template<core::GgmlType WType>
-void LaunchKQuantWmmaGEMMTyped(const void* w, const void* q8_1_x, float* y,
-                               std::size_t batch, std::size_t m, std::size_t k,
-                               hipStream_t stream) {
+template<core::GgmlType WType, bool UsePrecomputedSums,
+         bool StagePrecomputedSums>
+void LaunchKQuantWmmaGEMMTypedImpl(const void* w, const void* q8_1_x, float* y,
+                                   std::size_t batch, std::size_t m,
+                                   std::size_t k, hipStream_t stream) {
   if (batch <= 8 && UseCompactW8A8SmallBatchTile()) {
     constexpr int kBM = 128;
     const dim3 grid(1, static_cast<unsigned int>((m + kBM - 1) / kBM));
     if (m >= (3 * k)) {
-      WKQuantA8BlockedWmmaGEMMKernel<kBM, 32, 4, 4, 2, WType>
+      WKQuantA8BlockedWmmaGEMMKernel<kBM, 32, 4, 4, 2, WType,
+                                     UsePrecomputedSums, StagePrecomputedSums>
           <<<grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
     } else {
-      WKQuantA8BlockedWmmaGEMMKernel<kBM, 16, 4, 8, 1, WType>
+      WKQuantA8BlockedWmmaGEMMKernel<kBM, 16, 4, 8, 1, WType,
+                                     UsePrecomputedSums, StagePrecomputedSums>
           <<<grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
     }
     return;
@@ -1838,7 +1960,8 @@ void LaunchKQuantWmmaGEMMTyped(const void* w, const void* q8_1_x, float* y,
     // shape WM=2/WN=4 halves the per-token activation sums the offset term
     // needs, but measured far worse -- pp2048 464 -> 372 -- because four row
     // subtiles per wave hold twice the A-fragment and scale state.
-    WKQuantA8BlockedWmmaGEMMKernel<kBM, kBN, 2, 4, 2, WType>
+    WKQuantA8BlockedWmmaGEMMKernel<kBM, kBN, 2, 4, 2, WType, UsePrecomputedSums,
+                                   StagePrecomputedSums>
         <<<grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
     return;
   }
@@ -1846,8 +1969,29 @@ void LaunchKQuantWmmaGEMMTyped(const void* w, const void* q8_1_x, float* y,
   constexpr int kBN = 64;
   const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
                   static_cast<unsigned int>((m + kBM - 1) / kBM));
-  WKQuantA8BlockedWmmaGEMMKernel<kBM, kBN, 4, 8, 1, WType>
+  WKQuantA8BlockedWmmaGEMMKernel<kBM, kBN, 4, 8, 1, WType, UsePrecomputedSums,
+                                 StagePrecomputedSums>
       <<<grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
+}
+
+template<core::GgmlType WType>
+void LaunchKQuantWmmaGEMMTyped(const void* w, const void* q8_1_x, float* y,
+                               std::size_t batch, std::size_t m, std::size_t k,
+                               hipStream_t stream) {
+  switch (detail::KQuantActivationSumModeFromEnv()) {
+    case detail::KQuantActivationSumMode::kStaged:
+      LaunchKQuantWmmaGEMMTypedImpl<WType, true, true>(w, q8_1_x, y, batch, m,
+                                                       k, stream);
+      return;
+    case detail::KQuantActivationSumMode::kDirect:
+      LaunchKQuantWmmaGEMMTypedImpl<WType, true, false>(w, q8_1_x, y, batch, m,
+                                                        k, stream);
+      return;
+    case detail::KQuantActivationSumMode::kReference:
+      LaunchKQuantWmmaGEMMTypedImpl<WType, false, false>(w, q8_1_x, y, batch, m,
+                                                         k, stream);
+      return;
+  }
 }
 
 void LaunchKQuantWmmaGEMM(core::GgmlType type, const void* w,

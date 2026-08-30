@@ -190,6 +190,20 @@ if (ENGINE_ENABLE_HIP)
     LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-rows2"
     ENVIRONMENT "GUFO_KQUANT_SMALL_BATCH_ROWS=2"
     SKIP_RETURN_CODE 77)
+  # The default route is now the staged sidecar, so this pins the independent
+  # in-kernel sudot4 reference that the sidecar is validated against.
+  add_test(NAME qwen_q4kxl_quant_activation_sums_reference_ops_test
+    COMMAND qwen_q4kxl_quant_ops_test)
+  set_tests_properties(qwen_q4kxl_quant_activation_sums_reference_ops_test PROPERTIES
+    LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-actsum"
+    ENVIRONMENT "GUFO_KQUANT_ACTIVATION_SUMS=0"
+    SKIP_RETURN_CODE 77)
+  add_test(NAME qwen_q4kxl_quant_activation_sums_direct_ops_test
+    COMMAND qwen_q4kxl_quant_ops_test)
+  set_tests_properties(qwen_q4kxl_quant_activation_sums_direct_ops_test PROPERTIES
+    LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-actsum"
+    ENVIRONMENT "GUFO_KQUANT_ACTIVATION_SUMS=direct"
+    SKIP_RETURN_CODE 77)
   add_qwen_hip_test(qwen_kquant_gemv_ops_test
     tests/models/qwen/hip/quant/kquant_gemv_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemv;k-quant")

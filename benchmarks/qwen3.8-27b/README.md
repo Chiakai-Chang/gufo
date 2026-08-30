@@ -447,13 +447,18 @@ so expanding them would cost 30 GB and give back every byte Q4 was chosen to
 save. The loader picks the native route automatically when the shard contains a
 format with no BF16 pre-dequant path.
 
-Measured on this host, interleaved A/B, three repetitions each:
+Measured on this host in matched, interleaved sessions:
 
-| Test | Q8_K_XL | UD-Q4_K_XL | Ratio |
-| --- | --- | --- | --- |
-| pp2048 | 505.8 t/s | 460.2 t/s | 0.91x |
-| tg128 (no draft) | 6.89 t/s | 11.59 t/s | **1.68x** |
-| tg128-dflash2 | 19.4-27.3 t/s | 18.2-18.4 t/s | 0.67-0.94x |
+| Metric | Q8_K_XL | UD-Q4_K_XL | Q4 vs Q8 |
+| --- | ---: | ---: | ---: |
+| Target artifact size | 26.12 GiB | 16.35 GiB | **0.63x (-37.4%)** |
+| DFlash2 companion size | 3.85 GB (Q8_0) | 1.14 GB (Q4_K_M) | **0.30x (-70.4%)** |
+| `pp2048` | 505.8 t/s | 460.2 t/s | 0.91x (-9.0%) |
+| `tg128` (no draft) | 6.89 t/s | 11.59 t/s | **1.68x (+68.2%)** |
+| `tg128-dflash2` | 19.4-27.3 t/s | 18.2-18.4 t/s | 0.67-0.94x |
+| Validation top-1, 1024 tokens | 198 | 198 | Match |
+| Validation RMSE, 1024 tokens | 0.02007260 | 0.09512630 | 4.74x higher |
+| Validation cosine, 1024 tokens | 0.99997753 | 0.99946874 | -0.00050879 |
 
 pp2048 and tg128 are medians of five interleaved repetitions at host load
 below 1.5; the spread within each column is under 1%. The dflash2 row is
@@ -569,6 +574,7 @@ depth. Read the Q8 section for the current state of the engine.
 | Exact small-batch Q8 projection | Shared-weight FP32 Q8_0/Q8_K kernels for physical W=2/W=4/W=8, with masked C=3/C=5/C=6, structural C=1 fallback, and the measured smallest-covering selector (`opt-c206-q8-small-batch`) | Standalone Q8_K-only promotion on the current Q8_K_XL artifact; C=1 Q8_0 one-row/two-row specialization, four rows per wave, and eight-wave workgroups; capped W=4 composition and a native W=6 specialization were neutral or regressive (`opt-c206-q8-c1`, #206) |
 | UD-Q4_K_XL shard support (`opt-q4kxl`) | Native in-kernel decode of Q4_K/Q5_K/Q6_K/Q3_K/IQ4_XS/IQ4_NL/IQ3_S for decode GEMV, prefill WMMA GEMM and small-batch draft verification; weight type as a template parameter; word-wide (SWAR) nibble unpack and a V_PERM_B32 codebook lookup for IQ4; DFlash-2 Q4_K_M companion kept packed | 32-element shared-header decode (prefill neutral, tg128 8.25 -> 7.18); `__launch_bounds__(256, 8)` on the blocked GEMM (pp2048 462.7 -> 412.9); branchless `GetQKScaleMin` (tg128 8.25 -> 8.09); WM=2/WN=4 wave shape (pp2048 464 -> 372); strength-reduced store addressing (neutral to slightly negative) |
 | Exact small-batch K-quant row geometry (`opt-q4kxl-rows3`) | Three output rows per wave for Q4_K/Q5_K/Q3_K/IQ with the zero-scratch two-row Q6_K fallback; `tg128-dflash2` median 18.245 -> 18.76 tok/s (+2.82%); 8/8 greedy `gufo eval` cases passed | Four rows: neutral-to-regressive end to end and +26.6% at width 7; three rows for Q6_K: faster but spills 12 private bytes/lane |
+| Q4_K/Q5_K activation-sum sidecar (`opt-q4kxl-actsum`) | Per-32-block activation sums written once beside the unchanged 576-byte Q8_1 tiles and staged through LDS, replacing eight in-kernel `sudot4` per token tile per K block that every row tile recomputed; `pp2048` median 466.59 -> 469.05 tok/s (+0.53%, 4/4 interleaved pairs positive), decode unaffected, `tg128-dflash2` 3/3 pairs slightly ahead | Direct-read sidecar: re-reads the sum from global inside the innermost token-tile loop instead of sharing one LDS read; `pp2048` median 454.98 tok/s (-2.49%, 4/4 pairs negative). Kept selectable with `GUFO_KQUANT_ACTIVATION_SUMS=direct` |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
@@ -742,11 +748,14 @@ it multiplies a contribution that starts at ~3%.
   and BM=256/BN=64 (doubles the re-decode). Progress here needs either a
   cheaper offset formulation or a larger accumulator budget.
 - Continue closing the UD-Q4_K_XL speculative gap after the retained three-row
-  exact verifier (+2.82% `tg128-dflash2`). Precomputing per-32-block activation
-  sums in the quantize kernels (tile stride 576 -> 640) would remove the last
-  redundant work, at the cost of touching the tuned Q8 activation layout. Any
-  attempt must preserve Q6_K's two-row no-scratch fallback; its three-row
-  specialization spills 12 private bytes/lane.
+  exact verifier (+2.82% `tg128-dflash2`) and the retained activation-sum
+  sidecar (+0.53% `pp2048`). The sidecar took the redundant sum work out of the
+  blocked WMMA without touching the Q8_1 tile layout -- it is appended after the
+  tiled payload, so every Q8 kernel still sees the same 576-byte stride. What is
+  left in the Q4_K/Q5_K epilogue is the correction itself (8 FMA per accumulator
+  group per K block), which is rank-1 per K block and so cannot ride the WMMA.
+  Any further row-geometry attempt must preserve Q6_K's two-row no-scratch
+  fallback; its three-row specialization spills 12 private bytes/lane.
 - Consider whether the Q8_0 blocked WMMA kernel would also benefit from the
   store-addressing and wave-shape findings recorded for `opt-q4kxl`; both
   kernels spend ~44% of their VALU on 64-bit epilogue address arithmetic.

@@ -761,14 +761,15 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
   HIP_CHECK(
       hipMalloc(&d_scratch_bf16, scratch_elements * sizeof(hip_bfloat16)));
   // The tiled Q8_1 activation layout groups 16 tokens per tile, so size for a
-  // batch rounded up to a whole tile. At 36 bytes per 32 elements that matches
-  // the row-major size whenever the batch is already a multiple of 16.
+  // batch rounded up to a whole tile. The base layout remains 36 bytes per 32
+  // elements; reserve another float per block for the optional K-quant
+  // activation-sum sidecar without changing the Q8 payload or its stride.
   const std::size_t q8_rows = ((batch + 15) / 16) * 16;
   const std::size_t q8_row_elements =
       scratch_elements / std::max<std::size_t>(batch, 1);
   const std::size_t scratch_q8_bytes =
-      ((((q8_rows * q8_row_elements) + 31) / 32) * sizeof(float) * 9) +
-      4096;  // 36 bytes per 32 elems
+      ((((q8_rows * q8_row_elements) + 31) / 32) * sizeof(float) * 10) +
+      4096;  // 36-byte payload + 4-byte optional sidecar per 32 elems
   HIP_CHECK(hipMalloc(&d_scratch_q8_act, scratch_q8_bytes));
   const std::size_t split_k_elements = detail::DecodeAttentionScratchElements(
       config_.num_attention_heads, config_.head_dim);
