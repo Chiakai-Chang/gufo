@@ -525,7 +525,12 @@ void QwenDFlashGpuExecutor::RunBlockGemm(const models::QwenTensorRef& weight,
                                          std::size_t batch_size,
                                          std::size_t output_size,
                                          std::size_t input_size) {
-  if (weight.type == core::GgmlType::kQ8_0) {
+  // opt-q4kxl: the Q4_K_M DFlash-2 companion keeps its K-quant weights packed
+  // (PackBlockMatrix), so they must take a quant-aware route. The dense
+  // LaunchBatchedGEMM below reads its operand as F32 or BF16 and would walk far
+  // past the end of a 0.56 byte-per-element Q4_K row.
+  if (weight.type == core::GgmlType::kQ8_0 ||
+      detail::IsNativeWmmaQuant(weight.type)) {
     // The FP32-activation route streams each quantized weight row once for the
     // whole block and needs no BF16 activation round trip. It also beat the
     // matrix-core W8A8 route once the shared kernel read activations as float4
@@ -574,7 +579,9 @@ void QwenDFlashGpuExecutor::RunInjectGemm(const models::QwenTensorRef& weight,
   // kernels in chunks reads them once per chunk instead, which is the same
   // arithmetic per row but up to eight times less weight traffic.
   const bool is_bf16 = weight.type == core::GgmlType::kBF16;
-  if (!is_bf16 && weight.type != core::GgmlType::kQ8_0) {
+  const bool is_packed_quant = weight.type == core::GgmlType::kQ8_0 ||
+                               detail::IsNativeWmmaQuant(weight.type);
+  if (!is_bf16 && !is_packed_quant) {
     LaunchBatchedGEMM(weight.data, is_bf16, input, output, num_tokens,
                       output_size, input_size, stream_);
     return;

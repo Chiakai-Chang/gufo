@@ -35,6 +35,9 @@ enum class GgmlType : std::uint16_t {
   kQ6_K = 14,
   kQ8_K = 15,
   kIQ2_XXS = 16,
+  kIQ4_NL = 20,
+  kIQ3_S = 21,
+  kIQ4_XS = 23,
   kBF16 = 30,
 
   // Strix Halo specialized hardware quantization types (Wave32 & XDNA2 NPU
@@ -76,6 +79,12 @@ enum class GgmlType : std::uint16_t {
       return "Q8_K";
     case GgmlType::kIQ2_XXS:
       return "IQ2_XXS";
+    case GgmlType::kIQ4_NL:
+      return "IQ4_NL";
+    case GgmlType::kIQ3_S:
+      return "IQ3_S";
+    case GgmlType::kIQ4_XS:
+      return "IQ4_XS";
     case GgmlType::kBF16:
       return "BF16";
     case GgmlType::kStrixSHQ4_T16:

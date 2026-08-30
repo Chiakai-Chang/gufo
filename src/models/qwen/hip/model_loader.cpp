@@ -1,5 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
+#include <cstdlib>
 #include <limits>
+#include <string_view>
 #include <utility>
 
 #include "src/models/qwen/hip/detail/weight_regions.hpp"
@@ -193,8 +195,48 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
     return nullptr;
   }
 
+  // opt-q4kxl: whether this shard runs its K-quants natively.
+  //
+  // The Q8_K_XL shard is 90% Q8_0 with a small Q5_K/Q6_K tail, and expanding
+  // that tail to device BF16 costs ~4 GB while letting the tuned BF16 hipBLAS
+  // prefill own those projections. The UD-Q4_K_XL shard inverts the ratio:
+  // Q5_K + Q6_K alone are 15.0G elements, so the same expansion would cost
+  // 30 GB and hand back every byte Q4 was chosen to save.
+  //
+  // The discriminator is whether the shard uses a format that has no BF16
+  // pre-dequant route at all (Q4_K / Q3_K / IQ4_NL / IQ4_XS / IQ3_S). If it
+  // does, the shard is a mixed low-bit shard and everything stays packed;
+  // otherwise the historical behaviour is preserved exactly.
+  // GUFO_QUANT_NATIVE_KQUANT=1/0 forces the decision either way.
+  const auto has_native_only_type = [](core::GgmlType type) {
+    return type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ3_K ||
+           type == core::GgmlType::kIQ4_NL || type == core::GgmlType::kIQ4_XS ||
+           type == core::GgmlType::kIQ3_S;
+  };
+  bool native_kquant = has_native_only_type(weights_opt->token_embd.type) ||
+                       has_native_only_type(weights_opt->output.type);
+  for (const auto& layer : weights_opt->layers) {
+    native_kquant = native_kquant || has_native_only_type(layer.attn_q.type) ||
+                    has_native_only_type(layer.attn_k.type) ||
+                    has_native_only_type(layer.attn_v.type) ||
+                    has_native_only_type(layer.attn_output.type) ||
+                    has_native_only_type(layer.attn_qkv.type) ||
+                    has_native_only_type(layer.attn_gate.type) ||
+                    has_native_only_type(layer.ssm_out.type) ||
+                    has_native_only_type(layer.ssm_alpha.type) ||
+                    has_native_only_type(layer.ssm_beta.type) ||
+                    has_native_only_type(layer.ffn_gate.type) ||
+                    has_native_only_type(layer.ffn_up.type) ||
+                    has_native_only_type(layer.ffn_down.type);
+  }
+  if (const char* forced = std::getenv("GUFO_QUANT_NATIVE_KQUANT");
+      forced != nullptr) {
+    const std::string_view setting{forced};
+    native_kquant = setting != "0" && setting != "false" && setting != "off";
+  }
+
   const auto pre_dequantize = [&](models::QwenTensorRef& tensor) {
-    if (tensor.empty()) {
+    if (tensor.empty() || native_kquant) {
       return true;
     }
     if (tensor.type == core::GgmlType::kQ6_K ||

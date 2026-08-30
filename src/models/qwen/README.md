@@ -310,10 +310,20 @@ program that consume that ABI. See also
 
 DFlash and DFlash-2 are parallel block-diffusion speculative drafting systems. Unlike traditional autoregressive drafters (such as EAGLE-3 or sequential draft models) that predict draft tokens one step at a time, DFlash predicts an entire block of $K$ candidate tokens ($K \in [8, 16]$) simultaneously in a single forward pass.
 
-The validated Qwen3.8 pairing is the Unsloth
+The validated Qwen3.8 pairings are the Unsloth
 `Qwen3.8-27B-UD-Q8_K_XL.gguf` target with the z-lab
-`Qwen3.8-27B-DFlash2-Q8_0.gguf` companion. Extra MTP and vision tensors in the
-Unsloth GGUF do not shift target-layer indices: the target loader resolves
+`Qwen3.8-27B-DFlash2-Q8_0.gguf` companion, and the Unsloth
+`Qwen3.8-27B-UD-Q4_K_XL.gguf` target with the z-lab
+`Qwen3.8-27B-DFlash2-Q4_K_M.gguf` companion. The Q4 companion is kept in its
+packed form rather than expanded to BF16 (1.14 GB against 3.85 GB), because the
+draft graph re-reads every draft matrix on each speculation step. Draft-width
+verification of a K-quant target runs on a shared-weight kernel that is
+bit-exact with the single-token decode GEMV, which is required for a drafted
+token to be acceptable. See `benchmarks/qwen3.8-27b/README.md` under
+"Unsloth UD-Q4_K_XL target" for the format census and measurements.
+
+Extra MTP and vision tensors in the
+Unsloth GGUFs do not shift target-layer indices: the target loader resolves
 base-model tensors by name, while the DFlash loader validates the companion
 topology, target taps, vocabulary, and tied embedding/output dimensions
 independently. Other target/draft combinations still need the same

@@ -133,6 +133,29 @@ void LaunchDequantizeQ8KToBf16(const void* w, hip_bfloat16* out,
 /// block, matching the CPU DequantizeQ8_0/Q5_K/Q6_K/Q8_K oracles. Q8_0 uses
 /// QK=32, Q5_K/Q6_K/Q8_K use QK=256; requires n_elems to be a whole number of
 /// blocks. Unsupported types are a no-op.
+namespace detail {
+
+/// opt-q4kxl: true for the formats WKQuantA8BlockedWmmaGEMMKernel decodes, i.e.
+/// everything with a DecodeQuantSub16 implementation except Q8_0 (which keeps
+/// its own untouched kernel) and Q8_K (whose row layout carries block sums the
+/// WMMA staging does not use).
+[[nodiscard]] constexpr bool IsNativeWmmaQuant(core::GgmlType type) noexcept {
+  switch (type) {
+    case core::GgmlType::kQ4_K:
+    case core::GgmlType::kQ5_K:
+    case core::GgmlType::kQ6_K:
+    case core::GgmlType::kQ3_K:
+    case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kIQ4_XS:
+    case core::GgmlType::kIQ3_S:
+      return true;
+    default:
+      return false;
+  }
+}
+
+}  // namespace detail
+
 void LaunchDequantizeToBf16(core::GgmlType type, const void* w,
                             hip_bfloat16* out, std::size_t n_elems,
                             hipStream_t stream = nullptr);

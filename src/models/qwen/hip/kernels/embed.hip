@@ -29,6 +29,14 @@ __global__ void EmbeddingLookupKernel(const void* __restrict__ table,
   } else if (type == core::GgmlType::kF32) {
     const auto* f_ptr = static_cast<const float*>(table);
     out_hidden[idx] = f_ptr[offset];
+  } else if (type != core::GgmlType::kQ8_0) {
+    // opt-q4kxl: the UD-Q4_K_XL shard stores token_embd.weight as Q4_K, so the
+    // lookup decodes whichever block format the row actually uses instead of
+    // reinterpreting it as Q8_0.
+    const auto* row =
+        static_cast<const std::uint8_t*>(table) +
+        (static_cast<std::size_t>(token_id) * QuantRowBytes(type, hidden_size));
+    out_hidden[idx] = QuantBlockElement(type, row, idx);
   } else {
     const auto* q8 = static_cast<const Q8_0Block*>(table);
     const Q8_0Block& wblk =
@@ -56,6 +64,14 @@ __global__ void EmbeddingLookupPtrKernel(
   } else if (type == core::GgmlType::kF32) {
     const auto* f_ptr = static_cast<const float*>(table);
     out_hidden[idx] = f_ptr[offset];
+  } else if (type != core::GgmlType::kQ8_0) {
+    // opt-q4kxl: the UD-Q4_K_XL shard stores token_embd.weight as Q4_K, so the
+    // lookup decodes whichever block format the row actually uses instead of
+    // reinterpreting it as Q8_0.
+    const auto* row =
+        static_cast<const std::uint8_t*>(table) +
+        (static_cast<std::size_t>(token_id) * QuantRowBytes(type, hidden_size));
+    out_hidden[idx] = QuantBlockElement(type, row, idx);
   } else {
     const auto* q8 = static_cast<const Q8_0Block*>(table);
     const Q8_0Block& wblk =

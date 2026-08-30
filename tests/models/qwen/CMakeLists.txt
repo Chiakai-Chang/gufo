@@ -175,6 +175,9 @@ if (ENGINE_ENABLE_HIP)
   add_qwen_hip_test(qwen_prefill_quant_gemm_ops_test
     tests/models/qwen/hip/quant/prefill_quant_gemm_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;prefill;q8;opt-c163-blocked-w8a8")
+  add_qwen_hip_test(qwen_q4kxl_quant_ops_test
+    tests/models/qwen/hip/quant/q4kxl_quant_ops_test.cpp
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemv;gemm;k-quant;iquant;opt-q4kxl")
   add_qwen_hip_test(qwen_kquant_gemv_ops_test
     tests/models/qwen/hip/quant/kquant_gemv_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemv;k-quant")

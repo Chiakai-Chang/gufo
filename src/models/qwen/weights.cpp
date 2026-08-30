@@ -63,17 +63,28 @@ enum class TensorRole : std::uint8_t {
       // The production HIP embedding kernel has exact F32, BF16, and Q8_0
       // implementations. Treating every other type as Q8_0 would decode the
       // wrong block layout.
+      // opt-q4kxl: token_embd.weight is Q4_K in the UD-Q4_K_XL shard; the
+      // lookup kernels decode any DecodeQuantSub16-backed format directly.
       return type == core::GgmlType::kF32 || type == core::GgmlType::kBF16 ||
-             type == core::GgmlType::kQ8_0;
+             type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ4_K ||
+             type == core::GgmlType::kQ3_K || type == core::GgmlType::kQ5_K ||
+             type == core::GgmlType::kQ6_K || type == core::GgmlType::kIQ4_NL ||
+             type == core::GgmlType::kIQ4_XS || type == core::GgmlType::kIQ3_S;
     case TensorRole::kNorm:
     case TensorRole::kSsmParameter:
       // HIP norm, convolution, and recurrence kernels consume these tensors as
       // float pointers. Accepting BF16 or packed data would reinterpret bytes.
       return type == core::GgmlType::kF32;
     case TensorRole::kProjection:
+      // opt-q4kxl: the Unsloth UD-Q4_K_XL shard mixes Q5_K, IQ4_XS, Q4_K, Q6_K,
+      // IQ4_NL, Q3_K and IQ3_S across projections, and every one of them has an
+      // in-kernel decoder, so all are accepted here.
       return type == core::GgmlType::kF32 || type == core::GgmlType::kBF16 ||
              type == core::GgmlType::kQ8_K || type == core::GgmlType::kQ8_0 ||
-             type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ6_K;
+             type == core::GgmlType::kQ5_K || type == core::GgmlType::kQ6_K ||
+             type == core::GgmlType::kQ4_K || type == core::GgmlType::kQ3_K ||
+             type == core::GgmlType::kIQ4_NL ||
+             type == core::GgmlType::kIQ4_XS || type == core::GgmlType::kIQ3_S;
   }
   return false;
 }

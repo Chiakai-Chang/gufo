@@ -54,9 +54,10 @@ void TestFormatCapabilities() {
       GgmlType::kQ2_K,          GgmlType::kQ3_K,
       GgmlType::kQ4_K,          GgmlType::kQ5_K,
       GgmlType::kQ6_K,          GgmlType::kQ8_K,
-      GgmlType::kIQ2_XXS,       GgmlType::kBF16,
-      GgmlType::kStrixSHQ4_T16, GgmlType::kStrixSHQ6_T16,
-      GgmlType::kStrixSHQ8_T16,
+      GgmlType::kIQ2_XXS,       GgmlType::kIQ4_NL,
+      GgmlType::kIQ3_S,         GgmlType::kIQ4_XS,
+      GgmlType::kBF16,          GgmlType::kStrixSHQ4_T16,
+      GgmlType::kStrixSHQ6_T16, GgmlType::kStrixSHQ8_T16,
   };
   for (const auto type : all_types) {
     const auto descriptor = DescribeQwenGemmFormat(type);
@@ -94,8 +95,28 @@ void TestFormatCapabilities() {
         "HIP F16 rejection");
   Check(DescribeQwenGemmFormat(GgmlType::kQ5_K).hip_prefill_direct,
         "HIP prefill K-quant support");
-  Check(!DescribeQwenGemmFormat(GgmlType::kQ4_K).hip_prefill_direct,
-        "HIP prefill Q4_K rejection");
+  // opt-q4kxl: every format the UD-Q4_K_XL shard uses is decoded in-kernel, so
+  // all of them are direct on both GPU paths. Q4_K in particular used to be
+  // CPU-only.
+  for (const auto type : {GgmlType::kQ4_K, GgmlType::kQ3_K, GgmlType::kIQ4_NL,
+                          GgmlType::kIQ4_XS, GgmlType::kIQ3_S}) {
+    Check(DescribeQwenGemmFormat(type).quantized,
+          "mixed low-bit format is quantized");
+    Check(DescribeQwenGemmFormat(type).cpu_direct, "mixed low-bit CPU support");
+    Check(DescribeQwenGemmFormat(type).hip_decode_direct,
+          "mixed low-bit HIP decode support");
+    Check(DescribeQwenGemmFormat(type).hip_prefill_direct,
+          "mixed low-bit HIP prefill support");
+    Check(DescribeQwenGemmFormat(type).block_elements != 0,
+          "mixed low-bit block geometry");
+  }
+  Check(DescribeQwenGemmFormat(GgmlType::kIQ4_NL).block_elements == 32,
+        "IQ4_NL block geometry");
+  Check(DescribeQwenGemmFormat(GgmlType::kIQ4_XS).block_elements == 256,
+        "IQ4_XS block geometry");
+  // Still unsupported everywhere, so the switch stays honest about its gaps.
+  Check(!DescribeQwenGemmFormat(GgmlType::kQ2_K).cpu_direct,
+        "HIP Q2_K rejection");
 }
 
 void TestCpuRoutes() {
@@ -286,8 +307,20 @@ void TestRejections() {
             QwenGemmRoute::kRejected,
         "quantized residual epilogue rejection");
   Check(Route(GgmlType::kQ4_K, 1, 256, QwenGemmMode::kHipDecode) ==
+            QwenGemmRoute::kHipQuantDirect,
+        "HIP decode Q4_K direct route");
+  Check(Route(GgmlType::kIQ4_XS, 1, 256, QwenGemmMode::kHipDecode) ==
+            QwenGemmRoute::kHipQuantDirect,
+        "HIP decode IQ4_XS direct route");
+  Check(Route(GgmlType::kIQ4_NL, 1, 32, QwenGemmMode::kHipDecode) ==
+            QwenGemmRoute::kHipQuantDirect,
+        "HIP decode IQ4_NL direct route");
+  Check(Route(GgmlType::kIQ4_NL, 1, 31, QwenGemmMode::kHipDecode) ==
             QwenGemmRoute::kRejected,
-        "unsupported HIP Q4_K rejection");
+        "IQ4_NL K=31 rejection");
+  Check(Route(GgmlType::kQ2_K, 1, 256, QwenGemmMode::kHipDecode) ==
+            QwenGemmRoute::kRejected,
+        "unsupported HIP Q2_K rejection");
   Check(Route(GgmlType::kF16, 1, 256, QwenGemmMode::kHipMtp) ==
             QwenGemmRoute::kRejected,
         "unsupported MTP F16 rejection");

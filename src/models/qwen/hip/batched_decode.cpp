@@ -28,7 +28,12 @@ constexpr std::size_t kMaxDecodeBatch = 8;
 
 [[nodiscard]] constexpr bool SupportsExactSharedProjection(
     core::GgmlType type) noexcept {
-  return type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ8_K;
+  // opt-q4kxl: the K-quant/IQ formats have an exact shared-weight small-batch
+  // kernel too (SmallBatchKQuantExactFp32GEMMKernel). Without them here, every
+  // projection in the UD-Q4_K_XL shard fell to the per-row loop below, which
+  // re-reads the weight matrix once per token in the draft block.
+  return type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ8_K ||
+         detail::IsNativeWmmaQuant(type);
 }
 
 [[nodiscard]] bool UseExactBf16Lds8Projection() noexcept {

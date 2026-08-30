@@ -426,6 +426,88 @@ also exposed unsafe cross-process memcpy replay when one plan database held
 multiple hipBLASLt algorithm IDs; runtime replay now reconstructs every opaque
 descriptor from its stable solution index before validating and using it.
 
+
+### Unsloth UD-Q4_K_XL target (`opt-q4kxl`)
+
+`models/Qwen3.8-27B-UD-Q4_K_XL.gguf` (16.35 GiB against the Q8_K_XL artifact's
+26.12 GiB) is a *mixed* low-bit shard, not a single format. By element count:
+
+| Format | Elements | Share | Where |
+| --- | --- | --- | --- |
+| Q5_K | 11.53G | 42% | ffn_down/up, ssm_out, attn_gate |
+| IQ4_XS | 5.88G | 22% | ffn_gate, ffn_up |
+| Q4_K | 5.44G | 20% | token_embd, attn_qkv |
+| Q6_K | 3.49G | 13% | output.weight, attn_output |
+| IQ4_NL / Q3_K / IQ3_S / Q8_0 | 0.98G | 3% | scattered |
+
+All seven quantizations are decoded in-kernel from their packed form. The
+Q8_K_XL loader's pre-dequantize-to-BF16 route is disabled for shards like this
+(`GUFO_QUANT_NATIVE_KQUANT` overrides): Q5_K and Q6_K alone are 15.0G elements,
+so expanding them would cost 30 GB and give back every byte Q4 was chosen to
+save. The loader picks the native route automatically when the shard contains a
+format with no BF16 pre-dequant path.
+
+Measured on this host, interleaved A/B, three repetitions each:
+
+| Test | Q8_K_XL | UD-Q4_K_XL | Ratio |
+| --- | --- | --- | --- |
+| pp2048 | 505.8 t/s | 460.2 t/s | 0.91x |
+| tg128 (no draft) | 6.89 t/s | 11.59 t/s | **1.68x** |
+| tg128-dflash2 | 19.4-27.3 t/s | 18.2-18.4 t/s | 0.67-0.94x |
+
+pp2048 and tg128 are medians of five interleaved repetitions at host load
+below 1.5; the spread within each column is under 1%. The dflash2 row is
+reported as a range on purpose: the Q4 target is remarkably stable across every
+run (18.2-18.4 over more than a dozen samples) while the Q8 target ranges
+14.8-27.5. Speculative throughput depends on how many drafted tokens a
+particular continuation gets accepted, and the two targets emit different token
+streams, so a single dflash2 number for either model would be misleading. Take
+the unspeculated tg128 column as the load-bearing decode comparison.
+
+Prefill validation at 1024 tokens: top-1 matches the sequential reference
+(198), logits finite, rmse `0.09512630`, cosine `0.99946874`. The envelope is
+wider than the Q8 artifact's `0.02007260` / `0.99997753` because the underlying
+weights are coarser, not because the batched path diverges -- top-1 is exact.
+
+**Why Q4 wins decode and loses the batched regimes.** Single-token decode is
+DRAM bound: 17.5 GB of weights per token against 28.0 GB, and the 1.60x traffic
+reduction converts almost fully into throughput. Prefill and draft verification
+are arithmetic bound, and a K-quant costs more ALU per weight byte than Q8_0
+does -- an ISA dump of the blocked GEMM puts Q4_K/Q5_K at 3413/3467
+instructions against the Q8_0 kernel's 3049, and the Q4_K/Q5_K offset term
+(`w = scale*q - offset`, needing `sum(x)` per token per block) accounts for
+roughly 250 of the difference. Fewer bytes stops paying once the bytes are no
+longer the constraint. The per-stage prefill rollup (`GUFO_PROFILE`, B=2048)
+localizes the whole gap to the GEMMs: FFN 2838 ms vs 2603, input projection
+1012 vs 895, ssm_out 238 vs 212, with norms, recurrence and attention equal.
+
+The single largest decode win came from routing Q5_K and Q6_K -- 55% of the
+shard -- off the pre-existing per-element `Q5KValue`/`Q6KValue` path and onto
+the word-wide sub-block decoder: tg128 8.24 -> 11.63 in one change.
+
+### DFlash-2 with the Q4_K_M companion
+
+`z-lab/Qwen3.8-27B-DFlash2-GGUF : Qwen3.8-27B-DFlash2-Q4_K_M.gguf` (1.14 GB) is
+supported alongside the Q8_0 companion. Draft matrices stay packed rather than
+being expanded to BF16 (1.14 GB against 3.85 GB), since the draft graph re-reads
+them on every speculation step.
+
+| Target + draft | tg128-dflash2 |
+| --- | --- |
+| Q8_K_XL + DFlash2 Q8_0 | 19.4-27.3 t/s |
+| UD-Q4_K_XL + DFlash2 Q4_K_M | 18.2-18.4 t/s |
+| UD-Q4_K_XL + DFlash2 Q8_0 | 14.4 t/s |
+
+The Q4 companion beats the Q8 companion on a Q4 target, as expected from draft
+bandwidth. Two defects had to be fixed before any of this ran: packed non-Q8_0
+draft weights reached a dense GEMM that reinterprets their bytes as F32 (GPU
+memory fault), and K-quant projections at draft width fell to a per-token GEMV
+that re-reads the whole weight matrix per token (1.32 t/s). Draft-width
+verification now uses `SmallBatchKQuantExactFp32GEMMKernel`, which is bit-exact
+with the single-token decode GEMV at every width from 1 to 8 -- verified in
+`qwen_q4kxl_quant_ops_test`, since a drafted token may only be accepted if the
+verifier reproduces exactly what the unspeculated decode would have emitted.
+
 ## Runtime Status
 
 | Area | Current production route |
@@ -452,6 +534,7 @@ depth. Read the Q8 section for the current state of the engine.
 | --- | --- | --- |
 | Projection | Shape-specific hipBLASLt plans and tuned decode GEMV | Blanket algorithm overrides and concurrent gate/up launches |
 | Exact small-batch Q8 projection | Shared-weight FP32 Q8_0/Q8_K kernels for physical W=2/W=4/W=8, with masked C=3/C=5/C=6, structural C=1 fallback, and the measured smallest-covering selector (`opt-c206-q8-small-batch`) | Standalone Q8_K-only promotion on the current Q8_K_XL artifact; C=1 Q8_0 one-row/two-row specialization, four rows per wave, and eight-wave workgroups; capped W=4 composition and a native W=6 specialization were neutral or regressive (`opt-c206-q8-c1`, #206) |
+| UD-Q4_K_XL shard support (`opt-q4kxl`) | Native in-kernel decode of Q4_K/Q5_K/Q6_K/Q3_K/IQ4_XS/IQ4_NL/IQ3_S for decode GEMV, prefill WMMA GEMM and small-batch draft verification; weight type as a template parameter; word-wide (SWAR) nibble unpack and a V_PERM_B32 codebook lookup for IQ4; DFlash-2 Q4_K_M companion kept packed | 32-element shared-header decode (prefill neutral, tg128 8.25 -> 7.18); `__launch_bounds__(256, 8)` on the blocked GEMM (pp2048 462.7 -> 412.9); branchless `GetQKScaleMin` (tg128 8.25 -> 8.09); WM=2/WN=4 wave shape (pp2048 464 -> 372); strength-reduced store addressing (neutral to slightly negative) |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
@@ -614,6 +697,25 @@ it multiplies a contribution that starts at ~3%.
 
 ## TODOs
 
+- Close the UD-Q4_K_XL prefill gap (0.91x of Q8). The Q4_K/Q5_K offset term is
+  ~250 of the ~420 extra instructions per blocked-GEMM kernel; it is a per
+  (row, K-block) constant times the per-token activation sum, so it resists the
+  usual factorings (shifting the codes by round(offset/scale) only moves the
+  residual, and the correction is rank-1 per K block, so it cannot ride the
+  WMMA). The tile is also pinned: the accumulator array is exactly BM*BN/256
+  registers, so BM*BN cannot exceed 128*128, which fixes the weight re-decode
+  count at batch/BN = 16 and rules out BM=64/BN=256 (needs BK=4, 47 KB of LDS)
+  and BM=256/BN=64 (doubles the re-decode). Progress here needs either a
+  cheaper offset formulation or a larger accumulator budget.
+- Close the UD-Q4_K_XL speculative gap (0.67x of Q8). The small-batch
+  verification kernel is ~1.9x its Q8_0 counterpart in aggregate; at draft width
+  the K-quant decode arithmetic no longer hides behind weight streaming.
+  Precomputing per-32-block activation sums in the quantize kernels (tile stride
+  576 -> 640) would remove the last redundant work, at the cost of touching the
+  tuned Q8 activation layout.
+- Consider whether the Q8_0 blocked WMMA kernel would also benefit from the
+  store-addressing and wave-shape findings recorded for `opt-q4kxl`; both
+  kernels spend ~44% of their VALU on 64-bit epilogue address arithmetic.
 - Revisit BF16 DeltaNet state only with a different update/storage formulation
   that preserves the promoted FP32 full-logit envelope and exact long greedy
   trajectories; the direct load/FP32-update/BF16-store route saves 96 MiB per
