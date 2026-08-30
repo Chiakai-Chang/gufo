@@ -25,7 +25,8 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen3_asr/hip/blas.hpp"
+#include "src/models/qwen3_asr/hip/gemm_route.hpp"
 #include "src/models/qwen3_asr/hip/text_ops.hpp"
 #include "src/models/qwen3_asr/loader.hpp"
 
@@ -118,13 +119,31 @@ enum class WeightMode : std::uint8_t {
   kCopy,
 };
 
-bool UseDecodeGemv() {
+/// Batch-one decode projection route. `GUFO_QWEN3_ASR_TEXT_GEMV` selects it:
+/// `hipblas` (or `0`) for the library GEMM, `unfused` for one shared-kernel
+/// GEMV dispatch per tensor, otherwise the fused model-private dispatch. All
+/// three produce the same tokens; the knob exists so the routes can be
+/// alternated in one process, which is the only way to compare them without the
+/// APU's thermal drift between runs.
+enum class DecodeGemmRoute : std::uint8_t {
+  kHipblas,
+  kUnfusedGemv,
+  kFusedGemv,
+};
+
+DecodeGemmRoute GetDecodeGemmRoute() {
   const char* value = std::getenv("GUFO_QWEN3_ASR_TEXT_GEMV");
   if (value == nullptr) {
-    return true;
+    return DecodeGemmRoute::kFusedGemv;
   }
   const std::string_view mode(value);
-  return mode != "0" && mode != "hipblas";
+  if (mode == "0" || mode == "hipblas") {
+    return DecodeGemmRoute::kHipblas;
+  }
+  if (mode == "unfused") {
+    return DecodeGemmRoute::kUnfusedGemv;
+  }
+  return DecodeGemmRoute::kFusedGemv;
 }
 
 WeightMode GetWeightMode() {
@@ -335,6 +354,7 @@ struct TextDecoderHipRuntime::Impl {
             model.config.text.num_key_value_heads * token_capacity *
             model.config.text.head_dim),
         logits(model.config.text.vocab_size),
+        argmax_scratch(TextArgmaxScratchElements()),
         token_ids(token_capacity),
         selected_token(1U) {
     if (maximum_tokens == 0U) {
@@ -351,7 +371,15 @@ struct TextDecoderHipRuntime::Impl {
     const char* attention_mode = std::getenv("GUFO_QWEN3_ASR_TEXT_ATTENTION");
     hipblas_attention = attention_mode != nullptr &&
                         std::string_view(attention_mode) == "hipblas";
-    gemv_decode = UseDecodeGemv();
+    // `batched` keeps the shared batched kernel for decode so it can be
+    // alternated against the model-private one in a single process.
+    batched_attention = attention_mode != nullptr &&
+                        std::string_view(attention_mode) == "batched";
+    decode_route = GetDecodeGemmRoute();
+    gemv_decode = decode_route != DecodeGemmRoute::kHipblas;
+    if (UsePrefillHipblasLt()) {
+      prefill_lt = std::make_unique<GemmLt>();
+    }
     if (hipblas_attention) {
       const TextConfig& config = model.config.text;
       q_bfloat16.Reset(token_capacity * config.num_attention_heads *
@@ -455,18 +483,67 @@ struct TextDecoderHipRuntime::Impl {
         std::array<std::uint64_t, 2>{config.vocab_size, config.hidden_size});
   }
 
+  struct GemmProjection {
+    const void* weights{nullptr};
+    float* output{nullptr};
+    std::size_t rows{0U};
+  };
+
   void Gemm(const void* weights, const void* inputs_bfloat16, float* output,
             std::size_t batch, std::size_t rows, std::size_t columns) {
-    if (batch == 1U && gemv_decode) {
-      LaunchTextBfloat16ToFloat(inputs_bfloat16, gemv_input.get(), columns,
-                                stream);
-      gufo::hip::LaunchGEMV(weights, core::GgmlType::kBF16, gemv_input.get(),
-                            output, rows, columns, stream,
-                            models::qwen::QwenGemmMode::kHipDecode);
-      return;
+    const GemmProjection projection{
+        .weights = weights, .output = output, .rows = rows};
+    GemmFused(&projection, 1U, inputs_bfloat16, batch, columns);
+  }
+
+  /// Runs projections that share one activation vector. Batch-one decode takes
+  /// them as a single fused dispatch over their concatenated rows; prefill
+  /// still issues one hipBLAS GEMM per tensor because it is matrix-throughput
+  /// bound rather than occupancy bound.
+  void GemmFused(const GemmProjection* projections, std::uint32_t count,
+                 const void* inputs_bfloat16, std::size_t batch,
+                 std::size_t columns) {
+    if (batch == 1U && decode_route == DecodeGemmRoute::kFusedGemv &&
+        count <= kTextDecodeGemvMaxTensors) {
+      std::array<TextDecodeGemvTensor, kTextDecodeGemvMaxTensors> tensors{};
+      bool representable = true;
+      for (std::uint32_t index = 0U; index < count; ++index) {
+        if (projections[index].rows >
+            std::numeric_limits<std::uint32_t>::max()) {
+          representable = false;
+          break;
+        }
+        tensors[index] = {
+            .weights_bfloat16 = projections[index].weights,
+            .output = projections[index].output,
+            .rows = static_cast<std::uint32_t>(projections[index].rows)};
+      }
+      if (representable &&
+          LaunchTextDecodeGemv(tensors.data(), count, inputs_bfloat16, columns,
+                               stream)) {
+        return;
+      }
     }
-    gufo::hip::LaunchHipblasGEMMBF16(blas, weights, inputs_bfloat16, output,
-                                     batch, rows, columns, stream);
+    for (std::uint32_t index = 0U; index < count; ++index) {
+      if (batch == 1U && gemv_decode) {
+        // Retained fallback for a geometry the fused kernel rejects.
+        LaunchTextBfloat16ToFloat(inputs_bfloat16, gemv_input.get(), columns,
+                                  stream);
+        LaunchTextRowGemv(projections[index].weights, gemv_input.get(),
+                          projections[index].output, projections[index].rows,
+                          columns, stream);
+        continue;
+      }
+      if (prefill_lt != nullptr &&
+          prefill_lt->Run(projections[index].weights, inputs_bfloat16,
+                          projections[index].output, batch,
+                          projections[index].rows, columns, stream)) {
+        continue;
+      }
+      LaunchGemmBf16(blas, projections[index].weights, inputs_bfloat16,
+                     projections[index].output, batch, projections[index].rows,
+                     columns, stream);
+    }
   }
 
   void HipblasAttention(std::size_t layer, std::size_t tokens,
@@ -573,9 +650,8 @@ struct TextDecoderHipRuntime::Impl {
                               prompt_ids.size() * sizeof(std::uint32_t),
                               hipMemcpyHostToDevice, stream),
                "hipMemcpyAsync Qwen3-ASR prompt ids");
-    gufo::hip::LaunchBatchedEmbeddingLookup(
-        embedding, core::GgmlType::kBF16, token_ids.get(), hidden.get(),
-        prompt_ids.size(), config.hidden_size, stream);
+    LaunchTextEmbeddingLookup(embedding, token_ids.get(), hidden.get(),
+                              prompt_ids.size(), config.hidden_size, stream);
     float* audio_destination =
         hidden.get() + (audio_offset * config.hidden_size);
     RequireHip(hipMemcpyAsync(audio_destination, audio_embeddings.data(),
@@ -593,9 +669,8 @@ struct TextDecoderHipRuntime::Impl {
     RequireHip(hipMemcpyAsync(token_ids.get(), &token, sizeof(token),
                               hipMemcpyHostToDevice, stream),
                "hipMemcpyAsync Qwen3-ASR generated token");
-    gufo::hip::LaunchBatchedEmbeddingLookup(embedding, core::GgmlType::kBF16,
-                                            token_ids.get(), hidden.get(), 1U,
-                                            config.hidden_size, stream);
+    LaunchTextEmbeddingLookup(embedding, token_ids.get(), hidden.get(), 1U,
+                              config.hidden_size, stream);
   }
 
   void RunTokens(std::size_t tokens, std::uint32_t start_position,
@@ -613,12 +688,21 @@ struct TextDecoderHipRuntime::Impl {
 
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
       const LayerWeights& weights = layers[layer];
-      Gemm(weights.q, bfloat16_scratch.get(), q.get(), tokens,
-           config.num_attention_heads * config.head_dim, config.hidden_size);
-      Gemm(weights.k, bfloat16_scratch.get(), k.get(), tokens,
-           config.num_key_value_heads * config.head_dim, config.hidden_size);
-      Gemm(weights.v, bfloat16_scratch.get(), v.get(), tokens,
-           config.num_key_value_heads * config.head_dim, config.hidden_size);
+      // q/k/v read the same normalized activations, so decode issues them as
+      // one dispatch over 4096 concatenated rows instead of three grids of
+      // 2048/1024/1024 that each leave the machine under half occupied.
+      const std::array<GemmProjection, 3> qkv{
+          GemmProjection{.weights = weights.q,
+                         .output = q.get(),
+                         .rows = config.num_attention_heads * config.head_dim},
+          GemmProjection{.weights = weights.k,
+                         .output = k.get(),
+                         .rows = config.num_key_value_heads * config.head_dim},
+          GemmProjection{.weights = weights.v,
+                         .output = v.get(),
+                         .rows = config.num_key_value_heads * config.head_dim}};
+      GemmFused(qkv.data(), 3U, bfloat16_scratch.get(), tokens,
+                config.hidden_size);
       if (!LaunchTextQkNormRoPE(
               q.get(), k.get(), v.get(), weights.q_norm.values.get(),
               weights.k_norm.values.get(), tokens, config.num_attention_heads,
@@ -631,14 +715,20 @@ struct TextDecoderHipRuntime::Impl {
       }
       if (hipblas_attention) {
         HipblasAttention(layer, tokens, start_position);
-      } else {
-        gufo::hip::LaunchBatchedAttention(
-            q.get(), k.get(), v.get(), nullptr, key_cache.get(),
-            value_cache.get(), nullptr, nullptr, attention.get(),
-            static_cast<std::uint32_t>(layer), start_position, tokens,
-            static_cast<std::uint32_t>(maximum_tokens),
+      } else if (tokens != 1U || batched_attention ||
+                 !LaunchTextDecodeAttention(
+                     q.get(), key_cache.get(), value_cache.get(),
+                     attention.get(), bfloat16_scratch.get(),
+                     static_cast<std::uint32_t>(layer), start_position,
+                     static_cast<std::uint32_t>(maximum_tokens),
+                     config.num_attention_heads, config.num_key_value_heads,
+                     config.head_dim, stream)) {
+        LaunchTextBatchedAttention(
+            q.get(), key_cache.get(), value_cache.get(), attention.get(),
+            bfloat16_scratch.get(), static_cast<std::uint32_t>(layer),
+            start_position, tokens, static_cast<std::uint32_t>(maximum_tokens),
             config.num_attention_heads, config.num_key_value_heads,
-            config.head_dim, stream, true, bfloat16_scratch.get());
+            config.head_dim, stream);
       }
       Gemm(weights.o, bfloat16_scratch.get(), projection.get(), tokens,
            config.hidden_size, config.num_attention_heads * config.head_dim);
@@ -646,10 +736,16 @@ struct TextDecoderHipRuntime::Impl {
           hidden.get(), projection.get(), weights.post_norm.values.get(),
           bfloat16_scratch.get(), tokens, config.hidden_size,
           config.rms_norm_eps, stream);
-      Gemm(weights.gate, bfloat16_scratch.get(), gate.get(), tokens,
-           config.intermediate_size, config.hidden_size);
-      Gemm(weights.up, bfloat16_scratch.get(), up.get(), tokens,
-           config.intermediate_size, config.hidden_size);
+      // gate and up likewise share their input.
+      const std::array<GemmProjection, 2> gate_up{
+          GemmProjection{.weights = weights.gate,
+                         .output = gate.get(),
+                         .rows = config.intermediate_size},
+          GemmProjection{.weights = weights.up,
+                         .output = up.get(),
+                         .rows = config.intermediate_size}};
+      GemmFused(gate_up.data(), 2U, bfloat16_scratch.get(), tokens,
+                config.hidden_size);
       LaunchTextSwiGLU(gate.get(), up.get(), bfloat16_scratch.get(),
                        ffn_elements, stream);
       Gemm(weights.down, bfloat16_scratch.get(), feed_forward.get(), tokens,
@@ -702,9 +798,9 @@ struct TextDecoderHipRuntime::Impl {
     // The decode GEMV accumulation orders that pair as 35.25/35.5. Official
     // non-tied greedy margins in the captured sequence are at least 1.0.
     constexpr float kGemvTieTolerance = 0.25F;
-    LaunchTextArgmax(logits.get(), selected_token.get(),
-                     model.config.text.vocab_size,
-                     gemv_decode ? kGemvTieTolerance : 0.0F, stream);
+    LaunchTextArgmax(
+        logits.get(), selected_token.get(), model.config.text.vocab_size,
+        gemv_decode ? kGemvTieTolerance : 0.0F, argmax_scratch.get(), stream);
     std::uint32_t result = 0U;
     RequireHip(hipMemcpyAsync(&result, selected_token.get(), sizeof(result),
                               hipMemcpyDeviceToHost, stream),
@@ -728,6 +824,8 @@ struct TextDecoderHipRuntime::Impl {
   std::size_t maximum_tokens;
   std::size_t cache_tokens{0U};
   bool hipblas_attention{false};
+  bool batched_attention{false};
+  DecodeGemmRoute decode_route{DecodeGemmRoute::kFusedGemv};
   bool gemv_decode{false};
   std::vector<std::unique_ptr<DeviceRegion>> weight_regions;
   std::vector<LayerWeights> layers;
@@ -736,6 +834,7 @@ struct TextDecoderHipRuntime::Impl {
   const void* lm_head{nullptr};
   hipStream_t stream{nullptr};
   hipblasHandle_t blas{nullptr};
+  std::unique_ptr<GemmLt> prefill_lt;
   DeviceBuffer<float> hidden;
   DeviceBuffer<float> q;
   DeviceBuffer<float> k;
@@ -756,6 +855,7 @@ struct TextDecoderHipRuntime::Impl {
   DeviceBuffer<float> attention_probabilities;
   DeviceBuffer<hip_bfloat16> attention_packed;
   DeviceBuffer<float> logits;
+  DeviceBuffer<float> argmax_scratch;
   DeviceBuffer<std::uint32_t> token_ids;
   DeviceBuffer<std::uint32_t> selected_token;
 };

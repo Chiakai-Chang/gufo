@@ -11,11 +11,11 @@
 #include <unordered_set>
 #include <vector>
 
-namespace gufo::tokenization {
-class QwenTokenizer;
-}
-
 namespace gufo::models::qwen3_asr {
+
+namespace tokenization {
+class BpeTokenizer;
+}
 
 class Tokenizer {
 public:
@@ -37,7 +37,7 @@ public:
 private:
   void EnsureEncodingTokenizer() const;
 
-  mutable std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
+  mutable std::unique_ptr<tokenization::BpeTokenizer> tokenizer_;
   std::filesystem::path model_root_;
   std::vector<std::string> tokens_;
   std::unordered_map<std::string, std::uint32_t> added_tokens_;

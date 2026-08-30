@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -216,10 +217,12 @@ int main() {
   const auto prefill_end = std::chrono::steady_clock::now();
   const Quality layer0 = Compare(trace.layer0, expected_layer0.values);
   const Quality logits = Compare(trace.logits, expected_logits.values);
-  std::cout << "qwen3_asr_text_layer0 cosine=" << layer0.cosine
+  std::cout << std::defaultfloat << std::setprecision(6)
+            << "qwen3_asr_text_layer0 cosine=" << layer0.cosine
             << " relL2=" << layer0.relative_l2
             << " max_abs=" << layer0.maximum_error << '\n';
-  std::cout << "qwen3_asr_prefill_logits cosine=" << logits.cosine
+  std::cout << std::defaultfloat << std::setprecision(6)
+            << "qwen3_asr_prefill_logits cosine=" << logits.cosine
             << " relL2=" << logits.relative_l2
             << " max_abs=" << logits.maximum_error
             << " native_argmax=" << Argmax(trace.logits)

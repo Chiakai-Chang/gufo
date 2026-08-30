@@ -12,13 +12,11 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/qwen/tokenizer.hpp"
-#include "src/models/qwen3_tts/json.hpp"
+#include "src/models/qwen3_asr/bpe.hpp"
+#include "src/models/qwen3_asr/json.hpp"
 
 namespace gufo::models::qwen3_asr {
 namespace {
-
-namespace json = gufo::models::qwen3_tts::json;
 
 constexpr std::size_t kMaximumVocabularyBytes = 16U << 20U;
 constexpr std::size_t kMaximumTokenizerConfigBytes = 1U << 20U;
@@ -134,7 +132,7 @@ bool Tokenizer::Load(const std::filesystem::path& model_root, Tokenizer* output,
 
     std::string tokenizer_error;
     const std::vector<std::string> no_merges;
-    auto implementation = tokenization::QwenTokenizer::CreateFromVocabulary(
+    auto implementation = tokenization::BpeTokenizer::CreateFromVocabulary(
         tokens, no_merges, special_tokens, &tokenizer_error,
         tokenization::VocabularyLoadOptions{
             .eager_decoded_tokens = false,
@@ -174,7 +172,7 @@ void Tokenizer::EnsureEncodingTokenizer() const {
     }
   }
   std::string tokenizer_error;
-  auto implementation = tokenization::QwenTokenizer::CreateFromVocabulary(
+  auto implementation = tokenization::BpeTokenizer::CreateFromVocabulary(
       tokens_, merges, added_tokens_, &tokenizer_error,
       tokenization::VocabularyLoadOptions{
           .eager_decoded_tokens = false,

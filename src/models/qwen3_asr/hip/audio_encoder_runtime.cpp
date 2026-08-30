@@ -23,8 +23,9 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen3_asr/hip/audio_ops.hpp"
+#include "src/models/qwen3_asr/hip/blas.hpp"
+#include "src/models/qwen3_asr/hip/gemm_route.hpp"
 #include "src/models/qwen3_asr/loader.hpp"
 
 namespace gufo::models::qwen3_asr::hip {
@@ -265,6 +266,9 @@ struct AudioEncoderHipRuntime::Impl {
     RequireHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
                "hipStreamCreate Qwen3-ASR audio encoder");
     RequireHipblas(hipblasCreate(&blas), "hipblasCreate Qwen3-ASR");
+    if (UsePrefillHipblasLt()) {
+      lt = std::make_unique<GemmLt>();
+    }
     RequireHipblas(hipblasSetStream(blas, stream),
                    "hipblasSetStream Qwen3-ASR");
     RequireHipblas(hipblasSetAtomicsMode(blas, HIPBLAS_ATOMICS_NOT_ALLOWED),
@@ -414,11 +418,18 @@ struct AudioEncoderHipRuntime::Impl {
     ffn_bfloat16.Reset(token_capacity * kFfn);
   }
 
+  /// The audio tower always runs multi-token, and rocBLAS has no WMMA kernel
+  /// for a transposed BF16 operand with a float32 output, so hipBLASLt is tried
+  /// first with hipBLAS retained as the fallback.
   void Gemm(const void* weight, const void* input_bfloat16, float* output,
             std::size_t rows, std::size_t output_columns,
             std::size_t reduction) {
-    gufo::hip::LaunchHipblasGEMMBF16(blas, weight, input_bfloat16, output, rows,
-                                     output_columns, reduction, stream);
+    if (lt != nullptr && lt->Run(weight, input_bfloat16, output, rows,
+                                 output_columns, reduction, stream)) {
+      return;
+    }
+    LaunchGemmBf16(blas, weight, input_bfloat16, output, rows, output_columns,
+                   reduction, stream);
   }
 
   AudioEncoderOutput EncodeFrontend(std::span<const float> log_mel,
@@ -446,9 +457,8 @@ struct AudioEncoderHipRuntime::Impl {
     LaunchBiasGelu(conv3.get(), conv3_bias.get(), conv3.size(), kConvChannels,
                    16U * kConvTime, stream);
     LaunchConvOutputLayout(conv3.get(), layout.get(), requested_chunks, stream);
-    gufo::hip::LaunchHipblasGEMMBF16(
-        blas, conv_out.get(), layout.get(), projected.get(),
-        requested_chunks * kConvTime, kHidden, kFlattened, stream);
+    Gemm(conv_out.get(), layout.get(), projected.get(),
+         requested_chunks * kConvTime, kHidden, kFlattened);
     LaunchAddPositionAndCompact(projected.get(), compact.get(), frames,
                                 requested_chunks, stream);
 
@@ -559,6 +569,7 @@ struct AudioEncoderHipRuntime::Impl {
   LoadResult model;
   hipStream_t stream{nullptr};
   hipblasHandle_t blas{nullptr};
+  std::unique_ptr<GemmLt> lt;
   miopenHandle_t miopen{nullptr};
   std::size_t chunks{0};
   std::size_t token_capacity{0};

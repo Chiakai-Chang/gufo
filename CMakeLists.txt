@@ -244,7 +244,6 @@ target_link_libraries(gufo_core PUBLIC ICU::uc Threads::Threads)
 add_subdirectory(src/models/qwen)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
-target_link_libraries(gufo_qwen3_asr PUBLIC gufo_core)
 
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)

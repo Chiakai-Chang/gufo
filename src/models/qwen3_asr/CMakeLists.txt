@@ -2,6 +2,7 @@
 
 add_library(gufo_qwen3_asr STATIC
   audio.cpp
+  bpe.cpp
   config.cpp
   hip/transcription_runtime.cpp
   loader.cpp
@@ -17,12 +18,14 @@ if (ENGINE_ENABLE_HIP)
   target_sources(gufo_qwen3_asr PRIVATE
     hip/audio_encoder_runtime.cpp
     hip/audio_ops.hip
+    hip/blas.cpp
     hip/text_decoder_runtime.cpp
     hip/text_ops.hip)
   target_compile_definitions(gufo_qwen3_asr PRIVATE ENGINE_ENABLE_HIP=1)
   target_link_libraries(gufo_qwen3_asr PUBLIC
     hip::host
     roc::hipblas
+    roc::hipblaslt
     MIOpen)
 endif()
 

@@ -3,6 +3,7 @@
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -12,6 +13,302 @@
 
 namespace gufo::models::qwen3_asr::hip {
 namespace {
+
+// Sixteen-byte load granule. A native vector type is used rather than HIP's
+// uint4 so the compiler emits a single global_load_dwordx4 and so the same type
+// can back the LDS staging buffer.
+using Vec16 = __attribute__((__vector_size__(16))) unsigned int;
+
+/// Number of row loads a wave issues before consuming the first. Eight is the
+/// measured optimum on gfx1151: four leaves the memory pipeline short of the
+/// DRAM read ceiling and sixteen costs enough registers to lose occupancy.
+constexpr std::uint32_t kDecodeGemvUnroll = 8;
+constexpr std::uint32_t kDecodeGemvWavesPerBlock = 4;
+constexpr std::uint32_t kDecodeGemvBlockThreads = kDecodeGemvWavesPerBlock * 32;
+
+struct DecodeGemvTensors {
+  const hip_bfloat16* weights[kTextDecodeGemvMaxTensors];
+  float* outputs[kTextDecodeGemvMaxTensors];
+  std::uint32_t first_row[kTextDecodeGemvMaxTensors];
+  std::uint32_t count;
+  std::uint32_t total_rows;
+};
+
+__device__ __forceinline__ float Bf16BitsToFloat(std::uint16_t bits) {
+  return __uint_as_float(static_cast<std::uint32_t>(bits) << 16);
+}
+
+/// Eight BF16 products summed left to right. This is the accumulation order the
+/// unfused decode GEMV uses, and the generated token IDs depend on it.
+__device__ __forceinline__ float DecodeDot8(Vec16 weights, Vec16 activations) {
+  const auto* w = reinterpret_cast<const std::uint16_t*>(&weights);
+  const auto* a = reinterpret_cast<const std::uint16_t*>(&activations);
+  return (Bf16BitsToFloat(w[0]) * Bf16BitsToFloat(a[0])) +
+         (Bf16BitsToFloat(w[1]) * Bf16BitsToFloat(a[1])) +
+         (Bf16BitsToFloat(w[2]) * Bf16BitsToFloat(a[2])) +
+         (Bf16BitsToFloat(w[3]) * Bf16BitsToFloat(a[3])) +
+         (Bf16BitsToFloat(w[4]) * Bf16BitsToFloat(a[4])) +
+         (Bf16BitsToFloat(w[5]) * Bf16BitsToFloat(a[5])) +
+         (Bf16BitsToFloat(w[6]) * Bf16BitsToFloat(a[6])) +
+         (Bf16BitsToFloat(w[7]) * Bf16BitsToFloat(a[7]));
+}
+
+__launch_bounds__(kDecodeGemvBlockThreads, 4) __global__
+    void TextDecodeGemvKernel(DecodeGemvTensors tensors,
+                              const hip_bfloat16* __restrict__ input,
+                              std::uint32_t k_vectors) {
+  // Staged before the row-range test so every thread in the block reaches the
+  // barrier.
+  extern __shared__ Vec16 shared_input[];
+  const auto* input_vec = reinterpret_cast<const Vec16*>(input);
+  for (std::uint32_t index = threadIdx.x; index < k_vectors;
+       index += blockDim.x) {
+    shared_input[index] = input_vec[index];
+  }
+  __syncthreads();
+
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t row =
+      (blockIdx.x * kDecodeGemvWavesPerBlock) + (threadIdx.x >> 5U);
+  if (row >= tensors.total_rows) {
+    return;
+  }
+  std::uint32_t tensor = 0U;
+#pragma unroll
+  for (std::uint32_t candidate = 1U; candidate < kTextDecodeGemvMaxTensors;
+       ++candidate) {
+    if (candidate < tensors.count && row >= tensors.first_row[candidate]) {
+      tensor = candidate;
+    }
+  }
+  const std::uint32_t local_row = row - tensors.first_row[tensor];
+  const auto* row_vec = reinterpret_cast<const Vec16*>(
+      tensors.weights[tensor] +
+      (static_cast<std::size_t>(local_row) * k_vectors * 8U));
+
+  constexpr std::uint32_t kStride = 32U * kDecodeGemvUnroll;
+  float dot = 0.0F;
+  std::uint32_t index = lane;
+  for (; index + (kStride - 32U) < k_vectors; index += kStride) {
+    Vec16 weights[kDecodeGemvUnroll];
+#pragma unroll
+    for (std::uint32_t step = 0U; step < kDecodeGemvUnroll; ++step) {
+      weights[step] = row_vec[index + (step * 32U)];
+    }
+#pragma unroll
+    for (std::uint32_t step = 0U; step < kDecodeGemvUnroll; ++step) {
+      dot += DecodeDot8(weights[step], shared_input[index + (step * 32U)]);
+    }
+  }
+  for (; index < k_vectors; index += 32U) {
+    dot += DecodeDot8(row_vec[index], shared_input[index]);
+  }
+
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot += __shfl_xor(dot, offset);
+  }
+  if (lane == 0U) {
+    tensors.outputs[tensor][local_row] = dot;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Kernels that were previously reached through src/models/qwen. They are
+// reproduced here so this model's sources stand alone, restricted to the BF16
+// weights and the single route this checkpoint uses, and with the arithmetic of
+// the shared originals preserved -- the generated token IDs depend on it.
+// ---------------------------------------------------------------------------
+
+__launch_bounds__(256) __global__
+    void TextEmbeddingLookupKernel(const hip_bfloat16* __restrict__ table,
+                                   const std::uint32_t* __restrict__ token_ids,
+                                   float* __restrict__ output,
+                                   std::size_t batch_size,
+                                   std::size_t hidden_size) {
+  const std::size_t batch = blockIdx.y;
+  if (batch >= batch_size) {
+    return;
+  }
+  const std::size_t index = (blockIdx.x * blockDim.x) + threadIdx.x;
+  if (index >= hidden_size) {
+    return;
+  }
+  const std::size_t row =
+      static_cast<std::size_t>(token_ids[batch]) * hidden_size;
+  output[(batch * hidden_size) + index] =
+      static_cast<float>(table[row + index]);
+}
+
+/// One wave per output row, lane-strided over eight-element groups, reduced by
+/// a butterfly. Matches the shared wave32 single-row GEMV.
+template<std::uint32_t WavesPerBlock>
+__launch_bounds__(WavesPerBlock * 32, 4) __global__
+    void TextRowGemvKernel(const hip_bfloat16* __restrict__ weights,
+                           const float* __restrict__ input,
+                           float* __restrict__ output, std::size_t rows,
+                           std::size_t columns) {
+  const std::size_t lane = threadIdx.x & 31U;
+  const std::size_t row = (blockIdx.x * WavesPerBlock) + (threadIdx.x >> 5U);
+  if (row >= rows) {
+    return;
+  }
+  const auto* weight_row = weights + (row * columns);
+  const auto* weight_vec = reinterpret_cast<const Vec16*>(weight_row);
+  const std::size_t groups = columns / 8U;
+
+  float dot = 0.0F;
+  for (std::size_t group = lane; group < groups; group += 32U) {
+    const Vec16 packed = weight_vec[group];
+    const auto* values = reinterpret_cast<const std::uint16_t*>(&packed);
+    const std::size_t base = group * 8U;
+    const float4 low = *reinterpret_cast<const float4*>(&input[base]);
+    const float4 high = *reinterpret_cast<const float4*>(&input[base + 4U]);
+    dot += (Bf16BitsToFloat(values[0]) * low.x) +
+           (Bf16BitsToFloat(values[1]) * low.y) +
+           (Bf16BitsToFloat(values[2]) * low.z) +
+           (Bf16BitsToFloat(values[3]) * low.w) +
+           (Bf16BitsToFloat(values[4]) * high.x) +
+           (Bf16BitsToFloat(values[5]) * high.y) +
+           (Bf16BitsToFloat(values[6]) * high.z) +
+           (Bf16BitsToFloat(values[7]) * high.w);
+  }
+  for (std::size_t column = (groups * 8U) + lane; column < columns;
+       column += 32U) {
+    dot += static_cast<float>(weight_row[column]) * input[column];
+  }
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    dot += __shfl_xor(dot, offset);
+  }
+  if (lane == 0U) {
+    output[row] = dot;
+  }
+}
+
+/// Shortest sequence scored with the wave-parallel branch. Below it a whole row
+/// is summed in one thread, which is a different accumulation order; both
+/// branches are reproduced so behaviour matches the shared kernel at every
+/// context length.
+constexpr std::size_t kBatchedAttentionWaveMinSequence = 64;
+
+__launch_bounds__(256) __global__ void TextBatchedAttentionKernel(
+    const float* __restrict__ query, const float* __restrict__ key_cache,
+    const float* __restrict__ value_cache, float* __restrict__ out_context,
+    hip_bfloat16* __restrict__ out_context_bfloat16, std::uint32_t layer_index,
+    std::uint32_t start_position, std::size_t batch_size,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_key_value_heads, std::uint32_t head_dim) {
+  const std::uint32_t head = blockIdx.x;
+  const std::uint32_t token = blockIdx.y;
+  if (head >= num_heads || token >= batch_size) {
+    return;
+  }
+  const std::size_t thread = threadIdx.x;
+  const std::uint32_t key_value_head = head / (num_heads / num_key_value_heads);
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+
+  __shared__ float reduction[256];
+  extern __shared__ float scores[];
+
+  const std::uint32_t position = start_position + token;
+  const std::size_t sequence = static_cast<std::size_t>(position) + 1U;
+  const float* query_head = query + (token * num_heads * head_dim) +
+                            (static_cast<std::size_t>(head) * head_dim);
+  const auto* query_vec = reinterpret_cast<const float4*>(query_head);
+  const std::size_t vectors = head_dim / 4U;
+
+  const auto key_offset = [&](std::size_t key) {
+    return (((static_cast<std::size_t>(layer_index) * num_key_value_heads) +
+             key_value_head) *
+                max_context +
+            key) *
+           head_dim;
+  };
+
+  if (sequence >= kBatchedAttentionWaveMinSequence) {
+    const std::size_t lane = thread & 31U;
+    const std::size_t wave = thread >> 5U;
+    const std::size_t waves = blockDim.x >> 5U;
+    for (std::size_t key = wave; key < sequence; key += waves) {
+      const auto* key_vec =
+          reinterpret_cast<const float4*>(key_cache + key_offset(key));
+      float dot = 0.0F;
+      for (std::size_t vector = lane; vector < vectors; vector += 32U) {
+        const float4 q = query_vec[vector];
+        const float4 k = key_vec[vector];
+        dot += (q.x * k.x) + (q.y * k.y) + (q.z * k.z) + (q.w * k.w);
+      }
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        dot += __shfl_xor(dot, offset);
+      }
+      if (lane == 0U) {
+        scores[key] = dot * scale;
+      }
+    }
+  } else {
+    for (std::size_t key = thread; key < sequence; key += blockDim.x) {
+      const auto* key_vec =
+          reinterpret_cast<const float4*>(key_cache + key_offset(key));
+      float dot = 0.0F;
+      for (std::size_t vector = 0; vector < vectors; ++vector) {
+        const float4 q = query_vec[vector];
+        const float4 k = key_vec[vector];
+        dot += (q.x * k.x) + (q.y * k.y) + (q.z * k.z) + (q.w * k.w);
+      }
+      scores[key] = dot * scale;
+    }
+  }
+  __syncthreads();
+
+  float local_maximum = -1e30F;
+  for (std::size_t key = thread; key < sequence; key += blockDim.x) {
+    local_maximum = fmaxf(local_maximum, scores[key]);
+  }
+  reduction[thread] = local_maximum;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2U; stride > 0U; stride /= 2U) {
+    if (thread < stride) {
+      reduction[thread] = fmaxf(reduction[thread], reduction[thread + stride]);
+    }
+    __syncthreads();
+  }
+  const float maximum = reduction[0];
+  __syncthreads();
+
+  float local_sum = 0.0F;
+  for (std::size_t key = thread; key < sequence; key += blockDim.x) {
+    const float value = expf(scores[key] - maximum);
+    scores[key] = value;
+    local_sum += value;
+  }
+  reduction[thread] = local_sum;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2U; stride > 0U; stride /= 2U) {
+    if (thread < stride) {
+      reduction[thread] += reduction[thread + stride];
+    }
+    __syncthreads();
+  }
+  const float inverse_sum = 1.0F / (reduction[0] + 1e-9F);
+  __syncthreads();
+  for (std::size_t key = thread; key < sequence; key += blockDim.x) {
+    scores[key] *= inverse_sum;
+  }
+  __syncthreads();
+
+  if (thread < head_dim) {
+    float context = 0.0F;
+    for (std::size_t key = 0; key < sequence; ++key) {
+      context += scores[key] * value_cache[key_offset(key) + thread];
+    }
+    const std::size_t index = (token * num_heads * head_dim) +
+                              (static_cast<std::size_t>(head) * head_dim) +
+                              thread;
+    out_context[index] = context;
+    if (out_context_bfloat16 != nullptr) {
+      out_context_bfloat16[index] = hip_bfloat16(context);
+    }
+  }
+}
 
 __device__ void NormalizeAndRotateHead(float* values, const float* weight,
                                        std::uint32_t head_dim, float epsilon,
@@ -114,6 +411,177 @@ __launch_bounds__(Threads) __global__ void TextQkNormRoPEKernel(
         key_cache[cache_offset + index] = key[offset + index];
         value_cache[cache_offset + index] = rounded;
       }
+    }
+  }
+}
+
+// Batch-one decode attention.
+//
+// The shared batched kernel launches one block per head -- sixteen blocks on a
+// forty-CU part -- and its score loop issues a single 16-byte key load per wave
+// per position, then immediately reduces it. With that little in flight the
+// kernel runs at roughly an eighth of the DRAM read rate and is bound by load
+// latency, not bandwidth.
+//
+// This kernel keeps every arithmetic step of the shared one and only raises the
+// number of loads in flight: each wave scores `Unroll` positions at a time and
+// the value accumulation prefetches `Unroll` rows before consuming the first.
+// Per-position score reductions are independent, and the context accumulator
+// stays single and in ascending position order, so every result is
+// bit-identical and greedy decode still reproduces the official token IDs.
+constexpr std::uint32_t kDecodeAttentionThreads = 256;
+constexpr std::uint32_t kDecodeAttentionUnroll = 8;
+
+/// Shortest sequence the shared kernel scores with its wave-parallel branch.
+/// Below this it sums a whole row in one thread, which is a different
+/// accumulation order, so short contexts must keep using the shared kernel.
+constexpr std::uint32_t kDecodeAttentionMinSequence = 64;
+
+__launch_bounds__(kDecodeAttentionThreads) __global__
+    void TextDecodeAttentionKernel(
+        const float* __restrict__ query, const float* __restrict__ key_cache,
+        const float* __restrict__ value_cache, float* __restrict__ out_context,
+        hip_bfloat16* __restrict__ out_context_bfloat16,
+        std::uint32_t layer_index, std::uint32_t position,
+        std::uint32_t max_context, std::uint32_t num_heads,
+        std::uint32_t num_key_value_heads, std::uint32_t head_dim) {
+  const std::uint32_t head = blockIdx.x;
+  if (head >= num_heads) {
+    return;
+  }
+  const std::uint32_t thread = threadIdx.x;
+  const std::uint32_t lane = thread & 31U;
+  const std::uint32_t wave = thread >> 5U;
+  constexpr std::uint32_t kWaves = kDecodeAttentionThreads / 32U;
+  const std::uint32_t key_value_head = head / (num_heads / num_key_value_heads);
+  const float scale = 1.0F / sqrtf(static_cast<float>(head_dim));
+  const std::size_t sequence = static_cast<std::size_t>(position) + 1U;
+  const std::size_t cache_head_stride =
+      static_cast<std::size_t>(max_context) * head_dim;
+  const float* cache_head =
+      key_cache +
+      (((static_cast<std::size_t>(layer_index) * num_key_value_heads) +
+        key_value_head) *
+       cache_head_stride);
+  const float* value_head =
+      value_cache +
+      (((static_cast<std::size_t>(layer_index) * num_key_value_heads) +
+        key_value_head) *
+       cache_head_stride);
+
+  __shared__ float reduction[kDecodeAttentionThreads];
+  extern __shared__ float scores[];
+
+  const auto* query_vec = reinterpret_cast<const float4*>(
+      query + (static_cast<std::size_t>(head) * head_dim));
+  const std::uint32_t vectors = head_dim / 4U;
+
+  // Scores. Each wave takes `Unroll` positions per step so that many key rows
+  // are in flight before the first reduction consumes one.
+  const std::uint32_t step = kWaves * kDecodeAttentionUnroll;
+  std::size_t base = wave;
+  for (; base + (step - kWaves) < sequence; base += step) {
+    float dot[kDecodeAttentionUnroll];
+#pragma unroll
+    for (std::uint32_t slot = 0U; slot < kDecodeAttentionUnroll; ++slot) {
+      const std::size_t key = base + (slot * kWaves);
+      dot[slot] = 0.0F;
+      for (std::uint32_t vector = lane; vector < vectors; vector += 32U) {
+        const float4 q = query_vec[vector];
+        const float4 k = reinterpret_cast<const float4*>(
+            cache_head + (key * head_dim))[vector];
+        dot[slot] += (q.x * k.x) + (q.y * k.y) + (q.z * k.z) + (q.w * k.w);
+      }
+    }
+#pragma unroll
+    for (std::uint32_t slot = 0U; slot < kDecodeAttentionUnroll; ++slot) {
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        dot[slot] += __shfl_xor(dot[slot], offset);
+      }
+      if (lane == 0U) {
+        scores[base + (slot * kWaves)] = dot[slot] * scale;
+      }
+    }
+  }
+  for (std::size_t key = base; key < sequence; key += kWaves) {
+    float dot = 0.0F;
+    for (std::uint32_t vector = lane; vector < vectors; vector += 32U) {
+      const float4 q = query_vec[vector];
+      const float4 k = reinterpret_cast<const float4*>(
+          cache_head + (key * head_dim))[vector];
+      dot += (q.x * k.x) + (q.y * k.y) + (q.z * k.z) + (q.w * k.w);
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_xor(dot, offset);
+    }
+    if (lane == 0U) {
+      scores[key] = dot * scale;
+    }
+  }
+  __syncthreads();
+
+  // Softmax, matching the shared kernel's reduction tree and epsilon.
+  float local_maximum = -1e30F;
+  for (std::size_t key = thread; key < sequence; key += blockDim.x) {
+    local_maximum = fmaxf(local_maximum, scores[key]);
+  }
+  reduction[thread] = local_maximum;
+  __syncthreads();
+  for (std::uint32_t offset = blockDim.x / 2U; offset > 0U; offset /= 2U) {
+    if (thread < offset) {
+      reduction[thread] = fmaxf(reduction[thread], reduction[thread + offset]);
+    }
+    __syncthreads();
+  }
+  const float maximum = reduction[0];
+  __syncthreads();
+
+  float local_sum = 0.0F;
+  for (std::size_t key = thread; key < sequence; key += blockDim.x) {
+    const float value = expf(scores[key] - maximum);
+    scores[key] = value;
+    local_sum += value;
+  }
+  reduction[thread] = local_sum;
+  __syncthreads();
+  for (std::uint32_t offset = blockDim.x / 2U; offset > 0U; offset /= 2U) {
+    if (thread < offset) {
+      reduction[thread] += reduction[thread + offset];
+    }
+    __syncthreads();
+  }
+  const float inverse_sum = 1.0F / (reduction[0] + 1e-9F);
+  __syncthreads();
+  for (std::size_t key = thread; key < sequence; key += blockDim.x) {
+    scores[key] *= inverse_sum;
+  }
+  __syncthreads();
+
+  // Values. One thread per head dimension, prefetching `Unroll` rows while the
+  // single accumulator stays in ascending position order.
+  if (thread < head_dim) {
+    float context = 0.0F;
+    std::size_t key = 0U;
+    for (; key + kDecodeAttentionUnroll <= sequence;
+         key += kDecodeAttentionUnroll) {
+      float values[kDecodeAttentionUnroll];
+#pragma unroll
+      for (std::uint32_t slot = 0U; slot < kDecodeAttentionUnroll; ++slot) {
+        values[slot] = value_head[((key + slot) * head_dim) + thread];
+      }
+#pragma unroll
+      for (std::uint32_t slot = 0U; slot < kDecodeAttentionUnroll; ++slot) {
+        context += scores[key + slot] * values[slot];
+      }
+    }
+    for (; key < sequence; ++key) {
+      context += scores[key] * value_head[(key * head_dim) + thread];
+    }
+    const std::size_t index =
+        (static_cast<std::size_t>(head) * head_dim) + thread;
+    out_context[index] = context;
+    if (out_context_bfloat16 != nullptr) {
+      out_context_bfloat16[index] = hip_bfloat16(context);
     }
   }
 }
@@ -334,6 +802,95 @@ __global__ void Bfloat16ToFloatKernel(const hip_bfloat16* input, float* output,
   }
 }
 
+// The single-block argmax below reads the whole 151936-entry vocabulary on one
+// compute unit. These three kernels compute the identical result -- the lowest
+// index whose logit is within tie_tolerance of the maximum -- across the whole
+// grid. A maximum and a minimum index are both order independent, so spreading
+// them over blocks cannot change the selected token.
+constexpr std::uint32_t kArgmaxBlocks = 1024;
+constexpr std::uint32_t kArgmaxThreads = 256;
+
+__launch_bounds__(kArgmaxThreads) __global__
+    void TextArgmaxPartialMaxKernel(const float* __restrict__ logits,
+                                    float* __restrict__ partials,
+                                    std::size_t count) {
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * kArgmaxThreads;
+  float maximum = -INFINITY;
+  for (std::size_t index = (blockIdx.x * kArgmaxThreads) + threadIdx.x;
+       index < count; index += stride) {
+    maximum = fmaxf(maximum, logits[index]);
+  }
+  __shared__ float shared[kArgmaxThreads];
+  shared[threadIdx.x] = maximum;
+  __syncthreads();
+  for (std::uint32_t offset = kArgmaxThreads / 2U; offset > 0U; offset /= 2U) {
+    if (threadIdx.x < offset) {
+      shared[threadIdx.x] =
+          fmaxf(shared[threadIdx.x], shared[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0U) {
+    partials[blockIdx.x] = shared[0];
+  }
+}
+
+__launch_bounds__(kArgmaxBlocks) __global__
+    void TextArgmaxThresholdKernel(const float* __restrict__ partials,
+                                   std::uint32_t partial_count,
+                                   float* __restrict__ threshold,
+                                   std::uint32_t* __restrict__ output_token,
+                                   float tie_tolerance) {
+  __shared__ float shared[kArgmaxBlocks];
+  shared[threadIdx.x] =
+      threadIdx.x < partial_count ? partials[threadIdx.x] : -INFINITY;
+  __syncthreads();
+  for (std::uint32_t offset = kArgmaxBlocks / 2U; offset > 0U; offset /= 2U) {
+    if (threadIdx.x < offset) {
+      shared[threadIdx.x] =
+          fmaxf(shared[threadIdx.x], shared[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0U) {
+    *threshold = shared[0] - tie_tolerance;
+    *output_token = std::numeric_limits<std::uint32_t>::max();
+  }
+}
+
+__launch_bounds__(kArgmaxThreads) __global__
+    void TextArgmaxSelectKernel(const float* __restrict__ logits,
+                                const float* __restrict__ threshold,
+                                std::uint32_t* __restrict__ output_token,
+                                std::size_t count) {
+  const float limit = *threshold;
+  const std::size_t stride =
+      static_cast<std::size_t>(gridDim.x) * kArgmaxThreads;
+  std::uint32_t token = std::numeric_limits<std::uint32_t>::max();
+  for (std::size_t index = (blockIdx.x * kArgmaxThreads) + threadIdx.x;
+       index < count; index += stride) {
+    if (logits[index] >= limit) {
+      token = static_cast<std::uint32_t>(index);
+      break;
+    }
+  }
+  __shared__ std::uint32_t shared[kArgmaxThreads];
+  shared[threadIdx.x] = token;
+  __syncthreads();
+  for (std::uint32_t offset = kArgmaxThreads / 2U; offset > 0U; offset /= 2U) {
+    if (threadIdx.x < offset) {
+      shared[threadIdx.x] =
+          min(shared[threadIdx.x], shared[threadIdx.x + offset]);
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0U &&
+      shared[0] != std::numeric_limits<std::uint32_t>::max()) {
+    atomicMin(output_token, shared[0]);
+  }
+}
+
 __global__ void TextArgmaxKernel(const float* logits,
                                  std::uint32_t* output_token, std::size_t count,
                                  float tie_tolerance) {
@@ -499,13 +1056,157 @@ void LaunchTextBfloat16ToFloat(const void* input_bfloat16, float* output,
   }
 }
 
+void LaunchTextEmbeddingLookup(const void* table_bfloat16,
+                               const std::uint32_t* token_ids, float* output,
+                               std::size_t batch_size, std::size_t hidden_size,
+                               hipStream_t stream) {
+  if (batch_size == 0U || hidden_size == 0U) {
+    return;
+  }
+  constexpr unsigned int kBlock = 256;
+  const dim3 grid(
+      static_cast<unsigned int>((hidden_size + kBlock - 1U) / kBlock),
+      static_cast<unsigned int>(batch_size));
+  TextEmbeddingLookupKernel<<<grid, kBlock, 0, stream>>>(
+      static_cast<const hip_bfloat16*>(table_bfloat16), token_ids, output,
+      batch_size, hidden_size);
+}
+
+void LaunchTextRowGemv(const void* weights_bfloat16, const float* input,
+                       float* output, std::size_t rows, std::size_t columns,
+                       hipStream_t stream) {
+  if (rows == 0U || columns == 0U) {
+    return;
+  }
+  constexpr std::uint32_t kWaves = 4;
+  const auto blocks = static_cast<unsigned int>((rows + kWaves - 1U) / kWaves);
+  TextRowGemvKernel<kWaves><<<blocks, kWaves * 32, 0, stream>>>(
+      static_cast<const hip_bfloat16*>(weights_bfloat16), input, output, rows,
+      columns);
+}
+
+void LaunchTextBatchedAttention(
+    const float* query, const float* key_cache, const float* value_cache,
+    float* out_context, void* out_context_bfloat16, std::uint32_t layer_index,
+    std::uint32_t start_position, std::size_t tokens, std::uint32_t max_context,
+    std::uint32_t num_heads, std::uint32_t num_key_value_heads,
+    std::uint32_t head_dim, hipStream_t stream) {
+  if (tokens == 0U || num_heads == 0U || num_key_value_heads == 0U) {
+    return;
+  }
+  const dim3 grid(num_heads, static_cast<unsigned int>(tokens));
+  const std::size_t sequence =
+      static_cast<std::size_t>(start_position) + tokens;
+  TextBatchedAttentionKernel<<<grid, 256, sequence * sizeof(float), stream>>>(
+      query, key_cache, value_cache, out_context,
+      static_cast<hip_bfloat16*>(out_context_bfloat16), layer_index,
+      start_position, tokens, max_context, num_heads, num_key_value_heads,
+      head_dim);
+}
+
+bool LaunchTextDecodeAttention(
+    const float* query, const float* key_cache, const float* value_cache,
+    float* out_context, void* out_context_bfloat16, std::uint32_t layer_index,
+    std::uint32_t position, std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_key_value_heads, std::uint32_t head_dim,
+    hipStream_t stream) {
+  const std::size_t sequence = static_cast<std::size_t>(position) + 1U;
+  if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
+      out_context == nullptr || num_heads == 0U || num_key_value_heads == 0U ||
+      head_dim == 0U || head_dim % 4U != 0U ||
+      head_dim > kDecodeAttentionThreads ||
+      num_heads % num_key_value_heads != 0U || sequence > max_context ||
+      sequence < kDecodeAttentionMinSequence) {
+    return false;
+  }
+  TextDecodeAttentionKernel<<<num_heads, kDecodeAttentionThreads,
+                              sequence * sizeof(float), stream>>>(
+      query, key_cache, value_cache, out_context,
+      static_cast<hip_bfloat16*>(out_context_bfloat16), layer_index, position,
+      max_context, num_heads, num_key_value_heads, head_dim);
+  return true;
+}
+
+bool LaunchTextDecodeGemv(const TextDecodeGemvTensor* tensors,
+                          std::uint32_t count, const void* input_bfloat16,
+                          std::size_t columns, hipStream_t stream) {
+  // The kernel loads sixteen bytes at a time and stages the activation vector
+  // in LDS, so it needs an eight-element column multiple, aligned bases, and a
+  // vector that fits the 64 KB shared-memory limit for one workgroup.
+  constexpr std::size_t kAlignment = 16;
+  constexpr std::size_t kMaxSharedBytes = 64U * 1024U;
+  if (tensors == nullptr || count == 0U || count > kTextDecodeGemvMaxTensors ||
+      input_bfloat16 == nullptr || columns == 0U || columns % 8U != 0U) {
+    return false;
+  }
+  const std::size_t k_vectors = columns / 8U;
+  if (k_vectors * kAlignment > kMaxSharedBytes) {
+    return false;
+  }
+  if (reinterpret_cast<std::uintptr_t>(input_bfloat16) % kAlignment != 0U) {
+    return false;
+  }
+
+  DecodeGemvTensors packed{};
+  packed.count = count;
+  std::uint64_t total_rows = 0U;
+  for (std::uint32_t index = 0U; index < count; ++index) {
+    const TextDecodeGemvTensor& tensor = tensors[index];
+    if (tensor.weights_bfloat16 == nullptr || tensor.output == nullptr ||
+        tensor.rows == 0U ||
+        reinterpret_cast<std::uintptr_t>(tensor.weights_bfloat16) %
+                kAlignment !=
+            0U) {
+      return false;
+    }
+    packed.weights[index] =
+        static_cast<const hip_bfloat16*>(tensor.weights_bfloat16);
+    packed.outputs[index] = tensor.output;
+    packed.first_row[index] = static_cast<std::uint32_t>(total_rows);
+    total_rows += tensor.rows;
+  }
+  if (total_rows > std::numeric_limits<std::uint32_t>::max()) {
+    return false;
+  }
+  packed.total_rows = static_cast<std::uint32_t>(total_rows);
+
+  const unsigned int blocks = static_cast<unsigned int>(
+      (total_rows + kDecodeGemvWavesPerBlock - 1U) / kDecodeGemvWavesPerBlock);
+  TextDecodeGemvKernel<<<blocks, kDecodeGemvBlockThreads,
+                         k_vectors * kAlignment, stream>>>(
+      packed, static_cast<const hip_bfloat16*>(input_bfloat16),
+      static_cast<std::uint32_t>(k_vectors));
+  return true;
+}
+
 void LaunchTextArgmax(const float* logits, std::uint32_t* output_token,
-                      std::size_t count, float tie_tolerance,
+                      std::size_t count, float tie_tolerance, float* scratch,
                       hipStream_t stream) {
-  if (count != 0U) {
+  if (count == 0U) {
+    return;
+  }
+  // Four elements per thread amortizes the in-block reduction; a vocabulary too
+  // small to fill even one block is not worth three dispatches.
+  constexpr std::uint32_t kElementsPerThread = 4;
+  constexpr std::size_t kElementsPerBlock = kArgmaxThreads * kElementsPerThread;
+  if (scratch == nullptr || count <= kElementsPerBlock) {
     TextArgmaxKernel<<<1, 256, 0, stream>>>(logits, output_token, count,
                                             tie_tolerance);
+    return;
   }
+  const auto blocks = static_cast<std::uint32_t>(std::min<std::size_t>(
+      kArgmaxBlocks, (count + kElementsPerBlock - 1U) / kElementsPerBlock));
+  float* threshold = scratch + kArgmaxBlocks;
+  TextArgmaxPartialMaxKernel<<<blocks, kArgmaxThreads, 0, stream>>>(
+      logits, scratch, count);
+  TextArgmaxThresholdKernel<<<1, kArgmaxBlocks, 0, stream>>>(
+      scratch, blocks, threshold, output_token, tie_tolerance);
+  TextArgmaxSelectKernel<<<blocks, kArgmaxThreads, 0, stream>>>(
+      logits, threshold, output_token, count);
+}
+
+std::size_t TextArgmaxScratchElements() {
+  return kArgmaxBlocks + 1U;
 }
 
 }  // namespace gufo::models::qwen3_asr::hip

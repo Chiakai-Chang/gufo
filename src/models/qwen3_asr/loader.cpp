@@ -14,12 +14,10 @@
 #include <string_view>
 #include <utility>
 
-#include "src/models/qwen3_tts/json.hpp"
+#include "src/models/qwen3_asr/json.hpp"
 
 namespace gufo::models::qwen3_asr {
 namespace {
-
-namespace json = gufo::models::qwen3_tts::json;
 
 class MappedFile {
 public:

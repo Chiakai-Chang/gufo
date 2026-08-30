@@ -201,9 +201,23 @@ __global__ void BiasGeluToBfloat16Kernel(const float* input,
       hip_bfloat16(0.5F * biased * (1.0F + erff(biased * kInverseSqrtTwo)));
 }
 
+// Largest head dimension the register-resident query path covers. The audio
+// tower is 1024 hidden over 16 heads, so 64.
+constexpr std::size_t kAttentionMaxHeadDim = 64;
+
+/// Number of value rows prefetched before the first is accumulated.
+constexpr std::size_t kAttentionValueUnroll = 8;
+
+// `Vectorized` holds the query row in registers and reads both score operands
+// sixteen bytes at a time instead of one float at a time, and prefetches value
+// rows. Every fmaf chain keeps its ascending order and single accumulator, so
+// both instantiations produce bit-identical results; the generic one remains
+// for head dimensions the fast path does not cover.
+template<bool Vectorized>
 __global__ void SegmentedSelfAttentionKernel(
-    const float* query, const float* key, const float* value, float* output,
-    hip_bfloat16* output_bfloat16, std::size_t tokens,
+    const float* __restrict__ query, const float* __restrict__ key,
+    const float* __restrict__ value, float* __restrict__ output,
+    hip_bfloat16* __restrict__ output_bfloat16, std::size_t tokens,
     std::size_t segment_tokens, std::size_t heads, std::size_t head_dim) {
   const std::size_t query_token = blockIdx.x;
   const std::size_t head = blockIdx.y;
@@ -214,15 +228,38 @@ __global__ void SegmentedSelfAttentionKernel(
   extern __shared__ float shared[];
   float* scores = shared;
   float* reduction = shared + segment_length;
+  const std::size_t query_base = (query_token * heads + head) * head_dim;
+  // The query row is the same for every key this block scores, so it is read
+  // once rather than once per key.
+  float4 query_row[kAttentionMaxHeadDim / 4];
+  if (Vectorized) {
+    const auto* query_vec = reinterpret_cast<const float4*>(query + query_base);
+    for (std::size_t vector = 0; vector < head_dim / 4U; ++vector) {
+      query_row[vector] = query_vec[vector];
+    }
+  }
+
   float local_max = -INFINITY;
   for (std::size_t offset = threadIdx.x; offset < segment_length;
        offset += blockDim.x) {
     const std::size_t key_token = segment_begin + offset;
     float dot = 0.0F;
-    const std::size_t query_base = (query_token * heads + head) * head_dim;
     const std::size_t key_base = (key_token * heads + head) * head_dim;
-    for (std::size_t dimension = 0; dimension < head_dim; ++dimension) {
-      dot = fmaf(query[query_base + dimension], key[key_base + dimension], dot);
+    if (Vectorized) {
+      const auto* key_vec = reinterpret_cast<const float4*>(key + key_base);
+      for (std::size_t vector = 0; vector < head_dim / 4U; ++vector) {
+        const float4 k = key_vec[vector];
+        const float4 q = query_row[vector];
+        dot = fmaf(q.x, k.x, dot);
+        dot = fmaf(q.y, k.y, dot);
+        dot = fmaf(q.z, k.z, dot);
+        dot = fmaf(q.w, k.w, dot);
+      }
+    } else {
+      for (std::size_t dimension = 0; dimension < head_dim; ++dimension) {
+        dot =
+            fmaf(query[query_base + dimension], key[key_base + dimension], dot);
+      }
     }
     const float product = static_cast<float>(hip_bfloat16(dot));
     const float score = static_cast<float>(
@@ -264,12 +301,28 @@ __global__ void SegmentedSelfAttentionKernel(
   __syncthreads();
 
   if (threadIdx.x < head_dim) {
+    const float* value_column =
+        value + ((segment_begin * heads + head) * head_dim) + threadIdx.x;
+    const std::size_t row_stride = heads * head_dim;
     float context = 0.0F;
-    for (std::size_t offset = 0; offset < segment_length; ++offset) {
-      const std::size_t key_token = segment_begin + offset;
-      const std::size_t value_index =
-          (key_token * heads + head) * head_dim + threadIdx.x;
-      context = fmaf(scores[offset], value[value_index], context);
+    std::size_t offset = 0;
+    if (Vectorized) {
+      for (; offset + kAttentionValueUnroll <= segment_length;
+           offset += kAttentionValueUnroll) {
+        float rows[kAttentionValueUnroll];
+#pragma unroll
+        for (std::size_t slot = 0; slot < kAttentionValueUnroll; ++slot) {
+          rows[slot] = value_column[(offset + slot) * row_stride];
+        }
+#pragma unroll
+        for (std::size_t slot = 0; slot < kAttentionValueUnroll; ++slot) {
+          context = fmaf(scores[offset + slot], rows[slot], context);
+        }
+      }
+    }
+    for (; offset < segment_length; ++offset) {
+      context =
+          fmaf(scores[offset], value_column[offset * row_stride], context);
     }
     const std::size_t output_index =
         (query_token * heads + head) * head_dim + threadIdx.x;
@@ -366,7 +419,17 @@ void LaunchSegmentedSelfAttention(const float* query, const float* key,
   const dim3 grid(tokens, heads);
   const std::size_t shared =
       (segment_tokens + kAttentionThreads) * sizeof(float);
-  hipLaunchKernelGGL(SegmentedSelfAttentionKernel, grid,
+  const bool vectorized =
+      head_dim % 4U == 0U && head_dim <= kAttentionMaxHeadDim;
+  if (vectorized) {
+    hipLaunchKernelGGL(SegmentedSelfAttentionKernel<true>, grid,
+                       dim3(kAttentionThreads), shared, stream, query, key,
+                       value, output,
+                       static_cast<hip_bfloat16*>(output_bfloat16), tokens,
+                       segment_tokens, heads, head_dim);
+    return;
+  }
+  hipLaunchKernelGGL(SegmentedSelfAttentionKernel<false>, grid,
                      dim3(kAttentionThreads), shared, stream, query, key, value,
                      output, static_cast<hip_bfloat16*>(output_bfloat16),
                      tokens, segment_tokens, heads, head_dim);

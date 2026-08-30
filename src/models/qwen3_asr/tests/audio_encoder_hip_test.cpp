@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -172,7 +173,8 @@ int main() {
   }
   const double relative_l2 = std::sqrt(squared_error / squared_reference);
   const double cosine = Cosine(actual.values, expected.values);
-  std::cout << "qwen3_asr_audio_frontend tokens=" << actual.tokens
+  std::cout << std::defaultfloat << std::setprecision(6)
+            << "qwen3_asr_audio_frontend tokens=" << actual.tokens
             << " cosine=" << cosine << " relL2=" << relative_l2
             << " max_abs=" << maximum_error << '\n';
   Check(cosine > 0.9999 && relative_l2 < 0.02,
@@ -195,7 +197,8 @@ int main() {
     }
     const double relative_l2 = std::sqrt(squared_error / squared_reference);
     const double cosine = Cosine(actual, reference);
-    std::cout << name << " cosine=" << cosine << " relL2=" << relative_l2
+    std::cout << std::defaultfloat << std::setprecision(6) << name
+              << " cosine=" << cosine << " relL2=" << relative_l2
               << " max_abs=" << maximum_error << '\n';
     return std::pair(cosine, relative_l2);
   };
