@@ -733,8 +733,12 @@ __launch_bounds__(256) __global__
 // inner loop to hit the register target costs more than the extra wave returns,
 // so this kernel is latency-bound rather than occupancy-bound.
 template<int BM, int BN, int BK, int WM, int WN, core::GgmlType WType,
-         bool UsePrecomputedSums, bool StagePrecomputedSums>
-__launch_bounds__(256) __global__
+         bool UsePrecomputedSums, bool StagePrecomputedSums,
+         bool ForceOccupancy = false>
+// `ForceOccupancy` asks the allocator for eight wave32s per SIMD instead of
+// letting it settle. It exists only so the 512-thread tile can be measured at
+// two workgroups per CU as well as one; see the opt-q4kxl-wide write-up.
+__launch_bounds__(WM * WN * 32, ForceOccupancy ? 8 : 1) __global__
     void WKQuantA8BlockedWmmaGEMMKernel(const void* __restrict__ w,
                                         const void* __restrict__ x_blocks,
                                         float* __restrict__ y,
@@ -747,16 +751,27 @@ __launch_bounds__(256) __global__
   constexpr bool HasOffset =
       WType == core::GgmlType::kQ4_K || WType == core::GgmlType::kQ5_K;
   static_assert(!StagePrecomputedSums || UsePrecomputedSums);
-  static_assert(WM * WN == 8, "256 threads is 8 waves");
+  // The block is WM*WN waves of 32 lanes. Eight waves (256 threads) is the
+  // production shape; sixteen waves (512 threads) is what makes BN=256
+  // reachable at all, because the accumulator array is BM*BN/threads registers
+  // and BM*BN is otherwise pinned at 128*128.
+  static_assert(WM * WN == 8 || WM * WN == 16, "8 or 16 wave32s per block");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
-  static_assert(BN / 16 <= 8,
-                "the activation stage assigns one wave per token subtile");
+  constexpr int kThreads = WM * WN * 32;
+  constexpr int kWaves = WM * WN;
+  static_assert(BN / 16 <= kWaves || (BN / 16) % kWaves == 0,
+                "token subtiles must divide evenly across the waves");
   constexpr int kRowTiles = BM / 16;
   constexpr int kTokTiles = BN / 16;
   constexpr int kWaveRowTiles = kRowTiles / WM;
   constexpr int kWaveTokTiles = kTokTiles / WN;
   constexpr int kScaleHalves = PerHalfScale ? 2 : 1;
   constexpr int kOffRowTiles = HasOffset ? kRowTiles : 1;
+  // Token subtiles are staged one per wave. A macro tile with more subtiles
+  // than waves gives each wave several, which is what lets BN grow without
+  // growing the block: BM=64/BN=256 keeps the same BM*BN/threads accumulator
+  // and the same eight-wave workgroup as BM=128/BN=128.
+  constexpr int kStageTiles = (kTokTiles + kWaves - 1) / kWaves;
 
   __shared__ int32x4_t s_a[BK][kRowTiles][32];
   __shared__ float s_dw[BK][kScaleHalves][kRowTiles][16];
@@ -793,16 +808,23 @@ __launch_bounds__(256) __global__
     }
   }
 
-  constexpr int kPrefetch = (BM * BK) / 256;
+  // One fetch unit is one (row, K-block) pair, decoded as two sub-16 blocks.
+  // At 256 threads every configuration has at least one unit per thread and the
+  // indexing below reduces to what it was. At 512 threads with BK=2 there are
+  // only BM*BK = 256 units, so half the block sits out the weight half of the
+  // stage; keeping BK=2 rather than growing it to 4 is what holds LDS at 30 KB
+  // and therefore two resident workgroups.
+  constexpr int kFetchUnits = BM * BK;
+  constexpr int kPrefetch = (kFetchUnits + kThreads - 1) / kThreads;
+  constexpr bool kPartialFetch = (kPrefetch * kThreads) != kFetchUnits;
   int32x4_t r_q0[kPrefetch];
   int32x4_t r_q1[kPrefetch];
   float r_dw0[kPrefetch];
   float r_dw1[kPrefetch];
   float r_off[kPrefetch];
-  int32x4_t r_b[BK];
-  float r_dx[BK];
-  float r_sx[StagePrecomputedSums && HasOffset ? BK : 1];
-  const int b_tile = wave_id;
+  int32x4_t r_b[kStageTiles][BK];
+  float r_dx[kStageTiles][BK];
+  float r_sx[kStageTiles][StagePrecomputedSums && HasOffset ? BK : 1];
 
   // Row bases and liveness are hoisted exactly as in the Q8_0 kernel: an
   // out-of-range row is clamped to a valid address and its scale (and offset)
@@ -813,22 +835,45 @@ __launch_bounds__(256) __global__
   float row_live[kPrefetch];
 #pragma unroll
   for (int p = 0; p < kPrefetch; ++p) {
-    const int r = static_cast<int>(r_block) + (((p * 256) + tid) / BK);
+    const int idx = (p * kThreads) + tid;
+    const bool unit_live = !kPartialFetch || idx < kFetchUnits;
+    const int idx_clamped = unit_live ? idx : 0;
+    const int r = static_cast<int>(r_block) + (idx_clamped / BK);
     const int r_clamped = (r < m_i) ? r : (m_i - 1);
     w_row[p] = static_cast<const std::uint8_t*>(w) +
                (static_cast<std::size_t>(r_clamped) * row_bytes);
-    row_live[p] = (r < m_i) ? 1.0F : 0.0F;
+    row_live[p] = (r < m_i && unit_live) ? 1.0F : 0.0F;
   }
-  const auto* b_base = reinterpret_cast<const std::int8_t*>(x_blocks) +
-                       ((tt_block + static_cast<std::size_t>(b_tile)) *
-                        num_blocks * kQ8ActTileBytes);
-  const bool b_live = b_tile < kTokTiles;
+  // The staged activation buffer holds exactly ceil(batch / 16) token tiles.
+  // A macro tile wider than the tail reaches past it, so an out-of-range tile
+  // is clamped to tile 0 and its scale zeroed -- the same trick the row bases
+  // use, and the reason a 256-token tile can be launched on any batch at all.
+  const std::size_t num_act_tiles =
+      (batch + kQ8ActTileTokens - 1) / kQ8ActTileTokens;
+  int b_tile[kStageTiles];
+  const std::int8_t* b_base[kStageTiles];
+  std::size_t act_tile[kStageTiles];
+  float tile_scale[kStageTiles];
+  bool b_live[kStageTiles];
+#pragma unroll
+  for (int t = 0; t < kStageTiles; ++t) {
+    b_tile[t] = wave_id + (t * kWaves);
+    const std::size_t wanted = tt_block + static_cast<std::size_t>(b_tile[t]);
+    const bool live = (b_tile[t] < kTokTiles) && (wanted < num_act_tiles);
+    act_tile[t] = live ? wanted : 0;
+    tile_scale[t] = live ? 1.0F : 0.0F;
+    b_live[t] = b_tile[t] < kTokTiles;
+    b_base[t] = reinterpret_cast<const std::int8_t*>(x_blocks) +
+                (act_tile[t] * num_blocks * kQ8ActTileBytes);
+  }
   const float* activation_sums = Q8ActSumSidecar(x_blocks, batch, k);
 
   const auto fetch_stage = [&](int kb0) {
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
-      const int kb = kb0 + (((p * 256) + tid) % BK);
+      const int idx = (p * kThreads) + tid;
+      const int idx_clamped = (!kPartialFetch || idx < kFetchUnits) ? idx : 0;
+      const int kb = kb0 + (idx_clamped % BK);
       const int kb_clamped = (kb < num_kb) ? kb : (num_kb - 1);
       const float live = (kb < num_kb) ? row_live[p] : 0.0F;
       QuantSub16 lo;
@@ -845,25 +890,27 @@ __launch_bounds__(256) __global__
         r_off[p] = lo.offset * live;
       }
     }
-    if (b_live) {
+#pragma unroll
+    for (int t = 0; t < kStageTiles; ++t) {
+      if (!b_live[t]) {
+        continue;
+      }
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
         const int kb = kb0 + i;
         const int kb_clamped = (kb < num_kb) ? kb : (num_kb - 1);
-        const auto* tile =
-            b_base + (static_cast<std::size_t>(kb_clamped) * kQ8ActTileBytes);
-        r_b[i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
-        r_dx[i] = ((kb < num_kb) ? 1.0F : 0.0F) *
-                  reinterpret_cast<const float*>(
-                      tile + kQ8ActScaleOffset)[lane_id & 15];
+        const auto* tile = b_base[t] + (static_cast<std::size_t>(kb_clamped) *
+                                        kQ8ActTileBytes);
+        r_b[t][i] = reinterpret_cast<const int32x4_t*>(tile)[lane_id];
+        r_dx[t][i] = ((kb < num_kb) ? tile_scale[t] : 0.0F) *
+                     reinterpret_cast<const float*>(
+                         tile + kQ8ActScaleOffset)[lane_id & 15];
         if constexpr (StagePrecomputedSums && HasOffset) {
-          const std::size_t token_tile =
-              tt_block + static_cast<std::size_t>(b_tile);
-          r_sx[i] = ((kb < num_kb) ? 1.0F : 0.0F) *
-                    activation_sums[(((token_tile * num_blocks) +
-                                      static_cast<std::size_t>(kb_clamped)) *
-                                     kQ8ActTileTokens) +
-                                    static_cast<std::size_t>(lane_id & 15)];
+          r_sx[t][i] = ((kb < num_kb) ? tile_scale[t] : 0.0F) *
+                       activation_sums[(((act_tile[t] * num_blocks) +
+                                         static_cast<std::size_t>(kb_clamped)) *
+                                        kQ8ActTileTokens) +
+                                       static_cast<std::size_t>(lane_id & 15)];
         }
       }
     }
@@ -872,7 +919,12 @@ __launch_bounds__(256) __global__
   const auto commit_stage = [&]() {
 #pragma unroll
     for (int p = 0; p < kPrefetch; ++p) {
-      const int idx = (p * 256) + tid;
+      const int idx = (p * kThreads) + tid;
+      if constexpr (kPartialFetch) {
+        if (idx >= kFetchUnits) {
+          continue;
+        }
+      }
       const int rr = idx / BK;
       const int kk = idx % BK;
       const int rs = rr / 16;
@@ -888,14 +940,18 @@ __launch_bounds__(256) __global__
         s_off[kk][rs][slot] = r_off[p];
       }
     }
-    if (b_live) {
+#pragma unroll
+    for (int t = 0; t < kStageTiles; ++t) {
+      if (!b_live[t]) {
+        continue;
+      }
 #pragma unroll
       for (int i = 0; i < BK; ++i) {
-        s_b[i][b_tile][lane_id] = r_b[i];
+        s_b[i][b_tile[t]][lane_id] = r_b[t][i];
         if (lane_id < 16) {
-          s_dx[i][b_tile][lane_id] = r_dx[i];
+          s_dx[i][b_tile[t]][lane_id] = r_dx[t][i];
           if constexpr (StagePrecomputedSums && HasOffset) {
-            s_sx[i][b_tile][lane_id] = r_sx[i];
+            s_sx[i][b_tile[t]][lane_id] = r_sx[t][i];
           }
         }
       }
@@ -982,12 +1038,15 @@ __launch_bounds__(256) __global__
             if constexpr (StagePrecomputedSums) {
               sx = s_sx[kb][ts][sub_lane];
             } else {
-              const std::size_t token_tile =
+              const std::size_t wanted_tile =
                   tt_block + static_cast<std::size_t>(ts);
+              const bool sum_live = wanted_tile < num_act_tiles;
+              const std::size_t token_tile = sum_live ? wanted_tile : 0;
               const int global_kb = kb0 + kb;
               const std::size_t activation_block = static_cast<std::size_t>(
                   global_kb < num_kb ? global_kb : num_kb - 1);
-              sx = activation_sums[(((token_tile * num_blocks) +
+              sx = (sum_live ? 1.0F : 0.0F) *
+                   activation_sums[(((token_tile * num_blocks) +
                                      activation_block) *
                                     kQ8ActTileTokens) +
                                    static_cast<std::size_t>(sub_lane)];
@@ -1041,8 +1100,20 @@ __launch_bounds__(256) __global__
   }
 
   __syncthreads();
+  // Each wave stages its 16x16 output tile through 256 floats of LDS. `s_a` is
+  // BK*kRowTiles*512 bytes, which is exactly kWaves*1024 at 256 threads; the
+  // 512-thread shape needs 16 KB, which is what `s_b` is at BK=2 with BN=256.
+  // Pick whichever staging array actually covers the requirement -- both are
+  // dead by this point, and the __syncthreads above orders the reuse.
+  constexpr int kEpilogueBytes = kWaves * 256 * static_cast<int>(sizeof(float));
+  constexpr bool kEpilogueInA = static_cast<int>(sizeof(s_a)) >= kEpilogueBytes;
+  static_assert(
+      kEpilogueInA || static_cast<int>(sizeof(s_b)) >= kEpilogueBytes,
+      "no staging array is large enough to hold every wave's output tile");
   float* tile_scratch =
-      reinterpret_cast<float*>(&s_a[0][0][0]) + (wave_id * 256);
+      (kEpilogueInA ? reinterpret_cast<float*>(&s_a[0][0][0])
+                    : reinterpret_cast<float*>(&s_b[0][0][0])) +
+      (wave_id * 256);
 #pragma unroll
   for (int i = 0; i < kWaveRowTiles; ++i) {
 #pragma unroll
@@ -1953,6 +2024,41 @@ void LaunchKQuantWmmaGEMMTypedImpl(const void* w, const void* q8_1_x, float* y,
   }
   if (batch >= 96) {
     constexpr int kBM = 128;
+    // opt-q4kxl-wide: 128x256 over sixteen waves. Same 64-register accumulator
+    // as the 256-thread tile, half the weight re-decode count.
+    const auto tile = detail::KQuantPrefillTileFromEnv();
+    if (tile == detail::KQuantPrefillTile::kNarrowRows) {
+      // opt-q4kxl-wide, second shape: BN=256 with BM=64 keeps BM*BN/256 = 64
+      // accumulator registers and the eight-wave workgroup, so the CU can
+      // still hold three blocks. BK has to drop to 1 because a 256-token
+      // activation stage is 8 KB per K block.
+      constexpr int kNarrowBM = 64;
+      constexpr int kNarrowBN = 256;
+      const dim3 narrow_grid(
+          static_cast<unsigned int>((batch + kNarrowBN - 1) / kNarrowBN),
+          static_cast<unsigned int>((m + kNarrowBM - 1) / kNarrowBM));
+      WKQuantA8BlockedWmmaGEMMKernel<kNarrowBM, kNarrowBN, 1, 2, 4, WType,
+                                     UsePrecomputedSums, StagePrecomputedSums>
+          <<<narrow_grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
+      return;
+    }
+    if (tile != detail::KQuantPrefillTile::kDefault) {
+      constexpr int kWideBN = 256;
+      const dim3 wide_grid(
+          static_cast<unsigned int>((batch + kWideBN - 1) / kWideBN),
+          static_cast<unsigned int>((m + kBM - 1) / kBM));
+      if (tile == detail::KQuantPrefillTile::kWideForcedOccupancy) {
+        WKQuantA8BlockedWmmaGEMMKernel<kBM, kWideBN, 2, 4, 4, WType,
+                                       UsePrecomputedSums, StagePrecomputedSums,
+                                       true>
+            <<<wide_grid, 512, 0, stream>>>(w, q8_1_x, y, batch, m, k);
+        return;
+      }
+      WKQuantA8BlockedWmmaGEMMKernel<kBM, kWideBN, 2, 4, 4, WType,
+                                     UsePrecomputedSums, StagePrecomputedSums>
+          <<<wide_grid, 512, 0, stream>>>(w, q8_1_x, y, batch, m, k);
+      return;
+    }
     constexpr int kBN = 128;
     const dim3 grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
                     static_cast<unsigned int>((m + kBM - 1) / kBM));

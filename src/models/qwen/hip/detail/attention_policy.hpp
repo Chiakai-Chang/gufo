@@ -210,6 +210,47 @@ KQuantActivationSumModeFromEnv() noexcept {
   return mode;
 }
 
+// opt-q4kxl-wide: the blocked K-quant WMMA prefill tile. Every weight element
+// is decoded once per token block, so the decode cost the K-quants pay over
+// Q8_0 scales with ceil(batch / BN). BN is pinned by the accumulator array,
+// which is BM*BN/threads registers: at 256 threads BM*BN cannot exceed
+// 128*128, which fixes the re-decode count at 16 for a 2048-token prefill.
+// A 512-thread block keeps the same 64-register accumulator at BM=128/BN=256
+// and halves the re-decode count to 8.
+//
+// `default` pins the retained 128x128 / 256-thread tile; `wide` selects the
+// 128x256 / 512-thread tile for the large-batch route only. Both stay
+// runnable so the comparison can be re-measured.
+enum class KQuantPrefillTile : std::uint8_t {
+  kDefault,
+  kWide,
+  kWideForcedOccupancy,
+  kNarrowRows,
+};
+
+[[nodiscard]] inline KQuantPrefillTile ResolveKQuantPrefillTile(
+    const char* value) noexcept {
+  if (value == nullptr) {
+    return KQuantPrefillTile::kDefault;
+  }
+  const std::string_view text{value};
+  if (text == "wide-occ" || text == "wide8") {
+    return KQuantPrefillTile::kWideForcedOccupancy;
+  }
+  if (text == "narrow" || text == "64x256") {
+    return KQuantPrefillTile::kNarrowRows;
+  }
+  return text == "wide" || text == "256" || text == "1"
+             ? KQuantPrefillTile::kWide
+             : KQuantPrefillTile::kDefault;
+}
+
+[[nodiscard]] inline KQuantPrefillTile KQuantPrefillTileFromEnv() noexcept {
+  static const KQuantPrefillTile tile =
+      ResolveKQuantPrefillTile(std::getenv("GUFO_KQUANT_PREFILL_TILE"));
+  return tile;
+}
+
 [[nodiscard]] inline bool ShouldStoreKQuantActivationSums() noexcept {
   return KQuantActivationSumModeFromEnv() !=
          KQuantActivationSumMode::kReference;

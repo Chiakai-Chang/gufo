@@ -408,6 +408,10 @@ int main() {
   for (const auto& format : kFormats) {
     TestPrefillGemm(format, 4);
     TestPrefillGemm(format, 128);
+    // 128 is narrower and 288 wider than the 256-token macro tile the wide
+    // route launches, so between them they cover a partially and a fully
+    // populated token block plus a ragged tail.
+    TestPrefillGemm(format, 288);
   }
   for (const auto& format : kFormats) {
     if (format.type == gufo::core::GgmlType::kQ8_0) {

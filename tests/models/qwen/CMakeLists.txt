@@ -198,6 +198,19 @@ if (ENGINE_ENABLE_HIP)
     LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-actsum"
     ENVIRONMENT "GUFO_KQUANT_ACTIVATION_SUMS=0"
     SKIP_RETURN_CODE 77)
+  # opt-q4kxl-wide: the 128x256 sixteen-wave prefill macro tile.
+  add_test(NAME qwen_q4kxl_quant_wide_tile_ops_test
+    COMMAND qwen_q4kxl_quant_ops_test)
+  set_tests_properties(qwen_q4kxl_quant_wide_tile_ops_test PROPERTIES
+    LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-wide"
+    ENVIRONMENT "GUFO_KQUANT_PREFILL_TILE=wide"
+    SKIP_RETURN_CODE 77)
+  add_test(NAME qwen_q4kxl_quant_narrow_tile_ops_test
+    COMMAND qwen_q4kxl_quant_ops_test)
+  set_tests_properties(qwen_q4kxl_quant_narrow_tile_ops_test PROPERTIES
+    LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-wide"
+    ENVIRONMENT "GUFO_KQUANT_PREFILL_TILE=narrow"
+    SKIP_RETURN_CODE 77)
   add_test(NAME qwen_q4kxl_quant_activation_sums_direct_ops_test
     COMMAND qwen_q4kxl_quant_ops_test)
   set_tests_properties(qwen_q4kxl_quant_activation_sums_direct_ops_test PROPERTIES

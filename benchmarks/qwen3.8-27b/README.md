@@ -546,6 +546,116 @@ request exercised DFlash-2 (40.8-75.3% draft acceptance in server telemetry),
 so this is a behavioral validation of the speculative path rather than only a
 model-load smoke test.
 
+### Prefill macro-tile width (`opt-q4kxl-wide`)
+
+The prefill gap is arithmetic, and the largest single arithmetic term that is
+structurally avoidable is the weight re-decode. Every weight element of a
+blocked GEMM is decoded once per token block, so the K-quants pay their extra
+decode cost `ceil(batch / BN)` times -- sixteen times for a 2048-token prefill
+at the production `BN = 128`. `BN = 256` would halve that. It was previously
+ruled out because the accumulator array is exactly `BM*BN/threads` registers,
+which caps `BM*BN` at `128*128` on a 256-thread block.
+
+Both shapes that lift that cap were built and measured, and both lose.
+
+`GUFO_KQUANT_PREFILL_TILE` selects between them: `default` (production
+128x128 over eight waves), `wide` (128x256 over sixteen waves), `wide-occ`
+(the same at a forced eight waves per SIMD) and `narrow` (64x256 over eight
+waves). The blocked kernel is now templated on its wave count rather than
+assuming 256 threads, and stages several token subtiles per wave when the
+macro tile has more subtiles than waves.
+
+rocprofv3 resource table, Q4_K / Q5_K instantiations:
+
+| Tile | Threads | SGPR | VGPR | LDS | Scratch |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 128x128 BK=2 WM=4/WN=2 (production) | 256 | 128 | 240 | 19,456-20,480 | 0 |
+| 128x256 BK=2 WM=4/WN=4 (`wide`) | 512 | 128 | 240 | 28,672-30,720 | 0 |
+| 128x256 forced 8 waves/SIMD (`wide-occ`) | 512 | 128 | 192 | 28,672-30,720 | 12-252 |
+| 64x256 BK=1 WM=2/WN=4 (`narrow`) | 256 | 128 | 192-208 | 11,520-12,800 | 0 |
+
+Interleaved single-repetition `pp2048` on the UD-Q4_K_XL shard, host load
+1.1-1.4, every column from the same binary:
+
+| Round | `default` | `wide` | `wide-occ` |
+| --- | ---: | ---: | ---: |
+| 1 | 469.68 | 416.73 | 338.85 |
+| 2 | 467.36 | 413.83 | 336.90 |
+| 3 | 465.35 | 411.94 | 337.16 |
+| 4 | 464.33 | 409.82 | 335.99 |
+| **Median** | **466.36** | **412.89 (-11.5%)** | **337.03 (-27.7%)** |
+
+| Round | `default` | `narrow` |
+| --- | ---: | ---: |
+| 1 | 474.63 | 361.05 |
+| 2 | 469.27 | 360.66 |
+| 3 | 466.95 | 357.57 |
+| 4 | 464.79 | 355.59 |
+| **Median** | **468.11** | **359.12 (-23.3%)** |
+
+Every candidate loses 4/4 pairs.
+
+**Why.** At 240 VGPR a wave32 SIMD holds six waves, so a CU holds twenty-four.
+Eight-wave workgroups pack three of those; sixteen-wave workgroups would need
+thirty-two for two, so only **one** is resident and occupancy falls from six to
+four waves per SIMD. Halving the re-decode does not pay for losing a third of
+the occupancy on a kernel already shown to be latency- rather than
+occupancy-bound. Forcing eight waves per SIMD restores the wave count on paper
+but costs 192-VGPR rematerialization and spills 12-252 private bytes per lane,
+landing 18% below the plain wide tile -- the same failure the earlier
+`__launch_bounds__(256, 8)` experiment produced.
+
+The `narrow` shape is the controlled version of the experiment: `BM*BN/threads`
+is 64 registers for 64x256 at 256 threads exactly as it is for 128x128, so
+occupancy stays at three eight-wave workgroups and LDS actually *drops* to
+11.5-12.8 KB. It still loses 23%, because `BN = 256` forces `BK = 1` -- a
+256-token activation stage is 8 KB per K block -- which halves the compute each
+stage has to hide its own prefetch behind and doubles the barrier count, while
+`BM = 64` doubles the number of row blocks and therefore how many times the
+staged activations are read. Q3_K additionally allocates 256 VGPR and spills
+484 private bytes per lane in this shape.
+
+The conclusion generalizes past these two shapes: the accumulator budget was
+never the binding constraint on `BN`. The constraints are the CU's twenty-four
+wave budget against a sixteen-wave workgroup, and the 8 KB-per-K-block
+activation stage a 256-token tile requires. Nothing about a wider macro tile
+reaches `BN = 256` without paying one of them.
+
+**What this leaves.** The Q4_K/Q5_K minimum correction is unchanged and remains
+the only large arithmetic term left, but its ceiling is now quantified rather
+than open: it is roughly 250 of the Q4_K kernel's 3413 instructions, so
+removing it entirely is worth about 7%. Applied to the `pp2048` measured in
+this session that is 466 -> ~500 against Q8's ~502 -- parity at best, not a
+win. The term is also a genuine rank-1 outer product per K block (eight FMAs
+produce eight outputs), and the WMMA path cannot absorb it: folding it into an
+integer WMMA over the K-block axis needs the activation scale `dx` to factor
+out of the sum over K blocks, and the Q8_1 activation layout carries one scale
+per token *per block*. A bf16 WMMA could take the correction as a float
+contraction, but bf16's eight mantissa bits put its error three orders of
+magnitude above the 1e-6 oracle tolerance.
+
+All rejected routes remain selectable and are covered by CTest:
+`qwen_q4kxl_quant_wide_tile_ops_test` and
+`qwen_q4kxl_quant_narrow_tile_ops_test` run the full eight-format oracle
+comparison under `GUFO_KQUANT_PREFILL_TILE=wide` and `=narrow`. The shared
+test body gained a `batch = 288` case so a partially populated, a fully
+populated and a ragged 256-token block are all covered.
+
+Two things were fixed in passing. The blocked kernel clamped out-of-range
+*rows* but not out-of-range *token tiles*, so a macro tile wider than
+`ceil(batch/16)` activation tiles read past the staged activation buffer; token
+tiles are now clamped to tile 0 with a zeroed scale, the same way rows are.
+Production `pp2048` and the full-logit envelope are unchanged by the
+refactor -- paired deltas against the pre-refactor binary were
+-5.01/+0.32/+0.23/+0.51 with medians 466.08 against 466.36, and
+`--validate-prefill 1024` still reports top-1 `198`, rmse `0.09512630`,
+cosine `0.99946874`.
+
+Q8 against Q4 re-measured interleaved in the same session, since absolute
+`pp2048` drifts with host state: Q8 497.05/499.98/504.86/506.85 (median
+502.42), Q4 468.22/467.34/464.71/464.70 (median 466.03) -- 0.93x, the gap this
+card set out to close and did not.
+
 ## Runtime Status
 
 | Area | Current production route |
@@ -575,6 +685,7 @@ depth. Read the Q8 section for the current state of the engine.
 | UD-Q4_K_XL shard support (`opt-q4kxl`) | Native in-kernel decode of Q4_K/Q5_K/Q6_K/Q3_K/IQ4_XS/IQ4_NL/IQ3_S for decode GEMV, prefill WMMA GEMM and small-batch draft verification; weight type as a template parameter; word-wide (SWAR) nibble unpack and a V_PERM_B32 codebook lookup for IQ4; DFlash-2 Q4_K_M companion kept packed | 32-element shared-header decode (prefill neutral, tg128 8.25 -> 7.18); `__launch_bounds__(256, 8)` on the blocked GEMM (pp2048 462.7 -> 412.9); branchless `GetQKScaleMin` (tg128 8.25 -> 8.09); WM=2/WN=4 wave shape (pp2048 464 -> 372); strength-reduced store addressing (neutral to slightly negative) |
 | Exact small-batch K-quant row geometry (`opt-q4kxl-rows3`) | Three output rows per wave for Q4_K/Q5_K/Q3_K/IQ with the zero-scratch two-row Q6_K fallback; `tg128-dflash2` median 18.245 -> 18.76 tok/s (+2.82%); 8/8 greedy `gufo eval` cases passed | Four rows: neutral-to-regressive end to end and +26.6% at width 7; three rows for Q6_K: faster but spills 12 private bytes/lane |
 | Q4_K/Q5_K activation-sum sidecar (`opt-q4kxl-actsum`) | Per-32-block activation sums written once beside the unchanged 576-byte Q8_1 tiles and staged through LDS, replacing eight in-kernel `sudot4` per token tile per K block that every row tile recomputed; `pp2048` median 466.59 -> 469.05 tok/s (+0.53%, 4/4 interleaved pairs positive), decode unaffected, `tg128-dflash2` 3/3 pairs slightly ahead | Direct-read sidecar: re-reads the sum from global inside the innermost token-tile loop instead of sharing one LDS read; `pp2048` median 454.98 tok/s (-2.49%, 4/4 pairs negative). Kept selectable with `GUFO_KQUANT_ACTIVATION_SUMS=direct` |
+| Prefill macro-tile width (`opt-q4kxl-wide`) | Nothing; the 128x128 eight-wave tile stands. The blocked kernel is now templated on its wave count and stages several token subtiles per wave, and out-of-range token tiles are clamped like rows instead of reading past the staged activation buffer (neutral: medians 466.08 -> 466.36) | `BN=256` in both shapes that reach it: 128x256 over sixteen waves (`pp2048` 466.36 -> 412.89, -11.5%, occupancy 6 -> 4 waves/SIMD), the same at a forced eight waves/SIMD (337.03, -27.7%, spills 12-252 private bytes/lane), and 64x256 over eight waves with `BK=1` (468.11 -> 359.12, -23.3%). Kept selectable with `GUFO_KQUANT_PREFILL_TILE=wide|wide-occ|narrow` |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
@@ -737,16 +848,27 @@ it multiplies a contribution that starts at ~3%.
 
 ## TODOs
 
-- Close the UD-Q4_K_XL prefill gap (0.91x of Q8). The Q4_K/Q5_K offset term is
-  ~250 of the ~420 extra instructions per blocked-GEMM kernel; it is a per
-  (row, K-block) constant times the per-token activation sum, so it resists the
-  usual factorings (shifting the codes by round(offset/scale) only moves the
-  residual, and the correction is rank-1 per K block, so it cannot ride the
-  WMMA). The tile is also pinned: the accumulator array is exactly BM*BN/256
-  registers, so BM*BN cannot exceed 128*128, which fixes the weight re-decode
-  count at batch/BN = 16 and rules out BM=64/BN=256 (needs BK=4, 47 KB of LDS)
-  and BM=256/BN=64 (doubles the re-decode). Progress here needs either a
-  cheaper offset formulation or a larger accumulator budget.
+- Close the UD-Q4_K_XL prefill gap (0.93x of Q8 as last measured). The weight
+  re-decode half of this is now closed as a route: `BN=256` was built in both
+  shapes that reach it and both lose, so the blocker is the CU's twenty-four
+  wave budget and the 8 KB-per-K-block activation stage, not the accumulator
+  size -- see "Prefill macro-tile width (`opt-q4kxl-wide`)". What is left is the
+  Q4_K/Q5_K offset term, ~250 of the ~420 extra instructions per blocked-GEMM
+  kernel, worth about 7% and therefore parity with Q8 at best. It is a per
+  (row, K-block) constant times the per-token activation sum and resists the
+  usual factorings: shifting the codes by round(offset/scale) only moves the
+  residual; it is rank-1 per K block so it cannot ride the existing WMMA; an
+  integer WMMA over the K-block axis would need the Q8_1 activation scale to be
+  per token rather than per token per block; and a bf16 WMMA's eight mantissa
+  bits put its error three orders of magnitude above the 1e-6 oracle tolerance.
+  A route that beats Q8 rather than reaching it needs a different idea than a
+  cheaper offset.
+- Consider whether a per-tensor requantization of Q4_K/Q5_K to Q8_0 in scratch
+  before prefill is worth measuring. It replaces sixteen in-kernel decodes with
+  one and hands the untouched W8A8 blocked kernel the result, but it also
+  doubles the weight bytes the GEMM reads, so by construction it converges on
+  Q8 prefill from below and cannot beat it. Only worth building if matching Q8
+  is acceptable and the ~71 MB scratch buffer per projection tensor is.
 - Continue closing the UD-Q4_K_XL speculative gap after the retained three-row
   exact verifier (+2.82% `tg128-dflash2`) and the retained activation-sum
   sidecar (+0.53% `pp2048`). The sidecar took the redundant sum work out of the
