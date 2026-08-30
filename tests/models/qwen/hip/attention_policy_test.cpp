@@ -218,6 +218,22 @@ void TestDecodeSplitPolicy() {
         "fused Q/K norm rejects larger head dimensions");
 }
 
+void TestKQuantSmallBatchRowsPolicy() {
+  using gufo::hip::detail::KQuantSmallBatchRows;
+  using gufo::hip::detail::ResolveKQuantSmallBatchRows;
+
+  Check(ResolveKQuantSmallBatchRows(nullptr) == KQuantSmallBatchRows::kThree,
+        "K-quant small-batch rows default to the retained three-row route");
+  Check(ResolveKQuantSmallBatchRows("2") == KQuantSmallBatchRows::kTwo,
+        "the explicit two-row setting selects the reference");
+  Check(ResolveKQuantSmallBatchRows("3") == KQuantSmallBatchRows::kThree,
+        "the numeric three-row setting selects the retained route");
+  Check(ResolveKQuantSmallBatchRows("4") == KQuantSmallBatchRows::kFour,
+        "the numeric four-row setting selects the rejected alternative");
+  Check(ResolveKQuantSmallBatchRows("rows4") == KQuantSmallBatchRows::kFour,
+        "the named four-row setting selects the candidate");
+}
+
 static_assert(!gufo::hip::detail::ShouldAttemptOptimizedAttention(1023));
 static_assert(gufo::hip::detail::ShouldAttemptOptimizedAttention(1024));
 static_assert(gufo::hip::detail::SelectDecodeAttentionSplitCount(32768) == 32);
@@ -228,6 +244,7 @@ int main() {
   TestDispatchThresholdAndFallbackOrder();
   TestBackendSupportPredicates();
   TestDecodeSplitPolicy();
+  TestKQuantSmallBatchRowsPolicy();
   if (failures != 0) {
     std::cerr << failures << " Qwen attention policy test(s) failed.\n";
     return 1;

@@ -11,6 +11,7 @@
 
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
+#include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/quant_ops.hpp"
 
@@ -1730,16 +1731,16 @@ __launch_bounds__(WavesPerBlock * 32, 10) __global__
 constexpr std::size_t kKQuantSmallBatchWarps = 16;
 constexpr std::size_t kKQuantSmallBatchRowsPerWave = 2;
 
-template<core::GgmlType WType>
+template<std::size_t RowsPerWave, core::GgmlType WType>
 void LaunchKQuantSmallBatchTyped(const void* w, const float* fp32_x, float* y,
                                  std::size_t batch, std::size_t m,
                                  std::size_t k, dim3 grid, dim3 block,
                                  hipStream_t stream) {
-#define GUFO_KQUANT_SMALL_BATCH(N)                                           \
-  case N:                                                                    \
-    SmallBatchKQuantExactFp32GEMMKernel<kKQuantSmallBatchWarps, N,           \
-                                        kKQuantSmallBatchRowsPerWave, WType> \
-        <<<grid, block, 0, stream>>>(w, fp32_x, y, m, k);                    \
+#define GUFO_KQUANT_SMALL_BATCH(N)                                 \
+  case N:                                                          \
+    SmallBatchKQuantExactFp32GEMMKernel<kKQuantSmallBatchWarps, N, \
+                                        RowsPerWave, WType>        \
+        <<<grid, block, 0, stream>>>(w, fp32_x, y, m, k);          \
     return;
   switch (batch) {
     GUFO_KQUANT_SMALL_BATCH(1)
@@ -1756,6 +1757,7 @@ void LaunchKQuantSmallBatchTyped(const void* w, const float* fp32_x, float* y,
 #undef GUFO_KQUANT_SMALL_BATCH
 }
 
+template<std::size_t RowsPerWave>
 void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
                                   const float* fp32_x, float* y,
                                   std::size_t batch, std::size_t m,
@@ -1763,31 +1765,44 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
                                   hipStream_t stream) {
   switch (type) {
     case core::GgmlType::kQ4_K:
-      LaunchKQuantSmallBatchTyped<core::GgmlType::kQ4_K>(
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ4_K>(
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kQ5_K:
-      LaunchKQuantSmallBatchTyped<core::GgmlType::kQ5_K>(
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ5_K>(
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kQ6_K:
-      LaunchKQuantSmallBatchTyped<core::GgmlType::kQ6_K>(
-          w, fp32_x, y, batch, m, k, grid, block, stream);
+      if constexpr (RowsPerWave == 3) {
+        // Q6_K's extra per-half scale state spills 12 bytes/lane with three
+        // rows. Keep it on the zero-scratch two-row reference while the other
+        // formats use the candidate geometry.
+        constexpr std::size_t kRowsPerBlock =
+            kKQuantSmallBatchWarps * kKQuantSmallBatchRowsPerWave;
+        const dim3 reference_grid(
+            static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
+        LaunchKQuantSmallBatchTyped<kKQuantSmallBatchRowsPerWave,
+                                    core::GgmlType::kQ6_K>(
+            w, fp32_x, y, batch, m, k, reference_grid, block, stream);
+      } else {
+        LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ6_K>(
+            w, fp32_x, y, batch, m, k, grid, block, stream);
+      }
       return;
     case core::GgmlType::kQ3_K:
-      LaunchKQuantSmallBatchTyped<core::GgmlType::kQ3_K>(
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ3_K>(
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kIQ4_NL:
-      LaunchKQuantSmallBatchTyped<core::GgmlType::kIQ4_NL>(
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ4_NL>(
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kIQ4_XS:
-      LaunchKQuantSmallBatchTyped<core::GgmlType::kIQ4_XS>(
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ4_XS>(
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kIQ3_S:
-      LaunchKQuantSmallBatchTyped<core::GgmlType::kIQ3_S>(
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ3_S>(
           w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     default:
@@ -2042,14 +2057,32 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
   if (::gufo::hip::detail::IsNativeWmmaQuant(type) && batch <= 8) {
     // Exact width instantiations: a padded Batch would stage and multiply
     // activations that no output consumes.
-    constexpr std::size_t kKRowsPerWave = kKQuantSmallBatchRowsPerWave;
     constexpr std::size_t kKWarpsPerBlock = kKQuantSmallBatchWarps;
-    constexpr std::size_t kKRowsPerBlock = kKWarpsPerBlock * kKRowsPerWave;
     const dim3 block(static_cast<unsigned int>(kWarp * kKWarpsPerBlock));
-    const dim3 grid(
-        static_cast<unsigned int>((m + kKRowsPerBlock - 1) / kKRowsPerBlock));
-    LaunchKQuantSmallBatchByType(type, w, fp32_x, y, batch, m, k, grid, block,
-                                 stream);
+    if (detail::KQuantSmallBatchRowsFromEnv() ==
+        detail::KQuantSmallBatchRows::kFour) {
+      constexpr std::size_t kRowsPerWave = 4;
+      constexpr std::size_t kRowsPerBlock = kKWarpsPerBlock * kRowsPerWave;
+      const dim3 grid(
+          static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
+      LaunchKQuantSmallBatchByType<kRowsPerWave>(type, w, fp32_x, y, batch, m,
+                                                 k, grid, block, stream);
+    } else if (detail::KQuantSmallBatchRowsFromEnv() ==
+               detail::KQuantSmallBatchRows::kThree) {
+      constexpr std::size_t kRowsPerWave = 3;
+      constexpr std::size_t kRowsPerBlock = kKWarpsPerBlock * kRowsPerWave;
+      const dim3 grid(
+          static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
+      LaunchKQuantSmallBatchByType<kRowsPerWave>(type, w, fp32_x, y, batch, m,
+                                                 k, grid, block, stream);
+    } else {
+      constexpr std::size_t kRowsPerBlock =
+          kKWarpsPerBlock * kKQuantSmallBatchRowsPerWave;
+      const dim3 grid(
+          static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
+      LaunchKQuantSmallBatchByType<kKQuantSmallBatchRowsPerWave>(
+          type, w, fp32_x, y, batch, m, k, grid, block, stream);
+    }
     return;
   }
   if ((type == core::GgmlType::kQ8_0 || type == core::GgmlType::kQ8_K) &&

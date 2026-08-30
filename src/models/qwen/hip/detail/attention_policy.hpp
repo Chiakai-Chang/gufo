@@ -129,6 +129,37 @@ struct AttentionSupportParams {
   return ShouldPrefetchNextLayer(QwenExecutionPolicy::Production());
 }
 
+// opt-q4kxl-rows3: three rows amortizes the exact small-batch K-quant
+// verifier's shared activation tile over 1.5x as many output rows and improves
+// Q4 DFlash-2 end to end. Q6_K stays on two rows because its extra per-half
+// scale state spills with three; four rows remains a rejected, measurable
+// alternative. `2` pins the independent production reference.
+enum class KQuantSmallBatchRows : std::uint8_t {
+  kTwo = 2,
+  kThree = 3,
+  kFour = 4,
+};
+
+[[nodiscard]] inline KQuantSmallBatchRows ResolveKQuantSmallBatchRows(
+    const char* value) noexcept {
+  if (value == nullptr) {
+    return KQuantSmallBatchRows::kThree;
+  }
+  const std::string_view text{value};
+  if (text == "3" || text == "three" || text == "rows3") {
+    return KQuantSmallBatchRows::kThree;
+  }
+  return text == "4" || text == "four" || text == "rows4"
+             ? KQuantSmallBatchRows::kFour
+             : KQuantSmallBatchRows::kTwo;
+}
+
+[[nodiscard]] inline KQuantSmallBatchRows KQuantSmallBatchRowsFromEnv() {
+  static const KQuantSmallBatchRows rows =
+      ResolveKQuantSmallBatchRows(std::getenv("GUFO_KQUANT_SMALL_BATCH_ROWS"));
+  return rows;
+}
+
 [[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
     std::size_t sequence_length) noexcept {
   if (sequence_length < kSplitKDecodeAttentionMinContext) {

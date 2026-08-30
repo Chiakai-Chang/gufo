@@ -508,6 +508,39 @@ with the single-token decode GEMV at every width from 1 to 8 -- verified in
 `qwen_q4kxl_quant_ops_test`, since a drafted token may only be accepted if the
 verifier reproduces exactly what the unspeculated decode would have emitted.
 
+The exact verifier was subsequently tuned on gfx1151 by changing how many
+output rows share each wave's staged activation tile. The production selector
+uses three rows per wave for Q4_K, Q5_K, Q3_K and the IQ formats, but leaves
+Q6_K on the two-row reference: Q6_K's extra per-half scale state spills 12
+private bytes/lane at three rows. `GUFO_KQUANT_SMALL_BATCH_ROWS=2` pins the
+reference and `=4` keeps the rejected four-row route measurable.
+
+All end-to-end rows below are four interleaved, single-repetition `tg128`
+DFlash-2 samples with fixed draft width 7. The target and companion SHA-256
+hashes are `3f227079...b01e` and `1a25c568...1ebd` respectively.
+
+| Verifier geometry | Raw `tg128-dflash2` (tok/s) | Median | Kernel/profile result | Decision |
+| --- | --- | ---: | --- | --- |
+| Two rows (reference) | 18.26, 18.31, 18.23, 18.22 | 18.245 | Width-8 K-quant kernel family 2827.46 ms in the baseline trace | Reference |
+| Four rows | 18.23, 17.44, 18.23, 18.24 | 18.23 | Width 8 improved only 0.57%; width 7 regressed 26.6% (113.82 -> 144.08 ms) | Rejected: no end-to-end gain |
+| Three rows for every format | 18.67, 18.66, 18.62, 18.65 | 18.655 | +2.08%, but batch-8 Q6_K spilled 12 private bytes/lane | Rejected: violates the no-scratch contract |
+| **Three rows, Q6_K on two** | **18.77, 18.78, 18.74, 18.75** | **18.76** | **+2.82%; traced kernel sum 4461.39 -> 4369.00 ms** | **Retained** |
+
+The active batch-8 three-row specializations use 128 SGPR, 128-144 VGPR,
+21,504 bytes LDS, zero private bytes and the ten-wave launch bound; the Q6_K
+two-row fallback uses 128 VGPR, the same LDS, and zero private bytes. The
+candidate's width-8 work splits into 2445.77 ms on three rows plus 301.57 ms on
+Q6_K's two rows, 2.84% below the all-two-row baseline. Final production sanity
+measured `pp2048` 465.33 tok/s (inside the 463.63-469.04 baseline range) and
+`tg128-dflash2` 18.73 tok/s. Full-logit validation remained top-1 198, RMSE
+`0.09512630`, cosine `0.99946874`.
+
+The retained HTTP route also passed `gufo eval --questions 8 --greedy` against
+the pinned DS4 fixture with **8 passed, 0 failed, 0 execution errors**. Every
+request exercised DFlash-2 (40.8-75.3% draft acceptance in server telemetry),
+so this is a behavioral validation of the speculative path rather than only a
+model-load smoke test.
+
 ## Runtime Status
 
 | Area | Current production route |
@@ -535,6 +568,7 @@ depth. Read the Q8 section for the current state of the engine.
 | Projection | Shape-specific hipBLASLt plans and tuned decode GEMV | Blanket algorithm overrides and concurrent gate/up launches |
 | Exact small-batch Q8 projection | Shared-weight FP32 Q8_0/Q8_K kernels for physical W=2/W=4/W=8, with masked C=3/C=5/C=6, structural C=1 fallback, and the measured smallest-covering selector (`opt-c206-q8-small-batch`) | Standalone Q8_K-only promotion on the current Q8_K_XL artifact; C=1 Q8_0 one-row/two-row specialization, four rows per wave, and eight-wave workgroups; capped W=4 composition and a native W=6 specialization were neutral or regressive (`opt-c206-q8-c1`, #206) |
 | UD-Q4_K_XL shard support (`opt-q4kxl`) | Native in-kernel decode of Q4_K/Q5_K/Q6_K/Q3_K/IQ4_XS/IQ4_NL/IQ3_S for decode GEMV, prefill WMMA GEMM and small-batch draft verification; weight type as a template parameter; word-wide (SWAR) nibble unpack and a V_PERM_B32 codebook lookup for IQ4; DFlash-2 Q4_K_M companion kept packed | 32-element shared-header decode (prefill neutral, tg128 8.25 -> 7.18); `__launch_bounds__(256, 8)` on the blocked GEMM (pp2048 462.7 -> 412.9); branchless `GetQKScaleMin` (tg128 8.25 -> 8.09); WM=2/WN=4 wave shape (pp2048 464 -> 372); strength-reduced store addressing (neutral to slightly negative) |
+| Exact small-batch K-quant row geometry (`opt-q4kxl-rows3`) | Three output rows per wave for Q4_K/Q5_K/Q3_K/IQ with the zero-scratch two-row Q6_K fallback; `tg128-dflash2` median 18.245 -> 18.76 tok/s (+2.82%); 8/8 greedy `gufo eval` cases passed | Four rows: neutral-to-regressive end to end and +26.6% at width 7; three rows for Q6_K: faster but spills 12 private bytes/lane |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
@@ -707,12 +741,12 @@ it multiplies a contribution that starts at ~3%.
   count at batch/BN = 16 and rules out BM=64/BN=256 (needs BK=4, 47 KB of LDS)
   and BM=256/BN=64 (doubles the re-decode). Progress here needs either a
   cheaper offset formulation or a larger accumulator budget.
-- Close the UD-Q4_K_XL speculative gap (0.67x of Q8). The small-batch
-  verification kernel is ~1.9x its Q8_0 counterpart in aggregate; at draft width
-  the K-quant decode arithmetic no longer hides behind weight streaming.
-  Precomputing per-32-block activation sums in the quantize kernels (tile stride
-  576 -> 640) would remove the last redundant work, at the cost of touching the
-  tuned Q8 activation layout.
+- Continue closing the UD-Q4_K_XL speculative gap after the retained three-row
+  exact verifier (+2.82% `tg128-dflash2`). Precomputing per-32-block activation
+  sums in the quantize kernels (tile stride 576 -> 640) would remove the last
+  redundant work, at the cost of touching the tuned Q8 activation layout. Any
+  attempt must preserve Q6_K's two-row no-scratch fallback; its three-row
+  specialization spills 12 private bytes/lane.
 - Consider whether the Q8_0 blocked WMMA kernel would also benefit from the
   store-addressing and wave-shape findings recorded for `opt-q4kxl`; both
   kernels spend ~44% of their VALU on 64-bit epilogue address arithmetic.
