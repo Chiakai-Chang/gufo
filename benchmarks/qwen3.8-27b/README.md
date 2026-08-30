@@ -546,6 +546,95 @@ request exercised DFlash-2 (40.8-75.3% draft acceptance in server telemetry),
 so this is a behavioral validation of the speculative path rather than only a
 model-load smoke test.
 
+### Speculative verifier occupancy (`opt-q4kxl-occ12`)
+
+Q4 wins unspeculated decode by 1.68x but converts that into only 1.61x under
+DFlash-2, where Q8 converts 6.89 into 19.4-27.3. Measuring acceptance with
+`bench --verbose` splits that into two independent problems:
+
+| Target | Draft | Acceptance | `tg128-dflash2` |
+| --- | --- | ---: | ---: |
+| Q8_K_XL | DFlash2 Q8_0 | 0.595 | 22.99 |
+| Q8_K_XL | DFlash2 Q4_K_M | 0.567 | 23.08 |
+| UD-Q4_K_XL | DFlash2 Q4_K_M | 0.322 | 18.81 |
+| UD-Q4_K_XL | DFlash2 Q8_0 | 0.252 | 15.91 |
+
+The draft's own quantization barely moves acceptance -- 0.595 against 0.567 on
+the same target. It is the *target* being Q4 that halves it, which is a model
+quality property rather than a kernel one. The other half of the deficit is
+per-step cost, and that one was addressable.
+
+The lead came from a draft-width sweep that does not read as a width effect:
+
+| Draft width | Verify batch | `tg128-dflash2` | Q5_K rows=3, mean per dispatch |
+| ---: | ---: | ---: | ---: |
+| 2 | 3 | 15.98 | 279.0 us |
+| 4 | 5 | 17.86 | 292.4 us |
+| 5 | 6 | **20.50** | **264.0 us** |
+| 6 | 7 | 18.95 | 324.1 us |
+| 7 | 8 | 18.75 | 339.2 us |
+
+Verify batch 6 is *cheaper per dispatch* than batch 3 while doing twice the
+token work. It is residency, not width. `SmallBatchKQuantExactFp32GEMMKernel`
+launches sixteen waves per workgroup, so a CU takes workgroups in sixteen-wave
+steps: the retained ten-waves-per-SIMD hint is forty waves per CU and holds
+two workgroups, twelve is forty-eight and holds three. At batch 6 the allocator
+happens to land on 120 VGPR and picks up the third workgroup; at batch 5, 7 and
+8 it lands on 136-144 and does not.
+
+Raising the hint to twelve makes the third workgroup deterministic. The LDS
+stage is 2,688 bytes per draft token, so three workgroups at the widest draft
+is 3 x 21,504 = 64,512 bytes -- just inside the 64 KB.
+
+Resources at verify batch 8, production geometry:
+
+| Format | Rows/wave | VGPR at 10 | VGPR at 12 | LDS | Scratch at 12 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q5_K | 3 | 144 | 112 | 21,504 | 0 |
+| Q4_K | 3 | 136 | 104 | 21,504 | 0 |
+| IQ4_XS | 3 | 136 | 104 | 21,504 | 0 |
+| Q3_K | 3 | 144 | 112 | 21,504 | 0 |
+| Q6_K | 2 | 128 | 96 | 21,504 | 0 |
+
+The rejected four-row geometry is the one exception: at twelve waves the
+allocator caps it at 120 VGPR and spills 12-88 private bytes per lane for every
+format, so it stays on the ten-wave hint and remains zero-scratch and
+measurable. Per dispatch at batch 8 the retained geometries move 339.2 -> 296.5
+us (Q5_K), 290.7 -> 241.3 (Q4_K), 291.2 -> 278.5 (Q6_K two rows) and
+353.0 -> 362.7 (IQ4_XS); the family total per run falls 5,226 -> 4,714 ms.
+
+Interleaved, release binaries, fixed width 7, host load 1.3-1.5:
+
+| Pair | 10 waves/SIMD | 12 waves/SIMD |
+| --- | ---: | ---: |
+| 1 | 18.80 | 20.33 |
+| 2 | 18.75 | 20.29 |
+| 3 | 18.77 | 20.27 |
+| 4 | 18.75 | 20.26 |
+| **Median** | **18.77** | **20.29 (+8.1%)** |
+
+Retained: 4/4 pairs positive, zero scratch on every dispatched instantiation,
+twelve waves per SIMD against the four-wave floor. `10` pins the previous hint
+via `GUFO_KQUANT_SMALL_BATCH_WAVES=10`.
+
+The width curve flattens once residency stops depending on the allocator's
+luck -- widths 5/6/7 measure 20.46/20.47/20.24 against 20.50/18.95/18.75 -- so
+the production fixed width 7 keeps the win and no draft-policy change is
+needed. Three rows per wave is still the best geometry at twelve waves (20.27,
+against 19.64 at two rows and 18.30 at four).
+
+Untouched paths measured in the same session: `tg128` 11.57-11.61 against
+11.58-11.60 and `pp2048` 460.25-462.71 against 460.38-462.18 over three
+interleaved pairs. Batch 1 uses the decode GEMV and long prefill uses the
+blocked WMMA, so neither reaches this kernel, and the Q8 target uses
+`SmallBatchQ8_0ExactFp32VecGEMMKernel` and is not touched at all.
+
+Correctness: the `opt-q4kxl` label passes under both wave hints and all three
+row geometries; `--validate-prefill 1024` is unchanged at top-1 `198`, rmse
+`0.09512630`, cosine `0.99946874`; and `gufo eval --questions 8 --greedy`
+against the pinned DS4 fixture on a speculative Q4 server passed 8, failed 0,
+execution errors 0.
+
 ### Prefill macro-tile width (`opt-q4kxl-wide`)
 
 The prefill gap is arithmetic, and the largest single arithmetic term that is
@@ -686,6 +775,7 @@ depth. Read the Q8 section for the current state of the engine.
 | Exact small-batch K-quant row geometry (`opt-q4kxl-rows3`) | Three output rows per wave for Q4_K/Q5_K/Q3_K/IQ with the zero-scratch two-row Q6_K fallback; `tg128-dflash2` median 18.245 -> 18.76 tok/s (+2.82%); 8/8 greedy `gufo eval` cases passed | Four rows: neutral-to-regressive end to end and +26.6% at width 7; three rows for Q6_K: faster but spills 12 private bytes/lane |
 | Q4_K/Q5_K activation-sum sidecar (`opt-q4kxl-actsum`) | Per-32-block activation sums written once beside the unchanged 576-byte Q8_1 tiles and staged through LDS, replacing eight in-kernel `sudot4` per token tile per K block that every row tile recomputed; `pp2048` median 466.59 -> 469.05 tok/s (+0.53%, 4/4 interleaved pairs positive), decode unaffected, `tg128-dflash2` 3/3 pairs slightly ahead | Direct-read sidecar: re-reads the sum from global inside the innermost token-tile loop instead of sharing one LDS read; `pp2048` median 454.98 tok/s (-2.49%, 4/4 pairs negative). Kept selectable with `GUFO_KQUANT_ACTIVATION_SUMS=direct` |
 | Prefill macro-tile width (`opt-q4kxl-wide`) | Nothing; the 128x128 eight-wave tile stands. The blocked kernel is now templated on its wave count and stages several token subtiles per wave, and out-of-range token tiles are clamped like rows instead of reading past the staged activation buffer (neutral: medians 466.08 -> 466.36) | `BN=256` in both shapes that reach it: 128x256 over sixteen waves (`pp2048` 466.36 -> 412.89, -11.5%, occupancy 6 -> 4 waves/SIMD), the same at a forced eight waves/SIMD (337.03, -27.7%, spills 12-252 private bytes/lane), and 64x256 over eight waves with `BK=1` (468.11 -> 359.12, -23.3%). Kept selectable with `GUFO_KQUANT_PREFILL_TILE=wide|wide-occ|narrow` |
+| Speculative verifier occupancy (`opt-q4kxl-occ12`) | Twelve wave32s per SIMD on the exact small-batch K-quant verifier, which turns its sixteen-wave workgroup residency from two blocks per CU into three; `tg128-dflash2` median 18.77 -> 20.29 tok/s (+8.1%, 4/4 interleaved pairs), zero scratch, `tg128` and `pp2048` untouched, DS4 eval 8/8 | The four-row geometry stays on the ten-wave hint: at twelve waves it caps at 120 VGPR and spills 12-88 private bytes/lane for every format. `GUFO_KQUANT_SMALL_BATCH_WAVES=10` pins the previous hint |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
@@ -870,14 +960,28 @@ it multiplies a contribution that starts at ~3%.
   Q8 prefill from below and cannot beat it. Only worth building if matching Q8
   is acceptable and the ~71 MB scratch buffer per projection tensor is.
 - Continue closing the UD-Q4_K_XL speculative gap after the retained three-row
-  exact verifier (+2.82% `tg128-dflash2`) and the retained activation-sum
-  sidecar (+0.53% `pp2048`). The sidecar took the redundant sum work out of the
+  exact verifier (+2.82% `tg128-dflash2`), the retained twelve-wave occupancy
+  hint (+8.1% `tg128-dflash2`, see `opt-q4kxl-occ12`) and the retained
+  activation-sum sidecar (+0.53% `pp2048`). The sidecar took the redundant sum work out of the
   blocked WMMA without touching the Q8_1 tile layout -- it is appended after the
   tiled payload, so every Q8 kernel still sees the same 576-byte stride. What is
   left in the Q4_K/Q5_K epilogue is the correction itself (8 FMA per accumulator
   group per K block), which is rank-1 per K block and so cannot ride the WMMA.
   Any further row-geometry attempt must preserve Q6_K's two-row no-scratch
   fallback; its three-row specialization spills 12 private bytes/lane.
+- The remaining UD-Q4_K_XL speculative deficit is now acceptance, not kernel
+  time: 0.322 against the Q8 target's 0.595 at fixed width 7, while swapping
+  the draft companion between Q8_0 and Q4_K_M on a fixed target moves it by
+  under 0.03. A Q4 target hands the DFlash-2 head a coarser hidden state, so
+  progress here means model or draft-head work rather than kernel work. Worth
+  quantifying properly on the 10-prompt corpus before anyone acts on it, since
+  the two targets emit different continuations and acceptance is
+  continuation-dependent.
+- The exact small-batch K-quant verifier still streams below the decode GEMV:
+  roughly 144 GB/s against the GEMV's ~203 GB/s on the same weights, so there
+  is headroom left after the occupancy fix. A fourth resident workgroup is out
+  of reach at verify batch 8 (4 x 21,504 bytes of LDS exceeds 64 KB) unless the
+  activation stage's `kSubElems + 4` padding is narrowed.
 - Consider whether the Q8_0 blocked WMMA kernel would also benefit from the
   store-addressing and wave-shape findings recorded for `opt-q4kxl`; both
   kernels spend ~44% of their VALU on 64-bit epilogue address arithmetic.

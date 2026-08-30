@@ -205,6 +205,14 @@ if (ENGINE_ENABLE_HIP)
     LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-wide"
     ENVIRONMENT "GUFO_KQUANT_PREFILL_TILE=wide"
     SKIP_RETURN_CODE 77)
+  # opt-q4kxl-occ12: `10` pins the previously retained occupancy hint for the
+  # exact small-batch verifier; the default is now twelve waves per SIMD.
+  add_test(NAME qwen_q4kxl_quant_small_batch_waves10_ops_test
+    COMMAND qwen_q4kxl_quant_ops_test)
+  set_tests_properties(qwen_q4kxl_quant_small_batch_waves10_ops_test PROPERTIES
+    LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-occ12"
+    ENVIRONMENT "GUFO_KQUANT_SMALL_BATCH_WAVES=10"
+    SKIP_RETURN_CODE 77)
   add_test(NAME qwen_q4kxl_quant_narrow_tile_ops_test
     COMMAND qwen_q4kxl_quant_ops_test)
   set_tests_properties(qwen_q4kxl_quant_narrow_tile_ops_test PROPERTIES

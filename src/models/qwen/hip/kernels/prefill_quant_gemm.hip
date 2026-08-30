@@ -1781,8 +1781,9 @@ std::size_t QuantizedActivationBytes(std::size_t batch, std::size_t k) {
 // whole game, while the blocked GEMM is latency bound inside its own
 // dependency chain and lost 11% when the same kind of hint was applied to it.
 template<std::uint32_t WavesPerBlock, std::size_t Batch,
-         std::size_t RowsPerWave, core::GgmlType WType>
-__launch_bounds__(WavesPerBlock * 32, 10) __global__
+         std::size_t RowsPerWave, core::GgmlType WType,
+         std::uint32_t MinWavesPerSimd = 10>
+__launch_bounds__(WavesPerBlock * 32, MinWavesPerSimd) __global__
     void SmallBatchKQuantExactFp32GEMMKernel(const void* __restrict__ w,
                                              const float* __restrict__ x,
                                              float* __restrict__ y,
@@ -1921,16 +1922,17 @@ __launch_bounds__(WavesPerBlock * 32, 10) __global__
 constexpr std::size_t kKQuantSmallBatchWarps = 16;
 constexpr std::size_t kKQuantSmallBatchRowsPerWave = 2;
 
-template<std::size_t RowsPerWave, core::GgmlType WType>
+template<std::size_t RowsPerWave, core::GgmlType WType,
+         std::uint32_t MinWavesPerSimd>
 void LaunchKQuantSmallBatchTyped(const void* w, const float* fp32_x, float* y,
                                  std::size_t batch, std::size_t m,
                                  std::size_t k, dim3 grid, dim3 block,
                                  hipStream_t stream) {
-#define GUFO_KQUANT_SMALL_BATCH(N)                                 \
-  case N:                                                          \
-    SmallBatchKQuantExactFp32GEMMKernel<kKQuantSmallBatchWarps, N, \
-                                        RowsPerWave, WType>        \
-        <<<grid, block, 0, stream>>>(w, fp32_x, y, m, k);          \
+#define GUFO_KQUANT_SMALL_BATCH(N)                                           \
+  case N:                                                                    \
+    SmallBatchKQuantExactFp32GEMMKernel<kKQuantSmallBatchWarps, N,           \
+                                        RowsPerWave, WType, MinWavesPerSimd> \
+        <<<grid, block, 0, stream>>>(w, fp32_x, y, m, k);                    \
     return;
   switch (batch) {
     GUFO_KQUANT_SMALL_BATCH(1)
@@ -1947,7 +1949,7 @@ void LaunchKQuantSmallBatchTyped(const void* w, const float* fp32_x, float* y,
 #undef GUFO_KQUANT_SMALL_BATCH
 }
 
-template<std::size_t RowsPerWave>
+template<std::size_t RowsPerWave, std::uint32_t MinWavesPerSimd>
 void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
                                   const float* fp32_x, float* y,
                                   std::size_t batch, std::size_t m,
@@ -1955,12 +1957,14 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
                                   hipStream_t stream) {
   switch (type) {
     case core::GgmlType::kQ4_K:
-      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ4_K>(
-          w, fp32_x, y, batch, m, k, grid, block, stream);
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ4_K,
+                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
+                                                   grid, block, stream);
       return;
     case core::GgmlType::kQ5_K:
-      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ5_K>(
-          w, fp32_x, y, batch, m, k, grid, block, stream);
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ5_K,
+                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
+                                                   grid, block, stream);
       return;
     case core::GgmlType::kQ6_K:
       if constexpr (RowsPerWave == 3) {
@@ -1972,28 +1976,33 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
         const dim3 reference_grid(
             static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
         LaunchKQuantSmallBatchTyped<kKQuantSmallBatchRowsPerWave,
-                                    core::GgmlType::kQ6_K>(
+                                    core::GgmlType::kQ6_K, MinWavesPerSimd>(
             w, fp32_x, y, batch, m, k, reference_grid, block, stream);
       } else {
-        LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ6_K>(
-            w, fp32_x, y, batch, m, k, grid, block, stream);
+        LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ6_K,
+                                    MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
+                                                     grid, block, stream);
       }
       return;
     case core::GgmlType::kQ3_K:
-      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ3_K>(
-          w, fp32_x, y, batch, m, k, grid, block, stream);
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ3_K,
+                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
+                                                   grid, block, stream);
       return;
     case core::GgmlType::kIQ4_NL:
-      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ4_NL>(
-          w, fp32_x, y, batch, m, k, grid, block, stream);
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ4_NL,
+                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
+                                                   grid, block, stream);
       return;
     case core::GgmlType::kIQ4_XS:
-      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ4_XS>(
-          w, fp32_x, y, batch, m, k, grid, block, stream);
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ4_XS,
+                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
+                                                   grid, block, stream);
       return;
     case core::GgmlType::kIQ3_S:
-      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ3_S>(
-          w, fp32_x, y, batch, m, k, grid, block, stream);
+      LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ3_S,
+                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
+                                                   grid, block, stream);
       return;
     default:
       return;
@@ -2309,29 +2318,32 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
     // activations that no output consumes.
     constexpr std::size_t kKWarpsPerBlock = kKQuantSmallBatchWarps;
     const dim3 block(static_cast<unsigned int>(kWarp * kKWarpsPerBlock));
+    // The four-row route stays on the ten-wave hint. It is a rejected geometry
+    // kept selectable, and at twelve waves the allocator caps it at 120 VGPR
+    // and spills 12-88 private bytes/lane for every format; the two- and
+    // three-row geometries reach 96-112 VGPR with no scratch.
+    const bool twelve_waves = detail::KQuantSmallBatchOccupancyFromEnv() ==
+                              detail::KQuantSmallBatchOccupancy::kTwelveWaves;
+    const auto dispatch_rows = [&]<std::size_t RowsPerWave>() {
+      constexpr std::size_t kRowsPerBlock = kKWarpsPerBlock * RowsPerWave;
+      const dim3 grid(
+          static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
+      if (twelve_waves && RowsPerWave != 4) {
+        LaunchKQuantSmallBatchByType<RowsPerWave, 12>(
+            type, w, fp32_x, y, batch, m, k, grid, block, stream);
+        return;
+      }
+      LaunchKQuantSmallBatchByType<RowsPerWave, 10>(type, w, fp32_x, y, batch,
+                                                    m, k, grid, block, stream);
+    };
     if (detail::KQuantSmallBatchRowsFromEnv() ==
         detail::KQuantSmallBatchRows::kFour) {
-      constexpr std::size_t kRowsPerWave = 4;
-      constexpr std::size_t kRowsPerBlock = kKWarpsPerBlock * kRowsPerWave;
-      const dim3 grid(
-          static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
-      LaunchKQuantSmallBatchByType<kRowsPerWave>(type, w, fp32_x, y, batch, m,
-                                                 k, grid, block, stream);
+      dispatch_rows.template operator()<4>();
     } else if (detail::KQuantSmallBatchRowsFromEnv() ==
                detail::KQuantSmallBatchRows::kThree) {
-      constexpr std::size_t kRowsPerWave = 3;
-      constexpr std::size_t kRowsPerBlock = kKWarpsPerBlock * kRowsPerWave;
-      const dim3 grid(
-          static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
-      LaunchKQuantSmallBatchByType<kRowsPerWave>(type, w, fp32_x, y, batch, m,
-                                                 k, grid, block, stream);
+      dispatch_rows.template operator()<3>();
     } else {
-      constexpr std::size_t kRowsPerBlock =
-          kKWarpsPerBlock * kKQuantSmallBatchRowsPerWave;
-      const dim3 grid(
-          static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
-      LaunchKQuantSmallBatchByType<kKQuantSmallBatchRowsPerWave>(
-          type, w, fp32_x, y, batch, m, k, grid, block, stream);
+      dispatch_rows.template operator()<kKQuantSmallBatchRowsPerWave>();
     }
     return;
   }

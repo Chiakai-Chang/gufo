@@ -160,6 +160,46 @@ enum class KQuantSmallBatchRows : std::uint8_t {
   return rows;
 }
 
+// opt-q4kxl-occ12: how many wave32s per SIMD the exact small-batch K-quant
+// verifier asks the register allocator for.
+//
+// The kernel launches sixteen waves per workgroup, so residency moves in whole
+// sixteen-wave steps: ten waves per SIMD is forty per CU and holds two
+// workgroups, twelve is forty-eight and holds three. Twelve needs VGPR <= 128,
+// and the LDS stage is 2688 bytes per draft token, so three workgroups at the
+// widest draft (batch 8, 21,504 bytes) is 64,512 -- just inside the 64 KB.
+//
+// The evidence that this matters came from a draft-width sweep. At draft width
+// five (verify batch six) the allocator happens to land on 120 VGPR for Q5_K
+// and the kernel runs 264 us per dispatch, against 324 at batch seven and 339
+// at batch eight where it lands on 136-144. That is not a width effect: batch
+// three costs 279 us, more than batch six. It is the third workgroup.
+//
+// `10` pins the previously retained hint and stays selectable.
+enum class KQuantSmallBatchOccupancy : std::uint8_t {
+  kTenWaves = 10,
+  kTwelveWaves = 12,
+};
+
+[[nodiscard]] inline KQuantSmallBatchOccupancy ResolveKQuantSmallBatchOccupancy(
+    const char* value) noexcept {
+  if (value == nullptr) {
+    return KQuantSmallBatchOccupancy::kTwelveWaves;
+  }
+  const std::string_view text{value};
+  return text == "10" || text == "ten"
+             ? KQuantSmallBatchOccupancy::kTenWaves
+             : KQuantSmallBatchOccupancy::kTwelveWaves;
+}
+
+[[nodiscard]] inline KQuantSmallBatchOccupancy
+KQuantSmallBatchOccupancyFromEnv() noexcept {
+  static const KQuantSmallBatchOccupancy waves =
+      ResolveKQuantSmallBatchOccupancy(
+          std::getenv("GUFO_KQUANT_SMALL_BATCH_WAVES"));
+  return waves;
+}
+
 // opt-q4kxl-actsum: Q4_K/Q5_K blocked WMMA needs the sum of each quantized
 // 32-element activation block for its minimum correction. Computing it in the
 // kernel costs eight `sudot4` per token tile per K block, and every row tile in
