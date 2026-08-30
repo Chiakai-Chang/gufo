@@ -197,8 +197,9 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
 
   // opt-q4kxl: whether this shard runs its K-quants natively.
   //
-  // The Q8_K_XL shard is 90% Q8_0 with a small Q5_K/Q6_K tail, and expanding
-  // that tail to device BF16 costs ~4 GB while letting the tuned BF16 hipBLAS
+  // The Q8_K_XL shard is 86% Q8_0 by element count with a small Q5_K/Q6_K tail,
+  // and expanding that 3.9G-element tail to device BF16 costs 7.7 GB (about
+  // 4.5 GB more than its packed form) while letting the tuned BF16 hipBLAS
   // prefill own those projections. The UD-Q4_K_XL shard inverts the ratio:
   // Q5_K + Q6_K alone are 15.0G elements, so the same expansion would cost
   // 30 GB and hand back every byte Q4 was chosen to save.

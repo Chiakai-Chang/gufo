@@ -1580,6 +1580,15 @@ std::size_t QuantizedActivationBytes(std::size_t batch, std::size_t k) {
 // the allocator size for the worst one. The activation sum is accumulated for
 // every format even though only Q4_K and Q5_K consume it: see the note in the
 // epilogue on why specializing it away breaks bit-exactness.
+//
+// The occupancy hint is load bearing, and note that it points the OPPOSITE way
+// from the blocked WMMA kernel above. Left unhinted this kernel settles at
+// 128-176 VGPRs against its Q8_0 counterpart's 80-104; asking for ten wave32s
+// per SIMD brings it to ~100 with no scratch and measured tg128-dflash2
+// 17.2 -> 18.2. The two kernels differ because this one streams weights at
+// draft width and is memory-latency bound, where more waves in flight is the
+// whole game, while the blocked GEMM is latency bound inside its own
+// dependency chain and lost 11% when the same kind of hint was applied to it.
 template<std::uint32_t WavesPerBlock, std::size_t Batch,
          std::size_t RowsPerWave, core::GgmlType WType>
 __launch_bounds__(WavesPerBlock * 32, 10) __global__

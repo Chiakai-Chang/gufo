@@ -135,10 +135,15 @@ void LaunchDequantizeQ8KToBf16(const void* w, hip_bfloat16* out,
 /// blocks. Unsupported types are a no-op.
 namespace detail {
 
-/// opt-q4kxl: true for the formats WKQuantA8BlockedWmmaGEMMKernel decodes, i.e.
-/// everything with a DecodeQuantSub16 implementation except Q8_0 (which keeps
-/// its own untouched kernel) and Q8_K (whose row layout carries block sums the
-/// WMMA staging does not use).
+/// opt-q4kxl: true for the formats that run natively through the K-quant GPU
+/// kernels -- the blocked WMMA GEMM at prefill batch, the exact shared-weight
+/// kernel at draft width, and the routing and activation-fusion gates that feed
+/// them. That is everything with a DecodeQuantSub16 implementation except Q8_0
+/// (which keeps its own untouched kernels) and Q8_K (whose row layout carries
+/// block sums the WMMA staging does not use).
+///
+/// The name says Wmma for the kernel it was introduced for; the predicate is
+/// now the general "decoded in-kernel from packed form" test.
 [[nodiscard]] constexpr bool IsNativeWmmaQuant(core::GgmlType type) noexcept {
   switch (type) {
     case core::GgmlType::kQ4_K:
