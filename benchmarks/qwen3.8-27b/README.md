@@ -462,6 +462,7 @@ depth. Read the Q8 section for the current state of the engine.
 | RMSNorm + projection input | Decode RMSNorm kernel + fused QKV/SSM-input/SwiGLU projection GEMVs | Norm folded into the projection GEMVs: bit-exact but every block redundantly re-normalizes the row, +9-21% per projection launch and ~9% decode regression (`opt-c010-rmsnorm-projection`) |
 | Layer prefetch | Single-stream decode; no prefetch | Async next-layer page-touch on a side stream: tg128 -1.6%, and the per-layer cross-stream join serializes the non-graph (split-K) decode path, ~4x regression at depth 4K/8K/16K (`opt-c014-layer-prefetch`) |
 | Speculation | Official DFlash2 graph and selector, transactional batched target verification, and exact GPU MTP verification policies | W8A8-only verification where it changes greedy output; small-batch dual gate/up despite a faster isolated GEMM because it regresses end-to-end throughput |
+| XDNA2 NPU offload | Nothing | Every route measured and rejected: the NPU streams 47 GB/s against the GPU's 214 and computes ~0.94 TOPS against 30 once Q8_0's per-32 dequantization is paid. See "XDNA2 NPU offload" below |
 
 ### Rejected C=1 Q8 decode experiments
 
@@ -513,6 +514,103 @@ Both fusions from `opt-c010-residual-rmsnorm` and `opt-c010-ffn-swiglu` remain
 implemented and tested behind policy toggles in
 `src/core/hip/detail/qwen_attention_policy.hpp`; they are kept disabled because
 they did not beat the unfused routes end-to-end on gfx1151.
+
+
+## XDNA2 NPU offload
+
+Measured 2026-08-30 on Strix Halo (`RyzenAI-npu5`, XDNA2, 32 AIE tiles,
+`amdxdna` firmware 1.1.2.64/65) against the HIP backend. **Nothing was
+retained.** The section exists so the next attempt starts from the numbers
+rather than from the TOPS figure on the box.
+
+### Baselines it had to beat
+
+| test | tok/s |
+| --- | ---: |
+| decode `tg128`, no speculation | 7.60 |
+| decode `tg128`, `mtp` | 12.95 |
+| decode `tg128`, `mtp-npu` | 12.69 |
+| decode `tg128`, `dflash2` | **22.65** |
+| prefill `pp2048` | **545.66** |
+| `gufo eval --questions 8 --greedy` | passed 7, failed 1, 0 execution errors |
+
+The `dflash2` figure saturates at `--draft-tokens 7` (18.97 / 22.65 / 22.63 /
+22.61 at 4 / 7 / 10 / 16) because the checkpoint carries `dflash.block_size = 8`.
+The draft block cannot be widened on this model.
+
+### The two hardware limits everything else follows from
+
+**Streaming.** An AIE compute program sustains **47 GB/s** against the GPU's
+213.9 GB/s device path. Three dataflow levers failed to move it: a contiguous
+weight layout replacing a strided 288-byte gather bought 6% (44.2 to 46.9 GB/s),
+object-fifo depth 4 fails aiecc with `'aie.memtile_dma' op has more than 48
+blocks`, and doubling the DMA burst to two K blocks per object made it *worse*
+(43.3 GB/s). 47 GB/s over eight columns is ~5.9 GB/s per column, which reads as
+the per-column shim rate.
+
+**Arithmetic.** AIE2P's `mmul_8_8` specializes only to N=8 ((2,8,8) (4,8,8)
+(4,16,8) (8,16,8) (8,8,8)) where `mmul_8_4` reaches (4,16,16) -- which is why
+the existing `aie2p_w4a8_pack.hpp` is four-bit. That costs nothing on its own,
+but Q8_0's per-32 dequantization does: emitting four token rows instead of one
+runs at **~11 TOPS with the per-group epilogue removed and ~0.94 TOPS with it**,
+against the GPU's 30 TOPS achieved. It is the same epilogue that holds the GPU
+projection at 55% of its WMMA ceiling, and the NPU has far less arithmetic to
+spare.
+
+### Routes, and why each was rejected
+
+| route | measured result |
+| --- | --- |
+| `mtp-npu`, the shipping single-projection offload | 12.69 against 12.95 tok/s on the GPU. A 10240x5120 projection cannot pay a 63.39 us dispatch plus packing and upload |
+| DFlash-2 drafter relocated to the NPU | The GPU already runs the draft at 72-96% of its ceiling: gemm 1.75 GB in 11.30 ms (155 GB/s), lm head 1.27 GB in 6.17 ms (206 GB/s). The NPU's ceiling is 58% of the GPU's, so every stage gets slower |
+| DFlash-2 overlapped with verification | The drafter consumes target hidden states produced by the verify immediately before it, so overlap requires stale features. Measured with one-step staleness: acceptance 0.413 to 0.288 (x0.697) against a x1.152 overlap ceiling, 22.61 to 17.53 tok/s |
+| Target-model weight streaming split, decode | Decode is pinned at 217 GB/s. Running an NPU program concurrently: GPU 217 to 177.5 GB/s while the NPU adds 44.4, aggregate 221.9, **+2.3%** -- below the 3.1% cost of 64 per-layer dispatches |
+| Target-model split, prefill | Prefill is issue bound, so contention is only **-1.7%** at `pp2048` (545.66 to 536.19) against decode's -18%. But the NPU's share at 0.94 TOPS is ~3% of the arithmetic, so the net is ~+1.3% |
+
+### The one arrangement that does pay
+
+The NPU loses whenever it competes with the GPU on the same model. It wins when
+it runs a **different, concurrent workload**:
+
+| arrangement | main LLM decode | companion |
+| --- | ---: | ---: |
+| main LLM alone | 7.60 tok/s | -- |
+| main LLM + Qwen3.5-4B on the **GPU** | **5.04 (-34%)** | 14.06 tok/s |
+| main LLM + a heavy NPU workload | **6.21 (-18%)** | -- |
+
+A companion model costs the main LLM 34% on the GPU and 18% on the NPU, so
+moving it to the NPU is worth about **+23%** to the model the user is waiting
+on. There is no serial dependency to break, no per-layer dispatch to amortize
+and no precision decision; the two models simply do not need each other, and the
+NPU being 30x slower stops mattering once it is off the critical path. The trade
+is the companion's own latency (~5-6 tok/s against 14.06), which is right for a
+background task and wrong when the user is waiting on the companion. Qwen3-ASR
+is this shape.
+
+### Two traps that cost time
+
+1. **A DMA benchmark is not a proxy for an AIE program.** `xrt_bo_sync` sustains
+   124.76 GB/s and costs a saturated GPU nothing, which reads as a green light.
+   An AIE compute program sustains 46.5 GB/s and costs it 18%. They differ 2.7x
+   in rate and completely in contention behaviour.
+2. **Pass `xrt::bo`, not `xrt::ext::bo`, to a kernel.** The derived type selects
+   the scalar-argument overload and XRT fails with `patch_value() only supports
+   64-bit values or less`, which looks like a corrupt artifact and is not.
+
+### If it is revisited
+
+A working AIE2P W8A8 Q8_0 GEMV was built and verified during this work
+(exact against a CPU oracle, 44.7 GB/s, 13% faster per byte than the shipping
+`qwen_mtp_eh_proj` at 39.4) and then discarded with the rest of the route, since
+nothing consumed it. It is reconstructible from the geometry above: 4608-byte
+weight records of `[group][half][lane_group][k][lane]` int8 codes plus 8x16 f32
+scales, 1280-byte activation records with per-group scales and no activation
+sums, and two N=8 mmuls per 16-lane tile.
+
+The only untested lever is a W4A8 share, which halves NPU bytes and reaches
+N=16 on the mmul, plausibly 3-4x the contribution. It is a precision reduction
+against the model's Q8_0 weights and therefore an operator decision, and at best
+it multiplies a contribution that starts at ~3%.
 
 ## TODOs
 
