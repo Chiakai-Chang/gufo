@@ -288,11 +288,22 @@ nix develop -c tools/bench/build.sh w8a8_gemm_bench
 
 /tmp/bf16_gemm_bench -b 2048     # hipBLAS / hipBLASLt bar to beat
 /tmp/aotriton_attn_bench -i 5    # AOTriton flash-attention capability probe
+/tmp/asr_decode_gemv_bench       # batch-one decode GEMV vs the DRAM ceiling
 ```
 
 The `maxrel` column is relative error against the production kernel in the same
 run; `0.0e+00` means bit-identical. Winning variants are then ported into
 `src/` and re-validated through `nix build` plus their CTest oracle.
+
+**Size the working set like the model does.** Strix Halo has a 32 MB MALL, and a
+single decoder projection is 4-25 MB. Timing one shape in a repeat loop leaves it
+cache resident and reports 400-860 GB/s for a kernel that sustains 124 GB/s in
+the model. A decode-bandwidth harness must therefore allocate the whole per-token
+weight footprint and time a full token pass, which is what
+`tools/bench/asr_decode_gemv_bench.hip` does. The same caveat applies in reverse
+to non-temporal loads: `__builtin_nontemporal_load` bypasses the MALL, and on
+every streaming kernel measured so far it has cost more than half the achieved
+bandwidth rather than helping.
 
 ### Profiling
 
