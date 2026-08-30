@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -10,6 +11,8 @@
 #include <numbers>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -237,6 +240,49 @@ DftTable MakeDftTable() {
   return result;
 }
 
+/// Splits `count` items across the available cores and runs `body(begin, end)`
+/// on each contiguous range. Ranges never overlap and each range keeps its
+/// items in ascending order, so any per-item computation stays bit-identical to
+/// the serial loop.
+template<typename Body>
+void ForEachRange(std::size_t count, const Body& body) {
+  const unsigned int cores = std::max(1U, std::thread::hardware_concurrency());
+  const std::size_t workers =
+      std::min<std::size_t>(cores, std::max<std::size_t>(1U, count));
+  if (workers <= 1U) {
+    body(0U, count);
+    return;
+  }
+  const std::size_t span = (count + workers - 1U) / workers;
+  std::vector<std::thread> threads;
+  threads.reserve(workers - 1U);
+  for (std::size_t worker = 1U; worker < workers; ++worker) {
+    const std::size_t begin = worker * span;
+    if (begin >= count) {
+      break;
+    }
+    threads.emplace_back([&body, begin, end = std::min(begin + span, count)] {
+      body(begin, end);
+    });
+  }
+  body(0U, std::min(span, count));
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+}
+
+constexpr std::int64_t kResamplerRadius = 24;
+constexpr std::size_t kResamplerTaps =
+    2U * static_cast<std::size_t>(kResamplerRadius);
+
+/// One windowed-sinc resampler tap set for a single fractional output phase.
+struct ResamplerPhase {
+  std::array<double, kResamplerTaps> weights{};
+  std::array<std::int64_t, kResamplerTaps> offsets{};
+  std::size_t taps{0U};
+  double normalization{0.0};
+};
+
 }  // namespace
 
 bool DecodeWav(std::span<const std::byte> bytes, AudioBuffer* output,
@@ -276,7 +322,6 @@ std::vector<float> ResampleMono16k(const AudioBuffer& audio) {
   // A compact windowed-sinc converter avoids folding ultrasonic energy into
   // the speech band when validating 24 kHz Qwen3-TTS output. The 16 kHz
   // reference path above intentionally remains an exact copy.
-  constexpr std::int64_t kRadius = 24;
   const std::size_t output_frames = static_cast<std::size_t>(
       (static_cast<std::uint64_t>(input_frames) * kAudioSampleRate +
        audio.sample_rate - 1U) /
@@ -287,34 +332,58 @@ std::vector<float> ResampleMono16k(const AudioBuffer& audio) {
   const double cutoff =
       std::min(1.0, static_cast<double>(kAudioSampleRate) /
                         static_cast<double>(audio.sample_rate));
+  // Each tap weight depends only on `position - source`, and with
+  // `source = floor(position) + tap` that difference is the correctly-rounded
+  // value of `frac - tap` where `frac = position - floor(position)`. Two output
+  // frames with a bit-identical `frac` therefore produce bit-identical weights,
+  // so the 48 sine and cosine evaluations per output frame collapse to one
+  // evaluation per distinct fractional phase. A rate that is an exact multiple
+  // of 16 kHz has a single phase; 44.1 kHz has 160.
+  std::unordered_map<std::uint64_t, ResamplerPhase> phases;
   for (std::size_t frame = 0; frame < output_frames; ++frame) {
     const double position = static_cast<double>(frame) * scale;
     const auto center = static_cast<std::int64_t>(std::floor(position));
-    double weighted = 0.0;
-    double normalization = 0.0;
-    for (std::int64_t tap = -kRadius + 1; tap <= kRadius; ++tap) {
-      const std::int64_t source = center + tap;
-      const double distance = position - static_cast<double>(source);
-      const double phase = std::numbers::pi * cutoff * distance;
-      const double sinc = phase == 0.0 ? 1.0 : std::sin(phase) / phase;
-      const double window_position =
-          std::abs(distance) / static_cast<double>(kRadius);
-      if (window_position >= 1.0) {
-        continue;
+    const double fraction = position - static_cast<double>(center);
+    const std::uint64_t key = std::bit_cast<std::uint64_t>(fraction);
+
+    auto entry = phases.find(key);
+    if (entry == phases.end()) {
+      ResamplerPhase phase_taps;
+      for (std::int64_t tap = -kResamplerRadius + 1; tap <= kResamplerRadius;
+           ++tap) {
+        const double distance = position - static_cast<double>(center + tap);
+        const double window_position =
+            std::abs(distance) / static_cast<double>(kResamplerRadius);
+        if (window_position >= 1.0) {
+          continue;
+        }
+        const double phase = std::numbers::pi * cutoff * distance;
+        const double sinc = phase == 0.0 ? 1.0 : std::sin(phase) / phase;
+        const double window =
+            0.5 + 0.5 * std::cos(std::numbers::pi * window_position);
+        const double weight = cutoff * sinc * window;
+        phase_taps.offsets[phase_taps.taps] = tap;
+        phase_taps.weights[phase_taps.taps] = weight;
+        ++phase_taps.taps;
+        phase_taps.normalization += weight;
       }
-      const double window =
-          0.5 + 0.5 * std::cos(std::numbers::pi * window_position);
-      const double weight = cutoff * sinc * window;
+      entry = phases.emplace(key, phase_taps).first;
+    }
+
+    const ResamplerPhase& phase_taps = entry->second;
+    double weighted = 0.0;
+    for (std::size_t tap = 0; tap < phase_taps.taps; ++tap) {
       const std::int64_t reflected =
-          ReflectIndex(source, static_cast<std::int64_t>(input_frames));
+          ReflectIndex(center + phase_taps.offsets[tap],
+                       static_cast<std::int64_t>(input_frames));
       weighted +=
           static_cast<double>(mono[static_cast<std::size_t>(reflected)]) *
-          weight;
-      normalization += weight;
+          phase_taps.weights[tap];
     }
-    result[frame] = normalization == 0.0
-                        ? 0.0F
-                        : static_cast<float>(weighted / normalization);
+    result[frame] =
+        phase_taps.normalization == 0.0
+            ? 0.0F
+            : static_cast<float>(weighted / phase_taps.normalization);
   }
   return result;
 }
@@ -346,40 +415,59 @@ LogMelFeatures ComputeLogMelFeatures(std::span<const float> waveform) {
       1U + (padded.size() - kAudioFftSize) / kAudioHopLength;
   // WhisperFeatureExtractor intentionally drops the final centered STFT bin.
   const std::size_t frames = stft_frames - 1U;
+  // The windowed DFT is the dominant cost of the request's CPU work: 201 bins
+  // times 400 samples per frame, times about a hundred frames per audio second.
+  // Frames are independent and each frame keeps its own accumulation order, so
+  // spreading them across cores is bit-identical to the serial loop.
   std::vector<float> power(kFrequencyBins * frames, 0.0F);
   static const DftTable dft = MakeDftTable();
-  for (std::size_t frame = 0; frame < frames; ++frame) {
-    const float* samples = padded.data() + frame * kAudioHopLength;
-    for (std::size_t bin = 0; bin < kFrequencyBins; ++bin) {
-      double real = 0.0;
-      double imaginary = 0.0;
-      const std::size_t table_offset = bin * kAudioFftSize;
-      for (std::size_t sample = 0; sample < kAudioFftSize; ++sample) {
-        real += static_cast<double>(samples[sample]) *
-                dft.real[table_offset + sample];
-        imaginary += static_cast<double>(samples[sample]) *
-                     dft.imaginary[table_offset + sample];
+  ForEachRange(frames, [&](std::size_t begin, std::size_t end) {
+    for (std::size_t frame = begin; frame < end; ++frame) {
+      const float* samples = padded.data() + frame * kAudioHopLength;
+      for (std::size_t bin = 0; bin < kFrequencyBins; ++bin) {
+        double real = 0.0;
+        double imaginary = 0.0;
+        const std::size_t table_offset = bin * kAudioFftSize;
+        for (std::size_t sample = 0; sample < kAudioFftSize; ++sample) {
+          real += static_cast<double>(samples[sample]) *
+                  dft.real[table_offset + sample];
+          imaginary += static_cast<double>(samples[sample]) *
+                       dft.imaginary[table_offset + sample];
+        }
+        power[bin * frames + frame] =
+            static_cast<float>(real * real + imaginary * imaginary);
       }
-      power[bin * frames + frame] =
-          static_cast<float>(real * real + imaginary * imaginary);
     }
-  }
+  });
 
   static const MelFilterbank filters = MakeMelFilterbank();
   LogMelFeatures result;
   result.frames = frames;
   result.values.resize(kAudioMelBins * frames);
-  float maximum = -std::numeric_limits<float>::infinity();
-  for (std::size_t mel = 0; mel < kAudioMelBins; ++mel) {
-    for (std::size_t frame = 0; frame < frames; ++frame) {
-      float sum = 0.0F;
-      for (std::size_t bin = 0; bin < kFrequencyBins; ++bin) {
-        sum += filters[bin * kAudioMelBins + mel] * power[bin * frames + frame];
+  // Mel bands are independent too, and the running maximum is
+  // order-independent, so each worker keeps a private maximum that is combined
+  // afterwards.
+  std::vector<float> worker_maxima(kAudioMelBins,
+                                   -std::numeric_limits<float>::infinity());
+  ForEachRange(kAudioMelBins, [&](std::size_t begin, std::size_t end) {
+    for (std::size_t mel = begin; mel < end; ++mel) {
+      float band_maximum = -std::numeric_limits<float>::infinity();
+      for (std::size_t frame = 0; frame < frames; ++frame) {
+        float sum = 0.0F;
+        for (std::size_t bin = 0; bin < kFrequencyBins; ++bin) {
+          sum +=
+              filters[bin * kAudioMelBins + mel] * power[bin * frames + frame];
+        }
+        const float value = std::log10(std::max(sum, 1.0e-10F));
+        result.values[mel * frames + frame] = value;
+        band_maximum = std::max(band_maximum, value);
       }
-      const float value = std::log10(std::max(sum, 1.0e-10F));
-      result.values[mel * frames + frame] = value;
-      maximum = std::max(maximum, value);
+      worker_maxima[mel] = band_maximum;
     }
+  });
+  float maximum = -std::numeric_limits<float>::infinity();
+  for (const float value : worker_maxima) {
+    maximum = std::max(maximum, value);
   }
   const float floor = maximum - 8.0F;
   for (float& value : result.values) {
