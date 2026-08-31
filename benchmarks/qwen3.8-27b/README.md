@@ -546,6 +546,103 @@ request exercised DFlash-2 (40.8-75.3% draft acceptance in server telemetry),
 so this is a behavioral validation of the speculative path rather than only a
 model-load smoke test.
 
+### What the prefill gap actually costs (`opt-q4kxl-probe`)
+
+Two measurements reframe the prefill gap, and both contradict earlier
+reasoning recorded in this file.
+
+**llama.cpp on the same host, same shards.** `llama-bench -p 2048 -n 0`,
+build `169e4a7ff`:
+
+| Shard | gufo | llama.cpp |
+| --- | ---: | ---: |
+| UD-Q4_K_XL | ~466-476 | 374.62 |
+| UD-Q8_K_XL | ~487-499 | 341.29 |
+
+gufo is ahead on both, by 1.24x on Q4 and 1.47x on Q8. But llama.cpp's Q4 is
+**faster than its own Q8** (1.10x) while gufo's is slower (0.93x). "A K-quant
+costs more ALU per weight byte than Q8_0, so prefill must lose" is therefore
+not a property of the format. It is a property of this kernel.
+
+**The upper bound on fixing it.** `GUFO_KQUANT_PREFILL_TILE=drop-offset-probe`
+compiles the blocked GEMM with `HasOffset` forced false, deleting the Q4_K/Q5_K
+minimum correction. The result is WRONG -- the correctness gate rejects it with
+3.15% relative error on Q4_K and 1.64% on Q5_K, which is also a useful
+calibration of how much of the answer that term carries -- and it exists only
+to bound what an exact cheaper formulation could be worth. Interleaved
+`pp2048`, host load 1.25-1.77:
+
+| Pair | Q4 | Q4 minus the correction | Q8 |
+| --- | ---: | ---: | ---: |
+| 1 | 475.60 | 516.99 | 492.24 |
+| 2 | 472.95 | 512.36 | 491.17 |
+| 3 | 469.32 | 510.56 | 487.82 |
+| 4 | 468.09 | 510.57 | 498.91 |
+| **Median** | **471.14** | **511.47 (+8.6%)** | **491.71** |
+
+So the correction costs 8.6%, and without it **Q4 beats Q8 by 1.04x**. The
+card's definition of done is reachable; an earlier note in this file estimating
+the term at "roughly 7%, parity at best" understated it and is superseded.
+
+**Why the term is expensive, and the shape of an exact fix.** The correction is
+`sum_kb off[r,kb] * sx[t,kb]`, eight FMAs per accumulator group per K block,
+where `off = dmin[r,SB] * m[r,kb]` (`dmin` per 256-element superblock, `m` a
+6-bit index) and `sx[t,kb] = dx[t,kb] * qsum[t,kb]`. Factoring `dmin` out per
+superblock leaves `sum_{kb in SB} m[r,kb] * sx[t,kb]`, which is an eight-deep
+contraction over the K-block axis -- exactly the shape a `16x16x16` iu8 WMMA
+consumes, with `m` fitting `u8` directly.
+
+What blocks it today is `sx`: it is a float, because `dx` is a per-32-block
+activation scale. Two ways out, and the second is the one worth building:
+
+- Give the K-quant path a per-256 activation scale, matching the weight
+  superblock, so `dx` factors out of the contraction and `qsum` (14 bits) can be
+  split into two `int8` planes. This is what llama.cpp does -- Q8_K activations
+  for K-quant matmuls -- and is very likely why its Q4 beats its Q8. It changes
+  the main dot product's accuracy, not just the correction's.
+- Keep the exact per-32 `dx` for the main dot product and quantize only the
+  block sums, `sx[t,kb] = sigma[t,SB] * (256*hi + lo)` with `hi`/`lo` `int8`.
+  The correction then rides two iu8 WMMAs per superblock in place of sixty-four
+  FMAs, and the main GEMM's numerics are untouched. The 3.15% figure above
+  bounds the error budget: a single `int8` plane would land ~1e-4 relative,
+  a hundred times over the 1e-6 oracle tolerance, while the two-plane split
+  lands near 1.5e-8.
+
+Both need the correction's WMMA to contract over the K-block axis while the
+main WMMA contracts over the element axis, so a superblock's worth of `m` and
+`hi`/`lo` has to be buffered across the `BK=2` stages and issued at superblock
+boundaries. That is the next piece of work, not something this card landed.
+
+### Rejected: hoisting the verifier's weight fetch (`opt-q4kxl-hoist`)
+
+`SmallBatchKQuantExactFp32GEMMKernel` stages activations into LDS, syncs, then
+decodes the weight sub-blocks each lane owns. The weight fetch reads nothing
+the stage produces, so issuing it before the stage should put those loads in
+flight during the staging reads -- the only prefetch the kernel can afford,
+since the decoded sub-blocks are already live across the compute phase.
+
+It loses. Interleaved `tg128-dflash2`, fixed width 7, host load 1.04-1.62,
+with the pushed `main` binary carried as a third column to prove the flag's
+"off" path is unchanged:
+
+| Pair | `main` | flag off | hoisted |
+| --- | ---: | ---: | ---: |
+| 1 | 20.32 | 20.32 | 18.73 |
+| 2 | 20.28 | 20.27 | 18.79 |
+| 3 | 20.27 | 20.27 | 18.74 |
+| 4 | 20.28 | 20.26 | 18.76 |
+
+Median 20.28 -> 18.75, **-7.6%**, 4/4 pairs negative. The hoisted variant also
+allocates 120 VGPR with 68 private bytes/lane on IQ3_S at three rows, which is
+a dispatched instantiation, so it fails the no-scratch contract independently.
+Extending the decoded sub-blocks' live range across the staging loop and its
+barrier costs the allocator more than the earlier issue buys back; the
+in-order kernel already has twelve waves per SIMD to hide that latency with.
+The route stays selectable as `GUFO_KQUANT_SMALL_BATCH_FETCH=hoist`, in its own
+branch so the retained ordering compiles exactly as before -- confirmed by the
+resource table (Q5_K 112, Q4_K 104, IQ4_XS 104, Q6_K two-row 96 VGPR, zero
+scratch, identical to `main`) and by the paired measurement above.
+
 ### Speculative verifier occupancy (`opt-q4kxl-occ12`)
 
 Q4 wins unspeculated decode by 1.68x but converts that into only 1.61x under
@@ -711,11 +808,11 @@ activation stage a 256-token tile requires. Nothing about a wider macro tile
 reaches `BN = 256` without paying one of them.
 
 **What this leaves.** The Q4_K/Q5_K minimum correction is unchanged and remains
-the only large arithmetic term left, but its ceiling is now quantified rather
-than open: it is roughly 250 of the Q4_K kernel's 3413 instructions, so
-removing it entirely is worth about 7%. Applied to the `pp2048` measured in
-this session that is 466 -> ~500 against Q8's ~502 -- parity at best, not a
-win. The term is also a genuine rank-1 outer product per K block (eight FMAs
+the only large arithmetic term left. This section originally estimated it at
+"roughly 7%, parity at best" from instruction counts; that was measured
+directly afterwards and is wrong -- deleting the term is worth **8.6%** and
+puts Q4 **above** Q8. See "What the prefill gap actually costs
+(`opt-q4kxl-probe`)". The term is also a genuine rank-1 outer product per K block (eight FMAs
 produce eight outputs), and the WMMA path cannot absorb it: folding it into an
 integer WMMA over the K-block axis needs the activation scale `dx` to factor
 out of the sum over K blocks, and the Q8_1 activation layout carries one scale
@@ -776,6 +873,8 @@ depth. Read the Q8 section for the current state of the engine.
 | Q4_K/Q5_K activation-sum sidecar (`opt-q4kxl-actsum`) | Per-32-block activation sums written once beside the unchanged 576-byte Q8_1 tiles and staged through LDS, replacing eight in-kernel `sudot4` per token tile per K block that every row tile recomputed; `pp2048` median 466.59 -> 469.05 tok/s (+0.53%, 4/4 interleaved pairs positive), decode unaffected, `tg128-dflash2` 3/3 pairs slightly ahead | Direct-read sidecar: re-reads the sum from global inside the innermost token-tile loop instead of sharing one LDS read; `pp2048` median 454.98 tok/s (-2.49%, 4/4 pairs negative). Kept selectable with `GUFO_KQUANT_ACTIVATION_SUMS=direct` |
 | Prefill macro-tile width (`opt-q4kxl-wide`) | Nothing; the 128x128 eight-wave tile stands. The blocked kernel is now templated on its wave count and stages several token subtiles per wave, and out-of-range token tiles are clamped like rows instead of reading past the staged activation buffer (neutral: medians 466.08 -> 466.36) | `BN=256` in both shapes that reach it: 128x256 over sixteen waves (`pp2048` 466.36 -> 412.89, -11.5%, occupancy 6 -> 4 waves/SIMD), the same at a forced eight waves/SIMD (337.03, -27.7%, spills 12-252 private bytes/lane), and 64x256 over eight waves with `BK=1` (468.11 -> 359.12, -23.3%). Kept selectable with `GUFO_KQUANT_PREFILL_TILE=wide|wide-occ|narrow` |
 | Speculative verifier occupancy (`opt-q4kxl-occ12`) | Twelve wave32s per SIMD on the exact small-batch K-quant verifier, which turns its sixteen-wave workgroup residency from two blocks per CU into three; `tg128-dflash2` median 18.77 -> 20.29 tok/s (+8.1%, 4/4 interleaved pairs), zero scratch, `tg128` and `pp2048` untouched, DS4 eval 8/8 | The four-row geometry stays on the ten-wave hint: at twelve waves it caps at 120 VGPR and spills 12-88 private bytes/lane for every format. `GUFO_KQUANT_SMALL_BATCH_WAVES=10` pins the previous hint |
+| Prefill minimum-correction cost (`opt-q4kxl-probe`) | Nothing yet; the measurement itself. Deleting the Q4_K/Q5_K correction is worth +8.6% `pp2048` (471.14 -> 511.47) and puts Q4 **above** Q8's 491.71, so an exact cheaper formulation wins the card. llama.cpp on the same host shows the same shape from the other side: its Q4 beats its Q8 1.10x while gufo's loses 0.93x | The probe route itself: `GUFO_KQUANT_PREFILL_TILE=drop-offset-probe` is numerically wrong (3.15% on Q4_K, 1.64% on Q5_K) and the correctness gate rejects it. Measurement only |
+| Verifier weight-fetch order (`opt-q4kxl-hoist`) | Nothing; the in-order fetch stands | Hoisting the weight decode above the activation stage's barrier: `tg128-dflash2` 20.28 -> 18.75 (-7.6%, 4/4 pairs) and 68 private bytes/lane on a dispatched IQ3_S instantiation. Kept selectable with `GUFO_KQUANT_SMALL_BATCH_FETCH=hoist` |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |
 | Decode attention | Online softmax and 32-way split-K | Context-sized LDS scores and oversized GEMV launches |
@@ -947,12 +1046,11 @@ it multiplies a contribution that starts at ~3%.
   kernel, worth about 7% and therefore parity with Q8 at best. It is a per
   (row, K-block) constant times the per-token activation sum and resists the
   usual factorings: shifting the codes by round(offset/scale) only moves the
-  residual; it is rank-1 per K block so it cannot ride the existing WMMA; an
-  integer WMMA over the K-block axis would need the Q8_1 activation scale to be
-  per token rather than per token per block; and a bf16 WMMA's eight mantissa
-  bits put its error three orders of magnitude above the 1e-6 oracle tolerance.
-  A route that beats Q8 rather than reaching it needs a different idea than a
-  cheaper offset.
+  residual, and it is rank-1 per K block so it cannot ride the *existing* WMMA.
+  It can ride a *second* WMMA contracting over the K-block axis, which is the
+  next piece of work; see "What the prefill gap actually costs
+  (`opt-q4kxl-probe`)" for the two ways to make `sx` an `int8` operand and for
+  the measurement showing the term is worth 8.6% and enough to beat Q8.
 - Consider whether a per-tensor requantization of Q4_K/Q5_K to Q8_0 in scratch
   before prefill is worth measuring. It replaces sixteen in-kernel decodes with
   one and hands the untouched W8A8 blocked kernel the result, but it also

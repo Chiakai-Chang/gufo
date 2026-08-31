@@ -200,6 +200,43 @@ KQuantSmallBatchOccupancyFromEnv() noexcept {
   return waves;
 }
 
+// opt-q4kxl-hoist: where the exact small-batch K-quant verifier issues its
+// weight loads relative to the activation stage.
+//
+// The kernel stages a tile of FP32 activations into LDS, syncs, then decodes
+// the weight sub-blocks each lane owns and multiplies. The weight fetch does
+// not read anything the stage produces, so waiting behind the stage's barrier
+// exposes its latency at the top of every tile iteration. `hoist` issues it
+// first, which is the only prefetch this kernel can afford for free: the
+// decoded sub-blocks are already live across the whole compute phase, so
+// extending them over one barrier adds no registers and cannot cost the third
+// resident workgroup that `GUFO_KQUANT_SMALL_BATCH_WAVES=12` buys.
+//
+// The arithmetic is untouched -- same terms, same order -- so the bit-exact
+// contract against the decode GEMV holds by construction.
+enum class KQuantSmallBatchFetch : std::uint8_t {
+  kInOrder,
+  kHoisted,
+};
+
+[[nodiscard]] inline KQuantSmallBatchFetch ResolveKQuantSmallBatchFetch(
+    const char* value) noexcept {
+  if (value == nullptr) {
+    return KQuantSmallBatchFetch::kHoisted;
+  }
+  const std::string_view text{value};
+  return text == "0" || text == "in-order" || text == "inorder"
+             ? KQuantSmallBatchFetch::kInOrder
+             : KQuantSmallBatchFetch::kHoisted;
+}
+
+[[nodiscard]] inline KQuantSmallBatchFetch
+KQuantSmallBatchFetchFromEnv() noexcept {
+  static const KQuantSmallBatchFetch fetch = ResolveKQuantSmallBatchFetch(
+      std::getenv("GUFO_KQUANT_SMALL_BATCH_FETCH"));
+  return fetch;
+}
+
 // opt-q4kxl-actsum: Q4_K/Q5_K blocked WMMA needs the sum of each quantized
 // 32-element activation block for its minimum correction. Computing it in the
 // kernel costs eight `sudot4` per token tile per K block, and every row tile in
@@ -266,6 +303,9 @@ enum class KQuantPrefillTile : std::uint8_t {
   kWide,
   kWideForcedOccupancy,
   kNarrowRows,
+  // Measurement only, and numerically WRONG: deletes the Q4_K/Q5_K minimum
+  // correction to bound what an exact cheaper formulation could ever be worth.
+  kDropOffsetProbe,
 };
 
 [[nodiscard]] inline KQuantPrefillTile ResolveKQuantPrefillTile(
@@ -279,6 +319,9 @@ enum class KQuantPrefillTile : std::uint8_t {
   }
   if (text == "narrow" || text == "64x256") {
     return KQuantPrefillTile::kNarrowRows;
+  }
+  if (text == "drop-offset-probe") {
+    return KQuantPrefillTile::kDropOffsetProbe;
   }
   return text == "wide" || text == "256" || text == "1"
              ? KQuantPrefillTile::kWide

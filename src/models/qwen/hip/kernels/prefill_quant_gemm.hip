@@ -734,7 +734,7 @@ __launch_bounds__(256) __global__
 // so this kernel is latency-bound rather than occupancy-bound.
 template<int BM, int BN, int BK, int WM, int WN, core::GgmlType WType,
          bool UsePrecomputedSums, bool StagePrecomputedSums,
-         bool ForceOccupancy = false>
+         bool ForceOccupancy = false, bool DropOffsetProbe = false>
 // `ForceOccupancy` asks the allocator for eight wave32s per SIMD instead of
 // letting it settle. It exists only so the 512-thread tile can be measured at
 // two workgroups per CU as well as one; see the opt-q4kxl-wide write-up.
@@ -748,8 +748,14 @@ __launch_bounds__(WM * WN * 32, ForceOccupancy ? 8 : 1) __global__
   // explicit minimum. The two properties never co-occur.
   constexpr bool PerHalfScale =
       WType == core::GgmlType::kQ6_K || WType == core::GgmlType::kQ3_K;
+  // `DropOffsetProbe` deletes the Q4_K/Q5_K minimum correction outright. The
+  // result is WRONG -- `w = scale*q - offset` is not `scale*q` -- and it exists
+  // only to measure what a hypothetical free correction would be worth, which
+  // is the upper bound on any exact reformulation. It is never a production
+  // route and the correctness gate rejects it.
   constexpr bool HasOffset =
-      WType == core::GgmlType::kQ4_K || WType == core::GgmlType::kQ5_K;
+      (WType == core::GgmlType::kQ4_K || WType == core::GgmlType::kQ5_K) &&
+      !DropOffsetProbe;
   static_assert(!StagePrecomputedSums || UsePrecomputedSums);
   // The block is WM*WN waves of 32 lanes. Eight waves (256 threads) is the
   // production shape; sixteen waves (512 threads) is what makes BN=256
@@ -1782,7 +1788,7 @@ std::size_t QuantizedActivationBytes(std::size_t batch, std::size_t k) {
 // dependency chain and lost 11% when the same kind of hint was applied to it.
 template<std::uint32_t WavesPerBlock, std::size_t Batch,
          std::size_t RowsPerWave, core::GgmlType WType,
-         std::uint32_t MinWavesPerSimd = 10>
+         std::uint32_t MinWavesPerSimd = 10, bool HoistWeightDecode = false>
 __launch_bounds__(WavesPerBlock * 32, MinWavesPerSimd) __global__
     void SmallBatchKQuantExactFp32GEMMKernel(const void* __restrict__ w,
                                              const float* __restrict__ x,
@@ -1812,6 +1818,28 @@ __launch_bounds__(WavesPerBlock * 32, MinWavesPerSimd) __global__
 
   for (std::size_t tile_base = 0; tile_base < num_sub;
        tile_base += kSubsPerTile) {
+    const std::size_t sub = tile_base + lane;
+    // opt-q4kxl-hoist: the weight fetch reads nothing the activation stage
+    // produces, so it need not wait behind the stage's barrier. This branch
+    // issues it first, putting the lane's weight loads in flight while the
+    // block is still reading activations. It is a rejected route kept
+    // selectable; it lives in its own array so that with the flag off the
+    // retained ordering below compiles exactly as it did before the flag
+    // existed.
+    QuantSub16 hoisted[HoistWeightDecode ? RowsPerWave : 1];
+    if constexpr (HoistWeightDecode) {
+      if (sub < num_sub) {
+#pragma unroll
+        for (std::size_t r = 0; r < RowsPerWave; ++r) {
+          const std::size_t row = row_base + r;
+          const std::size_t safe_row = row < m ? row : m - 1;
+          DecodeQuantSub16(
+              WType,
+              static_cast<const std::uint8_t*>(w) + (safe_row * row_bytes), sub,
+              hoisted[r]);
+        }
+      }
+    }
     // One thread stages a whole (token, sub-block) so it can accumulate that
     // sub-block's activation sum sequentially while it has the values.
     for (std::size_t flat = threadIdx.x; flat < Batch * kSubsPerTile;
@@ -1839,16 +1867,20 @@ __launch_bounds__(WavesPerBlock * 32, MinWavesPerSimd) __global__
     }
     __syncthreads();
 
-    const std::size_t sub = tile_base + lane;
     if (sub < num_sub) {
       QuantSub16 decoded[RowsPerWave];
 #pragma unroll
       for (std::size_t r = 0; r < RowsPerWave; ++r) {
-        const std::size_t row = row_base + r;
-        const std::size_t safe_row = row < m ? row : m - 1;
-        DecodeQuantSub16(
-            WType, static_cast<const std::uint8_t*>(w) + (safe_row * row_bytes),
-            sub, decoded[r]);
+        if constexpr (HoistWeightDecode) {
+          decoded[r] = hoisted[r];
+        } else {
+          const std::size_t row = row_base + r;
+          const std::size_t safe_row = row < m ? row : m - 1;
+          DecodeQuantSub16(
+              WType,
+              static_cast<const std::uint8_t*>(w) + (safe_row * row_bytes), sub,
+              decoded[r]);
+        }
       }
       float dots[RowsPerWave][Batch] = {};
 #pragma unroll
@@ -1923,7 +1955,7 @@ constexpr std::size_t kKQuantSmallBatchWarps = 16;
 constexpr std::size_t kKQuantSmallBatchRowsPerWave = 2;
 
 template<std::size_t RowsPerWave, core::GgmlType WType,
-         std::uint32_t MinWavesPerSimd>
+         std::uint32_t MinWavesPerSimd, bool HoistWeightDecode>
 void LaunchKQuantSmallBatchTyped(const void* w, const float* fp32_x, float* y,
                                  std::size_t batch, std::size_t m,
                                  std::size_t k, dim3 grid, dim3 block,
@@ -1931,7 +1963,8 @@ void LaunchKQuantSmallBatchTyped(const void* w, const float* fp32_x, float* y,
 #define GUFO_KQUANT_SMALL_BATCH(N)                                           \
   case N:                                                                    \
     SmallBatchKQuantExactFp32GEMMKernel<kKQuantSmallBatchWarps, N,           \
-                                        RowsPerWave, WType, MinWavesPerSimd> \
+                                        RowsPerWave, WType, MinWavesPerSimd, \
+                                        HoistWeightDecode>                   \
         <<<grid, block, 0, stream>>>(w, fp32_x, y, m, k);                    \
     return;
   switch (batch) {
@@ -1949,7 +1982,8 @@ void LaunchKQuantSmallBatchTyped(const void* w, const float* fp32_x, float* y,
 #undef GUFO_KQUANT_SMALL_BATCH
 }
 
-template<std::size_t RowsPerWave, std::uint32_t MinWavesPerSimd>
+template<std::size_t RowsPerWave, std::uint32_t MinWavesPerSimd,
+         bool HoistWeightDecode>
 void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
                                   const float* fp32_x, float* y,
                                   std::size_t batch, std::size_t m,
@@ -1958,13 +1992,13 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
   switch (type) {
     case core::GgmlType::kQ4_K:
       LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ4_K,
-                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
-                                                   grid, block, stream);
+                                  MinWavesPerSimd, HoistWeightDecode>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kQ5_K:
       LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ5_K,
-                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
-                                                   grid, block, stream);
+                                  MinWavesPerSimd, HoistWeightDecode>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kQ6_K:
       if constexpr (RowsPerWave == 3) {
@@ -1976,33 +2010,34 @@ void LaunchKQuantSmallBatchByType(core::GgmlType type, const void* w,
         const dim3 reference_grid(
             static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
         LaunchKQuantSmallBatchTyped<kKQuantSmallBatchRowsPerWave,
-                                    core::GgmlType::kQ6_K, MinWavesPerSimd>(
+                                    core::GgmlType::kQ6_K, MinWavesPerSimd,
+                                    HoistWeightDecode>(
             w, fp32_x, y, batch, m, k, reference_grid, block, stream);
       } else {
         LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ6_K,
-                                    MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
-                                                     grid, block, stream);
+                                    MinWavesPerSimd, HoistWeightDecode>(
+            w, fp32_x, y, batch, m, k, grid, block, stream);
       }
       return;
     case core::GgmlType::kQ3_K:
       LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kQ3_K,
-                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
-                                                   grid, block, stream);
+                                  MinWavesPerSimd, HoistWeightDecode>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kIQ4_NL:
       LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ4_NL,
-                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
-                                                   grid, block, stream);
+                                  MinWavesPerSimd, HoistWeightDecode>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kIQ4_XS:
       LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ4_XS,
-                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
-                                                   grid, block, stream);
+                                  MinWavesPerSimd, HoistWeightDecode>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     case core::GgmlType::kIQ3_S:
       LaunchKQuantSmallBatchTyped<RowsPerWave, core::GgmlType::kIQ3_S,
-                                  MinWavesPerSimd>(w, fp32_x, y, batch, m, k,
-                                                   grid, block, stream);
+                                  MinWavesPerSimd, HoistWeightDecode>(
+          w, fp32_x, y, batch, m, k, grid, block, stream);
       return;
     default:
       return;
@@ -2049,6 +2084,16 @@ void LaunchKQuantWmmaGEMMTypedImpl(const void* w, const void* q8_1_x, float* y,
       WKQuantA8BlockedWmmaGEMMKernel<kNarrowBM, kNarrowBN, 1, 2, 4, WType,
                                      UsePrecomputedSums, StagePrecomputedSums>
           <<<narrow_grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
+      return;
+    }
+    if (tile == detail::KQuantPrefillTile::kDropOffsetProbe) {
+      constexpr int kBN = 128;
+      const dim3 probe_grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
+                            static_cast<unsigned int>((m + kBM - 1) / kBM));
+      WKQuantA8BlockedWmmaGEMMKernel<kBM, kBN, 2, 4, 2, WType,
+                                     UsePrecomputedSums, StagePrecomputedSums,
+                                     false, true>
+          <<<probe_grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
       return;
     }
     if (tile != detail::KQuantPrefillTile::kDefault) {
@@ -2324,17 +2369,26 @@ void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
     // three-row geometries reach 96-112 VGPR with no scratch.
     const bool twelve_waves = detail::KQuantSmallBatchOccupancyFromEnv() ==
                               detail::KQuantSmallBatchOccupancy::kTwelveWaves;
+    const bool hoist = detail::KQuantSmallBatchFetchFromEnv() ==
+                       detail::KQuantSmallBatchFetch::kHoisted;
     const auto dispatch_rows = [&]<std::size_t RowsPerWave>() {
       constexpr std::size_t kRowsPerBlock = kKWarpsPerBlock * RowsPerWave;
       const dim3 grid(
           static_cast<unsigned int>((m + kRowsPerBlock - 1) / kRowsPerBlock));
-      if (twelve_waves && RowsPerWave != 4) {
-        LaunchKQuantSmallBatchByType<RowsPerWave, 12>(
+      const auto launch = [&]<std::uint32_t Waves, bool Hoist>() {
+        LaunchKQuantSmallBatchByType<RowsPerWave, Waves, Hoist>(
             type, w, fp32_x, y, batch, m, k, grid, block, stream);
-        return;
+      };
+      const bool waves12 = twelve_waves && RowsPerWave != 4;
+      if (waves12 && hoist) {
+        launch.template operator()<12, true>();
+      } else if (waves12) {
+        launch.template operator()<12, false>();
+      } else if (hoist) {
+        launch.template operator()<10, true>();
+      } else {
+        launch.template operator()<10, false>();
       }
-      LaunchKQuantSmallBatchByType<RowsPerWave, 10>(type, w, fp32_x, y, batch,
-                                                    m, k, grid, block, stream);
     };
     if (detail::KQuantSmallBatchRowsFromEnv() ==
         detail::KQuantSmallBatchRows::kFour) {
