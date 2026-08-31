@@ -613,6 +613,50 @@ main WMMA contracts over the element axis, so a superblock's worth of `m` and
 `hi`/`lo` has to be buffered across the `BK=2` stages and issued at superblock
 boundaries. That is the next piece of work, not something this card landed.
 
+### Where the prefill instructions actually go (`opt-q4kxl-isa`)
+
+`tools/prof/isa_mix.py` over the emitted gfx1151 assembly, the production
+`BM=128/BN=128/BK=2/WM=4/WN=2` instantiations:
+
+| Kernel | Total | fp32 FMA/mul/add | `s_delay_alu` | WMMA |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K, production | 3,481 | 297 | 527 | 32 |
+| Q4_K, correction compiled out | 3,141 | 166 | 412 | 32 |
+| Q5_K, production | 3,536 | 300 | 526 | 32 |
+| Q8_0 (`W8A8`, for reference) | 3,049 | -- | -- | 32 |
+
+The correction is **340 instructions, 9.8%** -- which lines up with the 8.6%
+the `drop-offset-probe` measured end to end, so for this kernel runtime tracks
+static instruction count closely enough to predict changes before building them.
+
+Against Q8_0's 3,049 that makes the correction **79% of the entire Q4-versus-Q8
+instruction gap**. Everything else about decoding a K-quant in-kernel -- the
+SWAR nibble unpack, the scale-pair extraction, the `V_PERM_B32` codebook --
+costs about 92 instructions in total. There is no second thing to fix.
+
+Two things this ruled out that had looked promising:
+
+- **Epilogue address arithmetic is not worth attacking.** `v_mad_u64_u32` (194)
+  plus `v_add_co_u32` (173) is 367 instructions, 10.5% of the listing and
+  comparable to the correction itself. But the epilogue runs *once per block*
+  while the K loop runs `num_kb / BK` = 64 times at k=4096, so those 367
+  instructions are well under 1% of dynamic issue. This is also the reason the
+  earlier "strength-reduced store addressing" experiment measured neutral: it
+  was optimizing code that executes once. The same applies to the note about
+  both kernels spending "~44% of VALU on 64-bit epilogue address arithmetic" --
+  true of the listing, not of the runtime.
+- **The correction's cost is not a dependency chain.** It adds +131 fp32 FMAs
+  and +115 `s_delay_alu`, and stall hints nearly equalling the arithmetic
+  suggested that the two back-to-back accumulates into the same `acc` register
+  were serialising. `GUFO_KQUANT_PREFILL_TILE=fuse` folds the correction into
+  the main term so `acc` takes one accumulate instead of two, at the cost of one
+  extra multiply per output. The listing goes to 3,635 instructions with
+  `s_delay_alu` *rising* to 545, and it measures 471.88 -> 459.28 tok/s
+  (**-2.7%**, 3/3 pairs negative). The scheduler was not stalling on `acc`.
+
+What is left is the term itself, and the operand-gathering WMMA rewrite
+described below is the only route to it.
+
 ### Rejected: one K block per stage (`opt-q4kxl-bk1`)
 
 The probe above shows the correction also costs registers: deleting it drops
@@ -795,6 +839,59 @@ row geometries; `--validate-prefill 1024` is unchanged at top-1 `198`, rmse
 against the pinned DS4 fixture on a speculative Q4 server passed 8, failed 0,
 execution errors 0.
 
+### Context depth, UD-Q4_K_XL against Q8_K_XL
+
+Single-repetition sweeps on a quiet host, both shards through the same binary,
+`--n-depth 0,4096,8192,16384`.
+
+`pp2048`:
+
+| Depth | UD-Q4_K_XL | Q8_K_XL | Q4/Q8 |
+| ---: | ---: | ---: | ---: |
+| 0 | 474.92 | 506.05 | 0.938 |
+| 4096 | 450.19 | 481.56 | 0.935 |
+| 8192 | 430.54 | 461.12 | 0.934 |
+| 16384 | 396.93 | 422.31 | 0.940 |
+
+The ratio is flat -- 0.934 to 0.940 across a 16K span -- and the two shards
+retain almost identically from depth 0 to 16384 (83.6% against 83.4%). The
+prefill deficit is therefore entirely the GEMM arithmetic; attention and KV
+scaling contribute none of it. That agrees with the `GUFO_PROFILE` stage rollup
+and with the `opt-q4kxl-probe` measurement, and it rules out any
+depth-dependent cause.
+
+`tg128`:
+
+| Depth | UD-Q4_K_XL | Q8_K_XL | Q4/Q8 |
+| ---: | ---: | ---: | ---: |
+| 0 | 11.62 | 6.80 | 1.71 |
+| 4096 | 11.49 | 6.74 | 1.70 |
+| 8192 | 11.31 | 6.56 | 1.72 |
+| 16384 | 10.91 | 6.53 | 1.67 |
+
+The 1.7x decode win holds to 16K. Q4 retains 93.9% of its depth-0 rate against
+Q8's 96.0%: the depth-dependent KV traffic is a larger share of Q4's total
+because its weight traffic is smaller. Both cross to the split-K (non-graph)
+decode path at 4K and neither shows a cliff there.
+
+`tg128-dflash2`, which is the one sweep that must be read **down the columns,
+never across the rows**:
+
+| Depth | Twelve waves/SIMD (default) | Ten waves/SIMD |
+| ---: | ---: | ---: |
+| 0 | 18.78 | 17.33 |
+| 4096 | 12.60 | 11.64 |
+| 8192 | 33.13 | 30.69 |
+| 16384 | 12.69 | 10.75 |
+
+The 33.13 at depth 8192 is not a depth effect. Each depth primes a different
+continuation, and speculative throughput tracks how many drafted tokens that
+continuation gets accepted -- the same reason the dflash2 row elsewhere in this
+file is reported as a range. What the columns do show is that the retained
+twelve-wave hint (`opt-q4kxl-occ12`) wins at every depth: +8.4%, +8.2%, +8.0%
+and +18.0%. Host load had drifted to 2.31 by the last pair, so that row is the
+least trustworthy of the four, though both of its arms ran adjacent.
+
 ### Prefill macro-tile width (`opt-q4kxl-wide`)
 
 The prefill gap is arithmetic, and the largest single arithmetic term that is
@@ -937,6 +1034,7 @@ depth. Read the Q8 section for the current state of the engine.
 | Prefill macro-tile width (`opt-q4kxl-wide`) | Nothing; the 128x128 eight-wave tile stands. The blocked kernel is now templated on its wave count and stages several token subtiles per wave, and out-of-range token tiles are clamped like rows instead of reading past the staged activation buffer (neutral: medians 466.08 -> 466.36) | `BN=256` in both shapes that reach it: 128x256 over sixteen waves (`pp2048` 466.36 -> 412.89, -11.5%, occupancy 6 -> 4 waves/SIMD), the same at a forced eight waves/SIMD (337.03, -27.7%, spills 12-252 private bytes/lane), and 64x256 over eight waves with `BK=1` (468.11 -> 359.12, -23.3%). Kept selectable with `GUFO_KQUANT_PREFILL_TILE=wide|wide-occ|narrow` |
 | Speculative verifier occupancy (`opt-q4kxl-occ12`) | Twelve wave32s per SIMD on the exact small-batch K-quant verifier, which turns its sixteen-wave workgroup residency from two blocks per CU into three; `tg128-dflash2` median 18.77 -> 20.29 tok/s (+8.1%, 4/4 interleaved pairs), zero scratch, `tg128` and `pp2048` untouched, DS4 eval 8/8 | The four-row geometry stays on the ten-wave hint: at twelve waves it caps at 120 VGPR and spills 12-88 private bytes/lane for every format. `GUFO_KQUANT_SMALL_BATCH_WAVES=10` pins the previous hint |
 | Prefill minimum-correction cost (`opt-q4kxl-probe`) | Nothing yet; the measurement itself. Deleting the Q4_K/Q5_K correction is worth +8.6% `pp2048` (471.14 -> 511.47) and puts Q4 **above** Q8's 491.71, so an exact cheaper formulation wins the card. llama.cpp on the same host shows the same shape from the other side: its Q4 beats its Q8 1.10x while gufo's loses 0.93x | The probe route itself: `GUFO_KQUANT_PREFILL_TILE=drop-offset-probe` is numerically wrong (3.15% on Q4_K, 1.64% on Q5_K) and the correctness gate rejects it. Measurement only |
+| Prefill instruction accounting (`opt-q4kxl-isa`) | The measurement: the minimum correction is 340 of the 432-instruction Q4-vs-Q8 gap (79%), and all other K-quant decode is ~92. Epilogue address arithmetic (367 instructions) runs once per block and is under 1% of dynamic issue, which retrospectively explains the neutral store-addressing result | Folding the correction into the main term to shorten the `acc` chain (`GUFO_KQUANT_PREFILL_TILE=fuse`): 3,481 -> 3,635 instructions, `s_delay_alu` 527 -> 545, `pp2048` 471.88 -> 459.28 (-2.7%, 3/3 pairs) |
 | Prefill stage depth (`opt-q4kxl-bk1`) | Nothing; `BK=2` stands | One K block per stage: LDS 19,456 -> 10,240 and VGPR 240 -> 200, but `pp2048` 469.55 -> 355.54 (-24.3%, 4/4 pairs). Isolates the earlier `narrow` rejection as a `BK=1` effect rather than a 64-row-tile one. Kept selectable with `GUFO_KQUANT_PREFILL_TILE=bk1` |
 | Verifier weight-fetch order (`opt-q4kxl-hoist`) | Nothing; the in-order fetch stands | Hoisting the weight decode above the activation stage's barrier: `tg128-dflash2` 20.28 -> 18.75 (-7.6%, 4/4 pairs) and 68 private bytes/lane on a dispatched IQ3_S instantiation. Kept selectable with `GUFO_KQUANT_SMALL_BATCH_FETCH=hoist` |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |

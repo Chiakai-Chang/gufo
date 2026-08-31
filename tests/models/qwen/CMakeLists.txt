@@ -227,6 +227,13 @@ if (ENGINE_ENABLE_HIP)
     LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-bk1"
     ENVIRONMENT "GUFO_KQUANT_PREFILL_TILE=bk1"
     SKIP_RETURN_CODE 77)
+  # opt-q4kxl-fuse: the rejected fused-correction ordering stays covered.
+  add_test(NAME qwen_q4kxl_quant_fused_offset_ops_test
+    COMMAND qwen_q4kxl_quant_ops_test)
+  set_tests_properties(qwen_q4kxl_quant_fused_offset_ops_test PROPERTIES
+    LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;k-quant;iquant;opt-q4kxl;opt-q4kxl-fuse"
+    ENVIRONMENT "GUFO_KQUANT_PREFILL_TILE=fuse"
+    SKIP_RETURN_CODE 77)
   add_test(NAME qwen_q4kxl_quant_narrow_tile_ops_test
     COMMAND qwen_q4kxl_quant_ops_test)
   set_tests_properties(qwen_q4kxl_quant_narrow_tile_ops_test PROPERTIES

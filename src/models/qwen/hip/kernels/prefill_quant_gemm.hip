@@ -734,7 +734,8 @@ __launch_bounds__(256) __global__
 // so this kernel is latency-bound rather than occupancy-bound.
 template<int BM, int BN, int BK, int WM, int WN, core::GgmlType WType,
          bool UsePrecomputedSums, bool StagePrecomputedSums,
-         bool ForceOccupancy = false, bool DropOffsetProbe = false>
+         bool ForceOccupancy = false, bool DropOffsetProbe = false,
+         bool FuseOffsetTerm = false>
 // `ForceOccupancy` asks the allocator for eight wave32s per SIMD instead of
 // letting it settle. It exists only so the 512-thread tile can be measured at
 // two workgroups per CU as well as one; see the opt-q4kxl-wide write-up.
@@ -1088,12 +1089,29 @@ __launch_bounds__(WM * WN * 32, ForceOccupancy ? 8 : 1) __global__
             int32x8_t c = {0, 0, 0, 0, 0, 0, 0, 0};
             c = Wmma_16x16x16_iu8<true>(a0[i], b0, c);
             c = Wmma_16x16x16_iu8<true>(a1[i], b1, c);
+            // opt-q4kxl-fuse: with the minimum correction applied as a second
+            // accumulate, `acc` takes two dependent FMAs per K block and the
+            // scheduler pays for it -- an ISA dump puts the correction at +131
+            // fp32 FMAs and +115 `s_delay_alu` against the same kernel with the
+            // term compiled out. Folding the correction into the main term
+            // first leaves one accumulate, so the chain on `acc` is half as
+            // long, at the cost of one extra multiply per output.
+            if constexpr (HasOffset && FuseOffsetTerm) {
 #pragma unroll
-            for (int l = 0; l < 8; ++l) {
-              acc[i][j][l] += (dw0[i][l] * dx) * static_cast<float>(c[l]);
+              for (int l = 0; l < 8; ++l) {
+                const float term =
+                    ((dw0[i][l] * dx) * static_cast<float>(c[l])) -
+                    (off[i][l] * sx);
+                acc[i][j][l] += term;
+              }
+            } else {
+#pragma unroll
+              for (int l = 0; l < 8; ++l) {
+                acc[i][j][l] += (dw0[i][l] * dx) * static_cast<float>(c[l]);
+              }
             }
           }
-          if constexpr (HasOffset) {
+          if constexpr (HasOffset && !(FuseOffsetTerm && !PerHalfScale)) {
 #pragma unroll
             for (int l = 0; l < 8; ++l) {
               acc[i][j][l] -= off[i][l] * sx;
@@ -2098,6 +2116,16 @@ void LaunchKQuantWmmaGEMMTypedImpl(const void* w, const void* q8_1_x, float* y,
       WKQuantA8BlockedWmmaGEMMKernel<kNarrowBM, kNarrowBN, 1, 2, 4, WType,
                                      UsePrecomputedSums, StagePrecomputedSums>
           <<<narrow_grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
+      return;
+    }
+    if (tile == detail::KQuantPrefillTile::kFusedOffset) {
+      constexpr int kBN = 128;
+      const dim3 fused_grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
+                            static_cast<unsigned int>((m + kBM - 1) / kBM));
+      WKQuantA8BlockedWmmaGEMMKernel<kBM, kBN, 2, 4, 2, WType,
+                                     UsePrecomputedSums, StagePrecomputedSums,
+                                     false, false, true>
+          <<<fused_grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
       return;
     }
     if (tile == detail::KQuantPrefillTile::kSingleKBlock) {
