@@ -1111,50 +1111,64 @@ __launch_bounds__(WM * WN * 32, ForceOccupancy ? 8 : 1) __global__
   // 512-thread shape needs 16 KB, which is what `s_b` is at BK=2 with BN=256.
   // Pick whichever staging array actually covers the requirement -- both are
   // dead by this point, and the __syncthreads above orders the reuse.
-  constexpr int kEpilogueBytes = kWaves * 256 * static_cast<int>(sizeof(float));
-  constexpr bool kEpilogueInA = static_cast<int>(sizeof(s_a)) >= kEpilogueBytes;
-  static_assert(
-      kEpilogueInA || static_cast<int>(sizeof(s_b)) >= kEpilogueBytes,
-      "no staging array is large enough to hold every wave's output tile");
-  float* tile_scratch =
-      (kEpilogueInA ? reinterpret_cast<float*>(&s_a[0][0][0])
-                    : reinterpret_cast<float*>(&s_b[0][0][0])) +
-      (wave_id * 256);
+  // A stage buffer big enough for every wave at once is not guaranteed: at
+  // BK=1 each of `s_a` and `s_b` is only 4 KB while eight waves want 8 KB. Take
+  // the larger array, work out how many waves it holds, and run the epilogue in
+  // that many passes. The extra barriers are per block, not per K stage.
+  constexpr int kScratchBytes =
+      static_cast<int>(sizeof(s_a) > sizeof(s_b) ? sizeof(s_a) : sizeof(s_b));
+  constexpr int kWavesPerPass = kScratchBytes / (256 * 4);
+  static_assert(kWavesPerPass >= 1,
+                "no staging array holds even one wave's output tile");
+  constexpr int kEpiloguePasses = (kWaves + kWavesPerPass - 1) / kWavesPerPass;
+  float* const scratch_base =
+      (sizeof(s_a) > sizeof(s_b) ? reinterpret_cast<float*>(&s_a[0][0][0])
+                                 : reinterpret_cast<float*>(&s_b[0][0][0]));
+  float* tile_scratch = scratch_base + ((wave_id % kWavesPerPass) * 256);
 #pragma unroll
-  for (int i = 0; i < kWaveRowTiles; ++i) {
-#pragma unroll
-    for (int j = 0; j < kWaveTokTiles; ++j) {
-#pragma unroll
-      for (int l = 0; l < 8; ++l) {
-        tile_scratch[(sub_lane * 16) + (2 * l) + half_id] = acc[i][j][l];
+  for (int pass = 0; pass < kEpiloguePasses; ++pass) {
+    if constexpr (kEpiloguePasses > 1) {
+      __syncthreads();
+      if ((wave_id / kWavesPerPass) != pass) {
+        continue;
       }
-      __builtin_amdgcn_wave_barrier();
-      const std::size_t r0 =
-          r_block +
-          static_cast<std::size_t>((((wave_row * kWaveRowTiles) + i) * 16));
-      const std::size_t t0 =
-          t_block +
-          static_cast<std::size_t>((((wave_tok * kWaveTokTiles) + j) * 16));
-      if (t0 + 16 <= batch && r0 + 16 <= m) {
-        const std::size_t out_base = (t0 * m) + r0;
+    }
 #pragma unroll
-        for (int s = 0; s < 8; ++s) {
-          const int flat = (s * 32) + lane_id;
-          y[out_base + (static_cast<std::size_t>(flat >> 4) * m) +
-            static_cast<std::size_t>(flat & 15)] = tile_scratch[flat];
+    for (int i = 0; i < kWaveRowTiles; ++i) {
+#pragma unroll
+      for (int j = 0; j < kWaveTokTiles; ++j) {
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+          tile_scratch[(sub_lane * 16) + (2 * l) + half_id] = acc[i][j][l];
         }
-      } else {
+        __builtin_amdgcn_wave_barrier();
+        const std::size_t r0 =
+            r_block +
+            static_cast<std::size_t>((((wave_row * kWaveRowTiles) + i) * 16));
+        const std::size_t t0 =
+            t_block +
+            static_cast<std::size_t>((((wave_tok * kWaveTokTiles) + j) * 16));
+        if (t0 + 16 <= batch && r0 + 16 <= m) {
+          const std::size_t out_base = (t0 * m) + r0;
 #pragma unroll
-        for (int s = 0; s < 8; ++s) {
-          const int flat = (s * 32) + lane_id;
-          const std::size_t tok = t0 + static_cast<std::size_t>(flat >> 4);
-          const std::size_t r = r0 + static_cast<std::size_t>(flat & 15);
-          if (tok < batch && r < m) {
-            y[(tok * m) + r] = tile_scratch[flat];
+          for (int st = 0; st < 8; ++st) {
+            const int flat = (st * 32) + lane_id;
+            y[out_base + (static_cast<std::size_t>(flat >> 4) * m) +
+              static_cast<std::size_t>(flat & 15)] = tile_scratch[flat];
+          }
+        } else {
+#pragma unroll
+          for (int st = 0; st < 8; ++st) {
+            const int flat = (st * 32) + lane_id;
+            const std::size_t tok = t0 + static_cast<std::size_t>(flat >> 4);
+            const std::size_t r = r0 + static_cast<std::size_t>(flat & 15);
+            if (tok < batch && r < m) {
+              y[(tok * m) + r] = tile_scratch[flat];
+            }
           }
         }
+        __builtin_amdgcn_wave_barrier();
       }
-      __builtin_amdgcn_wave_barrier();
     }
   }
 }
@@ -2084,6 +2098,15 @@ void LaunchKQuantWmmaGEMMTypedImpl(const void* w, const void* q8_1_x, float* y,
       WKQuantA8BlockedWmmaGEMMKernel<kNarrowBM, kNarrowBN, 1, 2, 4, WType,
                                      UsePrecomputedSums, StagePrecomputedSums>
           <<<narrow_grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
+      return;
+    }
+    if (tile == detail::KQuantPrefillTile::kSingleKBlock) {
+      constexpr int kBN = 128;
+      const dim3 bk1_grid(static_cast<unsigned int>((batch + kBN - 1) / kBN),
+                          static_cast<unsigned int>((m + kBM - 1) / kBM));
+      WKQuantA8BlockedWmmaGEMMKernel<kBM, kBN, 1, 4, 2, WType,
+                                     UsePrecomputedSums, StagePrecomputedSums>
+          <<<bk1_grid, 256, 0, stream>>>(w, q8_1_x, y, batch, m, k);
       return;
     }
     if (tile == detail::KQuantPrefillTile::kDropOffsetProbe) {

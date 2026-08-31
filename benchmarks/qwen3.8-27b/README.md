@@ -613,6 +613,69 @@ main WMMA contracts over the element axis, so a superblock's worth of `m` and
 `hi`/`lo` has to be buffered across the `BK=2` stages and issued at superblock
 boundaries. That is the next piece of work, not something this card landed.
 
+### Rejected: one K block per stage (`opt-q4kxl-bk1`)
+
+The probe above shows the correction also costs registers: deleting it drops
+the Q4_K/Q5_K blocked GEMM from 240 to 184 VGPR. That does not currently buy
+anything, because LDS caps residency first -- 19,456 bytes per workgroup allows
+three per CU, and four would need 18,432 x 4 = 73,728 against the 64 KB limit.
+So the 8.6% the correction costs is instruction count, not occupancy.
+
+That points at LDS. `BK=1` halves every stage buffer, taking LDS to
+9,216-10,240 bytes and removing it from the residency equation entirely:
+
+| Format | VGPR at BK=2 | VGPR at BK=1 | LDS at BK=1 | Scratch |
+| --- | ---: | ---: | ---: | ---: |
+| Q5_K / Q4_K | 240 | 200 | 10,240 | 0 |
+| Q6_K | 232 | 192 | 9,728 | 0 |
+| IQ4_XS | 184 | 168 | 9,216 | 0 |
+| Q3_K | 240 | 256 | 9,728 | 452 |
+
+Q4_K and Q5_K land at 200, eight registers above the 192 that a fourth
+workgroup needs, and Q3_K spills. None of that matters, because the stage depth
+itself is worth far more:
+
+| Pair | `default` (BK=2) | `bk1` |
+| --- | ---: | ---: |
+| 1 | 476.53 | 356.79 |
+| 2 | 470.52 | 355.79 |
+| 3 | 468.57 | 355.29 |
+| 4 | 467.20 | 354.57 |
+| **Median** | **469.55** | **355.54 (-24.3%)** |
+
+4/4 pairs negative. Halving the compute each stage has to hide its own prefetch
+behind, and doubling the barrier count, costs 24% -- far more than the one
+extra workgroup could return. This also isolates the earlier `narrow`
+(BM=64/BN=256/BK=1) rejection, which lost 23.3%: that was `BK=1`, not the
+64-row macro tile. Kept selectable as `GUFO_KQUANT_PREFILL_TILE=bk1`.
+
+### Why the minimum correction cannot be made cheaper at this tile
+
+Putting the two results together closes the analysis the probe opened.
+
+The correction is `sum_kb off[r,kb] * sx[t,kb]`: one FMA per output per K block,
+which is already optimal as scalar code -- factoring `dmin` out per superblock
+gives eight MADs plus one multiply where the current form gives eight FMAs.
+The only way to beat it is a matrix instruction, contracting over the *K-block*
+axis rather than the element axis: `m[r,kb]` is a 6-bit index and fits `u8`
+exactly, and `sx` split into two `int8` planes lands ~1.5e-8 relative against
+the 1e-6 oracle tolerance.
+
+That does not fit. Each `(row tile, token tile)` pair would need its own `int32`
+accumulator per plane, live across the eight K blocks of a superblock -- two
+row tiles x four token tiles x eight lanes x two planes = 128 registers on top
+of the 240 the kernel already allocates. Gathering the *operands* across stages
+instead of the accumulators is affordable (~20 registers) and is the one
+remaining opening, but it needs `m` staged in WMMA A-fragment layout while the
+values arrive in C-fragment layout, so it is a real rewrite of the staging path
+rather than a local change. Sized at roughly +4% end to end, against the 8.6%
+the probe bounds -- the WMMA replaces half the correction's VALU and adds 12.5%
+more WMMA issue.
+
+Occupancy is closed from both directions: LDS pins the blocked GEMM at three
+workgroups, `BK=1` is the only way to cut LDS and costs 24%, and forcing the
+register target instead was already rejected at -10.8%.
+
 ### Rejected: hoisting the verifier's weight fetch (`opt-q4kxl-hoist`)
 
 `SmallBatchKQuantExactFp32GEMMKernel` stages activations into LDS, syncs, then
@@ -874,6 +937,7 @@ depth. Read the Q8 section for the current state of the engine.
 | Prefill macro-tile width (`opt-q4kxl-wide`) | Nothing; the 128x128 eight-wave tile stands. The blocked kernel is now templated on its wave count and stages several token subtiles per wave, and out-of-range token tiles are clamped like rows instead of reading past the staged activation buffer (neutral: medians 466.08 -> 466.36) | `BN=256` in both shapes that reach it: 128x256 over sixteen waves (`pp2048` 466.36 -> 412.89, -11.5%, occupancy 6 -> 4 waves/SIMD), the same at a forced eight waves/SIMD (337.03, -27.7%, spills 12-252 private bytes/lane), and 64x256 over eight waves with `BK=1` (468.11 -> 359.12, -23.3%). Kept selectable with `GUFO_KQUANT_PREFILL_TILE=wide|wide-occ|narrow` |
 | Speculative verifier occupancy (`opt-q4kxl-occ12`) | Twelve wave32s per SIMD on the exact small-batch K-quant verifier, which turns its sixteen-wave workgroup residency from two blocks per CU into three; `tg128-dflash2` median 18.77 -> 20.29 tok/s (+8.1%, 4/4 interleaved pairs), zero scratch, `tg128` and `pp2048` untouched, DS4 eval 8/8 | The four-row geometry stays on the ten-wave hint: at twelve waves it caps at 120 VGPR and spills 12-88 private bytes/lane for every format. `GUFO_KQUANT_SMALL_BATCH_WAVES=10` pins the previous hint |
 | Prefill minimum-correction cost (`opt-q4kxl-probe`) | Nothing yet; the measurement itself. Deleting the Q4_K/Q5_K correction is worth +8.6% `pp2048` (471.14 -> 511.47) and puts Q4 **above** Q8's 491.71, so an exact cheaper formulation wins the card. llama.cpp on the same host shows the same shape from the other side: its Q4 beats its Q8 1.10x while gufo's loses 0.93x | The probe route itself: `GUFO_KQUANT_PREFILL_TILE=drop-offset-probe` is numerically wrong (3.15% on Q4_K, 1.64% on Q5_K) and the correctness gate rejects it. Measurement only |
+| Prefill stage depth (`opt-q4kxl-bk1`) | Nothing; `BK=2` stands | One K block per stage: LDS 19,456 -> 10,240 and VGPR 240 -> 200, but `pp2048` 469.55 -> 355.54 (-24.3%, 4/4 pairs). Isolates the earlier `narrow` rejection as a `BK=1` effect rather than a 64-row-tile one. Kept selectable with `GUFO_KQUANT_PREFILL_TILE=bk1` |
 | Verifier weight-fetch order (`opt-q4kxl-hoist`) | Nothing; the in-order fetch stands | Hoisting the weight decode above the activation stage's barrier: `tg128-dflash2` 20.28 -> 18.75 (-7.6%, 4/4 pairs) and 68 private bytes/lane on a dispatched IQ3_S instantiation. Kept selectable with `GUFO_KQUANT_SMALL_BATCH_FETCH=hoist` |
 | DeltaNet | Two-lane persistent recurrence and SSM input replay | Four-lane recurrence |
 | Prefill attention | 64-key native tile, odd LDS stride, CK fallback | Head-major KV and lower-precision weighted-V accumulation |

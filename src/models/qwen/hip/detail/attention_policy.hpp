@@ -303,6 +303,11 @@ enum class KQuantPrefillTile : std::uint8_t {
   kWide,
   kWideForcedOccupancy,
   kNarrowRows,
+  // opt-q4kxl-bk1: one K block per LDS stage instead of two. The stage buffers
+  // drop from 19,456 to ~10,240 bytes, which takes LDS out of the residency
+  // equation entirely; whether a fourth workgroup actually lands then depends
+  // only on whether the allocator stays at or below 192 VGPR.
+  kSingleKBlock,
   // Measurement only, and numerically WRONG: deletes the Q4_K/Q5_K minimum
   // correction to bound what an exact cheaper formulation could ever be worth.
   kDropOffsetProbe,
@@ -322,6 +327,9 @@ enum class KQuantPrefillTile : std::uint8_t {
   }
   if (text == "drop-offset-probe") {
     return KQuantPrefillTile::kDropOffsetProbe;
+  }
+  if (text == "bk1") {
+    return KQuantPrefillTile::kSingleKBlock;
   }
   return text == "wide" || text == "256" || text == "1"
              ? KQuantPrefillTile::kWide
