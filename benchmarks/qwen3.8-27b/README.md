@@ -841,56 +841,70 @@ execution errors 0.
 
 ### Context depth, UD-Q4_K_XL against Q8_K_XL
 
-Single-repetition sweeps on a quiet host, both shards through the same binary,
-`--n-depth 0,4096,8192,16384`.
+Every pair below is **interleaved at each depth point** -- the two shards run
+back to back at one depth before moving to the next -- and repeated for two
+rounds, because running one shard's whole sweep and then the other's drifts
+with host load badly enough to invert the result (a first attempt that way put
+Q8 at 476.78 against Q4's 478.45 at depth 0, against 493.5 / 466.4 when
+interleaved).
 
-`pp2048`:
+`pp2048`, medians of two rounds:
 
 | Depth | UD-Q4_K_XL | Q8_K_XL | Q4/Q8 |
 | ---: | ---: | ---: | ---: |
-| 0 | 474.92 | 506.05 | 0.938 |
-| 4096 | 450.19 | 481.56 | 0.935 |
-| 8192 | 430.54 | 461.12 | 0.934 |
-| 16384 | 396.93 | 422.31 | 0.940 |
+| 0 | 466.4 | 493.5 | 0.945 |
+| 4096 | 445.1 | 469.9 | 0.947 |
+| 8192 | 426.6 | 455.8 | 0.936 |
+| 16384 | 392.7 | 421.7 | 0.931 |
 
-The ratio is flat -- 0.934 to 0.940 across a 16K span -- and the two shards
-retain almost identically from depth 0 to 16384 (83.6% against 83.4%). The
-prefill deficit is therefore entirely the GEMM arithmetic; attention and KV
-scaling contribute none of it. That agrees with the `GUFO_PROFILE` stage rollup
-and with the `opt-q4kxl-probe` measurement, and it rules out any
-depth-dependent cause.
+The ratio is flat across a 16K span and the two shards retain almost
+identically (84.2% against 85.4% from depth 0 to 16384). The prefill deficit is
+therefore entirely the GEMM arithmetic -- consistent with the `GUFO_PROFILE`
+stage rollup and with `opt-q4kxl-isa`, which puts 79% of it in the minimum
+correction -- and nothing about it is depth-dependent.
 
 `tg128`:
 
 | Depth | UD-Q4_K_XL | Q8_K_XL | Q4/Q8 |
 | ---: | ---: | ---: | ---: |
-| 0 | 11.62 | 6.80 | 1.71 |
-| 4096 | 11.49 | 6.74 | 1.70 |
-| 8192 | 11.31 | 6.56 | 1.72 |
-| 16384 | 10.91 | 6.53 | 1.67 |
+| 0 | 11.60 | 6.80 | 1.71 |
+| 4096 | 11.43 | 6.74 | 1.70 |
+| 8192 | 11.25 | 6.55 | 1.72 |
+| 16384 | 10.90 | 6.52 | 1.67 |
 
-The 1.7x decode win holds to 16K. Q4 retains 93.9% of its depth-0 rate against
-Q8's 96.0%: the depth-dependent KV traffic is a larger share of Q4's total
-because its weight traffic is smaller. Both cross to the split-K (non-graph)
-decode path at 4K and neither shows a cliff there.
+The 1.7x decode win holds to 16K. Both shards cross to the split-K (non-graph)
+decode path at 4K and neither shows a cliff. One Q8 sample at depth 4096 was
+discarded as a load spike (5.25 at load 2.18).
 
-`tg128-dflash2`, which is the one sweep that must be read **down the columns,
-never across the rows**:
+`tg128-dflash2`, each target with its best companion (Q4 with the Q4_K_M draft,
+Q8 with the Q8_0 draft), reported with the draft acceptance rate:
 
-| Depth | Twelve waves/SIMD (default) | Ten waves/SIMD |
-| ---: | ---: | ---: |
-| 0 | 18.78 | 17.33 |
-| 4096 | 12.60 | 11.64 |
-| 8192 | 33.13 | 30.69 |
-| 16384 | 12.69 | 10.75 |
+| Depth | Q4 | Q4 acc | Q8 | Q8 acc | Q4/Q8 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | ~20.3 | 0.322 | ~27.2 | 0.595 | ~0.75 |
+| 4096 | 12.59 | 0.210 | 13.57 | 0.275 | 0.928 |
+| 8192 | **33.01** | 0.838 | 32.26 | 0.909 | **1.023** |
+| 16384 | 12.69 | 0.288 | 12.81 | 0.337 | 0.991 |
 
-The 33.13 at depth 8192 is not a depth effect. Each depth primes a different
-continuation, and speculative throughput tracks how many drafted tokens that
-continuation gets accepted -- the same reason the dflash2 row elsewhere in this
-file is reported as a range. What the columns do show is that the retained
-twelve-wave hint (`opt-q4kxl-occ12`) wins at every depth: +8.4%, +8.2%, +8.0%
-and +18.0%. Host load had drifted to 2.31 by the last pair, so that row is the
-least trustworthy of the four, though both of its arms ran adjacent.
+Depth 0 is the most load-sensitive point measured anywhere in this file: across
+one day it produced 12.6-20.3 for Q4 and 17.7-27.2 for Q8, and the rows above
+are the best observed rather than medians. The other three depths reproduced to
+within 0.05% between rounds.
+
+These rows compare **across**, never **down**: each depth primes a different
+continuation, and acceptance swings from 0.210 to 0.838 because of it. The
+acceptance figures were bit-identical between rounds -- greedy decoding on a
+fixed prompt -- so they are signal rather than noise, and two things follow
+from them:
+
+- Q4's acceptance is below Q8's at every depth (0.322/0.595, 0.210/0.275,
+  0.838/0.909, 0.288/0.337), which is the coarser hidden state a Q4 target
+  hands the DFlash-2 head.
+- **At depth 8192, where both targets accept deeply, Q4 wins (1.023x).** That is
+  the only regime measured where Q4 leads on speculative decode, and it isolates
+  the deficit cleanly: Q4's cost per verify step is already better than Q8's, so
+  it loses overall only where low acceptance makes the step count dominate.
+  Closing the speculative gap is therefore acceptance work, not kernel work.
 
 ### Prefill macro-tile width (`opt-q4kxl-wide`)
 
@@ -1222,7 +1236,9 @@ it multiplies a contribution that starts at ~3%.
 - Continue closing the UD-Q4_K_XL speculative gap after the retained three-row
   exact verifier (+2.82% `tg128-dflash2`), the retained twelve-wave occupancy
   hint (+8.1% `tg128-dflash2`, see `opt-q4kxl-occ12`) and the retained
-  activation-sum sidecar (+0.53% `pp2048`). The sidecar took the redundant sum work out of the
+  activation-sum sidecar (+0.53% `pp2048`). The depth sweep now shows what is
+  left is acceptance rather than kernel time: at depth 8192, where both targets
+  accept deeply, Q4 already beats Q8 (33.01 against 32.26). The sidecar took the redundant sum work out of the
   blocked WMMA without touching the Q8_1 tile layout -- it is appended after the
   tiled payload, so every Q8 kernel still sees the same 576-byte stride. What is
   left in the Q4_K/Q5_K epilogue is the correction itself (8 FMA per accumulator
