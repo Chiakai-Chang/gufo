@@ -646,6 +646,56 @@ void TestSnapshotCacheBranchesOnePrefixIntoIndependentStates() {
   third.Invalidate();
 }
 
+void TestSnapshotRetentionUsesPromptBoundary() {
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<SnapshotRunner>(stats);
+  TextRunnerPool pool(runner, 1);
+
+  {
+    auto root = pool.Acquire({1, 2, 3, 4});
+    Expect(root.Prefill(4).decode_ready,
+           "root prompt reaches its decode frontier");
+    Expect(stats->snapshot_captures == 1,
+           "snapshot is captured before generated tokens mutate the state");
+    Expect(root.SelectNext().token == 90,
+           "root selects its prompt-boundary frontier");
+    root.Advance();
+    Expect(root.SelectNext().token == 91,
+           "root advances beyond the reusable prompt boundary");
+    root.Advance();
+    const auto commit = root.Commit();
+    Expect(commit.snapshot_bytes == sizeof(FakeSnapshot),
+           "root commit publishes the held prompt snapshot");
+  }
+
+  {
+    auto repeated = pool.Acquire({1, 2, 3, 4});
+    Expect(repeated.cache_hit() && repeated.cached_prompt_tokens() == 4,
+           "an identical prompt restores the prompt-boundary snapshot");
+    Expect(repeated.prefill_complete(),
+           "an exact snapshot hit retains its decode frontier");
+    Expect(stats->snapshot_captures == 1,
+           "an exact in-memory hit avoids another snapshot copy");
+    Expect(repeated.SelectNext().token == 90,
+           "exact reuse starts from the prompt rather than post-generation");
+    repeated.Invalidate();
+  }
+
+  {
+    auto extension = pool.Acquire({1, 2, 3, 4, 7, 8});
+    Expect(extension.cache_hit() && extension.cached_prompt_tokens() == 4,
+           "a prompt that omits generated tokens still reuses the root");
+    const auto suffix = extension.Prefill(8);
+    Expect(suffix.consumed_tokens == 2 && suffix.decode_ready,
+           "only the extension after the stable prompt is prefetched");
+    Expect(stats->snapshot_captures == 2,
+           "the extended prompt captures its own reusable boundary");
+    Expect(extension.SelectNext().token == 90,
+           "extended reuse preserves the rebuilt decode frontier");
+    extension.Invalidate();
+  }
+}
+
 void TestPersistentSnapshotRestoresAcrossPools() {
   TemporaryDirectory directory;
   const TextRunnerDiskCacheOptions disk_cache{
@@ -783,6 +833,7 @@ int main() {
   TestResourceClaimsAreValidatedBeforeAllocation();
   TestSnapshotForkAndUnsupportedCapabilities();
   TestSnapshotCacheBranchesOnePrefixIntoIndependentStates();
+  TestSnapshotRetentionUsesPromptBoundary();
   TestPersistentSnapshotRestoresAcrossPools();
   TestMeasuredStateIsReconciledWithClaim();
   TestSnapshotBudgetRefusalDoesNotFailCompletedRequest();

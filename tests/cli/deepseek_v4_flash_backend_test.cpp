@@ -93,9 +93,19 @@ int main() {
         };
     const auto direct_chat =
         GenerateDirect(model, model->EncodeChat(direct_messages), 2);
-    const auto http_chat = backend.chat(messages, 2, 0.0F);
+    const auto http_chat = backend.chat(messages, 2, {});
     Expect(http_chat.tokens == direct_chat, "chat direct/HTTP token parity");
     Expect(!http_chat.cache_hit, "first chat request is a cache miss");
+    const auto repeated_chat = backend.chat(messages, 2, {});
+    Expect(
+        repeated_chat.cache_hit &&
+            repeated_chat.cached_prompt_tokens == repeated_chat.prompt_tokens &&
+            repeated_chat.prefill_tokens == 0,
+        "repeated DeepSeek chat restores the complete prompt boundary");
+    Expect(repeated_chat.tokens == direct_chat,
+           "repeated DeepSeek chat differs from cold target execution");
+    Expect(repeated_chat.cache_snapshot_bytes == 0,
+           "exact DeepSeek reuse avoids another full snapshot copy");
 
     auto continued_messages = messages;
     continued_messages.emplace_back(gufo::tokenization::ChatRole::kAssistant,

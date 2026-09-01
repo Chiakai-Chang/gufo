@@ -263,7 +263,10 @@ public:
     void Advance();
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);
 
-    /// Publishes the model state at its reported checkpoint boundary.
+    /// Publishes a reusable continuation boundary.
+    ///
+    /// Snapshot-capable runners publish the immutable prompt frontier captured
+    /// before decode. Mutable-state runners publish their reported checkpoint.
     CommitMetrics Commit();
     void Invalidate() noexcept;
 

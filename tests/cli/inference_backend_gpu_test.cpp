@@ -80,13 +80,78 @@ private:
   std::filesystem::path path_;
 };
 
+void RunPromptReuseSmoke(
+    const std::shared_ptr<const gufo::hip::QwenGpuModel>& model,
+    gufo::server::InferenceBackend& backend) {
+  const std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kSystem, "Answer with one short sentence.",
+       "", ""},
+      {gufo::tokenization::ChatRole::kUser, "Name one primary color.", "", ""},
+  };
+  const auto rendered_chat =
+      gufo::tokenization::QwenChatTemplate::Render(messages);
+  Expect(rendered_chat.has_value() && !rendered_chat->empty(),
+         "prefix-reuse chat prompt rendering");
+  const auto prompt = model->GetTokenizer().Encode(*rendered_chat);
+  const auto root = backend.chat(messages, 1, {});
+  Expect(
+      !root.tokens.empty() && !root.cache_hit && root.cache_snapshot_bytes > 0,
+      "cold prefix-reuse chat must publish one prompt snapshot");
+
+  const auto repeated = backend.chat(messages, 1, {});
+  Expect(repeated.cache_hit && repeated.cached_prompt_tokens == prompt.size() &&
+             repeated.prefill_tokens == 0,
+         "repeated chat must restore the complete prompt boundary");
+  Expect(repeated.tokens == root.tokens,
+         "repeated chat differs from the cold request");
+  Expect(repeated.cache_snapshot_bytes == 0,
+         "exact prompt reuse must avoid another full snapshot copy");
+
+  auto continued_messages = messages;
+  continued_messages.emplace_back(gufo::tokenization::ChatRole::kAssistant,
+                                  "Blue.");
+  continued_messages.emplace_back(gufo::tokenization::ChatRole::kUser,
+                                  "Name a different primary color.");
+  const auto rendered_continuation =
+      gufo::tokenization::QwenChatTemplate::Render(continued_messages);
+  Expect(rendered_continuation.has_value(),
+         "prefix-reuse continuation prompt rendering");
+  const auto continuation_prompt =
+      model->GetTokenizer().Encode(*rendered_continuation);
+  const auto continued = backend.chat(continued_messages, 1, {});
+  Expect(continued.cache_hit &&
+             continued.cached_prompt_tokens == prompt.size() &&
+             continued.prefill_tokens ==
+                 continuation_prompt.size() - prompt.size(),
+         "continuation must prefill only the suffix after the cached prompt");
+  Expect(!continued.tokens.empty(),
+         "cached continuation must generate at least one token");
+}
+
 }  // namespace
 
 int main(int argc, const char* const* argv) {
   try {
     if (argc < 2) {
-      std::cout << "SKIP: pass a Qwen GGUF path for the gfx1151 server test\n";
+      std::cout << "SKIP: pass a Qwen GGUF path for the gfx1151 server test; "
+                   "append --full for the exhaustive suite\n";
       return 77;
+    }
+
+    bool run_full_suite = false;
+    const char* draft_model_path = nullptr;
+    for (int index = 2; index < argc; ++index) {
+      const std::string_view argument = argv[index];
+      if (argument == "--full") {
+        run_full_suite = true;
+      } else if (argument.starts_with("--")) {
+        throw std::invalid_argument("unknown Qwen GPU test option");
+      } else if (draft_model_path == nullptr) {
+        draft_model_path = argv[index];
+        run_full_suite = true;
+      } else {
+        throw std::invalid_argument("multiple DFlash model paths provided");
+      }
     }
 
     std::string error;
@@ -99,14 +164,21 @@ int main(int argc, const char* const* argv) {
     Expect(model->GetWeightRegionCount() == reader->GetMappedRegions().size(),
            "every mapped GGUF shard must have one shared GPU region");
 
-    constexpr std::uint32_t context = 256;
-    auto direct = gufo::hip::QwenGpuExecutor::Create(model, &error, context);
-    Expect(direct != nullptr, error);
-
+    const std::uint32_t context = run_full_suite ? 256U : 64U;
+    const std::size_t state_count = run_full_suite ? 2U : 1U;
     gufo::server::InferenceBackend backend;
-    Expect(backend.load(model, &error, context, 2), error);
+    Expect(backend.load(model, &error, context, state_count), error);
     Expect(backend.model_id() == model->GetConfig().model_name,
            "HTTP model identifier");
+
+    if (!run_full_suite) {
+      RunPromptReuseSmoke(model, backend);
+      std::cout << "Qwen continuation prefix-reuse smoke test passed.\n";
+      return 0;
+    }
+
+    auto direct = gufo::hip::QwenGpuExecutor::Create(model, &error, context);
+    Expect(direct != nullptr, error);
 
     const std::string raw_prompt = "The capital of France is";
     const auto raw_prompt_tokens = model->GetTokenizer().Encode(raw_prompt);
@@ -143,13 +215,13 @@ int main(int argc, const char* const* argv) {
            "raw HTTP text must decode the exact generated tokens");
     Expect(http_raw.ttft_ms > 0.0, "raw HTTP TTFT must be reported");
 
-    if (argc >= 3) {
+    if (draft_model_path != nullptr) {
       gufo::server::InferenceBackend speculative_backend;
       Expect(speculative_backend.load(
                  model, &error, context, 2, {}, {},
                  gufo::server::TextSpeculativeConfig{
                      .backend = gufo::server::TextSpeculativeBackend::kDFlash,
-                     .draft_model_path = argv[2],
+                     .draft_model_path = draft_model_path,
                      .max_draft_tokens = 7,
                      .min_draft_tokens = 1,
                      .draft_policy =
@@ -183,7 +255,7 @@ int main(int argc, const char* const* argv) {
            ""},
       };
       const auto first_spec_chat =
-          speculative_backend.chat(spec_messages, 2, 0.0F);
+          speculative_backend.chat(spec_messages, 2, {});
       Expect(!first_spec_chat.cache_hit,
              "first DFlash chat request must be a cache miss");
       Expect(first_spec_chat.cache_snapshot_bytes > 0,
@@ -254,10 +326,19 @@ int main(int argc, const char* const* argv) {
            "CLI chat prompt rendering");
     const auto chat_prompt = model->GetTokenizer().Encode(*rendered_chat);
     const auto direct_chat = GenerateDirect(*direct, chat_prompt, 2);
-    const auto http_chat = backend.chat(messages, 2, 0.0F);
+    const auto http_chat = backend.chat(messages, 2, {});
     Expect(http_chat.tokens == direct_chat,
            "chat HTTP and direct executor tokens differ");
     Expect(!http_chat.cache_hit, "first chat request must be a cache miss");
+    const auto repeated_chat = backend.chat(messages, 2, {});
+    Expect(repeated_chat.cache_hit &&
+               repeated_chat.cached_prompt_tokens == chat_prompt.size() &&
+               repeated_chat.prefill_tokens == 0,
+           "repeated Qwen chat restores the complete prompt boundary");
+    Expect(repeated_chat.tokens == direct_chat,
+           "repeated Qwen chat differs from cold target execution");
+    Expect(repeated_chat.cache_snapshot_bytes == 0,
+           "exact Qwen reuse avoids another full snapshot copy");
 
     auto continued_messages = messages;
     continued_messages.emplace_back(gufo::tokenization::ChatRole::kAssistant,
@@ -330,7 +411,7 @@ int main(int argc, const char* const* argv) {
         gufo::server::InferenceBackend writer;
         Expect(writer.load(model, &error, context, 1, {}, {}, {}, disk_cache),
                error);
-        const auto persistent_root = writer.chat(messages, 2, 0.0F);
+        const auto persistent_root = writer.chat(messages, 2, {});
         Expect(persistent_root.tokens == direct_chat,
                "Qwen disk writer differs from cold target execution");
         Expect(persistent_root.text == http_chat.text,
@@ -343,12 +424,11 @@ int main(int argc, const char* const* argv) {
       Expect(restarted.load(model, &error, context, 1, {}, {}, {}, disk_cache),
              error);
       const auto restored_continuation =
-          restarted.chat(continued_messages, 2, 0.0F);
+          restarted.chat(continued_messages, 2, {});
       Expect(restored_continuation.cache_hit &&
                  restored_continuation.cache_disk_hit,
              "fresh Qwen backend did not restore its disk prefix");
-      Expect(restored_continuation.cached_prompt_tokens ==
-                     chat_prompt.size() + direct_chat.size() &&
+      Expect(restored_continuation.cached_prompt_tokens == chat_prompt.size() &&
                  restored_continuation.cached_prompt_tokens <
                      restored_continuation.prompt_tokens,
              "Qwen disk restore did not report its exact reusable prefix");
@@ -364,17 +444,17 @@ int main(int argc, const char* const* argv) {
                                incompatible_cache),
              error);
       const auto incompatible_result =
-          incompatible.chat(continued_messages, 2, 0.0F);
+          incompatible.chat(continued_messages, 2, {});
       Expect(
           !incompatible_result.cache_hit && !incompatible_result.cache_disk_hit,
           "changed Qwen artifact fingerprint must be a cold miss");
       Expect(incompatible_result.tokens == direct_continuation,
              "Qwen compatibility miss changed cold execution");
 
-      if (argc >= 3) {
+      if (draft_model_path != nullptr) {
         const gufo::server::TextSpeculativeConfig dflash_config{
             .backend = gufo::server::TextSpeculativeBackend::kDFlash,
-            .draft_model_path = argv[2],
+            .draft_model_path = draft_model_path,
             .max_draft_tokens = 7,
             .min_draft_tokens = 1,
             .draft_policy = gufo::server::TextDraftPolicy::kRollingAcceptance,
@@ -389,9 +469,9 @@ int main(int argc, const char* const* argv) {
         Expect(
             warm_dflash.load(model, &error, context, 1, {}, {}, dflash_config),
             error);
-        const auto warm_dflash_root = warm_dflash.chat(messages, 2, 0.0F);
+        const auto warm_dflash_root = warm_dflash.chat(messages, 2, {});
         const auto warm_dflash_continuation =
-            warm_dflash.chat(continued_messages, 8, 0.0F);
+            warm_dflash.chat(continued_messages, 8, {});
         Expect(warm_dflash_continuation.cache_hit &&
                    !warm_dflash_continuation.cache_disk_hit,
                "warm DFlash reference restores its in-memory prefix");
@@ -406,7 +486,7 @@ int main(int argc, const char* const* argv) {
                                     dflash_config, dflash_disk_cache),
                  error);
           const auto persistent_dflash_root =
-              dflash_writer.chat(messages, 2, 0.0F);
+              dflash_writer.chat(messages, 2, {});
           Expect(persistent_dflash_root.tokens == warm_dflash_root.tokens,
                  "DFlash disk writer root differs from warm execution");
           Expect(persistent_dflash_root.cache_disk_write_bytes > 0,
@@ -418,7 +498,7 @@ int main(int argc, const char* const* argv) {
                                      dflash_config, dflash_disk_cache),
                error);
         const auto restored_dflash_continuation =
-            restarted_dflash.chat(continued_messages, 8, 0.0F);
+            restarted_dflash.chat(continued_messages, 8, {});
         Expect(restored_dflash_continuation.cache_hit &&
                    restored_dflash_continuation.cache_disk_hit,
                "fresh DFlash backend did not restore its disk prefix");
@@ -445,7 +525,7 @@ int main(int argc, const char* const* argv) {
                                      dflash_config, incompatible_dflash_cache),
             error);
         const auto incompatible_dflash_result =
-            incompatible_dflash.chat(continued_messages, 8, 0.0F);
+            incompatible_dflash.chat(continued_messages, 8, {});
         Expect(!incompatible_dflash_result.cache_hit &&
                    !incompatible_dflash_result.cache_disk_hit,
                "changed DFlash artifact fingerprint must be a cold miss");
@@ -466,7 +546,7 @@ int main(int argc, const char* const* argv) {
     const auto http_continuation = pending_continuation->Wait();
     const auto http_fork = pending_fork->Wait();
 
-    const auto root_tokens = chat_prompt.size() + http_chat.tokens.size();
+    const auto root_tokens = chat_prompt.size();
     for (const auto* result : {&http_continuation, &http_fork}) {
       Expect(result->cache_hit,
              "concurrent Qwen branch must restore the retained root");
