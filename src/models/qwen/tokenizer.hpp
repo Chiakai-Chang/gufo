@@ -89,6 +89,11 @@ public:
   [[nodiscard]] bool IsSpecialToken(TokenId id) const noexcept;
 
 private:
+  enum class PreTokenizer : std::uint8_t {
+    kNone,
+    kQwen35,
+  };
+
   struct PairHash {
     std::size_t operator()(
         const std::pair<TokenId, TokenId>& p) const noexcept {
@@ -101,6 +106,7 @@ private:
 
   void InitializeByteTokens(bool eager_decoded_tokens = true);
   std::vector<TokenId> BpeMergeChunk(std::string_view chunk) const;
+  std::vector<TokenId> BpeEncodeText(std::string_view text) const;
 
   std::vector<std::string> id_to_token_;
   std::vector<std::string> id_to_decoded_token_;
@@ -114,6 +120,7 @@ private:
   TokenId bos_token_id_{kInvalidTokenId};
   TokenId eos_token_id_{kDefaultQwenEosTokenId};
   TokenId pad_token_id_{kDefaultQwenEndoftextId};
+  PreTokenizer pre_tokenizer_{PreTokenizer::kNone};
 };
 
 }  // namespace gufo::tokenization

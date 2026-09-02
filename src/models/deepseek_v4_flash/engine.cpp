@@ -114,15 +114,17 @@ std::vector<int> Model::EncodeChat(std::string_view system_prompt,
   return TakeTokens(&tokens);
 }
 
-std::vector<int> Model::EncodeChat(
-    std::span<const ChatMessage> messages) const {
+std::vector<int> Model::EncodeChat(std::span<const ChatMessage> messages,
+                                   const ChatTemplateOptions& options) const {
+  return EncodeChat(messages, {}, options);
+}
+
+std::vector<int> Model::EncodeChat(std::span<const ChatMessage> messages,
+                                   std::span<const ChatTool> tools,
+                                   const ChatTemplateOptions& options) const {
+  const std::string rendered = RenderChat(messages, tools, options);
   ds4_tokens tokens{};
-  ds4_chat_begin(engine_, &tokens);
-  for (const auto& message : messages) {
-    ds4_chat_append_message(engine_, &tokens, message.role.c_str(),
-                            message.content.c_str());
-  }
-  ds4_chat_append_assistant_prefix(engine_, &tokens);
+  ds4_tokenize_rendered_chat(engine_, rendered.c_str(), &tokens);
   return TakeTokens(&tokens);
 }
 

@@ -1,0 +1,89 @@
+{
+  "schema": "gufo.chat-template-hf-goldens.v1",
+  "qwen": {
+    "repo": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
+    "template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "cases": {
+      "chat": {
+        "rendered_sha256": "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7",
+        "token_ids_le_u32_sha256": "f18ef8903baeb128acd6602394502b29c044153de2c4bdde5099f4225500e4b4",
+        "token_count": 16
+      },
+      "thinking_low": {
+        "rendered_sha256": "50ec206299577d35eead707cb1b60fdd8875176f69fb064785eed858836ee999",
+        "token_ids_le_u32_sha256": "07dce17023afae004b4646361f5f3ea5637e418de73c587b0024d9e488578102",
+        "token_count": 44
+      },
+      "thinking_medium": {
+        "rendered_sha256": "c2ba928ee33190de9d2bbb82fb68dfaed38a4ee345dcf675a3bc27f112f45b05",
+        "token_ids_le_u32_sha256": "11c0c78f89b1093eb12e04a2abda17e909e5a68345789d5e729c073b9429f81b",
+        "token_count": 14
+      },
+      "thinking_xhigh": {
+        "rendered_sha256": "97dbf46721e76ae30614f4b4d6bdb6147bc9b34d1a0f93e04699b3ac622fb99d",
+        "token_ids_le_u32_sha256": "3fddc6464bf4bfc03f63a42e09fa147d5da705a5ee38bec97891440cd29f3069",
+        "token_count": 56
+      },
+      "history_drop": {
+        "rendered_sha256": "ea0dc42bc76d66bb38fab09250bcf72f63c3bb1ec7098403a77a8c6452add6a5",
+        "token_ids_le_u32_sha256": "7868a53541665707ddc8b72b51a7f30656e3f78da04c019fe49183b147e71dfb",
+        "token_count": 28
+      },
+      "history_preserve": {
+        "rendered_sha256": "6fc054000bc6bedd03a3521bd92c59af85247ad7d3bb2013d97c1a25eea6bdee",
+        "token_ids_le_u32_sha256": "43067b07b0ea1aa4d8d4d3a4cd908c65fbafa62e209be0c84adf383d16959eea",
+        "token_count": 42
+      },
+      "tools": {
+        "rendered_sha256": "acab567a1e900a69b084c0309ef9291ceccaa50ba59b184bd6d3fd0e5b4581a2",
+        "token_ids_le_u32_sha256": "9cbadda4140440b2003fb0224534da4e5100382c91ace043caf6c6cb90595a35",
+        "token_count": 270
+      }
+    }
+  },
+  "deepseek": {
+    "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+    "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+    "encoder_sha256": "abc0d26120250dda0ae077dc64aa28836026e61e970854aaeb792445e6a0dde6",
+    "tokenizer_sha256": "8f9f37ca37fdc4f5fd36d5cf4d3b0e8392edb4e894fd10cc0d70b4957c8633cf",
+    "cases": {
+      "chat": {
+        "rendered_sha256": "d3953e69808de7acaa73269d1fbd13a930a4ee743b65ec2883b91d206ceb4121",
+        "token_ids_le_u32_sha256": "8e8e58e4ae7e4efd356aabacb28790ad37681602c68fd543540bc7f9611d3c13",
+        "token_count": 11
+      },
+      "thinking_low": {
+        "rendered_sha256": "302d80db67339dedc8489476bde608f250f13f2b7bb89d6c4467538e057e0dba",
+        "token_ids_le_u32_sha256": "7ca6a24b76b38eb95cdaf72609ca247db76274362043b976ac8fa6c89d7945aa",
+        "token_count": 11
+      },
+      "thinking_high": {
+        "rendered_sha256": "4e0a1a55cd4c39b593c49f3ec8384e32cde119bff97416a611d7ab459624aaa9",
+        "token_ids_le_u32_sha256": "867961edffd2cfc304419c5bbb1b9caffe409cefee565e303aef0f79611d3862",
+        "token_count": 90
+      },
+      "thinking_max": {
+        "rendered_sha256": "b61a0552e96f0458cada39d46bd11a15adc206f0cd3a1dfea096687fe3fb4968",
+        "token_ids_le_u32_sha256": "dd52a2f1b490035e79e4da6c342c93ef8574e7d76a446abce7998a8533445121",
+        "token_count": 103
+      },
+      "history_drop": {
+        "rendered_sha256": "df3c2370812a2f993fca67aee691ccf730d57f24f9207cb8e5b1be38ba916e88",
+        "token_ids_le_u32_sha256": "7b72730d7a454c417d5a34b91ef76635ebf4546311a98a47fa10536b463a4a8c",
+        "token_count": 16
+      },
+      "history_preserve": {
+        "rendered_sha256": "2fc631d9339a08cd4fffd643eae2b58426fb0d709e69daaaffb978d55b6906d3",
+        "token_ids_le_u32_sha256": "169de9603c7876e29494f3c357172fb0f4742fef0fbf96750f6d7b4291924486",
+        "token_count": 24
+      },
+      "tools": {
+        "rendered_sha256": "cd89794650716ce13bac7ac2392db6a06231ce9927ceb1d712f7c399a0a2fde6",
+        "token_ids_le_u32_sha256": "aeb24f88f10cdbd8e8278043e02c08670c82e09ef6180d99f7aa89314fa31d1f",
+        "token_count": 344
+      }
+    }
+  }
+}

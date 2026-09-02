@@ -156,6 +156,7 @@ void TestDirectVocabularyTokenizer() {
 void TestGgufTokenizerLoading() {
   GgufTokenizerBuilder builder;
   builder.AddMetadataString("tokenizer.ggml.model", "gpt2");
+  builder.AddMetadataString("tokenizer.ggml.pre", "qwen35");
   builder.AddMetadataUint32("tokenizer.ggml.eos_token_id", 151645U);
   builder.AddMetadataUint32("tokenizer.ggml.padding_token_id", 151643U);
 
@@ -168,6 +169,18 @@ void TestGgufTokenizerLoading() {
   vocab.emplace_back("the");
   vocab.emplace_back("<|im_start|>");
   vocab.emplace_back("<|im_end|>");
+  const auto tool_call_start =
+      static_cast<gufo::tokenization::TokenId>(vocab.size());
+  vocab.emplace_back("<tool_call>");
+  const auto tool_call_end =
+      static_cast<gufo::tokenization::TokenId>(vocab.size());
+  vocab.emplace_back("</tool_call>");
+  const auto tool_response_start =
+      static_cast<gufo::tokenization::TokenId>(vocab.size());
+  vocab.emplace_back("<tool_response>");
+  const auto tool_response_end =
+      static_cast<gufo::tokenization::TokenId>(vocab.size());
+  vocab.emplace_back("</tool_response>");
 
   builder.AddMetadataStringArray("tokenizer.ggml.tokens", vocab);
   builder.AddMetadataStringArray("tokenizer.ggml.merges", {"t h", "th e"});
@@ -189,6 +202,15 @@ void TestGgufTokenizerLoading() {
   Expect(!encoded.empty(), "Encoded 'the' is not empty");
   auto decoded = tok->Decode(encoded);
   Expect(decoded == "the", "Roundtrip decoding of 'the' matches");
+
+  encoded = tok->Encode("<tool_call>x</tool_call>");
+  Expect(encoded.size() == 3 && encoded.front() == tool_call_start &&
+             encoded.back() == tool_call_end,
+         "Qwen tool-call markers are parsed as special tokens");
+  encoded = tok->Encode("<tool_response>x</tool_response>");
+  Expect(encoded.size() == 3 && encoded.front() == tool_response_start &&
+             encoded.back() == tool_response_end,
+         "Qwen tool-response markers are parsed as special tokens");
 }
 
 void TestEmptyAndSpecialEdgeCases() {

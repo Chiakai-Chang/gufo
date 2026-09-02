@@ -52,6 +52,8 @@ add_qwen_cpu_test(qwen_tokenizer_test
 add_qwen_cpu_test(qwen_chat_template_test
   tests/models/qwen/tokenization/chat_template_test.cpp
   "cpu;tokenization;chat_template")
+target_compile_definitions(qwen_chat_template_test PRIVATE
+  GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/src/models/qwen/reference/chat_template.jinja")
 
 add_qwen_cpu_test(qwen_cpu_oracles_test
   tests/models/qwen/cpu/oracles_test.cpp

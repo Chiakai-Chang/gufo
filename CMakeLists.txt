@@ -244,6 +244,9 @@ target_link_libraries(gufo_core PUBLIC ICU::uc Threads::Threads)
 add_subdirectory(src/models/qwen)
 
 target_link_libraries(gufo_qwen3_tts PUBLIC gufo_core)
+if (ENGINE_ENABLE_HIP)
+  target_link_libraries(gufo_deepseek_v4_flash PUBLIC gufo_core)
+endif()
 
 find_package(OpenMP)
 if (OpenMP_CXX_FOUND)
@@ -437,6 +440,32 @@ if (BUILD_TESTING)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(deepseek_v4_flash_chat_template_test
+    tests/models/deepseek_v4_flash_chat_template_test.cpp
+    src/models/deepseek_v4_flash/chat_template.cpp)
+  target_link_libraries(deepseek_v4_flash_chat_template_test PRIVATE gufo_core)
+  target_compile_definitions(deepseek_v4_flash_chat_template_test PRIVATE
+    GUFO_DEEPSEEK_CHAT_TEMPLATE_REFERENCE="${CMAKE_CURRENT_SOURCE_DIR}/src/models/deepseek_v4_flash/reference/artifact_chat_template.jinja")
+  add_test(NAME deepseek_v4_flash_chat_template_test
+    COMMAND deepseek_v4_flash_chat_template_test)
+  set_tests_properties(deepseek_v4_flash_chat_template_test PROPERTIES
+    LABELS "cpu;tokenization;chat_template;deepseek")
+
+  if(ENGINE_ENABLE_HIP)
+    add_executable(chat_template_hf_token_golden_test
+      tests/models/chat_template_hf_token_golden_test.cpp)
+    target_link_libraries(chat_template_hf_token_golden_test PRIVATE
+      gufo_core
+      gufo_deepseek_v4_flash)
+    target_compile_definitions(chat_template_hf_token_golden_test PRIVATE
+      GUFO_CHAT_TEMPLATE_HF_GOLDENS="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/chat_template_hf_goldens.json")
+    add_test(NAME chat_template_hf_token_golden_test
+      COMMAND chat_template_hf_token_golden_test)
+    set_tests_properties(chat_template_hf_token_golden_test PROPERTIES
+      LABELS "gpu;hip;tokenization;chat_template;qwen;deepseek;external-model"
+      SKIP_RETURN_CODE 77)
+  endif()
 
   add_executable(continuation_cache_test
     tests/cli/continuation_cache_test.cpp

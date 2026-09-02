@@ -170,6 +170,10 @@ public:
       std::string_view text) const = 0;
   [[nodiscard]] virtual std::optional<std::vector<TextRunnerToken>>
   RenderAndTokenize(const ChatRequest& request) const = 0;
+  [[nodiscard]] virtual TextGenerationBackend::InitialOutputState
+  InitialOutputState(const ChatRequest&) const {
+    return TextGenerationBackend::InitialOutputState::kAuto;
+  }
   [[nodiscard]] virtual std::string Decode(
       std::span<const TextRunnerToken> tokens) const = 0;
 

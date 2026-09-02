@@ -52,9 +52,6 @@ void PrintPromptHelp(std::string_view program_name) {
   parser.AddInverseFlag("", "--raw",
                         "Disable chat template framing and pass raw tokens",
                         "Prompt", &opt.use_chat_template);
-  parser.AddOption("", "--chat-template", "NAME",
-                   "Custom Jinja chat template (e.g. qwen, chatml, deepseek)",
-                   "Prompt", &opt.chat_template);
   parser.AddInverseFlag("", "--no-display-prompt",
                         "Suppress echoing the prompt before generated response",
                         "Prompt", &opt.display_prompt);
@@ -63,13 +60,14 @@ void PrintPromptHelp(std::string_view program_name) {
                    "Sampling", &opt.max_tokens);
   RegisterSamplingOptions(parser, &opt.sampling);
   parser.AddOption("", "--think", "MODE",
-                   "Reasoning trace mode for thinking models: on, off, or auto "
-                   "(default: auto) (TODO: qwen, deepseek)",
+                   "Reasoning mode: on, off, or auto (default: off)",
                    "Reasoning", &opt.reasoning_mode);
-  parser.AddOption("", "--reasoning-budget", "N",
-                   "Maximum token cap for thinking traces before forcing final "
-                   "answer (default: -1 = unlimited) (TODO: qwen, deepseek)",
-                   "Reasoning", &opt.reasoning_budget);
+  parser.AddOption("", "--reasoning-effort", "LEVEL",
+                   "Effort: auto, minimal, low, medium, high, xhigh, or max",
+                   "Reasoning", &opt.reasoning_effort);
+  parser.AddOption("", "--preserve-thinking", "MODE",
+                   "Replay prior reasoning: on, off, or auto", "Reasoning",
+                   &opt.preserve_thinking);
   parser.AddOption(
       "", "--speculative", "MODE",
       "Draft backend: dspark (DeepSeek V4 Flash), dflash, dflash2, "
@@ -128,21 +126,19 @@ void PrintChatHelp(std::string_view program_name) {
                    "System role instructions prepended to the conversation "
                    "(default: helpful assistant)",
                    "Prompt", &opt.system_prompt);
-  parser.AddOption("", "--chat-template", "NAME",
-                   "Custom Jinja chat template (e.g. qwen, chatml, deepseek)",
-                   "Prompt", &opt.chat_template);
   parser.AddOption("-n", "--max-tokens", "N",
                    "Maximum tokens generated per turn (default: 256)",
                    "Sampling", &opt.max_tokens);
   RegisterSamplingOptions(parser, &opt.sampling);
   parser.AddOption("", "--think", "MODE",
-                   "Reasoning trace mode for thinking models: on, off, or auto "
-                   "(default: auto) (TODO: qwen, deepseek)",
+                   "Reasoning mode: on, off, or auto (default: off)",
                    "Reasoning", &opt.reasoning_mode);
-  parser.AddOption("", "--reasoning-budget", "N",
-                   "Maximum token cap for thinking traces before forcing final "
-                   "answer (default: -1 = unlimited) (TODO: qwen, deepseek)",
-                   "Reasoning", &opt.reasoning_budget);
+  parser.AddOption("", "--reasoning-effort", "LEVEL",
+                   "Effort: auto, minimal, low, medium, high, xhigh, or max",
+                   "Reasoning", &opt.reasoning_effort);
+  parser.AddOption("", "--preserve-thinking", "MODE",
+                   "Replay prior reasoning: on, off, or auto", "Reasoning",
+                   &opt.preserve_thinking);
   parser.AddFlag("", "--cpu",
                  "Force CPU OpenMP execution fallback instead of GPU ROCm",
                  "Hardware", &opt.force_cpu);
@@ -171,11 +167,76 @@ bool IsDeepSeekV4Flash(const core::GgufReader& reader) {
   return reader.GetMetadataString("general.architecture") == "deepseek4";
 }
 
+std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
+  if (value == "minimal") {
+    return ReasoningEffort::kMinimal;
+  }
+  if (value == "low") {
+    return ReasoningEffort::kLow;
+  }
+  if (value == "medium") {
+    return ReasoningEffort::kMedium;
+  }
+  if (value == "high") {
+    return ReasoningEffort::kHigh;
+  }
+  if (value == "xhigh") {
+    return ReasoningEffort::kXHigh;
+  }
+  if (value == "max") {
+    return ReasoningEffort::kMax;
+  }
+  return std::nullopt;
+}
+
+ReasoningOptions PromptReasoningOptions(const PromptOptions& options) {
+  ReasoningOptions reasoning;
+  if (options.reasoning_mode == "on") {
+    reasoning.enabled = true;
+  } else if (options.reasoning_mode == "off") {
+    reasoning.enabled = false;
+  }
+  if (options.reasoning_effort != "auto") {
+    reasoning.effort = ParseReasoningEffort(options.reasoning_effort);
+    reasoning.enabled = true;
+  }
+  if (options.preserve_thinking == "on") {
+    reasoning.preserve_thinking = true;
+  } else if (options.preserve_thinking == "off") {
+    reasoning.preserve_thinking = false;
+  }
+  return reasoning;
+}
+
+tokenization::QwenReasoningEffort QwenEffort(
+    std::optional<ReasoningEffort> effort) {
+  switch (effort.value_or(ReasoningEffort::kXHigh)) {
+    case ReasoningEffort::kMinimal:
+    case ReasoningEffort::kLow:
+      return tokenization::QwenReasoningEffort::kLow;
+    case ReasoningEffort::kMedium:
+      return tokenization::QwenReasoningEffort::kMedium;
+    case ReasoningEffort::kHigh:
+    case ReasoningEffort::kXHigh:
+    case ReasoningEffort::kMax:
+      return tokenization::QwenReasoningEffort::kXHigh;
+  }
+  return tokenization::QwenReasoningEffort::kXHigh;
+}
+
 #if defined(ENGINE_ENABLE_HIP)
-int RunDeepSeekPrompt(const PromptOptions& opt,
+int RunDeepSeekPrompt(const PromptOptions& opt, const core::GgufReader& reader,
                       std::chrono::steady_clock::time_point load_start) {
   if (opt.force_cpu) {
     std::cerr << "DeepSeek V4 Flash is supported only by the ROCm backend\n";
+    PrintModelLoadTime(load_start, false);
+    return 1;
+  }
+  std::string template_error;
+  if (!models::deepseek_v4_flash::ValidateGgufTemplate(reader,
+                                                       &template_error)) {
+    std::cerr << "Unsupported DeepSeek chat template: " << template_error
+              << '\n';
     PrintModelLoadTime(load_start, false);
     return 1;
   }
@@ -210,10 +271,26 @@ int RunDeepSeekPrompt(const PromptOptions& opt,
   }
   PrintModelLoadTime(load_start);
 
-  const auto prompt_tokens =
-      opt.use_chat_template
-          ? model->EncodeChat(opt.system_prompt, opt.prompt_text)
-          : model->Tokenize(opt.prompt_text);
+  std::vector<int> prompt_tokens;
+  if (opt.use_chat_template) {
+    const auto reasoning = PromptReasoningOptions(opt);
+    const std::vector<models::deepseek_v4_flash::ChatMessage> messages = {
+        {.role = "system",
+         .content = opt.system_prompt,
+         .reasoning_content = {}},
+        {.role = "user", .content = opt.prompt_text, .reasoning_content = {}},
+    };
+    prompt_tokens = model->EncodeChat(
+        messages,
+        models::deepseek_v4_flash::ChatTemplateOptions{
+            .enable_thinking = reasoning.enabled.value_or(false),
+            .reasoning_effort =
+                reasoning.effort.value_or(ReasoningEffort::kLow),
+            .preserve_thinking = reasoning.preserve_thinking.value_or(false),
+        });
+  } else {
+    prompt_tokens = model->Tokenize(opt.prompt_text);
+  }
   if (prompt_tokens.empty()) {
     std::cerr << "DeepSeek V4 Flash prompt produced no tokens\n";
     return 1;
@@ -394,9 +471,6 @@ std::optional<PromptOptions> ParsePromptOptions(
   parser.AddInverseFlag("", "--raw",
                         "Disable chat template framing and pass raw tokens",
                         "Prompt", &opt.use_chat_template);
-  parser.AddOption("", "--chat-template", "NAME",
-                   "Custom Jinja chat template (e.g. qwen, chatml, deepseek)",
-                   "Prompt", &opt.chat_template);
   parser.AddInverseFlag("", "--no-display-prompt",
                         "Suppress echoing the prompt before generated response",
                         "Prompt", &opt.display_prompt);
@@ -409,13 +483,14 @@ std::optional<PromptOptions> ParsePromptOptions(
 
   // Reasoning
   parser.AddOption("", "--think", "MODE",
-                   "Reasoning trace mode for thinking models: on, off, or auto "
-                   "(default: auto) (TODO: qwen, deepseek)",
+                   "Reasoning mode: on, off, or auto (default: off)",
                    "Reasoning", &opt.reasoning_mode);
-  parser.AddOption("", "--reasoning-budget", "N",
-                   "Maximum token cap for thinking traces before forcing final "
-                   "answer (default: -1 = unlimited) (TODO: qwen, deepseek)",
-                   "Reasoning", &opt.reasoning_budget);
+  parser.AddOption("", "--reasoning-effort", "LEVEL",
+                   "Effort: auto, minimal, low, medium, high, xhigh, or max",
+                   "Reasoning", &opt.reasoning_effort);
+  parser.AddOption("", "--preserve-thinking", "MODE",
+                   "Replay prior reasoning: on, off, or auto", "Reasoning",
+                   &opt.preserve_thinking);
 
   // Speculative & Hardware
   const auto parse_speculative_backend =
@@ -550,6 +625,35 @@ std::optional<PromptOptions> ParsePromptOptions(
     }
     return std::nullopt;
   }
+  if (opt.reasoning_mode != "on" && opt.reasoning_mode != "off" &&
+      opt.reasoning_mode != "auto") {
+    if (error_msg != nullptr) {
+      *error_msg = "--think must be on, off, or auto";
+    }
+    return std::nullopt;
+  }
+  if (opt.reasoning_effort != "auto" &&
+      !ParseReasoningEffort(opt.reasoning_effort).has_value()) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "--reasoning-effort must be auto, minimal, low, medium, high, "
+          "xhigh, or max";
+    }
+    return std::nullopt;
+  }
+  if (opt.reasoning_mode == "off" && opt.reasoning_effort != "auto") {
+    if (error_msg != nullptr) {
+      *error_msg = "--reasoning-effort cannot be set while --think is off";
+    }
+    return std::nullopt;
+  }
+  if (opt.preserve_thinking != "on" && opt.preserve_thinking != "off" &&
+      opt.preserve_thinking != "auto") {
+    if (error_msg != nullptr) {
+      *error_msg = "--preserve-thinking must be on, off, or auto";
+    }
+    return std::nullopt;
+  }
   return opt;
 }
 
@@ -610,7 +714,7 @@ int RunPrompt(std::span<const char* const> args) {
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
-    return RunDeepSeekPrompt(opt, model_load_start);
+    return RunDeepSeekPrompt(opt, *reader, model_load_start);
   }
 #else
   if (IsDeepSeekV4Flash(*reader)) {
@@ -629,7 +733,15 @@ int RunPrompt(std::span<const char* const> args) {
     }
     messages.push_back(
         {tokenization::ChatRole::kUser, opt.prompt_text, "", ""});
-    const auto rendered = tokenization::QwenChatTemplate::Render(messages);
+    const auto reasoning = PromptReasoningOptions(opt);
+    const auto rendered = tokenization::QwenChatTemplate::Render(
+        messages,
+        tokenization::ChatTemplateOptions{
+            .add_generation_prompt = true,
+            .enable_thinking = reasoning.enabled.value_or(false),
+            .reasoning_effort = QwenEffort(reasoning.effort),
+            .preserve_thinking = reasoning.preserve_thinking.value_or(true),
+        });
     if (rendered.has_value()) {
       rendered_prompt = *rendered;
     }
@@ -935,8 +1047,15 @@ int RunChat(std::span<const char* const> args) {
     }
 
     history.push_back({tokenization::ChatRole::kUser, user_input, "", ""});
-    const auto rendered_prompt =
-        tokenization::QwenChatTemplate::Render(history);
+    const auto reasoning = PromptReasoningOptions(opt);
+    const auto rendered_prompt = tokenization::QwenChatTemplate::Render(
+        history,
+        tokenization::ChatTemplateOptions{
+            .add_generation_prompt = true,
+            .enable_thinking = reasoning.enabled.value_or(false),
+            .reasoning_effort = QwenEffort(reasoning.effort),
+            .preserve_thinking = reasoning.preserve_thinking.value_or(true),
+        });
     if (!rendered_prompt.has_value()) {
       std::cerr << "Error formatting chat template.\n";
       continue;

@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/runtime/model.h"
 
 namespace gufo::models::deepseek_v4_flash {
@@ -20,11 +21,6 @@ struct ModelOptions {
   int power_percent = 100;
   /// Optional DSpark support model. Empty leaves speculative decoding off.
   std::string dspark_model_path;
-};
-
-struct ChatMessage {
-  std::string role;
-  std::string content;
 };
 
 class Session;
@@ -49,7 +45,11 @@ public:
   [[nodiscard]] std::vector<int> EncodeChat(std::string_view system_prompt,
                                             std::string_view user_prompt) const;
   [[nodiscard]] std::vector<int> EncodeChat(
-      std::span<const ChatMessage> messages) const;
+      std::span<const ChatMessage> messages,
+      const ChatTemplateOptions& options = {}) const;
+  [[nodiscard]] std::vector<int> EncodeChat(
+      std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
+      const ChatTemplateOptions& options = {}) const;
   [[nodiscard]] std::string DecodeToken(int token) const;
   [[nodiscard]] bool IsStopToken(int token) const;
   [[nodiscard]] int EosToken() const;

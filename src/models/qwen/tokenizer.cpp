@@ -1,5 +1,7 @@
 #include "src/models/qwen/tokenizer.hpp"
 
+#include <unicode/uchar.h>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -133,6 +135,187 @@ std::string UnescapeGpt2Bytes(std::string_view text) {
   return result;
 }
 
+struct Utf8CodePoint {
+  UChar32 value{0};
+  std::size_t length{1};
+};
+
+Utf8CodePoint DecodeUtf8(std::string_view text, std::size_t offset) noexcept {
+  const auto first = static_cast<std::uint8_t>(text[offset]);
+  if (first < 0x80U) {
+    return {.value = first, .length = 1};
+  }
+
+  std::size_t length = 0;
+  UChar32 value = 0;
+  if ((first & 0xE0U) == 0xC0U) {
+    length = 2;
+    value = static_cast<UChar32>(first & 0x1FU);
+  } else if ((first & 0xF0U) == 0xE0U) {
+    length = 3;
+    value = static_cast<UChar32>(first & 0x0FU);
+  } else if ((first & 0xF8U) == 0xF0U) {
+    length = 4;
+    value = static_cast<UChar32>(first & 0x07U);
+  } else {
+    return {.value = first, .length = 1};
+  }
+  if (offset + length > text.size()) {
+    return {.value = first, .length = 1};
+  }
+  for (std::size_t index = 1; index < length; ++index) {
+    const auto byte = static_cast<std::uint8_t>(text[offset + index]);
+    if ((byte & 0xC0U) != 0x80U) {
+      return {.value = first, .length = 1};
+    }
+    value = static_cast<UChar32>((value << 6U) | (byte & 0x3FU));
+  }
+  return {.value = value, .length = length};
+}
+
+bool IsUnicodeLetter(UChar32 value) noexcept {
+  return u_isalpha(value) != 0;
+}
+
+bool IsUnicodeNumber(UChar32 value) noexcept {
+  const auto category = static_cast<UCharCategory>(u_charType(value));
+  return category == U_DECIMAL_DIGIT_NUMBER || category == U_LETTER_NUMBER ||
+         category == U_OTHER_NUMBER;
+}
+
+bool IsUnicodeWhitespace(UChar32 value) noexcept {
+  return u_isUWhiteSpace(value) != 0;
+}
+
+bool IsNewline(UChar32 value) noexcept {
+  return value == '\r' || value == '\n';
+}
+
+char AsciiLower(char value) noexcept {
+  if (value >= 'A' && value <= 'Z') {
+    return static_cast<char>(value - 'A' + 'a');
+  }
+  return value;
+}
+
+std::size_t Qwen35ContractionEnd(std::string_view text,
+                                 std::size_t offset) noexcept {
+  if (text[offset] != '\'') {
+    return offset;
+  }
+  constexpr std::array<std::string_view, 7> kSuffixes = {
+      "s", "t", "re", "ve", "m", "ll", "d",
+  };
+  for (const std::string_view suffix : kSuffixes) {
+    if (offset + 1 + suffix.size() > text.size()) {
+      continue;
+    }
+    bool matches = true;
+    for (std::size_t index = 0; index < suffix.size(); ++index) {
+      if (AsciiLower(text[offset + 1 + index]) != suffix[index]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      return offset + 1 + suffix.size();
+    }
+  }
+  return offset;
+}
+
+std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
+  if (const std::size_t contraction = Qwen35ContractionEnd(text, offset);
+      contraction != offset) {
+    return contraction;
+  }
+
+  const Utf8CodePoint first = DecodeUtf8(text, offset);
+  if (IsUnicodeLetter(first.value)) {
+    std::size_t end = offset + first.length;
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsUnicodeLetter(next.value)) {
+        break;
+      }
+      end += next.length;
+    }
+    return end;
+  }
+
+  if (!IsNewline(first.value) && !IsUnicodeLetter(first.value) &&
+      !IsUnicodeNumber(first.value) && offset + first.length < text.size()) {
+    const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
+    if (IsUnicodeLetter(next.value)) {
+      std::size_t end = offset + first.length + next.length;
+      while (end < text.size()) {
+        const Utf8CodePoint letter = DecodeUtf8(text, end);
+        if (!IsUnicodeLetter(letter.value)) {
+          break;
+        }
+        end += letter.length;
+      }
+      return end;
+    }
+  }
+
+  if (IsUnicodeNumber(first.value)) {
+    return offset + first.length;
+  }
+
+  std::size_t punctuation_start = offset;
+  if (first.value == ' ' && offset + first.length < text.size()) {
+    const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
+    if (!IsUnicodeWhitespace(next.value) && !IsUnicodeLetter(next.value) &&
+        !IsUnicodeNumber(next.value)) {
+      punctuation_start += first.length;
+    }
+  }
+  const Utf8CodePoint punctuation = DecodeUtf8(text, punctuation_start);
+  if (!IsUnicodeWhitespace(punctuation.value) &&
+      !IsUnicodeLetter(punctuation.value) &&
+      !IsUnicodeNumber(punctuation.value)) {
+    std::size_t end = punctuation_start;
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (IsUnicodeWhitespace(next.value) || IsUnicodeLetter(next.value) ||
+          IsUnicodeNumber(next.value)) {
+        break;
+      }
+      end += next.length;
+    }
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsNewline(next.value)) {
+        break;
+      }
+      end += next.length;
+    }
+    return end;
+  }
+
+  if (IsUnicodeWhitespace(first.value)) {
+    std::size_t end = offset;
+    std::size_t last_newline_end = offset;
+    while (end < text.size()) {
+      const Utf8CodePoint next = DecodeUtf8(text, end);
+      if (!IsUnicodeWhitespace(next.value)) {
+        break;
+      }
+      end += next.length;
+      if (IsNewline(next.value)) {
+        last_newline_end = end;
+      }
+    }
+    if (last_newline_end != offset) {
+      return last_newline_end;
+    }
+    return end;
+  }
+
+  return offset + first.length;
+}
+
 }  // namespace
 
 std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromBinaryFile(
@@ -243,7 +426,10 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
   for (std::size_t i = 0; i < tokens.size(); ++i) {
     const auto& t = tokens[i];
     if (t == "<|endoftext|>" || t == "<|im_start|>" || t == "<|im_end|>" ||
-        t == "<think>" || t == "</think>" || t == "<|object_ref_start|>" ||
+        t == "<tool_call>" || t == "</tool_call>" || t == "<tool_response>" ||
+        t == "</tool_response>" || t == "<think>" || t == "</think>" ||
+        t == "<tts_pad>" || t == "<tts_text_bos>" || t == "<tts_text_eod>" ||
+        t == "<tts_text_bos_single>" || t == "<|object_ref_start|>" ||
         t == "<|object_ref_end|>" || t == "<|vision_start|>" ||
         t == "<|vision_end|>" || t == "<|image_pad|>" || t == "<|video_pad|>" ||
         t == "<|quad_start|>" || t == "<|quad_end|>" ||
@@ -256,6 +442,10 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
       CreateFromVocabulary(tokens, merges, special_tokens, error_msg);
   if (tokenizer == nullptr) {
     return nullptr;
+  }
+  if (reader.GetMetadataString("tokenizer.ggml.pre") ==
+      std::optional<std::string_view>{"qwen35"}) {
+    tokenizer->pre_tokenizer_ = PreTokenizer::kQwen35;
   }
 
   if (auto eos = reader.GetMetadataUint32("tokenizer.ggml.eos_token_id")) {
@@ -440,6 +630,22 @@ std::vector<TokenId> QwenTokenizer::BpeMergeChunk(
   return word_tokens;
 }
 
+std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
+  if (pre_tokenizer_ != PreTokenizer::kQwen35) {
+    return BpeMergeChunk(text);
+  }
+
+  std::vector<TokenId> tokens;
+  std::size_t offset = 0;
+  while (offset < text.size()) {
+    const std::size_t end = Qwen35PieceEnd(text, offset);
+    const auto piece_tokens = BpeMergeChunk(text.substr(offset, end - offset));
+    tokens.insert(tokens.end(), piece_tokens.begin(), piece_tokens.end());
+    offset = end;
+  }
+  return tokens;
+}
+
 std::vector<TokenId> QwenTokenizer::Encode(
     std::string_view text, const TokenizerOptions& options) const {
   std::vector<TokenId> tokens;
@@ -458,7 +664,7 @@ std::vector<TokenId> QwenTokenizer::Encode(
   }
 
   if (!options.parse_special_tokens || special_token_to_id_.empty()) {
-    const auto chunk_tokens = BpeMergeChunk(text);
+    const auto chunk_tokens = BpeEncodeText(text);
     tokens.insert(tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
   } else {
     // Scan text for special token delimiters
@@ -483,14 +689,14 @@ std::vector<TokenId> QwenTokenizer::Encode(
       if (next_special_pos == std::string_view::npos) {
         // No more special tokens; encode remainder
         const auto chunk = text.substr(pos);
-        const auto chunk_tokens = BpeMergeChunk(chunk);
+        const auto chunk_tokens = BpeEncodeText(chunk);
         tokens.insert(tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
         break;
       }
 
       if (next_special_pos > pos) {
         const auto chunk = text.substr(pos, next_special_pos - pos);
-        const auto chunk_tokens = BpeMergeChunk(chunk);
+        const auto chunk_tokens = BpeEncodeText(chunk);
         tokens.insert(tokens.end(), chunk_tokens.begin(), chunk_tokens.end());
       }
 

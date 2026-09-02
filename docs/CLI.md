@@ -39,6 +39,25 @@ non-interactive system and hardware diagnostics.
 All commands support `--help` and `--version`. Unknown options and invalid
 combinations return an error instead of being ignored.
 
+### Reasoning
+
+`prompt`, `chat`, and `serve llm` expose the implemented model controls:
+
+```bash
+gufo prompt --model model.gguf --think on --reasoning-effort high \
+  --preserve-thinking off --prompt "Check this result."
+```
+
+`--think` accepts `on`, `off`, or `auto`; the default is `off`.
+`--reasoning-effort` accepts `auto`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, or `max`. `--preserve-thinking` accepts `on`, `off`, or `auto`.
+Each model card under `src/models/` documents how provider-neutral levels map
+to the model's native effort set.
+
+The CLI does not accept arbitrary Jinja templates. `--raw` remains available
+only for one-shot direct prompts. A reasoning-token budget is not exposed
+because decode-time budget enforcement is not implemented.
+
 ### Speech transcription
 
 `transcribe` loads one resident Qwen3-ASR runtime and accepts PCM16, PCM24,

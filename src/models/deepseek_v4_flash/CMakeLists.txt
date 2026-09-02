@@ -4,6 +4,7 @@ set(DEEPSEEK_V4_FLASH_ROCM_DIR
   "${CMAKE_CURRENT_SOURCE_DIR}/kernels/rocm")
 
 add_library(gufo_deepseek_v4_flash STATIC
+  chat_template.cpp
   engine.cpp
   ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/model_data.cpp
   ${DEEPSEEK_V4_FLASH_RUNTIME_DIR}/rocm_graph.cpp

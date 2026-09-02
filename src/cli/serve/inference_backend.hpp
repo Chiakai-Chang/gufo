@@ -99,9 +99,13 @@ public:
   [[nodiscard]] std::string model_id() const override;
   [[nodiscard]] bool ready() const override;
   [[nodiscard]] SamplingDefaults sampling_defaults() const override;
+  [[nodiscard]] ReasoningOptions reasoning_defaults() const override;
+  [[nodiscard]] InitialOutputState initial_output_state(
+      const ChatRequest& request) const override;
   void set_model_id(const std::string& model_id);
   void set_sampling_defaults(std::size_t max_tokens,
                              const sampling::SamplingConfig& sampling);
+  void set_reasoning_defaults(const ReasoningOptions& reasoning);
 
   /// Plain text completion (no chat framing).
   Result complete(std::string_view prompt, std::size_t max_tokens,

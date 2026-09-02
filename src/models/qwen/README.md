@@ -88,6 +88,50 @@ layer-64 graph, and feeds proposed tokens through the speculative backend.
   loader retaining the existing binary-vocabulary fallback. [`QwenChatTemplate`](chat_template.hpp)
   renders structured messages before tokenization.
 
+### Chat template and reasoning
+
+Gufo uses the compiled `qwen38-reasoning-compiled-v2` formatter. The official
+Jinja and its provenance are stored under [`reference/`](reference/). A
+Qwen3.8 GGUF is accepted only when `tokenizer.chat_template` has an explicitly
+recognized SHA-256; unknown or missing Qwen3.8 templates fail model loading.
+Jinja is never executed at runtime.
+
+Chat Completions accepts Pi/OpenAI-style `reasoning_effort` and
+`chat_template_kwargs` with `enable_thinking`, `reasoning_effort`, and
+`preserve_thinking`. Server and CLI thinking defaults to off unless explicitly
+enabled. Native Qwen effort mapping is:
+
+| Requested | Qwen template level |
+|---|---|
+| `minimal`, `low` | `low` |
+| `medium` | `medium` |
+| `high`, `xhigh`, `max` | `xhigh` |
+
+Qwen preserves historical assistant reasoning by default.
+`preserve_thinking=false` drops reasoning before the latest user turn while
+retaining visible assistant content. Thinking generation begins inside the
+prompt-opened `<think>` block, so HTTP responses expose those bytes as
+`reasoning_content`, not `content`.
+
+The CLI controls are `--think`, `--reasoning-effort`, and
+`--preserve-thinking`. This path has no custom Jinja override and no
+reasoning-token-budget enforcement.
+
+Pi should configure this model with `thinkingFormat:
+"qwen-chat-template"`. Gufo accepts the resulting
+`chat_template_kwargs.enable_thinking`, `reasoning_effort`, and
+`preserve_thinking` fields.
+
+Rendered-byte and token-ID SHA goldens generated with the pinned Hugging Face
+template/tokenizer are stored in
+[`tests/fixtures/chat_template_hf_goldens.json`](../../../tests/fixtures/chat_template_hf_goldens.json).
+The template tests cover chat mode, all native effort levels, history
+preservation, and tools. The model-backed
+`chat_template_hf_token_golden_test` loads a real Qwen3.8 GGUF, applies its
+`qwen35` pre-tokenizer and added tool tokens, and compares Gufo's complete
+token-ID sequences with those goldens. Set `GUFO_QWEN_GGUF` and
+`GUFO_DEEPSEEK_GGUF` to run it; CTest skips it when the artifacts are absent.
+
 ### HIP target model
 
 - [`QwenGpuModel::CreateFromGguf`](hip/executor.hpp) owns the GGUF reader,

@@ -329,6 +329,146 @@ bool ParseToolChoice(const json::Value* value, ParsedChatRequest* request,
   return false;
 }
 
+std::optional<ReasoningEffort> ParseReasoningEffortName(
+    std::string_view value) {
+  if (value == "minimal") {
+    return ReasoningEffort::kMinimal;
+  }
+  if (value == "low") {
+    return ReasoningEffort::kLow;
+  }
+  if (value == "medium") {
+    return ReasoningEffort::kMedium;
+  }
+  if (value == "high") {
+    return ReasoningEffort::kHigh;
+  }
+  if (value == "xhigh") {
+    return ReasoningEffort::kXHigh;
+  }
+  if (value == "max") {
+    return ReasoningEffort::kMax;
+  }
+  return std::nullopt;
+}
+
+bool AssignReasoningEnabled(ReasoningOptions* options, bool enabled,
+                            std::string* error) {
+  if (options->enabled.has_value() && *options->enabled != enabled) {
+    *error = "reasoning controls disagree about whether thinking is enabled";
+    return false;
+  }
+  options->enabled = enabled;
+  return true;
+}
+
+bool AssignReasoningEffort(ReasoningOptions* options, std::string_view value,
+                           std::string* error) {
+  if (value == "off" || value == "none") {
+    return AssignReasoningEnabled(options, false, error);
+  }
+  const auto effort = ParseReasoningEffortName(value);
+  if (!effort.has_value()) {
+    *error =
+        "reasoning_effort must be off, minimal, low, medium, high, xhigh, or "
+        "max";
+    return false;
+  }
+  if (options->effort.has_value() && options->effort != effort) {
+    *error = "top-level and chat_template_kwargs reasoning_effort disagree";
+    return false;
+  }
+  options->effort = effort;
+  return AssignReasoningEnabled(options, true, error);
+}
+
+bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
+                           std::string* error) {
+  if (const json::Value* thinking = body.find("thinking")) {
+    if (!thinking->is_object()) {
+      *error = "'thinking' must be an object";
+      return false;
+    }
+    const json::Value* type = thinking->find("type");
+    if (type == nullptr || !type->is_string()) {
+      *error = "'thinking.type' must be enabled or disabled";
+      return false;
+    }
+    const std::string value = type->get_str();
+    if (value != "enabled" && value != "disabled") {
+      *error = "'thinking.type' must be enabled or disabled";
+      return false;
+    }
+    if (!AssignReasoningEnabled(options, value == "enabled", error)) {
+      return false;
+    }
+  }
+
+  if (const json::Value* effort = body.find("reasoning_effort")) {
+    if (!effort->is_string() ||
+        !AssignReasoningEffort(options, effort->get_str(), error)) {
+      if (error->empty()) {
+        *error = "'reasoning_effort' must be a string";
+      }
+      return false;
+    }
+  }
+
+  const json::Value* kwargs = body.find("chat_template_kwargs");
+  if (kwargs == nullptr) {
+    return true;
+  }
+  if (!kwargs->is_object()) {
+    *error = "'chat_template_kwargs' must be an object";
+    return false;
+  }
+  if (const json::Value* enabled = kwargs->find("enable_thinking")) {
+    if (!enabled->is_bool() ||
+        !AssignReasoningEnabled(options, enabled->as_bool(), error)) {
+      if (error->empty()) {
+        *error = "'chat_template_kwargs.enable_thinking' must be a boolean";
+      }
+      return false;
+    }
+  }
+  if (const json::Value* mode = kwargs->find("thinking_mode")) {
+    if (!mode->is_string()) {
+      *error = "'chat_template_kwargs.thinking_mode' must be a string";
+      return false;
+    }
+    const std::string value = mode->get_str();
+    if (value != "auto") {
+      const bool enabled = value == "thinking" || value == "on";
+      if ((!enabled && value != "chat" && value != "off" && value != "none") ||
+          !AssignReasoningEnabled(options, enabled, error)) {
+        if (error->empty()) {
+          *error =
+              "'chat_template_kwargs.thinking_mode' must be auto, thinking, "
+              "or chat";
+        }
+        return false;
+      }
+    }
+  }
+  if (const json::Value* effort = kwargs->find("reasoning_effort")) {
+    if (!effort->is_string() ||
+        !AssignReasoningEffort(options, effort->get_str(), error)) {
+      if (error->empty()) {
+        *error = "'chat_template_kwargs.reasoning_effort' must be a string";
+      }
+      return false;
+    }
+  }
+  if (const json::Value* preserve = kwargs->find("preserve_thinking")) {
+    if (!preserve->is_bool()) {
+      *error = "'chat_template_kwargs.preserve_thinking' must be a boolean";
+      return false;
+    }
+    options->preserve_thinking = preserve->as_bool();
+  }
+  return true;
+}
+
 std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                                          TextGenerationBackend& backend,
                                          ParsedChatRequest* output) {
@@ -389,6 +529,21 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request",
                  "'tool_choice' cannot be required without tools",
                  "invalid_tool_choice");
+  }
+
+  if (!ParseReasoningOptions(body, &output->chat.reasoning, &parse_error)) {
+    return Error(400, "Bad Request", std::move(parse_error),
+                 "invalid_reasoning");
+  }
+  const ReasoningOptions defaults = backend.reasoning_defaults();
+  if (!output->chat.reasoning.enabled.has_value()) {
+    output->chat.reasoning.enabled = defaults.enabled;
+  }
+  if (!output->chat.reasoning.effort.has_value()) {
+    output->chat.reasoning.effort = defaults.effort;
+  }
+  if (!output->chat.reasoning.preserve_thinking.has_value()) {
+    output->chat.reasoning.preserve_thinking = defaults.preserve_thinking;
   }
 
   if (const json::Value* stream = body.find("stream")) {
@@ -724,36 +879,60 @@ void ParseDsmlCalls(std::string_view text, std::vector<ParsedToolCall>* calls) {
   }
 }
 
-ParsedGeneration ParseGeneration(std::string_view raw) {
+ParsedGeneration ParseGeneration(
+    std::string_view raw,
+    TextGenerationBackend::InitialOutputState initial_output_state =
+        TextGenerationBackend::InitialOutputState::kAuto) {
   ParsedGeneration parsed;
-  const std::string_view content = raw;
+  std::string_view content = raw;
 
   constexpr std::string_view kThinkStart = "<think>";
   constexpr std::string_view kThinkEnd = "</think>";
-  const std::size_t think_start = content.find(kThinkStart);
-  if (think_start != std::string_view::npos) {
-    const std::size_t think_content_start = think_start + kThinkStart.size();
-    const std::size_t think_end = content.find(kThinkEnd, think_content_start);
-    if (think_end != std::string_view::npos) {
-      parsed.reasoning_content = std::string(Trim(content.substr(
-          think_content_start, think_end - think_content_start)));
-      std::string_view remaining = content.substr(think_end + kThinkEnd.size());
-      if (remaining.starts_with("\n")) {
-        remaining.remove_prefix(1);
-      }
-      if (think_start > 0) {
-        parsed.text = std::string(content.substr(0, think_start)) +
-                      std::string(remaining);
+  if (initial_output_state ==
+      TextGenerationBackend::InitialOutputState::kReasoning) {
+    if (content.starts_with(kThinkStart)) {
+      content.remove_prefix(kThinkStart.size());
+    }
+    const std::size_t think_end = content.find(kThinkEnd);
+    if (think_end == std::string_view::npos) {
+      parsed.reasoning_content = std::string(Trim(content));
+      return parsed;
+    }
+    parsed.reasoning_content = std::string(Trim(content.substr(0, think_end)));
+    content.remove_prefix(think_end + kThinkEnd.size());
+    while (!content.empty() &&
+           (content.front() == '\n' || content.front() == '\r')) {
+      content.remove_prefix(1);
+    }
+    parsed.text = std::string(content);
+  } else {
+    const std::size_t think_start = content.find(kThinkStart);
+    if (think_start != std::string_view::npos) {
+      const std::size_t think_content_start = think_start + kThinkStart.size();
+      const std::size_t think_end =
+          content.find(kThinkEnd, think_content_start);
+      if (think_end != std::string_view::npos) {
+        parsed.reasoning_content = std::string(Trim(content.substr(
+            think_content_start, think_end - think_content_start)));
+        std::string_view remaining =
+            content.substr(think_end + kThinkEnd.size());
+        if (remaining.starts_with("\n")) {
+          remaining.remove_prefix(1);
+        }
+        if (think_start > 0) {
+          parsed.text = std::string(content.substr(0, think_start)) +
+                        std::string(remaining);
+        } else {
+          parsed.text = std::string(remaining);
+        }
       } else {
-        parsed.text = std::string(remaining);
+        parsed.reasoning_content =
+            std::string(Trim(content.substr(think_content_start)));
+        parsed.text = "";
       }
     } else {
-      parsed.reasoning_content =
-          std::string(Trim(content.substr(think_content_start)));
-      parsed.text = "";
+      parsed.text = std::string(content);
     }
-  } else {
-    parsed.text = std::string(content);
   }
 
   const std::size_t marker = EarliestMarker(parsed.text);
@@ -948,8 +1127,18 @@ public:
   using EmitCallback =
       std::function<bool(std::string_view piece, bool is_reasoning)>;
 
-  explicit StreamingTextFilter(EmitCallback emit_piece)
-      : emit_piece_(std::move(emit_piece)) {}
+  StreamingTextFilter(
+      TextGenerationBackend::InitialOutputState initial_output_state,
+      EmitCallback emit_piece)
+      : emit_piece_(std::move(emit_piece)) {
+    if (initial_output_state ==
+        TextGenerationBackend::InitialOutputState::kReasoning) {
+      state_ = State::kThinking;
+    } else if (initial_output_state ==
+               TextGenerationBackend::InitialOutputState::kContent) {
+      state_ = State::kContent;
+    }
+  }
 
   bool Push(std::string_view piece) {
     raw_.append(piece);
@@ -1070,10 +1259,11 @@ private:
 
 HttpResponse NonStreamingResponse(
     TextGenerationBackend& backend,
-    const std::shared_ptr<TextGenerationBackend::GenerationRequest>&
-        generation) {
+    const std::shared_ptr<TextGenerationBackend::GenerationRequest>& generation,
+    TextGenerationBackend::InitialOutputState initial_output_state) {
   const auto result = generation->Wait();
-  const ParsedGeneration generated = ParseGeneration(result.text);
+  const ParsedGeneration generated =
+      ParseGeneration(result.text, initial_output_state);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -1160,7 +1350,8 @@ HttpResponse NonStreamingResponse(
 
 HttpResponse StreamingResponse(
     const ParsedChatRequest& request, TextGenerationBackend& backend,
-    std::shared_ptr<TextGenerationBackend::GenerationRequest> generation) {
+    std::shared_ptr<TextGenerationBackend::GenerationRequest> generation,
+    TextGenerationBackend::InitialOutputState initial_output_state) {
   const std::string id = RandomId("chatcmpl-");
   const long long created = Now();
   const std::string model = backend.model_id();
@@ -1175,8 +1366,8 @@ HttpResponse StreamingResponse(
               {"X-Accel-Buffering", "no"},
           },
       .streaming_body =
-          [request, generation = std::move(generation), id, created,
-           model](const HttpResponse::BodyWriter& writer) {
+          [request, generation = std::move(generation), id, created, model,
+           initial_output_state](const HttpResponse::BodyWriter& writer) {
             json::Value role_delta = json::Value::object();
             role_delta["role"] = "assistant";
             if (!writer(Sse(
@@ -1187,6 +1378,7 @@ HttpResponse StreamingResponse(
 
             bool connected = true;
             StreamingTextFilter filter(
+                initial_output_state,
                 [&](std::string_view text, bool is_reasoning) {
                   if (text.empty()) {
                     return true;
@@ -1210,7 +1402,8 @@ HttpResponse StreamingResponse(
                 return;
               }
 
-              const ParsedGeneration generated = ParseGeneration(filter.raw());
+              const ParsedGeneration generated =
+                  ParseGeneration(filter.raw(), initial_output_state);
               if (!filter.Finish(!generated.tool_calls.empty())) {
                 return;
               }
@@ -1286,13 +1479,15 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     return std::move(*error);
   }
   try {
+    const auto initial_output_state = backend.initial_output_state(parsed.chat);
     auto generation =
         backend.start_chat(parsed.chat, parsed.max_tokens, parsed.sampling,
                            request.is_cancelled, parsed.stream);
     if (parsed.stream) {
-      return StreamingResponse(parsed, backend, std::move(generation));
+      return StreamingResponse(parsed, backend, std::move(generation),
+                               initial_output_state);
     }
-    return NonStreamingResponse(backend, generation);
+    return NonStreamingResponse(backend, generation, initial_output_state);
   } catch (const TextGenerationError& exception) {
     return GenerationError(exception);
   }

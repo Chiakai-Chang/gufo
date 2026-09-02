@@ -5,6 +5,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/models/qwen/chat_template.hpp"
+
 namespace gufo::models {
 
 QwenGenerator::QwenGenerator(
@@ -24,6 +26,10 @@ QwenGenerator::QwenGenerator(
 
 std::unique_ptr<QwenGenerator> QwenGenerator::CreateFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {
+  if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(reader,
+                                                            error_msg)) {
+    return nullptr;
+  }
   auto weights_opt = QwenModelWeights::LoadFromGguf(reader, error_msg);
   if (!weights_opt.has_value()) {
     return nullptr;

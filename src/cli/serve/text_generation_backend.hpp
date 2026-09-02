@@ -6,12 +6,14 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
+#include "src/core/reasoning.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/tokenizer.hpp"
@@ -87,6 +89,7 @@ struct ChatRequest {
   std::vector<tokenization::ChatTool> tools;
   std::string client_id{"anonymous"};
   ToolChoice tool_choice{ToolChoice::kAuto};
+  ReasoningOptions reasoning;
 };
 
 /// Model-agnostic text generation boundary used by the HTTP transport.
@@ -103,6 +106,12 @@ public:
     kStop,
     kLength,
     kCancelled,
+  };
+
+  enum class InitialOutputState : std::uint8_t {
+    kAuto,
+    kReasoning,
+    kContent,
   };
 
   struct SamplingDefaults {
@@ -179,6 +188,13 @@ public:
   [[nodiscard]] virtual bool ready() const = 0;
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
     return {};
+  }
+  [[nodiscard]] virtual ReasoningOptions reasoning_defaults() const {
+    return {};
+  }
+  [[nodiscard]] virtual InitialOutputState initial_output_state(
+      const ChatRequest&) const {
+    return InitialOutputState::kAuto;
   }
 
   virtual Result complete(std::string_view prompt, std::size_t max_tokens,

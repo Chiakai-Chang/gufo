@@ -32,6 +32,15 @@ public:
   [[nodiscard]] SamplingDefaults sampling_defaults() const override {
     return defaults;
   }
+  [[nodiscard]] gufo::ReasoningOptions reasoning_defaults() const override {
+    return reasoning_defaults_value;
+  }
+  [[nodiscard]] InitialOutputState initial_output_state(
+      const gufo::server::ChatRequest& request) const override {
+    return request.reasoning.enabled.value_or(false)
+               ? InitialOutputState::kReasoning
+               : InitialOutputState::kContent;
+  }
 
   Result complete(std::string_view, std::size_t,
                   const gufo::sampling::SamplingConfig&,
@@ -129,6 +138,7 @@ public:
   std::atomic<int> chat_calls{0};
   gufo::server::ChatRequest last_request;
   SamplingDefaults defaults;
+  gufo::ReasoningOptions reasoning_defaults_value;
   std::size_t last_max_tokens{0};
   float last_temperature{0.0F};
   gufo::sampling::SamplingConfig last_sampling;
@@ -407,6 +417,104 @@ void TestAssistantReasoningContentReachesBackend() {
          "Assistant visible content remains separate from reasoning");
 }
 
+void TestPiReasoningControlsAndOutputFraming() {
+  FakeBackend backend;
+  backend.pieces = {"I should verify this.", "</think>\n\n", "Forty-two."};
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"What is six times seven?"}],
+        "reasoning_effort":"high",
+        "chat_template_kwargs":{
+          "enable_thinking":true,
+          "reasoning_effort":"high",
+          "preserve_thinking":false
+        }
+      })"),
+                                                       backend);
+
+  Expect(response.status == 200, "Pi reasoning request is accepted");
+  Expect(backend.last_request.reasoning.enabled == true,
+         "Pi enable_thinking reaches the backend");
+  Expect(backend.last_request.reasoning.effort == gufo::ReasoningEffort::kHigh,
+         "Pi reasoning effort reaches the backend");
+  Expect(backend.last_request.reasoning.preserve_thinking == false,
+         "Pi preservation control reaches the backend");
+  Expect(response.body.find(R"("reasoning_content":"I should verify this.")") !=
+             std::string::npos,
+         "Prompt-opened reasoning is returned separately");
+  Expect(response.body.find(R"("content":"Forty-two.")") != std::string::npos,
+         "Visible answer excludes reasoning");
+}
+
+void TestPiNativeDeepSeekThinkingObject() {
+  FakeBackend backend;
+  backend.pieces = {"Check.", "</think>", "Done."};
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"Check this."}],
+        "thinking":{"type":"enabled"},
+        "reasoning_effort":"high"
+      })"),
+                                                       backend);
+  Expect(response.status == 200,
+         "Pi native DeepSeek thinking object is accepted");
+  Expect(backend.last_request.reasoning.enabled == true,
+         "Pi DeepSeek thinking.type enables reasoning");
+  Expect(backend.last_request.reasoning.effort == gufo::ReasoningEffort::kHigh,
+         "Pi DeepSeek reasoning effort reaches the backend");
+
+  const auto disabled = gufo::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"Answer directly."}],
+        "thinking":{"type":"disabled"}
+      })"),
+                                                       backend);
+  Expect(disabled.status == 200,
+         "Pi native DeepSeek disabled thinking object is accepted");
+  Expect(backend.last_request.reasoning.enabled == false,
+         "Pi DeepSeek thinking.type disables reasoning");
+}
+
+void TestStreamingPromptOpenedReasoning() {
+  FakeBackend backend;
+  backend.pieces = {"Check", " carefully", "</thi", "nk>\n\n", "Done"};
+  auto response = gufo::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"Check it."}],
+        "reasoning_effort":"xhigh",
+        "stream":true
+      })"),
+                                                 backend);
+  Expect(response.status == 200, "Streaming reasoning request is accepted");
+  std::string output;
+  response.streaming_body([&](std::string_view chunk) {
+    output.append(chunk);
+    return true;
+  });
+  Expect(output.find(R"("reasoning_content":"Check")") != std::string::npos,
+         "Streaming reasoning uses reasoning_content deltas");
+  Expect(output.find(R"("content":"Done")") != std::string::npos,
+         "Streaming answer switches to content after think end");
+  Expect(output.find(R"("content":"Check")") == std::string::npos,
+         "Reasoning is never exposed as visible content");
+}
+
+void TestConflictingReasoningControlsAreRejected() {
+  FakeBackend backend;
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"hello"}],
+        "reasoning_effort":"high",
+        "chat_template_kwargs":{"enable_thinking":false}
+      })"),
+                                                       backend);
+  Expect(response.status == 400, "Conflicting reasoning controls are rejected");
+  Expect(response.body.find("invalid_reasoning") != std::string::npos,
+         "Reasoning conflict has a stable error code");
+  Expect(backend.chat_calls.load() == 0,
+         "Invalid reasoning request never reaches generation");
+}
+
 void TestWrongModelIsRejected() {
   FakeBackend backend;
   const auto response = gufo::server::HandleOpenAiChat(Request(R"({
@@ -485,6 +593,10 @@ int main() {
   TestBackendSamplingDefaults();
   TestAllSamplingControlsReachBackend();
   TestAssistantReasoningContentReachesBackend();
+  TestPiReasoningControlsAndOutputFraming();
+  TestPiNativeDeepSeekThinkingObject();
+  TestStreamingPromptOpenedReasoning();
+  TestConflictingReasoningControlsAreRejected();
   TestToolCallsAreStructured();
   TestDeepSeekToolCallsAreStructured();
   TestWrongModelIsRejected();

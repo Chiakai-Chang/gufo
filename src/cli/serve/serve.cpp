@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -23,6 +24,71 @@
 #include "src/core/speculative/draft_policy.hpp"
 
 namespace gufo::cli {
+namespace {
+
+std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
+  if (value == "minimal") {
+    return ReasoningEffort::kMinimal;
+  }
+  if (value == "low") {
+    return ReasoningEffort::kLow;
+  }
+  if (value == "medium") {
+    return ReasoningEffort::kMedium;
+  }
+  if (value == "high") {
+    return ReasoningEffort::kHigh;
+  }
+  if (value == "xhigh") {
+    return ReasoningEffort::kXHigh;
+  }
+  if (value == "max") {
+    return ReasoningEffort::kMax;
+  }
+  return std::nullopt;
+}
+
+std::optional<ReasoningOptions> ResolveReasoningDefaults(
+    std::string_view mode, std::string_view effort, std::string_view preserve,
+    std::string* error) {
+  ReasoningOptions options;
+  if (mode == "on") {
+    options.enabled = true;
+  } else if (mode == "off") {
+    options.enabled = false;
+  } else if (mode != "auto") {
+    *error = "--think must be on, off, or auto";
+    return std::nullopt;
+  }
+
+  if (effort != "auto") {
+    const auto parsed = ParseReasoningEffort(effort);
+    if (!parsed.has_value()) {
+      *error =
+          "--reasoning-effort must be auto, minimal, low, medium, high, "
+          "xhigh, or max";
+      return std::nullopt;
+    }
+    if (options.enabled == false) {
+      *error = "--reasoning-effort cannot be set while --think is off";
+      return std::nullopt;
+    }
+    options.enabled = true;
+    options.effort = parsed;
+  }
+
+  if (preserve == "on") {
+    options.preserve_thinking = true;
+  } else if (preserve == "off") {
+    options.preserve_thinking = false;
+  } else if (preserve != "auto") {
+    *error = "--preserve-thinking must be on, off, or auto";
+    return std::nullopt;
+  }
+  return options;
+}
+
+}  // namespace
 
 void PrintServeHelp(std::string_view program_name,
                     std::string_view subcommand) {
@@ -90,14 +156,11 @@ void PrintServeHelp(std::string_view program_name,
     std::string model = "models/Qwen3.5-4B-BF16.gguf";
     std::string served_model_name;
     std::uint32_t max_context = 4096;
-    std::string system_prompt =
-        "You are a helpful, respectful, and honest assistant.";
-    std::string chat_template;
-    bool use_chat_template = true;
     std::size_t max_tokens = 128;
     sampling::SamplingConfig sampling_config;
-    std::string reasoning_mode = "auto";
-    std::int64_t reasoning_budget = -1;
+    std::string reasoning_mode = "off";
+    std::string reasoning_effort = "auto";
+    std::string preserve_thinking = "auto";
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string mtp_model_path;
@@ -144,27 +207,17 @@ void PrintServeHelp(std::string_view program_name,
                      "Sampling Defaults", &max_tokens);
     RegisterSamplingOptions(parser, &sampling_config, "Sampling Defaults");
 
-    // Prompt Defaults
-    parser.AddOption("", "--system", "PROMPT",
-                     "Default system instructions (default: helpful assistant)",
-                     "Prompt Defaults", &system_prompt);
-    parser.AddInverseFlag("", "--raw",
-                          "Disable chat template framing by default",
-                          "Prompt Defaults", &use_chat_template);
-    parser.AddOption("", "--chat-template", "NAME",
-                     "Default Jinja chat template override (e.g. qwen, chatml, "
-                     "deepseek)",
-                     "Prompt Defaults", &chat_template);
-
     // Reasoning Defaults
     parser.AddOption("", "--think", "MODE",
-                     "Default reasoning mode for thinking models: on, off, or "
-                     "auto (default: auto) (TODO: qwen, deepseek)",
+                     "Default reasoning mode: on, off, or auto (default: off)",
                      "Reasoning Defaults", &reasoning_mode);
-    parser.AddOption("", "--reasoning-budget", "N",
-                     "Default token cap for thinking traces (default: -1 = "
-                     "unlimited) (TODO: qwen, deepseek)",
-                     "Reasoning Defaults", &reasoning_budget);
+    parser.AddOption(
+        "", "--reasoning-effort", "LEVEL",
+        "Default effort: auto, minimal, low, medium, high, xhigh, or max",
+        "Reasoning Defaults", &reasoning_effort);
+    parser.AddOption("", "--preserve-thinking", "MODE",
+                     "Replay prior reasoning: on, off, or auto",
+                     "Reasoning Defaults", &preserve_thinking);
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
@@ -570,14 +623,11 @@ int RunServe(std::span<const char* const> args) {
     std::string model = "models/Qwen3.5-4B-BF16.gguf";
     std::string served_model_name;
     std::uint32_t max_context = 4096;
-    std::string system_prompt =
-        "You are a helpful, respectful, and honest assistant.";
-    std::string chat_template;
-    bool use_chat_template = true;
     std::size_t max_tokens = 128;
     sampling::SamplingConfig sampling_config;
-    std::string reasoning_mode = "auto";
-    std::int64_t reasoning_budget = -1;
+    std::string reasoning_mode = "off";
+    std::string reasoning_effort = "auto";
+    std::string preserve_thinking = "auto";
     std::string speculative_backend;
     std::string dflash_model_path;
     std::string mtp_model_path;
@@ -621,26 +671,16 @@ int RunServe(std::span<const char* const> args) {
         "Sampling Defaults", &max_tokens);
     RegisterSamplingOptions(llm_parser, &sampling_config, "Sampling Defaults");
     llm_parser.AddOption(
-        "", "--system", "PROMPT",
-        "Default system instructions (default: helpful assistant)",
-        "Prompt Defaults", &system_prompt);
-    llm_parser.AddInverseFlag("", "--raw",
-                              "Disable chat template framing by default",
-                              "Prompt Defaults", &use_chat_template);
-    llm_parser.AddOption(
-        "", "--chat-template", "NAME",
-        "Default Jinja chat template override (e.g. qwen, chatml, deepseek)",
-        "Prompt Defaults", &chat_template);
-    llm_parser.AddOption(
         "", "--think", "MODE",
-        "Default reasoning mode for thinking models: on, off, or auto "
-        "(default: auto) (TODO: qwen, deepseek)",
+        "Default reasoning mode: on, off, or auto (default: off)",
         "Reasoning Defaults", &reasoning_mode);
     llm_parser.AddOption(
-        "", "--reasoning-budget", "N",
-        "Default token cap for thinking traces (default: -1 = unlimited) "
-        "(TODO: qwen, deepseek)",
-        "Reasoning Defaults", &reasoning_budget);
+        "", "--reasoning-effort", "LEVEL",
+        "Default effort: auto, minimal, low, medium, high, xhigh, or max",
+        "Reasoning Defaults", &reasoning_effort);
+    llm_parser.AddOption("", "--preserve-thinking", "MODE",
+                         "Replay prior reasoning: on, off, or auto",
+                         "Reasoning Defaults", &preserve_thinking);
     llm_parser.AddOption("", "--speculative", "MODE",
                          "HTTP draft backend: dflash, dflash2, or off",
                          "Speculative", &speculative_backend);
@@ -753,6 +793,12 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
+    const auto reasoning_defaults = ResolveReasoningDefaults(
+        reasoning_mode, reasoning_effort, preserve_thinking, &parse_err);
+    if (!reasoning_defaults.has_value()) {
+      std::cerr << "Error: " << parse_err << "\n";
+      return 2;
+    }
 
     server::TextSpeculativeConfig speculative_config;
     if (speculative_backend.empty() || speculative_backend == "off") {
@@ -827,6 +873,7 @@ int RunServe(std::span<const char* const> args) {
     }
     backend->set_model_id(served_model_name);
     backend->set_sampling_defaults(max_tokens, sampling_config);
+    backend->set_reasoning_defaults(*reasoning_defaults);
   }
 
   server::HttpServer server(

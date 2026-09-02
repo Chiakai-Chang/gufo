@@ -14,6 +14,9 @@ void TestDefaultOptions() {
   assert(opt->max_tokens == 128);
   assert(opt->sampling.temperature == 0.0F);
   assert(opt->use_chat_template);
+  assert(opt->reasoning_mode == "off");
+  assert(opt->reasoning_effort == "auto");
+  assert(opt->preserve_thinking == "auto");
   assert(!opt->verbose);
   assert(opt->draft_tokens == 7);
   assert(opt->draft_policy == "auto");
@@ -84,6 +87,12 @@ void TestInvalidFlags() {
 
   const std::array<const char*, 2> args7 = {"--spec-draft-p-min", "-0.1"};
   assert(!gufo::cli::ParsePromptOptions(args7, &err).has_value());
+
+  const std::array<const char*, 2> args8 = {"--chat-template", "qwen"};
+  assert(!gufo::cli::ParsePromptOptions(args8, &err).has_value());
+
+  const std::array<const char*, 2> args9 = {"--reasoning-budget", "1024"};
+  assert(!gufo::cli::ParsePromptOptions(args9, &err).has_value());
 }
 
 void TestSamplingAndReasoningFlags() {
@@ -109,10 +118,10 @@ void TestSamplingAndReasoningFlags() {
                                             "0.5",
                                             "--think",
                                             "on",
-                                            "--reasoning-budget",
-                                            "1024",
-                                            "--chat-template",
-                                            "qwen",
+                                            "--reasoning-effort",
+                                            "high",
+                                            "--preserve-thinking",
+                                            "off",
                                             "--no-display-prompt",
                                             "-p",
                                             "Explicit prompt text"};
@@ -132,8 +141,8 @@ void TestSamplingAndReasoningFlags() {
   assert(opt->sampling.presence_penalty > 0.49F &&
          opt->sampling.presence_penalty < 0.51F);
   assert(opt->reasoning_mode == "on");
-  assert(opt->reasoning_budget == 1024);
-  assert(opt->chat_template == "qwen");
+  assert(opt->reasoning_effort == "high");
+  assert(opt->preserve_thinking == "off");
   assert(!opt->display_prompt);
   assert(opt->prompt_text == "Explicit prompt text");
 }

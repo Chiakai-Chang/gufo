@@ -99,6 +99,44 @@ actual prefill work; cache use; logical concurrency; physical execution width;
 and the executed plan. Prompts, generated text, local paths, request IDs, and
 token IDs are excluded.
 
+### Reasoning controls
+
+`POST /v1/chat/completions` accepts top-level `reasoning_effort` (`off`,
+`minimal`, `low`, `medium`, `high`, `xhigh`, or `max`) and Pi/llama.cpp-style
+`chat_template_kwargs`:
+
+```json
+{
+  "reasoning_effort": "high",
+  "chat_template_kwargs": {
+    "enable_thinking": true,
+    "reasoning_effort": "high",
+    "preserve_thinking": false
+  }
+}
+```
+
+Pi's native DeepSeek request shape is also accepted:
+
+```json
+{
+  "thinking": {"type": "enabled"},
+  "reasoning_effort": "high"
+}
+```
+
+`thinking.type` accepts `enabled` or `disabled`. DeepSeek also accepts
+`thinking_mode` (`thinking`, `chat`, or `auto`) in `chat_template_kwargs`.
+Conflicting controls return `invalid_reasoning`. Thinking is off by default
+unless the request or `gufo serve llm --think on` enables it.
+Generated reasoning is returned as `reasoning_content` in ordinary and
+streaming Chat Completions responses. Per-model effort mappings and history
+policies are documented in the model cards under `src/models/`.
+
+The server uses compiled model-specific formatters and validates recognized
+artifact template hashes during model loading. It does not accept custom Jinja
+or claim to enforce a reasoning-token budget.
+
 Diagnostic telemetry is limited to status, token counts, timing, and
 cancellation state. It must not contain prompt text, model paths, machine
 identity, request IDs, or token IDs.

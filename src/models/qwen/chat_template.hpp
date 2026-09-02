@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/reasoning.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
 namespace gufo::tokenization {
@@ -77,10 +78,18 @@ struct ChatTool {
   std::string parameters_json{"{}"};
 };
 
+enum class QwenReasoningEffort : std::uint8_t {
+  kLow,
+  kMedium,
+  kXHigh,
+};
+
 /// Formatting options for rendering a conversation into a text prompt.
 struct ChatTemplateOptions {
   bool add_generation_prompt{true};
   bool enable_thinking{false};
+  QwenReasoningEffort reasoning_effort{QwenReasoningEffort::kXHigh};
+  bool preserve_thinking{true};
   bool require_tool_call{false};
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
 };
@@ -88,6 +97,11 @@ struct ChatTemplateOptions {
 /// Deterministic, bounded Qwen ChatML formatter.
 class QwenChatTemplate {
 public:
+  enum class Profile : std::uint8_t {
+    kLegacyChatMl,
+    kQwen38Reasoning,
+  };
+
   ~QwenChatTemplate() = default;
 
   QwenChatTemplate(const QwenChatTemplate&) = delete;
@@ -100,12 +114,32 @@ public:
   [[nodiscard]] static std::unique_ptr<QwenChatTemplate> CreateFromGguf(
       const core::GgufReader& reader, std::string* error_msg = nullptr);
 
+  /// Validates that a Qwen3.8 artifact carries a recognized, pinned chat
+  /// template. Other Qwen model revisions retain their legacy formatter.
+  [[nodiscard]] static bool ValidateGgufTemplate(
+      const core::GgufReader& reader, std::string* error_msg = nullptr);
+
   /// Creates a default Qwen ChatML template formatter.
   [[nodiscard]] static std::unique_ptr<QwenChatTemplate> CreateDefault(
       std::string_view raw_template = "");
 
   [[nodiscard]] std::string_view GetTemplateString() const noexcept {
     return template_string_;
+  }
+  [[nodiscard]] std::string_view GetTemplateSha256() const noexcept {
+    return template_sha256_;
+  }
+  [[nodiscard]] Profile GetProfile() const noexcept { return profile_; }
+  [[nodiscard]] std::string_view GetTemplateId() const noexcept;
+
+  [[nodiscard]] static constexpr std::string_view
+  OfficialTemplateSha256() noexcept {
+    return "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041";
+  }
+
+  [[nodiscard]] static constexpr std::string_view
+  UnslothArtifactTemplateSha256() noexcept {
+    return "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce";
   }
 
   /// Formats a list of messages into a deterministic UTF-8 prompt string.
@@ -132,10 +166,15 @@ public:
       std::string* error_msg = nullptr);
 
 private:
-  explicit QwenChatTemplate(std::string template_str)
-      : template_string_(std::move(template_str)) {}
+  QwenChatTemplate(std::string template_str, std::string template_sha256,
+                   Profile profile)
+      : template_string_(std::move(template_str)),
+        template_sha256_(std::move(template_sha256)),
+        profile_(profile) {}
 
   std::string template_string_;
+  std::string template_sha256_;
+  Profile profile_{Profile::kLegacyChatMl};
 };
 
 }  // namespace gufo::tokenization

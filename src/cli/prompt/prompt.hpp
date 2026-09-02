@@ -21,9 +21,9 @@ struct PromptOptions {
       "You are a helpful, respectful, and honest assistant.";
   std::size_t max_tokens = 128;
   sampling::SamplingConfig sampling;
-  std::string chat_template;
-  std::string reasoning_mode = "auto";
-  std::int64_t reasoning_budget = -1;
+  std::string reasoning_mode = "off";
+  std::string reasoning_effort = "auto";
+  std::string preserve_thinking = "auto";
   bool display_prompt = true;
   bool use_chat_template = true;
   bool verbose = false;

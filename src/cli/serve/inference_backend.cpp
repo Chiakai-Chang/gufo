@@ -93,7 +93,10 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
            << "model_kind=deepseek4\n"
            << "artifact_sha256=" << artifact_fingerprint << '\n'
            << "tokenizer=joyai-byte-bpe-v1\n"
-           << "chat_template=gufo-deepseek-tools-v1\n"
+           << "chat_template=" << models::deepseek_v4_flash::ChatTemplateId()
+           << '\n'
+           << "chat_template_reference_sha256="
+           << models::deepseek_v4_flash::EncoderReferenceSha256() << '\n'
            << "state_abi=" << kDeepSeekStateAbi << '\n'
            << "payload_layout=ds4-rocm-v2-f32-live-prefix-fp16-mirror\n"
            << "context_tokens=" << max_context << '\n'
@@ -126,7 +129,9 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "model_kind=qwen3.8\n"
            << "artifact_sha256=" << artifact_fingerprint << '\n'
            << "tokenizer=embedded-in-artifact-sha256\n"
-           << "chat_template=embedded-in-artifact-plus-gufo-tools-v1\n"
+           << "chat_template=qwen38-reasoning-compiled-v2\n"
+           << "chat_template_reference_sha256="
+           << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
            << "state_abi=" << state_abi << '\n'
            << "payload_layout=qwen-gfx1151-live-prefix-v2\n"
            << "kv_storage="
@@ -705,6 +710,23 @@ public:
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
     tokenization::ChatTemplateOptions options;
+    options.enable_thinking = request.reasoning.enabled.value_or(false);
+    options.preserve_thinking =
+        request.reasoning.preserve_thinking.value_or(true);
+    switch (request.reasoning.effort.value_or(ReasoningEffort::kXHigh)) {
+      case ReasoningEffort::kMinimal:
+      case ReasoningEffort::kLow:
+        options.reasoning_effort = tokenization::QwenReasoningEffort::kLow;
+        break;
+      case ReasoningEffort::kMedium:
+        options.reasoning_effort = tokenization::QwenReasoningEffort::kMedium;
+        break;
+      case ReasoningEffort::kHigh:
+      case ReasoningEffort::kXHigh:
+      case ReasoningEffort::kMax:
+        options.reasoning_effort = tokenization::QwenReasoningEffort::kXHigh;
+        break;
+    }
     options.require_tool_call =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
     return tokenization::QwenChatTemplate::RenderAndTokenize(
@@ -713,6 +735,13 @@ public:
             ? std::span<const tokenization::ChatTool>{}
             : std::span<const tokenization::ChatTool>{request.tools},
         options);
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return request.reasoning.enabled.value_or(false)
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
   }
 
   [[nodiscard]] std::string Decode(
@@ -1138,62 +1167,6 @@ std::string_view ChatRoleName(tokenization::ChatRole role) {
   return "user";
 }
 
-std::string DeepSeekToolsPrompt(const ChatRequest& request) {
-  if (request.tools.empty() ||
-      request.tool_choice == ChatRequest::ToolChoice::kNone) {
-    return {};
-  }
-
-  std::ostringstream prompt;
-  prompt << "\n\n## Tools\n\n"
-         << "You have access to tools. Invoke them with this exact syntax:\n"
-         << "<｜DSML｜tool_calls｜>\n"
-         << "<｜DS｜invoke name=\"$TOOL_NAME\">\n"
-         << "<｜DS｜parameter name=\"$PARAMETER_NAME\" "
-            "string=\"true|false\">$PARAMETER_VALUE"
-            "</｜DS｜parameter>\n"
-         << "</｜DS｜invoke>\n"
-         << "</｜DSML｜tool_calls｜>\n\n"
-         << "Available tool schemas:\n";
-  for (const auto& tool : request.tools) {
-    prompt << "{\"type\":\"function\",\"function\":{\"name\":"
-           << std::quoted(tool.name)
-           << ",\"description\":" << std::quoted(tool.description)
-           << ",\"parameters\":"
-           << (tool.parameters_json.empty() ? "{}" : tool.parameters_json)
-           << "}}\n";
-  }
-  if (request.tool_choice == ChatRequest::ToolChoice::kRequired) {
-    prompt << "\nYou must call at least one available tool.";
-  }
-  return prompt.str();
-}
-
-void AppendDeepSeekToolCalls(
-    std::string& content,
-    std::span<const tokenization::ChatMessage::ToolCall> calls) {
-  if (calls.empty()) {
-    return;
-  }
-  content.append("<｜DSML｜tool_calls｜>\n");
-  for (const auto& call : calls) {
-    content.append("<｜DS｜invoke name=\"");
-    content.append(call.name);
-    content.append("\">\n");
-    for (const auto& argument : call.arguments) {
-      content.append("<｜DS｜parameter name=\"");
-      content.append(argument.name);
-      content.append("\" string=\"");
-      content.append(argument.is_string ? "true" : "false");
-      content.append("\">");
-      content.append(argument.value);
-      content.append("</｜DS｜parameter>\n");
-    }
-    content.append("</｜DS｜invoke>\n");
-  }
-  content.append("</｜DSML｜tool_calls｜>");
-}
-
 class DeepSeekTextRunnerState final : public TextRunnerState {
 public:
   DeepSeekTextRunnerState(
@@ -1345,45 +1318,67 @@ public:
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
     std::vector<models::deepseek_v4_flash::ChatMessage> messages;
-    messages.reserve(request.messages.size() + 1);
-    const std::string tools_prompt = DeepSeekToolsPrompt(request);
-    bool tools_rendered = tools_prompt.empty();
-    if (!tools_rendered &&
-        (request.messages.empty() ||
-         (request.messages.front().role != tokenization::ChatRole::kSystem &&
-          request.messages.front().role !=
-              tokenization::ChatRole::kDeveloper))) {
-      messages.push_back({
-          .role = "system",
-          .content = tools_prompt,
-      });
-      tools_rendered = true;
-    }
+    messages.reserve(request.messages.size());
     for (const auto& message : request.messages) {
-      std::string content = message.content;
-      if (message.role == tokenization::ChatRole::kAssistant &&
-          !message.thought.empty()) {
-        content = "<think>\n" + message.thought + "\n</think>\n" + content;
-      }
-      if (!tools_rendered &&
-          (message.role == tokenization::ChatRole::kSystem ||
-           message.role == tokenization::ChatRole::kDeveloper)) {
-        content += tools_prompt;
-        tools_rendered = true;
-      }
-      if (message.role == tokenization::ChatRole::kAssistant) {
-        AppendDeepSeekToolCalls(content, message.tool_calls);
-      }
-      messages.push_back({
+      models::deepseek_v4_flash::ChatMessage converted{
           .role = std::string(ChatRoleName(message.role)),
-          .content = std::move(content),
-      });
+          .content = message.content,
+          .reasoning_content = message.thought,
+      };
+      converted.tool_calls.reserve(message.tool_calls.size());
+      for (const auto& call : message.tool_calls) {
+        models::deepseek_v4_flash::ChatMessage::ToolCall converted_call{
+            .name = call.name,
+        };
+        converted_call.arguments.reserve(call.arguments.size());
+        for (const auto& argument : call.arguments) {
+          converted_call.arguments.push_back({
+              .name = argument.name,
+              .value = argument.value,
+              .is_string = argument.is_string,
+          });
+        }
+        converted.tool_calls.push_back(std::move(converted_call));
+      }
+      messages.push_back(std::move(converted));
     }
-    auto tokens = DeepSeekRunnerTokens(model_->EncodeChat(messages));
+
+    std::vector<models::deepseek_v4_flash::ChatTool> tools;
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      tools.reserve(request.tools.size());
+      for (const auto& tool : request.tools) {
+        tools.push_back({
+            .name = tool.name,
+            .description = tool.description,
+            .parameters_json = tool.parameters_json,
+        });
+      }
+    }
+    auto tokens = DeepSeekRunnerTokens(model_->EncodeChat(
+        messages, tools,
+        models::deepseek_v4_flash::ChatTemplateOptions{
+            .enable_thinking = request.reasoning.enabled.value_or(false),
+            .reasoning_effort =
+                request.reasoning.effort.value_or(ReasoningEffort::kLow),
+            .preserve_thinking =
+                request.reasoning.preserve_thinking.value_or(false),
+            .tools_present =
+                !request.tools.empty() &&
+                request.tool_choice != ChatRequest::ToolChoice::kNone,
+            .require_tool_call =
+                request.tool_choice == ChatRequest::ToolChoice::kRequired,
+        }));
     if (tokens.empty()) {
       return std::nullopt;
     }
     return tokens;
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return request.reasoning.enabled.value_or(false)
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
   }
 
   [[nodiscard]] std::string Decode(
@@ -1575,6 +1570,7 @@ struct InferenceBackend::Impl {
     std::shared_ptr<TextGenerationScheduler> scheduler;
     std::string model_id;
     SamplingDefaults sampling_defaults;
+    ReasoningOptions reasoning_defaults;
   };
 
   class ScheduledGenerationRequest final : public GenerationRequest {
@@ -1681,6 +1677,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled) {
       SetError(error,
                "Speculative decoding is only supported by Qwen HTTP models");
+      return false;
+    }
+    if (!models::deepseek_v4_flash::ValidateGgufTemplate(*reader,
+                                                         &load_error)) {
+      SetError(error, "Unsupported DeepSeek chat template: " + load_error);
       return false;
     }
     auto model = models::deepseek_v4_flash::Model::Load(
@@ -1960,6 +1961,28 @@ InferenceBackend::SamplingDefaults InferenceBackend::sampling_defaults() const {
 #endif
 }
 
+ReasoningOptions InferenceBackend::reasoning_defaults() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr ? state->reasoning_defaults : ReasoningOptions{};
+#else
+  return {};
+#endif
+}
+
+InferenceBackend::InitialOutputState InferenceBackend::initial_output_state(
+    const ChatRequest& request) const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  return state != nullptr
+             ? state->scheduler->runner().InitialOutputState(request)
+             : InitialOutputState::kAuto;
+#else
+  (void)request;
+  return InitialOutputState::kAuto;
+#endif
+}
+
 void InferenceBackend::set_model_id(const std::string& model_id) {
 #if defined(ENGINE_ENABLE_HIP)
   if (model_id.empty()) {
@@ -1994,6 +2017,21 @@ void InferenceBackend::set_sampling_defaults(
 #else
   (void)max_tokens;
   (void)sampling_config;
+#endif
+}
+
+void InferenceBackend::set_reasoning_defaults(
+    const ReasoningOptions& reasoning) {
+#if defined(ENGINE_ENABLE_HIP)
+  const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+  if (impl_->state == nullptr) {
+    return;
+  }
+  auto updated = std::make_shared<Impl::State>(*impl_->state);
+  updated->reasoning_defaults = reasoning;
+  impl_->state = std::move(updated);
+#else
+  (void)reasoning;
 #endif
 }
 

@@ -3,11 +3,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
@@ -18,6 +21,17 @@ void Expect(bool condition, std::string_view msg) {
     std::cerr << "Assertion failed: " << msg << "\n";
     std::exit(1);
   }
+}
+
+std::string Sha256(std::string_view value) {
+  const auto* data = reinterpret_cast<const std::uint8_t*>(value.data());
+  return gufo::crypto::Sha256Hex({data, value.size()});
+}
+
+std::string ReadText(std::string_view path) {
+  std::ifstream input(std::string(path), std::ios::binary);
+  return {std::istreambuf_iterator<char>(input),
+          std::istreambuf_iterator<char>()};
 }
 
 // Simple in-memory GGUF builder for template tests
@@ -94,7 +108,7 @@ void TestBasicChatRendering() {
   const std::string expected =
       "<|im_start|>system\nYou are a concise assistant.<|im_end|>\n"
       "<|im_start|>user\nWhat is 2+2?<|im_end|>\n"
-      "<|im_start|>assistant\n";
+      "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 
   Expect(*rendered == expected, "Rendered output matches ChatML golden");
 }
@@ -111,6 +125,7 @@ void TestThinkingFraming() {
   gufo::tokenization::ChatTemplateOptions opts;
   opts.add_generation_prompt = true;
   opts.enable_thinking = true;
+  opts.reasoning_effort = gufo::tokenization::QwenReasoningEffort::kMedium;
 
   auto rendered = tpl->Render(messages, opts);
   Expect(rendered.has_value(), "Render with thinking succeeds");
@@ -118,7 +133,7 @@ void TestThinkingFraming() {
   const std::string expected =
       "<|im_start|>user\nSolve this equation.<|im_end|>\n"
       "<|im_start|>assistant\n<think>\nFirst let's factor the "
-      "polynomial.\n</think>\n"
+      "polynomial.\n</think>\n\n"
       "The roots are 2 and 3.<|im_end|>\n"
       "<|im_start|>assistant\n<think>\n";
 
@@ -130,7 +145,7 @@ void TestHistoricalThinkingDoesNotEnableNewThinking() {
   auto tpl = gufo::tokenization::QwenChatTemplate::CreateDefault();
   const std::vector<gufo::tokenization::ChatMessage> messages = {
       {gufo::tokenization::ChatRole::kUser, "Name one color.", "", ""},
-      {gufo::tokenization::ChatRole::kAssistant, "\nRed", "",
+      {gufo::tokenization::ChatRole::kAssistant, "Red", "",
        "I should answer with one color."},
       {gufo::tokenization::ChatRole::kUser, "Name another.", "", ""},
   };
@@ -145,8 +160,37 @@ void TestHistoricalThinkingDoesNotEnableNewThinking() {
              "<|im_start|>assistant\n<think>\nI should answer with one "
              "color.\n</think>\n\nRed<|im_end|>\n"
              "<|im_start|>user\nName another.<|im_end|>\n"
-             "<|im_start|>assistant\n",
+             "<|im_start|>assistant\n<think>\n\n</think>\n\n",
          "Historical reasoning round-trips without changing the next prompt");
+}
+
+void TestReasoningEffortAndPreservation() {
+  const std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kSystem, "System rules.", "", ""},
+      {gufo::tokenization::ChatRole::kDeveloper, "Developer rules.", "", ""},
+      {gufo::tokenization::ChatRole::kUser, "First question.", "", ""},
+      {gufo::tokenization::ChatRole::kAssistant, "First answer.", "",
+       "Old private reasoning."},
+      {gufo::tokenization::ChatRole::kUser, "Second question.", "", ""},
+  };
+
+  gufo::tokenization::ChatTemplateOptions options;
+  options.enable_thinking = true;
+  options.reasoning_effort = gufo::tokenization::QwenReasoningEffort::kLow;
+  options.preserve_thinking = false;
+  const auto rendered =
+      gufo::tokenization::QwenChatTemplate::Render(messages, options);
+  Expect(rendered.has_value(), "Reasoning options render");
+  Expect(rendered->find("Reasoning effort is set to low.") != std::string::npos,
+         "Low effort instruction is compiled into the system message");
+  Expect(rendered->find("System rules.\nDeveloper rules.") != std::string::npos,
+         "Leading system and developer messages are merged");
+  Expect(rendered->find("Old private reasoning.") == std::string::npos,
+         "Historical reasoning is dropped when preservation is disabled");
+  Expect(rendered->find("First answer.") != std::string::npos,
+         "Visible historical assistant content is retained");
+  Expect(rendered->ends_with("<|im_start|>assistant\n<think>\n"),
+         "Thinking generation starts inside the reasoning block");
 }
 
 void TestBoundedOutputLimit() {
@@ -169,9 +213,13 @@ void TestBoundedOutputLimit() {
 
 void TestGgufTemplateExtraction() {
   GgufTemplateBuilder builder;
-  builder.AddMetadataString(
-      "tokenizer.chat_template",
-      "{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}");
+  builder.AddMetadataString("general.name", "Qwen3.8-27B");
+  std::string reference = ReadText(GUFO_QWEN38_CHAT_TEMPLATE_REFERENCE);
+  Expect(!reference.empty(), "Pinned Qwen template reference is readable");
+  if (reference.ends_with('\n')) {
+    reference.pop_back();
+  }
+  builder.AddMetadataString("tokenizer.chat_template", reference);
 
   auto binary = builder.Build();
 
@@ -183,9 +231,83 @@ void TestGgufTemplateExtraction() {
   auto tpl =
       gufo::tokenization::QwenChatTemplate::CreateFromGguf(*reader, &err);
   Expect(tpl != nullptr, "Template extracted from GGUF");
-  Expect(tpl->GetTemplateString().find("{% for m in messages %}") !=
+  Expect(tpl->GetTemplateString().find("preserve_thinking") !=
              std::string_view::npos,
          "Template string matches GGUF header");
+  Expect(tpl->GetProfile() ==
+             gufo::tokenization::QwenChatTemplate::Profile::kQwen38Reasoning,
+         "Recognized Qwen3.8 template profile is classified");
+  Expect(tpl->GetTemplateId() == "qwen38-reasoning-compiled-v2",
+         "Compiled template version is stable");
+  Expect(tpl->GetTemplateSha256().size() == 64,
+         "Embedded template provenance is hashed");
+  Expect(tpl->GetTemplateSha256() ==
+             gufo::tokenization::QwenChatTemplate::OfficialTemplateSha256(),
+         "Pinned upstream template hash is recognized exactly");
+
+  GgufTemplateBuilder lookalike_builder;
+  lookalike_builder.AddMetadataString("general.name", "Qwen3.8-27B");
+  lookalike_builder.AddMetadataString(
+      "tokenizer.chat_template",
+      "{% set enable_thinking = true %}{% set preserve_thinking = true %}"
+      "<|im_start|><think>");
+  const auto lookalike_binary = lookalike_builder.Build();
+  auto lookalike_reader = gufo::core::GgufReader::OpenMemory(
+      lookalike_binary.data(), lookalike_binary.size(), &err);
+  Expect(lookalike_reader != nullptr, "Look-alike GGUF opens");
+  Expect(gufo::tokenization::QwenChatTemplate::CreateFromGguf(*lookalike_reader,
+                                                              &err) == nullptr,
+         "Qwen3.8 look-alike template is rejected by hash");
+}
+
+void TestHuggingFaceRenderedGoldens() {
+  using gufo::tokenization::ChatMessage;
+  using gufo::tokenization::ChatRole;
+  using gufo::tokenization::ChatTemplateOptions;
+  using gufo::tokenization::QwenChatTemplate;
+  using gufo::tokenization::QwenReasoningEffort;
+
+  const std::vector<ChatMessage> base = {
+      {ChatRole::kUser, "Name one color.", "", ""},
+  };
+  const std::vector<ChatMessage> history = {
+      {ChatRole::kUser, "Name one color.", "", ""},
+      {ChatRole::kAssistant, "Red", "", "I should answer with one color."},
+      {ChatRole::kUser, "Name another.", "", ""},
+  };
+  const auto check = [](const std::vector<ChatMessage>& messages,
+                        const ChatTemplateOptions& options,
+                        std::string_view expected) {
+    const auto rendered = QwenChatTemplate::Render(messages, options);
+    Expect(rendered.has_value(), "Qwen Hugging Face golden renders");
+    Expect(Sha256(*rendered) == expected,
+           "Qwen rendered bytes match the pinned Hugging Face golden");
+  };
+
+  ChatTemplateOptions options;
+  options.enable_thinking = false;
+  check(base, options,
+        "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7");
+
+  options.enable_thinking = true;
+  options.reasoning_effort = QwenReasoningEffort::kLow;
+  check(base, options,
+        "50ec206299577d35eead707cb1b60fdd8875176f69fb064785eed858836ee999");
+  options.reasoning_effort = QwenReasoningEffort::kMedium;
+  check(base, options,
+        "c2ba928ee33190de9d2bbb82fb68dfaed38a4ee345dcf675a3bc27f112f45b05");
+  options.reasoning_effort = QwenReasoningEffort::kXHigh;
+  check(base, options,
+        "97dbf46721e76ae30614f4b4d6bdb6147bc9b34d1a0f93e04699b3ac622fb99d");
+
+  options.reasoning_effort = QwenReasoningEffort::kMedium;
+  options.preserve_thinking = false;
+  check(history, options,
+        "ea0dc42bc76d66bb38fab09250bcf72f63c3bb1ec7098403a77a8c6452add6a5");
+  options.enable_thinking = false;
+  options.preserve_thinking = true;
+  check(history, options,
+        "6fc054000bc6bedd03a3521bd92c59af85247ad7d3bb2013d97c1a25eea6bdee");
 }
 
 void TestRenderAndTokenize() {
@@ -225,7 +347,8 @@ void TestRenderAndTokenize() {
 
   auto decoded = tokenizer->Decode(*token_ids);
   const std::string expected =
-      "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n";
+      "<|im_start|>user\nHello<|im_end|>\n"
+      "<|im_start|>assistant\n<think>\n\n</think>\n\n";
   Expect(decoded == expected, "Decoded tokens match rendered prompt exactly");
 }
 
@@ -241,7 +364,8 @@ void TestChatCorpusConformance() {
     auto res = tpl->Render(msgs, opts);
     Expect(res.has_value() && *res ==
                                   "<|im_start|>user\nHello, Strix "
-                                  "Halo!<|im_end|>\n<|im_start|>assistant\n",
+                                  "Halo!<|im_end|>\n<|im_start|>assistant\n"
+                                  "<think>\n\n</think>\n\n",
            "Case 1 single_turn_user matches golden");
   }
 
@@ -259,7 +383,8 @@ void TestChatCorpusConformance() {
                    "<|im_start|>user\nFetch "
                    "weather.<|im_end|>\n<|im_start|>user\n<tool_response>\n"
                    "{\"temp\": 22, \"city\": \"Rome\"}\n</tool_response>"
-                   "<|im_end|>\n<|im_start|>assistant\n",
+                   "<|im_end|>\n<|im_start|>assistant\n"
+                   "<think>\n\n</think>\n\n",
            "Case 2 tool_message matches golden");
   }
 
@@ -272,7 +397,8 @@ void TestChatCorpusConformance() {
     auto res = tpl->Render(msgs, opts);
     Expect(res.has_value() && *res ==
                                   "<|im_start|>user\n你好，世界！🚀<|im_end|>"
-                                  "\n<|im_start|>assistant\n",
+                                  "\n<|im_start|>assistant\n"
+                                  "<think>\n\n</think>\n\n",
            "Case 3 unicode_cjk matches golden");
   }
 }
@@ -314,7 +440,7 @@ void TestToolRendering() {
   Expect(rendered.has_value(), "Tool-aware render succeeds");
   Expect(rendered->find("# Tools") != std::string::npos,
          "Tool prompt is rendered");
-  Expect(rendered->find(R"("name":"get_weather")") != std::string::npos,
+  Expect(rendered->find(R"("name": "get_weather")") != std::string::npos,
          "Tool schema is rendered");
   Expect(rendered->find("<function=get_weather>") != std::string::npos,
          "Assistant tool call uses native Qwen syntax");
@@ -373,8 +499,10 @@ int main() {
   TestBasicChatRendering();
   TestThinkingFraming();
   TestHistoricalThinkingDoesNotEnableNewThinking();
+  TestReasoningEffortAndPreservation();
   TestBoundedOutputLimit();
   TestGgufTemplateExtraction();
+  TestHuggingFaceRenderedGoldens();
   TestRenderAndTokenize();
   TestChatCorpusConformance();
   TestToolRendering();
