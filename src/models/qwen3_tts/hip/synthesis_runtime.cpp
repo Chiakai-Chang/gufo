@@ -85,7 +85,8 @@ struct SynthesisHipRuntime::Impl {
     }
 
     TalkerGenerationOutput generated;
-    if (!GenerateCodecFrames(request, prompt.talker, &generated, error) ||
+    if (!GenerateCodecFrames(request, prompt.talker, is_cancelled, &generated,
+                             error) ||
         IsCancelled(is_cancelled, error)) {
       return false;
     }
@@ -296,14 +297,15 @@ private:
 
   [[nodiscard]] bool GenerateCodecFrames(const SynthesisRequest& request,
                                          const TalkerPromptOutput& prompt,
+                                         const CancellationCheck& is_cancelled,
                                          TalkerGenerationOutput* generated,
                                          std::string* error) {
     const TalkerSamplingOptions sampling{
         .sample = !request.greedy,
         .seed = request.seed,
     };
-    if (!talker_->Generate(prompt, request.max_new_tokens, sampling, generated,
-                           error)) {
+    if (!talker_->Generate(prompt, request.max_new_tokens, sampling,
+                           is_cancelled, generated, error)) {
       return false;
     }
     if (generated->frames != 0 && generated->code_groups == 16 &&

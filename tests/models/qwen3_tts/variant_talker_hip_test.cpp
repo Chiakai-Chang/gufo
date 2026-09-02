@@ -187,8 +187,23 @@ double Cosine(std::span<const float> left, std::span<const float> right) {
 void CheckGreedyCodes(qwen3_tts_hip::TalkerHipRuntime* runtime,
                       const qwen3_tts_hip::TalkerPromptOutput& prompt,
                       std::span<const std::int32_t> expected) {
-  qwen3_tts_hip::TalkerGenerationOutput generated;
   std::string error;
+  qwen3_tts_hip::TalkerSamplingOptions greedy;
+  greedy.sample = false;
+  qwen3_tts_hip::TalkerGenerationOutput cancelled;
+  std::size_t cancellation_checks = 0;
+  Check(!runtime->Generate(
+            prompt, 5, greedy,
+            [&cancellation_checks] { return ++cancellation_checks >= 3; },
+            &cancelled, &error),
+        "frame-level cancellation must stop generation");
+  Check(cancelled.codes.empty() && cancelled.frames == 0 &&
+            cancellation_checks == 3 &&
+            error == "Qwen3-TTS native generation cancelled",
+        "cancelled generation returns no partial codec frames");
+
+  qwen3_tts_hip::TalkerGenerationOutput generated;
+  error.clear();
   Check(runtime->GenerateGreedy(prompt, 5, &generated, &error), error);
   Check(generated.frames == 5 && generated.code_groups == 16,
         "greedy generation shape");
@@ -318,7 +333,7 @@ int main() {
   const std::filesystem::path base_root =
       "/home/fbozzo/projects/audio.cpp/models/Qwen3-TTS-12Hz-1.7B-Base";
   const std::filesystem::path artifact_root =
-      "/home/fbozzo/projects/gufo/artifacts/qwen3_tts";
+      "/home/fbozzo/projects/strix-halo.cpp/artifacts/qwen3_tts";
   if (!std::filesystem::is_regular_file(voice_design_root /
                                         "model.safetensors") ||
       !std::filesystem::is_regular_file(base_root / "model.safetensors") ||

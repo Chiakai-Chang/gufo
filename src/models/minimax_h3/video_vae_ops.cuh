@@ -187,44 +187,51 @@ static __global__ void LayerNormKernel(const float* input, const float* weight,
                                        const float* bias, float* output,
                                        std::uint32_t rows, std::uint32_t width,
                                        float epsilon) {
-  const std::uint32_t row = blockIdx.x;
-  const std::uint32_t lane = threadIdx.x;
-  if (row >= rows) {
-    return;
-  }
-  __shared__ float sums[256];
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  const std::uint32_t lane = threadIdx.x & 31U;
+  const std::uint32_t wave = threadIdx.x >> 5U;
+  const std::uint32_t row = blockIdx.x * kRowsPerBlock + wave;
+  const bool active = row < rows;
+  __shared__ float sums[kRowsPerBlock][32];
   const std::size_t base = static_cast<std::size_t>(row) * width;
   float local_sum = 0.0F;
-  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
-    local_sum += input[base + column];
+  if (active) {
+    for (std::uint32_t column = lane; column < width; column += 32U) {
+      local_sum += input[base + column];
+    }
   }
-  sums[lane] = local_sum;
+  sums[wave][lane] = local_sum;
   __syncthreads();
-  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+  for (std::uint32_t stride = 16U; stride != 0; stride >>= 1U) {
     if (lane < stride) {
-      sums[lane] += sums[lane + stride];
+      sums[wave][lane] += sums[wave][lane + stride];
     }
     __syncthreads();
   }
-  const float mean = sums[0] / static_cast<float>(width);
+  const float mean = sums[wave][0] / static_cast<float>(width);
   float local_square = 0.0F;
-  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
-    const float centered = input[base + column] - mean;
-    local_square = fmaf(centered, centered, local_square);
+  if (active) {
+    for (std::uint32_t column = lane; column < width; column += 32U) {
+      const float centered = input[base + column] - mean;
+      local_square = fmaf(centered, centered, local_square);
+    }
   }
-  sums[lane] = local_square;
+  sums[wave][lane] = local_square;
   __syncthreads();
-  for (std::uint32_t stride = blockDim.x / 2U; stride != 0; stride >>= 1U) {
+  for (std::uint32_t stride = 16U; stride != 0; stride >>= 1U) {
     if (lane < stride) {
-      sums[lane] += sums[lane + stride];
+      sums[wave][lane] += sums[wave][lane + stride];
     }
     __syncthreads();
   }
-  const float variance = sums[0] / static_cast<float>(width);
+  const float variance = sums[wave][0] / static_cast<float>(width);
   const float inverse = rsqrtf(variance + epsilon);
-  for (std::uint32_t column = lane; column < width; column += blockDim.x) {
-    output[base + column] =
-        (input[base + column] - mean) * inverse * weight[column] + bias[column];
+  if (active) {
+    for (std::uint32_t column = lane; column < width; column += 32U) {
+      output[base + column] =
+          (input[base + column] - mean) * inverse * weight[column] +
+          bias[column];
+    }
   }
 }
 
@@ -232,8 +239,11 @@ inline void LaunchLayerNorm(const float* input, const float* weight,
                             const float* bias, float* output,
                             std::uint32_t rows, std::uint32_t width,
                             float epsilon, hipStream_t stream) {
-  hipLaunchKernelGGL(LayerNormKernel, dim3(rows), dim3(32), 0, stream, input,
-                     weight, bias, output, rows, width, epsilon);
+  constexpr std::uint32_t kRowsPerBlock = 8;
+  hipLaunchKernelGGL(LayerNormKernel,
+                     dim3((rows + kRowsPerBlock - 1U) / kRowsPerBlock),
+                     dim3(kRowsPerBlock * 32U), 0, stream, input, weight, bias,
+                     output, rows, width, epsilon);
 }
 
 static __global__ void VideoQkvRopeKernel(

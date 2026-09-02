@@ -131,9 +131,9 @@ const Tensor& RequireTensor(const TensorStore& store, std::string_view name,
   return *tensor;
 }
 
-DeviceBuffer<hip_bfloat16> UploadBfloat16(
+DeviceBuffer<hip_bfloat16> UploadBfloat16Async(
     const TensorStore& store, std::string_view name,
-    std::span<const std::uint64_t> shape) {
+    std::span<const std::uint64_t> shape, hipStream_t stream) {
   const Tensor& tensor = RequireTensor(store, name, shape);
   const auto elements = tensor.NumElements();
   if (!elements.has_value()) {
@@ -141,9 +141,9 @@ DeviceBuffer<hip_bfloat16> UploadBfloat16(
                              std::string(name));
   }
   DeviceBuffer<hip_bfloat16> result(*elements);
-  RequireHip(hipMemcpy(result.get(), tensor.data, tensor.byte_count,
-                       hipMemcpyHostToDevice),
-             "hipMemcpy Qwen3-ASR weight");
+  RequireHip(hipMemcpyAsync(result.get(), tensor.data, tensor.byte_count,
+                            hipMemcpyHostToDevice, stream),
+             "hipMemcpyAsync Qwen3-ASR weight");
   return result;
 }
 
@@ -290,6 +290,12 @@ struct AudioEncoderHipRuntime::Impl {
     }
   }
 
+  DeviceBuffer<hip_bfloat16> UploadBfloat16(
+      const TensorStore& store, std::string_view name,
+      std::span<const std::uint64_t> shape) {
+    return UploadBfloat16Async(store, name, shape, stream);
+  }
+
   void LoadWeights() {
     const TensorStore& store = *model.store;
     conv1_weight = UploadBfloat16(store, "thinker.audio_tower.conv2d1.weight",
@@ -432,8 +438,7 @@ struct AudioEncoderHipRuntime::Impl {
                    reduction, stream);
   }
 
-  AudioEncoderOutput EncodeFrontend(std::span<const float> log_mel,
-                                    std::size_t frames) {
+  std::size_t RunFrontend(std::span<const float> log_mel, std::size_t frames) {
     if (frames == 0U || log_mel.size() != kMelBins * frames) {
       throw std::invalid_argument(
           "Qwen3-ASR log-mel tensor must have shape [128, frames]");
@@ -462,11 +467,15 @@ struct AudioEncoderHipRuntime::Impl {
     LaunchAddPositionAndCompact(projected.get(), compact.get(), frames,
                                 requested_chunks, stream);
 
-    AudioEncoderOutput result;
     const std::size_t tail_frames =
         frames - (requested_chunks - 1U) * kChunkFrames;
-    result.tokens =
-        (requested_chunks - 1U) * kConvTime + (tail_frames + 7U) / 8U;
+    return (requested_chunks - 1U) * kConvTime + (tail_frames + 7U) / 8U;
+  }
+
+  AudioEncoderOutput EncodeFrontend(std::span<const float> log_mel,
+                                    std::size_t frames) {
+    AudioEncoderOutput result;
+    result.tokens = RunFrontend(log_mel, frames);
     result.values.resize(result.tokens * kHidden);
     RequireHip(hipMemcpyAsync(result.values.data(), compact.get(),
                               result.values.size() * sizeof(float),
@@ -478,12 +487,20 @@ struct AudioEncoderHipRuntime::Impl {
     return result;
   }
 
-  AudioEncoderTrace Encode(std::span<const float> log_mel, std::size_t frames) {
-    AudioEncoderTrace trace;
-    trace.frontend = EncodeFrontend(log_mel, frames);
+  AudioEncoderDeviceOutput Encode(std::span<const float> log_mel,
+                                  std::size_t frames,
+                                  AudioEncoderTrace* trace) {
+    const std::size_t tokens = RunFrontend(log_mel, frames);
+    if (trace != nullptr) {
+      trace->frontend.tokens = tokens;
+      trace->frontend.values.resize(tokens * kHidden);
+      RequireHip(hipMemcpyAsync(trace->frontend.values.data(), compact.get(),
+                                trace->frontend.values.size() * sizeof(float),
+                                hipMemcpyDeviceToHost, stream),
+                 "hipMemcpyAsync Qwen3-ASR audio frontend");
+    }
     EnsureEncoderWeights();
-    EnsureTransformerCapacity(trace.frontend.tokens);
-    const std::size_t tokens = trace.frontend.tokens;
+    EnsureTransformerCapacity(tokens);
     const std::size_t hidden_elements = tokens * kHidden;
     RequireHip(hipMemcpyAsync(hidden.get(), compact.get(),
                               hidden_elements * sizeof(float),
@@ -532,10 +549,10 @@ struct AudioEncoderHipRuntime::Impl {
       LaunchResidualAddBfloat16(hidden.get(), projection.get(), hidden_elements,
                                 stream);
 
-      if (layer == 0U) {
-        trace.layer0.tokens = tokens;
-        trace.layer0.values.resize(hidden_elements);
-        RequireHip(hipMemcpyAsync(trace.layer0.values.data(), hidden.get(),
+      if (layer == 0U && trace != nullptr) {
+        trace->layer0.tokens = tokens;
+        trace->layer0.values.resize(hidden_elements);
+        RequireHip(hipMemcpyAsync(trace->layer0.values.data(), hidden.get(),
                                   hidden_elements * sizeof(float),
                                   hipMemcpyDeviceToHost, stream),
                    "hipMemcpyAsync Qwen3-ASR layer0");
@@ -554,16 +571,34 @@ struct AudioEncoderHipRuntime::Impl {
     LaunchBiasRoundBfloat16(projection.get(), proj2_bias.get(), tokens, kOutput,
                             stream);
 
-    trace.final.tokens = tokens;
-    trace.final.values.resize(tokens * kOutput);
-    RequireHip(hipMemcpyAsync(trace.final.values.data(), projection.get(),
-                              trace.final.values.size() * sizeof(float),
+    if (trace != nullptr) {
+      trace->final.tokens = tokens;
+      trace->final.values.resize(tokens * kOutput);
+      RequireHip(hipMemcpyAsync(trace->final.values.data(), projection.get(),
+                                trace->final.values.size() * sizeof(float),
+                                hipMemcpyDeviceToHost, stream),
+                 "hipMemcpyAsync Qwen3-ASR audio final");
+    }
+    std::uint32_t finite = 1U;
+    RequireHip(hipMemcpyAsync(finite_flag.get(), &finite, sizeof(finite),
+                              hipMemcpyHostToDevice, stream),
+               "hipMemcpyAsync Qwen3-ASR finite flag");
+    LaunchAllFinite(projection.get(), tokens * kOutput, finite_flag.get(),
+                    stream);
+    RequireHip(hipMemcpyAsync(&finite, finite_flag.get(), sizeof(finite),
                               hipMemcpyDeviceToHost, stream),
-               "hipMemcpyAsync Qwen3-ASR audio final");
+               "hipMemcpyAsync Qwen3-ASR finite result");
     RequireHip(hipStreamSynchronize(stream),
                "hipStreamSynchronize Qwen3-ASR audio encoder");
     RequireHip(hipGetLastError(), "Qwen3-ASR audio encoder");
-    return trace;
+    if (finite == 0U) {
+      throw std::runtime_error(
+          "Qwen3-ASR audio encoder produced non-finite embeddings");
+    }
+    return {
+        .values = projection.get(),
+        .tokens = tokens,
+    };
   }
 
   LoadResult model;
@@ -608,6 +643,7 @@ struct AudioEncoderHipRuntime::Impl {
   DeviceBuffer<float> projection;
   DeviceBuffer<float> ffn;
   DeviceBuffer<hip_bfloat16> ffn_bfloat16;
+  DeviceBuffer<std::uint32_t> finite_flag{1U};
 };
 
 AudioEncoderHipRuntime::AudioEncoderHipRuntime(std::unique_ptr<Impl> impl)
@@ -659,7 +695,25 @@ bool AudioEncoderHipRuntime::Encode(std::span<const float> log_mel,
   }
   *output = {};
   try {
-    *output = impl_->Encode(log_mel, frames);
+    (void)impl_->Encode(log_mel, frames, output);
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool AudioEncoderHipRuntime::EncodeDevice(std::span<const float> log_mel,
+                                          std::size_t frames,
+                                          AudioEncoderDeviceOutput* output,
+                                          std::string* error) {
+  if (output == nullptr) {
+    SetError(error, "Qwen3-ASR device encoder output must not be null");
+    return false;
+  }
+  *output = {};
+  try {
+    *output = impl_->Encode(log_mel, frames, nullptr);
     return true;
   } catch (const std::exception& exception) {
     SetError(error, exception.what());
@@ -694,6 +748,15 @@ bool AudioEncoderHipRuntime::EncodeFrontend(std::span<const float>, std::size_t,
 
 bool AudioEncoderHipRuntime::Encode(std::span<const float>, std::size_t,
                                     AudioEncoderTrace*, std::string* error) {
+  if (error != nullptr) {
+    *error = "Qwen3-ASR audio encoder requires ENGINE_ENABLE_HIP";
+  }
+  return false;
+}
+
+bool AudioEncoderHipRuntime::EncodeDevice(std::span<const float>, std::size_t,
+                                          AudioEncoderDeviceOutput*,
+                                          std::string* error) {
   if (error != nullptr) {
     *error = "Qwen3-ASR audio encoder requires ENGINE_ENABLE_HIP";
   }

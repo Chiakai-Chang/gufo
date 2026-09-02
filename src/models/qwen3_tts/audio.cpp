@@ -1,13 +1,17 @@
 #include "src/models/qwen3_tts/audio.hpp"
 
 #include <algorithm>
+#include <array>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numbers>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -18,6 +22,16 @@ constexpr std::size_t kMaximumEncodedBytes = 12U << 20U;
 constexpr std::uint32_t kMaximumChannels = 8;
 constexpr std::uint32_t kMaximumSampleRate = 192000;
 constexpr std::uint64_t kMaximumFrames = 30ULL * kMaximumSampleRate;
+constexpr std::int64_t kResamplerRadius = 24;
+constexpr std::size_t kResamplerTaps =
+    2U * static_cast<std::size_t>(kResamplerRadius);
+
+struct ResamplerPhase {
+  std::array<double, kResamplerTaps> weights{};
+  std::array<std::int64_t, kResamplerTaps> offsets{};
+  std::size_t taps{0U};
+  double normalization{0.0};
+};
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -58,6 +72,16 @@ int Base64Value(unsigned char character) {
     return 63;
   }
   return -1;
+}
+
+std::int64_t ReflectIndex(std::int64_t index, std::int64_t length) {
+  if (length <= 1) {
+    return 0;
+  }
+  while (index < 0 || index >= length) {
+    index = index < 0 ? -index : 2 * length - index - 2;
+  }
+  return index;
 }
 
 std::vector<std::byte> DecodeBase64(std::string_view encoded) {
@@ -248,14 +272,54 @@ std::vector<float> ResampleMono(const AudioBuffer& audio,
   std::vector<float> result(output_frames, 0.0F);
   const double scale = static_cast<double>(audio.sample_rate) /
                        static_cast<double>(output_sample_rate);
+  const double cutoff =
+      std::min(1.0, static_cast<double>(output_sample_rate) /
+                        static_cast<double>(audio.sample_rate));
+  std::unordered_map<std::uint64_t, ResamplerPhase> phases;
   for (std::size_t frame = 0; frame < output_frames; ++frame) {
     const double position = static_cast<double>(frame) * scale;
-    const std::size_t left =
-        std::min(static_cast<std::size_t>(position), input_frames - 1);
-    const std::size_t right = std::min(left + 1, input_frames - 1);
-    const float fraction =
-        static_cast<float>(position - static_cast<double>(left));
-    result[frame] = std::lerp(mono[left], mono[right], fraction);
+    const auto center = static_cast<std::int64_t>(std::floor(position));
+    const double fraction = position - static_cast<double>(center);
+    const std::uint64_t key = std::bit_cast<std::uint64_t>(fraction);
+
+    auto entry = phases.find(key);
+    if (entry == phases.end()) {
+      ResamplerPhase phase_taps;
+      for (std::int64_t tap = -kResamplerRadius + 1; tap <= kResamplerRadius;
+           ++tap) {
+        const double distance = position - static_cast<double>(center + tap);
+        const double window_position =
+            std::abs(distance) / static_cast<double>(kResamplerRadius);
+        if (window_position >= 1.0) {
+          continue;
+        }
+        const double phase = std::numbers::pi * cutoff * distance;
+        const double sinc = phase == 0.0 ? 1.0 : std::sin(phase) / phase;
+        const double window =
+            0.5 + 0.5 * std::cos(std::numbers::pi * window_position);
+        const double weight = cutoff * sinc * window;
+        phase_taps.offsets[phase_taps.taps] = tap;
+        phase_taps.weights[phase_taps.taps] = weight;
+        ++phase_taps.taps;
+        phase_taps.normalization += weight;
+      }
+      entry = phases.emplace(key, phase_taps).first;
+    }
+
+    const ResamplerPhase& phase_taps = entry->second;
+    double weighted = 0.0;
+    for (std::size_t tap = 0; tap < phase_taps.taps; ++tap) {
+      const std::int64_t reflected =
+          ReflectIndex(center + phase_taps.offsets[tap],
+                       static_cast<std::int64_t>(input_frames));
+      weighted +=
+          static_cast<double>(mono[static_cast<std::size_t>(reflected)]) *
+          phase_taps.weights[tap];
+    }
+    result[frame] =
+        phase_taps.normalization == 0.0
+            ? 0.0F
+            : static_cast<float>(weighted / phase_taps.normalization);
   }
   return result;
 }

@@ -226,7 +226,7 @@ __launch_bounds__(ThreadsPerBlock) __global__ void Bfloat16QkNormRoPEKernel(
 /// independent and the reduction keeps the 256-thread tree of the standalone
 /// RMSNorm, so the BF16 result is unchanged.
 __launch_bounds__(256) __global__ void Bfloat16ResidualAddRMSNormKernel(
-    float* __restrict__ hidden, const float* __restrict__ update,
+    const float* residual, float* hidden, const float* __restrict__ update,
     const float* __restrict__ weight, hip_bfloat16* __restrict__ output,
     std::size_t batch_size, std::size_t dimension, float epsilon) {
   const std::size_t batch = blockIdx.x;
@@ -234,16 +234,17 @@ __launch_bounds__(256) __global__ void Bfloat16ResidualAddRMSNormKernel(
     return;
   }
   const std::size_t thread = threadIdx.x;
-  float* row = hidden + (batch * dimension);
+  const float* residual_row = residual + (batch * dimension);
+  float* hidden_row = hidden + (batch * dimension);
   const float* update_row = update + (batch * dimension);
   hip_bfloat16* output_row = output + (batch * dimension);
 
   float sum_squared = 0.0F;
   for (std::size_t index = thread; index < dimension; index += blockDim.x) {
-    const float left = static_cast<float>(hip_bfloat16(row[index]));
+    const float left = static_cast<float>(hip_bfloat16(residual_row[index]));
     const float right = static_cast<float>(hip_bfloat16(update_row[index]));
     const float sum = static_cast<float>(hip_bfloat16(left + right));
-    row[index] = sum;
+    hidden_row[index] = sum;
     sum_squared += sum * sum;
   }
 
@@ -260,7 +261,7 @@ __launch_bounds__(256) __global__ void Bfloat16ResidualAddRMSNormKernel(
   const float inverse_rms = rsqrtf(mean_squared + epsilon);
   for (std::size_t index = thread; index < dimension; index += blockDim.x) {
     const float scale = weight != nullptr ? weight[index] : 1.0F;
-    output_row[index] = hip_bfloat16((row[index] * inverse_rms) * scale);
+    output_row[index] = hip_bfloat16((hidden_row[index] * inverse_rms) * scale);
   }
 }
 
@@ -599,8 +600,23 @@ void LaunchBfloat16ResidualAddRMSNorm(float* hidden, const float* update,
   }
   Bfloat16ResidualAddRMSNormKernel<<<static_cast<unsigned int>(batch_size), 256,
                                      0, stream>>>(
-      hidden, update, weight, static_cast<hip_bfloat16*>(output_bfloat16),
-      batch_size, dimension, epsilon);
+      hidden, hidden, update, weight,
+      static_cast<hip_bfloat16*>(output_bfloat16), batch_size, dimension,
+      epsilon);
+}
+
+void LaunchBfloat16ResidualAddRMSNormFrom(
+    const float* residual, float* hidden, const float* update,
+    const float* weight, void* output_bfloat16, std::size_t batch_size,
+    std::size_t dimension, float epsilon, hipStream_t stream) {
+  if (batch_size == 0 || dimension == 0) {
+    return;
+  }
+  Bfloat16ResidualAddRMSNormKernel<<<static_cast<unsigned int>(batch_size), 256,
+                                     0, stream>>>(
+      residual, hidden, update, weight,
+      static_cast<hip_bfloat16*>(output_bfloat16), batch_size, dimension,
+      epsilon);
 }
 
 void LaunchRoundBfloat16InPlace(float* values, std::size_t count,

@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "src/models/qwen3_tts/prompt.hpp"
+#include "src/models/qwen3_tts/synthesis.hpp"
 
 namespace gufo::models::qwen3_tts::hip {
 
@@ -126,6 +127,15 @@ public:
   [[nodiscard]] bool Generate(const TalkerPromptOutput& prompt,
                               std::size_t maximum_new_tokens,
                               const TalkerSamplingOptions& sampling,
+                              TalkerGenerationOutput* output,
+                              std::string* error = nullptr);
+
+  /// Generates while checking for cancellation before prefill and every codec
+  /// frame. A cancelled generation fails without returning partial codes.
+  [[nodiscard]] bool Generate(const TalkerPromptOutput& prompt,
+                              std::size_t maximum_new_tokens,
+                              const TalkerSamplingOptions& sampling,
+                              const CancellationCheck& is_cancelled,
                               TalkerGenerationOutput* output,
                               std::string* error = nullptr);
 

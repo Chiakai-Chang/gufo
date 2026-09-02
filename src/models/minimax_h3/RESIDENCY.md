@@ -5,7 +5,7 @@ Status: retained second-profile implementation, 2026-08-23
 ## Contract
 
 The production loader accepts only the committed source manifest with SHA-256
-`8776014efafac996761041c0e3df740b41667275ed12a1e021cf8b49faf9b009`.
+`00a83367b87017f1f3d5547a963b20567a46d7aea44f0aac495c816147720d89`.
 Inspection parses the two safetensors indexes and every shard header with
 bounded `pread`; it maps no tensor payload and performs no HIP allocation.
 

@@ -27,7 +27,7 @@ constexpr std::string_view kModelKind = "minimax-h3-fl2va-bf16";
 constexpr std::string_view kRevision =
     "42ed227ee7df40d41602854ae760620d6eb651fe";
 constexpr std::string_view kSourceManifestSha256 =
-    "8776014efafac996761041c0e3df740b41667275ed12a1e021cf8b49faf9b009";
+    "00a83367b87017f1f3d5547a963b20567a46d7aea44f0aac495c816147720d89";
 constexpr std::size_t kMaximumJsonBytes = 64U << 20U;
 constexpr std::uint64_t kMaximumHeaderBytes = 64U << 20U;
 constexpr std::size_t kDeviceAlignment = 256;

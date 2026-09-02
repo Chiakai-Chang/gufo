@@ -371,6 +371,8 @@ struct AudioVaeDecoder::Impl {
   int device{0};
   hipStream_t stream{nullptr};
   void* staging{nullptr};
+  std::array<hipEvent_t, kStages> stage_start{};
+  std::array<hipEvent_t, kStages> stage_stop{};
 
   DeviceBuffer latent_mean;
   DeviceBuffer latent_std;
@@ -397,6 +399,14 @@ struct AudioVaeDecoder::Impl {
   ~Impl() {
     if (staging != nullptr) {
       (void)hipHostFree(staging);
+    }
+    for (std::size_t stage = 0; stage < kStages; ++stage) {
+      if (stage_start[stage] != nullptr) {
+        (void)hipEventDestroy(stage_start[stage]);
+      }
+      if (stage_stop[stage] != nullptr) {
+        (void)hipEventDestroy(stage_stop[stage]);
+      }
     }
     if (stream != nullptr) {
       (void)hipStreamDestroy(stream);
@@ -819,7 +829,12 @@ struct AudioVaeDecoder::Impl {
                           std::to_string(stage_index));
       return false;
     }
-    const auto begin = Clock::now();
+    hipError_t status = hipEventRecord(stage_start[stage_index], stream);
+    if (status != hipSuccess) {
+      SetError(error,
+               HipError("record MiniMax H3 AudioVAE stage start", status));
+      return false;
+    }
     const StageWeights& weights = stages[stage_index];
     const std::uint32_t output_length = *length * kUpsampleRates[stage_index];
     const std::uint32_t channels = kDecoderDimension >> (stage_index + 1U);
@@ -886,15 +901,14 @@ struct AudioVaeDecoder::Impl {
         ++base_telemetry.dispatches;
       }
     }
-    const hipError_t status = hipStreamSynchronize(stream);
+    status = hipEventRecord(stage_stop[stage_index], stream);
     if (status != hipSuccess) {
       SetError(error,
-               HipError("synchronize MiniMax H3 AudioVAE stage", status));
+               HipError("record MiniMax H3 AudioVAE stage stop", status));
       return false;
     }
     *hidden_index = sum_index;
     *length = output_length;
-    base_telemetry.stage_ms.push_back(Milliseconds(begin, Clock::now()));
     return true;
   }
 
@@ -976,6 +990,17 @@ struct AudioVaeDecoder::Impl {
                HipError("synchronize MiniMax H3 AudioVAE decode", status));
       return false;
     }
+    for (std::size_t stage = 0; stage < kStages; ++stage) {
+      float stage_ms = 0.0F;
+      const hipError_t event_status =
+          hipEventElapsedTime(&stage_ms, stage_start[stage], stage_stop[stage]);
+      if (event_status != hipSuccess) {
+        SetError(error,
+                 HipError("time MiniMax H3 AudioVAE stage", event_status));
+        return false;
+      }
+      base_telemetry.stage_ms.push_back(stage_ms);
+    }
     output->channels = kH3AudioVaeStereoChannels;
     output->samples = static_cast<int>(length);
     output->sample_rate = kH3AudioVaeSampleRate;
@@ -1039,6 +1064,13 @@ std::unique_ptr<AudioVaeDecoder> AudioVaeDecoder::Create(
   if (status == hipSuccess) {
     status = hipHostMalloc(&impl->staging, kWeightStagingBytes,
                            hipHostMallocDefault);
+  }
+  for (std::size_t stage = 0; status == hipSuccess && stage < kStages;
+       ++stage) {
+    status = hipEventCreate(&impl->stage_start[stage]);
+    if (status == hipSuccess) {
+      status = hipEventCreate(&impl->stage_stop[stage]);
+    }
   }
   if (status != hipSuccess) {
     SetError(error, HipError("initialize MiniMax H3 AudioVAE", status));

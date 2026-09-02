@@ -200,7 +200,8 @@ int main(int argc, char** argv) {
       argc > 1 ? argv[1]
                : "/home/fbozzo/projects/Qwen3-TTS-12Hz-1.7B-CustomVoice";
   const std::filesystem::path artifacts =
-      argc > 2 ? argv[2] : "/home/fbozzo/projects/gufo/artifacts/qwen3_tts";
+      argc > 2 ? argv[2]
+               : "/home/fbozzo/projects/strix-halo.cpp/artifacts/qwen3_tts";
   const std::filesystem::path embeddings_path =
       artifacts / "internals" / "prefill_inputs_embeds.npy";
   if (!std::filesystem::is_regular_file(model_root / "model.safetensors") ||

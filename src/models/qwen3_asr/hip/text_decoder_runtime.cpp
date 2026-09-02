@@ -10,7 +10,6 @@
 
 #include <algorithm>
 #include <array>
-#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -55,10 +54,6 @@ void RequireHipblas(hipblasStatus_t status, std::string_view operation) {
     throw std::runtime_error(std::string(operation) + ": status " +
                              std::to_string(status));
   }
-}
-
-float Bfloat16ToFloat(std::uint16_t value) {
-  return std::bit_cast<float>(static_cast<std::uint32_t>(value) << 16U);
 }
 
 template<typename Element>
@@ -176,7 +171,7 @@ public:
   DeviceRegion(const DeviceRegion&) = delete;
   DeviceRegion& operator=(const DeviceRegion&) = delete;
 
-  [[nodiscard]] bool Initialize(MappedRegion region) {
+  [[nodiscard]] bool Initialize(MappedRegion region, hipStream_t stream) {
     host_ = region.data;
     size_ = region.size;
     payload_offset_ = region.payload_offset;
@@ -184,7 +179,7 @@ public:
     if (mode == WeightMode::kMapped) {
       return TryMap();
     }
-    if (TryCopy()) {
+    if (TryCopy(stream)) {
       return true;
     }
     return mode == WeightMode::kAuto && TryMap();
@@ -217,7 +212,7 @@ private:
     return false;
   }
 
-  [[nodiscard]] bool TryCopy() {
+  [[nodiscard]] bool TryCopy(hipStream_t stream) {
     constexpr std::size_t kLoadAlignment = 16U;
     const std::size_t shift =
         (kLoadAlignment - (payload_offset_ % kLoadAlignment)) % kLoadAlignment;
@@ -227,7 +222,8 @@ private:
     }
     owns_device_ = true;
     device_ = static_cast<std::byte*>(allocation_) + shift;
-    if (hipMemcpy(device_, host_, size_, hipMemcpyHostToDevice) == hipSuccess) {
+    if (hipMemcpyAsync(device_, host_, size_, hipMemcpyHostToDevice, stream) ==
+        hipSuccess) {
       return true;
     }
     (void)hipFree(allocation_);
@@ -271,31 +267,18 @@ const void* ResolveTensor(
                            std::string(name));
 }
 
-std::vector<float> DecodeBfloat16(const Tensor& tensor) {
-  const auto elements = tensor.NumElements();
-  if (!elements.has_value()) {
-    throw std::runtime_error("invalid Qwen3-ASR BF16 norm tensor");
-  }
-  std::vector<float> result(*elements);
-  const auto* source = reinterpret_cast<const std::uint16_t*>(tensor.data);
-  std::ranges::transform(std::span(source, *elements), result.begin(),
-                         Bfloat16ToFloat);
-  return result;
-}
-
 struct DeviceNorm {
   DeviceBuffer<float> values;
 };
 
-DeviceNorm UploadNorm(const TensorStore& store, std::string_view name,
-                      std::size_t size) {
+DeviceNorm UploadNorm(const TensorStore& store,
+                      const std::vector<std::unique_ptr<DeviceRegion>>& regions,
+                      std::string_view name, std::size_t size,
+                      hipStream_t stream) {
   const std::array<std::uint64_t, 1> shape{static_cast<std::uint64_t>(size)};
-  const Tensor& tensor = RequireTensor(store, name, shape);
-  const std::vector<float> host = DecodeBfloat16(tensor);
-  DeviceNorm result{DeviceBuffer<float>(host.size())};
-  RequireHip(hipMemcpy(result.values.get(), host.data(),
-                       host.size() * sizeof(float), hipMemcpyHostToDevice),
-             "hipMemcpy Qwen3-ASR text norm");
+  const void* source = ResolveTensor(store, regions, name, shape);
+  DeviceNorm result{DeviceBuffer<float>(size)};
+  LaunchTextBfloat16ToFloat(source, result.values.get(), size, stream);
   return result;
 }
 
@@ -401,7 +384,7 @@ struct TextDecoderHipRuntime::Impl {
     weight_regions.reserve(model.mapped_regions.size());
     for (const MappedRegion region : model.mapped_regions) {
       auto device_region = std::make_unique<DeviceRegion>();
-      if (!device_region->Initialize(region)) {
+      if (!device_region->Initialize(region, stream)) {
         throw std::runtime_error(
             "cannot make Qwen3-ASR safetensors GPU-visible");
       }
@@ -461,20 +444,23 @@ struct TextDecoderHipRuntime::Impl {
           store, weight_regions, LayerName(layer, "mlp.down_proj.weight"),
           std::array<std::uint64_t, 2>{config.hidden_size,
                                        config.intermediate_size});
-      weights.input_norm =
-          UploadNorm(store, LayerName(layer, "input_layernorm.weight"),
-                     config.hidden_size);
-      weights.q_norm = UploadNorm(
-          store, LayerName(layer, "self_attn.q_norm.weight"), config.head_dim);
-      weights.k_norm = UploadNorm(
-          store, LayerName(layer, "self_attn.k_norm.weight"), config.head_dim);
+      weights.input_norm = UploadNorm(
+          store, weight_regions, LayerName(layer, "input_layernorm.weight"),
+          config.hidden_size, stream);
+      weights.q_norm = UploadNorm(store, weight_regions,
+                                  LayerName(layer, "self_attn.q_norm.weight"),
+                                  config.head_dim, stream);
+      weights.k_norm = UploadNorm(store, weight_regions,
+                                  LayerName(layer, "self_attn.k_norm.weight"),
+                                  config.head_dim, stream);
       weights.post_norm =
-          UploadNorm(store, LayerName(layer, "post_attention_layernorm.weight"),
-                     config.hidden_size);
+          UploadNorm(store, weight_regions,
+                     LayerName(layer, "post_attention_layernorm.weight"),
+                     config.hidden_size, stream);
       layers.push_back(std::move(weights));
     }
-    final_norm =
-        UploadNorm(store, "thinker.model.norm.weight", config.hidden_size);
+    final_norm = UploadNorm(store, weight_regions, "thinker.model.norm.weight",
+                            config.hidden_size, stream);
     embedding = ResolveTensor(
         store, weight_regions, "thinker.model.embed_tokens.weight",
         std::array<std::uint64_t, 2>{config.vocab_size, config.hidden_size});
@@ -617,12 +603,13 @@ struct TextDecoderHipRuntime::Impl {
   }
 
   void PreparePrompt(std::span<const std::uint32_t> prompt_ids,
-                     std::span<const float> audio_embeddings,
-                     std::size_t audio_tokens) {
+                     const float* audio_embeddings,
+                     std::size_t audio_embedding_elements,
+                     std::size_t audio_tokens, hipMemcpyKind copy_kind) {
     const TextConfig& config = model.config.text;
     if (prompt_ids.empty() || prompt_ids.size() > maximum_tokens ||
-        audio_tokens == 0U ||
-        audio_embeddings.size() != audio_tokens * config.hidden_size) {
+        audio_embeddings == nullptr || audio_tokens == 0U ||
+        audio_embedding_elements != audio_tokens * config.hidden_size) {
       throw std::invalid_argument("Qwen3-ASR text prompt shape is invalid");
     }
     std::size_t audio_offset = prompt_ids.size();
@@ -654,11 +641,12 @@ struct TextDecoderHipRuntime::Impl {
                               prompt_ids.size(), config.hidden_size, stream);
     float* audio_destination =
         hidden.get() + (audio_offset * config.hidden_size);
-    RequireHip(hipMemcpyAsync(audio_destination, audio_embeddings.data(),
-                              audio_embeddings.size() * sizeof(float),
-                              hipMemcpyHostToDevice, stream),
+    RequireHip(hipMemcpyAsync(audio_destination, audio_embeddings,
+                              audio_embedding_elements * sizeof(float),
+                              copy_kind, stream),
                "hipMemcpyAsync Qwen3-ASR audio embeddings");
-    LaunchTextRoundBfloat16(audio_destination, audio_embeddings.size(), stream);
+    LaunchTextRoundBfloat16(audio_destination, audio_embedding_elements,
+                            stream);
   }
 
   void PrepareToken(std::uint32_t token) {
@@ -777,7 +765,8 @@ struct TextDecoderHipRuntime::Impl {
   void Prefill(std::span<const std::uint32_t> prompt_ids,
                std::span<const float> audio_embeddings,
                std::size_t audio_tokens, TextDecoderTrace* trace) {
-    PreparePrompt(prompt_ids, audio_embeddings, audio_tokens);
+    PreparePrompt(prompt_ids, audio_embeddings.data(), audio_embeddings.size(),
+                  audio_tokens, hipMemcpyHostToDevice);
     RunTokens(prompt_ids.size(), 0U,
               trace != nullptr ? &trace->layer0 : nullptr);
     cache_tokens = prompt_ids.size();
@@ -791,6 +780,15 @@ struct TextDecoderHipRuntime::Impl {
                  "hipStreamSynchronize Qwen3-ASR prefill");
       RequireHip(hipGetLastError(), "Qwen3-ASR text prefill");
     }
+  }
+
+  void PrefillDevice(std::span<const std::uint32_t> prompt_ids,
+                     const float* audio_embeddings, std::size_t audio_tokens) {
+    PreparePrompt(prompt_ids, audio_embeddings,
+                  audio_tokens * model.config.text.hidden_size, audio_tokens,
+                  hipMemcpyDeviceToDevice);
+    RunTokens(prompt_ids.size(), 0U, nullptr);
+    cache_tokens = prompt_ids.size();
   }
 
   std::uint32_t SelectToken() {
@@ -946,6 +944,50 @@ bool TextDecoderHipRuntime::Generate(std::span<const std::uint32_t> prompt_ids,
   }
 }
 
+bool TextDecoderHipRuntime::GenerateDevice(
+    std::span<const std::uint32_t> prompt_ids,
+    const float* audio_embeddings_device, std::size_t audio_tokens,
+    std::size_t maximum_new_tokens, std::vector<std::uint32_t>* generated_ids,
+    std::string* error) {
+  if (generated_ids == nullptr) {
+    SetError(error, "Qwen3-ASR generated-token output must not be null");
+    return false;
+  }
+  generated_ids->clear();
+  if (maximum_new_tokens == 0U) {
+    return true;
+  }
+  try {
+    if (prompt_ids.size() + maximum_new_tokens > impl_->maximum_tokens) {
+      throw std::length_error(
+          "Qwen3-ASR requested generation exceeds KV capacity");
+    }
+    impl_->PrefillDevice(prompt_ids, audio_embeddings_device, audio_tokens);
+    std::uint32_t token = impl_->SelectToken();
+    if (token >= impl_->model.config.text.vocab_size) {
+      throw std::runtime_error(
+          "Qwen3-ASR decoder produced non-finite prefill logits");
+    }
+    generated_ids->push_back(token);
+    while (!IsStopToken(token) && generated_ids->size() < maximum_new_tokens) {
+      impl_->Decode(token);
+      token = impl_->SelectToken();
+      if (token >= impl_->model.config.text.vocab_size) {
+        throw std::runtime_error(
+            "Qwen3-ASR decoder produced non-finite logits at generation "
+            "step " +
+            std::to_string(generated_ids->size()));
+      }
+      generated_ids->push_back(token);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    generated_ids->clear();
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
 }  // namespace gufo::models::qwen3_asr::hip
 
 #else
@@ -975,6 +1017,17 @@ bool TextDecoderHipRuntime::Generate(std::span<const std::uint32_t>,
                                      std::span<const float>, std::size_t,
                                      std::size_t, std::vector<std::uint32_t>*,
                                      std::string* error) {
+  if (error != nullptr) {
+    *error = "Qwen3-ASR text decoder requires ENGINE_ENABLE_HIP";
+  }
+  return false;
+}
+
+bool TextDecoderHipRuntime::GenerateDevice(std::span<const std::uint32_t>,
+                                           const float*, std::size_t,
+                                           std::size_t,
+                                           std::vector<std::uint32_t>*,
+                                           std::string* error) {
   if (error != nullptr) {
     *error = "Qwen3-ASR text decoder requires ENGINE_ENABLE_HIP";
   }

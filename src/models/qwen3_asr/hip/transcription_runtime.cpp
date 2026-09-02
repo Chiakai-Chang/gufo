@@ -7,8 +7,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <cmath>
 #include <cstddef>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -103,19 +103,33 @@ struct TranscriptionHipRuntime::Impl {
     root = std::move(model_root);
     maximum_context_tokens = token_capacity;
 
+    auto audio_future = std::async(std::launch::async, [model_root = root] {
+      std::string error;
+      auto runtime = AudioEncoderHipRuntime::Create(model_root, &error);
+      return std::pair(std::move(runtime), std::move(error));
+    });
+    auto text_future =
+        std::async(std::launch::async, [model_root = root, token_capacity] {
+          std::string error;
+          auto runtime =
+              TextDecoderHipRuntime::Create(model_root, token_capacity, &error);
+          return std::pair(std::move(runtime), std::move(error));
+        });
+
     std::string load_error;
     if (!Tokenizer::Load(root, &tokenizer, &load_error)) {
       throw std::runtime_error(load_error);
     }
-    audio_encoder = AudioEncoderHipRuntime::Create(root, &load_error);
-    if (audio_encoder == nullptr) {
-      throw std::runtime_error(load_error);
+    auto [loaded_audio, audio_error] = audio_future.get();
+    if (loaded_audio == nullptr) {
+      throw std::runtime_error(audio_error);
     }
-    text_decoder =
-        TextDecoderHipRuntime::Create(root, token_capacity, &load_error);
-    if (text_decoder == nullptr) {
-      throw std::runtime_error(load_error);
+    auto [loaded_text, text_error] = text_future.get();
+    if (loaded_text == nullptr) {
+      throw std::runtime_error(text_error);
     }
+    audio_encoder = std::move(loaded_audio);
+    text_decoder = std::move(loaded_text);
   }
 
   bool Transcribe(const TranscriptionRequest& request,
@@ -175,41 +189,25 @@ struct TranscriptionHipRuntime::Impl {
       }
 
       const Clock::time_point encoder_begin = Clock::now();
-      AudioEncoderTrace encoded;
-      if (!audio_encoder->Encode(features.values, features.frames, &encoded,
-                                 &phase_error)) {
+      AudioEncoderDeviceOutput encoded;
+      if (!audio_encoder->EncodeDevice(features.values, features.frames,
+                                       &encoded, &phase_error)) {
         throw std::runtime_error(phase_error);
       }
       const Clock::time_point encoder_end = Clock::now();
       result->timings.audio_encoder_ms =
           Milliseconds(encoder_begin, encoder_end);
-      result->audio_tokens = encoded.final.tokens;
-      if (encoded.final.tokens != expected_audio_tokens) {
+      result->audio_tokens = encoded.tokens;
+      if (encoded.tokens != expected_audio_tokens) {
         throw std::runtime_error(
             "Qwen3-ASR audio frontend token count is inconsistent");
-      }
-      const auto finite = [](const AudioEncoderOutput& output) {
-        return std::ranges::all_of(
-            output.values, [](float value) { return std::isfinite(value); });
-      };
-      if (!finite(encoded.frontend)) {
-        throw std::runtime_error(
-            "Qwen3-ASR audio frontend produced non-finite embeddings");
-      }
-      if (!finite(encoded.layer0)) {
-        throw std::runtime_error(
-            "Qwen3-ASR audio encoder layer 0 produced non-finite embeddings");
-      }
-      if (!finite(encoded.final)) {
-        throw std::runtime_error(
-            "Qwen3-ASR audio encoder produced non-finite embeddings");
       }
       CheckCancellation(is_cancelled);
 
       const Clock::time_point decoder_begin = Clock::now();
-      if (!text_decoder->Generate(prompt, encoded.final.values,
-                                  encoded.final.tokens, request.max_new_tokens,
-                                  &result->generated_ids, &phase_error)) {
+      if (!text_decoder->GenerateDevice(prompt, encoded.values, encoded.tokens,
+                                        request.max_new_tokens,
+                                        &result->generated_ids, &phase_error)) {
         throw std::runtime_error(phase_error);
       }
       const Clock::time_point decoder_end = Clock::now();

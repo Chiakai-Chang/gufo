@@ -45,6 +45,9 @@ void LaunchSegmentedSelfAttention(const float* query, const float* key,
                                   std::size_t segment_tokens, std::size_t heads,
                                   std::size_t head_dim, hipStream_t stream);
 
+void LaunchAllFinite(const float* values, std::size_t count,
+                     std::uint32_t* finite, hipStream_t stream);
+
 }  // namespace gufo::models::qwen3_asr::hip
 #endif
 

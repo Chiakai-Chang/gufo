@@ -332,6 +332,15 @@ __global__ void SegmentedSelfAttentionKernel(
   }
 }
 
+__global__ void AllFiniteKernel(const float* values, std::size_t count,
+                                std::uint32_t* finite) {
+  const std::size_t index =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < count && !isfinite(values[index])) {
+    atomicExch(finite, 0U);
+  }
+}
+
 }  // namespace
 
 void LaunchChunkLogMel(const float* input, void* output_bfloat16,
@@ -433,6 +442,15 @@ void LaunchSegmentedSelfAttention(const float* query, const float* key,
                      dim3(kAttentionThreads), shared, stream, query, key, value,
                      output, static_cast<hip_bfloat16*>(output_bfloat16),
                      tokens, segment_tokens, heads, head_dim);
+}
+
+void LaunchAllFinite(const float* values, std::size_t count,
+                     std::uint32_t* finite, hipStream_t stream) {
+  if (count == 0U) {
+    return;
+  }
+  hipLaunchKernelGGL(AllFiniteKernel, dim3(Blocks(count)), dim3(kThreads), 0,
+                     stream, values, count, finite);
 }
 
 }  // namespace gufo::models::qwen3_asr::hip

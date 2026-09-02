@@ -22,6 +22,13 @@ struct AudioEncoderTrace {
   AudioEncoderOutput final;
 };
 
+struct AudioEncoderDeviceOutput {
+  // Device-resident float32 [tokens, 2048]. The pointer remains valid until
+  // the next call on this runtime.
+  const float* values{nullptr};
+  std::size_t tokens{0};
+};
+
 class AudioEncoderHipRuntime {
 public:
   ~AudioEncoderHipRuntime();
@@ -46,6 +53,13 @@ public:
   [[nodiscard]] bool Encode(std::span<const float> log_mel, std::size_t frames,
                             AudioEncoderTrace* output,
                             std::string* error = nullptr);
+
+  /// Production path. Runs the same encoder without intermediate host captures
+  /// and retains the final embeddings on the GPU.
+  [[nodiscard]] bool EncodeDevice(std::span<const float> log_mel,
+                                  std::size_t frames,
+                                  AudioEncoderDeviceOutput* output,
+                                  std::string* error = nullptr);
 
 private:
   struct Impl;

@@ -237,6 +237,55 @@ private:
   bool registered_{false};
 };
 
+bool UseMappedPrompt() {
+  const char* value = std::getenv("GUFO_QWEN3_TTS_PROMPT_MODE");
+  return value == nullptr ||
+         (std::string_view(value) != "copy" && std::string_view(value) != "0");
+}
+
+class MappedPrompt {
+public:
+  explicit MappedPrompt(std::span<const float> values) {
+    if (!UseMappedPrompt() || values.empty()) {
+      return;
+    }
+    host_ = values.data();
+    const std::size_t bytes = values.size_bytes();
+    if (hipHostRegister(const_cast<float*>(host_), bytes,
+                        hipHostRegisterMapped | hipHostRegisterReadOnly) !=
+        hipSuccess) {
+      host_ = nullptr;
+      return;
+    }
+    registered_ = true;
+    void* device = nullptr;
+    if (hipHostGetDevicePointer(&device, const_cast<float*>(host_), 0) ==
+        hipSuccess) {
+      device_ = static_cast<const float*>(device);
+      return;
+    }
+    (void)hipHostUnregister(const_cast<float*>(host_));
+    host_ = nullptr;
+    registered_ = false;
+  }
+
+  ~MappedPrompt() {
+    if (registered_) {
+      (void)hipHostUnregister(const_cast<float*>(host_));
+    }
+  }
+
+  MappedPrompt(const MappedPrompt&) = delete;
+  MappedPrompt& operator=(const MappedPrompt&) = delete;
+
+  [[nodiscard]] const float* device() const noexcept { return device_; }
+
+private:
+  const float* host_{nullptr};
+  const float* device_{nullptr};
+  bool registered_{false};
+};
+
 const Tensor& RequireTensor(const TensorStore& store, std::string_view name,
                             std::span<const std::uint64_t> shape) {
   const Tensor* tensor = store.Find(name);
@@ -721,6 +770,15 @@ struct TalkerHipRuntime::Impl {
                                      dimension, epsilon, stream);
   }
 
+  void ResidualAddNormToBfloat16From(const float* residual, const float* update,
+                                     const float* weight,
+                                     std::size_t batch_size,
+                                     std::size_t dimension, float epsilon) {
+    LaunchBfloat16ResidualAddRMSNormFrom(residual, hidden.get(), update, weight,
+                                         bfloat16_scratch.get(), batch_size,
+                                         dimension, epsilon, stream);
+  }
+
   std::vector<float> ProjectText(std::span<const std::uint32_t> token_ids) {
     const auto& config = model.config.talker;
     if (token_ids.empty()) {
@@ -1142,10 +1200,15 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
     const std::size_t q_elements =
         tokens * config.num_attention_heads * config.head_dim;
     const std::size_t ffn_elements = tokens * config.intermediate_size;
-    RequireHip(hipMemcpyAsync(impl_->hidden.get(), input_embeddings.data(),
-                              hidden_elements * sizeof(float),
-                              hipMemcpyHostToDevice, impl_->stream),
-               "hipMemcpyAsync prefill embeddings");
+    MappedPrompt mapped_prompt(input_embeddings);
+    const float* initial_hidden = mapped_prompt.device();
+    if (initial_hidden == nullptr) {
+      RequireHip(hipMemcpyAsync(impl_->hidden.get(), input_embeddings.data(),
+                                hidden_elements * sizeof(float),
+                                hipMemcpyHostToDevice, impl_->stream),
+                 "hipMemcpyAsync prefill embeddings");
+      initial_hidden = impl_->hidden.get();
+    }
     RequireHip(
         hipMemsetAsync(impl_->key_cache.get(), 0,
                        static_cast<std::size_t>(config.num_hidden_layers) *
@@ -1161,7 +1224,7 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
                        impl_->stream),
         "hipMemsetAsync value cache");
 
-    impl_->RmsNormToBfloat16(impl_->hidden.get(),
+    impl_->RmsNormToBfloat16(initial_hidden,
                              impl_->layers.front().input_norm.values.get(),
                              tokens, config.hidden_size, config.rms_norm_eps);
     for (std::size_t layer = 0; layer < impl_->layers.size(); ++layer) {
@@ -1194,9 +1257,16 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
       impl_->Gemm(weights.o, impl_->bfloat16_scratch.get(),
                   impl_->attention_output.get(), tokens, config.hidden_size,
                   config.num_attention_heads * config.head_dim);
-      impl_->ResidualAddNormToBfloat16(impl_->attention_output.get(),
-                                       weights.post_norm.values.get(), tokens,
-                                       config.hidden_size, config.rms_norm_eps);
+      if (layer == 0) {
+        impl_->ResidualAddNormToBfloat16From(
+            initial_hidden, impl_->attention_output.get(),
+            weights.post_norm.values.get(), tokens, config.hidden_size,
+            config.rms_norm_eps);
+      } else {
+        impl_->ResidualAddNormToBfloat16(
+            impl_->attention_output.get(), weights.post_norm.values.get(),
+            tokens, config.hidden_size, config.rms_norm_eps);
+      }
       const std::array<Bfloat16GemvGroup, 2> gate_up{{
           {weights.gate, impl_->gate.get(), config.intermediate_size},
           {weights.up, impl_->up.get(), config.intermediate_size},
@@ -1716,6 +1786,15 @@ bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
                                 const TalkerSamplingOptions& sampling,
                                 TalkerGenerationOutput* output,
                                 std::string* error) {
+  return Generate(prompt, maximum_new_tokens, sampling, {}, output, error);
+}
+
+bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
+                                std::size_t maximum_new_tokens,
+                                const TalkerSamplingOptions& sampling,
+                                const CancellationCheck& is_cancelled,
+                                TalkerGenerationOutput* output,
+                                std::string* error) {
   if (output == nullptr) {
     SetError(error, "Qwen3-TTS generation output must not be null");
     return false;
@@ -1750,6 +1829,17 @@ bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
   };
   const PredictorSamplingReset reset{impl_.get()};
   try {
+    const auto cancelled = [&] {
+      if (!is_cancelled || !is_cancelled()) {
+        return false;
+      }
+      SetError(error, "Qwen3-TTS native generation cancelled");
+      *output = {};
+      return true;
+    };
+    if (cancelled()) {
+      return false;
+    }
     TalkerPrefillOutput current;
     if (!Prefill(prompt.embeddings, prompt.tokens, &current, error)) {
       return false;
@@ -1762,6 +1852,9 @@ bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
     const std::size_t trailing_rows =
         prompt.trailing_text.size() / config.hidden_size;
     for (std::size_t step = 0; step < maximum_new_tokens; ++step) {
+      if (cancelled()) {
+        return false;
+      }
       const std::uint32_t first_code = SelectMainCode(
           current.logits, generated_first_codes, step,
           config.codec_eos_token_id, sampling,
@@ -1911,6 +2004,16 @@ bool TalkerHipRuntime::GenerateGreedy(const CustomVoicePromptOutput&,
 
 bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput&, std::size_t,
                                 const TalkerSamplingOptions&,
+                                TalkerGenerationOutput*, std::string* error) {
+  if (error != nullptr) {
+    *error = "Qwen3-TTS HIP support is not enabled";
+  }
+  return false;
+}
+
+bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput&, std::size_t,
+                                const TalkerSamplingOptions&,
+                                const CancellationCheck&,
                                 TalkerGenerationOutput*, std::string* error) {
   if (error != nullptr) {
     *error = "Qwen3-TTS HIP support is not enabled";

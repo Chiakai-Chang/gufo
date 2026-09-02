@@ -687,6 +687,13 @@ if (BUILD_TESTING)
   set_tests_properties(qwen3_tts_audio_api_test PROPERTIES
     LABELS "cpu;models;qwen3-tts;server;api;audio;quality")
 
+  add_executable(qwen3_tts_audio_test
+    tests/models/qwen3_tts/audio_test.cpp)
+  target_link_libraries(qwen3_tts_audio_test PRIVATE gufo_qwen3_tts)
+  add_test(NAME qwen3_tts_audio_test COMMAND qwen3_tts_audio_test)
+  set_tests_properties(qwen3_tts_audio_test PROPERTIES
+    LABELS "cpu;models;qwen3-tts;audio;quality;resampling")
+
   add_executable(qwen3_tts_config_test
     tests/models/qwen3_tts/config_test.cpp)
   target_link_libraries(qwen3_tts_config_test PRIVATE gufo_qwen3_tts)
