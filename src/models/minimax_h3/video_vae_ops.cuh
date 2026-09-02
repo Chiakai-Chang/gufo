@@ -192,7 +192,6 @@ static __global__ void LayerNormKernel(const float* input, const float* weight,
   const std::uint32_t wave = threadIdx.x >> 5U;
   const std::uint32_t row = blockIdx.x * kRowsPerBlock + wave;
   const bool active = row < rows;
-  __shared__ float sums[kRowsPerBlock][32];
   const std::size_t base = static_cast<std::size_t>(row) * width;
   float local_sum = 0.0F;
   if (active) {
@@ -200,15 +199,13 @@ static __global__ void LayerNormKernel(const float* input, const float* weight,
       local_sum += input[base + column];
     }
   }
-  sums[wave][lane] = local_sum;
-  __syncthreads();
   for (std::uint32_t stride = 16U; stride != 0; stride >>= 1U) {
+    const float peer = __shfl_down(local_sum, stride, 32);
     if (lane < stride) {
-      sums[wave][lane] += sums[wave][lane + stride];
+      local_sum += peer;
     }
-    __syncthreads();
   }
-  const float mean = sums[wave][0] / static_cast<float>(width);
+  const float mean = __shfl(local_sum, 0, 32) / static_cast<float>(width);
   float local_square = 0.0F;
   if (active) {
     for (std::uint32_t column = lane; column < width; column += 32U) {
@@ -216,15 +213,14 @@ static __global__ void LayerNormKernel(const float* input, const float* weight,
       local_square = fmaf(centered, centered, local_square);
     }
   }
-  sums[wave][lane] = local_square;
-  __syncthreads();
   for (std::uint32_t stride = 16U; stride != 0; stride >>= 1U) {
+    const float peer = __shfl_down(local_square, stride, 32);
     if (lane < stride) {
-      sums[wave][lane] += sums[wave][lane + stride];
+      local_square += peer;
     }
-    __syncthreads();
   }
-  const float variance = sums[wave][0] / static_cast<float>(width);
+  const float variance =
+      __shfl(local_square, 0, 32) / static_cast<float>(width);
   const float inverse = rsqrtf(variance + epsilon);
   if (active) {
     for (std::uint32_t column = lane; column < width; column += 32U) {

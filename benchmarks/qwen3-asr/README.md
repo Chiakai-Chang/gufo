@@ -426,6 +426,36 @@ So a FlashAttention port for this model is capped at roughly `1%` end to end and
 would need new CK or AOTriton shape support to reach it. Not worth it while
 `747 ms` of the request is decode-projection bandwidth.
 
+## September 2026 route audit
+
+The production audio encoder now returns its device-resident output directly to
+the text decoder. Validation keeps only a scalar finite flag on the host; large
+diagnostic traces and the device-to-host-to-device transfer remain confined to
+focused tests. Audio and text runtime construction also overlap their
+independent weight loading.
+
+On the same warm filesystem state, the previous and retained release binaries
+produced the exact same transcript:
+
+| Route | Weight load | Resident request mean |
+|---|---:|---:|
+| Previous release | `548.094 ms` | `992.48 ms` |
+| Retained device route | `389.198 ms` | `992.14 ms` |
+
+Two proposed defaults were rejected:
+
+- Mapping decoder weights reduced load time to `332.669 ms`, but increased the
+  resident request mean to `1570.89 ms` (`58%` slower). Device copies therefore
+  remain the default.
+- Restricting audio self-attention to the official 104-token window preserved
+  the 15-second transcript but reduced final-encoder cosine to `0.964719`,
+  below the `0.995` gate. On a 60.2-second fixture it became non-finite, while
+  full attention completed with 180 generated tokens in `4842.8 ms`.
+
+The 104-token experiment was removed completely. There is no audio-window
+environment variable, segmented-window route, or dormant attention-window
+setting in production.
+
 ## Remaining headroom
 
 | Item | Now | Assessment |

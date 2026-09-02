@@ -99,6 +99,25 @@ non-precision levers are a hand-written f32 GEMM for the decoder convolutions
 (see [appendix C](#rocblas-f32-ceiling-on-gfx1151)) and sparse
 attention.
 
+### September 2026 route audit
+
+Three review findings were resolved without adding production route choices:
+
+- Input audio resampling now uses the same windowed-sinc policy as the native
+  audio frontend instead of linear interpolation. The focused gate covers exact
+  identity-rate output, finite bounded output, passband preservation, and
+  stopband attenuation.
+- Cancellation is checked before prefill and once per generated codec frame.
+  A cancelled request clears partial codes and returns the existing
+  cancellation error.
+- Mapped prompt embeddings were implemented and tested, then removed. Four
+  alternating optimized runs kept all prompt, logit, argmax, and sampled-code
+  checks identical, but mapped prompt processing averaged `14.28 ms` versus
+  `13.68 ms` for the copy route. Total prefill averaged `82.34 ms` versus
+  `83.02 ms`, a `0.8%` difference inside roughly `10 ms` run-to-run variation.
+  Because there was no credible speedup, the copy path is again the sole route
+  and no prompt-mode environment variable remains.
+
 ## Quality
 
 The upstream Python implementation never serves a request. It is an offline
@@ -314,6 +333,7 @@ Kept so they are not retried. All were implemented and measured.
 | GPU-side masked top-k | greedy replaces 15 of 16 host sorts per frame and gains only `0.7%`, so the whole host sampling path is ~`0.2` ms/frame |
 | Precomputed SnakeBeta exponents | `33.32` versus `32.97` ms, a `1.0%` regression |
 | hipBLASLt, direct rocBLAS, alternative attention routes | neutral, slower, or failed exactness |
+| Mapped prompt embeddings | Prompt stage `14.28` versus `13.68` ms; total prefill difference was below run noise. Implementation and route knob removed |
 | Decoder GEMM restructuring | at the library ceiling, detailed below |
 
 #### rocBLAS f32 ceiling on gfx1151

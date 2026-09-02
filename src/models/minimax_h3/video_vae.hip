@@ -883,6 +883,11 @@ struct VideoVaeDecoder::Impl {
       if (!CheckLaunch("H3 VisualVAE MLP residual", error)) {
         return false;
       }
+      status = hipStreamSynchronize(stream);
+      if (status != hipSuccess) {
+        SetError(error, HipError("synchronize H3 VisualVAE block", status));
+        return false;
+      }
       base_telemetry.dispatches += 9;
     }
     video_vae_ops::LaunchLayerNorm(

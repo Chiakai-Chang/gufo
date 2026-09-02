@@ -848,6 +848,38 @@ work. A cached softmax and faster attention-GEMM solution indices were
 discarded after their changed reduction order failed the frozen quality gate.
 No second MP4 or complete denoising trajectory was run for retention.
 
+### September 2026 exact-route audit
+
+The VisualVAE LayerNorm now assigns eight independent rows to the eight waves
+of a 256-thread block and uses the same 32-lane reduction tree through wave
+shuffles. Across ten independent exact 1,797-by-2,048 microbenchmark runs, each
+containing fifteen 1,000-iteration paired samples, it wins nine times. The
+aggregate median falls from `0.12345` ms to `0.11371` ms (`1.086x`) with
+bit-exact output. VGPR use moves from 13 to 18, occupancy stays at 16 waves per
+SIMD, neither route spills, and the retained route removes the former 1,024-byte
+LDS allocation. The real selected-tile oracle remains at relative L2
+`8.14968e-7`.
+
+The remaining candidates were discarded:
+
+- Removing the VisualVAE per-block stream synchronization measured
+  `2743.60` ms versus `2746.32` ms with the same LayerNorm route, only `0.10%`
+  amid tens of milliseconds of run variation.
+- Replacing AudioVAE stage synchronizations with events measured `76.45` ms
+  versus `76.48` ms (`0.04%`) while preserving spectrogram relative L2
+  `3.62714e-6` and waveform relative L2 `1.08936e-5`.
+- A direct BF16-input/F32-accumulate final-head GEMM had no supported rocBLAS
+  solution for the released shape and failed before producing velocity output.
+  The cast-plus-GEMM route remains unchanged.
+- Graph capture was not retained: a generation owns a fresh denoiser session,
+  and host-built row maps and schedules remain step-dependent. Existing traces
+  cap dispatch-only savings near `0.1%`, below the cost and lifecycle
+  complexity of a capture cache.
+
+Both synchronization experiments and the mixed-GEMM implementation were
+removed rather than left behind switches. Validation used the frozen
+single-forward and selected-decoder oracles; no full video generation was run.
+
 The harness schedules each requested preset once, rejects `--rounds` values
 other than one, and requires an acknowledgement before it can launch a
 complete generation:

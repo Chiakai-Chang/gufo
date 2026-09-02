@@ -52,14 +52,6 @@ void LaunchBfloat16ResidualAddRMSNorm(float* hidden, const float* update,
                                       std::size_t dimension, float epsilon,
                                       hipStream_t stream);
 
-/// First-layer variant whose immutable residual may be mapped host memory.
-/// Writes the rounded sum into `hidden` before producing the normalized BF16
-/// output.
-void LaunchBfloat16ResidualAddRMSNormFrom(
-    const float* residual, float* hidden, const float* update,
-    const float* weight, void* output_bfloat16, std::size_t batch_size,
-    std::size_t dimension, float epsilon, hipStream_t stream);
-
 void LaunchRoundBfloat16InPlace(float* values, std::size_t count,
                                 hipStream_t stream);
 
