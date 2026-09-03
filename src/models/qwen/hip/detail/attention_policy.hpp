@@ -214,6 +214,22 @@ KQuantSmallBatchOccupancyFromEnv() noexcept {
 //
 // The arithmetic is untouched -- same terms, same order -- so the bit-exact
 // contract against the decode GEMV holds by construction.
+//
+// It loses, and the default here used to say otherwise. `opt-q4kxl-hoist`
+// measured the hoisted route at -7.6% `tg128-dflash2` (20.28 -> 18.75, 4/4
+// interleaved pairs) and rejected it, but this resolver kept returning
+// `kHoisted` for an unset variable, so production ran the rejected route.
+// Re-measured under DFlash-2 at draft width 7 on UD-Q4_K_XL, three interleaved
+// pairs, `GUFO_VERIFY_TIMING=1`:
+//
+//   hoisted   26.28 / 30.15 / 30.15 tok/s, ffn 111.70 / 84.38 / 84.45 ms/chunk
+//   in-order  32.59 / 32.49 / 32.52 tok/s, ffn  78.55 / 78.84 / 78.61 ms/chunk
+//
+// Median 30.15 -> 32.52 tok/s (+7.9%, 3/3 pairs), verify chunk 142.08 -> 131.02
+// ms. Extending the decoded sub-blocks' live range across the staging loop and
+// its barrier costs the allocator more than the earlier issue buys back; the
+// in-order kernel already has twelve waves per SIMD to hide that latency with.
+// The route stays selectable as `GUFO_KQUANT_SMALL_BATCH_FETCH=hoist`.
 enum class KQuantSmallBatchFetch : std::uint8_t {
   kInOrder,
   kHoisted,
@@ -222,12 +238,12 @@ enum class KQuantSmallBatchFetch : std::uint8_t {
 [[nodiscard]] inline KQuantSmallBatchFetch ResolveKQuantSmallBatchFetch(
     const char* value) noexcept {
   if (value == nullptr) {
-    return KQuantSmallBatchFetch::kHoisted;
+    return KQuantSmallBatchFetch::kInOrder;
   }
   const std::string_view text{value};
-  return text == "0" || text == "in-order" || text == "inorder"
-             ? KQuantSmallBatchFetch::kInOrder
-             : KQuantSmallBatchFetch::kHoisted;
+  return text == "1" || text == "hoist" || text == "hoisted"
+             ? KQuantSmallBatchFetch::kHoisted
+             : KQuantSmallBatchFetch::kInOrder;
 }
 
 [[nodiscard]] inline KQuantSmallBatchFetch
@@ -235,6 +251,37 @@ KQuantSmallBatchFetchFromEnv() noexcept {
   static const KQuantSmallBatchFetch fetch = ResolveKQuantSmallBatchFetch(
       std::getenv("GUFO_KQUANT_SMALL_BATCH_FETCH"));
   return fetch;
+}
+
+// opt-dflash2-verify-marginal: measurement-only route that deletes the
+// Q4_K/Q5_K minimum correction from the small-batch verifier. `w = scale*q -
+// offset` is not `scale*q`, so the result is WRONG and the correctness gate
+// rejects it; it exists to bound what an exact cheaper formulation of the
+// correction could be worth in the speculative step, the same way
+// `GUFO_KQUANT_PREFILL_TILE=drop-offset-probe` bounds it for prefill. The
+// verifier pays the term once per verified row, so its cost scales with draft
+// width where prefill's scales with prompt length.
+enum class KQuantSmallBatchOffset : std::uint8_t {
+  kExact,
+  kDropProbe,
+};
+
+[[nodiscard]] inline KQuantSmallBatchOffset ResolveKQuantSmallBatchOffset(
+    const char* value) noexcept {
+  if (value == nullptr) {
+    return KQuantSmallBatchOffset::kExact;
+  }
+  const std::string_view text{value};
+  return text == "drop-probe" || text == "drop-offset-probe"
+             ? KQuantSmallBatchOffset::kDropProbe
+             : KQuantSmallBatchOffset::kExact;
+}
+
+[[nodiscard]] inline KQuantSmallBatchOffset
+KQuantSmallBatchOffsetFromEnv() noexcept {
+  static const KQuantSmallBatchOffset offset = ResolveKQuantSmallBatchOffset(
+      std::getenv("GUFO_KQUANT_SMALL_BATCH_OFFSET"));
+  return offset;
 }
 
 // opt-q4kxl-actsum: Q4_K/Q5_K blocked WMMA needs the sum of each quantized
