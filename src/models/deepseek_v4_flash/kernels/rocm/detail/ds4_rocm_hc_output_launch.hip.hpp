@@ -1,3 +1,13 @@
+/* The vec4 expand kernels read and write four adjacent embedding lanes as one
+ * 16-byte access, which needs the row pitch to be a multiple of four and every
+ * base 16-byte aligned. hipMalloc over-aligns, but these tensors can be views
+ * into a larger arena, so check rather than assume. */
+static inline bool hip_hc_vec4_ok(uint32_t n_embd, const void *a, const void *b,
+                                  const void *c) {
+    return (n_embd & 3u) == 0u &&
+           (((uintptr_t)a | (uintptr_t)b | (uintptr_t)c) & 15u) == 0u;
+}
+
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
     const uint64_t mix_bytes = 24ull * sizeof(float);
@@ -117,6 +127,86 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
             n_embd, n_hc, (uint32_t)n_rows, sinkhorn_iters, eps);
     return hip_ok(hipGetLastError(), "hc split weighted sum launch");
 }
+/* Fused norm + 24-wide mix projection + Sinkhorn split + weighted sum.
+ *
+ * Replaces three passes over the hyper-connection row with one; see
+ * hc4_norm_mix_split_weighted_sum_kernel. Returns 0 when the shape, the F16
+ * weight alignment, or the row width does not fit the register tiling, so the
+ * caller keeps the separate chain. `mix` and `split` shift by the projection's
+ * reassociation, so this is scoped to prompt-chunk width by the caller. */
+extern "C" int ds4_gpu_hc_norm_mix_split_weighted_sum_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mix,
+        ds4_gpu_tensor       *split,
+        const ds4_gpu_tensor *residual_hc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                mix_weight_offset,
+        uint64_t                scale_offset,
+        uint64_t                base_offset,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        uint32_t                n_rows,
+        uint32_t                sinkhorn_iters,
+        float                   eps,
+        float                   norm_eps) {
+    /* Four tokens per workgroup, 256 lanes each, sixteen columns per lane.
+     * More tokens amortize the 786 KiB projection weight over more rows and
+     * fewer leave register room for a second resident workgroup; at 152 VGPRs
+     * and no scratch this kernel gets one workgroup per CU either way, and two
+     * and eight tokens measured 494.0 and 493.1 tok/s against four's 498.6. */
+    constexpr uint32_t TOK = 4u, TPT = 256u, COLS = 16u;
+    if (!out || !mix || !split || !residual_hc || !model_map ||
+        n_hc != 4u || n_rows == 0u || n_embd != TPT * COLS) {
+        return 0;
+    }
+    const uint64_t hc_dim = 4ull * n_embd;
+    const uint64_t mix_hc = 24ull;
+    uint64_t out_bytes = 0, residual_bytes = 0, mix_bytes = 0, weight_bytes = 0;
+    if (!hip_u64_mul3_checked(n_rows, n_embd, sizeof(float), &out_bytes) ||
+        !hip_u64_mul3_checked(n_rows, hc_dim, sizeof(float), &residual_bytes) ||
+        !hip_u64_mul3_checked(n_rows, mix_hc, sizeof(float), &mix_bytes) ||
+        !hip_u64_mul3_checked(mix_hc, hc_dim, sizeof(uint16_t), &weight_bytes) ||
+        out->bytes < out_bytes || residual_hc->bytes < residual_bytes ||
+        mix->bytes < mix_bytes || split->bytes < mix_bytes ||
+        scale_offset > model_size ||
+        3ull * sizeof(float) > model_size - scale_offset ||
+        base_offset > model_size ||
+        mix_hc * sizeof(float) > model_size - base_offset ||
+        mix_weight_offset > model_size ||
+        weight_bytes > model_size - mix_weight_offset) {
+        return 0;
+    }
+    const float *scale = (const float *)hip_model_range_ptr(
+            model_map, scale_offset, 3ull * sizeof(float), "hc_scale");
+    const float *base = (const float *)hip_model_range_ptr(
+            model_map, base_offset, mix_hc * sizeof(float), "hc_base");
+    const __half *mix_w = (const __half *)hip_model_range_ptr(
+            model_map, mix_weight_offset, weight_bytes, "hc_mix_fused");
+    if (!scale || !base || !mix_w) return 0;
+    /* The weight is read eight halves at a time and the row in float4. */
+    if (((uintptr_t)mix_w & 15u) != 0u ||
+        ((uintptr_t)residual_hc->ptr & 15u) != 0u ||
+        ((uintptr_t)out->ptr & 15u) != 0u) {
+        return 0;
+    }
+    hc4_norm_mix_split_weighted_sum_kernel<TOK, TPT, COLS>
+            <<<(n_rows + TOK - 1u) / TOK, TOK * TPT>>>(
+            (float *)out->ptr,
+            (float *)mix->ptr,
+            (float *)split->ptr,
+            (const float *)residual_hc->ptr,
+            mix_w,
+            scale,
+            base,
+            n_embd,
+            n_rows,
+            sinkhorn_iters,
+            eps,
+            norm_eps);
+    return hip_ok(hipGetLastError(), "hc norm mix split weighted sum launch");
+}
+
 extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_out,
@@ -241,6 +331,13 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(ds4_gpu_tensor *out_hc, const ds4_
     uint32_t n_tokens = (uint32_t)n_tokens64;
     if (n_hc == 4u) {
         const uint64_t n = (uint64_t)n_tokens * n_embd;
+        if (hip_hc_vec4_ok(n_embd, out_hc->ptr, block_out->ptr, residual_hc->ptr)) {
+            hc_expand4_vec4_kernel<<<((n >> 2u) + 255) / 256, 256>>>(
+                    (float *)out_hc->ptr, (const float *)block_out->ptr,
+                    (const float *)residual_hc->ptr, (const float *)split->ptr,
+                    n_embd, n_tokens);
+            return hip_ok(hipGetLastError(), "hc_expand_split4 vec4 launch");
+        }
         hc_expand4_kernel<<<(n + 255) / 256, 256>>>((float *)out_hc->ptr,
                                                     (const float *)block_out->ptr,
                                                     (const float *)residual_hc->ptr,
@@ -297,6 +394,45 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(ds4_gpu_tensor *out_hc, const 
                                                     mix_hc, mix_hc, 1);
     return hip_ok(hipGetLastError(), "hc_expand_add_split launch");
 }
+/* Fused form of ds4_gpu_hc_expand_add_split_tensor: `down_h` holds the routed
+ * per-expert F16 rows and the 6-way sum happens here. Returns 0 when the shape
+ * is unsupported so the caller keeps the separate sum plus expand. */
+extern "C" int ds4_gpu_hc_expand_add_split_moesum_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *down_h,
+        const ds4_gpu_tensor *block_add, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc,
+        uint32_t n_expert, uint32_t n_tokens) {
+    uint64_t flat_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0,
+             down_bytes = 0;
+    if (!out_hc || !down_h || !block_add || !residual_hc || !split ||
+        n_hc != 4u || n_embd == 0u || n_expert == 0u || n_tokens == 0u ||
+        !hip_hc_mix_width(n_hc, &mix_hc64) ||
+        !hip_u64_mul3_checked(n_tokens, n_embd, sizeof(float), &flat_bytes) ||
+        !hip_u64_mul3_checked(n_tokens, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !hip_u64_mul3_checked(n_tokens, mix_hc64, sizeof(float), &split_bytes) ||
+        !hip_u64_mul3_checked((uint64_t)n_tokens * n_expert, n_embd, sizeof(__half), &down_bytes) ||
+        block_add->bytes < flat_bytes || residual_hc->bytes < hc_bytes ||
+        split->bytes < split_bytes || down_h->bytes < down_bytes ||
+        out_hc->bytes < hc_bytes) {
+        return 0;
+    }
+    const uint64_t n = (uint64_t)n_tokens * n_embd;
+    if (hip_hc_vec4_ok(n_embd, out_hc->ptr, block_add->ptr, residual_hc->ptr) &&
+        ((uintptr_t)down_h->ptr & 7u) == 0u) {
+        hc_expand4_add_moesum_vec4_kernel<<<((n >> 2u) + 255) / 256, 256>>>(
+                (float *)out_hc->ptr, (const __half *)down_h->ptr,
+                (const float *)block_add->ptr, (const float *)residual_hc->ptr,
+                (const float *)split->ptr, n_embd, n_expert, n_tokens);
+        return hip_ok(hipGetLastError(),
+                      "hc_expand_add_split4 moesum vec4 launch");
+    }
+    hc_expand4_add_moesum_kernel<<<(n + 255) / 256, 256>>>(
+            (float *)out_hc->ptr, (const __half *)down_h->ptr,
+            (const float *)block_add->ptr, (const float *)residual_hc->ptr,
+            (const float *)split->ptr, n_embd, n_expert, n_tokens);
+    return hip_ok(hipGetLastError(), "hc_expand_add_split4 moesum launch");
+}
+
 extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *shared_out,

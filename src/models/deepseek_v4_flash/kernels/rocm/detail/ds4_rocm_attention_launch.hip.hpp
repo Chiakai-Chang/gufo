@@ -270,6 +270,57 @@ static int attention_decode_batch_launch(
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention score buffer too small for %u compressed rows\n", n_comp);
         return 0;
     }
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    /*
+     * A prompt longer than one chunk resumes through this entry rather than
+     * attention_prefill_mixed_launch, and the ratio-128 layers then landed on
+     * the scalar F32 producer below -- the same shape the rocWMMA producer
+     * takes from 916 ms to 316 ms on the first chunk. Only the ring parameters
+     * differ, and the kernel already consumes raw_cap/raw_start/pos0, so the
+     * gap was launch plumbing.
+     *
+     * Held to the same conditions as the zero-prefix route: it converts Q and
+     * KV to F16 rather than reordering a reduction, so it stays at prompt-chunk
+     * width.
+     */
+    if (!use_comp_mask &&
+        g_rocm_gfx1151 && n_tokens >= DS4_ROCM_WIDE_PREFILL_ROWS &&
+        n_comp != 0u && comp_kv && n_head == 64u && head_dim == 512u &&
+        window != 0u && window <= 256u && ratio != 0u) {
+        const dim3 grid(n_tokens, n_head / 32u, 1u);
+        attention_mixed_heads32_wmma_kernel<false, false><<<grid, 1024>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr,
+                NULL,
+                NULL,
+                0u,
+                n_tokens,
+                pos0,
+                n_raw,
+                raw_cap,
+                raw_start,
+                n_comp,
+                0u,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+        if (hip_ok(hipGetLastError(), "attention batch mixed window wmma launch")) {
+            static int notice_printed = 0;
+            if (!notice_printed) {
+                notice_printed = 1;
+                fprintf(stderr,
+                        DS4_GPU_LOG_PREFIX
+                        "resumed mixed-window chunk using wave32 rocWMMA\n");
+            }
+            return 1;
+        }
+        return 0;
+    }
+#endif
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         fast_window_attention) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -417,38 +468,17 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                 (uint32_t)((head_dim & 3u) == 0u));
         return hip_ok(hipGetLastError(), "attention indexed decode oldhip fast launch");
     }
-    float *wmma_score_cache = nullptr;
-    uint32_t wmma_score_stride = 0u;
+    /* The single-pass rocWMMA kernel visits each KV row block once, so the score
+     * cache that let the old second pass skip its QK matrix multiply has no
+     * reader. It cost up to 1 GiB of the shared scratch buffer. */
+    float *const wmma_score_cache = nullptr;
+    const uint32_t wmma_score_stride = 0u;
     if (n_tokens > 1u && top_k == 512u) {
         const uint64_t sort_bytes = (uint64_t)n_tokens * top_k * sizeof(int32_t);
-        const uint64_t sort_aligned = (sort_bytes + 255u) & ~255ull;
-        uint64_t tmp_bytes = sort_aligned;
-        if (wmma_supported) {
-            const uint32_t stride = DS4_ROCM_ATTENTION_RAW_SCORE_CAP + top_k;
-            uint64_t score_bytes = 0u;
-            if (hip_u64_mul3_checked(
-                    n_tokens,
-                    (uint64_t)n_head * stride,
-                    sizeof(float),
-                    &score_bytes) &&
-                score_bytes <= (1ull << 30u) &&
-                sort_aligned <= UINT64_MAX - score_bytes) {
-                wmma_score_stride = stride;
-                tmp_bytes = sort_aligned + score_bytes;
-            }
-        }
         char *scratch = (char *)hip_tmp_alloc(
-            tmp_bytes, "indexed attention topk and WMMA scores");
-        if (!scratch && wmma_score_stride != 0u) {
-            wmma_score_stride = 0u;
-            scratch = (char *)hip_tmp_alloc(
-                sort_bytes, "indexed attention topk sort");
-        }
+            sort_bytes, "indexed attention topk sort");
         int32_t *sorted = (int32_t *)scratch;
         if (!sorted) return 0;
-        if (wmma_score_stride != 0u) {
-            wmma_score_cache = (float *)(scratch + sort_aligned);
-        }
         indexed_topk_sort_512_asc_kernel<<<n_tokens, 512>>>(sorted, topk_ptr, n_tokens);
         if (!hip_ok(hipGetLastError(), "indexed attention topk sort launch")) return 0;
         topk_ptr = sorted;
@@ -728,6 +758,55 @@ static int attention_prefill_mixed_launch(
     const float *sinks = (const float *)hip_model_range_ptr(
             model_map, sinks_offset, (uint64_t)n_head * sizeof(float), "attn_sinks");
     if (!sinks) return 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    /* Mixed-window prompt chunks can reach the same wave32 rocWMMA producer the
+     * indexed layers use. This launcher is the zero-prefix route, so the raw
+     * cache is the chunk's own linear KV: positions start at zero, the ring is
+     * the chunk itself, and `window <= 256` keeps `raw_count` inside the
+     * kernel's row table.
+     *
+     * Worth 599 ms per 4,096-token chunk (915.82 -> 316.35 ms). It is the one
+     * accelerated route that lowers precision rather than reordering a
+     * reduction -- the scalar kernel below keeps the whole mixed-window score
+     * and value pass in F32, while the rocWMMA producer converts Q and KV to
+     * F16 -- so it is held to the prompt-chunk width like the rest. The indexed
+     * layers already use this producer. */
+    if (!use_comp_mask && g_rocm_gfx1151 &&
+        n_tokens >= DS4_ROCM_WIDE_PREFILL_ROWS && n_comp != 0u &&
+        n_head == 64u && head_dim == 512u && window != 0u && window <= 256u) {
+        const dim3 grid(n_tokens, n_head / 32u, 1u);
+        attention_mixed_heads32_wmma_kernel<false, false><<<grid, 1024>>>(
+                (float *)heads->ptr,
+                sinks,
+                (const float *)q->ptr,
+                (const float *)raw_kv->ptr,
+                (const float *)comp_kv->ptr,
+                NULL,
+                NULL,
+                0u,
+                n_tokens,
+                0u,
+                n_tokens,
+                n_tokens,
+                0u,
+                n_comp,
+                0u,
+                window,
+                ratio,
+                n_head,
+                head_dim);
+        static int notice_printed = 0;
+        if (!notice_printed) {
+            fprintf(stderr,
+                    DS4_GPU_LOG_PREFIX
+                    "mixed-window prefill using wave32 rocWMMA "
+                    "(heads=32, rows=16, single-pass)\n");
+            notice_printed = 1;
+        }
+        return hip_ok(hipGetLastError(),
+                      "attention mixed-window wave32 wmma launch");
+    }
+#endif
     if (!use_comp_mask && n_tokens > 1 && head_dim == 512 &&
         ((window != 0u ? window : n_tokens) + n_comp <= 768u)) {
         dim3 grid(n_tokens, (n_head + 7u) / 8u, 1);
@@ -887,7 +966,10 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                                        n_comp, window, ratio, n_head, head_dim);
 }
 
-extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+/* `rope` non-null asks for the inverse rotated tail to be folded into the F16
+ * group pack. Only the packed hipBLAS/rocWMMA route can absorb it, so every
+ * other route returns 0 and the caller keeps its separate rope_tail launch. */
+static int attention_output_q8_batch_launch(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         ds4_gpu_tensor       *group_tmp,
@@ -901,9 +983,11 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         uint32_t                n_groups,
         uint64_t                out_dim,
         const ds4_gpu_tensor *heads,
-        uint32_t                n_tokens) {
+        uint32_t                n_tokens,
+        const ds4_attn_pack_rope *rope) {
     (void)group_tmp;
     (void)low_tmp;
+    if (rope && !ds4_attn_pack_rope_eligible(rope, (uint32_t)group_dim)) return 0;
     if (!out || !low || !heads || !model_map ||
         group_dim == 0 || rank == 0 || n_groups == 0 || out_dim == 0 || n_tokens == 0) {
         return 0;
@@ -936,6 +1020,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     const int attn_output_hipblas =
         hip_runtime_config()->attention_output_hipblas_all &&
         !(n_tokens > 1u && n_tokens <= attn_small_batch_rows);
+    if (rope && !attn_output_hipblas) return 0;
     if (!attn_output_hipblas) {
         if ((group_dim & 31u) == 0u && rank <= UINT32_MAX && n_tokens <= UINT32_MAX) {
             const uint32_t rows_per_block = 32u;
@@ -1005,17 +1090,46 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 if (!tmp) return 0;
                 __half *heads_h = (__half *)tmp;
                 __half *low_h = (__half *)((char *)tmp + low_h_offset);
-                attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
-                        heads_h,
-                        (const float *)heads->ptr,
-                        n_tokens,
-                        n_groups,
-                        group_dim);
+                if (rope) {
+                    if (!hip_launch_attention_pack_group_heads_rope_f16(
+                                heads_h,
+                                (const float *)heads->ptr,
+                                n_tokens,
+                                n_groups,
+                                group_dim,
+                                heads_h_count,
+                                rope)) {
+                        return 0;
+                    }
+                } else {
+                    hip_launch_attention_pack_group_heads_f16(
+                            heads_h,
+                            (const float *)heads->ptr,
+                            n_tokens,
+                            n_groups,
+                            group_dim,
+                            heads_h_count);
+                }
                 if (!hip_ok(hipGetLastError(), "attention_output_q8 packed heads pack launch")) return 0;
                 const float alpha = 1.0f;
                 const float beta0 = 0.0f;
                 const float beta1 = 1.0f;
-                hipblasStatus_t st = hipblasGemmStridedBatchedEx(g_hipblas,
+                int a_wmma_ok = 0;
+#ifdef __HIP_PLATFORM_AMD__
+                /* rocBLAS reaches 2.7 TFLOP/s on this strided-batched shape;
+                 * see the batched launcher. Only the interleaved-B layout puts
+                 * each group's rank block at `g * rank` of a `low_dim` row,
+                 * which is what the kernel's `ldc` and C stride assume. */
+                a_wmma_ok = interleaved_b &&
+                            ds4_gemm_f16_wmma_batched_eligible(
+                                    rank, n_tokens, group_dim, n_groups) &&
+                            ds4_gemm_f16_wmma_batched_launch(
+                                    low_h, out_a_f16, heads_h, rank, n_tokens,
+                                    group_dim, low_dim, n_groups,
+                                    "attention output a batched wmma launch");
+#endif
+                hipblasStatus_t st = HIPBLAS_STATUS_SUCCESS;
+                if (!a_wmma_ok) st = hipblasGemmStridedBatchedEx(g_hipblas,
                                                                HIPBLAS_OP_T,
                                                                HIPBLAS_OP_N,
                                                                (int)rank,
@@ -1042,6 +1156,26 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                     const __half *b_ptr = out_b_f16_t ? out_b_f16_t : out_b_f16;
                     const auto b_op = out_b_f16_t ? HIPBLAS_OP_N : HIPBLAS_OP_T;
                     const int b_lda = out_b_f16_t ? (int)out_dim : (int)low_dim;
+#ifdef __HIP_PLATFORM_AMD__
+                    /* The 256x128 rocWMMA tile moves 3.22 GB against Tensile's
+                     * 5.7 GB on this shape; see the kernel comment. Needs the
+                     * transposed weight cache, so opA is N. */
+                    if (out_b_f16_t &&
+                        ds4_gemm_f16_wmma_eligible(out_dim, n_tokens, low_dim) &&
+                        ds4_gemm_f16_wmma_launch<false, float>(
+                                (float *)out->ptr, out_b_f16_t, low_h,
+                                out_dim, n_tokens, low_dim,
+                                "attention output b wmma launch")) {
+                        return 1;
+                    }
+                    if (hipblaslt_route_enabled(DS4_ROCM_LT_ROUTE_ATTN_B) &&
+                        hipblaslt_gemm_f16(out->ptr, b_ptr, low_h,
+                                           (uint32_t)out_dim, n_tokens,
+                                           (uint32_t)low_dim, b_op, HIP_R_32F,
+                                           "attention output b")) {
+                        return 1;
+                    }
+#endif
                     st = hipblasGemmEx(g_hipblas,
                                       b_op,
                                       HIPBLAS_OP_N,
@@ -1098,6 +1232,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 }
             }
         }
+        if (rope) return 0;
         const uint64_t heads_h_count = (uint64_t)n_groups * n_tokens * group_dim;
         const uint64_t low_tmp_count = (uint64_t)n_groups * n_tokens * rank;
         const uint64_t heads_h_bytes = heads_h_count * sizeof(__half);
@@ -1107,12 +1242,13 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
         if (!tmp) return 0;
         __half *heads_h = (__half *)tmp;
         float *low_packed = (float *)((char *)tmp + low_tmp_offset);
-        attention_pack_group_heads_f16_kernel<<<(heads_h_count + 255) / 256, 256>>>(
+        hip_launch_attention_pack_group_heads_f16(
                 heads_h,
                 (const float *)heads->ptr,
                 n_tokens,
                 n_groups,
-                group_dim);
+                group_dim,
+                heads_h_count);
         if (!hip_ok(hipGetLastError(), "attention_output_q8_a pack launch")) return 0;
         const float alpha = 1.0f;
         const float beta = 0.0f;
@@ -1148,6 +1284,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                 rank);
         if (!hip_ok(hipGetLastError(), "attention_output_q8_a unpack launch")) return 0;
     } else {
+        if (rope) return 0;
         const uint64_t x_rows = (uint64_t)n_tokens * n_groups;
         const uint64_t xq_bytes = x_rows * blocks_a * 32u;
         const uint64_t scale_offset = (xq_bytes + 15u) & ~15ull;
@@ -1201,6 +1338,80 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
                                            n_tokens,
                                            "attn_output_b");
 }
+
+extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    return attention_output_q8_batch_launch(out, low, group_tmp, low_tmp,
+                                            model_map, model_size, out_a_offset,
+                                            out_b_offset, group_dim, rank,
+                                            n_groups, out_dim, heads, n_tokens,
+                                            NULL);
+}
+
+extern "C" int ds4_gpu_attention_output_q8_batch_inv_rope_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens,
+        uint32_t                head_dim,
+        uint32_t                n_rot,
+        uint32_t                pos0,
+        uint32_t                n_ctx_orig,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow) {
+    /* Held to prompt-chunk width: the rotation moves into registers ahead of an
+     * F16 conversion, which is the same value the separate pass produced, but
+     * this backend builds with -ffast-math and the surrounding expression
+     * changes, so the narrow verification widths keep the separate launches. */
+    if (n_tokens < DS4_ROCM_WIDE_PREFILL_ROWS) return 0;
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    const ds4_attn_pack_rope rope = {
+        head_dim, n_rot, pos0, n_ctx_orig, /*inverse=*/1,
+        freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow,
+    };
+    return attention_output_q8_batch_launch(out, low, group_tmp, low_tmp,
+                                            model_map, model_size, out_a_offset,
+                                            out_b_offset, group_dim, rank,
+                                            n_groups, out_dim, heads, n_tokens,
+                                            &rope);
+#else
+    (void)out; (void)low; (void)group_tmp; (void)low_tmp; (void)model_map;
+    (void)model_size; (void)out_a_offset; (void)out_b_offset; (void)group_dim;
+    (void)rank; (void)n_groups; (void)out_dim; (void)heads; (void)head_dim;
+    (void)n_rot; (void)pos0; (void)n_ctx_orig; (void)freq_base;
+    (void)freq_scale; (void)ext_factor; (void)attn_factor; (void)beta_fast;
+    (void)beta_slow;
+    return 0;
+#endif
+}
+
 extern "C" int ds4_gpu_attention_output_low_q8_tensor(
         ds4_gpu_tensor       *low,
         const void             *model_map,

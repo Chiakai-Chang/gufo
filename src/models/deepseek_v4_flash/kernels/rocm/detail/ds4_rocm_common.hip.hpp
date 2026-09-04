@@ -347,6 +347,99 @@ __global__ static void f32_to_f16_kernel(__half *out, const float *x, uint64_t n
     if (i < n) out[i] = __float2half(x[i]);
 }
 
+/* Four elements per thread.
+ *
+ * One element per thread gives a wave 128 B of loads against 64 B of stores, so
+ * every store is a partial cache line and the conversion runs at about half of
+ * DRAM peak even though it is pure streaming. A `float4` load and a paired-half
+ * store per thread makes both sides full lines. Per-element arithmetic is
+ * unchanged, and elementwise conversion has no accumulation order. */
+__global__ static void f32_to_f16_vec4_kernel(
+        __half *out, const float *x, uint64_t groups) {
+    const uint64_t g = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= groups) return;
+    const float4 v = *(const float4 *)(x + g * 4u);
+    __half2 packed[2];
+    packed[0] = __floats2half2_rn(v.x, v.y);
+    packed[1] = __floats2half2_rn(v.z, v.w);
+    *(__half2 *)(out + g * 4u) = packed[0];
+    *(__half2 *)(out + g * 4u + 2u) = packed[1];
+}
+
+/* Convert `n` floats to halves, vectorized when the extent and both pointers
+ * allow it. Callers check hipGetLastError afterwards as before. */
+/* Published F16 mirror of one activation buffer.
+ *
+ * A ratio-4 layer's normalized attention rows feed eight projections -- the
+ * compressor KV and gate, the indexer KV, gate and projection, and the QKV
+ * pair -- and every F16 route among them converted the same 4,096 x 4,096 rows
+ * again, 188 conversions per prefill at 0.475 ms each.
+ *
+ * The graph publishes the mirror once after producing the rows and clears it at
+ * every layer boundary, and a consumer reuses it only when both the pointer and
+ * the element count match, so a recycled buffer cannot be served stale: the
+ * clear happens before anything can overwrite the published rows. */
+static const void *g_f16_input_src = NULL;
+static uint64_t     g_f16_input_count = 0;
+static __half      *g_f16_input_mirror = NULL;
+static uint64_t     g_f16_input_mirror_bytes = 0;
+
+static void hip_f16_input_release(void) {
+    if (g_f16_input_mirror) (void)hipFree(g_f16_input_mirror);
+    g_f16_input_mirror = NULL;
+    g_f16_input_mirror_bytes = 0;
+    g_f16_input_src = NULL;
+    g_f16_input_count = 0;
+}
+
+static void hip_f16_input_clear(void) {
+    g_f16_input_src = NULL;
+    g_f16_input_count = 0;
+}
+
+static __half *hip_f16_input_lookup(const float *x, uint64_t count) {
+    if (!g_f16_input_mirror || !g_f16_input_src || count == 0u) return NULL;
+    if (g_f16_input_src != (const void *)x || g_f16_input_count != count) {
+        return NULL;
+    }
+    return g_f16_input_mirror;
+}
+
+static void hip_launch_f32_to_f16(__half *out, const float *x, uint64_t n) {
+    if (n == 0u) return;
+    if ((n & 3u) == 0u &&
+        ((uintptr_t)x & 15u) == 0u && ((uintptr_t)out & 7u) == 0u) {
+        const uint64_t groups = n >> 2u;
+        f32_to_f16_vec4_kernel<<<(groups + 255u) / 256u, 256>>>(out, x, groups);
+        return;
+    }
+    f32_to_f16_kernel<<<(n + 255u) / 256u, 256>>>(out, x, n);
+}
+
+static int hip_f16_input_publish(const float *x, uint64_t count) {
+    hip_f16_input_clear();
+    if (!x || count == 0u) return 0;
+    uint64_t bytes = 0;
+    if (!hip_u64_mul_checked(count, sizeof(__half), &bytes)) return 0;
+    if (g_f16_input_mirror_bytes < bytes) {
+        if (g_f16_input_mirror) (void)hipFree(g_f16_input_mirror);
+        g_f16_input_mirror = NULL;
+        g_f16_input_mirror_bytes = 0;
+        void *ptr = NULL;
+        if (!hip_ok(hipMalloc(&ptr, (size_t)bytes), "f16 input mirror alloc")) {
+            (void)hipGetLastError();
+            return 0;
+        }
+        g_f16_input_mirror = (__half *)ptr;
+        g_f16_input_mirror_bytes = bytes;
+    }
+    hip_launch_f32_to_f16(g_f16_input_mirror, x, count);
+    if (!hip_ok(hipGetLastError(), "f16 input mirror convert")) return 0;
+    g_f16_input_src = (const void *)x;
+    g_f16_input_count = count;
+    return 1;
+}
+
 __device__ static float warp_sum_f32(float v) {
     for (int offset = 16; offset > 0; offset >>= 1) {
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)

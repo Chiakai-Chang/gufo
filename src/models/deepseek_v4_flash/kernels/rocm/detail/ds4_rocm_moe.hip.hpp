@@ -841,15 +841,46 @@ __global__ static void moe_scatter_sorted_pairs_kernel(
 
 /* Keep pair order stable inside each expert bucket.  The MoE WMMA kernels are
  * row-position sensitive enough that atomic append order changes logits. */
+/* One block per expert, scanning the assignment list for its own pairs.
+ *
+ * This ran on a single thread per block, so all 256 blocks walked the whole
+ * `pair_count` list serially: 24,576 dependent loads each at a 4,096-token
+ * chunk, 539 us per call. Scanning in chunks of blockDim.x with a block-wide
+ * stable prefix sum keeps the output byte-identical -- pair indices still land in
+ * ascending order within each expert -- while cutting the serial depth by the
+ * block width. */
 __global__ static void moe_scatter_sorted_pairs_deterministic_kernel(
         uint32_t *sorted_pairs,
         const uint32_t *offsets,
         const int32_t *selected,
         uint32_t pair_count) {
     const uint32_t expert = (uint32_t)blockIdx.x;
-    if (expert >= 256u || threadIdx.x != 0u) return;
-    uint32_t pos = offsets[expert];
-    for (uint32_t pair = 0; pair < pair_count; pair++) {
+    if (expert >= 256u) return;
+    extern __shared__ uint32_t scatter_scan[];
+    const uint32_t tid = threadIdx.x;
+    /* Contiguous range per thread, counted then written: thread t's range
+     * precedes t+1's and each is walked in order, so the output is byte-identical
+     * to the single-threaded form -- ascending pair indices within each expert --
+     * with one block-wide prefix sum instead of a per-chunk one. */
+    const uint32_t per = (pair_count + blockDim.x - 1u) / blockDim.x;
+    const uint32_t lo = tid * per;
+    const uint32_t hi = lo + per < pair_count ? lo + per : pair_count;
+    uint32_t count = 0u;
+    for (uint32_t pair = lo; pair < hi; pair++) {
+        int32_t expert_i = selected[pair];
+        if (expert_i < 0) expert_i = 0;
+        if ((uint32_t)expert_i == expert) count++;
+    }
+    scatter_scan[tid] = count;
+    __syncthreads();
+    for (uint32_t off = 1u; off < blockDim.x; off <<= 1u) {
+        const uint32_t add = tid >= off ? scatter_scan[tid - off] : 0u;
+        __syncthreads();
+        scatter_scan[tid] += add;
+        __syncthreads();
+    }
+    uint32_t pos = offsets[expert] + scatter_scan[tid] - count;
+    for (uint32_t pair = lo; pair < hi; pair++) {
         int32_t expert_i = selected[pair];
         if (expert_i < 0) expert_i = 0;
         if ((uint32_t)expert_i == expert) sorted_pairs[pos++] = pair;
@@ -2554,6 +2585,42 @@ __global__ static void moe_sum_kernel(float *out, const float *down, uint32_t ou
     out[gid] = acc;
 }
 
+/* SwiGLU epilogue for the MMQ routed gate/up pair.
+ *
+ * MMQ writes raw gate and up projections, so this applies the clamp, the SiLU
+ * gate, and the router weight in one pass and emits the F16 mirror the wide Q2
+ * down kernel reads. It runs only when MMQ could not fuse the epilogue itself. */
+__global__ static void moe_mmq_swiglu_weighted_clamp_kernel(
+        float *mid_out,
+        __half *mid_out_h,
+        const float *gate_buf,
+        const float *up_buf,
+        const float *weights,
+        uint32_t expert_mid_dim,
+        uint32_t n_tokens,
+        uint32_t n_expert,
+        float clamp) {
+    const uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const uint64_t n = (uint64_t)n_tokens * n_expert * expert_mid_dim;
+    if (gid >= n) return;
+    const uint64_t pair = gid / expert_mid_dim;
+    const uint32_t tok = (uint32_t)(pair / n_expert);
+    const uint32_t slot = (uint32_t)(pair - (uint64_t)tok * n_expert);
+    float g = gate_buf[gid];
+    float u = up_buf[gid];
+    if (!isfinite(g)) g = 0.0f;
+    if (!isfinite(u)) u = 0.0f;
+    if (clamp > 1.0e-6f) {
+        if (g > clamp) g = clamp;
+        if (u > clamp) u = clamp;
+        if (u < -clamp) u = -clamp;
+    }
+    const float w = weights[(uint64_t)tok * n_expert + slot];
+    const float value = (g / (1.0f + expf(-g))) * u * w;
+    if (mid_out) mid_out[gid] = value;
+    if (mid_out_h) mid_out_h[gid] = __float2half(value);
+}
+
 __global__ static void moe_sum_f16_kernel(float *out, const __half *down_h, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
     uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t n = (uint64_t)n_tokens * out_dim;
@@ -2774,8 +2841,62 @@ __device__ __forceinline__ static void q2_K_dequant_wide_tile_half_rowwise(
                                      ds * (float)q3 - dmm);
         }
         __half *dst = shB + tile * (uint32_t)(BK * BN) + nn * (uint32_t)BK + kk0;
-        *reinterpret_cast<uint32_t *>(dst) = v0;
-        *reinterpret_cast<uint32_t *>(dst + 2u) = v1;
+        /* One 8-byte store; see the note in the wide dequantizer. */
+        *reinterpret_cast<uint2 *>(dst) = make_uint2(v0, v1);
+    }
+}
+
+/* NFRAG-wide dequantizer over Q2_K blocks already staged in shared memory.
+ *
+ * The global-memory twin below re-reads the same 84-byte block on every one of
+ * the sixteen BK steps inside a 256-value K slab, and each read is six scalar
+ * sub-word loads from a two-byte-aligned block. Staging the slab once as
+ * uint32 words and dequantizing from there leaves the arithmetic and the
+ * emitted values identical. */
+template <int BN, int BK, int NFRAG>
+__device__ __forceinline__ static void q2_K_dequant_wide_tile_half_rowwise_staged(
+        __half *shB,
+        const uint32_t *raw_rows,
+        uint32_t k0,
+        uint32_t tid) {
+    const uint32_t g = (k0 & 255u) >> 4u;
+    const uint32_t within = g & 7u;
+    const uint32_t qbase = (g >> 3u) * 32u + (within & 1u) * 16u;
+    const uint32_t shift = (within >> 1u) * 2u;
+    constexpr uint32_t KG = 4u;
+    constexpr uint32_t RAW_DWORDS = 84u / sizeof(uint32_t);
+    constexpr uint32_t UNITS_PER_TILE = (uint32_t)(BN * (BK / KG));
+    for (uint32_t j = tid; j < (uint32_t)NFRAG * UNITS_PER_TILE; j += blockDim.x) {
+        const uint32_t tile = j / UNITS_PER_TILE;
+        const uint32_t rem = j - tile * UNITS_PER_TILE;
+        const uint32_t nn = rem / (uint32_t)(BK / KG);
+        const uint32_t kk0 = (rem - nn * (uint32_t)(BK / KG)) * KG;
+        const uint32_t row_local = tile * (uint32_t)BN + nn;
+        const unsigned char *blk = reinterpret_cast<const unsigned char *>(
+                raw_rows + row_local * RAW_DWORDS);
+        const uint32_t dm_bits = *reinterpret_cast<const uint32_t *>(blk + 80u);
+        const float d = dev_f16_to_f32((uint16_t)dm_bits);
+        const float dm = dev_f16_to_f32((uint16_t)(dm_bits >> 16u));
+        const float s = (float)(blk[g] & 0x0fu);
+        const float m = (float)(blk[g] >> 4u);
+        const uint32_t qbits =
+                *reinterpret_cast<const uint32_t *>(blk + 16u + qbase + kk0);
+        const uint32_t q0 = (qbits >> shift) & 3u;
+        const uint32_t q1 = (qbits >> (8u + shift)) & 3u;
+        const uint32_t q2 = (qbits >> (16u + shift)) & 3u;
+        const uint32_t q3 = (qbits >> (24u + shift)) & 3u;
+        const float ds = d * s;
+        const float dmm = dm * m;
+        /* One 8-byte LDS store rather than two adjacent 4-byte ones. Split, the
+         * compiler pairs them into a two-address form whose halves land in the
+         * same bank; the same change in the IQ2 tile loader took its conflict
+         * rate from 19.7% to 11.7%. `kk0` is a multiple of KG = 4, so `dst` is
+         * always 8-byte aligned. Same bytes in the same order. */
+        __half *dst = shB + tile * (uint32_t)(BK * BN) + nn * (uint32_t)BK + kk0;
+        uint2 packed;
+        packed.x = dev_pack_half2_bits(ds * (float)q0 - dmm, ds * (float)q1 - dmm);
+        packed.y = dev_pack_half2_bits(ds * (float)q2 - dmm, ds * (float)q3 - dmm);
+        *reinterpret_cast<uint2 *>(dst) = packed;
     }
 }
 
@@ -2823,8 +2944,8 @@ __device__ __forceinline__ static void q2_K_dequant_pair_tile_half_rowwise(
                                      ds * (float)q3 - dmm);
         }
         __half *dst = shB + nn * (uint32_t)BK + kk0;
-        *reinterpret_cast<uint32_t *>(dst) = v0;
-        *reinterpret_cast<uint32_t *>(dst + 2u) = v1;
+        /* One 8-byte store; see the note in the wide dequantizer. */
+        *reinterpret_cast<uint2 *>(dst) = make_uint2(v0, v1);
     }
 }
 
@@ -2894,10 +3015,9 @@ __device__ __forceinline__ static void q2_K_dequant_dual_pair_tile_half_rowwise(
                                       uds * (float)uq3 - umm);
         }
         const uint32_t sj = nn * (uint32_t)BK + kk0;
-        *reinterpret_cast<uint32_t *>(shBg + sj) = gv0;
-        *reinterpret_cast<uint32_t *>(shBg + sj + 2u) = gv1;
-        *reinterpret_cast<uint32_t *>(shBu + sj) = uv0;
-        *reinterpret_cast<uint32_t *>(shBu + sj + 2u) = uv1;
+        /* One 8-byte store each; see the note in the wide dequantizer. */
+        *reinterpret_cast<uint2 *>(shBg + sj) = make_uint2(gv0, gv1);
+        *reinterpret_cast<uint2 *>(shBu + sj) = make_uint2(uv0, uv1);
     }
 }
 
@@ -3395,10 +3515,9 @@ __device__ __forceinline__ static void iq2_xxs_dequant_dual_pair_tile_half_rowwi
             uv1 = dev_pack_half2_bits(u2, u3);
         }
         const uint32_t sj = nn * (uint32_t)BK + kk0;
-        *reinterpret_cast<uint32_t *>(shBg + sj) = gv0;
-        *reinterpret_cast<uint32_t *>(shBg + sj + 2u) = gv1;
-        *reinterpret_cast<uint32_t *>(shBu + sj) = uv0;
-        *reinterpret_cast<uint32_t *>(shBu + sj + 2u) = uv1;
+        /* One 8-byte store each; see the note in the wide dequantizer. */
+        *reinterpret_cast<uint2 *>(shBg + sj) = make_uint2(gv0, gv1);
+        *reinterpret_cast<uint2 *>(shBu + sj) = make_uint2(uv0, uv1);
     }
 }
 
@@ -3959,16 +4078,45 @@ __global__ static void moe_down_q2K_hotlist_wmma_wide_kernel(
         uint32_t out_dim,
         uint64_t down_expert_bytes,
         uint64_t down_row_bytes,
-        uint32_t n_tokens = 0u) {
+        uint32_t n_tokens = 0u,
+        /* When non-null, blockIdx.y indexes a compacted list of the
+         * (hot expert, row group) pairs that actually have rows, packed as
+         * (hot_index << 16) | row_group, and gridDim.z is 1. */
+        const uint32_t *tile_map = nullptr) {
     extern __shared__ unsigned char raw_sh[];
+    /* Two mid-tile buffers. Counters put this kernel at 9 to 18%
+     * instruction-issue utilisation with 96 VGPRs and no scratch, so it is
+     * waiting rather than working, and the mid tile is the only global read
+     * left inside the K step once the weights are staged per slab. Fetching the
+     * next step's tile into registers before this step's dequantize, barrier
+     * and matrix ops lets that load retire underneath them. */
+    constexpr uint32_t A_TILE = (uint32_t)(MTILES * BM * BK);
     __half *shA = reinterpret_cast<__half *>(raw_sh);
-    __half *shB = shA + MTILES * BM * BK;
+    __half *shB = shA + 2u * A_TILE;
+    /* Raw Q2_K blocks for this workgroup's NFRAG * BN output rows, one 256-value
+     * K slab at a time. shC still aliases the A and B staging area, which the K
+     * loop has finished with by the time the epilogue runs, so the raw window
+     * sits beyond both and is never overwritten. */
+    constexpr uint32_t RAW_DWORDS = 84u / sizeof(uint32_t);
+    constexpr uint32_t RAW_ROWS = (uint32_t)(NFRAG * BN);
+    uint32_t *shW = reinterpret_cast<uint32_t *>(shB + (uint32_t)(NFRAG * BK * BN));
+    /* MTILES*BM*(BK/2) uint32 over 32*MTILES threads is BM*(BK/2)/32 each,
+     * independent of MTILES. */
+    constexpr uint32_t MID_PRE = (uint32_t)(BM * (BK / 2) / 32);
     float *shC = reinterpret_cast<float *>(raw_sh);
-    const uint32_t hot_idx = (uint32_t)blockIdx.z;
+    uint32_t hot_idx;
+    uint32_t m_group0;
+    if (tile_map) {
+        const uint32_t packed = tile_map[blockIdx.y];
+        hot_idx = packed >> 16u;
+        m_group0 = (packed & 0xffffu) * MTILES * BM;
+    } else {
+        hot_idx = (uint32_t)blockIdx.z;
+        m_group0 = (uint32_t)blockIdx.y * MTILES * BM;
+    }
     if (hot_idx >= hot_count) return;
     const uint32_t expert = hot_experts[hot_idx];
     const uint32_t count = counts[expert];
-    const uint32_t m_group0 = (uint32_t)blockIdx.y * MTILES * BM;
     if (m_group0 >= count) return;
     const uint32_t n0 = (uint32_t)blockIdx.x * (NFRAG * BN);
     const uint32_t tid = threadIdx.x;
@@ -3993,55 +4141,108 @@ __global__ static void moe_down_q2K_hotlist_wmma_wide_kernel(
     }
 
     const unsigned char *dew = (const unsigned char *)down_base + (uint64_t)expert * down_expert_bytes;
-    for (uint32_t k0 = 0; k0 < expert_mid_dim; k0 += BK) {
-        if (MID_F16) {
-            for (uint32_t j = tid; j < MTILES * BM * (BK / 2); j += blockDim.x) {
-                const uint32_t pair_row = j / (BK / 2);
-                const uint32_t kk2 = j - pair_row * (BK / 2);
-                const uint32_t pair = shPair[pair_row];
-                uint32_t v = 0u;
-                if (pair != UINT32_MAX) {
-                    const uint64_t moff = (uint64_t)pair * expert_mid_dim + k0 + kk2 * 2u;
-                    v = *reinterpret_cast<const uint32_t *>(mid_h + moff);
-                }
-                *reinterpret_cast<uint32_t *>(shA + pair_row * BK + kk2 * 2u) = v;
-            }
-        } else {
-            for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
-                const uint32_t mt = j / (BM * BK);
-                const uint32_t rem = j - mt * BM * BK;
-                const uint32_t mm = rem / BK;
-                const uint32_t kk = rem - mm * BK;
-                const uint32_t pair = shPair[mt * BM + mm];
-                if (pair != UINT32_MAX) {
-                    shA[j] = __float2half(mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
-                } else {
-                    shA[j] = __float2half(0.0f);
-                }
-            }
-        }
-        q2_K_dequant_wide_tile_half_rowwise<BN, BK, NFRAG>(
-                shB, dew, down_row_bytes, n0, k0, out_dim, tid);
-        __syncthreads();
-        if (wave < MTILES) {
-            rocwmma::load_matrix_sync(a, shA + wave * BM * BK, BK);
+
+    uint32_t pre[MID_PRE];
+    const auto fetch_mid = [&](uint32_t k0, uint32_t *dst) {
 #pragma unroll
-            for (int f = 0; f < NFRAG; f++) {
-                rocwmma::load_matrix_sync(b[f], shB + f * (BK * BN), BN);
-                rocwmma::mma_sync(acc[f], a, b[f], acc[f]);
+        for (uint32_t u = 0; u < MID_PRE; u++) {
+            const uint32_t j = tid + u * blockDim.x;
+            const uint32_t pair_row = j / (BK / 2);
+            const uint32_t kk2 = j - pair_row * (BK / 2);
+            const uint32_t pair = shPair[pair_row];
+            uint32_t v = 0u;
+            if (pair != UINT32_MAX) {
+                const uint64_t moff =
+                    (uint64_t)pair * expert_mid_dim + k0 + kk2 * 2u;
+                v = *reinterpret_cast<const uint32_t *>(mid_h + moff);
             }
+            dst[u] = v;
+        }
+    };
+    if (MID_F16) fetch_mid(0u, pre);
+    uint32_t abuf = 0u;
+    for (uint32_t kb = 0; kb < expert_mid_dim; kb += 256u) {
+        for (uint32_t j = tid; j < RAW_ROWS * RAW_DWORDS; j += blockDim.x) {
+            const uint32_t row_local = j / RAW_DWORDS;
+            const uint32_t word = j - row_local * RAW_DWORDS;
+            const uint32_t row = n0 + row_local;
+            uint32_t v = 0u;
+            if (row < out_dim) {
+                const unsigned char *blk = dew + (uint64_t)row * down_row_bytes +
+                                           (uint64_t)(kb >> 8u) * 84u;
+                v = *reinterpret_cast<const uint32_t *>(
+                        blk + word * sizeof(uint32_t));
+            }
+            shW[j] = v;
         }
         __syncthreads();
+
+        for (uint32_t krel = 0; krel < 256u && kb + krel < expert_mid_dim;
+             krel += BK) {
+            const uint32_t k0 = kb + krel;
+            uint32_t next[MID_PRE];
+            if (MID_F16) {
+#pragma unroll
+                for (uint32_t u = 0; u < MID_PRE; u++) {
+                    const uint32_t j = tid + u * blockDim.x;
+                    const uint32_t pair_row = j / (BK / 2);
+                    const uint32_t kk2 = j - pair_row * (BK / 2);
+                    *reinterpret_cast<uint32_t *>(
+                        shA + abuf * A_TILE + pair_row * BK + kk2 * 2u) = pre[u];
+                }
+                const uint32_t k_next = k0 + BK;
+                if (k_next < expert_mid_dim) fetch_mid(k_next, next);
+            } else {
+                for (uint32_t j = tid; j < MTILES * BM * BK; j += blockDim.x) {
+                    const uint32_t mt = j / (BM * BK);
+                    const uint32_t rem = j - mt * BM * BK;
+                    const uint32_t mm = rem / BK;
+                    const uint32_t kk = rem - mm * BK;
+                    const uint32_t pair = shPair[mt * BM + mm];
+                    if (pair != UINT32_MAX) {
+                        shA[abuf * A_TILE + j] = __float2half(
+                            mid[(uint64_t)pair * expert_mid_dim + k0 + kk]);
+                    } else {
+                        shA[abuf * A_TILE + j] = __float2half(0.0f);
+                    }
+                }
+            }
+            q2_K_dequant_wide_tile_half_rowwise_staged<BN, BK, NFRAG>(
+                    shB, shW, krel, tid);
+            __syncthreads();
+            if (wave < MTILES) {
+                rocwmma::load_matrix_sync(
+                    a, shA + abuf * A_TILE + wave * BM * BK, BK);
+#pragma unroll
+                for (int f = 0; f < NFRAG; f++) {
+                    rocwmma::load_matrix_sync(b[f], shB + f * (BK * BN), BN);
+                    rocwmma::mma_sync(acc[f], a, b[f], acc[f]);
+                }
+            }
+            if (MID_F16) {
+#pragma unroll
+                for (uint32_t u = 0; u < MID_PRE; u++) pre[u] = next[u];
+            }
+            abuf ^= 1u;
+            __syncthreads();
+        }
     }
 
     /* Page the accumulators out two fragments at a time so the C window stays
      * the same size the n2 kernel aliases. */
+    /* Page the accumulators out one fragment at a time.
+     *
+     * Two at a time needed `2 * MTILES * BM * BN` floats, which made the C
+     * window rather than the A/B staging the binding term and capped MTILES at
+     * four for eight resident workgroups per CU. One fragment halves that
+     * window, so MTILES can double without costing residency, and doubling the
+     * row tile halves how often each weight column block is dequantized. The
+     * epilogue writes the same values in the same order either way. */
 #pragma unroll
-    for (int base = 0; base < NFRAG; base += 2) {
+    for (int f = 0; f < NFRAG; f++) {
         __syncthreads();
         if (wave < MTILES) {
-            rocwmma::store_matrix_sync(shC + wave * BM * BN, acc[base], BN, rocwmma::mem_row_major);
-            rocwmma::store_matrix_sync(shC + (MTILES + wave) * BM * BN, acc[base + 1], BN, rocwmma::mem_row_major);
+            rocwmma::store_matrix_sync(shC + wave * BM * BN, acc[f], BN, rocwmma::mem_row_major);
         }
         __syncthreads();
         for (uint32_t j = tid; j < MTILES * BM * BN; j += blockDim.x) {
@@ -4053,16 +4254,13 @@ __global__ static void moe_down_q2K_hotlist_wmma_wide_kernel(
             if (pair == UINT32_MAX) continue;
             const uint32_t tok = pair / 6u;
             const uint32_t slot = pair - tok * 6u;
-#pragma unroll
-            for (int half_i = 0; half_i < 2; half_i++) {
-                const uint32_t row = n0 + (uint32_t)(base + half_i) * BN + nn;
-                if (row >= out_dim) continue;
-                const float v = shC[(uint32_t)half_i * (MTILES * BM * BN) + j];
-                uint64_t dst = (uint64_t)pair * out_dim + row;
-                if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row;
-                if (OUT_F16) down_out_h[dst] = __float2half(v);
-                else down_out[dst] = v;
-            }
+            const uint32_t row = n0 + (uint32_t)f * BN + nn;
+            if (row >= out_dim) continue;
+            const float v = shC[j];
+            uint64_t dst = (uint64_t)pair * out_dim + row;
+            if (SLOT_MAJOR) dst = ((uint64_t)slot * n_tokens + tok) * out_dim + row;
+            if (OUT_F16) down_out_h[dst] = __float2half(v);
+            else down_out[dst] = v;
         }
     }
 }
