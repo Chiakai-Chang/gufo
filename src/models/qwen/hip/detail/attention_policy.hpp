@@ -400,6 +400,53 @@ enum class KQuantPrefillTile : std::uint8_t {
          KQuantActivationSumMode::kReference;
 }
 
+// opt-c192-swiglu-epilogue: have the FFN up projection apply SwiGLU against the
+// already-written gate result and emit the tiled Q8_1 activation straight from
+// its accumulator, instead of storing 2048x17408 FP32 and having a separate
+// bandwidth-bound pass read it back.
+//
+// Bit-identical by construction, not by tolerance: the accumulator value is the
+// same float the FP32 store would have round-tripped, the gate is read from the
+// same buffer, `expf`/`roundf` and the per-32 scale are the same expressions,
+// and both the max and the code sum are reduced with order-independent
+// operators.
+//
+// It pays on a Q8_0 shard and not on a K-quant one. The saving is the same
+// 285 MB of FFN round trips per layer either way, but the cost -- the gate
+// panel read, which is exposed because an epilogue has no remaining compute to
+// hide memory latency behind -- is also the same, and the K-quant up projection
+// is already the slower kernel with the tighter register budget. Interleaved
+// medians, three pairs each, all pairs agreeing in sign: UD-Q8_K_XL `pp2048`
+// 544.83 -> 552.66 (**+1.44%**) and `pp512` 549.02 -> 551.86 (+0.52%);
+// UD-Q4_K_XL `pp2048` 466.12 -> 462.10 (-0.86%) and `pp512` 461.24 -> 456.69
+// (-0.90%). So the default is Q8_0 only.
+//
+// `GUFO_FFN_SWIGLU_EPILOGUE=0` pins the separate pass as the independent
+// reference; `=all` re-enables the K-quant instantiations so the rejection can
+// be re-measured in the same binary.
+enum class FusedSwiGluEpilogue : std::uint8_t {
+  kOff,
+  kQ8Only,
+  kAll,
+};
+
+[[nodiscard]] inline FusedSwiGluEpilogue FusedSwiGluEpilogueFromEnv() noexcept {
+  static const FusedSwiGluEpilogue mode = [] {
+    const char* value = std::getenv("GUFO_FFN_SWIGLU_EPILOGUE");
+    if (value == nullptr) {
+      return FusedSwiGluEpilogue::kQ8Only;
+    }
+    const std::string_view text{value};
+    if (text == "all" || text == "kquant") {
+      return FusedSwiGluEpilogue::kAll;
+    }
+    return (text == "0" || text == "false" || text == "off")
+               ? FusedSwiGluEpilogue::kOff
+               : FusedSwiGluEpilogue::kQ8Only;
+  }();
+  return mode;
+}
+
 [[nodiscard]] constexpr std::uint32_t SelectDecodeAttentionSplitCount(
     std::size_t sequence_length) noexcept {
   if (sequence_length < kSplitKDecodeAttentionMinContext) {

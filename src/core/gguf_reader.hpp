@@ -220,6 +220,13 @@ public:
   [[nodiscard]] std::optional<ModelConfig> ExtractModelConfig(
       std::string* error_msg = nullptr) const;
 
+  /// Names the weight format this file was produced in, for benchmark and
+  /// diagnostic output. Prefers the `general.file_type` the quantizer recorded
+  /// (llama.cpp's ftype, so the label matches `llama-bench` on the same
+  /// artifact) and otherwise falls back to whichever tensor type holds the most
+  /// bytes. Never empty.
+  [[nodiscard]] std::string GetQuantizationLabel() const;
+
   /// Inspects presence of MTP speculative tensors
   [[nodiscard]] bool HasMtpTensors() const noexcept;
 

@@ -418,6 +418,121 @@ __global__ void BatchedFusedSwiGLUQuantizeQ8_1Kernel(
                                      q);
 }
 
+// opt-c192-swiglu-epilogue: SwiGLU + tiled Q8_1 quantization straight out of a
+// blocked GEMM's accumulator.
+//
+// The FFN up projection's only consumer is SwiGLU, whose only consumer is the
+// Q8_1 activation ffn_down reads. Writing the FP32 intermediate therefore costs
+// 143 MB of stores per layer at batch 2048 and another 143 MB of loads in a
+// separate bandwidth-bound pass, to reproduce a value the GEMM already had in a
+// register.
+//
+// Two shape facts make the fused form possible without any cross-wave traffic:
+//
+//   * A wave's two row subtiles are rows [32*wave_row, 32*wave_row+32) of the
+//     macro tile, which is exactly one 32-element quantization block of the
+//     *next* GEMM's K dimension. So one wave owns every value a block scale
+//     depends on.
+//   * Staging both subtiles through the wave's LDS slot puts one token's
+//     sixteen rows in sixteen consecutive lanes, so the gate load is one
+//     64-byte segment, the code stores are one 16-byte segment, and the max
+//     reduction is four `__shfl_xor` inside a half-wave.
+//
+// Bit-identical to LaunchBatchedFusedSwiGLUQuantizeQ8_1 over the same inputs:
+// `acc` is the float the FP32 store would have round-tripped exactly, `gate`
+// comes from the same buffer, and `fmaxf` and integer addition are
+// order-independent so the changed reduction shape cannot move a result.
+template<int TokTiles, bool StoreActivationSum>
+__device__ __forceinline__ void BlockedSwiGluQuantEpilogue(
+    const float (*acc_lo)[8], const float (*acc_hi)[8], float* scratch_lo,
+    float* scratch_hi, const float* __restrict__ gate,
+    void* __restrict__ q8_out, std::size_t batch, std::size_t m,
+    std::size_t r_base, std::size_t t_base, int lane_id) {
+  const int sub_lane = lane_id & 15;
+  const int half_id = lane_id >> 4;
+  const std::size_t num_blocks = m / 32;
+  const std::size_t blk = r_base / 32;
+#pragma unroll
+  for (int j = 0; j < TokTiles; ++j) {
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+      scratch_lo[(sub_lane * 16) + (2 * l) + half_id] = acc_lo[j][l];
+      scratch_hi[(sub_lane * 16) + (2 * l) + half_id] = acc_hi[j][l];
+    }
+    __builtin_amdgcn_wave_barrier();
+    const std::size_t t0 = t_base + static_cast<std::size_t>(j * 16);
+    std::int8_t* tile =
+        Q8ActTile(q8_out, num_blocks, t0 / kQ8ActTileTokens, blk);
+    // Every gate load for this tile is issued before any of the dependent math.
+    // This epilogue runs after the K loop, so unlike the GEMM body there is no
+    // other work left to hide memory latency behind: one load per step would
+    // serialize sixteen round trips per tile, which measured as most of the
+    // epilogue's cost. Sixteen floats per lane is sixteen registers, and the
+    // block's whole gate panel (64 KiB) is far too large to stage instead.
+    // A token past the batch contributes nothing and must not read `gate` out
+    // of bounds; its tile slot is zeroed by ZeroQ8ActTailKernel, exactly as on
+    // the separate-pass route.
+    float g_lo[8];
+    float g_hi[8];
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      const int flat = (s * 32) + lane_id;
+      const std::size_t tok = t0 + static_cast<std::size_t>(flat >> 4);
+      const std::size_t row_base =
+          (tok * m) + r_base + static_cast<std::size_t>(flat & 15);
+      const bool live = tok < batch;
+      g_lo[s] = live ? gate[row_base] : 0.0F;
+      g_hi[s] = live ? gate[row_base + 16] : 0.0F;
+    }
+#pragma unroll
+    for (int s = 0; s < 8; ++s) {
+      const int flat = (s * 32) + lane_id;
+      const int tl = flat >> 4;
+      const int row = flat & 15;
+      const std::size_t tok = t0 + static_cast<std::size_t>(tl);
+      const bool live = tok < batch;
+      float v_lo = 0.0F;
+      float v_hi = 0.0F;
+      if (live) {
+        v_lo = (g_lo[s] / (1.0F + expf(-g_lo[s]))) * scratch_lo[flat];
+        v_hi = (g_hi[s] / (1.0F + expf(-g_hi[s]))) * scratch_hi[flat];
+      }
+      float max_abs = fmaxf(fabsf(v_lo), fabsf(v_hi));
+#pragma unroll
+      for (int off = 8; off > 0; off >>= 1) {
+        max_abs = fmaxf(max_abs, __shfl_xor(max_abs, off, 16));
+      }
+      const float d = max_abs / 127.0F;
+      const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
+      const auto q_lo = static_cast<std::int8_t>(roundf(v_lo * id));
+      const auto q_hi = static_cast<std::int8_t>(roundf(v_hi * id));
+      if (live) {
+        tile[(tl * 16) + row] = q_lo;
+        tile[256 + (tl * 16) + row] = q_hi;
+        if (row == 0) {
+          *reinterpret_cast<float*>(
+              tile + kQ8ActScaleOffset +
+              (static_cast<std::size_t>(tl) * sizeof(float))) = d;
+        }
+      }
+      if constexpr (StoreActivationSum) {
+        int qsum = static_cast<int>(q_lo) + static_cast<int>(q_hi);
+#pragma unroll
+        for (int off = 8; off > 0; off >>= 1) {
+          qsum += __shfl_xor(qsum, off, 16);
+        }
+        if (live && row == 0) {
+          float* sums = Q8ActSumSidecar(q8_out, batch, m);
+          sums[(((t0 / kQ8ActTileTokens * num_blocks) + blk) *
+                kQ8ActTileTokens) +
+               static_cast<std::size_t>(tl)] = d * static_cast<float>(qsum);
+        }
+      }
+    }
+    __builtin_amdgcn_wave_barrier();
+  }
+}
+
 template<bool SubOpsel>
 __device__ __forceinline__ int32x8_t Wmma_16x16x16_iu8(int32x4_t a, int32x4_t b,
                                                        int32x8_t c) {
@@ -447,12 +562,13 @@ __device__ __forceinline__ int32x8_t Wmma_16x16x16_iu8(int32x4_t a, int32x4_t b,
 // second copy of the model is needed; activations arrive in the tiled layout
 // the quantize kernel emits. Accumulation order over K blocks is unchanged from
 // the 16-row kernel, so results are bit-identical.
-template<int BM, int BN, int BK, int WM, int WN>
-__launch_bounds__(256) __global__
-    void W8A8BlockedWmmaGEMMKernel(const void* __restrict__ w,
-                                   const void* __restrict__ x_blocks,
-                                   float* __restrict__ y, std::size_t batch,
-                                   std::size_t m, std::size_t k) {
+template<int BM, int BN, int BK, int WM, int WN, bool FusedSwiGluQuant = false,
+         bool StoreActivationSum = false>
+__launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
+    const void* __restrict__ w, const void* __restrict__ x_blocks,
+    float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
+    const float* __restrict__ swiglu_gate = nullptr,
+    void* __restrict__ q8_out = nullptr) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(BN / 16 <= 8,
@@ -643,6 +759,28 @@ __launch_bounds__(256) __global__
   // Transpose each 16x16 result tile through LDS so the global stores cover 16
   // consecutive rows of one token instead of 16 separate cache lines.
   __syncthreads();
+  if constexpr (FusedSwiGluQuant) {
+    // The fused epilogue owns two 256-float slots per wave and never touches
+    // `y`, so it takes the whole of both staging arrays. The conditions are
+    // written against the flag because clang checks a static_assert in a
+    // discarded `if constexpr` branch once the enclosing template is
+    // instantiated, and the narrow tiles do not satisfy them.
+    static_assert(!FusedSwiGluQuant || kWaveRowTiles == 2,
+                  "the fused SwiGLU epilogue needs a wave to own one whole "
+                  "32-element quantization block");
+    static_assert(
+        !FusedSwiGluQuant || (sizeof(s_a) >= WM * WN * 256 * sizeof(float) &&
+                              sizeof(s_b) >= WM * WN * 256 * sizeof(float)),
+        "the fused epilogue stages two output tiles per wave");
+    BlockedSwiGluQuantEpilogue<kWaveTokTiles, StoreActivationSum>(
+        acc[0], acc[1],
+        reinterpret_cast<float*>(&s_a[0][0][0]) + (wave_id * 256),
+        reinterpret_cast<float*>(&s_b[0][0][0]) + (wave_id * 256), swiglu_gate,
+        q8_out, batch, m, r_block + static_cast<std::size_t>(wave_row * 32),
+        t_block + static_cast<std::size_t>(wave_tok * kWaveTokTiles * 16),
+        lane_id);
+    return;
+  }
   float* tile_scratch =
       reinterpret_cast<float*>(&s_a[0][0][0]) + (wave_id * 256);
 #pragma unroll
@@ -735,16 +873,16 @@ __launch_bounds__(256) __global__
 template<int BM, int BN, int BK, int WM, int WN, core::GgmlType WType,
          bool UsePrecomputedSums, bool StagePrecomputedSums,
          bool ForceOccupancy = false, bool DropOffsetProbe = false,
-         bool FuseOffsetTerm = false>
+         bool FuseOffsetTerm = false, bool FusedSwiGluQuant = false>
 // `ForceOccupancy` asks the allocator for eight wave32s per SIMD instead of
 // letting it settle. It exists only so the 512-thread tile can be measured at
 // two workgroups per CU as well as one; see the opt-q4kxl-wide write-up.
 __launch_bounds__(WM * WN * 32, ForceOccupancy ? 8 : 1) __global__
-    void WKQuantA8BlockedWmmaGEMMKernel(const void* __restrict__ w,
-                                        const void* __restrict__ x_blocks,
-                                        float* __restrict__ y,
-                                        std::size_t batch, std::size_t m,
-                                        std::size_t k) {
+    void WKQuantA8BlockedWmmaGEMMKernel(
+        const void* __restrict__ w, const void* __restrict__ x_blocks,
+        float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
+        const float* __restrict__ swiglu_gate = nullptr,
+        void* __restrict__ q8_out = nullptr) {
   // Q6_K and Q3_K carry one scale per sixteen elements; Q4_K and Q5_K carry an
   // explicit minimum. The two properties never co-occur.
   constexpr bool PerHalfScale =
@@ -1124,6 +1262,23 @@ __launch_bounds__(WM * WN * 32, ForceOccupancy ? 8 : 1) __global__
   }
 
   __syncthreads();
+  if constexpr (FusedSwiGluQuant) {
+    static_assert(!FusedSwiGluQuant || kWaveRowTiles == 2,
+                  "the fused SwiGLU epilogue needs a wave to own one whole "
+                  "32-element quantization block");
+    static_assert(
+        !FusedSwiGluQuant || (sizeof(s_a) >= kWaves * 256 * sizeof(float) &&
+                              sizeof(s_b) >= kWaves * 256 * sizeof(float)),
+        "the fused epilogue stages two output tiles per wave");
+    BlockedSwiGluQuantEpilogue<kWaveTokTiles, UsePrecomputedSums>(
+        acc[0], acc[1],
+        reinterpret_cast<float*>(&s_a[0][0][0]) + (wave_id * 256),
+        reinterpret_cast<float*>(&s_b[0][0][0]) + (wave_id * 256), swiglu_gate,
+        q8_out, batch, m, r_block + static_cast<std::size_t>(wave_row * 32),
+        t_block + static_cast<std::size_t>(wave_tok * kWaveTokTiles * 16),
+        lane_id);
+    return;
+  }
   // Each wave stages its 16x16 output tile through 256 floats of LDS. `s_a` is
   // BK*kRowTiles*512 bytes, which is exactly kWaves*1024 at 256 threads; the
   // 512-thread shape needs 16 KB, which is what `s_b` is at BK=2 with BN=256.
@@ -2329,6 +2484,131 @@ void LaunchBatchedDualQuantGEMMPreQuantized(
                                      stream);
   LaunchBatchedQuantGEMMPreQuantized(type, w_up, q8_1_x, y_up, batch, m, k,
                                      stream);
+}
+
+namespace {
+
+/// Dispatches the fused-epilogue instantiation of whichever blocked prefill
+/// kernel `type` uses. The row-block base has to be a whole 32-element
+/// quantization block for every block in the grid, which is what pins BM here.
+template<int BN>
+void LaunchFusedSwiGluTile(core::GgmlType type, const void* w_up,
+                           const void* q8_1_x, const float* gate,
+                           void* q8_1_out, std::size_t batch, std::size_t m,
+                           std::size_t k, hipStream_t stream) {
+  constexpr int kBM = 128;
+  const dim3 grid(static_cast<unsigned int>((batch + BN - 1) / BN),
+                  static_cast<unsigned int>(m / kBM));
+  const bool sums = detail::ShouldStoreKQuantActivationSums();
+  if (type == core::GgmlType::kQ8_0) {
+    if (sums) {
+      W8A8BlockedWmmaGEMMKernel<kBM, BN, 2, 4, 2, true, true>
+          <<<grid, 256, 0, stream>>>(w_up, q8_1_x, nullptr, batch, m, k, gate,
+                                     q8_1_out);
+    } else {
+      W8A8BlockedWmmaGEMMKernel<kBM, BN, 2, 4, 2, true, false>
+          <<<grid, 256, 0, stream>>>(w_up, q8_1_x, nullptr, batch, m, k, gate,
+                                     q8_1_out);
+    }
+    return;
+  }
+  // The K-quant kernel's sidecar flag is the same bit: `UsePrecomputedSums` is
+  // true exactly when the sidecar exists, so the epilogue that writes it and
+  // the fetch that reads it can never disagree.
+  const auto launch = [&]<core::GgmlType WType>() {
+    if (sums) {
+      WKQuantA8BlockedWmmaGEMMKernel<kBM, BN, 2, 4, 2, WType, true, true, false,
+                                     false, false, true>
+          <<<grid, 256, 0, stream>>>(w_up, q8_1_x, nullptr, batch, m, k, gate,
+                                     q8_1_out);
+    } else {
+      WKQuantA8BlockedWmmaGEMMKernel<kBM, BN, 2, 4, 2, WType, false, false,
+                                     false, false, false, true>
+          <<<grid, 256, 0, stream>>>(w_up, q8_1_x, nullptr, batch, m, k, gate,
+                                     q8_1_out);
+    }
+  };
+  switch (type) {
+    case core::GgmlType::kQ4_K:
+      launch.template operator()<core::GgmlType::kQ4_K>();
+      return;
+    case core::GgmlType::kQ5_K:
+      launch.template operator()<core::GgmlType::kQ5_K>();
+      return;
+    case core::GgmlType::kQ6_K:
+      launch.template operator()<core::GgmlType::kQ6_K>();
+      return;
+    case core::GgmlType::kQ3_K:
+      launch.template operator()<core::GgmlType::kQ3_K>();
+      return;
+    case core::GgmlType::kIQ4_NL:
+      launch.template operator()<core::GgmlType::kIQ4_NL>();
+      return;
+    case core::GgmlType::kIQ4_XS:
+      launch.template operator()<core::GgmlType::kIQ4_XS>();
+      return;
+    case core::GgmlType::kIQ3_S:
+      launch.template operator()<core::GgmlType::kIQ3_S>();
+      return;
+    default:
+      return;
+  }
+}
+
+}  // namespace
+
+bool IsFusedSwiGluGemmEpilogueSupported(core::GgmlType type, std::size_t batch,
+                                        std::size_t m,
+                                        std::size_t q8_out_bytes) noexcept {
+  const auto mode = detail::FusedSwiGluEpilogueFromEnv();
+  if (mode == detail::FusedSwiGluEpilogue::kOff) {
+    return false;
+  }
+  // Only the large-batch blocked route has the 128-row macro tile the
+  // epilogue's "one wave owns one whole quantization block" argument depends
+  // on, and only an m that the tile divides keeps every block's rows inside the
+  // matrix.
+  if (batch < 96 || m == 0 || (m % 128) != 0) {
+    return false;
+  }
+  // The fused instantiation carries the retained staged activation-sum fetch
+  // and the retained 128x128 macro tile: the epilogue needs two 256-float slots
+  // per wave, which only the two 8 KiB staging arrays of that tile cover.
+  // Rather than duplicate every K-quant instantiation for the alternative pins,
+  // hand them the unfused chain so an A/B against them still measures the tile
+  // or the sum route on its own.
+  if (detail::KQuantPrefillTileFromEnv() !=
+          detail::KQuantPrefillTile::kDefault ||
+      detail::KQuantActivationSumModeFromEnv() ==
+          detail::KQuantActivationSumMode::kDirect) {
+    return false;
+  }
+  if (Q8ActTiledBytes(batch, m) + Q8ActSumBytes(batch, m) > q8_out_bytes) {
+    return false;
+  }
+  if (type == core::GgmlType::kQ8_0) {
+    return true;
+  }
+  return mode == detail::FusedSwiGluEpilogue::kAll &&
+         detail::IsNativeWmmaQuant(type);
+}
+
+void LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
+    core::GgmlType type, const void* w_gate, const void* w_up,
+    const void* q8_1_x, float* y_gate, void* q8_1_out, std::size_t batch,
+    std::size_t m, std::size_t k, hipStream_t stream) {
+  if (m == 0 || k == 0 || batch == 0) {
+    return;
+  }
+  LaunchBatchedQuantGEMMPreQuantized(type, w_gate, q8_1_x, y_gate, batch, m, k,
+                                     stream);
+  LaunchFusedSwiGluTile<128>(type, w_up, q8_1_x, y_gate, q8_1_out, batch, m, k,
+                             stream);
+  if (detail::ShouldStoreKQuantActivationSums()) {
+    LaunchZeroQ8ActTail<true>(q8_1_out, batch, m, stream);
+  } else {
+    LaunchZeroQ8ActTail<false>(q8_1_out, batch, m, stream);
+  }
 }
 
 void LaunchBatchedQuantGEMM(core::GgmlType type, const void* w,

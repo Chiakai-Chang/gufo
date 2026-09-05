@@ -453,15 +453,19 @@ Measured on this host in matched, interleaved sessions:
 | --- | ---: | ---: | ---: |
 | Target artifact size | 26.12 GiB | 16.35 GiB | **0.63x (-37.4%)** |
 | DFlash2 companion size | 3.85 GB (Q8_0) | 1.14 GB (Q4_K_M) | **0.30x (-70.4%)** |
-| `pp2048` | 505.8 t/s | 460.2 t/s | 0.91x (-9.0%) |
+| `pp2048` | 557.3 t/s | 474.0 t/s | 0.85x (-14.9%) |
 | `tg128` (no draft) | 6.89 t/s | 11.59 t/s | **1.68x (+68.2%)** |
 | `tg128-dflash2` | 19.4-27.3 t/s | 18.2-18.4 t/s | 0.67-0.94x |
 | Validation top-1, 1024 tokens | 198 | 198 | Match |
 | Validation RMSE, 1024 tokens | 0.02007260 | 0.09512630 | 4.74x higher |
 | Validation cosine, 1024 tokens | 0.99997753 | 0.99946874 | -0.00050879 |
 
-pp2048 and tg128 are medians of five interleaved repetitions at host load
-below 1.5; the spread within each column is under 1%. The dflash2 row is
+The `pp2048` row was re-measured on an idle host after `opt-c192` (medians of
+three interleaved repetitions each). The 505.8 / 460.2 pair it replaces was taken
+at host load 1.25-1.77, which cost the Q8 column about 8% and is worth
+remembering the next time a number looks like a regression: see "Q8 prefill
+across the Q4 support work" below. tg128 is still the earlier five-repetition
+median. The dflash2 row is
 reported as a range on purpose: the Q4 target is remarkably stable across every
 run (18.2-18.4 over more than a dozen samples) while the Q8 target ranges
 14.8-27.5. Speculative throughput depends on how many drafted tokens a
@@ -489,6 +493,67 @@ localizes the whole gap to the GEMMs: FFN 2838 ms vs 2603, input projection
 The single largest decode win came from routing Q5_K and Q6_K -- 55% of the
 shard -- off the pre-existing per-element `Q5KValue`/`Q6KValue` path and onto
 the word-wide sub-block decoder: tg128 8.24 -> 11.63 in one change.
+
+### Q8 prefill across the Q4 support work
+
+The Q8 numbers recorded during `opt-q4kxl` (`pp2048` 497-507) sit well below the
+545-558 recorded before it, which reads like a regression introduced by adding
+the Q4 route. It is not one. Measured by building both revisions and alternating
+them in one session -- `36491c2`, the last commit before the Q4 work, against
+`bdec37d` -- on the UD-Q8_K_XL artifact, two interleaved rounds with the *base*
+arm first (the cooler slot) each round:
+
+| test | `36491c2` (pre-Q4) | `bdec37d` (main) |
+| --- | ---: | ---: |
+| `pp512` | 550.29 / 547.63 | 547.83 / 546.56 |
+| `pp2048` | 554.42 / 546.74 | 545.22 / 544.48 |
+
+That is -0.3% and -1.0% of median, inside the +/-3.5 t/s band this page's own
+measurement rule warns about, and the very first (coldest) run of the session was
+main at `pp2048` 557.25. The 497-507 figures were taken at host load 1.25-1.77.
+
+The structural reason there is no coupling: **UD-Q8_K_XL contains no K-quant at
+all.** By bytes it is Q8_0 26,293 MB (84%), BF16 5,143 MB (16%), F32 11 MB. Every
+`opt-q4kxl` gate that widened from `type == kQ8_0` to "reads the tiled Q8_1
+activation" therefore evaluates identically on this shard, and the loader's
+`native_kquant` decision -- which `9008a5e` flipped to always-on so the
+speculative verifier reproduces decode -- has no Q5_K/Q6_K/Q8_K tensor to act on.
+The two targets share the routing decisions but not a single kernel instantiation
+on the prefill path.
+
+### Where Q8 prefill time actually goes
+
+Per prefill pass at batch 2048, from `tools/prof/prof.py` with the per-shape
+rollup (the profile also contains one decode pass; the single-token-block
+dispatches are subtracted). Achieved rate is against the 55.07 TOPS/TFLOPS WMMA
+ceiling, which is the same for INT8 and BF16 on this part:
+
+| GEMM | m | k | calls/pass | mean | achieved | % of peak |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `ffn_gate`, `ffn_up` (Q8_0) | 17408 | 5120 | 128 | 11.53 ms | 31.7 TOPS | 58% |
+| `ffn_down` (Q8_0) | 5120 | 17408 | 64 | ~11.5 ms | ~31.7 TOPS | 58% |
+| `ssm_qkv` (Q8_0) | 10240 | 5120 | 48 | 6.63 ms | 32.4 TOPS | 59% |
+| `ssm_gate` (Q8_0) | 6144 | 5120 | 48 | 4.16 ms | 30.9 TOPS | 56% |
+| `attn_output` / `ssm_out` (Q8_0) | 5120 | 5120 | 64 | ~3.9 ms | ~27.5 TOPS | 50% |
+| **`attn_q` (BF16, hipBLASLt)** | **12288** | **5120** | **16** | **11.36 ms** | **22.7 TFLOPS** | **41%** |
+| `attn_k`, `attn_v` (BF16, hipBLASLt) | 1024 | 5120 | 32 | 0.86 ms | 24.9 TFLOPS | 45% |
+
+`attn_q` is the one shape not at the blocked kernel's plateau. It is 4.9% of a
+prefill pass at 41% of peak, so moving it to a hand-written blocked BF16 tile at
+the W8A8 kernel's 58% is worth about 1.4% of prefill, and requantizing the BF16
+attention projections to Q8_0 at load would be worth about 2% counting the norm
+fusion it unlocks -- but that is a precision change on the tensors Unsloth
+deliberately left at BF16, so it needs a quality decision rather than a
+measurement. This supersedes the 48-57% figure the `opt-c172-bf16-gemm-ceiling`
+entry assumed.
+
+For the ceiling: `pp2048` cannot exceed 1338 t/s on this part, and the blocked
+W8A8 GEMM is 80-82% of a pass at 56-59% of the WMMA ceiling. **600 t/s needs that
+kernel at about 68% of peak.** The `-epi` ablation, which deletes the whole
+epilogue and is therefore an upper bound on any exact reformulation of it,
+reaches 64%. So 600 is not reachable by epilogue work; it needs either a
+different instruction mix in the WMMA loop or the coarser activation scale
+(`opt-c163-coarse-dx`), which is a real precision change.
 
 ### DFlash-2 with the Q4_K_M companion
 
@@ -1819,6 +1884,9 @@ same effect at ambient scale.
 
 | ID | Experiment | Result | Status |
 | :--- | :--- | :--- | :--- |
+| `opt-c192-swiglu-epilogue` | Collapse the FFN gate -> up -> SwiGLU -> quantize chain into the two projections. The up projection's only consumer is SwiGLU and SwiGLU's only consumer is the Q8_1 activation `ffn_down` reads, so the FP32 [2048, 17408] intermediate exists only to be written and read straight back. Two shape facts make the fused form free of cross-wave traffic: a wave's two row subtiles are exactly one 32-element quantization block of the *next* GEMM's K dimension, so one wave owns every value a block scale depends on; and staging both subtiles through the wave's LDS slot puts one token's sixteen rows in sixteen consecutive lanes, so the gate load is one 64-byte segment and the max reduction is four `__shfl_xor` inside a half-wave | 285 MB of FFN round trips per layer removed and the `ffn: swiglu` stage goes 208.68 -> 1.49 ms across the profile. Bit-identical, not merely close: `acc` is the float the FP32 store would have round-tripped exactly, and `fmaxf` and integer addition are order-independent, so `qwen_prefill_quant_gemm_ops_test` compares whole Q8_1 buffers -- payload, per-block scales, activation-sum sidecar and tail-tile zeroing -- and requires zero differing bytes; the 1024-token prefill envelope is unchanged at RMSE/cosine `0.11256284`/`0.99925625`. Interleaved medians, three pairs, all pairs agreeing in sign and the *unfused* arm always in the cooler first slot: `pp2048` 547.10 -> **557.33 (+1.87%)**, `pp512` 550.57 -> 555.91 (+0.97%). An earlier three-pair round on the same code agreed at +1.44% / +0.52%, so the effect is larger than the run-to-run spread it is measured against. Costs one VGPR (180 -> 181), no LDS and no scratch. **The gate load has to be hoisted**: the epilogue runs after the K loop, so unlike the GEMM body it has no remaining compute to hide memory latency behind, and one load per store step serialized sixteen round trips per token tile -- issuing all sixteen up front is what took the epilogue from 730 to ~250 us per call | **Retained** for Q8_0 |
+| `opt-c192-swiglu-epilogue-kquant` | The same epilogue on the K-quant blocked kernel, i.e. on the UD-Q4_K_XL shard | **Rejected**, and it is the mirror image of why Q4 loses every batched regime. The saving is the identical 285 MB per layer, but so is the cost -- the exposed gate panel read -- while the K-quant up projection is the slower kernel with the tighter register budget (208 against 181 VGPR, LDS-limited to 6 waves/SIMD either way). Interleaved medians, three pairs, all three negative: `pp2048` 466.12 -> 462.10 (-0.86%), `pp512` 461.24 -> 456.69 (-0.90%). Kept reachable with `GUFO_FFN_SWIGLU_EPILOGUE=all` so the rejection is re-measurable in the same binary | **Rejected**; Q8_0 only by default |
+| `opt-c192-q8-tile` | Buy the Q8_0 prefill GEMM a fourth resident workgroup. Its 128x128 tile needs 18,432 bytes of LDS against the 16,384 four workgroups per WGP would allow, while its 180-VGPR allocation would permit eight wave32s per SIMD -- so LDS, not registers, is what holds it at seven. 128x96 is the only shape that fits (LDS 16,128) and keeps the fetch's `BM*BK` a multiple of the block size | **Rejected on the resource dump alone, before measuring**: the allocator answers 128x96 with **256 VGPR and 152 bytes of scratch per lane**, the same spill the `opt-q4kxl-wide` forced-occupancy variant hit, because `kTokTiles = 6` breaks the strength reduction the power-of-two tile gets. It also read past the staged activation buffer -- 22 token blocks of 96 reach tile 131 of 128 -- which the Q8_0 kernel, unlike the K-quant one, does not clamp. Removed rather than left behind a toggle. The lever that remains for this kernel is instruction mix, not residency, which is what `opt-q4kxl-bk1` already showed from the other side: 8 waves/SIMD against 6 and **-24%** | **Rejected**, removed |
 | `opt-c191-ssm-rows` | Chase the same launch-bound suspicion into the verifier's recurrent stage. A width-8 verification chunk issued `2 x 8` dispatches per SSM layer -- `SSMConvKernel` and `DeltaNetRecurrenceKernel` once per row -- so 768 of a chunk's ~1150 dispatches came from 48 SSM layers. Each kernel is row-separable by construction: the conv gives every thread sole ownership of one channel's four state slots, and the recurrence gives every block sole ownership of one head's state matrix, so walking rows *inside* the kernel performs the same updates in the same order | The stage fell from **46.17 to 7.76 ms** per chunk, and the whole chunk from 231.7 to **144.1 ms** -- every other stage dropped too (FFN 108.7 -> 85.3, attention 14.9 -> 4.78, projections 48.3 -> 34.8), because the chunk was globally launch-queue bound and not merely slow in the SSM stage. Unperturbed, a verification chunk is now **151.7 ms against a 143 ms autoregressive token, 1.06x**. Bit-exact by construction and asserted: the AR prefill envelope is byte-identical at RMSE/cosine 0.11256284/0.99925625, AR `tg32` is unchanged, and per-prompt acceptance is identical. `rows = 1` keeps single-token decode and multi-session batched decode on the original path | **Retained** |
 | `opt-c191-fixed-width` | Re-ask which draft-length controller is right, because the adaptive ones exist to protect a verifier whose cost grew steeply with width -- exactly the premise `opt-c190` removed | The controllers are now **harmful**, and acceptance *rate* is inversely correlated with throughput. Quick suite at 128 tokens: fixed 7 **20.40 tok/s / 2.91x** at 45.3% acceptance, rolling 19.52 / 2.79x at 54.7%, accepted-EMA 19.52 -> 18.72 / 2.67x at 64.8%. EMA has the best acceptance and the worst throughput because what pays is accepted tokens per step (fixed 4.17, rolling 3.79, EMA 3.62), not the ratio. `rolling 3-7` is identical to `rolling 1-7`, so the floor never binds. Critically, fixed 7 is now **3/3 exact on the 300-token stress suite** that previously rejected it at 1/3 -- that divergence was a verifier bug closed by `5dea0df`, not a property of the width -- and it wins there too, 20.00 vs 18.79 tok/s | **Retained**; `--draft-policy auto` resolves to fixed for DFlash-2 and keeps rolling elsewhere |
 | `opt-c191-q8-draft-head` | Retry the draft-private Q8_0 LM head that `opt-c190-q8-draft-head` rejected. That rejection was measured while the pipeline was launch-starved, so the draft's saving was being spent on contention rather than showing up | Now a clear win: draft head stage 13.48 -> **5.96 ms** per block, draft block total 27.1 -> **18.8 ms**, and end to end **20.41 -> 21.22 tok/s (2.91x -> 3.03x)** on the quick suite with acceptance bit-identical, since the top-16 candidate set is insensitive to Q8_0 on this head. The verifier keeps the target's BF16 head, so no emitted token can change. Costs 1.35 GiB resident | **Retained**, replacing the earlier rejection -- a reminder that a change measured under a different bottleneck has to be re-measured once that bottleneck moves |

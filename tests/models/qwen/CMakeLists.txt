@@ -180,7 +180,16 @@ if (ENGINE_ENABLE_HIP)
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemv;q8;opt-c162-q8k-model;opt-c206-q8-small-batch")
   add_qwen_hip_test(qwen_prefill_quant_gemm_ops_test
     tests/models/qwen/hip/quant/prefill_quant_gemm_ops_test.cpp
-    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;prefill;q8;opt-c163-blocked-w8a8")
+    "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;prefill;q8;opt-c163-blocked-w8a8;opt-c192-swiglu-epilogue")
+  # opt-c192-swiglu-epilogue: the fused epilogue is bit-identical to the separate
+  # SwiGLU pass, so the same byte comparison has to hold with the K-quant
+  # instantiations forced on, where the route is rejected only on speed.
+  add_test(NAME qwen_prefill_quant_gemm_swiglu_kquant_ops_test
+    COMMAND qwen_prefill_quant_gemm_ops_test)
+  set_tests_properties(qwen_prefill_quant_gemm_swiglu_kquant_ops_test PROPERTIES
+    LABELS "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemm;prefill;k-quant;opt-c192-swiglu-epilogue"
+    ENVIRONMENT "GUFO_FFN_SWIGLU_EPILOGUE=all"
+    SKIP_RETURN_CODE 77)
   add_qwen_hip_test(qwen_q4kxl_quant_ops_test
     tests/models/qwen/hip/quant/q4kxl_quant_ops_test.cpp
     "hip;gpu;kernels;qwen;qwen-kernel-oracle;slow;quant;gemv;gemm;k-quant;iquant;opt-q4kxl")

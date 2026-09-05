@@ -261,6 +261,26 @@ void LaunchBatchedDualQuantGEMMPreQuantized(
     const void* q8_1_x, float* y_gate, float* y_up, std::size_t batch,
     std::size_t m, std::size_t k, hipStream_t stream = nullptr);
 
+/// True when LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1 can replace the
+/// gate/up GEMM pair plus the separate SwiGLU-quantize pass
+/// (opt-c192-swiglu-epilogue). `q8_out_bytes` is the capacity of the buffer the
+/// fused epilogue will write the [batch, m] Q8_1 activation into; a caller that
+/// reuses a differently shaped scratch has to pass its real size.
+[[nodiscard]] bool IsFusedSwiGluGemmEpilogueSupported(
+    core::GgmlType type, std::size_t batch, std::size_t m,
+    std::size_t q8_out_bytes) noexcept;
+
+/// Computes Y_gate[B, M] = X_q8_1[B, K] * W_gate[M, K]^T and then, in the up
+/// projection's own epilogue, the tiled Q8_1 encoding of
+/// SiLU(Y_gate) * (X_q8_1 * W_up^T) -- so the FP32 [B, M] up intermediate is
+/// never stored and never read back. Bit-identical to the pair of GEMMs
+/// followed by LaunchBatchedFusedSwiGLUQuantizeQ8_1. `q8_1_out` must not alias
+/// `q8_1_x`.
+void LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
+    core::GgmlType type, const void* w_gate, const void* w_up,
+    const void* q8_1_x, float* y_gate, void* q8_1_out, std::size_t batch,
+    std::size_t m, std::size_t k, hipStream_t stream = nullptr);
+
 /// Batched GEMM: Y[B, M] = X[B, K] * A[M, K]^T
 void LaunchBatchedGEMM(const void* A, bool is_bf16, const float* X, float* Y,
                        std::size_t batch_size, std::size_t M, std::size_t K,

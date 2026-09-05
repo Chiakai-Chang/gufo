@@ -785,7 +785,8 @@ int RunBench(std::span<const char* const> args) {
                 << mtp_gpu_model->GetPackTimeSeconds() << " s\n";
     }
   }
-  const std::string model_name = config.model_name + " BF16";
+  const std::string model_name =
+      config.model_name + " " + reader->GetQuantizationLabel();
   const double model_size_gib =
       static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
   std::uint64_t parameter_count = 0;

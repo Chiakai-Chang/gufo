@@ -275,6 +275,7 @@ environment variables are read by the current source:
 | `GUFO_PROFILE` | Presence enables prefill timing output. It is diagnostic output, not a stable benchmark harness. |
 | `GUFO_DISABLE_SSM_REPLAY` | Presence with a value other than `0`, `false`, or `off` disables SSM replay. |
 | `GUFO_HIPBLASLT_PLAN_CACHE` | Path used by hipBLASLt plan persistence when its caller has not supplied one. |
+| `GUFO_FFN_SWIGLU_EPILOGUE` | Selects the FFN up-projection epilogue (`opt-c192-swiglu-epilogue`). Default: fused SwiGLU + tiled Q8_1 emitted from the up GEMM's accumulator on Q8_0 weights. `0`/`false`/`off` pins the separate `BatchedFusedSwiGLUQuantizeQ8_1` pass as the bit-identical reference; `all` also fuses the K-quant instantiations, which measured slower on UD-Q4_K_XL and is kept only so that rejection stays re-measurable. |
 
 Record the policy fingerprint, resolved route fingerprints/rejections, graph
 identity, model/shape, device, and revision with experiment results. Numeric
@@ -300,6 +301,16 @@ lifetime is a behavioral change even if C++ types remain the same.
 `QwenSsmScratch::alpha` as `std::uint32_t`. The alias is legal only in the
 sampling/output epoch, after all layer execution has finished using alpha.
 Never use both interpretations concurrently.
+
+`QwenFfnScratch::up` carries a second interpretation on the fused FFN route
+(`opt-c192-swiglu-epilogue`). When the up projection emits the tiled Q8_1
+activation directly, the FP32 `[batch, intermediate]` intermediate is dead, and
+its allocation is where the `[batch, intermediate]` Q8_1 payload plus its
+activation-sum sidecar go -- 1.25 against 4 bytes per element, so it always fits,
+and the call site checks that before selecting the route. Writing them into
+`d_scratch_q8_act` instead would be a read/write race, because that buffer holds
+the `[batch, hidden]` activation the same kernel is reading. The alias is legal
+only between the up projection and the `ffn_down` projection of the same layer.
 
 KV cache, SSM convolution state, DeltaNet state, their saved snapshots, and SSM
 replay logs are persistent execution state, not scratch. They must not be moved

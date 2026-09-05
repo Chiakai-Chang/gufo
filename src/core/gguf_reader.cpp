@@ -17,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -710,6 +711,40 @@ const GgufTensorInfo* GgufReader::FindTensor(
 
 bool GgufReader::HasTensor(std::string_view name) const noexcept {
   return tensor_index_.contains(name);
+}
+
+std::string GgufReader::GetQuantizationLabel() const {
+  // `general.file_type` is deliberately not consulted. The Unsloth UD-*_K_XL
+  // artifacts this repo targets carry a stale one -- UD-Q8_K_XL records ftype
+  // 15 (Q4_K_M), which is what llama-bench prints for it -- so the recorded
+  // value is not evidence about the weights. The tensor table always is.
+  //
+  // Weighted by element count, not by tensor count: an artifact carries
+  // hundreds of tiny F32 norms that would otherwise outvote every projection.
+  // Element count also avoids needing each format's byte geometry here, which
+  // lives in quant::QuantizedRowBytes and would invert this file's dependency
+  // direction.
+  std::unordered_map<std::uint16_t, std::uint64_t> elements_by_type;
+  std::uint64_t total_elements = 0;
+  for (const auto& tensor : tensors_) {
+    const std::uint64_t count = tensor.ElementCount();
+    elements_by_type[static_cast<std::uint16_t>(tensor.type)] += count;
+    total_elements += count;
+  }
+  if (elements_by_type.empty() || total_elements == 0) {
+    return "unknown";
+  }
+  const auto dominant = std::ranges::max_element(
+      elements_by_type, {}, [](const auto& entry) { return entry.second; });
+  std::string label(ToString(static_cast<GgmlType>(dominant->first)));
+  // The UD-*_K_XL targets spread seven formats across the projections, so
+  // naming only the largest would read as a claim about the whole file. Four
+  // fifths is the line between "this artifact is that format" and "this is a
+  // mix".
+  if (dominant->second * 5 < total_elements * 4) {
+    label += " mixed";
+  }
+  return label;
 }
 
 bool GgufReader::HasMtpTensors() const noexcept {

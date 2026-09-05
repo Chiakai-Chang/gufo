@@ -377,6 +377,65 @@ void TestVisionExclusionValidation() {
          "Error mentions vision rejection");
 }
 
+void TestQuantizationLabel() {
+  // The label the benchmark table prints, derived from the tensor table rather
+  // than from `general.file_type`: the Unsloth UD-Q8_K_XL artifact records
+  // ftype 15 (Q4_K_M) over Q8_0 weights, so a recorded ftype cannot be trusted
+  // and must not override what the tensors say.
+  {
+    GgufBuilder builder;
+    builder.AddMetadataString("general.architecture", "qwen35");
+    builder.AddMetadataUint32("general.file_type", 15);
+    builder.AddTensor("token_embd.weight", {4096, 4096},
+                      gufo::core::GgmlType::kQ8_0, 0);
+    builder.AddTensor("blk.0.attn_norm.weight", {64},
+                      gufo::core::GgmlType::kF32, 64);
+    builder.AddTensor("blk.1.attn_norm.weight", {64},
+                      gufo::core::GgmlType::kF32, 128);
+    builder.AddTensor("blk.2.attn_norm.weight", {64},
+                      gufo::core::GgmlType::kF32, 192);
+    auto binary = builder.Build(512);
+    std::string err;
+    auto reader =
+        gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+    Expect(reader != nullptr, "Q8_0 label reader opens: " + err);
+    Expect(reader->GetQuantizationLabel() == "Q8_0",
+           "dominant type beats a stale ftype and F32 norms outnumbering it");
+  }
+  {
+    // A mixed shard: no single format holds four fifths of the weights, so the
+    // label has to say so instead of claiming the file is its largest format.
+    GgufBuilder builder;
+    builder.AddMetadataString("general.architecture", "qwen35");
+    builder.AddTensor("blk.0.ffn_up.weight", {1024, 1024},
+                      gufo::core::GgmlType::kQ5_K, 0);
+    builder.AddTensor("blk.0.ffn_gate.weight", {1024, 512},
+                      gufo::core::GgmlType::kIQ4_XS, 64);
+    builder.AddTensor("blk.0.attn_qkv.weight", {1024, 256},
+                      gufo::core::GgmlType::kQ4_K, 128);
+    auto binary = builder.Build(512);
+    std::string err;
+    auto reader =
+        gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+    Expect(reader != nullptr, "mixed label reader opens: " + err);
+    Expect(reader->GetQuantizationLabel() == "Q5_K mixed",
+           "a shard with no dominant format is reported as mixed");
+  }
+  {
+    GgufBuilder builder;
+    builder.AddMetadataString("general.architecture", "qwen35");
+    builder.AddTensor("blk.0.ffn_up.weight", {4096, 4096},
+                      gufo::core::GgmlType::kBF16, 0);
+    auto binary = builder.Build(512);
+    std::string err;
+    auto reader =
+        gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &err);
+    Expect(reader != nullptr, "BF16 label reader opens: " + err);
+    Expect(reader->GetQuantizationLabel() == "BF16",
+           "a single-format artifact is named without a suffix");
+  }
+}
+
 void TestMalformedGgufRejection() {
   // Bad magic
   const std::uint8_t bad_magic[24] = {'N', 'O', 'P', 'E', 3, 0, 0, 0};
@@ -400,6 +459,7 @@ int main() {
   TestQwen38_27BParsing();
   TestSplitGgufDiscovery();
   TestVisionExclusionValidation();
+  TestQuantizationLabel();
   TestMalformedGgufRejection();
   std::cout << "All GgufReader tests passed successfully!\n";
   return 0;

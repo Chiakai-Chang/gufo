@@ -311,6 +311,131 @@ void RunCase(std::size_t batch, std::size_t m, std::size_t k, bool dual) {
   HIP_CHECK(hipFree(d_y2));
 }
 
+// opt-c192-swiglu-epilogue: the up projection's fused SwiGLU + Q8_1 epilogue
+// consumes the same accumulator value the FP32 store would have round-tripped
+// exactly and reduces the block max and the code sum with order-independent
+// operators, so it must be *bit-identical* to the pair of GEMMs followed by
+// LaunchBatchedFusedSwiGLUQuantizeQ8_1. Comparing whole Q8_1 buffers makes that
+// exact, including the per-block scales, the activation-sum sidecar, and the
+// tail-tile zeroing for a batch that is not a multiple of the 16-token tile.
+void RunFusedSwiGluEpilogueCase(gufo::core::GgmlType type, std::size_t batch,
+                                std::size_t m, std::size_t k) {
+  std::cout << "fused SwiGLU epilogue: type=" << gufo::core::ToString(type)
+            << " batch=" << batch << " m=" << m << " k=" << k << "\n";
+  const std::size_t out_bytes = batch * m * sizeof(float);
+  if (!gufo::hip::IsFusedSwiGluGemmEpilogueSupported(type, batch, m,
+                                                     out_bytes)) {
+    std::cout << "  unsupported shape, skipped\n";
+    return;
+  }
+
+  const std::size_t k_blocks = k / 32;
+  const std::size_t m_blocks = m / 32;
+  Rng rng(0x85EBCA6BU ^ static_cast<std::uint32_t>((batch * 31) + (m * 7) + k));
+
+  // Both projections are Q8_0 here: the epilogue is downstream of the weight
+  // decode, so one weight format exercises it, and the K-quant instantiations
+  // share the same BlockedSwiGluQuantEpilogue body.
+  std::vector<HostQ8_0Block> h_gate(m * k_blocks);
+  std::vector<HostQ8_0Block> h_up(m * k_blocks);
+  for (std::size_t i = 0; i < h_gate.size(); ++i) {
+    h_gate[i].d = FloatToFp16(rng.Uniform(-0.05F, 0.05F));
+    h_up[i].d = FloatToFp16(rng.Uniform(-0.05F, 0.05F));
+    for (int j = 0; j < 32; ++j) {
+      h_gate[i].qs[j] = rng.Int8();
+      h_up[i].qs[j] = rng.Int8();
+    }
+  }
+  std::vector<std::uint16_t> h_x_bf16(batch * k);
+  for (auto& v : h_x_bf16) {
+    v = gufo::test::FloatToBf16Bits(rng.Uniform(-1.5F, 1.5F));
+  }
+
+  const std::size_t act_bytes = (((batch + 15) / 16) * k_blocks * 576) + 4096;
+  const std::size_t q8_bytes = (((batch + 15) / 16) * m_blocks * 640) + 4096;
+
+  void* d_gate_w = nullptr;
+  void* d_up_w = nullptr;
+  void* d_x_bf16 = nullptr;
+  void* d_act = nullptr;
+  float* d_gate = nullptr;
+  float* d_up = nullptr;
+  void* d_ref = nullptr;
+  void* d_got = nullptr;
+  HIP_CHECK(hipMalloc(&d_gate_w, h_gate.size() * sizeof(HostQ8_0Block)));
+  HIP_CHECK(hipMalloc(&d_up_w, h_up.size() * sizeof(HostQ8_0Block)));
+  HIP_CHECK(hipMalloc(&d_x_bf16, h_x_bf16.size() * sizeof(std::uint16_t)));
+  HIP_CHECK(hipMalloc(&d_act, act_bytes));
+  HIP_CHECK(hipMalloc(&d_gate, batch * m * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_up, batch * m * sizeof(float)));
+  HIP_CHECK(hipMalloc(&d_ref, q8_bytes));
+  HIP_CHECK(hipMalloc(&d_got, q8_bytes));
+  HIP_CHECK(hipMemcpy(d_gate_w, h_gate.data(),
+                      h_gate.size() * sizeof(HostQ8_0Block),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_up_w, h_up.data(), h_up.size() * sizeof(HostQ8_0Block),
+                      hipMemcpyHostToDevice));
+  HIP_CHECK(hipMemcpy(d_x_bf16, h_x_bf16.data(),
+                      h_x_bf16.size() * sizeof(std::uint16_t),
+                      hipMemcpyHostToDevice));
+  // Stale bytes in both destinations: a slot the fused epilogue leaves for the
+  // tail-zero pass must still end up equal to the reference route's.
+  HIP_CHECK(hipMemset(d_ref, 0x5A, q8_bytes));
+  HIP_CHECK(hipMemset(d_got, 0x5A, q8_bytes));
+
+  gufo::hip::LaunchQuantizeActivationQ8_1(d_x_bf16, d_act, batch, k);
+
+  // Reference: the two projections, then the separate SwiGLU + quantize pass.
+  gufo::hip::LaunchBatchedDualQuantGEMMPreQuantized(
+      type, d_gate_w, d_up_w, d_act, d_gate, d_up, batch, m, k);
+  gufo::hip::LaunchBatchedFusedSwiGLUQuantizeQ8_1(d_gate, d_up, d_ref, batch,
+                                                  m);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  // Under test. The gate buffer is rewritten by the fused route as well, so it
+  // cannot be shared with the reference run.
+  HIP_CHECK(hipMemset(d_gate, 0, batch * m * sizeof(float)));
+  gufo::hip::LaunchBatchedDualQuantGEMMSwiGLUQuantizeQ8_1(
+      type, d_gate_w, d_up_w, d_act, d_gate, d_got, batch, m, k);
+  HIP_CHECK(hipDeviceSynchronize());
+
+  std::vector<std::uint8_t> ref(q8_bytes);
+  std::vector<std::uint8_t> got(q8_bytes);
+  HIP_CHECK(hipMemcpy(ref.data(), d_ref, q8_bytes, hipMemcpyDeviceToHost));
+  HIP_CHECK(hipMemcpy(got.data(), d_got, q8_bytes, hipMemcpyDeviceToHost));
+
+  // Only the region the layout actually defines is compared; the allocation is
+  // rounded up past it.
+  const std::size_t payload = ((batch + 15) / 16) * m_blocks * 576;
+  const std::size_t sums = ((batch + 15) / 16) * m_blocks * 64;
+  std::size_t mismatches = 0;
+  std::size_t first = 0;
+  for (std::size_t i = 0; i < payload + sums; ++i) {
+    if (ref[i] != got[i]) {
+      if (mismatches == 0) {
+        first = i;
+      }
+      ++mismatches;
+    }
+  }
+  std::cout << "  mismatching bytes: " << mismatches << " of " << payload + sums
+            << "\n";
+  if (mismatches != 0) {
+    std::cerr << "fused SwiGLU epilogue differs from the separate pass at byte "
+              << first << "\n";
+    std::abort();
+  }
+
+  HIP_CHECK(hipFree(d_gate_w));
+  HIP_CHECK(hipFree(d_up_w));
+  HIP_CHECK(hipFree(d_x_bf16));
+  HIP_CHECK(hipFree(d_act));
+  HIP_CHECK(hipFree(d_gate));
+  HIP_CHECK(hipFree(d_up));
+  HIP_CHECK(hipFree(d_ref));
+  HIP_CHECK(hipFree(d_got));
+}
+
 // opt-c173-norm-quant: the fused RMSNorm + Q8_1 quantize kernel keeps the exact
 // reduction loop and tree of BatchedRMSNormKernel and quantizes the same FP32
 // normed values, so it must be *bit-identical* to running the two kernels in
@@ -459,6 +584,13 @@ int main() {
   RunCase(96, 64, 128, false);
   // Dual gate/up path.
   RunCase(128, 256, 256, true);
+
+  // Fused SwiGLU + Q8_1 epilogue on the up projection. Macro-tile aligned, a
+  // batch that is not a multiple of the 16-token tile, and a shape below the
+  // batch-96 route so the support predicate's rejection is exercised too.
+  RunFusedSwiGluEpilogueCase(gufo::core::GgmlType::kQ8_0, 128, 256, 256);
+  RunFusedSwiGluEpilogueCase(gufo::core::GgmlType::kQ8_0, 200, 384, 512);
+  RunFusedSwiGluEpilogueCase(gufo::core::GgmlType::kQ8_0, 64, 256, 256);
 
   // Fused RMSNorm + Q8_1 quantize: the production hidden size, a batch that is
   // not a multiple of the 16-token tile, and a short row.
