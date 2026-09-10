@@ -198,7 +198,23 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
   models::qwen3_tts::AudioBuffer reference_audio;
   std::string reference_text;
   bool speaker_embedding_only = false;
-  if (service.variant() == models::qwen3_tts::ModelVariant::kBase) {
+  const TtsVoicePreset* preset = service.voice_preset(selected_voice);
+  if (service.variant() == models::qwen3_tts::ModelVariant::kBase &&
+      preset != nullptr) {
+    // The named preset already carries the reference audio, so accepting
+    // per-request reference fields too would leave which one wins ambiguous.
+    if (body.find("reference_audio") != nullptr ||
+        body.find("reference_text") != nullptr ||
+        body.find("voice_clone_mode") != nullptr) {
+      return Error(400, "Bad Request",
+                   "voice '" + selected_voice +
+                       "' is a preset that already supplies reference audio",
+                   "unsupported_field");
+    }
+    reference_audio = preset->reference_audio;
+    reference_text = preset->reference_text;
+    speaker_embedding_only = preset->speaker_embedding_only;
+  } else if (service.variant() == models::qwen3_tts::ModelVariant::kBase) {
     const json::Value* encoded_audio = body.find("reference_audio");
     const json::Value* clone_text = body.find("reference_text");
     const json::Value* clone_mode = body.find("voice_clone_mode");

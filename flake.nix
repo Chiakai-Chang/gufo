@@ -462,6 +462,33 @@
 
           mkServeCheck =
             let
+              audioCmd = self.lib.${system}.mkGufoServe {
+                modality = "audio";
+                model = "/var/models/qwen3-tts";
+                context = 4096;
+                port = 9100;
+                sessions = 2;
+              };
+              ttsAliasCmd = self.lib.${system}.mkGufoServe {
+                modality = "tts";
+                model = "/var/models/qwen3-tts";
+              };
+              bothCmd = self.lib.${system}.mkGufoServe {
+                modality = "audio";
+                ttsModel = "/var/models/qwen3-tts";
+                asrModel = "/var/models/qwen3-asr";
+                ttsContext = 4096;
+                asrContext = 1024;
+              };
+              asrCmd = self.lib.${system}.mkGufoServe {
+                modality = "asr";
+                model = "/var/models/qwen3-asr";
+                context = 1024;
+              };
+              sttAliasCmd = self.lib.${system}.mkGufoServe {
+                modality = "stt";
+                model = "/var/models/qwen3-asr";
+              };
               cmd = self.lib.${system}.mkGufoServe {
                 model = "/var/models/qwen.gguf";
                 context = 4096;
@@ -480,6 +507,11 @@
                 frequencyPenalty = 0.25;
                 presencePenalty = 0.5;
                 specDraftPMin = 0.75;
+                reasoningEffort = "high";
+                preserveThinking = "auto";
+                cacheDisk = "/var/cache/gufo";
+                cacheDiskBytes = 1024;
+                cacheDiskStagingBytes = 512;
               };
             in
             pkgsSys.runCommand "check-mk-serve" { } ''
@@ -503,6 +535,31 @@
               echo "$cmd_str" | grep -F -- "--frequency-penalty 0.250000"
               echo "$cmd_str" | grep -F -- "--presence-penalty 0.500000"
               echo "$cmd_str" | grep -F -- "--spec-draft-p-min 0.750000"
+              echo "$cmd_str" | grep -F -- "--reasoning-effort high"
+              echo "$cmd_str" | grep -F -- "--preserve-thinking auto"
+              echo "$cmd_str" | grep -F -- "--cache-disk /var/cache/gufo"
+              echo "$cmd_str" | grep -F -- "--cache-disk-bytes 1024"
+              echo "$cmd_str" | grep -F -- "--cache-disk-staging-bytes 512"
+
+              # Audio (Qwen3-TTS) and ASR (Qwen3-ASR) share the --model/--context
+              # surface. Server options must precede the modality subcommand.
+              audio_str="${audioCmd}"
+              echo "$audio_str" | grep -F -- "--port 9100 --sessions 2 audio"
+              echo "$audio_str" | grep -F -- "audio --model /var/models/qwen3-tts --context 4096"
+
+              # "asr"/"stt" are helper spellings over the single audio
+              # subcommand: a bare model routes to --asr-model.
+              asr_str="${asrCmd}"
+              echo "$asr_str" | grep -F -- "audio --asr-model /var/models/qwen3-asr --asr-context 1024"
+
+              # One audio server may host both services at once.
+              both_str="${bothCmd}"
+              echo "$both_str" | grep -F -- "audio --tts-model /var/models/qwen3-tts --asr-model /var/models/qwen3-asr"
+              echo "$both_str" | grep -F -- "--tts-context 4096 --asr-context 1024"
+
+              echo "${ttsAliasCmd}" | grep -F -- " audio --model /var/models/qwen3-tts"
+              echo "${sttAliasCmd}" | grep -F -- " audio --asr-model /var/models/qwen3-asr"
+
               mkdir -p $out
               echo "PASS: mkGufoServe CLI string check passed" > $out/result.txt
             '';

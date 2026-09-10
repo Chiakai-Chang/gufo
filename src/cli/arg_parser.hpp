@@ -1,6 +1,7 @@
 #ifndef GUFO_CLI_ARG_PARSER_HPP_
 #define GUFO_CLI_ARG_PARSER_HPP_
 
+#include <algorithm>
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
@@ -166,6 +167,36 @@ public:
         return true;
       }
 
+      // `--name=value` / `-n=value` carry their own value. Supporting the
+      // inline spelling lets a value that would otherwise be mistaken for
+      // another flag (`--system=-v`) be passed unambiguously.
+      const std::size_t equals = arg.find('=');
+      if (equals != std::string_view::npos && equals > 0 && arg[0] == '-') {
+        const std::string_view name = arg.substr(0, equals);
+        const std::string_view val = arg.substr(equals + 1);
+        const Option* inline_match = nullptr;
+        for (const auto& opt : options_) {
+          if ((!opt.short_name.empty() && name == opt.short_name) ||
+              (!opt.long_name.empty() && name == opt.long_name)) {
+            inline_match = &opt;
+            break;
+          }
+        }
+        if (inline_match != nullptr) {
+          if (inline_match->is_flag) {
+            if (error_msg != nullptr) {
+              *error_msg =
+                  "Option " + std::string(name) + " does not take a value";
+            }
+            return false;
+          }
+          if (!inline_match->parse_fn(name, val, error_msg)) {
+            return false;
+          }
+          continue;
+        }
+      }
+
       // Check if it matches an option
       const Option* matched = nullptr;
       for (const auto& opt : options_) {
@@ -238,6 +269,15 @@ public:
       groups[grp].push_back(&opt);
     }
 
+    // `-h/--help` is implicit and is always reported under "General". Sort
+    // that group last so the implicit entry can join it instead of forcing a
+    // second "General:" heading.
+    const bool has_general_group = groups.find("General") != groups.end();
+    if (has_general_group) {
+      const auto general = std::ranges::find(group_order, "General");
+      std::rotate(general, general + 1, group_order.end());
+    }
+
     for (const auto& grp_name : group_order) {
       out << grp_name << ":\n";
       for (const auto* opt : groups.at(grp_name)) {
@@ -260,10 +300,16 @@ public:
         out << std::left << std::setw(28) << flag_str << " " << opt->description
             << "\n";
       }
-      out << "\n";
+      // The implicit help entry is appended directly under "General"; every
+      // other group is terminated with a blank separator line.
+      if (!(has_general_group && grp_name == "General")) {
+        out << "\n";
+      }
     }
 
-    out << "General:\n";
+    if (!has_general_group) {
+      out << "General:\n";
+    }
     out << std::left << std::setw(28) << "  -h, --help" << " Print help\n";
 
     return out.str();

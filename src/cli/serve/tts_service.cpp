@@ -59,6 +59,21 @@ struct TtsService::Impl {
         options.voices.push_back("voice-clone");
       }
     }
+    // Presets carry reference audio, which only the Base checkpoint consumes:
+    // CustomVoice selects a trained speaker embedding and VoiceDesign is
+    // driven by `instruct`, so neither has anything to apply them to.
+    if (!options.voice_presets.empty() &&
+        options.variant != models::qwen3_tts::ModelVariant::kBase) {
+      initialization_error =
+          "voice presets require a Qwen3-TTS Base checkpoint";
+      return;
+    }
+    for (const auto& [name, unused] : options.voice_presets) {
+      (void)unused;
+      if (std::ranges::find(options.voices, name) == options.voices.end()) {
+        options.voices.push_back(name);
+      }
+    }
     if (!options.runner) {
       native_runtime = models::qwen3_tts::hip::SynthesisHipRuntime::Create(
           options.model_root.string(), options.native_context_tokens,
@@ -109,6 +124,11 @@ std::string TtsService::backend_name() const {
 
 std::vector<std::string> TtsService::voices() const {
   return impl_->options.voices;
+}
+
+const TtsVoicePreset* TtsService::voice_preset(const std::string& name) const {
+  const auto found = impl_->options.voice_presets.find(name);
+  return found == impl_->options.voice_presets.end() ? nullptr : &found->second;
 }
 
 models::qwen3_tts::ModelVariant TtsService::variant() const noexcept {

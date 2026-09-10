@@ -4,8 +4,18 @@
 }:
 
 {
-  modality ? "llm", # "llm", "video", or "audio"
-  model, # path, derivation, or string to GGUF model or weights directory
+  modality ? "llm", # "llm", "video", "audio" (alias "tts"), or "asr" (alias "stt")
+  model ? null, # path, derivation, or string to GGUF model or weights directory
+
+  # Audio Options (modality "audio"/"asr"): one audio server can host
+  # Qwen3-TTS synthesis, Qwen3-ASR transcription, or both at once.
+  ttsModel ? null,
+  asrModel ? null,
+  ttsContext ? null,
+  asrContext ? null,
+  # Named Qwen3-TTS Base voices: { <name> = <path to reference WAV>; }. The
+  # reference transcript is read from a `.txt` sidecar beside each WAV.
+  voices ? { },
 
   # Server Options
   host ? null,
@@ -32,11 +42,12 @@
   repeatLastN ? null,
   frequencyPenalty ? null,
   presencePenalty ? null,
-  system ? null,
-  raw ? false,
-  chatTemplate ? null,
   think ? null, # "on", "off", "auto"
-  reasoningBudget ? null,
+  reasoningEffort ? null, # "auto", "minimal", "low", "medium", "high", "xhigh", "max"
+  preserveThinking ? null, # "on", "off", "auto"
+  cacheDisk ? null,
+  cacheDiskBytes ? null,
+  cacheDiskStagingBytes ? null,
   speculative ? null, # "dflash", "dflash2", "mtp", "mtp-npu", "npu", "pld", "self", "off"
   specType ? null, # alias for speculative ("draft-mtp" -> "mtp", etc.)
   draftModel ? null, # generic draft model path / derivation
@@ -95,15 +106,34 @@ let
       draftModel
     else
       null;
+  # `gufo serve` has a single "audio" subcommand hosting Qwen3-TTS synthesis,
+  # Qwen3-ASR transcription, or both. "tts"/"asr"/"stt" remain accepted helper
+  # spellings: they all emit `serve audio`, and "asr"/"stt" additionally route
+  # a bare `model` to --asr-model instead of the TTS default.
+  isAsrSpelling = modality == "asr" || modality == "stt";
+  finalModality =
+    if modality == "tts" || isAsrSpelling then "audio" else modality;
   validModalities = [
     "llm"
     "video"
     "audio"
+    "tts"
+    "asr"
+    "stt"
   ];
   validThinkModes = [
     "on"
     "off"
     "auto"
+  ];
+  validReasoningEfforts = [
+    "auto"
+    "minimal"
+    "low"
+    "medium"
+    "high"
+    "xhigh"
+    "max"
   ];
   validSpeculativeModes = [
     "dflash"
@@ -145,12 +175,32 @@ let
     ]
     ++ lib.optionals verbose [ "--verbose" ];
 
+  isAudio = finalModality == "audio";
+
+  # Under an "asr"/"stt" spelling a bare `model`/`context` names the ASR
+  # service; the CLI's own --model/--context are TTS aliases.
+  finalTtsModel = if ttsModel != null then ttsModel else null;
+  finalAsrModel =
+    if asrModel != null then
+      asrModel
+    else if isAsrSpelling && model != null then
+      model
+    else
+      null;
+  finalAsrContext =
+    if asrContext != null then
+      asrContext
+    else if isAsrSpelling then
+      finalContext
+    else
+      null;
+
   modalityArgs =
-    [
+    lib.optionals (model != null && !isAsrSpelling) [
       "--model"
       (toString model)
     ]
-    ++ lib.optionals (modality == "llm") (
+    ++ lib.optionals (finalModality == "llm") (
       lib.optionals (servedModelName != null) [
         "--served-model-name"
         servedModelName
@@ -203,22 +253,29 @@ let
         "--presence-penalty"
         (toString presencePenalty)
       ]
-      ++ lib.optionals (system != null) [
-        "--system"
-        system
-      ]
-      ++ lib.optionals raw [ "--raw" ]
-      ++ lib.optionals (chatTemplate != null) [
-        "--chat-template"
-        chatTemplate
-      ]
       ++ lib.optionals (think != null) [
         "--think"
         think
       ]
-      ++ lib.optionals (reasoningBudget != null) [
-        "--reasoning-budget"
-        (toString reasoningBudget)
+      ++ lib.optionals (reasoningEffort != null) [
+        "--reasoning-effort"
+        reasoningEffort
+      ]
+      ++ lib.optionals (preserveThinking != null) [
+        "--preserve-thinking"
+        preserveThinking
+      ]
+      ++ lib.optionals (cacheDisk != null) [
+        "--cache-disk"
+        (toString cacheDisk)
+      ]
+      ++ lib.optionals (cacheDiskBytes != null) [
+        "--cache-disk-bytes"
+        (toString cacheDiskBytes)
+      ]
+      ++ lib.optionals (cacheDiskStagingBytes != null) [
+        "--cache-disk-staging-bytes"
+        (toString cacheDiskStagingBytes)
       ]
       ++ lib.optionals (finalSpeculative != null) [
         "--speculative"
@@ -278,7 +335,7 @@ let
       ]
       ++ lib.optionals cpu [ "--cpu" ]
     )
-    ++ lib.optionals (modality == "video") (
+    ++ lib.optionals (finalModality == "video") (
       lib.optionals (root != null) [
         "--root"
         (toString root)
@@ -292,11 +349,31 @@ let
         (toString ttl)
       ]
     )
-    ++ lib.optionals (modality == "audio") (
-      lib.optionals (finalContext != null) [
+    ++ lib.optionals isAudio (
+      lib.optionals (finalContext != null && !isAsrSpelling) [
         "--context"
         (toString finalContext)
       ]
+      ++ lib.optionals (finalTtsModel != null) [
+        "--tts-model"
+        (toString finalTtsModel)
+      ]
+      ++ lib.optionals (finalAsrModel != null) [
+        "--asr-model"
+        (toString finalAsrModel)
+      ]
+      ++ lib.optionals (ttsContext != null) [
+        "--tts-context"
+        (toString ttsContext)
+      ]
+      ++ lib.optionals (finalAsrContext != null) [
+        "--asr-context"
+        (toString finalAsrContext)
+      ]
+      ++ lib.concatMap (name: [
+        "--voice"
+        "${name}=${toString voices.${name}}"
+      ]) (builtins.attrNames voices)
     )
     ++ extraArgs;
 
@@ -310,10 +387,21 @@ let
 in
 assert lib.assertMsg (lib.elem modality validModalities)
   "gufo.mkServe: 'modality' must be one of ${lib.generators.toJSON { } validModalities}, got '${modality}'";
-assert lib.assertMsg (model != null && model != "")
-  "gufo.mkServe: 'model' must be specified (cannot be empty)";
+assert lib.assertMsg (
+  (model != null && model != "") || (isAudio && (finalTtsModel != null || finalAsrModel != null))
+) "gufo.mkServe: 'model' must be specified (cannot be empty)";
+assert lib.assertMsg (isAudio || (ttsModel == null && asrModel == null && ttsContext == null && asrContext == null))
+  "gufo.mkServe: 'ttsModel'/'asrModel'/'ttsContext'/'asrContext' require modality 'audio' or 'asr'";
+assert lib.assertMsg (isAudio || voices == { })
+  "gufo.mkServe: 'voices' requires modality 'audio'";
+assert lib.assertMsg (voices == { } || finalTtsModel != null)
+  "gufo.mkServe: 'voices' requires a Qwen3-TTS checkpoint ('ttsModel' or 'model')";
 assert lib.assertMsg (think == null || lib.elem think validThinkModes)
   "gufo.mkServe: 'think' must be one of ${lib.generators.toJSON { } validThinkModes}, got '${toString think}'";
+assert lib.assertMsg (preserveThinking == null || lib.elem preserveThinking validThinkModes)
+  "gufo.mkServe: 'preserveThinking' must be one of ${lib.generators.toJSON { } validThinkModes}, got '${toString preserveThinking}'";
+assert lib.assertMsg (reasoningEffort == null || lib.elem reasoningEffort validReasoningEfforts)
+  "gufo.mkServe: 'reasoningEffort' must be one of ${lib.generators.toJSON { } validReasoningEfforts}, got '${toString reasoningEffort}'";
 assert lib.assertMsg (finalSpeculative == null || lib.elem finalSpeculative validSpeculativeModes)
   "gufo.mkServe: 'speculative' must be one of ${lib.generators.toJSON { } validSpeculativeModes}, got '${toString finalSpeculative}'";
-"${bin} serve${serverStr}${rawHostStr}${rawPortStr} ${modality}${modalityStr}"
+"${bin} serve${serverStr}${rawHostStr}${rawPortStr} ${finalModality}${modalityStr}"

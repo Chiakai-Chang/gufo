@@ -256,7 +256,7 @@ tensor by tensor. Do not debug every low-bit kernel simultaneously.
 1. Implement configuration parsing and model alias loading.
 2. Implement the single-owner scheduler and generation-tagged completions.
 3. Add the direct single-request fast lane.
-4. Implement `/healthz`, `/readyz`, and `/v1/models`.
+4. Implement `/health`, `/ready`, and `/v1/models`.
 5. Implement non-streaming `/v1/responses`.
 6. Add SSE streaming and cancellation.
 7. Add the Chat Completions adapter.

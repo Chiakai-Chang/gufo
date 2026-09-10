@@ -1043,12 +1043,19 @@ void HttpServer::reap_workers() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
-  if (req.method == "GET" && req.path == "/health") {
+  // `/health` and `/ready` are the native spelling and match llama-server's
+  // `/health`. `/healthz` and `/readyz` are aliases so Kubernetes-style probe
+  // configuration works unmodified.
+  if (req.method == "GET" &&
+      (req.path == "/health" || req.path == "/v1/health" ||
+       req.path == "/healthz")) {
     json::Value body = json::Value::object();
     body["status"] = "ok";
     return Ok(body);
   }
-  if (req.method == "GET" && req.path == "/ready") {
+  if (req.method == "GET" &&
+      (req.path == "/ready" || req.path == "/v1/ready" ||
+       req.path == "/readyz")) {
     const bool ready = (backend_ != nullptr && backend_->ready()) ||
                        (video_jobs_ != nullptr && video_jobs_->ready()) ||
                        (tts_ != nullptr && tts_->ready()) ||

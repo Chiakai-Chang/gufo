@@ -217,9 +217,9 @@ state. I/O threads never wait synchronously for device completion.
 | `POST` | `/v1/responses` | Primary text generation API |
 | `POST` | `/v1/chat/completions` | Chat Completions compatibility |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
-| `GET` | `/healthz` | Process liveness |
-| `GET` | `/readyz` | Model and backend readiness |
-| `GET` | `/metrics` | Prometheus-format operational metrics |
+| `GET` | `/health` | Process liveness (aliases: `/v1/health`, `/healthz`) |
+| `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
+| `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
 
 ### Later, capability-gated
 
@@ -234,11 +234,77 @@ state. I/O threads never wait synchronously for device completion.
 | `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
 | `DELETE` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 
-Qwen3-ASR serving is enabled with a dedicated model process:
+Qwen3-TTS serving is enabled with a dedicated model process. All three 12Hz
+1.7B variants are supported; the variant is detected from the checkpoint's
+`tts_model_type` and determines both the advertised model id and the request
+fields that are required:
 
 ```sh
-./result/bin/gufo serve asr \
-  --model /var/llms/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/<revision>
+./result/bin/gufo serve --port 8080 audio \
+  --model /persist/models/audio/Qwen3-TTS-12Hz-1.7B-CustomVoice
+```
+
+A single audio server can host Qwen3-TTS synthesis, Qwen3-ASR transcription,
+or both, since `/v1/audio/speech` and `/v1/audio/transcriptions` dispatch from
+independent services. Name each checkpoint explicitly to run both in one
+process:
+
+```sh
+./result/bin/gufo serve --port 8080 audio \
+  --tts-model /persist/models/audio/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --asr-model /var/llms/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/<revision>
+```
+
+At least one of `--tts-model` or `--asr-model` is required. A bare `--model`
+and `--context` are backward-compatible aliases for `--tts-model` and
+`--tts-context`. `--tts-context` (default 4096) and `--asr-context`
+(default 1024) size each service independently. Both checkpoints load eagerly at startup, so running
+them co-resident costs the sum of their weights.
+
+| Variant | Model id | Voices | Additional required fields |
+| --- | --- | --- | --- |
+| CustomVoice | `qwen3-tts-12hz-1.7b-customvoice` | `talker_config.spk_id` names | `voice` |
+| VoiceDesign | `qwen3-tts-12hz-1.7b-voice-design` | `voice-design` | `instruct` |
+| Base | `qwen3-tts-12hz-1.7b-base` | `voice-clone` | `reference_audio`, plus `reference_text` unless `voice_clone_mode` is `speaker_embedding_only` |
+
+`GET /v1/audio/voices` lists the advertised voices. CustomVoice exposes the
+speaker names in `talker_config.spk_id`, while VoiceDesign and Base expose a
+single placeholder name because their timbre comes from `instruct` or
+`reference_audio` per request.
+
+A Base checkpoint can additionally advertise operator-registered named voices,
+so clients select a speaker by name instead of uploading a reference clip on
+every request:
+
+```sh
+./result/bin/gufo serve audio \
+  --tts-model /persist/models/audio/Qwen3-TTS-12Hz-1.7B-Base \
+  --voice narrator_eng=/persist/models/audio/clear-english-voice.wav \
+  --voice narrator_ita=/persist/models/audio/clear-italian-voice.wav
+```
+
+`--voice NAME=PATH` is repeatable. The reference transcript is read from a
+`.txt` sidecar beside the WAV (`clear-english-voice.txt` for the example
+above); when no sidecar exists the preset falls back to
+`speaker_embedding_only` cloning, which needs no transcript. Preset names join
+`voice-clone` in `/v1/audio/voices`, and a request naming a preset must not
+also send `reference_audio`, `reference_text`, or `voice_clone_mode` --- the
+preset already supplies them. Presets require a Base checkpoint; CustomVoice
+selects a trained embedding and VoiceDesign is driven by `instruct`, so
+neither has anything to apply them to.
+
+`POST /v1/audio/speech` accepts `model`, `input`, `voice`, `response_format`,
+`speed`, `language`, `instruct`, `seed`, `max_new_tokens`, `greedy`, and the
+Base-only `reference_audio`, `reference_text`, and `voice_clone_mode`. Any
+other field is rejected. `response_format` supports `wav` only and `speed`
+supports `1.0` only; `input` is capped at 16384 UTF-8 bytes and
+`max_new_tokens` at 8192 (default 3000). Output is 24 kHz mono 16-bit PCM.
+
+Qwen3-ASR serving uses the same audio server, naming only the ASR checkpoint:
+
+```sh
+./result/bin/gufo serve audio \
+  --asr-model /var/llms/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/<revision>
 ```
 
 `POST /v1/audio/transcriptions` accepts OpenAI-compatible multipart fields
@@ -475,10 +541,10 @@ Startup performs:
 9. Warm required single-request and configured batch routes.
 10. Publish usable model aliases and become ready.
 
-`GET /healthz` reports whether the process event loops and control plane are
+`GET /health` reports whether the process event loops and control plane are
 alive. It does not imply that a model is usable.
 
-`GET /readyz` succeeds when at least one advertised model alias can admit work.
+`GET /ready` succeeds when at least one advertised model alias can admit work.
 Its body reports:
 
 - Process state.
