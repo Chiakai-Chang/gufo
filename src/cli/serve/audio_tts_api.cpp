@@ -118,14 +118,22 @@ HttpResponse Voices(TtsService& service) {
   root["object"] = "list";
   root["schema"] = std::string(kAudioTtsApiSchema);
   json::Value data = json::Value::array();
+  json::Value names = json::Value::array();
   for (const std::string& voice : service.voices()) {
     json::Value item = json::Value::object();
     item["id"] = voice;
     item["object"] = "voice";
     item["model"] = service.model_id();
     data.push_back(std::move(item));
+    names.push_back(json::Value(voice));
   }
   root["data"] = std::move(data);
+  // `data` carries the OpenAI-style {object, data} envelope the rest of this
+  // API uses. `voices` repeats the same names as a flat array because clients
+  // that front this endpoint accept only a bare array or a `voices` key --
+  // llama-swap, for one, silently substitutes its own default list when it
+  // finds neither, so registered voices never reach its UI. Keep both.
+  root["voices"] = std::move(names);
   return {
       .status = 200,
       .reason = "OK",
