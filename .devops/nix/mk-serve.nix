@@ -17,10 +17,17 @@
   # (its transcript read from a `.txt` sidecar beside it) or an attrset
   # { wav = <path>; text = <transcript or path to a file holding it>; }:
   #
+  # An optional `language` supplies the request default for that voice, so a
+  # caller naming it need not repeat the language:
+  #
   #   voices = {
   #     narrator_eng = "/voices/en.wav";
-  #     narrator_ita = { wav = "/voices/it.wav"; text = "Questo racconto..."; };
-  #     narrator_de  = { wav = "/voices/de.wav"; text = "/voices/de.txt"; };
+  #     narrator_ita = {
+  #       wav = "/voices/it.wav";
+  #       text = "Questo racconto...";
+  #       language = "italian";
+  #     };
+  #     narrator_de = { wav = "/voices/de.wav"; text = "/voices/de.txt"; };
   #   };
   voices ? { },
 
@@ -384,6 +391,7 @@ let
           structured = lib.isAttrs entry && !lib.isDerivation entry;
           wav = if structured then entry.wav else entry;
           text = if structured then (entry.text or null) else null;
+          language = if structured then (entry.language or null) else null;
         in
         assert lib.assertMsg (!structured || entry ? wav)
           "gufo.mkServe: voice '${name}' must set 'wav'";
@@ -394,6 +402,10 @@ let
         ++ lib.optionals (text != null) [
           "--voice-text"
           "${name}=${toString text}"
+        ]
+        ++ lib.optionals (language != null) [
+          "--voice-lang"
+          "${name}=${toString language}"
         ]
       ) (builtins.attrNames voices)
     )

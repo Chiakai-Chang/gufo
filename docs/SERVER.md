@@ -302,6 +302,13 @@ anything else is used as the transcript itself. Resolution order is
 (`clear-english-voice.txt` for the example above), and with neither the preset
 falls back to `speaker_embedding_only` cloning, which needs no transcript.
 
+`--voice-lang NAME=LANGUAGE` binds a language to a voice. It supplies the
+default when a request omits `language`, so a caller naming an Italian voice
+does not have to repeat it -- without this the request would fall back to the
+global `english` default and synthesize the voice in the wrong language. An
+explicit request `language` still wins, so a voice can be driven in another
+language deliberately.
+
 A transcript that does not match its reference audio is worse than no
 transcript: synthesis runs to the `max_new_tokens` cap, so a short input can
 return several minutes of unusable audio. Preset names join

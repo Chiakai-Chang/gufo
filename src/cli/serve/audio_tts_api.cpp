@@ -311,10 +311,21 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
     greedy = value->as_bool();
   }
 
+  // A registered voice may declare the language it speaks, which spares
+  // callers from repeating it -- naming an Italian voice without a language
+  // would otherwise synthesize it as English. An explicit request language
+  // still wins, so one voice can be driven in another language on purpose.
+  std::string language = body.member_str("language");
+  if (language.empty()) {
+    language = (preset != nullptr && !preset->language.empty())
+                   ? preset->language
+                   : std::string("english");
+  }
+
   const models::qwen3_tts::SynthesisRequest synthesis{
       .text = input->str(),
       .speaker = selected_voice,
-      .language = body.member_str("language", "english"),
+      .language = std::move(language),
       .instruct = body.member_str("instruct"),
       .reference_audio = std::move(reference_audio),
       .reference_text = std::move(reference_text),

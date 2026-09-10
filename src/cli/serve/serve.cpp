@@ -145,6 +145,7 @@ std::string ResolveReferenceText(const std::string& value) {
 bool BuildVoicePresets(
     const std::vector<std::pair<std::string, std::string>>& voice_specs,
     const std::map<std::string, std::string>& text_specs,
+    const std::map<std::string, std::string>& language_specs,
     std::map<std::string, server::TtsVoicePreset>* presets,
     std::string* error) {
   for (const auto& [name, wav] : voice_specs) {
@@ -184,6 +185,10 @@ bool BuildVoicePresets(
       }
     }
     preset.speaker_embedding_only = preset.reference_text.empty();
+    if (const auto language = language_specs.find(name);
+        language != language_specs.end()) {
+      preset.language = language->second;
+    }
     presets->emplace(name, std::move(preset));
   }
 
@@ -191,6 +196,13 @@ bool BuildVoicePresets(
     (void)unused;
     if (!presets->contains(name)) {
       *error = "--voice-text names unknown voice '" + name + "'";
+      return false;
+    }
+  }
+  for (const auto& [name, unused] : language_specs) {
+    (void)unused;
+    if (!presets->contains(name)) {
+      *error = "--voice-lang names unknown voice '" + name + "'";
       return false;
     }
   }
@@ -302,6 +314,12 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddCustomOption(
         "", "--voice", "NAME=PATH",
         "Register a named Qwen3-TTS Base voice from a reference WAV "
+        "(repeatable)",
+        "Model",
+        [](std::string_view, std::string_view, std::string*) { return true; });
+    parser.AddCustomOption(
+        "", "--voice-lang", "NAME=LANGUAGE",
+        "Language a --voice speaks; used when a request omits 'language' "
         "(repeatable)",
         "Model",
         [](std::string_view, std::string_view, std::string*) { return true; });
@@ -745,6 +763,7 @@ int RunServe(std::span<const char* const> args) {
     std::map<std::string, server::TtsVoicePreset> voice_presets;
     std::vector<std::pair<std::string, std::string>> voice_specs;
     std::map<std::string, std::string> voice_text_specs;
+    std::map<std::string, std::string> voice_lang_specs;
     audio_parser.AddCustomOption(
         "", "--voice", "NAME=PATH",
         "Register a named Qwen3-TTS Base voice from a reference WAV "
@@ -758,6 +777,25 @@ int RunServe(std::span<const char* const> args) {
             return false;
           }
           voice_specs.emplace_back(std::move(name), std::move(path));
+          return true;
+        });
+    audio_parser.AddCustomOption(
+        "", "--voice-lang", "NAME=LANGUAGE",
+        "Language a --voice speaks; used when a request omits 'language' "
+        "(repeatable)",
+        "Model",
+        [&voice_lang_specs](std::string_view, std::string_view value,
+                            std::string* err) {
+          std::string name;
+          std::string language;
+          if (!SplitNameValue(value, "--voice-lang", &name, &language, err)) {
+            return false;
+          }
+          if (!voice_lang_specs.emplace(std::move(name), std::move(language))
+                   .second) {
+            *err = "duplicate --voice-lang name";
+            return false;
+          }
           return true;
         });
     audio_parser.AddCustomOption(
@@ -803,8 +841,8 @@ int RunServe(std::span<const char* const> args) {
       tts_context_tokens = default_context;
     }
 
-    if (!BuildVoicePresets(voice_specs, voice_text_specs, &voice_presets,
-                           &parse_err)) {
+    if (!BuildVoicePresets(voice_specs, voice_text_specs, voice_lang_specs,
+                           &voice_presets, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
       PrintServeHelp("gufo", help_topic);
       return 2;

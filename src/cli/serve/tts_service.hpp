@@ -23,6 +23,10 @@ struct TtsVoicePreset {
   models::qwen3_tts::AudioBuffer reference_audio;
   std::string reference_text;
   bool speaker_embedding_only{false};
+  /// Language this voice speaks. Supplies the request default when set, so a
+  /// caller naming the voice does not have to repeat it; an explicit request
+  /// `language` still wins. Empty means the global default applies.
+  std::string language;
 };
 
 struct TtsServiceOptions {
