@@ -15,6 +15,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <utility>
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
@@ -97,56 +99,101 @@ void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
                    &targets->verbose);
 }
 
-// Parse one `--voice NAME=PATH` value and load the referenced WAV. The
-// reference transcript is read from a `.txt` sidecar beside the WAV; without
-// one the preset falls back to speaker-embedding-only cloning, which needs no
-// transcript.
-bool LoadVoicePreset(std::string_view spec,
-                     std::map<std::string, server::TtsVoicePreset>* presets,
-                     std::string* error) {
+// Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.
+bool SplitNameValue(std::string_view spec, std::string_view flag,
+                    std::string* name, std::string* value,
+                    std::string* error) {
   const std::size_t separator = spec.find('=');
   if (separator == std::string_view::npos || separator == 0 ||
       separator + 1 >= spec.size()) {
-    *error = "--voice expects NAME=PATH";
+    *error = std::string(flag) + " expects NAME=VALUE";
     return false;
   }
-  const std::string name(spec.substr(0, separator));
-  const std::filesystem::path wav_path(spec.substr(separator + 1));
-  if (presets->contains(name)) {
-    *error = "duplicate --voice name '" + name + "'";
-    return false;
-  }
+  *name = std::string(spec.substr(0, separator));
+  *value = std::string(spec.substr(separator + 1));
+  return true;
+}
 
-  std::ifstream wav_file(wav_path, std::ios::binary);
-  if (!wav_file) {
-    *error = "cannot open voice reference " + wav_path.string();
-    return false;
+std::optional<std::string> ReadTextFile(const std::filesystem::path& path) {
+  std::ifstream file(path);
+  if (!file) {
+    return std::nullopt;
   }
-  const std::vector<char> wav_bytes{std::istreambuf_iterator<char>(wav_file),
-                                    std::istreambuf_iterator<char>()};
-
-  server::TtsVoicePreset preset;
-  std::string decode_error;
-  if (!models::qwen3_tts::DecodeWav(
-          std::as_bytes(std::span<const char>(wav_bytes)),
-          &preset.reference_audio, &decode_error)) {
-    *error = wav_path.string() + ": " + decode_error;
-    return false;
+  std::string text{std::istreambuf_iterator<char>(file),
+                   std::istreambuf_iterator<char>()};
+  while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
+    text.pop_back();
   }
+  return text;
+}
 
-  std::filesystem::path transcript_path = wav_path;
-  transcript_path.replace_extension(".txt");
-  if (std::ifstream transcript(transcript_path); transcript) {
-    std::string text{std::istreambuf_iterator<char>(transcript),
-                     std::istreambuf_iterator<char>()};
-    while (!text.empty() && (text.back() == '\n' || text.back() == '\r')) {
-      text.pop_back();
+// Resolve a `--voice-text` value: an existing file is read for its contents,
+// anything else is taken as the transcript itself.
+std::string ResolveReferenceText(const std::string& value) {
+  std::error_code ec;
+  if (std::filesystem::is_regular_file(std::filesystem::path(value), ec)) {
+    if (const auto text = ReadTextFile(std::filesystem::path(value))) {
+      return *text;
     }
-    preset.reference_text = std::move(text);
   }
-  preset.speaker_embedding_only = preset.reference_text.empty();
+  return value;
+}
 
-  presets->emplace(name, std::move(preset));
+// Build the registered voices from `--voice NAME=WAV` and the optional
+// `--voice-text NAME=<text|path>` overrides. Resolution happens after parsing
+// so the two flags may appear in any order.
+bool BuildVoicePresets(
+    const std::vector<std::pair<std::string, std::string>>& voice_specs,
+    const std::map<std::string, std::string>& text_specs,
+    std::map<std::string, server::TtsVoicePreset>* presets,
+    std::string* error) {
+  for (const auto& [name, wav] : voice_specs) {
+    if (presets->contains(name)) {
+      *error = "duplicate --voice name '" + name + "'";
+      return false;
+    }
+    const std::filesystem::path wav_path(wav);
+    std::ifstream wav_file(wav_path, std::ios::binary);
+    if (!wav_file) {
+      *error = "cannot open voice reference " + wav_path.string();
+      return false;
+    }
+    const std::vector<char> wav_bytes{std::istreambuf_iterator<char>(wav_file),
+                                      std::istreambuf_iterator<char>()};
+
+    server::TtsVoicePreset preset;
+    std::string decode_error;
+    if (!models::qwen3_tts::DecodeWav(
+            std::as_bytes(std::span<const char>(wav_bytes)),
+            &preset.reference_audio, &decode_error)) {
+      *error = wav_path.string() + ": " + decode_error;
+      return false;
+    }
+
+    // An explicit --voice-text wins; otherwise fall back to a `.txt` sidecar
+    // beside the WAV. With neither, the voice clones from the speaker
+    // embedding alone, which needs no transcript.
+    if (const auto override_text = text_specs.find(name);
+        override_text != text_specs.end()) {
+      preset.reference_text = ResolveReferenceText(override_text->second);
+    } else {
+      std::filesystem::path sidecar = wav_path;
+      sidecar.replace_extension(".txt");
+      if (const auto text = ReadTextFile(sidecar)) {
+        preset.reference_text = *text;
+      }
+    }
+    preset.speaker_embedding_only = preset.reference_text.empty();
+    presets->emplace(name, std::move(preset));
+  }
+
+  for (const auto& [name, unused] : text_specs) {
+    (void)unused;
+    if (!presets->contains(name)) {
+      *error = "--voice-text names unknown voice '" + name + "'";
+      return false;
+    }
+  }
   return true;
 }
 
@@ -254,8 +301,14 @@ void PrintServeHelp(std::string_view program_name,
                      &asr_context_tokens);
     parser.AddCustomOption(
         "", "--voice", "NAME=PATH",
-        "Register a named Qwen3-TTS Base voice from a reference WAV; the "
-        "transcript is read from a .txt sidecar (repeatable)",
+        "Register a named Qwen3-TTS Base voice from a reference WAV "
+        "(repeatable)",
+        "Model",
+        [](std::string_view, std::string_view, std::string*) { return true; });
+    parser.AddCustomOption(
+        "", "--voice-text", "NAME=TEXT|PATH",
+        "Reference transcript for a --voice, given inline or as a file path; "
+        "defaults to a .txt sidecar beside the WAV (repeatable)",
         "Model",
         [](std::string_view, std::string_view, std::string*) { return true; });
     ServerOptionHelpTargets server_help;
@@ -690,14 +743,41 @@ int RunServe(std::span<const char* const> args) {
         &asr_context_tokens);
 
     std::map<std::string, server::TtsVoicePreset> voice_presets;
+    std::vector<std::pair<std::string, std::string>> voice_specs;
+    std::map<std::string, std::string> voice_text_specs;
     audio_parser.AddCustomOption(
         "", "--voice", "NAME=PATH",
-        "Register a named Qwen3-TTS Base voice from a reference WAV; the "
-        "transcript is read from a .txt sidecar (repeatable)",
+        "Register a named Qwen3-TTS Base voice from a reference WAV "
+        "(repeatable)",
         "Model",
-        [&voice_presets](std::string_view, std::string_view value,
-                         std::string* err) {
-          return LoadVoicePreset(value, &voice_presets, err);
+        [&voice_specs](std::string_view, std::string_view value,
+                       std::string* err) {
+          std::string name;
+          std::string path;
+          if (!SplitNameValue(value, "--voice", &name, &path, err)) {
+            return false;
+          }
+          voice_specs.emplace_back(std::move(name), std::move(path));
+          return true;
+        });
+    audio_parser.AddCustomOption(
+        "", "--voice-text", "NAME=TEXT|PATH",
+        "Reference transcript for a --voice, given inline or as a file path; "
+        "defaults to a .txt sidecar beside the WAV (repeatable)",
+        "Model",
+        [&voice_text_specs](std::string_view, std::string_view value,
+                            std::string* err) {
+          std::string name;
+          std::string text;
+          if (!SplitNameValue(value, "--voice-text", &name, &text, err)) {
+            return false;
+          }
+          if (!voice_text_specs.emplace(std::move(name), std::move(text))
+                   .second) {
+            *err = "duplicate --voice-text name";
+            return false;
+          }
+          return true;
         });
 
     if (!audio_parser.Parse(sub_args, &parse_err)) {
@@ -721,6 +801,13 @@ int RunServe(std::span<const char* const> args) {
     }
     if (default_context != 4096U) {
       tts_context_tokens = default_context;
+    }
+
+    if (!BuildVoicePresets(voice_specs, voice_text_specs, &voice_presets,
+                           &parse_err)) {
+      std::cerr << "Error: " << parse_err << "\n";
+      PrintServeHelp("gufo", help_topic);
+      return 2;
     }
 
     if (!voice_presets.empty() && tts_model.empty()) {

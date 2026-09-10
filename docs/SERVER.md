@@ -283,10 +283,28 @@ every request:
   --voice narrator_ita=/persist/models/audio/clear-italian-voice.wav
 ```
 
-`--voice NAME=PATH` is repeatable. The reference transcript is read from a
-`.txt` sidecar beside the WAV (`clear-english-voice.txt` for the example
-above); when no sidecar exists the preset falls back to
-`speaker_embedding_only` cloning, which needs no transcript. Preset names join
+`--voice NAME=PATH` is repeatable. The reference transcript comes from
+`--voice-text NAME=<transcript or path>`, which is also repeatable and may
+appear before or after its matching `--voice`:
+
+```sh
+./result/bin/gufo serve audio \
+  --tts-model /persist/models/audio/Qwen3-TTS-12Hz-1.7B-Base \
+  --voice narrator_ita=/persist/models/audio/clear-italian-voice.wav \
+  --voice-text "narrator_ita=Questo racconto e' cresciuto..." \
+  --voice narrator_eng=/persist/models/audio/clear-english-voice.wav \
+  --voice-text narrator_eng=/persist/models/audio/clear-english-voice.txt
+```
+
+A `--voice-text` value that names an existing file is read for its contents;
+anything else is used as the transcript itself. Resolution order is
+`--voice-text`, then a `.txt` sidecar beside the WAV
+(`clear-english-voice.txt` for the example above), and with neither the preset
+falls back to `speaker_embedding_only` cloning, which needs no transcript.
+
+A transcript that does not match its reference audio is worse than no
+transcript: synthesis runs to the `max_new_tokens` cap, so a short input can
+return several minutes of unusable audio. Preset names join
 `voice-clone` in `/v1/audio/voices`, and a request naming a preset must not
 also send `reference_audio`, `reference_text`, or `voice_clone_mode` --- the
 preset already supplies them. Presets require a Base checkpoint; CustomVoice

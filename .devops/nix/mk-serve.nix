@@ -13,8 +13,15 @@
   asrModel ? null,
   ttsContext ? null,
   asrContext ? null,
-  # Named Qwen3-TTS Base voices: { <name> = <path to reference WAV>; }. The
-  # reference transcript is read from a `.txt` sidecar beside each WAV.
+  # Named Qwen3-TTS Base voices. Each entry is either a bare reference WAV
+  # (its transcript read from a `.txt` sidecar beside it) or an attrset
+  # { wav = <path>; text = <transcript or path to a file holding it>; }:
+  #
+  #   voices = {
+  #     narrator_eng = "/voices/en.wav";
+  #     narrator_ita = { wav = "/voices/it.wav"; text = "Questo racconto..."; };
+  #     narrator_de  = { wav = "/voices/de.wav"; text = "/voices/de.txt"; };
+  #   };
   voices ? { },
 
   # Server Options
@@ -370,10 +377,25 @@ let
         "--asr-context"
         (toString finalAsrContext)
       ]
-      ++ lib.concatMap (name: [
-        "--voice"
-        "${name}=${toString voices.${name}}"
-      ]) (builtins.attrNames voices)
+      ++ lib.concatMap (
+        name:
+        let
+          entry = voices.${name};
+          structured = lib.isAttrs entry && !lib.isDerivation entry;
+          wav = if structured then entry.wav else entry;
+          text = if structured then (entry.text or null) else null;
+        in
+        assert lib.assertMsg (!structured || entry ? wav)
+          "gufo.mkServe: voice '${name}' must set 'wav'";
+        [
+          "--voice"
+          "${name}=${toString wav}"
+        ]
+        ++ lib.optionals (text != null) [
+          "--voice-text"
+          "${name}=${toString text}"
+        ]
+      ) (builtins.attrNames voices)
     )
     ++ extraArgs;
 

@@ -480,6 +480,21 @@
                 ttsContext = 4096;
                 asrContext = 1024;
               };
+              voicesCmd = self.lib.${system}.mkGufoServe {
+                modality = "audio";
+                ttsModel = "/var/models/qwen3-tts";
+                voices = {
+                  plain = "/var/voices/plain.wav";
+                  inline = {
+                    wav = "/var/voices/inline.wav";
+                    text = "spoken reference line";
+                  };
+                  sidecarfile = {
+                    wav = "/var/voices/file.wav";
+                    text = "/var/voices/file.txt";
+                  };
+                };
+              };
               asrCmd = self.lib.${system}.mkGufoServe {
                 modality = "asr";
                 model = "/var/models/qwen3-asr";
@@ -546,6 +561,14 @@
               audio_str="${audioCmd}"
               echo "$audio_str" | grep -F -- "--port 9100 --sessions 2 audio"
               echo "$audio_str" | grep -F -- "audio --model /var/models/qwen3-tts --context 4096"
+
+              # Voices take a bare WAV (sidecar transcript) or {wav, text},
+              # where text is either the transcript or a path holding it.
+              voices_str="${voicesCmd}"
+              echo "$voices_str" | grep -F -- "--voice 'plain=/var/voices/plain.wav'"
+              echo "$voices_str" | grep -F -- "--voice-text 'inline=spoken reference line'"
+              echo "$voices_str" | grep -F -- "--voice-text 'sidecarfile=/var/voices/file.txt'"
+              test "$(echo "$voices_str" | grep -o -- '--voice ' | wc -l)" = 3
 
               # "asr"/"stt" are helper spellings over the single audio
               # subcommand: a bare model routes to --asr-model.
