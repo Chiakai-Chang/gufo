@@ -99,6 +99,20 @@ actual prefill work; cache use; logical concurrency; physical execution width;
 and the executed plan. Prompts, generated text, local paths, request IDs, and
 token IDs are excluded.
 
+DeepSeek V4 Flash batches up to eight active requests. Each request owns its
+attention caches, compressor state, position, and sampling state. Dense and
+expert projections share weight reads across the batch; one request uses the
+single-session path.
+
+With `--dspark-model <support.gguf>`, DSpark is selected automatically unless
+`--speculative off` is explicit. Greedy requests share support computation and
+ragged verification; sampled requests use autoregressive decoding. Draft widths
+adapt within the requested `--draft-tokens` ceiling. C1 starts at three support
+tokens and can grow to the artifact limit; C2/C4/C8 cap the tail at three and C6
+at two. Low-acceptance C1 requests temporarily return to autoregressive decode.
+These measured defaults are model-owned. See the
+[DS4 benchmark and quality contract](../benchmarks/deepseek-v4-flash/README.md).
+
 ### Reasoning controls
 
 `POST /v1/chat/completions` accepts top-level `reasoning_effort` (`off`,

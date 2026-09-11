@@ -49,10 +49,6 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     AssignError(error_msg, "DeepSeek V4 Flash context must be at least 2");
     return nullptr;
   }
-  if (options.power_percent < 1 || options.power_percent > 100) {
-    AssignError(error_msg, "DeepSeek V4 Flash power must be in [1, 100]");
-    return nullptr;
-  }
   if (options.max_context >
       static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
     AssignError(error_msg, "DeepSeek V4 Flash context exceeds engine limits");
@@ -64,9 +60,6 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   engine_options.dspark_model_path = options.dspark_model_path.empty()
                                          ? nullptr
                                          : options.dspark_model_path.c_str();
-  engine_options.context_size = static_cast<int>(options.max_context);
-  engine_options.prefill_chunk = options.prefill_chunk;
-  engine_options.power_percent = options.power_percent;
 
   ds4_engine* engine = nullptr;
   if (ds4_engine_open(&engine, &engine_options) != 0 || engine == nullptr) {
@@ -96,6 +89,88 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   }
 
   return std::unique_ptr<Session>(new Session(shared_from_this(), session));
+}
+
+bool Model::EvaluateBatch(std::span<const SessionBatchItem> items,
+                          std::string* error_msg) const {
+  if (items.size() < 2 || items.size() > 8) {
+    AssignError(error_msg,
+                "DeepSeek batch decode requires two to eight sessions");
+    return false;
+  }
+
+  std::array<ds4_session_batch_item, 8> native_items{};
+  std::size_t item_count = 0;
+  for (const auto& item : items) {
+    if (item.session == nullptr || item.session->model_.get() != this) {
+      AssignError(error_msg, "DeepSeek batch contains an incompatible session");
+      return false;
+    }
+    native_items[item_count] = {
+        .session = item.session->session_,
+        .token = item.token,
+    };
+    ++item_count;
+  }
+
+  std::array<char, kErrorCapacity> error{};
+  if (ds4_sessions_eval_batch(native_items.data(), item_count, error.data(),
+                              error.size()) != 0) {
+    AssignError(error_msg, error[0] != '\0' ? error.data()
+                                            : "DeepSeek batch decode failed");
+    return false;
+  }
+  return true;
+}
+
+bool Model::DsparkStepBatch(std::span<const SessionDsparkBatchItem> items,
+                            std::string* error_msg) const {
+  if (items.empty() || items.size() > 8) {
+    AssignError(error_msg,
+                "DeepSeek DSpark batch requires one to eight sessions");
+    return false;
+  }
+
+  std::array<std::array<int, 32>, 8> blocks{};
+  std::array<int, 8> produced{};
+  std::array<ds4_session_dspark_batch_item, 8> native_items{};
+  for (std::size_t index = 0; index < items.size(); ++index) {
+    const SessionDsparkBatchItem& item = items[index];
+    if (item.session == nullptr || item.session->model_.get() != this ||
+        item.emitted == nullptr) {
+      AssignError(error_msg,
+                  "DeepSeek DSpark batch contains an incompatible session");
+      return false;
+    }
+    if (item.max_tokens == 0 || item.max_draft_tokens == 0) {
+      AssignError(error_msg,
+                  "DeepSeek DSpark batch needs positive token budgets");
+      return false;
+    }
+    native_items[index] = {
+        .session = item.session->session_,
+        .emitted = blocks[index].data(),
+        .emitted_cap =
+            static_cast<int>(std::min(item.max_tokens, blocks[index].size())),
+        .max_draft_tokens = item.max_draft_tokens,
+        .n_emitted = &produced[index],
+    };
+  }
+
+  std::array<char, kErrorCapacity> error{};
+  if (ds4_sessions_dspark_step_batch(native_items.data(), items.size(),
+                                     error.data(), error.size()) != 0) {
+    AssignError(error_msg,
+                error[0] != '\0'
+                    ? error.data()
+                    : "DeepSeek V4 Flash speculative batch step failed");
+    return false;
+  }
+  for (std::size_t index = 0; index < items.size(); ++index) {
+    items[index].emitted->assign(blocks[index].begin(),
+                                 blocks[index].begin() + produced[index]);
+  }
+  return true;
 }
 
 std::vector<int> Model::Tokenize(std::string_view text) const {
@@ -156,12 +231,12 @@ std::string Model::ModelName() const {
   return name != nullptr ? std::string(name) : std::string{};
 }
 
-std::uint32_t Model::PrefillChunk() const {
-  return ds4_engine_prefill_chunk(engine_);
-}
-
 std::uint32_t Model::MaxContext() const noexcept {
   return options_.max_context;
+}
+
+bool Model::HasDspark() const {
+  return ds4_engine_has_dspark(engine_);
 }
 
 Session::Session(std::shared_ptr<Model> model, ds4_session* session)
@@ -222,10 +297,6 @@ int Session::SelectNext(float temperature, std::uint64_t* rng_state, int top_k,
                             rng_state);
 }
 
-int Session::SelectNextExcluding(int excluded_token) const {
-  return ds4_session_argmax_excluding(session_, excluded_token);
-}
-
 bool Session::Evaluate(int token, std::string* error_msg) {
   std::array<char, kErrorCapacity> error{};
   if (ds4_session_eval(session_, token, error.data(), error.size()) != 0) {
@@ -241,24 +312,34 @@ bool Session::HasDspark() const {
   return ds4_engine_has_dspark(model_->engine_);
 }
 
+void Session::BeginRequest() {
+  ds4_session_begin_request(session_);
+}
+
+void Session::PrepareBatchExecution() {
+  ds4_session_prepare_batch_execution(session_);
+}
+
 bool Session::DsparkStep(std::vector<int>* emitted, std::string* error_msg) {
-  if (emitted == nullptr) {
-    AssignError(error_msg, "DSpark step needs an output buffer");
-    return false;
-  }
-  std::array<int, 32> block{};
-  int produced = 0;
-  std::array<char, kErrorCapacity> error{};
-  if (ds4_session_dspark_step(session_, block.data(),
-                              static_cast<int>(block.size()), &produced,
-                              error.data(), error.size()) != 0) {
-    AssignError(error_msg, error[0] != '\0'
-                               ? error.data()
-                               : "DeepSeek V4 Flash speculative step failed");
-    return false;
-  }
-  emitted->assign(block.begin(), block.begin() + produced);
-  return true;
+  return DsparkStep(32, emitted, error_msg);
+}
+
+bool Session::DsparkStep(std::size_t max_tokens, std::vector<int>* emitted,
+                         std::string* error_msg) {
+  return DsparkStep(max_tokens, SessionDsparkBatchItem{}.max_draft_tokens,
+                    emitted, error_msg);
+}
+
+bool Session::DsparkStep(std::size_t max_tokens, std::uint32_t max_draft_tokens,
+                         std::vector<int>* emitted, std::string* error_msg) {
+  const SessionDsparkBatchItem item{
+      .session = this,
+      .max_tokens = max_tokens,
+      .max_draft_tokens = max_draft_tokens,
+      .emitted = emitted,
+  };
+  return model_->DsparkStepBatch(
+      std::span<const SessionDsparkBatchItem>(&item, 1), error_msg);
 }
 
 Session::DsparkStats Session::DsparkStatistics() const {
@@ -269,32 +350,6 @@ Session::DsparkStats Session::DsparkStatistics() const {
                            &stats.anchors, &stats.full_blocks, &stats.steps,
                            &stats.skipped, &stats.context_tokens);
   return stats;
-}
-
-bool Session::DsparkDraftSelfTest(int cycles, std::string* error_msg) {
-  std::array<char, kErrorCapacity> error{};
-  if (ds4_session_dspark_draft_selftest(session_, cycles, error.data(),
-                                        error.size()) != 0) {
-    AssignError(error_msg,
-                error[0] != '\0'
-                    ? error.data()
-                    : "DeepSeek V4 Flash DSpark draft self-test failed");
-    return false;
-  }
-  return true;
-}
-
-bool Session::DsparkSelfTest(int rows, std::string* error_msg) {
-  std::array<char, kErrorCapacity> error{};
-  if (ds4_session_dspark_selftest(session_, rows, error.data(), error.size()) !=
-      0) {
-    AssignError(error_msg,
-                error[0] != '\0'
-                    ? error.data()
-                    : "DeepSeek V4 Flash DSpark verifier self-test failed");
-    return false;
-  }
-  return true;
 }
 
 std::vector<float> Session::CopyLogits(std::string* error_msg) const {
@@ -379,6 +434,10 @@ int Session::Position() const {
 
 int Session::ContextSize() const {
   return ds4_session_ctx(session_);
+}
+
+std::uint32_t Session::PrefillCapacity() const {
+  return ds4_session_prefill_capacity(session_);
 }
 
 std::uint64_t Session::PayloadBytes() const {

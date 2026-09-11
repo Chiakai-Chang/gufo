@@ -16,14 +16,15 @@ struct BenchOptions {
   std::vector<std::size_t> n_prompts{64, 128, 512};
   std::vector<std::size_t> n_gens{128};
   std::vector<std::size_t> n_depths{0};
+  std::vector<std::size_t> concurrency{1};
   std::size_t repetitions{1};
   std::size_t validate_prefill_tokens{0};
   int n_gpu_layers{99};
   std::string speculative_backend{""};
   std::string mtp_model_path;
   std::string dflash_model_path;
+  std::string dspark_model_path;
   std::uint32_t draft_tokens{7};
-  std::string draft_policy{"auto"};
   std::uint32_t min_draft_tokens{1};
   float draft_p_min{0.0F};
   bool verbose{false};

@@ -7,6 +7,7 @@
 #include "model.h"
 
 struct ds4_dspark_model;
+struct ds4_dspark_request_state;
 struct ds4_model;
 struct ds4_rocm_graph;
 struct ds4_vocab;
@@ -23,13 +24,38 @@ struct ds4_string_iterator {
     uint64_t remaining;
 };
 
+struct ds4_rocm_batch_item {
+    ds4_rocm_graph *graph;
+    int token;
+    uint32_t position;
+    float *logits;
+};
+
+struct ds4_rocm_verify_item {
+  ds4_rocm_graph* graph;
+  const ds4_tokens* tokens;
+  uint32_t start;
+  uint32_t n_tokens;
+  uint32_t logical_n_tokens;
+  int32_t* row_tops;
+  float* frontier_logits;
+};
+
+struct ds4_rocm_dspark_draft_item {
+  ds4_rocm_graph* graph;
+  int target_next_token;
+  uint32_t position;
+  uint32_t max_draft_tokens;
+  int32_t* tokens;
+  uint32_t* n_tokens;
+};
+
 struct ds4_engine {
     ds4_model *model;
     ds4_vocab *vocab;
     ds4_weights *weights;
     ds4_dspark_model *dspark;
-    int power_percent;
-    uint32_t prefill_chunk;
+    ds4_rocm_graph* batch_workspace;
     bool rocm_ready;
 };
 
@@ -101,6 +127,9 @@ bool ds4_rocm_graph_eval(ds4_rocm_graph *graph,
                          int token,
                          uint32_t position,
                          float *logits);
+bool ds4_rocm_graph_eval_batch(ds4_engine *engine,
+                               const ds4_rocm_batch_item *items,
+                               size_t item_count);
 /* DSpark speculative verification.
  *
  * ds4_rocm_graph_verify_suffix scores `n_tokens` candidates in one batched pass
@@ -121,6 +150,9 @@ bool ds4_rocm_graph_verify_suffix(ds4_rocm_graph *graph,
                                   uint32_t start,
                                   uint32_t n_tokens,
                                   int32_t *row_tops);
+bool ds4_rocm_graph_verify_batch(ds4_engine* engine,
+                                 const ds4_rocm_verify_item* items,
+                                 size_t item_count);
 bool ds4_rocm_graph_read_spec_logits_row(const ds4_rocm_graph *graph,
                                          uint32_t row,
                                          float *logits);
@@ -128,14 +160,16 @@ bool ds4_rocm_graph_read_spec_logits_row(const ds4_rocm_graph *graph,
 /* DSpark drafting.
  *
  * Attaching a support model allocates the drafter's rings and enables target
- * feature capture. `_inject` turns captured features into ring rows for the given
- * absolute positions; `_draft` proposes one block for [pos0, pos0 + block_size).
+ * feature capture. `_inject` turns captured features into ring rows for the
+ * given absolute positions; `_draft` proposes one block for [pos0, pos0 +
+ * block_size).
  */
-struct ds4_dspark_model;
 bool ds4_rocm_graph_dspark_attach(ds4_rocm_graph *graph,
                                   ds4_engine *engine,
                                   const ds4_dspark_model *dspark);
 uint32_t ds4_rocm_graph_dspark_block_size(const ds4_rocm_graph *graph);
+void ds4_rocm_graph_dspark_set_capture_enabled(ds4_rocm_graph *graph,
+                                               bool enabled);
 bool ds4_rocm_graph_dspark_capture_ready(const ds4_rocm_graph *graph);
 void ds4_rocm_graph_dspark_capture_reset(ds4_rocm_graph *graph);
 uint32_t ds4_rocm_graph_dspark_batch_capture_rows(const ds4_rocm_graph *graph,
@@ -144,38 +178,29 @@ bool ds4_rocm_graph_dspark_inject(ds4_rocm_graph *graph,
                                   uint32_t pos0,
                                   uint32_t n_rows);
 uint32_t ds4_rocm_graph_dspark_context_len(const ds4_rocm_graph *graph);
-void ds4_rocm_graph_dspark_truncate_context(ds4_rocm_graph *graph, uint32_t length);
-/* Replaces row 0 with the target's known next token and re-traces the Markov
- * chain over the remaining rows from it. Must run before the verification pass,
- * which overwrites the draft's base logits. */
-bool ds4_rocm_graph_dspark_reselect_tail(ds4_rocm_graph *graph,
-                                         int known_first_token,
-                                         uint32_t n_rows,
-                                         int32_t *tokens_out);
-bool ds4_rocm_graph_dspark_draft(ds4_rocm_graph *graph,
-                                 ds4_engine *engine,
-                                 int last_token,
-                                 uint32_t pos0,
-                                 int32_t *tokens_out,
-                                 uint32_t *n_out);
+void ds4_rocm_graph_dspark_truncate_context(ds4_rocm_graph* graph,
+                                            uint32_t length);
+bool ds4_rocm_graph_dspark_draft(ds4_rocm_graph* graph, ds4_engine* engine,
+                                 int target_next_token, uint32_t pos0,
+                                 int32_t* tokens_out, uint32_t* n_out);
+bool ds4_rocm_graph_dspark_draft_head_batch(
+    ds4_engine* engine, const ds4_rocm_dspark_draft_item* items,
+    size_t item_count);
 
 uint64_t ds4_rocm_graph_snapshot_bytes(const ds4_rocm_graph *graph,
                                        const ds4_tokens *checkpoint);
-int ds4_rocm_graph_save_snapshot(const ds4_rocm_graph *graph,
-                                 const ds4_tokens *checkpoint,
-                                 const float *logits,
-                                 uint32_t prefill_capacity,
+int ds4_rocm_graph_save_snapshot(const ds4_rocm_graph* graph,
+                                 const ds4_tokens* checkpoint,
+                                 const float* logits, uint32_t prefill_capacity,
                                  int context_size,
-                                 ds4_session_snapshot *snapshot,
-                                 char *error,
+                                 const ds4_dspark_request_state* state,
+                                 ds4_session_snapshot* snapshot, char* error,
                                  size_t error_capacity);
-int ds4_rocm_graph_load_snapshot(ds4_rocm_graph *graph,
-                                 ds4_tokens *checkpoint,
-                                 float *logits,
-                                 uint32_t prefill_capacity,
+int ds4_rocm_graph_load_snapshot(ds4_rocm_graph* graph, ds4_tokens* checkpoint,
+                                 float* logits, uint32_t prefill_capacity,
                                  int context_size,
-                                 const ds4_session_snapshot *snapshot,
-                                 char *error,
-                                 size_t error_capacity);
+                                 ds4_dspark_request_state* state,
+                                 const ds4_session_snapshot* snapshot,
+                                 char* error, size_t error_capacity);
 
 #endif  // GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_NATIVE_INTERNAL_H_

@@ -26,12 +26,7 @@ namespace gufo::server {
 enum class TextSpeculativeBackend : std::uint8_t {
   kDisabled,
   kDFlash,
-};
-
-enum class TextDraftPolicy : std::uint8_t {
-  kFixed,
-  kRollingAcceptance,
-  kAcceptedTokenEma,
+  kDSpark,
 };
 
 struct TextSpeculativeConfig {
@@ -40,7 +35,6 @@ struct TextSpeculativeConfig {
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
   float draft_p_min{0.0F};
-  TextDraftPolicy draft_policy{TextDraftPolicy::kRollingAcceptance};
 };
 
 struct TextDiskCacheConfig {
@@ -92,6 +86,7 @@ public:
             std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {});
 #endif
 

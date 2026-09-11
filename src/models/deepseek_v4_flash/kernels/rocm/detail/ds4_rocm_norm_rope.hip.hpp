@@ -1,114 +1,4 @@
-/* Plain RMS norm with the row held in registers.
- *
- * The generic kernel below reads the row twice from global memory: once to
- * square and once to scale. At `n == blockDim.x * PER_THREAD` each thread can
- * keep its own strided slice, so the second read disappears and a 4,096-wide
- * row costs 16 VGPRs. The accumulation order and the reduction tree are
- * unchanged, so the output is bit-identical. */
-/* Both outputs are optional, and that is load-bearing rather than a convenience.
- *
- * A separate F16 norm kernel with identical source drifted -- the 273-token
- * prefill envelope moved to rmse 0.53 from 0.41 -- because under -ffast-math
- * `rsqrtf` need not lower to the same instruction sequence in two different
- * functions, so the two kernels computed slightly different `scale`. A
- * measurement settled that it was not the projection: running the F32 and
- * F16-activation routes back to back on byte-identical F16 input differs in
- * 0 of 98,304 outputs. Keeping one function for both output forms makes the
- * halves exactly what converting the floats would produce, because it is the
- * same `scale` from the same compiled code. */
-template <uint32_t PER_THREAD>
-__global__ static void rms_norm_plain_regs_kernel(
-        float *out, __half *out_h, const float *x, uint32_t n, uint32_t rows,
-        float eps) {
-    const uint32_t row = blockIdx.x;
-    if (row >= rows) return;
-    const float *xr = x + (uint64_t)row * n;
-    float *orow = out ? out + (uint64_t)row * n : NULL;
-    __half *orow_h = out_h ? out_h + (uint64_t)row * n : NULL;
-    float v[PER_THREAD];
-    float sum = 0.0f;
-#pragma unroll
-    for (uint32_t k = 0; k < PER_THREAD; k++) {
-        v[k] = xr[threadIdx.x + k * blockDim.x];
-        sum += v[k] * v[k];
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
-#pragma unroll
-    for (uint32_t k = 0; k < PER_THREAD; k++) {
-        const float y = v[k] * scale;
-        const uint32_t idx = threadIdx.x + k * blockDim.x;
-        if (orow) orow[idx] = y;
-        if (orow_h) orow_h[idx] = __float2half_rn(y);
-    }
-}
-
-/* Same reduction, F16 result.
- *
- * The hyper-connection row is normalized and then consumed by exactly one F16
- * projection, so the F32 store and the separate conversion pass that followed it
- * were both avoidable: 268 MiB written and 402 MiB moved per call for a value the
- * consumer immediately narrows. Bit-identical -- the F32 the separate form stored
- * is exactly what is rounded here. */
-template <uint32_t PER_THREAD>
-__global__ static void rms_norm_plain_regs_f16_kernel(
-        __half *out, const float *x, uint32_t n, uint32_t rows, float eps) {
-    const uint32_t row = blockIdx.x;
-    if (row >= rows) return;
-    const float *xr = x + (uint64_t)row * n;
-    __half *orow = out + (uint64_t)row * n;
-    float v[PER_THREAD];
-    float sum = 0.0f;
-#pragma unroll
-    for (uint32_t k = 0; k < PER_THREAD; k++) {
-        v[k] = xr[threadIdx.x + k * blockDim.x];
-        sum += v[k] * v[k];
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)n + eps);
-#pragma unroll
-    for (uint32_t k = 0; k < PER_THREAD; k++) {
-        /* Explicit round-to-nearest, matching f32_to_f16_vec4_kernel: the plain
-         * conversion is not pinned to a rounding mode under -ffast-math, and the
-         * separate F32-store-then-convert pair this replaces rounded once, here. */
-        orow[threadIdx.x + k * blockDim.x] = __float2half_rn(v[k] * scale);
-    }
-}
-
-__global__ static void rms_norm_plain_kernel(float *out, const float *x, uint32_t n, uint32_t rows, float eps) {
-    uint32_t row = blockIdx.x;
-    if (row >= rows) return;
-    const float *xr = x + (uint64_t)row * n;
-    float *orow = out + (uint64_t)row * n;
-    float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        float v = xr[i];
-        sum += v * v;
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    float scale = rsqrtf(partial[0] / (float)n + eps);
-    for (uint32_t i = threadIdx.x; i < n; i += blockDim.x) {
-        orow[i] = xr[i] * scale;
-    }
-}
+#include "ds4_rocm_norm.hip.hpp"
 
 __global__ static void rms_norm_weight_kernel(float *out, const float *x, const float *w, uint32_t n, uint32_t rows, float eps) {
     uint32_t row = blockIdx.x;
@@ -198,13 +88,9 @@ __device__ static float rope_yarn_ramp_dev(float low, float high, int i0);
  * The row is `head_dim` floats -- 2 KiB at the 512 this model uses -- so it
  * fits beside the reduction scratch and the second read disappears entirely.
  *
- * Not bit-identical to the norm-then-rope sequence in practice. Every value,
- * the reduction tree, and the per-element arithmetic are written identically,
- * and the tail is still stored and reloaded so the rotation's operands come
- * from memory as before, yet the pinned trajectory still moves (116/128 to
- * 113/128 top-1). Staging the row in LDS changes the schedule enough for
- * -ffast-math to land somewhere else. Kept opt-in for that reason; see the
- * launcher. */
+ * Wide prefill uses this fused route under the model's logit error envelope.
+ * Verification retains separate norm and rotation kernels to preserve scalar
+ * rounding exactly. */
 #define DS4_HEAD_ROPE_LDS_DIM 512u
 
 __global__ static void head_rms_norm_rope_tail_lds_kernel(
@@ -285,147 +171,6 @@ __global__ static void head_rms_norm_rope_tail_lds_kernel(
         const float x1 = tail[i + 1];
         tail[i] = x0 * c - x1 * s;
         tail[i + 1] = x0 * s + x1 * c;
-    }
-}
-
-__global__ static void head_rms_norm_rope_tail_kernel(
-        float *x,
-        uint32_t n_tok,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t n_rot,
-        uint32_t pos0,
-        uint32_t n_ctx_orig,
-        int inverse,
-        float freq_base,
-        float freq_scale,
-        float ext_factor,
-        float attn_factor,
-        float beta_fast,
-        float beta_slow,
-        float eps) {
-    uint32_t row = blockIdx.x;
-    if (row >= n_tok * n_head) return;
-    uint32_t t = row / n_head;
-    float *xr = x + (uint64_t)row * head_dim;
-    float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = xr[i];
-        sum += v * v;
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
-    const uint32_t n_nope = head_dim - n_rot;
-    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
-        xr[i] *= scale;
-    }
-
-    float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        float denom = 2.0f * logf(freq_base);
-        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
-        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
-        corr0 = fmaxf(0.0f, corr0);
-        corr1 = fminf((float)(n_rot - 1), corr1);
-    }
-    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
-    for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
-        uint32_t i = pair * 2u;
-        float theta_extrap = (float)(pos0 + t) * powf(theta_scale, (float)pair);
-        float theta_interp = freq_scale * theta_extrap;
-        float theta = theta_interp;
-        float mscale = attn_factor;
-        if (ext_factor != 0.0f) {
-            float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
-            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-        }
-        float c = cosf(theta) * mscale;
-        float s = sinf(theta) * mscale;
-        if (inverse) s = -s;
-        float *tail = xr + n_nope;
-        float x0 = tail[i] * scale;
-        float x1 = tail[i + 1] * scale;
-        tail[i] = x0 * c - x1 * s;
-        tail[i + 1] = x0 * s + x1 * c;
-    }
-}
-
-__global__ static void head_rms_norm_rope_tail_from_half_kernel(
-        float *out,
-        const __half *x,
-        uint32_t n_tok,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t n_rot,
-        uint32_t pos0,
-        uint32_t n_ctx_orig,
-        int inverse,
-        float freq_base,
-        float freq_scale,
-        float ext_factor,
-        float attn_factor,
-        float beta_fast,
-        float beta_slow,
-        float eps) {
-    uint32_t row = blockIdx.x;
-    if (row >= n_tok * n_head) return;
-    uint32_t t = row / n_head;
-    const __half *xr = x + (uint64_t)row * head_dim;
-    float *orow = out + (uint64_t)row * head_dim;
-    float sum = 0.0f;
-    for (uint32_t i = threadIdx.x; i < head_dim; i += blockDim.x) {
-        float v = __half2float(xr[i]);
-        sum += v * v;
-    }
-    __shared__ float partial[256];
-    partial[threadIdx.x] = sum;
-    __syncthreads();
-    for (uint32_t stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float scale = rsqrtf(partial[0] / (float)head_dim + eps);
-    const uint32_t n_nope = head_dim - n_rot;
-    for (uint32_t i = threadIdx.x; i < n_nope; i += blockDim.x) {
-        orow[i] = __half2float(xr[i]) * scale;
-    }
-
-    float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        float denom = 2.0f * logf(freq_base);
-        corr0 = floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
-        corr1 = ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
-        corr0 = fmaxf(0.0f, corr0);
-        corr1 = fminf((float)(n_rot - 1), corr1);
-    }
-    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
-    const __half *tail = xr + n_nope;
-    float *otail = orow + n_nope;
-    for (uint32_t pair = threadIdx.x; pair < n_rot / 2; pair += blockDim.x) {
-        uint32_t i = pair * 2u;
-        float theta_extrap = (float)(pos0 + t) * powf(theta_scale, (float)pair);
-        float theta_interp = freq_scale * theta_extrap;
-        float theta = theta_interp;
-        float mscale = attn_factor;
-        if (ext_factor != 0.0f) {
-            float ramp_mix = rope_yarn_ramp_dev(corr0, corr1, (int)i) * ext_factor;
-            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
-            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-        }
-        float c = cosf(theta) * mscale;
-        float s = sinf(theta) * mscale;
-        if (inverse) s = -s;
-        float x0 = __half2float(tail[i]) * scale;
-        float x1 = __half2float(tail[i + 1]) * scale;
-        otail[i] = x0 * c - x1 * s;
-        otail[i + 1] = x0 * s + x1 * c;
     }
 }
 
@@ -543,12 +288,6 @@ __device__ static float dsv4_e2m1fn_dequant_dev(float x) {
     return sign * dsv4_e2m1fn_value_dev(best);
 }
 
-__device__ static float model_scalar_dev(const void *base, uint64_t offset, uint32_t type, uint64_t idx) {
-    const char *p = (const char *)base + offset;
-    if (type == 1u) return __half2float(((const __half *)p)[idx]);
-    return ((const float *)p)[idx];
-}
-
 __device__ static float model_ape_value_dev(const void *base, uint64_t offset, uint32_t type,
                                             uint32_t width, uint32_t row, uint32_t col) {
     const char *p = (const char *)base + offset;
@@ -563,72 +302,24 @@ __device__ static float model_ape_value_dev(const void *base, uint64_t offset, u
     return ((const float *)p)[(uint64_t)row * width + col];
 }
 
-__device__ static float rope_yarn_ramp_cpu_equiv_dev(float low, float high, int i0) {
-    float y = ((float)(i0 / 2) - low) / fmaxf(0.001f, high - low);
-    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
-}
-
-__device__ static DS4_ROCM_UNUSED void rope_tail_one_dev(float *x, uint32_t head_dim, uint32_t n_rot, uint32_t pos, uint32_t n_ctx_orig, float freq_base, float freq_scale, float ext_factor, float attn_factor, float beta_fast, float beta_slow) {
-    uint32_t n_nope = head_dim - n_rot;
-    float corr0 = 0.0f, corr1 = 0.0f;
-    if (ext_factor != 0.0f) {
-        float denom = 2.0f * logf(freq_base);
-        corr0 = fmaxf(0.0f, floorf((float)n_rot * logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom));
-        corr1 = fminf((float)(n_rot - 1), ceilf((float)n_rot * logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom));
-    }
-    for (uint32_t i = 0; i < n_rot; i += 2) {
-        float theta_extrap = (float)pos * powf(freq_base, -((float)i) / (float)n_rot);
-        float theta_interp = freq_scale * theta_extrap;
-        float theta = theta_interp;
-        float mscale = attn_factor;
-        if (ext_factor != 0.0f) {
-            float mix = rope_yarn_ramp_cpu_equiv_dev(corr0, corr1, (int)i) * ext_factor;
-            theta = theta_interp * (1.0f - mix) + theta_extrap * mix;
-            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
-        }
-        float c = cosf(theta) * mscale;
-        float s = sinf(theta) * mscale;
-        float x0 = x[n_nope + i];
-        float x1 = x[n_nope + i + 1];
-        x[n_nope + i] = x0 * c - x1 * s;
-        x[n_nope + i + 1] = x0 * s + x1 * c;
-    }
-}
-
-extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, float eps) {
-    if (!hip_tensor_has_f32(out, n) || !hip_tensor_has_f32(x, n)) return 0;
-    if (n == 0u) return 1;
-    rms_norm_plain_kernel<<<1, 256>>>((float *)out->ptr, (const float *)x->ptr, n, 1, eps);
-    return hip_ok(hipGetLastError(), "rms_norm_plain launch");
-}
 extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
     if (!hip_tensor_has_elems2(out, n, rows, sizeof(float)) ||
         !hip_tensor_has_elems2(x, n, rows, sizeof(float))) return 0;
     if (n == 0u || rows == 0u) return 1;
     /* The hot caller is the 4-way hyper-connection row, 16,384 floats wide. */
     if (n == 256u * 64u) {
-        rms_norm_plain_regs_kernel<64u><<<rows, 256>>>(
-                (float *)out->ptr, NULL, (const float *)x->ptr, n, rows, eps);
-        return hip_ok(hipGetLastError(), "rms_norm_plain regs launch");
+      rms_norm_plain_regs_kernel<64u>
+          <<<rows, 256>>>((float*)out->ptr, (const float*)x->ptr, n, rows, eps);
+      return hip_ok(hipGetLastError(), "rms_norm_plain regs launch");
     }
     rms_norm_plain_kernel<<<rows, 256>>>((float *)out->ptr, (const float *)x->ptr, n, rows, eps);
     return hip_ok(hipGetLastError(), "rms_norm_plain launch");
 }
-/* F16-only result from the shared norm kernel, so the halves are exactly what
- * converting its floats would give. Pair with
- * ds4_gpu_matmul_f16_f16_input_tensor, which is byte-identical to the F32 entry's
- * projection on the same halves. Returns 0 when the shape is not the hot
- * hyper-connection row. */
-extern "C" int ds4_gpu_rms_norm_plain_rows_f16_tensor(ds4_gpu_tensor *out_h, const ds4_gpu_tensor *x, uint32_t n, uint32_t rows, float eps) {
-    if (n != 256u * 64u) return 0;
-    if (!hip_tensor_has_elems2(out_h, n, rows, sizeof(__half)) ||
-        !hip_tensor_has_elems2(x, n, rows, sizeof(float))) return 0;
-    if (rows == 0u) return 1;
-    rms_norm_plain_regs_kernel<64u><<<rows, 256>>>(
-            NULL, (__half *)out_h->ptr, (const float *)x->ptr, n, rows, eps);
-    return hip_ok(hipGetLastError(), "rms_norm_plain regs f16 launch");
+extern "C" int ds4_gpu_rms_norm_plain_tensor(ds4_gpu_tensor* out,
+                                             const ds4_gpu_tensor* x,
+                                             uint32_t n, float eps) {
+  return ds4_gpu_rms_norm_plain_rows_tensor(out, x, n, 1u, eps);
 }
-
 extern "C" int ds4_gpu_rms_norm_weight_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t n, float eps) {
     uint64_t weight_bytes = 0;
     if (!model_map || !hip_u64_mul_checked(n, sizeof(float), &weight_bytes) ||
@@ -716,12 +407,8 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(ds4_gpu_tensor *x, uint32_
         return 0;
     }
     if (rows64 == 0u) return 1;
-    /* Opt-in: worth about 250 ms per 4,096-token chunk, but it perturbs the
-     * pinned trajectory (116/128 to 113/128 top-1). Staging the row in LDS
-     * changes what the optimizer can do with the scale multiply even when the
-     * expression is written identically, and this backend builds with
-     * -ffast-math. Enable with GUFO_DEEPSEEK_ROCM_FUSED_QNORM_ROPE=1. */
-    if (n_tok < DS4_ROCM_WIDE_PREFILL_ROWS) return 0;
+    // Restrict fusion to the qualified wide-prefill shapes.
+    if (n_tok < DS4_ROCM_ATTENTION_WIDE_ROWS) return 0;
     head_rms_norm_rope_tail_lds_kernel<<<(uint32_t)rows64, 256>>>(
             (float *)x->ptr, n_tok, n_head, head_dim, n_rot, pos0, n_ctx_orig,
             inverse ? 1 : 0, freq_base, freq_scale, ext_factor, attn_factor,

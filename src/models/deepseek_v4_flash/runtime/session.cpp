@@ -1,13 +1,15 @@
-#include "native_internal.h"
-
-#include "dspark_internal.h"
-
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
+#include <array>
 #include <memory>
 #include <new>
+
+#include "dspark_internal.h"
+#include "native_internal.h"
 
 #define DS4_SESSION_NEG_INF (-1.0e30f)
 
@@ -21,16 +23,7 @@ struct ds4_session {
     uint32_t prefill_capacity;
     int context_size;
     bool checkpoint_valid;
-    uint64_t dspark_drafted;
-    uint64_t dspark_accepted;
-    uint64_t dspark_support_drafted;
-    uint64_t dspark_support_accepted;
-    uint64_t dspark_positional_accepted;
-    uint64_t dspark_anchors;
-    uint64_t dspark_full_blocks;
-    uint64_t dspark_steps;
-    uint64_t dspark_skipped;
-    uint32_t dspark_skip_remaining;
+    ds4_dspark_request_state dspark_state{};
 };
 
 static void set_error(char *error,
@@ -44,6 +37,17 @@ static void set_error(char *error,
 static bool session_cancelled(const ds4_session *session) {
     return session && session->cancel &&
            session->cancel(session->cancel_user_data);
+}
+
+static void session_dspark_reset_request_state(ds4_session *session,
+                                               bool preserve_force_plain) {
+    if (!session) return;
+    const bool force_plain =
+        preserve_force_plain && session->dspark_state.force_plain_request;
+    session->dspark_state = {};
+    session->dspark_state.force_plain_request = force_plain;
+    session->dspark_state.plain_only = force_plain;
+    ds4_rocm_graph_dspark_set_capture_enabled(session->graph, !force_plain);
 }
 
 int ds4_session_create(ds4_session **out,
@@ -69,8 +73,8 @@ int ds4_session_create(ds4_session **out,
     const int vocabulary_size = ds4_engine_vocab_size(engine);
     if (vocabulary_size <= 0 ||
         (size_t)vocabulary_size > SIZE_MAX / sizeof(session->logits[0])) {
-        ds4_rocm_graph_destroy(session->graph);
-        return 1;
+      ds4_rocm_graph_destroy(session->graph);
+      return 1;
     }
     session->logits.reset(new (std::nothrow) float[vocabulary_size]);
     if (!session->logits) {
@@ -78,9 +82,8 @@ int ds4_session_create(ds4_session **out,
         return 1;
     }
 
-    /* Attach before prefill so target hidden states are captured. Converting
-     * those captures into support KV is deferred until the first draft, keeping
-     * ordinary prompt processing unchanged. */
+    /* Prefill captures target features and seeds the attached support model's
+     * KV. */
     if (engine->dspark != nullptr) {
         if (!ds4_rocm_graph_dspark_attach(session->graph, engine, engine->dspark)) {
             ds4_rocm_graph_destroy(session->graph);
@@ -110,13 +113,34 @@ void ds4_session_set_cancel(ds4_session *session,
 void ds4_session_invalidate(ds4_session *session) {
     if (!session) return;
     session->checkpoint_valid = false;
+    session_dspark_reset_request_state(session, false);
+}
+
+void ds4_session_begin_request(ds4_session* session) {
+  if (!session)
+    return;
+  const bool incomplete_support =
+      session->engine->dspark &&
+      ds4_rocm_graph_dspark_context_len(session->graph) <
+          static_cast<uint32_t>(session->checkpoint.len);
+  session_dspark_reset_request_state(session, false);
+  if (incomplete_support)
+    ds4_session_prepare_batch_execution(session);
+}
+
+void ds4_session_prepare_batch_execution(ds4_session *session) {
+    if (!session || ds4_rocm_graph_dspark_block_size(session->graph) == 0u) {
+        return;
+    }
+    session->dspark_state.force_plain_request = true;
+    session->dspark_state.plain_only = true;
+    ds4_rocm_graph_dspark_set_capture_enabled(session->graph, false);
 }
 
 /*
  * Evaluate one target token and extend the support ring with the sampled target
- * features captured by that decode. If support coverage has a gap (for example
- * after restoring a target-only snapshot), injection stores the row but the
- * graph deliberately leaves its contiguous context length unchanged.
+ * features captured by that decode. An injection after disabled capture cannot
+ * claim contiguous coverage across the missing support rows.
  */
 static bool session_commit_and_extend(ds4_session *session, int token) {
     const uint32_t position = (uint32_t)session->checkpoint.len;
@@ -130,9 +154,41 @@ static bool session_commit_and_extend(ds4_session *session, int token) {
     ds4_tokens_push(&session->checkpoint, token);
     if (ds4_rocm_graph_dspark_block_size(session->graph) != 0 &&
         ds4_rocm_graph_dspark_capture_ready(session->graph)) {
-        return ds4_rocm_graph_dspark_inject(session->graph, position, 1u);
+      return ds4_rocm_graph_dspark_inject(session->graph, position, 1u);
     }
     return true;
+}
+
+static bool sessions_commit_and_extend_batch(
+    const ds4_session_dspark_batch_item* items,
+    const std::array<int, 8>& tokens, size_t item_count) {
+  if (!items || item_count < 2u || item_count > 8u)
+    return false;
+  std::array<ds4_rocm_batch_item, 8> batch{};
+  for (size_t index = 0; index < item_count; ++index) {
+    ds4_session* session = items[index].session;
+    batch[index] = {
+        .graph = session->graph,
+        .token = tokens[index],
+        .position = static_cast<uint32_t>(session->checkpoint.len),
+        .logits = session->logits.get(),
+    };
+  }
+  if (!ds4_rocm_graph_eval_batch(items[0].session->engine, batch.data(),
+                                 item_count)) {
+    return false;
+  }
+  for (size_t index = 0; index < item_count; ++index) {
+    ds4_session* session = items[index].session;
+    const uint32_t position = static_cast<uint32_t>(session->checkpoint.len);
+    ds4_tokens_push(&session->checkpoint, tokens[index]);
+    if (ds4_rocm_graph_dspark_block_size(session->graph) != 0u &&
+        ds4_rocm_graph_dspark_capture_ready(session->graph) &&
+        !ds4_rocm_graph_dspark_inject(session->graph, position, 1u)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /*
@@ -167,66 +223,68 @@ int ds4_session_sync(ds4_session *session,
                      const ds4_tokens *prompt,
                      char *error,
                      size_t error_capacity) {
-    if (!session || !prompt || prompt->len <= 0 ||
-        prompt->len >= session->context_size) {
-        set_error(error, error_capacity, "prompt exceeds context");
-        return 1;
-    }
+  if (!session || !prompt || !prompt->v || prompt->len <= 0 ||
+      prompt->len >= session->context_size) {
+    set_error(error, error_capacity, "prompt exceeds context");
+    return 1;
+  }
+  const int vocabulary_size = ds4_engine_vocab_size(session->engine);
+  if (std::any_of(prompt->v, prompt->v + prompt->len,
+                  [vocabulary_size](int token) {
+                    return token < 0 || token >= vocabulary_size;
+                  })) {
+    set_error(error, error_capacity, "prompt contains an invalid token ID");
+    return 1;
+  }
     if (session_cancelled(session)) {
         set_error(error, error_capacity, "prefill cancelled");
         return DS4_SESSION_SYNC_INTERRUPTED;
     }
 
-    if (session->checkpoint_valid &&
-        prompt->len >= session->checkpoint.len &&
+    if (session->checkpoint_valid && prompt->len >= session->checkpoint.len &&
         ds4_tokens_starts_with(prompt, &session->checkpoint)) {
-        const int suffix = prompt->len - session->checkpoint.len;
-        if (suffix > 0) {
-            /* Preserve a lazily captured prompt before the resumed prefill
-             * reuses the batch capture storage for its suffix. A target-only
-             * snapshot has no capture and simply remains unable to draft. */
-            (void)session_dspark_seed_pending(
-                session, (uint32_t)session->checkpoint.len);
+      const int suffix = prompt->len - session->checkpoint.len;
+      if (suffix > 0) {
+        /* Materialize any pending capture before suffix prefill reuses its
+         * storage. */
+        (void)session_dspark_seed_pending(session,
+                                          (uint32_t)session->checkpoint.len);
+      }
+      const uint32_t resume_minimum =
+          ds4_rocm_graph_resume_prefill_min_tokens();
+      if (suffix > 0 && (uint32_t)suffix >= resume_minimum) {
+        const bool ok = ds4_rocm_graph_prefill_range(
+            session->graph, session->engine, prompt,
+            (uint32_t)session->checkpoint.len, (uint32_t)suffix,
+            session->logits.get());
+        if (!ok) {
+          set_error(error, error_capacity,
+                    "ROCm resumed prefill failed while extending checkpoint");
+          session->checkpoint_valid = false;
+          return 1;
         }
-        const uint32_t resume_minimum =
-            ds4_rocm_graph_resume_prefill_min_tokens();
-        if (suffix > 0 && (uint32_t)suffix >= resume_minimum) {
-            const bool ok = ds4_rocm_graph_prefill_range(
-                session->graph,
-                session->engine,
-                prompt,
-                (uint32_t)session->checkpoint.len,
-                (uint32_t)suffix,
-                session->logits.get());
-            if (!ok) {
-                set_error(error,
-                          error_capacity,
-                          "ROCm resumed prefill failed while extending checkpoint");
-                session->checkpoint_valid = false;
-                return 1;
-            }
-            ds4_tokens_copy(&session->checkpoint, prompt);
-            session->checkpoint_valid = true;
-            return 0;
-        }
-
-        for (int i = session->checkpoint.len; i < prompt->len; ++i) {
-            if (session_cancelled(session)) {
-                set_error(error, error_capacity, "prefill cancelled");
-                return DS4_SESSION_SYNC_INTERRUPTED;
-            }
-            if (!session_commit_and_extend(session, prompt->v[i])) {
-                set_error(error,
-                          error_capacity,
-                          "ROCm decode failed while extending checkpoint");
-                session->checkpoint_valid = false;
-                return 1;
-            }
-        }
+        ds4_tokens_copy(&session->checkpoint, prompt);
+        session->checkpoint_valid = true;
         return 0;
+      }
+
+      for (int i = session->checkpoint.len; i < prompt->len; ++i) {
+        if (session_cancelled(session)) {
+          set_error(error, error_capacity, "prefill cancelled");
+          return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        if (!session_commit_and_extend(session, prompt->v[i])) {
+          set_error(error, error_capacity,
+                    "ROCm decode failed while extending checkpoint");
+          session->checkpoint_valid = false;
+          return 1;
+        }
+      }
+      return 0;
     }
 
     session->checkpoint_valid = false;
+    session_dspark_reset_request_state(session, true);
     if (!ds4_rocm_graph_reset(session->graph)) {
         set_error(error, error_capacity, "ROCm prefill state reset failed");
         return 1;
@@ -244,27 +302,10 @@ int ds4_session_sync(ds4_session *session,
 }
 
 int ds4_session_argmax(const ds4_session *session) {
-    if (!session || !session->logits) return -1;
-    return ds4_sample_argmax(session->logits.get(),
-                             (uint32_t)ds4_engine_vocab_size(session->engine));
-}
-
-int ds4_session_argmax_excluding(const ds4_session *session,
-                                 int excluded_token) {
-    if (!session || !session->logits) return -1;
-
-    const int vocabulary_size = ds4_engine_vocab_size(session->engine);
-    int best = -1;
-    float best_logit = DS4_SESSION_NEG_INF;
-    for (int i = 0; i < vocabulary_size; ++i) {
-        if (i == excluded_token) continue;
-        const float value = session->logits[i];
-        if (best < 0 || value > best_logit) {
-            best = i;
-            best_logit = value;
-        }
-    }
-    return best;
+  if (!session || !session->checkpoint_valid || !session->logits)
+    return -1;
+  return ds4_sample_argmax(session->logits.get(),
+                           (uint32_t)ds4_engine_vocab_size(session->engine));
 }
 
 int ds4_session_sample(const ds4_session *session,
@@ -273,27 +314,23 @@ int ds4_session_sample(const ds4_session *session,
                        float top_p,
                        float min_p,
                        uint64_t *rng_state) {
-    if (!session || !session->logits || !rng_state) return -1;
-    return ds4_sample_top_p_min_p(
-        session->logits.get(),
-        (uint32_t)ds4_engine_vocab_size(session->engine),
-        temperature,
-        top_k,
-        top_p,
-        min_p,
-        rng_state);
+  if (!session || !session->checkpoint_valid || !session->logits || !rng_state)
+    return -1;
+  return ds4_sample_top_p_min_p(
+      session->logits.get(), (uint32_t)ds4_engine_vocab_size(session->engine),
+      temperature, top_k, top_p, min_p, rng_state);
 }
 
 int ds4_session_copy_logits(const ds4_session *session,
                             float *out,
                             int capacity) {
-    if (!session || !out) return 0;
-    const int vocabulary_size = ds4_engine_vocab_size(session->engine);
-    if (capacity < vocabulary_size) return 0;
-    memcpy(out,
-           session->logits.get(),
-           (size_t)vocabulary_size * sizeof(out[0]));
-    return vocabulary_size;
+  if (!session || !session->checkpoint_valid || !out)
+    return 0;
+  const int vocabulary_size = ds4_engine_vocab_size(session->engine);
+  if (capacity < vocabulary_size)
+    return 0;
+  memcpy(out, session->logits.get(), (size_t)vocabulary_size * sizeof(out[0]));
+  return vocabulary_size;
 }
 
 int ds4_session_eval(ds4_session *session,
@@ -303,6 +340,13 @@ int ds4_session_eval(ds4_session *session,
     if (!session) {
         set_error(error, error_capacity, "invalid session");
         return 1;
+    }
+    if (!session->checkpoint_valid ||
+        session->checkpoint.len >= session->context_size || token < 0 ||
+        token >= ds4_engine_vocab_size(session->engine)) {
+      set_error(error, error_capacity,
+                "decode needs a valid checkpoint, token, and context position");
+      return 1;
     }
     if (session_cancelled(session)) {
         set_error(error, error_capacity, "decode cancelled");
@@ -314,6 +358,95 @@ int ds4_session_eval(ds4_session *session,
         return 1;
     }
     session->checkpoint_valid = true;
+    return 0;
+}
+
+int ds4_sessions_eval_batch(const ds4_session_batch_item *items,
+                            size_t item_count,
+                            char *error,
+                            size_t error_capacity) {
+    if (!items || item_count < 2 || item_count > 8) {
+        set_error(error,
+                  error_capacity,
+                  "batch decode requires two to eight sessions");
+        return 1;
+    }
+
+    ds4_engine *engine = nullptr;
+    std::array<ds4_rocm_batch_item, 8> graph_items{};
+    size_t graph_item_count = 0;
+    for (size_t index = 0; index < item_count; ++index) {
+        ds4_session *session = items[index].session;
+        if (!session || !session->checkpoint_valid) {
+            set_error(error,
+                      error_capacity,
+                      "batch decode contains an invalid session");
+            return 1;
+        }
+        if (engine == nullptr) {
+            engine = session->engine;
+        } else if (session->engine != engine) {
+            set_error(error,
+                      error_capacity,
+                      "batch decode sessions do not share one model");
+            return 1;
+        }
+        if (session_cancelled(session)) {
+            set_error(error, error_capacity, "batch decode cancelled");
+            return DS4_SESSION_SYNC_INTERRUPTED;
+        }
+        if (items[index].token < 0 ||
+            items[index].token >= ds4_engine_vocab_size(session->engine)) {
+          set_error(error, error_capacity,
+                    "batch decode contains an invalid token");
+          return 1;
+        }
+        if (session->checkpoint.len < 0 ||
+            session->checkpoint.len >= session->context_size) {
+          set_error(error, error_capacity,
+                    "batch decode exceeds a session context");
+          return 1;
+        }
+        for (size_t previous = 0; previous < index; ++previous) {
+            if (items[previous].session == session) {
+                set_error(error,
+                          error_capacity,
+                          "batch decode contains a duplicate session");
+                return 1;
+            }
+        }
+        graph_items[graph_item_count++] = {
+            .graph = session->graph,
+            .token = items[index].token,
+            .position = static_cast<uint32_t>(session->checkpoint.len),
+            .logits = session->logits.get(),
+        };
+    }
+
+    if (!ds4_rocm_graph_eval_batch(engine,
+                                   graph_items.data(),
+                                   graph_item_count)) {
+        for (size_t index = 0; index < item_count; ++index) {
+            items[index].session->checkpoint_valid = false;
+        }
+        set_error(error, error_capacity, "ROCm batch decode failed");
+        return 1;
+    }
+
+    for (size_t index = 0; index < item_count; ++index) {
+        ds4_tokens_push(&items[index].session->checkpoint, items[index].token);
+        items[index].session->checkpoint_valid = true;
+        /*
+         * The multi-session target path does not capture per-session sampled
+         * hidden states for the support ring. Keep this request on exact target
+         * batching after its first concurrent step; a cold request reset
+         * enables DSpark again.
+         */
+        items[index].session->dspark_state.plain_only = true;
+        items[index].session->dspark_state.force_plain_request = true;
+        ds4_rocm_graph_dspark_set_capture_enabled(
+            items[index].session->graph, false);
+    }
     return 0;
 }
 
@@ -331,14 +464,10 @@ int ds4_session_save_snapshot(const ds4_session *session,
         set_error(error, error_capacity, "session has no valid checkpoint");
         return 1;
     }
-    return ds4_rocm_graph_save_snapshot(session->graph,
-                                        &session->checkpoint,
-                                        session->logits.get(),
-                                        session->prefill_capacity,
-                                        session->context_size,
-                                        snapshot,
-                                        error,
-                                        error_capacity);
+    return ds4_rocm_graph_save_snapshot(
+        session->graph, &session->checkpoint, session->logits.get(),
+        session->prefill_capacity, session->context_size,
+        &session->dspark_state, snapshot, error, error_capacity);
 }
 
 int ds4_session_load_snapshot(ds4_session *session,
@@ -350,15 +479,10 @@ int ds4_session_load_snapshot(ds4_session *session,
         return 1;
     }
     session->checkpoint_valid = false;
-    const int result =
-        ds4_rocm_graph_load_snapshot(session->graph,
-                                     &session->checkpoint,
-                                     session->logits.get(),
-                                     session->prefill_capacity,
-                                     session->context_size,
-                                     snapshot,
-                                     error,
-                                     error_capacity);
+    const int result = ds4_rocm_graph_load_snapshot(
+        session->graph, &session->checkpoint, session->logits.get(),
+        session->prefill_capacity, session->context_size,
+        &session->dspark_state, snapshot, error, error_capacity);
     session->checkpoint_valid = result == 0;
     return result;
 }
@@ -369,426 +493,308 @@ void ds4_session_snapshot_free(ds4_session_snapshot *snapshot) {
     memset(snapshot, 0, sizeof(*snapshot));
 }
 
-/*
- * DSpark verifier self-check.
- *
- * Speculative decoding is only lossless if the batched verification pass agrees
- * with ordinary one-token decode about the target's greedy continuation. The
- * two paths run different kernels with different reduction orders, so agreement
- * is an empirical property of this checkpoint, not something the design can
- * assume. This routine measures it directly: decode a suffix autoregressively,
- * roll back, verify the same suffix as one block, and compare.
- *
- * It also times both paths, which is what decides whether a drafter can pay for
- * itself: verification has to cost far less than the tokens it replaces.
- */
-int ds4_session_dspark_selftest(ds4_session *session,
-                                int rows,
-                                char *error,
-                                size_t error_capacity) {
-    if (!session || !session->checkpoint_valid || rows < 2) {
-        set_error(error, error_capacity, "invalid DSpark self-test request");
-        return 1;
-    }
-    if (rows > (int)DS4_SPEC_MAX_ROWS) {
-        set_error(error, error_capacity, "DSpark self-test row count exceeds the verifier cap");
-        return 1;
-    }
-    const int start = session->checkpoint.len;
-    if (start + rows >= session->context_size) {
-        set_error(error, error_capacity, "DSpark self-test would exceed the context");
-        return 1;
-    }
-    if (!ds4_rocm_graph_spec_prepare(session->graph, session->engine, (uint32_t)rows)) {
-        set_error(error, error_capacity, "DSpark verification state allocation failed");
-        return 1;
-    }
+/* C1 retains the established four-probe/64-token acceptance policy. Concurrent
+ * requests use a separate recent-cost window after their batched cycle. */
+static void session_dspark_note_cycle(ds4_session* session,
+                                      bool concurrent_batch) {
+  if (concurrent_batch) {
+    return;
+  }
+  constexpr uint64_t kEarlyCycles = 4u;
+  constexpr double kEarlyRejectRate = 0.25;
+  constexpr uint64_t kWarmupCycles = 8u;
+  constexpr double kBreakEvenAcceptance = 0.48;
+  constexpr uint32_t kSerialLowAcceptanceBackoff = DS4_DSPARK_RETRY_TOKENS;
 
-    const int vocabulary_size = ds4_engine_vocab_size(session->engine);
-    auto base_logits = std::unique_ptr<float[]>(
-        new (std::nothrow) float[vocabulary_size]);
-    auto block = std::unique_ptr<int[]>(new (std::nothrow) int[rows + 1]);
-    auto row_tops = std::unique_ptr<int32_t[]>(new (std::nothrow) int32_t[rows]);
-    if (!base_logits || !block || !row_tops) {
-        set_error(error, error_capacity, "DSpark self-test allocation failed");
-        return 1;
-    }
-    memcpy(base_logits.get(),
-           session->logits.get(),
-           (size_t)vocabulary_size * sizeof(float));
-
-    if (!ds4_rocm_graph_spec_frontier_save(session->graph)) {
-        set_error(error, error_capacity, "DSpark frontier save failed");
-        return 1;
-    }
-
-    /* Autoregressive reference: block[i] is what greedy decode emits at
-     * position start + i, so block[i + 1] is the target's continuation after
-     * row i and is exactly what the verifier's row i must reproduce. */
-    const double ar_t0 = ds4_now_seconds();
-    for (int i = 0; i < rows; ++i) {
-        block[i] = ds4_sample_argmax(session->logits.get(), (uint32_t)vocabulary_size);
-        if (!ds4_rocm_graph_eval(session->graph,
-                                 session->engine,
-                                 block[i],
-                                 (uint32_t)(start + i),
-                                 session->logits.get())) {
-            set_error(error, error_capacity, "DSpark self-test decode failed");
-            session->checkpoint_valid = false;
-            return 1;
-        }
-    }
-    const double ar_seconds = ds4_now_seconds() - ar_t0;
-    block[rows] = ds4_sample_argmax(session->logits.get(), (uint32_t)vocabulary_size);
-
-    /* Roll back to the pre-suffix frontier and replay the same suffix as one
-     * verification block. */
-    session->checkpoint.len = start;
-    if (!ds4_rocm_graph_spec_frontier_restore(session->graph)) {
-        set_error(error, error_capacity, "DSpark frontier restore failed");
-        session->checkpoint_valid = false;
-        return 1;
-    }
-    for (int i = 0; i < rows; ++i) {
-        ds4_tokens_push(&session->checkpoint, block[i]);
-    }
-
-    /* Batched kernels and hipBLASLt plans are selected per row count, so the
-     * first verification block at a new width pays setup that steady-state
-     * decoding never sees again. Report every repetition rather than one
-     * number that silently mixes the two. */
-    const int repetitions = 4;
-    double verify_seconds = 0.0;
-    double verify_best = 0.0;
-    for (int rep = 0; rep < repetitions; ++rep) {
-        if (rep > 0) {
-            session->checkpoint.len = start;
-            if (!ds4_rocm_graph_spec_frontier_restore(session->graph)) {
-                set_error(error, error_capacity, "DSpark frontier restore between reps failed");
-                session->checkpoint_valid = false;
-                return 1;
-            }
-            for (int i = 0; i < rows; ++i) {
-                ds4_tokens_push(&session->checkpoint, block[i]);
-            }
-        }
-        const double verify_t0 = ds4_now_seconds();
-        const bool verified = ds4_rocm_graph_verify_suffix(session->graph,
-                                                          session->engine,
-                                                          &session->checkpoint,
-                                                          (uint32_t)start,
-                                                          (uint32_t)rows,
-                                                          row_tops.get());
-        verify_seconds = ds4_now_seconds() - verify_t0;
-        if (!verified) {
-            set_error(error, error_capacity, "DSpark verification pass failed");
-            session->checkpoint_valid = false;
-            return 1;
-        }
-        if (rep == 0 || verify_seconds < verify_best) verify_best = verify_seconds;
-        fprintf(stderr,
-                "ds4: DSpark selftest rows=%d rep=%d verify=%.2f ms\n",
-                rows,
-                rep,
-                verify_seconds * 1000.0);
-    }
-    verify_seconds = verify_best;
-
-    int agree = 0;
-    for (int i = 0; i < rows; ++i) {
-        if (row_tops[i] == block[i + 1]) agree++;
-    }
-    fprintf(stderr,
-            "ds4: DSpark selftest rows=%d start=%d agree=%d/%d "
-            "autoregressive=%.2f ms (%.2f ms/token) verify_best=%.2f ms "
-            "verify_per_row=%.2f ms cost_ratio=%.2fx\n",
-            rows,
-            start,
-            agree,
-            rows,
-            ar_seconds * 1000.0,
-            ar_seconds * 1000.0 / (double)rows,
-            verify_seconds * 1000.0,
-            verify_seconds * 1000.0 / (double)rows,
-            ar_seconds > 0.0 ? verify_seconds / (ar_seconds / (double)rows) : 0.0);
-    for (int i = 0; i < rows; ++i) {
-        if (row_tops[i] == block[i + 1]) continue;
-        fprintf(stderr,
-                "ds4: DSpark selftest row %d disagrees: verify=%d autoregressive=%d\n",
-                i,
-                (int)row_tops[i],
-                block[i + 1]);
-    }
-
-    /* Restore the frontier once more and confirm rollback leaves the session
-     * able to reproduce the original continuation. */
-    session->checkpoint.len = start;
-    if (!ds4_rocm_graph_spec_frontier_restore(session->graph)) {
-        set_error(error, error_capacity, "DSpark frontier restore after verify failed");
-        session->checkpoint_valid = false;
-        return 1;
-    }
-    memcpy(session->logits.get(),
-           base_logits.get(),
-           (size_t)vocabulary_size * sizeof(float));
-    if (!ds4_rocm_graph_eval(session->graph,
-                             session->engine,
-                             block[0],
-                             (uint32_t)start,
-                             session->logits.get())) {
-        set_error(error, error_capacity, "DSpark rollback replay failed");
-        session->checkpoint_valid = false;
-        return 1;
-    }
-    const int replayed = ds4_sample_argmax(session->logits.get(),
-                                           (uint32_t)vocabulary_size);
-    fprintf(stderr,
-            "ds4: DSpark selftest rollback replay next=%d expected=%d %s\n",
-            replayed,
-            block[1],
-            replayed == block[1] ? "ok" : "MISMATCH");
-
-    session->checkpoint.len = start;
-    ds4_tokens_push(&session->checkpoint, block[0]);
-    session->checkpoint_valid = true;
-    return agree == rows && replayed == block[1] ? 0 : 1;
+  const auto& state = session->dspark_state;
+  const uint64_t drafted = state.support_drafted - state.policy_start_drafted;
+  const uint64_t accepted =
+      state.support_accepted - state.policy_start_accepted;
+  const uint64_t steps = state.steps - state.policy_start_steps;
+  if (drafted == 0u || steps < kEarlyCycles)
+    return;
+  const double acceptance =
+      static_cast<double>(accepted) / static_cast<double>(drafted);
+  if (steps < kWarmupCycles && acceptance >= kEarlyRejectRate) {
+    return;
+  }
+  if (acceptance >= kBreakEvenAcceptance) {
+    session->dspark_state.skip_remaining = 0u;
+    return;
+  }
+  session->dspark_state.skip_remaining = kSerialLowAcceptanceBackoff;
 }
 
-/*
- * DSpark drafting self-check.
- *
- * Runs whole speculative cycles: seed the drafter's rings from the prompt's
- * captured target features, propose a block, verify it against the target, commit
- * the accepted prefix, and repeat. Reports acceptance and timing per cycle, which
- * is the measurement that says whether the drafter earns its verification block.
- */
-int ds4_session_dspark_draft_selftest(ds4_session *session,
-                                     int cycles,
-                                     char *error,
-                                     size_t error_capacity) {
-    if (!session || !session->checkpoint_valid || cycles < 1) {
-        set_error(error, error_capacity, "invalid DSpark draft self-test request");
-        return 1;
+// Cost units are hundredths of one ordinary batch decode step, calibrated
+// offline on gfx1151 at 0/4K/16K with tg128, rounded up to five units.
+// See benchmarks/deepseek-v4-flash/cost-calibration.json. Runtime wall clocks
+// never influence token decisions.
+static uint32_t session_dspark_cycle_cost(const ds4_session* session,
+                                          uint32_t tail, size_t concurrency) {
+  using Costs = std::array<uint32_t, 3>;
+  static constexpr std::array<Costs, 4> short_context{
+      {{165, 185, 215}, {195, 260, 430}, {225, 275, 375}, {255, 330, 445}}};
+  static constexpr std::array<Costs, 4> medium_context{
+      {{160, 190, 220}, {185, 245, 295}, {215, 275, 360}, {230, 305, 410}}};
+  static constexpr std::array<Costs, 4> long_context{
+      {{160, 190, 225}, {185, 240, 300}, {210, 270, 370}, {220, 305, 390}}};
+  const size_t group = std::min((concurrency - 1u) / 2u, size_t{3});
+  const size_t column = std::clamp(tail, 1u, 3u) - 1u;
+  const uint32_t depth = static_cast<uint32_t>(session->checkpoint.len);
+  const bool deep = depth > 4096u;
+  const uint32_t span = deep ? 12288u : 3968u;
+  const uint32_t weight =
+      deep ? std::min(depth - 4096u, span) : (depth > 128u ? depth - 128u : 0u);
+  const uint32_t low = (deep ? medium_context : short_context)[group][column];
+  const uint32_t high = (deep ? long_context : medium_context)[group][column];
+  return (low * (span - weight) + high * weight) / span;
+}
+
+static uint32_t session_dspark_profitable_tail(const ds4_session* session,
+                                               uint32_t maximum,
+                                               size_t concurrency) {
+  uint32_t best_tail = 0;
+  uint32_t best_cost = 100;
+  for (uint32_t tail = 1; tail <= std::min(maximum, 3u); ++tail) {
+    const uint32_t cost = session_dspark_cycle_cost(session, tail, concurrency);
+    // Compare cost per emitted token under full acceptance, including the
+    // target-known first token. Zero selects ordinary target decoding.
+    if (cost * (best_tail + 1u) < best_cost * (tail + 1u)) {
+      best_tail = tail;
+      best_cost = cost;
     }
-    if (!ds4_engine_has_dspark(session->engine)) {
-        set_error(error, error_capacity, "no DSpark support model is attached");
-        return 1;
-    }
-    const uint32_t block = ds4_rocm_graph_dspark_block_size(session->graph);
-    if (block == 0) {
-        set_error(error, error_capacity, "DSpark drafting is not attached to this session");
-        return 1;
-    }
+  }
+  return best_tail;
+}
 
-    if (!session_dspark_seed_pending(
-            session, (uint32_t)session->checkpoint.len)) {
-        set_error(error,
-                  error_capacity,
-                  "prompt prefill did not capture DSpark support context");
-        return 1;
-    }
-    const uint32_t context_len =
-        ds4_rocm_graph_dspark_context_len(session->graph);
-    if (context_len < (uint32_t)session->checkpoint.len) {
-        set_error(error,
-                  error_capacity,
-                  "prompt prefill did not seed the DSpark support cache");
-        return 1;
-    }
-    fprintf(stderr,
-            "ds4: DSpark draft selftest prompt_context=%u\n",
-            context_len);
+static void session_dspark_use_concurrency(ds4_session* session,
+                                           size_t concurrency) {
+  auto& state = session->dspark_state;
+  if (state.policy_concurrency == concurrency)
+    return;
+  state.policy_concurrency = static_cast<uint32_t>(concurrency);
+  state.policy_start_drafted = state.support_drafted;
+  state.policy_start_accepted = state.support_accepted;
+  state.policy_start_steps = state.steps;
+  state.concurrent_width = 3u;
+  state.probe_cycles = state.probe_emitted = state.probe_cost = 0;
+  state.skip_remaining = 0;
+}
 
-    const int vocabulary_size = ds4_engine_vocab_size(session->engine);
-    auto drafts = std::unique_ptr<int32_t[]>(new (std::nothrow) int32_t[block]);
-    auto row_tops = std::unique_ptr<int32_t[]>(new (std::nothrow) int32_t[block]);
-    if (!drafts || !row_tops) {
-        set_error(error, error_capacity, "DSpark draft self-test allocation failed");
-        return 1;
-    }
+static void session_dspark_note_concurrent_cycle(ds4_session* session,
+                                                 uint32_t drafted,
+                                                 uint32_t accepted,
+                                                 size_t concurrency) {
+  if (drafted == 0)
+    return;
+  auto& state = session->dspark_state;
+  // Let C2 build its adaptive tail before judging a cold start.
+  if (concurrency <= 2u && state.steps - state.policy_start_steps <= 4u)
+    return;
+  const uint32_t cost =
+      session_dspark_cycle_cost(session, drafted, concurrency);
+  // One probe is sufficient when even full acceptance cannot repay the
+  // calibrated cycle. Keep a bounded retry so later request membership or
+  // context can still resume useful drafting.
+  if (cost >= 100u * (drafted + 1u)) {
+    state.skip_remaining = DS4_DSPARK_RETRY_TOKENS;
+    state.probe_cycles = state.probe_emitted = state.probe_cost = 0;
+    return;
+  }
+  ++state.probe_cycles;
+  state.probe_emitted += 1u + accepted;
+  state.probe_cost += cost;
+  if (state.probe_cycles < 4u)
+    return;
+  // Retry after a bounded number of target tokens; their captured features keep
+  // the support state complete, so a later profitable cohort can resume
+  // drafting.
+  if (100u * state.probe_emitted < state.probe_cost)
+    state.skip_remaining = DS4_DSPARK_RETRY_TOKENS;
+  state.probe_cycles = state.probe_emitted = state.probe_cost = 0;
+}
 
-    std::size_t total_drafted = 0;
-    std::size_t total_accepted = 0;
-    /* Per-position agreement, counted independently of the accepted prefix.
-     * Acceptance is prefix-based, so one early miss discards correct later
-     * tokens; this separates drafter quality from prefix fragility. */
-    std::size_t total_positional = 0;
-    std::size_t total_positional_rows = 0;
-    double total_draft_ms = 0.0;
-    double total_verify_ms = 0.0;
+static uint32_t session_dspark_adaptive_width(const ds4_session* session,
+                                              uint32_t maximum) {
+  if (!session || maximum == 0u) {
+    return 0u;
+  }
+  return std::clamp(session->dspark_state.concurrent_width, 1u, maximum);
+}
 
-    for (int cycle = 0; cycle < cycles; ++cycle) {
-        const int length = session->checkpoint.len;
-        if (length < 1 || length + (int)block + 1 >= session->context_size) break;
-        const int last_token = session->checkpoint.v[length - 1];
-
-        /* The stage input leads with an encoder row holding the fused feature of
-         * the last committed position, so the rows occupy
-         * [length - 1, length - 1 + block_size], and the drafted rows land
-         * exactly on the positions being predicted. */
-        constexpr int pos_shift = -1;
-        if (length + pos_shift < 1) break;
-        const uint32_t pos0 = (uint32_t)(length + pos_shift);
-        uint32_t drafted = 0;
-        const double draft_t0 = ds4_now_seconds();
-        const bool proposed = ds4_rocm_graph_dspark_draft(session->graph,
-                                                         session->engine,
-                                                         last_token,
-                                                         pos0,
-                                                         drafts.get(),
-                                                         &drafted);
-        const double draft_ms = (ds4_now_seconds() - draft_t0) * 1000.0;
-        if (!proposed || drafted == 0) {
-            set_error(error, error_capacity, "DSpark draft proposal failed");
-            return 1;
-        }
-        total_draft_ms += draft_ms;
-        total_drafted += drafted;
-
-        /* The target's own next token decides whether the first draft survives. */
-        const int target_first =
-            ds4_sample_argmax(session->logits.get(), (uint32_t)vocabulary_size);
-        uint32_t accepted = 0;
-        double verify_ms = 0.0;
-        if (target_first == drafts[0]) {
-            if (!ds4_rocm_graph_spec_prepare(session->graph, session->engine, drafted) ||
-                !ds4_rocm_graph_spec_frontier_save(session->graph)) {
-                set_error(error, error_capacity, "DSpark verification setup failed");
-                return 1;
-            }
-            for (uint32_t i = 0; i < drafted; ++i) {
-                ds4_tokens_push(&session->checkpoint, drafts[i]);
-            }
-            const double verify_t0 = ds4_now_seconds();
-            const bool verified = ds4_rocm_graph_verify_suffix(session->graph,
-                                                              session->engine,
-                                                              &session->checkpoint,
-                                                              (uint32_t)length,
-                                                              drafted,
-                                                              row_tops.get());
-            verify_ms = (ds4_now_seconds() - verify_t0) * 1000.0;
-            if (!verified) {
-                set_error(error, error_capacity, "DSpark verification failed");
-                session->checkpoint_valid = false;
-                return 1;
-            }
-            accepted = 1;
-            while (accepted < drafted && row_tops[accepted - 1] == drafts[accepted]) {
-                accepted++;
-            }
-            total_positional += 1;
-            total_positional_rows += drafted;
-            for (uint32_t i = 1; i < drafted; ++i) {
-                if (row_tops[i - 1] == drafts[i]) total_positional++;
-            }
-            /* Commit only the accepted prefix: rewind, restore the frontier, and
-             * replay it so the committed state matches what was accepted. */
-            session->checkpoint.len = length;
-            if (!ds4_rocm_graph_spec_frontier_restore(session->graph)) {
-                set_error(error, error_capacity, "DSpark rollback failed");
-                session->checkpoint_valid = false;
-                return 1;
-            }
-            ds4_rocm_graph_dspark_truncate_context(session->graph, (uint32_t)length);
-            for (uint32_t i = 0; i < accepted; ++i) {
-                if (!session_commit_and_extend(session, drafts[i])) {
-                    set_error(error, error_capacity, "DSpark accepted-prefix replay failed");
-                    session->checkpoint_valid = false;
-                    return 1;
-                }
-            }
-        } else {
-            total_positional_rows += 1;
-            /* First draft missed: commit the target's own token. */
-            if (!session_commit_and_extend(session, target_first)) {
-                set_error(error, error_capacity, "DSpark miss replay failed");
-                session->checkpoint_valid = false;
-                return 1;
-            }
-        }
-        total_accepted += accepted;
-        total_verify_ms += verify_ms;
-
-        if (getenv("GUFO_DEEPSEEK_DSPARK_TRACE") != nullptr) {
-            /* The four MASK positions start from identical embeddings and are
-             * separated only by rope and by attending to each other. Printing the
-             * proposal next to the target's own continuation shows immediately
-             * whether they differentiate at all. */
-            fprintf(stderr, "ds4:   draft =");
-            for (uint32_t i = 0; i < drafted; ++i) {
-                fprintf(stderr, " %d", (int)drafts[i]);
-            }
-            fprintf(stderr, "\nds4:   target= %d", target_first);
-            if (target_first == drafts[0]) {
-                for (uint32_t i = 0; i + 1 < drafted; ++i) {
-                    fprintf(stderr, " %d", (int)row_tops[i]);
-                }
-            }
-            fprintf(stderr, "\n");
-        }
-        fprintf(stderr,
-                "ds4: DSpark draft cycle=%d drafted=%u accepted=%u draft=%.2f ms "
-                "verify=%.2f ms first=%s\n",
-                cycle,
-                drafted,
-                accepted,
-                draft_ms,
-                verify_ms,
-                target_first == drafts[0] ? "hit" : "miss");
-    }
-
-    const double emitted = (double)total_accepted + (double)cycles;
-    fprintf(stderr,
-            "ds4: DSpark draft selftest cycles=%d drafted=%zu accepted=%zu "
-            "acceptance=%.1f%% positional=%.1f%% (%zu/%zu) "
-            "draft_avg=%.2f ms verify_avg=%.2f ms\n",
-            cycles,
-            total_drafted,
-            total_accepted,
-            total_drafted ? 100.0 * (double)total_accepted / (double)total_drafted : 0.0,
-            total_positional_rows
-                ? 100.0 * (double)total_positional / (double)total_positional_rows
-                : 0.0,
-            total_positional,
-            total_positional_rows,
-            total_draft_ms / (double)cycles,
-            total_verify_ms / (double)cycles);
-    (void)emitted;
-    session->checkpoint_valid = true;
+static uint32_t session_dspark_usable_tail(const ds4_session* session,
+                                           uint32_t maximum, int emitted_cap) {
+  const int context_room = session->context_size - session->checkpoint.len;
+  if (emitted_cap <= 1 || context_room <= 2) {
     return 0;
+  }
+  return std::min({session_dspark_adaptive_width(session, maximum),
+                   static_cast<uint32_t>(emitted_cap - 1),
+                   static_cast<uint32_t>(context_room - 2)});
 }
 
+static void session_dspark_update_adaptive_width(ds4_session* session,
+                                                 uint32_t drafted,
+                                                 uint32_t accepted,
+                                                 uint32_t maximum) {
+  if (!session || drafted == 0u || maximum == 0u) {
+    return;
+  }
+  const uint32_t previous = session_dspark_adaptive_width(session, maximum);
+  uint32_t next = previous;
+  if (accepted >= drafted) {
+    next = std::min(previous + 1u, maximum);
+  } else if (accepted * 2u < drafted) {
+    next = std::max(previous - 1u, 1u);
+  }
+  session->dspark_state.concurrent_width = next;
+  if (getenv("GUFO_DEEPSEEK_DSPARK_WIDTH_TRACE") != nullptr) {
+    fprintf(stderr,
+            "ds4: DSpark adaptive width previous=%u drafted=%u "
+            "accepted=%u next=%u maximum=%u\n",
+            previous, drafted, accepted, next, maximum);
+  }
+}
 
+static int session_dspark_finish_verified(
+    ds4_session* session, int length, int vocabulary_size,
+    bool concurrent_batch, const int32_t* drafts, uint32_t drafted,
+    const int32_t* row_tops, int* emitted, int* n_emitted, char* error,
+    size_t error_capacity) {
+  uint32_t accepted = 1;
+  while (accepted < drafted && row_tops[accepted - 1] == drafts[accepted]) {
+    accepted++;
+  }
+  uint32_t positional_accepted = 0;
+  for (uint32_t i = 1; i < drafted; ++i) {
+    if (row_tops[i - 1u] == drafts[i])
+      positional_accepted++;
+  }
+  if (getenv("GUFO_DEEPSEEK_DSPARK_TRACE") != nullptr) {
+    fprintf(stderr, "ds4: DSpark cycle drafted=%u accepted=%u draft=", drafted,
+            accepted);
+    for (uint32_t i = 0; i < drafted; ++i) {
+      fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int)drafts[i]);
+    }
+    fprintf(stderr, " tops=");
+    for (uint32_t i = 0; i < drafted; ++i) {
+      fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int)row_tops[i]);
+    }
+    fputc('\n', stderr);
+  }
 
-/*
- * Feed one attempted cycle's outcome to the break-even controller.
- *
- * Stop probing after four clearly poor cycles or eight marginal cycles, then
- * periodically sample again after ordinary decode. The 48% threshold is the
- * measured seed-plus-five break-even point on gfx1151.
- */
-static void session_dspark_note_cycle(ds4_session *session) {
-    constexpr uint64_t kEarlyCycles = 4u;
-    constexpr double kEarlyRejectRate = 0.25;
-    constexpr uint64_t kWarmupCycles = 8u;
-    constexpr double kBreakEvenAcceptance = 0.48;
-    constexpr uint32_t kLowAcceptanceBackoff = 64u;
-    if (session->dspark_support_drafted == 0u ||
-        session->dspark_steps < kEarlyCycles) {
-        return;
+  if (accepted == drafted) {
+    session->checkpoint.len = length + (int)drafted;
+    if (!concurrent_batch &&
+        !ds4_rocm_graph_read_spec_logits_row(session->graph, drafted - 1u,
+                                             session->logits.get())) {
+      set_error(error, error_capacity, "DSpark frontier logits read failed");
+      session->checkpoint_valid = false;
+      return 1;
     }
-    const double acceptance =
-        (double)session->dspark_support_accepted /
-        (double)session->dspark_support_drafted;
-    if (session->dspark_steps < kWarmupCycles &&
-        acceptance >= kEarlyRejectRate) {
-        return;
+    session->checkpoint_valid = true;
+    if (ds4_rocm_graph_dspark_capture_ready(session->graph)) {
+      (void)ds4_rocm_graph_dspark_inject(session->graph, (uint32_t)length,
+                                         drafted);
     }
-    if (acceptance >= kBreakEvenAcceptance) {
-        session->dspark_skip_remaining = 0u;
-        return;
+    for (uint32_t i = 0; i < drafted; ++i) {
+      emitted[(*n_emitted)++] = drafts[i];
     }
-    session->dspark_skip_remaining = kLowAcceptanceBackoff;
+    session->dspark_state.drafted += drafted;
+    session->dspark_state.accepted += accepted;
+    session->dspark_state.support_drafted += drafted - 1u;
+    session->dspark_state.support_accepted += accepted - 1u;
+    session->dspark_state.positional_accepted += positional_accepted;
+    session->dspark_state.anchors += 1u;
+    session->dspark_state.full_blocks += 1u;
+    session->dspark_state.steps += 1;
+    session_dspark_note_cycle(session, concurrent_batch);
+    return 0;
+  }
+
+  bool committed_prefix = false;
+  if (accepted <= 4u) {
+    committed_prefix =
+        (concurrent_batch ||
+         ds4_rocm_graph_read_spec_logits_row(session->graph, accepted - 1u,
+                                             session->logits.get())) &&
+        ds4_rocm_graph_spec_frontier_commit_prefix(session->graph, accepted);
+    if (committed_prefix) {
+      session->checkpoint.len = length + (int)accepted;
+      if (ds4_rocm_graph_dspark_capture_ready(session->graph)) {
+        committed_prefix = ds4_rocm_graph_dspark_inject(
+            session->graph, (uint32_t)length, accepted);
+      }
+    }
+  } else if (accepted == 5u) {
+    committed_prefix =
+        ds4_rocm_graph_spec_frontier_commit_prefix(session->graph, 4u);
+    if (committed_prefix) {
+      session->checkpoint.len = length + 4;
+      if (ds4_rocm_graph_dspark_capture_ready(session->graph)) {
+        committed_prefix =
+            ds4_rocm_graph_dspark_inject(session->graph, (uint32_t)length, 4u);
+      }
+    }
+    if (committed_prefix) {
+      committed_prefix = session_commit_and_extend(session, drafts[4]);
+    }
+  }
+  if (committed_prefix) {
+    session->checkpoint_valid = true;
+    for (uint32_t i = 0; i < accepted; ++i) {
+      emitted[(*n_emitted)++] = drafts[i];
+    }
+    session->dspark_state.drafted += drafted;
+    session->dspark_state.accepted += accepted;
+    session->dspark_state.support_drafted += drafted - 1u;
+    session->dspark_state.support_accepted += accepted - 1u;
+    session->dspark_state.positional_accepted += positional_accepted;
+    session->dspark_state.anchors += 1u;
+    session->dspark_state.steps += 1u;
+    session_dspark_note_cycle(session, concurrent_batch);
+    return 0;
+  }
+
+  if (!ds4_rocm_graph_spec_frontier_restore(session->graph)) {
+    set_error(error, error_capacity, "DSpark rollback failed");
+    session->checkpoint_valid = false;
+    return 1;
+  }
+  ds4_rocm_graph_dspark_truncate_context(session->graph, (uint32_t)length);
+  uint32_t committed = 0;
+  for (uint32_t i = 0; i < accepted; ++i) {
+    const int sequential_top =
+        ds4_sample_argmax(session->logits.get(), (uint32_t)vocabulary_size);
+    if (sequential_top != drafts[i]) {
+      if (getenv("GUFO_DEEPSEEK_DSPARK_TRACE") != nullptr) {
+        fprintf(stderr,
+                "ds4: DSpark replay shortened at row=%u "
+                "verify_accept=%d sequential=%d\n",
+                i, (int)drafts[i], sequential_top);
+      }
+      break;
+    }
+    if (!session_commit_and_extend(session, drafts[i])) {
+      set_error(error, error_capacity, "DSpark accepted-prefix replay failed");
+      session->checkpoint_valid = false;
+      return 1;
+    }
+    emitted[(*n_emitted)++] = drafts[i];
+    committed++;
+  }
+  session->dspark_state.drafted += drafted;
+  session->dspark_state.accepted += committed;
+  session->dspark_state.support_drafted += drafted - 1u;
+  session->dspark_state.support_accepted +=
+      committed > 0u ? committed - 1u : 0u;
+  session->dspark_state.positional_accepted += positional_accepted;
+  session->dspark_state.anchors += 1u;
+  if (committed == drafted)
+    session->dspark_state.full_blocks += 1u;
+  session->dspark_state.steps += 1;
+  session_dspark_note_cycle(session, concurrent_batch);
+  return 0;
 }
 
 /*
@@ -799,258 +805,381 @@ static void session_dspark_note_cycle(ds4_session *session) {
  * authoritative cache state. Replay is only an internal safety fallback if a
  * prefix snapshot cannot be committed.
  */
-int ds4_session_dspark_step(ds4_session *session,
-                           int *emitted,
-                           int emitted_cap,
-                           int *n_emitted,
-                           char *error,
-                           size_t error_capacity) {
-    if (!session || !emitted || !n_emitted || emitted_cap < 1) {
-        set_error(error, error_capacity, "invalid DSpark step request");
-        return 1;
-    }
-    *n_emitted = 0;
-    const uint32_t block = ds4_rocm_graph_dspark_block_size(session->graph);
-    const int length = session->checkpoint.len;
-    const int vocabulary_size = ds4_engine_vocab_size(session->engine);
-    const int target_first =
-        ds4_sample_argmax(session->logits.get(), (uint32_t)vocabulary_size);
-    const uint32_t required_context = (uint32_t)length;
+static int session_dspark_step(ds4_session* session, int* emitted,
+                               int emitted_cap, int* n_emitted, char* error,
+                               size_t error_capacity,
+                               uint32_t max_draft_tokens) {
+  if (!session || !session->checkpoint_valid || !emitted || !n_emitted ||
+      emitted_cap < 1) {
+    set_error(error, error_capacity, "invalid DSpark step request");
+    return 1;
+  }
+  *n_emitted = 0;
+  if (session->checkpoint.len >= session->context_size) {
+    set_error(error, error_capacity, "DSpark decode exceeds session context");
+    return 1;
+  }
+  session_dspark_use_concurrency(session, 1u);
+  const uint32_t block = ds4_rocm_graph_dspark_block_size(session->graph);
+  const uint32_t maximum =
+      max_draft_tokens == 0u ? block : std::min(block, max_draft_tokens);
+  const uint32_t requested_tail =
+      session_dspark_usable_tail(session, maximum, emitted_cap);
+  const int length = session->checkpoint.len;
+  const int vocabulary_size = ds4_engine_vocab_size(session->engine);
+  const int target_first =
+      ds4_sample_argmax(session->logits.get(), (uint32_t)vocabulary_size);
+  const uint32_t required_context = (uint32_t)length;
 
-    (void)session_dspark_seed_pending(session, required_context);
+  (void)session_dspark_seed_pending(session, required_context);
 
-    /* Fall back to one ordinary token whenever a block cannot be drafted or
-     * verified: no drafter, no captured features, or not enough context room. */
-    bool can_draft =
-        block != 0 && length >= 2 &&
-        length + (int)block + 1 < session->context_size &&
-        ds4_rocm_graph_dspark_context_len(session->graph) >=
-            required_context &&
-        emitted_cap >= (int)block + 1;
-    if (can_draft && session->dspark_skip_remaining != 0) {
-        session->dspark_skip_remaining--;
-        session->dspark_skipped++;
-        can_draft = false;
+  /* Fall back to one ordinary token whenever a block cannot be drafted or
+   * verified: no drafter, no captured features, or not enough context room. */
+  bool can_draft =
+      !session->dspark_state.plain_only && requested_tail != 0 && length >= 2 &&
+      ds4_rocm_graph_dspark_context_len(session->graph) >= required_context;
+  if (can_draft && session->dspark_state.skip_remaining != 0) {
+    session->dspark_state.skip_remaining--;
+    session->dspark_state.skipped++;
+    can_draft = false;
+  }
+  if (!can_draft) {
+    if (!session_commit_and_extend(session, target_first)) {
+      set_error(error, error_capacity, "DeepSeek decode failed");
+      session->checkpoint_valid = false;
+      return 1;
     }
-    if (!can_draft) {
-        if (!session_commit_and_extend(session, target_first)) {
-            set_error(error, error_capacity, "DeepSeek decode failed");
-            session->checkpoint_valid = false;
-            return 1;
-        }
-        emitted[(*n_emitted)++] = target_first;
-        return 0;
-    }
-
-    int32_t drafts[DS4_DSPARK_MAX_BLOCK + 1u];
-    uint32_t tail_drafted = 0;
-    const bool proposed =
-        ds4_rocm_graph_dspark_draft(session->graph,
-                                   session->engine,
-                                   target_first,
-                                   (uint32_t)length,
-                                   drafts + 1,
-                                   &tail_drafted);
-    uint32_t drafted = 0;
-    if (proposed && tail_drafted <= DS4_DSPARK_MAX_BLOCK) {
-        drafts[0] = target_first;
-        drafted = tail_drafted + 1u;
-    }
-    const uint32_t drafted_cap = DS4_DSPARK_MAX_BLOCK + 1u;
-    if (!proposed || drafted == 0 || drafted > drafted_cap) {
-        if (!session_commit_and_extend(session, target_first)) {
-            set_error(error, error_capacity, "DeepSeek decode failed after draft failure");
-            session->checkpoint_valid = false;
-            return 1;
-        }
-        emitted[(*n_emitted)++] = target_first;
-        return 0;
-    }
-
-    /* Row 0 is the target-known frontier token. The support model drafts only
-     * the tail conditioned on that real token, so every verifier pass commits
-     * at least the anchor. */
-
-    int32_t row_tops[DS4_DSPARK_MAX_BLOCK + 1u];
-    if (!ds4_rocm_graph_spec_prepare(session->graph, session->engine, drafted) ||
-        !ds4_rocm_graph_spec_frontier_save(session->graph)) {
-        set_error(error, error_capacity, "DSpark verification setup failed");
-        return 1;
-    }
-    for (uint32_t i = 0; i < drafted; ++i) {
-        ds4_tokens_push(&session->checkpoint, drafts[i]);
-    }
-    const bool verified = ds4_rocm_graph_verify_suffix(session->graph,
-                                                      session->engine,
-                                                      &session->checkpoint,
-                                                      (uint32_t)length,
-                                                      drafted,
-                                                      row_tops);
-    session->checkpoint.len = length;
-    if (!verified) {
-        set_error(error, error_capacity, "DSpark verification failed");
-        session->checkpoint_valid = false;
-        return 1;
-    }
-    uint32_t accepted = 1;
-    while (accepted < drafted && row_tops[accepted - 1] == drafts[accepted]) {
-        accepted++;
-    }
-    uint32_t positional_accepted = 0;
-    for (uint32_t i = 1; i < drafted; ++i) {
-        if (row_tops[i - 1u] == drafts[i]) positional_accepted++;
-    }
-    if (getenv("GUFO_DEEPSEEK_DSPARK_TRACE") != nullptr) {
-        fprintf(stderr,
-                "ds4: DSpark cycle drafted=%u accepted=%u draft=",
-                drafted,
-                accepted);
-        for (uint32_t i = 0; i < drafted; ++i) {
-            fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int)drafts[i]);
-        }
-        fprintf(stderr, " tops=");
-        for (uint32_t i = 0; i < drafted; ++i) {
-            fprintf(stderr, "%s%d", i == 0 ? "" : ",", (int)row_tops[i]);
-        }
-        fputc('\n', stderr);
-    }
-
-    if (accepted == drafted) {
-        /*
-         * Every drafted row was accepted, so the verification pass already holds
-         * cache state for exactly these tokens: row i's context was rows < i, all
-         * committed. Keeping it avoids a decode step per accepted token, which
-         * is the saving that makes high-acceptance text profitable.
-         */
-        session->checkpoint.len = length + (int)drafted;
-        if (!ds4_rocm_graph_read_spec_logits_row(session->graph,
-                                                drafted - 1u,
-                                                session->logits.get())) {
-            set_error(error, error_capacity, "DSpark frontier logits read failed");
-            session->checkpoint_valid = false;
-            return 1;
-        }
-        session->checkpoint_valid = true;
-        /* The same pass captured this block's target features, so the drafter's
-         * rings extend over the committed positions without another forward. */
-        if (ds4_rocm_graph_dspark_capture_ready(session->graph)) {
-            (void)ds4_rocm_graph_dspark_inject(session->graph,
-                                               (uint32_t)length,
-                                               drafted);
-        }
-        for (uint32_t i = 0; i < drafted; ++i) {
-            emitted[(*n_emitted)++] = drafts[i];
-        }
-        session->dspark_drafted += drafted;
-        session->dspark_accepted += accepted;
-        session->dspark_support_drafted += drafted - 1u;
-        session->dspark_support_accepted += accepted - 1u;
-        session->dspark_positional_accepted += positional_accepted;
-        session->dspark_anchors += 1u;
-        session->dspark_full_blocks += 1u;
-        session->dspark_steps += 1;
-        session_dspark_note_cycle(session);
-        return 0;
-    }
-
-    if (accepted < drafted) {
-        bool committed_prefix = false;
-        if (accepted <= 4u) {
-            committed_prefix =
-                ds4_rocm_graph_read_spec_logits_row(session->graph,
-                                                    accepted - 1u,
-                                                    session->logits.get()) &&
-                ds4_rocm_graph_spec_frontier_commit_prefix(session->graph,
-                                                           accepted);
-            if (committed_prefix) {
-                session->checkpoint.len = length + (int)accepted;
-                if (ds4_rocm_graph_dspark_capture_ready(session->graph)) {
-                    committed_prefix =
-                        ds4_rocm_graph_dspark_inject(session->graph,
-                                                    (uint32_t)length,
-                                                    accepted);
-                }
-            }
-        } else if (accepted == 5u) {
-            committed_prefix =
-                ds4_rocm_graph_spec_frontier_commit_prefix(session->graph, 4u);
-            if (committed_prefix) {
-                session->checkpoint.len = length + 4;
-                if (ds4_rocm_graph_dspark_capture_ready(session->graph)) {
-                    committed_prefix =
-                        ds4_rocm_graph_dspark_inject(session->graph,
-                                                    (uint32_t)length,
-                                                    4u);
-                }
-            }
-            if (committed_prefix) {
-                committed_prefix =
-                    session_commit_and_extend(session, drafts[4]);
-            }
-        }
-        if (committed_prefix) {
-            session->checkpoint_valid = true;
-            for (uint32_t i = 0; i < accepted; ++i) {
-                emitted[(*n_emitted)++] = drafts[i];
-            }
-            session->dspark_drafted += drafted;
-            session->dspark_accepted += accepted;
-            session->dspark_support_drafted += drafted - 1u;
-            session->dspark_support_accepted += accepted - 1u;
-            session->dspark_positional_accepted += positional_accepted;
-            session->dspark_anchors += 1u;
-            session->dspark_steps += 1u;
-            session_dspark_note_cycle(session);
-            return 0;
-        }
-    }
-
-    /*
-     * A failed prefix commit is not expected in normal operation. Restore the
-     * target frontier and replay only tokens that still agree with sequential
-     * greedy decode so the session remains correct.
-     */
-    if (!ds4_rocm_graph_spec_frontier_restore(session->graph)) {
-        set_error(error, error_capacity, "DSpark rollback failed");
-        session->checkpoint_valid = false;
-        return 1;
-    }
-    ds4_rocm_graph_dspark_truncate_context(session->graph, (uint32_t)length);
-    uint32_t committed = 0;
-    for (uint32_t i = 0; i < accepted; ++i) {
-        const int sequential_top =
-            ds4_sample_argmax(session->logits.get(),
-                              (uint32_t)vocabulary_size);
-        if (sequential_top != drafts[i]) {
-            if (getenv("GUFO_DEEPSEEK_DSPARK_TRACE") != nullptr) {
-                fprintf(stderr,
-                        "ds4: DSpark replay shortened at row=%u "
-                        "verify_accept=%d sequential=%d\n",
-                        i,
-                        (int)drafts[i],
-                        sequential_top);
-            }
-            break;
-        }
-        if (!session_commit_and_extend(session, drafts[i])) {
-            set_error(error, error_capacity, "DSpark accepted-prefix replay failed");
-            session->checkpoint_valid = false;
-            return 1;
-        }
-        emitted[(*n_emitted)++] = drafts[i];
-        committed++;
-    }
-    session->dspark_drafted += drafted;
-    session->dspark_accepted += committed;
-    session->dspark_support_drafted += drafted - 1u;
-    session->dspark_support_accepted +=
-        committed > 0u ? committed - 1u : 0u;
-    session->dspark_positional_accepted += positional_accepted;
-    session->dspark_anchors += 1u;
-    if (committed == drafted) session->dspark_full_blocks += 1u;
-    session->dspark_steps += 1;
-    session_dspark_note_cycle(session);
+    emitted[(*n_emitted)++] = target_first;
     return 0;
+  }
+
+  int32_t drafts[DS4_DSPARK_MAX_BLOCK + 1u];
+  uint32_t tail_drafted = 0;
+  const bool proposed =
+      ds4_rocm_graph_dspark_draft(session->graph, session->engine, target_first,
+                                  (uint32_t)length, drafts + 1, &tail_drafted);
+  uint32_t drafted = 0;
+  if (proposed && tail_drafted <= DS4_DSPARK_MAX_BLOCK) {
+    // Keep the qualified support computation and select only the requested
+    // prefix for verification. The server's C1 draft budget used to be
+    // ignored here.
+    tail_drafted = std::min(tail_drafted, requested_tail);
+    drafts[0] = target_first;
+    drafted = tail_drafted + 1u;
+  }
+  const uint32_t drafted_cap = DS4_DSPARK_MAX_BLOCK + 1u;
+  if (!proposed || drafted == 0 || drafted > drafted_cap) {
+    if (!session_commit_and_extend(session, target_first)) {
+      set_error(error, error_capacity,
+                "DeepSeek decode failed after draft failure");
+      session->checkpoint_valid = false;
+      return 1;
+    }
+    emitted[(*n_emitted)++] = target_first;
+    return 0;
+  }
+
+  /* Row 0 is the target-known frontier token. The support model drafts only
+   * the tail conditioned on that real token, so every verifier pass commits
+   * at least the anchor. */
+
+  int32_t row_tops[DS4_DSPARK_MAX_BLOCK + 1u];
+  if (!ds4_rocm_graph_spec_prepare(session->graph, session->engine, drafted) ||
+      !ds4_rocm_graph_spec_frontier_save(session->graph)) {
+    set_error(error, error_capacity, "DSpark verification setup failed");
+    return 1;
+  }
+  for (uint32_t i = 0; i < drafted; ++i) {
+    ds4_tokens_push(&session->checkpoint, drafts[i]);
+  }
+  const bool verified = ds4_rocm_graph_verify_suffix(
+      session->graph, session->engine, &session->checkpoint, (uint32_t)length,
+      drafted, row_tops);
+  session->checkpoint.len = length;
+  if (!verified) {
+    set_error(error, error_capacity, "DSpark verification failed");
+    session->checkpoint_valid = false;
+    return 1;
+  }
+  const uint64_t accepted_before = session->dspark_state.support_accepted;
+  const int status = session_dspark_finish_verified(
+      session, length, vocabulary_size, false, drafts, drafted, row_tops,
+      emitted, n_emitted, error, error_capacity);
+  if (status == 0) {
+    session_dspark_update_adaptive_width(
+        session, tail_drafted,
+        static_cast<uint32_t>(session->dspark_state.support_accepted -
+                              accepted_before),
+        maximum);
+  }
+  return status;
+}
+
+int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
+                                   size_t item_count, char* error,
+                                   size_t error_capacity) {
+  if (!items || item_count == 0u || item_count > 8u) {
+    set_error(error, error_capacity,
+              "DSpark batch requires one to eight sessions");
+    return 1;
+  }
+  if (item_count == 1u) {
+    const auto& item = items[0];
+    if (!item.session || !item.session->checkpoint_valid ||
+        item.max_draft_tokens == 0u) {
+      set_error(error, error_capacity, "DSpark batch contains an invalid session");
+      return 1;
+    }
+    if (session_cancelled(item.session)) {
+      set_error(error, error_capacity, "DSpark batch decode cancelled");
+      return DS4_SESSION_SYNC_INTERRUPTED;
+    }
+    return session_dspark_step(item.session, item.emitted, item.emitted_cap,
+                               item.n_emitted, error, error_capacity,
+                               item.max_draft_tokens);
+  }
+
+  ds4_engine* engine = nullptr;
+  uint32_t block = 0;
+  int vocabulary_size = 0;
+  std::array<int, 8> lengths{};
+  std::array<int, 8> target_first{};
+  std::array<bool, 8> can_draft_items{};
+  std::array<uint32_t, 8> verify_tails{};
+  std::array<uint32_t, 8> policy_tails{};
+  bool any_can_draft = false;
+  for (size_t index = 0; index < item_count; ++index) {
+    const ds4_session_dspark_batch_item& item = items[index];
+    ds4_session* session = item.session;
+    if (!session || !session->checkpoint_valid || !item.emitted ||
+        !item.n_emitted || item.emitted_cap < 1) {
+      set_error(error, error_capacity,
+                "DSpark batch contains an invalid session");
+      return 1;
+    }
+    *item.n_emitted = 0;
+    if (session->checkpoint.len >= session->context_size) {
+      set_error(error, error_capacity,
+                "DSpark batch decode exceeds session context");
+      return 1;
+    }
+    if (engine == nullptr) {
+      engine = session->engine;
+      block = ds4_rocm_graph_dspark_block_size(session->graph);
+      vocabulary_size = ds4_engine_vocab_size(engine);
+    } else if (session->engine != engine) {
+      set_error(error, error_capacity,
+                "DSpark batch sessions do not share one model");
+      return 1;
+    }
+    if (session_cancelled(session)) {
+      set_error(error, error_capacity, "DSpark batch decode cancelled");
+      return DS4_SESSION_SYNC_INTERRUPTED;
+    }
+    for (size_t previous = 0; previous < index; ++previous) {
+      if (items[previous].session == session) {
+        set_error(error, error_capacity,
+                  "DSpark batch contains a duplicate session");
+        return 1;
+      }
+    }
+  }
+
+  // Validate the whole cohort before changing any request's draft policy or KV.
+  for (size_t index = 0; index < item_count; ++index) {
+    const auto& item = items[index];
+    ds4_session* session = item.session;
+    session_dspark_use_concurrency(session, item_count);
+    const int length = session->checkpoint.len;
+    lengths[index] = length;
+    target_first[index] = ds4_sample_argmax(
+        session->logits.get(), static_cast<uint32_t>(vocabulary_size));
+    (void)session_dspark_seed_pending(session, static_cast<uint32_t>(length));
+
+    const uint32_t maximum =
+        std::min({item.max_draft_tokens, block, DS4_DSPARK_MAX_BLOCK, 3u});
+    policy_tails[index] =
+        session_dspark_profitable_tail(session, maximum, item_count);
+    verify_tails[index] = session_dspark_usable_tail(
+        session, policy_tails[index], item.emitted_cap);
+    bool can_draft =
+        !session->dspark_state.plain_only &&
+        session_dspark_usable_tail(session, maximum, item.emitted_cap) != 0u &&
+        length >= 2 &&
+        ds4_rocm_graph_dspark_context_len(session->graph) >=
+            static_cast<uint32_t>(length);
+    if (can_draft && (policy_tails[index] == 0u ||
+                      session->dspark_state.skip_remaining != 0u)) {
+      // Reconsider cost each token and keep aging an existing acceptance
+      // backoff even while the caller's draft limit is unprofitable.
+      if (session->dspark_state.skip_remaining != 0u)
+        session->dspark_state.skip_remaining--;
+      session->dspark_state.skipped++;
+      can_draft = false;
+    }
+    can_draft_items[index] = can_draft;
+    any_can_draft = any_can_draft || can_draft;
+  }
+  if (!any_can_draft) {
+    if (!sessions_commit_and_extend_batch(items, target_first, item_count)) {
+      for (size_t index = 0; index < item_count; ++index) {
+        items[index].session->checkpoint_valid = false;
+      }
+      set_error(error, error_capacity,
+                "DeepSeek DSpark fallback batch decode failed");
+      return 1;
+    }
+    for (size_t index = 0; index < item_count; ++index) {
+      items[index].emitted[0] = target_first[index];
+      *items[index].n_emitted = 1;
+    }
+    return 0;
+  }
+
+  constexpr uint32_t kDraftCapacity = DS4_DSPARK_MAX_BLOCK + 1u;
+  std::array<std::array<int32_t, kDraftCapacity>, 8> drafts{};
+  std::array<std::array<int32_t, kDraftCapacity>, 8> row_tops{};
+  std::array<uint32_t, 8> drafted_counts{};
+  std::array<uint32_t, 8> verify_counts{};
+  std::array<uint32_t, 8> tail_drafted{};
+  const bool trace_timing =
+      getenv("GUFO_DEEPSEEK_DSPARK_TIMING") != nullptr;
+  const double draft_t0 = trace_timing ? ds4_now_seconds() : 0.0;
+  std::array<ds4_rocm_dspark_draft_item, 8> draft_items{};
+  size_t draft_item_count = 0;
+  size_t single_draft_index = 0;
+  for (size_t index = 0; index < item_count; ++index) {
+    if (can_draft_items[index]) {
+      single_draft_index = index;
+      draft_items[draft_item_count++] = {
+          .graph = items[index].session->graph,
+          .target_next_token = target_first[index],
+          .position = static_cast<uint32_t>(lengths[index]),
+          .max_draft_tokens = verify_tails[index],
+          .tokens = drafts[index].data() + 1,
+          .n_tokens = &tail_drafted[index],
+      };
+    }
+  }
+  bool proposed_all = false;
+  if (draft_item_count >= 2) {
+    proposed_all = ds4_rocm_graph_dspark_draft_head_batch(
+        engine, draft_items.data(), draft_item_count);
+  } else {
+    const size_t index = single_draft_index;
+    proposed_all = ds4_rocm_graph_dspark_draft(
+        items[index].session->graph, engine, target_first[index],
+        static_cast<uint32_t>(lengths[index]), drafts[index].data() + 1,
+        &tail_drafted[index]);
+  }
+  const double draft_ms =
+      trace_timing ? (ds4_now_seconds() - draft_t0) * 1000.0 : 0.0;
+
+  for (size_t index = 0; index < item_count; ++index) {
+    drafts[index][0] = target_first[index];
+    if (proposed_all && tail_drafted[index] <= DS4_DSPARK_MAX_BLOCK) {
+      const uint32_t verify_tail =
+          std::min(tail_drafted[index], verify_tails[index]);
+      drafted_counts[index] = can_draft_items[index] ? verify_tail + 1u : 1u;
+    }
+    proposed_all = proposed_all && drafted_counts[index] != 0u &&
+                   drafted_counts[index] <= kDraftCapacity;
+  }
+
+  if (!proposed_all) {
+    if (!sessions_commit_and_extend_batch(items, target_first, item_count)) {
+      for (size_t index = 0; index < item_count; ++index) {
+        items[index].session->checkpoint_valid = false;
+      }
+      set_error(error, error_capacity,
+                "DeepSeek DSpark draft fallback batch decode failed");
+      return 1;
+    }
+    for (size_t index = 0; index < item_count; ++index) {
+      items[index].emitted[0] = target_first[index];
+      *items[index].n_emitted = 1;
+    }
+    return 0;
+  }
+
+  verify_counts = drafted_counts;
+  std::array<ds4_rocm_verify_item, 8> verify_items{};
+  for (size_t index = 0; index < item_count; ++index) {
+    ds4_session* session = items[index].session;
+    for (uint32_t row = 0; row < verify_counts[index]; ++row) {
+      ds4_tokens_push(&session->checkpoint, drafts[index][row]);
+    }
+    verify_items[index] = {
+        .graph = session->graph,
+        .tokens = &session->checkpoint,
+        .start = static_cast<uint32_t>(lengths[index]),
+        .n_tokens = verify_counts[index],
+        .logical_n_tokens = drafted_counts[index],
+        .row_tops = row_tops[index].data(),
+        .frontier_logits = session->logits.get(),
+    };
+  }
+
+  const double verify_t0 = trace_timing ? ds4_now_seconds() : 0.0;
+  const bool verified =
+      ds4_rocm_graph_verify_batch(engine, verify_items.data(), item_count);
+  const double verify_ms =
+      trace_timing ? (ds4_now_seconds() - verify_t0) * 1000.0 : 0.0;
+  for (size_t index = 0; index < item_count; ++index) {
+    items[index].session->checkpoint.len = lengths[index];
+  }
+  if (!verified) {
+    for (size_t index = 0; index < item_count; ++index) {
+      items[index].session->checkpoint_valid = false;
+    }
+    set_error(error, error_capacity, "DSpark batch verification failed");
+    return 1;
+  }
+
+  const double commit_t0 = trace_timing ? ds4_now_seconds() : 0.0;
+  uint32_t total_rows = 0u;
+  uint32_t total_emitted = 0u;
+  for (size_t index = 0; index < item_count; ++index) {
+    total_rows += verify_counts[index];
+    const int result = session_dspark_finish_verified(
+        items[index].session, lengths[index], vocabulary_size, true,
+        drafts[index].data(), drafted_counts[index], row_tops[index].data(),
+        items[index].emitted, items[index].n_emitted, error, error_capacity);
+    if (result != 0) {
+      for (size_t remaining = index + 1u; remaining < item_count; ++remaining) {
+        items[remaining].session->checkpoint_valid = false;
+      }
+      return result;
+    }
+    total_emitted +=
+        static_cast<uint32_t>(*items[index].n_emitted);
+    if (can_draft_items[index]) {
+      const uint32_t maximum = std::min(
+          {items[index].max_draft_tokens, block, DS4_DSPARK_MAX_BLOCK});
+      const uint32_t policy_maximum = std::min(maximum, policy_tails[index]);
+      const uint32_t support_drafted =
+          drafted_counts[index] > 0u ? drafted_counts[index] - 1u : 0u;
+      const uint32_t support_accepted =
+          *items[index].n_emitted > 0
+              ? static_cast<uint32_t>(*items[index].n_emitted - 1)
+              : 0u;
+      session_dspark_note_concurrent_cycle(
+          items[index].session, support_drafted, support_accepted, item_count);
+      session_dspark_update_adaptive_width(items[index].session,
+                                           support_drafted, support_accepted,
+                                           policy_maximum);
+    }
+  }
+  if (trace_timing) {
+    const double commit_ms =
+        (ds4_now_seconds() - commit_t0) * 1000.0;
+    fprintf(stderr,
+            "ds4: DSpark batch timing c=%zu rows=%u emitted=%u "
+            "draft=%.3f ms verify=%.3f ms commit=%.3f ms\n",
+            item_count, total_rows, total_emitted, draft_ms, verify_ms,
+            commit_ms);
+  }
+  return 0;
 }
 
 void ds4_session_dspark_stats(const ds4_session *session,
@@ -1065,17 +1194,25 @@ void ds4_session_dspark_stats(const ds4_session *session,
                               uint64_t *skipped,
                               uint32_t *context_tokens) {
     if (!session) return;
-    if (drafted) *drafted = session->dspark_drafted;
-    if (accepted) *accepted = session->dspark_accepted;
-    if (support_drafted) *support_drafted = session->dspark_support_drafted;
-    if (support_accepted) *support_accepted = session->dspark_support_accepted;
+    if (drafted)
+      *drafted = session->dspark_state.drafted;
+    if (accepted)
+      *accepted = session->dspark_state.accepted;
+    if (support_drafted)
+      *support_drafted = session->dspark_state.support_drafted;
+    if (support_accepted)
+      *support_accepted = session->dspark_state.support_accepted;
     if (positional_accepted) {
-        *positional_accepted = session->dspark_positional_accepted;
+      *positional_accepted = session->dspark_state.positional_accepted;
     }
-    if (anchors) *anchors = session->dspark_anchors;
-    if (full_blocks) *full_blocks = session->dspark_full_blocks;
-    if (steps) *steps = session->dspark_steps;
-    if (skipped) *skipped = session->dspark_skipped;
+    if (anchors)
+      *anchors = session->dspark_state.anchors;
+    if (full_blocks)
+      *full_blocks = session->dspark_state.full_blocks;
+    if (steps)
+      *steps = session->dspark_state.steps;
+    if (skipped)
+      *skipped = session->dspark_state.skipped;
     if (context_tokens) {
         *context_tokens =
             ds4_rocm_graph_dspark_context_len(session->graph);
@@ -1088,4 +1225,8 @@ int ds4_session_pos(const ds4_session *session) {
 
 int ds4_session_ctx(const ds4_session *session) {
     return session ? session->context_size : 0;
+}
+
+uint32_t ds4_session_prefill_capacity(const ds4_session* session) {
+  return session ? session->prefill_capacity : 0;
 }

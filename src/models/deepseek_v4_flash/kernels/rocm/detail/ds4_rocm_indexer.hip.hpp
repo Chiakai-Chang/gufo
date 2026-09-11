@@ -1,3 +1,6 @@
+#include "ds4_rocm_indexer_score.hip.hpp"
+#include "ds4_rocm_indexer_topk.hip.hpp"
+
 template <typename Kernel>
 static hipError_t ds4_hip_set_dynamic_shared_memory(Kernel kernel,
                                                      int bytes) {
@@ -88,49 +91,6 @@ __global__ static void indexer_scores_kernel(
         __syncthreads();
     }
     if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = total * scale;
-}
-
-__global__ static void indexer_score_one_direct_kernel(
-        float *scores,
-        const float *q,
-        const float *weights,
-        const float *index_comp,
-        uint32_t n_comp,
-        uint32_t pos0,
-        uint32_t ratio,
-        float scale,
-        int causal) {
-    const uint32_t c = blockIdx.x;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t lane = tid & 31u;
-    const uint32_t warp = tid >> 5u;
-    if (c >= n_comp || tid >= 128u) return;
-    if (causal) {
-        const uint32_t visible = ratio ? (pos0 + 1u) / ratio : n_comp;
-        if (c >= visible) {
-            if (tid == 0) scores[c] = -INFINITY;
-            return;
-        }
-    }
-
-    __shared__ float krow[128];
-    __shared__ float partial[4];
-    if (tid < 128u) krow[tid] = index_comp[(uint64_t)c * 128u + tid];
-    __syncthreads();
-
-    float total = 0.0f;
-    for (uint32_t h0 = 0; h0 < 64u; h0 += 4u) {
-        const uint32_t h = h0 + warp;
-        const float4 qv = ((const float4 *)(q + (uint64_t)h * 128u))[lane];
-        const float4 kv = ((const float4 *)krow)[lane];
-        float dot = qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
-        dot = warp_sum_f32(dot);
-        if (lane == 0) partial[warp] = fmaxf(dot, 0.0f) * weights[h] * scale;
-        __syncthreads();
-        if (tid == 0) total += partial[0] + partial[1] + partial[2] + partial[3];
-        __syncthreads();
-    }
-    if (tid == 0) scores[c] = total;
 }
 
 __global__ static void indexer_scores_wmma128_kernel(
@@ -315,64 +275,6 @@ __global__ static void indexer_scores_wmma128_kernel(
 #endif
 }
 
-__global__ static void argmax_kernel(int32_t *out_idx, const float *logits, uint32_t n_vocab) {
-    enum { THREADS = 1024 };
-    __shared__ float sm_val[THREADS];
-    __shared__ int32_t sm_idx[THREADS];
-
-    const uint32_t tid = threadIdx.x;
-    float local_v = -INFINITY;
-    int32_t local_i = 0;
-    for (uint32_t i = tid; i < n_vocab; i += THREADS) {
-        const float v = logits[i];
-        if (v > local_v) {
-            local_v = v;
-            local_i = (int32_t)i;
-        }
-    }
-    sm_val[tid] = local_v;
-    sm_idx[tid] = local_i;
-    __syncthreads();
-
-    for (uint32_t s = THREADS / 2u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            const float vr = sm_val[tid + s];
-            const int32_t ir = sm_idx[tid + s];
-            const float vl = sm_val[tid];
-            const int32_t il = sm_idx[tid];
-            if ((vr > vl) || (vr == vl && ir < il)) {
-                sm_val[tid] = vr;
-                sm_idx[tid] = ir;
-            }
-        }
-        __syncthreads();
-    }
-
-    if (tid == 0u) *out_idx = sm_idx[0];
-}
-
-__global__ static void indexer_topk_kernel(uint32_t *selected, const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
-    uint32_t t = blockIdx.x;
-    if (t >= n_tokens || threadIdx.x != 0) return;
-    const float *row = scores + (uint64_t)t * n_comp;
-    uint32_t *sel = selected + (uint64_t)t * top_k;
-    for (uint32_t k = 0; k < top_k; k++) sel[k] = 0;
-    for (uint32_t c = 0; c < n_comp; c++) {
-        float v = row[c];
-        for (uint32_t k = 0; k < top_k; k++) {
-            if ((k >= c) || v > row[sel[k]]) {
-                for (uint32_t j = top_k - 1; j > k; j--) sel[j] = sel[j - 1];
-                sel[k] = c;
-                break;
-            }
-        }
-    }
-}
-
-__device__ __forceinline__ static bool topk_score_better(float av, uint32_t ai, float bv, uint32_t bi) {
-    return av > bv || (av == bv && ai < bi);
-}
-
 /* DSpark Markov correction: select argmax(logits + W2 * W1[prev]) without
  * moving the vocabulary row back to the host. W1 and W2 are Q8_0. */
 __global__ static void dspark_markov_argmax_kernel(
@@ -444,403 +346,122 @@ __global__ static void dspark_markov_argmax_kernel(
     }
 }
 
-__device__ __forceinline__ static uint32_t topk_float_ordered_key(float v) {
-    const uint32_t u = __float_as_uint(v);
-    return (u & 0x80000000u) ? ~u : (u ^ 0x80000000u);
-}
-
-__device__ __forceinline__ static uint64_t topk_pack_key(float v, uint32_t idx) {
-    return ((uint64_t)topk_float_ordered_key(v) << 32u) | (uint64_t)(0xffffffffu - idx);
-}
-
-__global__ static void indexer_topk_8192_cub_kernel(
-        uint32_t *selected,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k) {
-    constexpr uint32_t BLOCK_THREADS = 512u;
-    constexpr uint32_t ITEMS_PER_THREAD = 16u;
-    using BlockSort = cub::BlockRadixSort<uint64_t, BLOCK_THREADS, ITEMS_PER_THREAD>;
-    extern __shared__ __align__(16) unsigned char sort_smem[];
-    typename BlockSort::TempStorage &sort_storage =
-        *reinterpret_cast<typename BlockSort::TempStorage *>(sort_smem);
-
-    const uint32_t t = blockIdx.x;
+/*
+ * Resolve one DSpark position for several requests while streaming Markov W2
+ * once. Each request keeps the scalar kernel's block/lane accumulation and
+ * reduction order; only the independent request dimension is fused.
+ */
+template <uint32_t N_ROWS>
+__global__ static void dspark_markov_argmax_batch_kernel(
+        unsigned long long *out_keys,
+        const float *logits,
+        uint64_t logits_row_stride,
+        const int32_t *previous_tokens,
+        const unsigned char *w1,
+        const unsigned char *w2,
+        uint32_t vocab,
+        uint32_t rank_blocks) {
+    __shared__ float states[N_ROWS][256];
+    __shared__ float values[N_ROWS][256];
+    __shared__ uint32_t indices[N_ROWS][256];
     const uint32_t tid = threadIdx.x;
-    if (t >= n_tokens || tid >= BLOCK_THREADS) return;
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    uint64_t keys[ITEMS_PER_THREAD];
-#pragma unroll
-    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
-        const uint32_t i = tid * ITEMS_PER_THREAD + item;
-        if (i < n_comp) {
-            keys[item] = topk_pack_key(row[i], i);
-        } else {
-            keys[item] = topk_pack_key(-INFINITY, UINT32_MAX);
-        }
-    }
-
-    BlockSort(sort_storage).SortDescending(keys);
+    const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
 
 #pragma unroll
-    for (uint32_t item = 0; item < ITEMS_PER_THREAD; item++) {
-        const uint32_t i = tid * ITEMS_PER_THREAD + item;
-        if (i < top_k) {
-            selected[(uint64_t)t * top_k + i] = 0xffffffffu - (uint32_t)keys[item];
-        }
-    }
-}
-
-__global__ static void indexer_topk_1024_kernel(
-        uint32_t *selected,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k) {
-    uint32_t t = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens || tid >= 1024u) return;
-    __shared__ float vals[1024];
-    __shared__ uint32_t idxs[1024];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    if (tid < n_comp) {
-        vals[tid] = row[tid];
-        idxs[tid] = tid;
-    } else {
-        vals[tid] = -INFINITY;
-        idxs[tid] = UINT32_MAX;
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= 1024u; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            uint32_t other = tid ^ j;
-            if (other > tid && other < 1024u) {
-                const float av = vals[tid];
-                const float bv = vals[other];
-                const uint32_t ai = idxs[tid];
-                const uint32_t bi = idxs[other];
-                const bool desc_half = (tid & k) == 0u;
-                const bool swap = desc_half
-                    ? topk_score_better(bv, bi, av, ai)
-                    : topk_score_better(av, ai, bv, bi);
-                if (swap) {
-                    vals[tid] = bv;
-                    idxs[tid] = bi;
-                    vals[other] = av;
-                    idxs[other] = ai;
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    if (tid < top_k) selected[(uint64_t)t * top_k + tid] = idxs[tid];
-}
-
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_pow2_kernel(
-        uint32_t *selected,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k) {
-    uint32_t t = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-    __shared__ float vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < n_comp) {
-            vals[i] = row[i];
-            idxs[i] = i;
-        } else {
-            vals[i] = -INFINITY;
-            idxs[i] = UINT32_MAX;
+    for (uint32_t request = 0; request < N_ROWS; ++request) {
+        if (tid < rank_blocks * 32u) {
+            const uint32_t block = tid >> 5u;
+            const uint32_t lane = tid & 31u;
+            const unsigned char *qblock =
+                w1 + (uint64_t)(uint32_t)previous_tokens[request] * row_bytes +
+                (uint64_t)block * 34u;
+            const float scale = __half2float(*(const __half *)qblock);
+            states[request][tid] =
+                scale * (float)((const int8_t *)(qblock + 2u))[lane];
         }
     }
     __syncthreads();
 
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
+    float best_values[N_ROWS];
+    uint32_t best_indices[N_ROWS];
+#pragma unroll
+    for (uint32_t request = 0; request < N_ROWS; ++request) {
+        best_values[request] = -INFINITY;
+        best_indices[request] = 0u;
+    }
+
+    for (uint32_t i = blockIdx.x * blockDim.x + tid; i < vocab;
+         i += gridDim.x * blockDim.x) {
+        const unsigned char *row = w2 + (uint64_t)i * row_bytes;
+        float acc[N_ROWS] = {};
+        for (uint32_t block = 0; block < rank_blocks; ++block) {
+            const unsigned char *qblock = row + (uint64_t)block * 34u;
+            const float scale = __half2float(*(const __half *)qblock);
+            const int8_t *quants = (const int8_t *)(qblock + 2u);
+            float sums[N_ROWS] = {};
+#pragma unroll
+            for (uint32_t lane = 0; lane < 32u; ++lane) {
+                const float quant = (float)quants[lane];
+#pragma unroll
+                for (uint32_t request = 0; request < N_ROWS; ++request) {
+                    sums[request] +=
+                        quant * states[request][block * 32u + lane];
                 }
             }
-            __syncthreads();
+#pragma unroll
+            for (uint32_t request = 0; request < N_ROWS; ++request) {
+                acc[request] += scale * sums[request];
+            }
+        }
+#pragma unroll
+        for (uint32_t request = 0; request < N_ROWS; ++request) {
+            const float value =
+                logits[(uint64_t)request * logits_row_stride + i] +
+                acc[request];
+            if (topk_score_better(value, i, best_values[request],
+                                  best_indices[request])) {
+                best_values[request] = value;
+                best_indices[request] = i;
+            }
         }
     }
 
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        selected[(uint64_t)t * top_k + i] = idxs[i];
-    }
-}
-
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_pow2_u16_kernel(
-        uint32_t *selected,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k) {
-    uint32_t t = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-    __shared__ float vals[SORT_N];
-    __shared__ uint16_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < n_comp) {
-            vals[i] = row[i];
-            idxs[i] = (uint16_t)i;
-        } else {
-            vals[i] = -INFINITY;
-            idxs[i] = UINT16_MAX;
-        }
+#pragma unroll
+    for (uint32_t request = 0; request < N_ROWS; ++request) {
+        values[request][tid] = best_values[request];
+        indices[request][tid] = best_indices[request];
     }
     __syncthreads();
-
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = (uint16_t)bi;
-                        vals[other] = av;
-                        idxs[other] = (uint16_t)ai;
-                    }
+    for (uint32_t stride = blockDim.x >> 1u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+#pragma unroll
+            for (uint32_t request = 0; request < N_ROWS; ++request) {
+                if (topk_score_better(
+                        values[request][tid + stride],
+                        indices[request][tid + stride],
+                        values[request][tid],
+                        indices[request][tid])) {
+                    values[request][tid] =
+                        values[request][tid + stride];
+                    indices[request][tid] =
+                        indices[request][tid + stride];
                 }
             }
-            __syncthreads();
         }
+        __syncthreads();
     }
-
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        selected[(uint64_t)t * top_k + i] = idxs[i];
-    }
-}
-
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_chunk_pow2_kernel(
-        uint32_t *candidates,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k,
-        uint32_t candidate_stride) {
-    uint32_t t = blockIdx.x;
-    uint32_t chunk = blockIdx.y;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-
-    const uint32_t chunk_start = chunk * SORT_N;
-    if (chunk_start >= n_comp) return;
-    const uint32_t chunk_n = n_comp - chunk_start < SORT_N ? n_comp - chunk_start : SORT_N;
-    __shared__ float vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        if (i < chunk_n) {
-            vals[i] = row[chunk_start + i];
-            idxs[i] = chunk_start + i;
-        } else {
-            vals[i] = -INFINITY;
-            idxs[i] = UINT32_MAX;
+    if (tid == 0u) {
+#pragma unroll
+        for (uint32_t request = 0; request < N_ROWS; ++request) {
+            const unsigned int bits =
+                __float_as_uint(values[request][0]);
+            const unsigned int value_key =
+                (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+            const unsigned long long key =
+                ((unsigned long long)value_key << 32) |
+                (unsigned int)(~indices[request][0]);
+            atomicMax(out_keys + request, key);
         }
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    uint32_t *out = candidates + (uint64_t)t * candidate_stride + chunk * top_k;
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        out[i] = idxs[i];
-    }
-}
-
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_merge_pow2_kernel(
-        uint32_t *selected,
-        const uint32_t *candidates,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k,
-        uint32_t candidate_count,
-        uint32_t candidate_stride) {
-    uint32_t t = blockIdx.x;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-    __shared__ float vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        uint32_t idx = UINT32_MAX;
-        float v = -INFINITY;
-        if (i < candidate_count) {
-            idx = cand[i];
-            if (idx < n_comp) v = row[idx];
-        }
-        vals[i] = v;
-        idxs[i] = idx;
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        selected[(uint64_t)t * top_k + i] = idxs[i];
-    }
-}
-
-template <uint32_t SORT_N>
-__global__ static void indexer_topk_tree_merge_pow2_kernel(
-        uint32_t *out,
-        const uint32_t *candidates,
-        const float *scores,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t top_k,
-        uint32_t n_sets,
-        uint32_t merge_group,
-        uint32_t candidate_stride,
-        uint32_t out_stride) {
-    uint32_t t = blockIdx.x;
-    uint32_t group = blockIdx.y;
-    uint32_t tid = threadIdx.x;
-    if (t >= n_tokens) return;
-
-    const uint32_t set0 = group * merge_group;
-    if (set0 >= n_sets) return;
-    uint32_t set_count = n_sets - set0;
-    if (set_count > merge_group) set_count = merge_group;
-    const uint32_t candidate_count = set_count * top_k;
-
-    __shared__ float vals[SORT_N];
-    __shared__ uint32_t idxs[SORT_N];
-
-    const float *row = scores + (uint64_t)t * n_comp;
-    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
-    for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-        uint32_t idx = UINT32_MAX;
-        float v = -INFINITY;
-        if (i < candidate_count) {
-            idx = cand[i];
-            if (idx < n_comp) v = row[idx];
-        }
-        vals[i] = v;
-        idxs[i] = idx;
-    }
-    __syncthreads();
-
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += blockDim.x) {
-                uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half
-                        ? topk_score_better(bv, bi, av, ai)
-                        : topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            __syncthreads();
-        }
-    }
-
-    uint32_t *dst = out + (uint64_t)t * out_stride + group * top_k;
-    for (uint32_t i = tid; i < top_k; i += blockDim.x) {
-        dst[i] = idxs[i];
     }
 }
 
@@ -877,22 +498,6 @@ __global__ static void indexed_topk_sort_512_asc_kernel(
     dst_row[tid] = rows[tid];
 }
 
-__global__ static void topk_mask_kernel(float *mask, const uint32_t *topk, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
-    uint64_t gid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t n = (uint64_t)n_tokens * n_comp;
-    if (gid >= n) return;
-    uint32_t t = gid / n_comp;
-    uint32_t c = gid - (uint64_t)t * n_comp;
-    float v = -INFINITY;
-    for (uint32_t k = 0; k < top_k; k++) {
-        if (topk[(uint64_t)t * top_k + k] == c) {
-            v = 0.0f;
-            break;
-        }
-    }
-    mask[gid] = v;
-}
-
 static int indexer_scores_launch(
         ds4_gpu_tensor       *scores,
         const ds4_gpu_tensor *q,
@@ -915,14 +520,13 @@ static int indexer_scores_launch(
         return 0;
     }
     if (causal && ratio == 0) return 0;
-    if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-        indexer_score_one_direct_kernel<<<n_comp, 128>>>((float *)scores->ptr,
-                                                         (const float *)q->ptr,
-                                                         (const float *)weights->ptr,
-                                                         (const float *)index_comp->ptr,
-                                                         n_comp, pos0, ratio,
-                                                         scale, causal ? 1 : 0);
-        return hip_ok(hipGetLastError(), "indexer score one direct launch");
+    if ((n_tokens == 1u || ds4_rocm_verifier_batch_mode()) &&
+        head_dim == 128u && n_head == 64u) {
+      indexer_score_one_direct_kernel<<<dim3(n_comp, n_tokens), 128>>>(
+          (float*)scores->ptr, (const float*)q->ptr, (const float*)weights->ptr,
+          (const float*)index_comp->ptr, n_comp, pos0, ratio, scale,
+          causal ? 1 : 0);
+      return hip_ok(hipGetLastError(), "indexer score one direct launch");
     }
     if (head_dim == 128u && n_head == 64u) {
         dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
@@ -999,6 +603,11 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
         scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
         return 0;
+    }
+    if (indexer_partial_topk_launch((uint32_t*)selected->ptr,
+                                    (const float*)scores->ptr, n_comp, n_tokens,
+                                    top_k)) {
+      return hip_ok(hipGetLastError(), "indexer partial topk launch");
     }
     if (top_k == 512u && n_comp <= 1024u) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
@@ -1212,26 +821,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
     return hip_ok(hipGetLastError(), "indexer topk launch");
 }
 
-extern "C" int ds4_gpu_dsv4_topk_mask_tensor(
-        ds4_gpu_tensor       *mask,
-        const ds4_gpu_tensor *topk,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                top_k) {
-    if (!mask || !topk || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
-        mask->bytes < (uint64_t)n_tokens * n_comp * sizeof(float) ||
-        topk->bytes < (uint64_t)n_tokens * top_k * sizeof(uint32_t)) {
-        return 0;
-    }
-    uint64_t n = (uint64_t)n_tokens * n_comp;
-    uint64_t nk = (uint64_t)n_tokens * top_k;
-    uint64_t blocks = ((n > nk ? n : nk) + 255) / 256;
-    topk_mask_kernel<<<blocks, 256>>>((float *)mask->ptr,
-                                      (const uint32_t *)topk->ptr,
-                                      n_comp, n_tokens, top_k);
-    return hip_ok(hipGetLastError(), "topk mask launch");
-}
-
 extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_rows, uint32_t head_dim) {
     if (!x || n_rows == 0 || head_dim != 128u ||
         x->bytes < (uint64_t)n_rows * head_dim * sizeof(float)) {
@@ -1239,21 +828,6 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x, uint32_t n_row
     }
     indexer_hadamard_fp4_kernel<<<n_rows, 128>>>((float *)x->ptr, n_rows, head_dim);
     return hip_ok(hipGetLastError(), "indexer_hadamard_fp4 launch");
-}
-
-/* Dequantize one Q8_0 row of the DSpark Markov W1 table. The row for the
- * previously selected token is the state consumed by the path selector. */
-__global__ static void dspark_markov_w1_row_kernel(
-        float *out,
-        const unsigned char *w1_row,
-        uint32_t rank_blocks) {
-    const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= rank_blocks * 32u) return;
-    const uint32_t block = tid >> 5u;
-    const uint32_t lane = tid & 31u;
-    const unsigned char *qblock = w1_row + (uint64_t)block * 34u;
-    const float scale = __half2float(*(const __half *)qblock);
-    out[tid] = scale * (float)((const int8_t *)(qblock + 2u))[lane];
 }
 
 /* Decode the packed (value, index) key produced by the Markov argmax reduce. */
@@ -1264,28 +838,14 @@ __global__ static void dspark_markov_key_decode_kernel(
     out_index[0] = (int32_t)(~(unsigned int)(key[0] & 0xffffffffull));
 }
 
-extern "C" int ds4_gpu_dspark_markov_w1_row_tensor(
-        ds4_gpu_tensor       *out_state,
-        const void             *model_map,
-        uint64_t                model_size,
-        uint64_t                w1_offset,
-        uint32_t                markov_rank,
-        uint32_t                token) {
-    if (!out_state || !model_map || markov_rank == 0u || markov_rank % 32u != 0u ||
-        !hip_tensor_has_elems(out_state, markov_rank, sizeof(float))) {
-        return 0;
-    }
-    const uint32_t rank_blocks = markov_rank / 32u;
-    const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
-    uint64_t row_offset = 0;
-    if (!hip_u64_mul_checked(token, row_bytes, &row_offset)) return 0;
-    if (!hip_model_range_fits(model_size, w1_offset + row_offset, row_bytes)) return 0;
-    const unsigned char *row = (const unsigned char *)hip_model_range_ptr(
-            model_map, w1_offset + row_offset, row_bytes, "dspark_markov_w1_row");
-    if (!row) return 0;
-    dspark_markov_w1_row_kernel<<<(markov_rank + 255u) / 256u, 256>>>(
-            (float *)out_state->ptr, row, rank_blocks);
-    return hip_ok(hipGetLastError(), "dspark markov w1 row launch");
+__global__ static void dspark_markov_key_decode_batch_kernel(
+        int32_t *out_indices,
+        const unsigned long long *keys,
+        uint32_t n_rows) {
+    const uint32_t row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) return;
+    out_indices[row] =
+        (int32_t)(~(unsigned int)(keys[row] & 0xffffffffull));
 }
 
 /*
@@ -1348,4 +908,95 @@ extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
             (int32_t *)out_index->ptr,
             (const unsigned long long *)scratch_key->ptr);
     return hip_ok(hipGetLastError(), "dspark markov decode launch");
+}
+
+extern "C" int ds4_gpu_dspark_markov_argmax_batch_tensor(
+        ds4_gpu_tensor       *out_index,
+        ds4_gpu_tensor       *scratch_key,
+        const ds4_gpu_tensor *logits_rows,
+        const ds4_gpu_tensor *previous_tokens,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                w1_offset,
+        uint64_t                w2_offset,
+        uint32_t                vocab,
+        uint32_t                markov_rank,
+        uint32_t                n_rows,
+        uint64_t                logits_row_stride) {
+    if (!out_index || !scratch_key || !logits_rows || !previous_tokens ||
+        !model_map || vocab == 0u || markov_rank == 0u ||
+        markov_rank % 32u != 0u ||
+        (n_rows != 2u && n_rows != 4u && n_rows != 6u && n_rows != 8u) ||
+        logits_row_stride < vocab ||
+        !hip_tensor_has_elems(out_index, n_rows, sizeof(int32_t)) ||
+        !hip_tensor_has_elems(scratch_key, n_rows,
+                              sizeof(unsigned long long)) ||
+        !hip_tensor_has_elems(previous_tokens, n_rows, sizeof(int32_t)) ||
+        !hip_tensor_has_elems(
+            logits_rows,
+            (uint64_t)(n_rows - 1u) * logits_row_stride + vocab,
+            sizeof(float))) {
+        return 0;
+    }
+    const uint32_t rank_blocks = markov_rank / 32u;
+    if (rank_blocks * 32u > 256u) return 0;
+    const uint64_t row_bytes = (uint64_t)rank_blocks * 34u;
+    uint64_t table_bytes = 0u;
+    if (!hip_u64_mul_checked(vocab, row_bytes, &table_bytes) ||
+        !hip_model_range_fits(model_size, w1_offset, table_bytes) ||
+        !hip_model_range_fits(model_size, w2_offset, table_bytes)) {
+        return 0;
+    }
+    const unsigned char *w1 =
+        (const unsigned char *)hip_model_range_ptr(
+            model_map, w1_offset, table_bytes, "dspark_markov_w1_batch");
+    const unsigned char *w2 =
+        (const unsigned char *)hip_model_range_ptr(
+            model_map, w2_offset, table_bytes, "dspark_markov_w2_batch");
+    if (!w1 || !w2) return 0;
+    if (!hip_ok(hipMemset(scratch_key->ptr, 0,
+                          (size_t)n_rows * sizeof(unsigned long long)),
+                "dspark markov batch key reset")) {
+        return 0;
+    }
+    const uint32_t blocks = (vocab + 255u) / 256u;
+    switch (n_rows) {
+        case 2u:
+            dspark_markov_argmax_batch_kernel<2u><<<blocks, 256>>>(
+                (unsigned long long *)scratch_key->ptr,
+                (const float *)logits_rows->ptr, logits_row_stride,
+                (const int32_t *)previous_tokens->ptr, w1, w2, vocab,
+                rank_blocks);
+            break;
+        case 4u:
+            dspark_markov_argmax_batch_kernel<4u><<<blocks, 256>>>(
+                (unsigned long long *)scratch_key->ptr,
+                (const float *)logits_rows->ptr, logits_row_stride,
+                (const int32_t *)previous_tokens->ptr, w1, w2, vocab,
+                rank_blocks);
+            break;
+        case 6u:
+            dspark_markov_argmax_batch_kernel<6u><<<blocks, 256>>>(
+                (unsigned long long *)scratch_key->ptr,
+                (const float *)logits_rows->ptr, logits_row_stride,
+                (const int32_t *)previous_tokens->ptr, w1, w2, vocab,
+                rank_blocks);
+            break;
+        case 8u:
+            dspark_markov_argmax_batch_kernel<8u><<<blocks, 256>>>(
+                (unsigned long long *)scratch_key->ptr,
+                (const float *)logits_rows->ptr, logits_row_stride,
+                (const int32_t *)previous_tokens->ptr, w1, w2, vocab,
+                rank_blocks);
+            break;
+        default:
+            return 0;
+    }
+    if (!hip_ok(hipGetLastError(), "dspark markov batch argmax launch")) {
+        return 0;
+    }
+    dspark_markov_key_decode_batch_kernel<<<1, 32>>>(
+        (int32_t *)out_index->ptr,
+        (const unsigned long long *)scratch_key->ptr, n_rows);
+    return hip_ok(hipGetLastError(), "dspark markov batch decode launch");
 }

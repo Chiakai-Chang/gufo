@@ -20,9 +20,6 @@ struct ds4_engine_options {
   /* Optional DSpark support model. NULL leaves speculative decoding off and
    * the engine byte-for-byte identical to a non-speculative build. */
   const char* dspark_model_path;
-  int context_size;
-  uint32_t prefill_chunk;
-  int power_percent;
 };
 
 struct ds4_session_snapshot {
@@ -31,13 +28,25 @@ struct ds4_session_snapshot {
   uint64_t cap;
 };
 
+struct ds4_session_batch_item {
+  ds4_session* session;
+  int token;
+};
+
+struct ds4_session_dspark_batch_item {
+  ds4_session* session;
+  int* emitted;
+  int emitted_cap;
+  uint32_t max_draft_tokens;
+  int* n_emitted;
+};
+
 inline constexpr int DS4_SESSION_SYNC_INTERRUPTED = 2;
-inline constexpr std::uint32_t DS4_SESSION_PAYLOAD_VERSION = 2;
+inline constexpr std::uint32_t DS4_SESSION_PAYLOAD_VERSION = 4;
 
 int ds4_engine_open(ds4_engine** out, const ds4_engine_options* options);
 void ds4_engine_close(ds4_engine* engine);
 int ds4_engine_vocab_size(const ds4_engine* engine);
-uint32_t ds4_engine_prefill_chunk(const ds4_engine* engine);
 const char* ds4_engine_model_name(const ds4_engine* engine);
 
 void ds4_tokens_free(ds4_tokens* tokens);
@@ -59,27 +68,19 @@ void ds4_session_free(ds4_session* session);
 int ds4_session_sync(ds4_session* session, const ds4_tokens* prompt,
                      char* error, size_t error_capacity);
 int ds4_session_argmax(const ds4_session* session);
-int ds4_session_argmax_excluding(const ds4_session* session,
-                                 int excluded_token);
 int ds4_session_sample(const ds4_session* session, float temperature, int top_k,
                        float top_p, float min_p, uint64_t* rng_state);
 int ds4_session_eval(ds4_session* session, int token, char* error,
                      size_t error_capacity);
-/* Measures whether batched DSpark verification reproduces one-token decode's
- * greedy continuation, and how much cheaper a verification block is than the
- * tokens it replaces. Returns 0 when the suffix agrees exactly. */
-int ds4_session_dspark_selftest(ds4_session* session, int rows, char* error,
-                                size_t error_capacity);
-/* Proposes one DSpark block, verifies it against the target, and reports how
- * many tokens the target accepted. Returns 0 when a block was proposed. */
-int ds4_session_dspark_draft_selftest(ds4_session* session, int cycles,
-                                      char* error, size_t error_capacity);
+int ds4_sessions_eval_batch(const ds4_session_batch_item* items,
+                            size_t item_count, char* error,
+                            size_t error_capacity);
+void ds4_session_begin_request(ds4_session* session);
+void ds4_session_prepare_batch_execution(ds4_session* session);
 bool ds4_engine_has_dspark(const ds4_engine* engine);
-/* Runs one greedy DSpark speculative cycle, emitting the accepted prefix plus
- * the target's correction. Falls back to a single ordinary token when a block
- * cannot be drafted or verified. */
-int ds4_session_dspark_step(ds4_session* session, int* emitted, int emitted_cap,
-                            int* n_emitted, char* error, size_t error_capacity);
+int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
+                                   size_t item_count, char* error,
+                                   size_t error_capacity);
 void ds4_session_dspark_stats(const ds4_session* session, uint64_t* drafted,
                               uint64_t* accepted, uint64_t* support_drafted,
                               uint64_t* support_accepted,
@@ -100,6 +101,7 @@ void ds4_session_set_cancel(ds4_session* session,
 void ds4_session_invalidate(ds4_session* session);
 int ds4_session_pos(const ds4_session* session);
 int ds4_session_ctx(const ds4_session* session);
+uint32_t ds4_session_prefill_capacity(const ds4_session* session);
 uint64_t ds4_session_payload_bytes(const ds4_session* session);
 
 #endif  // GUFO_MODELS_DEEPSEEK_V4_FLASH_RUNTIME_MODEL_H_

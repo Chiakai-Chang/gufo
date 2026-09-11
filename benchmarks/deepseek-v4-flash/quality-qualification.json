@@ -1,0 +1,163 @@
+{
+  "schema": "gufo.ds4-quality-qualification.v1",
+  "date": "2026-09-10",
+  "candidate": {
+    "source_commit": "76d2f8b66918d0244f58d68b388ec7a40e90977e",
+    "working_tree_changes": true,
+    "production_source_sha256": "b760954f621995ac9639e3946b68d1c9adc0d2d0d896e3446329e96b6b9dcccb",
+    "nix_output": "/nix/store/444s9difsbvkzc64q7xayw79zymjw3g3-gufo-76d2f8b-dirty",
+    "binary_sha256": "b16e356d11905d16f27b9f3d9377ce348f39c6faad04588af8e64235e6488e53",
+    "quality_binary_sha256": "d7492bf4a99fc29262056a3b8c1431472abbaa4228128f62c8992b79450338aa",
+    "serving_binary_sha256": "815a9005f61f7e5974697a18b0fdc7d973492f789fce6e2506c54b462dfdf29d"
+  },
+  "target_sha256": "ca22ae2f838e14077c22bc1c1417b71b45b5e5a3687bd96c2ac6e17fdb6261c0",
+  "support_sha256": "7e319924541db3f7a163ed7e11d7532a70d48228ab59d36cb81e1d4511885360",
+  "checks": [
+    {
+      "name": "ds4.template",
+      "passed": true,
+      "seconds": 0.05
+    },
+    {
+      "name": "ds4.cli",
+      "passed": true,
+      "seconds": 0.04
+    },
+    {
+      "name": "ds4.target",
+      "passed": true,
+      "seconds": 98.58
+    },
+    {
+      "name": "ds4.dspark",
+      "passed": true,
+      "seconds": 375.8
+    },
+    {
+      "name": "ds4.serving",
+      "passed": true,
+      "seconds": 85.02
+    },
+    {
+      "name": "ds4.projections",
+      "passed": true,
+      "seconds": 0.45
+    },
+    {
+      "name": "ds4.attention",
+      "passed": true,
+      "seconds": 0.61
+    },
+    {
+      "name": "ds4.dataset",
+      "passed": true,
+      "seconds": 0.04
+    },
+    {
+      "name": "ds4.eval",
+      "passed": true,
+      "seconds": 0.05
+    }
+  ],
+  "scalar_replay": [
+    {
+      "concurrency": 1,
+      "depth": 0,
+      "choices": 128,
+      "exact_greedy_tokens": true,
+      "exact_frontier_logits": true
+    },
+    {
+      "concurrency": 1,
+      "depth": 2048,
+      "choices": 128,
+      "exact_greedy_tokens": true,
+      "exact_frontier_logits": true
+    },
+    {
+      "concurrency": 1,
+      "depth": 4096,
+      "choices": 128,
+      "exact_greedy_tokens": true,
+      "exact_frontier_logits": true
+    },
+    {
+      "concurrency": 2,
+      "depth": 4096,
+      "choices": 32,
+      "exact_greedy_tokens": true,
+      "exact_frontier_logits": true
+    },
+    {
+      "concurrency": 4,
+      "depth": 4096,
+      "choices": 64,
+      "exact_greedy_tokens": true,
+      "exact_frontier_logits": true
+    },
+    {
+      "concurrency": 6,
+      "depth": 4096,
+      "choices": 96,
+      "exact_greedy_tokens": true,
+      "exact_frontier_logits": true
+    },
+    {
+      "concurrency": 8,
+      "depth": 16384,
+      "choices": 128,
+      "exact_greedy_tokens": true,
+      "exact_frontier_logits": true
+    },
+    {
+      "concurrency": 2,
+      "depth": 16384,
+      "choices": 32,
+      "exact_greedy_tokens": true,
+      "exact_frontier_logits": true
+    }
+  ],
+  "repeatability": "Exact tokens, logits and draft counters at fixed and changing concurrency, including different session capacities.",
+  "snapshots": "Exact support/controller continuation through 16384 tokens; serving prefix and disk reuse passed.",
+  "memory": {
+    "reserve_gib": 12,
+    "target_span_payload_bytes": 86714777636,
+    "previous_weight_reservation_bytes": 93952409600,
+    "span_count": 138,
+    "all_checks": {
+      "exit_code": 0,
+      "aborted_for_memory": false,
+      "minimum_available_gib": 16.005645751953125,
+      "reserve_gib": 12.0
+    }
+  },
+  "logs_sha256": {
+    "ds4-memory-step23-quality.log": "c6e08f3d91f36c0057ab38fe0cd9dd7435377d8b6d28025985d60e1df60392d0"
+  },
+  "limits": [
+    "Correctness checks use Nix gpu-test binaries; speed measurements use the pinned Nix release binary.",
+    "DSpark/scalar agreement does not prove official-model equivalence.",
+    "Four existing post-prefill differences versus Antirez remain under investigation; neither implementation is ground truth.",
+    "The 75-question capability comparison remains pending separate approval."
+  ],
+  "capacity_control": {
+    "context_capacities": [
+      4096,
+      262144
+    ],
+    "prefill_tokens": 2048,
+    "continuation_frontiers": 4,
+    "exact_target_logits": true,
+    "dspark_serving_capacity": 262144,
+    "dspark_prefix_repeat_exact": true,
+    "full_context_filled": false
+  },
+  "memory_optimization": {
+    "exact_baseline_fingerprints": true,
+    "exact_http_outputs_and_draft_counts": true,
+    "compressed_kv_prefill_and_snapshot_growth": true,
+    "decode_growth_control_tokens": 256,
+    "context_capacity": 262144,
+    "largest_used_context": 20608
+  }
+}

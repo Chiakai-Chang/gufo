@@ -17,8 +17,6 @@ namespace gufo::models::deepseek_v4_flash {
 
 struct ModelOptions {
   std::uint32_t max_context = 4096;
-  std::uint32_t prefill_chunk = 2048;
-  int power_percent = 100;
   /// Optional DSpark support model. Empty leaves speculative decoding off.
   std::string dspark_model_path;
 };
@@ -26,6 +24,21 @@ struct ModelOptions {
 class Session;
 class SessionSnapshot;
 
+struct SessionBatchItem {
+  Session* session = nullptr;
+  int token = 0;
+};
+
+struct SessionDsparkBatchItem {
+  Session* session = nullptr;
+  std::size_t max_tokens = 32;
+  std::uint32_t max_draft_tokens = 5;
+  std::vector<int>* emitted = nullptr;
+};
+
+/// GPU operations, including session creation/destruction, share scratch
+/// storage and must be serialized. Use the batch APIs to advance concurrent
+/// requests; the server scheduler owns and serializes their dispatch.
 class Model final : public std::enable_shared_from_this<Model> {
 public:
   ~Model();
@@ -41,6 +54,11 @@ public:
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       std::uint32_t max_context, std::string* error_msg = nullptr);
+  [[nodiscard]] bool EvaluateBatch(std::span<const SessionBatchItem> items,
+                                   std::string* error_msg = nullptr) const;
+  [[nodiscard]] bool DsparkStepBatch(
+      std::span<const SessionDsparkBatchItem> items,
+      std::string* error_msg = nullptr) const;
   [[nodiscard]] std::vector<int> Tokenize(std::string_view text) const;
   [[nodiscard]] std::vector<int> EncodeChat(std::string_view system_prompt,
                                             std::string_view user_prompt) const;
@@ -55,8 +73,8 @@ public:
   [[nodiscard]] int EosToken() const;
   [[nodiscard]] int VocabSize() const;
   [[nodiscard]] std::string ModelName() const;
-  [[nodiscard]] std::uint32_t PrefillChunk() const;
   [[nodiscard]] std::uint32_t MaxContext() const noexcept;
+  [[nodiscard]] bool HasDspark() const;
 
 private:
   Model(ds4_engine* engine, ModelOptions options);
@@ -83,19 +101,23 @@ public:
   [[nodiscard]] int SelectNext(float temperature, std::uint64_t* rng_state,
                                int top_k = 0, float top_p = 1.0F,
                                float min_p = 0.0F) const;
-  [[nodiscard]] int SelectNextExcluding(int excluded_token) const;
   [[nodiscard]] bool Evaluate(int token, std::string* error_msg = nullptr);
-  /// Compares batched DSpark verification against one-token decode and reports
-  /// the relative cost of both paths. Diagnostic only.
-  [[nodiscard]] bool DsparkSelfTest(int rows, std::string* error_msg = nullptr);
-  /// Runs whole DSpark speculative cycles and reports acceptance. Diagnostic
-  /// only.
-  [[nodiscard]] bool DsparkDraftSelfTest(int cycles,
-                                         std::string* error_msg = nullptr);
   /// True when this session has a DSpark drafter attached.
   [[nodiscard]] bool HasDspark() const;
+  /// Reset request statistics and draft policy, retaining a restored prefix.
+  void BeginRequest();
+  /// Discards DSpark-only request state before exact multi-session execution.
+  void PrepareBatchExecution();
   /// Runs one greedy speculative cycle and appends the emitted tokens.
   [[nodiscard]] bool DsparkStep(std::vector<int>* emitted,
+                                std::string* error_msg = nullptr);
+  /// Runs one greedy speculative cycle without committing more than max_tokens.
+  [[nodiscard]] bool DsparkStep(std::size_t max_tokens,
+                                std::vector<int>* emitted,
+                                std::string* error_msg = nullptr);
+  [[nodiscard]] bool DsparkStep(std::size_t max_tokens,
+                                std::uint32_t max_draft_tokens,
+                                std::vector<int>* emitted,
                                 std::string* error_msg = nullptr);
   struct DsparkStats {
     std::uint64_t verifier_rows{0};
@@ -108,6 +130,7 @@ public:
     std::uint64_t steps{0};
     std::uint64_t skipped{0};
     std::uint32_t context_tokens{0};
+    bool operator==(const DsparkStats&) const = default;
   };
   [[nodiscard]] DsparkStats DsparkStatistics() const;
   [[nodiscard]] std::vector<float> CopyLogits(
@@ -123,6 +146,7 @@ public:
 
   [[nodiscard]] int Position() const;
   [[nodiscard]] int ContextSize() const;
+  [[nodiscard]] std::uint32_t PrefillCapacity() const;
   [[nodiscard]] std::uint64_t PayloadBytes() const;
 
 private:
