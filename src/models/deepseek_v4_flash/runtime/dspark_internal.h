@@ -90,6 +90,9 @@ struct ds4_dspark_request_state {
   uint32_t probe_cost = 0;
   bool plain_only = false;
   bool force_plain_request = false;
+  /* Sampled token rejected by the last cycle, emitted as the next anchor.
+   * Never persisted: a restored prefix starts a new request. */
+  int pending_anchor = -1;
 };
 
 struct ds4_dspark_stage_weights {

@@ -14,6 +14,8 @@ are in [the DS4 benchmark README](../../benchmarks/deepseek-v4-flash/README.md).
 | `result/bin/gufo eval --questions 75 --greedy --output /tmp/ds4-quality.json` | Pinned capability evaluation through the real HTTP server (add `--base-url`) |
 | `result/bin/gufo bench -c 1,2,4,6,8 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v` | Release model sweep; per-request output hashes and draft counters (add model paths) |
 | `tools/ds4/check.py benchmark --ar-log /tmp/ar.log --dspark-log /tmp/dspark.log --output /tmp/bench.json` | Check all 25 points and every member of both repeats; require repeated hashes/counters and matching AR/DSpark tokens |
+| `result/bin/gufo bench -c 1,2,4 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v --temperature 0.6 --seed 7` | Sampled release sweep; the same seed on the AR and DSpark runs must produce the same hashes |
+| `tools/ds4/check.py benchmark --concurrency 1,2,4 --temperature 0.6 --seed 7 --ar-log /tmp/ar-t06.log --dspark-log /tmp/dspark-t06.log --output /tmp/bench-t06.json` | Same checks on the sampled sweep, with per-point DSpark acceptance in the report |
 | `tools/serving/gufo-serving-bench.py` | Shared HTTP concurrency, scheduling, and acceptance measurement |
 | `tools/quant/speculative-corpus.py` | Shared AR/speculative text comparison on the fixed corpus |
 | `tools/prof/prof.py` | Shared rocprofv3 capture, rollup, and A/B diff |

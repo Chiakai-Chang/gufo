@@ -82,9 +82,50 @@ DSpark chooses draft lengths from [measured cycle costs](cost-calibration.json)
 and backs off when acceptance is too low. It skips cycles whose verification
 cost cannot be repaid even at full acceptance. Decisions use token history and
 offline calibration; wall-clock timing never changes token decisions. Sampled requests
-use target decoding while eligible greedy peers retain DSpark batching. Changes
+draft in the same cohort as greedy peers: each verified row is drawn with the
+request sampler and accepted while the draw reproduces the draft, so a seeded
+request emits the tokens autoregressive decoding would; acceptance is the
+target probability of the draft and falls with temperature. Changes
 in concurrency reset the decision history. Complete support state and controller
 state survive snapshots; a new request reusing a prefix starts fresh statistics.
+
+## Sampled requests, `temperature 0.6`
+
+Cells are **per-user tg128 AR / DSpark**, in tok/s, with the DSpark support
+acceptance; `--seed 7`, pp2048, two repetitions, from the
+[sampled matrix](sampled-speed-matrix.json). Every request's DSpark output
+hash equals its autoregressive hash.
+
+| Context depth | C1 | C2 | C4 |
+| ---: | ---: | ---: | ---: |
+| 0 | 17.27 / 15.69 (0.13) | 16.25 / 24.88 (0.87) | 13.63 / 14.12 (0.91) |
+| 4,096 | 15.46 / 39.15 (1.00) | 13.66 / 24.17 (1.00) | 10.51 / 13.64 (1.00) |
+| 8,192 | 15.31 / 38.34 (1.00) | 13.43 / 22.37 (1.00) | 10.29 / 13.29 (1.00) |
+| 12,288 | 15.15 / 37.56 (1.00) | 13.14 / 21.81 (1.00) | 9.94 / 12.93 (1.00) |
+| 16,384 | 15.03 / 35.93 (0.98) | 12.97 / 21.24 (1.00) | 9.77 / 12.58 (1.00) |
+
+The fixed repeating benchmark sequence leaves the target distribution nearly a
+spike at 4K–16K, so sampled acceptance equals greedy acceptance there and the
+speedups (**2.39–2.53× at C1, 1.64–1.77× at C2, 1.29–1.30× at C4**) match the
+greedy tables; the sampled cycle adds no measurable cost. The depth-zero seed
+is the only point where draws reject drafts (C1 backs off after 5 cycles).
+
+Natural text is where temperature matters. The serving harness on the shared
+speculative corpus (`--corpus-layout distinct`, 128-token budget, one warmup
+and two rounds, release servers with eight sessions, 8K context) reports
+aggregate output tok/s **AR / DSpark** with the DSpark support acceptance:
+
+| Temperature | C1 | C2 | C4 | C8 |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 16.2 / 20.5 (0.66) | 25.8 / 26.0 (0.71) | 39.2 / 35.7 (0.75) | 49.3 / 45.8 (skipped) |
+| 0.6 | 16.3 / 22.0 (0.63) | 25.6 / 25.6 (0.66) | 38.3 / 33.6 (0.64) | 46.5 / 45.1 (0.60) |
+| 1.0 | 16.3 / 19.1 (0.56) | 25.5 / 25.4 (0.63) | 38.6 / 33.0 (0.66) | 44.4 / 44.2 (0.62) |
+
+Sampled acceptance stays 0.56–0.66 through `temperature 1.0`, above the 0.48
+break-even, so the sampled cycle behaves like the greedy one at every width:
+C1 gains 17–35%, C2 is even, and C4/C8 on these short prompts lose 3–14% in
+both modes, the known depth-zero cost of the concurrent policy rather than a
+sampling effect. Reports: `serving-{ar,dspark}-t{0,0.6,1.0}.json`.
 
 ## C1 memory with a 262,144-token capacity
 
@@ -123,6 +164,13 @@ DSPARK=/path/to/DSpark-support.gguf
 # Capture stdout and stderr for each run, then validate the pair:
 nix develop -c tools/ds4/check.py benchmark \
   --ar-log /tmp/ar.log --dspark-log /tmp/dspark.log --output /tmp/bench.json
+# Sampled column: same seed on both runs, then validate with the sampling flags.
+./result/bin/gufo bench --model "$MODEL" --dspark-model "$DSPARK" \
+  -c 1,2,4 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v \
+  --temperature 0.6 --seed 7
+nix develop -c tools/ds4/check.py benchmark --concurrency 1,2,4 \
+  --temperature 0.6 --seed 7 \
+  --ar-log /tmp/ar-t06.log --dspark-log /tmp/dspark-t06.log --output /tmp/bench-t06.json
 
 # Large capacity, single-user server; ordinary prompts suffice for memory checks.
 ./result/bin/gufo serve --host 127.0.0.1 --port 19231 --sessions 1 llm \

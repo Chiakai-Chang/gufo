@@ -27,6 +27,9 @@ struct BenchOptions {
   std::uint32_t draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
   float draft_p_min{0.0F};
+  /// DeepSeek generation sampling; 0 keeps greedy decoding.
+  float temperature{0.0F};
+  std::uint32_t seed{0};
   bool verbose{false};
 };
 

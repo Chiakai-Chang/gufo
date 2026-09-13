@@ -32,6 +32,12 @@ def main() -> None:
     parser.add_argument("--ar-log", type=Path)
     parser.add_argument("--dspark-log", type=Path)
     parser.add_argument("--repetitions", type=int, default=2)
+    parser.add_argument("--concurrency", default="1,2,4,6,8",
+                        help="benchmark: comma-separated C values the logs cover")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="benchmark: --temperature both logs were produced with")
+    parser.add_argument("--seed", type=int, default=0,
+                        help="benchmark: --seed both logs were produced with")
     args = parser.parse_args()
     if not os.environ.get("IN_NIX_SHELL"):
         parser.error("run with nix develop -c tools/ds4/check.py")
@@ -43,9 +49,14 @@ def main() -> None:
         if args.model or args.dspark_model or args.upstream:
             parser.error("benchmark validates existing logs; model/upstream options do not apply")
         from benchmark import summarize
-        summarize(args.ar_log, args.dspark_log, args.repetitions, args.output)
+        concurrency = tuple(int(value) for value in args.concurrency.split(","))
+        sampling = ({"temperature": args.temperature, "seed": args.seed}
+                    if args.temperature > 0.0 else None)
+        summarize(args.ar_log, args.dspark_log, args.repetitions, args.output,
+                  concurrency, sampling)
         return
-    if args.ar_log or args.dspark_log or args.repetitions != 2:
+    if (args.ar_log or args.dspark_log or args.repetitions != 2 or
+            args.concurrency != "1,2,4,6,8" or args.temperature or args.seed):
         parser.error("benchmark log/repetition options require the benchmark suite")
     environment = os.environ.copy()
     reference = args.suite == "reference"

@@ -33,12 +33,27 @@ struct ds4_session_batch_item {
   int token;
 };
 
+/* Request sampler for a DSpark cycle. NULL keeps the greedy argmax cycle.
+ *
+ * `sample` draws the next token from one row of target logits with the
+ * request's sampling configuration and RNG. Every drawn token is eventually
+ * emitted in draw order (accepted rows now, a rejected row as the next cycle's
+ * anchor), so the callee may record it as request history immediately.
+ * `accept` reports a token the runtime emits without drawing it: the anchor
+ * carried over from the previous cycle's rejected row. */
+struct ds4_dspark_sampler {
+  void* ctx;
+  int (*sample)(void* ctx, const float* logits, uint32_t vocabulary_size);
+  void (*accept)(void* ctx, int token);
+};
+
 struct ds4_session_dspark_batch_item {
   ds4_session* session;
   int* emitted;
   int emitted_cap;
   uint32_t max_draft_tokens;
   int* n_emitted;
+  const ds4_dspark_sampler* sampler;
 };
 
 inline constexpr int DS4_SESSION_SYNC_INTERRUPTED = 2;
@@ -81,6 +96,10 @@ bool ds4_engine_has_dspark(const ds4_engine* engine);
 int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
                                    size_t item_count, char* error,
                                    size_t error_capacity);
+/* Returns and clears the sampled token a DSpark cycle rejected, or -1. The
+ * token is the request's next output; an exact target step must emit it
+ * instead of sampling the frontier logits again. */
+int ds4_session_dspark_take_pending_anchor(ds4_session* session);
 void ds4_session_dspark_stats(const ds4_session* session, uint64_t* drafted,
                               uint64_t* accepted, uint64_t* support_drafted,
                               uint64_t* support_accepted,

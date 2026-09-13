@@ -105,9 +105,13 @@ expert projections share weight reads across the batch; one request uses the
 single-session path.
 
 With `--dspark-model <support.gguf>`, DSpark is selected automatically unless
-`--speculative off` is explicit. Greedy requests share support computation and
-ragged verification; sampled requests use autoregressive decoding. Draft widths
-adapt within the requested `--draft-tokens` ceiling. C1 starts at three support
+`--speculative off` is explicit. Greedy and sampled requests share support
+computation and ragged verification. A sampled request draws every verified
+row with its own sampler (temperature, top-k, top-p, min-p, penalties, seed)
+and accepts the draft while the draw reproduces it, so a seeded request emits
+the same tokens as autoregressive decoding; acceptance falls with temperature
+because a draft is accepted with its target probability rather than by argmax
+match. Draft widths adapt within the requested `--draft-tokens` ceiling. C1 starts at three support
 tokens and can grow to the artifact limit; C2/C4/C8 cap the tail at three and C6
 at two. Low-acceptance C1 requests temporarily return to autoregressive decode.
 These measured defaults are model-owned. See the

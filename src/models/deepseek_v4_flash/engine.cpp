@@ -154,6 +154,7 @@ bool Model::DsparkStepBatch(std::span<const SessionDsparkBatchItem> items,
             static_cast<int>(std::min(item.max_tokens, blocks[index].size())),
         .max_draft_tokens = item.max_draft_tokens,
         .n_emitted = &produced[index],
+        .sampler = item.sampler,
     };
   }
 
@@ -331,15 +332,21 @@ bool Session::DsparkStep(std::size_t max_tokens, std::vector<int>* emitted,
 }
 
 bool Session::DsparkStep(std::size_t max_tokens, std::uint32_t max_draft_tokens,
-                         std::vector<int>* emitted, std::string* error_msg) {
+                         std::vector<int>* emitted, std::string* error_msg,
+                         const ds4_dspark_sampler* sampler) {
   const SessionDsparkBatchItem item{
       .session = this,
       .max_tokens = max_tokens,
       .max_draft_tokens = max_draft_tokens,
       .emitted = emitted,
+      .sampler = sampler,
   };
   return model_->DsparkStepBatch(
       std::span<const SessionDsparkBatchItem>(&item, 1), error_msg);
+}
+
+int Session::TakePendingDsparkToken() {
+  return ds4_session_dspark_take_pending_anchor(session_);
 }
 
 Session::DsparkStats Session::DsparkStatistics() const {

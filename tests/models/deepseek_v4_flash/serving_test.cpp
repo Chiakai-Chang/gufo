@@ -94,7 +94,46 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
            "decisions");
   }
 
-  // Model-owned subgroups must survive mixed greedy and seeded sampling.
+  // Sampled requests draft too: each verified row is drawn with the request
+  // sampler, so a seeded DSpark request reproduces autoregressive decoding
+  // token for token, including penalties.
+  {
+    const std::vector<gufo::models::deepseek_v4_flash::ChatMessage>
+        direct_messages = {
+            {.role = "user",
+             .content = "Continue the pattern with twenty terms: red, blue, "
+                        "blue, red, blue, blue,"},
+        };
+    const auto direct_prompt = model->EncodeChat(direct_messages);
+    InferenceBackend backend;
+    Expect(backend.load(model, &error, 4096, 1, {}, {}, speculative), error);
+    const auto greedy = backend.chat(prompt, 32, 0.0F);
+    for (const auto& sampling : {
+             gufo::sampling::SamplingConfig{.temperature = 0.6F, .seed = 7},
+             gufo::sampling::SamplingConfig{.temperature = 1.0F, .seed = 7},
+             gufo::sampling::SamplingConfig{.temperature = 0.6F,
+                                            .top_k = 40,
+                                            .top_p = 0.95F,
+                                            .seed = 11,
+                                            .repeat_penalty = 1.2F,
+                                            .frequency_penalty = 0.3F},
+         }) {
+      const auto direct = GenerateDirect(model, direct_prompt, 32, sampling);
+      const auto result = backend.chat(prompt, 32, sampling);
+      Expect(result.draft_tokens > 0,
+             "sampled DSpark request reports draft statistics");
+      Expect(result.tokens == direct,
+             "seeded sampled DSpark output equals autoregressive decoding");
+    }
+    const auto greedy_again = backend.chat(prompt, 32, 0.0F);
+    Expect(greedy_again.tokens == greedy.tokens &&
+               greedy_again.draft_tokens == greedy.draft_tokens &&
+               greedy_again.draft_accepted_tokens ==
+                   greedy.draft_accepted_tokens,
+           "greedy DSpark output is unchanged after sampled cycles");
+  }
+
+  // Greedy and seeded sampled requests share one DSpark cohort.
   const gufo::sampling::SamplingConfig sampled{.temperature = 0.8F,
                                                .top_k = 20,
                                                .top_p = 0.9F,
@@ -120,14 +159,12 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
       const auto result = pending[i]->Wait();
       Expect(!result.tokens.empty() && result.tokens.size() <= 32,
              "mixed sampling request completes within its budget");
-      Expect(i % 2 == 0 ? result.draft_tokens > 0 : result.draft_tokens == 0,
-             "greedy requests retain DSpark and sampled requests use target "
-             "sampling");
-      const std::size_t expected_width = concurrency / 2;
-      Expect(result.physical_execution_width == expected_width &&
+      Expect(result.draft_tokens > 0,
+             "greedy and sampled requests both retain DSpark");
+      Expect(result.physical_execution_width == concurrency &&
                  result.execution_plan ==
-                     (expected_width == 1 ? "serial-fallback" : "batched-w2"),
-             "mixed sampling reports actual subgroup width");
+                     "batched-w" + std::to_string(concurrency),
+             "mixed sampling reports one DSpark cohort");
     }
   }
   {

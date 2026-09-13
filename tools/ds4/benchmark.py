@@ -22,7 +22,8 @@ def require(condition: bool, message: str) -> None:
         raise RuntimeError(message)
 
 
-def parse(path: Path, repetitions: int) -> tuple[dict, dict]:
+def parse(path: Path, repetitions: int,
+          concurrencies: tuple[int, ...] = CONCURRENCY) -> tuple[dict, dict]:
     points, histories = {}, {}
     for line in path.read_text().splitlines():
         if match := ROW.search(line):
@@ -45,7 +46,7 @@ def parse(path: Path, repetitions: int) -> tuple[dict, dict]:
                 "steps": int(steps), "skipped": int(skipped),
                 "output_sha256": digest,
             })
-    expected = {(c, depth) for c in CONCURRENCY for depth in DEPTHS}
+    expected = {(c, depth) for c in concurrencies for depth in DEPTHS}
     require(points.keys() == expected, f"{path}: incomplete concurrency/depth matrix")
     require(histories.keys() == {(c, depth, member)
                                 for c, depth in expected for member in range(c)},
@@ -64,11 +65,20 @@ def parse(path: Path, repetitions: int) -> tuple[dict, dict]:
     return points, histories
 
 
-def summarize(ar_log: Path, dspark_log: Path, repetitions: int, output: Path) -> None:
+def summarize(ar_log: Path, dspark_log: Path, repetitions: int, output: Path,
+              concurrency: tuple[int, ...] = CONCURRENCY,
+              sampling: dict | None = None) -> None:
+    """Validate a matched AR/DSpark pair of `gufo bench -v` logs.
+
+    `sampling` records the `--temperature`/`--seed` both logs were produced
+    with; token equality is then the seeded sampled equality DSpark
+    guarantees, and acceptance is reported next to each request.
+    """
     require(repetitions >= 2, "benchmark qualification requires at least two repeats")
     require(not output.exists(), "benchmark report already exists")
-    ar, ar_hashes = parse(ar_log, repetitions)
-    dspark, dspark_hashes = parse(dspark_log, repetitions)
+    ar, ar_hashes = parse(ar_log, repetitions, concurrency)
+    dspark, dspark_hashes = parse(dspark_log, repetitions, concurrency)
+    mode = "sampled" if sampling else "greedy"
     records = []
     for c, depth in sorted(ar):
         key = (c, depth)
@@ -78,15 +88,19 @@ def summarize(ar_log: Path, dspark_log: Path, repetitions: int, output: Path) ->
         for member in range(c):
             before, after = ar_hashes[(*key, member)], dspark_hashes[(*key, member)]
             require(before[0]["output_sha256"] == after[0]["output_sha256"],
-                    f"AR/DSpark greedy tokens differ at C{c}/depth{depth}/request{member}")
+                    f"AR/DSpark {mode} tokens differ at C{c}/depth{depth}/request{member}")
             requests.append({"request": member, "ar": before, "dspark": after})
+        drafted = sum(request["dspark"][0]["drafted"] for request in requests)
+        accepted = sum(request["dspark"][0]["accepted"] for request in requests)
         records.append({
             "concurrency": c, "depth": depth,
             "ar": ar[key], "dspark": dspark[key], "requests": requests,
+            "acceptance": accepted / drafted if drafted else None,
         })
     report = {
         "schema": "gufo.ds4-benchmark.v1", "repetitions": repetitions,
         "units": "aggregate prefill / per-user generation, tokens per second",
+        "mode": mode, "sampling": sampling, "concurrency": list(concurrency),
         "logs_sha256": {
             name: hashlib.sha256(path.read_bytes()).hexdigest()
             for name, path in (("ar", ar_log), ("dspark", dspark_log))
@@ -94,5 +108,6 @@ def summarize(ar_log: Path, dspark_log: Path, repetitions: int, output: Path) ->
         "records": records,
     }
     output.write_text(json.dumps(report, indent=2) + "\n")
-    print("Checked all 25 points: repeated output/draft decisions and AR/DSpark token equality.")
+    print(f"Checked all {len(records)} {mode} points: repeated output/draft "
+          "decisions and AR/DSpark token equality.")
     print(f"Report: {output}")

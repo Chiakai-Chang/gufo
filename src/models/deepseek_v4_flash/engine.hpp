@@ -34,6 +34,8 @@ struct SessionDsparkBatchItem {
   std::size_t max_tokens = 32;
   std::uint32_t max_draft_tokens = 5;
   std::vector<int>* emitted = nullptr;
+  /// Request sampler for a sampled cycle; null runs the greedy cycle.
+  const ds4_dspark_sampler* sampler = nullptr;
 };
 
 /// GPU operations, including session creation/destruction, share scratch
@@ -115,10 +117,15 @@ public:
   [[nodiscard]] bool DsparkStep(std::size_t max_tokens,
                                 std::vector<int>* emitted,
                                 std::string* error_msg = nullptr);
+  /// Runs one speculative cycle; a sampler makes it a sampled cycle.
   [[nodiscard]] bool DsparkStep(std::size_t max_tokens,
                                 std::uint32_t max_draft_tokens,
                                 std::vector<int>* emitted,
-                                std::string* error_msg = nullptr);
+                                std::string* error_msg = nullptr,
+                                const ds4_dspark_sampler* sampler = nullptr);
+  /// Returns and clears the token a sampled cycle drew but has not emitted,
+  /// or -1. An exact target step must emit it instead of sampling again.
+  [[nodiscard]] int TakePendingDsparkToken();
   struct DsparkStats {
     std::uint64_t verifier_rows{0};
     std::uint64_t verifier_accepted{0};

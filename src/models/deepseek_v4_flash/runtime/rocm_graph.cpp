@@ -5197,9 +5197,22 @@ static bool rocm_graph_distribute_verify_results(
 
   const uint64_t logits_row_bytes = vocab_dim * sizeof(float);
   if (gather_frontiers) {
+    // Sampled items decide acceptance on the CPU, so they take every verified
+    // row instead of the argmax-selected frontier.
+    for (size_t index = 0; index < item_count; ++index) {
+      const ds4_rocm_verify_item& item = items[index];
+      if (item.row_logits == nullptr) continue;
+      if (ds4_gpu_tensor_read(coordinator->spec_logits,
+                              (uint64_t)row_offsets[index] * logits_row_bytes,
+                              item.row_logits,
+                              (uint64_t)item.n_tokens * logits_row_bytes) == 0) {
+        return false;
+      }
+    }
     bool ok = ds4_gpu_begin_commands() != 0;
     for (size_t index = 0; ok && index < item_count; ++index) {
       const ds4_rocm_verify_item& item = items[index];
+      if (item.row_logits != nullptr) continue;
       uint32_t accepted = 1u;
       while (accepted < item.logical_n_tokens &&
              item.row_tops[accepted - 1u] ==
@@ -5229,6 +5242,7 @@ static bool rocm_graph_distribute_verify_results(
       return false;
     }
     for (size_t index = 0; index < item_count; ++index) {
+      if (items[index].row_logits != nullptr) continue;
       memcpy(items[index].frontier_logits,
              frontier_logits.data() + index * vocab_dim,
              (size_t)logits_row_bytes);

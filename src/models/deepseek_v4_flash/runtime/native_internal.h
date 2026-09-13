@@ -39,6 +39,10 @@ struct ds4_rocm_verify_item {
   uint32_t logical_n_tokens;
   int32_t* row_tops;
   float* frontier_logits;
+  /* Optional: receives all `n_tokens` verified rows (row-major, vocab
+   * floats each). The frontier gather is skipped for such items because the
+   * caller decides acceptance by sampling those rows. */
+  float* row_logits;
 };
 
 struct ds4_rocm_dspark_draft_item {

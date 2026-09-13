@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -19,6 +20,8 @@
 #include "src/cli/arg_parser.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/sampling.hpp"
+#include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
@@ -111,6 +114,12 @@ void PrintBenchHelp(std::string_view program_name) {
       "Speculative", &opt.draft_p_min);
   parser.AddOption("", "--draft-p-min", "P", "Alias for --spec-draft-p-min",
                    "Speculative", &opt.draft_p_min);
+  parser.AddOption("", "--temperature", "T",
+                   "DeepSeek generation temperature; 0 is greedy (default: 0)",
+                   "Workload", &opt.temperature);
+  parser.AddOption("", "--seed", "N",
+                   "DeepSeek sampling seed for --temperature (default: 0)",
+                   "Workload", &opt.seed);
 
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
@@ -303,6 +312,26 @@ int RunDeepSeekBenchmark(
     return 1;
   }
 
+  // Sampled generation draws with the shared server sampler on both paths so
+  // the AR and DSpark runs of one seed produce comparable token hashes.
+  const bool sampled = options.temperature > 0.0F;
+  const sampling::SamplingConfig sampling_config{
+      .temperature = options.temperature,
+      .seed = options.seed,
+  };
+  const auto sample_next = [&](models::deepseek_v4_flash::Session& session,
+                               sampling::SamplerState& sampler,
+                               std::string* error_msg) -> int {
+    int token = session.TakePendingDsparkToken();
+    if (token < 0) {
+      const auto logits = session.CopyLogits(error_msg);
+      if (logits.empty()) return -1;
+      token = static_cast<int>(sampler.Sample(logits));
+    }
+    sampler.Accept(static_cast<sampling::TokenId>(token));
+    return token;
+  };
+
   std::string error;
   auto model = models::deepseek_v4_flash::Model::Load(
       options.model_path,
@@ -414,6 +443,8 @@ int RunDeepSeekBenchmark(
                  ++repeat) {
               std::vector<std::unique_ptr<Session>> sessions;
               std::vector<std::vector<int>> generated(concurrency);
+              std::vector<sampling::SamplerState> samplers(
+                  concurrency, sampling::SamplerState(sampling_config));
               for (std::size_t i = 0; i < concurrency; ++i) {
                 auto session = model->CreateSession(
                     static_cast<uint32_t>(required_context), &error);
@@ -443,14 +474,25 @@ int RunDeepSeekBenchmark(
                   std::vector<models::deepseek_v4_flash::SessionDsparkBatchItem>
                       items;
                   std::vector<std::size_t> active;
+                  std::vector<std::unique_ptr<
+                      models::deepseek_v4_flash::DsparkSamplerBridge>>
+                      bridges;
                   for (std::size_t i = 0; i < concurrency; ++i) {
                     if (generated[i].size() == count)
                       continue;
                     active.push_back(i);
+                    const ds4_dspark_sampler* hook = nullptr;
+                    if (sampled) {
+                      bridges.push_back(std::make_unique<
+                                        models::deepseek_v4_flash::
+                                            DsparkSamplerBridge>(samplers[i]));
+                      hook = bridges.back()->hook();
+                    }
                     items.push_back({.session = sessions[i].get(),
                                      .max_tokens = count - generated[i].size(),
                                      .max_draft_tokens = options.draft_tokens,
-                                     .emitted = &emitted[i]});
+                                     .emitted = &emitted[i],
+                                     .sampler = hook});
                   }
                   if (items.empty())
                     break;
@@ -459,12 +501,20 @@ int RunDeepSeekBenchmark(
                               << '\n';
                     return 1;
                   }
-                  for (const auto i : active) {
+                  for (std::size_t slot = 0; slot < active.size(); ++slot) {
+                    const auto i = active[slot];
                     if (emitted[i].empty() ||
                         emitted[i].size() > count - generated[i].size()) {
                       std::cerr << "Error: DSpark returned an invalid "
                                    "benchmark token count\n";
                       return 1;
+                    }
+                    if (sampled) {
+                      samplers[i].SetRngState(bridges[slot]->rng_state());
+                      for (const int token : emitted[i]) {
+                        samplers[i].Accept(
+                            static_cast<sampling::TokenId>(token));
+                      }
                     }
                     generated[i].insert(generated[i].end(), emitted[i].begin(),
                                         emitted[i].end());
@@ -475,7 +525,14 @@ int RunDeepSeekBenchmark(
                   std::vector<models::deepseek_v4_flash::SessionBatchItem>
                       items;
                   for (std::size_t i = 0; i < concurrency; ++i) {
-                    const int token = sessions[i]->SelectNext(0.0F, nullptr);
+                    const int token =
+                        sampled ? sample_next(*sessions[i], samplers[i], &error)
+                                : sessions[i]->SelectNext(0.0F, nullptr);
+                    if (token < 0) {
+                      std::cerr << "Error in concurrent sampling: " << error
+                                << '\n';
+                      return 1;
+                    }
                     generated[i].push_back(token);
                     items.push_back(
                         {.session = sessions[i].get(), .token = token});
@@ -627,21 +684,32 @@ int RunDeepSeekBenchmark(
 
           std::vector<int> generated;
           generated.reserve(generation_length);
+          sampling::SamplerState sampler(sampling_config);
           const auto start = std::chrono::steady_clock::now();
           for (std::size_t step = 0; step < generation_length;) {
             if (dspark) {
               std::vector<int> emitted;
+              std::optional<models::deepseek_v4_flash::DsparkSamplerBridge>
+                  bridge;
+              if (sampled) bridge.emplace(sampler);
               if (!session->DsparkStep(generation_length - step,
-                                       options.draft_tokens, &emitted,
-                                       &error) ||
+                                       options.draft_tokens, &emitted, &error,
+                                       bridge ? bridge->hook() : nullptr) ||
                   emitted.empty()) {
                 std::cerr << "Error running DSpark decode: " << error << '\n';
                 return 1;
               }
+              if (bridge) {
+                sampler.SetRngState(bridge->rng_state());
+                for (const int token : emitted) {
+                  sampler.Accept(static_cast<sampling::TokenId>(token));
+                }
+              }
               generated.insert(generated.end(), emitted.begin(), emitted.end());
               step += emitted.size();
             } else {
-              const int token = session->SelectNext(0.0F, nullptr);
+              const int token = sampled ? sample_next(*session, sampler, &error)
+                                        : session->SelectNext(0.0F, nullptr);
               if (token < 0 || !session->Evaluate(token, &error)) {
                 std::cerr << "Error running DeepSeek decode: " << error << '\n';
                 return 1;
@@ -874,6 +942,12 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       "Speculative", &opt.draft_p_min);
   parser.AddOption("", "--draft-p-min", "P", "Alias for --spec-draft-p-min",
                    "Speculative", &opt.draft_p_min);
+  parser.AddOption("", "--temperature", "T",
+                   "DeepSeek generation temperature; 0 is greedy (default: 0)",
+                   "Workload", &opt.temperature);
+  parser.AddOption("", "--seed", "N",
+                   "DeepSeek sampling seed for --temperature (default: 0)",
+                   "Workload", &opt.seed);
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
@@ -923,6 +997,12 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     }
     return std::nullopt;
   }
+  if (!std::isfinite(opt.temperature) || opt.temperature < 0.0F) {
+    if (error_msg != nullptr) {
+      *error_msg = "temperature must be non-negative";
+    }
+    return std::nullopt;
+  }
 
   return opt;
 }
@@ -962,6 +1042,11 @@ int RunBench(std::span<const char* const> args) {
   if (opt.concurrency != std::vector<std::size_t>{1}) {
     std::cerr << "Error: concurrent model benchmarks currently support DS4 "
                  "only; use the serving benchmark for Qwen\n";
+    return 1;
+  }
+  if (opt.temperature > 0.0F) {
+    std::cerr << "Error: sampled model benchmarks currently support DS4 only; "
+                 "use the serving benchmark for Qwen\n";
     return 1;
   }
 

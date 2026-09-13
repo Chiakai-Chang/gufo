@@ -27,6 +27,7 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 #include "src/core/speculative/speculative_verifier.hpp"
+#include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -1471,12 +1472,16 @@ public:
     auto& deepseek = RequireDeepSeekState(state);
     if (deepseek.position() >= max_context_)
       return {.stop = true, .piece = {}};
-    std::string error;
-    const auto logits = deepseek.session().CopyLogits(&error);
-    if (logits.empty()) {
-      throw std::runtime_error("DeepSeek token selection failed: " + error);
+    // A sampled DSpark cycle may have drawn the next token already.
+    int token = deepseek.session().TakePendingDsparkToken();
+    if (token < 0) {
+      std::string error;
+      const auto logits = deepseek.session().CopyLogits(&error);
+      if (logits.empty()) {
+        throw std::runtime_error("DeepSeek token selection failed: " + error);
+      }
+      token = static_cast<int>(sampler.Sample(logits));
     }
-    const int token = static_cast<int>(sampler.Sample(logits));
     if (model_->IsStopToken(token)) {
       return {
           .stop = true,
@@ -1506,7 +1511,7 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
-    if (!model_->HasDspark() || !sampler.config().can_use_unmodified_argmax()) {
+    if (!model_->HasDspark()) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     if (max_tokens == 0) {
@@ -1518,14 +1523,22 @@ public:
     if (deepseek.position() >= max_context_)
       return {.selections = {}, .stop = true};
     const auto stats_before = deepseek.session().DsparkStatistics();
+    std::optional<models::deepseek_v4_flash::DsparkSamplerBridge> bridge;
+    if (!sampler.config().can_use_unmodified_argmax()) {
+      bridge.emplace(sampler);
+    }
     std::vector<int> emitted;
     std::string error;
     if (!deepseek.session().DsparkStep(max_tokens, max_draft_tokens_, &emitted,
-                                       &error)) {
+                                       &error,
+                                       bridge ? bridge->hook() : nullptr)) {
       throw std::runtime_error("DeepSeek DSpark decode failed: " + error);
     }
     if (emitted.empty()) {
       throw std::runtime_error("DeepSeek DSpark decode produced no tokens");
+    }
+    if (bridge) {
+      sampler.SetRngState(bridge->rng_state());
     }
 
     TextDecodeStep step;
@@ -1578,71 +1591,29 @@ public:
       }
       return steps;
     }
-    std::vector<TextRunnerDecode> greedy;
-    std::vector<std::size_t> greedy_indices;
-    std::vector<std::size_t> sampled_indices;
-    for (std::size_t index = 0; index < decodes.size(); ++index) {
-      if (decodes[index].sampler.get().config().can_use_unmodified_argmax()) {
-        greedy.push_back(decodes[index]);
-        greedy_indices.push_back(index);
-      } else {
-        sampled_indices.push_back(index);
-      }
-    }
-    if (!sampled_indices.empty()) {
-      std::vector<TextDecodeStep> steps(decodes.size());
-      if (greedy.size() == 1) {
-        const auto& item = greedy.front();
-        steps[greedy_indices.front()] =
-            DecodeStep(item.state.get(), item.max_tokens, item.sampler.get());
-      } else if (!greedy.empty()) {
-        auto greedy_steps = DecodeBatch(greedy);
-        for (std::size_t index = 0; index < greedy.size(); ++index) {
-          steps[greedy_indices[index]] = std::move(greedy_steps[index]);
-        }
-      }
-
-      std::vector<TextRunnerAdvance> advances;
-      std::vector<std::size_t> advanced_indices;
-      for (const std::size_t index : sampled_indices) {
-        const auto& item = decodes[index];
-        auto selection = SelectNext(item.state.get(), item.sampler.get());
-        if (selection.stop) {
-          steps[index].stop = true;
-          continue;
-        }
-        advances.push_back({.state = item.state, .token = selection.token});
-        advanced_indices.push_back(index);
-        steps[index].selections.push_back(std::move(selection));
-      }
-      if (advances.size() == 1) {
-        Advance(advances.front().state.get(), advances.front().token);
-      } else if (!advances.empty()) {
-        AdvanceBatch(advances);
-        for (const std::size_t index : advanced_indices) {
-          steps[index].execution_plan = {
-              .kind = TextExecutionPlanKind::kBatched,
-              .physical_width = advances.size(),
-          };
-        }
-      }
-      return steps;
-    }
-
+    // Greedy and sampled requests share one DSpark cohort; the runtime keeps
+    // the greedy verifier for items without a sampler.
     std::array<models::deepseek_v4_flash::SessionDsparkBatchItem, 8> items{};
     std::array<DeepSeekTextRunnerState*, 8> states{};
     std::array<models::deepseek_v4_flash::Session::DsparkStats, 8>
         stats_before{};
     std::array<std::vector<int>, 8> emitted{};
+    std::array<std::optional<models::deepseek_v4_flash::DsparkSamplerBridge>, 8>
+        bridges{};
     for (std::size_t index = 0; index < decodes.size(); ++index) {
       auto& deepseek = RequireDeepSeekState(decodes[index].state.get());
       states[index] = &deepseek;
       stats_before[index] = deepseek.session().DsparkStatistics();
+      auto& sampler = decodes[index].sampler.get();
+      if (!sampler.config().can_use_unmodified_argmax()) {
+        bridges[index].emplace(sampler);
+      }
       items[index] = {
           .session = &deepseek.session(),
           .max_tokens = decodes[index].max_tokens,
           .max_draft_tokens = max_draft_tokens_,
           .emitted = &emitted[index],
+          .sampler = bridges[index] ? bridges[index]->hook() : nullptr,
       };
     }
 
@@ -1658,6 +1629,9 @@ public:
     for (std::size_t index = 0; index < decodes.size(); ++index) {
       if (emitted[index].empty()) {
         throw std::runtime_error("DeepSeek DSpark batch produced no tokens");
+      }
+      if (bridges[index]) {
+        decodes[index].sampler.get().SetRngState(bridges[index]->rng_state());
       }
       auto& step = steps[index];
       step.execution_plan = {
