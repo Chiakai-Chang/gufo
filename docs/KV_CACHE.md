@@ -220,6 +220,13 @@ it is not portable across:
 Backend portability may be allowed when GPU and NPU use the same defined KV
 layout and both implementations pass restore tests.
 
+The weight artifact is identified by a sampled content digest
+(`gguf-sampled-v1`): the GGUF header, every metadata entry, the full tensor
+table, and 4 KiB windows at the start, middle, and end of each tensor payload.
+It changes on any layout, quantization, metadata, or whole-tensor change, costs
+a few thousand small reads regardless of file size, and depends on nothing but
+the file bytes, so restarts, copies, and moves never re-read the model.
+
 ### File organization
 
 ```text
@@ -234,6 +241,26 @@ session-id/
 
 Write chunks to temporary names, fsync according to configured durability, then
 atomically publish the final manifest. The manifest is the commit record.
+
+### Shared prefixes
+
+Entries hold complete prompts, and a restore needs an entry that is an exact
+prefix of the new prompt. A system prompt shared by many conversations is
+therefore never an entry on its own: `sys + turn1_A` is not a prefix of
+`sys + turn1_B`. The store learns such prefixes from traffic instead. When a
+prompt is admitted, the longest common prefix with every stored entry is
+computed; each distinct length that is at least `shared_prefix_min_tokens`
+(128) and not stored exactly becomes a boundary. Prefill stops on each
+boundary, snapshots the continuation, and writes it before continuing, so the
+next conversation with the same prefix restores it and prefills only its own
+turn. Writing happens once per distinct prefix: saving tokens that already
+have an entry only refreshes their recency.
+
+With `gufo serve --cache-disk`, the second conversation after a cold cache
+pays the prefill and writes the shared prefix; every later conversation starts
+from it. The prefix must be token-identical across conversations, so a client
+that injects a date or session id near the top of its system prompt shortens
+the cacheable prefix to whatever precedes it.
 
 ### Restore
 

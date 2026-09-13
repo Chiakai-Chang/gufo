@@ -104,6 +104,25 @@ public:
       const TextModelRunner& runner, TextRunnerState& state,
       std::span<const TextRunnerToken> prompt);
 
+  /// Prefix lengths that prompt shares with stored entries but that no entry
+  /// holds exactly.
+  ///
+  /// For each stored entry of the same compatibility identity, the common
+  /// prefix length with prompt is a candidate. Lengths below min_tokens, equal
+  /// to prompt.size(), or already stored exactly are dropped. Returns at most
+  /// max_boundaries distinct lengths in ascending order. Callers snapshot at
+  /// those positions so a prefix shared across conversations (system prompt,
+  /// tool schemas) becomes restorable by the next one instead of being
+  /// prefilled again.
+  [[nodiscard]] std::vector<std::size_t> SharedPrefixBoundaries(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+      std::size_t min_tokens, std::size_t max_boundaries);
+
+  /// Marks the exact entry for tokens as recently used without reading it.
+  /// Returns false when no such entry exists.
+  [[nodiscard]] bool Touch(const TextModelRunner& runner,
+                           std::span<const TextRunnerToken> tokens);
+
   [[nodiscard]] std::size_t entry_count() const noexcept;
   [[nodiscard]] std::size_t retained_bytes() const noexcept;
   [[nodiscard]] std::size_t capacity_bytes() const noexcept;

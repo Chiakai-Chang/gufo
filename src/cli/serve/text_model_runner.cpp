@@ -394,12 +394,17 @@ struct TextRunnerPool::Impl {
                   disk_cache_options->staging_capacity_bytes,
           },
           EmitDiskEvent);
+      shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
+      shared_prefix_max_boundaries =
+          disk_cache_options->shared_prefix_max_boundaries;
     }
   }
 
   ValidatedRunner validated;
   ContinuationCache cache;
   std::shared_ptr<ContinuationDiskStore> disk_store;
+  std::size_t shared_prefix_min_tokens{0};
+  std::size_t shared_prefix_max_boundaries{0};
 };
 
 struct TextRunnerPool::Request::Impl {
@@ -407,12 +412,14 @@ struct TextRunnerPool::Request::Impl {
        std::shared_ptr<ContinuationDiskStore> persistent_store,
        ContinuationCache::Lease state_lease,
        std::vector<TextRunnerToken> prompt_tokens,
+       std::vector<std::size_t> shared_prefix_boundaries,
        const sampling::SamplingConfig& sampling_config,
        const CancellationCheck& is_cancelled)
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
         lease(std::move(state_lease)),
         prompt(std::move(prompt_tokens)),
+        boundaries(std::move(shared_prefix_boundaries)),
         prefill_offset(lease.cached_tokens()),
         decode_ready(prefill_offset == prompt.size()),
         sampler(sampling_config, prompt) {
@@ -510,10 +517,64 @@ struct TextRunnerPool::Request::Impl {
     retain_prompt_snapshot = retain_snapshot;
   }
 
+  /// Persists the continuation at a shared-prefix boundary reached by prefill.
+  ///
+  /// The boundary was learned from stored entries that agree with this prompt
+  /// up to `position`, so the next conversation sharing that prefix restores
+  /// it instead of prefilling it again. Written synchronously: it happens once
+  /// per distinct shared prefix, and holding snapshots until commit would keep
+  /// them in memory for the whole generation.
+  void CaptureSharedPrefix(std::size_t position) noexcept {
+    if (disk_store == nullptr || position == 0 || position >= prompt.size()) {
+      return;
+    }
+    const auto start = std::chrono::steady_clock::now();
+    bool failed = false;
+    try {
+      const auto capabilities = runner->Descriptor().capabilities;
+      if (!capabilities.prefix_reuse || !capabilities.snapshot ||
+          !capabilities.fork) {
+        return;
+      }
+      const auto& state = dynamic_cast<const TextRunnerState&>(lease.state());
+      if (runner->CheckpointPosition(state) != position) {
+        return;
+      }
+      const auto prefix =
+          std::span<const TextRunnerToken>(prompt).first(position);
+      // Another request may have stored this prefix meanwhile.
+      if (disk_store->Touch(*runner, prefix)) {
+        return;
+      }
+      (void)runner->SnapshotPayloadBytes(state);
+      const auto snapshot = runner->Snapshot(state);
+      if (snapshot == nullptr) {
+        return;
+      }
+      const auto saved = disk_store->Save(*runner, prefix, *snapshot);
+      if (saved.stored) {
+        ++snapshot_metrics.shared_prefix_snapshots;
+        snapshot_metrics.shared_prefix_bytes += saved.file_bytes;
+      }
+    } catch (...) {
+      // Best effort: the request itself is unaffected.
+      failed = true;
+    }
+    snapshot_metrics.shared_prefix_ms +=
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start)
+            .count();
+    if (failed) {
+      snapshot_metrics.shared_prefix_failures += 1;
+    }
+  }
+
   std::shared_ptr<TextModelRunner> runner;
   std::shared_ptr<ContinuationDiskStore> disk_store;
   ContinuationCache::Lease lease;
   std::vector<TextRunnerToken> prompt;
+  /// Ascending prefill positions to persist, all inside (cached, prompt size).
+  std::vector<std::size_t> boundaries;
   std::vector<TextRunnerToken> generated;
   std::size_t prefill_offset{0};
   bool decode_ready{false};
@@ -604,6 +665,16 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
         "text runner prefill budget must be at least one token");
   }
 
+  // Stop exactly on the next shared-prefix boundary so it can be persisted.
+  while (!impl_->boundaries.empty() &&
+         impl_->boundaries.front() <= impl_->prefill_offset) {
+    impl_->boundaries.erase(impl_->boundaries.begin());
+  }
+  if (!impl_->boundaries.empty()) {
+    max_input_tokens = std::min(
+        max_input_tokens, impl_->boundaries.front() - impl_->prefill_offset);
+  }
+
   const std::size_t remaining = impl_->prompt.size() - impl_->prefill_offset;
   auto step = impl_->runner->Prefill(
       dynamic_cast<TextRunnerState&>(impl_->lease.state()), impl_->prompt,
@@ -621,6 +692,11 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
         "text runner returned an inconsistent prefill boundary");
   }
   impl_->decode_ready = reached_frontier;
+  if (!impl_->boundaries.empty() &&
+      impl_->boundaries.front() == impl_->prefill_offset) {
+    impl_->boundaries.erase(impl_->boundaries.begin());
+    impl_->CaptureSharedPrefix(impl_->prefill_offset);
+  }
   if (reached_frontier) {
     impl_->CapturePromptSnapshot();
   }
@@ -983,9 +1059,22 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       lease.state().Invalidate();
     }
   }
+  std::vector<std::size_t> boundaries;
+  if (impl_->disk_store != nullptr && !(is_cancelled && is_cancelled())) {
+    try {
+      boundaries = impl_->disk_store->SharedPrefixBoundaries(
+          *impl_->validated.runner, prompt, impl_->shared_prefix_min_tokens,
+          impl_->shared_prefix_max_boundaries);
+    } catch (...) {
+      boundaries.clear();
+    }
+    std::erase_if(boundaries, [&lease](std::size_t boundary) {
+      return boundary <= lease.cached_tokens();
+    });
+  }
   return Request(std::make_unique<Request::Impl>(
       impl_->validated.runner, impl_->disk_store, std::move(lease),
-      std::move(prompt), sampling_config, is_cancelled));
+      std::move(prompt), std::move(boundaries), sampling_config, is_cancelled));
 }
 
 TextRunnerPool::Request TextRunnerPool::Acquire(

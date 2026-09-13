@@ -214,6 +214,7 @@ add_library(gufo_core STATIC
   src/core/crypto/sha256.cpp
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
+  src/core/gguf_identity.cpp
   src/core/sampling.cpp
   src/models/minimax_h3/audio_vae.cpp
   src/models/minimax_h3/denoiser.cpp
@@ -642,6 +643,12 @@ if (BUILD_TESTING)
 
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
   set_tests_properties(gguf_reader_test PROPERTIES LABELS "cpu;core;gguf;model_config")
+
+  add_executable(gguf_identity_test tests/core/gguf_identity_test.cpp)
+  target_link_libraries(gguf_identity_test PRIVATE gufo_core)
+
+  add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
+  set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
 
   add_executable(model_registry_test tests/core/model_registry_test.cpp)
   target_link_libraries(model_registry_test PRIVATE gufo_core)

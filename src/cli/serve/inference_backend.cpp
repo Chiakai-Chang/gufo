@@ -16,9 +16,10 @@
 #include <type_traits>
 #include <utility>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
-#include "src/core/crypto/sha256.hpp"
+#include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
@@ -87,12 +88,13 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
     std::uint32_t max_context, std::uint32_t max_draft_tokens) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
-        "DeepSeek disk cache requires a SHA-256 artifact fingerprint");
+        "DeepSeek disk cache requires an artifact fingerprint");
   }
   std::ostringstream identity;
-  identity << "schema=gufo-text-continuation-v1\n"
+  identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=deepseek4\n"
-           << "artifact_sha256=" << artifact_fingerprint << '\n'
+           << "artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
            << "tokenizer=joyai-byte-bpe-v1\n"
            << "chat_template=" << models::deepseek_v4_flash::ChatTemplateId()
            << '\n'
@@ -106,7 +108,8 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
            << "position_policy=absolute-v1\n"
            << "rope_window_policy=deepseek4-compiled-v1\n"
            << "adapters=none\n";
-  identity << "support_sha256=" << support_fingerprint << '\n'
+  identity << "support_id=" << core::kGgufSampledIdentityScheme << ':'
+           << support_fingerprint << '\n'
            << "max_draft_tokens=" << max_draft_tokens << '\n'
            << "draft_policy=dspark-cost-v5-window128\n";
   const std::string canonical = identity.str();
@@ -120,21 +123,21 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
     const speculative::SpeculativeOptions& speculative_options) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
-        "Qwen disk cache requires a SHA-256 artifact fingerprint");
+        "Qwen disk cache requires an artifact fingerprint");
   }
   if (speculative && !IsSha256Hex(draft_artifact_fingerprint)) {
     throw std::invalid_argument(
-        "Qwen DFlash disk cache requires a SHA-256 draft artifact "
-        "fingerprint");
+        "Qwen DFlash disk cache requires a draft artifact fingerprint");
   }
   const std::string_view state_abi =
       QwenStateAbi(speculative, execution_policy.UsesFp16AttentionKv(),
                    execution_policy.UsesBf16RecurrentState());
   std::ostringstream identity;
-  identity << "schema=gufo-text-continuation-v1\n"
+  identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=qwen3.8\n"
-           << "artifact_sha256=" << artifact_fingerprint << '\n'
-           << "tokenizer=embedded-in-artifact-sha256\n"
+           << "artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact\n"
            << "chat_template=qwen38-reasoning-compiled-v2\n"
            << "chat_template_reference_sha256="
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
@@ -152,7 +155,8 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
   if (speculative) {
     identity
         << "draft_backend=dflash2-gfx1151-v1\n"
-        << "draft_artifact_sha256=" << draft_artifact_fingerprint << '\n'
+        << "draft_artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+        << draft_artifact_fingerprint << '\n'
         << "draft_state_layout=dflash-live-kv-and-frontier-v1\n"
         << "draft_max_tokens=" << speculative_options.max_draft_tokens << '\n'
         << "draft_min_tokens=" << speculative_options.min_draft_tokens << '\n'
@@ -254,6 +258,10 @@ void EmitRequestMetrics(const InferenceBackend::Result& result,
        << ",\"cache_restore_ms\":" << result.cache_restore_ms
        << ",\"cache_snapshot_ms\":" << result.cache_snapshot_ms
        << ",\"cache_disk_write_ms\":" << result.cache_disk_write_ms
+       << ",\"cache_shared_prefix_snapshots\":"
+       << result.cache_shared_prefix_snapshots
+       << ",\"cache_shared_prefix_bytes\":" << result.cache_shared_prefix_bytes
+       << ",\"cache_shared_prefix_ms\":" << result.cache_shared_prefix_ms
        << ",\"cache_disk_hit\":" << (result.cache_disk_hit ? "true" : "false")
        << ",\"prefill_tokens\":" << result.prefill_tokens
        << ",\"prefill_chunks\":" << result.prefill_chunks
@@ -1820,6 +1828,44 @@ private:
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
+/// Derives the content identity that keys persistent continuations for one
+/// GGUF artifact. Sampled rather than hashed in full so an 80 GiB model costs
+/// about the same as a small one at every start.
+bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
+                         std::string* fingerprint, std::string* error) {
+  const auto start = std::chrono::steady_clock::now();
+  try {
+    *fingerprint = core::GgufSampledIdentityHex(reader);
+  } catch (const std::exception& exception) {
+    SetError(error, std::string("Failed to fingerprint ") + std::string(label) +
+                        " GGUF: " + exception.what());
+    return false;
+  }
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+  std::ostringstream message;
+  message << "Fingerprinted " << label << " artifact ("
+          << core::kGgufSampledIdentityScheme << ", " << reader.GetTensorCount()
+          << " tensors) in " << std::fixed << std::setprecision(0) << elapsed_ms
+          << " ms";
+  Logger::Info("engine", message.str());
+  return true;
+}
+
+bool FingerprintArtifactFile(std::string_view label,
+                             const std::filesystem::path& path,
+                             std::string* fingerprint, std::string* error) {
+  std::string open_error;
+  const auto reader = core::GgufReader::OpenFile(path, &open_error);
+  if (reader == nullptr) {
+    SetError(error, std::string("Failed to open ") + std::string(label) +
+                        " GGUF for fingerprinting: " + open_error);
+    return false;
+  }
+  return FingerprintArtifact(label, *reader, fingerprint, error);
+}
+
 #endif
 
 }  // namespace
@@ -1965,26 +2011,19 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
       return false;
     }
     if (DiskCacheEnabled(resolved_disk_cache_config) &&
-        resolved_disk_cache_config.model_artifact_fingerprint.empty()) {
-      try {
-        resolved_disk_cache_config.model_artifact_fingerprint =
-            crypto::Sha256FileHex(model_path);
-      } catch (const std::exception& exception) {
-        SetError(error, std::string("Failed to fingerprint DeepSeek GGUF: ") +
-                            exception.what());
-        return false;
-      }
+        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+        !FingerprintArtifact(
+            "DeepSeek", *reader,
+            &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+      return false;
     }
     if (DiskCacheEnabled(resolved_disk_cache_config) && model->HasDspark() &&
-        resolved_disk_cache_config.draft_model_artifact_fingerprint.empty()) {
-      try {
-        resolved_disk_cache_config.draft_model_artifact_fingerprint =
-            crypto::Sha256FileHex(speculative_config.draft_model_path);
-      } catch (const std::exception& exception) {
-        SetError(error, std::string("Failed to fingerprint DSpark GGUF: ") +
-                            exception.what());
-        return false;
-      }
+        resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
+        !FingerprintArtifactFile(
+            "DSpark", speculative_config.draft_model_path,
+            &resolved_disk_cache_config.draft_model_artifact_fingerprint,
+            error)) {
+      return false;
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
@@ -1996,15 +2035,11 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   if (DiskCacheEnabled(resolved_disk_cache_config) &&
-      resolved_disk_cache_config.model_artifact_fingerprint.empty()) {
-    try {
-      resolved_disk_cache_config.model_artifact_fingerprint =
-          crypto::Sha256FileHex(model_path);
-    } catch (const std::exception& exception) {
-      SetError(error, std::string("Failed to fingerprint Qwen GGUF: ") +
-                          exception.what());
-      return false;
-    }
+      resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+      !FingerprintArtifact(
+          "Qwen", *reader,
+          &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+    return false;
   }
   return load(std::move(model), error, max_context, session_count,
               prefill_policy, scheduler_policy, speculative_config,
@@ -2076,24 +2111,6 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
         SetError(error, "DFlash HTTP decoding requires --dflash-model");
         return false;
       }
-      if (DiskCacheEnabled(disk_cache_config) &&
-          disk_cache_config.draft_model_artifact_fingerprint.empty()) {
-        try {
-          disk_cache_config.draft_model_artifact_fingerprint =
-              crypto::Sha256FileHex(speculative_config.draft_model_path);
-        } catch (const std::exception& exception) {
-          SetError(error, std::string("Failed to fingerprint DFlash GGUF: ") +
-                              exception.what());
-          return false;
-        }
-      }
-      if (DiskCacheEnabled(disk_cache_config) &&
-          !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) {
-        SetError(error,
-                 "Qwen DFlash persistent disk cache configuration is "
-                 "invalid");
-        return false;
-      }
       std::string dflash_error;
       auto dflash_reader_owner = core::GgufReader::OpenFile(
           speculative_config.draft_model_path, &dflash_error);
@@ -2103,6 +2120,20 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
       }
       std::shared_ptr<const core::GgufReader> dflash_reader(
           std::move(dflash_reader_owner));
+      if (DiskCacheEnabled(disk_cache_config) &&
+          disk_cache_config.draft_model_artifact_fingerprint.empty() &&
+          !FingerprintArtifact(
+              "DFlash", *dflash_reader,
+              &disk_cache_config.draft_model_artifact_fingerprint, error)) {
+        return false;
+      }
+      if (DiskCacheEnabled(disk_cache_config) &&
+          !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) {
+        SetError(error,
+                 "Qwen DFlash persistent disk cache configuration is "
+                 "invalid");
+        return false;
+      }
       dflash_model = hip::QwenDFlashGpuModel::Create(std::move(dflash_reader),
                                                      model, &dflash_error);
       if (dflash_model == nullptr) {

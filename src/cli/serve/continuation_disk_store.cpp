@@ -677,12 +677,9 @@ struct ContinuationDiskStore::Impl {
     return true;
   }
 
-  [[nodiscard]] EntryIterator LeastRecentlyUsed(EntryIterator excluded) {
+  [[nodiscard]] EntryIterator LeastRecentlyUsed() {
     EntryIterator selected = entries.end();
     for (auto current = entries.begin(); current != entries.end(); ++current) {
-      if (excluded != entries.end() && current == excluded) {
-        continue;
-      }
       if (selected == entries.end() ||
           current->last_access < selected->last_access ||
           (current->last_access == selected->last_access &&
@@ -695,7 +692,7 @@ struct ContinuationDiskStore::Impl {
 
   void EvictToCapacity() {
     while (retained > options.capacity_bytes) {
-      const EntryIterator victim = LeastRecentlyUsed(entries.end());
+      const EntryIterator victim = LeastRecentlyUsed();
       if (victim == entries.end() ||
           !RemoveEntry(victim, ContinuationDiskEventReason::kLru)) {
         break;
@@ -703,14 +700,12 @@ struct ContinuationDiskStore::Impl {
     }
   }
 
-  bool MakeCapacity(std::size_t file_bytes, EntryIterator replacement) {
-    const std::size_t replacement_bytes =
-        replacement != entries.end() ? replacement->file_bytes : 0;
+  bool MakeCapacity(std::size_t file_bytes) {
     if (file_bytes > options.capacity_bytes) {
       return false;
     }
-    while (retained - replacement_bytes > options.capacity_bytes - file_bytes) {
-      const EntryIterator victim = LeastRecentlyUsed(replacement);
+    while (retained > options.capacity_bytes - file_bytes) {
+      const EntryIterator victim = LeastRecentlyUsed();
       if (victim == entries.end() ||
           !RemoveEntry(victim, ContinuationDiskEventReason::kLru)) {
         return false;
@@ -794,6 +789,21 @@ struct ContinuationDiskStore::Impl {
            ContinuationDiskEventReason::kSerializationFailure, 0, 0, 0);
       return {};
     }
+    // The same prefix is offered again whenever a restored continuation is
+    // committed or several conversations share one system prompt. The stored
+    // file already represents these tokens; refresh its recency and skip the
+    // serialization and write.
+    const std::string digest =
+        HashKey(*descriptor.persistence, checkpoint_tokens);
+    const EntryIterator existing =
+        FindExact(digest, *descriptor.persistence, checkpoint_tokens);
+    if (existing != entries.end()) {
+      TouchEntry(existing);
+      Emit(ContinuationDiskEventAction::kSkipped,
+           ContinuationDiskEventReason::kExactReplacement, existing->file_bytes,
+           existing->payload_bytes, checkpoint_tokens.size());
+      return {};
+    }
 
     std::size_t payload_bytes = 0;
     std::vector<std::uint8_t> image;
@@ -839,11 +849,7 @@ struct ContinuationDiskStore::Impl {
     std::copy(checksum.begin(), checksum.end(),
               image.begin() + kChecksumOffset);
 
-    const std::string digest =
-        HashKey(*descriptor.persistence, checkpoint_tokens);
-    const EntryIterator replacement =
-        FindExact(digest, *descriptor.persistence, checkpoint_tokens);
-    if (!MakeCapacity(image.size(), replacement)) {
+    if (!MakeCapacity(image.size())) {
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kByteCapacity, image.size(),
            payload_bytes, checkpoint_tokens.size());
@@ -858,46 +864,19 @@ struct ContinuationDiskStore::Impl {
       return {};
     }
 
-    if (replacement != entries.end()) {
-      if (::unlinkat(directory_fd, replacement->filename.c_str(), 0) != 0 &&
-          errno != ENOENT) {
-        RemoveFileOnly(filename);
-        (void)::fsync(directory_fd);
-        Emit(ContinuationDiskEventAction::kSkipped,
-             ContinuationDiskEventReason::kIoFailure, image.size(),
-             payload_bytes, checkpoint_tokens.size());
-        return {};
-      }
-      const std::size_t old_file_bytes = replacement->file_bytes;
-      const std::size_t old_payload_bytes = replacement->payload_bytes;
-      retained -= old_file_bytes;
-      replacement->filename = filename;
-      replacement->persistence = *descriptor.persistence;
-      replacement->tokens.assign(checkpoint_tokens.begin(),
-                                 checkpoint_tokens.end());
-      replacement->file_bytes = image.size();
-      replacement->payload_bytes = payload_bytes;
-      replacement->last_access = std::filesystem::file_time_type::clock::now();
-      retained += image.size();
-      (void)::fsync(directory_fd);
-      Emit(ContinuationDiskEventAction::kRemoved,
-           ContinuationDiskEventReason::kExactReplacement, old_file_bytes,
-           old_payload_bytes, checkpoint_tokens.size());
-    } else {
-      entries.push_back({
-          .filename = filename,
-          .key_hash = digest,
-          .persistence = *descriptor.persistence,
-          .tokens = std::vector<TextRunnerToken>(checkpoint_tokens.begin(),
-                                                 checkpoint_tokens.end()),
-          .file_bytes = image.size(),
-          .payload_bytes = payload_bytes,
-          .last_access = std::filesystem::file_time_type::clock::now(),
-      });
-      const EntryIterator added = std::prev(entries.end());
-      index.emplace(digest, added);
-      retained += image.size();
-    }
+    entries.push_back({
+        .filename = filename,
+        .key_hash = digest,
+        .persistence = *descriptor.persistence,
+        .tokens = std::vector<TextRunnerToken>(checkpoint_tokens.begin(),
+                                               checkpoint_tokens.end()),
+        .file_bytes = image.size(),
+        .payload_bytes = payload_bytes,
+        .last_access = std::filesystem::file_time_type::clock::now(),
+    });
+    const EntryIterator added = std::prev(entries.end());
+    index.emplace(digest, added);
+    retained += image.size();
     Emit(ContinuationDiskEventAction::kStored,
          ContinuationDiskEventReason::kSaved, image.size(), payload_bytes,
          checkpoint_tokens.size());
@@ -1006,9 +985,7 @@ struct ContinuationDiskStore::Impl {
         return {};
       }
 
-      candidate->last_access = std::filesystem::file_time_type::clock::now();
-      (void)::utimensat(directory_fd, candidate->filename.c_str(), nullptr,
-                        AT_SYMLINK_NOFOLLOW);
+      TouchEntry(candidate);
       Emit(ContinuationDiskEventAction::kRestored,
            ContinuationDiskEventReason::kHit, candidate->file_bytes,
            candidate->payload_bytes, candidate->tokens.size());
@@ -1019,6 +996,69 @@ struct ContinuationDiskStore::Impl {
           .payload_bytes = candidate->payload_bytes,
       };
     }
+  }
+
+  void TouchEntry(EntryIterator entry) {
+    entry->last_access = std::filesystem::file_time_type::clock::now();
+    (void)::utimensat(directory_fd, entry->filename.c_str(), nullptr,
+                      AT_SYMLINK_NOFOLLOW);
+  }
+
+  [[nodiscard]] std::vector<std::size_t> SharedPrefixBoundaries(
+      const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+      std::size_t min_tokens, std::size_t max_boundaries) {
+    const auto descriptor = runner.Descriptor();
+    if (!descriptor.persistence.has_value() || max_boundaries == 0) {
+      return {};
+    }
+    std::set<std::size_t> lengths;
+    for (const Entry& entry : entries) {
+      if (entry.persistence != *descriptor.persistence) {
+        continue;
+      }
+      const auto [entry_mismatch, prompt_mismatch] =
+          std::ranges::mismatch(entry.tokens, prompt);
+      const auto shared =
+          static_cast<std::size_t>(entry_mismatch - entry.tokens.begin());
+      // A full match is a restorable prefix, not a new boundary.
+      if (shared < min_tokens || shared >= prompt.size() ||
+          shared == entry.tokens.size()) {
+        continue;
+      }
+      lengths.insert(shared);
+    }
+    std::vector<std::size_t> boundaries;
+    for (const std::size_t length : lengths) {
+      const auto prefix = prompt.first(length);
+      const std::string digest = HashKey(*descriptor.persistence, prefix);
+      if (FindExact(digest, *descriptor.persistence, prefix) != entries.end()) {
+        continue;
+      }
+      boundaries.push_back(length);
+    }
+    // Keep the longest ones: they save the most prefill when they hit.
+    if (boundaries.size() > max_boundaries) {
+      boundaries.erase(
+          boundaries.begin(),
+          boundaries.end() - static_cast<std::ptrdiff_t>(max_boundaries));
+    }
+    return boundaries;
+  }
+
+  [[nodiscard]] bool Touch(const TextModelRunner& runner,
+                           std::span<const TextRunnerToken> tokens) {
+    const auto descriptor = runner.Descriptor();
+    if (!descriptor.persistence.has_value()) {
+      return false;
+    }
+    const std::string digest = HashKey(*descriptor.persistence, tokens);
+    const EntryIterator entry =
+        FindExact(digest, *descriptor.persistence, tokens);
+    if (entry == entries.end()) {
+      return false;
+    }
+    TouchEntry(entry);
+    return true;
   }
 
   ContinuationDiskStoreOptions options;
@@ -1055,6 +1095,20 @@ ContinuationDiskStore::RestoreLongestPrefix(
     std::span<const TextRunnerToken> prompt) {
   const ScopedOperationPermit permit(impl_->operation_gate);
   return impl_->RestoreLongestPrefix(runner, state, prompt);
+}
+
+std::vector<std::size_t> ContinuationDiskStore::SharedPrefixBoundaries(
+    const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
+    std::size_t min_tokens, std::size_t max_boundaries) {
+  const ScopedOperationPermit permit(impl_->operation_gate);
+  return impl_->SharedPrefixBoundaries(runner, prompt, min_tokens,
+                                       max_boundaries);
+}
+
+bool ContinuationDiskStore::Touch(const TextModelRunner& runner,
+                                  std::span<const TextRunnerToken> tokens) {
+  const ScopedOperationPermit permit(impl_->operation_gate);
+  return impl_->Touch(runner, tokens);
 }
 
 std::size_t ContinuationDiskStore::entry_count() const noexcept {

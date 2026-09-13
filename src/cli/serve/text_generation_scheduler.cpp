@@ -356,6 +356,11 @@ struct TextGenerationScheduler::Impl {
     request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
     request->result.cache_disk_write_bytes = cache_commit.disk_write_bytes;
     request->result.cache_disk_write_ms = cache_commit.disk_write_ms;
+    request->result.cache_shared_prefix_snapshots =
+        cache_commit.shared_prefix_snapshots;
+    request->result.cache_shared_prefix_bytes =
+        cache_commit.shared_prefix_bytes;
+    request->result.cache_shared_prefix_ms = cache_commit.shared_prefix_ms;
     PublishTerminal(request);
   }
 

@@ -743,6 +743,63 @@ void TestPersistentSnapshotRestoresAcrossPools() {
   miss.Invalidate();
 }
 
+void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
+  TemporaryDirectory directory;
+  const TextRunnerDiskCacheOptions disk_cache{
+      .directory = directory.path(),
+      .capacity_bytes = 8192,
+      .staging_capacity_bytes = 4096,
+      .shared_prefix_min_tokens = 2,
+      .shared_prefix_max_boundaries = 4,
+  };
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(
+      stats, "artifact-A", sizeof(FakeSnapshot) - 1);
+  TextRunnerPool pool(runner, 1, disk_cache);
+
+  // Conversation A: system prefix {7, 7, 7} plus its own turn.
+  {
+    auto request = pool.Acquire({7, 7, 7, 1, 2});
+    Expect(!request.cache_hit(), "first conversation is cold");
+    Expect(request.Prefill(8).consumed_tokens == 5,
+           "nothing is shared yet, so prefill runs uninterrupted");
+    const auto commit = request.Commit();
+    Expect(commit.shared_prefix_snapshots == 0,
+           "no shared prefix exists after one conversation");
+  }
+
+  // Conversation B shares only the system prefix. Prefill stops there so the
+  // prefix is persisted for the next conversation.
+  {
+    auto request = pool.Acquire({7, 7, 7, 3, 4, 5});
+    Expect(!request.cache_hit(), "second conversation still has no prefix");
+    const auto first = request.Prefill(8);
+    Expect(first.consumed_tokens == 3 && !first.decode_ready,
+           "prefill stops at the learned shared prefix");
+    const auto second = request.Prefill(8);
+    Expect(second.consumed_tokens == 3 && second.decode_ready,
+           "prefill resumes after the boundary");
+    const auto commit = request.Commit();
+    Expect(commit.shared_prefix_snapshots == 1 &&
+               commit.shared_prefix_bytes > 0 && commit.shared_prefix_ms >= 0.0,
+           "the shared prefix was written once during prefill");
+  }
+
+  // Conversation C restores the shared prefix and prefills only its turn.
+  {
+    auto request = pool.Acquire({7, 7, 7, 9});
+    Expect(request.cache_hit() && request.cache_disk_hit() &&
+               request.cached_prompt_tokens() == 3,
+           "third conversation restores the shared prefix from disk");
+    const auto step = request.Prefill(8);
+    Expect(step.consumed_tokens == 1 && step.decode_ready,
+           "only the conversation's own turn is prefilled");
+    const auto commit = request.Commit();
+    Expect(commit.shared_prefix_snapshots == 0,
+           "a restored prefix is not written again");
+  }
+}
+
 void TestMeasuredStateIsReconciledWithClaim() {
   auto stats = std::make_shared<FakeStats>();
   bool rejected = false;
@@ -835,6 +892,7 @@ int main() {
   TestSnapshotCacheBranchesOnePrefixIntoIndependentStates();
   TestSnapshotRetentionUsesPromptBoundary();
   TestPersistentSnapshotRestoresAcrossPools();
+  TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
   TestMeasuredStateIsReconciledWithClaim();
   TestSnapshotBudgetRefusalDoesNotFailCompletedRequest();
   TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful();

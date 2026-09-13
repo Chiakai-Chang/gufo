@@ -734,9 +734,70 @@ void TestConcurrentStoreInstancesPublishSafely() {
       "concurrent publishers expose no partial or confused entry");
 }
 
+void TestSharedPrefixBoundariesAndExactDedup() {
+  TemporaryDirectory directory;
+  const FakeRunner runner("shared-prefix-model");
+  ContinuationDiskStore store(StoreOptions(directory.path()), {});
+
+  // Conversation A: shared system prefix {7, 7, 7} plus its own turn.
+  auto first = MakeSnapshot(runner, 11, 5);
+  Expect(SaveTokens(store, runner, {7, 7, 7, 1, 2}, *first).stored,
+         "first conversation frontier is stored");
+
+  // Conversation B shares the first three tokens only.
+  const std::vector<TextRunnerToken> second_prompt = {7, 7, 7, 3, 4, 5};
+  Expect(store.SharedPrefixBoundaries(runner, second_prompt, 1, 4) ==
+             std::vector<std::size_t>{3},
+         "common prefix with a stored entry becomes a boundary");
+  Expect(store.SharedPrefixBoundaries(runner, second_prompt, 4, 4).empty(),
+         "boundaries below the minimum length are dropped");
+  const std::vector<TextRunnerToken> first_prompt = {7, 7, 7, 1, 2};
+  Expect(store.SharedPrefixBoundaries(runner, first_prompt, 1, 4).empty(),
+         "an exact stored prompt yields no boundary");
+
+  // Persist the shared prefix; a third conversation restores it.
+  auto shared = MakeSnapshot(runner, 77, 3);
+  Expect(SaveTokens(store, runner, {7, 7, 7}, *shared).stored,
+         "shared prefix snapshot is stored");
+  Expect(store.SharedPrefixBoundaries(runner, second_prompt, 1, 4).empty(),
+         "a stored shared prefix is no longer a boundary");
+  auto state = runner.CreateState();
+  const auto restored = RestoreTokens(store, runner, *state, {7, 7, 7, 9});
+  Expect(restored.restored && restored.token_count == 3 &&
+             RequireFakeState(*state).value == 77,
+         "new conversation restores the shared prefix");
+
+  // Saving the same tokens again touches instead of rewriting.
+  const std::size_t retained_before = store.retained_bytes();
+  const std::size_t entries_before = store.entry_count();
+  auto duplicate = MakeSnapshot(runner, 78, 3);
+  Expect(!SaveTokens(store, runner, {7, 7, 7}, *duplicate).stored,
+         "exact duplicate save is skipped");
+  Expect(store.retained_bytes() == retained_before &&
+             store.entry_count() == entries_before,
+         "exact duplicate save leaves the store unchanged");
+  Expect(store.Touch(runner, std::vector<TextRunnerToken>{7, 7, 7}),
+         "touch finds the exact entry");
+  Expect(!store.Touch(runner, std::vector<TextRunnerToken>{7, 7}),
+         "touch misses a non-stored prefix");
+
+  // Longest boundaries win when more than max_boundaries are shared.
+  auto deeper = MakeSnapshot(runner, 12, 5);
+  Expect(SaveTokens(store, runner, {7, 7, 7, 3, 8}, *deeper).stored,
+         "deeper entry is stored");
+  const std::vector<TextRunnerToken> third_prompt = {7, 7, 7, 3, 4, 6};
+  Expect(store.SharedPrefixBoundaries(runner, third_prompt, 1, 4) ==
+             std::vector<std::size_t>{4},
+         "only the unstored shared length is reported");
+  Expect(store.SharedPrefixBoundaries(runner, third_prompt, 1, 1) ==
+             std::vector<std::size_t>{4},
+         "capping keeps the longest boundary");
+}
+
 }  // namespace
 
 int main() {
+  TestSharedPrefixBoundariesAndExactDedup();
   TestSha256KnownVector();
   TestRestartRestoreAndCompatibilityIdentity();
   TestLongestPrefixAndForcedHashCollision();

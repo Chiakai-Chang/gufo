@@ -128,6 +128,9 @@ public:
     std::size_t cache_snapshot_bytes{0};
     std::size_t cache_disk_write_bytes{0};
     std::size_t cache_shared_bytes{0};
+    /// Shared-prefix snapshots persisted while prefilling this request.
+    std::size_t cache_shared_prefix_snapshots{0};
+    std::size_t cache_shared_prefix_bytes{0};
     std::size_t completion_tokens{0};
     std::size_t draft_tokens{0};
     std::size_t draft_accepted_tokens{0};
@@ -147,6 +150,7 @@ public:
     double cache_restore_ms{0.0};
     double cache_snapshot_ms{0.0};
     double cache_disk_write_ms{0.0};
+    double cache_shared_prefix_ms{0.0};
     double ttft_ms{0.0};
     double mean_inter_token_ms{0.0};
     double max_inter_token_ms{0.0};

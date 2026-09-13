@@ -24,6 +24,10 @@ struct TextRunnerDiskCacheOptions {
   std::filesystem::path directory;
   std::size_t capacity_bytes{0};
   std::size_t staging_capacity_bytes{0};
+  /// Shared prefixes shorter than this are cheaper to prefill than to restore.
+  std::size_t shared_prefix_min_tokens{128};
+  /// Bound on shared-prefix snapshots written while prefilling one request.
+  std::size_t shared_prefix_max_boundaries{4};
 };
 
 enum class TextExecutionPlanKind : std::uint8_t {
@@ -263,6 +267,11 @@ public:
       double snapshot_ms{0.0};
       std::size_t disk_write_bytes{0};
       double disk_write_ms{0.0};
+      /// Shared-prefix snapshots written to disk during prefill.
+      std::size_t shared_prefix_snapshots{0};
+      std::size_t shared_prefix_bytes{0};
+      std::size_t shared_prefix_failures{0};
+      double shared_prefix_ms{0.0};
     };
 
     Request();
