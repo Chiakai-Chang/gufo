@@ -23,6 +23,7 @@
 #include "src/core/sampling.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/qwen38_flash_next/engine.hpp"
 #include "src/testing/compare/logit_comparator.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -749,6 +750,242 @@ int RunDeepSeekBenchmark(
   std::cout << '\n';
   return 0;
 }
+
+bool IsQwen38FlashNext(const core::GgufReader& reader) {
+  return reader.GetMetadataString("general.architecture") == "qwen4exp";
+}
+
+int RunQwen38FlashNextBenchmark(
+    const BenchOptions& options,
+    const std::shared_ptr<const core::GgufReader>& reader,
+    std::chrono::steady_clock::time_point model_load_start) {
+  namespace qfn = models::qwen38_flash_next;
+  int device_count = 0;
+  if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
+    std::cerr << "Error: no HIP GPU is available for Qwen3.8-Flash-Next\n";
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  const auto max_or_zero = [](const std::vector<std::size_t>& values) {
+    return values.empty() ? std::size_t{0}
+                          : *std::max_element(values.begin(), values.end());
+  };
+  const std::size_t max_depth = max_or_zero(options.n_depths);
+  const std::size_t max_prompt = max_or_zero(options.n_prompts);
+  const std::size_t max_generation = max_or_zero(options.n_gens);
+  const std::size_t required_context =
+      std::max({std::size_t{4096}, max_depth + max_prompt + 1,
+                std::max<std::size_t>(max_depth, 16) + max_generation + 1,
+                options.validate_prefill_tokens + 1});
+  const bool mtp = options.speculative_backend == "mtp";
+  if (!options.speculative_backend.empty() && !mtp) {
+    std::cerr << "Error: Qwen3.8-Flash-Next supports only --speculative mtp "
+                 "or off\n";
+    return 1;
+  }
+  if (mtp && options.mtp_model_path.empty()) {
+    std::cerr << "Error: --speculative mtp requires --mtp-model\n";
+    return 1;
+  }
+  if (options.temperature > 0.0F) {
+    std::cerr << "Error: Qwen3.8-Flash-Next benchmark decodes greedily\n";
+    return 1;
+  }
+
+  std::string error;
+  auto model = qfn::Model::Load(
+      options.model_path,
+      qfn::ModelOptions{
+          .max_context = static_cast<std::uint32_t>(required_context),
+          .mtp_model_path = mtp ? options.mtp_model_path : "",
+          .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
+      },
+      &error);
+  if (model == nullptr) {
+    std::cerr << "Error creating Qwen3.8-Flash-Next model: " << error << '\n';
+    PrintModelLoadTime(model_load_start, false);
+    return 1;
+  }
+  PrintModelLoadTime(model_load_start);
+
+  // A natural-language pattern keeps the router and the n-gram hashes on
+  // realistic paths.
+  std::vector<std::int32_t> tokens;
+  {
+    const auto pattern = model->Tokenize(
+        "The quick brown fox jumps over the lazy dog. "
+        "Strix Halo executes this deterministic benchmark sequence. ");
+    if (pattern.empty()) {
+      std::cerr << "Error: benchmark token pattern is empty\n";
+      return 1;
+    }
+    tokens.resize(required_context);
+    for (std::size_t i = 0; i < tokens.size(); ++i) {
+      tokens[i] = pattern[i % pattern.size()];
+    }
+  }
+
+  if (options.validate_prefill_tokens != 0) {
+    // Batched prefill against one-token-at-a-time evaluation of the same
+    // prefix; both run on the GPU, so this checks the batched kernels.
+    auto sequential = model->CreateSession(
+        static_cast<std::uint32_t>(required_context), &error);
+    auto batched = model->CreateSession(
+        static_cast<std::uint32_t>(required_context), &error);
+    const auto prefix = std::span(tokens).first(options.validate_prefill_tokens);
+    if (!sequential || !batched || !sequential->Sync(prefix.first(1), &error) ||
+        !batched->Sync(prefix, &error)) {
+      std::cerr << "Qwen3.8-Flash-Next prefill validation failed: " << error
+                << '\n';
+      return 1;
+    }
+    for (const std::int32_t token : prefix.subspan(1)) {
+      if (!sequential->Evaluate(token, &error)) {
+        std::cerr << "Qwen3.8-Flash-Next sequential reference failed: " << error
+                  << '\n';
+        return 1;
+      }
+    }
+    const auto reference = sequential->Logits();
+    const auto candidate = batched->Logits();
+    const auto comparison = testing::CompareLogits(reference, candidate);
+    const std::size_t rank =
+        1 + std::count_if(candidate.begin(), candidate.end(), [&](float value) {
+          return value > candidate[comparison.reference_argmax];
+        });
+    std::cout << "[Prefill Validation] tokens=" << prefix.size()
+              << " finite=" << comparison.finite
+              << " scalar_winner_rank=" << rank
+              << " rmse=" << comparison.root_mean_square_error
+              << " cosine=" << comparison.cosine_similarity
+              << " max_error=" << comparison.max_abs_diff << '\n';
+    if (!comparison.finite || rank > 3 ||
+        comparison.root_mean_square_error > 1.12F ||
+        comparison.cosine_similarity < 0.979F ||
+        comparison.max_abs_diff > 5.0F) {
+      return 1;
+    }
+  }
+
+  const double size_gib =
+      static_cast<double>(reader->GetSize()) / (1024.0 * 1024.0 * 1024.0);
+  const auto model_name = model->ModelName();
+  std::cout << "| " << std::left << std::setw(32) << "model"
+            << " | " << std::right << std::setw(10) << "size"
+            << " | " << std::left << std::setw(10) << "backend"
+            << " | " << std::right << std::setw(18) << "test"
+            << " | " << std::right << std::setw(21) << "t/s"
+            << " |\n"
+            << "| " << std::string(32, '-') << " | " << std::string(10, '-')
+            << " | " << std::string(10, '-') << " | " << std::string(18, '-')
+            << " | " << std::string(21, '-') << " |\n";
+  std::ostringstream size_text;
+  size_text << std::fixed << std::setprecision(2) << size_gib << " GiB";
+  const auto print_result = [&](std::string_view test_name,
+                                const BenchStats& stats) {
+    std::ostringstream throughput;
+    throughput << std::fixed << std::setprecision(2) << stats.mean << " ± "
+               << stats.stddev;
+    std::cout << "| " << std::left << std::setw(32) << model_name << " | "
+              << std::right << std::setw(10) << size_text.str() << " | "
+              << std::left << std::setw(10) << "ROCm (HIP)"
+              << " | " << std::right << std::setw(18) << test_name << " | "
+              << std::right << std::setw(21) << throughput.str() << " |\n"
+              << std::flush;
+  };
+
+  for (const std::size_t depth : options.n_depths) {
+    for (const std::size_t prompt_length : options.n_prompts) {
+      if (depth + prompt_length >= required_context) {
+        std::cerr << "Error: prompt benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            (depth > 0 && !session->Sync(std::span(tokens).first(depth), &error))) {
+          std::cerr << "Error preparing depth: " << error << '\n';
+          return 1;
+        }
+        const auto start = std::chrono::steady_clock::now();
+        if (!session->Sync(std::span(tokens).first(depth + prompt_length),
+                           &error)) {
+          std::cerr << "Error running prefill: " << error << '\n';
+          return 1;
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        runs.push_back(static_cast<double>(prompt_length) / seconds);
+      }
+      print_result(MakeTestName("pp", prompt_length, depth), ComputeStats(runs));
+    }
+
+    for (const std::size_t generation_length : options.n_gens) {
+      const std::size_t prefix_length = depth > 0 ? depth : 16;
+      if (prefix_length + generation_length >= required_context) {
+        std::cerr << "Error: generation benchmark exceeds context\n";
+        return 1;
+      }
+      std::vector<double> runs;
+      for (std::size_t repetition = 0; repetition < options.repetitions;
+           ++repetition) {
+        auto session = model->CreateSession(
+            static_cast<std::uint32_t>(required_context), &error);
+        if (!session ||
+            !session->Sync(std::span(tokens).first(prefix_length), &error)) {
+          std::cerr << "Error preparing generation: " << error << '\n';
+          return 1;
+        }
+        std::vector<std::int32_t> generated;
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t step = 0; step < generation_length;) {
+          if (mtp) {
+            std::vector<std::int32_t> emitted;
+            if (!session->SpeculativeStep(generation_length - step, &emitted,
+                                          &error) ||
+                emitted.empty()) {
+              std::cerr << "Error running MTP decode: " << error << '\n';
+              return 1;
+            }
+            generated.insert(generated.end(), emitted.begin(), emitted.end());
+            step += emitted.size();
+          } else {
+            const std::int32_t token = session->SelectNext(0.0F, nullptr);
+            if (!session->Evaluate(token, &error)) {
+              std::cerr << "Error running decode: " << error << '\n';
+              return 1;
+            }
+            generated.push_back(token);
+            ++step;
+          }
+        }
+        const double seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now() - start)
+                                   .count();
+        runs.push_back(static_cast<double>(generation_length) / seconds);
+        if (options.verbose) {
+          const auto stats = session->Statistics();
+          std::cerr << "Qwen3.8-Flash-Next tg depth=" << depth
+                    << " cycles=" << stats.cycles
+                    << " drafted=" << stats.drafted
+                    << " accepted=" << stats.accepted << " text="
+                    << model->Decode(std::span(generated).first(
+                           std::min<std::size_t>(generated.size(), 48)))
+                    << '\n';
+        }
+      }
+      print_result(MakeTestName("tg", generation_length, depth),
+                   ComputeStats(runs));
+    }
+  }
+  std::cout << '\n';
+  return 0;
+}
+
 #endif
 
 }  // namespace
@@ -1037,6 +1274,9 @@ int RunBench(std::span<const char* const> args) {
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
     return RunDeepSeekBenchmark(opt, reader, model_load_start);
+  }
+  if (IsQwen38FlashNext(*reader)) {
+    return RunQwen38FlashNextBenchmark(opt, reader, model_load_start);
   }
 
   if (opt.concurrency != std::vector<std::size_t>{1}) {

@@ -1,0 +1,273 @@
+#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
+#define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_
+
+#include <hip/hip_fp16.h>
+#include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
+
+#include <cstddef>
+#include <cstdint>
+#include <future>
+#include <memory>
+#include <span>
+#include <string>
+#include <vector>
+
+#include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+#include "src/models/qwen38_flash_next/ngram.hpp"
+
+namespace gufo::models::qwen38_flash_next::rocm {
+
+class Executor;
+
+/// Per-sequence state on the device: recurrent SSM state, KV and indexer
+/// caches, PLE conv history, plus the host-side n-gram window. A
+/// speculative forward additionally keeps per-token snapshots of every
+/// recurrent buffer so the batch can be cut back to its accepted prefix.
+class Session {
+public:
+  ~Session();
+  Session(const Session&) = delete;
+  Session& operator=(const Session&) = delete;
+
+  [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
+  [[nodiscard]] std::uint32_t max_context() const noexcept {
+    return max_context_;
+  }
+  /// Drops every token; the next Forward starts at position 0.
+  void Reset();
+
+private:
+  friend class Executor;
+  Session() = default;
+
+  struct LinearState {
+    float* conv_state{nullptr};  ///< [kernel-1][channels]
+    float* state{nullptr};       ///< [v_heads][d][d]
+    float* conv_snapshots{nullptr};   ///< [max_spec][kernel-1][channels]
+    float* state_snapshots{nullptr};  ///< [max_spec][v_heads][d][d]
+  };
+  struct AttentionState {
+    __half* k_cache{nullptr};   ///< [max_context][kv_heads*d]
+    __half* v_cache{nullptr};   ///< [max_context][kv_heads*d]
+    float* index_k{nullptr};    ///< [max_context][indexer_dim] raw
+    float* block_k{nullptr};    ///< [max_context/ratio][indexer_dim]
+    std::uint32_t blocks{0};    ///< pooled block count
+  };
+  struct MtpState {
+    __half* k_cache{nullptr};
+    __half* v_cache{nullptr};
+    float* h{nullptr};  ///< [hc_dim] wide residual handed to the next draft
+    std::uint32_t position{0};
+  };
+
+  const Executor* owner_{nullptr};
+  std::uint32_t max_context_{0};
+  std::uint32_t position_{0};
+  std::vector<LinearState> linear_;
+  std::vector<AttentionState> attention_;
+  float* ple_history_{nullptr};    ///< [PleConvHistory()][hc_dim]
+  float* ple_snapshots_{nullptr};  ///< [max_spec][PleConvHistory()][hc_dim]
+  NgramHistory ngram_;
+  std::vector<NgramHistory> ngram_snapshots_;
+  std::uint32_t spec_base_{0};    ///< position before the speculative batch
+  std::uint32_t spec_tokens_{0};  ///< tokens of the pending speculative batch
+  MtpState mtp_;
+  std::vector<void*> allocations_;
+};
+
+/// Runs the trunk graph on the GPU for one session at a time. Buffers are
+/// sized once for `max_batch` tokens; longer prompts are fed in chunks.
+class Executor {
+public:
+  struct Options {
+    std::uint32_t max_batch{512};
+    /// Rows of logits (and hidden states) a Forward call may return.
+    std::uint32_t max_logit_rows{64};
+    /// Longest speculative batch; bounds the recurrent snapshot storage.
+    std::uint32_t max_speculative{8};
+  };
+
+  ~Executor();
+  Executor(const Executor&) = delete;
+  Executor& operator=(const Executor&) = delete;
+
+  [[nodiscard]] static std::unique_ptr<Executor> Create(
+      const DeviceModel& model, NgramTable* ngram, Options options,
+      std::string* error_msg = nullptr);
+
+  [[nodiscard]] std::unique_ptr<Session> CreateSession(
+      std::uint32_t max_context, std::string* error_msg = nullptr) const;
+
+  /// Appends `tokens` (at most max_batch) to the session and returns the
+  /// logits of the last `n_logits` tokens in `logits` (n_logits * vocab
+  /// floats, host memory). The final wide residual of those tokens stays on
+  /// the device for MtpForward. With `speculative` set (batch at most
+  /// max_speculative) the batch can be cut back with Rollback.
+  [[nodiscard]] bool Forward(Session& session,
+                             std::span<const std::int32_t> tokens,
+                             std::uint32_t n_logits, float* logits,
+                             bool speculative, std::string* error_msg) const;
+
+  /// Keeps the first `keep` (1..n) tokens of the last speculative batch and
+  /// discards the rest.
+  [[nodiscard]] bool Rollback(Session& session, std::uint32_t keep,
+                              std::string* error_msg) const;
+
+  /// Runs the draft block over `tokens` (at most max_batch) at the session's
+  /// MTP position. The hidden input of token i is the trunk residual of row
+  /// `hidden_row + i` of the last Forward batch, or, with hidden_row < 0
+  /// (single token), the draft block's own residual from the previous call.
+  /// `logits` receives the last token's draft logits (vocab floats, host).
+  [[nodiscard]] bool MtpForward(Session& session,
+                                std::span<const std::int32_t> tokens,
+                                std::int32_t hidden_row, float* logits,
+                                std::string* error_msg) const;
+
+  /// Rewinds the draft block's own context.
+  void MtpRewind(Session& session, std::uint32_t position) const noexcept {
+    session.mtp_.position = position;
+  }
+  [[nodiscard]] std::uint32_t MtpPosition(const Session& session) const noexcept {
+    return session.mtp_.position;
+  }
+
+  [[nodiscard]] const Config& config() const noexcept {
+    return model_->config();
+  }
+  [[nodiscard]] std::uint32_t max_batch() const noexcept {
+    return options_.max_batch;
+  }
+  [[nodiscard]] std::uint32_t max_speculative() const noexcept {
+    return options_.max_speculative;
+  }
+  [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
+
+private:
+  Executor() = default;
+
+  bool Dense(const DeviceTensor& w, const float* x, float* out,
+             std::uint32_t n_tokens, std::string* error_msg) const;
+  void RoutedHints(const DeviceTensor& w, std::uint32_t n_tokens) const;
+  /// Gate and up projections over the same routing.
+  bool ExpertPair(const DeviceTensor& a, const DeviceTensor& b, const float* x,
+                  const std::int32_t* ids, float* out_a, float* out_b,
+                  std::uint32_t n_tokens, std::uint32_t n_used,
+                  std::string* error_msg) const;
+  bool Experts(const DeviceTensor& w, const float* x, const std::int32_t* ids,
+               float* out, std::uint32_t n_rows, std::uint32_t n_used,
+               std::uint32_t n_tokens, std::string* error_msg) const;
+  /// A non-null `xn` is m's grouped norm of res, already computed.
+  bool HcMix(const DeviceMixer& m, const float* res, const float* xn,
+             float* mixed, float* inject, std::uint32_t n_tokens,
+             std::string* error_msg) const;
+  /// Hashes the batch's n-gram rows and starts reading them from disk, so
+  /// the read overlaps the layers before the PLE one.
+  void PleFetch(Session& s, std::span<const std::int32_t> tokens,
+                bool speculative) const;
+  bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens,
+           float* res, bool speculative, std::string* error_msg) const;
+  bool LinearAttention(const DeviceLayer& l, Session::LinearState& s,
+                       const float* x, float* out, std::uint32_t n_tokens,
+                       bool speculative, std::string* error_msg) const;
+  /// Dense attention over start_pos + n keys as batched GEMMs; needs
+  /// start_pos + n <= s_.score_kv.
+  bool BatchedAttention(const Session::AttentionState& s,
+                        const std::uint32_t* mask, std::uint32_t n_tokens,
+                        std::uint32_t start_pos, std::string* error_msg) const;
+  bool Attention(const DeviceLayer& l, Session::AttentionState& s,
+                 const float* x, float* out, std::uint32_t n_tokens,
+                 std::uint32_t start_pos, std::uint32_t max_context,
+                 bool sparse, std::string* error_msg) const;
+  bool Moe(const DeviceLayer& l, const float* x, float* out,
+           std::uint32_t n_tokens, std::string* error_msg) const;
+  bool Head(const DeviceMixer& head, const float* res, std::uint32_t n_rows,
+            float* logits_host, std::string* error_msg) const;
+
+  const DeviceModel* model_{nullptr};
+  NgramTable* ngram_{nullptr};
+  Options options_;
+  hipStream_t stream_{nullptr};
+  hipblasHandle_t blas_{nullptr};
+  std::unique_ptr<BlasLt> blaslt_;
+
+  // Scratch, sized for max_batch tokens. Names follow reference.cpp.
+  struct Scratch {
+    std::int32_t* tokens;
+    void* x_half;  ///< activations narrowed to the weight's 16-bit type
+    float* res;
+    float* xn;
+    float* lo;
+    float* hc_gate;
+    float* mixed;
+    float* inject;
+    float* block_out;
+    // linear attention
+    float* qkv;
+    float* z;
+    float* alpha_beta;
+    float* conv_scratch;
+    float* qn;
+    float* kn;
+    float* gdn_raw;
+    float* gdn_out;
+    // attention
+    float* qg;
+    float* q;
+    float* attn_gate;
+    float* k;
+    float* v;
+    float* iq;
+    float* ik;
+    std::uint32_t* mask;
+    float* scores;
+    float* ctx;
+    __half* q_half;       ///< [n][heads*d] for the batched score GEMM
+    float* attn_scores;   ///< [heads][n][kv] raw scores
+    __half* probs;        ///< [heads][n][kv] softmax
+    std::uint32_t score_kv;  ///< widest kv range the score buffers hold
+    // ple
+    float* ple_emb;
+    float* ple_key;
+    float* ple_value;
+    float* ple_query;
+    float* ple_gated;
+    float* ple_norm;
+    float* ple_conv;
+    float* ple_history_scratch;
+    // moe
+    float* router;
+    std::int32_t* ids;
+    float* weights;
+    float* gate_e;
+    float* up_e;
+    float* down_e;
+    float* shexp_gate;
+    float* shexp_up;
+    float* shexp_out;
+    // head and hidden rows kept for the draft block
+    float* logits;
+    float* hc_keep;
+    // mtp
+    float* mtp_h;
+    float* mtp_embd;
+    float* mtp_concat;
+    float* mtp_res;
+  } s_{};
+  float* trace_{nullptr};  ///< QFN_TRACE per-layer checksums
+  std::uint32_t mask_words_{0};
+  std::uint32_t select_chunk_{64};
+  std::vector<void*> allocations_;
+  /// Pinned: the n-gram rows go up with hipMemcpyAsync, and a pageable
+  /// source would not be ordered against the kernels behind it.
+  float* host_emb_{nullptr};
+  mutable std::vector<std::uint32_t> host_rows_;
+  mutable std::future<bool> ple_read_;
+  /// Partial sums per inject logit the last HcMix left in s_.inject.
+  mutable std::uint32_t inject_parts_{1};
+};
+
+}  // namespace gufo::models::qwen38_flash_next::rocm
+
+#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_EXECUTOR_HPP_

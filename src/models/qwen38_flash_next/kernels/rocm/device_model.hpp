@@ -1,0 +1,103 @@
+#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_DEVICE_MODEL_HPP_
+#define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_DEVICE_MODEL_HPP_
+
+#include <cstddef>
+#include <cstdint>
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "src/core/gguf_reader.hpp"
+#include "src/models/qwen38_flash_next/weights.hpp"
+
+namespace gufo::models::qwen38_flash_next::rocm {
+
+/// One weight resident in device memory, still in its GGUF encoding.
+struct DeviceTensor {
+  void* data{nullptr};
+  core::GgmlType type{core::GgmlType::kF32};
+  std::uint32_t cols{0};
+  std::uint32_t rows{0};
+  std::uint32_t experts{1};
+
+  [[nodiscard]] bool empty() const noexcept { return data == nullptr; }
+  [[nodiscard]] const float* f32() const noexcept {
+    return static_cast<const float*>(data);
+  }
+};
+
+struct DeviceMixer {
+  DeviceTensor norm;
+  DeviceTensor down;
+  DeviceTensor up;
+  DeviceTensor inject;
+};
+
+struct DeviceLayer {
+  bool linear{false};
+  DeviceMixer hc_attn;
+  DeviceMixer hc_ffn;
+
+  DeviceTensor ssm_qkv, ssm_gate, ssm_conv1d, ssm_dt, ssm_a, ssm_norm, ssm_out;
+  /// alpha and beta rows stacked: [hidden -> 2 * v_heads] F32.
+  DeviceTensor ssm_alpha_beta;
+  DeviceTensor attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm,
+      indexer_q, indexer_k, indexer_q_norm, indexer_k_norm;
+  DeviceTensor ple_key, ple_value, ple_norm_key, ple_norm_query, ple_norm_conv,
+      ple_conv1d;
+  /// Router rows followed by the shared-expert gate row:
+  /// [hidden -> num_experts + 1] F32.
+  DeviceTensor router;
+  DeviceTensor ffn_gate_exps, ffn_up_exps, ffn_down_exps, shexp_gate, shexp_up,
+      shexp_down;
+  DeviceTensor nextn_enorm, nextn_hnorm, nextn_eh_proj;
+  DeviceMixer nextn_head;
+};
+
+/// The trunk (and optionally the MTP draft block) uploaded to the GPU. The
+/// n-gram table is never uploaded: it is read from disk per token.
+class DeviceModel {
+public:
+  ~DeviceModel();
+  DeviceModel(const DeviceModel&) = delete;
+  DeviceModel& operator=(const DeviceModel&) = delete;
+
+  /// Streams every tensor from the shard files into device memory. `mtp`
+  /// may be null; `mtp_path` is the sidecar it was bound from.
+  [[nodiscard]] static std::unique_ptr<DeviceModel> Upload(
+      const ModelWeights& weights, const std::filesystem::path& model_path,
+      const MtpWeights* mtp, const std::filesystem::path& mtp_path,
+      std::string* error_msg = nullptr);
+
+  const Config& config() const noexcept { return config_; }
+  const DeviceTensor& token_embd() const noexcept { return token_embd_; }
+  const DeviceTensor& output() const noexcept { return output_; }
+  const DeviceMixer& hc_head() const noexcept { return hc_head_; }
+  const std::vector<DeviceLayer>& layers() const noexcept { return layers_; }
+  [[nodiscard]] bool has_mtp() const noexcept { return has_mtp_; }
+  const DeviceLayer& mtp() const noexcept { return mtp_; }
+  [[nodiscard]] std::size_t resident_bytes() const noexcept { return bytes_; }
+  /// Widest K among the BF16/F16 matrices (activation staging for hipBLAS).
+  [[nodiscard]] std::size_t max_half_cols() const noexcept {
+    return max_half_cols_;
+  }
+
+private:
+  DeviceModel() = default;
+
+  Config config_;
+  DeviceTensor token_embd_;
+  DeviceTensor output_;
+  DeviceMixer hc_head_;
+  std::vector<DeviceLayer> layers_;
+  DeviceLayer mtp_;
+  bool has_mtp_{false};
+  std::vector<void*> allocations_;
+  std::size_t bytes_{0};
+  std::size_t max_half_cols_{1};
+};
+
+}  // namespace gufo::models::qwen38_flash_next::rocm
+
+#endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_DEVICE_MODEL_HPP_
