@@ -2492,9 +2492,15 @@ __launch_bounds__(256) __global__
   constexpr int kWaveRowTiles = kRowTiles / WM;
   constexpr int kWaveTokTiles = kTokTiles / WN;
 
-  __shared__ int32x4_t s_a[BK][kRowTiles][32];
-  __shared__ float s_dw[BK][kRowTiles][16];
-  __shared__ float s_off[BK][kRowTiles][16];
+  // The commit writes one (row, K block) unit per thread with BK
+  // consecutive lanes on the same row, so each K-block plane is padded by
+  // one element to spread those lanes over the banks (measured 22-28% of
+  // cycles in bank conflicts before).
+  constexpr int kAPlane = kRowTiles * 32 + 1;
+  constexpr int kSPlane = kRowTiles * 16 + 4;
+  __shared__ int32x4_t s_a[BK * kAPlane];
+  __shared__ float s_dw[BK * kSPlane];
+  __shared__ float s_off[BK * kSPlane];
   __shared__ int32x4_t s_b[BK][kTokTiles][32];
   __shared__ float s_dx[BK][kTokTiles][16];
 
@@ -2622,10 +2628,10 @@ __launch_bounds__(256) __global__
       const int rs = rr / 16;
       const int rl = rr % 16;
       const int slot = (rl % 2 == 0) ? (rl / 2) : (8 + (rl / 2));
-      s_a[kk][rs][rl] = st.q0[p];
-      s_a[kk][rs][16 + rl] = st.q1[p];
-      s_dw[kk][rs][slot] = st.dw[p];
-      s_off[kk][rs][slot] = st.off[p];
+      s_a[(kk * kAPlane) + (rs * 32) + rl] = st.q0[p];
+      s_a[(kk * kAPlane) + (rs * 32) + 16 + rl] = st.q1[p];
+      s_dw[(kk * kSPlane) + (rs * 16) + slot] = st.dw[p];
+      s_off[(kk * kSPlane) + (rs * 16) + slot] = st.off[p];
     }
     if (b_live) {
 #pragma unroll
@@ -2650,12 +2656,12 @@ __launch_bounds__(256) __global__
 #pragma unroll
       for (int i = 0; i < kWaveRowTiles; ++i) {
         const int rs = (wave_row * kWaveRowTiles) + i;
-        a0[i] = s_a[kb][rs][sub_lane];
-        a1[i] = s_a[kb][rs][16 + sub_lane];
-        const float4 lo =
-            *reinterpret_cast<const float4*>(&s_dw[kb][rs][half_id * 8]);
-        const float4 up =
-            *reinterpret_cast<const float4*>(&s_dw[kb][rs][(half_id * 8) + 4]);
+        a0[i] = s_a[(kb * kAPlane) + (rs * 32) + sub_lane];
+        a1[i] = s_a[(kb * kAPlane) + (rs * 32) + 16 + sub_lane];
+        const float4 lo = *reinterpret_cast<const float4*>(
+            &s_dw[(kb * kSPlane) + (rs * 16) + (half_id * 8)]);
+        const float4 up = *reinterpret_cast<const float4*>(
+            &s_dw[(kb * kSPlane) + (rs * 16) + (half_id * 8) + 4]);
         dw[i][0] = lo.x;
         dw[i][1] = lo.y;
         dw[i][2] = lo.z;
@@ -2664,10 +2670,10 @@ __launch_bounds__(256) __global__
         dw[i][5] = up.y;
         dw[i][6] = up.z;
         dw[i][7] = up.w;
-        const float4 olo =
-            *reinterpret_cast<const float4*>(&s_off[kb][rs][half_id * 8]);
-        const float4 oup =
-            *reinterpret_cast<const float4*>(&s_off[kb][rs][(half_id * 8) + 4]);
+        const float4 olo = *reinterpret_cast<const float4*>(
+            &s_off[(kb * kSPlane) + (rs * 16) + (half_id * 8)]);
+        const float4 oup = *reinterpret_cast<const float4*>(
+            &s_off[(kb * kSPlane) + (rs * 16) + (half_id * 8) + 4]);
         off[i][0] = olo.x;
         off[i][1] = olo.y;
         off[i][2] = olo.z;
@@ -2746,8 +2752,7 @@ __launch_bounds__(256) __global__
   // Transpose each 16x16 tile through LDS, then scatter the 16 rows of each
   // token to its output row.
   __syncthreads();
-  float* tile_scratch =
-      reinterpret_cast<float*>(&s_a[0][0][0]) + (wave_id * 256);
+  float* tile_scratch = reinterpret_cast<float*>(&s_a[0]) + (wave_id * 256);
 #pragma unroll
   for (int i = 0; i < kWaveRowTiles; ++i) {
 #pragma unroll
