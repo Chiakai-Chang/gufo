@@ -16,7 +16,7 @@ per shape, then the timed one; single samples, the host's noise band is about
 | --- | ---: | ---: | ---: |
 | pp128 | 464 | 443 | — |
 | pp512 | 796 | 628 | 402 |
-| pp1024 | 921 | — | — |
+| pp1024 | 931 | — | — |
 | pp2048 | 1007 | 719 | 439 |
 | tg64 greedy | 22.7 | 22.8 | 21.9 |
 | tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 32.9 (depth 0) / 36.5 (depth 1024) / 35.0 (depth 4096) / 42.9 (depth 16384) | 38.4 / 35.0 / 30.4 / — | — |
@@ -71,10 +71,11 @@ targets under `tests/models/qwen38_flash_next/` (label
 | vec4 MoE epilogue | retained, +3.4% (859 → 888) | float4 slot reduction, a quarter of the waves; 2.56 → 1.3 ms per layer |
 | parallel routed id maps | retained, +2.7% (916 → 940) | three-pass scan replaces the one-warp-per-expert helper (0.6–1.0 ms per launch); bit-identical maps |
 | W8A8 int8 WMMA dense GEMM | retained, +2.7% (938 → 964) | 27B blocked kernel over the untouched Q8_0 blocks, about 30 TOPS; 64-row tiles for the 320-row mixer down |
-| routed int8 WMMA expert GEMM | retained at ≥ 24 rows per expert, +2.2% (965 → 986) | 128 x 48 macro tiles per expert over 16-row padded buckets, K-quant fetch with a cached block header, in-GEMM row gather; the MMQ tier stays below 1,229 tokens where it is 5–8% faster |
+| routed int8 WMMA expert GEMM | retained at ≥ 24 rows per expert, +2.2% (965 → 986) | 128 x 48 macro tiles per expert over 16-row padded buckets, K-quant fetch with a cached block header, in-GEMM row gather; the MMQ tier stays below 820 tokens where it is 5% faster |
 | W8A8 mixer down from a fused tiled-Q8 norm | retained, +2.4% (988 → 1011) | the combine also quantizes the norm per 32-block; removes the hipBLASLt plan lottery on that shape |
 | sparse-window attention at depth (depth card) | retained, pp2048@16k 320 → 838, tg64@32k 12.4 → 19.4 | the fused WMMA kernel was only used up to 4096 keys and the per-token fallback swept every key of the context with the mask; now: the WMMA kernel at any depth gathers 16-key tiles from the union of a block's query masks, with the twelve heads of one query packed into a 16-row tile and four queries per block (a 32-query union covered 60% of the context, a 4-query union 20%); the per-token kernel compacts the query's selected blocks through LDS, splits its tiles over eight blocks with a log-sum-exp merge, and scores/accumulates wave-cooperatively (one 16-byte load per lane) instead of one lane per key; block selection scores sixteen queries per pooled key row over row splits instead of one block per query |
 | SwiGLU in the routed up projection's epilogue | retained (bundled) | the up GEMM writes silu(gate) * up in place of the up result; drops the SwiGLU pass and one 52 MB round trip per layer |
+| routed WMMA route from 16 rows per expert (was 24) | retained, pp1024 914 → 931 | after the LDS padding the WMMA tier wins at 1024 tokens too; pp512 (ten-row buckets) stays on MMQ |
 | routed GEMM LDS plane padding | retained, +0.7% (1014 → 1022) | one-element padding per K-block plane halves the bank conflicts (22–28% → 11–18% of cycles); MemUnitBusy then reads 93–95%, so the kernel is memory-unit bound at ~15 TOPS |
 | routed GEMM tiles 128x96 (4x2 waves) / BK=2 | rejected | 6.53 / 8.51 ms and 4.76 / 5.77 ms per call against 4.45 / 5.36 for 128x48 BK=4: fewer weight re-fetches lose to the occupancy drop (256 VGPRs, 34 KB LDS) |
 | fused Q4_K expert gate/up (decode) | rejected | MTP tg128 38.6 → 33.5 despite fewer cycles |

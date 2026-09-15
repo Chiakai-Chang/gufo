@@ -954,15 +954,15 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (!RouteHints(n_tokens, error_msg)) {
     return false;
   }
-  // Batches whose mean bucket fills at least half of the 48-row macro tile
-  // take the WMMA route: assignments compacted by expert into 16-row padded
-  // buckets, tokens quantized once, then the int8 matrix-core GEMM per
-  // expert (measured: 988 -> 1008 tok/s at 2048 tokens, a wash at 1024, and
-  // 794 -> 752 at 512 where the MMQ tier's 16/32-column tiles fit the
-  // ten-row buckets better).
+  // Batches whose mean bucket fills at least a third of the 48-row macro
+  // tile take the WMMA route: assignments compacted by expert into 16-row
+  // padded buckets, tokens quantized once, then the int8 matrix-core GEMM
+  // per expert (measured: 988 -> 1008 tok/s at 2048 tokens, 914 -> 931 at
+  // 1024, and 794 -> 752 at 512 where the MMQ tier's 16/32-column tiles fit
+  // the ten-row buckets better).
   const bool wmma_experts = n_tokens > 4 * kVecBatch &&
                             static_cast<std::size_t>(n_tokens) * used >=
-                                static_cast<std::size_t>(24) * c.num_experts &&
+                                static_cast<std::size_t>(16) * c.num_experts &&
                             l.ffn_gate_exps.type == GgmlType::kQ4_K &&
                             l.ffn_up_exps.type == GgmlType::kQ4_K &&
                             l.ffn_down_exps.type == GgmlType::kQ5_1 &&
