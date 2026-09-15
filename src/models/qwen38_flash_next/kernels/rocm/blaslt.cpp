@@ -29,11 +29,18 @@ struct BlasLt::Problem {
   long long stride_c;
   int m, n, k, batch;
 
-  /// Shape class: everything but the token count, which varies per chunk.
+  /// Token counts round up to a power of two: one plan per size class.
+  [[nodiscard]] int ClassN() const {
+    int c = 16;
+    while (c < n) {
+      c *= 2;
+    }
+    return c;
+  }
   [[nodiscard]] std::string Key() const {
     std::ostringstream key;
     key << a.type << ':' << a.transpose << ':' << b.type << ':' << b.transpose
-        << ':' << m << ':' << k << ':' << batch;
+        << ':' << m << ':' << k << ':' << batch << ':' << ClassN();
     return key.str();
   }
 };
@@ -198,10 +205,11 @@ bool BlasLt::Gemm(const Operand& a, const Operand& b, float* out, int ldc,
   const Problem p{a, b, out, ldc, stride_c, m, n, k, batch};
   Plan& plan = plans_[p.Key()];
   if (!plan.tuned) {
-    // Time the class at the widest token count it will see, so the pick is
-    // right where the work is; the layouts below carry the real n.
+    // Time the class at the top of its size bucket (never past the buffers
+    // sized for tuning_n); the layouts below carry the real n.
     Problem widest = p;
-    widest.n = std::max<int>(n, static_cast<int>(tuning_n_));
+    widest.n = std::min<int>(p.ClassN(), static_cast<int>(tuning_n_));
+    widest.n = std::max<int>(widest.n, n);
     if (!Tune(widest, out, &plan, error_msg)) {
       return false;
     }

@@ -1,7 +1,6 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -362,9 +361,6 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
 /// the mean bucket, so most experts fit one tile with little padding.
 int RoutedTileCols(std::uint32_t n_tokens, std::uint32_t n_used,
                    std::uint32_t n_experts) {
-  if (const char* env = std::getenv("QFN_MOE_TILE")) {
-    return std::atoi(env);
-  }
   const std::uint32_t mean =
       std::max<std::uint32_t>(1, n_tokens * n_used / std::max(n_experts, 1u));
   for (int cols = 16; cols < 80; cols += 16) {
@@ -532,14 +528,8 @@ bool Executor::RouteHints(std::uint32_t n_tokens, std::string* error_msg) const 
     max_rows = std::max(max_rows, counts_host_[e]);
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
-  if (const char* env = std::getenv("QFN_MOE_GRID_ROWS")) {
-    routed_max_rows_ = static_cast<std::uint32_t>(std::atoi(env));
-  }
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
       counts_host_, static_cast<int>(c.num_experts));
-  if (const char* env = std::getenv("QFN_MOE_TILE")) {
-    routed_tile_cols_ = std::atoi(env);
-  }
   return true;
 }
 
@@ -984,18 +974,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       }
       session.graphs_.emplace(key, exec);
     }
-    const auto t0 = std::chrono::steady_clock::now();
     if (!Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
       return false;
-    }
-    const auto t1 = std::chrono::steady_clock::now();
-    if (std::getenv("QFN_GRAPH_DEBUG") != nullptr) {
-      (void)hipStreamSynchronize(stream_);
-      const auto t2 = std::chrono::steady_clock::now();
-      std::fprintf(stderr, "graph key %llx launch %.2f ms run %.2f ms\n",
-                   static_cast<unsigned long long>(key),
-                   std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                   std::chrono::duration<double, std::milli>(t2 - t1).count());
     }
   } else {
     if (!body()) {

@@ -908,7 +908,9 @@ int RunQwen38FlashNextBenchmark(
         return 1;
       }
       std::vector<double> runs;
-      for (std::size_t repetition = 0; repetition < options.repetitions;
+      // One untimed pass first, as llama-bench does: GEMM plan tuning and
+      // arena growth happen once per shape.
+      for (std::size_t repetition = 0; repetition <= options.repetitions;
            ++repetition) {
         auto session = model->CreateSession(
             static_cast<std::uint32_t>(required_context), &error);
@@ -926,7 +928,9 @@ int RunQwen38FlashNextBenchmark(
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
                                    .count();
-        runs.push_back(static_cast<double>(prompt_length) / seconds);
+        if (repetition > 0) {
+          runs.push_back(static_cast<double>(prompt_length) / seconds);
+        }
       }
       print_result(MakeTestName("pp", prompt_length, depth), ComputeStats(runs));
     }

@@ -147,7 +147,6 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
                                     float* inject, std::uint32_t hidden,
                                     std::uint32_t streams) {
   constexpr std::uint32_t kMaxStreams = 8;
-  __shared__ float shared[32];
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t i = blockIdx.y * blockDim.x + threadIdx.x;
   const std::size_t hc_dim = static_cast<std::size_t>(streams) * hidden;
@@ -168,6 +167,11 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
   if (inject_w == nullptr) {
     return;
   }
+  // All inject dots reduce through one shared pass: wave sums first, then
+  // one thread per logit totals the waves.
+  __shared__ float partial[kMaxStreams][kThreads / 32];
+  const std::uint32_t lane = threadIdx.x % warpSize;
+  const std::uint32_t wave = threadIdx.x / warpSize;
   for (std::uint32_t o = 0; o < streams; ++o) {
     const float* w = inject_w + o * hc_dim;
     float dot = 0.0f;
@@ -176,11 +180,19 @@ __global__ void HcMixEpilogueKernel(const float* xn, const float* gate,
         dot += w[static_cast<std::size_t>(s) * hidden + i] * v[s];
       }
     }
-    dot = BlockSum(dot, shared);
-    if (threadIdx.x == 0) {
-      inject[(static_cast<std::size_t>(t) * streams + o) * gridDim.y +
-             blockIdx.y] = dot;
+    dot = WaveSum(dot);
+    if (lane == 0) {
+      partial[o][wave] = dot;
     }
+  }
+  __syncthreads();
+  if (threadIdx.x < streams) {
+    float total = 0.0f;
+    for (std::uint32_t w = 0; w < blockDim.x / warpSize; ++w) {
+      total += partial[threadIdx.x][w];
+    }
+    inject[(static_cast<std::size_t>(t) * streams + threadIdx.x) * gridDim.y +
+           blockIdx.y] = total;
   }
 }
 
