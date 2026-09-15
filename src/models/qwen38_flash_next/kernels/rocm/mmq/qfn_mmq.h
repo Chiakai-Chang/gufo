@@ -943,6 +943,17 @@ int qfn_mmq_q4_K_moe_pair_raw_vec(
 //
 // Returns 0 on success, non-zero on validation or launch failure.
 
+// qwen38: split vec path. Bytes of the Q8_1 activation buffer for N rows
+// of K, the quantization into it, and the GEMV over the quantized rows
+// (no output memset, no sanitize pass).
+size_t qfn_mmq_q8_1_bytes(int N, int K);
+int qfn_mmq_quantize_q8_1(const float * X_f32, void * X_q8, int N, int K,
+                          cudaStream_t stream);
+// A non-null W_gate (same shape) makes it (W . x) * silu(W_gate . x).
+int qfn_mmq_q8_0_dense_vec_preq(const void * W_q8_0, const void * W_gate,
+                                const void * X_q8, float * out_f32, int M,
+                                int N, int K, cudaStream_t stream);
+
 int qfn_mmq_q8_0_dense_vec(
     const void  * W_q8_0,
     const float * X_f32,

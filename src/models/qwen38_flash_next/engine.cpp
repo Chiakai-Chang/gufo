@@ -76,6 +76,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   exec.max_batch = std::max<std::uint32_t>(1, options.max_batch);
   exec.max_logit_rows = std::max<std::uint32_t>(1, options.max_draft_tokens + 1);
   exec.max_speculative = exec.max_logit_rows;
+  exec.draft_rows = options.draft_vocab;
   m->executor_ = rocm::Executor::Create(*m->device_, m->ngram_.get(), exec,
                                         error_msg);
   if (!m->executor_) {
@@ -166,9 +167,9 @@ void Session::Reset() {
   model_->executor_->MtpRewind(*session_, 0);
 }
 
-std::int32_t Session::Argmax(const float* row) const noexcept {
-  const std::size_t vocab = model_->VocabSize();
-  return static_cast<std::int32_t>(std::max_element(row, row + vocab) - row);
+std::int32_t Session::Argmax(const float* row, std::size_t count) const noexcept {
+  const std::size_t n = count > 0 ? count : model_->VocabSize();
+  return static_cast<std::int32_t>(std::max_element(row, row + n) - row);
 }
 
 bool Session::DraftCatchUp(std::int32_t next_token, std::string* error_msg) {
@@ -292,7 +293,8 @@ bool Session::SpeculativeStep(std::size_t max_tokens,
     return false;
   }
   std::vector<std::int32_t> chain{pending_};
-  std::int32_t draft = Argmax(draft_logits_.data());
+  const std::size_t draft_rows = exec.DraftRows();
+  std::int32_t draft = Argmax(draft_logits_.data(), draft_rows);
   while (chain.size() < width) {
     chain.push_back(draft);
     if (chain.size() < width) {
@@ -300,7 +302,7 @@ bool Session::SpeculativeStep(std::size_t max_tokens,
                            -1, draft_logits_.data(), error_msg)) {
         return false;
       }
-      draft = Argmax(draft_logits_.data());
+      draft = Argmax(draft_logits_.data(), draft_rows);
     }
   }
 

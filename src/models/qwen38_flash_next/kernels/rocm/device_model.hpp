@@ -40,10 +40,16 @@ struct DeviceLayer {
   DeviceMixer hc_ffn;
 
   DeviceTensor ssm_qkv, ssm_gate, ssm_conv1d, ssm_dt, ssm_a, ssm_norm, ssm_out;
-  /// alpha and beta rows stacked: [hidden -> 2 * v_heads] F32.
+  /// qkv and gate rows stacked ([hidden -> conv channels + value dim]) when
+  /// both are Q8_0; then ssm_qkv/ssm_gate are empty.
+  DeviceTensor ssm_in;
+  /// alpha and beta rows stacked: [hidden -> 2 * v_heads] F16.
   DeviceTensor ssm_alpha_beta;
   DeviceTensor attn_q, attn_k, attn_v, attn_out, attn_q_norm, attn_k_norm,
       indexer_q, indexer_k, indexer_q_norm, indexer_k_norm;
+  /// [q|gate ; k ; v] rows stacked when all are Q8_0; then attn_q/k/v are
+  /// empty.
+  DeviceTensor attn_qkv;
   DeviceTensor ple_key, ple_value, ple_norm_key, ple_norm_query, ple_norm_conv,
       ple_conv1d;
   /// Router rows followed by the shared-expert gate row:
@@ -82,6 +88,10 @@ public:
   [[nodiscard]] std::size_t max_half_cols() const noexcept {
     return max_half_cols_;
   }
+  /// Widest K among the Q8_0 matrices (decode activation quantization).
+  [[nodiscard]] std::size_t max_q8_cols() const noexcept {
+    return max_q8_cols_;
+  }
 
 private:
   DeviceModel() = default;
@@ -96,6 +106,7 @@ private:
   std::vector<void*> allocations_;
   std::size_t bytes_{0};
   std::size_t max_half_cols_{1};
+  std::size_t max_q8_cols_{32};
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

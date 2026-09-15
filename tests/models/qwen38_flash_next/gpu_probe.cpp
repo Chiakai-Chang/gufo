@@ -1,7 +1,7 @@
 // Runs the ROCm executor over a prompt, optionally next to the float32
 // reference, and reports agreement per position plus greedy continuations.
 //
-//   gpu_probe --model FIRST_SHARD.gguf [--mtp MTP.gguf] --prompt TEXT
+//   gpu_probe --model FIRST_SHARD.gguf [--mtp MTP.gguf] --prompt TEXT [--warm]
 //             [--generate N] [--reference] [--batch T] [--context N]
 //             [--dump logits.bin]
 #include <algorithm>
@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
   int generate = 0;
   bool reference = false;
   bool repeat_check = false;
+  bool warm = false;
   int spec = 0;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
@@ -90,6 +91,8 @@ int main(int argc, char** argv) {
       reference = true;
     } else if (arg == "--repeat") {
       repeat_check = true;
+    } else if (arg == "--warm") {
+      warm = true;
     } else if (arg == "--spec") {
       spec = std::atoi(next().c_str());
     } else if (arg == "--batch") {
@@ -203,6 +206,20 @@ int main(int argc, char** argv) {
   std::vector<float> gpu_logits;
   std::size_t logit_rows = 0;
   std::vector<float> draft_logits(c.vocab_size);
+  if (warm) {
+    // An untimed pass first: GEMM tuning and arena growth happen once.
+    for (std::size_t off = 0; off < tokens.size(); off += batch) {
+      const std::size_t n = std::min<std::size_t>(batch, tokens.size() - off);
+      std::vector<float> out(c.vocab_size);
+      if (!executor->Forward(*session,
+                             std::span<const std::int32_t>(tokens.data() + off, n),
+                             1, out.data(), false, &error)) {
+        std::fprintf(stderr, "warm-up failed: %s\n", error.c_str());
+        return 1;
+      }
+    }
+    session->Reset();
+  }
   t0 = std::chrono::steady_clock::now();
   for (std::size_t off = 0; off < tokens.size(); off += batch) {
     const std::size_t n = std::min<std::size_t>(batch, tokens.size() - off);

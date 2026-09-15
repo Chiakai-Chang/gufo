@@ -163,6 +163,7 @@ struct Uploader {
   std::vector<void*>& allocations;
   std::size_t& bytes;
   std::size_t& max_half_cols;
+  std::size_t& max_q8_cols;
   std::string* error;
   bool ok{true};
 
@@ -201,13 +202,17 @@ struct Uploader {
     if (t.type == core::GgmlType::kBF16 || t.type == core::GgmlType::kF16) {
       max_half_cols = std::max<std::size_t>(max_half_cols, t.cols);
     }
+    if (t.type == core::GgmlType::kQ8_0 && t.experts == 1) {
+      max_q8_cols = std::max<std::size_t>(max_q8_cols, t.cols);
+    }
     return d;
   }
 
-  /// Uploads F32 matrices stacked along rows and narrows the stack to F16;
-  /// every input shares `cols`. The stacked rows (router logits, GDN
-  /// alpha/beta) are the only unquantized projections, and F16 is what the
-  /// wide-batch GEMM tier runs at speed.
+  /// Uploads matrices of one type stacked along rows; every input shares
+  /// `cols`. An F32 stack (router logits, GDN alpha/beta: the only
+  /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
+  /// tier runs at speed. A Q8_0 stack merges projections of one input into
+  /// a single decode GEMV.
   DeviceTensor Stack(std::initializer_list<const TensorRef*> parts) {
     DeviceTensor d;
     if (!ok) {
@@ -215,9 +220,11 @@ struct Uploader {
     }
     std::size_t rows = 0;
     std::size_t size = 0;
+    const core::GgmlType type = (*parts.begin())->type;
     for (const TensorRef* t : parts) {
-      if (t->empty() || t->type != core::GgmlType::kF32) {
-        Fail("stacked upload needs F32 tensors");
+      if (t->empty() || t->type != type || t->cols != (*parts.begin())->cols ||
+          (type != core::GgmlType::kF32 && type != core::GgmlType::kQ8_0)) {
+        Fail("stacked upload needs F32 or Q8_0 tensors of one shape");
         return d;
       }
       rows += t->rows;
@@ -238,6 +245,16 @@ struct Uploader {
         return d;
       }
       offset += t->SizeBytes();
+    }
+    if (type == core::GgmlType::kQ8_0) {
+      (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0,
+                           kTailMargin, nullptr);
+      d.data = ptr;
+      d.type = type;
+      d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
+      d.rows = static_cast<std::uint32_t>(rows);
+      max_q8_cols = std::max<std::size_t>(max_q8_cols, d.cols);
+      return d;
     }
     const std::size_t count = size / sizeof(float);
     void* half = nullptr;
@@ -279,8 +296,23 @@ struct Uploader {
     d.linear = l.linear;
     d.hc_attn = Mixer(l.hc_attn);
     d.hc_ffn = Mixer(l.hc_ffn);
-    d.ssm_qkv = Copy(l.ssm_qkv);
-    d.ssm_gate = Copy(l.ssm_gate);
+    // Projections of one input are stacked into one Q8_0 GEMV where the
+    // quantization allows; otherwise they stay separate.
+    const auto stackable = [](std::initializer_list<const TensorRef*> parts) {
+      for (const TensorRef* t : parts) {
+        if (t->empty() || t->type != core::GgmlType::kQ8_0 ||
+            t->cols != (*parts.begin())->cols) {
+          return false;
+        }
+      }
+      return true;
+    };
+    if (l.linear && stackable({&l.ssm_qkv, &l.ssm_gate})) {
+      d.ssm_in = Stack({&l.ssm_qkv, &l.ssm_gate});
+    } else {
+      d.ssm_qkv = Copy(l.ssm_qkv);
+      d.ssm_gate = Copy(l.ssm_gate);
+    }
     d.ssm_conv1d = Copy(l.ssm_conv1d);
     if (l.linear) {
       d.ssm_alpha_beta = Stack({&l.ssm_alpha, &l.ssm_beta});
@@ -289,9 +321,13 @@ struct Uploader {
     d.ssm_a = Copy(l.ssm_a);
     d.ssm_norm = Copy(l.ssm_norm);
     d.ssm_out = Copy(l.ssm_out);
-    d.attn_q = Copy(l.attn_q);
-    d.attn_k = Copy(l.attn_k);
-    d.attn_v = Copy(l.attn_v);
+    if (!l.linear && stackable({&l.attn_q, &l.attn_k, &l.attn_v})) {
+      d.attn_qkv = Stack({&l.attn_q, &l.attn_k, &l.attn_v});
+    } else {
+      d.attn_q = Copy(l.attn_q);
+      d.attn_k = Copy(l.attn_k);
+      d.attn_v = Copy(l.attn_v);
+    }
     d.attn_out = Copy(l.attn_out);
     d.attn_q_norm = Copy(l.attn_q_norm);
     d.attn_k_norm = Copy(l.attn_k_norm);
@@ -350,7 +386,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     return nullptr;
   }
   Uploader up{stager, m->allocations_, m->bytes_, m->max_half_cols_,
-              error_msg};
+              m->max_q8_cols_, error_msg};
   m->token_embd_ = up.Copy(w.token_embd);
   m->output_ = w.output.data == w.token_embd.data ? m->token_embd_
                                                    : up.Copy(w.output);
@@ -368,7 +404,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       return nullptr;
     }
     Uploader mtp_up{mtp_stager, m->allocations_, m->bytes_,
-                    m->max_half_cols_, error_msg};
+                    m->max_half_cols_, m->max_q8_cols_, error_msg};
     m->mtp_ = mtp_up.Layer(mtp->block);
     m->has_mtp_ = true;
     if (!mtp_up.ok || !mtp_stager.Finish()) {

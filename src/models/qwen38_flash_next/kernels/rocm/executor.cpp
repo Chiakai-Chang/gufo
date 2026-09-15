@@ -1,10 +1,12 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 #include "qfn_mmq.h"
@@ -67,9 +69,16 @@ WeightType SmallType(GgmlType type) {
   }
 }
 
+// The tier's tiled kernels compute whole column tiles; below this width the
+// matrix-vector kernels read each weight once per row and win outright.
+constexpr std::uint32_t kVecBatch = 8;
+
 }  // namespace
 
 Session::~Session() {
+  for (auto& [key, exec] : graphs_) {
+    (void)hipGraphExecDestroy(exec);
+  }
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -91,9 +100,7 @@ void Session::Reset() {
                     c.ssm_head_dim * sizeof(float));
     }
   }
-  for (auto& a : attention_) {
-    a.blocks = 0;
-  }
+  blocks_ = 0;
   if (ple_history_ != nullptr) {
     (void)hipMemset(ple_history_, 0,
               static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim() *
@@ -105,8 +112,12 @@ Executor::~Executor() {
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
-  if (host_emb_ != nullptr) {
-    (void)hipHostFree(host_emb_);
+  for (void* p : {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
+                  static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
+                  static_cast<void*>(counts_host_)}) {
+    if (p != nullptr) {
+      (void)hipHostFree(p);
+    }
   }
   if (blas_ != nullptr) {
     (void)hipblasDestroy(blas_);
@@ -128,6 +139,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       options.max_logit_rows, 1, e->options_.max_batch);
   e->options_.max_speculative = std::clamp<std::uint32_t>(
       options.max_speculative, 1, e->options_.max_logit_rows);
+  const std::uint32_t vocab = model.config().vocab_size;
+  if (options.draft_rows == 0 || options.draft_rows > vocab) {
+    e->options_.draft_rows = vocab;
+  }
   if (qfn_mmq_init(0) != 0) {
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
@@ -155,6 +170,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   auto f32 = [&](std::size_t n) { return Alloc<float>(a, n, error_msg); };
   s.tokens = Alloc<std::int32_t>(a, T, error_msg);
   s.x_half = Alloc<std::uint16_t>(a, T * model.max_half_cols(), error_msg);
+  for (void*& slot : s.x_q8) {
+    slot = Alloc<std::uint8_t>(
+        a, qfn_mmq_q8_1_bytes(static_cast<int>(kVecBatch),
+                              static_cast<int>(model.max_q8_cols())),
+        error_msg);
+  }
   s.res = f32(T * hc_dim);
   s.xn = f32(T * hc_dim);
   s.lo = f32(T * c.hc_low_rank);
@@ -164,13 +185,14 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.block_out = f32(T * hidden);
   s.qkv = f32(T * c.SsmConvChannels());
   s.z = f32(T * c.SsmValueDim());
+  s.qkvz = f32(T * (c.SsmConvChannels() + c.SsmValueDim()));
   s.alpha_beta = f32(T * 2 * c.ssm_num_v_heads);
   s.conv_scratch = f32((T + c.ssm_conv_kernel) * c.SsmConvChannels());
   s.qn = f32(T * c.SsmKeyDim());
   s.kn = f32(T * c.SsmKeyDim());
   s.gdn_raw = f32(T * c.SsmValueDim());
   s.gdn_out = f32(T * c.SsmValueDim());
-  s.qg = f32(T * 2 * c.AttentionQDim());
+  s.qg = f32(T * (2 * c.AttentionQDim() + 2 * c.AttentionKvDim()));
   s.q = f32(T * c.AttentionQDim());
   s.attn_gate = f32(T * c.AttentionQDim());
   s.k = f32(T * c.AttentionKvDim());
@@ -212,6 +234,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   s.router = f32(T * (c.num_experts + 1));
   s.ids = Alloc<std::int32_t>(a, slots, error_msg);
+  s.expert_counts = Alloc<std::uint32_t>(a, c.num_experts, error_msg);
   s.weights = f32(slots);
   s.gate_e = f32(slots * c.expert_ff);
   s.up_e = f32(slots * c.expert_ff);
@@ -220,6 +243,33 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.shexp_up = f32(T * c.shared_expert_ff);
   s.shexp_out = f32(T * hidden);
   s.logits = f32(static_cast<std::size_t>(e->options_.max_logit_rows) * c.vocab_size);
+  {
+    void* control = nullptr;
+    void* tokens = nullptr;
+    void* logits = nullptr;
+    if (!Check(hipHostMalloc(&control, sizeof(Session::Control)),
+               "pinned control buffer", error_msg) ||
+        !Check(hipHostMalloc(&tokens, T * sizeof(std::int32_t)),
+               "pinned token buffer", error_msg) ||
+        !Check(hipHostMalloc(&logits, static_cast<std::size_t>(
+                                          e->options_.max_logit_rows) *
+                                          c.vocab_size * sizeof(float)),
+               "pinned logits buffer", error_msg)) {
+      return nullptr;
+    }
+    void* counts = nullptr;
+    if (!Check(hipHostMalloc(&counts, c.num_experts * sizeof(std::uint32_t)),
+               "pinned expert counts", error_msg)) {
+      return nullptr;
+    }
+    e->counts_host_ = static_cast<std::uint32_t*>(counts);
+    e->control_host_ = static_cast<Session::Control*>(control);
+    e->tokens_host_ = static_cast<std::int32_t*>(tokens);
+    e->logits_host_ = static_cast<float*>(logits);
+  }
+  if (const char* env = std::getenv("QFN_GRAPHS"); env != nullptr) {
+    e->graphs_enabled_ = std::string_view(env) != "0";
+  }
   if (std::getenv("QFN_TRACE") != nullptr) {
     e->trace_ = f32(static_cast<std::size_t>(c.num_layers) * 8 + 16);
   }
@@ -286,6 +336,7 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
     s->ple_history_ = Alloc<float>(a, hist, error_msg);
     s->ple_snapshots_ = Alloc<float>(a, spec * hist, error_msg);
   }
+  s->control_ = Alloc<Session::Control>(a, 1, error_msg);
   if (model_->has_mtp()) {
     s->mtp_.k_cache = Alloc<__half>(
         a, static_cast<std::size_t>(max_context) * kv_row, error_msg);
@@ -306,9 +357,6 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
   return s;
 }
 
-// The tier's tiled kernels compute whole column tiles; below this width the
-// matrix-vector kernels read each weight once per row and win outright.
-constexpr std::uint32_t kVecBatch = 8;
 
 /// Column-tile width for the routed expert GEMMs: the tile at or above twice
 /// the mean bucket, so most experts fit one tile with little padding.
@@ -327,18 +375,90 @@ int RoutedTileCols(std::uint32_t n_tokens, std::uint32_t n_used,
   return 80;
 }
 
+bool Executor::Quantize(const float* x, std::uint32_t n_tokens,
+                        std::uint32_t k, Q8Input* q,
+                        std::string* error_msg) const {
+  q->x = x;
+  q->data = nullptr;
+  q->n = n_tokens;
+  q->k = k;
+  if (n_tokens > kVecBatch) {
+    return true;  // the tiled path quantizes per call
+  }
+  // Two slots alternate, so an input stays valid across one other
+  // quantization; captured graphs replay the same alternation.
+  void* slot = s_.x_q8[q8_slot_];
+  q8_slot_ ^= 1u;
+  if (qfn_mmq_quantize_q8_1(x, slot, static_cast<int>(n_tokens),
+                            static_cast<int>(k), stream_) != 0) {
+    AssignError(error_msg, "activation quantization failed");
+    return false;
+  }
+  q->data = slot;
+  return true;
+}
+
+bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
+                     std::string* error_msg) const {
+  if (w.type == GgmlType::kQ8_0 && q.data != nullptr) {
+    if (w.cols != q.k) {
+      AssignError(error_msg, "quantized input width mismatch");
+      return false;
+    }
+    if (qfn_mmq_q8_0_dense_vec_preq(w.data, nullptr, q.data, out,
+                                    static_cast<int>(w.rows),
+                                    static_cast<int>(q.n),
+                                    static_cast<int>(w.cols), stream_) != 0) {
+      AssignError(error_msg, "Q8_0 GEMV failed");
+      return false;
+    }
+    return true;
+  }
+  return Dense(w, q.x, out, q.n, error_msg);
+}
+
+bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
+                          const float* x, float* out, std::uint32_t n_tokens,
+                          std::string* error_msg) const {
+  // One single-token launch computes both projections and the SwiGLU (the
+  // tier fuses the gate for one column only).
+  if (n_tokens == 1 && up.type == GgmlType::kQ8_0 &&
+      gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
+      up.cols == gate.cols) {
+    Q8Input xq;
+    if (!Quantize(x, n_tokens, up.cols, &xq, error_msg)) {
+      return false;
+    }
+    if (qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, xq.data, out,
+                                    static_cast<int>(up.rows),
+                                    static_cast<int>(n_tokens),
+                                    static_cast<int>(up.cols), stream_) != 0) {
+      AssignError(error_msg, "gated Q8_0 GEMV failed");
+      return false;
+    }
+    return true;
+  }
+  // Swiglu is in place over its first operand.
+  if (!Dense(gate, x, out, n_tokens, error_msg) ||
+      !Dense(up, x, s_.shexp_gate, n_tokens, error_msg)) {
+    return false;
+  }
+  Swiglu(out, s_.shexp_gate, static_cast<std::size_t>(n_tokens) * up.rows,
+         stream_);
+  return true;
+}
+
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
   if (w.type == GgmlType::kQ8_0) {
-    const int rc =
-        n_tokens > kVecBatch
-            ? qfn_mmq_q8_0_dense(w.data, x, out, static_cast<int>(w.rows),
-                                 static_cast<int>(n_tokens),
-                                 static_cast<int>(w.cols), stream_)
-            : qfn_mmq_q8_0_dense_vec(w.data, x, out, static_cast<int>(w.rows),
-                                     static_cast<int>(n_tokens),
-                                     static_cast<int>(w.cols), stream_);
-    if (rc != 0) {
+    if (n_tokens <= kVecBatch) {
+      Q8Input q;
+      return Quantize(x, n_tokens, w.cols, &q, error_msg) &&
+             Dense(w, q, out, error_msg);
+    }
+    if (qfn_mmq_q8_0_dense(w.data, x, out, static_cast<int>(w.rows),
+                           static_cast<int>(n_tokens),
+                           static_cast<int>(w.cols), stream_) != 0) {
       AssignError(error_msg, "Q8_0 GEMM failed");
       return false;
     }
@@ -375,12 +495,52 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
 }
 
 void Executor::RoutedHints(const DeviceTensor& w, std::uint32_t n_tokens) const {
-  // No expert bucket exceeds the token count, and the mean bucket
-  // (n_tokens * top_k / experts) is far smaller than the chunk-width
-  // default tile, so bound the column grid and ask for a narrow tile.
+  // The column grid is bounded by the largest expert bucket and the tile
+  // width fitted to the whole distribution (see RouteHints); the fallback
+  // bound is the token count with a tile near twice the mean bucket.
+  if (routed_max_rows_ > 0) {
+    qfn_mmq_set_routed_max_expert_rows(static_cast<int>(routed_max_rows_));
+    qfn_mmq_set_routed_tile_cols(routed_tile_cols_);
+    return;
+  }
   qfn_mmq_set_routed_max_expert_rows(static_cast<int>(n_tokens));
   qfn_mmq_set_routed_tile_cols(
       RoutedTileCols(n_tokens, config().num_experts_used, w.experts));
+}
+
+bool Executor::RouteHints(std::uint32_t n_tokens, std::string* error_msg) const {
+  // Every column tile past an expert's bucket still costs a dispatch and a
+  // full shared-memory reservation, so the grid is cut to the real largest
+  // bucket: the per-expert counts come back to the host (one short stall
+  // per layer), which also lets the tile width follow the distribution.
+  const Config& c = config();
+  routed_max_rows_ = 0;
+  if (n_tokens <= 4 * kVecBatch) {
+    return true;
+  }
+  ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts,
+               c.num_experts_used, stream_);
+  if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
+                            c.num_experts * sizeof(std::uint32_t),
+                            hipMemcpyDeviceToHost, stream_),
+             "expert counts download", error_msg) ||
+      !Check(hipStreamSynchronize(stream_), "expert counts", error_msg)) {
+    return false;
+  }
+  std::uint32_t max_rows = 0;
+  for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+    max_rows = std::max(max_rows, counts_host_[e]);
+  }
+  routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
+  if (const char* env = std::getenv("QFN_MOE_GRID_ROWS")) {
+    routed_max_rows_ = static_cast<std::uint32_t>(std::atoi(env));
+  }
+  routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
+      counts_host_, static_cast<int>(c.num_experts));
+  if (const char* env = std::getenv("QFN_MOE_TILE")) {
+    routed_tile_cols_ = std::atoi(env);
+  }
+  return true;
 }
 
 bool Executor::Experts(const DeviceTensor& w, const float* x,
@@ -535,8 +695,10 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
     }
   };
   tr(0, s_.ple_emb, static_cast<std::size_t>(n) * c.PleEmbeddingDim());
-  if (!Dense(l.ple_key, s_.ple_emb, s_.ple_key, n, error_msg) ||
-      !Dense(l.ple_value, s_.ple_emb, s_.ple_value, n, error_msg)) {
+  Q8Input emb;
+  if (!Quantize(s_.ple_emb, n, c.PleEmbeddingDim(), &emb, error_msg) ||
+      !Dense(l.ple_key, emb, s_.ple_key, error_msg) ||
+      !Dense(l.ple_value, emb, s_.ple_value, error_msg)) {
     return false;
   }
   tr(1, s_.ple_key, static_cast<std::size_t>(n) * hc_dim);
@@ -568,12 +730,31 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                                std::uint32_t n_tokens, bool speculative,
                                std::string* error_msg) const {
   const Config& c = config();
-  if (!Dense(l.ssm_qkv, x, s_.qkv, n_tokens, error_msg) ||
-      !Dense(l.ssm_gate, x, s_.z, n_tokens, error_msg) ||
-      !Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
+  const std::uint32_t channels = c.SsmConvChannels();
+  const float* qkv = s_.qkv;
+  const float* z = s_.z;
+  std::uint32_t qkv_stride = channels;
+  std::uint32_t z_stride = c.SsmValueDim();
+  if (!l.ssm_in.empty()) {
+    // One GEMV yields [qkv | z] per row.
+    if (!Dense(l.ssm_in, x, s_.qkvz, n_tokens, error_msg)) {
+      return false;
+    }
+    qkv = s_.qkvz;
+    z = s_.qkvz + channels;
+    qkv_stride = z_stride = l.ssm_in.rows;
+  } else {
+    Q8Input xq;
+    if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
+        !Dense(l.ssm_qkv, xq, s_.qkv, error_msg) ||
+        !Dense(l.ssm_gate, xq, s_.z, error_msg)) {
+      return false;
+    }
+  }
+  if (!Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
     return false;
   }
-  GatedDeltaNet(s_.qkv, s_.z, s_.alpha_beta, l.ssm_conv1d.f32(),
+  GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
                 l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
                 s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
                 speculative ? s.state_snapshots : nullptr,
@@ -585,40 +766,49 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
 
 bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          const float* x, float* out, std::uint32_t n_tokens,
-                         std::uint32_t start_pos, std::uint32_t max_context,
-                         bool sparse, std::string* error_msg) const {
+                         const std::uint32_t* pos,
+                         const std::uint32_t* first_block,
+                         std::uint32_t start_pos, std::uint32_t pool_grid,
+                         std::uint32_t max_context, bool sparse,
+                         std::string* error_msg) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
-  if (!Dense(l.attn_q, x, s_.qg, n_tokens, error_msg) ||
-      !Dense(l.attn_k, x, s_.k, n_tokens, error_msg) ||
-      !Dense(l.attn_v, x, s_.v, n_tokens, error_msg)) {
-    return false;
+  if (!l.attn_qkv.empty()) {
+    // One GEMV yields [q|gate ; k ; v] per row; the unpack splits it.
+    if (!Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
+      return false;
+    }
+    UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
+                n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
+  } else {
+    Q8Input xq;
+    if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
+        !Dense(l.attn_q, xq, s_.qg, error_msg) ||
+        !Dense(l.attn_k, xq, s_.k, error_msg) ||
+        !Dense(l.attn_v, xq, s_.v, error_msg)) {
+      return false;
+    }
+    UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
+                nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
   }
-  UnpackQGate(s_.qg, s_.q, s_.attn_gate, n_tokens, c.num_heads, c.head_dim,
-              stream_);
   RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
               c.head_dim, 1, c.rms_eps, stream_);
   RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
               c.head_dim, 1, c.rms_eps, stream_);
-  Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, start_pos,
+  Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
        c.rope_theta, stream_);
-  Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, start_pos,
+  Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
        c.rope_theta, stream_);
-  StoreKv(s_.k, s.k_cache, n_tokens, kv_row, start_pos, stream_);
-  StoreKv(s_.v, s.v_cache, n_tokens, kv_row, start_pos, stream_);
+  StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
+  StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
 
   // Raw indexer keys are always cached: a later chunk past the budget
   // pools them into block keys. The draft block keeps no indexer cache.
-  if (s.index_k != nullptr &&
-      (!Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg) ||
-       !Check(hipMemcpyAsync(s.index_k + static_cast<std::size_t>(start_pos) *
-                                             c.indexer_head_dim,
-                             s_.ik,
-                             static_cast<std::size_t>(n_tokens) *
-                                 c.indexer_head_dim * sizeof(float),
-                             hipMemcpyDeviceToDevice, stream_),
-              "indexer key store", error_msg))) {
-    return false;
+  if (s.index_k != nullptr) {
+    if (!Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg)) {
+      return false;
+    }
+    StoreRows(s_.ik, s.index_k, n_tokens, c.indexer_head_dim, pos, stream_);
   }
   const std::uint32_t* mask = nullptr;
   if (sparse) {
@@ -629,15 +819,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 n_tokens * c.indexer_heads, c.indexer_head_dim, 1, c.rms_eps,
                 stream_);
     Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
-         start_pos, c.rope_theta, stream_);
-    const std::uint32_t complete = (start_pos + n_tokens) / c.compress_ratio;
-    if (complete > s.blocks) {
-      PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, s.blocks,
-                        complete - s.blocks, c.compress_ratio,
-                        c.indexer_head_dim, c.rotary_dim, c.rope_theta,
-                        c.rms_eps, stream_);
-      s.blocks = complete;
-    }
+         pos, c.rope_theta, stream_);
+    PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k,
+                      first_block, pos, n_tokens, pool_grid,
+                      c.compress_ratio, c.indexer_head_dim, c.rotary_dim,
+                      c.rope_theta, c.rms_eps, stream_);
     const std::uint32_t max_blocks =
         (max_context + c.compress_ratio - 1) / c.compress_ratio;
     for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += select_chunk_) {
@@ -645,21 +831,22 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       SelectBlocks(s_.iq + static_cast<std::size_t>(t0) * c.indexer_heads *
                               c.indexer_head_dim,
                    s.block_k, s_.mask + static_cast<std::size_t>(t0) * mask_words_,
-                   s_.scores, n, start_pos + t0, c.indexer_heads,
-                   c.indexer_head_dim, c.compress_ratio,
-                   c.indexer_top_k / c.compress_ratio, mask_words_, max_blocks,
-                   stream_);
+                   s_.scores, n, pos, t0, c.indexer_heads, c.indexer_head_dim,
+                   c.compress_ratio, c.indexer_top_k / c.compress_ratio,
+                   mask_words_, max_blocks, stream_);
     }
     mask = s_.mask;
   }
+  // Wide batches score the dense window with GEMMs (never inside a graph:
+  // the kv extent is a host value); the per-token kernel covers the rest.
   if (n_tokens > kVecBatch && start_pos + n_tokens <= s_.score_kv) {
     if (!BatchedAttention(s, mask, n_tokens, start_pos, error_msg)) {
       return false;
     }
   } else {
     rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
-                    n_tokens, start_pos, c.num_heads, c.num_kv_heads,
-                    c.head_dim, c.compress_ratio, stream_);
+                    n_tokens, pos, c.num_heads, c.num_kv_heads, c.head_dim,
+                    c.compress_ratio, stream_);
   }
   SigmoidMul(s_.ctx, s_.attn_gate,
              static_cast<std::size_t>(n_tokens) * c.AttentionQDim(), stream_);
@@ -721,6 +908,9 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
+  if (!RouteHints(n_tokens, error_msg)) {
+    return false;
+  }
   if (!ExpertPair(l.ffn_gate_exps, l.ffn_up_exps, x, s_.ids, s_.gate_e,
                   s_.up_e, n_tokens, used, error_msg)) {
     return false;
@@ -733,13 +923,9 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     return false;
   }
   // Shared expert, gated by the last router row.
-  if (!Dense(l.shexp_gate, x, s_.shexp_gate, n_tokens, error_msg) ||
-      !Dense(l.shexp_up, x, s_.shexp_up, n_tokens, error_msg)) {
-    return false;
-  }
-  Swiglu(s_.shexp_gate, s_.shexp_up,
-         static_cast<std::size_t>(n_tokens) * c.shared_expert_ff, stream_);
-  if (!Dense(l.shexp_down, s_.shexp_gate, s_.shexp_out, n_tokens, error_msg)) {
+  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                  error_msg) ||
+      !Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg)) {
     return false;
   }
   MoeEpilogue(s_.down_e, s_.weights, s_.shexp_out, s_.router + c.num_experts,
@@ -748,18 +934,76 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 }
 
 bool Executor::Head(const DeviceMixer& head, const float* res,
-                    std::uint32_t n_rows, float* logits_host,
+                    std::uint32_t n_rows, std::uint32_t vocab_rows,
                     std::string* error_msg) const {
-  const Config& c = config();
+  // The output matrix is [vocab][hidden], so its leading rows form a
+  // contiguous smaller head.
+  DeviceTensor output = model_->output();
+  output.rows = std::min(output.rows, vocab_rows);
   if (!HcMix(head, res, nullptr, s_.mixed, nullptr, n_rows, error_msg) ||
-      !Dense(model_->output(), s_.mixed, s_.logits, n_rows, error_msg)) {
+      !Dense(output, s_.mixed, s_.logits, n_rows, error_msg)) {
     return false;
   }
-  return Check(hipMemcpyAsync(logits_host, s_.logits,
-                              static_cast<std::size_t>(n_rows) * c.vocab_size *
+  return Check(hipMemcpyAsync(logits_host_, s_.logits,
+                              static_cast<std::size_t>(n_rows) * output.rows *
                                   sizeof(float),
                               hipMemcpyDeviceToHost, stream_),
                "logits download", error_msg);
+}
+
+bool Executor::Run(Session& session, std::uint64_t key, bool graph,
+                   const std::function<bool()>& body,
+                   std::string* error_msg) const {
+  // A batch shape runs eagerly once before it is captured: the first pass
+  // grows the GEMM tier's arena, which capture forbids.
+  if (graph && session.warmed_.contains(key)) {
+    hipGraphExec_t exec = nullptr;
+    if (const auto it = session.graphs_.find(key); it != session.graphs_.end()) {
+      exec = it->second;
+    } else {
+      hipGraph_t captured = nullptr;
+      if (!Check(hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal),
+                 "graph capture", error_msg)) {
+        return false;
+      }
+      const bool ok = body();
+      if (!Check(hipStreamEndCapture(stream_, &captured), "graph capture end",
+                 error_msg) ||
+          !ok) {
+        if (captured != nullptr) {
+          (void)hipGraphDestroy(captured);
+        }
+        return false;
+      }
+      const bool instantiated =
+          Check(hipGraphInstantiate(&exec, captured, nullptr, nullptr, 0),
+                "graph instantiate", error_msg);
+      (void)hipGraphDestroy(captured);
+      if (!instantiated) {
+        return false;
+      }
+      session.graphs_.emplace(key, exec);
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!Check(hipGraphLaunch(exec, stream_), "graph launch", error_msg)) {
+      return false;
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    if (std::getenv("QFN_GRAPH_DEBUG") != nullptr) {
+      (void)hipStreamSynchronize(stream_);
+      const auto t2 = std::chrono::steady_clock::now();
+      std::fprintf(stderr, "graph key %llx launch %.2f ms run %.2f ms\n",
+                   static_cast<unsigned long long>(key),
+                   std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                   std::chrono::duration<double, std::milli>(t2 - t1).count());
+    }
+  } else {
+    if (!body()) {
+      return false;
+    }
+    session.warmed_.insert(key);
+  }
+  return Check(hipStreamSynchronize(stream_), "forward", error_msg);
 }
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
@@ -789,13 +1033,14 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const std::uint32_t start_pos = session.position_;
   session.spec_base_ = start_pos;
   session.spec_tokens_ = speculative ? n : 0;
-  if (!Check(hipMemcpyAsync(s_.tokens, tokens.data(), n * sizeof(std::int32_t),
-                            hipMemcpyHostToDevice, stream_),
-             "token upload", error_msg)) {
-    return false;
-  }
-  EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-              s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
+  // Everything the launched work reads from the host sits in pinned
+  // buffers the graph nodes point at: tokens, the control block (positions
+  // the kernels read on the device) and the n-gram rows.
+  std::copy(tokens.begin(), tokens.end(), tokens_host_);
+  control_host_->position = start_pos;
+  control_host_->blocks = session.blocks_;
+  control_host_->mtp_position = session.mtp_.position;
+  control_host_->hidden_row = -1;
   if (c.ple_layer >= 0) {
     if (ngram_ == nullptr) {
       AssignError(error_msg, "n-gram table is not open");
@@ -803,11 +1048,76 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     }
     PleFetch(session, tokens, speculative);
   }
-
   // Sparse selection only changes the result once a query can see more
   // than the token budget; every layer of this model shares one ratio.
   const bool sparse =
       c.compress_ratio > 0 && start_pos + n > c.indexer_top_k;
+  const std::uint32_t complete =
+      c.compress_ratio > 0 ? (start_pos + n) / c.compress_ratio : 0;
+  const std::uint32_t pool_grid =
+      sparse && complete > session.blocks_ ? complete - session.blocks_ : 0;
+  // Decode-sized batches replay as graphs; a pooling backlog (the first
+  // batch past the budget) needs the wider eager grid.
+  const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
+  const bool graph = graphs_enabled_ && trace_ == nullptr && n <= kVecBatch &&
+                     pool_grid <= graph_pool_grid;
+  const std::uint64_t key = static_cast<std::uint64_t>(n) |
+                            (static_cast<std::uint64_t>(n_logits) << 16) |
+                            (static_cast<std::uint64_t>(speculative) << 32) |
+                            (static_cast<std::uint64_t>(sparse) << 33);
+  const auto body = [&] {
+    return ForwardBody(session, n, n_logits, speculative, sparse, start_pos,
+                       graph ? graph_pool_grid : pool_grid, error_msg);
+  };
+  // A replayed graph copies the n-gram rows without passing through Ple,
+  // so the read has to be complete before the launch.
+  if (graph && session.graphs_.contains(key) && ple_read_.valid() &&
+      !ple_read_.get()) {
+    AssignError(error_msg, "n-gram table read failed");
+    return false;
+  }
+  if (!Run(session, key, graph, body, error_msg)) {
+    return false;
+  }
+  if (n_logits > 0) {
+    std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,
+                logits);
+  }
+  if (trace_ != nullptr) {
+    std::vector<float> h(static_cast<std::size_t>(c.num_layers) * 8 + 16);
+    (void)hipMemcpy(h.data(), trace_, h.size() * 4, hipMemcpyDeviceToHost);
+    const float* pl = h.data() + static_cast<std::size_t>(c.num_layers) * 8;
+    std::fprintf(stderr, "trace ple emb %.5f %.5f key %.5f %.5f value %.5f %.5f keyn %.5f %.5f query %.5f %.5f gated %.5f %.5f conv %.5f %.5f res %.5f %.5f\n",
+                 pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], pl[6], pl[7], pl[8], pl[9], pl[10], pl[11], pl[12], pl[13], pl[14], pl[15]);
+    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      std::fprintf(stderr, "trace %u mixed %.5f %.5f attn %.5f %.5f ffn %.5f %.5f res %.5f %.5f\n", il,
+                   h[il * 8], h[il * 8 + 1], h[il * 8 + 2], h[il * 8 + 3], h[il * 8 + 4], h[il * 8 + 5], h[il * 8 + 6], h[il * 8 + 7]);
+    }
+  }
+  session.position_ += n;
+  if (sparse) {
+    session.blocks_ = complete;
+  }
+  return true;
+}
+
+bool Executor::ForwardBody(Session& session, std::uint32_t n,
+                           std::uint32_t n_logits, bool speculative,
+                           bool sparse, std::uint32_t start_pos,
+                           std::uint32_t pool_grid,
+                           std::string* error_msg) const {
+  const Config& c = config();
+  if (!Check(hipMemcpyAsync(session.control_, control_host_,
+                            sizeof(Session::Control), hipMemcpyHostToDevice,
+                            stream_),
+             "control upload", error_msg) ||
+      !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
+                            hipMemcpyHostToDevice, stream_),
+             "token upload", error_msg)) {
+    return false;
+  }
+  EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
+              s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
   const auto& layers = model_->layers();
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
   for (std::uint32_t il = 0; il < c.num_layers; ++il) {
@@ -826,7 +1136,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
         return false;
       }
     } else if (!Attention(l, session.attention_[il], s_.mixed, s_.block_out, n,
-                          start_pos, session.max_context_, sparse, error_msg)) {
+                          &session.control_->position,
+                          &session.control_->blocks, start_pos, pool_grid,
+                          session.max_context_, sparse, error_msg)) {
       return false;
     }
     if (trace_ != nullptr) {
@@ -869,7 +1181,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     if (!HcMix(head, nullptr, s_.xn + skip * c.HcDim(), s_.mixed, nullptr,
                n_logits, error_msg) ||
         !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg) ||
-        !Check(hipMemcpyAsync(logits, s_.logits,
+        !Check(hipMemcpyAsync(logits_host_, s_.logits,
                               static_cast<std::size_t>(n_logits) * c.vocab_size *
                                   sizeof(float),
                               hipMemcpyDeviceToHost, stream_),
@@ -877,21 +1189,6 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
       return false;
     }
   }
-  if (!Check(hipStreamSynchronize(stream_), "forward", error_msg)) {
-    return false;
-  }
-  if (trace_ != nullptr) {
-    std::vector<float> h(static_cast<std::size_t>(c.num_layers) * 8 + 16);
-    (void)hipMemcpy(h.data(), trace_, h.size() * 4, hipMemcpyDeviceToHost);
-    const float* pl = h.data() + static_cast<std::size_t>(c.num_layers) * 8;
-    std::fprintf(stderr, "trace ple emb %.5f %.5f key %.5f %.5f value %.5f %.5f keyn %.5f %.5f query %.5f %.5f gated %.5f %.5f conv %.5f %.5f res %.5f %.5f\n",
-                 pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], pl[6], pl[7], pl[8], pl[9], pl[10], pl[11], pl[12], pl[13], pl[14], pl[15]);
-    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-      std::fprintf(stderr, "trace %u mixed %.5f %.5f attn %.5f %.5f ffn %.5f %.5f res %.5f %.5f\n", il,
-                   h[il * 8], h[il * 8 + 1], h[il * 8 + 2], h[il * 8 + 3], h[il * 8 + 4], h[il * 8 + 5], h[il * 8 + 6], h[il * 8 + 7]);
-    }
-  }
-  session.position_ += n;
   return true;
 }
 
@@ -941,9 +1238,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   session.position_ = session.spec_base_ + keep;
   // Pooled block keys past the kept prefix are stale; they are rebuilt
   // from the raw keys when needed.
-  for (auto& a : session.attention_) {
-    a.blocks = std::min(a.blocks, session.position_ / c.compress_ratio);
-  }
+  session.blocks_ = std::min(session.blocks_, session.position_ / c.compress_ratio);
   return Check(hipStreamSynchronize(stream_), "rollback", error_msg);
 }
 
@@ -963,17 +1258,39 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP batch outside the kept hidden rows");
     return false;
   }
-  const DeviceLayer& l = model_->mtp();
   const std::uint32_t pos = session.mtp_.position;
   if (pos + n > session.max_context_) {
     AssignError(error_msg, "MTP context is full");
     return false;
   }
+  std::copy(tokens.begin(), tokens.end(), tokens_host_);
+  control_host_->position = session.position_;
+  control_host_->blocks = session.blocks_;
+  control_host_->mtp_position = pos;
+  control_host_->hidden_row = hidden_row;
+  const bool graph = graphs_enabled_ && trace_ == nullptr && n <= kVecBatch;
+  const std::uint64_t key = static_cast<std::uint64_t>(n) |
+                            (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
+                            (std::uint64_t{1} << 40);
+  const auto body = [&] { return MtpBody(session, n, pos, error_msg); };
+  if (!Run(session, key, graph, body, error_msg)) {
+    return false;
+  }
+  std::copy_n(logits_host_, options_.draft_rows, logits);
+  session.mtp_.position = pos + n;
+  return true;
+}
+
+bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
+                       std::string* error_msg) const {
+  const Config& c = config();
+  const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
-  const float* h = hidden_row >= 0
-                       ? s_.hc_keep + static_cast<std::size_t>(hidden_row) * hc_dim
-                       : session.mtp_.h;
-  if (!Check(hipMemcpyAsync(s_.tokens, tokens.data(), n * sizeof(std::int32_t),
+  if (!Check(hipMemcpyAsync(session.control_, control_host_,
+                            sizeof(Session::Control), hipMemcpyHostToDevice,
+                            stream_),
+             "control upload", error_msg) ||
+      !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
                             hipMemcpyHostToDevice, stream_),
              "token upload", error_msg)) {
     return false;
@@ -982,7 +1299,11 @@ bool Executor::MtpForward(Session& session,
               s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
   RmsNormRows(s_.mtp_embd, l.nextn_enorm.f32(), s_.mtp_embd, n, c.hidden_size,
               1, c.rms_eps, stream_);
-  RmsNormRows(h, l.nextn_hnorm.f32(), s_.mtp_h, n, hc_dim, c.hc_count,
+  // The hidden input: kept trunk rows from `hidden_row`, or the block's
+  // own carried residual.
+  MtpHidden(s_.hc_keep, session.mtp_.h, &session.control_->hidden_row,
+            s_.mtp_h, n, hc_dim, stream_);
+  RmsNormRows(s_.mtp_h, l.nextn_hnorm.f32(), s_.mtp_h, n, hc_dim, c.hc_count,
               c.rms_eps, stream_);
   MtpConcat(s_.mtp_embd, s_.mtp_h, s_.mtp_concat, n, c.hidden_size, c.hc_count,
             stream_);
@@ -995,9 +1316,11 @@ bool Executor::MtpForward(Session& session,
   Session::AttentionState attn;
   attn.k_cache = session.mtp_.k_cache;
   attn.v_cache = session.mtp_.v_cache;
+  // The draft block's attention runs at its own position.
   if (!HcMix(l.hc_attn, s_.mtp_res, nullptr, s_.mixed, s_.inject, n, error_msg) ||
-      !Attention(l, attn, s_.mixed, s_.block_out, n, pos, session.max_context_,
-                 false, error_msg)) {
+      !Attention(l, attn, s_.mixed, s_.block_out, n,
+                 &session.control_->mtp_position, nullptr, pos, 0,
+                 session.max_context_, false, error_msg)) {
     return false;
   }
   HcCombine(s_.mtp_res, s_.block_out, s_.inject, inject_parts_,
@@ -1016,12 +1339,7 @@ bool Executor::MtpForward(Session& session,
              "MTP hidden carry", error_msg)) {
     return false;
   }
-  if (!Head(l.nextn_head, last, 1, logits, error_msg) ||
-      !Check(hipStreamSynchronize(stream_), "draft forward", error_msg)) {
-    return false;
-  }
-  session.mtp_.position = pos + n;
-  return true;
+  return Head(l.nextn_head, last, 1, options_.draft_rows, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

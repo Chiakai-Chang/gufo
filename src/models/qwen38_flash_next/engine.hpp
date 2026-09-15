@@ -36,6 +36,10 @@ struct ModelOptions {
   std::uint32_t max_batch = 512;
   /// Tokens the draft block proposes per speculative cycle.
   std::uint32_t max_draft_tokens = 3;
+  /// Vocabulary prefix the draft block scores (0 = full). Token ids follow
+  /// merge order, so a prefix holds the frequent tokens; verification
+  /// always uses the full head, so only which draft is proposed changes.
+  std::uint32_t draft_vocab = 0;
 };
 
 class Session;
@@ -138,7 +142,8 @@ private:
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg);
   bool DraftCatchUp(std::int32_t next_token, std::string* error_msg);
-  [[nodiscard]] std::int32_t Argmax(const float* row) const noexcept;
+  [[nodiscard]] std::int32_t Argmax(const float* row,
+                                    std::size_t count = 0) const noexcept;
 
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;

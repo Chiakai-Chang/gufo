@@ -7,10 +7,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <memory>
 #include <span>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
@@ -53,7 +56,14 @@ private:
     __half* v_cache{nullptr};   ///< [max_context][kv_heads*d]
     float* index_k{nullptr};    ///< [max_context][indexer_dim] raw
     float* block_k{nullptr};    ///< [max_context/ratio][indexer_dim]
-    std::uint32_t blocks{0};    ///< pooled block count
+  };
+  /// Per-launch values the kernels read from device memory, so a captured
+  /// graph replays at any position.
+  struct Control {
+    std::uint32_t position;      ///< first position of the trunk batch
+    std::uint32_t blocks;        ///< indexer blocks pooled so far
+    std::uint32_t mtp_position;  ///< first position of the draft batch
+    std::int32_t hidden_row;     ///< kept trunk row the draft reads, or -1
   };
   struct MtpState {
     __half* k_cache{nullptr};
@@ -74,6 +84,12 @@ private:
   std::uint32_t spec_base_{0};    ///< position before the speculative batch
   std::uint32_t spec_tokens_{0};  ///< tokens of the pending speculative batch
   MtpState mtp_;
+  Control* control_{nullptr};
+  std::uint32_t blocks_{0};  ///< host shadow of Control::blocks
+  /// Captured decode graphs by batch shape, and the shapes that ran eagerly
+  /// once (the GEMM tier's arena must be grown before capture).
+  std::unordered_map<std::uint64_t, hipGraphExec_t> graphs_;
+  std::unordered_set<std::uint64_t> warmed_;
   std::vector<void*> allocations_;
 };
 
@@ -87,6 +103,10 @@ public:
     std::uint32_t max_logit_rows{64};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
     std::uint32_t max_speculative{8};
+    /// Rows of the output head the draft block scores (0 = every row).
+    /// Token ids follow merge order, so a leading prefix holds the frequent
+    /// tokens: the FR-Spec idea, as ds4 applies it to this model.
+    std::uint32_t draft_rows{0};
   };
 
   ~Executor();
@@ -119,7 +139,8 @@ public:
   /// MTP position. The hidden input of token i is the trunk residual of row
   /// `hidden_row + i` of the last Forward batch, or, with hidden_row < 0
   /// (single token), the draft block's own residual from the previous call.
-  /// `logits` receives the last token's draft logits (vocab floats, host).
+  /// `logits` receives the last token's draft logits (DraftRows() floats,
+  /// host).
   [[nodiscard]] bool MtpForward(Session& session,
                                 std::span<const std::int32_t> tokens,
                                 std::int32_t hidden_row, float* logits,
@@ -143,13 +164,35 @@ public:
     return options_.max_speculative;
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
+  [[nodiscard]] std::uint32_t DraftRows() const noexcept {
+    return options_.draft_rows;
+  }
 
 private:
   Executor() = default;
 
+  /// An activation batch quantized once for the decode GEMVs; `data` is
+  /// null when the batch is wide enough for the tiled path.
+  struct Q8Input {
+    const float* x;
+    const void* data;
+    std::uint32_t n;
+    std::uint32_t k;
+  };
+  bool Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
+                Q8Input* q, std::string* error_msg) const;
+  bool Dense(const DeviceTensor& w, const Q8Input& q, float* out,
+             std::string* error_msg) const;
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
+  /// out = (up . x) * silu(gate . x); s_.shexp_gate is scratch.
+  bool GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
+                  const float* x, float* out, std::uint32_t n_tokens,
+                  std::string* error_msg) const;
   void RoutedHints(const DeviceTensor& w, std::uint32_t n_tokens) const;
+  /// Reads the routing of the current batch back and derives the tile
+  /// hints for its expert GEMMs (tiled batches only).
+  bool RouteHints(std::uint32_t n_tokens, std::string* error_msg) const;
   /// Gate and up projections over the same routing.
   bool ExpertPair(const DeviceTensor& a, const DeviceTensor& b, const float* x,
                   const std::int32_t* ids, float* out_a, float* out_b,
@@ -176,14 +219,30 @@ private:
   bool BatchedAttention(const Session::AttentionState& s,
                         const std::uint32_t* mask, std::uint32_t n_tokens,
                         std::uint32_t start_pos, std::string* error_msg) const;
+  /// `pos`/`first_block` are device values; `start_pos` and `pool_grid`
+  /// are their host-side counterparts for the eager-only decisions.
   bool Attention(const DeviceLayer& l, Session::AttentionState& s,
                  const float* x, float* out, std::uint32_t n_tokens,
-                 std::uint32_t start_pos, std::uint32_t max_context,
-                 bool sparse, std::string* error_msg) const;
+                 const std::uint32_t* pos, const std::uint32_t* first_block,
+                 std::uint32_t start_pos, std::uint32_t pool_grid,
+                 std::uint32_t max_context, bool sparse,
+                 std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg) const;
+  /// Logits over the first `vocab_rows` tokens of `n_rows` rows land in
+  /// logits_host_.
   bool Head(const DeviceMixer& head, const float* res, std::uint32_t n_rows,
-            float* logits_host, std::string* error_msg) const;
+            std::uint32_t vocab_rows, std::string* error_msg) const;
+  /// Enqueues one trunk batch (control and token upload through logits).
+  bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
+                   bool speculative, bool sparse, std::uint32_t start_pos,
+                   std::uint32_t pool_grid, std::string* error_msg) const;
+  bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
+               std::string* error_msg) const;
+  /// Runs `body` eagerly, or as the session's captured graph for `key`
+  /// when `graph` is set, and waits for it.
+  bool Run(Session& session, std::uint64_t key, bool graph,
+           const std::function<bool()>& body, std::string* error_msg) const;
 
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
@@ -196,6 +255,7 @@ private:
   struct Scratch {
     std::int32_t* tokens;
     void* x_half;  ///< activations narrowed to the weight's 16-bit type
+    void* x_q8[2];  ///< Q8_1 activations of a decode batch, alternating
     float* res;
     float* xn;
     float* lo;
@@ -206,6 +266,7 @@ private:
     // linear attention
     float* qkv;
     float* z;
+    float* qkvz;  ///< [t][qkv | z] from the stacked projection
     float* alpha_beta;
     float* conv_scratch;
     float* qn;
@@ -213,7 +274,7 @@ private:
     float* gdn_raw;
     float* gdn_out;
     // attention
-    float* qg;
+    float* qg;  ///< [t][q|gate (; k ; v)]
     float* q;
     float* attn_gate;
     float* k;
@@ -239,6 +300,7 @@ private:
     // moe
     float* router;
     std::int32_t* ids;
+    std::uint32_t* expert_counts;
     float* weights;
     float* gate_e;
     float* up_e;
@@ -264,8 +326,17 @@ private:
   float* host_emb_{nullptr};
   mutable std::vector<std::uint32_t> host_rows_;
   mutable std::future<bool> ple_read_;
+  // Pinned host staging the launched (or captured) work reads and writes.
+  Session::Control* control_host_{nullptr};
+  std::int32_t* tokens_host_{nullptr};
+  std::uint32_t* counts_host_{nullptr};
+  mutable std::uint32_t routed_max_rows_{0};  ///< 0 = no readback yet
+  mutable int routed_tile_cols_{0};
+  float* logits_host_{nullptr};
+  bool graphs_enabled_{true};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
+  mutable unsigned q8_slot_{0};
 };
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

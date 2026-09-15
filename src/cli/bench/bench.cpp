@@ -101,6 +101,10 @@ void PrintBenchHelp(std::string_view program_name) {
   parser.AddOption("", "--spec-draft-n-max", "N",
                    "llama.cpp-compatible alias for --draft-tokens",
                    "Speculative", &opt.draft_tokens);
+  parser.AddOption("", "--draft-vocab", "N",
+                   "Qwen3.8-Flash-Next: score MTP drafts over the first N "
+                   "token ids only (default: 0 = full vocabulary)",
+                   "Speculative", &opt.draft_vocab);
 
   parser.AddOption("", "--min-draft-tokens", "N",
                    "Adaptive draft floor (default: 1)", "Speculative",
@@ -798,7 +802,10 @@ int RunQwen38FlashNextBenchmark(
       qfn::ModelOptions{
           .max_context = static_cast<std::uint32_t>(required_context),
           .mtp_model_path = mtp ? options.mtp_model_path : "",
+          .max_batch = static_cast<std::uint32_t>(
+              std::max<std::size_t>(1, options.batch_size)),
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
+          .draft_vocab = options.draft_vocab,
       },
       &error);
   if (model == nullptr) {
@@ -1076,6 +1083,9 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
         return true;
       });
 
+  parser.AddOption("-b", "--batch-size", "N",
+                   "Qwen3.8-Flash-Next: prefill chunk size (default: 512)",
+                   "Workload", &opt.batch_size);
   parser.AddOption(
       "-r", "--repetitions", "N",
       "Repetitions per test point for variance reduction (default: 1)",
@@ -1172,6 +1182,10 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
   parser.AddOption("", "--spec-draft-n-min", "N",
                    "llama.cpp-compatible alias for --min-draft-tokens",
                    "Speculative", &opt.min_draft_tokens);
+  parser.AddOption("", "--draft-vocab", "N",
+                   "Qwen3.8-Flash-Next: score MTP drafts over the first N "
+                   "token ids only (default: 0 = full vocabulary)",
+                   "Speculative", &opt.draft_vocab);
   parser.AddOption(
       "", "--spec-draft-p-min", "P",
       "Stop at the first draft token below confidence P; 0 disables "

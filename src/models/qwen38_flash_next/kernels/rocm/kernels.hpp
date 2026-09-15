@@ -110,7 +110,10 @@ void PleInject(float* res, const float* gated, const float* conv,
 /// back to any accepted prefix.
 /// Scratch: `conv_scratch` ((n_tokens + kernel) * channels), `qn`/`kn`
 /// (n_tokens * k_heads * d), `raw` (n_tokens * v_heads * d).
-void GatedDeltaNet(const float* qkv, const float* z, const float* alpha_beta,
+/// `qkv` rows are `qkv_stride` floats apart and `z` rows `z_stride`, so a
+/// stacked [qkv|z] projection feeds both without unpacking.
+void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
+                   std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
                    const float* norm_w, float* conv_state, float* conv_scratch,
                    float* qn, float* kn, float* raw, float* state, float* out,
@@ -119,48 +122,59 @@ void GatedDeltaNet(const float* qkv, const float* z, const float* alpha_beta,
                    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
                    float eps, hipStream_t stream);
 
-/// Splits the interleaved [q|gate] projection into q [t][heads][d] and
-/// gate [t][heads*d].
-void UnpackQGate(const float* qg, float* q, float* gate, std::uint32_t n_tokens,
-                 std::uint32_t heads, std::uint32_t d, hipStream_t stream);
+/// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
+/// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row
+/// continues with k and v (`kv_width` each), copied out contiguously.
+void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
+                 float* gate, float* k, float* v, std::uint32_t n_tokens,
+                 std::uint32_t heads, std::uint32_t d, std::uint32_t kv_width,
+                 hipStream_t stream);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
+/// Positions are read from device memory (`start_pos` points at the
+/// session's control block) so a captured decode graph replays at any
+/// position.
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
-          std::uint32_t d, std::uint32_t rotary_dim, std::uint32_t start_pos,
-          float theta, hipStream_t stream);
+          std::uint32_t d, std::uint32_t rotary_dim,
+          const std::uint32_t* start_pos, float theta, hipStream_t stream);
 
 /// Stores f32 rows into the f16 cache at positions start_pos + t:
 /// cache[(start_pos + t)][row_dim].
 void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
-             std::uint32_t row_dim, std::uint32_t start_pos,
+             std::uint32_t row_dim, const std::uint32_t* start_pos,
              hipStream_t stream);
+/// Same for an f32 row store (raw indexer keys).
+void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
+               std::uint32_t row_dim, const std::uint32_t* start_pos,
+               hipStream_t stream);
 
-/// Pools raw indexer keys ([pos][dim] f32) of complete blocks
-/// [first_block, first_block + n_blocks) into block keys: mean over `ratio`
-/// positions, RMSNorm with gamma, rotary at the block start position.
+/// Pools raw indexer keys ([pos][dim] f32) of the blocks the batch
+/// completes, [*first_block, (*start_pos + n_tokens) / ratio), into block
+/// keys: mean over `ratio` positions, RMSNorm with gamma, rotary at the
+/// block start position. `grid_blocks` bounds how many blocks one launch
+/// can pool (a device-side bound is not available at launch time).
 void PoolIndexerBlocks(const float* raw_keys, const float* gamma, float* blocks,
-                       std::uint32_t first_block, std::uint32_t n_blocks,
-                       std::uint32_t ratio, std::uint32_t dim,
-                       std::uint32_t rotary_dim, float theta, float eps,
-                       hipStream_t stream);
+                       const std::uint32_t* first_block,
+                       const std::uint32_t* start_pos, std::uint32_t n_tokens,
+                       std::uint32_t grid_blocks, std::uint32_t ratio,
+                       std::uint32_t dim, std::uint32_t rotary_dim, float theta,
+                       float eps, hipStream_t stream);
 
-/// Per query t (position start_pos + t): scores every complete block below
-/// its own tail, keeps the `budget` highest, and writes a visibility bitmap
-/// (`mask_words` uint32 per query, bit b = block b visible). Every block is
-/// visible when the count fits the budget. `scores` is scratch of
-/// n_tokens * max_blocks floats.
+/// Per query t (position *start_pos + first_token + t): scores every
+/// complete block below its own tail, keeps the `budget` highest, and
+/// writes a visibility bitmap (`mask_words` uint32 per query, bit b = block
+/// b visible). Every block is visible when the count fits the budget.
+/// `scores` is scratch of n_tokens * max_blocks floats.
 void SelectBlocks(const float* q, const float* blocks, std::uint32_t* mask,
-                  float* scores, std::uint32_t n_tokens, std::uint32_t start_pos,
+                  float* scores, std::uint32_t n_tokens,
+                  const std::uint32_t* start_pos, std::uint32_t first_token,
                   std::uint32_t heads, std::uint32_t dim, std::uint32_t ratio,
                   std::uint32_t budget, std::uint32_t mask_words,
                   std::uint32_t max_blocks, hipStream_t stream);
 
-/// Causal GQA attention of `n_tokens` queries at start_pos + t against the
-/// f16 caches, with block visibility from `mask` (null = dense) and the
-/// incomplete tail always visible. out[t][heads*d].
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
-               std::uint32_t n_tokens, std::uint32_t start_pos,
+               std::uint32_t n_tokens, const std::uint32_t* start_pos,
                std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
                std::uint32_t ratio, hipStream_t stream);
 
@@ -173,6 +187,11 @@ void AttentionSoftmax(const float* scores, const std::uint32_t* mask,
                       std::uint32_t n_tokens, std::uint32_t n_kv,
                       std::uint32_t start_pos, std::uint32_t heads,
                       std::uint32_t d, std::uint32_t ratio, hipStream_t stream);
+
+/// counts[e] = number of (token, slot) pairs routed to expert e.
+void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
+                  std::uint32_t n_tokens, std::uint32_t n_experts,
+                  std::uint32_t k, hipStream_t stream);
 
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
@@ -187,6 +206,11 @@ void MoeEpilogue(const float* expert_out, const float* weights,
 
 /// MTP input: res[t][s][i] = eh_proj( [enorm(embd[t]) ; hnorm(h[t][s])] ) is
 /// assembled here as concat[t][s][2*hidden] for the tier's GEMM.
+/// dst[t] = *row < 0 ? alt[t] : base[*row + t] (rows of `width` floats).
+void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
+               float* dst, std::uint32_t n_tokens, std::uint32_t width,
+               hipStream_t stream);
+
 void MtpConcat(const float* embd_n, const float* h_n, float* concat,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, hipStream_t stream);

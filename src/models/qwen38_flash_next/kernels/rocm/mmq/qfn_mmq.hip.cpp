@@ -4312,6 +4312,56 @@ extern "C" int qfn_mmq_q4_K_moe_pair_raw_vec(
         M, K, n_tokens, n_experts, n_expert_used, stream);
 }
 
+/* qwen38: the decode path splits the vec entry so one activation
+ * quantization feeds every projection that reads it, and drops the output
+ * memset and the sanitize pass (mul_mat_vec_q writes every element). */
+extern "C" size_t qfn_mmq_q8_1_bytes(int N, int K) {
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    return (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
+}
+
+extern "C" int qfn_mmq_quantize_q8_1(
+        const float * X_f32, void * X_q8, int N, int K, cudaStream_t stream) {
+    if (!X_f32 || !X_q8 || N <= 0 || K <= 0 || K % 32 != 0) {
+        fprintf(stderr, "qfn_mmq_quantize_q8_1: bad arguments N=%d K=%d\n", N, K);
+        return -1;
+    }
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    quantize_row_q8_1_cuda(
+        X_f32, /*ids=*/nullptr, X_q8, GGML_TYPE_Q8_0, /*ne00=*/K,
+        /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
+        /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1, stream);
+    return cudaGetLastError() == cudaSuccess ? 0 : -2;
+}
+
+/* W_gate, when given, is a second [M x K] Q8_0 matrix over the same input
+ * and the output becomes (W . x) * silu(W_gate . x): the kernel's own GLU
+ * fusion, one launch for a gated projection. */
+extern "C" int qfn_mmq_q8_0_dense_vec_preq(
+        const void * W, const void * W_gate, const void * X_q8, float * out_f32,
+        int M, int N, int K, cudaStream_t stream) {
+    if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || K <= 0 || K % 32 != 0 ||
+        N > MMVQ_MAX_BATCH_SIZE) {
+        fprintf(stderr, "qfn_mmq_q8_0_dense_vec_preq: bad arguments M=%d N=%d K=%d\n",
+                M, N, K);
+        return -1;
+    }
+    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
+    const int64_t s01_row = (int64_t)K / ggml_blck_size(GGML_TYPE_Q8_0);
+    const int64_t s11_y   = ne10_padded / QK8_1;
+    const int64_t s12_y   = (int64_t)N * s11_y;
+    ggml_cuda_mm_fusion_args_device fusion = {};
+    fusion.gate = W_gate;
+    fusion.glu_op = GGML_GLU_OP_SWIGLU;
+    mul_mat_vec_q_switch_type(
+        W, GGML_TYPE_Q8_0, X_q8, /*ids=*/nullptr, fusion, out_f32,
+        /*ncols_x=*/K, /*nrows_x=*/M, /*ncols_dst=*/N,
+        /*stride_row_x=*/(int)s01_row, /*stride_col_y=*/(int)s11_y,
+        /*stride_col_dst=*/M, 1, 1, 1, 0, (int)s12_y, 0, 1, 1, 0, 0, 0,
+        /*ids_stride=*/0, stream);
+    return cudaGetLastError() == cudaSuccess ? 0 : -3;
+}
+
 extern "C" int qfn_mmq_q8_0_dense_vec(
         const void * W, const float * X, float * out,
         int M, int N, int K, cudaStream_t stream) {

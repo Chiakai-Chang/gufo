@@ -18,6 +18,8 @@ struct BenchOptions {
   std::vector<std::size_t> n_depths{0};
   std::vector<std::size_t> concurrency{1};
   std::size_t repetitions{1};
+  /// Qwen3.8-Flash-Next: prefill chunk (tokens per forward).
+  std::size_t batch_size{512};
   std::size_t validate_prefill_tokens{0};
   int n_gpu_layers{99};
   std::string speculative_backend{""};
@@ -25,6 +27,8 @@ struct BenchOptions {
   std::string dflash_model_path;
   std::string dspark_model_path;
   std::uint32_t draft_tokens{7};
+  /// Qwen3.8-Flash-Next: vocabulary prefix the MTP draft scores (0 = full).
+  std::uint32_t draft_vocab{0};
   std::uint32_t min_draft_tokens{1};
   float draft_p_min{0.0F};
   /// DeepSeek generation sampling; 0 keeps greedy decoding.
