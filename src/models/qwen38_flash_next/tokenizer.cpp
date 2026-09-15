@@ -575,8 +575,7 @@ void Tokenizer::InitializeByteTokens(bool eager_decoded_tokens) {
   }
 }
 
-std::vector<TokenId> Tokenizer::BpeMergeChunk(
-    std::string_view chunk) const {
+std::vector<TokenId> Tokenizer::BpeMergeChunk(std::string_view chunk) const {
   if (chunk.empty()) {
     return {};
   }
@@ -646,8 +645,8 @@ std::vector<TokenId> Tokenizer::BpeEncodeText(std::string_view text) const {
   return tokens;
 }
 
-std::vector<TokenId> Tokenizer::Encode(
-    std::string_view text, const TokenizerOptions& options) const {
+std::vector<TokenId> Tokenizer::Encode(std::string_view text,
+                                       const TokenizerOptions& options) const {
   std::vector<TokenId> tokens;
   if (text.empty()) {
     if (options.add_bos && bos_token_id_ != kInvalidTokenId) {

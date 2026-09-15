@@ -51,8 +51,7 @@ struct Reader {
       for (auto v : *s) {
         out.push_back(static_cast<std::uint64_t>(v));
       }
-    } else if (const auto* d =
-                   std::get_if<std::vector<double>>(&meta->value)) {
+    } else if (const auto* d = std::get_if<std::vector<double>>(&meta->value)) {
       for (auto v : *d) {
         out.push_back(static_cast<std::uint64_t>(v));
       }
@@ -185,8 +184,8 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
       c.num_kv_heads == 0 || c.num_heads % c.num_kv_heads != 0 ||
       c.head_dim == 0 || c.rotary_dim == 0 || c.rotary_dim % 2 != 0 ||
       c.rotary_dim > c.head_dim || c.ssm_conv_kernel == 0 ||
-      c.ssm_head_dim == 0 || c.ssm_num_k_heads == 0 ||
-      c.ssm_num_v_heads == 0 || c.ssm_num_v_heads % c.ssm_num_k_heads != 0 ||
+      c.ssm_head_dim == 0 || c.ssm_num_k_heads == 0 || c.ssm_num_v_heads == 0 ||
+      c.ssm_num_v_heads % c.ssm_num_k_heads != 0 ||
       c.ssm_inner_size != c.SsmValueDim() || c.num_experts == 0 ||
       c.num_experts_used == 0 || c.num_experts_used > c.num_experts ||
       c.expert_ff == 0 || c.shared_expert_ff == 0) {
@@ -198,8 +197,8 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
       r.Fail("qwen4exp trunk layer count is not a multiple of the interval");
       return std::nullopt;
     }
-    if (c.ple_layer >= 0 && !c.IsLinearLayer(
-                                static_cast<std::uint32_t>(c.ple_layer))) {
+    if (c.ple_layer >= 0 &&
+        !c.IsLinearLayer(static_cast<std::uint32_t>(c.ple_layer))) {
       r.Fail("PLE layer must be a linear attention layer");
       return std::nullopt;
     }

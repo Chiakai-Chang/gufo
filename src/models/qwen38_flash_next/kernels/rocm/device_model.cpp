@@ -5,9 +5,11 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <cstring>
 #include <initializer_list>
+#include <thread>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
@@ -40,11 +42,13 @@ public:
         fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
       }
       if (fd < 0) {
-        Fail("cannot open shard " + path.string() + ": " + std::strerror(errno));
+        Fail("cannot open shard " + path.string() + ": " +
+             std::strerror(errno));
       }
       fds_.push_back(fd);
     }
-    if (hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking) != hipSuccess) {
+    if (hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking) !=
+        hipSuccess) {
       Fail("upload stream creation failed");
     }
     for (std::size_t i = 0; i < kStageCount; ++i) {
@@ -57,8 +61,8 @@ public:
       }
       raw_[i] = raw;
       const auto address = reinterpret_cast<std::uintptr_t>(raw);
-      stage_[i] = reinterpret_cast<std::uint8_t*>(
-          (address + kDirectAlign - 1) & ~(kDirectAlign - 1));
+      stage_[i] = reinterpret_cast<std::uint8_t*>((address + kDirectAlign - 1) &
+                                                  ~(kDirectAlign - 1));
       busy_[i] = false;
     }
   }
@@ -85,59 +89,109 @@ public:
 
   [[nodiscard]] bool ok() const noexcept { return ok_; }
 
-  /// Copies `size` bytes at `offset` of shard `shard` to `device`.
+  /// Copies `size` bytes at `offset` of shard `shard` to `device`: every
+  /// staging buffer is filled by its own reader thread (direct I/O wants an
+  /// aligned file offset and length, so each reads the enclosing aligned
+  /// window and copies from the interior), then the batch is queued to the
+  /// device in order.
   bool Copy(std::uint32_t shard, std::uint64_t offset, std::size_t size,
             void* device) {
     if (!ok_ || shard >= fds_.size()) {
       return false;
     }
+    return CopyParallel(shard, offset, size, device);
+  }
+
+  bool Finish() { return hipStreamSynchronize(stream_) == hipSuccess; }
+
+private:
+  struct ReadTask {
+    std::size_t stage{0};
+    std::uint64_t begin{0};
+    std::size_t skip{0};
+    std::size_t want{0};
+    std::size_t length{0};
+    std::size_t destination_offset{0};
+    int error{0};
+    bool ok{false};
+  };
+
+  void Read(std::uint32_t shard, ReadTask* task) {
+    std::size_t got = 0;
+    while (got < task->skip + task->want) {
+      const ssize_t n =
+          ::pread(fds_[shard], stage_[task->stage] + got, task->length - got,
+                  static_cast<off_t>(task->begin + got));
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      if (n <= 0) {
+        task->error = n < 0 ? errno : 0;
+        return;
+      }
+      got += static_cast<std::size_t>(n);
+    }
+    task->ok = true;
+  }
+
+  bool CopyParallel(std::uint32_t shard, std::uint64_t offset, std::size_t size,
+                    void* device) {
     std::size_t done = 0;
     while (done < size) {
-      const std::size_t i = next_++ % kStageCount;
-      if (busy_[i] && hipEventSynchronize(events_[i]) != hipSuccess) {
-        return Fail("staging event wait failed");
-      }
-      busy_[i] = false;
-      // Direct I/O wants an aligned file offset and length: read the
-      // enclosing aligned window and copy from the interior.
-      const std::uint64_t at = offset + done;
-      const std::uint64_t begin = direct_[shard] ? at & ~(kDirectAlign - 1) : at;
-      const std::size_t skip = at - begin;
-      std::size_t want = std::min(size - done, kStageBytes - skip);
-      std::size_t length = skip + want;
-      if (direct_[shard]) {
-        length = (length + kDirectAlign - 1) & ~(kDirectAlign - 1);
-      }
-      std::size_t got = 0;
-      while (got < skip + want) {
-        const ssize_t n = ::pread(fds_[shard], stage_[i] + got, length - got,
-                                  static_cast<off_t>(begin + got));
-        if (n < 0 && errno == EINTR) {
-          continue;
+      std::array<ReadTask, kStageCount> tasks{};
+      std::array<std::jthread, kStageCount> readers;
+      std::size_t count = 0;
+      std::size_t batch_bytes = 0;
+      while (count < kStageCount && done + batch_bytes < size) {
+        ReadTask& task = tasks[count];
+        task.stage = next_++ % kStageCount;
+        if (busy_[task.stage] &&
+            hipEventSynchronize(events_[task.stage]) != hipSuccess) {
+          return Fail("staging event wait failed");
         }
-        if (n <= 0) {
+        busy_[task.stage] = false;
+        const std::uint64_t at = offset + done + batch_bytes;
+        task.begin = direct_[shard] ? at & ~(kDirectAlign - 1) : at;
+        task.skip = at - task.begin;
+        task.want =
+            std::min(size - done - batch_bytes, kStageBytes - task.skip);
+        task.length = task.skip + task.want;
+        if (direct_[shard]) {
+          task.length = (task.length + kDirectAlign - 1) & ~(kDirectAlign - 1);
+        }
+        task.destination_offset = done + batch_bytes;
+        batch_bytes += task.want;
+        ++count;
+      }
+      for (std::size_t i = 0; i < count; ++i) {
+        readers[i] = std::jthread(
+            [this, shard, task = &tasks[i]] { Read(shard, task); });
+      }
+      for (std::size_t i = 0; i < count; ++i) {
+        readers[i].join();
+        if (!tasks[i].ok) {
           return Fail("shard read failed: " +
-                      std::string(n < 0 ? std::strerror(errno) : "short read"));
+                      std::string(tasks[i].error != 0
+                                      ? std::strerror(tasks[i].error)
+                                      : "short read"));
         }
-        got += static_cast<std::size_t>(n);
       }
-      if (hipMemcpyAsync(static_cast<std::uint8_t*>(device) + done,
-                         stage_[i] + skip, want, hipMemcpyHostToDevice,
-                         stream_) != hipSuccess ||
-          hipEventRecord(events_[i], stream_) != hipSuccess) {
-        return Fail("device copy failed");
+      for (std::size_t i = 0; i < count; ++i) {
+        const ReadTask& task = tasks[i];
+        if (hipMemcpyAsync(
+                static_cast<std::uint8_t*>(device) + task.destination_offset,
+                stage_[task.stage] + task.skip, task.want,
+                hipMemcpyHostToDevice, stream_) != hipSuccess ||
+            hipEventRecord(events_[task.stage], stream_) != hipSuccess) {
+          return Fail("device copy failed");
+        }
+        busy_[task.stage] = true;
       }
-      busy_[i] = true;
-      done += want;
+      done += batch_bytes;
     }
     return true;
   }
 
-  bool Finish() {
-    return hipStreamSynchronize(stream_) == hipSuccess;
-  }
-
-private:
   bool Fail(const std::string& message) {
     if (ok_ && error_ != nullptr) {
       *error_ = message;
@@ -193,7 +247,8 @@ struct Uploader {
            (error != nullptr ? ": " + *error : std::string()));
       return d;
     }
-    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin, nullptr);
+    (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0, kTailMargin,
+                         nullptr);
     d.data = ptr;
     d.type = t.type;
     d.cols = static_cast<std::uint32_t>(t.cols);
@@ -385,11 +440,11 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   if (!stager.ok()) {
     return nullptr;
   }
-  Uploader up{stager, m->allocations_, m->bytes_, m->max_half_cols_,
+  Uploader up{stager,          m->allocations_, m->bytes_, m->max_half_cols_,
               m->max_q8_cols_, error_msg};
   m->token_embd_ = up.Copy(w.token_embd);
-  m->output_ = w.output.data == w.token_embd.data ? m->token_embd_
-                                                   : up.Copy(w.output);
+  m->output_ =
+      w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);
   m->hc_head_ = up.Mixer(w.hc_head);
   m->layers_.reserve(w.layers.size());
   for (const auto& l : w.layers) {
@@ -403,7 +458,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     if (!mtp_stager.ok()) {
       return nullptr;
     }
-    Uploader mtp_up{mtp_stager, m->allocations_, m->bytes_,
+    Uploader mtp_up{mtp_stager,        m->allocations_, m->bytes_,
                     m->max_half_cols_, m->max_q8_cols_, error_msg};
     m->mtp_ = mtp_up.Layer(mtp->block);
     m->has_mtp_ = true;

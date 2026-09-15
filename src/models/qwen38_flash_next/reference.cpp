@@ -13,7 +13,9 @@ using cpu::Silu;
 
 ReferenceModel::ReferenceModel(const ModelWeights& weights, NgramTable* ngram,
                                std::uint32_t max_context)
-    : w_(weights), c_(weights.config), ngram_(ngram),
+    : w_(weights),
+      c_(weights.config),
+      ngram_(ngram),
       max_context_(max_context) {
   linear_.resize(c_.num_layers);
   attention_.resize(c_.num_layers);
@@ -49,9 +51,9 @@ void ReferenceModel::Reset() {
 // its own, then the whole [hc_dim] gamma applies.
 static void GroupedNorm(const Config& c, std::span<float> x, const float* w) {
   for (std::uint32_t s = 0; s < c.hc_count; ++s) {
-    cpu::RmsNorm(x.subspan(static_cast<std::size_t>(s) * c.hidden_size,
-                           c.hidden_size),
-                 w + static_cast<std::size_t>(s) * c.hidden_size, c.rms_eps);
+    cpu::RmsNorm(
+        x.subspan(static_cast<std::size_t>(s) * c.hidden_size, c.hidden_size),
+        w + static_cast<std::size_t>(s) * c.hidden_size, c.rms_eps);
   }
 }
 
@@ -90,8 +92,7 @@ void ReferenceModel::HcCombine(std::span<float> res,
   // 2*sigmoid centres the scatter weights on 1: zero injection logits make a
   // plain residual add into every stream.
   for (std::uint32_t s = 0; s < c_.hc_count; ++s) {
-    const float w =
-        2.0F * Sigmoid(inject[s] / static_cast<float>(c_.hc_count));
+    const float w = 2.0F * Sigmoid(inject[s] / static_cast<float>(c_.hc_count));
     float* dst = res.data() + static_cast<std::size_t>(s) * c_.hidden_size;
     for (std::uint32_t i = 0; i < c_.hidden_size; ++i) {
       dst[i] += block_out[i] * w;
@@ -129,11 +130,11 @@ bool ReferenceModel::Ple(const LayerWeights& l, std::int32_t token,
     for (std::uint32_t i = 0; i < c_.hidden_size; ++i) {
       dot += static_cast<double>(key[base + i]) * query[base + i];
     }
-    const float sc = static_cast<float>(dot) /
-                     std::sqrt(static_cast<float>(c_.hidden_size));
+    const float sc =
+        static_cast<float>(dot) / std::sqrt(static_cast<float>(c_.hidden_size));
     const float mag = std::sqrt(std::max(std::fabs(sc), 1e-6F));
-    const float gate = Sigmoid((sc < 0.0F ? -1.0F : (sc > 0.0F ? 1.0F : 0.0F)) *
-                               mag);
+    const float gate =
+        Sigmoid((sc < 0.0F ? -1.0F : (sc > 0.0F ? 1.0F : 0.0F)) * mag);
     for (std::uint32_t i = 0; i < c_.hidden_size; ++i) {
       gated[base + i] = value[i] * gate;
     }
@@ -152,10 +153,10 @@ bool ReferenceModel::Ple(const LayerWeights& l, std::int32_t token,
   std::vector<float> conv_out(hc_dim, 0.0F);
   for (std::uint32_t k = 0; k < kern; ++k) {
     const std::uint32_t back = (kern - 1 - k) * dil;
-    const float* src = back == 0 ? normalized.data()
-                                 : ple_conv_history_.data() +
-                                       static_cast<std::size_t>(hist - back) *
-                                           hc_dim;
+    const float* src = back == 0
+                           ? normalized.data()
+                           : ple_conv_history_.data() +
+                                 static_cast<std::size_t>(hist - back) * hc_dim;
     for (std::uint32_t ch = 0; ch < hc_dim; ++ch) {
       conv_out[ch] += conv_w[static_cast<std::size_t>(ch) * kern + k] * src[ch];
     }
@@ -195,7 +196,8 @@ void ReferenceModel::LinearAttention(const LayerWeights& l, LinearState& s,
   const auto* conv_w = static_cast<const float*>(l.ssm_conv1d.data);
   std::vector<float> conv(channels);
   for (std::uint32_t ch = 0; ch < channels; ++ch) {
-    float acc = conv_w[static_cast<std::size_t>(ch) * kern + kern - 1] * qkv[ch];
+    float acc =
+        conv_w[static_cast<std::size_t>(ch) * kern + kern - 1] * qkv[ch];
     for (std::uint32_t k = 0; k + 1 < kern; ++k) {
       acc += conv_w[static_cast<std::size_t>(ch) * kern + k] *
              s.conv[static_cast<std::size_t>(k) * channels + ch];
@@ -286,14 +288,14 @@ void ReferenceModel::Attention(const LayerWeights& l, AttentionState& s,
                 q.begin() + static_cast<std::size_t>(h) * hd);
     std::copy_n(qg.begin() + static_cast<std::size_t>(h) * 2 * hd + hd, hd,
                 gate.begin() + static_cast<std::size_t>(h) * hd);
-    cpu::RmsNorm(std::span<float>(q.data() + static_cast<std::size_t>(h) * hd,
-                                  hd),
-                 static_cast<const float*>(l.attn_q_norm.data), c_.rms_eps);
+    cpu::RmsNorm(
+        std::span<float>(q.data() + static_cast<std::size_t>(h) * hd, hd),
+        static_cast<const float*>(l.attn_q_norm.data), c_.rms_eps);
   }
   for (std::uint32_t h = 0; h < nkv; ++h) {
-    cpu::RmsNorm(std::span<float>(k.data() + static_cast<std::size_t>(h) * hd,
-                                  hd),
-                 static_cast<const float*>(l.attn_k_norm.data), c_.rms_eps);
+    cpu::RmsNorm(
+        std::span<float>(k.data() + static_cast<std::size_t>(h) * hd, hd),
+        static_cast<const float*>(l.attn_k_norm.data), c_.rms_eps);
   }
   cpu::Rope(q.data(), nh, hd, c_.rotary_dim, pos, c_.rope_theta);
   cpu::Rope(k.data(), nkv, hd, c_.rotary_dim, pos, c_.rope_theta);
@@ -308,9 +310,9 @@ void ReferenceModel::Attention(const LayerWeights& l, AttentionState& s,
   cpu::MatVec(l.indexer_k, 0, x, ik);
   s.index_k.insert(s.index_k.end(), ik.begin(), ik.end());
   for (std::uint32_t h = 0; h < c_.indexer_heads; ++h) {
-    cpu::RmsNorm(std::span<float>(iq.data() + static_cast<std::size_t>(h) * idim,
-                                  idim),
-                 static_cast<const float*>(l.indexer_q_norm.data), c_.rms_eps);
+    cpu::RmsNorm(
+        std::span<float>(iq.data() + static_cast<std::size_t>(h) * idim, idim),
+        static_cast<const float*>(l.indexer_q_norm.data), c_.rms_eps);
   }
   cpu::Rope(iq.data(), c_.indexer_heads, idim, c_.rotary_dim, pos,
             c_.rope_theta);
@@ -321,8 +323,9 @@ void ReferenceModel::Attention(const LayerWeights& l, AttentionState& s,
   while (s.blocks < complete) {
     std::vector<float> pooled(idim, 0.0F);
     for (std::uint32_t t = 0; t < ratio; ++t) {
-      const float* src = s.index_k.data() +
-                         (static_cast<std::size_t>(s.blocks) * ratio + t) * idim;
+      const float* src =
+          s.index_k.data() +
+          (static_cast<std::size_t>(s.blocks) * ratio + t) * idim;
       for (std::uint32_t i = 0; i < idim; ++i) {
         pooled[i] += src[i] / static_cast<float>(ratio);
       }
@@ -357,10 +360,9 @@ void ReferenceModel::Attention(const LayerWeights& l, AttentionState& s,
     }
     std::vector<std::uint32_t> order(complete);
     std::iota(order.begin(), order.end(), 0U);
-    std::stable_sort(order.begin(), order.end(),
-                     [&](std::uint32_t a, std::uint32_t b) {
-                       return score[a] > score[b];
-                     });
+    std::stable_sort(
+        order.begin(), order.end(),
+        [&](std::uint32_t a, std::uint32_t b) { return score[a] > score[b]; });
     order.resize(block_budget);
     std::sort(order.begin(), order.end());
     for (std::uint32_t b : order) {
@@ -427,10 +429,9 @@ void ReferenceModel::Moe(const LayerWeights& l, std::span<const float> x,
   }
   std::vector<std::uint32_t> order(c_.num_experts);
   std::iota(order.begin(), order.end(), 0U);
-  std::partial_sort(order.begin(), order.begin() + c_.num_experts_used,
-                    order.end(), [&](std::uint32_t a, std::uint32_t b) {
-                      return logits[a] > logits[b];
-                    });
+  std::partial_sort(
+      order.begin(), order.begin() + c_.num_experts_used, order.end(),
+      [&](std::uint32_t a, std::uint32_t b) { return logits[a] > logits[b]; });
   float sum = 0.0F;
   for (std::uint32_t i = 0; i < c_.num_experts_used; ++i) {
     sum += logits[order[i]];

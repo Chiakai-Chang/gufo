@@ -46,16 +46,16 @@ private:
   Session() = default;
 
   struct LinearState {
-    float* conv_state{nullptr};  ///< [kernel-1][channels]
-    float* state{nullptr};       ///< [v_heads][d][d]
+    float* conv_state{nullptr};       ///< [kernel-1][channels]
+    float* state{nullptr};            ///< [v_heads][d][d]
     float* conv_snapshots{nullptr};   ///< [max_spec][kernel-1][channels]
     float* state_snapshots{nullptr};  ///< [max_spec][v_heads][d][d]
   };
   struct AttentionState {
-    __half* k_cache{nullptr};   ///< [max_context][kv_heads*d]
-    __half* v_cache{nullptr};   ///< [max_context][kv_heads*d]
-    float* index_k{nullptr};    ///< [max_context][indexer_dim] raw
-    float* block_k{nullptr};    ///< [max_context/ratio][indexer_dim]
+    __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
+    __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
+    float* index_k{nullptr};   ///< [max_context][indexer_dim] raw
+    float* block_k{nullptr};   ///< [max_context/ratio][indexer_dim]
   };
   /// Per-launch values the kernels read from device memory, so a captured
   /// graph replays at any position.
@@ -150,7 +150,8 @@ public:
   void MtpRewind(Session& session, std::uint32_t position) const noexcept {
     session.mtp_.position = position;
   }
-  [[nodiscard]] std::uint32_t MtpPosition(const Session& session) const noexcept {
+  [[nodiscard]] std::uint32_t MtpPosition(
+      const Session& session) const noexcept {
     return session.mtp_.position;
   }
 
@@ -201,24 +202,23 @@ private:
   bool Experts(const DeviceTensor& w, const float* x, const std::int32_t* ids,
                float* out, std::uint32_t n_rows, std::uint32_t n_used,
                std::uint32_t n_tokens, std::string* error_msg) const;
-  /// A non-null `xn` is m's grouped norm of res, already computed.
-  bool HcMix(const DeviceMixer& m, const float* res, const float* xn,
-             float* mixed, float* inject, std::uint32_t n_tokens,
+  /// `normed` says the previous Combine already produced m's grouped norm
+  /// of res (F32 in s_.xn, or F16 plus tiled Q8 on the wide route).
+  bool HcMix(const DeviceMixer& m, const float* res, bool normed, float* mixed,
+             float* inject, std::uint32_t n_tokens,
              std::string* error_msg) const;
+  /// Residual update by the block output plus the grouped norm for the next
+  /// mixer (`gamma`); wide batches write it as F16 and tiled Q8.
+  void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
   void PleFetch(Session& s, std::span<const std::int32_t> tokens,
                 bool speculative) const;
-  bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens,
-           float* res, bool speculative, std::string* error_msg) const;
+  bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens, float* res,
+           bool speculative, std::string* error_msg) const;
   bool LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                        const float* x, float* out, std::uint32_t n_tokens,
                        bool speculative, std::string* error_msg) const;
-  /// Dense attention over start_pos + n keys as batched GEMMs; needs
-  /// start_pos + n <= s_.score_kv.
-  bool BatchedAttention(const Session::AttentionState& s,
-                        const std::uint32_t* mask, std::uint32_t n_tokens,
-                        std::uint32_t start_pos, std::string* error_msg) const;
   /// `pos`/`first_block` are device values; `start_pos` and `pool_grid`
   /// are their host-side counterparts for the eager-only decisions.
   bool Attention(const DeviceLayer& l, Session::AttentionState& s,
@@ -254,10 +254,13 @@ private:
   // Scratch, sized for max_batch tokens. Names follow reference.cpp.
   struct Scratch {
     std::int32_t* tokens;
-    void* x_half;  ///< activations narrowed to the weight's 16-bit type
+    void* x_half;   ///< activations narrowed to the weight's 16-bit type
     void* x_q8[2];  ///< Q8_1 activations of a decode batch, alternating
+    void* x_q8t;    ///< tiled Q8 activations of a wide batch (W8A8 route)
     float* res;
     float* xn;
+    __half* xn_half;  ///< xn as F16 on the F16 mixer input route
+    void* xn_q8t;     ///< xn as tiled Q8 for the W8A8 mixer down projection
     float* lo;
     float* hc_gate;
     float* mixed;
@@ -284,10 +287,7 @@ private:
     std::uint32_t* mask;
     float* scores;
     float* ctx;
-    __half* q_half;       ///< [n][heads*d] for the batched score GEMM
-    float* attn_scores;   ///< [heads][n][kv] raw scores
-    __half* probs;        ///< [heads][n][kv] softmax
-    std::uint32_t score_kv;  ///< widest kv range the score buffers hold
+    std::uint32_t score_kv;  ///< widest dense window the fused kernel scores
     // ple
     float* ple_emb;
     float* ple_key;
@@ -301,6 +301,13 @@ private:
     float* router;
     std::int32_t* ids;
     std::uint32_t* expert_counts;
+    // Routed WMMA route: 16-row padded bucket bounds, scatter cursors, the
+    // compact row -> (token, slot) maps and the tiled Q8 gathered rows.
+    std::int32_t* routed_bounds;
+    std::int32_t* routed_cursors;
+    std::int32_t* rows_token;
+    std::int32_t* rows_slot;
+    void* x_q8t_routed;
     float* weights;
     float* gate_e;
     float* up_e;
@@ -330,10 +337,16 @@ private:
   Session::Control* control_host_{nullptr};
   std::int32_t* tokens_host_{nullptr};
   std::uint32_t* counts_host_{nullptr};
-  mutable std::uint32_t routed_max_rows_{0};  ///< 0 = no readback yet
+  mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
+  mutable std::uint32_t routed_max_pad_{0};     ///< widest 16-padded bucket
+  mutable std::size_t routed_compact_rows_{0};  ///< sum of padded buckets
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
   bool graphs_enabled_{true};
+  /// The model geometry allows the wide mixer route (see Combine).
+  bool wide_mixer_{false};
+  /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
+  mutable bool xn_half_{false};
   /// Partial sums per inject logit the last HcMix left in s_.inject.
   mutable std::uint32_t inject_parts_{1};
   mutable unsigned q8_slot_{0};

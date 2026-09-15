@@ -17,7 +17,9 @@ namespace gufo::models::qwen38_flash_next::rocm {
 enum class WeightType : std::uint32_t {
   kF32 = 0,
   kF16 = 1,
+  kQ5_1 = 7,
   kQ8_0 = 8,
+  kQ4_K = 12,
   kBF16 = 30,
 };
 
@@ -38,10 +40,23 @@ void RmsNormRows(const float* x, const float* gamma, float* out,
 /// Partial sums per inject logit the fused epilogue emits; `inject` holds
 /// n_tokens * streams * HcInjectParts(hidden) floats.
 std::uint32_t HcInjectParts(std::uint32_t hidden);
+std::uint32_t HcInjectPartsVec4(std::uint32_t hidden);
 void HcMixEpilogue(const float* xn, const float* gate, const float* inject_w,
                    float* mixed, float* inject, std::uint32_t n_tokens,
                    std::uint32_t hidden, std::uint32_t streams,
                    hipStream_t stream);
+/// Four adjacent hidden lanes per thread. The model's four-stream geometry
+/// emits HcInjectPartsVec4(hidden) partial sums per inject logit.
+void HcMixEpilogueVec4(const float* xn, const float* gate,
+                       const float* inject_w, float* mixed, float* inject,
+                       std::uint32_t n_tokens, std::uint32_t hidden,
+                       std::uint32_t streams, hipStream_t stream);
+/// The vec4 epilogue over an F16 `xn` (the F16 mixer input route); the
+/// four-stream geometry is the caller's contract.
+void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
+                          const float* inject_w, float* mixed, float* inject,
+                          std::uint32_t n_tokens, std::uint32_t hidden,
+                          hipStream_t stream);
 
 /// res[t][s][i] += block_out[t][i] * 2*sigmoid(inject[t][s] / streams), and
 /// when `gamma` is non-null also the next mixer's grouped RMSNorm of the
@@ -51,6 +66,15 @@ void HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, float eps, hipStream_t stream);
+/// HcCombine writing the normalized output as F16, the width the next
+/// mixer's projection and epilogue consume on the F16 mixer input route.
+/// A non-null `xn_q8` also receives the norm quantized into the tiled Q8
+/// layout (`Q8TiledBytes(n_tokens, streams * hidden)`) for the W8A8 down
+/// projection; hidden must be a multiple of 32.
+void HcCombineF16(float* res, const float* block_out, const float* inject,
+                  std::uint32_t inject_parts, const float* gamma, __half* xn,
+                  void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
+                  std::uint32_t streams, float eps, hipStream_t stream);
 
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
@@ -70,6 +94,38 @@ void AddInPlace(float* dst, const float* src, std::size_t count,
 /// Converts `count` floats to BF16 (or F16) for a 16-bit hipBLAS GEMM.
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,
                        hipStream_t stream);
+
+/// W8A8 route for wide batches over Q8_0 weights: activations quantized per
+/// 32-wide block into the tiled fragment layout (`Q8TiledBytes(batch, k)`
+/// bytes, padded to the GEMM's 128-token macro tile), then an int8 WMMA
+/// GEMM. out is [batch][m]. W8A8Gemm returns false, launching nothing, when
+/// k is not a multiple of 32.
+std::size_t Q8TiledBytes(std::size_t batch, std::size_t k);
+void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
+                     std::size_t k, hipStream_t stream);
+bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
+              std::size_t m, std::size_t k, hipStream_t stream);
+
+/// Routed expert GEMMs on the int8 WMMA cores. RoutedCompact sorts the
+/// (token, slot) assignments by expert into `rows_token`/`rows_slot`
+/// (RoutedCompactRows(slots, experts) entries, -1 for padding) with every
+/// bucket padded to 16 rows (`pad_bounds`, experts + 1 entries) from the
+/// per-expert `counts`. RoutedWmmaGemm reads activations quantized once per
+/// source row with QuantizeQ8Tiled (`x_tiled`), gathering compact row c's
+/// row through `rows_in[c]`, and computes out[rows_out[c]][m] for Q4_K
+/// (k % 256 == 0) or Q5_1 (k % 32 == 0) expert weights [experts][m][k],
+/// returning false, launching nothing, for other types.
+std::size_t RoutedCompactRows(std::size_t slots, std::size_t n_experts);
+void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
+                   std::int32_t* pad_bounds, std::int32_t* cursors,
+                   std::int32_t* rows_token, std::int32_t* rows_slot,
+                   std::uint32_t n_tokens, std::uint32_t k,
+                   std::uint32_t n_experts, hipStream_t stream);
+bool RoutedWmmaGemm(const void* w, WeightType type, const void* x_tiled,
+                    const std::int32_t* pad_bounds, const std::int32_t* rows_in,
+                    const std::int32_t* rows_out, float* out, std::size_t m,
+                    std::size_t k, std::uint32_t n_experts,
+                    std::uint32_t max_bucket_rows, hipStream_t stream);
 
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
@@ -120,7 +176,7 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    float* state_snapshots, float* conv_snapshots,
                    std::uint32_t n_tokens, std::uint32_t k_heads,
                    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
-                   float eps, hipStream_t stream);
+                   bool row_split, float eps, hipStream_t stream);
 
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row
@@ -178,21 +234,26 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
                std::uint32_t ratio, hipStream_t stream);
 
-/// Softmax over `n_experts` logits per token (rows `stride` apart), top-k
-/// selection, renormalized weights. ids [t][k] int32, weights [t][k] f32.
-/// Scaled, causal (and block-masked) softmax of raw scores [heads][n][n_kv]
-/// into F16 probabilities; row (h, t) sees keys up to start_pos + t.
-void AttentionSoftmax(const float* scores, const std::uint32_t* mask,
-                      std::uint32_t mask_words, __half* probs,
-                      std::uint32_t n_tokens, std::uint32_t n_kv,
-                      std::uint32_t start_pos, std::uint32_t heads,
-                      std::uint32_t d, std::uint32_t ratio, hipStream_t stream);
+/// Fused causal attention on the WMMA cores for wide batches: scores, online
+/// softmax, PV and the sigmoid output gate in one launch. `mask` follows
+/// Attention's block-selection contract (null for the dense window). Returns
+/// false, launching nothing, when the geometry is not the model's 24 x 256
+/// heads over two KV heads.
+bool WmmaCausalAttention(const float* q, const float* gate,
+                         const __half* k_cache, const __half* v_cache,
+                         const std::uint32_t* mask, std::uint32_t mask_words,
+                         float* out, std::uint32_t n_tokens,
+                         std::uint32_t start_pos, std::uint32_t heads,
+                         std::uint32_t kv_heads, std::uint32_t d,
+                         std::uint32_t ratio, hipStream_t stream);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
                   std::uint32_t n_tokens, std::uint32_t n_experts,
                   std::uint32_t k, hipStream_t stream);
 
+/// Softmax over `n_experts` logits per token (rows `stride` apart), top-k
+/// selection, renormalized weights. ids [t][k] int32, weights [t][k] f32.
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
                 std::uint32_t k, hipStream_t stream);
@@ -203,6 +264,13 @@ void MoeEpilogue(const float* expert_out, const float* weights,
                  const float* shared, const float* gate,
                  std::uint32_t gate_stride, float* out, std::uint32_t n_tokens,
                  std::uint32_t k, std::uint32_t dim, hipStream_t stream);
+/// Same contract, four adjacent lanes per thread (`dim % 4 == 0`, else the
+/// scalar kernel runs).
+void MoeEpilogueVec4(const float* expert_out, const float* weights,
+                     const float* shared, const float* gate,
+                     std::uint32_t gate_stride, float* out,
+                     std::uint32_t n_tokens, std::uint32_t k, std::uint32_t dim,
+                     hipStream_t stream);
 
 /// MTP input: res[t][s][i] = eh_proj( [enorm(embd[t]) ; hnorm(h[t][s])] ) is
 /// assembled here as concat[t][s][2*hidden] for the tier's GEMM.
@@ -216,7 +284,8 @@ void MtpConcat(const float* embd_n, const float* h_n, float* concat,
                std::uint32_t streams, hipStream_t stream);
 
 /// Diagnostic: out[0] = sum of x[0..count), out[1] = sum of |x|.
-void Checksum(const float* x, std::size_t count, float* out, hipStream_t stream);
+void Checksum(const float* x, std::size_t count, float* out,
+              hipStream_t stream);
 
 /// argmax of logits[t][vocab] into out[t].
 void Argmax(const float* logits, std::int32_t* out, std::uint32_t n_tokens,

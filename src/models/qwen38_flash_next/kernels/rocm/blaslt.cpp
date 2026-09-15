@@ -1,9 +1,8 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 
-#include <hipblaslt/hipblaslt-ext.hpp>
-
 #include <algorithm>
 #include <array>
+#include <hipblaslt/hipblaslt-ext.hpp>
 #include <sstream>
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -83,11 +82,11 @@ bool BlasLt::Describe(const Problem& p, hipblasLtMatmulDesc_t* desc,
   if (hipblasLtMatmulDescCreate(desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) !=
           HIPBLAS_STATUS_SUCCESS ||
       hipblasLtMatmulDescSetAttribute(*desc, HIPBLASLT_MATMUL_DESC_TRANSA,
-                                      &op_a, sizeof(op_a)) !=
-          HIPBLAS_STATUS_SUCCESS ||
+                                      &op_a,
+                                      sizeof(op_a)) != HIPBLAS_STATUS_SUCCESS ||
       hipblasLtMatmulDescSetAttribute(*desc, HIPBLASLT_MATMUL_DESC_TRANSB,
-                                      &op_b, sizeof(op_b)) !=
-          HIPBLAS_STATUS_SUCCESS) {
+                                      &op_b,
+                                      sizeof(op_b)) != HIPBLAS_STATUS_SUCCESS) {
     return false;
   }
   const auto layout = [&](hipblasLtMatrixLayout_t* l, hipDataType type,

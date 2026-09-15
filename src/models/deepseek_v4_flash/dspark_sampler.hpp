@@ -27,9 +27,7 @@ public:
   DsparkSamplerBridge& operator=(const DsparkSamplerBridge&) = delete;
 
   [[nodiscard]] const ds4_dspark_sampler* hook() const { return &hook_; }
-  [[nodiscard]] std::uint64_t rng_state() const {
-    return working_.rng_state();
-  }
+  [[nodiscard]] std::uint64_t rng_state() const { return working_.rng_state(); }
 
 private:
   static int Sample(void* ctx, const float* logits,

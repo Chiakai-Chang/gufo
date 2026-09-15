@@ -1053,9 +1053,8 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     body["status"] = "ok";
     return Ok(body);
   }
-  if (req.method == "GET" &&
-      (req.path == "/ready" || req.path == "/v1/ready" ||
-       req.path == "/readyz")) {
+  if (req.method == "GET" && (req.path == "/ready" || req.path == "/v1/ready" ||
+                              req.path == "/readyz")) {
     const bool ready = (backend_ != nullptr && backend_->ready()) ||
                        (video_jobs_ != nullptr && video_jobs_->ready()) ||
                        (tts_ != nullptr && tts_->ready()) ||

@@ -71,6 +71,13 @@ void qfn_mmq_set_routed_max_expert_rows(int rows);
 // order, so results are unchanged.
 void qfn_mmq_set_routed_tile_cols(int cols);
 
+// qwen38: the routed id maps alone (for the id-map builder's test). ids is
+// [n_tokens][si1]; ids_src1/ids_dst hold n_tokens * n_expert_used entries and
+// expert_bounds n_experts + 1.
+int qfn_mmq_build_ids_maps(
+        const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
+        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, cudaStream_t stream);
+
 // The width the model above picks for one per-expert assignment-count array.
 // Returns 0 when the counts are unusable, which the setter treats as "default".
 int qfn_mmq_routed_tile_cols_for_counts(const unsigned int *counts,

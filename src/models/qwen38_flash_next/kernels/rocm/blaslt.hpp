@@ -32,8 +32,9 @@ public:
   BlasLt(const BlasLt&) = delete;
   BlasLt& operator=(const BlasLt&) = delete;
 
-  [[nodiscard]] static std::unique_ptr<BlasLt> Create(
-      hipStream_t stream, std::uint32_t tuning_n, std::string* error_msg);
+  [[nodiscard]] static std::unique_ptr<BlasLt> Create(hipStream_t stream,
+                                                      std::uint32_t tuning_n,
+                                                      std::string* error_msg);
 
   /// out[t][i] = sum_k A(i, k) * B(t, k) for i < m, t < n, with `out` row
   /// stride `ldc` and batch stride `stride_c`: `a` is (m x k) after its

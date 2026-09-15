@@ -88,10 +88,10 @@ struct LayerWeights {
   TensorRef ple_conv1d;      ///< [conv_kernel, hc_dim]
 
   // Mixture of experts.
-  TensorRef router;         ///< [hidden -> num_experts] F32
-  TensorRef ffn_gate_exps;  ///< [hidden -> expert_ff] x experts
-  TensorRef ffn_up_exps;    ///< [hidden -> expert_ff] x experts
-  TensorRef ffn_down_exps;  ///< [expert_ff -> hidden] x experts
+  TensorRef router;          ///< [hidden -> num_experts] F32
+  TensorRef ffn_gate_exps;   ///< [hidden -> expert_ff] x experts
+  TensorRef ffn_up_exps;     ///< [hidden -> expert_ff] x experts
+  TensorRef ffn_down_exps;   ///< [expert_ff -> hidden] x experts
   TensorRef shexp_gate_inp;  ///< [hidden] -> scalar sigmoid gate
   TensorRef shexp_gate;      ///< [hidden -> shared_ff]
   TensorRef shexp_up;        ///< [hidden -> shared_ff]
@@ -120,8 +120,8 @@ struct ModelWeights {
 
 /// Path of mapped region `shard` of a split artifact opened from `first`
 /// (`name-00001-of-0000N.gguf`); single files return `first` for shard 0.
-[[nodiscard]] std::filesystem::path ShardPath(const std::filesystem::path& first,
-                                              std::uint32_t shard);
+[[nodiscard]] std::filesystem::path ShardPath(
+    const std::filesystem::path& first, std::uint32_t shard);
 
 /// The MTP draft block from the `shared-*` sidecar: one attention layer with
 /// its own hyper-connection mixers and experts; token embedding and LM head

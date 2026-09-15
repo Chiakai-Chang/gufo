@@ -47,10 +47,9 @@ void PrintTop(const std::vector<float>& logits, const q::Tokenizer& tokenizer,
               std::uint32_t top) {
   std::vector<std::uint32_t> order(logits.size());
   std::iota(order.begin(), order.end(), 0U);
-  std::partial_sort(order.begin(), order.begin() + top, order.end(),
-                    [&](std::uint32_t a, std::uint32_t b) {
-                      return logits[a] > logits[b];
-                    });
+  std::partial_sort(
+      order.begin(), order.begin() + top, order.end(),
+      [&](std::uint32_t a, std::uint32_t b) { return logits[a] > logits[b]; });
   const float max_logit = logits[order[0]];
   double denom = 0.0;
   for (float v : logits) {
@@ -58,8 +57,8 @@ void PrintTop(const std::vector<float>& logits, const q::Tokenizer& tokenizer,
   }
   for (std::uint32_t i = 0; i < top; ++i) {
     const std::uint32_t id = order[i];
-    const double p = std::exp(static_cast<double>(logits[id] - max_logit)) /
-                     denom;
+    const double p =
+        std::exp(static_cast<double>(logits[id] - max_logit)) / denom;
     std::string text(tokenizer.DecodeToken(id));
     for (char& ch : text) {
       if (ch == '\n') {
@@ -129,17 +128,18 @@ int main(int argc, char** argv) {
   std::unique_ptr<q::NgramTable> ngram;
   if (c.ple_layer >= 0) {
     const auto& t = weights->ple_table;
-    ngram = q::NgramTable::Open(q::ShardPath(model_path, t.shard),
-                                t.file_offset, t.rows, c.ple_head_dim, t.type,
-                                &error);
+    ngram =
+        q::NgramTable::Open(q::ShardPath(model_path, t.shard), t.file_offset,
+                            t.rows, c.ple_head_dim, t.type, &error);
     if (!ngram) {
       std::fprintf(stderr, "n-gram table failed: %s\n", error.c_str());
       return 1;
     }
   }
-  std::printf("model: %u layers, hidden %u, vocab %u, experts %u/%u, ple layer %d\n",
-              c.num_layers, c.hidden_size, c.vocab_size, c.num_experts_used,
-              c.num_experts, c.ple_layer);
+  std::printf(
+      "model: %u layers, hidden %u, vocab %u, experts %u/%u, ple layer %d\n",
+      c.num_layers, c.hidden_size, c.vocab_size, c.num_experts_used,
+      c.num_experts, c.ple_layer);
 
   std::vector<std::int32_t> tokens;
   if (!tokens_arg.empty()) {

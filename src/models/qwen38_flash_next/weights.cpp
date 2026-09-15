@@ -53,9 +53,9 @@ struct Binder {
   }
 
   /// Binds `name` with the exact shape and one of the accepted formats.
-  TensorRef Get(const std::string& name, std::uint64_t cols,
-                std::uint64_t rows, std::uint64_t experts,
-                std::initializer_list<GgmlType> types, bool required = true) {
+  TensorRef Get(const std::string& name, std::uint64_t cols, std::uint64_t rows,
+                std::uint64_t experts, std::initializer_list<GgmlType> types,
+                bool required = true) {
     TensorRef t;
     const auto* info = reader.FindTensor(name);
     if (info == nullptr) {
@@ -118,12 +118,12 @@ struct Binder {
     HcMixer m;
     const std::uint64_t hc_dim = c.HcDim();
     m.norm = Get(prefix + "_norm.weight", hc_dim, 1, 1, {GgmlType::kF32});
-    m.down = Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
-                 {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
-                  GgmlType::kF32});
-    m.up = Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
-               {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16,
-                GgmlType::kF32});
+    m.down =
+        Get(prefix + "_down.weight", hc_dim, c.hc_low_rank, 1,
+            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
+    m.up =
+        Get(prefix + "_up.weight", c.hc_low_rank, hc_dim, 1,
+            {GgmlType::kQ8_0, GgmlType::kBF16, GgmlType::kF16, GgmlType::kF32});
     if (with_inject) {
       m.inject = Get(prefix + "_inject.weight", hc_dim, c.hc_count, 1,
                      {GgmlType::kF32, GgmlType::kQ8_0, GgmlType::kBF16});
@@ -131,8 +131,8 @@ struct Binder {
     return m;
   }
 
-  LayerWeights Layer(const Config& c, std::uint32_t il, bool linear,
-                     bool ple, bool nextn) {
+  LayerWeights Layer(const Config& c, std::uint32_t il, bool linear, bool ple,
+                     bool nextn) {
     LayerWeights l;
     l.linear = linear;
     const std::string p = "blk." + std::to_string(il) + ".";
@@ -147,44 +147,41 @@ struct Binder {
     l.hc_ffn = Mixer(p + "hc_ffn", c, true);
 
     if (linear) {
-      l.ssm_qkv = Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1,
-                      dense);
-      l.ssm_gate = Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1,
-                       dense);
+      l.ssm_qkv =
+          Get(p + "attn_qkv.weight", hidden, c.SsmConvChannels(), 1, dense);
+      l.ssm_gate =
+          Get(p + "attn_gate.weight", hidden, c.SsmValueDim(), 1, dense);
       l.ssm_conv1d = Get(p + "ssm_conv1d.weight", c.ssm_conv_kernel,
                          c.SsmConvChannels(), 1, {GgmlType::kF32});
       l.ssm_alpha = Get(p + "ssm_alpha.weight", hidden, c.ssm_num_v_heads, 1,
                         {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0});
       l.ssm_beta = Get(p + "ssm_beta.weight", hidden, c.ssm_num_v_heads, 1,
                        {GgmlType::kF32, GgmlType::kBF16, GgmlType::kQ8_0});
-      l.ssm_dt = Get(p + "ssm_dt.bias", c.ssm_num_v_heads, 1, 1,
-                     {GgmlType::kF32});
+      l.ssm_dt =
+          Get(p + "ssm_dt.bias", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
       l.ssm_a = Get(p + "ssm_a", c.ssm_num_v_heads, 1, 1, {GgmlType::kF32});
       l.ssm_norm =
           Get(p + "ssm_norm.weight", c.ssm_head_dim, 1, 1, {GgmlType::kF32});
-      l.ssm_out =
-          Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, dense);
+      l.ssm_out = Get(p + "ssm_out.weight", c.SsmValueDim(), hidden, 1, dense);
     } else {
-      l.attn_q = Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1,
-                     dense);
-      l.attn_k = Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1,
-                     dense);
-      l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1,
-                     dense);
-      l.attn_out = Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1,
-                       dense);
+      l.attn_q =
+          Get(p + "attn_q.weight", hidden, 2 * c.AttentionQDim(), 1, dense);
+      l.attn_k = Get(p + "attn_k.weight", hidden, c.AttentionKvDim(), 1, dense);
+      l.attn_v = Get(p + "attn_v.weight", hidden, c.AttentionKvDim(), 1, dense);
+      l.attn_out =
+          Get(p + "attn_output.weight", c.AttentionQDim(), hidden, 1, dense);
       l.attn_q_norm =
           Get(p + "attn_q_norm.weight", c.head_dim, 1, 1, {GgmlType::kF32});
       l.attn_k_norm =
           Get(p + "attn_k_norm.weight", c.head_dim, 1, 1, {GgmlType::kF32});
       l.indexer_q = Get(p + "indexer.q_proj.weight", hidden,
                         c.indexer_heads * c.indexer_head_dim, 1, dense);
-      l.indexer_k = Get(p + "indexer.k_proj.weight", hidden,
-                        c.indexer_head_dim, 1, dense);
-      l.indexer_q_norm = Get(p + "indexer.q_norm.weight", c.indexer_head_dim,
-                             1, 1, {GgmlType::kF32});
-      l.indexer_k_norm = Get(p + "indexer.k_norm.weight", c.indexer_head_dim,
-                             1, 1, {GgmlType::kF32});
+      l.indexer_k = Get(p + "indexer.k_proj.weight", hidden, c.indexer_head_dim,
+                        1, dense);
+      l.indexer_q_norm = Get(p + "indexer.q_norm.weight", c.indexer_head_dim, 1,
+                             1, {GgmlType::kF32});
+      l.indexer_k_norm = Get(p + "indexer.k_norm.weight", c.indexer_head_dim, 1,
+                             1, {GgmlType::kF32});
     }
 
     if (ple) {
@@ -209,14 +206,14 @@ struct Binder {
                         c.num_experts, experts);
     l.ffn_down_exps = Get(p + "ffn_down_exps.weight", c.expert_ff, hidden,
                           c.num_experts, experts);
-    l.shexp_gate_inp = Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1,
-                           {GgmlType::kF32});
-    l.shexp_gate = Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff,
-                       1, dense);
-    l.shexp_up = Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1,
-                     dense);
-    l.shexp_down = Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden,
-                       1, dense);
+    l.shexp_gate_inp =
+        Get(p + "ffn_gate_inp_shexp.weight", hidden, 1, 1, {GgmlType::kF32});
+    l.shexp_gate =
+        Get(p + "ffn_gate_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
+    l.shexp_up =
+        Get(p + "ffn_up_shexp.weight", hidden, c.shared_expert_ff, 1, dense);
+    l.shexp_down =
+        Get(p + "ffn_down_shexp.weight", c.shared_expert_ff, hidden, 1, dense);
 
     if (nextn) {
       l.nextn_enorm =
@@ -286,10 +283,10 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
     }
     w.config.vocab_size = static_cast<std::uint32_t>(info->dimensions[1]);
   }
-  w.token_embd = b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1,
-                       dense);
-  w.output = b.Get("output.weight", c.hidden_size, c.vocab_size, 1, dense,
-                   false);
+  w.token_embd =
+      b.Get("token_embd.weight", c.hidden_size, c.vocab_size, 1, dense);
+  w.output =
+      b.Get("output.weight", c.hidden_size, c.vocab_size, 1, dense, false);
   if (w.output.empty()) {
     w.output = w.token_embd;
   }
@@ -298,9 +295,9 @@ std::optional<ModelWeights> ModelWeights::Bind(const core::GgufReader& reader,
     // The converter may pad the table beyond the hashed range, so take the
     // row count from the file and only check that it covers every head.
     const auto* info = reader.FindTensor("per_layer_token_embd.weight");
-    const std::uint64_t rows =
-        info != nullptr && info->dimensions.size() == 2 ? info->dimensions[1]
-                                                        : 0;
+    const std::uint64_t rows = info != nullptr && info->dimensions.size() == 2
+                                   ? info->dimensions[1]
+                                   : 0;
     if (rows < c.ple_rows) {
       b.Fail("per_layer_token_embd.weight is missing or too short");
     } else {

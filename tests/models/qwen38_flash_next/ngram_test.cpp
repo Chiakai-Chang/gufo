@@ -1,4 +1,6 @@
 // PLE n-gram hashing and disk row reads, checked without the model.
+#include "src/models/qwen38_flash_next/ngram.hpp"
+
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -6,8 +8,6 @@
 #include <filesystem>
 #include <fstream>
 #include <vector>
-
-#include "src/models/qwen38_flash_next/ngram.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
 
@@ -125,8 +125,8 @@ void TestTable() {
     Check(table->Read(ids, out), "table read");
     for (std::size_t j = 0; j < ids.size(); ++j) {
       for (std::uint32_t i = 0; i < dim; i += 37) {
-        const float v = static_cast<float>(ids[j]) +
-                        static_cast<float>(i) / 1000.0F;
+        const float v =
+            static_cast<float>(ids[j]) + static_cast<float>(i) / 1000.0F;
         std::uint32_t bits = 0;
         std::memcpy(&bits, &v, 4);
         bits &= 0xFFFF0000U;

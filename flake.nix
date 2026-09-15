@@ -300,6 +300,7 @@
               -not -path "*/vendor/*" \
               -not -path "src/models/deepseek_v4_flash/runtime/*" \
               -not -path "src/models/deepseek_v4_flash/kernels/rocm/*" \
+              -not -path "src/models/qwen38_flash_next/kernels/rocm/mmq/*" \
               \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) \
               -exec clang-format --dry-run --Werror {} +
             mkdir -p $out

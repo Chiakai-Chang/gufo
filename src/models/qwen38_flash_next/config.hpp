@@ -40,10 +40,10 @@ struct Config {
   std::array<std::uint32_t, 4> rope_sections{};
 
   // Qwen Sparse Attention indexer (block top-k selection).
-  std::uint32_t indexer_heads{0};      ///< 4
-  std::uint32_t indexer_head_dim{0};   ///< 128
-  std::uint32_t indexer_top_k{0};      ///< 2048 tokens
-  std::uint32_t compress_ratio{0};     ///< 4 tokens per scored block
+  std::uint32_t indexer_heads{0};     ///< 4
+  std::uint32_t indexer_head_dim{0};  ///< 128
+  std::uint32_t indexer_top_k{0};     ///< 2048 tokens
+  std::uint32_t compress_ratio{0};    ///< 4 tokens per scored block
 
   // Gated DeltaNet linear attention.
   std::uint32_t ssm_conv_kernel{0};  ///< 4
@@ -59,13 +59,13 @@ struct Config {
   std::uint32_t shared_expert_ff{0};  ///< 640
 
   // PLE n-gram hash embedding, injected into one linear-attention layer.
-  std::int32_t ple_layer{-1};  ///< -1 when the artifact carries no PLE.
-  std::uint32_t ple_ngram_size{0};       ///< 3: bigrams and trigrams
+  std::int32_t ple_layer{-1};       ///< -1 when the artifact carries no PLE.
+  std::uint32_t ple_ngram_size{0};  ///< 3: bigrams and trigrams
   std::uint32_t ple_heads_per_ngram{0};  ///< 8
   std::uint32_t ple_heads{0};            ///< (ngram_size - 1) * heads_per_ngram
-  std::uint32_t ple_head_dim{0};         ///< 160 (embedding_length_per_layer_input)
-  std::uint32_t ple_conv_kernel{0};      ///< 4
-  std::uint32_t ple_eos_token{0};        ///< resets the n-gram window
+  std::uint32_t ple_head_dim{0};     ///< 160 (embedding_length_per_layer_input)
+  std::uint32_t ple_conv_kernel{0};  ///< 4
+  std::uint32_t ple_eos_token{0};    ///< resets the n-gram window
   std::array<std::uint64_t, kMaxPleNgram> ple_multipliers{};
   std::array<std::uint32_t, kMaxPleHeads> ple_head_offsets{};
   std::array<std::uint32_t, kMaxPleHeads> ple_head_vocab{};

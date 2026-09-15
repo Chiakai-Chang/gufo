@@ -56,7 +56,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
   }
   if (!options.mtp_model_path.empty()) {
-    m->mtp_reader_ = core::GgufReader::OpenFile(options.mtp_model_path, error_msg);
+    m->mtp_reader_ =
+        core::GgufReader::OpenFile(options.mtp_model_path, error_msg);
     if (!m->mtp_reader_) {
       return nullptr;
     }
@@ -66,19 +67,20 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     m->mtp_weights_ = std::make_unique<MtpWeights>(std::move(*mtp));
   }
-  m->device_ = rocm::DeviceModel::Upload(*m->weights_, model_path,
-                                         m->mtp_weights_.get(),
-                                         options.mtp_model_path, error_msg);
+  m->device_ =
+      rocm::DeviceModel::Upload(*m->weights_, model_path, m->mtp_weights_.get(),
+                                options.mtp_model_path, error_msg);
   if (!m->device_) {
     return nullptr;
   }
   rocm::Executor::Options exec;
   exec.max_batch = std::max<std::uint32_t>(1, options.max_batch);
-  exec.max_logit_rows = std::max<std::uint32_t>(1, options.max_draft_tokens + 1);
+  exec.max_logit_rows =
+      std::max<std::uint32_t>(1, options.max_draft_tokens + 1);
   exec.max_speculative = exec.max_logit_rows;
   exec.draft_rows = options.draft_vocab;
-  m->executor_ = rocm::Executor::Create(*m->device_, m->ngram_.get(), exec,
-                                        error_msg);
+  m->executor_ =
+      rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
     return nullptr;
   }
@@ -129,14 +131,18 @@ std::uint32_t Model::VocabSize() const noexcept {
   return weights_->config.vocab_size;
 }
 
-bool Model::HasMtp() const noexcept { return device_->has_mtp(); }
-
-std::string Model::ModelName() const {
-  return std::string(
-      reader_->GetMetadataString("general.name").value_or("Qwen3.8-Flash-Next"));
+bool Model::HasMtp() const noexcept {
+  return device_->has_mtp();
 }
 
-const Config& Model::config() const noexcept { return weights_->config; }
+std::string Model::ModelName() const {
+  return std::string(reader_->GetMetadataString("general.name")
+                         .value_or("Qwen3.8-Flash-Next"));
+}
+
+const Config& Model::config() const noexcept {
+  return weights_->config;
+}
 
 std::size_t Model::ResidentBytes() const noexcept {
   return device_->resident_bytes();
@@ -147,13 +153,16 @@ Session::Session(std::shared_ptr<Model> model,
     : model_(std::move(model)), session_(std::move(session)) {
   logits_.resize(model_->VocabSize());
   draft_logits_.resize(model_->VocabSize());
-  verify_logits_.resize(static_cast<std::size_t>(model_->options_.max_draft_tokens + 1) *
-                        model_->VocabSize());
+  verify_logits_.resize(
+      static_cast<std::size_t>(model_->options_.max_draft_tokens + 1) *
+      model_->VocabSize());
 }
 
 Session::~Session() = default;
 
-std::uint32_t Session::Position() const noexcept { return session_->position(); }
+std::uint32_t Session::Position() const noexcept {
+  return session_->position();
+}
 std::uint32_t Session::ContextSize() const noexcept {
   return session_->max_context();
 }
@@ -167,7 +176,8 @@ void Session::Reset() {
   model_->executor_->MtpRewind(*session_, 0);
 }
 
-std::int32_t Session::Argmax(const float* row, std::size_t count) const noexcept {
+std::int32_t Session::Argmax(const float* row,
+                             std::size_t count) const noexcept {
   const std::size_t n = count > 0 ? count : model_->VocabSize();
   return static_cast<std::int32_t>(std::max_element(row, row + n) - row);
 }
@@ -198,7 +208,8 @@ bool Session::DraftCatchUp(std::int32_t next_token, std::string* error_msg) {
   }
   std::vector<std::int32_t> replay(tokens_.begin() + mp + 1, tokens_.end());
   replay.push_back(next_token);
-  if (!exec.MtpForward(*session_, replay, static_cast<std::int32_t>(mp - hidden_base_),
+  if (!exec.MtpForward(*session_, replay,
+                       static_cast<std::int32_t>(mp - hidden_base_),
                        draft_logits_.data(), error_msg)) {
     return false;
   }
@@ -210,7 +221,8 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
                    std::string* error_msg) {
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size(); off += exec.max_batch()) {
-    const std::size_t n = std::min<std::size_t>(exec.max_batch(), tokens.size() - off);
+    const std::size_t n =
+        std::min<std::size_t>(exec.max_batch(), tokens.size() - off);
     const auto chunk = tokens.subspan(off, n);
     if (model_->HasMtp() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], error_msg)) {
@@ -272,8 +284,8 @@ bool Session::SpeculativeStep(std::size_t max_tokens,
   rocm::Executor& exec = *model_->executor_;
   const std::uint32_t max_draft = model_->options_.max_draft_tokens;
   const std::size_t room = ContextSize() - tokens_.size();
-  const std::size_t width =
-      std::min<std::size_t>({max_tokens, room, static_cast<std::size_t>(max_draft) + 1});
+  const std::size_t width = std::min<std::size_t>(
+      {max_tokens, room, static_cast<std::size_t>(max_draft) + 1});
   if (!model_->HasMtp() || width < 2) {
     if (width == 0) {
       AssignError(error_msg, "no room for another token");
@@ -310,18 +322,20 @@ bool Session::SpeculativeStep(std::size_t max_tokens,
   // choice and always stands.
   const auto k = static_cast<std::uint32_t>(chain.size());
   const std::size_t vocab = model_->VocabSize();
-  if (!exec.Forward(*session_, chain, k, verify_logits_.data(), true, error_msg)) {
+  if (!exec.Forward(*session_, chain, k, verify_logits_.data(), true,
+                    error_msg)) {
     return false;
   }
   std::uint32_t keep = 1;
-  while (keep < k && Argmax(verify_logits_.data() + (keep - 1) * vocab) ==
-                         chain[keep]) {
+  while (keep < k &&
+         Argmax(verify_logits_.data() + (keep - 1) * vocab) == chain[keep]) {
     ++keep;
   }
   if (!exec.Rollback(*session_, keep, error_msg)) {
     return false;
   }
-  std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab, logits_.begin());
+  std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
+              logits_.begin());
   hidden_base_ = base;
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   emitted->insert(emitted->end(), chain.begin(), chain.begin() + keep);
@@ -345,8 +359,10 @@ std::int32_t Session::SelectNext(float temperature, std::uint64_t* rng_state,
   }
   std::vector<std::uint32_t> order(vocab);
   std::iota(order.begin(), order.end(), 0U);
-  const std::size_t keep = top_k > 0 ? std::min<std::size_t>(top_k, vocab) : vocab;
-  std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(keep),
+  const std::size_t keep =
+      top_k > 0 ? std::min<std::size_t>(top_k, vocab) : vocab;
+  std::partial_sort(order.begin(),
+                    order.begin() + static_cast<std::ptrdiff_t>(keep),
                     order.end(), [&](std::uint32_t a, std::uint32_t b) {
                       return logits_[a] > logits_[b];
                     });
@@ -377,8 +393,9 @@ std::int32_t Session::SelectNext(float temperature, std::uint64_t* rng_state,
   *rng_state ^= *rng_state >> 12;
   *rng_state ^= *rng_state << 25;
   *rng_state ^= *rng_state >> 27;
-  const double u = static_cast<double>((*rng_state * 2685821657736338717ULL) >> 11) /
-                   static_cast<double>(1ULL << 53) * total;
+  const double u =
+      static_cast<double>((*rng_state * 2685821657736338717ULL) >> 11) /
+      static_cast<double>(1ULL << 53) * total;
   double acc = 0.0;
   for (std::size_t i = 0; i < count; ++i) {
     acc += probs[i];

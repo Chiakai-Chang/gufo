@@ -22,7 +22,7 @@ namespace gufo::models::qwen38_flash_next {
 using TokenId = std::uint32_t;
 
 constexpr TokenId kInvalidTokenId = 0xFFFFFFFFU;
-constexpr TokenId kDefaultEosTokenId = 248046U;  // <|im_end|>
+constexpr TokenId kDefaultEosTokenId = 248046U;   // <|im_end|>
 constexpr TokenId kDefaultEndoftextId = 248044U;  // <|endoftext|>
 
 /// Configuration options for the tokenizer encoding pass.

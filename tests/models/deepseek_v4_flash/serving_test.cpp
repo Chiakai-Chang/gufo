@@ -126,11 +126,11 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
              "seeded sampled DSpark output equals autoregressive decoding");
     }
     const auto greedy_again = backend.chat(prompt, 32, 0.0F);
-    Expect(greedy_again.tokens == greedy.tokens &&
-               greedy_again.draft_tokens == greedy.draft_tokens &&
-               greedy_again.draft_accepted_tokens ==
-                   greedy.draft_accepted_tokens,
-           "greedy DSpark output is unchanged after sampled cycles");
+    Expect(
+        greedy_again.tokens == greedy.tokens &&
+            greedy_again.draft_tokens == greedy.draft_tokens &&
+            greedy_again.draft_accepted_tokens == greedy.draft_accepted_tokens,
+        "greedy DSpark output is unchanged after sampled cycles");
   }
 
   // Greedy and seeded sampled requests share one DSpark cohort.

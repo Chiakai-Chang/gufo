@@ -119,8 +119,8 @@ void RmsNorm(std::span<float> x, const float* w, float eps) {
     ss += static_cast<double>(v) * v;
   }
   const float scale =
-      1.0F / std::sqrt(static_cast<float>(ss / static_cast<double>(x.size())) +
-                       eps);
+      1.0F /
+      std::sqrt(static_cast<float>(ss / static_cast<double>(x.size())) + eps);
   for (std::size_t i = 0; i < x.size(); ++i) {
     x[i] = x[i] * scale * (w != nullptr ? w[i] : 1.0F);
   }
@@ -137,8 +137,12 @@ void L2Norm(std::span<float> x, float eps) {
   }
 }
 
-float Sigmoid(float x) noexcept { return 1.0F / (1.0F + std::exp(-x)); }
-float Silu(float x) noexcept { return x * Sigmoid(x); }
+float Sigmoid(float x) noexcept {
+  return 1.0F / (1.0F + std::exp(-x));
+}
+float Silu(float x) noexcept {
+  return x * Sigmoid(x);
+}
 float Softplus(float x) noexcept {
   return x > 20.0F ? x : std::log1p(std::exp(x));
 }
@@ -149,9 +153,8 @@ void Rope(float* x, std::uint32_t heads, std::uint32_t head_dim,
   for (std::uint32_t h = 0; h < heads; ++h) {
     float* v = x + static_cast<std::size_t>(h) * head_dim;
     for (std::uint32_t i = 0; i < half; ++i) {
-      const float freq =
-          std::pow(theta, -2.0F * static_cast<float>(i) /
-                              static_cast<float>(rotary_dim));
+      const float freq = std::pow(theta, -2.0F * static_cast<float>(i) /
+                                             static_cast<float>(rotary_dim));
       const float angle = static_cast<float>(pos) * freq;
       const float c = std::cos(angle);
       const float s = std::sin(angle);

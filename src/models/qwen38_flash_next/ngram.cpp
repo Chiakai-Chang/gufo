@@ -127,11 +127,11 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
     buf.resize(length + kPage);
   }
   // O_DIRECT needs a page-aligned buffer; align inside the vector.
-  auto* base = reinterpret_cast<std::uintptr_t>(buf.data()) % kPage == 0
-                   ? buf.data()
-                   : buf.data() + (kPage - reinterpret_cast<std::uintptr_t>(
-                                               buf.data()) %
-                                               kPage);
+  auto* base =
+      reinterpret_cast<std::uintptr_t>(buf.data()) % kPage == 0
+          ? buf.data()
+          : buf.data() +
+                (kPage - reinterpret_cast<std::uintptr_t>(buf.data()) % kPage);
   // The aligned window may run past the end of the file: only the row's own
   // bytes have to arrive.
   const std::size_t needed = (offset - begin) + row_bytes_;

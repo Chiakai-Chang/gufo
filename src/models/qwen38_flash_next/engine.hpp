@@ -114,8 +114,8 @@ public:
                                      std::vector<std::int32_t>* emitted,
                                      std::string* error_msg = nullptr);
   [[nodiscard]] std::int32_t SelectNext(float temperature,
-                                        std::uint64_t* rng_state,
-                                        int top_k = 0, float top_p = 1.0F,
+                                        std::uint64_t* rng_state, int top_k = 0,
+                                        float top_p = 1.0F,
                                         float min_p = 0.0F) const;
   [[nodiscard]] std::span<const float> Logits() const noexcept {
     return logits_;
@@ -155,7 +155,7 @@ private:
   /// propose the token after the pending one.
   bool draft_ready_{false};
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
-  std::int32_t pending_{-1};  ///< argmax of `logits_`, next token to feed
+  std::int32_t pending_{-1};      ///< argmax of `logits_`, next token to feed
   SpeculativeStats stats_;
 };
 

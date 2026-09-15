@@ -26,8 +26,8 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
-#include "src/models/qwen3_tts/audio.hpp"
 #include "src/cli/video/video.hpp"
+#include "src/models/qwen3_tts/audio.hpp"
 
 namespace gufo::cli {
 namespace {
@@ -61,8 +61,8 @@ std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
 void AddServerOptions(gufo::cli::ArgParser& parser, std::string* host,
                       int* port, std::size_t* session_count,
                       std::size_t* max_connections,
-                      std::size_t* max_request_body_bytes,
-                      std::string* api_key, bool* verbose) {
+                      std::size_t* max_request_body_bytes, std::string* api_key,
+                      bool* verbose) {
   parser.AddOption("-i", "--host", "IP", "Bind address", "Server", host);
   parser.AddOption("-p", "--port", "N", "Port to listen on", "Server", port);
   parser.AddOption("-j", "--sessions", "N", "Preallocated GPU request sessions",
@@ -100,8 +100,7 @@ void AddServerOptionsForHelp(gufo::cli::ArgParser& parser,
 
 // Split a `NAME=VALUE` CLI spec. Returns false when either side is empty.
 bool SplitNameValue(std::string_view spec, std::string_view flag,
-                    std::string* name, std::string* value,
-                    std::string* error) {
+                    std::string* name, std::string* value, std::string* error) {
   const std::size_t separator = spec.find('=');
   if (separator == std::string_view::npos || separator == 0 ||
       separator + 1 >= spec.size()) {
@@ -749,14 +748,12 @@ int RunServe(std::span<const char* const> args) {
     audio_parser.AddOption("", "--asr-model", "DIR",
                            "Qwen3-ASR-1.7B model directory", "Model",
                            &asr_model);
-    audio_parser.AddOption(
-        "", "--tts-context", "N",
-        "Qwen3-TTS context capacity (default: 4096)", "Model",
-        &tts_context_tokens);
-    audio_parser.AddOption(
-        "", "--asr-context", "N",
-        "Qwen3-ASR context capacity (default: 1024)", "Model",
-        &asr_context_tokens);
+    audio_parser.AddOption("", "--tts-context", "N",
+                           "Qwen3-TTS context capacity (default: 4096)",
+                           "Model", &tts_context_tokens);
+    audio_parser.AddOption("", "--asr-context", "N",
+                           "Qwen3-ASR context capacity (default: 1024)",
+                           "Model", &asr_context_tokens);
 
     std::map<std::string, server::TtsVoicePreset> voice_presets;
     std::vector<std::pair<std::string, std::string>> voice_specs;

@@ -144,9 +144,9 @@ int main(int argc, char** argv) {
   std::unique_ptr<q::NgramTable> ngram;
   if (c.ple_layer >= 0) {
     const auto& t = weights->ple_table;
-    ngram = q::NgramTable::Open(q::ShardPath(model_path, t.shard),
-                                t.file_offset, t.rows, c.ple_head_dim, t.type,
-                                &error);
+    ngram =
+        q::NgramTable::Open(q::ShardPath(model_path, t.shard), t.file_offset,
+                            t.rows, c.ple_head_dim, t.type, &error);
     if (!ngram) {
       std::fprintf(stderr, "n-gram table failed: %s\n", error.c_str());
       return 1;
@@ -154,9 +154,8 @@ int main(int argc, char** argv) {
   }
 
   auto t0 = std::chrono::steady_clock::now();
-  auto device = q::rocm::DeviceModel::Upload(*weights, model_path,
-                                             mtp ? &*mtp : nullptr, mtp_path,
-                                             &error);
+  auto device = q::rocm::DeviceModel::Upload(
+      *weights, model_path, mtp ? &*mtp : nullptr, mtp_path, &error);
   if (!device) {
     std::fprintf(stderr, "upload failed: %s\n", error.c_str());
     return 1;
@@ -177,8 +176,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--spec needs --mtp\n");
     return 2;
   }
-  auto executor = q::rocm::Executor::Create(*device, ngram.get(), options,
-                                            &error);
+  auto executor =
+      q::rocm::Executor::Create(*device, ngram.get(), options, &error);
   if (!executor) {
     std::fprintf(stderr, "executor failed: %s\n", error.c_str());
     return 1;
@@ -211,9 +210,9 @@ int main(int argc, char** argv) {
     for (std::size_t off = 0; off < tokens.size(); off += batch) {
       const std::size_t n = std::min<std::size_t>(batch, tokens.size() - off);
       std::vector<float> out(c.vocab_size);
-      if (!executor->Forward(*session,
-                             std::span<const std::int32_t>(tokens.data() + off, n),
-                             1, out.data(), false, &error)) {
+      if (!executor->Forward(
+              *session, std::span<const std::int32_t>(tokens.data() + off, n),
+              1, out.data(), false, &error)) {
         std::fprintf(stderr, "warm-up failed: %s\n", error.c_str());
         return 1;
       }
@@ -226,9 +225,9 @@ int main(int argc, char** argv) {
     const auto rows = static_cast<std::uint32_t>(
         std::min<std::size_t>(n, options.max_logit_rows));
     std::vector<float> out(static_cast<std::size_t>(rows) * c.vocab_size);
-    if (!executor->Forward(*session,
-                           std::span<const std::int32_t>(tokens.data() + off, n),
-                           rows, out.data(), false, &error)) {
+    if (!executor->Forward(
+            *session, std::span<const std::int32_t>(tokens.data() + off, n),
+            rows, out.data(), false, &error)) {
       std::fprintf(stderr, "prefill failed: %s\n", error.c_str());
       return 1;
     }
@@ -240,11 +239,13 @@ int main(int argc, char** argv) {
     if (spec > 0) {
       // Tokens off+1 .. off+n (the next chunk's first token, or the first
       // generated token for the last chunk) against hidden rows 0 .. n-1.
-      std::vector<std::int32_t> next(tokens.begin() + static_cast<std::ptrdiff_t>(off + 1),
-                                     tokens.begin() + static_cast<std::ptrdiff_t>(off + n));
+      std::vector<std::int32_t> next(
+          tokens.begin() + static_cast<std::ptrdiff_t>(off + 1),
+          tokens.begin() + static_cast<std::ptrdiff_t>(off + n));
       if (last) {
         next.push_back(static_cast<std::int32_t>(
-            std::max_element(gpu_logits.end() - c.vocab_size, gpu_logits.end()) -
+            std::max_element(gpu_logits.end() - c.vocab_size,
+                             gpu_logits.end()) -
             (gpu_logits.end() - c.vocab_size)));
       } else {
         next.push_back(tokens[off + n]);
@@ -286,8 +287,9 @@ int main(int argc, char** argv) {
       }
       max_abs = std::max(max_abs, d);
     }
-    std::printf("repeat: max|d| %.6f first diff at row %zu\n", max_abs,
-                first_diff == out.size() ? logit_rows : first_diff / c.vocab_size);
+    std::printf(
+        "repeat: max|d| %.6f first diff at row %zu\n", max_abs,
+        first_diff == out.size() ? logit_rows : first_diff / c.vocab_size);
   }
   if (dump.is_open()) {
     dump.write(reinterpret_cast<const char*>(gpu_logits.data()),
@@ -307,9 +309,9 @@ int main(int argc, char** argv) {
       if (i < first) {
         continue;
       }
-      const Stats st = Compare(
-          ref_logits.data(),
-          gpu_logits.data() + (i - first) * c.vocab_size, c.vocab_size);
+      const Stats st =
+          Compare(ref_logits.data(),
+                  gpu_logits.data() + (i - first) * c.vocab_size, c.vocab_size);
       std::printf("pos %3zu ref %6u gpu %6u %s  KL %.5f  max|d| %.3f\n", i,
                   st.argmax_a, st.argmax_b,
                   st.argmax_a == st.argmax_b ? "OK  " : "DIFF", st.kl,
@@ -318,13 +320,13 @@ int main(int argc, char** argv) {
   }
 
   auto argmax = [&](const float* row) {
-    return static_cast<std::int32_t>(
-        std::max_element(row, row + c.vocab_size) - row);
+    return static_cast<std::int32_t>(std::max_element(row, row + c.vocab_size) -
+                                     row);
   };
   std::vector<std::uint32_t> generated;
   std::vector<float> logits(c.vocab_size);
-  std::copy_n(gpu_logits.data() + (logit_rows - 1) * c.vocab_size,
-              c.vocab_size, logits.begin());
+  std::copy_n(gpu_logits.data() + (logit_rows - 1) * c.vocab_size, c.vocab_size,
+              logits.begin());
   std::int32_t next_token = argmax(logits.data());
   t0 = std::chrono::steady_clock::now();
   if (spec > 0) {
@@ -341,8 +343,9 @@ int main(int argc, char** argv) {
       for (int j = 1; j < spec; ++j) {
         chain.push_back(draft);
         if (j + 1 < spec &&
-            !executor->MtpForward(*session, std::span<const std::int32_t>(&draft, 1),
-                                  -1, draft_logits.data(), &error)) {
+            !executor->MtpForward(*session,
+                                  std::span<const std::int32_t>(&draft, 1), -1,
+                                  draft_logits.data(), &error)) {
           std::fprintf(stderr, "draft failed: %s\n", error.c_str());
           return 1;
         }
@@ -372,8 +375,7 @@ int main(int argc, char** argv) {
       accepted += keep - 1;
       // Re-sync the draft block: positions base .. base+keep-1 consume
       // chain[1..keep-1] and the new token, with the trunk's true hidden.
-      std::vector<std::int32_t> resync(chain.begin() + 1,
-                                       chain.begin() + keep);
+      std::vector<std::int32_t> resync(chain.begin() + 1, chain.begin() + keep);
       resync.push_back(next_token);
       executor->MtpRewind(*session, base);
       if (!executor->MtpForward(*session, resync, 0, draft_logits.data(),
@@ -383,11 +385,11 @@ int main(int argc, char** argv) {
       }
     }
     const double decode_s = secs(t0);
-    std::printf("spec decode %zu tokens in %.3f s (%.2f tok/s), %zu cycles, "
-                "acceptance %.1f%% (%zu/%zu)\n",
-                generated.size(), decode_s, generated.size() / decode_s, cycles,
-                drafted > 0 ? 100.0 * accepted / drafted : 0.0, accepted,
-                drafted);
+    std::printf(
+        "spec decode %zu tokens in %.3f s (%.2f tok/s), %zu cycles, "
+        "acceptance %.1f%% (%zu/%zu)\n",
+        generated.size(), decode_s, generated.size() / decode_s, cycles,
+        drafted > 0 ? 100.0 * accepted / drafted : 0.0, accepted, drafted);
   } else {
     for (int i = 0; i < generate; ++i) {
       generated.push_back(static_cast<std::uint32_t>(next_token));

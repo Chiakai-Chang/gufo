@@ -330,7 +330,8 @@ int RunDeepSeekBenchmark(
     int token = session.TakePendingDsparkToken();
     if (token < 0) {
       const auto logits = session.CopyLogits(error_msg);
-      if (logits.empty()) return -1;
+      if (logits.empty())
+        return -1;
       token = static_cast<int>(sampler.Sample(logits));
     }
     sampler.Accept(static_cast<sampling::TokenId>(token));
@@ -488,9 +489,10 @@ int RunDeepSeekBenchmark(
                     active.push_back(i);
                     const ds4_dspark_sampler* hook = nullptr;
                     if (sampled) {
-                      bridges.push_back(std::make_unique<
-                                        models::deepseek_v4_flash::
-                                            DsparkSamplerBridge>(samplers[i]));
+                      bridges.push_back(
+                          std::make_unique<
+                              models::deepseek_v4_flash::DsparkSamplerBridge>(
+                              samplers[i]));
                       hook = bridges.back()->hook();
                     }
                     items.push_back({.session = sessions[i].get(),
@@ -696,7 +698,8 @@ int RunDeepSeekBenchmark(
               std::vector<int> emitted;
               std::optional<models::deepseek_v4_flash::DsparkSamplerBridge>
                   bridge;
-              if (sampled) bridge.emplace(sampler);
+              if (sampled)
+                bridge.emplace(sampler);
               if (!session->DsparkStep(generation_length - step,
                                        options.draft_tokens, &emitted, &error,
                                        bridge ? bridge->hook() : nullptr) ||
@@ -839,7 +842,8 @@ int RunQwen38FlashNextBenchmark(
         static_cast<std::uint32_t>(required_context), &error);
     auto batched = model->CreateSession(
         static_cast<std::uint32_t>(required_context), &error);
-    const auto prefix = std::span(tokens).first(options.validate_prefill_tokens);
+    const auto prefix =
+        std::span(tokens).first(options.validate_prefill_tokens);
     if (!sequential || !batched || !sequential->Sync(prefix.first(1), &error) ||
         !batched->Sync(prefix, &error)) {
       std::cerr << "Qwen3.8-Flash-Next prefill validation failed: " << error
@@ -915,7 +919,8 @@ int RunQwen38FlashNextBenchmark(
         auto session = model->CreateSession(
             static_cast<std::uint32_t>(required_context), &error);
         if (!session ||
-            (depth > 0 && !session->Sync(std::span(tokens).first(depth), &error))) {
+            (depth > 0 &&
+             !session->Sync(std::span(tokens).first(depth), &error))) {
           std::cerr << "Error preparing depth: " << error << '\n';
           return 1;
         }
@@ -932,7 +937,8 @@ int RunQwen38FlashNextBenchmark(
           runs.push_back(static_cast<double>(prompt_length) / seconds);
         }
       }
-      print_result(MakeTestName("pp", prompt_length, depth), ComputeStats(runs));
+      print_result(MakeTestName("pp", prompt_length, depth),
+                   ComputeStats(runs));
     }
 
     for (const std::size_t generation_length : options.n_gens) {
