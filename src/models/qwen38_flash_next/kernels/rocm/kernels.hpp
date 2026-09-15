@@ -123,9 +123,10 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
                    std::uint32_t n_experts, hipStream_t stream);
 bool RoutedWmmaGemm(const void* w, WeightType type, const void* x_tiled,
                     const std::int32_t* pad_bounds, const std::int32_t* rows_in,
-                    const std::int32_t* rows_out, float* out, std::size_t m,
-                    std::size_t k, std::uint32_t n_experts,
-                    std::uint32_t max_bucket_rows, hipStream_t stream);
+                    const std::int32_t* rows_out, const float* swiglu_gate,
+                    float* out, std::size_t m, std::size_t k,
+                    std::uint32_t n_experts, std::uint32_t max_bucket_rows,
+                    hipStream_t stream);
 
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
@@ -228,11 +229,15 @@ void SelectBlocks(const float* q, const float* blocks, std::uint32_t* mask,
                   std::uint32_t budget, std::uint32_t mask_words,
                   std::uint32_t max_blocks, hipStream_t stream);
 
+/// Per-token attention (decode and narrow batches). With `partials`
+/// (n_tokens * heads * splits * (d + 2) floats) the key tiles are split
+/// across `splits` blocks per row and merged in a second launch.
 void Attention(const float* q, const __half* k_cache, const __half* v_cache,
                const std::uint32_t* mask, std::uint32_t mask_words, float* out,
-               std::uint32_t n_tokens, const std::uint32_t* start_pos,
-               std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
-               std::uint32_t ratio, hipStream_t stream);
+               float* partials, std::uint32_t splits, std::uint32_t n_tokens,
+               const std::uint32_t* start_pos, std::uint32_t heads,
+               std::uint32_t kv_heads, std::uint32_t d, std::uint32_t ratio,
+               hipStream_t stream);
 
 /// Fused causal attention on the WMMA cores for wide batches: scores, online
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows

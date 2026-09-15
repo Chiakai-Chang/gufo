@@ -71,6 +71,8 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+/// Key-tile splits per row of a narrow attention batch (decode at depth).
+constexpr std::uint32_t kAttnSplits = 8;
 
 }  // namespace
 
@@ -213,11 +215,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.mask = Alloc<std::uint32_t>(a, T * e->mask_words_, error_msg);
   s.scores = f32(static_cast<std::size_t>(e->select_chunk_) * max_blocks);
   s.ctx = f32(T * c.AttentionQDim());
-  // Wide batches run the fused kernel over every key of a dense window;
-  // past the sparse budget the per-token kernel gathers the selected blocks
-  // instead.
-  s.score_kv = static_cast<std::uint32_t>(
-      std::max<std::size_t>(c.indexer_top_k, c.compress_ratio) + T);
+  s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
+                        kAttnSplits * (c.head_dim + 2));
   if (c.ple_layer >= 0) {
     s.ple_emb = f32(T * c.PleEmbeddingDim());
     s.ple_key = f32(T * hc_dim);
@@ -475,11 +474,20 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
              Dense(w, q, out, error_msg);
     }
     // Wide batches: activations quantized per 32-wide block into the tiled
-    // layout, then the int8 WMMA GEMM over the Q8_0 blocks.
-    QuantizeQ8Tiled(x, s_.x_q8t, n_tokens, w.cols, stream_);
-    if (!W8A8Gemm(w.data, s_.x_q8t, out, n_tokens, w.rows, w.cols, stream_)) {
-      AssignError(error_msg, "W8A8 GEMM failed");
-      return false;
+    // layout, then the int8 WMMA GEMM over the Q8_0 blocks. The tiled
+    // buffer holds max_batch rows; a wider call (the draft block folds its
+    // streams into rows) runs in pieces.
+    const std::uint32_t piece = static_cast<std::uint32_t>(options_.max_batch);
+    for (std::uint32_t r0 = 0; r0 < n_tokens; r0 += piece) {
+      const std::uint32_t rows = std::min(piece, n_tokens - r0);
+      QuantizeQ8Tiled(x + static_cast<std::size_t>(r0) * w.cols, s_.x_q8t, rows,
+                      w.cols, stream_);
+      if (!W8A8Gemm(w.data, s_.x_q8t,
+                    out + static_cast<std::size_t>(r0) * w.rows, rows, w.rows,
+                    w.cols, stream_)) {
+        AssignError(error_msg, "W8A8 GEMM failed");
+        return false;
+      }
     }
     return true;
   }
@@ -910,18 +918,22 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     }
     mask = s_.mask;
   }
-  // Wide batches run the fused WMMA kernel over the dense window (never
-  // inside a graph: the kv extent is a host value), output gate included;
-  // the per-token kernel covers the rest.
-  if (n_tokens > kVecBatch && start_pos + n_tokens <= s_.score_kv &&
+  // Wide batches run the fused WMMA kernel (never inside a graph: the kv
+  // extent is a host value), output gate included, skipping the key tiles
+  // no query of a block selected; the per-token kernel covers the rest.
+  if (n_tokens > kVecBatch &&
       WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, mask,
                           mask_words_, s_.ctx, n_tokens, start_pos, c.num_heads,
                           c.num_kv_heads, c.head_dim, c.compress_ratio,
                           stream_)) {
     return Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
+  // Narrow batches split each row's key tiles over kAttnSplits blocks so a
+  // decode step at depth fills the device.
+  const bool split = n_tokens <= kVecBatch;
   rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
-                  n_tokens, pos, c.num_heads, c.num_kv_heads, c.head_dim,
+                  split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
+                  pos, c.num_heads, c.num_kv_heads, c.head_dim,
                   c.compress_ratio, stream_);
   SigmoidMul(s_.ctx, s_.attn_gate,
              static_cast<std::size_t>(n_tokens) * c.AttentionQDim(), stream_);
@@ -961,24 +973,25 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                   stream_);
     // Tokens are quantized once; the GEMM gathers them per compact row.
     QuantizeQ8Tiled(x, s_.x_q8t_routed, n_tokens, c.hidden_size, stream_);
+    // The up projection's epilogue applies the SwiGLU with the gate output
+    // and writes the down projection's input in place of the up result.
     if (!RoutedWmmaGemm(l.ffn_gate_exps.data, WeightType::kQ4_K,
                         s_.x_q8t_routed, s_.routed_bounds, s_.rows_token,
-                        s_.rows_slot, s_.gate_e, c.expert_ff, c.hidden_size,
-                        c.num_experts, routed_max_pad_, stream_) ||
+                        s_.rows_slot, nullptr, s_.gate_e, c.expert_ff,
+                        c.hidden_size, c.num_experts, routed_max_pad_,
+                        stream_) ||
         !RoutedWmmaGemm(l.ffn_up_exps.data, WeightType::kQ4_K, s_.x_q8t_routed,
-                        s_.routed_bounds, s_.rows_token, s_.rows_slot, s_.up_e,
-                        c.expert_ff, c.hidden_size, c.num_experts,
-                        routed_max_pad_, stream_)) {
+                        s_.routed_bounds, s_.rows_token, s_.rows_slot,
+                        s_.gate_e, s_.up_e, c.expert_ff, c.hidden_size,
+                        c.num_experts, routed_max_pad_, stream_)) {
       AssignError(error_msg, "routed WMMA gate/up GEMM failed");
       return false;
     }
-    Swiglu(s_.gate_e, s_.up_e, static_cast<std::size_t>(slots) * c.expert_ff,
-           stream_);
-    QuantizeQ8Tiled(s_.gate_e, s_.x_q8t_routed, slots, c.expert_ff, stream_);
+    QuantizeQ8Tiled(s_.up_e, s_.x_q8t_routed, slots, c.expert_ff, stream_);
     if (!RoutedWmmaGemm(l.ffn_down_exps.data, WeightType::kQ5_1,
                         s_.x_q8t_routed, s_.routed_bounds, s_.rows_slot,
-                        s_.rows_slot, s_.down_e, c.hidden_size, c.expert_ff,
-                        c.num_experts, routed_max_pad_, stream_)) {
+                        s_.rows_slot, nullptr, s_.down_e, c.hidden_size,
+                        c.expert_ff, c.num_experts, routed_max_pad_, stream_)) {
       AssignError(error_msg, "routed WMMA down GEMM failed");
       return false;
     }

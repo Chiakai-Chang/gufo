@@ -18,8 +18,27 @@ per shape, then the timed one; single samples, the host's noise band is about
 | pp512 | 796 | 628 | 402 |
 | pp1024 | 921 | — | — |
 | pp2048 | 1007 | 719 | 439 |
-| tg64 greedy | 23.4 | 22.8 | 21.9 |
-| tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 32.9 (depth 0) / 36.5 (depth 1024) | 38.4 / 35.0 | — |
+| tg64 greedy | 22.7 | 22.8 | 21.9 |
+| tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 32.9 (depth 0) / 36.5 (depth 1024) / 35.0 (depth 4096) / 42.9 (depth 16384) | 38.4 / 35.0 / 30.4 / — | — |
+
+Context depth (`-p 2048 -n 64 -b 2048 -d N`, one 2048-token chunk and 64
+decode steps after N prepared tokens; the sparse attention budget is 2048
+tokens, so past 2048 keys every full-attention layer selects blocks):
+
+| depth | pp2048 | tg64 | pp2048 before the depth card | tg64 before |
+| ---: | ---: | ---: | ---: | ---: |
+| 0 | 1016 | 22.8 | 1010 | 22.8 |
+| 4096 | 942 | 21.7 | 484 | 17.8 |
+| 16384 | 838 | 20.1 | 320 | 15.0 |
+| 32768 | 766 | 19.4 | 221 | 12.4 |
+| 65536 | — | — | 140 | — |
+
+Depths of 64k and beyond were not benchmarked after the change (each depth
+prepares the whole context first); the per-chunk cost is now the union of
+four consecutive queries' selections (about 850 blocks at 16k against 512
+per query) plus a per-query indexer scan, so it still grows slowly with
+depth. Peak resident memory at the 65k depth measured 90.9 GiB GTT (77 GiB
+weights; KV is 24 KiB per token).
 
 The MTP figures are acceptance-bound: the per-cycle cost is unchanged (75.5
 versus 76.5 ms) and the depth-1024 prompt accepts 85/126 drafts against
@@ -54,6 +73,9 @@ targets under `tests/models/qwen38_flash_next/` (label
 | W8A8 int8 WMMA dense GEMM | retained, +2.7% (938 → 964) | 27B blocked kernel over the untouched Q8_0 blocks, about 30 TOPS; 64-row tiles for the 320-row mixer down |
 | routed int8 WMMA expert GEMM | retained at ≥ 24 rows per expert, +2.2% (965 → 986) | 128 x 48 macro tiles per expert over 16-row padded buckets, K-quant fetch with a cached block header, in-GEMM row gather; the MMQ tier stays below 1,229 tokens where it is 5–8% faster |
 | W8A8 mixer down from a fused tiled-Q8 norm | retained, +2.4% (988 → 1011) | the combine also quantizes the norm per 32-block; removes the hipBLASLt plan lottery on that shape |
+| sparse-window attention at depth (depth card) | retained, pp2048@16k 320 → 838, tg64@32k 12.4 → 19.4 | the fused WMMA kernel was only used up to 4096 keys and the per-token fallback swept every key of the context with the mask; now: the WMMA kernel at any depth gathers 16-key tiles from the union of a block's query masks, with the twelve heads of one query packed into a 16-row tile and four queries per block (a 32-query union covered 60% of the context, a 4-query union 20%); the per-token kernel compacts the query's selected blocks through LDS, splits its tiles over eight blocks with a log-sum-exp merge, and scores/accumulates wave-cooperatively (one 16-byte load per lane) instead of one lane per key; block selection scores sixteen queries per pooled key row over row splits instead of one block per query |
+| SwiGLU in the routed up projection's epilogue | retained (bundled) | the up GEMM writes silu(gate) * up in place of the up result; drops the SwiGLU pass and one 52 MB round trip per layer |
+| routed GEMM tiles 128x96 (4x2 waves) / BK=2 | rejected | 6.53 / 8.51 ms and 4.76 / 5.77 ms per call against 4.45 / 5.36 for 128x48 BK=4: fewer weight re-fetches lose to the occupancy drop (256 VGPRs, 34 KB LDS) |
 | fused Q4_K expert gate/up (decode) | rejected | MTP tg128 38.6 → 33.5 despite fewer cycles |
 | 40-row expert vector dispatch (decode) | rejected | vector 33.3 versus tiled 38.0 tok/s |
 
@@ -73,6 +95,22 @@ graph replay leaves ~1.3 µs per launch of gaps.
 
 ## TODOs
 
+- pp2048 above ~1,050 needs a different expert GEMM: the routed WMMA kernel
+  is at 15 TOPS and the fetch/LDS path, not the matrix cores, bounds it
+  (ablations above); the expert weight stream alone floors a chunk at about
+  310 ms of the current 2.0 s. Candidates in order: stage scales once per row
+  tile instead of per K block, swizzle the LDS fragment layout (22–28% bank
+  conflicts), a load-time repack of the Q4_K/Q5_1 experts into a
+  fragment-major int8 layout with separate scale planes (the prototype's
+  layout), and a fused gate+up kernel sharing the activation stage.
+- Attention at depth: a 5-query x 12-head flat row layout (60 live rows of
+  64) would cut the sparse sweep another ~10%; the indexer scan
+  (SelectScoreKernel, 1.7 ms per layer at 16k) could score 64 queries per
+  block from LDS.
+- The draft block folds its four streams into rows, so its projections run
+  at 4x the batch; the W8A8 path chunks them to the tiled buffer (found as
+  a GPU fault in MTP decode past 2048 tokens of context: the first card's
+  W8A8 route overflowed that buffer silently below 4096 and faulted above).
 - Routed WMMA GEMM: the fetch path, not the matrix cores, bounds it (ablating
   all WMMA work leaves 5.8 ms of the 5.2 ms call). Candidates: stage the
   per-32 scales and offsets once per row tile instead of per K block (they

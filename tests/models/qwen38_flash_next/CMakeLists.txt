@@ -75,4 +75,12 @@ if(ENGINE_ENABLE_HIP)
     COMMAND qwen38_flash_next_routed_wmma_ops_test)
   set_tests_properties(qwen38_flash_next.routed_wmma_ops PROPERTIES
     LABELS "hip;gpu;gfx1151;qwen38_flash_next;prefill;moe;opt-qfn-moe-wmma")
+
+  add_executable(qwen38_flash_next_select_ops_test select_ops_test.cpp)
+  target_link_libraries(qwen38_flash_next_select_ops_test PRIVATE
+    gufo_qwen38_flash_next)
+  add_test(NAME qwen38_flash_next.select_ops
+    COMMAND qwen38_flash_next_select_ops_test)
+  set_tests_properties(qwen38_flash_next.select_ops PROPERTIES
+    LABELS "hip;gpu;gfx1151;qwen38_flash_next;prefill;attention")
 endif()

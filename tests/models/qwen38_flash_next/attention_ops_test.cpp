@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -98,7 +99,7 @@ std::vector<float> Download(HipBuffer<float>* source, std::size_t count) {
 /// Runs the per-token reference and the fused WMMA route over the same
 /// cache and reports the worst absolute error of the gated context.
 double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
-               std::uint32_t seed) {
+               std::uint32_t seed, bool sparse = false) {
   const std::uint32_t n_kv = start_pos + n_tokens;
   const std::uint32_t max_blocks = (n_kv + kRatio - 1) / kRatio;
   const std::uint32_t mask_words = (max_blocks + 31) / 32;
@@ -120,6 +121,11 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
   std::uint32_t state = seed ^ 0x77777777U;
   for (std::uint32_t& word : mask) {
     word = NextRandom(&state) & NextRandom(&state);
+    if (sparse) {
+      // About one block in sixteen: most 16-key tiles are unselected for a
+      // whole query block, which is what the tile skipping is for.
+      word &= NextRandom(&state) & NextRandom(&state);
+    }
   }
 
   HipBuffer<float> d_q(q_count);
@@ -139,9 +145,32 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
   const std::uint32_t* mask_ptr = masked ? d_mask.get() : nullptr;
 
   q::Attention(d_q.get(), d_k.get(), d_v.get(), mask_ptr, mask_words,
-               d_ref.get(), n_tokens, d_pos.get(), kHeads, kKvHeads, kDim,
-               kRatio, nullptr);
+               d_ref.get(), nullptr, 1, n_tokens, d_pos.get(), kHeads, kKvHeads,
+               kDim, kRatio, nullptr);
   q::SigmoidMul(d_ref.get(), d_gate.get(), q_count, nullptr);
+  // The split-key form of the reference must match its single-block form
+  // (log-sum-exp merge), the way decode runs it.
+  {
+    constexpr std::uint32_t kSplits = 8;
+    HipBuffer<float> d_split(q_count);
+    HipBuffer<float> d_partials(static_cast<std::size_t>(n_tokens) * kHeads *
+                                kSplits * (kDim + 2));
+    q::Attention(d_q.get(), d_k.get(), d_v.get(), mask_ptr, mask_words,
+                 d_split.get(), d_partials.get(), kSplits, n_tokens,
+                 d_pos.get(), kHeads, kKvHeads, kDim, kRatio, nullptr);
+    q::SigmoidMul(d_split.get(), d_gate.get(), q_count, nullptr);
+    CheckHip(hipDeviceSynchronize(), "split attention");
+    const auto a = Download(&d_ref, q_count);
+    const auto b = Download(&d_split, q_count);
+    double worst = 0.0;
+    for (std::size_t i = 0; i < q_count; ++i) {
+      worst = std::max(worst, std::abs(static_cast<double>(a[i] - b[i])));
+    }
+    std::cout << "  split-key reference worst absolute error " << worst << '\n';
+    if (worst > 1e-4) {
+      throw std::runtime_error("split-key attention disagrees");
+    }
+  }
   if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
                               mask_ptr, mask_words, d_wmma.get(), n_tokens,
                               start_pos, kHeads, kKvHeads, kDim, kRatio,
@@ -159,6 +188,21 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     }
     worst = std::max(worst, std::abs(static_cast<double>(ref[i] - out[i])));
   }
+  if (std::getenv("QFN_ATTN_DEBUG") != nullptr && worst > 1e-2) {
+    for (std::uint32_t t = 0; t < n_tokens; ++t) {
+      for (std::uint32_t h = 0; h < kHeads; ++h) {
+        double w = 0.0;
+        for (std::uint32_t d = 0; d < kDim; ++d) {
+          const std::size_t i =
+              (static_cast<std::size_t>(t) * kHeads + h) * kDim + d;
+          w = std::max(w, std::abs(static_cast<double>(ref[i] - out[i])));
+        }
+        if (w > 1e-2) {
+          std::cout << "  query " << t << " head " << h << " err " << w << '\n';
+        }
+      }
+    }
+  }
   return worst;
 }
 
@@ -170,16 +214,20 @@ int main() {
       std::uint32_t n_tokens;
       std::uint32_t start_pos;
       bool masked;
+      bool sparse;
     };
-    const Case cases[] = {
-        {100, 0, false}, {64, 37, false}, {100, 0, true}, {77, 51, true}};
+    const Case cases[] = {{4, 4096, false, false}, {3, 9000, true, true},
+                          {100, 0, false, false},  {64, 37, false, false},
+                          {100, 0, true, false},   {77, 51, true, false},
+                          {96, 4096, true, true},  {70, 8000, true, true}};
     bool ok = true;
     std::uint32_t seed = 0x1234ABCDU;
     for (const Case& c : cases) {
-      const double worst = Compare(c.n_tokens, c.start_pos, c.masked, seed++);
+      const double worst =
+          Compare(c.n_tokens, c.start_pos, c.masked, seed++, c.sparse);
       std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
-                << (c.masked ? " masked" : " dense") << " worst absolute error "
-                << worst << '\n';
+                << (c.masked ? (c.sparse ? " sparse" : " masked") : " dense")
+                << " worst absolute error " << worst << '\n';
       // The reference accumulates FP32 probabilities; the WMMA route rounds
       // Q and P to FP16, so the contract is a small absolute envelope on
       // values of order one.

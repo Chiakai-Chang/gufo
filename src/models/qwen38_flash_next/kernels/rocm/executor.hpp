@@ -287,7 +287,7 @@ private:
     std::uint32_t* mask;
     float* scores;
     float* ctx;
-    std::uint32_t score_kv;  ///< widest dense window the fused kernel scores
+    float* attn_partials;  ///< split-key partials of a narrow batch
     // ple
     float* ple_emb;
     float* ple_key;
@@ -326,7 +326,9 @@ private:
   } s_{};
   float* trace_{nullptr};  ///< QFN_TRACE per-layer checksums
   std::uint32_t mask_words_{0};
-  std::uint32_t select_chunk_{64};
+  /// Queries per block-selection launch (its score scratch is chunk x
+  /// max_blocks floats: 128 MB at the 262k context).
+  std::uint32_t select_chunk_{512};
   std::vector<void*> allocations_;
   /// Pinned: the n-gram rows go up with hipMemcpyAsync, and a pageable
   /// source would not be ordered against the kernels behind it.

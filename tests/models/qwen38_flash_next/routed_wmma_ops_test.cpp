@@ -221,9 +221,10 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
                    static_cast<std::uint32_t>(used),
                    static_cast<std::uint32_t>(experts), nullptr);
   q::QuantizeQ8Tiled(d_x, d_tiled, n_tokens, k, nullptr);
-  if (!q::RoutedWmmaGemm(
-          d_w, type, d_tiled, d_bounds, d_rows_token, d_rows_slot, d_wmma, m, k,
-          static_cast<std::uint32_t>(experts), max_bucket, nullptr)) {
+  if (!q::RoutedWmmaGemm(d_w, type, d_tiled, d_bounds, d_rows_token,
+                         d_rows_slot, nullptr, d_wmma, m, k,
+                         static_cast<std::uint32_t>(experts), max_bucket,
+                         nullptr)) {
     throw std::runtime_error("routed WMMA GEMM rejected the shape");
   }
   CheckHip(hipDeviceSynchronize(), "routed GEMMs");
