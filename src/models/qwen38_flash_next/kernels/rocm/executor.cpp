@@ -73,6 +73,16 @@ WeightType SmallType(GgmlType type) {
 constexpr std::uint32_t kVecBatch = 8;
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
 constexpr std::uint32_t kAttnSplits = 8;
+/// Token rows per routed F16 expert GEMM tile.
+constexpr std::uint32_t kRoutedTileRows = 48;
+
+/// Upper bound on launched routed tiles: every 16-padded bucket contributes
+/// at most one partial tile beyond its rows.
+std::size_t RoutedTileCapacity(std::size_t slots, const Config& c) {
+  return (slots + static_cast<std::size_t>(c.num_experts) * 15) /
+             kRoutedTileRows +
+         c.num_experts + 1;
+}
 
 }  // namespace
 
@@ -116,7 +126,7 @@ Executor::~Executor() {
   for (void* p :
        {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
         static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
-        static_cast<void*>(counts_host_)}) {
+        static_cast<void*>(counts_host_), static_cast<void*>(tiles_host_)}) {
     if (p != nullptr) {
       (void)hipHostFree(p);
     }
@@ -244,9 +254,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.routed_cursors = Alloc<std::int32_t>(a, c.num_experts, error_msg);
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
-    s.x_q8t_routed = Alloc<std::uint8_t>(
-        a, std::max(Q8TiledBytes(T, hidden), Q8TiledBytes(slots, c.expert_ff)),
-        error_msg);
+    s.routed_tiles =
+        Alloc<std::int32_t>(a, RoutedTileCapacity(slots, c), error_msg);
   }
   s.weights = f32(slots);
   s.gate_e = f32(slots * c.expert_ff);
@@ -277,6 +286,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       return nullptr;
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
+    void* tiles = nullptr;
+    if (!Check(hipHostMalloc(
+                   &tiles, RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
+               "pinned routed tile map", error_msg)) {
+      return nullptr;
+    }
+    e->tiles_host_ = static_cast<std::int32_t*>(tiles);
     e->control_host_ = static_cast<Session::Control*>(control);
     e->tokens_host_ = static_cast<std::int32_t*>(tokens);
     e->logits_host_ = static_cast<float*>(logits);
@@ -436,7 +452,7 @@ bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
 
 bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
-                          std::string* error_msg) const {
+                          bool q8_tiled_out, std::string* error_msg) const {
   // One single-token launch computes both projections and the SwiGLU (the
   // tier fuses the gate for one column only).
   if (n_tokens == 1 && up.type == GgmlType::kQ8_0 &&
@@ -460,6 +476,16 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
       !Dense(up, x, s_.shexp_gate, n_tokens, error_msg)) {
     return false;
   }
+  // A wide batch writes the down projection's tiled Q8 input directly (the
+  // F32 rows are read by nothing else); the cache lets Dense skip its
+  // activation pass.
+  if (q8_tiled_out && n_tokens > kVecBatch && n_tokens <= options_.max_batch &&
+      SwigluQ8Tiled(out, s_.shexp_gate, s_.x_q8t, n_tokens, up.rows, stream_)) {
+    q8t_src_ = out;
+    q8t_rows_ = n_tokens;
+    q8t_cols_ = up.rows;
+    return true;
+  }
   Swiglu(out, s_.shexp_gate, static_cast<std::size_t>(n_tokens) * up.rows,
          stream_);
   return true;
@@ -480,8 +506,15 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     const std::uint32_t piece = static_cast<std::uint32_t>(options_.max_batch);
     for (std::uint32_t r0 = 0; r0 < n_tokens; r0 += piece) {
       const std::uint32_t rows = std::min(piece, n_tokens - r0);
-      QuantizeQ8Tiled(x + static_cast<std::size_t>(r0) * w.cols, s_.x_q8t, rows,
-                      w.cols, stream_);
+      // The tiled buffer may already hold this input (a producer wrote it,
+      // or the previous projection read the same rows).
+      const float* src = x + static_cast<std::size_t>(r0) * w.cols;
+      if (!(q8t_src_ == src && q8t_rows_ == rows && q8t_cols_ == w.cols)) {
+        QuantizeQ8Tiled(src, s_.x_q8t, rows, w.cols, stream_);
+        q8t_src_ = src;
+        q8t_rows_ = rows;
+        q8t_cols_ = w.cols;
+      }
       if (!W8A8Gemm(w.data, s_.x_q8t,
                     out + static_cast<std::size_t>(r0) * w.rows, rows, w.rows,
                     w.cols, stream_)) {
@@ -514,8 +547,15 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
   }
   const bool bf16 = w.type == GgmlType::kBF16;
   const hipDataType type = bf16 ? HIP_R_16BF : HIP_R_16F;
-  NarrowActivations(x, s_.x_half, bf16, static_cast<std::size_t>(n) * k,
-                    stream_);
+  if (!(half_src_ == x && half_rows_ == n_tokens && half_cols_ == w.cols &&
+        half_bf16_ == bf16)) {
+    NarrowActivations(x, s_.x_half, bf16, static_cast<std::size_t>(n) * k,
+                      stream_);
+    half_src_ = x;
+    half_rows_ = n_tokens;
+    half_cols_ = w.cols;
+    half_bf16_ = bf16;
+  }
   return blaslt_->Gemm({w.data, type, k, 0, false},
                        {s_.x_half, type, k, 0, false}, out, m, 0, m, n, k, 1,
                        error_msg);
@@ -556,21 +596,30 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
       !Check(hipStreamSynchronize(stream_), "expert counts", error_msg)) {
     return false;
   }
+  // The F16 expert GEMM launches one block per (expert, 48-row tile of its
+  // 16-padded bucket): the map is built here and uploaded ahead of the
+  // launches on the same stream.
   std::uint32_t max_rows = 0;
-  std::uint32_t max_pad = 0;
   std::size_t compact = 0;
+  std::uint32_t n_tiles = 0;
   for (std::uint32_t e = 0; e < c.num_experts; ++e) {
     const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
     max_rows = std::max(max_rows, counts_host_[e]);
-    max_pad = std::max(max_pad, padded);
     compact += padded;
+    for (std::uint32_t j = 0;
+         j < (padded + kRoutedTileRows - 1) / kRoutedTileRows; ++j) {
+      tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+    }
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
-  routed_max_pad_ = std::max<std::uint32_t>(16, max_pad);
+  routed_n_tiles_ = n_tiles;
   routed_compact_rows_ = std::max<std::size_t>(16, compact);
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
       counts_host_, static_cast<int>(c.num_experts));
-  return true;
+  return n_tiles == 0 || Check(hipMemcpyAsync(s_.routed_tiles, tiles_host_,
+                                              n_tiles * sizeof(std::int32_t),
+                                              hipMemcpyHostToDevice, stream_),
+                               "routed tile map upload", error_msg);
 }
 
 bool Executor::Experts(const DeviceTensor& w, const float* x,
@@ -655,6 +704,23 @@ void Executor::Combine(float* res, const float* gamma,
   // projection: half the bytes for the combine and the epilogue, and no
   // separate activation pass for the projection.
   xn_half_ = wide_mixer_ && n_tokens > kVecBatch && gamma != nullptr;
+  if (moe_pending_) {
+    // The MoE epilogue was deferred to this combine (see Moe).
+    moe_pending_ = false;
+    const auto* down = reinterpret_cast<const __half*>(s_.down_e);
+    if (xn_half_ &&
+        HcCombineMoeF16(res, down, s_.weights, s_.shexp_out,
+                        s_.router + c.num_experts, c.num_experts + 1,
+                        c.num_experts_used, s_.inject, inject_parts_, gamma,
+                        s_.xn_half, s_.xn_q8t, n_tokens, c.hidden_size,
+                        c.hc_count, c.rms_eps, stream_)) {
+      return;
+    }
+    MoeEpilogueVec4F16(down, s_.weights, s_.shexp_out,
+                       s_.router + c.num_experts, c.num_experts + 1,
+                       s_.block_out, n_tokens, c.num_experts_used,
+                       c.hidden_size, stream_);
+  }
   if (xn_half_) {
     HcCombineF16(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn_half,
                  s_.xn_q8t, n_tokens, c.hidden_size, c.hc_count, c.rms_eps,
@@ -697,10 +763,27 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   const bool vectorized =
       xn_half_ ||
       (n_tokens > kVecBatch && c.hc_count == 4 && c.hidden_size % 4 == 0);
+  // `mixed` is being rewritten: whatever the input caches held of it is
+  // stale. The wide F16 route also emits the F16 and tiled Q8 copies the
+  // projections that follow read.
+  q8t_src_ = nullptr;
+  half_src_ = nullptr;
   if (xn_half_) {
-    HcMixEpilogueVec4F16(s_.xn_half, s_.hc_gate,
-                         fused_inject ? m.inject.f32() : nullptr, mixed, inject,
-                         n_tokens, c.hidden_size, stream_);
+    const bool extras = n_tokens <= options_.max_batch &&
+                        c.hidden_size <= model_->max_half_cols();
+    HcMixEpilogueVec4F16(
+        s_.xn_half, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr, mixed,
+        extras ? static_cast<__half*>(s_.x_half) : nullptr,
+        extras ? s_.x_q8t : nullptr, inject, n_tokens, c.hidden_size, stream_);
+    if (extras) {
+      half_src_ = mixed;
+      half_rows_ = n_tokens;
+      half_cols_ = c.hidden_size;
+      half_bf16_ = false;
+      q8t_src_ = mixed;
+      q8t_rows_ = n_tokens;
+      q8t_cols_ = c.hidden_size;
+    }
   } else if (vectorized) {
     HcMixEpilogueVec4(xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
                       mixed, inject, n_tokens, c.hidden_size, c.hc_count,
@@ -833,14 +916,28 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
     return false;
   }
-  GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
-                l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
-                s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
-                speculative ? s.state_snapshots : nullptr,
-                speculative ? s.conv_snapshots : nullptr, n_tokens,
-                c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
-                c.ssm_conv_kernel, n_tokens > kVecBatch && !speculative,
-                c.rms_eps, stream_);
+  // Wide batches hand the output projection its tiled Q8 input straight
+  // from the epilogue: no F32 row and no activation pass.
+  const bool tiled = n_tokens > kVecBatch &&
+                     l.ssm_out.type == GgmlType::kQ8_0 &&
+                     n_tokens <= options_.max_batch;
+  GatedDeltaNet(
+      qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
+      l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
+      s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
+      tiled ? s_.x_q8t : nullptr, speculative ? s.state_snapshots : nullptr,
+      speculative ? s.conv_snapshots : nullptr, n_tokens, c.ssm_num_k_heads,
+      c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
+      n_tokens > kVecBatch && !speculative, c.rms_eps, stream_);
+  if (tiled) {
+    q8t_src_ = nullptr;
+    if (!W8A8Gemm(l.ssm_out.data, s_.x_q8t, out, n_tokens, l.ssm_out.rows,
+                  l.ssm_out.cols, stream_)) {
+      AssignError(error_msg, "W8A8 GEMM failed");
+      return false;
+    }
+    return true;
+  }
   return Dense(l.ssm_out, s_.gdn_out, out, n_tokens, error_msg);
 }
 
@@ -951,6 +1048,14 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
+  // The shared expert (gated by the last router row) does not depend on
+  // the routing, so it is launched before the expert-count readback: its
+  // GEMMs keep the device busy while the host waits for the counts.
+  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
+                  l.shexp_down.type == GgmlType::kQ8_0, error_msg) ||
+      !Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg)) {
+    return false;
+  }
   if (!RouteHints(n_tokens, error_msg)) {
     return false;
   }
@@ -963,36 +1068,57 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   const bool wmma_experts = n_tokens > 4 * kVecBatch &&
                             static_cast<std::size_t>(n_tokens) * used >=
                                 static_cast<std::size_t>(16) * c.num_experts &&
-                            l.ffn_gate_exps.type == GgmlType::kQ4_K &&
-                            l.ffn_up_exps.type == GgmlType::kQ4_K &&
-                            l.ffn_down_exps.type == GgmlType::kQ5_1 &&
-                            c.hidden_size % 256 == 0 && c.expert_ff % 32 == 0;
+                            (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
+                             l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
+                            l.ffn_up_exps.type == l.ffn_gate_exps.type &&
+                            (l.ffn_down_exps.type == GgmlType::kQ5_1 ||
+                             l.ffn_down_exps.type == GgmlType::kQ8_0) &&
+                            c.hidden_size % 256 == 0 && c.expert_ff % 64 == 0;
   if (wmma_experts) {
     RoutedCompact(s_.ids, s_.expert_counts, s_.routed_bounds, s_.routed_cursors,
                   s_.rows_token, s_.rows_slot, n_tokens, used, c.num_experts,
                   stream_);
-    // Tokens are quantized once; the GEMM gathers them per compact row.
-    QuantizeQ8Tiled(x, s_.x_q8t_routed, n_tokens, c.hidden_size, stream_);
+    // The GEMMs read F16 token rows: the router's F16 GEMM (or the mix)
+    // usually left them in s_.x_half already.
+    if (!(half_src_ == x && half_rows_ == n_tokens &&
+          half_cols_ == c.hidden_size && !half_bf16_)) {
+      NarrowActivations(x, s_.x_half, false,
+                        static_cast<std::size_t>(n_tokens) * c.hidden_size,
+                        stream_);
+      half_src_ = x;
+      half_rows_ = n_tokens;
+      half_cols_ = c.hidden_size;
+      half_bf16_ = false;
+    }
+    const auto* x_half = static_cast<const __half*>(s_.x_half);
     // The up projection's epilogue applies the SwiGLU with the gate output
-    // and writes the down projection's input in place of the up result.
-    if (!RoutedWmmaGemm(l.ffn_gate_exps.data, WeightType::kQ4_K,
-                        s_.x_q8t_routed, s_.routed_bounds, s_.rows_token,
-                        s_.rows_slot, nullptr, s_.gate_e, c.expert_ff,
-                        c.hidden_size, c.num_experts, routed_max_pad_,
-                        stream_) ||
-        !RoutedWmmaGemm(l.ffn_up_exps.data, WeightType::kQ4_K, s_.x_q8t_routed,
-                        s_.routed_bounds, s_.rows_token, s_.rows_slot,
-                        s_.gate_e, s_.up_e, c.expert_ff, c.hidden_size,
-                        c.num_experts, routed_max_pad_, stream_)) {
-      AssignError(error_msg, "routed WMMA gate/up GEMM failed");
+    // and writes the down projection's F16 input in place of the up result.
+    auto* up_half = reinterpret_cast<__half*>(s_.up_e);
+    const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
+                                     ? WeightType::kQ5_K
+                                     : WeightType::kQ4_K;
+    if (!RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half, s_.routed_tiles,
+                       routed_n_tiles_, s_.routed_bounds, s_.rows_token,
+                       s_.rows_slot, nullptr, s_.gate_e, nullptr, c.expert_ff,
+                       c.hidden_size, stream_) ||
+        !RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half, s_.routed_tiles,
+                       routed_n_tiles_, s_.routed_bounds, s_.rows_token,
+                       s_.rows_slot, s_.gate_e, nullptr, up_half, c.expert_ff,
+                       c.hidden_size, stream_)) {
+      AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }
-    QuantizeQ8Tiled(s_.up_e, s_.x_q8t_routed, slots, c.expert_ff, stream_);
-    if (!RoutedWmmaGemm(l.ffn_down_exps.data, WeightType::kQ5_1,
-                        s_.x_q8t_routed, s_.routed_bounds, s_.rows_slot,
-                        s_.rows_slot, nullptr, s_.down_e, c.hidden_size,
-                        c.expert_ff, c.num_experts, routed_max_pad_, stream_)) {
-      AssignError(error_msg, "routed WMMA down GEMM failed");
+    const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
+                                     ? WeightType::kQ8_0
+                                     : WeightType::kQ5_1;
+    // The down projection's rows are F16 too: the epilogue reads half the
+    // bytes of the largest routed intermediate.
+    if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
+                       s_.routed_tiles, routed_n_tiles_, s_.routed_bounds,
+                       s_.rows_slot, s_.rows_slot, nullptr, nullptr,
+                       reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
+                       c.expert_ff, stream_)) {
+      AssignError(error_msg, "routed F16 down GEMM failed");
       return false;
     }
   } else {
@@ -1008,13 +1134,17 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   }
-  // Shared expert, gated by the last router row.
-  if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
-                  error_msg) ||
-      !Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg)) {
-    return false;
-  }
-  if (n_tokens > kVecBatch) {
+  if (wmma_experts) {
+    // The combine that follows folds this epilogue into its own pass when
+    // it takes the F16 route (Combine); otherwise it runs here.
+    moe_pending_ = trace_ == nullptr && out == s_.block_out;
+    if (!moe_pending_) {
+      MoeEpilogueVec4F16(reinterpret_cast<const __half*>(s_.down_e), s_.weights,
+                         s_.shexp_out, s_.router + c.num_experts,
+                         c.num_experts + 1, out, n_tokens, used, c.hidden_size,
+                         stream_);
+    }
+  } else if (n_tokens > kVecBatch) {
     MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
                     s_.router + c.num_experts, c.num_experts + 1, out, n_tokens,
                     used, c.hidden_size, stream_);

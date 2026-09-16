@@ -20,6 +20,7 @@ enum class WeightType : std::uint32_t {
   kQ5_1 = 7,
   kQ8_0 = 8,
   kQ4_K = 12,
+  kQ5_K = 13,
   kBF16 = 30,
 };
 
@@ -52,9 +53,12 @@ void HcMixEpilogueVec4(const float* xn, const float* gate,
                        std::uint32_t n_tokens, std::uint32_t hidden,
                        std::uint32_t streams, hipStream_t stream);
 /// The vec4 epilogue over an F16 `xn` (the F16 mixer input route); the
-/// four-stream geometry is the caller's contract.
+/// four-stream geometry is the caller's contract. Non-null `mixed_half` /
+/// `mixed_q8` also receive the mixed rows as F16 and in the W8A8 tiled Q8
+/// layout (K = hidden).
 void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
-                          const float* inject_w, float* mixed, float* inject,
+                          const float* inject_w, float* mixed,
+                          __half* mixed_half, void* mixed_q8, float* inject,
                           std::uint32_t n_tokens, std::uint32_t hidden,
                           hipStream_t stream);
 
@@ -75,12 +79,29 @@ void HcCombineF16(float* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                   std::uint32_t streams, float eps, hipStream_t stream);
+/// HcCombineF16 with the MoE epilogue fused in: the block output is
+/// MoeEpilogueVec4F16's result over `expert_out` ([tokens][used][hidden]
+/// F16 rows), `weights`, the gated shared expert; it is formed in
+/// registers and never written. Returns false (launching nothing) for a
+/// geometry the fused kernel does not cover (four 2,560-wide streams with a
+/// norm and the tiled Q8 output are required).
+bool HcCombineMoeF16(float* res, const __half* expert_out, const float* weights,
+                     const float* shared_out, const float* gate,
+                     std::uint32_t gate_stride, std::uint32_t used,
+                     const float* inject, std::uint32_t inject_parts,
+                     const float* gamma, __half* xn, void* xn_q8,
+                     std::uint32_t n_tokens, std::uint32_t hidden,
+                     std::uint32_t streams, float eps, hipStream_t stream);
 
 /// x[i] = silu(x[i] * scale), in place over `count` floats.
 void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
 /// gate[i] = silu(gate[i]) * up[i], in place in `gate`.
 void Swiglu(float* gate, const float* up, std::size_t count,
             hipStream_t stream);
+/// silu(gate) * up over n_rows rows of k elements, written only into the
+/// W8A8 tiled Q8 layout `out_q8`; false (nothing launched) unless k % 32 == 0.
+bool SwigluQ8Tiled(const float* gate, const float* up, void* out_q8,
+                   std::size_t n_rows, std::size_t k, hipStream_t stream);
 /// x[i] *= sigmoid(g[i]).
 void SigmoidMul(float* x, const float* g, std::size_t count,
                 hipStream_t stream);
@@ -106,27 +127,33 @@ void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
               std::size_t m, std::size_t k, hipStream_t stream);
 
-/// Routed expert GEMMs on the int8 WMMA cores. RoutedCompact sorts the
-/// (token, slot) assignments by expert into `rows_token`/`rows_slot`
-/// (RoutedCompactRows(slots, experts) entries, -1 for padding) with every
-/// bucket padded to 16 rows (`pad_bounds`, experts + 1 entries) from the
-/// per-expert `counts`. RoutedWmmaGemm reads activations quantized once per
-/// source row with QuantizeQ8Tiled (`x_tiled`), gathering compact row c's
-/// row through `rows_in[c]`, and computes out[rows_out[c]][m] for Q4_K
-/// (k % 256 == 0) or Q5_1 (k % 32 == 0) expert weights [experts][m][k],
-/// returning false, launching nothing, for other types.
+/// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
+/// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,
+/// experts) entries, -1 for padding) with every bucket padded to 16 rows
+/// (`pad_bounds`, experts + 1 entries) from the per-expert `counts`.
 std::size_t RoutedCompactRows(std::size_t slots, std::size_t n_experts);
 void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
                    std::int32_t* pad_bounds, std::int32_t* cursors,
                    std::int32_t* rows_token, std::int32_t* rows_slot,
                    std::uint32_t n_tokens, std::uint32_t k,
                    std::uint32_t n_experts, hipStream_t stream);
-bool RoutedWmmaGemm(const void* w, WeightType type, const void* x_tiled,
-                    const std::int32_t* pad_bounds, const std::int32_t* rows_in,
-                    const std::int32_t* rows_out, const float* swiglu_gate,
-                    float* out, std::size_t m, std::size_t k,
-                    std::uint32_t n_experts, std::uint32_t max_bucket_rows,
-                    hipStream_t stream);
+
+/// Routed expert GEMM on the F16 WMMA cores over F16 activation rows
+/// `x` ([rows][k]): the weights are dequantized to F16 after the LDS read
+/// and the whole K extent accumulates in F32. `tiles` (n_tiles entries)
+/// packs each launched (expert, 48-row token tile) as expert | tile << 16,
+/// so empty tiles cost nothing. Exactly one of `out` (F32) and `out_half`
+/// (F16) receives the result; a non-null `swiglu_gate` (the gate
+/// projection's F32 output over the same rows) turns it into
+/// silu(gate) * result.
+/// Q4_K and Q5_K need k % 256 == 0, Q5_1 and Q8_0 k % 64 == 0; other types
+/// return false.
+bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
+                   const std::int32_t* tiles, std::uint32_t n_tiles,
+                   const std::int32_t* pad_bounds, const std::int32_t* rows_in,
+                   const std::int32_t* rows_out, const float* swiglu_gate,
+                   float* out, __half* out_half, std::size_t m, std::size_t k,
+                   hipStream_t stream);
 
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
@@ -168,13 +195,15 @@ void PleInject(float* res, const float* gated, const float* conv,
 /// Scratch: `conv_scratch` ((n_tokens + kernel) * channels), `qn`/`kn`
 /// (n_tokens * k_heads * d), `raw` (n_tokens * v_heads * d).
 /// `qkv` rows are `qkv_stride` floats apart and `z` rows `z_stride`, so a
-/// stacked [qkv|z] projection feeds both without unpacking.
+/// stacked [qkv|z] projection feeds both without unpacking. A non-null
+/// `out_q8` receives the rows quantized into the W8A8 tiled layout
+/// (K = v_heads * d) instead of `out`.
 void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
                    const float* norm_w, float* conv_state, float* conv_scratch,
                    float* qn, float* kn, float* raw, float* state, float* out,
-                   float* state_snapshots, float* conv_snapshots,
+                   void* out_q8, float* state_snapshots, float* conv_snapshots,
                    std::uint32_t n_tokens, std::uint32_t k_heads,
                    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
                    bool row_split, float eps, hipStream_t stream);
@@ -276,6 +305,12 @@ void MoeEpilogueVec4(const float* expert_out, const float* weights,
                      std::uint32_t gate_stride, float* out,
                      std::uint32_t n_tokens, std::uint32_t k, std::uint32_t dim,
                      hipStream_t stream);
+/// MoeEpilogueVec4 over F16 expert rows.
+void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
+                        const float* shared, const float* gate,
+                        std::uint32_t gate_stride, float* out,
+                        std::uint32_t n_tokens, std::uint32_t k,
+                        std::uint32_t dim, hipStream_t stream);
 
 /// MTP input: res[t][s][i] = eh_proj( [enorm(embd[t]) ; hnorm(h[t][s])] ) is
 /// assembled here as concat[t][s][2*hidden] for the tier's GEMM.

@@ -12,14 +12,14 @@ draft block. Build: `nix develop` gpu preset, `gufo bench`.
 per shape, then the timed one; single samples, the host's noise band is about
 ±1% with occasional 150–300 tok/s dips from background jobs):
 
-| test | gufo | before the prefill work (`97b445b`) | llama.cpp ROCm `41abbfd59` (`-fa 1 -ub 2048`) |
-| --- | ---: | ---: | ---: |
-| pp128 | 464 | 443 | — |
-| pp512 | 796 | 628 | 402 |
-| pp1024 | 931 | — | — |
-| pp2048 | 1007 | 719 | 439 |
-| tg64 greedy | 22.7 | 22.8 | 21.9 |
-| tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 32.9 (depth 0) / 36.5 (depth 1024) / 35.0 (depth 4096) / 42.9 (depth 16384) | 38.4 / 35.0 / 30.4 / — | — |
+| test | gufo | before the F16 expert card (`72fe0f4`) | before the prefill work (`97b445b`) | llama.cpp ROCm `41abbfd59` (`-fa 1 -ub 2048`) |
+| --- | ---: | ---: | ---: | ---: |
+| pp128 | 473 | 464 | 443 | — |
+| pp512 | 814 | 796 | 628 | 402 |
+| pp1024 | 1184 | 931 | — | — |
+| pp2048 | 1298 | 1040 | 719 | 439 |
+| tg64 greedy | 22.8 | 22.7 | 22.8 | 21.9 |
+| tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 29.5 (depth 0; 76.3 ms per cycle, 71/168 drafts accepted on a different greedy continuation) | 32.9 (depth 0) / 36.5 (depth 1024) / 35.0 (depth 4096) / 42.9 (depth 16384) | 38.4 / 35.0 / 30.4 / — | — |
 
 Context depth (`-p 2048 -n 64 -b 2048 -d N`, one 2048-token chunk and 64
 decode steps after N prepared tokens; the sparse attention budget is 2048
@@ -47,8 +47,9 @@ prefill numerics changed (W8A8 and F16 mixer inputs instead of the Q8 MMQ
 tier) and that continuation happens to accept 76/153.
 
 Batched prefill against the sequential reference at 2048 tokens: finite,
-scalar winner rank 1, RMSE 0.30, cosine 1.00, max error 1.96 (128 tokens
-before the work: RMSE 0.61, cosine 0.99). Agreement with llama.cpp on a
+scalar winner rank 1, RMSE 0.26, cosine 1.00, max error 1.73 (RMSE 0.30, max
+error 1.96 before the F16 expert card; 128 tokens before the prefill work:
+RMSE 0.61, cosine 0.99). Agreement with llama.cpp on a
 776-token README prompt before the work: argmax 59–62/64 of the last rows,
 mean KL 0.008–0.010, max 0.15.
 
@@ -78,18 +79,39 @@ targets under `tests/models/qwen38_flash_next/` (label
 | routed WMMA route from 16 rows per expert (was 24) | retained, pp1024 914 → 931 | after the LDS padding the WMMA tier wins at 1024 tokens too; pp512 (ten-row buckets) stays on MMQ |
 | routed GEMM LDS plane padding | retained, +0.7% (1014 → 1022) | one-element padding per K-block plane halves the bank conflicts (22–28% → 11–18% of cycles); MemUnitBusy then reads 93–95%, so the kernel is memory-unit bound at ~15 TOPS |
 | routed GEMM tiles 128x96 (4x2 waves) / BK=2 | rejected | 6.53 / 8.51 ms and 4.76 / 5.77 ms per call against 4.45 / 5.36 for 128x48 BK=4: fewer weight re-fetches lose to the occupancy drop (256 VGPRs, 34 KB LDS) |
+| routed F16 WMMA expert GEMM (replaces the int8 kernel) | retained, pp2048 1040 → 1162 | the int8 kernel paid a float epilogue and an activation-sum correction every K block (VALU and WMMA serialize on gfx1151: WMMA 1.63 ms + VALU 0.66 ms of a 4.3 ms Q4_K call); the F16 kernel dequantizes the codes after the LDS read (packed nibbles / raw Q5_1 blocks in LDS, 11–12 KB, five blocks per WGP) with a byte permute into the mantissa of 1024.0, an exact packed subtract and one packed FMA, reads F16 activation rows (the router's narrow of x; the up projection's epilogue writes the down projection's F16 input) and accumulates all of K in F32: Q4_K gate/up 4.3 → 3.3 ms, Q5_1 down 5.3 → 4.4 ms in the harness (10x closer to F64 than the int8 route: 1.33 vs 12.2 at scale 4036); a host-built tile map (expert \| tile << 16) launches no empty blocks and the grid runs row blocks fastest so a tile's gathered activations stay in L2 (tiles-fastest was 4.5 / 9.4 ms) |
+| Q8_0 and Q5_K experts on the F16 route | retained, +55 tok/s with the combine below | the five Q8_0-down layers ran the MMQ tier at 12 ms per down call (4.4 ms on the F16 route: signed bytes carried as q + 128 with a 1152 magic) and the Q5_K layer's tier calls sat behind 7.8 ms host gaps between its quantize and GEMM launches; every wide MoE layer now takes the F16 route |
+| F16 down rows + F16 MoE epilogue | retained, +5 (bench) / −22 ms per pass (profile) | the down projection writes F16 rows and the epilogue reads them: half the bytes of the largest routed intermediate |
+| one block per token hyper-connection combine | retained, 1.71 → 1.27 ms per call | float4 lanes over all four streams of a token, the updated residual kept in registers between the two passes, one block reduction for the four norms, four-code stores into the tiled Q8 norm |
+| multi-token hyper-connection mix | retained, 0.93 → 0.83 ms per call | eight tokens per block reuse the block's inject weight slice from registers (sixteen weight loads per token dominated the one-token kernel) |
+| sliding-window causal conv | retained, 1.27 → 0.80 ms per call | one thread per (channel, eight tokens): the four taps in one float4, the window in registers, one load and one store per token |
+| vec4 tiled Q8 quantizer | retained, ≈ −20 ms per pass | four elements per lane, eight lanes per block, four-code stores |
+| activation-pass fusions | retained, ≈ −35 ms per pass | the GDN epilogue writes the ssm_out projection's tiled Q8 input, the mix writes the F16 and tiled Q8 copies of `mixed` that the router / routed GEMMs and the mixer in-projection read, the shared expert's SwiGLU writes its down projection's tiled input, and an input cache lets a projection over rows that are already staged skip its pass; the shared expert is launched before the expert-count readback so the device stays busy through it |
+| MoE epilogue fused into the combine | retained, 2.05 → 1.75 ms per layer | the block output row is formed in registers from the experts' F16 rows and never written |
+| BM=256 (two row tiles per wave) F16 expert GEMM | rejected | 4.46 / 4.40 ms: spills at m = 640 (three row blocks, the last half empty) and no gain for the down projection, so the activation LDS reads are not the bound |
+| two-stage weight prefetch, 128-byte-per-row fetch rounds | rejected | 4.4 / 4.4 and 4.7–4.9 / 4.6–5.1 ms: the compiler caps VGPRs at 144–152 for the LDS-derived occupancy and spills; ablations put the F16 kernel at 2.3 / 2.9 ms with no weight loads, 2.7 / 3.1 with fully coalesced ones and 3.2 / 3.7 with the real pattern served from cache, so the remaining cost is the sixteen-lines-per-instruction fetch itself (about 0.5 ms) plus 0.1 / 0.7 ms of exposed DRAM |
+| 64x64 tiles for the 320-row mixer down | rejected | 0.47 vs 0.40 ms per call: the weight re-reads cost more than the occupancy gained |
 | fused Q4_K expert gate/up (decode) | rejected | MTP tg128 38.6 → 33.5 despite fewer cycles |
 | 40-row expert vector dispatch (decode) | rejected | vector 33.3 versus tiled 38.0 tok/s |
 
-## Where the time goes (after the prefill work)
+## Where the time goes (after the F16 expert card)
 
-Two profiled pp2048 passes, 4.5 s GPU-busy: dense W8A8 GEMMs 20% (about 30
-TOPS, 54% of the int8 WMMA ceiling), routed expert GEMMs 34%, hyper-connection
-combine and mix 10%, DeltaNet recurrence 5%, MoE epilogue and activation
-quantization 5%, attention 2%. The routed GEMMs stream 1.57 GB of expert
-weights per layer at about 90 GB/s equivalent on either tier: the WMMA
-kernel is memory-unit bound (MemUnitBusy 73%, LDS bank conflicts 22–28%),
-not matrix-core bound.
+One profiled pp2048 pass, 1.62 s GPU-busy (idle between dispatches 7 ms):
+dense W8A8 GEMMs 30% (about 32 TOPS, 58% of the WMMA ceiling; the 16384-row
+GDN in-projection alone is 12%), routed expert GEMMs 34% (Q4_K gate/up 3.5
+ms, Q5_1 down 4.5 ms per layer), DeltaNet recurrence 7%, hyper-connection
+combine (with the MoE epilogue) and mix 15%, attention 3%, causal conv 2%.
+VALU and WMMA do not overlap on gfx1151, so the expert GEMM's floor is its
+WMMA issue (1.63 ms per Q4_K call) plus its dequant VALU (0.66 ms); the
+measured 3.3 ms adds the weight fetch (sixteen cache lines per wave-wide
+load, about 0.5 ms) and exposed DRAM latency. The int8 dense kernel's float
+epilogue is 17% of its time (ablation).
+
+Before the card (two passes, 4.5 s): dense W8A8 GEMMs 20%, routed expert
+GEMMs 34%, hyper-connection combine and mix 10%, DeltaNet recurrence 5%,
+MoE epilogue and activation quantization 5%, attention 2%; the int8 routed
+kernel streamed 1.57 GB of expert weights per layer at about 90 GB/s
+equivalent (MemUnitBusy 73%, LDS bank conflicts 22–28%).
 
 Decode streams ~6 GB per token (dense Q8 4.5 GB including the 675 MB output
 head, experts 1.5 GB): the GEMVs run at ~210 GB/s, elementwise work ~7 ms,
@@ -97,14 +119,22 @@ graph replay leaves ~1.3 µs per launch of gaps.
 
 ## TODOs
 
-- pp2048 above ~1,050 needs a different expert GEMM: the routed WMMA kernel
-  is at 15 TOPS and the fetch/LDS path, not the matrix cores, bounds it
-  (ablations above); the expert weight stream alone floors a chunk at about
-  310 ms of the current 2.0 s. Candidates in order: stage scales once per row
-  tile instead of per K block, swizzle the LDS fragment layout (22–28% bank
-  conflicts), a load-time repack of the Q4_K/Q5_1 experts into a
-  fragment-major int8 layout with separate scale planes (the prototype's
-  layout), and a fused gate+up kernel sharing the activation stage.
+- Routed F16 GEMM: the weight fetch reads sixteen 32-byte row pieces per
+  wave-wide load; 128 contiguous bytes per row per instruction needs four
+  stages of codes in registers, which the compiler spills at the
+  occupancy it targets (rejected rounds above). A fragment-major repack of
+  the expert codes at load time would make each stage's sixteen rows one
+  512-byte read, but the decode GEMVs read the standard layout, so it needs
+  either a second copy (72 GB) or repacked decode kernels. A fused gate+up
+  kernel sharing the activation stage halves the activation traffic and the
+  gate round trip.
+- Dense W8A8 GEMM at 58% of the WMMA ceiling: the per-K-block float
+  epilogue is 17% of its time; an F16 formulation like the expert GEMM
+  (Q8_0 codes dequantized after the LDS read, F16 activations from the
+  producers) removes it and the activation passes, but every dense input
+  would have to be produced as F16.
+- DeltaNet recurrence (3.0 ms per layer, 7% of a pass) is a sequential
+  per-token chain; a chunked formulation would turn it into GEMMs.
 - Attention at depth: a 5-query x 12-head flat row layout (60 live rows of
   64) would cut the sparse sweep another ~10%; the indexer scan
   (SelectScoreKernel, 1.7 ms per layer at 16k) could score 64 queries per
@@ -113,20 +143,12 @@ graph replay leaves ~1.3 µs per launch of gaps.
   at 4x the batch; the W8A8 path chunks them to the tiled buffer (found as
   a GPU fault in MTP decode past 2048 tokens of context: the first card's
   W8A8 route overflowed that buffer silently below 4096 and faulted above).
-- Routed WMMA GEMM: the fetch path, not the matrix cores, bounds it (ablating
-  all WMMA work leaves 5.8 ms of the 5.2 ms call). Candidates: stage the
-  per-32 scales and offsets once per row tile instead of per K block (they
-  are half the LDS read traffic), a token-major lane mapping so a wave load
-  covers whole 128-byte lines, and a fused gate/up kernel sharing the
-  activation stage with the SwiGLU and the down-input quantization in its
-  epilogue.
-- Fuse the SwiGLU and the down-projection activation quantization into the
-  up GEMM's epilogue (about 1 ms per layer of elementwise traffic).
 - The hyper-connection combine and mix are bandwidth bound on the F32
   residual stream (about 250 MB per call); a BF16 residual would halve it at
   a precision cost that needs its own validation.
-- pp512 and below still take the MMQ tier for the experts; a 16-row macro
-  tile variant of the routed WMMA kernel could cover the 10-row buckets.
+- pp512 and below still take the MMQ tier for the experts; a 16- or 32-row
+  token tile variant of the routed F16 kernel could cover the 10-row
+  buckets (the tile map already handles ragged buckets).
 
 ## Where the time went (before the prefill work)
 

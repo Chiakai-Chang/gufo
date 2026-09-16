@@ -169,11 +169,42 @@ int main() {
           d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
           d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
           d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
-          d_raw.get(), d_state.get(), d_out.get(), nullptr, nullptr, kTokens,
-          kKHeads, kVHeads, kDim, kKernel, route == 1, kEps, nullptr);
+          d_raw.get(), d_state.get(), d_out.get(), nullptr, nullptr, nullptr,
+          kTokens, kKHeads, kVHeads, kDim, kKernel, route == 1, kEps, nullptr);
       CheckHip(hipDeviceSynchronize(), "GDN synchronization");
       outs[route] = Download(&d_out, kOut);
       states[route] = Download(&d_state, kStateCount);
+      // The causal conv's output (the scratch's first rows) against a CPU
+      // reference over the same history.
+      const auto conv_out = Download(&d_scratch, kScratch);
+      double worst_conv = 0.0;
+      for (std::uint32_t t = 0; t < kTokens; ++t) {
+        for (std::uint32_t c = 0; c < kChannels; ++c) {
+          double acc = 0.0;
+          for (std::uint32_t k = 0; k < kKernel; ++k) {
+            const std::int32_t src = static_cast<std::int32_t>(t + k) -
+                                     static_cast<std::int32_t>(kKernel - 1);
+            const double v =
+                src >= 0
+                    ? qkv[static_cast<std::size_t>(src) * kChannels + c]
+                    : conv_state[static_cast<std::size_t>(kKernel - 1 + src) *
+                                     kChannels +
+                                 c];
+            acc += static_cast<double>(conv_w[c * kKernel + k]) * v;
+          }
+          const double ref = acc / (1.0 + std::exp(-acc));
+          worst_conv = std::max(
+              worst_conv,
+              std::abs(ref -
+                       conv_out[static_cast<std::size_t>(t) * kChannels + c]) /
+                  std::max(1e-3, std::abs(ref)));
+        }
+      }
+      std::cout << "GDN conv vs CPU worst relative error " << worst_conv
+                << '\n';
+      if (worst_conv > 1e-4) {
+        return 1;
+      }
     }
     for (float v : outs[1]) {
       if (!std::isfinite(v)) {

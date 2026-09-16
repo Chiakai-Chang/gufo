@@ -16,7 +16,7 @@
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
 
-constexpr std::uint32_t kTokens = 3;
+constexpr std::uint32_t kTokens = 19;
 constexpr std::uint32_t kHidden = 2560;
 constexpr std::uint32_t kStreams = 4;
 
@@ -191,12 +191,53 @@ int main() {
                          d_mixed_scalar.get(), d_inject_ref.get(), kTokens,
                          kHidden, kStreams, nullptr);
     q::HcMixEpilogueVec4F16(d_xn_f16.get(), d_gate.get(), d_weight.get(),
-                            d_mixed_vec.get(), d_inject_vec.get(), kTokens,
-                            kHidden, nullptr);
+                            d_mixed_vec.get(), nullptr, nullptr,
+                            d_inject_vec.get(), kTokens, kHidden, nullptr);
     CheckHip(hipDeviceSynchronize(), "HC F16 synchronization");
     const auto res_ref = Download(&d_res_ref, kRows);
     const auto res_f16 = Download(&d_res_f16, kRows);
     const auto xn_ref = Download(&d_xn_ref, kRows);
+    // CPU reference of the combine (residual update and grouped norm) over
+    // the same inject partials.
+    {
+      double worst_cpu_res = 0.0;
+      double worst_cpu_xn = 0.0;
+      for (std::uint32_t t = 0; t < kTokens; ++t) {
+        for (std::uint32_t s = 0; s < kStreams; ++s) {
+          double logit = 0.0;
+          for (std::uint32_t p = 0; p < vec_parts; ++p) {
+            logit += inject_vec[(static_cast<std::size_t>(t) * kStreams + s) *
+                                    vec_parts +
+                                p];
+          }
+          const double w =
+              2.0 / (1.0 + std::exp(-logit / static_cast<double>(kStreams)));
+          const std::size_t base =
+              (static_cast<std::size_t>(t) * kStreams + s) * kHidden;
+          std::vector<double> v(kHidden);
+          double ss = 0.0;
+          for (std::uint32_t i = 0; i < kHidden; ++i) {
+            v[i] = res[base + i] +
+                   block_out[static_cast<std::size_t>(t) * kHidden + i] * w;
+            ss += v[i] * v[i];
+          }
+          const double scale = 1.0 / std::sqrt(ss / kHidden + kEps);
+          for (std::uint32_t i = 0; i < kHidden; ++i) {
+            worst_cpu_res =
+                std::max(worst_cpu_res, std::abs(v[i] - res_ref[base + i]));
+            const double n = v[i] * scale * gamma[s * kHidden + i];
+            worst_cpu_xn =
+                std::max(worst_cpu_xn, std::abs(n - xn_ref[base + i]) /
+                                           std::max(1e-2, std::abs(n)));
+          }
+        }
+      }
+      std::cerr << "HC combine vs CPU: residual " << worst_cpu_res << ", norm "
+                << worst_cpu_xn << std::endl;
+      if (worst_cpu_res > 1e-4 || worst_cpu_xn > 1e-3) {
+        return 1;
+      }
+    }
     std::vector<__half> xn_f16(kRows);
     CheckHip(hipMemcpy(xn_f16.data(), d_xn_f16.get(), kRows * sizeof(__half),
                        hipMemcpyDeviceToHost),

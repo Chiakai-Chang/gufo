@@ -187,9 +187,12 @@ private:
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
   /// out = (up . x) * silu(gate . x); s_.shexp_gate is scratch.
+  /// With `q8_tiled_out`, a wide batch leaves only the tiled Q8 form of the
+  /// result (in s_.x_q8t, registered in the input cache) for a Q8_0 down
+  /// projection; `out` then holds the gate projection, not the result.
   bool GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                   const float* x, float* out, std::uint32_t n_tokens,
-                  std::string* error_msg) const;
+                  bool q8_tiled_out, std::string* error_msg) const;
   void RoutedHints(const DeviceTensor& w, std::uint32_t n_tokens) const;
   /// Reads the routing of the current batch back and derives the tile
   /// hints for its expert GEMMs (tiled batches only).
@@ -307,7 +310,7 @@ private:
     std::int32_t* routed_cursors;
     std::int32_t* rows_token;
     std::int32_t* rows_slot;
-    void* x_q8t_routed;
+    std::int32_t* routed_tiles;  ///< (expert | tile << 16) per launched tile
     float* weights;
     float* gate_e;
     float* up_e;
@@ -339,14 +342,27 @@ private:
   Session::Control* control_host_{nullptr};
   std::int32_t* tokens_host_{nullptr};
   std::uint32_t* counts_host_{nullptr};
+  std::int32_t* tiles_host_{nullptr};           ///< routed tile map staging
   mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
-  mutable std::uint32_t routed_max_pad_{0};     ///< widest 16-padded bucket
+  mutable std::uint32_t routed_n_tiles_{0};     ///< launched 48-row tiles
   mutable std::size_t routed_compact_rows_{0};  ///< sum of padded buckets
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
   bool graphs_enabled_{true};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
+  /// Set by Moe when its epilogue is left for the combine that follows.
+  mutable bool moe_pending_{false};
+  // What s_.x_q8t / s_.x_half currently hold (input pointer, rows, cols,
+  // and the half type), so a projection over the same rows skips its
+  // activation pass. Cleared whenever the source buffer is rewritten.
+  mutable const float* q8t_src_{nullptr};
+  mutable std::uint32_t q8t_rows_{0};
+  mutable std::size_t q8t_cols_{0};
+  mutable const float* half_src_{nullptr};
+  mutable std::uint32_t half_rows_{0};
+  mutable std::size_t half_cols_{0};
+  mutable bool half_bf16_{false};
   /// Set by a combine that wrote s_.xn_half / s_.xn_q8t instead of s_.xn.
   mutable bool xn_half_{false};
   /// Partial sums per inject logit the last HcMix left in s_.inject.

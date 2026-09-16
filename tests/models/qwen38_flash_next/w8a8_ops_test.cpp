@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -71,8 +72,8 @@ Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed) {
   return w;
 }
 
-double Run(std::size_t batch, std::size_t m, std::size_t k,
-           std::uint32_t seed) {
+double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
+           bool check = true) {
   const Q8Weights w = MakeWeights(m, k, seed);
   std::vector<float> x(batch * k);
   std::uint32_t state = seed ^ 0xABCDEF01U;
@@ -101,8 +102,10 @@ double Run(std::size_t batch, std::size_t m, std::size_t k,
     throw std::runtime_error("MMQ dense failed");
   }
   q::QuantizeQ8Tiled(d_x, d_tiled, batch, k, nullptr);
-  if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
-    throw std::runtime_error("W8A8 GEMM rejected the shape");
+  for (int rep = 0; rep < (check ? 1 : 3); ++rep) {
+    if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
+      throw std::runtime_error("W8A8 GEMM rejected the shape");
+    }
   }
   CheckHip(hipDeviceSynchronize(), "GEMMs");
   std::vector<float> mmq(batch * m);
@@ -117,7 +120,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k,
   double worst_vs_mmq = 0.0;
   double worst_vs_ref = 0.0;
   double ref_scale = 0.0;
-  for (std::size_t t = 0; t < batch; ++t) {
+  for (std::size_t t = 0; t < (check ? batch : 0); ++t) {
     for (std::size_t r = 0; r < m; ++r) {
       double ref = 0.0;
       for (std::size_t i = 0; i < k; ++i) {
@@ -157,6 +160,14 @@ int main() {
     ok = Run(100, 320, 2560, 0x1234ABCDU) < 1e-2 && ok;
     ok = Run(37, 640, 2560, 0x0BADF00DU) < 1e-2 && ok;
     ok = Run(200, 200, 6144, 0xDEADBEEFU) < 1e-2 && ok;
+    // Production shapes for profiling only (QFN_W8A8_BENCH=1): three
+    // launches each, no reference.
+    if (std::getenv("QFN_W8A8_BENCH") != nullptr) {
+      (void)Run(2048, 16384, 2560, 0x1111U, false);
+      (void)Run(2048, 2560, 2560, 0x2222U, false);
+      (void)Run(2048, 10240, 640, 0x3333U, false);
+      (void)Run(2048, 320, 10240, 0x4444U, false);
+    }
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
