@@ -73,6 +73,17 @@ WeightType SmallType(GgmlType type) {
 constexpr std::uint32_t kVecBatch = 8;
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
 constexpr std::uint32_t kAttnSplits = 8;
+/// Wide dense Q8_0 projections take the F16 WMMA GEMM (F16 activation
+/// rows, weights dequantized as they are staged, no per-block scaling) when
+/// its 256-row tiles fill the device and the K sweep is short enough that
+/// the F16 rows stay cache-resident: measured per shape at 2048 tokens
+/// (W8A8 -> F16 ms): 16384x2560 5.7 -> 4.6, 13312x2560 4.3 -> 3.9,
+/// 10240x320 1.02 -> 0.79, 2560x2560 0.81 -> 0.74, 2560x640 0.24 -> 0.21;
+/// against 2560x6144 1.8 -> 2.1+, 640x2560 0.19 -> 0.23 and 320x10240
+/// 0.40 -> 1.3, which keep the int8 route.
+constexpr std::uint32_t kDenseF16MinRows = 2048;
+constexpr std::uint32_t kDenseF16MaxCols = 2560;
+
 /// Token rows per routed F16 expert GEMM tile: the narrow tile for batches
 /// whose buckets pad to one or two 16-row tiles, the wide one when the
 /// mean bucket fills most of it (the weight dequantization is per tile).
@@ -461,7 +472,8 @@ bool Executor::Dense(const DeviceTensor& w, const Q8Input& q, float* out,
 
 bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
-                          bool q8_tiled_out, std::string* error_msg) const {
+                          const DeviceTensor* down,
+                          std::string* error_msg) const {
   // One single-token launch computes both projections and the SwiGLU (the
   // tier fuses the gate for one column only).
   if (n_tokens == 1 && up.type == GgmlType::kQ8_0 &&
@@ -485,19 +497,39 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
       !Dense(up, x, s_.shexp_gate, n_tokens, error_msg)) {
     return false;
   }
-  // A wide batch writes the down projection's tiled Q8 input directly (the
-  // F32 rows are read by nothing else); the cache lets Dense skip its
-  // activation pass.
-  if (q8_tiled_out && n_tokens > kVecBatch && n_tokens <= options_.max_batch &&
-      SwigluQ8Tiled(out, s_.shexp_gate, s_.x_q8t, n_tokens, up.rows, stream_)) {
-    q8t_src_ = out;
-    q8t_rows_ = n_tokens;
-    q8t_cols_ = up.rows;
-    return true;
+  // A wide batch writes the down projection's staged input directly (the
+  // F32 rows are read by nothing else): F16 rows for the F16 route, else
+  // the tiled Q8 layout; the cache lets Dense skip its activation pass.
+  if (down != nullptr && down->cols == up.rows && n_tokens > kVecBatch &&
+      n_tokens <= options_.max_batch) {
+    if (DenseF16Route(*down, n_tokens)) {
+      SwigluHalf(out, s_.shexp_gate, static_cast<__half*>(s_.x_half),
+                 static_cast<std::size_t>(n_tokens) * up.rows, stream_);
+      half_src_ = out;
+      half_rows_ = n_tokens;
+      half_cols_ = up.rows;
+      half_bf16_ = false;
+      return true;
+    }
+    if (down->type == GgmlType::kQ8_0 &&
+        SwigluQ8Tiled(out, s_.shexp_gate, s_.x_q8t, n_tokens, up.rows,
+                      stream_)) {
+      q8t_src_ = out;
+      q8t_rows_ = n_tokens;
+      q8t_cols_ = up.rows;
+      return true;
+    }
   }
   Swiglu(out, s_.shexp_gate, static_cast<std::size_t>(n_tokens) * up.rows,
          stream_);
   return true;
+}
+
+bool Executor::DenseF16Route(const DeviceTensor& w,
+                             std::uint32_t n_tokens) const {
+  return w.type == GgmlType::kQ8_0 && n_tokens > kVecBatch &&
+         w.rows >= kDenseF16MinRows && w.cols <= kDenseF16MaxCols &&
+         w.cols <= model_->max_half_cols();
 }
 
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
@@ -508,16 +540,36 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
       return Quantize(x, n_tokens, w.cols, &q, error_msg) &&
              Dense(w, q, out, error_msg);
     }
-    // Wide batches: activations quantized per 32-wide block into the tiled
-    // layout, then the int8 WMMA GEMM over the Q8_0 blocks. The tiled
-    // buffer holds max_batch rows; a wider call (the draft block folds its
-    // streams into rows) runs in pieces.
+    // Wide batches: the F16 route for the shapes it wins (F16 rows in
+    // s_.x_half, often left there by a producer), else activations
+    // quantized per 32-wide block into the tiled layout and the int8 WMMA
+    // GEMM. Both staging buffers hold max_batch rows; a wider call (the
+    // draft block folds its streams into rows) runs in pieces.
+    const bool f16 = DenseF16Route(w, n_tokens);
     const std::uint32_t piece = static_cast<std::uint32_t>(options_.max_batch);
     for (std::uint32_t r0 = 0; r0 < n_tokens; r0 += piece) {
       const std::uint32_t rows = std::min(piece, n_tokens - r0);
-      // The tiled buffer may already hold this input (a producer wrote it,
-      // or the previous projection read the same rows).
+      // The staging buffer may already hold this input (a producer wrote
+      // it, or the previous projection read the same rows).
       const float* src = x + static_cast<std::size_t>(r0) * w.cols;
+      if (f16) {
+        if (!(half_src_ == src && half_rows_ == rows && half_cols_ == w.cols &&
+              !half_bf16_)) {
+          NarrowActivations(src, s_.x_half, false,
+                            static_cast<std::size_t>(rows) * w.cols, stream_);
+          half_src_ = src;
+          half_rows_ = rows;
+          half_cols_ = w.cols;
+          half_bf16_ = false;
+        }
+        if (!DenseF16Gemm(w.data, static_cast<const __half*>(s_.x_half),
+                          out + static_cast<std::size_t>(r0) * w.rows, rows,
+                          w.rows, w.cols, stream_)) {
+          AssignError(error_msg, "dense F16 GEMM failed");
+          return false;
+        }
+        continue;
+      }
       if (!(q8t_src_ == src && q8t_rows_ == rows && q8t_cols_ == w.cols)) {
         QuantizeQ8Tiled(src, s_.x_q8t, rows, w.cols, stream_);
         q8t_src_ = src;
@@ -1063,7 +1115,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // the routing, so it is launched before the expert-count readback: its
   // GEMMs keep the device busy while the host waits for the counts.
   if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
-                  l.shexp_down.type == GgmlType::kQ8_0, error_msg) ||
+                  &l.shexp_down, error_msg) ||
       !Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg)) {
     return false;
   }

@@ -84,18 +84,28 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   float* d_x = nullptr;
   float* d_mmq = nullptr;
   float* d_w8 = nullptr;
+  float* d_f16 = nullptr;
+  __half* d_x_half = nullptr;
   void* d_tiled = nullptr;
-  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "hipMalloc");
+  // The model's weights live in GTT (the carve-out VRAM is 0.5 GiB); a
+  // bench allocation past that size lands the weights there too.
+  const std::size_t w_alloc =
+      check ? w.blocks.size() + 4096
+            : std::max<std::size_t>(w.blocks.size() + 4096, 1u << 30);
+  CheckHip(hipMalloc(&d_w, w_alloc), "hipMalloc");
   CheckHip(hipMalloc(&d_x, x.size() * 4), "hipMalloc");
   CheckHip(hipMalloc(&d_mmq, batch * m * 4), "hipMalloc");
   CheckHip(hipMalloc(&d_w8, batch * m * 4), "hipMalloc");
   CheckHip(hipMalloc(&d_tiled, q::Q8TiledBytes(batch, k)), "hipMalloc");
+  CheckHip(hipMalloc(&d_f16, batch * m * 4), "hipMalloc");
+  CheckHip(hipMalloc(&d_x_half, x.size() * 2), "hipMalloc");
   CheckHip(
       hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
       "upload");
   CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
            "upload");
   CheckHip(hipMemset(d_w8, 0, batch * m * 4), "memset");
+  CheckHip(hipMemset(d_f16, 0, batch * m * 4), "memset");
   if (qfn_mmq_q8_0_dense(d_w, d_x, d_mmq, static_cast<int>(m),
                          static_cast<int>(batch), static_cast<int>(k),
                          nullptr) != 0) {
@@ -107,9 +117,21 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
       throw std::runtime_error("W8A8 GEMM rejected the shape");
     }
   }
+  q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
+  const int f16_reps = std::getenv("QFN_F16_REPS") != nullptr
+                           ? std::atoi(std::getenv("QFN_F16_REPS"))
+                           : 3;
+  for (int rep = 0; rep < (check ? 1 : f16_reps); ++rep) {
+    if (!q::DenseF16Gemm(d_w, d_x_half, d_f16, batch, m, k, nullptr)) {
+      throw std::runtime_error("dense F16 GEMM rejected the shape");
+    }
+  }
   CheckHip(hipDeviceSynchronize(), "GEMMs");
   std::vector<float> mmq(batch * m);
   std::vector<float> w8(batch * m);
+  std::vector<float> f16(batch * m);
+  CheckHip(hipMemcpy(f16.data(), d_f16, f16.size() * 4, hipMemcpyDeviceToHost),
+           "download");
   CheckHip(hipMemcpy(mmq.data(), d_mmq, mmq.size() * 4, hipMemcpyDeviceToHost),
            "download");
   CheckHip(hipMemcpy(w8.data(), d_w8, w8.size() * 4, hipMemcpyDeviceToHost),
@@ -119,6 +141,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   // bounds the activation quantization itself.
   double worst_vs_mmq = 0.0;
   double worst_vs_ref = 0.0;
+  double worst_f16 = 0.0;
   double ref_scale = 0.0;
   for (std::size_t t = 0; t < (check ? batch : 0); ++t) {
     for (std::size_t r = 0; r < m; ++r) {
@@ -133,21 +156,29 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
       worst_vs_mmq = std::max(
           worst_vs_mmq, std::abs(static_cast<double>(mmq[idx] - w8[idx])));
       worst_vs_ref = std::max(worst_vs_ref, std::abs(ref - w8[idx]));
+      if (!std::isfinite(f16[idx])) {
+        throw std::runtime_error("dense F16 output is not finite");
+      }
+      worst_f16 = std::max(worst_f16, std::abs(ref - f16[idx]));
       ref_scale = std::max(ref_scale, std::abs(ref));
     }
   }
   std::cout << "W8A8 batch=" << batch << " m=" << m << " k=" << k
             << ": worst |W8A8 - MMQ| " << worst_vs_mmq
-            << ", worst |W8A8 - F64| " << worst_vs_ref << " (reference scale "
-            << ref_scale << ")\n";
+            << ", worst |W8A8 - F64| " << worst_vs_ref << ", worst |F16 - F64| "
+            << worst_f16 << " (reference scale " << ref_scale << ")\n";
   (void)hipFree(d_w);
   (void)hipFree(d_x);
   (void)hipFree(d_mmq);
   (void)hipFree(d_w8);
   (void)hipFree(d_tiled);
+  (void)hipFree(d_f16);
+  (void)hipFree(d_x_half);
   // The MMQ agreement is accumulation order; the F64 gap is the shared
-  // 8-bit activation quantization, well under 1% of the output scale.
-  return worst_vs_mmq < 1e-3 ? worst_vs_ref / ref_scale : 1.0;
+  // 8-bit activation quantization, well under 1% of the output scale. The
+  // F16 route's gap is its F16 activation rounding, a few ulps smaller.
+  return worst_vs_mmq < 1e-3 ? std::max(worst_vs_ref, worst_f16) / ref_scale
+                             : 1.0;
 }
 
 }  // namespace
@@ -167,6 +198,11 @@ int main() {
       (void)Run(2048, 2560, 2560, 0x2222U, false);
       (void)Run(2048, 10240, 640, 0x3333U, false);
       (void)Run(2048, 320, 10240, 0x4444U, false);
+      (void)Run(2048, 640, 2560, 0x5555U, false);
+      (void)Run(2048, 2560, 640, 0x7777U, false);
+      (void)Run(2048, 2560, 6144, 0x8888U, false);
+      (void)Run(2048, 10240, 320, 0x9999U, false);
+      (void)Run(2048, 13312, 2560, 0x6666U, false);
     }
     return ok ? 0 : 1;
   } catch (const std::exception& error) {

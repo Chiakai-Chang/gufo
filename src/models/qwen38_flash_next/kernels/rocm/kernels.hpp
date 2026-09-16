@@ -98,6 +98,9 @@ void SiluScale(float* x, float scale, std::size_t count, hipStream_t stream);
 /// gate[i] = silu(gate[i]) * up[i], in place in `gate`.
 void Swiglu(float* gate, const float* up, std::size_t count,
             hipStream_t stream);
+/// out[i] = silu(gate[i]) * up[i] as F16 (`count` elements).
+void SwigluHalf(const float* gate, const float* up, __half* out,
+                std::size_t count, hipStream_t stream);
 /// silu(gate) * up over n_rows rows of k elements, written only into the
 /// W8A8 tiled Q8 layout `out_q8`; false (nothing launched) unless k % 32 == 0.
 bool SwigluQ8Tiled(const float* gate, const float* up, void* out_q8,
@@ -126,6 +129,14 @@ void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
                      std::size_t k, hipStream_t stream);
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
               std::size_t m, std::size_t k, hipStream_t stream);
+
+/// F16 route for wide batches over Q8_0 weights: F16 activation rows
+/// [batch][k] (NarrowActivations, or a producer's F16 output), weights
+/// dequantized to F16 as they are staged, F32 accumulation. out is
+/// [batch][m]; returns false, launching nothing, when k is not a multiple
+/// of 32.
+bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
+                  std::size_t m, std::size_t k, hipStream_t stream);
 
 /// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
 /// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,

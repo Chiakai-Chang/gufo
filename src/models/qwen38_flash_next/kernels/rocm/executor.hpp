@@ -187,12 +187,15 @@ private:
   bool Dense(const DeviceTensor& w, const float* x, float* out,
              std::uint32_t n_tokens, std::string* error_msg) const;
   /// out = (up . x) * silu(gate . x); s_.shexp_gate is scratch.
-  /// With `q8_tiled_out`, a wide batch leaves only the tiled Q8 form of the
-  /// result (in s_.x_q8t, registered in the input cache) for a Q8_0 down
-  /// projection; `out` then holds the gate projection, not the result.
+  /// With `down` (the projection that consumes the result), a wide batch
+  /// leaves only that projection's staged input form (F16 rows in
+  /// s_.x_half or the tiled Q8 layout in s_.x_q8t, registered in the input
+  /// cache); `out` then holds the gate projection, not the result.
   bool GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                   const float* x, float* out, std::uint32_t n_tokens,
-                  bool q8_tiled_out, std::string* error_msg) const;
+                  const DeviceTensor* down, std::string* error_msg) const;
+  /// Whether a wide dense Q8_0 projection takes the F16 WMMA GEMM.
+  bool DenseF16Route(const DeviceTensor& w, std::uint32_t n_tokens) const;
   void RoutedHints(const DeviceTensor& w, std::uint32_t n_tokens) const;
   /// Reads the routing of the current batch back and derives the tile
   /// hints for its expert GEMMs (tiled batches only).
