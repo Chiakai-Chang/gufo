@@ -31,6 +31,7 @@
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
+#include "src/models/qwen38_flash_next/engine.hpp"
 #endif
 
 namespace gufo::server {
@@ -1842,6 +1843,337 @@ bool FingerprintArtifactFile(std::string_view label,
 
 #endif
 
+#if defined(ENGINE_ENABLE_HIP)
+// Qwen3.8-Flash-Next: one session per request state, the whole prompt fed
+// through the model's own prefix-keeping Sync, the server-side sampler over
+// the session's logits. The recurrent (GDN) state cannot be rewound, so the
+// runner offers no snapshots or forks: an exact retained prefix is reused
+// in place, anything else restarts the session.
+constexpr std::string_view kQwenFlashNextStateAbi =
+    "qwen38-flash-next-rocm-session-v1";
+
+using QwenFlashNextModel = models::qwen38_flash_next::Model;
+using QwenFlashNextSession = models::qwen38_flash_next::Session;
+
+std::vector<TextRunnerToken> QwenFlashNextRunnerTokens(
+    std::span<const std::int32_t> tokens) {
+  std::vector<TextRunnerToken> converted;
+  converted.reserve(tokens.size());
+  for (const std::int32_t token : tokens) {
+    if (token < 0) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next token ID must not be negative");
+    }
+    converted.push_back(static_cast<TextRunnerToken>(token));
+  }
+  return converted;
+}
+
+std::vector<std::int32_t> QwenFlashNextEngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const TextRunnerToken token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+class QwenFlashNextTextRunnerState final : public TextRunnerState {
+public:
+  QwenFlashNextTextRunnerState(const std::shared_ptr<QwenFlashNextModel>& model,
+                               std::uint32_t max_context) {
+    std::string error;
+    session_ = model->CreateSession(max_context, &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create Qwen3.8-Flash-Next session: " +
+                               error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    session_->Reset();
+    position_ = 0;
+  }
+
+  [[nodiscard]] QwenFlashNextSession& session() const { return *session_; }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+private:
+  std::unique_ptr<QwenFlashNextSession> session_;
+  std::size_t position_{0};
+};
+
+QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
+    TextRunnerState& state) {
+  auto* qfn = dynamic_cast<QwenFlashNextTextRunnerState*>(&state);
+  if (qfn == nullptr) {
+    throw std::logic_error("text runner state is not Qwen3.8-Flash-Next");
+  }
+  return *qfn;
+}
+
+const QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
+    const TextRunnerState& state) {
+  const auto* qfn = dynamic_cast<const QwenFlashNextTextRunnerState*>(&state);
+  if (qfn == nullptr) {
+    throw std::logic_error("text runner state is not Qwen3.8-Flash-Next");
+  }
+  return *qfn;
+}
+
+class QwenFlashNextTextRunner final : public TextModelRunner {
+public:
+  QwenFlashNextTextRunner(
+      std::shared_ptr<QwenFlashNextModel> model,
+      std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+      std::uint32_t max_context)
+      : model_(std::move(model)),
+        tokenizer_(std::move(tokenizer)),
+        max_context_(max_context) {}
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->ModelName(),
+        .state_abi = std::string(kQwenFlashNextStateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                .snapshot = false,
+                .fork = false,
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                // The MTP draft block verifies greedily; sampled requests
+                // fall back to one token per step.
+                .multi_token_decode = model_->HasMtp(),
+                .batched_multi_token_decode = false,
+                .batched_multi_token_decode_max_width = 0,
+                .prefix_reuse = true,
+            },
+        .persistence = std::nullopt,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      capacity = free_bytes;
+    }
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = std::nullopt,
+        .temporary_scratch_bytes = std::nullopt,
+        .retained_snapshot_capacity_bytes = std::size_t{0},
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    return {{
+        .kind = TextExecutionPlanKind::kSerial,
+        .physical_width = 1,
+    }};
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return tokenizer_->Encode(text);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    // The artifact carries the pinned Qwen3.8 reasoning template (checked
+    // at load), so the compiled Qwen renderer applies as is.
+    tokenization::ChatTemplateOptions options;
+    options.enable_thinking = request.reasoning.enabled.value_or(false);
+    options.preserve_thinking =
+        request.reasoning.preserve_thinking.value_or(true);
+    switch (request.reasoning.effort.value_or(ReasoningEffort::kXHigh)) {
+      case ReasoningEffort::kMinimal:
+      case ReasoningEffort::kLow:
+        options.reasoning_effort = tokenization::QwenReasoningEffort::kLow;
+        break;
+      case ReasoningEffort::kMedium:
+        options.reasoning_effort = tokenization::QwenReasoningEffort::kMedium;
+        break;
+      case ReasoningEffort::kHigh:
+      case ReasoningEffort::kXHigh:
+      case ReasoningEffort::kMax:
+        options.reasoning_effort = tokenization::QwenReasoningEffort::kXHigh;
+        break;
+    }
+    options.require_tool_call =
+        request.tool_choice == ChatRequest::ToolChoice::kRequired;
+    return tokenization::QwenChatTemplate::RenderAndTokenize(
+        *tokenizer_, request.messages,
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const tokenization::ChatTool>{}
+            : std::span<const tokenization::ChatTool>{request.tools},
+        options);
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return request.reasoning.enabled.value_or(false)
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return tokenizer_->Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<QwenFlashNextTextRunnerState>(model_, max_context_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    const auto& qfn = RequireQwenFlashNextState(state);
+    if (qfn.position() != prefix.size()) {
+      throw std::logic_error(
+          "Qwen3.8-Flash-Next reused prefix does not match checkpoint");
+    }
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& qfn = RequireQwenFlashNextState(state);
+    if (offset != qfn.position()) {
+      throw std::logic_error(
+          "Qwen3.8-Flash-Next prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error(
+          "Qwen3.8-Flash-Next prefill has no remaining input");
+    }
+    const std::size_t consumed =
+        std::min(max_input_tokens, prompt.size() - offset);
+    const std::size_t next_position = offset + consumed;
+    const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
+    std::string error;
+    if (!qfn.session().Sync(prefix, &error)) {
+      qfn.set_position(0);
+      throw std::runtime_error("Qwen3.8-Flash-Next prefill failed: " + error);
+    }
+    qfn.set_position(next_position);
+    return {
+        .consumed_tokens = consumed,
+        .decode_ready = next_position == prompt.size(),
+    };
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& qfn = RequireQwenFlashNextState(state);
+    if (qfn.position() >= max_context_) {
+      return {.stop = true, .piece = {}};
+    }
+    const auto logits = qfn.session().Logits();
+    if (logits.empty()) {
+      throw std::runtime_error(
+          "Qwen3.8-Flash-Next token selection has no logits");
+    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (model_->IsStopToken(token)) {
+      return {.stop = true, .token = 0, .piece = {}};
+    }
+    return {
+        .stop = false,
+        .token = static_cast<TextRunnerToken>(token),
+        .piece = model_->TokenText(token),
+    };
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next token ID exceeds engine range");
+    }
+    auto& qfn = RequireQwenFlashNextState(state);
+    std::string error;
+    if (!qfn.session().Evaluate(static_cast<std::int32_t>(token), &error)) {
+      throw std::runtime_error("Qwen3.8-Flash-Next decode failed: " + error);
+    }
+    qfn.set_position(qfn.position() + 1);
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    // The draft block chains greedy proposals and the trunk verifies them
+    // greedily, so only an unmodified argmax request can take the cycle.
+    if (!model_->HasMtp() || !sampler.config().can_use_unmodified_argmax()) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next MTP decode budget must be at least one token");
+    }
+    auto& qfn = RequireQwenFlashNextState(state);
+    if (qfn.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    const auto stats_before = qfn.session().Statistics();
+    std::vector<std::int32_t> emitted;
+    std::string error;
+    if (!qfn.session().SpeculativeStep(max_tokens, &emitted, &error)) {
+      throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
+                               error);
+    }
+    if (emitted.empty()) {
+      throw std::runtime_error(
+          "Qwen3.8-Flash-Next MTP decode produced no tokens");
+    }
+    TextDecodeStep step;
+    step.selections.reserve(emitted.size());
+    for (const std::int32_t token : emitted) {
+      if (model_->IsStopToken(token)) {
+        step.stop = true;
+        break;
+      }
+      step.selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = model_->TokenText(token),
+      });
+    }
+    // The checkpoint counts the tokens the pool records. Past a stop token
+    // the session has consumed more than that; its next Sync sees the
+    // divergence and restarts, so the retained position stays honest.
+    qfn.set_position(qfn.position() + step.selections.size());
+    const auto stats_after = qfn.session().Statistics();
+    step.draft_tokens = stats_after.drafted - stats_before.drafted;
+    step.draft_accepted_tokens = stats_after.accepted - stats_before.accepted;
+    return step;
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireQwenFlashNextState(state).position();
+  }
+
+private:
+  std::shared_ptr<QwenFlashNextModel> model_;
+  std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
+  std::uint32_t max_context_;
+};
+#endif
+
 }  // namespace
 
 struct InferenceBackend::Impl {
@@ -2002,6 +2334,65 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config));
+  }
+  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kMtp) {
+      SetError(error,
+               "Qwen3.8-Flash-Next HTTP models support only MTP speculative "
+               "decoding (--speculative mtp --mtp-model)");
+      return false;
+    }
+    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        speculative_config.draft_model_path.empty()) {
+      SetError(error,
+               "Qwen3.8-Flash-Next MTP HTTP decoding requires --mtp-model");
+      return false;
+    }
+    if (DiskCacheEnabled(disk_cache_config)) {
+      SetError(error,
+               "Qwen3.8-Flash-Next HTTP models keep no continuation "
+               "snapshots; --cache-disk is unsupported");
+      return false;
+    }
+    // The compiled Qwen3.8 chat template renders through the artifact's
+    // own tokenizer (the same vocabulary and pre-tokenizer as Qwen3.8).
+    if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader,
+                                                              &load_error)) {
+      SetError(error,
+               "Unsupported Qwen3.8-Flash-Next chat template: " + load_error);
+      return false;
+    }
+    auto tokenizer =
+        tokenization::QwenTokenizer::CreateFromGguf(*reader, &load_error);
+    if (tokenizer == nullptr) {
+      SetError(error,
+               "Failed to create Qwen3.8-Flash-Next tokenizer: " + load_error);
+      return false;
+    }
+    // Prompt chunks of up to 2048 tokens keep the expert GEMMs on the
+    // matrix-core route; the scheduler's --prefill-chunk bounds each step.
+    auto model = models::qwen38_flash_next::Model::Load(
+        model_path,
+        models::qwen38_flash_next::ModelOptions{
+            .max_context = max_context,
+            .mtp_model_path =
+                speculative_config.backend == TextSpeculativeBackend::kMtp
+                    ? speculative_config.draft_model_path
+                    : std::string{},
+            .max_batch = std::min<std::uint32_t>(2048, max_context),
+            .max_draft_tokens = speculative_config.max_draft_tokens,
+            .draft_vocab = speculative_config.draft_vocab,
+        },
+        &load_error);
+    if (model == nullptr) {
+      SetError(error,
+               "Failed to create Qwen3.8-Flash-Next model: " + load_error);
+      return false;
+    }
+    return load(std::move(model), std::move(tokenizer), error, max_context,
+                session_count, prefill_policy, scheduler_policy,
+                speculative_config);
   }
   auto model = hip::QwenGpuModel::CreateFromGguf(reader, &load_error);
   if (model == nullptr) {
@@ -2217,6 +2608,54 @@ bool InferenceBackend::load(
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::move(runner_disk_cache));
+    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+        std::move(runner_pool), prefill_policy, scheduler_policy);
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::load(
+    std::shared_ptr<models::qwen38_flash_next::Model> model,
+    std::unique_ptr<tokenization::QwenTokenizer> tokenizer, std::string* error,
+    std::uint32_t max_context, std::size_t session_count,
+    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextSpeculativeConfig speculative_config) {
+  if (model == nullptr || tokenizer == nullptr) {
+    SetError(error, "Qwen3.8-Flash-Next model and tokenizer must not be null");
+    return false;
+  }
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (max_context == 0 || max_context > model->MaxContext()) {
+    SetError(
+        error,
+        "HTTP context exceeds the loaded Qwen3.8-Flash-Next model context");
+    return false;
+  }
+  if (model->HasMtp() && (speculative_config.max_draft_tokens == 0 ||
+                          speculative_config.min_draft_tokens != 1 ||
+                          speculative_config.draft_p_min != 0.0F)) {
+    SetError(error,
+             "Qwen3.8-Flash-Next MTP drafts a fixed chain; custom draft "
+             "floors and confidence thresholds are unsupported");
+    return false;
+  }
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    auto runner = std::make_shared<QwenFlashNextTextRunner>(
+        std::move(model), std::move(tokenizer), max_context);
+    new_state->model_id = runner->Descriptor().model_id;
+    auto runner_pool = std::make_shared<TextRunnerPool>(
+        std::move(runner), session_count, std::nullopt);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

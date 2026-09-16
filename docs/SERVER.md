@@ -117,6 +117,20 @@ at two. Low-acceptance C1 requests temporarily return to autoregressive decode.
 These measured defaults are model-owned. See the
 [DS4 benchmark and quality contract](../benchmarks/deepseek-v4-flash/README.md).
 
+Qwen3.8-Flash-Next (`general.architecture = qwen4exp`) serves through the
+same runner interface with one session per request state. Its recurrent
+state cannot be rewound, so the runner keeps no continuation snapshots or
+forks: an exact retained prefix is reused in place (the session extends it),
+anything else restarts the session, and `--cache-disk` is refused. Sampling
+runs server-side over the session logits, so every sampling flag applies;
+the artifact's pinned Qwen3.8 reasoning template drives the reasoning
+controls below. `--speculative mtp --mtp-model <mtp-...-shared-*.gguf>`
+enables the MTP draft block (`--draft-tokens`, `--draft-vocab`): drafts are
+verified greedily, so only unmodified-argmax requests take multi-token steps
+and sampled requests decode one token per step. Prompt chunks of up to 2048
+tokens keep the expert GEMMs on the matrix-core route
+(`--prefill-chunk 2048`); requests run serially across sessions.
+
 ### Reasoning controls
 
 `POST /v1/chat/completions` accepts top-level `reasoning_effort` (`off`,

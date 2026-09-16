@@ -1000,9 +1000,10 @@ if (BUILD_TESTING)
       src/cli/serve/continuation_disk_store.cpp
       src/cli/serve/text_model_runner.cpp
       src/cli/serve/text_generation_scheduler.cpp
-      src/cli/serve/inference_backend.cpp)
+      src/cli/serve/inference_backend.cpp
+      src/cli/serve/logging.cpp)
     target_link_libraries(inference_backend_gpu_test PRIVATE
-      gufo_core gufo_deepseek_v4_flash hip::host)
+      gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next hip::host)
     add_test(NAME inference_backend_gpu_test COMMAND inference_backend_gpu_test)
     set_tests_properties(inference_backend_gpu_test PROPERTIES
       LABELS "hip;gpu;server;correctness"

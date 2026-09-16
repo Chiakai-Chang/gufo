@@ -21,12 +21,21 @@ namespace gufo::models::deepseek_v4_flash {
 class Model;
 }
 
+namespace gufo::models::qwen38_flash_next {
+class Model;
+}
+
+namespace gufo::tokenization {
+class QwenTokenizer;
+}
+
 namespace gufo::server {
 
 enum class TextSpeculativeBackend : std::uint8_t {
   kDisabled,
   kDFlash,
   kDSpark,
+  kMtp,  ///< Qwen3.8-Flash-Next's MTP draft block (greedy verification)
 };
 
 struct TextSpeculativeConfig {
@@ -35,6 +44,8 @@ struct TextSpeculativeConfig {
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
   float draft_p_min{0.0F};
+  /// MTP: vocabulary prefix the draft block scores (0 = full vocabulary).
+  std::uint32_t draft_vocab{0};
 };
 
 struct TextDiskCacheConfig {
@@ -88,6 +99,17 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {});
+
+  /// Installs a previously loaded Qwen3.8-Flash-Next model with
+  /// request-owned sessions; `tokenizer` is the artifact's tokenizer as the
+  /// Qwen chat template renders through it. No continuation snapshots.
+  bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
+            std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
+            std::string* error, std::uint32_t max_context = 4096,
+            std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {});
 #endif
 
   /// Stable model identifier used in API responses.
