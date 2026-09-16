@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <future>
 #include <memory>
 #include <span>
 #include <string>
@@ -212,8 +211,9 @@ private:
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
   /// Hashes the batch's n-gram rows and starts reading them from disk, so
   /// the read overlaps the layers before the PLE one.
-  void PleFetch(Session& s, std::span<const std::int32_t> tokens,
-                bool speculative) const;
+  bool PleFetch(Session& s, std::span<const std::int32_t> tokens,
+                bool speculative, std::string* error_msg) const;
+  bool WaitPle(std::string* error_msg) const;
   bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens, float* res,
            bool speculative, std::string* error_msg) const;
   bool LinearAttention(const DeviceLayer& l, Session::LinearState& s,
@@ -235,13 +235,16 @@ private:
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool speculative, bool sparse, std::uint32_t start_pos,
-                   std::uint32_t pool_grid, std::string* error_msg) const;
+                   std::uint32_t pool_grid, std::uint32_t first_layer,
+                   std::uint32_t end_layer, std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
                std::string* error_msg) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
-  /// when `graph` is set, and waits for it.
+  /// when `graph` is set. A prefix may leave its work queued so the host
+  /// can wait for disk reads while the GPU computes it.
   bool Run(Session& session, std::uint64_t key, bool graph,
-           const std::function<bool()>& body, std::string* error_msg) const;
+           const std::function<bool()>& body, std::string* error_msg,
+           bool synchronize = true) const;
 
   const DeviceModel* model_{nullptr};
   NgramTable* ngram_{nullptr};
@@ -331,7 +334,7 @@ private:
   /// source would not be ordered against the kernels behind it.
   float* host_emb_{nullptr};
   mutable std::vector<std::uint32_t> host_rows_;
-  mutable std::future<bool> ple_read_;
+  mutable bool ple_pending_{false};
   // Pinned host staging the launched (or captured) work reads and writes.
   Session::Control* control_host_{nullptr};
   std::int32_t* tokens_host_{nullptr};

@@ -56,6 +56,7 @@ void HashNgramRows(const Config& c, NgramHistory& history,
 }
 
 NgramTable::~NgramTable() {
+  (void)WaitRead();
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stop_ = true;
@@ -181,41 +182,55 @@ void NgramTable::Worker() {
 
 bool NgramTable::Read(std::span<const std::uint32_t> rows,
                       std::span<float> out) {
-  if (out.size() < rows.size() * row_dim_) {
+  return StartRead(rows, out) && WaitRead();
+}
+
+bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
+                           std::span<float> out) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (active_ || rows.size() > out.size() / row_dim_ ||
+      std::any_of(rows.begin(), rows.end(),
+                  [this](std::uint32_t row) { return row >= rows_; })) {
     return false;
   }
   // Read each distinct row once, then copy it to its other slots.
   std::unordered_map<std::uint32_t, std::size_t> first;
   first.reserve(rows.size());
-  std::vector<std::pair<std::size_t, std::size_t>> copies;
-  std::vector<Job> jobs;
-  jobs.reserve(rows.size());
+  jobs_.clear();
+  copies_.clear();
+  jobs_.reserve(rows.size());
   for (std::size_t i = 0; i < rows.size(); ++i) {
     const auto [it, inserted] = first.emplace(rows[i], i);
     if (inserted) {
-      jobs.push_back({rows[i], out.data() + i * row_dim_});
+      jobs_.push_back({rows[i], out.data() + i * row_dim_});
     } else {
-      copies.emplace_back(it->second, i);
+      copies_.push_back(
+          {out.data() + it->second * row_dim_, out.data() + i * row_dim_});
     }
   }
-  {
-    std::unique_lock<std::mutex> lock(mutex_);
-    jobs_ = std::move(jobs);
-    next_job_ = 0;
-    pending_ = jobs_.size();
-    failed_ = false;
-    wake_.notify_all();
-    done_.wait(lock, [&] { return pending_ == 0; });
-    jobs_.clear();
-    if (failed_) {
-      return false;
-    }
-  }
-  for (const auto& [src, dst] : copies) {
-    std::copy_n(out.data() + src * row_dim_, row_dim_,
-                out.data() + dst * row_dim_);
-  }
+  next_job_ = 0;
+  pending_ = jobs_.size();
+  failed_ = false;
+  active_ = true;
+  wake_.notify_all();
   return true;
+}
+
+bool NgramTable::WaitRead() {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (!active_) {
+    return false;
+  }
+  done_.wait(lock, [&] { return pending_ == 0; });
+  if (!failed_) {
+    for (const Copy& copy : copies_) {
+      std::copy_n(copy.src, row_dim_, copy.dst);
+    }
+  }
+  jobs_.clear();
+  copies_.clear();
+  active_ = false;
+  return !failed_;
 }
 
 }  // namespace gufo::models::qwen38_flash_next

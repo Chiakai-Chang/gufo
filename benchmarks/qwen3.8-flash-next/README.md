@@ -11,23 +11,23 @@ stays on disk. Context, scratch and MTP add memory. NVMe loading takes about
 ## Performance
 
 Nix release, C1, pp2048, tg128, seed 1, one prefill warm-up and one measured
-repetition (2026-09-16). Rates are tok/s. Depth precedes the measured operation;
+repetition (2026-09-16 UTC). Rates are tok/s. Depth precedes the measured operation;
 fixed-length generation continues past EOS. MTP scores the full vocabulary
 and proposes up to seven drafts per cycle.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1262.33 | 1259.94 |
-| 4096 | 1155.47 | 1113.81 |
+| 0 | 1259.33 | 1270.26 |
+| 4096 | 1146.71 | 1115.88 |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 23.04 | 33.64 | 51.0% |
-| Greedy | 4096 | 22.26 | 24.85 | 37.6% |
-| Temperature 0.7 | 0 | 22.64 | 24.44 | 34.9% |
-| Temperature 0.7 | 4096 | 21.79 | 46.53 | 92.4% |
-| Temperature 1.0, top-p 0.95 | 0 | 20.68 | 15.20 | 19.1% |
-| Temperature 1.0, top-p 0.95 | 4096 | 21.19 | 21.13 | 31.3% |
+| Greedy | 0 | 24.19 | TODO | TODO |
+| Greedy | 4096 | 23.31 | TODO | TODO |
+| Temperature 0.7 | 0 | TODO | 24.91 | 34.9% |
+| Temperature 0.7 | 4096 | TODO | 47.20 | 92.4% |
+| Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
+| Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
 Depths 8192/12288/16384 and concurrent throughput: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
@@ -41,6 +41,7 @@ sessions but does not batch model work; `gufo bench` supports C1 for this model.
 ```
 
 The model uses 2048-token internal chunks, selected by a 512–4096 sweep.
+Resident readers gather n-gram rows while layer 0 runs, including graph replay.
 HTTP accepts arbitrary prompt lengths and yields between those chunks;
 spare session slots do not reduce the idle chunk size. Dense projection plans
 are deterministic and depend on exact shapes and the pinned HIP library.
@@ -72,6 +73,7 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
   projections against numerical references. F16 plans require FP64 agreement
   and bitwise replay, including ragged sizes and fallback shapes.
 - Upload tests check bytes, guards, shard/chunk boundaries and invalid inputs.
+  N-gram tests check asynchronous reads, duplicates, failed I/O and teardown.
   Wiring changes also require actual prompt, chat and sampled HTTP requests.
 
 Run the affected operator test first, then model replay for retained changes.

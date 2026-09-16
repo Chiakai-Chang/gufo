@@ -55,6 +55,12 @@ public:
   [[nodiscard]] bool Read(std::span<const std::uint32_t> rows,
                           std::span<float> out);
 
+  /// Starts a gather on the resident readers. The output must stay alive
+  /// until WaitRead; only one gather may be outstanding on this table.
+  [[nodiscard]] bool StartRead(std::span<const std::uint32_t> rows,
+                               std::span<float> out);
+  [[nodiscard]] bool WaitRead();
+
   [[nodiscard]] std::uint32_t RowDim() const noexcept { return row_dim_; }
   [[nodiscard]] std::uint64_t Rows() const noexcept { return rows_; }
   [[nodiscard]] std::size_t RowBytes() const noexcept { return row_bytes_; }
@@ -64,6 +70,10 @@ private:
 
   struct Job {
     std::uint32_t row;
+    float* dst;
+  };
+  struct Copy {
+    const float* src;
     float* dst;
   };
   bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf);
@@ -84,8 +94,10 @@ private:
   std::condition_variable wake_;
   std::condition_variable done_;
   std::vector<Job> jobs_;
+  std::vector<Copy> copies_;
   std::size_t next_job_{0};
   std::size_t pending_{0};
+  bool active_{false};
   bool failed_{false};
   bool stop_{false};
 };

@@ -134,6 +134,11 @@ void Session::Reset() {
 }
 
 Executor::~Executor() {
+  // Readers write pinned staging memory; drain them before freeing it,
+  // including when a forward failed before reaching PLE.
+  if (ple_pending_) {
+    (void)ngram_->WaitRead();
+  }
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -854,8 +859,11 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   return true;
 }
 
-void Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
-                        bool speculative) const {
+bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
+                        bool speculative, std::string* error_msg) const {
+  if (ple_pending_ && !WaitPle(error_msg)) {
+    return false;
+  }
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   // A speculative batch keeps the hash window after every token.
@@ -870,12 +878,23 @@ void Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
     HashNgramRows(c, session.ngram_, tokens,
                   std::span<std::uint32_t>(host_rows_.data(), n * c.ple_heads));
   }
-  ple_read_ = std::async(std::launch::async, [this, n, &c] {
-    return ngram_->Read(
-        std::span<const std::uint32_t>(host_rows_.data(), n * c.ple_heads),
-        std::span<float>(host_emb_,
-                         static_cast<std::size_t>(n) * c.PleEmbeddingDim()));
-  });
+  ple_pending_ = ngram_->StartRead(
+      std::span<const std::uint32_t>(host_rows_.data(), n * c.ple_heads),
+      std::span<float>(host_emb_,
+                       static_cast<std::size_t>(n) * c.PleEmbeddingDim()));
+  if (!ple_pending_) {
+    AssignError(error_msg, "n-gram table read could not start");
+  }
+  return ple_pending_;
+}
+
+bool Executor::WaitPle(std::string* error_msg) const {
+  const bool ok = ple_pending_ && ngram_->WaitRead();
+  ple_pending_ = false;
+  if (!ok) {
+    AssignError(error_msg, "n-gram table read failed");
+  }
+  return ok;
 }
 
 bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
@@ -883,8 +902,7 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
   const Config& c = config();
   const std::size_t emb_count =
       static_cast<std::size_t>(n) * c.PleEmbeddingDim();
-  if (!ple_read_.valid() || !ple_read_.get()) {
-    AssignError(error_msg, "n-gram table read failed");
+  if (!WaitPle(error_msg)) {
     return false;
   }
   if (!Check(hipMemcpyAsync(s_.ple_emb, host_emb_, emb_count * sizeof(float),
@@ -1194,8 +1212,8 @@ bool Executor::Head(const DeviceMixer& head, const float* res,
 }
 
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
-                   const std::function<bool()>& body,
-                   std::string* error_msg) const {
+                   const std::function<bool()>& body, std::string* error_msg,
+                   bool synchronize) const {
   // A batch shape runs eagerly once before it is captured: the first pass
   // grows the GEMM tier's arena, which capture forbids.
   if (graph && session.warmed_.contains(key)) {
@@ -1236,7 +1254,8 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
     }
     session.warmed_.insert(key);
   }
-  return Check(hipStreamSynchronize(stream_), "forward", error_msg);
+  return !synchronize ||
+         Check(hipStreamSynchronize(stream_), "forward", error_msg);
 }
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
@@ -1279,7 +1298,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
       AssignError(error_msg, "n-gram table is not open");
       return false;
     }
-    PleFetch(session, tokens, speculative);
+    if (!PleFetch(session, tokens, speculative, error_msg)) {
+      return false;
+    }
   }
   // Sparse selection only changes the result once a query can see more
   // than the token budget; every layer of this model shares one ratio.
@@ -1296,15 +1317,30 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
                             (static_cast<std::uint64_t>(sparse) << 33);
+  // PLE first consumes the disk rows at its injection layer. Queue the
+  // preceding layers before waiting, including on captured graph replay.
+  // Both pieces use the same stream and arithmetic as the unsplit graph.
+  const std::uint32_t first_layer =
+      graph && c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer) : 0;
+  if (first_layer > 0) {
+    const auto prefix = [&] {
+      return ForwardBody(session, n, 0, speculative, sparse, start_pos,
+                         graph_pool_grid, 0, first_layer, error_msg);
+    };
+    constexpr std::uint64_t kPrefixKey = std::uint64_t{1} << 35;
+    if (!Run(session, key | kPrefixKey, graph, prefix, error_msg, false)) {
+      return false;
+    }
+  }
   const auto body = [&] {
     return ForwardBody(session, n, n_logits, speculative, sparse, start_pos,
-                       graph ? graph_pool_grid : pool_grid, error_msg);
+                       graph ? graph_pool_grid : pool_grid, first_layer,
+                       c.num_layers, error_msg);
   };
-  // A replayed graph copies the n-gram rows without passing through Ple,
-  // so the read has to be complete before the launch.
-  if (graph && session.graphs_.contains(key) && ple_read_.valid() &&
-      !ple_read_.get()) {
-    AssignError(error_msg, "n-gram table read failed");
+  // Only the suffix waits for its pinned n-gram rows. During eager
+  // execution and capture, Ple performs this wait at the same boundary.
+  if (graph && session.graphs_.contains(key) && ple_pending_ &&
+      !WaitPle(error_msg)) {
     return false;
   }
   if (!Run(session, key, graph, body, error_msg)) {
@@ -1325,23 +1361,26 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
 bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t n_logits, bool speculative,
                            bool sparse, std::uint32_t start_pos,
-                           std::uint32_t pool_grid,
+                           std::uint32_t pool_grid, std::uint32_t first_layer,
+                           std::uint32_t end_layer,
                            std::string* error_msg) const {
   const Config& c = config();
-  if (!Check(hipMemcpyAsync(session.control_, control_host_,
-                            sizeof(Session::Control), hipMemcpyHostToDevice,
-                            stream_),
-             "control upload", error_msg) ||
-      !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
-                            hipMemcpyHostToDevice, stream_),
-             "token upload", error_msg)) {
-    return false;
+  if (first_layer == 0) {
+    if (!Check(hipMemcpyAsync(session.control_, control_host_,
+                              sizeof(Session::Control), hipMemcpyHostToDevice,
+                              stream_),
+               "control upload", error_msg) ||
+        !Check(hipMemcpyAsync(s_.tokens, tokens_host_, n * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               "token upload", error_msg)) {
+      return false;
+    }
+    EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
+                s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
   }
-  EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
-              s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
   const auto& layers = model_->layers();
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
-  for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+  for (std::uint32_t il = first_layer; il < end_layer; ++il) {
     const DeviceLayer& l = layers[il];
     if (c.IsPleLayer(il) &&
         !Ple(l, session, n, s_.res, speculative, error_msg)) {
@@ -1376,6 +1415,9 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             : model_->hc_head().norm.f32();
     Combine(s_.res, next_norm, n);
     normed = next_norm != nullptr;
+  }
+  if (end_layer < c.num_layers) {
+    return true;
   }
   // Keep the wide residual of every row for the draft block.
   if (model_->has_mtp() &&

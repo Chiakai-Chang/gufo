@@ -137,6 +137,33 @@ void TestTable() {
     }
     const std::vector<std::uint32_t> bad{rows};
     Check(!table->Read(bad, out), "out-of-range row rejected");
+    const auto expected = out;
+    std::fill(out.begin(), out.end(), -1.0F);
+    Check(table->StartRead(ids, out), "asynchronous gather starts");
+    Check(!table->StartRead(ids, out), "overlapping gather rejected");
+    Check(table->WaitRead(), "asynchronous gather completes");
+    Check(out == expected, "asynchronous rows and duplicates match");
+    Check(!table->WaitRead(), "completed gather cannot be consumed twice");
+    Check(table->Read({}, {}), "empty gather completes");
+    Check(!table->StartRead(ids, std::span<float>(out).first(dim)),
+          "short output rejected");
+    Check(table->Read(ids, out), "reader remains usable after rejection");
+    std::fill(out.begin(), out.end(), -1.0F);
+    Check(table->StartRead(ids, out), "final gather starts");
+    table.reset();
+    Check(out == expected, "destruction drains the outstanding gather");
+
+    // Valid row metadata with a truncated backing file must fail at the
+    // read boundary, then allow another gather to use the same readers.
+    auto truncated = q::NgramTable::Open(path, offset, rows + 1, dim,
+                                         gufo::core::GgmlType::kBF16, &error);
+    Check(truncated != nullptr, error.c_str());
+    if (truncated) {
+      Check(truncated->StartRead(bad, out), "missing row gather starts");
+      Check(!truncated->WaitRead(), "truncated row read fails");
+      Check(truncated->Read(ids, out), "reader recovers after failed I/O");
+      Check(out == expected, "failed I/O does not corrupt later rows");
+    }
   }
   std::filesystem::remove(path);
 }
