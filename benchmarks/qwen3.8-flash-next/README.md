@@ -27,13 +27,28 @@ Context depth (`-p 2048 -n 64 -b 2048 -d N`, one 2048-token chunk and 64
 decode steps after N prepared tokens; the sparse attention budget is 2048
 tokens, so past 2048 keys every full-attention layer selects blocks):
 
-| depth | pp2048 | tg64 | pp2048 before the F16 expert card | tg64 before | pp2048 before the depth card | tg64 before |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1299 | 22.5 | 1016 | 22.8 | 1010 | 22.8 |
-| 4096 | 1172 | 21.7 | 942 | 21.7 | 484 | 17.8 |
-| 16384 | 1051 | 20.9 | 838 | 20.1 | 320 | 15.0 |
-| 32768 | 936 | 19.5 | 766 | 19.4 | 221 | 12.4 |
-| 65536 | — | — | — | — | 140 | — |
+| depth | pp2048 | tg64 | pp2048 before the selection card | tg64 before | pp2048 before the F16 expert card | tg64 before | pp2048 before the depth card | tg64 before |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1276 | 22.2 | 1299 | 22.5 | 1016 | 22.8 | 1010 | 22.8 |
+| 4096 | 1210 | 22.0 | 1172 | 21.7 | 942 | 21.7 | 484 | 17.8 |
+| 16384 | 1155 | 21.5 | 1051 | 20.9 | 838 | 20.1 | 320 | 15.0 |
+| 32768 | 1109 | 20.9 | 936 | 19.5 | 766 | 19.4 | 221 | 12.4 |
+| 65536 | — | — | — | — | — | — | 140 | — |
+
+Where a 2048-token chunk's time goes with depth (one profiled pass per depth,
+12 full-attention layers; everything else is flat at about 1,560 ms):
+
+| depth | attention | block scoring (indexer) | top-k marking |
+| ---: | ---: | ---: | ---: |
+| 0 | 46 ms | 0 | 0 |
+| 2048 | 162 | 2 (was 25) | 7 (was 10) |
+| 8192 | 219 | 5 (was 64) | 8 (was 22) |
+| 16384 | 248 | 8 (was 128) | 11 (was 44) |
+
+The attention kernel's growth is the gather of the four-query union of
+selected blocks (about 850 blocks, 3,400 keys, 7 MB of K/V per block of four
+queries at 16k: 3.6 GB per layer at roughly 175 GB/s), i.e. K/V bandwidth,
+not matrix work; a narrower K/V format is the lever left there.
 
 Depths of 64k and beyond were not benchmarked after the change (each depth
 prepares the whole context first); the per-chunk cost is now the union of
@@ -102,6 +117,8 @@ targets under `tests/models/qwen38_flash_next/` (label
 | 64x64 tiles for the 320-row mixer down | rejected | 0.47 vs 0.40 ms per call: the weight re-reads cost more than the occupancy gained |
 | fused gate+up F16 expert GEMM (one launch, shared activation stages, SwiGLU on the accumulators) | rejected | 7.1 ms against 2 x 3.3: two accumulator sets and two decoded row tiles put the kernel at 231 VGPRs with 48 bytes of scratch (indexing the block header by a runtime byte lands it in memory) and 24.7 KB of LDS after the compiler promotes an alloca, two blocks per WGP |
 | F16 gate rows (the up epilogue reads the gate as F16) | rejected | neutral in a four-repeat interleaved A/B (1287–1298 against 1294–1301); the gate round trip is 0.2 ms per layer of a 1.6 s pass |
+| indexer block scoring on the matrix cores (selection card) | retained, pp2048@16k 1051 → 1155, @32k 936 → 1109 | the scalar scan (four heads x 128 dims per query-block pair, 8.6 GFLOP per layer at 16k) ran at 0.8 TFLOPS; now 32 queries x 128 blocks per workgroup as F16 fragments read straight from the F32 rows, four per-head F32 accumulators, relu-sum in the epilogue: 128 → 8 ms per chunk at 16k (scores within 0.6% of F64; the mask over them is exact). The unrolled K loop spilled 1 KB per lane and read garbage; `#pragma unroll 1` holds it at 147 VGPRs |
+| top-k marking by four-pass radix select | retained (bundled) | the 32-pass bit search re-read every score from L2 per pass; a 256-bin histogram per byte finds the threshold in four passes and a ballot scan ranks the ties in index order: 44 → 11 ms per chunk at 16k; decode at depth gains too (tg64@32k 19.5 → 20.9) |
 | fused Q4_K expert gate/up (decode) | rejected | MTP tg128 38.6 → 33.5 despite fewer cycles |
 | 40-row expert vector dispatch (decode) | rejected | vector 33.3 versus tiled 38.0 tok/s |
 
@@ -149,10 +166,11 @@ graph replay leaves ~1.3 µs per launch of gaps.
   would have to be produced as F16.
 - DeltaNet recurrence (3.0 ms per layer, 7% of a pass) is a sequential
   per-token chain; a chunked formulation would turn it into GEMMs.
-- Attention at depth: a 5-query x 12-head flat row layout (60 live rows of
-  64) would cut the sparse sweep another ~10%; the indexer scan
-  (SelectScoreKernel, 1.7 ms per layer at 16k) could score 64 queries per
-  block from LDS.
+- Attention at depth is bound by the gather of the four-query union of
+  selected blocks (3.6 GB of K/V per layer at 16k); a narrower K/V cache
+  (FP8 with per-block scales) would halve it at a precision cost that needs
+  validation, and a 5-query x 12-head flat row layout (60 live rows of 64)
+  would cut the sweep another ~10%.
 - The draft block folds its four streams into rows, so its projections run
   at 4x the batch; the W8A8 path chunks them to the tiled buffer (found as
   a GPU fault in MTP decode past 2048 tokens of context: the first card's

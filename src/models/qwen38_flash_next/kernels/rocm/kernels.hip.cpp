@@ -1524,16 +1524,44 @@ __global__ void PoolBlocksKernel(const float* raw, const float* gamma,
   }
 }
 
-/// Indexer scores: grid (query groups of kSelectQueries, row splits of
-/// kSelectRows blocks). Four lanes share one pooled key row (32 dims each)
-/// and every query of the group scores it from LDS, so a key row is read
-/// once per sixteen queries instead of once per query. Score = sum over
-/// heads of relu(q_h . k), positive, written for blocks below the group's
-/// widest complete range (rows a query cannot see are simply never read).
-constexpr std::uint32_t kSelectQueries = 16;
-constexpr std::uint32_t kSelectRows = 1024;
+// F16 WMMA fragments (wave32): sixteen halves per lane, eight F32
+// accumulators per lane.
+using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
+using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
+
+__device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
+  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+}
+
+/// Indexer scores on the matrix cores: score[q][b] = sum over heads of
+/// relu(q_h . k_b) for a 32-query x 128-block tile per workgroup (wave w:
+/// queries (w & 1) * 16.., blocks (w >> 1) * 32.., so a pooled key
+/// fragment serves the four heads and a query fragment two block tiles).
+/// Both operands are read straight from their F32 rows as 16-element
+/// fragments and rounded to F16; the four per-head dot products accumulate
+/// in F32 over the 128 dims before the relu. Scores are written for every
+/// block below the group's widest complete range (a query never reads
+/// blocks it cannot see); below the budget nothing is scored.
+constexpr std::uint32_t kSelectQueries = 32;
+constexpr std::uint32_t kSelectRows = 128;
 constexpr std::uint32_t kSelectHeads = 4;
 constexpr std::uint32_t kSelectDim = 128;
+
+/// Sixteen consecutive F32 values as an F16 fragment.
+__device__ __forceinline__ v16h LoadFragF32(const float* p) {
+  const auto* v = reinterpret_cast<const float4*>(p);
+  __half2 h[8];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const float4 f = v[i];
+    h[2 * i] = __floats2half2_rn(f.x, f.y);
+    h[2 * i + 1] = __floats2half2_rn(f.z, f.w);
+  }
+  v16h out;
+  __builtin_memcpy(&out, h, 32);
+  return out;
+}
+
 __global__ void SelectScoreKernel(const float* q, const float* blocks,
                                   float* scores, std::uint32_t n_tokens,
                                   const std::uint32_t* start_pos,
@@ -1541,67 +1569,94 @@ __global__ void SelectScoreKernel(const float* q, const float* blocks,
                                   std::uint32_t ratio, std::uint32_t budget,
                                   std::uint32_t max_blocks) {
   constexpr std::uint32_t kQDim = kSelectHeads * kSelectDim;
-  __shared__ float qs[kSelectQueries * kQDim];
+  constexpr std::uint32_t kSteps = kSelectDim / 16;
+  constexpr std::uint32_t kTiles = 2;  // block tiles per wave
   const std::uint32_t t0 = blockIdx.x * kSelectQueries;
   const std::uint32_t live = min(kSelectQueries, n_tokens - t0);
-  // The widest complete range in the group; below the budget nothing is
-  // scored (the mark kernel makes everything visible).
   const std::uint32_t complete = (*start_pos + first_token + t0 + live) / ratio;
   const std::uint32_t row0 = blockIdx.y * kSelectRows;
   if (complete <= budget || row0 >= complete) {
     return;
   }
-  for (std::uint32_t i = threadIdx.x; i < live * kQDim; i += blockDim.x) {
-    qs[i] = q[(static_cast<std::size_t>(t0) * kQDim) + i];
-  }
-  __syncthreads();
-  const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t wave = threadIdx.x >> 5u;
-  const std::uint32_t quarter = lane & 3u;  // 32 dims of the row
-  const std::uint32_t row_in_wave = lane >> 2u;
-  const std::uint32_t row_end = min(complete, row0 + kSelectRows);
-  for (std::uint32_t b = row0 + (wave * 8) + row_in_wave; b < row_end;
-       b += 64) {
-    const auto* kb = reinterpret_cast<const float4*>(
-        blocks + (static_cast<std::size_t>(b) * kSelectDim) + (quarter * 32));
-    float4 kv[8];
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t sub_lane = lane & 15u;
+  const std::uint32_t half_id = lane >> 4u;
+  const std::uint32_t qt = t0 + ((wave & 1u) * 16);
+  const std::uint32_t bt = row0 + ((wave >> 1u) * 16 * kTiles);
+  if (bt >= complete) {
+    return;
+  }
+  // Rows past the batch / the complete range read a clamped row; their
+  // scores are never read back.
+  const std::uint32_t q_row = min(qt + sub_lane, n_tokens - 1);
+  const float* q_lane = q + (static_cast<std::size_t>(q_row) * kQDim);
+  const float* k_lane[kTiles];
 #pragma unroll
-    for (std::uint32_t i = 0; i < 8; ++i) {
-      kv[i] = kb[i];
+  for (std::uint32_t j = 0; j < kTiles; ++j) {
+    const std::uint32_t b_row = min(bt + (j * 16) + sub_lane, complete - 1);
+    k_lane[j] = blocks + (static_cast<std::size_t>(b_row) * kSelectDim);
+  }
+  v8f acc[kSelectHeads][kTiles];
+#pragma unroll
+  for (std::uint32_t h = 0; h < kSelectHeads; ++h) {
+#pragma unroll
+    for (std::uint32_t j = 0; j < kTiles; ++j) {
+      acc[h][j] = v8f{0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
     }
-    for (std::uint32_t qi = 0; qi < live; ++qi) {
-      float total = 0.0f;
+  }
+  // Not unrolled: eight unrolled steps hoist every fragment load and spill.
+#pragma unroll 1
+  for (std::uint32_t ks = 0; ks < kSteps; ++ks) {
+    v16h kf[kTiles];
 #pragma unroll
-      for (std::uint32_t h = 0; h < kSelectHeads; ++h) {
-        const auto* qh = reinterpret_cast<const float4*>(
-            qs + (qi * kQDim) + (h * kSelectDim) + (quarter * 32));
-        float dot = 0.0f;
+    for (std::uint32_t j = 0; j < kTiles; ++j) {
+      kf[j] = LoadFragF32(k_lane[j] + (ks * 16));
+    }
 #pragma unroll
-        for (std::uint32_t i = 0; i < 8; ++i) {
-          const float4 v = qh[i];
-          dot += v.x * kv[i].x + v.y * kv[i].y + v.z * kv[i].z + v.w * kv[i].w;
-        }
-        dot += __shfl_xor(dot, 1);
-        dot += __shfl_xor(dot, 2);
-        total += fmaxf(dot, 0.0f);
+    for (std::uint32_t h = 0; h < kSelectHeads; ++h) {
+      const v16h qf = LoadFragF32(q_lane + (h * kSelectDim) + (ks * 16));
+#pragma unroll
+      for (std::uint32_t j = 0; j < kTiles; ++j) {
+        acc[h][j] = Wmma(qf, kf[j], acc[h][j]);
       }
-      if (quarter == 0) {
-        scores[(static_cast<std::size_t>(t0 + qi) * max_blocks) + b] = total;
+    }
+  }
+  // Lane element l of a tile is (query 2l + half, block sub_lane).
+#pragma unroll
+  for (std::uint32_t j = 0; j < kTiles; ++j) {
+    const std::uint32_t b = bt + (j * 16) + sub_lane;
+    if (b >= complete) {
+      continue;
+    }
+#pragma unroll
+    for (int l = 0; l < 8; ++l) {
+      const std::uint32_t t = qt + (2 * l) + half_id;
+      if (t < n_tokens) {
+        float total = 0.0F;
+#pragma unroll
+        for (std::uint32_t h = 0; h < kSelectHeads; ++h) {
+          total += fmaxf(acc[h][j][l], 0.0F);
+        }
+        scores[(static_cast<std::size_t>(t) * max_blocks) + b] = total;
       }
     }
   }
 }
 
-/// One block per query: finds the budget-th largest score by a 32-step bit
-/// search over the float ordering and marks the blocks at or above it (ties
-/// resolved by lowest index). Every block is visible below the budget.
+/// One block per query: a four-pass radix select over the float ordering
+/// (scores are non-negative, so their bit patterns order like unsigned
+/// ints) finds the budget-th largest score, then marks the blocks above it
+/// and the first `remaining` ties in index order. Every block is visible
+/// below the budget.
 __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
                                  const std::uint32_t* start_pos,
                                  std::uint32_t first_token, std::uint32_t ratio,
                                  std::uint32_t budget, std::uint32_t mask_words,
                                  std::uint32_t max_blocks) {
-  __shared__ float shared[32];
-  __shared__ std::uint32_t counts[32];
+  __shared__ std::uint32_t hist[256];
+  __shared__ std::uint32_t wave_ties[kThreads / 32];
+  __shared__ std::uint32_t state[2];  // threshold, remaining
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t pos = *start_pos + first_token + t;
   const std::uint32_t complete = (pos + 1) / ratio;
@@ -1612,48 +1667,75 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
   if (complete <= budget) {
     return;
   }
-  __syncthreads();
-  const float* sc = scores + static_cast<std::size_t>(t) * max_blocks;
-  // Scores are non-negative, so their bit patterns order like unsigned ints.
-  std::uint32_t threshold = 0;
-  for (int bit = 31; bit >= 0; --bit) {
-    const std::uint32_t candidate = threshold | (1u << bit);
-    std::uint32_t count = 0;
+  const auto* sc = reinterpret_cast<const std::uint32_t*>(
+      scores + static_cast<std::size_t>(t) * max_blocks);
+  std::uint32_t prefix = 0;          // the threshold's bits settled so far
+  std::uint32_t remaining = budget;  // ranks still to fill below the prefix
+  for (int shift = 24; shift >= 0; shift -= 8) {
+    hist[threadIdx.x] = 0;
+    __syncthreads();
+    const std::uint32_t prefix_mask = shift == 24 ? 0u : (~0u << (shift + 8));
     for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
-      count += __float_as_uint(sc[b]) >= candidate ? 1u : 0u;
-    }
-    const float total = BlockSum(static_cast<float>(count), shared);
-    if (static_cast<std::uint32_t>(total + 0.5f) >= budget) {
-      threshold = candidate;
-    }
-  }
-  // Blocks strictly above the threshold are in; ties fill the remainder in
-  // index order.
-  std::uint32_t above = 0;
-  for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
-    above += __float_as_uint(sc[b]) > threshold ? 1u : 0u;
-  }
-  const std::uint32_t n_above = static_cast<std::uint32_t>(
-      BlockSum(static_cast<float>(above), shared) + 0.5f);
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    counts[0] = budget - n_above;
-  }
-  __syncthreads();
-  for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
-    if (__float_as_uint(sc[b]) > threshold) {
-      atomicOr(&words[b / 32], 1u << (b % 32));
-    }
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    std::uint32_t remaining = counts[0];
-    for (std::uint32_t b = 0; b < complete && remaining > 0; ++b) {
-      if (__float_as_uint(sc[b]) == threshold) {
-        words[b / 32] |= 1u << (b % 32);
-        --remaining;
+      const std::uint32_t v = sc[b];
+      if ((v & prefix_mask) == prefix) {
+        atomicAdd(&hist[(v >> shift) & 0xFFu], 1u);
       }
     }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      // Walk the bins from the top: the bin where the running count reaches
+      // `remaining` holds the threshold's next byte.
+      std::uint32_t seen = 0;
+      std::uint32_t bin = 0;
+      for (int i = 255; i >= 0; --i) {
+        if (seen + hist[i] >= remaining) {
+          bin = static_cast<std::uint32_t>(i);
+          break;
+        }
+        seen += hist[i];
+      }
+      state[0] = prefix | (bin << shift);
+      state[1] = remaining - seen;
+    }
+    __syncthreads();
+    prefix = state[0];
+    remaining = state[1];
+    __syncthreads();
+  }
+  const std::uint32_t threshold = prefix;
+  // Blocks strictly above the threshold are in; the first `remaining` ties
+  // in index order fill the budget. Ties are ranked with a wave ballot and
+  // a per-chunk scan over the eight waves.
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t wave = threadIdx.x >> 5u;
+  std::uint32_t ties_before = 0;
+  for (std::uint32_t chunk = 0; chunk < complete; chunk += blockDim.x) {
+    const std::uint32_t b = chunk + threadIdx.x;
+    const std::uint32_t v = b < complete ? sc[b] : 0u;
+    const bool tie = b < complete && v == threshold;
+    if (b < complete && v > threshold) {
+      atomicOr(&words[b / 32], 1u << (b % 32));
+    }
+    const std::uint64_t ballot = __ballot(tie);
+    if (lane == 0) {
+      wave_ties[wave] = static_cast<std::uint32_t>(__popcll(ballot));
+    }
+    __syncthreads();
+    std::uint32_t before = ties_before;
+    for (std::uint32_t w = 0; w < wave; ++w) {
+      before += wave_ties[w];
+    }
+    before += static_cast<std::uint32_t>(
+        __popcll(ballot & ((std::uint64_t{1} << lane) - 1)));
+    if (tie && before < remaining) {
+      atomicOr(&words[b / 32], 1u << (b % 32));
+    }
+    std::uint32_t chunk_ties = 0;
+    for (std::uint32_t w = 0; w < kThreads / 32; ++w) {
+      chunk_ties += wave_ties[w];
+    }
+    ties_before += chunk_ties;
+    __syncthreads();
   }
 }
 
@@ -2128,13 +2210,6 @@ constexpr std::uint32_t kWmmaKSteps = kWmmaHeadDim / 16;
 constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
 // Union-mask capacity: one bit per 4-token block, 262,144 tokens of context.
 constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
-
-using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
-using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
-
-__device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
-  return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
-}
 
 // A fragment is 16 contiguous halves = 32 bytes: two 16-byte loads and a
 // bitcast. Every fragment base here is 16-byte aligned by construction.

@@ -66,13 +66,17 @@ std::vector<T> Download(const T* device, std::size_t count) {
   return host;
 }
 
-bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed) {
+bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
+         bool zero_queries = false) {
   const std::uint32_t max_context = start_pos + n_tokens + 64;
   const std::uint32_t max_blocks = (max_context + kRatio - 1) / kRatio;
   const std::uint32_t mask_words = (max_blocks + 31) / 32;
   const std::size_t q_count =
       static_cast<std::size_t>(n_tokens) * kHeads * kDim;
-  const auto qv = MakeValues(q_count, seed, 1.0F);
+  // Zero queries make every score tie at zero: the budget must then fill
+  // in index order.
+  const auto qv = zero_queries ? std::vector<float>(q_count, 0.0F)
+                               : MakeValues(q_count, seed, 1.0F);
   const auto blocks = MakeValues(static_cast<std::size_t>(max_blocks) * kDim,
                                  seed ^ 0x9999U, 1.0F);
   float* d_q = Upload(qv);
@@ -120,8 +124,8 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed) {
       }
       ref[b] = total;
       const float got = scores[static_cast<std::size_t>(t) * max_blocks + b];
-      worst_score =
-          std::max(worst_score, std::abs(total - got) / std::max(1.0, total));
+      const double err = std::abs(total - got) / std::max(1.0, total);
+      worst_score = std::max(worst_score, err);
     }
     // Selection contract on the GPU's own scores: the budget highest,
     // blocks strictly above the threshold first, ties by lowest index.
@@ -156,7 +160,9 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed) {
   (void)hipFree(d_pos);
   (void)hipFree(d_mask);
   (void)hipFree(d_scores);
-  return worst_score < 1e-4 && mismatches == 0;
+  // The scores ride F16 fragments on the matrix cores, so they agree with
+  // the F64 reference to about 1e-3; the mask is exact over the GPU scores.
+  return worst_score < 1e-2 && mismatches == 0;
 }
 
 }  // namespace
@@ -164,9 +170,10 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed) {
 int main() {
   try {
     bool ok = true;
-    ok = Run(100, 20000, 0x1234ABCDU) && ok;  // deep, ragged group
-    ok = Run(1, 9001, 0x0BADF00DU) && ok;     // decode
-    ok = Run(40, 2040, 0xDEADBEEFU) && ok;    // straddles the budget
+    ok = Run(100, 20000, 0x1234ABCDU) && ok;     // deep, ragged group
+    ok = Run(1, 9001, 0x0BADF00DU) && ok;        // decode
+    ok = Run(40, 2040, 0xDEADBEEFU) && ok;       // straddles the budget
+    ok = Run(3, 6000, 0x5EED5EEDU, true) && ok;  // all scores tie at zero
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
