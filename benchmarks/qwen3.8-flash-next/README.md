@@ -16,10 +16,11 @@ pass can read 2–4% low — `-p 2048,2048,2048,2048` settles at 1294–1301):
 
 | test | gufo (`nix build` of this tree) | before the F16 expert card (`72fe0f4`) | before the prefill work (`97b445b`) | llama.cpp ROCm `41abbfd59` (`-fa 1 -ub 2048`) |
 | --- | ---: | ---: | ---: | ---: |
-| pp128 | 474 | 464 | 443 | — |
-| pp512 | 814 | 796 | 628 | 402 |
-| pp1024 | 1195 | 931 | — | — |
-| pp2048 | 1293 (steady clock 1298) | 1040 | 719 | 439 |
+| pp128 | 532 | 464 | 443 | — |
+| pp256 | 753 | — | — | — |
+| pp512 | 995 | 796 | 628 | 402 |
+| pp1024 | 1194 | 931 | — | — |
+| pp2048 | 1300 (steady clock 1298) | 1040 | 719 | 439 |
 | tg64 greedy | 22.9 | 22.7 | 22.8 | 21.9 |
 | tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 29.6 (depth 0) / 36.2 (depth 1024) / 14.8 (depth 4096) / 15.3 (depth 16384) | 32.9 (depth 0) / 36.5 (depth 1024) / 35.0 (depth 4096) / 42.9 (depth 16384) | 38.4 / 35.0 / 30.4 / — | — |
 
@@ -118,6 +119,7 @@ targets under `tests/models/qwen38_flash_next/` (label
 | fused gate+up F16 expert GEMM (one launch, shared activation stages, SwiGLU on the accumulators) | rejected | 7.1 ms against 2 x 3.3: two accumulator sets and two decoded row tiles put the kernel at 231 VGPRs with 48 bytes of scratch (indexing the block header by a runtime byte lands it in memory) and 24.7 KB of LDS after the compiler promotes an alloca, two blocks per WGP |
 | F16 gate rows (the up epilogue reads the gate as F16) | rejected | neutral in a four-repeat interleaved A/B (1287–1298 against 1294–1301); the gate round trip is 0.2 ms per layer of a 1.6 s pass |
 | indexer block scoring on the matrix cores (selection card) | retained, pp2048@16k 1051 → 1155, @32k 936 → 1109 | the scalar scan (four heads x 128 dims per query-block pair, 8.6 GFLOP per layer at 16k) ran at 0.8 TFLOPS; now 32 queries x 128 blocks per workgroup as F16 fragments read straight from the F32 rows, four per-head F32 accumulators, relu-sum in the epilogue: 128 → 8 ms per chunk at 16k (scores within 0.6% of F64; the mask over them is exact). The unrolled K loop spilled 1 KB per lane and read garbage; `#pragma unroll 1` holds it at 147 VGPRs |
+| 16-row tile of the routed F16 GEMM for small batches | retained, pp512 814 → 995, pp128 474 → 532, pp256 753 | below 16 rows per expert on average the MMQ tier had kept the experts (its 16/32-column tiles fit ten-row buckets); the F16 kernel's row tile is a template parameter, so a 16-row instantiation covers those buckets exactly and the whole batch takes the F16 route with its fused activation passes. Bucket means of 16 and up keep the 48-row tile (pp1024 1194 against 1129 on the narrow tile: the per-row dequantization is per tile) |
 | top-k marking by four-pass radix select | retained (bundled) | the 32-pass bit search re-read every score from L2 per pass; a 256-bin histogram per byte finds the threshold in four passes and a ballot scan ranks the ties in index order: 44 → 11 ms per chunk at 16k; decode at depth gains too (tg64@32k 19.5 → 20.9) |
 | fused Q4_K expert gate/up (decode) | rejected | MTP tg128 38.6 → 33.5 despite fewer cycles |
 | 40-row expert vector dispatch (decode) | rejected | vector 33.3 versus tiled 38.0 tok/s |
@@ -178,9 +180,6 @@ graph replay leaves ~1.3 µs per launch of gaps.
 - The hyper-connection combine and mix are bandwidth bound on the F32
   residual stream (about 250 MB per call); a BF16 residual would halve it at
   a precision cost that needs its own validation.
-- pp512 and below still take the MMQ tier for the experts; a 16- or 32-row
-  token tile variant of the routed F16 kernel could cover the 10-row
-  buckets (the tile map already handles ragged buckets).
 
 ## Where the time went (before the prefill work)
 

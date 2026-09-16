@@ -226,7 +226,8 @@ struct Result {
 /// its activation quantization).
 Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
            std::size_t experts, std::size_t m, std::size_t k,
-           std::uint32_t seed, bool check = true) {
+           std::uint32_t seed, bool check = true,
+           std::uint32_t tile_rows = 48) {
   const Experts w =
       type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, seed)
       : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, seed)
@@ -299,7 +300,7 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   std::vector<std::int32_t> tiles;
   for (std::size_t e = 0; e < experts; ++e) {
     const std::uint32_t padded = (counts[e] + 15u) / 16u * 16u;
-    for (std::uint32_t j = 0; j < (padded + 47u) / 48u; ++j) {
+    for (std::uint32_t j = 0; j < (padded + tile_rows - 1) / tile_rows; ++j) {
       tiles.push_back(static_cast<std::int32_t>(e | (j << 16)));
     }
   }
@@ -308,9 +309,9 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   float* d_f16 = Upload(zero_out);
   for (int rep = 0; rep < (check ? 1 : 3); ++rep) {
     if (!q::RoutedF16Gemm(d_w, type, d_x_half, d_tiles,
-                          static_cast<std::uint32_t>(tiles.size()), d_bounds,
-                          d_rows_token, d_rows_slot, nullptr, d_f16, nullptr, m,
-                          k, nullptr)) {
+                          static_cast<std::uint32_t>(tiles.size()), tile_rows,
+                          d_bounds, d_rows_token, d_rows_slot, nullptr, d_f16,
+                          nullptr, m, k, nullptr)) {
       throw std::runtime_error("routed F16 GEMM rejected the shape");
     }
   }
@@ -319,9 +320,9 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   __half* d_f16_half =
       Upload(std::vector<__half>(slots * m, __float2half(0.0F)));
   if (!q::RoutedF16Gemm(d_w, type, d_x_half, d_tiles,
-                        static_cast<std::uint32_t>(tiles.size()), d_bounds,
-                        d_rows_token, d_rows_slot, nullptr, nullptr, d_f16_half,
-                        m, k, nullptr)) {
+                        static_cast<std::uint32_t>(tiles.size()), tile_rows,
+                        d_bounds, d_rows_token, d_rows_slot, nullptr, nullptr,
+                        d_f16_half, m, k, nullptr)) {
     throw std::runtime_error("routed F16 GEMM (F16 out) rejected the shape");
   }
   CheckHip(hipDeviceSynchronize(), "routed GEMMs");
@@ -409,16 +410,38 @@ int main() {
          ok;
     // Ragged rows against the 128-row tile and a tiny batch.
     ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 200, 512, 0xDEADBEEFU)) && ok;
+    // The 16-row tile (small buckets) on every type.
+    ok = Ok(Run(q::WeightType::kQ4_K, 300, 10, 64, 640, 2560, 0x16161616U, true,
+                16)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x16160002U, true,
+                16)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kQ5_1, 3000, 1, 64, 2560, 640, 0x16160003U, true,
+                16)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x16160004U, true,
+                16)) &&
+         ok;
     // Production shapes for profiling only (QFN_ROUTED_BENCH=1): the F16
     // route is launched three times per shape, no reference.
     if (std::getenv("QFN_ROUTED_BENCH") != nullptr) {
+      const std::uint32_t tile_rows =
+          std::getenv("QFN_ROUTED_TILE") != nullptr
+              ? static_cast<std::uint32_t>(
+                    std::atoi(std::getenv("QFN_ROUTED_TILE")))
+              : 48;
+      const std::size_t n_tokens = std::getenv("QFN_ROUTED_TOKENS") != nullptr
+                                       ? static_cast<std::size_t>(std::atoi(
+                                             std::getenv("QFN_ROUTED_TOKENS")))
+                                       : 2048;
       for (int i = 0; i < 3; ++i) {
-        (void)Run(q::WeightType::kQ4_K, 2048, 10, 512, 640, 2560, 0x1111U + i,
-                  false);
-        (void)Run(q::WeightType::kQ5_1, 20480, 1, 512, 2560, 640, 0x2222U + i,
-                  false);
-        (void)Run(q::WeightType::kQ8_0, 20480, 1, 512, 2560, 640, 0x3333U + i,
-                  false);
+        (void)Run(q::WeightType::kQ4_K, n_tokens, 10, 512, 640, 2560,
+                  0x1111U + i, false, tile_rows);
+        (void)Run(q::WeightType::kQ5_1, n_tokens * 10, 1, 512, 2560, 640,
+                  0x2222U + i, false, tile_rows);
+        (void)Run(q::WeightType::kQ8_0, n_tokens * 10, 1, 512, 2560, 640,
+                  0x3333U + i, false, tile_rows);
       }
     }
     return ok ? 0 : 1;

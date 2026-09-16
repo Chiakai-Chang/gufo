@@ -146,14 +146,15 @@ void RoutedCompact(const std::int32_t* ids, const std::uint32_t* counts,
 /// (F16) receives the result; a non-null `swiglu_gate` (the gate
 /// projection's F32 output over the same rows) turns it into
 /// silu(gate) * result.
+/// `tile_rows` is the token rows per tile the map was built with (16 or 48).
 /// Q4_K and Q5_K need k % 256 == 0, Q5_1 and Q8_0 k % 64 == 0; other types
-/// return false.
+/// and tile widths return false.
 bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                    const std::int32_t* tiles, std::uint32_t n_tiles,
-                   const std::int32_t* pad_bounds, const std::int32_t* rows_in,
-                   const std::int32_t* rows_out, const float* swiglu_gate,
-                   float* out, __half* out_half, std::size_t m, std::size_t k,
-                   hipStream_t stream);
+                   std::uint32_t tile_rows, const std::int32_t* pad_bounds,
+                   const std::int32_t* rows_in, const std::int32_t* rows_out,
+                   const float* swiglu_gate, float* out, __half* out_half,
+                   std::size_t m, std::size_t k, hipStream_t stream);
 
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,

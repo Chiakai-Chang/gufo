@@ -344,7 +344,8 @@ private:
   std::uint32_t* counts_host_{nullptr};
   std::int32_t* tiles_host_{nullptr};           ///< routed tile map staging
   mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
-  mutable std::uint32_t routed_n_tiles_{0};     ///< launched 48-row tiles
+  mutable std::uint32_t routed_n_tiles_{0};     ///< launched row tiles
+  mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable std::size_t routed_compact_rows_{0};  ///< sum of padded buckets
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
