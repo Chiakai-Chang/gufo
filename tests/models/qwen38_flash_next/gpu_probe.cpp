@@ -251,8 +251,8 @@ int main(int argc, char** argv) {
       } else {
         next.push_back(tokens[off + n]);
       }
-      if (!executor->MtpForward(*session, next, 0, draft_logits.data(),
-                                &error)) {
+      if (!executor->MtpForward(*session, next, 0,
+                                {.logits = draft_logits.data()}, &error)) {
         std::fprintf(stderr, "draft prefill failed: %s\n", error.c_str());
         return 1;
       }
@@ -346,7 +346,7 @@ int main(int argc, char** argv) {
         if (j + 1 < spec &&
             !executor->MtpForward(*session,
                                   std::span<const std::int32_t>(&draft, 1), -1,
-                                  draft_logits.data(), &error)) {
+                                  {.logits = draft_logits.data()}, &error)) {
           std::fprintf(stderr, "draft failed: %s\n", error.c_str());
           return 1;
         }
@@ -379,8 +379,8 @@ int main(int argc, char** argv) {
       std::vector<std::int32_t> resync(chain.begin() + 1, chain.begin() + keep);
       resync.push_back(next_token);
       executor->MtpRewind(*session, base);
-      if (!executor->MtpForward(*session, resync, 0, draft_logits.data(),
-                                &error)) {
+      if (!executor->MtpForward(*session, resync, 0,
+                                {.logits = draft_logits.data()}, &error)) {
         std::fprintf(stderr, "draft resync failed: %s\n", error.c_str());
         return 1;
       }

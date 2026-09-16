@@ -174,7 +174,6 @@ Session::Session(std::shared_ptr<Model> model,
     : model_(std::move(model)), session_(std::move(session)) {
   logits_.resize(model_->VocabSize());
   if (model_->HasMtp()) {
-    draft_logits_.resize(model_->VocabSize());
     verify_logits_.resize(
         static_cast<std::size_t>(model_->executor_->max_speculative()) *
         model_->VocabSize());
@@ -197,12 +196,8 @@ void Session::Reset() {
   model_->executor_->MtpRewind(*session_, 0);
 }
 
-std::int32_t Session::Argmax(const float* row) const noexcept {
-  const std::size_t n = model_->VocabSize();
-  return static_cast<std::int32_t>(std::max_element(row, row + n) - row);
-}
-
-bool Session::DraftCatchUp(std::int32_t next_token, std::string* error_msg) {
+bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
+                           std::string* error_msg) {
   // The draft block trails the trunk: MTP position i consumes token i+1 and
   // the trunk's hidden of position i, so positions up to the current one are
   // replayed once their successor token is known. The session keeps hidden
@@ -219,9 +214,9 @@ bool Session::DraftCatchUp(std::int32_t next_token, std::string* error_msg) {
   }
   std::vector<std::int32_t> replay(tokens_.begin() + mp + 1, tokens_.end());
   replay.push_back(next_token);
-  if (!exec.MtpForward(*session_, replay,
-                       static_cast<std::int32_t>(mp - hidden_base_),
-                       draft_logits_.data(), error_msg)) {
+  if (!exec.MtpForward(
+          *session_, replay, static_cast<std::int32_t>(mp - hidden_base_),
+          {.token = propose ? &draft_token_ : nullptr}, error_msg)) {
     return false;
   }
   return true;
@@ -235,7 +230,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
         std::min<std::size_t>(exec.max_batch(), tokens.size() - off);
     const auto chunk = tokens.subspan(off, n);
     if (model_->HasMtp() && !tokens_.empty() &&
-        !DraftCatchUp(chunk[0], error_msg)) {
+        !DraftCatchUp(chunk[0], false, error_msg)) {
       return false;
     }
     if (!exec.Forward(*session_, chunk, 1, logits_.data(), false, error_msg)) {
@@ -318,19 +313,18 @@ bool Session::DecodeStep(std::size_t max_tokens,
   }
 
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
-  if (!DraftCatchUp(anchor, error_msg)) {
+  if (!DraftCatchUp(anchor, true, error_msg)) {
     return false;
   }
   std::vector<std::int32_t> chain{anchor};
-  std::int32_t draft = Argmax(draft_logits_.data());
+  std::int32_t draft = draft_token_;
   while (chain.size() < width) {
     chain.push_back(draft);
     if (chain.size() < width) {
       if (!exec.MtpForward(*session_, std::span<const std::int32_t>(&draft, 1),
-                           -1, draft_logits_.data(), error_msg)) {
+                           -1, {.token = &draft}, error_msg)) {
         return false;
       }
-      draft = Argmax(draft_logits_.data());
     }
   }
 

@@ -143,14 +143,14 @@ private:
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg);
-  bool DraftCatchUp(std::int32_t next_token, std::string* error_msg);
-  [[nodiscard]] std::int32_t Argmax(const float* row) const noexcept;
+  bool DraftCatchUp(std::int32_t next_token, bool propose,
+                    std::string* error_msg);
 
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;
   std::vector<std::int32_t> tokens_;
   std::vector<float> logits_;
-  std::vector<float> draft_logits_;
+  std::int32_t draft_token_{0};
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   SpeculativeStats stats_;

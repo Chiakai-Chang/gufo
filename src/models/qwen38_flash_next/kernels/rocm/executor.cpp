@@ -145,7 +145,8 @@ Executor::~Executor() {
   for (void* p :
        {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
         static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
-        static_cast<void*>(counts_host_), static_cast<void*>(tiles_host_)}) {
+        static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
+        static_cast<void*>(tiles_host_)}) {
     if (p != nullptr) {
       (void)hipHostFree(p);
     }
@@ -322,6 +323,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_embd = f32(T * hidden);
     s.mtp_concat = f32(T * hc_dim * 2);
     s.mtp_res = f32(T * hc_dim);
+    s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
+    s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
+    if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t)),
+               "pinned draft token", error_msg)) {
+      return nullptr;
+    }
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -1197,18 +1204,27 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   return true;
 }
 
-bool Executor::Head(const DeviceMixer& head, const float* res,
-                    std::uint32_t n_rows, std::string* error_msg) const {
+bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
+                       bool logits, std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
-  if (!HcMix(head, res, false, s_.mixed, nullptr, n_rows, error_msg) ||
-      !Dense(output, s_.mixed, s_.logits, n_rows, error_msg)) {
+  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
+      !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
     return false;
   }
-  return Check(hipMemcpyAsync(logits_host_, s_.logits,
-                              static_cast<std::size_t>(n_rows) * output.rows *
-                                  sizeof(float),
-                              hipMemcpyDeviceToHost, stream_),
-               "logits download", error_msg);
+  if (token) {
+    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, output.rows, stream_);
+    if (!Check(
+            hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
+                           hipMemcpyDeviceToHost, stream_),
+            "draft token download", error_msg)) {
+      return false;
+    }
+  }
+  return !logits || Check(hipMemcpyAsync(logits_host_, s_.logits,
+                                         static_cast<std::size_t>(output.rows) *
+                                             sizeof(float),
+                                         hipMemcpyDeviceToHost, stream_),
+                          "logits download", error_msg);
 }
 
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
@@ -1504,9 +1520,8 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
 
 bool Executor::MtpForward(Session& session,
                           std::span<const std::int32_t> tokens,
-                          std::int32_t hidden_row, float* logits,
+                          std::int32_t hidden_row, MtpOutput output,
                           std::string* error_msg) const {
-  const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (!model_->has_mtp()) {
     AssignError(error_msg, "no MTP block loaded");
@@ -1531,18 +1546,28 @@ bool Executor::MtpForward(Session& session,
   const bool graph = n <= kVecBatch;
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
-                            (std::uint64_t{1} << 40);
-  const auto body = [&] { return MtpBody(session, n, pos, error_msg); };
+                            (std::uint64_t{1} << 40) |
+                            (std::uint64_t{output.token != nullptr} << 41) |
+                            (std::uint64_t{output.logits != nullptr} << 42);
+  const auto body = [&] {
+    return MtpBody(session, n, pos, output.token != nullptr,
+                   output.logits != nullptr, error_msg);
+  };
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
   }
-  std::copy_n(logits_host_, c.vocab_size, logits);
+  if (output.token != nullptr) {
+    *output.token = *mtp_token_host_;
+  }
+  if (output.logits != nullptr) {
+    std::copy_n(logits_host_, config().vocab_size, output.logits);
+  }
   session.mtp_.position = pos + n;
   return true;
 }
 
 bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
-                       std::string* error_msg) const {
+                       bool token, bool logits, std::string* error_msg) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
@@ -1595,7 +1620,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
              "MTP hidden carry", error_msg)) {
     return false;
   }
-  return Head(l.nextn_head, last, 1, error_msg);
+  return (!token && !logits) ||
+         MtpHead(l.nextn_head, last, token, logits, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

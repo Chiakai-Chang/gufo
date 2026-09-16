@@ -22,6 +22,7 @@
 namespace gufo::models::qwen38_flash_next::rocm {
 
 class Executor;
+struct ArgmaxCandidate;
 
 /// Per-sequence state on the device: recurrent SSM state, KV and indexer
 /// caches, PLE conv history, plus the host-side n-gram window. A
@@ -135,11 +136,16 @@ public:
   /// MTP position. The hidden input of token i is the trunk residual of row
   /// `hidden_row + i` of the last Forward batch, or, with hidden_row < 0
   /// (single token), the draft block's own residual from the previous call.
-  /// `logits` receives the last token's draft logits (vocab_size floats,
-  /// host).
+  /// Only requested outputs are computed. Production requests the greedy
+  /// token; numerical probes can request the full logits. Catch-up can skip
+  /// the output head when only the draft state is needed.
+  struct MtpOutput {
+    std::int32_t* token{nullptr};
+    float* logits{nullptr};
+  };
   [[nodiscard]] bool MtpForward(Session& session,
                                 std::span<const std::int32_t> tokens,
-                                std::int32_t hidden_row, float* logits,
+                                std::int32_t hidden_row, MtpOutput output,
                                 std::string* error_msg) const;
 
   /// Rewinds the draft block's own context.
@@ -230,15 +236,15 @@ private:
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg) const;
   /// Full-vocabulary logits of `n_rows` rows land in logits_host_.
-  bool Head(const DeviceMixer& head, const float* res, std::uint32_t n_rows,
-            std::string* error_msg) const;
+  bool MtpHead(const DeviceMixer& head, const float* res, bool token,
+               bool logits, std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool speculative, bool sparse, std::uint32_t start_pos,
                    std::uint32_t pool_grid, std::uint32_t first_layer,
                    std::uint32_t end_layer, std::string* error_msg) const;
-  bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
-               std::string* error_msg) const;
+  bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
+               bool logits, std::string* error_msg) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -324,6 +330,8 @@ private:
     float* mtp_embd;
     float* mtp_concat;
     float* mtp_res;
+    ArgmaxCandidate* mtp_argmax;
+    std::int32_t* mtp_token;
   } s_{};
   std::uint32_t mask_words_{0};
   /// Queries per block-selection launch (its score scratch is chunk x
@@ -346,6 +354,7 @@ private:
   mutable std::size_t routed_compact_rows_{0};  ///< sum of padded buckets
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
+  std::int32_t* mtp_token_host_{nullptr};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

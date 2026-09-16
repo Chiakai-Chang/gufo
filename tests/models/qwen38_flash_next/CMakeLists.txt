@@ -23,6 +23,15 @@ add_custom_target(qwen38_flash_next_tests
   DEPENDS qwen38_flash_next_ngram_test qwen38_flash_next_mtp_sampling_test)
 
 if(ENGINE_ENABLE_HIP)
+  add_executable(qwen38_flash_next_mtp_ops_test mtp_ops_test.cpp)
+  target_link_libraries(qwen38_flash_next_mtp_ops_test PRIVATE
+    gufo_qwen38_flash_next)
+  add_test(NAME qwen38_flash_next.mtp_ops
+    COMMAND qwen38_flash_next_mtp_ops_test)
+  set_tests_properties(qwen38_flash_next.mtp_ops PROPERTIES
+    LABELS "hip;gpu;qwen38_flash_next")
+  add_dependencies(qwen38_flash_next_tests qwen38_flash_next_mtp_ops_test)
+
   add_executable(qwen38_flash_next_blaslt_ops_test blaslt_ops_test.cpp)
   target_link_libraries(qwen38_flash_next_blaslt_ops_test PRIVATE
     gufo_qwen38_flash_next)

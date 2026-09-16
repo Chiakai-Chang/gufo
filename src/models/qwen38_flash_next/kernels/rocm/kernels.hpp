@@ -335,11 +335,16 @@ void MtpConcat(const float* embd_n, const float* h_n, float* concat,
                std::uint32_t n_tokens, std::uint32_t hidden,
                std::uint32_t streams, hipStream_t stream);
 
-/// Diagnostic: out[0] = sum of x[0..count), out[1] = sum of |x|.
-
-/// argmax of logits[t][vocab] into out[t].
-void Argmax(const float* logits, std::int32_t* out, std::uint32_t n_tokens,
-            std::uint32_t vocab, hipStream_t stream);
+inline constexpr std::uint32_t kArgmaxParts = 64;
+struct ArgmaxCandidate {
+  float value;
+  std::int32_t index;
+};
+/// Full-vocabulary argmax into out[t], with the lowest index winning ties.
+/// Matches std::max_element, including NaNs. Scratch holds
+/// n_tokens * kArgmaxParts candidates.
+void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
+            std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream);
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 

@@ -17,15 +17,15 @@ and proposes up to seven drafts per cycle.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1259.33 | 1270.26 |
-| 4096 | 1146.71 | 1115.88 |
+| 0 | 1259.33 | 1260.80 |
+| 4096 | 1146.71 | 1111.57 |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 24.19 | TODO | TODO |
-| Greedy | 4096 | 23.31 | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 24.91 | 34.9% |
-| Temperature 0.7 | 4096 | TODO | 47.20 | 92.4% |
+| Greedy | 0 | 24.19 | 36.78 | 51.0% |
+| Greedy | 4096 | 23.31 | 27.54 | 37.6% |
+| Temperature 0.7 | 0 | TODO | 25.85 | 34.9% |
+| Temperature 0.7 | 4096 | TODO | 48.68 | 92.4% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
@@ -48,8 +48,9 @@ are deterministic and depend on exact shapes and the pinned HIP library.
 The [projection sweep](tools/projection_plans.hip) uses `tools/bench/build.sh`.
 
 `prompt`, `chat` and `serve llm` share MTP and sampling options. Drafts are
-greedy; verification uses the target sampler with its filters, penalties and
-RNG. Chains support 1–7 drafts. Adaptive MTP: TODO. Shorter chains favored
+greedy over the full vocabulary on the GPU; verification uses the target
+sampler with its filters, penalties and RNG. Chains support 1–7 drafts.
+Adaptive MTP: TODO. Shorter chains favored
 short prefixes; longer chains favored the repetitive 4K case. Fixed seven-draft
 chains can be slower than AR when acceptance is low.
 
@@ -72,6 +73,7 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
 - Operator tests cover attention, DeltaNet, hyper-connections, routing and
   projections against numerical references. F16 plans require FP64 agreement
   and bitwise replay, including ragged sizes and fallback shapes.
+  MTP token selection matches the CPU rule, including ties and graph replay.
 - Upload tests check bytes, guards, shard/chunk boundaries and invalid inputs.
   N-gram tests check asynchronous reads, duplicates, failed I/O and teardown.
   Wiring changes also require actual prompt, chat and sampled HTTP requests.

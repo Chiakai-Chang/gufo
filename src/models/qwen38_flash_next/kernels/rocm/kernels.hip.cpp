@@ -2243,31 +2243,63 @@ __global__ void MtpConcatKernel(const float* embd_n, const float* h_n,
   }
 }
 
-__global__ void ArgmaxKernel(const float* logits, std::int32_t* out,
-                             std::uint32_t vocab) {
-  __shared__ float shared[32];
-  __shared__ std::uint32_t chosen;
-  const std::uint32_t t = blockIdx.x;
-  const float* src = logits + static_cast<std::size_t>(t) * vocab;
-  float best = -INFINITY;
-  std::uint32_t best_i = 0;
-  for (std::uint32_t i = threadIdx.x; i < vocab; i += blockDim.x) {
-    if (src[i] > best) {
-      best = src[i];
-      best_i = i;
+__device__ __forceinline__ ArgmaxCandidate BetterCandidate(ArgmaxCandidate a,
+                                                           ArgmaxCandidate b) {
+  return b.value > a.value || (b.value == a.value && b.index < a.index) ? b : a;
+}
+
+__device__ ArgmaxCandidate ArgmaxBlock(ArgmaxCandidate best,
+                                       ArgmaxCandidate* shared) {
+  const unsigned lane = threadIdx.x & 31u;
+  const unsigned wave = threadIdx.x >> 5u;
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    best = BetterCandidate(
+        best, {__shfl_xor(best.value, offset), __shfl_xor(best.index, offset)});
+  }
+  if (lane == 0) {
+    shared[wave] = best;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    for (unsigned w = 1; w < kThreads / 32; ++w) {
+      best = BetterCandidate(best, shared[w]);
     }
   }
-  const float block_best = BlockMax(best, shared);
-  if (threadIdx.x == 0) {
-    chosen = 0xFFFFFFFFu;
+  return best;
+}
+
+__global__ void ArgmaxPartialKernel(const float* logits,
+                                    ArgmaxCandidate* partial,
+                                    std::uint32_t vocab) {
+  __shared__ ArgmaxCandidate shared[kThreads / 32];
+  const std::uint32_t t = blockIdx.y;
+  const float* src = logits + static_cast<std::size_t>(t) * vocab;
+  ArgmaxCandidate best{-INFINITY, INT32_MAX};
+  for (std::uint32_t i = blockIdx.x * kThreads + threadIdx.x; i < vocab;
+       i += kArgmaxParts * kThreads) {
+    best = BetterCandidate(best, {src[i], static_cast<std::int32_t>(i)});
   }
-  __syncthreads();
-  if (best == block_best) {
-    atomicMin(&chosen, best_i);
-  }
-  __syncthreads();
+  best = ArgmaxBlock(best, shared);
   if (threadIdx.x == 0) {
-    out[t] = static_cast<std::int32_t>(chosen);
+    partial[t * kArgmaxParts + blockIdx.x] = best;
+  }
+}
+
+__global__ void ArgmaxFinishKernel(const float* logits,
+                                   const ArgmaxCandidate* partial,
+                                   std::int32_t* out, std::uint32_t vocab) {
+  __shared__ ArgmaxCandidate shared[kThreads / 32];
+  const std::uint32_t t = blockIdx.x;
+  ArgmaxCandidate best{-INFINITY, INT32_MAX};
+  if (threadIdx.x < kArgmaxParts) {
+    best = partial[t * kArgmaxParts + threadIdx.x];
+  }
+  best = ArgmaxBlock(best, shared);
+  if (threadIdx.x == 0) {
+    // std::max_element keeps element zero when it is NaN; later NaNs
+    // never replace a finite candidate.
+    out[t] =
+        isnan(logits[static_cast<std::size_t>(t) * vocab]) ? 0 : best.index;
   }
 }
 
@@ -4549,10 +4581,12 @@ void MtpConcat(const float* embd_n, const float* h_n, float* concat,
                      embd_n, h_n, concat, hidden, streams);
 }
 
-void Argmax(const float* logits, std::int32_t* out, std::uint32_t n_tokens,
-            std::uint32_t vocab, hipStream_t stream) {
-  hipLaunchKernelGGL(ArgmaxKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
-                     logits, out, vocab);
+void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
+            std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream) {
+  hipLaunchKernelGGL(ArgmaxPartialKernel, dim3(kArgmaxParts, n_tokens),
+                     dim3(kThreads), 0, stream, logits, scratch, vocab);
+  hipLaunchKernelGGL(ArgmaxFinishKernel, dim3(n_tokens), dim3(kThreads), 0,
+                     stream, logits, scratch, out, vocab);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
