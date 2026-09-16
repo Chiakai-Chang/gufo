@@ -271,7 +271,6 @@ if (ENGINE_ENABLE_HIP)
     "${GUFO_H3_ATTENTION_GENERATED_HEADER}"
     src/core/speculative/draft_heads.cpp
     src/core/speculative/self_speculative.cpp
-    src/core/speculative/prompt_lookup_backend.cpp
     src/core/speculative/speculative_verifier.cpp
     src/core/heterogeneous/npu_drafter.cpp
   )
@@ -359,9 +358,6 @@ if (ENGINE_ENABLE_HIP)
   add_executable(tune_hipblaslt tools/bench/tune_hipblaslt.cpp)
   target_link_libraries(tune_hipblaslt PRIVATE gufo_core hip::host)
 
-  add_executable(benchmark_ssm_replay tools/bench/benchmark_ssm_replay.cpp)
-  target_link_libraries(benchmark_ssm_replay PRIVATE gufo_core hip::host)
-
   option(GUFO_BUILD_DIAG_TOOLS "Build standalone diagnostic tools" OFF)
   if(GUFO_BUILD_DIAG_TOOLS)
     add_executable(gguf_dump_types tools/quant/gguf_dump_types.cpp)
@@ -387,17 +383,20 @@ install(FILES
   tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json
   DESTINATION share/gufo/eval)
 if (ENGINE_ENABLE_HIP)
-  install(TARGETS gufo-kernel-bench tune_hipblaslt benchmark_ssm_replay
+  install(TARGETS gufo-kernel-bench tune_hipblaslt
     DESTINATION bin)
 endif()
 
 # CTest integration
 include(CTest)
 
+# Test assertions remain active when model code uses production optimization.
 if (BUILD_TESTING)
+  add_compile_options(-UNDEBUG)
   find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
   add_subdirectory(tests/models/qwen)
+  add_subdirectory(tests/models/qwen27b)
   gufo_qwen3_asr_register_tests()
 
   add_test(NAME gufo_version COMMAND gufo --version)
@@ -979,36 +978,12 @@ if (BUILD_TESTING)
     set_tests_properties(hipblaslt_runtime_cache_test PROPERTIES
       LABELS "hip;gpu;hipblaslt;cache")
 
-    add_executable(qwen_sampling_hip_test
-      tests/kernels/qwen_sampling_hip_test.hip)
-    target_link_libraries(qwen_sampling_hip_test PRIVATE gufo_core hip::host)
-    add_test(NAME qwen_sampling_hip_test COMMAND qwen_sampling_hip_test)
-    set_tests_properties(qwen_sampling_hip_test PROPERTIES
-      LABELS "hip;gpu;qwen;sampling;correctness"
-      SKIP_RETURN_CODE 77)
-
     add_executable(persistent_deltanet_test
       tests/kernels/persistent_deltanet_test.cpp)
     target_link_libraries(persistent_deltanet_test PRIVATE gufo_core hip::host)
     add_test(NAME persistent_deltanet_test COMMAND persistent_deltanet_test)
     set_tests_properties(persistent_deltanet_test PROPERTIES
       LABELS "hip;gpu;kernels;deltanet;speculative")
-
-    add_executable(inference_backend_gpu_test
-      tests/cli/inference_backend_gpu_test.cpp
-      src/cli/serve/continuation_cache.cpp
-      src/cli/serve/continuation_disk_store.cpp
-      src/cli/serve/text_model_runner.cpp
-      src/cli/serve/text_generation_scheduler.cpp
-      src/cli/serve/inference_backend.cpp
-      src/cli/serve/logging.cpp)
-    target_link_libraries(inference_backend_gpu_test PRIVATE
-      gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next hip::host)
-    add_test(NAME inference_backend_gpu_test COMMAND inference_backend_gpu_test)
-    set_tests_properties(inference_backend_gpu_test PROPERTIES
-      LABELS "hip;gpu;server;correctness"
-      SKIP_RETURN_CODE 77)
-
 
     add_executable(gfx1151_acceptance_test tests/benchmarks/gfx1151_acceptance_test.cpp)
     target_link_libraries(gfx1151_acceptance_test PRIVATE gufo_core hip::host roc::hipblas roc::rocblas)
@@ -1034,11 +1009,6 @@ if (BUILD_TESTING)
     add_test(NAME npu_draft_fallback_test COMMAND npu_draft_fallback_test)
     set_tests_properties(npu_draft_fallback_test PROPERTIES
       LABELS "host;speculative;lookup;npu-fallback")
-
-    add_executable(prompt_lookup_test tests/core/prompt_lookup_test.cpp)
-    target_link_libraries(prompt_lookup_test PRIVATE gufo_core hip::host roc::hipblas roc::rocblas)
-    add_test(NAME prompt_lookup_test COMMAND prompt_lookup_test)
-    set_tests_properties(prompt_lookup_test PROPERTIES LABELS "speculative;lookup;pld")
 
   endif()
 

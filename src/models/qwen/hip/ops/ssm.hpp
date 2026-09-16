@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/hip/execution_policy.hpp"
@@ -21,6 +22,23 @@ struct SsmReplayCapture {
   const std::uint32_t* position{nullptr};
   const std::uint32_t* enabled{nullptr};
 };
+
+struct SsmSequenceState {
+  float* conv{nullptr};
+  void* recurrent{nullptr};
+  SsmReplayCapture replay;
+  std::uint32_t row_offset{0};
+  std::uint32_t rows{0};
+};
+
+/// Copies aligned recurrent-state row groups without touching attention rows.
+/// Pointers, widths and pitches must be 16-byte aligned; all byte offsets must
+/// fit in uint32_t. The arena retains the general HIP copy for other layouts.
+void LaunchCopyRecurrentStateRows(void* destination, const void* source,
+                                  std::uint32_t width_bytes,
+                                  std::uint32_t destination_pitch_bytes,
+                                  std::uint32_t source_pitch_bytes,
+                                  std::uint32_t groups, hipStream_t stream);
 
 /// Captures the raw recurrent inputs for every row in a verification batch so
 /// a rejected speculative suffix can restore the checkpoint and replay only
@@ -41,21 +59,12 @@ void LaunchFusedSSMInputProjections(
     std::size_t hidden_size, std::size_t qkv_size, std::size_t inner_size,
     std::size_t time_step_rank, hipStream_t stream = nullptr);
 
-/// Fused layer pre-RMSNorm + SSM input projections (QKV, Gate, Alpha, Beta).
-void LaunchFusedRMSNormSSMInputProjections(
-    const float* x, const float* norm_w, float eps, const void* qkv_w,
-    bool qkv_is_bf16, const void* gate_w, bool gate_is_bf16,
-    const void* alpha_w, bool alpha_is_bf16, const void* beta_w,
-    bool beta_is_bf16, float* qkv_out, float* gate_out, float* alpha_out,
-    float* beta_out, std::size_t hidden_size, std::size_t qkv_size,
-    std::size_t inner_size, std::size_t time_step_rank,
-    hipStream_t stream = nullptr);
-
 /// Runs `rows` consecutive verification rows through the conv and DeltaNet
 /// recurrence in a single pair of launches. Each row's arithmetic and its order
 /// are identical to the one-row-per-launch form, so the result is bit-exact;
 /// what it removes is the launch serialization of 2 x rows dispatches per
-/// layer.
+/// layer. A null `out_buf` updates only the recurrent/conv state for replay,
+/// omitting query normalization, output dot products and output normalization.
 void LaunchSSMConvRecurrenceRows(
     const float* qkv_in, const float* conv_weights, float* conv_state,
     float* conv_out, void* deltanet_state, const float* alpha_buf,
@@ -66,6 +75,20 @@ void LaunchSSMConvRecurrenceRows(
     std::uint32_t rows, std::size_t projection_row_stride,
     std::size_t inner_row_stride, hipStream_t stream = nullptr,
     SsmReplayCapture replay_capture = {},
+    QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32);
+
+/// Runs independent request states in one pair of launches. Row offsets index
+/// the shared projection buffers; each sequence retains its own causal order
+/// and replay positions. A single sequence uses the direct rows launcher.
+void LaunchSSMConvRecurrenceBatch(
+    const float* qkv_in, const float* conv_weights, float* conv_out,
+    const float* alpha_buf, const float* beta_buf, const float* ssm_a,
+    const float* ssm_dt, const float* ssm_norm, const float* gate, float* out_buf,
+    std::span<const SsmSequenceState> sequences, std::uint32_t layer_idx,
+    std::size_t qkv_size, std::uint32_t num_key_heads, std::uint32_t num_heads,
+    std::uint32_t key_dim, std::uint32_t val_dim,
+    std::size_t projection_row_stride, std::size_t inner_row_stride,
+    hipStream_t stream = nullptr,
     QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32);
 
 void LaunchSSMConvRecurrence(
@@ -98,19 +121,6 @@ void LaunchBatchedSSMConvRecurrence(
     std::uint32_t val_dim, hipStream_t stream = nullptr,
     QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32);
 
-/// Batched Causal SSM Conv1D + DeltaNet recurrence with the per-head
-/// post-RMSNorm + SiLU gate folded into the recurrence epilogue
-/// (opt-c010-ssm-gate-residual). Writes the final gated output into out_buf.
-void LaunchBatchedSSMConvRecurrenceNormGate(
-    const float* qkv_in, const float* conv_weights, float* conv_state,
-    float* conv_out, void* deltanet_state, const float* alpha_buf,
-    const float* beta_buf, const float* ssm_a, const float* ssm_dt,
-    const float* ssm_norm, const float* gate, float* out_buf,
-    std::uint32_t layer_idx, std::size_t batch_size, std::size_t qkv_size,
-    std::uint32_t num_key_heads, std::uint32_t num_heads, std::uint32_t key_dim,
-    std::uint32_t val_dim, hipStream_t stream = nullptr,
-    QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32);
-
 /// True when the row-split DeltaNet recurrence supports this state shape. Its
 /// register tile is built for key_dim == val_dim == 128.
 [[nodiscard]] bool IsDeltaNetRowSplitSupported(std::uint32_t key_dim,
@@ -122,7 +132,8 @@ void LaunchBatchedSSMConvRecurrenceNormGate(
 /// head); both are pure scratch. `out_buf` carries the recurrence output and is
 /// then normalized and gated in place. When `q8_out` is non-null the epilogue
 /// writes the tiled Q8_1 activation there instead of the FP32 row, which is
-/// valid only when nothing else reads the FP32 form.
+/// valid only when nothing else reads the FP32 form. Alternatively, `fp16_out`
+/// receives the gated row as FP16. Only one activation destination may be set.
 void LaunchBatchedSSMConvRecurrenceRowSplit(
     const float* qkv_in, const float* conv_weights, float* conv_state,
     float* conv_out, void* deltanet_state, const float* alpha_buf,
@@ -132,7 +143,8 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     std::size_t batch_size, std::size_t qkv_size, std::uint32_t num_key_heads,
     std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
     hipStream_t stream = nullptr,
-    QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32);
+    QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32,
+    void* fp16_out = nullptr);
 
 }  // namespace gufo::hip
 

@@ -1,6 +1,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <algorithm>
 #include <cstddef>
+#include <limits>
 #include <stdexcept>
 
 #include "src/core/hip/hip_utils.hpp"
@@ -8,16 +9,65 @@
 #include "src/models/qwen/hip/ops/ssm.hpp"
 
 namespace gufo::hip {
+namespace {
+
+// Live state is indexed by transformer layer. A rollback snapshot only needs
+// recurrent layers: each complete group ends with an unused attention row.
+void CopyRecurrentState(void* live, void* packed, std::size_t layer_bytes,
+                        const core::ModelConfig& config, bool save,
+                        hipStream_t stream) {
+  if (layer_bytes == 0 || config.num_layers == 0 ||
+      config.full_attention_interval == 1) {
+    return;
+  }
+  auto* destination = static_cast<std::uint8_t*>(save ? packed : live);
+  const auto* source = static_cast<const std::uint8_t*>(save ? live : packed);
+  const std::size_t interval = config.full_attention_interval;
+  if (interval == 0 || interval > config.num_layers) {
+    HIP_CHECK(hipMemcpyAsync(destination, source,
+                             config.num_layers * layer_bytes,
+                             hipMemcpyDeviceToDevice, stream));
+    return;
+  }
+  const std::size_t groups = config.num_layers / interval;
+  const std::size_t live_pitch = interval * layer_bytes;
+  const std::size_t packed_pitch = (interval - 1) * layer_bytes;
+  const std::size_t destination_pitch = save ? packed_pitch : live_pitch;
+  const std::size_t source_pitch = save ? live_pitch : packed_pitch;
+  if (layer_bytes >= 1024 * 1024 &&
+      ((live_pitch | packed_pitch) & 15U) == 0 &&
+      groups <= std::numeric_limits<std::uint32_t>::max() / live_pitch) {
+    LaunchCopyRecurrentStateRows(
+        destination, source, static_cast<std::uint32_t>(packed_pitch),
+        static_cast<std::uint32_t>(destination_pitch),
+        static_cast<std::uint32_t>(source_pitch),
+        static_cast<std::uint32_t>(groups), stream);
+  } else {
+    HIP_CHECK(hipMemcpy2DAsync(destination, destination_pitch, source,
+                               source_pitch, packed_pitch, groups,
+                               hipMemcpyDeviceToDevice, stream));
+  }
+  const std::size_t tail_bytes = (config.num_layers % interval) * layer_bytes;
+  if (tail_bytes != 0) {
+    HIP_CHECK(hipMemcpyAsync(destination + groups * destination_pitch,
+                             source + groups * source_pitch, tail_bytes,
+                             hipMemcpyDeviceToDevice, stream));
+  }
+}
+
+}  // namespace
 
 void QwenGpuArena::AllocateRecurrentSnapshot() {
   if (d_saved_ssm_conv_state_ != nullptr) {
     return;
   }
 
+  const std::size_t recurrent_layers =
+      config_.num_layers - config_.FullAttentionLayerCount();
   const std::size_t total_conv =
-      config_.num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
+      recurrent_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
   const std::size_t total_deltanet =
-      config_.num_layers * config_.ssm_time_step_rank * config_.ssm_state_size *
+      recurrent_layers * config_.ssm_time_step_rank * config_.ssm_state_size *
       config_.SsmValueSize();
 
   HIP_CHECK(hipMalloc(&d_saved_ssm_conv_state_, total_conv * sizeof(float)));
@@ -32,23 +82,19 @@ void QwenGpuArena::SaveState(std::uint32_t valid_context) {
   }
   AllocateRecurrentSnapshot();
 
-  const std::size_t total_conv =
-      config_.num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
-  const std::size_t total_deltanet =
-      config_.num_layers * config_.ssm_time_step_rank * config_.ssm_state_size *
-      config_.SsmValueSize();
-
   // KV entries are append-only and every attention launch is bounded by its
   // explicit position. Draft entries beyond valid_context can remain in place:
   // accepted positions reuse them and rejected positions are overwritten.
-  HIP_CHECK(hipMemcpyAsync(d_saved_ssm_conv_state_, d_ssm_conv_state,
-                           total_conv * sizeof(float), hipMemcpyDeviceToDevice,
-                           stream));
-  HIP_CHECK(hipMemcpyAsync(
-      d_saved_ssm_deltanet_state_, d_ssm_deltanet_state,
-      total_deltanet *
+  CopyRecurrentState(
+      d_ssm_conv_state, d_saved_ssm_conv_state_,
+      config_.SsmQkvSize() * config_.ssm_conv_kernel * sizeof(float), config_,
+      true, stream);
+  CopyRecurrentState(
+      d_ssm_deltanet_state, d_saved_ssm_deltanet_state_,
+      config_.ssm_time_step_rank * config_.ssm_state_size *
+          config_.SsmValueSize() *
           QwenRecurrentStateElementBytes(policy_.recurrent_state_storage),
-      hipMemcpyDeviceToDevice, stream));
+      config_, true, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
   saved_context_ = valid_context;
   replay_last_position_ = valid_context;
@@ -61,20 +107,16 @@ void QwenGpuArena::RestoreState() {
     throw std::logic_error("GPU state has not been saved");
   }
 
-  const std::size_t total_conv =
-      config_.num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
-  const std::size_t total_deltanet =
-      config_.num_layers * config_.ssm_time_step_rank * config_.ssm_state_size *
-      config_.SsmValueSize();
-
-  HIP_CHECK(hipMemcpyAsync(d_ssm_conv_state, d_saved_ssm_conv_state_,
-                           total_conv * sizeof(float), hipMemcpyDeviceToDevice,
-                           stream));
-  HIP_CHECK(hipMemcpyAsync(
+  CopyRecurrentState(
+      d_ssm_conv_state, d_saved_ssm_conv_state_,
+      config_.SsmQkvSize() * config_.ssm_conv_kernel * sizeof(float), config_,
+      false, stream);
+  CopyRecurrentState(
       d_ssm_deltanet_state, d_saved_ssm_deltanet_state_,
-      total_deltanet *
+      config_.ssm_time_step_rank * config_.ssm_state_size *
+          config_.SsmValueSize() *
           QwenRecurrentStateElementBytes(policy_.recurrent_state_storage),
-      hipMemcpyDeviceToDevice, stream));
+      config_, false, stream);
   HIP_CHECK(hipStreamSynchronize(stream));
 }
 

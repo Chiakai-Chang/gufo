@@ -96,18 +96,6 @@ void LaunchGEMV(
     std::size_t M, std::size_t K, hipStream_t stream = nullptr,
     models::qwen::QwenGemmMode mode = models::qwen::QwenGemmMode::kHipDecode);
 
-/// Computes Matrix-Vector Multiplication with a residual-add epilogue:
-/// y = A*x + residual (opt-c010-ssm-gate-residual). The residual is read
-/// before y is written, so residual may alias y (in-place accumulate).
-void LaunchGEMVResidual(const void* A, core::GgmlType a_type, const float* x,
-                        float* y, const float* residual, std::size_t M,
-                        std::size_t K, hipStream_t stream = nullptr);
-
-/// opt-c014-layer-prefetch: asynchronous page-touch of a weight region on the
-/// given stream. Reads one 16B chunk per 4KiB page; never writes.
-void LaunchLayerWeightPrefetch(const void* data, std::size_t bytes,
-                               hipStream_t stream = nullptr);
-
 /// opt-c1xx-q8k-gemv: computes y = A * x where A is stored as block_q8_K
 /// ({ float d; int8_t qs[256]; int16_t bsums[16]; }, QK_K=256). The dot runs
 /// at Q8 (activation quantized to int8, integer MAC, single fp scale at block
@@ -134,6 +122,26 @@ void LaunchDequantizeQ8KToBf16(const void* w, hip_bfloat16* out,
 /// QK=32, Q5_K/Q6_K/Q8_K use QK=256; requires n_elems to be a whole number of
 /// blocks. Unsupported types are a no-op.
 namespace detail {
+
+/// Launches the exact wave64 kernel for measured Qwen27B verification shapes.
+/// Returns false without launching for other widths, shapes and formats.
+[[nodiscard]] bool TryLaunchKQuantSmallBatchWave64(
+    core::GgmlType type, const void* w, const float* x, float* y,
+    std::size_t batch, std::size_t m, std::size_t k, hipStream_t stream,
+    std::size_t groups = 1);
+
+[[nodiscard]] bool TryLaunchQ8SmallBatchWave64(const void* w, const float* x,
+                                               float* y, std::size_t batch,
+                                               std::size_t m, std::size_t k,
+                                               hipStream_t stream,
+                                               std::size_t groups = 1);
+
+/// Exact BF16 projection for selected shared widths; the caller selects shapes.
+[[nodiscard]] bool TryLaunchBf16SmallBatchWave64(const void* w, const float* x,
+                                                 float* y, std::size_t batch,
+                                                 std::size_t m, std::size_t k,
+                                                 hipStream_t stream,
+                                                 std::size_t groups = 1);
 
 /// opt-q4kxl: true for the formats that run natively through the K-quant GPU
 /// kernels -- the blocked WMMA GEMM at prefill batch, the exact shared-weight
@@ -185,8 +193,8 @@ void LaunchBatchedQuantGEMMBf16(core::GgmlType type, const void* w,
 /// Directly computes Y[B, M] = X_fp32[B, K] * W_quant[M, K]^T using the same
 /// quant-block dot product and FP32 activation precision as decode. Intended
 /// for short verification batches where exact target-path numerics matter.
-/// Q8_0 and Q8_K batches of two through eight rows share weight loads while
-/// preserving the isolated production GEMV arithmetic order.
+/// Groups of up to sixteen rows share weight loads while preserving the
+/// isolated production GEMV arithmetic order.
 void LaunchBatchedQuantGEMMFp32(core::GgmlType type, const void* w,
                                 const float* fp32_x, float* y,
                                 std::size_t batch, std::size_t m, std::size_t k,
@@ -286,19 +294,13 @@ void LaunchBatchedGEMM(const void* A, bool is_bf16, const float* X, float* Y,
                        std::size_t batch_size, std::size_t M, std::size_t K,
                        hipStream_t stream = nullptr);
 
-/// Exact small-batch BF16-weight GEMM with FP32 activations for any width in
-/// 1..8. The per-output accumulation order matches the decode GEMV and does not
-/// depend on the batch width, so narrow batches stay bit-identical to wide ones
-/// while the weight stream is still read exactly once.
+/// Exact BF16-weight GEMM with FP32 activations, grouped into at most sixteen
+/// rows. The per-output accumulation order matches the decode GEMV and does
+/// not depend on the batch width.
 void LaunchExactBf16GEMMFp32SmallBatch(const void* A, const float* X, float* Y,
                                        std::size_t batch_size, std::size_t M,
                                        std::size_t K,
                                        hipStream_t stream = nullptr);
-
-/// Fixed width-8 alias of LaunchExactBf16GEMMFp32SmallBatch.
-void LaunchExactBf16GEMMFp32Batch8(const void* A, const float* X, float* Y,
-                                   std::size_t M, std::size_t K,
-                                   hipStream_t stream = nullptr);
 
 /// Converts float buffer to bfloat16 buffer on GPU
 void LaunchFloatToBfloat16(const float* in, void* out, std::size_t num_elements,

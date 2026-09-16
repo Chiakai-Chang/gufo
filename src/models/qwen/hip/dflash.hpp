@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -11,7 +12,8 @@
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/speculative/draft_backend.hpp"
-#include "src/models/qwen/dflash_reference.hpp"
+#include "src/models/qwen/dflash_policy.hpp"
+#include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
@@ -19,6 +21,30 @@
 #include <hip/hip_runtime.h>
 
 namespace gufo::hip {
+
+/// Optional synchronous host observation for the independent reference test.
+/// The span is valid only during the callback; production leaves it empty.
+using DFlashTrace =
+    std::function<void(std::string_view, std::span<const float>)>;
+
+class QwenDFlashGpuExecutor;
+
+struct QwenDFlashContextRequest {
+  QwenDFlashGpuExecutor* executor{nullptr};
+  std::span<const float> features;
+  std::uint32_t position{0};
+  DFlashTrace trace;
+};
+
+struct QwenDFlashBlockRequest {
+  QwenDFlashGpuExecutor* executor{nullptr};
+  tokenization::TokenId anchor{0};
+  std::uint32_t position{0};
+  std::uint32_t draft_count{0};
+  float temperature{0.0F};
+  std::span<const float> uniforms;
+  DFlashTrace trace;
+};
 
 class QwenDFlashGpuSnapshot final {
 public:
@@ -49,6 +75,7 @@ private:
   std::uint32_t kv_width_{0};
   std::uint32_t max_context_{0};
   std::uint32_t valid_context_{0};
+  std::uint32_t history_capacity_{0};
   std::size_t payload_bytes_{0};
 
   friend class QwenDFlashGpuExecutor;
@@ -117,7 +144,13 @@ public:
   /// Ingests target multi-layer hidden states and injects K/V into the draft
   /// cache.
   bool InjectTargetContext(std::span<const float> target_features,
-                           std::uint32_t position, std::uint32_t num_tokens);
+                           std::uint32_t position, std::uint32_t num_tokens,
+                           const DFlashTrace& trace = {});
+
+  /// Projects committed features together and writes each private cache at
+  /// its original absolute positions. Reuses the coordinator's scalar scratch.
+  static void InjectTargetContextBatch(
+      std::span<const QwenDFlashContextRequest> requests);
 
   /// Executes non-causal parallel block diffusion drafting.
   [[nodiscard]] std::vector<tokenization::TokenId> ForwardBlock(
@@ -126,13 +159,23 @@ public:
       std::span<const float> sample_uniforms = {},
       std::vector<float>* out_confidences = nullptr,
       std::vector<tokenization::TokenId>* out_candidate_ids = nullptr,
-      std::vector<float>* out_candidate_probabilities = nullptr);
+      std::vector<float>* out_candidate_probabilities = nullptr,
+      const DFlashTrace& trace = {});
+
+  /// Shared projections with independent attention, convolution and selector
+  /// boundaries. A single request retains the ordinary block execution.
+  [[nodiscard]] static std::vector<speculative::DraftProposal>
+  ForwardBlockBatch(std::span<const QwenDFlashBlockRequest> requests);
 
   [[nodiscard]] std::unique_ptr<QwenDFlashGpuSnapshot> SaveSnapshot() const;
   void RestoreSnapshot(const QwenDFlashGpuSnapshot& snapshot);
   void RestorePersistentSnapshot(std::span<const std::uint8_t> payload);
   [[nodiscard]] std::size_t StateBytes() const noexcept;
   [[nodiscard]] std::size_t SnapshotPayloadBytes() const noexcept;
+  [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept;
+  [[nodiscard]] static QwenGpuMemoryUsage EstimateMemoryUsage(
+      const QwenDFlashGpuModel& model, std::uint32_t max_context,
+      std::size_t max_batch_width = 1);
 
   [[nodiscard]] std::size_t GetHiddenSize() const noexcept {
     return model_->GetConfig().hidden_size;
@@ -151,8 +194,14 @@ private:
   QwenDFlashGpuExecutor(std::shared_ptr<const QwenDFlashGpuModel> model,
                         std::uint32_t max_context);
 
+  bool InjectTargetContextChunk(std::span<const float> target_features,
+                                std::uint32_t position,
+                                std::uint32_t num_tokens,
+                                const DFlashTrace& trace);
   void Allocate();
   void Free() noexcept;
+  [[nodiscard]] static std::size_t BatchScratchBytes(
+      const QwenDFlashGpuModel& model, std::size_t rows);
   void PrewarmBlockGemms();
   void RunBlockGemm(const models::QwenTensorRef& weight, const float* input,
                     float* output, std::size_t batch_size,
@@ -164,6 +213,8 @@ private:
   std::shared_ptr<const QwenDFlashGpuModel> model_;
   std::uint32_t max_context_{4096};
   std::uint32_t injected_context_len_{0};
+  std::uint32_t history_capacity_{0};
+  std::uint32_t injection_capacity_{0};
   hipStream_t stream_{nullptr};
   hipblasHandle_t hipblas_handle_{nullptr};
   std::unique_ptr<HipblasLtGemm> hipblaslt_gemm_;
@@ -196,18 +247,16 @@ private:
   float* d_confidences_{nullptr};
   std::uint32_t* d_out_token_{nullptr};
   hip_bfloat16* d_bf16_input_{nullptr};
-
-  // Host buffers for asynchronous synchronization
-  std::vector<float> h_target_features_;
-  std::vector<float> h_logits_;
+  std::size_t scratch_bytes_{0};
+  void* d_batch_scratch_{nullptr};
+  std::size_t batch_scratch_bytes_{0};
 };
 
 struct QwenDFlashGpuDraftConfig {
   std::uint32_t max_context{4096};
-  std::uint32_t max_draft_tokens{16};
-  /// Stop the proposal at the first draft token whose selected probability is
-  /// below this confidence threshold. Zero disables confidence filtering.
-  float draft_p_min{0.0F};
+  std::uint32_t max_draft_tokens{7};
+  speculative::DFlashDraftPolicy policy{
+      speculative::DFlashDraftPolicy::kAdaptive};
 };
 
 /// Adapts the GPU DFlash executor to the repository's IDraftBackend speculative
@@ -241,6 +290,9 @@ public:
 
   [[nodiscard]] bool PrimeTargetContext(
       const speculative::DraftTargetContext& context) override;
+  [[nodiscard]] bool AppendTargetContext(
+      const speculative::DraftTargetContext& context,
+      std::uint32_t position) override;
 
   void UpdateTargetHidden(std::span<const float> hidden) override;
 
@@ -254,6 +306,8 @@ public:
   [[nodiscard]] bool SupportsSampledProposals() const noexcept override {
     return true;
   }
+  [[nodiscard]] std::vector<speculative::DraftProposal> ProposeBatch(
+      std::span<const speculative::DraftProposalRequest> requests) override;
 
   void AcceptFeedback(std::span<const tokenization::TokenId> accepted,
                       tokenization::TokenId correction_token) override;
@@ -267,8 +321,15 @@ public:
       std::span<const std::uint8_t> payload) override;
 
   void Reset() noexcept override;
+  void BeginRequest() noexcept override { controller_.Reset(); }
+
+  [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept {
+    return executor_->GetMemoryUsage();
+  }
 
 private:
+  void InjectPendingFeatures(std::uint32_t position);
+  [[nodiscard]] std::uint32_t PendingFeatureCount(std::uint32_t position) const;
   QwenDFlashGpuDraftBackend(std::unique_ptr<QwenDFlashGpuExecutor> executor,
                             QwenDFlashGpuDraftConfig config);
   [[nodiscard]] speculative::DraftProposal ProposeImpl(
@@ -278,13 +339,11 @@ private:
 
   std::unique_ptr<QwenDFlashGpuExecutor> executor_;
   QwenDFlashGpuDraftConfig config_;
+  speculative::DFlashLengthController controller_;
   std::vector<float> pending_target_features_;
   std::vector<tokenization::TokenId> proposed_tokens_;
-  std::uint32_t proposal_checkpoint_{0};
-  tokenization::TokenId proposal_input_{0};
   bool primed_{false};
   bool proposal_active_{false};
-  std::string last_error_;
 };
 
 }  // namespace gufo::hip

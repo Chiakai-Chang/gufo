@@ -1,53 +1,13 @@
-// Row-split batched DeltaNet prefill recurrence (opt-c170-deltanet-rowsplit).
-//
-// The gated delta rule carries a [val_dim][key_dim] state per head and is
-// serial in the token index, but it is *not* serial in the state row: row j of
-// the state only ever needs its own row plus the per-token vectors k, q, v and
-// the scalars alpha, beta, k.q. The previous kernel nevertheless pinned all 128
-// rows of a head to one block so it could compute the k/q L2 norms and the
-// post-RMSNorm inline, which cost four block-wide barriers and two
-// single-thread cross-warp reductions per token, and left only 48 blocks
-// (384 waves) of work on a 20-WGP part.
-//
-// Here everything uniform across rows is hoisted into two tiny prologue kernels
-// and the recurrence itself becomes barrier-free, so the 128 rows spread over
-// as many blocks as the per-lane register tile allows:
-//
-//   BatchedDeltaNetPrepKqKernel        per (token, key head): inv_k_norm,
-//                                      q_scale, and the *unnormalized* k . q
-//   BatchedDeltaNetPrepAlphaBetaKernel per (token, value head): alpha_h, beta_h
-//   BatchedDeltaNetRowSplitKernel      the recurrence, one row group per lane
-//
-// Working on raw k and q instead of normalized copies is what makes the split
-// cheap: every scale is uniform over the row, so it can be applied to the two
-// reduced dot products and to the rank-1 update coefficient rather than to the
-// 128-wide vectors.
-//
-//   u = inv_k_norm * (S' . k_raw)      p = q_scale * (S' . q_raw)
-//   k . q = inv_k_norm * q_scale * (k_raw . q_raw)
-//   S += (d * inv_k_norm) * k_raw
-//
-// This is the same arithmetic in a different order, so results differ from the
-// previous kernel only by FP32 rounding (measured 5e-7 relative on the output
-// and 3e-7 on the carried state at batch 512 through 8192).
-//
-// Measured against the previous kernel at 48 heads / 16 key heads / dk = dv =
-// 128 (tools/bench/deltanet_bench.hip, one layer pass):
-//
-//   batch    before    after   speedup   cycles/token after
-//     512    1.913    0.428     4.47x    2209
-//    2048    7.401    1.991     3.72x    2567
-//    4096   14.804    4.617     3.21x    2976
-//    8192   29.686    9.362     3.17x    3017
-//
-// The floor is 1229 cycles/token: the state is touched four times per element
-// per token (decay, two dot accumulations, rank-1 update) and gfx1151 retires
-// 2560 FP32 lanes/cycle. A chunkwise-parallel reformulation would reach the
-// matrix cores but needs 1.2x (chunk 16) to 1.9x (chunk 64) more MACs, which
-// cancels the 2x BF16 WMMA rate, so this stays a VALU kernel.
+// Token-serial DeltaNet recurrence with independent state-row groups.
+// Prologues compute per-head K/Q norms, the raw K.Q dot product, alpha and beta.
+// Convolution history advances after all readers of the old history finish.
+// The recurrence applies the shared scales to its dot products and rank-one
+// update, then the epilogue normalizes and gates output.
 #if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -60,10 +20,10 @@
 namespace gufo::hip {
 
 // Defined in kernels/ssm_recurrence.hip and hip/batched_ssm.hip respectively;
-// the row-split route reuses both unchanged.
+// the row-split route shares the convolution and post-normalization kernels.
 __global__ void BatchedSSMConvKernel(const float* __restrict__ qkv_in,
                                      const float* __restrict__ conv_weights,
-                                     float* __restrict__ conv_state,
+                                     const float* __restrict__ conv_state,
                                      float* __restrict__ conv_out,
                                      std::size_t batch_size,
                                      std::size_t qkv_dim);
@@ -80,7 +40,7 @@ __global__ void BatchedSSMPostNormGateKernel(
 constexpr int kRowSplitDim = 128;
 
 // Crossover between the two register tiles, measured in
-// tools/bench/deltanet_bench.hip.
+// tools/qwen27b/prefill_deltanet_bench.hip.
 constexpr std::size_t kRowSplitSmallBatch = 2048;
 
 // One wave per (token, key head). 128 keys is exactly four values per lane, so
@@ -127,9 +87,14 @@ __launch_bounds__(32) __global__
 __launch_bounds__(256) __global__ void BatchedDeltaNetPrepAlphaBetaKernel(
     const float* __restrict__ alpha_buf, const float* __restrict__ beta_buf,
     const float* __restrict__ ssm_a, const float* __restrict__ ssm_dt,
-    float* __restrict__ ab, std::size_t count, std::uint32_t num_heads) {
+    float* __restrict__ ab, std::size_t count, std::uint32_t num_heads,
+    const float* __restrict__ qkv_in, float* __restrict__ conv_state,
+    std::size_t batch_size, std::size_t qkv_size) {
   const std::size_t i =
       (static_cast<std::size_t>(blockIdx.x) * blockDim.x) + threadIdx.x;
+  if (i < qkv_size) {
+    detail::StoreSSMConvHistory(qkv_in, conv_state, i, batch_size, qkv_size);
+  }
   if (i >= count) {
     return;
   }
@@ -351,6 +316,54 @@ bool IsDeltaNetRowSplitSupported(std::uint32_t key_dim,
          val_dim == static_cast<std::uint32_t>(kRowSplitDim);
 }
 
+namespace {
+// One wave per head retains the four independent reductions from the FP32
+// epilogue. Writing FP16 directly avoids materializing and rereading its FP32
+// output; the recurrence still computes and stores FP32.
+__global__ void BatchedSSMPostNormGateFp16Kernel(const float* raw,
+                                                 const float* weight,
+                                                 const float* gate, __half* out,
+                                                 std::size_t head_count) {
+  const unsigned lane = threadIdx.x & 31U;
+  const std::size_t head = std::size_t(blockIdx.x) * 8 + threadIdx.x / 32;
+  if (head >= head_count) {
+    return;
+  }
+  const std::size_t base = head * kRowSplitDim;
+  float values[4], squares[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    values[j] = raw[base + lane + j * 32];
+    squares[j] = __fmul_rn(values[j], values[j]);
+  }
+  for (int shift = 16; shift > 0; shift >>= 1) {
+#pragma unroll
+    for (unsigned j = 0; j < 4; ++j) {
+      squares[j] += __shfl_xor(squares[j], shift);
+    }
+  }
+  const float sum =
+      __shfl(__fadd_rn(__fadd_rn(__fadd_rn(squares[0], squares[1]), squares[2]),
+                       squares[3]),
+             0);
+  const float inv =
+      rsqrtf(__fadd_rn(__fmul_rn(sum, 1.0F / kRowSplitDim), 1e-6F));
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const unsigned column = lane + j * 32;
+    float result = (values[j] * inv) * (weight ? weight[column] : 1.0F);
+    if (gate) {
+      const float g = gate[base + column];
+      const float sig = 1.0F / (1.0F + expf(-g));
+      result *= g * sig;
+    }
+    // Preserve the standalone FP32 producer's rounding before conversion.
+    asm volatile("" : "+v"(result));
+    out[base + column] = __float2half_rn(result);
+  }
+}
+}  // namespace
+
 void LaunchBatchedSSMConvRecurrenceRowSplit(
     const float* qkv_in, const float* conv_weights, float* conv_state,
     float* conv_out, void* deltanet_state, const float* alpha_buf,
@@ -359,7 +372,8 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     float* kq_scales, float* alpha_beta, std::uint32_t layer_idx,
     std::size_t batch_size, std::size_t qkv_size, std::uint32_t num_key_heads,
     std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
-    hipStream_t stream, QwenRecurrentStateStorage state_storage) {
+    hipStream_t stream, QwenRecurrentStateStorage state_storage,
+    void* fp16_out) {
   if (!IsDeltaNetRowSplitSupported(key_dim, val_dim)) {
     throw std::invalid_argument(
         "row-split Qwen recurrent state requires 128x128 matrices");
@@ -380,9 +394,11 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
       conv_out, kq_scales, qkv_size, num_key_heads);
 
   const std::size_t ab_count = batch_size * num_heads;
+  const std::size_t prep_count = std::max(ab_count, qkv_size);
   BatchedDeltaNetPrepAlphaBetaKernel<<<
-      static_cast<unsigned int>((ab_count + 255) / 256), 256, 0, stream>>>(
-      alpha_buf, beta_buf, ssm_a, ssm_dt, alpha_beta, ab_count, num_heads);
+      static_cast<unsigned int>((prep_count + 255) / 256), 256, 0, stream>>>(
+      alpha_buf, beta_buf, ssm_a, ssm_dt, alpha_beta, ab_count, num_heads,
+      qkv_in, conv_layer_state, batch_size, qkv_size);
 
   const std::size_t inner_size = static_cast<std::size_t>(num_heads) * val_dim;
   const auto batch_i = static_cast<int>(batch_size);
@@ -428,12 +444,12 @@ void LaunchBatchedSSMConvRecurrenceRowSplit(
     }
   }
 
-  // opt-c174-ssm-epilogue-quant: when the gated row's only consumer is the Q8_0
-  // ssm_out projection, the epilogue writes the quantized activation directly
-  // and the FP32 store plus its read-back disappear. Otherwise the post-norm
-  // gate runs in place, which is safe because it reads its input into registers
-  // before the block reduction.
-  if (q8_out != nullptr) {
+  // Emit the activation consumed by ssm_out directly. Other callers retain the
+  // FP32 in-place epilogue.
+  if (fp16_out != nullptr) {
+    BatchedSSMPostNormGateFp16Kernel<<<(ab_count + 7) / 8, 256, 0, stream>>>(
+        out_buf, ssm_norm, gate, static_cast<__half*>(fp16_out), ab_count);
+  } else if (q8_out != nullptr) {
     LaunchBatchedFusedSSMPostNormGateQuantizeQ8_1(
         out_buf, ssm_norm, gate, q8_out, batch_size, inner_size, num_heads,
         val_dim, stream);

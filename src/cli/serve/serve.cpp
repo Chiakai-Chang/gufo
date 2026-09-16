@@ -344,11 +344,11 @@ void PrintServeHelp(std::string_view program_name,
     std::string preserve_thinking = "auto";
     std::string speculative_backend;
     std::string dflash_model_path;
+    std::string draft_policy;
     std::string dspark_model_path;
     std::string mtp_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
-    float draft_p_min = 0.0F;
     std::size_t draft_vocab = 0;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
@@ -365,7 +365,6 @@ void PrintServeHelp(std::string_view program_name,
         static_cast<std::size_t>(4) * 1024U * 1024U * 1024U;
     std::size_t cache_disk_staging_bytes =
         static_cast<std::size_t>(512) * 1024U * 1024U;
-    bool force_cpu = false;
 
     gufo::cli::ArgParser parser(
         std::string(program_name) + " serve llm",
@@ -403,11 +402,15 @@ void PrintServeHelp(std::string_view program_name,
 
     // Speculative & Hardware
     parser.AddOption("", "--speculative", "MODE",
-                     "HTTP draft backend: dspark, dflash, dflash2, mtp, or off",
+                     "HTTP draft backend: dspark, dflash2, mtp, or off",
                      "Speculative", &speculative_backend);
     parser.AddOption("", "--dflash-model", "PATH",
-                     "Path to quantized Qwen DFlash/DFlash-2 GGUF file",
-                     "Speculative", &dflash_model_path);
+                     "Path to Qwen DFlash2 GGUF file", "Speculative",
+                     &dflash_model_path);
+    parser.AddOption(
+        "", "--draft-policy", "POLICY",
+        "DFlash2 block length: fixed or adaptive (default: adaptive)",
+        "Speculative", &draft_policy);
     parser.AddOption("", "--dspark-model", "PATH",
                      "Path to DeepSeek V4 Flash DSpark support GGUF file",
                      "Speculative", &dspark_model_path);
@@ -419,23 +422,11 @@ void PrintServeHelp(std::string_view program_name,
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
         "Speculative", &draft_tokens);
-    parser.AddOption("", "--spec-draft-n-max", "N",
-                     "llama.cpp-compatible alias for --draft-tokens",
-                     "Speculative", &draft_tokens);
+
 
     parser.AddOption("", "--min-draft-tokens", "N",
                      "Adaptive draft floor (default: 1)", "Speculative",
                      &min_draft_tokens);
-    parser.AddOption("", "--spec-draft-n-min", "N",
-                     "llama.cpp-compatible alias for --min-draft-tokens",
-                     "Speculative", &min_draft_tokens);
-    parser.AddOption(
-        "", "--spec-draft-p-min", "P",
-        "Stop at the first draft token below confidence P; 0 disables "
-        "(default: 0)",
-        "Speculative", &draft_p_min);
-    parser.AddOption("", "--draft-p-min", "P", "Alias for --spec-draft-p-min",
-                     "Speculative", &draft_p_min);
     parser.AddOption("", "--draft-vocab", "N",
                      "Qwen3.8-Flash-Next MTP: score drafts over the first N "
                      "token ids only (default: 0 = full vocabulary)",
@@ -475,9 +466,6 @@ void PrintServeHelp(std::string_view program_name,
         "", "--cache-disk-staging-bytes", "N",
         "Single-operation RAM staging byte limit (default: 536870912)", "Cache",
         &cache_disk_staging_bytes);
-    parser.AddFlag("", "--cpu",
-                   "Force CPU OpenMP execution fallback instead of GPU ROCm",
-                   "Hardware", &force_cpu);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
     parser.PrintHelp();
@@ -909,11 +897,11 @@ int RunServe(std::span<const char* const> args) {
     std::string preserve_thinking = "auto";
     std::string speculative_backend;
     std::string dflash_model_path;
+    std::string draft_policy;
     std::string dspark_model_path;
     std::string mtp_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
-    float draft_p_min = 0.0F;
     std::size_t draft_vocab = 0;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
@@ -930,7 +918,6 @@ int RunServe(std::span<const char* const> args) {
         static_cast<std::size_t>(4) * 1024U * 1024U * 1024U;
     std::size_t cache_disk_staging_bytes =
         static_cast<std::size_t>(512) * 1024U * 1024U;
-    bool force_cpu = false;
 
     gufo::cli::ArgParser llm_parser(
         "gufo serve llm",
@@ -963,11 +950,15 @@ int RunServe(std::span<const char* const> args) {
                          "Reasoning Defaults", &preserve_thinking);
     llm_parser.AddOption(
         "", "--speculative", "MODE",
-        "HTTP draft backend: dspark, dflash, dflash2, mtp, or off",
+        "HTTP draft backend: dspark, dflash2, mtp, or off",
         "Speculative", &speculative_backend);
     llm_parser.AddOption("", "--dflash-model", "PATH",
-                         "Path to quantized Qwen DFlash/DFlash-2 GGUF file",
-                         "Speculative", &dflash_model_path);
+                         "Path to Qwen DFlash2 GGUF file", "Speculative",
+                         &dflash_model_path);
+    llm_parser.AddOption(
+        "", "--draft-policy", "POLICY",
+        "DFlash2 block length: fixed or adaptive (default: adaptive)",
+        "Speculative", &draft_policy);
     llm_parser.AddOption("", "--dspark-model", "PATH",
                          "Path to DeepSeek V4 Flash DSpark support GGUF file",
                          "Speculative", &dspark_model_path);
@@ -980,23 +971,10 @@ int RunServe(std::span<const char* const> args) {
         "-d", "--draft-tokens", "N",
         "Maximum speculative draft tokens evaluated per step (default: 7)",
         "Speculative", &draft_tokens);
-    llm_parser.AddOption("", "--spec-draft-n-max", "N",
-                         "llama.cpp-compatible alias for --draft-tokens",
-                         "Speculative", &draft_tokens);
+
     llm_parser.AddOption("", "--min-draft-tokens", "N",
                          "Adaptive draft floor (default: 1)", "Speculative",
                          &min_draft_tokens);
-    llm_parser.AddOption("", "--spec-draft-n-min", "N",
-                         "llama.cpp-compatible alias for --min-draft-tokens",
-                         "Speculative", &min_draft_tokens);
-    llm_parser.AddOption(
-        "", "--spec-draft-p-min", "P",
-        "Stop at the first draft token below confidence P; 0 disables "
-        "(default: 0)",
-        "Speculative", &draft_p_min);
-    llm_parser.AddOption("", "--draft-p-min", "P",
-                         "Alias for --spec-draft-p-min", "Speculative",
-                         &draft_p_min);
     llm_parser.AddOption("", "--draft-vocab", "N",
                          "Qwen3.8-Flash-Next MTP: score drafts over the first "
                          "N token ids only (default: 0 = full vocabulary)",
@@ -1038,9 +1016,6 @@ int RunServe(std::span<const char* const> args) {
         "", "--cache-disk-staging-bytes", "N",
         "Single-operation RAM staging byte limit (default: 536870912)", "Cache",
         &cache_disk_staging_bytes);
-    llm_parser.AddFlag(
-        "", "--cpu", "Force CPU OpenMP execution fallback instead of GPU ROCm",
-        "Hardware", &force_cpu);
 
     if (!llm_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
@@ -1072,9 +1047,7 @@ int RunServe(std::span<const char* const> args) {
     }
     if (draft_tokens == 0 || min_draft_tokens == 0 ||
         min_draft_tokens > draft_tokens ||
-        draft_tokens > std::numeric_limits<std::uint32_t>::max() ||
-        !std::isfinite(draft_p_min) || draft_p_min < 0.0F ||
-        draft_p_min > 1.0F) {
+        draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
@@ -1091,9 +1064,7 @@ int RunServe(std::span<const char* const> args) {
     }
     if (speculative_backend.empty() || speculative_backend == "off") {
       speculative_config.backend = server::TextSpeculativeBackend::kDisabled;
-    } else if (speculative_backend == "dflash" ||
-               speculative_backend == "dflash2" ||
-               speculative_backend == "dflash-2") {
+    } else if (speculative_backend == "dflash2") {
       speculative_config.backend = server::TextSpeculativeBackend::kDFlash;
     } else if (speculative_backend == "dspark") {
       speculative_config.backend = server::TextSpeculativeBackend::kDSpark;
@@ -1102,6 +1073,22 @@ int RunServe(std::span<const char* const> args) {
     } else {
       std::cerr << "Error: speculative backend '" << speculative_backend
                 << "' is not supported by the HTTP server\n";
+      return 2;
+    }
+    try {
+      if (!draft_policy.empty() &&
+          speculative_config.backend != server::TextSpeculativeBackend::kDFlash)
+        throw std::invalid_argument("--draft-policy requires DFlash2");
+      speculative_config.dflash_policy =
+          speculative::ParseDFlashDraftPolicy(draft_policy);
+    } catch (const std::invalid_argument& exception) {
+      std::cerr << "Error: " << exception.what() << '\n';
+      return 2;
+    }
+    if (speculative_config.backend == server::TextSpeculativeBackend::kDFlash &&
+        (dflash_model_path.empty() || min_draft_tokens != 1)) {
+      std::cerr << "Error: DFlash2 requires --dflash-model and "
+                   "--min-draft-tokens 1; bound blocks with --draft-tokens\n";
       return 2;
     }
     speculative_config.draft_model_path =
@@ -1119,7 +1106,6 @@ int RunServe(std::span<const char* const> args) {
         static_cast<std::uint32_t>(draft_tokens);
     speculative_config.min_draft_tokens =
         static_cast<std::uint32_t>(min_draft_tokens);
-    speculative_config.draft_p_min = draft_p_min;
     std::string err;
     backend = std::make_shared<server::InferenceBackend>();
     if (!backend->load(model, &err, max_context, session_count,
@@ -1154,7 +1140,7 @@ int RunServe(std::span<const char* const> args) {
       std::cout << "[Speculative]: DFlash enabled (max_draft_tokens="
                 << speculative_config.max_draft_tokens
                 << ", min_draft_tokens=" << speculative_config.min_draft_tokens
-                << ", draft_p_min=" << speculative_config.draft_p_min << ")\n";
+                << ")\n";
     } else if (speculative_config.backend ==
                server::TextSpeculativeBackend::kDSpark) {
       std::cout << "[Speculative]: DSpark enabled\n";

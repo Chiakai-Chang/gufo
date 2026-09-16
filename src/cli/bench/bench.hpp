@@ -13,7 +13,7 @@ namespace gufo::cli {
 
 struct BenchOptions {
   std::string model_path{"models/Qwen3.5-4B-BF16.gguf"};
-  std::vector<std::size_t> n_prompts{64, 128, 512};
+  std::vector<std::size_t> n_prompts{2048};
   std::vector<std::size_t> n_gens{128};
   std::vector<std::size_t> n_depths{0};
   std::vector<std::size_t> concurrency{1};
@@ -25,12 +25,12 @@ struct BenchOptions {
   std::string speculative_backend{""};
   std::string mtp_model_path;
   std::string dflash_model_path;
+  std::string draft_policy;
   std::string dspark_model_path;
   std::uint32_t draft_tokens{7};
   /// Qwen3.8-Flash-Next: vocabulary prefix the MTP draft scores (0 = full).
   std::uint32_t draft_vocab{0};
   std::uint32_t min_draft_tokens{1};
-  float draft_p_min{0.0F};
   /// DeepSeek generation sampling; 0 keeps greedy decoding.
   float temperature{0.0F};
   std::uint32_t seed{0};

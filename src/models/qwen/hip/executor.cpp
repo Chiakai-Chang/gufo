@@ -3,9 +3,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <stdexcept>
-#include <string_view>
 #include <utility>
 
 #include "src/core/hip/detail/dispatch_telemetry.hpp"
@@ -13,15 +11,6 @@
 
 namespace gufo::hip {
 namespace {
-
-bool IsSsmReplayEnabled() noexcept {
-  const char* value = std::getenv("GUFO_DISABLE_SSM_REPLAY");
-  if (value == nullptr) {
-    return true;
-  }
-  const std::string_view setting{value};
-  return setting == "0" || setting == "false" || setting == "off";
-}
 
 const QwenGpuModel& RequireModel(
     const std::shared_ptr<const QwenGpuModel>& model) {
@@ -99,9 +88,35 @@ void QwenGpuExecutor::EnsureVerificationLogits(std::size_t batch_size) {
     HIP_CHECK(hipFree(d_verification_logits_));
     d_verification_logits_ = nullptr;
   }
+  verification_logits_capacity_ = 0;
   HIP_CHECK(hipMalloc(&d_verification_logits_,
                       batch_size * weights_.config.vocab_size * sizeof(float)));
   verification_logits_capacity_ = batch_size;
+}
+
+QwenGpuMemoryUsage QwenGpuExecutor::EstimateMemoryUsage(
+    const core::ModelConfig& config, std::uint32_t max_context,
+    QwenExecutionPolicy policy) {
+  auto usage = QwenGpuArena::EstimateMemoryUsage(config, max_context, policy);
+  usage.temporary_scratch_bytes +=
+      EstimateGpuSamplingWorkspaceBytes(config.vocab_size, max_context);
+  // Reserve the bounded fallback for eight requests with eight rows each.
+  // Large arenas reuse FFN scratch and normally retain fewer rows.
+  const std::size_t rows = std::min<std::size_t>(max_context, 64);
+  const std::size_t features = rows * 5 * config.hidden_size;
+  const std::size_t feature_rows =
+      (features + config.vocab_size - 1) / config.vocab_size;
+  usage.temporary_scratch_bytes +=
+      std::max(rows, feature_rows) * config.vocab_size * sizeof(float);
+  return usage;
+}
+
+QwenGpuMemoryUsage QwenGpuExecutor::GetMemoryUsage() const {
+  auto usage = arena_.GetMemoryUsage();
+  usage.temporary_scratch_bytes += verification_logits_capacity_ *
+                                   weights_.config.vocab_size * sizeof(float);
+  usage.temporary_scratch_bytes += sampling_workspace_.SizeBytes();
+  return usage;
 }
 
 void QwenGpuExecutor::Reset() noexcept {
@@ -153,17 +168,24 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
 void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
   replaying_ssm_state_ = false;
   arena_.SaveState(valid_context);
-  if (IsSsmReplayEnabled() && arena_.BeginSsmReplayCapture()) {
+  if (arena_.BeginSsmReplayCapture()) {
     graph_executor_.Reset();
   }
 }
 
 void QwenGpuExecutor::RestoreState() {
+  if (arena_.IsSsmReplayCaptureActive())
+    arena_.DisableSsmReplayCapture();
   arena_.RestoreState();
-  replaying_ssm_state_ = IsSsmReplayEnabled();
+  replaying_ssm_state_ = true;
 }
 
-void QwenGpuExecutor::ReplaySsmState(std::uint32_t position) {
+void QwenGpuExecutor::FinishVerification() {
+  arena_.DisableSsmReplayCapture();
+}
+
+void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
+                                     std::uint32_t count) {
   const auto& config = weights_.config;
   auto scratch = arena_.GetScratchView();
   for (std::uint32_t layer_idx = 0; layer_idx < config.num_layers;
@@ -173,18 +195,29 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position) {
       continue;
     }
 
-    LaunchSSMConvRecurrence(
-        arena_.GetReplayQkv(layer_idx, position),
-        static_cast<const float*>(layer.ssm_conv1d.data),
-        arena_.d_ssm_conv_state, scratch.ssm.conv_out.data(),
-        arena_.d_ssm_deltanet_state, arena_.GetReplayAlpha(layer_idx, position),
-        arena_.GetReplayBeta(layer_idx, position),
-        static_cast<const float*>(layer.ssm_a.data),
-        static_cast<const float*>(layer.ssm_dt.data), nullptr, nullptr,
-        scratch.ssm.out.data(), layer_idx, config.SsmQkvSize(),
-        config.ssm_group_count, config.ssm_time_step_rank,
-        config.ssm_state_size, config.SsmValueSize(), arena_.stream, {},
-        arena_.GetRecurrentStateStorage());
+    // Layers have independent recorded inputs and recurrent state. Replay each
+    // layer's committed rows together, splitting only at ring/scratch bounds.
+    for (std::uint32_t offset = 0; offset < count;) {
+      const auto start = position + offset;
+      const auto until_wrap = static_cast<std::uint32_t>(
+          kSsmReplayCapacity - (start % kSsmReplayCapacity));
+      const auto rows =
+          std::min({count - offset, until_wrap, arena_.GetMaxBatch()});
+      LaunchSSMConvRecurrenceRows(
+          arena_.GetReplayQkv(layer_idx, start),
+          static_cast<const float*>(layer.ssm_conv1d.data),
+          arena_.d_ssm_conv_state, scratch.ssm.conv_out.data(),
+          arena_.d_ssm_deltanet_state, arena_.GetReplayAlpha(layer_idx, start),
+          arena_.GetReplayBeta(layer_idx, start),
+          static_cast<const float*>(layer.ssm_a.data),
+          static_cast<const float*>(layer.ssm_dt.data), nullptr, nullptr,
+          nullptr, layer_idx, config.SsmQkvSize(), config.ssm_group_count,
+          config.ssm_time_step_rank, config.ssm_state_size,
+          config.SsmValueSize(), rows, config.ssm_time_step_rank,
+          config.ssm_inner_size, arena_.stream, {},
+          arena_.GetRecurrentStateStorage());
+      offset += rows;
+    }
   }
 }
 
@@ -216,6 +249,18 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
                            hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
   return token;
+}
+
+tokenization::TokenId QwenGpuExecutor::SampleCachedLogits(
+    std::span<const float> logits, sampling::SamplerState& sampler) {
+  if (logits.size() != weights_.config.vocab_size)
+    throw std::invalid_argument(
+        "cached Qwen frontier has the wrong vocabulary");
+  auto scratch = arena_.GetScratchView();
+  HIP_CHECK(hipMemcpyAsync(scratch.decode.logits.data(), logits.data(),
+                           logits.size_bytes(), hipMemcpyHostToDevice,
+                           arena_.stream));
+  return SampleLastLogits(sampler);
 }
 
 GpuSamplingParameters QwenGpuExecutor::PrepareGpuSamplingParameters(
@@ -348,19 +393,6 @@ void QwenGpuExecutor::SetPromptHiddenCapture(
   h_verification_logits_.clear();
   arena_.SetTargetLayerCapture(enabled ? target_layer_ids
                                        : std::span<const std::uint32_t>{});
-}
-
-void QwenGpuExecutor::SetVerificationPolicy(
-    QwenVerificationPolicy policy) noexcept {
-  if (policy.bf16_from_layer < 0 ||
-      policy.bf16_from_layer > static_cast<int>(weights_.config.num_layers)) {
-    policy.bf16_from_layer = -1;
-  }
-  if (policy.fp32_from_layer < 0 ||
-      policy.fp32_from_layer > static_cast<int>(weights_.config.num_layers)) {
-    policy.fp32_from_layer = -1;
-  }
-  verification_policy_ = policy;
 }
 
 std::span<const float> QwenGpuExecutor::CopyLastHidden() {

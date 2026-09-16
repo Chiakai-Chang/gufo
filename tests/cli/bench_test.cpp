@@ -19,13 +19,31 @@ void TestDefaultOptions() {
   const std::array<const char*, 0> args{};
   const auto options = gufo::cli::ParseBenchOptions(args);
   Expect(options.has_value(), "default options parse");
+  Expect(options->n_prompts == std::vector<std::size_t>{2048},
+         "default prefill is 2048 tokens");
   Expect(options->n_depths == std::vector<std::size_t>{0},
          "default depth is zero");
   Expect(options->repetitions == 1, "default is one repetition");
   Expect(options->draft_tokens == 7, "default draft ceiling is seven");
   Expect(options->min_draft_tokens == 1, "default minimum draft is one");
-  Expect(options->draft_p_min == 0.0F,
-         "default draft confidence threshold is disabled");
+  Expect(options->temperature == 0.0F && options->seed == 0,
+         "benchmark sampling defaults remain greedy");
+}
+
+void TestDs4SamplingOptions() {
+  const std::array<const char*, 4> args = {
+      "--temperature", "0.6", "--seed", "7"};
+  const auto options = gufo::cli::ParseBenchOptions(args);
+  Expect(options && options->temperature == 0.6F && options->seed == 7,
+         "DS4 benchmark retains temperature and seed");
+  for (const char* value : {"-1", "nan", "inf"}) {
+    const std::array<const char*, 2> invalid = {"--temperature", value};
+    Expect(!gufo::cli::ParseBenchOptions(invalid),
+           "invalid benchmark temperature is rejected");
+  }
+  const std::array<const char*, 2> invalid_seed = {"--seed", "-1"};
+  Expect(!gufo::cli::ParseBenchOptions(invalid_seed),
+         "negative benchmark seed is rejected");
 }
 
 void TestDepthOptions() {
@@ -46,16 +64,14 @@ void TestDepthOptions() {
 }
 
 void TestHybridMtpOptions() {
-  const std::array<const char*, 12> args = {"--speculative",
+  const std::array<const char*, 10> args = {"--speculative",
                                             "mtp-npu",
                                             "--mtp-model",
                                             "mtp.gguf",
-                                            "--spec-draft-n-max",
+                                            "--draft-tokens",
                                             "2",
-                                            "--spec-draft-n-min",
+                                            "--min-draft-tokens",
                                             "2",
-                                            "--spec-draft-p-min",
-                                            "0.75",
                                             "--n-gen",
                                             "128"};
   const auto options = gufo::cli::ParseBenchOptions(args);
@@ -64,8 +80,6 @@ void TestHybridMtpOptions() {
   Expect(options->mtp_model_path == "mtp.gguf", "MTP model path parsed");
   Expect(options->draft_tokens == 2, "draft token count parsed");
   Expect(options->min_draft_tokens == 2, "minimum draft count parsed");
-  Expect(options->draft_p_min > 0.74F && options->draft_p_min < 0.76F,
-         "draft confidence threshold parsed");
 }
 
 void TestInvalidDepth() {
@@ -80,10 +94,25 @@ void TestInvalidDepth() {
   Expect(!gufo::cli::ParseBenchOptions(range_args, &error).has_value(),
          "invalid draft range rejected");
 
-  const std::array<const char*, 2> probability_args = {"--spec-draft-p-min",
-                                                       "1.1"};
-  Expect(!gufo::cli::ParseBenchOptions(probability_args, &error).has_value(),
-         "invalid draft confidence threshold rejected");
+  const std::array<const char*, 4> unsupported_floor = {"--speculative", "dflash2",
+                                                  "--min-draft-tokens", "2"};
+  Expect(!gufo::cli::ParseBenchOptions(unsupported_floor, &error).has_value() &&
+             error.find("min-draft-tokens") != std::string::npos,
+         "DFlash2 rejects an unsupported minimum draft length");
+  for (const char* policy : {"fixed", "adaptive", "unknown"}) {
+    const std::array<const char*, 4> args = {"--speculative", "dflash2",
+                                             "--draft-policy", policy};
+    const auto parsed = gufo::cli::ParseBenchOptions(args, &error);
+    Expect(parsed.has_value() == (std::string_view(policy) != "unknown"),
+           "DFlash benchmark validates its controller");
+    if (parsed)
+      Expect(parsed->draft_policy == policy,
+             "DFlash benchmark retains the requested controller");
+  }
+  const std::array<const char*, 2> policy_without_backend = {"--draft-policy",
+                                                             "adaptive"};
+  Expect(!gufo::cli::ParseBenchOptions(policy_without_backend, &error),
+         "a DFlash controller requires its backend");
 }
 
 void TestInvalidWorkload() {
@@ -109,6 +138,7 @@ void TestInvalidWorkload() {
 
 int main() {
   TestDefaultOptions();
+  TestDs4SamplingOptions();
   TestDepthOptions();
   TestHybridMtpOptions();
   TestInvalidDepth();

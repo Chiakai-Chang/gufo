@@ -18,14 +18,6 @@ void LaunchFusedSwiGLUGEMV(const void* gate_w, core::GgmlType gate_type,
                            std::size_t hidden_size,
                            hipStream_t stream = nullptr);
 
-/// Fused layer pre-RMSNorm + FFN SwiGLU gate/up GEMV (BF16 weights).
-void LaunchFusedRMSNormSwiGLUGEMV(const float* x, const float* norm_w,
-                                  float eps, const void* gate_w,
-                                  const void* up_w, float* out,
-                                  std::size_t intermediate_size,
-                                  std::size_t hidden_size,
-                                  hipStream_t stream = nullptr);
-
 /// Batched SwiGLU activation: out = (gate * sigmoid(gate)) * up (optional BF16
 /// output)
 void LaunchBatchedSwiGLUActivation(const float* gate, const float* up,
@@ -33,15 +25,20 @@ void LaunchBatchedSwiGLUActivation(const float* gate, const float* up,
                                    std::size_t num_elements,
                                    hipStream_t stream = nullptr);
 
-/// Batched Fused SwiGLU GEMM: Out[B, intermediate] = SiLU(X[B, K] * W_gate^T) *
-/// (X[B, K] * W_up^T), with optional BF16 output (opt-c010-ffn-swiglu)
-void LaunchBatchedFusedSwiGLUGEMM(const void* gate_w, bool gate_is_bf16,
-                                  const void* up_w, bool up_is_bf16,
-                                  const float* X, float* out, void* out_bf16,
-                                  std::size_t batch_size,
-                                  std::size_t intermediate_size,
-                                  std::size_t hidden_size,
-                                  hipStream_t stream = nullptr);
+/// SwiGLU for adjacent gate/up rows stored as [batch, 2, intermediate_size].
+void LaunchPackedSwiGLUActivation(const float* gate_up, float* out,
+                                   std::size_t batch_size,
+                                   std::size_t intermediate_size,
+                                   hipStream_t stream = nullptr);
+
+/// Exact projection and SwiGLU for adjacent packed gate/up weights.
+/// Returns false without launching when the shape has no qualified fused route.
+bool TryLaunchPackedQuantSwiGLUFp32(core::GgmlType type, const void* gate_up,
+                                    const float* input, float* output,
+                                    std::size_t batch_size,
+                                    std::size_t intermediate_size,
+                                    std::size_t hidden_size,
+                                    hipStream_t stream = nullptr);
 
 }  // namespace gufo::hip
 

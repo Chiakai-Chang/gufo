@@ -7,11 +7,12 @@ validation target:
 - `modules/` — narrow contracts for extracted norm, FFN, and SSM modules.
 - `hip/` — pure route-policy tests plus gfx1151 kernel and integration tests,
   grouped by attention, FFN, quant, and basic operation ownership.
-- `mtp/` — multi-token-prediction reference behavior.
 - `tokenization/` — tokenizer and chat-template behavior.
-- `xdna2/` — MTP kernels executed through the XDNA2 runtime.
 - `support/` — deterministic Qwen-only fixtures; repository-wide assertions
   and random helpers remain in `tests/testing/test_common.hpp`.
+
+Qwen27B MTP, DFlash2, model replay and optional BF16 reference checks live in
+`tests/models/qwen27b` and run through `tools/qwen27b/check.py`.
 
 Compatibility CTest names remain attached to their primary route.
 `qwen_gpu_ops_test` now owns dense GEMM/BLAS coverage, while focused targets
@@ -21,18 +22,20 @@ avoid compiling or running unrelated kernels:
 - attention: `qwen_attention_decode_ops_test`,
   `qwen_attention_long_context_ops_test`, `qwen_attention_fusion_ops_test`,
   `qwen_attention_projection_ops_test`, `qwen_attention_component_ops_test`;
-- FFN: `qwen_ffn_fusion_ops_test`, `qwen_ffn_residual_ops_test`;
 - quant: `qwen_quant_gemv_ops_test`, `qwen_kquant_gemv_ops_test`,
-  `qwen_dequant_ops_test`;
-- recurrent/runtime: `qwen_ssm_ops_test`, `qwen_graph_prefetch_ops_test`,
+  `qwen_q4kxl_quant_ops_test`, `qwen_dequant_ops_test`;
+- recurrent/runtime: `qwen_ssm_ops_test`, `qwen_graph_ops_test`,
   `qwen_module_ops_test`.
+
+`qwen_q4kxl_quant_ops_test` also owns fused gate/up/SwiGLU equivalence with
+batched verification, including mixed formats, distinct inputs and row tails.
 
 Small utilities under `hip/support/` provide move-only device allocation,
 host/device copies, explicit device requirements, BF16 conversion, and
 always-on numeric checks. They intentionally do not replace CTest or introduce
 a test registry.
 
-The focused basic, attention, FFN, and quant kernel executables declare HIP
+The focused basic, attention, and quant kernel executables declare HIP
 hardware optional at their device gate. No visible HIP device therefore returns
 CTest skip code 77 rather than success. HIP runtime discovery errors and tests
 that declare hardware required return failure. The shared CMake helper records
@@ -59,5 +62,5 @@ the supported gfx1151 target.
 The module-seam integration test does not yet cover the complete production
 executor: embedding, fused attention/SSM composition, unembedding, sampling,
 and real executor/logit parity remain separate acceptance work. Production
-model and performance validation must use the optimized `nix build` binaries,
-not the unoptimized `build/gpu-test` preset.
+performance validation uses the release `nix build` binaries. The `gpu-test`
+preset uses optimized code with symbols and keeps test assertions enabled.

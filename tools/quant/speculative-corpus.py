@@ -20,24 +20,20 @@ GENERATED_RE = re.compile(
     r"(?P<seconds>[0-9.]+)s\s+\((?P<tps>[0-9.]+)\s+tok/s\)"
 )
 SPECULATIVE_LINE_RE = re.compile(r"^\[Speculative\]:\s+(?P<body>.+)$", re.MULTILINE)
+TOKEN_TRACE_RE = re.compile(
+    r"^\[TokenTrace\]: count=(?P<count>\d+) sha256=(?P<sha256>[0-9a-f]{64})$",
+    re.MULTILINE,
+)
 SPECULATIVE_FIELD_RE = re.compile(
     r"(?P<key>[a-z_]+)=(?P<value>[0-9.eE+-]+)"
 )
 DSPARK_REFERENCE_SYSTEM_PROMPT = "You are a helpful assistant"
-CONTROLLED_ENV = {
-    "GUFO_BF16_SMALL_BATCH_EXACT_LDS8",
-    "GUFO_DFLASH_GEMM",
-    "GUFO_DFLASH_PREWARM",
-    "GUFO_DFLASH_SELECTOR",
-    "GUFO_PREFILL_SMALL_BATCH_BF16_FROM_LAYER",
-    "GUFO_PREFILL_SMALL_BATCH_BF16_TILE",
-    "GUFO_PREFILL_SMALL_BATCH_FP32_FROM_LAYER",
-    "GUFO_PREFILL_SMALL_BATCH_QUANT",
-    "GUFO_PREFILL_SMALL_BATCH_W8A8_TILE",
-    "GUFO_SPEC_BATCH_LM_HEAD",
-    "GUFO_SPEC_BATCH_VERIFY",
-    "GUFO_SPEC_BATCH_VERIFY_CHECK",
-}
+
+def parse_token_trace(stderr: str, tokens: int) -> str:
+    trace = TOKEN_TRACE_RE.search(stderr)
+    if trace is None or int(trace.group("count")) != tokens:
+        raise RuntimeError("missing or incomplete emitted-token trace; rebuild gufo")
+    return trace.group("sha256")
 
 
 def parse_speculative_stats(stderr: str) -> dict[str, int | float]:
@@ -83,7 +79,7 @@ def build_prompt_command(
 ) -> list[str]:
     prompt_mode = args.prompt_mode
     if prompt_mode == "auto":
-        prompt_mode = "chat" if args.backend == "dspark" else "raw"
+        prompt_mode = "chat"
 
     command = [
         args.binary,
@@ -93,6 +89,8 @@ def build_prompt_command(
         args.model,
         "--max-tokens",
         str(args.max_tokens),
+        "--temperature",
+        "0",
     ]
     if prompt_mode == "raw":
         command.append("--raw")
@@ -106,6 +104,8 @@ def build_prompt_command(
     if speculative:
         command.extend(["--speculative", args.backend])
         command.extend(["--draft-tokens", str(args.draft_tokens)])
+        if getattr(args, "draft_policy", None) is not None:
+            command.extend(["--draft-policy", args.draft_policy])
         if args.backend != "dspark":
             command.extend(
                 [
@@ -115,13 +115,26 @@ def build_prompt_command(
             )
         if args.backend == "dspark":
             option = "--dspark-model"
-        elif args.backend.startswith("dflash"):
+        elif args.backend == "dflash2":
             option = "--dflash-model"
         else:
             option = "--mtp-model"
         command.extend([option, args.draft_model])
     command.append(prompt)
     return command
+
+
+def artifact_identity(path: str) -> dict:
+    resolved = Path(path).resolve(strict=True)
+    stat = resolved.stat()
+    return {
+        "path": str(resolved),
+        "bytes": stat.st_size,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+    }
 
 
 def autoregressive_key(args: argparse.Namespace, prompt: str) -> str:
@@ -133,21 +146,21 @@ def autoregressive_key(args: argparse.Namespace, prompt: str) -> str:
     builds or framings, which would score a completion against a reference that
     could not have produced it.
     """
-    digest = hashlib.sha256()
-    prompt_mode = args.prompt_mode
-    if prompt_mode == "auto":
-        prompt_mode = "chat" if args.backend == "dspark" else "raw"
-    for field in (
-        os.path.realpath(args.binary),
-        os.path.realpath(args.model),
-        str(args.max_tokens),
-        prompt_mode,
-        str(args.system_prompt),
-        prompt,
-    ):
-        digest.update(field.encode("utf-8"))
-        digest.update(b"\x00")
-    return digest.hexdigest()
+    # Stat identities invalidate in-place rebuilds/replacements without
+    # rereading a multi-gigabyte target for every prompt. Artifact content
+    # hashes belong in the qualification manifest.
+    identity = {
+        "binary": artifact_identity(args.binary),
+        "model": artifact_identity(args.model),
+        "command": build_prompt_command(args, prompt, speculative=False),
+        "environment": {
+            key: value for key, value in os.environ.items()
+            if key.startswith(("GUFO_", "HIP_", "ROCR_", "HSA_"))
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True).encode("utf-8")
+    ).hexdigest()
 
 
 def load_autoregressive_cache(path: Path | None) -> dict[str, dict]:
@@ -170,38 +183,6 @@ def store_autoregressive_cache(path: Path | None, cache: dict[str, dict]) -> Non
     )
 
 
-def verification_environment(profile: str, backend: str) -> dict[str, str]:
-    result: dict[str, str] = {}
-    if profile == "production" or backend == "dspark":
-        return result
-    if backend.startswith("dflash"):
-        result["GUFO_DFLASH_GEMM"] = "hipblaslt"
-        result["GUFO_DFLASH_PREWARM"] = "1"
-    if profile == "sequential":
-        result["GUFO_SPEC_BATCH_VERIFY"] = "0"
-        return result
-    result["GUFO_SPEC_BATCH_VERIFY"] = "1"
-    result["GUFO_SPEC_BATCH_LM_HEAD"] = "1"
-    if profile == "bf16":
-        result["GUFO_PREFILL_SMALL_BATCH_QUANT"] = "bf16"
-    elif profile == "fp32":
-        result["GUFO_PREFILL_SMALL_BATCH_QUANT"] = "fp32"
-    elif profile == "fp32-tail":
-        result["GUFO_PREFILL_SMALL_BATCH_FP32_FROM_LAYER"] = "62"
-    elif profile == "w8a8":
-        result["GUFO_PREFILL_SMALL_BATCH_BF16_FROM_LAYER"] = "64"
-    return result
-
-
-def parse_environment(values: list[str]) -> dict[str, str]:
-    result: dict[str, str] = {}
-    for value in values:
-        key, separator, setting = value.partition("=")
-        if not separator or not key:
-            raise ValueError(f"invalid --env value: {value!r}")
-        result[key] = setting
-    return result
-
 
 def extract_completion(stdout: str) -> str:
     marker = "--- Generation Output ---\n"
@@ -212,7 +193,9 @@ def extract_completion(stdout: str) -> str:
     generated = GENERATED_RE.search(tail)
     if generated is None:
         raise RuntimeError("generation timing line is missing")
-    return tail[: generated.start()].rstrip("\n")
+    # The CLI adds one separator newline after the completion. Any earlier
+    # trailing newlines were generated and are part of the equality check.
+    return tail[: generated.start()].removesuffix("\n")
 
 
 def run_prompt(
@@ -224,8 +207,6 @@ def run_prompt(
     command = build_prompt_command(args, prompt, speculative)
 
     environment = os.environ.copy()
-    for key in CONTROLLED_ENV:
-        environment.pop(key, None)
     if speculative:
         environment.update(extra_environment)
 
@@ -251,6 +232,8 @@ def run_prompt(
         "tokens": int(generated.group("tokens")),
         "seconds": float(generated.group("seconds")),
         "tps": float(generated.group("tps")),
+        "token_sha256": parse_token_trace(
+            process.stderr, int(generated.group("tokens"))),
     }
     if speculative:
         try:
@@ -293,6 +276,8 @@ def load_prompts(
             raise ValueError(f"unknown suite case(s): {', '.join(sorted(missing))}")
     if limit > 0:
         selected = selected[:limit]
+    if not selected:
+        raise ValueError("suite selection contains no prompts")
     for case in selected:
         if not all(
             isinstance(case.get(field), str) and case[field]
@@ -312,18 +297,6 @@ def main() -> int:
         "--backend", choices=("dflash2", "mtp", "dspark"), default="dflash2"
     )
     parser.add_argument(
-        "--profile",
-        choices=(
-            "production",
-            "sequential",
-            "w8a8",
-            "bf16",
-            "fp32",
-            "fp32-tail",
-        ),
-        default="production",
-    )
-    parser.add_argument(
         "--suite",
         default="benchmarks/qwen3.8-27b/speculative-corpus.json",
     )
@@ -332,13 +305,15 @@ def main() -> int:
         "--prompt-mode",
         choices=("auto", "raw", "chat"),
         default="auto",
-        help="auto uses chat framing for DSpark and raw framing for Qwen",
+        help="auto uses production chat framing; raw is an explicit comparison",
     )
     parser.add_argument(
         "--system-prompt",
         help="chat-mode system prompt; DSpark auto mode uses the upstream default",
     )
     parser.add_argument("--draft-tokens", type=int, default=7)
+    parser.add_argument("--draft-policy", choices=("fixed", "adaptive"),
+                        help="DFlash2 controller; omitted uses the binary default")
     parser.add_argument("--min-draft-tokens", type=int, default=1)
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--timeout", type=float, default=180.0)
@@ -353,7 +328,6 @@ def main() -> int:
         help="reject sparse per-prompt samples (DSpark defaults to 8)",
     )
     parser.add_argument("--allow-sparse", action="store_true")
-    parser.add_argument("--env", action="append", default=[])
     parser.add_argument(
         "--ar-cache",
         default="",
@@ -371,6 +345,8 @@ def main() -> int:
         help="Free-form tag recorded in the JSON report",
     )
     args = parser.parse_args()
+    if args.draft_policy is not None and args.backend != "dflash2":
+        parser.error("--draft-policy requires a DFlash2 backend")
 
     if (
         args.max_tokens <= 0
@@ -383,11 +359,7 @@ def main() -> int:
         parser.error("token counts and repetitions must be positive")
 
     prompts = load_prompts(Path(args.suite), args.quick, args.limit, args.case)
-    environment = verification_environment(args.profile, args.backend)
-    try:
-        environment.update(parse_environment(args.env))
-    except ValueError as error:
-        parser.error(str(error))
+    environment: dict[str, str] = {}
     print(
         "| prompt | category | exact | AR tok/s | speculative tok/s | "
         "speedup | support acceptance | positional | full blocks | attempts | "
@@ -405,6 +377,7 @@ def main() -> int:
     skipped_cases: list[str] = []
     sparse_samples: list[str] = []
     total_tokens = 0
+    total_ar_tokens = 0
     total_ar_seconds = 0.0
     total_spec_seconds = 0.0
     total_drafted = 0
@@ -434,6 +407,9 @@ def main() -> int:
                 run_prompt(args, case["text"], True, environment)
                 for _ in range(args.repetitions)
             ]
+            if any(run["tokens"] == 0 or run["seconds"] <= 0
+                   for run in [autoregressive, *speculative_runs]):
+                raise RuntimeError("speed comparison needs generated tokens and positive time")
         except (subprocess.TimeoutExpired, RuntimeError) as error:
             # One pathological target/companion pairing must not abort the
             # suite: that it did not finish is itself a result, and the
@@ -446,6 +422,8 @@ def main() -> int:
             continue
         exact = all(
             run["completion"] == autoregressive["completion"]
+            and run["tokens"] == autoregressive["tokens"]
+            and run["token_sha256"] == autoregressive["token_sha256"]
             for run in speculative_runs
         )
         spec_seconds = statistics.median(
@@ -485,6 +463,7 @@ def main() -> int:
 
         representative = speculative_runs[0]
         total_tokens += int(representative["tokens"])
+        total_ar_tokens += int(autoregressive["tokens"])
         total_ar_seconds += ar_seconds
         total_spec_seconds += spec_seconds
         total_drafted += int(representative["drafted"])
@@ -527,6 +506,8 @@ def main() -> int:
                 "speedup": speedup,
                 "acceptance": acceptance,
                 "average_draft": average_draft,
+                "reference": autoregressive,
+                "runs": speculative_runs,
             }
         )
         if minimum_steps > 0 and attempts < minimum_steps:
@@ -538,7 +519,10 @@ def main() -> int:
                 str(autoregressive["completion"]),
                 str(representative["completion"]),
             )
-            mismatches.append(f"{case['id']}: {detail}")
+            mismatches.append(
+                f"{case['id']}: {detail}; tokens AR={autoregressive['tokens']} "
+                f"spec={[run['tokens'] for run in speculative_runs]}"
+            )
 
     if not rows:
         print()
@@ -548,9 +532,9 @@ def main() -> int:
         )
         for entry in skipped_cases:
             print(f"skipped: {entry}", file=sys.stderr)
-        return 0 if args.allow_mismatch else 1
+        return 1
 
-    aggregate_ar = total_tokens / total_ar_seconds
+    aggregate_ar = total_ar_tokens / total_ar_seconds
     aggregate_spec = total_tokens / total_spec_seconds
     aggregate_acceptance = (
         total_accepted / total_drafted if total_drafted else 0.0
@@ -594,7 +578,7 @@ def main() -> int:
     if args.json_path:
         prompt_mode = args.prompt_mode
         if prompt_mode == "auto":
-            prompt_mode = "chat" if args.backend == "dspark" else "raw"
+            prompt_mode = "chat"
         Path(args.json_path).write_text(
             json.dumps(
                 {
@@ -603,8 +587,13 @@ def main() -> int:
                     "binary": os.path.realpath(args.binary),
                     "model": os.path.realpath(args.model),
                     "draft_model": os.path.realpath(args.draft_model),
+                    "artifacts": {
+                        "binary": artifact_identity(args.binary),
+                        "model": artifact_identity(args.model),
+                        "draft": artifact_identity(args.draft_model),
+                    },
                     "backend": args.backend,
-                    "profile": args.profile,
+                    "profile": "production",
                     "prompt_mode": prompt_mode,
                     "suite": str(args.suite),
                     "suite_hash": suite_hash,
@@ -638,7 +627,7 @@ def main() -> int:
 
     mismatch_failed = bool(mismatches) and not args.allow_mismatch
     sparse_failed = bool(sparse_samples) and not args.allow_sparse
-    return 1 if mismatch_failed or sparse_failed else 0
+    return 1 if mismatch_failed or sparse_failed or skipped_cases else 0
 
 
 if __name__ == "__main__":

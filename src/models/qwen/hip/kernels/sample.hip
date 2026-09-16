@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +16,7 @@ namespace gufo::hip {
 namespace {
 
 constexpr std::size_t kSamplingThreads = 256;
+constexpr std::size_t kArgmaxTile = 4096;
 
 __device__ float SparseDraftProbability(
     std::uint32_t token,
@@ -101,7 +103,7 @@ __global__ void LinearSamplingKernel(const float* __restrict__ logits,
   const float maximum = shared_max[0];
   const float min_p_threshold =
       min_p > 0.0F ? maximum + logf(min_p) : -INFINITY;
-  const float inverse_temperature = 1.0F / temperature;
+  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   float local_sum = 0.0F;
   for (std::size_t index = begin; index < end; ++index) {
     const float value = logits[index];
@@ -121,7 +123,7 @@ __global__ void LinearSamplingKernel(const float* __restrict__ logits,
     float threshold = fminf(fmaxf(uniform, 0.0F), 0.99999994F) * total;
     selected_segment = static_cast<std::uint32_t>(blockDim.x - 1U);
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
-      if (threshold <= segment_prefix[segment] + segment_sums[segment]) {
+      if (threshold < segment_prefix[segment] + segment_sums[segment]) {
         selected_segment = static_cast<std::uint32_t>(segment);
         break;
       }
@@ -141,7 +143,7 @@ __global__ void LinearSamplingKernel(const float* __restrict__ logits,
       }
       threshold -= expf((value - maximum) * inverse_temperature);
       selected = static_cast<std::uint32_t>(index);
-      if (threshold <= 0.0F) {
+      if (threshold < 0.0F) {
         break;
       }
     }
@@ -241,7 +243,7 @@ __global__ void SortedSamplingKernel(
 
   const std::size_t sample_begin = (final_keep * tid) / blockDim.x;
   const std::size_t sample_end = (final_keep * (tid + 1U)) / blockDim.x;
-  const float inverse_temperature = 1.0F / temperature;
+  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   local_sum = 0.0F;
   for (std::size_t index = sample_begin; index < sample_end; ++index) {
     local_sum += expf((sorted_logits[index] - maximum) * inverse_temperature);
@@ -258,7 +260,7 @@ __global__ void SortedSamplingKernel(
     const float threshold = fminf(fmaxf(uniform, 0.0F), 0.99999994F) * total;
     selected_segment = static_cast<std::uint32_t>(blockDim.x - 1U);
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
-      if (threshold <= segment_prefix[segment] + segment_sums[segment]) {
+      if (threshold < segment_prefix[segment] + segment_sums[segment]) {
         selected_segment = static_cast<std::uint32_t>(segment);
         break;
       }
@@ -273,7 +275,7 @@ __global__ void SortedSamplingKernel(
     for (std::size_t index = sample_begin; index < sample_end; ++index) {
       threshold -= expf((sorted_logits[index] - maximum) * inverse_temperature);
       selected = sorted_token_ids[index];
-      if (threshold <= 0.0F) {
+      if (threshold < 0.0F) {
         break;
       }
     }
@@ -324,7 +326,7 @@ __global__ void LinearSpeculativeSamplingKernel(
   const float maximum = shared_max[0];
   const float min_p_threshold =
       min_p > 0.0F ? maximum + logf(min_p) : -INFINITY;
-  const float inverse_temperature = 1.0F / temperature;
+  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   float local_sum = 0.0F;
   float local_draft_weight = 0.0F;
   for (std::size_t index = begin; index < end; ++index) {
@@ -417,7 +419,7 @@ __global__ void LinearSpeculativeSamplingKernel(
     selected_segment = static_cast<std::uint32_t>(blockDim.x - 1U);
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
       if (segment_sums[segment] > 0.0F &&
-          threshold <= segment_prefix[segment] + segment_sums[segment]) {
+          threshold < segment_prefix[segment] + segment_sums[segment]) {
         selected_segment = static_cast<std::uint32_t>(segment);
         break;
       }
@@ -450,7 +452,7 @@ __global__ void LinearSpeculativeSamplingKernel(
       }
       threshold -= weight;
       selected = static_cast<std::uint32_t>(index);
-      if (threshold <= 0.0F) {
+      if (threshold < 0.0F) {
         break;
       }
     }
@@ -554,7 +556,7 @@ __global__ void SortedSpeculativeSamplingKernel(
 
   const std::size_t sample_begin = (final_keep * tid) / blockDim.x;
   const std::size_t sample_end = (final_keep * (tid + 1U)) / blockDim.x;
-  const float inverse_temperature = 1.0F / temperature;
+  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   local_sum = 0.0F;
   float local_draft_weight = 0.0F;
   for (std::size_t index = sample_begin; index < sample_end; ++index) {
@@ -637,7 +639,7 @@ __global__ void SortedSpeculativeSamplingKernel(
     selected_segment = static_cast<std::uint32_t>(blockDim.x - 1U);
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
       if (segment_sums[segment] > 0.0F &&
-          threshold <= segment_prefix[segment] + segment_sums[segment]) {
+          threshold < segment_prefix[segment] + segment_sums[segment]) {
         selected_segment = static_cast<std::uint32_t>(segment);
         break;
       }
@@ -665,7 +667,7 @@ __global__ void SortedSpeculativeSamplingKernel(
       }
       threshold -= weight;
       selected = sorted_token_ids[index];
-      if (threshold <= 0.0F) {
+      if (threshold < 0.0F) {
         break;
       }
     }
@@ -681,12 +683,12 @@ __global__ void ArgmaxKernel(const float* __restrict__ logits,
   const std::size_t tid = threadIdx.x;
   const std::size_t block_size = blockDim.x;
 
-  float max_val = -1e30F;
+  float max_val = -INFINITY;
   std::uint32_t max_idx = 0;
 
   for (std::size_t i = tid; i < vocab_size; i += block_size) {
     const float val = logits[i];
-    if (val > max_val) {
+    if (isfinite(val) && val > max_val) {
       max_val = val;
       max_idx = static_cast<std::uint32_t>(i);
     }
@@ -700,7 +702,9 @@ __global__ void ArgmaxKernel(const float* __restrict__ logits,
 
   for (std::size_t stride = block_size / 2; stride > 0; stride /= 2) {
     if (tid < stride) {
-      if (s_max[tid + stride] > s_max[tid]) {
+      if (s_max[tid + stride] > s_max[tid] ||
+          (s_max[tid + stride] == s_max[tid] &&
+           s_idx[tid + stride] < s_idx[tid])) {
         s_max[tid] = s_max[tid + stride];
         s_idx[tid] = s_idx[tid + stride];
       }
@@ -718,20 +722,36 @@ void LaunchGPUArgmax(const float* logits, std::uint32_t* out_token,
   ArgmaxKernel<<<1, 256, 0, stream>>>(logits, out_token, vocab_size);
 }
 
+template<bool Partial = false, bool MapIndices = false>
 __global__ void BatchedArgmaxKernel(const float* __restrict__ logits,
                                     std::uint32_t* __restrict__ out_tokens,
-                                    std::size_t vocab_size) {
-  const std::size_t row = blockIdx.x;
+                                    std::size_t vocab_size,
+                                    float* partial_values = nullptr,
+                                    std::uint32_t* partial_tokens = nullptr) {
+  const std::size_t row = Partial ? blockIdx.y : blockIdx.x;
   const std::size_t tid = threadIdx.x;
   const float* row_logits = logits + (row * vocab_size);
+  const std::size_t begin = Partial ? blockIdx.x * kArgmaxTile : 0;
+  const std::size_t end = Partial && begin + kArgmaxTile < vocab_size
+                              ? begin + kArgmaxTile
+                              : vocab_size;
 
-  float max_val = -1e30F;
+  float max_val = -INFINITY;
   std::uint32_t max_idx = 0;
-  for (std::size_t index = tid; index < vocab_size; index += blockDim.x) {
+  for (std::size_t index = begin + tid; index < end; index += blockDim.x) {
     const float value = row_logits[index];
-    if (value > max_val) {
-      max_val = value;
-      max_idx = static_cast<std::uint32_t>(index);
+    if constexpr (MapIndices) {
+      const auto candidate = partial_tokens[row * vocab_size + index];
+      if (isfinite(value) &&
+          (value > max_val || (value == max_val && candidate < max_idx))) {
+        max_val = value;
+        max_idx = candidate;
+      }
+    } else {
+      if (isfinite(value) && value > max_val) {
+        max_val = value;
+        max_idx = static_cast<std::uint32_t>(index);
+      }
     }
   }
 
@@ -742,7 +762,9 @@ __global__ void BatchedArgmaxKernel(const float* __restrict__ logits,
   __syncthreads();
 
   for (std::size_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
-    if (tid < stride && shared_max[tid + stride] > shared_max[tid]) {
+    if (tid < stride && (shared_max[tid + stride] > shared_max[tid] ||
+                         (shared_max[tid + stride] == shared_max[tid] &&
+                          shared_index[tid + stride] < shared_index[tid]))) {
       shared_max[tid] = shared_max[tid + stride];
       shared_index[tid] = shared_index[tid + stride];
     }
@@ -750,18 +772,52 @@ __global__ void BatchedArgmaxKernel(const float* __restrict__ logits,
   }
 
   if (tid == 0) {
-    out_tokens[row] = shared_index[0];
+    if constexpr (Partial) {
+      const auto offset = row * gridDim.x + blockIdx.x;
+      partial_values[offset] = shared_max[0];
+      partial_tokens[offset] = shared_index[0];
+    } else {
+      out_tokens[row] = shared_index[0];
+    }
   }
 }
 
 void LaunchBatchedGPUArgmax(const float* logits, std::uint32_t* out_tokens,
                             std::size_t batch_size, std::size_t vocab_size,
-                            hipStream_t stream) {
+                            std::span<float> scratch, hipStream_t stream) {
   if (batch_size == 0 || vocab_size == 0) {
     return;
   }
-  BatchedArgmaxKernel<<<static_cast<unsigned int>(batch_size), 256, 0,
-                        stream>>>(logits, out_tokens, vocab_size);
+  const auto partials = (vocab_size - 1) / kArgmaxTile + 1;
+  if (partials > 1 && batch_size <= scratch.size() / (2 * partials)) {
+    // FFN output scratch is free after the head projection. Parallel vocabulary
+    // tiles keep large rows from serializing their reads in one workgroup.
+    auto* const indices = reinterpret_cast<std::uint32_t*>(
+        scratch.data() + batch_size * partials);
+    BatchedArgmaxKernel<true><<<dim3(static_cast<unsigned>(partials),
+                                     static_cast<unsigned>(batch_size)),
+                                256, 0, stream>>>(
+        logits, out_tokens, vocab_size, scratch.data(), indices);
+    BatchedArgmaxKernel<false, true>
+        <<<static_cast<unsigned>(batch_size), 256, 0, stream>>>(
+            scratch.data(), out_tokens, partials, nullptr, indices);
+  } else {
+    BatchedArgmaxKernel<>
+        <<<static_cast<unsigned int>(batch_size), 256, 0, stream>>>(
+            logits, out_tokens, vocab_size);
+  }
+}
+
+std::size_t EstimateGpuSamplingWorkspaceBytes(std::size_t vocab_size,
+                                              std::size_t penalty_capacity) {
+  GpuSamplingWorkspace workspace;
+  workspace.vocab_size = vocab_size;
+  workspace.penalty_capacity = penalty_capacity;
+  HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
+      nullptr, workspace.sort_temp_storage_bytes,
+      workspace.adjusted_logits, workspace.sorted_logits,
+      workspace.token_ids, workspace.sorted_token_ids, vocab_size));
+  return workspace.SizeBytes();
 }
 
 void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
@@ -878,7 +934,7 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
     LaunchGPUArgmax(sampling_logits, out_token, vocab_size, stream);
     return;
   }
-  if (parameters.top_k == 1) {
+  if (parameters.top_k == 1 && parameters.min_keep <= 1) {
     LaunchGPUArgmax(sampling_logits, out_token, vocab_size, stream);
     return;
   }
@@ -913,15 +969,14 @@ void LaunchGPUSpeculativeSampling(
     GpuSamplingWorkspace* workspace, hipStream_t stream) {
   if (logits == nullptr || out_token == nullptr || out_accepted == nullptr ||
       workspace == nullptr || vocab_size == 0 ||
-      workspace->vocab_size != vocab_size ||
-      draft_candidate_count == 0 ||
+      workspace->vocab_size != vocab_size || draft_candidate_count == 0 ||
       draft_candidate_count > workspace->penalty_capacity ||
       penalty_count > workspace->penalty_capacity ||
       draft_candidate_ids == nullptr ||
       draft_candidate_probabilities == nullptr ||
       !std::isfinite(draft_token_probability) ||
-      draft_token_probability <= 0.0F ||
-      parameters.temperature <= 0.0F || parameters.top_k == 1) {
+      draft_token_probability <= 0.0F || parameters.temperature <= 0.0F ||
+      (parameters.top_k == 1 && parameters.min_keep <= 1)) {
     throw std::invalid_argument("invalid GPU speculative sampling launch");
   }
 

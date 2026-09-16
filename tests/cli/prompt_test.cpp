@@ -20,7 +20,6 @@ void TestDefaultOptions() {
   assert(!opt->verbose);
   assert(opt->draft_tokens == 7);
   assert(opt->min_draft_tokens == 1);
-  assert(opt->draft_p_min == 0.0F);
 }
 
 void TestExplicitFlags() {
@@ -39,24 +38,21 @@ void TestExplicitFlags() {
 }
 
 void TestHybridMtpFlags() {
-  const std::array<const char*, 11> args = {"--speculative",
-                                            "mtp-npu",
-                                            "--mtp-model",
-                                            "mtp.gguf",
-                                            "--spec-draft-n-max",
-                                            "2",
-                                            "--spec-draft-n-min",
-                                            "2",
-                                            "--spec-draft-p-min",
-                                            "0.75",
-                                            "Prompt"};
+  const std::array<const char*, 9> args = {"--speculative",
+                                           "mtp-npu",
+                                           "--mtp-model",
+                                           "mtp.gguf",
+                                           "--draft-tokens",
+                                           "2",
+                                           "--min-draft-tokens",
+                                           "2",
+                                           "Prompt"};
   const auto opt = gufo::cli::ParsePromptOptions(args);
   assert(opt.has_value());
   assert(opt->speculative_backend == "mtp-npu");
   assert(opt->mtp_model_path == "mtp.gguf");
   assert(opt->draft_tokens == 2);
   assert(opt->min_draft_tokens == 2);
-  assert(opt->draft_p_min > 0.74F && opt->draft_p_min < 0.76F);
 }
 
 void TestInvalidFlags() {
@@ -78,14 +74,41 @@ void TestInvalidFlags() {
   const std::array<const char*, 2> args6 = {"--top-p", "0"};
   assert(!gufo::cli::ParsePromptOptions(args6, &err).has_value());
 
-  const std::array<const char*, 2> args7 = {"--spec-draft-p-min", "-0.1"};
-  assert(!gufo::cli::ParsePromptOptions(args7, &err).has_value());
+  const std::array<const char*, 6> unsupported_floor = {
+      "--speculative",      "dflash2", "--dflash-model", "draft.gguf",
+      "--min-draft-tokens", "2"};
+  assert(!gufo::cli::ParsePromptOptions(unsupported_floor, &err).has_value());
+  assert(err.find("min-draft-tokens") != std::string::npos);
+  for (const char* policy : {"fixed", "adaptive", "unknown"}) {
+    const std::array<const char*, 6> args = {"--speculative",  "dflash2",
+                                             "--dflash-model", "draft.gguf",
+                                             "--draft-policy", policy};
+    const auto parsed = gufo::cli::ParsePromptOptions(args, &err);
+    assert(parsed.has_value() == (std::string_view(policy) != "unknown"));
+    if (parsed)
+      assert(parsed->draft_policy == policy);
+  }
+  const std::array<const char*, 2> policy_without_backend = {"--draft-policy",
+                                                             "adaptive"};
+  assert(!gufo::cli::ParsePromptOptions(policy_without_backend, &err));
 
   const std::array<const char*, 2> args8 = {"--chat-template", "qwen"};
   assert(!gufo::cli::ParsePromptOptions(args8, &err).has_value());
 
   const std::array<const char*, 2> args9 = {"--reasoning-budget", "1024"};
   assert(!gufo::cli::ParsePromptOptions(args9, &err).has_value());
+
+  for (const auto* backend : {"dflash2", "mtp"}) {
+    const std::array<const char*, 2> missing_path = {"--speculative", backend};
+    assert(!gufo::cli::ParsePromptOptions(missing_path, &err).has_value());
+    assert(err.find("requires --") != std::string::npos);
+  }
+  const std::array<const char*, 5> cpu_spec = {
+      "--cpu", "--speculative", "dflash2", "--dflash-model", "draft.gguf"};
+  assert(!gufo::cli::ParsePromptOptions(cpu_spec, &err).has_value());
+  assert(err.find("ROCm") != std::string::npos);
+  const std::array<const char*, 3> cpu_ar = {"--cpu", "--speculative", "off"};
+  assert(gufo::cli::ParsePromptOptions(cpu_ar, &err).has_value());
 }
 
 void TestSamplingAndReasoningFlags() {

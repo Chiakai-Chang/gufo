@@ -32,7 +32,6 @@
 #include "src/core/heterogeneous/npu_drafter.hpp"
 #include "src/core/hip/hip_utils.hpp"
 #include "src/core/speculative/draft_heads.hpp"
-#include "src/core/speculative/prompt_lookup_backend.hpp"
 #include "src/core/speculative/self_speculative.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
@@ -57,7 +56,7 @@ void PrintBenchHelp(std::string_view program_name) {
                    &opt.n_gpu_layers);
 
   parser.AddOption("-p", "--n-prompt", "n,n,...",
-                   "Prompt token lengths to benchmark (default: 64,128,512)",
+                   "Prompt token lengths to benchmark (default: 2048)",
                    "Workload", &opt.model_path);
   parser.AddOption(
       "-n", "--n-gen", "n,n,...",
@@ -80,14 +79,17 @@ void PrintBenchHelp(std::string_view program_name) {
                    "reference",
                    "Validation", &opt.model_path);
 
-  parser.AddOption(
-      "", "--speculative", "MODE",
-      "Draft backend: dflash, dflash2, mtp, mtp-npu, dspark, npu, pld, "
-      "self, or off",
-      "Speculative", &opt.speculative_backend);
+  parser.AddOption("", "--speculative", "MODE",
+                   "Draft backend: dflash2, mtp, mtp-npu, dspark, npu, "
+                   "self, or off",
+                   "Speculative", &opt.speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
-                   "Path to quantized Qwen DFlash/DFlash-2 GGUF file",
-                   "Speculative", &opt.dflash_model_path);
+                   "Path to Qwen DFlash2 GGUF file", "Speculative",
+                   &opt.dflash_model_path);
+  parser.AddOption(
+      "", "--draft-policy", "POLICY",
+      "DFlash2 block length: fixed or adaptive (default: adaptive)",
+      "Speculative", &opt.draft_policy);
   parser.AddOption("", "--dspark-model", "PATH",
                    "DeepSeek V4 Flash DSpark support GGUF", "Speculative",
                    &opt.dspark_model_path);
@@ -98,9 +100,6 @@ void PrintBenchHelp(std::string_view program_name) {
       "", "--draft-tokens", "N",
       "Maximum speculative draft tokens per verification step (default: 7)",
       "Speculative", &opt.draft_tokens);
-  parser.AddOption("", "--spec-draft-n-max", "N",
-                   "llama.cpp-compatible alias for --draft-tokens",
-                   "Speculative", &opt.draft_tokens);
   parser.AddOption("", "--draft-vocab", "N",
                    "Qwen3.8-Flash-Next: score MTP drafts over the first N "
                    "token ids only (default: 0 = full vocabulary)",
@@ -109,16 +108,7 @@ void PrintBenchHelp(std::string_view program_name) {
   parser.AddOption("", "--min-draft-tokens", "N",
                    "Adaptive draft floor (default: 1)", "Speculative",
                    &opt.min_draft_tokens);
-  parser.AddOption("", "--spec-draft-n-min", "N",
-                   "llama.cpp-compatible alias for --min-draft-tokens",
-                   "Speculative", &opt.min_draft_tokens);
-  parser.AddOption(
-      "", "--spec-draft-p-min", "P",
-      "Stop at the first draft token below confidence P; 0 disables "
-      "(default: 0)",
-      "Speculative", &opt.draft_p_min);
-  parser.AddOption("", "--draft-p-min", "P", "Alias for --spec-draft-p-min",
-                   "Speculative", &opt.draft_p_min);
+
   parser.AddOption("", "--temperature", "T",
                    "DeepSeek generation temperature; 0 is greedy (default: 0)",
                    "Workload", &opt.temperature);
@@ -310,10 +300,9 @@ int RunDeepSeekBenchmark(
     std::cerr << "Error: --speculative dspark requires --dspark-model\n";
     return 1;
   }
-  if (dspark &&
-      (options.min_draft_tokens != 1 || options.draft_p_min != 0.0F)) {
+  if (dspark && options.min_draft_tokens != 1) {
     std::cerr << "Error: DSpark uses model-owned adaptive drafting; custom "
-                 "draft floors and confidence thresholds are unsupported\n";
+                 "draft floors are unsupported\n";
     return 1;
   }
 
@@ -1027,7 +1016,7 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
 
   parser.AddCustomOption(
       "-p", "--n-prompt", "n,n,...",
-      "Prompt token lengths to benchmark (default: 64,128,512)", "Workload",
+      "Prompt token lengths to benchmark (default: 2048)", "Workload",
       [&opt, &explicit_p](std::string_view flag, std::string_view val,
                           std::string* error) -> bool {
         auto sizes = ParseCommaSeparatedSizes(val);
@@ -1122,26 +1111,31 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
   bool speculative_explicit = false;
   const auto parse_speculative_backend =
       [&opt, &speculative_explicit](std::string_view, std::string_view value,
-                                    std::string*) -> bool {
+                                    std::string* error) -> bool {
     speculative_explicit = true;
-    if (value == "none" || value == "off" || value == "false" ||
-        value == "disabled") {
+    if (value == "off") {
       opt.speculative_backend.clear();
-    } else {
+    } else if (value == "dspark" || value == "dflash2" || value == "mtp" ||
+               value == "mtp-npu" || value == "npu" || value == "self") {
       opt.speculative_backend = value;
+    } else {
+      if (error != nullptr)
+        *error = "Unknown speculative backend: " + std::string(value);
+      return false;
     }
     return true;
   };
   parser.AddCustomOption("", "--speculative", "MODE",
-                         "Draft backend: dflash, dflash2, mtp, mtp-npu, "
-                         "dspark, npu, pld, self, or off",
+                         "Draft backend: dflash2, mtp, mtp-npu, "
+                         "dspark, npu, self, or off",
                          "Speculative", parse_speculative_backend);
-  parser.AddCustomOption("", "--speculative-decoding", "MODE",
-                         "Alias for --speculative", "Speculative",
-                         parse_speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
-                   "Path to quantized Qwen DFlash/DFlash-2 GGUF file",
-                   "Speculative", &opt.dflash_model_path);
+                   "Path to Qwen DFlash2 GGUF file", "Speculative",
+                   &opt.dflash_model_path);
+  parser.AddOption(
+      "", "--draft-policy", "POLICY",
+      "DFlash2 block length: fixed or adaptive (default: adaptive)",
+      "Speculative", &opt.draft_policy);
   parser.AddOption("", "--dspark-model", "PATH",
                    "DeepSeek V4 Flash DSpark support GGUF", "Speculative",
                    &opt.dspark_model_path);
@@ -1186,23 +1180,10 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
         opt.min_draft_tokens = count;
         return true;
       });
-  parser.AddOption("", "--spec-draft-n-max", "N",
-                   "llama.cpp-compatible alias for --draft-tokens",
-                   "Speculative", &opt.draft_tokens);
-  parser.AddOption("", "--spec-draft-n-min", "N",
-                   "llama.cpp-compatible alias for --min-draft-tokens",
-                   "Speculative", &opt.min_draft_tokens);
   parser.AddOption("", "--draft-vocab", "N",
                    "Qwen3.8-Flash-Next: score MTP drafts over the first N "
                    "token ids only (default: 0 = full vocabulary)",
                    "Speculative", &opt.draft_vocab);
-  parser.AddOption(
-      "", "--spec-draft-p-min", "P",
-      "Stop at the first draft token below confidence P; 0 disables "
-      "(default: 0)",
-      "Speculative", &opt.draft_p_min);
-  parser.AddOption("", "--draft-p-min", "P", "Alias for --spec-draft-p-min",
-                   "Speculative", &opt.draft_p_min);
   parser.AddOption("", "--temperature", "T",
                    "DeepSeek generation temperature; 0 is greedy (default: 0)",
                    "Workload", &opt.temperature);
@@ -1251,17 +1232,24 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     }
     return std::nullopt;
   }
-  if (!std::isfinite(opt.draft_p_min) || opt.draft_p_min < 0.0F ||
-      opt.draft_p_min > 1.0F) {
-    if (error_msg != nullptr) {
-      *error_msg = "spec-draft-p-min must be in [0, 1]";
-    }
-    return std::nullopt;
-  }
   if (!std::isfinite(opt.temperature) || opt.temperature < 0.0F) {
     if (error_msg != nullptr) {
       *error_msg = "temperature must be non-negative";
     }
+    return std::nullopt;
+  }
+  if (!opt.draft_policy.empty() &&
+      ((opt.draft_policy != "fixed" && opt.draft_policy != "adaptive") ||
+       opt.speculative_backend != "dflash2")) {
+    if (error_msg != nullptr)
+      *error_msg = "--draft-policy requires DFlash2 and fixed or adaptive";
+    return std::nullopt;
+  }
+  if (opt.min_draft_tokens != 1 && opt.speculative_backend == "dflash2") {
+    if (error_msg != nullptr)
+      *error_msg =
+          "DFlash2 requires --min-draft-tokens 1; bound blocks with "
+          "--draft-tokens";
     return std::nullopt;
   }
 
@@ -1365,10 +1353,8 @@ int RunBench(std::span<const char* const> args) {
       opt.speculative_backend == "mtp-npu") {
     std::string mtp_path = opt.mtp_model_path;
     if (mtp_path.empty()) {
-      if (const char* environment = std::getenv("GUFO_MTP_MODEL");
-          environment != nullptr) {
-        mtp_path = environment;
-      }
+      std::cerr << "MTP requires --mtp-model\n";
+      return 1;
     }
     auto mtp_reader_owner = core::GgufReader::OpenFile(mtp_path, &err);
     if (mtp_reader_owner == nullptr) {
@@ -1388,6 +1374,30 @@ int RunBench(std::span<const char* const> args) {
                 << mtp_gpu_model->GetPackedWeightBytes() << " bytes in "
                 << mtp_gpu_model->GetPackTimeSeconds() << " s\n";
     }
+  }
+  // A DFlash2 pp row includes the same feature capture and draft injection as
+  // prompt/serving. Keep one backend alive across warmup, depth restores and
+  // TG.
+  std::unique_ptr<speculative::SpeculativeVerifier> dflash_verifier;
+  if (opt.speculative_backend == "dflash2") {
+    hip::QwenDFlashGpuDraftConfig draft_config{
+        .max_context = static_cast<std::uint32_t>(required_context),
+        .max_draft_tokens = opt.draft_tokens,
+        .policy = speculative::ParseDFlashDraftPolicy(opt.draft_policy),
+    };
+    auto draft = hip::QwenDFlashGpuDraftBackend::CreateFromGguf(
+        opt.dflash_model_path, gpu_exec->GetSharedModel(), draft_config, &err);
+    if (!draft) {
+      throw std::runtime_error("DFlash2 initialization failed: " + err);
+    }
+    speculative::SpeculativeOptions options;
+    options.max_draft_tokens = opt.draft_tokens;
+    options.min_draft_tokens = opt.min_draft_tokens;
+    options.initial_draft_tokens = opt.draft_tokens;
+    options.enable_adaptive_draft_length = false;
+    options.use_batched_verification = true;
+    dflash_verifier = std::make_unique<speculative::SpeculativeVerifier>(
+        *gpu_exec, std::move(draft), options);
   }
   const std::string model_name =
       config.model_name + " " + reader->GetQuantizationLabel();
@@ -1448,6 +1458,10 @@ int RunBench(std::span<const char* const> args) {
               << std::flush;
   };
 
+  // Verification owns the executor's SaveState rollback slot. A benchmark
+  // prefix must have an independent snapshot across speculative TG repeats.
+  std::unique_ptr<hip::QwenGpuSnapshot> prepared_target;
+  std::unique_ptr<speculative::SpeculativeVerifierSnapshot> prepared_draft;
   std::size_t prepared_depth = 0;
   bool has_prepared_depth = false;
   tokenization::TokenId prepared_next_token = 0;
@@ -1461,7 +1475,9 @@ int RunBench(std::span<const char* const> args) {
       double restore_ms = 0.0;
       if (has_prepared_depth && depth >= prepared_depth) {
         const auto restore_start = std::chrono::steady_clock::now();
-        gpu_exec->RestoreState();
+        gpu_exec->RestoreSnapshot(*prepared_target);
+        if (dflash_verifier)
+          dflash_verifier->RestoreSnapshot(*prepared_draft);
         const auto restore_end = std::chrono::steady_clock::now();
         restore_ms = std::chrono::duration<double, std::milli>(restore_end -
                                                                restore_start)
@@ -1476,9 +1492,19 @@ int RunBench(std::span<const char* const> args) {
       const auto preparation_begin = std::chrono::steady_clock::now();
       const bool compute_next_token = !opt.n_gens.empty();
       if (!depth_tokens.empty()) {
-        const auto next_token = gpu_exec->ForwardPromptBatch(
-            depth_tokens, static_cast<std::uint32_t>(preparation_start),
-            compute_next_token);
+        const auto next_token =
+            dflash_verifier
+                ? (preparation_start == 0
+                       ? dflash_verifier->Prime(depth_tokens,
+                                                compute_next_token)
+                       : dflash_verifier->ExtendPrompt(
+                             depth_tokens,
+                             static_cast<std::uint32_t>(preparation_start),
+                             compute_next_token))
+                : gpu_exec->ForwardPromptBatch(
+                      depth_tokens,
+                      static_cast<std::uint32_t>(preparation_start),
+                      compute_next_token);
         if (compute_next_token) {
           prepared_next_token = next_token;
           has_prepared_next_token = true;
@@ -1487,7 +1513,10 @@ int RunBench(std::span<const char* const> args) {
       HIP_CHECK(hipDeviceSynchronize());
       const auto preparation_end = std::chrono::steady_clock::now();
       const auto cache_begin = preparation_end;
-      gpu_exec->SaveState(static_cast<std::uint32_t>(depth));
+      prepared_target =
+          gpu_exec->SaveSnapshot(static_cast<std::uint32_t>(depth));
+      if (dflash_verifier)
+        prepared_draft = dflash_verifier->Snapshot();
       const auto cache_end = std::chrono::steady_clock::now();
       if (opt.verbose) {
         const double preparation_seconds =
@@ -1514,7 +1543,9 @@ int RunBench(std::span<const char* const> args) {
       if (depth == 0) {
         gpu_exec->Reset();
       } else {
-        gpu_exec->RestoreState();
+        gpu_exec->RestoreSnapshot(*prepared_target);
+        if (dflash_verifier)
+          dflash_verifier->RestoreSnapshot(*prepared_draft);
       }
       HIP_CHECK(hipDeviceSynchronize());
     };
@@ -1522,10 +1553,22 @@ int RunBench(std::span<const char* const> args) {
     for (const std::size_t p_len : opt.n_prompts) {
       const auto prompt_tokens = MakeBenchmarkTokens(p_len, depth);
 
+      const auto prefill = [&] {
+        if (dflash_verifier) {
+          if (depth == 0) {
+            (void)dflash_verifier->Prime(prompt_tokens);
+          } else {
+            (void)dflash_verifier->ExtendPrompt(
+                prompt_tokens, static_cast<std::uint32_t>(depth));
+          }
+        } else {
+          (void)gpu_exec->ForwardPromptBatch(prompt_tokens,
+                                             static_cast<std::uint32_t>(depth));
+        }
+        HIP_CHECK(hipDeviceSynchronize());
+      };
       restore_depth();
-      (void)gpu_exec->ForwardPromptBatch(prompt_tokens,
-                                         static_cast<std::uint32_t>(depth));
-      HIP_CHECK(hipDeviceSynchronize());
+      prefill();
 
       std::vector<double> runs;
       runs.reserve(opt.repetitions);
@@ -1533,9 +1576,7 @@ int RunBench(std::span<const char* const> args) {
         restore_depth();
 
         const auto t0 = std::chrono::high_resolution_clock::now();
-        (void)gpu_exec->ForwardPromptBatch(prompt_tokens,
-                                           static_cast<std::uint32_t>(depth));
-        HIP_CHECK(hipDeviceSynchronize());
+        prefill();
         const auto t1 = std::chrono::high_resolution_clock::now();
 
         const double elapsed_sec =
@@ -1569,31 +1610,8 @@ int RunBench(std::span<const char* const> args) {
 
         std::unique_ptr<speculative::IDraftBackend> draft_backend;
         hip::QwenMtpGpuDraftBackend* mtp_backend = nullptr;
-        if (opt.speculative_backend == "dflash" ||
-            opt.speculative_backend == "dflash2" ||
-            opt.speculative_backend == "dflash-2") {
-          std::string dflash_path = opt.dflash_model_path;
-          if (dflash_path.empty()) {
-            if (const char* env = std::getenv("GUFO_DFLASH_MODEL");
-                env != nullptr) {
-              dflash_path = env;
-            }
-          }
-          if (dflash_path.empty()) {
-            dflash_path = opt.model_path;
-          }
-          hip::QwenDFlashGpuDraftConfig cfg{
-              .max_context = static_cast<std::uint32_t>(required_context),
-              .max_draft_tokens = opt.draft_tokens,
-              .draft_p_min = opt.draft_p_min,
-          };
-          draft_backend = hip::QwenDFlashGpuDraftBackend::CreateFromGguf(
-              dflash_path, gpu_exec->GetSharedModel(), cfg, &err);
-          if (draft_backend == nullptr) {
-            throw std::runtime_error("DFlash initialization failed: " + err);
-          }
-        } else if (opt.speculative_backend == "mtp" ||
-                   opt.speculative_backend == "mtp-npu") {
+        if (opt.speculative_backend == "mtp" ||
+            opt.speculative_backend == "mtp-npu") {
           hip::QwenMtpGpuDraftConfig cfg{
               .max_context = static_cast<std::uint32_t>(required_context),
               .max_draft_tokens = opt.draft_tokens,
@@ -1621,40 +1639,23 @@ int RunBench(std::span<const char* const> args) {
           cfg.max_draft_tokens = opt.draft_tokens;
           cfg.vocab_size = config.vocab_size;
           draft_backend = std::make_unique<heterogeneous::NpuDraftBackend>(cfg);
-        } else if (opt.speculative_backend == "pld" ||
-                   opt.speculative_backend == "lookup") {
-          speculative::PromptLookupConfig cfg;
-          cfg.max_draft_tokens = opt.draft_tokens;
-          draft_backend =
-              std::make_unique<speculative::PromptLookupDraftBackend>(cfg);
         }
 
-        std::unique_ptr<speculative::SpeculativeVerifier> spec_verifier;
+        std::unique_ptr<speculative::SpeculativeVerifier> owned_spec_verifier;
+        auto* spec_verifier = dflash_verifier.get();
         if (draft_backend) {
           speculative::SpeculativeOptions s_opts;
           s_opts.max_draft_tokens = opt.draft_tokens;
           s_opts.min_draft_tokens = opt.min_draft_tokens;
           s_opts.initial_draft_tokens = opt.draft_tokens;
-          const bool block_diffusion_draft =
-              opt.speculative_backend == "dflash" ||
-              opt.speculative_backend == "dflash2" ||
-              opt.speculative_backend == "dflash-2";
-          s_opts.enable_adaptive_draft_length = !block_diffusion_draft;
-          if (opt.speculative_backend == "dflash" ||
-              opt.speculative_backend == "dflash2" ||
-              opt.speculative_backend == "dflash-2") {
+          if (opt.speculative_backend == "mtp" ||
+              opt.speculative_backend == "mtp-npu") {
             s_opts.use_batched_verification = true;
-            s_opts.use_batched_lm_head = true;
-            s_opts.target_bf16_from_layer = 48;
-          } else if (opt.speculative_backend == "mtp" ||
-                     opt.speculative_backend == "mtp-npu") {
-            s_opts.use_batched_verification = true;
-            s_opts.use_batched_lm_head = true;
-            s_opts.target_bf16_from_layer = 0;
-            s_opts.target_fp32_from_layer = 63;
           }
-          spec_verifier = std::make_unique<speculative::SpeculativeVerifier>(
-              *gpu_exec, std::move(draft_backend), s_opts);
+          owned_spec_verifier =
+              std::make_unique<speculative::SpeculativeVerifier>(
+                  *gpu_exec, std::move(draft_backend), s_opts);
+          spec_verifier = owned_spec_verifier.get();
         }
 
         std::vector<tokenization::TokenId> speculative_sequence;
@@ -1664,7 +1665,9 @@ int RunBench(std::span<const char* const> args) {
           speculative_sequence =
               MakeBenchmarkTokens(depth > 0 ? depth : std::size_t{16});
           speculative_current_token =
-              spec_verifier->Prime(speculative_sequence);
+              dflash_verifier && depth > 0
+                  ? prepared_next_token
+                  : spec_verifier->Prime(speculative_sequence);
           speculative_current_pos =
               static_cast<std::uint32_t>(speculative_sequence.size());
           speculative_sequence.push_back(speculative_current_token);
@@ -1687,6 +1690,9 @@ int RunBench(std::span<const char* const> args) {
         }
         HIP_CHECK(hipDeviceSynchronize());
 
+        std::vector<tokenization::TokenId> generated;
+        if (opt.verbose)
+          generated.reserve(g_len);
         const auto t0 = std::chrono::high_resolution_clock::now();
         if (spec_verifier) {
           std::size_t emitted = 0;
@@ -1697,6 +1703,8 @@ int RunBench(std::span<const char* const> args) {
                 static_cast<std::uint32_t>(g_len - emitted));
             for (const auto t : step_res.emitted_tokens) {
               speculative_sequence.push_back(t);
+              if (opt.verbose)
+                generated.push_back(t);
               ++speculative_current_pos;
               ++emitted;
               if (emitted >= g_len) {
@@ -1725,10 +1733,22 @@ int RunBench(std::span<const char* const> args) {
             greedy_current_token = gpu_exec->ForwardToken(greedy_current_token,
                                                           greedy_current_pos);
             ++greedy_current_pos;
+            if (opt.verbose)
+              generated.push_back(greedy_current_token);
           }
         }
         HIP_CHECK(hipDeviceSynchronize());
         const auto t1 = std::chrono::high_resolution_clock::now();
+        if (opt.verbose) {
+          const auto* bytes =
+              reinterpret_cast<const std::uint8_t*>(generated.data());
+          std::cerr << "[QwenBenchTrace]: depth=" << depth
+                    << " count=" << generated.size() << " sha256="
+                    << crypto::Sha256Hex(std::span(
+                           bytes,
+                           generated.size() * sizeof(tokenization::TokenId)))
+                    << '\n';
+        }
 
         const double elapsed_sec =
             std::chrono::duration<double>(t1 - t0).count();

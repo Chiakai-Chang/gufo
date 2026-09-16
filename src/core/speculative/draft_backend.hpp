@@ -21,7 +21,6 @@ struct DraftProposal {
   std::vector<tokenization::TokenId> candidate_ids;
   std::vector<float> candidate_probabilities;
   std::size_t candidates_per_token{0};
-  float confidence{1.0F};
   std::uint32_t start_pos{0};
 };
 
@@ -30,6 +29,19 @@ struct DraftTargetContext {
   std::span<const float> prompt_hidden_states;
   std::size_t hidden_size{0};
   tokenization::TokenId first_token{0};
+};
+
+class IDraftBackend;
+
+/// Independent requests that may share a draft-model forward pass. Each RNG
+/// belongs to its request; batching must preserve its proposal distribution.
+struct DraftProposalRequest {
+  IDraftBackend* backend{nullptr};
+  std::span<const tokenization::TokenId> tokens;
+  std::uint32_t position{0};
+  std::uint32_t max_tokens{0};
+  float temperature{0.0F};
+  std::uint64_t* rng_state{nullptr};
 };
 
 class IDraftBackendSnapshot {
@@ -74,7 +86,10 @@ public:
       std::uint32_t current_pos, std::uint32_t max_tokens) = 0;
 
   /// Samples proposals from the draft distribution and returns each sparse
-  /// proposal row needed by lossless speculative rejection sampling.
+  /// proposal row needed by lossless speculative rejection sampling. A row
+  /// must describe the distribution actually sampled, conditional on earlier
+  /// proposals. Do not discard a sampled token based on its own probability:
+  /// that conditions the proposal without updating its reported distribution.
   [[nodiscard]] virtual DraftProposal ProposeSampled(
       std::span<const tokenization::TokenId> prompt_tokens,
       std::uint32_t current_pos, std::uint32_t max_tokens, float temperature,
@@ -94,6 +109,32 @@ public:
     return false;
   }
 
+  /// Providers can share projections while retaining separate request state.
+  /// The default preserves the ordinary per-request proposal operations.
+  [[nodiscard]] virtual std::vector<DraftProposal> ProposeBatch(
+      std::span<const DraftProposalRequest> requests) {
+    for (std::size_t index = 0; index < requests.size(); ++index) {
+      if (requests[index].backend == nullptr)
+        throw std::invalid_argument("draft batch contains a null backend");
+      for (std::size_t previous = 0; previous < index; ++previous) {
+        if (requests[index].backend == requests[previous].backend)
+          throw std::invalid_argument("draft batch repeats a session");
+      }
+    }
+    std::vector<DraftProposal> proposals;
+    proposals.reserve(requests.size());
+    for (const auto& request : requests) {
+      proposals.push_back(
+          request.temperature > 0.0F
+              ? request.backend->ProposeSampled(
+                    request.tokens, request.position, request.max_tokens,
+                    request.temperature, request.rng_state)
+              : request.backend->Propose(request.tokens, request.position,
+                                         request.max_tokens));
+    }
+    return proposals;
+  }
+
   /// Returns true when the backend consumes target-model hidden states.
   [[nodiscard]] virtual bool RequiresTargetHiddenStates() const noexcept {
     return false;
@@ -110,6 +151,23 @@ public:
   [[nodiscard]] virtual bool PrimeTargetContext(
       const DraftTargetContext& context) {
     (void)context;
+    return true;
+  }
+
+  /// Appends externally supplied tokens and their target features to an
+  /// already primed draft. Position is the first new target input position.
+  [[nodiscard]] virtual bool AppendTargetContext(
+      const DraftTargetContext& context, std::uint32_t position) {
+    (void)position;
+    if (context.hidden_size == 0 ||
+        context.prompt_hidden_states.size() !=
+            context.prompt_tokens.size() * context.hidden_size) {
+      return false;
+    }
+    for (std::size_t row = 0; row < context.prompt_tokens.size(); ++row) {
+      UpdateTargetHidden(context.prompt_hidden_states.subspan(
+          row * context.hidden_size, context.hidden_size));
+    }
     return true;
   }
 
@@ -151,6 +209,10 @@ public:
 
   /// Resets internal draft generator state
   virtual void Reset() noexcept {}
+
+  /// Starts a new generation over retained model state. Request-local proposal
+  /// policies must reset so cache reuse does not change seeded generation.
+  virtual void BeginRequest() noexcept {}
 };
 
 /// Mock / test draft backend for deterministic verification testing

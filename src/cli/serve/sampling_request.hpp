@@ -92,6 +92,29 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
   }
   *output = defaults;
 
+  // These controls alter proposal/target probabilities. Reject unsupported
+  // spellings instead of accepting a request with a different distribution.
+  for (const auto& [field, value] : body.members()) {
+    const bool draft_control = field.starts_with("draft_") ||
+                               field.ends_with("_draft") || field == "draft" ||
+                               field == "speculative";
+    if (draft_control || field == "samplers" || field == "typical_p" ||
+        field == "tfs_z" || field == "mirostat" || field == "mirostat_eta" ||
+        field == "mirostat_tau" || field == "dynatemp_range" ||
+        field == "dynatemp_exponent" || field.starts_with("xtc_") ||
+        field.starts_with("dry_") || field == "top_n_sigma" ||
+        field == "logit_bias") {
+      return SamplingRequestError{
+          .message =
+              "request field '" + field + "' is not supported" +
+              (draft_control ? "; DFlash2 uses the target temperature and its "
+                               "trained draft selector"
+                             : ""),
+          .code = "unsupported_sampling",
+      };
+    }
+  }
+
   if (auto error = detail::ReadSamplingFloat(body, "temperature",
                                              &output->temperature)) {
     return error;

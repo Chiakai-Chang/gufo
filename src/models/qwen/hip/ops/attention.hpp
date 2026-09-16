@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 
 #include "src/core/gguf_reader.hpp"
 
@@ -22,15 +23,6 @@ void LaunchFusedQKVProjections(const void* q_w, core::GgmlType q_type,
                                std::size_t kv_dim, std::size_t hidden_size,
                                hipStream_t stream = nullptr);
 
-/// Fused layer pre-RMSNorm + QKV projections (opt-c010-rmsnorm-projection).
-/// Computes the norm over x and feeds the projections, matching the unfused
-/// RMSNormKernel + LaunchFusedQKVProjections chain bit-for-bit.
-void LaunchFusedRMSNormQKVProjections(
-    const float* x, const float* norm_w, float eps, const void* q_w,
-    bool q_is_bf16, const void* k_w, bool k_is_bf16, const void* v_w,
-    bool v_is_bf16, float* q_out, float* k_out, float* v_out, std::size_t q_dim,
-    std::size_t kv_dim, std::size_t hidden_size, hipStream_t stream = nullptr);
-
 /// Computes Grouped-Query Softmax Attention with KV-cache and optional gating
 /// on GPU. Production supplies canonical FP16 K/V; the independent validation
 /// fallback supplies FP32 K/V. Tests may supply both representations. When
@@ -45,6 +37,18 @@ void LaunchAttention(const float* q, const float* k, const float* v,
                      hipStream_t stream = nullptr,
                      float* split_k_scratch = nullptr,
                      bool skip_kv_write = false);
+
+/// Runs consecutive verification queries with scalar decode arithmetic.
+/// The selected KV cache must already contain all rows. Each row sees only
+/// its causal prefix. Scratch for batch_size rows batches split-K too; a
+/// smaller span retains the scalar split-K fallback.
+void LaunchCausalDecodeAttention(
+    const float* q, const float* gate, float* k_cache, float* v_cache,
+    void* k_cache_f16, void* v_cache_f16, float* out_context,
+    std::uint32_t layer_idx, std::uint32_t start_pos, std::size_t batch_size,
+    std::uint32_t max_context, std::uint32_t num_heads,
+    std::uint32_t num_kv_heads, std::uint32_t head_dim,
+    hipStream_t stream = nullptr, std::span<float> split_k_scratch = {});
 
 /// Computes Grouped-Query Softmax Attention reading position from device memory
 void LaunchAttention(const float* q, const float* k, const float* v,
@@ -132,27 +136,6 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     hipStream_t stream = nullptr, float* lse_out = nullptr,
     std::uint32_t key_begin = 0, bool skip_kv_write = false);
-
-[[nodiscard]] bool LaunchQwenAotritonPrefixAttention(
-    const __half* q_half, const void* k_cache_f16, const void* v_cache_f16,
-    __half* out_prefix, float* lse_prefix, std::size_t batch_size,
-    std::uint32_t prefix_length, std::uint32_t num_heads,
-    std::uint32_t num_kv_heads, std::uint32_t head_dim,
-    hipStream_t stream = nullptr);
-
-/// Converts FP32 queries to FP16 in place-compatible [token][head][dim] order.
-void LaunchConvertQueriesToHalf(const float* q, void* q_half,
-                                std::size_t num_elements,
-                                hipStream_t stream = nullptr);
-
-/// Combines the prefix and diagonal partial attentions by log-sum-exp and
-/// applies the SiLU gate to the merged result.
-void LaunchMergeSplitAttention(const void* out_prefix, const float* lse_prefix,
-                               const float* out_diag, const float* lse_diag,
-                               const float* gate, float* out,
-                               std::size_t batch_size, std::uint32_t num_heads,
-                               std::uint32_t head_dim,
-                               hipStream_t stream = nullptr);
 
 /// Causal GQA through ROCm Composable Kernel. Inputs and outputs remain FP32
 /// at the executor boundary; the fused attention operator uses FP16 tiles with

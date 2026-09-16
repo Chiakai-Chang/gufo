@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cmath>
@@ -22,6 +23,7 @@
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops.hpp"
+#include "src/models/qwen/hip/ops/prefill_fp16.hpp"
 #include "src/models/qwen/modules/ffn.hpp"
 #include "src/models/qwen/modules/layer_view.hpp"
 #include "src/models/qwen/modules/module_ctx.hpp"
@@ -30,7 +32,194 @@
 #include "src/models/qwen/modules/residual.hpp"
 #include "tests/models/qwen/hip/support/bfloat16.hpp"
 #include "tests/models/qwen/hip/support/device.hpp"
+#include "tests/models/qwen/hip/support/device_buffer.hpp"
 #include "tests/models/qwen/support/synthetic_weights.hpp"
+
+void TestConcurrentSsmRecurrence() {
+  using gufo::test::DeviceBuffer;
+  using Storage = gufo::hip::QwenRecurrentStateStorage;
+  constexpr std::size_t count = 8, total_rows = 36, layers = 2;
+  constexpr unsigned heads = 4, key_heads = 2, dim = 128, layer = 1;
+  constexpr std::size_t inner = heads * dim;
+  constexpr std::size_t qkv = 2 * key_heads * dim + inner;
+  constexpr std::size_t conv_per_sequence = layers * qkv * 4;
+  constexpr std::size_t state_per_sequence = layers * heads * dim * dim;
+  constexpr std::size_t replay_qkv = layers * gufo::hip::kSsmReplayCapacity * qkv;
+  constexpr std::size_t replay_control =
+      layers * gufo::hip::kSsmReplayCapacity * heads;
+  const auto values = [](std::size_t size, float phase) {
+    std::vector<float> result(size);
+    for (std::size_t i = 0; i < size; ++i)
+      result[i] = 0.1F * std::sin(phase + static_cast<float>(i) * 0.013F);
+    return result;
+  };
+  DeviceBuffer<float> input(values(total_rows * qkv, 1)),
+      weights(values(qkv * 4, 2)), controls(values(total_rows * heads * 2, 3)),
+      decay(std::vector<float>(heads, -0.15F)), dt(values(heads, 4)),
+      norm(std::vector<float>(dim, 1)), gate(values(total_rows * inner, 5)),
+      conv_state(count * conv_per_sequence), conv_output(total_rows * qkv),
+      output(total_rows * inner), captured_qkv(count * replay_qkv),
+      captured_alpha(count * replay_control),
+      captured_beta(count * replay_control);
+  const auto initial_conv = values(count * conv_per_sequence, 6);
+  const auto initial_state = values(count * state_per_sequence, 7);
+  std::vector<std::uint32_t> positions(total_rows), enabled(count);
+  std::array<gufo::hip::SsmSequenceState, count> sequences{};
+  std::size_t offset = 0;
+  for (std::size_t i = 0; i < count; ++i) {
+    sequences[i].row_offset = static_cast<std::uint32_t>(offset);
+    sequences[i].rows = static_cast<std::uint32_t>(i + 1);
+    for (std::size_t row = 0; row <= i; ++row)
+      positions[offset + row] = static_cast<std::uint32_t>(14 + i + row);
+    enabled[i] = i % 2;
+    offset += i + 1;
+  }
+  DeviceBuffer<std::uint32_t> device_positions(positions), device_enabled(enabled);
+  const auto clear = [](auto& buffer) {
+    HIP_CHECK(hipMemset(buffer.data(), 0,
+                        buffer.size() * sizeof(*buffer.data())));
+  };
+  const auto expect_equal = [](const auto& expected, const auto& actual) {
+    if (expected.size() != actual.size() ||
+        std::memcmp(expected.data(), actual.data(),
+                    expected.size() * sizeof(expected[0])) != 0)
+      throw std::runtime_error("concurrent SSM changed output, state or replay");
+  };
+  for (const auto storage : {Storage::kFp32, Storage::kBf16}) {
+    const std::size_t element_bytes =
+        gufo::hip::QwenRecurrentStateElementBytes(storage);
+    std::vector<std::uint8_t> state_bytes(initial_state.size() * element_bytes);
+    for (std::size_t i = 0; i < initial_state.size(); ++i) {
+      if (storage == Storage::kFp32) {
+        std::memcpy(state_bytes.data() + i * element_bytes, &initial_state[i],
+                    element_bytes);
+      } else {
+        const auto bits = gufo::test::FloatToBf16Bits(initial_state[i]);
+        std::memcpy(state_bytes.data() + i * element_bytes, &bits, element_bytes);
+      }
+    }
+    DeviceBuffer<std::uint8_t> recurrent(state_bytes);
+    for (std::size_t i = 0; i < count; ++i) {
+      auto& sequence = sequences[i];
+      sequence.conv = conv_state.data() + i * conv_per_sequence;
+      sequence.recurrent = recurrent.data() + i * state_per_sequence * element_bytes;
+      sequence.replay = {
+          captured_qkv.data() + i * replay_qkv,
+          captured_alpha.data() + i * replay_control,
+          captured_beta.data() + i * replay_control,
+          device_positions.data() + sequence.row_offset, device_enabled.data() + i};
+    }
+    const auto reset = [&] {
+      conv_state.CopyFrom(initial_conv);
+      recurrent.CopyFrom(state_bytes);
+      for (auto* buffer : {&conv_output, &output, &captured_qkv,
+                            &captured_alpha, &captured_beta})
+        clear(*buffer);
+    };
+    for (const std::size_t width : {1U, 2U, 4U, 6U, 8U}) {
+      for (const bool write_output : {false, true}) {
+        reset();
+        for (const auto& sequence : std::span(sequences).first(width)) {
+          const std::size_t row = sequence.row_offset;
+          gufo::hip::LaunchSSMConvRecurrenceRows(
+              input.data() + row * qkv, weights.data(), sequence.conv,
+              conv_output.data() + row * qkv, sequence.recurrent,
+              controls.data() + row * heads * 2,
+              controls.data() + row * heads * 2 + heads, decay.data(), dt.data(),
+              norm.data(), gate.data() + row * inner,
+              write_output ? output.data() + row * inner : nullptr, layer, qkv,
+              key_heads, heads, dim, dim, sequence.rows, heads * 2, inner,
+              nullptr, sequence.replay, storage);
+        }
+        const auto expected_state = recurrent.CopyToHost();
+        std::vector<std::vector<float>> expected;
+        for (auto* buffer : {&conv_state, &conv_output, &output, &captured_qkv,
+                              &captured_alpha, &captured_beta})
+          expected.push_back(buffer->CopyToHost());
+        reset();
+        gufo::hip::LaunchSSMConvRecurrenceBatch(
+            input.data(), weights.data(), conv_output.data(), controls.data(),
+            controls.data() + heads, decay.data(), dt.data(), norm.data(),
+            gate.data(), write_output ? output.data() : nullptr,
+            std::span(sequences).first(width), layer, qkv, key_heads, heads,
+            dim, dim, heads * 2, inner, nullptr, storage);
+        expect_equal(expected_state, recurrent.CopyToHost());
+        std::size_t index = 0;
+        for (auto* buffer : {&conv_state, &conv_output, &output, &captured_qkv,
+                              &captured_alpha, &captured_beta})
+          expect_equal(expected[index++], buffer->CopyToHost());
+      }
+    }
+  }
+  std::cout << "Concurrent SSM: FP32/BF16 state, ragged rows and replay exact\n";
+}
+
+void TestRecurrentRollbackRows(bool large_state) {
+  using gufo::hip::QwenRecurrentStateStorage;
+  for (const auto storage :
+       {QwenRecurrentStateStorage::kFp32, QwenRecurrentStateStorage::kBf16}) {
+    for (const auto [layers, interval] : {std::pair{4U, 4U},
+                                          {7U, 4U},
+                                          {3U, 4U},
+                                          {4U, 2U},
+                                          {4U, 1U},
+                                          {4U, 0U}}) {
+      auto config = gufo::models::qwen::make_small_qwen_config();
+      if (large_state) {
+        config.ssm_time_step_rank = 48;
+        config.ssm_state_size = 128;
+        config.ssm_inner_size = 48 * 128;
+      }
+      config.num_layers = layers;
+      config.full_attention_interval = interval;
+      auto policy = gufo::hip::QwenExecutionPolicy::Production();
+      policy.recurrent_state_storage = storage;
+      gufo::hip::QwenGpuArena arena(config, 16, policy);
+      const std::size_t conv_row =
+          config.SsmQkvSize() * config.ssm_conv_kernel * sizeof(float);
+      const std::size_t delta_row =
+          config.ssm_time_step_rank * config.ssm_state_size *
+          config.SsmValueSize() *
+          gufo::hip::QwenRecurrentStateElementBytes(storage);
+      std::vector<std::uint8_t> conv(layers * conv_row),
+          delta(layers * delta_row);
+      // A second save must replace the first snapshot, including a tail group.
+      for (unsigned generation = 0; generation < 2; ++generation) {
+        for (auto* values : {&conv, &delta}) {
+          for (std::size_t i = 0; i < values->size(); ++i) {
+            (*values)[i] = (i * 17U + i / 13U + generation * 23U) % 256U;
+          }
+        }
+        HIP_CHECK(hipMemcpy(arena.d_ssm_conv_state, conv.data(), conv.size(),
+                            hipMemcpyHostToDevice));
+        HIP_CHECK(hipMemcpy(arena.d_ssm_deltanet_state, delta.data(),
+                            delta.size(), hipMemcpyHostToDevice));
+        arena.SaveState(7);
+        HIP_CHECK(hipMemset(arena.d_ssm_conv_state, 0x5A, conv.size()));
+        HIP_CHECK(hipMemset(arena.d_ssm_deltanet_state, 0x5A, delta.size()));
+        arena.RestoreState();
+        const auto check = [&](const void* device,
+                               const std::vector<std::uint8_t>& expected,
+                               std::size_t row_bytes) {
+          std::vector<std::uint8_t> actual(expected.size());
+          HIP_CHECK(hipMemcpy(actual.data(), device, actual.size(),
+                              hipMemcpyDeviceToHost));
+          for (unsigned layer = 0; layer < layers; ++layer) {
+            const bool recurrent = interval == 0 || (layer + 1) % interval;
+            for (std::size_t i = layer * row_bytes; i < (layer + 1) * row_bytes;
+                 ++i) {
+              if (actual[i] != (recurrent ? expected[i] : 0x5A)) {
+                throw std::runtime_error("rollback changed recurrent state");
+              }
+            }
+          }
+        };
+        check(arena.d_ssm_conv_state, conv, conv_row);
+        check(arena.d_ssm_deltanet_state, delta, delta_row);
+      }
+    }
+  }
+}
 
 void TestBf16RecurrentMemoryAndSnapshot() {
   gufo::core::ModelConfig production;
@@ -122,8 +311,53 @@ void TestBf16RecurrentMemoryAndSnapshot() {
   }
 }
 
+// Independent causal-convolution oracle, including nonzero carried history.
+// Only short batches need scalar output checks; all batches check the exact tail.
+void CheckSSMConvolution(const std::vector<float>& input,
+                         const std::vector<float>& weights,
+                         const std::vector<float>& history,
+                         const float* device_output, const float* device_state,
+                         std::size_t batch, std::size_t channels) {
+  std::vector<float> state(channels * 4);
+  HIP_CHECK(hipMemcpy(state.data(), device_state, state.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+  for (std::size_t c = 0; c < channels; ++c) {
+    for (std::size_t j = 0; j < 4; ++j) {
+      const float expected = batch + j < 4
+                                 ? history[(c * 4) + batch + j]
+                                 : input[((batch + j - 4) * channels) + c];
+      if (std::memcmp(&expected, &state[(c * 4) + j], sizeof(float)) != 0) {
+        throw std::runtime_error("convolution history differs from causal tail");
+      }
+    }
+  }
+  if (batch > 8) {
+    return;
+  }
+  std::vector<float> output(batch * channels);
+  HIP_CHECK(hipMemcpy(output.data(), device_output,
+                      output.size() * sizeof(float), hipMemcpyDeviceToHost));
+  for (std::size_t t = 0; t < batch; ++t) {
+    for (std::size_t c = 0; c < channels; ++c) {
+      double dot = 0.0;
+      for (std::size_t j = 0; j < 4; ++j) {
+        const float value = t + j < 3
+                                ? history[(c * 4) + t + j + 1]
+                                : input[((t + j - 3) * channels) + c];
+        dot += static_cast<double>(value) * weights[(c * 4) + j];
+      }
+      const double expected = dot / (1.0 + std::exp(-dot));
+      const float actual = output[(t * channels) + c];
+      if (!std::isfinite(actual) ||
+          std::abs(actual - expected) > 2e-6 * (1.0 + std::abs(expected))) {
+        throw std::runtime_error("convolution differs from causal formula");
+      }
+    }
+  }
+}
+
 void TestBatchedSSMConvEquivalence() {
-  constexpr std::size_t batch = 4;
+  constexpr std::size_t batch = 8;
   constexpr std::uint32_t num_key_heads = 16;
   constexpr std::uint32_t num_heads = 48;
   constexpr std::uint32_t key_dim = 128;
@@ -282,6 +516,57 @@ void TestBatchedSSMConvEquivalence() {
     std::abort();
   }
 
+  // Verification and rollback replay must preserve every state bit. Reuse the
+  // existing buffers to cover both storage formats, per-row and whole-block
+  // dispatch, and omission of outputs that replay never consumes.
+  const auto expect_device_equal = [](const void* expected, const void* actual,
+                                      std::size_t bytes) {
+    std::vector<std::uint8_t> reference(bytes), candidate(bytes);
+    HIP_CHECK(
+        hipMemcpy(reference.data(), expected, bytes, hipMemcpyDeviceToHost));
+    HIP_CHECK(
+        hipMemcpy(candidate.data(), actual, bytes, hipMemcpyDeviceToHost));
+    if (reference != candidate) {
+      throw std::runtime_error("SSM verification/replay changed stored bits");
+    }
+  };
+  using Storage = gufo::hip::QwenRecurrentStateStorage;
+  for (const auto storage : {Storage::kFp32, Storage::kBf16}) {
+    const std::size_t state_bytes =
+        delta_size * gufo::hip::QwenRecurrentStateElementBytes(storage);
+    const void* reference_state = storage == Storage::kFp32
+                                      ? static_cast<void*>(d_delta_seq)
+                                      : d_delta_bf16;
+    const float* reference_output =
+        storage == Storage::kFp32 ? d_out_seq : d_out_bf16;
+    for (const bool write_output : {true, false}) {
+      for (const auto rows_per_launch : {std::size_t{1}, batch}) {
+        HIP_CHECK(hipMemset(d_state_batch, 0, qkv_dim * 4 * sizeof(float)));
+        HIP_CHECK(hipMemset(d_delta_batch, 0, state_bytes));
+        for (std::size_t offset = 0; offset < batch;
+             offset += rows_per_launch) {
+          gufo::hip::LaunchSSMConvRecurrenceRows(
+              d_qkv + offset * qkv_dim, d_w, d_state_batch, d_conv_out_batch,
+              d_delta_batch, d_alpha + offset * num_heads,
+              d_beta + offset * num_heads, d_ssm_a, d_ssm_dt, d_ssm_norm,
+              d_gate + offset * inner_size,
+              write_output ? d_out_batch + offset * inner_size : nullptr, 0,
+              qkv_dim, num_key_heads, num_heads, key_dim, val_dim,
+              static_cast<std::uint32_t>(rows_per_launch), num_heads,
+              inner_size, nullptr, {}, storage);
+        }
+        expect_device_equal(reference_state, d_delta_batch, state_bytes);
+        expect_device_equal(d_state_seq, d_state_batch,
+                            qkv_dim * 4 * sizeof(float));
+        if (write_output) {
+          expect_device_equal(reference_output, d_out_batch,
+                              batch * inner_size * sizeof(float));
+        }
+      }
+    }
+  }
+  std::cout << "SSM verification and state-only replay: bit-exact\n";
+
   HIP_CHECK(hipFree(d_qkv));
   HIP_CHECK(hipFree(d_w));
   HIP_CHECK(hipFree(d_state_seq));
@@ -302,132 +587,6 @@ void TestBatchedSSMConvEquivalence() {
   HIP_CHECK(hipFree(d_out_seq));
   HIP_CHECK(hipFree(d_out_batch));
   HIP_CHECK(hipFree(d_out_bf16));
-}
-
-void TestBatchedSSMRecurrenceNormGateEquivalence() {
-  constexpr std::size_t batch = 4;
-  constexpr std::uint32_t num_key_heads = 16;
-  constexpr std::uint32_t num_heads = 48;
-  constexpr std::uint32_t key_dim = 128;
-  constexpr std::uint32_t val_dim = 128;
-  constexpr std::size_t qkv_dim =
-      (2 * num_key_heads * key_dim) + (num_heads * val_dim);
-  constexpr std::size_t inner_size = num_heads * val_dim;
-
-  std::vector<float> h_qkv(batch * qkv_dim);
-  for (std::size_t i = 0; i < h_qkv.size(); ++i) {
-    h_qkv[i] = std::sin(static_cast<float>(i) * 0.01F);
-  }
-  std::vector<float> h_weights(qkv_dim * 4, 0.25F);
-  std::vector<float> h_ssm_a(num_heads, -0.05F);
-  std::vector<float> h_ssm_dt(num_heads, 0.01F);
-  std::vector<float> h_ssm_norm(val_dim);
-  std::vector<float> h_gate(batch * inner_size);
-  for (std::size_t i = 0; i < val_dim; ++i) {
-    h_ssm_norm[i] = 0.9F + 0.05F * static_cast<float>(i % 23);
-  }
-  for (std::size_t i = 0; i < batch * inner_size; ++i) {
-    h_gate[i] = 0.5F * std::sin(static_cast<float>(i + 1) * 0.013F);
-  }
-
-  float *d_qkv = nullptr, *d_w = nullptr;
-  float *d_state_ref = nullptr, *d_state_fus = nullptr;
-  float *d_conv_out_ref = nullptr, *d_conv_out_fus = nullptr;
-  float *d_delta_ref = nullptr, *d_delta_fus = nullptr;
-  float *d_alpha = nullptr, *d_beta = nullptr;
-  float *d_ssm_a = nullptr, *d_ssm_dt = nullptr, *d_ssm_norm = nullptr;
-  float* d_gate = nullptr;
-  float *d_out_ref = nullptr, *d_out_fus = nullptr;
-
-  const std::size_t delta_size = num_heads * key_dim * val_dim;
-  HIP_CHECK(hipMalloc(&d_qkv, batch * qkv_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_w, qkv_dim * 4 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_state_ref, qkv_dim * 4 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_state_fus, qkv_dim * 4 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_conv_out_ref, batch * qkv_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_conv_out_fus, batch * qkv_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_delta_ref, delta_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_delta_fus, delta_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha, batch * num_heads * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta, batch * num_heads * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_a, num_heads * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_dt, num_heads * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_norm, val_dim * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_gate, batch * inner_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_out_ref, batch * inner_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_out_fus, batch * inner_size * sizeof(float)));
-
-  HIP_CHECK(hipMemcpy(d_qkv, h_qkv.data(), batch * qkv_dim * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_w, h_weights.data(), qkv_dim * 4 * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemset(d_state_ref, 0, qkv_dim * 4 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_state_fus, 0, qkv_dim * 4 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_delta_ref, 0, delta_size * sizeof(float)));
-  HIP_CHECK(hipMemset(d_delta_fus, 0, delta_size * sizeof(float)));
-  HIP_CHECK(hipMemset(d_alpha, 0, batch * num_heads * sizeof(float)));
-  HIP_CHECK(hipMemset(d_beta, 0, batch * num_heads * sizeof(float)));
-  HIP_CHECK(hipMemcpy(d_ssm_a, h_ssm_a.data(), num_heads * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_ssm_dt, h_ssm_dt.data(), num_heads * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_ssm_norm, h_ssm_norm.data(), val_dim * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_gate, h_gate.data(), batch * inner_size * sizeof(float),
-                      hipMemcpyHostToDevice));
-
-  // Unfused reference chain: conv + recurrence + post-norm gate.
-  gufo::hip::LaunchBatchedSSMConvRecurrence(
-      d_qkv, d_w, d_state_ref, d_conv_out_ref, d_delta_ref, d_alpha, d_beta,
-      d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_ref, 0, batch, qkv_dim,
-      num_key_heads, num_heads, key_dim, val_dim);
-
-  // Fused: conv + recurrence with the norm+gate in the epilogue.
-  gufo::hip::LaunchBatchedSSMConvRecurrenceNormGate(
-      d_qkv, d_w, d_state_fus, d_conv_out_fus, d_delta_fus, d_alpha, d_beta,
-      d_ssm_a, d_ssm_dt, d_ssm_norm, d_gate, d_out_fus, 0, batch, qkv_dim,
-      num_key_heads, num_heads, key_dim, val_dim);
-
-  HIP_CHECK(hipDeviceSynchronize());
-
-  std::vector<float> res_ref(batch * inner_size);
-  std::vector<float> res_fus(batch * inner_size);
-  HIP_CHECK(hipMemcpy(res_ref.data(), d_out_ref,
-                      batch * inner_size * sizeof(float),
-                      hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(res_fus.data(), d_out_fus,
-                      batch * inner_size * sizeof(float),
-                      hipMemcpyDeviceToHost));
-
-  float max_diff = 0.0F;
-  for (std::size_t i = 0; i < res_ref.size(); ++i) {
-    const float d = std::abs(res_ref[i] - res_fus[i]);
-    if (d > max_diff)
-      max_diff = d;
-  }
-  std::cout << "Batched SSM recurrence+norm+gate fused vs unfused max diff: "
-            << max_diff << "\n";
-  if (max_diff != 0.0F) {
-    std::cerr << "Fused SSM recurrence+norm+gate mismatch\n";
-    std::abort();
-  }
-
-  HIP_CHECK(hipFree(d_qkv));
-  HIP_CHECK(hipFree(d_w));
-  HIP_CHECK(hipFree(d_state_ref));
-  HIP_CHECK(hipFree(d_state_fus));
-  HIP_CHECK(hipFree(d_conv_out_ref));
-  HIP_CHECK(hipFree(d_conv_out_fus));
-  HIP_CHECK(hipFree(d_delta_ref));
-  HIP_CHECK(hipFree(d_delta_fus));
-  HIP_CHECK(hipFree(d_alpha));
-  HIP_CHECK(hipFree(d_beta));
-  HIP_CHECK(hipFree(d_ssm_a));
-  HIP_CHECK(hipFree(d_ssm_dt));
-  HIP_CHECK(hipFree(d_ssm_norm));
-  HIP_CHECK(hipFree(d_gate));
-  HIP_CHECK(hipFree(d_out_ref));
-  HIP_CHECK(hipFree(d_out_fus));
 }
 
 // opt-c170-deltanet-rowsplit: the row-split recurrence spreads the 128 state
@@ -483,6 +642,10 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
   std::vector<float> h_gate(batch * inner_size);
   for (std::size_t i = 0; i < h_gate.size(); ++i) {
     h_gate[i] = 0.5F * std::sin(0.013F * static_cast<float>(i + 1));
+  }
+  std::vector<float> h_history(qkv_dim * 4);
+  for (std::size_t i = 0; i < h_history.size(); ++i) {
+    h_history[i] = 0.4F * std::sin(0.031F * static_cast<float>(i % 211));
   }
   // A non-zero starting state so the decay path is live from the first token.
   std::vector<float> h_delta0(delta_size);
@@ -546,9 +709,9 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
   HIP_CHECK(hipMemcpy(d_delta_bf16, h_delta0_bf16.data(),
                       h_delta0_bf16.size() * sizeof(std::uint16_t),
                       hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemset(d_state_ref, 0, qkv_dim * 4 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_state_new, 0, qkv_dim * 4 * sizeof(float)));
-  HIP_CHECK(hipMemset(d_state_bf16, 0, qkv_dim * 4 * sizeof(float)));
+  upload(d_state_ref, h_history);
+  upload(d_state_new, h_history);
+  upload(d_state_bf16, h_history);
 
   gufo::hip::LaunchBatchedSSMConvRecurrence(
       d_qkv, d_w, d_state_ref, d_conv_ref, d_delta_ref, d_alpha, d_beta,
@@ -572,6 +735,12 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
       gufo::hip::QwenRecurrentStateStorage::kBf16);
 
   HIP_CHECK(hipDeviceSynchronize());
+  CheckSSMConvolution(h_qkv, h_weights, h_history, d_conv_ref, d_state_ref,
+                       batch, qkv_dim);
+  CheckSSMConvolution(h_qkv, h_weights, h_history, d_conv_new, d_state_new,
+                       batch, qkv_dim);
+  CheckSSMConvolution(h_qkv, h_weights, h_history, d_conv_bf16, d_state_bf16,
+                       batch, qkv_dim);
 
   const auto download = [](std::vector<float>& dst, const float* src) {
     HIP_CHECK(hipMemcpy(dst.data(), src, dst.size() * sizeof(float),
@@ -653,15 +822,60 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
   compare_bf16("gated output", out_ref, out_bf16, 3e-2);
   compare_bf16("carried state", delta_ref, delta_bf16, 3e-2);
 
+  // Direct FP16 output must match the original FP32 epilogue followed by a
+  // cast, for both recurrent-state formats and both register-tile sizes.
+  // Reuse the existing scratch and restart from the same nonzero state.
+  for (const bool bf16_state : {false, true}) {
+    gufo::test::DeviceBuffer<std::uint16_t> expected(batch * inner_size);
+    gufo::test::DeviceBuffer<std::uint16_t> actual(batch * inner_size);
+    float* output = bf16_state ? d_out_bf16 : d_out_new;
+    float* conv_state = bf16_state ? d_state_bf16 : d_state_new;
+    float* conv_output = bf16_state ? d_conv_bf16 : d_conv_new;
+    void* state = bf16_state ? d_delta_bf16 : d_delta_new;
+    const auto storage = bf16_state
+                             ? gufo::hip::QwenRecurrentStateStorage::kBf16
+                             : gufo::hip::QwenRecurrentStateStorage::kFp32;
+    gufo::hip::LaunchFloatToFp16(output, expected.data(), batch * inner_size,
+                                 nullptr);
+    upload(conv_state, h_history);
+    if (bf16_state) {
+      HIP_CHECK(hipMemcpy(state, h_delta0_bf16.data(),
+                          delta_size * sizeof(std::uint16_t),
+                          hipMemcpyHostToDevice));
+    } else {
+      upload(static_cast<float*>(state), h_delta0);
+    }
+    gufo::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
+        d_qkv, d_w, conv_state, conv_output, state, d_alpha, d_beta, d_ssm_a,
+        d_ssm_dt, d_ssm_norm, d_gate, output, nullptr, d_kq, d_ab, 0, batch,
+        qkv_dim, num_key_heads, num_heads, key_dim, val_dim, nullptr, storage,
+        actual.data());
+    if (actual.CopyToHost() != expected.CopyToHost()) {
+      throw std::runtime_error("fused SSM FP16 epilogue changed output bits");
+    }
+    std::vector<std::uint8_t> state_bits(
+        delta_size * gufo::hip::QwenRecurrentStateElementBytes(storage));
+    HIP_CHECK(hipMemcpy(state_bits.data(), state, state_bits.size(),
+                        hipMemcpyDeviceToHost));
+    const void* expected_state =
+        bf16_state ? static_cast<void*>(delta_bf16_bits.data())
+                   : static_cast<void*>(delta_new.data());
+    if (std::memcmp(state_bits.data(), expected_state, state_bits.size()) !=
+        0) {
+      throw std::runtime_error("FP16 epilogue changed recurrent state");
+    }
+  }
+  // Restore the FP32 reference consumed by the Q8_1 epilogue check below.
+  upload(d_out_new, out_new);
+
   // opt-c174-ssm-epilogue-quant: with a Q8_1 destination the epilogue quantizes
   // the gated row in the same pass instead of storing FP32 for the quantizer to
   // read back. That has to be byte-for-byte identical to the FP32 path followed
   // by an FP32 quantize, including the per-block scales and the tail-tile
   // zeros.
   if (gufo::hip::IsFusedSSMEpilogueQuantizeQ8_1Supported(val_dim, inner_size)) {
-    const std::size_t num_blocks = inner_size / 32;
     const std::size_t q8_bytes =
-        ((((batch + 15) / 16) * num_blocks * 576)) + 4096;
+        gufo::hip::QuantizedActivationBytes(batch, inner_size) + 4096;
     void* d_q8_ref = nullptr;
     void* d_q8_got = nullptr;
     float* d_state_q8 = nullptr;
@@ -683,7 +897,7 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
 
     // Candidate: the same recurrence from the same starting state, but with the
     // epilogue writing Q8_1.
-    HIP_CHECK(hipMemset(d_state_q8, 0, qkv_dim * 4 * sizeof(float)));
+    upload(d_state_q8, h_history);
     upload(d_delta_q8, h_delta0);
     gufo::hip::LaunchBatchedSSMConvRecurrenceRowSplit(
         d_qkv, d_w, d_state_q8, d_conv_q8, d_delta_q8, d_alpha, d_beta, d_ssm_a,
@@ -730,148 +944,6 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
   }
 }
 
-void TestFusedRMSNormSSMInputProjectionsEquivalence() {
-  constexpr std::size_t hidden_size = 1024;
-  constexpr std::size_t qkv_size = 2048;
-  constexpr std::size_t inner_size = 512;
-  constexpr std::size_t time_step_rank = 16;
-  constexpr float eps = 1e-6F;
-
-  std::vector<float> h_x(hidden_size);
-  std::vector<float> h_w(hidden_size);
-  for (std::size_t i = 0; i < hidden_size; ++i) {
-    h_x[i] = 0.3F * std::sin(static_cast<float>(i) * 0.017F);
-    h_w[i] = 0.9F + 0.05F * static_cast<float>(i % 23);
-  }
-  std::vector<std::uint16_t> h_qkv(qkv_size * hidden_size);
-  std::vector<std::uint16_t> h_gate(inner_size * hidden_size);
-  std::vector<std::uint16_t> h_alpha(time_step_rank * hidden_size);
-  std::vector<std::uint16_t> h_beta(time_step_rank * hidden_size);
-  for (std::size_t i = 0; i < qkv_size * hidden_size; ++i) {
-    h_qkv[i] = gufo::test::FloatToBf16Bits(
-        0.009F * std::cos(static_cast<float>(i) * 0.0019F));
-  }
-  for (std::size_t i = 0; i < inner_size * hidden_size; ++i) {
-    h_gate[i] = gufo::test::FloatToBf16Bits(
-        0.012F * std::sin(static_cast<float>(i) * 0.0011F));
-  }
-  for (std::size_t i = 0; i < time_step_rank * hidden_size; ++i) {
-    h_alpha[i] = gufo::test::FloatToBf16Bits(
-        0.007F * std::cos(static_cast<float>(i) * 0.0023F));
-    h_beta[i] = gufo::test::FloatToBf16Bits(
-        0.006F * std::sin(static_cast<float>(i) * 0.0029F));
-  }
-
-  float *d_x = nullptr, *d_w = nullptr, *d_normed = nullptr;
-  void *d_qkv = nullptr, *d_gate = nullptr, *d_alpha = nullptr;
-  void* d_beta = nullptr;
-  float *d_qkv_ref = nullptr, *d_gate_ref = nullptr, *d_alpha_ref = nullptr;
-  float* d_beta_ref = nullptr;
-  float *d_qkv_fus = nullptr, *d_gate_fus = nullptr, *d_alpha_fus = nullptr;
-  float* d_beta_fus = nullptr;
-  HIP_CHECK(hipMalloc(&d_x, hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_w, hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_normed, hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_qkv, qkv_size * hidden_size * sizeof(std::uint16_t)));
-  HIP_CHECK(
-      hipMalloc(&d_gate, inner_size * hidden_size * sizeof(std::uint16_t)));
-  HIP_CHECK(hipMalloc(&d_alpha,
-                      time_step_rank * hidden_size * sizeof(std::uint16_t)));
-  HIP_CHECK(
-      hipMalloc(&d_beta, time_step_rank * hidden_size * sizeof(std::uint16_t)));
-  HIP_CHECK(hipMalloc(&d_qkv_ref, qkv_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_gate_ref, inner_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha_ref, time_step_rank * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta_ref, time_step_rank * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_qkv_fus, qkv_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_gate_fus, inner_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha_fus, time_step_rank * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta_fus, time_step_rank * sizeof(float)));
-  HIP_CHECK(hipMemcpy(d_x, h_x.data(), hidden_size * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_w, h_w.data(), hidden_size * sizeof(float),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_qkv, h_qkv.data(),
-                      qkv_size * hidden_size * sizeof(std::uint16_t),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_gate, h_gate.data(),
-                      inner_size * hidden_size * sizeof(std::uint16_t),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_alpha, h_alpha.data(),
-                      time_step_rank * hidden_size * sizeof(std::uint16_t),
-                      hipMemcpyHostToDevice));
-  HIP_CHECK(hipMemcpy(d_beta, h_beta.data(),
-                      time_step_rank * hidden_size * sizeof(std::uint16_t),
-                      hipMemcpyHostToDevice));
-
-  gufo::hip::LaunchRMSNorm(d_x, d_w, d_normed, hidden_size, eps);
-  gufo::hip::LaunchFusedSSMInputProjections(
-      d_qkv, gufo::core::GgmlType::kBF16, d_gate, gufo::core::GgmlType::kBF16,
-      d_alpha, gufo::core::GgmlType::kBF16, d_beta, gufo::core::GgmlType::kBF16,
-      d_normed, d_qkv_ref, d_gate_ref, d_alpha_ref, d_beta_ref, hidden_size,
-      qkv_size, inner_size, time_step_rank);
-  gufo::hip::LaunchFusedRMSNormSSMInputProjections(
-      d_x, d_w, eps, d_qkv, true, d_gate, true, d_alpha, true, d_beta, true,
-      d_qkv_fus, d_gate_fus, d_alpha_fus, d_beta_fus, hidden_size, qkv_size,
-      inner_size, time_step_rank);
-  HIP_CHECK(hipDeviceSynchronize());
-
-  std::vector<float> qkv_ref(qkv_size), gate_ref(inner_size);
-  std::vector<float> alpha_ref(time_step_rank), beta_ref(time_step_rank);
-  std::vector<float> qkv_fus(qkv_size), gate_fus(inner_size);
-  std::vector<float> alpha_fus(time_step_rank), beta_fus(time_step_rank);
-  HIP_CHECK(hipMemcpy(qkv_ref.data(), d_qkv_ref, qkv_size * sizeof(float),
-                      hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(gate_ref.data(), d_gate_ref, inner_size * sizeof(float),
-                      hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(alpha_ref.data(), d_alpha_ref,
-                      time_step_rank * sizeof(float), hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(beta_ref.data(), d_beta_ref,
-                      time_step_rank * sizeof(float), hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(qkv_fus.data(), d_qkv_fus, qkv_size * sizeof(float),
-                      hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(gate_fus.data(), d_gate_fus, inner_size * sizeof(float),
-                      hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(alpha_fus.data(), d_alpha_fus,
-                      time_step_rank * sizeof(float), hipMemcpyDeviceToHost));
-  HIP_CHECK(hipMemcpy(beta_fus.data(), d_beta_fus,
-                      time_step_rank * sizeof(float), hipMemcpyDeviceToHost));
-
-  float max_diff = 0.0F;
-  for (std::size_t i = 0; i < qkv_size; ++i) {
-    max_diff = std::max(max_diff, std::abs(qkv_ref[i] - qkv_fus[i]));
-  }
-  for (std::size_t i = 0; i < inner_size; ++i) {
-    max_diff = std::max(max_diff, std::abs(gate_ref[i] - gate_fus[i]));
-  }
-  for (std::size_t i = 0; i < time_step_rank; ++i) {
-    max_diff = std::max(max_diff, std::abs(alpha_ref[i] - alpha_fus[i]));
-    max_diff = std::max(max_diff, std::abs(beta_ref[i] - beta_fus[i]));
-  }
-  std::cout << "Fused RMSNorm+SSM-input vs unfused max diff: " << max_diff
-            << "\n";
-  if (max_diff != 0.0F) {
-    std::cerr << "Fused RMSNorm+SSM-input mismatch\n";
-    std::abort();
-  }
-
-  HIP_CHECK(hipFree(d_x));
-  HIP_CHECK(hipFree(d_w));
-  HIP_CHECK(hipFree(d_normed));
-  HIP_CHECK(hipFree(d_qkv));
-  HIP_CHECK(hipFree(d_gate));
-  HIP_CHECK(hipFree(d_alpha));
-  HIP_CHECK(hipFree(d_beta));
-  HIP_CHECK(hipFree(d_qkv_ref));
-  HIP_CHECK(hipFree(d_gate_ref));
-  HIP_CHECK(hipFree(d_alpha_ref));
-  HIP_CHECK(hipFree(d_beta_ref));
-  HIP_CHECK(hipFree(d_qkv_fus));
-  HIP_CHECK(hipFree(d_gate_fus));
-  HIP_CHECK(hipFree(d_alpha_fus));
-  HIP_CHECK(hipFree(d_beta_fus));
-}
-
 #endif  // defined(ENGINE_ENABLE_HIP)
 
 int main() {
@@ -883,13 +955,16 @@ int main() {
   }
 
   TestBatchedSSMConvEquivalence();
+  TestConcurrentSsmRecurrence();
+  TestRecurrentRollbackRows(false);
+  TestRecurrentRollbackRows(true);
   TestBf16RecurrentMemoryAndSnapshot();
-  TestBatchedSSMRecurrenceNormGateEquivalence();
-  TestBatchedSSMRowSplitRecurrenceEquivalence(96);
+  for (const std::size_t batch : {1U, 2U, 3U, 7U, 96U}) {
+    TestBatchedSSMRowSplitRecurrenceEquivalence(batch);
+  }
   // Above the launcher's 2048-token crossover, so the two-row prefetching tile
   // runs too.
   TestBatchedSSMRowSplitRecurrenceEquivalence(2080);
-  TestFusedRMSNormSSMInputProjectionsEquivalence();
   std::cout << "Qwen ssm ops test passed on gfx1151.\n";
   return 0;
 #else

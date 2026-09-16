@@ -18,16 +18,19 @@ target_sources(gufo_core PRIVATE
   ${PROJECT_SOURCE_DIR}/src/models/qwen/modules/unembed.cpp
    ${PROJECT_SOURCE_DIR}/src/models/qwen/generator.cpp
    ${PROJECT_SOURCE_DIR}/src/models/qwen/mtp_reference.cpp
-   ${PROJECT_SOURCE_DIR}/src/models/qwen/dflash_reference.cpp)
+   ${PROJECT_SOURCE_DIR}/src/models/qwen/dflash_weights.cpp)
 
 if (ENGINE_ENABLE_HIP)
   target_sources(gufo_core PRIVATE
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/attention.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_ssm.hip
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/decode_ops.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_embed.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_gemm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_gemm.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_fp16.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_wave64.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_wave64.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_norm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_residual.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_rope.hip
@@ -43,19 +46,16 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/gemv.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/gemv_quant.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/fused.hip
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/common.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/qkv.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_decode_recurrence.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_recurrence.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_row_split.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/swiglu.hip
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/swiglu_rmsnorm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_batched.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_ck.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_graph.hip
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_split.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_tile.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_wmma.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/hipblas_gemm.hip
@@ -75,7 +75,24 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/mtp/backend.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/model.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/executor.cpp
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/batch.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/dflash/backend.cpp)
+
+  # HIP helpers must share the kernel's wave size, so compile this unit
+  # separately while the other Qwen kernels retain wave32.
+  set_source_files_properties(
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_wave64.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_quant_wave64.hip
+    TARGET_DIRECTORY gufo_core
+    PROPERTIES COMPILE_OPTIONS -mwavefrontsize64)
+  # Iterative ILP improves Q4/Q5 groups of sixteen without changing arithmetic.
+  # Keep it isolated: other widths regress. Line tables retain source profiling
+  # while avoiding an LLVM register-pressure crash with full debug information.
+  set_source_files_properties(
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip
+    TARGET_DIRECTORY gufo_core
+    PROPERTIES COMPILE_OPTIONS
+    "-mwavefrontsize64;-gline-tables-only;-Xarch_device;-mllvm=-amdgpu-sched-strategy=iterative-ilp")
 endif()
 
 if (ENGINE_ENABLE_XRT)

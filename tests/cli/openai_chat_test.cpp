@@ -14,6 +14,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/json.hpp"
+
 namespace {
 
 using namespace std::chrono_literals;
@@ -389,6 +391,32 @@ void TestAllSamplingControlsReachBackend() {
          "presence penalty reaches backend");
 }
 
+void TestUnsupportedSamplingControlsAreRejected() {
+  FakeBackend backend;
+  for (const auto* field : {"draft_temperature",  "temperature_draft",
+                            "draft_top_k",        "draft_top_p",
+                            "draft_min_p",        "draft_seed",
+                            "draft_policy",       "samplers",
+                            "typical_p",          "tfs_z",
+                            "mirostat",           "mirostat_eta",
+                            "mirostat_tau",       "dynatemp_range",
+                            "dynatemp_exponent",  "xtc_probability",
+                            "xtc_threshold",      "dry_multiplier",
+                            "dry_base",           "dry_allowed_length",
+                            "dry_penalty_last_n", "dry_sequence_breakers",
+                            "top_n_sigma",        "logit_bias"}) {
+    auto request = Request(
+        R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})");
+    auto body = gufo::server::json::parse(request.body);
+    body[field] = 0.8;
+    request.body = body.dump();
+    const auto response = gufo::server::HandleOpenAiChat(request, backend);
+    Expect(response.status == 400 &&
+               response.body.find("unsupported_sampling") != std::string::npos,
+           "unsupported sampling must not be silently ignored");
+  }
+}
+
 void TestAssistantReasoningContentReachesBackend() {
   FakeBackend backend;
   backend.pieces = {"Blue"};
@@ -592,6 +620,7 @@ int main() {
   TestStreamingIsLive();
   TestBackendSamplingDefaults();
   TestAllSamplingControlsReachBackend();
+  TestUnsupportedSamplingControlsAreRejected();
   TestAssistantReasoningContentReachesBackend();
   TestPiReasoningControlsAndOutputFraming();
   TestPiNativeDeepSeekThinkingObject();

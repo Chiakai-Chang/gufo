@@ -56,11 +56,55 @@ for t in "${targets[@]}"; do
     extra+=(-laotriton_v2)
   fi
   echo "==> $src -> $out"
-  hipcc -O3 --offload-arch=gfx1151 -std=c++20 \
-    -I. "${inc[@]}" "${lib[@]}" \
-    -Rpass-analysis=kernel-resource-usage \
-    "$src" "${extra[@]}" -o "$out" 2>"/tmp/${t}.build.log" ||
-    { tail -40 "/tmp/${t}.build.log"; exit 1; }
+  compile=(hipcc -O3 --offload-arch=gfx1151 -std=c++20
+    -I. "${inc[@]}" -Rpass-analysis=kernel-resource-usage)
+  if [[ "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ]]; then
+    # Exact projection comparisons use the production compiler optimization level.
+    compile[1]=-O2
+  fi
+  native_sources=()
+  if [[ "$src" -ef tools/qwen27b/dflash_gemm_bench.hip ||
+        "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
+    native_sources+=(src/models/qwen/hip/kernels/small_batch_wave64.hip)
+    native_sources+=(src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip)
+  fi
+  if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
+    native_sources+=(src/models/qwen/hip/kernels/prefill_quant_wave64.hip)
+  fi
+  if ((${#native_sources[@]})); then
+    # HIP helpers and their callers must share the native wave size.
+    objects="$(mktemp -d "/tmp/${t}.XXXXXX")"
+    trap 'rm -rf "$objects"' EXIT
+    (
+      "${compile[@]}" -c "$src" -o "$objects/main.o" || exit 1
+      native_objects=()
+      for unit in "${native_sources[@]}"; do
+        object="$objects/$(basename "$unit").o"
+        native_extra=()
+        if [[ "$unit" == src/models/qwen/hip/kernels/small_batch_quant16_wave64.hip ]]; then
+          native_extra+=(-Xarch_device -mllvm=-amdgpu-sched-strategy=iterative-ilp)
+        fi
+        "${compile[@]}" -DENGINE_ENABLE_HIP=1 -mwavefrontsize64 \
+          "${native_extra[@]}" \
+          -c "$unit" -o "$object" || exit 1
+        native_objects+=("$object")
+      done
+      if [[ "$src" -ef tools/qwen27b/prefill_gemm_bench.hip ]]; then
+        "${compile[@]}" -c src/core/quant/ggml_dequant.cpp \
+          -o "$objects/quant.o" || exit 1
+        native_objects+=("$objects/quant.o")
+      fi
+      hipcc --offload-arch=gfx1151 "${lib[@]}" \
+        "$objects/main.o" "${native_objects[@]}" "${extra[@]}" -o "$out"
+    ) 2>"/tmp/${t}.build.log" ||
+      { tail -40 "/tmp/${t}.build.log"; exit 1; }
+    rm -rf "$objects"
+    trap - EXIT
+  else
+    "${compile[@]}" "${lib[@]}" \
+      "$src" "${extra[@]}" -o "$out" 2>"/tmp/${t}.build.log" ||
+      { tail -40 "/tmp/${t}.build.log"; exit 1; }
+  fi
   grep -E "Function Name|VGPRs:|Occupancy|VGPRs Spill|LDS Size" \
     "/tmp/${t}.build.log" | sed 's/.*remark: //; s/ \[-Rpass.*//' \
     >"/tmp/${t}.res.txt" || true

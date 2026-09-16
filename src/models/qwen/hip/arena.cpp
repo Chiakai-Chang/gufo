@@ -398,7 +398,7 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
   const std::size_t q8_row_elements = scratch_elements / batch;
   const std::size_t q8_elements = CheckedMultiply(q8_rows, q8_row_elements);
   const std::size_t q8_blocks = (q8_elements + 31) / 32;
-  CheckedAdd(CheckedMultiply(CheckedMultiply(q8_blocks, sizeof(float)), 9),
+  CheckedAdd(CheckedMultiply(CheckedMultiply(q8_blocks, sizeof(float)), 10),
              &scratch);
   CheckedAdd(4096, &scratch);
 
@@ -412,16 +412,6 @@ QwenGpuMemoryUsage QwenGpuArena::EstimateMemoryUsage(
   const std::size_t maximum_weight =
       CheckedMultiply(hidden, maximum_weight_width);
   AddAllocation(maximum_weight, sizeof(hip_bfloat16), &scratch);
-  AddAllocation(maximum_weight, sizeof(hip_bfloat16), &scratch);
-
-  const std::size_t attention_elements = CheckedMultiply(batch, attention);
-  AddAllocation(attention_elements, sizeof(std::uint16_t), &scratch);
-  AddAllocation(attention_elements, sizeof(std::uint16_t), &scratch);
-  AddAllocation(attention_elements, sizeof(float), &scratch);
-  const std::size_t lse_elements =
-      CheckedMultiply(batch, config.num_attention_heads);
-  AddAllocation(lse_elements, sizeof(float), &scratch);
-  AddAllocation(lse_elements, sizeof(float), &scratch);
 
   auto& state = usage.request_state_bytes;
   const std::size_t total_kv = CheckedMultiply(
@@ -705,8 +695,6 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       max_batch_(std::min(max_context_, kMaxPromptBatch)),
       policy_(policy) {
   HIP_CHECK(hipStreamCreate(&stream));
-  HIP_CHECK(hipStreamCreate(&prefetch_stream));
-  HIP_CHECK(hipEventCreate(&prefetch_event));
   HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
   HIPBLAS_CHECK(hipblasSetStream(hipblas_handle, stream));
   hipblaslt_gemm = std::make_unique<HipblasLtGemm>();
@@ -762,14 +750,14 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       hipMalloc(&d_scratch_bf16, scratch_elements * sizeof(hip_bfloat16)));
   // The tiled Q8_1 activation layout groups 16 tokens per tile, so size for a
   // batch rounded up to a whole tile. The base layout remains 36 bytes per 32
-  // elements; reserve another float per block for the optional K-quant
+  // elements; reserve another float per block for the K-quant
   // activation-sum sidecar without changing the Q8 payload or its stride.
   const std::size_t q8_rows = ((batch + 15) / 16) * 16;
   const std::size_t q8_row_elements =
       scratch_elements / std::max<std::size_t>(batch, 1);
   const std::size_t scratch_q8_bytes =
       ((((q8_rows * q8_row_elements) + 31) / 32) * sizeof(float) * 10) +
-      4096;  // 36-byte payload + 4-byte optional sidecar per 32 elems
+      4096;  // 36-byte payload + 4-byte sidecar per 32 elems
   HIP_CHECK(hipMalloc(&d_scratch_q8_act, scratch_q8_bytes));
   const std::size_t split_k_elements = detail::DecodeAttentionScratchElements(
       config_.num_attention_heads, config_.head_dim);
@@ -784,30 +772,14 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
                              time_step_rank});
   HIP_CHECK(
       hipMalloc(&d_weights_bf16, max_weight_elems * sizeof(hip_bfloat16)));
-  HIP_CHECK(
-      hipMalloc(&d_weights_bf16_aux, max_weight_elems * sizeof(hip_bfloat16)));
 
-  const std::size_t total_kv = config_.FullAttentionLayerCount() *
-                               num_kv_heads * max_context_ * head_dim;
+  const std::size_t total_kv = GetAttentionKvPlaneElements();
   if (policy_.UsesFp16AttentionKv()) {
     HIP_CHECK(
         hipMalloc(&d_attention_kv_f16, total_kv * sizeof(std::uint16_t) * 2));
   } else {
     HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
   }
-
-  // Split prefill attention scratch (opt-c165-attn-split). Only the FP16
-  // query/prefix planes are per-token; the log-sum-exp planes are tiny.
-  const std::size_t attention_elements = batch * attention_size;
-  HIP_CHECK(
-      hipMalloc(&d_attn_q_f16, attention_elements * sizeof(std::uint16_t)));
-  HIP_CHECK(hipMalloc(&d_attn_prefix_f16,
-                      attention_elements * sizeof(std::uint16_t)));
-  HIP_CHECK(hipMalloc(&d_attn_prefix_out, attention_elements * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_attn_lse_prefix,
-                      batch * config_.num_attention_heads * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_attn_lse_diag,
-                      batch * config_.num_attention_heads * sizeof(float)));
 
   const std::size_t total_conv =
       num_layers * ssm_qkv_size * config_.ssm_conv_kernel;
@@ -944,26 +916,18 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   d_ssm_alpha_beta = other.d_ssm_alpha_beta;
   d_logits = other.d_logits;
   d_attention_kv_f16 = other.d_attention_kv_f16;
-  d_attn_lse_diag = other.d_attn_lse_diag;
-  d_attn_lse_prefix = other.d_attn_lse_prefix;
-  d_attn_prefix_out = other.d_attn_prefix_out;
-  d_attn_prefix_f16 = other.d_attn_prefix_f16;
-  d_attn_q_f16 = other.d_attn_q_f16;
   d_kv_cache = other.d_kv_cache;
   d_ssm_conv_state = other.d_ssm_conv_state;
   d_ssm_deltanet_state = other.d_ssm_deltanet_state;
   d_prompt_tokens = other.d_prompt_tokens;
   d_target_layer_features = other.d_target_layer_features;
   stream = other.stream;
-  prefetch_stream = other.prefetch_stream;
-  prefetch_event = other.prefetch_event;
   hipblas_handle = other.hipblas_handle;
   hipblaslt_gemm = std::move(other.hipblaslt_gemm);
   d_scratch_bf16 = other.d_scratch_bf16;
   d_scratch_q8_act = other.d_scratch_q8_act;
   d_split_k_attention = other.d_split_k_attention;
   d_weights_bf16 = other.d_weights_bf16;
-  d_weights_bf16_aux = other.d_weights_bf16_aux;
   d_saved_ssm_conv_state_ = other.d_saved_ssm_conv_state_;
   d_saved_ssm_deltanet_state_ = other.d_saved_ssm_deltanet_state_;
   d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
@@ -996,25 +960,17 @@ QwenGpuArena::QwenGpuArena(QwenGpuArena&& other) noexcept
   other.d_ssm_alpha_beta = nullptr;
   other.d_logits = nullptr;
   other.d_attention_kv_f16 = nullptr;
-  other.d_attn_lse_diag = nullptr;
-  other.d_attn_lse_prefix = nullptr;
-  other.d_attn_prefix_out = nullptr;
-  other.d_attn_prefix_f16 = nullptr;
-  other.d_attn_q_f16 = nullptr;
   other.d_kv_cache = nullptr;
   other.d_ssm_conv_state = nullptr;
   other.d_ssm_deltanet_state = nullptr;
   other.d_prompt_tokens = nullptr;
   other.d_target_layer_features = nullptr;
   other.stream = nullptr;
-  other.prefetch_stream = nullptr;
-  other.prefetch_event = nullptr;
   other.hipblas_handle = nullptr;
   other.d_scratch_bf16 = nullptr;
   other.d_scratch_q8_act = nullptr;
   other.d_split_k_attention = nullptr;
   other.d_weights_bf16 = nullptr;
-  other.d_weights_bf16_aux = nullptr;
   other.d_saved_ssm_conv_state_ = nullptr;
   other.d_saved_ssm_deltanet_state_ = nullptr;
   other.d_ssm_replay_qkv_ = nullptr;
@@ -1056,26 +1012,18 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     d_ssm_alpha_beta = other.d_ssm_alpha_beta;
     d_logits = other.d_logits;
     d_attention_kv_f16 = other.d_attention_kv_f16;
-    d_attn_lse_diag = other.d_attn_lse_diag;
-    d_attn_lse_prefix = other.d_attn_lse_prefix;
-    d_attn_prefix_out = other.d_attn_prefix_out;
-    d_attn_prefix_f16 = other.d_attn_prefix_f16;
-    d_attn_q_f16 = other.d_attn_q_f16;
     d_kv_cache = other.d_kv_cache;
     d_ssm_conv_state = other.d_ssm_conv_state;
     d_ssm_deltanet_state = other.d_ssm_deltanet_state;
     d_prompt_tokens = other.d_prompt_tokens;
     d_target_layer_features = other.d_target_layer_features;
     stream = other.stream;
-    prefetch_stream = other.prefetch_stream;
-    prefetch_event = other.prefetch_event;
     hipblas_handle = other.hipblas_handle;
     hipblaslt_gemm = std::move(other.hipblaslt_gemm);
     d_scratch_bf16 = other.d_scratch_bf16;
     d_scratch_q8_act = other.d_scratch_q8_act;
     d_split_k_attention = other.d_split_k_attention;
     d_weights_bf16 = other.d_weights_bf16;
-    d_weights_bf16_aux = other.d_weights_bf16_aux;
     d_saved_ssm_conv_state_ = other.d_saved_ssm_conv_state_;
     d_saved_ssm_deltanet_state_ = other.d_saved_ssm_deltanet_state_;
     d_ssm_replay_qkv_ = other.d_ssm_replay_qkv_;
@@ -1108,25 +1056,17 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
     other.d_ssm_alpha_beta = nullptr;
     other.d_logits = nullptr;
     other.d_attention_kv_f16 = nullptr;
-    other.d_attn_lse_diag = nullptr;
-    other.d_attn_lse_prefix = nullptr;
-    other.d_attn_prefix_out = nullptr;
-    other.d_attn_prefix_f16 = nullptr;
-    other.d_attn_q_f16 = nullptr;
     other.d_kv_cache = nullptr;
     other.d_ssm_conv_state = nullptr;
     other.d_ssm_deltanet_state = nullptr;
     other.d_prompt_tokens = nullptr;
     other.d_target_layer_features = nullptr;
     other.stream = nullptr;
-    other.prefetch_stream = nullptr;
-    other.prefetch_event = nullptr;
     other.hipblas_handle = nullptr;
     other.d_scratch_bf16 = nullptr;
     other.d_scratch_q8_act = nullptr;
     other.d_split_k_attention = nullptr;
     other.d_weights_bf16 = nullptr;
-    other.d_weights_bf16_aux = nullptr;
     other.d_saved_ssm_conv_state_ = nullptr;
     other.d_saved_ssm_deltanet_state_ = nullptr;
     other.d_ssm_replay_qkv_ = nullptr;
@@ -1144,10 +1084,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
 
 void QwenGpuArena::Reset() noexcept {
   const std::size_t num_layers = config_.num_layers;
-  const std::size_t num_kv_heads = config_.num_key_value_heads;
-  const std::size_t head_dim = config_.head_dim;
-  const std::size_t total_kv = config_.FullAttentionLayerCount() *
-                               num_kv_heads * max_context_ * head_dim * 2;
+  const std::size_t total_kv = GetAttentionKvPlaneElements() * 2;
   const std::size_t total_conv =
       num_layers * config_.SsmQkvSize() * config_.ssm_conv_kernel;
   const std::size_t total_deltanet = num_layers * config_.ssm_time_step_rank *
@@ -1220,20 +1157,10 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_logits));
   if (d_attention_kv_f16 != nullptr)
     HIP_CHECK(hipFree(d_attention_kv_f16));
-  if (d_attn_lse_diag != nullptr)
-    HIP_CHECK(hipFree(d_attn_lse_diag));
-  if (d_attn_lse_prefix != nullptr)
-    HIP_CHECK(hipFree(d_attn_lse_prefix));
-  if (d_attn_prefix_out != nullptr)
-    HIP_CHECK(hipFree(d_attn_prefix_out));
   if (d_target_layer_features != nullptr) {
     HIP_CHECK(hipFree(d_target_layer_features));
     d_target_layer_features = nullptr;
   }
-  if (d_attn_prefix_f16 != nullptr)
-    HIP_CHECK(hipFree(d_attn_prefix_f16));
-  if (d_attn_q_f16 != nullptr)
-    HIP_CHECK(hipFree(d_attn_q_f16));
   if (d_kv_cache != nullptr)
     HIP_CHECK(hipFree(d_kv_cache));
   if (d_ssm_conv_state != nullptr)
@@ -1250,8 +1177,6 @@ void QwenGpuArena::FreeAll() noexcept {
     HIP_CHECK(hipFree(d_split_k_attention));
   if (d_weights_bf16 != nullptr)
     HIP_CHECK(hipFree(d_weights_bf16));
-  if (d_weights_bf16_aux != nullptr)
-    HIP_CHECK(hipFree(d_weights_bf16_aux));
   if (d_saved_ssm_conv_state_ != nullptr)
     HIP_CHECK(hipFree(d_saved_ssm_conv_state_));
   if (d_saved_ssm_deltanet_state_ != nullptr)
@@ -1269,10 +1194,6 @@ void QwenGpuArena::FreeAll() noexcept {
   hipblaslt_gemm.reset();
   if (stream != nullptr)
     HIP_CHECK(hipStreamDestroy(stream));
-  if (prefetch_stream != nullptr)
-    HIP_CHECK(hipStreamDestroy(prefetch_stream));
-  if (prefetch_event != nullptr)
-    HIP_CHECK(hipEventDestroy(prefetch_event));
 
   d_hidden = nullptr;
   d_normed = nullptr;
@@ -1294,11 +1215,6 @@ void QwenGpuArena::FreeAll() noexcept {
   d_ssm_alpha_beta = nullptr;
   d_logits = nullptr;
   d_attention_kv_f16 = nullptr;
-  d_attn_lse_diag = nullptr;
-  d_attn_lse_prefix = nullptr;
-  d_attn_prefix_out = nullptr;
-  d_attn_prefix_f16 = nullptr;
-  d_attn_q_f16 = nullptr;
   d_kv_cache = nullptr;
   d_ssm_conv_state = nullptr;
   d_ssm_deltanet_state = nullptr;
@@ -1306,7 +1222,6 @@ void QwenGpuArena::FreeAll() noexcept {
   d_scratch_bf16 = nullptr;
   d_split_k_attention = nullptr;
   d_weights_bf16 = nullptr;
-  d_weights_bf16_aux = nullptr;
   d_saved_ssm_conv_state_ = nullptr;
   d_saved_ssm_deltanet_state_ = nullptr;
   d_ssm_replay_qkv_ = nullptr;
@@ -1320,8 +1235,6 @@ void QwenGpuArena::FreeAll() noexcept {
   replay_capture_active_ = false;
   hipblas_handle = nullptr;
   stream = nullptr;
-  prefetch_stream = nullptr;
-  prefetch_event = nullptr;
 }
 
 }  // namespace gufo::hip
