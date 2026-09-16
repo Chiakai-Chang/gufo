@@ -165,7 +165,9 @@ void NgramTable::Worker() {
   std::vector<std::uint8_t> buf;
   std::unique_lock<std::mutex> lock(mutex_);
   for (;;) {
-    wake_.wait(lock, [&] { return stop_ || next_job_ < jobs_.size(); });
+    wake_.wait(lock, [&] {
+      return stop_ || (active_ && next_job_ < jobs_.size());
+    });
     if (stop_) {
       return;
     }
