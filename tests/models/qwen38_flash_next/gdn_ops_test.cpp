@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -16,7 +17,7 @@ namespace {
 
 // The model's linear-attention geometry: 16 key heads, 48 value heads,
 // 128-wide state, kernel-4 causal conv.
-constexpr std::uint32_t kTokens = 37;
+
 constexpr std::uint32_t kKHeads = 16;
 constexpr std::uint32_t kVHeads = 48;
 constexpr std::uint32_t kDim = 128;
@@ -108,23 +109,33 @@ double WorstRelative(const std::vector<float>& reference,
   return worst;
 }
 
-}  // namespace
+/// Worst absolute difference over the reference's RMS: the chunked route
+/// rounds its operands to F16, so near-zero elements carry the row's
+/// rounding noise.
+double WorstOverRms(const std::vector<float>& reference,
+                    const std::vector<float>& candidate) {
+  double ss = 0.0;
+  double worst = 0.0;
+  for (std::size_t i = 0; i < reference.size(); ++i) {
+    ss += static_cast<double>(reference[i]) * reference[i];
+    worst = std::max(
+        worst, std::abs(static_cast<double>(reference[i]) - candidate[i]));
+  }
+  return worst / std::sqrt(ss / static_cast<double>(reference.size()));
+}
 
-int main() {
-  try {
-    constexpr std::size_t kQkvCount =
-        static_cast<std::size_t>(kTokens) * kChannels;
-    constexpr std::size_t kStateCount =
+int RunCase(std::uint32_t kTokens) {
+  {
+    const std::size_t kQkvCount = static_cast<std::size_t>(kTokens) * kChannels;
+    const std::size_t kStateCount =
         static_cast<std::size_t>(kVHeads) * kDim * kDim;
-    constexpr std::size_t kConvState =
+    const std::size_t kConvState =
         static_cast<std::size_t>(kKernel - 1) * kChannels;
-    constexpr std::size_t kScratch =
+    const std::size_t kScratch =
         static_cast<std::size_t>(kTokens + kKernel) * kChannels;
-    constexpr std::size_t kQn =
-        static_cast<std::size_t>(kTokens) * kKHeads * kDim;
-    constexpr std::size_t kRaw =
-        static_cast<std::size_t>(kTokens) * kVHeads * kDim;
-    constexpr std::size_t kOut = static_cast<std::size_t>(kTokens) * kZ;
+    const std::size_t kQn = static_cast<std::size_t>(kTokens) * kKHeads * kDim;
+    const std::size_t kRaw = static_cast<std::size_t>(kTokens) * kVHeads * kDim;
+    const std::size_t kOut = static_cast<std::size_t>(kTokens) * kZ;
 
     const auto qkv = MakeValues(kQkvCount, 0x1234ABCDU, 1.0F);
     const auto z = MakeValues(kOut, 0x0BADF00DU, 2.0F);
@@ -159,6 +170,8 @@ int main() {
 
     std::vector<float> outs[2];
     std::vector<float> states[2];
+    std::vector<float> raws[2];
+    std::vector<float> conv_out;
     for (int route = 0; route < 2; ++route) {
       HipBuffer<float> d_conv_state(kConvState);
       HipBuffer<float> d_state(kStateCount);
@@ -174,9 +187,10 @@ int main() {
       CheckHip(hipDeviceSynchronize(), "GDN synchronization");
       outs[route] = Download(&d_out, kOut);
       states[route] = Download(&d_state, kStateCount);
+      raws[route] = Download(&d_raw, kRaw);
       // The causal conv's output (the scratch's first rows) against a CPU
       // reference over the same history.
-      const auto conv_out = Download(&d_scratch, kScratch);
+      conv_out = Download(&d_scratch, kScratch);
       double worst_conv = 0.0;
       for (std::uint32_t t = 0; t < kTokens; ++t) {
         for (std::uint32_t c = 0; c < kChannels; ++c) {
@@ -212,12 +226,122 @@ int main() {
         return 1;
       }
     }
+    {
+      // Double-precision recurrence over the conv output: the raw rows and
+      // the final state of both routes against it.
+      std::vector<float> raw_ref(kRaw);
+      std::vector<float> state_ref(kStateCount);
+      std::vector<double> S(static_cast<std::size_t>(kDim) * kDim);
+      for (std::uint32_t h = 0; h < kVHeads; ++h) {
+        const std::uint32_t kh = h % kKHeads;
+        for (std::size_t i = 0; i < S.size(); ++i) {
+          S[i] = state[h * S.size() + i];
+        }
+        for (std::uint32_t t = 0; t < kTokens; ++t) {
+          const float* row = conv_out.data() + t * kChannels;
+          const float* q = row + kh * kDim;
+          const float* k = row + (kKHeads + kh) * kDim;
+          const float* v = row + 2 * kKHeads * kDim + h * kDim;
+          double qs = 0.0;
+          double ks = 0.0;
+          for (std::uint32_t i = 0; i < kDim; ++i) {
+            qs += static_cast<double>(q[i]) * q[i];
+            ks += static_cast<double>(k[i]) * k[i];
+          }
+          const double q_scale = 1.0 / std::sqrt(qs + kEps) / std::sqrt(128.0);
+          const double inv_k = 1.0 / std::sqrt(ks + kEps);
+          const double alpha = alpha_beta[t * 2 * kVHeads + h];
+          const double beta_raw = alpha_beta[t * 2 * kVHeads + kVHeads + h];
+          const double g = std::exp(a[h] * std::log1p(std::exp(alpha + dt[h])));
+          const double beta = 1.0 / (1.0 + std::exp(-beta_raw));
+          for (std::uint32_t r = 0; r < kDim; ++r) {
+            double u = 0.0;
+            for (std::uint32_t c = 0; c < kDim; ++c) {
+              S[r * kDim + c] *= g;
+              u += S[r * kDim + c] * k[c] * inv_k;
+            }
+            const double delta = (v[r] - u) * beta;
+            double o = 0.0;
+            for (std::uint32_t c = 0; c < kDim; ++c) {
+              S[r * kDim + c] += delta * k[c] * inv_k;
+              o += S[r * kDim + c] * q[c] * q_scale;
+            }
+            raw_ref[(t * kVHeads + h) * kDim + r] = static_cast<float>(o);
+          }
+        }
+        for (std::size_t i = 0; i < S.size(); ++i) {
+          state_ref[h * S.size() + i] = static_cast<float>(S[i]);
+        }
+      }
+      // Per (token, head) row and per-head state: worst error over that
+      // row's / head's own RMS (heads decay at very different rates).
+      double worst_row[2] = {0.0, 0.0};
+      double worst_head[2] = {0.0, 0.0};
+      for (int route = 0; route < 2; ++route) {
+        for (std::uint32_t tt = 0; tt < kTokens; ++tt) {
+          for (std::uint32_t h = 0; h < kVHeads; ++h) {
+            double ss = 0.0;
+            double worst = 0.0;
+            for (std::uint32_t v = 0; v < kDim; ++v) {
+              const std::size_t idx = (tt * kVHeads + h) * kDim + v;
+              ss += static_cast<double>(raw_ref[idx]) * raw_ref[idx];
+              worst =
+                  std::max(worst, std::abs(static_cast<double>(raw_ref[idx]) -
+                                           raws[route][idx]));
+            }
+            worst_row[route] = std::max(worst_row[route],
+                                        worst / std::sqrt(ss / kDim + 1e-30));
+          }
+        }
+        for (std::uint32_t h = 0; h < kVHeads; ++h) {
+          double ss = 0.0;
+          double worst = 0.0;
+          for (std::uint32_t i = 0; i < kDim * kDim; ++i) {
+            const std::size_t idx = h * kDim * kDim + i;
+            ss += static_cast<double>(state_ref[idx]) * state_ref[idx];
+            worst =
+                std::max(worst, std::abs(static_cast<double>(state_ref[idx]) -
+                                         states[route][idx]));
+          }
+          worst_head[route] = std::max(
+              worst_head[route], worst / std::sqrt(ss / (kDim * kDim) + 1e-30));
+        }
+      }
+      std::cout << "  per row / head over own RMS: raw route0 " << worst_row[0]
+                << " route1 " << worst_row[1] << "; state route0 "
+                << worst_head[0] << " route1 " << worst_head[1] << '\n';
+      // Both routes accumulate in F32: F64 agreement to accumulation order.
+      if (std::max(std::max(worst_row[0], worst_row[1]),
+                   std::max(worst_head[0], worst_head[1])) > 1e-3) {
+        return 1;
+      }
+    }
     const double worst_out = WorstRelative(outs[0], outs[1]);
     const double worst_state = WorstRelative(states[0], states[1]);
     std::cout << "GDN row-split worst relative error: output " << worst_out
-              << ", state " << worst_state << '\n';
+              << ", state " << worst_state << "; over RMS: output "
+              << WorstOverRms(outs[0], outs[1]) << ", state "
+              << WorstOverRms(states[0], states[1]) << '\n';
     if (worst_out > 1e-3 || worst_state > 1e-3) {
       return 1;
+    }
+    return 0;
+  }
+}
+
+}  // namespace
+
+int main() {
+  try {
+    // 37 tokens: the row-split loop; 99: the chunked route (three full
+    // chunks and a ragged one).
+    // 37 tokens and a batch past two 32-token windows of the row-split
+    // loop's staging.
+    for (std::uint32_t n : {37u, 99u}) {
+      std::cout << "n=" << n << '\n';
+      if (RunCase(n) != 0) {
+        return 1;
+      }
     }
     return 0;
   } catch (const std::exception& error) {
