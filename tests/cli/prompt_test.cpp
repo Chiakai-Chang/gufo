@@ -57,13 +57,12 @@ void TestHybridMtpFlags() {
 
 void TestFlashMtpFlags() {
   const char* args[] = {"--speculative",  "mtp", "--mtp-model",   "mtp.gguf",
-                        "--draft-tokens", "3",   "--draft-vocab", "65536",
-                        "--temperature",  "0.7", "--seed",        "1",
-                        "Prompt"};
+                        "--draft-tokens", "3",   "--temperature", "0.7",
+                        "--seed",         "1",   "Prompt"};
   const auto opt = gufo::cli::ParsePromptOptions(args);
   assert(opt.has_value());
   assert(opt->speculative_backend == "mtp");
-  assert(opt->draft_tokens == 3 && opt->draft_vocab == 65536);
+  assert(opt->draft_tokens == 3);
   assert(opt->sampling.temperature == 0.7F && opt->sampling.seed == 1);
 }
 

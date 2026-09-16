@@ -63,9 +63,6 @@ void PrintBenchHelp(std::string_view program_name) {
   parser.AddOption("-d", "--n-depth", "n,n,...",
                    "Context depths prepared before timed region (default: 0)",
                    "Workload", &opt.model_path);
-  parser.AddOption("-b", "--batch-size", "N",
-                   "Flash-Next prefill chunk size (default: 512)", "Workload",
-                   &opt.batch_size);
   parser.AddOption("-c", "--concurrency", "n,n,...",
                    "DS4 simultaneous requests, 1..8 (default: 1); pp is "
                    "aggregate, tg per user",
@@ -101,10 +98,6 @@ void PrintBenchHelp(std::string_view program_name) {
       "", "--draft-tokens", "N",
       "Maximum speculative draft tokens per verification step (default: 7)",
       "Speculative", &opt.draft_tokens);
-  parser.AddOption("", "--draft-vocab", "N",
-                   "Qwen3.8-Flash-Next: score MTP drafts over the first N "
-                   "token ids only (default: 0 = full vocabulary)",
-                   "Speculative", &opt.draft_vocab);
 
   parser.AddOption("", "--min-draft-tokens", "N",
                    "Adaptive draft floor (default: 1)", "Speculative",
@@ -791,10 +784,8 @@ int RunQwen38FlashNextBenchmark(
     std::cerr << "Error: Flash-Next MTP requires --min-draft-tokens 1\n";
     return 1;
   }
-  if (required_context > std::numeric_limits<std::uint32_t>::max() ||
-      options.batch_size == 0 ||
-      options.batch_size > std::numeric_limits<std::uint32_t>::max()) {
-    std::cerr << "Error: Flash-Next context or batch size is out of range\n";
+  if (required_context > std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: Flash-Next context is out of range\n";
     return 1;
   }
 
@@ -804,10 +795,7 @@ int RunQwen38FlashNextBenchmark(
       qfn::ModelOptions{
           .max_context = static_cast<std::uint32_t>(required_context),
           .mtp_model_path = mtp ? options.mtp_model_path : "",
-          .max_batch = static_cast<std::uint32_t>(
-              std::max<std::size_t>(1, options.batch_size)),
           .max_draft_tokens = std::max<std::uint32_t>(1, options.draft_tokens),
-          .draft_vocab = options.draft_vocab,
       },
       &error);
   if (model == nullptr) {
@@ -911,8 +899,7 @@ int RunQwen38FlashNextBenchmark(
         return 1;
       }
       std::vector<double> runs;
-      // One untimed pass first, as llama-bench does: GEMM plan tuning and
-      // arena growth happen once per shape.
+      // One untimed pass first: initialize GEMM plans and warm resident data.
       for (std::size_t repetition = 0; repetition <= options.repetitions;
            ++repetition) {
         auto session = model->CreateSession(
@@ -1087,9 +1074,6 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
         return true;
       });
 
-  parser.AddOption("-b", "--batch-size", "N",
-                   "Qwen3.8-Flash-Next: prefill chunk size (default: 512)",
-                   "Workload", &opt.batch_size);
   parser.AddOption(
       "-r", "--repetitions", "N",
       "Repetitions per test point for variance reduction (default: 1)",
@@ -1185,10 +1169,6 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
         opt.min_draft_tokens = count;
         return true;
       });
-  parser.AddOption("", "--draft-vocab", "N",
-                   "Qwen3.8-Flash-Next: score MTP drafts over the first N "
-                   "token ids only (default: 0 = full vocabulary)",
-                   "Speculative", &opt.draft_vocab);
   RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
@@ -1286,12 +1266,6 @@ int RunBench(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
-  if (opt.draft_vocab != 0 &&
-      (reader->GetMetadataString("general.architecture") != "qwen4exp" ||
-       opt.speculative_backend != "mtp")) {
-    std::cerr << "Error: --draft-vocab requires Flash-Next MTP\n";
-    return 1;
-  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -1324,8 +1298,7 @@ int RunBench(std::span<const char* const> args) {
   const double total_vram_mib =
       static_cast<double>(prop.totalGlobalMem) / (1024.0 * 1024.0);
 
-  std::cout << "ggml_cuda_init: found " << device_count
-            << " ROCm devices (Total VRAM: "
+  std::cout << "HIP: found " << device_count << " ROCm devices (Total VRAM: "
             << static_cast<std::size_t>(total_vram_mib) << " MiB):\n"
             << "  Device 0: " << prop.name << ", " << prop.gcnArchName
             << ", Wave Size: " << prop.warpSize

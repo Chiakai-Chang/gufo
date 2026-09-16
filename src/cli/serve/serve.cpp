@@ -349,7 +349,6 @@ void PrintServeHelp(std::string_view program_name,
     std::string mtp_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
-    std::size_t draft_vocab = 0;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
@@ -423,14 +422,9 @@ void PrintServeHelp(std::string_view program_name,
         "Maximum speculative draft tokens evaluated per step (default: 7)",
         "Speculative", &draft_tokens);
 
-
     parser.AddOption("", "--min-draft-tokens", "N",
                      "Adaptive draft floor (default: 1)", "Speculative",
                      &min_draft_tokens);
-    parser.AddOption("", "--draft-vocab", "N",
-                     "Qwen3.8-Flash-Next MTP: score drafts over the first N "
-                     "token ids only (default: 0 = full vocabulary)",
-                     "Speculative", &draft_vocab);
     parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -902,7 +896,6 @@ int RunServe(std::span<const char* const> args) {
     std::string mtp_model_path;
     std::size_t draft_tokens = 7;
     std::size_t min_draft_tokens = 1;
-    std::size_t draft_vocab = 0;
     std::size_t prefill_chunk_tokens =
         server::kDefaultDecodeActivePrefillTokens;
     std::size_t max_pending_requests = 16;
@@ -975,10 +968,6 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--min-draft-tokens", "N",
                          "Adaptive draft floor (default: 1)", "Speculative",
                          &min_draft_tokens);
-    llm_parser.AddOption("", "--draft-vocab", "N",
-                         "Qwen3.8-Flash-Next MTP: score drafts over the first "
-                         "N token ids only (default: 0 = full vocabulary)",
-                         "Speculative", &draft_vocab);
     llm_parser.AddOption(
         "", "--prefill-chunk", "N",
         "Maximum prompt tokens between active decode rounds (default: 512)",
@@ -1097,11 +1086,6 @@ int RunServe(std::span<const char* const> args) {
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? mtp_model_path
             : dflash_model_path;
-    if (draft_vocab > std::numeric_limits<std::uint32_t>::max()) {
-      std::cerr << "Error: --draft-vocab is out of range\n";
-      return 2;
-    }
-    speculative_config.draft_vocab = static_cast<std::uint32_t>(draft_vocab);
     speculative_config.max_draft_tokens =
         static_cast<std::uint32_t>(draft_tokens);
     speculative_config.min_draft_tokens =
@@ -1147,8 +1131,7 @@ int RunServe(std::span<const char* const> args) {
     } else if (speculative_config.backend ==
                server::TextSpeculativeBackend::kMtp) {
       std::cout << "[Speculative]: MTP enabled (max_draft_tokens="
-                << speculative_config.max_draft_tokens
-                << ", draft_vocab=" << speculative_config.draft_vocab << ")\n";
+                << speculative_config.max_draft_tokens << ")\n";
     }
     backend->set_model_id(served_model_name);
     backend->set_sampling_defaults(max_tokens, sampling_config);

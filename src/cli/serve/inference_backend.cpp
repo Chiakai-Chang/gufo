@@ -819,6 +819,8 @@ public:
     if (offset >= prompt.size()) {
       throw std::logic_error("Qwen prefill has no remaining input");
     }
+    max_input_tokens = std::min<std::size_t>(
+        max_input_tokens, qwen.executor().GetMaxPromptBatch());
     if (qwen.speculative()) {
       if (offset == 0) {
         const auto consumed = std::min(max_input_tokens, prompt.size());
@@ -1532,7 +1534,8 @@ public:
     }
 
     const std::size_t consumed =
-        std::min(max_input_tokens, prompt.size() - offset);
+        std::min<std::size_t>({max_input_tokens, prompt.size() - offset,
+                               deepseek.session().PrefillCapacity()});
     const std::size_t next_position = offset + consumed;
     const auto prefix = DeepSeekEngineTokens(prompt.first(next_position));
     std::string error;
@@ -2122,8 +2125,8 @@ public:
       throw std::logic_error(
           "Qwen3.8-Flash-Next prefill has no remaining input");
     }
-    const std::size_t consumed =
-        std::min(max_input_tokens, prompt.size() - offset);
+    const std::size_t consumed = std::min<std::size_t>(
+        {max_input_tokens, prompt.size() - offset, model_->PrefillCapacity()});
     const std::size_t next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
     std::string error;
@@ -2341,12 +2344,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
-  if (speculative_config.draft_vocab != 0 &&
-      (reader->GetMetadataString("general.architecture") != "qwen4exp" ||
-       speculative_config.backend != TextSpeculativeBackend::kMtp)) {
-    SetError(error, "--draft-vocab requires Flash-Next MTP");
-    return false;
-  }
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kDSpark) {
@@ -2433,8 +2430,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "Unsupported Qwen3.8-Flash-Next chat template: " + load_error);
       return false;
     }
-    // Prompt chunks of up to 2048 tokens keep the expert GEMMs on the
-    // matrix-core route; the scheduler's --prefill-chunk bounds each step.
+    // The model owns prefill geometry for both bulk and scheduled requests.
     auto model = models::qwen38_flash_next::Model::Load(
         model_path,
         models::qwen38_flash_next::ModelOptions{
@@ -2443,9 +2439,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 speculative_config.backend == TextSpeculativeBackend::kMtp
                     ? speculative_config.draft_model_path
                     : std::string{},
-            .max_batch = std::min<std::uint32_t>(2048, max_context),
             .max_draft_tokens = speculative_config.max_draft_tokens,
-            .draft_vocab = speculative_config.draft_vocab,
         },
         &load_error);
     if (model == nullptr) {

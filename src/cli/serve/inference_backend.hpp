@@ -44,8 +44,6 @@ struct TextSpeculativeConfig {
   std::string draft_model_path;
   std::uint32_t max_draft_tokens{7};
   std::uint32_t min_draft_tokens{1};
-  /// MTP: vocabulary prefix the draft block scores (0 = full vocabulary).
-  std::uint32_t draft_vocab{0};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
 };

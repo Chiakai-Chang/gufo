@@ -165,10 +165,6 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       options.max_logit_rows, 1, e->options_.max_batch);
   e->options_.max_speculative = std::clamp<std::uint32_t>(
       options.max_speculative, 1, e->options_.max_logit_rows);
-  const std::uint32_t vocab = model.config().vocab_size;
-  if (options.draft_rows == 0 || options.draft_rows > vocab) {
-    e->options_.draft_rows = vocab;
-  }
   if (qfn_mmq_init(0) != 0) {
     AssignError(error_msg, "quantized GEMM tier initialization failed");
     return nullptr;
@@ -183,8 +179,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   }
   const Config& c = model.config();
   const std::size_t T = e->options_.max_batch;
-  e->blaslt_ =
-      BlasLt::Create(e->stream_, static_cast<std::uint32_t>(T), error_msg);
+  e->blaslt_ = BlasLt::Create(e->stream_, error_msg);
   if (e->blaslt_ == nullptr) {
     return nullptr;
   }
@@ -604,9 +599,7 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     half_cols_ = w.cols;
     half_bf16_ = bf16;
   }
-  return blaslt_->Gemm({w.data, type, k, 0, false},
-                       {s_.x_half, type, k, 0, false}, out, m, 0, m, n, k, 1,
-                       error_msg);
+  return blaslt_->Gemm(w.data, s_.x_half, out, type, m, n, k, error_msg);
 }
 
 void Executor::RoutedHints(const DeviceTensor& w,
@@ -1187,12 +1180,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 }
 
 bool Executor::Head(const DeviceMixer& head, const float* res,
-                    std::uint32_t n_rows, std::uint32_t vocab_rows,
-                    std::string* error_msg) const {
-  // The output matrix is [vocab][hidden], so its leading rows form a
-  // contiguous smaller head.
-  DeviceTensor output = model_->output();
-  output.rows = std::min(output.rows, vocab_rows);
+                    std::uint32_t n_rows, std::string* error_msg) const {
+  const DeviceTensor& output = model_->output();
   if (!HcMix(head, res, false, s_.mixed, nullptr, n_rows, error_msg) ||
       !Dense(output, s_.mixed, s_.logits, n_rows, error_msg)) {
     return false;
@@ -1505,7 +1494,7 @@ bool Executor::MtpForward(Session& session,
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
   }
-  std::copy_n(logits_host_, options_.draft_rows, logits);
+  std::copy_n(logits_host_, c.vocab_size, logits);
   session.mtp_.position = pos + n;
   return true;
 }
@@ -1564,7 +1553,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
              "MTP hidden carry", error_msg)) {
     return false;
   }
-  return Head(l.nextn_head, last, 1, options_.draft_rows, error_msg);
+  return Head(l.nextn_head, last, 1, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -99,15 +99,11 @@ private:
 class Executor {
 public:
   struct Options {
-    std::uint32_t max_batch{512};
+    std::uint32_t max_batch{1};
     /// Rows of logits (and hidden states) a Forward call may return.
-    std::uint32_t max_logit_rows{64};
+    std::uint32_t max_logit_rows{1};
     /// Longest speculative batch; bounds the recurrent snapshot storage.
-    std::uint32_t max_speculative{8};
-    /// Rows of the output head the draft block scores (0 = every row).
-    /// Token ids follow merge order, so a leading prefix holds the frequent
-    /// tokens: the FR-Spec idea, as ds4 applies it to this model.
-    std::uint32_t draft_rows{0};
+    std::uint32_t max_speculative{1};
   };
 
   ~Executor();
@@ -140,7 +136,7 @@ public:
   /// MTP position. The hidden input of token i is the trunk residual of row
   /// `hidden_row + i` of the last Forward batch, or, with hidden_row < 0
   /// (single token), the draft block's own residual from the previous call.
-  /// `logits` receives the last token's draft logits (DraftRows() floats,
+  /// `logits` receives the last token's draft logits (vocab_size floats,
   /// host).
   [[nodiscard]] bool MtpForward(Session& session,
                                 std::span<const std::int32_t> tokens,
@@ -166,9 +162,6 @@ public:
     return options_.max_speculative;
   }
   [[nodiscard]] bool has_mtp() const noexcept { return model_->has_mtp(); }
-  [[nodiscard]] std::uint32_t DraftRows() const noexcept {
-    return options_.draft_rows;
-  }
 
 private:
   Executor() = default;
@@ -236,10 +229,9 @@ private:
                  std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg) const;
-  /// Logits over the first `vocab_rows` tokens of `n_rows` rows land in
-  /// logits_host_.
+  /// Full-vocabulary logits of `n_rows` rows land in logits_host_.
   bool Head(const DeviceMixer& head, const float* res, std::uint32_t n_rows,
-            std::uint32_t vocab_rows, std::string* error_msg) const;
+            std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool speculative, bool sparse, std::uint32_t start_pos,

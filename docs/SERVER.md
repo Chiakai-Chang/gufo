@@ -125,15 +125,15 @@ anything else restarts the session, and `--cache-disk` is refused. Sampling
 runs server-side over the session logits, so every sampling flag applies;
 the artifact's pinned Qwen3.8 reasoning template drives the reasoning
 controls below. `--speculative mtp --mtp-model <mtp-...-shared-*.gguf>`
-enables the MTP draft block (`--draft-tokens`, `--draft-vocab`): drafts are
+enables the MTP draft block (`--draft-tokens`): drafts are
 deterministic, and both greedy and sampled requests verify them with the
 target sampler over the full vocabulary. Accepted tokens update penalty
 history once; rejection restores the RNG to the unconsumed target draw.
 The fixed draft chain supports 1–7 tokens and requires
-`--min-draft-tokens 1`. `--draft-vocab` applies only to Flash-Next MTP.
-Prompt chunks of up to 2048
-tokens keep the expert GEMMs on the matrix-core route
-(`--prefill-chunk 2048`); requests run serially across sessions.
+`--min-draft-tokens 1`. Drafts also score the full vocabulary.
+Each model yields after its own prefill chunk; spare session slots do not
+change a lone request's chunk size. `--prefill-chunk` separately limits prompt
+work between active decode rounds. Requests run serially across sessions.
 
 ### Reasoning controls
 

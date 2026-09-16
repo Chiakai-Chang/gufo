@@ -453,9 +453,11 @@ struct TextGenerationScheduler::Impl {
 
       request->phase.store(TextRequestPhase::kPrefilling,
                            std::memory_order_release);
+      // Runners yield after one model-sized prefill chunk. Only an active
+      // decoder needs the smaller latency budget; spare session slots must
+      // not change a lone request's prefill geometry.
       const bool bounded_prefill =
-          incremental_prefill_supported &&
-          (decoder_runnable || runner_pool->capacity() > 1);
+          incremental_prefill_supported && decoder_runnable;
       const std::size_t budget = bounded_prefill
                                      ? prefill_policy.decode_active_tokens
                                      : request->runner_request.prompt_tokens();

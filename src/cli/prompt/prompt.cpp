@@ -109,9 +109,6 @@ static void PrintTextHelp(std::string_view program_name,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
-  parser.AddOption("", "--draft-vocab", "N",
-                   "Flash-Next MTP vocabulary prefix (0 = full)", "Speculative",
-                   &opt.draft_vocab);
   parser.AddOption("-d", "--draft-tokens", "N",
                    "Maximum speculative draft tokens evaluated per step "
                    "(default: 7)",
@@ -545,9 +542,7 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
       {.max_context = kDefaultContext,
        .mtp_model_path =
            opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
-       .max_batch = 2048,
-       .max_draft_tokens = opt.draft_tokens,
-       .draft_vocab = opt.draft_vocab},
+       .max_draft_tokens = opt.draft_tokens},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
@@ -802,9 +797,6 @@ std::optional<PromptOptions> ParsePromptOptions(
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
-  parser.AddOption("", "--draft-vocab", "N",
-                   "Flash-Next MTP vocabulary prefix (0 = full)", "Speculative",
-                   &opt.draft_vocab);
   parser.AddCustomOption(
       "-d", "--draft-tokens", "N",
       "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -1000,12 +992,6 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
-  if (opt.draft_vocab != 0 &&
-      (reader->GetMetadataString("general.architecture") != "qwen4exp" ||
-       opt.speculative_backend != "mtp")) {
-    std::cerr << "Error: --draft-vocab requires Flash-Next MTP\n";
-    return 1;
-  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -1200,12 +1186,6 @@ int RunChat(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
-  if (opt.draft_vocab != 0 &&
-      (reader->GetMetadataString("general.architecture") != "qwen4exp" ||
-       opt.speculative_backend != "mtp")) {
-    std::cerr << "Error: --draft-vocab requires Flash-Next MTP\n";
-    return 1;
-  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {

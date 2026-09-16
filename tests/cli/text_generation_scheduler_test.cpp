@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -143,6 +144,7 @@ struct FakeControl {
   std::atomic<std::size_t> decode_calls{0};
   std::atomic<std::size_t> batch_preparations{0};
   bool incremental_prefill{true};
+  std::size_t prefill_capacity{std::numeric_limits<std::size_t>::max()};
   bool supports_batched_advance{false};
   bool final_token_advance_required{true};
   bool incremental_text_is_exact{false};
@@ -285,8 +287,8 @@ public:
       throw std::logic_error("invalid scheduler fake prefill");
     }
     fake.label = prompt.front();
-    const std::size_t consumed =
-        std::min(max_input_tokens, prompt.size() - offset);
+    const std::size_t consumed = std::min(
+        {max_input_tokens, prompt.size() - offset, control_->prefill_capacity});
 
     {
       std::unique_lock<std::mutex> lock(control_->mutex);
@@ -597,23 +599,24 @@ void TestModelOwnedBatchMetrics() {
 }
 
 void TestMultiResidentPrefillUsesBoundedWorkUnits() {
-  auto control = std::make_shared<FakeControl>();
-  auto scheduler = MakeScheduler(control, 2, {.decode_active_tokens = 2});
-
-  const auto result =
-      scheduler->Submit({7, 70, 71, 72, 73, 74, 75}, 2, 0.0F).Wait();
-
-  std::size_t chunks = 0;
-  for (const auto& event : control->Events()) {
-    if (event.kind == EventKind::kPrefill && event.label == 7) {
-      Expect(event.count <= 2,
-             "multi-resident prefill respects the fairness budget");
-      ++chunks;
+  for (const auto capacity : {1U, 2U}) {
+    auto control = std::make_shared<FakeControl>();
+    control->prefill_capacity = 3;
+    auto scheduler =
+        MakeScheduler(control, capacity, {.decode_active_tokens = 2});
+    const auto result =
+        scheduler->Submit({7, 70, 71, 72, 73, 74, 75}, 2, 0.0F).Wait();
+    std::vector<std::size_t> chunks;
+    for (const auto& event : control->Events()) {
+      if (event.kind == EventKind::kPrefill && event.label == 7)
+        chunks.push_back(event.count);
     }
+    Expect(chunks == std::vector<std::size_t>({3, 3, 1}),
+           "idle prefill uses model geometry regardless of spare slots");
+    Expect(
+        result.prefill_chunks == 3 && result.active_decode_prefill_chunks == 0,
+        "model-sized work units still yield for admission and cancellation");
   }
-  Expect(chunks == 4 && result.prefill_chunks == 4 &&
-             result.active_decode_prefill_chunks == 0,
-         "multi-resident prefill yields between bounded work units");
 }
 
 void TestDecodeActivePrefillIsBounded(bool multi_token, bool batched) {

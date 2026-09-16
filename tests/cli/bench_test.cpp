@@ -52,8 +52,6 @@ void TestFlashMtpSamplingOptions() {
                         "mtp",
                         "--mtp-model",
                         "mtp.gguf",
-                        "--draft-vocab",
-                        "65536",
                         "--draft-tokens",
                         "3",
                         "--temperature",
@@ -79,11 +77,11 @@ void TestFlashMtpSamplingOptions() {
   const auto options = gufo::cli::ParseBenchOptions(args);
   Expect(options.has_value(), "Flash MTP sampling options parse");
   const auto& s = options->sampling;
-  Expect(options->draft_vocab == 65536 && options->draft_tokens == 3 &&
-             s.temperature == 0.8F && s.seed == 73 && s.top_k == 40 &&
-             s.top_p == 0.9F && s.min_p == 0.01F && s.min_keep == 2 &&
-             s.repeat_penalty == 1.1F && s.repeat_last_n == 16 &&
-             s.frequency_penalty == 0.2F && s.presence_penalty == 0.1F,
+  Expect(options->draft_tokens == 3 && s.temperature == 0.8F && s.seed == 73 &&
+             s.top_k == 40 && s.top_p == 0.9F && s.min_p == 0.01F &&
+             s.min_keep == 2 && s.repeat_penalty == 1.1F &&
+             s.repeat_last_n == 16 && s.frequency_penalty == 0.2F &&
+             s.presence_penalty == 0.1F,
          "Flash MTP benchmark retains every sampling control");
 }
 

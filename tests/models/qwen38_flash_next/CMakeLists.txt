@@ -23,6 +23,15 @@ add_custom_target(qwen38_flash_next_tests
   DEPENDS qwen38_flash_next_ngram_test qwen38_flash_next_mtp_sampling_test)
 
 if(ENGINE_ENABLE_HIP)
+  add_executable(qwen38_flash_next_blaslt_ops_test blaslt_ops_test.cpp)
+  target_link_libraries(qwen38_flash_next_blaslt_ops_test PRIVATE
+    gufo_qwen38_flash_next)
+  add_test(NAME qwen38_flash_next.blaslt_ops
+    COMMAND qwen38_flash_next_blaslt_ops_test)
+  set_tests_properties(qwen38_flash_next.blaslt_ops PROPERTIES
+    LABELS "hip;gpu;qwen38_flash_next;prefill;gemm")
+  add_dependencies(qwen38_flash_next_tests qwen38_flash_next_blaslt_ops_test)
+
   add_executable(qwen38_flash_next_weight_upload_test weight_upload_test.cpp)
   target_link_libraries(qwen38_flash_next_weight_upload_test PRIVATE
     gufo_qwen38_flash_next)
@@ -32,9 +41,15 @@ if(ENGINE_ENABLE_HIP)
     LABELS "hip;gpu;qwen38_flash_next")
   add_dependencies(qwen38_flash_next_tests qwen38_flash_next_weight_upload_test)
 
-  add_executable(qwen38_flash_next_session_test session_test.cpp)
+  add_executable(qwen38_flash_next_session_test session_test.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/logging.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
   target_link_libraries(qwen38_flash_next_session_test PRIVATE
-    gufo_qwen38_flash_next)
+    gufo_qwen38_flash_next gufo_deepseek_v4_flash hip::host)
   add_executable(qwen38_flash_next_gpu_probe gpu_probe.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
     gufo_qwen38_flash_next)

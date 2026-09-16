@@ -13,6 +13,10 @@
 namespace gufo::models::qwen38_flash_next {
 namespace {
 
+// gfx1151 pp4096 at depths 0/4096: the 512/1024/2048/4096 sweep favored
+// 2048; larger chunks used more scratch without improving throughput.
+constexpr std::uint32_t kPrefillChunkTokens = 2048;
+
 void AssignError(std::string* error_msg, std::string_view message) {
   if (error_msg != nullptr) {
     *error_msg = message;
@@ -27,12 +31,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                    const ModelOptions& options,
                                    std::string* error_msg) {
   std::shared_ptr<Model> m(new Model());
-  if (options.max_batch == 0 || options.max_draft_tokens == 0) {
-    AssignError(error_msg, "batch size and draft token limit must be positive");
-    return nullptr;
-  }
-  if (options.draft_vocab != 0 && options.mtp_model_path.empty()) {
-    AssignError(error_msg, "a draft vocabulary requires an MTP model");
+  if (options.max_draft_tokens == 0) {
+    AssignError(error_msg, "draft token limit must be positive");
     return nullptr;
   }
   if (!options.mtp_model_path.empty() &&
@@ -55,10 +55,6 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (options.max_context == 0 || options.max_context > c.context_length) {
     AssignError(error_msg, "context exceeds the model's " +
                                std::to_string(c.context_length) + " tokens");
-    return nullptr;
-  }
-  if (options.draft_vocab > c.vocab_size) {
-    AssignError(error_msg, "draft vocabulary exceeds the target vocabulary");
     return nullptr;
   }
   m->tokenizer_ =
@@ -93,14 +89,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   rocm::Executor::Options exec;
-  exec.max_batch = std::min(options.max_batch, options.max_context);
+  exec.max_batch = m->PrefillCapacity();
   exec.max_logit_rows =
       m->mtp_weights_
           ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
                 exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
           : 1;
   exec.max_speculative = exec.max_logit_rows;
-  exec.draft_rows = options.draft_vocab;
   m->executor_ =
       rocm::Executor::Create(*m->device_, m->ngram_.get(), exec, error_msg);
   if (!m->executor_) {
@@ -153,6 +148,10 @@ std::uint32_t Model::VocabSize() const noexcept {
   return weights_->config.vocab_size;
 }
 
+std::uint32_t Model::PrefillCapacity() const noexcept {
+  return std::min(kPrefillChunkTokens, options_.max_context);
+}
+
 bool Model::HasMtp() const noexcept {
   return device_->has_mtp();
 }
@@ -175,7 +174,7 @@ Session::Session(std::shared_ptr<Model> model,
     : model_(std::move(model)), session_(std::move(session)) {
   logits_.resize(model_->VocabSize());
   if (model_->HasMtp()) {
-    draft_logits_.resize(model_->executor_->DraftRows());
+    draft_logits_.resize(model_->VocabSize());
     verify_logits_.resize(
         static_cast<std::size_t>(model_->executor_->max_speculative()) *
         model_->VocabSize());
@@ -198,9 +197,8 @@ void Session::Reset() {
   model_->executor_->MtpRewind(*session_, 0);
 }
 
-std::int32_t Session::Argmax(const float* row,
-                             std::size_t count) const noexcept {
-  const std::size_t n = count > 0 ? count : model_->VocabSize();
+std::int32_t Session::Argmax(const float* row) const noexcept {
+  const std::size_t n = model_->VocabSize();
   return static_cast<std::int32_t>(std::max_element(row, row + n) - row);
 }
 
@@ -324,8 +322,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return false;
   }
   std::vector<std::int32_t> chain{anchor};
-  const std::size_t draft_rows = exec.DraftRows();
-  std::int32_t draft = Argmax(draft_logits_.data(), draft_rows);
+  std::int32_t draft = Argmax(draft_logits_.data());
   while (chain.size() < width) {
     chain.push_back(draft);
     if (chain.size() < width) {
@@ -333,7 +330,7 @@ bool Session::DecodeStep(std::size_t max_tokens,
                            -1, draft_logits_.data(), error_msg)) {
         return false;
       }
-      draft = Argmax(draft_logits_.data(), draft_rows);
+      draft = Argmax(draft_logits_.data());
     }
   }
 

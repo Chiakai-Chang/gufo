@@ -35,14 +35,8 @@ struct ModelOptions {
   /// Optional MTP draft sidecar (`mtp-...-shared-*.gguf`). Empty leaves
   /// speculative decoding off.
   std::string mtp_model_path;
-  /// Prefill chunk; also bounds the draft block's batch.
-  std::uint32_t max_batch = 512;
   /// Tokens the draft block proposes per speculative cycle.
-  std::uint32_t max_draft_tokens = 3;
-  /// Vocabulary prefix the draft block scores (0 = full). Token ids follow
-  /// merge order, so a prefix holds the frequent tokens; verification
-  /// always uses the full head, so only which draft is proposed changes.
-  std::uint32_t draft_vocab = 0;
+  std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
 };
 
 class Session;
@@ -68,6 +62,7 @@ public:
   [[nodiscard]] std::int32_t EosToken() const noexcept;
   [[nodiscard]] bool IsStopToken(std::int32_t token) const noexcept;
   [[nodiscard]] std::uint32_t VocabSize() const noexcept;
+  [[nodiscard]] std::uint32_t PrefillCapacity() const noexcept;
   [[nodiscard]] std::uint32_t MaxContext() const noexcept {
     return options_.max_context;
   }
@@ -149,8 +144,7 @@ private:
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg);
   bool DraftCatchUp(std::int32_t next_token, std::string* error_msg);
-  [[nodiscard]] std::int32_t Argmax(const float* row,
-                                    std::size_t count = 0) const noexcept;
+  [[nodiscard]] std::int32_t Argmax(const float* row) const noexcept;
 
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;

@@ -1,247 +1,169 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 
-#include <algorithm>
 #include <array>
 #include <hipblaslt/hipblaslt-ext.hpp>
-#include <sstream>
+#include <vector>
 
 namespace gufo::models::qwen38_flash_next::rocm {
-
 namespace {
 
-constexpr std::size_t kWorkspaceBytes = std::size_t{32} << 20;
-constexpr int kCandidates = 16;
-
-void AssignError(std::string* error_msg, const std::string& message) {
-  if (error_msg != nullptr) {
-    *error_msg = message;
+void AssignError(std::string* error, const char* message) {
+  if (error != nullptr) {
+    *error = message;
   }
+}
+
+int ProjectionAlgorithm(hipDataType type, int m, int n, int k) {
+  // gfx1151 / pinned hipBLASLt: offline F16 alpha-beta and router sweeps.
+  // The first heuristic can be several times slower. These workspace-free
+  // kernels pass the F64 and cross-instance replay checks.
+  if (type != HIP_R_16F || k != 2560 || (m != 96 && m != 513)) {
+    return -1;
+  }
+  if (m == 96) {
+    return n <= 256 ? 5079 : n <= 1024 ? 5080 : 5081;
+  }
+  return n <= 128 ? 5079 : 5081;
 }
 
 }  // namespace
 
-struct BlasLt::Problem {
-  Operand a;
-  Operand b;
-  float* out;
-  int ldc;
-  long long stride_c;
-  int m, n, k, batch;
+struct BlasLt::Plan {
+  hipblasLtMatmulDesc_t operation{nullptr};
+  hipblasLtMatrixLayout_t weights{nullptr};
+  hipblasLtMatrixLayout_t input{nullptr};
+  hipblasLtMatrixLayout_t output{nullptr};
+  hipblasLtMatmulAlgo_t algorithm{};
 
-  /// Token counts round up to a power of two: one plan per size class.
-  [[nodiscard]] int ClassN() const {
-    int c = 16;
-    while (c < n) {
-      c *= 2;
-    }
-    return c;
-  }
-  [[nodiscard]] std::string Key() const {
-    std::ostringstream key;
-    key << a.type << ':' << a.transpose << ':' << b.type << ':' << b.transpose
-        << ':' << m << ':' << k << ':' << batch << ':' << ClassN();
-    return key.str();
+  ~Plan() {
+    if (output != nullptr)
+      (void)hipblasLtMatrixLayoutDestroy(output);
+    if (input != nullptr)
+      (void)hipblasLtMatrixLayoutDestroy(input);
+    if (weights != nullptr)
+      (void)hipblasLtMatrixLayoutDestroy(weights);
+    if (operation != nullptr)
+      (void)hipblasLtMatmulDescDestroy(operation);
   }
 };
 
 BlasLt::~BlasLt() {
-  if (workspace_ != nullptr) {
-    (void)hipFree(workspace_);
-  }
+  plans_.clear();
   if (handle_ != nullptr) {
     (void)hipblasLtDestroy(handle_);
   }
 }
 
-std::unique_ptr<BlasLt> BlasLt::Create(hipStream_t stream,
-                                       std::uint32_t tuning_n,
-                                       std::string* error_msg) {
-  std::unique_ptr<BlasLt> b(new BlasLt());
-  b->stream_ = stream;
-  b->tuning_n_ = std::max<std::uint32_t>(1, tuning_n);
-  if (hipblasLtCreate(&b->handle_) != HIPBLAS_STATUS_SUCCESS) {
-    AssignError(error_msg, "hipblasLtCreate failed");
+std::unique_ptr<BlasLt> BlasLt::Create(hipStream_t stream, std::string* error) {
+  std::unique_ptr<BlasLt> blas(new BlasLt());
+  blas->stream_ = stream;
+  if (hipblasLtCreate(&blas->handle_) != HIPBLAS_STATUS_SUCCESS) {
+    AssignError(error, "hipblasLtCreate failed");
     return nullptr;
   }
-  if (hipMalloc(&b->workspace_, kWorkspaceBytes) != hipSuccess) {
-    AssignError(error_msg, "hipBLASLt workspace allocation failed");
-    return nullptr;
-  }
-  b->workspace_bytes_ = kWorkspaceBytes;
-  return b;
+  return blas;
 }
 
-bool BlasLt::Describe(const Problem& p, hipblasLtMatmulDesc_t* desc,
-                      hipblasLtMatrixLayout_t* la, hipblasLtMatrixLayout_t* lb,
-                      hipblasLtMatrixLayout_t* lc) const {
-  // Column-major view: C(m x n) = opA(A) * opB(B). A row-major [m][k]
-  // operand is a column-major (k x m) matrix, so it enters transposed; a
-  // transposed operand ([k][m] in memory) enters as is.
-  const hipblasOperation_t op_a = p.a.transpose ? HIPBLAS_OP_N : HIPBLAS_OP_T;
-  const hipblasOperation_t op_b = p.b.transpose ? HIPBLAS_OP_T : HIPBLAS_OP_N;
-  if (hipblasLtMatmulDescCreate(desc, HIPBLAS_COMPUTE_32F, HIP_R_32F) !=
+std::unique_ptr<BlasLt::Plan> BlasLt::MakePlan(hipDataType type, int m, int n,
+                                               int k,
+                                               std::string* error) const {
+  auto p = std::make_unique<Plan>();
+  const hipblasOperation_t transpose = HIPBLAS_OP_T;
+  const hipblasOperation_t normal = HIPBLAS_OP_N;
+  if (hipblasLtMatmulDescCreate(&p->operation, HIPBLAS_COMPUTE_32F,
+                                HIP_R_32F) != HIPBLAS_STATUS_SUCCESS ||
+      hipblasLtMatmulDescSetAttribute(
+          p->operation, HIPBLASLT_MATMUL_DESC_TRANSA, &transpose,
+          sizeof(transpose)) != HIPBLAS_STATUS_SUCCESS ||
+      hipblasLtMatmulDescSetAttribute(
+          p->operation, HIPBLASLT_MATMUL_DESC_TRANSB, &normal,
+          sizeof(normal)) != HIPBLAS_STATUS_SUCCESS ||
+      hipblasLtMatrixLayoutCreate(&p->weights, type, k, m, k) !=
           HIPBLAS_STATUS_SUCCESS ||
-      hipblasLtMatmulDescSetAttribute(*desc, HIPBLASLT_MATMUL_DESC_TRANSA,
-                                      &op_a,
-                                      sizeof(op_a)) != HIPBLAS_STATUS_SUCCESS ||
-      hipblasLtMatmulDescSetAttribute(*desc, HIPBLASLT_MATMUL_DESC_TRANSB,
-                                      &op_b,
-                                      sizeof(op_b)) != HIPBLAS_STATUS_SUCCESS) {
-    return false;
+      hipblasLtMatrixLayoutCreate(&p->input, type, k, n, k) !=
+          HIPBLAS_STATUS_SUCCESS ||
+      hipblasLtMatrixLayoutCreate(&p->output, HIP_R_32F, m, n, m) !=
+          HIPBLAS_STATUS_SUCCESS) {
+    AssignError(error, "hipBLASLt descriptor creation failed");
+    return nullptr;
   }
-  const auto layout = [&](hipblasLtMatrixLayout_t* l, hipDataType type,
-                          std::uint64_t rows, std::uint64_t cols, int ld,
-                          long long stride) {
-    if (hipblasLtMatrixLayoutCreate(l, type, rows, cols, ld) !=
-        HIPBLAS_STATUS_SUCCESS) {
-      return false;
-    }
-    const std::int32_t count = p.batch;
-    return hipblasLtMatrixLayoutSetAttribute(
-               *l, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &count,
-               sizeof(count)) == HIPBLAS_STATUS_SUCCESS &&
-           hipblasLtMatrixLayoutSetAttribute(
-               *l, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &stride,
-               sizeof(stride)) == HIPBLAS_STATUS_SUCCESS;
+
+  const float one = 1.0F;
+  const float zero = 0.0F;
+  const auto usable = [&](hipblasLtMatmulAlgo_t& algorithm) {
+    std::size_t workspace = 0;
+    return hipblaslt_ext::matmulIsAlgoSupported(
+               handle_, p->operation, &one, p->weights, p->input, &zero,
+               p->output, p->output, algorithm,
+               workspace) == HIPBLAS_STATUS_SUCCESS &&
+           workspace == 0;
   };
-  // Layout dimensions describe the stored (untransposed) matrix.
-  const std::uint64_t m = p.m;
-  const std::uint64_t n = p.n;
-  const std::uint64_t k = p.k;
-  return layout(la, p.a.type, p.a.transpose ? m : k, p.a.transpose ? k : m,
-                p.a.ld, p.a.stride) &&
-         layout(lb, p.b.type, p.b.transpose ? n : k, p.b.transpose ? k : n,
-                p.b.ld, p.b.stride) &&
-         layout(lc, HIP_R_32F, m, n, p.ldc, p.stride_c);
-}
 
-bool BlasLt::Tune(const Problem& p, float* out, Plan* plan,
-                  std::string* error_msg) {
-  hipblasLtMatmulDesc_t desc = nullptr;
-  hipblasLtMatrixLayout_t la = nullptr;
-  hipblasLtMatrixLayout_t lb = nullptr;
-  hipblasLtMatrixLayout_t lc = nullptr;
-  if (!Describe(p, &desc, &la, &lb, &lc)) {
-    AssignError(error_msg, "hipBLASLt descriptor creation failed");
-    return false;
+  // Initialize the solution library and keep a deterministic fallback for
+  // other tensor geometries. No trial GEMMs run on model activations.
+  hipblasLtMatmulPreference_t preference = nullptr;
+  if (hipblasLtMatmulPreferenceCreate(&preference) != HIPBLAS_STATUS_SUCCESS) {
+    AssignError(error, "hipBLASLt preference creation failed");
+    return nullptr;
   }
-  hipblasLtMatmulPreference_t pref = nullptr;
-  std::array<hipblasLtMatmulHeuristicResult_t, kCandidates> results{};
-  int found = 0;
-  const bool listed =
-      hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
-      hipblasLtMatmulPreferenceSetAttribute(
-          pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes_,
-          sizeof(workspace_bytes_)) == HIPBLAS_STATUS_SUCCESS &&
-      hipblasLtMatmulAlgoGetHeuristic(handle_, desc, la, lb, lc, lc, pref,
-                                      kCandidates, results.data(),
-                                      &found) == HIPBLAS_STATUS_SUCCESS &&
-      found > 0;
-  bool ok = listed;
-  if (listed) {
-    const float one = 1.0F;
-    const float zero = 0.0F;
-    hipEvent_t start = nullptr;
-    hipEvent_t stop = nullptr;
-    (void)hipEventCreate(&start);
-    (void)hipEventCreate(&stop);
-    float best_ms = 0.0F;
-    bool have_best = false;
-    for (int i = 0; i < found; ++i) {
-      // Workspace-backed kernels split K and reduce afterwards; the plain
-      // ones keep one summation order per output, which the repeatability
-      // checks rely on.
-      if (results[i].state != HIPBLAS_STATUS_SUCCESS ||
-          results[i].workspaceSize != 0) {
-        continue;
-      }
-      const auto run = [&] {
-        return hipblasLtMatmul(handle_, desc, &one, p.a.data, la, p.b.data, lb,
-                               &zero, out, lc, out, lc, &results[i].algo,
-                               workspace_, workspace_bytes_,
-                               stream_) == HIPBLAS_STATUS_SUCCESS;
-      };
-      if (!run()) {
-        continue;
-      }
-      (void)hipEventRecord(start, stream_);
-      constexpr int kReps = 3;
-      bool ran = true;
-      for (int r = 0; r < kReps && ran; ++r) {
-        ran = run();
-      }
-      (void)hipEventRecord(stop, stream_);
-      (void)hipEventSynchronize(stop);
-      float ms = 0.0F;
-      (void)hipEventElapsedTime(&ms, start, stop);
-      if (ran && (!have_best || ms < best_ms)) {
-        best_ms = ms;
-        have_best = true;
-        plan->algo = results[i].algo;
+  constexpr std::size_t workspace = 0;
+  (void)hipblasLtMatmulPreferenceSetAttribute(
+      preference, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace,
+      sizeof(workspace));
+  std::array<hipblasLtMatmulHeuristicResult_t, 16> candidates{};
+  int count = 0;
+  const auto status = hipblasLtMatmulAlgoGetHeuristic(
+      handle_, p->operation, p->weights, p->input, p->output, p->output,
+      preference, candidates.size(), candidates.data(), &count);
+  (void)hipblasLtMatmulPreferenceDestroy(preference);
+
+  const int preferred = ProjectionAlgorithm(type, m, n, k);
+  if (preferred >= 0) {
+    std::vector<int> indices{preferred};
+    std::vector<hipblasLtMatmulHeuristicResult_t> selected;
+    if (hipblaslt_ext::getAlgosFromIndex(handle_, indices, selected) ==
+            HIPBLAS_STATUS_SUCCESS &&
+        !selected.empty() && usable(selected.front().algo)) {
+      p->algorithm = selected.front().algo;
+      return p;
+    }
+  }
+  if (status == HIPBLAS_STATUS_SUCCESS) {
+    for (int i = 0; i < count; ++i) {
+      if (candidates[i].state == HIPBLAS_STATUS_SUCCESS &&
+          candidates[i].workspaceSize == 0 && usable(candidates[i].algo)) {
+        p->algorithm = candidates[i].algo;
+        return p;
       }
     }
-    (void)hipEventDestroy(start);
-    (void)hipEventDestroy(stop);
-    ok = have_best;
-    plan->tuned = have_best;
   }
-  if (pref != nullptr) {
-    (void)hipblasLtMatmulPreferenceDestroy(pref);
-  }
-  (void)hipblasLtMatrixLayoutDestroy(lc);
-  (void)hipblasLtMatrixLayoutDestroy(lb);
-  (void)hipblasLtMatrixLayoutDestroy(la);
-  (void)hipblasLtMatmulDescDestroy(desc);
-  if (!ok) {
-    AssignError(error_msg, "no hipBLASLt kernel for the GEMM shape");
-  }
-  return ok;
+  AssignError(error, "no workspace-free hipBLASLt kernel for the GEMM shape");
+  return nullptr;
 }
 
-bool BlasLt::Gemm(const Operand& a, const Operand& b, float* out, int ldc,
-                  long long stride_c, int m, int n, int k, int batch,
-                  std::string* error_msg) {
-  const Problem p{a, b, out, ldc, stride_c, m, n, k, batch};
-  Plan& plan = plans_[p.Key()];
-  if (!plan.tuned) {
-    // Time the class at the top of its size bucket (never past the buffers
-    // sized for tuning_n); the layouts below carry the real n.
-    Problem widest = p;
-    widest.n = std::min<int>(p.ClassN(), static_cast<int>(tuning_n_));
-    widest.n = std::max<int>(widest.n, n);
-    if (!Tune(widest, out, &plan, error_msg)) {
+bool BlasLt::Gemm(const void* weights, const void* input, float* out,
+                  hipDataType type, int m, int n, int k, std::string* error) {
+  if (m <= 0 || n <= 0 || k <= 0) {
+    AssignError(error, "hipBLASLt dimensions must be positive");
+    return false;
+  }
+  // Exact dimensions prevent the first ragged request from determining
+  // which kernel later requests in the same size bucket receive.
+  const std::array<int, 4> key{static_cast<int>(type), m, n, k};
+  auto& p = plans_[key];
+  if (!p) {
+    p = MakePlan(type, m, n, k, error);
+    if (!p) {
       return false;
     }
-  }
-  hipblasLtMatmulDesc_t desc = nullptr;
-  hipblasLtMatrixLayout_t la = nullptr;
-  hipblasLtMatrixLayout_t lb = nullptr;
-  hipblasLtMatrixLayout_t lc = nullptr;
-  if (!Describe(p, &desc, &la, &lb, &lc)) {
-    AssignError(error_msg, "hipBLASLt descriptor creation failed");
-    return false;
   }
   const float one = 1.0F;
   const float zero = 0.0F;
-  // The kernel was picked at the tuning width; make sure it also takes
-  // this one.
-  std::size_t needed = 0;
-  hipblasStatus_t status = hipblaslt_ext::matmulIsAlgoSupported(
-      handle_, desc, &one, la, lb, &zero, lc, lc, plan.algo, needed);
-  if (status == HIPBLAS_STATUS_SUCCESS && needed > workspace_bytes_) {
-    status = HIPBLAS_STATUS_INVALID_VALUE;
-  }
-  if (status == HIPBLAS_STATUS_SUCCESS) {
-    status = hipblasLtMatmul(handle_, desc, &one, a.data, la, b.data, lb, &zero,
-                             out, lc, out, lc, &plan.algo, workspace_,
-                             workspace_bytes_, stream_);
-  }
-  (void)hipblasLtMatrixLayoutDestroy(lc);
-  (void)hipblasLtMatrixLayoutDestroy(lb);
-  (void)hipblasLtMatrixLayoutDestroy(la);
-  (void)hipblasLtMatmulDescDestroy(desc);
-  if (status != HIPBLAS_STATUS_SUCCESS) {
-    AssignError(error_msg, "hipBLASLt GEMM failed");
+  if (hipblasLtMatmul(handle_, p->operation, &one, weights, p->weights, input,
+                      p->input, &zero, out, p->output, out, p->output,
+                      &p->algorithm, nullptr, 0,
+                      stream_) != HIPBLAS_STATUS_SUCCESS) {
+    AssignError(error, "hipBLASLt GEMM failed");
     return false;
   }
   return true;
