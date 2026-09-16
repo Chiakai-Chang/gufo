@@ -24,10 +24,15 @@ TOKEN_TRACE_RE = re.compile(
     r"^\[TokenTrace\]: count=(?P<count>\d+) sha256=(?P<sha256>[0-9a-f]{64})$",
     re.MULTILINE,
 )
+LLAMA_EVAL_RE = re.compile(
+    r"common_perf_print:\s+eval time =\s+(?P<ms>[0-9.]+) ms /\s+"
+    r"(?P<runs>\d+) runs"
+)
 SPECULATIVE_FIELD_RE = re.compile(
     r"(?P<key>[a-z_]+)=(?P<value>[0-9.eE+-]+)"
 )
 DSPARK_REFERENCE_SYSTEM_PROMPT = "You are a helpful assistant"
+QWEN_SYSTEM_PROMPT = "You are a helpful, respectful, and honest assistant."
 
 def parse_token_trace(stderr: str, tokens: int) -> str:
     trace = TOKEN_TRACE_RE.search(stderr)
@@ -247,6 +252,51 @@ def run_prompt(
     return result
 
 
+def run_llama_completion(args: argparse.Namespace, prompt: str) -> dict[str, object]:
+    if args.prompt_mode == "raw":
+        rendered = prompt
+    else:
+        system = args.system_prompt if args.system_prompt is not None else QWEN_SYSTEM_PROMPT
+        rendered = (
+            f"<|im_start|>system\n{system}<|im_end|>\n"
+            f"<|im_start|>user\n{prompt.strip()}<|im_end|>\n"
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+    command = [
+        args.llama_binary, "--model", args.model, "--prompt", rendered,
+        "--no-conversation", "--no-display-prompt",
+        "--n-predict", str(args.max_tokens), "--ctx-size", "4096",
+        "--temp", "0", "--top-k", "0", "--top-p", "1",
+        "--min-p", "0", "--samplers", "temperature",
+        "--seed", "0", "--gpu-layers", "99",
+        "--flash-attn", "on", "--cache-type-k", "f16",
+        "--cache-type-v", "f16", "--perf",
+    ]
+    process = subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, timeout=args.timeout,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"llama-completion failed ({process.returncode}): {process.stderr}"
+        )
+    match = LLAMA_EVAL_RE.search(process.stderr)
+    if match is None:
+        raise RuntimeError("llama-completion did not report decode timing")
+    runs = int(match.group("runs"))
+    seconds = float(match.group("ms")) / 1000.0
+    if runs <= 0 or seconds <= 0:
+        raise RuntimeError("llama-completion reported no decode work")
+    if not process.stdout.endswith("\n\n"):
+        raise RuntimeError("llama-completion output is missing its two display newlines")
+    return {
+        "completion": process.stdout.removesuffix("\n\n"),
+        "eval_runs": runs,
+        "seconds": seconds,
+        "tps": runs / seconds,
+    }
+
+
 def mismatch_summary(expected: str, actual: str) -> str:
     common = 0
     for left, right in zip(expected, actual):
@@ -290,6 +340,10 @@ def load_prompts(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True)
+    parser.add_argument(
+        "--llama-binary",
+        help="optional nixpkgs llama-completion executable for the same prompts",
+    )
     parser.add_argument("--model", required=True)
     parser.add_argument("--draft-model", required=True)
     parser.add_argument(
@@ -347,6 +401,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.draft_policy is not None and args.backend != "dflash2":
         parser.error("--draft-policy requires a DFlash2 backend")
+    if args.llama_binary and args.backend != "dflash2":
+        parser.error("--llama-binary currently supports Qwen DFlash2 only")
 
     if (
         args.max_tokens <= 0
@@ -364,10 +420,12 @@ def main() -> int:
         "| prompt | category | exact | AR tok/s | speculative tok/s | "
         "speedup | support acceptance | positional | full blocks | attempts | "
         "skipped | avg support |"
+        + (" llama.cpp tok/s | llama/Gufo exact |" if args.llama_binary else "")
     )
     print(
         "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | "
         "---: | ---: | ---: |"
+        + (" ---: | ---: |" if args.llama_binary else "")
     )
 
     cache_path = Path(args.ar_cache) if args.ar_cache else None
@@ -407,6 +465,10 @@ def main() -> int:
                 run_prompt(args, case["text"], True, environment)
                 for _ in range(args.repetitions)
             ]
+            llama = (
+                run_llama_completion(args, case["text"])
+                if args.llama_binary else None
+            )
             if any(run["tokens"] == 0 or run["seconds"] <= 0
                    for run in [autoregressive, *speculative_runs]):
                 raise RuntimeError("speed comparison needs generated tokens and positive time")
@@ -418,6 +480,7 @@ def main() -> int:
             print(
                 f"| {case['id']} | {case['category']} | - | - | - | - | - | "
                 f"- | - | - | - | - |"
+                + (" - | - |" if args.llama_binary else "")
             )
             continue
         exact = all(
@@ -425,6 +488,10 @@ def main() -> int:
             and run["tokens"] == autoregressive["tokens"]
             and run["token_sha256"] == autoregressive["token_sha256"]
             for run in speculative_runs
+        )
+        llama_exact = (
+            llama is not None
+            and llama["completion"] == autoregressive["completion"]
         )
         spec_seconds = statistics.median(
             float(run["seconds"]) for run in speculative_runs
@@ -495,21 +562,25 @@ def main() -> int:
             f"{speedup:.2f}x | {acceptance * 100.0:.1f}% | "
             f"{positional_cell} | {full_block_cell} | {attempts} | {skipped} | "
             f"{average_draft:.2f} |"
+            + (f" {llama['tps']:.2f} | {'yes' if llama_exact else 'NO'} |"
+               if llama is not None else "")
         )
-        rows.append(
-            {
-                "id": case["id"],
-                "category": case["category"],
-                "exact": exact,
-                "ar_tps": ar_tps,
-                "spec_tps": spec_tps,
-                "speedup": speedup,
-                "acceptance": acceptance,
-                "average_draft": average_draft,
-                "reference": autoregressive,
-                "runs": speculative_runs,
-            }
-        )
+        row = {
+            "id": case["id"],
+            "category": case["category"],
+            "exact": exact,
+            "ar_tps": ar_tps,
+            "spec_tps": spec_tps,
+            "speedup": speedup,
+            "acceptance": acceptance,
+            "average_draft": average_draft,
+            "reference": autoregressive,
+            "runs": speculative_runs,
+        }
+        if llama is not None:
+            row["llama"] = llama
+            row["llama_exact"] = llama_exact
+        rows.append(row)
         if minimum_steps > 0 and attempts < minimum_steps:
             sparse_samples.append(
                 f"{case['id']}: {attempts} attempted blocks, need {minimum_steps}"
@@ -536,6 +607,12 @@ def main() -> int:
 
     aggregate_ar = total_ar_tokens / total_ar_seconds
     aggregate_spec = total_tokens / total_spec_seconds
+    aggregate_llama = (
+        sum(int(row["llama"]["eval_runs"]) for row in rows)
+        / sum(float(row["llama"]["seconds"]) for row in rows)
+        if args.llama_binary else None
+    )
+    llama_exact_count = sum(bool(row.get("llama_exact")) for row in rows)
     aggregate_acceptance = (
         total_accepted / total_drafted if total_drafted else 0.0
     )
@@ -574,6 +651,9 @@ def main() -> int:
         f"{positional_summary}{full_block_summary}"
         f"attempts={total_steps} skipped={total_skipped} "
         f"avg_support={total_drafted / max(total_steps, 1):.2f}"
+        + (f" llama={aggregate_llama:.2f} tok/s "
+           f"llama_exact={llama_exact_count}/{len(rows)}"
+           if aggregate_llama is not None else "")
     )
     if args.json_path:
         prompt_mode = args.prompt_mode
@@ -585,12 +665,18 @@ def main() -> int:
                     "schema": "gufo.speculative-corpus-report.v1",
                     "label": args.label,
                     "binary": os.path.realpath(args.binary),
+                    "llama_binary": (
+                        os.path.realpath(args.llama_binary)
+                        if args.llama_binary else None
+                    ),
                     "model": os.path.realpath(args.model),
                     "draft_model": os.path.realpath(args.draft_model),
                     "artifacts": {
                         "binary": artifact_identity(args.binary),
                         "model": artifact_identity(args.model),
                         "draft": artifact_identity(args.draft_model),
+                        **({"llama_binary": artifact_identity(args.llama_binary)}
+                           if args.llama_binary else {}),
                     },
                     "backend": args.backend,
                     "profile": "production",
@@ -611,6 +697,9 @@ def main() -> int:
                         "median_speedup": statistics.median(speedups),
                         "acceptance": aggregate_acceptance,
                         "average_draft": total_drafted / max(total_steps, 1),
+                        **({"llama_tps": aggregate_llama,
+                            "llama_exact": llama_exact_count}
+                           if aggregate_llama is not None else {}),
                     },
                 },
                 indent=1,

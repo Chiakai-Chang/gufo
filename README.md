@@ -20,75 +20,36 @@ Supported models:
 
 More info in [MODELS.md](./docs/MODELS.md)
 
-## Quickstart
-
-```sh
-hf download unsloth/Qwen3.8-27B-GGUF \
-  Qwen3.8-27B-UD-Q8_K_XL.gguf \
-  --repo-type model \
-  --local-dir models/Qwen3.8-27B-GGUF
-nix develop -c hf download z-lab/Qwen3.8-27B-DFlash2-GGUF \
-  Qwen3.8-27B-DFlash2-Q8_0.gguf \
-  --repo-type model \
-  --local-dir models/Qwen3.8-27B-DFlash2-GGUF
-podman pull ghcr.io/gufo-org/toolboxes/gufo-runtime:latest
-podman run --rm \
-  --userns=keep-id:uid=1000,gid=1000 \
-  --device /dev/kfd \
-  --device /dev/dri \
-  --group-add keep-groups \
-  --ulimit memlock=-1 \
-  -p 8080:8080 \
-  -v ./models:/models:ro \
-  ghcr.io/gufo-org/toolboxes/gufo-runtime:latest \
-  gufo serve --host 0.0.0.0 --port 8080 llm \
-  --model /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf \
-  --speculative dflash2 \
-  --dflash-model /models/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q8_0.gguf
-```
-
-Then, from another terminal, ask it something through the OpenAI-compatible API:
-
-```sh
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3.8-27B-UD-Q8_K_XL",
-    "messages": [{"role": "user", "content": "Say something"}]
-  }'
-```
-
-The server also exposes `/v1/completions`, `/v1/responses`, `/v1/models`, and
-`/health`. Any OpenAI-compatible client can point at `http://localhost:8080`.
-
-## Manifest/Philosophy
-
-- The project is vertical on the AMD Strix Halo 128 GiB; our goal is solely to optimize it. This enables optimizations that otherwise wouldn't be possible if we were focusing on other chips as well. Smaller models should fit the 32 and 64 GiB hardware, but no test was conducted on them.
-- Quality over speed: we want to squeeze the most out of this chip without compromising on quality compared to other available tools (llama.cpp, audio.cpp, dwarfstar, etc.). To guarantee this we ensure several steps during the development, such as logits checks, internal eval, and a harness + model evaluation framework (coming soon). If at some point a breakthrough novelty brings a lot of speed at the cost of a little accuracy, the feature would be opt-in and the user will be responsible for enabling it, acknowledging the accuracy degradation.
-- We only support a few models to allow us to run extremely long optimization sessions to improve kernels based on the Strix Halo architecture. Models are selected based on evidence collected by the community on "the best model for task X for Strix Halo".
-- Code duplication over code re-utilization across models and quants. Despite being counterintuitive, it allows us to make models evolve independently without huge refactors when an optimization works only for a model and not for another.
-- We would like this project to be the reference for the community using Strix Halo, and every PR is welcome.
-- We don't to sacrificate multi-agent scenarios, concurrent requests are a first class citizen gufo.
-
 ## Benchmarks
 
 ### Text
 
-#### Qwen3.8-27B
+#### Qwen3.8-27B Q4
 
-Comparison of gufo's native Qwen3.8-27B path against `llama.cpp` on the same hardware, the same model weights (Q8 with DFlash2 Q8), and the same numeric precision.
+**Date: 2026-09-16 — Gufo `7daf2ebc` — llama.cpp benchmark binary `169e4a7ff` (build 10489)**
 
-_Illustrative facsimile data; these are not measured benchmark results._
+Gufo and `llama.cpp` were benchmarked on the same Strix Halo machine and the same `UD-Q4_K_XL` model file, with FP16 KV caches. Both use 2,048 prompt tokens and 128 generation steps at each prepared context depth. Their benchmark tools use different token sequences: Gufo greedily generates output, while `llama-bench` feeds random tokens. The Gufo / llama.cpp figures compare throughput at the same workload shape, not identical completions. Gufo used three repetitions; llama.cpp used one. Values are tokens/s.
 
-| Depth | Gufo `pp2048/tg128` | Over llama.cpp `pp2048/tg128` | DFlash2 mixed corpus/repetition `tg128` | DFlash2 over llama.cpp `tg128` |
-| ----: | ------------------: | ----------------------------: | --------------------------------------: | -----------------------------: |
-|     0 |       545.15 / 7.10 |                   155% / 156% |                              62.06 / 50 |                  1364% / 1099% |
-|   16K |       446.94 / 6.50 |                   166% / 176% |                              62.06 / 50 |                  1677% / 1351% |
-|   32K |       398.20 / 6.20 |                   173% / 188% |                              62.06 / 50 |                  1881% / 1515% |
-|   64K |       351.60 / 5.90 |                   185% / 200% |                              62.06 / 50 |                  2104% / 1695% |
-|  128K |       289.40 / 5.50 |                   207% / 224% |                              62.06 / 50 |                  2533% / 2041% |
+| Depth | Gufo `pp2048 / tg128` | llama.cpp `pp2048 / tg128` | Gufo / llama.cpp `pp2048 / tg128` |
+| ----: | --------------------: | -------------------------: | --------------------------------: |
+|     0 |        689.69 / 12.02 |             348.41 / 12.11 |                        198% / 99% |
+|   16K |        523.59 / 11.32 |             252.01 / 11.46 |                        208% / 99% |
+|   32K |        354.36 / 10.58 |             194.40 / 10.89 |                        182% / 97% |
+|   64K |         199.97 / 9.25 |              121.42 / 9.94 |                        165% / 93% |
+|  128K |         106.52 / 6.35 |               76.95 / 8.45 |                        138% / 75% |
+
+On 2026-09-17, the Q4 target and `DFlash2-Q4_K_M` draft were run on the [corpus suite](benchmarks/qwen3.8-27b/speculative-corpus.json) with production chat framing, greedy decoding, a 128-token output limit, and one run per case. These short prompts have no prepared context depth, so their results are separate from the depth sweep. “Mixed” contains nine non-repetitive prompts; “repetition” contains the two repetitive prompts. Throughput is total generated tokens divided by total generation time within each group. Acceptance is accepted draft tokens divided by proposed draft tokens. All 11 DFlash2 completions matched Gufo's non-speculative output token for token.
+
+| Corpus group | Cases | Gufo AR `tg≤128` | Gufo DFlash2 `tg≤128` | Acceptance | DFlash2 / Gufo AR | llama.cpp AR `tg≤128` | llama.cpp / Gufo exact |
+| -----------: | ----: | ---------------: | --------------------: | ---------: | ----------------: | ---------------------: | ----------------------: |
+|        Mixed |     9 |            11.69 |                 29.26 |      48.3% |             2.50x |                  12.00 |                     3/9 |
+|   Repetition |     2 |            11.72 |                 53.83 |      89.6% |             4.59x |                  11.99 |                     1/2 |
+
+The corpus llama.cpp run used the supplied nixpkgs `llama-completion` binary (version `7d56da7`, package `llama-cpp-10063`) and the same Q4 target, prompt tokens, and greedy output limit. Its reported rate is decode evaluation tokens divided by decode evaluation time, excluding the first-token evaluation. Four of its 11 completion texts exactly matched Gufo's. The other seven diverged in generated content despite identical prompt tokens, so no DFlash2 / llama.cpp speedup is claimed from this corpus.
 
 With concurrency token generation using the dflash2 drafter (cumulative)
+
+_Illustrative facsimile data; these are not measured benchmark results._
 
 | Concurrency | Gufo `pp2048/tg128` | Over llama.cpp `pp2048/tg128` | DFlash2 mixed corpus/repetition `tg128` | DFlash2 over llama.cpp `tg128` |
 | ----------: | ------------------: | ----------------------------: | --------------------------------------: | -----------------------------: |
@@ -134,6 +95,56 @@ Comparison of gufo's native Qwen3-TTS and Qwen3-ASR paths against [audio.cpp](ht
 | asr  | **0.075** | **0.121**     | **1.62x**   |
 
 For more information please see [TTS_ASR.md](./docs/benchmarks/TTS_ASR.md).
+
+## Manifest/Philosophy
+
+- The project is vertical on the AMD Strix Halo 128 GiB; our goal is solely to optimize it. This enables optimizations that otherwise wouldn't be possible if we were focusing on other chips as well. Smaller models should fit the 32 and 64 GiB hardware, but no test was conducted on them.
+- Quality over speed: we want to squeeze the most out of this chip without compromising on quality compared to other available tools (llama.cpp, audio.cpp, dwarfstar, etc.). To guarantee this we ensure several steps during the development, such as logits checks, internal eval, and a harness + model evaluation framework (coming soon). If at some point a breakthrough novelty brings a lot of speed at the cost of a little accuracy, the feature would be opt-in and the user will be responsible for enabling it, acknowledging the accuracy degradation.
+- We only support a few models to allow us to run extremely long optimization sessions to improve kernels based on the Strix Halo architecture. Models are selected based on evidence collected by the community on "the best model for task X for Strix Halo".
+- Code duplication over code re-utilization across models and quants. Despite being counterintuitive, it allows us to make models evolve independently without huge refactors when an optimization works only for a model and not for another.
+- We would like this project to be the reference for the community using Strix Halo, and every PR is welcome.
+- We don't to sacrificate multi-agent scenarios, concurrent requests are a first class citizen gufo.
+
+## Quickstart
+
+```sh
+hf download unsloth/Qwen3.8-27B-GGUF \
+  Qwen3.8-27B-UD-Q8_K_XL.gguf \
+  --repo-type model \
+  --local-dir models/Qwen3.8-27B-GGUF
+nix develop -c hf download z-lab/Qwen3.8-27B-DFlash2-GGUF \
+  Qwen3.8-27B-DFlash2-Q8_0.gguf \
+  --repo-type model \
+  --local-dir models/Qwen3.8-27B-DFlash2-GGUF
+podman pull ghcr.io/gufo-org/toolboxes/gufo-runtime:latest
+podman run --rm \
+  --userns=keep-id:uid=1000,gid=1000 \
+  --device /dev/kfd \
+  --device /dev/dri \
+  --group-add keep-groups \
+  --ulimit memlock=-1 \
+  -p 8080:8080 \
+  -v ./models:/models:ro \
+  ghcr.io/gufo-org/toolboxes/gufo-runtime:latest \
+  gufo serve --host 0.0.0.0 --port 8080 llm \
+  --model /models/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf \
+  --speculative dflash2 \
+  --dflash-model /models/Qwen3.8-27B-DFlash2-GGUF/Qwen3.8-27B-DFlash2-Q8_0.gguf
+```
+
+Then, from another terminal, ask it something through the OpenAI-compatible API:
+
+```sh
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.8-27B-UD-Q8_K_XL",
+    "messages": [{"role": "user", "content": "Say something"}]
+  }'
+```
+
+The server also exposes `/v1/completions`, `/v1/responses`, `/v1/models`, and
+`/health`. Any OpenAI-compatible client can point at `http://localhost:8080`.
 
 ## Supported Platform
 
