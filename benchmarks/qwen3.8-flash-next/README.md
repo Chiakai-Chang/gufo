@@ -10,28 +10,30 @@ draft block. Build: `nix develop` gpu preset, `gufo bench`.
 
 `gufo bench --model ... -p 128,512,1024,2048 -b 2048 -n 64` (one untimed pass
 per shape, then the timed one; single samples, the host's noise band is about
-±1% with occasional 150–300 tok/s dips from background jobs):
+±1% with occasional 150–300 tok/s dips from background jobs; the GPU clock
+ramps from 1 to 2.76 GHz over the first seconds of a run, so a first timed
+pass can read 2–4% low — `-p 2048,2048,2048,2048` settles at 1294–1301):
 
-| test | gufo | before the F16 expert card (`72fe0f4`) | before the prefill work (`97b445b`) | llama.cpp ROCm `41abbfd59` (`-fa 1 -ub 2048`) |
+| test | gufo (`nix build` of this tree) | before the F16 expert card (`72fe0f4`) | before the prefill work (`97b445b`) | llama.cpp ROCm `41abbfd59` (`-fa 1 -ub 2048`) |
 | --- | ---: | ---: | ---: | ---: |
-| pp128 | 473 | 464 | 443 | — |
+| pp128 | 474 | 464 | 443 | — |
 | pp512 | 814 | 796 | 628 | 402 |
-| pp1024 | 1184 | 931 | — | — |
-| pp2048 | 1298 | 1040 | 719 | 439 |
-| tg64 greedy | 22.8 | 22.7 | 22.8 | 21.9 |
-| tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 29.5 (depth 0; 76.3 ms per cycle, 71/168 drafts accepted on a different greedy continuation) | 32.9 (depth 0) / 36.5 (depth 1024) / 35.0 (depth 4096) / 42.9 (depth 16384) | 38.4 / 35.0 / 30.4 / — | — |
+| pp1024 | 1195 | 931 | — | — |
+| pp2048 | 1293 (steady clock 1298) | 1040 | 719 | 439 |
+| tg64 greedy | 22.9 | 22.7 | 22.8 | 21.9 |
+| tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 29.6 (depth 0) / 36.2 (depth 1024) / 14.8 (depth 4096) / 15.3 (depth 16384) | 32.9 (depth 0) / 36.5 (depth 1024) / 35.0 (depth 4096) / 42.9 (depth 16384) | 38.4 / 35.0 / 30.4 / — | — |
 
 Context depth (`-p 2048 -n 64 -b 2048 -d N`, one 2048-token chunk and 64
 decode steps after N prepared tokens; the sparse attention budget is 2048
 tokens, so past 2048 keys every full-attention layer selects blocks):
 
-| depth | pp2048 | tg64 | pp2048 before the depth card | tg64 before |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 1016 | 22.8 | 1010 | 22.8 |
-| 4096 | 942 | 21.7 | 484 | 17.8 |
-| 16384 | 838 | 20.1 | 320 | 15.0 |
-| 32768 | 766 | 19.4 | 221 | 12.4 |
-| 65536 | — | — | 140 | — |
+| depth | pp2048 | tg64 | pp2048 before the F16 expert card | tg64 before | pp2048 before the depth card | tg64 before |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1299 | 22.5 | 1016 | 22.8 | 1010 | 22.8 |
+| 4096 | 1172 | 21.7 | 942 | 21.7 | 484 | 17.8 |
+| 16384 | 1051 | 20.9 | 838 | 20.1 | 320 | 15.0 |
+| 32768 | 936 | 19.5 | 766 | 19.4 | 221 | 12.4 |
+| 65536 | — | — | — | — | 140 | — |
 
 Depths of 64k and beyond were not benchmarked after the change (each depth
 prepares the whole context first); the per-chunk cost is now the union of
@@ -40,11 +42,18 @@ per query) plus a per-query indexer scan, so it still grows slowly with
 depth. Peak resident memory at the 65k depth measured 90.9 GiB GTT (77 GiB
 weights; KV is 24 KiB per token).
 
-The MTP figures are acceptance-bound: the per-cycle cost is unchanged (75.5
-versus 76.5 ms) and the depth-1024 prompt accepts 85/126 drafts against
-83/131 before, but the depth-0 prompt's greedy continuation diverges after the
-prefill numerics changed (W8A8 and F16 mixer inputs instead of the Q8 MMQ
-tier) and that continuation happens to accept 76/153.
+The MTP figures are acceptance-bound on this synthetic prompt: the per-cycle
+cost is unchanged (76.3 ms now, 75.9 before the F16 expert card, 75.5 / 76.5
+across the earlier cards), depth 1024 accepts 82/133 drafts (85/126 before),
+and depth 0 accepts 71/168 on a greedy continuation that diverged when the
+prefill numerics changed. At depths 4096 and 16384 the current greedy
+continuation of the repeated benchmark sentence emits `<|im_end|>` at once
+and the draft cannot follow what comes after it (21/315 and 29/291
+accepted); the binary before the card continued the sentence there (83/132
+at 4096). Forcing any one of the wide MoE passes onto the MMQ tier flips the
+continuation back (77/147), so this is the same numerics-sensitive fork as
+at depth 0, not a draft-path defect: the greedy tg64 continuation at depth
+4096 is identical between the two binaries.
 
 Batched prefill against the sequential reference at 2048 tokens: finite,
 scalar winner rank 1, RMSE 0.26, cosine 1.00, max error 1.73 (RMSE 0.30, max
@@ -91,12 +100,14 @@ targets under `tests/models/qwen38_flash_next/` (label
 | BM=256 (two row tiles per wave) F16 expert GEMM | rejected | 4.46 / 4.40 ms: spills at m = 640 (three row blocks, the last half empty) and no gain for the down projection, so the activation LDS reads are not the bound |
 | two-stage weight prefetch, 128-byte-per-row fetch rounds | rejected | 4.4 / 4.4 and 4.7–4.9 / 4.6–5.1 ms: the compiler caps VGPRs at 144–152 for the LDS-derived occupancy and spills; ablations put the F16 kernel at 2.3 / 2.9 ms with no weight loads, 2.7 / 3.1 with fully coalesced ones and 3.2 / 3.7 with the real pattern served from cache, so the remaining cost is the sixteen-lines-per-instruction fetch itself (about 0.5 ms) plus 0.1 / 0.7 ms of exposed DRAM |
 | 64x64 tiles for the 320-row mixer down | rejected | 0.47 vs 0.40 ms per call: the weight re-reads cost more than the occupancy gained |
+| fused gate+up F16 expert GEMM (one launch, shared activation stages, SwiGLU on the accumulators) | rejected | 7.1 ms against 2 x 3.3: two accumulator sets and two decoded row tiles put the kernel at 231 VGPRs with 48 bytes of scratch (indexing the block header by a runtime byte lands it in memory) and 24.7 KB of LDS after the compiler promotes an alloca, two blocks per WGP |
+| F16 gate rows (the up epilogue reads the gate as F16) | rejected | neutral in a four-repeat interleaved A/B (1287–1298 against 1294–1301); the gate round trip is 0.2 ms per layer of a 1.6 s pass |
 | fused Q4_K expert gate/up (decode) | rejected | MTP tg128 38.6 → 33.5 despite fewer cycles |
 | 40-row expert vector dispatch (decode) | rejected | vector 33.3 versus tiled 38.0 tok/s |
 
 ## Where the time goes (after the F16 expert card)
 
-One profiled pp2048 pass, 1.62 s GPU-busy (idle between dispatches 7 ms):
+One profiled pp2048 pass, 1.60 s GPU-busy (idle between dispatches 7 ms):
 dense W8A8 GEMMs 30% (about 32 TOPS, 58% of the WMMA ceiling; the 16384-row
 GDN in-projection alone is 12%), routed expert GEMMs 34% (Q4_K gate/up 3.5
 ms, Q5_1 down 4.5 ms per layer), DeltaNet recurrence 7%, hyper-connection
@@ -119,6 +130,9 @@ graph replay leaves ~1.3 µs per launch of gaps.
 
 ## TODOs
 
+- 1,400 tok/s at 2048 tokens needs about 115 ms less per pass; the two
+  structural cards below are the only levers of that size left (the
+  elementwise fusions above took the rest).
 - Routed F16 GEMM: the weight fetch reads sixteen 32-byte row pieces per
   wave-wide load; 128 contiguous bytes per row per instruction needs four
   stages of codes in registers, which the compiler spills at the
