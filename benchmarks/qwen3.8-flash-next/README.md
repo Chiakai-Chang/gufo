@@ -18,9 +18,9 @@ pass can read 2–4% low — `-p 2048,2048,2048,2048` settles at 1294–1301):
 | --- | ---: | ---: | ---: | ---: |
 | pp128 | 512 | 464 | 443 | — |
 | pp256 | 759 | — | — | — |
-| pp512 | 1008 | 796 | 628 | 402 |
+| pp512 | 1013 | 796 | 628 | 402 |
 | pp1024 | 1212 | 931 | — | — |
-| pp2048 | 1318 (steady clock 1314–1335) | 1040 | 719 | 439 |
+| pp2048 | 1335 (steady clock 1330–1340) | 1040 | 719 | 439 |
 | tg64 greedy | 22.9 | 22.7 | 22.8 | 21.9 |
 | tg128 MTP (`--speculative mtp --draft-tokens 3 --draft-vocab 65536`) | 29.6 (depth 0) / 36.2 (depth 1024) / 14.8 (depth 4096) / 15.3 (depth 16384) | 32.9 (depth 0) / 36.5 (depth 1024) / 35.0 (depth 4096) / 42.9 (depth 16384) | 38.4 / 35.0 / 30.4 / — | — |
 
@@ -121,6 +121,7 @@ targets under `tests/models/qwen38_flash_next/` (label
 | indexer block scoring on the matrix cores (selection card) | retained, pp2048@16k 1051 → 1155, @32k 936 → 1109 | the scalar scan (four heads x 128 dims per query-block pair, 8.6 GFLOP per layer at 16k) ran at 0.8 TFLOPS; now 32 queries x 128 blocks per workgroup as F16 fragments read straight from the F32 rows, four per-head F32 accumulators, relu-sum in the epilogue: 128 → 8 ms per chunk at 16k (scores within 0.6% of F64; the mask over them is exact). The unrolled K loop spilled 1 KB per lane and read garbage; `#pragma unroll 1` holds it at 147 VGPRs |
 | 16-row tile of the routed F16 GEMM for small batches | retained, pp512 814 → 995, pp128 474 → 532, pp256 753 | below 16 rows per expert on average the MMQ tier had kept the experts (its 16/32-column tiles fit ten-row buckets); the F16 kernel's row tile is a template parameter, so a 16-row instantiation covers those buckets exactly and the whole batch takes the F16 route with its fused activation passes. Bucket means of 16 and up keep the 48-row tile (pp1024 1194 against 1129 on the narrow tile: the per-row dequantization is per tile) |
 | dense F16 WMMA GEMM for the wide Q8_0 projections | retained, pp2048 1300 → 1318, validation rmse 0.26 → 0.28 (max 1.73 → 1.74; the F16 rows are 15x closer to F64 than the tiled Q8 in the harness) | same construction as the expert kernel (codes dequantized into F16 as they are committed to LDS, F16 activation rows, F32 accumulation, no per-block scaling) with 64 x 64 wave tiles (256 x 128 blocks, one K block per stage) because F16 fragments are twice the int8 bytes and the LDS read rate is the limit: 32 x 64 wave tiles ran slower than the int8 kernel (6.2 against 5.5 ms). Per shape at 2048 tokens (int8 → F16 ms): 16384x2560 5.4 → 4.9, 13312x2560 4.4 → 3.9, 10240x320 1.3 → 1.1, 2560x2560 0.87 → 0.78; the K = 6144 output projections (1.9 → 2.4+, activation re-reads across ten row blocks), the 640-row shared expert (0.20 → 0.23) and the 320-row mixer down (0.40 → 1.2) keep the int8 route. Two in-kernel lessons: the compiler sank the next stage's global loads below the matrix work (a `sched_barrier` after the fetch: 4.9 → 4.6 ms in VRAM), and the transposed epilogue's 64-byte half-line stores cost 10% in GTT (where the model's weights and activations live; the harness now allocates past the 0.5 GiB carve-out) — stores now pair row tiles into full 128-byte lines. The shared-expert SwiGLU writes F16 rows for its down projection |
+| DeltaNet recurrence operands staged through LDS | retained, 3.06 → 2.18 ms per layer (pp2048 1318 → 1335) | the serial token loop read q, k, v and the per-token scales straight from the 84 MB conv output, so each of the 2048 steps paid a DRAM latency (register prefetch of one token: 2.63 ms, 224 VGPRs); the block now stages four tokens per window into LDS with three windows of loads in flight, stored [key chunk][segment] so a row's four lanes hit adjacent banks (row-major was a four-way conflict: 1198 tok/s). What remains is the elementwise floor: eight rows per wave re-read the same q/k fragments (64 LDS cycles per wave-token across 40 waves per WGP) and about 150 instructions per token, so a chunked formulation on the matrix cores is the lever left |
 | top-k marking by four-pass radix select | retained (bundled) | the 32-pass bit search re-read every score from L2 per pass; a 256-bin histogram per byte finds the threshold in four passes and a ballot scan ranks the ties in index order: 44 → 11 ms per chunk at 16k; decode at depth gains too (tg64@32k 19.5 → 20.9) |
 | fused Q4_K expert gate/up (decode) | rejected | MTP tg128 38.6 → 33.5 despite fewer cycles |
 | 40-row expert vector dispatch (decode) | rejected | vector 33.3 versus tiled 38.0 tok/s |
@@ -168,8 +169,11 @@ graph replay leaves ~1.3 µs per launch of gaps.
   K = 6144 output projections stay int8 because ten row blocks re-read 25
   MB of F16 rows (a token-tile-major raster with cooperative row groups,
   or a 512-row block, would cut that).
-- DeltaNet recurrence (3.0 ms per layer, 7% of a pass) is a sequential
-  per-token chain; a chunked formulation would turn it into GEMMs.
+- DeltaNet recurrence (2.2 ms per layer, 5% of a pass) is a sequential
+  per-token chain at its elementwise instruction floor; a chunked
+  formulation (64-token chunks: intra-chunk products and the state update
+  as F16 WMMA with the state kept in F32) would turn it into GEMMs, about
+  23 GFLOP per layer.
 - Attention at depth is bound by the gather of the four-query union of
   selected blocks (3.6 GB of K/V per layer at 16k); a narrower K/V cache
   (FP8 with per-block scales) would halve it at a precision cost that needs
