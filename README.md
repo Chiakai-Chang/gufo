@@ -1,7 +1,7 @@
-# Gufo: a Strix Halo inference engine
+# Gufo: the Strix Halo inference engine
 
 <p align="center">
-  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="360">
+  <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
 Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
@@ -83,13 +83,10 @@ _Illustrative facsimile data; these are not measured benchmark results._
 | Depth | Gufo `pp2048/tg128` | Over llama.cpp `pp2048/tg128` | DFlash2 mixed corpus/repetition `tg128` | DFlash2 over llama.cpp `tg128` |
 | ----: | ------------------: | ----------------------------: | --------------------------------------: | -----------------------------: |
 |     0 |       545.15 / 7.10 |                   155% / 156% |                              62.06 / 50 |                  1364% / 1099% |
-|    4K |       524.11 / 7.00 |                   158% / 163% |                              62.06 / 50 |                  1443% / 1163% |
-|    8K |       498.94 / 6.80 |                   161% / 166% |                              62.06 / 50 |                  1514% / 1220% |
 |   16K |       446.94 / 6.50 |                   166% / 176% |                              62.06 / 50 |                  1677% / 1351% |
 |   32K |       398.20 / 6.20 |                   173% / 188% |                              62.06 / 50 |                  1881% / 1515% |
 |   64K |       351.60 / 5.90 |                   185% / 200% |                              62.06 / 50 |                  2104% / 1695% |
 |  128K |       289.40 / 5.50 |                   207% / 224% |                              62.06 / 50 |                  2533% / 2041% |
-|  256K |       214.80 / 5.00 |                   226% / 278% |                              62.06 / 50 |                  3448% / 2778% |
 
 With concurrency token generation using the dflash2 drafter (cumulative)
 
@@ -110,13 +107,10 @@ _Illustrative facsimile data; these are not measured benchmark results._
 | Depth | Gufo `pp2048/tg128` | Over llama.cpp `pp2048/tg128` | DFlash2 mixed corpus/repetition `tg128` | DFlash2 over llama.cpp `tg128` |
 | ----: | ------------------: | ----------------------------: | --------------------------------------: | -----------------------------: |
 |     0 |       545.15 / 7.10 |                   155% / 156% |                              62.06 / 50 |                  1364% / 1099% |
-|    4K |       524.11 / 7.00 |                   158% / 163% |                              62.06 / 50 |                  1443% / 1163% |
-|    8K |       498.94 / 6.80 |                   161% / 166% |                              62.06 / 50 |                  1514% / 1220% |
 |   16K |       446.94 / 6.50 |                   166% / 176% |                              62.06 / 50 |                  1677% / 1351% |
 |   32K |       398.20 / 6.20 |                   173% / 188% |                              62.06 / 50 |                  1881% / 1515% |
 |   64K |       351.60 / 5.90 |                   185% / 200% |                              62.06 / 50 |                  2104% / 1695% |
 |  128K |       289.40 / 5.50 |                   207% / 224% |                              62.06 / 50 |                  2533% / 2041% |
-|  256K |       214.80 / 5.00 |                   226% / 278% |                              62.06 / 50 |                  3448% / 2778% |
 
 With concurrency token generation using the dflash2 drafter (cumulative) at depth 0
 
