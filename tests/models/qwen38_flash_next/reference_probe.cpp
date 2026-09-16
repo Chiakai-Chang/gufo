@@ -20,9 +20,9 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/reference.hpp"
-#include "src/models/qwen38_flash_next/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
@@ -43,7 +43,8 @@ std::vector<std::int32_t> ParseTokens(const std::string& text) {
   return out;
 }
 
-void PrintTop(const std::vector<float>& logits, const q::Tokenizer& tokenizer,
+void PrintTop(const std::vector<float>& logits,
+              const gufo::tokenization::QwenTokenizer& tokenizer,
               std::uint32_t top) {
   std::vector<std::uint32_t> order(logits.size());
   std::iota(order.begin(), order.end(), 0U);
@@ -119,7 +120,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "bind failed: %s\n", error.c_str());
     return 1;
   }
-  auto tokenizer = q::Tokenizer::CreateFromGguf(*reader, &error);
+  auto tokenizer =
+      gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &error);
   if (!tokenizer) {
     std::fprintf(stderr, "tokenizer failed: %s\n", error.c_str());
     return 1;

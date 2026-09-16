@@ -9,6 +9,8 @@
 #include <string_view>
 #include <vector>
 
+#include "src/core/sampling.hpp"
+
 namespace gufo::cli {
 
 struct BenchOptions {
@@ -21,7 +23,6 @@ struct BenchOptions {
   /// Qwen3.8-Flash-Next: prefill chunk (tokens per forward).
   std::size_t batch_size{512};
   std::size_t validate_prefill_tokens{0};
-  int n_gpu_layers{99};
   std::string speculative_backend{""};
   std::string mtp_model_path;
   std::string dflash_model_path;
@@ -31,9 +32,7 @@ struct BenchOptions {
   /// Qwen3.8-Flash-Next: vocabulary prefix the MTP draft scores (0 = full).
   std::uint32_t draft_vocab{0};
   std::uint32_t min_draft_tokens{1};
-  /// DeepSeek generation sampling; 0 keeps greedy decoding.
-  float temperature{0.0F};
-  std::uint32_t seed{0};
+  sampling::SamplingConfig sampling{.seed = 0};
   bool verbose{false};
 };
 

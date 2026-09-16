@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
@@ -51,9 +52,6 @@ void PrintBenchHelp(std::string_view program_name) {
       "-m", "--model", "PATH",
       "Path to GGUF model file (default: models/Qwen3.5-4B-BF16.gguf)", "Model",
       &opt.model_path);
-  parser.AddOption("-ngl", "--n-gpu-layers", "N",
-                   "Number of layers offloaded to GPU (default: 99)", "Model",
-                   &opt.n_gpu_layers);
 
   parser.AddOption("-p", "--n-prompt", "n,n,...",
                    "Prompt token lengths to benchmark (default: 2048)",
@@ -65,6 +63,9 @@ void PrintBenchHelp(std::string_view program_name) {
   parser.AddOption("-d", "--n-depth", "n,n,...",
                    "Context depths prepared before timed region (default: 0)",
                    "Workload", &opt.model_path);
+  parser.AddOption("-b", "--batch-size", "N",
+                   "Flash-Next prefill chunk size (default: 512)", "Workload",
+                   &opt.batch_size);
   parser.AddOption("-c", "--concurrency", "n,n,...",
                    "DS4 simultaneous requests, 1..8 (default: 1); pp is "
                    "aggregate, tg per user",
@@ -109,12 +110,7 @@ void PrintBenchHelp(std::string_view program_name) {
                    "Adaptive draft floor (default: 1)", "Speculative",
                    &opt.min_draft_tokens);
 
-  parser.AddOption("", "--temperature", "T",
-                   "DeepSeek generation temperature; 0 is greedy (default: 0)",
-                   "Workload", &opt.temperature);
-  parser.AddOption("", "--seed", "N",
-                   "DeepSeek sampling seed for --temperature (default: 0)",
-                   "Workload", &opt.seed);
+  RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
 
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
@@ -308,11 +304,8 @@ int RunDeepSeekBenchmark(
 
   // Sampled generation draws with the shared server sampler on both paths so
   // the AR and DSpark runs of one seed produce comparable token hashes.
-  const bool sampled = options.temperature > 0.0F;
-  const sampling::SamplingConfig sampling_config{
-      .temperature = options.temperature,
-      .seed = options.seed,
-  };
+  const bool sampled = !options.sampling.can_use_unmodified_argmax();
+  const auto sampling_config = options.sampling;
   const auto sample_next = [&](models::deepseek_v4_flash::Session& session,
                                sampling::SamplerState& sampler,
                                std::string* error_msg) -> int {
@@ -769,6 +762,12 @@ int RunQwen38FlashNextBenchmark(
   const std::size_t max_depth = max_or_zero(options.n_depths);
   const std::size_t max_prompt = max_or_zero(options.n_prompts);
   const std::size_t max_generation = max_or_zero(options.n_gens);
+  if (std::max({max_depth, max_prompt, max_generation,
+                options.validate_prefill_tokens}) >
+      std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: benchmark workload exceeds the context range\n";
+    return 1;
+  }
   const std::size_t required_context =
       std::max({std::size_t{4096}, max_depth + max_prompt + 1,
                 std::max<std::size_t>(max_depth, 16) + max_generation + 1,
@@ -783,8 +782,19 @@ int RunQwen38FlashNextBenchmark(
     std::cerr << "Error: --speculative mtp requires --mtp-model\n";
     return 1;
   }
-  if (options.temperature > 0.0F) {
-    std::cerr << "Error: Qwen3.8-Flash-Next benchmark decodes greedily\n";
+  if (options.concurrency != std::vector<std::size_t>{1}) {
+    std::cerr << "Error: Flash-Next bench supports C1; use the serving "
+                 "benchmark for concurrent requests\n";
+    return 1;
+  }
+  if (mtp && options.min_draft_tokens != 1) {
+    std::cerr << "Error: Flash-Next MTP requires --min-draft-tokens 1\n";
+    return 1;
+  }
+  if (required_context > std::numeric_limits<std::uint32_t>::max() ||
+      options.batch_size == 0 ||
+      options.batch_size > std::numeric_limits<std::uint32_t>::max()) {
+    std::cerr << "Error: Flash-Next context or batch size is out of range\n";
     return 1;
   }
 
@@ -947,27 +957,20 @@ int RunQwen38FlashNextBenchmark(
           return 1;
         }
         std::vector<std::int32_t> generated;
+        const std::vector<sampling::TokenId> history(
+            tokens.begin(), tokens.begin() + prefix_length);
+        sampling::SamplerState sampler(options.sampling, history);
         const auto start = std::chrono::steady_clock::now();
-        for (std::size_t step = 0; step < generation_length;) {
-          if (mtp) {
-            std::vector<std::int32_t> emitted;
-            if (!session->SpeculativeStep(generation_length - step, &emitted,
-                                          &error) ||
-                emitted.empty()) {
-              std::cerr << "Error running MTP decode: " << error << '\n';
-              return 1;
-            }
-            generated.insert(generated.end(), emitted.begin(), emitted.end());
-            step += emitted.size();
-          } else {
-            const std::int32_t token = session->SelectNext(0.0F, nullptr);
-            if (!session->Evaluate(token, &error)) {
-              std::cerr << "Error running decode: " << error << '\n';
-              return 1;
-            }
-            generated.push_back(token);
-            ++step;
+        while (generated.size() < generation_length) {
+          qfn::Session::DecodeResult decoded;
+          if (!session->DecodeStep(generation_length - generated.size(),
+                                   sampler, &decoded, &error, false) ||
+              decoded.tokens.empty()) {
+            std::cerr << "Error running Flash-Next decode: " << error << '\n';
+            return 1;
           }
+          generated.insert(generated.end(), decoded.tokens.begin(),
+                           decoded.tokens.end());
         }
         const double seconds = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - start)
@@ -978,7 +981,12 @@ int RunQwen38FlashNextBenchmark(
           std::cerr << "Qwen3.8-Flash-Next tg depth=" << depth
                     << " cycles=" << stats.cycles
                     << " drafted=" << stats.drafted
-                    << " accepted=" << stats.accepted << " text="
+                    << " accepted=" << stats.accepted << " output_sha256="
+                    << crypto::Sha256Hex(
+                           std::span(reinterpret_cast<const std::uint8_t*>(
+                                         generated.data()),
+                                     generated.size() * sizeof(std::int32_t)))
+                    << " text="
                     << model->Decode(std::span(generated).first(
                            std::min<std::size_t>(generated.size(), 48)))
                     << '\n';
@@ -1010,9 +1018,6 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       "-m", "--model", "PATH",
       "Path to GGUF model file (default: models/Qwen3.5-4B-BF16.gguf)", "Model",
       &opt.model_path);
-  parser.AddOption("-ngl", "--n-gpu-layers", "N",
-                   "Number of layers offloaded to GPU (default: 99)", "Model",
-                   &opt.n_gpu_layers);
 
   parser.AddCustomOption(
       "-p", "--n-prompt", "n,n,...",
@@ -1184,12 +1189,7 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
                    "Qwen3.8-Flash-Next: score MTP drafts over the first N "
                    "token ids only (default: 0 = full vocabulary)",
                    "Speculative", &opt.draft_vocab);
-  parser.AddOption("", "--temperature", "T",
-                   "DeepSeek generation temperature; 0 is greedy (default: 0)",
-                   "Workload", &opt.temperature);
-  parser.AddOption("", "--seed", "N",
-                   "DeepSeek sampling seed for --temperature (default: 0)",
-                   "Workload", &opt.seed);
+  RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
@@ -1232,10 +1232,14 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     }
     return std::nullopt;
   }
-  if (!std::isfinite(opt.temperature) || opt.temperature < 0.0F) {
-    if (error_msg != nullptr) {
-      *error_msg = "temperature must be non-negative";
+  try {
+    opt.sampling.Validate();
+    if (opt.sampling.seed < 0) {
+      throw std::invalid_argument("benchmark seed must be non-negative");
     }
+  } catch (const std::invalid_argument& error) {
+    if (error_msg)
+      *error_msg = error.what();
     return std::nullopt;
   }
   if (!opt.draft_policy.empty() &&
@@ -1282,6 +1286,12 @@ int RunBench(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (opt.draft_vocab != 0 &&
+      (reader->GetMetadataString("general.architecture") != "qwen4exp" ||
+       opt.speculative_backend != "mtp")) {
+    std::cerr << "Error: --draft-vocab requires Flash-Next MTP\n";
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -1296,8 +1306,8 @@ int RunBench(std::span<const char* const> args) {
                  "only; use the serving benchmark for Qwen\n";
     return 1;
   }
-  if (opt.temperature > 0.0F) {
-    std::cerr << "Error: sampled model benchmarks currently support DS4 only; "
+  if (!opt.sampling.can_use_unmodified_argmax()) {
+    std::cerr << "Error: sampled model benchmarks support DS4 and Flash-Next; "
                  "use the serving benchmark for Qwen\n";
     return 1;
   }
@@ -1419,13 +1429,12 @@ int RunBench(std::span<const char* const> args) {
             << " | " << std::right << std::setw(10) << "size"
             << " | " << std::right << std::setw(10) << "params"
             << " | " << std::left << std::setw(10) << "backend"
-            << " | " << std::right << std::setw(3) << "ngl"
             << " | " << std::right << std::setw(15) << "test"
             << " | " << std::right << std::setw(21) << "t/s"
             << " |\n";
   std::cout << "| " << std::string(30, '-') << " | " << std::string(10, '-')
             << " | " << std::string(10, '-') << " | " << std::string(10, '-')
-            << " | " << std::string(3, '-') << " | " << std::string(15, '-')
+            << " | " << std::string(15, '-')
             << " | " << std::string(21, '-') << " |\n";
 
   // Warmup run
@@ -1452,7 +1461,6 @@ int RunBench(std::span<const char* const> args) {
               << std::right << std::setw(10) << ss_size.str() << " | "
               << std::right << std::setw(10) << ss_params.str() << " | "
               << std::left << std::setw(10) << backend_name << " | "
-              << std::right << std::setw(3) << opt.n_gpu_layers << " | "
               << std::right << std::setw(15) << test_name << " | " << std::right
               << std::setw(21) << ss_ts.str() << " |\n"
               << std::flush;

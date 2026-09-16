@@ -55,6 +55,18 @@ void TestHybridMtpFlags() {
   assert(opt->min_draft_tokens == 2);
 }
 
+void TestFlashMtpFlags() {
+  const char* args[] = {"--speculative",  "mtp", "--mtp-model",   "mtp.gguf",
+                        "--draft-tokens", "3",   "--draft-vocab", "65536",
+                        "--temperature",  "0.7", "--seed",        "1",
+                        "Prompt"};
+  const auto opt = gufo::cli::ParsePromptOptions(args);
+  assert(opt.has_value());
+  assert(opt->speculative_backend == "mtp");
+  assert(opt->draft_tokens == 3 && opt->draft_vocab == 65536);
+  assert(opt->sampling.temperature == 0.7F && opt->sampling.seed == 1);
+}
+
 void TestInvalidFlags() {
   std::string err;
   const std::array<const char*, 1> args1 = {"--model"};
@@ -168,6 +180,7 @@ int main() {
   TestExplicitFlags();
   TestSamplingAndReasoningFlags();
   TestHybridMtpFlags();
+  TestFlashMtpFlags();
   TestInvalidFlags();
   std::cout << "All prompt CLI tests passed.\n";
   return 0;

@@ -31,6 +31,7 @@
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/mtp.hpp"
+#include "src/models/qwen38_flash_next/engine.hpp"
 #endif
 
 namespace gufo::cli {
@@ -108,6 +109,9 @@ static void PrintTextHelp(std::string_view program_name,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
+  parser.AddOption("", "--draft-vocab", "N",
+                   "Flash-Next MTP vocabulary prefix (0 = full)", "Speculative",
+                   &opt.draft_vocab);
   parser.AddOption("-d", "--draft-tokens", "N",
                    "Maximum speculative draft tokens evaluated per step "
                    "(default: 7)",
@@ -520,6 +524,86 @@ int RunDeepSeekChat(const PromptOptions& opt, const core::GgufReader& reader,
   return 0;
 }
 
+std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
+    const PromptOptions& opt, const core::GgufReader& reader,
+    std::chrono::steady_clock::time_point load_start) {
+  std::string error;
+  if (opt.force_cpu ||
+      (!opt.speculative_backend.empty() && opt.speculative_backend != "mtp") ||
+      (opt.speculative_backend == "mtp" && opt.min_draft_tokens != 1)) {
+    std::cerr << "Flash-Next requires ROCm and supports MTP with "
+                 "--min-draft-tokens 1\n";
+    return nullptr;
+  }
+  if (opt.use_chat_template &&
+      !tokenization::QwenChatTemplate::ValidateGgufTemplate(reader, &error)) {
+    std::cerr << "Unsupported Flash-Next chat template: " << error << '\n';
+    return nullptr;
+  }
+  auto model = models::qwen38_flash_next::Model::Load(
+      opt.model_path,
+      {.max_context = kDefaultContext,
+       .mtp_model_path =
+           opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
+       .max_batch = 2048,
+       .max_draft_tokens = opt.draft_tokens,
+       .draft_vocab = opt.draft_vocab},
+      &error);
+  PrintModelLoadTime(load_start, model != nullptr);
+  if (!model)
+    std::cerr << "Flash-Next load failed: " << error << '\n';
+  return model;
+}
+
+int GenerateFlashNextResponse(const PromptOptions& opt,
+                              const models::qwen38_flash_next::Model& model,
+                              models::qwen38_flash_next::Session& session,
+                              std::span<const tokenization::TokenId> prompt,
+                              std::string* reply = nullptr) {
+  if (prompt.empty() || prompt.size() >= session.ContextSize() ||
+      opt.max_tokens > session.ContextSize() - prompt.size()) {
+    std::cerr
+        << "Flash-Next prompt and output exceed the 4096-token CLI context\n";
+    return 1;
+  }
+  const std::vector<std::int32_t> input(prompt.begin(), prompt.end());
+  std::string error;
+  if (!session.Sync(input, &error)) {
+    std::cerr << "Flash-Next prefill failed: " << error << '\n';
+    return 1;
+  }
+  sampling::SamplerState sampler(opt.sampling, prompt);
+  std::vector<tokenization::TokenId> generated;
+  const auto start = std::chrono::steady_clock::now();
+  while (generated.size() < opt.max_tokens) {
+    models::qwen38_flash_next::Session::DecodeResult decoded;
+    if (!session.DecodeStep(opt.max_tokens - generated.size(), sampler,
+                            &decoded, &error)) {
+      std::cerr << "Flash-Next decode failed: " << error << '\n';
+      return 1;
+    }
+    for (const auto token : decoded.tokens) {
+      const auto piece = model.TokenText(token);
+      std::cout << piece << std::flush;
+      if (reply)
+        reply->append(piece);
+      generated.push_back(static_cast<tokenization::TokenId>(token));
+    }
+    if (decoded.stop)
+      break;
+  }
+  std::cout << '\n';
+  if (opt.verbose) {
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
+            .count();
+    std::cerr << "Generated " << generated.size() << " tokens ("
+              << generated.size() / seconds << " tok/s)\n";
+    PrintTokenTrace(generated);
+  }
+  return 0;
+}
+
 std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     const PromptOptions& opt, hip::QwenGpuExecutor& executor) {
   std::string err;
@@ -718,6 +802,9 @@ std::optional<PromptOptions> ParsePromptOptions(
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
+  parser.AddOption("", "--draft-vocab", "N",
+                   "Flash-Next MTP vocabulary prefix (0 = full)", "Speculative",
+                   &opt.draft_vocab);
   parser.AddCustomOption(
       "-d", "--draft-tokens", "N",
       "Maximum speculative draft tokens evaluated per step (default: 7)",
@@ -913,6 +1000,12 @@ int RunPrompt(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (opt.draft_vocab != 0 &&
+      (reader->GetMetadataString("general.architecture") != "qwen4exp" ||
+       opt.speculative_backend != "mtp")) {
+    std::cerr << "Error: --draft-vocab requires Flash-Next MTP\n";
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -953,6 +1046,19 @@ int RunPrompt(std::span<const char* const> args) {
   }
 
 #if defined(ENGINE_ENABLE_HIP)
+  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+    auto model = LoadFlashNextModel(opt, *reader, model_load_start);
+    if (!model)
+      return 1;
+    auto session = model->CreateSession(kDefaultContext, &err);
+    if (!session) {
+      std::cerr << "Flash-Next session failed: " << err << '\n';
+      return 1;
+    }
+    const auto ids = model->Tokenize(rendered_prompt);
+    const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
+    return GenerateFlashNextResponse(opt, *model, *session, prompt);
+  }
   int dev_count = 0;
   if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
       dev_count > 0) {
@@ -1094,6 +1200,12 @@ int RunChat(std::span<const char* const> args) {
   }
   const std::shared_ptr<const gufo::core::GgufReader> reader(
       std::move(reader_owner));
+  if (opt.draft_vocab != 0 &&
+      (reader->GetMetadataString("general.architecture") != "qwen4exp" ||
+       opt.speculative_backend != "mtp")) {
+    std::cerr << "Error: --draft-vocab requires Flash-Next MTP\n";
+    return 1;
+  }
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
@@ -1112,9 +1224,23 @@ int RunChat(std::span<const char* const> args) {
 #if defined(ENGINE_ENABLE_HIP)
   std::unique_ptr<hip::QwenGpuExecutor> gpu_executor;
   std::unique_ptr<speculative::SpeculativeVerifier> verifier;
+  std::shared_ptr<models::qwen38_flash_next::Model> flash_model;
+  std::unique_ptr<models::qwen38_flash_next::Session> flash_session;
+  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+    flash_model = LoadFlashNextModel(opt, *reader, model_load_start);
+    if (!flash_model)
+      return 1;
+    flash_session = flash_model->CreateSession(kDefaultContext, &err);
+    if (!flash_session) {
+      std::cerr << "Flash-Next session failed: " << err << '\n';
+      return 1;
+    }
+    tokenizer = &flash_model->tokenizer();
+    architecture = "qwen4exp";
+  }
   int device_count = 0;
-  if (!opt.force_cpu && hipGetDeviceCount(&device_count) == hipSuccess &&
-      device_count > 0) {
+  if (tokenizer == nullptr && !opt.force_cpu &&
+      hipGetDeviceCount(&device_count) == hipSuccess && device_count > 0) {
     gpu_executor = hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
     if (!gpu_executor) {
       std::cerr << "Error creating Qwen GPU executor: " << err << '\n';
@@ -1198,7 +1324,11 @@ int RunChat(std::span<const char* const> args) {
 
     try {
 #if defined(ENGINE_ENABLE_HIP)
-      if (gpu_executor != nullptr) {
+      if (flash_model) {
+        if (GenerateFlashNextResponse(opt, *flash_model, *flash_session,
+                                      prompt_tokens, &assistant_reply) != 0)
+          return 1;
+      } else if (gpu_executor != nullptr) {
         GenerateQwenGpuResponse(opt, *gpu_executor, verifier.get(),
                                 prompt_tokens, &assistant_reply);
       } else

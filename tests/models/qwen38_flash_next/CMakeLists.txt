@@ -12,7 +12,29 @@ add_test(NAME qwen38_flash_next.ngram COMMAND qwen38_flash_next_ngram_test)
 set_tests_properties(qwen38_flash_next.ngram PROPERTIES
   LABELS "cpu;qwen38_flash_next")
 
+add_executable(qwen38_flash_next_mtp_sampling_test mtp_sampling_test.cpp)
+target_link_libraries(qwen38_flash_next_mtp_sampling_test PRIVATE gufo_core)
+add_test(NAME qwen38_flash_next.mtp_sampling
+  COMMAND qwen38_flash_next_mtp_sampling_test)
+set_tests_properties(qwen38_flash_next.mtp_sampling PROPERTIES
+  LABELS "cpu;qwen38_flash_next")
+
+add_custom_target(qwen38_flash_next_tests
+  DEPENDS qwen38_flash_next_ngram_test qwen38_flash_next_mtp_sampling_test)
+
 if(ENGINE_ENABLE_HIP)
+  add_executable(qwen38_flash_next_weight_upload_test weight_upload_test.cpp)
+  target_link_libraries(qwen38_flash_next_weight_upload_test PRIVATE
+    gufo_qwen38_flash_next)
+  add_test(NAME qwen38_flash_next.weight_upload
+    COMMAND qwen38_flash_next_weight_upload_test)
+  set_tests_properties(qwen38_flash_next.weight_upload PROPERTIES
+    LABELS "hip;gpu;qwen38_flash_next")
+  add_dependencies(qwen38_flash_next_tests qwen38_flash_next_weight_upload_test)
+
+  add_executable(qwen38_flash_next_session_test session_test.cpp)
+  target_link_libraries(qwen38_flash_next_session_test PRIVATE
+    gufo_qwen38_flash_next)
   add_executable(qwen38_flash_next_gpu_probe gpu_probe.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
     gufo_qwen38_flash_next)
@@ -83,4 +105,15 @@ if(ENGINE_ENABLE_HIP)
     COMMAND qwen38_flash_next_select_ops_test)
   set_tests_properties(qwen38_flash_next.select_ops PROPERTIES
     LABELS "hip;gpu;gfx1151;qwen38_flash_next;prefill;attention")
+
+  add_dependencies(qwen38_flash_next_tests
+    qwen38_flash_next_session_test
+    qwen38_flash_next_hc_mix_ops_test
+    qwen38_flash_next_gdn_ops_test
+    qwen38_flash_next_attention_ops_test
+    qwen38_flash_next_moe_epilogue_ops_test
+    qwen38_flash_next_moe_ids_ops_test
+    qwen38_flash_next_w8a8_ops_test
+    qwen38_flash_next_routed_wmma_ops_test
+    qwen38_flash_next_select_ops_test)
 endif()

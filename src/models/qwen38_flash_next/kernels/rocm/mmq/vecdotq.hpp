@@ -1,6 +1,6 @@
 #pragma once
 
-#include "common.cuh"
+#include "common.hpp"
 
 #include <cstdint>
 
@@ -32,7 +32,6 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.
 static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, const int8_t * table) {
-#if defined(GGML_USE_HIP)
     // Load the 16-byte table into four 32-bit unsigned integers.
     const uint32_t *values = (const uint32_t *)table;
 
@@ -54,44 +53,6 @@ static __device__ __forceinline__ int2 get_int_from_table_16(const int & q4, con
     uint32_t res_y = __builtin_amdgcn_perm(v_odd_high, v_odd_low, mask_odd);
 
     return make_int2(res_x, res_y);
-#elif !defined(GGML_USE_MUSA)
-    // CUDA does not have an instruction for selecting bytes with 4 bit indices.
-    // However, __byte_perm is an instruction that selects bytes with 3 bit indices that can be used instead.
-    const uint32_t * table32 = (const uint32_t *) table;
-
-    // __byte_perm selects bytes based on the lower 16 bits in its third argument.
-    // Therefore, do 2 iterations over the 32 bits in q4 with 0 and 16 shift.
-    // To handle the fourth bit, first call _byte_perm both for the low and the high 64 bit of table, using the low 3 bits.
-    // Then, call __byte_perm again to select from the low and high bytes based on the fourth bit.
-    uint32_t tmp[2];
-    const uint32_t low_high_selection_indices = (0x32103210 | ((q4 & 0x88888888) >> 1));
-#pragma unroll
-    for (uint32_t i = 0; i < 2; ++i) {
-        const uint32_t shift = 16 * i;
-
-        const uint32_t low  = __byte_perm(table32[0], table32[1], q4 >> shift);
-        const uint32_t high = __byte_perm(table32[2], table32[3], q4 >> shift);
-        tmp[i] = __byte_perm(low, high, low_high_selection_indices >> shift);
-    }
-
-    // tmp contains the bytes from tyble in the same order as the 4 bit indices in q4.
-    // However, for the result we need ints with all even/odd 4 bit indices in q4.
-    // Therefore, 2 more calls to __byte_perm to put the bytes in the correct order.
-    return make_int2(__byte_perm(tmp[0], tmp[1], 0x6420), __byte_perm(tmp[0], tmp[1], 0x7531));
-#else
-    // Generic implementation.
-    const int      q0_32  = (q4 >> 0) & 0x0F0F0F0F;
-    const int8_t * q0_8   = (const int8_t *) &q0_32;
-    const char4    val0_8 = make_char4(
-        table[q0_8[0]], table[q0_8[1]], table[q0_8[2]], table[q0_8[3]]);
-
-    const int      q1_32  = (q4 >> 4) & 0x0F0F0F0F;
-    const int8_t * q1_8   = (const int8_t *) &q1_32;
-    const char4    val1_8 = make_char4(
-        table[q1_8[0]], table[q1_8[1]], table[q1_8[2]], table[q1_8[3]]);
-
-    return make_int2(*((const int *) &val0_8), *((const int *) &val1_8));
-#endif
 }
 
 static __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
@@ -123,8 +84,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
         const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
 
         // SIMD dot product of quantized values
-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
+        sumi = ggml_hip_dp4a(vi0, u[2*i+0], sumi);
+        sumi = ggml_hip_dp4a(vi1, u[2*i+1], sumi);
     }
 
     const float2 ds8f = __half22float2(ds8);
@@ -147,8 +108,8 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
         const int vi1 = (v[i] >> 4) & 0x0F0F0F0F;
 
         // SIMD dot product of quantized values
-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi);
-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi);
+        sumi = ggml_hip_dp4a(vi0, u[2*i+0], sumi);
+        sumi = ggml_hip_dp4a(vi1, u[2*i+1], sumi);
     }
 
 #ifdef FAST_FP16_AVAILABLE
@@ -181,14 +142,14 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_0_q8_1_imp
         vi0    |= (vh[i] << 11) & 0x00001000; // 1 -> 12
         vi0    |= (vh[i] << 18) & 0x00100000; // 2 -> 20
         vi0    |= (vh[i] << 25) & 0x10000000; // 3 -> 28
-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
+        sumi = ggml_hip_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
 
         int vi1 = (vl[i] >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
         vi1    |= (vh[i] >> 12) & 0x00000010; // 16 ->  4
         vi1    |= (vh[i] >>  5) & 0x00001000; // 17 -> 12
         vi1    |= (vh[i] <<  2) & 0x00100000; // 18 -> 20
         vi1    |= (vh[i] <<  9) & 0x10000000; // 19 -> 28
-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
+        sumi = ggml_hip_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
     const float2 ds8f = __half22float2(ds8);
@@ -212,14 +173,14 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
         vi0    |= (vh[i] << 11) & 0x00001000; // 1 -> 12
         vi0    |= (vh[i] << 18) & 0x00100000; // 2 -> 20
         vi0    |= (vh[i] << 25) & 0x10000000; // 3 -> 28
-        sumi = ggml_cuda_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
+        sumi = ggml_hip_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
 
         int vi1 = (vl[i] >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
         vi1    |= (vh[i] >> 12) & 0x00000010; // 16 ->  4
         vi1    |= (vh[i] >>  5) & 0x00001000; // 17 -> 12
         vi1    |= (vh[i] <<  2) & 0x00100000; // 18 -> 20
         vi1    |= (vh[i] <<  9) & 0x10000000; // 19 -> 28
-        sumi = ggml_cuda_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
+        sumi = ggml_hip_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 
 #ifdef FAST_FP16_AVAILABLE
@@ -248,7 +209,7 @@ template <typename T, int vdr> static __device__ __forceinline__ T vec_dot_q8_0_
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
         // SIMD dot product of quantized values
-        sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
+        sumi = ggml_hip_dp4a(v[i], u[i], sumi);
     }
 
     return d8_0*d8_1 * ((T) sumi);
@@ -262,7 +223,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_1_q8_1_imp
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
         // SIMD dot product of quantized values
-        sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
+        sumi = ggml_hip_dp4a(v[i], u[i], sumi);
     }
 
 #ifdef FAST_FP16_AVAILABLE
@@ -292,7 +253,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q8_0_16_q8_1_
 #pragma unroll
         for (int i = i0; i < i0 + QI8_0/2; ++i) {
             // SIMD dot product of quantized values
-            sumi = ggml_cuda_dp4a(v[i], u[i], sumi);
+            sumi = ggml_hip_dp4a(v[i], u[i], sumi);
         }
 
         sumf += d8_0[i0/(QI8_0/2)]*sumi;
@@ -317,11 +278,11 @@ static __device__ __forceinline__ float vec_dot_mxfp4_q8_1(
         const int aux_q4 = get_int_b1(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
 
-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
-        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+        sumi = ggml_hip_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_hip_dp4a(v.y, q8[l + 4], sumi);
     }
 
-    const float d = ggml_cuda_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
+    const float d = ggml_hip_e8m0_to_fp32(bq4->e) * 0.5f * __low2float(bq8_1->ds);
     return d * sumi;
 }
 
@@ -346,12 +307,12 @@ static __device__ __forceinline__ float vec_dot_nvfp4_q8_1(
         const block_q8_1 * bq8 = bq8_1 + (is >> 1);
         const int32_t i8 = ((is & 1) << 2);
 
-        int sumi = ggml_cuda_dp4a(v0.x, get_int_b4(bq8->qs, i8 + 0), 0);
-        sumi = ggml_cuda_dp4a(v0.y, get_int_b4(bq8->qs, i8 + 2), sumi);
-        sumi = ggml_cuda_dp4a(v1.x, get_int_b4(bq8->qs, i8 + 1), sumi);
-        sumi = ggml_cuda_dp4a(v1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
+        int sumi = ggml_hip_dp4a(v0.x, get_int_b4(bq8->qs, i8 + 0), 0);
+        sumi = ggml_hip_dp4a(v0.y, get_int_b4(bq8->qs, i8 + 2), sumi);
+        sumi = ggml_hip_dp4a(v1.x, get_int_b4(bq8->qs, i8 + 1), sumi);
+        sumi = ggml_hip_dp4a(v1.y, get_int_b4(bq8->qs, i8 + 3), sumi);
 
-        const float d = ggml_cuda_ue4m3_to_fp32(bq4->d[is]) * __low2float(bq8->ds);
+        const float d = ggml_hip_ue4m3_to_fp32(bq4->d[is]) * __low2float(bq8->ds);
         sum += d * float(sumi);
     }
 
@@ -374,13 +335,13 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmvq(
 
         const int vi = (v >> (2*i)) & 0x03030303;
 
-        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
+        sumf_d += d8[i] * (ggml_hip_dp4a(vi, u[i], 0) * (sc & 0xF)); // SIMD dot product
 
         // fill int with 4x m
         int m = sc >> 4;
         m |= m <<  8;
         m |= m << 16;
-        sumf_m += d8[i] * ggml_cuda_dp4a(m, u[i], 0); // multiply constant q2_K part with sum of q8_1 values
+        sumf_m += d8[i] * ggml_hip_dp4a(m, u[i], 0); // multiply constant q2_K part with sum of q8_1 values
     }
 
     const float2 dm2f = __half22float2(dm2);
@@ -406,13 +367,13 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
 
 #pragma unroll
         for (int i = i0; i < i0 + QI8_1/2; ++i) {
-            sumi_d0 = ggml_cuda_dp4a(v[i], u[i], sumi_d0);
+            sumi_d0 = ggml_hip_dp4a(v[i], u[i], sumi_d0);
         }
         sumf_d8 += dm2f0.x * sumi_d0;
 
 #pragma unroll
         for (int i = i0 + QI8_1/2; i < i0 + QI8_1; ++i) {
-            sumi_d1 = ggml_cuda_dp4a(v[i], u[i], sumi_d1);
+            sumi_d1 = ggml_hip_dp4a(v[i], u[i], sumi_d1);
         }
         sumf_d8 += dm2f1.x * sumi_d1;
 
@@ -424,14 +385,14 @@ static __device__ __forceinline__ float vec_dot_q2_K_q8_1_impl_mmq(
             int sumi_m0 = 0;
 #pragma unroll
             for (int i = i0; i < i0 + QI8_1/2; ++i) {
-                sumi_m0 = ggml_cuda_dp4a(0x01010101, u[i], sumi_m0);
+                sumi_m0 = ggml_hip_dp4a(0x01010101, u[i], sumi_m0);
             }
             sumf_d8 -= dm2f0.y * sumi_m0;
 
             int sumi_m1 = 0;
 #pragma unroll
             for (int i = i0 + QI8_1/2; i < i0 + QI8_1; ++i) {
-                sumi_m1 = ggml_cuda_dp4a(0x01010101, u[i], sumi_m1);
+                sumi_m1 = ggml_hip_dp4a(0x01010101, u[i], sumi_m1);
             }
             sumf_d8 -= dm2f1.y * sumi_m1;
         }
@@ -470,7 +431,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vi = __vsubss4(vil, vih);
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * (ggml_hip_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
 
     return d3 * sumf;
@@ -489,7 +450,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
 
 #pragma unroll
         for (int i = i0; i < i0 + QI8_1/2; ++i) {
-            sumi_sc = ggml_cuda_dp4a(v[i], u[i], sumi_sc); // SIMD dot product
+            sumi_sc = ggml_hip_dp4a(v[i], u[i], sumi_sc); // SIMD dot product
         }
 
         sumi += sumi_sc * scales[i0 / (QI8_1/2)];
@@ -514,8 +475,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
         const int v0i = (v[0] >> (4*i)) & 0x0F0F0F0F;
         const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
 
-        const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
-        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
+        const int dot1 = ggml_hip_dp4a(v1i, u[2*i+1], ggml_hip_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
+        const int dot2 = ggml_hip_dp4a(0x01010101, u[2*i+1], ggml_hip_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
 
         sumf_d += d8[i] * (dot1 * sc[i]);
         sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
@@ -540,7 +501,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_mmq(
 
 #pragma unroll
         for (int j = 0; j < QI8_1; ++j) {
-            sumi_d = ggml_cuda_dp4a((v[j] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j], sumi_d); // SIMD dot product
+            sumi_d = ggml_hip_dp4a((v[j] >> (4*i)) & 0x0F0F0F0F, u[i*QI8_1 + j], sumi_d); // SIMD dot product
         }
 
         const float2 ds8f = __half22float2(ds8[i]);
@@ -576,8 +537,8 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
         const int v0i = vl0i | vh0i;
         const int v1i = vl1i | vh1i;
 
-        const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
-        const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
+        const int dot1 = ggml_hip_dp4a(v0i, u[2*i+0], ggml_hip_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
+        const int dot2 = ggml_hip_dp4a(0x01010101, u[2*i+0], ggml_hip_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
 
         sumf_d += d8[i] * (dot1 * sc[i]);
         sumf_m += d8[i] * (dot2 * m[i]);
@@ -603,7 +564,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
 
 #pragma unroll
         for (int j = 0; j < QI8_1; ++j) {
-            sumi_d = ggml_cuda_dp4a(v[i*QI8_1 + j], u[i*QI8_1 + j], sumi_d); // SIMD dot product
+            sumi_d = ggml_hip_dp4a(v[i*QI8_1 + j], u[i*QI8_1 + j], sumi_d); // SIMD dot product
         }
 
         const float2 ds8f = __half22float2(ds8[i]);
@@ -637,7 +598,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vi = __vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * (ggml_hip_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }
 
     return d*sumf;
@@ -659,11 +620,11 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmq(
 
 #pragma unroll
         for (int i = i0; i < i0 + 2; ++i) {
-            sumi_d.x = ggml_cuda_dp4a(v[2*i+0], u[2*i+0], sumi_d.x); // SIMD dot product
-            sumi_d.x = ggml_cuda_dp4a(v[2*i+1], u[2*i+1], sumi_d.x); // SIMD dot product
+            sumi_d.x = ggml_hip_dp4a(v[2*i+0], u[2*i+0], sumi_d.x); // SIMD dot product
+            sumi_d.x = ggml_hip_dp4a(v[2*i+1], u[2*i+1], sumi_d.x); // SIMD dot product
 
-            sumi_d.y = ggml_cuda_dp4a(v[2*i+4], u[2*i+4], sumi_d.y); // SIMD dot product
-            sumi_d.y = ggml_cuda_dp4a(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
+            sumi_d.y = ggml_hip_dp4a(v[2*i+4], u[2*i+4], sumi_d.y); // SIMD dot product
+            sumi_d.y = ggml_hip_dp4a(v[2*i+5], u[2*i+5], sumi_d.y); // SIMD dot product
         }
 
         sumf_d += d8[i0/4] * (sc_reg[i0/2+0]*sumi_d.x + sc_reg[i0/2+1]*sumi_d.y);
@@ -709,7 +670,7 @@ static __device__ __forceinline__ float vec_dot_q1_0_q8_1(
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int u = get_int_b4(bq8_1_chunk->qs, j);
-        sumi = ggml_cuda_dp4a(vi_bytes[j], u, sumi);
+        sumi = ggml_hip_dp4a(vi_bytes[j], u, sumi);
     }
 
     // Apply Q1_0's single scale and this chunk's Q8_1 scale
@@ -1000,12 +961,12 @@ static __device__ __forceinline__ float vec_dot_iq2_xxs_q8_1(
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int grid0 = __vsub4(grid_pos.x ^ signs0, signs0);
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, k0 + 0);
-        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
+        sumi = ggml_hip_dp4a(grid0, u0, sumi);
 
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid1 = __vsub4(grid_pos.y ^ signs1, signs1);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, k0 + 1);
-        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+        sumi = ggml_hip_dp4a(grid1, u1, sumi);
     }
 
     const int ls = aux32 >> 27 | 1; // (scale * 2 + 1)
@@ -1043,11 +1004,11 @@ static __device__ __forceinline__ float vec_dot_iq2_xs_q8_1(
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
-            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
-            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+            sumi0 = ggml_hip_dp4a(grid_l, u0, sumi0);
+            sumi0 = ggml_hip_dp4a(grid_h, u1, sumi0);
         } else {
-            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
-            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+            sumi1 = ggml_hip_dp4a(grid_l, u0, sumi1);
+            sumi1 = ggml_hip_dp4a(grid_h, u1, sumi1);
         }
     }
     const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
@@ -1090,11 +1051,11 @@ static __device__ __forceinline__ float vec_dot_iq2_s_q8_1(
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
         if (l0 < 4) {
-            sumi0 = ggml_cuda_dp4a(grid_l, u0, sumi0);
-            sumi0 = ggml_cuda_dp4a(grid_h, u1, sumi0);
+            sumi0 = ggml_hip_dp4a(grid_l, u0, sumi0);
+            sumi0 = ggml_hip_dp4a(grid_h, u1, sumi0);
         } else {
-            sumi1 = ggml_cuda_dp4a(grid_l, u0, sumi1);
-            sumi1 = ggml_cuda_dp4a(grid_h, u1, sumi1);
+            sumi1 = ggml_hip_dp4a(grid_l, u0, sumi1);
+            sumi1 = ggml_hip_dp4a(grid_h, u1, sumi1);
         }
     }
     const int sumi = (sumi0*ls0 + sumi1*ls1 + (sumi0 + sumi1)/2)/4;
@@ -1131,8 +1092,8 @@ static __device__ __forceinline__ float vec_dot_iq3_xxs_q8_1(
 
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
-        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
-        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+        sumi = ggml_hip_dp4a(grid_l, u0, sumi);
+        sumi = ggml_hip_dp4a(grid_h, u1, sumi);
     }
 
     const int ls = aux32 >> 28;
@@ -1174,8 +1135,8 @@ static __device__ __forceinline__ float vec_dot_iq3_s_q8_1(
         const int u0 = get_int_b4(bq8_1[iqs/2].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs/2].qs, l0 + 1);
 
-        sumi = ggml_cuda_dp4a(grid_l, u0, sumi);
-        sumi = ggml_cuda_dp4a(grid_h, u1, sumi);
+        sumi = ggml_hip_dp4a(grid_l, u0, sumi);
+        sumi = ggml_hip_dp4a(grid_h, u1, sumi);
     }
 
     sumi *= 1 + 2*((bq3->scales[iqs/4] >> ((iqs << 1) & 0x04)) & 0x0F);
@@ -1207,8 +1168,8 @@ static __device__ __forceinline__ float vec_dot_iq1_s_q8_1(
         const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
 
-        sumi = ggml_cuda_dp4a(grid0, u0, sumi);
-        sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+        sumi = ggml_hip_dp4a(grid0, u0, sumi);
+        sumi = ggml_hip_dp4a(grid1, u1, sumi);
     }
 
     const float  d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
@@ -1242,13 +1203,13 @@ static __device__ __forceinline__ float vec_dot_iq1_m_q8_1(
         const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
         const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
 
-        sumi[l0/4] = ggml_cuda_dp4a(grid0, u0, sumi[l0/4]);
-        sumi[l0/4] = ggml_cuda_dp4a(grid1, u1, sumi[l0/4]);
+        sumi[l0/4] = ggml_hip_dp4a(grid0, u0, sumi[l0/4]);
+        sumi[l0/4] = ggml_hip_dp4a(grid1, u1, sumi[l0/4]);
 
         const float delta = -1.0f + IQ1M_DELTA - (qhl & 0x08) * (2.0f*IQ1M_DELTA/0x08);
         int sumy = 0;
-        sumy = ggml_cuda_dp4a(u0, 0x01010101, sumy);
-        sumy = ggml_cuda_dp4a(u1, 0x01010101, sumy);
+        sumy = ggml_hip_dp4a(u0, 0x01010101, sumy);
+        sumy = ggml_hip_dp4a(u1, 0x01010101, sumy);
         sumf[l0/4] += delta*sumy;
     }
 
@@ -1280,8 +1241,8 @@ static __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(
         const int aux_q4 = get_int_b2(bq4->qs, iqs + l);
         const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
 
-        sumi = ggml_cuda_dp4a(v.x, q8[l + 0], sumi);
-        sumi = ggml_cuda_dp4a(v.y, q8[l + 4], sumi);
+        sumi = ggml_hip_dp4a(v.x, q8[l + 0], sumi);
+        sumi = ggml_hip_dp4a(v.y, q8[l + 4], sumi);
     }
 
     const float d = __half2float(bq4->d) * __low2float(bq8_1->ds);
@@ -1305,8 +1266,8 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
         const int u0 = get_int_b4(bq8_1[iqs/4].qs, j + 0);
         const int u1 = get_int_b4(bq8_1[iqs/4].qs, j + 4);
 
-        sumi = ggml_cuda_dp4a(v.x, u0, sumi);
-        sumi = ggml_cuda_dp4a(v.y, u1, sumi);
+        sumi = ggml_hip_dp4a(v.x, u0, sumi);
+        sumi = ggml_hip_dp4a(v.y, u1, sumi);
     }
 
     const int ls = ((bq4->scales_l[iqs/8] >> (iqs & 0x04)) & 0x0F) | (((bq4->scales_h >> (iqs/2)) & 0x03) << 4);

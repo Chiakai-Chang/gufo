@@ -9,14 +9,17 @@
 #include <string_view>
 #include <vector>
 
+#include "src/core/sampling.hpp"
+#include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
-#include "src/models/qwen38_flash_next/tokenizer.hpp"
 
 namespace gufo::core {
 class GgufReader;
 }
 
 namespace gufo::models::qwen38_flash_next {
+
+inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
 
 struct ModelWeights;
 struct MtpWeights;
@@ -71,7 +74,7 @@ public:
   [[nodiscard]] bool HasMtp() const noexcept;
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
-  [[nodiscard]] const Tokenizer& tokenizer() const noexcept {
+  [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {
     return *tokenizer_;
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
@@ -84,7 +87,7 @@ private:
   std::shared_ptr<core::GgufReader> mtp_reader_;
   std::unique_ptr<ModelWeights> weights_;
   std::unique_ptr<MtpWeights> mtp_weights_;
-  std::unique_ptr<Tokenizer> tokenizer_;
+  std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::unique_ptr<NgramTable> ngram_;
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
@@ -93,7 +96,7 @@ private:
 };
 
 /// One conversation's context. Sync feeds a prompt (reusing whatever prefix
-/// the session already holds), Evaluate appends one token, SpeculativeStep
+/// the session already holds), Evaluate appends one token, DecodeStep
 /// runs a draft-verify cycle. The logits of the last token are kept.
 class Session final {
 public:
@@ -107,16 +110,20 @@ public:
                           std::string* error_msg = nullptr);
   [[nodiscard]] bool Evaluate(std::int32_t token,
                               std::string* error_msg = nullptr);
-  /// Greedy draft-verify cycle: emits between one and max_draft_tokens+1
-  /// tokens, never more than `max_tokens`, and leaves the logits of the
-  /// last emitted token in place. Falls back to Evaluate without MTP.
-  [[nodiscard]] bool SpeculativeStep(std::size_t max_tokens,
-                                     std::vector<std::int32_t>* emitted,
-                                     std::string* error_msg = nullptr);
-  [[nodiscard]] std::int32_t SelectNext(float temperature,
-                                        std::uint64_t* rng_state, int top_k = 0,
-                                        float top_p = 1.0F,
-                                        float min_p = 0.0F) const;
+  struct DecodeResult {
+    std::vector<std::int32_t> tokens;
+    bool stop{false};
+  };
+  /// Samples the target and verifies deterministic MTP proposals with the
+  /// same sampler. Updates its history/RNG only for emitted tokens (and the
+  /// stop draw), leaving the session at exactly the emitted prefix. A
+  /// one-token budget or a model without MTP uses ordinary decoding.
+  /// Benchmarks may continue past EOS by setting stop_at_eos to false.
+  [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
+                                sampling::SamplerState& sampler,
+                                DecodeResult* result,
+                                std::string* error_msg = nullptr,
+                                bool stop_at_eos = true);
   [[nodiscard]] std::span<const float> Logits() const noexcept {
     return logits_;
   }
@@ -151,11 +158,7 @@ private:
   std::vector<float> logits_;
   std::vector<float> draft_logits_;
   std::vector<float> verify_logits_;
-  /// The draft block has consumed every committed token and its logits
-  /// propose the token after the pending one.
-  bool draft_ready_{false};
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
-  std::int32_t pending_{-1};      ///< argmax of `logits_`, next token to feed
   SpeculativeStats stats_;
 };
 

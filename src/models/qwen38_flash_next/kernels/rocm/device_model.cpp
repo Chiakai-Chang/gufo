@@ -1,17 +1,12 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 
-#include <fcntl.h>
 #include <hip/hip_runtime.h>
-#include <unistd.h>
 
 #include <algorithm>
-#include <array>
-#include <cerrno>
-#include <cstring>
 #include <initializer_list>
-#include <thread>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/weight_upload.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -23,203 +18,22 @@ namespace {
 /// activation padding and contribute nothing).
 constexpr std::size_t kTailMargin = 4096;
 
-constexpr std::size_t kStageBytes = 64ULL << 20;
-constexpr std::size_t kStageCount = 3;
-constexpr std::size_t kDirectAlign = 4096;
-
-/// Streams tensor payloads from the shard files straight into device memory:
-/// direct reads into pinned staging buffers, asynchronous copies behind
-/// them. The mapped GGUF is never touched, so the page cache stays empty and
-/// the copy runs at disk speed instead of page-fault speed.
-class Stager {
-public:
-  Stager(std::vector<std::filesystem::path> shards, std::string* error)
-      : error_(error) {
-    for (const auto& path : shards) {
-      int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-      direct_.push_back(fd >= 0);
-      if (fd < 0) {
-        fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-      }
-      if (fd < 0) {
-        Fail("cannot open shard " + path.string() + ": " +
-             std::strerror(errno));
-      }
-      fds_.push_back(fd);
-    }
-    if (hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking) !=
-        hipSuccess) {
-      Fail("upload stream creation failed");
-    }
-    for (std::size_t i = 0; i < kStageCount; ++i) {
-      void* raw = nullptr;
-      if (hipHostMalloc(&raw, kStageBytes + kDirectAlign) != hipSuccess ||
-          hipEventCreateWithFlags(&events_[i], hipEventDisableTiming) !=
-              hipSuccess) {
-        Fail("pinned staging allocation failed");
-        break;
-      }
-      raw_[i] = raw;
-      const auto address = reinterpret_cast<std::uintptr_t>(raw);
-      stage_[i] = reinterpret_cast<std::uint8_t*>((address + kDirectAlign - 1) &
-                                                  ~(kDirectAlign - 1));
-      busy_[i] = false;
-    }
-  }
-
-  ~Stager() {
-    if (stream_ != nullptr) {
-      (void)hipStreamSynchronize(stream_);
-      (void)hipStreamDestroy(stream_);
-    }
-    for (std::size_t i = 0; i < kStageCount; ++i) {
-      if (raw_[i] != nullptr) {
-        (void)hipHostFree(raw_[i]);
-      }
-      if (events_[i] != nullptr) {
-        (void)hipEventDestroy(events_[i]);
-      }
-    }
-    for (int fd : fds_) {
-      if (fd >= 0) {
-        ::close(fd);
-      }
-    }
-  }
-
-  [[nodiscard]] bool ok() const noexcept { return ok_; }
-
-  /// Copies `size` bytes at `offset` of shard `shard` to `device`: every
-  /// staging buffer is filled by its own reader thread (direct I/O wants an
-  /// aligned file offset and length, so each reads the enclosing aligned
-  /// window and copies from the interior), then the batch is queued to the
-  /// device in order.
-  bool Copy(std::uint32_t shard, std::uint64_t offset, std::size_t size,
-            void* device) {
-    if (!ok_ || shard >= fds_.size()) {
-      return false;
-    }
-    return CopyParallel(shard, offset, size, device);
-  }
-
-  bool Finish() { return hipStreamSynchronize(stream_) == hipSuccess; }
-
-private:
-  struct ReadTask {
-    std::size_t stage{0};
-    std::uint64_t begin{0};
-    std::size_t skip{0};
-    std::size_t want{0};
-    std::size_t length{0};
-    std::size_t destination_offset{0};
-    int error{0};
-    bool ok{false};
-  };
-
-  void Read(std::uint32_t shard, ReadTask* task) {
-    std::size_t got = 0;
-    while (got < task->skip + task->want) {
-      const ssize_t n =
-          ::pread(fds_[shard], stage_[task->stage] + got, task->length - got,
-                  static_cast<off_t>(task->begin + got));
-      if (n < 0 && errno == EINTR) {
-        continue;
-      }
-      if (n <= 0) {
-        task->error = n < 0 ? errno : 0;
-        return;
-      }
-      got += static_cast<std::size_t>(n);
-    }
-    task->ok = true;
-  }
-
-  bool CopyParallel(std::uint32_t shard, std::uint64_t offset, std::size_t size,
-                    void* device) {
-    std::size_t done = 0;
-    while (done < size) {
-      std::array<ReadTask, kStageCount> tasks{};
-      std::array<std::jthread, kStageCount> readers;
-      std::size_t count = 0;
-      std::size_t batch_bytes = 0;
-      while (count < kStageCount && done + batch_bytes < size) {
-        ReadTask& task = tasks[count];
-        task.stage = next_++ % kStageCount;
-        if (busy_[task.stage] &&
-            hipEventSynchronize(events_[task.stage]) != hipSuccess) {
-          return Fail("staging event wait failed");
-        }
-        busy_[task.stage] = false;
-        const std::uint64_t at = offset + done + batch_bytes;
-        task.begin = direct_[shard] ? at & ~(kDirectAlign - 1) : at;
-        task.skip = at - task.begin;
-        task.want =
-            std::min(size - done - batch_bytes, kStageBytes - task.skip);
-        task.length = task.skip + task.want;
-        if (direct_[shard]) {
-          task.length = (task.length + kDirectAlign - 1) & ~(kDirectAlign - 1);
-        }
-        task.destination_offset = done + batch_bytes;
-        batch_bytes += task.want;
-        ++count;
-      }
-      for (std::size_t i = 0; i < count; ++i) {
-        readers[i] = std::jthread(
-            [this, shard, task = &tasks[i]] { Read(shard, task); });
-      }
-      for (std::size_t i = 0; i < count; ++i) {
-        readers[i].join();
-        if (!tasks[i].ok) {
-          return Fail("shard read failed: " +
-                      std::string(tasks[i].error != 0
-                                      ? std::strerror(tasks[i].error)
-                                      : "short read"));
-        }
-      }
-      for (std::size_t i = 0; i < count; ++i) {
-        const ReadTask& task = tasks[i];
-        if (hipMemcpyAsync(
-                static_cast<std::uint8_t*>(device) + task.destination_offset,
-                stage_[task.stage] + task.skip, task.want,
-                hipMemcpyHostToDevice, stream_) != hipSuccess ||
-            hipEventRecord(events_[task.stage], stream_) != hipSuccess) {
-          return Fail("device copy failed");
-        }
-        busy_[task.stage] = true;
-      }
-      done += batch_bytes;
-    }
-    return true;
-  }
-
-  bool Fail(const std::string& message) {
-    if (ok_ && error_ != nullptr) {
-      *error_ = message;
-    }
-    ok_ = false;
-    return false;
-  }
-
-  std::string* error_;
-  bool ok_{true};
-  std::vector<int> fds_;
-  std::vector<bool> direct_;
-  hipStream_t stream_{nullptr};
-  void* raw_[kStageCount]{};
-  std::uint8_t* stage_[kStageCount]{};
-  hipEvent_t events_[kStageCount]{};
-  bool busy_[kStageCount]{};
-  std::size_t next_{0};
+struct Conversion {
+  void* source;
+  void* destination;
+  std::size_t count;
 };
 
 struct Uploader {
-  Stager& stager;
+  WeightUpload& stager;
+  std::vector<Conversion>& conversions;
   std::vector<void*>& allocations;
   std::size_t& bytes;
   std::size_t& max_half_cols;
   std::size_t& max_q8_cols;
   std::string* error;
   bool ok{true};
+  std::uint32_t shard_base{0};
 
   void Fail(const std::string& message) {
     if (ok && error != nullptr) {
@@ -242,7 +56,7 @@ struct Uploader {
     }
     allocations.push_back(ptr);
     bytes += size + kTailMargin;
-    if (!stager.Copy(t.shard, t.file_offset, size, ptr)) {
+    if (!stager.Copy(shard_base + t.shard, t.file_offset, size, ptr, error)) {
       Fail("upload failed for " + std::string(t.name) +
            (error != nullptr ? ": " + *error : std::string()));
       return d;
@@ -294,8 +108,8 @@ struct Uploader {
     bytes += size + kTailMargin;
     std::size_t offset = 0;
     for (const TensorRef* t : parts) {
-      if (!stager.Copy(t->shard, t->file_offset, t->SizeBytes(),
-                       static_cast<std::uint8_t*>(ptr) + offset)) {
+      if (!stager.Copy(shard_base + t->shard, t->file_offset, t->SizeBytes(),
+                       static_cast<std::uint8_t*>(ptr) + offset, error)) {
         Fail("upload failed for " + std::string(t->name));
         return d;
       }
@@ -320,20 +134,11 @@ struct Uploader {
     }
     allocations.push_back(half);
     bytes += count * sizeof(std::uint16_t) + kTailMargin;
-    // The staged copies land on the upload stream; convert behind them.
-    if (!stager.Finish()) {
-      Fail("upload failed for stacked tensor");
-      return d;
-    }
-    NarrowActivations(static_cast<const float*>(ptr), half, false, count,
-                      nullptr);
+    // Keep the small F32 stacks until the disk pipeline drains. Converting
+    // each router immediately would serialize every layer's uploads.
+    conversions.push_back({ptr, half, count});
     (void)hipMemsetAsync(static_cast<std::uint8_t*>(half) + count * 2, 0,
                          kTailMargin, nullptr);
-    (void)hipDeviceSynchronize();
-    // The F32 stack was pushed right after `half`; drop it.
-    allocations.erase(allocations.end() - 2);
-    (void)hipFree(ptr);
-    bytes -= size + kTailMargin;
     d.data = half;
     d.type = core::GgmlType::kF16;
     d.cols = static_cast<std::uint32_t>((*parts.begin())->cols);
@@ -423,6 +228,24 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const ModelWeights& w, const std::filesystem::path& model_path,
     const MtpWeights* mtp, const std::filesystem::path& mtp_path,
     std::string* error_msg) {
+  // The CPU reference also reads Q6_K, but the production embedding, dense
+  // and routed kernels do not. Reject it before allocating device weights.
+  const auto supported = [&](const TensorRef& t) {
+    if (t.type != core::GgmlType::kQ6_K)
+      return true;
+    if (error_msg != nullptr)
+      *error_msg = "unsupported HIP tensor format Q6_K: " + std::string(t.name);
+    return false;
+  };
+  const auto layer_supported = [&](const LayerWeights& l) {
+    return supported(l.ffn_gate_exps) && supported(l.ffn_up_exps) &&
+           supported(l.ffn_down_exps);
+  };
+  if (!supported(w.token_embd) || !supported(w.output) ||
+      !std::all_of(w.layers.begin(), w.layers.end(), layer_supported) ||
+      (mtp != nullptr && !layer_supported(mtp->block))) {
+    return nullptr;
+  }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;
   std::vector<std::filesystem::path> shards;
@@ -436,12 +259,16 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   for (std::uint32_t i = 0; i < shard_count; ++i) {
     shards.push_back(ShardPath(model_path, i));
   }
-  Stager stager(shards, error_msg);
-  if (!stager.ok()) {
+  if (mtp != nullptr) {
+    shards.push_back(mtp_path);
+  }
+  auto stager = WeightUpload::Create(shards, error_msg);
+  if (!stager) {
     return nullptr;
   }
-  Uploader up{stager,          m->allocations_, m->bytes_, m->max_half_cols_,
-              m->max_q8_cols_, error_msg};
+  std::vector<Conversion> conversions;
+  Uploader up{*stager,           conversions,     m->allocations_, m->bytes_,
+              m->max_half_cols_, m->max_q8_cols_, error_msg};
   m->token_embd_ = up.Copy(w.token_embd);
   m->output_ =
       w.output.data == w.token_embd.data ? m->token_embd_ : up.Copy(w.output);
@@ -454,22 +281,32 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     }
   }
   if (mtp != nullptr) {
-    Stager mtp_stager({mtp_path}, error_msg);
-    if (!mtp_stager.ok()) {
-      return nullptr;
-    }
-    Uploader mtp_up{mtp_stager,        m->allocations_, m->bytes_,
-                    m->max_half_cols_, m->max_q8_cols_, error_msg};
-    m->mtp_ = mtp_up.Layer(mtp->block);
+    // The sidecar has its own shard index; use the same readers and staging
+    // pool as the target, without another allocation or pipeline barrier.
+    up.shard_base = shard_count;
+    m->mtp_ = up.Layer(mtp->block);
     m->has_mtp_ = true;
-    if (!mtp_up.ok || !mtp_stager.Finish()) {
-      return nullptr;
-    }
   }
-  if (!up.ok || !stager.Finish()) {
+  if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
   }
-  (void)hipDeviceSynchronize();
+  for (const auto& c : conversions) {
+    NarrowActivations(static_cast<const float*>(c.source), c.destination, false,
+                      c.count, nullptr);
+  }
+  const auto status = hipDeviceSynchronize();
+  if (status != hipSuccess) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "weight conversion failed: " + std::string(hipGetErrorString(status));
+    }
+    return nullptr;
+  }
+  for (const auto& c : conversions) {
+    std::erase(m->allocations_, c.source);
+    (void)hipFree(c.source);
+    m->bytes_ -= c.count * sizeof(float) + kTailMargin;
+  }
   return m;
 }
 

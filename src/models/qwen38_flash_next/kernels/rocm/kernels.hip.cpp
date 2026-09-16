@@ -2279,22 +2279,6 @@ __global__ void CopyKernel(const float* src, float* dst, std::size_t count) {
   }
 }
 
-__global__ void ChecksumKernel(const float* x, std::size_t count, float* out) {
-  __shared__ float shared[32];
-  float sum = 0.0f;
-  float abs_sum = 0.0f;
-  for (std::size_t i = threadIdx.x; i < count; i += blockDim.x) {
-    sum += x[i];
-    abs_sum += fabsf(x[i]);
-  }
-  sum = BlockSum(sum, shared);
-  abs_sum = BlockSum(abs_sum, shared);
-  if (threadIdx.x == 0) {
-    out[0] = sum;
-    out[1] = abs_sum;
-  }
-}
-
 inline unsigned Blocks(std::size_t count) {
   return static_cast<unsigned>((count + kThreads - 1) / kThreads);
 }
@@ -4563,12 +4547,6 @@ void MtpConcat(const float* embd_n, const float* h_n, float* concat,
                std::uint32_t streams, hipStream_t stream) {
   hipLaunchKernelGGL(MtpConcatKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
                      embd_n, h_n, concat, hidden, streams);
-}
-
-void Checksum(const float* x, std::size_t count, float* out,
-              hipStream_t stream) {
-  hipLaunchKernelGGL(ChecksumKernel, dim3(1), dim3(kThreads), 0, stream, x,
-                     count, out);
 }
 
 void Argmax(const float* logits, std::int32_t* out, std::uint32_t n_tokens,

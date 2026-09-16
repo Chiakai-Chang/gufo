@@ -69,6 +69,7 @@ private:
     __half* k_cache{nullptr};
     __half* v_cache{nullptr};
     float* h{nullptr};  ///< [hc_dim] wide residual handed to the next draft
+    float* target_hidden{nullptr};  ///< this session's last trunk batch
     std::uint32_t position{0};
   };
 
@@ -323,14 +324,12 @@ private:
     float* shexp_out;
     // head and hidden rows kept for the draft block
     float* logits;
-    float* hc_keep;
     // mtp
     float* mtp_h;
     float* mtp_embd;
     float* mtp_concat;
     float* mtp_res;
   } s_{};
-  float* trace_{nullptr};  ///< QFN_TRACE per-layer checksums
   std::uint32_t mask_words_{0};
   /// Queries per block-selection launch (its score scratch is chunk x
   /// max_blocks floats: 128 MB at the 262k context).
@@ -352,7 +351,6 @@ private:
   mutable std::size_t routed_compact_rows_{0};  ///< sum of padded buckets
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
-  bool graphs_enabled_{true};
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

@@ -5,20 +5,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
 #include "qfn_mmq.h"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
-
-// The tier asks its host for producer-emitted Q8_1 activations (a DeepSeek
-// decode fusion). This runtime never registers any, so every lookup misses
-// and the tier quantizes the activation itself.
-extern "C" int qfn_cuda_q8_fold_take_q81(const void* /*src*/,
-                                         std::uint64_t /*in_dim*/,
-                                         const void** /*q81*/) {
-  return 0;
-}
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -63,8 +55,10 @@ WeightType SmallType(GgmlType type) {
       return WeightType::kF16;
     case GgmlType::kQ8_0:
       return WeightType::kQ8_0;
-    default:
+    case GgmlType::kF32:
       return WeightType::kF32;
+    default:
+      throw std::logic_error("unsupported Flash-Next matrix format");
   }
 }
 
@@ -317,21 +311,12 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     e->tokens_host_ = static_cast<std::int32_t*>(tokens);
     e->logits_host_ = static_cast<float*>(logits);
   }
-  if (const char* env = std::getenv("QFN_GRAPHS"); env != nullptr) {
-    e->graphs_enabled_ = std::string_view(env) != "0";
-  }
   // The wide mixer route (F16 norm for the epilogue, tiled Q8 norm for the
   // W8A8 down projection) needs the four-stream geometry, 32-wide blocks and
   // a Q8_0 down projection.
   e->wide_mixer_ = c.hc_count == 4 && c.hidden_size % 32 == 0 &&
                    !model.layers().empty() &&
                    model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
-  if (std::getenv("QFN_TRACE") != nullptr) {
-    e->trace_ = f32(static_cast<std::size_t>(c.num_layers) * 8 + 16);
-  }
-  // Every row of the batch is kept: the draft block consumes the trunk's
-  // hidden state of each prompt position during its own prefill.
-  s.hc_keep = f32(T * hc_dim);
   if (model.has_mtp()) {
     s.mtp_h = f32(T * hc_dim);
     s.mtp_embd = f32(T * hidden);
@@ -397,6 +382,8 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg);
   if (model_->has_mtp()) {
+    s->mtp_.target_hidden = Alloc<float>(
+        a, static_cast<std::size_t>(options_.max_batch) * c.HcDim(), error_msg);
     s->mtp_.k_cache = Alloc<__half>(
         a, static_cast<std::size_t>(max_context) * kv_row, error_msg);
     s->mtp_.v_cache = Alloc<__half>(
@@ -474,9 +461,9 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           const float* x, float* out, std::uint32_t n_tokens,
                           const DeviceTensor* down,
                           std::string* error_msg) const {
-  // One single-token launch computes both projections and the SwiGLU (the
-  // tier fuses the gate for one column only).
-  if (n_tokens == 1 && up.type == GgmlType::kQ8_0 &&
+  // Decode and verification use the same fused projections and activation.
+  // A different SwiGLU rounding can change later activation quantization.
+  if (n_tokens <= kVecBatch && up.type == GgmlType::kQ8_0 &&
       gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
       up.cols == gate.cols) {
     Q8Input xq;
@@ -696,7 +683,9 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
   const int U = static_cast<int>(n_used);
   // The vector entries loop over column chunks, so the decode-time down
   // projection (top-k rows, one expert each) stays on them as well.
-  const bool tiled = n_rows > 4 * kVecBatch;
+  // Verification keeps the same quantization and reduction as single-token
+  // decoding even when top-k expansion produces more than 32 slot rows.
+  const bool tiled = n_rows > 4 * kVecBatch && n_tokens > kVecBatch;
   if (tiled) {
     RoutedHints(w, n_tokens);
   }
@@ -911,42 +900,26 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
     return false;
   }
   const std::uint32_t hc_dim = c.HcDim();
-  // QFN_TRACE checksums of every PLE stage, after the per-layer ones.
-  auto tr = [&](int slot, const float* x, std::size_t count) {
-    if (trace_ != nullptr) {
-      Checksum(x, count,
-               trace_ + static_cast<std::size_t>(c.num_layers) * 8 + slot * 2,
-               stream_);
-    }
-  };
-  tr(0, s_.ple_emb, static_cast<std::size_t>(n) * c.PleEmbeddingDim());
   Q8Input emb;
   if (!Quantize(s_.ple_emb, n, c.PleEmbeddingDim(), &emb, error_msg) ||
       !Dense(l.ple_key, emb, s_.ple_key, error_msg) ||
       !Dense(l.ple_value, emb, s_.ple_value, error_msg)) {
     return false;
   }
-  tr(1, s_.ple_key, static_cast<std::size_t>(n) * hc_dim);
-  tr(2, s_.ple_value, static_cast<std::size_t>(n) * c.hidden_size);
   RmsNormRows(s_.ple_key, l.ple_norm_key.f32(), s_.ple_key, n, hc_dim,
               c.hc_count, c.rms_eps, stream_);
   RmsNormRows(res, l.ple_norm_query.f32(), s_.ple_query, n, hc_dim, c.hc_count,
               c.rms_eps, stream_);
-  tr(3, s_.ple_key, static_cast<std::size_t>(n) * hc_dim);
-  tr(4, s_.ple_query, static_cast<std::size_t>(n) * hc_dim);
   PleGate(s_.ple_key, s_.ple_query, s_.ple_value, s_.ple_gated, n,
           c.hidden_size, c.hc_count, stream_);
-  tr(5, s_.ple_gated, static_cast<std::size_t>(n) * hc_dim);
   RmsNormRows(s_.ple_gated, l.ple_norm_conv.f32(), s_.ple_norm, n, hc_dim,
               c.hc_count, c.rms_eps, stream_);
   PleConv(s_.ple_norm, l.ple_conv1d.f32(), session.ple_history_,
           s_.ple_history_scratch, s_.ple_conv,
           speculative ? session.ple_snapshots_ : nullptr, n, hc_dim,
           c.ple_conv_kernel, c.ple_ngram_size, stream_);
-  tr(6, s_.ple_conv, static_cast<std::size_t>(n) * hc_dim);
   PleInject(res, s_.ple_gated, s_.ple_conv,
             static_cast<std::size_t>(n) * hc_dim, stream_);
-  tr(7, res, static_cast<std::size_t>(n) * hc_dim);
   return true;
 }
 
@@ -1195,7 +1168,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   if (wmma_experts) {
     // The combine that follows folds this epilogue into its own pass when
     // it takes the F16 route (Combine); otherwise it runs here.
-    moe_pending_ = trace_ == nullptr && out == s_.block_out;
+    moe_pending_ = out == s_.block_out;
     if (!moe_pending_) {
       MoeEpilogueVec4F16(reinterpret_cast<const __half*>(s_.down_e), s_.weights,
                          s_.shexp_out, s_.router + c.num_experts,
@@ -1329,8 +1302,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = graphs_enabled_ && trace_ == nullptr && n <= kVecBatch &&
-                     pool_grid <= graph_pool_grid;
+  const bool graph = n <= kVecBatch && pool_grid <= graph_pool_grid;
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
@@ -1353,24 +1325,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,
                 logits);
   }
-  if (trace_ != nullptr) {
-    std::vector<float> h(static_cast<std::size_t>(c.num_layers) * 8 + 16);
-    (void)hipMemcpy(h.data(), trace_, h.size() * 4, hipMemcpyDeviceToHost);
-    const float* pl = h.data() + static_cast<std::size_t>(c.num_layers) * 8;
-    std::fprintf(
-        stderr,
-        "trace ple emb %.5f %.5f key %.5f %.5f value %.5f %.5f keyn %.5f %.5f "
-        "query %.5f %.5f gated %.5f %.5f conv %.5f %.5f res %.5f %.5f\n",
-        pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], pl[6], pl[7], pl[8], pl[9],
-        pl[10], pl[11], pl[12], pl[13], pl[14], pl[15]);
-    for (std::uint32_t il = 0; il < c.num_layers; ++il) {
-      std::fprintf(stderr,
-                   "trace %u mixed %.5f %.5f attn %.5f %.5f ffn %.5f %.5f res "
-                   "%.5f %.5f\n",
-                   il, h[il * 8], h[il * 8 + 1], h[il * 8 + 2], h[il * 8 + 3],
-                   h[il * 8 + 4], h[il * 8 + 5], h[il * 8 + 6], h[il * 8 + 7]);
-    }
-  }
+
   session.position_ += n;
   if (sparse) {
     session.blocks_ = complete;
@@ -1417,12 +1372,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
                           session.max_context_, sparse, error_msg)) {
       return false;
     }
-    if (trace_ != nullptr) {
-      Checksum(s_.mixed, static_cast<std::size_t>(n) * c.hidden_size,
-               trace_ + il * 8, stream_);
-      Checksum(s_.block_out, static_cast<std::size_t>(n) * c.hidden_size,
-               trace_ + il * 8 + 2, stream_);
-    }
+
     // Each combine also norms the residual for the mixer that follows it,
     // unless PLE rewrites the residual first.
     Combine(s_.res, l.hc_ffn.norm.f32(), n);
@@ -1437,16 +1387,11 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             : model_->hc_head().norm.f32();
     Combine(s_.res, next_norm, n);
     normed = next_norm != nullptr;
-    if (trace_ != nullptr) {
-      Checksum(s_.block_out, static_cast<std::size_t>(n) * c.hidden_size,
-               trace_ + il * 8 + 4, stream_);
-      Checksum(s_.res, static_cast<std::size_t>(n) * c.HcDim(),
-               trace_ + il * 8 + 6, stream_);
-    }
   }
   // Keep the wide residual of every row for the draft block.
-  if (!Check(hipMemcpyAsync(
-                 s_.hc_keep, s_.res,
+  if (model_->has_mtp() &&
+      !Check(hipMemcpyAsync(
+                 session.mtp_.target_hidden, s_.res,
                  static_cast<std::size_t>(n) * c.HcDim() * sizeof(float),
                  hipMemcpyDeviceToDevice, stream_),
              "hidden keep", error_msg)) {
@@ -1520,7 +1465,9 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   // Pooled block keys past the kept prefix are stale; they are rebuilt
   // from the raw keys when needed.
   session.blocks_ =
-      std::min(session.blocks_, session.position_ / c.compress_ratio);
+      c.compress_ratio == 0
+          ? 0
+          : std::min(session.blocks_, session.position_ / c.compress_ratio);
   return Check(hipStreamSynchronize(stream_), "rollback", error_msg);
 }
 
@@ -1550,7 +1497,7 @@ bool Executor::MtpForward(Session& session,
   control_host_->blocks = session.blocks_;
   control_host_->mtp_position = pos;
   control_host_->hidden_row = hidden_row;
-  const bool graph = graphs_enabled_ && trace_ == nullptr && n <= kVecBatch;
+  const bool graph = n <= kVecBatch;
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
                             (std::uint64_t{1} << 40);
@@ -1583,8 +1530,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
               1, c.rms_eps, stream_);
   // The hidden input: kept trunk rows from `hidden_row`, or the block's
   // own carried residual.
-  MtpHidden(s_.hc_keep, session.mtp_.h, &session.control_->hidden_row, s_.mtp_h,
-            n, hc_dim, stream_);
+  MtpHidden(session.mtp_.target_hidden, session.mtp_.h,
+            &session.control_->hidden_row, s_.mtp_h, n, hc_dim, stream_);
   RmsNormRows(s_.mtp_h, l.nextn_hnorm.f32(), s_.mtp_h, n, hc_dim, c.hc_count,
               c.rms_eps, stream_);
   MtpConcat(s_.mtp_embd, s_.mtp_h, s_.mtp_concat, n, c.hidden_size, c.hc_count,

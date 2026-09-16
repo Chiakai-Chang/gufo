@@ -1933,20 +1933,6 @@ constexpr std::string_view kQwenFlashNextStateAbi =
 using QwenFlashNextModel = models::qwen38_flash_next::Model;
 using QwenFlashNextSession = models::qwen38_flash_next::Session;
 
-std::vector<TextRunnerToken> QwenFlashNextRunnerTokens(
-    std::span<const std::int32_t> tokens) {
-  std::vector<TextRunnerToken> converted;
-  converted.reserve(tokens.size());
-  for (const std::int32_t token : tokens) {
-    if (token < 0) {
-      throw std::invalid_argument(
-          "Qwen3.8-Flash-Next token ID must not be negative");
-    }
-    converted.push_back(static_cast<TextRunnerToken>(token));
-  }
-  return converted;
-}
-
 std::vector<std::int32_t> QwenFlashNextEngineTokens(
     std::span<const TextRunnerToken> tokens) {
   std::vector<std::int32_t> converted;
@@ -2008,13 +1994,13 @@ const QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
 
 class QwenFlashNextTextRunner final : public TextModelRunner {
 public:
-  QwenFlashNextTextRunner(
-      std::shared_ptr<QwenFlashNextModel> model,
-      std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
-      std::uint32_t max_context)
+  QwenFlashNextTextRunner(std::shared_ptr<QwenFlashNextModel> model,
+                          std::uint32_t max_context, bool use_mtp,
+                          std::uint32_t max_draft_tokens)
       : model_(std::move(model)),
-        tokenizer_(std::move(tokenizer)),
-        max_context_(max_context) {}
+        max_context_(max_context),
+        use_mtp_(use_mtp),
+        max_draft_tokens_(max_draft_tokens) {}
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -2028,9 +2014,7 @@ public:
                 .fork = false,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
-                // The MTP draft block verifies greedily; sampled requests
-                // fall back to one token per step.
-                .multi_token_decode = model_->HasMtp(),
+                .multi_token_decode = use_mtp_,
                 .batched_multi_token_decode = false,
                 .batched_multi_token_decode_max_width = 0,
                 .prefix_reuse = true,
@@ -2065,7 +2049,7 @@ public:
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override {
-    return tokenizer_->Encode(text);
+    return model_->tokenizer().Encode(text);
   }
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
@@ -2093,7 +2077,7 @@ public:
     options.require_tool_call =
         request.tool_choice == ChatRequest::ToolChoice::kRequired;
     return tokenization::QwenChatTemplate::RenderAndTokenize(
-        *tokenizer_, request.messages,
+        model_->tokenizer(), request.messages,
         request.tool_choice == ChatRequest::ToolChoice::kNone
             ? std::span<const tokenization::ChatTool>{}
             : std::span<const tokenization::ChatTool>{request.tools},
@@ -2109,7 +2093,7 @@ public:
 
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override {
-    return tokenizer_->Decode(tokens);
+    return model_->tokenizer().Decode(tokens);
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
@@ -2193,9 +2177,7 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
-    // The draft block chains greedy proposals and the trunk verifies them
-    // greedily, so only an unmodified argmax request can take the cycle.
-    if (!model_->HasMtp() || !sampler.config().can_use_unmodified_argmax()) {
+    if (!use_mtp_ || max_tokens == 1) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     if (max_tokens == 0) {
@@ -2207,33 +2189,28 @@ public:
       return {.selections = {}, .stop = true};
     }
     const auto stats_before = qfn.session().Statistics();
-    std::vector<std::int32_t> emitted;
+    sampling::SamplerState working_sampler = sampler;
+    QwenFlashNextSession::DecodeResult decoded;
     std::string error;
-    if (!qfn.session().SpeculativeStep(max_tokens, &emitted, &error)) {
+    const auto budget =
+        std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
+    if (!qfn.session().DecodeStep(budget, working_sampler, &decoded, &error)) {
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
                                error);
     }
-    if (emitted.empty()) {
-      throw std::runtime_error(
-          "Qwen3.8-Flash-Next MTP decode produced no tokens");
-    }
+    // The pool accepts the returned tokens once; only publish the RNG here.
+    sampler.SetRngState(working_sampler.rng_state());
     TextDecodeStep step;
-    step.selections.reserve(emitted.size());
-    for (const std::int32_t token : emitted) {
-      if (model_->IsStopToken(token)) {
-        step.stop = true;
-        break;
-      }
+    step.stop = decoded.stop;
+    step.selections.reserve(decoded.tokens.size());
+    for (const std::int32_t token : decoded.tokens) {
       step.selections.push_back({
           .stop = false,
           .token = static_cast<TextRunnerToken>(token),
           .piece = model_->TokenText(token),
       });
     }
-    // The checkpoint counts the tokens the pool records. Past a stop token
-    // the session has consumed more than that; its next Sync sees the
-    // divergence and restarts, so the retained position stays honest.
-    qfn.set_position(qfn.position() + step.selections.size());
+    qfn.set_position(qfn.session().Position());
     const auto stats_after = qfn.session().Statistics();
     step.draft_tokens = stats_after.drafted - stats_before.drafted;
     step.draft_accepted_tokens = stats_after.accepted - stats_before.accepted;
@@ -2247,8 +2224,9 @@ public:
 
 private:
   std::shared_ptr<QwenFlashNextModel> model_;
-  std::unique_ptr<tokenization::QwenTokenizer> tokenizer_;
   std::uint32_t max_context_;
+  bool use_mtp_;
+  std::uint32_t max_draft_tokens_;
 };
 #endif
 
@@ -2363,6 +2341,12 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
+  if (speculative_config.draft_vocab != 0 &&
+      (reader->GetMetadataString("general.architecture") != "qwen4exp" ||
+       speculative_config.backend != TextSpeculativeBackend::kMtp)) {
+    SetError(error, "--draft-vocab requires Flash-Next MTP");
+    return false;
+  }
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kDSpark) {
@@ -2427,6 +2411,14 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "Qwen3.8-Flash-Next MTP HTTP decoding requires --mtp-model");
       return false;
     }
+    if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        (speculative_config.max_draft_tokens == 0 ||
+         speculative_config.min_draft_tokens != 1)) {
+      SetError(error,
+               "Flash-Next MTP requires a positive draft limit and "
+               "--min-draft-tokens 1");
+      return false;
+    }
     if (DiskCacheEnabled(disk_cache_config)) {
       SetError(error,
                "Qwen3.8-Flash-Next HTTP models keep no continuation "
@@ -2439,13 +2431,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                                                               &load_error)) {
       SetError(error,
                "Unsupported Qwen3.8-Flash-Next chat template: " + load_error);
-      return false;
-    }
-    auto tokenizer =
-        tokenization::QwenTokenizer::CreateFromGguf(*reader, &load_error);
-    if (tokenizer == nullptr) {
-      SetError(error,
-               "Failed to create Qwen3.8-Flash-Next tokenizer: " + load_error);
       return false;
     }
     // Prompt chunks of up to 2048 tokens keep the expert GEMMs on the
@@ -2468,9 +2453,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "Failed to create Qwen3.8-Flash-Next model: " + load_error);
       return false;
     }
-    return load(std::move(model), std::move(tokenizer), error, max_context,
-                session_count, prefill_policy, scheduler_policy,
-                speculative_config);
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config);
   }
   auto model = hip::QwenGpuModel::CreateFromGguf(reader, &load_error);
   if (model == nullptr) {
@@ -2695,13 +2679,12 @@ bool InferenceBackend::load(
 }
 
 bool InferenceBackend::load(
-    std::shared_ptr<models::qwen38_flash_next::Model> model,
-    std::unique_ptr<tokenization::QwenTokenizer> tokenizer, std::string* error,
+    std::shared_ptr<models::qwen38_flash_next::Model> model, std::string* error,
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config) {
-  if (model == nullptr || tokenizer == nullptr) {
-    SetError(error, "Qwen3.8-Flash-Next model and tokenizer must not be null");
+  if (model == nullptr) {
+    SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
   }
   if (session_count == 0) {
@@ -2714,8 +2697,16 @@ bool InferenceBackend::load(
         "HTTP context exceeds the loaded Qwen3.8-Flash-Next model context");
     return false;
   }
-  if (model->HasMtp() && (speculative_config.max_draft_tokens == 0 ||
-                          speculative_config.min_draft_tokens != 1)) {
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      (speculative_config.backend != TextSpeculativeBackend::kMtp ||
+       !model->HasMtp())) {
+    SetError(error,
+             "Flash-Next MTP requires a model loaded with its draft sidecar");
+    return false;
+  }
+  if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+      (speculative_config.max_draft_tokens == 0 ||
+       speculative_config.min_draft_tokens != 1)) {
     SetError(error,
              "Qwen3.8-Flash-Next MTP drafts a fixed chain; custom draft "
              "floors are unsupported");
@@ -2724,7 +2715,9 @@ bool InferenceBackend::load(
   try {
     auto new_state = std::make_shared<Impl::State>();
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
-        std::move(model), std::move(tokenizer), max_context);
+        std::move(model), max_context,
+        speculative_config.backend == TextSpeculativeBackend::kMtp,
+        speculative_config.max_draft_tokens);
     new_state->model_id = runner->Descriptor().model_id;
     auto runner_pool = std::make_shared<TextRunnerPool>(
         std::move(runner), session_count, std::nullopt);

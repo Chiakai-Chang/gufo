@@ -6,183 +6,13 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 
-#if defined(GGML_HIP_ROCWMMA_FATTN)
-#include <rocwmma/rocwmma-version.hpp>
-#endif
-
-#ifdef GGML_USE_NCCL
-#include <rccl/rccl.h>
-#endif
-
-#define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
-#define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
-#define CUBLAS_OP_N HIPBLAS_OP_N
-#define CUBLAS_OP_T HIPBLAS_OP_T
-#define CUBLAS_STATUS_SUCCESS HIPBLAS_STATUS_SUCCESS
-#define CUBLAS_TF32_TENSOR_OP_MATH 0
-#define CUDA_R_16F  HIPBLAS_R_16F
-#define CUDA_R_16BF HIPBLAS_R_16B
-#define CUDA_R_32F  HIPBLAS_R_32F
-#define CUBLAS_SIDE_RIGHT HIPBLAS_SIDE_RIGHT
-#define CUBLAS_FILL_MODE_UPPER HIPBLAS_FILL_MODE_UPPER
-#define CUBLAS_DIAG_NON_UNIT HIPBLAS_DIAG_NON_UNIT
-#define CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED hipDeviceAttributeVirtualMemoryManagementSupported
-#define CU_MEM_ALLOC_GRANULARITY_RECOMMENDED hipMemAllocationGranularityRecommended
-#define CU_MEM_ALLOCATION_TYPE_PINNED hipMemAllocationTypePinned
-#define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
-#define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
-#define CU_CHECK(fn) { hipError_t err = fn; if (err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); } }
-#define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
-#define __shfl_down_sync(mask, var, delta, ...) __shfl_down(var, delta, ##__VA_ARGS__)
-#define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
-#define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
-#define __all_sync(mask, var) __all(var)
-#define __any_sync(mask, var) __any(var)
-#define cublasStrsmBatched hipblasStrsmBatched
-#define cublasCreate hipblasCreate
-#define cublasDestroy hipblasDestroy
-#define cublasGemmEx hipblasGemmEx
-#define cublasGemmBatchedEx hipblasGemmBatchedEx
-#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
-#define cublasHandle_t hipblasHandle_t
-#define cublasSetMathMode(handle, mode) CUBLAS_STATUS_SUCCESS
-#define cublasSetStream hipblasSetStream
-#define cublasSgemm hipblasSgemm
-#define cublasSgemmStridedBatched hipblasSgemmStridedBatched
-#define cublasStatus_t hipblasStatus_t
-#define cublasOperation_t hipblasOperation_t
-#define cudaDevAttrCooperativeLaunch hipDeviceAttributeCooperativeLaunch
-#define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
-#define cudaDeviceDisablePeerAccess hipDeviceDisablePeerAccess
-#define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
-#define cudaDeviceGetAttribute hipDeviceGetAttribute
-#define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
-#define cudaDeviceProp hipDeviceProp_t
-#define cudaDeviceSynchronize hipDeviceSynchronize
-#define cudaError_t hipError_t
-#define cudaErrorMemoryAllocation hipErrorOutOfMemory
-#define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
-#define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
-#define cudaEventCreateWithFlags hipEventCreateWithFlags
-#define cudaEventDisableTiming hipEventDisableTiming
-#define cudaEventRecord hipEventRecord
-#define cudaEventSynchronize hipEventSynchronize
-#define cudaEvent_t hipEvent_t
-#define cudaEventDestroy hipEventDestroy
-#define cudaFree hipFree
-#define cudaFreeAsync hipFreeAsync
-#define cudaFreeHost hipHostFree
-#define cudaGetDevice hipGetDevice
-#define cudaGetDeviceCount hipGetDeviceCount
-#define cudaGetDeviceProperties hipGetDeviceProperties
-#define cudaGetErrorString hipGetErrorString
-#define cudaGetLastError hipGetLastError
-#define cudaHostRegister hipHostRegister
-#define cudaHostRegisterPortable hipHostRegisterPortable
-#define cudaHostRegisterReadOnly hipHostRegisterReadOnly
-#define cudaHostUnregister hipHostUnregister
-#define cudaLaunchCooperativeKernel hipLaunchCooperativeKernel
-#define cudaLaunchHostFunc hipLaunchHostFunc
-#define cudaMalloc hipMalloc
-#define cudaMallocAsync hipMallocAsync
-#define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
-#define cudaMallocManaged hipMallocManaged
-#define cudaMemAdvise hipMemAdvise
-#define cudaMemcpy hipMemcpy
-#define cudaMemcpyAsync hipMemcpyAsync
-#define cudaMemcpyPeerAsync hipMemcpyPeerAsync
-#define cudaMemcpy2DAsync hipMemcpy2DAsync
-#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
-#define cudaMemcpyDeviceToHost hipMemcpyDeviceToHost
-#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
-#define cudaMemcpyKind hipMemcpyKind
-#define cudaMemset hipMemset
-#define cudaMemsetAsync hipMemsetAsync
-#define cudaMemGetInfo hipMemGetInfo
-#define cudaOccupancyMaxPotentialBlockSize hipOccupancyMaxPotentialBlockSize
-#define cudaSetDevice hipSetDevice
-#define cuDeviceGet hipDeviceGet
-#define CUdevice hipDevice_t
-#define CUdeviceptr hipDeviceptr_t
-#define cuMemUnmap hipMemUnmap
-#define CUmemAccessDesc hipMemAccessDesc
-#define cuMemAddressFree hipMemAddressFree
-#define cuMemRelease hipMemRelease
-#define CUmemGenericAllocationHandle hipMemGenericAllocationHandle_t
-#define cuMemCreate hipMemCreate
-#define cuMemAddressReserve hipMemAddressReserve
-#define cuMemMap hipMemMap
-#define cuMemSetAccess hipMemSetAccess
-#define cuMemGetAllocationGranularity hipMemGetAllocationGranularity
-#define CUmemAllocationProp hipMemAllocationProp
-#define cuDeviceGetAttribute hipDeviceGetAttribute
-#define cudaStreamCreate hipStreamCreate
-#define cudaStreamCreateWithFlags hipStreamCreateWithFlags
-#define cudaStreamDestroy hipStreamDestroy
-#define cudaStreamFireAndForget hipStreamFireAndForget
-#define cudaStreamNonBlocking hipStreamNonBlocking
-#define cudaStreamPerThread hipStreamPerThread
-#define cudaStreamSynchronize hipStreamSynchronize
-#define cudaStreamWaitEvent hipStreamWaitEvent
-#define cudaGraphExec_t hipGraphExec_t
-#define cudaGraphNode_t hipGraphNode_t
-#define cudaKernelNodeParams hipKernelNodeParams
-#define cudaGraphExecDestroy hipGraphExecDestroy
-#define cudaGraphLaunch hipGraphLaunch
-#define cudaErrorGraphExecUpdateFailure hipErrorGraphExecUpdateFailure
-#define cudaGraphExecUpdateResult hipGraphExecUpdateResult
-#define cudaGraphNodeType hipGraphNodeType
-#define cudaGraphNodeTypeKernel hipGraphNodeTypeKernel
-#define cudaGraphInstantiate hipGraphInstantiate
-#define cudaStreamEndCapture hipStreamEndCapture
-#define cudaGraphDestroy hipGraphDestroy
-#define cudaGraphKernelNodeSetParams hipGraphKernelNodeSetParams
-#define cudaErrorInvalidDeviceFunction hipErrorInvalidDeviceFunction
-#define cudaGraphKernelNodeGetParams hipGraphKernelNodeGetParams
-#define cudaGraphNodeGetType hipGraphNodeGetType
-#define cudaGraphGetNodes hipGraphGetNodes
-#define cudaGraphExecUpdate hipGraphExecUpdate
-#define cudaStreamCaptureModeRelaxed hipStreamCaptureModeRelaxed
-#define cudaStreamCaptureStatus hipStreamCaptureStatus
-#define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
-#define cudaStreamBeginCapture hipStreamBeginCapture
-#define cudaStreamIsCapturing hipStreamIsCapturing
-#define cudaGraph_t hipGraph_t
-#define cudaStream_t hipStream_t
-#define cudaSuccess hipSuccess
-#define cudaOccupancyMaxActiveBlocksPerMultiprocessor hipOccupancyMaxActiveBlocksPerMultiprocessor
-#define cudaFuncSetAttribute hipFuncSetAttribute
-#define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define __trap() do { abort(); __builtin_unreachable(); } while (0)
-#define CUBLAS_STATUS_SUCCESS HIPBLAS_STATUS_SUCCESS
-#define CUBLAS_STATUS_NOT_INITIALIZED HIPBLAS_STATUS_NOT_INITIALIZED
-#define CUBLAS_STATUS_ALLOC_FAILED HIPBLAS_STATUS_ALLOC_FAILED
-#define CUBLAS_STATUS_INVALID_VALUE HIPBLAS_STATUS_INVALID_VALUE
-#define CUBLAS_STATUS_ARCH_MISMATCH HIPBLAS_STATUS_ARCH_MISMATCH
-#define CUBLAS_STATUS_MAPPING_ERROR HIPBLAS_STATUS_MAPPING_ERROR
-#define CUBLAS_STATUS_EXECUTION_FAILED HIPBLAS_STATUS_EXECUTION_FAILED
-#define CUBLAS_STATUS_INTERNAL_ERROR HIPBLAS_STATUS_INTERNAL_ERROR
-#define CUBLAS_STATUS_NOT_SUPPORTED HIPBLAS_STATUS_NOT_SUPPORTED
 
-#if HIP_VERSION >= 60500000
-#define CUBLAS_COMPUTE_16F HIPBLAS_COMPUTE_16F
-#define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
-#define CUBLAS_COMPUTE_32F_FAST_16F HIPBLAS_COMPUTE_32F_FAST_16F
-#define cublasComputeType_t hipblasComputeType_t
-#define cudaDataType_t hipDataType
-#else
-#define CUBLAS_COMPUTE_16F HIPBLAS_R_16F
-#define CUBLAS_COMPUTE_32F HIPBLAS_R_32F
-#define CUBLAS_COMPUTE_32F_FAST_16F HIPBLAS_R_32F
-#define cublasComputeType_t hipblasDatatype_t
-#define cudaDataType_t hipblasDatatype_t
-#endif
 
 #if !defined(__HIP_PLATFORM_AMD__)
 #error "The HIP backend supports only AMD targets"
 #endif
 
-#define __CUDA_ARCH__ 1300
 
 #if defined(__gfx900__) || defined(__gfx906__)
 #define GCN5
@@ -249,12 +79,9 @@
 #define __has_builtin(x) 0
 #endif
 
-typedef __hip_bfloat16 nv_bfloat16;
-typedef __hip_bfloat162 nv_bfloat162;
 
 #if HIP_VERSION >= 60200000
 #include <hip/hip_fp8.h>
-typedef __hip_fp8_e4m3 __nv_fp8_e4m3;
 #define FP8_AVAILABLE
 #endif
 

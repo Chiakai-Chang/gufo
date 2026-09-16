@@ -1,7 +1,7 @@
 #include "qfn_mmq_prelude.h"
 namespace qfn_mmq {
-#include "common.cuh"
-#include "mmid.cuh"
+#include "common.hpp"
+#include "mmid.hpp"
 
 // qwen38 local: parallel, deterministic id-map builder, replacing llama.cpp's
 // mm_ids_helper. That helper ran one warp per expert over every assignment
@@ -136,7 +136,7 @@ static size_t g_ids_scratch_elems = 0;
 
 static void launch_mm_ids_helper_scan(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, hipStream_t stream) {
     const int n_rows = n_tokens * n_expert_used;
     const int n_blocks = (n_rows + kIdsRowsPerBlock - 1) / kIdsRowsPerBlock;
     const size_t need = (size_t)n_rows + (size_t)n_blocks * (n_experts + 1);
@@ -147,7 +147,7 @@ static void launch_mm_ids_helper_scan(
         // the old allocation is left to the process (it happens once per
         // widest shape).
         int32_t * grown = nullptr;
-        CUDA_CHECK(cudaMalloc(&grown, need * sizeof(int32_t)));
+        HIP_CHECK(hipMalloc(&grown, need * sizeof(int32_t)));
         g_ids_scratch = grown;
         g_ids_scratch_elems = need;
     }
@@ -162,9 +162,9 @@ static void launch_mm_ids_helper_scan(
         n_experts, n_expert_used, nchannels_y, si1, sis1);
 }
 
-void ggml_cuda_launch_mm_ids_helper(
+void ggml_hip_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, hipStream_t stream) {
     launch_mm_ids_helper_scan(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
 }
 
@@ -172,7 +172,7 @@ void ggml_cuda_launch_mm_ids_helper(
 
 extern "C" int qfn_mmq_build_ids_maps(
         const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * expert_bounds,
-        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, cudaStream_t stream) {
-    qfn_mmq::ggml_cuda_launch_mm_ids_helper(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
-    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+        int n_experts, int n_tokens, int n_expert_used, int nchannels_y, int si1, int sis1, hipStream_t stream) {
+    qfn_mmq::ggml_hip_launch_mm_ids_helper(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, stream);
+    return hipGetLastError() == hipSuccess ? 0 : -1;
 }

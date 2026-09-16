@@ -36,7 +36,7 @@ enum class TextSpeculativeBackend : std::uint8_t {
   kDisabled,
   kDFlash,
   kDSpark,
-  kMtp,  ///< Qwen3.8-Flash-Next's MTP draft block (greedy verification)
+  kMtp,  ///< Qwen MTP draft block
 };
 
 struct TextSpeculativeConfig {
@@ -103,10 +103,9 @@ public:
             TextDiskCacheConfig disk_cache_config = {});
 
   /// Installs a previously loaded Qwen3.8-Flash-Next model with
-  /// request-owned sessions; `tokenizer` is the artifact's tokenizer as the
-  /// Qwen chat template renders through it. No continuation snapshots.
+  /// request-owned sessions and the model's tokenizer. No continuation
+  /// snapshots.
   bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
-            std::unique_ptr<tokenization::QwenTokenizer> tokenizer,
             std::string* error, std::uint32_t max_context = 4096,
             std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},

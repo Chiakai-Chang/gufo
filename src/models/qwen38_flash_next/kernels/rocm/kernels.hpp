@@ -336,8 +336,6 @@ void MtpConcat(const float* embd_n, const float* h_n, float* concat,
                std::uint32_t streams, hipStream_t stream);
 
 /// Diagnostic: out[0] = sum of x[0..count), out[1] = sum of |x|.
-void Checksum(const float* x, std::size_t count, float* out,
-              hipStream_t stream);
 
 /// argmax of logits[t][vocab] into out[t].
 void Argmax(const float* logits, std::int32_t* out, std::uint32_t n_tokens,

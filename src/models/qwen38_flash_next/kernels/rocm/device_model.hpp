@@ -53,7 +53,7 @@ struct DeviceLayer {
   DeviceTensor ple_key, ple_value, ple_norm_key, ple_norm_query, ple_norm_conv,
       ple_conv1d;
   /// Router rows followed by the shared-expert gate row:
-  /// [hidden -> num_experts + 1] F32.
+  /// [hidden -> num_experts + 1] F16.
   DeviceTensor router;
   DeviceTensor ffn_gate_exps, ffn_up_exps, ffn_down_exps, shexp_gate, shexp_up,
       shexp_down;

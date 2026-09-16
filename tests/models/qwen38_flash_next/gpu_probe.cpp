@@ -16,11 +16,11 @@
 #include <vector>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/reference.hpp"
-#include "src/models/qwen38_flash_next/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
@@ -135,7 +135,8 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-  auto tokenizer = q::Tokenizer::CreateFromGguf(*reader, &error);
+  auto tokenizer =
+      gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &error);
   if (!tokenizer) {
     std::fprintf(stderr, "tokenizer failed: %s\n", error.c_str());
     return 1;

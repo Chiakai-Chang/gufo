@@ -1,12 +1,12 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <numeric>
+#include <limits>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
@@ -27,6 +27,20 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                    const ModelOptions& options,
                                    std::string* error_msg) {
   std::shared_ptr<Model> m(new Model());
+  if (options.max_batch == 0 || options.max_draft_tokens == 0) {
+    AssignError(error_msg, "batch size and draft token limit must be positive");
+    return nullptr;
+  }
+  if (options.draft_vocab != 0 && options.mtp_model_path.empty()) {
+    AssignError(error_msg, "a draft vocabulary requires an MTP model");
+    return nullptr;
+  }
+  if (!options.mtp_model_path.empty() &&
+      options.max_draft_tokens > kMaxMtpDraftTokens) {
+    AssignError(error_msg,
+                "Flash-Next MTP supports at most seven draft tokens");
+    return nullptr;
+  }
   m->options_ = options;
   m->reader_ = core::GgufReader::OpenFile(model_path, error_msg);
   if (!m->reader_) {
@@ -43,7 +57,12 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
                                std::to_string(c.context_length) + " tokens");
     return nullptr;
   }
-  m->tokenizer_ = Tokenizer::CreateFromGguf(*m->reader_, error_msg);
+  if (options.draft_vocab > c.vocab_size) {
+    AssignError(error_msg, "draft vocabulary exceeds the target vocabulary");
+    return nullptr;
+  }
+  m->tokenizer_ =
+      tokenization::QwenTokenizer::CreateFromGguf(*m->reader_, error_msg);
   if (!m->tokenizer_) {
     return nullptr;
   }
@@ -74,9 +93,12 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     return nullptr;
   }
   rocm::Executor::Options exec;
-  exec.max_batch = std::max<std::uint32_t>(1, options.max_batch);
+  exec.max_batch = std::min(options.max_batch, options.max_context);
   exec.max_logit_rows =
-      std::max<std::uint32_t>(1, options.max_draft_tokens + 1);
+      m->mtp_weights_
+          ? static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                exec.max_batch, std::uint64_t{options.max_draft_tokens} + 1))
+          : 1;
   exec.max_speculative = exec.max_logit_rows;
   exec.draft_rows = options.draft_vocab;
   m->executor_ =
@@ -110,12 +132,12 @@ std::vector<std::int32_t> Model::Tokenize(std::string_view text) const {
 }
 
 std::string Model::Decode(std::span<const std::int32_t> tokens) const {
-  std::vector<TokenId> ids(tokens.begin(), tokens.end());
+  std::vector<tokenization::TokenId> ids(tokens.begin(), tokens.end());
   return tokenizer_->Decode(ids);
 }
 
 std::string Model::TokenText(std::int32_t token) const {
-  return tokenizer_->DecodeTokenCopy(static_cast<TokenId>(token));
+  return tokenizer_->DecodeTokenCopy(static_cast<tokenization::TokenId>(token));
 }
 
 std::int32_t Model::EosToken() const noexcept {
@@ -152,10 +174,12 @@ Session::Session(std::shared_ptr<Model> model,
                  std::unique_ptr<rocm::Session> session)
     : model_(std::move(model)), session_(std::move(session)) {
   logits_.resize(model_->VocabSize());
-  draft_logits_.resize(model_->VocabSize());
-  verify_logits_.resize(
-      static_cast<std::size_t>(model_->options_.max_draft_tokens + 1) *
-      model_->VocabSize());
+  if (model_->HasMtp()) {
+    draft_logits_.resize(model_->executor_->DraftRows());
+    verify_logits_.resize(
+        static_cast<std::size_t>(model_->executor_->max_speculative()) *
+        model_->VocabSize());
+  }
 }
 
 Session::~Session() = default;
@@ -170,9 +194,7 @@ std::uint32_t Session::ContextSize() const noexcept {
 void Session::Reset() {
   session_->Reset();
   tokens_.clear();
-  pending_ = -1;
   hidden_base_ = 0;
-  draft_ready_ = false;
   model_->executor_->MtpRewind(*session_, 0);
 }
 
@@ -185,21 +207,12 @@ std::int32_t Session::Argmax(const float* row,
 bool Session::DraftCatchUp(std::int32_t next_token, std::string* error_msg) {
   // The draft block trails the trunk: MTP position i consumes token i+1 and
   // the trunk's hidden of position i, so positions up to the current one are
-  // replayed once their successor token is known. hc_keep holds the hidden
+  // replayed once their successor token is known. The session keeps hidden
   // rows of positions [hidden_base_, tokens_.size()).
   rocm::Executor& exec = *model_->executor_;
   const auto size = static_cast<std::uint32_t>(tokens_.size());
-  if (draft_ready_ && next_token != pending_) {
-    // The draft consumed a token the caller did not choose.
-    exec.MtpRewind(*session_, size - 1);
-    draft_ready_ = false;
-  }
-  if (draft_ready_) {
-    return true;
-  }
   const std::uint32_t mp = exec.MtpPosition(*session_);
   if (mp >= size) {
-    draft_ready_ = true;
     return true;
   }
   if (mp < hidden_base_) {
@@ -213,7 +226,6 @@ bool Session::DraftCatchUp(std::int32_t next_token, std::string* error_msg) {
                        draft_logits_.data(), error_msg)) {
     return false;
   }
-  draft_ready_ = true;
   return true;
 }
 
@@ -233,9 +245,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
     }
     hidden_base_ = static_cast<std::uint32_t>(tokens_.size());
     tokens_.insert(tokens_.end(), chunk.begin(), chunk.end());
-    draft_ready_ = false;
   }
-  pending_ = Argmax(logits_.data());
   return true;
 }
 
@@ -274,37 +284,46 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return Feed(std::span<const std::int32_t>(&token, 1), error_msg);
 }
 
-bool Session::SpeculativeStep(std::size_t max_tokens,
-                              std::vector<std::int32_t>* emitted,
-                              std::string* error_msg) {
-  if (tokens_.empty() || pending_ < 0) {
-    AssignError(error_msg, "speculative step needs a synced prompt");
+bool Session::DecodeStep(std::size_t max_tokens,
+                         sampling::SamplerState& sampler, DecodeResult* result,
+                         std::string* error_msg, bool stop_at_eos) {
+  if (result == nullptr || max_tokens == 0 || tokens_.empty()) {
+    AssignError(
+        error_msg,
+        "decode needs an output, a positive budget and a synced prompt");
     return false;
   }
+  *result = {};
+  const auto is_stop = [&](std::int32_t token) {
+    return stop_at_eos && model_->IsStopToken(token);
+  };
   rocm::Executor& exec = *model_->executor_;
-  const std::uint32_t max_draft = model_->options_.max_draft_tokens;
   const std::size_t room = ContextSize() - tokens_.size();
-  const std::size_t width = std::min<std::size_t>(
-      {max_tokens, room, static_cast<std::size_t>(max_draft) + 1});
+  const std::size_t width =
+      std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
+  if (width == 0) {
+    result->stop = true;
+    return true;
+  }
+  const auto anchor = static_cast<std::int32_t>(sampler.Sample(logits_));
+  if (is_stop(anchor)) {
+    result->stop = true;
+    return true;
+  }
   if (!model_->HasMtp() || width < 2) {
-    if (width == 0) {
-      AssignError(error_msg, "no room for another token");
+    if (!Evaluate(anchor, error_msg)) {
       return false;
     }
-    const std::int32_t token = pending_;
-    if (!Evaluate(token, error_msg)) {
-      return false;
-    }
-    emitted->push_back(token);
+    sampler.Accept(static_cast<sampling::TokenId>(anchor));
+    result->tokens.push_back(anchor);
     return true;
   }
 
-  // Bring the draft block up to the pending token, then chain drafts.
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
-  if (!DraftCatchUp(pending_, error_msg)) {
+  if (!DraftCatchUp(anchor, error_msg)) {
     return false;
   }
-  std::vector<std::int32_t> chain{pending_};
+  std::vector<std::int32_t> chain{anchor};
   const std::size_t draft_rows = exec.DraftRows();
   std::int32_t draft = Argmax(draft_logits_.data(), draft_rows);
   while (chain.size() < width) {
@@ -318,17 +337,24 @@ bool Session::SpeculativeStep(std::size_t max_tokens,
     }
   }
 
-  // Verify: row i predicts chain[i+1]; the first token is the trunk's own
-  // choice and always stands.
+  // Row i predicts chain[i+1]. Sample only through the kept prefix, using
+  // target logits over the full vocabulary and the request's token history.
   const auto k = static_cast<std::uint32_t>(chain.size());
   const std::size_t vocab = model_->VocabSize();
   if (!exec.Forward(*session_, chain, k, verify_logits_.data(), true,
                     error_msg)) {
     return false;
   }
+  sampler.Accept(static_cast<sampling::TokenId>(anchor));
   std::uint32_t keep = 1;
-  while (keep < k &&
-         Argmax(verify_logits_.data() + (keep - 1) * vocab) == chain[keep]) {
+  while (keep < k) {
+    const auto decision = VerifyDraft(std::span<const float>(verify_logits_)
+                                          .subspan((keep - 1) * vocab, vocab),
+                                      chain[keep], sampler, is_stop);
+    if (decision != DraftDecision::kAccept) {
+      result->stop = decision == DraftDecision::kStop;
+      break;
+    }
     ++keep;
   }
   if (!exec.Rollback(*session_, keep, error_msg)) {
@@ -338,72 +364,15 @@ bool Session::SpeculativeStep(std::size_t max_tokens,
               logits_.begin());
   hidden_base_ = base;
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
-  emitted->insert(emitted->end(), chain.begin(), chain.begin() + keep);
-  pending_ = Argmax(logits_.data());
+  result->tokens.assign(chain.begin(), chain.begin() + keep);
   stats_.cycles += 1;
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
 
-  // Re-sync the draft block on the trunk's true hidden rows of the kept
-  // tokens, ending on the new pending token.
+  // The next call knows the next sampled anchor. Defer draft catch-up until
+  // then, retaining this session's target hidden rows across interleaving.
   exec.MtpRewind(*session_, base);
-  draft_ready_ = false;
-  return DraftCatchUp(pending_, error_msg);
-}
-
-std::int32_t Session::SelectNext(float temperature, std::uint64_t* rng_state,
-                                 int top_k, float top_p, float min_p) const {
-  const std::size_t vocab = logits_.size();
-  if (temperature <= 0.0F || rng_state == nullptr) {
-    return Argmax(logits_.data());
-  }
-  std::vector<std::uint32_t> order(vocab);
-  std::iota(order.begin(), order.end(), 0U);
-  const std::size_t keep =
-      top_k > 0 ? std::min<std::size_t>(top_k, vocab) : vocab;
-  std::partial_sort(order.begin(),
-                    order.begin() + static_cast<std::ptrdiff_t>(keep),
-                    order.end(), [&](std::uint32_t a, std::uint32_t b) {
-                      return logits_[a] > logits_[b];
-                    });
-  order.resize(keep);
-  std::vector<double> probs(keep);
-  const float max_logit = logits_[order[0]];
-  double sum = 0.0;
-  for (std::size_t i = 0; i < keep; ++i) {
-    probs[i] = std::exp(static_cast<double>(logits_[order[i]] - max_logit) /
-                        temperature);
-    sum += probs[i];
-  }
-  std::size_t count = keep;
-  double cumulative = 0.0;
-  for (std::size_t i = 0; i < keep; ++i) {
-    probs[i] /= sum;
-    if (probs[i] < min_p * probs[0] || (cumulative >= top_p && i > 0)) {
-      count = i;
-      break;
-    }
-    cumulative += probs[i];
-  }
-  double total = 0.0;
-  for (std::size_t i = 0; i < count; ++i) {
-    total += probs[i];
-  }
-  // xorshift64*
-  *rng_state ^= *rng_state >> 12;
-  *rng_state ^= *rng_state << 25;
-  *rng_state ^= *rng_state >> 27;
-  const double u =
-      static_cast<double>((*rng_state * 2685821657736338717ULL) >> 11) /
-      static_cast<double>(1ULL << 53) * total;
-  double acc = 0.0;
-  for (std::size_t i = 0; i < count; ++i) {
-    acc += probs[i];
-    if (u < acc) {
-      return static_cast<std::int32_t>(order[i]);
-    }
-  }
-  return static_cast<std::int32_t>(order[count - 1]);
+  return true;
 }
 
 }  // namespace gufo::models::qwen38_flash_next

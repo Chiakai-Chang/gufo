@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -391,10 +392,96 @@ bool Ok(const Result& r) {
          r.mmq_vs_ref < 1e-2 * r.scale;
 }
 
+void CheckVectorGrouping() {
+  constexpr int experts = 8, rows = 64, cols = 512, tokens = 7, used = 3;
+  using Gemm = decltype(&qfn_mmq_q4_K_moe_vec);
+  const std::array<Gemm, 4> gemms{qfn_mmq_q4_K_moe_vec, qfn_mmq_q5_K_moe_vec,
+                                  qfn_mmq_q5_1_moe_vec, qfn_mmq_q8_0_moe_vec};
+  const std::array<Experts, 4> weights{
+      MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
+      MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23)};
+  std::vector<float> x(tokens * cols);
+  std::uint32_t seed = 37;
+  for (auto& v : x)
+    v = Uniform(&seed, 2.0F);
+  std::vector<std::int32_t> ids(tokens * used);
+  for (int t = 0; t < tokens; ++t)
+    for (int j = 0; j < used; ++j)
+      ids[t * used + j] = (t + j) % experts;
+  auto* dx = Upload(x);
+  auto* di = Upload(ids);
+  const std::vector<float> zeros(tokens * used * rows);
+  auto* scalar = Upload(zeros);
+  auto* batch = Upload(zeros);
+  for (std::size_t f = 0; f < weights.size(); ++f) {
+    auto* w = Upload(weights[f].packed);
+    for (int t = 0; t < tokens; ++t)
+      if (gemms[f](w, dx + t * cols, di + t * used, scalar + t * used * rows,
+                   rows, cols, 1, experts, used, nullptr))
+        throw std::runtime_error("scalar routed vector launch failed");
+    for (int n : {2, 3, 4, 7}) {
+      if (gemms[f](w, dx, di, batch, rows, cols, n, experts, used, nullptr))
+        throw std::runtime_error("batched routed vector launch failed");
+      const auto a = Download(scalar, n * used * rows);
+      const auto b = Download(batch, n * used * rows);
+      if (a != b)
+        throw std::runtime_error("routed vector grouping changed format " +
+                                 std::to_string(f) + " width " +
+                                 std::to_string(n));
+    }
+    CheckHip(hipFree(w), "grouping weight free");
+  }
+  for (void* ptr : {static_cast<void*>(dx), static_cast<void*>(di),
+                    static_cast<void*>(scalar), static_cast<void*>(batch)})
+    CheckHip(hipFree(ptr), "grouping free");
+}
+
+void CheckPairedMmq() {
+  constexpr int experts = 8, rows = 64, cols = 512, tokens = 65, used = 3;
+  const auto a = MakeQ4K(experts, rows, cols, 11);
+  const auto b = MakeQ4K(experts, rows, cols, 23);
+  std::vector<float> x(tokens * cols);
+  std::uint32_t seed = 37;
+  for (auto& v : x)
+    v = Uniform(&seed, 2.0F);
+  std::vector<std::int32_t> ids(tokens * used);
+  for (int t = 0; t < tokens; ++t)
+    for (int j = 0; j < used; ++j)
+      ids[t * used + j] = (t + j) % experts;
+  auto* wa = Upload(a.packed);
+  auto* wb = Upload(b.packed);
+  auto* dx = Upload(x);
+  auto* di = Upload(ids);
+  const std::vector<float> zeros(tokens * used * rows);
+  auto* ra = Upload(zeros);
+  auto* rb = Upload(zeros);
+  auto* pa = Upload(zeros);
+  auto* pb = Upload(zeros);
+  if (qfn_mmq_q4_K_moe_raw(wa, dx, di, ra, rows, cols, tokens, experts, used,
+                           nullptr) ||
+      qfn_mmq_q4_K_moe_raw(wb, dx, di, rb, rows, cols, tokens, experts, used,
+                           nullptr) ||
+      qfn_mmq_q4_K_moe_pair_unique(wa, wb, dx, di, pa, pb, rows, cols, tokens,
+                                   experts, used, nullptr)) {
+    throw std::runtime_error("paired MMQ launch failed");
+  }
+  const bool equal = Download(ra, zeros.size()) == Download(pa, zeros.size()) &&
+                     Download(rb, zeros.size()) == Download(pb, zeros.size());
+  for (void* ptr :
+       {static_cast<void*>(wa), static_cast<void*>(wb), static_cast<void*>(dx),
+        static_cast<void*>(di), static_cast<void*>(ra), static_cast<void*>(rb),
+        static_cast<void*>(pa), static_cast<void*>(pb)})
+    CheckHip(hipFree(ptr), "paired MMQ free");
+  if (!equal)
+    throw std::runtime_error("paired MMQ differs from separate projections");
+}
+
 }  // namespace
 
 int main() {
   try {
+    CheckVectorGrouping();
+    CheckPairedMmq();
     bool ok = true;
     // Gate/up view: 64 experts, top-10, 640 x 2560 Q4_K.
     ok = Ok(Run(q::WeightType::kQ4_K, 300, 10, 64, 640, 2560, 0x1234ABCDU)) &&

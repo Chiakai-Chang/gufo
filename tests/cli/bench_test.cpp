@@ -26,7 +26,7 @@ void TestDefaultOptions() {
   Expect(options->repetitions == 1, "default is one repetition");
   Expect(options->draft_tokens == 7, "default draft ceiling is seven");
   Expect(options->min_draft_tokens == 1, "default minimum draft is one");
-  Expect(options->temperature == 0.0F && options->seed == 0,
+  Expect(options->sampling.temperature == 0.0F && options->sampling.seed == 0,
          "benchmark sampling defaults remain greedy");
 }
 
@@ -34,7 +34,8 @@ void TestDs4SamplingOptions() {
   const std::array<const char*, 4> args = {
       "--temperature", "0.6", "--seed", "7"};
   const auto options = gufo::cli::ParseBenchOptions(args);
-  Expect(options && options->temperature == 0.6F && options->seed == 7,
+  Expect(options && options->sampling.temperature == 0.6F &&
+             options->sampling.seed == 7,
          "DS4 benchmark retains temperature and seed");
   for (const char* value : {"-1", "nan", "inf"}) {
     const std::array<const char*, 2> invalid = {"--temperature", value};
@@ -44,6 +45,46 @@ void TestDs4SamplingOptions() {
   const std::array<const char*, 2> invalid_seed = {"--seed", "-1"};
   Expect(!gufo::cli::ParseBenchOptions(invalid_seed),
          "negative benchmark seed is rejected");
+}
+
+void TestFlashMtpSamplingOptions() {
+  const char* args[] = {"--speculative",
+                        "mtp",
+                        "--mtp-model",
+                        "mtp.gguf",
+                        "--draft-vocab",
+                        "65536",
+                        "--draft-tokens",
+                        "3",
+                        "--temperature",
+                        "0.8",
+                        "--seed",
+                        "73",
+                        "--top-k",
+                        "40",
+                        "--top-p",
+                        "0.9",
+                        "--min-p",
+                        "0.01",
+                        "--min-keep",
+                        "2",
+                        "--repeat-penalty",
+                        "1.1",
+                        "--repeat-last-n",
+                        "16",
+                        "--frequency-penalty",
+                        "0.2",
+                        "--presence-penalty",
+                        "0.1"};
+  const auto options = gufo::cli::ParseBenchOptions(args);
+  Expect(options.has_value(), "Flash MTP sampling options parse");
+  const auto& s = options->sampling;
+  Expect(options->draft_vocab == 65536 && options->draft_tokens == 3 &&
+             s.temperature == 0.8F && s.seed == 73 && s.top_k == 40 &&
+             s.top_p == 0.9F && s.min_p == 0.01F && s.min_keep == 2 &&
+             s.repeat_penalty == 1.1F && s.repeat_last_n == 16 &&
+             s.frequency_penalty == 0.2F && s.presence_penalty == 0.1F,
+         "Flash MTP benchmark retains every sampling control");
 }
 
 void TestDepthOptions() {
@@ -139,6 +180,7 @@ void TestInvalidWorkload() {
 int main() {
   TestDefaultOptions();
   TestDs4SamplingOptions();
+  TestFlashMtpSamplingOptions();
   TestDepthOptions();
   TestHybridMtpOptions();
   TestInvalidDepth();

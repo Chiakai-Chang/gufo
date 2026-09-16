@@ -6,7 +6,6 @@ add_library(gufo_qwen38_flash_next STATIC
   cpu_ops.cpp
   ngram.cpp
   reference.cpp
-  tokenizer.cpp
   weights.cpp)
 
 target_include_directories(gufo_qwen38_flash_next PUBLIC ${PROJECT_SOURCE_DIR})
@@ -21,14 +20,11 @@ if (ENGINE_ENABLE_HIP)
   set(QFN_ROCM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/kernels/rocm")
   set(QFN_MMQ_DIR "${QFN_ROCM_DIR}/mmq")
 
-  # Vendored llama.cpp quantized-matmul tier, the same files the DeepSeek V4
-  # Flash package carries, wrapped in namespace qfn_mmq so both copies link
-  # into one binary. It keeps its own C++17 dialect and GGML feature macros,
-  # so it stays a separate target.
+  # HIP quantized matrix kernels adapted from llama.cpp, isolated in the
+  # qfn_mmq namespace. The adapter retains its C++17 dialect.
   set(QFN_MMQ_SOURCES
     ${QFN_MMQ_DIR}/qfn_ggml_stubs.hip.cpp
     ${QFN_MMQ_DIR}/qfn_mmq.hip.cpp
-    ${QFN_MMQ_DIR}/qfn_mmq_d2r.hip.cpp
     ${QFN_MMQ_DIR}/mmid.hip.cpp
     ${QFN_MMQ_DIR}/mmvq.hip.cpp
     ${QFN_MMQ_DIR}/quantize.hip.cpp)
@@ -40,9 +36,7 @@ if (ENGINE_ENABLE_HIP)
     HIP_STANDARD_REQUIRED ON
     POSITION_INDEPENDENT_CODE ON)
   target_compile_definitions(gufo_qwen38_flash_next_mmq PRIVATE
-    GGML_USE_HIP
-    GGML_HIP_NO_VMM
-    DS4_ROCM_WMMA_MMQ_Y=64)
+    GGML_HIP_NO_VMM)
   target_compile_options(gufo_qwen38_flash_next_mmq PRIVATE
     $<$<COMPILE_LANGUAGE:HIP>:-O3;-ffast-math;-fno-finite-math-only;-Wno-unused-value;-Wno-unused-command-line-argument>)
   target_include_directories(gufo_qwen38_flash_next_mmq SYSTEM PUBLIC ${QFN_MMQ_DIR})
@@ -52,6 +46,7 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/kernels.hip.cpp
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
+    ${QFN_ROCM_DIR}/weight_upload.cpp
     ${QFN_ROCM_DIR}/executor.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
   set_source_files_properties(${QFN_ROCM_DIR}/kernels.hip.cpp PROPERTIES LANGUAGE HIP)

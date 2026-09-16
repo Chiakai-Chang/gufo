@@ -181,10 +181,69 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
                              : 1.0;
 }
 
+void CheckDecodeGrouping() {
+  constexpr int rows = 64, cols = 2560, tokens = 8;
+  const auto w = MakeWeights(rows, cols, 11);
+  const auto gate = MakeWeights(rows, cols, 17);
+  std::vector<float> x(tokens * cols);
+  std::uint32_t seed = 37;
+  for (auto& v : x)
+    v = Uniform(&seed, 2.0F);
+  void* dw = nullptr;
+  void* dg = nullptr;
+  float* dx = nullptr;
+  void* dq = nullptr;
+  float* out = nullptr;
+  CheckHip(hipMalloc(&dw, w.blocks.size() + 4096), "decode weights");
+  CheckHip(hipMalloc(&dg, gate.blocks.size() + 4096), "decode gate");
+  CheckHip(hipMalloc(&dx, x.size() * sizeof(float)), "decode inputs");
+  CheckHip(hipMalloc(&dq, qfn_mmq_q8_1_bytes(tokens, cols)),
+           "decode quantized inputs");
+  CheckHip(hipMalloc(&out, rows * tokens * sizeof(float)), "decode output");
+  CheckHip(
+      hipMemcpy(dw, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
+      "weights upload");
+  CheckHip(hipMemcpy(dg, gate.blocks.data(), gate.blocks.size(),
+                     hipMemcpyHostToDevice),
+           "gate upload");
+  CheckHip(
+      hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
+      "input upload");
+  if (qfn_mmq_quantize_q8_1(dx, dq, tokens, cols, nullptr))
+    throw std::runtime_error("decode input quantization failed");
+  for (const bool gated : {false, true}) {
+    for (int t = 0; t < tokens; ++t) {
+      const auto* qrow = static_cast<const std::uint8_t*>(dq) +
+                         t * qfn_mmq_q8_1_bytes(1, cols);
+      if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, qrow,
+                                      out + t * rows, rows, 1, cols, nullptr))
+        throw std::runtime_error("scalar dense projection failed");
+    }
+    std::vector<float> scalar(tokens * rows), batch(tokens * rows);
+    CheckHip(hipMemcpy(scalar.data(), out, scalar.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "scalar output");
+    for (int n : {2, 3, 4, 8}) {
+      if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, dq, out, rows,
+                                      n, cols, nullptr))
+        throw std::runtime_error("batched dense projection failed");
+      CheckHip(hipMemcpy(batch.data(), out, n * rows * sizeof(float),
+                         hipMemcpyDeviceToHost),
+               "batch output");
+      if (!std::equal(scalar.begin(), scalar.begin() + n * rows, batch.begin()))
+        throw std::runtime_error("Q8 dense projection changed with grouping");
+    }
+  }
+  for (void* ptr :
+       {dw, dg, static_cast<void*>(dx), dq, static_cast<void*>(out)})
+    CheckHip(hipFree(ptr), "decode test free");
+}
+
 }  // namespace
 
 int main() {
   try {
+    CheckDecodeGrouping();
     bool ok = true;
     // Ragged batch and rows against the 128-wide macro tiles, the 64-token
     // tile below 96, and the model's ssm_out / shexp_down widths.
