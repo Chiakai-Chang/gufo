@@ -14,9 +14,10 @@ namespace gufo::models::qwen38_flash_next {
 namespace {
 
 constexpr std::size_t kPage = 4096;
-/// Synchronous preads at a queue depth of one each: a 512-token chunk
-/// gathers 8192 random rows, 62 ms on 8 workers and 27 ms on 32.
+// Keep enough direct reads outstanding while layer 0 runs.
 constexpr std::size_t kWorkers = 32;
+constexpr std::size_t kReadBatch = 8;
+constexpr std::size_t kBatchJobs = 1024;
 
 }  // namespace
 
@@ -171,12 +172,23 @@ void NgramTable::Worker() {
     if (stop_) {
       return;
     }
-    const Job job = jobs_[next_job_++];
+    // Large gathers amortize the queue lock. Small gathers keep one read
+    // per worker, so decode does not serialize its few rows into a batch.
+    std::array<Job, kReadBatch> batch;
+    const std::size_t count =
+        std::min(jobs_.size() >= kBatchJobs ? kReadBatch : 1,
+                 jobs_.size() - next_job_);
+    std::copy_n(jobs_.data() + next_job_, count, batch.data());
+    next_job_ += count;
     lock.unlock();
-    const bool ok = ReadOne(job.row, job.dst, buf);
+    bool ok = true;
+    for (std::size_t i = 0; i < count; ++i) {
+      ok = ReadOne(batch[i].row, batch[i].dst, buf) && ok;
+    }
     lock.lock();
     failed_ = failed_ || !ok;
-    if (--pending_ == 0) {
+    pending_ -= count;
+    if (pending_ == 0) {
       done_.notify_all();
     }
   }
@@ -209,6 +221,10 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
       copies_.push_back(
           {out.data() + it->second * row_dim_, out.data() + i * row_dim_});
     }
+  }
+  if (jobs_.size() >= kBatchJobs) {
+    std::sort(jobs_.begin(), jobs_.end(),
+              [](const Job& a, const Job& b) { return a.row < b.row; });
   }
   next_job_ = 0;
   pending_ = jobs_.size();

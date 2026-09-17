@@ -99,7 +99,7 @@ void TestTable() {
   const std::filesystem::path path =
       std::filesystem::temp_directory_path() / "qwen38_ngram_test.bin";
   const std::uint32_t dim = 160;
-  const std::uint64_t rows = 300;
+  const std::uint64_t rows = 2049;
   const std::uint64_t offset = 4096 + 90;  // deliberately unaligned
   {
     std::ofstream out(path, std::ios::binary);
@@ -120,7 +120,7 @@ void TestTable() {
                                    gufo::core::GgmlType::kBF16, &error);
   Check(table != nullptr, error.c_str());
   if (table) {
-    const std::vector<std::uint32_t> ids{7, 299, 7, 0, 128, 299};
+    const std::vector<std::uint32_t> ids{7, rows - 1, 7, 0, 128, rows - 1};
     std::vector<float> out(ids.size() * dim);
     Check(table->Read(ids, out), "table read");
     for (std::size_t j = 0; j < ids.size(); ++j) {
@@ -148,6 +148,32 @@ void TestTable() {
     Check(!table->StartRead(ids, std::span<float>(out).first(dim)),
           "short output rejected");
     Check(table->Read(ids, out), "reader remains usable after rejection");
+    // More distinct rows than the reader's batching threshold, shuffled
+    // with duplicates. File-order reads must preserve every output slot.
+    std::vector<std::uint32_t> wide_ids(rows * 2 + 17);
+    for (std::size_t i = 0; i < wide_ids.size(); ++i) {
+      wide_ids[i] = static_cast<std::uint32_t>((i * 109 + 19) % rows);
+    }
+    constexpr std::size_t guard = 16;
+    const std::size_t wide_size = wide_ids.size() * dim;
+    std::vector<float> wide(wide_size + guard, -123.0F);
+    Check(table->Read(wide_ids, std::span<float>(wide).first(wide_size)),
+          "batched gather completes");
+    for (std::size_t j = 0; j < wide_ids.size(); ++j) {
+      for (std::uint32_t i = 0; i < dim; ++i) {
+        const float v =
+            static_cast<float>(wide_ids[j]) + static_cast<float>(i) / 1000.0F;
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &v, 4);
+        bits &= 0xFFFF0000U;
+        float expected_value = 0.0F;
+        std::memcpy(&expected_value, &bits, 4);
+        Check(wide[j * dim + i] == expected_value, "batched output slot");
+      }
+    }
+    for (std::size_t i = wide_size; i < wide.size(); ++i) {
+      Check(wide[i] == -123.0F, "batched output guard");
+    }
     std::fill(out.begin(), out.end(), -1.0F);
     Check(table->StartRead(ids, out), "final gather starts");
     table.reset();
@@ -163,6 +189,12 @@ void TestTable() {
       Check(!truncated->WaitRead(), "truncated row read fails");
       Check(truncated->Read(ids, out), "reader recovers after failed I/O");
       Check(out == expected, "failed I/O does not corrupt later rows");
+      wide_ids[333] = rows;
+      Check(!truncated->Read(
+                wide_ids, std::span<float>(wide).first(wide_size)),
+            "failed batched read drains outstanding jobs");
+      Check(truncated->Read(ids, out), "reader recovers after batched failure");
+      Check(out == expected, "batched failure preserves subsequent reads");
     }
   }
   std::filesystem::remove(path);
