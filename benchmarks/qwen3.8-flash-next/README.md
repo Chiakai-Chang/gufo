@@ -18,18 +18,18 @@ and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1308.82 | 1329.34 |
-| 4096 | TODO | 1224.07 |
+| 0 | 1308.82 | 1332.46 |
+| 4096 | TODO | 1228.18 |
 | 16384 | TODO | TODO |
 | 32768 | TODO | TODO |
 | 131072 | 1166.53 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 24.87 | 41.05 | 71.0% |
-| Greedy | 4096 | 24.08 | 34.91 | 63.7% |
-| Temperature 0.7 | 0 | TODO | 35.60 | 65.5% |
-| Temperature 0.7 | 4096 | TODO | 47.64 | 93.0% |
+| Greedy | 0 | 25.22 | 41.40 | 71.0% |
+| Greedy | 4096 | 24.36 | 35.24 | 63.7% |
+| Temperature 0.7 | 0 | TODO | 35.82 | 65.5% |
+| Temperature 0.7 | 4096 | TODO | 48.23 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
@@ -57,6 +57,9 @@ The [projection sweep](tools/projection_plans.hip) uses `tools/bench/build.sh`.
 Projection plans and sparse selections are deterministic. Sparse attention
 packs four queries' twelve heads into 48 rows; selection refines a bounded
 candidate list with exact score ordering and lowest-index ties.
+For a stage breakdown, run `tools/prof/prof.py run --stages qwen-flash --`
+before the release command inside `nix develop`. Profiler timings include
+instrumentation overhead and are not benchmark results.
 
 `prompt`, `chat` and `serve llm` share MTP and sampling options. Drafts are
 greedy over the full vocabulary on the GPU; verification uses the target

@@ -408,45 +408,20 @@ int qfn_mmq_moe_vec_impl(
         return -2;
     }
 
-    const int64_t blck      = ggml_blck_size(type);
-    const int64_t s01_row   = (int64_t)K / blck;
-    const int64_t s02_chan  = (int64_t)M * s01_row;
-    const int64_t s11_y     = ne10_padded / QK8_1;
-    const int64_t s12_y     = (int64_t)1 * s11_y;
-    const int64_t s1_dst    = (int64_t)M;
-    const int64_t s2_dst    = (int64_t)n_expert_used * M;
-
-    const int ids_stride = n_expert_used;
-
-    ggml_hip_mm_fusion_args_device fusion = {};
-
-    const int cc      = ggml_hip_info().devices[dev].cc;
-    const int col_cap = get_mmvq_mmid_max_batch(type, ggml_hip_highest_compiled_arch(cc));
-
+    const int input_stride = ne10_padded / QK8_1;
+    const int col_cap = mmvq_moe_max_batch(type);
     for (int c0 = 0; c0 < n_tokens; c0 += col_cap) {
-        const int ncols = (n_tokens - c0 < col_cap) ? (n_tokens - c0) : col_cap;
-        mul_mat_vec_q_switch_type(
+        const int ncols = std::min(n_tokens - c0, col_cap);
+        mul_mat_vec_moe_dispatch(
             W, type,
-            (const void *)(src1_q8_1_ptr + (size_t)c0 * s12_y * sizeof(block_q8_1)),
-            ids + (size_t)c0 * ids_stride, fusion,
-            out_f32 + (int64_t)c0 * s2_dst,
-            K, M, ncols,
-            (int)s01_row,
-            (int)s12_y,
-            (int)s2_dst,
-            n_experts,
-            1,
-            n_expert_used,
-            (int)s02_chan,
-            (int)s11_y,
-            (int)s1_dst,
-            1, 1,
-            0, 0, 0,
-            ids_stride, stream);
+            reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr) + size_t(c0) * input_stride,
+            ids + size_t(c0) * n_expert_used,
+            out_f32 + int64_t(c0) * n_expert_used * M,
+            K, M, ncols, n_expert_used, input_stride, stream);
 
         err = hipGetLastError();
         if (err != hipSuccess) {
-            fprintf(stderr, "%s: mul_mat_vec_q_switch_type launch failed: %s (cols %d..%d cap %d)\n",
+            fprintf(stderr, "%s: mul_mat_vec_moe_dispatch launch failed: %s (cols %d..%d cap %d)\n",
                     tag, hipGetErrorString(err), c0, c0 + ncols - 1, col_cap);
             return -3;
         }
@@ -612,19 +587,9 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(
             static_cast<const block_q8_1*>(X_q8), out_f32);
         return hipGetLastError() == hipSuccess ? 0 : -3;
     }
-    const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
-    const int64_t s01_row = (int64_t)K / ggml_blck_size(GGML_TYPE_Q8_0);
-    const int64_t s11_y   = ne10_padded / QK8_1;
-    const int64_t s12_y   = (int64_t)N * s11_y;
-    ggml_hip_mm_fusion_args_device fusion = {};
-    fusion.gate = W_gate;
-    fusion.glu_op = GGML_GLU_OP_SWIGLU;
-    mul_mat_vec_q_switch_type(
-        W, GGML_TYPE_Q8_0, X_q8, nullptr, fusion, out_f32,
-        K, M, N,
-        (int)s01_row, (int)s11_y,
-        M, 1, 1, 1, 0, (int)s12_y, 0, 1, 1, 0, 0, 0,
-        0, stream);
+    const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;
+    mul_mat_vec_q8_dispatch(W, W_gate, static_cast<const block_q8_1*>(X_q8),
+                           out_f32, K, M, N, input_stride, stream);
     return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(

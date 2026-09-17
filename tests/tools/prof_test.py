@@ -40,6 +40,14 @@ assert prof.stage_of(
     prof.STAGE_MAPS["qwen"],
 ) == "gemm: quant x fp16 prefill"
 
+for symbol, expected in (
+    ("qfn_mmq::mul_mat_vec_q_moe<(qfn_mmq::ggml_type)12, 2>",
+     "moe: quantized vectors"),
+    ("qfn_mmq::mul_mat_vec_q8<7, true>", "dense: quantized vectors"),
+    ("SelectMarkKernel", "attention: exact selection"),
+):
+    assert prof.stage_of(symbol, prof.STAGE_MAPS["qwen-flash"]) == expected
+
 with tempfile.TemporaryDirectory() as directory:
     database = Path(directory) / "profile.db"
     connection = sqlite3.connect(database)

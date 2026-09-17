@@ -241,7 +241,7 @@ void CheckDecodeGrouping(int rows, int cols) {
     CheckHip(hipMemcpy(scalar.data(), out, scalar.size() * sizeof(float),
                        hipMemcpyDeviceToHost),
              "scalar output");
-    for (int n : {2, 3, 4, 8}) {
+    for (int n = 2; n <= tokens; ++n) {
       if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, dq, out, rows,
                                       n, cols, nullptr))
         throw std::runtime_error("batched dense projection failed");
