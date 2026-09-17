@@ -99,7 +99,7 @@ std::vector<float> Download(HipBuffer<float>* source, std::size_t count) {
 /// Runs the per-token reference and the fused WMMA route over the same
 /// cache and reports the worst absolute error of the gated context.
 double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
-               std::uint32_t seed, bool sparse = false) {
+               std::uint32_t seed, bool sparse = false, bool bounded = false) {
   const std::uint32_t n_kv = start_pos + n_tokens;
   const std::uint32_t max_blocks = (n_kv + kRatio - 1) / kRatio;
   const std::uint32_t mask_words = (max_blocks + 31) / 32;
@@ -125,6 +125,23 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
       // About one block in sixteen: most 16-key tiles are unselected for a
       // whole query block, which is what the tile skipping is for.
       word &= NextRandom(&state) & NextRandom(&state);
+    }
+  }
+  if (bounded) {
+    std::fill(mask.begin(), mask.end(), 0);
+    for (std::uint32_t t = 0; t < n_tokens; ++t) {
+      const auto complete = (start_pos + t + 1) / kRatio;
+      std::uint32_t selected = 0;
+      while (selected < std::min(512U, complete)) {
+        const auto block = NextRandom(&state) % complete;
+        auto& word =
+            mask[static_cast<std::size_t>(t) * mask_words + block / 32];
+        const auto bit = 1U << (block % 32);
+        if ((word & bit) == 0) {
+          word |= bit;
+          ++selected;
+        }
+      }
     }
   }
 
@@ -225,17 +242,19 @@ int main() {
       std::uint32_t start_pos;
       bool masked;
       bool sparse;
+      bool bounded{false};
     };
-    const Case cases[] = {{4, 4096, false, false}, {3, 9000, true, true},
-                          {100, 0, false, false},  {64, 37, false, false},
-                          {100, 0, true, false},   {77, 51, true, false},
-                          {96, 4096, true, true},  {70, 8000, true, true},
-                          {5, 131069, true, true}};
+    const Case cases[] = {
+        {4, 4096, false, false}, {3, 9000, true, true},
+        {100, 0, false, false},  {64, 37, false, false},
+        {100, 0, true, false},   {77, 51, true, false},
+        {96, 4096, true, true},  {70, 8000, true, true},
+        {5, 131069, true, true}, {7, 131069, true, true, true}};
     bool ok = true;
     std::uint32_t seed = 0x1234ABCDU;
     for (const Case& c : cases) {
-      const double worst =
-          Compare(c.n_tokens, c.start_pos, c.masked, seed++, c.sparse);
+      const double worst = Compare(c.n_tokens, c.start_pos, c.masked, seed++,
+                                   c.sparse, c.bounded);
       std::cout << "WMMA attention n=" << c.n_tokens << " start=" << c.start_pos
                 << (c.masked ? (c.sparse ? " sparse" : " masked") : " dense")
                 << " worst absolute error " << worst << '\n';

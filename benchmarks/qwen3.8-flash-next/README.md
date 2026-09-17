@@ -17,27 +17,27 @@ and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1235.61 | 1260.10 |
-| 4096 | TODO | 1128.31 |
-| 16384 | 1122.91 | TODO |
-| 32768 | 1105.16 | TODO |
-| 131072 | 1041.99 | TODO |
+| 0 | 1244.01 | 1263.29 |
+| 4096 | TODO | 1135.10 |
+| 16384 | TODO | TODO |
+| 32768 | TODO | TODO |
+| 131072 | 1070.59 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 24.19 | 40.70 | 71.0% |
-| Greedy | 4096 | 23.31 | 34.45 | 63.7% |
-| Temperature 0.7 | 0 | TODO | 35.07 | 65.5% |
-| Temperature 0.7 | 4096 | TODO | 46.93 | 93.0% |
+| Greedy | 0 | 24.20 | 40.59 | 71.0% |
+| Greedy | 4096 | 23.35 | 34.48 | 63.7% |
+| Temperature 0.7 | 0 | TODO | 34.51 | 65.5% |
+| Temperature 0.7 | 4096 | TODO | 47.06 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
 Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
-The AR depth sweep uses one 133,121-token context limit throughout; MTP PP
-uses 6,145 and TG uses 4,225. AR PP loses 15.7% from d0 to d128K. Near-flat throughput
-across that range remains TODO; profiling identifies sparse attention as
-the main shallow-to-deep cost.
+AR PP uses one 133,121-token context limit throughout; AR TG uses 4,225
+and MTP uses 6,145. AR PP loses 13.9% from d0 to d128K. Near-flat throughput
+across that range remains TODO. Profiling identifies sparse attention and
+selection as the main depth-dependent costs.
 
 ```sh
 ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \
@@ -53,6 +53,9 @@ HTTP accepts arbitrary prompt lengths and yields between those chunks;
 spare session slots do not reduce the idle chunk size. Dense projection plans
 are deterministic and depend on exact shapes and the pinned HIP library.
 The [projection sweep](tools/projection_plans.hip) uses `tools/bench/build.sh`.
+Sparse attention compacts selected blocks in order. The indexer caches F16
+fragments and accumulates scores in FP32; selection retains exact score
+ordering and lowest-index ties.
 
 `prompt`, `chat` and `serve llm` share MTP and sampling options. Drafts are
 greedy over the full vocabulary on the GPU; verification uses the target
@@ -83,7 +86,10 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
   and bitwise replay, including ragged sizes and fallback shapes.
   Wave64 prefill projections check every output against MMQ, sampled FP64
   dots at the production shape and bitwise replay.
-  Attention checks include a ragged batch near 128K and bitwise replay.
+  Attention checks bounded and wider masks near 128K with bitwise replay.
+  Indexer pooling checks FP64 formulas, block boundaries and replay;
+  selection checks exact masks, ties and deep contexts. Mixer checks include
+  independent F16/Q8 outputs and optional inject weights.
   MTP token selection matches the CPU rule, including ties and graph replay.
 - Upload tests check bytes, guards, shard/chunk boundaries and invalid inputs.
   N-gram tests check asynchronous reads, duplicates, failed I/O and teardown.

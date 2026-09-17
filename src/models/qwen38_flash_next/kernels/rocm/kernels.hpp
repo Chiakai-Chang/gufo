@@ -253,10 +253,11 @@ void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
 /// Pools raw indexer keys ([pos][dim] f32) of the blocks the batch
 /// completes, [*first_block, (*start_pos + n_tokens) / ratio), into block
 /// keys: mean over `ratio` positions, RMSNorm with gamma, rotary at the
-/// block start position. `grid_blocks` bounds how many blocks one launch
+/// block start position, then round once to F16 for scoring.
+/// `grid_blocks` bounds how many blocks one launch
 /// can pool (a device-side bound is not available at launch time).
-void PoolIndexerBlocks(const float* raw_keys, const float* gamma, float* blocks,
-                       const std::uint32_t* first_block,
+void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
+                       __half* blocks, const std::uint32_t* first_block,
                        const std::uint32_t* start_pos, std::uint32_t n_tokens,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
@@ -266,8 +267,9 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma, float* blocks,
 /// complete block below its own tail, keeps the `budget` highest, and
 /// writes a visibility bitmap (`mask_words` uint32 per query, bit b = block
 /// b visible). Every block is visible when the count fits the budget.
-/// `scores` is scratch of n_tokens * max_blocks floats.
-void SelectBlocks(const float* q, const float* blocks, std::uint32_t* mask,
+/// Inputs contain the F16 values consumed by the matrix cores; scores
+/// still accumulate in FP32. `scores` holds n_tokens * max_blocks floats.
+void SelectBlocks(const __half* q, const __half* blocks, std::uint32_t* mask,
                   float* scores, std::uint32_t n_tokens,
                   const std::uint32_t* start_pos, std::uint32_t first_token,
                   std::uint32_t heads, std::uint32_t dim, std::uint32_t ratio,

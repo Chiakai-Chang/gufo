@@ -296,26 +296,16 @@ __device__ __forceinline__ std::int8_t* Q8ActTile(void* base,
          (((tt * num_blocks) + kb) * kQ8ActTileBytes);
 }
 
-/// HcMixEpilogueVec4Kernel over kMixTokensPerBlock tokens per block: the
-/// block's inject weight slice (four outputs x four streams x four lanes
-/// per thread) is loaded once and reused for every token, which removes
-/// the sixteen weight loads per token that dominated the one-token kernel.
-/// grid (inject parts, token groups); inject partials keep the one-token
-/// layout [t][o][part].
-constexpr std::uint32_t kMixTokensPerBlock = 8;
-/// Non-null `mixed_half` / `mixed_q8` also receive the mixed row as F16 and
-/// in the W8A8 tiled Q8 layout (K = hidden), for the projections that read
-/// it next.
-template<typename XnT>
-__global__ void HcMixEpilogueVec4MultiKernel(const XnT* xn, const float* gate,
-                                             const float* inject_w,
-                                             float* mixed, __half* mixed_half,
-                                             void* mixed_q8, float* inject,
-                                             std::uint32_t n_tokens,
-                                             std::uint32_t hidden) {
+/// One token per block keeps independent rows in flight. The FP32 mixed
+/// row, optional F16/Q8 projection inputs and inject partials share one
+/// read of the four residual streams. Grid: (inject parts, tokens).
+__global__ void HcMixEpilogueF16Kernel(const __half* xn, const float* gate,
+                                       const float* inject_w, float* mixed,
+                                       __half* mixed_half, void* mixed_q8,
+                                       float* inject, std::uint32_t hidden) {
   constexpr std::uint32_t kStreams = 4;
   const std::uint32_t part = blockIdx.x;
-  const std::uint32_t t0 = blockIdx.y * kMixTokensPerBlock;
+  const std::uint32_t t = blockIdx.y;
   const std::uint32_t i = (part * blockDim.x + threadIdx.x) * 4;
   const std::size_t hc_dim = static_cast<std::size_t>(kStreams) * hidden;
   const bool live = i < hidden;
@@ -324,112 +314,104 @@ __global__ void HcMixEpilogueVec4MultiKernel(const XnT* xn, const float* gate,
   for (std::uint32_t o = 0; o < kStreams; ++o) {
 #pragma unroll
     for (std::uint32_t s = 0; s < kStreams; ++s) {
-      wq[o][s] = live ? *reinterpret_cast<const float4*>(
-                            inject_w + (static_cast<std::size_t>(o) * hc_dim) +
-                            (static_cast<std::size_t>(s) * hidden) + i)
-                      : float4{0.0F, 0.0F, 0.0F, 0.0F};
+      wq[o][s] = live && inject_w != nullptr
+                     ? *reinterpret_cast<const float4*>(
+                           inject_w + (static_cast<std::size_t>(o) * hc_dim) +
+                           (static_cast<std::size_t>(s) * hidden) + i)
+                     : float4{0.0F, 0.0F, 0.0F, 0.0F};
     }
   }
-  __shared__ float partial[kMixTokensPerBlock][kStreams][kThreads / 32];
+  __shared__ float partial[kStreams][kThreads / 32];
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t wave = threadIdx.x / warpSize;
   constexpr float kInvStreams = 1.0F / static_cast<float>(kStreams);
+  float4 v[kStreams];
+  float4 acc{0.0F, 0.0F, 0.0F, 0.0F};
 #pragma unroll
-  for (std::uint32_t tt = 0; tt < kMixTokensPerBlock; ++tt) {
-    const std::uint32_t t = t0 + tt;
-    // Every lane joins the wave reductions; a token past the batch or a
-    // lane past the row contributes zeros.
-    const bool active = live && t < n_tokens;
-    float4 v[kStreams];
-    float4 acc{0.0F, 0.0F, 0.0F, 0.0F};
-#pragma unroll
-    for (std::uint32_t s = 0; s < kStreams; ++s) {
-      const std::size_t idx = (static_cast<std::size_t>(t) * hc_dim) +
-                              (static_cast<std::size_t>(s) * hidden) + i;
-      v[s] = active ? Load4(xn + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
-      if (active) {
-        const float4 g = *reinterpret_cast<const float4*>(gate + idx);
-        acc.x += v[s].x * SigmoidF(g.x);
-        acc.y += v[s].y * SigmoidF(g.y);
-        acc.z += v[s].z * SigmoidF(g.z);
-        acc.w += v[s].w * SigmoidF(g.w);
-      }
+  for (std::uint32_t s = 0; s < kStreams; ++s) {
+    const std::size_t idx = (static_cast<std::size_t>(t) * hc_dim) +
+                            (static_cast<std::size_t>(s) * hidden) + i;
+    v[s] = live ? Load4(xn + idx) : float4{0.0F, 0.0F, 0.0F, 0.0F};
+    if (live) {
+      const float4 g = *reinterpret_cast<const float4*>(gate + idx);
+      acc.x += v[s].x * SigmoidF(g.x);
+      acc.y += v[s].y * SigmoidF(g.y);
+      acc.z += v[s].z * SigmoidF(g.z);
+      acc.w += v[s].w * SigmoidF(g.w);
     }
-    if (active) {
-      acc.x *= kInvStreams;
-      acc.y *= kInvStreams;
-      acc.z *= kInvStreams;
-      acc.w *= kInvStreams;
-      *reinterpret_cast<float4*>(mixed + static_cast<std::size_t>(t) * hidden +
-                                 i) = acc;
-      if (mixed_half != nullptr) {
-        __half* out = mixed_half + (static_cast<std::size_t>(t) * hidden) + i;
-        *reinterpret_cast<__half2*>(out) = __floats2half2_rn(acc.x, acc.y);
-        *reinterpret_cast<__half2*>(out + 2) = __floats2half2_rn(acc.z, acc.w);
-      }
+  }
+  if (live) {
+    acc.x *= kInvStreams;
+    acc.y *= kInvStreams;
+    acc.z *= kInvStreams;
+    acc.w *= kInvStreams;
+    *reinterpret_cast<float4*>(mixed + static_cast<std::size_t>(t) * hidden +
+                               i) = acc;
+    if (mixed_half != nullptr) {
+      __half* out = mixed_half + (static_cast<std::size_t>(t) * hidden) + i;
+      *reinterpret_cast<__half2*>(out) = __floats2half2_rn(acc.x, acc.y);
+      *reinterpret_cast<__half2*>(out + 2) = __floats2half2_rn(acc.z, acc.w);
     }
-    if (mixed_q8 != nullptr) {
-      // Eight lanes hold one 32-wide block (every lane joins the reduction).
-      float max_abs = fmaxf(fmaxf(fabsf(acc.x), fabsf(acc.y)),
-                            fmaxf(fabsf(acc.z), fabsf(acc.w)));
-      for (int off = 4; off > 0; off >>= 1) {
-        max_abs = fmaxf(max_abs, __shfl_xor(max_abs, off));
-      }
-      if (active) {
-        const float d = max_abs / 127.0F;
-        const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
-        const auto q0 = static_cast<std::uint32_t>(static_cast<std::uint8_t>(
-            static_cast<std::int8_t>(roundf(acc.x * id))));
-        const auto q1 = static_cast<std::uint32_t>(static_cast<std::uint8_t>(
-            static_cast<std::int8_t>(roundf(acc.y * id))));
-        const auto q2 = static_cast<std::uint32_t>(static_cast<std::uint8_t>(
-            static_cast<std::int8_t>(roundf(acc.z * id))));
-        const auto q3 = static_cast<std::uint32_t>(static_cast<std::uint8_t>(
-            static_cast<std::int8_t>(roundf(acc.w * id))));
-        const std::size_t kb = i / 32;
-        const std::uint32_t pos = i % 32;  // 0, 4, ..., 28
-        std::int8_t* tile =
-            Q8ActTile(mixed_q8, hidden / 32, t / kQ8ActTileTokens, kb);
-        const std::size_t tl = t % kQ8ActTileTokens;
-        *reinterpret_cast<std::uint32_t*>(tile + ((pos >> 4u) * 256) +
-                                          (tl * 16) + (pos & 15u)) =
-            q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
-        if (pos == 0) {
-          *reinterpret_cast<float*>(tile + kQ8ActScaleOffset +
-                                    (tl * sizeof(float))) = d;
-        }
-      }
+  }
+  if (mixed_q8 != nullptr) {
+    // Eight lanes hold one 32-wide block (every lane joins the reduction).
+    float max_abs = fmaxf(fmaxf(fabsf(acc.x), fabsf(acc.y)),
+                          fmaxf(fabsf(acc.z), fabsf(acc.w)));
+    for (int off = 4; off > 0; off >>= 1) {
+      max_abs = fmaxf(max_abs, __shfl_xor(max_abs, off));
     }
-#pragma unroll
-    for (std::uint32_t o = 0; o < kStreams; ++o) {
-      float dot = 0.0F;
-#pragma unroll
-      for (std::uint32_t s = 0; s < kStreams; ++s) {
-        dot += wq[o][s].x * v[s].x;
-        dot += wq[o][s].y * v[s].y;
-        dot += wq[o][s].z * v[s].z;
-        dot += wq[o][s].w * v[s].w;
-      }
-      dot = WaveSum(dot);
-      if (lane == 0) {
-        partial[tt][o][wave] = dot;
+    if (live) {
+      const float d = max_abs / 127.0F;
+      const float id = (d != 0.0F) ? (1.0F / d) : 0.0F;
+      const auto q0 = static_cast<std::uint32_t>(static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(roundf(acc.x * id))));
+      const auto q1 = static_cast<std::uint32_t>(static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(roundf(acc.y * id))));
+      const auto q2 = static_cast<std::uint32_t>(static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(roundf(acc.z * id))));
+      const auto q3 = static_cast<std::uint32_t>(static_cast<std::uint8_t>(
+          static_cast<std::int8_t>(roundf(acc.w * id))));
+      const std::size_t kb = i / 32;
+      const std::uint32_t pos = i % 32;  // 0, 4, ..., 28
+      std::int8_t* tile =
+          Q8ActTile(mixed_q8, hidden / 32, t / kQ8ActTileTokens, kb);
+      const std::size_t tl = t % kQ8ActTileTokens;
+      *reinterpret_cast<std::uint32_t*>(tile + ((pos >> 4u) * 256) + (tl * 16) +
+                                        (pos & 15u)) =
+          q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
+      if (pos == 0) {
+        *reinterpret_cast<float*>(tile + kQ8ActScaleOffset +
+                                  (tl * sizeof(float))) = d;
       }
     }
   }
-  __syncthreads();
-  // Thread (tt, o) totals the waves of one (token, output).
-  if (threadIdx.x < kMixTokensPerBlock * kStreams) {
-    const std::uint32_t tt = threadIdx.x / kStreams;
-    const std::uint32_t o = threadIdx.x % kStreams;
-    const std::uint32_t t = t0 + tt;
-    if (t < n_tokens) {
-      float total = 0.0F;
-      for (std::uint32_t w = 0; w < kThreads / 32; ++w) {
-        total += partial[tt][o][w];
-      }
-      inject[(static_cast<std::size_t>(t) * kStreams + o) * gridDim.x + part] =
-          total;
+  if (inject_w == nullptr) {
+    return;
+  }
+#pragma unroll
+  for (std::uint32_t o = 0; o < kStreams; ++o) {
+    float dot = 0.0F;
+#pragma unroll
+    for (std::uint32_t s = 0; s < kStreams; ++s) {
+      dot += wq[o][s].x * v[s].x;
+      dot += wq[o][s].y * v[s].y;
+      dot += wq[o][s].z * v[s].z;
+      dot += wq[o][s].w * v[s].w;
     }
+    dot = WaveSum(dot);
+    if (lane == 0) {
+      partial[o][wave] = dot;
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x < kStreams) {
+    float total = 0.0F;
+    for (std::uint32_t w = 0; w < kThreads / 32; ++w) {
+      total += partial[threadIdx.x][w];
+    }
+    inject[(static_cast<std::size_t>(t) * kStreams + threadIdx.x) * gridDim.x +
+           part] = total;
   }
 }
 
@@ -1593,7 +1575,7 @@ __global__ void StoreRowsKernel(const float* src, float* dst,
 /// [b*ratio, (b+1)*ratio) once every one of them is stored, i.e. for
 /// b in [*first_block, (*start_pos + n_tokens) / ratio).
 __global__ void PoolBlocksKernel(const float* raw, const float* gamma,
-                                 float* blocks,
+                                 __half* blocks,
                                  const std::uint32_t* first_block,
                                  const std::uint32_t* start_pos,
                                  std::uint32_t n_tokens, std::uint32_t ratio,
@@ -1633,7 +1615,7 @@ __global__ void PoolBlocksKernel(const float* raw, const float* gamma,
     outv = i < half ? a * c - bb * s : a * s + bb * c;
   }
   if (i < dim) {
-    blocks[static_cast<std::size_t>(b) * dim + i] = outv;
+    blocks[static_cast<std::size_t>(b) * dim + i] = __float2half_rn(outv);
   }
 }
 
@@ -1650,32 +1632,29 @@ __device__ __forceinline__ v8f Wmma(v16h a, v16h b, v8f c) {
 /// relu(q_h . k_b) for a 32-query x 128-block tile per workgroup (wave w:
 /// queries (w & 1) * 16.., blocks (w >> 1) * 32.., so a pooled key
 /// fragment serves the four heads and a query fragment two block tiles).
-/// Both operands are read straight from their F32 rows as 16-element
-/// fragments and rounded to F16; the four per-head dot products accumulate
-/// in F32 over the 128 dims before the relu. Scores are written for every
-/// block below the group's widest complete range (a query never reads
+/// Both operands are stored as the F16 fragments consumed here; the
+/// conversion happens once when producing each row. Head dot products
+/// accumulate in F32 over the 128 dims before the relu. Scores are written for
+/// every block below the group's widest complete range (a query never reads
 /// blocks it cannot see); below the budget nothing is scored.
 constexpr std::uint32_t kSelectQueries = 32;
 constexpr std::uint32_t kSelectRows = 128;
 constexpr std::uint32_t kSelectHeads = 4;
 constexpr std::uint32_t kSelectDim = 128;
 
-/// Sixteen consecutive F32 values as an F16 fragment.
-__device__ __forceinline__ v16h LoadFragF32(const float* p) {
-  const auto* v = reinterpret_cast<const float4*>(p);
-  __half2 h[8];
-#pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    const float4 f = v[i];
-    h[2 * i] = __floats2half2_rn(f.x, f.y);
-    h[2 * i + 1] = __floats2half2_rn(f.z, f.w);
-  }
-  v16h out;
-  __builtin_memcpy(&out, h, 32);
-  return out;
+// A fragment is 16 contiguous halves = 32 bytes: two 16-byte loads and a
+// bitcast. Every fragment base here is 16-byte aligned by construction.
+__device__ __forceinline__ v16h LoadFrag(const __half* p) {
+  union {
+    v16h f;
+    uint4 u[2];
+  } cvt;
+  cvt.u[0] = *reinterpret_cast<const uint4*>(p);
+  cvt.u[1] = *reinterpret_cast<const uint4*>(p + 8);
+  return cvt.f;
 }
 
-__global__ void SelectScoreKernel(const float* q, const float* blocks,
+__global__ void SelectScoreKernel(const __half* q, const __half* blocks,
                                   float* scores, std::uint32_t n_tokens,
                                   const std::uint32_t* start_pos,
                                   std::uint32_t first_token,
@@ -1703,8 +1682,8 @@ __global__ void SelectScoreKernel(const float* q, const float* blocks,
   // Rows past the batch / the complete range read a clamped row; their
   // scores are never read back.
   const std::uint32_t q_row = min(qt + sub_lane, n_tokens - 1);
-  const float* q_lane = q + (static_cast<std::size_t>(q_row) * kQDim);
-  const float* k_lane[kTiles];
+  const __half* q_lane = q + (static_cast<std::size_t>(q_row) * kQDim);
+  const __half* k_lane[kTiles];
 #pragma unroll
   for (std::uint32_t j = 0; j < kTiles; ++j) {
     const std::uint32_t b_row = min(bt + (j * 16) + sub_lane, complete - 1);
@@ -1724,11 +1703,11 @@ __global__ void SelectScoreKernel(const float* q, const float* blocks,
     v16h kf[kTiles];
 #pragma unroll
     for (std::uint32_t j = 0; j < kTiles; ++j) {
-      kf[j] = LoadFragF32(k_lane[j] + (ks * 16));
+      kf[j] = LoadFrag(k_lane[j] + (ks * 16));
     }
 #pragma unroll
     for (std::uint32_t h = 0; h < kSelectHeads; ++h) {
-      const v16h qf = LoadFragF32(q_lane + (h * kSelectDim) + (ks * 16));
+      const v16h qf = LoadFrag(q_lane + (h * kSelectDim) + (ks * 16));
 #pragma unroll
       for (std::uint32_t j = 0; j < kTiles; ++j) {
         acc[h][j] = Wmma(qf, kf[j], acc[h][j]);
@@ -2340,18 +2319,6 @@ constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
 // Union-mask capacity: one bit per 4-token block, 262,144 tokens of context.
 constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
 
-// A fragment is 16 contiguous halves = 32 bytes: two 16-byte loads and a
-// bitcast. Every fragment base here is 16-byte aligned by construction.
-__device__ __forceinline__ v16h LoadFrag(const __half* p) {
-  union {
-    v16h f;
-    uint4 u[2];
-  } cvt;
-  cvt.u[0] = *reinterpret_cast<const uint4*>(p);
-  cvt.u[1] = *reinterpret_cast<const uint4*>(p + 8);
-  return cvt.f;
-}
-
 /// Two row layouts share the kernel. The dense window packs 32 queries x 2
 /// heads (a row block is 16 queries of one head, grid.y over head pairs).
 /// The sparse window packs the twelve heads of one query into a row block
@@ -2475,17 +2442,69 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   const std::uint32_t tail_block =
       ((start_pos + query_start + 1) / ratio);  // first always-visible block
   const bool sparse = mask != nullptr;
-  __shared__ std::uint32_t union_words[kWmmaMaxMaskWords];
+  // Four 512-block selections plus their incomplete tail. The same LDS
+  // stores a mask for arbitrary wider selections used by operator callers.
+  constexpr unsigned kListCapacity = 4 * 512 + 4;
+  __shared__ unsigned union_words[kListCapacity];
+  __shared__ unsigned wave_counts[8];
+  bool compact = false;
+  unsigned selected = 0;
   if (sparse) {
-    const std::uint32_t live_rows =
-        min(kQueryRows, n_tokens > query_start ? n_tokens - query_start : 0u);
-    for (std::uint32_t w = tid; w < mask_words; w += 256) {
-      std::uint32_t acc = 0;
-      for (std::uint32_t r = 0; r < live_rows; ++r) {
-        acc |=
-            mask[(static_cast<std::size_t>(query_start + r) * mask_words) + w];
+    // Consecutive word ranges per thread make the prefix scan preserve
+    // increasing block order, including ties and the always-visible tail.
+    const unsigned live_rows = min(kQueryRows, n_tokens - query_start);
+    const unsigned word_count = (n_blocks + 31) / 32;
+    const unsigned words_per_thread = (word_count + 255) / 256;
+    unsigned local_words[8];
+    unsigned count = 0;
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) {
+      const unsigned w = tid * words_per_thread + j;
+      unsigned bits = 0;
+      if (j < words_per_thread && w < word_count) {
+        for (unsigned r = 0; r < live_rows; ++r)
+          bits |= mask[size_t(query_start + r) * mask_words + w];
+        if (w * 32 >= tail_block)
+          bits = ~0u;
+        else if ((w + 1) * 32 > tail_block)
+          bits |= ~0u << (tail_block % 32);
+        if ((w + 1) * 32 > n_blocks)
+          bits &= (1u << (n_blocks % 32)) - 1u;
       }
-      union_words[w] = acc;
+      local_words[j] = bits;
+      count += __popc(bits);
+    }
+    unsigned scan = count;
+#pragma unroll
+    for (unsigned offset = 1; offset < 32; offset *= 2) {
+      unsigned before = __shfl_up(scan, offset, 32);
+      if (lane >= offset)
+        scan += before;
+    }
+    if (lane == 31)
+      wave_counts[wave] = scan;
+    __syncthreads();
+    unsigned prefix = scan - count;
+#pragma unroll
+    for (unsigned w = 0; w < 8; ++w) {
+      if (w < wave)
+        prefix += wave_counts[w];
+      selected += wave_counts[w];
+    }
+    compact = selected <= kListCapacity;
+#pragma unroll
+    for (unsigned j = 0; j < 8; ++j) {
+      const unsigned word = tid * words_per_thread + j;
+      unsigned bits = local_words[j];
+      if (compact) {
+        while (bits) {
+          unsigned bit = __builtin_ctz(bits);
+          union_words[prefix++] = word * 32 + bit;
+          bits &= bits - 1;
+        }
+      } else if (j < words_per_thread && word < word_count) {
+        union_words[word] = bits;
+      }
     }
     __syncthreads();
   }
@@ -2513,6 +2532,13 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   // Gathers the next tile starting the search at block `b`; returns the
   // block to continue from.
   const auto gather_tile = [&](std::uint32_t b, Tile& tile) {
+    if (compact) {
+      tile.count = min(kBlocksPerTile, selected - min(b, selected));
+#pragma unroll
+      for (unsigned i = 0; i < kBlocksPerTile; ++i)
+        tile.block[i] = b + i < selected ? union_words[b + i] : n_blocks;
+      return b + tile.count;
+    }
     tile.count = 0;
 #pragma unroll
     for (std::uint32_t i = 0; i < kBlocksPerTile; ++i) {
@@ -3711,32 +3737,23 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
                           __half* mixed_half, void* mixed_q8, float* inject,
                           std::uint32_t n_tokens, std::uint32_t hidden,
                           hipStream_t stream) {
-  if (inject_w != nullptr && n_tokens >= kMixTokensPerBlock &&
-      hidden % 32 == 0) {
-    hipLaunchKernelGGL(
-        HcMixEpilogueVec4MultiKernel<__half>,
-        dim3(HcInjectPartsVec4(hidden),
-             (n_tokens + kMixTokensPerBlock - 1) / kMixTokensPerBlock),
-        dim3(kThreads), 0, stream, xn, gate, inject_w, mixed, mixed_half,
-        mixed_q8, inject, n_tokens, hidden);
-    return;
-  }
-  if (mixed_half != nullptr) {
-    // The one-token kernel has no side outputs; produce them separately.
-    hipLaunchKernelGGL(HcMixEpilogueVec4Kernel<__half>,
-                       dim3(n_tokens, HcInjectPartsVec4(hidden)),
+  if (hidden % 32 == 0) {
+    hipLaunchKernelGGL(HcMixEpilogueF16Kernel,
+                       dim3(HcInjectPartsVec4(hidden), n_tokens),
                        dim3(kThreads), 0, stream, xn, gate, inject_w, mixed,
-                       inject, hidden);
-    NarrowActivations(mixed, mixed_half, false,
-                      static_cast<std::size_t>(n_tokens) * hidden, stream);
-    if (mixed_q8 != nullptr) {
-      QuantizeQ8Tiled(mixed, mixed_q8, n_tokens, hidden, stream);
-    }
+                       mixed_half, mixed_q8, inject, hidden);
     return;
   }
   hipLaunchKernelGGL(HcMixEpilogueVec4Kernel<__half>,
                      dim3(n_tokens, HcInjectPartsVec4(hidden)), dim3(kThreads),
                      0, stream, xn, gate, inject_w, mixed, inject, hidden);
+  if (mixed_half != nullptr) {
+    NarrowActivations(mixed, mixed_half, false,
+                      static_cast<std::size_t>(n_tokens) * hidden, stream);
+  }
+  if (mixed_q8 != nullptr) {
+    QuantizeQ8Tiled(mixed, mixed_q8, n_tokens, hidden, stream);
+  }
 }
 
 void HcCombine(float* res, const float* block_out, const float* inject,
@@ -4428,8 +4445,8 @@ void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                      src, dst, row_dim, start_pos);
 }
 
-void PoolIndexerBlocks(const float* raw_keys, const float* gamma, float* blocks,
-                       const std::uint32_t* first_block,
+void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
+                       __half* blocks, const std::uint32_t* first_block,
                        const std::uint32_t* start_pos, std::uint32_t n_tokens,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
@@ -4442,7 +4459,7 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma, float* blocks,
                      n_tokens, ratio, dim, rotary_dim, theta, eps);
 }
 
-void SelectBlocks(const float* q, const float* blocks, std::uint32_t* mask,
+void SelectBlocks(const __half* q, const __half* blocks, std::uint32_t* mask,
                   float* scores, std::uint32_t n_tokens,
                   const std::uint32_t* start_pos, std::uint32_t first_token,
                   std::uint32_t heads, std::uint32_t dim, std::uint32_t ratio,

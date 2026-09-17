@@ -1,9 +1,11 @@
+#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <numeric>
 #include <stdexcept>
@@ -79,8 +81,12 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
                                : MakeValues(q_count, seed, 1.0F);
   const auto blocks = MakeValues(static_cast<std::size_t>(max_blocks) * kDim,
                                  seed ^ 0x9999U, 1.0F);
-  float* d_q = Upload(qv);
-  float* d_blocks = Upload(blocks);
+  std::vector<__half> q_half(qv.size()), blocks_half(blocks.size());
+  const auto half = [](float value) { return __float2half_rn(value); };
+  std::transform(qv.begin(), qv.end(), q_half.begin(), half);
+  std::transform(blocks.begin(), blocks.end(), blocks_half.begin(), half);
+  __half* d_q = Upload(q_half);
+  __half* d_blocks = Upload(blocks_half);
   std::uint32_t* d_pos = Upload(std::vector<std::uint32_t>{start_pos});
   std::uint32_t* d_mask = Upload(std::vector<std::uint32_t>(
       static_cast<std::size_t>(n_tokens) * mask_words, 0xA5A5A5A5U));
@@ -93,6 +99,11 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
       Download(d_mask, static_cast<std::size_t>(n_tokens) * mask_words);
   const auto scores =
       Download(d_scores, static_cast<std::size_t>(n_tokens) * max_blocks);
+  q::SelectBlocks(d_q, d_blocks, d_mask, d_scores, n_tokens, d_pos, 0, kHeads,
+                  kDim, kRatio, kBudget, mask_words, max_blocks, nullptr);
+  if (Download(d_mask, mask.size()) != mask) {
+    throw std::runtime_error("selection replay changed the mask");
+  }
 
   double worst_score = 0.0;
   std::size_t mismatches = 0;
@@ -165,12 +176,84 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   return worst_score < 1e-2 && mismatches == 0;
 }
 
+void CheckPooling() {
+  constexpr unsigned start = 29, tokens = 7, first = 7, blocks = 12;
+  constexpr unsigned rotary = 64;
+  constexpr float theta = 1000000.0F, eps = 1e-6F;
+  const auto raw = MakeValues((start + tokens) * kDim, 0x31415926U, 1.0F);
+  const auto gamma = MakeValues(kDim, 0x27182818U, 1.0F);
+  const std::vector<__half> initial(blocks * kDim, __float2half(3.0F));
+  auto* d_raw = Upload(raw);
+  auto* d_gamma = Upload(gamma);
+  auto* d_blocks = Upload(initial);
+  auto* d_first = Upload(std::vector<unsigned>{first});
+  auto* d_start = Upload(std::vector<unsigned>{start});
+  const auto run = [&] {
+    q::PoolIndexerBlocks(d_raw, d_gamma, d_blocks, d_first, d_start, tokens, 4,
+                         kRatio, kDim, rotary, theta, eps, nullptr);
+  };
+  run();
+  const auto actual = Download(d_blocks, initial.size());
+  run();
+  const auto replay = Download(d_blocks, initial.size());
+  if (std::memcmp(actual.data(), replay.data(),
+                  actual.size() * sizeof(__half)) != 0) {
+    throw std::runtime_error("pooling replay changed the block keys");
+  }
+  double worst = 0.0;
+  for (unsigned block = 0; block < blocks; ++block) {
+    if (block < first || block >= (start + tokens) / kRatio) {
+      for (unsigned i = 0; i < kDim; ++i) {
+        if (__half2float(actual[block * kDim + i]) != 3.0F) {
+          throw std::runtime_error("pooling wrote an incomplete or old block");
+        }
+      }
+      continue;
+    }
+    std::vector<double> values(kDim);
+    double squares = 0.0;
+    for (unsigned i = 0; i < kDim; ++i) {
+      for (unsigned r = 0; r < kRatio; ++r)
+        values[i] += raw[(block * kRatio + r) * kDim + i] / double(kRatio);
+      squares += values[i] * values[i];
+    }
+    const double scale = 1.0 / std::sqrt(squares / kDim + eps);
+    for (unsigned i = 0; i < kDim; ++i)
+      values[i] *= scale * gamma[i];
+    for (unsigned i = 0; i < rotary / 2; ++i) {
+      const double angle =
+          block * kRatio * std::pow(double(theta), -2.0 * i / rotary);
+      const auto a = values[i], b = values[i + rotary / 2];
+      values[i] = a * std::cos(angle) - b * std::sin(angle);
+      values[i + rotary / 2] = a * std::sin(angle) + b * std::cos(angle);
+    }
+    for (unsigned i = 0; i < kDim; ++i) {
+      const double value = __half2float(actual[block * kDim + i]);
+      const double error =
+          std::abs(value - values[i]) / std::max(1.0, std::abs(values[i]));
+      if (!std::isfinite(value) || error > 1e-3) {
+        throw std::runtime_error("pooled F16 key disagrees with FP64 formula");
+      }
+      worst = std::max(worst, error);
+    }
+  }
+  for (void* pointer :
+       {static_cast<void*>(d_raw), static_cast<void*>(d_gamma),
+        static_cast<void*>(d_blocks), static_cast<void*>(d_first),
+        static_cast<void*>(d_start)})
+    CheckHip(hipFree(pointer), "free pooling input");
+  std::cout << "pooled F16 keys: FP64 error " << worst
+            << ", boundaries and replay exact\n";
+}
+
 }  // namespace
 
 int main() {
   try {
+    CheckPooling();
     bool ok = true;
     ok = Run(100, 20000, 0x1234ABCDU) && ok;     // deep, ragged group
+    ok = Run(7, 131069, 0x2468ACE0U) && ok;      // deep, partial word
     ok = Run(1, 9001, 0x0BADF00DU) && ok;        // decode
     ok = Run(40, 2040, 0xDEADBEEFU) && ok;       // straddles the budget
     ok = Run(3, 6000, 0x5EED5EEDU, true) && ok;  // all scores tie at zero

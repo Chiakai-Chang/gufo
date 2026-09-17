@@ -233,6 +233,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   s.k = f32(T * c.AttentionKvDim());
   s.v = f32(T * c.AttentionKvDim());
   s.iq = f32(T * c.indexer_heads * c.indexer_head_dim);
+  s.iq_half =
+      Alloc<__half>(a, T * c.indexer_heads * c.indexer_head_dim, error_msg);
   s.ik = f32(T * c.indexer_head_dim);
   const std::uint32_t max_blocks =
       (c.context_length + c.compress_ratio - 1) / c.compress_ratio;
@@ -374,7 +376,7 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
       at.index_k = Alloc<float>(
           a, static_cast<std::size_t>(max_context) * c.indexer_head_dim,
           error_msg);
-      at.block_k = Alloc<float>(
+      at.block_k = Alloc<__half>(
           a,
           static_cast<std::size_t>(max_context / c.compress_ratio + 1) *
               c.indexer_head_dim,
@@ -1051,6 +1053,12 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 stream_);
     Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
          pos, c.rope_theta, stream_);
+    // Scoring already consumes half fragments. Convert each query once,
+    // instead of repeating the conversion for every tile of cached keys.
+    NarrowActivations(s_.iq, s_.iq_half, false,
+                      static_cast<std::size_t>(n_tokens) * c.indexer_heads *
+                          c.indexer_head_dim,
+                      stream_);
     PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
@@ -1059,8 +1067,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
         (max_context + c.compress_ratio - 1) / c.compress_ratio;
     for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += select_chunk_) {
       const std::uint32_t n = std::min(select_chunk_, n_tokens - t0);
-      SelectBlocks(s_.iq + static_cast<std::size_t>(t0) * c.indexer_heads *
-                               c.indexer_head_dim,
+      SelectBlocks(s_.iq_half + static_cast<std::size_t>(t0) * c.indexer_heads *
+                                    c.indexer_head_dim,
                    s.block_k,
                    s_.mask + static_cast<std::size_t>(t0) * mask_words_,
                    s_.scores, n, pos, t0, c.indexer_heads, c.indexer_head_dim,

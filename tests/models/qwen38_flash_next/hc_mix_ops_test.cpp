@@ -319,6 +319,81 @@ int main() {
       return 1;
     }
 
+    // Side outputs are independent: Q8 must also work without an F16
+    // output or inject weights, including a one-token batch.
+    for (const auto count : {1U, kTokens}) {
+      const std::size_t mixed_count = static_cast<std::size_t>(count) * kHidden;
+      const auto bytes = q::Q8TiledBytes(count, kHidden);
+      HipBuffer<__half> d_half(mixed_count);
+      HipBuffer<std::uint8_t> d_q8(bytes);
+      for (unsigned outputs = 0; outputs < 8; ++outputs) {
+        const bool half_output = (outputs & 1U) != 0;
+        const bool q8_output = (outputs & 2U) != 0;
+        const bool inject_output = (outputs & 4U) != 0;
+        CheckHip(hipMemset(d_q8.get(), 0xA5, bytes), "poison Q8 output");
+        q::HcMixEpilogueVec4F16(d_xn_f16.get(), d_gate.get(),
+                                inject_output ? d_weight.get() : nullptr,
+                                d_mixed_vec.get(),
+                                half_output ? d_half.get() : nullptr,
+                                q8_output ? d_q8.get() : nullptr,
+                                inject_output ? d_inject_vec.get() : nullptr,
+                                count, kHidden, nullptr);
+        const auto actual = Download(&d_mixed_vec, kMixed);
+        if (std::memcmp(actual.data(), mixed_f16.data(),
+                        mixed_count * sizeof(float)) != 0) {
+          throw std::runtime_error("optional outputs changed the mixed row");
+        }
+        if (inject_output) {
+          const auto actual_inject = Download(&d_inject_vec, vec_inject);
+          if (std::memcmp(actual_inject.data(), inject_f16.data(),
+                          static_cast<std::size_t>(count) * kStreams *
+                              vec_parts * sizeof(float)) != 0) {
+            throw std::runtime_error("mixer replay changed inject partials");
+          }
+        }
+        if (half_output) {
+          std::vector<__half> half(mixed_count);
+          CheckHip(hipMemcpy(half.data(), d_half.get(), d_half.bytes(),
+                             hipMemcpyDeviceToHost),
+                   "download mixed F16");
+          for (std::size_t i = 0; i < mixed_count; ++i) {
+            if (__half2float(half[i]) !=
+                __half2float(__float2half(mixed_f16[i]))) {
+              throw std::runtime_error("mixed F16 rounding differs");
+            }
+          }
+        }
+        if (q8_output) {
+          std::vector<std::uint8_t> packed(bytes);
+          CheckHip(hipMemcpy(packed.data(), d_q8.get(), bytes,
+                             hipMemcpyDeviceToHost),
+                   "download mixed Q8");
+          for (std::uint32_t t = 0; t < count; ++t) {
+            for (std::uint32_t kb = 0; kb < kHidden / 32; ++kb) {
+              const auto* tile =
+                  packed.data() + ((t / 16) * (kHidden / 32) + kb) * 576;
+              float scale;
+              std::memcpy(&scale, tile + 512 + (t % 16) * 4, 4);
+              if (!std::isfinite(scale) || scale < 0.0F) {
+                throw std::runtime_error("invalid mixed Q8 scale");
+              }
+              for (std::uint32_t j = 0; j < 32; ++j) {
+                const auto code = static_cast<std::int8_t>(
+                    tile[(j / 16) * 256 + (t % 16) * 16 + j % 16]);
+                const float expected =
+                    mixed_f16[static_cast<std::size_t>(t) * kHidden + kb * 32 +
+                              j];
+                if (std::abs(expected - scale * code) >
+                    0.501F * scale + 1e-7F) {
+                  throw std::runtime_error("mixed Q8 rounding differs");
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    std::cout << "HC mixed F16/Q8 and inject outputs work independently\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

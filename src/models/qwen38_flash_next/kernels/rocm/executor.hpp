@@ -55,7 +55,7 @@ private:
     __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
     __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
     float* index_k{nullptr};   ///< [max_context][indexer_dim] raw
-    float* block_k{nullptr};   ///< [max_context/ratio][indexer_dim]
+    __half* block_k{nullptr};  ///< [max_context/ratio][indexer_dim]
   };
   /// Per-launch values the kernels read from device memory, so a captured
   /// graph replays at any position.
@@ -291,6 +291,7 @@ private:
     float* k;
     float* v;
     float* iq;
+    __half* iq_half;
     float* ik;
     std::uint32_t* mask;
     float* scores;
