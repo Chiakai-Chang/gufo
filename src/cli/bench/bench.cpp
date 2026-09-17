@@ -805,8 +805,8 @@ int RunQwen38FlashNextBenchmark(
   }
   PrintModelLoadTime(model_load_start);
 
-  // A natural-language pattern keeps the router and the n-gram hashes on
-  // realistic paths.
+  // Repeat a fixed token pattern for reproducible timing. It uses far fewer
+  // distinct PLE rows than varied requests.
   std::vector<std::int32_t> tokens;
   {
     const auto pattern = model->Tokenize(
