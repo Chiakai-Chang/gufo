@@ -1,15 +1,19 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 namespace q = gufo::models::qwen38_flash_next::rocm;
 namespace {
@@ -130,6 +134,73 @@ void CheckArgmax(std::uint32_t vocab) {
             << ": CPU oracle and graph replay passed\n";
 }
 
+void CheckCandidates(std::uint32_t vocab) {
+  gufo::hip::GpuSamplingWorkspace workspace;
+  gufo::hip::AllocateGpuSamplingWorkspace(&workspace, vocab, 64);
+  auto device_logits = Allocate<float>(vocab);
+  std::vector<float> logits(vocab);
+  std::vector<std::uint32_t> expected(vocab);
+  const auto count = std::min<std::size_t>(
+      vocab, gufo::models::qwen38_flash_next::kMtpCandidates);
+  std::vector<float> scores(count);
+  std::vector<std::uint32_t> ids(count);
+  hipStream_t stream = nullptr;
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t executable = nullptr;
+  CheckHip(hipStreamCreate(&stream), "candidate stream");
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+           "candidate capture");
+  gufo::hip::LaunchGPUSortLogits(device_logits.get(), &workspace, stream);
+  CheckHip(hipStreamEndCapture(stream, &graph), "candidate capture end");
+  CheckHip(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+           "candidate graph");
+  for (unsigned mode = 0; mode < 3; ++mode) {
+    for (std::uint32_t i = 0; i < vocab; ++i) {
+      logits[i] = mode == 0   ? static_cast<float>((i * 7919U) % 257)
+                  : mode == 1 ? (i % 2 ? 0.0F : -0.0F)
+                              : std::numeric_limits<float>::quiet_NaN();
+    }
+    if (mode == 0) {
+      logits[0] = std::numeric_limits<float>::infinity();
+      logits[vocab - 1] = std::numeric_limits<float>::quiet_NaN();
+    }
+    std::iota(expected.begin(), expected.end(), 0);
+    const auto score = [&](std::uint32_t id) {
+      return std::isfinite(logits[id])
+                 ? logits[id]
+                 : -std::numeric_limits<float>::infinity();
+    };
+    std::sort(expected.begin(), expected.end(), [&](auto a, auto b) {
+      return score(a) == score(b) ? a < b : score(a) > score(b);
+    });
+    CheckHip(
+        hipMemcpyAsync(device_logits.get(), logits.data(),
+                       vocab * sizeof(float), hipMemcpyHostToDevice, stream),
+        "candidate upload");
+    CheckHip(hipGraphLaunch(executable, stream), "candidate replay");
+    CheckHip(hipMemcpyAsync(ids.data(), workspace.sorted_token_ids,
+                            count * sizeof(std::uint32_t),
+                            hipMemcpyDeviceToHost, stream),
+             "candidate IDs");
+    CheckHip(
+        hipMemcpyAsync(scores.data(), workspace.sorted_logits,
+                       count * sizeof(float), hipMemcpyDeviceToHost, stream),
+        "candidate scores");
+    CheckHip(hipStreamSynchronize(stream), "candidate synchronization");
+    for (std::size_t i = 0; i < count; ++i) {
+      if (ids[i] != expected[i] || scores[i] != score(expected[i])) {
+        throw std::runtime_error("MTP candidate sort disagrees with CPU");
+      }
+    }
+  }
+  CheckHip(hipGraphExecDestroy(executable), "candidate graph destroy");
+  CheckHip(hipGraphDestroy(graph), "candidate source graph destroy");
+  CheckHip(hipStreamDestroy(stream), "candidate stream destroy");
+  gufo::hip::FreeGpuSamplingWorkspace(&workspace);
+  std::cout << "MTP candidates vocab=" << vocab
+            << ": exact finite ordering, ties and graph replay passed\n";
+}
+
 }  // namespace
 
 int main() {
@@ -137,6 +208,9 @@ int main() {
     CheckArgmax(1);
     CheckArgmax(257);
     CheckArgmax(248320);
+    CheckCandidates(1);
+    CheckCandidates(257);
+    CheckCandidates(248320);
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

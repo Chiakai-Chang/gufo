@@ -55,6 +55,11 @@ void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
     std::size_t vocab_size, std::size_t penalty_capacity);
 void FreeGpuSamplingWorkspace(GpuSamplingWorkspace* workspace) noexcept;
 
+/// Sorts finite logits into workspace.sorted_logits/sorted_token_ids.
+/// Equal logits retain ascending token IDs. Non-finite values sort last.
+void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
+                         hipStream_t stream = nullptr);
+
 /// Samples one device-resident logit row and writes a single device token.
 ///
 /// Penalty token/count spans are host-resident compact unique-token arrays.

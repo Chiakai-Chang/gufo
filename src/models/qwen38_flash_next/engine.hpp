@@ -23,6 +23,7 @@ namespace gufo::models::qwen38_flash_next {
 struct ModelWeights;
 struct MtpWeights;
 class NgramTable;
+struct MtpCandidateLogits;
 namespace rocm {
 class DeviceModel;
 class Executor;
@@ -109,9 +110,10 @@ public:
     std::vector<std::int32_t> tokens;
     bool stop{false};
   };
-  /// Samples the target and verifies deterministic MTP proposals with the
-  /// same sampler. Updates its history/RNG only for emitted tokens (and the
-  /// stop draw), leaving the session at exactly the emitted prefix. A
+  /// Greedy decoding verifies deterministic drafts. Sampled decoding draws
+  /// compact MTP proposals and uses target/draft rejection with a residual
+  /// correction. History contains only committed tokens; stochastic RNG
+  /// consumption includes proposal and verification draws. A
   /// one-token budget or a model without MTP uses ordinary decoding.
   /// Benchmarks may continue past EOS by setting stop_at_eos to false.
   [[nodiscard]] bool DecodeStep(std::size_t max_tokens,
@@ -128,6 +130,8 @@ public:
     return tokens_;
   }
   void Reset();
+  /// A new request reusing cached context starts its own acceptance history.
+  void ResetDraftPolicy() noexcept { draft_length_.Reset(); }
 
   struct SpeculativeStats {
     std::uint64_t cycles{0};
@@ -139,12 +143,12 @@ public:
   }
 
   /// Layout version of the snapshot payload; bump on any format change.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 1;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 2;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent
   /// state, draft-block state, last logits) into host memory. The
-  /// speculative acceptance history restarts on restore.
+  /// speculative length controller is preserved for stochastic replay.
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
       std::string* error_msg = nullptr) const;
   /// Replaces this session's context with a snapshot of the same model.
@@ -161,7 +165,8 @@ private:
   /// Trunk rows the draft block may still read: [hidden_base_, size).
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
   bool DraftCatchUp(std::int32_t next_token, bool propose,
-                    std::string* error_msg);
+                    std::string* error_msg,
+                    MtpCandidateLogits* candidates = nullptr);
 
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;

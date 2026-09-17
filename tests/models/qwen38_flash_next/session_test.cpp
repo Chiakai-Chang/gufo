@@ -48,11 +48,39 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
                                ": Continue red, blue, blue, red,";
     auto ordinary = ar.complete(prompt, 8, test.config);
     auto speculative = mtp.complete(prompt, 8, test.config);
+    // Exercise the serving handoff against the model session directly.
+    // Replaying HTTP alone would not detect a consistently dropped residual.
+    auto direct = model->CreateSession(6145, &error);
+    const auto encoded = model->Tokenize(prompt);
+    Require(direct && direct->Sync(encoded, &error), error);
+    const std::vector<sampling::TokenId> history(encoded.begin(),
+                                                 encoded.end());
+    sampling::SamplerState direct_sampler(test.config, history);
+    std::vector<sampling::TokenId> direct_tokens;
+    while (direct_tokens.size() < 8) {
+      qfn::Session::DecodeResult step;
+      Require(direct->DecodeStep(8 - direct_tokens.size(), direct_sampler,
+                                 &step, &error),
+              error);
+      direct_tokens.insert(direct_tokens.end(), step.tokens.begin(),
+                           step.tokens.end());
+      if (step.stop)
+        break;
+      Require(!step.tokens.empty(),
+              "direct serving reference made no progress");
+    }
+    const auto direct_stats = direct->Statistics();
+    Require(direct_tokens == speculative.tokens &&
+                direct_stats.drafted == speculative.draft_tokens &&
+                direct_stats.accepted == speculative.draft_accepted_tokens,
+            "serving lost sampling state: " + std::string(test.name));
     Require(!ordinary.tokens.empty() && ordinary.draft_tokens == 0 &&
                 speculative.draft_tokens > 0,
             "sampling strategy did not exercise AR and MTP");
-    Require(ordinary.tokens == speculative.tokens,
-            "serving AR/MTP mismatch: " + std::string(test.name));
+    if (!test.config.uses_random_sampling()) {
+      Require(ordinary.tokens == speculative.tokens,
+              "serving greedy AR/MTP mismatch: " + std::string(test.name));
+    }
     for (const bool use_mtp : {false, true}) {
       auto& backend = use_mtp ? mtp : ar;
       const auto& expected = use_mtp ? speculative : ordinary;
@@ -65,7 +93,7 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
     }
     references.push_back(
         {test, prompt, std::move(ordinary), std::move(speculative)});
-    std::cout << "serving sampling=" << test.name << " ar_mtp_exact=1\n"
+    std::cout << "serving sampling=" << test.name << " replay_exact=1\n"
               << std::flush;
   }
   // Every strategy also runs in an interleaved pair. Flash-Next currently
@@ -91,17 +119,29 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
             "interleaving changed serving sampling or acceptance");
       }
     }
-    // Truncating a request must retain the same prefix, including penalties.
+    // Greedy/AR prefixes are budget-independent. Sampled MTP consumes
+    // proposal/rejection draws, so each budget must replay its own result.
     for (const auto index : {std::size_t{0}, references.size() - 2}) {
       const auto& saved = references[index];
       for (const auto budget : {1U, 2U, 3U}) {
         const auto actual =
             backend.complete(saved.prompt, budget, saved.test.config);
-        Require(actual.tokens.size() ==
-                        std::min<std::size_t>(budget, saved.ar.tokens.size()) &&
-                    std::equal(actual.tokens.begin(), actual.tokens.end(),
-                               saved.ar.tokens.begin()),
-                "output budget changed the sampled prefix");
+        if (use_mtp && saved.test.config.uses_random_sampling()) {
+          const auto replay =
+              backend.complete(saved.prompt, budget, saved.test.config);
+          Require(
+              actual.tokens.size() <= budget &&
+                  actual.tokens == replay.tokens &&
+                  actual.draft_tokens == replay.draft_tokens &&
+                  actual.draft_accepted_tokens == replay.draft_accepted_tokens,
+              "sampled MTP budget or replay differs");
+        } else {
+          Require(actual.tokens.size() == std::min<std::size_t>(
+                                              budget, saved.ar.tokens.size()) &&
+                      std::equal(actual.tokens.begin(), actual.tokens.end(),
+                                 saved.ar.tokens.begin()),
+                  "output budget changed the AR/greedy prefix");
+        }
       }
     }
     std::cout << "serving strategies=" << references.size()
@@ -160,6 +200,7 @@ int main(int argc, char** argv) {
       const std::vector<sampling::TokenId> history(prefix.begin(),
                                                    prefix.end());
       for (std::size_t c = 0; c < configs.size(); ++c) {
+        const bool sampled = configs[c].uses_random_sampling();
         auto ar = model->CreateSession(6145, &error);
         auto mtp = model->CreateSession(6145, &error);
         Require(ar && mtp, error);
@@ -185,6 +226,15 @@ int main(int argc, char** argv) {
           candidate.insert(candidate.end(), decoded.tokens.begin(),
                            decoded.tokens.end());
           while (reference.size() < candidate.size()) {
+            if (sampled) {
+              // Independent target replay checks every committed token's
+              // recurrent/cache state, including residual corrections.
+              const auto token = candidate[reference.size()];
+              Require(ar->Evaluate(token, &error), error);
+              reference.push_back(token);
+              a.Accept(static_cast<sampling::TokenId>(token));
+              continue;
+            }
             qfn::Session::DecodeResult single;
             Require(ar->DecodeStep(1, a, &single, &error, false), error);
             reference.insert(reference.end(), single.tokens.begin(),
@@ -222,13 +272,16 @@ int main(int argc, char** argv) {
                       " config " + std::to_string(c) + " token " +
                       std::to_string(reference.size()));
           Require(max_diff == 0.0F, "AR/MTP frontier logits differ");
-          Require(a.rng_state() == b.rng_state(), "AR/MTP RNG mismatch");
+          if (!sampled) {
+            Require(a.rng_state() == b.rng_state(),
+                    "greedy AR/MTP RNG mismatch");
+          }
           Require(ar->Position() == mtp->Position(),
                   "AR/MTP position mismatch");
         }
         saved.final_logits.assign(ar->Logits().begin(), ar->Logits().end());
         saved.tokens = reference;
-        saved.rng = a.rng_state();
+        saved.rng = b.rng_state();
         // Greedy and seeded sampling exercise fresh-load determinism; the
         // remaining configurations cover filters and penalties above.
         if (c <= 1)
@@ -275,6 +328,7 @@ int main(int argc, char** argv) {
       const std::vector<sampling::TokenId> history(prefix.begin(),
                                                    prefix.end());
       for (const bool speculative : {false, true}) {
+        const bool sampled = configs[saved.config].uses_random_sampling();
         auto session = model->CreateSession(6145, &error);
         Require(session && session->Sync(prefix, &error), error);
         RequireExact(saved.prefill_logits, session->Logits(),
@@ -284,8 +338,15 @@ int main(int argc, char** argv) {
         constexpr std::array<std::size_t, 4> budgets{2, 8, 1, 4};
         std::size_t step = 0;
         while (tokens.size() < saved.tokens.size()) {
-          const auto budget =
-              speculative ? budgets[step++ % budgets.size()] : 1;
+          if (sampled && !speculative) {
+            const auto token = saved.tokens[tokens.size()];
+            Require(session->Evaluate(token, &error), error);
+            tokens.push_back(token);
+            continue;
+          }
+          const auto budget = sampled ? saved.tokens.size() - tokens.size()
+                              : speculative ? budgets[step++ % budgets.size()]
+                                            : 1;
           qfn::Session::DecodeResult decoded;
           Require(session->DecodeStep(
                       std::min(budget, saved.tokens.size() - tokens.size()),
@@ -299,8 +360,10 @@ int main(int argc, char** argv) {
                 "fresh load or draft width changed tokens");
         RequireExact(saved.final_logits, session->Logits(),
                      "fresh load or draft width changed final logits");
-        Require(sampler.rng_state() == saved.rng,
-                "fresh load or draft width changed RNG");
+        if (!sampled || speculative) {
+          Require(sampler.rng_state() == saved.rng,
+                  "fresh load or draft width changed RNG");
+        }
         std::cout << "fresh_load depth=" << saved.depth
                   << " config=" << saved.config << " mtp=" << speculative
                   << " tokens=" << tokens.size() << " bitwise_exact=1\n"

@@ -2,6 +2,8 @@
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_MTP_POLICY_HPP_
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 
@@ -56,6 +58,21 @@ public:
   void Reset() noexcept {
     successes_ = 3.0F;
     failures_ = 1.0F;
+  }
+
+  [[nodiscard]] std::array<float, 2> State() const noexcept {
+    return {successes_, failures_};
+  }
+
+  [[nodiscard]] bool Restore(std::array<float, 2> state) noexcept {
+    if (!std::isfinite(state[0]) || !std::isfinite(state[1]) ||
+        state[0] < 0.0F || state[1] < 0.0F ||
+        !std::isfinite(state[0] + state[1]) || state[0] + state[1] <= 0.0F) {
+      return false;
+    }
+    successes_ = state[0];
+    failures_ = state[1];
+    return true;
   }
 
 private:

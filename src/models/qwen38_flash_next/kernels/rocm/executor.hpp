@@ -15,8 +15,10 @@
 #include <unordered_set>
 #include <vector>
 
+#include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -137,17 +139,27 @@ public:
   /// MTP position. The hidden input of token i is the trunk residual of row
   /// `hidden_row + i` of the last Forward batch, or, with hidden_row < 0
   /// (single token), the draft block's own residual from the previous call.
-  /// Only requested outputs are computed. Production requests the greedy
-  /// token; numerical probes can request the full logits. Catch-up can skip
+  /// Only requested outputs are computed. Production requests a greedy
+  /// token or compact candidate logits. Numerical probes can request full
+  /// logits. Catch-up can skip
   /// the output head when only the draft state is needed.
   struct MtpOutput {
     std::int32_t* token{nullptr};
     float* logits{nullptr};
+    MtpCandidateLogits* candidates{nullptr};
   };
   [[nodiscard]] bool MtpForward(Session& session,
                                 std::span<const std::int32_t> tokens,
                                 std::int32_t hidden_row, MtpOutput output,
                                 std::string* error_msg) const;
+
+  /// Verifies a proposal against a device-resident target logit row.
+  /// Returns either the accepted proposal or its residual correction.
+  [[nodiscard]] bool VerifyMtpProposal(std::uint32_t row,
+                                       const MtpProposal& proposal,
+                                       sampling::SamplerState& sampler,
+                                       std::int32_t* token, bool* accepted,
+                                       std::string* error_msg) const;
 
   /// A session's complete context as one host byte payload: recurrent and
   /// PLE state, KV and indexer caches up to the position, and the draft
@@ -268,14 +280,14 @@ private:
            std::uint32_t n_tokens, std::string* error_msg) const;
   /// Full-vocabulary logits of `n_rows` rows land in logits_host_.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
-               bool logits, std::string* error_msg) const;
+               bool logits, bool candidates, std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool speculative, bool sparse, std::uint32_t start_pos,
                    std::uint32_t pool_grid, std::uint32_t first_layer,
                    std::uint32_t end_layer, std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
-               bool logits, std::string* error_msg) const;
+               bool logits, bool candidates, std::string* error_msg) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -391,6 +403,10 @@ private:
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
   std::int32_t* mtp_token_host_{nullptr};
+  MtpCandidateLogits* mtp_candidates_host_{nullptr};
+  mutable gufo::hip::GpuSamplingWorkspace sampling_workspace_;
+  mutable std::vector<std::uint32_t> penalty_tokens_;
+  mutable std::vector<std::uint32_t> penalty_counts_;
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

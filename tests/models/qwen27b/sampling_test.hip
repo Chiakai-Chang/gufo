@@ -352,6 +352,29 @@ void TestSpeculativeResidualSampling() {
          "GPU rejection samples the target-minus-draft residual");
 }
 
+void TestDuplicateDraftCandidates() {
+  const std::vector<float> logits{std::log(0.20F), std::log(0.30F),
+                                  std::log(0.50F)};
+  const std::vector<std::uint32_t> unique_ids{0, 1};
+  const std::vector<float> unique_probabilities{0.8F, 0.2F};
+  const std::vector<std::uint32_t> duplicate_ids{0, 1, 0, 99};
+  const std::vector<float> duplicate_probabilities{0.4F, 0.2F, 0.4F, 0.0F};
+  for (const int top_k : {0, 3}) {
+    gufo::hip::GpuSamplingParameters parameters{.temperature = 1.0F,
+                                                .top_k = top_k};
+    for (const float uniform : {0.0F, 0.1F, 0.5F, 0.99999994F}) {
+      const auto expected =
+          SampleSpeculatively(logits, parameters, 0, 0.8F, unique_ids,
+                              unique_probabilities, 0.9F, uniform);
+      const auto actual =
+          SampleSpeculatively(logits, parameters, 0, 0.8F, duplicate_ids,
+                              duplicate_probabilities, 0.9F, uniform);
+      Expect(!actual.accepted && actual.token == expected.token,
+             "duplicate or out-of-vocabulary candidates alter residual q");
+    }
+  }
+}
+
 void TestFilteredSpeculativeResidualSampling() {
   const std::vector<float> logits = {5.0F, 4.0F, 3.0F};
   const std::vector<std::uint32_t> draft_ids = {0U, 1U, 2U};
@@ -629,6 +652,7 @@ int main() {
   TestTopKOneRespectsMinimumKeep();
   TestFilterCombinations();
   TestSpeculativeResidualSampling();
+  TestDuplicateDraftCandidates();
   TestFilteredSpeculativeResidualSampling();
   TestSamplingBoundaryValues();
   TestExactNucleusBoundaryAndGreedyTies();

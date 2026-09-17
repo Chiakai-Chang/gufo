@@ -2201,6 +2201,7 @@ public:
       throw std::logic_error(
           "Qwen3.8-Flash-Next reused prefix does not match checkpoint");
     }
+    qfn.session().ResetDraftPolicy();
   }
 
   [[nodiscard]] TextPrefillStep Prefill(
@@ -2291,8 +2292,9 @@ public:
       throw std::runtime_error("Qwen3.8-Flash-Next MTP decode failed: " +
                                error);
     }
-    // The pool accepts the returned tokens once; only publish the RNG here.
-    sampler.SetRngState(working_sampler.rng_state());
+    // The pool accepts the returned tokens once. Publish the RNG and residual
+    // draw so the next batch retains the rejection-conditioned distribution.
+    sampler.CopyDrawStateFrom(working_sampler);
     TextDecodeStep step;
     step.stop = decoded.stop;
     step.selections.reserve(decoded.tokens.size());

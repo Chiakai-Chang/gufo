@@ -26,14 +26,9 @@ struct Decoded {
   qfn::Session::SpeculativeStats stats;
 };
 
-/// Decodes `count` tokens past EOS with a fresh seeded sampler.
 Decoded Decode(qfn::Session& session, std::size_t count,
-               const sampling::SamplingConfig& config, std::size_t budget) {
+               sampling::SamplerState& sampler, std::size_t budget) {
   std::string error;
-  const auto history = session.Tokens();
-  const std::vector<sampling::TokenId> initial(history.begin(),
-                                               history.end());
-  sampling::SamplerState sampler(config, initial);
   const auto before = session.Statistics();
   Decoded out;
   while (out.tokens.size() < count) {
@@ -49,6 +44,15 @@ Decoded Decode(qfn::Session& session, std::size_t count,
   out.stats = {after.cycles - before.cycles, after.drafted - before.drafted,
                after.accepted - before.accepted};
   return out;
+}
+
+/// Decodes `count` tokens past EOS with a fresh seeded sampler.
+Decoded Decode(qfn::Session& session, std::size_t count,
+               const sampling::SamplingConfig& config, std::size_t budget) {
+  const auto history = session.Tokens();
+  const std::vector<sampling::TokenId> initial(history.begin(), history.end());
+  sampling::SamplerState sampler(config, initial);
+  return Decode(session, count, sampler, budget);
 }
 
 void RequireSame(const Decoded& expected, const Decoded& actual,
@@ -162,10 +166,35 @@ int main(int argc, char** argv) {
     Require(restored->RestoreSnapshot(*mid, &error), error);
     Require(restored->Position() == prompt.size() + first_half.tokens.size(),
             "mid-decode position");
-    // The acceptance history restarts on restore, so draft widths may
-    // differ; verification keeps the emitted tokens identical.
-    Require(second_half.tokens == Decode(*restored, kTokens, config, 8).tokens,
-            "mid-decode restore: tokens differ");
+    // Controller state is part of a stochastic continuation's replay.
+    RequireSame(second_half, Decode(*restored, kTokens, config, 8),
+                "mid-decode restore");
+
+    // Capture a rejected proposal before its residual has been evaluated.
+    // The context snapshot and the request-owned sampler must replay together.
+    auto pending = model->CreateSession(kContext, &error);
+    const auto short_prompt = std::span(prompt).first(16);
+    Require(pending && pending->Sync(short_prompt, &error), error);
+    const std::vector<sampling::TokenId> short_history(short_prompt.begin(),
+                                                       short_prompt.end());
+    sampling::SamplerState sampler({.temperature = 2.0F, .seed = 73},
+                                   short_history);
+    bool rejected = false;
+    for (unsigned attempt = 0; attempt < 32 && !rejected; ++attempt) {
+      qfn::Session::DecodeResult step;
+      Require(pending->DecodeStep(2, sampler, &step, &error, false), error);
+      rejected = step.tokens.size() == 1;
+    }
+    Require(rejected, "snapshot test did not exercise a deferred residual");
+    auto residual_snapshot = pending->SaveSnapshot(&error);
+    Require(residual_snapshot != nullptr, error);
+    auto replay_sampler = sampler;
+    const auto residual_expected = Decode(*pending, 16, sampler, 8);
+    Require(restored->RestoreSnapshot(*residual_snapshot, &error), error);
+    RequireSame(residual_expected, Decode(*restored, 16, replay_sampler, 8),
+                "deferred residual restore");
+    Require(sampler.rng_state() == replay_sampler.rng_state(),
+            "deferred residual restore changed RNG");
 
     // Extending the restored context keeps the prefix.
     Require(restored->RestoreSnapshot(*at_prompt, &error), error);

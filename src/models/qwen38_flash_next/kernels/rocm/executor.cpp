@@ -141,6 +141,7 @@ Executor::~Executor() {
   if (ple_pending_) {
     (void)ngram_->WaitRead();
   }
+  gufo::hip::FreeGpuSamplingWorkspace(&sampling_workspace_);
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -148,6 +149,7 @@ Executor::~Executor() {
        {static_cast<void*>(host_emb_), static_cast<void*>(control_host_),
         static_cast<void*>(tokens_host_), static_cast<void*>(logits_host_),
         static_cast<void*>(mtp_token_host_), static_cast<void*>(counts_host_),
+        static_cast<void*>(mtp_candidates_host_),
         static_cast<void*>(tiles_host_)}) {
     if (p != nullptr) {
       (void)hipHostFree(p);
@@ -330,10 +332,14 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_res = f32(T * hc_dim);
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
-    if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t)),
-               "pinned draft token", error_msg)) {
+    if (!Check(hipHostMalloc(&e->mtp_token_host_, 2 * sizeof(std::int32_t)),
+               "pinned draft token", error_msg) ||
+        !Check(
+            hipHostMalloc(&e->mtp_candidates_host_, sizeof(MtpCandidateLogits)),
+            "pinned draft candidates", error_msg)) {
       return nullptr;
     }
+    std::memset(e->mtp_candidates_host_, 0, sizeof(MtpCandidateLogits));
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -1339,7 +1345,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
-                       bool logits, std::string* error_msg) const {
+                       bool logits, bool candidates,
+                       std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
       !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
@@ -1351,6 +1358,22 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
             hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
                            hipMemcpyDeviceToHost, stream_),
             "draft token download", error_msg)) {
+      return false;
+    }
+  }
+  if (candidates) {
+    gufo::hip::LaunchGPUSortLogits(s_.logits, &sampling_workspace_, stream_);
+    const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
+    if (!Check(hipMemcpyAsync(mtp_candidates_host_->ids.data(),
+                              sampling_workspace_.sorted_token_ids,
+                              count * sizeof(std::uint32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               "draft candidate IDs download", error_msg) ||
+        !Check(hipMemcpyAsync(mtp_candidates_host_->logits.data(),
+                              sampling_workspace_.sorted_logits,
+                              count * sizeof(float), hipMemcpyDeviceToHost,
+                              stream_),
+               "draft candidate logits download", error_msg)) {
       return false;
     }
   }
@@ -1903,6 +1926,77 @@ bool Executor::RestoreSnapshot(Session& session,
   return true;
 }
 
+bool Executor::VerifyMtpProposal(std::uint32_t row, const MtpProposal& proposal,
+                                 sampling::SamplerState& sampler,
+                                 std::int32_t* token, bool* accepted,
+                                 std::string* error_msg) const {
+  if (row >= options_.max_logit_rows || proposal.size == 0 ||
+      proposal.size > kMtpCandidates || !(proposal.probability > 0.0F) ||
+      sampling_workspace_.vocab_size == 0 || token == nullptr ||
+      accepted == nullptr) {
+    AssignError(error_msg, "invalid MTP verification request");
+    return false;
+  }
+  const auto& config = sampler.config();
+  penalty_tokens_.clear();
+  penalty_counts_.clear();
+  if (config.penalties_enabled()) {
+    for (const auto id : sampler.history()) {
+      if (id < this->config().vocab_size) {
+        penalty_tokens_.push_back(id);
+      }
+    }
+    std::sort(penalty_tokens_.begin(), penalty_tokens_.end());
+    std::size_t count = 0;
+    for (const auto id : penalty_tokens_) {
+      if (count == 0 || penalty_tokens_[count - 1] != id) {
+        penalty_tokens_[count++] = id;
+        penalty_counts_.push_back(1);
+      } else {
+        ++penalty_counts_.back();
+      }
+    }
+    penalty_tokens_.resize(count);
+  }
+  const gufo::hip::GpuSamplingParameters parameters{
+      .temperature = config.temperature,
+      .top_k = config.top_k,
+      .top_p = config.top_p,
+      .min_p = config.min_p,
+      .min_keep = config.min_keep,
+      .repeat_penalty = config.repeat_penalty,
+      .frequency_penalty = config.frequency_penalty,
+      .presence_penalty = config.presence_penalty,
+  };
+  const float acceptance_uniform = static_cast<float>(sampler.Uniform());
+  const auto residual_checkpoint = sampler.rng_state();
+  const float residual_uniform = static_cast<float>(sampler.Uniform());
+  gufo::hip::LaunchGPUSpeculativeSampling(
+      s_.logits + static_cast<std::size_t>(row) * this->config().vocab_size,
+      reinterpret_cast<std::uint32_t*>(s_.mtp_token),
+      sampling_workspace_.speculative_accepted, this->config().vocab_size,
+      parameters, proposal.token, proposal.probability, proposal.ids.data(),
+      proposal.probabilities.data(), proposal.size, acceptance_uniform,
+      residual_uniform, penalty_tokens_.data(), penalty_counts_.data(),
+      penalty_tokens_.size(), &sampling_workspace_, stream_);
+  if (!Check(hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
+                            hipMemcpyDeviceToHost, stream_),
+             "MTP verification token download", error_msg) ||
+      !Check(hipMemcpyAsync(
+                 mtp_token_host_ + 1, sampling_workspace_.speculative_accepted,
+                 sizeof(std::uint32_t), hipMemcpyDeviceToHost, stream_),
+             "MTP acceptance download", error_msg) ||
+      !Check(hipStreamSynchronize(stream_), "MTP verification", error_msg)) {
+    return false;
+  }
+  *token = mtp_token_host_[0];
+  *accepted = mtp_token_host_[1] != 0;
+  if (*accepted) {
+    sampler.SetRngState(residual_checkpoint);
+  }
+  return true;
+}
+
 bool Executor::MtpForward(Session& session,
                           std::span<const std::int32_t> tokens,
                           std::int32_t hidden_row, MtpOutput output,
@@ -1911,6 +2005,11 @@ bool Executor::MtpForward(Session& session,
   if (!model_->has_mtp()) {
     AssignError(error_msg, "no MTP block loaded");
     return false;
+  }
+  // Allocate before capture; captured candidate sorts retain these pointers.
+  if (output.candidates != nullptr && sampling_workspace_.vocab_size == 0) {
+    gufo::hip::AllocateGpuSamplingWorkspace(
+        &sampling_workspace_, config().vocab_size, config().vocab_size);
   }
   if (n == 0 || n > options_.max_batch || (hidden_row < 0 && n != 1) ||
       (hidden_row >= 0 &&
@@ -1933,10 +2032,12 @@ bool Executor::MtpForward(Session& session,
                             (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
                             (std::uint64_t{1} << 40) |
                             (std::uint64_t{output.token != nullptr} << 41) |
-                            (std::uint64_t{output.logits != nullptr} << 42);
+                            (std::uint64_t{output.logits != nullptr} << 42) |
+                            (std::uint64_t{output.candidates != nullptr} << 43);
   const auto body = [&] {
     return MtpBody(session, n, pos, output.token != nullptr,
-                   output.logits != nullptr, error_msg);
+                   output.logits != nullptr, output.candidates != nullptr,
+                   error_msg);
   };
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
@@ -1947,12 +2048,18 @@ bool Executor::MtpForward(Session& session,
   if (output.logits != nullptr) {
     std::copy_n(logits_host_, config().vocab_size, output.logits);
   }
+  if (output.candidates != nullptr) {
+    *output.candidates = *mtp_candidates_host_;
+    output.candidates->size =
+        std::min<std::size_t>(config().vocab_size, kMtpCandidates);
+  }
   session.mtp_.position = pos + n;
   return true;
 }
 
 bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
-                       bool token, bool logits, std::string* error_msg) const {
+                       bool token, bool logits, bool candidates,
+                       std::string* error_msg) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
@@ -2005,8 +2112,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
              "MTP hidden carry", error_msg)) {
     return false;
   }
-  return (!token && !logits) ||
-         MtpHead(l.nextn_head, last, token, logits, error_msg);
+  return (!token && !logits && !candidates) ||
+         MtpHead(l.nextn_head, last, token, logits, candidates, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

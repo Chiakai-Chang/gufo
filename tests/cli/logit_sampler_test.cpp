@@ -360,6 +360,42 @@ void TestStrategyReplayAgainstReference() {
   }
 }
 
+void TestDeferredResidualReplay() {
+  const std::array<float, 3> logits{100.0F, -100.0F, -100.0F};
+  gufo::sampling::SamplerState sampler({.temperature = 1.0F, .seed = 7});
+  // A retained residual must win over a fresh draw, even when that fresh
+  // draw would almost certainly select a different token.
+  sampler.DeferSample(2);
+  const auto rng = sampler.rng_state();
+  auto copied = sampler;
+  gufo::sampling::SamplerState assigned;
+  assigned = sampler;
+  bool duplicate_rejected = false;
+  try {
+    sampler.DeferSample(1);
+  } catch (const std::logic_error&) {
+    duplicate_rejected = true;
+  }
+  Expect(duplicate_rejected, "pending residual cannot be overwritten");
+  gufo::sampling::SamplerState published({.temperature = 1.0F});
+  published.Accept(1);
+  published.CopyDrawStateFrom(sampler);
+  Expect(published.history().size() == 1 && published.history()[0] == 1,
+         "publishing draw state leaves committed history unchanged");
+  for (auto* state : {&sampler, &copied, &assigned, &published}) {
+    Expect(state->Sample(logits) == 2 && state->rng_state() == rng,
+           "copied residual is consumed without another RNG draw");
+    Expect(state->Sample(logits) == 0 && state->rng_state() != rng,
+           "residual is consumed only once");
+  }
+  sampler.DeferSample(2);
+  sampler.ResetHistory({});
+  Expect(sampler.Sample(logits) == 0, "new history discards pending residual");
+  sampler.DeferSample(2);
+  sampler.SetRngState(rng);
+  Expect(sampler.Sample(logits) == 0, "RNG reset discards pending residual");
+}
+
 }  // namespace
 
 int main() {
@@ -381,6 +417,7 @@ int main() {
   TestSamplingFailsClosedOnInvalidInputs();
   TestZeroDrawAndNonFiniteCandidates();
   TestStrategyReplayAgainstReference();
+  TestDeferredResidualReplay();
   std::cout << "All logit sampler tests passed.\n";
   return 0;
 }

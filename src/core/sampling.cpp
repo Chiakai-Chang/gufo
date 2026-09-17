@@ -366,7 +366,8 @@ SamplerState::SamplerState(const SamplerState& other)
     : config_(other.config_),
       history_(other.history_),
       penalty_counts_(other.penalty_counts_),
-      rng_state_(other.rng_state_) {}
+      rng_state_(other.rng_state_),
+      pending_sample_(other.pending_sample_) {}
 
 SamplerState& SamplerState::operator=(const SamplerState& other) {
   if (this == &other) {
@@ -377,6 +378,7 @@ SamplerState& SamplerState::operator=(const SamplerState& other) {
   penalty_counts_ = other.penalty_counts_;
   candidate_scratch_.clear();
   rng_state_ = other.rng_state_;
+  pending_sample_ = other.pending_sample_;
   return *this;
 }
 
@@ -398,9 +400,16 @@ std::uint64_t* SamplerState::mutable_rng_state() noexcept {
 
 void SamplerState::SetRngState(std::uint64_t state) noexcept {
   rng_state_ = state;
+  pending_sample_.reset();
+}
+
+void SamplerState::CopyDrawStateFrom(const SamplerState& other) noexcept {
+  rng_state_ = other.rng_state_;
+  pending_sample_ = other.pending_sample_;
 }
 
 void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
+  pending_sample_.reset();
   history_.assign(tokens.begin(), tokens.end());
   TrimHistory();
   RebuildPenaltyCounts();
@@ -429,6 +438,13 @@ SamplingDistribution SamplerState::Distribution(
   return BuildDistribution(logits, config_, history_);
 }
 
+void SamplerState::DeferSample(TokenId token) {
+  if (pending_sample_) {
+    throw std::logic_error("a sampled token is already pending");
+  }
+  pending_sample_ = token;
+}
+
 TokenId SamplerState::Sample(std::span<const float> logits) {
   config_.Validate();
   if (logits.empty()) {
@@ -437,6 +453,14 @@ TokenId SamplerState::Sample(std::span<const float> logits) {
   if (logits.size() >
       static_cast<std::size_t>(std::numeric_limits<TokenId>::max())) {
     throw std::invalid_argument("logit distribution exceeds token ID range");
+  }
+  if (pending_sample_) {
+    if (*pending_sample_ >= logits.size()) {
+      throw std::invalid_argument("pending sample exceeds vocabulary");
+    }
+    const auto token = *pending_sample_;
+    pending_sample_.reset();
+    return token;
   }
   if (config_.temperature == 0.0F) {
     return SampleGreedy(logits);

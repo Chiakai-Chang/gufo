@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -82,6 +83,8 @@ public:
   [[nodiscard]] std::uint64_t rng_state() const noexcept;
   [[nodiscard]] std::uint64_t* mutable_rng_state() noexcept;
   void SetRngState(std::uint64_t state) noexcept;
+  /// Publish RNG and any deferred draw without accepting tentative history.
+  void CopyDrawStateFrom(const SamplerState& other) noexcept;
 
   void ResetHistory(std::span<const TokenId> tokens);
   void Accept(TokenId token);
@@ -89,6 +92,9 @@ public:
 
   [[nodiscard]] SamplingDistribution Distribution(
       std::span<const float> logits) const;
+  /// Retain a speculative residual draw for the next Sample call. Copies
+  /// preserve this draw along with the RNG; resetting history discards it.
+  void DeferSample(TokenId token);
   [[nodiscard]] TokenId Sample(std::span<const float> logits);
   [[nodiscard]] TokenId SampleResidual(
       std::span<const float> target_logits,
@@ -109,6 +115,7 @@ private:
   std::vector<std::pair<TokenId, std::uint32_t>> penalty_counts_;
   std::vector<Probability> candidate_scratch_;
   std::uint64_t rng_state_{0};
+  std::optional<TokenId> pending_sample_;
 };
 
 [[nodiscard]] std::uint64_t NextRandom(std::uint64_t* state);

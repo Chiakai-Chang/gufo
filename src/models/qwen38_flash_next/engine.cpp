@@ -4,6 +4,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
@@ -38,6 +39,7 @@ struct SessionSnapshotHeader {
   std::uint32_t token_count;
   std::uint32_t hidden_rows;
   std::uint64_t executor_bytes;
+  std::array<float, 2> draft_policy;
 };
 static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
 
@@ -259,6 +261,7 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
       .token_count = token_count,
       .hidden_rows = hidden_rows,
       .executor_bytes = executor_bytes,
+      .draft_policy = draft_length_.State(),
   };
   std::memcpy(out, &header, sizeof(header));
   out += sizeof(header);
@@ -301,6 +304,11 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot does not fit this session");
     return false;
   }
+  auto restored_policy = draft_length_;
+  if (!restored_policy.Restore(header.draft_policy)) {
+    AssignError(error_msg, "session snapshot draft policy is invalid");
+    return false;
+  }
   const std::uint8_t* in = payload.data() + sizeof(header);
   std::vector<std::int32_t> tokens(header.token_count);
   std::memcpy(tokens.data(), in, tokens.size() * sizeof(std::int32_t));
@@ -328,7 +336,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   logits_ = std::move(logits);
   hidden_base_ = info.position - info.hidden_rows;
   draft_token_ = 0;
-  draft_length_.Reset();
+  draft_length_ = restored_policy;
   stats_ = {};
   return true;
 }
@@ -346,7 +354,8 @@ bool SessionSnapshot::CopyTo(
 }
 
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
-                           std::string* error_msg) {
+                           std::string* error_msg,
+                           MtpCandidateLogits* candidates) {
   // The draft block trails the trunk: MTP position i consumes token i+1 and
   // the trunk's hidden of position i, so positions up to the current one are
   // replayed once their successor token is known. The session keeps hidden
@@ -365,7 +374,9 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   replay.push_back(next_token);
   if (!exec.MtpForward(
           *session_, replay, static_cast<std::int32_t>(mp - hidden_base_),
-          {.token = propose ? &draft_token_ : nullptr}, error_msg)) {
+          {.token = propose && candidates == nullptr ? &draft_token_ : nullptr,
+           .candidates = candidates},
+          error_msg)) {
     return false;
   }
   return true;
@@ -466,16 +477,34 @@ bool Session::DecodeStep(std::size_t max_tokens,
   }
 
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
-  if (!DraftCatchUp(anchor, true, error_msg)) {
+  const bool sampled = sampler.config().uses_random_sampling();
+  MtpCandidateLogits candidates;
+  if (!DraftCatchUp(anchor, true, error_msg, sampled ? &candidates : nullptr)) {
     return false;
   }
+  // A cycle-local proposal stream needs no pending RNG state in snapshots.
+  // Target verification keeps its own draws after this independent seed.
+  std::uint64_t draft_rng =
+      sampled ? sampling::NextRandom(sampler.mutable_rng_state()) : 0;
+  auto draft_sampler = sampler;
+  draft_sampler.Accept(static_cast<sampling::TokenId>(anchor));
+  std::vector<MtpProposal> proposals;
   std::vector<std::int32_t> chain{anchor};
   std::int32_t draft = draft_token_;
   while (chain.size() < width) {
+    if (sampled) {
+      proposals.push_back(
+          SampleMtpProposal(candidates, draft_sampler, &draft_rng));
+      draft = static_cast<std::int32_t>(proposals.back().token);
+      draft_sampler.Accept(proposals.back().token);
+    }
     chain.push_back(draft);
     if (chain.size() < width) {
       if (!exec.MtpForward(*session_, std::span<const std::int32_t>(&draft, 1),
-                           -1, {.token = &draft}, error_msg)) {
+                           -1,
+                           {.token = sampled ? nullptr : &draft,
+                            .candidates = sampled ? &candidates : nullptr},
+                           error_msg)) {
         return false;
       }
     }
@@ -491,7 +520,27 @@ bool Session::DecodeStep(std::size_t max_tokens,
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
   std::uint32_t keep = 1;
+  std::optional<std::int32_t> correction;
   while (keep < k) {
+    if (sampled) {
+      std::int32_t token = 0;
+      bool accepted = false;
+      if (!exec.VerifyMtpProposal(keep - 1, proposals[keep - 1], sampler,
+                                  &token, &accepted, error_msg)) {
+        return false;
+      }
+      if (is_stop(token)) {
+        result->stop = true;
+        break;
+      }
+      if (!accepted) {
+        correction = token;
+        break;
+      }
+      sampler.Accept(static_cast<sampling::TokenId>(token));
+      ++keep;
+      continue;
+    }
     const auto decision = VerifyDraft(std::span<const float>(verify_logits_)
                                           .subspan((keep - 1) * vocab, vocab),
                                       chain[keep], sampler, is_stop);
@@ -519,6 +568,11 @@ bool Session::DecodeStep(std::size_t max_tokens,
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.
   exec.MtpRewind(*session_, base);
+  if (correction) {
+    // Evaluate the residual as the next cycle's anchor, avoiding a separate
+    // target pass. Preserve the actual draw: resampling p would be biased.
+    sampler.DeferSample(static_cast<sampling::TokenId>(*correction));
+  }
   return true;
 }
 

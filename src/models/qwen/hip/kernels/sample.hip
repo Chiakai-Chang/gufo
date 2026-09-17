@@ -18,18 +18,29 @@ namespace {
 constexpr std::size_t kSamplingThreads = 256;
 constexpr std::size_t kArgmaxTile = 4096;
 
-__device__ float SparseDraftProbability(
-    std::uint32_t token,
+__global__ void ScatterDraftProbabilitiesKernel(
     const std::uint32_t* __restrict__ draft_candidate_ids,
     const float* __restrict__ draft_candidate_probabilities,
-    std::size_t draft_candidate_count) {
-  float probability = 0.0F;
-  for (std::size_t index = 0; index < draft_candidate_count; ++index) {
-    if (draft_candidate_ids[index] == token) {
-      probability += draft_candidate_probabilities[index];
-    }
+    std::size_t draft_candidate_count, float* __restrict__ dense,
+    std::size_t vocab_size) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index >= draft_candidate_count)
+    return;
+  const auto token = draft_candidate_ids[index];
+  if (token >= vocab_size)
+    return;
+  // Only the first occurrence writes. Sum duplicates in their original order
+  // so the lookup retains the sparse verifier's exact F32 probability.
+  for (std::size_t previous = 0; previous < index; ++previous) {
+    if (draft_candidate_ids[previous] == token)
+      return;
   }
-  return probability;
+  float probability = 0.0F;
+  for (std::size_t next = index; next < draft_candidate_count; ++next) {
+    if (draft_candidate_ids[next] == token)
+      probability += draft_candidate_probabilities[next];
+  }
+  dense[token] = probability;
 }
 
 __global__ void PrepareSamplingKernel(const float* __restrict__ logits,
@@ -43,6 +54,17 @@ __global__ void PrepareSamplingKernel(const float* __restrict__ logits,
   }
   adjusted_logits[index] = logits[index];
   token_ids[index] = static_cast<std::uint32_t>(index);
+}
+
+__global__ void PrepareCandidateLogitsKernel(const float* logits, float* scores,
+                                             std::uint32_t* ids,
+                                             std::size_t size) {
+  const std::size_t i =
+      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i < size) {
+    scores[i] = isfinite(logits[i]) ? logits[i] : -INFINITY;
+    ids[i] = static_cast<std::uint32_t>(i);
+  }
 }
 
 __global__ void ApplySparsePenaltiesKernel(
@@ -284,14 +306,11 @@ __global__ void SortedSamplingKernel(
 }
 
 __global__ void LinearSpeculativeSamplingKernel(
-    const float* __restrict__ logits,
-    std::uint32_t* __restrict__ out_token,
+    const float* __restrict__ logits, std::uint32_t* __restrict__ out_token,
     std::uint32_t* __restrict__ out_accepted, std::size_t vocab_size,
     float temperature, float min_p, std::uint32_t draft_token,
     float draft_token_probability,
-    const std::uint32_t* __restrict__ draft_candidate_ids,
-    const float* __restrict__ draft_candidate_probabilities,
-    std::size_t draft_candidate_count, float acceptance_uniform,
+    const float* __restrict__ draft_probabilities, float acceptance_uniform,
     float residual_uniform) {
   const std::size_t tid = threadIdx.x;
   const std::size_t begin = (vocab_size * tid) / blockDim.x;
@@ -373,9 +392,7 @@ __global__ void LinearSpeculativeSamplingKernel(
     }
     const float target_weight =
         expf((value - maximum) * inverse_temperature);
-    const float draft_probability = SparseDraftProbability(
-        static_cast<std::uint32_t>(index), draft_candidate_ids,
-        draft_candidate_probabilities, draft_candidate_count);
+    const float draft_probability = draft_probabilities[index];
     local_sum += fmaxf(target_weight - draft_probability * target_total, 0.0F);
   }
   segment_sums[tid] = local_sum;
@@ -441,9 +458,7 @@ __global__ void LinearSpeculativeSamplingKernel(
           expf((value - maximum) * inverse_temperature);
       float weight = target_weight;
       if (use_residual) {
-        const float draft_probability = SparseDraftProbability(
-            static_cast<std::uint32_t>(index), draft_candidate_ids,
-            draft_candidate_probabilities, draft_candidate_count);
+        const float draft_probability = draft_probabilities[index];
         weight =
             fmaxf(target_weight - draft_probability * target_total, 0.0F);
       }
@@ -468,9 +483,7 @@ __global__ void SortedSpeculativeSamplingKernel(
     float temperature, std::int32_t top_k, float top_p, float min_p,
     std::size_t min_keep, std::uint32_t draft_token,
     float draft_token_probability,
-    const std::uint32_t* __restrict__ draft_candidate_ids,
-    const float* __restrict__ draft_candidate_probabilities,
-    std::size_t draft_candidate_count, float acceptance_uniform,
+    const float* __restrict__ draft_probabilities, float acceptance_uniform,
     float residual_uniform) {
   const std::size_t tid = threadIdx.x;
   const std::size_t minimum = min(vocab_size, max(min_keep, std::size_t{1}));
@@ -596,9 +609,8 @@ __global__ void SortedSpeculativeSamplingKernel(
   for (std::size_t index = sample_begin; index < sample_end; ++index) {
     const float target_weight =
         expf((sorted_logits[index] - maximum) * inverse_temperature);
-    const float draft_probability = SparseDraftProbability(
-        sorted_token_ids[index], draft_candidate_ids,
-        draft_candidate_probabilities, draft_candidate_count);
+    const float draft_probability =
+        draft_probabilities[sorted_token_ids[index]];
     local_sum += fmaxf(target_weight - draft_probability * target_total, 0.0F);
   }
   segment_sums[tid] = local_sum;
@@ -656,9 +668,8 @@ __global__ void SortedSpeculativeSamplingKernel(
           expf((sorted_logits[index] - maximum) * inverse_temperature);
       float weight = target_weight;
       if (use_residual) {
-        const float draft_probability = SparseDraftProbability(
-            sorted_token_ids[index], draft_candidate_ids,
-            draft_candidate_probabilities, draft_candidate_count);
+        const float draft_probability =
+            draft_probabilities[sorted_token_ids[index]];
         weight =
             fmaxf(target_weight - draft_probability * target_total, 0.0F);
       }
@@ -887,6 +898,23 @@ void FreeGpuSamplingWorkspace(GpuSamplingWorkspace* workspace) noexcept {
   workspace->penalty_capacity = 0;
 }
 
+void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
+                         hipStream_t stream) {
+  if (logits == nullptr || workspace == nullptr || workspace->vocab_size == 0) {
+    throw std::invalid_argument("invalid GPU candidate sort");
+  }
+  const auto size = workspace->vocab_size;
+  PrepareCandidateLogitsKernel<<<
+      static_cast<unsigned>((size + kSamplingThreads - 1) / kSamplingThreads),
+      kSamplingThreads, 0, stream>>>(logits, workspace->adjusted_logits,
+                                     workspace->token_ids, size);
+  HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
+      workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
+      workspace->adjusted_logits, workspace->sorted_logits,
+      workspace->token_ids, workspace->sorted_token_ids, size, 0,
+      static_cast<int>(sizeof(float) * 8U), stream));
+}
+
 void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
                        std::size_t vocab_size,
                        const GpuSamplingParameters& parameters,
@@ -1019,28 +1047,39 @@ void LaunchGPUSpeculativeSampling(
         parameters.presence_penalty);
   }
 
+  if (needs_ordering) {
+    HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
+        workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
+        workspace->adjusted_logits, workspace->sorted_logits,
+        workspace->token_ids, workspace->sorted_token_ids, vocab_size, 0,
+        static_cast<int>(sizeof(float) * 8U), stream));
+  }
+  // The unsorted token IDs are dead after sorting. Reuse that buffer for q;
+  // residual evaluation then makes one lookup per vocabulary token.
+  auto* draft_probabilities = reinterpret_cast<float*>(workspace->token_ids);
+  HIP_CHECK(hipMemsetAsync(draft_probabilities, 0, vocab_size * sizeof(float),
+                           stream));
+  ScatterDraftProbabilitiesKernel<<<
+      static_cast<unsigned>((draft_candidate_count + kSamplingThreads - 1) /
+                            kSamplingThreads),
+      kSamplingThreads, 0, stream>>>(
+      workspace->draft_candidate_ids, workspace->draft_candidate_probabilities,
+      draft_candidate_count, draft_probabilities, vocab_size);
   if (!needs_ordering) {
     LinearSpeculativeSamplingKernel<<<1, kSamplingThreads, 0, stream>>>(
         sampling_logits, out_token, out_accepted, vocab_size,
         parameters.temperature, parameters.min_p, draft_token,
-        draft_token_probability, workspace->draft_candidate_ids,
-        workspace->draft_candidate_probabilities, draft_candidate_count,
-        acceptance_uniform, residual_uniform);
+        draft_token_probability, draft_probabilities, acceptance_uniform,
+        residual_uniform);
     return;
   }
 
-  HIP_CHECK(hipcub::DeviceRadixSort::SortPairsDescending(
-      workspace->sort_temp_storage, workspace->sort_temp_storage_bytes,
-      workspace->adjusted_logits, workspace->sorted_logits,
-      workspace->token_ids, workspace->sorted_token_ids, vocab_size, 0,
-      static_cast<int>(sizeof(float) * 8U), stream));
   SortedSpeculativeSamplingKernel<<<1, kSamplingThreads, 0, stream>>>(
       workspace->sorted_logits, workspace->sorted_token_ids, out_token,
       out_accepted, vocab_size, parameters.temperature, parameters.top_k,
       parameters.top_p, parameters.min_p, parameters.min_keep, draft_token,
-      draft_token_probability, workspace->draft_candidate_ids,
-      workspace->draft_candidate_probabilities, draft_candidate_count,
-      acceptance_uniform, residual_uniform);
+      draft_token_probability, draft_probabilities, acceptance_uniform,
+      residual_uniform);
 }
 
 }  // namespace gufo::hip
