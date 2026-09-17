@@ -53,7 +53,33 @@ The same corpus was replayed through the HTTP serving harness ([`tools/serving/g
 
 The reference outputs are Gufo AR at C=1. "llama.cpp exact" counts requests whose completion hash matched that reference. The ratio columns divide aggregate rates over all requests (DFlash2 over Gufo AR, Gufo AR over llama.cpp), so the llama.cpp ratio at C>1 compares throughput on outputs that mostly differ from the greedy reference; read it together with the exact column. Every Gufo AR and Gufo DFlash2 completion at every level matched the reference byte for byte. Acceptance is accepted draft tokens over proposed draft tokens across the level.
 
-Servers: `gufo serve --sessions 8 llm --context 4096 --think off` with `Qwen3.8-27B-UD-Q4_K_XL` (DFlash2 run adds `--speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M --draft-policy adaptive --draft-tokens 7`); `llama-server` `7d56da7` (nixpkgs `llama-cpp-10063`) with the same GGUF, `-ngl 999 -np 8 -c 32768 -fa on --cache-reuse 0 --jinja --reasoning off`, and `cache_prompt=false` on every request. One server process per column for the whole sweep. Gufo's in-memory continuation cache cannot be disabled, so repeated prompts across waves reuse their prefill there; the prompts are 30-200 tokens, so this changes wave time by well under 1%.
+One server process per column for the whole sweep, started as follows (`$Q4` is `Qwen3.8-27B-UD-Q4_K_XL.gguf`, `$DRAFT` is `Qwen3.8-27B-DFlash2-Q4_K_M.gguf`; llama-server is `7d56da7`, nixpkgs `llama-cpp-10063`, same GGUF):
+
+```sh
+# Gufo AR
+gufo serve --host 127.0.0.1 --port 8081 --sessions 8 llm \
+  --model $Q4 --context 4096 --think off --speculative off
+
+# Gufo DFlash2
+gufo serve --host 127.0.0.1 --port 8081 --sessions 8 llm \
+  --model $Q4 --context 4096 --think off \
+  --speculative dflash2 --dflash-model $DRAFT
+
+# llama.cpp
+llama-server -m $Q4 --host 127.0.0.1 --port 8092 -ngl 999 -np 8 -c 32768 \
+  -fa on --cache-reuse 0 --jinja --reasoning off --alias Qwen3.8-27B
+```
+
+Each column is two harness invocations (mixed group with `--exclude-category repetitive`, repetition group with `--category repetitive`); llama.cpp adds `--endpoint-profile openai` and both later columns pass `--reference-report` pointing at the Gufo AR artifact:
+
+```sh
+python3 tools/serving/gufo-serving-bench.py --base-url http://127.0.0.1:8081 \
+  --suite benchmarks/qwen3.8-27b/speculative-corpus.json --exclude-category repetitive \
+  --concurrency 1,2,4,6,8 --warmup 1 --repetitions 3 --max-tokens 128 --temperature 0 \
+  --no-cache-prompt --output benchmarks/qwen3.8-27b/serving/gufo-ar-mixed.json
+```
+
+`--no-cache-prompt` sends `cache_prompt=false` on every request so llama-server does not reuse prompts across waves. Gufo's in-memory continuation cache cannot be disabled, so repeated prompts across waves reuse their prefill there; the prompts are 30-200 tokens, so this changes wave time by well under 1%. The table itself is rendered from the artifacts by `tools/serving/concurrency-table.py`.
 
 | Concurrency |       Gufo AR |  Gufo DFlash2 | DFlash2 acceptance | DFlash2 / Gufo AR |  llama.cpp AR | llama.cpp exact | Gufo AR / llama.cpp |
 | ----------: | ------------: | ------------: | -----------------: | ----------------: | ------------: | --------------: | ------------------: |
