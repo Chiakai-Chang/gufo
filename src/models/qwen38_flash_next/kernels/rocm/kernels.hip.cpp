@@ -4722,6 +4722,11 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
     if (m == 10240 && k == 320 && batch >= 1024) {
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2, 8>), grid,
                          dim3(kThreads), 0, stream, w, x, out, batch, m, k);
+    } else if (m == 16384 && k == 2560 && batch >= 1024) {
+      // Two K blocks per stage reduce barriers on the wide SSM projection.
+      // The matrix products retain the same accumulation order.
+      hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 4, 2>), grid,
+                         dim3(kThreads), 0, stream, w, x, out, batch, m, k);
     } else {
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2>), grid,
                          dim3(kThreads), 0, stream, w, x, out, batch, m, k);

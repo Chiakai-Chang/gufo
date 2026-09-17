@@ -18,18 +18,18 @@ and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1373.01 | 1387.23 |
-| 4096 | TODO | 1277.06 |
+| 0 | 1378.16 | 1408.69 |
+| 4096 | TODO | 1297.42 |
 | 16384 | TODO | TODO |
 | 32768 | TODO | TODO |
-| 131072 | 1225.96 | TODO |
+| 131072 | 1226.09 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.13 | 42.37 | 71.0% |
-| Greedy | 4096 | 25.25 | 36.28 | 63.7% |
-| Temperature 0.7 | 0 | TODO | 36.88 | 65.5% |
-| Temperature 0.7 | 4096 | TODO | 49.57 | 93.0% |
+| Greedy | 0 | 26.13 | 42.68 | 71.0% |
+| Greedy | 4096 | 25.25 | 36.33 | 63.7% |
+| Temperature 0.7 | 0 | 25.57 | 36.88 | 65.5% |
+| Temperature 0.7 | 4096 | 24.70 | 49.57 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
@@ -37,7 +37,7 @@ Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
 AR PP uses one 133,121-token context limit throughout; AR TG uses 4,225
 and MTP PP/greedy TG use 6,145 (sampled TG: 4,225).
-AR PP loses 10.7% from d0 to d128K. Near-flat throughput across that range
+AR PP loses 11.0% from d0 to d128K. Near-flat throughput across that range
 remains TODO. Sparse attention and selection are the main depth-dependent
 costs. Fresh-load performance variation remains under investigation.
 
