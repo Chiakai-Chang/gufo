@@ -2457,7 +2457,6 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   __shared__ __half kv_lds[kKvLdsHalves];
   __shared__ float s_lds[2][kSTiles][16][16];
   __shared__ __half p_lds[kRows][kKeys];
-  __shared__ float row_max[kRows];
   __shared__ float row_sum[kRows];
   __shared__ float row_scale[kRows];
 
@@ -2491,10 +2490,11 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 
   // This wave owns dim tiles `wave` and `wave + 8` for every row block.
   v8f o_acc[kRowBlocks][2] = {};
-  for (std::uint32_t r = tid; r < kRows; r += 256) {
-    row_max[r] = -INFINITY;
-    row_sum[r] = 0.0F;
-  }
+  // The same four threads own each softmax row throughout the key sweep.
+  // Keep its running statistics in registers; only the final denominator
+  // and each tile's rescale factor need to cross waves.
+  float running_max = -INFINITY;
+  float running_sum = 0.0F;
 
   const std::uint32_t context_end = start_pos + n_tokens;
   const std::uint32_t max_visible =
@@ -2781,7 +2781,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
           part_max = fmaxf(part_max, __shfl_xor(part_max, off));
         }
-        const float prev_max = row_max[rg];
+        const float prev_max = running_max;
         const float next_max = fmaxf(prev_max, part_max);
         const float prior_scale =
             isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
@@ -2796,9 +2796,9 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
           part_sum += __shfl_xor(part_sum, off);
         }
+        running_max = next_max;
+        running_sum = (running_sum * prior_scale) + part_sum;
         if (seg == 0) {
-          row_max[rg] = next_max;
-          row_sum[rg] = (row_sum[rg] * prior_scale) + part_sum;
           row_scale[rg] = prior_scale;
         }
       }
@@ -2853,6 +2853,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     }
     cur = pre;
   }
+  if (tid < kRows * kSoftmaxLanes && tid % kSoftmaxLanes == 0)
+    row_sum[tid / kSoftmaxLanes] = running_sum;
   __syncthreads();
 
   // --- epilogue: normalize and apply the sigmoid output gate ---

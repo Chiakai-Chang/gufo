@@ -18,18 +18,18 @@ and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1350.23 | 1381.60 |
-| 4096 | TODO | 1268.27 |
+| 0 | 1352.29 | 1378.10 |
+| 4096 | TODO | 1267.15 |
 | 16384 | TODO | TODO |
 | 32768 | TODO | TODO |
-| 131072 | 1195.10 | TODO |
+| 131072 | 1202.12 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 25.42 | 42.22 | 71.0% |
-| Greedy | 4096 | 24.52 | 35.97 | 63.7% |
-| Temperature 0.7 | 0 | TODO | 36.62 | 65.5% |
-| Temperature 0.7 | 4096 | TODO | 49.26 | 93.0% |
+| Greedy | 0 | 25.86 | 42.27 | 71.0% |
+| Greedy | 4096 | 24.91 | 35.96 | 63.7% |
+| Temperature 0.7 | 0 | TODO | 36.53 | 65.5% |
+| Temperature 0.7 | 4096 | TODO | 49.13 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
@@ -37,7 +37,7 @@ Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
 AR PP uses one 133,121-token context limit throughout; AR TG uses 4,225
 and MTP PP/greedy TG use 6,145 (sampled TG: 4,225).
-AR PP loses 11.5% from d0 to d128K. Near-flat throughput across that range
+AR PP loses 11.1% from d0 to d128K. Near-flat throughput across that range
 remains TODO. Sparse attention and selection are the main depth-dependent
 costs. Fresh-load performance variation remains under investigation.
 
@@ -104,6 +104,7 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
   Paired Q4_K/Q5_K expert projections require exact numerical agreement with
   separate projections, including ragged rows and distinct gate/up tile widths.
   Paired vectors must match separate projections over distinct weights.
+  Fused expert decode must also match the separate GPU SwiGLU exactly.
   Routed vector tests cover
   inactive experts, nonfinite outputs, overwrite guards and batch grouping
   across all four quantized formats.

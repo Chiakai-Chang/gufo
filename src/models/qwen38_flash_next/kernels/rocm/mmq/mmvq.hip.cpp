@@ -67,42 +67,48 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type) {
     }
 }
 
-template <ggml_type type, int c_rows_per_block>
-__launch_bounds__(mmvq_moe_max_batch(type) * 32, 1)
-static __global__ void mul_mat_vec_q_moe(
-        const void * __restrict__ vx, const void * __restrict__ vy, const int32_t * __restrict__ ids,
-        float * __restrict__ dst,
-        const uint32_t ncols_x, const uint32_t nrows_x,
-        const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
-        const uint32_t stride_channel_x, const uint32_t stride_channel_dst,
-        const uint32_t ncols_dst, const uint32_t ids_stride) {
+template<ggml_type type, int c_rows_per_block, bool gated = false>
+__launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
+                  1) static __global__
+    void mul_mat_vec_q_moe(const void* __restrict__ weights,
+                           const void* __restrict__ vy,
+                           const int32_t* __restrict__ ids,
+                           float* __restrict__ dst, const uint32_t ncols_x,
+                           const uint32_t nrows_x, const uint32_t stride_row_x,
+                           const uint32_t stride_col_y,
+                           const uint32_t stride_col_dst,
+                           const uint32_t stride_channel_x,
+                           const uint32_t stride_channel_dst,
+                           const uint32_t ncols_dst, const uint32_t ids_stride,
+                           const void* __restrict__ up_weights = nullptr) {
+  constexpr int qk = ggml_hip_type_traits<type>::qk;
+  constexpr int qi = ggml_hip_type_traits<type>::qi;
+  constexpr int vdr = get_vdr_mmvq(type);
+  constexpr int warp_size = 32;
 
-    constexpr int qk  = ggml_hip_type_traits<type>::qk;
-    constexpr int qi  = ggml_hip_type_traits<type>::qi;
-    constexpr int vdr = get_vdr_mmvq(type);
-    constexpr int warp_size = 32;
+  constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
 
-    constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
+  const bool is_up = gated && threadIdx.y != 0;
+  const uint32_t token_idx = gated ? 0 : threadIdx.y;
+  const void* vx = is_up ? up_weights : weights;
+  const int row0 = c_rows_per_block * blockIdx.x;
+  const int blocks_per_row_x = ncols_x / qk;
+  constexpr int blocks_per_iter = vdr * warp_size / qi;
 
-    const uint32_t token_idx   = threadIdx.y;
-    const int      row0        = c_rows_per_block*blockIdx.x;
-    const int      blocks_per_row_x = ncols_x / qk;
-    constexpr int  blocks_per_iter  = vdr * warp_size / qi;
+  const uint32_t channel_dst = blockIdx.y;
 
-    const uint32_t channel_dst = blockIdx.y;
+  if (token_idx >= ncols_dst) {
+    return;
+  }
 
-    if (token_idx >= ncols_dst) {
-        return;
-    }
+  // Inactive experts still write zero to every output row. The expert ID
+  // and its validity are uniform within a wave.
+  const int32_t id_raw = ids[channel_dst + token_idx * ids_stride];
+  const bool invalid_id = id_raw < 0;
+  const uint32_t channel_x = invalid_id ? 0u : (uint32_t)id_raw;
 
-    // Inactive experts still write zero to every output row. The expert ID
-    // and its validity are uniform within a wave.
-    const int32_t  id_raw     = ids[channel_dst + token_idx * ids_stride];
-    const bool     invalid_id = id_raw < 0;
-    const uint32_t channel_x  = invalid_id ? 0u : (uint32_t)id_raw;
-
-    const block_q8_1 * y = ((const block_q8_1 *) vy) + token_idx*stride_col_y;
-    uint32_t row_offsets[c_rows_per_block];
+  const block_q8_1* y = ((const block_q8_1*)vy) + token_idx * stride_col_y;
+  uint32_t row_offsets[c_rows_per_block];
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
         // A ragged tile reads the last valid row again for its unused lane.
@@ -128,6 +134,26 @@ static __global__ void mul_mat_vec_q_moe(
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
         tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+    }
+
+    if constexpr (gated) {
+      // Separate waves preserve each projection's original dot-product
+      // grouping. Combining two accumulators in one wave lets fast-math
+      // reassociate their shared input scales.
+      __shared__ float values[2][c_rows_per_block];
+      if (threadIdx.x < c_rows_per_block) {
+        const float value = tmp[threadIdx.x];
+        values[is_up][threadIdx.x] = isfinite(value) ? value : 0.0f;
+      }
+      __syncthreads();
+      if (!is_up && threadIdx.x < c_rows_per_block &&
+          uint32_t(row0 + threadIdx.x) < nrows_x) {
+        const float g = values[0][threadIdx.x];
+        const float u = values[1][threadIdx.x];
+        dst[channel_dst * stride_channel_dst + row0 + threadIdx.x] =
+            (g * (1.0f / (1.0f + __expf(-g)))) * u;
+      }
+      return;
     }
 
     // Write results
@@ -203,6 +229,26 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
             break;
         default: GGML_ABORT("unsupported vector weight format");
     }
+}
+
+void mul_mat_vec_moe_gated_decode(const void* gate, const void* up,
+                                  ggml_type type, const block_q8_1* input,
+                                  const int32_t* ids, float* output, int k,
+                                  int rows, int experts_used, int input_stride,
+                                  hipStream_t stream) {
+  const int row_stride = k / ggml_blck_size(type);
+  const dim3 grid((rows + 1) / 2, experts_used);
+  const dim3 block(32, 2);
+  if (type == GGML_TYPE_Q4_K) {
+    mul_mat_vec_q_moe<GGML_TYPE_Q4_K, 2, true><<<grid, block, 0, stream>>>(
+        gate, input, ids, output, k, rows, row_stride, input_stride,
+        rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
+  } else {
+    GGML_ASSERT(type == GGML_TYPE_Q5_K);
+    mul_mat_vec_q_moe<GGML_TYPE_Q5_K, 2, true><<<grid, block, 0, stream>>>(
+        gate, input, ids, output, k, rows, row_stride, input_stride,
+        rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
+  }
 }
 
 }  // namespace qfn_mmq

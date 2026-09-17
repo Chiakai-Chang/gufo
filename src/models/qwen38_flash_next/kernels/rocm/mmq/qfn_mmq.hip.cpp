@@ -348,12 +348,12 @@ int qfn_mmq_moe_impl(
     return 0;
 }
 
-extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
-                               const float* X_f32, const int32_t* ids,
-                               float* out_f32, int M, int K, int n_tokens,
-                               int n_experts, int n_expert_used,
-                               hipStream_t stream, const void* W_b,
-                               float* out_b) {
+static int moe_vector_projection(int weight_type, const void* W,
+                                 const float* X_f32, const int32_t* ids,
+                                 float* out_f32, int M, int K, int n_tokens,
+                                 int n_experts, int n_expert_used,
+                                 hipStream_t stream, const void* W_b,
+                                 float* out_b, bool gated) {
   constexpr const char* tag = "qfn_mmq_moe_vec";
   const auto type = static_cast<ggml_type>(weight_type);
   if (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
@@ -362,7 +362,8 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
     return -1;
   }
 
-  if (!W || !X_f32 || !ids || !out_f32 || (bool(W_b) != bool(out_b))) {
+  if (!W || !X_f32 || !ids || !out_f32 ||
+      (gated ? !W_b : bool(W_b) != bool(out_b))) {
     fprintf(stderr, "%s: null pointer\n", tag);
     return -1;
   }
@@ -379,6 +380,11 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
   if (n_expert_used > n_experts) {
     fprintf(stderr, "%s: n_expert_used=%d > n_experts=%d\n", tag, n_expert_used,
             n_experts);
+    return -1;
+  }
+  if (gated &&
+      (n_tokens != 1 || (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K))) {
+    fprintf(stderr, "%s: gated decode requires one Q4_K/Q5_K token\n", tag);
     return -1;
   }
 
@@ -408,6 +414,18 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
   }
 
   const int input_stride = ne10_padded / QK8_1;
+  if (gated) {
+    mul_mat_vec_moe_gated_decode(
+        W, W_b, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr), ids,
+        out_f32, K, M, n_expert_used, input_stride, stream);
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "%s: gated vector launch failed: %s\n", tag,
+              hipGetErrorString(err));
+      return -3;
+    }
+    return 0;
+  }
   const int col_cap = mmvq_moe_max_batch(type);
   // Gate and up share one Q8 input. Preserve each projection's column
   // order, including the tuned per-format chunk limit.
@@ -436,6 +454,26 @@ extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
   }
 
   return 0;
+}
+
+extern "C" int qfn_mmq_moe_vec(int weight_type, const void* W,
+                               const float* X_f32, const int32_t* ids,
+                               float* out_f32, int M, int K, int n_tokens,
+                               int n_experts, int n_expert_used,
+                               hipStream_t stream, const void* W_b,
+                               float* out_b) {
+  return moe_vector_projection(weight_type, W, X_f32, ids, out_f32, M, K,
+                               n_tokens, n_experts, n_expert_used, stream, W_b,
+                               out_b, false);
+}
+
+extern "C" int qfn_mmq_moe_gated_decode(int weight_type, const void* gate,
+                                        const void* up, const float* x,
+                                        const int32_t* ids, float* out, int m,
+                                        int k, int experts, int experts_used,
+                                        hipStream_t stream) {
+  return moe_vector_projection(weight_type, gate, x, ids, out, m, k, 1, experts,
+                               experts_used, stream, up, nullptr, true);
 }
 
 extern "C" int qfn_mmq_q8_0_moe_raw(const void* W, const float* X,

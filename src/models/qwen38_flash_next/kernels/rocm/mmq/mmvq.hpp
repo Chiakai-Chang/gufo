@@ -16,3 +16,8 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              const block_q8_1* input, const int32_t* ids, float* output,
                              int k, int rows, int tokens, int experts_used,
                              int input_stride, hipStream_t stream);
+void mul_mat_vec_moe_gated_decode(const void* gate, const void* up,
+                                  ggml_type type, const block_q8_1* input,
+                                  const int32_t* ids, float* output, int k,
+                                  int rows, int experts_used, int input_stride,
+                                  hipStream_t stream);

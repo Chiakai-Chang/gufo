@@ -68,12 +68,16 @@ std::vector<T> Download(const T* device, std::size_t count) {
   return host;
 }
 
+enum class ScoreLayout { kTight, kAligned };
+
 bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
          bool zero_queries = false, std::uint32_t tied_high_blocks = 0,
-         bool sample_scores = false) {
+         bool sample_scores = false, ScoreLayout layout = ScoreLayout::kTight) {
   const std::uint32_t max_context = start_pos + n_tokens + 64;
-  const std::uint32_t max_blocks = (max_context + kRatio - 1) / kRatio;
-  const std::uint32_t mask_words = (max_blocks + 31) / 32;
+  const std::uint32_t blocks_needed = (max_context + kRatio - 1) / kRatio;
+  const std::uint32_t mask_words = (blocks_needed + 31) / 32;
+  const std::uint32_t max_blocks =
+      layout == ScoreLayout::kAligned ? mask_words * 32 : blocks_needed;
   const std::size_t q_count =
       static_cast<std::size_t>(n_tokens) * kHeads * kDim;
   // Zero queries make every score tie at zero: the budget must then fill
@@ -265,7 +269,8 @@ int main() {
     bool ok = true;
     ok = Run(100, 20000, 0x1234ABCDU) && ok;     // deep, ragged group
     ok = Run(7, 131069, 0x2468ACE0U) && ok;
-    ok = Run(129, 131069, 0xC0FFEE01U, false, 0, true) && ok;
+    ok = Run(129, 131069, 0xC0FFEE01U, false, 0, true,
+             ScoreLayout::kAligned) && ok;
     ok = Run(129, 131069, 0, true, 0, true) && ok;  // deep, partial word
     ok = Run(1, 9001, 0x0BADF00DU) && ok;        // decode
     ok = Run(40, 2040, 0xDEADBEEFU) && ok;       // straddles the budget

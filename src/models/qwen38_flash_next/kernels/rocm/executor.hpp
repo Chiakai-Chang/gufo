@@ -199,11 +199,11 @@ private:
   /// Reads the routing of the current batch back and derives the tile
   /// hints for its expert GEMMs (tiled batches only).
   bool RouteHints(std::uint32_t n_tokens, std::string* error_msg) const;
-  /// Gate and up projections over the same routing.
-  bool ExpertPair(const DeviceTensor& a, const DeviceTensor& b, const float* x,
-                  const std::int32_t* ids, float* out_a, float* out_b,
-                  std::uint32_t n_tokens, std::uint32_t n_used,
-                  std::string* error_msg) const;
+  /// Routed gate/up projections followed by SwiGLU.
+  bool GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
+                    const float* x, const std::int32_t* ids, float* out,
+                    std::uint32_t n_tokens, std::uint32_t n_used,
+                    std::string* error_msg) const;
   bool Experts(const DeviceTensor& w, const float* x, const std::int32_t* ids,
                float* out, std::uint32_t n_rows, std::uint32_t n_used,
                std::uint32_t n_tokens, std::string* error_msg) const;

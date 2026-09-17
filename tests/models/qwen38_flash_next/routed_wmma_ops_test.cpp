@@ -547,6 +547,26 @@ void CheckVectorGrouping() {
           throw std::runtime_error(
               "paired vector differs from separate projections");
       }
+      if (f < 2) {
+        // Compare the fused decode path with the original GPU SwiGLU too:
+        // inactive experts, nonfinite scales and a ragged last row must
+        // retain their exact values and output guards.
+        q::Swiglu(scalar + guard, paired_scalar + guard, used * rows, nullptr);
+        const auto gated_reference = Download(scalar, dirty.size());
+        for (int replay = 0; replay < 2; ++replay) {
+          CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
+                             hipMemcpyHostToDevice),
+                   "poison gated output");
+          if (qfn_mmq_moe_gated_decode(static_cast<int>(formats[f]), w, wb, dx,
+                                       di, batch + guard, rows, cols, experts,
+                                       used, nullptr))
+            throw std::runtime_error("gated vector launch failed");
+          const auto gated = check_output(batch, 1);
+          if (std::memcmp(gated_reference.data() + guard, gated.data() + guard,
+                          used * rows * sizeof(float)) != 0)
+            throw std::runtime_error("gated decode changed SwiGLU output");
+        }
+      }
       CheckHip(hipFree(wb), "paired weight free");
       CheckHip(hipFree(w), "grouping weight free");
     }

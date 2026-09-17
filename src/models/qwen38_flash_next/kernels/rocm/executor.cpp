@@ -240,7 +240,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       (c.context_length + c.compress_ratio - 1) / c.compress_ratio;
   e->mask_words_ = (max_blocks + 31) / 32;
   s.mask = Alloc<std::uint32_t>(a, T * e->mask_words_, error_msg);
-  s.scores = f32(static_cast<std::size_t>(e->select_chunk_) * max_blocks);
+  s.scores =
+      f32(static_cast<std::size_t>(e->select_chunk_) * e->mask_words_ * 32);
   s.ctx = f32(T * c.AttentionQDim());
   s.attn_partials = f32(static_cast<std::size_t>(kVecBatch) * c.num_heads *
                         kAttnSplits * (c.head_dim + 2));
@@ -736,38 +737,52 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
   return true;
 }
 
-bool Executor::ExpertPair(const DeviceTensor& a, const DeviceTensor& b,
-                          const float* x, const std::int32_t* ids, float* out_a,
-                          float* out_b, std::uint32_t n_tokens,
-                          std::uint32_t n_used, std::string* error_msg) const {
+bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
+                            const float* x, const std::int32_t* ids, float* out,
+                            std::uint32_t n_tokens, std::uint32_t n_used,
+                            std::string* error_msg) const {
   const bool same_shape = a.type == b.type && a.rows == b.rows &&
                           a.cols == b.cols && a.experts == b.experts;
-  if (n_tokens <= 4 * kVecBatch && same_shape) {
-    if (qfn_mmq_moe_vec(static_cast<int>(a.type), a.data, x, ids, out_a,
-                        static_cast<int>(a.rows), static_cast<int>(a.cols),
-                        static_cast<int>(n_tokens), static_cast<int>(a.experts),
-                        static_cast<int>(n_used), stream_, b.data,
-                        out_b) != 0) {
-      AssignError(error_msg, "expert vector pair GEMM failed");
+  if (n_tokens == 1 && same_shape &&
+      (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K)) {
+    if (qfn_mmq_moe_gated_decode(static_cast<int>(a.type), a.data, b.data, x,
+                                 ids, out, static_cast<int>(a.rows),
+                                 static_cast<int>(a.cols),
+                                 static_cast<int>(a.experts),
+                                 static_cast<int>(n_used), stream_) != 0) {
+      AssignError(error_msg, "gated expert decode failed");
       return false;
     }
     return true;
   }
-  // The wide Q4_K path shares its gather and tiled quantization as well.
-  if (n_tokens > 4 * kVecBatch && same_shape && a.type == GgmlType::kQ4_K) {
+  if (n_tokens <= 4 * kVecBatch && same_shape) {
+    if (qfn_mmq_moe_vec(static_cast<int>(a.type), a.data, x, ids, out,
+                        static_cast<int>(a.rows), static_cast<int>(a.cols),
+                        static_cast<int>(n_tokens), static_cast<int>(a.experts),
+                        static_cast<int>(n_used), stream_, b.data,
+                        s_.up_e) != 0) {
+      AssignError(error_msg, "expert vector pair GEMM failed");
+      return false;
+    }
+  } else if (same_shape && a.type == GgmlType::kQ4_K) {
+    // The wide Q4_K path shares its gather and tiled quantization as well.
     RoutedHints(a, n_tokens);
     if (qfn_mmq_q4_K_moe_pair_unique(
-            a.data, b.data, x, ids, out_a, out_b, static_cast<int>(a.rows),
+            a.data, b.data, x, ids, out, s_.up_e, static_cast<int>(a.rows),
             static_cast<int>(a.cols), static_cast<int>(n_tokens),
             static_cast<int>(a.experts), static_cast<int>(n_used),
             stream_) != 0) {
       AssignError(error_msg, "expert pair GEMM failed");
       return false;
     }
-    return true;
+  } else if (!Experts(a, x, ids, out, n_tokens, n_used, n_tokens, error_msg) ||
+             !Experts(b, x, ids, s_.up_e, n_tokens, n_used, n_tokens,
+                      error_msg)) {
+    return false;
   }
-  return Experts(a, x, ids, out_a, n_tokens, n_used, n_tokens, error_msg) &&
-         Experts(b, x, ids, out_b, n_tokens, n_used, n_tokens, error_msg);
+  Swiglu(out, s_.up_e, static_cast<std::size_t>(n_tokens) * n_used * a.rows,
+         stream_);
+  return true;
 }
 
 void Executor::Combine(float* res, const float* gamma,
@@ -1101,8 +1116,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
                       stream_);
-    const std::uint32_t max_blocks =
+    // Align score rows to full cache lines. The selector still considers
+    // only complete causal blocks, so padding cannot change the ranking.
+    const std::uint32_t blocks =
         (max_context + c.compress_ratio - 1) / c.compress_ratio;
+    const std::uint32_t max_blocks = (blocks + 31) / 32 * 32;
     for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += select_chunk_) {
       const std::uint32_t n = std::min(select_chunk_, n_tokens - t0);
       SelectBlocks(s_.iq_half + static_cast<std::size_t>(t0) * c.indexer_heads *
@@ -1227,12 +1245,10 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       return false;
     }
   } else {
-    if (!ExpertPair(l.ffn_gate_exps, l.ffn_up_exps, x, s_.ids, s_.gate_e,
-                    s_.up_e, n_tokens, used, error_msg)) {
+    if (!GatedExperts(l.ffn_gate_exps, l.ffn_up_exps, x, s_.ids, s_.gate_e,
+                      n_tokens, used, error_msg)) {
       return false;
     }
-    Swiglu(s_.gate_e, s_.up_e, static_cast<std::size_t>(slots) * c.expert_ff,
-           stream_);
     // The down projection sees one (token, slot) row per expert id.
     if (!Experts(l.ffn_down_exps, s_.gate_e, s_.ids, s_.down_e, slots, 1,
                  n_tokens, error_msg)) {
