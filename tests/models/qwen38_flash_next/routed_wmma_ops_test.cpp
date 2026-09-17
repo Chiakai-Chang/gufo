@@ -314,8 +314,10 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   }
   // The F16-output route (the up and down projections' rows) must match
   // the F32 output to F16 rounding.
+  constexpr std::size_t kHalfGuard = 16;
+  const __half half_guard = __float2half(123.0F);
   __half* d_f16_half =
-      Upload(std::vector<__half>(slots * m, __float2half(0.0F)));
+      Upload(std::vector<__half>(slots * m + kHalfGuard, half_guard));
   if (!q::RoutedF16Gemm(d_w, type, d_x_half, d_tiles,
                         static_cast<std::uint32_t>(tiles.size()), tile_rows,
                         d_bounds, d_rows_token, d_rows_slot, nullptr, nullptr,
@@ -349,15 +351,16 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
     }
     CheckHip(hipFree(d_narrow_tiles), "free reference tiles");
   }
-  double worst_half = 0.0;
   for (std::size_t i = 0; i < slots * m; ++i) {
-    const double a = f16[i];
-    const double b = __half2float(f16_half[i]);
-    worst_half = std::max(worst_half, std::abs(a - b) / (std::abs(a) + 1.0));
+    const __half expected = __float2half(f16[i]);
+    if (std::memcmp(&expected, &f16_half[i], sizeof(__half)) != 0) {
+      throw std::runtime_error("routed F16 output changed rounding");
+    }
   }
-  if (worst_half > 2e-3) {
-    throw std::runtime_error("routed F16-output rows disagree with F32: " +
-                             std::to_string(worst_half));
+  const auto half_tail = Download(d_f16_half + slots * m, kHalfGuard);
+  for (__half value : half_tail) {
+    if (std::memcmp(&value, &half_guard, sizeof(__half)) != 0)
+      throw std::runtime_error("routed F16 output overwrote its guard");
   }
 
   if (tile_rows == 48 &&
@@ -691,7 +694,8 @@ int main() {
     ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x5A5A0001U)) &&
          ok;
     // Q8_0 down view (five layers keep Q8_0 down projections).
-    ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U)) &&
+    ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x0C0FFEE0U,
+                64)) &&
          ok;
     // Ragged rows against the 128-row tile and a tiny batch.
     ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 200, 512, 0xDEADBEEFU)) && ok;

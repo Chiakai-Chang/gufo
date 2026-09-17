@@ -687,7 +687,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
   routed_n_tiles_ = n_tiles;
-  // Append the 64-token map for gate/up and eligible Q5_1 down projections.
+  // Append the 64-token map for gate/up and eligible down projections.
   // Wide expert buckets also get a 128-token gate/up map: it amortizes
   // weight decoding, while short buckets retain the cheaper 64-token tile.
   if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
@@ -1288,11 +1288,12 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
                                      ? WeightType::kQ8_0
                                      : WeightType::kQ5_1;
-    // Larger Q5_1 tiles amortize weight decoding. Use them only when the
-    // existing 64-token map has no more padded rows than the 48-token map.
-    const bool wide_down = down_type == WeightType::kQ5_1 &&
-                           routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
-                           routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
+    // Larger down tiles amortize weight decoding. Reuse the 64-token map
+    // when it has no more padded rows than the 48-token map.
+    const bool wide_down =
+        (down_type == WeightType::kQ5_1 || down_type == WeightType::kQ8_0) &&
+        routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
+        routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
     if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,

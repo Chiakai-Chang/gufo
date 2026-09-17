@@ -3797,15 +3797,15 @@ __launch_bounds__(256) __global__
       }
 #pragma unroll
       for (int j = 0; j < kTokTiles; ++j) {
-        if constexpr (kPair) {
+        if constexpr (kPair || ((kQ5 || kQ8) && BN >= 48)) {
           // Keep one token tile's LDS fragments live at a time. Hoisting
           // all eight tiles spills registers and defeats the wider tile's
           // reuse of each weight decode. This is a compiler barrier only.
           asm volatile("" ::: "memory");
         }
-        // Paired gate/up is compute-bound. A short expert bucket has no
-        // output in the remaining token tiles, so omit their WMMA work.
-        if constexpr (kPair && kTokTiles > 1) {
+        // A short expert bucket has no output in the remaining token
+        // tiles, so omit their WMMA work.
+        if constexpr ((kPair || ((kQ5 || kQ8) && BN >= 48)) && kTokTiles > 1) {
           if (j >= live_tok_tiles)
             continue;
         }
@@ -3879,6 +3879,56 @@ __launch_bounds__(256) __global__
     return;
   }
 
+  // One wave writes a complete 128-byte line of F16 output. Padding the
+  // shared row by two floats also makes the accumulator scatter conflict-free.
+  // Narrow buckets keep the lighter wave-local epilogue below.
+  if constexpr (BN >= 48) {
+    static_assert(kLdsBytes >= 16 * (BM + 2) * sizeof(float));
+    if (out_half != nullptr) {
+      constexpr unsigned stride = BM + 2;
+      float* scratch = reinterpret_cast<float*>(lds);
+#pragma unroll
+      for (int j = 0; j < kTokTiles; ++j) {
+#pragma unroll
+        for (int u = 0; u < kWaveRowTiles; ++u) {
+#pragma unroll
+          for (int l = 0; l < 8; ++l)
+            scratch[sub_lane * stride + wave_id * 16 + u * 128 + 2 * l +
+                    half_id] = acc[u][j][l];
+        }
+        __syncthreads();
+#pragma unroll
+        for (int round = 0; round < 16 * BM / (256 * 2); ++round) {
+          const unsigned flat = (round * 256 + tid) * 2;
+          const unsigned tr = flat / BM, row = flat % BM;
+          const unsigned t = t_local + j * 16 + tr, r = r_block + row;
+          if (t < unsigned(bucket_rows) && r < m) {
+            const int dst = rows_out[bucket_begin + t];
+            if (dst >= 0) {
+              float2 v =
+                  *reinterpret_cast<const float2*>(scratch + tr * stride + row);
+              const size_t o = size_t(dst) * m + r;
+              if (swiglu_gate != nullptr) {
+                v.x *= SiluF(swiglu_gate[o]);
+                if (r + 1 < m)
+                  v.y *= SiluF(swiglu_gate[o + 1]);
+              }
+              if (m % 2 == 0 && r + 1 < m)
+                *reinterpret_cast<__half2*>(out_half + o) =
+                    __floats2half2_rn(v.x, v.y);
+              else {
+                out_half[o] = __float2half(v.x);
+                if (r + 1 < m)
+                  out_half[o + 1] = __float2half(v.y);
+              }
+            }
+          }
+        }
+        __syncthreads();
+      }
+      return;
+    }
+  }
   // Transpose each 16x16 tile through LDS, then scatter the 16 rows of each
   // token to its output row.
   float* tile_scratch = reinterpret_cast<float*>(lds) + (wave_id * 256);
@@ -4235,11 +4285,15 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
   const dim3 grid(static_cast<unsigned int>((m + kBM - 1) / kBM), n_tiles);
   switch (type) {
     case WeightType::kQ4_K:
-      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ4_K, kBM, BN, kBK>),
-                         grid, dim3(kThreads), 0, stream, w, x, tiles,
-                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
-                         out_half, m, k, nullptr);
-      return true;
+      if constexpr (BN > 48) {
+        return false;
+      } else {
+        hipLaunchKernelGGL(
+            (RoutedF16GEMMKernel<WeightType::kQ4_K, kBM, BN, kBK>), grid,
+            dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
+            rows_out, swiglu_gate, out, out_half, m, k, nullptr);
+        return true;
+      }
     case WeightType::kQ5_1:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_1, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
@@ -4253,11 +4307,15 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
                          out_half, m, k, nullptr);
       return true;
     case WeightType::kQ5_K:
-      hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK>),
-                         grid, dim3(kThreads), 0, stream, w, x, tiles,
-                         pad_bounds, rows_in, rows_out, swiglu_gate, out,
-                         out_half, m, k, nullptr);
-      return true;
+      if constexpr (BN > 48) {
+        return false;
+      } else {
+        hipLaunchKernelGGL(
+            (RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK>), grid,
+            dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in,
+            rows_out, swiglu_gate, out, out_half, m, k, nullptr);
+        return true;
+      }
     default:
       return false;
   }
@@ -4285,15 +4343,9 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
     case 64:
-      if (type != WeightType::kQ5_1) {
-        return false;
-      }
-      hipLaunchKernelGGL(
-          (RoutedF16GEMMKernel<WeightType::kQ5_1, 128, 64, 2>),
-          dim3(static_cast<unsigned int>((m + 127) / 128), n_tiles),
-          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
-          swiglu_gate, out, out_half, m, k, nullptr);
-      return true;
+      return LaunchRoutedF16<64>(w, type, x, tiles, n_tiles, pad_bounds,
+                                 rows_in, rows_out, swiglu_gate, out, out_half,
+                                 m, k, stream);
     default:
       return false;
   }
