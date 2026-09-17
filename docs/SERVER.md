@@ -119,9 +119,14 @@ These measured defaults are model-owned. See the
 
 Qwen3.8-Flash-Next (`general.architecture = qwen4exp`) serves through the
 same runner interface with one session per request state. Its recurrent
-state cannot be rewound, so the runner keeps no continuation snapshots or
-forks: an exact retained prefix is reused in place (the session extends it),
-anything else restarts the session, and `--cache-disk` is refused. Sampling
+state cannot be rewound, so continuation reuse works through snapshots: at
+the end of prefill the runner copies the session (recurrent and PLE state,
+KV and indexer rows up to the prompt, the draft block's caches) into host
+memory, keyed on the prompt tokens. A later prompt that extends a retained
+prompt restores that copy into a free session and prefills only the tail;
+the retained set is bounded by half of the host memory free at load, and
+`--cache-disk` adds the restart-safe tier with the same payload. A prompt
+that matches no retained prefix restarts from token zero. Sampling
 runs server-side over the session logits, so every sampling flag applies;
 the artifact's pinned Qwen3.8 reasoning template drives the reasoning
 controls below. `--speculative mtp --mtp-model <mtp-...-shared-*.gguf>`

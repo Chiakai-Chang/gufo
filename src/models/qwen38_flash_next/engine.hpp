@@ -39,6 +39,7 @@ struct ModelOptions {
 };
 
 class Session;
+class SessionSnapshot;
 
 /// Gufo-owned API over the ROCm runtime: one resident model, any number of
 /// sessions, executed one at a time.
@@ -137,11 +138,28 @@ public:
     return stats_;
   }
 
+  /// Layout version of the snapshot payload; bump on any format change.
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 1;
+  /// Bytes a snapshot of the current context occupies.
+  [[nodiscard]] std::uint64_t SnapshotBytes() const;
+  /// Captures the whole context (tokens, device caches and recurrent
+  /// state, draft-block state, last logits) into host memory. The
+  /// speculative acceptance history restarts on restore.
+  [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
+      std::string* error_msg = nullptr) const;
+  /// Replaces this session's context with a snapshot of the same model.
+  [[nodiscard]] bool RestoreSnapshot(const SessionSnapshot& snapshot,
+                                     std::string* error_msg = nullptr);
+  [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
+                                     std::string* error_msg = nullptr);
+
 private:
   friend class Model;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg);
+  /// Trunk rows the draft block may still read: [hidden_base_, size).
+  [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg);
 
@@ -154,6 +172,31 @@ private:
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   SpeculativeStats stats_;
+};
+
+/// Immutable host copy of a session context. The same bytes restore in
+/// memory and persist to disk.
+class SessionSnapshot final {
+public:
+  ~SessionSnapshot() = default;
+  SessionSnapshot(const SessionSnapshot&) = delete;
+  SessionSnapshot& operator=(const SessionSnapshot&) = delete;
+  SessionSnapshot(SessionSnapshot&&) = delete;
+  SessionSnapshot& operator=(SessionSnapshot&&) = delete;
+
+  [[nodiscard]] std::uint64_t SizeBytes() const noexcept { return size_; }
+  [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept {
+    return {data_.get(), size_};
+  }
+  [[nodiscard]] bool CopyTo(std::span<std::uint8_t> destination) const noexcept;
+
+private:
+  explicit SessionSnapshot(std::uint64_t size);
+
+  std::unique_ptr<std::uint8_t[]> data_;
+  std::uint64_t size_{0};
+
+  friend class Session;
 };
 
 }  // namespace gufo::models::qwen38_flash_next

@@ -1,7 +1,10 @@
 #include "src/models/qwen38_flash_next/engine.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstring>
 #include <limits>
+#include <type_traits>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
@@ -21,6 +24,28 @@ void AssignError(std::string* error_msg, std::string_view message) {
   if (error_msg != nullptr) {
     *error_msg = message;
   }
+}
+
+constexpr std::array<char, 8> kSessionSnapshotMagic{'Q', 'F', 'N', 'S',
+                                                    'E', 'S', 'S', '1'};
+
+/// Host-side session fields ahead of the executor payload: the token
+/// history and the logits of the last token.
+struct SessionSnapshotHeader {
+  std::array<char, 8> magic;
+  std::uint32_t version;
+  std::uint32_t vocab_size;
+  std::uint32_t token_count;
+  std::uint32_t hidden_rows;
+  std::uint64_t executor_bytes;
+};
+static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
+
+std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
+                                       std::uint32_t vocab_size) {
+  return sizeof(SessionSnapshotHeader) +
+         std::uint64_t{token_count} * sizeof(std::int32_t) +
+         std::uint64_t{vocab_size} * sizeof(float);
 }
 
 }  // namespace
@@ -197,6 +222,127 @@ void Session::Reset() {
   hidden_base_ = 0;
   draft_length_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
+}
+
+std::uint32_t Session::KeptHiddenRows() const noexcept {
+  return model_->HasMtp()
+             ? static_cast<std::uint32_t>(tokens_.size() - hidden_base_)
+             : 0;
+}
+
+std::uint64_t Session::SnapshotBytes() const {
+  return SessionSnapshotHostBytes(static_cast<std::uint32_t>(tokens_.size()),
+                                  model_->VocabSize()) +
+         model_->executor_->SnapshotBytes(*session_, KeptHiddenRows());
+}
+
+std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
+    std::string* error_msg) const {
+  if (tokens_.empty() || tokens_.size() != session_->position() ||
+      tokens_.size() > std::numeric_limits<std::uint32_t>::max()) {
+    AssignError(error_msg, "snapshot needs a synced, non-empty context");
+    return nullptr;
+  }
+  const auto token_count = static_cast<std::uint32_t>(tokens_.size());
+  const std::uint32_t hidden_rows = KeptHiddenRows();
+  const std::uint64_t executor_bytes =
+      model_->executor_->SnapshotBytes(*session_, hidden_rows);
+  const std::uint64_t host_bytes =
+      SessionSnapshotHostBytes(token_count, model_->VocabSize());
+  std::unique_ptr<SessionSnapshot> snapshot(
+      new SessionSnapshot(host_bytes + executor_bytes));
+  std::uint8_t* out = snapshot->data_.get();
+  const SessionSnapshotHeader header{
+      .magic = kSessionSnapshotMagic,
+      .version = kSnapshotPayloadVersion,
+      .vocab_size = model_->VocabSize(),
+      .token_count = token_count,
+      .hidden_rows = hidden_rows,
+      .executor_bytes = executor_bytes,
+  };
+  std::memcpy(out, &header, sizeof(header));
+  out += sizeof(header);
+  std::memcpy(out, tokens_.data(), tokens_.size() * sizeof(std::int32_t));
+  out += tokens_.size() * sizeof(std::int32_t);
+  std::memcpy(out, logits_.data(), logits_.size() * sizeof(float));
+  out += logits_.size() * sizeof(float);
+  if (!model_->executor_->SaveSnapshot(
+          *session_, hidden_rows,
+          std::span<std::uint8_t>(out, static_cast<std::size_t>(executor_bytes)),
+          error_msg)) {
+    return nullptr;
+  }
+  return snapshot;
+}
+
+bool Session::RestoreSnapshot(const SessionSnapshot& snapshot,
+                              std::string* error_msg) {
+  return RestoreSnapshot(snapshot.bytes(), error_msg);
+}
+
+bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
+                              std::string* error_msg) {
+  SessionSnapshotHeader header{};
+  if (payload.size() < sizeof(header)) {
+    AssignError(error_msg, "session snapshot is truncated");
+    return false;
+  }
+  std::memcpy(&header, payload.data(), sizeof(header));
+  if (header.magic != kSessionSnapshotMagic ||
+      header.version != kSnapshotPayloadVersion) {
+    AssignError(error_msg, "session snapshot format is not supported");
+    return false;
+  }
+  if (header.vocab_size != model_->VocabSize() || header.token_count == 0 ||
+      header.token_count > ContextSize() ||
+      payload.size() != SessionSnapshotHostBytes(header.token_count,
+                                                 header.vocab_size) +
+                            header.executor_bytes) {
+    AssignError(error_msg, "session snapshot does not fit this session");
+    return false;
+  }
+  const std::uint8_t* in = payload.data() + sizeof(header);
+  std::vector<std::int32_t> tokens(header.token_count);
+  std::memcpy(tokens.data(), in, tokens.size() * sizeof(std::int32_t));
+  in += tokens.size() * sizeof(std::int32_t);
+  std::vector<float> logits(header.vocab_size);
+  std::memcpy(logits.data(), in, logits.size() * sizeof(float));
+  in += logits.size() * sizeof(float);
+
+  rocm::Executor::SnapshotInfo info;
+  if (!model_->executor_->RestoreSnapshot(
+          *session_,
+          std::span<const std::uint8_t>(
+              in, static_cast<std::size_t>(header.executor_bytes)),
+          &info, error_msg)) {
+    Reset();
+    return false;
+  }
+  if (info.position != header.token_count ||
+      info.hidden_rows != header.hidden_rows) {
+    Reset();
+    AssignError(error_msg, "session snapshot positions are inconsistent");
+    return false;
+  }
+  tokens_ = std::move(tokens);
+  logits_ = std::move(logits);
+  hidden_base_ = info.position - info.hidden_rows;
+  draft_token_ = 0;
+  draft_length_.Reset();
+  stats_ = {};
+  return true;
+}
+
+SessionSnapshot::SessionSnapshot(std::uint64_t size)
+    : data_(new std::uint8_t[size]), size_(size) {}
+
+bool SessionSnapshot::CopyTo(
+    std::span<std::uint8_t> destination) const noexcept {
+  if (destination.size() != size_) {
+    return false;
+  }
+  std::memcpy(destination.data(), data_.get(), size_);
+  return true;
 }
 
 bool Session::DraftCatchUp(std::int32_t next_token, bool propose,

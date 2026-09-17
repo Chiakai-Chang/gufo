@@ -23,6 +23,7 @@ namespace gufo::models::qwen38_flash_next::rocm {
 
 class Executor;
 struct ArgmaxCandidate;
+struct SnapshotHeader;
 
 /// Per-sequence state on the device: recurrent SSM state, KV and indexer
 /// caches, PLE conv history, plus the host-side n-gram window. A
@@ -148,6 +149,26 @@ public:
                                 std::int32_t hidden_row, MtpOutput output,
                                 std::string* error_msg) const;
 
+  /// A session's complete context as one host byte payload: recurrent and
+  /// PLE state, KV and indexer caches up to the position, and the draft
+  /// block's caches plus the `hidden_rows` most recent kept trunk rows.
+  /// The payload restores into any session of this executor whose context
+  /// holds the position; the pending speculative batch must be empty.
+  struct SnapshotInfo {
+    std::uint32_t position{0};
+    std::uint32_t hidden_rows{0};
+  };
+  [[nodiscard]] std::uint64_t SnapshotBytes(const Session& session,
+                                            std::uint32_t hidden_rows) const;
+  [[nodiscard]] bool SaveSnapshot(const Session& session,
+                                  std::uint32_t hidden_rows,
+                                  std::span<std::uint8_t> payload,
+                                  std::string* error_msg) const;
+  [[nodiscard]] bool RestoreSnapshot(Session& session,
+                                     std::span<const std::uint8_t> payload,
+                                     SnapshotInfo* info,
+                                     std::string* error_msg) const;
+
   /// Rewinds the draft block's own context.
   void MtpRewind(Session& session, std::uint32_t position) const noexcept {
     session.mtp_.position = position;
@@ -170,6 +191,13 @@ public:
 
 private:
   Executor() = default;
+
+  /// Visits every device region of a snapshot in payload order with
+  /// (device pointer or null when sizing, payload offset, bytes, name).
+  /// Returns the payload size, or 0 once a visit failed.
+  template<typename Visit>
+  static std::uint64_t WalkSnapshot(const SnapshotHeader& h,
+                                    const Session* session, Visit&& visit);
 
   /// An activation batch quantized once for the decode GEMVs; `data` is
   /// null when the batch is wide enough for the tiled path.

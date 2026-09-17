@@ -101,14 +101,15 @@ public:
             TextDiskCacheConfig disk_cache_config = {});
 
   /// Installs a previously loaded Qwen3.8-Flash-Next model with
-  /// request-owned sessions and the model's tokenizer. No continuation
-  /// snapshots.
+  /// request-owned sessions, the model's tokenizer, and host-memory
+  /// continuation snapshots.
   bool load(std::shared_ptr<models::qwen38_flash_next::Model> model,
             std::string* error, std::uint32_t max_context = 4096,
             std::size_t session_count = 1,
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
-            TextSpeculativeConfig speculative_config = {});
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {});
 #endif
 
   /// Stable model identifier used in API responses.

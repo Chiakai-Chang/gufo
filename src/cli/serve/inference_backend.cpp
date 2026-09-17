@@ -16,6 +16,8 @@
 #include <type_traits>
 #include <utility>
 
+#include <unistd.h>
+
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
@@ -114,6 +116,44 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
            << support_fingerprint << '\n'
            << "max_draft_tokens=" << max_draft_tokens << '\n'
            << "draft_policy=dspark-cost-v5-window128\n";
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
+std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
+    bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "Qwen3.8-Flash-Next disk cache requires an artifact fingerprint");
+  }
+  if (has_mtp && !IsSha256Hex(mtp_fingerprint)) {
+    throw std::invalid_argument(
+        "Qwen3.8-Flash-Next MTP disk cache requires a draft artifact "
+        "fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=qwen38-flash-next\n"
+           << "artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact\n"
+           << "chat_template=qwen38-reasoning-compiled-v2\n"
+           << "chat_template_reference_sha256="
+           << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
+           << "state_abi=qwen38-flash-next-rocm-session-v1\n"
+           << "payload_layout=qfn-rocm-session-snapshot-v"
+           << models::qwen38_flash_next::Session::kSnapshotPayloadVersion
+           << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "adapters=none\n";
+  if (has_mtp) {
+    identity << "draft_backend=qfn-mtp-v1\n"
+             << "draft_artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+             << mtp_fingerprint << '\n'
+             << "draft_max_tokens=" << max_draft_tokens << '\n';
+  }
   const std::string canonical = identity.str();
   return {canonical.begin(), canonical.end()};
 }
@@ -1977,6 +2017,43 @@ private:
   std::size_t position_{0};
 };
 
+class QwenFlashNextTextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  QwenFlashNextTextRunnerSnapshot(
+      std::shared_ptr<QwenFlashNextModel> model,
+      std::unique_ptr<models::qwen38_flash_next::SessionSnapshot> snapshot,
+      std::size_t position)
+      : model(std::move(model)),
+        snapshot(std::move(snapshot)),
+        position(position) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    if (snapshot == nullptr ||
+        snapshot->SizeBytes() > static_cast<std::uint64_t>(
+                                    std::numeric_limits<std::size_t>::max())) {
+      return 0;
+    }
+    return static_cast<std::size_t>(snapshot->SizeBytes());
+  }
+
+  std::shared_ptr<QwenFlashNextModel> model;
+  std::unique_ptr<models::qwen38_flash_next::SessionSnapshot> snapshot;
+  std::size_t position;
+};
+
+/// Host memory the retained snapshots of one process may occupy: half of
+/// what is free now, so the model's own page cache and request buffers
+/// keep their share.
+std::size_t HostSnapshotBudgetBytes() noexcept {
+  const long pages = sysconf(_SC_AVPHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (pages <= 0 || page_size <= 0) {
+    return 0;
+  }
+  return static_cast<std::size_t>(pages) *
+         static_cast<std::size_t>(page_size) / 2;
+}
+
 QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
     TextRunnerState& state) {
   auto* qfn = dynamic_cast<QwenFlashNextTextRunnerState*>(&state);
@@ -1999,11 +2076,23 @@ class QwenFlashNextTextRunner final : public TextModelRunner {
 public:
   QwenFlashNextTextRunner(std::shared_ptr<QwenFlashNextModel> model,
                           std::uint32_t max_context, bool use_mtp,
-                          std::uint32_t max_draft_tokens)
+                          std::uint32_t max_draft_tokens,
+                          std::string artifact_fingerprint = {},
+                          std::string mtp_fingerprint = {})
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens) {}
+        max_draft_tokens_(max_draft_tokens) {
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity = QwenFlashNextCompatibilityIdentity(
+              artifact_fingerprint, mtp_fingerprint, model_->HasMtp(),
+              max_context_, max_draft_tokens_),
+          .payload_version =
+              models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
+      };
+    }
+  }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
     return {
@@ -2013,8 +2102,8 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = true,
-                .snapshot = false,
-                .fork = false,
+                .snapshot = true,
+                .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
@@ -2022,7 +2111,7 @@ public:
                 .batched_multi_token_decode_max_width = 0,
                 .prefix_reuse = true,
             },
-        .persistence = std::nullopt,
+        .persistence = persistence_,
     };
   }
 
@@ -2033,12 +2122,13 @@ public:
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
       capacity = free_bytes;
     }
+    // Snapshots live in host memory, not in the device state pool.
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
-        .retained_snapshot_capacity_bytes = std::size_t{0},
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -2225,11 +2315,103 @@ public:
     return RequireQwenFlashNextState(state).position();
   }
 
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    const std::uint64_t bytes =
+        RequireQwenFlashNextState(state).session().SnapshotBytes();
+    if (bytes == 0 || bytes > static_cast<std::uint64_t>(
+                                  std::numeric_limits<std::size_t>::max())) {
+      throw std::overflow_error(
+          "Qwen3.8-Flash-Next snapshot size is unavailable");
+    }
+    return static_cast<std::size_t>(bytes);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& qfn = RequireQwenFlashNextState(state);
+    std::string error;
+    auto snapshot = qfn.session().SaveSnapshot(&error);
+    if (snapshot == nullptr) {
+      throw std::runtime_error("Qwen3.8-Flash-Next snapshot failed: " + error);
+    }
+    return std::make_unique<QwenFlashNextTextRunnerSnapshot>(
+        model_, std::move(snapshot), qfn.position());
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto* qfn_snapshot =
+        dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
+    if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
+        qfn_snapshot->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next snapshot does not belong to this model");
+    }
+    auto& restored = RequireQwenFlashNextState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(*qfn_snapshot->snapshot, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error("Qwen3.8-Flash-Next snapshot restore failed: " +
+                               error);
+    }
+    restored.set_position(qfn_snapshot->position);
+  }
+
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    const auto* qfn_snapshot =
+        dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
+    if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
+        qfn_snapshot->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next persistent snapshot does not belong to this "
+          "model");
+    }
+    return qfn_snapshot->PayloadBytes();
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto* qfn_snapshot =
+        dynamic_cast<const QwenFlashNextTextRunnerSnapshot*>(&snapshot);
+    if (qfn_snapshot == nullptr || qfn_snapshot->model.get() != model_.get() ||
+        qfn_snapshot->snapshot == nullptr ||
+        destination.size() != qfn_snapshot->PayloadBytes() ||
+        !qfn_snapshot->snapshot->CopyTo(destination)) {
+      throw std::invalid_argument(
+          "Qwen3.8-Flash-Next persistent snapshot serialization failed");
+    }
+    return destination.size();
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    auto& restored = RequireQwenFlashNextState(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(payload, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error(
+          "Qwen3.8-Flash-Next persistent snapshot restore failed: " + error);
+    }
+    const std::uint32_t position = restored.session().Position();
+    if (position == 0 || position > max_context_) {
+      restored.Invalidate();
+      throw std::runtime_error(
+          "Qwen3.8-Flash-Next persistent snapshot restored an invalid "
+          "position");
+    }
+    restored.set_position(position);
+  }
+
 private:
   std::shared_ptr<QwenFlashNextModel> model_;
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 #endif
 
@@ -2416,12 +2598,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "--min-draft-tokens 1");
       return false;
     }
-    if (DiskCacheEnabled(disk_cache_config)) {
-      SetError(error,
-               "Qwen3.8-Flash-Next HTTP models keep no continuation "
-               "snapshots; --cache-disk is unsupported");
-      return false;
-    }
     // The compiled Qwen3.8 chat template renders through the artifact's
     // own tokenizer (the same vocabulary and pre-tokenizer as Qwen3.8).
     if (!tokenization::QwenChatTemplate::ValidateGgufTemplate(*reader,
@@ -2447,8 +2623,24 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                "Failed to create Qwen3.8-Flash-Next model: " + load_error);
       return false;
     }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+        !FingerprintArtifact(
+            "Qwen3.8-Flash-Next", *reader,
+            &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) && model->HasMtp() &&
+        resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
+        !FingerprintArtifactFile(
+            "Qwen3.8-Flash-Next MTP", speculative_config.draft_model_path,
+            &resolved_disk_cache_config.draft_model_artifact_fingerprint,
+            error)) {
+      return false;
+    }
     return load(std::move(model), error, max_context, session_count,
-                prefill_policy, scheduler_policy, speculative_config);
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config));
   }
   auto model = hip::QwenGpuModel::CreateFromGguf(reader, &load_error);
   if (model == nullptr) {
@@ -2676,7 +2868,8 @@ bool InferenceBackend::load(
     std::shared_ptr<models::qwen38_flash_next::Model> model, std::string* error,
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
-    TextSpeculativeConfig speculative_config) {
+    TextSpeculativeConfig speculative_config,
+    TextDiskCacheConfig disk_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
     return false;
@@ -2706,15 +2899,36 @@ bool InferenceBackend::load(
              "floors are unsupported");
     return false;
   }
+  if (DiskCacheEnabled(disk_cache_config) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       (model->HasMtp() &&
+        !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) ||
+       disk_cache_config.capacity_bytes == 0 ||
+       disk_cache_config.staging_capacity_bytes == 0)) {
+    SetError(error,
+             "Qwen3.8-Flash-Next persistent disk cache configuration is "
+             "invalid");
+    return false;
+  }
   try {
     auto new_state = std::make_shared<Impl::State>();
     auto runner = std::make_shared<QwenFlashNextTextRunner>(
         std::move(model), max_context,
         speculative_config.backend == TextSpeculativeBackend::kMtp,
-        speculative_config.max_draft_tokens);
+        speculative_config.max_draft_tokens,
+        disk_cache_config.model_artifact_fingerprint,
+        disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
+    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+    if (DiskCacheEnabled(disk_cache_config)) {
+      runner_disk_cache = TextRunnerDiskCacheOptions{
+          .directory = std::move(disk_cache_config.directory),
+          .capacity_bytes = disk_cache_config.capacity_bytes,
+          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+      };
+    }
     auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::nullopt);
+        std::move(runner), session_count, std::move(runner_disk_cache));
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
         std::move(runner_pool), prefill_policy, scheduler_policy);
     {

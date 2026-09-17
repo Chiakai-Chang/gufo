@@ -1,12 +1,14 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #include "qfn_mmq.h"
@@ -1605,6 +1607,257 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
           ? 0
           : std::min(session.blocks_, session.position_ / c.compress_ratio);
   return Check(hipStreamSynchronize(stream_), "rollback", error_msg);
+}
+
+constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
+                                             'N', 'A', 'P', '1'};
+
+/// Fixed header ahead of the section bytes. It carries every geometry
+/// value the section sizes derive from, so a payload of another artifact
+/// or executor configuration is rejected before anything is copied.
+struct SnapshotHeader {
+  std::array<char, 8> magic;
+  std::uint32_t num_layers;
+  std::uint32_t full_attention_interval;
+  std::uint32_t conv_elems;
+  std::uint32_t state_elems;
+  std::uint32_t kv_row;
+  std::uint32_t indexer_head_dim;
+  std::uint32_t compress_ratio;
+  std::uint32_t hc_dim;
+  std::uint32_t ple_elems;
+  std::uint32_t has_mtp;
+  std::uint32_t position;
+  std::uint32_t blocks;
+  std::uint32_t mtp_position;
+  std::uint32_t hidden_rows;
+  std::array<std::int32_t, Config::kMaxPleNgram - 1> ngram_prev;
+  std::uint64_t payload_bytes;
+};
+static_assert(std::is_trivially_copyable_v<SnapshotHeader>);
+
+namespace {
+
+SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
+                                  const Session& session) {
+  SnapshotHeader h{};
+  h.magic = kSnapshotMagic;
+  h.num_layers = c.num_layers;
+  h.full_attention_interval = c.full_attention_interval;
+  h.conv_elems = (c.ssm_conv_kernel - 1) * c.SsmConvChannels();
+  h.state_elems = c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim;
+  h.kv_row = c.AttentionKvDim();
+  h.indexer_head_dim = c.indexer_head_dim;
+  h.compress_ratio = c.compress_ratio;
+  h.hc_dim = c.HcDim();
+  h.ple_elems = c.ple_layer >= 0 ? c.PleConvHistory() * c.HcDim() : 0;
+  h.has_mtp = has_mtp ? 1 : 0;
+  h.position = session.position();
+  return h;
+}
+
+/// Whether `h` describes this executor's geometry (positions aside).
+bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
+  return h.magic == mine.magic && h.num_layers == mine.num_layers &&
+         h.full_attention_interval == mine.full_attention_interval &&
+         h.conv_elems == mine.conv_elems && h.state_elems == mine.state_elems &&
+         h.kv_row == mine.kv_row && h.indexer_head_dim == mine.indexer_head_dim &&
+         h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
+         h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp;
+}
+
+}  // namespace
+
+template<typename Visit>
+std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
+                                     const Session* session, Visit&& visit) {
+  std::uint64_t offset = sizeof(SnapshotHeader);
+  const auto region = [&](void* device, std::uint64_t bytes,
+                          const char* what) {
+    if (bytes != 0 && !visit(device, offset, bytes, what)) {
+      return false;
+    }
+    offset += bytes;
+    return true;
+  };
+  const auto linear = [&](std::uint32_t il) -> const Session::LinearState* {
+    return session != nullptr ? &session->linear_[il] : nullptr;
+  };
+  const auto attention = [&](std::uint32_t il)
+      -> const Session::AttentionState* {
+    return session != nullptr ? &session->attention_[il] : nullptr;
+  };
+  for (std::uint32_t il = 0; il < h.num_layers; ++il) {
+    if (((il + 1) % h.full_attention_interval) != 0) {
+      const auto* l = linear(il);
+      if (!region(l != nullptr ? l->conv_state : nullptr,
+                  std::uint64_t{h.conv_elems} * sizeof(float), "conv state") ||
+          !region(l != nullptr ? l->state : nullptr,
+                  std::uint64_t{h.state_elems} * sizeof(float),
+                  "recurrent state")) {
+        return 0;
+      }
+    }
+  }
+  if (!region(session != nullptr ? session->ple_history_ : nullptr,
+              std::uint64_t{h.ple_elems} * sizeof(float), "PLE history")) {
+    return 0;
+  }
+  const std::uint64_t kv_bytes =
+      std::uint64_t{h.position} * h.kv_row * sizeof(__half);
+  const std::uint64_t index_bytes =
+      std::uint64_t{h.position} * h.indexer_head_dim * sizeof(float);
+  const std::uint64_t block_bytes =
+      std::uint64_t{h.blocks} * h.indexer_head_dim * sizeof(__half);
+  for (std::uint32_t il = 0; il < h.num_layers; ++il) {
+    if (((il + 1) % h.full_attention_interval) == 0) {
+      const auto* at = attention(il);
+      if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache") ||
+          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache") ||
+          !region(at != nullptr ? at->index_k : nullptr, index_bytes,
+                  "indexer keys") ||
+          !region(at != nullptr ? at->block_k : nullptr, block_bytes,
+                  "pooled block keys")) {
+        return 0;
+      }
+    }
+  }
+  if (h.has_mtp != 0) {
+    const auto* mtp = session != nullptr ? &session->mtp_ : nullptr;
+    const std::uint64_t mtp_kv_bytes =
+        std::uint64_t{h.mtp_position} * h.kv_row * sizeof(__half);
+    if (!region(mtp != nullptr ? mtp->k_cache : nullptr, mtp_kv_bytes,
+                "draft K cache") ||
+        !region(mtp != nullptr ? mtp->v_cache : nullptr, mtp_kv_bytes,
+                "draft V cache") ||
+        !region(mtp != nullptr ? mtp->h : nullptr,
+                std::uint64_t{h.hc_dim} * sizeof(float), "draft residual") ||
+        !region(mtp != nullptr ? mtp->target_hidden : nullptr,
+                std::uint64_t{h.hidden_rows} * h.hc_dim * sizeof(float),
+                "kept trunk rows")) {
+      return 0;
+    }
+  }
+  return offset;
+}
+
+std::uint64_t Executor::SnapshotBytes(const Session& session,
+                                      std::uint32_t hidden_rows) const {
+  SnapshotHeader h =
+      MakeSnapshotHeader(config(), model_->has_mtp(), session);
+  h.blocks = session.blocks_;
+  h.mtp_position = session.mtp_.position;
+  h.hidden_rows = hidden_rows;
+  return WalkSnapshot(h, nullptr,
+                      [](void*, std::uint64_t, std::uint64_t, const char*) {
+                        return true;
+                      });
+}
+
+bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
+                            std::span<std::uint8_t> payload,
+                            std::string* error_msg) const {
+  if (session.owner_ != this) {
+    AssignError(error_msg, "session belongs to another executor");
+    return false;
+  }
+  if (session.spec_tokens_ != 0) {
+    AssignError(error_msg,
+                "snapshot with a pending speculative batch; roll back first");
+    return false;
+  }
+  if (hidden_rows > session.position_ || hidden_rows > options_.max_batch) {
+    AssignError(error_msg, "kept trunk rows exceed the position or batch");
+    return false;
+  }
+  SnapshotHeader h =
+      MakeSnapshotHeader(config(), model_->has_mtp(), session);
+  h.blocks = session.blocks_;
+  h.mtp_position = session.mtp_.position;
+  h.hidden_rows = hidden_rows;
+  h.ngram_prev = session.ngram_.prev;
+  h.payload_bytes = SnapshotBytes(session, hidden_rows);
+  if (payload.size() != h.payload_bytes) {
+    AssignError(error_msg, "snapshot buffer size does not match the payload");
+    return false;
+  }
+  // Queued work may still be writing the caches this reads.
+  if (!Check(hipStreamSynchronize(stream_), "snapshot drain", error_msg)) {
+    return false;
+  }
+  std::memcpy(payload.data(), &h, sizeof(h));
+  return WalkSnapshot(h, &session,
+                      [&](void* device, std::uint64_t offset,
+                          std::uint64_t bytes, const char* what) {
+                        return Check(hipMemcpy(payload.data() + offset, device,
+                                               bytes, hipMemcpyDeviceToHost),
+                                     what, error_msg);
+                      }) != 0;
+}
+
+bool Executor::RestoreSnapshot(Session& session,
+                               std::span<const std::uint8_t> payload,
+                               SnapshotInfo* info,
+                               std::string* error_msg) const {
+  if (session.owner_ != this) {
+    AssignError(error_msg, "session belongs to another executor");
+    return false;
+  }
+  if (payload.size() < sizeof(SnapshotHeader)) {
+    AssignError(error_msg, "snapshot payload is truncated");
+    return false;
+  }
+  SnapshotHeader h{};
+  std::memcpy(&h, payload.data(), sizeof(h));
+  const SnapshotHeader mine =
+      MakeSnapshotHeader(config(), model_->has_mtp(), session);
+  if (!SameGeometry(h, mine)) {
+    AssignError(error_msg, "snapshot was taken with another model geometry");
+    return false;
+  }
+  const std::uint32_t max_blocks =
+      h.compress_ratio == 0 ? 0 : h.position / h.compress_ratio;
+  if (h.position == 0 || h.position > session.max_context_ ||
+      h.blocks > max_blocks || h.mtp_position > h.position ||
+      h.hidden_rows > h.position || h.hidden_rows > options_.max_batch ||
+      (h.has_mtp == 0 && (h.mtp_position != 0 || h.hidden_rows != 0))) {
+    AssignError(error_msg, "snapshot positions do not fit this session");
+    return false;
+  }
+  if (h.payload_bytes != payload.size() ||
+      WalkSnapshot(h, nullptr,
+                   [](void*, std::uint64_t, std::uint64_t, const char*) {
+                     return true;
+                   }) != payload.size()) {
+    AssignError(error_msg, "snapshot payload size does not match its header");
+    return false;
+  }
+  // The session's queued work targets buffers the copies overwrite.
+  if (!Check(hipStreamSynchronize(stream_), "restore drain", error_msg)) {
+    return false;
+  }
+  session.Reset();
+  if (WalkSnapshot(h, &session,
+                   [&](void* device, std::uint64_t offset, std::uint64_t bytes,
+                       const char* what) {
+                     return Check(hipMemcpy(device, payload.data() + offset,
+                                            bytes, hipMemcpyHostToDevice),
+                                  what, error_msg);
+                   }) == 0) {
+    session.Reset();
+    return false;
+  }
+  session.position_ = h.position;
+  session.blocks_ = h.blocks;
+  session.mtp_.position = h.mtp_position;
+  session.spec_base_ = h.position;
+  session.spec_tokens_ = 0;
+  session.ngram_.prev = h.ngram_prev;
+  if (info != nullptr) {
+    info->position = h.position;
+    info->hidden_rows = h.hidden_rows;
+  }
+  return true;
 }
 
 bool Executor::MtpForward(Session& session,

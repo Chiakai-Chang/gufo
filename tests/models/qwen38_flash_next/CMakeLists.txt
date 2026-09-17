@@ -59,6 +59,9 @@ if(ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
   target_link_libraries(qwen38_flash_next_session_test PRIVATE
     gufo_qwen38_flash_next gufo_deepseek_v4_flash hip::host)
+  add_executable(qwen38_flash_next_snapshot_test snapshot_test.cpp)
+  target_link_libraries(qwen38_flash_next_snapshot_test PRIVATE
+    gufo_qwen38_flash_next)
   add_executable(qwen38_flash_next_gpu_probe gpu_probe.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
     gufo_qwen38_flash_next)
@@ -132,6 +135,7 @@ if(ENGINE_ENABLE_HIP)
 
   add_dependencies(qwen38_flash_next_tests
     qwen38_flash_next_session_test
+    qwen38_flash_next_snapshot_test
     qwen38_flash_next_hc_mix_ops_test
     qwen38_flash_next_gdn_ops_test
     qwen38_flash_next_attention_ops_test
