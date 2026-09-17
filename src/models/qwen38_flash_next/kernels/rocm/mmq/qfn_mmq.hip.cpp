@@ -556,6 +556,47 @@ extern "C" int qfn_mmq_quantize_q8_1(
     return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
+// The 320-row HC down projection has too few waves to hide its long K
+// loads. Fetch two iterations together, retaining the MMVQ sum order.
+__launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
+        const block_q8_0* __restrict__ weights,
+        const block_q8_1* __restrict__ input, float* __restrict__ output) {
+    constexpr int blocks = 10240 / QK8_0;
+    constexpr int prefetch = 2;
+    const int lane = threadIdx.x;
+    const int part = (lane & 3) * 2;
+    float sum = 0.0f;
+    for (int first = lane / 4; first < blocks; first += 8 * prefetch) {
+        int v[prefetch][2], u[prefetch][2];
+        half dw[prefetch], dx[prefetch];
+#pragma unroll
+        for (int j = 0; j < prefetch; ++j) {
+            const int kb = first + 8 * j;
+            const auto& w = weights[blockIdx.x * blocks + kb];
+            const auto& x = input[kb];
+            dw[j] = w.d;
+            dx[j] = __low2half(x.ds);
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                v[j][i] = get_int_b2(w.qs, part + i);
+                u[j][i] = get_int_b4(x.qs, part + i);
+            }
+        }
+        __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+        for (int j = 0; j < prefetch; ++j) {
+            int dot = ggml_hip_dp4a(v[j][0], u[j][0], 0);
+            dot = ggml_hip_dp4a(v[j][1], u[j][1], dot);
+            const float scale = __fmul_rn(__half2float(dw[j]), __half2float(dx[j]));
+            const float product = __fmul_rn(scale, static_cast<float>(dot));
+            // Match MMVQ's rounded dot product before its accumulator update.
+            sum = __fadd_rn(sum, product);
+        }
+    }
+    sum = warp_reduce_sum<32>(sum);
+    if (lane == 0) output[blockIdx.x] = sum;
+}
+
 extern "C" int qfn_mmq_q8_0_dense_vec_preq(
         const void * W, const void * W_gate, const void * X_q8, float * out_f32,
         int M, int N, int K, hipStream_t stream) {
@@ -564,6 +605,12 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(
         fprintf(stderr, "qfn_mmq_q8_0_dense_vec_preq: bad arguments M=%d N=%d K=%d\n",
                 M, N, K);
         return -1;
+    }
+    if (N == 1 && M == 320 && K == 10240 && W_gate == nullptr) {
+        qfn_q8_hc_down_kernel<<<320, 32, 0, stream>>>(
+            static_cast<const block_q8_0*>(W),
+            static_cast<const block_q8_1*>(X_q8), out_f32);
+        return hipGetLastError() == hipSuccess ? 0 : -3;
     }
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const int64_t s01_row = (int64_t)K / ggml_blck_size(GGML_TYPE_Q8_0);

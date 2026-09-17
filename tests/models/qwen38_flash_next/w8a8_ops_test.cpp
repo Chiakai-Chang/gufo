@@ -199,8 +199,8 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
              : 1.0;
 }
 
-void CheckDecodeGrouping() {
-  constexpr int rows = 64, cols = 2560, tokens = 8;
+void CheckDecodeGrouping(int rows, int cols) {
+  constexpr int tokens = 8;
   const auto w = MakeWeights(rows, cols, 11);
   const auto gate = MakeWeights(rows, cols, 17);
   std::vector<float> x(tokens * cols);
@@ -248,8 +248,11 @@ void CheckDecodeGrouping() {
       CheckHip(hipMemcpy(batch.data(), out, n * rows * sizeof(float),
                          hipMemcpyDeviceToHost),
                "batch output");
-      if (!std::equal(scalar.begin(), scalar.begin() + n * rows, batch.begin()))
-        throw std::runtime_error("Q8 dense projection changed with grouping");
+      if (std::memcmp(scalar.data(), batch.data(), n * rows * sizeof(float)) != 0)
+        throw std::runtime_error(
+            "Q8 dense grouping differs: M=" + std::to_string(rows) +
+            " K=" + std::to_string(cols) + " N=" + std::to_string(n) +
+            " gated=" + std::to_string(gated));
     }
   }
   for (void* ptr :
@@ -261,7 +264,8 @@ void CheckDecodeGrouping() {
 
 int main() {
   try {
-    CheckDecodeGrouping();
+    CheckDecodeGrouping(64, 2560);
+    CheckDecodeGrouping(320, 10240);
     bool ok = true;
     // Ragged batch and rows against the 128-wide macro tiles, the 64-token
     // tile below 96, and the model's ssm_out / shexp_down widths.
