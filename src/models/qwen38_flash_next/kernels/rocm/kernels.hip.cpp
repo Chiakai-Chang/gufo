@@ -2506,7 +2506,7 @@ constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
 /// Two row layouts share the kernel. The dense window packs 32 queries x 2
 /// heads (a row block is 16 queries of one head, grid.y over head pairs).
 /// The sparse window packs four queries x twelve heads into three row
-/// blocks without padding, grid.y over KV heads: the key
+/// blocks without padding, with adjacent blocks covering both KV heads: the key
 /// tiles are gathered from the union of the block's query selections and
 /// four selections overlap far less than 32 (measured at 16k depth: 846
 /// versus 2,478 selected blocks against 512 per query).
@@ -2548,9 +2548,15 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   const std::uint32_t sub = lane & 15u;
   const std::uint32_t half_id = lane >> 4u;
 
-  const std::uint32_t query_start = blockIdx.x * kQueryRows;
+  // Keep the two KV heads of nearby queries together in the launch order.
+  // This improves cache reuse without changing any query's key sweep.
+  const std::uint32_t linear = blockIdx.y * gridDim.x + blockIdx.x;
+  const std::uint32_t query_group =
+      kPackHeads ? linear / kWmmaKvHeads : blockIdx.x;
+  const std::uint32_t query_start = query_group * kQueryRows;
   const std::uint32_t kv_head =
-      kPackHeads ? blockIdx.y : blockIdx.y / (kWmmaGqa / kWmmaHeads);
+      kPackHeads ? linear % kWmmaKvHeads
+                 : blockIdx.y / (kWmmaGqa / kWmmaHeads);
   const std::uint32_t first_query_head =
       kPackHeads ? kv_head * kWmmaGqa
                  : (kv_head * kWmmaGqa) +
