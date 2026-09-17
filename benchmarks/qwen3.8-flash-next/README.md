@@ -11,26 +11,30 @@ stays on disk. Context, scratch and MTP add memory. NVMe loading takes about
 ## Performance
 
 Nix release, C1, pp2048, tg128, seed 1, one prefill warm-up and one measured
-repetition (2026-09-16 UTC). Rates are tok/s. Depth precedes the measured operation;
+repetition (2026-09-16–17 UTC). Rates are tok/s. Depth precedes the measured operation;
 fixed-length generation continues past EOS. MTP scores the full vocabulary
 and proposes up to seven drafts per cycle.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1259.33 | 1260.80 |
-| 4096 | 1146.71 | 1111.57 |
+| 0 | 1253.96 | 1254.58 |
+| 4096 | 1146.71 | 1112.38 |
+| 16384 | 1103.66 | TODO |
+| 32768 | 1084.28 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 24.19 | 36.78 | 51.0% |
-| Greedy | 4096 | 23.31 | 27.54 | 37.6% |
-| Temperature 0.7 | 0 | TODO | 25.85 | 34.9% |
-| Temperature 0.7 | 4096 | TODO | 48.68 | 92.4% |
+| Greedy | 0 | 24.19 | 36.77 | 51.0% |
+| Greedy | 4096 | 23.31 | 27.41 | 37.6% |
+| Temperature 0.7 | 0 | TODO | 25.56 | 34.9% |
+| Temperature 0.7 | 4096 | TODO | 48.44 | 92.4% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
-Depths 8192/12288/16384 and concurrent throughput: TODO. Serving interleaves
+Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
+PP loses about 1.8% from 16K to 32K. Profiling attributes the larger shallow-to-deep
+step to sparse attention; 128K remains unmeasured.
 
 ```sh
 ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \
@@ -73,6 +77,8 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
 - Operator tests cover attention, DeltaNet, hyper-connections, routing and
   projections against numerical references. F16 plans require FP64 agreement
   and bitwise replay, including ragged sizes and fallback shapes.
+  Wave64 prefill projections check every output against MMQ, sampled FP64
+  dots at the production shape and bitwise replay.
   MTP token selection matches the CPU rule, including ties and graph replay.
 - Upload tests check bytes, guards, shard/chunk boundaries and invalid inputs.
   N-gram tests check asynchronous reads, duplicates, failed I/O and teardown.

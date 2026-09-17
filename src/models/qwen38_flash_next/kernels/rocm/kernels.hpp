@@ -129,6 +129,10 @@ void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
                      std::size_t k, hipStream_t stream);
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
               std::size_t m, std::size_t k, hipStream_t stream);
+/// Native wave64 launch, selected by W8A8Gemm for wide output projections.
+void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
+                    std::size_t batch, std::size_t m, std::size_t k,
+                    hipStream_t stream);
 
 /// F16 route for wide batches over Q8_0 weights: F16 activation rows
 /// [batch][k] (NarrowActivations, or a producer's F16 output), weights

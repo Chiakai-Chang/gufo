@@ -7,9 +7,7 @@
 #include <cstdint>
 #include <type_traits>
 
-// First-light kernels: one thread or one block per output, no tiling beyond
-// what correctness needs. Every kernel is written against the float32
-// reference (reference.cpp); the layouts are the reference's layouts.
+// HIP kernels follow the layouts and operator formulas in reference.cpp.
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -3871,9 +3869,15 @@ bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
   if (m == 0 || k == 0 || batch == 0 || k % 32 != 0) {
     return false;
   }
+  // Qwen's wave64 matrix kernel with four row groups improves the model's
+  // large output projections while preserving every K32 accumulator update.
+  if (batch >= 1024 && m == 2560 && k == 6144) {
+    W8A8GemmWave64(w, x_tiled, out, batch, m, k, stream);
+    return true;
+  }
   // A 128-token macro tile is the throughput configuration; short chunks
   // would leave most of it idle and take the 64-token variant. A narrow
-  // projection (the 320-row mixer down over K = 10240) gets 32-row tiles so
+  // projection (the 320-row mixer down over K = 10240) gets 64-row tiles so
   // it still fills the device.
   constexpr int kBM = 128;
   if (m <= 512 && batch >= 96) {

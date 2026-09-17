@@ -73,7 +73,7 @@ Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed) {
 }
 
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
-           bool check = true) {
+           bool check = true, std::size_t reference_tokens = 0) {
   const Q8Weights w = MakeWeights(m, k, seed);
   std::vector<float> x(batch * k);
   std::uint32_t state = seed ^ 0xABCDEF01U;
@@ -143,22 +143,39 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   double worst_vs_ref = 0.0;
   double worst_f16 = 0.0;
   double ref_scale = 0.0;
-  for (std::size_t t = 0; t < (check ? batch : 0); ++t) {
+  if (check) {
+    for (std::size_t i = 0; i < w8.size(); ++i) {
+      if (!std::isfinite(w8[i]) || !std::isfinite(f16[i])) {
+        throw std::runtime_error("projection output is not finite");
+      }
+      worst_vs_mmq =
+          std::max(worst_vs_mmq, std::abs(static_cast<double>(mmq[i] - w8[i])));
+    }
+    if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
+      throw std::runtime_error("W8A8 replay rejected the shape");
+    }
+    std::vector<float> replay(w8.size());
+    CheckHip(hipMemcpy(replay.data(), d_w8, replay.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "replay download");
+    if (replay != w8) {
+      throw std::runtime_error("W8A8 replay changed the output");
+    }
+  }
+  // Large production shapes still compare every output against MMQ. Sample
+  // evenly spaced tokens for the more expensive independent F64 reference.
+  const std::size_t samples =
+      reference_tokens == 0 ? batch : std::min(batch, reference_tokens);
+  for (std::size_t sample = 0; sample < (check ? samples : 0); ++sample) {
+    const std::size_t t =
+        samples > 1 ? sample * (batch - 1) / (samples - 1) : 0;
     for (std::size_t r = 0; r < m; ++r) {
       double ref = 0.0;
       for (std::size_t i = 0; i < k; ++i) {
         ref += static_cast<double>(w.values[r * k + i]) * x[t * k + i];
       }
       const std::size_t idx = t * m + r;
-      if (!std::isfinite(w8[idx])) {
-        throw std::runtime_error("W8A8 output is not finite");
-      }
-      worst_vs_mmq = std::max(
-          worst_vs_mmq, std::abs(static_cast<double>(mmq[idx] - w8[idx])));
       worst_vs_ref = std::max(worst_vs_ref, std::abs(ref - w8[idx]));
-      if (!std::isfinite(f16[idx])) {
-        throw std::runtime_error("dense F16 output is not finite");
-      }
       worst_f16 = std::max(worst_f16, std::abs(ref - f16[idx]));
       ref_scale = std::max(ref_scale, std::abs(ref));
     }
@@ -250,6 +267,7 @@ int main() {
     ok = Run(100, 320, 2560, 0x1234ABCDU) < 1e-2 && ok;
     ok = Run(37, 640, 2560, 0x0BADF00DU) < 1e-2 && ok;
     ok = Run(200, 200, 6144, 0xDEADBEEFU) < 1e-2 && ok;
+    ok = Run(1025, 2560, 6144, 0x51A17U, true, 2) < 1e-2 && ok;
     // Production shapes for profiling only (QFN_W8A8_BENCH=1): three
     // launches each, no reference.
     if (std::getenv("QFN_W8A8_BENCH") != nullptr) {
