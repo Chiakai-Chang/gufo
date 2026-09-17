@@ -1,13 +1,18 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 
 namespace {
@@ -163,10 +168,138 @@ bool Same(const Maps& a, const Maps& b, const char* what) {
   return ok;
 }
 
+// Check the router independently of the assignment-map builder: softmax,
+// selection without replacement, lowest-index ties, and renormalization.
+void CheckRouter(int tokens, int experts, int used, int pattern) {
+  namespace q = gufo::models::qwen38_flash_next::rocm;
+  const int stride = experts + 1;
+  const std::size_t count = static_cast<std::size_t>(tokens) * used;
+  constexpr std::int32_t kIdGuard = -771;
+  constexpr float kWeightGuard = -71.0F;
+  std::vector<float> logits(static_cast<std::size_t>(tokens) * stride,
+                            std::numeric_limits<float>::quiet_NaN());
+  std::uint32_t random = 0xBADC0FFEU;
+  for (int t = 0; t < tokens; ++t) {
+    for (int e = 0; e < experts; ++e) {
+      const auto bits = NextRandom(&random);
+      float value =
+          static_cast<float>(static_cast<int>(bits % 16384) - 8192) / 1024.0F;
+      if (pattern == 1) {
+        value = static_cast<float>(bits % 8);
+      } else if (pattern == 2) {
+        value = 0.0F;
+      } else if (pattern == 3 && e % 3 == 0) {
+        value = -std::numeric_limits<float>::infinity();
+      }
+      logits[static_cast<std::size_t>(t) * stride + e] = value;
+    }
+  }
+  float* d_logits = nullptr;
+  float* d_weights = nullptr;
+  std::int32_t* d_ids = nullptr;
+  CheckHip(hipMalloc(&d_logits, logits.size() * sizeof(float)),
+           "router logits");
+  CheckHip(hipMalloc(&d_weights, (count + 2) * sizeof(float)),
+           "router weights");
+  CheckHip(hipMalloc(&d_ids, (count + 2) * sizeof(std::int32_t)), "router ids");
+  const std::vector<float> weight_guards(count + 2, kWeightGuard);
+  const std::vector<std::int32_t> id_guards(count + 2, kIdGuard);
+  CheckHip(hipMemcpy(d_logits, logits.data(), logits.size() * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "upload logits");
+  CheckHip(
+      hipMemcpy(d_weights, weight_guards.data(),
+                weight_guards.size() * sizeof(float), hipMemcpyHostToDevice),
+      "upload weight guards");
+  CheckHip(
+      hipMemcpy(d_ids, id_guards.data(),
+                id_guards.size() * sizeof(std::int32_t), hipMemcpyHostToDevice),
+      "upload id guards");
+  std::vector<float> first_weights;
+  std::vector<std::int32_t> first_ids;
+  for (int replay = 0; replay < 2; ++replay) {
+    q::RouterTopK(d_logits, stride, d_ids + 1, d_weights + 1, tokens, experts,
+                  used, nullptr);
+    CheckHip(hipDeviceSynchronize(), "router");
+    std::vector<float> weights(count + 2);
+    std::vector<std::int32_t> ids(count + 2);
+    CheckHip(hipMemcpy(weights.data(), d_weights,
+                       weights.size() * sizeof(float), hipMemcpyDeviceToHost),
+             "download router weights");
+    CheckHip(hipMemcpy(ids.data(), d_ids, ids.size() * sizeof(std::int32_t),
+                       hipMemcpyDeviceToHost),
+             "download router ids");
+    if (weights.front() != kWeightGuard || weights.back() != kWeightGuard ||
+        ids.front() != kIdGuard || ids.back() != kIdGuard) {
+      throw std::runtime_error("router overwrote output guards");
+    }
+    if (replay != 0) {
+      if (ids != first_ids ||
+          !std::equal(weights.begin(), weights.end(), first_weights.begin(),
+                      [](float a, float b) {
+                        return std::bit_cast<std::uint32_t>(a) ==
+                               std::bit_cast<std::uint32_t>(b);
+                      })) {
+        throw std::runtime_error("router replay differs");
+      }
+      continue;
+    }
+    first_weights = weights;
+    first_ids = ids;
+    for (int t = 0; t < tokens; ++t) {
+      const float* row = logits.data() + static_cast<std::size_t>(t) * stride;
+      const float maximum = *std::max_element(row, row + experts);
+      std::vector<double> probabilities(experts);
+      double denominator = 0.0;
+      for (int e = 0; e < experts; ++e) {
+        probabilities[e] = std::exp(static_cast<double>(row[e]) - maximum);
+        denominator += probabilities[e];
+      }
+      for (double& probability : probabilities) {
+        probability /= denominator;
+      }
+      std::vector<int> order(experts);
+      std::iota(order.begin(), order.end(), 0);
+      std::partial_sort(order.begin(), order.begin() + used, order.end(),
+                        [&](int a, int b) {
+                          return probabilities[a] == probabilities[b]
+                                     ? a < b
+                                     : probabilities[a] > probabilities[b];
+                        });
+      double sum = 0.0;
+      for (int i = 0; i < used; ++i) {
+        sum += probabilities[order[i]];
+      }
+      sum = std::max(sum, 6.103515625e-5);
+      for (int i = 0; i < used; ++i) {
+        const auto at = 1 + static_cast<std::size_t>(t) * used + i;
+        const double expected = probabilities[order[i]] / sum;
+        if (ids[at] != order[i] || !std::isfinite(weights[at]) ||
+            std::abs(weights[at] - expected) > 2e-6) {
+          throw std::runtime_error("router differs from softmax reference");
+        }
+      }
+    }
+  }
+  (void)hipFree(d_logits);
+  (void)hipFree(d_weights);
+  (void)hipFree(d_ids);
+}
+
 }  // namespace
 
 int main() {
   try {
+    for (int pattern : {0, 1, 2, 3}) {
+      CheckRouter(1, 512, 10, pattern);
+      CheckRouter(8, 512, 10, pattern);
+      CheckRouter(2048, 512, 10, pattern);
+    }
+    CheckRouter(17, 8, 8, 1);
+    CheckRouter(17, 513, 32, 0);
+    CheckRouter(17, 1024, 32, 1);
+    CheckRouter(17, 1024, 1, 3);
+    std::cout << "Router softmax, ties, guards and replay: passed\n";
     bool ok = true;
     for (int n_tokens : {37, 512, 2048}) {
       const auto ids = MakeIds(n_tokens, 0x1234ABCDU + n_tokens);

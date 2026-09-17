@@ -326,6 +326,29 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   const auto mmq = Download(d_mmq, slots * m);
   const auto f16 = Download(d_f16, slots * m);
   const auto f16_half = Download(d_f16_half, slots * m);
+  if (tile_rows == 64) {
+    std::vector<std::int32_t> narrow_tiles;
+    for (std::size_t e = 0; e < experts; ++e) {
+      const std::uint32_t padded = (counts[e] + 15u) / 16u * 16u;
+      for (std::uint32_t j = 0; j < (padded + 47u) / 48u; ++j) {
+        narrow_tiles.push_back(static_cast<std::int32_t>(e | (j << 16)));
+      }
+    }
+    auto* d_narrow_tiles = Upload(narrow_tiles);
+    if (!q::RoutedF16Gemm(d_w, type, d_x_half, d_narrow_tiles,
+                          static_cast<std::uint32_t>(narrow_tiles.size()), 48,
+                          d_bounds, d_rows_token, d_rows_slot, nullptr, d_f16,
+                          nullptr, m, k, nullptr)) {
+      throw std::runtime_error("routed reference tile rejected");
+    }
+    CheckHip(hipDeviceSynchronize(), "routed tile comparison");
+    const auto narrow = Download(d_f16, slots * m);
+    if (std::memcmp(narrow.data(), f16.data(), f16.size() * sizeof(float)) !=
+        0) {
+      throw std::runtime_error("routed tile widths change output bits");
+    }
+    CheckHip(hipFree(d_narrow_tiles), "free reference tiles");
+  }
   double worst_half = 0.0;
   for (std::size_t i = 0; i < slots * m; ++i) {
     const double a = f16[i];
@@ -439,13 +462,17 @@ bool Ok(const Result& r) {
          r.mmq_vs_ref < 1e-2 * r.scale;
 }
 
-void CheckVectorGrouping() {
-  constexpr int experts = 8, cols = 512, tokens = 7, used = 3;
+void CheckVectorGrouping(bool down = false) {
+  constexpr int experts = 8;
+  const int cols = down ? 640 : 512;
+  const int tokens = down ? 80 : 7;
+  const int used = down ? 1 : 3;
   constexpr std::size_t guard = 16;
   constexpr float poison = -1234567.0F;
-  constexpr std::array<q::WeightType, 4> formats{
-      q::WeightType::kQ4_K, q::WeightType::kQ5_K, q::WeightType::kQ5_1,
-      q::WeightType::kQ8_0};
+  const std::vector<q::WeightType> formats =
+      down ? std::vector{q::WeightType::kQ8_0}
+           : std::vector{q::WeightType::kQ4_K, q::WeightType::kQ5_K,
+                         q::WeightType::kQ5_1, q::WeightType::kQ8_0};
   std::vector<float> x(tokens * cols);
   std::uint32_t seed = 37;
   for (auto& v : x)
@@ -453,16 +480,23 @@ void CheckVectorGrouping() {
   std::vector<std::int32_t> ids(tokens * used);
   for (int t = 0; t < tokens; ++t)
     for (int j = 0; j < used; ++j)
-      ids[t * used + j] = j == 1 ? -1 : (t + j) % experts;
+      ids[t * used + j] =
+          j == 1 || (down && t % 11 == 1) ? -1 : (t + j) % experts;
   auto* dx = Upload(x);
   auto* di = Upload(ids);
-  for (int rows : {64, 65}) {
-    std::array<Experts, 4> weights{
-        MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
-        MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23)};
-    std::array<Experts, 4> paired_weights{
-        MakeQ4K(experts, rows, cols, 71), MakeQ5K(experts, rows, cols, 73),
-        MakeQ5_1(experts, rows, cols, 79), MakeQ8_0(experts, rows, cols, 83)};
+  for (int rows : {down ? 2560 : 64, down ? 2561 : 65}) {
+    std::vector<Experts> weights, paired_weights;
+    if (down) {
+      weights = {MakeQ8_0(experts, rows, cols, 23)};
+      paired_weights = {MakeQ8_0(experts, rows, cols, 83)};
+    } else {
+      weights = {
+          MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
+          MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23)};
+      paired_weights = {
+          MakeQ4K(experts, rows, cols, 71), MakeQ5K(experts, rows, cols, 73),
+          MakeQ5_1(experts, rows, cols, 79), MakeQ8_0(experts, rows, cols, 83)};
+    }
     const std::size_t count = tokens * used * rows;
     const std::vector<float> dirty(count + 2 * guard, poison);
     auto* scalar = Upload(dirty);
@@ -513,7 +547,9 @@ void CheckVectorGrouping() {
                           used, nullptr))
         throw std::runtime_error("paired reference projection failed");
       const auto reference_b = check_output(paired_scalar, tokens);
-      for (int n : {2, 3, 4, 7}) {
+      const auto widths = down ? std::vector{2, 3, 4, 7, 8, 10, 40, 80}
+                               : std::vector{2, 3, 4, 7};
+      for (int n : widths) {
         CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
                            hipMemcpyHostToDevice),
                  "poison batched output");
@@ -547,7 +583,8 @@ void CheckVectorGrouping() {
           throw std::runtime_error(
               "paired vector differs from separate projections");
       }
-      if (f < 2) {
+      if (formats[f] == q::WeightType::kQ4_K ||
+          formats[f] == q::WeightType::kQ5_K) {
         // Compare the fused decode path with the original GPU SwiGLU too:
         // inactive experts, nonfinite scales and a ragged last row must
         // retain their exact values and output guards.
@@ -624,13 +661,17 @@ void CheckPairedMmq() {
 int main() {
   try {
     CheckVectorGrouping();
+    CheckVectorGrouping(true);
     CheckPairedMmq();
     bool ok = true;
     // Gate/up view: 64 experts, top-10, 640 x 2560 Q4_K.
     ok = Ok(Run(q::WeightType::kQ4_K, 300, 10, 64, 640, 2560, 0x1234ABCDU)) &&
          ok;
     // Down view: single-expert slot rows, 2560 x 640 Q5_1.
-    ok = Ok(Run(q::WeightType::kQ5_1, 3000, 1, 64, 2560, 640, 0x0BADF00DU)) &&
+    ok = Ok(Run(q::WeightType::kQ5_1, 3000, 1, 64, 2560, 640, 0x0BADF00DU,
+                64)) &&
+         ok;
+    ok = Ok(Run(q::WeightType::kQ5_1, 97, 1, 8, 129, 640, 0x51516464U, 64)) &&
          ok;
     // Q5_K gate/up view (one layer).
     ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x5A5A0001U)) &&

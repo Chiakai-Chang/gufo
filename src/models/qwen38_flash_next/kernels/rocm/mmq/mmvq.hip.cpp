@@ -194,16 +194,19 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
     }
 }
 
-template <ggml_type type>
-static void launch_moe(const void* weights, const block_q8_1* input, const int32_t* ids,
-                       float* output, int k, int rows, int tokens, int experts_used,
-                       int input_stride, hipStream_t stream) {
-    GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0);
-    GGML_ASSERT(tokens > 0 && tokens <= mmvq_moe_max_batch(type));
-    const int row_stride = k / ggml_blck_size(type);
-    mul_mat_vec_q_moe<type, 2><<<dim3((rows + 1) / 2, experts_used), dim3(32, tokens), 0, stream>>>(
-        weights, input, ids, output, k, rows, row_stride, input_stride, rows * experts_used,
-        rows * row_stride, rows, tokens, experts_used);
+template<ggml_type type, int rows_per_wave = 2>
+static void launch_moe(const void* weights, const block_q8_1* input,
+                       const int32_t* ids, float* output, int k, int rows,
+                       int tokens, int experts_used, int input_stride,
+                       hipStream_t stream) {
+  GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0);
+  GGML_ASSERT(tokens > 0 && tokens <= mmvq_moe_max_batch(type));
+  const int row_stride = k / ggml_blck_size(type);
+  mul_mat_vec_q_moe<type, rows_per_wave>
+      <<<dim3((rows + rows_per_wave - 1) / rows_per_wave, experts_used),
+         dim3(32, tokens), 0, stream>>>(
+          weights, input, ids, output, k, rows, row_stride, input_stride,
+          rows * experts_used, rows * row_stride, rows, tokens, experts_used);
 }
 
 void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
@@ -216,6 +219,14 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                                           experts_used, input_stride, stream);
             break;
         case GGML_TYPE_Q8_0:
+          // Down projection slots have independent inputs. Four rows reuse
+          // each short input across more weights without changing its sum.
+          if (k == 640 && experts_used == 1 && tokens > 1) {
+            launch_moe<GGML_TYPE_Q8_0, 4>(weights, input, ids, output, k, rows,
+                                          tokens, experts_used, input_stride,
+                                          stream);
+            break;
+          }
             launch_moe<GGML_TYPE_Q8_0>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;

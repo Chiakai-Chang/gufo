@@ -672,8 +672,8 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
   routed_n_tiles_ = n_tiles;
-  // Append the paired gate/up map to the same upload. Its 64-token tile
-  // reduces repeated weight reads; the down projection keeps 48-token tiles.
+  // Append the 64-token map to the same upload. Gate/up always uses it;
+  // Q5_1 down can reuse it when it does not add padded computation.
   if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
       const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
@@ -1244,13 +1244,20 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     const WeightType down_type = l.ffn_down_exps.type == GgmlType::kQ8_0
                                      ? WeightType::kQ8_0
                                      : WeightType::kQ5_1;
+    // Larger Q5_1 tiles amortize weight decoding. Use them only when the
+    // existing 64-token map has no more padded rows than the 48-token map.
+    const bool wide_down = down_type == WeightType::kQ5_1 &&
+                           routed_tile_rows_ == 48 && routed_gate_tiles_ != 0 &&
+                           routed_gate_tiles_ * 4 <= routed_n_tiles_ * 3;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
     if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
-                       s_.routed_tiles, routed_n_tiles_, routed_tile_rows_,
-                       s_.routed_bounds, s_.rows_slot, s_.rows_slot, nullptr,
-                       nullptr, reinterpret_cast<__half*>(s_.down_e),
-                       c.hidden_size, c.expert_ff, stream_)) {
+                       s_.routed_tiles + (wide_down ? routed_n_tiles_ : 0),
+                       wide_down ? routed_gate_tiles_ : routed_n_tiles_,
+                       wide_down ? 64 : routed_tile_rows_, s_.routed_bounds,
+                       s_.rows_slot, s_.rows_slot, nullptr, nullptr,
+                       reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
+                       c.expert_ff, stream_)) {
       AssignError(error_msg, "routed F16 down GEMM failed");
       return false;
     }

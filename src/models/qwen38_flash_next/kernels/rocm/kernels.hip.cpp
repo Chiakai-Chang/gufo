@@ -1834,6 +1834,50 @@ __global__ void SelectScoreKernel(const __half* q, const __half* blocks,
   }
 }
 
+/// Locate a descending histogram rank cooperatively. Each thread owns
+/// consecutive bins; state receives the bin, its remaining rank and count.
+template<std::uint32_t kBinsPerThread>
+__device__ void FindHistogramThreshold(const std::uint32_t* histogram,
+                                       std::uint32_t wanted,
+                                       std::uint32_t* wave_sums,
+                                       std::uint32_t* state) {
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t wave = threadIdx.x >> 5;
+  const std::uint32_t first =
+      kThreads * kBinsPerThread - 1 - threadIdx.x * kBinsPerThread;
+  std::uint32_t count = 0;
+#pragma unroll
+  for (std::uint32_t j = 0; j < kBinsPerThread; ++j)
+    count += histogram[first - j];
+  std::uint32_t inclusive = count;
+#pragma unroll
+  for (std::uint32_t distance = 1; distance < 32; distance *= 2) {
+    const std::uint32_t other = __shfl_up(inclusive, distance);
+    if (lane >= distance)
+      inclusive += other;
+  }
+  if (lane == 31)
+    wave_sums[wave] = inclusive;
+  __syncthreads();
+  std::uint32_t before = inclusive - count;
+  for (std::uint32_t w = 0; w < wave; ++w)
+    before += wave_sums[w];
+  if (before < wanted && before + count >= wanted) {
+    for (std::uint32_t j = 0; j < kBinsPerThread; ++j) {
+      const std::uint32_t bin = first - j;
+      const std::uint32_t bin_count = histogram[bin];
+      if (before + bin_count >= wanted) {
+        state[0] = bin;
+        state[1] = wanted - before;
+        state[2] = bin_count;
+        break;
+      }
+      before += bin_count;
+    }
+  }
+  __syncthreads();
+}
+
 /// Exact top-k over non-negative score bits. A 12-bit histogram locates
 /// the threshold bin, then at most 4096 candidates are refined in LDS.
 /// Larger bins use the original scores. The final mask keeps lowest-index
@@ -1867,41 +1911,11 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
   __syncthreads();
   for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x)
     atomicAdd(&candidates[sc[b] >> 20], 1u);
-  __syncthreads();
-  std::uint32_t local_sum = 0;
-#pragma unroll
-  for (std::uint32_t j = 0; j < 16; ++j)
-    local_sum += candidates[4095 - threadIdx.x * 16 - j];
-  std::uint32_t inclusive = local_sum;
-#pragma unroll
-  for (std::uint32_t d = 1; d < 32; d *= 2) {
-    std::uint32_t v = __shfl_up(inclusive, d);
-    if (lane >= d)
-      inclusive += v;
-  }
-  if (lane == 31)
-    wave_ties[wave] = inclusive;
-  __syncthreads();
-  std::uint32_t before = inclusive - local_sum;
-  for (std::uint32_t w = 0; w < wave; ++w)
-    before += wave_ties[w];
-  if (before < budget && before + local_sum >= budget) {
-    std::uint32_t seen = before;
-    for (std::uint32_t j = 0; j < 16; ++j) {
-      std::uint32_t bin = 4095 - threadIdx.x * 16 - j;
-      if (seen + candidates[bin] >= budget) {
-        state[0] = bin << 20;
-        state[1] = budget - seen;
-        state[2] = candidates[bin];
-        break;
-      }
-      seen += candidates[bin];
-    }
-  }
   if (threadIdx.x == 0)
     candidate_count = 0;
   __syncthreads();
-  std::uint32_t prefix = state[0], remaining = state[1];
+  FindHistogramThreshold<16>(candidates, budget, wave_ties, state);
+  std::uint32_t prefix = state[0] << 20, remaining = state[1];
   // Reuse the first histogram as a bounded candidate list. If its bin is
   // larger, later radix passes read the original scores instead.
   const bool compact = state[2] <= 4096 && remaining != state[2];
@@ -1928,21 +1942,8 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
         atomicAdd(&hist[(v >> shift) & radix_mask], 1u);
     }
     __syncthreads();
-    if (threadIdx.x == 0) {
-      std::uint32_t seen = 0, bin = 0;
-      for (int i = radix_mask; i >= 0; --i) {
-        if (seen + hist[i] >= remaining) {
-          bin = i;
-          break;
-        }
-        seen += hist[i];
-      }
-      state[0] = prefix | (bin << shift);
-      state[1] = remaining - seen;
-      state[2] = hist[bin];
-    }
-    __syncthreads();
-    prefix = state[0];
+    FindHistogramThreshold<1>(hist, remaining, wave_ties, state);
+    prefix |= state[0] << shift;
     remaining = state[1];
     __syncthreads();
     if (shift == 0)
@@ -2236,6 +2237,9 @@ __global__ void AttentionMergeKernel(const float* partials, float* out,
   }
 }
 
+// Keep the original block-wide softmax reduction. Selection then stays in
+// one wave's registers, retaining probability ordering and lowest-index ties.
+template<unsigned MaxExperts>
 __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
                                  std::int32_t* ids, float* weights,
                                  std::uint32_t n_experts, std::uint32_t k) {
@@ -2260,31 +2264,45 @@ __global__ void RouterTopKKernel(const float* logits, std::uint32_t stride,
     probs[e] /= denom;
   }
   __syncthreads();
-  for (std::uint32_t slot = 0; slot < k; ++slot) {
-    // Block argmax: value first, lowest index on ties.
+
+  if (threadIdx.x >= 32)
+    return;
+  constexpr unsigned Items = MaxExperts / 32;
+  float values[Items];
+#pragma unroll
+  for (unsigned j = 0; j < Items; ++j) {
+    unsigned e = threadIdx.x + j * 32;
+    values[j] = e < n_experts ? probs[e] : -1.0f;
+  }
+  for (unsigned slot = 0; slot < k; ++slot) {
     float best = -1.0f;
-    std::uint32_t best_e = 0;
-    for (std::uint32_t e = threadIdx.x; e < n_experts; e += blockDim.x) {
-      if (probs[e] > best) {
-        best = probs[e];
-        best_e = e;
+    unsigned index = 0xffffffffu;
+#pragma unroll
+    for (unsigned j = 0; j < Items; ++j) {
+      unsigned e = threadIdx.x + j * 32;
+      if (values[j] > best) {
+        best = values[j];
+        index = e;
       }
     }
-    const float block_best = BlockMax(best, shared);
-    __syncthreads();
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      float other = __shfl_xor(best, offset);
+      unsigned oi = __shfl_xor(index, offset);
+      if (other > best || (other == best && oi < index)) {
+        best = other;
+        index = oi;
+      }
+    }
     if (threadIdx.x == 0) {
-      chosen[slot] = 0xFFFFFFFFu;
+      chosen[slot] = index;
+      chosen_p[slot] = best;
     }
-    __syncthreads();
-    if (best == block_best) {
-      atomicMin(&chosen[slot], best_e);
+#pragma unroll
+    for (unsigned j = 0; j < Items; ++j) {
+      if (threadIdx.x + j * 32 == index)
+        values[j] = -1.0f;
     }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-      chosen_p[slot] = probs[chosen[slot]];
-      probs[chosen[slot]] = -1.0f;
-    }
-    __syncthreads();
   }
   if (threadIdx.x == 0) {
     float sum = 0.0f;
@@ -3524,6 +3542,9 @@ __launch_bounds__(256) __global__
   // (scale, bias) pair is derived from the raw header word only when the
   // stage is committed, so nothing waits on the loads before the compute.
   uint4 f_codes[kWaveRowTiles];
+  // Paired gate/up tiles reuse the full quantized block over four stages.
+  // Keep its remaining codes in registers alongside the cached header.
+  uint4 code_cache[kWaveRowTiles][4];
   uint4 f_codes_hi[kWaveRowTiles];  ///< Q8_0: the block's second 16 codes
   uint4 f_qh[kWaveRowTiles][2];     ///< Q5_K: the superblock's high bits
   std::uint32_t f_high[kWaveRowTiles];
@@ -3584,13 +3605,26 @@ __launch_bounds__(256) __global__
         // The K sweep enters a new superblock every eight Q8-sized blocks.
         if (kb0 % 8 == 0) {
           f_header[u] = blk[0];
+          if constexpr (kPair) {
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+              code_cache[u][group] = blk[kCodeChunk + group * 2 + f_c];
+          }
           if constexpr (kQ5K) {
             f_qh[u][0] = blk[1];
             f_qh[u][1] = blk[2];
           }
         }
         const int sb32 = (kb0 % 8) + f_c;
-        f_codes[u] = blk[kCodeChunk + (sb32 / 2) * 2 + f_c];
+        if constexpr (kPair) {
+          const int group = sb32 / 2;
+          f_codes[u] = group == 0   ? code_cache[u][0]
+                       : group == 1 ? code_cache[u][1]
+                       : group == 2 ? code_cache[u][2]
+                                    : code_cache[u][3];
+        } else {
+          f_codes[u] = blk[kCodeChunk + (sb32 / 2) * 2 + f_c];
+        }
         f_sb32[u] = sb32;
         if constexpr (kQ5K) {
           // Bit sb32 of the 32 high-bit bytes, packed as the Q5_1 word.
@@ -4237,6 +4271,16 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       return LaunchRoutedF16<48>(w, type, x, tiles, n_tiles, pad_bounds,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
+    case 64:
+      if (type != WeightType::kQ5_1) {
+        return false;
+      }
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ5_1, 128, 64, 2>),
+          dim3(static_cast<unsigned int>((m + 127) / 128), n_tiles),
+          dim3(kThreads), 0, stream, w, x, tiles, pad_bounds, rows_in, rows_out,
+          swiglu_gate, out, out_half, m, k, nullptr);
+      return true;
     default:
       return false;
   }
@@ -5012,8 +5056,13 @@ __global__ void ExpertCountsKernel(const std::int32_t* ids,
 void RouterTopK(const float* logits, std::uint32_t stride, std::int32_t* ids,
                 float* weights, std::uint32_t n_tokens, std::uint32_t n_experts,
                 std::uint32_t k, hipStream_t stream) {
-  hipLaunchKernelGGL(RouterTopKKernel, dim3(n_tokens), dim3(kThreads), 0,
-                     stream, logits, stride, ids, weights, n_experts, k);
+  if (n_experts <= 512) {
+    hipLaunchKernelGGL((RouterTopKKernel<512>), dim3(n_tokens), dim3(kThreads),
+                       0, stream, logits, stride, ids, weights, n_experts, k);
+  } else {
+    hipLaunchKernelGGL((RouterTopKKernel<1024>), dim3(n_tokens), dim3(kThreads),
+                       0, stream, logits, stride, ids, weights, n_experts, k);
+  }
 }
 
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,
