@@ -190,8 +190,7 @@ void TestTable() {
       Check(truncated->Read(ids, out), "reader recovers after failed I/O");
       Check(out == expected, "failed I/O does not corrupt later rows");
       wide_ids[333] = rows;
-      Check(!truncated->Read(
-                wide_ids, std::span<float>(wide).first(wide_size)),
+      Check(!truncated->Read(wide_ids, std::span<float>(wide).first(wide_size)),
             "failed batched read drains outstanding jobs");
       Check(truncated->Read(ids, out), "reader recovers after batched failure");
       Check(out == expected, "batched failure preserves subsequent reads");
@@ -200,11 +199,68 @@ void TestTable() {
   std::filesystem::remove(path);
 }
 
+// Widely spaced rows exercise cache eviction, including simultaneous readers
+// whose compressed rows map to the same bounded-cache slot.
+void TestDistantRows() {
+  const auto path =
+      std::filesystem::temp_directory_path() / "qwen38_ngram_distant.bin";
+  constexpr std::uint32_t dim = 160;
+  constexpr std::uint32_t stride = 65536;
+  constexpr std::uint64_t offset = 4096 + 90;
+  constexpr std::uint32_t last = 7 * stride;
+  {
+    std::ofstream file(path, std::ios::binary);
+    for (std::uint32_t r = 0; r < 8; ++r) {
+      file.seekp(offset + static_cast<std::uint64_t>(r * stride) * dim * 2);
+      for (std::uint32_t col = 0; col < dim; ++col) {
+        const float value = static_cast<float>(r) + 1.25F +
+                            static_cast<float>(col % 16) / 16.0F;
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const auto bf = static_cast<std::uint16_t>(bits >> 16);
+        file.write(reinterpret_cast<const char*>(&bf), sizeof(bf));
+      }
+    }
+    Check(file.good(), "sparse row fixture written");
+  }
+  std::string error;
+  auto table = q::NgramTable::Open(path, offset, last + 2, dim,
+                                   gufo::core::GgmlType::kBF16, &error);
+  Check(table != nullptr, error.c_str());
+  if (table) {
+    std::vector<std::uint32_t> ids(80);
+    std::vector<float> out(ids.size() * dim + 16, -123.0F);
+    for (std::uint32_t round = 0; round < 4; ++round) {
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        ids[i] = static_cast<std::uint32_t>((i * 3 + round) % 8) * stride;
+      }
+      Check(table->Read(ids, std::span<float>(out).first(ids.size() * dim)),
+            "colliding row gather completes");
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        for (std::uint32_t col = 0; col < dim; ++col) {
+          const float expected = static_cast<float>(ids[i] / stride) + 1.25F +
+                                 static_cast<float>(col % 16) / 16.0F;
+          Check(out[i * dim + col] == expected,
+                "evicted row retains exact bytes");
+        }
+      }
+      const std::array<std::uint32_t, 1> missing{last + 1};
+      Check(!table->Read(missing, out), "incomplete row is not cached");
+    }
+    for (std::size_t i = ids.size() * dim; i < out.size(); ++i) {
+      Check(out[i] == -123.0F, "colliding gather output guard");
+    }
+  }
+  table.reset();
+  std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main() {
   TestHash();
   TestTable();
+  TestDistantRows();
   if (failures != 0) {
     std::fprintf(stderr, "%d failures\n", failures);
     return 1;

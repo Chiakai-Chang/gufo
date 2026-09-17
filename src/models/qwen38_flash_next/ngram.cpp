@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <cerrno>
 #include <cstring>
 #include <unordered_map>
@@ -18,6 +19,7 @@ constexpr std::size_t kPage = 4096;
 constexpr std::size_t kWorkers = 32;
 constexpr std::size_t kReadBatch = 8;
 constexpr std::size_t kBatchJobs = 1024;
+constexpr std::size_t kCacheBytes = 8 * 1024 * 1024;
 
 }  // namespace
 
@@ -90,6 +92,9 @@ std::unique_ptr<NgramTable> NgramTable::Open(const std::filesystem::path& path,
   t->type_ = type;
   t->row_dim_ = row_dim;
   t->row_bytes_ = row_dim / block * block_bytes;
+  t->cache_count_ = std::bit_floor(kCacheBytes / t->row_bytes_);
+  t->cache_entries_ = std::make_unique<CacheEntry[]>(t->cache_count_);
+  t->cache_rows_.resize(t->cache_count_ * t->row_bytes_);
   t->rows_ = rows;
   t->base_offset_ = file_offset;
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
@@ -137,16 +142,42 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
   // The aligned window may run past the end of the file: only the row's own
   // bytes have to arrive.
   const std::size_t needed = (offset - begin) + row_bytes_;
-  std::size_t got = 0;
-  while (got < needed) {
-    const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);
-    if (n <= 0) {
-      if (n < 0 && errno == EINTR) {
-        continue;
-      }
-      return false;
+  const std::size_t slot =
+      cache_count_ != 0 ? (row * 2654435761U) & (cache_count_ - 1) : 0;
+  CacheEntry* entry = cache_count_ != 0 ? &cache_entries_[slot] : nullptr;
+  std::uint8_t* cached =
+      entry != nullptr ? cache_rows_.data() + slot * row_bytes_ : nullptr;
+  bool hit = false;
+  // A busy slot is a cache miss: readers never wait for another row's I/O.
+  // The flag protects the tag and bytes together when colliding rows race.
+  if (entry != nullptr &&
+      !entry->busy.test_and_set(std::memory_order_acquire)) {
+    if (entry->valid && entry->row == row) {
+      std::memcpy(base + (offset - begin), cached, row_bytes_);
+      hit = true;
     }
-    got += static_cast<std::size_t>(n);
+    entry->busy.clear(std::memory_order_release);
+  }
+  if (!hit) {
+    std::size_t got = 0;
+    while (got < needed) {
+      const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);
+      if (n <= 0) {
+        if (n < 0 && errno == EINTR) {
+          continue;
+        }
+        return false;
+      }
+      got += static_cast<std::size_t>(n);
+    }
+    // Cache only a complete row, still in its original quantized format.
+    if (entry != nullptr &&
+        !entry->busy.test_and_set(std::memory_order_acquire)) {
+      std::memcpy(cached, base + (offset - begin), row_bytes_);
+      entry->row = row;
+      entry->valid = true;
+      entry->busy.clear(std::memory_order_release);
+    }
   }
   const std::uint8_t* src = base + (offset - begin);
   if (type_ == core::GgmlType::kIQ4_NL) {
@@ -166,18 +197,16 @@ void NgramTable::Worker() {
   std::vector<std::uint8_t> buf;
   std::unique_lock<std::mutex> lock(mutex_);
   for (;;) {
-    wake_.wait(lock, [&] {
-      return stop_ || (active_ && next_job_ < jobs_.size());
-    });
+    wake_.wait(lock,
+               [&] { return stop_ || (active_ && next_job_ < jobs_.size()); });
     if (stop_) {
       return;
     }
     // Large gathers amortize the queue lock. Small gathers keep one read
     // per worker, so decode does not serialize its few rows into a batch.
     std::array<Job, kReadBatch> batch;
-    const std::size_t count =
-        std::min(jobs_.size() >= kBatchJobs ? kReadBatch : 1,
-                 jobs_.size() - next_job_);
+    const std::size_t count = std::min(
+        jobs_.size() >= kBatchJobs ? kReadBatch : 1, jobs_.size() - next_job_);
     std::copy_n(jobs_.data() + next_job_, count, batch.data());
     next_job_ += count;
     lock.unlock();

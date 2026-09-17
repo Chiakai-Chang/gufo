@@ -2,6 +2,7 @@
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_NGRAM_HPP_
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -35,9 +36,9 @@ void HashNgramRows(const Config& config, NgramHistory& history,
                    std::span<const std::int32_t> tokens,
                    std::span<std::uint32_t> rows);
 
-/// Reads n-gram embedding rows straight from the GGUF shard with direct I/O,
-/// so the 27 GiB table never occupies RAM or the page cache. Rows are
-/// dequantized to F32 and laid out [token][head][ple_head_dim].
+/// Reads n-gram embedding rows from the GGUF shard with direct I/O and a
+/// bounded cache of compressed rows. The table stays out of the page cache.
+/// Rows are dequantized to F32 and laid out [token][head][ple_head_dim].
 class NgramTable {
 public:
   ~NgramTable();
@@ -78,6 +79,15 @@ private:
   };
   bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf);
   void Worker();
+
+  struct CacheEntry {
+    std::atomic_flag busy = ATOMIC_FLAG_INIT;
+    std::uint32_t row{0};
+    bool valid{false};
+  };
+  std::unique_ptr<CacheEntry[]> cache_entries_;
+  std::vector<std::uint8_t> cache_rows_;
+  std::size_t cache_count_{0};
 
   int fd_{-1};
   bool direct_{false};
