@@ -2575,8 +2575,10 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       (kKeys * kWmmaKStride > kHeadDim * kVtStride) ? (kKeys * kWmmaKStride)
                                                     : (kHeadDim * kVtStride);
   __shared__ __half kv_lds[kKvLdsHalves];
-  __shared__ float s_lds[2][kSTiles][16][16];
-  __shared__ __half p_lds[kRows][kKeys];
+  // Pad score rows for the four-lane softmax reads and probability rows
+  // for the WMMA fragments. Both transposes otherwise repeat LDS banks.
+  __shared__ float s_lds[2][kSTiles][16][17];
+  __shared__ __half p_lds[kRows][kKeys + 8];
   __shared__ float row_sum[kRows];
   __shared__ float row_scale[kRows];
 
