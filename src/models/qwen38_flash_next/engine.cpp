@@ -171,7 +171,9 @@ std::size_t Model::ResidentBytes() const noexcept {
 
 Session::Session(std::shared_ptr<Model> model,
                  std::unique_ptr<rocm::Session> session)
-    : model_(std::move(model)), session_(std::move(session)) {
+    : model_(std::move(model)),
+      session_(std::move(session)),
+      draft_length_(model_->options_.max_draft_tokens) {
   logits_.resize(model_->VocabSize());
   if (model_->HasMtp()) {
     verify_logits_.resize(
@@ -193,6 +195,7 @@ void Session::Reset() {
   session_->Reset();
   tokens_.clear();
   hidden_base_ = 0;
+  draft_length_.Reset();
   model_->executor_->MtpRewind(*session_, 0);
 }
 
@@ -292,8 +295,12 @@ bool Session::DecodeStep(std::size_t max_tokens,
   };
   rocm::Executor& exec = *model_->executor_;
   const std::size_t room = ContextSize() - tokens_.size();
-  const std::size_t width =
+  const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
+  const std::size_t width =
+      model_->HasMtp() && cap > 1
+          ? 1 + draft_length_.Choose(static_cast<std::uint32_t>(cap - 1))
+          : cap;
   if (width == 0) {
     result->stop = true;
     return true;
@@ -359,6 +366,9 @@ bool Session::DecodeStep(std::size_t max_tokens,
   stats_.cycles += 1;
   stats_.drafted += k - 1;
   stats_.accepted += keep - 1;
+  // A target stop ends the request; it does not classify the remaining
+  // proposals as failed predictions.
+  draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.

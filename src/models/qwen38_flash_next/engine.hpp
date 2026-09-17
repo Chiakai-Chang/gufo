@@ -12,14 +12,13 @@
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
+#include "src/models/qwen38_flash_next/mtp_policy.hpp"
 
 namespace gufo::core {
 class GgufReader;
 }
 
 namespace gufo::models::qwen38_flash_next {
-
-inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
 
 struct ModelWeights;
 struct MtpWeights;
@@ -35,7 +34,7 @@ struct ModelOptions {
   /// Optional MTP draft sidecar (`mtp-...-shared-*.gguf`). Empty leaves
   /// speculative decoding off.
   std::string mtp_model_path;
-  /// Tokens the draft block proposes per speculative cycle.
+  /// Maximum proposals per cycle; acceptance history selects the length.
   std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
 };
 
@@ -153,6 +152,7 @@ private:
   std::int32_t draft_token_{0};
   std::vector<float> verify_logits_;
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
+  MtpLengthController draft_length_;
   SpeculativeStats stats_;
 };
 

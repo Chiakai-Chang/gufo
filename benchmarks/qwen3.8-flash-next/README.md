@@ -13,7 +13,7 @@ stays on disk. Context, scratch and MTP add memory. NVMe loading takes about
 Nix release, C1, pp2048, tg128, seed 1, one prefill warm-up and one measured
 repetition (2026-09-16–17 UTC). Rates are tok/s. Depth precedes the measured operation;
 fixed-length generation continues past EOS. MTP scores the full vocabulary
-and proposes up to seven drafts per cycle.
+and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
@@ -25,17 +25,17 @@ and proposes up to seven drafts per cycle.
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 24.19 | 36.64 | 51.0% |
-| Greedy | 4096 | 23.31 | 27.53 | 37.6% |
-| Temperature 0.7 | 0 | TODO | 25.57 | 34.9% |
-| Temperature 0.7 | 4096 | TODO | 48.65 | 92.4% |
+| Greedy | 0 | 24.19 | 40.70 | 71.0% |
+| Greedy | 4096 | 23.31 | 34.45 | 63.7% |
+| Temperature 0.7 | 0 | TODO | 35.07 | 65.5% |
+| Temperature 0.7 | 4096 | TODO | 46.93 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
 Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
-The AR depth sweep uses one 133,121-token context limit throughout; the MTP
-controls use 6,145. AR PP loses 15.7% from d0 to d128K. Near-flat throughput
+The AR depth sweep uses one 133,121-token context limit throughout; MTP PP
+uses 6,145 and TG uses 4,225. AR PP loses 15.7% from d0 to d128K. Near-flat throughput
 across that range remains TODO; profiling identifies sparse attention as
 the main shallow-to-deep cost.
 
@@ -56,10 +56,11 @@ The [projection sweep](tools/projection_plans.hip) uses `tools/bench/build.sh`.
 
 `prompt`, `chat` and `serve llm` share MTP and sampling options. Drafts are
 greedy over the full vocabulary on the GPU; verification uses the target
-sampler with its filters, penalties and RNG. Chains support 1–7 drafts.
-Adaptive MTP: TODO. Shorter chains favored
-short prefixes; longer chains favored the repetitive 4K case. Fixed seven-draft
-chains can be slower than AR when acceptance is low.
+sampler with its filters, penalties and RNG. Adaptive MTP is the default;
+`--draft-tokens` caps the chain at 1–7 drafts. The controller estimates
+accepted output per unit of work, counts only the first rejected proposal
+as a failure, and resets with the session. Its decisions depend on acceptance
+history, never wall-clock timings.
 
 ## Quality checks
 
