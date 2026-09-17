@@ -5,7 +5,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -181,6 +181,16 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
 
   const auto ref = Download(&d_ref, q_count);
   const auto out = Download(&d_wmma, q_count);
+  if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
+                              mask_ptr, mask_words, d_wmma.get(), n_tokens,
+                              start_pos, kHeads, kKvHeads, kDim, kRatio,
+                              nullptr)) {
+    throw std::runtime_error("WMMA attention replay rejected the geometry");
+  }
+  const auto replay = Download(&d_wmma, q_count);
+  if (std::memcmp(out.data(), replay.data(), q_count * sizeof(float)) != 0) {
+    throw std::runtime_error("WMMA attention replay changed the output");
+  }
   double worst = 0.0;
   for (std::size_t i = 0; i < q_count; ++i) {
     if (!std::isfinite(out[i])) {
@@ -188,7 +198,7 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     }
     worst = std::max(worst, std::abs(static_cast<double>(ref[i] - out[i])));
   }
-  if (std::getenv("QFN_ATTN_DEBUG") != nullptr && worst > 1e-2) {
+  if (worst > 1e-2) {
     for (std::uint32_t t = 0; t < n_tokens; ++t) {
       for (std::uint32_t h = 0; h < kHeads; ++h) {
         double w = 0.0;
@@ -219,7 +229,8 @@ int main() {
     const Case cases[] = {{4, 4096, false, false}, {3, 9000, true, true},
                           {100, 0, false, false},  {64, 37, false, false},
                           {100, 0, true, false},   {77, 51, true, false},
-                          {96, 4096, true, true},  {70, 8000, true, true}};
+                          {96, 4096, true, true},  {70, 8000, true, true},
+                          {5, 131069, true, true}};
     bool ok = true;
     std::uint32_t seed = 0x1234ABCDU;
     for (const Case& c : cases) {

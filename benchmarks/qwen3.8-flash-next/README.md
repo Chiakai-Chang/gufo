@@ -17,24 +17,27 @@ and proposes up to seven drafts per cycle.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1253.96 | 1254.58 |
-| 4096 | 1146.71 | 1112.38 |
-| 16384 | 1103.66 | TODO |
-| 32768 | 1084.28 | TODO |
+| 0 | 1235.61 | 1260.10 |
+| 4096 | TODO | 1128.31 |
+| 16384 | 1122.91 | TODO |
+| 32768 | 1105.16 | TODO |
+| 131072 | 1041.99 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 24.19 | 36.77 | 51.0% |
-| Greedy | 4096 | 23.31 | 27.41 | 37.6% |
-| Temperature 0.7 | 0 | TODO | 25.56 | 34.9% |
-| Temperature 0.7 | 4096 | TODO | 48.44 | 92.4% |
+| Greedy | 0 | 24.19 | 36.64 | 51.0% |
+| Greedy | 4096 | 23.31 | 27.53 | 37.6% |
+| Temperature 0.7 | 0 | TODO | 25.57 | 34.9% |
+| Temperature 0.7 | 4096 | TODO | 48.65 | 92.4% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
 Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
-PP loses about 1.8% from 16K to 32K. Profiling attributes the larger shallow-to-deep
-step to sparse attention; 128K remains unmeasured.
+The AR depth sweep uses one 133,121-token context limit throughout; the MTP
+controls use 6,145. AR PP loses 15.7% from d0 to d128K. Near-flat throughput
+across that range remains TODO; profiling identifies sparse attention as
+the main shallow-to-deep cost.
 
 ```sh
 ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \
@@ -79,6 +82,7 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
   and bitwise replay, including ragged sizes and fallback shapes.
   Wave64 prefill projections check every output against MMQ, sampled FP64
   dots at the production shape and bitwise replay.
+  Attention checks include a ragged batch near 128K and bitwise replay.
   MTP token selection matches the CPU rule, including ties and graph replay.
 - Upload tests check bytes, guards, shard/chunk boundaries and invalid inputs.
   N-gram tests check asynchronous reads, duplicates, failed I/O and teardown.

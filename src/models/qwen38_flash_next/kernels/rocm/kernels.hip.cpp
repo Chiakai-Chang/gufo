@@ -2527,10 +2527,13 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   // Key position of tile row `r` (0..15), or context_end past the tile.
   const auto tile_key = [&](const Tile& tile, std::uint32_t r) {
     const std::uint32_t i = r / ratio;
-    const std::uint32_t blk = i == 0   ? tile.block[0]
-                              : i == 1 ? tile.block[1]
-                              : i == 2 ? tile.block[2]
-                                       : tile.block[3];
+    std::uint32_t blk = n_blocks;
+#pragma unroll
+    for (std::uint32_t j = 0; j < kBlocksPerTile; ++j) {
+      if (i == j) {
+        blk = tile.block[j];
+      }
+    }
     return blk < n_blocks ? (blk * ratio) + (r % ratio) : context_end;
   };
 
