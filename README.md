@@ -41,23 +41,29 @@ Gufo and `llama.cpp` were benchmarked on the same Strix Halo machine and the sam
 On 2026-09-17, the Q4 target and `DFlash2-Q4_K_M` draft were run on the [corpus suite](benchmarks/qwen3.8-27b/speculative-corpus.json) with production chat framing, greedy decoding, a 128-token output limit, and one run per case. These short prompts have no prepared context depth, so their results are separate from the depth sweep. “Mixed” contains nine non-repetitive prompts; “repetition” contains the two repetitive prompts. Throughput is total generated tokens divided by total generation time within each group. Acceptance is accepted draft tokens divided by proposed draft tokens. All 11 DFlash2 completions matched Gufo's non-speculative output token for token.
 
 | Corpus group | Cases | Gufo AR `tg≤128` | Gufo DFlash2 `tg≤128` | Acceptance | DFlash2 / Gufo AR | llama.cpp AR `tg≤128` | llama.cpp / Gufo exact |
-| -----------: | ----: | ---------------: | --------------------: | ---------: | ----------------: | ---------------------: | ----------------------: |
-|        Mixed |     9 |            11.69 |                 29.26 |      48.3% |             2.50x |                  12.00 |                     3/9 |
-|   Repetition |     2 |            11.72 |                 53.83 |      89.6% |             4.59x |                  11.99 |                     1/2 |
+| -----------: | ----: | ---------------: | --------------------: | ---------: | ----------------: | --------------------: | ---------------------: |
+|        Mixed |     9 |            11.69 |                 29.26 |      48.3% |             2.50x |                 12.00 |                    3/9 |
+|   Repetition |     2 |            11.72 |                 53.83 |      89.6% |             4.59x |                 11.99 |                    1/2 |
 
 The corpus llama.cpp run used the supplied nixpkgs `llama-completion` binary (version `7d56da7`, package `llama-cpp-10063`) and the same Q4 target, prompt tokens, and greedy output limit. Its reported rate is decode evaluation tokens divided by decode evaluation time, excluding the first-token evaluation. Four of its 11 completion texts exactly matched Gufo's. The other seven diverged in generated content despite identical prompt tokens, so no DFlash2 / llama.cpp speedup is claimed from this corpus.
 
-With concurrency token generation using the dflash2 drafter (cumulative)
+#### Concurrency (measured 2026-09-17)
 
-_Illustrative facsimile data; these are not measured benchmark results._
+The same corpus was replayed through the HTTP serving harness ([`tools/serving/gufo-serving-bench.py`](tools/serving/gufo-serving-bench.py), artifacts in [`benchmarks/qwen3.8-27b/serving/`](benchmarks/qwen3.8-27b/serving/)) at concurrency 1, 2, 4, 6, and 8 against `gufo serve` autoregressive, `gufo serve --speculative dflash2`, and `llama-server`. Every level sends synchronized waves of C distinct prompts (greedy, 128-token limit, thinking off); a group that does not divide evenly is padded by cycling prompts from the start, and the repetition group runs C copies of its two prompts per wave. Each level runs one warmup wave plus three repetitions of every wave. Values are **end-to-end aggregate output tokens per second**: total completion tokens divided by the summed wall time of the waves, so prefill, queueing, and the slowest request in each wave are all included. This is not the decode-only `tg` rate above. Cells read `mixed / repetition`.
 
-| Concurrency | Gufo `pp2048/tg128` | Over llama.cpp `pp2048/tg128` | DFlash2 mixed corpus/repetition `tg128` | DFlash2 over llama.cpp `tg128` |
-| ----------: | ------------------: | ----------------------------: | --------------------------------------: | -----------------------------: |
-|           1 |       545.15 / 7.10 |                   155% / 156% |                           36.46 / 62.06 |                   801% / 1364% |
-|           2 |       529.80 / 6.90 |                   152% / 157% |                           41.85 / 84.07 |                   951% / 1911% |
-|           4 |       503.40 / 6.70 |                   147% / 160% |                           46.48 / 94.43 |                  1107% / 2248% |
-|           6 |       476.60 / 6.40 |                   142% / 160% |                           55.02 / 96.06 |                  1376% / 2402% |
-|           8 |       451.20 / 6.20 |                   141% / 163% |                          56.73 / 100.37 |                  1493% / 2641% |
+The reference outputs are Gufo AR at C=1. "llama.cpp exact" counts requests whose completion hash matched that reference. The ratio columns divide aggregate rates over all requests (DFlash2 over Gufo AR, Gufo AR over llama.cpp), so the llama.cpp ratio at C>1 compares throughput on outputs that mostly differ from the greedy reference; read it together with the exact column. Every Gufo AR and Gufo DFlash2 completion at every level matched the reference byte for byte. Acceptance is accepted draft tokens over proposed draft tokens across the level.
+
+Servers: `gufo serve --sessions 8 llm --context 4096 --think off` with `Qwen3.8-27B-UD-Q4_K_XL` (DFlash2 run adds `--speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M --draft-policy adaptive --draft-tokens 7`); `llama-server` `7d56da7` (nixpkgs `llama-cpp-10063`) with the same GGUF, `-ngl 999 -np 8 -c 32768 -fa on --cache-reuse 0 --jinja --reasoning off`, and `cache_prompt=false` on every request. One server process per column for the whole sweep. Gufo's in-memory continuation cache cannot be disabled, so repeated prompts across waves reuse their prefill there; the prompts are 30-200 tokens, so this changes wave time by well under 1%.
+
+| Concurrency |       Gufo AR |  Gufo DFlash2 | DFlash2 acceptance | DFlash2 / Gufo AR |  llama.cpp AR | llama.cpp exact | Gufo AR / llama.cpp |
+| ----------: | ------------: | ------------: | -----------------: | ----------------: | ------------: | --------------: | ------------------: |
+|           1 | 11.72 / 11.84 | 29.31 / 43.77 |      49.6% / 71.1% |     2.50x / 3.70x | 11.67 / 11.70 |     18/27 / 3/6 |       1.00x / 1.01x |
+|           2 | 20.99 / 23.07 | 36.10 / 48.92 |      51.7% / 71.1% |     1.72x / 2.12x | 12.47 / 11.41 |     12/30 / 2/6 |       1.68x / 2.02x |
+|           4 | 38.95 / 41.88 | 43.74 / 57.89 |      54.2% / 71.1% |     1.12x / 1.38x | 17.86 / 20.10 |     2/36 / 5/12 |       2.18x / 2.08x |
+|           6 | 53.42 / 56.76 | 45.90 / 59.78 |      54.2% / 71.1% |     0.86x / 1.05x | 17.73 / 23.35 |     0/36 / 9/18 |       3.01x / 2.43x |
+|           8 | 62.99 / 67.77 | 47.56 / 65.16 |      52.1% / 71.1% |     0.76x / 0.96x | 24.67 / 29.35 |     0/48 / 8/24 |       2.55x / 2.31x |
+
+DFlash2 raises aggregate throughput up to C=4 on the mixed corpus and up to C=6 on the repetition corpus; beyond that the batched autoregressive path delivers more tokens per second with the same outputs. llama.cpp keeps pace with Gufo AR only at C=1: its aggregate rate reaches 24.67 tok/s at C=8 against 62.99 for Gufo AR, its per-request decode rate falls to 4-6 tok/s under load, and its completions diverge from the greedy reference as batch width grows (0 of 48 mixed requests match at C=8),.
 
 #### DeepSeek V4 Flash
 

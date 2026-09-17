@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterable
 
 
 BENCHMARK_SCHEMA = "gufo.serving-benchmark.v1"
+ENDPOINT_PROFILES = ("gufo", "openai")
 DEFAULT_PROMPT = (
     "Explain how a bounded continuous-serving scheduler can preserve "
     "single-request latency while allowing several independent requests to "
@@ -56,15 +57,18 @@ class RequestObservation:
     wall_ms: float
     client_ttft_ms: float | None
     client_event_inter_token_ms: float | None
-    queue_ms: float
-    prefill_ms: float
-    decode_ms: float
-    server_ttft_ms: float
-    server_inter_token_ms: float
-    server_max_inter_token_ms: float
-    requested_logical_concurrency: int
-    physical_execution_width: int
-    execution_plan: str
+    # Server-side fields are None when the endpoint supplies no metrics
+    # (endpoint profile "openai" without llama-server timings).
+    queue_ms: float | None
+    prefill_ms: float | None
+    decode_ms: float | None
+    server_ttft_ms: float | None
+    server_inter_token_ms: float | None
+    server_max_inter_token_ms: float | None
+    requested_logical_concurrency: int | None
+    physical_execution_width: int | None
+    execution_plan: str | None
+    metrics_source: str
     cache_hit: bool
     draft_tokens: int
     draft_accepted_tokens: int
@@ -98,6 +102,7 @@ class RoundObservation:
     def public(self) -> dict[str, Any]:
         return {
             "repetition": self.repetition,
+            "sampleCount": len(self.samples),
             "span_ms": self.span_ms,
             "prefill_tokens_per_second": self.prefill_tokens_per_second,
             "output_tokens_per_second": self.output_tokens_per_second,
@@ -174,6 +179,8 @@ def load_prompt_suite(
     quick: bool = False,
     limit: int | None = None,
     selected: set[str] | None = None,
+    categories: set[str] | None = None,
+    excluded_categories: set[str] | None = None,
 ) -> list[PromptCase]:
     document = json.loads(path.read_text(encoding="utf-8"))
     prompts = document.get("prompts") if isinstance(document, dict) else None
@@ -182,6 +189,7 @@ def load_prompt_suite(
 
     result: list[PromptCase] = []
     seen: set[str] = set()
+    seen_categories: set[str] = set()
     for entry in prompts:
         if not isinstance(entry, dict):
             raise ValueError("suite prompt entries must be objects")
@@ -200,7 +208,12 @@ def load_prompt_suite(
         if identifier in seen:
             raise ValueError(f"suite contains duplicate case id: {identifier}")
         seen.add(identifier)
+        seen_categories.add(category)
         if selected is not None and identifier not in selected:
+            continue
+        if categories is not None and category not in categories:
+            continue
+        if excluded_categories is not None and category in excluded_categories:
             continue
         if quick and not bool(entry.get("quick")):
             continue
@@ -212,6 +225,14 @@ def load_prompt_suite(
             raise ValueError(
                 f"unknown suite case(s): {', '.join(sorted(missing))}"
             )
+    for requested in (categories, excluded_categories):
+        if requested is not None:
+            missing = requested - seen_categories
+            if missing:
+                raise ValueError(
+                    "unknown suite category(s): "
+                    + ", ".join(sorted(missing))
+                )
     if not result:
         raise ValueError("suite selection produced no prompts")
     return result if limit is None else result[:limit]
@@ -237,6 +258,27 @@ def _required_integer(mapping: dict[str, Any], name: str) -> int:
     value = _required_number(mapping, name)
     if not value.is_integer():
         raise RuntimeError(f"terminal usage has non-integral gufo.{name}")
+    return int(value)
+
+
+def _optional_number(mapping: dict[str, Any], name: str) -> float | None:
+    value = mapping.get(name)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise RuntimeError(f"timings has invalid {name}")
+    return value
+
+
+def _optional_integer(
+    mapping: dict[str, Any], name: str, default: int
+) -> int:
+    value = _optional_number(mapping, name)
+    if value is None:
+        return default
+    if not value.is_integer():
+        raise RuntimeError(f"timings has non-integral {name}")
     return int(value)
 
 
@@ -278,18 +320,23 @@ def run_request(
     category: str | None = None,
     start_gate: threading.Barrier | None = None,
     clock: Callable[[], float] = time.perf_counter,
+    endpoint_profile: str = "gufo",
+    cache_prompt: bool | None = None,
 ) -> RequestObservation:
-    body = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        },
-        separators=(",", ":"),
-    ).encode("utf-8")
+    if endpoint_profile not in ENDPOINT_PROFILES:
+        raise ValueError("endpoint profile must be gufo or openai")
+    payload: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    if cache_prompt is not None:
+        # llama-server honours this field; gufo ignores unknown fields.
+        payload["cache_prompt"] = cache_prompt
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/chat/completions",
         data=body,
@@ -305,6 +352,7 @@ def run_request(
         start_gate.wait()
     started_at = clock()
     usage: dict[str, Any] | None = None
+    timings: dict[str, Any] | None = None
     useful_event_times: list[float] = []
     completion_parts: list[str] = []
     saw_done = False
@@ -344,6 +392,10 @@ def run_request(
                 candidate_usage = chunk.get("usage")
                 if isinstance(candidate_usage, dict):
                     usage = candidate_usage
+                # llama-server attaches `timings` to its final chunk.
+                candidate_timings = chunk.get("timings")
+                if isinstance(candidate_timings, dict):
+                    timings = candidate_timings
     except urllib.error.HTTPError as exception:
         raise _http_error(exception) from exception
     except urllib.error.URLError as exception:
@@ -355,15 +407,22 @@ def run_request(
     if not saw_done:
         raise RuntimeError("serving stream ended without [DONE]")
     if usage is None:
+        if endpoint_profile == "gufo":
+            raise RuntimeError(
+                "serving stream omitted terminal usage; rebuild the server "
+                "with the canonical benchmark metrics extension"
+            )
         raise RuntimeError(
-            "serving stream omitted terminal usage; rebuild the server with "
-            "the canonical benchmark metrics extension"
+            "serving stream omitted terminal usage; the endpoint must honour "
+            "stream_options.include_usage"
         )
 
     prompt_tokens = usage.get("prompt_tokens")
     completion_tokens = usage.get("completion_tokens")
     details = usage.get("prompt_tokens_details", {})
     metrics = usage.get("gufo")
+    if endpoint_profile == "openai" and not isinstance(metrics, dict):
+        metrics = None
     if (
         isinstance(prompt_tokens, bool)
         or not isinstance(prompt_tokens, int)
@@ -372,7 +431,8 @@ def run_request(
         or not isinstance(completion_tokens, int)
         or completion_tokens < 0
         or not isinstance(details, dict)
-        or not isinstance(metrics, dict)
+        or (metrics is None and endpoint_profile == "gufo")
+        or (metrics is not None and not isinstance(metrics, dict))
     ):
         raise RuntimeError("terminal usage has an incompatible schema")
     cached_prompt_tokens = details.get("cached_tokens", 0)
@@ -396,28 +456,65 @@ def run_request(
     ):
         raise RuntimeError("terminal usage has invalid draft token counts")
 
-    prefill_tokens = _required_integer(metrics, "prefill_tokens")
-    queue_ms = _required_number(metrics, "queue_ms")
-    prefill_ms = _required_number(metrics, "prefill_ms")
-    decode_ms = _required_number(metrics, "decode_ms")
-    server_ttft_ms = _required_number(metrics, "ttft_ms")
-    server_inter_token_ms = _required_number(
-        metrics, "mean_inter_token_ms"
-    )
-    server_max_inter_token_ms = _required_number(
-        metrics, "max_inter_token_ms"
-    )
-    requested_logical_concurrency = _required_integer(
-        metrics, "requested_logical_concurrency"
-    )
-    physical_execution_width = _required_integer(
-        metrics, "physical_execution_width"
-    )
-    execution_plan = metrics.get("execution_plan")
-    if not isinstance(execution_plan, str) or not execution_plan:
-        raise RuntimeError(
-            "terminal usage is missing string gufo.execution_plan"
+    queue_ms: float | None = None
+    prefill_ms: float | None = None
+    decode_ms: float | None = None
+    server_ttft_ms: float | None = None
+    server_inter_token_ms: float | None = None
+    server_max_inter_token_ms: float | None = None
+    requested_logical_concurrency: int | None = None
+    physical_execution_width: int | None = None
+    execution_plan: str | None = None
+    cache_hit = cached_prompt_tokens > 0
+    if metrics is not None:
+        metrics_source = "gufo"
+        prefill_tokens = _required_integer(metrics, "prefill_tokens")
+        queue_ms = _required_number(metrics, "queue_ms")
+        prefill_ms = _required_number(metrics, "prefill_ms")
+        decode_ms = _required_number(metrics, "decode_ms")
+        server_ttft_ms = _required_number(metrics, "ttft_ms")
+        server_inter_token_ms = _required_number(
+            metrics, "mean_inter_token_ms"
         )
+        server_max_inter_token_ms = _required_number(
+            metrics, "max_inter_token_ms"
+        )
+        requested_logical_concurrency = _required_integer(
+            metrics, "requested_logical_concurrency"
+        )
+        physical_execution_width = _required_integer(
+            metrics, "physical_execution_width"
+        )
+        execution_plan = metrics.get("execution_plan")
+        if not isinstance(execution_plan, str) or not execution_plan:
+            raise RuntimeError(
+                "terminal usage is missing string gufo.execution_plan"
+            )
+        cache_hit = bool(metrics.get("cache_hit", cache_hit))
+    elif timings is not None:
+        # llama-server `timings`: prompt_n counts prompt tokens actually
+        # evaluated, cache_n the tokens reused from its prompt cache.
+        metrics_source = "llama_timings"
+        prefill_tokens = _optional_integer(timings, "prompt_n", prompt_tokens)
+        llama_cached = _optional_integer(timings, "cache_n", 0)
+        if llama_cached > cached_prompt_tokens:
+            cached_prompt_tokens = min(llama_cached, prompt_tokens)
+        cache_hit = cache_hit or llama_cached > 0
+        prefill_ms = _optional_number(timings, "prompt_ms")
+        decode_ms = _optional_number(timings, "predicted_ms")
+        predicted_n = _optional_integer(timings, "predicted_n", 0)
+        if decode_ms is not None and predicted_n > 1:
+            server_inter_token_ms = decode_ms / (predicted_n - 1)
+        if draft_tokens == 0:
+            draft_tokens = _optional_integer(timings, "draft_n", 0)
+            draft_accepted_tokens = _optional_integer(
+                timings, "draft_n_accepted", 0
+            )
+            if draft_accepted_tokens > draft_tokens:
+                raise RuntimeError("timings has invalid draft token counts")
+    else:
+        metrics_source = "none"
+        prefill_tokens = prompt_tokens - cached_prompt_tokens
 
     wall_ms = (finished_at - started_at) * 1000.0
     client_ttft_ms = (
@@ -456,7 +553,8 @@ def run_request(
         requested_logical_concurrency=requested_logical_concurrency,
         physical_execution_width=physical_execution_width,
         execution_plan=execution_plan,
-        cache_hit=bool(metrics.get("cache_hit", cached_prompt_tokens > 0)),
+        metrics_source=metrics_source,
+        cache_hit=cache_hit,
         draft_tokens=draft_tokens,
         draft_accepted_tokens=draft_accepted_tokens,
         draft_acceptance=(
@@ -467,8 +565,12 @@ def run_request(
         completion_sha256=hashlib.sha256(
             "".join(completion_parts).encode("utf-8")
         ).hexdigest(),
-        prefill_tokens_per_second=_rate(prefill_tokens, prefill_ms),
-        decode_tokens_per_second=_rate(completion_tokens, decode_ms),
+        prefill_tokens_per_second=(
+            None if prefill_ms is None else _rate(prefill_tokens, prefill_ms)
+        ),
+        decode_tokens_per_second=(
+            None if decode_ms is None else _rate(completion_tokens, decode_ms)
+        ),
         whole_request_tokens_per_second=_rate(useful_tokens, wall_ms),
         started_at=started_at,
         finished_at=finished_at,
@@ -509,6 +611,8 @@ def _run_round(
     concurrency: int,
     repetition: int,
     run_nonce: str,
+    endpoint_profile: str = "gufo",
+    cache_prompt: bool | None = None,
 ) -> RoundObservation:
     start_gate = threading.Barrier(concurrency + 1)
 
@@ -529,6 +633,8 @@ def _run_round(
             repetition=repetition,
             request_index=index,
             start_gate=start_gate,
+            endpoint_profile=endpoint_profile,
+            cache_prompt=cache_prompt,
         )
 
     with concurrent.futures.ThreadPoolExecutor(
@@ -551,6 +657,8 @@ def _run_corpus_round(
     concurrency: int,
     repetition: int,
     group_index: int,
+    endpoint_profile: str = "gufo",
+    cache_prompt: bool | None = None,
 ) -> RoundObservation:
     if len(cases) != concurrency:
         raise ValueError("corpus round must contain exactly C prompt cases")
@@ -575,6 +683,8 @@ def _run_corpus_round(
             case_id=case.identifier,
             category=case.category,
             start_gate=start_gate,
+            endpoint_profile=endpoint_profile,
+            cache_prompt=cache_prompt,
         )
 
     with concurrent.futures.ThreadPoolExecutor(
@@ -640,45 +750,135 @@ def _grouped_speculative_summary(
     }
 
 
-def _annotate_corpus_exactness(results: dict[str, Any]) -> None:
-    baseline = results.get("c1")
-    if not isinstance(baseline, dict):
+def _warn_capacity(
+    warnings: list[str], concurrency: int, summary: dict[str, Any]
+) -> None:
+    reported = summary["logicalConcurrency"]
+    if not reported:
         return
-    baseline_cases = baseline.get("cases")
-    if not isinstance(baseline_cases, dict):
-        return
+    observed_capacity = max(reported)
+    if observed_capacity < concurrency:
+        warnings.append(
+            f"C={concurrency} exceeded the server's reported logical "
+            f"capacity {observed_capacity}; queueing is included"
+        )
+
+
+def reference_hashes_from_report(report: dict[str, Any]) -> dict[str, str]:
+    """Extract per-case C=1 completion hashes from a corpus artifact."""
+    results = report.get("results") if isinstance(report, dict) else None
+    baseline = results.get("c1") if isinstance(results, dict) else None
+    cases = baseline.get("cases") if isinstance(baseline, dict) else None
+    if not isinstance(cases, dict):
+        raise ValueError("reference report has no C=1 corpus case summaries")
     references = {
         case_id: summary["completionHashes"][0]
-        for case_id, summary in baseline_cases.items()
+        for case_id, summary in cases.items()
         if isinstance(summary, dict)
         and len(summary.get("completionHashes", [])) == 1
     }
+    if not references:
+        raise ValueError("reference report has no stable C=1 completions")
+    return references
+
+
+def load_reference_report(path: Path) -> dict[str, Any]:
+    report = json.loads(path.read_text(encoding="utf-8"))
+    workload = report.get("workload", {}) if isinstance(report, dict) else {}
+    return {
+        "source": "report",
+        "workloadId": workload.get("id"),
+        "suiteSha256": workload.get("suiteSha256"),
+        "modelId": report.get("model", {}).get("id"),
+        "hashes": reference_hashes_from_report(report),
+    }
+
+
+def _annotate_corpus_exactness(
+    results: dict[str, Any],
+    references: dict[str, str] | None = None,
+) -> str:
+    """Compare every sample against per-case reference hashes.
+
+    References default to this run's own C=1 completions. Returns the
+    reference source used ("self-c1", "report", or "none").
+    """
+    source = "report"
+    if references is None:
+        source = "self-c1"
+        baseline = results.get("c1")
+        baseline_cases = (
+            baseline.get("cases") if isinstance(baseline, dict) else None
+        )
+        if not isinstance(baseline_cases, dict):
+            return "none"
+        references = {
+            case_id: summary["completionHashes"][0]
+            for case_id, summary in baseline_cases.items()
+            if isinstance(summary, dict)
+            and len(summary.get("completionHashes", [])) == 1
+        }
     for result in results.values():
         if not isinstance(result, dict):
             continue
         cases = result.get("cases")
+        matched_cases = 0
         if isinstance(cases, dict):
             for case_id, summary in cases.items():
                 reference = references.get(case_id)
                 hashes = summary.get("completionHashes", [])
-                summary["matchesC1"] = (
+                matches = (
                     reference is not None
                     and bool(hashes)
                     and all(value == reference for value in hashes)
                 )
+                summary["matchesReference"] = matches
+                summary["matchesC1"] = matches
+                matched_cases += matches
         compared = 0
         exact = 0
-        for sample in result.get("samples", []):
+        samples = result.get("samples", [])
+        sample_matches: list[bool | None] = []
+        for sample in samples:
             reference = references.get(sample.get("case_id"))
             if reference is None:
+                sample_matches.append(None)
                 continue
             compared += 1
-            exact += sample.get("completion_sha256") == reference
+            matched = sample.get("completion_sha256") == reference
+            exact += matched
+            sample_matches.append(matched)
+        # Samples are stored round by round; a round whose requests all
+        # matched the reference contributes to the matched-subset rate.
+        matched_rounds = 0
+        matched_span_ms = 0.0
+        matched_output_tokens = 0
+        offset = 0
+        for round_ in result.get("rounds", []):
+            count = round_.get("sampleCount", 0)
+            window = sample_matches[offset : offset + count]
+            round_samples = samples[offset : offset + count]
+            offset += count
+            if count and all(window):
+                matched_rounds += 1
+                matched_span_ms += round_["span_ms"]
+                matched_output_tokens += sum(
+                    sample["completion_tokens"] for sample in round_samples
+                )
         result["completionExactness"] = {
             "comparedRequests": compared,
             "exactRequests": exact,
             "exactRate": exact / compared if compared else None,
+            "comparedCases": len(cases) if isinstance(cases, dict) else 0,
+            "matchedCases": matched_cases,
+            "matchedRounds": matched_rounds,
+            "matchedRoundOutputTokensPerSecond": (
+                matched_output_tokens * 1000.0 / matched_span_ms
+                if matched_span_ms > 0.0
+                else None
+            ),
         }
+    return source
 
 
 def _summarize_rounds(
@@ -738,13 +938,28 @@ def _summarize_rounds(
         },
         "aggregate": aggregate,
         "executionPlans": sorted(
-            {sample.execution_plan for sample in samples}
+            {
+                sample.execution_plan
+                for sample in samples
+                if sample.execution_plan is not None
+            }
         ),
         "logicalConcurrency": sorted(
-            {sample.requested_logical_concurrency for sample in samples}
+            {
+                sample.requested_logical_concurrency
+                for sample in samples
+                if sample.requested_logical_concurrency is not None
+            }
         ),
         "physicalExecutionWidths": sorted(
-            {sample.physical_execution_width for sample in samples}
+            {
+                sample.physical_execution_width
+                for sample in samples
+                if sample.physical_execution_width is not None
+            }
+        ),
+        "metricsSources": sorted(
+            {sample.metrics_source for sample in samples}
         ),
         "rounds": [round_.public() for round_ in rounds],
         "samples": [sample.public() for sample in samples],
@@ -774,6 +989,9 @@ def run_benchmark(
     source_revision: str,
     source_dirty: bool,
     prompt_repeat: int = 1,
+    endpoint_profile: str = "gufo",
+    cache_prompt: bool | None = None,
+    notes: list[str] | None = None,
 ) -> dict[str, Any]:
     if not model:
         raise ValueError("model must not be empty")
@@ -783,6 +1001,8 @@ def run_benchmark(
         raise ValueError("token and repetition counts are invalid")
     if not 0.0 <= temperature <= 2.0:
         raise ValueError("temperature must be between zero and two")
+    if endpoint_profile not in ENDPOINT_PROFILES:
+        raise ValueError("endpoint profile must be gufo or openai")
 
     run_nonce = uuid.uuid4().hex
     results: dict[str, Any] = {}
@@ -799,6 +1019,8 @@ def run_benchmark(
                 concurrency=concurrency,
                 repetition=-(warmup + 1),
                 run_nonce=run_nonce,
+                endpoint_profile=endpoint_profile,
+                cache_prompt=cache_prompt,
             )
         rounds = [
             _run_round(
@@ -811,17 +1033,14 @@ def run_benchmark(
                 concurrency=concurrency,
                 repetition=repetition,
                 run_nonce=run_nonce,
+                endpoint_profile=endpoint_profile,
+                cache_prompt=cache_prompt,
             )
             for repetition in range(repetitions)
         ]
         summary = _summarize_rounds(rounds)
         results[f"c{concurrency}"] = summary
-        observed_capacity = max(summary["logicalConcurrency"])
-        if observed_capacity < concurrency:
-            warnings.append(
-                f"C={concurrency} exceeded the server's reported logical "
-                f"capacity {observed_capacity}; queueing is included"
-            )
+        _warn_capacity(warnings, concurrency, summary)
 
     fingerprint_id = fingerprint.get("fingerprintId")
     canonical = fingerprint.get("canonical")
@@ -853,13 +1072,20 @@ def run_benchmark(
             "warmupRounds": warmup_rounds,
             "repetitions": repetitions,
             "concurrency": concurrency_levels,
+            "endpointProfile": endpoint_profile,
+            "cachePrompt": cache_prompt,
         },
+        "notes": list(notes or []),
         "metricDefinitions": {
             "prefill_tokens_per_second": (
                 "actual server prefill tokens divided by server prefill time"
             ),
             "decode_tokens_per_second": (
                 "completion tokens divided by server decode time"
+            ),
+            "aggregate_output_tokens_per_second": (
+                "overall: completion tokens divided by the sum of measured "
+                "round spans (end-to-end, includes prefill and queueing)"
             ),
             "server_inter_token_ms": (
                 "mean scheduler-observed interval between generated tokens"
@@ -900,6 +1126,10 @@ def run_corpus_benchmark(
     source_dirty: bool,
     suite_bytes: bytes,
     corpus_layout: str = "distinct",
+    endpoint_profile: str = "gufo",
+    cache_prompt: bool | None = None,
+    reference: dict[str, Any] | None = None,
+    notes: list[str] | None = None,
 ) -> dict[str, Any]:
     if not model:
         raise ValueError("model must not be empty")
@@ -911,6 +1141,8 @@ def run_corpus_benchmark(
         raise ValueError("temperature must be between zero and two")
     if corpus_layout not in {"distinct", "homogeneous"}:
         raise ValueError("corpus layout must be distinct or homogeneous")
+    if endpoint_profile not in ENDPOINT_PROFILES:
+        raise ValueError("endpoint profile must be gufo or openai")
 
     results: dict[str, Any] = {}
     warnings: list[str] = []
@@ -940,6 +1172,8 @@ def run_corpus_benchmark(
                 concurrency=concurrency,
                 repetition=-(warmup + 1),
                 group_index=warmup % len(groups),
+                endpoint_profile=endpoint_profile,
+                cache_prompt=cache_prompt,
             )
 
         rounds: list[RoundObservation] = []
@@ -956,6 +1190,8 @@ def run_corpus_benchmark(
                         concurrency=concurrency,
                         repetition=repetition,
                         group_index=group_index,
+                        endpoint_profile=endpoint_profile,
+                        cache_prompt=cache_prompt,
                     )
                 )
         summary = _summarize_rounds(rounds)
@@ -963,19 +1199,16 @@ def run_corpus_benchmark(
         summary["scheduledPromptCount"] = padded_count
         results[f"c{concurrency}"] = summary
 
-        observed_capacity = max(summary["logicalConcurrency"])
-        if observed_capacity < concurrency:
-            warnings.append(
-                f"C={concurrency} exceeded the server's reported logical "
-                f"capacity {observed_capacity}; queueing is included"
-            )
+        _warn_capacity(warnings, concurrency, summary)
         cache_hits = summary["speculative"]["cacheHits"]
         if cache_hits:
             warnings.append(
-                f"C={concurrency} observed {cache_hits} continuation-cache "
-                "hits; use a fresh server for acceptance qualification"
+                f"C={concurrency} observed {cache_hits} prompt-cache hits; "
+                "use a fresh server for acceptance qualification"
             )
-    _annotate_corpus_exactness(results)
+    exactness_reference = _annotate_corpus_exactness(
+        results, None if reference is None else reference["hashes"]
+    )
 
     fingerprint_id = fingerprint.get("fingerprintId")
     canonical = fingerprint.get("canonical")
@@ -1017,13 +1250,31 @@ def run_corpus_benchmark(
             "warmupRounds": warmup_rounds,
             "repetitions": repetitions,
             "concurrency": concurrency_levels,
+            "endpointProfile": endpoint_profile,
+            "cachePrompt": cache_prompt,
         },
+        "notes": list(notes or []),
+        "reference": (
+            {"source": exactness_reference}
+            if reference is None
+            else {
+                key: value for key, value in reference.items() if key != "hashes"
+            }
+        ),
         "metricDefinitions": {
             "prefill_tokens_per_second": (
                 "actual server prefill tokens divided by server prefill time"
             ),
             "decode_tokens_per_second": (
                 "completion tokens divided by server decode time"
+            ),
+            "aggregate_output_tokens_per_second": (
+                "overall: completion tokens divided by the sum of measured "
+                "round spans (end-to-end, includes prefill and queueing)"
+            ),
+            "matchedRoundOutputTokensPerSecond": (
+                "aggregate output tokens per second over rounds whose "
+                "completions all matched the reference hashes"
             ),
             "draft_acceptance": (
                 "accepted support-model tokens divided by drafted "
@@ -1133,7 +1384,7 @@ def print_human(report: dict[str, Any]) -> None:
     print(
         "C  requests  request p50/p95 ms  TTFT p50/p95 ms  "
         "ITL p50/p95 ms  prefill tok/s  decode tg  whole tok/s  "
-        "aggregate tok/s  draft accepted"
+        "aggregate tok/s  output tok/s  draft accepted  matched"
     )
     for key, result in report["results"].items():
         concurrency = key[1:]
@@ -1141,7 +1392,17 @@ def print_human(report: dict[str, Any]) -> None:
         stage = result["stage"]
         aggregate = result["aggregate"]
         aggregate_rate = aggregate["total_tokens_per_second"]["overall"]
+        output_rate = aggregate["output_tokens_per_second"]["overall"]
         speculative = result["speculative"]
+        exactness = result.get("completionExactness")
+        matched = "-"
+        if isinstance(exactness, dict):
+            matched = (
+                f"{exactness['exactRequests']}/{exactness['comparedRequests']}"
+            )
+            matched_rate = exactness.get("matchedRoundOutputTokensPerSecond")
+            if matched_rate is not None:
+                matched += f" @{matched_rate:.2f}"
         request_p95 = latency["request_ms"]["p95"]
         ttft_p95 = latency["client_ttft_ms"]["p95"]
         itl_p95 = latency["server_inter_token_ms"]["p95"]
@@ -1157,8 +1418,10 @@ def print_human(report: dict[str, Any]) -> None:
             f"{_median(stage['decode_tokens_per_second']):>9}  "
             f"{_median(stage['whole_request_tokens_per_second']):>11}  "
             f"{'-' if aggregate_rate is None else f'{aggregate_rate:.2f}':>15}  "
+            f"{'-' if output_rate is None else f'{output_rate:.2f}':>12}  "
             f"{speculative['acceptedTokens']:>5}/"
-            f"{speculative['draftedTokens']:<5}"
+            f"{speculative['draftedTokens']:<8}  "
+            f"{matched}"
         )
         categories = result.get("categories")
         if isinstance(categories, dict):
@@ -1173,6 +1436,11 @@ def print_human(report: dict[str, Any]) -> None:
                     f"{summary['draftedPerOutputToken']:.2f}, "
                     f"decode p50={_median(summary['decode_tokens_per_second'])}"
                 )
+    reference = report.get("reference")
+    if isinstance(reference, dict):
+        print(f"reference: {reference.get('source')}")
+    for note in report.get("notes", []):
+        print(f"note: {note}")
     for warning in report["warnings"]:
         print(f"warning: {warning}")
 
@@ -1221,6 +1489,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Limit the number of selected corpus cases",
     )
     parser.add_argument(
+        "--category",
+        action="append",
+        default=[],
+        help="Select corpus cases by category (repeatable)",
+    )
+    parser.add_argument(
+        "--exclude-category",
+        action="append",
+        default=[],
+        help="Drop corpus cases by category (repeatable)",
+    )
+    parser.add_argument(
         "--corpus-layout",
         choices=("distinct", "homogeneous"),
         default="distinct",
@@ -1233,6 +1513,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--workload-id",
         default="canonical-serving-v1",
         help="Public workload identity stored in the artifact",
+    )
+    parser.add_argument(
+        "--endpoint-profile",
+        choices=ENDPOINT_PROFILES,
+        default="gufo",
+        help=(
+            "gufo: require gufo usage metrics; openai: accept plain OpenAI "
+            "usage and parse llama-server timings when present"
+        ),
+    )
+    parser.add_argument(
+        "--no-cache-prompt",
+        action="store_true",
+        help="Send cache_prompt=false with every request (llama-server)",
+    )
+    parser.add_argument(
+        "--reference-report",
+        type=Path,
+        help=(
+            "Corpus artifact whose C=1 completion hashes serve as the "
+            "exactness reference (default: this run's own C=1)"
+        ),
+    )
+    parser.add_argument(
+        "--note",
+        action="append",
+        default=[],
+        help="Free-text note stored in the artifact (server flags, version)",
     )
     parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -1267,8 +1575,19 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--prompt-repeat must be positive")
     if args.limit is not None and args.limit <= 0:
         raise SystemExit("--limit must be positive")
-    if args.suite is None and (args.case or args.quick or args.limit is not None):
-        raise SystemExit("--case/--quick/--limit require --suite")
+    if args.suite is None and (
+        args.case
+        or args.quick
+        or args.limit is not None
+        or args.category
+        or args.exclude_category
+        or args.reference_report is not None
+    ):
+        raise SystemExit(
+            "--case/--quick/--limit/--category/--exclude-category/"
+            "--reference-report require --suite"
+        )
+    cache_prompt = False if args.no_cache_prompt else None
     if args.suite is not None and args.prompt_repeat not in (None, 1):
         raise SystemExit("--prompt-repeat is not used with --suite")
     prompt = args.prompt or DEFAULT_PROMPT
@@ -1296,6 +1615,9 @@ def main(argv: list[str] | None = None) -> int:
             source_revision=revision,
             source_dirty=dirty,
             prompt_repeat=prompt_repeat,
+            endpoint_profile=args.endpoint_profile,
+            cache_prompt=cache_prompt,
+            notes=args.note,
         )
     else:
         suite_bytes = args.suite.read_bytes()
@@ -1304,7 +1626,14 @@ def main(argv: list[str] | None = None) -> int:
             quick=args.quick,
             limit=args.limit,
             selected=set(args.case) if args.case else None,
+            categories=set(args.category) if args.category else None,
+            excluded_categories=(
+                set(args.exclude_category) if args.exclude_category else None
+            ),
         )
+        reference = None
+        if args.reference_report is not None:
+            reference = load_reference_report(args.reference_report)
         report = run_corpus_benchmark(
             base_url=args.base_url,
             model=model,
@@ -1321,6 +1650,10 @@ def main(argv: list[str] | None = None) -> int:
             source_dirty=dirty,
             suite_bytes=suite_bytes,
             corpus_layout=args.corpus_layout,
+            endpoint_profile=args.endpoint_profile,
+            cache_prompt=cache_prompt,
+            reference=reference,
+            notes=args.note,
         )
     if args.output is not None:
         atomic_json(args.output, report)

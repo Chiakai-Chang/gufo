@@ -166,9 +166,22 @@ paths, raw token IDs, and timestamps.
 
 Use `aggregate.output_tokens_per_second.overall` for corpus throughput: total
 delivered tokens divided by the sum of measured round spans. The human table
-uses the corresponding total-token rate. Per-round medians remain available
-for timing variation, but do not describe throughput over a mixed corpus.
-`measuredSpanMs` excludes warmups and time between rounds.
+prints it as `output tok/s` next to the total-token rate. Per-round medians
+remain available for timing variation, but do not describe throughput over a
+mixed corpus. `measuredSpanMs` excludes warmups and time between rounds.
+
+`--endpoint-profile openai` runs the same request schedule against any
+OpenAI-compatible server (for example `llama-server`). Plain `usage` is
+enough; server-stage fields become `null`, and llama-server `timings`
+(`prompt_n`, `predicted_ms`, `draft_n_accepted`, `cache_n`, ...) are parsed
+when present (`metricsSources` records which). `--no-cache-prompt` sends
+`cache_prompt=false` so llama-server does not reuse prompts across rounds.
+`--category`/`--exclude-category` split a suite into groups, and
+`--reference-report` compares every completion hash against another
+artifact's C=1 completions instead of this run's own; `completionExactness`
+then reports matched requests, matched cases, and
+`matchedRoundOutputTokensPerSecond` over rounds whose outputs all matched.
+`--note` stores server flags and versions in the artifact.
 
 ## Machine Fingerprint & Artifact Binding
 

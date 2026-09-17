@@ -2,6 +2,7 @@
 
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -16,10 +17,44 @@ def check(condition, message):
         raise AssertionError(message)
 
 
+GUFO_USAGE = {
+    "prompt_tokens": 12,
+    "completion_tokens": 2,
+    "total_tokens": 14,
+    "draft_tokens": 8,
+    "draft_tokens_accepted": 4,
+    "prompt_tokens_details": {"cached_tokens": 2},
+    "gufo": {
+        "cache_hit": True,
+        "prefill_tokens": 10,
+        "prefill_ms": 20.0,
+        "decode_ms": 10.0,
+        "queue_ms": 1.0,
+        "ttft_ms": 21.0,
+        "mean_inter_token_ms": 5.0,
+        "max_inter_token_ms": 6.0,
+        "requested_logical_concurrency": 4,
+        "physical_execution_width": 1,
+        "execution_plan": "serial-fallback",
+    },
+}
+OPENAI_USAGE = {"prompt_tokens": 12, "completion_tokens": 2, "total_tokens": 14}
+LLAMA_TIMINGS = {
+    "prompt_n": 10,
+    "prompt_ms": 20.0,
+    "cache_n": 2,
+    "predicted_n": 2,
+    "predicted_ms": 10.0,
+    "draft_n": 8,
+    "draft_n_accepted": 4,
+}
+
+
 class FakeResponse:
     status = 200
 
-    def __init__(self):
+    def __init__(self, usage=None, timings=None, content=("one", " two")):
+        usage = GUFO_USAGE if usage is None else usage
         chunks = [
             {
                 "choices": [
@@ -30,49 +65,23 @@ class FakeResponse:
                     }
                 ]
             },
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": "one"},
-                        "finish_reason": None,
-                    }
-                ]
-            },
-            {
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": " two"},
-                        "finish_reason": None,
-                    }
-                ]
-            },
-            {
-                "choices": [],
-                "usage": {
-                    "prompt_tokens": 12,
-                    "completion_tokens": 2,
-                    "total_tokens": 14,
-                    "draft_tokens": 8,
-                    "draft_tokens_accepted": 4,
-                    "prompt_tokens_details": {"cached_tokens": 2},
-                    "gufo": {
-                        "cache_hit": True,
-                        "prefill_tokens": 10,
-                        "prefill_ms": 20.0,
-                        "decode_ms": 10.0,
-                        "queue_ms": 1.0,
-                        "ttft_ms": 21.0,
-                        "mean_inter_token_ms": 5.0,
-                        "max_inter_token_ms": 6.0,
-                        "requested_logical_concurrency": 4,
-                        "physical_execution_width": 1,
-                        "execution_plan": "serial-fallback",
-                    },
-                },
-            },
         ]
+        for part in content:
+            chunks.append(
+                {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": part},
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+        final = {"choices": [], "usage": usage}
+        if timings is not None:
+            final["timings"] = timings
+        chunks.append(final)
         self.lines = []
         for chunk in chunks:
             self.lines.extend(
@@ -264,5 +273,251 @@ check(
     serving_bench.parse_concurrency_levels("1,2,4") == [1, 2, 4],
     "concurrency parser",
 )
+
+# Endpoint profiles: plain OpenAI usage, llama-server timings, strict gufo.
+def fake_urlopen_openai(request, timeout):
+    del timeout
+    body = json.loads(request.data)
+    check(body.get("cache_prompt") is False, "cache_prompt=false is sent")
+    return FakeResponse(usage=OPENAI_USAGE)
+
+
+def fake_urlopen_llama(request, timeout):
+    del timeout
+    body = json.loads(request.data)
+    check("cache_prompt" not in body, "cache_prompt is omitted by default")
+    return FakeResponse(usage=OPENAI_USAGE, timings=LLAMA_TIMINGS)
+
+
+def request_with(fake, **overrides):
+    serving_bench.urllib.request.urlopen = fake
+    try:
+        return serving_bench.run_request(
+            base_url="https://private.example",
+            model="test-model",
+            prompt="p",
+            max_tokens=2,
+            temperature=0.0,
+            timeout_seconds=5.0,
+            client_id="t",
+            concurrency=1,
+            repetition=0,
+            request_index=0,
+            **overrides,
+        )
+    finally:
+        serving_bench.urllib.request.urlopen = original_urlopen
+
+
+plain = request_with(
+    fake_urlopen_openai, endpoint_profile="openai", cache_prompt=False
+)
+check(plain.metrics_source == "none", "plain OpenAI usage has no metrics")
+check(
+    plain.decode_ms is None
+    and plain.server_ttft_ms is None
+    and plain.execution_plan is None
+    and plain.decode_tokens_per_second is None,
+    "server-side fields are None without endpoint metrics",
+)
+check(plain.prefill_tokens == 12, "prefill tokens fall back to prompt tokens")
+check(plain.completion_tokens == 2 and plain.wall_ms >= 0.0, "client fields")
+
+llama = request_with(fake_urlopen_llama, endpoint_profile="openai")
+check(llama.metrics_source == "llama_timings", "llama timings are detected")
+check(llama.decode_tokens_per_second == 200.0, "llama decode tg from timings")
+check(llama.prefill_tokens_per_second == 500.0, "llama prefill from timings")
+check(
+    llama.draft_tokens == 8 and llama.draft_acceptance == 0.5,
+    "llama draft acceptance from timings",
+)
+check(
+    llama.cached_prompt_tokens == 2 and llama.cache_hit,
+    "llama cache_n marks a prompt-cache hit",
+)
+check(llama.server_inter_token_ms == 10.0, "llama ITL derived from timings")
+
+try:
+    request_with(fake_urlopen_llama, endpoint_profile="gufo")
+except RuntimeError as exception:
+    check("incompatible schema" in str(exception), "gufo profile is strict")
+else:
+    raise AssertionError("gufo profile must reject a missing gufo block")
+
+# Aggregate throughput: total completion tokens over the slowest request.
+fast = serving_bench.RequestObservation(
+    **{**plain.public(), "completion_tokens": 3}, started_at=0.0, finished_at=1.0
+)
+slow = serving_bench.RequestObservation(
+    **{**plain.public(), "completion_tokens": 5}, started_at=0.0, finished_at=4.0
+)
+wave = serving_bench._round_from_samples(2, 0, (fast, slow))
+check(wave.span_ms == 4000.0, "wave span is the slowest request")
+check(wave.output_tokens_per_second == 2.0, "8 tokens over 4 s")
+two_waves = serving_bench._summarize_rounds([wave, wave])
+check(
+    two_waves["aggregate"]["output_tokens_per_second"]["overall"] == 2.0,
+    "aggregate output tok/s = total tokens / summed wave time",
+)
+check(
+    two_waves["executionPlans"] == []
+    and two_waves["logicalConcurrency"] == []
+    and two_waves["metricsSources"] == ["none"],
+    "summaries tolerate missing server metrics",
+)
+warnings = []
+serving_bench._warn_capacity(warnings, 8, two_waves)
+check(warnings == [], "no capacity warning without server metrics")
+
+# Corpus run against a plain OpenAI endpoint works end to end.
+serving_bench.urllib.request.urlopen = fake_urlopen_openai
+try:
+    openai_report = serving_bench.run_corpus_benchmark(
+        base_url="https://private.example",
+        model="test-model",
+        cases=[
+            serving_bench.PromptCase("json", "structured", "return JSON"),
+            serving_bench.PromptCase("code", "code", "write C++"),
+        ],
+        workload_id="test-corpus-v1",
+        max_tokens=2,
+        temperature=0.0,
+        concurrency_levels=[1, 2],
+        warmup_rounds=0,
+        repetitions=1,
+        timeout_seconds=5.0,
+        fingerprint=fingerprint,
+        source_revision="a" * 40,
+        source_dirty=False,
+        suite_bytes=b"test suite",
+        endpoint_profile="openai",
+        cache_prompt=False,
+        notes=["llama-server -np 8"],
+    )
+finally:
+    serving_bench.urllib.request.urlopen = original_urlopen
+check(
+    openai_report["workload"]["endpointProfile"] == "openai"
+    and openai_report["workload"]["cachePrompt"] is False
+    and openai_report["notes"] == ["llama-server -np 8"]
+    and openai_report["reference"] == {"source": "self-c1"},
+    "openai profile, cache flag, notes, and reference are recorded",
+)
+check(openai_report["warnings"] == [], "no spurious warnings without metrics")
+check(
+    openai_report["results"]["c2"]["completionExactness"]["matchedRounds"] == 1,
+    "fully matching rounds are counted",
+)
+
+# Reference hashes from another report flag differing outputs.
+reference_hashes = serving_bench.reference_hashes_from_report(corpus_report)
+check(
+    reference_hashes["code"] == serving_bench.hashlib.sha256(b"one two").hexdigest(),
+    "reference hashes come from the report's C=1 cases",
+)
+
+
+def fake_urlopen_diverging(request, timeout):
+    del timeout
+    body = json.loads(request.data)
+    content = ("one", " two")
+    if body["messages"][0]["content"] == "write C++":
+        content = ("three",)
+    return FakeResponse(usage=OPENAI_USAGE, content=content)
+
+
+serving_bench.urllib.request.urlopen = fake_urlopen_diverging
+try:
+    diverging_report = serving_bench.run_corpus_benchmark(
+        base_url="https://private.example",
+        model="test-model",
+        cases=[
+            serving_bench.PromptCase("json", "structured", "return JSON"),
+            serving_bench.PromptCase("code", "code", "write C++"),
+        ],
+        workload_id="test-corpus-v1",
+        max_tokens=2,
+        temperature=0.0,
+        concurrency_levels=[1, 2],
+        warmup_rounds=0,
+        repetitions=1,
+        timeout_seconds=5.0,
+        fingerprint=fingerprint,
+        source_revision="a" * 40,
+        source_dirty=False,
+        suite_bytes=b"test suite",
+        endpoint_profile="openai",
+        reference={
+            "source": "report",
+            "workloadId": "test-corpus-v1",
+            "suiteSha256": None,
+            "modelId": "test-model",
+            "hashes": reference_hashes,
+        },
+    )
+finally:
+    serving_bench.urllib.request.urlopen = original_urlopen
+exactness = diverging_report["results"]["c2"]["completionExactness"]
+check(
+    exactness["exactRequests"] == 1
+    and exactness["comparedRequests"] == 2
+    and exactness["matchedCases"] == 1
+    and exactness["comparedCases"] == 2,
+    "differing outputs are flagged against the reference report",
+)
+check(
+    exactness["matchedRounds"] == 0
+    and exactness["matchedRoundOutputTokensPerSecond"] is None,
+    "a round with any mismatch is excluded from the matched-subset rate",
+)
+check(
+    diverging_report["results"]["c1"]["completionExactness"]["exactRequests"]
+    == 1,
+    "C=1 is compared against the external reference too",
+)
+check(
+    diverging_report["results"]["c2"]["cases"]["code"]["matchesReference"]
+    is False,
+    "per-case reference flag",
+)
+check(
+    diverging_report["reference"]["source"] == "report"
+    and "hashes" not in diverging_report["reference"],
+    "external reference identity is recorded without hashes",
+)
+
+# Suite category filters.
+with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as handle:
+    json.dump(
+        {
+            "prompts": [
+                {"id": "a", "category": "code", "text": "x"},
+                {"id": "b", "category": "repetitive", "text": "y"},
+                {"id": "c", "category": "reasoning", "text": "z"},
+            ]
+        },
+        handle,
+    )
+    suite_path = Path(handle.name)
+try:
+    only = serving_bench.load_prompt_suite(
+        suite_path, categories={"repetitive"}
+    )
+    check([case.identifier for case in only] == ["b"], "--category filter")
+    rest = serving_bench.load_prompt_suite(
+        suite_path, excluded_categories={"repetitive"}
+    )
+    check(
+        [case.identifier for case in rest] == ["a", "c"],
+        "--exclude-category filter",
+    )
+    try:
+        serving_bench.load_prompt_suite(suite_path, categories={"missing"})
+    except ValueError as exception:
+        check("unknown suite category" in str(exception), "unknown category")
+    else:
+        raise AssertionError("unknown categories must be rejected")
+finally:
+    suite_path.unlink()
 
 print("Serving benchmark harness tests passed.")
