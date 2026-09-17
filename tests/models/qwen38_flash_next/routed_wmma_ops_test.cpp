@@ -351,14 +351,21 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
         std::memcpy(up.data() + b + offset, &scale, sizeof(scale));
       }
     }
+    std::vector<std::int32_t> gate_tiles;
+    for (std::size_t e = 0; e < experts; ++e) {
+      const std::uint32_t padded = (counts[e] + 15u) / 16u * 16u;
+      for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
+        gate_tiles.push_back(static_cast<std::int32_t>(e | (j << 16)));
+    }
+    auto* d_gate_tiles = Upload(gate_tiles);
     auto* d_up = Upload(up);
     auto* d_pair = Upload(std::vector<__half>(slots * m, __float2half(0.0F)));
     if (!q::RoutedF16Gemm(d_up, type, d_x_half, d_tiles,
                           static_cast<std::uint32_t>(tiles.size()), tile_rows,
                           d_bounds, d_rows_token, d_rows_slot, d_f16, nullptr,
                           d_f16_half, m, k, nullptr) ||
-        !q::RoutedGatedF16Gemm(d_w, d_up, type, d_x_half, d_tiles,
-                               static_cast<std::uint32_t>(tiles.size()),
+        !q::RoutedGatedF16Gemm(d_w, d_up, type, d_x_half, d_gate_tiles,
+                               static_cast<std::uint32_t>(gate_tiles.size()),
                                d_bounds, d_rows_token, d_rows_slot, d_pair, m,
                                k, nullptr)) {
       throw std::runtime_error("paired routed SwiGLU launch failed");
@@ -378,6 +385,7 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
     }
     CheckHip(hipFree(d_up), "paired up free");
     CheckHip(hipFree(d_pair), "paired output free");
+    CheckHip(hipFree(d_gate_tiles), "paired tile map free");
   }
 
   Result r{0.0, 0.0, 0.0, 0.0};
@@ -435,9 +443,9 @@ void CheckVectorGrouping() {
   constexpr int experts = 8, cols = 512, tokens = 7, used = 3;
   constexpr std::size_t guard = 16;
   constexpr float poison = -1234567.0F;
-  using Gemm = decltype(&qfn_mmq_q4_K_moe_vec);
-  const std::array<Gemm, 4> gemms{qfn_mmq_q4_K_moe_vec, qfn_mmq_q5_K_moe_vec,
-                                  qfn_mmq_q5_1_moe_vec, qfn_mmq_q8_0_moe_vec};
+  constexpr std::array<q::WeightType, 4> formats{
+      q::WeightType::kQ4_K, q::WeightType::kQ5_K, q::WeightType::kQ5_1,
+      q::WeightType::kQ8_0};
   std::vector<float> x(tokens * cols);
   std::uint32_t seed = 37;
   for (auto& v : x)
@@ -452,10 +460,15 @@ void CheckVectorGrouping() {
     std::array<Experts, 4> weights{
         MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
         MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23)};
+    std::array<Experts, 4> paired_weights{
+        MakeQ4K(experts, rows, cols, 71), MakeQ5K(experts, rows, cols, 73),
+        MakeQ5_1(experts, rows, cols, 79), MakeQ8_0(experts, rows, cols, 83)};
     const std::size_t count = tokens * used * rows;
     const std::vector<float> dirty(count + 2 * guard, poison);
     auto* scalar = Upload(dirty);
     auto* batch = Upload(dirty);
+    auto* paired_scalar = Upload(dirty);
+    auto* paired_batch = Upload(dirty);
     const auto check_output = [&](const float* device, int n) {
       const auto output = Download(device, dirty.size());
       for (std::size_t i = 0; i < output.size(); ++i) {
@@ -479,22 +492,34 @@ void CheckVectorGrouping() {
       const __half infinite_scale = __float2half(INFINITY);
       std::memcpy(weights[f].packed.data(), &infinite_scale,
                   sizeof(infinite_scale));
+      std::memcpy(paired_weights[f].packed.data(), &infinite_scale,
+                  sizeof(infinite_scale));
+      auto* wb = Upload(paired_weights[f].packed);
       auto* w = Upload(weights[f].packed);
       CheckHip(hipMemcpy(scalar, dirty.data(), dirty.size() * sizeof(float),
                          hipMemcpyHostToDevice),
                "poison scalar output");
       for (int t = 0; t < tokens; ++t)
-        if (gemms[f](w, dx + t * cols, di + t * used,
-                     scalar + guard + t * used * rows, rows, cols, 1, experts,
-                     used, nullptr))
+        if (qfn_mmq_moe_vec(static_cast<int>(formats[f]), w, dx + t * cols,
+                            di + t * used, scalar + guard + t * used * rows,
+                            rows, cols, 1, experts, used, nullptr))
           throw std::runtime_error("scalar routed vector launch failed");
       const auto reference = check_output(scalar, tokens);
+      CheckHip(hipMemcpy(paired_scalar, dirty.data(),
+                         dirty.size() * sizeof(float), hipMemcpyHostToDevice),
+               "poison paired reference");
+      if (qfn_mmq_moe_vec(static_cast<int>(formats[f]), wb, dx, di,
+                          paired_scalar + guard, rows, cols, tokens, experts,
+                          used, nullptr))
+        throw std::runtime_error("paired reference projection failed");
+      const auto reference_b = check_output(paired_scalar, tokens);
       for (int n : {2, 3, 4, 7}) {
         CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
                            hipMemcpyHostToDevice),
                  "poison batched output");
-        if (gemms[f](w, dx, di, batch + guard, rows, cols, n, experts, used,
-                     nullptr))
+        if (qfn_mmq_moe_vec(static_cast<int>(formats[f]), w, dx, di,
+                            batch + guard, rows, cols, n, experts, used,
+                            nullptr))
           throw std::runtime_error("batched routed vector launch failed");
         const auto output = check_output(batch, n);
         if (std::memcmp(reference.data() + guard, output.data() + guard,
@@ -503,10 +528,32 @@ void CheckVectorGrouping() {
                                    std::to_string(f) + " width " +
                                    std::to_string(n));
       }
+      for (int n : {1, 4, 7}) {
+        CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
+                           hipMemcpyHostToDevice),
+                 "poison paired gate");
+        CheckHip(hipMemcpy(paired_batch, dirty.data(),
+                           dirty.size() * sizeof(float), hipMemcpyHostToDevice),
+                 "poison paired up");
+        if (qfn_mmq_moe_vec(static_cast<int>(formats[f]), w, dx, di,
+                            batch + guard, rows, cols, n, experts, used,
+                            nullptr, wb, paired_batch + guard))
+          throw std::runtime_error("paired vector projection failed");
+        const auto gate = check_output(batch, n);
+        const auto up = check_output(paired_batch, n);
+        const std::size_t bytes = n * used * rows * sizeof(float);
+        if (std::memcmp(reference.data() + guard, gate.data() + guard, bytes) ||
+            std::memcmp(reference_b.data() + guard, up.data() + guard, bytes))
+          throw std::runtime_error(
+              "paired vector differs from separate projections");
+      }
+      CheckHip(hipFree(wb), "paired weight free");
       CheckHip(hipFree(w), "grouping weight free");
     }
     CheckHip(hipFree(scalar), "scalar output free");
     CheckHip(hipFree(batch), "batch output free");
+    CheckHip(hipFree(paired_scalar), "paired reference free");
+    CheckHip(hipFree(paired_batch), "paired output free");
   }
   CheckHip(hipFree(dx), "grouping input free");
   CheckHip(hipFree(di), "grouping IDs free");

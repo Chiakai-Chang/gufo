@@ -2392,7 +2392,8 @@ constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
 /// tiles are gathered from the union of the block's query selections and
 /// four selections overlap far less than 32 (measured at 16k depth: 846
 /// versus 2,478 selected blocks against 512 per query).
-template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kPackHeads>
+template<std::uint32_t kQueryRows, std::uint32_t kKeys, bool kPackHeads,
+         bool kLateV = false>
 __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
@@ -2701,7 +2702,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     cursor = gather_tile(cursor, pre);
     if (pre.count != 0) {
       load_k(pre, k_pre);
-      load_v(pre, v_pre);
+      if constexpr (!kLateV)
+        load_v(pre, v_pre);
     }
 
     // --- S = Q K^T ---
@@ -2721,6 +2723,23 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       }
     }
     __syncthreads();
+
+    // QK has finished reading K. V and softmax P use separate LDS, so
+    // their writes can share the barrier at the end of softmax.
+    {
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVRegs; ++j) {
+        const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
+#pragma unroll
+        for (std::uint32_t i = 0; i < 8; ++i) {
+          kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
+        }
+      }
+    }
+    if constexpr (kLateV) {
+      if (pre.count != 0)
+        load_v(pre, v_pre);
+    }
 
     // --- online softmax: kSoftmaxLanes threads per query row ---
     {
@@ -2803,20 +2822,6 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
         }
       }
     }
-
-    // --- stage V transposed. The barrier after the softmax already
-    // separates every read of K from these writes to the same buffer.
-    {
-#pragma unroll
-      for (std::uint32_t j = 0; j < kVRegs; ++j) {
-        const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
-#pragma unroll
-        for (std::uint32_t i = 0; i < 8; ++i) {
-          kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
-        }
-      }
-    }
-    __syncthreads();
 
     // --- O += P V ---
 #pragma unroll
@@ -3375,6 +3380,8 @@ __launch_bounds__(256) __global__
   const int t_local = (tile >> 16) * BN;
   const int bucket_begin = pad_bounds[expert];
   const int bucket_rows = pad_bounds[expert + 1] - bucket_begin;
+  const int live_tok_tiles =
+      std::min(kTokTiles, (bucket_rows - t_local + 15) / 16);
   const int num_kb = static_cast<int>(k / 32);
   const int m_i = static_cast<int>(m);
   const std::size_t row_bytes = RoutedF16RowBytes<kType>(k);
@@ -3648,6 +3655,12 @@ __launch_bounds__(256) __global__
       }
 #pragma unroll
       for (int j = 0; j < kTokTiles; ++j) {
+        // Paired gate/up is compute-bound. A short expert bucket has no
+        // output in the remaining token tiles, so omit their WMMA work.
+        if constexpr (kPair && kTokTiles > 1) {
+          if (j >= live_tok_tiles)
+            continue;
+        }
         const uint4* frag =
             s_act + ((kb * 4) * kActStride) + (j * 16) + sub_lane;
         uint4 b[4];
@@ -4141,13 +4154,13 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
   switch (type) {
     case WeightType::kQ4_K:
       hipLaunchKernelGGL(
-          (RoutedF16GEMMKernel<WeightType::kQ4_K, 128, 48, 2, true>), grid,
+          (RoutedF16GEMMKernel<WeightType::kQ4_K, 128, 64, 2, true>), grid,
           dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
           rows_out, nullptr, nullptr, out, m, k, up);
       return true;
     case WeightType::kQ5_K:
       hipLaunchKernelGGL(
-          (RoutedF16GEMMKernel<WeightType::kQ5_K, 128, 48, 2, true>), grid,
+          (RoutedF16GEMMKernel<WeightType::kQ5_K, 128, 64, 2, true>), grid,
           dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
           rows_out, nullptr, nullptr, out, m, k, up);
       return true;
@@ -4832,10 +4845,19 @@ bool WmmaCausalAttention(const float* q, const float* gate,
     constexpr std::uint32_t kPackedQueries = 4;
     const dim3 grid((n_tokens + kPackedQueries - 1) / kPackedQueries,
                     kWmmaKvHeads);
-    hipLaunchKernelGGL(
-        (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
-        dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-        out, start_pos, n_tokens, ratio);
+    // At deep sparse windows, staging the current V before fetching the
+    // next one shortens their overlapping register lifetimes.
+    if (start_pos >= 65536) {
+      hipLaunchKernelGGL(
+          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
+          grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
+          mask_words, out, start_pos, n_tokens, ratio);
+    } else {
+      hipLaunchKernelGGL(
+          (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
+          dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
+          mask_words, out, start_pos, n_tokens, ratio);
+    }
     return true;
   }
   const dim3 grid((n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows,

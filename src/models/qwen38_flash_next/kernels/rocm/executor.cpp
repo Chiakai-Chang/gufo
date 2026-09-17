@@ -272,7 +272,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
     s.routed_tiles =
-        Alloc<std::int32_t>(a, RoutedTileCapacity(slots, c), error_msg);
+        Alloc<std::int32_t>(a, 2 * RoutedTileCapacity(slots, c), error_msg);
   }
   s.weights = f32(slots);
   s.gate_e = f32(slots * c.expert_ff);
@@ -304,8 +304,8 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(hipHostMalloc(
-                   &tiles, RoutedTileCapacity(slots, c) * sizeof(std::int32_t)),
+    if (!Check(hipHostMalloc(&tiles, 2 * RoutedTileCapacity(slots, c) *
+                                         sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
     }
@@ -639,6 +639,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   // per layer), which also lets the tile width follow the distribution.
   const Config& c = config();
   routed_max_rows_ = 0;
+  routed_gate_tiles_ = 0;
   if (n_tokens <= 4 * kVecBatch) {
     return true;
   }
@@ -670,6 +671,16 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
   routed_n_tiles_ = n_tiles;
+  // Append the paired gate/up map to the same upload. Its 64-token tile
+  // reduces repeated weight reads; the down projection keeps 48-token tiles.
+  if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
+    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+      const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
+      for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
+        tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+    }
+    routed_gate_tiles_ = n_tiles - routed_n_tiles_;
+  }
   routed_compact_rows_ = std::max<std::size_t>(16, compact);
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
       counts_host_, static_cast<int>(c.num_experts));
@@ -697,33 +708,26 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
     RoutedHints(w, n_tokens);
   }
   int rc = -1;
-  switch (w.type) {
-    case GgmlType::kQ4_K:
-      rc = tiled ? qfn_mmq_q4_K_moe_raw(w.data, x, ids, out, M, K, T, E, U,
-                                        stream_)
-                 : qfn_mmq_q4_K_moe_vec(w.data, x, ids, out, M, K, T, E, U,
-                                        stream_);
-      break;
-    case GgmlType::kQ5_K:
-      rc = tiled ? qfn_mmq_q5_K_moe_raw(w.data, x, ids, out, M, K, T, E, U,
-                                        stream_)
-                 : qfn_mmq_q5_K_moe_vec(w.data, x, ids, out, M, K, T, E, U,
-                                        stream_);
-      break;
-    case GgmlType::kQ5_1:
-      rc = tiled ? qfn_mmq_q5_1_moe_raw(w.data, x, ids, out, M, K, T, E, U,
-                                        stream_)
-                 : qfn_mmq_q5_1_moe_vec(w.data, x, ids, out, M, K, T, E, U,
-                                        stream_);
-      break;
-    case GgmlType::kQ8_0:
-      rc = tiled ? qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U,
-                                        stream_)
-                 : qfn_mmq_q8_0_moe_vec(w.data, x, ids, out, M, K, T, E, U,
-                                        stream_);
-      break;
-    default:
-      break;
+  if (!tiled) {
+    rc = qfn_mmq_moe_vec(static_cast<int>(w.type), w.data, x, ids, out, M, K, T,
+                         E, U, stream_);
+  } else {
+    switch (w.type) {
+      case GgmlType::kQ4_K:
+        rc = qfn_mmq_q4_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kQ5_K:
+        rc = qfn_mmq_q5_K_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kQ5_1:
+        rc = qfn_mmq_q5_1_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      case GgmlType::kQ8_0:
+        rc = qfn_mmq_q8_0_moe_raw(w.data, x, ids, out, M, K, T, E, U, stream_);
+        break;
+      default:
+        break;
+    }
   }
   if (rc != 0) {
     AssignError(error_msg, "expert GEMM failed");
@@ -736,10 +740,21 @@ bool Executor::ExpertPair(const DeviceTensor& a, const DeviceTensor& b,
                           const float* x, const std::int32_t* ids, float* out_a,
                           float* out_b, std::uint32_t n_tokens,
                           std::uint32_t n_used, std::string* error_msg) const {
-  // One row gather and quantization feeds both projections; only the Q4_K
-  // tile path has the paired entry.
-  if (n_tokens > 4 * kVecBatch && a.type == GgmlType::kQ4_K &&
-      b.type == GgmlType::kQ4_K && a.rows == b.rows && a.cols == b.cols) {
+  const bool same_shape = a.type == b.type && a.rows == b.rows &&
+                          a.cols == b.cols && a.experts == b.experts;
+  if (n_tokens <= 4 * kVecBatch && same_shape) {
+    if (qfn_mmq_moe_vec(static_cast<int>(a.type), a.data, x, ids, out_a,
+                        static_cast<int>(a.rows), static_cast<int>(a.cols),
+                        static_cast<int>(n_tokens), static_cast<int>(a.experts),
+                        static_cast<int>(n_used), stream_, b.data,
+                        out_b) != 0) {
+      AssignError(error_msg, "expert vector pair GEMM failed");
+      return false;
+    }
+    return true;
+  }
+  // The wide Q4_K path shares its gather and tiled quantization as well.
+  if (n_tokens > 4 * kVecBatch && same_shape && a.type == GgmlType::kQ4_K) {
     RoutedHints(a, n_tokens);
     if (qfn_mmq_q4_K_moe_pair_unique(
             a.data, b.data, x, ids, out_a, out_b, static_cast<int>(a.rows),
@@ -1179,11 +1194,11 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                                      : WeightType::kQ4_K;
     const bool gated_ok =
         n_tokens >= 1024 && routed_tile_rows_ == 48
-            ? RoutedGatedF16Gemm(l.ffn_gate_exps.data, l.ffn_up_exps.data,
-                                 gate_type, x_half, s_.routed_tiles,
-                                 routed_n_tiles_, s_.routed_bounds,
-                                 s_.rows_token, s_.rows_slot, up_half,
-                                 c.expert_ff, c.hidden_size, stream_)
+            ? RoutedGatedF16Gemm(
+                  l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
+                  s_.routed_tiles + routed_n_tiles_, routed_gate_tiles_,
+                  s_.routed_bounds, s_.rows_token, s_.rows_slot, up_half,
+                  c.expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
                              s_.routed_tiles, routed_n_tiles_,
                              routed_tile_rows_, s_.routed_bounds, s_.rows_token,
