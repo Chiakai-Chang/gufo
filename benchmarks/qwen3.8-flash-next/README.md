@@ -11,33 +11,34 @@ stays on disk. Context, scratch and MTP add memory. NVMe loading takes about
 ## Performance
 
 Nix release, C1, pp2048, tg128, seed 1, one prefill warm-up and one measured
-repetition (2026-09-16–17 UTC). Rates are tok/s. Depth precedes the measured operation;
+repetition (2026-09-17 UTC). Rates are tok/s. Depth precedes the measured operation;
 fixed-length generation continues past EOS. MTP scores the full vocabulary
 and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1244.01 | 1263.29 |
-| 4096 | TODO | 1135.10 |
+| 0 | 1254.03 | 1281.98 |
+| 4096 | TODO | 1153.55 |
 | 16384 | TODO | TODO |
 | 32768 | TODO | TODO |
-| 131072 | 1070.59 | TODO |
+| 131072 | 1088.47 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 24.20 | 40.59 | 71.0% |
-| Greedy | 4096 | 23.35 | 34.48 | 63.7% |
-| Temperature 0.7 | 0 | TODO | 34.51 | 65.5% |
-| Temperature 0.7 | 4096 | TODO | 47.06 | 93.0% |
+| Greedy | 0 | 24.16 | 40.36 | 71.0% |
+| Greedy | 4096 | 23.29 | 34.34 | 63.7% |
+| Temperature 0.7 | 0 | TODO | 34.23 | 65.5% |
+| Temperature 0.7 | 4096 | TODO | 46.91 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
 Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
 AR PP uses one 133,121-token context limit throughout; AR TG uses 4,225
-and MTP uses 6,145. AR PP loses 13.9% from d0 to d128K. Near-flat throughput
+and MTP uses 6,145. AR PP loses 13.2% from d0 to d128K. Near-flat throughput
 across that range remains TODO. Profiling identifies sparse attention and
-selection as the main depth-dependent costs.
+selection as the main depth-dependent costs. Performance variation across
+fresh loads remains under investigation.
 
 ```sh
 ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \
@@ -55,7 +56,8 @@ are deterministic and depend on exact shapes and the pinned HIP library.
 The [projection sweep](tools/projection_plans.hip) uses `tools/bench/build.sh`.
 Sparse attention compacts selected blocks in order. The indexer caches F16
 fragments and accumulates scores in FP32; selection retains exact score
-ordering and lowest-index ties.
+ordering and lowest-index ties. Large expert batches fuse gate/up and SwiGLU;
+selection skips the tie-prefix scan when every threshold tie fits.
 
 `prompt`, `chat` and `serve llm` share MTP and sampling options. Drafts are
 greedy over the full vocabulary on the GPU; verification uses the target
@@ -90,6 +92,8 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
   Indexer pooling checks FP64 formulas, block boundaries and replay;
   selection checks exact masks, ties and deep contexts. Mixer checks include
   independent F16/Q8 outputs and optional inject weights.
+  Paired Q4_K/Q5_K expert projections require exact numerical agreement with
+  separate projections, including ragged rows.
   MTP token selection matches the CPU rule, including ties and graph replay.
 - Upload tests check bytes, guards, shard/chunk boundaries and invalid inputs.
   N-gram tests check asynchronous reads, duplicates, failed I/O and teardown.

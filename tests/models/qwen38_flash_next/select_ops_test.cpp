@@ -69,7 +69,7 @@ std::vector<T> Download(const T* device, std::size_t count) {
 }
 
 bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
-         bool zero_queries = false) {
+         bool zero_queries = false, std::uint32_t tied_high_blocks = 0) {
   const std::uint32_t max_context = start_pos + n_tokens + 64;
   const std::uint32_t max_blocks = (max_context + kRatio - 1) / kRatio;
   const std::uint32_t mask_words = (max_blocks + 31) / 32;
@@ -77,10 +77,18 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
       static_cast<std::size_t>(n_tokens) * kHeads * kDim;
   // Zero queries make every score tie at zero: the budget must then fill
   // in index order.
-  const auto qv = zero_queries ? std::vector<float>(q_count, 0.0F)
-                               : MakeValues(q_count, seed, 1.0F);
-  const auto blocks = MakeValues(static_cast<std::size_t>(max_blocks) * kDim,
-                                 seed ^ 0x9999U, 1.0F);
+  auto qv = zero_queries ? std::vector<float>(q_count, 0.0F)
+                         : MakeValues(q_count, seed, 1.0F);
+  auto blocks = MakeValues(static_cast<std::size_t>(max_blocks) * kDim,
+                           seed ^ 0x9999U, 1.0F);
+  if (tied_high_blocks != 0) {
+    std::fill(qv.begin(), qv.end(), 0.0F);
+    std::fill(blocks.begin(), blocks.end(), 0.0F);
+    for (std::size_t i = 0; i < qv.size(); i += kDim)
+      qv[i] = 1.0F;
+    for (std::uint32_t b = 0; b < tied_high_blocks; ++b)
+      blocks[static_cast<std::size_t>(b) * kDim] = 1.0F;
+  }
   std::vector<__half> q_half(qv.size()), blocks_half(blocks.size());
   const auto half = [](float value) { return __float2half_rn(value); };
   std::transform(qv.begin(), qv.end(), q_half.begin(), half);
@@ -257,6 +265,10 @@ int main() {
     ok = Run(1, 9001, 0x0BADF00DU) && ok;        // decode
     ok = Run(40, 2040, 0xDEADBEEFU) && ok;       // straddles the budget
     ok = Run(3, 6000, 0x5EED5EEDU, true) && ok;  // all scores tie at zero
+    // A threshold tie group that fits exactly, then one that needs the
+    // lowest-index prefix. Both must produce the same CPU-sorted mask.
+    ok = Run(1, 9001, 0, false, kBudget) && ok;
+    ok = Run(1, 9001, 0, false, kBudget + 7) && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

@@ -6,7 +6,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -227,8 +226,7 @@ struct Result {
 /// its activation quantization).
 Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
            std::size_t experts, std::size_t m, std::size_t k,
-           std::uint32_t seed, bool check = true,
-           std::uint32_t tile_rows = 48) {
+           std::uint32_t seed, std::uint32_t tile_rows = 48) {
   const Experts w =
       type == q::WeightType::kQ4_K   ? MakeQ4K(experts, m, k, seed)
       : type == q::WeightType::kQ5_K ? MakeQ5K(experts, m, k, seed)
@@ -242,8 +240,8 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
     std::vector<std::int32_t> chosen;
     while (chosen.size() < used) {
       const std::uint32_t r = NextRandom(&state);
-      const auto e = static_cast<std::int32_t>(
-          (check && r % 3 == 0 ? r / 3 % 4 : r / 3) % experts);
+      const auto e =
+          static_cast<std::int32_t>((r % 3 == 0 ? r / 3 % 4 : r / 3) % experts);
       if (std::find(chosen.begin(), chosen.end(), e) == chosen.end()) {
         chosen.push_back(e);
       }
@@ -308,13 +306,11 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   __half* d_x_half = Upload(x_half);
   std::int32_t* d_tiles = Upload(tiles);
   float* d_f16 = Upload(zero_out);
-  for (int rep = 0; rep < (check ? 1 : 3); ++rep) {
-    if (!q::RoutedF16Gemm(d_w, type, d_x_half, d_tiles,
-                          static_cast<std::uint32_t>(tiles.size()), tile_rows,
-                          d_bounds, d_rows_token, d_rows_slot, nullptr, d_f16,
-                          nullptr, m, k, nullptr)) {
-      throw std::runtime_error("routed F16 GEMM rejected the shape");
-    }
+  if (!q::RoutedF16Gemm(d_w, type, d_x_half, d_tiles,
+                        static_cast<std::uint32_t>(tiles.size()), tile_rows,
+                        d_bounds, d_rows_token, d_rows_slot, nullptr, d_f16,
+                        nullptr, m, k, nullptr)) {
+    throw std::runtime_error("routed F16 GEMM rejected the shape");
   }
   // The F16-output route (the up and down projections' rows) must match
   // the F32 output to F16 rounding.
@@ -331,18 +327,61 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
   const auto f16 = Download(d_f16, slots * m);
   const auto f16_half = Download(d_f16_half, slots * m);
   double worst_half = 0.0;
-  for (std::size_t i = 0; i < (check ? slots * m : 0); ++i) {
+  for (std::size_t i = 0; i < slots * m; ++i) {
     const double a = f16[i];
     const double b = __half2float(f16_half[i]);
     worst_half = std::max(worst_half, std::abs(a - b) / (std::abs(a) + 1.0));
   }
-  if (check && worst_half > 2e-3) {
+  if (worst_half > 2e-3) {
     throw std::runtime_error("routed F16-output rows disagree with F32: " +
                              std::to_string(worst_half));
   }
 
+  if (tile_rows == 48 &&
+      (type == q::WeightType::kQ4_K || type == q::WeightType::kQ5_K)) {
+    // Different gate/up weights, with the up scale small enough that these
+    // deliberately large synthetic weights do not overflow the F16 output.
+    auto up = w.packed;
+    const std::size_t block_bytes = type == q::WeightType::kQ4_K ? 144 : 176;
+    for (std::size_t b = 0; b < up.size(); b += block_bytes) {
+      for (std::size_t offset : {0U, 2U}) {
+        __half scale;
+        std::memcpy(&scale, up.data() + b + offset, sizeof(scale));
+        scale = __float2half(__half2float(scale) / 1024.0F);
+        std::memcpy(up.data() + b + offset, &scale, sizeof(scale));
+      }
+    }
+    auto* d_up = Upload(up);
+    auto* d_pair = Upload(std::vector<__half>(slots * m, __float2half(0.0F)));
+    if (!q::RoutedF16Gemm(d_up, type, d_x_half, d_tiles,
+                          static_cast<std::uint32_t>(tiles.size()), tile_rows,
+                          d_bounds, d_rows_token, d_rows_slot, d_f16, nullptr,
+                          d_f16_half, m, k, nullptr) ||
+        !q::RoutedGatedF16Gemm(d_w, d_up, type, d_x_half, d_tiles,
+                               static_cast<std::uint32_t>(tiles.size()),
+                               d_bounds, d_rows_token, d_rows_slot, d_pair, m,
+                               k, nullptr)) {
+      throw std::runtime_error("paired routed SwiGLU launch failed");
+    }
+    const auto separate = Download(d_f16_half, slots * m);
+    const auto paired = Download(d_pair, slots * m);
+    for (std::size_t i = 0; i < paired.size(); ++i) {
+      const float a = __half2float(separate[i]);
+      const float b = __half2float(paired[i]);
+      // Fast-math permits either sign of zero; every numerical value must
+      // match exactly, including subnormal F16 values.
+      if (!std::isfinite(a) || !std::isfinite(b) || a != b) {
+        throw std::runtime_error("paired routed SwiGLU differs at " +
+                                 std::to_string(i) + ": " + std::to_string(a) +
+                                 " vs " + std::to_string(b));
+      }
+    }
+    CheckHip(hipFree(d_up), "paired up free");
+    CheckHip(hipFree(d_pair), "paired output free");
+  }
+
   Result r{0.0, 0.0, 0.0, 0.0};
-  for (std::size_t s = 0; s < (check ? slots : 0); ++s) {
+  for (std::size_t s = 0; s < slots; ++s) {
     const std::size_t t = s / used;
     const std::int32_t e = ids[s];
     for (std::size_t row = 0; row < m; ++row) {
@@ -498,39 +537,18 @@ int main() {
     // Ragged rows against the 128-row tile and a tiny batch.
     ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 200, 512, 0xDEADBEEFU)) && ok;
     // The 16-row tile (small buckets) on every type.
-    ok = Ok(Run(q::WeightType::kQ4_K, 300, 10, 64, 640, 2560, 0x16161616U, true,
+    ok = Ok(Run(q::WeightType::kQ4_K, 300, 10, 64, 640, 2560, 0x16161616U,
                 16)) &&
          ok;
-    ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x16160002U, true,
+    ok = Ok(Run(q::WeightType::kQ5_K, 300, 10, 64, 640, 2560, 0x16160002U,
                 16)) &&
          ok;
-    ok = Ok(Run(q::WeightType::kQ5_1, 3000, 1, 64, 2560, 640, 0x16160003U, true,
+    ok = Ok(Run(q::WeightType::kQ5_1, 3000, 1, 64, 2560, 640, 0x16160003U,
                 16)) &&
          ok;
-    ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x16160004U, true,
+    ok = Ok(Run(q::WeightType::kQ8_0, 3000, 1, 64, 2560, 640, 0x16160004U,
                 16)) &&
          ok;
-    // Production shapes for profiling only (QFN_ROUTED_BENCH=1): the F16
-    // route is launched three times per shape, no reference.
-    if (std::getenv("QFN_ROUTED_BENCH") != nullptr) {
-      const std::uint32_t tile_rows =
-          std::getenv("QFN_ROUTED_TILE") != nullptr
-              ? static_cast<std::uint32_t>(
-                    std::atoi(std::getenv("QFN_ROUTED_TILE")))
-              : 48;
-      const std::size_t n_tokens = std::getenv("QFN_ROUTED_TOKENS") != nullptr
-                                       ? static_cast<std::size_t>(std::atoi(
-                                             std::getenv("QFN_ROUTED_TOKENS")))
-                                       : 2048;
-      for (int i = 0; i < 3; ++i) {
-        (void)Run(q::WeightType::kQ4_K, n_tokens, 10, 512, 640, 2560,
-                  0x1111U + i, false, tile_rows);
-        (void)Run(q::WeightType::kQ5_1, n_tokens * 10, 1, 512, 2560, 640,
-                  0x2222U + i, false, tile_rows);
-        (void)Run(q::WeightType::kQ8_0, n_tokens * 10, 1, 512, 2560, 640,
-                  0x3333U + i, false, tile_rows);
-      }
-    }
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

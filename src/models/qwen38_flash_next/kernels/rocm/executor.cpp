@@ -1148,20 +1148,30 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       half_bf16_ = false;
     }
     const auto* x_half = static_cast<const __half*>(s_.x_half);
-    // The up projection's epilogue applies the SwiGLU with the gate output
-    // and writes the down projection's F16 input in place of the up result.
+    // Large batches pair the gate/up projections and apply SwiGLU without
+    // materializing the gate. Smaller buckets favor separate projections.
     auto* up_half = reinterpret_cast<__half*>(s_.up_e);
     const WeightType gate_type = l.ffn_gate_exps.type == GgmlType::kQ5_K
                                      ? WeightType::kQ5_K
                                      : WeightType::kQ4_K;
-    if (!RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half, s_.routed_tiles,
-                       routed_n_tiles_, routed_tile_rows_, s_.routed_bounds,
-                       s_.rows_token, s_.rows_slot, nullptr, s_.gate_e, nullptr,
-                       c.expert_ff, c.hidden_size, stream_) ||
-        !RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half, s_.routed_tiles,
-                       routed_n_tiles_, routed_tile_rows_, s_.routed_bounds,
-                       s_.rows_token, s_.rows_slot, s_.gate_e, nullptr, up_half,
-                       c.expert_ff, c.hidden_size, stream_)) {
+    const bool gated_ok =
+        n_tokens >= 1024 && routed_tile_rows_ == 48
+            ? RoutedGatedF16Gemm(l.ffn_gate_exps.data, l.ffn_up_exps.data,
+                                 gate_type, x_half, s_.routed_tiles,
+                                 routed_n_tiles_, s_.routed_bounds,
+                                 s_.rows_token, s_.rows_slot, up_half,
+                                 c.expert_ff, c.hidden_size, stream_)
+            : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
+                             s_.routed_tiles, routed_n_tiles_,
+                             routed_tile_rows_, s_.routed_bounds, s_.rows_token,
+                             s_.rows_slot, nullptr, s_.gate_e, nullptr,
+                             c.expert_ff, c.hidden_size, stream_) &&
+               RoutedF16Gemm(l.ffn_up_exps.data, gate_type, x_half,
+                             s_.routed_tiles, routed_n_tiles_,
+                             routed_tile_rows_, s_.routed_bounds, s_.rows_token,
+                             s_.rows_slot, s_.gate_e, nullptr, up_half,
+                             c.expert_ff, c.hidden_size, stream_));
+    if (!gated_ok) {
       AssignError(error_msg, "routed F16 gate/up GEMM failed");
       return false;
     }

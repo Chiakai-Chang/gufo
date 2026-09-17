@@ -1748,7 +1748,7 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
                                  std::uint32_t max_blocks) {
   __shared__ std::uint32_t hist[256];
   __shared__ std::uint32_t wave_ties[kThreads / 32];
-  __shared__ std::uint32_t state[2];  // threshold, remaining
+  __shared__ std::uint32_t state[3];  // threshold, remaining, bin count
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t pos = *start_pos + first_token + t;
   const std::uint32_t complete = (pos + 1) / ratio;
@@ -1788,6 +1788,7 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
       }
       state[0] = prefix | (bin << shift);
       state[1] = remaining - seen;
+      state[2] = hist[bin];
     }
     __syncthreads();
     prefix = state[0];
@@ -1800,6 +1801,19 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
   // a per-chunk scan over the eight waves.
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t wave = threadIdx.x >> 5u;
+  if (remaining == state[2]) {
+    // Every threshold tie fits (in particular, a unique threshold). No
+    // prefix scan is needed: each wave writes one complete mask word.
+    for (std::uint32_t chunk = 0; chunk < complete; chunk += blockDim.x) {
+      const std::uint32_t b = chunk + threadIdx.x;
+      const bool selected = b < complete && sc[b] >= threshold;
+      const auto bits = static_cast<std::uint32_t>(__ballot(selected));
+      if (lane == 0 && b < complete) {
+        words[b / 32] = bits;
+      }
+    }
+    return;
+  }
   std::uint32_t ties_before = 0;
   for (std::uint32_t chunk = 0; chunk < complete; chunk += blockDim.x) {
     const std::uint32_t b = chunk + threadIdx.x;
@@ -3249,7 +3263,7 @@ __device__ __forceinline__ void CodesToHalves(std::uint32_t codes,
   hi = __hfma2(__hadd2(__builtin_bit_cast(__half2, p1), magic), scale2, bias2);
 }
 
-template<WeightType kType, int BM, int BN, int BK>
+template<WeightType kType, int BM, int BN, int BK, bool kPair = false>
 __launch_bounds__(256) __global__
     void RoutedF16GEMMKernel(const void* __restrict__ w,
                              const __half* __restrict__ x,
@@ -3260,8 +3274,9 @@ __launch_bounds__(256) __global__
                              const float* __restrict__ swiglu_gate,
                              float* __restrict__ out,
                              __half* __restrict__ out_half, std::size_t m,
-                             std::size_t k) {
+                             std::size_t k, const void* __restrict__ w_up) {
   static_assert(BM == 128 || BM == 256, "eight waves, 16-row tiles");
+  static_assert(!kPair || BM == 128);
   static_assert(BN % 16 == 0 && BN / 16 <= 8);
   static_assert(BK == 2, "one stage is one 32-byte Q4_K nibble group");
   constexpr int kTokTiles = BN / 16;
@@ -3314,7 +3329,8 @@ __launch_bounds__(256) __global__
   const int lane_id = tid & 31;
   const int sub_lane = lane_id & 15;
   const int half_id = lane_id >> 4;
-  const int r_block = static_cast<int>(blockIdx.x) * BM;
+  constexpr int kRows = kPair ? BM / 2 : BM;
+  const int r_block = static_cast<int>(blockIdx.x) * kRows;
 
   // Weight fetch: unit u of a thread is (row = tid / 2 + 128 u, chunk c =
   // tid % 2). Q4_K: the two 16-byte halves of one 32-byte nibble group (two
@@ -3326,9 +3342,17 @@ __launch_bounds__(256) __global__
   int f_header_block[kWaveRowTiles];
 #pragma unroll
   for (int u = 0; u < kWaveRowTiles; ++u) {
-    const int r = r_block + (tid >> 1) + (u * 128);
+    const int r =
+        r_block + (kPair ? (tid >> 1) % kRows : (tid >> 1) + (u * 128));
     f_live[u] = r < m_i;
-    f_ptr[u] = w_expert +
+    const std::uint8_t* weights = w_expert;
+    if constexpr (kPair) {
+      if ((tid >> 1) >= kRows) {
+        weights = static_cast<const std::uint8_t*>(w_up) +
+                  static_cast<std::size_t>(expert) * m * row_bytes;
+      }
+    }
+    f_ptr[u] = weights +
                static_cast<std::size_t>(f_live[u] ? r : (m_i - 1)) * row_bytes;
     f_header[u] = make_uint4(0u, 0u, 0u, 0u);
     f_header_block[u] = -1;
@@ -3598,6 +3622,45 @@ __launch_bounds__(256) __global__
     }
     compute_stage();
     __syncthreads();
+  }
+
+  if constexpr (kPair) {
+    // Four waves compute gate rows and four compute the matching up rows.
+    // Pair them in the existing LDS allocation, keeping the K accumulation
+    // order and avoiding the gate's F32 write/read between projections.
+    float* base = reinterpret_cast<float*>(lds);
+    float* scratch = base + wave_id * 256;
+#pragma unroll
+    for (int j = 0; j < kTokTiles; ++j) {
+#pragma unroll
+      for (int l = 0; l < 8; ++l) {
+        scratch[sub_lane * 16 + 2 * l + half_id] = acc[0][j][l];
+      }
+      __syncthreads();
+#pragma unroll
+      for (int unit = 0; unit < 4; ++unit) {
+        const int flat = unit * 256 + tid;
+        const int t = t_local + j * 16 + flat / kRows;
+        const int r = flat % kRows;
+        if (t < bucket_rows && r_block + r < m_i) {
+          const std::int32_t dst = rows_out[bucket_begin + t];
+          if (dst >= 0) {
+            const int idx = (r / 16) * 256 + (flat / kRows) * 16 + r % 16;
+            // Preserve the separate projection epilogue's F32 evaluation
+            // order before narrowing. Fast-math can otherwise regroup the
+            // products and change an F16 rounding tie.
+            float product = base[idx + 4 * 256] * base[idx];
+            asm volatile("" : "+v"(product));
+            float value = product * SigmoidF(base[idx]);
+            asm volatile("" : "+v"(value));
+            out_half[static_cast<std::size_t>(dst) * m + r_block + r] =
+                __float2half(value);
+          }
+        }
+      }
+      __syncthreads();
+    }
+    return;
   }
 
   // Transpose each 16x16 tile through LDS, then scatter the 16 rows of each
@@ -3959,25 +4022,25 @@ bool LaunchRoutedF16(const void* w, WeightType type, const __half* x,
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ4_K, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
                          pad_bounds, rows_in, rows_out, swiglu_gate, out,
-                         out_half, m, k);
+                         out_half, m, k, nullptr);
       return true;
     case WeightType::kQ5_1:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_1, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
                          pad_bounds, rows_in, rows_out, swiglu_gate, out,
-                         out_half, m, k);
+                         out_half, m, k, nullptr);
       return true;
     case WeightType::kQ8_0:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ8_0, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
                          pad_bounds, rows_in, rows_out, swiglu_gate, out,
-                         out_half, m, k);
+                         out_half, m, k, nullptr);
       return true;
     case WeightType::kQ5_K:
       hipLaunchKernelGGL((RoutedF16GEMMKernel<WeightType::kQ5_K, kBM, BN, kBK>),
                          grid, dim3(kThreads), 0, stream, w, x, tiles,
                          pad_bounds, rows_in, rows_out, swiglu_gate, out,
-                         out_half, m, k);
+                         out_half, m, k, nullptr);
       return true;
     default:
       return false;
@@ -4005,6 +4068,34 @@ bool RoutedF16Gemm(const void* w, WeightType type, const __half* x,
       return LaunchRoutedF16<48>(w, type, x, tiles, n_tiles, pad_bounds,
                                  rows_in, rows_out, swiglu_gate, out, out_half,
                                  m, k, stream);
+    default:
+      return false;
+  }
+}
+
+bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
+                        const __half* x, const std::int32_t* tiles,
+                        std::uint32_t n_tiles, const std::int32_t* pad_bounds,
+                        const std::int32_t* rows_in,
+                        const std::int32_t* rows_out, __half* out,
+                        std::size_t m, std::size_t k, hipStream_t stream) {
+  if (m == 0 || k == 0 || k % 256 != 0 || n_tiles == 0 || out == nullptr) {
+    return false;
+  }
+  const dim3 grid(static_cast<unsigned int>((m + 63) / 64), n_tiles);
+  switch (type) {
+    case WeightType::kQ4_K:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ4_K, 128, 48, 2, true>), grid,
+          dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
+          rows_out, nullptr, nullptr, out, m, k, up);
+      return true;
+    case WeightType::kQ5_K:
+      hipLaunchKernelGGL(
+          (RoutedF16GEMMKernel<WeightType::kQ5_K, 128, 48, 2, true>), grid,
+          dim3(kThreads), 0, stream, gate, x, tiles, pad_bounds, rows_in,
+          rows_out, nullptr, nullptr, out, m, k, up);
+      return true;
     default:
       return false;
   }
