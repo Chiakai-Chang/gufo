@@ -848,14 +848,6 @@ __global__ void SigmoidMulKernel(float* x, const float* g, std::size_t count) {
   }
 }
 
-__global__ void AddKernel(float* dst, const float* src, std::size_t count) {
-  const std::size_t i =
-      blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
-  if (i < count) {
-    dst[i] += src[i];
-  }
-}
-
 template<typename T>
 __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
   const std::size_t i =
@@ -4186,12 +4178,6 @@ void SigmoidMul(float* x, const float* g, std::size_t count,
                 hipStream_t stream) {
   hipLaunchKernelGGL(SigmoidMulKernel, dim3(Blocks(count)), dim3(kThreads), 0,
                      stream, x, g, count);
-}
-
-void AddInPlace(float* dst, const float* src, std::size_t count,
-                hipStream_t stream) {
-  hipLaunchKernelGGL(AddKernel, dim3(Blocks(count)), dim3(kThreads), 0, stream,
-                     dst, src, count);
 }
 
 void NarrowActivations(const float* x, void* out, bool bf16, std::size_t count,

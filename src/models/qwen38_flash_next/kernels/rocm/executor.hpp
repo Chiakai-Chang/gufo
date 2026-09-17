@@ -141,12 +141,10 @@ public:
   /// `hidden_row + i` of the last Forward batch, or, with hidden_row < 0
   /// (single token), the draft block's own residual from the previous call.
   /// Only requested outputs are computed. Production requests a greedy
-  /// token or compact candidate logits. Numerical probes can request full
-  /// logits. Catch-up can skip
-  /// the output head when only the draft state is needed.
+  /// token or compact candidate logits. Catch-up skips the output head
+  /// when only the draft state is needed.
   struct MtpOutput {
     std::int32_t* token{nullptr};
-    float* logits{nullptr};
     MtpCandidateLogits* candidates{nullptr};
   };
   [[nodiscard]] bool MtpForward(Session& session,
@@ -279,16 +277,16 @@ private:
                  std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg) const;
-  /// Full-vocabulary logits of `n_rows` rows land in logits_host_.
+  /// Selects the greedy token or compact candidates from full MTP logits.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
-               bool logits, bool candidates, std::string* error_msg) const;
+               bool candidates, std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool speculative, bool sparse, std::uint32_t start_pos,
                    std::uint32_t pool_grid, std::uint32_t first_layer,
                    std::uint32_t end_layer, std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
-               bool logits, bool candidates, std::string* error_msg) const;
+               bool candidates, std::string* error_msg) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -400,7 +398,6 @@ private:
   mutable std::uint32_t routed_pair_tiles_{0};
   mutable std::uint32_t routed_pair_rows_{64};
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
-  mutable std::size_t routed_compact_rows_{0};  ///< sum of padded buckets
   mutable int routed_tile_cols_{0};
   float* logits_host_{nullptr};
   std::int32_t* mtp_token_host_{nullptr};

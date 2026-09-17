@@ -9,7 +9,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 SUITES = {
-    "fast": ["qwen_aie2p_w4a8_pack_test", "logit_sampler_test",
+    "fast": ["logit_sampler_test",
              "prompt_cli_test", "bench_cli_test", "openai_chat_test",
              "speculative_verification_test"],
     "kernels": ["qwen_gpu_ops_test", "qwen_ssm_ops_test",

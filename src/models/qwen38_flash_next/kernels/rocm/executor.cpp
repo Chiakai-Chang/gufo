@@ -698,14 +698,12 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   // 16-padded bucket): the map is built here and uploaded ahead of the
   // launches on the same stream.
   std::uint32_t max_rows = 0;
-  std::size_t compact = 0;
   std::uint32_t n_tiles = 0;
   routed_tile_rows_ = RoutedTileRows(
       static_cast<std::size_t>(n_tokens) * c.num_experts_used, c);
   for (std::uint32_t e = 0; e < c.num_experts; ++e) {
     const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
     max_rows = std::max(max_rows, counts_host_[e]);
-    compact += padded;
     for (std::uint32_t j = 0;
          j < (padded + routed_tile_rows_ - 1) / routed_tile_rows_; ++j) {
       tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
@@ -740,7 +738,6 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
       }
     }
   }
-  routed_compact_rows_ = std::max<std::size_t>(16, compact);
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
       counts_host_, static_cast<int>(c.num_experts));
   return n_tiles == 0 || Check(hipMemcpyAsync(s_.routed_tiles, tiles_host_,
@@ -1368,8 +1365,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 }
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
-                       bool logits, bool candidates,
-                       std::string* error_msg) const {
+                       bool candidates, std::string* error_msg) const {
   const DeviceTensor& output = model_->output();
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
       !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
@@ -1400,11 +1396,7 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
       return false;
     }
   }
-  return !logits || Check(hipMemcpyAsync(logits_host_, s_.logits,
-                                         static_cast<std::size_t>(output.rows) *
-                                             sizeof(float),
-                                         hipMemcpyDeviceToHost, stream_),
-                          "logits download", error_msg);
+  return true;
 }
 
 bool Executor::Run(Session& session, std::uint64_t key, bool graph,
@@ -2075,21 +2067,16 @@ bool Executor::MtpForward(Session& session,
                             (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
                             (std::uint64_t{1} << 40) |
                             (std::uint64_t{output.token != nullptr} << 41) |
-                            (std::uint64_t{output.logits != nullptr} << 42) |
                             (std::uint64_t{output.candidates != nullptr} << 43);
   const auto body = [&] {
     return MtpBody(session, n, pos, output.token != nullptr,
-                   output.logits != nullptr, output.candidates != nullptr,
-                   error_msg);
+                   output.candidates != nullptr, error_msg);
   };
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
   }
   if (output.token != nullptr) {
     *output.token = *mtp_token_host_;
-  }
-  if (output.logits != nullptr) {
-    std::copy_n(logits_host_, config().vocab_size, output.logits);
   }
   if (output.candidates != nullptr) {
     *output.candidates = *mtp_candidates_host_;
@@ -2101,7 +2088,7 @@ bool Executor::MtpForward(Session& session,
 }
 
 bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
-                       bool token, bool logits, bool candidates,
+                       bool token, bool candidates,
                        std::string* error_msg) const {
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
@@ -2155,8 +2142,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
              "MTP hidden carry", error_msg)) {
     return false;
   }
-  return (!token && !logits && !candidates) ||
-         MtpHead(l.nextn_head, last, token, logits, candidates, error_msg);
+  return (!token && !candidates) ||
+         MtpHead(l.nextn_head, last, token, candidates, error_msg);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -88,29 +88,25 @@ The current supported modality are: llm, video, audio (tts, asr).
 - `cacheDiskStagingBytes` — scratch space used while writing new cache
   entries. Must fit alongside `cacheDiskBytes`.
 
-**Speculative decoding (a small draft model guesses ahead, the big model
-verifies; output is identical, just faster)**
+**Speculative decoding**
 
-- `speculative` (alias `specType`) — which draft scheme to use: `dflash` /
-  `dflash2` (z-lab companion for Qwen), `mtp` / `mtp-npu` (multi-token
-  prediction, optionally offloaded to the NPU), `npu`, `pld` (prompt lookup
-  decoding: drafts by reusing matching text from the prompt itself, great for
-  summarizing or editing), `self` (the model drafts from itself, no extra
-  file), or `off`.
-- `draftModel` — generic path for a draft model; use this when your scheme
-  has no dedicated flag.
+A draft model proposes tokens for the target model to verify. Greedy decoding
+must reproduce the target's tokens; sampled decoding must preserve the target's
+distribution, but need not match an autoregressive run's sequence for the same
+seed. Speed depends on acceptance and verification cost.
+
+- `speculative` — `dflash2` for Qwen3.8-27B, `dspark` for DeepSeek V4 Flash,
+  `mtp` for models with a supported MTP head, or `off`. HTTP serving
+  supports `dflash2`, `dspark`, and Flash-Next `mtp`.
 - `dflashModel` — path to the DFlash2 companion draft.
+- `dsparkModel` — path to the DSpark support GGUF.
 - `mtpModel` — path to the MTP draft model.
-- `draftTokens` (alias `specDraftNMax`) — maximum tokens drafted per step. In
-  practice: wider drafts go faster when the guesses are accepted and waste
-  work when they are rejected.
-- `draftPolicy` (`"fixed"` / `"rolling"` / `"accepted-ema"`) — how the draft
-  length is chosen each step: always the maximum, a sliding range, or
-  adaptive based on recent acceptance.
-- `minDraftTokens` — never draft fewer than this, even when the adaptive
-  policy wants to collapse.
-- `specDraftPMin` — confidence floor: don't draft tokens whose probability is
-  below this. In practice: stops the drafter from guessing garbage.
+- `draftTokens` — maximum tokens drafted per step. Wider drafts go faster
+  when the guesses are accepted and waste work when they are rejected.
+- `draftPolicy` (`"fixed"` / `"adaptive"`) — DFlash2 block-length policy;
+  defaults to adaptive.
+- `minDraftTokens` — minimum draft length where supported. DFlash2, DSpark,
+  and Flash-Next MTP require the default of one.
 
 **Server limits (protecting the machine from clients)**
 

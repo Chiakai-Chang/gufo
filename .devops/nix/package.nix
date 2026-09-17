@@ -10,8 +10,6 @@
   ffmpeg-headless,
   libuuid,
   rocmPackages,
-  aie-qwen-mtp-eh-proj,
-  aie-qwen-mtp-rmsnorm,
   aie-smoke,
   xrt,
   xrt-plugin-amdxdna,
@@ -94,8 +92,6 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.rocprofiler-sdk
   ]
   ++ lib.optionals xrtSupport [
-    aie-qwen-mtp-eh-proj
-    aie-qwen-mtp-rmsnorm
     aie-smoke
     xrt
     xrt-plugin-amdxdna
@@ -116,8 +112,6 @@ stdenv.mkDerivation (finalAttrs: {
   ++ lib.optional rocmSupport "-DROCPRIM_INCLUDE_DIR=${rocmPackages.rocprim}/include"
   ++ lib.optional rocmSupport "-DROCWMMA_INCLUDE_DIR=${rocmPackages.rocwmma}/include"
   ++ lib.optional xrtSupport "-DENGINE_ENABLE_XRT=ON"
-  ++ lib.optional xrtSupport "-DGUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR=${placeholder "out"}/share/gufo/aie/qwen-mtp-eh-proj"
-  ++ lib.optional xrtSupport "-DGUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR=${placeholder "out"}/share/gufo/aie/qwen-mtp-rmsnorm"
   ++ lib.optional xrtSupport "-DGUFO_AIE_SMOKE_PROGRAM_DIR=${placeholder "out"}/share/gufo/aie/smoke";
 
   env = lib.optionalAttrs rocmSupport {
@@ -127,8 +121,6 @@ stdenv.mkDerivation (finalAttrs: {
     GUFO_ROCWMMA_ROOT = "${rocmPackages.rocwmma}";
   }
   // lib.optionalAttrs xrtSupport {
-    GUFO_AIE_QWEN_MTP_EH_PROJ_ROOT = "${aie-qwen-mtp-eh-proj}";
-    GUFO_AIE_QWEN_MTP_RMSNORM_ROOT = "${aie-qwen-mtp-rmsnorm}";
     GUFO_AIE_SMOKE_ROOT = "${aie-smoke}";
     XRT_PATH = "${xrt}/opt/xilinx/xrt";
     # Combined NPU lib dir so XRT can discover the amdxdna plugin at runtime.
@@ -165,28 +157,6 @@ stdenv.mkDerivation (finalAttrs: {
         ${aie-smoke}/smoke.aie-partition.json \
         ${aie-smoke}/manifest.json ${aie-smoke}/SHA256SUMS \
         $out/share/gufo/aie/smoke/
-    fi
-    if [ -d ${aie-qwen-mtp-rmsnorm} ]; then
-      mkdir -p $out/share/gufo/aie/qwen-mtp-rmsnorm
-      cp ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.xclbin \
-        ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.insts.elf \
-        ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.insts.bin \
-        ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.pdi \
-        ${aie-qwen-mtp-rmsnorm}/qwen_mtp_rmsnorm.aie-partition.json \
-        ${aie-qwen-mtp-rmsnorm}/manifest.json \
-        ${aie-qwen-mtp-rmsnorm}/SHA256SUMS \
-        $out/share/gufo/aie/qwen-mtp-rmsnorm/
-    fi
-    if [ -d ${aie-qwen-mtp-eh-proj} ]; then
-      mkdir -p $out/share/gufo/aie/qwen-mtp-eh-proj
-      cp ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.xclbin \
-        ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.insts.elf \
-        ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj_insts.bin \
-        ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.pdi \
-        ${aie-qwen-mtp-eh-proj}/qwen_mtp_eh_proj.aie-partition.json \
-        ${aie-qwen-mtp-eh-proj}/manifest.json \
-        ${aie-qwen-mtp-eh-proj}/SHA256SUMS \
-        $out/share/gufo/aie/qwen-mtp-eh-proj/
     fi
     chmod +x $out/bin/*
 

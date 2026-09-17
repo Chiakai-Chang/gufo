@@ -119,8 +119,16 @@ when reusing context. Decisions never depend on wall-clock timings.
 
 ## Quality checks
 
-Tests and probes live in `tests/models/qwen38_flash_next/`. Build and run the
-operator affected by a change first; for example:
+Tests and probes live in `tests/models/qwen38_flash_next/`. The
+`qwen38_flash_next_tests` build target contains 13 checks: n-gram I/O, MTP
+sampling, and 11 GPU operator/upload checks. Each covers a separate contract.
+Full-model tests are in the explicit `qwen38_flash_next_model_tests` build
+target; run `session_test` for decoding/sampling/wiring and `snapshot_test`
+for persistence and rollback. They require model paths and are not automatic
+CTest jobs. CPU/reference and GPU logit probes are explicit diagnostic targets;
+they do not implement a separate speculative generation loop.
+
+Build and run the operator affected by a change first; for example:
 
 ```sh
 nix develop -c cmake --build --preset gpu-test --target qwen38_flash_next_moe_ids_ops_test
@@ -140,8 +148,11 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]moe_ids_o
   match at short and 4K contexts. Sampled MTP must replay itself exactly;
   teacher-forcing its tokens through AR must reproduce every frontier logit.
   Cover fresh loads, request order, resets, snapshots and rollback prefixes.
-  Run `build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test
-  --model "$MODEL" --mtp-model "$MTP"` for retained model changes.
+  Build `qwen38_flash_next_model_tests`, then run
+  `build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test
+  --model "$MODEL" --mtp-model "$MTP"` for retained model changes. Run the
+  sibling `qwen38_flash_next_snapshot_test` with the same arguments when
+  state or snapshot handling changes.
 - **Sampling and wiring:** the shared 23-case serving matrix covers AR/MTP,
   filters, penalties, replay, C2 and short output budgets. Direct session and
   serving outputs must agree. Proposal tests check exact exported probability

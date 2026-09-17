@@ -195,13 +195,11 @@ void PackPrivateWeights(speculative::QwenMtpWeights& weights,
 QwenMtpGpuModel::QwenMtpGpuModel(
     std::shared_ptr<const core::GgufReader> mtp_reader,
     std::shared_ptr<const QwenGpuModel> target_model,
-    speculative::QwenMtpWeights weights,
-    models::QwenTensorRef raw_fusion_projection, std::vector<void*> allocations,
+    speculative::QwenMtpWeights weights, std::vector<void*> allocations,
     std::size_t packed_weight_bytes, double pack_time_seconds)
     : mtp_reader_(std::move(mtp_reader)),
       target_model_(std::move(target_model)),
       weights_(std::move(weights)),
-      raw_fusion_projection_(raw_fusion_projection),
       allocations_(std::move(allocations)),
       packed_weight_bytes_(packed_weight_bytes),
       pack_time_seconds_(pack_time_seconds) {}
@@ -236,7 +234,6 @@ std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::Create(
 
   std::vector<void*> allocations;
   std::size_t packed_bytes = 0;
-  const auto raw_fusion_projection = weights->fusion_projection;
   const auto start = std::chrono::steady_clock::now();
   try {
     PackPrivateWeights(*weights, allocations, packed_bytes);
@@ -253,10 +250,9 @@ std::shared_ptr<const QwenMtpGpuModel> QwenMtpGpuModel::Create(
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();
 
-  return std::shared_ptr<const QwenMtpGpuModel>(
-      new QwenMtpGpuModel(std::move(mtp_reader), std::move(target_model),
-                          std::move(*weights), raw_fusion_projection,
-                          std::move(allocations), packed_bytes, pack_seconds));
+  return std::shared_ptr<const QwenMtpGpuModel>(new QwenMtpGpuModel(
+      std::move(mtp_reader), std::move(target_model), std::move(*weights),
+      std::move(allocations), packed_bytes, pack_seconds));
 }
 
 }  // namespace gufo::hip

@@ -293,7 +293,7 @@ measurement. Avoid initially:
 - Running NPU work solely to increase nominal utilization.
 - Maintaining an unaccounted second weight layout.
 
-The NPU may also be useful for batched verification, MTP/draft work across
+The NPU may also be useful for batched verification, draft work across
 requests, vision encoding in a future multimodal product, or independent
 auxiliary models. Each is a separate measured route.
 

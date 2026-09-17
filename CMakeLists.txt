@@ -124,37 +124,7 @@ if (ENGINE_ENABLE_XRT)
       CACHE PATH "Directory containing the reviewed XDNA2 smoke artifacts")
   endif()
   set(GUFO_AIE_SMOKE_INCLUDE_DIR "$ENV{GUFO_AIE_SMOKE_ROOT}/include")
-  if (DEFINED ENV{GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}
-      AND NOT "$ENV{GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}" STREQUAL "")
-    set(GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
-      "$ENV{GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}"
-      CACHE PATH "Directory containing the reviewed Qwen MTP RMSNorm artifacts"
-      FORCE)
-  else()
-    set(GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
-      "${GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}"
-      CACHE PATH "Directory containing the reviewed Qwen MTP RMSNorm artifacts")
-  endif()
-  set(GUFO_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR
-    "$ENV{GUFO_AIE_QWEN_MTP_RMSNORM_ROOT}/include")
-  if (DEFINED ENV{GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}
-      AND NOT "$ENV{GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}" STREQUAL "")
-    set(GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR
-      "$ENV{GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
-      CACHE PATH "Directory containing the reviewed Qwen MTP eh_proj artifacts"
-      FORCE)
-  else()
-    set(GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR
-      "${GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
-      CACHE PATH "Directory containing the reviewed Qwen MTP eh_proj artifacts")
-  endif()
-  set(GUFO_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR
-    "$ENV{GUFO_AIE_QWEN_MTP_EH_PROJ_ROOT}/include")
-  if (NOT GUFO_AIE_SMOKE_PROGRAM_DIR OR NOT GUFO_AIE_SMOKE_INCLUDE_DIR
-      OR NOT GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR
-      OR NOT GUFO_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR
-      OR NOT GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR
-      OR NOT GUFO_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR)
+  if (NOT GUFO_AIE_SMOKE_PROGRAM_DIR OR NOT GUFO_AIE_SMOKE_INCLUDE_DIR)
     message(FATAL_ERROR "XDNA2 program artifacts not found. Use the Nix development environment")
   endif()
   message(STATUS "gufo: XRT NPU shim enabled, include=${XRT_INCLUDE_DIR}")
@@ -269,10 +239,7 @@ if (ENGINE_ENABLE_HIP)
     src/models/minimax_h3/sampling.hip
     src/models/minimax_h3/video_vae.hip
     "${GUFO_H3_ATTENTION_GENERATED_HEADER}"
-    src/core/speculative/draft_heads.cpp
-    src/core/speculative/self_speculative.cpp
     src/core/speculative/speculative_verifier.cpp
-    src/core/heterogeneous/npu_drafter.cpp
   )
   target_compile_definitions(gufo_core PUBLIC ENGINE_ENABLE_HIP=1)
   target_compile_definitions(gufo_core PRIVATE CK_ENABLE_BF16=1)
@@ -994,22 +961,6 @@ if (BUILD_TESTING)
     target_link_libraries(speculative_verification_test PRIVATE gufo_core hip::host roc::hipblas roc::rocblas)
     add_test(NAME speculative_verification_test COMMAND speculative_verification_test)
     set_tests_properties(speculative_verification_test PROPERTIES LABELS "hip;gpu;speculative")
-
-    add_executable(draft_heads_test tests/core/draft_heads_test.cpp)
-    target_link_libraries(draft_heads_test PRIVATE gufo_core hip::host roc::hipblas roc::rocblas)
-    add_test(NAME draft_heads_test COMMAND draft_heads_test)
-    set_tests_properties(draft_heads_test PROPERTIES LABELS "hip;gpu;draft_heads;speculative")
-
-    add_executable(npu_draft_fallback_test
-      tests/core/npu_draft_fallback_test.cpp)
-    target_link_libraries(npu_draft_fallback_test PRIVATE gufo_core hip::host roc::hipblas roc::rocblas)
-    if (ENGINE_ENABLE_XRT)
-      target_link_libraries(npu_draft_fallback_test PRIVATE ${XRT_COREUTIL_LIB})
-    endif()
-    add_test(NAME npu_draft_fallback_test COMMAND npu_draft_fallback_test)
-    set_tests_properties(npu_draft_fallback_test PROPERTIES
-      LABELS "host;speculative;lookup;npu-fallback")
-
   endif()
 
   if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)

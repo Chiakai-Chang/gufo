@@ -48,7 +48,8 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
     ${QFN_ROCM_DIR}/weight_upload.cpp
-    ${QFN_ROCM_DIR}/executor.cpp)
+    ${QFN_ROCM_DIR}/executor.cpp
+    engine.cpp)
   target_sources(gufo_qwen38_flash_next PRIVATE ${QFN_HIP_SOURCES})
   set_source_files_properties(${QFN_ROCM_DIR}/kernels.hip.cpp PROPERTIES LANGUAGE HIP)
   set_source_files_properties(${QFN_ROCM_DIR}/w8a8_wave64.hip
@@ -63,8 +64,4 @@ if (ENGINE_ENABLE_HIP)
     ${ROCWMMA_INCLUDE_DIR})
   target_link_libraries(gufo_qwen38_flash_next PUBLIC
     gufo_qwen38_flash_next_mmq hip::host roc::hipblas roc::hipblaslt)
-endif()
-
-if (ENGINE_ENABLE_HIP)
-  target_sources(gufo_qwen38_flash_next PRIVATE engine.cpp)
 endif()

@@ -42,7 +42,7 @@ layers own Q/K/V, per-head Q/K norms, RoPE/KV-cache work, and output projection.
 SSM layers own QKV/gate/alpha/beta projections, causal convolution, recurrent
 DeltaNet state, per-head normalization, gating, and output projection.
 
-[MTP](#mtp-and-xdna2) is a draft-model path, not another target-model layer. It
+[MTP](#mtp) is a draft-model path, not another target-model layer. It
 combines a target hidden state with the next-token embedding, runs the dedicated
 layer-64 graph, and feeds proposed tokens through the speculative backend.
 
@@ -65,10 +65,9 @@ layer-64 graph, and feeds proposed tokens through the speculative backend.
 | [`hip/ops/`](hip/ops/) | Narrow launcher interfaces grouped by attention, GEMM, norm/residual, SSM, SwiGLU, and token operations. [`ops.hpp`](hip/ops.hpp) is a compatibility umbrella. |
 | [`hip/kernels/`](hip/kernels/) | HIP implementations split by launch/experiment boundary; graph-pointer attention, decode recurrence, quant GEMV, and fused RMSNorm+SwiGLU have independent translation units. |
 | [`mtp_reference.hpp`](mtp_reference.hpp), [`mtp_reference.cpp`](mtp_reference.cpp) | Stateful CPU oracle for the single-layer MTP graph. |
-| [`hip/mtp/`](hip/mtp/), [`hip/mtp.hpp`](hip/mtp.hpp) | GPU MTP model conversion, executor, and speculative draft backend; optional hybrid NPU EH projection. |
+| [`hip/mtp/`](hip/mtp/), [`hip/mtp.hpp`](hip/mtp.hpp) | GPU MTP model conversion, executor, and speculative draft backend. |
 | [`dflash_weights.hpp`](dflash_weights.hpp), [`dflash_weights.cpp`](dflash_weights.cpp) | DFlash2 GGUF configuration, tensor binding and validation. The independent operator reference is in `tools/qwen27b/dflash_reference.py`. |
 | [`hip/dflash/`](hip/dflash/), [`hip/dflash.hpp`](hip/dflash.hpp), [`hip/kernels/dflash_kernels.*`](hip/kernels/dflash_kernels.hip) | GPU DFlash / DFlash-2 model, non-causal block attention kernels, 2-tap dynamic convs, bilinear path selector, and speculative draft backend. |
-| [`xdna2/`](xdna2/) | XRT sessions, packing contracts, and AIE2P programs for Qwen MTP operations. |
 | [`tokenizer.*`](tokenizer.hpp), [`chat_template.*`](chat_template.hpp) | BPE vocabulary/merge handling and bounded deterministic Qwen ChatML formatting. |
 | [`oracles.*`](oracles.hpp) | Independent reference helpers used for correctness comparison. |
 | [`CMakeLists.txt`](CMakeLists.txt) | Explicit Qwen production source registration and HIP/XRT source ownership. |
@@ -193,9 +192,7 @@ A tensor's original GGUF format and its runtime format are not always the same:
 - target-model GPU mapping/copy changes the address but preserves the encoded
   bytes and `QwenTensorRef::type`;
 - the GPU MTP loader expands supported matrix formats once into F32 or BF16
-  allocations and updates the runtime tensor type accordingly; and
-- the original raw MTP fusion projection is retained separately when the hybrid
-  XDNA2 EH projection needs its packed source representation.
+  allocations and updates the runtime tensor type accordingly.
 
 Always dispatch from the runtime `QwenTensorRef::type`. Original GGUF metadata
 is provenance, not permission to reinterpret converted storage.
@@ -313,35 +310,16 @@ point: it constructs `QwenSsmParameters` with `MakeQwenSsmParameters` and then
 delegates. New module code should use the typed slice rather than grow the
 compatibility wrapper.
 
-## MTP and XDNA2
+## MTP
 
 The MTP paths share the target tokenizer/embedding/LM-head contract but own
 their own model and session state:
 
 - [`QwenMtpReference`](mtp_reference.hpp) is the CPU oracle.
 - [`QwenMtpGpuModel` and `QwenMtpGpuExecutor`](hip/mtp.hpp) own converted GPU
-  weights, the layer-64 graph, feedback state, and optional hybrid metrics.
+  weights, the layer-64 graph, and feedback state.
 - `QwenMtpGpuDraftBackend` adapts the executor to the speculative draft API and
   requires target hidden states.
-- In `kHybridNpuEhProj` mode, the EH fusion projection may run through an XRT
-  [`QwenMtpEhProjSession`](xdna2/mtp_eh_proj.h); the remainder of the graph is
-  still HIP.
-
-There are two distinct W4A8 byte ABIs in this directory:
-
-1. [`aie2p_w4a8_pack.hpp`](xdna2/aie2p_w4a8_pack.hpp) defines the tiled AIE2P
-   W4A8 records used by its program family: 16-lane tiles, per-group activation
-   records, and tiled output accumulation.
-2. [`mtp_eh_proj.cpp`](xdna2/mtp_eh_proj.cpp) owns the EH projection session;
-   it starts from row-major Q4_K source rows and repacks them into its own
-   4096-byte weight-record and 2048-byte input-record ABI.
-
-They are **not interchangeable**. Sharing the words "W4A8" or a logical matrix
-shape does not make packed bytes compatible. Any packing change must be checked
-against the exact program manifest, host session, CPU reference, and device
-program that consume that ABI. See also
-[`docs/QUANTIZATION.md`](../../../docs/QUANTIZATION.md).
-
 ## DFlash and DFlash-2 block diffusion drafting
 
 DFlash and DFlash-2 are parallel block-diffusion speculative drafting systems. Unlike traditional autoregressive drafters (such as EAGLE-3 or sequential draft models) that predict draft tokens one step at a time, DFlash predicts an entire block of $K$ candidate tokens ($K \in [8, 16]$) simultaneously in a single forward pass.
@@ -527,8 +505,8 @@ When adding or changing a route:
   resolved before capture and remain immutable within an executor.
 - Split-K decode attention and side-stream layer prefetch currently bypass graph
   capture.
-- `hipblaslt_gemm.hip`, `aie2p_w4a8_pack.hpp`, and `mtp_eh_proj.cpp` remain
-  intentionally cohesive because they each own private cache/session or packed
+- `hipblaslt_gemm.hip` remains
+  intentionally cohesive because it owns private cache/session or packed
   ABI state that must change together.
 - Model-local CMake registration improves ownership, but Qwen still attaches to
   the shared `gufo_core` target; finer object-library build boundaries are

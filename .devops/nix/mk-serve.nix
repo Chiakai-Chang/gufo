@@ -62,14 +62,11 @@
   cacheDisk ? null,
   cacheDiskBytes ? null,
   cacheDiskStagingBytes ? null,
-  speculative ? null, # "dspark", "dflash", "dflash2", "mtp", "mtp-npu", "npu", "pld", "self", "off"
-  specType ? null, # alias for speculative ("draft-mtp" -> "mtp", etc.)
-  draftModel ? null, # generic draft model path / derivation
+  speculative ? null, # "dspark", "dflash2", "mtp", "off"
   dflashModel ? null,
   dsparkModel ? null,
   mtpModel ? null,
   draftTokens ? null,
-  specDraftNMax ? null, # alias for draftTokens
   minDraftTokens ? null,
   prefillChunk ? null,
   ubatchSize ? null, # alias for prefillChunk
@@ -94,38 +91,7 @@
 let
   finalContext = if context != null then context else batchSize;
   finalTemperature = if temperature != null then temperature else temp;
-  finalDraftTokens = if draftTokens != null then draftTokens else specDraftNMax;
   finalPrefillChunk = if prefillChunk != null then prefillChunk else ubatchSize;
-  finalSpeculative =
-    if specType == "draft-mtp" then
-      "mtp"
-    else if specType == "draft-dflash" then
-      "dflash2"
-    else if specType != null then
-      specType
-    else
-      speculative;
-  finalDflashModel =
-    if dflashModel != null then
-      dflashModel
-    else if (finalSpeculative == "dflash" || finalSpeculative == "dflash2") then
-      draftModel
-    else
-      null;
-  finalDsparkModel =
-    if dsparkModel != null then
-      dsparkModel
-    else if finalSpeculative == "dspark" then
-      draftModel
-    else
-      null;
-  finalMtpModel =
-    if mtpModel != null then
-      mtpModel
-    else if (finalSpeculative != null && finalSpeculative != "dflash" && finalSpeculative != "dflash2" && finalSpeculative != "dspark" && finalSpeculative != "off") then
-      draftModel
-    else
-      null;
   # `gufo serve` has a single "audio" subcommand hosting Qwen3-TTS synthesis,
   # Qwen3-ASR transcription, or both. "tts"/"asr"/"stt" remain accepted helper
   # spellings: they all emit `serve audio`, and "asr"/"stt" additionally route
@@ -157,13 +123,8 @@ let
   ];
   validSpeculativeModes = [
     "dspark"
-    "dflash"
     "dflash2"
     "mtp"
-    "mtp-npu"
-    "npu"
-    "pld"
-    "self"
     "off"
   ];
 
@@ -298,25 +259,25 @@ let
         "--cache-disk-staging-bytes"
         (toString cacheDiskStagingBytes)
       ]
-      ++ lib.optionals (finalSpeculative != null) [
+      ++ lib.optionals (speculative != null) [
         "--speculative"
-        finalSpeculative
+        speculative
       ]
-      ++ lib.optionals (finalDflashModel != null) [
+      ++ lib.optionals (dflashModel != null) [
         "--dflash-model"
-        (toString finalDflashModel)
+        (toString dflashModel)
       ]
-      ++ lib.optionals (finalDsparkModel != null) [
+      ++ lib.optionals (dsparkModel != null) [
         "--dspark-model"
-        (toString finalDsparkModel)
+        (toString dsparkModel)
       ]
-      ++ lib.optionals (finalMtpModel != null && finalDflashModel == null) [
+      ++ lib.optionals (mtpModel != null && dflashModel == null) [
         "--mtp-model"
-        (toString finalMtpModel)
+        (toString mtpModel)
       ]
-      ++ lib.optionals (finalDraftTokens != null) [
+      ++ lib.optionals (draftTokens != null) [
         "--draft-tokens"
-        (toString finalDraftTokens)
+        (toString draftTokens)
       ]
       ++ lib.optionals (minDraftTokens != null) [
         "--min-draft-tokens"
@@ -439,6 +400,6 @@ assert lib.assertMsg (preserveThinking == null || lib.elem preserveThinking vali
   "gufo.mkServe: 'preserveThinking' must be one of ${lib.generators.toJSON { } validThinkModes}, got '${toString preserveThinking}'";
 assert lib.assertMsg (reasoningEffort == null || lib.elem reasoningEffort validReasoningEfforts)
   "gufo.mkServe: 'reasoningEffort' must be one of ${lib.generators.toJSON { } validReasoningEfforts}, got '${toString reasoningEffort}'";
-assert lib.assertMsg (finalSpeculative == null || lib.elem finalSpeculative validSpeculativeModes)
-  "gufo.mkServe: 'speculative' must be one of ${lib.generators.toJSON { } validSpeculativeModes}, got '${toString finalSpeculative}'";
+assert lib.assertMsg (speculative == null || lib.elem speculative validSpeculativeModes)
+  "gufo.mkServe: 'speculative' must be one of ${lib.generators.toJSON { } validSpeculativeModes}, got '${toString speculative}'";
 "${bin} serve${serverStr}${rawHostStr}${rawPortStr} ${finalModality}${modalityStr}"

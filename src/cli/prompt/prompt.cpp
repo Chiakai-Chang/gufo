@@ -24,9 +24,6 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-#include "src/core/heterogeneous/npu_drafter.hpp"
-#include "src/core/speculative/draft_heads.hpp"
-#include "src/core/speculative/self_speculative.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -94,7 +91,7 @@ static void PrintTextHelp(std::string_view program_name,
                    &opt.preserve_thinking);
   parser.AddOption("", "--speculative", "MODE",
                    "Draft backend: dspark (DeepSeek V4 Flash), dflash2, "
-                   "mtp, mtp-npu, npu, self, or off",
+                   "mtp, or off",
                    "Speculative", &opt.speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
                    "Path to Qwen DFlash2 GGUF file", "Speculative",
@@ -602,7 +599,6 @@ int GenerateFlashNextResponse(const PromptOptions& opt,
 std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     const PromptOptions& opt, hip::QwenGpuExecutor& executor) {
   std::string err;
-  const auto& config = executor.GetConfig();
   std::unique_ptr<speculative::IDraftBackend> draft_backend;
   if (opt.speculative_backend == "dflash2") {
     std::string dflash_path = opt.dflash_model_path;
@@ -619,13 +615,7 @@ std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     if (draft_backend == nullptr) {
       throw std::runtime_error("Failed to initialize DFlash backend: " + err);
     }
-  } else if (opt.speculative_backend == "npu") {
-    heterogeneous::NpuDrafterConfig cfg;
-    cfg.max_draft_tokens = opt.draft_tokens;
-    cfg.vocab_size = config.vocab_size;
-    draft_backend = std::make_unique<heterogeneous::NpuDraftBackend>(cfg);
-  } else if (opt.speculative_backend == "mtp" ||
-             opt.speculative_backend == "mtp-npu") {
+  } else if (opt.speculative_backend == "mtp") {
     std::string mtp_path = opt.mtp_model_path;
     if (mtp_path.empty()) {
       throw std::invalid_argument("MTP requires --mtp-model");
@@ -633,21 +623,12 @@ std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     hip::QwenMtpGpuDraftConfig cfg{
         .max_context = executor.GetMaxContext(),
         .max_draft_tokens = static_cast<std::uint32_t>(opt.draft_tokens),
-        .execution_mode = opt.speculative_backend == "mtp-npu"
-                              ? hip::QwenMtpExecutionMode::kHybridNpuEhProj
-                              : hip::QwenMtpExecutionMode::kGpu,
     };
     draft_backend = hip::QwenMtpGpuDraftBackend::CreateFromGguf(
         mtp_path, executor.GetSharedModel(), cfg, &err);
     if (draft_backend == nullptr) {
       throw std::runtime_error("Failed to initialize MTP backend: " + err);
     }
-  } else if (opt.speculative_backend == "self") {
-    speculative::SelfSpeculativeConfig cfg;
-    cfg.total_layers = config.num_layers;
-    cfg.exit_layer = std::max<std::uint32_t>(4U, config.num_layers / 4);
-    cfg.draft_step_count = opt.draft_tokens;
-    draft_backend = std::make_unique<speculative::SelfSpeculativeBackend>(cfg);
   } else {
     throw std::invalid_argument("Unknown speculative backend: " +
                                 opt.speculative_backend);
@@ -659,9 +640,7 @@ std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
   s_opts.initial_draft_tokens = opt.draft_tokens;
   const bool block_diffusion_draft = opt.speculative_backend == "dflash2";
   s_opts.enable_adaptive_draft_length = !block_diffusion_draft;
-  s_opts.use_batched_verification = block_diffusion_draft ||
-                                    opt.speculative_backend == "mtp" ||
-                                    opt.speculative_backend == "mtp-npu";
+  s_opts.use_batched_verification = true;
   return std::make_unique<speculative::SpeculativeVerifier>(
       executor, std::move(draft_backend), s_opts);
 }
@@ -769,8 +748,7 @@ std::optional<PromptOptions> ParsePromptOptions(
     speculative_explicit = true;
     if (value == "off") {
       opt.speculative_backend.clear();
-    } else if (value == "dspark" || value == "dflash2" || value == "mtp" ||
-               value == "mtp-npu" || value == "npu" || value == "self") {
+    } else if (value == "dspark" || value == "dflash2" || value == "mtp") {
       opt.speculative_backend = value;
     } else {
       if (error != nullptr)
@@ -781,8 +759,7 @@ std::optional<PromptOptions> ParsePromptOptions(
   };
   parser.AddCustomOption(
       "", "--speculative", "MODE",
-      "Draft backend: dspark (DeepSeek V4 Flash), dflash2, mtp, "
-      "mtp-npu, npu, self, or off",
+      "Draft backend: dspark (DeepSeek V4 Flash), dflash2, mtp, or off",
       "Speculative", parse_speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
                    "Path to Qwen DFlash2 GGUF file", "Speculative",
@@ -878,8 +855,7 @@ std::optional<PromptOptions> ParsePromptOptions(
       *error_msg = "DFlash2 requires --dflash-model";
     return std::nullopt;
   }
-  if ((backend == "mtp" || backend == "mtp-npu") &&
-      opt.mtp_model_path.empty()) {
+  if (backend == "mtp" && opt.mtp_model_path.empty()) {
     if (error_msg != nullptr)
       *error_msg = "MTP requires --mtp-model";
     return std::nullopt;

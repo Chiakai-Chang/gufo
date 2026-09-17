@@ -139,42 +139,6 @@ int main(int argc, const char* const* argv) {
     }
     Expect(max_logit_error < 2.0F, "selected logit error");
 
-#if defined(ENGINE_ENABLE_XRT)
-    auto hybrid_executor = gufo::hip::QwenMtpGpuExecutor::Create(
-        mtp_model, 8, &error,
-        gufo::hip::QwenMtpExecutionMode::kHybridNpuEhProj);
-    Expect(hybrid_executor != nullptr, error);
-    const auto hybrid_token =
-        hybrid_executor->ForwardTargetHidden(17, target_hidden, 0, true);
-    const auto hybrid_hidden = hybrid_executor->CopyLastHidden();
-    const auto hybrid_hidden_comparison = Compare(hybrid_hidden, gpu_hidden);
-    Expect(std::isfinite(hybrid_hidden_comparison.rmse),
-           "hybrid hidden RMSE is finite");
-    Expect(hybrid_hidden_comparison.rmse < 0.15, "hybrid hidden RMSE");
-    Expect(hybrid_hidden_comparison.cosine > 0.999, "hybrid hidden cosine");
-    Expect(hybrid_hidden_comparison.max_abs < 1.0F,
-           "hybrid hidden max absolute error");
-    const auto hybrid_logits = hybrid_executor->CopyLastLogits();
-    float hybrid_max_logit_error = 0.0F;
-    for (const auto selected : kSelectedTokens) {
-      hybrid_max_logit_error =
-          std::max(hybrid_max_logit_error,
-                   std::abs(hybrid_logits[selected] - logits[selected]));
-    }
-    Expect(hybrid_max_logit_error < 2.0F, "hybrid selected logit error");
-    const auto hybrid_logit_comparison = Compare(hybrid_logits, logits);
-    Expect(std::isfinite(hybrid_logit_comparison.rmse),
-           "hybrid logit RMSE is finite");
-    Expect(hybrid_logit_comparison.rmse < 0.2, "hybrid logit RMSE");
-    Expect(hybrid_logit_comparison.cosine > 0.999, "hybrid logit cosine");
-    Expect(hybrid_logit_comparison.max_abs < 2.0F,
-           "hybrid logit max absolute error");
-    Expect(hybrid_token == token, "hybrid draft token parity");
-    const auto hybrid_metrics = hybrid_executor->GetHybridMetrics();
-    Expect(hybrid_metrics.projection_count == 1, "hybrid projection count");
-    Expect(hybrid_metrics.npu_command_us > 0.0, "hybrid NPU command timing");
-#endif
-
     const std::vector<float> first_gpu_hidden(gpu_hidden.begin(),
                                               gpu_hidden.end());
     executor->Reset();
@@ -257,23 +221,7 @@ int main(int argc, const char* const* argv) {
               << " hidden_rmse=" << hidden_comparison.rmse
               << " hidden_cosine=" << hidden_comparison.cosine
               << " hidden_max_abs=" << hidden_comparison.max_abs
-              << " selected_logit_max_abs=" << max_logit_error
-#if defined(ENGINE_ENABLE_XRT)
-              << " hybrid_hidden_rmse=" << hybrid_hidden_comparison.rmse
-              << " hybrid_hidden_cosine=" << hybrid_hidden_comparison.cosine
-              << " hybrid_selected_logit_max_abs=" << hybrid_max_logit_error
-              << " hybrid_logit_rmse=" << hybrid_logit_comparison.rmse
-              << " hybrid_logit_cosine=" << hybrid_logit_comparison.cosine
-              << " hybrid_logit_max_abs=" << hybrid_logit_comparison.max_abs
-              << " hybrid_gpu_to_host_us=" << hybrid_metrics.gpu_to_host_us
-              << " hybrid_activation_pack_us="
-              << hybrid_metrics.activation_pack_us
-              << " hybrid_npu_command_us=" << hybrid_metrics.npu_command_us
-              << " hybrid_npu_end_to_end_us="
-              << hybrid_metrics.npu_end_to_end_us
-              << " hybrid_host_to_gpu_us=" << hybrid_metrics.host_to_gpu_us
-#endif
-              << '\n';
+              << " selected_logit_max_abs=" << max_logit_error << '\n';
     return 0;
   } catch (const std::exception& exception) {
     std::cerr << "qwen_mtp_gpu_test failed: " << exception.what() << '\n';

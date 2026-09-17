@@ -96,17 +96,8 @@ if (ENGINE_ENABLE_HIP)
 endif()
 
 if (ENGINE_ENABLE_XRT)
-  target_sources(gufo_core PRIVATE
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/xdna2/mtp_eh_proj.cpp
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/xdna2/mtp_rmsnorm.cpp)
   target_compile_definitions(gufo_core PUBLIC ENGINE_ENABLE_XRT=1)
-  target_compile_definitions(gufo_core PRIVATE
-    GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR="${GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR}"
-    GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR="${GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR}")
-  target_include_directories(gufo_core SYSTEM PUBLIC
-    ${XRT_INCLUDE_DIR}
-    ${GUFO_AIE_QWEN_MTP_EH_PROJ_INCLUDE_DIR}
-    ${GUFO_AIE_QWEN_MTP_RMSNORM_INCLUDE_DIR})
+  target_include_directories(gufo_core SYSTEM PUBLIC ${XRT_INCLUDE_DIR})
   target_link_libraries(gufo_core PUBLIC
     gufo_diagnostics
     ${XRT_COREUTIL_LIB}

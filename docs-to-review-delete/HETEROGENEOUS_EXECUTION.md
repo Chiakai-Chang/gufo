@@ -90,7 +90,7 @@ differently.
 | Small prompt prefill | GPU |
 | Large dense batched verification | NPU or split |
 | Small speculative verification | GPU |
-| Batched draft/MTP heads | NPU candidate |
+| Batched draft heads | NPU candidate |
 | MoE populated expert groups | Expert parallel |
 | Sampling and grammar | GPU/CPU contract |
 | Disk persistence | Background CPU and copy queue |
@@ -165,7 +165,7 @@ Suggested device ownership:
 | Scenario | Proposal | Verification |
 | --- | --- | --- |
 | One request, tiny MTP head | GPU | GPU |
-| Multiple MTP requests | NPU batch | GPU batch |
+| Multiple draft requests | NPU batch | GPU batch |
 | Dense draft model | NPU candidate | GPU |
 | Large combined verifier batch | GPU or NPU | NPU or split |
 | DeepSeek DSpark | NPU support-model candidate | GPU target |

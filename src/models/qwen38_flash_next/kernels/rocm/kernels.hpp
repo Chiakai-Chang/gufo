@@ -108,9 +108,6 @@ bool SwigluQ8Tiled(const float* gate, const float* up, void* out_q8,
 /// x[i] *= sigmoid(g[i]).
 void SigmoidMul(float* x, const float* g, std::size_t count,
                 hipStream_t stream);
-/// dst[i] += src[i].
-void AddInPlace(float* dst, const float* src, std::size_t count,
-                hipStream_t stream);
 
 /// out[t][m] = sum_k W[m][k] * x[t][k] for F32/BF16/F16 weights; meant for
 /// the narrow projections (routers, alpha/beta, indexer, inject) that the

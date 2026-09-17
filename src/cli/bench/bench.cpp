@@ -30,10 +30,7 @@
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
 
-#include "src/core/heterogeneous/npu_drafter.hpp"
 #include "src/core/hip/hip_utils.hpp"
-#include "src/core/speculative/draft_heads.hpp"
-#include "src/core/speculative/self_speculative.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
@@ -78,9 +75,8 @@ void PrintBenchHelp(std::string_view program_name) {
                    "Validation", &opt.model_path);
 
   parser.AddOption("", "--speculative", "MODE",
-                   "Draft backend: dflash2, mtp, mtp-npu, dspark, npu, "
-                   "self, or off",
-                   "Speculative", &opt.speculative_backend);
+                   "Draft backend: dflash2, mtp, dspark, or off", "Speculative",
+                   &opt.speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
                    "Path to Qwen DFlash2 GGUF file", "Speculative",
                    &opt.dflash_model_path);
@@ -1109,8 +1105,7 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     speculative_explicit = true;
     if (value == "off") {
       opt.speculative_backend.clear();
-    } else if (value == "dspark" || value == "dflash2" || value == "mtp" ||
-               value == "mtp-npu" || value == "npu" || value == "self") {
+    } else if (value == "dspark" || value == "dflash2" || value == "mtp") {
       opt.speculative_backend = value;
     } else {
       if (error != nullptr)
@@ -1120,8 +1115,7 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
     return true;
   };
   parser.AddCustomOption("", "--speculative", "MODE",
-                         "Draft backend: dflash2, mtp, mtp-npu, "
-                         "dspark, npu, self, or off",
+                         "Draft backend: dflash2, mtp, dspark, or off",
                          "Speculative", parse_speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
                    "Path to Qwen DFlash2 GGUF file", "Speculative",
@@ -1337,8 +1331,7 @@ int RunBench(std::span<const char* const> args) {
 
   const auto& config = gpu_exec->GetConfig();
   std::shared_ptr<const hip::QwenMtpGpuModel> mtp_gpu_model;
-  if (opt.speculative_backend == "mtp" ||
-      opt.speculative_backend == "mtp-npu") {
+  if (opt.speculative_backend == "mtp") {
     std::string mtp_path = opt.mtp_model_path;
     if (mtp_path.empty()) {
       std::cerr << "MTP requires --mtp-model\n";
@@ -1427,8 +1420,7 @@ int RunBench(std::span<const char* const> args) {
   ss_size << std::fixed << std::setprecision(2) << model_size_gib << " GiB";
   ss_params << std::fixed << std::setprecision(2) << model_params_b << " B";
 
-  const std::string_view backend_name =
-      opt.speculative_backend == "mtp-npu" ? "HIP+XDNA2" : "ROCm (HIP)";
+  const std::string_view backend_name = "ROCm (HIP)";
   const auto print_result = [&](std::string_view test_name,
                                 const BenchStats& stats) {
     std::ostringstream ss_ts;
@@ -1586,45 +1578,20 @@ int RunBench(std::span<const char* const> args) {
       runs.reserve(opt.repetitions);
       std::vector<double> acceptance_runs;
       acceptance_runs.reserve(opt.repetitions);
-      std::vector<double> hybrid_gpu_to_host_runs;
-      std::vector<double> hybrid_activation_pack_runs;
-      std::vector<double> hybrid_command_runs;
-      std::vector<double> hybrid_end_to_end_runs;
-      std::vector<double> hybrid_host_to_gpu_runs;
       for (std::size_t r = 0; r < opt.repetitions; ++r) {
         restore_depth();
 
         std::unique_ptr<speculative::IDraftBackend> draft_backend;
-        hip::QwenMtpGpuDraftBackend* mtp_backend = nullptr;
-        if (opt.speculative_backend == "mtp" ||
-            opt.speculative_backend == "mtp-npu") {
+        if (opt.speculative_backend == "mtp") {
           hip::QwenMtpGpuDraftConfig cfg{
               .max_context = static_cast<std::uint32_t>(required_context),
               .max_draft_tokens = opt.draft_tokens,
-              .execution_mode =
-                  opt.speculative_backend == "mtp-npu"
-                      ? hip::QwenMtpExecutionMode::kHybridNpuEhProj
-                      : hip::QwenMtpExecutionMode::kGpu,
           };
           draft_backend =
               hip::QwenMtpGpuDraftBackend::Create(mtp_gpu_model, cfg, &err);
           if (draft_backend == nullptr) {
             throw std::runtime_error("MTP initialization failed: " + err);
           }
-          mtp_backend =
-              static_cast<hip::QwenMtpGpuDraftBackend*>(draft_backend.get());
-        } else if (opt.speculative_backend == "self") {
-          speculative::SelfSpeculativeConfig cfg;
-          cfg.total_layers = config.num_layers;
-          cfg.exit_layer = std::max<std::uint32_t>(4U, config.num_layers / 4);
-          cfg.draft_step_count = opt.draft_tokens;
-          draft_backend =
-              std::make_unique<speculative::SelfSpeculativeBackend>(cfg);
-        } else if (opt.speculative_backend == "npu") {
-          heterogeneous::NpuDrafterConfig cfg;
-          cfg.max_draft_tokens = opt.draft_tokens;
-          cfg.vocab_size = config.vocab_size;
-          draft_backend = std::make_unique<heterogeneous::NpuDraftBackend>(cfg);
         }
 
         std::unique_ptr<speculative::SpeculativeVerifier> owned_spec_verifier;
@@ -1634,10 +1601,7 @@ int RunBench(std::span<const char* const> args) {
           s_opts.max_draft_tokens = opt.draft_tokens;
           s_opts.min_draft_tokens = opt.min_draft_tokens;
           s_opts.initial_draft_tokens = opt.draft_tokens;
-          if (opt.speculative_backend == "mtp" ||
-              opt.speculative_backend == "mtp-npu") {
-            s_opts.use_batched_verification = true;
-          }
+          s_opts.use_batched_verification = true;
           owned_spec_verifier =
               std::make_unique<speculative::SpeculativeVerifier>(
                   *gpu_exec, std::move(draft_backend), s_opts);
@@ -1700,20 +1664,6 @@ int RunBench(std::span<const char* const> args) {
             speculative_current_token = step_res.next_token;
           }
           acceptance_runs.push_back(spec_verifier->GetStats().AcceptanceRate());
-          if (mtp_backend != nullptr && opt.speculative_backend == "mtp-npu") {
-            const auto& metrics = mtp_backend->GetHybridMetrics();
-            if (metrics.projection_count > 0) {
-              const double count =
-                  static_cast<double>(metrics.projection_count);
-              hybrid_gpu_to_host_runs.push_back(metrics.gpu_to_host_us / count);
-              hybrid_activation_pack_runs.push_back(metrics.activation_pack_us /
-                                                    count);
-              hybrid_command_runs.push_back(metrics.npu_command_us / count);
-              hybrid_end_to_end_runs.push_back(metrics.npu_end_to_end_us /
-                                               count);
-              hybrid_host_to_gpu_runs.push_back(metrics.host_to_gpu_us / count);
-            }
-          }
         } else {
           for (std::size_t step = 0; step < g_len; ++step) {
             greedy_current_token = gpu_exec->ForwardToken(greedy_current_token,
@@ -1753,19 +1703,6 @@ int RunBench(std::span<const char* const> args) {
         std::cerr << test_name << " acceptance=" << std::fixed
                   << std::setprecision(3) << acceptance.mean << " +/- "
                   << acceptance.stddev << '\n';
-      }
-      if (opt.verbose && !hybrid_command_runs.empty()) {
-        const auto gpu_to_host = ComputeStats(hybrid_gpu_to_host_runs);
-        const auto activation_pack = ComputeStats(hybrid_activation_pack_runs);
-        const auto command = ComputeStats(hybrid_command_runs);
-        const auto npu_end_to_end = ComputeStats(hybrid_end_to_end_runs);
-        const auto host_to_gpu = ComputeStats(hybrid_host_to_gpu_runs);
-        std::cerr << test_name << " hybrid_us_per_projection: gpu_to_host="
-                  << gpu_to_host.mean
-                  << " activation_pack=" << activation_pack.mean
-                  << " npu_command=" << command.mean
-                  << " npu_end_to_end=" << npu_end_to_end.mean
-                  << " host_to_gpu=" << host_to_gpu.mean << '\n';
       }
     }
   }

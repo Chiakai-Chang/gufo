@@ -102,25 +102,6 @@ void TestDepthOptions() {
   Expect(options->repetitions == 1, "repetition count parsed");
 }
 
-void TestHybridMtpOptions() {
-  const std::array<const char*, 10> args = {"--speculative",
-                                            "mtp-npu",
-                                            "--mtp-model",
-                                            "mtp.gguf",
-                                            "--draft-tokens",
-                                            "2",
-                                            "--min-draft-tokens",
-                                            "2",
-                                            "--n-gen",
-                                            "128"};
-  const auto options = gufo::cli::ParseBenchOptions(args);
-  Expect(options.has_value(), "hybrid MTP options parse");
-  Expect(options->speculative_backend == "mtp-npu", "hybrid MTP mode parsed");
-  Expect(options->mtp_model_path == "mtp.gguf", "MTP model path parsed");
-  Expect(options->draft_tokens == 2, "draft token count parsed");
-  Expect(options->min_draft_tokens == 2, "minimum draft count parsed");
-}
-
 void TestInvalidDepth() {
   std::string error;
   const std::array<const char*, 2> args = {"--n-depth", "invalid"};
@@ -180,7 +161,6 @@ int main() {
   TestDs4SamplingOptions();
   TestFlashMtpSamplingOptions();
   TestDepthOptions();
-  TestHybridMtpOptions();
   TestInvalidDepth();
   TestInvalidWorkload();
   std::cout << "All benchmark CLI tests passed.\n";

@@ -26,8 +26,8 @@ std::unique_ptr<QwenMtpGpuDraftBackend> QwenMtpGpuDraftBackend::Create(
     }
     return nullptr;
   }
-  auto executor = QwenMtpGpuExecutor::Create(
-      std::move(model), config.max_context, error_msg, config.execution_mode);
+  auto executor = QwenMtpGpuExecutor::Create(std::move(model),
+                                             config.max_context, error_msg);
   if (executor == nullptr) {
     return nullptr;
   }
@@ -84,7 +84,6 @@ bool QwenMtpGpuDraftBackend::PrimeTargetContext(
     const auto final_hidden =
         context.prompt_hidden_states.subspan(final_offset, context.hidden_size);
     std::ranges::copy(final_hidden, target_hidden_.begin());
-    executor_->ResetHybridMetrics();
     primed_ = true;
     return true;
   } catch (const std::exception& exception) {

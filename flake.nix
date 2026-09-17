@@ -112,10 +112,6 @@
             rocmSupport = true;
             rocmGpuTargets = [ "gfx1151" ];
           };
-          aie-qwen-mtp-eh-proj =
-            gufoPackages.${system}.aie-qwen-mtp-eh-proj;
-          aie-qwen-mtp-rmsnorm =
-            gufoPackages.${system}.aie-qwen-mtp-rmsnorm;
           aie-smoke = gufoPackages.${system}.aie-smoke;
         }
       );
@@ -140,14 +136,6 @@
               GUFO_HIPCUB_ROOT = "${pkgs.${system}.rocmPackages.hipcub}";
               GUFO_ROCPRIM_ROOT = "${pkgs.${system}.rocmPackages.rocprim}";
               GUFO_ROCWMMA_ROOT = "${pkgs.${system}.rocmPackages.rocwmma}";
-              GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
-                "${gufoPackages.${system}.aie-qwen-mtp-eh-proj}";
-              GUFO_AIE_QWEN_MTP_EH_PROJ_ROOT =
-                "${gufoPackages.${system}.aie-qwen-mtp-eh-proj}";
-              GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
-                "${gufoPackages.${system}.aie-qwen-mtp-rmsnorm}";
-              GUFO_AIE_QWEN_MTP_RMSNORM_ROOT =
-                "${gufoPackages.${system}.aie-qwen-mtp-rmsnorm}";
               GUFO_AIE_SMOKE_PROGRAM_DIR = "${gufoPackages.${system}.aie-smoke}";
               GUFO_AIE_SMOKE_ROOT = "${gufoPackages.${system}.aie-smoke}";
               XRT_PATH = "${gufoPackages.${system}.xrt}/opt/xilinx/xrt";
@@ -170,14 +158,6 @@
             env = {
               MLIR_AIE_INSTALL_DIR = "${gufoPackages.${system}.mlir-aie}/${pkgs.${system}.python312.sitePackages}/mlir_aie";
               PEANO_INSTALL_DIR = "${gufoPackages.${system}.llvm-aie}/${pkgs.${system}.python312.sitePackages}/llvm-aie";
-              GUFO_AIE_QWEN_MTP_EH_PROJ_PROGRAM_DIR =
-                "${gufoPackages.${system}.aie-qwen-mtp-eh-proj}";
-              GUFO_AIE_QWEN_MTP_EH_PROJ_ROOT =
-                "${gufoPackages.${system}.aie-qwen-mtp-eh-proj}";
-              GUFO_AIE_QWEN_MTP_RMSNORM_PROGRAM_DIR =
-                "${gufoPackages.${system}.aie-qwen-mtp-rmsnorm}";
-              GUFO_AIE_QWEN_MTP_RMSNORM_ROOT =
-                "${gufoPackages.${system}.aie-qwen-mtp-rmsnorm}";
               GUFO_AIE_SMOKE_PROGRAM_DIR = "${gufoPackages.${system}.aie-smoke}";
               XRT_PATH = "${gufoPackages.${system}.xrt}/opt/xilinx/xrt";
             };
@@ -510,7 +490,7 @@
                 context = 4096;
                 servedModelName = "qwen-test";
                 speculative = "dflash2";
-                draftModel = "/var/models/qwen-draft.gguf";
+                dflashModel = "/var/models/qwen-draft.gguf";
                 port = 9000;
                 temperature = 0.8;
                 topK = 40;
@@ -531,7 +511,13 @@
               dsparkCmd = self.lib.${system}.mkGufoServe {
                 model = "/var/models/ds4.gguf";
                 speculative = "dspark";
-                draftModel = "/var/models/dspark.gguf";
+                dsparkModel = "/var/models/dspark.gguf";
+                draftTokens = 3;
+              };
+              mtpCmd = self.lib.${system}.mkGufoServe {
+                model = "/var/models/qwen-flash.gguf";
+                speculative = "mtp";
+                mtpModel = "/var/models/mtp.gguf";
                 draftTokens = 3;
               };
             in
@@ -595,6 +581,10 @@
               if echo "$dspark_cmd" | grep -E -- '--mtp-model|--draft-policy'; then
                 exit 1
               fi
+              mtp_cmd="${mtpCmd}"
+              echo "$mtp_cmd" | grep -F -- "--speculative mtp"
+              echo "$mtp_cmd" | grep -F -- "--mtp-model /var/models/mtp.gguf"
+              echo "$mtp_cmd" | grep -F -- "--draft-tokens 3"
               mkdir -p $out
               echo "PASS: mkGufoServe CLI string check passed" > $out/result.txt
             '';

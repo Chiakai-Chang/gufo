@@ -71,7 +71,7 @@ public:
   }
 };
 
-/// Provider-neutral interface for draft token generators (NPU, MTP heads, small
+/// Provider-neutral interface for draft token generators (MTP heads, small
 /// model, heuristic)
 class IDraftBackend {
 public:

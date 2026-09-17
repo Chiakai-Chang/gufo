@@ -5,22 +5,6 @@
 }:
 
 lib.makeScope newScope (self: {
-  aie-qwen-mtp-eh-proj = self.callPackage ./aie-qwen-mtp-eh-proj.nix {
-    inherit (self)
-      aiebu
-      llvm-aie
-      mlir-aie
-      xrt
-      ;
-  };
-  aie-qwen-mtp-rmsnorm = self.callPackage ./aie-qwen-mtp-rmsnorm.nix {
-    inherit (self)
-      aiebu
-      llvm-aie
-      mlir-aie
-      xrt
-      ;
-  };
   aie-smoke = self.callPackage ./aie-smoke.nix {
     inherit (self)
       aiebu
@@ -32,7 +16,7 @@ lib.makeScope newScope (self: {
   aiebu = self.callPackage ./aiebu.nix { };
   gufo = self.callPackage ./package.nix {
     inherit version;
-    inherit (self) aie-qwen-mtp-eh-proj aie-qwen-mtp-rmsnorm aie-smoke;
+    inherit (self) aie-smoke;
   };
   xrt = self.callPackage ./xrt.nix { };
   xrt-plugin-amdxdna = self.callPackage ./xrt-plugin-amdxdna.nix {
