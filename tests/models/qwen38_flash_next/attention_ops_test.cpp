@@ -359,11 +359,12 @@ int main() {
       bool bounded{false};
     };
     const Case cases[] = {
-        {4, 4096, false, false},     {3, 9000, true, true},
-        {100, 0, false, false},      {64, 37, false, false},
-        {100, 0, true, false},       {77, 51, true, false},
-        {96, 4096, true, true},      {70, 8000, true, true},
-        {5, 131069, true, true},     {7, 131069, true, true, true},
+        {4, 4096, false, false},      {3, 9000, true, true},
+        {100, 0, false, false},       {64, 37, false, false},
+        {100, 0, true, false},        {77, 51, true, false},
+        {96, 4096, true, true},       {70, 8000, true, true},
+        {5, 32765, true, true, true}, {7, 65533, true, true, true},
+        {5, 131069, true, true},      {7, 131069, true, true, true},
         {17, 2047, true, true, true}};
     bool ok = true;
     std::uint32_t seed = 0x1234ABCDU;

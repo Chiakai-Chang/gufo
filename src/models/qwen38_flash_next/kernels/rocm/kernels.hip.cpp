@@ -2496,6 +2496,7 @@ constexpr std::uint32_t kWmmaKvWidth = kWmmaKvHeads * kWmmaHeadDim;
 constexpr std::uint32_t kWmmaHeads = 2;  // query heads per block, divides GQA
 constexpr std::uint32_t kWmmaQueryRows = 32;
 constexpr std::uint32_t kWmmaKeys = 16;
+constexpr std::uint32_t kWmmaRatio = 4;
 constexpr std::uint32_t kWmmaKSteps = kWmmaHeadDim / 16;
 // Row padding keeps a 16-byte-per-lane fragment read off a single bank group.
 constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
@@ -2515,8 +2516,10 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
-    float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
-    std::uint32_t ratio) {
+    float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens) {
+  // The launcher accepts only four-token selection blocks. Keep that
+  // geometry constant throughout the key sweep.
+  constexpr std::uint32_t ratio = kWmmaRatio;
   constexpr std::uint32_t kHeadDim = kWmmaHeadDim;
   constexpr std::uint32_t kRowBlocks = kPackHeads
                                            ? (kQueryRows * kWmmaGqa + 15) / 16
@@ -2628,7 +2631,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   const std::uint32_t n_blocks = (max_visible + ratio - 1) / ratio;
   const std::uint32_t tail_block =
       ((start_pos + query_start + 1) / ratio);  // first always-visible block
-  const bool sparse = mask != nullptr;
+  constexpr bool sparse = kPackHeads;
   // Four 512-block selections plus their incomplete tail. The same LDS
   // stores a mask for arbitrary wider selections used by operator callers.
   constexpr unsigned kListCapacity = 4 * 512 + 4;
@@ -5017,7 +5020,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          std::uint32_t kv_heads, std::uint32_t d,
                          std::uint32_t ratio, hipStream_t stream) {
   if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
-      d != kWmmaHeadDim || ratio != kWmmaKeys / 4 || n_tokens == 0 ||
+      d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
       (mask != nullptr && mask_words > kWmmaMaxMaskWords)) {
     return false;
   }
@@ -5031,12 +5034,12 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
           grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens, ratio);
+          mask_words, out, start_pos, n_tokens);
     } else {
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
           dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens, ratio);
+          mask_words, out, start_pos, n_tokens);
     }
     return true;
   }
@@ -5045,7 +5048,7 @@ bool WmmaCausalAttention(const float* q, const float* gate,
   hipLaunchKernelGGL(
       (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
       dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-      out, start_pos, n_tokens, ratio);
+      out, start_pos, n_tokens);
   return true;
 }
 
