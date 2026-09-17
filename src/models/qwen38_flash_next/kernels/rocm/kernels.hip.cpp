@@ -1909,8 +1909,20 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
   for (std::uint32_t i = threadIdx.x; i < 4096; i += blockDim.x)
     candidates[i] = 0;
   __syncthreads();
-  for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x)
-    atomicAdd(&candidates[sc[b] >> 20], 1u);
+  // Read four adjacent scores per lane. Production score rows are aligned;
+  // operator callers with ragged strides retain bounded scalar reads.
+  for (std::uint32_t b = threadIdx.x * 4; b < complete; b += blockDim.x * 4) {
+    if (b + 3 < complete && max_blocks % 4 == 0) {
+      const uint4 v = *reinterpret_cast<const uint4*>(sc + b);
+      atomicAdd(&candidates[v.x >> 20], 1u);
+      atomicAdd(&candidates[v.y >> 20], 1u);
+      atomicAdd(&candidates[v.z >> 20], 1u);
+      atomicAdd(&candidates[v.w >> 20], 1u);
+    } else {
+      for (std::uint32_t j = 0; j < 4 && b + j < complete; ++j)
+        atomicAdd(&candidates[sc[b + j] >> 20], 1u);
+    }
+  }
   if (threadIdx.x == 0)
     candidate_count = 0;
   __syncthreads();
