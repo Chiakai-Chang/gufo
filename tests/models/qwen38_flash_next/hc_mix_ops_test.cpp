@@ -89,10 +89,103 @@ std::vector<float> Download(HipBuffer<float>* source, std::size_t count) {
   return values;
 }
 
+// Fusing the projection must preserve every downstream representation,
+// including the inject partials' reduction order and quantization ties.
+void CheckFusedProjection(std::uint32_t tokens) {
+  constexpr std::size_t kRank = 320;
+  constexpr std::size_t kDim = kStreams * kHidden;
+  const std::size_t mixed_count = static_cast<std::size_t>(tokens) * kHidden;
+  const std::size_t inject_count = static_cast<std::size_t>(tokens) * kStreams *
+                                   q::HcInjectPartsVec4(kHidden);
+  const std::size_t q8_bytes = q::Q8TiledBytes(tokens, kHidden);
+  const auto low =
+      MakeValues(static_cast<std::size_t>(tokens) * kRank, 0x12345678U, 1.0F);
+  const auto norm =
+      MakeValues(static_cast<std::size_t>(tokens) * kDim, 0x87654321U, 0.5F);
+  std::vector<__half> low_half(low.size()), norm_half(norm.size());
+  std::transform(low.begin(), low.end(), low_half.begin(),
+                 [](float v) { return __float2half_rn(v); });
+  std::transform(norm.begin(), norm.end(), norm_half.begin(),
+                 [](float v) { return __float2half_rn(v); });
+  std::vector<std::uint8_t> weights(kDim * (kRank / 32) * 34);
+  std::uint32_t seed = 0xABCD0123U;
+  for (std::size_t block = 0; block < weights.size() / 34; ++block) {
+    const __half scale = __float2half_rn(
+        static_cast<float>(1 + NextRandom(&seed) % 13) / 2048.0F);
+    std::memcpy(weights.data() + block * 34, &scale, sizeof(scale));
+    for (std::size_t j = 0; j < 32; ++j) {
+      weights[block * 34 + 2 + j] = static_cast<std::uint8_t>(
+          static_cast<int>(NextRandom(&seed) % 255) - 127);
+    }
+  }
+  HipBuffer<std::uint8_t> d_up(weights.size());
+  HipBuffer<__half> d_low(low.size()), d_norm(norm.size());
+  HipBuffer<float> d_inject_w(kStreams * kDim);
+  HipBuffer<float> d_gate(norm.size()), d_ref(mixed_count), d_out(mixed_count);
+  HipBuffer<__half> d_ref_half(mixed_count), d_out_half(mixed_count);
+  HipBuffer<std::uint8_t> d_ref_q8(q8_bytes), d_out_q8(q8_bytes);
+  HipBuffer<float> d_ref_inject(inject_count), d_out_inject(inject_count);
+  CheckHip(hipMemcpy(d_up.get(), weights.data(), d_up.bytes(),
+                     hipMemcpyHostToDevice),
+           "up weights");
+  CheckHip(hipMemcpy(d_low.get(), low_half.data(), d_low.bytes(),
+                     hipMemcpyHostToDevice),
+           "low rank input");
+  CheckHip(hipMemcpy(d_norm.get(), norm_half.data(), d_norm.bytes(),
+                     hipMemcpyHostToDevice),
+           "normalized streams");
+  Upload(&d_inject_w, MakeValues(kStreams * kDim, 0xDEADBEEFU, 0.1F));
+  CheckHip(hipMemset(d_ref_q8.get(), 0, q8_bytes), "clear reference Q8");
+  CheckHip(hipMemset(d_out_q8.get(), 0, q8_bytes), "clear fused Q8");
+  if (!q::DenseF16Gemm(d_up.get(), d_low.get(), d_gate.get(), tokens, kDim,
+                       kRank, nullptr)) {
+    throw std::runtime_error("HC reference projection rejected");
+  }
+  q::HcMixEpilogueVec4F16(d_norm.get(), d_gate.get(), d_inject_w.get(),
+                          d_ref.get(), d_ref_half.get(), d_ref_q8.get(),
+                          d_ref_inject.get(), tokens, kHidden, nullptr);
+  const auto exact = [](auto& reference, auto& actual, const char* name) {
+    std::vector<std::uint8_t> a(reference.bytes()), b(actual.bytes());
+    CheckHip(
+        hipMemcpy(a.data(), reference.get(), a.size(), hipMemcpyDeviceToHost),
+        "reference download");
+    CheckHip(hipMemcpy(b.data(), actual.get(), b.size(), hipMemcpyDeviceToHost),
+             "fused download");
+    if (a != b) {
+      throw std::runtime_error(std::string("HC fusion changed ") + name);
+    }
+  };
+  // Small case covers all optional outputs; the large ragged case also
+  // replays the full path to catch cross-block races and tail writes.
+  const unsigned first = tokens == 96 ? 0 : 7;
+  const unsigned end = tokens == 96 ? 8 : 9;
+  for (unsigned iteration = first; iteration < end; ++iteration) {
+    const unsigned outputs = std::min(iteration, 7U);
+    if (!q::HcMixF16Gemm(d_up.get(), d_low.get(), d_norm.get(),
+                         outputs & 4 ? d_inject_w.get() : nullptr, d_out.get(),
+                         outputs & 1 ? d_out_half.get() : nullptr,
+                         outputs & 2 ? d_out_q8.get() : nullptr,
+                         outputs & 4 ? d_out_inject.get() : nullptr, tokens,
+                         kHidden, kRank, nullptr)) {
+      throw std::runtime_error("HC fused projection rejected");
+    }
+    exact(d_ref, d_out, "F32 mixed row");
+    if (outputs & 1)
+      exact(d_ref_half, d_out_half, "F16 mixed row");
+    if (outputs & 2)
+      exact(d_ref_q8, d_out_q8, "Q8 mixed row");
+    if (outputs & 4)
+      exact(d_ref_inject, d_out_inject, "inject partials");
+  }
+  std::cerr << "HC projection fusion exact at " << tokens << " tokens\n";
+}
+
 }  // namespace
 
 int main() {
   try {
+    CheckFusedProjection(96);
+    CheckFusedProjection(2049);
     constexpr std::size_t kHcDim = static_cast<std::size_t>(kHidden) * kStreams;
     constexpr std::size_t kRows = static_cast<std::size_t>(kTokens) * kHcDim;
     constexpr std::size_t kMixed = static_cast<std::size_t>(kTokens) * kHidden;

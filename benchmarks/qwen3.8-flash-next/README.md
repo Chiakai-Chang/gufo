@@ -17,25 +17,25 @@ and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1254.03 | 1281.98 |
-| 4096 | TODO | 1153.55 |
+| 0 | 1306.03 | 1322.67 |
+| 4096 | TODO | 1184.85 |
 | 16384 | TODO | TODO |
 | 32768 | TODO | TODO |
-| 131072 | 1088.47 | TODO |
+| 131072 | 1125.07 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 24.16 | 40.36 | 71.0% |
-| Greedy | 4096 | 23.29 | 34.34 | 63.7% |
-| Temperature 0.7 | 0 | TODO | 34.23 | 65.5% |
-| Temperature 0.7 | 4096 | TODO | 46.91 | 93.0% |
+| Greedy | 0 | 24.16 | 40.66 | 71.0% |
+| Greedy | 4096 | 23.29 | 34.44 | 63.7% |
+| Temperature 0.7 | 0 | TODO | 35.08 | 65.5% |
+| Temperature 0.7 | 4096 | TODO | 47.09 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
 Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
 AR PP uses one 133,121-token context limit throughout; AR TG uses 4,225
-and MTP uses 6,145. AR PP loses 13.2% from d0 to d128K. Near-flat throughput
+and MTP PP/greedy TG use 6,145 (sampled TG: 4,225). AR PP loses 13.9% from d0 to d128K. Near-flat throughput
 across that range remains TODO. Profiling identifies sparse attention and
 selection as the main depth-dependent costs. Performance variation across
 fresh loads remains under investigation.
@@ -58,6 +58,8 @@ Sparse attention compacts selected blocks in order. The indexer caches F16
 fragments and accumulates scores in FP32; selection retains exact score
 ordering and lowest-index ties. Large expert batches fuse gate/up and SwiGLU;
 selection skips the tie-prefix scan when every threshold tie fits.
+Wide hyper-connection batches fuse the up projection, mixer and F16/Q8
+output staging while preserving injection reductions.
 
 `prompt`, `chat` and `serve llm` share MTP and sampling options. Drafts are
 greedy over the full vocabulary on the GPU; verification uses the target
@@ -91,7 +93,9 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
   Attention checks bounded and wider masks near 128K with bitwise replay.
   Indexer pooling checks FP64 formulas, block boundaries and replay;
   selection checks exact masks, ties and deep contexts. Mixer checks include
-  independent F16/Q8 outputs and optional inject weights.
+  independent F16/Q8 outputs and optional inject weights. Fused HC projections
+  must match every output bit of the separate operators, including ragged
+  batches and replay.
   Paired Q4_K/Q5_K expert projections require exact numerical agreement with
   separate projections, including ragged rows.
   MTP token selection matches the CPU rule, including ties and graph replay.

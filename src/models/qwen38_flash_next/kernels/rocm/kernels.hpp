@@ -139,6 +139,14 @@ void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
 /// dequantized to F16 as they are staged, F32 accumulation. out is
 /// [batch][m]; returns false, launching nothing, when k is not a multiple
 /// of 32.
+/// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
+/// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
+/// shapes. low_rank must not overlap mixed_half; side outputs are optional.
+bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
+                  const float* inject_w, float* mixed, __half* mixed_half,
+                  void* mixed_q8, float* inject, std::uint32_t n_tokens,
+                  std::uint32_t hidden, std::uint32_t rank, hipStream_t stream);
+
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream);
 

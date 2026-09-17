@@ -813,11 +813,24 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   }
   SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
             static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
-  if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
-    return false;
-  }
   const bool fused_inject =
       inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
+  const bool extras = n_tokens <= options_.max_batch &&
+                      c.hidden_size <= model_->max_half_cols();
+  const bool fused_projection =
+      xn_half_ && n_tokens >= 96 && extras && c.hc_count == 4 &&
+      c.hidden_size == 2560 && c.hc_low_rank == 320 &&
+      m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
+      m.up.cols == c.hc_low_rank;
+  if (fused_projection) {
+    // The fusion emits mixed_half into x_half. Stage its input in the unused
+    // gate buffer so independent projection tiles cannot overwrite it.
+    NarrowActivations(s_.lo, s_.hc_gate, false,
+                      static_cast<std::size_t>(n_tokens) * c.hc_low_rank,
+                      stream_);
+  } else if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
+    return false;
+  }
   const float* xn = s_.xn;
   const bool vectorized =
       xn_half_ ||
@@ -828,12 +841,22 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   q8t_src_ = nullptr;
   half_src_ = nullptr;
   if (xn_half_) {
-    const bool extras = n_tokens <= options_.max_batch &&
-                        c.hidden_size <= model_->max_half_cols();
-    HcMixEpilogueVec4F16(
-        s_.xn_half, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr, mixed,
-        extras ? static_cast<__half*>(s_.x_half) : nullptr,
-        extras ? s_.x_q8t : nullptr, inject, n_tokens, c.hidden_size, stream_);
+    if (fused_projection) {
+      if (!HcMixF16Gemm(m.up.data, reinterpret_cast<const __half*>(s_.hc_gate),
+                        s_.xn_half, fused_inject ? m.inject.f32() : nullptr,
+                        mixed, static_cast<__half*>(s_.x_half), s_.x_q8t,
+                        inject, n_tokens, c.hidden_size, c.hc_low_rank,
+                        stream_)) {
+        AssignError(error_msg, "fused HC projection failed");
+        return false;
+      }
+    } else {
+      HcMixEpilogueVec4F16(s_.xn_half, s_.hc_gate,
+                           fused_inject ? m.inject.f32() : nullptr, mixed,
+                           extras ? static_cast<__half*>(s_.x_half) : nullptr,
+                           extras ? s_.x_q8t : nullptr, inject, n_tokens,
+                           c.hidden_size, stream_);
+    }
     if (extras) {
       half_src_ = mixed;
       half_rows_ = n_tokens;

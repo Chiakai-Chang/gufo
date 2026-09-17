@@ -5,7 +5,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -73,7 +72,7 @@ Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed) {
 }
 
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
-           bool check = true, std::size_t reference_tokens = 0) {
+           std::size_t reference_tokens = 0) {
   const Q8Weights w = MakeWeights(m, k, seed);
   std::vector<float> x(batch * k);
   std::uint32_t state = seed ^ 0xABCDEF01U;
@@ -87,12 +86,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   float* d_f16 = nullptr;
   __half* d_x_half = nullptr;
   void* d_tiled = nullptr;
-  // The model's weights live in GTT (the carve-out VRAM is 0.5 GiB); a
-  // bench allocation past that size lands the weights there too.
-  const std::size_t w_alloc =
-      check ? w.blocks.size() + 4096
-            : std::max<std::size_t>(w.blocks.size() + 4096, 1u << 30);
-  CheckHip(hipMalloc(&d_w, w_alloc), "hipMalloc");
+  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "hipMalloc");
   CheckHip(hipMalloc(&d_x, x.size() * 4), "hipMalloc");
   CheckHip(hipMalloc(&d_mmq, batch * m * 4), "hipMalloc");
   CheckHip(hipMalloc(&d_w8, batch * m * 4), "hipMalloc");
@@ -112,19 +106,12 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
     throw std::runtime_error("MMQ dense failed");
   }
   q::QuantizeQ8Tiled(d_x, d_tiled, batch, k, nullptr);
-  for (int rep = 0; rep < (check ? 1 : 3); ++rep) {
-    if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
-      throw std::runtime_error("W8A8 GEMM rejected the shape");
-    }
+  if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
+    throw std::runtime_error("W8A8 GEMM rejected the shape");
   }
   q::NarrowActivations(d_x, d_x_half, false, x.size(), nullptr);
-  const int f16_reps = std::getenv("QFN_F16_REPS") != nullptr
-                           ? std::atoi(std::getenv("QFN_F16_REPS"))
-                           : 3;
-  for (int rep = 0; rep < (check ? 1 : f16_reps); ++rep) {
-    if (!q::DenseF16Gemm(d_w, d_x_half, d_f16, batch, m, k, nullptr)) {
-      throw std::runtime_error("dense F16 GEMM rejected the shape");
-    }
+  if (!q::DenseF16Gemm(d_w, d_x_half, d_f16, batch, m, k, nullptr)) {
+    throw std::runtime_error("dense F16 GEMM rejected the shape");
   }
   CheckHip(hipDeviceSynchronize(), "GEMMs");
   std::vector<float> mmq(batch * m);
@@ -140,33 +127,45 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   // to accumulation order; the F64 reference over the dequantized weights
   // bounds the activation quantization itself.
   double worst_vs_mmq = 0.0;
+  double worst_f16_vs_mmq = 0.0;
   double worst_vs_ref = 0.0;
   double worst_f16 = 0.0;
   double ref_scale = 0.0;
-  if (check) {
-    for (std::size_t i = 0; i < w8.size(); ++i) {
-      if (!std::isfinite(w8[i]) || !std::isfinite(f16[i])) {
-        throw std::runtime_error("projection output is not finite");
-      }
-      worst_vs_mmq =
-          std::max(worst_vs_mmq, std::abs(static_cast<double>(mmq[i] - w8[i])));
+  for (std::size_t i = 0; i < w8.size(); ++i) {
+    if (!std::isfinite(w8[i]) || !std::isfinite(f16[i])) {
+      throw std::runtime_error("projection output is not finite");
     }
-    if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
-      throw std::runtime_error("W8A8 replay rejected the shape");
-    }
-    std::vector<float> replay(w8.size());
-    CheckHip(hipMemcpy(replay.data(), d_w8, replay.size() * sizeof(float),
-                       hipMemcpyDeviceToHost),
-             "replay download");
-    if (replay != w8) {
-      throw std::runtime_error("W8A8 replay changed the output");
-    }
+    worst_vs_mmq =
+        std::max(worst_vs_mmq, std::abs(static_cast<double>(mmq[i] - w8[i])));
+    worst_f16_vs_mmq = std::max(worst_f16_vs_mmq,
+                                std::abs(static_cast<double>(mmq[i] - f16[i])));
   }
+  if (!q::W8A8Gemm(d_w, d_tiled, d_w8, batch, m, k, nullptr)) {
+    throw std::runtime_error("W8A8 replay rejected the shape");
+  }
+  std::vector<float> replay(w8.size());
+  CheckHip(hipMemcpy(replay.data(), d_w8, replay.size() * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "replay download");
+  if (replay != w8) {
+    throw std::runtime_error("W8A8 replay changed the output");
+  }
+  if (!q::DenseF16Gemm(d_w, d_x_half, d_f16, batch, m, k, nullptr)) {
+    throw std::runtime_error("F16 replay rejected the shape");
+  }
+  CheckHip(hipMemcpy(replay.data(), d_f16, replay.size() * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "F16 replay download");
+  if (std::memcmp(replay.data(), f16.data(), replay.size() * sizeof(float)) !=
+      0) {
+    throw std::runtime_error("F16 replay changed the output");
+  }
+
   // Large production shapes still compare every output against MMQ. Sample
   // evenly spaced tokens for the more expensive independent F64 reference.
   const std::size_t samples =
       reference_tokens == 0 ? batch : std::min(batch, reference_tokens);
-  for (std::size_t sample = 0; sample < (check ? samples : 0); ++sample) {
+  for (std::size_t sample = 0; sample < samples; ++sample) {
     const std::size_t t =
         samples > 1 ? sample * (batch - 1) / (samples - 1) : 0;
     for (std::size_t r = 0; r < m; ++r) {
@@ -181,9 +180,10 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
     }
   }
   std::cout << "W8A8 batch=" << batch << " m=" << m << " k=" << k
-            << ": worst |W8A8 - MMQ| " << worst_vs_mmq
-            << ", worst |W8A8 - F64| " << worst_vs_ref << ", worst |F16 - F64| "
-            << worst_f16 << " (reference scale " << ref_scale << ")\n";
+            << ": worst |W8A8 - MMQ| " << worst_vs_mmq << ", worst |F16 - MMQ| "
+            << worst_f16_vs_mmq << ", worst |W8A8 - F64| " << worst_vs_ref
+            << ", worst |F16 - F64| " << worst_f16 << " (reference scale "
+            << ref_scale << ")\n";
   (void)hipFree(d_w);
   (void)hipFree(d_x);
   (void)hipFree(d_mmq);
@@ -194,8 +194,9 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   // The MMQ agreement is accumulation order; the F64 gap is the shared
   // 8-bit activation quantization, well under 1% of the output scale. The
   // F16 route's gap is its F16 activation rounding, a few ulps smaller.
-  return worst_vs_mmq < 1e-3 ? std::max(worst_vs_ref, worst_f16) / ref_scale
-                             : 1.0;
+  return worst_vs_mmq < 1e-3
+             ? std::max({worst_vs_ref, worst_f16, worst_f16_vs_mmq}) / ref_scale
+             : 1.0;
 }
 
 void CheckDecodeGrouping() {
@@ -267,20 +268,9 @@ int main() {
     ok = Run(100, 320, 2560, 0x1234ABCDU) < 1e-2 && ok;
     ok = Run(37, 640, 2560, 0x0BADF00DU) < 1e-2 && ok;
     ok = Run(200, 200, 6144, 0xDEADBEEFU) < 1e-2 && ok;
-    ok = Run(1025, 2560, 6144, 0x51A17U, true, 2) < 1e-2 && ok;
-    // Production shapes for profiling only (QFN_W8A8_BENCH=1): three
-    // launches each, no reference.
-    if (std::getenv("QFN_W8A8_BENCH") != nullptr) {
-      (void)Run(2048, 16384, 2560, 0x1111U, false);
-      (void)Run(2048, 2560, 2560, 0x2222U, false);
-      (void)Run(2048, 10240, 640, 0x3333U, false);
-      (void)Run(2048, 320, 10240, 0x4444U, false);
-      (void)Run(2048, 640, 2560, 0x5555U, false);
-      (void)Run(2048, 2560, 640, 0x7777U, false);
-      (void)Run(2048, 2560, 6144, 0x8888U, false);
-      (void)Run(2048, 10240, 320, 0x9999U, false);
-      (void)Run(2048, 13312, 2560, 0x6666U, false);
-    }
+    ok = Run(1025, 2560, 6144, 0x51A17U, 2) < 1e-2 && ok;
+    // HC up: the grouped grid, including the last partial token tile.
+    ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';
