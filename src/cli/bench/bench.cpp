@@ -899,9 +899,14 @@ int RunQwen38FlashNextBenchmark(
         return 1;
       }
       std::vector<double> runs;
-      // One untimed pass first: initialize GEMM plans and warm resident data.
-      for (std::size_t repetition = 0; repetition <= options.repetitions;
-           ++repetition) {
+      // A full aligned prefix already warms the same chunk shapes and GEMM
+      // plans. Other shapes still need an untimed pass before measurement.
+      const auto chunk = model->PrefillCapacity();
+      const bool warm_prefix = chunk > 0 && depth >= chunk &&
+                               depth % chunk == 0 && prompt_length > 0 &&
+                               prompt_length % chunk == 0;
+      for (std::size_t repetition = warm_prefix ? 1 : 0;
+           repetition <= options.repetitions; ++repetition) {
         auto session = model->CreateSession(
             static_cast<std::uint32_t>(required_context), &error);
         if (!session ||

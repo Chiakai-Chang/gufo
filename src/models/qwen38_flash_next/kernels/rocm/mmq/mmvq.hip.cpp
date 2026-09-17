@@ -578,19 +578,22 @@ static __global__ void mul_mat_vec_q_moe(
         return;
     }
 
-    // ds4 task #23: the router's NaN path emits -1 expert ids by design; cast
-    // to uint32 that becomes a wild weight-channel offset (hip-gdb-convicted
-    // Warp Illegal Address in vec_dot_q4_K_q8_1 on sm_100).  Redirect the
-    // pointer math to expert 0 and skip the dot loop so the row writes a
-    // clean 0 through the unchanged reduction/write-back.  Warp-uniform:
-    // token_idx is constant across a warp's lanes.
+    // Inactive experts still write zero to every output row. The expert ID
+    // and its validity are uniform within a wave.
     const int32_t  id_raw     = ids[channel_dst + token_idx * ids_stride];
     const bool     invalid_id = id_raw < 0;
     const uint32_t channel_x  = invalid_id ? 0u : (uint32_t)id_raw;
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    uint32_t row_offsets[c_rows_per_block];
+#pragma unroll
+    for (int i = 0; i < c_rows_per_block; ++i) {
+        // A ragged tile reads the last valid row again for its unused lane.
+        // Keep the bounds check out of the quantized dot-product loop.
+        const uint32_t row = min(uint32_t(row0 + i), nrows_x - 1);
+        row_offsets[i] = channel_x*stride_channel_x + row*stride_row_x;
+    }
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -601,7 +604,7 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_hip(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+            tmp[i] += vec_dot_q_hip(vx, &y[kby], row_offsets[i] + kbx, kqs);
         }
     }
 
@@ -613,7 +616,9 @@ static __global__ void mul_mat_vec_q_moe(
 
     // Write results
     if (threadIdx.x < c_rows_per_block && (c_rows_per_block == 1 || uint32_t(row0 + threadIdx.x) < nrows_x)) {
-        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = tmp[threadIdx.x];
+        const float value = tmp[threadIdx.x];
+        dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] =
+            isfinite(value) ? value : 0.0f;
     }
 }
 

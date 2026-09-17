@@ -432,13 +432,12 @@ bool Ok(const Result& r) {
 }
 
 void CheckVectorGrouping() {
-  constexpr int experts = 8, rows = 64, cols = 512, tokens = 7, used = 3;
+  constexpr int experts = 8, cols = 512, tokens = 7, used = 3;
+  constexpr std::size_t guard = 16;
+  constexpr float poison = -1234567.0F;
   using Gemm = decltype(&qfn_mmq_q4_K_moe_vec);
   const std::array<Gemm, 4> gemms{qfn_mmq_q4_K_moe_vec, qfn_mmq_q5_K_moe_vec,
                                   qfn_mmq_q5_1_moe_vec, qfn_mmq_q8_0_moe_vec};
-  const std::array<Experts, 4> weights{
-      MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
-      MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23)};
   std::vector<float> x(tokens * cols);
   std::uint32_t seed = 37;
   for (auto& v : x)
@@ -446,33 +445,71 @@ void CheckVectorGrouping() {
   std::vector<std::int32_t> ids(tokens * used);
   for (int t = 0; t < tokens; ++t)
     for (int j = 0; j < used; ++j)
-      ids[t * used + j] = (t + j) % experts;
+      ids[t * used + j] = j == 1 ? -1 : (t + j) % experts;
   auto* dx = Upload(x);
   auto* di = Upload(ids);
-  const std::vector<float> zeros(tokens * used * rows);
-  auto* scalar = Upload(zeros);
-  auto* batch = Upload(zeros);
-  for (std::size_t f = 0; f < weights.size(); ++f) {
-    auto* w = Upload(weights[f].packed);
-    for (int t = 0; t < tokens; ++t)
-      if (gemms[f](w, dx + t * cols, di + t * used, scalar + t * used * rows,
-                   rows, cols, 1, experts, used, nullptr))
-        throw std::runtime_error("scalar routed vector launch failed");
-    for (int n : {2, 3, 4, 7}) {
-      if (gemms[f](w, dx, di, batch, rows, cols, n, experts, used, nullptr))
-        throw std::runtime_error("batched routed vector launch failed");
-      const auto a = Download(scalar, n * used * rows);
-      const auto b = Download(batch, n * used * rows);
-      if (a != b)
-        throw std::runtime_error("routed vector grouping changed format " +
-                                 std::to_string(f) + " width " +
-                                 std::to_string(n));
+  for (int rows : {64, 65}) {
+    std::array<Experts, 4> weights{
+        MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
+        MakeQ5_1(experts, rows, cols, 17), MakeQ8_0(experts, rows, cols, 23)};
+    const std::size_t count = tokens * used * rows;
+    const std::vector<float> dirty(count + 2 * guard, poison);
+    auto* scalar = Upload(dirty);
+    auto* batch = Upload(dirty);
+    const auto check_output = [&](const float* device, int n) {
+      const auto output = Download(device, dirty.size());
+      for (std::size_t i = 0; i < output.size(); ++i) {
+        if (i < guard || i >= guard + n * used * rows) {
+          if (output[i] != poison)
+            throw std::runtime_error("routed vector output guard changed");
+          continue;
+        }
+        const std::size_t slot = (i - guard) / rows;
+        const bool zero =
+            ids[slot] < 0 || (ids[slot] == 0 && (i - guard) % rows == 0);
+        if (!std::isfinite(output[i]) || output[i] == poison ||
+            (zero && output[i] != 0.0F))
+          throw std::runtime_error("routed vector did not write a valid row");
+      }
+      return output;
+    };
+    for (std::size_t f = 0; f < weights.size(); ++f) {
+      // Every format starts with an F16 scale. A nonfinite projection must
+      // still produce zero, just as an inactive expert does.
+      const __half infinite_scale = __float2half(INFINITY);
+      std::memcpy(weights[f].packed.data(), &infinite_scale,
+                  sizeof(infinite_scale));
+      auto* w = Upload(weights[f].packed);
+      CheckHip(hipMemcpy(scalar, dirty.data(), dirty.size() * sizeof(float),
+                         hipMemcpyHostToDevice),
+               "poison scalar output");
+      for (int t = 0; t < tokens; ++t)
+        if (gemms[f](w, dx + t * cols, di + t * used,
+                     scalar + guard + t * used * rows, rows, cols, 1, experts,
+                     used, nullptr))
+          throw std::runtime_error("scalar routed vector launch failed");
+      const auto reference = check_output(scalar, tokens);
+      for (int n : {2, 3, 4, 7}) {
+        CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
+                           hipMemcpyHostToDevice),
+                 "poison batched output");
+        if (gemms[f](w, dx, di, batch + guard, rows, cols, n, experts, used,
+                     nullptr))
+          throw std::runtime_error("batched routed vector launch failed");
+        const auto output = check_output(batch, n);
+        if (std::memcmp(reference.data() + guard, output.data() + guard,
+                        n * used * rows * sizeof(float)) != 0)
+          throw std::runtime_error("routed vector grouping changed format " +
+                                   std::to_string(f) + " width " +
+                                   std::to_string(n));
+      }
+      CheckHip(hipFree(w), "grouping weight free");
     }
-    CheckHip(hipFree(w), "grouping weight free");
+    CheckHip(hipFree(scalar), "scalar output free");
+    CheckHip(hipFree(batch), "batch output free");
   }
-  for (void* ptr : {static_cast<void*>(dx), static_cast<void*>(di),
-                    static_cast<void*>(scalar), static_cast<void*>(batch)})
-    CheckHip(hipFree(ptr), "grouping free");
+  CheckHip(hipFree(dx), "grouping input free");
+  CheckHip(hipFree(di), "grouping IDs free");
 }
 
 void CheckPairedMmq() {

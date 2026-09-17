@@ -69,7 +69,8 @@ std::vector<T> Download(const T* device, std::size_t count) {
 }
 
 bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
-         bool zero_queries = false, std::uint32_t tied_high_blocks = 0) {
+         bool zero_queries = false, std::uint32_t tied_high_blocks = 0,
+         bool sample_scores = false) {
   const std::uint32_t max_context = start_pos + n_tokens + 64;
   const std::uint32_t max_blocks = (max_context + kRatio - 1) / kRatio;
   const std::uint32_t mask_words = (max_blocks + 31) / 32;
@@ -128,8 +129,11 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
       continue;
     }
     // Reference scores in double; the GPU value must agree closely.
-    std::vector<double> ref(complete);
     for (std::uint32_t b = 0; b < complete; ++b) {
+      // The large selection case checks every mask bit and samples score
+      // arithmetic already covered exhaustively by the smaller cases.
+      if (sample_scores && b % 1024 != 0 && b + 1 != complete)
+        continue;
       double total = 0.0;
       for (std::uint32_t h = 0; h < kHeads; ++h) {
         double dot = 0.0;
@@ -141,7 +145,6 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
         }
         total += std::max(dot, 0.0);
       }
-      ref[b] = total;
       const float got = scores[static_cast<std::size_t>(t) * max_blocks + b];
       const double err = std::abs(total - got) / std::max(1.0, total);
       worst_score = std::max(worst_score, err);
@@ -261,7 +264,9 @@ int main() {
     CheckPooling();
     bool ok = true;
     ok = Run(100, 20000, 0x1234ABCDU) && ok;     // deep, ragged group
-    ok = Run(7, 131069, 0x2468ACE0U) && ok;      // deep, partial word
+    ok = Run(7, 131069, 0x2468ACE0U) && ok;
+    ok = Run(129, 131069, 0xC0FFEE01U, false, 0, true) && ok;
+    ok = Run(129, 131069, 0, true, 0, true) && ok;  // deep, partial word
     ok = Run(1, 9001, 0x0BADF00DU) && ok;        // decode
     ok = Run(40, 2040, 0xDEADBEEFU) && ok;       // straddles the budget
     ok = Run(3, 6000, 0x5EED5EEDU, true) && ok;  // all scores tie at zero

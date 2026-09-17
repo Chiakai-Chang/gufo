@@ -420,8 +420,6 @@ int qfn_mmq_moe_vec_impl(
 
     ggml_hip_mm_fusion_args_device fusion = {};
 
-    hipMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float), stream);
-
     const int cc      = ggml_hip_info().devices[dev].cc;
     const int col_cap = get_mmvq_mmid_max_batch(type, ggml_hip_highest_compiled_arch(cc));
 
@@ -454,7 +452,6 @@ int qfn_mmq_moe_vec_impl(
         }
     }
 
-    qfn_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)n_tokens * (uint64_t)n_expert_used, stream);
     return 0;
 }
 

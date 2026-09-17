@@ -1737,17 +1737,18 @@ __global__ void SelectScoreKernel(const __half* q, const __half* blocks,
   }
 }
 
-/// One block per query: a four-pass radix select over the float ordering
-/// (scores are non-negative, so their bit patterns order like unsigned
-/// ints) finds the budget-th largest score, then marks the blocks above it
-/// and the first `remaining` ties in index order. Every block is visible
-/// below the budget.
+/// Exact top-k over non-negative score bits. A 12-bit histogram locates
+/// the threshold bin, then at most 4096 candidates are refined in LDS.
+/// Larger bins use the original scores. The final mask keeps lowest-index
+/// ties; neither the coarse histogram nor compaction changes the ordering.
 __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
                                  const std::uint32_t* start_pos,
                                  std::uint32_t first_token, std::uint32_t ratio,
                                  std::uint32_t budget, std::uint32_t mask_words,
                                  std::uint32_t max_blocks) {
+  __shared__ std::uint32_t candidates[4096];
   __shared__ std::uint32_t hist[256];
+  __shared__ std::uint32_t candidate_count;
   __shared__ std::uint32_t wave_ties[kThreads / 32];
   __shared__ std::uint32_t state[3];  // threshold, remaining, bin count
   const std::uint32_t t = blockIdx.x;
@@ -1762,27 +1763,79 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
   }
   const auto* sc = reinterpret_cast<const std::uint32_t*>(
       scores + static_cast<std::size_t>(t) * max_blocks);
-  std::uint32_t prefix = 0;          // the threshold's bits settled so far
-  std::uint32_t remaining = budget;  // ranks still to fill below the prefix
-  for (int shift = 24; shift >= 0; shift -= 8) {
+  const std::uint32_t lane = threadIdx.x & 31u;
+  const std::uint32_t wave = threadIdx.x >> 5;
+  for (std::uint32_t i = threadIdx.x; i < 4096; i += blockDim.x)
+    candidates[i] = 0;
+  __syncthreads();
+  for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x)
+    atomicAdd(&candidates[sc[b] >> 20], 1u);
+  __syncthreads();
+  std::uint32_t local_sum = 0;
+#pragma unroll
+  for (std::uint32_t j = 0; j < 16; ++j)
+    local_sum += candidates[4095 - threadIdx.x * 16 - j];
+  std::uint32_t inclusive = local_sum;
+#pragma unroll
+  for (std::uint32_t d = 1; d < 32; d *= 2) {
+    std::uint32_t v = __shfl_up(inclusive, d);
+    if (lane >= d)
+      inclusive += v;
+  }
+  if (lane == 31)
+    wave_ties[wave] = inclusive;
+  __syncthreads();
+  std::uint32_t before = inclusive - local_sum;
+  for (std::uint32_t w = 0; w < wave; ++w)
+    before += wave_ties[w];
+  if (before < budget && before + local_sum >= budget) {
+    std::uint32_t seen = before;
+    for (std::uint32_t j = 0; j < 16; ++j) {
+      std::uint32_t bin = 4095 - threadIdx.x * 16 - j;
+      if (seen + candidates[bin] >= budget) {
+        state[0] = bin << 20;
+        state[1] = budget - seen;
+        state[2] = candidates[bin];
+        break;
+      }
+      seen += candidates[bin];
+    }
+  }
+  if (threadIdx.x == 0)
+    candidate_count = 0;
+  __syncthreads();
+  std::uint32_t prefix = state[0], remaining = state[1];
+  // Reuse the first histogram as a bounded candidate list. If its bin is
+  // larger, later radix passes read the original scores instead.
+  const bool compact = state[2] <= 4096 && remaining != state[2];
+  const std::uint32_t input_count = compact ? state[2] : complete;
+  if (compact) {
+    for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
+      std::uint32_t v = sc[b];
+      if ((v & 0xFFF00000u) == prefix)
+        candidates[atomicAdd(&candidate_count, 1u)] = v;
+    }
+    __syncthreads();
+  }
+  // A whole bin can be accepted as soon as its count fills the remaining
+  // budget. Otherwise refine the low 20 bits exactly (8 + 8 + 4).
+  for (int shift = 12; shift >= 0 && remaining != state[2];
+       shift = shift == 4 ? 0 : shift - 8) {
     hist[threadIdx.x] = 0;
     __syncthreads();
-    const std::uint32_t prefix_mask = shift == 24 ? 0u : (~0u << (shift + 8));
-    for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
-      const std::uint32_t v = sc[b];
-      if ((v & prefix_mask) == prefix) {
-        atomicAdd(&hist[(v >> shift) & 0xFFu], 1u);
-      }
+    const std::uint32_t prefix_mask = ~0u << (shift == 0 ? 4 : shift + 8);
+    const std::uint32_t radix_mask = shift == 0 ? 15 : 255;
+    for (std::uint32_t b = threadIdx.x; b < input_count; b += blockDim.x) {
+      const std::uint32_t v = compact ? candidates[b] : sc[b];
+      if ((v & prefix_mask) == prefix)
+        atomicAdd(&hist[(v >> shift) & radix_mask], 1u);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-      // Walk the bins from the top: the bin where the running count reaches
-      // `remaining` holds the threshold's next byte.
-      std::uint32_t seen = 0;
-      std::uint32_t bin = 0;
-      for (int i = 255; i >= 0; --i) {
+      std::uint32_t seen = 0, bin = 0;
+      for (int i = radix_mask; i >= 0; --i) {
         if (seen + hist[i] >= remaining) {
-          bin = static_cast<std::uint32_t>(i);
+          bin = i;
           break;
         }
         seen += hist[i];
@@ -1795,13 +1848,13 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
     prefix = state[0];
     remaining = state[1];
     __syncthreads();
+    if (shift == 0)
+      break;
   }
   const std::uint32_t threshold = prefix;
   // Blocks strictly above the threshold are in; the first `remaining` ties
   // in index order fill the budget. Ties are ranked with a wave ballot and
   // a per-chunk scan over the eight waves.
-  const std::uint32_t lane = threadIdx.x & 31u;
-  const std::uint32_t wave = threadIdx.x >> 5u;
   if (remaining == state[2]) {
     // Every threshold tie fits (in particular, a unique threshold). No
     // prefix scan is needed: each wave writes one complete mask word.
@@ -2336,8 +2389,8 @@ constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
 
 /// Two row layouts share the kernel. The dense window packs 32 queries x 2
 /// heads (a row block is 16 queries of one head, grid.y over head pairs).
-/// The sparse window packs the twelve heads of one query into a row block
-/// (four dead rows), four queries per block, grid.y over KV heads: the key
+/// The sparse window packs four queries x twelve heads into three row
+/// blocks without padding, grid.y over KV heads: the key
 /// tiles are gathered from the union of the block's query selections and
 /// four selections overlap far less than 32 (measured at 16k depth: 846
 /// versus 2,478 selected blocks against 512 per query).
@@ -2349,21 +2402,23 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
     std::uint32_t ratio) {
   constexpr std::uint32_t kHeadDim = kWmmaHeadDim;
-  constexpr std::uint32_t kRowBlocks =
-      kPackHeads ? kQueryRows : (kQueryRows / 16) * kWmmaHeads;
-  static_assert(!kPackHeads || kWmmaGqa <= 16, "heads pack into one tile");
+  constexpr std::uint32_t kRowBlocks = kPackHeads
+                                           ? (kQueryRows * kWmmaGqa + 15) / 16
+                                           : (kQueryRows / 16) * kWmmaHeads;
+  static_assert(!kPackHeads || kQueryRows * kWmmaGqa == 48,
+                "four queries pack twelve heads into three tiles");
   constexpr std::uint32_t kKeyBlocks = kKeys / 16;
   constexpr std::uint32_t kSTiles = kRowBlocks * kKeyBlocks;
-  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / (8 / kSTiles);
+  constexpr std::uint32_t kKStepsPerWave = kWmmaKSteps / 2;
   constexpr std::uint32_t kRows = kRowBlocks * 16;
   constexpr std::uint32_t kOTilesPerWave = (kRowBlocks * kWmmaKSteps) / 8;
-  constexpr std::uint32_t kSoftmaxLanes = 256 / kRows;
+  constexpr std::uint32_t kSoftmaxLanes = 4;
   constexpr std::uint32_t kVtStride = kKeys + 8;
-  static_assert(kSTiles == 4, "eight waves cover four S tiles in two halves");
+  static_assert(kSTiles == (kPackHeads ? 3 : 4), "two waves per S tile");
   static_assert(kOTilesPerWave == 2 * kRowBlocks, "O tiles per wave");
   static_assert(kKeys % 16 == 0 && (kPackHeads || kQueryRows % 16 == 0),
                 "16-row WMMA tiles");
-  static_assert(kKStepsPerWave * 8 / kSTiles == kWmmaKSteps, "k split");
+  static_assert(kKStepsPerWave * 2 == kWmmaKSteps, "k split");
   static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0,
                 "fragment rows must start on a 16-byte boundary");
   static_assert(kSoftmaxLanes * (kKeys / kSoftmaxLanes) == kKeys, "softmax");
@@ -2385,15 +2440,16 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 
   // Row (row block rb, row r) -> (local query, query head, live).
   const auto row_query = [&](std::uint32_t rb, std::uint32_t r) {
-    return kPackHeads ? query_start + rb
+    return kPackHeads ? query_start + (rb * 16 + r) / kWmmaGqa
                       : query_start + ((rb / kWmmaHeads) * 16) + r;
   };
   const auto row_head = [&](std::uint32_t rb, std::uint32_t r) {
-    return kPackHeads ? first_query_head + r
+    return kPackHeads ? first_query_head + (rb * 16 + r) % kWmmaGqa
                       : first_query_head + (rb % kWmmaHeads);
   };
   const auto row_live = [&](std::uint32_t rb, std::uint32_t r) {
-    return row_query(rb, r) < n_tokens && (!kPackHeads || r < kWmmaGqa);
+    return row_query(rb, r) < n_tokens &&
+           (!kPackHeads || rb * 16 + r < kQueryRows * kWmmaGqa);
   };
 
   constexpr std::uint32_t kKvLdsHalves =
@@ -2412,7 +2468,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   const std::uint32_t s_kb = s_tile / kRowBlocks;
 
   v16h q_frag[kKStepsPerWave];
-  {
+  if (wave < 2 * kSTiles) {
     const std::uint32_t local_query = row_query(s_rb, sub);
     const bool live = row_live(s_rb, sub);
     const float* q_row =
@@ -2651,7 +2707,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     }
 
     // --- S = Q K^T ---
-    {
+    if (wave < 2 * kSTiles) {
       v8f s_acc = {};
 #pragma unroll
       for (std::uint32_t ks = 0; ks < kKStepsPerWave; ++ks) {
@@ -2671,61 +2727,63 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     // --- online softmax: kSoftmaxLanes threads per query row ---
     {
       const std::uint32_t rg = tid / kSoftmaxLanes;
-      const std::uint32_t seg = tid % kSoftmaxLanes;
-      constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
-      const std::uint32_t rb = rg / 16;
-      const std::uint32_t row = rg % 16;
-      const std::uint32_t local_query = row_query(rb, row);
-      const bool live_row = row_live(rb, row);
-      const std::uint32_t absolute_query = start_pos + local_query;
-      // Keys in the query's own incomplete block are always visible; earlier
-      // blocks follow the selection mask.
-      const std::uint32_t tail_start = ((absolute_query + 1) / ratio) * ratio;
-      const std::uint32_t* words =
-          mask == nullptr || !live_row
-              ? nullptr
-              : mask + static_cast<std::size_t>(local_query) * mask_words;
-      float part_max = -INFINITY;
-      float vals[kPerLane];
+      if (rg < kRows) {
+        const std::uint32_t seg = tid % kSoftmaxLanes;
+        constexpr std::uint32_t kPerLane = kKeys / kSoftmaxLanes;
+        const std::uint32_t rb = rg / 16;
+        const std::uint32_t row = rg % 16;
+        const std::uint32_t local_query = row_query(rb, row);
+        const bool live_row = row_live(rb, row);
+        const std::uint32_t absolute_query = start_pos + local_query;
+        // Keys in the query's own incomplete block are always visible; earlier
+        // blocks follow the selection mask.
+        const std::uint32_t tail_start = ((absolute_query + 1) / ratio) * ratio;
+        const std::uint32_t* words =
+            mask == nullptr || !live_row
+                ? nullptr
+                : mask + static_cast<std::size_t>(local_query) * mask_words;
+        float part_max = -INFINITY;
+        float vals[kPerLane];
 #pragma unroll
-      for (std::uint32_t m = 0; m < kPerLane; ++m) {
-        const std::uint32_t col = (seg * kPerLane) + m;
-        const std::uint32_t key_position = tile_key(cur, col);
-        bool valid = live_row && key_position <= absolute_query &&
-                     key_position < context_end;
-        if (valid && words != nullptr && key_position < tail_start) {
-          const std::uint32_t b = key_position / ratio;
-          valid = ((words[b / 32] >> (b % 32)) & 1u) != 0u;
+        for (std::uint32_t m = 0; m < kPerLane; ++m) {
+          const std::uint32_t col = (seg * kPerLane) + m;
+          const std::uint32_t key_position = tile_key(cur, col);
+          bool valid = live_row && key_position <= absolute_query &&
+                       key_position < context_end;
+          if (valid && words != nullptr && key_position < tail_start) {
+            const std::uint32_t b = key_position / ratio;
+            valid = ((words[b / 32] >> (b % 32)) & 1u) != 0u;
+          }
+          const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
+          vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
+                             s_lds[1][tile][row][col % 16])
+                          : -INFINITY;
+          part_max = fmaxf(part_max, vals[m]);
         }
-        const std::uint32_t tile = ((col / 16) * kRowBlocks) + rb;
-        vals[m] = valid ? (s_lds[0][tile][row][col % 16] +
-                           s_lds[1][tile][row][col % 16])
-                        : -INFINITY;
-        part_max = fmaxf(part_max, vals[m]);
-      }
 #pragma unroll
-      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
-        part_max = fmaxf(part_max, __shfl_xor(part_max, off));
-      }
-      const float prev_max = row_max[rg];
-      const float next_max = fmaxf(prev_max, part_max);
-      const float prior_scale =
-          isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
-      float part_sum = 0.0F;
+        for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+          part_max = fmaxf(part_max, __shfl_xor(part_max, off));
+        }
+        const float prev_max = row_max[rg];
+        const float next_max = fmaxf(prev_max, part_max);
+        const float prior_scale =
+            isfinite(prev_max) ? __expf(prev_max - next_max) : 0.0F;
+        float part_sum = 0.0F;
 #pragma unroll
-      for (std::uint32_t m = 0; m < kPerLane; ++m) {
-        const float w = isfinite(vals[m]) ? __expf(vals[m] - next_max) : 0.0F;
-        part_sum += w;
-        p_lds[rg][(seg * kPerLane) + m] = static_cast<__half>(w);
-      }
+        for (std::uint32_t m = 0; m < kPerLane; ++m) {
+          const float w = isfinite(vals[m]) ? __expf(vals[m] - next_max) : 0.0F;
+          part_sum += w;
+          p_lds[rg][(seg * kPerLane) + m] = static_cast<__half>(w);
+        }
 #pragma unroll
-      for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
-        part_sum += __shfl_xor(part_sum, off);
-      }
-      if (seg == 0) {
-        row_max[rg] = next_max;
-        row_sum[rg] = (row_sum[rg] * prior_scale) + part_sum;
-        row_scale[rg] = prior_scale;
+        for (std::uint32_t off = 1; off < kSoftmaxLanes; off <<= 1) {
+          part_sum += __shfl_xor(part_sum, off);
+        }
+        if (seg == 0) {
+          row_max[rg] = next_max;
+          row_sum[rg] = (row_sum[rg] * prior_scale) + part_sum;
+          row_scale[rg] = prior_scale;
+        }
       }
     }
     __syncthreads();
