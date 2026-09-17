@@ -178,12 +178,13 @@ int RunCase(std::uint32_t kTokens) {
       HipBuffer<float> d_out(kOut);
       Upload(&d_conv_state, conv_state);
       Upload(&d_state, state);
-      q::GatedDeltaNet(
-          d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
-          d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
-          d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
-          d_raw.get(), d_state.get(), d_out.get(), nullptr, nullptr, nullptr,
-          kTokens, kKHeads, kVHeads, kDim, kKernel, route == 1, kEps, nullptr);
+      q::GatedDeltaNet(d_qkv.get(), kChannels, d_z.get(), kZ,
+                       d_alpha_beta.get(), d_conv_w.get(), d_a.get(),
+                       d_dt.get(), d_norm_w.get(), d_conv_state.get(),
+                       d_scratch.get(), d_qn.get(), d_kn.get(), d_raw.get(),
+                       d_state.get(), d_out.get(), nullptr, nullptr, nullptr,
+                       kTokens, kKHeads, kVHeads, kDim, kKernel, route == 1,
+                       false, kEps, nullptr);
       CheckHip(hipDeviceSynchronize(), "GDN synchronization");
       outs[route] = Download(&d_out, kOut);
       states[route] = Download(&d_state, kStateCount);

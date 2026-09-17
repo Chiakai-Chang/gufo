@@ -134,11 +134,6 @@ void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
                     std::size_t batch, std::size_t m, std::size_t k,
                     hipStream_t stream);
 
-/// F16 route for wide batches over Q8_0 weights: F16 activation rows
-/// [batch][k] (NarrowActivations, or a producer's F16 output), weights
-/// dequantized to F16 as they are staged, F32 accumulation. out is
-/// [batch][m]; returns false, launching nothing, when k is not a multiple
-/// of 32.
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
 /// shapes. low_rank must not overlap mixed_half; side outputs are optional.
@@ -147,8 +142,23 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                   void* mixed_q8, float* inject, std::uint32_t n_tokens,
                   std::uint32_t hidden, std::uint32_t rank, hipStream_t stream);
 
+/// F16 activation rows [batch][k], Q8_0 weights dequantized to F16 in LDS,
+/// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream);
+
+/// SSM Q8_0 projection fused with its four-tap convolution. Supports
+/// [m=16384,k=2560,channels=10240] and at least 1024 tokens. qkvz retains
+/// every Z row plus the QKV rows required for tile boundaries and rolling
+/// history; other QKV rows are not written. convolved is [tokens][channels].
+/// history is read only; pass convolved=true to GatedDeltaNet to consume
+/// this result and update history. Speculative snapshots need all raw QKV
+/// rows and must use DenseF16Gemm instead. Unsupported shapes launch nothing.
+bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
+                     const float* history, float* qkvz, float* convolved,
+                     std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                     std::uint32_t channels, std::uint32_t kernel,
+                     hipStream_t stream);
 
 /// Routed expert GEMMs. RoutedCompact sorts the (token, slot) assignments
 /// by expert into `rows_token`/`rows_slot` (RoutedCompactRows(slots,
@@ -234,7 +244,8 @@ void PleInject(float* res, const float* gated, const float* conv,
 /// `qkv` rows are `qkv_stride` floats apart and `z` rows `z_stride`, so a
 /// stacked [qkv|z] projection feeds both without unpacking. A non-null
 /// `out_q8` receives the rows quantized into the W8A8 tiled layout
-/// (K = v_heads * d) instead of `out`.
+/// (K = v_heads * d) instead of `out`. `convolved` consumes convolution
+/// rows already in conv_scratch; it requires null speculative snapshots.
 void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
@@ -243,7 +254,8 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    void* out_q8, float* state_snapshots, float* conv_snapshots,
                    std::uint32_t n_tokens, std::uint32_t k_heads,
                    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
-                   bool row_split, float eps, hipStream_t stream);
+                   bool row_split, bool convolved, float eps,
+                   hipStream_t stream);
 
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row

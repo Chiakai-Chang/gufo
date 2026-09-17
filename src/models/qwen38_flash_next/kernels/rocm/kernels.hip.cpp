@@ -4317,6 +4317,41 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
   }
 }
 
+// Keep the separate four-tap convolution's F32 rounding order when its
+// inputs come from the projection's LDS tile.
+__device__ __forceinline__ float SsmConv4Value(float4 w, float x0, float x1,
+                                               float x2, float x3) {
+  float acc = __fmaf_rn(w.x, x0, __fmul_rn(w.y, x1));
+  acc = __fmaf_rn(w.z, x2, acc);
+  acc = __fmaf_rn(w.w, x3, acc);
+  return SiluF(acc);
+}
+
+// The fused projection leaves each 16-token tile's first and last three
+// raw rows in qkv. Only the first three convolutions need another tile or
+// the previous chunk's history; all other rows are produced in LDS.
+__global__ void SsmConvBoundaryKernel(const float* qkv, const float* w,
+                                      const float* history, float* out,
+                                      std::uint32_t n_tokens,
+                                      std::uint32_t channels,
+                                      std::uint32_t stride) {
+  const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::uint32_t t = blockIdx.y * 16 + blockIdx.z;
+  if (c >= channels || t >= n_tokens) {
+    return;
+  }
+  const float4 taps = *reinterpret_cast<const float4*>(w + c * 4);
+  float v[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const int src = static_cast<int>(t) - 3 + j;
+    v[j] = src < 0 ? history[static_cast<std::size_t>(src + 3) * channels + c]
+                   : qkv[static_cast<std::size_t>(src) * stride + c];
+  }
+  out[static_cast<std::size_t>(t) * channels + c] =
+      SsmConv4Value(taps, v[0], v[1], v[2], v[3]);
+}
+
 /// Dense F16 WMMA GEMM over Q8_0 weights: block = BM rows x BN tokens, BK
 /// 32-element K blocks per LDS stage, waves = WM row groups x WN token
 /// groups. The codes are dequantized to F16 once per stage as they are
@@ -4324,14 +4359,16 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
 /// and the activations are F16 rows [batch][k], so the matrix cores
 /// accumulate in F32 with no per-block scaling. y is [batch][m].
 template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
-         bool kHcMix = false>
+         bool kHcMix = false, bool kSsmConv = false>
 __launch_bounds__(256) __global__
     void DenseF16GEMMKernel(const void* __restrict__ w,
                             const __half* __restrict__ x, float* __restrict__ y,
                             std::size_t batch, std::size_t m, std::size_t k,
                             const __half* xn = nullptr,
                             __half* mixed_half = nullptr,
-                            void* mixed_q8 = nullptr) {
+                            void* mixed_q8 = nullptr,
+                            const float* conv_w = nullptr,
+                            float* conv_out = nullptr) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   constexpr int kRowTiles = BM / 16;
@@ -4656,19 +4693,61 @@ __launch_bounds__(256) __global__
       const std::size_t tok = t0 + static_cast<std::size_t>(tok_l);
       const auto* src =
           reinterpret_cast<const float4*>(tile_scratch + (tok_l * 32) + row_l);
-      if (tok < batch && r0 + 32 <= m) {
-        auto* dst = reinterpret_cast<float4*>(y + (tok * m) + r0 +
-                                              static_cast<std::size_t>(row_l));
+      if constexpr (kSsmConv) {
+        static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 4 && WN == 2);
+        static_assert(!kHcMix && kRowGroup == 1);
+        constexpr std::uint32_t channels = 10240;
+        if (tok < batch) {
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-          dst[q] = src[q];
+          for (int v = 0; v < 4; ++v) {
+            const unsigned row = r0 + row_l + v * 4;
+            if (row >= m)
+              continue;
+            const float4 current = src[v];
+            if (row >= channels || tok_l < 3 || tok_l >= 13 ||
+                tok + 3 >= batch) {
+              *reinterpret_cast<float4*>(y + tok * m + row) = current;
+            }
+            if (row < channels && tok_l >= 3) {
+              const float4 x0 = *reinterpret_cast<const float4*>(
+                  tile_scratch + (tok_l - 3) * 32 + row_l + v * 4);
+              const float4 x1 = *reinterpret_cast<const float4*>(
+                  tile_scratch + (tok_l - 2) * 32 + row_l + v * 4);
+              const float4 x2 = *reinterpret_cast<const float4*>(
+                  tile_scratch + (tok_l - 1) * 32 + row_l + v * 4);
+              const float4 w0 =
+                  *reinterpret_cast<const float4*>(conv_w + (row + 0) * 4);
+              const float4 w1 =
+                  *reinterpret_cast<const float4*>(conv_w + (row + 1) * 4);
+              const float4 w2 =
+                  *reinterpret_cast<const float4*>(conv_w + (row + 2) * 4);
+              const float4 w3 =
+                  *reinterpret_cast<const float4*>(conv_w + (row + 3) * 4);
+              const float4 value{
+                  SsmConv4Value(w0, x0.x, x1.x, x2.x, current.x),
+                  SsmConv4Value(w1, x0.y, x1.y, x2.y, current.y),
+                  SsmConv4Value(w2, x0.z, x1.z, x2.z, current.z),
+                  SsmConv4Value(w3, x0.w, x1.w, x2.w, current.w)};
+              *reinterpret_cast<float4*>(conv_out + tok * channels + row) =
+                  value;
+            }
+          }
         }
-      } else if (tok < batch) {
+      } else {
+        if (tok < batch && r0 + 32 <= m) {
+          auto* dst = reinterpret_cast<float4*>(
+              y + (tok * m) + r0 + static_cast<std::size_t>(row_l));
 #pragma unroll
-        for (int q = 0; q < 16; ++q) {
-          const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
-          if (r < m) {
-            y[(tok * m) + r] = tile_scratch[(tok_l * 32) + row_l + q];
+          for (int q = 0; q < 4; ++q) {
+            dst[q] = src[q];
+          }
+        } else if (tok < batch) {
+#pragma unroll
+          for (int q = 0; q < 16; ++q) {
+            const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
+            if (r < m) {
+              y[(tok * m) + r] = tile_scratch[(tok_l * 32) + row_l + q];
+            }
           }
         }
       }
@@ -4741,6 +4820,26 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
     hipLaunchKernelGGL((DenseF16GEMMKernel<kBM, kBN, 4, 4, 2>), grid,
                        dim3(kThreads), 0, stream, w, x, out, batch, m, k);
   }
+  return true;
+}
+
+bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
+                     const float* history, float* qkvz, float* convolved,
+                     std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
+                     std::uint32_t channels, std::uint32_t kernel,
+                     hipStream_t stream) {
+  if (n_tokens < 1024 || m != 16384 || k != 2560 || channels != 10240 ||
+      kernel != kSsmConvTaps) {
+    return false;
+  }
+  hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 4, 2, 1, false, true>),
+                     dim3((n_tokens + 127) / 128, m / 256), dim3(kThreads), 0,
+                     stream, w, x, qkvz, n_tokens, m, k, nullptr, nullptr,
+                     nullptr, conv_w, convolved);
+  hipLaunchKernelGGL(SsmConvBoundaryKernel,
+                     dim3(Blocks(channels), (n_tokens + 15) / 16, 3),
+                     dim3(kThreads), 0, stream, qkvz, conv_w, history,
+                     convolved, n_tokens, channels, m);
   return true;
 }
 
@@ -4841,20 +4940,23 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    void* out_q8, float* state_snapshots, float* conv_snapshots,
                    std::uint32_t n_tokens, std::uint32_t k_heads,
                    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
-                   bool row_split, float eps, hipStream_t stream) {
+                   bool row_split, bool convolved, float eps,
+                   hipStream_t stream) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
-  if (kernel == kSsmConvTaps) {
-    hipLaunchKernelGGL(
-        SsmConv4Kernel,
-        dim3(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
-                                   kSsmConvTokensPerThread),
-        dim3(kThreads), 0, stream, qkv, qkv_stride, conv_w, conv_state,
-        conv_scratch, n_tokens, channels);
-  } else {
-    hipLaunchKernelGGL(SsmConvKernel, dim3(Blocks(count)), dim3(kThreads), 0,
-                       stream, qkv, qkv_stride, conv_w, conv_state,
-                       conv_scratch, n_tokens, channels, kernel);
+  if (!convolved) {
+    if (kernel == kSsmConvTaps) {
+      hipLaunchKernelGGL(
+          SsmConv4Kernel,
+          dim3(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
+                                     kSsmConvTokensPerThread),
+          dim3(kThreads), 0, stream, qkv, qkv_stride, conv_w, conv_state,
+          conv_scratch, n_tokens, channels);
+    } else {
+      hipLaunchKernelGGL(SsmConvKernel, dim3(Blocks(count)), dim3(kThreads), 0,
+                         stream, qkv, qkv_stride, conv_w, conv_state,
+                         conv_scratch, n_tokens, channels, kernel);
+    }
   }
   if (conv_snapshots != nullptr) {
     hipLaunchKernelGGL(RollingSnapshotKernel,

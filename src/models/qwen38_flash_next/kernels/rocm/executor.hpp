@@ -221,6 +221,9 @@ private:
   bool GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                   const float* x, float* out, std::uint32_t n_tokens,
                   const DeviceTensor* down, std::string* error_msg) const;
+  /// Reuse or populate the F16 activation staging buffer.
+  void PrepareHalfInput(const float* x, std::uint32_t rows,
+                        std::uint32_t cols) const;
   /// Whether a wide dense Q8_0 projection takes the F16 WMMA GEMM.
   bool DenseF16Route(const DeviceTensor& w, std::uint32_t n_tokens) const;
   void RoutedHints(const DeviceTensor& w, std::uint32_t n_tokens) const;

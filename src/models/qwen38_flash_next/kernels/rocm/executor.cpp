@@ -524,6 +524,20 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
   return true;
 }
 
+void Executor::PrepareHalfInput(const float* x, std::uint32_t rows,
+                                std::uint32_t cols) const {
+  if (half_src_ == x && half_rows_ == rows && half_cols_ == cols &&
+      !half_bf16_) {
+    return;
+  }
+  NarrowActivations(x, s_.x_half, false, static_cast<std::size_t>(rows) * cols,
+                    stream_);
+  half_src_ = x;
+  half_rows_ = rows;
+  half_cols_ = cols;
+  half_bf16_ = false;
+}
+
 bool Executor::DenseF16Route(const DeviceTensor& w,
                              std::uint32_t n_tokens) const {
   return w.type == GgmlType::kQ8_0 && n_tokens > kVecBatch &&
@@ -552,15 +566,7 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
       // it, or the previous projection read the same rows).
       const float* src = x + static_cast<std::size_t>(r0) * w.cols;
       if (f16) {
-        if (!(half_src_ == src && half_rows_ == rows && half_cols_ == w.cols &&
-              !half_bf16_)) {
-          NarrowActivations(src, s_.x_half, false,
-                            static_cast<std::size_t>(rows) * w.cols, stream_);
-          half_src_ = src;
-          half_rows_ = rows;
-          half_cols_ = w.cols;
-          half_bf16_ = false;
-        }
+        PrepareHalfInput(src, rows, w.cols);
         if (!DenseF16Gemm(w.data, static_cast<const __half*>(s_.x_half),
                           out + static_cast<std::size_t>(r0) * w.rows, rows,
                           w.rows, w.cols, stream_)) {
@@ -1008,9 +1014,19 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   const float* z = s_.z;
   std::uint32_t qkv_stride = channels;
   std::uint32_t z_stride = c.SsmValueDim();
+  bool convolved = false;
   if (!l.ssm_in.empty()) {
-    // One GEMV yields [qkv | z] per row.
-    if (!Dense(l.ssm_in, x, s_.qkvz, n_tokens, error_msg)) {
+    // Wide prefill convolves QKV in the projection's LDS tile. The raw
+    // boundary rows remain available for the rolling history update.
+    if (!speculative && n_tokens >= 1024 && n_tokens <= options_.max_batch &&
+        DenseF16Route(l.ssm_in, n_tokens)) {
+      PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
+      convolved = DenseF16SsmGemm(
+          l.ssm_in.data, static_cast<const __half*>(s_.x_half),
+          l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch, n_tokens,
+          l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_);
+    }
+    if (!convolved && !Dense(l.ssm_in, x, s_.qkvz, n_tokens, error_msg)) {
       return false;
     }
     qkv = s_.qkvz;
@@ -1039,7 +1055,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       tiled ? s_.x_q8t : nullptr, speculative ? s.state_snapshots : nullptr,
       speculative ? s.conv_snapshots : nullptr, n_tokens, c.ssm_num_k_heads,
       c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
-      n_tokens > kVecBatch && !speculative, c.rms_eps, stream_);
+      n_tokens > kVecBatch && !speculative, convolved, c.rms_eps, stream_);
   if (tiled) {
     q8t_src_ = nullptr;
     if (!W8A8Gemm(l.ssm_out.data, s_.x_q8t, out, n_tokens, l.ssm_out.rows,

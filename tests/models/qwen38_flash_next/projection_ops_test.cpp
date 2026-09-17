@@ -72,6 +72,137 @@ Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed) {
   return w;
 }
 
+// Reuse the wide projection fixture to check the fused convolution through
+// its actual consumer, including the state carried into the next chunk.
+void CheckSsmProjection(const void* w, const __half* x, float* projected,
+                        const std::vector<float>& reference,
+                        std::uint32_t batch) {
+  constexpr std::uint32_t m = 16384, k = 2560, channels = 10240;
+  constexpr std::uint32_t kh = 16, vh = 48, d = 128, value_dim = vh * d;
+  const std::size_t conv_count = std::size_t(batch) * channels;
+  const std::size_t state_count = std::size_t(vh) * d * d;
+  const std::size_t out_count = std::size_t(batch) * value_dim;
+  struct Buffers {
+    std::vector<float*> pointers;
+    ~Buffers() {
+      for (float* p : pointers) {
+        (void)hipFree(p);
+      }
+    }
+    float* Make(std::size_t count) {
+      float* p = nullptr;
+      CheckHip(hipMalloc(&p, count * sizeof(float)), "SSM allocation");
+      pointers.push_back(p);
+      return p;
+    }
+  } buffers;
+  std::uint32_t seed = 0x349B71U;
+  auto values = [&](std::size_t count, float scale, float offset = 0.0F) {
+    std::vector<float> v(count);
+    for (float& x : v) {
+      x = offset + Uniform(&seed, scale);
+    }
+    return v;
+  };
+  auto upload = [](float* p, const std::vector<float>& v) {
+    CheckHip(
+        hipMemcpy(p, v.data(), v.size() * sizeof(float), hipMemcpyHostToDevice),
+        "SSM upload");
+  };
+  auto input = [&](std::size_t count, float scale, float offset = 0.0F) {
+    float* p = buffers.Make(count);
+    upload(p, values(count, scale, offset));
+    return p;
+  };
+  auto download = [](const float* p, std::size_t count) {
+    std::vector<float> v(count);
+    CheckHip(
+        hipMemcpy(v.data(), p, count * sizeof(float), hipMemcpyDeviceToHost),
+        "SSM download");
+    return v;
+  };
+  auto exact = [&](const std::vector<float>& expected, const float* actual,
+                   const char* name) {
+    const auto result = download(actual, expected.size());
+    if (std::memcmp(expected.data(), result.data(),
+                    expected.size() * sizeof(float)) != 0) {
+      throw std::runtime_error(std::string("fused SSM changed ") + name);
+    }
+    for (float value : result) {
+      if (!std::isfinite(value)) {
+        throw std::runtime_error(std::string("nonfinite SSM ") + name);
+      }
+    }
+  };
+  float* conv_w = input(channels * 4, 0.05F);
+  float* ab = input(std::size_t(batch) * 2 * vh, 1.0F);
+  float* a = input(vh, 0.5F, -1.5F);
+  float* dt = input(vh, 1.0F);
+  float* norm = input(d, 0.5F, 1.0F);
+  const auto history = values(channels * 3, 0.5F);
+  const auto initial_state = values(state_count, 0.05F);
+  float* conv_state = buffers.Make(history.size());
+  float* state = buffers.Make(state_count);
+  float* scratch = buffers.Make(conv_count + channels * 4);
+  float* qn = buffers.Make(std::size_t(batch) * kh * d);
+  float* kn = buffers.Make(std::size_t(batch) * kh * d);
+  float* raw = buffers.Make(out_count);
+  float* out = buffers.Make(out_count);
+  float* fused = buffers.Make(reference.size() + 8);
+  auto consume = [&](float* qkvz, bool convolved) {
+    q::GatedDeltaNet(qkvz, m, qkvz + channels, m, ab, conv_w, a, dt, norm,
+                     conv_state, scratch, qn, kn, raw, state, out, nullptr,
+                     nullptr, nullptr, batch, kh, vh, d, 4, true, convolved,
+                     1e-6F, nullptr);
+  };
+  upload(conv_state, history);
+  upload(state, initial_state);
+  consume(projected, false);
+  const auto expected_conv = download(scratch, conv_count);
+  const auto expected_history = download(conv_state, history.size());
+  const auto expected_state = download(state, state_count);
+  const auto expected_out = download(out, out_count);
+  for (int replay = 0; replay < 2; ++replay) {
+    upload(conv_state, history);
+    upload(state, initial_state);
+    CheckHip(hipMemset(fused, 0xFF, (reference.size() + 8) * sizeof(float)),
+             "poison fused projection");
+    CheckHip(hipMemset(scratch, 0xFF, conv_count * sizeof(float)),
+             "poison fused convolution");
+    if (!q::DenseF16SsmGemm(w, x, conv_w, conv_state, fused, scratch, batch, m,
+                            k, channels, 4, nullptr)) {
+      throw std::runtime_error("SSM projection rejected the shape");
+    }
+    exact(expected_conv, scratch, "convolution");
+    const auto projected = download(fused, reference.size() + 8);
+    for (std::size_t t = 0; t < batch; ++t) {
+      const std::size_t first = t + 3 >= batch ? 0 : channels;
+      if (std::memcmp(projected.data() + t * m + first,
+                      reference.data() + t * m + first,
+                      (m - first) * sizeof(float)) != 0) {
+        throw std::runtime_error("SSM projection changed Z or final QKV");
+      }
+    }
+    for (std::size_t i = reference.size(); i < projected.size(); ++i) {
+      if (std::bit_cast<std::uint32_t>(projected[i]) != 0xFFFFFFFFU) {
+        throw std::runtime_error("SSM projection overwrote its guard");
+      }
+    }
+    consume(fused, true);
+    exact(expected_history, conv_state, "history");
+    exact(expected_state, state, "recurrent state");
+    exact(expected_out, out, "output");
+  }
+  // A rejected geometry must not touch any pointer.
+  if (q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                         1023, m, k, channels, 4, nullptr) ||
+      q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                         batch, m, k, channels, 3, nullptr)) {
+    throw std::runtime_error("SSM projection accepted an unsupported shape");
+  }
+  std::cout << "fused SSM convolution, output, state and replay are exact\n";
+}
+
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
            std::size_t reference_tokens = 0) {
   const Q8Weights w = MakeWeights(m, k, seed);
@@ -185,6 +316,10 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
             << worst_f16_vs_mmq << ", worst |W8A8 - F64| " << worst_vs_ref
             << ", worst |F16 - F64| " << worst_f16 << " (reference scale "
             << ref_scale << ")\n";
+  if (m == 16384 && k == 2560 && batch >= 1024) {
+    CheckSsmProjection(d_w, d_x_half, d_f16, f16,
+                       static_cast<std::uint32_t>(batch));
+  }
   (void)hipFree(d_w);
   (void)hipFree(d_x);
   (void)hipFree(d_mmq);
