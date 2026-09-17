@@ -191,21 +191,33 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   return worst_score < 1e-2 && mismatches == 0;
 }
 
-void CheckPooling() {
-  constexpr unsigned start = 29, tokens = 7, first = 7, blocks = 12;
+void CheckPooling(unsigned start, unsigned capacity) {
+  constexpr unsigned tokens = 7;
+  const unsigned first = start / kRatio;
+  const unsigned blocks = (start + tokens) / kRatio + 3;
   constexpr unsigned rotary = 64;
   constexpr float theta = 1000000.0F, eps = 1e-6F;
   const auto raw = MakeValues((start + tokens) * kDim, 0x31415926U, 1.0F);
   const auto gamma = MakeValues(kDim, 0x27182818U, 1.0F);
   const std::vector<__half> initial(blocks * kDim, __float2half(3.0F));
-  auto* d_raw = Upload(raw);
+  // Keep only the newest raw rows. Store the next batch through the same
+  // ring operation used by the executor, including a wrap within a block
+  // of speculative tokens.
+  std::vector<float> ring(capacity * kDim, -123.0F);
+  for (unsigned t = start > capacity ? start - capacity : 0; t < start; ++t)
+    std::copy_n(raw.data() + std::size_t{t} * kDim, kDim,
+                ring.data() + std::size_t{t & (capacity - 1)} * kDim);
+  auto* d_raw = Upload(ring);
+  auto* d_input =
+      Upload(std::vector<float>(raw.begin() + start * kDim, raw.end()));
   auto* d_gamma = Upload(gamma);
   auto* d_blocks = Upload(initial);
   auto* d_first = Upload(std::vector<unsigned>{first});
   auto* d_start = Upload(std::vector<unsigned>{start});
   const auto run = [&] {
+    q::StoreRows(d_input, d_raw, tokens, kDim, d_start, capacity, nullptr);
     q::PoolIndexerBlocks(d_raw, d_gamma, d_blocks, d_first, d_start, tokens, 4,
-                         kRatio, kDim, rotary, theta, eps, nullptr);
+                         kRatio, kDim, rotary, theta, eps, capacity, nullptr);
   };
   run();
   const auto actual = Download(d_blocks, initial.size());
@@ -253,9 +265,9 @@ void CheckPooling() {
     }
   }
   for (void* pointer :
-       {static_cast<void*>(d_raw), static_cast<void*>(d_gamma),
-        static_cast<void*>(d_blocks), static_cast<void*>(d_first),
-        static_cast<void*>(d_start)})
+       {static_cast<void*>(d_raw), static_cast<void*>(d_input),
+        static_cast<void*>(d_gamma), static_cast<void*>(d_blocks),
+        static_cast<void*>(d_first), static_cast<void*>(d_start)})
     CheckHip(hipFree(pointer), "free pooling input");
   std::cout << "pooled F16 keys: FP64 error " << worst
             << ", boundaries and replay exact\n";
@@ -265,7 +277,9 @@ void CheckPooling() {
 
 int main() {
   try {
-    CheckPooling();
+    CheckPooling(29, 64);
+    CheckPooling(29, 16);     // batch wraps the raw-key ring
+    CheckPooling(65533, 16);  // many wraps; absolute rotary position retained
     bool ok = true;
     ok = Run(100, 20000, 0x1234ABCDU) && ok;     // deep, ragged group
     ok = Run(7, 131069, 0x2468ACE0U) && ok;

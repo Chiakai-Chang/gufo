@@ -91,9 +91,9 @@ int main(int argc, char** argv) {
         "The quick brown fox jumps over the lazy dog. "
         "Strix Halo executes this deterministic benchmark sequence. ");
     Require(!pattern.empty(), "empty prompt pattern");
-    // Longer than one prefill chunk, so the kept trunk rows are a partial
-    // batch and the indexer has pooled blocks.
-    std::vector<std::int32_t> prompt(3000);
+    // Partial prefill batch and three unpooled raw indexer rows at the end
+    // of the ring. Continuing (and speculative rollback) crosses its wrap.
+    std::vector<std::int32_t> prompt(4095);
     for (std::size_t i = 0; i < prompt.size(); ++i)
       prompt[i] = pattern[i % pattern.size()];
     const sampling::SamplingConfig config{

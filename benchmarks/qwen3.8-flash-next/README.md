@@ -9,6 +9,23 @@ stays on disk with about 6 MiB of compressed rows cached in RAM.
 Context, scratch and MTP add memory. NVMe loading takes about
 15 seconds; 256 MiB of upload staging is released before inference.
 
+## Memory
+
+C1, context limit 262144, one server session, a 3891-token repetitive prompt,
+128 generated tokens and seed 1. GPU-visible unified allocations use the Linux
+GTT counter with the idle host subtracted; separate CPU memory is not included.
+
+| Mode | Loaded GiB | After generation GiB | Greedy TG tok/s | Temperature 0.7 TG tok/s |
+| --- | ---: | ---: | ---: | ---: |
+| AR | 85.39 | 85.66 | 25.70 | 25.19 |
+| MTP | 89.39 | 89.67 | 59.82 | 56.99 |
+
+The full requested KV capacity remains allocated. Raw indexer keys use a
+4096-row ring; completed blocks retain their pooled keys. PLE, MTP and trunk
+activations share storage when their lifetimes do not overlap. Snapshots keep
+only unpooled raw keys; existing disk cache entries rebuild after this layout
+change. Weights, cache precision and sampling are unchanged.
+
 ## Performance
 
 Nix release builds, C1, pp2048, tg128, seed 1, one measured repetition
@@ -19,8 +36,8 @@ are from `8e60594`; MTP measurements include sampled proposals.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1462.41 | 1499.78 |
-| 4096 | TODO | 1373.54 |
+| 0 | 1462.41 | 1496.14 |
+| 4096 | TODO | 1372.44 |
 | 16384 | TODO | TODO |
 | 32768 | 1378.66 | TODO |
 | 65536 | 1340.91 | TODO |
@@ -28,8 +45,8 @@ are from `8e60594`; MTP measurements include sampled proposals.
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.19 | 42.64 | 71.0% |
-| Greedy | 4096 | 25.22 | 36.55 | 63.7% |
+| Greedy | 0 | 26.19 | 43.04 | 71.0% |
+| Greedy | 4096 | 25.22 | 36.61 | 63.7% |
 | Temperature 0.7 | 0 | 25.56 | 43.48 | 75.9% |
 | Temperature 0.7 | 4096 | 24.86 | 38.89 | 67.7% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
@@ -113,7 +130,8 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]moe_ids_o
 
 - **Operators:** independent numerical references, FP64 projection dots,
   exact outputs and replay. Cover ragged shapes, guards, inactive experts,
-  finite outputs, tied selections, and attention near 128K. Router tests check
+  finite outputs, tied selections, indexer ring wraps, and attention near 128K.
+  Router tests check
   softmax weights and lowest-index ties independently of assignment maps.
   Fusions must preserve the separate operators' rounding. Decode and
   verification projections must agree across batch widths one through eight;

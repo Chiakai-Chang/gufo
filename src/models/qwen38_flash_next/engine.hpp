@@ -143,7 +143,7 @@ public:
   }
 
   /// Layout version of the snapshot payload; bump on any format change.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 2;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 3;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent

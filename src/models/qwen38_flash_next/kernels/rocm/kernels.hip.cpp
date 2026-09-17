@@ -1661,10 +1661,12 @@ __global__ void StoreKvKernel(const float* src, __half* cache,
 
 __global__ void StoreRowsKernel(const float* src, float* dst,
                                 std::uint32_t row_dim,
-                                const std::uint32_t* start_pos) {
+                                const std::uint32_t* start_pos,
+                                std::uint32_t capacity) {
   const std::uint32_t t = blockIdx.x;
+  const std::uint32_t row = (*start_pos + t) & (capacity - 1);
   for (std::uint32_t i = threadIdx.x; i < row_dim; i += blockDim.x) {
-    dst[static_cast<std::size_t>(*start_pos + t) * row_dim + i] =
+    dst[static_cast<std::size_t>(row) * row_dim + i] =
         src[static_cast<std::size_t>(t) * row_dim + i];
   }
 }
@@ -1672,13 +1674,11 @@ __global__ void StoreRowsKernel(const float* src, float* dst,
 /// grid: the most blocks a batch can complete. Block b pools raw keys
 /// [b*ratio, (b+1)*ratio) once every one of them is stored, i.e. for
 /// b in [*first_block, (*start_pos + n_tokens) / ratio).
-__global__ void PoolBlocksKernel(const float* raw, const float* gamma,
-                                 __half* blocks,
-                                 const std::uint32_t* first_block,
-                                 const std::uint32_t* start_pos,
-                                 std::uint32_t n_tokens, std::uint32_t ratio,
-                                 std::uint32_t dim, std::uint32_t rotary_dim,
-                                 float theta, float eps) {
+__global__ void PoolBlocksKernel(
+    const float* raw, const float* gamma, __half* blocks,
+    const std::uint32_t* first_block, const std::uint32_t* start_pos,
+    std::uint32_t n_tokens, std::uint32_t ratio, std::uint32_t dim,
+    std::uint32_t rotary_dim, float theta, float eps, std::uint32_t capacity) {
   __shared__ float v[256];
   __shared__ float shared[32];
   const std::uint32_t b = *first_block + blockIdx.x;
@@ -1689,7 +1689,8 @@ __global__ void PoolBlocksKernel(const float* raw, const float* gamma,
   float mean = 0.0f;
   if (i < dim) {
     for (std::uint32_t r = 0; r < ratio; ++r) {
-      mean += raw[(static_cast<std::size_t>(b) * ratio + r) * dim + i];
+      const std::uint32_t row = (b * ratio + r) & (capacity - 1);
+      mean += raw[static_cast<std::size_t>(row) * dim + i];
     }
     mean /= static_cast<float>(ratio);
   }
@@ -5155,9 +5156,9 @@ void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
 
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                std::uint32_t row_dim, const std::uint32_t* start_pos,
-               hipStream_t stream) {
+               std::uint32_t capacity, hipStream_t stream) {
   hipLaunchKernelGGL(StoreRowsKernel, dim3(n_tokens), dim3(kThreads), 0, stream,
-                     src, dst, row_dim, start_pos);
+                     src, dst, row_dim, start_pos, capacity);
 }
 
 void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
@@ -5165,13 +5166,13 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        const std::uint32_t* start_pos, std::uint32_t n_tokens,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
-                       float eps, hipStream_t stream) {
+                       float eps, std::uint32_t capacity, hipStream_t stream) {
   if (grid_blocks == 0) {
     return;
   }
   hipLaunchKernelGGL(PoolBlocksKernel, dim3(grid_blocks), dim3(kThreads), 0,
                      stream, raw_keys, gamma, blocks, first_block, start_pos,
-                     n_tokens, ratio, dim, rotary_dim, theta, eps);
+                     n_tokens, ratio, dim, rotary_dim, theta, eps, capacity);
 }
 
 void SelectBlocks(const __half* q, const __half* blocks, std::uint32_t* mask,

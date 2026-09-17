@@ -289,12 +289,12 @@ void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
 void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
              std::uint32_t row_dim, const std::uint32_t* start_pos,
              hipStream_t stream);
-/// Same for an f32 row store (raw indexer keys).
+/// Stores raw indexer rows in a power-of-two ring of `capacity` rows.
 void StoreRows(const float* src, float* dst, std::uint32_t n_tokens,
                std::uint32_t row_dim, const std::uint32_t* start_pos,
-               hipStream_t stream);
+               std::uint32_t capacity, hipStream_t stream);
 
-/// Pools raw indexer keys ([pos][dim] f32) of the blocks the batch
+/// Pools raw indexer keys ([pos % capacity][dim] f32) of the blocks the batch
 /// completes, [*first_block, (*start_pos + n_tokens) / ratio), into block
 /// keys: mean over `ratio` positions, RMSNorm with gamma, rotary at the
 /// block start position, then round once to F16 for scoring.
@@ -305,7 +305,7 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        const std::uint32_t* start_pos, std::uint32_t n_tokens,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
-                       float eps, hipStream_t stream);
+                       float eps, std::uint32_t capacity, hipStream_t stream);
 
 /// Per query t (position *start_pos + first_token + t): scores every
 /// complete block below its own tail, keeps the `budget` highest, and

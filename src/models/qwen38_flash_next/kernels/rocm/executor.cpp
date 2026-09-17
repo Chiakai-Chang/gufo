@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -42,6 +43,7 @@ T* Alloc(std::vector<void*>& allocations, std::size_t count,
   if (hipMalloc(&p, bytes) != hipSuccess) {
     AssignError(error_msg,
                 "hipMalloc of " + std::to_string(bytes) + " bytes failed");
+    allocations.push_back(nullptr);
     return nullptr;
   }
   (void)hipMemset(p, 0, bytes);
@@ -98,6 +100,12 @@ std::size_t RoutedTileCapacity(std::size_t slots, const Config& c) {
   return (slots + static_cast<std::size_t>(c.num_experts) * 15) /
              kRoutedTileRowsNarrow +
          c.num_experts + 1;
+}
+
+std::uint32_t IndexerCapacity(const Config& c, std::uint32_t batch,
+                              std::uint32_t context) {
+  return static_cast<std::uint32_t>(std::bit_ceil(std::min<std::uint64_t>(
+      context, std::uint64_t{c.indexer_top_k} + batch)));
 }
 
 }  // namespace
@@ -212,19 +220,21 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
       Alloc<std::uint8_t>(a, Q8TiledBytes(T, model.max_q8_cols()), error_msg);
   s.res = f32(T * hc_dim);
   s.xn = f32(T * hc_dim);
-  // Twice the rows: the head mixer reads its tail rows at an offset, and
-  // the first hipBLASLt call of a size class times the class at up to T rows
-  // from that offset.
-  s.xn_half = Alloc<__half>(a, 2 * T * hc_dim, error_msg);
+  s.xn_half = Alloc<__half>(a, T * hc_dim, error_msg);
   s.xn_q8t = Alloc<std::uint8_t>(a, Q8TiledBytes(T, hc_dim), error_msg);
   s.lo = f32(T * c.hc_low_rank);
   s.hc_gate = f32(T * hc_dim);
   s.mixed = f32(T * hidden);
   s.inject = f32(T * c.hc_count * HcInjectParts(hidden));
   s.block_out = f32(T * hidden);
-  s.qkv = f32(T * c.SsmConvChannels());
-  s.z = f32(T * c.SsmValueDim());
-  s.qkvz = f32(T * (c.SsmConvChannels() + c.SsmValueDim()));
+  // Stacked and separate SSM projections are mutually exclusive. MTP's
+  // input concatenation is consumed before its attention/FFN block, and
+  // never overlaps a trunk SSM layer.
+  s.qkvz = f32(T * std::max<std::size_t>({c.SsmConvChannels() + c.SsmValueDim(),
+                                          model.has_mtp() ? 2 * hc_dim : 0,
+                                          c.ple_layer >= 0 ? hc_dim : 0}));
+  s.qkv = s.qkvz;
+  s.z = s.qkvz != nullptr ? s.qkvz + T * c.SsmConvChannels() : nullptr;
   s.alpha_beta = f32(T * 2 * c.ssm_num_v_heads);
   s.conv_scratch = f32((T + c.ssm_conv_kernel) * c.SsmConvChannels());
   s.qn = f32(T * c.SsmKeyDim());
@@ -251,12 +261,15 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                         kAttnSplits * (c.head_dim + 2));
   if (c.ple_layer >= 0) {
     s.ple_emb = f32(T * c.PleEmbeddingDim());
-    s.ple_key = f32(T * hc_dim);
-    s.ple_value = f32(T * hidden);
-    s.ple_query = f32(T * hc_dim);
-    s.ple_gated = f32(T * hc_dim);
-    s.ple_norm = f32(T * hc_dim);
-    s.ple_conv = f32(T * hc_dim);
+    // PLE finishes before this layer's mixer/SSM. Its gate consumes key
+    // and query before normalization/convolution reuse those two buffers.
+    // The gated input stays separate until PleInject consumes both outputs.
+    s.ple_key = s.hc_gate;
+    s.ple_value = s.block_out;
+    s.ple_query = s.xn;
+    s.ple_gated = s.qkvz;
+    s.ple_norm = s.hc_gate;
+    s.ple_conv = s.xn;
     s.ple_history_scratch =
         f32(static_cast<std::size_t>(c.PleConvHistory()) * hc_dim);
     void* pinned = nullptr;
@@ -326,10 +339,13 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
                    !model.layers().empty() &&
                    model.layers()[0].hc_ffn.down.type == GgmlType::kQ8_0;
   if (model.has_mtp()) {
-    s.mtp_h = f32(T * hc_dim);
-    s.mtp_embd = f32(T * hidden);
-    s.mtp_concat = f32(T * hc_dim * 2);
-    s.mtp_res = f32(T * hc_dim);
+    // The trunk's kept rows are session-owned. Its transient residual and
+    // mixer buffers are free while MTP constructs its input. Concatenation
+    // consumes h/embd before the first mixer rewrites xn/mixed.
+    s.mtp_h = s.xn;
+    s.mtp_embd = s.mixed;
+    s.mtp_concat = s.qkvz;
+    s.mtp_res = s.res;
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
     if (!Check(hipHostMalloc(&e->mtp_token_host_, 2 * sizeof(std::int32_t)),
@@ -359,6 +375,10 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
     return nullptr;
   }
   s->max_context_ = max_context;
+  // Before sparse attention starts, pooling can lag by indexer_top_k
+  // rows. Afterwards only an incomplete block precedes the current batch.
+  // Completed block keys remain in block_k; their raw rows are dead.
+  s->index_capacity_ = IndexerCapacity(c, options_.max_batch, max_context);
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
   const std::size_t spec = options_.max_speculative - 1;
@@ -385,7 +405,7 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
       at.v_cache = Alloc<__half>(
           a, static_cast<std::size_t>(max_context) * kv_row, error_msg);
       at.index_k = Alloc<float>(
-          a, static_cast<std::size_t>(max_context) * c.indexer_head_dim,
+          a, static_cast<std::size_t>(s->index_capacity_) * c.indexer_head_dim,
           error_msg);
       at.block_k = Alloc<__half>(
           a,
@@ -1109,6 +1129,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::string* error_msg) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
+  const std::uint32_t index_capacity =
+      IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
     // The stacked projection feeds normalization, rotation and cache writes.
@@ -1148,13 +1170,14 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
   }
 
-  // Raw indexer keys are always cached: a later chunk past the budget
-  // pools them into block keys. The draft block keeps no indexer cache.
+  // Raw keys survive only until pooling. The ring holds the initial
+  // pre-budget backlog and a batch; the draft block has no indexer.
   if (s.index_k != nullptr) {
     if (!Dense(l.indexer_k, x, s_.ik, n_tokens, error_msg)) {
       return false;
     }
-    StoreRows(s_.ik, s.index_k, n_tokens, c.indexer_head_dim, pos, stream_);
+    StoreRows(s_.ik, s.index_k, n_tokens, c.indexer_head_dim, pos,
+              index_capacity, stream_);
   }
   const std::uint32_t* mask = nullptr;
   if (sparse) {
@@ -1175,7 +1198,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
-                      stream_);
+                      index_capacity, stream_);
     // Align score rows to full cache lines. The selector still considers
     // only complete causal blocks, so padding cannot change the ranking.
     const std::uint32_t blocks =
@@ -1676,7 +1699,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
 }
 
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
-                                             'N', 'A', 'P', '1'};
+                                             'N', 'A', 'P', '2'};
 
 /// Fixed header ahead of the section bytes. It carries every geometry
 /// value the section sizes derive from, so a payload of another artifact
@@ -1771,21 +1794,37 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   }
   const std::uint64_t kv_bytes =
       std::uint64_t{h.position} * h.kv_row * sizeof(__half);
-  const std::uint64_t index_bytes =
-      std::uint64_t{h.position} * h.indexer_head_dim * sizeof(float);
+  const std::uint64_t index_row_bytes =
+      std::uint64_t{h.indexer_head_dim} * sizeof(float);
+  const std::uint32_t index_begin = h.blocks * h.compress_ratio;
+  const std::uint32_t index_rows = h.position - index_begin;
   const std::uint64_t block_bytes =
       std::uint64_t{h.blocks} * h.indexer_head_dim * sizeof(__half);
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
     if (((il + 1) % h.full_attention_interval) == 0) {
       const auto* at = attention(il);
       if (!region(at != nullptr ? at->k_cache : nullptr, kv_bytes, "K cache") ||
-          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache") ||
-          !region(at != nullptr ? at->index_k : nullptr, index_bytes,
-                  "indexer keys") ||
-          !region(at != nullptr ? at->block_k : nullptr, block_bytes,
-                  "pooled block keys")) {
+          !region(at != nullptr ? at->v_cache : nullptr, kv_bytes, "V cache")) {
         return 0;
       }
+      // Serialize only unpooled rows, in chronological order. The physical
+      // ring may wrap, and a destination session may have another capacity.
+      if (session == nullptr) {
+        if (!region(nullptr, index_rows * index_row_bytes, "indexer keys"))
+          return 0;
+      } else {
+        const auto first = index_begin & (session->index_capacity_ - 1);
+        const auto tail =
+            std::min(index_rows, session->index_capacity_ - first);
+        if (!region(at->index_k + std::size_t{first} * h.indexer_head_dim,
+                    tail * index_row_bytes, "indexer tail") ||
+            !region(at->index_k, (index_rows - tail) * index_row_bytes,
+                    "indexer wrap"))
+          return 0;
+      }
+      if (!region(at != nullptr ? at->block_k : nullptr, block_bytes,
+                  "pooled block keys"))
+        return 0;
     }
   }
   if (h.has_mtp != 0) {
@@ -1888,6 +1927,10 @@ bool Executor::RestoreSnapshot(Session& session,
       h.hidden_rows > h.position || h.hidden_rows > options_.max_batch ||
       (h.has_mtp == 0 && (h.mtp_position != 0 || h.hidden_rows != 0))) {
     AssignError(error_msg, "snapshot positions do not fit this session");
+    return false;
+  }
+  if (h.position - h.blocks * h.compress_ratio > session.index_capacity_) {
+    AssignError(error_msg, "unpooled indexer rows exceed the ring capacity");
     return false;
   }
   if (h.payload_bytes != payload.size() ||

@@ -57,7 +57,7 @@ private:
   struct AttentionState {
     __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
     __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
-    float* index_k{nullptr};   ///< [max_context][indexer_dim] raw
+    float* index_k{nullptr};   ///< [index_capacity_][indexer_dim] raw ring
     __half* block_k{nullptr};  ///< [max_context/ratio][indexer_dim]
   };
   /// Per-launch values the kernels read from device memory, so a captured
@@ -78,6 +78,7 @@ private:
 
   const Executor* owner_{nullptr};
   std::uint32_t max_context_{0};
+  std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
