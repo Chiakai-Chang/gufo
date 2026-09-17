@@ -219,7 +219,8 @@ void PleGate(const float* key_n, const float* query_n, const float* value,
 /// where tokens before the chunk come from `history` ([hist][channels],
 /// oldest first). `history` is then advanced past the chunk.
 /// `snapshots`, when non-null, receives the history as it stands after
-/// every token: [n_tokens][hist][channels].
+/// each proper prefix: [n_tokens-1][hist][channels]. The full batch's
+/// history remains in `history`.
 void PleConv(const float* in, const float* w, float* history,
              float* history_scratch, float* out, float* snapshots,
              std::uint32_t n_tokens, std::uint32_t channels,
@@ -236,10 +237,9 @@ void PleInject(float* res, const float* gated, const float* conv,
 /// [t][alpha(v_heads) | beta(v_heads)]. Outputs the normalized,
 /// sigmoid-gated attention rows [tokens][v_heads*d] ready for the output
 /// projection.
-/// `state_snapshots` ([n_tokens][v_heads*d*d]) and `conv_snapshots`
-/// ([n_tokens][(kernel-1)*channels]), when non-null, receive the recurrent
-/// state as it stands after every token, so a speculative batch can be cut
-/// back to any accepted prefix.
+/// `state_snapshots` ([n_tokens-1][v_heads*d*d]) and `conv_snapshots`
+/// ([n_tokens-1][(kernel-1)*channels]), when non-null, receive the state after
+/// each proper prefix. The live state already holds the full batch.
 /// Scratch: `conv_scratch` ((n_tokens + kernel) * channels), `qn`/`kn`
 /// (n_tokens * k_heads * d), `raw` (n_tokens * v_heads * d).
 /// `qkv` rows are `qkv_stride` floats apart and `z` rows `z_stride`, so a

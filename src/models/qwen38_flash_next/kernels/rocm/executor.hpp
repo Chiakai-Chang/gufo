@@ -49,8 +49,8 @@ private:
   struct LinearState {
     float* conv_state{nullptr};       ///< [kernel-1][channels]
     float* state{nullptr};            ///< [v_heads][d][d]
-    float* conv_snapshots{nullptr};   ///< [max_spec][kernel-1][channels]
-    float* state_snapshots{nullptr};  ///< [max_spec][v_heads][d][d]
+    float* conv_snapshots{nullptr};   ///< [max_spec-1][kernel-1][channels]
+    float* state_snapshots{nullptr};  ///< [max_spec-1][v_heads][d][d]
   };
   struct AttentionState {
     __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
@@ -80,7 +80,7 @@ private:
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
   float* ple_history_{nullptr};    ///< [PleConvHistory()][hc_dim]
-  float* ple_snapshots_{nullptr};  ///< [max_spec][PleConvHistory()][hc_dim]
+  float* ple_snapshots_{nullptr};  ///< [max_spec-1][PleConvHistory()][hc_dim]
   NgramHistory ngram_;
   std::vector<NgramHistory> ngram_snapshots_;
   std::uint32_t spec_base_{0};    ///< position before the speculative batch

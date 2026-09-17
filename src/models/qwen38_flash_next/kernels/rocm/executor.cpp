@@ -355,10 +355,10 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
   s->max_context_ = max_context;
   s->linear_.resize(c.num_layers);
   s->attention_.resize(c.num_layers);
-  s->ngram_snapshots_.resize(options_.max_speculative);
+  const std::size_t spec = options_.max_speculative - 1;
+  s->ngram_snapshots_.resize(spec);
   auto& a = s->allocations_;
   const std::size_t kv_row = c.AttentionKvDim();
-  const std::size_t spec = options_.max_speculative;
   const std::size_t conv_elems =
       static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
   const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
@@ -368,8 +368,10 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
       auto& l = s->linear_[il];
       l.conv_state = Alloc<float>(a, conv_elems, error_msg);
       l.state = Alloc<float>(a, state_elems, error_msg);
-      l.conv_snapshots = Alloc<float>(a, spec * conv_elems, error_msg);
-      l.state_snapshots = Alloc<float>(a, spec * state_elems, error_msg);
+      if (spec != 0) {
+        l.conv_snapshots = Alloc<float>(a, spec * conv_elems, error_msg);
+        l.state_snapshots = Alloc<float>(a, spec * state_elems, error_msg);
+      }
     } else {
       auto& at = s->attention_[il];
       at.k_cache = Alloc<__half>(
@@ -390,7 +392,9 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
     const std::size_t hist =
         static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();
     s->ple_history_ = Alloc<float>(a, hist, error_msg);
-    s->ple_snapshots_ = Alloc<float>(a, spec * hist, error_msg);
+    if (spec != 0) {
+      s->ple_snapshots_ = Alloc<float>(a, spec * hist, error_msg);
+    }
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg);
   if (model_->has_mtp()) {
@@ -956,13 +960,15 @@ bool Executor::PleFetch(Session& session, std::span<const std::int32_t> tokens,
   }
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
-  // A speculative batch keeps the hash window after every token.
+  // Only proper prefixes need snapshots; the full batch keeps its live state.
   if (speculative) {
     for (std::uint32_t i = 0; i < n; ++i) {
       HashNgramRows(c, session.ngram_, tokens.subspan(i, 1),
                     std::span<std::uint32_t>(
                         host_rows_.data() + i * c.ple_heads, c.ple_heads));
-      session.ngram_snapshots_[i] = session.ngram_;
+      if (i + 1 < n) {
+        session.ngram_snapshots_[i] = session.ngram_;
+      }
     }
   } else {
     HashNgramRows(c, session.ngram_, tokens,

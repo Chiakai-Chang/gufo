@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -221,6 +222,100 @@ int RunCase(std::uint32_t kTokens) {
         return 1;
       }
     }
+    if (kTokens <= 8) {
+      // Every rollback prefix must match a fresh forward of that prefix.
+      // The final state stays live; no snapshot may be written for it.
+      constexpr std::size_t kGuard = 32;
+      constexpr float kSentinel = 12345.0F;
+      const std::size_t saved = kTokens - 1;
+      HipBuffer<float> state_snaps(saved * kStateCount + kGuard);
+      HipBuffer<float> conv_snaps(saved * kConvState + kGuard);
+      Upload(&state_snaps,
+             std::vector<float>(saved * kStateCount + kGuard, kSentinel));
+      Upload(&conv_snaps,
+             std::vector<float>(saved * kConvState + kGuard, kSentinel));
+      HipBuffer<float> current_state(kStateCount), current_conv(kConvState);
+      HipBuffer<float> current_out(kOut);
+      auto forward = [&](std::uint32_t n, float* ss, float* cs) {
+        Upload(&current_state, state);
+        Upload(&current_conv, conv_state);
+        q::GatedDeltaNet(d_qkv.get(), kChannels, d_z.get(), kZ,
+                         d_alpha_beta.get(), d_conv_w.get(), d_a.get(),
+                         d_dt.get(), d_norm_w.get(), current_conv.get(),
+                         d_scratch.get(), d_qn.get(), d_kn.get(), d_raw.get(),
+                         current_state.get(), current_out.get(), nullptr, ss,
+                         cs, n, kKHeads, kVHeads, kDim, kKernel, false, false,
+                         kEps, nullptr);
+      };
+      forward(kTokens, state_snaps.get(), conv_snaps.get());
+      const auto saved_states =
+          Download(&state_snaps, saved * kStateCount + kGuard);
+      const auto saved_convs =
+          Download(&conv_snaps, saved * kConvState + kGuard);
+      const auto final_state = Download(&current_state, kStateCount);
+      const auto final_out = Download(&current_out, kOut);
+      if (std::memcmp(final_state.data(), states[0].data(),
+                      kStateCount * sizeof(float)) ||
+          std::memcmp(final_out.data(), outs[0].data(), kOut * sizeof(float))) {
+        throw std::runtime_error("GDN snapshots changed the full forward");
+      }
+      for (std::size_t i = 0; i < kGuard; ++i) {
+        if (saved_states[saved * kStateCount + i] != kSentinel ||
+            saved_convs[saved * kConvState + i] != kSentinel) {
+          throw std::runtime_error("GDN wrote an unused final snapshot");
+        }
+      }
+      for (std::uint32_t keep = 1; keep < kTokens; ++keep) {
+        forward(keep, nullptr, nullptr);
+        const auto expected_state = Download(&current_state, kStateCount);
+        const auto expected_conv = Download(&current_conv, kConvState);
+        if (std::memcmp(expected_state.data(),
+                        saved_states.data() + (keep - 1) * kStateCount,
+                        kStateCount * sizeof(float)) ||
+            std::memcmp(expected_conv.data(),
+                        saved_convs.data() + (keep - 1) * kConvState,
+                        kConvState * sizeof(float))) {
+          throw std::runtime_error("GDN rollback prefix changed state");
+        }
+      }
+
+      // The PLE convolution has a dilated history and the same prefix contract.
+      constexpr std::uint32_t kDilation = 2;
+      constexpr std::size_t kPleHistory = (kKernel - 1) * kDilation * kChannels;
+      const auto ple_history = MakeValues(kPleHistory, 0x12873491U, 1.0F);
+      HipBuffer<float> ple_current(kPleHistory), ple_scratch(kPleHistory);
+      HipBuffer<float> ple_out(kQkvCount),
+          ple_snaps(saved * kPleHistory + kGuard);
+      Upload(&ple_snaps,
+             std::vector<float>(saved * kPleHistory + kGuard, kSentinel));
+      auto ple = [&](std::uint32_t n, float* snapshots) {
+        Upload(&ple_current, ple_history);
+        q::PleConv(d_qkv.get(), d_conv_w.get(), ple_current.get(),
+                   ple_scratch.get(), ple_out.get(), snapshots, n, kChannels,
+                   kKernel, kDilation, nullptr);
+      };
+      ple(kTokens, ple_snaps.get());
+      const auto saved_ple = Download(&ple_snaps, saved * kPleHistory + kGuard);
+      const auto full_ple = Download(&ple_current, kPleHistory);
+      const auto full_ple_out = Download(&ple_out, kQkvCount);
+      for (std::size_t i = 0; i < kGuard; ++i) {
+        if (saved_ple[saved * kPleHistory + i] != kSentinel)
+          throw std::runtime_error("PLE wrote an unused final snapshot");
+      }
+      for (std::uint32_t keep = 1; keep <= kTokens; ++keep) {
+        ple(keep, nullptr);
+        const auto expected = Download(&ple_current, kPleHistory);
+        const float* actual = keep == kTokens
+                                  ? full_ple.data()
+                                  : saved_ple.data() + (keep - 1) * kPleHistory;
+        if (std::memcmp(expected.data(), actual, kPleHistory * sizeof(float)))
+          throw std::runtime_error("PLE rollback prefix changed history");
+      }
+      const auto plain_ple_out = Download(&ple_out, kQkvCount);
+      if (std::memcmp(full_ple_out.data(), plain_ple_out.data(),
+                      kQkvCount * sizeof(float)))
+        throw std::runtime_error("PLE snapshots changed the full forward");
+    }
     for (float v : outs[1]) {
       if (!std::isfinite(v)) {
         std::cerr << "row-split output is not finite\n";
@@ -334,11 +429,9 @@ int RunCase(std::uint32_t kTokens) {
 
 int main() {
   try {
-    // 37 tokens: the row-split loop; 99: the chunked route (three full
-    // chunks and a ragged one).
-    // 37 tokens and a batch past two 32-token windows of the row-split
-    // loop's staging.
-    for (std::uint32_t n : {37u, 99u}) {
+    // Short batches cover every rollback prefix and the no-snapshot case.
+    // Longer batches exercise full and ragged recurrence windows.
+    for (std::uint32_t n : {1u, 8u, 37u, 99u}) {
       std::cout << "n=" << n << '\n';
       if (RunCase(n) != 0) {
         return 1;

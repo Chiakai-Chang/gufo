@@ -1333,7 +1333,7 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
       raw[static_cast<std::size_t>(t) * v_heads * d + h * d + j] =
           acc * q_scale;
     }
-    if (snapshots != nullptr) {
+    if (snapshots != nullptr && t + 1 < n_tokens) {
       float* snap = snapshots +
                     (static_cast<std::size_t>(t) * v_heads + h) * d * d +
                     j * d + i0;
@@ -4939,10 +4939,11 @@ void PleConv(const float* in, const float* w, float* history,
   hipLaunchKernelGGL(PleConvKernel, dim3(Blocks(count)), dim3(kThreads), 0,
                      stream, in, w, history, out, n_tokens, channels, kernel,
                      dilation, hist);
-  if (snapshots != nullptr) {
-    hipLaunchKernelGGL(RollingSnapshotKernel, dim3(Blocks(count * hist)),
+  if (snapshots != nullptr && n_tokens > 1) {
+    const std::size_t saved = static_cast<std::size_t>(n_tokens - 1) * channels;
+    hipLaunchKernelGGL(RollingSnapshotKernel, dim3(Blocks(saved * hist)),
                        dim3(kThreads), 0, stream, in, channels, history,
-                       snapshots, n_tokens, channels, hist);
+                       snapshots, n_tokens - 1, channels, hist);
   }
   // Device copies stay kernels: a copy engine transfer is not reliably
   // ordered behind the kernels on this stream.
@@ -4986,11 +4987,12 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                          conv_scratch, n_tokens, channels, kernel);
     }
   }
-  if (conv_snapshots != nullptr) {
+  if (conv_snapshots != nullptr && n_tokens > 1) {
+    const std::size_t saved = static_cast<std::size_t>(n_tokens - 1) * channels;
     hipLaunchKernelGGL(RollingSnapshotKernel,
-                       dim3(Blocks(count * (kernel - 1))), dim3(kThreads), 0,
+                       dim3(Blocks(saved * (kernel - 1))), dim3(kThreads), 0,
                        stream, qkv, qkv_stride, conv_state, conv_snapshots,
-                       n_tokens, channels, kernel - 1);
+                       n_tokens - 1, channels, kernel - 1);
   }
   // The rolling state is the last kernel-1 projections: [history ; qkv].
   const std::uint32_t hist = kernel - 1;
