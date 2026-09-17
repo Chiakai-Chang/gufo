@@ -18,18 +18,18 @@ and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1308.82 | 1332.46 |
-| 4096 | TODO | 1228.18 |
+| 0 | 1308.82 | 1336.08 |
+| 4096 | TODO | 1229.45 |
 | 16384 | TODO | TODO |
 | 32768 | TODO | TODO |
 | 131072 | 1166.53 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 25.22 | 41.40 | 71.0% |
-| Greedy | 4096 | 24.36 | 35.24 | 63.7% |
-| Temperature 0.7 | 0 | TODO | 35.82 | 65.5% |
-| Temperature 0.7 | 4096 | TODO | 48.23 | 93.0% |
+| Greedy | 0 | 25.33 | 41.99 | 71.0% |
+| Greedy | 4096 | 24.45 | 35.69 | 63.7% |
+| Temperature 0.7 | 0 | TODO | 36.50 | 65.5% |
+| Temperature 0.7 | 4096 | TODO | 48.91 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
@@ -99,6 +99,8 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
   batches and replay.
   Q8 vector projections require bitwise agreement across decode and verification
   batch widths, including the 320-by-10240 HC projection and fused gates.
+  Small F32/BF16/F16 projections check FP64 dots, every batch width from
+  one to eight, ragged rows/columns and output guards in the same test.
   Paired Q4_K/Q5_K expert projections require exact numerical agreement with
   separate projections, including ragged rows. Routed vector tests cover
   inactive experts, nonfinite outputs, overwrite guards and batch grouping

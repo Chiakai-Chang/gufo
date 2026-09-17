@@ -5,6 +5,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 #include <type_traits>
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
@@ -867,10 +868,9 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
 /// One wave per weight row, kSmallGemmRows rows per block: the row is read
 /// once (four consecutive elements per lane per step) while up to eight
 /// tokens accumulate in registers, then a wave reduction per token.
-constexpr unsigned kSmallGemmTokens = 8;
-constexpr unsigned kSmallGemmRows = kThreads / 32;
-__global__ void SmallGemmKernel(const void* w, WeightType type, const float* x,
-                                float* out, std::uint32_t n_tokens,
+constexpr unsigned kSmallGemmRows = 4;
+template<WeightType type, unsigned tokens>
+__global__ void SmallGemmKernel(const void* w, const float* x, float* out,
                                 std::uint32_t m, std::uint32_t k) {
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t row =
@@ -880,7 +880,7 @@ __global__ void SmallGemmKernel(const void* w, WeightType type, const float* x,
   }
   const auto* wrow =
       static_cast<const std::uint8_t*>(w) + RowBytes(type, k) * row;
-  float acc[kSmallGemmTokens] = {};
+  float acc[tokens] = {};
   for (std::uint32_t i0 = lane * 4; i0 < k; i0 += warpSize * 4) {
     float wv[4];
 #pragma unroll
@@ -888,22 +888,20 @@ __global__ void SmallGemmKernel(const void* w, WeightType type, const float* x,
       wv[r] = i0 + r < k ? RowElement(wrow, type, i0 + r) : 0.0f;
     }
 #pragma unroll
-    for (unsigned j = 0; j < kSmallGemmTokens; ++j) {
-      if (j < n_tokens) {
-        const float* xr = x + static_cast<std::size_t>(j) * k + i0;
-        float dot = 0.0f;
+    for (unsigned j = 0; j < tokens; ++j) {
+      const float* xr = x + static_cast<std::size_t>(j) * k + i0;
+      float dot = 0.0f;
 #pragma unroll
-        for (unsigned r = 0; r < 4; ++r) {
-          dot += wv[r] * (i0 + r < k ? xr[r] : 0.0f);
-        }
-        acc[j] += dot;
+      for (unsigned r = 0; r < 4; ++r) {
+        dot += wv[r] * (i0 + r < k ? xr[r] : 0.0f);
       }
+      acc[j] += dot;
     }
   }
 #pragma unroll
-  for (unsigned j = 0; j < kSmallGemmTokens; ++j) {
+  for (unsigned j = 0; j < tokens; ++j) {
     const float total = WaveSum(acc[j]);
-    if (lane == 0 && j < n_tokens) {
+    if (lane == 0) {
       out[static_cast<std::size_t>(j) * m + row] = total;
     }
   }
@@ -3398,7 +3396,6 @@ __launch_bounds__(256) __global__
   const std::uint8_t* f_ptr[kWaveRowTiles];
   bool f_live[kWaveRowTiles];
   uint4 f_header[kWaveRowTiles];
-  int f_header_block[kWaveRowTiles];
 #pragma unroll
   for (int u = 0; u < kWaveRowTiles; ++u) {
     const int r =
@@ -3414,7 +3411,6 @@ __launch_bounds__(256) __global__
     f_ptr[u] = weights +
                static_cast<std::size_t>(f_live[u] ? r : (m_i - 1)) * row_bytes;
     f_header[u] = make_uint4(0u, 0u, 0u, 0u);
-    f_header_block[u] = -1;
   }
   // The next stage's weights and activations, fetched one stage ahead. The
   // (scale, bias) pair is derived from the raw header word only when the
@@ -3477,9 +3473,9 @@ __launch_bounds__(256) __global__
         const int block = kb0 / 8;
         const auto* blk =
             reinterpret_cast<const uint4*>(f_ptr[u]) + (block * kBlockChunks);
-        if (block != f_header_block[u]) {
+        // The K sweep enters a new superblock every eight Q8-sized blocks.
+        if (kb0 % 8 == 0) {
           f_header[u] = blk[0];
-          f_header_block[u] = block;
           if constexpr (kQ5K) {
             f_qh[u][0] = blk[1];
             f_qh[u][1] = blk[2];
@@ -4582,16 +4578,55 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
   return true;
 }
 
+template<WeightType type, unsigned tokens>
+void LaunchSmallGemm(const void* w, const float* x, float* out, std::uint32_t m,
+                     std::uint32_t k, hipStream_t stream) {
+  hipLaunchKernelGGL((SmallGemmKernel<type, tokens>),
+                     dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
+                     dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+}
+
+template<WeightType type>
+void SmallGemmForType(const void* w, const float* x, float* out,
+                      std::uint32_t tokens, std::uint32_t m, std::uint32_t k,
+                      hipStream_t stream) {
+  switch (tokens) {
+    case 1:
+      return LaunchSmallGemm<type, 1>(w, x, out, m, k, stream);
+    case 2:
+      return LaunchSmallGemm<type, 2>(w, x, out, m, k, stream);
+    case 3:
+      return LaunchSmallGemm<type, 3>(w, x, out, m, k, stream);
+    case 4:
+      return LaunchSmallGemm<type, 4>(w, x, out, m, k, stream);
+    case 5:
+      return LaunchSmallGemm<type, 5>(w, x, out, m, k, stream);
+    case 6:
+      return LaunchSmallGemm<type, 6>(w, x, out, m, k, stream);
+    case 7:
+      return LaunchSmallGemm<type, 7>(w, x, out, m, k, stream);
+    case 8:
+      return LaunchSmallGemm<type, 8>(w, x, out, m, k, stream);
+    default:
+      throw std::logic_error("small projection requires 1-8 token rows");
+  }
+}
+
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                hipStream_t stream) {
-  for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += kSmallGemmTokens) {
-    const std::uint32_t n = std::min(kSmallGemmTokens, n_tokens - t0);
-    hipLaunchKernelGGL(SmallGemmKernel,
-                       dim3((m + kSmallGemmRows - 1) / kSmallGemmRows),
-                       dim3(kThreads), 0, stream, w, type,
-                       x + static_cast<std::size_t>(t0) * k,
-                       out + static_cast<std::size_t>(t0) * m, n, m, k);
+  switch (type) {
+    case WeightType::kF32:
+      return SmallGemmForType<WeightType::kF32>(w, x, out, n_tokens, m, k,
+                                                stream);
+    case WeightType::kBF16:
+      return SmallGemmForType<WeightType::kBF16>(w, x, out, n_tokens, m, k,
+                                                 stream);
+    case WeightType::kF16:
+      return SmallGemmForType<WeightType::kF16>(w, x, out, n_tokens, m, k,
+                                                stream);
+    default:
+      throw std::logic_error("unsupported small projection format");
   }
 }
 

@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -199,6 +200,92 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
              : 1.0;
 }
 
+// Unquantized router, alpha/beta and indexer projections must keep the same
+// result when a token moves between decode and any verification batch width.
+void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
+  constexpr unsigned tokens = 8;
+  const unsigned element_bytes = type == q::WeightType::kF32 ? 4 : 2;
+  std::vector<std::uint8_t> weights(std::size_t(rows) * cols * element_bytes);
+  std::vector<float> reference_weights(std::size_t(rows) * cols);
+  std::vector<float> input(std::size_t(tokens) * cols);
+  std::uint32_t seed = 0x319F42U;
+  for (std::size_t i = 0; i < reference_weights.size(); ++i) {
+    float value = Uniform(&seed, 0.125F);
+    if (type == q::WeightType::kF32) {
+      std::memcpy(weights.data() + i * 4, &value, 4);
+    } else if (type == q::WeightType::kBF16) {
+      const auto packed =
+          static_cast<std::uint16_t>(std::bit_cast<std::uint32_t>(value) >> 16);
+      std::memcpy(weights.data() + i * 2, &packed, 2);
+      value = std::bit_cast<float>(std::uint32_t(packed) << 16);
+    } else {
+      const __half packed = __float2half(value);
+      std::memcpy(weights.data() + i * 2, &packed, 2);
+      value = __half2float(packed);
+    }
+    reference_weights[i] = value;
+  }
+  for (float& value : input)
+    value = Uniform(&seed, 1.7F);
+  void* dw = nullptr;
+  float* dx = nullptr;
+  float* dy = nullptr;
+  const std::size_t count = std::size_t(tokens) * rows;
+  CheckHip(hipMalloc(&dw, weights.size()), "small weights allocation");
+  CheckHip(hipMalloc(&dx, input.size() * sizeof(float)),
+           "small input allocation");
+  CheckHip(hipMalloc(&dy, (count + 8) * sizeof(float)),
+           "small output allocation");
+  CheckHip(hipMemcpy(dw, weights.data(), weights.size(), hipMemcpyHostToDevice),
+           "small weights upload");
+  CheckHip(hipMemcpy(dx, input.data(), input.size() * sizeof(float),
+                     hipMemcpyHostToDevice),
+           "small input upload");
+  for (unsigned token = 0; token < tokens; ++token)
+    q::SmallGemm(dw, type, dx + token * cols, dy + token * rows, 1, rows, cols,
+                 nullptr);
+  std::vector<float> scalar(count), batch(count + 8), replay(count);
+  CheckHip(hipMemcpy(scalar.data(), dy, count * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "small scalar output");
+  for (unsigned token = 0; token < tokens; ++token) {
+    for (unsigned row = 0; row < rows; ++row) {
+      double expected = 0.0;
+      for (unsigned col = 0; col < cols; ++col)
+        expected += double(reference_weights[std::size_t(row) * cols + col]) *
+                    input[std::size_t(token) * cols + col];
+      const float actual = scalar[std::size_t(token) * rows + row];
+      if (!std::isfinite(actual) || std::abs(double(actual) - expected) >
+                                        2e-5 * (1.0 + std::abs(expected)))
+        throw std::runtime_error(
+            "small projection differs from FP64 reference");
+    }
+  }
+  for (unsigned n = 1; n <= tokens; ++n) {
+    CheckHip(hipMemset(dy, 0xA5, batch.size() * sizeof(float)),
+             "small output poison");
+    q::SmallGemm(dw, type, dx, dy, n, rows, cols, nullptr);
+    CheckHip(hipMemcpy(batch.data(), dy, batch.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "small batch output");
+    if (std::memcmp(scalar.data(), batch.data(),
+                    std::size_t(n) * rows * sizeof(float)))
+      throw std::runtime_error("small projection changes with batch width");
+    for (std::size_t i = std::size_t(n) * rows; i < batch.size(); ++i)
+      if (std::bit_cast<std::uint32_t>(batch[i]) != 0xA5A5A5A5U)
+        throw std::runtime_error("small projection overwrote its output guard");
+  }
+  q::SmallGemm(dw, type, dx, dy, tokens, rows, cols, nullptr);
+  CheckHip(hipMemcpy(replay.data(), dy, count * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "small replay output");
+  if (std::memcmp(scalar.data(), replay.data(), count * sizeof(float)))
+    throw std::runtime_error("small projection replay differs");
+  CheckHip(hipFree(dy), "small output free");
+  CheckHip(hipFree(dx), "small input free");
+  CheckHip(hipFree(dw), "small weights free");
+}
+
 void CheckDecodeGrouping(int rows, int cols) {
   constexpr int tokens = 8;
   const auto w = MakeWeights(rows, cols, 11);
@@ -248,7 +335,8 @@ void CheckDecodeGrouping(int rows, int cols) {
       CheckHip(hipMemcpy(batch.data(), out, n * rows * sizeof(float),
                          hipMemcpyDeviceToHost),
                "batch output");
-      if (std::memcmp(scalar.data(), batch.data(), n * rows * sizeof(float)) != 0)
+      if (std::memcmp(scalar.data(), batch.data(), n * rows * sizeof(float)) !=
+          0)
         throw std::runtime_error(
             "Q8 dense grouping differs: M=" + std::to_string(rows) +
             " K=" + std::to_string(cols) + " N=" + std::to_string(n) +
@@ -264,6 +352,10 @@ void CheckDecodeGrouping(int rows, int cols) {
 
 int main() {
   try {
+    CheckSmallProjection(q::WeightType::kF32, 513, 2560);
+    CheckSmallProjection(q::WeightType::kF32, 96, 2560);
+    CheckSmallProjection(q::WeightType::kBF16, 129, 2560);
+    CheckSmallProjection(q::WeightType::kF16, 7, 131);
     CheckDecodeGrouping(64, 2560);
     CheckDecodeGrouping(320, 10240);
     bool ok = true;
