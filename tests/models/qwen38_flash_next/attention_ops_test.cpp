@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
@@ -94,6 +95,115 @@ std::vector<float> Download(HipBuffer<float>* source, std::size_t count) {
                      hipMemcpyDeviceToHost),
            "download");
   return values;
+}
+
+void CheckPreparation(std::uint32_t n, std::uint32_t start,
+                      std::uint32_t rotary) {
+  constexpr std::uint32_t stride = 2 * (kQWidth + kKvWidth);
+  const std::size_t count = static_cast<std::size_t>(n) * kQWidth;
+  const std::size_t cache_rows = start + n + 2;
+  HipBuffer<float> packed(static_cast<std::size_t>(n) * stride);
+  HipBuffer<float> q_gamma(kDim), k_gamma(kDim);
+  HipBuffer<float> q_ref(count), gate_ref(count), q_out(count), gate_out(count);
+  HipBuffer<float> k(static_cast<std::size_t>(n) * kKvWidth);
+  HipBuffer<float> v(static_cast<std::size_t>(n) * kKvWidth);
+  HipBuffer<__half> k_ref(cache_rows * kKvWidth), v_ref(cache_rows * kKvWidth);
+  HipBuffer<__half> k_out(cache_rows * kKvWidth), v_out(cache_rows * kKvWidth);
+  HipBuffer<std::uint32_t> pos(1);
+  Upload(&packed, MakeValues(static_cast<std::size_t>(n) * stride, 17, 4.0F));
+  auto qg = MakeValues(kDim, 37, 0.5F);
+  auto kg = MakeValues(kDim, 91, 0.5F);
+  for (auto& x : qg)
+    x += 1.0F;
+  for (auto& x : kg)
+    x += 1.0F;
+  Upload(&q_gamma, qg);
+  Upload(&k_gamma, kg);
+
+  struct Capture {
+    hipStream_t stream{nullptr};
+    hipGraph_t graph{nullptr};
+    hipGraphExec_t exec{nullptr};
+    Capture() {
+      CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking),
+               "preparation stream");
+    }
+    ~Capture() {
+      if (exec)
+        (void)hipGraphExecDestroy(exec);
+      if (graph)
+        (void)hipGraphDestroy(graph);
+      (void)hipStreamDestroy(stream);
+    }
+  } capture;
+  const auto same = [&](auto* expected, auto* actual, std::size_t size,
+                        const char* name, std::uint32_t replay) {
+    using T = std::remove_pointer_t<decltype(expected)>;
+    std::vector<T> a(size), b(size);
+    CheckHip(
+        hipMemcpy(a.data(), expected, size * sizeof(T), hipMemcpyDeviceToHost),
+        "preparation reference");
+    CheckHip(
+        hipMemcpy(b.data(), actual, size * sizeof(T), hipMemcpyDeviceToHost),
+        "preparation result");
+    for (std::size_t i = 0; i < size; ++i) {
+      if (std::memcmp(&a[i], &b[i], sizeof(T)) == 0)
+        continue;
+      std::cerr << "preparation n=" << n << " start=" << start
+                << " rotary=" << rotary << " replay=" << replay
+                << " index=" << i << " expected=" << std::hexfloat
+                << static_cast<float>(a[i])
+                << " actual=" << static_cast<float>(b[i]) << std::defaultfloat
+                << '\n';
+      throw std::runtime_error(std::string("attention preparation changed ") +
+                               name);
+    }
+  };
+  for (std::uint32_t replay = 0; replay < 2; ++replay) {
+    const std::vector<std::uint32_t> position{start + replay};
+    Upload(&pos, position);
+    q::UnpackQGate(packed.get(), stride, q_ref.get(), gate_ref.get(), k.get(),
+                   v.get(), n, kHeads, kDim, kKvWidth, nullptr);
+    q::RmsNormRows(q_ref.get(), q_gamma.get(), q_ref.get(), n * kHeads, kDim, 1,
+                   1e-6F, nullptr);
+    q::RmsNormRows(k.get(), k_gamma.get(), k.get(), n * kKvHeads, kDim, 1,
+                   1e-6F, nullptr);
+    q::Rope(q_ref.get(), n, kHeads, kDim, rotary, pos.get(), 1e7F, nullptr);
+    q::Rope(k.get(), n, kKvHeads, kDim, rotary, pos.get(), 1e7F, nullptr);
+    q::StoreKv(k.get(), k_ref.get(), n, kKvWidth, pos.get(), nullptr);
+    q::StoreKv(v.get(), v_ref.get(), n, kKvWidth, pos.get(), nullptr);
+    CheckHip(hipDeviceSynchronize(), "preparation reference ready");
+    if (replay == 0) {
+      CheckHip(
+          hipStreamBeginCapture(capture.stream, hipStreamCaptureModeGlobal),
+          "preparation capture");
+      const bool supported = q::PrepareAttention(
+          packed.get(), stride, q_gamma.get(), k_gamma.get(), q_out.get(),
+          gate_out.get(), k_out.get(), v_out.get(), n, kHeads, kKvHeads, kDim,
+          rotary, pos.get(), 1e7F, 1e-6F, capture.stream);
+      CheckHip(hipStreamEndCapture(capture.stream, &capture.graph),
+               "preparation capture end");
+      if (!supported)
+        throw std::runtime_error("attention preparation rejected geometry");
+      CheckHip(hipGraphInstantiate(&capture.exec, capture.graph, nullptr,
+                                   nullptr, 0),
+               "preparation instantiate");
+    }
+    CheckHip(hipGraphLaunch(capture.exec, capture.stream),
+             "preparation replay");
+    CheckHip(hipStreamSynchronize(capture.stream), "preparation ready");
+    same(q_ref.get(), q_out.get(), count, "queries", replay);
+    same(gate_ref.get(), gate_out.get(), count, "gates", replay);
+    // Include the neighboring cache rows and replay at a new device position.
+    const std::size_t first = start == 0 ? 0 : start - 1;
+    const std::size_t window = (cache_rows - first) * kKvWidth;
+    same(k_ref.get() + first * kKvWidth, k_out.get() + first * kKvWidth, window,
+         "key cache", replay);
+    same(v_ref.get() + first * kKvWidth, v_out.get() + first * kKvWidth, window,
+         "value cache", replay);
+  }
+  std::cout << "attention preparation n=" << n << " start=" << start
+            << " rotary=" << rotary << ": exact, including graph positions\n";
 }
 
 /// Runs the per-token reference and the fused WMMA route over the same
@@ -237,6 +347,10 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
 
 int main() {
   try {
+    CheckPreparation(1, 0, 64);
+    CheckPreparation(8, 4096, 64);
+    CheckPreparation(65, 131069, 64);
+    CheckPreparation(7, 131069, 256);
     struct Case {
       std::uint32_t n_tokens;
       std::uint32_t start_pos;

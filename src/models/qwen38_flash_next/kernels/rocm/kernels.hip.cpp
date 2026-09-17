@@ -1528,6 +1528,105 @@ __global__ void UnpackQGateKernel(const float* qg, std::uint32_t qg_stride,
   }
 }
 
+// Keep each head's original eight-wave reduction. Heads in a block share
+// rotary angles; normalization statistics remain independent.
+template<std::uint32_t kHeadsPerBlock>
+__global__ void PrepareAttentionKernel(
+    const float* __restrict__ packed, std::uint32_t stride,
+    const float* __restrict__ q_gamma, const float* __restrict__ k_gamma,
+    float* __restrict__ q, float* __restrict__ gate,
+    __half* __restrict__ k_cache, __half* __restrict__ v_cache,
+    std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
+    std::uint32_t rotary, const std::uint32_t* start_pos, float theta,
+    float eps) {
+  __shared__ float partial[kHeadsPerBlock][8];
+  __shared__ float norm[kHeadsPerBlock][256];
+  const std::uint32_t t = blockIdx.x, first = blockIdx.y * kHeadsPerBlock,
+                      tid = threadIdx.x;
+  const std::uint32_t lane = tid % 32, wave = tid / 32;
+  const std::uint32_t live = min(kHeadsPerBlock, heads + kv_heads - first);
+  const std::size_t width = std::size_t(heads) * d,
+                    kv_width = std::size_t(kv_heads) * d;
+  const float* row = packed + std::size_t(t) * stride;
+  float values[kHeadsPerBlock];
+#pragma unroll
+  for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
+    const std::uint32_t h = first + j;
+    const bool query = h < heads;
+    const std::uint32_t head = query ? h : h - heads;
+    values[j] = j < live && tid < d
+                    ? row[(query ? head * 2 * d : 2 * width + head * d) + tid]
+                    : 0.0f;
+    float ss = values[j] * values[j];
+    // Match the separate RMS kernel's rounded square before its reduction.
+    // Otherwise fast-math can contract it with the first shuffle addition.
+    asm volatile("" : "+v"(ss));
+    ss = WaveSum(ss);
+    if (lane == 0)
+      partial[j][wave] = ss;
+  }
+  __syncthreads();
+#pragma unroll
+  for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
+    if (j >= live)
+      continue;
+    const std::uint32_t h = first + j;
+    const bool query = h < heads;
+    const std::uint32_t head = query ? h : h - heads;
+    float total = 0.0f;
+    for (int w = 0; w < static_cast<int>(blockDim.x / warpSize); ++w)
+      total += partial[j][w];
+    const float scale = rsqrtf(total / static_cast<float>(d) + eps);
+    const float* gamma = query ? q_gamma : k_gamma;
+    if (tid < d) {
+      norm[j][tid] = values[j] * scale * (gamma != nullptr ? gamma[tid] : 1.0f);
+      if (query)
+        gate[std::size_t(t) * width + head * d + tid] =
+            row[head * 2 * d + d + tid];
+      else
+        v_cache[std::size_t(*start_pos + t) * kv_width + head * d + tid] =
+            __float2half(row[2 * width + kv_width + head * d + tid]);
+    }
+  }
+  __syncthreads();
+  const std::uint32_t half = rotary / 2;
+  float sine = 0.0f, cosine = 0.0f;
+  if (tid < half) {
+    const float freq = powf(
+        theta, -2.0f * static_cast<float>(tid) / static_cast<float>(rotary));
+    sincosf(static_cast<float>(*start_pos + t) * freq, &sine, &cosine);
+  }
+#pragma unroll
+  for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
+    if (j >= live)
+      continue;
+    const std::uint32_t h = first + j;
+    const bool query = h < heads;
+    const std::uint32_t head = query ? h : h - heads;
+    if (tid < half) {
+      const float a = norm[j][tid], b = norm[j][tid + half];
+      const float lo = __fmaf_rn(a, cosine, -__fmul_rn(b, sine)),
+                  hi = __fmaf_rn(a, sine, __fmul_rn(b, cosine));
+      if (query) {
+        q[std::size_t(t) * width + head * d + tid] = lo;
+        q[std::size_t(t) * width + head * d + tid + half] = hi;
+      } else {
+        k_cache[std::size_t(*start_pos + t) * kv_width + head * d + tid] =
+            __float2half(lo);
+        k_cache[std::size_t(*start_pos + t) * kv_width + head * d + tid +
+                half] = __float2half(hi);
+      }
+    }
+    if (tid >= rotary && tid < d) {
+      if (query)
+        q[std::size_t(t) * width + head * d + tid] = norm[j][tid];
+      else
+        k_cache[std::size_t(*start_pos + t) * kv_width + head * d + tid] =
+            __float2half(norm[j][tid]);
+    }
+  }
+}
+
 __global__ void RopeKernel(float* x, std::uint32_t heads, std::uint32_t d,
                            std::uint32_t rotary_dim,
                            const std::uint32_t* start_pos, float theta) {
@@ -4754,6 +4853,36 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
                  hipStream_t stream) {
   hipLaunchKernelGGL(UnpackQGateKernel, dim3(n_tokens), dim3(kThreads), 0,
                      stream, qg, qg_stride, q, gate, k, v, heads, d, kv_width);
+}
+
+bool PrepareAttention(const float* packed, std::uint32_t stride,
+                      const float* q_gamma, const float* k_gamma, float* q,
+                      float* gate, __half* k_cache, __half* v_cache,
+                      std::uint32_t n_tokens, std::uint32_t heads,
+                      std::uint32_t kv_heads, std::uint32_t d,
+                      std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                      float theta, float eps, hipStream_t stream) {
+  if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
+      rotary_dim % 2 != 0 || heads == 0 || kv_heads == 0 ||
+      stride < static_cast<std::size_t>(2) * (heads + kv_heads) * d) {
+    return false;
+  }
+  if (n_tokens == 0)
+    return true;
+  if (n_tokens < 32) {
+    hipLaunchKernelGGL((PrepareAttentionKernel<1>),
+                       dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
+                       stream, packed, stride, q_gamma, k_gamma, q, gate,
+                       k_cache, v_cache, heads, kv_heads, d, rotary_dim,
+                       start_pos, theta, eps);
+  } else {
+    hipLaunchKernelGGL((PrepareAttentionKernel<4>),
+                       dim3(n_tokens, (heads + kv_heads + 3) / 4),
+                       dim3(kThreads), 0, stream, packed, stride, q_gamma,
+                       k_gamma, q, gate, k_cache, v_cache, heads, kv_heads, d,
+                       rotary_dim, start_pos, theta, eps);
+  }
+  return true;
 }
 
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,

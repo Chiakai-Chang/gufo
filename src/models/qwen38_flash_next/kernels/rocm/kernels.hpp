@@ -252,6 +252,16 @@ void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,
                  std::uint32_t heads, std::uint32_t d, std::uint32_t kv_width,
                  hipStream_t stream);
 
+/// Unpacks a stacked Q/gate/K/V projection, normalizes and rotates Q/K,
+/// and writes the F16 caches. Returns false for heads wider than 256.
+bool PrepareAttention(const float* packed, std::uint32_t stride,
+                      const float* q_gamma, const float* k_gamma, float* q,
+                      float* gate, __half* k_cache, __half* v_cache,
+                      std::uint32_t n_tokens, std::uint32_t heads,
+                      std::uint32_t kv_heads, std::uint32_t d,
+                      std::uint32_t rotary_dim, const std::uint32_t* start_pos,
+                      float theta, float eps, hipStream_t stream);
+
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
 /// session's control block) so a captured decode graph replays at any

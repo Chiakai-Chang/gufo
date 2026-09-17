@@ -1059,13 +1059,21 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          std::string* error_msg) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
+  bool prepared = false;
   if (!l.attn_qkv.empty()) {
-    // One GEMV yields [q|gate ; k ; v] per row; the unpack splits it.
+    // The stacked projection feeds normalization, rotation and cache writes.
     if (!Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
       return false;
     }
-    UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
-                n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
+    prepared = PrepareAttention(s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(),
+                                l.attn_k_norm.f32(), s_.q, s_.attn_gate,
+                                s.k_cache, s.v_cache, n_tokens, c.num_heads,
+                                c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
+                                c.rope_theta, c.rms_eps, stream_);
+    if (!prepared) {
+      UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
+                  n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
+    }
   } else {
     Q8Input xq;
     if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
@@ -1077,16 +1085,18 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
                 nullptr, n_tokens, c.num_heads, c.head_dim, 0, stream_);
   }
-  RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
-              c.head_dim, 1, c.rms_eps, stream_);
-  RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
-              c.head_dim, 1, c.rms_eps, stream_);
-  Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
-       stream_);
-  Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
-       c.rope_theta, stream_);
-  StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
-  StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
+  if (!prepared) {
+    RmsNormRows(s_.q, l.attn_q_norm.f32(), s_.q, n_tokens * c.num_heads,
+                c.head_dim, 1, c.rms_eps, stream_);
+    RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
+                c.head_dim, 1, c.rms_eps, stream_);
+    Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
+         c.rope_theta, stream_);
+    Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
+         c.rope_theta, stream_);
+    StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
+    StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
+  }
 
   // Raw indexer keys are always cached: a later chunk past the budget
   // pools them into block keys. The draft block keeps no indexer cache.

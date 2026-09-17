@@ -18,18 +18,18 @@ and adapts between one and seven drafts from committed acceptance history.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1352.29 | 1378.10 |
-| 4096 | TODO | 1267.15 |
+| 0 | 1362.35 | 1396.85 |
+| 4096 | TODO | 1281.12 |
 | 16384 | TODO | TODO |
 | 32768 | TODO | TODO |
-| 131072 | 1202.12 | TODO |
+| 131072 | 1212.16 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 25.86 | 42.27 | 71.0% |
-| Greedy | 4096 | 24.91 | 35.96 | 63.7% |
-| Temperature 0.7 | 0 | TODO | 36.53 | 65.5% |
-| Temperature 0.7 | 4096 | TODO | 49.13 | 93.0% |
+| Greedy | 0 | 26.12 | 42.67 | 71.0% |
+| Greedy | 4096 | 25.18 | 36.22 | 63.7% |
+| Temperature 0.7 | 0 | TODO | 36.82 | 65.5% |
+| Temperature 0.7 | 4096 | TODO | 49.56 | 93.0% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
@@ -37,7 +37,7 @@ Other depth and concurrent throughput measurements: TODO. Serving interleaves
 sessions but does not batch model work; `gufo bench` supports C1 for this model.
 AR PP uses one 133,121-token context limit throughout; AR TG uses 4,225
 and MTP PP/greedy TG use 6,145 (sampled TG: 4,225).
-AR PP loses 11.1% from d0 to d128K. Near-flat throughput across that range
+AR PP loses 11.0% from d0 to d128K. Near-flat throughput across that range
 remains TODO. Sparse attention and selection are the main depth-dependent
 costs. Fresh-load performance variation remains under investigation.
 
@@ -91,7 +91,8 @@ build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_session_test \
   Wave64 prefill projections check every output against MMQ, sampled FP64
   dots at the production shape and bitwise replay.
   Attention checks bounded and wider masks near 128K, ragged head tiles and
-  bitwise replay.
+  bitwise replay. Fused preparation must exactly match separate normalization,
+  rotation and cache writes, including changing positions during graph replay.
   Indexer pooling checks FP64 formulas, block boundaries and replay;
   selection checks exact masks, ties and deep contexts. Mixer checks include
   independent F16/Q8 outputs and optional inject weights. Fused HC projections
