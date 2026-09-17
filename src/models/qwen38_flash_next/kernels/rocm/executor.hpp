@@ -379,10 +379,13 @@ private:
   Session::Control* control_host_{nullptr};
   std::int32_t* tokens_host_{nullptr};
   std::uint32_t* counts_host_{nullptr};
-  std::int32_t* tiles_host_{nullptr};           ///< routed tile map staging
-  mutable std::uint32_t routed_max_rows_{0};    ///< 0 = no readback yet
-  mutable std::uint32_t routed_n_tiles_{0};     ///< down projection tiles
-  mutable std::uint32_t routed_gate_tiles_{0};  ///< appended gate/up tiles
+  std::int32_t* tiles_host_{nullptr};         ///< routed tile map staging
+  mutable std::uint32_t routed_max_rows_{0};  ///< 0 = no readback yet
+  mutable std::uint32_t routed_n_tiles_{0};   ///< down projection tiles
+  mutable std::uint32_t routed_64_tiles_{0};  ///< appended 64-token tiles
+  mutable std::uint32_t routed_pair_offset_{0};
+  mutable std::uint32_t routed_pair_tiles_{0};
+  mutable std::uint32_t routed_pair_rows_{64};
   mutable std::uint32_t routed_tile_rows_{48};  ///< token rows per tile
   mutable std::size_t routed_compact_rows_{0};  ///< sum of padded buckets
   mutable int routed_tile_cols_{0};

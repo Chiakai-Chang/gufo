@@ -374,41 +374,55 @@ Result Run(q::WeightType type, std::size_t n_tokens, std::size_t used,
         std::memcpy(up.data() + b + offset, &scale, sizeof(scale));
       }
     }
-    std::vector<std::int32_t> gate_tiles;
-    for (std::size_t e = 0; e < experts; ++e) {
-      const std::uint32_t padded = (counts[e] + 15u) / 16u * 16u;
-      for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
-        gate_tiles.push_back(static_cast<std::int32_t>(e | (j << 16)));
-    }
-    auto* d_gate_tiles = Upload(gate_tiles);
     auto* d_up = Upload(up);
     auto* d_pair = Upload(std::vector<__half>(slots * m, __float2half(0.0F)));
     if (!q::RoutedF16Gemm(d_up, type, d_x_half, d_tiles,
                           static_cast<std::uint32_t>(tiles.size()), tile_rows,
                           d_bounds, d_rows_token, d_rows_slot, d_f16, nullptr,
-                          d_f16_half, m, k, nullptr) ||
-        !q::RoutedGatedF16Gemm(d_w, d_up, type, d_x_half, d_gate_tiles,
-                               static_cast<std::uint32_t>(gate_tiles.size()),
-                               d_bounds, d_rows_token, d_rows_slot, d_pair, m,
-                               k, nullptr)) {
-      throw std::runtime_error("paired routed SwiGLU launch failed");
+                          d_f16_half, m, k, nullptr)) {
+      throw std::runtime_error("separate routed SwiGLU launch failed");
     }
     const auto separate = Download(d_f16_half, slots * m);
-    const auto paired = Download(d_pair, slots * m);
-    for (std::size_t i = 0; i < paired.size(); ++i) {
-      const float a = __half2float(separate[i]);
-      const float b = __half2float(paired[i]);
-      // Fast-math permits either sign of zero; every numerical value must
-      // match exactly, including subnormal F16 values.
-      if (!std::isfinite(a) || !std::isfinite(b) || a != b) {
-        throw std::runtime_error("paired routed SwiGLU differs at " +
-                                 std::to_string(i) + ": " + std::to_string(a) +
-                                 " vs " + std::to_string(b));
+    for (std::uint32_t pair_rows : {64U, 128U}) {
+      std::vector<std::int32_t> gate_tiles;
+      for (std::size_t e = 0; e < experts; ++e) {
+        for (std::uint32_t j = 0; j < (counts[e] + pair_rows - 1) / pair_rows;
+             ++j) {
+          gate_tiles.push_back(static_cast<std::int32_t>(e | (j << 16)));
+        }
       }
+      auto* d_gate_tiles = Upload(gate_tiles);
+      auto launch_pair = [&] {
+        if (!q::RoutedGatedF16Gemm(
+                d_w, d_up, type, d_x_half, d_gate_tiles,
+                static_cast<std::uint32_t>(gate_tiles.size()), pair_rows,
+                d_bounds, d_rows_token, d_rows_slot, d_pair, m, k, nullptr)) {
+          throw std::runtime_error("paired routed SwiGLU launch failed");
+        }
+      };
+      launch_pair();
+      const auto paired = Download(d_pair, slots * m);
+      for (std::size_t i = 0; i < paired.size(); ++i) {
+        const float a = __half2float(separate[i]);
+        const float b = __half2float(paired[i]);
+        // The independent epilogue permits either sign of zero; every
+        // numerical value must match, including subnormal F16 values.
+        if (!std::isfinite(a) || !std::isfinite(b) || a != b) {
+          throw std::runtime_error(
+              "paired routed SwiGLU differs at " + std::to_string(i) + ": " +
+              std::to_string(a) + " vs " + std::to_string(b));
+        }
+      }
+      launch_pair();
+      const auto replay = Download(d_pair, slots * m);
+      if (std::memcmp(paired.data(), replay.data(),
+                      paired.size() * sizeof(__half)) != 0) {
+        throw std::runtime_error("paired routed SwiGLU replay changed bits");
+      }
+      CheckHip(hipFree(d_gate_tiles), "paired tile map free");
     }
     CheckHip(hipFree(d_up), "paired up free");
     CheckHip(hipFree(d_pair), "paired output free");
-    CheckHip(hipFree(d_gate_tiles), "paired tile map free");
   }
 
   Result r{0.0, 0.0, 0.0, 0.0};

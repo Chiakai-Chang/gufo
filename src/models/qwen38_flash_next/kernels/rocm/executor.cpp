@@ -275,7 +275,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.rows_token = Alloc<std::int32_t>(a, compact, error_msg);
     s.rows_slot = Alloc<std::int32_t>(a, compact, error_msg);
     s.routed_tiles =
-        Alloc<std::int32_t>(a, 2 * RoutedTileCapacity(slots, c), error_msg);
+        Alloc<std::int32_t>(a, 3 * RoutedTileCapacity(slots, c), error_msg);
   }
   s.weights = f32(slots);
   s.gate_e = f32(slots * c.expert_ff);
@@ -307,7 +307,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     }
     e->counts_host_ = static_cast<std::uint32_t*>(counts);
     void* tiles = nullptr;
-    if (!Check(hipHostMalloc(&tiles, 2 * RoutedTileCapacity(slots, c) *
+    if (!Check(hipHostMalloc(&tiles, 3 * RoutedTileCapacity(slots, c) *
                                          sizeof(std::int32_t)),
                "pinned routed tile map", error_msg)) {
       return nullptr;
@@ -648,7 +648,10 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   // per layer), which also lets the tile width follow the distribution.
   const Config& c = config();
   routed_max_rows_ = 0;
-  routed_gate_tiles_ = 0;
+  routed_64_tiles_ = 0;
+  routed_pair_tiles_ = 0;
+  routed_pair_offset_ = 0;
+  routed_pair_rows_ = 64;
   if (n_tokens <= 4 * kVecBatch) {
     return true;
   }
@@ -680,15 +683,32 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   }
   routed_max_rows_ = std::max<std::uint32_t>(1, max_rows);
   routed_n_tiles_ = n_tiles;
-  // Append the 64-token map to the same upload. Gate/up always uses it;
-  // Q5_1 down can reuse it when it does not add padded computation.
+  // Append the 64-token map for gate/up and eligible Q5_1 down projections.
+  // Wide expert buckets also get a 128-token gate/up map: it amortizes
+  // weight decoding, while short buckets retain the cheaper 64-token tile.
   if (n_tokens >= 1024 && routed_tile_rows_ == kRoutedTileRowsWide) {
     for (std::uint32_t e = 0; e < c.num_experts; ++e) {
       const std::uint32_t padded = (counts_host_[e] + 15u) / 16u * 16u;
       for (std::uint32_t j = 0; j < (padded + 63u) / 64u; ++j)
         tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
     }
-    routed_gate_tiles_ = n_tiles - routed_n_tiles_;
+    routed_64_tiles_ = n_tiles - routed_n_tiles_;
+    routed_pair_offset_ = routed_n_tiles_;
+    routed_pair_tiles_ = routed_64_tiles_;
+    std::uint32_t tiles_128 = 0;
+    for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+      tiles_128 += (counts_host_[e] + 127u) / 128u;
+    }
+    if (tiles_128 * 4 <= routed_64_tiles_ * 3) {
+      routed_pair_rows_ = 128;
+      routed_pair_offset_ = n_tiles;
+      routed_pair_tiles_ = tiles_128;
+      for (std::uint32_t e = 0; e < c.num_experts; ++e) {
+        for (std::uint32_t j = 0; j < (counts_host_[e] + 127u) / 128u; ++j) {
+          tiles_host_[n_tiles++] = static_cast<std::int32_t>(e | (j << 16));
+        }
+      }
+    }
   }
   routed_compact_rows_ = std::max<std::size_t>(16, compact);
   routed_tile_cols_ = qfn_mmq_routed_tile_cols_for_counts(
@@ -1242,9 +1262,9 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
         n_tokens >= 1024 && routed_tile_rows_ == 48
             ? RoutedGatedF16Gemm(
                   l.ffn_gate_exps.data, l.ffn_up_exps.data, gate_type, x_half,
-                  s_.routed_tiles + routed_n_tiles_, routed_gate_tiles_,
-                  s_.routed_bounds, s_.rows_token, s_.rows_slot, up_half,
-                  c.expert_ff, c.hidden_size, stream_)
+                  s_.routed_tiles + routed_pair_offset_, routed_pair_tiles_,
+                  routed_pair_rows_, s_.routed_bounds, s_.rows_token,
+                  s_.rows_slot, up_half, c.expert_ff, c.hidden_size, stream_)
             : (RoutedF16Gemm(l.ffn_gate_exps.data, gate_type, x_half,
                              s_.routed_tiles, routed_n_tiles_,
                              routed_tile_rows_, s_.routed_bounds, s_.rows_token,
@@ -1265,13 +1285,13 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
     // Larger Q5_1 tiles amortize weight decoding. Use them only when the
     // existing 64-token map has no more padded rows than the 48-token map.
     const bool wide_down = down_type == WeightType::kQ5_1 &&
-                           routed_tile_rows_ == 48 && routed_gate_tiles_ != 0 &&
-                           routed_gate_tiles_ * 4 <= routed_n_tiles_ * 3;
+                           routed_tile_rows_ == 48 && routed_64_tiles_ != 0 &&
+                           routed_64_tiles_ * 4 <= routed_n_tiles_ * 3;
     // The down projection's rows are F16 too: the epilogue reads half the
     // bytes of the largest routed intermediate.
     if (!RoutedF16Gemm(l.ffn_down_exps.data, down_type, up_half,
                        s_.routed_tiles + (wide_down ? routed_n_tiles_ : 0),
-                       wide_down ? routed_gate_tiles_ : routed_n_tiles_,
+                       wide_down ? routed_64_tiles_ : routed_n_tiles_,
                        wide_down ? 64 : routed_tile_rows_, s_.routed_bounds,
                        s_.rows_slot, s_.rows_slot, nullptr, nullptr,
                        reinterpret_cast<__half*>(s_.down_e), c.hidden_size,
