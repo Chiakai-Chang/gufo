@@ -497,7 +497,10 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   c["text"] = res.text;
   c["index"] = 0;
   c["logprobs"] = json::Value();
-  c["finish_reason"] = "stop";
+  c["finish_reason"] =
+      res.finish_reason == TextGenerationBackend::FinishReason::kLength
+          ? "length"
+          : "stop";
   choices.push_back(std::move(c));
   resp["choices"] = std::move(choices);
   resp["usage"] = UsageJson(res);
