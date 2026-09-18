@@ -28,94 +28,67 @@ change. Weights, cache precision and sampling are unchanged.
 
 ## Performance
 
-Nix release builds, C1, pp2048, tg128, seed 1, one measured repetition
-(2026-09-17 UTC). The CLI benchmark uses deterministic repetitive text.
-Prefill is warmed before measurement; depth precedes the measured operation.
-Rates are tok/s. Fixed-length generation continues past EOS. AR measurements
-are from `8e60594`; MTP measurements include sampled proposals.
+Nix release, C1, pp2048, tg128, seed 1, one measured repetition
+(2026-09-18 UTC). The CLI uses deterministic repetitive text, warms prefill
+and continues generation past EOS. Depth precedes the measured operation.
+Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1462.41 | 1496.14 |
-| 4096 | TODO | 1372.44 |
+| 0 | 1484.98 | 1506.11 |
+| 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
-| 32768 | 1378.66 | TODO |
-| 65536 | 1340.91 | TODO |
-| 131072 | 1304.59 | TODO |
+| 32768 | 1394.13 | TODO |
+| 65536 | TODO | TODO |
+| 131072 | 1321.20 | TODO |
 
-| Sampling | Depth | AR tg128 | MTP tg128 | Acceptance |
+| Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.19 | 43.04 | 71.0% |
-| Greedy | 4096 | 25.22 | 36.61 | 63.7% |
-| Temperature 0.7 | 0 | 25.56 | 43.48 | 75.9% |
-| Temperature 0.7 | 4096 | 24.86 | 38.89 | 67.7% |
+| Greedy | 0 | 26.09 | 42.99 | 71.0% |
+| Greedy | 32768 | 23.94 | TODO | TODO |
+| Temperature 0.7 | 0 | TODO | 44.13 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
-| Temperature 1.0, top-p 0.95 | 4096 | TODO | TODO | TODO |
 
-Other depth and concurrent throughput measurements: TODO. Serving interleaves
-sessions but does not batch model work; `gufo bench` supports C1 for this model.
-AR PP uses one 133,121-token context limit throughout; AR TG uses 4,225
-and all MTP measurements use 6,145. The target is **1700 tok/s pp2048**;
-reaching it and retaining near-flat throughput through d128K remain TODO.
-The measured d0-to-d128K decline is 10.8%.
-At d32K, the latest profile attributes about 763 ms to expert/dense
-projections and 147 ms to attention, out of 1481 ms GPU time.
-
-HTTP prefill controls use 2048-token excerpts of `docs/PERFORMANCE.md` and
-`src/models/qwen38_flash_next/ngram.cpp` at `3ee6aea`, context 4096,
-one untimed warm request, and one output token. All have zero cached prefix
-tokens. Revised requests change the beginning but reuse most PLE rows.
-
-| HTTP input | PP tok/s |
-| --- | ---: |
-| Documentation | 1362.48 |
-| Code | 1359.27 |
-| Revised documentation | 1403.44 |
-| Revised code | 1395.72 |
-
-HTTP MTP generation, context 6145, temperature 0.7, seeds 1–4, one warm
-request per input and a reused prompt cache. Each measured request emits
-128 tokens. Rates divide total output tokens by total decode time.
-
-| HTTP input | Prompt tokens | TG tok/s | Acceptance |
-| --- | ---: | ---: | ---: |
-| Repetitive completion | 3891 | 57.32 | 100.0% |
-| Python merge function, chat | 33 | 47.77 | 78.2% |
-
-Sampling changes the generated path, so speed and acceptance vary by seed.
-The CLI temperature-0.7 ranges over seeds 1–3 are 38.28–43.48 tok/s at d0
-and 36.86–38.89 at d4K. Very short, EOS-limited replies are not steady
-generation measurements.
+AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
+The d32K TG control uses 34,945. MTP TG measurements use the same decoding
+kernels; the latest QKV tuning applies only to wide prefill.
+The targets are **1700 tok/s pp2048** and near-flat PP through d128K;
+both remain TODO. The measured d0-to-d128K decline is 11.0%.
+Refreshed HTTP and concurrent throughput: TODO.
+Serving interleaves sessions but does not batch model work;
+`gufo bench` supports C1 for this model.
 
 ```sh
 ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \
   -d 0,4096 --temperature 0 --seed 1 -v
 ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \
-  -d 0,4096 --temperature 0 --seed 1 -v \
+  -d 0,4096 --temperature 0.7 --seed 1 -v \
   --speculative mtp --mtp-model "$MTP"
 ```
 
-Internal chunks use 2048 tokens, selected by a 512–4096 sweep. HTTP accepts
-arbitrary prompt lengths and yields between chunks. Resident readers gather
-PLE rows while layer 0 runs, including graph replay. Large gathers read in
-file order; a bounded cache retains original compressed bytes.
-Projection plans and exact sparse selections are deterministic.
+Internal prefill chunks use 2048 tokens, selected by a 512–4096 sweep.
+HTTP accepts arbitrary prompt lengths and yields between chunks. PLE reads
+overlap layer 0; its bounded cache retains original compressed rows.
 The [projection sweep](tools/projection_plans.hip) uses `tools/bench/build.sh`;
 `tools/prof/prof.py run --stages qwen-flash --` profiles a release command
-inside `nix develop`. Profiler throughput is not a benchmark result.
+inside `nix develop`.
 
-`prompt`, `chat` and `serve llm` share MTP and sampling options. Greedy
-decoding uses full-vocabulary argmax drafts. Temperature sampling draws
-from 64 MTP candidates with the request's filters and penalties. GPU
-verification uses the full target vocabulary: accept with `min(1, p/q)`,
-otherwise sample normalized `max(p-q, 0)`. The correction becomes the next
-batch's anchor. Compact draft support never truncates the target.
+`prompt`, `chat` and `serve llm` share MTP and sampling options. Greedy uses
+full-vocabulary argmax drafts. Temperature sampling draws from 64 MTP
+candidates with the request's filters and penalties. GPU verification uses
+the full target vocabulary: accept with `min(1, p/q)`, otherwise draw from
+normalized `max(p-q, 0)`. The correction becomes the next batch's anchor.
+Compact draft support never truncates the target.
 
-Adaptive MTP is the default;
-`--draft-tokens` caps the chain at 1–7 drafts. The controller uses committed
-acceptance history, counts only the first rejection as a failure, and resets
-with the session. Snapshots preserve its state; new HTTP requests reset it
-when reusing context. Decisions never depend on wall-clock timings.
+Adaptive MTP is the default; `--draft-tokens` caps the chain at 1–7 drafts.
+Decisions use committed acceptance history and reset with the session.
+Snapshots preserve this state; new HTTP requests reset it when reusing
+context. Decisions never depend on wall-clock timings.
+
+Retained optimizations: exact SSM/QKV projection tiling, exact partial top-64
+selection, GPU verification logits with one frontier readback, and parallel
+unordered verification with the original F32 sum order. Six-wave and
+per-query sparse-attention experiments were exact but slower and were rejected.
 
 ## Quality checks
 

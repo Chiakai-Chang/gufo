@@ -475,6 +475,206 @@ __global__ void LinearSpeculativeSamplingKernel(
   }
 }
 
+// Preserve the linear sampler's 256 contiguous segments and sequential F32
+// additions, while distributing loads and exponentials across the GPU.
+// This workspace reuses the unused sorted token IDs on the unordered route.
+struct SpeculativeSegments {
+  float maxima[kSamplingThreads];
+  float target_sums[kSamplingThreads];
+  float residual_sums[kSamplingThreads];
+  float target_total;
+};
+
+constexpr std::size_t kSpeculativeSegmentThreads = 128;
+
+__global__ void SpeculativeSegmentMaxKernel(
+    const float* __restrict__ logits, SpeculativeSegments* __restrict__ scratch,
+    std::size_t vocab_size) {
+  __shared__ float maxima[kSpeculativeSegmentThreads];
+  const std::size_t begin = (vocab_size * blockIdx.x) / kSamplingThreads;
+  const std::size_t end = (vocab_size * (blockIdx.x + 1U)) / kSamplingThreads;
+  float maximum = -INFINITY;
+  for (std::size_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+    if (isfinite(logits[i]))
+      maximum = fmaxf(maximum, logits[i]);
+  }
+  maxima[threadIdx.x] = maximum;
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2U; stride > 0; stride /= 2U) {
+    if (threadIdx.x < stride)
+      maxima[threadIdx.x] =
+          fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    scratch->maxima[blockIdx.x] = maxima[0];
+}
+
+__global__ void SpeculativeSegmentWeightsKernel(
+    const float* __restrict__ logits, float* __restrict__ weights,
+    SpeculativeSegments* __restrict__ scratch, std::size_t vocab_size,
+    float temperature, float min_p) {
+  extern __shared__ float values[];
+  __shared__ float maxima[kSpeculativeSegmentThreads];
+  maxima[threadIdx.x] =
+      fmaxf(scratch->maxima[threadIdx.x],
+            scratch->maxima[threadIdx.x + kSpeculativeSegmentThreads]);
+  __syncthreads();
+  for (std::size_t stride = blockDim.x / 2U; stride > 0; stride /= 2U) {
+    if (threadIdx.x < stride)
+      maxima[threadIdx.x] =
+          fmaxf(maxima[threadIdx.x], maxima[threadIdx.x + stride]);
+    __syncthreads();
+  }
+  const float maximum = maxima[0];
+  const float min_p_threshold =
+      min_p > 0.0F ? maximum + logf(min_p) : -INFINITY;
+  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
+  const std::size_t begin = (vocab_size * blockIdx.x) / kSamplingThreads;
+  const std::size_t end = (vocab_size * (blockIdx.x + 1U)) / kSamplingThreads;
+  for (std::size_t i = begin + threadIdx.x; i < end; i += blockDim.x) {
+    const float value = logits[i];
+    const float weight = isfinite(value) && value >= min_p_threshold
+                             ? expf((value - maximum) * inverse_temperature)
+                             : 0.0F;
+    weights[i] = weight;
+    values[i - begin] = weight;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float sum = 0.0F;
+    for (std::size_t i = 0; i < end - begin; ++i)
+      sum += values[i];
+    scratch->target_sums[blockIdx.x] = sum;
+  }
+}
+
+__global__ void SpeculativeSegmentResidualKernel(
+    const float* __restrict__ weights,
+    const float* __restrict__ draft_probabilities,
+    SpeculativeSegments* __restrict__ scratch, std::size_t vocab_size,
+    std::uint32_t draft_token, float draft_token_probability,
+    float acceptance_uniform, std::uint32_t* __restrict__ out_token,
+    std::uint32_t* __restrict__ out_accepted) {
+  extern __shared__ float values[];
+  __shared__ float sums[kSamplingThreads];
+  __shared__ float target_total;
+  __shared__ bool accepted;
+  sums[threadIdx.x] = scratch->target_sums[threadIdx.x];
+  sums[threadIdx.x + kSpeculativeSegmentThreads] =
+      scratch->target_sums[threadIdx.x + kSpeculativeSegmentThreads];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    target_total = 0.0F;
+    for (std::size_t i = 0; i < kSamplingThreads; ++i)
+      target_total += sums[i];
+    const float draft_weight =
+        draft_token < vocab_size ? weights[draft_token] : 0.0F;
+    accepted = acceptance_uniform * draft_token_probability <
+               draft_weight / target_total;
+    if (blockIdx.x == 0) {
+      *out_accepted = accepted ? 1U : 0U;
+      scratch->target_total = target_total;
+      if (accepted)
+        *out_token = draft_token;
+    }
+  }
+  __syncthreads();
+  if (accepted)
+    return;
+  const std::size_t begin = (vocab_size * blockIdx.x) / kSamplingThreads;
+  const std::size_t end = (vocab_size * (blockIdx.x + 1U)) / kSamplingThreads;
+  for (std::size_t i = begin + threadIdx.x; i < end; i += blockDim.x)
+    values[i - begin] =
+        fmaxf(weights[i] - draft_probabilities[i] * target_total, 0.0F);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float sum = 0.0F;
+    for (std::size_t i = 0; i < end - begin; ++i)
+      sum += values[i];
+    scratch->residual_sums[blockIdx.x] = sum;
+  }
+}
+
+__global__ void SpeculativeSegmentSelectKernel(
+    const float* __restrict__ weights,
+    const float* __restrict__ draft_probabilities,
+    const SpeculativeSegments* __restrict__ scratch, std::size_t vocab_size,
+    float residual_uniform, std::uint32_t* __restrict__ out_token,
+    const std::uint32_t* __restrict__ out_accepted) {
+  if (*out_accepted != 0)
+    return;
+  extern __shared__ float values[];
+  __shared__ float sums[kSamplingThreads];
+  __shared__ float prefix[kSamplingThreads];
+  __shared__ bool use_residual;
+  __shared__ float selected_threshold;
+  __shared__ std::uint32_t selected_segment;
+  sums[threadIdx.x] = scratch->residual_sums[threadIdx.x];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float total = 0.0F;
+    for (std::size_t i = 0; i < kSamplingThreads; ++i) {
+      prefix[i] = total;
+      total += sums[i];
+    }
+    use_residual = total > 0.0F && isfinite(total);
+  }
+  __syncthreads();
+  if (!use_residual) {
+    sums[threadIdx.x] = scratch->target_sums[threadIdx.x];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float total = 0.0F;
+      for (std::size_t i = 0; i < kSamplingThreads; ++i) {
+        prefix[i] = total;
+        total += sums[i];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    const float total =
+        prefix[kSamplingThreads - 1U] + sums[kSamplingThreads - 1U];
+    const float threshold =
+        fminf(fmaxf(residual_uniform, 0.0F), 0.99999994F) * total;
+    selected_segment = kSamplingThreads - 1U;
+    for (std::size_t i = 0; i < kSamplingThreads; ++i) {
+      if (sums[i] > 0.0F && threshold < prefix[i] + sums[i]) {
+        selected_segment = static_cast<std::uint32_t>(i);
+        break;
+      }
+    }
+    selected_threshold = threshold - prefix[selected_segment];
+  }
+  __syncthreads();
+  const std::size_t begin = (vocab_size * selected_segment) / kSamplingThreads;
+  const std::size_t end =
+      (vocab_size * (selected_segment + 1U)) / kSamplingThreads;
+  for (std::size_t i = begin + threadIdx.x; i < end; i += blockDim.x)
+    values[i - begin] =
+        use_residual
+            ? fmaxf(weights[i] - draft_probabilities[i] * scratch->target_total,
+                    0.0F)
+            : weights[i];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float threshold = selected_threshold;
+    std::uint32_t selected =
+        static_cast<std::uint32_t>(end > begin ? end - 1U : 0U);
+    for (std::size_t i = begin; i < end; ++i) {
+      const float weight = values[i - begin];
+      if (weight <= 0.0F)
+        continue;
+      threshold -= weight;
+      selected = static_cast<std::uint32_t>(i);
+      if (threshold < 0.0F)
+        break;
+    }
+    *out_token = selected;
+  }
+}
+
 __global__ void SortedSpeculativeSamplingKernel(
     const float* __restrict__ sorted_logits,
     const std::uint32_t* __restrict__ sorted_token_ids,
@@ -1066,6 +1266,34 @@ void LaunchGPUSpeculativeSampling(
       workspace->draft_candidate_ids, workspace->draft_candidate_probabilities,
       draft_candidate_count, draft_probabilities, vocab_size);
   if (!needs_ordering) {
+    // Avoid multi-kernel overhead for small vocabularies and cap per-block
+    // shared memory at 16 KiB. Production vocabularies use this parallel path.
+    if (vocab_size >= 16384 && vocab_size <= kSamplingThreads * 4096U) {
+      auto* scratch =
+          reinterpret_cast<SpeculativeSegments*>(workspace->sorted_token_ids);
+      static_assert(sizeof(SpeculativeSegments) <=
+                    16384 * sizeof(std::uint32_t));
+      auto* weights = workspace->sorted_logits;
+      const std::size_t shared_bytes =
+          ((vocab_size + kSamplingThreads - 1U) / kSamplingThreads) *
+          sizeof(float);
+      SpeculativeSegmentMaxKernel<<<kSamplingThreads,
+                                    kSpeculativeSegmentThreads, 0, stream>>>(
+          sampling_logits, scratch, vocab_size);
+      SpeculativeSegmentWeightsKernel<<<
+          kSamplingThreads, kSpeculativeSegmentThreads, shared_bytes, stream>>>(
+          sampling_logits, weights, scratch, vocab_size, parameters.temperature,
+          parameters.min_p);
+      SpeculativeSegmentResidualKernel<<<
+          kSamplingThreads, kSpeculativeSegmentThreads, shared_bytes, stream>>>(
+          weights, draft_probabilities, scratch, vocab_size, draft_token,
+          draft_token_probability, acceptance_uniform, out_token, out_accepted);
+      SpeculativeSegmentSelectKernel<<<1, kSamplingThreads, shared_bytes,
+                                       stream>>>(
+          weights, draft_probabilities, scratch, vocab_size, residual_uniform,
+          out_token, out_accepted);
+      return;
+    }
     LinearSpeculativeSamplingKernel<<<1, kSamplingThreads, 0, stream>>>(
         sampling_logits, out_token, out_accepted, vocab_size,
         parameters.temperature, parameters.min_p, draft_token,

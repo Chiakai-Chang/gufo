@@ -123,7 +123,8 @@ public:
 
   /// Appends `tokens` (at most max_batch) to the session and returns the
   /// logits of the last `n_logits` tokens in `logits` (n_logits * vocab
-  /// floats, host memory). The final wide residual of those tokens stays on
+  /// floats, host memory). A null `logits` keeps the rows on the GPU for
+  /// verification. The final wide residual of those tokens stays on
   /// the device for MtpForward. With `speculative` set (batch at most
   /// max_speculative) the batch can be cut back with Rollback.
   [[nodiscard]] bool Forward(Session& session,
@@ -132,9 +133,11 @@ public:
                              bool speculative, std::string* error_msg) const;
 
   /// Keeps the first `keep` (1..n) tokens of the last speculative batch and
-  /// discards the rest.
+  /// discards the rest. If `logits` is supplied, copies the kept frontier
+  /// into it using the same synchronization as rollback.
   [[nodiscard]] bool Rollback(Session& session, std::uint32_t keep,
-                              std::string* error_msg) const;
+                              std::string* error_msg,
+                              float* logits = nullptr) const;
 
   /// Runs the draft block over `tokens` (at most max_batch) at the session's
   /// MTP position. The hidden input of token i is the trunk residual of row
@@ -282,9 +285,10 @@ private:
                bool candidates, std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
-                   bool speculative, bool sparse, std::uint32_t start_pos,
-                   std::uint32_t pool_grid, std::uint32_t first_layer,
-                   std::uint32_t end_layer, std::string* error_msg) const;
+                   bool download_logits, bool speculative, bool sparse,
+                   std::uint32_t start_pos, std::uint32_t pool_grid,
+                   std::uint32_t first_layer, std::uint32_t end_layer,
+                   std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
                bool candidates, std::string* error_msg) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`

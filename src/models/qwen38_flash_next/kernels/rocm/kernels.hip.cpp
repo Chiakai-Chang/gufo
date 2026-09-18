@@ -5,8 +5,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <hipcub/block/block_radix_sort.hpp>
 #include <stdexcept>
 #include <type_traits>
+
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 // HIP kernels follow the layouts and operator formulas in reference.cpp.
 
@@ -2468,6 +2471,44 @@ __global__ void ArgmaxFinishKernel(const float* logits,
   }
 }
 
+constexpr unsigned kMtpCandidateTile = 1024;
+
+// A token excluded from its tile's top 64 cannot enter the global top 64.
+// Reduce tiles repeatedly, retaining the original order of equal scores.
+// Only token IDs need to survive between passes; the original logit buffer
+// supplies scores and preserves the sign of zero in the final output.
+__global__ void MtpCandidateTileKernel(const float* logits,
+                                       const std::uint32_t* input,
+                                       std::uint32_t* output, float* scores,
+                                       std::uint32_t size,
+                                       std::uint32_t vocab) {
+  using Sort = hipcub::BlockRadixSort<float, kThreads, 4, std::uint32_t>;
+  __shared__ Sort::TempStorage scratch;
+  float keys[4];
+  std::uint32_t ids[4];
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const std::size_t i =
+        std::size_t(blockIdx.x) * kMtpCandidateTile + threadIdx.x * 4 + j;
+    const auto id = i < size ? (input != nullptr ? input[i] : i) : UINT32_MAX;
+    ids[j] = static_cast<std::uint32_t>(id);
+    const float value = id < vocab ? logits[id] : -INFINITY;
+    keys[j] = isfinite(value) ? (value == 0.0F ? 0.0F : value) : -INFINITY;
+  }
+  Sort(scratch).SortDescending(keys, ids);
+#pragma unroll
+  for (unsigned j = 0; j < 4; ++j) {
+    const unsigned rank = threadIdx.x * 4 + j;
+    if (rank < min(static_cast<unsigned>(kMtpCandidates), size)) {
+      output[blockIdx.x * kMtpCandidates + rank] = ids[j];
+      if (scores != nullptr) {
+        const float value = ids[j] < vocab ? logits[ids[j]] : -INFINITY;
+        scores[rank] = isfinite(value) ? value : -INFINITY;
+      }
+    }
+  }
+}
+
 __global__ void CopyKernel(const float* src, float* dst, std::size_t count) {
   const std::size_t i =
       blockIdx.x * static_cast<std::size_t>(blockDim.x) + threadIdx.x;
@@ -4779,7 +4820,7 @@ __launch_bounds__(256) __global__
       const auto* src =
           reinterpret_cast<const float4*>(tile_scratch + (tok_l * 32) + row_l);
       if constexpr (kSsmConv) {
-        static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 4 && WN == 2);
+        static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 8 && WN == 1);
         static_assert(!kHcMix && kRowGroup == 1);
         constexpr std::uint32_t channels = 10240;
         if (tok < batch) {
@@ -4889,10 +4930,10 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
     if (m == 10240 && k == 320 && batch >= 1024) {
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2, 8>), grid,
                          dim3(kThreads), 0, stream, w, x, out, batch, m, k);
-    } else if (m == 16384 && k == 2560 && batch >= 1024) {
-      // Two K blocks per stage reduce barriers on the wide SSM projection.
-      // The matrix products retain the same accumulation order.
-      hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 4, 2>), grid,
+    } else if ((m == 16384 || m == 13312) && k == 2560 && batch >= 1024) {
+      // Eight row groups reuse each weight fragment across all token tiles
+      // and keep fewer weight fragments live. K accumulation is unchanged.
+      hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1>), grid,
                          dim3(kThreads), 0, stream, w, x, out, batch, m, k);
     } else {
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2>), grid,
@@ -4917,7 +4958,7 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
       kernel != kSsmConvTaps) {
     return false;
   }
-  hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 4, 2, 1, false, true>),
+  hipLaunchKernelGGL((DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, true>),
                      dim3((n_tokens + 127) / 128, m / 256), dim3(kThreads), 0,
                      stream, w, x, qkvz, n_tokens, m, k, nullptr, nullptr,
                      nullptr, conv_w, convolved);
@@ -5327,6 +5368,39 @@ void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
                      dim3(kThreads), 0, stream, logits, scratch, vocab);
   hipLaunchKernelGGL(ArgmaxFinishKernel, dim3(n_tokens), dim3(kThreads), 0,
                      stream, logits, scratch, out, vocab);
+}
+
+void MtpTopCandidates(const float* logits, std::uint32_t* ids,
+                      std::uint32_t* scratch_ids, float* scores,
+                      std::uint32_t vocab, hipStream_t stream) {
+  if (logits == nullptr || ids == nullptr || scratch_ids == nullptr ||
+      scores == nullptr || vocab == 0) {
+    throw std::invalid_argument("invalid MTP candidate selection");
+  }
+  const auto tiles = [](std::uint32_t n) {
+    return 1U + (n - 1U) / kMtpCandidateTile;
+  };
+  unsigned passes = 1;
+  for (auto size = vocab; size > kMtpCandidateTile;
+       size = tiles(size) * kMtpCandidates) {
+    ++passes;
+  }
+  // Choose the first buffer so the final pass always lands in `ids`.
+  auto* destination = passes % 2 != 0 ? ids : scratch_ids;
+  const std::uint32_t* source = nullptr;
+  auto size = vocab;
+  for (;;) {
+    const auto blocks = tiles(size);
+    hipLaunchKernelGGL(MtpCandidateTileKernel, dim3(blocks), dim3(kThreads), 0,
+                       stream, logits, source, destination,
+                       blocks == 1 ? scores : nullptr, size, vocab);
+    if (blocks == 1) {
+      break;
+    }
+    size = blocks * kMtpCandidates;
+    source = destination;
+    destination = destination == ids ? scratch_ids : ids;
+  }
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

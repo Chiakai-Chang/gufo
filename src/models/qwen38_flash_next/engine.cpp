@@ -202,11 +202,6 @@ Session::Session(std::shared_ptr<Model> model,
       session_(std::move(session)),
       draft_length_(model_->options_.max_draft_tokens) {
   logits_.resize(model_->VocabSize());
-  if (model_->HasMtp()) {
-    verify_logits_.resize(
-        static_cast<std::size_t>(model_->executor_->max_speculative()) *
-        model_->VocabSize());
-  }
 }
 
 Session::~Session() = default;
@@ -514,7 +509,11 @@ bool Session::DecodeStep(std::size_t max_tokens,
   // target logits over the full vocabulary and the request's token history.
   const auto k = static_cast<std::uint32_t>(chain.size());
   const std::size_t vocab = model_->VocabSize();
-  if (!exec.Forward(*session_, chain, k, verify_logits_.data(), true,
+  if (!sampled && verify_logits_.empty()) {
+    verify_logits_.resize(exec.max_speculative() * vocab);
+  }
+  if (!exec.Forward(*session_, chain, k,
+                    sampled ? nullptr : verify_logits_.data(), true,
                     error_msg)) {
     return false;
   }
@@ -550,11 +549,14 @@ bool Session::DecodeStep(std::size_t max_tokens,
     }
     ++keep;
   }
-  if (!exec.Rollback(*session_, keep, error_msg)) {
+  if (!exec.Rollback(*session_, keep, error_msg,
+                     sampled ? logits_.data() : nullptr)) {
     return false;
   }
-  std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
-              logits_.begin());
+  if (!sampled) {
+    std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
+                logits_.begin());
+  }
   hidden_base_ = base;
   tokens_.insert(tokens_.end(), chain.begin(), chain.begin() + keep);
   result->tokens.assign(chain.begin(), chain.begin() + keep);

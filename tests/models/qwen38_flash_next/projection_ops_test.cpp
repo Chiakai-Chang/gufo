@@ -502,6 +502,7 @@ int main() {
     ok = Run(1025, 2560, 6144, 0x51A17U, 2) < 1e-2 && ok;
     // Wide SSM projection: two K blocks per stage, with a partial token tile.
     ok = Run(2049, 16384, 2560, 0x16384256U, 2) < 1e-2 && ok;
+    ok = Run(2049, 13312, 2560, 0x13312256U, 2) < 1e-2 && ok;
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
     return ok ? 0 : 1;

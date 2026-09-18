@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
@@ -150,15 +151,18 @@ void CheckCandidates(std::uint32_t vocab) {
   CheckHip(hipStreamCreate(&stream), "candidate stream");
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "candidate capture");
-  gufo::hip::LaunchGPUSortLogits(device_logits.get(), &workspace, stream);
+  q::MtpTopCandidates(device_logits.get(), workspace.sorted_token_ids,
+                      workspace.token_ids, workspace.sorted_logits, vocab,
+                      stream);
   CheckHip(hipStreamEndCapture(stream, &graph), "candidate capture end");
   CheckHip(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
            "candidate graph");
-  for (unsigned mode = 0; mode < 3; ++mode) {
+  for (unsigned mode = 0; mode < 4; ++mode) {
     for (std::uint32_t i = 0; i < vocab; ++i) {
       logits[i] = mode == 0   ? static_cast<float>((i * 7919U) % 257)
                   : mode == 1 ? (i % 2 ? 0.0F : -0.0F)
-                              : std::numeric_limits<float>::quiet_NaN();
+                  : mode == 2 ? std::numeric_limits<float>::quiet_NaN()
+                              : (i >= vocab - count ? 10.0F : -100.0F);
     }
     if (mode == 0) {
       logits[0] = std::numeric_limits<float>::infinity();
@@ -188,7 +192,9 @@ void CheckCandidates(std::uint32_t vocab) {
         "candidate scores");
     CheckHip(hipStreamSynchronize(stream), "candidate synchronization");
     for (std::size_t i = 0; i < count; ++i) {
-      if (ids[i] != expected[i] || scores[i] != score(expected[i])) {
+      if (ids[i] != expected[i] ||
+          std::bit_cast<std::uint32_t>(scores[i]) !=
+              std::bit_cast<std::uint32_t>(score(expected[i]))) {
         throw std::runtime_error("MTP candidate sort disagrees with CPU");
       }
     }
@@ -209,7 +215,13 @@ int main() {
     CheckArgmax(257);
     CheckArgmax(248320);
     CheckCandidates(1);
+    CheckCandidates(63);
+    CheckCandidates(64);
+    CheckCandidates(65);
     CheckCandidates(257);
+    CheckCandidates(1024);
+    CheckCandidates(1025);
+    CheckCandidates(16385);
     CheckCandidates(248320);
     return 0;
   } catch (const std::exception& error) {

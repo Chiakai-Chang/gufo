@@ -1381,7 +1381,10 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     }
   }
   if (candidates) {
-    gufo::hip::LaunchGPUSortLogits(s_.logits, &sampling_workspace_, stream_);
+    MtpTopCandidates(s_.logits, sampling_workspace_.sorted_token_ids,
+                     sampling_workspace_.token_ids,
+                     sampling_workspace_.sorted_logits,
+                     static_cast<std::uint32_t>(output.rows), stream_);
     const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
     if (!Check(hipMemcpyAsync(mtp_candidates_host_->ids.data(),
                               sampling_workspace_.sorted_token_ids,
@@ -1504,7 +1507,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
-                            (static_cast<std::uint64_t>(sparse) << 33);
+                            (static_cast<std::uint64_t>(sparse) << 33) |
+                            (std::uint64_t{logits != nullptr} << 34);
   // PLE first consumes the disk rows at its injection layer. Queue the
   // preceding layers before waiting, including on captured graph replay.
   // Both pieces use the same stream and arithmetic as the unsplit graph.
@@ -1512,7 +1516,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
       graph && c.ple_layer > 0 ? static_cast<std::uint32_t>(c.ple_layer) : 0;
   if (first_layer > 0) {
     const auto prefix = [&] {
-      return ForwardBody(session, n, 0, speculative, sparse, start_pos,
+      return ForwardBody(session, n, 0, false, speculative, sparse, start_pos,
                          graph_pool_grid, 0, first_layer, error_msg);
     };
     constexpr std::uint64_t kPrefixKey = std::uint64_t{1} << 35;
@@ -1521,9 +1525,9 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
     }
   }
   const auto body = [&] {
-    return ForwardBody(session, n, n_logits, speculative, sparse, start_pos,
-                       graph ? graph_pool_grid : pool_grid, first_layer,
-                       c.num_layers, error_msg);
+    return ForwardBody(session, n, n_logits, logits != nullptr, speculative,
+                       sparse, start_pos, graph ? graph_pool_grid : pool_grid,
+                       first_layer, c.num_layers, error_msg);
   };
   // Only the suffix waits for its pinned n-gram rows. During eager
   // execution and capture, Ple performs this wait at the same boundary.
@@ -1534,7 +1538,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (!Run(session, key, graph, body, error_msg)) {
     return false;
   }
-  if (n_logits > 0) {
+  if (n_logits > 0 && logits != nullptr) {
     std::copy_n(logits_host_, static_cast<std::size_t>(n_logits) * c.vocab_size,
                 logits);
   }
@@ -1547,10 +1551,10 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
 }
 
 bool Executor::ForwardBody(Session& session, std::uint32_t n,
-                           std::uint32_t n_logits, bool speculative,
-                           bool sparse, std::uint32_t start_pos,
-                           std::uint32_t pool_grid, std::uint32_t first_layer,
-                           std::uint32_t end_layer,
+                           std::uint32_t n_logits, bool download_logits,
+                           bool speculative, bool sparse,
+                           std::uint32_t start_pos, std::uint32_t pool_grid,
+                           std::uint32_t first_layer, std::uint32_t end_layer,
                            std::string* error_msg) const {
   const Config& c = config();
   if (first_layer == 0) {
@@ -1624,7 +1628,10 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     const DeviceMixer& head = model_->hc_head();
     if (!HcMix(head, s_.res + skip * c.HcDim(), false, s_.mixed, nullptr,
                n_logits, error_msg) ||
-        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg) ||
+        !Dense(model_->output(), s_.mixed, s_.logits, n_logits, error_msg)) {
+      return false;
+    }
+    if (download_logits &&
         !Check(hipMemcpyAsync(logits_host_, s_.logits,
                               static_cast<std::size_t>(n_logits) *
                                   c.vocab_size * sizeof(float),
@@ -1637,7 +1644,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
 }
 
 bool Executor::Rollback(Session& session, std::uint32_t keep,
-                        std::string* error_msg) const {
+                        std::string* error_msg, float* logits) const {
   const Config& c = config();
   const std::uint32_t n = session.spec_tokens_;
   if (n == 0 || keep == 0 || keep > n) {
@@ -1645,49 +1652,66 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
     return false;
   }
   session.spec_tokens_ = 0;
-  if (keep == n) {
+  if (logits != nullptr &&
+      !Check(hipMemcpyAsync(
+                 logits_host_,
+                 s_.logits + static_cast<std::size_t>(keep - 1) * c.vocab_size,
+                 c.vocab_size * sizeof(float), hipMemcpyDeviceToHost, stream_),
+             "frontier download", error_msg)) {
+    return false;
+  }
+  if (keep == n && logits == nullptr) {
     return true;
   }
-  const std::size_t conv_elems =
-      static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
-  const std::size_t state_elems = static_cast<std::size_t>(c.ssm_num_v_heads) *
-                                  c.ssm_head_dim * c.ssm_head_dim;
-  const std::size_t slot = keep - 1;
-  for (auto& l : session.linear_) {
-    if (l.state == nullptr) {
-      continue;
+  if (keep < n) {
+    const std::size_t conv_elems =
+        static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
+    const std::size_t state_elems =
+        static_cast<std::size_t>(c.ssm_num_v_heads) * c.ssm_head_dim *
+        c.ssm_head_dim;
+    const std::size_t slot = keep - 1;
+    for (auto& l : session.linear_) {
+      if (l.state == nullptr) {
+        continue;
+      }
+      if (!Check(hipMemcpyAsync(l.state, l.state_snapshots + slot * state_elems,
+                                state_elems * sizeof(float),
+                                hipMemcpyDeviceToDevice, stream_),
+                 "state rollback", error_msg) ||
+          !Check(
+              hipMemcpyAsync(l.conv_state, l.conv_snapshots + slot * conv_elems,
+                             conv_elems * sizeof(float),
+                             hipMemcpyDeviceToDevice, stream_),
+              "conv rollback", error_msg)) {
+        return false;
+      }
     }
-    if (!Check(hipMemcpyAsync(l.state, l.state_snapshots + slot * state_elems,
-                              state_elems * sizeof(float),
-                              hipMemcpyDeviceToDevice, stream_),
-               "state rollback", error_msg) ||
-        !Check(
-            hipMemcpyAsync(l.conv_state, l.conv_snapshots + slot * conv_elems,
-                           conv_elems * sizeof(float), hipMemcpyDeviceToDevice,
-                           stream_),
-            "conv rollback", error_msg)) {
-      return false;
+    if (session.ple_history_ != nullptr) {
+      const std::size_t hist =
+          static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();
+      if (!Check(hipMemcpyAsync(
+                     session.ple_history_, session.ple_snapshots_ + slot * hist,
+                     hist * sizeof(float), hipMemcpyDeviceToDevice, stream_),
+                 "PLE rollback", error_msg)) {
+        return false;
+      }
+      session.ngram_ = session.ngram_snapshots_[slot];
     }
+    session.position_ = session.spec_base_ + keep;
+    // Pooled block keys past the kept prefix are stale; they are rebuilt
+    // from the raw keys when needed.
+    session.blocks_ =
+        c.compress_ratio == 0
+            ? 0
+            : std::min(session.blocks_, session.position_ / c.compress_ratio);
   }
-  if (session.ple_history_ != nullptr) {
-    const std::size_t hist =
-        static_cast<std::size_t>(c.PleConvHistory()) * c.HcDim();
-    if (!Check(hipMemcpyAsync(
-                   session.ple_history_, session.ple_snapshots_ + slot * hist,
-                   hist * sizeof(float), hipMemcpyDeviceToDevice, stream_),
-               "PLE rollback", error_msg)) {
-      return false;
-    }
-    session.ngram_ = session.ngram_snapshots_[slot];
+  if (!Check(hipStreamSynchronize(stream_), "rollback", error_msg)) {
+    return false;
   }
-  session.position_ = session.spec_base_ + keep;
-  // Pooled block keys past the kept prefix are stale; they are rebuilt
-  // from the raw keys when needed.
-  session.blocks_ =
-      c.compress_ratio == 0
-          ? 0
-          : std::min(session.blocks_, session.position_ / c.compress_ratio);
-  return Check(hipStreamSynchronize(stream_), "rollback", error_msg);
+  if (logits != nullptr) {
+    std::copy_n(logits_host_, c.vocab_size, logits);
+  }
+  return true;
 }
 
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',

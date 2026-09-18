@@ -393,6 +393,13 @@ struct ArgmaxCandidate {
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream);
 
+/// Exact MTP top-64 selection, descending score with lowest-token-ID ties.
+/// Nonfinite scores become -infinity. `ids` and `scratch_ids` each have room
+/// for `vocab` entries; `scores` receives min(vocab, 64) values. Graph-safe.
+void MtpTopCandidates(const float* logits, std::uint32_t* ids,
+                      std::uint32_t* scratch_ids, float* scores,
+                      std::uint32_t vocab, hipStream_t stream);
+
 }  // namespace gufo::models::qwen38_flash_next::rocm
 
 #endif  // GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_KERNELS_HPP_

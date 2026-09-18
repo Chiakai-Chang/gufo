@@ -492,70 +492,75 @@ void TestExactNucleusBoundaryAndGreedyTies() {
 }
 
 void TestFullVocabularyQuantiles() {
-  // Exercise real Qwen vocabulary geometry and substantial mass outside the
-  // sparse draft support. For a dense tail, compare CDF mass rather than token
-  // identity: FP32 reductions can move a draw across very small intervals.
-  std::vector<float> logits(248320);
-  for (std::size_t i = 0; i < logits.size(); ++i)
-    logits[i] = -10.0F + 0.01F * static_cast<float>(i % 29);
-  logits[1] = 2.0F;
-  logits[3] = 1.1F;
-  logits[4] = -0.3F;
-  logits[258] = 0.4F;
-  const std::vector<std::uint32_t> draft_ids{1, 3, 4};
-  const std::vector<float> draft_probabilities{0.5F, 0.25F, 0.25F};
-  for (const auto& config :
-       {gufo::sampling::SamplingConfig{.temperature = 0.8F},
-        gufo::sampling::SamplingConfig{.temperature = 2.0F, .top_p = 0.9F},
-        gufo::sampling::SamplingConfig{.temperature = 0.8F, .top_k = 40},
-        gufo::sampling::SamplingConfig{
-            .temperature = 0.8F, .min_p = 0.8F, .min_keep = 3}}) {
-    const auto distribution = gufo::sampling::BuildDistribution(logits, config);
-    std::vector<gufo::sampling::Probability> ordered(
-        distribution.entries().begin(), distribution.entries().end());
-    if (config.top_k == 0 && config.top_p == 1.0F &&
-        !(config.min_p > 0.0F && config.min_keep > 1))
-      std::ranges::sort(ordered, {}, &gufo::sampling::Probability::token);
-    auto residual = ordered;
-    double total = 0.0;
-    for (auto& entry : residual) {
-      for (std::size_t i = 0; i < draft_ids.size(); ++i)
-        if (entry.token == draft_ids[i])
-          entry.value = std::max(0.0, entry.value - draft_probabilities[i]);
-      total += entry.value;
-    }
-    for (auto& entry : residual)
-      entry.value /= total;
-    const auto contains_quantile = [](const auto& entries, std::uint32_t token,
-                                      double uniform) {
-      constexpr double tolerance = 2e-5;
-      double cumulative = 0.0;
-      for (const auto& entry : entries) {
-        if (entry.token == token)
-          return entry.value > 0.0 && cumulative <= uniform + tolerance &&
-                 cumulative + entry.value >= uniform - tolerance;
-        cumulative += entry.value;
+  // Exercise the parallel verifier's dispatch boundary, real Qwen vocabulary
+  // and ragged segments, with substantial mass outside the draft support.
+  // Compare CDF mass: FP32 reductions can cross very small token intervals.
+  for (const std::size_t vocab : {16383U, 16384U, 248320U, 248323U}) {
+    std::vector<float> logits(vocab);
+    for (std::size_t i = 0; i < logits.size(); ++i)
+      logits[i] = -10.0F + 0.01F * static_cast<float>(i % 29);
+    logits[1] = 2.0F;
+    logits[3] = 1.1F;
+    logits[4] = -0.3F;
+    logits[258] = 0.4F;
+    const std::vector<std::uint32_t> draft_ids{1, 3, 4};
+    const std::vector<float> draft_probabilities{0.5F, 0.25F, 0.25F};
+    for (const auto& config :
+         {gufo::sampling::SamplingConfig{.temperature = 0.8F},
+          gufo::sampling::SamplingConfig{.temperature = 1e-38F},
+          gufo::sampling::SamplingConfig{.temperature = 0.8F, .min_p = 0.5F},
+          gufo::sampling::SamplingConfig{.temperature = 2.0F, .top_p = 0.9F},
+          gufo::sampling::SamplingConfig{.temperature = 0.8F, .top_k = 40},
+          gufo::sampling::SamplingConfig{
+              .temperature = 0.8F, .min_p = 0.8F, .min_keep = 3}}) {
+      const auto distribution =
+          gufo::sampling::BuildDistribution(logits, config);
+      std::vector<gufo::sampling::Probability> ordered(
+          distribution.entries().begin(), distribution.entries().end());
+      if (config.top_k == 0 && config.top_p == 1.0F &&
+          !(config.min_p > 0.0F && config.min_keep > 1))
+        std::ranges::sort(ordered, {}, &gufo::sampling::Probability::token);
+      auto residual = ordered;
+      double total = 0.0;
+      for (auto& entry : residual) {
+        for (std::size_t i = 0; i < draft_ids.size(); ++i)
+          if (entry.token == draft_ids[i])
+            entry.value = std::max(0.0, entry.value - draft_probabilities[i]);
+        total += entry.value;
       }
-      return false;
-    };
-    gufo::hip::GpuSamplingParameters parameters{
-        .temperature = config.temperature,
-        .top_k = config.top_k,
-        .top_p = config.top_p,
-        .min_p = config.min_p,
-        .min_keep = config.min_keep,
-    };
-    for (const float uniform : {0.0F, 0.23F, 0.91F, 0.99999994F}) {
-      parameters.uniform = uniform;
-      Expect(contains_quantile(ordered, Sample(logits, parameters), uniform),
-             "full-vocabulary AR CDF differs from reference");
-      // Token 4 has excess draft mass in every configuration.
-      const auto result =
-          SampleSpeculatively(logits, parameters, 4, 0.25F, draft_ids,
-                              draft_probabilities, 0.99F, uniform);
-      Expect(!result.accepted &&
-                 contains_quantile(residual, result.token, uniform),
-             "full-vocabulary DFlash2 residual CDF differs from reference");
+      for (auto& entry : residual)
+        entry.value /= total;
+      const auto contains_quantile = [](const auto& entries,
+                                        std::uint32_t token, double uniform) {
+        constexpr double tolerance = 2e-5;
+        double cumulative = 0.0;
+        for (const auto& entry : entries) {
+          if (entry.token == token)
+            return entry.value > 0.0 && cumulative <= uniform + tolerance &&
+                   cumulative + entry.value >= uniform - tolerance;
+          cumulative += entry.value;
+        }
+        return false;
+      };
+      gufo::hip::GpuSamplingParameters parameters{
+          .temperature = config.temperature,
+          .top_k = config.top_k,
+          .top_p = config.top_p,
+          .min_p = config.min_p,
+          .min_keep = config.min_keep,
+      };
+      for (const float uniform : {0.0F, 0.23F, 0.91F, 0.99999994F}) {
+        parameters.uniform = uniform;
+        Expect(contains_quantile(ordered, Sample(logits, parameters), uniform),
+               "full-vocabulary AR CDF differs from reference");
+        // Token 4 has excess draft mass in every configuration.
+        const auto result =
+            SampleSpeculatively(logits, parameters, 4, 0.25F, draft_ids,
+                                draft_probabilities, 0.99F, uniform);
+        Expect(!result.accepted &&
+                   contains_quantile(residual, result.token, uniform),
+               "full-vocabulary DFlash2 residual CDF differs from reference");
+      }
     }
   }
 }
