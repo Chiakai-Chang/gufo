@@ -199,6 +199,70 @@ void TestTable() {
   std::filesystem::remove(path);
 }
 
+// The production IQ4_NL format must decode identically on a cold read, a
+// cached gather and a mixed cached/disk gather, including duplicate slots.
+void TestQuantizedRows() {
+  const auto path =
+      std::filesystem::temp_directory_path() / "qwen38_ngram_iq4.bin";
+  constexpr std::uint32_t dim = 160;
+  constexpr std::uint32_t rows = 129;
+  constexpr std::uint64_t offset = 4096 + 90;
+  constexpr std::array<int, 16> values{
+      -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+  {
+    std::ofstream file(path, std::ios::binary);
+    file.seekp(offset);
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      for (std::uint32_t block = 0; block < dim / 32; ++block) {
+        // Exactly representable half scales: 0.5 and -2.
+        const std::uint16_t scale = row % 2 == 0 ? 0x3800 : 0xC000;
+        file.write(reinterpret_cast<const char*>(&scale), sizeof(scale));
+        for (std::uint32_t col = 0; col < 16; ++col) {
+          const auto packed =
+              static_cast<std::uint8_t>(((row + block + col) % 16) |
+                                        (((row + block + col + 7) % 16) << 4));
+          file.put(static_cast<char>(packed));
+        }
+      }
+    }
+    Check(file.good(), "IQ4_NL fixture written");
+  }
+  std::string error;
+  auto table = q::NgramTable::Open(path, offset, rows, dim,
+                                   gufo::core::GgmlType::kIQ4_NL, &error);
+  Check(table != nullptr, error.c_str());
+  if (table) {
+    const auto gather = [&](std::span<const std::uint32_t> ids) {
+      std::vector<float> out(ids.size() * dim + 16, -123.0F);
+      Check(table->Read(ids, std::span(out).first(ids.size() * dim)),
+            "IQ4_NL gather completes");
+      for (std::size_t i = 0; i < ids.size(); ++i) {
+        for (std::uint32_t col = 0; col < dim; ++col) {
+          const auto index =
+              (ids[i] + col / 32 + col % 16 + (col % 32 >= 16 ? 7 : 0)) % 16;
+          const float scale = ids[i] % 2 == 0 ? 0.5F : -2.0F;
+          Check(out[i * dim + col] == scale * values[index],
+                "IQ4_NL exact decoded value");
+        }
+      }
+      for (std::size_t i = ids.size() * dim; i < out.size(); ++i) {
+        Check(out[i] == -123.0F, "IQ4_NL output guard");
+      }
+    };
+    const std::array<std::uint32_t, 6> warm{0, 7, 128, 7, 0, 32};
+    gather(warm);
+    gather(warm);
+    const std::array<std::uint32_t, 7> mixed{128, 3, 7, 64, 3, 32, 1};
+    gather(mixed);
+    // The cached path must not need the backing file after successful reads.
+    std::filesystem::resize_file(path, 0);
+    gather(warm);
+    gather(mixed);
+  }
+  table.reset();
+  std::filesystem::remove(path);
+}
+
 // Widely spaced rows exercise cache eviction, including simultaneous readers
 // whose compressed rows map to the same bounded-cache slot.
 void TestDistantRows() {
@@ -260,6 +324,7 @@ void TestDistantRows() {
 int main() {
   TestHash();
   TestTable();
+  TestQuantizedRows();
   TestDistantRows();
   if (failures != 0) {
     std::fprintf(stderr, "%d failures\n", failures);

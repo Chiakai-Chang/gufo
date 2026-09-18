@@ -306,6 +306,7 @@ private:
   NgramTable* ngram_{nullptr};
   Options options_;
   hipStream_t stream_{nullptr};
+  hipEvent_t counts_ready_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
 

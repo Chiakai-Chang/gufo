@@ -37,28 +37,29 @@ Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1516.68 | 1554.87 |
+| 0 | 1571.61 | 1555.39 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
-| 32768 | 1424.78 | 1305.21 |
+| 32768 | 1423.63 | 1305.29 |
 | 65536 | TODO | TODO |
-| 131072 | 1352.81 | TODO |
+| 131072 | TODO | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.26 | 47.98 | 71.0% |
-| Greedy | 32768 | 23.98 | 58.65 | 100% |
-| Temperature 0.7 | 0 | TODO | 48.95 | 75.9% |
+| Greedy | 0 | 26.24 | 47.89 | 71.0% |
+| Greedy | 32768 | 24.04 | 59.17 | 100% |
+| Temperature 0.7 | 0 | TODO | 47.86 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
-AR PP uses a 133,121-token context limit; TG and MTP use depth + 2,177.
-MTP PP includes draft catch-up and uses the greedy run.
+Greedy AR and MTP use the same 34,817-token context limit at both depths;
+the separate temperature 0.7 run uses 4,096. MTP PP includes draft catch-up.
+TG starts from 16 prompt tokens at d0 and from the specified depth otherwise.
 The d32K continuation accepted all 110 draft proposals; acceptance depends
 on the prompt and depth. SSM convolution and QKV normalization/cache writes
 are fused into projections for prefill batches of at least 1024 tokens.
 The HC down projection fuses its activation and F16 conversion from 96 tokens.
 The targets are **1700 tok/s pp2048** and near-flat PP through d128K;
-both remain TODO. The measured d0-to-d128K decline is 10.8%.
+both remain TODO.
 HTTP, C1, context 4096, seed 1, up to 128 output tokens, uncached prompts:
 
 | Prompt | MTP greedy tok/s | MTP temperature 0.7 tok/s |
@@ -83,6 +84,9 @@ Serving interleaves sessions but does not batch model work;
 Internal prefill chunks use 2048 tokens, selected by a 512–4096 sweep.
 HTTP accepts arbitrary prompt lengths and yields between chunks. PLE reads
 overlap layer 0; its bounded cache retains original compressed rows.
+Small cached gathers complete without waking the I/O workers; large gathers
+still decode rows in parallel. Expert-count downloads precede the shared
+expert, allowing CPU tile selection to overlap its GPU projections.
 The [projection sweep](tools/projection_plans.hip) uses `tools/bench/build.sh`;
 `tools/prof/prof.py run --stages qwen-flash --` profiles a release command
 inside `nix develop`.
@@ -115,6 +119,9 @@ range if the threshold is clipped. Every score participates.
 Larger attention tiles, wider DeltaNet reductions and carrying convolution
 boundaries across larger tiles were slower. Compact attention scratch gave
 no material gain. Sparse attention remains the largest measured depth penalty.
+Blocking HIP waits reduced CPU use but slightly slowed generation, so were
+not retained. Sampling and exponentials accounted for about 2% of CPU cycles
+in unfiltered temperature 0.7 AR; most CPU cycles were spent waiting for the GPU.
 
 ## Quality checks
 
@@ -165,8 +172,9 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]moe_ids_o
   target mass outside draft support. Wiring changes also require actual
   prompt, chat and sampled HTTP requests.
 - **Loading and I/O:** verify upload bytes, guards, shard/chunk boundaries,
-  asynchronous n-gram reads, duplicate/reordered rows, cache collisions and
-  eviction, failed I/O recovery, and teardown.
+  exact IQ4_NL/BF16 cold, cached and mixed n-gram reads, duplicate/reordered
+  rows, asynchronous completion, cache collisions and eviction, failed I/O
+  recovery, cached reads after truncation, and teardown.
 
 Prefill changes also require `gufo bench --validate-prefill N` and CPU/reference
 probes. Benchmark retained changes with the Nix release and the same artifact,

@@ -119,10 +119,43 @@ std::unique_ptr<NgramTable> NgramTable::Open(const std::filesystem::path& path,
   return t;
 }
 
+void NgramTable::DecodeRow(const std::uint8_t* src, float* dst) const {
+  if (type_ == core::GgmlType::kIQ4_NL) {
+    gufo::quant::DequantizeIQ4_NL(src, dst, row_dim_);
+  } else {
+    for (std::uint32_t i = 0; i < row_dim_; ++i) {
+      std::uint16_t bits = 0;
+      std::memcpy(&bits, src + 2 * i, 2);
+      const std::uint32_t f = static_cast<std::uint32_t>(bits) << 16;
+      std::memcpy(dst + i, &f, sizeof(float));
+    }
+  }
+}
+
+bool NgramTable::ReadCached(std::uint32_t row, float* dst) {
+  if (cache_count_ == 0) {
+    return false;
+  }
+  const std::size_t slot = (row * 2654435761U) & (cache_count_ - 1);
+  CacheEntry& entry = cache_entries_[slot];
+  if (entry.busy.test_and_set(std::memory_order_acquire)) {
+    return false;
+  }
+  const bool hit = entry.valid && entry.row == row;
+  if (hit) {
+    DecodeRow(cache_rows_.data() + slot * row_bytes_, dst);
+  }
+  entry.busy.clear(std::memory_order_release);
+  return hit;
+}
+
 bool NgramTable::ReadOne(std::uint32_t row, float* dst,
                          std::vector<std::uint8_t>& buf) {
   if (row >= rows_) {
     return false;
+  }
+  if (ReadCached(row, dst)) {
+    return true;
   }
   const std::uint64_t offset = base_offset_ + row * row_bytes_;
   const std::uint64_t begin = direct_ ? offset & ~(kPage - 1) : offset;
@@ -147,49 +180,27 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
   CacheEntry* entry = cache_count_ != 0 ? &cache_entries_[slot] : nullptr;
   std::uint8_t* cached =
       entry != nullptr ? cache_rows_.data() + slot * row_bytes_ : nullptr;
-  bool hit = false;
-  // A busy slot is a cache miss: readers never wait for another row's I/O.
-  // The flag protects the tag and bytes together when colliding rows race.
+  std::size_t got = 0;
+  while (got < needed) {
+    const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);
+    if (n <= 0) {
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+      return false;
+    }
+    got += static_cast<std::size_t>(n);
+  }
+  // Cache only a complete row, still in its original quantized format.
+  // A busy slot is skipped; readers never wait for another row's I/O.
   if (entry != nullptr &&
       !entry->busy.test_and_set(std::memory_order_acquire)) {
-    if (entry->valid && entry->row == row) {
-      std::memcpy(base + (offset - begin), cached, row_bytes_);
-      hit = true;
-    }
+    std::memcpy(cached, base + (offset - begin), row_bytes_);
+    entry->row = row;
+    entry->valid = true;
     entry->busy.clear(std::memory_order_release);
   }
-  if (!hit) {
-    std::size_t got = 0;
-    while (got < needed) {
-      const ssize_t n = ::pread(fd_, base + got, length - got, begin + got);
-      if (n <= 0) {
-        if (n < 0 && errno == EINTR) {
-          continue;
-        }
-        return false;
-      }
-      got += static_cast<std::size_t>(n);
-    }
-    // Cache only a complete row, still in its original quantized format.
-    if (entry != nullptr &&
-        !entry->busy.test_and_set(std::memory_order_acquire)) {
-      std::memcpy(cached, base + (offset - begin), row_bytes_);
-      entry->row = row;
-      entry->valid = true;
-      entry->busy.clear(std::memory_order_release);
-    }
-  }
-  const std::uint8_t* src = base + (offset - begin);
-  if (type_ == core::GgmlType::kIQ4_NL) {
-    gufo::quant::DequantizeIQ4_NL(src, dst, row_dim_);
-  } else {
-    for (std::uint32_t i = 0; i < row_dim_; ++i) {
-      std::uint16_t bits = 0;
-      std::memcpy(&bits, src + 2 * i, 2);
-      const std::uint32_t f = static_cast<std::uint32_t>(bits) << 16;
-      std::memcpy(dst + i, &f, sizeof(float));
-    }
-  }
+  DecodeRow(base + (offset - begin), dst);
   return true;
 }
 
@@ -254,12 +265,19 @@ bool NgramTable::StartRead(std::span<const std::uint32_t> rows,
   if (jobs_.size() >= kBatchJobs) {
     std::sort(jobs_.begin(), jobs_.end(),
               [](const Job& a, const Job& b) { return a.row < b.row; });
+  } else {
+    // Small cached gathers avoid waking the I/O pool for every decode
+    // token. Large prefills still parallelize their row conversions.
+    std::erase_if(
+        jobs_, [this](const Job& job) { return ReadCached(job.row, job.dst); });
   }
   next_job_ = 0;
   pending_ = jobs_.size();
   failed_ = false;
   active_ = true;
-  wake_.notify_all();
+  if (pending_ != 0) {
+    wake_.notify_all();
+  }
   return true;
 }
 

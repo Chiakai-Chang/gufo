@@ -77,6 +77,8 @@ private:
     const float* src;
     float* dst;
   };
+  void DecodeRow(const std::uint8_t* src, float* dst) const;
+  bool ReadCached(std::uint32_t row, float* dst);
   bool ReadOne(std::uint32_t row, float* dst, std::vector<std::uint8_t>& buf);
   void Worker();
 

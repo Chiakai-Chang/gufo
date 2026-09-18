@@ -168,6 +168,9 @@ Executor::~Executor() {
   if (blas_ != nullptr) {
     (void)hipblasDestroy(blas_);
   }
+  if (counts_ready_ != nullptr) {
+    (void)hipEventDestroy(counts_ready_);
+  }
   if (stream_ != nullptr) {
     (void)hipStreamDestroy(stream_);
   }
@@ -190,6 +193,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     return nullptr;
   }
   if (!Check(hipStreamCreate(&e->stream_), "hipStreamCreate", error_msg)) {
+    return nullptr;
+  }
+  if (!Check(hipEventCreateWithFlags(&e->counts_ready_, hipEventDisableTiming),
+             "expert counts event", error_msg)) {
     return nullptr;
   }
   if (hipblasCreate(&e->blas_) != HIPBLAS_STATUS_SUCCESS ||
@@ -684,8 +691,8 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
                           std::string* error_msg) const {
   // Every column tile past an expert's bucket still costs a dispatch and a
   // full shared-memory reservation, so the grid is cut to the real largest
-  // bucket: the per-expert counts come back to the host (one short stall
-  // per layer), which also lets the tile width follow the distribution.
+  // bucket. Counts are downloaded before the shared expert; wait only for
+  // that download while the shared expert continues on the same stream.
   const Config& c = config();
   routed_max_rows_ = 0;
   routed_64_tiles_ = 0;
@@ -695,13 +702,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   if (n_tokens <= 4 * kVecBatch) {
     return true;
   }
-  ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts,
-               c.num_experts_used, stream_);
-  if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
-                            c.num_experts * sizeof(std::uint32_t),
-                            hipMemcpyDeviceToHost, stream_),
-             "expert counts download", error_msg) ||
-      !Check(hipStreamSynchronize(stream_), "expert counts", error_msg)) {
+  if (!Check(hipEventSynchronize(counts_ready_), "expert counts", error_msg)) {
     return false;
   }
   // The F16 expert GEMM launches one block per (expert, row tile of its
@@ -1291,9 +1292,21 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
+  if (n_tokens > 4 * kVecBatch) {
+    ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
+                 stream_);
+    if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
+                              c.num_experts * sizeof(std::uint32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               "expert counts download", error_msg) ||
+        !Check(hipEventRecord(counts_ready_, stream_), "expert counts event",
+               error_msg)) {
+      return false;
+    }
+  }
   // The shared expert (gated by the last router row) does not depend on
-  // the routing, so it is launched before the expert-count readback: its
-  // GEMMs keep the device busy while the host waits for the counts.
+  // routing. Queue its GEMMs after the count download, then prepare the
+  // routed dispatch on the CPU without waiting for these GEMMs to finish.
   if (!GatedDense(l.shexp_up, l.shexp_gate, x, s_.shexp_up, n_tokens,
                   &l.shexp_down, error_msg) ||
       !Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg)) {
