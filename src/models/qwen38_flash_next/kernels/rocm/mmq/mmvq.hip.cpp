@@ -5,71 +5,73 @@ namespace qfn_mmq {
 #include "vecdotq.hpp"
 
 // MTP shortlists with a private Q4 head, then rescores using the original Q8.
-static __global__ void requantize_q8_0_q4_1_kernel(const block_q8_0* source,
-                                                   block_q4_1* destination,
+static __global__ void requantize_q8_0_q4_0_kernel(const block_q8_0* source,
+                                                   block_q4_0* destination,
                                                    size_t blocks) {
   const size_t block = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (block >= blocks)
     return;
   float values[32];
-  float low = INFINITY, high = -INFINITY;
+  float peak = 0.0f, max_abs = 0.0f;
   const float scale = __half2float(source[block].d);
 #pragma unroll
   for (int i = 0; i < 32; ++i) {
     values[i] = scale * static_cast<float>(source[block].qs[i]);
-    low = fminf(low, values[i]);
-    high = fmaxf(high, values[i]);
+    if (fabsf(values[i]) > max_abs) {
+      max_abs = fabsf(values[i]);
+      peak = values[i];
+    }
   }
-  const float delta = (high - low) / 15.0f;
+  const float delta = peak / -8.0f;
   const float inverse = delta != 0.0f ? 1.0f / delta : 0.0f;
   auto& out = destination[block];
-  out.dm = __floats2half2_rn(delta, low);
+  out.d = __float2half_rn(delta);
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
-    const unsigned a = min(15, int((values[i] - low) * inverse + 0.5f));
-    const unsigned b = min(15, int((values[i + 16] - low) * inverse + 0.5f));
+    const unsigned a = min(15, int(values[i] * inverse + 8.5f));
+    const unsigned b = min(15, int(values[i + 16] * inverse + 8.5f));
     out.qs[i] = a | (b << 4);
   }
 }
 
 __launch_bounds__(32) static __global__
-    void mul_mat_vec_q4_1(const void* weights, const block_q8_1* input,
+    void mul_mat_vec_q4_0(const void* weights, const block_q8_1* input,
                           float* output, int cols) {
-  constexpr int vdr = VDR_Q4_1_Q8_1_MMVQ;
-  constexpr int blocks_per_iter = vdr * 32 / QI4_1;
+  constexpr int vdr = VDR_Q4_0_Q8_1_MMVQ;
+  constexpr int blocks_per_iter = vdr * 32 / QI4_0;
   const int lane = threadIdx.x;
-  const int blocks_per_row = cols / QK4_1;
+  const int blocks_per_row = cols / QK4_0;
   const int row_offset = blockIdx.x * blocks_per_row;
-  const int part = vdr * (lane % (QI4_1 / vdr));
+  const int part = vdr * (lane % (QI4_0 / vdr));
   float sum = 0.0f;
-  for (int kb = lane / (QI4_1 / vdr); kb < blocks_per_row;
+  for (int kb = lane / (QI4_0 / vdr); kb < blocks_per_row;
        kb += blocks_per_iter) {
-    sum += vec_dot_q4_1_q8_1(weights, input + kb, row_offset + kb, part);
+    sum += vec_dot_q4_0_q8_1(weights, input + kb, row_offset + kb, part);
   }
   sum = warp_reduce_sum<32>(sum);
   if (lane == 0)
     output[blockIdx.x] = sum;
 }
 
-extern "C" int qfn_mmq_requantize_q8_0_q4_1(const void* source,
+extern "C" int qfn_mmq_requantize_q8_0_q4_0(const void* source,
                                             void* destination, int rows,
                                             int cols, hipStream_t stream) {
   if (!source || !destination || rows <= 0 || cols <= 0 || cols % 32)
     return -1;
   const size_t blocks = size_t(rows) * cols / 32;
-  requantize_q8_0_q4_1_kernel<<<(blocks + 255) / 256, 256, 0, stream>>>(
+  requantize_q8_0_q4_0_kernel<<<(blocks + 255) / 256, 256, 0, stream>>>(
       static_cast<const block_q8_0*>(source),
-      static_cast<block_q4_1*>(destination), blocks);
+      static_cast<block_q4_0*>(destination), blocks);
   return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
-extern "C" int qfn_mmq_q4_1_dense_vec_preq(const void* weights,
+extern "C" int qfn_mmq_q4_0_dense_vec_preq(const void* weights,
                                            const void* input, float* output,
                                            int rows, int cols,
                                            hipStream_t stream) {
   if (!weights || !input || !output || rows <= 0 || cols <= 0 || cols % 32)
     return -1;
-  mul_mat_vec_q4_1<<<rows, 32, 0, stream>>>(
+  mul_mat_vec_q4_0<<<rows, 32, 0, stream>>>(
       weights, static_cast<const block_q8_1*>(input), output, cols);
   return hipGetLastError() == hipSuccess ? 0 : -2;
 }

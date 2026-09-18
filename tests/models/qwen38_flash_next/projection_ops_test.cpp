@@ -486,7 +486,7 @@ void CheckDecodeGrouping(int rows, int cols) {
 void CheckMtpOutputHead(float input_scale) {
   constexpr int rows = 65, cols = 2560, blocks = cols / 32;
   auto weights = MakeWeights(rows, cols, 73);
-  // Constant and zero blocks exercise the affine quantizer's zero range.
+  // Exercise a zero scale and constant blocks of either sign.
   for (int b = 0; b < 3; ++b)
     for (int i = 0; i < 32; ++i) {
       const auto code = static_cast<std::int8_t>(b == 0 ? 0 : b == 1 ? -7 : 9);
@@ -499,7 +499,7 @@ void CheckMtpOutputHead(float input_scale) {
   std::uint32_t seed = 31;
   for (auto& value : input)
     value = Uniform(&seed, 2.0F * input_scale);
-  const std::size_t q4_bytes = std::size_t(rows) * blocks * 20;
+  const std::size_t q4_bytes = std::size_t(rows) * blocks * 18;
   std::vector<std::uint8_t> packed(q4_bytes + 64, 0xAC);
   std::vector<std::uint8_t> quantized(qfn_mmq_q8_1_bytes(1, cols));
   std::vector<float> output(rows + 8, -1234567.0F);
@@ -530,8 +530,8 @@ void CheckMtpOutputHead(float input_scale) {
   CheckHip(hipStreamCreate(&stream), "MTP test stream");
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "MTP capture");
-  if (qfn_mmq_requantize_q8_0_q4_1(dw, dpacked + 32, rows, cols, stream) ||
-      qfn_mmq_q4_1_dense_vec_preq(dpacked + 32, dq, dy + 4, rows, cols, stream))
+  if (qfn_mmq_requantize_q8_0_q4_0(dw, dpacked + 32, rows, cols, stream) ||
+      qfn_mmq_q4_0_dense_vec_preq(dpacked + 32, dq, dy + 4, rows, cols, stream))
     throw std::runtime_error("MTP head launch failed");
   CheckHip(hipStreamEndCapture(stream, &graph), "MTP capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
@@ -568,26 +568,29 @@ void CheckMtpOutputHead(float input_scale) {
   for (int row = 0; row < rows; ++row) {
     double expected = 0;
     for (int b = 0; b < blocks; ++b) {
-      const auto* w = packed.data() + 32 + (row * blocks + b) * 20;
+      const auto* w = packed.data() + 32 + (row * blocks + b) * 18;
       const auto* x = quantized.data() + b * 36;
-      __half d4, minimum, d8, sum;
+      __half d4, d8, sum;
       std::memcpy(&d4, w, 2);
-      std::memcpy(&minimum, w + 2, 2);
       std::memcpy(&d8, x, 2);
       std::memcpy(&sum, x + 2, 2);
       int dot = 0;
       for (int i = 0; i < 32; ++i) {
-        const int code = (w[4 + i % 16] >> (i / 16 * 4)) & 15;
-        const float value = __half2float(d4) * code + __half2float(minimum);
+        const int code = (w[2 + i % 16] >> (i / 16 * 4)) & 15;
+        const float value = __half2float(d4) * (code - 8);
         const float original = weights.values[row * cols + b * 32 + i];
-        const float bound =
-            __half2float(d4) * 0.51F + (1.0F + std::abs(original)) * 0.002F;
+        // Q4_0 has levels -8..7; only the clipped endpoint gets a full step.
+        const float scale = __half2float(d4);
+        const bool clipped =
+            code == 15 && scale != 0.0F && original / scale > 7.5F;
+        const float bound = std::abs(scale) * (clipped ? 1.01F : 0.51F) +
+                            (1.0F + std::abs(original)) * 0.002F;
         if (!std::isfinite(value) || std::abs(value - original) > bound)
-          throw std::runtime_error("MTP quantization exceeds half-step error");
+          throw std::runtime_error("MTP quantization exceeds endpoint error");
         dot += code * static_cast<std::int8_t>(x[4 + i]);
       }
-      expected += double(__half2float(d4)) * __half2float(d8) * dot +
-                  double(__half2float(minimum)) * __half2float(sum);
+      expected += double(__half2float(d4)) *
+                  (double(__half2float(d8)) * dot - 8.0 * __half2float(sum));
     }
     if (!std::isfinite(output[row + 4]) ||
         std::abs(output[row + 4] - expected) > 0.001 * input_scale)

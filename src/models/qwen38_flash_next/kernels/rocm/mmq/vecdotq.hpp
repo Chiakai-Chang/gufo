@@ -112,7 +112,7 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_1_q8_1_imp
         sumi = ggml_hip_dp4a(vi1, u[2*i+1], sumi);
     }
 
-    // Keep the shortlist's scale products in F32, including small activations.
+    // Keep scale products in F32, including small activations.
     const float2 dm4f = __half22float2(dm4);
     const float2 ds8f = __half22float2(ds8);
     const float d4d8 = dm4f.x * ds8f.x;

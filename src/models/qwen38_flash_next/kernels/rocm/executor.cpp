@@ -1388,12 +1388,12 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
     return false;
   }
-  const bool shortlist = output.type == GgmlType::kQ4_1;
+  const bool shortlist = output.type == GgmlType::kQ4_0;
   if (shortlist) {
     Q8Input input;
     if (!Quantize(s_.mixed, 1, output.cols, &input, error_msg))
       return false;
-    if (qfn_mmq_q4_1_dense_vec_preq(output.data, input.data, s_.logits,
+    if (qfn_mmq_q4_0_dense_vec_preq(output.data, input.data, s_.logits,
                                     output.rows, output.cols, stream_) != 0) {
       AssignError(error_msg, "MTP shortlist projection failed");
       return false;

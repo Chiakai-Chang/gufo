@@ -297,7 +297,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       // Q4 selects a shortlist; the original Q8 head rescores those rows.
       // Convert once while loading, before graph capture.
       const std::size_t size =
-          std::size_t(m->output_.rows) * m->output_.cols / 32 * 20;
+          std::size_t(m->output_.rows) * m->output_.cols / 32 * 18;
       void* ptr = nullptr;
       if (hipMalloc(&ptr, size + kTailMargin) != hipSuccess) {
         up.Fail("hipMalloc failed for MTP output head");
@@ -305,7 +305,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       }
       m->allocations_.push_back(ptr);
       m->bytes_ += size + kTailMargin;
-      if (qfn_mmq_requantize_q8_0_q4_1(m->output_.data, ptr, m->output_.rows,
+      if (qfn_mmq_requantize_q8_0_q4_0(m->output_.data, ptr, m->output_.rows,
                                        m->output_.cols, nullptr) != 0) {
         up.Fail("MTP output head conversion failed");
         return nullptr;
@@ -313,7 +313,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
       (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0,
                            kTailMargin, nullptr);
       m->mtp_output_.data = ptr;
-      m->mtp_output_.type = core::GgmlType::kQ4_1;
+      m->mtp_output_.type = core::GgmlType::kQ4_0;
     }
   }
   for (const auto& c : conversions) {

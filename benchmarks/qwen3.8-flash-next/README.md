@@ -18,13 +18,13 @@ GTT counter with the idle host subtracted; separate CPU memory is not included.
 | Mode | Loaded GiB | After generation GiB |
 | --- | ---: | ---: |
 | AR | 85.39 | 85.66 |
-| MTP | 89.76 | 90.04 |
+| MTP | 89.72 | 90.01 |
 
 The full requested KV capacity remains allocated. Raw indexer keys use a
 4096-row ring; completed blocks retain their pooled keys. PLE, MTP and trunk
 activations share storage when their lifetimes do not overlap. Snapshots keep
 only unpooled raw keys; existing disk cache entries rebuild after this layout
-change. MTP adds a 0.37 GiB Q4 shortlist head; target weights and cache
+change. MTP adds a 0.33 GiB Q4 shortlist head; target weights and cache
 precision are unchanged.
 
 ## Performance
@@ -37,7 +37,7 @@ Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1495.63 | 1528.66 |
+| 0 | 1495.63 | 1522.21 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
 | 32768 | 1406.93 | TODO |
@@ -46,9 +46,9 @@ Rates are tok/s; profiler timings are excluded.
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.32 | 47.12 | 71.0% |
+| Greedy | 0 | 26.32 | 47.58 | 71.0% |
 | Greedy | 32768 | TODO | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 48.22 | 75.9% |
+| Temperature 0.7 | 0 | TODO | 47.93 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
 AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
@@ -60,9 +60,9 @@ HTTP, C1, context 4096, seed 1, up to 128 output tokens, uncached prompts:
 
 | Prompt | MTP greedy tok/s | MTP temperature 0.7 tok/s |
 | --- | ---: | ---: |
-| Repetitive pattern | 81.34 | 71.11 |
-| Python iterator merge | 47.77 | 47.03 |
-| Probability exercise | 57.38 | 52.13 |
+| Repetitive pattern | 82.02 | 71.95 |
+| Python iterator merge | 48.11 | 47.33 |
+| Probability exercise | 58.13 | 52.60 |
 
 The sampled repetitive response ended at 78 tokens; other rows generated 128.
 Concurrent throughput: TODO.

@@ -51,10 +51,10 @@ int qfn_mmq_q8_0_dense_vec_preq(const void * W_q8_0, const void * W_gate,
                                 const void * X_q8, float * out_f32, int M,
                                 int N, int K, hipStream_t stream);
 
-int qfn_mmq_requantize_q8_0_q4_1(const void* source, void* destination,
+int qfn_mmq_requantize_q8_0_q4_0(const void* source, void* destination,
                                  int rows, int cols, hipStream_t stream);
 
-int qfn_mmq_q4_1_dense_vec_preq(const void* weights, const void* input,
+int qfn_mmq_q4_0_dense_vec_preq(const void* weights, const void* input,
                                 float* output, int rows, int cols,
                                 hipStream_t stream);
 
