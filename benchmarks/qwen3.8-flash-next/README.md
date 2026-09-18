@@ -63,9 +63,10 @@ All 46 measured MTP requests matched the AR C1 completions. Acceptance was
 workload at C6/C8.
 
 Target projections share batches across requests; KV, recurrent state,
-sampling history and rollback stay independent. MTP proposals still run per
-session. Large Q8 projections share weight rows across waves, with eight
-input rows per wave. Other shapes retain their measured faster geometry.
+sampling history and rollback stay independent. MTP proposal generation and
+acceptance decisions run per session. Large Q8 projections share weight rows
+across waves, with eight input rows per wave. Other shapes retain their measured
+faster geometry.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
 
 ## Memory and execution
@@ -130,10 +131,13 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]projectio
 - **Model state:** `qwen38_flash_next_session_test` checks full logits, tokens,
   RNG and acceptance against serial execution at C2/C4/C6/C8, including ragged
   budgets, reordered requests, a 4K boundary and complete snapshot bytes.
+  Sampled cycles must exercise acceptance and rejection, preserving penalty
+  history and deferred residual draws across requests.
   Its shared 23-case serving matrix checks AR/MTP filters, penalties, replay,
-  C2 and short budgets. Sampled tokens teacher-forced through AR must reproduce
-  each frontier. `qwen38_flash_next_snapshot_test` checks persistence, rollback
-  and deferred residual draws. Both accept `--model "$MODEL" --mtp-model "$MTP"`
+  C2, reported execution width and short budgets. Sampled tokens teacher-forced
+  through AR must reproduce each frontier. `qwen38_flash_next_snapshot_test`
+  checks persistence, rollback and deferred residual draws. Both accept
+  `--model "$MODEL" --mtp-model "$MTP"`
   and belong to the explicit `qwen38_flash_next_model_tests` build target.
 - **Qualification:** scheduling/fusion changes must preserve operator rounding
   and model replay. Arithmetic changes additionally need CPU/reference probes

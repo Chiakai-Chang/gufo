@@ -2371,6 +2371,9 @@ public:
       }
       throw std::runtime_error("Flash-Next batched MTP failed: " + error);
     }
+    const auto active_count = static_cast<std::size_t>(std::count_if(
+        results.begin(), results.end(),
+        [](const auto& result) { return !result.tokens.empty(); }));
     std::vector<TextDecodeStep> steps(count);
     for (std::size_t i = 0; i < count; ++i) {
       auto& state = RequireQwenFlashNextState(decodes[i].state.get());
@@ -2378,6 +2381,10 @@ public:
       state.set_position(state.session().Position());
       auto& step = steps[i];
       step.stop = results[i].stop;
+      if (active_count > 1 && !results[i].tokens.empty()) {
+        step.execution_plan = {.kind = TextExecutionPlanKind::kBatched,
+                               .physical_width = active_count};
+      }
       for (const auto token : results[i].tokens) {
         step.selections.push_back({.stop = false,
                                    .token = static_cast<TextRunnerToken>(token),

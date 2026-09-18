@@ -4,6 +4,7 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <latch>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -30,6 +31,8 @@ void RequireExact(std::span<const float> expected,
 
 void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
+  std::size_t sampled_rejections = 0;
+  std::size_t sampled_acceptances = 0;
   std::vector<std::unique_ptr<qfn::Session>> serial, batched;
   std::vector<sampling::SamplerState> serial_samplers, batch_samplers;
   const auto cases = gufo::test::QwenSamplingCases();
@@ -81,8 +84,10 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
     for (unsigned cycle = 0; cycle < 2; ++cycle) {
       std::vector<qfn::Session::DecodeResult> expected(width), actual(width);
       std::vector<qfn::Session::DecodeRequest> requests;
+      std::vector<qfn::Session::SpeculativeStats> before;
       for (std::size_t i = 0; i < width; ++i) {
         const std::size_t budget = 1 + (i * 3 + cycle * 5 + 7) % 8;
+        before.push_back(serial[i]->Statistics());
         Require(serial[i]->DecodeStep(budget, serial_samplers[i], &expected[i],
                                       &error, false),
                 error);
@@ -109,11 +114,43 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
                 "batched decode tokens, RNG or acceptance differ");
         RequireExact(serial[i]->Logits(), batched[i]->Logits(),
                      "batched MTP frontier differs");
+        Require(std::equal(serial_samplers[i].history().begin(),
+                           serial_samplers[i].history().end(),
+                           batch_samplers[i].history().begin(),
+                           batch_samplers[i].history().end()),
+                "batched sampling history differs");
+        // Probe a copy so the test also compares pending residual draws at
+        // the final cycle, without consuming either request's real state.
+        auto serial_next = serial_samplers[i];
+        auto batch_next = batch_samplers[i];
+        Require(serial_next.Sample(serial[i]->Logits()) ==
+                        batch_next.Sample(batched[i]->Logits()) &&
+                    serial_next.rng_state() == batch_next.rng_state(),
+                "batched next draw or deferred residual differs");
+        if (serial_samplers[i].config().uses_random_sampling()) {
+          const auto drafted = a.drafted - before[i].drafted;
+          const auto accepted = a.accepted - before[i].accepted;
+          sampled_acceptances += accepted;
+          if (accepted < drafted) {
+            ++sampled_rejections;
+            // stop_at_eos is false: a sampled rejection always defers its
+            // correction. Retrieving it must not draw again from p.
+            Require(serial_next.rng_state() == serial_samplers[i].rng_state(),
+                    "sampled rejection lost its deferred correction");
+          }
+        }
       }
     }
     std::cout << "batch C" << width << " AR_MTP_logits_RNG_exact=1\n"
               << std::flush;
   }
+  Require(
+      sampled_acceptances > 0 && sampled_rejections > 0,
+      "batch test must exercise sampled acceptance and residual correction");
+  std::cout << "batch sampled_accepted=" << sampled_acceptances
+            << " rejected_cycles=" << sampled_rejections
+            << " history_and_residual_exact=1\n"
+            << std::flush;
   // A complete state comparison catches recurrent/hidden differences that a
   // short output comparison could miss.
   for (std::size_t i = 0; i < serial.size(); ++i) {
@@ -176,6 +213,9 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
     Require(!ordinary.tokens.empty() && ordinary.draft_tokens == 0 &&
                 speculative.draft_tokens > 0,
             "sampling strategy did not exercise AR and MTP");
+    Require(ordinary.physical_execution_width == 1 &&
+                speculative.physical_execution_width == 1,
+            "serial completion reported a batched execution");
     if (!test.config.uses_random_sampling()) {
       Require(ordinary.tokens == speculative.tokens,
               "serving greedy AR/MTP mismatch: " + std::string(test.name));
@@ -198,13 +238,17 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   // Every strategy also runs with shared projections in a concurrent pair.
   for (const bool use_mtp : {false, true}) {
     auto& backend = use_mtp ? mtp : ar;
+    std::size_t batched_requests = 0;
     for (std::size_t offset = 0; offset < references.size(); offset += 2) {
       std::array<std::future<Backend::Result>, 2> pending;
+      std::latch ready(pending.size());
       for (std::size_t row = 0; row < pending.size(); ++row) {
         const auto* saved = &references[(offset + row) % references.size()];
-        pending[row] = std::async(std::launch::async, [&backend, saved] {
-          return backend.complete(saved->prompt, 8, saved->test.config);
-        });
+        pending[row] =
+            std::async(std::launch::async, [&backend, &ready, saved] {
+              ready.arrive_and_wait();
+              return backend.complete(saved->prompt, 8, saved->test.config);
+            });
       }
       for (std::size_t row = 0; row < pending.size(); ++row) {
         const auto& saved = references[(offset + row) % references.size()];
@@ -215,8 +259,16 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
                 actual.draft_tokens == expected.draft_tokens &&
                 actual.draft_accepted_tokens == expected.draft_accepted_tokens,
             "interleaving changed serving sampling or acceptance");
+        if (actual.physical_execution_width > 1) {
+          Require(actual.physical_execution_width == 2 &&
+                      actual.execution_plan == "batched-w2",
+                  "paired completion reported an incorrect execution plan");
+          ++batched_requests;
+        }
       }
     }
+    Require(batched_requests > 0,
+            "concurrent sampling checks did not report batched execution");
     // Greedy/AR prefixes are budget-independent. Sampled MTP consumes
     // proposal/rejection draws, so each budget must replay its own result.
     for (const auto index : {std::size_t{0}, references.size() - 2}) {
@@ -243,7 +295,8 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
       }
     }
     std::cout << "serving strategies=" << references.size()
-              << " mtp=" << use_mtp << " C2_and_budgets_exact=1\n"
+              << " mtp=" << use_mtp << " batched_requests=" << batched_requests
+              << " C2_and_budgets_exact=1\n"
               << std::flush;
   }
 }
