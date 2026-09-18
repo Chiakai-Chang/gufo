@@ -1351,7 +1351,7 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
 /// each wave-wide slice of 32 lanes is one K block.
 __global__ void GdnEpilogueKernel(const float* raw, const float* z,
                                   std::uint32_t z_stride, const float* norm_w,
-                                  float* out, void* out_q8,
+                                  float* out, void* out_q8, __half* out_half,
                                   std::uint32_t n_rows, std::uint32_t v_heads,
                                   float eps) {
   constexpr std::uint32_t d = kGdnDim;
@@ -1377,7 +1377,11 @@ __global__ void GdnEpilogueKernel(const float* raw, const float* z,
 #pragma unroll
     for (std::uint32_t r = 0; r < per_lane; ++r) {
       const std::uint32_t i = r * warpSize + lane;
-      out[row * d + i] = v[r] * scale * norm_w[i] * SigmoidF(zrow[i]);
+      const float value = v[r] * scale * norm_w[i] * SigmoidF(zrow[i]);
+      if (out_half != nullptr)
+        out_half[row * d + i] = __float2half_rn(value);
+      else
+        out[row * d + i] = value;
     }
     return;
   }
@@ -2601,8 +2605,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
       kPackHeads ? linear / kWmmaKvHeads : blockIdx.x;
   const std::uint32_t query_start = query_group * kQueryRows;
   const std::uint32_t kv_head =
-      kPackHeads ? linear % kWmmaKvHeads
-                 : blockIdx.y / (kWmmaGqa / kWmmaHeads);
+      kPackHeads ? linear % kWmmaKvHeads : blockIdx.y / (kWmmaGqa / kWmmaHeads);
   const std::uint32_t first_query_head =
       kPackHeads ? kv_head * kWmmaGqa
                  : (kv_head * kWmmaGqa) +
@@ -4930,7 +4933,8 @@ bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
     if (m == 10240 && k == 320 && batch >= 1024) {
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 1, 4, 2, 8>), grid,
                          dim3(kThreads), 0, stream, w, x, out, batch, m, k);
-    } else if ((m == 16384 || m == 13312) && k == 2560 && batch >= 1024) {
+    } else if (batch >= 1024 && (((m == 16384 || m == 13312) && k == 2560) ||
+                                 (m == 2560 && k == 6144))) {
       // Eight row groups reuse each weight fragment across all token tiles
       // and keep fewer weight fragments live. K accumulation is unchanged.
       hipLaunchKernelGGL((DenseF16GEMMKernel<kWideBM, kBN, 2, 8, 1>), grid,
@@ -5068,7 +5072,7 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t n_tokens, std::uint32_t k_heads,
                    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
                    bool row_split, bool convolved, float eps,
-                   hipStream_t stream) {
+                   hipStream_t stream, __half* out_half) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
   if (!convolved) {
@@ -5126,7 +5130,7 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
   hipLaunchKernelGGL(GdnEpilogueKernel,
                      dim3((n_tokens * v_heads + waves - 1) / waves),
                      dim3(kThreads), 0, stream, raw, z, z_stride, norm_w, out,
-                     out_q8, n_tokens * v_heads, v_heads, eps);
+                     out_q8, out_half, n_tokens * v_heads, v_heads, eps);
 }
 
 void UnpackQGate(const float* qg, std::uint32_t qg_stride, float* q,

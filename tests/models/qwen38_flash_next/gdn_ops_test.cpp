@@ -190,6 +190,39 @@ int RunCase(std::uint32_t kTokens) {
       outs[route] = Download(&d_out, kOut);
       states[route] = Download(&d_state, kStateCount);
       raws[route] = Download(&d_raw, kRaw);
+      // Direct F16 output must equal narrowing the independently checked
+      // F32 epilogue and must not change the recurrent state.
+      constexpr std::size_t kHalfGuard = 16;
+      HipBuffer<__half> d_half(kOut + kHalfGuard);
+      CheckHip(hipMemset(d_half.get(), 0x7F, d_half.bytes()), "half guard");
+      Upload(&d_conv_state, conv_state);
+      Upload(&d_state, state);
+      q::GatedDeltaNet(d_qkv.get(), kChannels, d_z.get(), kZ,
+                       d_alpha_beta.get(), d_conv_w.get(), d_a.get(),
+                       d_dt.get(), d_norm_w.get(), d_conv_state.get(),
+                       d_scratch.get(), d_qn.get(), d_kn.get(), d_raw.get(),
+                       d_state.get(), nullptr, nullptr, nullptr, nullptr,
+                       kTokens, kKHeads, kVHeads, kDim, kKernel, route == 1,
+                       false, kEps, nullptr, d_half.get());
+      std::vector<__half> half(kOut + kHalfGuard);
+      CheckHip(hipMemcpy(half.data(), d_half.get(), d_half.bytes(),
+                         hipMemcpyDeviceToHost),
+               "half output");
+      for (std::size_t i = 0; i < kOut; ++i) {
+        const __half expected = __float2half_rn(outs[route][i]);
+        if (std::memcmp(&expected, &half[i], sizeof(__half)) != 0)
+          throw std::runtime_error("GDN F16 epilogue changed rounding");
+      }
+      for (std::size_t i = kOut; i < half.size(); ++i) {
+        std::uint16_t bits;
+        std::memcpy(&bits, &half[i], sizeof(bits));
+        if (bits != 0x7F7F)
+          throw std::runtime_error("GDN F16 epilogue wrote past its output");
+      }
+      const auto half_state = Download(&d_state, kStateCount);
+      if (std::memcmp(half_state.data(), states[route].data(),
+                      kStateCount * sizeof(float)) != 0)
+        throw std::runtime_error("GDN F16 epilogue changed the state");
       // The causal conv's output (the scratch's first rows) against a CPU
       // reference over the same history.
       conv_out = Download(&d_scratch, kScratch);

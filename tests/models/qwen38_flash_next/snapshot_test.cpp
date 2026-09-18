@@ -208,6 +208,15 @@ int main(int argc, char** argv) {
                         prompt_logits.size() * sizeof(float)) == 0,
             "extension after restore differs");
 
+    // Cached state from older prefill arithmetic must be rebuilt.
+    auto incompatible = bytes;
+    const std::uint32_t old_version = qfn::Session::kSnapshotPayloadVersion - 1;
+    std::memcpy(incompatible.data() + 8, &old_version, sizeof(old_version));
+    Require(!restored->RestoreSnapshot(incompatible, &error),
+            "incompatible snapshot version accepted");
+    Require(restored->Position() == extended.size(),
+            "incompatible snapshot disturbed the session");
+
     // Rejections: truncated payload, and a context too small to hold it.
     Require(!restored->RestoreSnapshot(
                 std::span<const std::uint8_t>(bytes).first(bytes.size() / 2),

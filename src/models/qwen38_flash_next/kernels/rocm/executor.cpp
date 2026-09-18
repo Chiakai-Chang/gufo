@@ -1092,19 +1092,33 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
     return false;
   }
-  // Wide batches hand the output projection its tiled Q8 input straight
-  // from the epilogue: no F32 row and no activation pass.
+  // The epilogue writes the output projection's input directly. Large
+  // SSM batches use F16 activations and reuse the F32 output allocation;
+  // smaller batches keep the tiled Q8 route.
   const bool tiled = n_tokens > kVecBatch &&
                      l.ssm_out.type == GgmlType::kQ8_0 &&
                      n_tokens <= options_.max_batch;
-  GatedDeltaNet(
-      qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
-      l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
-      s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
-      tiled ? s_.x_q8t : nullptr, speculative ? s.state_snapshots : nullptr,
-      speculative ? s.conv_snapshots : nullptr, n_tokens, c.ssm_num_k_heads,
-      c.ssm_num_v_heads, c.ssm_head_dim, c.ssm_conv_kernel,
-      n_tokens > kVecBatch && !speculative, convolved, c.rms_eps, stream_);
+  const bool half_output = tiled && n_tokens >= 1024 &&
+                           l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
+  auto* out_half =
+      half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
+  GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),
+                l.ssm_a.f32(), l.ssm_dt.f32(), l.ssm_norm.f32(), s.conv_state,
+                s_.conv_scratch, s_.qn, s_.kn, s_.gdn_raw, s.state, s_.gdn_out,
+                tiled && !half_output ? s_.x_q8t : nullptr,
+                speculative ? s.state_snapshots : nullptr,
+                speculative ? s.conv_snapshots : nullptr, n_tokens,
+                c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
+                c.ssm_conv_kernel, n_tokens > kVecBatch && !speculative,
+                convolved, c.rms_eps, stream_, out_half);
+  if (half_output) {
+    if (!DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens, l.ssm_out.rows,
+                      l.ssm_out.cols, stream_)) {
+      AssignError(error_msg, "SSM output F16 GEMM failed");
+      return false;
+    }
+    return true;
+  }
   if (tiled) {
     q8t_src_ = nullptr;
     if (!W8A8Gemm(l.ssm_out.data, s_.x_q8t, out, n_tokens, l.ssm_out.rows,

@@ -242,8 +242,10 @@ void PleInject(float* res, const float* gated, const float* conv,
 /// `qkv` rows are `qkv_stride` floats apart and `z` rows `z_stride`, so a
 /// stacked [qkv|z] projection feeds both without unpacking. A non-null
 /// `out_q8` receives the rows quantized into the W8A8 tiled layout
-/// (K = v_heads * d) instead of `out`. `convolved` consumes convolution
-/// rows already in conv_scratch; it requires null speculative snapshots.
+/// (K = v_heads * d) instead of `out`. With null `out_q8`, a non-null
+/// `out_half` receives F16 rows instead of `out`. `convolved` consumes
+/// convolution rows already in conv_scratch; it requires null speculative
+/// snapshots.
 void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t z_stride, const float* alpha_beta,
                    const float* conv_w, const float* a, const float* dt,
@@ -253,7 +255,7 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    std::uint32_t n_tokens, std::uint32_t k_heads,
                    std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
                    bool row_split, bool convolved, float eps,
-                   hipStream_t stream);
+                   hipStream_t stream, __half* out_half = nullptr);
 
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row

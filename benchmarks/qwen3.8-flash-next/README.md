@@ -15,10 +15,10 @@ C1, context limit 262144, one server session, a 3891-token repetitive prompt,
 128 generated tokens and seed 1. GPU-visible unified allocations use the Linux
 GTT counter with the idle host subtracted; separate CPU memory is not included.
 
-| Mode | Loaded GiB | After generation GiB | Greedy TG tok/s | Temperature 0.7 TG tok/s |
-| --- | ---: | ---: | ---: | ---: |
-| AR | 85.39 | 85.66 | 25.70 | 25.19 |
-| MTP | 89.39 | 89.67 | 59.82 | 56.99 |
+| Mode | Loaded GiB | After generation GiB |
+| --- | ---: | ---: |
+| AR | 85.39 | 85.66 |
+| MTP | 89.39 | 89.67 |
 
 The full requested KV capacity remains allocated. Raw indexer keys use a
 4096-row ring; completed blocks retain their pooled keys. PLE, MTP and trunk
@@ -28,32 +28,33 @@ change. Weights, cache precision and sampling are unchanged.
 
 ## Performance
 
-Nix release, C1, pp2048, tg128, seed 1, one measured repetition
-(2026-09-18 UTC). The CLI uses deterministic repetitive text, warms prefill
+Nix release, C1, pp2048, tg128, seed 1, one measured repetition except
+sampled MTP TG (two; mean ± standard deviation), 2026-09-18 UTC.
+The CLI uses deterministic repetitive text, warms prefill
 and continues generation past EOS. Depth precedes the measured operation.
 Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1484.98 | 1506.11 |
+| 0 | 1481.68 | 1514.58 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
-| 32768 | 1394.13 | TODO |
+| 32768 | 1396.57 | TODO |
 | 65536 | TODO | TODO |
-| 131072 | 1321.20 | TODO |
+| 131072 | 1322.90 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.09 | 42.99 | 71.0% |
-| Greedy | 32768 | 23.94 | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 44.13 | 75.9% |
+| Greedy | 0 | 26.11 | 43.16 | 71.0% |
+| Greedy | 32768 | TODO | TODO | TODO |
+| Temperature 0.7 | 0 | TODO | 43.31 ± 0.26 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
 AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
-The d32K TG control uses 34,945. MTP TG measurements use the same decoding
-kernels; the latest QKV tuning applies only to wide prefill.
+MTP PP uses the greedy run. The latest SSM projection tuning applies only
+to prefill batches of at least 1024 tokens.
 The targets are **1700 tok/s pp2048** and near-flat PP through d128K;
-both remain TODO. The measured d0-to-d128K decline is 11.0%.
+both remain TODO. The measured d0-to-d128K decline is 10.7%.
 Refreshed HTTP and concurrent throughput: TODO.
 Serving interleaves sessions but does not batch model work;
 `gufo bench` supports C1 for this model.
@@ -85,10 +86,12 @@ Decisions use committed acceptance history and reset with the session.
 Snapshots preserve this state; new HTTP requests reset it when reusing
 context. Decisions never depend on wall-clock timings.
 
-Retained optimizations: exact SSM/QKV projection tiling, exact partial top-64
-selection, GPU verification logits with one frontier readback, and parallel
-unordered verification with the original F32 sum order. Six-wave and
-per-query sparse-attention experiments were exact but slower and were rejected.
+Retained optimizations: SSM/QKV projection tiling, F16 SSM output activations,
+exact partial top-64 selection, GPU verification logits with one frontier
+readback, and parallel unordered verification with the original F32 sum order.
+F16 SSM output reduces numerical error with unchanged model throughput and
+no additional allocation. Larger sparse-attention tiles and wider DeltaNet
+row reductions were slower. Compact attention scratch gave no material gain.
 
 ## Quality checks
 
@@ -141,6 +144,9 @@ Prefill changes also require `gufo bench --validate-prefill N` and CPU/reference
 probes. Benchmark retained changes with the Nix release and the same artifact,
 context capacity and request setup. Keep exact output and acceptance checks
 beside speed results; a profiler trace is not a speed benchmark.
+The current 1024-token prefill check is finite, with scalar-winner rank 1,
+logit RMSE 0.24 and maximum absolute error 1.15. Snapshot compatibility
+includes prefill arithmetic; older cached states rebuild after it changes.
 
 Sampled MTP preserves the target sampling distribution within floating-point
 precision, but need not produce AR's same-seed tokens or a common prefix
