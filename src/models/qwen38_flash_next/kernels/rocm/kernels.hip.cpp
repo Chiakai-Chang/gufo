@@ -2477,10 +2477,11 @@ __global__ void ArgmaxFinishKernel(const float* logits,
 
 constexpr unsigned kMtpCandidateTile = 1024;
 
-// A token excluded from its tile's top 64 cannot enter the global top 64.
+// A token excluded from its tile's top Keep cannot enter the global top Keep.
 // Reduce tiles repeatedly, retaining the original order of equal scores.
 // Only token IDs need to survive between passes; the original logit buffer
 // supplies scores and preserves the sign of zero in the final output.
+template<unsigned Keep>
 __global__ void MtpCandidateTileKernel(const float* logits,
                                        const std::uint32_t* input,
                                        std::uint32_t* output, float* scores,
@@ -2503,13 +2504,42 @@ __global__ void MtpCandidateTileKernel(const float* logits,
 #pragma unroll
   for (unsigned j = 0; j < 4; ++j) {
     const unsigned rank = threadIdx.x * 4 + j;
-    if (rank < min(static_cast<unsigned>(kMtpCandidates), size)) {
-      output[blockIdx.x * kMtpCandidates + rank] = ids[j];
+    if (rank < min(Keep, size)) {
+      output[blockIdx.x * Keep + rank] = ids[j];
       if (scores != nullptr) {
         const float value = ids[j] < vocab ? logits[ids[j]] : -INFINITY;
         scores[rank] = isfinite(value) ? value : -INFINITY;
       }
     }
+  }
+}
+
+// Q8 rescoring changes the shortlist's order. Encode the token ID in the key
+// so equal scores still choose the lowest ID, including signed zero/nonfinite.
+__global__ void MtpRescoredCandidatesKernel(const float* logits,
+                                            std::uint32_t* ids, float* scores,
+                                            std::uint32_t vocab) {
+  using Sort =
+      hipcub::BlockRadixSort<std::uint64_t, kMtpShortlist, 1, std::uint32_t>;
+  __shared__ Sort::TempStorage scratch;
+  const unsigned rank = threadIdx.x;
+  const unsigned id = rank < min(vocab, kMtpShortlist) ? ids[rank] : UINT32_MAX;
+  const float value = id < vocab ? logits[id] : -INFINITY;
+  auto bits = __float_as_uint(value);
+  const auto magnitude = bits & 0x7FFFFFFFU;
+  // Integer canonicalization survives -fno-signed-zeros in release builds.
+  if (magnitude == 0)
+    bits = 0;
+  else if (magnitude >= 0x7F800000U)
+    bits = 0xFF800000U;
+  const auto ordered = bits & 0x80000000U ? ~bits : bits ^ 0x80000000U;
+  std::uint64_t key[1]{(std::uint64_t(ordered) << 32) | (UINT32_MAX - id)};
+  std::uint32_t token[1]{id};
+  Sort(scratch).SortDescending(key, token);
+  if (rank < min(vocab, static_cast<unsigned>(kMtpCandidates))) {
+    ids[rank] = token[0];
+    const float score = logits[token[0]];
+    scores[rank] = isfinite(score) ? score : -INFINITY;
   }
 }
 
@@ -5374,19 +5404,19 @@ void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
                      stream, logits, scratch, out, vocab);
 }
 
-void MtpTopCandidates(const float* logits, std::uint32_t* ids,
-                      std::uint32_t* scratch_ids, float* scores,
-                      std::uint32_t vocab, hipStream_t stream) {
+template<unsigned Keep>
+void SelectMtpCandidates(const float* logits, std::uint32_t* ids,
+                         std::uint32_t* scratch_ids, float* scores,
+                         std::uint32_t vocab, hipStream_t stream) {
   if (logits == nullptr || ids == nullptr || scratch_ids == nullptr ||
-      scores == nullptr || vocab == 0) {
+      vocab == 0) {
     throw std::invalid_argument("invalid MTP candidate selection");
   }
   const auto tiles = [](std::uint32_t n) {
     return 1U + (n - 1U) / kMtpCandidateTile;
   };
   unsigned passes = 1;
-  for (auto size = vocab; size > kMtpCandidateTile;
-       size = tiles(size) * kMtpCandidates) {
+  for (auto size = vocab; size > kMtpCandidateTile; size = tiles(size) * Keep) {
     ++passes;
   }
   // Choose the first buffer so the final pass always lands in `ids`.
@@ -5395,16 +5425,41 @@ void MtpTopCandidates(const float* logits, std::uint32_t* ids,
   auto size = vocab;
   for (;;) {
     const auto blocks = tiles(size);
-    hipLaunchKernelGGL(MtpCandidateTileKernel, dim3(blocks), dim3(kThreads), 0,
-                       stream, logits, source, destination,
+    hipLaunchKernelGGL((MtpCandidateTileKernel<Keep>), dim3(blocks),
+                       dim3(kThreads), 0, stream, logits, source, destination,
                        blocks == 1 ? scores : nullptr, size, vocab);
     if (blocks == 1) {
       break;
     }
-    size = blocks * kMtpCandidates;
+    size = blocks * Keep;
     source = destination;
     destination = destination == ids ? scratch_ids : ids;
   }
+}
+
+void MtpTopCandidates(const float* logits, std::uint32_t* ids,
+                      std::uint32_t* scratch_ids, float* scores,
+                      std::uint32_t vocab, hipStream_t stream) {
+  if (scores == nullptr)
+    throw std::invalid_argument("invalid MTP candidate scores");
+  SelectMtpCandidates<kMtpCandidates>(logits, ids, scratch_ids, scores, vocab,
+                                      stream);
+}
+
+void MtpShortlist(const float* logits, std::uint32_t* ids,
+                  std::uint32_t* scratch_ids, std::uint32_t vocab,
+                  hipStream_t stream) {
+  SelectMtpCandidates<kMtpShortlist>(logits, ids, scratch_ids, nullptr, vocab,
+                                     stream);
+}
+
+void MtpRescoredCandidates(const float* logits, std::uint32_t* ids,
+                           float* scores, std::uint32_t vocab,
+                           hipStream_t stream) {
+  if (logits == nullptr || ids == nullptr || scores == nullptr || vocab == 0)
+    throw std::invalid_argument("invalid MTP candidate rescoring");
+  hipLaunchKernelGGL(MtpRescoredCandidatesKernel, dim3(1), dim3(kMtpShortlist),
+                     0, stream, logits, ids, scores, vocab);
 }
 
 }  // namespace gufo::models::qwen38_flash_next::rocm

@@ -348,6 +348,10 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     s.mtp_res = s.res;
     s.mtp_argmax = Alloc<ArgmaxCandidate>(a, kArgmaxParts, error_msg);
     s.mtp_token = Alloc<std::int32_t>(a, 1, error_msg);
+    const auto candidate_ids = MtpCandidateWorkspaceSize(c.vocab_size);
+    s.mtp_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
+    s.mtp_scratch_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
+    s.mtp_scores = f32(kMtpCandidates);
     if (!Check(hipHostMalloc(&e->mtp_token_host_, 2 * sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
         !Check(
@@ -1380,35 +1384,61 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 
 bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
                        bool candidates, std::string* error_msg) const {
-  const DeviceTensor& output = model_->output();
-  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg) ||
-      !Dense(output, s_.mixed, s_.logits, 1, error_msg)) {
+  const DeviceTensor& output = model_->mtp_output();
+  if (!HcMix(head, res, false, s_.mixed, nullptr, 1, error_msg)) {
     return false;
   }
+  const bool shortlist = output.type == GgmlType::kQ4_1;
+  if (shortlist) {
+    Q8Input input;
+    if (!Quantize(s_.mixed, 1, output.cols, &input, error_msg))
+      return false;
+    if (qfn_mmq_q4_1_dense_vec_preq(output.data, input.data, s_.logits,
+                                    output.rows, output.cols, stream_) != 0) {
+      AssignError(error_msg, "MTP shortlist projection failed");
+      return false;
+    }
+    MtpShortlist(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, output.rows,
+                 stream_);
+    // Keep the same input quantization and Q8 dot/reduction order as the full
+    // head. Only the proposed support is approximated; target p/q verification
+    // consumes the actual resulting proposal distribution.
+    if (qfn_mmq_q8_0_selected_vec_preq(
+            model_->output().data, input.data, s_.mtp_ids, s_.logits,
+            std::min<std::uint32_t>(output.rows, kMtpShortlist), output.rows,
+            output.cols, stream_) != 0) {
+      AssignError(error_msg, "MTP shortlist rescoring failed");
+      return false;
+    }
+    MtpRescoredCandidates(s_.logits, s_.mtp_ids, s_.mtp_scores, output.rows,
+                          stream_);
+  } else {
+    if (!Dense(output, s_.mixed, s_.logits, 1, error_msg))
+      return false;
+    if (candidates)
+      MtpTopCandidates(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, s_.mtp_scores,
+                       output.rows, stream_);
+  }
   if (token) {
-    Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, output.rows, stream_);
-    if (!Check(
-            hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
-                           hipMemcpyDeviceToHost, stream_),
-            "draft token download", error_msg)) {
+    if (!shortlist)
+      Argmax(s_.logits, s_.mtp_argmax, s_.mtp_token, 1, output.rows, stream_);
+    const void* source = shortlist ? static_cast<const void*>(s_.mtp_ids)
+                                   : static_cast<const void*>(s_.mtp_token);
+    if (!Check(hipMemcpyAsync(mtp_token_host_, source, sizeof(std::int32_t),
+                              hipMemcpyDeviceToHost, stream_),
+               "draft token download", error_msg)) {
       return false;
     }
   }
   if (candidates) {
-    MtpTopCandidates(s_.logits, sampling_workspace_.sorted_token_ids,
-                     sampling_workspace_.token_ids,
-                     sampling_workspace_.sorted_logits,
-                     static_cast<std::uint32_t>(output.rows), stream_);
     const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
-    if (!Check(hipMemcpyAsync(mtp_candidates_host_->ids.data(),
-                              sampling_workspace_.sorted_token_ids,
+    if (!Check(hipMemcpyAsync(mtp_candidates_host_->ids.data(), s_.mtp_ids,
                               count * sizeof(std::uint32_t),
                               hipMemcpyDeviceToHost, stream_),
                "draft candidate IDs download", error_msg) ||
         !Check(hipMemcpyAsync(mtp_candidates_host_->logits.data(),
-                              sampling_workspace_.sorted_logits,
-                              count * sizeof(float), hipMemcpyDeviceToHost,
-                              stream_),
+                              s_.mtp_scores, count * sizeof(float),
+                              hipMemcpyDeviceToHost, stream_),
                "draft candidate logits download", error_msg)) {
       return false;
     }
@@ -2079,7 +2109,7 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "no MTP block loaded");
     return false;
   }
-  // Allocate before capture; captured candidate sorts retain these pointers.
+  // Allocate the target p/q verifier workspace before any graph capture.
   if (output.candidates != nullptr && sampling_workspace_.vocab_size == 0) {
     gufo::hip::AllocateGpuSamplingWorkspace(
         &sampling_workspace_, config().vocab_size, config().vocab_size);

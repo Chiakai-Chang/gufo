@@ -483,6 +483,177 @@ void CheckDecodeGrouping(int rows, int cols) {
     CheckHip(hipFree(ptr), "decode test free");
 }
 
+void CheckMtpOutputHead(float input_scale) {
+  constexpr int rows = 65, cols = 2560, blocks = cols / 32;
+  auto weights = MakeWeights(rows, cols, 73);
+  // Constant and zero blocks exercise the affine quantizer's zero range.
+  for (int b = 0; b < 3; ++b)
+    for (int i = 0; i < 32; ++i) {
+      const auto code = static_cast<std::int8_t>(b == 0 ? 0 : b == 1 ? -7 : 9);
+      weights.blocks[b * 34 + 2 + i] = static_cast<std::uint8_t>(code);
+      __half scale;
+      std::memcpy(&scale, weights.blocks.data() + b * 34, 2);
+      weights.values[b * 32 + i] = __half2float(scale) * code;
+    }
+  std::vector<float> input(cols);
+  std::uint32_t seed = 31;
+  for (auto& value : input)
+    value = Uniform(&seed, 2.0F * input_scale);
+  const std::size_t q4_bytes = std::size_t(rows) * blocks * 20;
+  std::vector<std::uint8_t> packed(q4_bytes + 64, 0xAC);
+  std::vector<std::uint8_t> quantized(qfn_mmq_q8_1_bytes(1, cols));
+  std::vector<float> output(rows + 8, -1234567.0F);
+  void *dw = nullptr, *dq = nullptr;
+  std::uint8_t* dpacked = nullptr;
+  float *dx = nullptr, *dy = nullptr;
+  CheckHip(hipMalloc(&dw, weights.blocks.size()), "MTP source weights");
+  CheckHip(hipMalloc(&dpacked, packed.size()), "MTP packed weights");
+  CheckHip(hipMalloc(&dq, quantized.size()), "MTP quantized input");
+  CheckHip(hipMalloc(&dx, input.size() * 4), "MTP input");
+  CheckHip(hipMalloc(&dy, output.size() * 4), "MTP output");
+  CheckHip(hipMemcpy(dw, weights.blocks.data(), weights.blocks.size(),
+                     hipMemcpyHostToDevice),
+           "MTP weights upload");
+  CheckHip(
+      hipMemcpy(dpacked, packed.data(), packed.size(), hipMemcpyHostToDevice),
+      "MTP weight guards");
+  CheckHip(hipMemcpy(dx, input.data(), input.size() * 4, hipMemcpyHostToDevice),
+           "MTP input upload");
+  CheckHip(
+      hipMemcpy(dy, output.data(), output.size() * 4, hipMemcpyHostToDevice),
+      "MTP output guards");
+  if (qfn_mmq_quantize_q8_1(dx, dq, 1, cols, nullptr))
+    throw std::runtime_error("MTP input quantization failed");
+  hipStream_t stream;
+  hipGraph_t graph;
+  hipGraphExec_t replay;
+  CheckHip(hipStreamCreate(&stream), "MTP test stream");
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+           "MTP capture");
+  if (qfn_mmq_requantize_q8_0_q4_1(dw, dpacked + 32, rows, cols, stream) ||
+      qfn_mmq_q4_1_dense_vec_preq(dpacked + 32, dq, dy + 4, rows, cols, stream))
+    throw std::runtime_error("MTP head launch failed");
+  CheckHip(hipStreamEndCapture(stream, &graph), "MTP capture end");
+  CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
+           "MTP graph instantiate");
+  std::vector<std::uint8_t> first_packed;
+  std::vector<float> first_output;
+  for (int repetition = 0; repetition < 2; ++repetition) {
+    CheckHip(hipGraphLaunch(replay, stream), "MTP graph replay");
+    CheckHip(hipStreamSynchronize(stream), "MTP graph wait");
+    CheckHip(
+        hipMemcpy(packed.data(), dpacked, packed.size(), hipMemcpyDeviceToHost),
+        "MTP packed download");
+    CheckHip(
+        hipMemcpy(output.data(), dy, output.size() * 4, hipMemcpyDeviceToHost),
+        "MTP output download");
+    if (repetition == 0) {
+      first_packed = packed;
+      first_output = output;
+    } else if (packed != first_packed ||
+               std::memcmp(output.data(), first_output.data(),
+                           output.size() * 4)) {
+      throw std::runtime_error("MTP head replay changed");
+    }
+  }
+  CheckHip(
+      hipMemcpy(quantized.data(), dq, quantized.size(), hipMemcpyDeviceToHost),
+      "MTP quantized download");
+  for (std::size_t i = 0; i < packed.size(); ++i)
+    if ((i < 32 || i >= 32 + q4_bytes) && packed[i] != 0xAC)
+      throw std::runtime_error("MTP weight guard changed");
+  for (int i = 0; i < rows + 8; ++i)
+    if ((i < 4 || i >= rows + 4) && output[i] != -1234567.0F)
+      throw std::runtime_error("MTP output guard changed");
+  for (int row = 0; row < rows; ++row) {
+    double expected = 0;
+    for (int b = 0; b < blocks; ++b) {
+      const auto* w = packed.data() + 32 + (row * blocks + b) * 20;
+      const auto* x = quantized.data() + b * 36;
+      __half d4, minimum, d8, sum;
+      std::memcpy(&d4, w, 2);
+      std::memcpy(&minimum, w + 2, 2);
+      std::memcpy(&d8, x, 2);
+      std::memcpy(&sum, x + 2, 2);
+      int dot = 0;
+      for (int i = 0; i < 32; ++i) {
+        const int code = (w[4 + i % 16] >> (i / 16 * 4)) & 15;
+        const float value = __half2float(d4) * code + __half2float(minimum);
+        const float original = weights.values[row * cols + b * 32 + i];
+        const float bound =
+            __half2float(d4) * 0.51F + (1.0F + std::abs(original)) * 0.002F;
+        if (!std::isfinite(value) || std::abs(value - original) > bound)
+          throw std::runtime_error("MTP quantization exceeds half-step error");
+        dot += code * static_cast<std::int8_t>(x[4 + i]);
+      }
+      expected += double(__half2float(d4)) * __half2float(d8) * dot +
+                  double(__half2float(minimum)) * __half2float(sum);
+    }
+    if (!std::isfinite(output[row + 4]) ||
+        std::abs(output[row + 4] - expected) > 0.001 * input_scale)
+      throw std::runtime_error(
+          "MTP projection differs from F64 reference: row " +
+          std::to_string(row) + " actual " + std::to_string(output[row + 4]) +
+          " expected " + std::to_string(expected));
+  }
+  CheckHip(hipGraphExecDestroy(replay), "MTP graph free");
+  CheckHip(hipGraphDestroy(graph), "MTP graph definition free");
+  // Rescoring must reproduce the original Q8 kernel bit for bit and leave
+  // unselected rows untouched. Replay with different IDs and an invalid tail.
+  float* reference = nullptr;
+  std::uint32_t* device_ids = nullptr;
+  constexpr int selected = rows / 2;
+  CheckHip(hipMalloc(&reference, rows * sizeof(float)), "Q8 reference output");
+  CheckHip(hipMalloc(&device_ids, (selected + 1) * sizeof(std::uint32_t)),
+           "selected Q8 IDs");
+  if (qfn_mmq_q8_0_dense_vec_preq(dw, nullptr, dq, reference, rows, 1, cols,
+                                  stream))
+    throw std::runtime_error("Q8 reference projection failed");
+  CheckHip(hipStreamSynchronize(stream), "Q8 reference wait");
+  std::vector<float> full(rows);
+  CheckHip(hipMemcpy(full.data(), reference, rows * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "Q8 reference download");
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+           "Q8 selected capture");
+  if (qfn_mmq_q8_0_selected_vec_preq(dw, dq, device_ids, dy + 4, selected + 1,
+                                     rows, cols, stream))
+    throw std::runtime_error("Q8 selected projection failed");
+  CheckHip(hipStreamEndCapture(stream, &graph), "Q8 selected capture end");
+  CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
+           "Q8 selected graph");
+  for (int repetition = 0; repetition < 2; ++repetition) {
+    std::vector<std::uint32_t> ids(selected + 1, rows + 1);
+    std::vector<float> expected(rows + 8, -1234567.0F);
+    for (int i = 0; i < selected; ++i) {
+      ids[i] = rows - 1 - 2 * i - repetition;
+      expected[ids[i] + 4] = full[ids[i]];
+    }
+    std::fill(output.begin(), output.end(), -1234567.0F);
+    CheckHip(hipMemcpyAsync(device_ids, ids.data(), ids.size() * 4,
+                            hipMemcpyHostToDevice, stream),
+             "selected IDs upload");
+    CheckHip(hipMemcpyAsync(dy, output.data(), output.size() * 4,
+                            hipMemcpyHostToDevice, stream),
+             "selected guards");
+    CheckHip(hipGraphLaunch(replay, stream), "Q8 selected replay");
+    CheckHip(hipMemcpyAsync(output.data(), dy, output.size() * 4,
+                            hipMemcpyDeviceToHost, stream),
+             "selected download");
+    CheckHip(hipStreamSynchronize(stream), "Q8 selected wait");
+    if (std::memcmp(output.data(), expected.data(), output.size() * 4))
+      throw std::runtime_error("selected Q8 rows differ from full projection");
+  }
+  CheckHip(hipGraphExecDestroy(replay), "Q8 selected graph free");
+  CheckHip(hipGraphDestroy(graph), "Q8 selected definition free");
+  CheckHip(hipFree(reference), "Q8 reference free");
+  CheckHip(hipFree(device_ids), "Q8 selected IDs free");
+  CheckHip(hipStreamDestroy(stream), "MTP stream free");
+  for (void* ptr : {dw, static_cast<void*>(dpacked), dq, static_cast<void*>(dx),
+                    static_cast<void*>(dy)})
+    CheckHip(hipFree(ptr), "MTP test free");
+}
+
 }  // namespace
 
 int main() {
@@ -493,6 +664,9 @@ int main() {
     CheckSmallProjection(q::WeightType::kF16, 7, 131);
     CheckDecodeGrouping(64, 2560);
     CheckDecodeGrouping(320, 10240);
+    CheckMtpOutputHead(1.0F);
+    // Small activations must retain products below F16's normal range.
+    CheckMtpOutputHead(0.0001F);
     bool ok = true;
     // Ragged batch and rows against the 128-wide macro tiles, the 64-token
     // tile below 96, and the model's ssm_out / shexp_down widths.

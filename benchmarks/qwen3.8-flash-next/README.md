@@ -18,13 +18,14 @@ GTT counter with the idle host subtracted; separate CPU memory is not included.
 | Mode | Loaded GiB | After generation GiB |
 | --- | ---: | ---: |
 | AR | 85.39 | 85.66 |
-| MTP | 89.39 | 89.67 |
+| MTP | 89.76 | 90.04 |
 
 The full requested KV capacity remains allocated. Raw indexer keys use a
 4096-row ring; completed blocks retain their pooled keys. PLE, MTP and trunk
 activations share storage when their lifetimes do not overlap. Snapshots keep
 only unpooled raw keys; existing disk cache entries rebuild after this layout
-change. Weights, cache precision and sampling are unchanged.
+change. MTP adds a 0.37 GiB Q4 shortlist head; target weights and cache
+precision are unchanged.
 
 ## Performance
 
@@ -36,7 +37,7 @@ Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1481.68 | 1523.15 |
+| 0 | 1481.68 | 1513.76 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
 | 32768 | 1396.57 | TODO |
@@ -45,9 +46,9 @@ Rates are tok/s; profiler timings are excluded.
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.33 | 44.73 | 71.0% |
+| Greedy | 0 | 26.33 | 47.10 | 71.0% |
 | Greedy | 32768 | TODO | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 45.35 | 75.9% |
+| Temperature 0.7 | 0 | TODO | 47.52 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
 AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
@@ -55,7 +56,16 @@ MTP PP uses the greedy run. The latest SSM projection tuning applies only
 to prefill batches of at least 1024 tokens.
 The targets are **1700 tok/s pp2048** and near-flat PP through d128K;
 both remain TODO. The measured d0-to-d128K decline is 10.7%.
-Refreshed HTTP and concurrent throughput: TODO.
+HTTP, C1, context 4096, seed 1, up to 128 output tokens, uncached prompts:
+
+| Prompt | MTP greedy tok/s | MTP temperature 0.7 tok/s |
+| --- | ---: | ---: |
+| Repetitive pattern | 81.34 | 71.11 |
+| Python iterator merge | 47.77 | 47.03 |
+| Probability exercise | 57.38 | 52.13 |
+
+The sampled repetitive response ended at 78 tokens; other rows generated 128.
+Concurrent throughput: TODO.
 Serving interleaves sessions but does not batch model work;
 `gufo bench` supports C1 for this model.
 
@@ -74,12 +84,15 @@ The [projection sweep](tools/projection_plans.hip) uses `tools/bench/build.sh`;
 `tools/prof/prof.py run --stages qwen-flash --` profiles a release command
 inside `nix develop`.
 
-`prompt`, `chat` and `serve llm` share MTP and sampling options. Greedy uses
-full-vocabulary argmax drafts. Temperature sampling draws from 64 MTP
-candidates with the request's filters and penalties. GPU verification uses
+`prompt`, `chat` and `serve llm` share MTP and sampling options. A private Q4
+head shortlists 256 vocabulary rows, then the original Q8 head rescores them.
+Greedy takes the best rescored row; temperature sampling draws from the best
+64 using the request's filters and penalties. GPU verification uses
 the full target vocabulary: accept with `min(1, p/q)`, otherwise draw from
 normalized `max(p-q, 0)`. The correction becomes the next batch's anchor.
-Compact draft support never truncates the target.
+Compact draft support never truncates the target. Shortlisting can alter draft
+support; it is not guaranteed to reproduce the full Q8 head's top 64 on every
+input. Rescored logits use the full Q8 kernel's exact arithmetic.
 
 Adaptive MTP is the default; `--draft-tokens` caps the chain at 1–7 drafts.
 Decisions use committed acceptance history and reset with the session.
@@ -88,7 +101,7 @@ context. Decisions never depend on wall-clock timings.
 
 Retained optimizations: SSM/QKV projection tiling, F16 SSM output activations,
 grouped Q4_K/Q5_K expert verification with fused SwiGLU, single-launch
-Q5_1/Q8_0 down projections, exact partial top-64 selection, GPU verification
+Q5_1/Q8_0 down projections, Q4 shortlisting with Q8 rescoring, GPU verification
 logits with one frontier readback, and parallel unordered verification with
 the original F32 sum order.
 F16 SSM output reduces numerical error with unchanged model throughput and
@@ -122,7 +135,9 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]moe_ids_o
   Fusions must preserve the separate operators' rounding. Decode and
   verification projections must agree across batch widths one through eight;
   routed down projections also check expanded top-10 batches. Grouped
-  projections cover duplicate expert slots within and across tokens.
+  projections cover duplicate expert slots within and across tokens. MTP head
+  checks cover Q4 quantization, bit-exact selected Q8 rows, lowest-ID ties
+  including signed zero, nonfinite logits and graph replay.
 - **Model replay:** greedy AR/MTP tokens, full logits, RNG and positions must
   match at short and 4K contexts. Sampled MTP must replay itself exactly;
   teacher-forcing its tokens through AR must reproduce every frontier logit.
@@ -149,7 +164,7 @@ context capacity and request setup. Keep exact output and acceptance checks
 beside speed results; a profiler trace is not a speed benchmark.
 The current 1024-token prefill check is finite, with scalar-winner rank 1,
 logit RMSE 0.24 and maximum absolute error 1.15. Snapshot compatibility
-includes prefill arithmetic; older cached states rebuild after it changes.
+includes inference arithmetic; older cached states rebuild after it changes.
 
 Sampled MTP preserves the target sampling distribution within floating-point
 precision, but need not produce AR's same-seed tokens or a common prefix

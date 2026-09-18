@@ -395,12 +395,30 @@ struct ArgmaxCandidate {
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream);
 
+inline constexpr std::uint32_t kMtpShortlist = 256;
+/// Number of IDs in each of the two selection buffers.
+inline constexpr std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
+  return ((vocab + 1023) / 1024) * kMtpShortlist;
+}
+
 /// Exact MTP top-64 selection, descending score with lowest-token-ID ties.
-/// Nonfinite scores become -infinity. `ids` and `scratch_ids` each have room
-/// for `vocab` entries; `scores` receives min(vocab, 64) values. Graph-safe.
+/// Nonfinite scores become -infinity. Both ID buffers have room for
+/// MtpCandidateWorkspaceSize(vocab); scores receives min(vocab, 64) values.
+/// All candidate operations are graph-safe.
 void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
+
+/// Select min(vocab, kMtpShortlist) IDs before Q8 rescoring.
+void MtpShortlist(const float* logits, std::uint32_t* ids,
+                  std::uint32_t* scratch_ids, std::uint32_t vocab,
+                  hipStream_t stream);
+
+/// Sort rescored shortlist IDs in place and emit the top 64 and their logits.
+/// Ties use the lowest token ID, irrespective of the shortlist's input order.
+void MtpRescoredCandidates(const float* logits, std::uint32_t* ids,
+                           float* scores, std::uint32_t vocab,
+                           hipStream_t stream);
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 

@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 
-#include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
@@ -135,28 +134,62 @@ void CheckArgmax(std::uint32_t vocab) {
             << ": CPU oracle and graph replay passed\n";
 }
 
-void CheckCandidates(std::uint32_t vocab) {
-  gufo::hip::GpuSamplingWorkspace workspace;
-  gufo::hip::AllocateGpuSamplingWorkspace(&workspace, vocab, 64);
+void CheckCandidates(std::uint32_t vocab, bool shortlist) {
+  constexpr auto kCandidates = gufo::models::qwen38_flash_next::kMtpCandidates;
+  const auto workspace_size = q::MtpCandidateWorkspaceSize(vocab);
+  auto device_ids = Allocate<std::uint32_t>(workspace_size + 2);
+  auto scratch_ids = Allocate<std::uint32_t>(workspace_size + 2);
+  auto device_scores = Allocate<float>(kCandidates + 2);
   auto device_logits = Allocate<float>(vocab);
   std::vector<float> logits(vocab);
   std::vector<std::uint32_t> expected(vocab);
-  const auto count = std::min<std::size_t>(
-      vocab, gufo::models::qwen38_flash_next::kMtpCandidates);
-  std::vector<float> scores(count);
-  std::vector<std::uint32_t> ids(count);
+  const auto count =
+      std::min<std::size_t>(vocab, shortlist ? q::kMtpShortlist : kCandidates);
+  const auto result_count = std::min<std::size_t>(vocab, kCandidates);
+  std::vector<float> scores(result_count + 2, -1234567.0F);
+  std::vector<std::uint32_t> ids(workspace_size + 2, UINT32_MAX);
+  CheckHip(hipMemcpy(device_ids.get(), ids.data(), ids.size() * 4,
+                     hipMemcpyHostToDevice),
+           "candidate ID guards");
+  CheckHip(hipMemcpy(scratch_ids.get(), ids.data(), ids.size() * 4,
+                     hipMemcpyHostToDevice),
+           "candidate scratch guards");
+  CheckHip(hipMemcpy(device_scores.get(), scores.data(), scores.size() * 4,
+                     hipMemcpyHostToDevice),
+           "candidate score guards");
   hipStream_t stream = nullptr;
-  hipGraph_t graph = nullptr;
-  hipGraphExec_t executable = nullptr;
+  hipGraph_t graph = nullptr, finish_graph = nullptr;
+  hipGraphExec_t executable = nullptr, finish = nullptr;
   CheckHip(hipStreamCreate(&stream), "candidate stream");
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "candidate capture");
-  q::MtpTopCandidates(device_logits.get(), workspace.sorted_token_ids,
-                      workspace.token_ids, workspace.sorted_logits, vocab,
-                      stream);
+  if (shortlist)
+    q::MtpShortlist(device_logits.get(), device_ids.get() + 1,
+                    scratch_ids.get() + 1, vocab, stream);
+  else
+    q::MtpTopCandidates(device_logits.get(), device_ids.get() + 1,
+                        scratch_ids.get() + 1, device_scores.get() + 1, vocab,
+                        stream);
   CheckHip(hipStreamEndCapture(stream, &graph), "candidate capture end");
   CheckHip(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
            "candidate graph");
+  if (shortlist) {
+    CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+             "rescoring capture");
+    q::MtpRescoredCandidates(device_logits.get(), device_ids.get() + 1,
+                             device_scores.get() + 1, vocab, stream);
+    CheckHip(hipStreamEndCapture(stream, &finish_graph),
+             "rescoring capture end");
+    CheckHip(hipGraphInstantiate(&finish, finish_graph, nullptr, nullptr, 0),
+             "rescoring graph");
+  }
+  const auto score = [&](std::uint32_t id) {
+    return std::isfinite(logits[id]) ? logits[id]
+                                     : -std::numeric_limits<float>::infinity();
+  };
+  const auto better = [&](auto a, auto b) {
+    return score(a) == score(b) ? a < b : score(a) > score(b);
+  };
   for (unsigned mode = 0; mode < 4; ++mode) {
     for (std::uint32_t i = 0; i < vocab; ++i) {
       logits[i] = mode == 0   ? static_cast<float>((i * 7919U) % 257)
@@ -169,42 +202,73 @@ void CheckCandidates(std::uint32_t vocab) {
       logits[vocab - 1] = std::numeric_limits<float>::quiet_NaN();
     }
     std::iota(expected.begin(), expected.end(), 0);
-    const auto score = [&](std::uint32_t id) {
-      return std::isfinite(logits[id])
-                 ? logits[id]
-                 : -std::numeric_limits<float>::infinity();
-    };
-    std::sort(expected.begin(), expected.end(), [&](auto a, auto b) {
-      return score(a) == score(b) ? a < b : score(a) > score(b);
-    });
-    CheckHip(
-        hipMemcpyAsync(device_logits.get(), logits.data(),
-                       vocab * sizeof(float), hipMemcpyHostToDevice, stream),
-        "candidate upload");
+    std::sort(expected.begin(), expected.end(), better);
+    CheckHip(hipMemcpyAsync(device_logits.get(), logits.data(), vocab * 4,
+                            hipMemcpyHostToDevice, stream),
+             "candidate upload");
     CheckHip(hipGraphLaunch(executable, stream), "candidate replay");
-    CheckHip(hipMemcpyAsync(ids.data(), workspace.sorted_token_ids,
-                            count * sizeof(std::uint32_t),
+    CheckHip(hipMemcpyAsync(ids.data(), device_ids.get(), ids.size() * 4,
                             hipMemcpyDeviceToHost, stream),
              "candidate IDs");
-    CheckHip(
-        hipMemcpyAsync(scores.data(), workspace.sorted_logits,
-                       count * sizeof(float), hipMemcpyDeviceToHost, stream),
-        "candidate scores");
     CheckHip(hipStreamSynchronize(stream), "candidate synchronization");
-    for (std::size_t i = 0; i < count; ++i) {
-      if (ids[i] != expected[i] ||
-          std::bit_cast<std::uint32_t>(scores[i]) !=
-              std::bit_cast<std::uint32_t>(score(expected[i]))) {
-        throw std::runtime_error("MTP candidate sort disagrees with CPU");
+    if (ids.front() != UINT32_MAX || ids.back() != UINT32_MAX)
+      throw std::runtime_error("MTP candidate ID guard changed");
+    for (std::size_t i = 0; i < count; ++i)
+      if (ids[i + 1] != expected[i])
+        throw std::runtime_error("MTP candidate IDs disagree with CPU");
+    if (shortlist) {
+      // Simulate rescoring, including ties in a previously unrelated order.
+      for (std::uint32_t i = 0; i < vocab; ++i)
+        logits[i] = mode == 0   ? static_cast<float>((i * 31U) % 7)
+                    : mode == 1 ? (i % 2 ? 0.0F : -0.0F)
+                    : mode == 2 ? -std::numeric_limits<float>::infinity()
+                                : -static_cast<float>(i % 17);
+      if (mode == 0) {
+        logits[expected[0]] = std::numeric_limits<float>::quiet_NaN();
+        logits[expected[count - 1]] = std::numeric_limits<float>::infinity();
       }
+      std::sort(expected.begin(), expected.begin() + count, better);
+      CheckHip(hipMemcpyAsync(device_logits.get(), logits.data(), vocab * 4,
+                              hipMemcpyHostToDevice, stream),
+               "rescored logits");
+      CheckHip(hipGraphLaunch(finish, stream), "rescoring replay");
+      CheckHip(hipMemcpyAsync(ids.data(), device_ids.get(), ids.size() * 4,
+                              hipMemcpyDeviceToHost, stream),
+               "rescored IDs");
     }
+    CheckHip(hipMemcpyAsync(scores.data(), device_scores.get(),
+                            scores.size() * 4, hipMemcpyDeviceToHost, stream),
+             "candidate scores");
+    CheckHip(hipStreamSynchronize(stream), "rescoring synchronization");
+    if (scores.front() != -1234567.0F || scores.back() != -1234567.0F ||
+        ids.front() != UINT32_MAX || ids.back() != UINT32_MAX)
+      throw std::runtime_error("MTP candidate output guard changed");
+    for (std::size_t i = 0; i < result_count; ++i) {
+      if (ids[i + 1] != expected[i] ||
+          std::bit_cast<std::uint32_t>(scores[i + 1]) !=
+              std::bit_cast<std::uint32_t>(score(expected[i])))
+        throw std::runtime_error(
+            "MTP candidate scores disagree with CPU: mode=" +
+            std::to_string(mode) + " rank=" + std::to_string(i) + " ID=" +
+            std::to_string(ids[i + 1]) + "/" + std::to_string(expected[i]) +
+            " score=" + std::to_string(scores[i + 1]) + "/" +
+            std::to_string(score(expected[i])));
+    }
+    CheckHip(hipMemcpy(ids.data(), scratch_ids.get(), ids.size() * 4,
+                       hipMemcpyDeviceToHost),
+             "candidate scratch download");
+    if (ids.front() != UINT32_MAX || ids.back() != UINT32_MAX)
+      throw std::runtime_error("MTP candidate scratch guard changed");
+  }
+  if (shortlist) {
+    CheckHip(hipGraphExecDestroy(finish), "rescoring graph destroy");
+    CheckHip(hipGraphDestroy(finish_graph), "rescoring source graph destroy");
   }
   CheckHip(hipGraphExecDestroy(executable), "candidate graph destroy");
   CheckHip(hipGraphDestroy(graph), "candidate source graph destroy");
   CheckHip(hipStreamDestroy(stream), "candidate stream destroy");
-  gufo::hip::FreeGpuSamplingWorkspace(&workspace);
-  std::cout << "MTP candidates vocab=" << vocab
-            << ": exact finite ordering, ties and graph replay passed\n";
+  std::cout << "MTP candidates vocab=" << vocab << " shortlist=" << shortlist
+            << ": exact ordering, ties, guards and graph replay passed\n";
 }
 
 }  // namespace
@@ -214,15 +278,11 @@ int main() {
     CheckArgmax(1);
     CheckArgmax(257);
     CheckArgmax(248320);
-    CheckCandidates(1);
-    CheckCandidates(63);
-    CheckCandidates(64);
-    CheckCandidates(65);
-    CheckCandidates(257);
-    CheckCandidates(1024);
-    CheckCandidates(1025);
-    CheckCandidates(16385);
-    CheckCandidates(248320);
+    for (const unsigned vocab :
+         {1, 63, 64, 65, 255, 256, 257, 1024, 1025, 16385, 248320}) {
+      CheckCandidates(vocab, false);
+      CheckCandidates(vocab, true);
+    }
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

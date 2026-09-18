@@ -6,6 +6,7 @@
 #include <initializer_list>
 
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #include "src/models/qwen38_flash_next/kernels/rocm/weight_upload.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -289,6 +290,31 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
+  }
+  if (m->has_mtp_) {
+    m->mtp_output_ = m->output_;
+    if (m->output_.type == core::GgmlType::kQ8_0) {
+      // Q4 selects a shortlist; the original Q8 head rescores those rows.
+      // Convert once while loading, before graph capture.
+      const std::size_t size =
+          std::size_t(m->output_.rows) * m->output_.cols / 32 * 20;
+      void* ptr = nullptr;
+      if (hipMalloc(&ptr, size + kTailMargin) != hipSuccess) {
+        up.Fail("hipMalloc failed for MTP output head");
+        return nullptr;
+      }
+      m->allocations_.push_back(ptr);
+      m->bytes_ += size + kTailMargin;
+      if (qfn_mmq_requantize_q8_0_q4_1(m->output_.data, ptr, m->output_.rows,
+                                       m->output_.cols, nullptr) != 0) {
+        up.Fail("MTP output head conversion failed");
+        return nullptr;
+      }
+      (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0,
+                           kTailMargin, nullptr);
+      m->mtp_output_.data = ptr;
+      m->mtp_output_.type = core::GgmlType::kQ4_1;
+    }
   }
   for (const auto& c : conversions) {
     NarrowActivations(static_cast<const float*>(c.source), c.destination, false,

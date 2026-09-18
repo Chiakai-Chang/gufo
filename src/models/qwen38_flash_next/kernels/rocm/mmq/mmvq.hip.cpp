@@ -4,45 +4,135 @@ namespace qfn_mmq {
 #include "unary.hpp"
 #include "vecdotq.hpp"
 
-// Flash Next uses one wave per dense row and per routed token on gfx1151.
-template <int ncols_dst, bool has_gate>
-__launch_bounds__(32, 1)
-static __global__ void mul_mat_vec_q8(
-        const void* __restrict__ weights, const void* __restrict__ gate,
-        const block_q8_1* __restrict__ input, float* __restrict__ output,
-        const uint32_t ncols_x, const uint32_t nrows_x,
-        const uint32_t stride_col_y) {
-    constexpr int qi = QI8_0;
-    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
-    constexpr int blocks_per_iter = vdr * 32 / qi;
-    const int lane = threadIdx.x;
-    const int row = blockIdx.x;
-    const int blocks_per_row = ncols_x / QK8_0;
-    const int row_offset = row * blocks_per_row;
-    const int kqs = vdr * (lane % (qi / vdr));
-    float sum[ncols_dst] = {};
-    float gate_sum[ncols_dst] = {};
-    for (int kbx = lane / (qi / vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+// MTP shortlists with a private Q4 head, then rescores using the original Q8.
+static __global__ void requantize_q8_0_q4_1_kernel(const block_q8_0* source,
+                                                   block_q4_1* destination,
+                                                   size_t blocks) {
+  const size_t block = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (block >= blocks)
+    return;
+  float values[32];
+  float low = INFINITY, high = -INFINITY;
+  const float scale = __half2float(source[block].d);
 #pragma unroll
-        for (int j = 0; j < ncols_dst; ++j) {
-            sum[j] += vec_dot_q8_0_q8_1(weights, input + j * stride_col_y + kbx,
-                                      row_offset + kbx, kqs);
-            if constexpr (has_gate) {
-                gate_sum[j] += vec_dot_q8_0_q8_1(gate, input + j * stride_col_y + kbx,
-                                               row_offset + kbx, kqs);
-            }
-        }
-    }
+  for (int i = 0; i < 32; ++i) {
+    values[i] = scale * static_cast<float>(source[block].qs[i]);
+    low = fminf(low, values[i]);
+    high = fmaxf(high, values[i]);
+  }
+  const float delta = (high - low) / 15.0f;
+  const float inverse = delta != 0.0f ? 1.0f / delta : 0.0f;
+  auto& out = destination[block];
+  out.dm = __floats2half2_rn(delta, low);
+#pragma unroll
+  for (int i = 0; i < 16; ++i) {
+    const unsigned a = min(15, int((values[i] - low) * inverse + 0.5f));
+    const unsigned b = min(15, int((values[i + 16] - low) * inverse + 0.5f));
+    out.qs[i] = a | (b << 4);
+  }
+}
+
+__launch_bounds__(32) static __global__
+    void mul_mat_vec_q4_1(const void* weights, const block_q8_1* input,
+                          float* output, int cols) {
+  constexpr int vdr = VDR_Q4_1_Q8_1_MMVQ;
+  constexpr int blocks_per_iter = vdr * 32 / QI4_1;
+  const int lane = threadIdx.x;
+  const int blocks_per_row = cols / QK4_1;
+  const int row_offset = blockIdx.x * blocks_per_row;
+  const int part = vdr * (lane % (QI4_1 / vdr));
+  float sum = 0.0f;
+  for (int kb = lane / (QI4_1 / vdr); kb < blocks_per_row;
+       kb += blocks_per_iter) {
+    sum += vec_dot_q4_1_q8_1(weights, input + kb, row_offset + kb, part);
+  }
+  sum = warp_reduce_sum<32>(sum);
+  if (lane == 0)
+    output[blockIdx.x] = sum;
+}
+
+extern "C" int qfn_mmq_requantize_q8_0_q4_1(const void* source,
+                                            void* destination, int rows,
+                                            int cols, hipStream_t stream) {
+  if (!source || !destination || rows <= 0 || cols <= 0 || cols % 32)
+    return -1;
+  const size_t blocks = size_t(rows) * cols / 32;
+  requantize_q8_0_q4_1_kernel<<<(blocks + 255) / 256, 256, 0, stream>>>(
+      static_cast<const block_q8_0*>(source),
+      static_cast<block_q4_1*>(destination), blocks);
+  return hipGetLastError() == hipSuccess ? 0 : -2;
+}
+
+extern "C" int qfn_mmq_q4_1_dense_vec_preq(const void* weights,
+                                           const void* input, float* output,
+                                           int rows, int cols,
+                                           hipStream_t stream) {
+  if (!weights || !input || !output || rows <= 0 || cols <= 0 || cols % 32)
+    return -1;
+  mul_mat_vec_q4_1<<<rows, 32, 0, stream>>>(
+      weights, static_cast<const block_q8_1*>(input), output, cols);
+  return hipGetLastError() == hipSuccess ? 0 : -2;
+}
+
+// Flash Next uses one wave per dense row and per routed token on gfx1151.
+template<int ncols_dst, bool has_gate, bool selected = false>
+__launch_bounds__(32, 1) static __global__
+    void mul_mat_vec_q8(const void* __restrict__ weights,
+                        const void* __restrict__ gate,
+                        const block_q8_1* __restrict__ input,
+                        float* __restrict__ output, const uint32_t ncols_x,
+                        const uint32_t nrows_x, const uint32_t stride_col_y,
+                        const uint32_t* selected_ids = nullptr) {
+  constexpr int qi = QI8_0;
+  constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  const int lane = threadIdx.x;
+  const int row = selected ? selected_ids[blockIdx.x] : blockIdx.x;
+  if constexpr (selected) {
+    if (static_cast<uint32_t>(row) >= nrows_x)
+      return;
+  }
+  const int blocks_per_row = ncols_x / QK8_0;
+  const int row_offset = row * blocks_per_row;
+  const int kqs = vdr * (lane % (qi / vdr));
+  float sum[ncols_dst] = {};
+  float gate_sum[ncols_dst] = {};
+  for (int kbx = lane / (qi / vdr); kbx < blocks_per_row;
+       kbx += blocks_per_iter) {
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
-        sum[j] = warp_reduce_sum<32>(sum[j]);
-        if constexpr (has_gate) gate_sum[j] = warp_reduce_sum<32>(gate_sum[j]);
-        if (lane == 0) {
-            float value = sum[j];
-            if constexpr (has_gate) value *= ggml_hip_op_silu_single(gate_sum[j]);
-            output[j * nrows_x + row] = value;
-        }
+      sum[j] += vec_dot_q8_0_q8_1(weights, input + j * stride_col_y + kbx,
+                                  row_offset + kbx, kqs);
+      if constexpr (has_gate) {
+        gate_sum[j] += vec_dot_q8_0_q8_1(gate, input + j * stride_col_y + kbx,
+                                         row_offset + kbx, kqs);
+      }
     }
+  }
+#pragma unroll
+  for (int j = 0; j < ncols_dst; ++j) {
+    sum[j] = warp_reduce_sum<32>(sum[j]);
+    if constexpr (has_gate)
+      gate_sum[j] = warp_reduce_sum<32>(gate_sum[j]);
+    if (lane == 0) {
+      float value = sum[j];
+      if constexpr (has_gate)
+        value *= ggml_hip_op_silu_single(gate_sum[j]);
+      output[j * nrows_x + row] = value;
+    }
+  }
+}
+
+extern "C" int qfn_mmq_q8_0_selected_vec_preq(
+    const void* weights, const void* input, const uint32_t* ids, float* output,
+    int count, int rows, int cols, hipStream_t stream) {
+  if (!weights || !input || !ids || !output || count <= 0 || rows <= 0 ||
+      cols <= 0 || cols % 32)
+    return -1;
+  mul_mat_vec_q8<1, false, true><<<count, 32, 0, stream>>>(
+      weights, nullptr, static_cast<const block_q8_1*>(input), output, cols,
+      rows, cols / 32, ids);
+  return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
 typedef float (*vec_dot_q_hip_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);

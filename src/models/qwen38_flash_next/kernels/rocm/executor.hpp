@@ -379,6 +379,9 @@ private:
     float* mtp_res;
     ArgmaxCandidate* mtp_argmax;
     std::int32_t* mtp_token;
+    std::uint32_t* mtp_ids;
+    std::uint32_t* mtp_scratch_ids;
+    float* mtp_scores;
   } s_{};
   std::uint32_t mask_words_{0};
   /// Queries per block-selection launch (its score scratch is chunk x
