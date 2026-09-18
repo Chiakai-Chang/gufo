@@ -132,6 +132,20 @@ public:
                              std::uint32_t n_logits, float* logits,
                              bool speculative, std::string* error_msg) const;
 
+  struct BatchItem {
+    Session* session;
+    std::span<const std::int32_t> tokens;
+    bool speculative;
+  };
+  /// Packs independent decode chains for shared projections. Every chain
+  /// keeps its own recurrent/KV state and the decode arithmetic (<=8 rows).
+  /// Logit rows remain in batch order until SelectBatchLogits is called.
+  [[nodiscard]] bool ForwardBatch(std::span<const BatchItem> items,
+                                  std::string* error_msg) const;
+  [[nodiscard]] bool SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
+                                       float* logits,
+                                       std::string* error_msg) const;
+
   /// Keeps the first `keep` (1..n) tokens of the last speculative batch and
   /// discards the rest. If `logits` is supplied, copies the kept frontier
   /// into it using the same synchronization as rollback.
@@ -270,18 +284,22 @@ private:
                 bool speculative, std::string* error_msg) const;
   bool WaitPle(std::string* error_msg) const;
   bool Ple(const DeviceLayer& l, Session& s, std::uint32_t n_tokens, float* res,
-           bool speculative, std::string* error_msg) const;
+           bool speculative, std::string* error_msg,
+           bool embeddings_ready = false) const;
   bool LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                        const float* x, float* out, std::uint32_t n_tokens,
-                       bool speculative, std::string* error_msg) const;
+                       bool speculative, std::string* error_msg,
+                       bool projections_ready = false,
+                       bool project_output = true) const;
   /// `pos`/`first_block` are device values; `start_pos` and `pool_grid`
   /// are their host-side counterparts for the eager-only decisions.
   bool Attention(const DeviceLayer& l, Session::AttentionState& s,
                  const float* x, float* out, std::uint32_t n_tokens,
                  const std::uint32_t* pos, const std::uint32_t* first_block,
                  std::uint32_t start_pos, std::uint32_t pool_grid,
-                 std::uint32_t max_context, bool sparse,
-                 std::string* error_msg) const;
+                 std::uint32_t max_context, bool sparse, std::string* error_msg,
+                 bool last_only = false, bool projections_ready = false,
+                 bool project_output = true) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg) const;
   /// Selects the greedy token or compact candidates from full MTP logits.
@@ -387,7 +405,18 @@ private:
     std::uint32_t* mtp_ids;
     std::uint32_t* mtp_scratch_ids;
     float* mtp_scores;
-  } s_{};
+  };
+  mutable Scratch s_{};
+  [[nodiscard]] Scratch RowScratch(const Scratch& base,
+                                   std::uint32_t offset) const;
+  void UseScratch(const Scratch& scratch) const;
+  bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
+                  std::uint32_t rows, std::string* error_msg) const;
+  /// Allocated only when concurrent decoding is first requested.
+  mutable float* batch_logits_{nullptr};
+  mutable void* batch_q8_{nullptr};
+  mutable Session::Control* batch_controls_{nullptr};
+  mutable std::uint32_t batch_rows_{0};
   std::uint32_t mask_words_{0};
   /// Queries per block-selection launch (its score scratch is chunk x
   /// max_blocks floats: 128 MB at the 262k context).

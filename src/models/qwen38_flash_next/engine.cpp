@@ -268,7 +268,8 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
   out += logits_.size() * sizeof(float);
   if (!model_->executor_->SaveSnapshot(
           *session_, hidden_rows,
-          std::span<std::uint8_t>(out, static_cast<std::size_t>(executor_bytes)),
+          std::span<std::uint8_t>(out,
+                                  static_cast<std::size_t>(executor_bytes)),
           error_msg)) {
     return nullptr;
   }
@@ -295,9 +296,9 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   }
   if (header.vocab_size != model_->VocabSize() || header.token_count == 0 ||
       header.token_count > ContextSize() ||
-      payload.size() != SessionSnapshotHostBytes(header.token_count,
-                                                 header.vocab_size) +
-                            header.executor_bytes) {
+      payload.size() !=
+          SessionSnapshotHostBytes(header.token_count, header.vocab_size) +
+              header.executor_bytes) {
     AssignError(error_msg, "session snapshot does not fit this session");
     return false;
   }
@@ -434,9 +435,22 @@ bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
   return Feed(std::span<const std::int32_t>(&token, 1), error_msg);
 }
 
-bool Session::DecodeStep(std::size_t max_tokens,
-                         sampling::SamplerState& sampler, DecodeResult* result,
-                         std::string* error_msg, bool stop_at_eos) {
+struct Session::PendingDecode {
+  std::vector<std::int32_t> chain;
+  std::vector<MtpProposal> proposals;
+  std::uint32_t base{0};
+  bool speculative{false};
+  bool sampled{false};
+  bool gpu_greedy{false};
+  bool gpu_verification{false};
+};
+
+bool Session::PrepareDecode(const DecodeRequest& request,
+                            PendingDecode* pending, std::string* error_msg) {
+  const auto max_tokens = request.max_tokens;
+  auto& sampler = *request.sampler;
+  auto* result = request.result;
+  const bool stop_at_eos = request.stop_at_eos;
   if (result == nullptr || max_tokens == 0 || tokens_.empty()) {
     AssignError(
         error_msg,
@@ -465,11 +479,11 @@ bool Session::DecodeStep(std::size_t max_tokens,
     return true;
   }
   if (!model_->HasMtp() || width < 2) {
-    if (!Evaluate(anchor, error_msg)) {
+    if (model_->HasMtp() && !DraftCatchUp(anchor, false, error_msg)) {
       return false;
     }
-    sampler.Accept(static_cast<sampling::TokenId>(anchor));
-    result->tokens.push_back(anchor);
+    pending->chain = {anchor};
+    pending->base = static_cast<std::uint32_t>(tokens_.size());
     return true;
   }
 
@@ -509,17 +523,43 @@ bool Session::DecodeStep(std::size_t max_tokens,
     }
   }
 
-  // Row i predicts chain[i+1]. Sample only through the kept prefix, using
-  // target logits over the full vocabulary and the request's token history.
-  const auto k = static_cast<std::uint32_t>(chain.size());
-  const std::size_t vocab = model_->VocabSize();
+  pending->chain = std::move(chain);
+  pending->proposals = std::move(proposals);
+  pending->base = base;
+  pending->speculative = true;
+  pending->sampled = sampled;
+  pending->gpu_greedy = gpu_greedy;
+  pending->gpu_verification = gpu_verification;
   if (!gpu_verification && verify_logits_.empty()) {
-    verify_logits_.resize(exec.max_speculative() * vocab);
+    verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
   }
-  if (!exec.Forward(*session_, chain, k,
-                    gpu_verification ? nullptr : verify_logits_.data(), true,
-                    error_msg)) {
-    return false;
+  return true;
+}
+
+bool Session::FinishDecode(const DecodeRequest& request,
+                           const PendingDecode& pending,
+                           std::string* error_msg) {
+  auto& sampler = *request.sampler;
+  auto* result = request.result;
+  auto& exec = *model_->executor_;
+  const auto& chain = pending.chain;
+  const auto& proposals = pending.proposals;
+  const auto base = pending.base;
+  const bool sampled = pending.sampled;
+  const bool gpu_greedy = pending.gpu_greedy;
+  const bool gpu_verification = pending.gpu_verification;
+  const auto anchor = chain.front();
+  const auto k = static_cast<std::uint32_t>(chain.size());
+  const auto vocab = model_->VocabSize();
+  const auto is_stop = [&](std::int32_t token) {
+    return request.stop_at_eos && model_->IsStopToken(token);
+  };
+  if (!pending.speculative) {
+    hidden_base_ = base;
+    tokens_.push_back(anchor);
+    sampler.Accept(static_cast<sampling::TokenId>(anchor));
+    result->tokens.push_back(anchor);
+    return true;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
   std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
@@ -600,6 +640,144 @@ bool Session::DecodeStep(std::size_t max_tokens,
     // Evaluate the residual as the next cycle's anchor, avoiding a separate
     // target pass. Preserve the actual draw: resampling p would be biased.
     sampler.DeferSample(static_cast<sampling::TokenId>(*correction));
+  }
+  return true;
+}
+
+bool Session::DecodeStep(std::size_t max_tokens,
+                         sampling::SamplerState& sampler, DecodeResult* result,
+                         std::string* error_msg, bool stop_at_eos) {
+  const DecodeRequest request{this, max_tokens, &sampler, result, stop_at_eos};
+  PendingDecode pending;
+  if (!PrepareDecode(request, &pending, error_msg)) {
+    return false;
+  }
+  if (pending.chain.empty()) {
+    return true;
+  }
+  float* logits = !pending.speculative       ? logits_.data()
+                  : pending.gpu_verification ? nullptr
+                                             : verify_logits_.data();
+  if (!model_->executor_->Forward(*session_, pending.chain,
+                                  pending.chain.size(), logits,
+                                  pending.speculative, error_msg)) {
+    return false;
+  }
+  return FinishDecode(request, pending, error_msg);
+}
+
+bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
+                          std::string* error_msg) {
+  if (requests.empty() || requests.size() > 8) {
+    AssignError(error_msg, "decode batch must contain 1..8 sessions");
+    return false;
+  }
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    const auto& request = requests[i];
+    if (request.session == nullptr || request.sampler == nullptr ||
+        request.result == nullptr || request.max_tokens == 0 ||
+        request.session->tokens_.empty() ||
+        request.session->model_ != requests.front().session->model_) {
+      AssignError(error_msg, "invalid decode batch request");
+      return false;
+    }
+    for (std::size_t j = 0; j < i; ++j) {
+      if (requests[j].session == request.session ||
+          requests[j].sampler == request.sampler ||
+          requests[j].result == request.result) {
+        AssignError(error_msg, "decode batch requests must be independent");
+        return false;
+      }
+    }
+  }
+  if (requests.size() == 1) {
+    const auto& r = requests.front();
+    return r.session->DecodeStep(r.max_tokens, *r.sampler, r.result, error_msg,
+                                 r.stop_at_eos);
+  }
+  auto& exec = *requests.front().session->model_->executor_;
+  std::vector<PendingDecode> pending(requests.size());
+  std::vector<rocm::Executor::BatchItem> items;
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    const auto& r = requests[i];
+    if (!r.session->PrepareDecode(r, &pending[i], error_msg)) {
+      return false;
+    }
+    if (!pending[i].chain.empty()) {
+      items.push_back({r.session->session_.get(), pending[i].chain,
+                       pending[i].speculative});
+    }
+  }
+  if (items.empty()) {
+    return true;
+  }
+  if (!exec.ForwardBatch(items, error_msg)) {
+    return false;
+  }
+  std::uint32_t offset = 0;
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    const auto& p = pending[i];
+    if (p.chain.empty()) {
+      continue;
+    }
+    auto& session = *requests[i].session;
+    float* logits = !p.speculative       ? session.logits_.data()
+                    : p.gpu_verification ? nullptr
+                                         : session.verify_logits_.data();
+    if (!exec.SelectBatchLogits(offset, p.chain.size(), logits, error_msg) ||
+        !session.FinishDecode(requests[i], p, error_msg)) {
+      return false;
+    }
+    offset += p.chain.size();
+  }
+  return true;
+}
+
+bool Session::EvaluateBatch(std::span<const AdvanceRequest> requests,
+                            std::string* error_msg) {
+  if (requests.empty() || requests.size() > 8) {
+    AssignError(error_msg, "advance batch must contain 1..8 sessions");
+    return false;
+  }
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    const auto& r = requests[i];
+    if (r.session == nullptr || r.token < 0 ||
+        static_cast<std::uint32_t>(r.token) >= r.session->model_->VocabSize() ||
+        r.session->model_ != requests.front().session->model_ ||
+        r.session->Position() >= r.session->ContextSize()) {
+      AssignError(error_msg, "invalid advance batch request");
+      return false;
+    }
+    for (std::size_t j = 0; j < i; ++j) {
+      if (requests[j].session == r.session) {
+        AssignError(error_msg, "advance batch contains a duplicate session");
+        return false;
+      }
+    }
+  }
+  if (requests.size() == 1) {
+    return requests.front().session->Evaluate(requests.front().token,
+                                              error_msg);
+  }
+  auto& exec = *requests.front().session->model_->executor_;
+  std::vector<rocm::Executor::BatchItem> items;
+  for (const auto& r : requests) {
+    if (r.session->model_->HasMtp() &&
+        !r.session->DraftCatchUp(r.token, false, error_msg)) {
+      return false;
+    }
+    items.push_back({r.session->session_.get(), {&r.token, 1}, false});
+  }
+  if (!exec.ForwardBatch(items, error_msg)) {
+    return false;
+  }
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    auto& session = *requests[i].session;
+    if (!exec.SelectBatchLogits(i, 1, session.logits_.data(), error_msg)) {
+      return false;
+    }
+    session.hidden_base_ = static_cast<std::uint32_t>(session.tokens_.size());
+    session.tokens_.push_back(requests[i].token);
   }
   return true;
 }

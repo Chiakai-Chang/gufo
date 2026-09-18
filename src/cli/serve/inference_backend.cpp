@@ -1,5 +1,7 @@
 #include "src/cli/serve/inference_backend.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -15,8 +17,6 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-
-#include <unistd.h>
 
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
@@ -1965,11 +1965,8 @@ bool FingerprintArtifactFile(std::string_view label,
 #endif
 
 #if defined(ENGINE_ENABLE_HIP)
-// Qwen3.8-Flash-Next: one session per request state, the whole prompt fed
-// through the model's own prefix-keeping Sync, the server-side sampler over
-// the session's logits. The recurrent (GDN) state cannot be rewound, so the
-// runner offers no snapshots or forks: an exact retained prefix is reused
-// in place, anything else restarts the session.
+// Each Flash-Next request owns its recurrent/KV state and snapshots. Target
+// projections share batches; sampling and rollback remain request-local.
 constexpr std::string_view kQwenFlashNextStateAbi =
     "qwen38-flash-next-rocm-session-v1";
 
@@ -2050,8 +2047,8 @@ std::size_t HostSnapshotBudgetBytes() noexcept {
   if (pages <= 0 || page_size <= 0) {
     return 0;
   }
-  return static_cast<std::size_t>(pages) *
-         static_cast<std::size_t>(page_size) / 2;
+  return static_cast<std::size_t>(pages) * static_cast<std::size_t>(page_size) /
+         2;
 }
 
 QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
@@ -2107,8 +2104,8 @@ public:
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
-                .batched_multi_token_decode = false,
-                .batched_multi_token_decode_max_width = 0,
+                .batched_multi_token_decode = use_mtp_,
+                .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
                 .prefix_reuse = true,
             },
         .persistence = persistence_,
@@ -2134,10 +2131,13 @@ public:
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
-    return {{
-        .kind = TextExecutionPlanKind::kSerial,
-        .physical_width = 1,
-    }};
+    std::vector<TextExecutionPlan> plans{
+        {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    for (std::size_t width = 2; width <= 8; ++width) {
+      plans.push_back(
+          {.kind = TextExecutionPlanKind::kBatched, .physical_width = width});
+    }
+    return plans;
   }
 
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
@@ -2310,6 +2310,84 @@ public:
     step.draft_tokens = stats_after.drafted - stats_before.drafted;
     step.draft_accepted_tokens = stats_after.accepted - stats_before.accepted;
     return step;
+  }
+
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    if (advances.size() < 2) {
+      return TextModelRunner::AdvanceBatch(advances);
+    }
+    std::vector<QwenFlashNextSession::AdvanceRequest> requests;
+    for (const auto& advance : advances) {
+      if (advance.token > static_cast<TextRunnerToken>(
+                              std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("Flash-Next token exceeds engine range");
+      }
+      requests.push_back(
+          {&RequireQwenFlashNextState(advance.state.get()).session(),
+           static_cast<std::int32_t>(advance.token)});
+    }
+    std::string error;
+    if (!QwenFlashNextSession::EvaluateBatch(requests, &error)) {
+      for (const auto& advance : advances) {
+        RequireQwenFlashNextState(advance.state.get()).Invalidate();
+      }
+      throw std::runtime_error("Flash-Next batched advance failed: " + error);
+    }
+    for (const auto& advance : advances) {
+      auto& state = RequireQwenFlashNextState(advance.state.get());
+      state.set_position(state.session().Position());
+    }
+  }
+
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    if (decodes.size() < 2 || !use_mtp_) {
+      return TextModelRunner::DecodeBatch(decodes);
+    }
+    const auto count = decodes.size();
+    std::vector<sampling::SamplerState> samplers;
+    std::vector<QwenFlashNextSession::DecodeResult> results(count);
+    std::vector<QwenFlashNextSession::SpeculativeStats> before;
+    std::vector<QwenFlashNextSession::DecodeRequest> requests;
+    samplers.reserve(count);
+    before.reserve(count);
+    requests.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      auto& session =
+          RequireQwenFlashNextState(decodes[i].state.get()).session();
+      auto& sampler = samplers.emplace_back(decodes[i].sampler.get());
+      before.push_back(session.Statistics());
+      requests.push_back(
+          {&session,
+           std::min<std::size_t>(decodes[i].max_tokens,
+                                 std::uint64_t{max_draft_tokens_} + 1),
+           &sampler, &results[i]});
+    }
+    std::string error;
+    if (!QwenFlashNextSession::DecodeBatch(requests, &error)) {
+      for (const auto& decode : decodes) {
+        RequireQwenFlashNextState(decode.state.get()).Invalidate();
+      }
+      throw std::runtime_error("Flash-Next batched MTP failed: " + error);
+    }
+    std::vector<TextDecodeStep> steps(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      auto& state = RequireQwenFlashNextState(decodes[i].state.get());
+      decodes[i].sampler.get().CopyDrawStateFrom(samplers[i]);
+      state.set_position(state.session().Position());
+      auto& step = steps[i];
+      step.stop = results[i].stop;
+      for (const auto token : results[i].tokens) {
+        step.selections.push_back({.stop = false,
+                                   .token = static_cast<TextRunnerToken>(token),
+                                   .piece = model_->TokenText(token)});
+      }
+      const auto stats = state.session().Statistics();
+      step.draft_tokens = stats.drafted - before[i].drafted;
+      step.draft_accepted_tokens = stats.accepted - before[i].accepted;
+    }
+    return steps;
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(

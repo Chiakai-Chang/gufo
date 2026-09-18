@@ -349,14 +349,16 @@ void Attention(const float* q, const __half* k_cache, const __half* v_cache,
 /// softmax, PV and the sigmoid output gate in one launch. `mask` follows
 /// Attention's block-selection contract (null for the dense window). Returns
 /// false, launching nothing, when the geometry is not the model's 24 x 256
-/// heads over two KV heads.
+/// heads over two KV heads. `last_only` computes only the final dense query
+/// tile, retaining its key sweep and leaving earlier output rows untouched.
 bool WmmaCausalAttention(const float* q, const float* gate,
                          const __half* k_cache, const __half* v_cache,
                          const std::uint32_t* mask, std::uint32_t mask_words,
                          float* out, std::uint32_t n_tokens,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream);
+                         std::uint32_t ratio, hipStream_t stream,
+                         bool last_only = false);
 
 /// counts[e] = number of (token, slot) pairs routed to expert e.
 void ExpertCounts(const std::int32_t* ids, std::uint32_t* counts,

@@ -28,6 +28,105 @@ void RequireExact(std::span<const float> expected,
           message);
 }
 
+void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  std::vector<std::unique_ptr<qfn::Session>> serial, batched;
+  std::vector<sampling::SamplerState> serial_samplers, batch_samplers;
+  const auto cases = gufo::test::QwenSamplingCases();
+  for (std::size_t i = 0; i < 8; ++i) {
+    serial.push_back(model->CreateSession(6145, &error));
+    batched.push_back(model->CreateSession(6145, &error));
+    Require(serial.back() && batched.back(), error);
+    auto prompt = model->Tokenize("Batch request " + std::to_string(i) +
+                                  ": Continue red, blue, blue, red,");
+    // One member crosses the sparse-attention boundary while the others
+    // remain short; interleaving must not share positions or pooling state.
+    if (i == 1) {
+      const auto pattern = prompt;
+      prompt.resize(4095);
+      for (std::size_t t = pattern.size(); t < prompt.size(); ++t) {
+        prompt[t] = pattern[t % pattern.size()];
+      }
+    }
+    Require(serial.back()->Sync(prompt, &error), error);
+    auto snapshot = serial.back()->SaveSnapshot(&error);
+    Require(snapshot && batched.back()->RestoreSnapshot(*snapshot, &error),
+            error);
+    std::vector<sampling::TokenId> history(prompt.begin(), prompt.end());
+    const auto config = cases[(i * 3) % cases.size()].config;
+    serial_samplers.emplace_back(config, history);
+    batch_samplers.emplace_back(config, history);
+  }
+  // Exercise the AR serving entrypoint, including a session crossing 4K.
+  for (const std::size_t width : {2, 4, 6, 8}) {
+    std::vector<qfn::Session::AdvanceRequest> advances;
+    for (std::size_t i = 0; i < width; ++i) {
+      const auto token = static_cast<std::int32_t>(
+          std::max_element(serial[i]->Logits().begin(),
+                           serial[i]->Logits().end()) -
+          serial[i]->Logits().begin());
+      Require(serial[i]->Evaluate(token, &error), error);
+      advances.push_back({batched[i].get(), token});
+      serial_samplers[i].Accept(token);
+      batch_samplers[i].Accept(token);
+    }
+    Require(qfn::Session::EvaluateBatch(advances, &error), error);
+    for (std::size_t i = 0; i < width; ++i) {
+      RequireExact(serial[i]->Logits(), batched[i]->Logits(),
+                   "batched AR frontier differs at C" + std::to_string(width) +
+                       " row " + std::to_string(i));
+    }
+    // Different budgets create ragged chains and include ordinary one-token
+    // decoding in the same batch as speculative verification.
+    for (unsigned cycle = 0; cycle < 2; ++cycle) {
+      std::vector<qfn::Session::DecodeResult> expected(width), actual(width);
+      std::vector<qfn::Session::DecodeRequest> requests;
+      for (std::size_t i = 0; i < width; ++i) {
+        const std::size_t budget = 1 + (i * 3 + cycle * 5 + 7) % 8;
+        Require(serial[i]->DecodeStep(budget, serial_samplers[i], &expected[i],
+                                      &error, false),
+                error);
+        requests.push_back(
+            {batched[i].get(), budget, &batch_samplers[i], &actual[i], false});
+      }
+      if (cycle % 2 != 0) {
+        std::reverse(requests.begin(), requests.end());
+      }
+      Require(qfn::Session::DecodeBatch(requests, &error), error);
+      for (std::size_t i = 0; i < width; ++i) {
+        const auto a = serial[i]->Statistics();
+        const auto b = batched[i]->Statistics();
+        Require(expected[i].tokens == actual[i].tokens &&
+                    expected[i].stop == actual[i].stop &&
+                    serial_samplers[i].rng_state() ==
+                        batch_samplers[i].rng_state() &&
+                    a.cycles == b.cycles && a.drafted == b.drafted &&
+                    a.accepted == b.accepted &&
+                    std::equal(serial[i]->Tokens().begin(),
+                               serial[i]->Tokens().end(),
+                               batched[i]->Tokens().begin(),
+                               batched[i]->Tokens().end()),
+                "batched decode tokens, RNG or acceptance differ");
+        RequireExact(serial[i]->Logits(), batched[i]->Logits(),
+                     "batched MTP frontier differs");
+      }
+    }
+    std::cout << "batch C" << width << " AR_MTP_logits_RNG_exact=1\n"
+              << std::flush;
+  }
+  // A complete state comparison catches recurrent/hidden differences that a
+  // short output comparison could miss.
+  for (std::size_t i = 0; i < serial.size(); ++i) {
+    const auto a = serial[i]->SaveSnapshot(&error);
+    const auto b = batched[i]->SaveSnapshot(&error);
+    Require(a && b &&
+                std::equal(a->bytes().begin(), a->bytes().end(),
+                           b->bytes().begin(), b->bytes().end()),
+            "batched snapshot state differs: " + std::to_string(i));
+  }
+  std::cout << "batch independent_state_exact=1\n" << std::flush;
+}
+
 void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   namespace server = gufo::server;
   using Backend = server::InferenceBackend;
@@ -96,8 +195,7 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
     std::cout << "serving sampling=" << test.name << " replay_exact=1\n"
               << std::flush;
   }
-  // Every strategy also runs in an interleaved pair. Flash-Next currently
-  // serializes model execution; this tests independent request histories.
+  // Every strategy also runs with shared projections in a concurrent pair.
   for (const bool use_mtp : {false, true}) {
     auto& backend = use_mtp ? mtp : ar;
     for (std::size_t offset = 0; offset < references.size(); offset += 2) {
@@ -164,6 +262,7 @@ int main(int argc, char** argv) {
         {.max_context = 6145, .mtp_model_path = argv[4], .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
+    CheckBatchedSessions(model);
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. "
         "Strix Halo executes this deterministic benchmark sequence. ");

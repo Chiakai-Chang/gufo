@@ -383,9 +383,10 @@ static int moe_vector_projection(int weight_type, const void* W,
     return -1;
   }
   if (gated && (n_tokens > MMVQ_MAX_BATCH_SIZE || n_expert_used > 32 ||
-                (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K))) {
+                (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
+                 type != GGML_TYPE_Q8_0))) {
     fprintf(stderr,
-            "%s: gated vector requires 1–8 Q4_K/Q5_K tokens and "
+            "%s: gated vector requires 1–8 Q4_K/Q5_K/Q8_0 tokens and "
             "at most 32 selected experts\n",
             tag);
     return -1;
@@ -440,13 +441,13 @@ static int moe_vector_projection(int weight_type, const void* W,
     const void* weights = projection == 0 ? W : W_b;
     float* output = projection == 0 ? out_f32 : out_b;
     mul_mat_vec_moe_dispatch(
-        weights, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr),
-        ids, output, K, M, n_tokens, n_expert_used, input_stride, stream);
+        weights, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr), ids,
+        output, K, M, n_tokens, n_expert_used, input_stride, stream);
 
     err = hipGetLastError();
     if (err != hipSuccess) {
-      fprintf(stderr, "%s: mul_mat_vec_moe_dispatch launch failed: %s\n",
-              tag, hipGetErrorString(err));
+      fprintf(stderr, "%s: mul_mat_vec_moe_dispatch launch failed: %s\n", tag,
+              hipGetErrorString(err));
       return -3;
     }
   }
@@ -581,25 +582,27 @@ __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
     if (lane == 0) output[blockIdx.x] = sum;
 }
 
-extern "C" int qfn_mmq_q8_0_dense_vec_preq(
-        const void * W, const void * W_gate, const void * X_q8, float * out_f32,
-        int M, int N, int K, hipStream_t stream) {
-    if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || K <= 0 || K % 32 != 0 ||
-        N > MMVQ_MAX_BATCH_SIZE) {
-        fprintf(stderr, "qfn_mmq_q8_0_dense_vec_preq: bad arguments M=%d N=%d K=%d\n",
-                M, N, K);
-        return -1;
-    }
-    if (N == 1 && M == 320 && K == 10240 && W_gate == nullptr) {
-        qfn_q8_hc_down_kernel<<<320, 32, 0, stream>>>(
-            static_cast<const block_q8_0*>(W),
-            static_cast<const block_q8_1*>(X_q8), out_f32);
-        return hipGetLastError() == hipSuccess ? 0 : -3;
-    }
-    const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;
-    mul_mat_vec_q8_dispatch(W, W_gate, static_cast<const block_q8_1*>(X_q8),
-                           out_f32, K, M, N, input_stride, stream);
+extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
+                                           const void* X_q8, float* out_f32,
+                                           int M, int N, int K,
+                                           hipStream_t stream) {
+  if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || K <= 0 || K % 32 != 0 ||
+      N > 32 || (N > MMVQ_MAX_BATCH_SIZE && (W_gate || N % 8 != 0))) {
+    fprintf(stderr,
+            "qfn_mmq_q8_0_dense_vec_preq: bad arguments M=%d N=%d K=%d\n", M, N,
+            K);
+    return -1;
+  }
+  if (N == 1 && M == 320 && K == 10240 && W_gate == nullptr) {
+    qfn_q8_hc_down_kernel<<<320, 32, 0, stream>>>(
+        static_cast<const block_q8_0*>(W), static_cast<const block_q8_1*>(X_q8),
+        out_f32);
     return hipGetLastError() == hipSuccess ? 0 : -3;
+  }
+  const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;
+  mul_mat_vec_q8_dispatch(W, W_gate, static_cast<const block_q8_1*>(X_q8),
+                          out_f32, K, M, N, input_stride, stream);
+  return hipGetLastError() == hipSuccess ? 0 : -3;
 }
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(
     ggml_backend_hip_context&, const mmq_args&, hipStream_t);

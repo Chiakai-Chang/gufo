@@ -152,6 +152,9 @@ Executor::~Executor() {
     (void)ngram_->WaitRead();
   }
   gufo::hip::FreeGpuSamplingWorkspace(&sampling_workspace_);
+  (void)hipFree(batch_logits_);
+  (void)hipFree(batch_q8_);
+  (void)hipHostFree(batch_controls_);
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -810,7 +813,8 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
   const bool same_shape = a.type == b.type && a.rows == b.rows &&
                           a.cols == b.cols && a.experts == b.experts;
   if (n_tokens <= kVecBatch && n_used <= 32 && same_shape &&
-      (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K)) {
+      (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
+       a.type == GgmlType::kQ8_0)) {
     if (qfn_mmq_moe_gated_vec(
             static_cast<int>(a.type), a.data, b.data, x, ids, out,
             static_cast<int>(a.rows), static_cast<int>(a.cols),
@@ -1032,16 +1036,16 @@ bool Executor::WaitPle(std::string* error_msg) const {
 }
 
 bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
-                   float* res, bool speculative, std::string* error_msg) const {
+                   float* res, bool speculative, std::string* error_msg,
+                   bool embeddings_ready) const {
   const Config& c = config();
   const std::size_t emb_count =
       static_cast<std::size_t>(n) * c.PleEmbeddingDim();
-  if (!WaitPle(error_msg)) {
-    return false;
-  }
-  if (!Check(hipMemcpyAsync(s_.ple_emb, host_emb_, emb_count * sizeof(float),
-                            hipMemcpyHostToDevice, stream_),
-             "n-gram upload", error_msg)) {
+  if (!embeddings_ready &&
+      (!WaitPle(error_msg) ||
+       !Check(hipMemcpyAsync(s_.ple_emb, host_emb_, emb_count * sizeof(float),
+                             hipMemcpyHostToDevice, stream_),
+              "n-gram upload", error_msg))) {
     return false;
   }
   const std::uint32_t hc_dim = c.HcDim();
@@ -1071,7 +1075,8 @@ bool Executor::Ple(const DeviceLayer& l, Session& session, std::uint32_t n,
 bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                                const float* x, float* out,
                                std::uint32_t n_tokens, bool speculative,
-                               std::string* error_msg) const {
+                               std::string* error_msg, bool projections_ready,
+                               bool project_output) const {
   const Config& c = config();
   const std::uint32_t channels = c.SsmConvChannels();
   const float* qkv = s_.qkv;
@@ -1082,21 +1087,22 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   if (!l.ssm_in.empty()) {
     // Wide prefill convolves QKV in the projection's LDS tile. The raw
     // boundary rows remain available for the rolling history update.
-    if (!speculative && n_tokens >= 1024 && n_tokens <= options_.max_batch &&
-        DenseF16Route(l.ssm_in, n_tokens)) {
+    if (!projections_ready && !speculative && n_tokens >= 1024 &&
+        n_tokens <= options_.max_batch && DenseF16Route(l.ssm_in, n_tokens)) {
       PrepareHalfInput(x, n_tokens, l.ssm_in.cols);
       convolved = DenseF16SsmGemm(
           l.ssm_in.data, static_cast<const __half*>(s_.x_half),
           l.ssm_conv1d.f32(), s.conv_state, s_.qkvz, s_.conv_scratch, n_tokens,
           l.ssm_in.rows, l.ssm_in.cols, channels, c.ssm_conv_kernel, stream_);
     }
-    if (!convolved && !Dense(l.ssm_in, x, s_.qkvz, n_tokens, error_msg)) {
+    if (!projections_ready && !convolved &&
+        !Dense(l.ssm_in, x, s_.qkvz, n_tokens, error_msg)) {
       return false;
     }
     qkv = s_.qkvz;
     z = s_.qkvz + channels;
     qkv_stride = z_stride = l.ssm_in.rows;
-  } else {
+  } else if (!projections_ready) {
     Q8Input xq;
     if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
         !Dense(l.ssm_qkv, xq, s_.qkv, error_msg) ||
@@ -1104,7 +1110,8 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       return false;
     }
   }
-  if (!Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
+  if (!projections_ready &&
+      !Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
     return false;
   }
   // The epilogue writes the output projection's input directly. Large
@@ -1126,6 +1133,9 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
                 c.ssm_conv_kernel, n_tokens > kVecBatch && !speculative,
                 convolved, c.rms_eps, stream_, out_half);
+  if (!project_output) {
+    return true;
+  }
   if (half_output) {
     if (!DenseF16Gemm(l.ssm_out.data, out_half, out, n_tokens, l.ssm_out.rows,
                       l.ssm_out.cols, stream_)) {
@@ -1152,7 +1162,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                          const std::uint32_t* first_block,
                          std::uint32_t start_pos, std::uint32_t pool_grid,
                          std::uint32_t max_context, bool sparse,
-                         std::string* error_msg) const {
+                         std::string* error_msg, bool last_only,
+                         bool projections_ready, bool project_output) const {
   const Config& c = config();
   const std::uint32_t kv_row = c.AttentionKvDim();
   const std::uint32_t index_capacity =
@@ -1160,10 +1171,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
     const bool fused_projection =
-        n_tokens >= 1024 && n_tokens <= options_.max_batch &&
-        DenseF16Route(l.attn_qkv, n_tokens) && l.attn_qkv.rows == 13312 &&
-        l.attn_qkv.cols == 2560 && c.num_heads == 24 && c.num_kv_heads == 2 &&
-        c.head_dim == 256 && c.rotary_dim == 64;
+        !projections_ready && n_tokens >= 1024 &&
+        n_tokens <= options_.max_batch && DenseF16Route(l.attn_qkv, n_tokens) &&
+        l.attn_qkv.rows == 13312 && l.attn_qkv.cols == 2560 &&
+        c.num_heads == 24 && c.num_kv_heads == 2 && c.head_dim == 256 &&
+        c.rotary_dim == 64;
     if (fused_projection) {
       PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
       prepared = AttentionF16Gemm(
@@ -1176,7 +1188,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
         return false;
       }
     } else {
-      if (!Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
+      if (!projections_ready &&
+          !Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
         return false;
       }
       prepared = PrepareAttention(s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(),
@@ -1191,10 +1204,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     }
   } else {
     Q8Input xq;
-    if (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
-        !Dense(l.attn_q, xq, s_.qg, error_msg) ||
-        !Dense(l.attn_k, xq, s_.k, error_msg) ||
-        !Dense(l.attn_v, xq, s_.v, error_msg)) {
+    if (!projections_ready &&
+        (!Quantize(x, n_tokens, c.hidden_size, &xq, error_msg) ||
+         !Dense(l.attn_q, xq, s_.qg, error_msg) ||
+         !Dense(l.attn_k, xq, s_.k, error_msg) ||
+         !Dense(l.attn_v, xq, s_.v, error_msg))) {
       return false;
     }
     UnpackQGate(s_.qg, 2 * c.AttentionQDim(), s_.q, s_.attn_gate, nullptr,
@@ -1262,12 +1276,20 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   // Wide batches run the fused WMMA kernel (never inside a graph: the kv
   // extent is a host value), output gate included, skipping the key tiles
   // no query of a block selected; the per-token kernel covers the rest.
+  if (last_only && !Check(hipMemsetAsync(s_.ctx, 0,
+                                         static_cast<std::size_t>(n_tokens) *
+                                             c.AttentionQDim() * sizeof(float),
+                                         stream_),
+                          "draft attention output initialization", error_msg)) {
+    return false;
+  }
   if (n_tokens > kVecBatch &&
       WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, mask,
                           mask_words_, s_.ctx, n_tokens, start_pos, c.num_heads,
-                          c.num_kv_heads, c.head_dim, c.compress_ratio,
-                          stream_)) {
-    return Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+                          c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
+                          last_only)) {
+    return !project_output ||
+           Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
   }
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
@@ -1278,7 +1300,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                   c.compress_ratio, stream_);
   SigmoidMul(s_.ctx, s_.attn_gate,
              static_cast<std::size_t>(n_tokens) * c.AttentionQDim(), stream_);
-  return Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
+  return !project_output || Dense(l.attn_out, s_.ctx, out, n_tokens, error_msg);
 }
 
 bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
@@ -1849,7 +1871,8 @@ bool SameGeometry(const SnapshotHeader& h, const SnapshotHeader& mine) {
   return h.magic == mine.magic && h.num_layers == mine.num_layers &&
          h.full_attention_interval == mine.full_attention_interval &&
          h.conv_elems == mine.conv_elems && h.state_elems == mine.state_elems &&
-         h.kv_row == mine.kv_row && h.indexer_head_dim == mine.indexer_head_dim &&
+         h.kv_row == mine.kv_row &&
+         h.indexer_head_dim == mine.indexer_head_dim &&
          h.compress_ratio == mine.compress_ratio && h.hc_dim == mine.hc_dim &&
          h.ple_elems == mine.ple_elems && h.has_mtp == mine.has_mtp;
 }
@@ -1860,8 +1883,7 @@ template<typename Visit>
 std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
                                      const Session* session, Visit&& visit) {
   std::uint64_t offset = sizeof(SnapshotHeader);
-  const auto region = [&](void* device, std::uint64_t bytes,
-                          const char* what) {
+  const auto region = [&](void* device, std::uint64_t bytes, const char* what) {
     if (bytes != 0 && !visit(device, offset, bytes, what)) {
       return false;
     }
@@ -1871,8 +1893,8 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
   const auto linear = [&](std::uint32_t il) -> const Session::LinearState* {
     return session != nullptr ? &session->linear_[il] : nullptr;
   };
-  const auto attention = [&](std::uint32_t il)
-      -> const Session::AttentionState* {
+  const auto attention =
+      [&](std::uint32_t il) -> const Session::AttentionState* {
     return session != nullptr ? &session->attention_[il] : nullptr;
   };
   for (std::uint32_t il = 0; il < h.num_layers; ++il) {
@@ -1947,15 +1969,13 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
 
 std::uint64_t Executor::SnapshotBytes(const Session& session,
                                       std::uint32_t hidden_rows) const {
-  SnapshotHeader h =
-      MakeSnapshotHeader(config(), model_->has_mtp(), session);
+  SnapshotHeader h = MakeSnapshotHeader(config(), model_->has_mtp(), session);
   h.blocks = session.blocks_;
   h.mtp_position = session.mtp_.position;
   h.hidden_rows = hidden_rows;
-  return WalkSnapshot(h, nullptr,
-                      [](void*, std::uint64_t, std::uint64_t, const char*) {
-                        return true;
-                      });
+  return WalkSnapshot(
+      h, nullptr,
+      [](void*, std::uint64_t, std::uint64_t, const char*) { return true; });
 }
 
 bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
@@ -1974,8 +1994,7 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     AssignError(error_msg, "kept trunk rows exceed the position or batch");
     return false;
   }
-  SnapshotHeader h =
-      MakeSnapshotHeader(config(), model_->has_mtp(), session);
+  SnapshotHeader h = MakeSnapshotHeader(config(), model_->has_mtp(), session);
   h.blocks = session.blocks_;
   h.mtp_position = session.mtp_.position;
   h.hidden_rows = hidden_rows;
@@ -2251,10 +2270,15 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   attn.k_cache = session.mtp_.k_cache;
   attn.v_cache = session.mtp_.v_cache;
   // The draft block's attention runs at its own position.
+  // Catch-up exports KV for every row but only carries its final residual.
+  // Preserve that row's original query tile and all projection shapes;
+  // earlier attention results never contribute to the carried state.
+  const bool last_only =
+      !token && !candidates && n > 32 && control_host_->hidden_row >= 0;
   if (!HcMix(l.hc_attn, s_.mtp_res, false, s_.mixed, s_.inject, n, error_msg) ||
       !Attention(l, attn, s_.mixed, s_.block_out, n,
                  &session.control_->mtp_position, nullptr, pos, 0,
-                 session.max_context_, false, error_msg)) {
+                 session.max_context_, false, error_msg, last_only)) {
     return false;
   }
   Combine(s_.mtp_res, l.hc_ffn.norm.f32(), n);

@@ -76,9 +76,10 @@ extern "C" int qfn_mmq_q4_0_dense_vec_preq(const void* weights,
   return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
-// Flash Next uses one wave per dense row and per routed token on gfx1151.
-template<int ncols_dst, bool has_gate, bool selected = false>
-__launch_bounds__(32, 1) static __global__
+// Each wave handles up to eight dense inputs for one weight row on gfx1151.
+template<int ncols_dst, bool has_gate, bool selected = false,
+         int token_waves = 1>
+__launch_bounds__(32 * token_waves, 1) static __global__
     void mul_mat_vec_q8(const void* __restrict__ weights,
                         const void* __restrict__ gate,
                         const block_q8_1* __restrict__ input,
@@ -88,7 +89,8 @@ __launch_bounds__(32, 1) static __global__
   constexpr int qi = QI8_0;
   constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
   constexpr int blocks_per_iter = vdr * 32 / qi;
-  const int lane = threadIdx.x;
+  const int lane = token_waves > 1 ? threadIdx.x % 32 : threadIdx.x;
+  const int first_token = token_waves > 1 ? threadIdx.x / 32 * ncols_dst : 0;
   const int row = selected ? selected_ids[blockIdx.x] : blockIdx.x;
   if constexpr (selected) {
     if (static_cast<uint32_t>(row) >= nrows_x)
@@ -103,8 +105,9 @@ __launch_bounds__(32, 1) static __global__
        kbx += blocks_per_iter) {
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
-      sum[j] += vec_dot_q8_0_q8_1(weights, input + j * stride_col_y + kbx,
-                                  row_offset + kbx, kqs);
+      sum[j] += vec_dot_q8_0_q8_1(
+          weights, input + (first_token + j) * stride_col_y + kbx,
+          row_offset + kbx, kqs);
       if constexpr (has_gate) {
         gate_sum[j] += vec_dot_q8_0_q8_1(gate, input + j * stride_col_y + kbx,
                                          row_offset + kbx, kqs);
@@ -120,7 +123,7 @@ __launch_bounds__(32, 1) static __global__
       float value = sum[j];
       if constexpr (has_gate)
         value *= ggml_hip_op_silu_single(gate_sum[j]);
-      output[j * nrows_x + row] = value;
+      output[(first_token + j) * nrows_x + row] = value;
     }
   }
 }
@@ -397,21 +400,57 @@ static void launch_q8(const void* weights, const void* gate, const block_q8_1* i
 }
 
 void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
-                            const block_q8_1* input, float* output,
-                            int k, int rows, int tokens, int input_stride,
-                            hipStream_t stream) {
-    GGML_ASSERT(k % QK8_0 == 0 && rows > 0);
-    switch (tokens) {
-        case 1: launch_q8<1>(weights, gate, input, output, k, rows, input_stride, stream); break;
-        case 2: launch_q8<2>(weights, gate, input, output, k, rows, input_stride, stream); break;
-        case 3: launch_q8<3>(weights, gate, input, output, k, rows, input_stride, stream); break;
-        case 4: launch_q8<4>(weights, gate, input, output, k, rows, input_stride, stream); break;
-        case 5: launch_q8<5>(weights, gate, input, output, k, rows, input_stride, stream); break;
-        case 6: launch_q8<6>(weights, gate, input, output, k, rows, input_stride, stream); break;
-        case 7: launch_q8<7>(weights, gate, input, output, k, rows, input_stride, stream); break;
-        case 8: launch_q8<8>(weights, gate, input, output, k, rows, input_stride, stream); break;
-        default: GGML_ABORT("invalid vector batch width");
+                             const block_q8_1* input, float* output, int k,
+                             int rows, int tokens, int input_stride,
+                             hipStream_t stream) {
+  GGML_ASSERT(k % QK8_0 == 0 && rows > 0);
+  if (tokens > 8) {
+    GGML_ASSERT(tokens <= 32 && tokens % 8 == 0 && !gate);
+    // Each wave retains the eight-row arithmetic. Adjacent waves work
+    // on the same weight row, reusing cache lines across requests.
+    if (tokens == 16) {
+      mul_mat_vec_q8<8, false, false, 2>
+          <<<rows, 64, 0, stream>>>(weights, nullptr, input, output, k, rows,
+                                    input_stride);
+    } else if (tokens == 24) {
+      mul_mat_vec_q8<8, false, false, 3>
+          <<<rows, 96, 0, stream>>>(weights, nullptr, input, output, k, rows,
+                                    input_stride);
+    } else {
+      mul_mat_vec_q8<8, false, false, 4>
+          <<<rows, 128, 0, stream>>>(weights, nullptr, input, output, k, rows,
+                                     input_stride);
     }
+    return;
+  }
+  switch (tokens) {
+    case 1:
+      launch_q8<1>(weights, gate, input, output, k, rows, input_stride, stream);
+      break;
+    case 2:
+      launch_q8<2>(weights, gate, input, output, k, rows, input_stride, stream);
+      break;
+    case 3:
+      launch_q8<3>(weights, gate, input, output, k, rows, input_stride, stream);
+      break;
+    case 4:
+      launch_q8<4>(weights, gate, input, output, k, rows, input_stride, stream);
+      break;
+    case 5:
+      launch_q8<5>(weights, gate, input, output, k, rows, input_stride, stream);
+      break;
+    case 6:
+      launch_q8<6>(weights, gate, input, output, k, rows, input_stride, stream);
+      break;
+    case 7:
+      launch_q8<7>(weights, gate, input, output, k, rows, input_stride, stream);
+      break;
+    case 8:
+      launch_q8<8>(weights, gate, input, output, k, rows, input_stride, stream);
+      break;
+    default:
+      GGML_ABORT("invalid vector batch width");
+  }
 }
 
 template<ggml_type type, int rows_per_wave = 2>
@@ -492,6 +531,10 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
       launch_moe_grouped<GGML_TYPE_Q4_K>(gate, up, input, groups, output, k,
                                          rows, tokens, experts_used,
                                          input_stride, stream);
+    } else if (type == GGML_TYPE_Q8_0) {
+      launch_moe_grouped<GGML_TYPE_Q8_0>(gate, up, input, groups, output, k,
+                                         rows, tokens, experts_used,
+                                         input_stride, stream);
     } else {
       GGML_ASSERT(type == GGML_TYPE_Q5_K);
       launch_moe_grouped<GGML_TYPE_Q5_K>(gate, up, input, groups, output, k,
@@ -505,6 +548,10 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
   const dim3 block(32, 2);
   if (type == GGML_TYPE_Q4_K) {
     mul_mat_vec_q_moe<GGML_TYPE_Q4_K, 2, true><<<grid, block, 0, stream>>>(
+        gate, input, ids, output, k, rows, row_stride, input_stride,
+        rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
+  } else if (type == GGML_TYPE_Q8_0) {
+    mul_mat_vec_q_moe<GGML_TYPE_Q8_0, 2, true><<<grid, block, 0, stream>>>(
         gate, input, ids, output, k, rows, row_stride, input_stride,
         rows * experts_used, rows * row_stride, rows, 1, experts_used, up);
   } else {

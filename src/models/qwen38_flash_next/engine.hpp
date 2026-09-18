@@ -43,7 +43,7 @@ class Session;
 class SessionSnapshot;
 
 /// Gufo-owned API over the ROCm runtime: one resident model, any number of
-/// sessions, executed one at a time.
+/// sessions with shared projection batches and independent context state.
 class Model final : public std::enable_shared_from_this<Model> {
 public:
   ~Model();
@@ -121,6 +121,22 @@ public:
                                 DecodeResult* result,
                                 std::string* error_msg = nullptr,
                                 bool stop_at_eos = true);
+  struct DecodeRequest {
+    Session* session;
+    std::size_t max_tokens;
+    sampling::SamplerState* sampler;
+    DecodeResult* result;
+    bool stop_at_eos{true};
+  };
+  [[nodiscard]] static bool DecodeBatch(std::span<const DecodeRequest> requests,
+                                        std::string* error_msg = nullptr);
+  struct AdvanceRequest {
+    Session* session;
+    std::int32_t token;
+  };
+  [[nodiscard]] static bool EvaluateBatch(
+      std::span<const AdvanceRequest> requests,
+      std::string* error_msg = nullptr);
   [[nodiscard]] std::span<const float> Logits() const noexcept {
     return logits_;
   }
@@ -167,6 +183,11 @@ private:
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
                     MtpCandidateLogits* candidates = nullptr);
+  struct PendingDecode;
+  bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,
+                     std::string* error_msg);
+  bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
+                    std::string* error_msg);
 
   std::shared_ptr<Model> model_;
   std::unique_ptr<rocm::Session> session_;

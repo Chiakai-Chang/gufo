@@ -579,7 +579,7 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
 }
 
 void CheckDecodeGrouping(int rows, int cols) {
-  constexpr int tokens = 8;
+  constexpr int tokens = 32;
   const auto w = MakeWeights(rows, cols, 11);
   const auto gate = MakeWeights(rows, cols, 17);
   std::vector<float> x(tokens * cols);
@@ -596,7 +596,8 @@ void CheckDecodeGrouping(int rows, int cols) {
   CheckHip(hipMalloc(&dx, x.size() * sizeof(float)), "decode inputs");
   CheckHip(hipMalloc(&dq, qfn_mmq_q8_1_bytes(tokens, cols)),
            "decode quantized inputs");
-  CheckHip(hipMalloc(&out, rows * tokens * sizeof(float)), "decode output");
+  CheckHip(hipMalloc(&out, (rows * tokens + 4) * sizeof(float)),
+           "decode output");
   CheckHip(
       hipMemcpy(dw, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
       "weights upload");
@@ -616,15 +617,19 @@ void CheckDecodeGrouping(int rows, int cols) {
                                       out + t * rows, rows, 1, cols, nullptr))
         throw std::runtime_error("scalar dense projection failed");
     }
-    std::vector<float> scalar(tokens * rows), batch(tokens * rows);
+    std::vector<float> scalar(tokens * rows), batch(tokens * rows + 4);
     CheckHip(hipMemcpy(scalar.data(), out, scalar.size() * sizeof(float),
                        hipMemcpyDeviceToHost),
              "scalar output");
-    for (int n = 2; n <= tokens; ++n) {
+    for (int n = 2; n <= (gated ? 8 : tokens); ++n) {
+      if (n > 8 && n % 8 != 0)
+        continue;
+      CheckHip(hipMemset(out, 0xA5, batch.size() * sizeof(float)),
+               "decode output guard");
       if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, dq, out, rows,
                                       n, cols, nullptr))
         throw std::runtime_error("batched dense projection failed");
-      CheckHip(hipMemcpy(batch.data(), out, n * rows * sizeof(float),
+      CheckHip(hipMemcpy(batch.data(), out, batch.size() * sizeof(float),
                          hipMemcpyDeviceToHost),
                "batch output");
       if (std::memcmp(scalar.data(), batch.data(), n * rows * sizeof(float)) !=
@@ -633,6 +638,10 @@ void CheckDecodeGrouping(int rows, int cols) {
             "Q8 dense grouping differs: M=" + std::to_string(rows) +
             " K=" + std::to_string(cols) + " N=" + std::to_string(n) +
             " gated=" + std::to_string(gated));
+      for (std::size_t i = std::size_t(n) * rows; i < batch.size(); ++i) {
+        if (std::bit_cast<std::uint32_t>(batch[i]) != 0xA5A5A5A5U)
+          throw std::runtime_error("Q8 batch projection overwrote its guard");
+      }
     }
   }
   for (void* ptr :

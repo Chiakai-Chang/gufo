@@ -610,7 +610,8 @@ void CheckVectorGrouping(bool down = false) {
               "paired vector differs from separate projections");
       }
       if (formats[f] == q::WeightType::kQ4_K ||
-          formats[f] == q::WeightType::kQ5_K) {
+          formats[f] == q::WeightType::kQ5_K ||
+          formats[f] == q::WeightType::kQ8_0) {
         // Compare the fused vector path with the original GPU SwiGLU too:
         // inactive experts, nonfinite scales and a ragged last row must
         // retain their exact values and output guards.

@@ -2663,7 +2663,8 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
     const float* __restrict__ q, const float* __restrict__ gate,
     const __half* __restrict__ k_cache, const __half* __restrict__ v_cache,
     const std::uint32_t* __restrict__ mask, std::uint32_t mask_words,
-    float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens) {
+    float* __restrict__ out, std::uint32_t start_pos, std::uint32_t n_tokens,
+    std::uint32_t first_query_group = 0) {
   // The launcher accepts only four-token selection blocks. Keep that
   // geometry constant throughout the key sweep.
   constexpr std::uint32_t ratio = kWmmaRatio;
@@ -2699,7 +2700,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   // This improves cache reuse without changing any query's key sweep.
   const std::uint32_t linear = blockIdx.y * gridDim.x + blockIdx.x;
   const std::uint32_t query_group =
-      kPackHeads ? linear / kWmmaKvHeads : blockIdx.x;
+      kPackHeads ? linear / kWmmaKvHeads : first_query_group + blockIdx.x;
   const std::uint32_t query_start = query_group * kQueryRows;
   const std::uint32_t kv_head =
       kPackHeads ? linear % kWmmaKvHeads : blockIdx.y / (kWmmaGqa / kWmmaHeads);
@@ -5552,7 +5553,8 @@ bool WmmaCausalAttention(const float* q, const float* gate,
                          float* out, std::uint32_t n_tokens,
                          std::uint32_t start_pos, std::uint32_t heads,
                          std::uint32_t kv_heads, std::uint32_t d,
-                         std::uint32_t ratio, hipStream_t stream) {
+                         std::uint32_t ratio, hipStream_t stream,
+                         bool last_only) {
   if (heads != kWmmaQueryHeads || kv_heads != kWmmaKvHeads ||
       d != kWmmaHeadDim || ratio != kWmmaRatio || n_tokens == 0 ||
       (mask != nullptr && mask_words > kWmmaMaxMaskWords)) {
@@ -5577,12 +5579,15 @@ bool WmmaCausalAttention(const float* q, const float* gate,
     }
     return true;
   }
-  const dim3 grid((n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows,
-                  kWmmaKvHeads * (kWmmaGqa / kWmmaHeads));
+  const std::uint32_t first_group =
+      last_only ? (n_tokens - 1) / kWmmaQueryRows : 0;
+  const dim3 grid(
+      (n_tokens + kWmmaQueryRows - 1) / kWmmaQueryRows - first_group,
+      kWmmaKvHeads * (kWmmaGqa / kWmmaHeads));
   hipLaunchKernelGGL(
       (WmmaCausalAttentionKernel<kWmmaQueryRows, kWmmaKeys, false>), grid,
       dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask, mask_words,
-      out, start_pos, n_tokens);
+      out, start_pos, n_tokens, first_group);
   return true;
 }
 

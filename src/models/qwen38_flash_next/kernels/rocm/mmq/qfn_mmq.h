@@ -36,7 +36,7 @@ int qfn_mmq_moe_vec(int weight_type, const void* W, const float* X_f32,
                     int n_experts, int n_expert_used, hipStream_t stream,
                     const void* W_b = nullptr, float* out_b = nullptr);
 
-// Q4_K/Q5_K gate/up projection for 1–8 tokens, with the SwiGLU result in out.
+// Q4_K/Q5_K/Q8_0 gate/up for 1–8 tokens, with the SwiGLU result in out.
 int qfn_mmq_moe_gated_vec(int weight_type, const void* gate, const void* up,
                           const float* x, const int32_t* ids, float* out, int m,
                           int k, int tokens, int experts, int experts_used,
@@ -47,6 +47,7 @@ size_t qfn_mmq_q8_1_bytes(int N, int K);
 int qfn_mmq_quantize_q8_1(const float* X_f32, void* X_q8, int N, int K,
                           hipStream_t stream);
 
+// Exact vector arithmetic for 1–8 rows, or 16/24/32 ungated rows.
 int qfn_mmq_q8_0_dense_vec_preq(const void * W_q8_0, const void * W_gate,
                                 const void * X_q8, float * out_f32, int M,
                                 int N, int K, hipStream_t stream);
