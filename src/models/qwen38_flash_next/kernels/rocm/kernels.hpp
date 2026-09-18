@@ -131,6 +131,22 @@ void W8A8GemmWave64(const void* w, const void* x_tiled, float* out,
                     std::size_t batch, std::size_t m, std::size_t k,
                     hipStream_t stream);
 
+/// Q8_0 HC down projection [320,10240], SiLU(x / 4), then F16 output.
+/// Matches the separate operators' rounding. Supports at least 96 tokens.
+bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
+                   std::uint32_t n_tokens, hipStream_t stream);
+
+/// Stacked Q8_0 QKV projection [13312,2560], head normalization and RoPE.
+/// Writes Q/gates in F32 and K/V caches in F16, preserving separate rounding.
+/// Fixed geometry: 24 query heads, two KV heads, 256 dimensions, 64 rotary.
+/// Requires at least 1024 tokens; cache capacity must include position +
+/// tokens.
+bool AttentionF16Gemm(const void* weights, const __half* input,
+                      const float* q_gamma, const float* k_gamma, float* query,
+                      float* gate, __half* keys, __half* values,
+                      std::uint32_t n_tokens, const std::uint32_t* position,
+                      float theta, float eps, hipStream_t stream);
+
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
 /// shapes. low_rank must not overlap mixed_half; side outputs are optional.

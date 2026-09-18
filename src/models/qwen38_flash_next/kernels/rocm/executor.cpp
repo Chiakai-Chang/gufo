@@ -891,19 +891,6 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
     RmsNormRows(res, m.norm.f32(), s_.xn, n_tokens, c.HcDim(), c.hc_count,
                 c.rms_eps, stream_);
   }
-  if (xn_half_) {
-    if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
-                  m.down.cols, stream_)) {
-      AssignError(error_msg, "W8A8 mixer down projection failed");
-      return false;
-    }
-  } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
-    return false;
-  }
-  SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
-            static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
-  const bool fused_inject =
-      inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
   const bool extras = n_tokens <= options_.max_batch &&
                       c.hidden_size <= model_->max_half_cols();
   const bool fused_projection =
@@ -912,14 +899,31 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
       m.up.type == GgmlType::kQ8_0 && m.up.rows == c.HcDim() &&
       m.up.cols == c.hc_low_rank;
   if (fused_projection) {
-    // The fusion emits mixed_half into x_half. Stage its input in the unused
-    // gate buffer so independent projection tiles cannot overwrite it.
-    NarrowActivations(s_.lo, s_.hc_gate, false,
-                      static_cast<std::size_t>(n_tokens) * c.hc_low_rank,
-                      stream_);
-  } else if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
-    return false;
+    // The up projection writes x_half; keep its input in the gate buffer.
+    if (!HcDownF16Gemm(m.down.data, s_.xn_q8t,
+                       reinterpret_cast<__half*>(s_.hc_gate), n_tokens,
+                       stream_)) {
+      AssignError(error_msg, "fused HC down projection failed");
+      return false;
+    }
+  } else {
+    if (xn_half_) {
+      if (!W8A8Gemm(m.down.data, s_.xn_q8t, s_.lo, n_tokens, m.down.rows,
+                    m.down.cols, stream_)) {
+        AssignError(error_msg, "W8A8 mixer down projection failed");
+        return false;
+      }
+    } else if (!Dense(m.down, s_.xn, s_.lo, n_tokens, error_msg)) {
+      return false;
+    }
+    SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
+              static_cast<std::size_t>(n_tokens) * c.hc_low_rank, stream_);
+    if (!Dense(m.up, s_.lo, s_.hc_gate, n_tokens, error_msg)) {
+      return false;
+    }
   }
+  const bool fused_inject =
+      inject != nullptr && !m.inject.empty() && m.inject.type == GgmlType::kF32;
   const float* xn = s_.xn;
   const bool vectorized =
       xn_half_ ||
@@ -1148,18 +1152,35 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       IndexerCapacity(c, options_.max_batch, max_context);
   bool prepared = false;
   if (!l.attn_qkv.empty()) {
-    // The stacked projection feeds normalization, rotation and cache writes.
-    if (!Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
-      return false;
-    }
-    prepared = PrepareAttention(s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(),
-                                l.attn_k_norm.f32(), s_.q, s_.attn_gate,
-                                s.k_cache, s.v_cache, n_tokens, c.num_heads,
-                                c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
-                                c.rope_theta, c.rms_eps, stream_);
-    if (!prepared) {
-      UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
-                  n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
+    const bool fused_projection =
+        n_tokens >= 1024 && n_tokens <= options_.max_batch &&
+        DenseF16Route(l.attn_qkv, n_tokens) && l.attn_qkv.rows == 13312 &&
+        l.attn_qkv.cols == 2560 && c.num_heads == 24 && c.num_kv_heads == 2 &&
+        c.head_dim == 256 && c.rotary_dim == 64;
+    if (fused_projection) {
+      PrepareHalfInput(x, n_tokens, l.attn_qkv.cols);
+      prepared = AttentionF16Gemm(
+          l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
+          l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
+          s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps,
+          stream_);
+      if (!prepared) {
+        AssignError(error_msg, "fused attention projection failed");
+        return false;
+      }
+    } else {
+      if (!Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
+        return false;
+      }
+      prepared = PrepareAttention(s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(),
+                                  l.attn_k_norm.f32(), s_.q, s_.attn_gate,
+                                  s.k_cache, s.v_cache, n_tokens, c.num_heads,
+                                  c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
+                                  c.rope_theta, c.rms_eps, stream_);
+      if (!prepared) {
+        UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
+                    n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
+      }
     }
   } else {
     Q8Input xq;

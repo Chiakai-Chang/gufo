@@ -3196,16 +3196,25 @@ __global__ void QuantizeQ8TiledKernel(const float* __restrict__ x,
   }
 }
 
+// Preserve the separate scale/SiLU kernel's F32 intermediates before narrowing.
+// Without these compiler boundaries, fused F16 output can round differently.
+__device__ __forceinline__ float HcScaledSilu(float value) {
+  float scaled = value * 0.25F;
+  asm volatile("" : "+v"(scaled));
+  float result = SiluF(scaled);
+  asm volatile("" : "+v"(result));
+  return result;
+}
+
 /// Two-dimensionally blocked W8A8 WMMA GEMM: block = BM rows x BN tokens, BK
 /// 32-element K blocks per LDS stage, waves = WM row groups x WN token groups.
 /// Out-of-range rows and K blocks are clamped and their scale zeroed, so
 /// they contribute exactly zero without divergence. y is [batch][m].
-template<int BM, int BN, int BK, int WM, int WN>
-__launch_bounds__(256) __global__
-    void W8A8BlockedWmmaGEMMKernel(const void* __restrict__ w,
-                                   const void* __restrict__ x_blocks,
-                                   float* __restrict__ y, std::size_t batch,
-                                   std::size_t m, std::size_t k) {
+template<int BM, int BN, int BK, int WM, int WN, bool kHcDown = false>
+__launch_bounds__(256) __global__ void W8A8BlockedWmmaGEMMKernel(
+    const void* __restrict__ w, const void* __restrict__ x_blocks,
+    std::conditional_t<kHcDown, __half, float>* __restrict__ y,
+    std::size_t batch, std::size_t m, std::size_t k) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   static_assert(BN / 16 <= 8,
@@ -3391,7 +3400,10 @@ __launch_bounds__(256) __global__
   // global store covers 32 consecutive rows of one token: a full 128-byte
   // line (half lines cost a read-modify-write on the fabric).
   __syncthreads();
-  float* tile_scratch = reinterpret_cast<float*>(lds) + (wave_id * 512);
+  constexpr unsigned kOutputStride = kHcDown ? 36 : 32;
+  static_assert(8 * 16 * kOutputStride * sizeof(float) <= sizeof(lds));
+  float* tile_scratch =
+      reinterpret_cast<float*>(lds) + wave_id * 16 * kOutputStride;
 #pragma unroll
   for (int i = 0; i < kWaveRowTiles; i += 2) {
 #pragma unroll
@@ -3399,8 +3411,9 @@ __launch_bounds__(256) __global__
       // scratch[token][row] over 16 tokens x 32 rows.
 #pragma unroll
       for (int l = 0; l < 8; ++l) {
-        tile_scratch[(sub_lane * 32) + (2 * l) + half_id] = acc[i][j][l];
-        tile_scratch[(sub_lane * 32) + 16 + (2 * l) + half_id] =
+        tile_scratch[(sub_lane * kOutputStride) + (2 * l) + half_id] =
+            acc[i][j][l];
+        tile_scratch[(sub_lane * kOutputStride) + 16 + (2 * l) + half_id] =
             acc[i + 1][j][l];
       }
       __builtin_amdgcn_wave_barrier();
@@ -3414,21 +3427,38 @@ __launch_bounds__(256) __global__
       const int tok_l = lane_id >> 1;
       const int row_l = (lane_id & 1) * 16;
       const std::size_t tok = t0 + static_cast<std::size_t>(tok_l);
-      const auto* src =
-          reinterpret_cast<const float4*>(tile_scratch + (tok_l * 32) + row_l);
+      const auto* src = reinterpret_cast<const float4*>(
+          tile_scratch + (tok_l * kOutputStride) + row_l);
       if (tok < batch && r0 + 32 <= m) {
-        auto* dst = reinterpret_cast<float4*>(y + (tok * m) + r0 +
-                                              static_cast<std::size_t>(row_l));
+        if constexpr (kHcDown) {
+          auto* dst = y + tok * m + r0 + static_cast<std::size_t>(row_l);
 #pragma unroll
-        for (int q = 0; q < 4; ++q) {
-          dst[q] = src[q];
+          for (int q = 0; q < 4; ++q) {
+            const float4 v = src[q];
+            *reinterpret_cast<__half2*>(dst + 4 * q) =
+                __floats2half2_rn(HcScaledSilu(v.x), HcScaledSilu(v.y));
+            *reinterpret_cast<__half2*>(dst + 4 * q + 2) =
+                __floats2half2_rn(HcScaledSilu(v.z), HcScaledSilu(v.w));
+          }
+        } else {
+          auto* dst = reinterpret_cast<float4*>(
+              y + (tok * m) + r0 + static_cast<std::size_t>(row_l));
+#pragma unroll
+          for (int q = 0; q < 4; ++q) {
+            dst[q] = src[q];
+          }
         }
       } else if (tok < batch) {
 #pragma unroll
         for (int q = 0; q < 16; ++q) {
           const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
           if (r < m) {
-            y[(tok * m) + r] = tile_scratch[(tok_l * 32) + row_l + q];
+            const float value =
+                tile_scratch[(tok_l * kOutputStride) + row_l + q];
+            if constexpr (kHcDown)
+              y[(tok * m) + r] = __float2half_rn(HcScaledSilu(value));
+            else
+              y[(tok * m) + r] = value;
           }
         }
       }
@@ -4296,6 +4326,16 @@ void QuantizeQ8Tiled(const float* x, void* out, std::size_t batch,
                      dim3(kThreads), 0, stream, x, out, batch, k);
 }
 
+bool HcDownF16Gemm(const void* w, const void* x_tiled, __half* out,
+                   std::uint32_t n_tokens, hipStream_t stream) {
+  if (n_tokens < 96 || w == nullptr || x_tiled == nullptr || out == nullptr)
+    return false;
+  hipLaunchKernelGGL((W8A8BlockedWmmaGEMMKernel<64, 128, 4, 2, 4, true>),
+                     dim3((n_tokens + 127) / 128, 5), dim3(kThreads), 0, stream,
+                     w, x_tiled, out, n_tokens, 320, 10240);
+  return true;
+}
+
 bool W8A8Gemm(const void* w, const void* x_tiled, float* out, std::size_t batch,
               std::size_t m, std::size_t k, hipStream_t stream) {
   if (m == 0 || k == 0 || batch == 0 || k % 32 != 0) {
@@ -4490,7 +4530,9 @@ __device__ __forceinline__ float SsmConv4Value(float4 w, float x0, float x1,
   return SiluF(acc);
 }
 
-// The fused projection leaves each 16-token tile's first and last three
+constexpr unsigned kSsmProjectionTileTokens = 32;
+
+// The fused projection leaves each 32-token tile's first and last three
 // raw rows in qkv. Only the first three convolutions need another tile or
 // the previous chunk's history; all other rows are produced in LDS.
 __global__ void SsmConvBoundaryKernel(const float* qkv, const float* w,
@@ -4499,7 +4541,7 @@ __global__ void SsmConvBoundaryKernel(const float* qkv, const float* w,
                                       std::uint32_t channels,
                                       std::uint32_t stride) {
   const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::uint32_t t = blockIdx.y * 16 + blockIdx.z;
+  const std::uint32_t t = blockIdx.y * kSsmProjectionTileTokens + blockIdx.z;
   if (c >= channels || t >= n_tokens) {
     return;
   }
@@ -4515,6 +4557,20 @@ __global__ void SsmConvBoundaryKernel(const float* qkv, const float* w,
       SsmConv4Value(taps, v[0], v[1], v[2], v[3]);
 }
 
+// Optional output layout for the stacked QKV projection. The projection's
+// 256-row tile covers one query, gate, key or value head.
+struct AttentionProjectionOutput {
+  const float* q_gamma;
+  const float* k_gamma;
+  float* query;
+  float* gate;
+  __half* keys;
+  __half* values;
+  const std::uint32_t* position;
+  float theta;
+  float eps;
+};
+
 /// Dense F16 WMMA GEMM over Q8_0 weights: block = BM rows x BN tokens, BK
 /// 32-element K blocks per LDS stage, waves = WM row groups x WN token
 /// groups. The codes are dequantized to F16 once per stage as they are
@@ -4522,16 +4578,13 @@ __global__ void SsmConvBoundaryKernel(const float* qkv, const float* w,
 /// and the activations are F16 rows [batch][k], so the matrix cores
 /// accumulate in F32 with no per-block scaling. y is [batch][m].
 template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
-         bool kHcMix = false, bool kSsmConv = false>
-__launch_bounds__(256) __global__
-    void DenseF16GEMMKernel(const void* __restrict__ w,
-                            const __half* __restrict__ x, float* __restrict__ y,
-                            std::size_t batch, std::size_t m, std::size_t k,
-                            const __half* xn = nullptr,
-                            __half* mixed_half = nullptr,
-                            void* mixed_q8 = nullptr,
-                            const float* conv_w = nullptr,
-                            float* conv_out = nullptr) {
+         bool kHcMix = false, bool kSsmConv = false, bool kAttention = false>
+__launch_bounds__(256) __global__ void DenseF16GEMMKernel(
+    const void* __restrict__ w, const __half* __restrict__ x,
+    float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
+    const __half* xn = nullptr, __half* mixed_half = nullptr,
+    void* mixed_q8 = nullptr, const float* conv_w = nullptr,
+    float* conv_out = nullptr, AttentionProjectionOutput attention = {}) {
   static_assert(WM * WN == 8, "256 threads is 8 waves");
   static_assert(BM % (16 * WM) == 0 && BN % (16 * WN) == 0);
   constexpr int kRowTiles = BM / 16;
@@ -4735,6 +4788,90 @@ __launch_bounds__(256) __global__
     __syncthreads();
   }
 
+  if constexpr (kAttention) {
+    static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 8 && WN == 1);
+    static_assert(!kHcMix && !kSsmConv && kRowGroup == 1);
+    constexpr unsigned stride = 36, dim = 256, width = 6144, kvwidth = 512;
+    float* scratch = reinterpret_cast<float*>(s_lds);
+    float* tile = scratch + wave_id * 16 * stride;
+    const unsigned projection_head = r_block / 256;
+    const bool query = projection_head < 48 && (projection_head % 2) == 0;
+    const bool key = projection_head >= 48 && projection_head < 50;
+    const bool gate = projection_head < 48 && (projection_head % 2) == 1;
+    const unsigned head =
+        projection_head < 48 ? projection_head / 2 : projection_head % 2;
+#pragma unroll
+    for (int j = 0; j < kWaveTokTiles; ++j) {
+#pragma unroll
+      for (int l = 0; l < 8; ++l) {
+        tile[sub_lane * stride + 2 * l + half_id] = acc[0][j][l];
+        tile[sub_lane * stride + 16 + 2 * l + half_id] = acc[1][j][l];
+      }
+      __syncthreads();
+#pragma unroll
+      for (unsigned phase = 0; phase < 2; ++phase) {
+        // One wave handles a token, emulating its original eight-wave norm.
+        const unsigned tok_local = wave_id * 2 + phase;
+        const std::size_t tok = t_block + j * 16 + tok_local;
+        if (tok < batch) {
+          float v[8];
+#pragma unroll
+          for (unsigned c = 0; c < 8; ++c)
+            v[c] = scratch[(c * 16 + tok_local) * stride + lane_id];
+          if (query || key) {
+            float total = 0.0F;
+#pragma unroll
+            for (unsigned c = 0; c < 8; ++c) {
+              // Match the separate norm: round each square and each wave sum
+              // before accumulating the eight partials in their original order.
+              float sq = v[c] * v[c];
+              asm volatile("" : "+v"(sq));
+              float ss = WaveSum(sq);
+              asm volatile("" : "+v"(ss));
+              total += ss;
+              asm volatile("" : "+v"(total));
+            }
+            const float scale = rsqrtf(total / 256.0F + attention.eps);
+            const float* gamma = query ? attention.q_gamma : attention.k_gamma;
+#pragma unroll
+            for (unsigned c = 0; c < 8; ++c) {
+              v[c] = v[c] * scale;
+              asm volatile("" : "+v"(v[c]));
+              v[c] = v[c] * gamma[c * 32 + lane_id];
+              asm volatile("" : "+v"(v[c]));
+            }
+            const float freq = powf(
+                attention.theta, -2.0F * static_cast<float>(lane_id) / 64.0F);
+            float sn = 0.0F, cs = 0.0F;
+            sincosf(static_cast<float>(*attention.position + tok) * freq, &sn,
+                    &cs);
+            const float lo = __fmaf_rn(v[0], cs, -__fmul_rn(v[1], sn));
+            const float hi = __fmaf_rn(v[0], sn, __fmul_rn(v[1], cs));
+            v[0] = lo;
+            v[1] = hi;
+          }
+#pragma unroll
+          for (unsigned c = 0; c < 8; ++c) {
+            const unsigned col = c * 32 + lane_id;
+            if (query)
+              attention.query[tok * width + head * dim + col] = v[c];
+            else if (gate)
+              attention.gate[tok * width + head * dim + col] = v[c];
+            else if (key)
+              attention.keys[std::size_t(*attention.position + tok) * kvwidth +
+                             head * dim + col] = __float2half_rn(v[c]);
+            else
+              attention
+                  .values[std::size_t(*attention.position + tok) * kvwidth +
+                          head * dim + col] = __float2half_rn(v[c]);
+          }
+        }
+      }
+      __syncthreads();
+    }
+    return;
+  }
+
   if constexpr (kHcMix) {
     static_assert(BM == 256 && BN == 128 && BK == 1 && WM == 4 && WN == 2);
     constexpr unsigned kHiddenTile = BM / 4;
@@ -4833,21 +4970,29 @@ __launch_bounds__(256) __global__
   // Four padding floats reduce scatter bank conflicts and retain float4
   // alignment for both output stores and the fused convolution's reads.
   constexpr unsigned kOutputStride = 36;
-  static_assert(8 * 16 * kOutputStride * sizeof(float) <= sizeof(s_lds));
+  // Pair token tiles for SSM: half as many convolutions cross a tile edge.
+  // The larger transpose still fits the projection's existing LDS allocation.
+  constexpr unsigned kOutputTokens = kSsmConv ? kSsmProjectionTileTokens : 16;
+  constexpr unsigned kOutputGroups = kOutputTokens / 16;
+  static_assert(8 * kOutputTokens * kOutputStride * sizeof(float) <=
+                sizeof(s_lds));
   static_assert(kWaveRowTiles % 2 == 0, "the epilogue pairs row tiles");
   float* tile_scratch =
-      reinterpret_cast<float*>(s_lds) + wave_id * 16 * kOutputStride;
+      reinterpret_cast<float*>(s_lds) + wave_id * kOutputTokens * kOutputStride;
 #pragma unroll
   for (int i = 0; i < kWaveRowTiles; i += 2) {
 #pragma unroll
-    for (int j = 0; j < kWaveTokTiles; ++j) {
-      // scratch[token][row] over 16 tokens x 32 rows.
+    for (int j = 0; j < kWaveTokTiles; j += kOutputGroups) {
 #pragma unroll
-      for (int l = 0; l < 8; ++l) {
-        tile_scratch[(sub_lane * kOutputStride) + (2 * l) + half_id] =
-            acc[i][j][l];
-        tile_scratch[(sub_lane * kOutputStride) + 16 + (2 * l) + half_id] =
-            acc[i + 1][j][l];
+      for (unsigned group = 0; group < kOutputGroups; ++group) {
+        // scratch[token][row], with 32 output rows per token.
+#pragma unroll
+        for (int l = 0; l < 8; ++l) {
+          tile_scratch[((sub_lane + group * 16) * kOutputStride) + (2 * l) +
+                       half_id] = acc[i][j + group][l];
+          tile_scratch[((sub_lane + group * 16) * kOutputStride) + 16 +
+                       (2 * l) + half_id] = acc[i + 1][j + group][l];
+        }
       }
       __builtin_amdgcn_wave_barrier();
       const std::size_t r0 =
@@ -4856,67 +5001,71 @@ __launch_bounds__(256) __global__
       const std::size_t t0 =
           static_cast<std::size_t>(t_block) +
           static_cast<std::size_t>((((wave_tok * kWaveTokTiles) + j) * 16));
-      // Lane pair (2p, 2p + 1) stores token p's 32 rows as eight float4.
-      const int tok_l = lane_id >> 1;
-      const int row_l = (lane_id & 1) * 16;
-      const std::size_t tok = t0 + static_cast<std::size_t>(tok_l);
-      const auto* src = reinterpret_cast<const float4*>(
-          tile_scratch + (tok_l * kOutputStride) + row_l);
-      if constexpr (kSsmConv) {
-        static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 8 && WN == 1);
-        static_assert(!kHcMix && kRowGroup == 1);
-        constexpr std::uint32_t channels = 10240;
-        if (tok < batch) {
 #pragma unroll
-          for (int v = 0; v < 4; ++v) {
-            const unsigned row = r0 + row_l + v * 4;
-            if (row >= m)
-              continue;
-            const float4 current = src[v];
-            if (row >= channels || tok_l < 3 || tok_l >= 13 ||
-                tok + 3 >= batch) {
-              *reinterpret_cast<float4*>(y + tok * m + row) = current;
-            }
-            if (row < channels && tok_l >= 3) {
-              const float4 x0 = *reinterpret_cast<const float4*>(
-                  tile_scratch + (tok_l - 3) * kOutputStride + row_l + v * 4);
-              const float4 x1 = *reinterpret_cast<const float4*>(
-                  tile_scratch + (tok_l - 2) * kOutputStride + row_l + v * 4);
-              const float4 x2 = *reinterpret_cast<const float4*>(
-                  tile_scratch + (tok_l - 1) * kOutputStride + row_l + v * 4);
-              const float4 w0 =
-                  *reinterpret_cast<const float4*>(conv_w + (row + 0) * 4);
-              const float4 w1 =
-                  *reinterpret_cast<const float4*>(conv_w + (row + 1) * 4);
-              const float4 w2 =
-                  *reinterpret_cast<const float4*>(conv_w + (row + 2) * 4);
-              const float4 w3 =
-                  *reinterpret_cast<const float4*>(conv_w + (row + 3) * 4);
-              const float4 value{
-                  SsmConv4Value(w0, x0.x, x1.x, x2.x, current.x),
-                  SsmConv4Value(w1, x0.y, x1.y, x2.y, current.y),
-                  SsmConv4Value(w2, x0.z, x1.z, x2.z, current.z),
-                  SsmConv4Value(w3, x0.w, x1.w, x2.w, current.w)};
-              *reinterpret_cast<float4*>(conv_out + tok * channels + row) =
-                  value;
+      for (unsigned group = 0; group < kOutputGroups; ++group) {
+        // Lane pair (2p, 2p + 1) stores token p's 32 rows as eight float4.
+        const int tok_l = (lane_id >> 1) + group * 16;
+        const int row_l = (lane_id & 1) * 16;
+        const std::size_t tok = t0 + static_cast<std::size_t>(tok_l);
+        const auto* src = reinterpret_cast<const float4*>(
+            tile_scratch + (tok_l * kOutputStride) + row_l);
+        if constexpr (kSsmConv) {
+          static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 8 &&
+                        WN == 1);
+          static_assert(!kHcMix && kRowGroup == 1);
+          constexpr std::uint32_t channels = 10240;
+          if (tok < batch) {
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+              const unsigned row = r0 + row_l + v * 4;
+              if (row >= m)
+                continue;
+              const float4 current = src[v];
+              if (row >= channels || tok_l < 3 || tok_l >= kOutputTokens - 3 ||
+                  tok + 3 >= batch) {
+                *reinterpret_cast<float4*>(y + tok * m + row) = current;
+              }
+              if (row < channels && tok_l >= 3) {
+                const float4 x0 = *reinterpret_cast<const float4*>(
+                    tile_scratch + (tok_l - 3) * kOutputStride + row_l + v * 4);
+                const float4 x1 = *reinterpret_cast<const float4*>(
+                    tile_scratch + (tok_l - 2) * kOutputStride + row_l + v * 4);
+                const float4 x2 = *reinterpret_cast<const float4*>(
+                    tile_scratch + (tok_l - 1) * kOutputStride + row_l + v * 4);
+                const float4 w0 =
+                    *reinterpret_cast<const float4*>(conv_w + (row + 0) * 4);
+                const float4 w1 =
+                    *reinterpret_cast<const float4*>(conv_w + (row + 1) * 4);
+                const float4 w2 =
+                    *reinterpret_cast<const float4*>(conv_w + (row + 2) * 4);
+                const float4 w3 =
+                    *reinterpret_cast<const float4*>(conv_w + (row + 3) * 4);
+                const float4 value{
+                    SsmConv4Value(w0, x0.x, x1.x, x2.x, current.x),
+                    SsmConv4Value(w1, x0.y, x1.y, x2.y, current.y),
+                    SsmConv4Value(w2, x0.z, x1.z, x2.z, current.z),
+                    SsmConv4Value(w3, x0.w, x1.w, x2.w, current.w)};
+                *reinterpret_cast<float4*>(conv_out + tok * channels + row) =
+                    value;
+              }
             }
           }
-        }
-      } else {
-        if (tok < batch && r0 + 32 <= m) {
-          auto* dst = reinterpret_cast<float4*>(
-              y + (tok * m) + r0 + static_cast<std::size_t>(row_l));
+        } else {
+          if (tok < batch && r0 + 32 <= m) {
+            auto* dst = reinterpret_cast<float4*>(
+                y + (tok * m) + r0 + static_cast<std::size_t>(row_l));
 #pragma unroll
-          for (int q = 0; q < 4; ++q) {
-            dst[q] = src[q];
-          }
-        } else if (tok < batch) {
+            for (int q = 0; q < 4; ++q) {
+              dst[q] = src[q];
+            }
+          } else if (tok < batch) {
 #pragma unroll
-          for (int q = 0; q < 16; ++q) {
-            const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
-            if (r < m) {
-              y[(tok * m) + r] =
-                  tile_scratch[(tok_l * kOutputStride) + row_l + q];
+            for (int q = 0; q < 16; ++q) {
+              const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
+              if (r < m) {
+                y[(tok * m) + r] =
+                    tile_scratch[(tok_l * kOutputStride) + row_l + q];
+              }
             }
           }
         }
@@ -4924,6 +5073,26 @@ __launch_bounds__(256) __global__
       __builtin_amdgcn_wave_barrier();
     }
   }
+}
+
+bool AttentionF16Gemm(const void* weights, const __half* input,
+                      const float* q_gamma, const float* k_gamma, float* query,
+                      float* gate, __half* keys, __half* values,
+                      std::uint32_t n_tokens, const std::uint32_t* position,
+                      float theta, float eps, hipStream_t stream) {
+  if (n_tokens < 1024 || weights == nullptr || input == nullptr ||
+      q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
+      gate == nullptr || keys == nullptr || values == nullptr ||
+      position == nullptr)
+    return false;
+  const AttentionProjectionOutput output{q_gamma, k_gamma,  query, gate, keys,
+                                         values,  position, theta, eps};
+  hipLaunchKernelGGL(
+      (DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, false, true>),
+      dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
+      input, nullptr, n_tokens, 13312, 2560, nullptr, nullptr, nullptr, nullptr,
+      nullptr, output);
+  return true;
 }
 
 bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
@@ -5007,10 +5176,13 @@ bool DenseF16SsmGemm(const void* w, const __half* x, const float* conv_w,
                      dim3((n_tokens + 127) / 128, m / 256), dim3(kThreads), 0,
                      stream, w, x, qkvz, n_tokens, m, k, nullptr, nullptr,
                      nullptr, conv_w, convolved);
-  hipLaunchKernelGGL(SsmConvBoundaryKernel,
-                     dim3(Blocks(channels), (n_tokens + 15) / 16, 3),
-                     dim3(kThreads), 0, stream, qkvz, conv_w, history,
-                     convolved, n_tokens, channels, m);
+  hipLaunchKernelGGL(
+      SsmConvBoundaryKernel,
+      dim3(Blocks(channels),
+           (n_tokens + kSsmProjectionTileTokens - 1) / kSsmProjectionTileTokens,
+           3),
+      dim3(kThreads), 0, stream, qkvz, conv_w, history, convolved, n_tokens,
+      channels, m);
   return true;
 }
 

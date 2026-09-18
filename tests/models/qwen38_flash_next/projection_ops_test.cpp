@@ -203,6 +203,155 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
   std::cout << "fused SSM convolution, output, state and replay are exact\n";
 }
 
+void CheckAttentionProjection(const void* weights, const __half* input,
+                              const float* projected, std::uint32_t batch) {
+  constexpr std::uint32_t start = 131069;
+  const std::size_t query_bytes = (std::size_t(batch) * 6144 + 16) * 4;
+  const std::size_t cache_bytes =
+      (std::size_t(start + batch) * 512 + 16) * sizeof(__half);
+  struct Buffers {
+    std::vector<void*> pointers;
+    ~Buffers() {
+      for (void* p : pointers)
+        (void)hipFree(p);
+    }
+    void* Make(std::size_t bytes) {
+      void* p = nullptr;
+      CheckHip(hipMalloc(&p, bytes), "attention allocation");
+      pointers.push_back(p);
+      CheckHip(hipMemset(p, 0xA5, bytes), "attention guards");
+      return p;
+    }
+  } buffers;
+  void* expected[4];
+  void* actual[4];
+  for (unsigned i = 0; i < 4; ++i) {
+    const auto bytes = i < 2 ? query_bytes : cache_bytes;
+    expected[i] = buffers.Make(bytes);
+    actual[i] = buffers.Make(bytes);
+  }
+  auto* position = static_cast<std::uint32_t*>(buffers.Make(4));
+  CheckHip(hipMemcpy(position, &start, 4, hipMemcpyHostToDevice),
+           "attention position");
+  std::vector<float> gamma(512);
+  std::uint32_t seed = 0x34185A9U;
+  for (float& value : gamma)
+    value = 1.0F + Uniform(&seed, 0.5F);
+  auto* device_gamma = static_cast<float*>(buffers.Make(gamma.size() * 4));
+  CheckHip(hipMemcpy(device_gamma, gamma.data(), gamma.size() * 4,
+                     hipMemcpyHostToDevice),
+           "attention norm weights");
+  if (!q::PrepareAttention(projected, 13312, device_gamma, device_gamma + 256,
+                           static_cast<float*>(expected[0]) + 8,
+                           static_cast<float*>(expected[1]) + 8,
+                           static_cast<__half*>(expected[2]) + 8,
+                           static_cast<__half*>(expected[3]) + 8, batch, 24, 2,
+                           256, 64, position, 1e7F, 1e-6F, nullptr))
+    throw std::runtime_error("attention preparation rejected the model shape");
+  hipStream_t stream = nullptr;
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t replay = nullptr;
+  CheckHip(hipStreamCreate(&stream), "attention stream");
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+           "attention capture");
+  if (!q::AttentionF16Gemm(weights, input, device_gamma, device_gamma + 256,
+                           static_cast<float*>(actual[0]) + 8,
+                           static_cast<float*>(actual[1]) + 8,
+                           static_cast<__half*>(actual[2]) + 8,
+                           static_cast<__half*>(actual[3]) + 8, batch, position,
+                           1e7F, 1e-6F, stream))
+    throw std::runtime_error("attention fusion rejected the model shape");
+  CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
+  CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
+           "attention graph");
+  for (unsigned repetition = 0; repetition < 2; ++repetition) {
+    for (unsigned i = 0; i < 4; ++i)
+      CheckHip(hipMemsetAsync(actual[i], 0xA5,
+                              i < 2 ? query_bytes : cache_bytes, stream),
+               "attention replay guards");
+    CheckHip(hipGraphLaunch(replay, stream), "attention replay");
+    CheckHip(hipStreamSynchronize(stream), "attention wait");
+    for (unsigned i = 0; i < 4; ++i) {
+      const auto bytes = i < 2 ? query_bytes : cache_bytes;
+      std::vector<std::byte> a(bytes), b(bytes);
+      CheckHip(hipMemcpy(a.data(), expected[i], bytes, hipMemcpyDeviceToHost),
+               "attention reference download");
+      CheckHip(hipMemcpy(b.data(), actual[i], bytes, hipMemcpyDeviceToHost),
+               "attention output download");
+      if (a != b)
+        throw std::runtime_error(
+            "attention fusion changed rounding, cache boundaries or replay");
+    }
+  }
+  if (q::AttentionF16Gemm(weights, input, device_gamma, device_gamma + 256,
+                          static_cast<float*>(actual[0]) + 8,
+                          static_cast<float*>(actual[1]) + 8,
+                          static_cast<__half*>(actual[2]) + 8,
+                          static_cast<__half*>(actual[3]) + 8, 1023, position,
+                          1e7F, 1e-6F, nullptr))
+    throw std::runtime_error("attention fusion accepted a short batch");
+  CheckHip(hipGraphExecDestroy(replay), "attention graph free");
+  CheckHip(hipGraphDestroy(graph), "attention graph definition free");
+  CheckHip(hipStreamDestroy(stream), "attention stream free");
+}
+
+void CheckHcDownProjection(const void* w, const void* tiled,
+                           const float* projected, std::uint32_t batch) {
+  const std::size_t count = std::size_t(batch) * 320;
+  float* activated = nullptr;
+  __half* reference = nullptr;
+  __half* output = nullptr;
+  CheckHip(hipMalloc(&activated, count * sizeof(float)), "HC allocation");
+  CheckHip(hipMalloc(&reference, (count + 16) * sizeof(__half)),
+           "HC reference");
+  CheckHip(hipMalloc(&output, (count + 16) * sizeof(__half)), "HC output");
+  CheckHip(hipMemset(reference, 0xA5, (count + 16) * sizeof(__half)),
+           "HC guards");
+  CheckHip(hipMemcpy(activated, projected, count * sizeof(float),
+                     hipMemcpyDeviceToDevice),
+           "HC projection copy");
+  q::SiluScale(activated, 0.25F, count, nullptr);
+  q::NarrowActivations(activated, reference + 8, false, count, nullptr);
+  std::vector<__half> expected(count + 16), actual(count + 16);
+  CheckHip(hipMemcpy(expected.data(), reference,
+                     expected.size() * sizeof(__half), hipMemcpyDeviceToHost),
+           "HC reference download");
+  hipStream_t stream = nullptr;
+  hipGraph_t graph = nullptr;
+  hipGraphExec_t replay = nullptr;
+  CheckHip(hipStreamCreate(&stream), "HC stream");
+  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
+           "HC capture");
+  if (!q::HcDownF16Gemm(w, tiled, output + 8, batch, stream))
+    throw std::runtime_error("fused HC down rejected the model shape");
+  CheckHip(hipStreamEndCapture(stream, &graph), "HC capture end");
+  CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
+           "HC graph");
+  for (unsigned repetition = 0; repetition < 2; ++repetition) {
+    CheckHip(
+        hipMemsetAsync(output, 0xA5, actual.size() * sizeof(__half), stream),
+        "HC output guards");
+    CheckHip(hipGraphLaunch(replay, stream), "HC replay");
+    CheckHip(
+        hipMemcpyAsync(actual.data(), output, actual.size() * sizeof(__half),
+                       hipMemcpyDeviceToHost, stream),
+        "HC download");
+    CheckHip(hipStreamSynchronize(stream), "HC wait");
+    if (std::memcmp(actual.data(), expected.data(),
+                    actual.size() * sizeof(__half)) != 0)
+      throw std::runtime_error(
+          "fused HC down changed rounding, guards or replay");
+  }
+  if (q::HcDownF16Gemm(w, tiled, output + 8, 95, nullptr))
+    throw std::runtime_error("fused HC down accepted a short batch");
+  CheckHip(hipGraphExecDestroy(replay), "HC graph free");
+  CheckHip(hipGraphDestroy(graph), "HC graph definition free");
+  CheckHip(hipStreamDestroy(stream), "HC stream free");
+  CheckHip(hipFree(output), "HC output free");
+  CheckHip(hipFree(reference), "HC reference free");
+  CheckHip(hipFree(activated), "HC activation free");
+}
+
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
            std::size_t reference_tokens = 0) {
   const Q8Weights w = MakeWeights(m, k, seed);
@@ -319,6 +468,14 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
   if (m == 16384 && k == 2560 && batch >= 1024) {
     CheckSsmProjection(d_w, d_x_half, d_f16, f16,
                        static_cast<std::uint32_t>(batch));
+  }
+  if (m == 320 && k == 10240 && batch >= 96) {
+    CheckHcDownProjection(d_w, d_tiled, d_w8,
+                          static_cast<std::uint32_t>(batch));
+  }
+  if (m == 13312 && k == 2560 && batch >= 1024) {
+    CheckAttentionProjection(d_w, d_x_half, d_f16,
+                             static_cast<std::uint32_t>(batch));
   }
   (void)hipFree(d_w);
   (void)hipFree(d_x);
@@ -683,6 +840,9 @@ int main() {
     ok = Run(2049, 13312, 2560, 0x13312256U, 2) < 1e-2 && ok;
     // HC up: the grouped grid, including the last partial token tile.
     ok = Run(2049, 10240, 320, 0x8A8A320U, 2) < 1e-2 && ok;
+    // HC down fusion: its first supported batch and a partial final tile.
+    ok = Run(96, 320, 10240, 0x320A96U, 2) < 1e-2 && ok;
+    ok = Run(2049, 320, 10240, 0x320A2049U, 2) < 1e-2 && ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

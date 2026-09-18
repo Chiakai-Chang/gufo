@@ -37,23 +37,24 @@ Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1495.63 | 1522.21 |
+| 0 | 1509.21 | 1542.85 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
-| 32768 | 1406.93 | TODO |
+| 32768 | 1415.87 | TODO |
 | 65536 | TODO | TODO |
-| 131072 | 1333.50 | TODO |
+| 131072 | 1346.73 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.32 | 47.58 | 71.0% |
+| Greedy | 0 | 26.37 | 47.49 | 71.0% |
 | Greedy | 32768 | TODO | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 47.93 | 75.9% |
+| Temperature 0.7 | 0 | TODO | 48.41 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
 AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
-MTP PP uses the greedy run. The latest SSM projection tuning applies only
-to prefill batches of at least 1024 tokens.
+MTP PP uses the greedy run. SSM convolution and QKV normalization/cache writes
+are fused into projections for prefill batches of at least 1024 tokens.
+The HC down projection fuses its activation and F16 conversion from 96 tokens.
 The targets are **1700 tok/s pp2048** and near-flat PP through d128K;
 both remain TODO. The measured d0-to-d128K decline is 10.8%.
 HTTP, C1, context 4096, seed 1, up to 128 output tokens, uncached prompts:
@@ -99,8 +100,8 @@ Decisions use committed acceptance history and reset with the session.
 Snapshots preserve this state; new HTTP requests reset it when reusing
 context. Decisions never depend on wall-clock timings.
 
-Retained optimizations: SSM/QKV projection tiling, padded WMMA output transposes,
-F16 SSM output activations,
+Retained optimizations: SSM/QKV projection fusions, HC down activation fusion,
+padded WMMA output transposes, F16 SSM output activations,
 grouped Q4_K/Q5_K expert verification with fused SwiGLU, single-launch
 Q5_1/Q8_0 down projections, Q4 shortlisting with Q8 rescoring, GPU verification
 logits with one frontier readback, and parallel unordered verification with
