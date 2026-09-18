@@ -17,6 +17,7 @@ which is gitignored — nothing committed.
 The `tools/` directory is organized into domain-specific subdirectories:
 
 - `tools/ds4/` — DeepSeek V4 quality and performance workflow
+- `tools/qwen27b/` — Qwen27B quality checks and shared [Qwen vision references](../benchmarks/qwen3.8-27b/eval/vision.md)
 - `tools/quant/` — Offline model inspection, quantization, calibration, evaluation, and test suites
 - `tools/bench/` — GPU & kernel standalone microbenchmarks (HIP / C++)
 - `tools/prof/` — rocprofv3 profiling wrappers and RDNA 3.5 ISA mix analyzer

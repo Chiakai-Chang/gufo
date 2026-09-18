@@ -5,6 +5,9 @@ Production targets: **UD-Q4_K_XL / UD-Q8_K_XL**. Recommended DFlash2 draft:
 **Q4_K_M**, with **adaptive** as the default controller. Q8_0 and BF16 drafts
 remain supported; a full comparison across context depths is **TODO**.
 
+PNG/JPEG image input uses the matching BF16 projector with AR, DFlash2 or
+native MTP. [CLI/HTTP usage and vision quality checks](eval/vision.md).
+
 Tables show the latest qualified release measurements. C1/C4 repetition was
 rechecked on the current release; the remaining performance refresh is **TODO**.
 

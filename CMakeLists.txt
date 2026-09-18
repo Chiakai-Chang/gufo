@@ -11,6 +11,8 @@ include_directories(${CMAKE_SOURCE_DIR})
 find_package(ICU REQUIRED COMPONENTS uc)
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
+find_package(PNG REQUIRED)
+find_package(JPEG REQUIRED)
 set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
   "FFmpeg executable used for generated media")
 set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
@@ -184,6 +186,7 @@ if (ENGINE_ENABLE_XRT)
 endif()
 
 add_library(gufo_core STATIC
+  src/core/image.cpp
   src/core/crypto/sha256.cpp
   src/core/model_registry.cpp
   src/core/gguf_reader.cpp
@@ -213,7 +216,8 @@ target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_definitions(gufo_core PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}"
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
-target_link_libraries(gufo_core PUBLIC ICU::uc Threads::Threads)
+target_link_libraries(gufo_core PUBLIC ICU::uc Threads::Threads
+  PNG::PNG JPEG::JPEG CURL::libcurl)
 
 add_subdirectory(src/models/qwen)
 

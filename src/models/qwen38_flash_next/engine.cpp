@@ -42,12 +42,14 @@ struct SessionSnapshotHeader {
   std::uint32_t hidden_rows;
   std::uint64_t executor_bytes;
   std::array<float, 2> draft_policy;
+  std::uint32_t image_identity_bytes;
 };
 static_assert(std::is_trivially_copyable_v<SessionSnapshotHeader>);
 
 std::uint64_t SessionSnapshotHostBytes(std::uint32_t token_count,
-                                       std::uint32_t vocab_size) {
-  return sizeof(SessionSnapshotHeader) +
+                                       std::uint32_t vocab_size,
+                                       std::size_t image_bytes) {
+  return sizeof(SessionSnapshotHeader) + image_bytes +
          std::uint64_t{token_count} * sizeof(std::int32_t) +
          std::uint64_t{vocab_size} * sizeof(float);
 }
@@ -84,6 +86,13 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   if (options.max_context == 0 || options.max_context > c.context_length) {
     AssignError(error_msg, "context exceeds the model's " +
                                std::to_string(c.context_length) + " tokens");
+    return nullptr;
+  }
+  try {
+    m->vision_ = qwen::vision::Encoder::Open(
+        model_path, options.vision_model_path, c.hidden_size);
+  } catch (const std::exception& e) {
+    AssignError(error_msg, e.what());
     return nullptr;
   }
   m->tokenizer_ =
@@ -195,7 +204,7 @@ const Config& Model::config() const noexcept {
 }
 
 std::size_t Model::ResidentBytes() const noexcept {
-  return device_->resident_bytes();
+  return device_->resident_bytes() + (vision_ ? vision_->ResidentBytes() : 0);
 }
 
 Session::Session(std::shared_ptr<Model> model,
@@ -223,6 +232,17 @@ void Session::Reset() {
   model_->executor_->MtpRewind(*session_, 0);
 }
 
+void Session::ConfigureVision(
+    std::shared_ptr<const qwen::vision::Prompt> prompt) {
+  const auto identity =
+      prompt ? prompt->cache_identity : std::vector<std::uint8_t>{};
+  if (!tokens_.empty() && identity != image_identity_)
+    Reset();
+  session_->ConfigureVision(std::move(prompt), model_->vision_,
+                            model_->executor_->stream());
+  image_identity_ = identity;
+}
+
 std::uint32_t Session::KeptHiddenRows() const noexcept {
   return model_->HasMtp()
              ? static_cast<std::uint32_t>(tokens_.size() - hidden_base_)
@@ -231,7 +251,7 @@ std::uint32_t Session::KeptHiddenRows() const noexcept {
 
 std::uint64_t Session::SnapshotBytes() const {
   return SessionSnapshotHostBytes(static_cast<std::uint32_t>(tokens_.size()),
-                                  model_->VocabSize()) +
+                                  model_->VocabSize(), image_identity_.size()) +
          model_->executor_->SnapshotBytes(*session_, KeptHiddenRows());
 }
 
@@ -246,8 +266,8 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
   const std::uint32_t hidden_rows = KeptHiddenRows();
   const std::uint64_t executor_bytes =
       model_->executor_->SnapshotBytes(*session_, hidden_rows);
-  const std::uint64_t host_bytes =
-      SessionSnapshotHostBytes(token_count, model_->VocabSize());
+  const std::uint64_t host_bytes = SessionSnapshotHostBytes(
+      token_count, model_->VocabSize(), image_identity_.size());
   std::unique_ptr<SessionSnapshot> snapshot(
       new SessionSnapshot(host_bytes + executor_bytes));
   std::uint8_t* out = snapshot->data_.get();
@@ -259,9 +279,14 @@ std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
       .hidden_rows = hidden_rows,
       .executor_bytes = executor_bytes,
       .draft_policy = draft_length_.State(),
+      .image_identity_bytes =
+          static_cast<std::uint32_t>(image_identity_.size()),
   };
   std::memcpy(out, &header, sizeof(header));
   out += sizeof(header);
+  if (!image_identity_.empty())
+    std::memcpy(out, image_identity_.data(), image_identity_.size());
+  out += image_identity_.size();
   std::memcpy(out, tokens_.data(), tokens_.size() * sizeof(std::int32_t));
   out += tokens_.size() * sizeof(std::int32_t);
   std::memcpy(out, logits_.data(), logits_.size() * sizeof(float));
@@ -296,9 +321,11 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   }
   if (header.vocab_size != model_->VocabSize() || header.token_count == 0 ||
       header.token_count > ContextSize() ||
-      payload.size() !=
-          SessionSnapshotHostBytes(header.token_count, header.vocab_size) +
-              header.executor_bytes) {
+      (header.image_identity_bytes != 0 && header.image_identity_bytes != 32) ||
+      payload.size() != SessionSnapshotHostBytes(header.token_count,
+                                                 header.vocab_size,
+                                                 header.image_identity_bytes) +
+                            header.executor_bytes) {
     AssignError(error_msg, "session snapshot does not fit this session");
     return false;
   }
@@ -308,6 +335,9 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     return false;
   }
   const std::uint8_t* in = payload.data() + sizeof(header);
+  std::vector<std::uint8_t> image_identity(in,
+                                           in + header.image_identity_bytes);
+  in += header.image_identity_bytes;
   std::vector<std::int32_t> tokens(header.token_count);
   std::memcpy(tokens.data(), in, tokens.size() * sizeof(std::int32_t));
   in += tokens.size() * sizeof(std::int32_t);
@@ -330,6 +360,7 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
     AssignError(error_msg, "session snapshot positions are inconsistent");
     return false;
   }
+  image_identity_ = std::move(image_identity);
   tokens_ = std::move(tokens);
   logits_ = std::move(logits);
   hidden_base_ = info.position - info.hidden_rows;

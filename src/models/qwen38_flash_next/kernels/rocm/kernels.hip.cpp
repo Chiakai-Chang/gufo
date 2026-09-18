@@ -1537,7 +1537,7 @@ __global__ void PrepareAttentionKernel(
     __half* __restrict__ k_cache, __half* __restrict__ v_cache,
     std::uint32_t heads, std::uint32_t kv_heads, std::uint32_t d,
     std::uint32_t rotary, const std::uint32_t* start_pos, float theta,
-    float eps) {
+    float eps, const qwen::vision::DeviceRope* rope) {
   __shared__ float partial[kHeadsPerBlock][8];
   __shared__ float norm[kHeadsPerBlock][256];
   const std::uint32_t t = blockIdx.x, first = blockIdx.y * kHeadsPerBlock,
@@ -1593,7 +1593,8 @@ __global__ void PrepareAttentionKernel(
   if (tid < half) {
     const float freq = powf(
         theta, -2.0f * static_cast<float>(tid) / static_cast<float>(rotary));
-    sincosf(static_cast<float>(*start_pos + t) * freq, &sine, &cosine);
+    sincosf(qwen::vision::RopePosition(rope, *start_pos + t, tid) * freq, &sine,
+            &cosine);
   }
 #pragma unroll
   for (std::uint32_t j = 0; j < kHeadsPerBlock; ++j) {
@@ -1628,10 +1629,10 @@ __global__ void PrepareAttentionKernel(
 
 __global__ void RopeKernel(float* x, std::uint32_t heads, std::uint32_t d,
                            std::uint32_t rotary_dim,
-                           const std::uint32_t* start_pos, float theta) {
+                           const std::uint32_t* start_pos, float theta,
+                           const qwen::vision::DeviceRope* rope) {
   const std::uint32_t t = blockIdx.x;
   const std::uint32_t half = rotary_dim / 2;
-  const float pos = static_cast<float>(*start_pos + t);
   for (std::uint32_t idx = threadIdx.x; idx < heads * half; idx += blockDim.x) {
     const std::uint32_t h = idx / half;
     const std::uint32_t i = idx % half;
@@ -1640,7 +1641,7 @@ __global__ void RopeKernel(float* x, std::uint32_t heads, std::uint32_t d,
         theta, -2.0f * static_cast<float>(i) / static_cast<float>(rotary_dim));
     float s = 0.0f;
     float c = 0.0f;
-    sincosf(pos * freq, &s, &c);
+    sincosf(qwen::vision::RopePosition(rope, *start_pos + t, i) * freq, &s, &c);
     const float a = v[i];
     const float b = v[i + half];
     v[i] = a * c - b * s;
@@ -1673,11 +1674,14 @@ __global__ void StoreRowsKernel(const float* src, float* dst,
 /// grid: the most blocks a batch can complete. Block b pools raw keys
 /// [b*ratio, (b+1)*ratio) once every one of them is stored, i.e. for
 /// b in [*first_block, (*start_pos + n_tokens) / ratio).
-__global__ void PoolBlocksKernel(
-    const float* raw, const float* gamma, __half* blocks,
-    const std::uint32_t* first_block, const std::uint32_t* start_pos,
-    std::uint32_t n_tokens, std::uint32_t ratio, std::uint32_t dim,
-    std::uint32_t rotary_dim, float theta, float eps, std::uint32_t capacity) {
+__global__ void PoolBlocksKernel(const float* raw, const float* gamma,
+                                 __half* blocks,
+                                 const std::uint32_t* first_block,
+                                 const std::uint32_t* start_pos,
+                                 std::uint32_t n_tokens, std::uint32_t ratio,
+                                 std::uint32_t dim, std::uint32_t rotary_dim,
+                                 float theta, float eps, std::uint32_t capacity,
+                                 const qwen::vision::DeviceRope* rope) {
   __shared__ float v[256];
   __shared__ float shared[32];
   const std::uint32_t b = *first_block + blockIdx.x;
@@ -1707,7 +1711,7 @@ __global__ void PoolBlocksKernel(
         theta, -2.0f * static_cast<float>(p) / static_cast<float>(rotary_dim));
     float s = 0.0f;
     float c = 0.0f;
-    sincosf(static_cast<float>(b * ratio) * freq, &s, &c);
+    sincosf(qwen::vision::RopePosition(rope, b * ratio, p) * freq, &s, &c);
     const float a = v[p];
     const float bb = v[p + half];
     outv = i < half ? a * c - bb * s : a * s + bb * c;
@@ -4649,6 +4653,7 @@ struct AttentionProjectionOutput {
   const std::uint32_t* position;
   float theta;
   float eps;
+  const qwen::vision::DeviceRope* rope;
 };
 
 /// Dense F16 WMMA GEMM over Q8_0 weights: block = BM rows x BN tokens, BK
@@ -4923,8 +4928,10 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
             const float freq = powf(
                 attention.theta, -2.0F * static_cast<float>(lane_id) / 64.0F);
             float sn = 0.0F, cs = 0.0F;
-            sincosf(static_cast<float>(*attention.position + tok) * freq, &sn,
-                    &cs);
+            sincosf(qwen::vision::RopePosition(
+                        attention.rope, *attention.position + tok, lane_id) *
+                        freq,
+                    &sn, &cs);
             const float lo = __fmaf_rn(v[0], cs, -__fmul_rn(v[1], sn));
             const float hi = __fmaf_rn(v[0], sn, __fmul_rn(v[1], cs));
             v[0] = lo;
@@ -5159,14 +5166,15 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
                       float* gate, __half* keys, __half* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
-                      float theta, float eps, hipStream_t stream) {
+                      float theta, float eps, hipStream_t stream,
+                      const qwen::vision::DeviceRope* rope) {
   if (n_tokens < 1024 || weights == nullptr || input == nullptr ||
       q_gamma == nullptr || k_gamma == nullptr || query == nullptr ||
       gate == nullptr || keys == nullptr || values == nullptr ||
       position == nullptr)
     return false;
   const AttentionProjectionOutput output{q_gamma, k_gamma,  query, gate, keys,
-                                         values,  position, theta, eps};
+                                         values,  position, theta, eps,  rope};
   hipLaunchKernelGGL(
       (DenseF16GEMMKernel<256, 128, 2, 8, 1, 1, false, false, true>),
       dim3((n_tokens + 127) / 128, 52), dim3(kThreads), 0, stream, weights,
@@ -5440,7 +5448,8 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t n_tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
-                      float theta, float eps, hipStream_t stream) {
+                      float theta, float eps, hipStream_t stream,
+                      const qwen::vision::DeviceRope* rope) {
   if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
       rotary_dim % 2 != 0 || heads == 0 || kv_heads == 0 ||
       stride < static_cast<std::size_t>(2) * (heads + kv_heads) * d) {
@@ -5453,22 +5462,23 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                        dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
                        stream, packed, stride, q_gamma, k_gamma, q, gate,
                        k_cache, v_cache, heads, kv_heads, d, rotary_dim,
-                       start_pos, theta, eps);
+                       start_pos, theta, eps, rope);
   } else {
     hipLaunchKernelGGL((PrepareAttentionKernel<4>),
                        dim3(n_tokens, (heads + kv_heads + 3) / 4),
                        dim3(kThreads), 0, stream, packed, stride, q_gamma,
                        k_gamma, q, gate, k_cache, v_cache, heads, kv_heads, d,
-                       rotary_dim, start_pos, theta, eps);
+                       rotary_dim, start_pos, theta, eps, rope);
   }
   return true;
 }
 
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           std::uint32_t d, std::uint32_t rotary_dim,
-          const std::uint32_t* start_pos, float theta, hipStream_t stream) {
+          const std::uint32_t* start_pos, float theta, hipStream_t stream,
+          const qwen::vision::DeviceRope* rope) {
   hipLaunchKernelGGL(RopeKernel, dim3(n_tokens), dim3(kThreads), 0, stream, x,
-                     heads, d, rotary_dim, start_pos, theta);
+                     heads, d, rotary_dim, start_pos, theta, rope);
 }
 
 void StoreKv(const float* src, __half* cache, std::uint32_t n_tokens,
@@ -5490,13 +5500,15 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        const std::uint32_t* start_pos, std::uint32_t n_tokens,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
-                       float eps, std::uint32_t capacity, hipStream_t stream) {
+                       float eps, std::uint32_t capacity, hipStream_t stream,
+                       const qwen::vision::DeviceRope* rope) {
   if (grid_blocks == 0) {
     return;
   }
   hipLaunchKernelGGL(PoolBlocksKernel, dim3(grid_blocks), dim3(kThreads), 0,
                      stream, raw_keys, gamma, blocks, first_block, start_pos,
-                     n_tokens, ratio, dim, rotary_dim, theta, eps, capacity);
+                     n_tokens, ratio, dim, rotary_dim, theta, eps, capacity,
+                     rope);
 }
 
 void SelectBlocks(const __half* q, const __half* blocks, std::uint32_t* mask,

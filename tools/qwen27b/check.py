@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SUITES = {
     "fast": ["logit_sampler_test",
              "prompt_cli_test", "bench_cli_test", "openai_chat_test",
-             "speculative_verification_test"],
+             "speculative_verification_test", "qwen27b_vision_test"],
     "kernels": ["qwen_gpu_ops_test", "qwen_ssm_ops_test",
                 "qwen_attention_kv_storage_ops_test",
                 "qwen_attention_fusion_ops_test",

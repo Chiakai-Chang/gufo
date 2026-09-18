@@ -31,6 +31,7 @@ std::unique_ptr<QwenMtpGpuDraftBackend> QwenMtpGpuDraftBackend::Create(
   if (executor == nullptr) {
     return nullptr;
   }
+  executor->SetVisionInput(config.vision_input);
   return std::unique_ptr<QwenMtpGpuDraftBackend>(
       new QwenMtpGpuDraftBackend(std::move(executor), config));
 }

@@ -5,6 +5,9 @@ Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Target:
 `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP uses `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
 
+PNG/JPEG image input uses the matching `mmproj-BF16.gguf`, with AR or MTP.
+[CLI/HTTP usage, cache behavior and vision checks](../qwen3.8-27b/eval/vision.md).
+
 ## Single user
 
 Nix release, pp2048 and tg128, one measured repetition, seed 1,

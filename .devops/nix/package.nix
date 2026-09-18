@@ -7,6 +7,9 @@
   python313,
   icu,
   curl,
+  libpng,
+  libjpeg,
+  openssl,
   ffmpeg-headless,
   libuuid,
   rocmPackages,
@@ -76,6 +79,9 @@ stdenv.mkDerivation (finalAttrs: {
   buildInputs = [
     icu
     curl
+    libpng
+    libjpeg
+    openssl
     ffmpeg-headless
   ]
   ++ lib.optionals rocmSupport [

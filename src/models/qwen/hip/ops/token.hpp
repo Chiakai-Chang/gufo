@@ -6,6 +6,7 @@
 #include <span>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/vision/rope.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
@@ -110,14 +111,16 @@ void LaunchUnpackQG(const float* qg_interleaved, float* q_out, float* gate_out,
 void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
                 std::uint32_t num_kv_heads, std::uint32_t head_dim,
                 std::uint32_t rotary_dim, std::uint32_t pos, float rope_theta,
-                hipStream_t stream = nullptr);
+                hipStream_t stream = nullptr,
+                const models::qwen::vision::DeviceRope* rope = nullptr);
 
 /// Computes Rotary Position Embedding (RoPE) reading position from device
 /// memory
 void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
                 std::uint32_t num_kv_heads, std::uint32_t head_dim,
                 std::uint32_t rotary_dim, const std::uint32_t* d_pos,
-                float rope_theta, hipStream_t stream = nullptr);
+                float rope_theta, hipStream_t stream = nullptr,
+                const models::qwen::vision::DeviceRope* rope = nullptr);
 
 /// Computes parallel GPU argmax reduction over logits
 void LaunchGPUArgmax(const float* logits, std::uint32_t* out_token,
@@ -147,7 +150,8 @@ void LaunchBatchedRoPE(float* q, float* k, std::size_t batch_size,
                        std::uint32_t num_heads, std::uint32_t num_kv_heads,
                        std::uint32_t head_dim, std::uint32_t rotary_dim,
                        std::uint32_t start_pos, float rope_theta,
-                       hipStream_t stream = nullptr);
+                       hipStream_t stream = nullptr,
+                       const models::qwen::vision::DeviceRope* rope = nullptr);
 
 }  // namespace gufo::hip
 

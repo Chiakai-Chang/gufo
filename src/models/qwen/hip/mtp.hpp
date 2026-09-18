@@ -77,6 +77,9 @@ public:
       std::shared_ptr<const QwenMtpGpuModel> model, std::uint32_t max_context,
       std::string* error_msg = nullptr);
 
+  void SetVisionInput(models::qwen::vision::DeviceInput* input) noexcept {
+    vision_input_ = input;
+  }
   void Reset() noexcept;
   void Rewind(std::uint32_t position);
 
@@ -138,6 +141,8 @@ private:
   float* d_split_k_scratch_{nullptr};
   std::uint32_t* d_out_token_{nullptr};
 
+  models::qwen::vision::DeviceInput* vision_input_{
+      nullptr};  // owned by the target session
   std::vector<float> h_last_hidden_;
   std::vector<float> h_logits_;
 };
@@ -145,6 +150,7 @@ private:
 struct QwenMtpGpuDraftConfig {
   std::uint32_t max_context{4096};
   std::uint32_t max_draft_tokens{4};
+  models::qwen::vision::DeviceInput* vision_input{nullptr};
 };
 
 /// Stateful MTP draft provider backed by the production HIP executor.

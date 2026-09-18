@@ -1,0 +1,138 @@
+#include <algorithm>
+#include <array>
+#include <cassert>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+
+#include "src/models/qwen/vision/prompt.hpp"
+
+#if defined(ENGINE_ENABLE_HIP)
+#include "src/models/qwen/vision/encoder.hpp"
+#endif
+
+namespace {
+using namespace gufo::models::qwen::vision;
+
+void TestPositionLayout() {
+  const RopeLayout layout{{{5, 2, 3}, {15, 3, 2}}};
+  layout.Validate(64);
+  assert((layout.Position(4) == std::array<std::int32_t, 3>{4, 4, 4}));
+  assert((layout.Position(5) == std::array<std::int32_t, 3>{5, 5, 5}));
+  assert((layout.Position(10) == std::array<std::int32_t, 3>{5, 6, 7}));
+  assert((layout.Position(11) == std::array<std::int32_t, 3>{8, 8, 8}));
+  assert((layout.Position(15) == std::array<std::int32_t, 3>{12, 12, 12}));
+  assert((layout.Position(20) == std::array<std::int32_t, 3>{12, 14, 13}));
+  assert((layout.Position(21) == std::array<std::int32_t, 3>{15, 15, 15}));
+  assert(layout.Delta() == -6);
+  assert(layout.PrefixLength() == 21);
+  assert(
+      (RopeLayout{}.Position(31) == std::array<std::int32_t, 3>{31, 31, 31}));
+  bool rejected = false;
+  try {
+    RopeLayout{{{5, 2, 3}, {8, 2, 2}}}.Validate(64);
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  assert(rejected);
+}
+
+void TestPreprocessing() {
+  gufo::core::Image input{48, 32, std::vector<std::uint8_t>(48 * 32 * 3, 123)};
+  const auto result = ResizeImage(input);
+  assert(result.width == 320 && result.height == 224);
+  assert(std::all_of(result.pixels.begin(), result.pixels.end(),
+                     [](auto value) { return value == 123; }));
+  input = {256, 256, std::vector<std::uint8_t>(256 * 256 * 3, 42)};
+  assert(ResizeImage(input).pixels == input.pixels);
+  const std::vector<std::uint8_t> payload{0xff, 0xd8, 0, 1, 2};
+  assert(gufo::core::ReadImageUrl("data:image/jpeg;base64,/9gAAQI=") ==
+         payload);
+  for (const auto* invalid :
+       {"data:image/png;base64,A===", "data:image/png;base64,AB==",
+        "data:image/png;base64,AAAA=", "file:///tmp/image.png"}) {
+    bool rejected = false;
+    try {
+      (void)gufo::core::ReadImageUrl(invalid);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    assert(rejected);
+  }
+}
+
+void TestRendering() {
+  using namespace gufo::tokenization;
+  ChatMessage message{ChatRole::kUser, "beforeafter"};
+  message.images.push_back(
+      {6, std::make_shared<const std::vector<std::uint8_t>>(1, 0)});
+  message.images.push_back({6, message.images.front().bytes});
+  std::vector<std::size_t> offsets;
+  const std::array messages{message};
+  const auto text =
+      QwenChatTemplate::Render(messages, {}, {}, nullptr, &offsets);
+  assert(text && offsets.size() == 2);
+  assert(text->find("before<|vision_start|><|image_pad|><|vision_end|>"
+                    "<|vision_start|><|image_pad|><|vision_end|>after") !=
+         std::string::npos);
+  for (auto offset : offsets)
+    assert(text->substr(offset, 13) == "<|image_pad|>");
+}
+}  // namespace
+
+int main(int argc, char** argv) {
+  try {
+    TestPositionLayout();
+    TestPreprocessing();
+    TestRendering();
+    if (argc == 1) {
+      std::cout << "vision input, layout and rendering: passed\n";
+      return 0;
+    }
+    const bool preprocess =
+        argc == 4 && std::string_view(argv[1]) == "--preprocess";
+    if (!preprocess && argc != 5)
+      throw std::invalid_argument(
+          "usage: qwen27b_vision_test MMPROJ IMAGE OUTPUT_DIR OUTPUT_WIDTH\n"
+          "       qwen27b_vision_test --preprocess IMAGE OUTPUT_DIR");
+    const auto image = ResizeImage(
+        gufo::core::DecodeImage(gufo::core::ReadImageFile(argv[2])));
+    const std::filesystem::path directory(argv[3]);
+    std::filesystem::create_directories(directory);
+    {
+      std::ofstream rgb(directory / "resized.rgb", std::ios::binary);
+      rgb.write(reinterpret_cast<const char*>(image.pixels.data()),
+                image.pixels.size());
+      std::ofstream shape(directory / "shape.txt");
+      shape << image.width << ' ' << image.height << '\n';
+    }
+    if (preprocess)
+      return 0;
+#if defined(ENGINE_ENABLE_HIP)
+    Encoder encoder(argv[1], std::stoul(argv[4]));
+    {
+      std::ofstream identity(directory / "projector.sha256");
+      identity << encoder.identity() << '\n';
+    }
+    const auto result = encoder.Encode(
+        image, [&](std::string_view stage, std::span<const float> values) {
+          std::ofstream output(directory / (std::string(stage) + ".f32"),
+                               std::ios::binary);
+          output.write(reinterpret_cast<const char*>(values.data()),
+                       values.size_bytes());
+          if (!output)
+            throw std::runtime_error("cannot write vision comparison tensor");
+        });
+    std::cout << "encoded " << image.width << 'x' << image.height << " -> "
+              << result->rows() << 'x' << result->width() << '\n';
+    return 0;
+#else
+    throw std::runtime_error("vision encoding requires HIP");
+#endif
+  } catch (const std::exception& error) {
+    std::cerr << error.what() << '\n';
+    return 1;
+  }
+}

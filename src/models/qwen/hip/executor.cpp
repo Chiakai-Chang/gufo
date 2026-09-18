@@ -116,6 +116,7 @@ QwenGpuMemoryUsage QwenGpuExecutor::GetMemoryUsage() const {
   usage.temporary_scratch_bytes += verification_logits_capacity_ *
                                    weights_.config.vocab_size * sizeof(float);
   usage.temporary_scratch_bytes += sampling_workspace_.SizeBytes();
+  usage.temporary_scratch_bytes += vision_input_.Bytes();
   return usage;
 }
 
@@ -134,7 +135,20 @@ void QwenGpuExecutor::Reset() noexcept {
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(
     std::uint32_t valid_context) {
-  return arena_.SaveSnapshot(valid_context);
+  auto snapshot = arena_.SaveSnapshot(valid_context);
+  snapshot->vision_layout_ = vision_input_.layout();
+  return snapshot;
+}
+
+void QwenGpuExecutor::ConfigureVision(
+    std::shared_ptr<const models::qwen::vision::Prompt> prompt,
+    std::shared_ptr<models::qwen::vision::Encoder> encoder) {
+  const auto* previous = vision_input_.rope();
+  if (prompt)
+    prompt->rope.Validate(arena_.GetMaxContext());
+  vision_input_.Configure(std::move(prompt), std::move(encoder), arena_.stream);
+  if (previous != vision_input_.rope())
+    graph_executor_.Reset();
 }
 
 void QwenGpuExecutor::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
@@ -147,6 +161,7 @@ void QwenGpuExecutor::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
   arena_.RestoreSnapshot(snapshot);
+  vision_input_.RestoreLayout(snapshot.vision_layout_, arena_.stream);
   graph_executor_.Reset();
 }
 
@@ -162,6 +177,8 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
   arena_.RestoreCompactSnapshot(payload, expected_valid_context);
+  vision_input_.RestoreLayout(QwenGpuSnapshot::ReadRopeLayout(payload),
+                              arena_.stream);
   graph_executor_.Reset();
 }
 

@@ -4,6 +4,9 @@ Targets: UD-Q4_K_XL and UD-Q8_K_XL. DFlash2 drafts: Q4_K_M, Q8_0 and BF16.
 **Adaptive is the default** in prompt, chat, bench and serving. Q4_K_M is the
 recommended draft; a full comparison across context depths remains TODO.
 
+[Image input and its focused quality checks](vision.md) cover both 27B
+targets and Flash-Next, including speculative decoding and persistent caches.
+
 ## Maintained checks
 
 Run on gfx1151 through Nix. Model-specific tests and tools live in

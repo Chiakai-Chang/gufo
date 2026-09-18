@@ -1,4 +1,5 @@
 target_sources(gufo_core PRIVATE
+  ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/prompt.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/tokenizer.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/chat_template.cpp
   ${PROJECT_SOURCE_DIR}/src/models/qwen/oracles.cpp
@@ -21,7 +22,11 @@ target_sources(gufo_core PRIVATE
    ${PROJECT_SOURCE_DIR}/src/models/qwen/dflash_weights.cpp)
 
 if (ENGINE_ENABLE_HIP)
+  find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+  target_link_libraries(gufo_core PRIVATE OpenSSL::Crypto)
   target_sources(gufo_core PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/encoder.hip
+    ${PROJECT_SOURCE_DIR}/src/models/qwen/vision/device_input.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/attention.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/batched_ssm.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/prefill_embed.hip

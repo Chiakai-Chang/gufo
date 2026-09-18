@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "src/models/qwen/hip/ops/token.hpp"
+#include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
@@ -43,6 +44,14 @@ public:
   }
   /// Drops every token; the next Forward starts at position 0.
   void Reset();
+  void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
+                       std::shared_ptr<qwen::vision::Encoder> encoder,
+                       hipStream_t stream);
+  void RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
+                           hipStream_t stream);
+  [[nodiscard]] const qwen::vision::RopeLayout& VisionLayout() const noexcept {
+    return vision_input_.layout();
+  }
 
 private:
   friend class Executor;
@@ -55,6 +64,7 @@ private:
     float* state_snapshots{nullptr};  ///< [max_spec-1][v_heads][d][d]
   };
   struct AttentionState {
+    const qwen::vision::DeviceRope* rope{nullptr};
     __half* k_cache{nullptr};  ///< [max_context][kv_heads*d]
     __half* v_cache{nullptr};  ///< [max_context][kv_heads*d]
     float* index_k{nullptr};   ///< [index_capacity_][indexer_dim] raw ring
@@ -77,6 +87,7 @@ private:
   };
 
   const Executor* owner_{nullptr};
+  qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
@@ -111,6 +122,7 @@ public:
   };
 
   ~Executor();
+  [[nodiscard]] hipStream_t stream() const noexcept { return stream_; }
   Executor(const Executor&) = delete;
   Executor& operator=(const Executor&) = delete;
 

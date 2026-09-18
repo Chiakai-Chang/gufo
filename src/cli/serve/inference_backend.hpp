@@ -80,7 +80,8 @@ public:
             TextPrefillPolicy prefill_policy = {},
             TextSchedulerPolicy scheduler_policy = {},
             const TextSpeculativeConfig& speculative_config = {},
-            const TextDiskCacheConfig& disk_cache_config = {});
+            const TextDiskCacheConfig& disk_cache_config = {},
+            const std::string& vision_model_path = {});
 
 #if defined(ENGINE_ENABLE_HIP)
   /// Installs a previously loaded model without duplicating mapped weights.

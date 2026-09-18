@@ -55,7 +55,7 @@ constexpr std::array<ModelDescriptor, 3> kCompiledModels = {
         .family = ModelFamily::kQwen35,
         .role = ModelRole::kProduction,
         .canonical_id = "qwen3.8-27b-text",
-        .display_name = "Qwen3.8-27B Text",
+        .display_name = "Qwen3.8-27B",
         .family_name = "qwen3.5",
         .source_repo = "https://huggingface.co/Qwen/Qwen3.8-27B",
         .pinned_revision = "main",
@@ -66,7 +66,7 @@ constexpr std::array<ModelDescriptor, 3> kCompiledModels = {
             ModelCapabilities{
                 .text_input = true,
                 .text_output = true,
-                .vision_input = false,
+                .vision_input = true,
                 .video_input = false,
                 .audio_input = false,
                 .video_output = false,

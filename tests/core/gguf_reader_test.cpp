@@ -93,6 +93,18 @@ public:
     metadata_count_++;
   }
 
+  template<class T>
+  void AddMetadataArray(std::string_view key, gufo::core::GgufValueType type,
+                        const std::vector<T>& values) {
+    AppendString(key);
+    AppendPod(static_cast<std::uint32_t>(gufo::core::GgufValueType::kArray));
+    AppendPod(static_cast<std::uint32_t>(type));
+    AppendPod(static_cast<std::uint64_t>(values.size()));
+    for (const auto value : values)
+      AppendPod(value);
+    ++metadata_count_;
+  }
+
   void AddTensor(std::string_view name, const std::vector<std::uint64_t>& dims,
                  gufo::core::GgmlType type, std::uint64_t offset) {
     tensors_to_write_.push_back({std::string(name), dims, type, offset});
@@ -451,9 +463,37 @@ void TestMalformedGgufRejection() {
   Expect(r2 == nullptr, "Truncated buffer rejected");
 }
 
+void TestVisionMetadataArrays() {
+  GgufBuilder builder;
+  builder.AddMetadataArray<float>("clip.vision.image_mean",
+                                  gufo::core::GgufValueType::kFloat32,
+                                  {0.5F, 0.5F, 0.5F});
+  builder.AddMetadataArray<double>(
+      "float64-array", gufo::core::GgufValueType::kFloat64, {1.25, -0.25});
+  builder.AddMetadataArray<std::uint8_t>("clip.vision.is_deepstack_layers",
+                                         gufo::core::GgufValueType::kBool,
+                                         {0, 1, 0});
+  auto bytes = builder.Build();
+  auto reader = gufo::core::GgufReader::OpenMemory(bytes.data(), bytes.size());
+  Expect(reader != nullptr, "vision metadata parses");
+  Expect(std::get<std::vector<double>>(
+             reader->FindMetadata("clip.vision.image_mean")->value) ==
+             std::vector<double>({0.5, 0.5, 0.5}),
+         "vision normalization metadata is retained");
+  Expect(std::get<std::vector<double>>(
+             reader->FindMetadata("float64-array")->value) ==
+             std::vector<double>({1.25, -0.25}),
+         "float64 array precision is retained");
+  Expect(std::get<std::vector<std::uint64_t>>(
+             reader->FindMetadata("clip.vision.is_deepstack_layers")->value) ==
+             std::vector<std::uint64_t>({0, 1, 0}),
+         "deepstack flags are retained");
+}
+
 }  // namespace
 
 int main() {
+  TestVisionMetadataArrays();
   std::cout << "Running GgufReader unit tests...\n";
   TestBasicGgufParsing();
   TestQwen38_27BParsing();

@@ -92,6 +92,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
       scratch.decode.prompt_tokens.data(), scratch.decode.hidden.data(),
       batch_size, hidden_size, arena_.stream);
 
+  vision_input_.Inject(scratch.decode.hidden.data(), start_pos, batch_size,
+                       hidden_size, 1, arena_.stream);
+
   const bool half_prefill = UseQwen27bFp16Prefill(weights_, batch_size);
   // Execute the pure Qwen route decision while keeping hipBLASLt failure as a
   // runtime fallback to hipBLAS, not as resolver state.
@@ -276,7 +279,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
             attn_layer_idx, start_pos, batch_size, arena_.GetMaxContext(),
             config.num_attention_heads, config.num_key_value_heads,
             config.head_dim, config.rotary_dim, config.rope_theta, eps,
-            arena_.stream);
+            arena_.stream, vision_input_.rope());
       } else {
         if (!layer.attn_q_norm.empty()) {
           LaunchBatchedPerHeadRMSNorm(
@@ -294,7 +297,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
         LaunchBatchedRoPE(
             arena_.d_q, arena_.d_k, batch_size, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim, config.rotary_dim,
-            start_pos, config.rope_theta, arena_.stream);
+            start_pos, config.rope_theta, arena_.stream, vision_input_.rope());
       }
 
       const std::size_t visible_context =

@@ -4,6 +4,7 @@
 #include <cstdint>
 
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen/vision/device_input.hpp"
 
 namespace gufo::models {
 struct QwenModelWeights;
@@ -20,11 +21,11 @@ void EmitDecodeRouteTelemetry(const models::QwenModelWeights& weights,
                               const QwenExecutionPolicy& policy);
 
 /// Runs one graph-capture-safe decode layer stack using stable arena storage.
-void ExecuteDecodeStep(QwenGpuArena& arena,
-                       const models::QwenModelWeights& weights,
-                       const QwenExecutionPolicy& policy,
-                       tokenization::TokenId token_id, std::uint32_t pos,
-                       bool compute_logits);
+void ExecuteDecodeStep(
+    QwenGpuArena& arena, const models::QwenModelWeights& weights,
+    const QwenExecutionPolicy& policy, tokenization::TokenId token_id,
+    std::uint32_t pos, bool compute_logits,
+    models::qwen::vision::DeviceInput* image_input = nullptr);
 
 }  // namespace gufo::hip
 

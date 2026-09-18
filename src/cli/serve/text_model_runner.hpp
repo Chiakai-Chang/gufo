@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,6 +20,18 @@
 namespace gufo::server {
 
 using TextRunnerToken = ContinuationToken;
+
+/// Immutable model-owned input which travels with one scheduled request.
+/// Cache identity supplements token IDs for inputs such as image embeddings.
+struct TextPromptContext {
+  virtual ~TextPromptContext() = default;
+  std::vector<std::uint8_t> cache_identity;
+};
+
+struct TextPreparedPrompt {
+  std::vector<TextRunnerToken> tokens;
+  std::shared_ptr<const TextPromptContext> context;
+};
 
 struct TextRunnerDiskCacheOptions {
   std::filesystem::path directory;
@@ -186,6 +199,27 @@ public:
       std::string_view text) const = 0;
   [[nodiscard]] virtual std::optional<std::vector<TextRunnerToken>>
   RenderAndTokenize(const ChatRequest& request) const = 0;
+  [[nodiscard]] virtual std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const {
+    for (const auto& message : request.messages) {
+      if (!message.images.empty()) {
+        throw std::invalid_argument("model does not support image input");
+      }
+    }
+    auto tokens = RenderAndTokenize(request);
+    if (!tokens)
+      return std::nullopt;
+    return TextPreparedPrompt{std::move(*tokens), {}};
+  }
+  /// Called after cache restoration and before prefill or selection, including
+  /// a complete prefix hit. Must replace, never inherit, the previous request.
+  virtual void SetPromptContext(
+      TextRunnerState&,
+      std::shared_ptr<const TextPromptContext> context) const {
+    if (context != nullptr) {
+      throw std::invalid_argument("model does not support this prompt context");
+    }
+  }
   [[nodiscard]] virtual TextGenerationBackend::InitialOutputState
   InitialOutputState(const ChatRequest&) const {
     return TextGenerationBackend::InitialOutputState::kAuto;
@@ -333,9 +367,11 @@ public:
       const TextExecutionPlan& plan);
   void AdvanceBatch(std::span<Request*> requests,
                     const TextExecutionPlan& plan);
-  [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
-                                const sampling::SamplingConfig& sampling,
-                                const CancellationCheck& is_cancelled = {});
+  [[nodiscard]] Request Acquire(
+      std::vector<TextRunnerToken> prompt,
+      const sampling::SamplingConfig& sampling,
+      const CancellationCheck& is_cancelled = {},
+      std::shared_ptr<const TextPromptContext> context = {});
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
 

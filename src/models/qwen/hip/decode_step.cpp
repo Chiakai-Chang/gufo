@@ -31,7 +31,9 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
                        const models::QwenModelWeights& weights,
                        const QwenExecutionPolicy& policy,
                        tokenization::TokenId token_id, std::uint32_t pos,
-                       bool compute_logits) {
+                       bool compute_logits,
+                       models::qwen::vision::DeviceInput* image_input) {
+  const auto* rope = image_input != nullptr ? image_input->rope() : nullptr;
   (void)token_id;
   const auto& config = weights.config;
   const std::size_t hidden_size = config.hidden_size;
@@ -61,6 +63,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
   // 1. Embedding lookup
   LaunchEmbeddingLookup(weights.token_embd.data, weights.token_embd.type,
                         d_in_token, decode_scratch.hidden.data(), hidden_size,
+                        arena.stream);
+
+  if (image_input != nullptr)
+    image_input->Inject(decode_scratch.hidden.data(), pos, 1, hidden_size, 1,
                         arena.stream);
 
   // 2. Layer stack
@@ -117,7 +123,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
             attn_layer_idx, d_in_pos, arena.GetMaxContext(),
             config.num_attention_heads, config.num_key_value_heads,
             config.head_dim, config.rotary_dim, config.rope_theta, 1e-6F,
-            arena.stream);
+            arena.stream, rope);
       } else {
         if (!layer.attn_q_norm.empty()) {
           LaunchPerHeadRMSNorm(
@@ -138,7 +144,7 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
         LaunchRoPE(attention_scratch.q.data(), attention_scratch.k.data(),
                    config.num_attention_heads, config.num_key_value_heads,
                    config.head_dim, config.rotary_dim, d_in_pos,
-                   config.rope_theta, arena.stream);
+                   config.rope_theta, arena.stream, rope);
       }
 
       // Softmax Attention + Gating

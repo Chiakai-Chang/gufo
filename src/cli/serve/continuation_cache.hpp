@@ -157,6 +157,7 @@ public:
     double restore_ms_{0.0};
     bool restored_from_disk_{false};
     std::size_t reserved_snapshot_bytes_{0};
+    std::vector<std::uint8_t> input_identity_;
   };
 
   ContinuationCache(std::size_t capacity, const StateFactory& factory,
@@ -168,8 +169,10 @@ public:
   ContinuationCache(ContinuationCache&&) = delete;
   ContinuationCache& operator=(ContinuationCache&&) = delete;
 
-  [[nodiscard]] Lease Acquire(std::span<const ContinuationToken> prompt,
-                              const CancellationCheck& is_cancelled = {});
+  [[nodiscard]] Lease Acquire(
+      std::span<const ContinuationToken> prompt,
+      const CancellationCheck& is_cancelled = {},
+      std::span<const std::uint8_t> input_identity = {});
 
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] std::size_t snapshot_capacity_bytes() const noexcept;
@@ -189,7 +192,8 @@ private:
   [[nodiscard]] std::size_t Commit(
       std::size_t index, std::size_t source_index,
       std::size_t reservation_bytes, std::vector<ContinuationToken> tokens,
-      std::unique_ptr<ContinuationSnapshot> snapshot);
+      std::unique_ptr<ContinuationSnapshot> snapshot,
+      std::vector<std::uint8_t> input_identity);
   void Invalidate(std::size_t index, std::size_t reservation_bytes) noexcept;
 
   struct Impl;

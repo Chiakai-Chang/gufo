@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "src/models/qwen/vision/rope.hpp"
+
 /// Model-private HIP launchers for everything outside the quantized GEMM
 /// tier. Activations are row-major float32 [tokens][dim] unless noted; every
 /// launch is asynchronous on `stream`. Weights referenced here are device
@@ -145,7 +147,8 @@ bool AttentionF16Gemm(const void* weights, const __half* input,
                       const float* q_gamma, const float* k_gamma, float* query,
                       float* gate, __half* keys, __half* values,
                       std::uint32_t n_tokens, const std::uint32_t* position,
-                      float theta, float eps, hipStream_t stream);
+                      float theta, float eps, hipStream_t stream,
+                      const qwen::vision::DeviceRope* rope = nullptr);
 
 /// Exact Q8_0 HC up projection and F16-input mixer for the Flash Next
 /// 2560-hidden, rank-320 geometry. Returns false below 96 tokens or for other
@@ -289,7 +292,8 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t n_tokens, std::uint32_t heads,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
-                      float theta, float eps, hipStream_t stream);
+                      float theta, float eps, hipStream_t stream,
+                      const qwen::vision::DeviceRope* rope = nullptr);
 
 /// NEOX partial rotary on x [t][heads][d] at positions start_pos + t.
 /// Positions are read from device memory (`start_pos` points at the
@@ -297,7 +301,8 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
 /// position.
 void Rope(float* x, std::uint32_t n_tokens, std::uint32_t heads,
           std::uint32_t d, std::uint32_t rotary_dim,
-          const std::uint32_t* start_pos, float theta, hipStream_t stream);
+          const std::uint32_t* start_pos, float theta, hipStream_t stream,
+          const qwen::vision::DeviceRope* rope = nullptr);
 
 /// Stores f32 rows into the f16 cache at positions start_pos + t:
 /// cache[(start_pos + t)][row_dim].
@@ -320,7 +325,8 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
                        const std::uint32_t* start_pos, std::uint32_t n_tokens,
                        std::uint32_t grid_blocks, std::uint32_t ratio,
                        std::uint32_t dim, std::uint32_t rotary_dim, float theta,
-                       float eps, std::uint32_t capacity, hipStream_t stream);
+                       float eps, std::uint32_t capacity, hipStream_t stream,
+                       const qwen::vision::DeviceRope* rope = nullptr);
 
 /// Per query t (position *start_pos + first_token + t): scores every
 /// complete block below its own tail, keeps the `budget` highest, and

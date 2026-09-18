@@ -16,6 +16,7 @@
 #include "src/cli/sampling_options.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/image.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
@@ -47,6 +48,36 @@ static void PrintTokenTrace(std::span<const tokenization::TokenId> tokens) {
             << " sha256=" << crypto::Sha256Hex(bytes) << '\n';
 }
 
+static void RegisterImageOptions(ArgParser& parser, PromptOptions& opt) {
+  parser.AddOption("", "--mmproj", "PATH",
+                   "Qwen BF16 vision sidecar (auto-discovered beside model)",
+                   "Model", &opt.vision_model_path);
+  parser.AddCustomOption(
+      "", "--image", "PATH",
+      "PNG/JPEG attached before text in the first user turn; repeat for "
+      "multiple images",
+      "Prompt",
+      [&opt](std::string_view, std::string_view value, std::string* error) {
+        if (value.empty() || opt.image_paths.size() >= 16) {
+          if (error)
+            *error =
+                "--image requires a file path; at most 16 images are supported";
+          return false;
+        }
+        opt.image_paths.emplace_back(value);
+        return true;
+      });
+}
+
+static void AttachImages(const PromptOptions& opt,
+                         tokenization::ChatMessage& message) {
+  for (const auto& path : opt.image_paths) {
+    message.images.push_back(
+        {0, std::make_shared<const std::vector<std::uint8_t>>(
+                core::ReadImageFile(path))});
+  }
+}
+
 static void PrintTextHelp(std::string_view program_name,
                           std::string_view command) {
   PromptOptions opt;
@@ -56,6 +87,7 @@ static void PrintTextHelp(std::string_view program_name,
                         : "Execute one prompt request and exit.");
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
+  RegisterImageOptions(parser, opt);
   if (command == "prompt") {
     parser.AddOption("-p", "--prompt", "TEXT", "Direct input prompt text",
                      "Prompt", &opt.prompt_text);
@@ -518,6 +550,40 @@ int RunDeepSeekChat(const PromptOptions& opt, const core::GgufReader& reader,
   return 0;
 }
 
+std::shared_ptr<models::qwen::vision::Encoder> LoadQwenVision(
+    const PromptOptions& opt, const core::GgufReader& reader) {
+  if (opt.image_paths.empty() && opt.vision_model_path.empty())
+    return {};
+  if (reader.GetMetadataUint64("qwen35.embedding_length") != 5120) {
+    throw std::invalid_argument(
+        "image input supports Qwen3.8-27B and Flash-Next");
+  }
+  auto encoder = models::qwen::vision::Encoder::Open(
+      opt.model_path, opt.vision_model_path, 5120);
+  if (!encoder)
+    throw std::invalid_argument(
+        "image input requires a matching --mmproj BF16 sidecar");
+  return encoder;
+}
+
+std::shared_ptr<const models::qwen::vision::Prompt> PrepareVision(
+    const PromptOptions& opt, const tokenization::QwenTokenizer& tokenizer,
+    std::span<const tokenization::ChatMessage> messages,
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder) {
+  if (!encoder)
+    throw std::invalid_argument(
+        "image input requires a matching --mmproj BF16 sidecar");
+  const auto reasoning = PromptReasoningOptions(opt);
+  return std::make_shared<models::qwen::vision::Prompt>(
+      models::qwen::vision::Prepare(
+          tokenizer, messages, {},
+          {.add_generation_prompt = true,
+           .enable_thinking = reasoning.enabled.value_or(false),
+           .reasoning_effort = QwenEffort(reasoning.effort),
+           .preserve_thinking = reasoning.preserve_thinking.value_or(true)},
+          encoder->identity(), kDefaultContext));
+}
+
 std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
     const PromptOptions& opt, const core::GgufReader& reader,
     std::chrono::steady_clock::time_point load_start) {
@@ -539,7 +605,8 @@ std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
       {.max_context = kDefaultContext,
        .mtp_model_path =
            opt.speculative_backend == "mtp" ? opt.mtp_model_path : "",
-       .max_draft_tokens = opt.draft_tokens},
+       .max_draft_tokens = opt.draft_tokens,
+       .vision_model_path = opt.vision_model_path},
       &error);
   PrintModelLoadTime(load_start, model != nullptr);
   if (!model)
@@ -623,6 +690,7 @@ std::unique_ptr<speculative::SpeculativeVerifier> CreateQwenVerifier(
     hip::QwenMtpGpuDraftConfig cfg{
         .max_context = executor.GetMaxContext(),
         .max_draft_tokens = static_cast<std::uint32_t>(opt.draft_tokens),
+        .vision_input = &executor.VisionInput(),
     };
     draft_backend = hip::QwenMtpGpuDraftBackend::CreateFromGguf(
         mtp_path, executor.GetSharedModel(), cfg, &err);
@@ -705,6 +773,7 @@ std::optional<PromptOptions> ParsePromptOptions(
   // Model
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
+  RegisterImageOptions(parser, opt);
 
   // Prompt & Formatting
   parser.AddOption("-p", "--prompt", "TEXT", "Direct input prompt text",
@@ -839,6 +908,12 @@ std::optional<PromptOptions> ParsePromptOptions(
     }
     return std::nullopt;
   }
+  if ((!opt.image_paths.empty() || !opt.vision_model_path.empty()) &&
+      (opt.force_cpu || !opt.use_chat_template)) {
+    if (error_msg)
+      *error_msg = "image input requires ROCm and chat framing";
+    return std::nullopt;
+  }
   if (!speculative_explicit && !opt.dspark_model_path.empty()) {
     opt.speculative_backend = "dspark";
   }
@@ -971,6 +1046,10 @@ int RunPrompt(std::span<const char* const> args) {
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "DeepSeek does not support image input\n";
+      return 2;
+    }
     return RunDeepSeekPrompt(opt, *reader, model_load_start);
   }
 #else
@@ -982,8 +1061,8 @@ int RunPrompt(std::span<const char* const> args) {
 #endif
 
   std::string rendered_prompt = opt.prompt_text;
+  std::vector<tokenization::ChatMessage> messages;
   if (opt.use_chat_template) {
-    std::vector<tokenization::ChatMessage> messages;
     if (!opt.system_prompt.empty()) {
       messages.push_back(
           {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
@@ -1017,9 +1096,21 @@ int RunPrompt(std::span<const char* const> args) {
       std::cerr << "Flash-Next session failed: " << err << '\n';
       return 1;
     }
-    const auto ids = model->Tokenize(rendered_prompt);
-    const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
-    return GenerateFlashNextResponse(opt, *model, *session, prompt);
+    try {
+      if (!opt.image_paths.empty()) {
+        AttachImages(opt, messages.back());
+        auto vision = PrepareVision(opt, model->tokenizer(), messages,
+                                    model->VisionEncoder());
+        session->ConfigureVision(vision);
+        return GenerateFlashNextResponse(opt, *model, *session, vision->tokens);
+      }
+      const auto ids = model->Tokenize(rendered_prompt);
+      const std::vector<tokenization::TokenId> prompt(ids.begin(), ids.end());
+      return GenerateFlashNextResponse(opt, *model, *session, prompt);
+    } catch (const std::exception& e) {
+      std::cerr << e.what() << '\n';
+      return 1;
+    }
   }
   int dev_count = 0;
   if (!opt.force_cpu && hipGetDeviceCount(&dev_count) == hipSuccess &&
@@ -1027,8 +1118,20 @@ int RunPrompt(std::span<const char* const> args) {
     auto gpu_exec = gufo::hip::QwenGpuExecutor::CreateFromGguf(reader, &err);
     if (gpu_exec) {
       PrintModelLoadTime(model_load_start);
-      const auto prompt_tokens =
-          gpu_exec->GetTokenizer().Encode(rendered_prompt);
+      auto prompt_tokens = gpu_exec->GetTokenizer().Encode(rendered_prompt);
+      try {
+        auto encoder = LoadQwenVision(opt, *reader);
+        if (!opt.image_paths.empty()) {
+          AttachImages(opt, messages.back());
+          auto vision =
+              PrepareVision(opt, gpu_exec->GetTokenizer(), messages, encoder);
+          prompt_tokens = vision->tokens;
+          gpu_exec->ConfigureVision(std::move(vision), std::move(encoder));
+        }
+      } catch (const std::exception& e) {
+        std::cerr << e.what() << '\n';
+        return 1;
+      }
 
       if (opt.verbose) {
         const auto& config = gpu_exec->GetConfig();
@@ -1064,6 +1167,10 @@ int RunPrompt(std::span<const char* const> args) {
   }
 #endif
 
+  if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+    std::cerr << "Image input requires ROCm\n";
+    return 1;
+  }
   if (!opt.speculative_backend.empty()) {
     std::cerr << "Qwen speculative decoding requires the ROCm backend\n";
     return 1;
@@ -1165,6 +1272,10 @@ int RunChat(std::span<const char* const> args) {
 
 #if defined(ENGINE_ENABLE_HIP)
   if (IsDeepSeekV4Flash(*reader)) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "DeepSeek does not support image input\n";
+      return 2;
+    }
     return RunDeepSeekChat(opt, *reader, model_load_start);
   }
 #else
@@ -1179,6 +1290,7 @@ int RunChat(std::span<const char* const> args) {
   std::unique_ptr<models::QwenGenerator> generator;
 #if defined(ENGINE_ENABLE_HIP)
   std::unique_ptr<hip::QwenGpuExecutor> gpu_executor;
+  std::shared_ptr<models::qwen::vision::Encoder> vision_encoder;
   std::unique_ptr<speculative::SpeculativeVerifier> verifier;
   std::shared_ptr<models::qwen38_flash_next::Model> flash_model;
   std::unique_ptr<models::qwen38_flash_next::Session> flash_session;
@@ -1193,6 +1305,7 @@ int RunChat(std::span<const char* const> args) {
     }
     tokenizer = &flash_model->tokenizer();
     architecture = "qwen4exp";
+    vision_encoder = flash_model->VisionEncoder();
   }
   int device_count = 0;
   if (tokenizer == nullptr && !opt.force_cpu &&
@@ -1204,6 +1317,7 @@ int RunChat(std::span<const char* const> args) {
       return 1;
     }
     try {
+      vision_encoder = LoadQwenVision(opt, *reader);
       if (!opt.speculative_backend.empty()) {
         verifier = CreateQwenVerifier(opt, *gpu_executor);
       }
@@ -1219,6 +1333,10 @@ int RunChat(std::span<const char* const> args) {
   }
 #endif
   if (tokenizer == nullptr) {
+    if (!opt.image_paths.empty() || !opt.vision_model_path.empty()) {
+      std::cerr << "Image input requires ROCm\n";
+      return 1;
+    }
     if (!opt.speculative_backend.empty()) {
       std::cerr << "Qwen speculative decoding requires the ROCm backend\n";
       return 1;
@@ -1245,6 +1363,7 @@ int RunChat(std::span<const char* const> args) {
         {tokenization::ChatRole::kSystem, opt.system_prompt, "", ""});
   }
 
+  bool first_turn = true;
   std::string user_input;
   while (true) {
     std::cout << ">>> User: " << std::flush;
@@ -1273,13 +1392,24 @@ int RunChat(std::span<const char* const> args) {
       return 1;
     }
 
-    const auto prompt_tokens = tokenizer->Encode(*rendered_prompt);
+    auto prompt_tokens = tokenizer->Encode(*rendered_prompt);
 
     std::cout << "<<< Assistant: ";
     std::string assistant_reply;
 
     try {
 #if defined(ENGINE_ENABLE_HIP)
+      if (first_turn)
+        AttachImages(opt, history.back());
+      first_turn = false;
+      if (!opt.image_paths.empty()) {
+        auto vision = PrepareVision(opt, *tokenizer, history, vision_encoder);
+        prompt_tokens = vision->tokens;
+        if (flash_session)
+          flash_session->ConfigureVision(vision);
+        if (gpu_executor)
+          gpu_executor->ConfigureVision(vision, vision_encoder);
+      }
       if (flash_model) {
         if (GenerateFlashNextResponse(opt, *flash_model, *flash_session,
                                       prompt_tokens, &assistant_reply) != 0)

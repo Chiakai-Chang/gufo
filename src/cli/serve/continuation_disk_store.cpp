@@ -32,6 +32,23 @@
 namespace gufo::server {
 namespace {
 
+TextRunnerDescriptor DescriptorForInput(
+    const TextModelRunner& runner,
+    std::span<const std::uint8_t> input_identity) {
+  auto descriptor = runner.Descriptor();
+  if (input_identity.empty() || !descriptor.persistence)
+    return descriptor;
+  auto& identity = descriptor.persistence->compatibility_identity;
+  const auto model_size = identity.size();
+  identity.insert(identity.begin(), {'I', 'M', 'G', 1});
+  for (unsigned shift = 0; shift < 64; shift += 8) {
+    identity.push_back(
+        static_cast<std::uint8_t>(std::uint64_t{model_size} >> shift));
+  }
+  identity.insert(identity.end(), input_identity.begin(), input_identity.end());
+  return descriptor;
+}
+
 constexpr std::array<std::uint8_t, 8> kMagic = {'G', 'U', 'F', 'O',
                                                 'K', 'V', 'C', '1'};
 constexpr std::uint32_t kFileVersion = 1;
@@ -776,8 +793,9 @@ struct ContinuationDiskStore::Impl {
   [[nodiscard]] SaveResult Save(
       const TextModelRunner& runner,
       std::span<const TextRunnerToken> checkpoint_tokens,
-      const TextRunnerSnapshot& snapshot) {
-    const auto descriptor = runner.Descriptor();
+      const TextRunnerSnapshot& snapshot,
+      std::span<const std::uint8_t> input_identity) {
+    const auto descriptor = DescriptorForInput(runner, input_identity);
     if (!descriptor.persistence.has_value()) {
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kUnsupported, 0, 0,
@@ -919,8 +937,9 @@ struct ContinuationDiskStore::Impl {
 
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,
-      std::span<const TextRunnerToken> prompt) {
-    const auto descriptor = runner.Descriptor();
+      std::span<const TextRunnerToken> prompt,
+      std::span<const std::uint8_t> input_identity) {
+    const auto descriptor = DescriptorForInput(runner, input_identity);
     if (!descriptor.persistence.has_value()) {
       Emit(ContinuationDiskEventAction::kMiss,
            ContinuationDiskEventReason::kUnsupported, 0, 0, 0);
@@ -1006,8 +1025,9 @@ struct ContinuationDiskStore::Impl {
 
   [[nodiscard]] std::vector<std::size_t> SharedPrefixBoundaries(
       const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
-      std::size_t min_tokens, std::size_t max_boundaries) {
-    const auto descriptor = runner.Descriptor();
+      std::size_t min_tokens, std::size_t max_boundaries,
+      std::span<const std::uint8_t> input_identity) {
+    const auto descriptor = DescriptorForInput(runner, input_identity);
     if (!descriptor.persistence.has_value() || max_boundaries == 0) {
       return {};
     }
@@ -1046,8 +1066,9 @@ struct ContinuationDiskStore::Impl {
   }
 
   [[nodiscard]] bool Touch(const TextModelRunner& runner,
-                           std::span<const TextRunnerToken> tokens) {
-    const auto descriptor = runner.Descriptor();
+                           std::span<const TextRunnerToken> tokens,
+                           std::span<const std::uint8_t> input_identity) {
+    const auto descriptor = DescriptorForInput(runner, input_identity);
     if (!descriptor.persistence.has_value()) {
       return false;
     }
@@ -1084,31 +1105,35 @@ ContinuationDiskStore::~ContinuationDiskStore() = default;
 ContinuationDiskStore::SaveResult ContinuationDiskStore::Save(
     const TextModelRunner& runner,
     std::span<const TextRunnerToken> checkpoint_tokens,
-    const TextRunnerSnapshot& snapshot) {
+    const TextRunnerSnapshot& snapshot,
+    std::span<const std::uint8_t> input_identity) {
   const ScopedOperationPermit permit(impl_->operation_gate);
-  return impl_->Save(runner, checkpoint_tokens, snapshot);
+  return impl_->Save(runner, checkpoint_tokens, snapshot, input_identity);
 }
 
 ContinuationDiskStore::RestoreResult
 ContinuationDiskStore::RestoreLongestPrefix(
     const TextModelRunner& runner, TextRunnerState& state,
-    std::span<const TextRunnerToken> prompt) {
+    std::span<const TextRunnerToken> prompt,
+    std::span<const std::uint8_t> input_identity) {
   const ScopedOperationPermit permit(impl_->operation_gate);
-  return impl_->RestoreLongestPrefix(runner, state, prompt);
+  return impl_->RestoreLongestPrefix(runner, state, prompt, input_identity);
 }
 
 std::vector<std::size_t> ContinuationDiskStore::SharedPrefixBoundaries(
     const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
-    std::size_t min_tokens, std::size_t max_boundaries) {
+    std::size_t min_tokens, std::size_t max_boundaries,
+    std::span<const std::uint8_t> input_identity) {
   const ScopedOperationPermit permit(impl_->operation_gate);
   return impl_->SharedPrefixBoundaries(runner, prompt, min_tokens,
-                                       max_boundaries);
+                                       max_boundaries, input_identity);
 }
 
-bool ContinuationDiskStore::Touch(const TextModelRunner& runner,
-                                  std::span<const TextRunnerToken> tokens) {
+bool ContinuationDiskStore::Touch(
+    const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
+    std::span<const std::uint8_t> input_identity) {
   const ScopedOperationPermit permit(impl_->operation_gate);
-  return impl_->Touch(runner, tokens);
+  return impl_->Touch(runner, tokens, input_identity);
 }
 
 std::size_t ContinuationDiskStore::entry_count() const noexcept {

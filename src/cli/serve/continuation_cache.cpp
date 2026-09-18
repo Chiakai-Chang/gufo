@@ -45,6 +45,7 @@ struct ContinuationCache::Entry {
   std::unique_ptr<ContinuationState> state;
   std::shared_ptr<const ContinuationSnapshot> snapshot;
   std::vector<ContinuationToken> tokens;
+  std::vector<std::uint8_t> input_identity;
   std::size_t snapshot_bytes{0};
   std::uint64_t state_last_used{0};
   std::uint64_t snapshot_last_used{0};
@@ -96,7 +97,8 @@ ContinuationCache::Lease::Lease(Lease&& other) noexcept
       restore_ms_(std::exchange(other.restore_ms_, 0.0)),
       restored_from_disk_(std::exchange(other.restored_from_disk_, false)),
       reserved_snapshot_bytes_(
-          std::exchange(other.reserved_snapshot_bytes_, 0)) {}
+          std::exchange(other.reserved_snapshot_bytes_, 0)),
+      input_identity_(std::move(other.input_identity_)) {}
 
 ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     Lease&& other) noexcept {
@@ -111,6 +113,7 @@ ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     restore_ms_ = std::exchange(other.restore_ms_, 0.0);
     restored_from_disk_ = std::exchange(other.restored_from_disk_, false);
     reserved_snapshot_bytes_ = std::exchange(other.reserved_snapshot_bytes_, 0);
+    input_identity_ = std::move(other.input_identity_);
   }
   return *this;
 }
@@ -173,9 +176,9 @@ std::size_t ContinuationCache::Lease::Commit(
   if (cache_ == nullptr) {
     throw std::logic_error("continuation cache lease is empty");
   }
-  const std::size_t retained =
-      cache_->Commit(index_, source_index_, reserved_snapshot_bytes_,
-                     std::move(tokens), std::move(snapshot));
+  const std::size_t retained = cache_->Commit(
+      index_, source_index_, reserved_snapshot_bytes_, std::move(tokens),
+      std::move(snapshot), std::move(input_identity_));
   cache_ = nullptr;
   reserved_snapshot_bytes_ = 0;
   return retained;
@@ -225,7 +228,8 @@ ContinuationCache::~ContinuationCache() = default;
 
 ContinuationCache::Lease ContinuationCache::Acquire(
     std::span<const ContinuationToken> prompt,
-    const CancellationCheck& is_cancelled) {
+    const CancellationCheck& is_cancelled,
+    std::span<const std::uint8_t> input_identity) {
   while (true) {
     std::unique_lock<std::mutex> lock(impl_->mutex);
 
@@ -235,6 +239,8 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
       const auto& entry = *impl_->entries[index];
       if ((!impl_->snapshot_mode() && !entry.available) || !entry.valid ||
+          !std::equal(entry.input_identity.begin(), entry.input_identity.end(),
+                      input_identity.begin(), input_identity.end()) ||
           !IsPrefix(entry.tokens, prompt)) {
         continue;
       }
@@ -306,8 +312,11 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         impl_->condition.notify_one();
         throw;
       }
-      return Lease(this, selected, cache_hit, cached_tokens, source,
-                   restored_snapshot_bytes, restore_ms);
+      Lease lease(this, selected, cache_hit, cached_tokens, source,
+                  restored_snapshot_bytes, restore_ms);
+      lease.input_identity_.assign(input_identity.begin(),
+                                   input_identity.end());
+      return lease;
     }
 
     lock.unlock();
@@ -456,7 +465,8 @@ void ContinuationCache::SkipSnapshot(std::size_t reservation_bytes,
 std::size_t ContinuationCache::Commit(
     std::size_t index, std::size_t source_index, std::size_t reservation_bytes,
     std::vector<ContinuationToken> tokens,
-    std::unique_ptr<ContinuationSnapshot> snapshot) {
+    std::unique_ptr<ContinuationSnapshot> snapshot,
+    std::vector<std::uint8_t> input_identity) {
   const std::size_t token_count = tokens.size();
   const std::size_t snapshot_bytes =
       snapshot != nullptr ? snapshot->PayloadBytes() : 0;
@@ -518,7 +528,8 @@ std::size_t ContinuationCache::Commit(
         for (std::size_t candidate = 0; candidate < impl_->entries.size();
              ++candidate) {
           const auto& entry = *impl_->entries[candidate];
-          if (entry.valid && entry.tokens == tokens) {
+          if (entry.valid && entry.tokens == tokens &&
+              entry.input_identity == input_identity) {
             target = candidate;
             exact_replacement = true;
             break;
@@ -574,6 +585,7 @@ std::size_t ContinuationCache::Commit(
           skip_reason = SnapshotEventReason::kReservationMismatch;
         } else {
           snapshot_entry.tokens = std::move(tokens);
+          snapshot_entry.input_identity = std::move(input_identity);
           snapshot_entry.snapshot = std::move(retained_snapshot);
           snapshot_entry.snapshot_bytes = snapshot_bytes;
           snapshot_entry.valid = !snapshot_entry.tokens.empty();
@@ -592,6 +604,7 @@ std::size_t ContinuationCache::Commit(
       }
     } else {
       state_entry.tokens = std::move(tokens);
+      state_entry.input_identity = std::move(input_identity);
       state_entry.valid = !state_entry.tokens.empty();
     }
     state_entry.dirty = true;

@@ -88,8 +88,7 @@ enum class ModelRole : std::uint8_t {
 }
 
 /// Declared capabilities for a compiled model descriptor.
-/// Initial models are strictly text-only: vision and video are explicitly
-/// disabled and rejected.
+/// Input/output modalities implemented by each model runtime.
 struct ModelCapabilities {
   bool text_input{true};
   bool text_output{true};

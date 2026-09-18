@@ -200,6 +200,8 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
   LaunchEmbeddingLookup(weights.token_embedding.data,
                         weights.token_embedding.type, input_token, d_embedding_,
                         hidden, stream_);
+  if (vision_input_)
+    vision_input_->Inject(d_embedding_, position + 1, 1, hidden, 1, stream_);
   LaunchRMSNorm(d_embedding_,
                 static_cast<const float*>(weights.embedding_norm.data),
                 d_fusion_, hidden, 1.0e-6F, stream_);
@@ -226,7 +228,7 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
                        1.0e-6F, stream_);
   LaunchRoPE(d_q_, d_k_, config.num_attention_heads, config.num_key_value_heads,
              config.head_dim, config.rotary_dim, position, config.rope_theta,
-             stream_);
+             stream_, vision_input_ ? vision_input_->rope() : nullptr);
   LaunchAttention(
       d_q_, d_k_, d_v_, d_gate_, d_kv_cache_, d_kv_cache_ + total_kv,
       d_kv_cache_f16_, static_cast<std::uint16_t*>(d_kv_cache_f16_) + total_kv,

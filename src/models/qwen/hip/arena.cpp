@@ -105,6 +105,8 @@ struct CompactSnapshotLayout {
   std::size_t conv_offset{0};
   std::size_t deltanet_offset{0};
   std::size_t total_bytes{0};
+  std::size_t rope_offset{0};
+  models::qwen::vision::RopeLayout rope;
 };
 
 CompactSnapshotLayout MakeCompactSnapshotLayout(
@@ -112,7 +114,8 @@ CompactSnapshotLayout MakeCompactSnapshotLayout(
     std::uint32_t max_context, std::uint32_t valid_context,
     QwenKvCacheStorage kv_storage,
     QwenRecurrentStateStorage recurrent_state_storage,
-    std::size_t conv_elements, std::size_t deltanet_elements) {
+    std::size_t conv_elements, std::size_t deltanet_elements,
+    std::size_t image_count = 0) {
   CompactSnapshotLayout layout{
       .attention_layers = attention_layers,
       .kv_width = kv_width,
@@ -140,6 +143,9 @@ CompactSnapshotLayout MakeCompactSnapshotLayout(
   layout.deltanet_offset = CheckedSum(layout.conv_offset, layout.conv_bytes);
   layout.total_bytes =
       CheckedSum(layout.deltanet_offset, layout.deltanet_bytes);
+  layout.rope_offset = layout.total_bytes;
+  layout.total_bytes =
+      CheckedSum(layout.total_bytes, CheckedMultiply(image_count, 12));
   return layout;
 }
 
@@ -150,10 +156,13 @@ CompactSnapshotLayout ParseCompactSnapshotLayout(
                   payload.begin())) {
     throw std::invalid_argument("Qwen compact snapshot header is invalid");
   }
-  if (GetLittleEndian<std::uint32_t>(payload, 8) != kCompactSnapshotVersion ||
+  const auto version = GetLittleEndian<std::uint32_t>(payload, 8);
+  const auto image_count = GetLittleEndian<std::uint32_t>(payload, 72);
+  if ((version != kCompactSnapshotVersion && version != 2) ||
+      image_count > 256 || (version == 1 && image_count != 0) ||
       GetLittleEndian<std::uint32_t>(payload, 12) !=
           kCompactSnapshotHeaderBytes ||
-      GetLittleEndian<std::uint64_t>(payload, 72) != 0) {
+      GetLittleEndian<std::uint32_t>(payload, 76) != 0) {
     throw std::invalid_argument("Qwen compact snapshot version is invalid");
   }
 
@@ -176,7 +185,7 @@ CompactSnapshotLayout ParseCompactSnapshotLayout(
       static_cast<QwenKvCacheStorage>(kv_storage_value),
       static_cast<QwenRecurrentStateStorage>(recurrent_storage_value),
       SizeFromU64(GetLittleEndian<std::uint64_t>(payload, 48)),
-      SizeFromU64(GetLittleEndian<std::uint64_t>(payload, 56)));
+      SizeFromU64(GetLittleEndian<std::uint64_t>(payload, 56)), image_count);
   if (layout.live_kv_elements_per_plane !=
           SizeFromU64(GetLittleEndian<std::uint64_t>(payload, 40)) ||
       layout.total_bytes !=
@@ -184,10 +193,23 @@ CompactSnapshotLayout ParseCompactSnapshotLayout(
       layout.total_bytes != payload.size()) {
     throw std::invalid_argument("Qwen compact snapshot size is invalid");
   }
+  for (std::size_t i = 0; i < image_count; ++i) {
+    const auto offset = layout.rope_offset + i * 12;
+    layout.rope.images.push_back(
+        {GetLittleEndian<std::uint32_t>(payload, offset),
+         GetLittleEndian<std::uint32_t>(payload, offset + 4),
+         GetLittleEndian<std::uint32_t>(payload, offset + 8)});
+  }
+  layout.rope.Validate(layout.max_context);
   return layout;
 }
 
 }  // namespace
+
+models::qwen::vision::RopeLayout QwenGpuSnapshot::ReadRopeLayout(
+    std::span<const std::uint8_t> payload) {
+  return ParseCompactSnapshotLayout(payload).rope;
+}
 
 QwenGpuSnapshot::~QwenGpuSnapshot() {
   if (d_kv_f32_ != nullptr) {
@@ -210,7 +232,8 @@ std::size_t QwenGpuSnapshot::CompactPayloadBytes() const {
              attention_layers_, kv_width_, max_context_, valid_context_,
              kv_storage_, recurrent_state_storage_,
              CheckedMultiply(recurrent_layers, conv_elements_per_layer_),
-             CheckedMultiply(recurrent_layers, deltanet_elements_per_layer_))
+             CheckedMultiply(recurrent_layers, deltanet_elements_per_layer_),
+             vision_layout_.images.size())
       .total_bytes;
 }
 
@@ -228,7 +251,8 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
       attention_layers_, kv_width_, max_context_, valid_context_, kv_storage_,
       recurrent_state_storage_,
       CheckedMultiply(recurrent_layers, conv_elements_per_layer_),
-      CheckedMultiply(recurrent_layers, deltanet_elements_per_layer_));
+      CheckedMultiply(recurrent_layers, deltanet_elements_per_layer_),
+      vision_layout_.images.size());
   if (destination.size() != layout.total_bytes) {
     throw std::invalid_argument(
         "Qwen compact snapshot destination size is invalid");
@@ -236,7 +260,9 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
   std::fill(destination.begin(), destination.end(), std::uint8_t{0});
   std::copy(kCompactSnapshotMagic.begin(), kCompactSnapshotMagic.end(),
             destination.begin());
-  PutLittleEndian<std::uint32_t>(destination, 8, kCompactSnapshotVersion);
+  PutLittleEndian<std::uint32_t>(destination, 8,
+                                 vision_layout_.images.empty() ? 1U : 2U);
+  PutLittleEndian<std::uint32_t>(destination, 72, vision_layout_.images.size());
   PutLittleEndian<std::uint32_t>(
       destination, 12, static_cast<std::uint32_t>(kCompactSnapshotHeaderBytes));
   PutLittleEndian<std::uint32_t>(destination, 16, attention_layers_);
@@ -332,10 +358,18 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
           "failed to serialize compact Qwen DeltaNet state");
       destination_offset = CheckedSum(destination_offset, bytes);
     }
-    if (destination_offset != layout.total_bytes) {
+    if (destination_offset != layout.rope_offset) {
       throw std::logic_error(
           "Qwen compact DeltaNet state has an invalid row count");
     }
+  }
+  vision_layout_.Validate(max_context_);
+  for (std::size_t i = 0; i < vision_layout_.images.size(); ++i) {
+    const auto& grid = vision_layout_.images[i];
+    const auto offset = layout.rope_offset + i * 12;
+    PutLittleEndian<std::uint32_t>(destination, offset, grid.offset);
+    PutLittleEndian<std::uint32_t>(destination, offset + 4, grid.height);
+    PutLittleEndian<std::uint32_t>(destination, offset + 8, grid.width);
   }
   return destination.size();
 }
@@ -678,7 +712,7 @@ void QwenGpuArena::RestoreCompactSnapshot(
           "failed to restore compact Qwen DeltaNet state");
       source_offset = CheckedSum(source_offset, bytes);
     }
-    if (source_offset != layout.total_bytes) {
+    if (source_offset != layout.rope_offset) {
       throw std::logic_error(
           "Qwen compact DeltaNet state has an invalid row count");
     }

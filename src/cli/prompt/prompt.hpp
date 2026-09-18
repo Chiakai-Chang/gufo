@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "src/core/sampling.hpp"
 
@@ -15,6 +16,8 @@ namespace gufo::cli {
 /// Options for `gufo prompt` and `gufo chat` execution.
 struct PromptOptions {
   std::string model_path;
+  std::string vision_model_path;
+  std::vector<std::string> image_paths;
   std::string prompt_text;
   std::string prompt_file;
   std::string system_prompt =

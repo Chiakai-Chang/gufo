@@ -278,7 +278,10 @@ std::optional<std::string> QwenChatTemplate::Render(
 
 std::optional<std::string> QwenChatTemplate::Render(
     std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
-    const ChatTemplateOptions& options, std::string* error_msg) {
+    const ChatTemplateOptions& options, std::string* error_msg,
+    std::vector<std::size_t>* image_offsets) {
+  if (image_offsets != nullptr)
+    image_offsets->clear();
   if (messages.empty()) {
     if (error_msg != nullptr) {
       *error_msg = "No messages provided";
@@ -290,7 +293,18 @@ std::optional<std::string> QwenChatTemplate::Render(
 
   std::size_t estimated_len = 0;
   for (const auto& msg : messages) {
-    estimated_len += msg.content.size() + msg.thought.size() + 32;
+    estimated_len +=
+        msg.content.size() + msg.thought.size() + 32 + msg.images.size() * 64;
+    std::size_t previous = 0;
+    for (const auto& image : msg.images) {
+      if (msg.role != ChatRole::kUser || image.bytes == nullptr ||
+          image.offset < previous || image.offset > msg.content.size()) {
+        if (error_msg != nullptr)
+          *error_msg = "invalid user image content";
+        return std::nullopt;
+      }
+      previous = image.offset;
+    }
     for (const auto& call : msg.tool_calls) {
       estimated_len += call.name.size() + 64;
       for (const auto& argument : call.arguments) {
@@ -378,7 +392,10 @@ std::optional<std::string> QwenChatTemplate::Render(
     output.append(role_name);
     output.push_back('\n');
 
-    const std::string_view content = Trim(msg.content);
+    // Image positions refer to the original text bytes. Preserve whitespace
+    // between text/image parts, as the official multimodal template does.
+    const std::string_view content =
+        msg.images.empty() ? Trim(msg.content) : std::string_view(msg.content);
     const std::string_view thought = Trim(msg.thought);
     if (msg.role == ChatRole::kAssistant &&
         !(thought.empty() && content.starts_with("<think>")) &&
@@ -388,7 +405,16 @@ std::optional<std::string> QwenChatTemplate::Render(
       output.append("\n</think>\n\n");
     }
 
-    output.append(content);
+    std::size_t cursor = 0;
+    for (const auto& image : msg.images) {
+      output.append(content.substr(cursor, image.offset - cursor));
+      output.append("<|vision_start|>");
+      if (image_offsets != nullptr)
+        image_offsets->push_back(output.size());
+      output.append("<|image_pad|><|vision_end|>");
+      cursor = image.offset;
+    }
+    output.append(content.substr(cursor));
     if (msg.role == ChatRole::kAssistant && !msg.tool_calls.empty()) {
       if (!content.empty()) {
         output.append("\n\n");
@@ -435,6 +461,15 @@ std::optional<std::vector<TokenId>> QwenChatTemplate::RenderAndTokenize(
     const QwenTokenizer& tokenizer, std::span<const ChatMessage> messages,
     std::span<const ChatTool> tools, const ChatTemplateOptions& options,
     std::string* error_msg) {
+  if (std::any_of(messages.begin(), messages.end(), [](const auto& message) {
+        return !message.images.empty();
+      })) {
+    if (error_msg != nullptr) {
+      *error_msg =
+          "image messages require the model's vision prompt preparation";
+    }
+    return std::nullopt;
+  }
   const auto rendered = Render(messages, tools, options, error_msg);
   if (!rendered.has_value()) {
     return std::nullopt;

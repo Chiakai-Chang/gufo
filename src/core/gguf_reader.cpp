@@ -491,7 +491,28 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
             str_arr.push_back(s);
           }
           meta_val.value = str_arr;
+        } else if (item_type == GgufValueType::kFloat32 ||
+                   item_type == GgufValueType::kFloat64) {
+          const auto bytes = item_type == GgufValueType::kFloat32 ? 4U : 8U;
+          if (offset > size_ || array_len > (size_ - offset) / bytes)
+            return false;
+          std::vector<double> values;
+          values.reserve(array_len);
+          for (std::uint64_t a = 0; a < array_len; ++a) {
+            double value = 0;
+            if (item_type == GgufValueType::kFloat32) {
+              float scalar = 0;
+              if (!ReadPod(data_, size_, offset, scalar))
+                return false;
+              value = scalar;
+            } else if (!ReadPod(data_, size_, offset, value)) {
+              return false;
+            }
+            values.push_back(value);
+          }
+          meta_val.value = std::move(values);
         } else if (item_type == GgufValueType::kUint32 ||
+                   item_type == GgufValueType::kBool ||
                    item_type == GgufValueType::kUint64) {
           std::vector<std::uint64_t> u_arr;
           u_arr.reserve(array_len);
@@ -503,6 +524,11 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
                 return false;
               }
               val = val32;
+            } else if (item_type == GgufValueType::kBool) {
+              std::uint8_t boolean = 0;
+              if (!ReadPod(data_, size_, offset, boolean) || boolean > 1)
+                return false;
+              val = boolean;
             } else {
               if (!ReadPod(data_, size_, offset, val)) {
                 return false;

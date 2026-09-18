@@ -46,7 +46,9 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
 
   EmitDecodeRouteTelemetry(weights_, policy_);
   const QwenGraphRejection graph_rejections = ResolveQwenGraphRejections(
-      compute_logits, use_split_k_decode, graph_executor_.IsEnabled());
+      compute_logits, use_split_k_decode,
+      graph_executor_.IsEnabled() &&
+          pos >= vision_input_.layout().PrefixLength());
   detail::EmitQwenGraphEligibility(
       graph_key_.execution_identity, graph_key_.workload_identity,
       static_cast<std::uint32_t>(graph_rejections));
@@ -66,17 +68,18 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
       const bool ok =
           graph_executor_.TryCapture(arena_.stream, graph_key_, [&]() {
             ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
-                              compute_logits);
+                              compute_logits, &vision_input_);
           });
       if (ok) {
         launch_captured_graph();
       } else {
         ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos,
-                          compute_logits);
+                          compute_logits, &vision_input_);
       }
     }
   } else {
-    ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos, compute_logits);
+    ExecuteDecodeStep(arena_, weights_, policy_, token_id, pos, compute_logits,
+                      &vision_input_);
   }
 
   if (!compute_logits) {

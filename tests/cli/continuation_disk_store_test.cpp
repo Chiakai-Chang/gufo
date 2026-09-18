@@ -796,7 +796,39 @@ void TestSharedPrefixBoundariesAndExactDedup() {
 
 }  // namespace
 
+void TestImageIdentitySurvivesRestart() {
+  TemporaryDirectory directory;
+  FakeRunner runner("image-cache-test");
+  const std::vector<TextRunnerToken> prompt{1, 248056, 3};
+  const std::vector<std::uint8_t> image_a{1, 2}, image_b{1, 3};
+  {
+    ContinuationDiskStore store(StoreOptions(directory.path()));
+    Expect(store
+               .Save(runner, prompt, *MakeSnapshot(runner, 10, prompt.size()),
+                     image_a)
+               .stored,
+           "first image is persisted");
+    Expect(store
+               .Save(runner, prompt, *MakeSnapshot(runner, 20, prompt.size()),
+                     image_b)
+               .stored,
+           "second image has an independent disk entry");
+  }
+  ContinuationDiskStore store(StoreOptions(directory.path()));
+  auto state = runner.CreateState();
+  Expect(store.RestoreLongestPrefix(runner, *state, prompt, image_a).restored &&
+             RequireFakeState(*state).value == 10,
+         "restart restores first image exactly");
+  Expect(store.RestoreLongestPrefix(runner, *state, prompt, image_b).restored &&
+             RequireFakeState(*state).value == 20,
+         "restart restores second image exactly");
+  Expect(!store.RestoreLongestPrefix(runner, *state, prompt).restored,
+         "text cannot restore a disk image continuation");
+  Expect(!store.Touch(runner, prompt), "disk dedup respects image identity");
+}
+
 int main() {
+  TestImageIdentitySurvivesRestart();
   TestSharedPrefixBoundariesAndExactDedup();
   TestSha256KnownVector();
   TestRestartRestoreAndCompatibilityIdentity();

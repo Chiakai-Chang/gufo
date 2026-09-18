@@ -13,7 +13,8 @@ namespace gufo::hip {
 __global__ void RoPEKernel(float* __restrict__ q, float* __restrict__ k,
                            std::uint32_t num_heads, std::uint32_t num_kv_heads,
                            std::uint32_t head_dim, std::uint32_t rotary_dim,
-                           std::uint32_t pos, float rope_theta) {
+                           std::uint32_t pos, float rope_theta,
+                           const models::qwen::vision::DeviceRope* rope) {
   const std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t half_rot = rotary_dim / 2;
   const std::size_t total_q_pairs =
@@ -29,7 +30,8 @@ __global__ void RoPEKernel(float* __restrict__ q, float* __restrict__ k,
     const float exponent =
         static_cast<float>(2 * pair) / static_cast<float>(rotary_dim);
     const float inv_freq = 1.0F / powf(rope_theta, exponent);
-    const float angle = static_cast<float>(pos) * inv_freq;
+    const float angle =
+        models::qwen::vision::RopePosition(rope, pos, pair) * inv_freq;
     const float cos_val = cosf(angle);
     const float sin_val = sinf(angle);
 
@@ -50,7 +52,8 @@ __global__ void RoPEKernel(float* __restrict__ q, float* __restrict__ k,
     const float exponent =
         static_cast<float>(2 * pair) / static_cast<float>(rotary_dim);
     const float inv_freq = 1.0F / powf(rope_theta, exponent);
-    const float angle = static_cast<float>(pos) * inv_freq;
+    const float angle =
+        models::qwen::vision::RopePosition(rope, pos, pair) * inv_freq;
     const float cos_val = cosf(angle);
     const float sin_val = sinf(angle);
 
@@ -69,7 +72,8 @@ __global__ void RoPEPtrKernel(float* __restrict__ q, float* __restrict__ k,
                               std::uint32_t num_kv_heads,
                               std::uint32_t head_dim, std::uint32_t rotary_dim,
                               const std::uint32_t* __restrict__ d_pos,
-                              float rope_theta) {
+                              float rope_theta,
+                              const models::qwen::vision::DeviceRope* rope) {
   const std::size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t half_rot = rotary_dim / 2;
   const std::size_t total_q_pairs =
@@ -87,7 +91,8 @@ __global__ void RoPEPtrKernel(float* __restrict__ q, float* __restrict__ k,
     const float exponent =
         static_cast<float>(2 * pair) / static_cast<float>(rotary_dim);
     const float inv_freq = 1.0F / powf(rope_theta, exponent);
-    const float angle = static_cast<float>(pos) * inv_freq;
+    const float angle =
+        models::qwen::vision::RopePosition(rope, pos, pair) * inv_freq;
     const float cos_val = cosf(angle);
     const float sin_val = sinf(angle);
 
@@ -108,7 +113,8 @@ __global__ void RoPEPtrKernel(float* __restrict__ q, float* __restrict__ k,
     const float exponent =
         static_cast<float>(2 * pair) / static_cast<float>(rotary_dim);
     const float inv_freq = 1.0F / powf(rope_theta, exponent);
-    const float angle = static_cast<float>(pos) * inv_freq;
+    const float angle =
+        models::qwen::vision::RopePosition(rope, pos, pair) * inv_freq;
     const float cos_val = cosf(angle);
     const float sin_val = sinf(angle);
 
@@ -125,7 +131,8 @@ __global__ void RoPEPtrKernel(float* __restrict__ q, float* __restrict__ k,
 void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
                 std::uint32_t num_kv_heads, std::uint32_t head_dim,
                 std::uint32_t rotary_dim, std::uint32_t pos, float rope_theta,
-                hipStream_t stream) {
+                hipStream_t stream,
+                const models::qwen::vision::DeviceRope* rope) {
   const std::size_t half_rot = rotary_dim / 2;
   const std::size_t total_pairs =
       std::max(static_cast<std::size_t>(num_heads) * half_rot,
@@ -133,13 +140,15 @@ void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
   const std::size_t block_size = 256;
   const std::size_t grid_size = (total_pairs + block_size - 1) / block_size;
   RoPEKernel<<<grid_size, block_size, 0, stream>>>(
-      q, k, num_heads, num_kv_heads, head_dim, rotary_dim, pos, rope_theta);
+      q, k, num_heads, num_kv_heads, head_dim, rotary_dim, pos, rope_theta,
+      rope);
 }
 
 void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
                 std::uint32_t num_kv_heads, std::uint32_t head_dim,
                 std::uint32_t rotary_dim, const std::uint32_t* d_pos,
-                float rope_theta, hipStream_t stream) {
+                float rope_theta, hipStream_t stream,
+                const models::qwen::vision::DeviceRope* rope) {
   const std::size_t half_rot = rotary_dim / 2;
   const std::size_t total_pairs =
       std::max(static_cast<std::size_t>(num_heads) * half_rot,
@@ -147,7 +156,8 @@ void LaunchRoPE(float* q, float* k, std::uint32_t num_heads,
   const std::size_t block_size = 256;
   const std::size_t grid_size = (total_pairs + block_size - 1) / block_size;
   RoPEPtrKernel<<<grid_size, block_size, 0, stream>>>(
-      q, k, num_heads, num_kv_heads, head_dim, rotary_dim, d_pos, rope_theta);
+      q, k, num_heads, num_kv_heads, head_dim, rotary_dim, d_pos, rope_theta,
+      rope);
 }
 
 }  // namespace gufo::hip

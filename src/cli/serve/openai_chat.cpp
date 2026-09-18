@@ -23,6 +23,7 @@
 
 #include "src/cli/serve/json.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/core/image.hpp"
 
 namespace gufo::server {
 namespace {
@@ -146,8 +147,9 @@ tokenization::ChatRole ParseRole(std::string_view role) {
   return tokenization::ChatRole::kUser;
 }
 
-bool ParseContent(const json::Value* content, std::string* output,
-                  std::string* error) {
+bool ParseContent(const json::Value* content,
+                  tokenization::ChatMessage* message, std::string* error) {
+  auto* output = &message->content;
   if (content == nullptr || content->is_null()) {
     return true;
   }
@@ -156,7 +158,7 @@ bool ParseContent(const json::Value* content, std::string* output,
     return true;
   }
   if (!content->is_array()) {
-    *error = "message content must be a string, null, or text-part array";
+    *error = "message content must be a string, null, or content-part array";
     return false;
   }
 
@@ -166,8 +168,37 @@ bool ParseContent(const json::Value* content, std::string* output,
       return false;
     }
     const std::string type = part.member_str("type", "text");
+    if (type == "image_url") {
+      const auto* image = part.find("image_url");
+      const auto* url =
+          image != nullptr && image->is_object() ? image->find("url") : nullptr;
+      if (message->role != tokenization::ChatRole::kUser || url == nullptr ||
+          !url->is_string() || message->images.size() >= 16) {
+        *error =
+            "image_url requires a user message and a string URL (at most 16 "
+            "images)";
+        return false;
+      }
+      // Resolution is model-owned; accept only the automatic policy rather
+      // than silently ignoring a requested low/high preprocessing policy.
+      const auto* detail = image->find("detail");
+      if (detail != nullptr &&
+          (!detail->is_string() || detail->get_str() != "auto")) {
+        *error = "image_url.detail supports only 'auto'";
+        return false;
+      }
+      try {
+        message->images.push_back(
+            {output->size(), std::make_shared<const std::vector<std::uint8_t>>(
+                                 core::ReadImageUrl(url->get_str()))});
+      } catch (const std::exception& exception) {
+        *error = exception.what();
+        return false;
+      }
+      continue;
+    }
     if (type != "text" && type != "input_text") {
-      *error = "only text message content is supported";
+      *error = "message content parts must use text or image_url";
       return false;
     }
     const json::Value* text = part.find("text");
@@ -219,7 +250,7 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
   message->role = ParseRole(role);
   message->name = value.member_str("name");
   message->tool_call_id = value.member_str("tool_call_id");
-  if (!ParseContent(value.find("content"), &message->content, error)) {
+  if (!ParseContent(value.find("content"), message, error)) {
     return false;
   }
   if (const json::Value* reasoning = value.find("reasoning_content");
@@ -1498,6 +1529,11 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     return NonStreamingResponse(backend, generation, initial_output_state);
   } catch (const TextGenerationError& exception) {
     return GenerationError(exception);
+  } catch (const std::invalid_argument& exception) {
+    return Error(400, "Bad Request", exception.what(), "invalid_prompt");
+  } catch (const std::length_error& exception) {
+    return Error(400, "Bad Request", exception.what(),
+                 "context_length_exceeded");
   }
 }
 

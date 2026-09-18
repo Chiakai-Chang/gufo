@@ -121,6 +121,38 @@ Session::~Session() {
   }
 }
 
+void Session::RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
+                                  hipStream_t stream) {
+  layout.Validate(max_context_);
+  const auto* previous = vision_input_.rope();
+  vision_input_.RestoreLayout(layout, stream);
+  for (auto& attention : attention_)
+    attention.rope = vision_input_.rope();
+  if (previous != vision_input_.rope()) {
+    for (const auto& [key, graph] : graphs_)
+      (void)hipGraphExecDestroy(graph);
+    graphs_.clear();
+    warmed_.clear();
+  }
+}
+
+void Session::ConfigureVision(
+    std::shared_ptr<const qwen::vision::Prompt> prompt,
+    std::shared_ptr<qwen::vision::Encoder> encoder, hipStream_t stream) {
+  if (prompt)
+    prompt->rope.Validate(max_context_);
+  const auto* previous = vision_input_.rope();
+  vision_input_.Configure(std::move(prompt), std::move(encoder), stream);
+  for (auto& attention : attention_)
+    attention.rope = vision_input_.rope();
+  if (previous != vision_input_.rope()) {
+    for (const auto& [key, graph] : graphs_)
+      (void)hipGraphExecDestroy(graph);
+    graphs_.clear();
+    warmed_.clear();
+  }
+}
+
 void Session::Reset() {
   position_ = 0;
   spec_tokens_ = 0;
@@ -1182,8 +1214,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
       prepared = AttentionF16Gemm(
           l.attn_qkv.data, static_cast<const __half*>(s_.x_half),
           l.attn_q_norm.f32(), l.attn_k_norm.f32(), s_.q, s_.attn_gate,
-          s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps,
-          stream_);
+          s.k_cache, s.v_cache, n_tokens, pos, c.rope_theta, c.rms_eps, stream_,
+          s.rope);
       if (!prepared) {
         AssignError(error_msg, "fused attention projection failed");
         return false;
@@ -1197,7 +1229,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                                   l.attn_k_norm.f32(), s_.q, s_.attn_gate,
                                   s.k_cache, s.v_cache, n_tokens, c.num_heads,
                                   c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
-                                  c.rope_theta, c.rms_eps, stream_);
+                                  c.rope_theta, c.rms_eps, stream_, s.rope);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -1221,9 +1253,9 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     RmsNormRows(s_.k, l.attn_k_norm.f32(), s_.k, n_tokens * c.num_kv_heads,
                 c.head_dim, 1, c.rms_eps, stream_);
     Rope(s_.q, n_tokens, c.num_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_);
+         c.rope_theta, stream_, s.rope);
     Rope(s_.k, n_tokens, c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
-         c.rope_theta, stream_);
+         c.rope_theta, stream_, s.rope);
     StoreKv(s_.k, s.k_cache, n_tokens, kv_row, pos, stream_);
     StoreKv(s_.v, s.v_cache, n_tokens, kv_row, pos, stream_);
   }
@@ -1246,7 +1278,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                 n_tokens * c.indexer_heads, c.indexer_head_dim, 1, c.rms_eps,
                 stream_);
     Rope(s_.iq, n_tokens, c.indexer_heads, c.indexer_head_dim, c.rotary_dim,
-         pos, c.rope_theta, stream_);
+         pos, c.rope_theta, stream_, s.rope);
     // Scoring already consumes half fragments. Convert each query once,
     // instead of repeating the conversion for every tile of cached keys.
     NarrowActivations(s_.iq, s_.iq_half, false,
@@ -1256,7 +1288,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     PoolIndexerBlocks(s.index_k, l.indexer_k_norm.f32(), s.block_k, first_block,
                       pos, n_tokens, pool_grid, c.compress_ratio,
                       c.indexer_head_dim, c.rotary_dim, c.rope_theta, c.rms_eps,
-                      index_capacity, stream_);
+                      index_capacity, stream_, s.rope);
     // Align score rows to full cache lines. The selector still considers
     // only complete causal blocks, so padding cannot change the ranking.
     const std::uint32_t blocks =
@@ -1618,7 +1650,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = n <= kVecBatch && pool_grid <= graph_pool_grid;
+  const bool graph = n <= kVecBatch && pool_grid <= graph_pool_grid &&
+                     session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(n_logits) << 16) |
                             (static_cast<std::uint64_t>(speculative) << 32) |
@@ -1684,6 +1717,8 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     }
     EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
                 s_.tokens, s_.res, n, c.hidden_size, c.hc_count, stream_);
+    session.vision_input_.Inject(s_.res, start_pos, n, c.hidden_size,
+                                 c.hc_count, stream_);
   }
   const auto& layers = model_->layers();
   bool normed = false;  ///< xn holds the next mixer's grouped norm of res
@@ -1831,7 +1866,7 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
 }
 
 constexpr std::array<char, 8> kSnapshotMagic{'Q', 'F', 'N', 'S',
-                                             'N', 'A', 'P', '2'};
+                                             'N', 'A', 'P', '3'};
 
 /// Fixed header ahead of the section bytes. It carries every geometry
 /// value the section sizes derive from, so a payload of another artifact
@@ -1852,6 +1887,7 @@ struct SnapshotHeader {
   std::uint32_t blocks;
   std::uint32_t mtp_position;
   std::uint32_t hidden_rows;
+  std::uint32_t image_count;
   std::array<std::int32_t, Config::kMaxPleNgram - 1> ngram_prev;
   std::uint64_t payload_bytes;
 };
@@ -1874,6 +1910,7 @@ SnapshotHeader MakeSnapshotHeader(const Config& c, bool has_mtp,
   h.ple_elems = c.ple_layer >= 0 ? c.PleConvHistory() * c.HcDim() : 0;
   h.has_mtp = has_mtp ? 1 : 0;
   h.position = session.position();
+  h.image_count = session.VisionLayout().images.size();
   return h;
 }
 
@@ -1975,7 +2012,8 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
       return 0;
     }
   }
-  return offset;
+  return offset +
+         std::uint64_t{h.image_count} * sizeof(qwen::vision::ImageGrid);
 }
 
 std::uint64_t Executor::SnapshotBytes(const Session& session,
@@ -2020,6 +2058,12 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     return false;
   }
   std::memcpy(payload.data(), &h, sizeof(h));
+  const auto grid_bytes =
+      std::size_t{h.image_count} * sizeof(qwen::vision::ImageGrid);
+  if (grid_bytes != 0) {
+    std::memcpy(payload.data() + payload.size() - grid_bytes,
+                session.VisionLayout().images.data(), grid_bytes);
+  }
   return WalkSnapshot(h, &session,
                       [&](void* device, std::uint64_t offset,
                           std::uint64_t bytes, const char* what) {
@@ -2051,9 +2095,10 @@ bool Executor::RestoreSnapshot(Session& session,
   }
   const std::uint32_t max_blocks =
       h.compress_ratio == 0 ? 0 : h.position / h.compress_ratio;
-  if (h.position == 0 || h.position > session.max_context_ ||
-      h.blocks > max_blocks || h.mtp_position > h.position ||
-      h.hidden_rows > h.position || h.hidden_rows > options_.max_batch ||
+  if (h.image_count > 256 || h.position == 0 ||
+      h.position > session.max_context_ || h.blocks > max_blocks ||
+      h.mtp_position > h.position || h.hidden_rows > h.position ||
+      h.hidden_rows > options_.max_batch ||
       (h.has_mtp == 0 && (h.mtp_position != 0 || h.hidden_rows != 0))) {
     AssignError(error_msg, "snapshot positions do not fit this session");
     return false;
@@ -2068,6 +2113,20 @@ bool Executor::RestoreSnapshot(Session& session,
                      return true;
                    }) != payload.size()) {
     AssignError(error_msg, "snapshot payload size does not match its header");
+    return false;
+  }
+  qwen::vision::RopeLayout layout;
+  layout.images.resize(h.image_count);
+  const auto grid_bytes =
+      layout.images.size() * sizeof(qwen::vision::ImageGrid);
+  if (grid_bytes != 0) {
+    std::memcpy(layout.images.data(),
+                payload.data() + payload.size() - grid_bytes, grid_bytes);
+  }
+  try {
+    layout.Validate(session.max_context_);
+  } catch (const std::exception& e) {
+    AssignError(error_msg, e.what());
     return false;
   }
   // The session's queued work targets buffers the copies overwrite.
@@ -2085,6 +2144,7 @@ bool Executor::RestoreSnapshot(Session& session,
     session.Reset();
     return false;
   }
+  session.RestoreVisionLayout(layout, stream_);
   session.position_ = h.position;
   session.blocks_ = h.blocks;
   session.mtp_.position = h.mtp_position;
@@ -2222,7 +2282,8 @@ bool Executor::MtpForward(Session& session,
   control_host_->blocks = session.blocks_;
   control_host_->mtp_position = pos;
   control_host_->hidden_row = hidden_row;
-  const bool graph = n <= kVecBatch;
+  const bool graph =
+      n <= kVecBatch && pos + 1 >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(hidden_row < 0) << 32) |
                             (std::uint64_t{1} << 40) |
@@ -2262,6 +2323,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   }
   EmbedTokens(model_->token_embd().data, SmallType(model_->token_embd().type),
               s_.tokens, s_.mtp_embd, n, c.hidden_size, 1, stream_);
+  session.vision_input_.Inject(s_.mtp_embd, pos + 1, n, c.hidden_size, 1,
+                               stream_);
   RmsNormRows(s_.mtp_embd, l.nextn_enorm.f32(), s_.mtp_embd, n, c.hidden_size,
               1, c.rms_eps, stream_);
   // The hidden input: kept trunk rows from `hidden_row`, or the block's
@@ -2279,6 +2342,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   Session::AttentionState attn;
+  attn.rope = session.vision_input_.rope();
   attn.k_cache = session.mtp_.k_cache;
   attn.v_cache = session.mtp_.v_cache;
   // The draft block's attention runs at its own position.

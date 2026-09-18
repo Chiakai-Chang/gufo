@@ -11,6 +11,8 @@
 
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "src/models/qwen/vision/encoder.hpp"
+#include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 
@@ -37,6 +39,7 @@ struct ModelOptions {
   std::string mtp_model_path;
   /// Maximum proposals per cycle; acceptance history selects the length.
   std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
+  std::string vision_model_path;
 };
 
 class Session;
@@ -74,6 +77,10 @@ public:
     return *tokenizer_;
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
+      const noexcept {
+    return vision_;
+  }
 
 private:
   Model() = default;
@@ -87,6 +94,7 @@ private:
   std::unique_ptr<NgramTable> ngram_;
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
+  std::shared_ptr<qwen::vision::Encoder> vision_;
 
   friend class Session;
 };
@@ -146,6 +154,7 @@ public:
     return tokens_;
   }
   void Reset();
+  void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy() noexcept { draft_length_.Reset(); }
 
@@ -159,7 +168,7 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 6;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 7;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent
@@ -199,6 +208,7 @@ private:
   std::uint32_t hidden_base_{0};  ///< first position whose hidden row is kept
   MtpLengthController draft_length_;
   SpeculativeStats stats_;
+  std::vector<std::uint8_t> image_identity_;
 };
 
 /// Immutable host copy of a session context. The same bytes restore in

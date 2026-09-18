@@ -48,6 +48,67 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
+struct QwenImageContext final : TextPromptContext {
+  std::shared_ptr<const models::qwen::vision::Prompt> prompt;
+};
+
+tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request) {
+  tokenization::ChatTemplateOptions options;
+  options.enable_thinking = request.reasoning.enabled.value_or(false);
+  options.preserve_thinking =
+      request.reasoning.preserve_thinking.value_or(true);
+  switch (request.reasoning.effort.value_or(ReasoningEffort::kXHigh)) {
+    case ReasoningEffort::kMinimal:
+    case ReasoningEffort::kLow:
+      options.reasoning_effort = tokenization::QwenReasoningEffort::kLow;
+      break;
+    case ReasoningEffort::kMedium:
+      options.reasoning_effort = tokenization::QwenReasoningEffort::kMedium;
+      break;
+    default:
+      options.reasoning_effort = tokenization::QwenReasoningEffort::kXHigh;
+  }
+  options.require_tool_call =
+      request.tool_choice == ChatRequest::ToolChoice::kRequired;
+  return options;
+}
+
+TextPreparedPrompt PrepareQwenPrompt(
+    const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
+    const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
+    std::uint32_t max_context) {
+  const bool has_images = std::ranges::any_of(
+      request.messages, [](const auto& m) { return !m.images.empty(); });
+  auto prompt = std::make_shared<models::qwen::vision::Prompt>(
+      models::qwen::vision::Prepare(
+          tokenizer, request.messages,
+          request.tool_choice == ChatRequest::ToolChoice::kNone
+              ? std::span<const tokenization::ChatTool>{}
+              : std::span<const tokenization::ChatTool>{request.tools},
+          QwenChatOptions(request),
+          encoder && has_images ? encoder->identity() : std::string_view{},
+          max_context));
+  if (prompt->images.empty())
+    return {std::move(prompt->tokens), {}};
+  if (!encoder)
+    throw std::invalid_argument(
+        "image input requires a matching --mmproj BF16 sidecar");
+  auto context = std::make_shared<QwenImageContext>();
+  context->cache_identity = prompt->cache_identity;
+  context->prompt = prompt;
+  return {prompt->tokens, std::move(context)};
+}
+
+std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
+    const std::shared_ptr<const TextPromptContext>& context) {
+  if (!context)
+    return {};
+  const auto* image = dynamic_cast<const QwenImageContext*>(context.get());
+  if (!image)
+    throw std::invalid_argument("invalid Qwen prompt context");
+  return image->prompt;
+}
+
 constexpr std::string_view kDeepSeekStateAbi =
     "deepseek-v4-flash-gfx1151-state-v4";
 constexpr std::array<std::uint8_t, 8> kQwenPersistentSnapshotMagic = {
@@ -592,6 +653,8 @@ public:
       throw std::overflow_error("Qwen snapshot size overflows");
     }
     checked_add(logits_count * sizeof(float));
+    checked_add(executor_->VisionLayout().images.size() *
+                sizeof(models::qwen::vision::ImageGrid));
     if (verifier_ != nullptr) {
       checked_add(verifier_->SnapshotPayloadBytes());
     }
@@ -793,32 +856,25 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
-    tokenization::ChatTemplateOptions options;
-    options.enable_thinking = request.reasoning.enabled.value_or(false);
-    options.preserve_thinking =
-        request.reasoning.preserve_thinking.value_or(true);
-    switch (request.reasoning.effort.value_or(ReasoningEffort::kXHigh)) {
-      case ReasoningEffort::kMinimal:
-      case ReasoningEffort::kLow:
-        options.reasoning_effort = tokenization::QwenReasoningEffort::kLow;
-        break;
-      case ReasoningEffort::kMedium:
-        options.reasoning_effort = tokenization::QwenReasoningEffort::kMedium;
-        break;
-      case ReasoningEffort::kHigh:
-      case ReasoningEffort::kXHigh:
-      case ReasoningEffort::kMax:
-        options.reasoning_effort = tokenization::QwenReasoningEffort::kXHigh;
-        break;
-    }
-    options.require_tool_call =
-        request.tool_choice == ChatRequest::ToolChoice::kRequired;
     return tokenization::QwenChatTemplate::RenderAndTokenize(
         model_->GetTokenizer(), request.messages,
         request.tool_choice == ChatRequest::ToolChoice::kNone
             ? std::span<const tokenization::ChatTool>{}
             : std::span<const tokenization::ChatTool>{request.tools},
-        options);
+        QwenChatOptions(request));
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    return PrepareQwenPrompt(request, model_->GetTokenizer(),
+                             model_->VisionEncoder(), max_context_);
+  }
+
+  void SetPromptContext(
+      TextRunnerState& state,
+      std::shared_ptr<const TextPromptContext> context) const override {
+    RequireQwenState(state).executor().ConfigureVision(QwenPrompt(context),
+                                                       model_->VisionEncoder());
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
@@ -2147,34 +2203,25 @@ public:
 
   [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
       const ChatRequest& request) const override {
-    // The artifact carries the pinned Qwen3.8 reasoning template (checked
-    // at load), so the compiled Qwen renderer applies as is.
-    tokenization::ChatTemplateOptions options;
-    options.enable_thinking = request.reasoning.enabled.value_or(false);
-    options.preserve_thinking =
-        request.reasoning.preserve_thinking.value_or(true);
-    switch (request.reasoning.effort.value_or(ReasoningEffort::kXHigh)) {
-      case ReasoningEffort::kMinimal:
-      case ReasoningEffort::kLow:
-        options.reasoning_effort = tokenization::QwenReasoningEffort::kLow;
-        break;
-      case ReasoningEffort::kMedium:
-        options.reasoning_effort = tokenization::QwenReasoningEffort::kMedium;
-        break;
-      case ReasoningEffort::kHigh:
-      case ReasoningEffort::kXHigh:
-      case ReasoningEffort::kMax:
-        options.reasoning_effort = tokenization::QwenReasoningEffort::kXHigh;
-        break;
-    }
-    options.require_tool_call =
-        request.tool_choice == ChatRequest::ToolChoice::kRequired;
     return tokenization::QwenChatTemplate::RenderAndTokenize(
         model_->tokenizer(), request.messages,
         request.tool_choice == ChatRequest::ToolChoice::kNone
             ? std::span<const tokenization::ChatTool>{}
             : std::span<const tokenization::ChatTool>{request.tools},
-        options);
+        QwenChatOptions(request));
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    return PrepareQwenPrompt(request, model_->tokenizer(),
+                             model_->VisionEncoder(), max_context_);
+  }
+
+  void SetPromptContext(
+      TextRunnerState& state,
+      std::shared_ptr<const TextPromptContext> context) const override {
+    RequireQwenFlashNextState(state).session().ConfigureVision(
+        QwenPrompt(context));
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
@@ -2549,14 +2596,14 @@ struct InferenceBackend::Impl {
     return state;
   }
 
-  Result GenerateScheduled(std::shared_ptr<const State> current,
-                           std::vector<TextRunnerToken> prompt_tokens,
-                           Clock::time_point request_start,
-                           std::size_t max_tokens,
-                           const sampling::SamplingConfig& sampling,
-                           const CancellationCheck& is_cancelled,
-                           const TokenCallback& on_token,
-                           std::string client_id) const {
+  Result GenerateScheduled(
+      std::shared_ptr<const State> current,
+      std::vector<TextRunnerToken> prompt_tokens,
+      Clock::time_point request_start, std::size_t max_tokens,
+      const sampling::SamplingConfig& sampling,
+      const CancellationCheck& is_cancelled, const TokenCallback& on_token,
+      std::string client_id,
+      std::shared_ptr<const TextPromptContext> context = {}) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -2577,6 +2624,7 @@ struct InferenceBackend::Impl {
               .client_id = std::move(client_id),
               .deadline = std::nullopt,
               .request_start = request_start,
+              .prompt_context = std::move(context),
           });
       result = request.Wait(on_token);
     } catch (...) {
@@ -2603,7 +2651,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             const TextSpeculativeConfig& speculative_config,
-                            const TextDiskCacheConfig& disk_cache_config) {
+                            const TextDiskCacheConfig& disk_cache_config,
+                            const std::string& vision_model_path) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
   std::string load_error;
@@ -2614,6 +2663,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
   if (reader->GetMetadataString("general.architecture") == "deepseek4") {
+    if (!vision_model_path.empty()) {
+      SetError(error, "DeepSeek does not support --mmproj");
+      return false;
+    }
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kDSpark) {
       SetError(error,
@@ -2703,6 +2756,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                     ? speculative_config.draft_model_path
                     : std::string{},
             .max_draft_tokens = speculative_config.max_draft_tokens,
+            .vision_model_path = vision_model_path,
         },
         &load_error);
     if (model == nullptr) {
@@ -2729,7 +2783,21 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config));
   }
-  auto model = hip::QwenGpuModel::CreateFromGguf(reader, &load_error);
+  std::shared_ptr<models::qwen::vision::Encoder> vision;
+  try {
+    if (reader->GetMetadataUint64("qwen35.embedding_length") == 5120) {
+      vision = models::qwen::vision::Encoder::Open(model_path,
+                                                   vision_model_path, 5120);
+    } else if (!vision_model_path.empty()) {
+      throw std::invalid_argument(
+          "image input supports Qwen3.8-27B and Flash-Next");
+    }
+  } catch (const std::exception& e) {
+    SetError(error, e.what());
+    return false;
+  }
+  auto model =
+      hip::QwenGpuModel::CreateFromGguf(reader, &load_error, std::move(vision));
   if (model == nullptr) {
     SetError(error, "Failed to create GPU model: " + load_error);
     return false;
@@ -2752,6 +2820,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)scheduler_policy;
   (void)speculative_config;
   (void)disk_cache_config;
+  (void)vision_model_path;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
 #endif
@@ -3164,13 +3233,14 @@ InferenceBackend::Result InferenceBackend::chat(
   if (state == nullptr) {
     return {};
   }
-  auto prompt_tokens = state->scheduler->runner().RenderAndTokenize(request);
-  if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
+  auto prompt = state->scheduler->runner().PreparePrompt(request);
+  if (!prompt.has_value() || prompt->tokens.empty()) {
     return {};
   }
-  return impl_->GenerateScheduled(state, std::move(*prompt_tokens),
+  return impl_->GenerateScheduled(state, std::move(prompt->tokens),
                                   request_start, max_tokens, sampling_config,
-                                  is_cancelled, on_token, request.client_id);
+                                  is_cancelled, on_token, request.client_id,
+                                  std::move(prompt->context));
 #else
   (void)request;
   (void)max_tokens;
@@ -3194,23 +3264,24 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
         request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
-  auto prompt_tokens = state->scheduler->runner().RenderAndTokenize(request);
-  if (!prompt_tokens.has_value() || prompt_tokens->empty()) {
+  auto prompt = state->scheduler->runner().PreparePrompt(request);
+  if (!prompt.has_value() || prompt->tokens.empty()) {
     return TextGenerationBackend::start_chat(
         request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
   Result error_result;
-  error_result.prompt_tokens = prompt_tokens->size();
+  error_result.prompt_tokens = prompt->tokens.size();
   error_result.client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   auto scheduled_request =
-      state->scheduler->Submit(std::move(*prompt_tokens), max_tokens,
+      state->scheduler->Submit(std::move(prompt->tokens), max_tokens,
                                sampling_config, is_cancelled, stream_output,
                                TextRequestMetadata{
                                    .client_id = error_result.client_id,
                                    .deadline = std::nullopt,
                                    .request_start = request_start,
+                                   .prompt_context = std::move(prompt->context),
                                });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), std::move(error_result));

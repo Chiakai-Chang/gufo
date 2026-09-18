@@ -11,6 +11,8 @@ function(add_qwen27b_test target source labels)
     SKIP_RETURN_CODE 77)
 endfunction()
 
+add_qwen27b_test(qwen27b_vision_test vision_test.cpp "cpu;vision;correctness")
+
 add_qwen27b_test(qwen_mtp_reference_test mtp_reference_test.cpp
   "cpu;mtp;external-model")
 if (ENGINE_ENABLE_HIP)
@@ -32,15 +34,23 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_dflash_noncausal_attention_ops_test attention_test.cpp
     "gpu;hip;dflash;dflash2;kernels")
   target_link_libraries(qwen_dflash_noncausal_attention_ops_test PRIVATE hip::host)
-  add_executable(inference_backend_gpu_test serving_test.cpp
+  add_library(qwen_serving_test_support STATIC
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_cache.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/logging.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
-  target_link_libraries(inference_backend_gpu_test PRIVATE
+  target_link_libraries(qwen_serving_test_support PUBLIC
     gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next hip::host)
+  add_executable(inference_backend_gpu_test serving_test.cpp)
+  target_link_libraries(inference_backend_gpu_test PRIVATE qwen_serving_test_support)
+  add_executable(qwen_vision_serving_test ../qwen/vision_serving_test.cpp)
+  target_link_libraries(qwen_vision_serving_test PRIVATE qwen_serving_test_support)
+  add_test(NAME qwen_vision_serving_test COMMAND qwen_vision_serving_test)
+  set_tests_properties(qwen_vision_serving_test PROPERTIES
+    LABELS "qwen27b;qwen38-flash-next;hip;gpu;vision;external-model"
+    SKIP_RETURN_CODE 77)
   add_test(NAME inference_backend_gpu_test COMMAND inference_backend_gpu_test)
   set_tests_properties(inference_backend_gpu_test PROPERTIES
     LABELS "qwen27b;hip;gpu;server;correctness;external-model"

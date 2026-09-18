@@ -614,6 +614,38 @@ void TestStreamingOverloadIsRejectedBeforeHeaders() {
   Expect(retry_after, "retryable overload advertises Retry-After");
 }
 
+void TestImagePartsRetainOrderAndIdentity() {
+  FakeBackend backend;
+  backend.pieces = {"ok"};
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+    "model":"test-model",
+    "messages":[{"role":"user","content":[
+      {"type":"text","text":"left"},
+      {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"auto"}},
+      {"type":"text","text":"right"},
+      {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,BAUG"}}
+    ]}]
+  })"),
+                                                       backend);
+  Expect(response.status == 200, "image content parts reach the backend");
+  const auto& message = backend.last_request.messages.front();
+  Expect(message.content == "leftright" && message.images.size() == 2,
+         "images do not become text placeholders before model preparation");
+  Expect(message.images[0].offset == 4 && message.images[1].offset == 9,
+         "image placement relative to text is preserved");
+  Expect(*message.images[0].bytes == std::vector<std::uint8_t>({1, 2, 3}) &&
+             *message.images[1].bytes == std::vector<std::uint8_t>({4, 5, 6}),
+         "each image retains its own decoded transport bytes");
+  for (
+      const auto* body :
+      {R"({"messages":[{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]}]})",
+       R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"low"}}]}]})",
+       R"({"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"file:///tmp/image.png"}}]}]})"}) {
+    Expect(gufo::server::HandleOpenAiChat(Request(body), backend).status == 400,
+           "unsupported image role, policy and URL are rejected");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -632,6 +664,7 @@ int main() {
   TestClientIdentityReachesBackend();
   TestInvalidClientIdentityIsRejected();
   TestStreamingOverloadIsRejectedBeforeHeaders();
+  TestImagePartsRetainOrderAndIdentity();
   std::cout << "All OpenAI chat protocol tests passed\n";
   return 0;
 }

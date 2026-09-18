@@ -464,7 +464,56 @@ void TestEntryReplacementLogsRemovedSnapshot() {
 
 }  // namespace
 
+void TestImageIdentityIsolation() {
+  for (const bool snapshot_mode : {false, true}) {
+    std::vector<std::size_t> invalidations(2);
+    std::size_t next_id = 0;
+    gufo::server::ContinuationCache::SnapshotSupport support;
+    if (snapshot_mode) {
+      support.capacity_bytes = [] { return std::size_t{1024}; };
+      support.restore = [](auto& state, const auto& snapshot) {
+        dynamic_cast<FakeState&>(state).value =
+            dynamic_cast<const FakeSnapshot&>(snapshot).value;
+      };
+    }
+    gufo::server::ContinuationCache cache(
+        2,
+        [&] { return std::make_unique<FakeState>(next_id++, &invalidations); },
+        std::move(support));
+    const std::vector<gufo::server::ContinuationToken> prompt{1, 248056, 3};
+    const std::vector<std::uint8_t> a{1, 2}, b{1, 3};
+    const auto save = [&](auto identity, std::size_t value) {
+      auto lease = cache.Acquire(prompt, {}, identity);
+      Expect(!lease.cache_hit(), "different image is a cold input");
+      dynamic_cast<FakeState&>(lease.state()).value = value;
+      if (snapshot_mode) {
+        Expect(lease.TryReserveSnapshot(sizeof(std::size_t), prompt.size()),
+               "snapshot admitted");
+        lease.Commit(prompt, std::make_unique<FakeSnapshot>(value));
+      } else {
+        lease.Commit(prompt);
+      }
+    };
+    save(a, 10);
+    save(b, 20);
+    for (const auto& [identity, value] :
+         std::vector<std::pair<std::vector<std::uint8_t>, std::size_t>>{
+             {a, 10}, {b, 20}}) {
+      auto lease = cache.Acquire(prompt, {}, identity);
+      Expect(lease.cache_hit(), "same image reuses its own prefix");
+      Expect(dynamic_cast<FakeState&>(lease.state()).value == value,
+             "image state cannot cross requests");
+      if (!snapshot_mode)
+        lease.Commit(prompt);
+    }
+    auto text = cache.Acquire(prompt);
+    Expect(!text.cache_hit(),
+           "literal image-pad text cannot reuse image state");
+  }
+}
+
 int main() {
+  TestImageIdentityIsolation();
   TestColdMissThenExactExtensionHit();
   TestDivergenceInvalidatesOldState();
   TestUncommittedLeaseIsInvalidated();

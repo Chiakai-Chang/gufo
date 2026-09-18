@@ -55,6 +55,7 @@ struct ScheduledRequest {
   std::uint64_t id{0};
   std::string client_id{"anonymous"};
   std::vector<TextRunnerToken> prompt;
+  std::shared_ptr<const TextPromptContext> prompt_context;
   std::size_t token_limit{1};
   sampling::SamplingConfig sampling;
   TextGenerationScheduler::CancellationCheck external_cancellation;
@@ -400,11 +401,13 @@ struct TextGenerationScheduler::Impl {
 
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
-            std::move(request->prompt), request->sampling, [weak_request] {
+            std::move(request->prompt), request->sampling,
+            [weak_request] {
               const auto request = weak_request.lock();
               return request == nullptr || CancellationRequested(request) ||
                      DeadlineExceeded(request);
-            });
+            },
+            std::move(request->prompt_context));
         if (!request->runner_request) {
           CompleteCancelled(request);
           continue;
@@ -1183,6 +1186,7 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->result.execution_plan =
       impl_->runner_pool->capacity() == 1 ? "serial-c1" : "serial-fallback";
   request->prompt = std::move(prompt);
+  request->prompt_context = std::move(metadata.prompt_context);
   request->token_limit = max_tokens > 0 ? max_tokens : 1;
   request->sampling = sampling;
   request->external_cancellation = is_cancelled;

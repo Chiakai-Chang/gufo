@@ -118,18 +118,20 @@ QwenGpuModel::QwenGpuModel(
     std::shared_ptr<const core::GgufReader> reader,
     models::QwenModelWeights weights,
     std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
-    std::vector<QwenGpuWeightRegion> weight_regions)
+    std::vector<QwenGpuWeightRegion> weight_regions,
+    std::shared_ptr<models::qwen::vision::Encoder> vision)
     : reader_(std::move(reader)),
       weights_(std::move(weights)),
       tokenizer_(std::move(tokenizer)),
-      weight_regions_(std::move(weight_regions)) {}
+      weight_regions_(std::move(weight_regions)),
+      vision_(std::move(vision)) {}
 
 QwenGpuModel::~QwenGpuModel() {
   ReleaseWeightRegions(weight_regions_);
 }
 
 std::size_t QwenGpuModel::GetResidentBytes() const noexcept {
-  std::size_t total = 0;
+  std::size_t total = vision_ ? vision_->ResidentBytes() : 0;
   for (const auto& region : weight_regions_) {
     if (region.size > std::numeric_limits<std::size_t>::max() - total) {
       return std::numeric_limits<std::size_t>::max();
@@ -140,7 +142,8 @@ std::size_t QwenGpuModel::GetResidentBytes() const noexcept {
 }
 
 std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
-    std::shared_ptr<const core::GgufReader> reader, std::string* error_msg) {
+    std::shared_ptr<const core::GgufReader> reader, std::string* error_msg,
+    std::shared_ptr<models::qwen::vision::Encoder> vision) {
   if (reader == nullptr) {
     if (error_msg != nullptr) {
       *error_msg = "GGUF reader must not be null";
@@ -204,7 +207,7 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
       std::move(tokenizer));
   return std::make_shared<const QwenGpuModel>(
       std::move(reader), std::move(*weights_opt), std::move(shared_tokenizer),
-      std::move(weight_regions));
+      std::move(weight_regions), std::move(vision));
 }
 
 std::unique_ptr<QwenGpuExecutor> QwenGpuExecutor::Create(

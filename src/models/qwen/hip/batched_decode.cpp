@@ -226,6 +226,11 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
                                scratch.decode.prompt_tokens.data(),
                                scratch.decode.hidden.data(), batch_size,
                                hidden_size, arena.stream);
+  for (std::size_t row = 0; row < items.size(); ++row) {
+    items[row].executor->vision_input_.Inject(
+        scratch.decode.hidden.data() + row * hidden_size, items[row].position,
+        1, hidden_size, 1, arena.stream);
+  }
   if (capture_replay) {
     // Embedding has consumed the token IDs. Reuse the buffer for the actual
     // per-session positions until every recurrent layer has captured its row.
@@ -288,8 +293,8 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
 
         LaunchRoPE(query, key, config.num_attention_heads,
                    config.num_key_value_heads, config.head_dim,
-                   config.rotary_dim, position, config.rope_theta,
-                   arena.stream);
+                   config.rotary_dim, position, config.rope_theta, arena.stream,
+                   items[row].executor->vision_input_.rope());
         const bool use_split_k = detail::IsSplitKDecodeAttentionSupported(
             static_cast<std::size_t>(position) + 1, config.num_attention_heads,
             config.num_key_value_heads, config.head_dim);
@@ -533,6 +538,12 @@ QwenGpuExecutor::ForwardVerificationBatch(
       weights_.token_embd.data, weights_.token_embd.type,
       scratch.decode.prompt_tokens.data(), scratch.decode.hidden.data(),
       batch_size, hidden_size, arena_.stream);
+  for (std::size_t index = 0; index < items.size(); ++index) {
+    items[index].executor->vision_input_.Inject(
+        scratch.decode.hidden.data() + offsets[index] * hidden_size,
+        items[index].position, items[index].tokens.size(), hidden_size, 1,
+        arena_.stream);
+  }
   HIP_CHECK(hipMemcpyAsync(scratch.decode.prompt_tokens.data(),
                            host_positions.data(),
                            batch_size * sizeof(std::uint32_t),
@@ -614,7 +625,8 @@ QwenGpuExecutor::ForwardVerificationBatch(
               attention_layer, start_pos, sequence_size,
               state_arena.GetMaxContext(), config.num_attention_heads,
               config.num_key_value_heads, config.head_dim, config.rotary_dim,
-              config.rope_theta, 1e-6F, arena_.stream);
+              config.rope_theta, 1e-6F, arena_.stream,
+              item.executor->vision_input_.rope());
           // Exact verification projections do not use weight dequantization
           // scratch. Reuse it for independent split-K rows without allocating
           // another buffer or changing the scalar decode workspace.
@@ -650,7 +662,7 @@ QwenGpuExecutor::ForwardVerificationBatch(
             LaunchRoPE(query, key, config.num_attention_heads,
                        config.num_key_value_heads, config.head_dim,
                        config.rotary_dim, position, config.rope_theta,
-                       arena_.stream);
+                       arena_.stream, item.executor->vision_input_.rope());
             LaunchAttention(
                 query, key,
                 (scratch.attention.v.data() + offset * kv_size) + row * kv_size,

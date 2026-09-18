@@ -363,6 +363,12 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     EmbedTokens(model_->token_embd().data,
                 EmbeddingType(model_->token_embd().type), base.tokens, base.res,
                 rows, c.hidden_size, c.hc_count, stream_);
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      items[i].session->vision_input_.Inject(
+          base.res + std::size_t{offsets[i]} * c.HcDim(),
+          items[i].session->position_, items[i].tokens.size(), c.hidden_size,
+          c.hc_count, stream_);
+    }
     const auto& layers = model_->layers();
     bool normed = false;
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {

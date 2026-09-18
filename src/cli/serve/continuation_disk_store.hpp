@@ -97,12 +97,14 @@ public:
   [[nodiscard]] SaveResult Save(
       const TextModelRunner& runner,
       std::span<const TextRunnerToken> checkpoint_tokens,
-      const TextRunnerSnapshot& snapshot);
+      const TextRunnerSnapshot& snapshot,
+      std::span<const std::uint8_t> input_identity = {});
 
   /// Restores the longest exact saved prefix of prompt into state.
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
       const TextModelRunner& runner, TextRunnerState& state,
-      std::span<const TextRunnerToken> prompt);
+      std::span<const TextRunnerToken> prompt,
+      std::span<const std::uint8_t> input_identity = {});
 
   /// Prefix lengths that prompt shares with stored entries but that no entry
   /// holds exactly.
@@ -116,12 +118,14 @@ public:
   /// prefilled again.
   [[nodiscard]] std::vector<std::size_t> SharedPrefixBoundaries(
       const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
-      std::size_t min_tokens, std::size_t max_boundaries);
+      std::size_t min_tokens, std::size_t max_boundaries,
+      std::span<const std::uint8_t> input_identity = {});
 
   /// Marks the exact entry for tokens as recently used without reading it.
   /// Returns false when no such entry exists.
   [[nodiscard]] bool Touch(const TextModelRunner& runner,
-                           std::span<const TextRunnerToken> tokens);
+                           std::span<const TextRunnerToken> tokens,
+                           std::span<const std::uint8_t> input_identity = {});
 
   [[nodiscard]] std::size_t entry_count() const noexcept;
   [[nodiscard]] std::size_t retained_bytes() const noexcept;

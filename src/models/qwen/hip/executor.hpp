@@ -27,6 +27,7 @@
 #include "src/models/qwen/hip/ops/gemm.hpp"
 #include "src/models/qwen/hip/ops/ssm.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
+#include "src/models/qwen/vision/device_input.hpp"
 
 namespace gufo::hip {
 
@@ -74,7 +75,8 @@ public:
   QwenGpuModel(std::shared_ptr<const core::GgufReader> reader,
                models::QwenModelWeights weights,
                std::shared_ptr<const tokenization::QwenTokenizer> tokenizer,
-               std::vector<QwenGpuWeightRegion> weight_regions);
+               std::vector<QwenGpuWeightRegion> weight_regions,
+               std::shared_ptr<models::qwen::vision::Encoder> vision = {});
   ~QwenGpuModel();
 
   QwenGpuModel(const QwenGpuModel&) = delete;
@@ -84,8 +86,13 @@ public:
 
   [[nodiscard]] static std::shared_ptr<const QwenGpuModel> CreateFromGguf(
       std::shared_ptr<const core::GgufReader> reader,
-      std::string* error_msg = nullptr);
+      std::string* error_msg = nullptr,
+      std::shared_ptr<models::qwen::vision::Encoder> vision = {});
 
+  [[nodiscard]] const std::shared_ptr<models::qwen::vision::Encoder>&
+  VisionEncoder() const noexcept {
+    return vision_;
+  }
   [[nodiscard]] const models::QwenModelWeights& GetWeights() const noexcept {
     return weights_;
   }
@@ -108,6 +115,7 @@ private:
   models::QwenModelWeights weights_;
   std::shared_ptr<const tokenization::QwenTokenizer> tokenizer_;
   std::vector<QwenGpuWeightRegion> weight_regions_;
+  std::shared_ptr<models::qwen::vision::Encoder> vision_;
 };
 
 class QwenGpuSnapshot final {
@@ -120,7 +128,8 @@ public:
   QwenGpuSnapshot& operator=(QwenGpuSnapshot&&) = delete;
 
   [[nodiscard]] std::size_t PayloadBytes() const noexcept {
-    return payload_bytes_;
+    return payload_bytes_ + vision_layout_.images.size() *
+                                sizeof(models::qwen::vision::ImageGrid);
   }
   [[nodiscard]] std::uint32_t ValidContext() const noexcept {
     return valid_context_;
@@ -135,6 +144,8 @@ public:
   [[nodiscard]] std::size_t CompactPayloadBytes() const;
   [[nodiscard]] std::size_t SerializeCompact(
       std::span<std::uint8_t> destination) const;
+  [[nodiscard]] static models::qwen::vision::RopeLayout ReadRopeLayout(
+      std::span<const std::uint8_t> payload);
 
 private:
   QwenGpuSnapshot() = default;
@@ -160,6 +171,8 @@ private:
       QwenRecurrentStateStorage::kFp32};
 
   friend class QwenGpuArena;
+  friend class QwenGpuExecutor;
+  models::qwen::vision::RopeLayout vision_layout_;
 };
 
 /// Shared decode-lifetime workspaces over stable arena allocations.
@@ -312,6 +325,7 @@ public:
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
+
   [[nodiscard]] std::unique_ptr<QwenGpuSnapshot> SaveSnapshot(
       std::uint32_t valid_context);
   void RestoreSnapshot(const QwenGpuSnapshot& snapshot);
@@ -496,6 +510,16 @@ public:
       const core::ModelConfig& config, std::uint32_t max_context,
       QwenExecutionPolicy policy = QwenExecutionPolicy::Production());
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const;
+  void ConfigureVision(
+      std::shared_ptr<const models::qwen::vision::Prompt> prompt,
+      std::shared_ptr<models::qwen::vision::Encoder> encoder);
+  [[nodiscard]] models::qwen::vision::DeviceInput& VisionInput() noexcept {
+    return vision_input_;
+  }
+  [[nodiscard]] const models::qwen::vision::RopeLayout& VisionLayout()
+      const noexcept {
+    return vision_input_.layout();
+  }
   [[nodiscard]] std::unique_ptr<QwenGpuSnapshot> SaveSnapshot(
       std::uint32_t valid_context);
   void RestoreSnapshot(const QwenGpuSnapshot& snapshot);
@@ -530,6 +554,7 @@ private:
   QwenGpuArena arena_;
   const detail::HipGraphCaptureKey graph_key_;
   detail::HipGraphDecodeExecutor graph_executor_;
+  models::qwen::vision::DeviceInput vision_input_;
   std::vector<float> h_logits_;
   std::vector<float> h_prompt_hidden_;
   std::vector<float> h_verification_hidden_;

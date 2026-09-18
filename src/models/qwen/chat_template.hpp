@@ -56,6 +56,13 @@ struct ChatMessage {
   std::string name;     ///< Optional function/tool name
   std::string thought;  ///< Optional thinking/reasoning prefix
   std::string tool_call_id;
+  struct ImagePart {
+    /// Insert an image before this byte of content. Equal offsets preserve
+    /// input order; image-only messages use offset zero.
+    std::size_t offset{0};
+    std::shared_ptr<const std::vector<std::uint8_t>> bytes;
+  };
+  std::vector<ImagePart> images;
 
   struct ToolArgument {
     std::string name;
@@ -150,8 +157,8 @@ public:
 
   [[nodiscard]] static std::optional<std::string> Render(
       std::span<const ChatMessage> messages, std::span<const ChatTool> tools,
-      const ChatTemplateOptions& options = {},
-      std::string* error_msg = nullptr);
+      const ChatTemplateOptions& options = {}, std::string* error_msg = nullptr,
+      std::vector<std::size_t>* image_offsets = nullptr);
 
   /// Formats messages and tokenizes the rendered prompt with the given
   /// tokenizer.
