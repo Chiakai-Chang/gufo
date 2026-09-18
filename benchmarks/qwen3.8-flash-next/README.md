@@ -36,7 +36,7 @@ Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1481.68 | 1509.77 |
+| 0 | 1481.68 | 1523.15 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
 | 32768 | 1396.57 | TODO |
@@ -45,9 +45,9 @@ Rates are tok/s; profiler timings are excluded.
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.11 | 43.71 | 71.0% |
+| Greedy | 0 | 26.33 | 44.73 | 71.0% |
 | Greedy | 32768 | TODO | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 44.80 | 75.9% |
+| Temperature 0.7 | 0 | TODO | 45.35 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
 AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
@@ -87,9 +87,10 @@ Snapshots preserve this state; new HTTP requests reset it when reusing
 context. Decisions never depend on wall-clock timings.
 
 Retained optimizations: SSM/QKV projection tiling, F16 SSM output activations,
-grouped Q4_K/Q5_K expert verification with fused SwiGLU, exact partial top-64
-selection, GPU verification logits with one frontier readback, and parallel
-unordered verification with the original F32 sum order.
+grouped Q4_K/Q5_K expert verification with fused SwiGLU, single-launch
+Q5_1/Q8_0 down projections, exact partial top-64 selection, GPU verification
+logits with one frontier readback, and parallel unordered verification with
+the original F32 sum order.
 F16 SSM output reduces numerical error with unchanged model throughput and
 no additional allocation. Larger sparse-attention tiles and wider DeltaNet
 row reductions were slower. Compact attention scratch gave no material gain.

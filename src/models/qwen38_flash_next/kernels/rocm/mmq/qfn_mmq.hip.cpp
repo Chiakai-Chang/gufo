@@ -434,30 +434,20 @@ static int moe_vector_projection(int weight_type, const void* W,
     }
     return 0;
   }
-  const int col_cap = mmvq_moe_max_batch(type);
-  // Gate and up share one Q8 input. Preserve each projection's column
-  // order, including the tuned per-format chunk limit.
+  // Gate and up share one Q8 input. Each projection covers every slot in
+  // one grid; the kernel retains the per-format number of waves per block.
   for (int projection = 0; projection < (W_b ? 2 : 1); ++projection) {
     const void* weights = projection == 0 ? W : W_b;
     float* output = projection == 0 ? out_f32 : out_b;
-    for (int c0 = 0; c0 < n_tokens; c0 += col_cap) {
-      const int ncols = std::min(n_tokens - c0, col_cap);
-      mul_mat_vec_moe_dispatch(
-          weights, type,
-          reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr) +
-              size_t(c0) * input_stride,
-          ids + size_t(c0) * n_expert_used,
-          output + int64_t(c0) * n_expert_used * M, K, M, ncols, n_expert_used,
-          input_stride, stream);
+    mul_mat_vec_moe_dispatch(
+        weights, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr),
+        ids, output, K, M, n_tokens, n_expert_used, input_stride, stream);
 
-      err = hipGetLastError();
-      if (err != hipSuccess) {
-        fprintf(stderr,
-                "%s: mul_mat_vec_moe_dispatch launch failed: %s (cols %d..%d "
-                "cap %d)\n",
-                tag, hipGetErrorString(err), c0, c0 + ncols - 1, col_cap);
-        return -3;
-      }
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+      fprintf(stderr, "%s: mul_mat_vec_moe_dispatch launch failed: %s\n",
+              tag, hipGetErrorString(err));
+      return -3;
     }
   }
 

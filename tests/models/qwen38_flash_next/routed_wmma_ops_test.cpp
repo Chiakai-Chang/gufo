@@ -487,7 +487,7 @@ void CheckVectorGrouping(bool down = false) {
   constexpr std::size_t guard = 16;
   constexpr float poison = -1234567.0F;
   const std::vector<q::WeightType> formats =
-      down ? std::vector{q::WeightType::kQ8_0}
+      down ? std::vector{q::WeightType::kQ5_1, q::WeightType::kQ8_0}
            : std::vector{q::WeightType::kQ4_K, q::WeightType::kQ5_K,
                          q::WeightType::kQ5_1, q::WeightType::kQ8_0};
   std::vector<float> x(tokens * cols);
@@ -510,8 +510,10 @@ void CheckVectorGrouping(bool down = false) {
   for (int rows : {down ? 2560 : 64, down ? 2561 : 65}) {
     std::vector<Experts> weights, paired_weights;
     if (down) {
-      weights = {MakeQ8_0(experts, rows, cols, 23)};
-      paired_weights = {MakeQ8_0(experts, rows, cols, 83)};
+      weights = {MakeQ5_1(experts, rows, cols, 17),
+                 MakeQ8_0(experts, rows, cols, 23)};
+      paired_weights = {MakeQ5_1(experts, rows, cols, 79),
+                        MakeQ8_0(experts, rows, cols, 83)};
     } else {
       weights = {
           MakeQ4K(experts, rows, cols, 11), MakeQ5K(experts, rows, cols, 13),
@@ -570,8 +572,9 @@ void CheckVectorGrouping(bool down = false) {
                           used, nullptr))
         throw std::runtime_error("paired reference projection failed");
       const auto reference_b = check_output(paired_scalar, tokens);
-      const auto widths = down ? std::vector{2, 3, 4, 7, 8, 10, 40, 80}
-                               : std::vector{2, 3, 4, 7, 8};
+      const auto widths =
+          down ? std::vector{2, 3, 4, 7, 8, 10, 20, 21, 30, 40, 79, 80}
+               : std::vector{2, 3, 4, 7, 8};
       for (int n : widths) {
         CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
                            hipMemcpyHostToDevice),

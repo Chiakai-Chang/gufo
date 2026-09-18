@@ -89,7 +89,8 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
   constexpr vec_dot_q_hip_t vec_dot_q_hip = get_vec_dot_q_hip(type);
 
   const bool is_up = gated && threadIdx.y != 0;
-  const uint32_t token_idx = gated ? 0 : threadIdx.y;
+  const uint32_t token_idx =
+      gated ? 0 : blockIdx.z * blockDim.y + threadIdx.y;
   const void* vx = is_up ? up_weights : weights;
   const int row0 = c_rows_per_block * blockIdx.x;
   const int blocks_per_row_x = ncols_x / qk;
@@ -327,11 +328,13 @@ static void launch_moe(const void* weights, const block_q8_1* input,
                        int tokens, int experts_used, int input_stride,
                        hipStream_t stream) {
   GGML_ASSERT(k % ggml_blck_size(type) == 0 && rows > 0);
-  GGML_ASSERT(tokens > 0 && tokens <= mmvq_moe_max_batch(type));
+  GGML_ASSERT(tokens > 0);
+  const int block_tokens = std::min(tokens, mmvq_moe_max_batch(type));
   const int row_stride = k / ggml_blck_size(type);
   mul_mat_vec_q_moe<type, rows_per_wave>
-      <<<dim3((rows + rows_per_wave - 1) / rows_per_wave, experts_used),
-         dim3(32, tokens), 0, stream>>>(
+      <<<dim3((rows + rows_per_wave - 1) / rows_per_wave, experts_used,
+              (tokens + block_tokens - 1) / block_tokens),
+         dim3(32, block_tokens), 0, stream>>>(
           weights, input, ids, output, k, rows, row_stride, input_stride,
           rows * experts_used, rows * row_stride, rows, tokens, experts_used);
 }
@@ -342,6 +345,20 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
                              int input_stride, hipStream_t stream) {
     switch (type) {
         case GGML_TYPE_Q5_1:
+          // Down projection slots have independent inputs. Wider row tiles
+          // reuse each short input without changing its dot-product sum.
+          if (k == 640 && experts_used == 1 && tokens > 1) {
+            if (tokens > 20) {
+              launch_moe<GGML_TYPE_Q5_1, 8>(
+                  weights, input, ids, output, k, rows, tokens, experts_used,
+                  input_stride, stream);
+            } else {
+              launch_moe<GGML_TYPE_Q5_1, 4>(
+                  weights, input, ids, output, k, rows, tokens, experts_used,
+                  input_stride, stream);
+            }
+            break;
+          }
             launch_moe<GGML_TYPE_Q5_1>(weights, input, ids, output, k, rows, tokens,
                                           experts_used, input_stride, stream);
             break;
