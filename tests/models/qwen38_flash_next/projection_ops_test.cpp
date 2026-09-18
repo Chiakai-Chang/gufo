@@ -622,8 +622,6 @@ void CheckDecodeGrouping(int rows, int cols) {
                        hipMemcpyDeviceToHost),
              "scalar output");
     for (int n = 2; n <= (gated ? 8 : tokens); ++n) {
-      if (n > 8 && n % 8 != 0)
-        continue;
       CheckHip(hipMemset(out, 0xA5, batch.size() * sizeof(float)),
                "decode output guard");
       if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, dq, out, rows,
@@ -643,6 +641,34 @@ void CheckDecodeGrouping(int rows, int cols) {
           throw std::runtime_error("Q8 batch projection overwrote its guard");
       }
     }
+  }
+  // The MTP shortlist shares Q4 weight reads across independent inputs.
+  // Every width must retain scalar logits and leave inactive output rows.
+  if (qfn_mmq_requantize_q8_0_q4_0(dw, dg, rows, cols, nullptr))
+    throw std::runtime_error("batched Q4 weight conversion failed");
+  for (int t = 0; t < 8; ++t) {
+    const auto* qrow =
+        static_cast<const std::uint8_t*>(dq) + t * qfn_mmq_q8_1_bytes(1, cols);
+    if (qfn_mmq_q4_0_dense_vec_preq(dg, qrow, out + t * rows, rows, cols, 1,
+                                    nullptr))
+      throw std::runtime_error("scalar Q4 head failed");
+  }
+  std::vector<float> scalar(8 * rows), batch(8 * rows + 4);
+  CheckHip(hipMemcpy(scalar.data(), out, scalar.size() * sizeof(float),
+                     hipMemcpyDeviceToHost),
+           "scalar Q4 download");
+  for (int n = 2; n <= 8; ++n) {
+    CheckHip(hipMemset(out, 0xA5, batch.size() * sizeof(float)), "Q4 guard");
+    if (qfn_mmq_q4_0_dense_vec_preq(dg, dq, out, rows, cols, n, nullptr))
+      throw std::runtime_error("batched Q4 head failed");
+    CheckHip(hipMemcpy(batch.data(), out, batch.size() * sizeof(float),
+                       hipMemcpyDeviceToHost),
+             "batched Q4 download");
+    if (std::memcmp(scalar.data(), batch.data(), n * rows * sizeof(float)))
+      throw std::runtime_error("Q4 head grouping changed logits");
+    for (std::size_t i = std::size_t(n) * rows; i < batch.size(); ++i)
+      if (std::bit_cast<std::uint32_t>(batch[i]) != 0xA5A5A5A5U)
+        throw std::runtime_error("Q4 head overwrote its guard");
   }
   for (void* ptr :
        {dw, dg, static_cast<void*>(dx), dq, static_cast<void*>(out)})
@@ -697,7 +723,8 @@ void CheckMtpOutputHead(float input_scale) {
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "MTP capture");
   if (qfn_mmq_requantize_q8_0_q4_0(dw, dpacked + 32, rows, cols, stream) ||
-      qfn_mmq_q4_0_dense_vec_preq(dpacked + 32, dq, dy + 4, rows, cols, stream))
+      qfn_mmq_q4_0_dense_vec_preq(dpacked + 32, dq, dy + 4, rows, cols, 1,
+                                  stream))
     throw std::runtime_error("MTP head launch failed");
   CheckHip(hipStreamEndCapture(stream, &graph), "MTP capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),

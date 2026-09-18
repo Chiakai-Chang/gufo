@@ -443,10 +443,26 @@ struct Session::PendingDecode {
   bool sampled{false};
   bool gpu_greedy{false};
   bool gpu_verification{false};
+  std::size_t width{0};
+  std::optional<sampling::SamplerState> draft_sampler;
+  std::uint64_t draft_rng{0};
+  MtpCandidateLogits candidates;
+  std::int32_t draft{0};
 };
 
+void Session::AppendDraft(PendingDecode& pending) {
+  if (pending.sampled) {
+    pending.proposals.push_back(SampleMtpProposal(
+        pending.candidates, *pending.draft_sampler, &pending.draft_rng));
+    pending.draft = static_cast<std::int32_t>(pending.proposals.back().token);
+    pending.draft_sampler->Accept(pending.proposals.back().token);
+  }
+  pending.chain.push_back(pending.draft);
+}
+
 bool Session::PrepareDecode(const DecodeRequest& request,
-                            PendingDecode* pending, std::string* error_msg) {
+                            PendingDecode* pending, std::string* error_msg,
+                            bool defer_head) {
   const auto max_tokens = request.max_tokens;
   auto& sampler = *request.sampler;
   auto* result = request.result;
@@ -491,40 +507,19 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
   const bool gpu_verification = sampled || gpu_greedy;
-  MtpCandidateLogits candidates;
-  if (!DraftCatchUp(anchor, true, error_msg, sampled ? &candidates : nullptr)) {
+  if (!DraftCatchUp(anchor, !defer_head, error_msg,
+                    sampled && !defer_head ? &pending->candidates : nullptr)) {
     return false;
   }
   // A cycle-local proposal stream needs no pending RNG state in snapshots.
   // Target verification keeps its own draws after this independent seed.
-  std::uint64_t draft_rng =
+  pending->draft_rng =
       sampled ? sampling::NextRandom(sampler.mutable_rng_state()) : 0;
-  auto draft_sampler = sampler;
-  draft_sampler.Accept(static_cast<sampling::TokenId>(anchor));
-  std::vector<MtpProposal> proposals;
-  std::vector<std::int32_t> chain{anchor};
-  std::int32_t draft = draft_token_;
-  while (chain.size() < width) {
-    if (sampled) {
-      proposals.push_back(
-          SampleMtpProposal(candidates, draft_sampler, &draft_rng));
-      draft = static_cast<std::int32_t>(proposals.back().token);
-      draft_sampler.Accept(proposals.back().token);
-    }
-    chain.push_back(draft);
-    if (chain.size() < width) {
-      if (!exec.MtpForward(*session_, std::span<const std::int32_t>(&draft, 1),
-                           -1,
-                           {.token = sampled ? nullptr : &draft,
-                            .candidates = sampled ? &candidates : nullptr},
-                           error_msg)) {
-        return false;
-      }
-    }
-  }
-
-  pending->chain = std::move(chain);
-  pending->proposals = std::move(proposals);
+  pending->draft_sampler = sampler;
+  pending->draft_sampler->Accept(static_cast<sampling::TokenId>(anchor));
+  pending->chain = {anchor};
+  pending->draft = draft_token_;
+  pending->width = width;
   pending->base = base;
   pending->speculative = true;
   pending->sampled = sampled;
@@ -532,6 +527,19 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   pending->gpu_verification = gpu_verification;
   if (!gpu_verification && verify_logits_.empty()) {
     verify_logits_.resize(exec.max_speculative() * model_->VocabSize());
+  }
+  if (!defer_head) {
+    while (pending->chain.size() < width) {
+      AppendDraft(*pending);
+      if (pending->chain.size() < width &&
+          !exec.MtpForward(
+              *session_, std::span<const std::int32_t>(&pending->draft, 1), -1,
+              {.token = sampled ? nullptr : &pending->draft,
+               .candidates = sampled ? &pending->candidates : nullptr},
+              error_msg)) {
+        return false;
+      }
+    }
   }
   return true;
 }
@@ -697,12 +705,45 @@ bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
   }
   auto& exec = *requests.front().session->model_->executor_;
   std::vector<PendingDecode> pending(requests.size());
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    const auto& r = requests[i];
+    if (!r.session->PrepareDecode(r, &pending[i], error_msg, true)) {
+      return false;
+    }
+  }
+  // Advance one proposal round across ready sessions. Their draft bodies,
+  // probability distributions and RNG streams remain private; only the
+  // vocabulary projection shares weight reads.
+  for (;;) {
+    std::vector<rocm::Executor::MtpHeadItem> heads;
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      auto& p = pending[i];
+      if (p.speculative && p.chain.size() < p.width) {
+        heads.push_back({requests[i].session->session_.get(),
+                         {.token = p.sampled ? nullptr : &p.draft,
+                          .candidates = p.sampled ? &p.candidates : nullptr}});
+      }
+    }
+    if (heads.empty())
+      break;
+    if (!exec.MtpHeads(heads, error_msg))
+      return false;
+    for (std::size_t i = 0; i < requests.size(); ++i) {
+      auto& p = pending[i];
+      if (!p.speculative || p.chain.size() >= p.width)
+        continue;
+      AppendDraft(p);
+      if (p.chain.size() < p.width &&
+          !exec.MtpForward(*requests[i].session->session_,
+                           std::span<const std::int32_t>(&p.draft, 1), -1, {},
+                           error_msg)) {
+        return false;
+      }
+    }
+  }
   std::vector<rocm::Executor::BatchItem> items;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& r = requests[i];
-    if (!r.session->PrepareDecode(r, &pending[i], error_msg)) {
-      return false;
-    }
     if (!pending[i].chain.empty()) {
       items.push_back({r.session->session_.get(), pending[i].chain,
                        pending[i].speculative});

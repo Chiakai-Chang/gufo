@@ -47,7 +47,9 @@ size_t qfn_mmq_q8_1_bytes(int N, int K);
 int qfn_mmq_quantize_q8_1(const float* X_f32, void* X_q8, int N, int K,
                           hipStream_t stream);
 
-// Exact vector arithmetic for 1–8 rows, or 16/24/32 ungated rows.
+// Exact vector arithmetic for 1–8 rows, or up to 32 ungated rows. Above eight,
+// input storage must include initialized padding to a multiple of eight.
+// Only N output rows are written.
 int qfn_mmq_q8_0_dense_vec_preq(const void * W_q8_0, const void * W_gate,
                                 const void * X_q8, float * out_f32, int M,
                                 int N, int K, hipStream_t stream);
@@ -56,7 +58,7 @@ int qfn_mmq_requantize_q8_0_q4_0(const void* source, void* destination,
                                  int rows, int cols, hipStream_t stream);
 
 int qfn_mmq_q4_0_dense_vec_preq(const void* weights, const void* input,
-                                float* output, int rows, int cols,
+                                float* output, int rows, int cols, int tokens,
                                 hipStream_t stream);
 
 // Recompute selected rows with the full Q8 GEMV's arithmetic. Output remains

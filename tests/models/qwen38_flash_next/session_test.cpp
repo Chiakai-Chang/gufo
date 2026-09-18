@@ -62,22 +62,26 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   }
   // Exercise the AR serving entrypoint, including a session crossing 4K.
   for (const std::size_t width : {2, 4, 6, 8}) {
-    std::vector<qfn::Session::AdvanceRequest> advances;
-    for (std::size_t i = 0; i < width; ++i) {
-      const auto token = static_cast<std::int32_t>(
-          std::max_element(serial[i]->Logits().begin(),
-                           serial[i]->Logits().end()) -
-          serial[i]->Logits().begin());
-      Require(serial[i]->Evaluate(token, &error), error);
-      advances.push_back({batched[i].get(), token});
-      serial_samplers[i].Accept(token);
-      batch_samplers[i].Accept(token);
-    }
-    Require(qfn::Session::EvaluateBatch(advances, &error), error);
-    for (std::size_t i = 0; i < width; ++i) {
-      RequireExact(serial[i]->Logits(), batched[i]->Logits(),
-                   "batched AR frontier differs at C" + std::to_string(width) +
-                       " row " + std::to_string(i));
+    // Reuse cohorts with different tokens and positions in the same
+    // allocations.
+    for (unsigned replay = 0; replay < 2; ++replay) {
+      std::vector<qfn::Session::AdvanceRequest> advances;
+      for (std::size_t i = 0; i < width; ++i) {
+        const auto token = static_cast<std::int32_t>(
+            std::max_element(serial[i]->Logits().begin(),
+                             serial[i]->Logits().end()) -
+            serial[i]->Logits().begin());
+        Require(serial[i]->Evaluate(token, &error), error);
+        advances.push_back({batched[i].get(), token});
+        serial_samplers[i].Accept(token);
+        batch_samplers[i].Accept(token);
+      }
+      Require(qfn::Session::EvaluateBatch(advances, &error), error);
+      for (std::size_t i = 0; i < width; ++i) {
+        RequireExact(serial[i]->Logits(), batched[i]->Logits(),
+                     "batched AR frontier differs at C" +
+                         std::to_string(width) + " row " + std::to_string(i));
+      }
     }
     // Different budgets create ragged chains and include ordinary one-token
     // decoding in the same batch as speculative verification.
@@ -302,10 +306,12 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
 }
 
 int main(int argc, char** argv) {
-  if (argc != 5 || std::string_view(argv[1]) != "--model" ||
+  const bool batch_only =
+      argc == 6 && std::string_view(argv[5]) == "--batch-only";
+  if ((argc != 5 && !batch_only) || std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
-    std::cerr
-        << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf\n";
+    std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
+                 "[--batch-only]\n";
     return 77;
   }
   try {
@@ -316,6 +322,8 @@ int main(int argc, char** argv) {
         &error);
     Require(model != nullptr, error);
     CheckBatchedSessions(model);
+    if (batch_only)
+      return 0;
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. "
         "Strix Halo executes this deterministic benchmark sequence. ");

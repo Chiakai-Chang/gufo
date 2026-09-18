@@ -155,6 +155,7 @@ Executor::~Executor() {
   (void)hipFree(batch_logits_);
   (void)hipFree(batch_q8_);
   (void)hipHostFree(batch_controls_);
+  (void)hipHostFree(batch_candidates_host_);
   for (void* p : allocations_) {
     (void)hipFree(p);
   }
@@ -1456,24 +1457,14 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
     if (!Quantize(s_.mixed, 1, output.cols, &input, error_msg))
       return false;
     if (qfn_mmq_q4_0_dense_vec_preq(output.data, input.data, s_.logits,
-                                    output.rows, output.cols, stream_) != 0) {
+                                    output.rows, output.cols, 1,
+                                    stream_) != 0) {
       AssignError(error_msg, "MTP shortlist projection failed");
       return false;
     }
-    MtpShortlist(s_.logits, s_.mtp_ids, s_.mtp_scratch_ids, output.rows,
-                 stream_);
-    // Keep the same input quantization and Q8 dot/reduction order as the full
-    // head. Only the proposed support is approximated; target p/q verification
-    // consumes the actual resulting proposal distribution.
-    if (qfn_mmq_q8_0_selected_vec_preq(
-            model_->output().data, input.data, s_.mtp_ids, s_.logits,
-            std::min<std::uint32_t>(output.rows, kMtpShortlist), output.rows,
-            output.cols, stream_) != 0) {
-      AssignError(error_msg, "MTP shortlist rescoring failed");
+    if (!MtpRescore(input.data, s_.logits, error_msg)) {
       return false;
     }
-    MtpRescoredCandidates(s_.logits, s_.mtp_ids, s_.mtp_scores, output.rows,
-                          stream_);
   } else {
     if (!Dense(output, s_.mixed, s_.logits, 1, error_msg))
       return false;
@@ -1504,6 +1495,24 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
       return false;
     }
   }
+  return true;
+}
+
+bool Executor::MtpRescore(const void* input, float* logits,
+                          std::string* error_msg) const {
+  const auto& output = model_->output();
+  MtpShortlist(logits, s_.mtp_ids, s_.mtp_scratch_ids, output.rows, stream_);
+  // Preserve the full Q8 head's dot/reduction order and the exact proposal
+  // distribution consumed by target p/q verification.
+  if (qfn_mmq_q8_0_selected_vec_preq(
+          output.data, input, s_.mtp_ids, logits,
+          std::min<std::uint32_t>(output.rows, kMtpShortlist), output.rows,
+          output.cols, stream_) != 0) {
+    AssignError(error_msg, "MTP shortlist rescoring failed");
+    return false;
+  }
+  MtpRescoredCandidates(logits, s_.mtp_ids, s_.mtp_scores, output.rows,
+                        stream_);
   return true;
 }
 
@@ -1557,6 +1566,7 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
                        std::uint32_t n_logits, float* logits, bool speculative,
                        std::string* error_msg) const {
+  selected_logits_ = nullptr;
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
   if (n == 0 || n > options_.max_batch ||
@@ -1760,7 +1770,8 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   if (logits != nullptr &&
       !Check(hipMemcpyAsync(
                  logits_host_,
-                 s_.logits + static_cast<std::size_t>(keep - 1) * c.vocab_size,
+                 VerificationLogits() +
+                     static_cast<std::size_t>(keep - 1) * c.vocab_size,
                  c.vocab_size * sizeof(float), hipMemcpyDeviceToHost, stream_),
              "frontier download", error_msg)) {
     return false;
@@ -2099,11 +2110,11 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
   // can be reused until the next draft head overwrites them.
   const auto vocab = config().vocab_size;
   gufo::hip::LaunchBatchedGPUArgmax(
-      s_.logits, s_.mtp_ids, rows, vocab,
+      VerificationLogits(), s_.mtp_ids, rows, vocab,
       {reinterpret_cast<float*>(s_.mtp_scratch_ids),
        MtpCandidateWorkspaceSize(vocab)},
       stream_);
-  GatherArgmaxCandidates(s_.logits, s_.mtp_ids, s_.mtp_argmax,
+  GatherArgmaxCandidates(VerificationLogits(), s_.mtp_ids, s_.mtp_argmax,
                          static_cast<std::uint32_t>(rows), vocab, stream_);
   return Check(hipMemcpyAsync(predictions.data(), s_.mtp_argmax,
                               predictions.size_bytes(), hipMemcpyDeviceToHost,
@@ -2159,7 +2170,8 @@ bool Executor::VerifyMtpProposal(std::uint32_t row, const MtpProposal& proposal,
   const auto residual_checkpoint = sampler.rng_state();
   const float residual_uniform = static_cast<float>(sampler.Uniform());
   gufo::hip::LaunchGPUSpeculativeSampling(
-      s_.logits + static_cast<std::size_t>(row) * this->config().vocab_size,
+      VerificationLogits() +
+          static_cast<std::size_t>(row) * this->config().vocab_size,
       s_.mtp_ids, s_.mtp_ids + 1, this->config().vocab_size, parameters,
       proposal.token, proposal.probability, proposal.ids.data(),
       proposal.probabilities.data(), proposal.size, acceptance_uniform,

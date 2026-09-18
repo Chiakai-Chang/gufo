@@ -5,6 +5,7 @@
 #include "qfn_mmq.h"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
+#include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -104,6 +105,119 @@ void Executor::UseScratch(const Scratch& scratch) const {
   moe_pending_ = false;
 }
 
+bool Executor::AllocateBatch(std::string* error) const {
+  return (batch_logits_ != nullptr ||
+          Check(hipMalloc(&batch_logits_,
+                          static_cast<std::size_t>(kBatchSessions) *
+                              std::min(kDecodeRows, options_.max_logit_rows) *
+                              config().vocab_size * sizeof(float)),
+                error)) &&
+         (batch_q8_ != nullptr ||
+          Check(hipMalloc(&batch_q8_,
+                          qfn_mmq_q8_1_bytes(
+                              32, std::max(2560U, config().hidden_size))),
+                error));
+}
+
+bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
+                        std::string* error) const {
+  selected_logits_ = nullptr;
+  if (!has_mtp() || items.empty() || items.size() > kBatchSessions ||
+      items.size() > options_.max_batch) {
+    return Fail(error, "invalid MTP head batch");
+  }
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    const auto& item = items[i];
+    if (item.session == nullptr || item.session->owner_ != this ||
+        item.session->mtp_.position == 0 ||
+        (item.output.token == nullptr && item.output.candidates == nullptr)) {
+      return Fail(error, "invalid MTP head request");
+    }
+    for (std::size_t j = 0; j < i; ++j) {
+      if (items[j].session == item.session) {
+        return Fail(error, "MTP head requests must be independent");
+      }
+    }
+    if (item.output.candidates != nullptr &&
+        sampling_workspace_.vocab_size == 0) {
+      gufo::hip::AllocateGpuSamplingWorkspace(
+          &sampling_workspace_, config().vocab_size, config().vocab_size);
+    }
+  }
+  const auto& output = model_->mtp_output();
+  const auto& head = model_->mtp().nextn_head;
+  if (items.size() == 1 || output.type != core::GgmlType::kQ4_0) {
+    for (const auto& item : items) {
+      if (!MtpHead(head, item.session->mtp_.h, item.output.token != nullptr,
+                   item.output.candidates != nullptr, error) ||
+          !Check(hipStreamSynchronize(stream_), error)) {
+        return false;
+      }
+      if (item.output.token != nullptr)
+        *item.output.token = *mtp_token_host_;
+      if (item.output.candidates != nullptr)
+        *item.output.candidates = *mtp_candidates_host_;
+    }
+    return true;
+  }
+  if (!AllocateBatch(error)) {
+    return false;
+  }
+  if (batch_candidates_host_ == nullptr) {
+    if (!Check(hipHostMalloc(&batch_candidates_host_,
+                             kBatchSessions * sizeof(MtpCandidateLogits)),
+               error))
+      return false;
+    for (std::uint32_t i = 0; i < kBatchSessions; ++i)
+      std::construct_at(batch_candidates_host_ + i);
+  }
+  const auto n = static_cast<std::uint32_t>(items.size());
+  const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
+  const Scratch base = s_;
+  const auto body = [&]() {
+    for (std::uint32_t i = 0; i < n; ++i) {
+      UseScratch(RowScratch(base, i));
+      if (!HcMix(head, items[i].session->mtp_.h, false, s_.mixed, nullptr, 1,
+                 error)) {
+        return false;
+      }
+    }
+    UseScratch(base);
+    if (qfn_mmq_quantize_q8_1(base.mixed, batch_q8_, n, output.cols, stream_) ||
+        qfn_mmq_q4_0_dense_vec_preq(output.data, batch_q8_, batch_logits_,
+                                    output.rows, output.cols, n, stream_)) {
+      return Fail(error, "batched MTP shortlist projection failed");
+    }
+    for (std::uint32_t i = 0; i < n; ++i) {
+      const auto* input = static_cast<const std::uint8_t*>(batch_q8_) +
+                          qfn_mmq_q8_1_bytes(i, output.cols);
+      if (!MtpRescore(input, batch_logits_ + std::size_t(i) * output.rows,
+                      error) ||
+          !Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
+                                offsetof(MtpCandidateLogits, logits) +
+                                    count * sizeof(float),
+                                hipMemcpyDeviceToHost, stream_),
+                 error)) {
+        return false;
+      }
+      batch_candidates_host_[i].size = count;
+    }
+    return true;
+  };
+  const bool ok = body();
+  const auto status = hipStreamSynchronize(stream_);
+  UseScratch(base);
+  if (!ok || !Check(status, error))
+    return false;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (items[i].output.token != nullptr)
+      *items[i].output.token = batch_candidates_host_[i].ids[0];
+    if (items[i].output.candidates != nullptr)
+      *items[i].output.candidates = batch_candidates_host_[i];
+  }
+  return true;
+}
+
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
   // Wide output matrices benefit from sharing weight rows across waves.
@@ -111,14 +225,16 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   if (rows > kDecodeRows && w.type == core::GgmlType::kQ8_0 && w.cols == 2560 &&
       w.rows >= 8192) {
     constexpr std::uint32_t chunk = 32;
-    if (batch_q8_ == nullptr &&
-        !Check(hipMalloc(&batch_q8_, qfn_mmq_q8_1_bytes(chunk, 2560)), error)) {
-      return false;
-    }
     for (std::uint32_t r = 0; r < rows;) {
-      auto n = std::min(chunk, rows - r);
-      if (n > kDecodeRows) {
-        n = n / kDecodeRows * kDecodeRows;
+      const auto n = std::min(chunk, rows - r);
+      const auto padded = (n + kDecodeRows - 1) / kDecodeRows * kDecodeRows;
+      if (n > kDecodeRows && padded != n &&
+          !Check(hipMemsetAsync(static_cast<std::uint8_t*>(batch_q8_) +
+                                    qfn_mmq_q8_1_bytes(n, w.cols),
+                                0, qfn_mmq_q8_1_bytes(padded - n, w.cols),
+                                stream_),
+                 error)) {
+        return false;
       }
       if (qfn_mmq_quantize_q8_1(x + static_cast<std::size_t>(r) * w.cols,
                                 batch_q8_, n, w.cols, stream_) != 0 ||
@@ -144,6 +260,7 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
 
 bool Executor::ForwardBatch(std::span<const BatchItem> items,
                             std::string* error) const {
+  selected_logits_ = nullptr;
   const Config& c = config();
   if (items.empty() || items.size() > kBatchSessions) {
     return Fail(error, "decode batch must contain 1..8 sessions");
@@ -181,12 +298,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   if (rows > options_.max_batch) {
     return Fail(error, "decode batch exceeds executor capacity");
   }
-  if (batch_logits_ == nullptr &&
-      !Check(hipMalloc(&batch_logits_,
-                       static_cast<std::size_t>(kBatchSessions) *
-                           std::min(kDecodeRows, options_.max_logit_rows) *
-                           c.vocab_size * sizeof(float)),
-             error)) {
+  if (!AllocateBatch(error)) {
     return false;
   }
   if (batch_controls_ == nullptr &&
@@ -401,17 +513,12 @@ bool Executor::SelectBatchLogits(std::uint32_t offset, std::uint32_t rows,
   }
   const std::size_t count =
       static_cast<std::size_t>(rows) * config().vocab_size;
-  if (!Check(hipMemcpyAsync(s_.logits,
-                            batch_logits_ + static_cast<std::size_t>(offset) *
-                                                config().vocab_size,
-                            count * sizeof(float), hipMemcpyDeviceToDevice,
-                            stream_),
-             error)) {
-    return false;
-  }
+  selected_logits_ =
+      batch_logits_ + static_cast<std::size_t>(offset) * config().vocab_size;
   if (logits != nullptr) {
-    if (!Check(hipMemcpyAsync(logits_host_, s_.logits, count * sizeof(float),
-                              hipMemcpyDeviceToHost, stream_),
+    if (!Check(hipMemcpyAsync(logits_host_, selected_logits_,
+                              count * sizeof(float), hipMemcpyDeviceToHost,
+                              stream_),
                error) ||
         !Check(hipStreamSynchronize(stream_), error)) {
       return false;

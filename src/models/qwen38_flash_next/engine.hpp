@@ -185,7 +185,8 @@ private:
                     MtpCandidateLogits* candidates = nullptr);
   struct PendingDecode;
   bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,
-                     std::string* error_msg);
+                     std::string* error_msg, bool defer_head = false);
+  static void AppendDraft(PendingDecode& pending);
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
                     std::string* error_msg);
 

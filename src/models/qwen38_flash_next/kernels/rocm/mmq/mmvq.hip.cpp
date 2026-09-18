@@ -34,23 +34,44 @@ static __global__ void requantize_q8_0_q4_0_kernel(const block_q8_0* source,
   }
 }
 
+template<int tokens>
 __launch_bounds__(32) static __global__
     void mul_mat_vec_q4_0(const void* weights, const block_q8_1* input,
-                          float* output, int cols) {
+                          float* output, int rows, int cols, int input_stride) {
   constexpr int vdr = VDR_Q4_0_Q8_1_MMVQ;
   constexpr int blocks_per_iter = vdr * 32 / QI4_0;
   const int lane = threadIdx.x;
   const int blocks_per_row = cols / QK4_0;
   const int row_offset = blockIdx.x * blocks_per_row;
   const int part = vdr * (lane % (QI4_0 / vdr));
-  float sum = 0.0f;
+  float sum[tokens] = {};
   for (int kb = lane / (QI4_0 / vdr); kb < blocks_per_row;
        kb += blocks_per_iter) {
-    sum += vec_dot_q4_0_q8_1(weights, input + kb, row_offset + kb, part);
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+      sum[t] += vec_dot_q4_0_q8_1(weights, input + t * input_stride + kb,
+                                  row_offset + kb, part);
+    }
   }
-  sum = warp_reduce_sum<32>(sum);
-  if (lane == 0)
-    output[blockIdx.x] = sum;
+#pragma unroll
+  for (int t = 0; t < tokens; ++t) {
+    sum[t] = warp_reduce_sum<32>(sum[t]);
+    if (lane == 0)
+      output[t * rows + blockIdx.x] = sum[t];
+  }
+}
+
+template<int tokens = 1>
+static void launch_q4(const void* weights, const block_q8_1* input,
+                      float* output, int rows, int cols, int n,
+                      hipStream_t stream) {
+  if (n == tokens) {
+    mul_mat_vec_q4_0<tokens>
+        <<<rows, 32, 0, stream>>>(weights, input, output, rows, cols,
+                                  GGML_PAD(cols, MATRIX_ROW_PADDING) / QK8_1);
+  } else if constexpr (tokens < 8) {
+    launch_q4<tokens + 1>(weights, input, output, rows, cols, n, stream);
+  }
 }
 
 extern "C" int qfn_mmq_requantize_q8_0_q4_0(const void* source,
@@ -67,12 +88,13 @@ extern "C" int qfn_mmq_requantize_q8_0_q4_0(const void* source,
 
 extern "C" int qfn_mmq_q4_0_dense_vec_preq(const void* weights,
                                            const void* input, float* output,
-                                           int rows, int cols,
+                                           int rows, int cols, int tokens,
                                            hipStream_t stream) {
-  if (!weights || !input || !output || rows <= 0 || cols <= 0 || cols % 32)
+  if (!weights || !input || !output || rows <= 0 || cols <= 0 || cols % 32 ||
+      tokens < 1 || tokens > 8)
     return -1;
-  mul_mat_vec_q4_0<<<rows, 32, 0, stream>>>(
-      weights, static_cast<const block_q8_1*>(input), output, cols);
+  launch_q4(weights, static_cast<const block_q8_1*>(input), output, rows, cols,
+            tokens, stream);
   return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
@@ -85,7 +107,8 @@ __launch_bounds__(32 * token_waves, 1) static __global__
                         const block_q8_1* __restrict__ input,
                         float* __restrict__ output, const uint32_t ncols_x,
                         const uint32_t nrows_x, const uint32_t stride_col_y,
-                        const uint32_t* selected_ids = nullptr) {
+                        const uint32_t* selected_ids = nullptr,
+                        const uint32_t valid_tokens = ncols_dst) {
   constexpr int qi = QI8_0;
   constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
   constexpr int blocks_per_iter = vdr * 32 / qi;
@@ -119,7 +142,7 @@ __launch_bounds__(32 * token_waves, 1) static __global__
     sum[j] = warp_reduce_sum<32>(sum[j]);
     if constexpr (has_gate)
       gate_sum[j] = warp_reduce_sum<32>(gate_sum[j]);
-    if (lane == 0) {
+    if (lane == 0 && (token_waves == 1 || first_token + j < valid_tokens)) {
       float value = sum[j];
       if constexpr (has_gate)
         value *= ggml_hip_op_silu_single(gate_sum[j]);
@@ -405,21 +428,21 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
                              hipStream_t stream) {
   GGML_ASSERT(k % QK8_0 == 0 && rows > 0);
   if (tokens > 8) {
-    GGML_ASSERT(tokens <= 32 && tokens % 8 == 0 && !gate);
+    GGML_ASSERT(tokens <= 32 && !gate);
     // Each wave retains the eight-row arithmetic. Adjacent waves work
     // on the same weight row, reusing cache lines across requests.
-    if (tokens == 16) {
+    if (tokens <= 16) {
       mul_mat_vec_q8<8, false, false, 2>
           <<<rows, 64, 0, stream>>>(weights, nullptr, input, output, k, rows,
-                                    input_stride);
-    } else if (tokens == 24) {
+                                    input_stride, nullptr, tokens);
+    } else if (tokens <= 24) {
       mul_mat_vec_q8<8, false, false, 3>
           <<<rows, 96, 0, stream>>>(weights, nullptr, input, output, k, rows,
-                                    input_stride);
+                                    input_stride, nullptr, tokens);
     } else {
       mul_mat_vec_q8<8, false, false, 4>
           <<<rows, 128, 0, stream>>>(weights, nullptr, input, output, k, rows,
-                                     input_stride);
+                                     input_stride, nullptr, tokens);
     }
     return;
   }

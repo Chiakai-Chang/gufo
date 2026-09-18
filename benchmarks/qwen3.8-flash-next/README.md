@@ -15,12 +15,12 @@ use the same 34,817-token context capacity. MTP PP includes draft catch-up.
 
 | Depth | AR pp2048 | MTP pp2048 | AR tg128 | MTP tg128 |
 | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1571.61 | 1560.66 | 26.24 | 48.10 |
+| 0 | 1572.81 | 1557.43 | 26.27 | 47.94 |
 | 4096 | TODO | TODO | TODO | TODO |
 | 8192 | TODO | TODO | TODO | TODO |
 | 12288 | TODO | TODO | TODO | TODO |
 | 16384 | TODO | TODO | TODO | TODO |
-| 32768 | 1423.63 | 1372.12 | 24.04 | 59.12 |
+| 32768 | 1426.10 | 1372.91 | 24.04 | 59.18 |
 | 65536 | TODO | TODO | TODO | TODO |
 | 131072 | TODO | TODO | TODO | TODO |
 
@@ -44,7 +44,7 @@ The targets of 1700 tok/s pp2048 and near-flat PP through d128K remain TODO.
 ## Concurrent serving
 
 HTTP aggregate output tok/s, context 4096, greedy, up to 128 output tokens,
-one warmup and one measured round per workload. Prefix caching is warm.
+one measured pass per workload after prompt-cache warmup.
 These are whole-request rates, including scheduling and prompt handling.
 The corpus is [speculative-corpus.json](../qwen3.8-27b/speculative-corpus.json):
 `repetition_word` uses identical concurrent requests; mixed requests use
@@ -52,21 +52,28 @@ The corpus is [speculative-corpus.json](../qwen3.8-27b/speculative-corpus.json):
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 26.81 | 83.96 | 25.81 | 46.52 |
-| 2 | 43.19 | 92.89 | 38.80 | 54.51 |
-| 4 | 62.35 | 96.41 | 54.53 | 61.32 |
-| 6 | 71.78 | 96.90 | 65.62 | 63.06 |
-| 8 | 77.52 | 97.88 | 71.74 | 63.46 |
+| 1 | 26.85 | 83.98 | 26.56 | 49.38 |
+| 2 | 43.24 | 99.10 | 38.78 | 57.53 |
+| 4 | 62.36 | 106.51 | 54.50 | 66.81 |
+| 6 | 71.78 | 108.01 | 65.51 | 69.98 |
+| 8 | 77.35 | 109.52 | 71.94 | 70.78 |
 
 All 46 measured MTP requests matched the AR C1 completions. Acceptance was
-100% on repetition and 70.7–71.6% on mixed requests. AR was faster on the mixed
-workload at C6/C8.
+100% on repetition and 70.7–71.6% on mixed requests. AR was slightly faster
+on the mixed workload at C8.
+
+Fresh-server C8 repetition: **90.21 tok/s**, zero cached prompt tokens,
+**880/880 drafts accepted**, and **8/8 completions matching AR**. Cold rates
+at the other concurrency levels remain TODO. A prompt-cache warning marks
+warm measurements; it does not establish cold-request acceptance.
 
 Target projections share batches across requests; KV, recurrent state,
-sampling history and rollback stay independent. MTP proposal generation and
-acceptance decisions run per session. Large Q8 projections share weight rows
-across waves, with eight input rows per wave. Other shapes retain their measured
-faster geometry.
+sampling history and rollback stay independent. MTP advances proposals one
+round across ready requests, sharing the Q4 vocabulary head while keeping
+draft bodies, probabilities and acceptance private. Ragged Q8 projections
+pad their input rows to avoid rereading weights for a separate tail launch.
+Verification reads each request's logit rows directly without copying them
+into another GPU buffer. C1 retains its single-request execution path.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
 
 ## Memory and execution
@@ -106,9 +113,14 @@ rescores them. Greedy takes the best rescored row. Sampling draws from the best
 accepts with `min(1, p/q)` or samples normalized `max(p-q, 0)`; the residual draw
 becomes the next anchor. Draft shortlisting does not truncate the target.
 
-Experiments not retained: grouped Q5 down projections were slower; adaptive
-two/four-query sparse attention gave no clear model-level gain. Larger attention
-tiles and wider DeltaNet reductions were also slower.
+Experiments not retained: target batch graph caching gave no speed gain;
+SSM selective prefetch spilled registers and was slower; concurrent short
+prefill improved cohort completion but increased median request latency,
+including when limited to pairs. Those paths and their temporary tests were
+removed.
+
+Current sampled C4 target-decode GPU time: 43% routed expert projections,
+34% dense Q8 projections. Model loading is excluded from these shares.
 
 ## Maintaining quality
 
@@ -124,8 +136,9 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]projectio
 
 - **Operators:** independent numerical references, FP64 dots, output guards,
   ragged shapes, finite values, tied selections and replay. Q8 projections must
-  match scalar evaluation at widths 1–8 and 16/24/32. Grouped experts cover
-  duplicate and inactive slots. Attention checks include deep contexts and
+  match scalar evaluation at every ungated width 1–32 and gated width 1–8;
+  Q4 MTP heads at widths 1–8. Grouped experts cover duplicate and inactive
+  slots. Attention checks include deep contexts and
   exact agreement between full and final-tile catch-up. Indexer masks match a
   CPU full sort. N-gram reads cover cold/cache/mixed paths and I/O failures.
 - **Model state:** `qwen38_flash_next_session_test` checks full logits, tokens,
@@ -139,6 +152,8 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]projectio
   checks persistence, rollback and deferred residual draws. Both accept
   `--model "$MODEL" --mtp-model "$MTP"`
   and belong to the explicit `qwen38_flash_next_model_tests` build target.
+  Pass `--batch-only` to the session test for a focused C2/C4/C6/C8 check
+  during iteration; run the full serving matrix when sampling or wiring changes.
 - **Qualification:** scheduling/fusion changes must preserve operator rounding
   and model replay. Arithmetic changes additionally need CPU/reference probes
   and `gufo bench --validate-prefill N`. The current 1024-token prefill check has
@@ -155,6 +170,7 @@ Standalone ablations must match production flags:
 
 Sampled MTP preserves the target distribution within floating-point precision;
 it need not match AR's same-seed tokens or prefixes across different budgets.
-Greedy decoding retains those guarantees. Batched prefill differs numerically
-from sequential decoding. These regression checks do not establish equivalence
-to the unquantized upstream model; that qualification remains TODO.
+Greedy decoding retains those guarantees. Prefill and token-at-a-time decoding
+use different floating-point reduction shapes. These regression checks do not
+establish equivalence to the unquantized upstream model; that qualification
+remains TODO.

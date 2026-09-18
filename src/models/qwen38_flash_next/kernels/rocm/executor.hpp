@@ -164,6 +164,13 @@ public:
     std::int32_t* token{nullptr};
     MtpCandidateLogits* candidates{nullptr};
   };
+  struct MtpHeadItem {
+    Session* session;
+    MtpOutput output;
+  };
+  /// Projects each session's carried draft hidden state with shared weights.
+  [[nodiscard]] bool MtpHeads(std::span<const MtpHeadItem> items,
+                              std::string* error_msg) const;
   [[nodiscard]] bool MtpForward(Session& session,
                                 std::span<const std::int32_t> tokens,
                                 std::int32_t hidden_row, MtpOutput output,
@@ -305,6 +312,8 @@ private:
   /// Selects the greedy token or compact candidates from full MTP logits.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
                bool candidates, std::string* error_msg) const;
+  bool MtpRescore(const void* input, float* logits,
+                  std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -412,11 +421,17 @@ private:
   void UseScratch(const Scratch& scratch) const;
   bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
                   std::uint32_t rows, std::string* error_msg) const;
+  bool AllocateBatch(std::string* error_msg) const;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable void* batch_q8_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};
+  mutable MtpCandidateLogits* batch_candidates_host_{nullptr};
   mutable std::uint32_t batch_rows_{0};
+  mutable const float* selected_logits_{nullptr};
+  [[nodiscard]] const float* VerificationLogits() const {
+    return selected_logits_ != nullptr ? selected_logits_ : s_.logits;
+  }
   std::uint32_t mask_words_{0};
   /// Queries per block-selection launch (its score scratch is chunk x
   /// max_blocks floats: 128 MB at the 262k context).

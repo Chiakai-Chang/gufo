@@ -38,9 +38,11 @@ from dataclasses import dataclass, field
 STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
     "qwen-flash": [
         ("RoutedF16", "moe: f16 projections"),
+        ("mul_mat_vec_moe_grouped", "moe: grouped gate/up"),
         ("mul_mat_vec_q_moe", "moe: quantized vectors"),
         ("mul_mat_q", "moe/dense: mmq"),
         ("qfn_q8_hc_down", "hyperconnections: down projection"),
+        ("mul_mat_vec_q4_0", "mtp: vocabulary projection"),
         ("mul_mat_vec_q8", "dense: quantized vectors"),
         ("DenseF16", "dense: f16 projections"),
         ("WKQuantA8", "dense: int8 projections"),
