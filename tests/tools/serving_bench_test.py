@@ -206,6 +206,22 @@ check(
     "completion text is retained only as a hash",
 )
 
+corpus_rounds = []
+original_corpus_round = serving_bench._run_corpus_round
+
+
+def record_corpus_round(**kwargs):
+    corpus_rounds.append(
+        (
+            kwargs["concurrency"],
+            kwargs["repetition"],
+            [case.identifier for case in kwargs["cases"]],
+        )
+    )
+    return original_corpus_round(**kwargs)
+
+
+serving_bench._run_corpus_round = record_corpus_round
 serving_bench.urllib.request.urlopen = fake_urlopen
 try:
     corpus_report = serving_bench.run_corpus_benchmark(
@@ -220,7 +236,7 @@ try:
         max_tokens=2,
         temperature=0.0,
         concurrency_levels=[1, 2],
-        warmup_rounds=0,
+        warmup_rounds=1,
         repetitions=1,
         timeout_seconds=5.0,
         fingerprint=fingerprint,
@@ -231,6 +247,24 @@ try:
     )
 finally:
     serving_bench.urllib.request.urlopen = original_urlopen
+    serving_bench._run_corpus_round = original_corpus_round
+for concurrency, expected in [
+    (1, ["repeat", "json", "code"]),
+    (2, ["repeat", "json", "code", "repeat"]),
+]:
+    observed_rounds = [row for row in corpus_rounds if row[0] == concurrency]
+    check(
+        [
+            case
+            for _, repetition, cases in observed_rounds
+            if repetition < 0
+            for case in cases
+        ]
+        == expected,
+        "warmup visits every scheduled prompt, including the padded tail",
+    )
+    phases = [repetition for _, repetition, _ in observed_rounds]
+    check(phases == sorted(phases), "all warmups precede measurement")
 c2_corpus = corpus_report["results"]["c2"]
 check(c2_corpus["requestCount"] == 4, "corpus tail is cycle-padded")
 check(
