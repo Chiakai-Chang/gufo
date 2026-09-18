@@ -28,15 +28,15 @@ change. Weights, cache precision and sampling are unchanged.
 
 ## Performance
 
-Nix release, C1, pp2048, tg128, seed 1, one measured repetition except
-sampled MTP TG (two; mean ± standard deviation), 2026-09-18 UTC.
+Nix release, C1, pp2048, tg128, seed 1, one measured repetition,
+2026-09-18 UTC.
 The CLI uses deterministic repetitive text, warms prefill
 and continues generation past EOS. Depth precedes the measured operation.
 Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1481.68 | 1514.58 |
+| 0 | 1481.68 | 1509.77 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
 | 32768 | 1396.57 | TODO |
@@ -45,9 +45,9 @@ Rates are tok/s; profiler timings are excluded.
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.11 | 43.16 | 71.0% |
+| Greedy | 0 | 26.11 | 43.71 | 71.0% |
 | Greedy | 32768 | TODO | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 43.31 ± 0.26 | 75.9% |
+| Temperature 0.7 | 0 | TODO | 44.80 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
 AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
@@ -87,8 +87,9 @@ Snapshots preserve this state; new HTTP requests reset it when reusing
 context. Decisions never depend on wall-clock timings.
 
 Retained optimizations: SSM/QKV projection tiling, F16 SSM output activations,
-exact partial top-64 selection, GPU verification logits with one frontier
-readback, and parallel unordered verification with the original F32 sum order.
+grouped Q4_K/Q5_K expert verification with fused SwiGLU, exact partial top-64
+selection, GPU verification logits with one frontier readback, and parallel
+unordered verification with the original F32 sum order.
 F16 SSM output reduces numerical error with unchanged model throughput and
 no additional allocation. Larger sparse-attention tiles and wider DeltaNet
 row reductions were slower. Compact attention scratch gave no material gain.
@@ -119,7 +120,8 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]moe_ids_o
   softmax weights and lowest-index ties independently of assignment maps.
   Fusions must preserve the separate operators' rounding. Decode and
   verification projections must agree across batch widths one through eight;
-  routed down projections also check expanded top-10 batches.
+  routed down projections also check expanded top-10 batches. Grouped
+  projections cover duplicate expert slots within and across tokens.
 - **Model replay:** greedy AR/MTP tokens, full logits, RNG and positions must
   match at short and 4K contexts. Sampled MTP must replay itself exactly;
   teacher-forcing its tokens through AR must reproduce every frontier logit.

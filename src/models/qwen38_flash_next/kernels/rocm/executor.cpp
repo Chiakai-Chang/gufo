@@ -798,14 +798,14 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                             std::string* error_msg) const {
   const bool same_shape = a.type == b.type && a.rows == b.rows &&
                           a.cols == b.cols && a.experts == b.experts;
-  if (n_tokens == 1 && same_shape &&
+  if (n_tokens <= kVecBatch && n_used <= 32 && same_shape &&
       (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K)) {
-    if (qfn_mmq_moe_gated_decode(static_cast<int>(a.type), a.data, b.data, x,
-                                 ids, out, static_cast<int>(a.rows),
-                                 static_cast<int>(a.cols),
-                                 static_cast<int>(a.experts),
-                                 static_cast<int>(n_used), stream_) != 0) {
-      AssignError(error_msg, "gated expert decode failed");
+    if (qfn_mmq_moe_gated_vec(
+            static_cast<int>(a.type), a.data, b.data, x, ids, out,
+            static_cast<int>(a.rows), static_cast<int>(a.cols),
+            static_cast<int>(n_tokens), static_cast<int>(a.experts),
+            static_cast<int>(n_used), stream_) != 0) {
+      AssignError(error_msg, "gated expert vector projection failed");
       return false;
     }
     return true;

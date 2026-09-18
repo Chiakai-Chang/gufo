@@ -164,6 +164,133 @@ __launch_bounds__(mmvq_moe_max_batch(type) * (gated ? 64 : 32),
     }
 }
 
+// Keep one anchor per expert and a slot mask for each token. Duplicate
+// experts share their weights; inactive slots still get explicit zeroes.
+static __global__ void group_moe_slots(const int32_t* ids, int32_t* groups,
+                                       int tokens, int experts_used) {
+  const int anchor = blockIdx.x * blockDim.x + threadIdx.x;
+  if (anchor >= tokens * experts_used)
+    return;
+  const int expert = ids[anchor];
+  int32_t* group = groups + anchor * (tokens + 1);
+  group[0] = -1;
+  if (expert < 0) {
+    group[0] = -2;
+    return;
+  }
+  for (int i = 0; i < anchor; ++i)
+    if (ids[i] == expert)
+      return;
+  group[0] = expert;
+  for (int t = 0; t < tokens; ++t) {
+    uint32_t slots = 0;
+    for (int j = 0; j < experts_used; ++j)
+      if (ids[t * experts_used + j] == expert)
+        slots |= uint32_t{1} << j;
+    group[t + 1] = static_cast<int32_t>(slots);
+  }
+}
+
+template<ggml_type type, int tokens>
+__launch_bounds__(64) static __global__
+    void mul_mat_vec_moe_grouped(const void* __restrict__ gate,
+                                 const void* __restrict__ up,
+                                 const block_q8_1* __restrict__ input,
+                                 const int32_t* __restrict__ groups,
+                                 float* __restrict__ output, int k, int rows,
+                                 int experts_used, int input_stride) {
+  constexpr int qk = ggml_hip_type_traits<type>::qk;
+  constexpr int qi = ggml_hip_type_traits<type>::qi;
+  constexpr int vdr = get_vdr_mmvq(type);
+  constexpr int blocks_per_iter = vdr * 32 / qi;
+  constexpr auto dot = get_vec_dot_q_hip(type);
+  const int anchor = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int lane = tid % 32;
+  const bool is_up = tid >= 32;
+  const int row0 = blockIdx.x * 2;
+  const int32_t* group = groups + anchor * (tokens + 1);
+  const int expert = group[0];
+  if (expert < 0) {
+    if (expert == -2 && tid < 2 && row0 + tid < rows)
+      output[anchor * rows + row0 + tid] = 0.0f;
+    return;
+  }
+
+  const void* weights = is_up ? up : gate;
+  const int blocks_per_row = k / qk;
+  uint32_t slots[tokens];
+#pragma unroll
+  for (int t = 0; t < tokens; ++t)
+    slots[t] = static_cast<uint32_t>(group[t + 1]);
+  float sum[tokens][2] = {};
+  for (int kb = lane / (qi / vdr); kb < blocks_per_row; kb += blocks_per_iter) {
+    const int kqs = vdr * (lane % (qi / vdr));
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+      if (slots[t] == 0)
+        continue;
+#pragma unroll
+      for (int r = 0; r < 2; ++r)
+        sum[t][r] +=
+            dot(weights, input + t * input_stride + kb * (qk / QK8_1),
+                (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
+                kqs);
+    }
+  }
+
+  // Gate and up stay in separate waves to retain the scalar projection's
+  // sum order, including the treatment of nonfinite quantization scales.
+  __shared__ float values[tokens][2][2];
+#pragma unroll
+  for (int t = 0; t < tokens; ++t) {
+    if (slots[t] == 0)
+      continue;
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+      sum[t][r] = warp_reduce_sum<32>(sum[t][r]);
+    if (lane < 2)
+      values[t][is_up][lane] = isfinite(sum[t][lane]) ? sum[t][lane] : 0.0f;
+  }
+  __syncthreads();
+  if (!is_up && lane < 2 && row0 + lane < rows) {
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+      if (slots[t] == 0)
+        continue;
+      const float g = values[t][0][lane];
+      const float u = values[t][1][lane];
+      uint32_t bits = slots[t];
+      while (bits) {
+        const int slot = __ffs(static_cast<int>(bits)) - 1;
+        output[(t * experts_used + slot) * rows + row0 + lane] =
+            (g * (1.0f / (1.0f + __expf(-g)))) * u;
+        bits &= bits - 1;
+      }
+    }
+  }
+}
+
+template<ggml_type type, int tokens = 2>
+static void launch_moe_grouped(const void* gate, const void* up,
+                               const block_q8_1* input, const int32_t* groups,
+                               float* output, int k, int rows, int n_tokens,
+                               int experts_used, int input_stride,
+                               hipStream_t stream) {
+  if (n_tokens == tokens) {
+    mul_mat_vec_moe_grouped<type, tokens>
+        <<<dim3((rows + 1) / 2, tokens * experts_used), 64, 0, stream>>>(
+            gate, up, input, groups, output, k, rows, experts_used,
+            input_stride);
+  } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
+    launch_moe_grouped<type, tokens + 1>(gate, up, input, groups, output, k,
+                                         rows, n_tokens, experts_used,
+                                         input_stride, stream);
+  } else {
+    GGML_ABORT("invalid gated vector batch width");
+  }
+}
+
 template <int tokens>
 static void launch_q8(const void* weights, const void* gate, const block_q8_1* input,
                       float* output, int k, int rows, int input_stride, hipStream_t stream) {
@@ -242,11 +369,28 @@ void mul_mat_vec_moe_dispatch(const void* weights, ggml_type type,
     }
 }
 
-void mul_mat_vec_moe_gated_decode(const void* gate, const void* up,
-                                  ggml_type type, const block_q8_1* input,
-                                  const int32_t* ids, float* output, int k,
-                                  int rows, int experts_used, int input_stride,
-                                  hipStream_t stream) {
+void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
+                           const block_q8_1* input, const int32_t* ids,
+                           int32_t* groups, float* output, int k, int rows,
+                           int tokens, int experts_used, int input_stride,
+                           hipStream_t stream) {
+  GGML_ASSERT(tokens > 0 && tokens <= MMVQ_MAX_BATCH_SIZE);
+  if (tokens > 1) {
+    GGML_ASSERT(groups && experts_used <= 32);
+    group_moe_slots<<<(tokens * experts_used + 127) / 128, 128, 0, stream>>>(
+        ids, groups, tokens, experts_used);
+    if (type == GGML_TYPE_Q4_K) {
+      launch_moe_grouped<GGML_TYPE_Q4_K>(gate, up, input, groups, output, k,
+                                         rows, tokens, experts_used,
+                                         input_stride, stream);
+    } else {
+      GGML_ASSERT(type == GGML_TYPE_Q5_K);
+      launch_moe_grouped<GGML_TYPE_Q5_K>(gate, up, input, groups, output, k,
+                                         rows, tokens, experts_used,
+                                         input_stride, stream);
+    }
+    return;
+  }
   const int row_stride = k / ggml_blck_size(type);
   const dim3 grid((rows + 1) / 2, experts_used);
   const dim3 block(32, 2);

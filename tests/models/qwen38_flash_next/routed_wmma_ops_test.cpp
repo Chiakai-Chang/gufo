@@ -482,7 +482,7 @@ bool Ok(const Result& r) {
 void CheckVectorGrouping(bool down = false) {
   constexpr int experts = 8;
   const int cols = down ? 640 : 512;
-  const int tokens = down ? 80 : 7;
+  const int tokens = down ? 80 : 8;
   const int used = down ? 1 : 3;
   constexpr std::size_t guard = 16;
   constexpr float poison = -1234567.0F;
@@ -499,6 +499,12 @@ void CheckVectorGrouping(bool down = false) {
     for (int j = 0; j < used; ++j)
       ids[t * used + j] =
           j == 1 || (down && t % 11 == 1) ? -1 : (t + j) % experts;
+  if (!down) {
+    // Exercise both repeated experts across tokens and duplicate slots
+    // within one token; each output must retain its original slot.
+    ids[2] = ids[0];
+    ids[6 * used + 2] = ids[6 * used];
+  }
   auto* dx = Upload(x);
   auto* di = Upload(ids);
   for (int rows : {down ? 2560 : 64, down ? 2561 : 65}) {
@@ -565,7 +571,7 @@ void CheckVectorGrouping(bool down = false) {
         throw std::runtime_error("paired reference projection failed");
       const auto reference_b = check_output(paired_scalar, tokens);
       const auto widths = down ? std::vector{2, 3, 4, 7, 8, 10, 40, 80}
-                               : std::vector{2, 3, 4, 7};
+                               : std::vector{2, 3, 4, 7, 8};
       for (int n : widths) {
         CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
                            hipMemcpyHostToDevice),
@@ -602,23 +608,23 @@ void CheckVectorGrouping(bool down = false) {
       }
       if (formats[f] == q::WeightType::kQ4_K ||
           formats[f] == q::WeightType::kQ5_K) {
-        // Compare the fused decode path with the original GPU SwiGLU too:
+        // Compare the fused vector path with the original GPU SwiGLU too:
         // inactive experts, nonfinite scales and a ragged last row must
         // retain their exact values and output guards.
-        q::Swiglu(scalar + guard, paired_scalar + guard, used * rows, nullptr);
+        q::Swiglu(scalar + guard, paired_scalar + guard, count, nullptr);
         const auto gated_reference = Download(scalar, dirty.size());
-        for (int replay = 0; replay < 2; ++replay) {
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8}) {
           CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
                              hipMemcpyHostToDevice),
                    "poison gated output");
-          if (qfn_mmq_moe_gated_decode(static_cast<int>(formats[f]), w, wb, dx,
-                                       di, batch + guard, rows, cols, experts,
-                                       used, nullptr))
+          if (qfn_mmq_moe_gated_vec(static_cast<int>(formats[f]), w, wb, dx, di,
+                                    batch + guard, rows, cols, n, experts, used,
+                                    nullptr))
             throw std::runtime_error("gated vector launch failed");
-          const auto gated = check_output(batch, 1);
+          const auto gated = check_output(batch, n);
           if (std::memcmp(gated_reference.data() + guard, gated.data() + guard,
-                          used * rows * sizeof(float)) != 0)
-            throw std::runtime_error("gated decode changed SwiGLU output");
+                          n * used * rows * sizeof(float)) != 0)
+            throw std::runtime_error("gated vector changed SwiGLU output");
         }
       }
       CheckHip(hipFree(wb), "paired weight free");
