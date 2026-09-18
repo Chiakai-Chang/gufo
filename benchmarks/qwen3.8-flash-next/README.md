@@ -37,25 +37,25 @@ Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1481.68 | 1513.76 |
+| 0 | 1495.63 | 1528.66 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
-| 32768 | 1396.57 | TODO |
+| 32768 | 1406.93 | TODO |
 | 65536 | TODO | TODO |
-| 131072 | 1322.90 | TODO |
+| 131072 | 1333.50 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.33 | 47.10 | 71.0% |
+| Greedy | 0 | 26.32 | 47.12 | 71.0% |
 | Greedy | 32768 | TODO | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 47.52 | 75.9% |
+| Temperature 0.7 | 0 | TODO | 48.22 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
 AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
 MTP PP uses the greedy run. The latest SSM projection tuning applies only
 to prefill batches of at least 1024 tokens.
 The targets are **1700 tok/s pp2048** and near-flat PP through d128K;
-both remain TODO. The measured d0-to-d128K decline is 10.7%.
+both remain TODO. The measured d0-to-d128K decline is 10.8%.
 HTTP, C1, context 4096, seed 1, up to 128 output tokens, uncached prompts:
 
 | Prompt | MTP greedy tok/s | MTP temperature 0.7 tok/s |
@@ -99,7 +99,8 @@ Decisions use committed acceptance history and reset with the session.
 Snapshots preserve this state; new HTTP requests reset it when reusing
 context. Decisions never depend on wall-clock timings.
 
-Retained optimizations: SSM/QKV projection tiling, F16 SSM output activations,
+Retained optimizations: SSM/QKV projection tiling, padded WMMA output transposes,
+F16 SSM output activations,
 grouped Q4_K/Q5_K expert verification with fused SwiGLU, single-launch
 Q5_1/Q8_0 down projections, Q4 shortlisting with Q8 rescoring, GPU verification
 logits with one frontier readback, and parallel unordered verification with
@@ -162,6 +163,8 @@ Prefill changes also require `gufo bench --validate-prefill N` and CPU/reference
 probes. Benchmark retained changes with the Nix release and the same artifact,
 context capacity and request setup. Keep exact output and acceptance checks
 beside speed results; a profiler trace is not a speed benchmark.
+Standalone kernel ablations must match production's HIP flags:
+`-O3 -ffast-math -fno-finite-math-only`; masked softmax relies on infinities.
 The current 1024-token prefill check is finite, with scalar-winner rank 1,
 logit RMSE 0.24 and maximum absolute error 1.15. Snapshot compatibility
 includes inference arithmetic; older cached states rebuild after it changes.

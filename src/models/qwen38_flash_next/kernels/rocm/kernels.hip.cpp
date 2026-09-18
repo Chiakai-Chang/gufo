@@ -3929,13 +3929,17 @@ __launch_bounds__(256) __global__
     // Four waves compute gate rows and four compute the matching up rows.
     // Pair them in the existing LDS allocation, keeping the K accumulation
     // order and avoiding the gate's F32 write/read between projections.
+    // Two padding floats keep the accumulator scatter off repeated banks.
+    constexpr unsigned stride = 18;
+    constexpr unsigned plane = 16 * stride;
+    static_assert(8 * plane * sizeof(float) <= kLdsBytes);
     float* base = reinterpret_cast<float*>(lds);
-    float* scratch = base + wave_id * 256;
+    float* scratch = base + wave_id * plane;
 #pragma unroll
     for (int j = 0; j < kTokTiles; ++j) {
 #pragma unroll
       for (int l = 0; l < 8; ++l) {
-        scratch[sub_lane * 16 + 2 * l + half_id] = acc[0][j][l];
+        scratch[sub_lane * stride + 2 * l + half_id] = acc[0][j][l];
       }
       __syncthreads();
 #pragma unroll
@@ -3946,11 +3950,11 @@ __launch_bounds__(256) __global__
         if (t < bucket_rows && r_block + r < m_i) {
           const std::int32_t dst = rows_out[bucket_begin + t];
           if (dst >= 0) {
-            const int idx = (r / 16) * 256 + (flat / kRows) * 16 + r % 16;
+            const int idx = (r / 16) * plane + (flat / kRows) * stride + r % 16;
             // Preserve the separate projection epilogue's F32 evaluation
             // order before narrowing. Fast-math can otherwise regroup the
             // products and change an F16 rounding tie.
-            float product = base[idx + 4 * 256] * base[idx];
+            float product = base[idx + 4 * plane] * base[idx];
             asm volatile("" : "+v"(product));
             float value = product * SigmoidF(base[idx]);
             asm volatile("" : "+v"(value));
@@ -4826,8 +4830,13 @@ __launch_bounds__(256) __global__
   // Transpose the result through LDS, two row tiles at a time, so every
   // global store covers 32 consecutive rows of one token: a full 128-byte
   // line (half lines cost a read-modify-write on the fabric).
+  // Four padding floats reduce scatter bank conflicts and retain float4
+  // alignment for both output stores and the fused convolution's reads.
+  constexpr unsigned kOutputStride = 36;
+  static_assert(8 * 16 * kOutputStride * sizeof(float) <= sizeof(s_lds));
   static_assert(kWaveRowTiles % 2 == 0, "the epilogue pairs row tiles");
-  float* tile_scratch = reinterpret_cast<float*>(s_lds) + (wave_id * 512);
+  float* tile_scratch =
+      reinterpret_cast<float*>(s_lds) + wave_id * 16 * kOutputStride;
 #pragma unroll
   for (int i = 0; i < kWaveRowTiles; i += 2) {
 #pragma unroll
@@ -4835,8 +4844,9 @@ __launch_bounds__(256) __global__
       // scratch[token][row] over 16 tokens x 32 rows.
 #pragma unroll
       for (int l = 0; l < 8; ++l) {
-        tile_scratch[(sub_lane * 32) + (2 * l) + half_id] = acc[i][j][l];
-        tile_scratch[(sub_lane * 32) + 16 + (2 * l) + half_id] =
+        tile_scratch[(sub_lane * kOutputStride) + (2 * l) + half_id] =
+            acc[i][j][l];
+        tile_scratch[(sub_lane * kOutputStride) + 16 + (2 * l) + half_id] =
             acc[i + 1][j][l];
       }
       __builtin_amdgcn_wave_barrier();
@@ -4850,8 +4860,8 @@ __launch_bounds__(256) __global__
       const int tok_l = lane_id >> 1;
       const int row_l = (lane_id & 1) * 16;
       const std::size_t tok = t0 + static_cast<std::size_t>(tok_l);
-      const auto* src =
-          reinterpret_cast<const float4*>(tile_scratch + (tok_l * 32) + row_l);
+      const auto* src = reinterpret_cast<const float4*>(
+          tile_scratch + (tok_l * kOutputStride) + row_l);
       if constexpr (kSsmConv) {
         static_assert(BM == 256 && BN == 128 && BK == 2 && WM == 8 && WN == 1);
         static_assert(!kHcMix && kRowGroup == 1);
@@ -4869,11 +4879,11 @@ __launch_bounds__(256) __global__
             }
             if (row < channels && tok_l >= 3) {
               const float4 x0 = *reinterpret_cast<const float4*>(
-                  tile_scratch + (tok_l - 3) * 32 + row_l + v * 4);
+                  tile_scratch + (tok_l - 3) * kOutputStride + row_l + v * 4);
               const float4 x1 = *reinterpret_cast<const float4*>(
-                  tile_scratch + (tok_l - 2) * 32 + row_l + v * 4);
+                  tile_scratch + (tok_l - 2) * kOutputStride + row_l + v * 4);
               const float4 x2 = *reinterpret_cast<const float4*>(
-                  tile_scratch + (tok_l - 1) * 32 + row_l + v * 4);
+                  tile_scratch + (tok_l - 1) * kOutputStride + row_l + v * 4);
               const float4 w0 =
                   *reinterpret_cast<const float4*>(conv_w + (row + 0) * 4);
               const float4 w1 =
@@ -4905,7 +4915,8 @@ __launch_bounds__(256) __global__
           for (int q = 0; q < 16; ++q) {
             const std::size_t r = r0 + static_cast<std::size_t>(row_l + q);
             if (r < m) {
-              y[(tok * m) + r] = tile_scratch[(tok_l * 32) + row_l + q];
+              y[(tok * m) + r] =
+                  tile_scratch[(tok_l * kOutputStride) + row_l + q];
             }
           }
         }
