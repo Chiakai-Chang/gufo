@@ -4,9 +4,11 @@
 #include <array>
 #include <bit>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -351,7 +353,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     const auto candidate_ids = MtpCandidateWorkspaceSize(c.vocab_size);
     s.mtp_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
     s.mtp_scratch_ids = Alloc<std::uint32_t>(a, candidate_ids, error_msg);
-    s.mtp_scores = f32(kMtpCandidates);
+    // Selection has consumed the shortlist before writing its final scores.
+    // Pack those scores behind the 64 returned IDs for one host transfer.
+    s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
     if (!Check(hipHostMalloc(&e->mtp_token_host_, 2 * sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
         !Check(
@@ -359,7 +363,9 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
             "pinned draft candidates", error_msg)) {
       return nullptr;
     }
-    std::memset(e->mtp_candidates_host_, 0, sizeof(MtpCandidateLogits));
+    std::construct_at(e->mtp_candidates_host_);
+    e->mtp_candidates_host_->size =
+        std::min<std::size_t>(c.vocab_size, kMtpCandidates);
   }
   for (void* p : a) {
     if (p == nullptr) {
@@ -1453,14 +1459,13 @@ bool Executor::MtpHead(const DeviceMixer& head, const float* res, bool token,
   }
   if (candidates) {
     const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
-    if (!Check(hipMemcpyAsync(mtp_candidates_host_->ids.data(), s_.mtp_ids,
-                              count * sizeof(std::uint32_t),
+    static_assert(offsetof(MtpCandidateLogits, logits) ==
+                  kMtpCandidates * sizeof(std::uint32_t));
+    const auto bytes =
+        offsetof(MtpCandidateLogits, logits) + count * sizeof(float);
+    if (!Check(hipMemcpyAsync(mtp_candidates_host_, s_.mtp_ids, bytes,
                               hipMemcpyDeviceToHost, stream_),
-               "draft candidate IDs download", error_msg) ||
-        !Check(hipMemcpyAsync(mtp_candidates_host_->logits.data(),
-                              s_.mtp_scores, count * sizeof(float),
-                              hipMemcpyDeviceToHost, stream_),
-               "draft candidate logits download", error_msg)) {
+               "draft candidates download", error_msg)) {
       return false;
     }
   }
@@ -2050,6 +2055,32 @@ bool Executor::RestoreSnapshot(Session& session,
   return true;
 }
 
+bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
+                                    std::string* error_msg) const {
+  const auto rows = predictions.size();
+  if (rows == 0 || rows > options_.max_logit_rows || rows > kArgmaxParts ||
+      s_.mtp_ids == nullptr) {
+    AssignError(error_msg, "invalid greedy MTP verification request");
+    return false;
+  }
+  // Proposal selection has finished. Its two ID buffers and argmax scratch
+  // can be reused until the next draft head overwrites them.
+  const auto vocab = config().vocab_size;
+  gufo::hip::LaunchBatchedGPUArgmax(
+      s_.logits, s_.mtp_ids, rows, vocab,
+      {reinterpret_cast<float*>(s_.mtp_scratch_ids),
+       MtpCandidateWorkspaceSize(vocab)},
+      stream_);
+  GatherArgmaxCandidates(s_.logits, s_.mtp_ids, s_.mtp_argmax,
+                         static_cast<std::uint32_t>(rows), vocab, stream_);
+  return Check(hipMemcpyAsync(predictions.data(), s_.mtp_argmax,
+                              predictions.size_bytes(), hipMemcpyDeviceToHost,
+                              stream_),
+               "greedy MTP predictions download", error_msg) &&
+         Check(hipStreamSynchronize(stream_), "greedy MTP verification",
+               error_msg);
+}
+
 bool Executor::VerifyMtpProposal(std::uint32_t row, const MtpProposal& proposal,
                                  sampling::SamplerState& sampler,
                                  std::int32_t* token, bool* accepted,
@@ -2097,19 +2128,15 @@ bool Executor::VerifyMtpProposal(std::uint32_t row, const MtpProposal& proposal,
   const float residual_uniform = static_cast<float>(sampler.Uniform());
   gufo::hip::LaunchGPUSpeculativeSampling(
       s_.logits + static_cast<std::size_t>(row) * this->config().vocab_size,
-      reinterpret_cast<std::uint32_t*>(s_.mtp_token),
-      sampling_workspace_.speculative_accepted, this->config().vocab_size,
-      parameters, proposal.token, proposal.probability, proposal.ids.data(),
+      s_.mtp_ids, s_.mtp_ids + 1, this->config().vocab_size, parameters,
+      proposal.token, proposal.probability, proposal.ids.data(),
       proposal.probabilities.data(), proposal.size, acceptance_uniform,
       residual_uniform, penalty_tokens_.data(), penalty_counts_.data(),
       penalty_tokens_.size(), &sampling_workspace_, stream_);
-  if (!Check(hipMemcpyAsync(mtp_token_host_, s_.mtp_token, sizeof(std::int32_t),
-                            hipMemcpyDeviceToHost, stream_),
-             "MTP verification token download", error_msg) ||
-      !Check(hipMemcpyAsync(
-                 mtp_token_host_ + 1, sampling_workspace_.speculative_accepted,
-                 sizeof(std::uint32_t), hipMemcpyDeviceToHost, stream_),
-             "MTP acceptance download", error_msg) ||
+  if (!Check(
+          hipMemcpyAsync(mtp_token_host_, s_.mtp_ids, 2 * sizeof(std::int32_t),
+                         hipMemcpyDeviceToHost, stream_),
+          "MTP verification result download", error_msg) ||
       !Check(hipStreamSynchronize(stream_), "MTP verification", error_msg)) {
     return false;
   }
@@ -2169,8 +2196,6 @@ bool Executor::MtpForward(Session& session,
   }
   if (output.candidates != nullptr) {
     *output.candidates = *mtp_candidates_host_;
-    output.candidates->size =
-        std::min<std::size_t>(config().vocab_size, kMtpCandidates);
   }
   session.mtp_.position = pos + n;
   return true;

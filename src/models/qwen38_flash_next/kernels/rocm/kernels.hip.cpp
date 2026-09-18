@@ -1752,6 +1752,7 @@ __device__ __forceinline__ v16h LoadFrag(const __half* p) {
   return cvt.f;
 }
 
+template<bool kPrefetch>
 __global__ void SelectScoreKernel(const __half* q, const __half* blocks,
                                   float* scores, std::uint32_t n_tokens,
                                   const std::uint32_t* start_pos,
@@ -1796,12 +1797,26 @@ __global__ void SelectScoreKernel(const __half* q, const __half* blocks,
     }
   }
   // Not unrolled: eight unrolled steps hoist every fragment load and spill.
+  v16h kf[kTiles];
+  if constexpr (kPrefetch) {
+#pragma unroll
+    for (unsigned j = 0; j < kTiles; ++j)
+      kf[j] = LoadFrag(k_lane[j]);
+  }
 #pragma unroll 1
   for (std::uint32_t ks = 0; ks < kSteps; ++ks) {
-    v16h kf[kTiles];
+    v16h next[kTiles];
+    if constexpr (kPrefetch) {
+      if (ks + 1 < kSteps) {
 #pragma unroll
-    for (std::uint32_t j = 0; j < kTiles; ++j) {
-      kf[j] = LoadFrag(k_lane[j] + (ks * 16));
+        for (unsigned j = 0; j < kTiles; ++j)
+          next[j] = LoadFrag(k_lane[j] + ((ks + 1) * 16));
+      }
+      asm volatile("" ::: "memory");
+    } else {
+#pragma unroll
+      for (unsigned j = 0; j < kTiles; ++j)
+        kf[j] = LoadFrag(k_lane[j] + (ks * 16));
     }
 #pragma unroll
     for (std::uint32_t h = 0; h < kSelectHeads; ++h) {
@@ -1809,6 +1824,13 @@ __global__ void SelectScoreKernel(const __half* q, const __half* blocks,
 #pragma unroll
       for (std::uint32_t j = 0; j < kTiles; ++j) {
         acc[h][j] = Wmma(qf, kf[j], acc[h][j]);
+      }
+    }
+    if constexpr (kPrefetch) {
+      if (ks + 1 < kSteps) {
+#pragma unroll
+        for (unsigned j = 0; j < kTiles; ++j)
+          kf[j] = next[j];
       }
     }
   }
@@ -1878,10 +1900,10 @@ __device__ void FindHistogramThreshold(const std::uint32_t* histogram,
   __syncthreads();
 }
 
-/// Exact top-k over non-negative score bits. A 12-bit histogram locates
-/// the threshold bin, then at most 4096 candidates are refined in LDS.
-/// Larger bins use the original scores. The final mask keeps lowest-index
-/// ties; neither the coarse histogram nor compaction changes the ordering.
+/// Exact top-k over non-negative score bits. A sample chooses a histogram
+/// window; a clipped threshold falls back to the full key range. At most
+/// 4096 candidates are refined in LDS; larger bins use the original scores.
+/// Every score participates, and the final mask keeps lowest-index ties.
 __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
                                  const std::uint32_t* start_pos,
                                  std::uint32_t first_token, std::uint32_t ratio,
@@ -1906,28 +1928,59 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
       scores + static_cast<std::size_t>(t) * max_blocks);
   const std::uint32_t lane = threadIdx.x & 31u;
   const std::uint32_t wave = threadIdx.x >> 5;
-  for (std::uint32_t i = threadIdx.x; i < 4096; i += blockDim.x)
-    candidates[i] = 0;
-  __syncthreads();
-  // Read four adjacent scores per lane. Production score rows are aligned;
-  // operator callers with ragged strides retain bounded scalar reads.
-  for (std::uint32_t b = threadIdx.x * 4; b < complete; b += blockDim.x * 4) {
-    if (b + 3 < complete && max_blocks % 4 == 0) {
-      const uint4 v = *reinterpret_cast<const uint4*>(sc + b);
-      atomicAdd(&candidates[v.x >> 20], 1u);
-      atomicAdd(&candidates[v.y >> 20], 1u);
-      atomicAdd(&candidates[v.z >> 20], 1u);
-      atomicAdd(&candidates[v.w >> 20], 1u);
-    } else {
-      for (std::uint32_t j = 0; j < 4 && b + j < complete; ++j)
-        atomicAdd(&candidates[sc[b + j] >> 20], 1u);
-    }
+  // Short rows already fit the original histogram cheaply.
+  const bool windowed = complete >= 4096;
+  std::uint32_t maximum = 0;
+  if (windowed) {
+    maximum = threadIdx.x < min(complete, kThreads) ? sc[threadIdx.x] : 0u;
+#pragma unroll
+    for (unsigned offset = 16; offset > 0; offset /= 2)
+      maximum = max(maximum, __shfl_xor(maximum, offset));
+    if (lane == 0)
+      wave_ties[wave] = maximum;
+    __syncthreads();
+    for (unsigned w = 0; w < kThreads / 32; ++w)
+      maximum = max(maximum, wave_ties[w]);
   }
+  // Finer bins reduce contention among scores with similar exponents.
+  // The sample only places the window: clipped tails are still counted.
+  unsigned prefix_bits = windowed ? 14 : 20;
+  unsigned base =
+      (maximum >> prefix_bits) > 2047 ? (maximum >> prefix_bits) - 2047 : 0;
   if (threadIdx.x == 0)
     candidate_count = 0;
-  __syncthreads();
-  FindHistogramThreshold<16>(candidates, budget, wave_ties, state);
-  std::uint32_t prefix = state[0] << 20, remaining = state[1];
+  for (unsigned attempt = 0; attempt < 2; ++attempt) {
+    for (unsigned i = threadIdx.x; i < 4096; i += blockDim.x)
+      candidates[i] = 0;
+    __syncthreads();
+    const auto bin = [&](std::uint32_t value) {
+      const auto key = value >> prefix_bits;
+      return key > base ? min(key - base, 4095u) : 0u;
+    };
+    // Aligned production rows use four adjacent scores per lane.
+    for (unsigned b = threadIdx.x * 4; b < complete; b += blockDim.x * 4) {
+      if (b + 3 < complete && max_blocks % 4 == 0) {
+        const uint4 v = *reinterpret_cast<const uint4*>(sc + b);
+        atomicAdd(&candidates[bin(v.x)], 1u);
+        atomicAdd(&candidates[bin(v.y)], 1u);
+        atomicAdd(&candidates[bin(v.z)], 1u);
+        atomicAdd(&candidates[bin(v.w)], 1u);
+      } else {
+        for (unsigned j = 0; j < 4 && b + j < complete; ++j)
+          atomicAdd(&candidates[bin(sc[b + j])], 1u);
+      }
+    }
+    __syncthreads();
+    FindHistogramThreshold<16>(candidates, budget, wave_ties, state);
+    if (!windowed || attempt != 0 ||
+        (state[0] != 4095 && (state[0] != 0 || base == 0)))
+      break;
+    // A clipped threshold needs a histogram over the full 32-bit keys.
+    prefix_bits = 20;
+    base = 0;
+  }
+  std::uint32_t prefix = (base + state[0]) << prefix_bits;
+  std::uint32_t remaining = state[1];
   // Reuse the first histogram as a bounded candidate list. If its bin is
   // larger, later radix passes read the original scores instead.
   const bool compact = state[2] <= 4096 && remaining != state[2];
@@ -1935,31 +1988,30 @@ __global__ void SelectMarkKernel(std::uint32_t* mask, const float* scores,
   if (compact) {
     for (std::uint32_t b = threadIdx.x; b < complete; b += blockDim.x) {
       std::uint32_t v = sc[b];
-      if ((v & 0xFFF00000u) == prefix)
+      if ((v & (~0u << prefix_bits)) == prefix)
         candidates[atomicAdd(&candidate_count, 1u)] = v;
     }
     __syncthreads();
   }
   // A whole bin can be accepted as soon as its count fills the remaining
-  // budget. Otherwise refine the low 20 bits exactly (8 + 8 + 4).
-  for (int shift = 12; shift >= 0 && remaining != state[2];
-       shift = shift == 4 ? 0 : shift - 8) {
+  // budget. Otherwise refine the remaining bits, at most eight per pass.
+  for (unsigned bits = prefix_bits; bits > 0 && remaining != state[2];) {
+    const unsigned digit_bits = min(bits, 8u);
+    const std::uint32_t prefix_mask = ~0u << bits;
+    bits -= digit_bits;
+    const std::uint32_t radix_mask = (1u << digit_bits) - 1;
     hist[threadIdx.x] = 0;
     __syncthreads();
-    const std::uint32_t prefix_mask = ~0u << (shift == 0 ? 4 : shift + 8);
-    const std::uint32_t radix_mask = shift == 0 ? 15 : 255;
     for (std::uint32_t b = threadIdx.x; b < input_count; b += blockDim.x) {
       const std::uint32_t v = compact ? candidates[b] : sc[b];
       if ((v & prefix_mask) == prefix)
-        atomicAdd(&hist[(v >> shift) & radix_mask], 1u);
+        atomicAdd(&hist[(v >> bits) & radix_mask], 1u);
     }
     __syncthreads();
     FindHistogramThreshold<1>(hist, remaining, wave_ties, state);
-    prefix |= state[0] << shift;
+    prefix |= state[0] << bits;
     remaining = state[1];
     __syncthreads();
-    if (shift == 0)
-      break;
   }
   const std::uint32_t threshold = prefix;
   // Blocks strictly above the threshold are in; the first `remaining` ties
@@ -2476,6 +2528,21 @@ __global__ void ArgmaxFinishKernel(const float* logits,
 }
 
 constexpr unsigned kMtpCandidateTile = 1024;
+
+__global__ void GatherArgmaxCandidatesKernel(const float* logits,
+                                             const std::uint32_t* ids,
+                                             ArgmaxCandidate* out,
+                                             std::uint32_t rows,
+                                             std::uint32_t vocab) {
+  const unsigned row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < rows) {
+    const auto id = ids[row];
+    out[row] = id < vocab
+                   ? ArgmaxCandidate{logits[std::size_t(row) * vocab + id],
+                                     static_cast<std::int32_t>(id)}
+                   : ArgmaxCandidate{NAN, -1};
+  }
+}
 
 // A token excluded from its tile's top Keep cannot enter the global top Keep.
 // Reduce tiles repeatedly, retaining the original order of equal scores.
@@ -3973,8 +4040,8 @@ __launch_bounds__(256) __global__
       }
       __syncthreads();
 #pragma unroll
-      for (int unit = 0; unit < 4; ++unit) {
-        const int flat = unit * 256 + tid;
+      for (int unit = 0; unit < 2; ++unit) {
+        const int flat = (unit * 256 + tid) * 2;
         const int t = t_local + j * 16 + flat / kRows;
         const int r = flat % kRows;
         if (t < bucket_rows && r_block + r < m_i) {
@@ -3984,12 +4051,24 @@ __launch_bounds__(256) __global__
             // Preserve the separate projection epilogue's F32 evaluation
             // order before narrowing. Fast-math can otherwise regroup the
             // products and change an F16 rounding tie.
-            float product = base[idx + 4 * plane] * base[idx];
-            asm volatile("" : "+v"(product));
-            float value = product * SigmoidF(base[idx]);
-            asm volatile("" : "+v"(value));
-            out_half[static_cast<std::size_t>(dst) * m + r_block + r] =
-                __float2half(value);
+            __half values[2];
+#pragma unroll
+            for (int v = 0; v < 2; ++v) {
+              float product = base[idx + v + 4 * plane] * base[idx + v];
+              asm volatile("" : "+v"(product));
+              float value = product * SigmoidF(base[idx + v]);
+              asm volatile("" : "+v"(value));
+              values[v] = __float2half(value);
+            }
+            const auto offset = static_cast<std::size_t>(dst) * m + r_block + r;
+            if (m % 2 == 0 && r_block + r + 1 < m_i) {
+              *reinterpret_cast<__half2*>(out_half + offset) =
+                  __halves2half2(values[0], values[1]);
+            } else {
+              out_half[offset] = values[0];
+              if (r_block + r + 1 < m_i)
+                out_half[offset + 1] = values[1];
+            }
           }
         }
       }
@@ -5430,11 +5509,19 @@ void SelectBlocks(const __half* q, const __half* blocks, std::uint32_t* mask,
   }
   // Grids are sized by max_blocks so a captured decode graph replays at any
   // position; blocks past the live range return at once.
-  hipLaunchKernelGGL(SelectScoreKernel,
-                     dim3((n_tokens + kSelectQueries - 1) / kSelectQueries,
-                          (max_blocks + kSelectRows - 1) / kSelectRows),
-                     dim3(kThreads), 0, stream, q, blocks, scores, n_tokens,
-                     start_pos, first_token, ratio, budget, max_blocks);
+  const dim3 grid((n_tokens + kSelectQueries - 1) / kSelectQueries,
+                  (max_blocks + kSelectRows - 1) / kSelectRows);
+  // Prefill can overlap the next key loads with four heads of matrix work.
+  // Short decode batches are faster with the smaller register footprint.
+  if (n_tokens >= 256) {
+    hipLaunchKernelGGL((SelectScoreKernel<true>), grid, dim3(kThreads), 0,
+                       stream, q, blocks, scores, n_tokens, start_pos,
+                       first_token, ratio, budget, max_blocks);
+  } else {
+    hipLaunchKernelGGL((SelectScoreKernel<false>), grid, dim3(kThreads), 0,
+                       stream, q, blocks, scores, n_tokens, start_pos,
+                       first_token, ratio, budget, max_blocks);
+  }
   hipLaunchKernelGGL(SelectMarkKernel, dim3(n_tokens), dim3(kThreads), 0,
                      stream, mask, scores, start_pos, first_token, ratio,
                      budget, mask_words, max_blocks);
@@ -5585,6 +5672,13 @@ void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
                      dim3(kThreads), 0, stream, logits, scratch, vocab);
   hipLaunchKernelGGL(ArgmaxFinishKernel, dim3(n_tokens), dim3(kThreads), 0,
                      stream, logits, scratch, out, vocab);
+}
+
+void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
+                            ArgmaxCandidate* out, std::uint32_t rows,
+                            std::uint32_t vocab, hipStream_t stream) {
+  hipLaunchKernelGGL(GatherArgmaxCandidatesKernel, dim3(Blocks(rows)),
+                     dim3(kThreads), 0, stream, logits, ids, out, rows, vocab);
 }
 
 template<unsigned Keep>

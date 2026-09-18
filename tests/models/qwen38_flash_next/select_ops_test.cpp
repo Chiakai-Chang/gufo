@@ -69,10 +69,12 @@ std::vector<T> Download(const T* device, std::size_t count) {
 }
 
 enum class ScoreLayout { kTight, kAligned };
+enum class TiedBlocks { kPrefix, kSuffix };
 
 bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
          bool zero_queries = false, std::uint32_t tied_high_blocks = 0,
-         bool sample_scores = false, ScoreLayout layout = ScoreLayout::kTight) {
+         bool sample_scores = false, ScoreLayout layout = ScoreLayout::kTight,
+         TiedBlocks tied_blocks = TiedBlocks::kPrefix) {
   const std::uint32_t max_context = start_pos + n_tokens + 64;
   const std::uint32_t blocks_needed = (max_context + kRatio - 1) / kRatio;
   const std::uint32_t mask_words = (blocks_needed + 31) / 32;
@@ -91,8 +93,11 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
     std::fill(blocks.begin(), blocks.end(), 0.0F);
     for (std::size_t i = 0; i < qv.size(); i += kDim)
       qv[i] = 1.0F;
-    for (std::uint32_t b = 0; b < tied_high_blocks; ++b)
-      blocks[static_cast<std::size_t>(b) * kDim] = 1.0F;
+    for (std::uint32_t b = 0; b < tied_high_blocks; ++b) {
+      const auto row =
+          tied_blocks == TiedBlocks::kPrefix ? b : max_blocks - 1 - b;
+      blocks[static_cast<std::size_t>(row) * kDim] = 1.0F;
+    }
   }
   std::vector<__half> q_half(qv.size()), blocks_half(blocks.size());
   const auto half = [](float value) { return __float2half_rn(value); };
@@ -283,8 +288,8 @@ int main() {
     bool ok = true;
     ok = Run(100, 20000, 0x1234ABCDU) && ok;     // deep, ragged group
     ok = Run(7, 131069, 0x2468ACE0U) && ok;
-    ok = Run(129, 131069, 0xC0FFEE01U, false, 0, true,
-             ScoreLayout::kAligned) && ok;
+    ok = Run(257, 131069, 0xC0FFEE01U, false, 0, true, ScoreLayout::kAligned) &&
+         ok;
     ok = Run(129, 131069, 0, true, 0, true) && ok;  // deep, partial word
     ok = Run(1, 9001, 0x0BADF00DU) && ok;        // decode
     ok = Run(40, 2040, 0xDEADBEEFU) && ok;       // straddles the budget
@@ -293,6 +298,12 @@ int main() {
     // lowest-index prefix. Both must produce the same CPU-sorted mask.
     ok = Run(1, 9001, 0, false, kBudget) && ok;
     ok = Run(1, 9001, 0, false, kBudget + 7) && ok;
+    // Unrepresentative samples put the threshold below or above the
+    // histogram window. Both tails must retain the exact sorted result.
+    ok = Run(1, 20000, 0, false, 256) && ok;
+    ok = Run(1, 20000, 0, false, kBudget + 128, false, ScoreLayout::kAligned,
+             TiedBlocks::kSuffix) &&
+         ok;
     return ok ? 0 : 1;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

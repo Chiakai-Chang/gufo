@@ -163,6 +163,10 @@ public:
                                        std::int32_t* token, bool* accepted,
                                        std::string* error_msg) const;
 
+  /// Plain greedy verification keeps full logit rows on the GPU.
+  [[nodiscard]] bool GreedyMtpPredictions(
+      std::span<ArgmaxCandidate> predictions, std::string* error_msg) const;
+
   /// A session's complete context as one host byte payload: recurrent and
   /// PLE state, KV and indexer caches up to the position, and the draft
   /// block's caches plus the `hidden_rows` most recent kept trunk rows.

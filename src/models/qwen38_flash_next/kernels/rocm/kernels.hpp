@@ -411,6 +411,12 @@ struct ArgmaxCandidate {
 void Argmax(const float* logits, ArgmaxCandidate* scratch, std::int32_t* out,
             std::uint32_t n_tokens, std::uint32_t vocab, hipStream_t stream);
 
+/// Gather selected IDs and their original logits from independent rows.
+/// The caller checks finite values only for the verification prefix it visits.
+void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
+                            ArgmaxCandidate* out, std::uint32_t rows,
+                            std::uint32_t vocab, hipStream_t stream);
+
 inline constexpr std::uint32_t kMtpShortlist = 256;
 /// Number of IDs in each of the two selection buffers.
 inline constexpr std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
@@ -420,6 +426,7 @@ inline constexpr std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
 /// Exact MTP top-64 selection, descending score with lowest-token-ID ties.
 /// Nonfinite scores become -infinity. Both ID buffers have room for
 /// MtpCandidateWorkspaceSize(vocab); scores receives min(vocab, 64) values.
+/// Scores may reuse the ID workspace starting at offset 64.
 /// All candidate operations are graph-safe.
 void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,

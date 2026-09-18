@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <optional>
@@ -10,6 +11,7 @@
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/executor.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
@@ -473,6 +475,8 @@ bool Session::DecodeStep(std::size_t max_tokens,
 
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
+  const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
+  const bool gpu_verification = sampled || gpu_greedy;
   MtpCandidateLogits candidates;
   if (!DraftCatchUp(anchor, true, error_msg, sampled ? &candidates : nullptr)) {
     return false;
@@ -509,18 +513,40 @@ bool Session::DecodeStep(std::size_t max_tokens,
   // target logits over the full vocabulary and the request's token history.
   const auto k = static_cast<std::uint32_t>(chain.size());
   const std::size_t vocab = model_->VocabSize();
-  if (!sampled && verify_logits_.empty()) {
+  if (!gpu_verification && verify_logits_.empty()) {
     verify_logits_.resize(exec.max_speculative() * vocab);
   }
   if (!exec.Forward(*session_, chain, k,
-                    sampled ? nullptr : verify_logits_.data(), true,
+                    gpu_verification ? nullptr : verify_logits_.data(), true,
                     error_msg)) {
     return false;
   }
   sampler.Accept(static_cast<sampling::TokenId>(anchor));
+  std::array<rocm::ArgmaxCandidate, kMaxMtpDraftTokens> greedy{};
+  if (gpu_greedy &&
+      !exec.GreedyMtpPredictions(std::span(greedy).first(k - 1), error_msg)) {
+    return false;
+  }
   std::uint32_t keep = 1;
   std::optional<std::int32_t> correction;
   while (keep < k) {
+    if (gpu_greedy) {
+      const auto& prediction = greedy[keep - 1];
+      if (!std::isfinite(prediction.value)) {
+        AssignError(error_msg, "logit distribution contains no finite values");
+        return false;
+      }
+      if (is_stop(prediction.index)) {
+        result->stop = true;
+        break;
+      }
+      if (prediction.index != chain[keep]) {
+        break;
+      }
+      sampler.Accept(static_cast<sampling::TokenId>(prediction.index));
+      ++keep;
+      continue;
+    }
     if (sampled) {
       std::int32_t token = 0;
       bool accepted = false;
@@ -550,10 +576,10 @@ bool Session::DecodeStep(std::size_t max_tokens,
     ++keep;
   }
   if (!exec.Rollback(*session_, keep, error_msg,
-                     sampled ? logits_.data() : nullptr)) {
+                     gpu_verification ? logits_.data() : nullptr)) {
     return false;
   }
-  if (!sampled) {
+  if (!gpu_verification) {
     std::copy_n(verify_logits_.data() + (keep - 1) * vocab, vocab,
                 logits_.begin());
   }

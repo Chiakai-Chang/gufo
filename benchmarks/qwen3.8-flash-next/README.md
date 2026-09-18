@@ -37,22 +37,24 @@ Rates are tok/s; profiler timings are excluded.
 
 | Depth | AR pp2048 | MTP pp2048 |
 | ---: | ---: | ---: |
-| 0 | 1509.21 | 1542.85 |
+| 0 | 1516.68 | 1554.87 |
 | 4096 | TODO | TODO |
 | 16384 | TODO | TODO |
-| 32768 | 1415.87 | TODO |
+| 32768 | 1424.78 | 1305.21 |
 | 65536 | TODO | TODO |
-| 131072 | 1346.73 | TODO |
+| 131072 | 1352.81 | TODO |
 
 | Sampling | Depth | AR tg128 | MTP tg128 | MTP acceptance |
 | --- | ---: | ---: | ---: | ---: |
-| Greedy | 0 | 26.37 | 47.49 | 71.0% |
-| Greedy | 32768 | TODO | TODO | TODO |
-| Temperature 0.7 | 0 | TODO | 48.41 | 75.9% |
+| Greedy | 0 | 26.26 | 47.98 | 71.0% |
+| Greedy | 32768 | 23.98 | 58.65 | 100% |
+| Temperature 0.7 | 0 | TODO | 48.95 | 75.9% |
 | Temperature 1.0, top-p 0.95 | 0 | TODO | TODO | TODO |
 
-AR PP uses a 133,121-token context limit; d0 TG and MTP use 2,177.
-MTP PP uses the greedy run. SSM convolution and QKV normalization/cache writes
+AR PP uses a 133,121-token context limit; TG and MTP use depth + 2,177.
+MTP PP includes draft catch-up and uses the greedy run.
+The d32K continuation accepted all 110 draft proposals; acceptance depends
+on the prompt and depth. SSM convolution and QKV normalization/cache writes
 are fused into projections for prefill batches of at least 1024 tokens.
 The HC down projection fuses its activation and F16 conversion from 96 tokens.
 The targets are **1700 tok/s pp2048** and near-flat PP through d128K;
@@ -61,9 +63,9 @@ HTTP, C1, context 4096, seed 1, up to 128 output tokens, uncached prompts:
 
 | Prompt | MTP greedy tok/s | MTP temperature 0.7 tok/s |
 | --- | ---: | ---: |
-| Repetitive pattern | 82.02 | 71.95 |
-| Python iterator merge | 48.11 | 47.33 |
-| Probability exercise | 58.13 | 52.60 |
+| Repetitive pattern | 82.01 | 73.49 |
+| Python iterator merge | 48.30 | 48.25 |
+| Probability exercise | 58.74 | 52.52 |
 
 The sampled repetitive response ended at 78 tokens; other rows generated 128.
 Concurrent throughput: TODO.
@@ -100,15 +102,19 @@ Decisions use committed acceptance history and reset with the session.
 Snapshots preserve this state; new HTTP requests reset it when reusing
 context. Decisions never depend on wall-clock timings.
 
-Retained optimizations: SSM/QKV projection fusions, HC down activation fusion,
-padded WMMA output transposes, F16 SSM output activations,
-grouped Q4_K/Q5_K expert verification with fused SwiGLU, single-launch
-Q5_1/Q8_0 down projections, Q4 shortlisting with Q8 rescoring, GPU verification
-logits with one frontier readback, and parallel unordered verification with
-the original F32 sum order.
-F16 SSM output reduces numerical error with unchanged model throughput and
-no additional allocation. Larger sparse-attention tiles and wider DeltaNet
-row reductions were slower. Compact attention scratch gave no material gain.
+Retained optimizations: fused prefill projections, padded WMMA transposes,
+grouped expert verification, paired F16 expert stores, Q4 shortlisting with
+Q8 rescoring, packed MTP readbacks and GPU verification with one frontier
+readback. Plain greedy verification returns GPU argmax results; penalties
+retain the shared sampler's semantics. Sampled verification preserves the
+original F32 sum order.
+
+The indexer prefetches keys for batches of at least 256 queries. Exact top-k
+uses a finer histogram window at 16K depth and above, falling back to the full
+range if the threshold is clipped. Every score participates.
+Larger attention tiles, wider DeltaNet reductions and carrying convolution
+boundaries across larger tiles were slower. Compact attention scratch gave
+no material gain. Sparse attention remains the largest measured depth penalty.
 
 ## Quality checks
 
@@ -139,7 +145,9 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]moe_ids_o
   routed down projections also check expanded top-10 batches. Grouped
   projections cover duplicate expert slots within and across tokens. MTP head
   checks cover Q4 quantization, bit-exact selected Q8 rows, lowest-ID ties
-  including signed zero, nonfinite logits and graph replay.
+  including signed zero, nonfinite logits, packed workspace reuse and graph
+  replay. Indexer checks compare every mask bit with a CPU full sort, including
+  both histogram fallback tails and a 257-query batch near 128K depth.
 - **Model replay:** greedy AR/MTP tokens, full logits, RNG and positions must
   match at short and 4K contexts. Sampled MTP must replay itself exactly;
   teacher-forcing its tokens through AR must reproduce every frontier logit.

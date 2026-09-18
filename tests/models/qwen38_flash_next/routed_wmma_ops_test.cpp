@@ -707,7 +707,7 @@ int main() {
                 64)) &&
          ok;
     // Ragged rows against the 128-row tile and a tiny batch.
-    ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 200, 512, 0xDEADBEEFU)) && ok;
+    ok = Ok(Run(q::WeightType::kQ4_K, 40, 4, 8, 201, 512, 0xDEADBEEFU)) && ok;
     // The 16-row tile (small buckets) on every type.
     ok = Ok(Run(q::WeightType::kQ4_K, 300, 10, 64, 640, 2560, 0x16161616U,
                 16)) &&

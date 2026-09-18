@@ -12,6 +12,8 @@
 #include <string>
 #include <vector>
 
+#include "src/core/sampling.hpp"
+#include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
@@ -71,7 +73,8 @@ void CheckArgmax(std::uint32_t vocab) {
         std::fill_n(row, vocab, nan);
         break;
       case 7:
-        std::fill_n(row, vocab, 0.0F);
+        for (std::uint32_t i = 0; i < vocab; ++i)
+          row[i] = i % 2 ? 0.0F : -0.0F;
         break;
       case 8:
         row[vocab / 2] = row[vocab - 1] = 10.0F;
@@ -83,10 +86,19 @@ void CheckArgmax(std::uint32_t vocab) {
   auto device_logits = Allocate<float>(logits.size());
   auto scratch = Allocate<q::ArgmaxCandidate>(rows * q::kArgmaxParts);
   auto output = Allocate<std::int32_t>(rows + 2);
+  const auto greedy_scratch_size = 2 * rows * ((vocab - 1) / 4096 + 1);
+  auto greedy_scratch = Allocate<float>(greedy_scratch_size);
+  auto greedy_ids = Allocate<std::uint32_t>(rows);
+  auto greedy_output = Allocate<q::ArgmaxCandidate>(rows + 2);
+  std::vector<q::ArgmaxCandidate> predictions(rows + 2, {-1234567.0F, guard});
   std::vector<std::int32_t> actual(rows + 2, guard);
   CheckHip(hipMemcpy(output.get(), actual.data(),
                      actual.size() * sizeof(actual[0]), hipMemcpyHostToDevice),
            "initialize output");
+  CheckHip(hipMemcpy(greedy_output.get(), predictions.data(),
+                     predictions.size() * sizeof(predictions[0]),
+                     hipMemcpyHostToDevice),
+           "initialize greedy output");
   // Reuse the captured selection with changed logits, as the draft executor
   // does.
   hipStream_t stream = nullptr;
@@ -97,6 +109,11 @@ void CheckArgmax(std::uint32_t vocab) {
            "capture");
   q::Argmax(device_logits.get(), scratch.get(), output.get() + 1, rows, vocab,
             stream);
+  gufo::hip::LaunchBatchedGPUArgmax(
+      device_logits.get(), greedy_ids.get(), rows, vocab,
+      {greedy_scratch.get(), greedy_scratch_size}, stream);
+  q::GatherArgmaxCandidates(device_logits.get(), greedy_ids.get(),
+                            greedy_output.get() + 1, rows, vocab, stream);
   CheckHip(hipStreamEndCapture(stream, &graph), "finish capture");
   CheckHip(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
            "instantiate");
@@ -110,10 +127,19 @@ void CheckArgmax(std::uint32_t vocab) {
                             actual.size() * sizeof(actual[0]),
                             hipMemcpyDeviceToHost, stream),
              "download tokens");
+    CheckHip(hipMemcpyAsync(predictions.data(), greedy_output.get(),
+                            predictions.size() * sizeof(predictions[0]),
+                            hipMemcpyDeviceToHost, stream),
+             "download greedy predictions");
     CheckHip(hipStreamSynchronize(stream), "synchronize");
     if (actual.front() != guard || actual.back() != guard) {
       throw std::runtime_error("argmax overwrote output guard");
     }
+    if (predictions.front().index != guard ||
+        predictions.back().index != guard ||
+        predictions.front().value != -1234567.0F ||
+        predictions.back().value != -1234567.0F)
+      throw std::runtime_error("greedy argmax overwrote output guard");
     for (std::uint32_t t = 0; t < rows; ++t) {
       const float* row = logits.data() + static_cast<std::size_t>(t) * vocab;
       const auto expected =
@@ -123,6 +149,25 @@ void CheckArgmax(std::uint32_t vocab) {
             "argmax mismatch: vocab=" + std::to_string(vocab) + " row=" +
             std::to_string(t) + " expected=" + std::to_string(expected) +
             " actual=" + std::to_string(actual[t + 1]));
+      }
+      const auto& prediction = predictions[t + 1];
+      gufo::sampling::SamplerState sampler;
+      std::uint32_t greedy = 0;
+      bool finite = true;
+      try {
+        greedy = sampler.Sample({row, vocab});
+      } catch (const std::runtime_error&) {
+        finite = false;
+      }
+      if (!finite) {
+        if (std::isfinite(prediction.value))
+          throw std::runtime_error("greedy argmax accepted nonfinite row");
+      } else if (prediction.index != static_cast<std::int32_t>(greedy) ||
+                 std::bit_cast<std::uint32_t>(prediction.value) !=
+                     std::bit_cast<std::uint32_t>(row[greedy])) {
+        throw std::runtime_error(
+            "greedy argmax disagrees with sampler: vocab=" +
+            std::to_string(vocab) + " row=" + std::to_string(t));
       }
     }
     std::reverse(logits.begin(), logits.end());
@@ -139,14 +184,17 @@ void CheckCandidates(std::uint32_t vocab, bool shortlist) {
   const auto workspace_size = q::MtpCandidateWorkspaceSize(vocab);
   auto device_ids = Allocate<std::uint32_t>(workspace_size + 2);
   auto scratch_ids = Allocate<std::uint32_t>(workspace_size + 2);
-  auto device_scores = Allocate<float>(kCandidates + 2);
+  // Match the executor's packed result: selection consumes the input IDs
+  // before the final scores overwrite the discarded part of the shortlist.
+  auto* device_scores =
+      reinterpret_cast<float*>(device_ids.get() + 1 + kCandidates);
   auto device_logits = Allocate<float>(vocab);
   std::vector<float> logits(vocab);
   std::vector<std::uint32_t> expected(vocab);
   const auto count =
       std::min<std::size_t>(vocab, shortlist ? q::kMtpShortlist : kCandidates);
   const auto result_count = std::min<std::size_t>(vocab, kCandidates);
-  std::vector<float> scores(result_count + 2, -1234567.0F);
+  std::vector<float> scores(result_count);
   std::vector<std::uint32_t> ids(workspace_size + 2, UINT32_MAX);
   CheckHip(hipMemcpy(device_ids.get(), ids.data(), ids.size() * 4,
                      hipMemcpyHostToDevice),
@@ -154,9 +202,6 @@ void CheckCandidates(std::uint32_t vocab, bool shortlist) {
   CheckHip(hipMemcpy(scratch_ids.get(), ids.data(), ids.size() * 4,
                      hipMemcpyHostToDevice),
            "candidate scratch guards");
-  CheckHip(hipMemcpy(device_scores.get(), scores.data(), scores.size() * 4,
-                     hipMemcpyHostToDevice),
-           "candidate score guards");
   hipStream_t stream = nullptr;
   hipGraph_t graph = nullptr, finish_graph = nullptr;
   hipGraphExec_t executable = nullptr, finish = nullptr;
@@ -168,8 +213,7 @@ void CheckCandidates(std::uint32_t vocab, bool shortlist) {
                     scratch_ids.get() + 1, vocab, stream);
   else
     q::MtpTopCandidates(device_logits.get(), device_ids.get() + 1,
-                        scratch_ids.get() + 1, device_scores.get() + 1, vocab,
-                        stream);
+                        scratch_ids.get() + 1, device_scores, vocab, stream);
   CheckHip(hipStreamEndCapture(stream, &graph), "candidate capture end");
   CheckHip(hipGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
            "candidate graph");
@@ -177,7 +221,7 @@ void CheckCandidates(std::uint32_t vocab, bool shortlist) {
     CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
              "rescoring capture");
     q::MtpRescoredCandidates(device_logits.get(), device_ids.get() + 1,
-                             device_scores.get() + 1, vocab, stream);
+                             device_scores, vocab, stream);
     CheckHip(hipStreamEndCapture(stream, &finish_graph),
              "rescoring capture end");
     CheckHip(hipGraphInstantiate(&finish, finish_graph, nullptr, nullptr, 0),
@@ -236,22 +280,21 @@ void CheckCandidates(std::uint32_t vocab, bool shortlist) {
                               hipMemcpyDeviceToHost, stream),
                "rescored IDs");
     }
-    CheckHip(hipMemcpyAsync(scores.data(), device_scores.get(),
-                            scores.size() * 4, hipMemcpyDeviceToHost, stream),
+    CheckHip(hipMemcpyAsync(scores.data(), device_scores, scores.size() * 4,
+                            hipMemcpyDeviceToHost, stream),
              "candidate scores");
     CheckHip(hipStreamSynchronize(stream), "rescoring synchronization");
-    if (scores.front() != -1234567.0F || scores.back() != -1234567.0F ||
-        ids.front() != UINT32_MAX || ids.back() != UINT32_MAX)
+    if (ids.front() != UINT32_MAX || ids.back() != UINT32_MAX)
       throw std::runtime_error("MTP candidate output guard changed");
     for (std::size_t i = 0; i < result_count; ++i) {
       if (ids[i + 1] != expected[i] ||
-          std::bit_cast<std::uint32_t>(scores[i + 1]) !=
+          std::bit_cast<std::uint32_t>(scores[i]) !=
               std::bit_cast<std::uint32_t>(score(expected[i])))
         throw std::runtime_error(
             "MTP candidate scores disagree with CPU: mode=" +
             std::to_string(mode) + " rank=" + std::to_string(i) + " ID=" +
             std::to_string(ids[i + 1]) + "/" + std::to_string(expected[i]) +
-            " score=" + std::to_string(scores[i + 1]) + "/" +
+            " score=" + std::to_string(scores[i]) + "/" +
             std::to_string(score(expected[i])));
     }
     CheckHip(hipMemcpy(ids.data(), scratch_ids.get(), ids.size() * 4,
