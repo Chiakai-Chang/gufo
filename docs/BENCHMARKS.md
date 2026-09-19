@@ -7,6 +7,14 @@ This method is teacher-forced and matched-token; it is not free-running
 evaluation. Capability evaluation (free-running, answer-graded) is defined
 in [EVAL.md](EVAL.md) and runs through the OpenAI-compatible serving route.
 
+Checked-in JSON retains fixtures, model provenance, calibration inputs and
+bounded result summaries. Serving summaries preserve aggregate metrics and
+per-case completion hashes and the original report digest. Raw samples stay
+in ignored `artifacts/`. Full-logit captures also stay there, except for independent
+reference data required by a maintained correctness test. Downloaded tokenizer
+files and `.direnv` shell state are local files, not repository source; use
+`nix run nixpkgs#cloc -- --vcs=git --force-lang=C++,hip` to count the tracked tree.
+
 ## Pipeline (tools/)
 
 Benchmarks are the last step of the offline conversion toolchain. Each step
