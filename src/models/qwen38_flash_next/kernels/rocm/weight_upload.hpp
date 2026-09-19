@@ -3,10 +3,11 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <span>
 #include <string>
+
+#include "src/core/gguf_reader.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 
@@ -16,7 +17,7 @@ namespace gufo::models::qwen38_flash_next::rocm {
 class WeightUpload {
 public:
   static std::unique_ptr<WeightUpload> Create(
-      std::span<const std::filesystem::path> shards, std::string* error);
+      std::span<const core::GgufMappedRegion> shards, std::string* error);
   ~WeightUpload();
   WeightUpload(const WeightUpload&) = delete;
   WeightUpload& operator=(const WeightUpload&) = delete;

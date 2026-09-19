@@ -1,5 +1,6 @@
 #include "src/models/qwen38_flash_next/kernels/rocm/weight_upload.hpp"
 
+#include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <unistd.h>
 
@@ -63,6 +64,15 @@ int main() {
     Require(out.good(), "write shard");
   }
 
+  std::array<gufo::core::GgufMappedRegion, 2> regions;
+  for (std::size_t i = 0; i < paths.size(); ++i) {
+    regions[i] = {nullptr, source[i].size(),
+                  ::open(paths[i].c_str(), O_RDONLY | O_CLOEXEC)};
+    Require(regions[i].file_descriptor >= 0, "open original shard");
+    std::filesystem::rename(paths[i], paths[i].string() + ".old");
+    std::ofstream replacement(paths[i], std::ios::binary);
+    replacement << "replacement must never supply model bytes";
+  }
   constexpr std::size_t guard = 64;
   std::vector<std::uint8_t> expected(guard, 0xa5);
   struct Slice {
@@ -90,7 +100,7 @@ int main() {
   Require(hipMemset(device.data, 0xa5, expected.size()) == hipSuccess,
           "initialize guards");
   std::string error;
-  auto upload = WeightUpload::Create(paths, &error);
+  auto upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, error);
   for (const auto& s : slices) {
     Require(
@@ -119,12 +129,15 @@ int main() {
   Require(!upload->Finish(&error), "failed upload reports failure after drain");
   upload.reset();
 
-  upload = WeightUpload::Create(paths, &error);
+  upload = WeightUpload::Create(regions, &error);
   Require(upload != nullptr, "reopen shards");
-  std::filesystem::resize_file(paths[1], 17);
+  std::filesystem::resize_file(paths[1].string() + ".old", 17);
   Require(upload->Copy(1, 4096, 8192, device.data, &error),
           "queue a range from the original file extent");
   Require(!upload->Finish(&error), "a truncated shard fails its pending read");
   std::puts(
       "PASS: byte-exact upload, EOF, guards, bounds and failed-read drain");
+  upload.reset();
+  for (const auto& region : regions)
+    ::close(region.file_descriptor);
 }

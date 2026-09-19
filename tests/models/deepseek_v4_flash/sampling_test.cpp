@@ -3,10 +3,12 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/runtime/dspark_policy.h"
+#include "src/models/deepseek_v4_flash/runtime/native_internal.h"
 
 using gufo::models::deepseek_v4_flash::DsparkSamplerBridge;
 using gufo::sampling::SamplerState;
@@ -141,6 +143,22 @@ void CheckConditionalProposals() {
 }  // namespace
 
 int main() {
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  const float extreme[]{-3e35F, -2e35F, -1e35F};
+  const float mixed[]{nan, inf, -inf, -3e35F, -3e35F};
+  Expect(ds4_sample_argmax(extreme, 3) == 2,
+         "argmax covers finite float range");
+  Expect(ds4_sample_argmax(mixed, 5) == 3,
+         "argmax skips nonfinite values and keeps first tie");
+  Expect(ds4_sample_argmax(mixed, 3) == -1 &&
+             ds4_sample_argmax(nullptr, 3) == -1 &&
+             ds4_sample_argmax(extreme, 0) == -1,
+         "invalid argmax reports failure");
+  std::uint64_t rng = 5;
+  for (int top_k : {0, 2})
+    Expect(ds4_sample_top_p_min_p(mixed, 3, 1, top_k, 0.9F, 0.1F, &rng) == -1,
+           "nonfinite sampled target fails closed");
   CheckConditionalProposals();
   CheckDistribution({.temperature = 1.F, .top_k = 10}, true);
   for (size_t c : {1u, 2u, 4u, 8u}) {

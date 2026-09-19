@@ -1,11 +1,17 @@
 #include "src/core/hip/detail/hipblaslt_plan_database.hpp"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <fstream>
 #include <functional>
 #include <limits>
 #include <ranges>
+#include <sstream>
 #include <system_error>
 #include <type_traits>
 #include <unordered_set>
@@ -13,6 +19,22 @@
 
 namespace gufo::hip::detail {
 namespace {
+
+struct DatabasePublication {
+  int lock{-1};
+  int file{-1};
+  std::filesystem::path temporary;
+  ~DatabasePublication() {
+    if (file >= 0)
+      ::close(file);
+    if (!temporary.empty()) {
+      std::error_code ignored;
+      std::filesystem::remove(temporary, ignored);
+    }
+    if (lock >= 0)
+      ::close(lock);
+  }
+};
 
 constexpr std::array<char, 8> kMagic = {'S', 'T', 'R', 'I',
                                         'X', 'L', 'T', '\0'};
@@ -256,25 +278,45 @@ bool SaveHipblasLtPlanDatabase(const std::filesystem::path& path,
     }
   }
 
-  auto temporary_path = path;
-  temporary_path += ".tmp";
-  std::ofstream output(temporary_path,
-                       std::ios::binary | std::ios::trunc | std::ios::out);
-  if (!output.is_open()) {
-    if (error != nullptr) {
-      *error = "failed to open temporary plan database";
-    }
+  DatabasePublication publication;
+  const auto lock_path = path.string() + ".lock";
+  publication.lock =
+      ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (publication.lock < 0 || ::flock(publication.lock, LOCK_EX) != 0) {
+    if (error)
+      *error = "failed to lock plan database";
     return false;
   }
+  // Concurrent tuners may have discovered different shapes. Merge under the
+  // writer lock; readers continue to see the previous complete publication.
+  auto merged = database;
+  const auto previous = LoadHipblasLtPlanDatabase(path, database.key);
+  if (previous.status == HipblasLtPlanDatabaseLoadStatus::kLoaded) {
+    for (const auto& record : previous.database.records) {
+      const RecordKey key{record.batch_size, record.m, record.k,
+                          static_cast<std::uint32_t>(record.data_type)};
+      if (merged.records.size() < kMaxRecords && keys.insert(key).second)
+        merged.records.push_back(record);
+    }
+  }
+  std::string temporary = path.string() + ".tmp.XXXXXX";
+  publication.file = ::mkstemp(temporary.data());
+  if (publication.file < 0) {
+    if (error)
+      *error = "failed to create temporary plan database";
+    return false;
+  }
+  publication.temporary = temporary;
+  std::ostringstream output(std::ios::binary | std::ios::out);
 
   output.write(kMagic.data(), static_cast<std::streamsize>(kMagic.size()));
   bool valid =
-      output.good() && WriteInteger(output, database.schema_version) &&
-      WriteString(output, database.key.hardware_fingerprint) &&
-      WriteInteger(output, database.key.hip_runtime_version) &&
-      WriteInteger(output, database.key.hipblaslt_version) &&
-      WriteInteger(output, static_cast<std::uint32_t>(database.records.size()));
-  for (const auto& record : database.records) {
+      output.good() && WriteInteger(output, merged.schema_version) &&
+      WriteString(output, merged.key.hardware_fingerprint) &&
+      WriteInteger(output, merged.key.hip_runtime_version) &&
+      WriteInteger(output, merged.key.hipblaslt_version) &&
+      WriteInteger(output, static_cast<std::uint32_t>(merged.records.size()));
+  for (const auto& record : merged.records) {
     valid =
         valid && WriteInteger(output, record.batch_size) &&
         WriteInteger(output, record.m) && WriteInteger(output, record.k) &&
@@ -286,25 +328,37 @@ bool SaveHipblasLtPlanDatabase(const std::filesystem::path& path,
         WriteString(output, record.solution_name) &&
         WriteString(output, record.kernel_name);
   }
-  output.flush();
-  valid = valid && output.good();
-  output.close();
-  if (!valid) {
-    std::filesystem::remove(temporary_path, filesystem_error);
-    if (error != nullptr) {
-      *error = "failed to write plan database";
-    }
+  if (!valid || !output.good()) {
+    if (error)
+      *error = "failed to serialize plan database";
     return false;
   }
-
-  std::filesystem::rename(temporary_path, path, filesystem_error);
+  const auto bytes = std::move(output).str();
+  std::size_t written = 0;
+  while (written < bytes.size()) {
+    const auto count = ::write(publication.file, bytes.data() + written,
+                               bytes.size() - written);
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count <= 0) {
+      if (error)
+        *error = "failed to write plan database";
+      return false;
+    }
+    written += static_cast<std::size_t>(count);
+  }
+  if (::fsync(publication.file) != 0) {
+    if (error)
+      *error = "failed to flush plan database";
+    return false;
+  }
+  std::filesystem::rename(publication.temporary, path, filesystem_error);
   if (filesystem_error) {
-    std::filesystem::remove(temporary_path, filesystem_error);
-    if (error != nullptr) {
+    if (error)
       *error = "failed to replace plan database";
-    }
     return false;
   }
+  publication.temporary.clear();
   return true;
 }
 

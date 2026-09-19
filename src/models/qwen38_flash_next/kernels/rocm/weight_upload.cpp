@@ -184,19 +184,23 @@ WeightUpload::WeightUpload() : state_(std::make_unique<State>()) {}
 WeightUpload::~WeightUpload() = default;
 
 std::unique_ptr<WeightUpload> WeightUpload::Create(
-    std::span<const std::filesystem::path> paths, std::string* error) {
+    std::span<const core::GgufMappedRegion> regions, std::string* error) {
   std::unique_ptr<WeightUpload> uploader(new WeightUpload());
   auto& s = *uploader->state_;
-  for (const auto& path : paths) {
+  for (const auto& region : regions) {
     auto& shard = s.shards.emplace_back();
-    shard.fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    shard.fd = ::fcntl(region.file_descriptor, F_DUPFD_CLOEXEC, 0);
     struct stat info{};
-    if (shard.fd < 0 || ::fstat(shard.fd, &info) != 0 || info.st_size <= 0) {
-      s.Fail("cannot read shard " + path.string());
+    if (shard.fd < 0 || ::fstat(shard.fd, &info) != 0 || info.st_size <= 0 ||
+        static_cast<std::uint64_t>(info.st_size) != region.size) {
+      s.Fail("cannot read the mapped GGUF shard");
       s.Status(error);
       return nullptr;
     }
     shard.size = static_cast<std::uint64_t>(info.st_size);
+    // Reopening the retained descriptor creates an independent O_DIRECT file
+    // description without resolving the original, replaceable pathname.
+    const auto path = "/proc/self/fd/" + std::to_string(shard.fd);
     shard.direct_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
   }
   for (auto& slot : s.slots) {

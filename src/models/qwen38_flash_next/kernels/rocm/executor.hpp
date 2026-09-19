@@ -237,14 +237,6 @@ public:
                                      std::span<float> hidden,
                                      std::string* error_msg) const;
 
-  /// Verifies a proposal against a device-resident target logit row.
-  /// Returns either the accepted proposal or its residual correction.
-  [[nodiscard]] bool VerifyMtpProposal(std::uint32_t row,
-                                       const MtpProposal& proposal,
-                                       sampling::SamplerState& sampler,
-                                       std::int32_t* token, bool* accepted,
-                                       std::string* error_msg) const;
-
   /// Plain greedy verification keeps full logit rows on the GPU.
   [[nodiscard]] bool GreedyMtpPredictions(
       std::span<ArgmaxCandidate> predictions, std::string* error_msg) const;
@@ -522,7 +514,6 @@ private:
   float* logits_host_{nullptr};
   std::int32_t* mtp_token_host_{nullptr};
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
-  mutable gufo::hip::GpuSamplingWorkspace sampling_workspace_;
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

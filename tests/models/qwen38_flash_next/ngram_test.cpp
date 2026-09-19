@@ -1,6 +1,9 @@
 // PLE n-gram hashing and disk row reads, checked without the model.
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -12,6 +15,17 @@
 namespace q = gufo::models::qwen38_flash_next;
 
 namespace {
+std::unique_ptr<q::NgramTable> OpenTable(const std::filesystem::path& path,
+                                         std::uint64_t offset,
+                                         std::uint64_t rows, std::uint32_t dim,
+                                         gufo::core::GgmlType type,
+                                         std::string* error) {
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  auto table = q::NgramTable::Open(fd, offset, rows, dim, type, error);
+  if (fd >= 0)
+    ::close(fd);
+  return table;
+}
 
 q::Config FlashNextPle() {
   q::Config c;
@@ -116,8 +130,8 @@ void TestTable() {
     }
   }
   std::string error;
-  auto table = q::NgramTable::Open(path, offset, rows, dim,
-                                   gufo::core::GgmlType::kBF16, &error);
+  auto table =
+      OpenTable(path, offset, rows, dim, gufo::core::GgmlType::kBF16, &error);
   Check(table != nullptr, error.c_str());
   if (table) {
     const std::vector<std::uint32_t> ids{7, rows - 1, 7, 0, 128, rows - 1};
@@ -181,8 +195,8 @@ void TestTable() {
 
     // Valid row metadata with a truncated backing file must fail at the
     // read boundary, then allow another gather to use the same readers.
-    auto truncated = q::NgramTable::Open(path, offset, rows + 1, dim,
-                                         gufo::core::GgmlType::kBF16, &error);
+    auto truncated = OpenTable(path, offset, rows + 1, dim,
+                               gufo::core::GgmlType::kBF16, &error);
     Check(truncated != nullptr, error.c_str());
     if (truncated) {
       Check(truncated->StartRead(bad, out), "missing row gather starts");
@@ -228,8 +242,8 @@ void TestQuantizedRows() {
     Check(file.good(), "IQ4_NL fixture written");
   }
   std::string error;
-  auto table = q::NgramTable::Open(path, offset, rows, dim,
-                                   gufo::core::GgmlType::kIQ4_NL, &error);
+  auto table =
+      OpenTable(path, offset, rows, dim, gufo::core::GgmlType::kIQ4_NL, &error);
   Check(table != nullptr, error.c_str());
   if (table) {
     const auto gather = [&](std::span<const std::uint32_t> ids) {
@@ -288,8 +302,8 @@ void TestDistantRows() {
     Check(file.good(), "sparse row fixture written");
   }
   std::string error;
-  auto table = q::NgramTable::Open(path, offset, last + 2, dim,
-                                   gufo::core::GgmlType::kBF16, &error);
+  auto table = OpenTable(path, offset, last + 2, dim,
+                         gufo::core::GgmlType::kBF16, &error);
   Check(table != nullptr, error.c_str());
   if (table) {
     std::vector<std::uint32_t> ids(80);
@@ -319,9 +333,37 @@ void TestDistantRows() {
   std::filesystem::remove(path);
 }
 
+void TestReplacedPath() {
+  char name[] = "/tmp/qwen-ngram-bound-XXXXXX";
+  const int fd = ::mkstemp(name);
+  Check(fd >= 0, "create bound table");
+  if (fd < 0)
+    return;
+  const std::uint16_t value = 0x3f80;  // BF16 1.0
+  Check(::write(fd, &value, sizeof(value)) == sizeof(value), "write bound row");
+  ::unlink(name);
+  {
+    std::ofstream replacement(name, std::ios::binary);
+    const std::uint16_t other = 0x4000;
+    replacement.write(reinterpret_cast<const char*>(&other), sizeof(other));
+  }
+  std::string error;
+  auto table =
+      q::NgramTable::Open(fd, 0, 1, 1, gufo::core::GgmlType::kBF16, &error);
+  ::close(fd);
+  Check(table != nullptr, "open original descriptor after path replacement");
+  std::array<std::uint32_t, 1> ids{0};
+  std::array<float, 1> output{};
+  if (table)
+    Check(table->Read(ids, output) && output[0] == 1.0F,
+          "PLE reads original weights after replacement and descriptor close");
+  std::filesystem::remove(name);
+}
+
 }  // namespace
 
 int main() {
+  TestReplacedPath();
   TestHash();
   TestTable();
   TestQuantizedRows();

@@ -263,7 +263,7 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
   CheckReset();
   auto parameters = PrepareGpuSamplingParameters(sampler);
   if (sampler.config().uses_random_sampling()) {
-    parameters.uniform = static_cast<float>(sampler.Uniform());
+    parameters.uniform = sampler.Uniform();
   }
 
   auto scratch = arena_.GetScratchView();
@@ -277,7 +277,7 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
   HIP_CHECK(hipMemcpyAsync(&token, d_out_token, sizeof(token),
                            hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
-  return token;
+  return CheckedSampleToken(token, weights_.config.vocab_size);
 }
 
 tokenization::TokenId QwenGpuExecutor::SampleCachedLogits(
@@ -317,7 +317,7 @@ tokenization::TokenId QwenGpuExecutor::SampleVerificationLogits(
   }
   auto parameters = PrepareGpuSamplingParameters(sampler);
   if (sampler.config().uses_random_sampling()) {
-    parameters.uniform = static_cast<float>(sampler.Uniform());
+    parameters.uniform = sampler.Uniform();
   }
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
@@ -330,7 +330,7 @@ tokenization::TokenId QwenGpuExecutor::SampleVerificationLogits(
   HIP_CHECK(hipMemcpyAsync(&token, d_out_token, sizeof(token),
                            hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
-  return token;
+  return CheckedSampleToken(token, weights_.config.vocab_size);
 }
 
 QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
@@ -351,9 +351,9 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
   }
 
   auto parameters = PrepareGpuSamplingParameters(sampler);
-  const float acceptance_uniform = static_cast<float>(sampler.Uniform());
+  const double acceptance_uniform = sampler.Uniform();
   const std::uint64_t residual_rng_checkpoint = sampler.rng_state();
-  const float residual_uniform = static_cast<float>(sampler.Uniform());
+  const double residual_uniform = sampler.Uniform();
 
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
@@ -374,6 +374,9 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
                            sizeof(accepted), hipMemcpyDeviceToHost,
                            arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  if (result.token >= weights_.config.vocab_size || accepted > 1)
+    throw std::runtime_error(
+        "target logit distribution contains no finite values");
   result.accepted = accepted != 0U;
   if (result.accepted) {
     // Lossless rejection sampling consumes a residual draw only when the

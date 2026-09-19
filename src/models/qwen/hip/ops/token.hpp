@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 
 #include "src/core/gguf_reader.hpp"
 #include "src/core/sampling.hpp"
@@ -13,6 +14,15 @@
 #include <hip/hip_runtime.h>
 
 namespace gufo::hip {
+
+inline constexpr std::uint32_t kInvalidSampleToken = UINT32_MAX;
+
+inline std::uint32_t CheckedSampleToken(std::uint32_t token,
+                                        std::size_t vocab_size) {
+  if (token >= vocab_size)
+    throw std::runtime_error("logit distribution contains no finite values");
+  return token;
+}
 
 struct GpuSamplingWorkspace {
   float* adjusted_logits{nullptr};
@@ -47,7 +57,7 @@ struct GpuSamplingParameters {
   float repeat_penalty{1.0F};
   float frequency_penalty{0.0F};
   float presence_penalty{0.0F};
-  float uniform{0.0F};
+  double uniform{0.0};
 };
 
 void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
@@ -64,6 +74,7 @@ void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
 
 /// Samples one device-resident logit row and writes a single device token.
 ///
+/// No finite target value yields kInvalidSampleToken; the host must reject it.
 /// Penalties are host-resident unique-token records from SamplerState.
 void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
                        std::size_t vocab_size,
@@ -77,6 +88,7 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
 /// accepts `draft_token` with the lossless speculative ratio, or samples the
 /// residual target-minus-draft distribution after rejection.
 ///
+/// Invalid targets yield kInvalidSampleToken and out_accepted = 2.
 /// Draft candidate spans and penalty spans are host-resident compact arrays.
 void LaunchGPUSpeculativeSampling(
     const float* logits, std::uint32_t* out_token, std::uint32_t* out_accepted,
@@ -84,8 +96,8 @@ void LaunchGPUSpeculativeSampling(
     std::uint32_t draft_token, float draft_token_probability,
     const std::uint32_t* draft_candidate_ids,
     const float* draft_candidate_probabilities,
-    std::size_t draft_candidate_count, float acceptance_uniform,
-    float residual_uniform, const sampling::TokenPenalty* penalties,
+    std::size_t draft_candidate_count, double acceptance_uniform,
+    double residual_uniform, const sampling::TokenPenalty* penalties,
     std::size_t penalty_count, GpuSamplingWorkspace* workspace,
     hipStream_t stream = nullptr);
 

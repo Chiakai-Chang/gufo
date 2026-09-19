@@ -3,7 +3,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <optional>
 #include <span>
 #include <string>
@@ -134,11 +133,6 @@ struct ModelWeights {
   [[nodiscard]] static std::optional<ModelWeights> Bind(
       const core::GgufReader& reader, std::string* error_msg = nullptr);
 };
-
-/// Path of mapped region `shard` of a split artifact opened from `first`
-/// (`name-00001-of-0000N.gguf`); single files return `first` for shard 0.
-[[nodiscard]] std::filesystem::path ShardPath(
-    const std::filesystem::path& first, std::uint32_t shard);
 
 /// The MTP draft block from the `shared-*` sidecar: one attention layer with
 /// its own hyper-connection mixers and experts; token embedding and LM head

@@ -709,7 +709,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                            hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
 
-  return next_token_id;
+  return CheckedSampleToken(next_token_id, config.vocab_size);
 }
 
 std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardVerificationChunk(

@@ -68,6 +68,44 @@ inline MtpProposal SampleMtpProposal(const MtpCandidateLogits& candidates,
   return proposal;
 }
 
+struct MtpVerification {
+  sampling::TokenId token;
+  bool accepted;
+};
+
+/// The same FP64 target distribution drives AR draws, support, acceptance
+/// and residual correction. Only proposal q uses the compact F32 masses.
+inline MtpVerification VerifyMtpProposal(std::span<const float> logits,
+                                         const MtpProposal& proposal,
+                                         sampling::SamplerState& sampler) {
+  if (proposal.size == 0 || proposal.size > kMtpCandidates ||
+      proposal.token >= logits.size() || !std::isfinite(proposal.probability) ||
+      proposal.probability <= 0 || proposal.probability > 1)
+    throw std::invalid_argument("invalid MTP proposal");
+  double total = 0;
+  double selected = 0;
+  for (std::size_t i = 0; i < proposal.size; ++i) {
+    if (proposal.ids[i] >= logits.size() ||
+        !std::isfinite(proposal.probabilities[i]) ||
+        proposal.probabilities[i] < 0)
+      throw std::invalid_argument("invalid MTP proposal mass");
+    total += proposal.probabilities[i];
+    if (proposal.ids[i] == proposal.token)
+      selected += proposal.probabilities[i];
+  }
+  if (total != 1 || selected != proposal.probability)
+    throw std::invalid_argument("MTP proposal masses do not match the draw");
+  const auto target = sampler.Distribution(logits);
+  if (sampler.Uniform() * proposal.probability <
+      target.probability(proposal.token))
+    return {proposal.token, true};
+  return {target.SampleResidual(
+              std::span(proposal.ids).first(proposal.size),
+              std::span(proposal.probabilities).first(proposal.size),
+              sampler.mutable_rng_state()),
+          false};
+}
+
 /// The draft is deterministic, so an exact target sample decides acceptance.
 /// A rejected draw is deferred to the next cycle: restore its RNG so that
 /// stopping at this prefix consumes exactly the draws made by ordinary decode.

@@ -30,6 +30,7 @@ public:
     gufo::server::ChatRequest chat;
     std::size_t max_tokens = 0;
     gufo::sampling::SamplingConfig sampling;
+    std::string client_id;
   };
   Call LastCall() {
     const std::lock_guard lock(mutex_);
@@ -46,9 +47,13 @@ public:
   }
   Result complete(std::string_view prompt, std::size_t limit,
                   const gufo::sampling::SamplingConfig& sampling,
-                  const CancellationCheck& cancel,
-                  const TokenCallback& token) override {
+                  const CancellationCheck& cancel, const TokenCallback& token,
+                  std::string_view client_id = "anonymous") override {
     ++calls;
+    if (failure == 1)
+      throw std::length_error("context exceeded");
+    if (failure == 2)
+      throw std::invalid_argument("invalid prompt");
     Result result;
     if (wait_for_disconnect) {
       entered.release();
@@ -65,7 +70,8 @@ public:
       const std::lock_guard lock(mutex_);
       last_ = {.prompt = std::string(prompt),
                .max_tokens = limit,
-               .sampling = sampling};
+               .sampling = sampling,
+               .client_id = std::string(client_id)};
       result.text = output_;
     }
     result.prompt_tokens = 10;
@@ -87,7 +93,8 @@ public:
               const gufo::sampling::SamplingConfig& sampling,
               const CancellationCheck& cancel,
               const TokenCallback& token) override {
-    auto result = complete("", limit, sampling, cancel, token);
+    auto result =
+        complete("", limit, sampling, cancel, token, request.client_id);
     {
       const std::lock_guard lock(mutex_);
       last_.chat = request;
@@ -95,6 +102,7 @@ public:
     return result;
   }
   std::atomic<int> calls{0};
+  std::atomic<int> failure{0};
   bool wait_for_disconnect{false};
   std::atomic<bool> disconnected{false};
   std::binary_semaphore entered{0};
@@ -329,6 +337,16 @@ void TestCompatibilityRequests() {
     body["repeat_penalty"] = 1.1;
     const auto output = response_body(server.Post(endpoint.path, body.dump()));
     const auto last = server.backend->LastCall();
+    for (int failure : {1, 2}) {
+      server.backend->failure = failure;
+      const auto rejected = server.Post(endpoint.path, body.dump());
+      ExpectStatus(rejected, 400);
+      assert(rejected.find(failure == 1
+                               ? "context_length_exceeded"
+                               : "invalid_prompt") != std::string::npos);
+    }
+    server.backend->failure = 0;
+    assert(last.client_id == "127.0.0.1");
     assert(last.max_tokens == 1 && last.sampling.temperature == 0.6F &&
            last.sampling.top_k == 40 && last.sampling.top_p == 0.9F &&
            last.sampling.seed == 123 && last.sampling.repeat_penalty == 1.1F);

@@ -129,7 +129,8 @@ public:
   Result complete(std::string_view prompt, std::size_t max_tokens,
                   const sampling::SamplingConfig& sampling,
                   const CancellationCheck& is_cancelled = {},
-                  const TokenCallback& on_token = {}) override;
+                  const TokenCallback& on_token = {},
+                  std::string_view client_id = "anonymous") override;
 
   /// Framed chat conversation; returns the assistant reply.
   Result chat(const ChatRequest& request, std::size_t max_tokens,

@@ -876,6 +876,12 @@ static int session_dspark_finish_verified(
         sampled ? drafts[i]
                 : ds4_sample_argmax(session->logits.get(),
                                     (uint32_t)vocabulary_size);
+    if (sequential_top < 0) {
+      set_error(error, error_capacity,
+                "DSpark replay logits contain no finite values");
+      session->checkpoint_valid = false;
+      return 1;
+    }
     if (sequential_top != drafts[i]) {
       if (getenv("GUFO_DEEPSEEK_DSPARK_TRACE") != nullptr) {
         fprintf(stderr,
@@ -951,6 +957,12 @@ static int session_dspark_step(ds4_session* session, int* emitted,
   const int vocabulary_size = ds4_engine_vocab_size(session->engine);
   const int target_first =
       session_dspark_anchor(session, sampler, vocabulary_size);
+  if (target_first < 0 || target_first >= vocabulary_size) {
+    set_error(error, error_capacity,
+              "DSpark target logits contain no finite values");
+    session->checkpoint_valid = false;
+    return 1;
+  }
   if (stop_at_eos && ds4_token_is_stop(session->engine, target_first)) {
     emitted[(*n_emitted)++] = target_first;
     return 0;
@@ -1125,6 +1137,12 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
     lengths[index] = length;
     target_first[index] =
         session_dspark_anchor(session, item.sampler, vocabulary_size);
+    if (target_first[index] < 0 || target_first[index] >= vocabulary_size) {
+      set_error(error, error_capacity,
+                "DSpark target logits contain no finite values");
+      session->checkpoint_valid = false;
+      return 1;
+    }
     if (item.stop_at_eos &&
         ds4_token_is_stop(session->engine, target_first[index])) {
       any_stopped = true;

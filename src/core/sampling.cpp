@@ -221,6 +221,7 @@ SamplingDistribution::SamplingDistribution(std::vector<Probability> entries)
   for (auto& entry : entries_) {
     entry.value /= sum;
   }
+  std::erase_if(entries_, [](const auto& entry) { return entry.value == 0; });
   std::ranges::sort(entries_,
                     [](const Probability& left, const Probability& right) {
                       if (left.value == right.value) {
@@ -228,6 +229,16 @@ SamplingDistribution::SamplingDistribution(std::vector<Probability> entries)
                       }
                       return left.value > right.value;
                     });
+}
+
+SamplingDistribution::SamplingDistribution(std::vector<Probability> entries,
+                                           double total)
+    : entries_(std::move(entries)) {
+  if (!(total > 0) || !std::isfinite(total))
+    throw std::runtime_error("logit softmax normalization failed");
+  for (auto& entry : entries_)
+    entry.value /= total;
+  std::erase_if(entries_, [](const auto& entry) { return entry.value == 0; });
 }
 
 std::span<const Probability> SamplingDistribution::entries() const noexcept {
@@ -238,7 +249,11 @@ TokenId SamplingDistribution::best_token() const {
   if (entries_.empty()) {
     throw std::logic_error("sampling distribution is empty");
   }
-  return entries_.front().token;
+  return std::ranges::max_element(entries_,
+                                  [](const auto& a, const auto& b) {
+                                    return IsBetterProbability(b, a);
+                                  })
+      ->token;
 }
 
 double SamplingDistribution::probability(TokenId token) const noexcept {
@@ -288,7 +303,9 @@ TokenId SamplingDistribution::SampleResidual(
   residual.reserve(entries_.size());
   double sum = 0.0;
   for (const auto& entry : entries_) {
-    const double value = std::max(entry.value - draft[entry.token], 0.0);
+    const auto found = draft.find(entry.token);
+    const double q = found == draft.end() ? 0.0 : found->second;
+    const double value = std::max(entry.value - q, 0.0);
     if (value > 0.0) {
       residual.push_back({.token = entry.token, .value = value});
       sum += value;
@@ -297,10 +314,7 @@ TokenId SamplingDistribution::SampleResidual(
   if (!(sum > 0.0) || !std::isfinite(sum)) {
     return Sample(rng_state);
   }
-  for (auto& entry : residual) {
-    entry.value /= sum;
-  }
-  return SamplingDistribution(std::move(residual)).Sample(rng_state);
+  return SamplingDistribution(std::move(residual), sum).Sample(rng_state);
 }
 
 static SamplingDistribution DistributionWithPenalties(
@@ -469,20 +483,25 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
 
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits) const {
-  // Reuse the bounded candidate selection used by ordinary filtered decode.
-  // The full-sort implementation remains the reference for unfiltered rows.
-  if (!logits.empty() && config_.temperature > 0 &&
-      (config_.top_k > 0 || config_.top_p < 1 || config_.min_p > 0)) {
-    auto working = *this;
-    working.PrepareSelected(logits);
-    auto& candidates = working.candidate_scratch_;
-    const double maximum = candidates.front().value;
-    for (auto& candidate : candidates)
-      candidate.value =
-          std::exp((candidate.value - maximum) / config_.temperature);
-    return SamplingDistribution(std::move(candidates));
+  config_.Validate();
+  if (logits.empty() || logits.size() > std::numeric_limits<TokenId>::max())
+    throw std::invalid_argument("invalid sampling vocabulary size");
+  if (config_.temperature == 0)
+    return SamplingDistribution({{SampleGreedy(logits), 1.0}}, 1.0);
+  const bool needs_floor = config_.min_p > 0 && config_.min_keep > 1;
+  if (config_.top_k == 0 && config_.top_p == 1 && !needs_floor)
+    return LinearDistribution(logits);
+  auto working = *this;
+  working.PrepareSelected(logits);
+  auto& candidates = working.candidate_scratch_;
+  const double maximum = candidates.front().value;
+  double total = 0;
+  for (auto& candidate : candidates) {
+    candidate.value =
+        std::exp((candidate.value - maximum) / config_.temperature);
+    total += candidate.value;
   }
-  return DistributionWithPenalties(logits, config_, penalty_counts_);
+  return SamplingDistribution(std::move(candidates), total);
 }
 
 SamplingDistribution SamplerState::Distribution(
@@ -530,11 +549,7 @@ TokenId SamplerState::Sample(std::span<const float> logits) {
   if (config_.temperature == 0.0F) {
     return SampleGreedy(logits);
   }
-  const bool min_p_needs_floor = config_.min_p > 0.0F && config_.min_keep > 1;
-  if (config_.top_k == 0 && config_.top_p == 1.0F && !min_p_needs_floor) {
-    return SampleLinear(logits);
-  }
-  return SampleSelected(logits);
+  return Distribution(logits).Sample(&rng_state_);
 }
 
 TokenId SamplerState::SampleResidual(
@@ -632,133 +647,40 @@ TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {
   return best_token;
 }
 
-TokenId SamplerState::SampleLinear(std::span<const float> logits) {
-  if (penalty_counts_.empty()) {
-    float maximum = -std::numeric_limits<float>::infinity();
-    bool found = false;
-    for (const float logit : logits) {
-      if (logit > maximum && std::isfinite(logit)) {
-        maximum = logit;
-        found = true;
-      }
-    }
-    if (!found) {
-      throw std::runtime_error("logit distribution contains no finite values");
-    }
-
-    const double min_p_threshold =
-        config_.min_p > 0.0F
-            ? static_cast<double>(maximum) +
-                  static_cast<double>(config_.temperature) *
-                      std::log(static_cast<double>(config_.min_p))
-            : -std::numeric_limits<double>::infinity();
-    const double inverse_temperature =
-        1.0 / static_cast<double>(config_.temperature);
-    double sum = 0.0;
-    for (const float logit : logits) {
-      if (std::isfinite(logit) &&
-          static_cast<double>(logit) >= min_p_threshold) {
-        sum += std::exp(
-            (static_cast<double>(logit) - static_cast<double>(maximum)) *
-            inverse_temperature);
-      }
-    }
-    if (!(sum > 0.0) || !std::isfinite(sum)) {
-      throw std::runtime_error("logit softmax normalization failed");
-    }
-
-    double threshold = Uniform() * sum;
-    TokenId last_token = 0;
-    bool has_candidate = false;
-    for (std::size_t index = 0; index < logits.size(); ++index) {
-      const double logit = static_cast<double>(logits[index]);
-      if (!std::isfinite(logit) || logit < min_p_threshold) {
-        continue;
-      }
-      const double weight = std::exp((logit - static_cast<double>(maximum)) *
-                                     inverse_temperature);
-      if (weight <= 0.0)
-        continue;
-      last_token = static_cast<TokenId>(index);
-      has_candidate = true;
-      threshold -= weight;
-      if (threshold < 0.0) {
-        return last_token;
-      }
-    }
-    if (!has_candidate) {
-      throw std::runtime_error("sampling filters removed every token");
-    }
-    return last_token;
-  }
-
+SamplingDistribution SamplerState::LinearDistribution(
+    std::span<const float> logits) const {
+  std::vector<Probability> candidates;
+  candidates.reserve(logits.size());
   double maximum = -std::numeric_limits<double>::infinity();
-  bool found = false;
-  for (std::size_t index = 0; index < logits.size(); ++index) {
-    if (!std::isfinite(logits[index])) {
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    if (!std::isfinite(logits[i]))
       continue;
-    }
-    const double adjusted =
-        AdjustedLogit(static_cast<TokenId>(index), logits[index]);
-    if (!std::isfinite(adjusted)) {
+    const double value =
+        penalty_counts_.empty()
+            ? static_cast<double>(logits[i])
+            : AdjustedLogit(static_cast<TokenId>(i), logits[i]);
+    if (!std::isfinite(value))
       throw std::runtime_error(
           "sampling penalties produced a non-finite logit");
-    }
-    maximum = std::max(maximum, adjusted);
-    found = true;
+    maximum = std::max(maximum, value);
+    candidates.push_back({static_cast<TokenId>(i), value});
   }
-  if (!found) {
+  if (candidates.empty())
     throw std::runtime_error("logit distribution contains no finite values");
-  }
-
-  const double min_p_threshold =
-      config_.min_p > 0.0F
+  const double threshold =
+      config_.min_p > 0
           ? maximum + static_cast<double>(config_.temperature) *
                           std::log(static_cast<double>(config_.min_p))
           : -std::numeric_limits<double>::infinity();
-  const double inverse_temperature =
-      1.0 / static_cast<double>(config_.temperature);
-  double sum = 0.0;
-  for (std::size_t index = 0; index < logits.size(); ++index) {
-    if (!std::isfinite(logits[index])) {
-      continue;
-    }
-    const double adjusted =
-        AdjustedLogit(static_cast<TokenId>(index), logits[index]);
-    if (adjusted >= min_p_threshold) {
-      sum += std::exp((adjusted - maximum) * inverse_temperature);
-    }
+  double total = 0;
+  for (auto& candidate : candidates) {
+    candidate.value =
+        candidate.value >= threshold
+            ? std::exp((candidate.value - maximum) / config_.temperature)
+            : 0;
+    total += candidate.value;
   }
-  if (!(sum > 0.0) || !std::isfinite(sum)) {
-    throw std::runtime_error("logit softmax normalization failed");
-  }
-
-  double threshold = Uniform() * sum;
-  TokenId last_token = 0;
-  bool has_candidate = false;
-  for (std::size_t index = 0; index < logits.size(); ++index) {
-    if (!std::isfinite(logits[index])) {
-      continue;
-    }
-    const double adjusted =
-        AdjustedLogit(static_cast<TokenId>(index), logits[index]);
-    if (adjusted < min_p_threshold) {
-      continue;
-    }
-    const double weight = std::exp((adjusted - maximum) * inverse_temperature);
-    if (weight <= 0.0)
-      continue;
-    last_token = static_cast<TokenId>(index);
-    has_candidate = true;
-    threshold -= weight;
-    if (threshold < 0.0) {
-      return last_token;
-    }
-  }
-  if (!has_candidate) {
-    throw std::runtime_error("sampling filters removed every token");
-  }
-  return last_token;
+  return SamplingDistribution(std::move(candidates), total);
 }
 
 void SamplerState::PrepareSelected(std::span<const float> logits) {
@@ -903,32 +825,6 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
   candidate_scratch_.resize(keep);
 }
 
-TokenId SamplerState::SampleSelected(std::span<const float> logits) {
-  PrepareSelected(logits);
-  if (candidate_scratch_.size() == 1) {
-    return candidate_scratch_.front().token;
-  }
-  const double maximum = candidate_scratch_.front().value;
-  const double inverse_temperature =
-      1.0 / static_cast<double>(config_.temperature);
-  double sum = 0.0;
-  for (const auto& candidate : candidate_scratch_) {
-    sum += std::exp((candidate.value - maximum) * inverse_temperature);
-  }
-  if (!(sum > 0.0) || !std::isfinite(sum)) {
-    throw std::runtime_error("logit softmax normalization failed");
-  }
-
-  double threshold = Uniform() * sum;
-  for (const auto& candidate : candidate_scratch_) {
-    threshold -= std::exp((candidate.value - maximum) * inverse_temperature);
-    if (threshold < 0.0) {
-      return candidate.token;
-    }
-  }
-  return candidate_scratch_.back().token;
-}
-
 std::uint64_t NextRandom(std::uint64_t* state) {
   if (state == nullptr) {
     throw std::invalid_argument("sampling requires RNG state");
@@ -946,7 +842,7 @@ std::uint64_t NextRandom(std::uint64_t* state) {
 
 double Uniform(std::uint64_t* state) {
   const std::uint64_t value = NextRandom(state);
-  return static_cast<double>((value >> 40U) & UINT64_C(0xffffff)) / 16777216.0;
+  return static_cast<double>(value >> 11U) * 0x1.0p-53;
 }
 
 TokenId SampleLogits(std::span<const float> logits, float temperature,

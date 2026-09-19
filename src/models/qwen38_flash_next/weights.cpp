@@ -230,29 +230,6 @@ struct Binder {
 
 }  // namespace
 
-std::filesystem::path ShardPath(const std::filesystem::path& first,
-                                std::uint32_t shard) {
-  const std::string name = first.filename().string();
-  // name-00001-of-00004.gguf: the shard number keeps its zero padding.
-  const std::string suffix = ".gguf";
-  const auto of = name.rfind("-of-");
-  if (of == std::string::npos || name.size() < suffix.size() ||
-      name.compare(name.size() - suffix.size(), suffix.size(), suffix) != 0) {
-    return first;
-  }
-  const auto dash = name.rfind('-', of - 1);
-  if (dash == std::string::npos) {
-    return first;
-  }
-  const std::string number = name.substr(dash + 1, of - dash - 1);
-  std::string replaced = std::to_string(shard + 1);
-  while (replaced.size() < number.size()) {
-    replaced.insert(replaced.begin(), '0');
-  }
-  return first.parent_path() /
-         (name.substr(0, dash + 1) + replaced + name.substr(of));
-}
-
 std::size_t TensorRef::RowBytes() const noexcept {
   const Format f = FormatOf(type);
   if (f.block == 0 || cols % f.block != 0) {

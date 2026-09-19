@@ -1,8 +1,11 @@
+#include <atomic>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "src/core/hip/detail/hipblaslt_plan_database.hpp"
 
@@ -101,6 +104,31 @@ int main() {
              temporary_directory / "duplicate.bin", duplicate, &error),
          "reject duplicate shape records");
 
+  const auto concurrent_path = temporary_directory / "concurrent.bin";
+  std::filesystem::remove(concurrent_path);
+  std::atomic<bool> writers_ok{true};
+  std::vector<std::thread> writers;
+  for (unsigned i = 1; i <= 8; ++i)
+    writers.emplace_back([&, i] {
+      auto update = MakeDatabase();
+      update.records[0].batch_size = i;
+      std::string failure;
+      if (!gufo::hip::detail::SaveHipblasLtPlanDatabase(concurrent_path, update,
+                                                        &failure))
+        writers_ok = false;
+    });
+  for (auto& writer : writers)
+    writer.join();
+  const auto combined = gufo::hip::detail::LoadHipblasLtPlanDatabase(
+      concurrent_path, expected.key);
+  Expect(writers_ok &&
+             combined.status == HipblasLtPlanDatabaseLoadStatus::kLoaded &&
+             combined.database.records.size() == 8,
+         "concurrent publications retain every distinct tuning result");
+  for (const auto& entry :
+       std::filesystem::directory_iterator(temporary_directory))
+    Expect(entry.path().filename().string().find(".tmp.") == std::string::npos,
+           "publication leaves no temporary files");
   std::filesystem::remove_all(temporary_directory);
   std::cout << "PASS: hipBLASLt plan database tests\n";
   return 0;

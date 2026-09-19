@@ -28,6 +28,8 @@ struct HttpRequest {
   std::vector<std::pair<std::string, std::string>> headers;
   TextGenerationBackend::CancellationCheck is_cancelled;
   std::string request_id{};
+  /// Transport-derived peer address, never read from client headers.
+  std::string client_id{"anonymous"};
 
   /// URL-decoded value of a query param, or "" if absent.
   std::string query_param(const std::string& key) const;

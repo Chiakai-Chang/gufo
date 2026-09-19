@@ -371,11 +371,6 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
         return Fail(error, "MTP head requests must be independent");
       }
     }
-    if (item.output.candidates != nullptr &&
-        sampling_workspace_.vocab_size == 0) {
-      gufo::hip::AllocateGpuSamplingWorkspace(
-          &sampling_workspace_, config().vocab_size, config().vocab_size);
-    }
   }
   const auto& output = model_->output();
   const auto& head = model_->mtp().nextn_head;

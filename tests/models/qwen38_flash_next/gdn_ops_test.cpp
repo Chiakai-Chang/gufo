@@ -125,7 +125,7 @@ double WorstOverRms(const std::vector<float>& reference,
   return worst / std::sqrt(ss / static_cast<double>(reference.size()));
 }
 
-int RunCase(std::uint32_t kTokens) {
+int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
   {
     const std::size_t kQkvCount = static_cast<std::size_t>(kTokens) * kChannels;
     const std::size_t kStateCount =
@@ -140,12 +140,22 @@ int RunCase(std::uint32_t kTokens) {
 
     const auto qkv = MakeValues(kQkvCount, 0x1234ABCDU, 1.0F);
     const auto z = MakeValues(kOut, 0x0BADF00DU, 2.0F);
-    const auto alpha_beta = MakeValues(
+    auto alpha_beta = MakeValues(
         static_cast<std::size_t>(kTokens) * 2 * kVHeads, 0xBADC0FFEU, 2.0F);
     const auto conv_w = MakeValues(
         static_cast<std::size_t>(kChannels) * kKernel, 0xDEADBEEFU, 0.5F);
-    const auto a = MakeValues(kVHeads, 0xC0FFEE11U, 1.0F, -1.5F);
-    const auto dt = MakeValues(kVHeads, 0xFEEDFACEU, 1.0F);
+    auto a = MakeValues(kVHeads, 0xC0FFEE11U, 1.0F, -1.5F);
+    auto dt = MakeValues(kVHeads, 0xFEEDFACEU, 1.0F);
+    if (extreme_gates) {
+      // Finite gates on both sides of the softplus threshold and expf overflow.
+      constexpr float gates[] = {-100.0F, 19.9F, 20.1F, 88.8F, 100.0F, 1000.0F};
+      for (std::uint32_t h = 0; h < kVHeads; ++h) {
+        a[h] = -0.01F;
+        dt[h] = 0.0F;
+        for (std::uint32_t t = 0; t < kTokens; ++t)
+          alpha_beta[t * 2 * kVHeads + h] = gates[h % 6];
+      }
+    }
     const auto norm_w = MakeValues(kDim, 0x600DCAFEU, 0.5F, 1.0F);
     const auto conv_state = MakeValues(kConvState, 0x13579BDFU, 1.0F);
     const auto state = MakeValues(kStateCount, 0x2468ACE0U, 0.1F);
@@ -391,7 +401,10 @@ int RunCase(std::uint32_t kTokens) {
           const double inv_k = 1.0 / std::sqrt(ks + kEps);
           const double alpha = alpha_beta[t * 2 * kVHeads + h];
           const double beta_raw = alpha_beta[t * 2 * kVHeads + kVHeads + h];
-          const double g = std::exp(a[h] * std::log1p(std::exp(alpha + dt[h])));
+          const double x = alpha + dt[h];
+          const double softplus =
+              std::max(x, 0.0) + std::log1p(std::exp(-std::abs(x)));
+          const double g = std::exp(a[h] * softplus);
           const double beta = 1.0 / (1.0 + std::exp(-beta_raw));
           for (std::uint32_t r = 0; r < kDim; ++r) {
             double u = 0.0;
@@ -480,6 +493,8 @@ int main() {
         return 1;
       }
     }
+    if (RunCase(1, true) != 0 || RunCase(8, true) != 0)
+      return 1;
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

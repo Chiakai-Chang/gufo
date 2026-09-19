@@ -243,9 +243,7 @@ std::string BuildResponseHead(const HttpResponse& resp,
   }
   out += "Access-Control-Allow-Origin: *\r\n";
   out += "Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n";
-  out +=
-      "Access-Control-Allow-Headers: Content-Type, Authorization, Range, "
-      "X-Client-ID\r\n";
+  out += "Access-Control-Allow-Headers: Content-Type, Authorization, Range\r\n";
   for (const auto& [name, value] : resp.headers) {
     out += name;
     out += ": ";
@@ -541,7 +539,7 @@ HttpResponse ListModels(TextGenerationBackend* backend,
 }
 
 HttpResponse OpenAiCompletions(const HttpRequest& req,
-                               TextGenerationBackend& b) {
+                               TextGenerationBackend& b) try {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -567,8 +565,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "invalid_request_error", "missing_prompt");
   }
 
-  const auto res =
-      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled);
+  const auto res = b.complete(prompt, max_tokens, sampling_config,
+                              req.is_cancelled, {}, req.client_id);
 
   json::Value resp = json::Value::object();
   resp["id"] = "cmpl-" + RandomId();
@@ -589,9 +587,16 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   resp["usage"] = UsageJson(res);
   resp["timings"] = GenerationTimings(res);
   return WithTiming(Ok(resp), res);
+} catch (const std::length_error& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "context_length_exceeded");
+} catch (const std::invalid_argument& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "invalid_prompt");
 }
 
-HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
+HttpResponse OpenAiResponses(const HttpRequest& req,
+                             TextGenerationBackend& b) try {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -624,8 +629,9 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
         "/v1/chat/completions for images and tools");
   }
 
-  const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
-                          sampling_config, req.is_cancelled);
+  ChatRequest chat{std::move(messages)};
+  chat.client_id = req.client_id;
+  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "resp_" + RandomId();
@@ -661,10 +667,16 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
   resp["usage"] = std::move(usage);
   resp["timings"] = GenerationTimings(res);
   return WithTiming(Ok(resp), res);
+} catch (const std::length_error& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "context_length_exceeded");
+} catch (const std::invalid_argument& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "invalid_prompt");
 }
 
 HttpResponse AnthropicMessages(const HttpRequest& req,
-                               TextGenerationBackend& b) {
+                               TextGenerationBackend& b) try {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -695,8 +707,9 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
         "for images and tools");
   }
 
-  const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
-                          sampling_config, req.is_cancelled);
+  ChatRequest chat{std::move(messages)};
+  chat.client_id = req.client_id;
+  const auto res = b.chat(chat, max_tokens, sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
   resp["id"] = "msg_" + RandomId();
@@ -722,9 +735,16 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   resp["usage"] = std::move(usage);
   resp["timings"] = GenerationTimings(res);
   return WithTiming(Ok(resp), res);
+} catch (const std::length_error& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "context_length_exceeded");
+} catch (const std::invalid_argument& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "invalid_prompt");
 }
 
-HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
+HttpResponse LlamaCompletion(const HttpRequest& req,
+                             TextGenerationBackend& b) try {
   json::Value body;
   try {
     body = json::parse(req.body);
@@ -746,8 +766,8 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   }
   const std::string prompt = input->str();
 
-  const auto res =
-      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled);
+  const auto res = b.complete(prompt, max_tokens, sampling_config,
+                              req.is_cancelled, {}, req.client_id);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -765,6 +785,12 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   resp["timings"] = GenerationTimings(res);
   resp["usage"] = UsageJson(res);
   return WithTiming(Ok(resp), res);
+} catch (const std::length_error& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "context_length_exceeded");
+} catch (const std::invalid_argument& error) {
+  return Err(400, "Bad Request", error.what(), "invalid_request_error",
+             "invalid_prompt");
 }
 
 HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend&) {
@@ -1163,6 +1189,13 @@ void HttpServer::handle_connection(int client_fd) {
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;
   static std::atomic<std::uint64_t> next_request{0};
+  sockaddr_in peer{};
+  socklen_t peer_size = sizeof(peer);
+  char peer_address[INET_ADDRSTRLEN]{};
+  if (::getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer),
+                    &peer_size) == 0 &&
+      ::inet_ntop(AF_INET, &peer.sin_addr, peer_address, sizeof(peer_address)))
+    req.client_id = peer_address;
   req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
   bool response_started = false;
   int response_status = 0;

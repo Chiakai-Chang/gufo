@@ -63,6 +63,9 @@ public:
       std::uint64_t* rng_state) const;
 
 private:
+  friend class SamplerState;
+  // Entries generated internally have unique IDs; retain their stable order.
+  SamplingDistribution(std::vector<Probability> entries, double total);
   std::vector<Probability> entries_;
 };
 
@@ -134,8 +137,8 @@ private:
   void RebuildPenaltyCounts();
   [[nodiscard]] double AdjustedLogit(TokenId token, float logit) const noexcept;
   [[nodiscard]] TokenId SampleGreedy(std::span<const float> logits) const;
-  [[nodiscard]] TokenId SampleLinear(std::span<const float> logits);
-  [[nodiscard]] TokenId SampleSelected(std::span<const float> logits);
+  [[nodiscard]] SamplingDistribution LinearDistribution(
+      std::span<const float> logits) const;
   void PrepareSelected(std::span<const float> logits);
 
   SamplingConfig config_;

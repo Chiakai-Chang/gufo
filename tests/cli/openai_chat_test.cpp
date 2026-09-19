@@ -46,7 +46,8 @@ public:
 
   Result complete(std::string_view, std::size_t,
                   const gufo::sampling::SamplingConfig&,
-                  const CancellationCheck&, const TokenCallback&) override {
+                  const CancellationCheck&, const TokenCallback&,
+                  std::string_view) override {
     return {};
   }
 
@@ -507,6 +508,63 @@ void TestQwenToolBoundariesAndSchema() {
   }
 }
 
+void TestToolChoiceEnforcement() {
+  for (bool stream : {false, true}) {
+    for (const auto* text :
+         {"<tool_call><function=f></function></tool_call>",
+          "<｜DSML｜tool_calls｜><｜DSML｜invoke "
+          "name=\"f\"></｜DSML｜invoke></｜DSML｜tool_calls｜>"}) {
+      for (const auto* choice : {"auto", "none", "required"}) {
+        for (const auto* declared : {"", "f", "other"}) {
+          auto body = gufo::json::parse(
+              R"({"model":"test-model","messages":[{"role":"user","content":"use a tool"}]})");
+          body["stream"] = stream;
+          body["tool_choice"] = choice;
+          if (*declared) {
+            auto tool = gufo::json::parse(
+                R"({"type":"function","function":{"name":"f","parameters":{"type":"object"}}})");
+            tool["function"]["name"] = declared;
+            body["tools"] = gufo::json::Value::array();
+            body["tools"].push_back(std::move(tool));
+          }
+          FakeBackend backend;
+          backend.pieces = {text};
+          const auto response =
+              gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+          const bool required = std::string_view(choice) == "required";
+          if (required && !*declared) {
+            Expect(response.status == 400, "required needs declared tools");
+            continue;
+          }
+          std::string output = response.body;
+          if (response.streaming_body)
+            response.streaming_body([&](std::string_view part) {
+              output += part;
+              return true;
+            });
+          const bool allowed = std::string_view(declared) == "f" &&
+                               std::string_view(choice) != "none";
+          Expect(
+              (output.find("\"tool_calls\":") != std::string::npos) == allowed,
+              "only declared, enabled tool calls can enter API output");
+          if (required && !allowed)
+            Expect(
+                output.find("tool_choice_unsatisfied") != std::string::npos &&
+                    (stream || response.status == 502),
+                "required cannot silently return text");
+        }
+      }
+    }
+  }
+  FakeBackend backend;
+  backend.pieces = {"ordinary text"};
+  auto body = gufo::json::parse(
+      R"({"model":"test-model","messages":[{"role":"user","content":"call f"}],"tool_choice":"required","tools":[{"type":"function","function":{"name":"f","parameters":{}}}]})");
+  Expect(gufo::server::HandleOpenAiChat(Request(body.dump()), backend).status ==
+             502,
+         "ordinary text cannot fulfill required tool choice");
+}
+
 void TestDeepSeekToolCallsAreStructured() {
   FakeBackend backend;
   backend.pieces = {
@@ -864,34 +922,16 @@ void TestWrongModelIsRejected() {
 void TestClientIdentityReachesBackend() {
   FakeBackend backend;
   backend.pieces = {"ok"};
-  const auto response =
-      gufo::server::HandleOpenAiChat(Request(R"({
-        "model":"test-model",
-        "messages":[{"role":"user","content":"hello"}]
-      })",
-                                             {{"X-Client-ID", "pi-agent-2"}}),
-                                     backend);
-
-  Expect(response.status == 200, "identified request is accepted");
-  Expect(backend.last_request.client_id == "pi-agent-2",
-         "validated client identity reaches scheduling backend");
-}
-
-void TestInvalidClientIdentityIsRejected() {
-  FakeBackend backend;
-  const auto response = gufo::server::HandleOpenAiChat(
-      Request(R"({
-        "model":"test-model",
-        "messages":[{"role":"user","content":"hello"}]
-      })",
-              {{"X-Client-ID", "contains spaces"}}),
-      backend);
-
-  Expect(response.status == 400, "invalid client identity is rejected");
-  Expect(response.body.find("invalid_client_id") != std::string::npos,
-         "invalid client identity returns a stable code");
-  Expect(backend.chat_calls.load() == 0,
-         "invalid identity never reaches generation");
+  for (const auto* header : {"pi-agent-2", "contains spaces", "rotated"}) {
+    auto request = Request(
+        R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})",
+        {{"X-Client-ID", header}});
+    request.client_id = "192.0.2.7";
+    const auto response = gufo::server::HandleOpenAiChat(request, backend);
+    Expect(response.status == 200 &&
+               backend.last_request.client_id == request.client_id,
+           "untrusted headers cannot change the transport identity");
+  }
 }
 
 void TestStreamingOverloadIsRejectedBeforeHeaders() {
@@ -967,6 +1007,7 @@ void TestAggregateImageLimit() {
 }  // namespace
 
 int main() {
+  TestToolChoiceEnforcement();
   TestStreamingIsLive();
   TestStreamingWithoutUsage();
   TestUtf8Output();
@@ -985,7 +1026,6 @@ int main() {
   TestDeepSeekToolCallsAreStructured();
   TestWrongModelIsRejected();
   TestClientIdentityReachesBackend();
-  TestInvalidClientIdentityIsRejected();
   TestStreamingOverloadIsRejectedBeforeHeaders();
   TestImagePartsRetainOrderAndIdentity();
   TestAggregateImageLimit();

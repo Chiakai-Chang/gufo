@@ -27,8 +27,10 @@ The target's original Q8 output head scores every vocabulary row. There is no
 private Q4 head or fixed vocabulary subset. Greedy proposals use full-head
 argmax. Sampled proposals use its exact top 64 logits and Gufo's bounded
 proposal policy; this does **not** claim upstream draft-sampler equivalence.
-Full-vocabulary target verification uses exact p/q acceptance and residual
-correction within floating-point precision.
+Full-vocabulary target verification uses the same FP64 filtered distribution
+as AR, with p/q acceptance and residual correction. Boundary tests cover
+top-p/min-p support, acceptance, residual draws and seeded replay. Target RNG
+draws retain 53 bits; compact proposal masses remain exact multiples of 2^-24.
 
 ## Maintained checks
 

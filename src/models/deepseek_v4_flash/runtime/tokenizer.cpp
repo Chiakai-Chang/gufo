@@ -1,16 +1,18 @@
-#include "native_internal.h"
-
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <memory>
+#include <stdexcept>
+
+#include "native_internal.h"
+
 using token_vec = ds4_tokens;
 
-static void tokenizer_die(const char *message) {
-    fprintf(stderr, "deepseek-v4-flash tokenizer: %s\n", message);
-    abort();
+[[noreturn]] static void tokenizer_die(const char* message) {
+  throw std::runtime_error(message);
 }
 
 static void *tokenizer_malloc(size_t size) {
@@ -524,7 +526,7 @@ static int vocab_lookup(const ds4_vocab *vocab, const char *text) {
     int token = -1;
     if (!table_get(&vocab->token_to_id, text, strlen(text), &token)) {
         fprintf(stderr, "ds4: required tokenizer token is missing: %s\n", text);
-        exit(1);
+        tokenizer_die("required tokenizer token is missing");
     }
     return token;
 }
@@ -543,8 +545,10 @@ ds4_vocab *ds4_vocab_create(const ds4_model *model) {
         tokenizer_die("GGUF tokenizer merge table is missing or invalid");
     }
 
-    auto *vocab =
-        static_cast<ds4_vocab *>(tokenizer_calloc(1, sizeof(ds4_vocab)));
+    std::unique_ptr<ds4_vocab, decltype(&ds4_vocab_destroy)> owned(
+        static_cast<ds4_vocab*>(tokenizer_calloc(1, sizeof(ds4_vocab))),
+        ds4_vocab_destroy);
+    auto* vocab = owned.get();
     vocab->n_vocab = (int)tokens.remaining;
     vocab->token = static_cast<ds4_string_view *>(
         tokenizer_calloc(static_cast<size_t>(vocab->n_vocab),
@@ -572,7 +576,7 @@ ds4_vocab *ds4_vocab_create(const ds4_model *model) {
     vocab->think_start_id = vocab_lookup(vocab, "<think>");
     vocab->think_end_id = vocab_lookup(vocab, "</think>");
     vocab->dsml_id = vocab_lookup(vocab, "｜DSML｜");
-    return vocab;
+    return owned.release();
 }
 
 void ds4_vocab_destroy(ds4_vocab *vocab) {

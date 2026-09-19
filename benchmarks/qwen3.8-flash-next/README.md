@@ -41,8 +41,8 @@ Sampled MTP, d0 raw prefix, seed 1, tg128, top-k/top-p/min-p disabled:
 
 | Sampling | MTP tok/s | Acceptance |
 | --- | ---: | ---: |
-| T=0.7 | 43.41 | 65.2% |
-| T=1.0 | 29.16 | 56.5% |
+| T=0.7 | 39.83 | 65.2% |
+| T=1.0 | 28.45 | 56.5% |
 
 ## Concurrent serving
 
@@ -174,8 +174,10 @@ need independent references and `gufo bench --validate-prefill N`. Measure with
 Nix release binaries, matching artifacts, capacity, prompts and sampling;
 profile separately using `tools/prof/prof.py run --stages qwen-flash -- ...`.
 
-Sampled MTP preserves the target distribution within floating-point precision.
-Replay requires the same seed, request budget, configured capacity and sampling
+Sampled MTP and AR share the same FP64 target filtering, normalization and CDF.
+Proposal acceptance and residual correction use that canonical distribution;
+shared target RNG draws retain 53 bits. Greedy verification stays on the GPU.
+Replay requires the same build, seed, request budget, configured capacity and sampling
 settings; sampled MTP need not match AR's same-seed sequence. Greedy output must
 remain independent of draft width and batching.
 

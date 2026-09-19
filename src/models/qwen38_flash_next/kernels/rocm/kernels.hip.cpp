@@ -21,6 +21,9 @@ constexpr unsigned kThreads = 256;
 __device__ __forceinline__ float SigmoidF(float x) {
   return 1.0f / (1.0f + __expf(-x));
 }
+__device__ __forceinline__ float SoftplusF(float x) {
+  return x > 20.0f ? x : log1pf(__expf(x));
+}
 __device__ __forceinline__ float SiluF(float x) {
   return x * SigmoidF(x);
 }
@@ -1063,7 +1066,7 @@ __global__ void GdnPrepAbKernel(const float* alpha_beta, const float* a,
   const std::size_t t = i / v_heads;
   const float alpha = alpha_beta[t * 2 * v_heads + h];
   const float beta = alpha_beta[t * 2 * v_heads + v_heads + h];
-  ab[i * 2] = __expf(a[h] * log1pf(__expf(alpha + dt[h])));
+  ab[i * 2] = __expf(a[h] * SoftplusF(alpha + dt[h]));
   ab[i * 2 + 1] = SigmoidF(beta);
 }
 
@@ -1300,7 +1303,7 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
                               2 * k_heads * d + h * d + j];
     const float alpha = alpha_beta[t * 2 * v_heads + h];
     const float beta = alpha_beta[t * 2 * v_heads + v_heads + h];
-    const float decay = __expf(a_h * log1pf(__expf(alpha + dt_h)));
+    const float decay = __expf(a_h * SoftplusF(alpha + dt_h));
     const float b = SigmoidF(beta);
     float kr[slice];
     float u = 0.0f;

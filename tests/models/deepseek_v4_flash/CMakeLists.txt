@@ -1,6 +1,7 @@
 # DS4 CTest checks are registered here. Shared CLI/parser and scheduler
 # tests remain with their shared components.
-add_executable(ds4_sampling_test sampling_test.cpp)
+add_executable(ds4_sampling_test sampling_test.cpp
+  ${PROJECT_SOURCE_DIR}/src/models/deepseek_v4_flash/runtime/sampling.cpp)
 target_link_libraries(ds4_sampling_test PRIVATE gufo_core)
 add_test(NAME ds4.sampling COMMAND ds4_sampling_test)
 set_tests_properties(ds4.sampling PROPERTIES LABELS "cpu;ds4;sampling")
@@ -21,6 +22,11 @@ add_test(NAME ds4.cli COMMAND ds4_cli_test)
 set_tests_properties(ds4.cli PROPERTIES LABELS "cpu;ds4;cli")
 
 if(ENGINE_ENABLE_HIP)
+  add_executable(ds4_load_test load_test.cpp)
+  target_link_libraries(ds4_load_test PRIVATE gufo_deepseek_v4_flash)
+  add_test(NAME ds4.load COMMAND ds4_load_test)
+  set_tests_properties(ds4.load PROPERTIES LABELS "cpu;ds4;loader")
+
   add_test(NAME ds4.chat COMMAND ds4_cli_test --sampled-chat)
   set_tests_properties(ds4.chat PROPERTIES
     LABELS "gpu;hip;ds4;cli;external-model;slow"

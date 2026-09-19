@@ -52,7 +52,7 @@ __global__ void PrepareSamplingKernel(const float* __restrict__ logits,
   if (index >= vocab_size) {
     return;
   }
-  adjusted_logits[index] = logits[index];
+  adjusted_logits[index] = isfinite(logits[index]) ? logits[index] : -INFINITY;
   token_ids[index] = static_cast<std::uint32_t>(index);
 }
 
@@ -96,7 +96,7 @@ __global__ void ApplySparsePenaltiesKernel(
 __global__ void LinearSamplingKernel(const float* __restrict__ logits,
                                      std::uint32_t* __restrict__ out_token,
                                      std::size_t vocab_size, float temperature,
-                                     float min_p, float uniform) {
+                                     float min_p, double uniform) {
   const std::size_t tid = threadIdx.x;
   const std::size_t begin = (vocab_size * tid) / blockDim.x;
   const std::size_t end = (vocab_size * (tid + 1U)) / blockDim.x;
@@ -105,7 +105,7 @@ __global__ void LinearSamplingKernel(const float* __restrict__ logits,
   __shared__ float segment_sums[kSamplingThreads];
   __shared__ float segment_prefix[kSamplingThreads];
   __shared__ std::uint32_t selected_segment;
-  __shared__ float selected_threshold;
+  __shared__ double selected_threshold;
 
   float local_max = -INFINITY;
   for (std::size_t index = begin; index < end; ++index) {
@@ -124,6 +124,12 @@ __global__ void LinearSamplingKernel(const float* __restrict__ logits,
   }
 
   const float maximum = shared_max[0];
+  if (!isfinite(maximum)) {
+    if (tid == 0) {
+      *out_token = kInvalidSampleToken;
+    }
+    return;
+  }
   const float min_p_threshold =
       min_p > 0.0F ? maximum + temperature * logf(min_p) : -INFINITY;
   const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
@@ -143,7 +149,7 @@ __global__ void LinearSamplingKernel(const float* __restrict__ logits,
       segment_prefix[segment] = total;
       total += segment_sums[segment];
     }
-    float threshold = fminf(fmaxf(uniform, 0.0F), 0.99999994F) * total;
+    double threshold = uniform * total;
     selected_segment = static_cast<std::uint32_t>(blockDim.x - 1U);
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
       if (threshold < segment_prefix[segment] + segment_sums[segment]) {
@@ -156,7 +162,7 @@ __global__ void LinearSamplingKernel(const float* __restrict__ logits,
   __syncthreads();
 
   if (tid == selected_segment) {
-    float threshold = selected_threshold;
+    double threshold = selected_threshold;
     std::uint32_t selected =
         static_cast<std::uint32_t>(end > begin ? end - 1U : 0U);
     for (std::size_t index = begin; index < end; ++index) {
@@ -179,7 +185,7 @@ __global__ void SortedSamplingKernel(
     const std::uint32_t* __restrict__ sorted_token_ids,
     std::uint32_t* __restrict__ out_token, std::size_t vocab_size,
     float temperature, std::int32_t top_k, float top_p, float min_p,
-    std::size_t min_keep, float uniform) {
+    std::size_t min_keep, double uniform) {
   const std::size_t tid = threadIdx.x;
   const std::size_t minimum = min(vocab_size, max(min_keep, std::size_t{1}));
   const std::size_t initial_count =
@@ -191,11 +197,17 @@ __global__ void SortedSamplingKernel(
   __shared__ std::size_t top_p_keep;
   __shared__ std::size_t final_keep;
   __shared__ std::uint32_t selected_segment;
-  __shared__ float selected_threshold;
+  __shared__ double selected_threshold;
 
   const std::size_t top_p_begin = (initial_count * tid) / blockDim.x;
   const std::size_t top_p_end = (initial_count * (tid + 1U)) / blockDim.x;
   const float maximum = sorted_logits[0];
+  if (!isfinite(maximum)) {
+    if (tid == 0) {
+      *out_token = kInvalidSampleToken;
+    }
+    return;
+  }
   const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   float local_sum = 0.0F;
   for (std::size_t index = top_p_begin; index < top_p_end; ++index) {
@@ -227,7 +239,7 @@ __global__ void SortedSamplingKernel(
   __syncthreads();
 
   if (top_p < 1.0F && tid == selected_segment) {
-    float threshold = selected_threshold;
+    double threshold = selected_threshold;
     std::size_t keep = top_p_end;
     for (std::size_t index = top_p_begin; index < top_p_end; ++index) {
       threshold -= expf((sorted_logits[index] - maximum) * inverse_temperature);
@@ -280,7 +292,7 @@ __global__ void SortedSamplingKernel(
       segment_prefix[segment] = total;
       total += segment_sums[segment];
     }
-    const float threshold = fminf(fmaxf(uniform, 0.0F), 0.99999994F) * total;
+    const double threshold = uniform * total;
     selected_segment = static_cast<std::uint32_t>(blockDim.x - 1U);
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
       if (threshold < segment_prefix[segment] + segment_sums[segment]) {
@@ -293,7 +305,7 @@ __global__ void SortedSamplingKernel(
   __syncthreads();
 
   if (tid == selected_segment) {
-    float threshold = selected_threshold;
+    double threshold = selected_threshold;
     std::uint32_t selected = sorted_token_ids[sample_end - 1U];
     for (std::size_t index = sample_begin; index < sample_end; ++index) {
       threshold -= expf((sorted_logits[index] - maximum) * inverse_temperature);
@@ -311,8 +323,8 @@ __global__ void LinearSpeculativeSamplingKernel(
     std::uint32_t* __restrict__ out_accepted, std::size_t vocab_size,
     float temperature, float min_p, std::uint32_t draft_token,
     float draft_token_probability,
-    const float* __restrict__ draft_probabilities, float acceptance_uniform,
-    float residual_uniform) {
+    const float* __restrict__ draft_probabilities, double acceptance_uniform,
+    double residual_uniform) {
   const std::size_t tid = threadIdx.x;
   const std::size_t begin = (vocab_size * tid) / blockDim.x;
   const std::size_t end = (vocab_size * (tid + 1U)) / blockDim.x;
@@ -325,7 +337,7 @@ __global__ void LinearSpeculativeSamplingKernel(
   __shared__ bool accepted;
   __shared__ bool use_residual;
   __shared__ std::uint32_t selected_segment;
-  __shared__ float selected_threshold;
+  __shared__ double selected_threshold;
 
   float local_max = -INFINITY;
   for (std::size_t index = begin; index < end; ++index) {
@@ -344,6 +356,13 @@ __global__ void LinearSpeculativeSamplingKernel(
   }
 
   const float maximum = shared_max[0];
+  if (!isfinite(maximum)) {
+    if (tid == 0) {
+      *out_token = kInvalidSampleToken;
+      *out_accepted = 2;
+    }
+    return;
+  }
   const float min_p_threshold =
       min_p > 0.0F ? maximum + temperature * logf(min_p) : -INFINITY;
   const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
@@ -432,8 +451,7 @@ __global__ void LinearSpeculativeSamplingKernel(
   if (tid == 0) {
     const float total =
         segment_prefix[blockDim.x - 1U] + segment_sums[blockDim.x - 1U];
-    const float threshold =
-        fminf(fmaxf(residual_uniform, 0.0F), 0.99999994F) * total;
+    const double threshold = residual_uniform * total;
     selected_segment = static_cast<std::uint32_t>(blockDim.x - 1U);
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
       if (segment_sums[segment] > 0.0F &&
@@ -447,7 +465,7 @@ __global__ void LinearSpeculativeSamplingKernel(
   __syncthreads();
 
   if (tid == selected_segment) {
-    float threshold = selected_threshold;
+    double threshold = selected_threshold;
     std::uint32_t selected =
         static_cast<std::uint32_t>(end > begin ? end - 1U : 0U);
     for (std::size_t index = begin; index < end; ++index) {
@@ -555,7 +573,7 @@ __global__ void SpeculativeSegmentResidualKernel(
     const float* __restrict__ draft_probabilities,
     SpeculativeSegments* __restrict__ scratch, std::size_t vocab_size,
     std::uint32_t draft_token, float draft_token_probability,
-    float acceptance_uniform, std::uint32_t* __restrict__ out_token,
+    double acceptance_uniform, std::uint32_t* __restrict__ out_token,
     std::uint32_t* __restrict__ out_accepted) {
   extern __shared__ float values[];
   __shared__ float sums[kSamplingThreads];
@@ -569,15 +587,23 @@ __global__ void SpeculativeSegmentResidualKernel(
     target_total = 0.0F;
     for (std::size_t i = 0; i < kSamplingThreads; ++i)
       target_total += sums[i];
-    const float draft_weight =
-        draft_token < vocab_size ? weights[draft_token] : 0.0F;
-    accepted = acceptance_uniform * draft_token_probability <
-               draft_weight / target_total;
-    if (blockIdx.x == 0) {
-      *out_accepted = accepted ? 1U : 0U;
-      scratch->target_total = target_total;
-      if (accepted)
-        *out_token = draft_token;
+    if (!(target_total > 0) || !isfinite(target_total)) {
+      accepted = true;  // All threads/blocks skip residual work on failure.
+      if (blockIdx.x == 0) {
+        *out_token = kInvalidSampleToken;
+        *out_accepted = 2;
+      }
+    } else {
+      const float draft_weight =
+          draft_token < vocab_size ? weights[draft_token] : 0.0F;
+      accepted = acceptance_uniform * draft_token_probability <
+                 draft_weight / target_total;
+      if (blockIdx.x == 0) {
+        *out_accepted = accepted ? 1U : 0U;
+        scratch->target_total = target_total;
+        if (accepted)
+          *out_token = draft_token;
+      }
     }
   }
   __syncthreads();
@@ -601,7 +627,7 @@ __global__ void SpeculativeSegmentSelectKernel(
     const float* __restrict__ weights,
     const float* __restrict__ draft_probabilities,
     const SpeculativeSegments* __restrict__ scratch, std::size_t vocab_size,
-    float residual_uniform, std::uint32_t* __restrict__ out_token,
+    double residual_uniform, std::uint32_t* __restrict__ out_token,
     const std::uint32_t* __restrict__ out_accepted) {
   if (*out_accepted != 0)
     return;
@@ -609,7 +635,7 @@ __global__ void SpeculativeSegmentSelectKernel(
   __shared__ float sums[kSamplingThreads];
   __shared__ float prefix[kSamplingThreads];
   __shared__ bool use_residual;
-  __shared__ float selected_threshold;
+  __shared__ double selected_threshold;
   __shared__ std::uint32_t selected_segment;
   sums[threadIdx.x] = scratch->residual_sums[threadIdx.x];
   __syncthreads();
@@ -637,8 +663,7 @@ __global__ void SpeculativeSegmentSelectKernel(
   if (threadIdx.x == 0) {
     const float total =
         prefix[kSamplingThreads - 1U] + sums[kSamplingThreads - 1U];
-    const float threshold =
-        fminf(fmaxf(residual_uniform, 0.0F), 0.99999994F) * total;
+    const double threshold = residual_uniform * total;
     selected_segment = kSamplingThreads - 1U;
     for (std::size_t i = 0; i < kSamplingThreads; ++i) {
       if (sums[i] > 0.0F && threshold < prefix[i] + sums[i]) {
@@ -660,7 +685,7 @@ __global__ void SpeculativeSegmentSelectKernel(
             : weights[i];
   __syncthreads();
   if (threadIdx.x == 0) {
-    float threshold = selected_threshold;
+    double threshold = selected_threshold;
     std::uint32_t selected =
         static_cast<std::uint32_t>(end > begin ? end - 1U : 0U);
     for (std::size_t i = begin; i < end; ++i) {
@@ -684,8 +709,8 @@ __global__ void SortedSpeculativeSamplingKernel(
     float temperature, std::int32_t top_k, float top_p, float min_p,
     std::size_t min_keep, std::uint32_t draft_token,
     float draft_token_probability,
-    const float* __restrict__ draft_probabilities, float acceptance_uniform,
-    float residual_uniform) {
+    const float* __restrict__ draft_probabilities, double acceptance_uniform,
+    double residual_uniform) {
   const std::size_t tid = threadIdx.x;
   const std::size_t minimum = min(vocab_size, max(min_keep, std::size_t{1}));
   const std::size_t initial_count =
@@ -701,11 +726,18 @@ __global__ void SortedSpeculativeSamplingKernel(
   __shared__ bool accepted;
   __shared__ bool use_residual;
   __shared__ std::uint32_t selected_segment;
-  __shared__ float selected_threshold;
+  __shared__ double selected_threshold;
 
   const std::size_t top_p_begin = (initial_count * tid) / blockDim.x;
   const std::size_t top_p_end = (initial_count * (tid + 1U)) / blockDim.x;
   const float maximum = sorted_logits[0];
+  if (!isfinite(maximum)) {
+    if (tid == 0) {
+      *out_token = kInvalidSampleToken;
+      *out_accepted = 2;
+    }
+    return;
+  }
   const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   float local_sum = 0.0F;
   for (std::size_t index = top_p_begin; index < top_p_end; ++index) {
@@ -737,7 +769,7 @@ __global__ void SortedSpeculativeSamplingKernel(
   __syncthreads();
 
   if (top_p < 1.0F && tid == selected_segment) {
-    float threshold = selected_threshold;
+    double threshold = selected_threshold;
     std::size_t keep = top_p_end;
     for (std::size_t index = top_p_begin; index < top_p_end; ++index) {
       threshold -= expf((sorted_logits[index] - maximum) * inverse_temperature);
@@ -847,8 +879,7 @@ __global__ void SortedSpeculativeSamplingKernel(
   if (tid == 0) {
     const float total =
         segment_prefix[blockDim.x - 1U] + segment_sums[blockDim.x - 1U];
-    const float threshold =
-        fminf(fmaxf(residual_uniform, 0.0F), 0.99999994F) * total;
+    const double threshold = residual_uniform * total;
     selected_segment = static_cast<std::uint32_t>(blockDim.x - 1U);
     for (std::size_t segment = 0; segment < blockDim.x; ++segment) {
       if (segment_sums[segment] > 0.0F &&
@@ -862,7 +893,7 @@ __global__ void SortedSpeculativeSamplingKernel(
   __syncthreads();
 
   if (tid == selected_segment) {
-    float threshold = selected_threshold;
+    double threshold = selected_threshold;
     std::uint32_t selected = sorted_token_ids[sample_end - 1U];
     for (std::size_t index = sample_begin; index < sample_end; ++index) {
       const float target_weight =
@@ -896,7 +927,7 @@ __global__ void ArgmaxKernel(const float* __restrict__ logits,
   const std::size_t block_size = blockDim.x;
 
   float max_val = -INFINITY;
-  std::uint32_t max_idx = 0;
+  std::uint32_t max_idx = kInvalidSampleToken;
 
   for (std::size_t i = tid; i < vocab_size; i += block_size) {
     const float val = logits[i];
@@ -949,7 +980,7 @@ __global__ void BatchedArgmaxKernel(const float* __restrict__ logits,
                               : vocab_size;
 
   float max_val = -INFINITY;
-  std::uint32_t max_idx = 0;
+  std::uint32_t max_idx = kInvalidSampleToken;
   for (std::size_t index = begin + tid; index < end; index += blockDim.x) {
     const float value = row_logits[index];
     if constexpr (MapIndices) {
@@ -1119,6 +1150,9 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
                        const sampling::TokenPenalty* penalties,
                        std::size_t penalty_count,
                        GpuSamplingWorkspace* workspace, hipStream_t stream) {
+  if (!std::isfinite(parameters.uniform) || parameters.uniform < 0 ||
+      parameters.uniform >= 1)
+    throw std::invalid_argument("sampling draw must be in [0, 1)");
   if (logits == nullptr || out_token == nullptr || workspace == nullptr ||
       vocab_size == 0 || workspace->vocab_size != vocab_size ||
       penalty_count > workspace->penalty_capacity) {
@@ -1183,10 +1217,14 @@ void LaunchGPUSpeculativeSampling(
     std::uint32_t draft_token, float draft_token_probability,
     const std::uint32_t* draft_candidate_ids,
     const float* draft_candidate_probabilities,
-    std::size_t draft_candidate_count, float acceptance_uniform,
-    float residual_uniform, const sampling::TokenPenalty* penalties,
+    std::size_t draft_candidate_count, double acceptance_uniform,
+    double residual_uniform, const sampling::TokenPenalty* penalties,
     std::size_t penalty_count, GpuSamplingWorkspace* workspace,
     hipStream_t stream) {
+  if (!std::isfinite(acceptance_uniform) || acceptance_uniform < 0 ||
+      acceptance_uniform >= 1 || !std::isfinite(residual_uniform) ||
+      residual_uniform < 0 || residual_uniform >= 1)
+    throw std::invalid_argument("speculative draws must be in [0, 1)");
   if (logits == nullptr || out_token == nullptr || out_accepted == nullptr ||
       workspace == nullptr || vocab_size == 0 ||
       workspace->vocab_size != vocab_size || draft_candidate_count == 0 ||

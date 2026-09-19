@@ -265,8 +265,8 @@ DeviceModel::~DeviceModel() {
 }
 
 std::unique_ptr<DeviceModel> DeviceModel::Upload(
-    const ModelWeights& w, const std::filesystem::path& model_path,
-    const MtpWeights* mtp, const std::filesystem::path& mtp_path,
+    const ModelWeights& w, const core::GgufReader& reader,
+    const MtpWeights* mtp, const core::GgufReader* mtp_reader,
     std::string* error_msg) {
   // The CPU reference also reads Q6_K, but the production embedding, dense
   // and routed kernels do not. Reject it before allocating device weights.
@@ -288,19 +288,17 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
   }
   std::unique_ptr<DeviceModel> m(new DeviceModel());
   m->config_ = w.config;
-  std::vector<std::filesystem::path> shards;
-  // Every shard the trunk references; the sidecar is one more file.
-  std::uint32_t shard_count = 0;
-  for (const auto& l : w.layers) {
-    shard_count = std::max(shard_count, l.ffn_down_exps.shard + 1);
-    shard_count = std::max(shard_count, l.hc_attn.norm.shard + 1);
-  }
-  shard_count = std::max(shard_count, w.output.shard + 1);
-  for (std::uint32_t i = 0; i < shard_count; ++i) {
-    shards.push_back(ShardPath(model_path, i));
-  }
+  const auto regions = reader.GetMappedRegions();
+  std::vector<core::GgufMappedRegion> shards(regions.begin(), regions.end());
+  const auto shard_count = static_cast<std::uint32_t>(shards.size());
   if (mtp != nullptr) {
-    shards.push_back(mtp_path);
+    if (mtp_reader == nullptr) {
+      if (error_msg)
+        *error_msg = "MTP weights require their bound reader";
+      return nullptr;
+    }
+    const auto extra = mtp_reader->GetMappedRegions();
+    shards.insert(shards.end(), extra.begin(), extra.end());
   }
   auto stager = WeightUpload::Create(shards, error_msg);
   if (!stager) {

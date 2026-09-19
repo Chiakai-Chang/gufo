@@ -92,7 +92,7 @@ tokenization::TokenId QwenGpuExecutor::ForwardToken(
                            hipMemcpyDeviceToHost, arena_.stream));
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
 
-  return next_token_id;
+  return CheckedSampleToken(next_token_id, config.vocab_size);
 }
 
 }  // namespace gufo::hip

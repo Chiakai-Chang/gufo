@@ -3,7 +3,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
@@ -69,11 +68,10 @@ public:
   DeviceModel(const DeviceModel&) = delete;
   DeviceModel& operator=(const DeviceModel&) = delete;
 
-  /// Streams every tensor from the shard files into device memory. `mtp`
-  /// may be null; `mtp_path` is the sidecar it was bound from.
+  /// Streams tensors from the same open files used to bind their metadata.
   [[nodiscard]] static std::unique_ptr<DeviceModel> Upload(
-      const ModelWeights& weights, const std::filesystem::path& model_path,
-      const MtpWeights* mtp, const std::filesystem::path& mtp_path,
+      const ModelWeights& weights, const core::GgufReader& reader,
+      const MtpWeights* mtp, const core::GgufReader* mtp_reader,
       std::string* error_msg = nullptr);
 
   const Config& config() const noexcept { return config_; }

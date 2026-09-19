@@ -73,12 +73,9 @@ NgramTable::~NgramTable() {
   }
 }
 
-std::unique_ptr<NgramTable> NgramTable::Open(const std::filesystem::path& path,
-                                             std::uint64_t file_offset,
-                                             std::uint64_t rows,
-                                             std::uint32_t row_dim,
-                                             core::GgmlType type,
-                                             std::string* error_msg) {
+std::unique_ptr<NgramTable> NgramTable::Open(
+    int file_descriptor, std::uint64_t file_offset, std::uint64_t rows,
+    std::uint32_t row_dim, core::GgmlType type, std::string* error_msg) {
   std::unique_ptr<NgramTable> t(new NgramTable());
   const std::size_t block = type == core::GgmlType::kIQ4_NL ? 32 : 1;
   const std::size_t block_bytes = type == core::GgmlType::kIQ4_NL ? 18 : 2;
@@ -99,6 +96,7 @@ std::unique_ptr<NgramTable> NgramTable::Open(const std::filesystem::path& path,
   t->base_offset_ = file_offset;
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
   // model must not be used here or every touched row would stay resident.
+  const auto path = "/proc/self/fd/" + std::to_string(file_descriptor);
   t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
   t->direct_ = t->fd_ >= 0;
   if (t->fd_ < 0) {
@@ -106,7 +104,7 @@ std::unique_ptr<NgramTable> NgramTable::Open(const std::filesystem::path& path,
   }
   if (t->fd_ < 0) {
     if (error_msg != nullptr) {
-      *error_msg = "cannot open n-gram table " + path.string() + ": " +
+      *error_msg = std::string("cannot open bound n-gram table: ") +
                    std::strerror(errno);
     }
     return nullptr;

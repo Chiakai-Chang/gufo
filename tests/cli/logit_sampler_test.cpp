@@ -341,7 +341,7 @@ void TestSamplingFailsClosedOnInvalidInputs() {
 }
 
 void TestZeroDrawAndNonFiniteCandidates() {
-  // Inverse xorshift state whose next 24-bit uniform is exactly zero.
+  // Inverse xorshift state whose next 53-bit uniform is exactly zero.
   constexpr std::uint64_t zero_draw_state = UINT64_C(0x98d76a164d99a710);
   const std::array<float, 3> cold_logits{-1000.0F, 0.0F, -1.0F};
   gufo::sampling::SamplerState sampler({.temperature = 1.0F, .seed = 0});
@@ -417,13 +417,13 @@ void TestFilteredDistributionAgainstFullSort() {
       const auto expected =
           gufo::sampling::BuildDistribution(logits, test.config, history);
       const auto actual = sampler.Distribution(logits);
-      Expect(actual.entries().size() == expected.entries().size(), test.name);
-      for (std::size_t i = 0; i < actual.entries().size(); ++i) {
-        Expect(actual.entries()[i].token == expected.entries()[i].token &&
-                   std::abs(actual.entries()[i].value -
-                            expected.entries()[i].value) < 1e-12,
+      const auto positive = std::ranges::count_if(
+          expected.entries(), [](const auto& e) { return e.value > 0; });
+      Expect(actual.entries().size() == static_cast<std::size_t>(positive),
+             test.name);
+      for (const auto& entry : expected.entries())
+        Expect(std::abs(actual.probability(entry.token) - entry.value) < 1e-12,
                test.name);
-      }
       Expect(sampler.rng_state() == rng,
              "materializing probabilities consumes no random draws");
     }
@@ -466,6 +466,29 @@ void TestDeferredResidualReplay() {
   Expect(sampler.Sample(logits) == 0, "RNG reset discards pending residual");
 }
 
+void TestCanonicalTargetDistribution() {
+  std::vector<float> logits(4099, -1000.0F);
+  logits[0] = 0;
+  logits[17] = -1;
+  logits[4098] = -2;
+  for (const auto& test : gufo::test::QwenSamplingCases()) {
+    for (float temperature : {0.5F, 0.99999994F, 2.0F}) {
+      auto config = test.config;
+      config.temperature = temperature;
+      config.seed = 19;
+      gufo::sampling::SamplerState sampler(config);
+      for (unsigned step = 0; step < 16; ++step) {
+        const auto distribution = sampler.Distribution(logits);
+        auto rng = sampler.rng_state();
+        const auto expected = distribution.Sample(&rng);
+        Expect(sampler.Sample(logits) == expected && sampler.rng_state() == rng,
+               "AR and verification share exact support, CDF and RNG draws");
+        sampler.Accept(expected);
+      }
+    }
+  }
+}
+
 void TestResponsePenaltyScope() {
   using gufo::sampling::SamplerState;
   using gufo::sampling::TokenId;
@@ -503,6 +526,21 @@ void TestResponsePenaltyScope() {
 }  // namespace
 
 int main() {
+  bool sub_float_resolution = false;
+  for (std::uint64_t seed = 1; seed < 100; ++seed) {
+    auto state = seed;
+    auto reference = seed;
+    const auto bits = gufo::sampling::NextRandom(&reference);
+    const double draw = gufo::sampling::Uniform(&state);
+    Expect(draw >= 0 && draw < 1 && state == reference,
+           "uniform stays half-open and consumes one RNG word");
+    Expect(draw == static_cast<double>(bits >> 11) * 0x1.0p-53,
+           "uniform retains all 53 random mantissa bits");
+    sub_float_resolution |=
+        draw != static_cast<double>(static_cast<float>(draw));
+  }
+  Expect(sub_float_resolution, "uniform must exceed float resolution");
+  TestCanonicalTargetDistribution();
   TestResponsePenaltyScope();
   TestGreedySelectsFiniteArgmaxWithoutAdvancingRng();
   TestDefaultConfigPreservesGreedyDecoding();

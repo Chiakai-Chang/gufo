@@ -259,7 +259,6 @@ Executor::~Executor() {
   if (ple_pending_) {
     (void)ngram_->WaitRead();
   }
-  gufo::hip::FreeGpuSamplingWorkspace(&sampling_workspace_);
   (void)hipFree(batch_logits_);
   (void)hipFree(batch_q8_);
   (void)hipHostFree(batch_controls_);
@@ -471,7 +470,7 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
     // Final selection consumes intermediate IDs before writing its scores.
     // Pack those scores behind the 64 returned IDs for one host transfer.
     s.mtp_scores = reinterpret_cast<float*>(s.mtp_ids + kMtpCandidates);
-    if (!Check(hipHostMalloc(&e->mtp_token_host_, 2 * sizeof(std::int32_t)),
+    if (!Check(hipHostMalloc(&e->mtp_token_host_, sizeof(std::int32_t)),
                "pinned draft token", error_msg) ||
         !Check(
             hipHostMalloc(&e->mtp_candidates_host_, sizeof(MtpCandidateLogits)),
@@ -662,9 +661,6 @@ std::size_t Executor::DeferredScratchBytes() const {
                           : 0;
   if (batch_q8_ == nullptr)
     bytes += qfn_mmq_q8_1_bytes(32, std::max(2560U, c.hidden_size));
-  if (has_mtp() && sampling_workspace_.vocab_size == 0)
-    bytes += gufo::hip::EstimateGpuSamplingWorkspaceBytes(c.vocab_size,
-                                                          c.vocab_size);
   return bytes;
 }
 
@@ -2393,54 +2389,6 @@ bool Executor::GreedyMtpPredictions(std::span<ArgmaxCandidate> predictions,
                error_msg);
 }
 
-bool Executor::VerifyMtpProposal(std::uint32_t row, const MtpProposal& proposal,
-                                 sampling::SamplerState& sampler,
-                                 std::int32_t* token, bool* accepted,
-                                 std::string* error_msg) const {
-  if (row >= options_.max_logit_rows || proposal.size == 0 ||
-      proposal.size > kMtpCandidates || !(proposal.probability > 0.0F) ||
-      sampling_workspace_.vocab_size == 0 || token == nullptr ||
-      accepted == nullptr) {
-    AssignError(error_msg, "invalid MTP verification request");
-    return false;
-  }
-  const auto& config = sampler.config();
-  const gufo::hip::GpuSamplingParameters parameters{
-      .temperature = config.temperature,
-      .top_k = config.top_k,
-      .top_p = config.top_p,
-      .min_p = config.min_p,
-      .min_keep = config.min_keep,
-      .repeat_penalty = config.repeat_penalty,
-      .frequency_penalty = config.frequency_penalty,
-      .presence_penalty = config.presence_penalty,
-  };
-  const float acceptance_uniform = static_cast<float>(sampler.Uniform());
-  const auto residual_checkpoint = sampler.rng_state();
-  const float residual_uniform = static_cast<float>(sampler.Uniform());
-  gufo::hip::LaunchGPUSpeculativeSampling(
-      VerificationLogits() +
-          static_cast<std::size_t>(row) * this->config().vocab_size,
-      s_.mtp_ids, s_.mtp_ids + 1, this->config().vocab_size, parameters,
-      proposal.token, proposal.probability, proposal.ids.data(),
-      proposal.probabilities.data(), proposal.size, acceptance_uniform,
-      residual_uniform, sampler.penalties().data(), sampler.penalties().size(),
-      &sampling_workspace_, stream_);
-  if (!Check(
-          hipMemcpyAsync(mtp_token_host_, s_.mtp_ids, 2 * sizeof(std::int32_t),
-                         hipMemcpyDeviceToHost, stream_),
-          "MTP verification result download", error_msg) ||
-      !Check(hipStreamSynchronize(stream_), "MTP verification", error_msg)) {
-    return false;
-  }
-  *token = mtp_token_host_[0];
-  *accepted = mtp_token_host_[1] != 0;
-  if (*accepted) {
-    sampler.SetRngState(residual_checkpoint);
-  }
-  return true;
-}
-
 bool Executor::MtpForward(Session& session,
                           std::span<const std::int32_t> tokens,
                           std::int32_t hidden_row, MtpOutput output,
@@ -2460,11 +2408,7 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "no MTP block loaded");
     return false;
   }
-  // Allocate the target p/q verifier workspace before any graph capture.
-  if (output.candidates != nullptr && sampling_workspace_.vocab_size == 0) {
-    gufo::hip::AllocateGpuSamplingWorkspace(
-        &sampling_workspace_, config().vocab_size, config().vocab_size);
-  }
+
   if (n == 0 || n > options_.max_batch || (hidden_row < 0 && n != 1) ||
       (hidden_row >= 0 &&
        static_cast<std::uint32_t>(hidden_row) + n >

@@ -27,6 +27,7 @@ enum class TextGenerationErrorCode : std::uint8_t {
   kOutputLimit,
   kOutputBackpressure,
   kSchedulerStopping,
+  kToolChoiceUnsatisfied,
 };
 
 class TextGenerationError final : public std::runtime_error {
@@ -46,6 +47,8 @@ public:
       case TextGenerationErrorCode::kOutputBackpressure:
       case TextGenerationErrorCode::kSchedulerStopping:
         return 503;
+      case TextGenerationErrorCode::kToolChoiceUnsatisfied:
+        return 502;
     }
     return 500;
   }
@@ -63,11 +66,14 @@ public:
         return "output_backpressure";
       case TextGenerationErrorCode::kSchedulerStopping:
         return "scheduler_stopping";
+      case TextGenerationErrorCode::kToolChoiceUnsatisfied:
+        return "tool_choice_unsatisfied";
     }
     return "generation_error";
   }
   [[nodiscard]] bool retryable() const noexcept {
-    return code_ != TextGenerationErrorCode::kOutputLimit;
+    return code_ != TextGenerationErrorCode::kOutputLimit &&
+           code_ != TextGenerationErrorCode::kToolChoiceUnsatisfied;
   }
 
 private:
@@ -206,7 +212,8 @@ public:
   virtual Result complete(std::string_view prompt, std::size_t max_tokens,
                           const sampling::SamplingConfig& sampling,
                           const CancellationCheck& is_cancelled = {},
-                          const TokenCallback& on_token = {}) = 0;
+                          const TokenCallback& on_token = {},
+                          std::string_view client_id = "anonymous") = 0;
 
   virtual Result chat(const ChatRequest& request, std::size_t max_tokens,
                       const sampling::SamplingConfig& sampling,

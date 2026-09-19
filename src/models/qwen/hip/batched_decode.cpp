@@ -406,6 +406,8 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
   }
   HIP_CHECK(hipStreamSynchronize(arena.stream));
 
+  for (std::size_t row = 0; row < batch_size; ++row)
+    (void)CheckedSampleToken(host_frontiers[row], vocab_size);
   return {host_frontiers.begin(),
           host_frontiers.begin() + static_cast<std::ptrdiff_t>(batch_size)};
 }
@@ -813,6 +815,8 @@ QwenGpuExecutor::ForwardVerificationBatch(
     }
   }
   HIP_CHECK(hipStreamSynchronize(arena_.stream));
+  for (std::size_t row = 0; row < batch_size; ++row)
+    (void)CheckedSampleToken(host_predictions[row], vocab_size);
   std::vector<std::vector<tokenization::TokenId>> predictions;
   predictions.reserve(items.size());
   for (std::size_t index = 0; index < items.size(); ++index) {

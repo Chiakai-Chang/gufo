@@ -112,8 +112,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   }
   if (c.ple_layer >= 0) {
     const auto& t = m->weights_->ple_table;
-    m->ngram_ = NgramTable::Open(ShardPath(model_path, t.shard), t.file_offset,
-                                 t.rows, c.ple_head_dim, t.type, error_msg);
+    m->ngram_ = NgramTable::Open(
+        m->reader_->GetMappedRegions()[t.shard].file_descriptor, t.file_offset,
+        t.rows, c.ple_head_dim, t.type, error_msg);
     if (!m->ngram_) {
       return nullptr;
     }
@@ -130,9 +131,9 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     m->mtp_weights_ = std::make_unique<MtpWeights>(std::move(*mtp));
   }
-  m->device_ =
-      rocm::DeviceModel::Upload(*m->weights_, model_path, m->mtp_weights_.get(),
-                                options.mtp_model_path, error_msg);
+  m->device_ = rocm::DeviceModel::Upload(*m->weights_, *m->reader_,
+                                         m->mtp_weights_.get(),
+                                         m->mtp_reader_.get(), error_msg);
   if (!m->device_) {
     return nullptr;
   }
@@ -675,7 +676,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
   const bool gpu_greedy = sampler.config().can_use_unmodified_argmax();
-  const bool gpu_verification = sampled || gpu_greedy;
+  const bool gpu_verification = gpu_greedy;
   if (!defer_head && !DraftCatchUp(anchor, true, error_msg,
                                    sampled ? &pending->candidates : nullptr)) {
     return false;
@@ -766,12 +767,12 @@ bool Session::FinishDecode(const DecodeRequest& request,
       continue;
     }
     if (sampled) {
-      std::int32_t token = 0;
-      bool accepted = false;
-      if (!exec.VerifyMtpProposal(keep - 1, proposals[keep - 1], sampler,
-                                  &token, &accepted, error_msg)) {
-        return false;
-      }
+      const auto verified =
+          VerifyMtpProposal(std::span<const float>(verify_logits_)
+                                .subspan((keep - 1) * vocab, vocab),
+                            proposals[keep - 1], sampler);
+      const auto token = static_cast<std::int32_t>(verified.token);
+      const bool accepted = verified.accepted;
       if (is_stop(token)) {
         result->stop = true;
         break;

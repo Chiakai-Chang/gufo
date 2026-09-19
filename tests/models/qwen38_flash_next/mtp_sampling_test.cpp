@@ -270,12 +270,7 @@ void CheckSampledOutputFrequencies() {
     for (unsigned trial = 0; trial < trials; ++trial) {
       auto draft_rng = sampling::NextRandom(sampler.mutable_rng_state());
       const auto q = qfn::SampleMtpProposal(candidates, sampler, &draft_rng);
-      auto token = q.token;
-      if (sampler.Uniform() * q.probability >= p.probability(token)) {
-        token = p.SampleResidual(std::span(q.ids).first(q.size),
-                                 std::span(q.probabilities).first(q.size),
-                                 sampler.mutable_rng_state());
-      }
+      const auto token = qfn::VerifyMtpProposal(logits, q, sampler).token;
       ++counts[token];
     }
     for (unsigned token = 0; token < counts.size(); ++token) {
@@ -286,8 +281,58 @@ void CheckSampledOutputFrequencies() {
   }
 }
 
+void CheckVerificationBoundaries() {
+  const std::array<float, 3> logits{0, -1, -2};
+  const std::array<sampling::TokenId, 3> history{1, 1, 2};
+  for (const auto& test : gufo::test::QwenSamplingCases()) {
+    auto config = test.config;
+    config.temperature = 0.5F;
+    config.seed = 6;
+    // top-p and min-p cutoffs immediately around the finite FP64 boundary.
+    for (const float top_p : {0.8F, 0.8668133F, 0.8668134F, 1.0F}) {
+      config.top_p = top_p;
+      for (const float min_p : {0.0F, 0.13533527F, 0.13533530F}) {
+        config.min_p = min_p;
+        sampling::SamplerState sampler(config, history);
+        sampler.Accept(1);
+        const auto target = sampler.Distribution(logits);
+        for (unsigned draft = 0; draft < logits.size(); ++draft) {
+          qfn::MtpProposal proposal;
+          proposal.size = 1;
+          proposal.ids[0] = proposal.token = draft;
+          proposal.probabilities[0] = proposal.probability = 1;
+          for (unsigned draw = 0; draw < 16; ++draw) {
+            auto reference = sampler;
+            auto replay = sampler;
+            const bool accepted =
+                reference.Uniform() < target.probability(draft);
+            const auto expected =
+                accepted ? draft
+                         : target.SampleResidual(
+                               std::span(proposal.ids).first(1),
+                               std::span(proposal.probabilities).first(1),
+                               reference.mutable_rng_state());
+            const auto actual =
+                qfn::VerifyMtpProposal(logits, proposal, sampler);
+            const auto repeated =
+                qfn::VerifyMtpProposal(logits, proposal, replay);
+            Require(actual.accepted == accepted && actual.token == expected &&
+                        sampler.rng_state() == reference.rng_state() &&
+                        actual.token == repeated.token &&
+                        actual.accepted == repeated.accepted &&
+                        sampler.rng_state() == replay.rng_state(),
+                    "MTP acceptance/residual must use the canonical AR "
+                    "distribution exactly");
+          }
+        }
+      }
+    }
+  }
+}
+
 int main() {
   try {
+    CheckVerificationBoundaries();
     CheckLengthController();
     CheckCalibratedCosts();
     CheckBatchProfitability();

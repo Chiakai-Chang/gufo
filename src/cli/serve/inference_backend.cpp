@@ -3217,7 +3217,8 @@ void InferenceBackend::set_reasoning_defaults(
 InferenceBackend::Result InferenceBackend::complete(
     std::string_view prompt, std::size_t max_tokens,
     const sampling::SamplingConfig& sampling_config,
-    const CancellationCheck& is_cancelled, const TokenCallback& on_token) {
+    const CancellationCheck& is_cancelled, const TokenCallback& on_token,
+    std::string_view client_id) {
 #if defined(ENGINE_ENABLE_HIP)
   const auto request_start = Clock::now();
   const auto state = impl_->Snapshot();
@@ -3225,10 +3226,11 @@ InferenceBackend::Result InferenceBackend::complete(
     return {};
   }
   auto prompt_tokens = state->scheduler->runner().Tokenize(prompt);
-  return impl_->GenerateScheduled(state, std::move(prompt_tokens),
-                                  request_start, max_tokens, sampling_config,
-                                  is_cancelled, on_token, "anonymous");
+  return impl_->GenerateScheduled(
+      state, std::move(prompt_tokens), request_start, max_tokens,
+      sampling_config, is_cancelled, on_token, std::string(client_id));
 #else
+  (void)client_id;
   (void)prompt;
   (void)max_tokens;
   (void)sampling_config;

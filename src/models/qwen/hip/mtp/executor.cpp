@@ -260,7 +260,7 @@ tokenization::TokenId QwenMtpGpuExecutor::Run(tokenization::TokenId input_token,
   if (copy_error != hipSuccess || hipStreamSynchronize(stream_) != hipSuccess) {
     throw std::runtime_error("MTP GPU result synchronization failed");
   }
-  return result;
+  return CheckedSampleToken(result, config.vocab_size);
 }
 
 std::span<const float> QwenMtpGpuExecutor::CopyLastHidden() {

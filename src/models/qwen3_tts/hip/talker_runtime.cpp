@@ -910,7 +910,7 @@ struct TalkerHipRuntime::Impl {
                "hipMemcpyAsync predictor token");
     RequireHip(hipStreamSynchronize(stream), "hipStreamSynchronize predictor");
     RequireHip(hipGetLastError(), "Qwen3-TTS code predictor");
-    return token;
+    return gufo::hip::CheckedSampleToken(token, config.vocab_size);
   }
 
   void RunTalkerToken(TalkerPrefillOutput* output) {

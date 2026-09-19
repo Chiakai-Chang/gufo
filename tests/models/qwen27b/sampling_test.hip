@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -70,7 +71,7 @@ SpeculativeSample SampleSpeculatively(
     std::uint32_t draft_token, float draft_token_probability,
     std::span<const std::uint32_t> draft_candidate_ids,
     std::span<const float> draft_candidate_probabilities,
-    float acceptance_uniform, float residual_uniform,
+    double acceptance_uniform, double residual_uniform,
     std::span<const gufo::sampling::TokenPenalty> penalties = {}) {
   if (draft_candidate_ids.size() != draft_candidate_probabilities.size()) {
     throw std::invalid_argument("sparse vectors must have equal lengths");
@@ -112,6 +113,53 @@ SpeculativeSample SampleSpeculatively(
   CheckHip(hipFree(device_token), "free token");
   CheckHip(hipFree(device_logits), "free logits");
   return result;
+}
+
+void TestInvalidTargetRows() {
+  bool failed = false;
+  try {
+    (void)gufo::hip::CheckedSampleToken(gufo::hip::kInvalidSampleToken, 248320);
+  } catch (const std::runtime_error&) {
+    failed = true;
+  }
+  Expect(failed,
+         "host must propagate invalid device samples as request failures");
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  for (std::size_t size : {3U, 16383U, 16384U, 248320U}) {
+    std::vector<float> logits(size);
+    for (std::size_t i = 0; i < size; ++i)
+      logits[i] = i % 3 == 0 ? nan : i % 3 == 1 ? inf : -inf;
+    for (int route : {0, 1, 2, 3}) {
+      gufo::hip::GpuSamplingParameters config;
+      config.temperature = route == 0 ? 0 : 1;
+      config.top_k = route == 2 ? 40 : 0;
+      config.top_p = route == 3 ? 0.9F : 1;
+      config.uniform = 0.5;
+      Expect(Sample(logits, config) == gufo::hip::kInvalidSampleToken,
+             "ordinary sampler must report all-nonfinite target failure");
+      if (route) {
+        const std::vector<std::uint32_t> ids{0};
+        const std::vector<float> mass{1};
+        const auto sampled =
+            SampleSpeculatively(logits, config, 0, 1, ids, mass, 0.0, 0.5);
+        Expect(sampled.token == gufo::hip::kInvalidSampleToken,
+               "speculative sampler must report all-nonfinite target failure");
+      }
+      logits.back() = -1e35F;
+      Expect(Sample(logits, config) == size - 1,
+             "nonfinite logits cannot outrank a finite candidate");
+      logits.back() = -inf;
+    }
+  }
+  gufo::hip::GpuSamplingParameters config;
+  config.temperature = 1;
+  config.uniform = 0.5 - 0x1.0p-40;
+  Expect(Sample(std::vector<float>{0, 0}, config) == 0,
+         "GPU draw must retain bits below float resolution");
+  config.uniform = 0.5;
+  Expect(Sample(std::vector<float>{0, 0}, config) == 1,
+         "GPU CDF is half-open at an exact boundary");
 }
 
 void TestGreedySparsePenalty() {
@@ -464,11 +512,11 @@ void TestSamplingBoundaryValues() {
   }
 
   // Inverse xorshift state whose next output is UINT64_MAX. The RNG keeps
-  // 24 bits, so its largest draw must remain below one after the GPU cast.
+  // 53 bits; passing a float here would round the largest draw to one.
   std::uint64_t maximum_draw_state = UINT64_C(0xa8d395be4b19cce8);
   const double maximum_draw = gufo::sampling::Uniform(&maximum_draw_state);
-  const float gpu_draw = static_cast<float>(maximum_draw);
-  Expect(maximum_draw == gpu_draw && gpu_draw == std::nextafter(1.0F, 0.0F),
+  const double gpu_draw = maximum_draw;
+  Expect(maximum_draw == gpu_draw && gpu_draw == std::nextafter(1.0, 0.0),
          "the largest RNG draw remains exactly representable below one");
   const std::vector<float> equal_logits(4, 0.0F);
   const std::vector<std::uint32_t> ids{0, 1, 2, 3};
@@ -636,7 +684,7 @@ void TestBatchedArgmaxTiles() {
         values[17] = -2e35F;
       }
     }
-    std::vector<std::uint32_t> expected(rows, 0);
+    std::vector<std::uint32_t> expected(rows, gufo::hip::kInvalidSampleToken);
     for (std::size_t row = 0; row < rows; ++row) {
       float maximum = -INFINITY;
       for (std::size_t id = 0; id < vocab; ++id) {
@@ -689,6 +737,7 @@ void TestBatchedArgmaxTiles() {
 }  // namespace
 
 int main() {
+  TestInvalidTargetRows();
   TestFullGenerationPenalties();
   int device_count = 0;
   if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {

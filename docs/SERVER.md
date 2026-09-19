@@ -429,6 +429,14 @@ and may include prompt tokens. Setting that window to zero disables only the
 repetition penalty. Speculative rejection discards tentative counts; seeded
 sampling replay retains independent request histories.
 
+Tool calls are emitted only for declared functions when `tool_choice` allows
+calling tools. An unmet `required` choice returns `tool_choice_unsatisfied`
+(HTTP 502, or an SSE error after streaming starts).
+
+Admission groups text requests by the socket peer's IP address across chat and
+compatibility endpoints. Caller-provided identity headers do not affect quotas;
+clients behind the same proxy or NAT share a peer quota.
+
 ## Model Discovery
 
 `GET /v1/models` lists the configured text model and ready audio/video

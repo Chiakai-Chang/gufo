@@ -94,6 +94,8 @@ const char* StatusReason(int status) noexcept {
       return "Too Many Requests";
     case 503:
       return "Service Unavailable";
+    case 502:
+      return "Bad Gateway";
     default:
       return "Internal Server Error";
   }
@@ -117,14 +119,6 @@ HttpResponse GenerationError(const TextGenerationError& exception) {
     output.headers.emplace_back("Retry-After", "1");
   }
   return output;
-}
-
-bool ValidClientId(std::string_view client_id) {
-  return !client_id.empty() && client_id.size() <= 64 &&
-         std::ranges::all_of(client_id, [](unsigned char character) {
-           return std::isalnum(character) != 0 || character == '-' ||
-                  character == '_' || character == '.' || character == ':';
-         });
 }
 
 bool IsKnownRole(std::string_view role) {
@@ -528,16 +522,7 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "model_not_found");
   }
 
-  const std::string client_id = request.header("X-Client-ID");
-  if (!client_id.empty()) {
-    if (!ValidClientId(client_id)) {
-      return Error(400, "Bad Request",
-                   "'X-Client-ID' must contain 1-64 letters, digits, '.', "
-                   "'_', '-', or ':'",
-                   "invalid_client_id");
-    }
-    output->chat.client_id = client_id;
-  }
+  output->chat.client_id = request.client_id;
 
   const json::Value* messages = body.find("messages");
   if (messages == nullptr || !messages->is_array() || messages->empty()) {
@@ -977,9 +962,9 @@ void ParseDsmlCalls(std::string_view text, std::vector<ParsedToolCall>* calls) {
 
 ParsedGeneration ParseGeneration(
     std::string_view raw,
-    TextGenerationBackend::InitialOutputState initial_output_state =
-        TextGenerationBackend::InitialOutputState::kAuto,
-    std::span<const tokenization::ChatTool> tools = {}) {
+    TextGenerationBackend::InitialOutputState initial_output_state,
+    std::span<const tokenization::ChatTool> tools,
+    ChatRequest::ToolChoice choice) {
   ParsedGeneration parsed;
   std::string_view content = raw;
 
@@ -996,8 +981,13 @@ ParsedGeneration ParseGeneration(
     if (think_end == std::string_view::npos) {
       const auto marker = EarliestMarker(content);
       parsed.reasoning_content = std::string(Trim(content.substr(0, marker)));
-      if (marker == std::string_view::npos)
+      if (marker == std::string_view::npos) {
+        if (choice == ChatRequest::ToolChoice::kRequired)
+          throw TextGenerationError(
+              TextGenerationErrorCode::kToolChoiceUnsatisfied,
+              "model did not produce a declared tool call");
         return parsed;
+      }
       parsed.text = std::string(content.substr(marker));
     } else {
       parsed.reasoning_content =
@@ -1047,15 +1037,23 @@ ParsedGeneration ParseGeneration(
   }
 
   const std::size_t marker = EarliestMarker(parsed.text);
-  if (marker != std::string_view::npos) {
+  if (choice != ChatRequest::ToolChoice::kNone && !tools.empty() &&
+      marker != std::string_view::npos) {
     const std::string text_before_tools = parsed.text.substr(0, marker);
     const std::string text_from_tools = parsed.text.substr(marker);
     ParseQwenCalls(text_from_tools, tools, &parsed.tool_calls);
     ParseDsmlCalls(text_from_tools, &parsed.tool_calls);
+    std::erase_if(parsed.tool_calls, [&](const auto& call) {
+      return std::ranges::none_of(
+          tools, [&](const auto& tool) { return tool.name == call.name; });
+    });
     if (!parsed.tool_calls.empty()) {
       parsed.text = text_before_tools;
     }
   }
+  if (choice == ChatRequest::ToolChoice::kRequired && parsed.tool_calls.empty())
+    throw TextGenerationError(TextGenerationErrorCode::kToolChoiceUnsatisfied,
+                              "model did not produce a declared tool call");
   return parsed;
 }
 
@@ -1353,7 +1351,7 @@ HttpResponse NonStreamingResponse(
   core::Utf8Decoder decoder;
   const ParsedGeneration generated =
       ParseGeneration(decoder.Push(result.text, true), initial_output_state,
-                      request.chat.tools);
+                      request.chat.tools, request.chat.tool_choice);
 
   json::Value response = json::Value::object();
   response["id"] = RandomId("chatcmpl-");
@@ -1460,8 +1458,9 @@ HttpResponse StreamingResponse(
               if (!filter.Push({}, true))
                 return;
 
-              const ParsedGeneration generated = ParseGeneration(
-                  filter.raw(), initial_output_state, request.chat.tools);
+              const ParsedGeneration generated =
+                  ParseGeneration(filter.raw(), initial_output_state,
+                                  request.chat.tools, request.chat.tool_choice);
               if (!filter.Finish(!generated.tool_calls.empty())) {
                 return;
               }

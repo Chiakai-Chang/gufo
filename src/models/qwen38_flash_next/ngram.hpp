@@ -6,7 +6,6 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -45,10 +44,10 @@ public:
   NgramTable(const NgramTable&) = delete;
   NgramTable& operator=(const NgramTable&) = delete;
 
-  /// `path` is the shard that holds the table at `file_offset`.
+  /// Borrows the bound GGUF descriptor during Open; retains its own handle.
   [[nodiscard]] static std::unique_ptr<NgramTable> Open(
-      const std::filesystem::path& path, std::uint64_t file_offset,
-      std::uint64_t rows, std::uint32_t row_dim, core::GgmlType type,
+      int file_descriptor, std::uint64_t file_offset, std::uint64_t rows,
+      std::uint32_t row_dim, core::GgmlType type,
       std::string* error_msg = nullptr);
 
   /// Gathers `rows.size()` rows into `out` (rows.size() * row_dim floats).
