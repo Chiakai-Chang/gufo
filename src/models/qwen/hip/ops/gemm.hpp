@@ -302,12 +302,6 @@ void LaunchExactBf16GEMMFp32SmallBatch(const void* A, const float* X, float* Y,
                                        std::size_t K,
                                        hipStream_t stream = nullptr);
 
-/// BF16 weights with three-component BF16 decomposition of FP32 activations.
-/// Matrix reductions have the same order at every prompt chunk boundary.
-void LaunchBf16PrefillFp32(const void* weights, const float* input, float* output,
-                           std::size_t batch, std::size_t m, std::size_t k,
-                           hipStream_t stream = nullptr);
-
 /// Converts float buffer to bfloat16 buffer on GPU
 void LaunchFloatToBfloat16(const float* in, void* out, std::size_t num_elements,
                            hipStream_t stream = nullptr);
