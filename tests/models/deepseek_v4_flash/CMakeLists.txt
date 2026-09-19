@@ -10,7 +10,8 @@ add_executable(ds4_chat_template_test
   ${PROJECT_SOURCE_DIR}/src/models/deepseek_v4_flash/chat_template.cpp)
 target_link_libraries(ds4_chat_template_test PRIVATE gufo_core)
 target_compile_definitions(ds4_chat_template_test PRIVATE
-  GUFO_DEEPSEEK_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/src/models/deepseek_v4_flash/reference/artifact_chat_template.jinja")
+  GUFO_DEEPSEEK_CHAT_TEMPLATE_REFERENCE="${PROJECT_SOURCE_DIR}/src/models/deepseek_v4_flash/reference/artifact_chat_template.jinja"
+  GUFO_CHAT_TEMPLATE_HF_GOLDENS="${PROJECT_SOURCE_DIR}/tests/fixtures/chat_template_hf_goldens.json")
 add_test(NAME ds4.template COMMAND ds4_chat_template_test)
 set_tests_properties(ds4.template PROPERTIES LABELS "cpu;ds4;tokenization")
 

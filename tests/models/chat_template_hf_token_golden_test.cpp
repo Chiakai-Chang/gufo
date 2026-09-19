@@ -106,6 +106,14 @@ void TestQwenGoldens(const json::Value& fixture,
   options = {};
   options.enable_thinking = false;
   CheckQwenCase(fixture, "tools", *tokenizer, base, tools, options);
+
+  std::vector<qwen::ChatMessage> system_tools{
+      {qwen::ChatRole::kSystem, "Be concise."}, base[0]};
+  CheckQwenCase(fixture, "system_tools", *tokenizer, system_tools, tools, {});
+  system_tools.insert(system_tools.begin() + 1,
+                      {qwen::ChatRole::kDeveloper, "Use metric units."});
+  CheckQwenCase(fixture, "developer_tools", *tokenizer, system_tools, tools,
+                {});
 }
 
 }  // namespace

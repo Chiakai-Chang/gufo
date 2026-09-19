@@ -1,10 +1,12 @@
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -283,6 +285,7 @@ std::string RenderChat(std::span<const ChatMessage> messages,
     }
   }
 
+  std::unordered_map<std::string_view, std::size_t> tool_call_order;
   for (std::size_t index = 0; index < messages.size(); ++index) {
     const auto& message = messages[index];
     const std::string_view role = message.role;
@@ -312,6 +315,27 @@ std::string RenderChat(std::span<const ChatMessage> messages,
       continue;
     }
     if (role == "user" || role == "tool" || role == "function") {
+      std::vector<const ChatMessage*> tool_results;
+      for (std::size_t end = index; end < messages.size(); ++end) {
+        const auto& next = messages[end];
+        if (next.role != "user" && next.role != "tool" &&
+            next.role != "function")
+          break;
+        if (next.role != "user")
+          tool_results.push_back(&next);
+      }
+      // Match sort_tool_results_by_call_order in the official encoder.
+      // Reorder only tool slots, retaining interleaved user text. Unknown
+      // IDs have rank zero and ties preserve their arrival order.
+      const auto rank = [&](const ChatMessage* result) {
+        const auto found = tool_call_order.find(result->tool_call_id);
+        return found == tool_call_order.end() ? std::size_t{0} : found->second;
+      };
+      std::stable_sort(tool_results.begin(), tool_results.end(),
+                       [&](const auto* left, const auto* right) {
+                         return rank(left) < rank(right);
+                       });
+      std::size_t result_index = 0;
       output.append(kUser);
       bool first_block = true;
       while (index < messages.size() && (messages[index].role == "user" ||
@@ -324,7 +348,7 @@ std::string RenderChat(std::span<const ChatMessage> messages,
           output.append(messages[index].content);
         } else {
           output.append("<tool_result>");
-          output.append(messages[index].content);
+          output.append(tool_results[result_index++]->content);
           output.append("</tool_result>");
         }
         first_block = false;
@@ -334,6 +358,13 @@ std::string RenderChat(std::span<const ChatMessage> messages,
       continue;
     }
     if (role == "assistant") {
+      if (!message.tool_calls.empty()) {
+        tool_call_order.clear();
+        for (std::size_t call = 0; call < message.tool_calls.size(); ++call) {
+          if (!message.tool_calls[call].id.empty())
+            tool_call_order[message.tool_calls[call].id] = call;
+        }
+      }
       output.append(kAssistant);
       if (options.enable_thinking &&
           (preserve_thinking || index > last_user_index)) {

@@ -109,6 +109,24 @@ void CheckTokenGoldens(const ds4::Model& model) {
   options = {};
   options.enable_thinking = true;
   CheckDeepSeekCase(fixture, "tools", model, tool_messages, tools, options);
+
+  ds4::ChatMessage parallel{.role = "assistant"};
+  parallel.tool_calls = {
+      {.name = "read",
+       .arguments = {{.name = "path", .value = "A"}},
+       .id = "call_A"},
+      {.name = "read",
+       .arguments = {{.name = "path", .value = "B"}},
+       .id = "call_B"},
+  };
+  const std::vector<ds4::ChatMessage> reversed = {
+      {.role = "user", .content = "Read A and B."},
+      parallel,
+      {.role = "tool", .content = "Result B", .tool_call_id = "call_B"},
+      {.role = "user", .content = "Compare them."},
+      {.role = "tool", .content = "Result A", .tool_call_id = "call_A"},
+  };
+  CheckDeepSeekCase(fixture, "parallel_tools", model, reversed, {}, {});
 }
 
 }  // namespace gufo::testing::ds4

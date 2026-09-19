@@ -89,7 +89,7 @@ layer-64 graph, and feeds proposed tokens through the speculative backend.
 
 ### Chat template and reasoning
 
-Gufo uses the compiled `qwen38-reasoning-compiled-v2` formatter. The official
+Gufo uses the compiled `qwen38-reasoning-compiled-v3` formatter. The official
 Jinja and its provenance are stored under [`reference/`](reference/). A
 Qwen3.8 GGUF is accepted only when `tokenizer.chat_template` has an explicitly
 recognized SHA-256; unknown or missing Qwen3.8 templates fail model loading.
@@ -97,7 +97,8 @@ Jinja is never executed at runtime.
 
 Chat Completions accepts Pi/OpenAI-style `reasoning_effort` and
 `chat_template_kwargs` with `enable_thinking`, `reasoning_effort`, and
-`preserve_thinking`. Qwen27B and Flash-Next default to thinking enabled at
+`preserve_thinking`, plus the boolean `add_vision_id` for image numbering.
+Qwen27B and Flash-Next default to thinking enabled at
 `xhigh`, matching their identical official Jinja templates. `--think auto`
 (the CLI/server default) selects the model default; `--think off` or
 `enable_thinking=false` disables reasoning. Native Qwen effort mapping is:
@@ -110,7 +111,11 @@ Chat Completions accepts Pi/OpenAI-style `reasoning_effort` and
 
 Qwen preserves historical assistant reasoning by default.
 `preserve_thinking=false` drops reasoning before the latest user turn while
-retaining visible assistant content. Thinking generation begins inside the
+retaining visible assistant content and reasoning in an unfinished tool loop.
+Leading system/developer instructions follow tool definitions; late
+system/developer messages are rejected. The pinned Unsloth artifact extends
+the official template with leading developer-message support.
+Thinking generation begins inside the
 prompt-opened `<think>` block, so HTTP responses expose those bytes as
 `reasoning_content`, not `content`.
 

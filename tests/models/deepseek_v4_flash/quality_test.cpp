@@ -1259,14 +1259,18 @@ int main(int argc, char** argv) try {
       dspark_replay || (argc == 2 && std::string_view(argv[1]) == "--dspark");
   const bool wide_prefill =
       argc == 2 && std::string_view(argv[1]) == "--wide-prefill";
+  const bool template_only =
+      argc == 2 && std::string_view(argv[1]) == "--template-only";
   const bool official = argc == 3 && std::string_view(argv[1]) == "--official";
   const bool prefill_only =
       argc == 4 && std::string_view(argv[3]) == "--prefill-only";
   const bool frontiers = (argc == 3 || prefill_only) &&
                          std::string_view(argv[1]) == "--reference-frontiers";
-  if (argc > 1 && !dspark && !wide_prefill && !official && !frontiers) {
+  if (argc > 1 && !dspark && !wide_prefill && !official && !frontiers &&
+      !template_only) {
     std::cerr << "usage: ds4_quality_test "
-                 "[--dspark|--dspark-replay|--wide-prefill|--official OUT.json|"
+                 "[--template-only|--dspark|--dspark-replay|--wide-prefill|--"
+                 "official OUT.json|"
                  "--reference-frontiers OUT-DIR [--prefill-only]]\n";
     return 2;
   }
@@ -1317,6 +1321,10 @@ int main(int argc, char** argv) try {
   }
 
   gufo::testing::ds4::CheckTokenGoldens(*model);
+  if (template_only) {
+    std::cout << "DeepSeek Hugging Face template token goldens passed\n";
+    return 0;
+  }
   const auto prompt =
       model->EncodeChat("You are a concise assistant.", "Reply with one word.");
   Expect(!prompt.empty(), "chat prompt tokenization");

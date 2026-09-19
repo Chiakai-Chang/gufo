@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 
@@ -15,6 +16,48 @@ namespace sampling = gufo::sampling;
 void Require(bool condition, const char* message) {
   if (!condition)
     throw std::runtime_error(message);
+}
+
+void CheckSidecarCompatibility() {
+  qfn::Config trunk;
+  trunk.num_layers = 48;
+  trunk.context_length = 262144;
+  trunk.hidden_size = 2560;
+  trunk.hc_count = 4;
+  trunk.hc_low_rank = 320;
+  trunk.num_experts = 512;
+  trunk.num_experts_used = 10;
+  trunk.expert_ff = trunk.shared_expert_ff = 640;
+  trunk.num_heads = 24;
+  trunk.num_kv_heads = 2;
+  trunk.head_dim = 256;
+  trunk.rotary_dim = 64;
+  trunk.rope_theta = 1e7F;
+  trunk.rope_sections = {16, 24, 24, 0};
+  auto sidecar = trunk;
+  sidecar.nextn_layers = 1;
+  Require(sidecar.MtpMatches(trunk), "matching MTP constants rejected");
+  for (auto member : {&qfn::Config::hc_low_rank, &qfn::Config::context_length,
+                      &qfn::Config::rotary_dim, &qfn::Config::num_experts_used,
+                      &qfn::Config::shared_expert_ff}) {
+    auto wrong = sidecar;
+    ++(wrong.*member);
+    Require(!wrong.MtpMatches(trunk),
+            "dimension-compatible MTP with different semantics accepted");
+  }
+  for (auto member : {&qfn::Config::rms_eps, &qfn::Config::rope_theta}) {
+    auto wrong = sidecar;
+    wrong.*member *= 2.0F;
+    Require(!wrong.MtpMatches(trunk),
+            "MTP numerical constant mismatch accepted");
+  }
+  auto wrong = sidecar;
+  std::swap(wrong.rope_sections[0], wrong.rope_sections[1]);
+  Require(!wrong.MtpMatches(trunk), "MTP RoPE partition mismatch accepted");
+  sidecar.ple_layer = -1;
+  trunk.ple_layer = 1;
+  Require(sidecar.MtpMatches(trunk),
+          "trunk-only PLE incorrectly required in MTP");
 }
 
 void CheckLengthController() {
@@ -161,6 +204,7 @@ void CheckSampledOutputFrequencies() {
 }
 
 int main() {
+  CheckSidecarCompatibility();
   try {
     CheckLengthController();
     CheckCompactProposals();

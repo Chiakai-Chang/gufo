@@ -567,6 +567,15 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request", std::move(parse_error),
                  "invalid_reasoning");
   }
+  if (const auto* kwargs = body.find("chat_template_kwargs")) {
+    if (const auto* vision_id = kwargs->find("add_vision_id")) {
+      if (!vision_id->is_bool())
+        return Error(400, "Bad Request",
+                     "'chat_template_kwargs.add_vision_id' must be a boolean",
+                     "invalid_template_options");
+      output->chat.add_vision_id = vision_id->as_bool();
+    }
+  }
   const ReasoningOptions defaults = backend.reasoning_defaults();
   if (!output->chat.reasoning.enabled.has_value()) {
     output->chat.reasoning.enabled = defaults.enabled;

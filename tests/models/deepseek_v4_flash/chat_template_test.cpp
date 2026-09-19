@@ -12,6 +12,7 @@
 
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "tests/models/chat_template_golden_helpers.hpp"
 
 namespace {
 
@@ -217,6 +218,51 @@ void TestOfficialDsmlToolLoop() {
          "DeepSeek tool loop matches the pinned official encoder golden");
 }
 
+void TestParallelToolOrder() {
+  ChatMessage assistant{.role = "assistant"};
+  assistant.tool_calls = {
+      {.name = "read",
+       .arguments = {{.name = "path", .value = "A"}},
+       .id = "call_A"},
+      {.name = "read",
+       .arguments = {{.name = "path", .value = "B"}},
+       .id = "call_B"},
+  };
+  std::vector<ChatMessage> messages = {
+      {.role = "user", .content = "Read A and B."},
+      assistant,
+      {.role = "tool", .content = "Result B", .tool_call_id = "call_B"},
+      {.role = "user", .content = "Compare them."},
+      {.role = "tool", .content = "Result A", .tool_call_id = "call_A"},
+  };
+  const auto reverse = gufo::models::deepseek_v4_flash::RenderChat(messages);
+  std::ifstream input(GUFO_CHAT_TEMPLATE_HF_GOLDENS);
+  Expect(input.good(), "Template fixture opens");
+  const auto fixture = gufo::json::parse(std::string{
+      std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()});
+  Expect(Sha256(reverse) == gufo::testing::chat_goldens::GoldenCase(
+                                fixture, "deepseek", "parallel_tools")
+                                .member_str("rendered_sha256"),
+         "Parallel tool rendering matches the pinned official encoder");
+  Expect(
+      reverse.find("<tool_result>Result A</tool_result>\n\nCompare them.\n\n"
+                   "<tool_result>Result B</tool_result>") != std::string::npos,
+      "IDs restore call order without moving interleaved user text");
+  std::swap(messages[2], messages[4]);
+  Expect(gufo::models::deepseek_v4_flash::RenderChat(messages) == reverse,
+         "Parallel result arrival order does not change the prompt");
+  messages[2].tool_call_id.clear();
+  messages[4].tool_call_id.clear();
+  std::swap(messages[2], messages[4]);
+  const auto unidentified =
+      gufo::models::deepseek_v4_flash::RenderChat(messages);
+  Expect(
+      unidentified.find(
+          "<tool_result>Result B</tool_result>\n\nCompare them.\n\n"
+          "<tool_result>Result A</tool_result>") != std::string::npos,
+      "Missing IDs retain stable arrival order, as the official encoder does");
+}
+
 void TestHuggingFaceRenderedGoldens() {
   const std::vector<ChatMessage> base = {
       {.role = "system", .content = "Be concise.", .reasoning_content = {}},
@@ -296,6 +342,7 @@ void TestPinnedArtifactTemplateValidation() {
 }  // namespace
 
 int main() {
+  TestParallelToolOrder();
   TestChatAndThinkingPrefixes();
   TestHistoricalThinkingPolicy();
   TestEffortMappingAndToolResults();

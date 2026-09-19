@@ -188,7 +188,6 @@ endif()
 add_library(gufo_core STATIC
   src/core/image.cpp
   src/core/crypto/sha256.cpp
-  src/core/model_registry.cpp
   src/core/gguf_reader.cpp
   src/core/gguf_identity.cpp
   src/core/sampling.cpp
@@ -646,13 +645,6 @@ if (BUILD_TESTING)
 
   add_test(NAME gguf_identity_test COMMAND gguf_identity_test)
   set_tests_properties(gguf_identity_test PROPERTIES LABELS "cpu;core;gguf")
-
-  add_executable(model_registry_test tests/core/model_registry_test.cpp)
-  target_link_libraries(model_registry_test PRIVATE gufo_core)
-
-  add_test(NAME model_registry_test COMMAND model_registry_test)
-  set_tests_properties(model_registry_test PROPERTIES
-    LABELS "cpu;core;model_registry;minimax-h3")
 
   add_executable(minimax_h3_runtime_test
     tests/models/minimax_h3_runtime_test.cpp)

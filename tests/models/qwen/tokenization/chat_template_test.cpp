@@ -13,6 +13,7 @@
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/models/qwen/tokenizer.hpp"
+#include "tests/models/chat_template_golden_helpers.hpp"
 
 namespace {
 
@@ -237,7 +238,7 @@ void TestGgufTemplateExtraction() {
   Expect(tpl->GetProfile() ==
              gufo::tokenization::QwenChatTemplate::Profile::kQwen38Reasoning,
          "Recognized Qwen3.8 template profile is classified");
-  Expect(tpl->GetTemplateId() == "qwen38-reasoning-compiled-v2",
+  Expect(tpl->GetTemplateId() == "qwen38-reasoning-compiled-v3",
          "Compiled template version is stable");
   Expect(tpl->GetTemplateSha256().size() == 64,
          "Embedded template provenance is hashed");
@@ -276,34 +277,37 @@ void TestHuggingFaceRenderedGoldens() {
       {ChatRole::kAssistant, "Red", "", "I should answer with one color."},
       {ChatRole::kUser, "Name another.", "", ""},
   };
-  const auto check = [](const std::vector<ChatMessage>& messages,
-                        const ChatTemplateOptions& options,
-                        std::string_view expected) {
-    const auto rendered = QwenChatTemplate::Render(messages, options);
-    Expect(rendered.has_value(), "Qwen Hugging Face golden renders");
-    Expect(Sha256(*rendered) == expected,
-           "Qwen rendered bytes match the pinned Hugging Face golden");
-  };
+  std::ifstream input(GUFO_CHAT_TEMPLATE_HF_GOLDENS);
+  Expect(input.good(), "Template fixture opens");
+  const auto fixture = gufo::json::parse(std::string{
+      std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()});
+  const auto check =
+      [&](const std::vector<ChatMessage>& messages,
+          const ChatTemplateOptions& options, std::string_view name,
+          std::span<const gufo::tokenization::ChatTool> tools = {}) {
+        const auto rendered =
+            QwenChatTemplate::Render(messages, tools, options);
+        Expect(rendered.has_value(), "Qwen Hugging Face golden renders");
+        const auto expected =
+            gufo::testing::chat_goldens::GoldenCase(fixture, "qwen", name)
+                .member_str("rendered_sha256");
+        Expect(Sha256(*rendered) == expected,
+               "Qwen rendered bytes match the pinned Hugging Face golden");
+      };
 
   ChatTemplateOptions options;
-  check(base, options,
-        "97dbf46721e76ae30614f4b4d6bdb6147bc9b34d1a0f93e04699b3ac622fb99d");
-  check(base, ResolveQwenChatOptions({}),
-        "97dbf46721e76ae30614f4b4d6bdb6147bc9b34d1a0f93e04699b3ac622fb99d");
+  check(base, options, "thinking_xhigh");
+  check(base, ResolveQwenChatOptions({}), "thinking_xhigh");
   options.enable_thinking = false;
-  check(base, options,
-        "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7");
+  check(base, options, "chat");
 
   options.enable_thinking = true;
   options.reasoning_effort = QwenReasoningEffort::kLow;
-  check(base, options,
-        "50ec206299577d35eead707cb1b60fdd8875176f69fb064785eed858836ee999");
+  check(base, options, "thinking_low");
   options.reasoning_effort = QwenReasoningEffort::kMedium;
-  check(base, options,
-        "c2ba928ee33190de9d2bbb82fb68dfaed38a4ee345dcf675a3bc27f112f45b05");
+  check(base, options, "thinking_medium");
   options.reasoning_effort = QwenReasoningEffort::kXHigh;
-  check(base, options,
-        "97dbf46721e76ae30614f4b4d6bdb6147bc9b34d1a0f93e04699b3ac622fb99d");
+  check(base, options, "thinking_xhigh");
   for (const auto effort :
        {gufo::ReasoningEffort::kLow, gufo::ReasoningEffort::kMedium,
         gufo::ReasoningEffort::kXHigh}) {
@@ -323,16 +327,60 @@ void TestHuggingFaceRenderedGoldens() {
   check(base,
         ResolveQwenChatOptions(
             {.enabled = false, .effort = gufo::ReasoningEffort::kLow}),
-        "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7");
+        "chat");
 
   options.reasoning_effort = QwenReasoningEffort::kMedium;
   options.preserve_thinking = false;
-  check(history, options,
-        "ea0dc42bc76d66bb38fab09250bcf72f63c3bb1ec7098403a77a8c6452add6a5");
+  check(history, options, "history_drop");
   options.enable_thinking = false;
   options.preserve_thinking = true;
-  check(history, options,
-        "6fc054000bc6bedd03a3521bd92c59af85247ad7d3bb2013d97c1a25eea6bdee");
+  check(history, options, "history_preserve");
+  const std::vector<gufo::tokenization::ChatTool> tools = {
+      {.name = "get_weather",
+       .description = "Get weather",
+       .parameters_json =
+           R"({"type":"object","properties":{"city":{"type":"string"}},"required":["city"]})"}};
+  std::vector<ChatMessage> system_tools{{ChatRole::kSystem, "Be concise."},
+                                        base[0]};
+  check(system_tools, {}, "system_tools", tools);
+  system_tools.insert(system_tools.begin() + 1,
+                      {ChatRole::kDeveloper, "Use metric units."});
+  check(system_tools, {}, "developer_tools", tools);
+
+  auto image = std::make_shared<const std::vector<std::uint8_t>>(1, 0);
+  std::vector<ChatMessage> vision{
+      {ChatRole::kUser, "\u2003 before  after \u00a0"},
+      {ChatRole::kAssistant, "Done."},
+      {ChatRole::kUser, " \t \n"}};
+  vision[0].images.push_back({std::string("\u2003 before ").size(), image});
+  vision[2].images.push_back({2, image});
+  options = {};
+  options.enable_thinking = false;
+  check(vision, options, "vision_whitespace");
+  options.add_vision_id = true;
+  check(vision, options, "vision_ids");
+  std::vector<std::size_t> offsets;
+  const auto rendered =
+      QwenChatTemplate::Render(vision, {}, options, nullptr, &offsets);
+  Expect(offsets.size() == 2, "Every image retains a placeholder offset");
+  for (const auto offset : offsets)
+    Expect(rendered->substr(offset, 13) == "<|image_pad|>",
+           "Image offsets follow whitespace trimming and Picture prefixes");
+
+  ChatMessage call{ChatRole::kAssistant, "", "", "Use the tool."};
+  call.tool_calls.push_back({.name = "get_weather",
+                             .arguments = {{.name = "city", .value = "Rome"}}});
+  options = {};
+  options.reasoning_effort = QwenReasoningEffort::kMedium;
+  options.preserve_thinking = false;
+  check(
+      {base[0], call, {ChatRole::kUser, "<tool_response>21 C</tool_response>"}},
+      options, "tool_loop_preserve");
+  for (const auto role : {ChatRole::kSystem, ChatRole::kDeveloper}) {
+    Expect(!QwenChatTemplate::Render(
+               std::vector<ChatMessage>{base[0], {role, "Late instructions"}}),
+           "Late system/developer messages are rejected");
+  }
 }
 
 void TestRenderAndTokenize() {
@@ -487,8 +535,8 @@ void TestToolReplayPreservesGeneratedPrefix() {
   constexpr std::string_view kGeneratedText =
       "<think>\nI should read the requested file.\n</think>\n\n";
   gufo::tokenization::ChatMessage assistant{
-      gufo::tokenization::ChatRole::kAssistant, std::string(kGeneratedText), "",
-      ""};
+      gufo::tokenization::ChatRole::kAssistant, "", "",
+      "I should read the requested file."};
   assistant.tool_calls.push_back({
       .id = "call_read",
       .name = "read",

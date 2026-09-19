@@ -18,6 +18,7 @@ struct PromptOptions {
   std::string model_path;
   std::string vision_model_path;
   std::vector<std::string> image_paths;
+  bool add_vision_id{false};
   std::string prompt_text;
   std::string prompt_file;
   std::string system_prompt;

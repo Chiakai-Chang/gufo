@@ -1,7 +1,11 @@
 #include "src/models/qwen/chat_template.hpp"
 
+#include <unicode/uchar.h>
+#include <unicode/utf8.h>
+
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -16,8 +20,10 @@
 
 namespace gufo::tokenization {
 
-ChatTemplateOptions ResolveQwenChatOptions(const ReasoningOptions& reasoning) {
+ChatTemplateOptions ResolveQwenChatOptions(const ReasoningOptions& reasoning,
+                                           bool add_vision_id) {
   ChatTemplateOptions options;
+  options.add_vision_id = add_vision_id;
   options.enable_thinking = reasoning.enabled.value_or(options.enable_thinking);
   options.preserve_thinking =
       reasoning.preserve_thinking.value_or(options.preserve_thinking);
@@ -76,12 +82,29 @@ bool IsQwen38Artifact(const core::GgufReader& reader) {
 }
 
 std::string_view Trim(std::string_view value) {
-  const auto first = value.find_first_not_of(" \t\r\n");
-  if (first == std::string_view::npos) {
-    return {};
+  const auto whitespace = [](UChar32 cp) {
+    // Python str.strip also includes the four ASCII information separators.
+    return u_isUWhiteSpace(cp) || (cp >= 0x1c && cp <= 0x1f);
+  };
+  std::int32_t first = 0;
+  auto last = static_cast<std::int32_t>(value.size());
+  while (first < last) {
+    auto next = first;
+    UChar32 cp;
+    U8_NEXT(value.data(), next, last, cp);
+    if (!whitespace(cp))
+      break;
+    first = next;
   }
-  const auto last = value.find_last_not_of(" \t\r\n");
-  return value.substr(first, last - first + 1);
+  while (first < last) {
+    auto previous = last;
+    UChar32 cp;
+    U8_PREV(value.data(), first, previous, cp);
+    if (!whitespace(cp))
+      break;
+    last = previous;
+  }
+  return value.substr(first, last - first);
 }
 
 std::string PythonJsonSpacing(std::string_view value) {
@@ -287,7 +310,7 @@ std::string_view QwenChatTemplate::GetTemplateId() const noexcept {
     case Profile::kLegacyChatMl:
       return "qwen-chatml-compiled-v1";
     case Profile::kQwen38Reasoning:
-      return "qwen38-reasoning-compiled-v2";
+      return "qwen38-reasoning-compiled-v3";
   }
   return "qwen-chatml-compiled-v1";
 }
@@ -343,7 +366,9 @@ std::optional<std::string> QwenChatTemplate::Render(
   }
   estimated_len += kXHighReasoningInstruction.size() + 64;
 
-  if (estimated_len > options.max_output_bytes) {
+  if (estimated_len > options.max_output_bytes ||
+      estimated_len >
+          static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
     if (error_msg != nullptr) {
       *error_msg = "Rendered prompt estimated length (" +
                    std::to_string(estimated_len) +
@@ -360,20 +385,22 @@ std::optional<std::string> QwenChatTemplate::Render(
   while (message_index < messages.size() &&
          (messages[message_index].role == ChatRole::kSystem ||
           messages[message_index].role == ChatRole::kDeveloper)) {
-    if (!system_content.empty()) {
-      system_content.push_back('\n');
+    const auto content = Trim(messages[message_index].content);
+    if (!content.empty()) {
+      if (!system_content.empty())
+        system_content.push_back('\n');
+      system_content.append(content);
     }
-    system_content.append(Trim(messages[message_index].content));
     ++message_index;
   }
 
   std::string system_prefix;
   AppendReasoningInstruction(system_prefix, options);
+  AppendToolsPrompt(system_prefix, tools, options.require_tool_call);
   if (!system_prefix.empty() && !system_content.empty()) {
     system_prefix.append("\n\n");
   }
   system_prefix.append(system_content);
-  AppendToolsPrompt(system_prefix, tools, options.require_tool_call);
   if (!system_prefix.empty()) {
     output.append("<|im_start|>system\n");
     output.append(system_prefix);
@@ -383,13 +410,24 @@ std::optional<std::string> QwenChatTemplate::Render(
   std::size_t last_user_index = messages.size();
   for (std::size_t index = messages.size(); index > 0; --index) {
     if (messages[index - 1].role == ChatRole::kUser) {
+      const auto content = Trim(messages[index - 1].content);
+      if (messages[index - 1].images.empty() &&
+          content.starts_with("<tool_response>") &&
+          content.ends_with("</tool_response>"))
+        continue;
       last_user_index = index - 1;
       break;
     }
   }
 
+  std::size_t image_count = 0;
   for (; message_index < messages.size(); ++message_index) {
     const auto& msg = messages[message_index];
+    if (msg.role == ChatRole::kSystem || msg.role == ChatRole::kDeveloper) {
+      if (error_msg != nullptr)
+        *error_msg = "System message must be at the beginning.";
+      return std::nullopt;
+    }
     const bool tool_result = msg.role == ChatRole::kTool;
     if (tool_result) {
       output.append("<|im_start|>user\n");
@@ -414,29 +452,45 @@ std::optional<std::string> QwenChatTemplate::Render(
     output.append(role_name);
     output.push_back('\n');
 
-    // Image positions refer to the original text bytes. Preserve whitespace
-    // between text/image parts, as the official multimodal template does.
-    const std::string_view content =
-        msg.images.empty() ? Trim(msg.content) : std::string_view(msg.content);
+    std::string image_content;
+    std::vector<std::size_t> local_image_offsets;
+    if (!msg.images.empty()) {
+      std::size_t cursor = 0;
+      for (const auto& image : msg.images) {
+        image_content.append(std::string_view(msg.content)
+                                 .substr(cursor, image.offset - cursor));
+        ++image_count;
+        if (options.add_vision_id)
+          image_content.append("Picture " + std::to_string(image_count) + ": ");
+        image_content.append("<|vision_start|>");
+        local_image_offsets.push_back(image_content.size());
+        image_content.append("<|image_pad|><|vision_end|>");
+        cursor = image.offset;
+      }
+      image_content.append(std::string_view(msg.content).substr(cursor));
+    }
+    // Trim the fully rendered content, including image markers. Whitespace
+    // between text and images remains significant; image offsets follow the
+    // trim.
+    const std::string_view untrimmed = msg.images.empty()
+                                           ? std::string_view(msg.content)
+                                           : std::string_view(image_content);
+    const std::string_view content = Trim(untrimmed);
     const std::string_view thought = Trim(msg.thought);
     if (msg.role == ChatRole::kAssistant &&
-        !(thought.empty() && content.starts_with("<think>")) &&
         (options.preserve_thinking || message_index > last_user_index)) {
       output.append("<think>\n");
       output.append(thought);
       output.append("\n</think>\n\n");
     }
 
-    std::size_t cursor = 0;
-    for (const auto& image : msg.images) {
-      output.append(content.substr(cursor, image.offset - cursor));
-      output.append("<|vision_start|>");
-      if (image_offsets != nullptr)
-        image_offsets->push_back(output.size());
-      output.append("<|image_pad|><|vision_end|>");
-      cursor = image.offset;
+    if (image_offsets != nullptr && !local_image_offsets.empty()) {
+      const auto removed =
+          static_cast<std::size_t>(content.data() - untrimmed.data());
+      for (const auto offset : local_image_offsets)
+        image_offsets->push_back(output.size() + offset - removed);
     }
-    output.append(content.substr(cursor));
+    output.append(content);
     if (msg.role == ChatRole::kAssistant && !msg.tool_calls.empty()) {
       if (!content.empty()) {
         output.append("\n\n");

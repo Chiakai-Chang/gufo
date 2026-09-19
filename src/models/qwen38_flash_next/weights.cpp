@@ -324,15 +324,10 @@ std::optional<MtpWeights> MtpWeights::Bind(const core::GgufReader& reader,
     return std::nullopt;
   }
   Binder b{reader, error_msg};
-  if (config->nextn_layers != 1 || config->num_layers != trunk.num_layers ||
-      config->hidden_size != trunk.hidden_size ||
-      config->hc_count != trunk.hc_count ||
-      config->num_experts != trunk.num_experts ||
-      config->expert_ff != trunk.expert_ff ||
-      config->head_dim != trunk.head_dim ||
-      config->num_heads != trunk.num_heads ||
-      config->num_kv_heads != trunk.num_kv_heads) {
-    b.Fail("MTP sidecar does not match the trunk architecture");
+  if (!config->MtpMatches(trunk)) {
+    b.Fail(
+        "MTP sidecar architecture or inference constants differ from the "
+        "trunk");
     return std::nullopt;
   }
   MtpWeights m;

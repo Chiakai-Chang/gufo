@@ -21,12 +21,14 @@ struct ChatMessage {
   struct ToolCall {
     std::string name;
     std::vector<ToolArgument> arguments;
+    std::string id;
   };
 
   std::string role;
   std::string content;
   std::string reasoning_content;
   std::vector<ToolCall> tool_calls;
+  std::string tool_call_id;
 };
 
 struct ChatTool {
@@ -56,7 +58,7 @@ struct ChatTemplateOptions {
                                         std::string* error_msg = nullptr);
 
 [[nodiscard]] constexpr std::string_view ChatTemplateId() noexcept {
-  return "deepseek-v4-flash-0731-compiled-v2";
+  return "deepseek-v4-flash-0731-compiled-v3";
 }
 
 [[nodiscard]] constexpr std::string_view ArtifactTemplateSha256() noexcept {

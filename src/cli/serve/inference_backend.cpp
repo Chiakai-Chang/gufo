@@ -53,7 +53,8 @@ struct QwenImageContext final : TextPromptContext {
 };
 
 tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request) {
-  auto options = tokenization::ResolveQwenChatOptions(request.reasoning);
+  auto options = tokenization::ResolveQwenChatOptions(request.reasoning,
+                                                      request.add_vision_id);
   options.require_tool_call =
       request.tool_choice == ChatRequest::ToolChoice::kRequired;
   return options;
@@ -185,7 +186,7 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
            << "artifact_id=" << core::kGgufSampledIdentityScheme << ':'
            << artifact_fingerprint << '\n'
            << "tokenizer=embedded-in-artifact\n"
-           << "chat_template=qwen38-reasoning-compiled-v2\n"
+           << "chat_template=qwen38-reasoning-compiled-v3\n"
            << "chat_template_reference_sha256="
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
            << "state_abi=qwen38-flash-next-rocm-session-v1\n"
@@ -227,7 +228,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << "artifact_id=" << core::kGgufSampledIdentityScheme << ':'
            << artifact_fingerprint << '\n'
            << "tokenizer=embedded-in-artifact\n"
-           << "chat_template=qwen38-reasoning-compiled-v2\n"
+           << "chat_template=qwen38-reasoning-compiled-v3\n"
            << "chat_template_reference_sha256="
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
            << "state_abi=" << state_abi << '\n'
@@ -1438,11 +1439,13 @@ public:
           .role = std::string(ChatRoleName(message.role)),
           .content = message.content,
           .reasoning_content = message.thought,
+          .tool_call_id = message.tool_call_id,
       };
       converted.tool_calls.reserve(message.tool_calls.size());
       for (const auto& call : message.tool_calls) {
         models::deepseek_v4_flash::ChatMessage::ToolCall converted_call{
             .name = call.name,
+            .id = call.id,
         };
         converted_call.arguments.reserve(call.arguments.size());
         for (const auto& argument : call.arguments) {

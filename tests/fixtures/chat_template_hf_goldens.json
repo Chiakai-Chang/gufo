@@ -40,6 +40,32 @@
         "rendered_sha256": "acab567a1e900a69b084c0309ef9291ceccaa50ba59b184bd6d3fd0e5b4581a2",
         "token_ids_le_u32_sha256": "9cbadda4140440b2003fb0224534da4e5100382c91ace043caf6c6cb90595a35",
         "token_count": 270
+      },
+      "system_tools": {
+        "rendered_sha256": "ec8e244724654dd38d66e8e83e6ede8369ef3fb3af4a0a8246ff7c7004823487",
+        "token_ids_le_u32_sha256": "1d48d843ab122eb38403deb379b343b5ed9d693c011dd3427ae3a5abb19c22d5",
+        "token_count": 310
+      },
+      "developer_tools": {
+        "rendered_sha256": "dccaa6a63337a18996254181d2a111824e0e77bcdef990bbd30b3aae2bc3c3ee",
+        "token_ids_le_u32_sha256": "325ba95802d044ca36c51bd5ecad657563029a7f58e2321c3bca85860408147c",
+        "token_count": 315,
+        "template_sha256": "12827f24b742ea4e80cdc12dbcf9622227056b9f797252a3149263d4f9aaadce"
+      },
+      "vision_whitespace": {
+        "rendered_sha256": "97abd59b092b6411a440216e4e4b13dd1b83c84f5c026fe4bdfb5affe6b01462",
+        "token_ids_le_u32_sha256": "66c9b19cdd2cac750ebac868c02ea0bc9788000f89a0bb67d76c675b20a3a8e6",
+        "token_count": 37
+      },
+      "vision_ids": {
+        "rendered_sha256": "a4bd48cf8adda0a57c4113774fb0a9555a00c9f6eba88f10676d043008acc54c",
+        "token_ids_le_u32_sha256": "ef5e2821bcefa4ac7d9c6a4a0af1a6f315cc1e26c6f2ae3b0d3fe18c2ea08370",
+        "token_count": 46
+      },
+      "tool_loop_preserve": {
+        "rendered_sha256": "6376ef1f57fd6b13f2f5aa6fb6485d8ec3120d240895a698c6f2ca154e2588c9",
+        "token_ids_le_u32_sha256": "3c20986f3f01d48af5c00014ffe614e2859e78677975c12b14f2163ea8171e29",
+        "token_count": 64
       }
     }
   },
@@ -83,6 +109,11 @@
         "rendered_sha256": "cd89794650716ce13bac7ac2392db6a06231ce9927ceb1d712f7c399a0a2fde6",
         "token_ids_le_u32_sha256": "aeb24f88f10cdbd8e8278043e02c08670c82e09ef6180d99f7aa89314fa31d1f",
         "token_count": 344
+      },
+      "parallel_tools": {
+        "rendered_sha256": "f3daf08d1cceae525601cd6e1835e3d0441a0f5d3d8c8fa1703cd75ab3b10b90",
+        "token_ids_le_u32_sha256": "b66f618bb5c8adcf03dd3cfb0d8acc9f97cce485ca4b4eb7866decec928ced04",
+        "token_count": 107
       }
     }
   }

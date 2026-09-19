@@ -6,7 +6,7 @@ implementation and update policy are recorded in [UPSTREAM.md](UPSTREAM.md).
 
 ## Chat template and reasoning
 
-Gufo uses the compiled `deepseek-v4-flash-0731-compiled-v2` formatter derived
+Gufo uses the compiled `deepseek-v4-flash-0731-compiled-v3` formatter derived
 from the official 0731 encoder. The official encoder provenance and deployed
 artifact Jinja are stored under [`reference/`](reference/). Model loading
 rejects missing or unrecognized `tokenizer.chat_template` hashes. It does not

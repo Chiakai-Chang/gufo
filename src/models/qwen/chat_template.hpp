@@ -97,6 +97,7 @@ struct ChatTemplateOptions {
   bool enable_thinking{true};
   QwenReasoningEffort reasoning_effort{QwenReasoningEffort::kXHigh};
   bool preserve_thinking{true};
+  bool add_vision_id{false};
   bool require_tool_call{false};
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
 };
@@ -104,7 +105,7 @@ struct ChatTemplateOptions {
 /// Resolve CLI/API controls against the official Qwen3.8 template defaults.
 /// Provider-neutral minimal/high/max map to native low/xhigh/xhigh.
 [[nodiscard]] ChatTemplateOptions ResolveQwenChatOptions(
-    const ReasoningOptions& reasoning);
+    const ReasoningOptions& reasoning, bool add_vision_id = false);
 
 /// Deterministic, bounded Qwen ChatML formatter.
 class QwenChatTemplate {

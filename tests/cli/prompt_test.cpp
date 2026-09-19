@@ -49,6 +49,15 @@ void TestFlashMtpFlags() {
   assert(opt->sampling.temperature == 0.7F && opt->sampling.seed == 1);
 }
 
+void TestImageFlags() {
+  const char* args[] = {"--image", "a.png",           "--image",
+                        "b.jpg",   "--add-vision-id", "Compare"};
+  const auto opt = gufo::cli::ParsePromptOptions(args);
+  assert(opt && opt->add_vision_id);
+  assert((opt->image_paths == std::vector<std::string>{"a.png", "b.jpg"}));
+  assert(!gufo::cli::ParsePromptOptions(std::array{"Compare"})->add_vision_id);
+}
+
 void TestInvalidFlags() {
   std::string err;
   const std::array<const char*, 1> args1 = {"--model"};
@@ -162,6 +171,7 @@ int main() {
   TestExplicitFlags();
   TestSamplingAndReasoningFlags();
   TestFlashMtpFlags();
+  TestImageFlags();
   TestInvalidFlags();
   std::cout << "All prompt CLI tests passed.\n";
   return 0;

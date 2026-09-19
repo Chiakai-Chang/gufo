@@ -17,6 +17,12 @@ Repeat `--image` for multiple images. In chat, these belong to the first user
 turn and remain in its history. HTTP accepts ordered text and `image_url`
 parts in user messages, including multiple images and subsequent turns:
 
+Image numbering follows the official template: off by default. Enable
+`Picture N:` prefixes with `--add-vision-id` or HTTP
+`chat_template_kwargs: {"add_vision_id": true}`. Numbering continues across
+conversation turns; fully rendered message content is trimmed before image
+offsets are passed to the encoder.
+
 ```python
 import base64, json, urllib.request
 

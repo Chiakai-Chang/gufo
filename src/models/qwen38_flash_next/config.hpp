@@ -108,6 +108,24 @@ struct Config {
     return ple_layer >= 0 && layer == static_cast<std::uint32_t>(ple_layer);
   }
 
+  /// The draft executes with trunk constants and shared vocabulary weights.
+  /// PLE/SSM parameters are intentionally excluded: the draft is full
+  /// attention.
+  [[nodiscard]] bool MtpMatches(const Config& trunk) const noexcept {
+    return nextn_layers == 1 && num_layers == trunk.num_layers &&
+           hidden_size == trunk.hidden_size &&
+           context_length == trunk.context_length && rms_eps == trunk.rms_eps &&
+           hc_count == trunk.hc_count && hc_low_rank == trunk.hc_low_rank &&
+           num_heads == trunk.num_heads && num_kv_heads == trunk.num_kv_heads &&
+           head_dim == trunk.head_dim && rotary_dim == trunk.rotary_dim &&
+           rope_theta == trunk.rope_theta &&
+           rope_sections == trunk.rope_sections &&
+           num_experts == trunk.num_experts &&
+           num_experts_used == trunk.num_experts_used &&
+           expert_ff == trunk.expert_ff &&
+           shared_expert_ff == trunk.shared_expert_ff;
+  }
+
   /// Reads and validates the `qwen4exp.*` metadata. `require_trunk` rejects
   /// draft-only sidecars; the MTP sidecar is read with it false.
   [[nodiscard]] static std::optional<Config> FromGguf(

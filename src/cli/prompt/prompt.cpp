@@ -51,6 +51,9 @@ static void PrintTokenTrace(std::span<const tokenization::TokenId> tokens) {
 }
 
 static void RegisterImageOptions(ArgParser& parser, PromptOptions& opt) {
+  parser.AddFlag("", "--add-vision-id",
+                 "Prefix image inputs with Picture N: in the chat template",
+                 "Prompt", &opt.add_vision_id);
   parser.AddOption("", "--mmproj", "PATH",
                    "Qwen BF16 vision sidecar (auto-discovered beside model)",
                    "Model", &opt.vision_model_path);
@@ -628,8 +631,8 @@ std::shared_ptr<const models::qwen::vision::Prompt> PrepareVision(
   return std::make_shared<models::qwen::vision::Prompt>(
       models::qwen::vision::Prepare(
           tokenizer, messages, {},
-          tokenization::ResolveQwenChatOptions(reasoning), encoder->identity(),
-          kDefaultContext));
+          tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id),
+          encoder->identity(), kDefaultContext));
 }
 
 std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
@@ -1004,7 +1007,8 @@ int RunPrompt(std::span<const char* const> args) {
         {tokenization::ChatRole::kUser, opt.prompt_text, "", ""});
     const auto reasoning = PromptReasoningOptions(opt);
     const auto rendered = tokenization::QwenChatTemplate::Render(
-        messages, tokenization::ResolveQwenChatOptions(reasoning));
+        messages,
+        tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id));
     if (rendered.has_value()) {
       rendered_prompt = *rendered;
     } else {
@@ -1296,7 +1300,8 @@ int RunChat(std::span<const char* const> args) {
     history.push_back({tokenization::ChatRole::kUser, user_input, "", ""});
     const auto reasoning = PromptReasoningOptions(opt);
     const auto rendered_prompt = tokenization::QwenChatTemplate::Render(
-        history, tokenization::ResolveQwenChatOptions(reasoning));
+        history,
+        tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id));
     if (!rendered_prompt.has_value()) {
       std::cerr << "Error formatting chat template.\n";
       return 1;
@@ -1349,7 +1354,8 @@ int RunChat(std::span<const char* const> args) {
 
     std::cout << '\n';
     tokenization::ChatMessage reply{tokenization::ChatRole::kAssistant, ""};
-    if (tokenization::ResolveQwenChatOptions(reasoning).enable_thinking) {
+    if (tokenization::ResolveQwenChatOptions(reasoning, opt.add_vision_id)
+            .enable_thinking) {
       constexpr std::string_view end = "</think>";
       const auto boundary = assistant_reply.find(end);
       reply.thought = assistant_reply.substr(0, boundary);

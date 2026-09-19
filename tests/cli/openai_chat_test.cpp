@@ -571,6 +571,19 @@ void TestPiReasoningControlsAndOutputFraming() {
       "Template enable_thinking=false suppresses the configured effort");
   Expect(disabled.body.find(R"("content":"Done.")") != std::string::npos,
          "Explicit thinking-off produces visible content");
+  const auto vision_ids = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"hello"}],
+                  "chat_template_kwargs":{"add_vision_id":true}})"),
+      backend);
+  Expect(vision_ids.status == 200 && backend.last_request.add_vision_id,
+         "Official add_vision_id option reaches the model formatter");
+  const auto invalid_ids = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"hello"}],
+                  "chat_template_kwargs":{"add_vision_id":"true"}})"),
+      backend);
+  Expect(invalid_ids.status == 400, "add_vision_id requires a boolean");
 }
 
 void TestPiNativeDeepSeekThinkingObject() {

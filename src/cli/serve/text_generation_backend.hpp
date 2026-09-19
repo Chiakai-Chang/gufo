@@ -90,6 +90,7 @@ struct ChatRequest {
   std::string client_id{"anonymous"};
   ToolChoice tool_choice{ToolChoice::kAuto};
   ReasoningOptions reasoning;
+  bool add_vision_id{false};
 };
 
 /// Model-agnostic text generation boundary used by the HTTP transport.

@@ -1,6 +1,7 @@
 #include "src/models/qwen38_flash_next/config.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <string_view>
 #include <variant>
 
@@ -179,13 +180,14 @@ std::optional<Config> Config::FromGguf(const core::GgufReader& gguf,
   }
 
   // Structural limits of this runtime, not of the format.
-  if (c.hidden_size == 0 || c.hc_count < 2 || c.hc_low_rank == 0 ||
-      c.full_attention_interval == 0 || c.num_heads == 0 ||
-      c.num_kv_heads == 0 || c.num_heads % c.num_kv_heads != 0 ||
-      c.head_dim == 0 || c.rotary_dim == 0 || c.rotary_dim % 2 != 0 ||
-      c.rotary_dim > c.head_dim || c.ssm_conv_kernel == 0 ||
-      c.ssm_head_dim == 0 || c.ssm_num_k_heads == 0 || c.ssm_num_v_heads == 0 ||
-      c.ssm_num_v_heads % c.ssm_num_k_heads != 0 ||
+  if (c.context_length == 0 || !std::isfinite(c.rms_eps) || c.rms_eps <= 0 ||
+      !std::isfinite(c.rope_theta) || c.rope_theta <= 0 || c.hidden_size == 0 ||
+      c.hc_count < 2 || c.hc_low_rank == 0 || c.full_attention_interval == 0 ||
+      c.num_heads == 0 || c.num_kv_heads == 0 ||
+      c.num_heads % c.num_kv_heads != 0 || c.head_dim == 0 ||
+      c.rotary_dim == 0 || c.rotary_dim % 2 != 0 || c.rotary_dim > c.head_dim ||
+      c.ssm_conv_kernel == 0 || c.ssm_head_dim == 0 || c.ssm_num_k_heads == 0 ||
+      c.ssm_num_v_heads == 0 || c.ssm_num_v_heads % c.ssm_num_k_heads != 0 ||
       c.ssm_inner_size != c.SsmValueDim() || c.num_experts == 0 ||
       c.num_experts_used == 0 || c.num_experts_used > c.num_experts ||
       c.expert_ff == 0 || c.shared_expert_ff == 0) {
