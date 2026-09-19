@@ -164,3 +164,4 @@ on those cases, not resolution of the existing build-sensitive discrepancy.
 - Exact partial top-k covers wide prefill through 32,768 compressed keys; deeper inputs use the parallel fallback. Tie ordering is unchanged.
 - Scalar-equivalent speculative projections and attention retain independent request state.
 - Additional F16 rounding in HC and FP32 compressor/router experiments were rejected by the maintained quality controls.
+- Paired IQ2 gate/up and transposed sparse-value experiments (2026-09-19) were rejected: the exact variants were slower; smaller paired tiles spilled registers and failed exactness.

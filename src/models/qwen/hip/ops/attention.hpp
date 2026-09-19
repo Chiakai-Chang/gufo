@@ -128,7 +128,8 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
 /// [`key_begin`, min(context_end, query position]), and emits the partial
 /// log-sum-exp into `lse_out` (suppressing the gate) when that is non-null.
 /// Optional workspace spans hold temporary KV layouts and must not alias live
-/// inputs, outputs or each other. Persistent KV storage is unchanged.
+/// inputs, outputs or each other. Heads reuse the workspace in bounded groups
+/// when the full layout does not fit. Persistent KV storage is unchanged.
 /// Returns false when the shape is unsupported, so the caller can fall back.
 [[nodiscard]] bool LaunchQwenWmmaAttention(
     const float* q, const float* k, const float* v, const float* gate,

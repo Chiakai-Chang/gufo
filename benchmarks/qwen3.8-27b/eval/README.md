@@ -124,6 +124,20 @@ The WMMA operator test requires exact output and log-sum-exp, repeated
 execution, guarded scratch, independently undersized key/value workspace,
 empty and unaligned key ranges, ragged tails, and both sides of the 1024-token
 dispatch boundary. Softmax and matrix products retain their reduction order.
+The same test covers one-, two- and three-head workspace groups, including
+unequal K/V capacities and a workspace just too small for one head. It is
+included in the canonical `kernels` suite.
+
+The 2026-09-19 bounded-head control restored a real 147,456-token Q4 prefix
+from the unchanged build, appended 2,048 tokens and continued decoding.
+All four complete logit vectors, all five captured prefill feature taps and
+the subsequent hidden states matched byte for byte. Grouping uses the existing
+scratch allocation and leaves persistent snapshots unchanged.
+The matching pp2048 operator control at that depth takes 292.7–294.8 ms
+per attention layer, including packing, using two existing 272 MiB scratch
+planes. This is a kernel measurement; full-model PP at that depth remains TODO.
+The retained Nix release also reproduces the unchanged build's 128-token AR
+traces on Q4 and Q8 at d0/d32768, with no material change to the d32768 rates.
 
 For prefill changes, the existing target check also covers 128/257/2048-token
 prefixes and a 1,025-token suffix after restoring an 8K prefix, repeated

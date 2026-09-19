@@ -121,6 +121,9 @@ SSM selective prefetch spilled registers and was slower; concurrent short
 prefill improved cohort completion but increased median request latency,
 including when limited to pairs. Those paths and their temporary tests were
 removed.
+Aligned Q8 weight groups and directly loaded four-key value blocks
+(2026-09-19) preserved output bits but lost their small kernel gains once packing
+was included; the existing layouts remain.
 
 Current sampled C4 target-decode GPU time: 43% routed expert projections,
 34% dense Q8 projections. Model loading is excluded from these shares.

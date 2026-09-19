@@ -18,18 +18,25 @@ Standard sweep: **pp2048 / tg128**, C1. Cells are prefill / generation tok/s.
 
 | Context depth | Q4 | Q8 |
 | ---: | ---: | ---: |
-| 0 | **631.99 / 11.79** | **504.36 / 7.11** |
+| 0 | **622.00 / 11.74** | **520.11 / 7.10** |
 | 4,096 | TODO | TODO |
 | 8,192 | TODO | TODO |
 | 12,288 | TODO | TODO |
 | 16,384 | TODO | TODO |
-| 32,768 | **467.85 / 10.35** | **402.68 / 6.56** |
+| 32,768 | **467.63 / 10.30** | **402.36 / 6.55** |
 
-Measured **2026-09-19**, one warmed release sample per point.
+Measured **2026-09-19**, one warmed release sample per point; Q4 d0 is the
+mean of two controls (PP range 620.38–623.61 tok/s).
 Q4 uses FP16 activations with packed quantized weights; Q8 retains native wave64.
 At depth, large prefill chunks pack keys by head and values into WMMA tiles in
 idle FFN scratch. Small chunks read the canonical cache directly. This adds no
 persistent allocation and leaves cache contents and attention arithmetic intact.
+When all KV heads no longer fit, bounded groups reuse that scratch instead of
+falling back to strided attention. End-to-end speed beyond d128K remains **TODO**.
+
+Projection experiments, 2026-09-19: smaller/larger tiles, alternative wave
+layouts, pipeline depths and Q8 row grouping did not improve the short controls;
+the current kernels remain.
 
 ## Single user, DFlash2
 

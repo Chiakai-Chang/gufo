@@ -15,6 +15,7 @@ SUITES = {
     "kernels": ["qwen_gpu_ops_test", "qwen_ssm_ops_test",
                 "qwen_attention_kv_storage_ops_test",
                 "qwen_attention_fusion_ops_test",
+                "qwen_attention_wmma_prefill_ops_test",
                 "qwen_dflash_noncausal_attention_ops_test",
                 "qwen_prefill_quant_gemm_ops_test", "qwen_q4kxl_quant_ops_test",
                 "qwen_quant_gemv_ops_test", "qwen_sampling_hip_test",

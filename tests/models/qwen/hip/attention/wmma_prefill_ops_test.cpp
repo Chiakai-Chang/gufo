@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -232,13 +233,19 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
     if (want_lse)
       HIP_CHECK(hipMemcpy(lse_expected.data(), d_lse_new,
                           lse_elements * sizeof(float), hipMemcpyDeviceToHost));
-    for (const unsigned short_plane : {0u, 1u, 2u}) {
+    for (const auto [key_heads, value_heads] :
+         {std::pair{4u, 4u}, std::pair{3u, 4u}, std::pair{1u, 4u},
+          std::pair{4u, 1u}, std::pair{2u, 3u}, std::pair{3u, 2u},
+          std::pair{0u, 4u}, std::pair{4u, 0u}}) {
       for (std::size_t i = 0; i < storage.size(); ++i)
         HIP_CHECK(hipMemset(storage[i], 0xA5, (words[i] + 32) * sizeof(float)));
-      const auto k_work =
-          short_plane == 1 ? work[0].first(words[0] - 1) : work[0];
-      const auto v_work =
-          short_plane == 2 ? work[1].first(words[1] - 1) : work[1];
+      const std::array<std::size_t, 2> sizes{
+          key_heads ? words[0] / kNumKvHeads * key_heads
+                    : words[0] / kNumKvHeads - 1,
+          value_heads ? words[1] / kNumKvHeads * value_heads
+                      : words[1] / kNumKvHeads - 1};
+      const auto k_work = work[0].first(sizes[0]);
+      const auto v_work = work[1].first(sizes[1]);
       if (!gufo::hip::LaunchQwenWmmaAttention(
               d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
               d_out_new, 0, start_pos, batch_size, kMaxContext, kNumHeads,
@@ -256,7 +263,8 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
         HIP_CHECK(hipMemcpy(actual.data(), d_lse_new,
                             lse_elements * sizeof(float),
                             hipMemcpyDeviceToHost));
-        if (actual != lse_expected)
+        if (std::memcmp(actual.data(), lse_expected.data(),
+                        lse_elements * sizeof(float)) != 0)
           std::abort();
       }
       for (std::size_t i = 0; i < storage.size(); ++i) {
@@ -266,10 +274,11 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
                             hipMemcpyDeviceToHost));
         const bool untouched = std::all_of(
             first.begin(), first.end(), [](auto byte) { return byte == 0xA5; });
-        if (untouched == (short_plane == 0 && batch_size >= 1024 &&
-                          key_begin < length && key_begin % 16 == 0))
+        if (untouched ==
+            (key_heads != 0 && value_heads != 0 && batch_size >= 1024 &&
+             key_begin < length && key_begin % 16 == 0))
           std::abort();
-        for (std::size_t off : {std::size_t{0}, words[i] + 16}) {
+        for (std::size_t off : {std::size_t{0}, sizes[i] + 16}) {
           std::array<std::uint8_t, 64> guard{};
           HIP_CHECK(hipMemcpy(guard.data(), data + off, guard.size(),
                               hipMemcpyDeviceToHost));
