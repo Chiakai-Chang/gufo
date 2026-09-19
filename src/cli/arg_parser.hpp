@@ -159,6 +159,10 @@ public:
   /// Parse the supplied arguments span. Returns true on success.
   [[nodiscard]] bool Parse(std::span<const char* const> args,
                            std::string* error_msg = nullptr) const {
+    help_requested_ = false;
+    if (error_msg != nullptr) {
+      error_msg->clear();
+    }
     for (std::size_t i = 0; i < args.size(); ++i) {
       const std::string_view arg = args[i];
 
@@ -174,14 +178,7 @@ public:
       if (equals != std::string_view::npos && equals > 0 && arg[0] == '-') {
         const std::string_view name = arg.substr(0, equals);
         const std::string_view val = arg.substr(equals + 1);
-        const Option* inline_match = nullptr;
-        for (const auto& opt : options_) {
-          if ((!opt.short_name.empty() && name == opt.short_name) ||
-              (!opt.long_name.empty() && name == opt.long_name)) {
-            inline_match = &opt;
-            break;
-          }
-        }
+        const Option* inline_match = FindOption(name);
         if (inline_match != nullptr) {
           if (inline_match->is_flag) {
             if (error_msg != nullptr) {
@@ -198,14 +195,7 @@ public:
       }
 
       // Check if it matches an option
-      const Option* matched = nullptr;
-      for (const auto& opt : options_) {
-        if ((!opt.short_name.empty() && arg == opt.short_name) ||
-            (!opt.long_name.empty() && arg == opt.long_name)) {
-          matched = &opt;
-          break;
-        }
-      }
+      const Option* matched = FindOption(arg);
 
       if (matched != nullptr) {
         if (matched->is_flag) {
@@ -236,6 +226,11 @@ public:
           if (!positional_handler_(arg, error_msg)) {
             return false;
           }
+        } else {
+          if (error_msg != nullptr) {
+            *error_msg = "Unexpected argument: " + std::string(arg);
+          }
+          return false;
         }
       }
     }
@@ -243,6 +238,16 @@ public:
   }
 
   [[nodiscard]] bool IsHelpRequested() const { return help_requested_; }
+
+  [[nodiscard]] const Option* FindOption(std::string_view name) const {
+    for (const auto& opt : options_) {
+      if ((!opt.short_name.empty() && name == opt.short_name) ||
+          (!opt.long_name.empty() && name == opt.long_name)) {
+        return &opt;
+      }
+    }
+    return nullptr;
+  }
 
   /// Generate grouped formatted help string.
   [[nodiscard]] std::string FormatHelp() const {

@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
 
 namespace gufo::server {
@@ -68,9 +69,10 @@ struct HttpResponse {
 using Handler =
     std::function<HttpResponse(const HttpRequest&, TextGenerationBackend&)>;
 
-struct HttpServerLimits {
+struct HttpServerOptions {
   std::size_t max_request_body_bytes{static_cast<std::size_t>(8) * 1024 * 1024};
   std::size_t max_connections{16};
+  std::string api_key;
 };
 
 /// Minimal bounded HTTP/1.1 server for trusted-LAN model serving.
@@ -81,7 +83,7 @@ public:
              std::shared_ptr<VideoJobService> video_jobs = nullptr,
              std::shared_ptr<TtsService> tts = nullptr,
              std::shared_ptr<AsrService> asr = nullptr,
-             HttpServerLimits limits = {});
+             HttpServerOptions options = {});
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
@@ -115,7 +117,8 @@ private:
   std::shared_ptr<VideoJobService> video_jobs_;
   std::shared_ptr<TtsService> tts_;
   std::shared_ptr<AsrService> asr_;
-  HttpServerLimits limits_;
+  HttpServerOptions options_;
+  std::string api_key_hash_;
   int listen_fd_ = -1;
   std::atomic<bool> stopped_{false};
   std::mutex workers_mutex_;
@@ -148,11 +151,7 @@ inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
   detail::TotalGenTokens().fetch_add(result.completion_tokens,
                                      std::memory_order_relaxed);
 
-  const double prompt_per_second =
-      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
-          ? (static_cast<double>(result.prompt_tokens) /
-             (result.prefill_ms / 1000.0))
-          : 0.0;
+  const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)
           ? (static_cast<double>(result.completion_tokens) /

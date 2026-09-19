@@ -39,75 +39,6 @@
 
 namespace gufo::cli {
 
-void PrintBenchHelp(std::string_view program_name) {
-  BenchOptions opt;
-  gufo::cli::ArgParser parser(
-      std::string(program_name) + " bench",
-      "Benchmark prompt processing (pp) and token generation (tg) throughput.");
-
-  parser.AddOption(
-      "-m", "--model", "PATH",
-      "Path to GGUF model file (default: models/Qwen3.5-4B-BF16.gguf)", "Model",
-      &opt.model_path);
-
-  parser.AddOption("-p", "--n-prompt", "n,n,...",
-                   "Prompt token lengths to benchmark (default: 2048)",
-                   "Workload", &opt.model_path);
-  parser.AddOption(
-      "-n", "--n-gen", "n,n,...",
-      "Number of text generation tokens to benchmark (default: 128)",
-      "Workload", &opt.model_path);
-  parser.AddOption("-d", "--n-depth", "n,n,...",
-                   "Context depths prepared before timed region (default: 0)",
-                   "Workload", &opt.model_path);
-  parser.AddOption("-c", "--concurrency", "n,n,...",
-                   "DS4 simultaneous requests, 1..8 (default: 1); pp is "
-                   "aggregate, tg per user",
-                   "Workload", &opt.model_path);
-  parser.AddOption(
-      "-r", "--repetitions", "N",
-      "Repetitions per test point for variance reduction (default: 1)",
-      "Workload", &opt.repetitions);
-
-  parser.AddOption("", "--validate-prefill", "N",
-                   "Compare batched prefill logits against sequential "
-                   "reference",
-                   "Validation", &opt.model_path);
-
-  parser.AddOption("", "--speculative", "MODE",
-                   "Draft backend: dflash2, mtp, dspark, or off", "Speculative",
-                   &opt.speculative_backend);
-  parser.AddOption("", "--dflash-model", "PATH",
-                   "Path to Qwen DFlash2 GGUF file", "Speculative",
-                   &opt.dflash_model_path);
-  parser.AddOption(
-      "", "--draft-policy", "POLICY",
-      "DFlash2 block length: fixed or adaptive (default: adaptive)",
-      "Speculative", &opt.draft_policy);
-  parser.AddOption("", "--dspark-model", "PATH",
-                   "DeepSeek V4 Flash DSpark support GGUF", "Speculative",
-                   &opt.dspark_model_path);
-  parser.AddOption("", "--mtp-model", "PATH",
-                   "Path to quantized Qwen MTP draft head GGUF file",
-                   "Speculative", &opt.mtp_model_path);
-  parser.AddOption(
-      "", "--draft-tokens", "N",
-      "Maximum speculative draft tokens per verification step (default: 7)",
-      "Speculative", &opt.draft_tokens);
-
-  parser.AddOption("", "--min-draft-tokens", "N",
-                   "Adaptive draft floor (default: 1)", "Speculative",
-                   &opt.min_draft_tokens);
-
-  RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
-
-  parser.AddFlag("-v", "--verbose",
-                 "Print detailed timing, latency breakdown, and tok/s metrics",
-                 "General", &opt.verbose);
-
-  parser.PrintHelp();
-}
-
 namespace {
 
 void PrintModelLoadTime(std::chrono::steady_clock::time_point start,
@@ -142,6 +73,186 @@ std::optional<std::vector<std::size_t>> ParseCommaSeparatedSizes(
     start = end + 1;
   }
   return result;
+}
+
+void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
+                          bool& explicit_p, bool& explicit_n,
+                          bool& speculative_explicit) {
+  parser.AddOption(
+      "-m", "--model", "PATH",
+      "Path to GGUF model file (default: models/Qwen3.5-4B-BF16.gguf)", "Model",
+      &opt.model_path);
+
+  parser.AddCustomOption(
+      "-p", "--n-prompt", "n,n,...",
+      "Prompt token lengths to benchmark (default: 2048)", "Workload",
+      [&opt, &explicit_p](std::string_view flag, std::string_view val,
+                          std::string* error) -> bool {
+        auto sizes = ParseCommaSeparatedSizes(val);
+        if (!sizes) {
+          if (error)
+            *error = "Invalid token counts for " + std::string(flag);
+          return false;
+        }
+        opt.n_prompts = std::move(*sizes);
+        explicit_p = true;
+        return true;
+      });
+
+  parser.AddCustomOption(
+      "-n", "--n-gen", "n,n,...",
+      "Number of text generation tokens to benchmark (default: 128)",
+      "Workload",
+      [&opt, &explicit_n](std::string_view flag, std::string_view val,
+                          std::string* error) -> bool {
+        auto sizes = ParseCommaSeparatedSizes(val);
+        if (!sizes) {
+          if (error)
+            *error = "Invalid token counts for " + std::string(flag);
+          return false;
+        }
+        opt.n_gens = std::move(*sizes);
+        explicit_n = true;
+        return true;
+      });
+
+  parser.AddCustomOption(
+      "-d", "--n-depth", "n,n,...",
+      "Context depths prepared before timed region (default: 0)", "Workload",
+      [&opt](std::string_view flag_name, std::string_view val,
+             std::string* err) -> bool {
+        auto sizes = ParseCommaSeparatedSizes(val, true);
+        if (!sizes) {
+          if (err != nullptr) {
+            *err = "Invalid argument for " + std::string(flag_name);
+          }
+          return false;
+        }
+        opt.n_depths = std::move(*sizes);
+        return true;
+      });
+
+  parser.AddCustomOption(
+      "-c", "--concurrency", "n,n,...",
+      "DS4 simultaneous requests, 1..8 (default: 1); pp is aggregate, tg per "
+      "user",
+      "Workload",
+      [&opt](std::string_view, std::string_view value, std::string* error) {
+        auto sizes = ParseCommaSeparatedSizes(value, true);
+        if (!sizes || sizes->empty() ||
+            std::any_of(sizes->begin(), sizes->end(),
+                        [](auto size) { return size < 1 || size > 8; })) {
+          if (error)
+            *error =
+                "--concurrency requires DS4 request counts between 1 and 8";
+          return false;
+        }
+        opt.concurrency = std::move(*sizes);
+        return true;
+      });
+
+  parser.AddOption(
+      "-r", "--repetitions", "N",
+      "Repetitions per test point for variance reduction (default: 1)",
+      "Workload", &opt.repetitions);
+
+  parser.AddCustomOption(
+      "", "--validate-prefill", "N",
+      "Compare batched prefill logits against sequential reference",
+      "Validation",
+      [&opt](std::string_view, std::string_view val, std::string* err) -> bool {
+        std::size_t num = 0;
+        const auto [ptr, ec] =
+            std::from_chars(val.data(), val.data() + val.size(), num);
+        if (ec != std::errc{} || ptr != val.data() + val.size() || num == 0) {
+          if (err != nullptr) {
+            *err = "Invalid argument for --validate-prefill";
+          }
+          return false;
+        }
+        opt.validate_prefill_tokens = num;
+        return true;
+      });
+
+  const auto parse_speculative_backend =
+      [&opt, &speculative_explicit](std::string_view, std::string_view value,
+                                    std::string* error) -> bool {
+    speculative_explicit = true;
+    if (value == "off") {
+      opt.speculative_backend.clear();
+    } else if (value == "dspark" || value == "dflash2" || value == "mtp") {
+      opt.speculative_backend = value;
+    } else {
+      if (error != nullptr)
+        *error = "Unknown speculative backend: " + std::string(value);
+      return false;
+    }
+    return true;
+  };
+  parser.AddCustomOption("", "--speculative", "MODE",
+                         "Draft backend: dflash2, mtp, dspark, or off",
+                         "Speculative", parse_speculative_backend);
+  parser.AddOption("", "--dflash-model", "PATH",
+                   "Path to Qwen DFlash2 GGUF file", "Speculative",
+                   &opt.dflash_model_path);
+  parser.AddOption(
+      "", "--draft-policy", "POLICY",
+      "DFlash2 block length: fixed or adaptive (default: adaptive)",
+      "Speculative", &opt.draft_policy);
+  parser.AddOption("", "--dspark-model", "PATH",
+                   "DeepSeek V4 Flash DSpark support GGUF", "Speculative",
+                   &opt.dspark_model_path);
+  parser.AddOption("", "--mtp-model", "PATH",
+                   "Path to quantized Qwen MTP draft head GGUF file",
+                   "Speculative", &opt.mtp_model_path);
+  parser.AddCustomOption(
+      "", "--draft-tokens", "N",
+      "Maximum speculative draft tokens per verification step (default: 7)",
+      "Speculative",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        std::uint32_t count = 0;
+        const auto [ptr, ec] =
+            std::from_chars(value.data(), value.data() + value.size(), count);
+        if (ec != std::errc{} || ptr != value.data() + value.size() ||
+            count == 0) {
+          if (error != nullptr) {
+            *error = "Invalid argument for --draft-tokens";
+          }
+          return false;
+        }
+        opt.draft_tokens = count;
+        return true;
+      });
+
+  parser.AddCustomOption(
+      "", "--min-draft-tokens", "N", "Adaptive draft floor (default: 1)",
+      "Speculative",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        std::uint32_t count = 0;
+        const auto [ptr, ec] =
+            std::from_chars(value.data(), value.data() + value.size(), count);
+        if (ec != std::errc{} || ptr != value.data() + value.size() ||
+            count == 0) {
+          if (error != nullptr) {
+            *error = "Invalid argument for --min-draft-tokens";
+          }
+          return false;
+        }
+        opt.min_draft_tokens = count;
+        return true;
+      });
+  RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
+  parser.AddFlag("-v", "--verbose",
+                 "Print detailed timing, latency breakdown, and tok/s metrics",
+                 "General", &opt.verbose);
+
+  parser.SetPositionalHandler(
+      [&opt](std::string_view arg, std::string*) -> bool {
+        opt.model_path = std::string(arg);
+        return true;
+      });
 }
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -997,6 +1108,19 @@ int RunQwen38FlashNextBenchmark(
 
 }  // namespace
 
+void PrintBenchHelp(std::string_view program_name) {
+  BenchOptions opt;
+  bool explicit_p = false;
+  bool explicit_n = false;
+  bool speculative_explicit = false;
+  ArgParser parser(
+      std::string(program_name) + " bench",
+      "Benchmark prompt processing (pp) and token generation (tg) throughput.");
+  RegisterBenchOptions(parser, opt, explicit_p, explicit_n,
+                       speculative_explicit);
+  parser.PrintHelp();
+}
+
 std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
                                               std::string* error_msg) {
   BenchOptions opt;
@@ -1007,182 +1131,9 @@ std::optional<BenchOptions> ParseBenchOptions(std::span<const char* const> args,
       "gufo bench",
       "Benchmark prompt processing (pp) and token generation (tg) "
       "throughput.");
-  parser.AddOption(
-      "-m", "--model", "PATH",
-      "Path to GGUF model file (default: models/Qwen3.5-4B-BF16.gguf)", "Model",
-      &opt.model_path);
-
-  parser.AddCustomOption(
-      "-p", "--n-prompt", "n,n,...",
-      "Prompt token lengths to benchmark (default: 2048)", "Workload",
-      [&opt, &explicit_p](std::string_view flag, std::string_view val,
-                          std::string* error) -> bool {
-        auto sizes = ParseCommaSeparatedSizes(val);
-        if (!sizes) {
-          if (error)
-            *error = "Invalid token counts for " + std::string(flag);
-          return false;
-        }
-        opt.n_prompts = std::move(*sizes);
-        explicit_p = true;
-        return true;
-      });
-
-  parser.AddCustomOption(
-      "-n", "--n-gen", "n,n,...",
-      "Number of text generation tokens to benchmark (default: 128)",
-      "Workload",
-      [&opt, &explicit_n](std::string_view flag, std::string_view val,
-                          std::string* error) -> bool {
-        auto sizes = ParseCommaSeparatedSizes(val);
-        if (!sizes) {
-          if (error)
-            *error = "Invalid token counts for " + std::string(flag);
-          return false;
-        }
-        opt.n_gens = std::move(*sizes);
-        explicit_n = true;
-        return true;
-      });
-
-  parser.AddCustomOption(
-      "-d", "--n-depth", "n,n,...",
-      "Context depths prepared before timed region (default: 0)", "Workload",
-      [&opt](std::string_view flag_name, std::string_view val,
-             std::string* err) -> bool {
-        auto sizes = ParseCommaSeparatedSizes(val, true);
-        if (!sizes) {
-          if (err != nullptr) {
-            *err = "Invalid argument for " + std::string(flag_name);
-          }
-          return false;
-        }
-        opt.n_depths = std::move(*sizes);
-        return true;
-      });
-
-  parser.AddCustomOption(
-      "-c", "--concurrency", "n,n,...",
-      "DS4 simultaneous requests, 1..8 (default: 1); pp is aggregate, tg per "
-      "user",
-      "Workload",
-      [&opt](std::string_view, std::string_view value, std::string* error) {
-        auto sizes = ParseCommaSeparatedSizes(value, true);
-        if (!sizes || sizes->empty() ||
-            std::any_of(sizes->begin(), sizes->end(),
-                        [](auto size) { return size < 1 || size > 8; })) {
-          if (error)
-            *error =
-                "--concurrency requires DS4 request counts between 1 and 8";
-          return false;
-        }
-        opt.concurrency = std::move(*sizes);
-        return true;
-      });
-
-  parser.AddOption(
-      "-r", "--repetitions", "N",
-      "Repetitions per test point for variance reduction (default: 1)",
-      "Workload", &opt.repetitions);
-
-  parser.AddCustomOption(
-      "", "--validate-prefill", "N",
-      "Compare batched prefill logits against sequential reference",
-      "Validation",
-      [&opt](std::string_view, std::string_view val, std::string* err) -> bool {
-        std::size_t num = 0;
-        const auto [ptr, ec] =
-            std::from_chars(val.data(), val.data() + val.size(), num);
-        if (ec != std::errc{} || ptr != val.data() + val.size() || num == 0) {
-          if (err != nullptr) {
-            *err = "Invalid argument for --validate-prefill";
-          }
-          return false;
-        }
-        opt.validate_prefill_tokens = num;
-        return true;
-      });
-
   bool speculative_explicit = false;
-  const auto parse_speculative_backend =
-      [&opt, &speculative_explicit](std::string_view, std::string_view value,
-                                    std::string* error) -> bool {
-    speculative_explicit = true;
-    if (value == "off") {
-      opt.speculative_backend.clear();
-    } else if (value == "dspark" || value == "dflash2" || value == "mtp") {
-      opt.speculative_backend = value;
-    } else {
-      if (error != nullptr)
-        *error = "Unknown speculative backend: " + std::string(value);
-      return false;
-    }
-    return true;
-  };
-  parser.AddCustomOption("", "--speculative", "MODE",
-                         "Draft backend: dflash2, mtp, dspark, or off",
-                         "Speculative", parse_speculative_backend);
-  parser.AddOption("", "--dflash-model", "PATH",
-                   "Path to Qwen DFlash2 GGUF file", "Speculative",
-                   &opt.dflash_model_path);
-  parser.AddOption(
-      "", "--draft-policy", "POLICY",
-      "DFlash2 block length: fixed or adaptive (default: adaptive)",
-      "Speculative", &opt.draft_policy);
-  parser.AddOption("", "--dspark-model", "PATH",
-                   "DeepSeek V4 Flash DSpark support GGUF", "Speculative",
-                   &opt.dspark_model_path);
-  parser.AddOption("", "--mtp-model", "PATH",
-                   "Path to quantized Qwen MTP draft head GGUF file",
-                   "Speculative", &opt.mtp_model_path);
-  parser.AddCustomOption(
-      "", "--draft-tokens", "N",
-      "Maximum speculative draft tokens per verification step (default: 7)",
-      "Speculative",
-      [&opt](std::string_view, std::string_view value,
-             std::string* error) -> bool {
-        std::uint32_t count = 0;
-        const auto [ptr, ec] =
-            std::from_chars(value.data(), value.data() + value.size(), count);
-        if (ec != std::errc{} || ptr != value.data() + value.size() ||
-            count == 0) {
-          if (error != nullptr) {
-            *error = "Invalid argument for --draft-tokens";
-          }
-          return false;
-        }
-        opt.draft_tokens = count;
-        return true;
-      });
-
-  parser.AddCustomOption(
-      "", "--min-draft-tokens", "N", "Adaptive draft floor (default: 1)",
-      "Speculative",
-      [&opt](std::string_view, std::string_view value,
-             std::string* error) -> bool {
-        std::uint32_t count = 0;
-        const auto [ptr, ec] =
-            std::from_chars(value.data(), value.data() + value.size(), count);
-        if (ec != std::errc{} || ptr != value.data() + value.size() ||
-            count == 0) {
-          if (error != nullptr) {
-            *error = "Invalid argument for --min-draft-tokens";
-          }
-          return false;
-        }
-        opt.min_draft_tokens = count;
-        return true;
-      });
-  RegisterSamplingOptions(parser, &opt.sampling, "Sampling", false);
-  parser.AddFlag("-v", "--verbose",
-                 "Print detailed timing, latency breakdown, and tok/s metrics",
-                 "General", &opt.verbose);
-
-  parser.SetPositionalHandler(
-      [&opt](std::string_view arg, std::string*) -> bool {
-        opt.model_path = std::string(arg);
-        return true;
-      });
+  RegisterBenchOptions(parser, opt, explicit_p, explicit_n,
+                       speculative_explicit);
 
   if (!parser.Parse(args, error_msg)) {
     return std::nullopt;

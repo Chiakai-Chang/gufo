@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
@@ -34,6 +35,7 @@
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
+#include "src/core/crypto/sha256.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
@@ -125,10 +127,16 @@ std::string UrlDecode(std::string_view s) {
           return h - 'a' + 10;
         if (h >= 'A' && h <= 'F')
           return h - 'A' + 10;
-        return 0;
+        return -1;
       };
-      out += static_cast<char>((hexval(s[i + 1]) << 4) | hexval(s[i + 2]));
-      i += 2;
+      const int high = hexval(s[i + 1]);
+      const int low = hexval(s[i + 2]);
+      if (high >= 0 && low >= 0) {
+        out += static_cast<char>((high << 4) | low);
+        i += 2;
+      } else {
+        out += c;
+      }
     } else {
       out += c;
     }
@@ -136,12 +144,61 @@ std::string UrlDecode(std::string_view s) {
   return out;
 }
 
-std::size_t ParseContentLength(const HttpRequest& request) {
-  const std::string value = request.header("content-length");
-  if (value.empty()) {
-    return 0;
+std::optional<std::size_t> ParseContentLength(const HttpRequest& request) {
+  std::optional<std::size_t> length;
+  for (const auto& [name, value] : request.headers) {
+    const auto lowered = ToLower(name);
+    // Chunked transfer is not implemented. Never interpret its encoded bytes
+    // as an empty or partial inference request.
+    if (lowered == "transfer-encoding") {
+      return std::nullopt;
+    }
+    if (lowered != "content-length") {
+      continue;
+    }
+    std::size_t parsed = 0;
+    const auto [end, error] =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (error != std::errc{} || end != value.data() + value.size() ||
+        (length.has_value() && *length != parsed)) {
+      return std::nullopt;
+    }
+    length = parsed;
   }
-  return static_cast<std::size_t>(std::strtoull(value.c_str(), nullptr, 10));
+  return length.value_or(0);
+}
+
+std::string CredentialHash(std::string_view value) {
+  return crypto::Sha256Hex(std::span(
+      reinterpret_cast<const std::uint8_t*>(value.data()), value.size()));
+}
+
+bool IsAuthorized(const HttpRequest& request, const std::string& key_hash) {
+  if (key_hash.empty()) {
+    return true;
+  }
+  std::string_view credential;
+  bool found = false;
+  for (const auto& [name, value] : request.headers) {
+    if (ToLower(name) == "authorization") {
+      if (found) {
+        return false;
+      }
+      found = true;
+      credential = value;
+    }
+  }
+  const auto space = credential.find(' ');
+  if (space == std::string_view::npos ||
+      ToLower(credential.substr(0, space)) != "bearer") {
+    return false;
+  }
+  credential.remove_prefix(space + 1);
+  while (credential.starts_with(' ')) {
+    credential.remove_prefix(1);
+  }
+  // Comparing digests does not disclose matching prefixes of the API key.
+  return CredentialHash(credential) == key_hash;
 }
 
 bool HasHeader(const HttpResponse& response, std::string_view name) {
@@ -212,43 +269,6 @@ HttpResponse Ok(const json::Value& v) {
   return {.status = 200, .reason = "OK", .body = v.dump()};
 }
 
-json::Value TimingsJson(const TextGenerationBackend::Result& result) {
-  json::Value timings = json::Value::object();
-  const double prompt_per_second =
-      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
-          ? (static_cast<double>(result.prompt_tokens) /
-             (result.prefill_ms / 1000.0))
-          : 0.0;
-  const double predicted_per_second =
-      (result.decode_ms > 0.0 && result.completion_tokens > 0)
-          ? (static_cast<double>(result.completion_tokens) /
-             (result.decode_ms / 1000.0))
-          : 0.0;
-  const double prompt_per_token_ms =
-      (result.prompt_tokens > 0)
-          ? (result.prefill_ms / static_cast<double>(result.prompt_tokens))
-          : 0.0;
-  const double predicted_per_token_ms =
-      (result.completion_tokens > 0)
-          ? (result.decode_ms / static_cast<double>(result.completion_tokens))
-          : 0.0;
-
-  timings["prompt_n"] = result.prompt_tokens;
-  timings["prompt_ms"] = result.prefill_ms;
-  timings["prompt_per_token_ms"] = prompt_per_token_ms;
-  timings["prompt_per_second"] = prompt_per_second;
-  timings["predicted_n"] = result.completion_tokens;
-  timings["predicted_ms"] = result.decode_ms;
-  timings["predicted_per_token_ms"] = predicted_per_token_ms;
-  timings["predicted_per_second"] = predicted_per_second;
-  timings["cache_n"] = result.cached_prompt_tokens;
-  timings["cache_restore_ms"] = result.cache_restore_ms;
-  timings["cache_snapshot_ms"] = result.cache_snapshot_ms;
-  timings["draft_n"] = result.draft_tokens;
-  timings["draft_n_accepted"] = result.draft_accepted_tokens;
-  return timings;
-}
-
 json::Value UsageJson(const TextGenerationBackend::Result& result) {
   json::Value usage = json::Value::object();
   usage["prompt_tokens"] = result.prompt_tokens;
@@ -258,11 +278,7 @@ json::Value UsageJson(const TextGenerationBackend::Result& result) {
   prompt_details["cached_tokens"] = result.cached_prompt_tokens;
   usage["prompt_tokens_details"] = std::move(prompt_details);
 
-  const double prompt_per_second =
-      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
-          ? (static_cast<double>(result.prompt_tokens) /
-             (result.prefill_ms / 1000.0))
-          : 0.0;
+  const double prompt_per_second = PrefillTokensPerSecond(result);
   const double predicted_per_second =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)
           ? (static_cast<double>(result.completion_tokens) /
@@ -305,11 +321,7 @@ HttpResponse WithTiming(HttpResponse response,
   response.headers.emplace_back("Server-Timing", value.str());
 
   std::ostringstream details;
-  const double prompt_per_second =
-      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
-          ? (static_cast<double>(result.prompt_tokens) /
-             (result.prefill_ms / 1000.0))
-          : 0.0;
+  const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)
           ? (static_cast<double>(result.completion_tokens) /
@@ -504,7 +516,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   choices.push_back(std::move(c));
   resp["choices"] = std::move(choices);
   resp["usage"] = UsageJson(res);
-  resp["timings"] = TimingsJson(res);
+  resp["timings"] = GenerationTimings(res);
   return WithTiming(Ok(resp), res);
 }
 
@@ -577,7 +589,7 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
   input_details["cached_tokens"] = res.cached_prompt_tokens;
   usage["input_token_details"] = std::move(input_details);
   resp["usage"] = std::move(usage);
-  resp["timings"] = TimingsJson(res);
+  resp["timings"] = GenerationTimings(res);
   return WithTiming(Ok(resp), res);
 }
 
@@ -641,7 +653,7 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   usage["cache_creation_input_tokens"] = 0;
   usage["cache_read_input_tokens"] = res.cached_prompt_tokens;
   resp["usage"] = std::move(usage);
-  resp["timings"] = TimingsJson(res);
+  resp["timings"] = GenerationTimings(res);
   return WithTiming(Ok(resp), res);
 }
 
@@ -713,7 +725,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   resp["tokens_predicted"] = res.completion_tokens;
   resp["tokens_evaluated"] = res.prompt_tokens;
   resp["tokens_cached"] = res.cached_prompt_tokens;
-  resp["timings"] = TimingsJson(res);
+  resp["timings"] = GenerationTimings(res);
   resp["usage"] = UsageJson(res);
   return WithTiming(Ok(resp), res);
 }
@@ -747,7 +759,7 @@ HttpResponse LlamaInfill(const HttpRequest& req, TextGenerationBackend& b) {
   resp["tokens_predicted"] = res.completion_tokens;
   resp["tokens_evaluated"] = res.prompt_tokens;
   resp["tokens_cached"] = res.cached_prompt_tokens;
-  resp["timings"] = TimingsJson(res);
+  resp["timings"] = GenerationTimings(res);
   resp["usage"] = UsageJson(res);
   return WithTiming(Ok(resp), res);
 }
@@ -815,15 +827,22 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend&) {
 // ---------------------------------------------------------------------------
 
 std::string HttpRequest::query_param(const std::string& key) const {
-  const auto pos = query.find(key + "=");
-  if (pos == std::string::npos)
-    return "";
-  const auto value_start = pos + key.size() + 1;
-  const auto end = query.find('&', value_start);
-  const std::size_t len = (end == std::string::npos)
-                              ? query.size() - value_start
-                              : end - value_start;
-  return UrlDecode(query.substr(value_start, len));
+  std::string_view remaining = query;
+  while (!remaining.empty()) {
+    const auto end = remaining.find('&');
+    const auto parameter = remaining.substr(0, end);
+    const auto equals = parameter.find('=');
+    if (UrlDecode(parameter.substr(0, equals)) == key) {
+      return equals == std::string_view::npos
+                 ? ""
+                 : UrlDecode(parameter.substr(equals + 1));
+    }
+    if (end == std::string_view::npos) {
+      break;
+    }
+    remaining.remove_prefix(end + 1);
+  }
+  return "";
 }
 
 // ---------------------------------------------------------------------------
@@ -831,7 +850,7 @@ std::string HttpRequest::query_param(const std::string& key) const {
 // ---------------------------------------------------------------------------
 
 struct HttpServer::ConnectionWorker {
-  std::atomic<int> fd{-1};
+  int fd{-1};  // Protected by workers_mutex_, including shutdown and close.
   std::atomic<bool> done{false};
   std::jthread thread;
 };
@@ -840,22 +859,29 @@ HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<TextGenerationBackend> backend,
                        std::shared_ptr<VideoJobService> video_jobs,
                        std::shared_ptr<TtsService> tts,
-                       std::shared_ptr<AsrService> asr, HttpServerLimits limits)
+                       std::shared_ptr<AsrService> asr,
+                       HttpServerOptions options)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
       video_jobs_(std::move(video_jobs)),
       tts_(std::move(tts)),
       asr_(std::move(asr)),
-      limits_(limits) {
-  if (limits_.max_request_body_bytes == 0 || limits_.max_connections == 0) {
+      options_(std::move(options)) {
+  if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
+  }
+  if (!options_.api_key.empty()) {
+    api_key_hash_ = CredentialHash(options_.api_key);
   }
   register_routes();
 }
 
 HttpServer::~HttpServer() {
   stop();
+  if (listen_fd_ >= 0) {
+    ::close(listen_fd_);
+  }
 }
 
 void HttpServer::add(const std::string& method, const std::string& path,
@@ -898,6 +924,23 @@ void HttpServer::register_routes() {
 }
 
 bool HttpServer::start(std::string* error) {
+  if (listen_fd_ >= 0 || stopped_.load(std::memory_order_acquire)) {
+    if (error != nullptr) {
+      *error = "HTTP server has already been started or stopped";
+    }
+    return false;
+  }
+  sockaddr_in addr{};
+  addr.sin_family = AF_INET;
+  if (port_ < 0 || port_ > 65535 ||
+      ::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+    if (error != nullptr) {
+      *error =
+          "host must be an IPv4 address and port must be between 0 and 65535";
+    }
+    return false;
+  }
+  addr.sin_port = htons(static_cast<unsigned short>(port_));
   (void)::signal(SIGPIPE, SIG_IGN);
   listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
   if (listen_fd_ < 0) {
@@ -907,13 +950,6 @@ bool HttpServer::start(std::string* error) {
   }
   const int yes = 1;
   ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-  sockaddr_in addr{};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<unsigned short>(port_));
-  if (::inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  }
 
   if (::bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
       0) {
@@ -983,12 +1019,16 @@ void HttpServer::run() {
     {
       const std::lock_guard<std::mutex> lock(workers_mutex_);
       overloaded = stopped_.load(std::memory_order_acquire) ||
-                   workers_.size() >= limits_.max_connections;
+                   workers_.size() >= options_.max_connections;
       if (!overloaded) {
-        worker_ptr->fd.store(client_fd, std::memory_order_release);
+        worker_ptr->fd = client_fd;
         worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
           handle_connection(client_fd);
-          worker_ptr->fd.store(-1, std::memory_order_release);
+          {
+            const std::lock_guard<std::mutex> lock(workers_mutex_);
+            ::close(worker_ptr->fd);
+            worker_ptr->fd = -1;
+          }
           worker_ptr->done.store(true, std::memory_order_release);
         });
         workers_.push_back(std::move(worker));
@@ -1008,23 +1048,20 @@ void HttpServer::run() {
 
 void HttpServer::stop() {
   const bool was_stopped = stopped_.exchange(true, std::memory_order_acq_rel);
-  if (!was_stopped) {
-    const int listen_fd = std::exchange(listen_fd_, -1);
-    if (listen_fd >= 0) {
-      (void)::shutdown(listen_fd, SHUT_RDWR);
-      ::close(listen_fd);
-    }
+  if (!was_stopped && listen_fd_ >= 0) {
+    // Keep the descriptor owned until destruction: run() may still be inside
+    // accept(). Closing here allows it to observe a reused descriptor.
+    (void)::shutdown(listen_fd_, SHUT_RDWR);
   }
 
   std::vector<std::unique_ptr<ConnectionWorker>> workers;
   {
     const std::lock_guard<std::mutex> lock(workers_mutex_);
     workers = std::move(workers_);
-  }
-  for (const auto& worker : workers) {
-    const int fd = worker->fd.load(std::memory_order_acquire);
-    if (fd >= 0) {
-      (void)::shutdown(fd, SHUT_RDWR);
+    for (const auto& worker : workers) {
+      if (worker->fd >= 0) {
+        (void)::shutdown(worker->fd, SHUT_RDWR);
+      }
     }
   }
 }
@@ -1046,6 +1083,12 @@ void HttpServer::reap_workers() {
 }
 
 HttpResponse HttpServer::handle_request(const HttpRequest& req) {
+  if (!IsAuthorized(req, api_key_hash_)) {
+    auto response = Err(401, "Unauthorized", "missing or invalid API key",
+                        "authentication_error", "invalid_api_key");
+    response.headers.emplace_back("WWW-Authenticate", "Bearer");
+    return response;
+  }
   // `/health` and `/ready` are the native spelling and match llama-server's
   // `/health`. `/healthz` and `/readyz` are aliases so Kubernetes-style probe
   // configuration works unmodified.
@@ -1143,7 +1186,12 @@ void HttpServer::handle_connection(int client_fd) {
             (eol == std::string::npos) ? headers : headers.substr(0, eol);
         std::istringstream ls(line);
         std::string target;
-        ls >> req.method >> target;
+        std::string version;
+        std::string extra;
+        ls >> req.method >> target >> version;
+        bool valid_headers = !req.method.empty() && target.starts_with('/') &&
+                             (version == "HTTP/1.0" || version == "HTTP/1.1") &&
+                             !(ls >> extra);
         const auto qpos = target.find('?');
         if (qpos != std::string::npos) {
           req.query = target.substr(qpos + 1);
@@ -1161,7 +1209,7 @@ void HttpServer::handle_connection(int client_fd) {
           const std::string_view header_line(headers.data() + cursor,
                                              line_end - cursor);
           const std::size_t colon = header_line.find(':');
-          if (colon != std::string_view::npos) {
+          if (colon != std::string_view::npos && colon > 0) {
             std::string name(header_line.substr(0, colon));
             std::string_view raw_value = header_line.substr(colon + 1);
             while (!raw_value.empty() &&
@@ -1175,6 +1223,8 @@ void HttpServer::handle_connection(int client_fd) {
               raw_value.remove_suffix(1);
             }
             req.headers.emplace_back(std::move(name), std::string(raw_value));
+          } else {
+            valid_headers = false;
           }
           if (next == std::string::npos) {
             break;
@@ -1182,10 +1232,13 @@ void HttpServer::handle_connection(int client_fd) {
           cursor = next + 2;
         }
 
-        const std::size_t content_length = ParseContentLength(req);
+        const auto parsed_length = ParseContentLength(req);
+        const std::size_t content_length = parsed_length.value_or(0);
         const std::size_t remaining =
             content_length > body.size() ? content_length - body.size() : 0;
-        if (content_length > limits_.max_request_body_bytes) {
+        if (!valid_headers || !parsed_length.has_value()) {
+          ok = false;
+        } else if (content_length > options_.max_request_body_bytes) {
           payload_too_large = true;
         } else if (content_length > 0) {
           if (remaining > 0) {
@@ -1279,7 +1332,6 @@ void HttpServer::handle_connection(int client_fd) {
                        resp.reason, duration_ms, "unknown server error");
     (void)SendAll(client_fd, BuildResponse(resp));
   }
-  ::close(client_fd);
 }
 
 }  // namespace gufo::server

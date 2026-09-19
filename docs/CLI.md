@@ -8,9 +8,9 @@ The `gufo` executable provides terminal interfaces for:
 - Testing a locally loaded runtime without HTTP.
 - Testing an already running OpenAI-compatible server.
 
-The CLI is a transport adapter over the same request, scheduler, tokenizer,
-sampling, and model implementations used by the HTTP server. It must not
-contain a second inference path.
+Terminal generation and HTTP serving share model runtimes, tokenizers, and
+sampling. The HTTP scheduler also manages concurrent requests and persistent
+prompt caching.
 
 ## Functionalities
 
@@ -28,19 +28,16 @@ The current supported modality are: llm, video, audio (tts, asr).
 
 **Size and memory**
 
-- `context` (alias `batchSize`) — how many tokens of conversation the model
-  keeps in memory. In practice: bigger means longer chats fit without the
-  model "forgetting" the start, but prefill gets slower and more memory is
-  used.
-- `prefillChunk` (alias `ubatchSize`) — how many prompt tokens are processed
-  per GPU pass while ingesting your prompt. In practice: a speed/memory knob
-  for prefill; you rarely need to touch it.
+- `context` — maximum context capacity; memory use depends on the model and
+  the number of resident sessions.
+- `prefillChunk` — prompt tokens processed between active decode steps in
+  HTTP serving. Model runtimes choose their own internal prefill batch sizes.
 - `maxTokens` — maximum number of tokens a request may generate. In practice:
   stops a model that rambles forever.
 
 **Sampling (how the next token is picked)**
 
-- `temperature` (alias `temp`) — randomness of the choice. Low (for example
+- `temperature` — randomness of the choice. Low (for example
   0.2) gives predictable, repetitive answers; high (1.0+) gives varied,
   creative ones. Greedy decoding is the low extreme.
 - `topP` — only consider the smallest set of tokens whose probabilities add
@@ -123,8 +120,8 @@ seed. Speed depends on acceptance and verification cost.
 
 **Hardware**
 
-- `cpu` — force CPU-only execution. In practice: very slow, useful only for
-  debugging when no GPU is available.
+- `cpu` — CPU reference execution for supported models in `prompt` and
+  `chat`; unavailable in HTTP serving.
 
 ### Video
 
@@ -133,9 +130,8 @@ TODO
 ### Audio (TTS and ASR)
 
 One `gufo serve audio` server can host Qwen3-TTS synthesis, Qwen3-ASR
-transcription, or both at once. `tts`, `asr`, and `stt` are accepted as
-alternative spellings of the same subcommand; `asr` and `stt` additionally
-route a bare `--model` to the ASR service instead of the TTS default.
+transcription, or both at once. Select each service with `--tts-model` or
+`--asr-model`.
 
 **Models**
 
@@ -176,7 +172,7 @@ gufo serve audio \
 
 ### Server options (all modalities)
 
-These apply to every modality, before the subcommand:
+These apply to every modality, before or after the subcommand:
 
 - `host` / `port` — where to listen (`-i` / `-p`). In practice: set
   `--host 0.0.0.0` if you serve from inside a container, or the published
@@ -189,8 +185,8 @@ These apply to every modality, before the subcommand:
 - `maxRequestBytes` — maximum request body size. In practice: matters mostly
   for ASR, since requests carry whole audio files (the audio benchmark used
   32 MiB).
-- `apiKey` — if set, clients must present this key. In practice: minimal
-  authentication for a home server.
+- `apiKey` — if set, requests require `Authorization: Bearer <key>`, including
+  health checks. Browser CORS preflight (`OPTIONS`) remains unauthenticated.
 - `verbose` — chattier logs.
 
 ## Commands

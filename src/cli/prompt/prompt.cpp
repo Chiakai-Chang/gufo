@@ -80,16 +80,15 @@ static void AttachImages(const PromptOptions& opt,
   }
 }
 
-static void PrintTextHelp(std::string_view program_name,
-                          std::string_view command) {
-  PromptOptions opt;
-  gufo::cli::ArgParser parser(
-      std::string(program_name) + " " + std::string(command),
-      command == "chat" ? "Interactive conversation."
-                        : "Execute one prompt request and exit.");
+static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
+                                bool& speculative_explicit,
+                                std::string_view command) {
+  // Model
   parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
                    &opt.model_path);
   RegisterImageOptions(parser, opt);
+
+  // Prompt & Formatting
   if (command == "prompt") {
     parser.AddOption("-p", "--prompt", "TEXT", "Direct input prompt text",
                      "Prompt", &opt.prompt_text);
@@ -110,10 +109,13 @@ static void PrintTextHelp(std::string_view program_name,
         "Suppress echoing the prompt before generated response", "Prompt",
         &opt.display_prompt);
   }
+  // Sampling
   parser.AddOption("-n", "--max-tokens", "N",
                    "Maximum number of new tokens to generate (default: 128)",
                    "Sampling", &opt.max_tokens);
   RegisterSamplingOptions(parser, &opt.sampling);
+
+  // Reasoning
   parser.AddOption("", "--think", "MODE",
                    "Reasoning mode: on, off, or auto (default: off)",
                    "Reasoning", &opt.reasoning_mode);
@@ -123,10 +125,27 @@ static void PrintTextHelp(std::string_view program_name,
   parser.AddOption("", "--preserve-thinking", "MODE",
                    "Replay prior reasoning: on, off, or auto", "Reasoning",
                    &opt.preserve_thinking);
-  parser.AddOption("", "--speculative", "MODE",
-                   "Draft backend: dspark (DeepSeek V4 Flash), dflash2, "
-                   "mtp, or off",
-                   "Speculative", &opt.speculative_backend);
+
+  // Speculative & Hardware
+  const auto parse_speculative_backend =
+      [&opt, &speculative_explicit](std::string_view, std::string_view value,
+                                    std::string* error) -> bool {
+    speculative_explicit = true;
+    if (value == "off") {
+      opt.speculative_backend.clear();
+    } else if (value == "dspark" || value == "dflash2" || value == "mtp") {
+      opt.speculative_backend = value;
+    } else {
+      if (error != nullptr)
+        *error = "Unknown speculative backend: " + std::string(value);
+      return false;
+    }
+    return true;
+  };
+  parser.AddCustomOption(
+      "", "--speculative", "MODE",
+      "Draft backend: dspark (DeepSeek V4 Flash), dflash2, mtp, or off",
+      "Speculative", parse_speculative_backend);
   parser.AddOption("", "--dflash-model", "PATH",
                    "Path to Qwen DFlash2 GGUF file", "Speculative",
                    &opt.dflash_model_path);
@@ -140,16 +159,45 @@ static void PrintTextHelp(std::string_view program_name,
   parser.AddOption("", "--mtp-model", "PATH",
                    "Path to quantized Qwen MTP draft head GGUF file",
                    "Speculative", &opt.mtp_model_path);
-  parser.AddOption("-d", "--draft-tokens", "N",
-                   "Maximum speculative draft tokens evaluated per step "
-                   "(default: 7)",
-                   "Speculative", &opt.draft_tokens);
+  parser.AddCustomOption(
+      "-d", "--draft-tokens", "N",
+      "Maximum speculative draft tokens evaluated per step (default: 7)",
+      "Speculative",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        std::uint32_t count = 0;
+        const auto [ptr, ec] =
+            std::from_chars(value.data(), value.data() + value.size(), count);
+        if (ec != std::errc{} || ptr != value.data() + value.size() ||
+            count == 0) {
+          if (error != nullptr) {
+            *error = "Invalid integer for draft-tokens: " + std::string(value);
+          }
+          return false;
+        }
+        opt.draft_tokens = count;
+        return true;
+      });
 
-
-  parser.AddOption("", "--min-draft-tokens", "N",
-                   "Adaptive draft floor (default: 1)", "Speculative",
-                   &opt.min_draft_tokens);
-
+  parser.AddCustomOption(
+      "", "--min-draft-tokens", "N", "Adaptive draft floor (default: 1)",
+      "Speculative",
+      [&opt](std::string_view, std::string_view value,
+             std::string* error) -> bool {
+        std::uint32_t count = 0;
+        const auto [ptr, ec] =
+            std::from_chars(value.data(), value.data() + value.size(), count);
+        if (ec != std::errc{} || ptr != value.data() + value.size() ||
+            count == 0) {
+          if (error != nullptr) {
+            *error =
+                "Invalid integer for min-draft-tokens: " + std::string(value);
+          }
+          return false;
+        }
+        opt.min_draft_tokens = count;
+        return true;
+      });
 
   parser.AddFlag("", "--cpu",
                  "Force CPU OpenMP execution fallback instead of GPU ROCm",
@@ -157,6 +205,20 @@ static void PrintTextHelp(std::string_view program_name,
   parser.AddFlag("-v", "--verbose",
                  "Print detailed timing, latency breakdown, and tok/s metrics",
                  "General", &opt.verbose);
+
+  if (command == "prompt") {
+    parser.JoinPositionals(&opt.prompt_text);
+  }
+}
+
+static void PrintTextHelp(std::string_view program_name,
+                          std::string_view command) {
+  PromptOptions opt;
+  bool speculative_explicit = false;
+  ArgParser parser(std::string(program_name) + " " + std::string(command),
+                   command == "chat" ? "Interactive conversation."
+                                     : "Execute one prompt request and exit.");
+  RegisterTextOptions(parser, opt, speculative_explicit, command);
   parser.PrintHelp();
 }
 
@@ -770,134 +832,14 @@ void GenerateQwenGpuResponse(
 
 }  // namespace
 
-std::optional<PromptOptions> ParsePromptOptions(
-    std::span<const char* const> args, std::string* error_msg) {
+static std::optional<PromptOptions> ParseTextOptions(
+    std::span<const char* const> args, std::string* error_msg,
+    std::string_view command) {
   PromptOptions opt;
   gufo::cli::ArgParser parser("gufo prompt",
                               "Execute one prompt request and exit.");
-  // Model
-  parser.AddOption("-m", "--model", "PATH", "Path to GGUF model file", "Model",
-                   &opt.model_path);
-  RegisterImageOptions(parser, opt);
-
-  // Prompt & Formatting
-  parser.AddOption("-p", "--prompt", "TEXT", "Direct input prompt text",
-                   "Prompt", &opt.prompt_text);
-  parser.AddOption("-f", "--file", "PATH",
-                   "File path to read input prompt text from", "Prompt",
-                   &opt.prompt_file);
-  parser.AddOption("", "--system", "PROMPT",
-                   "System role instructions prepended to the prompt "
-                   "(default: helpful assistant)",
-                   "Prompt", &opt.system_prompt);
-  parser.AddInverseFlag("", "--raw",
-                        "Disable chat template framing and pass raw tokens",
-                        "Prompt", &opt.use_chat_template);
-  parser.AddInverseFlag("", "--no-display-prompt",
-                        "Suppress echoing the prompt before generated response",
-                        "Prompt", &opt.display_prompt);
-
-  // Sampling
-  parser.AddOption("-n", "--max-tokens", "N",
-                   "Maximum number of new tokens to generate (default: 128)",
-                   "Sampling", &opt.max_tokens);
-  RegisterSamplingOptions(parser, &opt.sampling);
-
-  // Reasoning
-  parser.AddOption("", "--think", "MODE",
-                   "Reasoning mode: on, off, or auto (default: off)",
-                   "Reasoning", &opt.reasoning_mode);
-  parser.AddOption("", "--reasoning-effort", "LEVEL",
-                   "Effort: auto, minimal, low, medium, high, xhigh, or max",
-                   "Reasoning", &opt.reasoning_effort);
-  parser.AddOption("", "--preserve-thinking", "MODE",
-                   "Replay prior reasoning: on, off, or auto", "Reasoning",
-                   &opt.preserve_thinking);
-
-  // Speculative & Hardware
   bool speculative_explicit = false;
-  const auto parse_speculative_backend =
-      [&opt, &speculative_explicit](std::string_view, std::string_view value,
-                                    std::string* error) -> bool {
-    speculative_explicit = true;
-    if (value == "off") {
-      opt.speculative_backend.clear();
-    } else if (value == "dspark" || value == "dflash2" || value == "mtp") {
-      opt.speculative_backend = value;
-    } else {
-      if (error != nullptr)
-        *error = "Unknown speculative backend: " + std::string(value);
-      return false;
-    }
-    return true;
-  };
-  parser.AddCustomOption(
-      "", "--speculative", "MODE",
-      "Draft backend: dspark (DeepSeek V4 Flash), dflash2, mtp, or off",
-      "Speculative", parse_speculative_backend);
-  parser.AddOption("", "--dflash-model", "PATH",
-                   "Path to Qwen DFlash2 GGUF file", "Speculative",
-                   &opt.dflash_model_path);
-  parser.AddOption(
-      "", "--draft-policy", "POLICY",
-      "DFlash2 block length: fixed or adaptive (default: adaptive)",
-      "Speculative", &opt.draft_policy);
-  parser.AddOption("", "--dspark-model", "PATH",
-                   "Path to the DeepSeek V4 Flash DSpark support GGUF file",
-                   "Speculative", &opt.dspark_model_path);
-  parser.AddOption("", "--mtp-model", "PATH",
-                   "Path to quantized Qwen MTP draft head GGUF file",
-                   "Speculative", &opt.mtp_model_path);
-  parser.AddCustomOption(
-      "-d", "--draft-tokens", "N",
-      "Maximum speculative draft tokens evaluated per step (default: 7)",
-      "Speculative",
-      [&opt](std::string_view, std::string_view value,
-             std::string* error) -> bool {
-        std::uint32_t count = 0;
-        const auto [ptr, ec] =
-            std::from_chars(value.data(), value.data() + value.size(), count);
-        if (ec != std::errc{} || ptr != value.data() + value.size() ||
-            count == 0) {
-          if (error != nullptr) {
-            *error = "Invalid integer for draft-tokens: " + std::string(value);
-          }
-          return false;
-        }
-        opt.draft_tokens = count;
-        return true;
-      });
-
-  parser.AddCustomOption(
-      "", "--min-draft-tokens", "N", "Adaptive draft floor (default: 1)",
-      "Speculative",
-      [&opt](std::string_view, std::string_view value,
-             std::string* error) -> bool {
-        std::uint32_t count = 0;
-        const auto [ptr, ec] =
-            std::from_chars(value.data(), value.data() + value.size(), count);
-        if (ec != std::errc{} || ptr != value.data() + value.size() ||
-            count == 0) {
-          if (error != nullptr) {
-            *error =
-                "Invalid integer for min-draft-tokens: " + std::string(value);
-          }
-          return false;
-        }
-        opt.min_draft_tokens = count;
-        return true;
-      });
-
-
-
-  parser.AddFlag("", "--cpu",
-                 "Force CPU OpenMP execution fallback instead of GPU ROCm",
-                 "Hardware", &opt.force_cpu);
-  parser.AddFlag("-v", "--verbose",
-                 "Print detailed timing, latency breakdown, and tok/s metrics",
-                 "General", &opt.verbose);
-
-  parser.JoinPositionals(&opt.prompt_text);
+  RegisterTextOptions(parser, opt, speculative_explicit, command);
 
   if (!parser.Parse(args, error_msg)) {
     return std::nullopt;
@@ -992,6 +934,11 @@ std::optional<PromptOptions> ParsePromptOptions(
     return std::nullopt;
   }
   return opt;
+}
+
+std::optional<PromptOptions> ParsePromptOptions(
+    std::span<const char* const> args, std::string* error_msg) {
+  return ParseTextOptions(args, error_msg, "prompt");
 }
 
 int RunPrompt(std::span<const char* const> args) {
@@ -1234,7 +1181,7 @@ int RunPrompt(std::span<const char* const> args) {
 
 int RunChat(std::span<const char* const> args) {
   std::string parse_err;
-  const auto opt_res = ParsePromptOptions(args, &parse_err);
+  const auto opt_res = ParseTextOptions(args, &parse_err, "chat");
   if (!opt_res.has_value()) {
     if (!parse_err.empty()) {
       std::cerr << "Error: " << parse_err << "\n";
@@ -1246,17 +1193,6 @@ int RunChat(std::span<const char* const> args) {
   }
 
   const auto& opt = *opt_res;
-  if (!opt.use_chat_template) {
-    std::cerr << "Interactive chat requires chat framing; use prompt --raw for "
-                 "raw text\n";
-    return 2;
-  }
-  if (!opt.prompt_text.empty() || !opt.prompt_file.empty() ||
-      !opt.display_prompt) {
-    std::cerr << "Interactive chat reads prompts from stdin; use prompt for "
-                 "--prompt, --file, --no-display-prompt, or positional input\n";
-    return 2;
-  }
   if (opt.model_path.empty()) {
     std::cout << "gufo chat: interactive conversation mode\n"
               << "(Specify --model <PATH.gguf> to load model weights)\n";

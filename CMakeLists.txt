@@ -266,29 +266,33 @@ if(ENGINE_ENABLE_HIP)
     gufo_qwen38_flash_next)
 endif()
 
-add_executable(gufo
-  src/cli/main.cpp
-  src/cli/eval/eval.cpp
-  src/cli/transcribe/transcribe.cpp
-  src/cli/video/video.cpp
-  src/cli/serve/serve.cpp
+add_library(gufo_http STATIC
   src/cli/serve/audio_asr_api.cpp
   src/cli/serve/asr_service.cpp
   src/cli/serve/audio_tts_api.cpp
   src/cli/serve/tts_service.cpp
   src/cli/serve/video_api.cpp
   src/cli/serve/video_jobs.cpp
+  src/cli/serve/http_server.cpp
+  src/cli/serve/logging.cpp
+  src/cli/serve/openai_chat.cpp
+)
+target_link_libraries(gufo_http PUBLIC gufo_core gufo_qwen3_tts gufo_qwen3_asr)
+
+add_executable(gufo
+  src/cli/main.cpp
+  src/cli/eval/eval.cpp
+  src/cli/transcribe/transcribe.cpp
+  src/cli/video/video.cpp
+  src/cli/serve/serve.cpp
   src/cli/serve/continuation_cache.cpp
   src/cli/serve/continuation_disk_store.cpp
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
   src/cli/serve/inference_backend.cpp
-  src/cli/serve/http_server.cpp
-  src/cli/serve/logging.cpp
-  src/cli/serve/openai_chat.cpp
   src/eval/http_client.cpp
 )
-target_link_libraries(gufo PRIVATE gufo_diagnostics gufo_core gufo_llm_cli CURL::libcurl)
+target_link_libraries(gufo PRIVATE gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
 target_compile_definitions(gufo PRIVATE
   GUFO_VERSION="${GUFO_VERSION}"
   GUFO_EVAL_SOURCE_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json"
@@ -396,8 +400,8 @@ if (BUILD_TESTING)
   set_tests_properties(gufo_transcribe_help PROPERTIES
     LABELS "cpu;server;cli;qwen3-asr")
 
-  add_test(NAME gufo_serve_asr_help COMMAND gufo serve asr --help)
-  set_tests_properties(gufo_serve_asr_help PROPERTIES
+  add_test(NAME gufo_serve_audio_help COMMAND gufo serve audio --help)
+  set_tests_properties(gufo_serve_audio_help PROPERTIES
     LABELS "cpu;server;cli;qwen3-asr")
 
   add_test(NAME strix_serve_help COMMAND gufo serve --help)
@@ -421,6 +425,16 @@ if (BUILD_TESTING)
   add_test(NAME openai_chat_test COMMAND openai_chat_test)
   set_tests_properties(openai_chat_test PROPERTIES
     LABELS "cpu;server;api;openai;streaming;tools")
+
+  add_executable(http_server_test tests/cli/http_server_test.cpp)
+  target_link_libraries(http_server_test PRIVATE gufo_http)
+  add_test(NAME http_server_test COMMAND http_server_test)
+  set_tests_properties(http_server_test PROPERTIES LABELS "cpu;server;http" TIMEOUT 30)
+
+  add_test(NAME serve_cli_test
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli/serve_test.py
+      $<TARGET_FILE:gufo>)
+  set_tests_properties(serve_cli_test PROPERTIES LABELS "cpu;server;cli" TIMEOUT 30)
 
   add_subdirectory(tests/models/deepseek_v4_flash)
   add_subdirectory(tests/models/qwen38_flash_next)

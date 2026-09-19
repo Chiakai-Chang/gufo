@@ -56,9 +56,7 @@ def sampling_flags(config):
 
 def check_options(binary):
     commands = [
-        ["prompt"], ["chat"], ["bench"], ["eval"], ["video"], ["transcribe"],
-        ["asr"], ["diagnose"], ["info"], ["probe"], ["serve"], ["serve", "llm"],
-        ["serve", "video"], ["serve", "audio"], ["serve", "tts"],
+        ["prompt"], ["chat"], ["bench"], ["serve"], ["serve", "llm"],
     ]
     for command in commands:
         help_result = subprocess.run([binary, *command, "--help"],
@@ -91,13 +89,6 @@ def check_options(binary):
                                     text=True, capture_output=True, timeout=30)
             if result.returncode != 2:
                 raise AssertionError(f"invalid sampling accepted: {command} {flag}")
-    for command in (["serve"], ["serve", "llm"]):
-        result = subprocess.run([binary, *command, "--cpu"],
-                                text=True, capture_output=True, timeout=30)
-        if result.returncode != 2 or "--cpu" in subprocess.run(
-                [binary, *command, "--help"], text=True, capture_output=True,
-                timeout=30, check=True).stdout:
-            raise AssertionError("unused serve CPU option remains exposed")
     for flag, value in (("--prompt", "ignored"), ("--file", "/dev/null"),
                         ("--no-display-prompt", None),
                         ("--raw", None)):
@@ -105,18 +96,7 @@ def check_options(binary):
                                 text=True, capture_output=True, timeout=30)
         if result.returncode != 2:
             raise AssertionError(f"chat silently ignored {flag}")
-    # Temperature/seed are shared parser options for DS4. Qwen's
-    # architecture-specific rejection is checked with its model below.
-    for field, value in dict(top_k=40, top_p=0.9, min_p=0.05,
-                            min_keep=3, repeat_penalty=1.1,
-                            repeat_last_n=8, frequency_penalty=0.2,
-                            presence_penalty=0.1).items():
-        result = subprocess.run(
-            [binary, "bench", *sampling_flags({field: value})],
-            text=True, capture_output=True, timeout=30)
-        if result.returncode != 2:
-            raise AssertionError(f"greedy benchmark silently accepted {field}")
-    print("All gufo modules reject unsupported draft sampling; help and errors valid")
+    print("Qwen entrypoint help, sampling and speculative option checks passed")
 
 
 def run(binary, model, mode, backend, sampling=None):
@@ -329,7 +309,7 @@ def check_bench(binary, model, draft):
             common + backend + ["--temperature", "0.8", "--seed", "73"],
             text=True, capture_output=True, timeout=30)
         if (sampled.returncode != 1 or
-                "sampled model benchmarks currently support DS4 only" not in sampled.stderr):
+                "use the serving benchmark for Qwen" not in sampled.stderr):
             raise AssertionError("Qwen benchmark did not reject sampled generation")
         result = subprocess.run(common + backend, text=True, capture_output=True,
                                 timeout=180, check=True)

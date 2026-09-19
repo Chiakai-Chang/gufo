@@ -223,6 +223,10 @@ void TestStreamingIsLive() {
          "Usage reports transparently reused prompt tokens");
   Expect(output.find(R"("prefill_tokens":2)") != std::string::npos,
          "Usage reports actual prefill work");
+  Expect(output.find(R"("prompt_n":2)") != std::string::npos,
+         "Timings exclude cached tokens");
+  Expect(output.find(R"("prompt_tokens_per_second":800)") != std::string::npos,
+         "Usage throughput counts only tokens actually prefilled");
   Expect(output.find(R"("prefill_ms":2.5)") != std::string::npos,
          "Usage reports server prefill time");
   Expect(output.find(R"("decode_ms":4)") != std::string::npos,
@@ -235,6 +239,35 @@ void TestStreamingIsLive() {
       "Usage reports the executed serving plan");
   Expect(output.ends_with("data: [DONE]\n\n"),
          "Stream terminates with the OpenAI DONE sentinel");
+}
+
+void TestCachedPrefillMetrics() {
+  FakeBackend backend;
+  backend.pieces = {"ok"};
+  const auto response = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})"),
+      backend);
+  Expect(response.status == 200, "Cached non-streaming response succeeds");
+  const auto body = gufo::server::json::parse(response.body);
+  const auto* usage = body.find("usage");
+  const auto* timings = body.find("timings");
+  Expect(usage && usage->member_size("prompt_tokens") == 7,
+         "Token usage includes cached tokens");
+  Expect(timings && timings->member_size("prompt_n") == 2 &&
+             timings->member_double("prompt_per_second") == 800 &&
+             timings->member_double("prompt_per_token_ms") == 1.25,
+         "Non-streaming timings report executed prefill work");
+
+  gufo::server::TextGenerationBackend::Result cached;
+  cached.prompt_tokens = cached.cached_prompt_tokens = 1024;
+  cached.prefill_ms = 0.01;
+  Expect(gufo::server::PrefillTokensPerSecond(cached) == 0,
+         "Full cache hits cannot report artificial prefill throughput");
+  cached.prefill_tokens = 10;
+  cached.prefill_ms = 0;
+  Expect(gufo::server::PrefillTokensPerSecond(cached) == 0,
+         "Untimed work does not divide by zero");
 }
 
 void TestToolCallsAreStructured() {
@@ -650,6 +683,7 @@ void TestImagePartsRetainOrderAndIdentity() {
 
 int main() {
   TestStreamingIsLive();
+  TestCachedPrefillMetrics();
   TestBackendSamplingDefaults();
   TestAllSamplingControlsReachBackend();
   TestUnsupportedSamplingControlsAreRejected();

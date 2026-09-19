@@ -30,12 +30,17 @@ from typing import Any, Callable, Iterable
 
 BENCHMARK_SCHEMA = "gufo.serving-benchmark.v1"
 ENDPOINT_PROFILES = ("gufo", "openai")
+
 DEFAULT_PROMPT = (
     "Explain how a bounded continuous-serving scheduler can preserve "
     "single-request latency while allowing several independent requests to "
     "make fair progress. Discuss prefill, decode, queueing, and cancellation "
     "in concrete technical terms. Continue until the output limit is reached."
 )
+
+def _authorization_headers() -> dict[str, str]:
+    key = os.environ.get("OPENAI_API_KEY", "")
+    return {"Authorization": f"Bearer {key}"} if key else {}
 
 
 @dataclass(frozen=True)
@@ -341,6 +346,7 @@ def run_request(
         base_url.rstrip("/") + "/v1/chat/completions",
         data=body,
         headers={
+            **_authorization_headers(),
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
             "X-Client-ID": client_id,
@@ -1299,7 +1305,7 @@ def run_corpus_benchmark(
 def discover_model(base_url: str, timeout_seconds: float) -> str:
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/models",
-        headers={"Accept": "application/json"},
+        headers={**_authorization_headers(), "Accept": "application/json"},
     )
     try:
         with urllib.request.urlopen(

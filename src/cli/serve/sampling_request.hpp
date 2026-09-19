@@ -105,11 +105,7 @@ inline std::optional<SamplingRequestError> ParseSamplingConfig(
         field.starts_with("dry_") || field == "top_n_sigma" ||
         field == "logit_bias") {
       return SamplingRequestError{
-          .message =
-              "request field '" + field + "' is not supported" +
-              (draft_control ? "; DFlash2 uses the target temperature and its "
-                               "trained draft selector"
-                             : ""),
+          .message = "request field '" + field + "' is not supported",
           .code = "unsupported_sampling",
       };
     }

@@ -255,7 +255,7 @@ int RunDiagnose(std::span<const char* const> args) {
   }
   if (start_idx < args.size()) {
     const std::string_view cmd = args[start_idx];
-    if (cmd == "diagnose" || cmd == "probe" || cmd == "info") {
+    if (cmd == "diagnose" || cmd == "probe") {
       start_idx++;
     }
   }

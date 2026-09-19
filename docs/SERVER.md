@@ -296,9 +296,8 @@ process:
   --asr-model /var/llms/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/<revision>
 ```
 
-At least one of `--tts-model` or `--asr-model` is required. A bare `--model`
-and `--context` are backward-compatible aliases for `--tts-model` and
-`--tts-context`. `--tts-context` (default 4096) and `--asr-context`
+At least one of `--tts-model` or `--asr-model` is required.
+`--tts-context` (default 4096) and `--asr-context`
 (default 1024) size each service independently. Both checkpoints load eagerly at startup, so running
 them co-resident costs the sum of their weights.
 
@@ -550,27 +549,27 @@ limits in response metadata.
 
 ## Authentication and Exposure
 
-Default binding should be loopback-only. Optional bearer-token authentication
-uses:
+The server binds to `127.0.0.1` by default. Set `--api-key` to require:
 
 ```text
 Authorization: Bearer <local-token>
 ```
 
-Remote binding requires an explicit configuration flag. TLS should normally be
-terminated by a local reverse proxy, though native TLS may be added later.
+Authentication covers every route, including health, metrics, audio, and video.
+CORS preflight (`OPTIONS`) does not require credentials. Select the listen
+address with `--host`; it must be an IPv4 address. TLS termination belongs in
+a reverse proxy.
 
 Prompt and generated text logging is disabled by default.
 
 Tool definitions and generated tool calls are treated as data. `gufo`
 never executes tools, shell commands, URLs, or generated code.
 
-Browser access requires an explicit CORS origin allowlist. Do not enable a
-wildcard origin on a remotely reachable authenticated server.
+The HTTP transport currently uses a wildcard CORS origin and the same listener
+and API key for inference and metrics.
 
-Metrics and future administrative endpoints may use a separate loopback
-listener or a distinct administrative bearer token. They are not implicitly
-exposed merely because the inference listener is remote.
+`gufo eval` and `tools/serving/gufo-serving-bench.py` send `OPENAI_API_KEY`
+as the bearer credential when it is set.
 
 ## Backpressure and Cancellation
 

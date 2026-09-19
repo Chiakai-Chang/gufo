@@ -990,44 +990,6 @@ const char* FinishReason(const TextGenerationBackend::Result& result,
   return "stop";
 }
 
-json::Value Timings(const TextGenerationBackend::Result& result) {
-  json::Value timings = json::Value::object();
-  const double prompt_per_second =
-      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
-          ? (static_cast<double>(result.prompt_tokens) /
-             (result.prefill_ms / 1000.0))
-          : 0.0;
-  const double predicted_per_second =
-      (result.decode_ms > 0.0 && result.completion_tokens > 0)
-          ? (static_cast<double>(result.completion_tokens) /
-             (result.decode_ms / 1000.0))
-          : 0.0;
-  const double prompt_per_token_ms =
-      (result.prompt_tokens > 0)
-          ? (result.prefill_ms / static_cast<double>(result.prompt_tokens))
-          : 0.0;
-  const double predicted_per_token_ms =
-      (result.completion_tokens > 0)
-          ? (result.decode_ms / static_cast<double>(result.completion_tokens))
-          : 0.0;
-
-  timings["prompt_n"] = result.prompt_tokens;
-  timings["prompt_ms"] = result.prefill_ms;
-  timings["prompt_per_token_ms"] = prompt_per_token_ms;
-  timings["prompt_per_second"] = prompt_per_second;
-  timings["predicted_n"] = result.completion_tokens;
-  timings["predicted_ms"] = result.decode_ms;
-  timings["predicted_per_token_ms"] = predicted_per_token_ms;
-  timings["predicted_per_second"] = predicted_per_second;
-  timings["cache_n"] = result.cached_prompt_tokens;
-  timings["cache_restore_ms"] = result.cache_restore_ms;
-  timings["cache_snapshot_ms"] = result.cache_snapshot_ms;
-  timings["cache_disk_write_ms"] = result.cache_disk_write_ms;
-  timings["draft_n"] = result.draft_tokens;
-  timings["draft_n_accepted"] = result.draft_accepted_tokens;
-  return timings;
-}
-
 json::Value Metrics(const TextGenerationBackend::Result& result) {
   json::Value metrics = json::Value::object();
   metrics["time_to_first_token_ms"] = result.ttft_ms;
@@ -1061,11 +1023,7 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   prompt_details["cached_tokens"] = result.cached_prompt_tokens;
   usage["prompt_tokens_details"] = std::move(prompt_details);
 
-  const double prompt_per_second =
-      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
-          ? (static_cast<double>(result.prompt_tokens) /
-             (result.prefill_ms / 1000.0))
-          : 0.0;
+  const double prompt_per_second = PrefillTokensPerSecond(result);
   const double predicted_per_second =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)
           ? (static_cast<double>(result.completion_tokens) /
@@ -1330,7 +1288,7 @@ HttpResponse NonStreamingResponse(
   choices.push_back(std::move(choice));
   response["choices"] = std::move(choices);
   response["usage"] = Usage(result);
-  response["timings"] = Timings(result);
+  response["timings"] = GenerationTimings(result);
   response["metrics"] = Metrics(result);
   RecordServerMetrics(result);
 
@@ -1340,11 +1298,7 @@ HttpResponse NonStreamingResponse(
          << ", max_inter_token;dur=" << result.max_inter_token_ms;
 
   std::ostringstream details;
-  const double prompt_per_second =
-      (result.prefill_ms > 0.0 && result.prompt_tokens > 0)
-          ? (static_cast<double>(result.prompt_tokens) /
-             (result.prefill_ms / 1000.0))
-          : 0.0;
+  const double prompt_per_second = PrefillTokensPerSecond(result);
   const double tok_per_sec =
       (result.decode_ms > 0.0 && result.completion_tokens > 0)
           ? (static_cast<double>(result.completion_tokens) /
@@ -1476,7 +1430,7 @@ HttpResponse StreamingResponse(
               json::Value usage_chunk = BaseChunk(id, created, model);
               usage_chunk["choices"] = json::Value::array();
               usage_chunk["usage"] = Usage(result);
-              usage_chunk["timings"] = Timings(result);
+              usage_chunk["timings"] = GenerationTimings(result);
               usage_chunk["metrics"] = Metrics(result);
               RecordServerMetrics(result);
               if (!writer(Sse(usage_chunk))) {

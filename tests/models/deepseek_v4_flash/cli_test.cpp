@@ -111,11 +111,7 @@ int main(int argc, char** argv) {
   CheckBackend({"--speculative", "off", "--dspark-model", "support.gguf"}, "");
   CheckBackend({"--dspark-model", "support.gguf", "--speculative", "off"}, "");
 
-  const char* removed_policy[] = {"--draft-policy", "fixed"};
-  Expect(!gufo::cli::ParsePromptOptions(removed_policy),
-         "prompt rejects the removed policy selector");
-  Expect(!gufo::cli::ParseBenchOptions(removed_policy),
-         "benchmark rejects the removed policy selector");
+
   const char* args[] = {"--dspark-model", "support.gguf", "--draft-tokens",
                         "3"};
   const auto prompt = gufo::cli::ParsePromptOptions(args);

@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 
 import json
+import io
+import os
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -341,6 +344,31 @@ def request_with(fake, **overrides):
         )
     finally:
         serving_bench.urllib.request.urlopen = original_urlopen
+
+
+for api_key in ("", "benchmark-test-secret"):
+    with patch.dict(os.environ, {"OPENAI_API_KEY": api_key}):
+        expected = f"Bearer {api_key}" if api_key else None
+
+        def authenticated_completion(request, timeout):
+            check(request.get_header("Authorization") == expected,
+                  "generation uses the configured bearer credential")
+            return fake_urlopen(request, timeout)
+
+        observation = request_with(authenticated_completion)
+        if api_key:
+            check(api_key not in json.dumps(observation.public()),
+                  "credentials are not included in benchmark observations")
+
+        def authenticated_discovery(request, timeout):
+            check(request.get_header("Authorization") == expected,
+                  "model discovery uses the configured bearer credential")
+            return io.BytesIO(b'{"data":[{"id":"test-model"}]}')
+
+        with patch.object(serving_bench.urllib.request, "urlopen",
+                          authenticated_discovery):
+            check(serving_bench.discover_model("https://private.example", 5)
+                  == "test-model", "authenticated model discovery succeeds")
 
 
 plain = request_with(

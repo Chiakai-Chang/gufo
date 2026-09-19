@@ -98,7 +98,7 @@ int run(std::span<const char* const> args) {
     if (sub == "video") {
       return gufo::cli::RunVideo(help_flag);
     }
-    if (sub == "transcribe" || sub == "asr") {
+    if (sub == "transcribe") {
       return gufo::cli::RunTranscribe(help_flag);
     }
     if (sub == "chat") {
@@ -107,7 +107,7 @@ int run(std::span<const char* const> args) {
     if (sub == "probe") {
       return gufo::cli::RunProbe(help_flag);
     }
-    if (sub == "diagnose" || sub == "info") {
+    if (sub == "diagnose") {
       return gufo::cli::RunDiagnose(help_flag);
     }
     std::cerr << "Error: unknown help topic '" << sub << "'\n";
@@ -119,7 +119,7 @@ int run(std::span<const char* const> args) {
     return gufo::cli::RunProbe(options.subspan(1));
   }
 
-  if (first_arg == "diagnose" || first_arg == "info") {
+  if (first_arg == "diagnose") {
     return gufo::cli::RunDiagnose(options);
   }
 
@@ -139,7 +139,7 @@ int run(std::span<const char* const> args) {
     return gufo::cli::RunVideo(options.subspan(1));
   }
 
-  if (first_arg == "transcribe" || first_arg == "asr") {
+  if (first_arg == "transcribe") {
     return gufo::cli::RunTranscribe(options.subspan(1));
   }
 

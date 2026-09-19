@@ -77,11 +77,34 @@ void TestHelpFormatting() {
   assert(help.find("--interactive") != std::string::npos);
 }
 
+void TestUnexpectedPositionalsAndParserReuse() {
+  gufo::cli::ArgParser parser("test");
+  std::string text;
+  bool verbose = false;
+  parser.AddOption("", "--text", "TEXT", "Text", "Input", &text);
+  parser.AddFlag("-v", "--verbose", "Verbose", "General", &verbose);
+  std::string error;
+  const char* unexpected[] = {"typo"};
+  assert(!parser.Parse(unexpected, &error));
+  assert(error.find("typo") != std::string::npos);
+  const char* help[] = {"--help"};
+  assert(parser.Parse(help, &error));
+  assert(parser.IsHelpRequested() && error.empty());
+  const char* value[] = {"--text", "-v"};
+  assert(parser.Parse(value, &error));
+  assert(!parser.IsHelpRequested());
+  assert(text == "-v" && !verbose);
+  const char* inline_value[] = {"--text=audio"};
+  assert(parser.Parse(inline_value, &error));
+  assert(text == "audio");
+}
+
 int main() {
   TestBasicFlagsAndOptions();
   TestListParsing();
   TestPositionals();
   TestHelpFormatting();
+  TestUnexpectedPositionalsAndParserReuse();
   std::cout << "All ArgParser tests passed.\n";
   return 0;
 }

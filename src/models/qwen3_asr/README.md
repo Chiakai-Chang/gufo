@@ -73,8 +73,8 @@ resampler for the model's 16 kHz frontend.
 An OpenAI-compatible endpoint is also available:
 
 ```sh
-./result/bin/gufo serve asr \
-  --model /var/llms/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e70fe206f11671096ffdd38061171dd6e5
+./result/bin/gufo serve audio \
+  --asr-model /var/llms/huggingface/hub/models--Qwen--Qwen3-ASR-1.7B/snapshots/7278e1e70fe206f11671096ffdd38061171dd6e5
 
 curl -sS http://127.0.0.1:8080/v1/audio/transcriptions \
   -F file=@/tmp/qwen3-asr-en.wav \

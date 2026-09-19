@@ -1,5 +1,7 @@
 #include "src/cli/serve/serve.hpp"
 
+#include <arpa/inet.h>
+
 #include <charconv>
 #include <chrono>
 #include <cmath>
@@ -278,9 +280,7 @@ void PrintServeHelp(std::string_view program_name,
     return;
   }
 
-  if (subcommand == "audio" || subcommand == "tts") {
-    std::filesystem::path default_model;
-    std::size_t default_context = 4096;
+  if (subcommand == "audio") {
     std::filesystem::path tts_model;
     std::filesystem::path asr_model;
     std::size_t tts_context_tokens = 4096;
@@ -290,14 +290,6 @@ void PrintServeHelp(std::string_view program_name,
         std::string(program_name) + " serve audio",
         "Start the Qwen3 audio HTTP server (Qwen3-TTS synthesis, Qwen3-ASR "
         "transcription, or both).");
-    parser.AddOption("-m", "--model", "DIR",
-                     "Qwen3-TTS 12Hz 1.7B model directory (alias for "
-                     "--tts-model)",
-                     "Model", &default_model);
-    parser.AddOption(
-        "-c", "--context", "N",
-        "Qwen3-TTS context capacity (alias for --tts-context, default: 4096)",
-        "Model", &default_context);
     parser.AddOption("", "--tts-model", "DIR",
                      "Qwen3-TTS 12Hz 1.7B model directory", "Model",
                      &tts_model);
@@ -495,9 +487,7 @@ void PrintServeHelp(std::string_view program_name,
       << "      --max-request-bytes <N>\n"
       << "                         Maximum HTTP request body bytes (default: "
          "8388608)\n"
-      << "      --api-key <KEY>    Optional Bearer authorization API key "
-         "(TODO: "
-         "auth middleware)\n"
+      << "      --api-key <KEY>    Require Bearer authorization for requests\n"
       << "  -v, --verbose          Print detailed server metrics and request "
          "traces\n"
       << "  -h, --help             Print help\n";
@@ -546,99 +536,61 @@ int RunServe(std::span<const char* const> args) {
   std::string api_key;
   bool verbose = false;
 
-  // Split into server-level options and modality subcommand
-  std::vector<const char*> server_args;
-  std::string subcommand;
-  std::vector<const char*> sub_args;
-
-  // Server options bind to the server no matter which side of the subcommand
-  // they appear on: `gufo serve --port 8099 audio -m DIR` and
-  // `gufo serve audio -m DIR --port 8099` are equivalent. No modality
-  // subcommand defines a colliding short flag (-i/-p/-j/-v are server-only).
-  //
-  // Classification is positional and does not know which subcommand options
-  // take a value, so a subcommand option whose *value* is spelled exactly like
-  // a server flag (`--system -v`) would bind that value to the server. Use
-  // `--system=-v` for such values.
-  const auto is_server_value_option = [](std::string_view arg) {
-    return arg == "-i" || arg == "--host" || arg == "-p" || arg == "--port" ||
-           arg == "-j" || arg == "--sessions" || arg == "--api-key" ||
-           arg == "--max-connections" || arg == "--max-request-bytes";
+  // Identify the modality only after leading server options. The selected
+  // parser consumes every option together, so --served-model-name -v and
+  // --model audio cannot be mistaken for server flags or subcommands.
+  ArgParser server_parser("gufo serve");
+  const auto add_server_options = [&](ArgParser& parser) {
+    AddServerOptions(parser, &host, &port, &session_count, &max_connections,
+                     &max_request_body_bytes, &api_key, &verbose);
   };
-  const auto is_server_inline_option = [](std::string_view arg) {
-    return arg.starts_with("-i=") || arg.starts_with("--host=") ||
-           arg.starts_with("-p=") || arg.starts_with("--port=") ||
-           arg.starts_with("-j=") || arg.starts_with("--sessions=") ||
-           arg.starts_with("--api-key=") ||
-           arg.starts_with("--max-connections=") ||
-           arg.starts_with("--max-request-bytes=");
-  };
-  const auto is_server_flag = [](std::string_view arg) {
-    return arg == "-v" || arg == "--verbose";
-  };
-
+  add_server_options(server_parser);
+  std::string subcommand = "llm";
+  std::vector<const char*> sub_args(args.begin(), args.end());
   for (std::size_t i = 0; i < args.size(); ++i) {
     const std::string_view arg = args[i];
-    if (subcommand.empty()) {
-      if (arg == "llm" || arg == "video" || arg == "audio" || arg == "tts") {
-        subcommand = arg;
-        continue;
+    const auto equals = arg.find('=');
+    const auto* option = server_parser.FindOption(arg.substr(0, equals));
+    if (option != nullptr) {
+      if (!option->is_flag && equals == std::string_view::npos) {
+        ++i;
       }
-      if (arg == "asr" || arg == "stt") {
-        // Removed in favor of the single audio server. Without this the token
-        // falls through as an LLM positional and fails as a bad GGUF path.
-        std::cerr << "Error: 'gufo serve asr' has been replaced by the audio "
-                     "server.\n"
-                  << "Use: gufo serve audio --asr-model <DIR>\n";
+      continue;
+    }
+    if (arg == "llm" || arg == "video" || arg == "audio") {
+      subcommand = arg;
+      sub_args.erase(sub_args.begin() + static_cast<std::ptrdiff_t>(i));
+    } else if (arg == "--help" || arg == "-h" || arg == "help") {
+      const std::string_view topic =
+          arg == "help" && i + 1 < args.size() ? args[i + 1] : "";
+      if (!topic.empty() && topic != "llm" && topic != "video" &&
+          topic != "audio") {
+        std::cerr << "Error: unknown serve command '" << topic << "'\n";
         return 2;
       }
-      if (arg == "help") {
-        if (i + 1 < args.size()) {
-          PrintServeHelp("gufo", args[i + 1]);
-        } else {
-          PrintServeHelp("gufo");
-        }
-        return 0;
-      }
-      if (arg == "-h" || arg == "--help") {
-        PrintServeHelp("gufo");
-        return 0;
-      }
+      PrintServeHelp("gufo", topic);
+      return 0;
     }
-    if (is_server_value_option(arg)) {
-      server_args.push_back(args[i]);
-      if (i + 1 < args.size()) {
-        server_args.push_back(args[++i]);
-      }
-      continue;
-    }
-    if (is_server_inline_option(arg) || is_server_flag(arg)) {
-      server_args.push_back(args[i]);
-      continue;
-    }
-    // Anything else belongs to the modality subcommand, which for the bare
-    // `gufo serve -m model.gguf` form defaults to llm.
-    sub_args.push_back(args[i]);
+    break;
   }
-
-  // Parse server options
-  gufo::cli::ArgParser server_parser(
-      "gufo serve", "Start the OpenAI-compatible HTTP server.");
-  AddServerOptions(server_parser, &host, &port, &session_count,
-                   &max_connections, &max_request_body_bytes, &api_key,
-                   &verbose);
-
+  const auto valid_server_options = [&] {
+    in_addr address{};
+    if (::inet_pton(AF_INET, host.c_str(), &address) != 1) {
+      std::cerr << "Error: --host must be an IPv4 address\n";
+      return false;
+    }
+    if (port < 0 || port > 65535) {
+      std::cerr << "Error: --port must be between 0 and 65535\n";
+      return false;
+    }
+    if (session_count == 0 || max_connections == 0 ||
+        max_request_body_bytes == 0) {
+      std::cerr << "Error: server limits must be positive\n";
+      return false;
+    }
+    return true;
+  };
   std::string parse_err;
-  if (!server_parser.Parse(server_args, &parse_err)) {
-    std::cerr << "Error: " << parse_err << "\n";
-    PrintServeHelp("gufo");
-    return 2;
-  }
-  if (session_count == 0 || max_connections == 0 ||
-      max_request_body_bytes == 0) {
-    std::cerr << "Error: server limits must be positive\n";
-    return 2;
-  }
 
   std::shared_ptr<server::InferenceBackend> backend;
   std::shared_ptr<server::VideoJobService> video_jobs;
@@ -666,6 +618,7 @@ int RunServe(std::span<const char* const> args) {
                            "Completed-artifact TTL in seconds", "Storage",
                            &video_ttl_seconds);
 
+    add_server_options(video_parser);
     if (!video_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
       PrintServeHelp("gufo", "video");
@@ -674,6 +627,9 @@ int RunServe(std::span<const char* const> args) {
     if (video_parser.IsHelpRequested()) {
       PrintServeHelp("gufo", "video");
       return 0;
+    }
+    if (!valid_server_options()) {
+      return 2;
     }
 
     if (video_ttl_seconds == 0 ||
@@ -707,16 +663,13 @@ int RunServe(std::span<const char* const> args) {
                 << video_jobs->initialization_error() << '\n';
       return 1;
     }
-  } else if (subcommand == "audio" || subcommand == "tts") {
+  } else if (subcommand == "audio") {
     // One audio server hosts Qwen3-TTS synthesis, Qwen3-ASR transcription, or
     // both: HttpServer already dispatches /v1/audio/speech and
     // /v1/audio/transcriptions from independent services. Each service is
-    // selected by naming its checkpoint; a bare --model/--context is a
-    // backward-compatible alias for the TTS pair.
+    // selected by naming its checkpoint.
     const std::string_view help_topic = "audio";
 
-    std::filesystem::path default_model;
-    std::size_t default_context = 4096;
     std::filesystem::path tts_model;
     std::filesystem::path asr_model;
     std::size_t tts_context_tokens = 4096;
@@ -726,14 +679,6 @@ int RunServe(std::span<const char* const> args) {
         "gufo serve audio",
         "Start the Qwen3 audio HTTP server (Qwen3-TTS synthesis, Qwen3-ASR "
         "transcription, or both).");
-    audio_parser.AddOption(
-        "-m", "--model", "DIR",
-        "Qwen3-TTS 12Hz 1.7B model directory (alias for --tts-model)", "Model",
-        &default_model);
-    audio_parser.AddOption(
-        "-c", "--context", "N",
-        "Qwen3-TTS context capacity (alias for --tts-context, default: 4096)",
-        "Model", &default_context);
     audio_parser.AddOption("", "--tts-model", "DIR",
                            "Qwen3-TTS 12Hz 1.7B model directory", "Model",
                            &tts_model);
@@ -805,6 +750,7 @@ int RunServe(std::span<const char* const> args) {
           return true;
         });
 
+    add_server_options(audio_parser);
     if (!audio_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
       PrintServeHelp("gufo", help_topic);
@@ -814,18 +760,8 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("gufo", help_topic);
       return 0;
     }
-
-    // --model/--context are aliases for the TTS pair. Supplying both
-    // spellings for the same service is ambiguous.
-    if (!default_model.empty()) {
-      if (!tts_model.empty()) {
-        std::cerr << "Error: --model conflicts with --tts-model\n";
-        return 2;
-      }
-      tts_model = default_model;
-    }
-    if (default_context != 4096U) {
-      tts_context_tokens = default_context;
+    if (!valid_server_options()) {
+      return 2;
     }
 
     if (!BuildVoicePresets(voice_specs, voice_text_specs, voice_lang_specs,
@@ -1015,6 +951,7 @@ int RunServe(std::span<const char* const> args) {
         "Single-operation RAM staging byte limit (default: 536870912)", "Cache",
         &cache_disk_staging_bytes);
 
+    add_server_options(llm_parser);
     if (!llm_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
       PrintServeHelp("gufo", "llm");
@@ -1023,6 +960,9 @@ int RunServe(std::span<const char* const> args) {
     if (llm_parser.IsHelpRequested()) {
       PrintServeHelp("gufo", "llm");
       return 0;
+    }
+    if (!valid_server_options()) {
+      return 2;
     }
     bool sampling_valid = true;
     try {
@@ -1150,9 +1090,10 @@ int RunServe(std::span<const char* const> args) {
 
   server::HttpServer server(
       host, port, backend, video_jobs, tts, asr,
-      server::HttpServerLimits{
+      server::HttpServerOptions{
           .max_request_body_bytes = max_request_body_bytes,
           .max_connections = max_connections,
+          .api_key = std::move(api_key),
       });
   std::string err;
   if (!server.start(&err)) {
