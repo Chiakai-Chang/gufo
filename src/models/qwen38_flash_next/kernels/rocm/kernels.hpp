@@ -160,6 +160,9 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
 
 /// F16 activation rows [batch][k], Q8_0 weights dequantized to F16 in LDS,
 /// F32 accumulation. out is [batch][m]. Unsupported shapes launch nothing.
+bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
+                        std::size_t batch, std::size_t m, std::size_t k,
+                        hipStream_t stream);
 bool DenseF16Gemm(const void* w, const __half* x, float* out, std::size_t batch,
                   std::size_t m, std::size_t k, hipStream_t stream);
 

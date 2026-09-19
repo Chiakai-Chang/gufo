@@ -1147,14 +1147,14 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
       !Dense(l.ssm_alpha_beta, x, s_.alpha_beta, n_tokens, error_msg)) {
     return false;
   }
-  // The epilogue writes the output projection's input directly. Large
-  // SSM batches use F16 activations and reuse the F32 output allocation;
-  // smaller batches keep the tiled Q8 route.
+  // Keep the same activation precision across prefill chunk boundaries.
+  // The F16 epilogue reuses the F32 output allocation. Switching this
+  // projection to Q8 for a short tail changes every subsequent layer.
   const bool tiled = n_tokens > kVecBatch &&
                      l.ssm_out.type == GgmlType::kQ8_0 &&
                      n_tokens <= options_.max_batch;
-  const bool half_output = tiled && n_tokens >= 1024 &&
-                           l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
+  const bool half_output =
+      tiled && l.ssm_out.rows == 2560 && l.ssm_out.cols == 6144;
   auto* out_half =
       half_output ? reinterpret_cast<__half*>(s_.gdn_out) : nullptr;
   GatedDeltaNet(qkv, qkv_stride, z, z_stride, s_.alpha_beta, l.ssm_conv1d.f32(),

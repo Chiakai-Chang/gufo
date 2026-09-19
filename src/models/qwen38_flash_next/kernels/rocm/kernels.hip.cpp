@@ -2645,7 +2645,8 @@ constexpr std::uint32_t kWmmaGqa = kWmmaQueryHeads / kWmmaKvHeads;
 constexpr std::uint32_t kWmmaAttnWidth = kWmmaQueryHeads * kWmmaHeadDim;
 constexpr std::uint32_t kWmmaKvWidth = kWmmaKvHeads * kWmmaHeadDim;
 constexpr std::uint32_t kWmmaHeads = 2;  // query heads per block, divides GQA
-constexpr std::uint32_t kWmmaQueryRows = 32;
+// Sixteen queries keep the causal-tail accumulator in registers.
+constexpr std::uint32_t kWmmaQueryRows = 16;
 constexpr std::uint32_t kWmmaKeys = 16;
 constexpr std::uint32_t kWmmaRatio = 4;
 constexpr std::uint32_t kWmmaKSteps = kWmmaHeadDim / 16;
@@ -2654,7 +2655,7 @@ constexpr std::uint32_t kWmmaKStride = kWmmaHeadDim + 8;
 // Union-mask capacity: one bit per 4-token block, 262,144 tokens of context.
 constexpr std::uint32_t kWmmaMaxMaskWords = 2048;
 
-/// Two row layouts share the kernel. The dense window packs 32 queries x 2
+/// Two row layouts share the kernel. The dense window packs 16 queries x 2
 /// heads (a row block is 16 queries of one head, grid.y over head pairs).
 /// The sparse window packs four queries x twelve heads into three row
 /// blocks without padding, with adjacent blocks covering both KV heads: the key
@@ -2685,7 +2686,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   constexpr std::uint32_t kOTilesPerWave = (kRowBlocks * kWmmaKSteps) / 8;
   constexpr std::uint32_t kSoftmaxLanes = 4;
   constexpr std::uint32_t kVtStride = kKeys + 8;
-  static_assert(kSTiles == (kPackHeads ? 3 : 4), "two waves per S tile");
+  static_assert(kSTiles == (kPackHeads ? 3 : 2), "two waves per S tile");
   static_assert(kOTilesPerWave == 2 * kRowBlocks, "O tiles per wave");
   static_assert(kKeys % 16 == 0 && (kPackHeads || kQueryRows % 16 == 0),
                 "16-row WMMA tiles");
@@ -3117,7 +3118,37 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
 #pragma unroll
         for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
           const v16h p_frag = LoadFrag(&p_lds[(rb * 16) + sub][kb * 16]);
-          o_acc[rb][t] = Wmma(p_frag, v_frag[kb], o_acc[rb][t]);
+          v8f next = Wmma(p_frag, v_frag[kb], o_acc[rb][t]);
+          if constexpr (!kPackHeads) {
+            const std::uint32_t first_key = cur.block[0] * ratio;
+            // WMMA's dot accumulation can change its last bits when zero
+            // probabilities multiply populated future values instead of the
+            // zero padding at a chunk boundary. Accumulate each query's final
+            // partial tile over its visible keys only. Earlier complete tiles
+            // retain the matrix-core path.
+            if (first_key + kKeys - 1 > start_pos + query_start) {
+#pragma unroll
+              for (std::uint32_t i = 0; i < 8; ++i) {
+                const std::uint32_t row = (2 * i) + half_id;
+                const std::uint32_t absolute_query =
+                    start_pos + row_query(rb, row);
+                if (absolute_query < first_key + kKeys - 1) {
+                  float acc = o_acc[rb][t][i];
+                  for (std::uint32_t key = 0;
+                       key < kKeys && first_key + key <= absolute_query;
+                       ++key) {
+                    acc = fmaf(
+                        __half2float(p_lds[(rb * 16) + row][key]),
+                        __half2float(
+                            kv_lds[((dim_tile * 16) + sub) * kVtStride + key]),
+                        acc);
+                  }
+                  next[i] = acc;
+                }
+              }
+            }
+          }
+          o_acc[rb][t] = next;
         }
       }
     }
@@ -4656,14 +4687,16 @@ struct AttentionProjectionOutput {
   const qwen::vision::DeviceRope* rope;
 };
 
-/// Dense F16 WMMA GEMM over Q8_0 weights: block = BM rows x BN tokens, BK
-/// 32-element K blocks per LDS stage, waves = WM row groups x WN token
+/// Dense F16 WMMA GEMM over Q8_0 or F16 weights: block = BM rows x BN tokens,
+/// BK 32-element K blocks per LDS stage, waves = WM row groups x WN token
 /// groups. The codes are dequantized to F16 once per stage as they are
 /// committed to LDS (magic-number F16 construction, exact for a Q8_0 code),
 /// and the activations are F16 rows [batch][k], so the matrix cores
-/// accumulate in F32 with no per-block scaling. y is [batch][m].
+/// accumulate in F32 with no per-block scaling. F16 weights skip decoding
+/// and use the same ordered K16 products. y is [batch][m].
 template<int BM, int BN, int BK, int WM, int WN, int kRowGroup = 1,
-         bool kHcMix = false, bool kSsmConv = false, bool kAttention = false>
+         bool kHcMix = false, bool kSsmConv = false, bool kAttention = false,
+         bool kHalfWeights = false>
 __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     const void* __restrict__ w, const __half* __restrict__ x,
     float* __restrict__ y, std::size_t batch, std::size_t m, std::size_t k,
@@ -4688,7 +4721,10 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   // stride) covers all bank groups.
   constexpr int kLdsChunks = BK * (BM + BN) * 4;
   static_assert(kLdsChunks * 16 >= 8 * 512 * 4, "epilogue transposes 16 KB");
-  __shared__ __attribute__((aligned(16))) uint4 s_lds[kLdsChunks];
+  constexpr int kTransposeChunks = 8 * 16 * 36 * sizeof(float) / sizeof(uint4);
+  constexpr int kLdsStorage =
+      kLdsChunks < kTransposeChunks ? kTransposeChunks : kLdsChunks;
+  __shared__ __attribute__((aligned(16))) uint4 s_lds[kLdsStorage];
   auto* s_a = reinterpret_cast<uint4(*)[BM][4]>(s_lds);
   auto* s_b = reinterpret_cast<uint4(*)[BN][4]>(s_lds + (BK * BM * 4));
   const auto swizzle = [](int row, int c) { return c ^ ((row >> 1) & 3); };
@@ -4724,9 +4760,9 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     // Interleave the four gate streams within the tile, without repacking
     // weights. Each group of four rows produces one mixed hidden element.
     const int weight_row = kHcMix ? (r % 4) * (m_i / 4) + r / 4 : r;
-    a_ptr[p] =
-        w_bytes + static_cast<std::size_t>(a_live[p] ? weight_row : (m_i - 1)) *
-                      static_cast<std::size_t>(num_kb) * 34;
+    a_ptr[p] = w_bytes +
+               static_cast<std::size_t>(a_live[p] ? weight_row : (m_i - 1)) *
+                   static_cast<std::size_t>(num_kb) * (kHalfWeights ? 64 : 34);
   }
   const __half* b_ptr[kBPer];
 #pragma unroll
@@ -4738,6 +4774,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
                    : nullptr;
   }
   uint4 a_codes[kAPer][2];
+  uint4 a_half[kHalfWeights ? kAPer : 1][4];
   std::uint32_t a_d[kAPer];
   uint4 b_data[kBPer][4];
 
@@ -4746,11 +4783,20 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
     for (int p = 0; p < kAPer; ++p) {
       const int kb = kb0 + (((p * 256) + tid) % BK);
       const bool live = a_live[p] && kb < num_kb;
-      const std::uint8_t* blk =
-          a_ptr[p] + (static_cast<std::size_t>(live ? kb : (num_kb - 1)) * 34);
-      a_d[p] = live ? *reinterpret_cast<const std::uint16_t*>(blk) : 0U;
-      __builtin_memcpy(&a_codes[p][0], blk + 2, 16);
-      __builtin_memcpy(&a_codes[p][1], blk + 18, 16);
+      if constexpr (kHalfWeights) {
+        const auto* src = reinterpret_cast<const uint4*>(
+            a_ptr[p] + static_cast<std::size_t>(kb) * 64);
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+          a_half[p][c] = live ? src[c] : make_uint4(0u, 0u, 0u, 0u);
+      } else {
+        const std::uint8_t* blk =
+            a_ptr[p] +
+            (static_cast<std::size_t>(live ? kb : (num_kb - 1)) * 34);
+        a_d[p] = live ? *reinterpret_cast<const std::uint16_t*>(blk) : 0U;
+        __builtin_memcpy(&a_codes[p][0], blk + 2, 16);
+        __builtin_memcpy(&a_codes[p][1], blk + 18, 16);
+      }
     }
 #pragma unroll
     for (int p = 0; p < kBPer; ++p) {
@@ -4781,24 +4827,30 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
       }
       const int row = idx / BK;
       const int kk = idx % BK;
-      // Q8_0 codes are signed; flipping the sign bit carries q + 128, which
-      // the 1152 magic takes back out.
-      const std::uint32_t words[8] = {
-          a_codes[p][0].x, a_codes[p][0].y, a_codes[p][0].z, a_codes[p][0].w,
-          a_codes[p][1].x, a_codes[p][1].y, a_codes[p][1].z, a_codes[p][1].w};
-      const __half2 scale2 = __half2half2(
-          __builtin_bit_cast(__half, static_cast<std::uint16_t>(a_d[p])));
-      __half2 h[16];
+      if constexpr (kHalfWeights) {
 #pragma unroll
-      for (int i = 0; i < 8; ++i) {
-        CodesToHalves(words[i] ^ 0x80808080U, magic, scale2, zero2, h[2 * i],
-                      h[2 * i + 1]);
-      }
+        for (int c = 0; c < 4; ++c)
+          s_a[kk][row][swizzle(row, c)] = a_half[p][c];
+      } else {
+        // Q8_0 codes are signed; flipping the sign bit carries q + 128, which
+        // the 1152 magic takes back out.
+        const std::uint32_t words[8] = {
+            a_codes[p][0].x, a_codes[p][0].y, a_codes[p][0].z, a_codes[p][0].w,
+            a_codes[p][1].x, a_codes[p][1].y, a_codes[p][1].z, a_codes[p][1].w};
+        const __half2 scale2 = __half2half2(
+            __builtin_bit_cast(__half, static_cast<std::uint16_t>(a_d[p])));
+        __half2 h[16];
 #pragma unroll
-      for (int c = 0; c < 4; ++c) {
-        uint4 v;
-        __builtin_memcpy(&v, &h[4 * c], 16);
-        s_a[kk][row][swizzle(row, c)] = v;
+        for (int i = 0; i < 8; ++i) {
+          CodesToHalves(words[i] ^ 0x80808080U, magic, scale2, zero2, h[2 * i],
+                        h[2 * i + 1]);
+        }
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          uint4 v;
+          __builtin_memcpy(&v, &h[4 * c], 16);
+          s_a[kk][row][swizzle(row, c)] = v;
+        }
       }
     }
 #pragma unroll
@@ -4817,6 +4869,10 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
   };
 
   v8f acc[kWaveRowTiles][kWaveTokTiles];
+  // Separate K16 chains reduce FP32 accumulation error for the sensitive
+  // unquantized router/gate projections, with the same order in every chunk.
+  v8f acc_high[kHalfWeights ? kWaveRowTiles : 1]
+              [kHalfWeights ? kWaveTokTiles : 1]{};
 #pragma unroll
   for (int i = 0; i < kWaveRowTiles; ++i) {
 #pragma unroll
@@ -4866,11 +4922,23 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
 #pragma unroll
         for (int i = 0; i < kWaveRowTiles; ++i) {
           acc[i][j] = Wmma(a_lo[i], b_lo, acc[i][j]);
-          acc[i][j] = Wmma(a_hi[i], b_hi, acc[i][j]);
+          if constexpr (kHalfWeights)
+            acc_high[i][j] = Wmma(a_hi[i], b_hi, acc_high[i][j]);
+          else
+            acc[i][j] = Wmma(a_hi[i], b_hi, acc[i][j]);
         }
       }
     }
     __syncthreads();
+  }
+
+  if constexpr (kHalfWeights) {
+#pragma unroll
+    for (int i = 0; i < kWaveRowTiles; ++i) {
+#pragma unroll
+      for (int j = 0; j < kWaveTokTiles; ++j)
+        acc[i][j] += acc_high[i][j];
+    }
   }
 
   if constexpr (kAttention) {
@@ -5138,7 +5206,7 @@ __launch_bounds__(256) __global__ void DenseF16GEMMKernel(
             }
           }
         } else {
-          if (tok < batch && r0 + 32 <= m) {
+          if (tok < batch && r0 + 32 <= m && ((tok * m) % 4 == 0)) {
             auto* dst = reinterpret_cast<float4*>(
                 y + (tok * m) + r0 + static_cast<std::size_t>(row_l));
 #pragma unroll
@@ -5203,6 +5271,18 @@ bool HcMixF16Gemm(const void* up, const __half* low_rank, const __half* xn,
                        dim3(kThreads), 0, stream, xn, nullptr, inject_w,
                        nullptr, nullptr, nullptr, inject, hidden);
   }
+  return true;
+}
+
+bool UnquantizedF16Gemm(const void* w, const __half* x, float* out,
+                        std::size_t batch, std::size_t m, std::size_t k,
+                        hipStream_t stream) {
+  if (m == 0 || batch == 0 || k == 0 || k % 32 != 0)
+    return false;
+  hipLaunchKernelGGL(
+      (DenseF16GEMMKernel<64, 64, 2, 2, 4, 1, false, false, false, true>),
+      dim3((batch + 63) / 64, (m + 63) / 64), dim3(kThreads), 0, stream, w, x,
+      out, batch, m, k);
   return true;
 }
 

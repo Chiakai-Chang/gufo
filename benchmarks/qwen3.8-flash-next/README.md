@@ -11,27 +11,29 @@ PNG/JPEG image input uses the matching `mmproj-BF16.gguf`, with AR or MTP.
 ## Single user
 
 Nix release, pp2048 and tg128, one measured repetition, seed 1,
-2026-09-18 UTC. Rates are tok/s. Depth precedes the measured operation;
+2026-09-19 UTC. Rates are tok/s. Depth precedes the measured operation;
 TG starts from 16 prompt tokens at d0. The CLI uses deterministic repetitive
 text, warms prefill and continues generation past EOS. Known greedy rows
 use the same 34,817-token context capacity. MTP PP includes draft catch-up.
 
 | Depth | AR pp2048 | MTP pp2048 | AR tg128 | MTP tg128 |
 | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1572.81 | 1557.43 | 26.27 | 47.94 |
+| 0 | 1504.43 | 1531.14 | 26.13 | 46.25 |
 | 4096 | TODO | TODO | TODO | TODO |
 | 8192 | TODO | TODO | TODO | TODO |
 | 12288 | TODO | TODO | TODO | TODO |
 | 16384 | TODO | TODO | TODO | TODO |
-| 32768 | 1426.10 | 1372.91 | 24.04 | 59.18 |
+| 32768 | 1408.86 | 1363.98 | 24.15 | 58.40 |
 | 65536 | TODO | TODO | TODO | TODO |
 | 131072 | TODO | TODO | TODO | TODO |
 
-Separate sampled TG, d0, context 4096:
+AR and MTP emit identical 128-token outputs at both measured depths.
+These are single samples; small PP differences between modes can be noise.
+Sampled performance needs a refresh after the prefill arithmetic correction:
 
 | Sampling | MTP tg128 | Acceptance |
 | --- | ---: | ---: |
-| Temperature 0.7, seed 1 | 47.88 | 75.9% |
+| Temperature 0.7, seed 1 | TODO | TODO |
 | Temperature 1.0, top-p 0.95 | TODO | TODO |
 
 The targets of 1700 tok/s pp2048 and near-flat PP through d128K remain TODO.
@@ -46,8 +48,8 @@ The targets of 1700 tok/s pp2048 and near-flat PP through d128K remain TODO.
 
 ## Concurrent serving
 
-HTTP aggregate output tok/s, context 4096, greedy, up to 128 output tokens,
-one measured pass per workload after prompt-cache warmup.
+HTTP aggregate output tok/s, context 4096, greedy, up to 128 output tokens.
+The performance refresh after the prefill arithmetic correction is **TODO**.
 These are whole-request rates, including scheduling and prompt handling.
 The corpus is [speculative-corpus.json](../qwen3.8-27b/speculative-corpus.json):
 `repetition_word` uses identical concurrent requests; mixed requests use
@@ -55,20 +57,16 @@ The corpus is [speculative-corpus.json](../qwen3.8-27b/speculative-corpus.json):
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 26.85 | 83.98 | 26.56 | 49.38 |
-| 2 | 43.24 | 99.10 | 38.78 | 57.53 |
-| 4 | 62.36 | 106.51 | 54.50 | 66.81 |
-| 6 | 71.78 | 108.01 | 65.51 | 69.98 |
-| 8 | 77.35 | 109.52 | 71.94 | 70.78 |
+| 1 | TODO | TODO | TODO | TODO |
+| 2 | TODO | TODO | TODO | TODO |
+| 4 | TODO | TODO | TODO | TODO |
+| 6 | TODO | TODO | TODO | TODO |
+| 8 | TODO | TODO | TODO | TODO |
 
-All 46 measured MTP requests matched the AR C1 completions. Acceptance was
-100% on repetition and 70.7–71.6% on mixed requests. AR was slightly faster
-on the mixed workload at C8.
-
-Fresh-server C8 repetition: **90.21 tok/s**, zero cached prompt tokens,
-**880/880 drafts accepted**, and **8/8 completions matching AR**. Cold rates
-at the other concurrency levels remain TODO. A prompt-cache warning marks
-warm measurements; it does not establish cold-request acceptance.
+Current C2/C4/C6/C8 correctness checks retain exact isolated tokens, logits,
+RNG and acceptance, including sampled rejection and residual correction.
+Measure cold requests separately: prompt-cache hits do not establish
+cold-request acceptance.
 
 Target projections share batches across requests; KV, recurrent state,
 sampling history and rollback stay independent. MTP advances proposals one
@@ -141,12 +139,18 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]projectio
   ragged shapes, finite values, tied selections and replay. Q8 projections must
   match scalar evaluation at every ungated width 1–32 and gated width 1–8;
   Q4 MTP heads at widths 1–8. Grouped experts cover duplicate and inactive
-  slots. Attention checks include deep contexts and
+  slots. Router and recurrent-gate projections require exact results across
+  prefill chunk boundaries, including unaligned rows, and pass FP64 controls.
+  Attention checks include deep contexts and
   exact agreement between full and final-tile catch-up. Indexer masks match a
   CPU full sort. N-gram reads cover cold/cache/mixed paths and I/O failures.
 - **Model state:** `qwen38_flash_next_session_test` checks full logits, tokens,
   RNG and acceptance against serial execution at C2/C4/C6/C8, including ragged
   budgets, reordered requests, a 4K boundary and complete snapshot bytes.
+  Bulk and split prefill must produce identical full logits at maintained
+  unaligned boundaries through 4096 tokens. Use `--prefill-only` for this
+  focused check; image continuations also compare cold, RAM-cached and
+  disk-restored sessions.
   Sampled cycles must exercise acceptance and rejection, preserving penalty
   history and deferred residual draws across requests.
   Its shared 23-case serving matrix checks AR/MTP filters, penalties, replay,
@@ -160,7 +164,7 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]projectio
 - **Qualification:** scheduling/fusion changes must preserve operator rounding
   and model replay. Arithmetic changes additionally need CPU/reference probes
   and `gufo bench --validate-prefill N`. The current 1024-token prefill check has
-  finite logits, scalar-winner rank 1, RMSE 0.24 and maximum error 1.15. Snapshot
+  finite logits, scalar-winner rank 1, RMSE 0.23 and maximum error 1.22. Snapshot
   compatibility changes when inference arithmetic changes.
 
 Measure retained changes with Nix release binaries and the same artifact,

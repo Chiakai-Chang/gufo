@@ -329,7 +329,7 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     }
     const auto tail = Download(&d_wmma, q_count);
     const std::size_t begin =
-        static_cast<std::size_t>((n_tokens - 1) / 32 * 32) * kQWidth;
+        static_cast<std::size_t>((n_tokens - 1) / 16 * 16) * kQWidth;
     for (std::size_t i = 0; i < q_count; ++i) {
       if (i < begin ? tail[i] != poison
                     : std::memcmp(&out[i], &tail[i], sizeof(float)) != 0) {
@@ -362,10 +362,57 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
   return worst;
 }
 
+void CheckChunks(std::uint32_t n, std::uint32_t split) {
+  const std::size_t count = std::size_t(n) * kQWidth;
+  HipBuffer<float> queries(count), gates(count), full(count), chunked(count);
+  HipBuffer<__half> keys(std::size_t(n) * kKvWidth),
+      values(std::size_t(n) * kKvWidth);
+  Upload(&queries, MakeValues(count, 412, 4.0F));
+  Upload(&gates, MakeValues(count, 721, 3.0F));
+  for (auto* destination : {&keys, &values}) {
+    const auto f = MakeValues(std::size_t(n) * kKvWidth,
+                              destination == &keys ? 891 : 347, 1.0F);
+    std::vector<__half> half(f.size());
+    std::transform(f.begin(), f.end(), half.begin(),
+                   [](float x) { return __float2half(x); });
+    Upload(destination, half);
+  }
+  const auto run = [&](std::uint32_t start, std::uint32_t rows, float* out) {
+    const auto offset = std::size_t(start) * kQWidth;
+    if (!q::WmmaCausalAttention(queries.get() + offset, gates.get() + offset,
+                                keys.get(), values.get(), nullptr, 0,
+                                out + offset, rows, start, kHeads, kKvHeads,
+                                kDim, kRatio, nullptr)) {
+      throw std::runtime_error("chunk attention rejected geometry");
+    }
+  };
+  run(0, n, full.get());
+  run(0, split, chunked.get());
+  run(split, n - split, chunked.get());
+  const auto a = Download(&full, count);
+  const auto b = Download(&chunked, count);
+  std::size_t differences = 0, first = count;
+  float max_error = 0;
+  for (std::size_t i = 0; i < count; ++i) {
+    if (a[i] != b[i]) {
+      ++differences;
+      first = std::min(first, i);
+      max_error = std::max(max_error, std::abs(a[i] - b[i]));
+    }
+  }
+  std::cout << "chunk attention n=" << n << " split=" << split
+            << " differing=" << differences << " max=" << max_error
+            << " first_row=" << first / kQWidth << '\n';
+  if (differences != 0)
+    throw std::runtime_error("attention depends on prefill chunk boundary");
+}
+
 }  // namespace
 
 int main() {
   try {
+    CheckChunks(136, 94);
+    CheckChunks(2048, 1025);
     CheckPreparation(1, 0, 64);
     CheckPreparation(8, 4096, 64);
     CheckPreparation(65, 131069, 64);

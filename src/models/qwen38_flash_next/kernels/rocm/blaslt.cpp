@@ -2,7 +2,8 @@
 
 #include <array>
 #include <hipblaslt/hipblaslt-ext.hpp>
-#include <vector>
+
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -11,19 +12,6 @@ void AssignError(std::string* error, const char* message) {
   if (error != nullptr) {
     *error = message;
   }
-}
-
-int ProjectionAlgorithm(hipDataType type, int m, int n, int k) {
-  // gfx1151 / pinned hipBLASLt: offline F16 alpha-beta and router sweeps.
-  // The first heuristic can be several times slower. These workspace-free
-  // kernels pass the F64 and cross-instance replay checks.
-  if (type != HIP_R_16F || k != 2560 || (m != 96 && m != 513)) {
-    return -1;
-  }
-  if (m == 96) {
-    return n <= 256 ? 5079 : n <= 1024 ? 5080 : 5081;
-  }
-  return n <= 128 ? 5079 : 5081;
 }
 
 }  // namespace
@@ -117,17 +105,6 @@ std::unique_ptr<BlasLt::Plan> BlasLt::MakePlan(hipDataType type, int m, int n,
       preference, candidates.size(), candidates.data(), &count);
   (void)hipblasLtMatmulPreferenceDestroy(preference);
 
-  const int preferred = ProjectionAlgorithm(type, m, n, k);
-  if (preferred >= 0) {
-    std::vector<int> indices{preferred};
-    std::vector<hipblasLtMatmulHeuristicResult_t> selected;
-    if (hipblaslt_ext::getAlgosFromIndex(handle_, indices, selected) ==
-            HIPBLAS_STATUS_SUCCESS &&
-        !selected.empty() && usable(selected.front().algo)) {
-      p->algorithm = selected.front().algo;
-      return p;
-    }
-  }
   if (status == HIPBLAS_STATUS_SUCCESS) {
     for (int i = 0; i < count; ++i) {
       if (candidates[i].state == HIPBLAS_STATUS_SUCCESS &&
@@ -146,6 +123,13 @@ bool BlasLt::Gemm(const void* weights, const void* input, float* out,
   if (m <= 0 || n <= 0 || k <= 0) {
     AssignError(error, "hipBLASLt dimensions must be positive");
     return false;
+  }
+  // Library edge tiles change the accumulation order when the same token
+  // moves within a batch. Router and recurrent-gate errors then amplify across
+  // layers. Keep one K reduction for every row and prefill chunk size.
+  if (type == HIP_R_16F && k == 2560 && (m == 96 || m == 513)) {
+    return UnquantizedF16Gemm(weights, static_cast<const __half*>(input), out,
+                              n, m, k, stream_);
   }
   // Exact dimensions prevent the first ragged request from determining
   // which kernel later requests in the same size bucket receive.

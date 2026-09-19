@@ -7,6 +7,7 @@
 #include <latch>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
@@ -27,6 +28,44 @@ void RequireExact(std::span<const float> expected,
               std::memcmp(expected.data(), actual.data(),
                           expected.size_bytes()) == 0,
           message);
+}
+
+void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  const auto pattern = model->Tokenize(
+      "Virtual memory maps pages to physical storage. "
+      "A train travels sixty kilometers per hour. "
+      "Continue red, green, blue, red, green, blue. ");
+  Require(!pattern.empty(), "empty chunk fixture");
+  for (const auto [length, boundary] :
+       {std::pair{136U, 94U}, std::pair{2048U, 1025U},
+        std::pair{4096U, 2048U}}) {
+    std::vector<std::int32_t> tokens(length);
+    for (std::size_t i = 0; i < tokens.size(); ++i)
+      tokens[i] = pattern[i % pattern.size()];
+    auto bulk = model->CreateSession(6145, &error);
+    auto split = model->CreateSession(6145, &error);
+    Require(bulk && split, error);
+    Require(bulk->Sync(tokens, &error) &&
+                split->Sync(std::span(tokens).first(boundary), &error) &&
+                split->Sync(tokens, &error),
+            error);
+    for (unsigned step = 0; step < 4; ++step) {
+      const auto logits = bulk->Logits();
+      RequireExact(
+          logits, split->Logits(),
+          "prefill chunking changed logits: length=" + std::to_string(length) +
+              " boundary=" + std::to_string(boundary) +
+              " step=" + std::to_string(step));
+      const auto token = static_cast<std::int32_t>(
+          std::max_element(logits.begin(), logits.end()) - logits.begin());
+      Require(bulk->Evaluate(token, &error) && split->Evaluate(token, &error),
+              error);
+    }
+    std::cout << "prefill chunks: length=" << length << " boundary=" << boundary
+              << " four logit rows exact\n"
+              << std::flush;
+  }
 }
 
 void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
@@ -308,10 +347,13 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
 int main(int argc, char** argv) {
   const bool batch_only =
       argc == 6 && std::string_view(argv[5]) == "--batch-only";
-  if ((argc != 5 && !batch_only) || std::string_view(argv[1]) != "--model" ||
+  const bool prefill_only =
+      argc == 6 && std::string_view(argv[5]) == "--prefill-only";
+  if ((argc != 5 && !batch_only && !prefill_only) ||
+      std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-                 "[--batch-only]\n";
+                 "[--batch-only | --prefill-only]\n";
     return 77;
   }
   try {
@@ -321,6 +363,10 @@ int main(int argc, char** argv) {
         {.max_context = 6145, .mtp_model_path = argv[4], .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
+    if (!batch_only)
+      CheckPrefillChunks(model);
+    if (prefill_only)
+      return 0;
     CheckBatchedSessions(model);
     if (batch_only)
       return 0;

@@ -124,6 +124,8 @@ void CheckFlashIncrementalOracle(
             << " max_KL_temperature1=" << max_kl << '\n';
   Require(generated == cached.tokens,
           "Flash snapshot changed incremental inference");
+  Require(max_logit_error == 0,
+          "Flash image continuation changed logits with prefill chunking");
 }
 }  // namespace
 
@@ -290,15 +292,10 @@ int main(int argc, char** argv) {
       std::cout << '\n';
     }
     ar.reset();
-    // Flash's quantized wide projections have chunk-dependent rounding, even
-    // without images. Snapshot qualification must compare identical chunks.
-    // Keep the bulk comparison as a numerical diagnostic, not a cache oracle.
-    if (flash) {
+    Require(continuation_exact,
+            "continued image cache differs from cold prefill");
+    if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
-    } else {
-      Require(continuation_exact,
-              "continued image cache differs from cold prefill");
-    }
 
     std::array<char, 64> pattern{};
     const std::string temporary = "/tmp/gufo-vision-cache-XXXXXX";

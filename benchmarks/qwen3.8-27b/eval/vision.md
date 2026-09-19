@@ -86,12 +86,15 @@ EXIF orientation, palette, alpha, grayscale, gamma metadata and CMYK JPEG.
 Run parser/cache/codec tests under the `cpu-sanitizer` preset when changing
 input handling or persistence.
 
-Flash-Next bulk and incremental prefill have different floating-point
-rounding, including without images. A continued chat can therefore change a
-greedy token when its prefill chunking changes. The snapshot oracle uses a
-fresh session with identical chunks and requires exact tokens; the test also
-reports bulk/incremental logit error and KL. This is not a guarantee of
-bit-identical output across different prefill chunk sizes.
+Flash-Next's maintained continuation fixture requires **identical full logits**
+for bulk prefill, incremental prefill and restored cache state. Its router and
+recurrent-gate projections keep one accumulation order when rows move between
+chunks. Prefill retains F16 SSM output activations, and attention accumulates
+each query's final partial tile using only visible keys. Tests cover unaligned
+boundaries, full-model continuations through 4096 tokens, and FP64 operator
+controls.
+This does not establish bit-identical output between prefill and token-at-a-time
+kernels, which use different arithmetic routes.
 
 For encoder arithmetic, compare the complete graph and isolated layers with
 the original Transformers operators using the **same BF16 GGUF weights**:

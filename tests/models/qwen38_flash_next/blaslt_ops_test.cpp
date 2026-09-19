@@ -60,6 +60,30 @@ int main() {
                       hipMemcpyHostToDevice));
       Check(hipMemcpy(b.data, input.data(), input.size() * sizeof(__half),
                       hipMemcpyHostToDevice));
+      if (k == 2560) {
+        // Exercise both an unaligned cache boundary and a wide prefill split.
+        for (const auto [total, boundary] :
+             {std::pair{136, 94}, std::pair{2048, 1025}}) {
+          std::vector<float> bulk(std::size_t(m) * total), split(bulk.size());
+          Require(warmed->Gemm(a.data, b.data, static_cast<float*>(c.data),
+                               HIP_R_16F, m, total, k, &error),
+                  error);
+          Check(hipMemcpy(bulk.data(), c.data, bulk.size() * sizeof(float),
+                          hipMemcpyDeviceToHost));
+          for (const auto [off, n] : {std::pair{0, boundary},
+                                      std::pair{boundary, total - boundary}}) {
+            Require(
+                warmed->Gemm(
+                    a.data, static_cast<__half*>(b.data) + std::size_t(off) * k,
+                    static_cast<float*>(c.data) + std::size_t(off) * m,
+                    HIP_R_16F, m, n, k, &error),
+                error);
+          }
+          Check(hipMemcpy(split.data(), c.data, split.size() * sizeof(float),
+                          hipMemcpyDeviceToHost));
+          Require(bulk == split, "projection changed across prefill chunks");
+        }
+      }
       // Vary shape order and use ragged sizes between the calibrated widths.
       for (int n : {4096, 2048, 9, 1024, 512, 129, 128, 513, 256}) {
         auto fresh = BlasLt::Create(nullptr, &error);
@@ -97,7 +121,8 @@ int main() {
         }
       }
     }
-    std::cout << "PASS: deterministic F16 projections, ragged shapes and F64\n";
+    std::cout << "PASS: F16 projection replay, chunk boundaries, ragged shapes "
+                 "and F64\n";
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
     return 1;
