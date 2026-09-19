@@ -1,6 +1,6 @@
 """Safetensors inspection and validation.
 
-Implements the Safetensors Source Contract in docs/QUANTIZATION.md:
+Source snapshot checks:
 
 - Validate header length, JSON, dtype, shape, byte offsets, non-overlap.
 - Reject duplicate tensor names and missing indexed tensors.

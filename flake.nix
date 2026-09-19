@@ -33,7 +33,7 @@
         '';
 
       # Offline model-conversion toolchain. Python-only; never a transitive
-      # dependency of the server (see docs/QUANTIZATION.md "Offline Toolchain").
+      # dependency of the server (see tools/README.md for the offline toolchain).
       # Unified python313 + torchWithRocm: every Strix Halo box ships ROCm, so
       # the single toolchain serves CPU flows and the --device cuda
       # calibration forward alike. gfx1151 verified on this host.

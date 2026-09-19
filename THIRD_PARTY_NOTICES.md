@@ -3,7 +3,8 @@
 This document records the complete inventory of third-party software, libraries, drivers,
 and system components used, linked, or required by **gufo**.
 
-For design policy details regarding licensing boundaries, see [docs/LICENSING.md](docs/LICENSING.md).
+The engine license is in [LICENSE](LICENSE); model-specific acquisition and
+usage records are linked from [the model guide](docs/MODELS.md).
 
 ---
 
@@ -260,7 +261,7 @@ decoder and dynamic INT8/TensorOps scheduling design in `h3_shaders.metal` as
 adapted from ccv's `NAMatMulKernel` and `NAInt8MatMulKernel`, licensed
 BSD-3-Clause with copyright (c) 2010, Liu Liu. Any adapted expression or design
 retains that notice. See
-[`src/models/minimax_h3/UPSTREAM.md`](src/models/minimax_h3/UPSTREAM.md).
+[the MiniMax H3 provenance record](docs/models/MINIMAX_H3.md#upstream-provenance).
 
 ### 1.18 curl / libcurl
 
@@ -361,7 +362,7 @@ determination about a downstream operator.
 - **Relationship**: External model component within the operator-supplied H3
   checkpoint; not distributed by gufo
 
-See [docs/MINIMAX_H3.md](docs/MINIMAX_H3.md) for the acquisition, release, and
+See [the MiniMax H3 guide](docs/models/MINIMAX_H3.md) for the acquisition, release, and
 runtime boundary.
 
 ---

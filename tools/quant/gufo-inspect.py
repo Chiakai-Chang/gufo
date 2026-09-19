@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """gufo-inspect — validate a safetensors snapshot, write source-manifest.json.
 
-Implements the Safetensors Source Contract in docs/QUANTIZATION.md.
+Uses tools/gufo/safetensors.py for strict header, tensor, and shard validation.
 
 Usage:
   gufo-inspect --source DIR [--out manifest.json] [--json]

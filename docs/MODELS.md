@@ -119,23 +119,9 @@ configuration and can run alongside a text model.
 
 ## MiniMax H3
 
-Download
+Text-to-video from the pinned official FL2VA safetensors checkpoint, executed
+through Gufo's native HIP implementation. The default `exact` preset follows
+the released Diffusers schedule; `fast` and `aggressive` are approximate modes.
 
-```sh
-nix develop -c hf download MiniMaxAI/MiniMax-H3 \
-  --repo-type model \
-  --local-dir models/MiniMax-H3
-```
-
-The upstream repository is license-gated: sign in with `hf auth login` and
-accept the license on the model page before downloading.
-
-Supported modality: text to video
-
-Supported tech: official MiniMaxAI checkpoint only, executed through
-`gufo video`. Only MiniMaxAI's official implementation is supported, to
-retain full model quality.
-
-Machine footprint: peak device residency has been measured between ~43 and
-~59 GiB with zero swap; a 64 GiB machine is the practical minimum and 128 GiB
-is comfortable.
+See [the MiniMax H3 guide](models/MINIMAX_H3.md) for acquisition, CLI/server
+usage, phase memory, upstream provenance, and quality qualification.

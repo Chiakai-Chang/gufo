@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """gufo-quantize — deterministic SHQ-T16 conversion of a source snapshot.
 
-Implements docs/QUANTIZATION.md end-to-end pipeline steps 1 and 5. Each
-tensor's encoding comes from a mixed-precision recipe (tools/gufo/recipe.py):
+Validates the source snapshot and converts each tensor using a
+mixed-precision recipe (tools/gufo/recipe.py):
 SHQ4-G64-U4Z (bulk), SHQ4-G32-U4Z (attention), SHQ8-G64 (high-precision tier),
 or BF16 (kept). The recipe is per-tensor, so precision varies across layers
 and components the way the unsloth Q4_K_M recipe does.

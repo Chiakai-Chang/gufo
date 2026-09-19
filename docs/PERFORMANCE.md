@@ -255,9 +255,9 @@ advice/prefetch, synchronization, teardown, fault, and checksum behavior:
 ```
 
 The command aborts before a requested size that cannot preserve its memory
-headroom; it never silently substitutes a smaller working set. See
-[`HIP_ALLOCATION_PLACEMENT.md`](HIP_ALLOCATION_PLACEMENT.md) for the gfx1151
-findings and the Qwen3.8-27B placement decision.
+headroom; it never silently substitutes a smaller working set. The production
+Qwen3.8-27B loader registers mapped GGUF shards directly with HIP; see
+[the model's allocation ownership](../src/models/qwen/README.md#hip-target-model).
 
 ### Focused HIP benchmark
 

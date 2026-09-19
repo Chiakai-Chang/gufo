@@ -143,9 +143,9 @@ or Flash-Next target GGUF to run it; CTest skips it when the artifact is absent.
 
 - [`QwenGpuModel::CreateFromGguf`](hip/executor.hpp) owns the GGUF reader,
   validated weights, tokenizer, and GPU-visible weight regions. It registers
-  mapped GGUF shards directly with HIP; this is the fixed gfx1151 production
-  policy selected by the Qwen3.8-27B study in
-  [`docs/HIP_ALLOCATION_PLACEMENT.md`](../../../docs/HIP_ALLOCATION_PLACEMENT.md).
+  mapped GGUF shards directly with HIP, the fixed gfx1151 production policy.
+  The [allocation diagnostic](../../../docs/PERFORMANCE.md#hip-allocation-diagnostic)
+  measures registration, first-touch, copy, and warm-access costs.
 - [`QwenGpuExecutor::Generate`](hip/executor.hpp) first calls
   `ForwardPromptBatch` for batched prefill and then `ForwardToken` for
   autoregressive decode.

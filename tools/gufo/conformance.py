@@ -1,6 +1,6 @@
 """SHQ-T16 conformance vectors (T1 tests).
 
-Byte-exact checks per docs/QUANTIZATION.md:
+Byte-exact checks for the layouts in tools/gufo/shq.py:
 - Exhaustive UINT4 and signed nibble decode.
 - Low/high nibble ordering.
 - G32 and G64 offsets.

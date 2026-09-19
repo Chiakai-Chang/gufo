@@ -3,7 +3,7 @@
 check-docs.py — Documentation integrity, local link, and syntax validator for gufo
 
 Validates:
-1. Presence of required documentation files (ROADMAP, LICENSING, NOTICE, etc.)
+1. Presence of maintained user/developer documentation and license notices.
 2. Local Markdown links and section anchor integrity without network access.
 3. Syntax validity of fenced JSON code blocks.
 """
@@ -21,14 +21,14 @@ REQUIRED_DOC_FILES = [
     "NOTICE",
     "THIRD_PARTY_NOTICES.md",
     "AGENTS.md",
-    "docs/ROADMAP.md",
-    "docs/PROJECT_STATUS.md",
-    "docs/LICENSING.md",
+    "docs/CLI.md",
+    "docs/DEVELOPMENT.md",
+    "docs/MODELS.md",
+    "docs/SERVER.md",
     "docs/TESTING.md",
-    "docs/SUPPORTED_TOOLCHAIN.md",
-    "docs/GPU_BACKEND.md",
-    "docs/NPU_BACKEND.md",
-    "docs/NPU_RESEARCH.md",
+    "docs/BENCHMARKS.md",
+    "docs/PERFORMANCE.md",
+    "docs/models/MINIMAX_H3.md",
 ]
 
 EXCLUDE_DIRS = {

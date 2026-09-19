@@ -109,7 +109,8 @@ position, aggregated model-wide. It does not isolate which layer or tensor
 contributes the KL tail. Per-layer and per-tensor attribution (layer-output
 error, per-layer KL, first-divergent-layer search) is a planned refinement;
 `gufo-quantize.py` already records per-tensor reconstruction stats, and
-`docs/TESTING.md` T3 documents layer-boundary capture. Imatrix search was
+[the testing guide](TESTING.md#matched-token-and-layer-comparisons) documents
+layer-boundary comparisons. Imatrix search was
 implemented before this planned prerequisite; per-layer attribution is now a
 required catch-up gate before selecting the Qwen3.8-27B production recipe or
 promoting native quantized kernels.

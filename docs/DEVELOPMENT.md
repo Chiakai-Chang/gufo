@@ -1,5 +1,7 @@
 # Development
 
+See [testing](TESTING.md) for focused checks and model-specific quality gates.
+
 ## Code structure
 
 The codebase is organized in following way:

@@ -1,7 +1,7 @@
 """SHQ-T16 quantization and packing.
 
-Implements the normative SHQ4-T16 v1 contract and the SHQ8-T16 encoding from
-docs/QUANTIZATION.md. Byte layouts are byte-exact by design:
+Implements the SHQ4-T16 and SHQ8-T16 encodings used by the offline tools.
+Byte layouts are byte-exact by design and checked by gufo.conformance:
 
 SHQ4 U4Z G64:
   qweight[n_tile][k_group][k16_subtile][output_lane=16][packed_k=8]

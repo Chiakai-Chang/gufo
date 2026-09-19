@@ -14,7 +14,8 @@ Supported models:
 - [Qwen3.8-27B:UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-Q4_K_XL.gguf) and [Qwen3.8-27B-UD-Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/main/Qwen3.8-27B-UD-Q8_K_XL.gguf) GGUFs from unsloth with z-lab's [DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF). The best choice when you can't saturate your unified memory and want to leave room for something else.
 - [Qwen3.8-Flash-Next:UD-Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) GGUF from unsloth with its shared Q8 MTP draft block. This 103.7 GiB is a good trade-off between DeepSeek and Qwen when you still need some space for something while having a capable model running.
 - [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) Safetensors text to video generation model.
-  Even though the community has built quicker implementations, as of now we decided to support just MiniMaxAI's official one to retain the full model quality.
+  The native HIP implementation uses the pinned official checkpoint; see the
+  [MiniMax guide](docs/models/MINIMAX_H3.md) for presets and quality qualification.
 - [Qwen3-ASR-1.7B](https://huggingface.co/Qwen/Qwen3-ASR-1.7B) Safetensors for audio to text.
 - [Qwen3-TTS](https://huggingface.co/collections/Qwen/qwen3-tts) 1.7B models: Base, CustomVoice, and VoiceDesign.
 

@@ -105,7 +105,7 @@ python3 -c "import sys; sys.path.insert(0,'tools'); from gufo.conformance import
 
 ## Layout contract (SHQ4-T16)
 
-See docs/QUANTIZATION.md. Byte layout: `qweight[n_tile][k_group][k16][lane=16][k_pair=8]`,
+Byte layout: `qweight[n_tile][k_group][k16][lane=16][k_pair=8]`,
 scales/zeros BF16 + packed UINT4 per (tile,group,lane). U4Z dequant:
 `s * (q - z)`, scale rounded to BF16 RNE-ties-even before code selection.
 
