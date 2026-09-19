@@ -122,14 +122,13 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     hipStream_t stream = nullptr, float* lse_out = nullptr,
     std::uint32_t key_begin = 0, bool skip_kv_write = false);
 
-/// Non-causal attention of every query in the chunk against the first
-/// `prefix_length` cached keys, through AOTriton's pretuned gfx11xx flash
-/// attention. Returns false if AOTriton rejects the shape.
-/// Masked prefill attention on the WMMA matrix cores
-/// (opt-c177-attn-wmma). Same contract as LaunchBatchedAttentionTile -- it
+/// Masked prefill attention on the WMMA matrix cores.
+/// Same contract as LaunchBatchedAttentionTile: it
 /// packs the FP16 K/V cache unless `skip_kv_write`, masks keys in
 /// [`key_begin`, min(context_end, query position]), and emits the partial
 /// log-sum-exp into `lse_out` (suppressing the gate) when that is non-null.
+/// Optional workspace spans hold temporary KV layouts and must not alias live
+/// inputs, outputs or each other. Persistent KV storage is unchanged.
 /// Returns false when the shape is unsupported, so the caller can fall back.
 [[nodiscard]] bool LaunchQwenWmmaAttention(
     const float* q, const float* k, const float* v, const float* gate,

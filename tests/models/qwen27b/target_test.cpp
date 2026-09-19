@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
@@ -75,37 +76,52 @@ std::string Fingerprint(std::span<const float> values) {
 void CheckPrefillReplay(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& model) {
   std::string error;
-  auto executor = Executor::Create(model, &error, 4096);
+  auto executor = Executor::Create(model, &error, 12288);
   Expect(executor != nullptr, error);
   constexpr std::array<std::uint32_t, 5> layers{6, 20, 34, 48, 62};
-  executor->SetPromptHiddenCapture(true, layers);
   const auto text = executor->GetTokenizer().Encode(
       std::string(kTexts[0]) + "\n" + kTexts[1] + "\n" + kTexts[2]);
   Expect(!text.empty(), "prefill fixture must tokenize");
-  for (const std::size_t length : {128U, 257U, 2048U}) {
-    std::vector<Token> tokens(length + 2);
+  // A deep ragged suffix also checks restored attention state and the feature
+  // taps consumed by DFlash2 after prefill uses temporary KV layouts.
+  for (const auto [depth, length] :
+       {std::pair{0U, 128U}, std::pair{0U, 257U}, std::pair{0U, 2048U},
+        std::pair{8192U, 1025U}}) {
+    const std::uint32_t end = depth + length;
+    std::vector<Token> tokens(end + 2);
     for (std::size_t i = 0; i < tokens.size(); ++i)
       tokens[i] = text[i % text.size()];
-    const auto prompt = std::span(tokens).first(length);
+    const auto prompt = std::span(tokens).subspan(depth, length);
     executor->Reset();
-    (void)executor->ForwardPromptBatch(prompt);
+    executor->SetPromptHiddenCapture(false);
+    std::unique_ptr<gufo::hip::QwenGpuSnapshot> prefix;
+    if (depth != 0) {
+      (void)executor->ForwardPromptBatch(std::span(tokens).first(depth));
+      prefix = executor->SaveSnapshot(depth);
+      Expect(prefix != nullptr, "deep prefill snapshot");
+    }
+    executor->SetPromptHiddenCapture(true, layers);
+    (void)executor->ForwardPromptBatch(prompt, depth);
     const auto expected = Logits(*executor);
     const auto features = Fingerprint(executor->GetPromptHiddenStates());
     Expect(executor->GetPromptHiddenStates().size() ==
                length * layers.size() * executor->GetConfig().hidden_size,
            "prefill must capture every requested feature row");
-    executor->Reset();
-    (void)executor->ForwardPromptBatch(prompt);
+    if (prefix)
+      executor->RestoreSnapshot(*prefix);
+    else
+      executor->Reset();
+    (void)executor->ForwardPromptBatch(prompt, depth);
     Expect(ByteEqual(Logits(*executor), expected) &&
                Fingerprint(executor->GetPromptHiddenStates()) == features,
            "repeated matrix prefill changed logits or features");
-    std::cout << "prefill fingerprint tokens=" << length
+    std::cout << "prefill fingerprint depth=" << depth << " tokens=" << length
               << " logits=" << Fingerprint(expected) << " features=" << features
               << '\n';
 
-    const auto snapshot = executor->SaveSnapshot(length);
-    const auto suffix = std::span(tokens).subspan(length);
-    (void)executor->ForwardVerificationChunk(suffix, length, true);
+    const auto snapshot = executor->SaveSnapshot(end);
+    const auto suffix = std::span(tokens).subspan(end);
+    (void)executor->ForwardVerificationChunk(suffix, end, true);
     std::vector<std::vector<float>> verified;
     for (std::size_t row = 0; row < suffix.size(); ++row) {
       const auto logits = executor->CopyVerificationLogits(row);
@@ -115,7 +131,7 @@ void CheckPrefillReplay(
     const std::vector<float> verified_features(hidden.begin(), hidden.end());
     executor->RestoreSnapshot(*snapshot);
     for (std::size_t row = 0; row < suffix.size(); ++row) {
-      (void)executor->ForwardToken(suffix[row], length + row);
+      (void)executor->ForwardToken(suffix[row], end + row);
       const auto last_hidden = executor->CopyLastHidden();
       Expect(ByteEqual(Logits(*executor), verified[row]) &&
                  ByteEqual(last_hidden, std::span(verified_features)

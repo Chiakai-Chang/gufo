@@ -82,7 +82,8 @@ void Compare(const char* label, const std::vector<float>& got,
   }
 }
 
-void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
+void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse,
+             std::uint32_t key_begin = 0) {
   std::cout << "wmma prefill attention: start_pos=" << start_pos
             << " batch=" << batch_size << " lse=" << (want_lse ? "yes" : "no")
             << "\n";
@@ -162,7 +163,8 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
   if (!gufo::hip::LaunchBatchedAttentionTile(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
           d_out_ref, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
-          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_ref, 0, false)) {
+          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_ref, key_begin,
+          false)) {
     std::cerr << "tiled attention rejected the production shape\n";
     std::abort();
   }
@@ -173,7 +175,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
   if (!gufo::hip::LaunchQwenWmmaAttention(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
           d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
-          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, 0,
+          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin,
           /*skip_kv_write=*/true)) {
     std::cerr << "WMMA attention rejected the production shape\n";
     std::abort();
@@ -194,7 +196,7 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
   if (!gufo::hip::LaunchQwenWmmaAttention(
           d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
           d_out_new, /*layer_idx=*/0, start_pos, batch_size, kMaxContext,
-          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, 0,
+          kNumHeads, kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin,
           /*skip_kv_write=*/true)) {
     std::cerr << "WMMA attention rejected the production shape on replay\n";
     std::abort();
@@ -215,27 +217,33 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
   std::cout << "  replay: byte-identical over " << q_elements << " elements\n";
 
   if (start_pos >= 8192) {
-    const std::size_t words = (start_pos + batch_size) * kv_size / 2;
+    const std::size_t length = start_pos + batch_size;
+    const std::array<std::size_t, 2> words{
+        length * kv_size / 2,
+        ((length + 15u) & ~std::size_t{15}) * kv_size / 2};
     std::array<float*, 2> storage{};
     std::array<std::span<float>, 2> work{};
     for (std::size_t i = 0; i < storage.size(); ++i) {
-      HIP_CHECK(hipMalloc(&storage[i], (words + 32) * sizeof(float)));
-      HIP_CHECK(hipMemset(storage[i], 0xA5, (words + 32) * sizeof(float)));
-      work[i] = {storage[i] + 16, words};
+      HIP_CHECK(hipMalloc(&storage[i], (words[i] + 32) * sizeof(float)));
+      HIP_CHECK(hipMemset(storage[i], 0xA5, (words[i] + 32) * sizeof(float)));
+      work[i] = {storage[i] + 16, words[i]};
     }
     std::vector<float> lse_expected(lse_elements);
     if (want_lse)
       HIP_CHECK(hipMemcpy(lse_expected.data(), d_lse_new,
                           lse_elements * sizeof(float), hipMemcpyDeviceToHost));
-    for (const bool enough : {true, false}) {
-      for (float* data : storage)
-        HIP_CHECK(hipMemset(data, 0xA5, (words + 32) * sizeof(float)));
-      const auto k_work = enough ? work[0] : work[0].first(words - 1);
+    for (const unsigned short_plane : {0u, 1u, 2u}) {
+      for (std::size_t i = 0; i < storage.size(); ++i)
+        HIP_CHECK(hipMemset(storage[i], 0xA5, (words[i] + 32) * sizeof(float)));
+      const auto k_work =
+          short_plane == 1 ? work[0].first(words[0] - 1) : work[0];
+      const auto v_work =
+          short_plane == 2 ? work[1].first(words[1] - 1) : work[1];
       if (!gufo::hip::LaunchQwenWmmaAttention(
               d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
               d_out_new, 0, start_pos, batch_size, kMaxContext, kNumHeads,
-              kNumKvHeads, kHeadDim, nullptr, lse_new, 0, true, k_work,
-              work[1]))
+              kNumKvHeads, kHeadDim, nullptr, lse_new, key_begin, true, k_work,
+              v_work))
         std::abort();
       HIP_CHECK(hipDeviceSynchronize());
       HIP_CHECK(hipMemcpy(again.data(), d_out_new, q_elements * sizeof(float),
@@ -251,15 +259,17 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
         if (actual != lse_expected)
           std::abort();
       }
-      for (float* data : storage) {
+      for (std::size_t i = 0; i < storage.size(); ++i) {
+        float* data = storage[i];
         std::array<std::uint8_t, 64> first{};
         HIP_CHECK(hipMemcpy(first.data(), data + 16, first.size(),
                             hipMemcpyDeviceToHost));
         const bool untouched = std::all_of(
             first.begin(), first.end(), [](auto byte) { return byte == 0xA5; });
-        if (untouched == (enough && batch_size >= 1024))
+        if (untouched == (short_plane == 0 && batch_size >= 1024 &&
+                          key_begin < length && key_begin % 16 == 0))
           std::abort();
-        for (std::size_t off : {std::size_t{0}, words + 16}) {
+        for (std::size_t off : {std::size_t{0}, words[i] + 16}) {
           std::array<std::uint8_t, 64> guard{};
           HIP_CHECK(hipMemcpy(guard.data(), data + off, guard.size(),
                               hipMemcpyDeviceToHost));
@@ -323,6 +333,9 @@ int main() {
   RunCase(8192, 1023, false);
   RunCase(8192, 1024, false);
   RunCase(32781, 1025, true);
+  RunCase(8192, 1024, true, 16);
+  RunCase(8192, 1024, true, 17);
+  RunCase(8192, 1024, false, 9216);
 
   std::cout << "Qwen WMMA prefill attention ops test passed on gfx1151.\n";
   return 0;

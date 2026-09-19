@@ -82,6 +82,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops/attention.hpp"
@@ -179,6 +180,7 @@ __launch_bounds__(256, 2) __global__
   static_assert(kOTilesPerWave == 2 * kRowBlocks, "O tiles per wave");
   static_assert(kKeys % 16 == 0 && kQueryRows % 16 == 0, "16-row WMMA tiles");
   static_assert(kKStepsPerWave * 8 / kSTiles == kWmmaKSteps, "k split");
+  static_assert(!kHeadMajor || kKeys == 16, "packed value tile width");
   static_assert(kWmmaKStride % 8 == 0 && kVtStride % 8 == 0,
                 "fragment rows must start on a 16-byte boundary");
   static_assert(kSoftmaxLanes * (kKeys / kSoftmaxLanes) == kKeys, "softmax");
@@ -206,8 +208,9 @@ __launch_bounds__(256, 2) __global__
   };
 
   constexpr std::uint32_t kKvLdsHalves =
-      (kKeys * kWmmaKStride > kHeadDim * kVtStride) ? (kKeys * kWmmaKStride)
-                                                    : (kHeadDim * kVtStride);
+      kHeadMajor || kKeys * kWmmaKStride > kHeadDim * kVtStride
+          ? kKeys * kWmmaKStride
+          : kHeadDim * kVtStride;
   __shared__ __half kv_lds[kKvLdsHalves];
   // Padding avoids repeated banks in softmax reads and probability fragments.
   __shared__ float s_lds[2][kSTiles][16][17];
@@ -271,15 +274,33 @@ __launch_bounds__(256, 2) __global__
   const auto* v_base = v_cache_f16 + head_offset + v_slice;
   const auto* k_base = k_cache_f16 + head_offset;
 
-  const auto load_v = [&](std::uint32_t key_start, uint4* dst) {
-    const std::uint32_t key_position = key_start + v_key;
-    const auto* src =
-        v_base + (static_cast<std::size_t>(key_position) * kv_stride);
-    const bool live = key_position < context_end;
+  using ValueFragment = std::conditional_t<kHeadMajor, v16h, uint4>;
+  constexpr std::uint32_t kValueFragments = kHeadMajor ? 2 : kVRegs;
+  const auto load_v = [&](std::uint32_t key_start, ValueFragment* dst) {
+    if constexpr (kHeadMajor) {
+      // Each wave consumes two dimension tiles. The temporary value layout
+      // supplies their WMMA fragments directly, avoiding a repeated LDS
+      // transpose and barrier for every 16-key tile.
+      const std::size_t padded = (context_end + 15u) & ~std::size_t{15};
 #pragma unroll
-    for (std::uint32_t j = 0; j < kVRegs; ++j) {
-      dst[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
-                    : make_uint4(0u, 0u, 0u, 0u);
+      for (std::uint32_t t = 0; t < 2; ++t) {
+        const std::uint32_t dim = (wave + t * 8u) * 16u + sub;
+        dst[t] = LoadFrag(
+            v_cache_f16 +
+            static_cast<std::size_t>(kv_head) * padded * kHeadDim +
+            static_cast<std::size_t>(key_start / 16u) * kHeadDim * 16u +
+            dim * 16u);
+      }
+    } else {
+      const std::uint32_t key_position = key_start + v_key;
+      const auto* src =
+          v_base + (static_cast<std::size_t>(key_position) * kv_stride);
+      const bool live = key_position < context_end;
+#pragma unroll
+      for (std::uint32_t j = 0; j < kVRegs; ++j) {
+        dst[j] = live ? *reinterpret_cast<const uint4*>(src + (j * 8))
+                      : make_uint4(0u, 0u, 0u, 0u);
+      }
     }
   };
   // Coalesced: a wave reads one key row's 512 contiguous bytes.
@@ -299,9 +320,9 @@ __launch_bounds__(256, 2) __global__
   };
 
   uint4 k_cur[kKRegs];
-  uint4 v_cur[kVRegs];
-  uint4 k_pre[kKRegs];
-  uint4 v_pre[kVRegs];
+  ValueFragment v_cur[kValueFragments];
+  uint4 k_pre[kKRegs] = {};
+  ValueFragment v_pre[kValueFragments] = {};
   load_k(key_begin, k_cur);
   load_v(key_begin, v_cur);
 
@@ -425,7 +446,7 @@ __launch_bounds__(256, 2) __global__
     // prefer -- each lane taking 8 contiguous dims of one key -- puts all 32
     // lanes on rows kVtStride halves apart, which is one bank, and costs a
     // 32-way conflict on every write.
-    {
+    if constexpr (!kHeadMajor) {
 #pragma unroll
       for (std::uint32_t j = 0; j < kVRegs; ++j) {
         const auto* packed = reinterpret_cast<const __half*>(&v_cur[j]);
@@ -434,8 +455,8 @@ __launch_bounds__(256, 2) __global__
           kv_lds[((v_slice + (j * 8) + i) * kVtStride) + v_key] = packed[i];
         }
       }
+      __syncthreads();
     }
-    __syncthreads();
 
     // --- O += P V ---
 #pragma unroll
@@ -444,8 +465,11 @@ __launch_bounds__(256, 2) __global__
       v16h v_frag[kKeyBlocks];
 #pragma unroll
       for (std::uint32_t kb = 0; kb < kKeyBlocks; ++kb) {
-        v_frag[kb] = LoadFrag(
-            &kv_lds[(((dim_tile * 16) + sub) * kVtStride) + (kb * 16)]);
+        if constexpr (kHeadMajor)
+          v_frag[kb] = v_cur[t];
+        else
+          v_frag[kb] = LoadFrag(
+              &kv_lds[(((dim_tile * 16) + sub) * kVtStride) + (kb * 16)]);
       }
 #pragma unroll
       for (std::uint32_t rb = 0; rb < kRowBlocks; ++rb) {
@@ -462,7 +486,7 @@ __launch_bounds__(256, 2) __global__
       k_cur[n] = k_pre[n];
     }
 #pragma unroll
-    for (std::uint32_t n = 0; n < kVRegs; ++n) {
+    for (std::uint32_t n = 0; n < kValueFragments; ++n) {
       v_cur[n] = v_pre[n];
     }
   }
@@ -517,25 +541,47 @@ __launch_bounds__(256, 2) __global__
   }
 }
 
-// FFN scratch is idle during attention. Transpose the existing F16 bytes so
-// each head reads consecutive rows, avoiding strided cache traffic at depth.
+// FFN scratch is idle during attention. Keep K head-major and transpose each
+// 16-key V tile into the layout consumed by WMMA. Persistent KV is unchanged.
 __global__ void PackAttentionHeads(const __half* keys, const __half* values,
                                    __half* packed_keys, __half* packed_values,
                                    std::uint32_t length) {
-  constexpr std::size_t vectors_per_head = kHeadDim / 8;
-  constexpr std::size_t vectors_per_row = kKvHeads * vectors_per_head;
-  const std::size_t i =
-      static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= static_cast<std::size_t>(length) * vectors_per_row)
-    return;
-  const auto pos = i / vectors_per_row;
-  const auto head = (i / vectors_per_head) % kKvHeads;
-  const auto dim = i % vectors_per_head;
-  const auto out = (head * length + pos) * vectors_per_head + dim;
-  reinterpret_cast<uint4*>(packed_keys)[out] =
-      reinterpret_cast<const uint4*>(keys)[i];
-  reinterpret_cast<uint4*>(packed_values)[out] =
-      reinterpret_cast<const uint4*>(values)[i];
+  __shared__ __half tile[16][kHeadDim + 8];
+  // Adjacent blocks read adjacent heads of the same source token tile.
+  const std::uint32_t head = blockIdx.x, base = blockIdx.y * 16;
+  for (std::uint32_t i = threadIdx.x; i < 16 * kHeadDim / 8; i += 256) {
+    const std::uint32_t key = i / (kHeadDim / 8);
+    const std::uint32_t dim = (i % (kHeadDim / 8)) * 8;
+    uint4 value = make_uint4(0, 0, 0, 0);
+    if (base + key < length) {
+      const auto src =
+          (static_cast<std::size_t>(base + key) * kKvHeads + head) * kHeadDim +
+          dim;
+      const auto dst =
+          (static_cast<std::size_t>(head) * length + base + key) * kHeadDim +
+          dim;
+      *reinterpret_cast<uint4*>(packed_keys + dst) =
+          *reinterpret_cast<const uint4*>(keys + src);
+      value = *reinterpret_cast<const uint4*>(values + src);
+    }
+    *reinterpret_cast<uint4*>(&tile[key][dim]) = value;
+  }
+  __syncthreads();
+  const std::size_t padded = (length + 15u) & ~std::size_t{15};
+  for (std::uint32_t i = threadIdx.x; i < 16 * kHeadDim / 8; i += 256) {
+    const std::uint32_t dim = i / 2, key = (i % 2) * 8;
+    union {
+      uint4 packed;
+      __half halves[8];
+    } value;
+#pragma unroll
+    for (std::uint32_t j = 0; j < 8; ++j)
+      value.halves[j] = tile[key + j][dim];
+    *reinterpret_cast<uint4*>(
+        packed_values + static_cast<std::size_t>(head) * padded * kHeadDim +
+        static_cast<std::size_t>(base) * kHeadDim + dim * 16 + key) =
+        value.packed;
+  }
 }
 
 bool LaunchQwenWmmaAttention(
@@ -592,15 +638,18 @@ bool LaunchQwenWmmaAttention(
   const auto length = start_pos + static_cast<std::uint32_t>(batch_size);
   const std::size_t plane_bytes =
       static_cast<std::size_t>(length) * kKvWidth * sizeof(__half);
+  const std::size_t value_bytes =
+      ((static_cast<std::size_t>(length) + 15u) & ~std::size_t{15}) * kKvWidth *
+      sizeof(__half);
   // Copying the prefix pays off only for large chunks. Small prefill tails
   // and speculative commit replays retain the canonical cache directly.
   if (batch_size >= 1024 && start_pos >= 8192 &&
       packed_k_workspace.size_bytes() >= plane_bytes &&
-      packed_v_workspace.size_bytes() >= plane_bytes) {
+      packed_v_workspace.size_bytes() >= value_bytes && key_begin < length &&
+      key_begin % kWmmaKeys == 0) {
     auto* packed_k = reinterpret_cast<__half*>(packed_k_workspace.data());
     auto* packed_v = reinterpret_cast<__half*>(packed_v_workspace.data());
-    const auto vectors = static_cast<std::size_t>(length) * kKvWidth / 8;
-    PackAttentionHeads<<<(vectors + block_size - 1) / block_size, block_size, 0,
+    PackAttentionHeads<<<dim3(kKvHeads, (length + 15u) / 16u), block_size, 0,
                          stream>>>(layer_k, layer_v, packed_k, packed_v,
                                    length);
     WmmaCausalAttention<kWmmaQueryRows, kWmmaKeys, true>

@@ -113,29 +113,25 @@ workload.
 The 2026-09-19 depth control covers C1 pp2048/tg128 at d0 and d32768 on
 both targets, first AR and then adaptive DFlash2 with its Q4 draft. DFlash2
 reproduces the unchanged release's 128-token outputs and matches current AR.
-The d32768 DFlash2 control repeats twice on both releases. The remaining
-depths and concurrent depth sweep are TODO.
+All emitted IDs match between AR and DFlash2. The remaining depths and
+concurrent depth sweep are TODO.
 
 The depth bottleneck is full attention reading strided KV rows. Large chunks
-temporarily copy existing F16 bytes into contiguous per-head planes in idle
-FFN scratch; persistent KV and decoding keep their original layout. The
-WMMA operator test requires exact output and log-sum-exp, repeated execution,
-guarded scratch, undersized-workspace fallback, and both sides of the
-1024-token dispatch boundary at deep context. Softmax keeps its original
-reduction order while holding running statistics in registers.
-
-In separate profiles of the measured d32768 prefill chunk, the layout change
-reduces attention GPU time from 2529 to 1296 ms on Q4 and 2617 to 1298 ms on
-Q8; each adds about 22 ms of copying. Other major stages stay flat. Final
-softmax padding/register changes also pass the exact operator comparison.
-The repeated DFlash2 control improves d32768 prefill by 25% / 22% on Q4/Q8.
-Generation differs by about 1.3% / 1.1%, within the observed run variation;
-no generation gain is claimed.
+temporarily pack existing F16 bytes in idle FFN scratch: keys by head and
+values in 16-key tiles consumed directly by WMMA. Adjacent packing blocks visit
+adjacent source heads. Persistent KV and decoding keep their original layout.
+The WMMA operator test requires exact output and log-sum-exp, repeated
+execution, guarded scratch, independently undersized key/value workspace,
+empty and unaligned key ranges, ragged tails, and both sides of the 1024-token
+dispatch boundary. Softmax and matrix products retain their reduction order.
 
 For prefill changes, the existing target check also covers 128/257/2048-token
-prefixes, repeated prefill and two-token scalar/verification replay. It prints
-SHA-256 fingerprints of full logits and all five feature taps at every prompt
-position, so two builds can be compared without storing logit dumps:
+prefixes and a 1,025-token suffix after restoring an 8K prefix, repeated
+prefill and two-token scalar/verification replay. It prints SHA-256
+fingerprints of full logits and all five feature taps at every prompt position,
+so two builds can be compared without storing logit dumps. All twelve
+prefill/continuation fingerprint records match the unchanged library on both
+Q4 and Q8 for the current layout changes:
 
 ```sh
 nix develop -c build/gpu-test/tests/models/qwen27b/qwen27b_target_test \

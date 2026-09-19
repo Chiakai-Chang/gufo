@@ -18,16 +18,16 @@ Standard sweep: **pp2048 / tg128**, C1. Cells are prefill / generation tok/s.
 
 | Context depth | Q4 | Q8 |
 | ---: | ---: | ---: |
-| 0 | **619.82 / 11.66** | **510.39 / 7.07** |
+| 0 | **631.99 / 11.79** | **504.36 / 7.11** |
 | 4,096 | TODO | TODO |
 | 8,192 | TODO | TODO |
 | 12,288 | TODO | TODO |
 | 16,384 | TODO | TODO |
-| 32,768 | **451.81 / 10.23** | **388.38 / 6.53** |
+| 32,768 | **467.85 / 10.35** | **402.68 / 6.56** |
 
 Measured **2026-09-19**, one warmed release sample per point.
 Q4 uses FP16 activations with packed quantized weights; Q8 retains native wave64.
-At depth, large prefill chunks temporarily group existing KV bytes by head in
+At depth, large prefill chunks pack keys by head and values into WMMA tiles in
 idle FFN scratch. Small chunks read the canonical cache directly. This adds no
 persistent allocation and leaves cache contents and attention arithmetic intact.
 
@@ -35,16 +35,16 @@ persistent allocation and leaves cache contents and attention arithmetic intact.
 
 **pp2048 / tg128**, C1, greedy, Q4_K_M draft and adaptive controller.
 Cells are prefill / generation tok/s. Measured **2026-09-19**:
-one warmed sample at d0, two at d32768.
+one warmed sample per point, except the repeated Q8 d32768 control.
 
 | Context depth | Q4 target | Q8 target |
 | ---: | ---: | ---: |
-| 0 | **571.53 / 34.12** | **473.36 / 24.63** |
+| 0 | **578.04 / 34.32** | **477.27 / 24.71** |
 | 4,096 | TODO | TODO |
 | 8,192 | TODO | TODO |
 | 12,288 | TODO | TODO |
 | 16,384 | TODO | TODO |
-| 32,768 | **427.74 / 30.75** | **372.30 / 26.79** |
+| 32,768 | **442.86 / 31.01** | **384.86 / 27.05** |
 
 These repetitive CLI inputs accept 96.5% / 97.4% of proposals at d32768.
 Greedy outputs match AR. Natural prompts have different acceptance and speed.
