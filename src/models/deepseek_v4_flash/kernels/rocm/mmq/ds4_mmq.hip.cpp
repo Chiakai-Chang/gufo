@@ -12,11 +12,11 @@
 //
 #include "ds4_mmq.h"
 
-#include "common.cuh"
-#include "mmq.cuh"
-#include "quantize.cuh"
-#include "mmid.cuh"
-#include "ds4_mmq_d2r.cuh"
+#include "common.hip.hpp"
+#include "mmq.hip.hpp"
+#include "quantize.hip.hpp"
+#include "mmid.hip.hpp"
+#include "ds4_mmq_d2r.hip.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -33,7 +33,6 @@ static size_t g_aligned_q81_scratch_bytes = 0;
 static int    g_routed_max_expert_rows = 0;
 static int    g_routed_tile_cols = 0;
 
-#if defined(GGML_USE_HIP)
 struct ds4_hip_persistent_scratch {
     void *ptr = nullptr;
     size_t bytes = 0;
@@ -47,9 +46,9 @@ static void *ds4_hip_persistent_scratch_reserve_locked(
         ds4_hip_persistent_scratch *scratch,
         size_t bytes,
         size_t granularity,
-        cudaStream_t stream,
+        hipStream_t stream,
         const char *tag) {
-    if (!scratch || bytes == 0 || stream != (cudaStream_t)0) return nullptr;
+    if (!scratch || bytes == 0 || stream != (hipStream_t)0) return nullptr;
     if (scratch->ptr && scratch->bytes >= bytes) return scratch->ptr;
     if (granularity == 0 || bytes > SIZE_MAX - (granularity - 1u)) {
         return nullptr;
@@ -57,27 +56,26 @@ static void *ds4_hip_persistent_scratch_reserve_locked(
 
     const size_t reserve =
         ((bytes + granularity - 1u) / granularity) * granularity;
-    cudaError_t err = cudaStreamSynchronize(stream);
-    if (err != cudaSuccess) {
+    hipError_t err = hipStreamSynchronize(stream);
+    if (err != hipSuccess) {
         fprintf(stderr, "%s: scratch resize synchronization failed: %s\n",
-                tag, cudaGetErrorString(err));
+                tag, hipGetErrorString(err));
         return nullptr;
     }
 
     void *next = nullptr;
-    err = cudaMalloc(&next, reserve);
-    if (err != cudaSuccess) {
+    err = hipMalloc(&next, reserve);
+    if (err != hipSuccess) {
         fprintf(stderr, "%s: persistent scratch allocation of %zu bytes failed: %s\n",
-                tag, reserve, cudaGetErrorString(err));
-        (void)cudaGetLastError();
+                tag, reserve, hipGetErrorString(err));
+        (void)hipGetLastError();
         return nullptr;
     }
-    if (scratch->ptr) (void)cudaFree(scratch->ptr);
+    if (scratch->ptr) (void)hipFree(scratch->ptr);
     scratch->ptr = next;
     scratch->bytes = reserve;
     return scratch->ptr;
 }
-#endif
 
 extern "C" void ds4_mmq_set_aligned_q81_scratch(void *ptr, size_t bytes) {
     g_aligned_q81_scratch_ptr = ptr;
@@ -136,17 +134,17 @@ extern "C" int ds4_mmq_routed_tile_cols_for_counts(
 
 // M2-Inc2a: registry of producer-emitted q8_1 activations (ds4_cuda.cu).
 // A hit returns canonical block_q8_1 codes for this exact activation
-// pointer (bit-exact vs quantize_row_q8_1_cuda), letting the caller skip
+// pointer (bit-exact vs ds4_quantize_row_q8_1_hip), letting the caller skip
 // its quantize prelude.  Only valid for single-token unpadded rows
 // (ne10_padded == K); the registry itself guarantees freshness (slots are
 // reset by the producing entry every layer and pops are one-shot).
-extern "C" int ds4_cuda_q8_fold_take_q81(const void *src, uint64_t in_dim,
+extern "C" int ds4_hip_q8_fold_take_q81(const void *src, uint64_t in_dim,
                                          const void **q81);
 static char *ds4_mmq_folded_q81(const float *X_f32, int64_t K, int n_tokens,
                                 int64_t ne10_padded) {
     if (n_tokens != 1 || ne10_padded != K) return nullptr;
     const void *p = nullptr;
-    if (!ds4_cuda_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
+    if (!ds4_hip_q8_fold_take_q81((const void *)X_f32, (uint64_t)K, &p)) return nullptr;
     static int logged = 0;
     if (!logged) {
         logged = 1;
@@ -171,11 +169,11 @@ extern "C" int ds4_mmq_init(int device) {
         fprintf(stderr, "ds4_mmq_init: invalid device %d\n", device);
         return -1;
     }
-    ggml_cuda_set_device(device);
+    ds4_ggml_hip_set_device(device);
     // Trigger lazy population of the device-info singleton.
-    const auto & info = ggml_cuda_info();
+    const auto & info = ds4_ggml_hip_info();
     if (info.device_count == 0) {
-        fprintf(stderr, "ds4_mmq_init: no CUDA devices found\n");
+        fprintf(stderr, "ds4_mmq_init: no HIP devices found\n");
         return -1;
     }
     if (device >= info.device_count) {
@@ -188,12 +186,11 @@ extern "C" int ds4_mmq_init(int device) {
 }
 
 extern "C" void ds4_mmq_cleanup(void) {
-#if defined(GGML_USE_HIP)
-    (void)cudaDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     {
         std::lock_guard<std::mutex> lock(g_hip_dense_q81_scratch.mutex);
         if (g_hip_dense_q81_scratch.ptr) {
-            (void)cudaFree(g_hip_dense_q81_scratch.ptr);
+            (void)hipFree(g_hip_dense_q81_scratch.ptr);
             g_hip_dense_q81_scratch.ptr = nullptr;
             g_hip_dense_q81_scratch.bytes = 0;
         }
@@ -201,12 +198,11 @@ extern "C" void ds4_mmq_cleanup(void) {
     {
         std::lock_guard<std::mutex> lock(g_hip_pair_map_scratch.mutex);
         if (g_hip_pair_map_scratch.ptr) {
-            (void)cudaFree(g_hip_pair_map_scratch.ptr);
+            (void)hipFree(g_hip_pair_map_scratch.ptr);
             g_hip_pair_map_scratch.ptr = nullptr;
             g_hip_pair_map_scratch.bytes = 0;
         }
     }
-#endif
 
     g_aligned_q81_scratch_ptr = nullptr;
     g_aligned_q81_scratch_bytes = 0;
@@ -221,7 +217,7 @@ extern "C" void ds4_mmq_cleanup(void) {
 // ----------------------------------------------------------------------------
 
 static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
-#ifdef GGML_CUDA_FORCE_CUBLAS
+#ifdef DS4_GGML_HIP_FORCE_CUBLAS
     GGML_UNUSED(type); GGML_UNUSED(cc); GGML_UNUSED(ne11); GGML_UNUSED(n_experts);
     return false;
 #endif
@@ -260,19 +256,19 @@ static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, i
     if (turing_mma_available(cc)) {
         return true;
     }
-    if (ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A) {
+    if (ds4_ggml_hip_highest_compiled_arch(cc) < DS4_GGML_HIP_CC_DP4A) {
         return false;
     }
-#ifdef GGML_CUDA_FORCE_MMQ
+#ifdef DS4_GGML_HIP_FORCE_MMQ
     GGML_UNUSED(ne11); GGML_UNUSED(n_experts);
     return true;
 #endif
 
-    if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+    if (DS4_GGML_HIP_CC_IS_NVIDIA(cc)) {
         return !fp16_mma_hardware_available(cc) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
     }
     if (amd_mfma_available(cc)) {
-        if (GGML_CUDA_CC_IS_CDNA3(cc)) return true;
+        if (DS4_GGML_HIP_CC_IS_CDNA3(cc)) return true;
         if (n_experts > 64 || ne11 <= 128) return true;
         if (type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1 ||
             type == GGML_TYPE_Q5_0 || type == GGML_TYPE_Q5_1) return true;
@@ -280,25 +276,25 @@ static bool ds4_should_use_mmq_impl(enum ggml_type type, int cc, int64_t ne11, i
         return false;
     }
     if (amd_wmma_available(cc)) {
-        if (GGML_CUDA_CC_IS_RDNA3(cc)) {
+        if (DS4_GGML_HIP_CC_IS_RDNA3(cc)) {
             if (n_experts >= 64) return true;
             switch (type) {
                 case GGML_TYPE_Q2_K: return ne11 <= 128;
-                case GGML_TYPE_Q6_K: return ne11 <= (GGML_CUDA_CC_IS_RDNA3_0(cc) ? 128 : 256);
+                case GGML_TYPE_Q6_K: return ne11 <= (DS4_GGML_HIP_CC_IS_RDNA3_0(cc) ? 128 : 256);
                 case GGML_TYPE_IQ2_XS:
                 case GGML_TYPE_IQ2_S:
-                    return GGML_CUDA_CC_IS_RDNA3_5(cc) || ne11 <= 128;
+                    return DS4_GGML_HIP_CC_IS_RDNA3_5(cc) || ne11 <= 128;
                 default: return true;
             }
         }
         return true;
     }
-    return (!GGML_CUDA_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
+    return (!DS4_GGML_HIP_CC_IS_CDNA(cc)) || ne11 < MMQ_DP4A_MAX_BATCH_SIZE;
 }
 
 extern "C" int ds4_mmq_should_use(int type_x, int64_t ne11, int64_t n_experts) {
-    const int dev = ggml_cuda_get_device();
-    const int cc  = ggml_cuda_info().devices[dev].cc;
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc  = ds4_ggml_hip_info().devices[dev].cc;
     const enum ggml_type t = (enum ggml_type) type_x;
     return ds4_should_use_mmq_impl(t, cc, ne11, n_experts) ? 1 : 0;
 }
@@ -326,16 +322,16 @@ __global__ static void ds4_mmq_sanitize_f32_kernel(float *p, uint64_t n) {
     if (!isfinite(v)) p[i] = 0.0f;
 }
 
-static void ds4_mmq_sanitize_f32(float *p, uint64_t n, cudaStream_t stream) {
+static void ds4_mmq_sanitize_f32(float *p, uint64_t n, hipStream_t stream) {
     if (!p || n == 0) return;
     ds4_mmq_sanitize_f32_kernel<<<(unsigned)((n + 255u) / 256u), 256, 0, stream>>>(p, n);
 }
 
-ggml_backend_cuda_context * get_ctx_for_device(int device) {
-    static ggml_backend_cuda_context * cached[GGML_CUDA_MAX_DEVICES] = {};
-    if (device < 0 || device >= GGML_CUDA_MAX_DEVICES) return nullptr;
+ds4_ggml_hip_context * get_ctx_for_device(int device) {
+    static ds4_ggml_hip_context * cached[DS4_GGML_HIP_MAX_DEVICES] = {};
+    if (device < 0 || device >= DS4_GGML_HIP_MAX_DEVICES) return nullptr;
     if (!cached[device]) {
-        cached[device] = new ggml_backend_cuda_context(device);
+        cached[device] = new ds4_ggml_hip_context(device);
     }
     return cached[device];
 }
@@ -362,7 +358,7 @@ int ds4_mmq_dense_impl(
         int           M,
         int           N,
         int           K,
-        cudaStream_t  stream) {
+        hipStream_t  stream) {
 
     if (!W || !X_f32 || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -379,19 +375,19 @@ int ds4_mmq_dense_impl(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    const int cc  = ggml_cuda_info().devices[dev].cc;
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc  = ds4_ggml_hip_info().devices[dev].cc;
     if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
 
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
 
-    /* Order the pool's cudaMallocAsync/cudaFreeAsync on the SAME
+    /* Order the pool's hipMallocAsync/hipFreeAsync on the SAME
      * stream the kernels below launch on.  The pool defaults to
-     * cudaStreamPerThread; with kernels on the legacy stream the RAII free is
+     * hipStreamPerThread; with kernels on the legacy stream the RAII free is
      * ordered on an EMPTY stream, so the driver can recycle/remap the scratch
      * while the in-flight quantize/GEMM still reads it -> intermittent illegal
      * access under shape churn (the batched-draft early-step crash).  The vec
@@ -418,11 +414,10 @@ int ds4_mmq_dense_impl(
             y_values_per_block +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
 
-    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1 = nullptr;
-#if defined(GGML_USE_HIP)
     std::unique_lock<std::mutex> dense_scratch_lock;
-    if (stream == (cudaStream_t)0) {
+    if (stream == (hipStream_t)0) {
         dense_scratch_lock =
             std::unique_lock<std::mutex>(g_hip_dense_q81_scratch.mutex);
         src1_q8_1 = (char *)ds4_hip_persistent_scratch_reserve_locked(
@@ -432,7 +427,6 @@ int ds4_mmq_dense_impl(
             stream,
             tag);
     }
-#endif
     if (!src1_q8_1) {
         src1_q8_1 = src1_q8_1_pool.alloc(
             ctx->pool(), nbytes_src1_q8_1);
@@ -440,11 +434,11 @@ int ds4_mmq_dense_impl(
 
     // S1.1a fix: the mmq Y (activation) buffer is over-allocated for the kernel's
     // tail-tile reads (the +mmq_x_max blocks above), and ne11 columns may not fill
-    // the final column tile -- but quantize_mmq_q8_1_cuda only writes the ne11 valid
-    // columns.  The mmq kernel (mmq.cuh:3528) unconditionally loads the full column
+    // the final column tile -- but ds4_quantize_mmq_q8_1_hip only writes the ne11 valid
+    // columns.  The mmq kernel (mmq.hip.hpp:3528) unconditionally loads the full column
     // tile, reading the never-written tail.  Pool allocs reuse stale device memory,
     // so that tail is non-deterministic: any allocator/stream perturbation (e.g. an
-    // MTP draft's cudaMalloc) changes it and flips a near-threshold argmax in the
+    // MTP draft's hipMalloc) changes it and flips a near-threshold argmax in the
     // batched forward (confirmed by compute-sanitizer --tool initcheck on a PRO6000
     // / sm_120: 4-byte uninitialized __global__ read in mul_mat_q_process_tile).
     // The tail's dot-products are masked out by write_back, so only their
@@ -452,22 +446,22 @@ int ds4_mmq_dense_impl(
     // (a zero q8_1 block contributes 0 to the dot product).
 
     if (use_native_fp4) {
-        quantize_mmq_fp4_cuda(
+        ds4_quantize_mmq_fp4_hip(
             X_f32, /*ids=*/nullptr, (void *)src1_q8_1,
             type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
             /*ne0=*/ne10_padded, /*ne1=*/ne11, /*ne2=*/ne12, /*ne3=*/ne13,
             stream);
     } else {
-        quantize_mmq_q8_1_cuda(
+        ds4_quantize_mmq_q8_1_hip(
             X_f32, /*ids=*/nullptr, (void *)src1_q8_1,
             type, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
             /*ne0=*/ne10_padded, /*ne1=*/ne11, /*ne2=*/ne12, /*ne3=*/ne13,
             stream);
     }
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: quantize failed: %s\n", tag, hipGetErrorString(err));
         return -2;
     }
 
@@ -482,8 +476,8 @@ int ds4_mmq_dense_impl(
     const int64_t s13    = ne12 * s12;
 
     const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
+        (DS4_GGML_HIP_CC_IS_NVIDIA(cc) && ds4_ggml_hip_highest_compiled_arch(cc) >= DS4_GGML_HIP_CC_VOLTA) ||
+        DS4_GGML_HIP_CC_IS_CDNA(cc);
 
     mmq_args args = {
         /*x=*/(const char *)W,
@@ -501,19 +495,15 @@ int ds4_mmq_dense_impl(
         /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/ne11,
     };
-#if defined(GGML_USE_HIP)
     const bool inline_sanitize =
         type == GGML_TYPE_Q8_0 && !use_stream_k;
     args.sanitize_output = inline_sanitize;
-#else
-    const bool inline_sanitize = false;
-#endif
 
     mul_mat_q_case<type>(*ctx, args, stream);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
     }
     if (!inline_sanitize) {
@@ -526,7 +516,7 @@ int ds4_mmq_dense_impl(
 
 extern "C" int ds4_mmq_q8_0_dense(
         const void * W, const float * X, float * out,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     return ds4_mmq_dense_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_dense", W, X, out, M, N, K, stream);
 }
 
@@ -542,7 +532,7 @@ extern "C" int ds4_mmq_q8_0_dense(
  * (ib = kseg*N + row) matches the quantizer's exactly. */
 extern "C" int ds4_mmq_q8_0_dense_preq(
         const void * W, const void * Y_q8_mmq, size_t y_bytes, float * out,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     const char *tag = "ds4_mmq_q8_0_dense_preq";
     if (!W || !Y_q8_mmq || !out) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -555,11 +545,11 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     if (ne10_padded != (int64_t)K) return -1;  /* producer layout requires no row padding */
 
-    const int dev = ggml_cuda_get_device();
-    const int cc  = ggml_cuda_info().devices[dev].cc;
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc  = ds4_ggml_hip_info().devices[dev].cc;
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
     ds4_pool_set_stream(stream);
@@ -575,14 +565,14 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
     }
     /* Tail-tile slack: deterministic zeros (S1.1a).  ~18 KiB, stream-ordered
      * after the producer's emit on the same stream. */
-    cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
+    hipMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
 
     const int64_t s01 = (int64_t)K / QK8_0;
     const int64_t s12 = (int64_t)N * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
 
     const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
+        (DS4_GGML_HIP_CC_IS_NVIDIA(cc) && ds4_ggml_hip_highest_compiled_arch(cc) >= DS4_GGML_HIP_CC_VOLTA) ||
+        DS4_GGML_HIP_CC_IS_CDNA(cc);
 
     mmq_args args = {
         /*x=*/(const char *)W,
@@ -600,16 +590,12 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
         /*use_stream_k=*/use_stream_k,
         /*ncols_max=*/(int64_t)N,
     };
-#if defined(GGML_USE_HIP)
     const bool inline_sanitize = !use_stream_k;
     args.sanitize_output = inline_sanitize;
-#else
-    const bool inline_sanitize = false;
-#endif
     mul_mat_q_case<GGML_TYPE_Q8_0>(*ctx, args, stream);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: mul_mat_q_case launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
     }
     if (!inline_sanitize) {
@@ -626,7 +612,7 @@ extern "C" int ds4_mmq_q8_0_dense_preq(
 // gates on shape (M%128, K%1024, K<=4096) + n_tok.
 extern "C" int ds4_mmq_q8_0_dense_d2r(
         const void * W_aligned, const float * X_f32, float * out_f32,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     const char *tag = "ds4_mmq_q8_0_dense_d2r";
     if (!W_aligned || !X_f32 || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -636,14 +622,14 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
         fprintf(stderr, "%s: bad shape M=%d N=%d K=%d\n", tag, M, N, K);
         return -1;
     }
-    const int dev = ggml_cuda_get_device();
-    const int cc  = ggml_cuda_info().devices[dev].cc;
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc  = ds4_ggml_hip_info().devices[dev].cc;
     if (!ds4_mmq_q8_0_dense_d2r_available(cc)) {
         return -1;
     }
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
     ds4_pool_set_stream(stream);
@@ -655,16 +641,16 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
         (int64_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1 +
         slack_blocks * sizeof(block_q8_1_mmq);
 
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
-    quantize_mmq_q8_1_cuda(
+    ds4_quantize_mmq_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
         GGML_TYPE_Q8_0, /*ne00=*/K, /*s11=*/(int64_t)K, /*s12=*/0, /*s13=*/0,
         /*ne0=*/ne10_padded, /*ne1=*/(int64_t)N, /*ne2=*/1, /*ne3=*/1,
         stream);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: quantize failed: %s\n", tag, hipGetErrorString(err));
         return -2;
     }
     return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, src1_q8_1.get(), out_f32,
@@ -679,15 +665,15 @@ extern "C" int ds4_mmq_q8_0_dense_d2r(
  * previous larger emit's bytes). */
 extern "C" int ds4_mmq_q8_0_dense_d2r_preq(
         const void * W_aligned, const void * Y_q8_mmq, size_t y_bytes,
-        float * out_f32, int M, int N, int K, cudaStream_t stream) {
+        float * out_f32, int M, int N, int K, hipStream_t stream) {
     if (!W_aligned || !Y_q8_mmq || !out_f32) {
         return -1;
     }
     if (M <= 0 || (M % 128) != 0 || N <= 0 || K <= 0 || (K % 1024) != 0) {
         return -1;
     }
-    const int dev = ggml_cuda_get_device();
-    const int cc  = ggml_cuda_info().devices[dev].cc;
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc  = ds4_ggml_hip_info().devices[dev].cc;
     if (!ds4_mmq_q8_0_dense_d2r_available(cc)) {
         return -1;
     }
@@ -700,32 +686,32 @@ extern "C" int ds4_mmq_q8_0_dense_d2r_preq(
     if (y_bytes < data_bytes + slack_bytes) {
         return -1;
     }
-    cudaMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
+    hipMemsetAsync((char *)Y_q8_mmq + data_bytes, 0, slack_bytes, stream);
     return ds4_mmq_q8_0_dense_d2r_launch(W_aligned, Y_q8_mmq, out_f32,
                                          M, N, K, stream);
 }
 
 extern "C" int ds4_mmq_q2_K_dense(
         const void * W, const float * X, float * out,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     return ds4_mmq_dense_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_dense", W, X, out, M, N, K, stream);
 }
 
 extern "C" int ds4_mmq_iq2_xxs_dense(
         const void * W, const float * X, float * out,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     return ds4_mmq_dense_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_dense", W, X, out, M, N, K, stream);
 }
 
 extern "C" int ds4_mmq_q4_K_dense(
         const void * W, const float * X, float * out,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     return ds4_mmq_dense_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_dense", W, X, out, M, N, K, stream);
 }
 
 extern "C" int ds4_mmq_mxfp4_dense(
         const void * W, const float * X, float * out,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     return ds4_mmq_dense_impl<GGML_TYPE_MXFP4>("ds4_mmq_mxfp4_dense", W, X, out, M, N, K, stream);
 }
 
@@ -738,9 +724,9 @@ extern "C" int ds4_mmq_mxfp4_dense(
 //   - per-token activations [n_tokens, K]
 //   - routing table ids[t, s] = expert id
 // The wrapper invokes:
-//   1. ggml_cuda_launch_mm_ids_helper to build (ids_src1, ids_dst,
+//   1. ds4_ggml_hip_launch_mm_ids_helper to build (ids_src1, ids_dst,
 //      expert_bounds) - permutations that sort assignments by expert.
-//   2. quantize_mmq_q8_1_cuda with ids_src1 - gathers and quantizes the
+//   2. ds4_quantize_mmq_q8_1_hip with ids_src1 - gathers and quantizes the
 //      activation into the expert-major flat layout.
 //   3. mul_mat_q_case<type> with ids_dst + expert_bounds - the matmul.
 // ----------------------------------------------------------------------------
@@ -759,7 +745,7 @@ int ds4_mmq_moe_impl(
         int             n_tokens,
         int             n_experts,
         int             n_expert_used,
-        cudaStream_t    stream,
+        hipStream_t    stream,
         /* ds4 (P4 Inc3): optional aligned-SoA artifact; when non-null the mmq
          * kernel loads tiles from it directly and W is ignored (see mmq_args). */
         const char    * x_soa      = NULL,
@@ -787,13 +773,13 @@ int ds4_mmq_moe_impl(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    const int cc  = ggml_cuda_info().devices[dev].cc;
+    const int dev = ds4_ggml_hip_get_device();
+    const int cc  = ds4_ggml_hip_info().devices[dev].cc;
     if (!ds4_mmq_k_tile_supported<type>(tag, K, cc)) return -1;
 
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
 
@@ -809,9 +795,9 @@ int ds4_mmq_moe_impl(
     const int64_t s02          = (int64_t)M * s01;   // per-expert weight stride in blocks
 
     // 1. Build the expert-major work map.
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
+    ds4_ggml_hip_pool_alloc<int32_t> ids_src1(ctx->pool(), ne_get_rows);
+    ds4_ggml_hip_pool_alloc<int32_t> ids_dst(ctx->pool(), ne_get_rows);
+    ds4_ggml_hip_pool_alloc<int32_t> expert_bounds(ctx->pool(), n_experts + 1);
 
     // mm_ids_helper compacts - it only writes ids_src1
     // entries for in-range router ids and drops invalid ones (the router's NaN
@@ -823,8 +809,8 @@ int ds4_mmq_moe_impl(
     // Zero both id maps so unwritten tail slots gather/scatter row 0 instead:
     // those lanes' output is never consumed (the mmq write-back loop is
     // expert_bounds-bounded), the cost is a few KB of memset on-stream.
-    cudaMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
-    cudaMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
+    hipMemsetAsync(ids_src1.get(), 0, ne_get_rows * sizeof(int32_t), stream);
+    hipMemsetAsync(ids_dst.get(),  0, ne_get_rows * sizeof(int32_t), stream);
 
     // si1 = stride between tokens in the ids tensor, in elements. Our ids is
     // contiguous [n_tokens, n_expert_used] so si1 = n_expert_used.
@@ -840,13 +826,13 @@ int ds4_mmq_moe_impl(
     // variant instead (mmid.cu mm_ids_helper_global) — refusing here used to
     // throw the WHOLE MoE block (including gate/up mmq work) onto the legacy
     // expert-tile fallback, the W8192 prefill cliff.
-    ggml_cuda_launch_mm_ids_helper(
+    ds4_ggml_hip_launch_mm_ids_helper(
         ids, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
         n_experts, n_tokens, n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: mm_ids_helper failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: mm_ids_helper failed: %s\n", tag, hipGetErrorString(err));
         return -2;
     }
 
@@ -861,12 +847,12 @@ int ds4_mmq_moe_impl(
     const size_t nbytes_src1_q8_1 =
         ne_get_rows * ne10_padded * y_block_size / y_values_per_block +
         get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_src1_q8_1);
 
     // S1.1a fix (same as the dense path): the mmq Y buffer is over-allocated for the
     // kernel's tail-tile reads and ne_get_rows columns need not fill the final mmq
     // column tile, but quantize only writes the valid columns.  The mmq kernel
-    // (mmq.cuh:3528) unconditionally loads the full tile, reading the never-written
+    // (mmq.hip.hpp:3528) unconditionally loads the full tile, reading the never-written
     // tail from stale pool memory -> allocator-perturbation-dependent garbage in the
     // (write_back-masked) tail lanes -> non-deterministic batched-forward output.
     // Zero it so the masked-out tail is a deterministic zero.
@@ -878,23 +864,23 @@ int ds4_mmq_moe_impl(
     const int64_t s13_src = (int64_t)K * ne11 * ne12;                   // stride between samples
 
     if (use_native_fp4) {
-        quantize_mmq_fp4_cuda(
+        ds4_quantize_mmq_fp4_hip(
             X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
             /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
             stream);
     } else {
-        quantize_mmq_q8_1_cuda(
+        ds4_quantize_mmq_q8_1_hip(
             X_f32, ids_src1.get(), (void *)src1_q8_1.get(),
             type, /*ne00=*/K, s11_src, s12_src, s13_src,
             /*ne0=*/ne10_padded, /*ne1=*/ne_get_rows, /*ne2=*/1, /*ne3=*/1,
             stream);
     }
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
+    err = hipGetLastError();
+    if (err != hipSuccess) {
         fprintf(stderr, "%s: MMQ activation quantize failed: %s\n",
-                tag, cudaGetErrorString(err));
+                tag, hipGetErrorString(err));
         return -3;
     }
 
@@ -916,8 +902,8 @@ int ds4_mmq_moe_impl(
     const int64_t s13_mmq = ne12 * s12_mmq;
 
     const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
+        (DS4_GGML_HIP_CC_IS_NVIDIA(cc) && ds4_ggml_hip_highest_compiled_arch(cc) >= DS4_GGML_HIP_CC_VOLTA) ||
+        DS4_GGML_HIP_CC_IS_CDNA(cc);
 
     if (type == GGML_TYPE_Q2_K && x_soa != nullptr &&
         K % 256 == 0 && M % 2 == 0 && ne_get_rows >= D2R_MIN_COLS) {
@@ -931,7 +917,7 @@ int ds4_mmq_moe_impl(
             const size_t d2r_work_bytes =
                 ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
             if (d2r_work_bytes != 0) {
-                ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
+                ds4_ggml_hip_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
                 const int d2r_rc = ds4_mmq_q2_K_moe_d2r_launch(
                     x_soa, soa_blocks, src1_q8_1.get(), ids_dst.get(), expert_bounds.get(),
                     out_f32, M, K, ne_get_rows, n_experts, d2r_work.get(), d2r_work_bytes,
@@ -974,9 +960,9 @@ int ds4_mmq_moe_impl(
 
     mul_mat_q_case<type>(*ctx, args, stream);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, cudaGetErrorString(err));
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: mul_mat_q_case (moe) launch failed: %s\n", tag, hipGetErrorString(err));
         return -4;
     }
     if (sanitize_out) {
@@ -1074,7 +1060,7 @@ template<ggml_type type, bool token_expert_unique = false>
 int ds4_mmq_moe_pair_impl(
     const char* tag, const void* W_a, const void* W_b, const float* X_f32,
     const int32_t* ids, float* out_a, float* out_b, int M, int K, int n_tokens,
-    int n_experts, int n_expert_used, cudaStream_t stream,
+    int n_experts, int n_expert_used, hipStream_t stream,
     /* ds4 (P4 Inc3): optional aligned-SoA artifacts for W_a / W_b (same
      * shape, so one block count); see ds4_mmq_moe_impl. */
     const char* xa_soa = NULL, const char* xb_soa = NULL,
@@ -1125,14 +1111,14 @@ int ds4_mmq_moe_pair_impl(
     return -1;
   }
 
-  const int dev = ggml_cuda_get_device();
-  const int cc = ggml_cuda_info().devices[dev].cc;
+  const int dev = ds4_ggml_hip_get_device();
+  const int cc = ds4_ggml_hip_info().devices[dev].cc;
   if (!ds4_mmq_k_tile_supported<type>(tag, K, cc))
     return -1;
 
-  ggml_backend_cuda_context* ctx = get_ctx_for_device(dev);
+  ds4_ggml_hip_context* ctx = get_ctx_for_device(dev);
   if (!ctx) {
-    fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+    fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
     return -1;
   }
 
@@ -1148,15 +1134,13 @@ int ds4_mmq_moe_pair_impl(
   const int64_t s01 = (int64_t)K / blck;
   const int64_t s02 = (int64_t)M * s01;
 
-  ggml_cuda_pool_alloc<int32_t> ids_src1_alloc;
-  ggml_cuda_pool_alloc<int32_t> ids_dst_alloc;
-  ggml_cuda_pool_alloc<int32_t> expert_bounds_alloc;
+  ds4_ggml_hip_pool_alloc<int32_t> ids_src1_alloc;
+  ds4_ggml_hip_pool_alloc<int32_t> ids_dst_alloc;
+  ds4_ggml_hip_pool_alloc<int32_t> expert_bounds_alloc;
   int32_t* ids_src1 = nullptr;
   int32_t* ids_dst = nullptr;
   int32_t* expert_bounds = nullptr;
-#if defined(GGML_USE_HIP)
     std::unique_lock<std::mutex> pair_map_scratch_lock;
-#endif
     void *direct_work = nullptr;
     size_t direct_work_bytes = 0;
 
@@ -1217,8 +1201,7 @@ int ds4_mmq_moe_pair_impl(
         ids_dst = (int32_t *)ids_dst_raw;
         expert_bounds = (int32_t *)expert_bounds_raw;
     } else {
-#if defined(GGML_USE_HIP)
-        if (stream == (cudaStream_t)0 &&
+        if (stream == (hipStream_t)0 &&
             (uint64_t)ne_get_rows <=
                 (SIZE_MAX / sizeof(int32_t) - (size_t)n_experts - 1u) / 2u) {
             pair_map_scratch_lock =
@@ -1238,7 +1221,6 @@ int ds4_mmq_moe_pair_impl(
                 expert_bounds = ids_dst + ne_get_rows;
             }
         }
-#endif
         if (!ids_src1) {
             ids_src1 = ids_src1_alloc.alloc(ctx->pool(), ne_get_rows);
             ids_dst = ids_dst_alloc.alloc(ctx->pool(), ne_get_rows);
@@ -1252,27 +1234,27 @@ int ds4_mmq_moe_pair_impl(
 
     // Same cap guard as ds4_mmq_moe_impl (see comment there): past the smem
     // cap the launcher takes the bit-identical global variant (P5).
-    cudaError_t err = cudaSuccess;
+    hipError_t err = hipSuccess;
     {
       // Zero the ID maps, as in ds4_mmq_moe_impl
       // so entries dropped by mm_ids_helper never expose stale pool memory.
-      cudaMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
-      cudaMemsetAsync(ids_dst, 0, ne_get_rows * sizeof(int32_t), stream);
-      ggml_cuda_launch_mm_ids_helper(
+      hipMemsetAsync(ids_src1, 0, ne_get_rows * sizeof(int32_t), stream);
+      hipMemsetAsync(ids_dst, 0, ne_get_rows * sizeof(int32_t), stream);
+      ds4_ggml_hip_launch_mm_ids_helper(
           ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens,
           n_expert_used, /*nchannels_y=*/(int)ne11, si1, sis1, stream);
 
-      err = cudaGetLastError();
-      if (err != cudaSuccess) {
+      err = hipGetLastError();
+      if (err != hipSuccess) {
         fprintf(stderr, "%s: mm_ids_helper failed: %s\n", tag,
-                cudaGetErrorString(err));
+                hipGetErrorString(err));
         return -2;
       }
     }
 
     const bool use_stream_k =
-        (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_VOLTA) ||
-        GGML_CUDA_CC_IS_CDNA(cc);
+        (DS4_GGML_HIP_CC_IS_NVIDIA(cc) && ds4_ggml_hip_highest_compiled_arch(cc) >= DS4_GGML_HIP_CC_VOLTA) ||
+        DS4_GGML_HIP_CC_IS_CDNA(cc);
     if (swiglu_epilogue && use_stream_k) {
         return -13;
     }
@@ -1295,21 +1277,19 @@ int ds4_mmq_moe_pair_impl(
      * down Q8_1. The direct path needs both simultaneously, but writes down
      * Q8_1 into caller-owned gate scratch instead of growing the CUDA pool. */
     {
-    ggml_cuda_pool_alloc<char> src1_q8_1_alloc;
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1_alloc;
     char *src1_q8_1 = nullptr;
     if (direct_gateup_q8) {
         src1_q8_1 = (char *)fused_down->input_q8_scratch;
-#if defined(GGML_USE_HIP)
     } else if (g_aligned_q81_scratch_ptr &&
                g_aligned_q81_scratch_bytes >= nbytes_src1_q8_1) {
         src1_q8_1 = (char *)g_aligned_q81_scratch_ptr;
-#endif
     } else {
         src1_q8_1 = src1_q8_1_alloc.alloc(ctx->pool(), nbytes_src1_q8_1);
     }
 
     // S1.1a fix (same as the dense/moe paths): zero the over-allocated mmq Y buffer
-    // so the kernel's unconditional masked-out tail-tile read (mmq.cuh:3528) returns
+    // so the kernel's unconditional masked-out tail-tile read (mmq.hip.hpp:3528) returns
     // a deterministic zero instead of allocator-perturbation-dependent stale memory.
     const int64_t s11_src = (int64_t)K;
     const int64_t s12_src = (int64_t)K * ne11;
@@ -1341,23 +1321,23 @@ int ds4_mmq_moe_pair_impl(
     const int64_t quant_rows = moe_yind ? (int64_t)n_tokens : ne_get_rows;
     if (!input_q8_ext) {
       if (use_native_fp4) {
-        quantize_mmq_fp4_cuda(X_f32, moe_yind ? nullptr : ids_src1,
+        ds4_quantize_mmq_fp4_hip(X_f32, moe_yind ? nullptr : ids_src1,
                               (void*)src1_q8_1, type, /*ne00=*/K, s11_src,
                               s12_src, s13_src,
                               /*ne0=*/ne10_padded, /*ne1=*/quant_rows,
                               /*ne2=*/1, /*ne3=*/1, stream);
       } else {
-        quantize_mmq_q8_1_cuda(X_f32, moe_yind ? nullptr : ids_src1,
+        ds4_quantize_mmq_q8_1_hip(X_f32, moe_yind ? nullptr : ids_src1,
                                (void*)src1_q8_1, type, /*ne00=*/K, s11_src,
                                s12_src, s13_src,
                                /*ne0=*/ne10_padded, /*ne1=*/quant_rows,
                                /*ne2=*/1, /*ne3=*/1, stream);
       }
 
-      err = cudaGetLastError();
-      if (err != cudaSuccess) {
+      err = hipGetLastError();
+      if (err != hipSuccess) {
         fprintf(stderr, "%s: MMQ activation quantize failed: %s\n", tag,
-                cudaGetErrorString(err));
+                hipGetErrorString(err));
         return -3;
       }
     }
@@ -1427,7 +1407,7 @@ int ds4_mmq_moe_pair_impl(
             const size_t d2r_work_bytes =
                 ds4_mmq_iq2_xxs_moe_d2r_pair_scratch_bytes(ne_get_rows, n_experts);
             if (d2r_work_bytes != 0) {
-                ggml_cuda_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
+                ds4_ggml_hip_pool_alloc<char> d2r_work(ctx->pool(), d2r_work_bytes);
 
                 const int d2r_rc = ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
                         xa_soa, xb_soa, soa_blocks, src1_q8_1, ids_dst,
@@ -1474,10 +1454,10 @@ int ds4_mmq_moe_pair_impl(
 
     {
       mul_mat_q_case<type>(*ctx, args, stream);
-      err = cudaGetLastError();
-      if (err != cudaSuccess) {
+      err = hipGetLastError();
+      if (err != hipSuccess) {
         fprintf(stderr, "%s: mul_mat_q_case (pair a) launch failed: %s\n", tag,
-                cudaGetErrorString(err));
+                hipGetErrorString(err));
         return -4;
       }
     }
@@ -1495,10 +1475,10 @@ int ds4_mmq_moe_pair_impl(
     }
     {
       mul_mat_q_case<type>(*ctx, args, stream);
-      err = cudaGetLastError();
-      if (err != cudaSuccess) {
+      err = hipGetLastError();
+      if (err != hipSuccess) {
         fprintf(stderr, "%s: mul_mat_q_case (pair b) launch failed: %s\n", tag,
-                cudaGetErrorString(err));
+                hipGetErrorString(err));
         return -5;
       }
     }
@@ -1511,7 +1491,7 @@ int ds4_mmq_moe_pair_impl(
             (size_t)ne_get_rows * (size_t)down_ne10_padded * sizeof(block_q8_1) / QK8_1;
         const size_t tail_q8_bytes =
             (size_t)get_mmq_x_max_host(cc) * sizeof(block_q8_1_mmq);
-        ggml_cuda_pool_alloc<char> down_q8_1(
+        ds4_ggml_hip_pool_alloc<char> down_q8_1(
             ctx->pool(), logical_q8_bytes + tail_q8_bytes);
 
         const uint64_t mid_values = (uint64_t)ne_get_rows * (uint64_t)M;
@@ -1520,23 +1500,23 @@ int ds4_mmq_moe_pair_impl(
                                     0, stream>>>(
               out_a, out_b, fused_down->router_weights, fused_down->mid_f32,
               mid_values, M, fused_down->clamp);
-          err = cudaGetLastError();
-          if (err != cudaSuccess) {
+          err = hipGetLastError();
+          if (err != hipSuccess) {
             fprintf(stderr, "%s: weighted SwiGLU launch failed: %s\n", tag,
-                    cudaGetErrorString(err));
+                    hipGetErrorString(err));
             return -6;
           }
 
-          quantize_mmq_q8_1_cuda(
+          ds4_quantize_mmq_q8_1_hip(
               fused_down->mid_f32, ids_dst, (void*)down_q8_1.get(),
               GGML_TYPE_Q2_K, /*ne00=*/M, /*s01=*/M,
               /*s02=*/(int64_t)M, /*s03=*/(int64_t)M * ne_get_rows,
               /*ne0=*/down_ne10_padded, /*ne1=*/ne_get_rows,
               /*ne2=*/1, /*ne3=*/1, stream);
-          err = cudaGetLastError();
-          if (err != cudaSuccess) {
-            fprintf(stderr, "%s: down quantize_mmq_q8_1_cuda failed: %s\n", tag,
-                    cudaGetErrorString(err));
+          err = hipGetLastError();
+          if (err != hipSuccess) {
+            fprintf(stderr, "%s: down ds4_quantize_mmq_q8_1_hip failed: %s\n", tag,
+                    hipGetErrorString(err));
             return -7;
           }
         }
@@ -1581,7 +1561,7 @@ int ds4_mmq_moe_pair_impl(
             const size_t work_bytes =
                 ds4_mmq_q2_K_moe_d2r_scratch_bytes(ne_get_rows, n_experts);
             if (work_bytes != 0u) {
-                ggml_cuda_pool_alloc<char> work(ctx->pool(), work_bytes);
+                ds4_ggml_hip_pool_alloc<char> work(ctx->pool(), work_bytes);
 
                 down_done = ds4_mmq_q2_K_moe_d2r_launch(
                         fused_down->W_soa,
@@ -1601,10 +1581,10 @@ int ds4_mmq_moe_pair_impl(
         }
         if (!down_done) {
           mul_mat_q_case<GGML_TYPE_Q2_K>(*ctx, down_args, stream);
-          err = cudaGetLastError();
-          if (err != cudaSuccess) {
+          err = hipGetLastError();
+          if (err != hipSuccess) {
             fprintf(stderr, "%s: fused Q2_K down launch failed: %s\n", tag,
-                    cudaGetErrorString(err));
+                    hipGetErrorString(err));
             return -8;
           }
         }
@@ -1621,7 +1601,7 @@ int ds4_mmq_moe_pair_impl(
 extern "C" int ds4_mmq_q8_0_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q8_0>("ds4_mmq_q8_0_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
 }
@@ -1629,7 +1609,7 @@ extern "C" int ds4_mmq_q8_0_moe(
 extern "C" int ds4_mmq_q2_K_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q2_K>("ds4_mmq_q2_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
 }
@@ -1637,7 +1617,7 @@ extern "C" int ds4_mmq_q2_K_moe(
 extern "C" int ds4_mmq_iq2_xxs_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_IQ2_XXS>("ds4_mmq_iq2_xxs_moe", W, X, ids, out, M, K,
                                                n_tokens, n_experts, n_expert_used, stream);
 }
@@ -1649,7 +1629,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe(
 extern "C" int ds4_mmq_q2_K_moe_soa(
         const void * W_soa, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     if (M <= 0 || M % 2 != 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_mmq_q2_K_moe_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
         return -1;
@@ -1667,7 +1647,7 @@ extern "C" int ds4_mmq_q2_K_moe_soa(
 extern "C" int ds4_mmq_q4_K_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_Q4_K>("ds4_mmq_q4_K_moe", W, X, ids, out, M, K,
                                             n_tokens, n_experts, n_expert_used, stream);
 }
@@ -1675,7 +1655,7 @@ extern "C" int ds4_mmq_q4_K_moe(
 extern "C" int ds4_mmq_mxfp4_moe(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_impl<GGML_TYPE_MXFP4>("ds4_mmq_mxfp4_moe", W, X, ids, out, M, K,
                                              n_tokens, n_experts, n_expert_used, stream);
 }
@@ -1684,7 +1664,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
@@ -1694,7 +1674,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_token_bound(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
   return ds4_mmq_moe_pair_impl<GGML_TYPE_IQ2_XXS, true>(
       "ds4_mmq_iq2_xxs_moe_pair_token_bound", W_a, W_b, X, ids, out_a, out_b, M,
       K, n_tokens, n_experts, n_expert_used, stream);
@@ -1705,7 +1685,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_token_bound_swiglu(
         const float * X, const int32_t * ids, const float * router_weights,
         float * gate, float * discard, float * mid_f32, void * mid_f16,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, hipStream_t stream) {
     const ds4_mmq_swiglu_epilogue epilogue = {
         router_weights,
         mid_f32,
@@ -1725,7 +1705,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_soa(
         const void * Wa_soa, const void * Wb_soa,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     if (M <= 0 || K <= 0 || K % 256 != 0 || n_experts <= 0) {
         fprintf(stderr, "ds4_mmq_iq2_xxs_moe_pair_soa: bad shape M=%d K=%d nexp=%d\n", M, K, n_experts);
         return -1;
@@ -1751,7 +1731,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
         float * gate, float * up, float * mid_f32, float * down,
         int expert_mid_dim, int expert_in_dim, int out_dim,
         int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, hipStream_t stream) {
     if (expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
         n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
         n_expert_used > n_experts || expert_in_dim % 256 != 0 ||
@@ -1805,7 +1785,7 @@ extern "C" int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
         float * down,
         int expert_mid_dim, int expert_in_dim, int out_dim,
         int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, hipStream_t stream) {
     if (expert_mid_dim <= 0 || expert_in_dim <= 0 || out_dim <= 0 ||
         n_tokens <= 0 || n_experts <= 0 || n_expert_used <= 0 ||
         n_expert_used > n_experts || expert_in_dim % 256 != 0 ||
@@ -1870,7 +1850,7 @@ extern "C" int ds4_mmq_q4_K_moe_pair(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_pair_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
@@ -1880,7 +1860,7 @@ extern "C" int ds4_mmq_mxfp4_moe_pair(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_pair_impl<GGML_TYPE_MXFP4>(
         "ds4_mmq_mxfp4_moe_pair", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
@@ -1891,8 +1871,8 @@ extern "C" int ds4_mmq_mxfp4_moe_pair(
 //
 // mmvq is upstream's matrix-vector matmul family, optimised for the
 // n_tokens <= MMVQ_MAX_BATCH_SIZE=8 regime. Unlike mmq it consumes the
-// CANONICAL block_q8_1 layout (via quantize_row_q8_1_cuda), not the
-// interleaved block_q8_1_mmq that quantize_mmq_q8_1_cuda produces.
+// CANONICAL block_q8_1 layout (via ds4_quantize_row_q8_1_hip), not the
+// interleaved block_q8_1_mmq that ds4_quantize_mmq_q8_1_hip produces.
 //
 // The single-W _moe_vec entries cover:
 //   - the down matmul at decode (treating [n_tokens=1, n_expert_used=6]
@@ -1908,7 +1888,7 @@ extern "C" int ds4_mmq_mxfp4_moe_pair(
 // only at ncols_dst=1, so n_tokens=1 is the only valid case.
 // ----------------------------------------------------------------------------
 
-#include "mmvq.cuh"
+#include "mmvq.hip.hpp"
 
 namespace {
 
@@ -1924,7 +1904,7 @@ int ds4_mmq_moe_vec_impl(
         int             n_tokens,
         int             n_experts,
         int             n_expert_used,
-        cudaStream_t    stream) {
+        hipStream_t    stream) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -1950,14 +1930,14 @@ int ds4_mmq_moe_vec_impl(
     // FD Inc2a: n_tokens beyond the per-launch column cap no longer rejects;
     // the launch loop below splits the column dim into capped chunks.
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
 
-    // Route the pool's cudaMallocAsync / cudaFreeAsync through the same
+    // Route the pool's hipMallocAsync / hipFreeAsync through the same
     // stream the caller uses for kernel launches so allocations do not
     // invalidate graph capture.
     ds4_pool_set_stream(stream);
@@ -1967,7 +1947,7 @@ int ds4_mmq_moe_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t nbytes_q8_1 =
         (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1_pool;
     src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
     char* src1_q8_1_ptr = src1_q8_1_pool.get();
 
@@ -1975,21 +1955,21 @@ int ds4_mmq_moe_vec_impl(
     //       Logical src1 [K, ne11=1, ne12=n_tokens, ne13=1] - K innermost.
     // s12 = stride between channels = K * ne11 = K.
     // s13 = stride between samples = K * ne11 * ne12 = K * n_tokens.
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1_ptr,
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
-                tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n",
+                tag, hipGetErrorString(err));
         return -2;
     }
 
-    // 2. mmvq stride setup. Mirror upstream's ggml_cuda_mul_mat_vec_q
+    // 2. mmvq stride setup. Mirror upstream's ds4_ggml_hip_mul_mat_vec_q
     //    dispatch (mmvq.cu:1101-1136).
     //
     //    For MoE (ids != nullptr): per the dispatch math at line 1121-1130,
@@ -2025,9 +2005,9 @@ int ds4_mmq_moe_vec_impl(
     // is n_expert_used.
     const int ids_stride = n_expert_used;
 
-    ggml_cuda_mm_fusion_args_device fusion = {};
+    ds4_ggml_hip_mm_fusion_args_device fusion = {};
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float), stream);
+    hipMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float), stream);
 
     // FD Inc2a: one mmvq launch serves at most col_cap columns -- the moe
     // kernel runs one warp per column (block.y = ncols_dst) under
@@ -2041,8 +2021,8 @@ int ds4_mmq_moe_vec_impl(
     // ceil(n_tokens / col_cap) launches; every per-column stride (vy, ids,
     // dst) is uniform, so a chunk is plain pointer offsets.  The single
     // quantize above already covers all columns.
-    const int cc      = ggml_cuda_info().devices[dev].cc;
-    const int col_cap = get_mmvq_mmid_max_batch(type, ggml_cuda_highest_compiled_arch(cc));
+    const int cc      = ds4_ggml_hip_info().devices[dev].cc;
+    const int col_cap = get_mmvq_mmid_max_batch(type, ds4_ggml_hip_highest_compiled_arch(cc));
 
     for (int c0 = 0; c0 < n_tokens; c0 += col_cap) {
         const int ncols = (n_tokens - c0 < col_cap) ? (n_tokens - c0) : col_cap;
@@ -2065,10 +2045,10 @@ int ds4_mmq_moe_vec_impl(
             /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
             /*ids_stride=*/ids_stride, stream);
 
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
+        err = hipGetLastError();
+        if (err != hipSuccess) {
             fprintf(stderr, "%s: mul_mat_vec_q_switch_type launch failed: %s (cols %d..%d cap %d)\n",
-                    tag, cudaGetErrorString(err), c0, c0 + ncols - 1, col_cap);
+                    tag, hipGetErrorString(err), c0, c0 + ncols - 1, col_cap);
             return -3;
         }
     }
@@ -2083,7 +2063,7 @@ int ds4_mmq_moe_vec_impl(
 // Layout contract (see ds4_mmq.h): W_aligned = [__half dq[nblk]][pad to 64B]
 // [uint2 qs[nblk*8]], nblk = n_experts * M * (K/256), block linear order equal
 // to the raw tensor byte order.  Per-pair integer math is bit-identical to
-// vec_dot_iq2_xxs_q8_1 (vecdotq.cuh); only the float accumulation order
+// vec_dot_iq2_xxs_q8_1 (vecdotq.hip.hpp); only the float accumulation order
 // differs (per-warp-row here vs per-mmvq-tile there).  Proven +12% over the
 // raw-layout vec path at the production decode shape
 // (cuda/mmq/test/proto_iq2_aligned.cu).
@@ -2128,11 +2108,11 @@ __global__ void iq2_xxs_aligned_moe_vec_kernel(
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
-            sumi = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi);
+            sumi = ds4_ggml_hip_dp4a(grid0, u[k0 + 0], sumi);
 
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
-            sumi = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi);
+            sumi = ds4_ggml_hip_dp4a(grid1, u[k0 + 1], sumi);
         }
         const int ls = aux32 >> 27 | 1;
         sumi = sumi * ls / 8;
@@ -2191,11 +2171,11 @@ __global__ void iq2_xxs_aligned_moe_pair_vec_kernel(
 
             const int signs0 = __vcmpne4(signs & 0x08040201, 0);
             const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
-            sumi = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi);
+            sumi = ds4_ggml_hip_dp4a(grid0, u[k0 + 0], sumi);
 
             const int signs1 = __vcmpne4(signs & 0x80402010, 0);
             const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
-            sumi = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi);
+            sumi = ds4_ggml_hip_dp4a(grid1, u[k0 + 1], sumi);
         }
         const int ls = aux32 >> 27 | 1;
         sumi = sumi * ls / 8;
@@ -2262,20 +2242,20 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_kernel(
                 const uint32_t signs = unpack_ksigns(cwg.y >> (7 * k0 / 2));
                 const int signs0 = __vcmpne4(signs & 0x08040201, 0);
                 const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
-                sumi_g = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi_g);
+                sumi_g = ds4_ggml_hip_dp4a(grid0, u[k0 + 0], sumi_g);
                 const int signs1 = __vcmpne4(signs & 0x80402010, 0);
                 const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
-                sumi_g = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi_g);
+                sumi_g = ds4_ggml_hip_dp4a(grid1, u[k0 + 1], sumi_g);
             }
             {
                 const uint2 grid_pos = ((const uint2 *)iq2xxs_grid)[aux8u[k0 / 2]];
                 const uint32_t signs = unpack_ksigns(cwu.y >> (7 * k0 / 2));
                 const int signs0 = __vcmpne4(signs & 0x08040201, 0);
                 const int grid0  = __vsub4(grid_pos.x ^ signs0, signs0);
-                sumi_u = ggml_cuda_dp4a(grid0, u[k0 + 0], sumi_u);
+                sumi_u = ds4_ggml_hip_dp4a(grid0, u[k0 + 0], sumi_u);
                 const int signs1 = __vcmpne4(signs & 0x80402010, 0);
                 const int grid1  = __vsub4(grid_pos.y ^ signs1, signs1);
-                sumi_u = ggml_cuda_dp4a(grid1, u[k0 + 1], sumi_u);
+                sumi_u = ds4_ggml_hip_dp4a(grid1, u[k0 + 1], sumi_u);
             }
         }
         const int ls_g = cwg.y >> 27 | 1;
@@ -2404,10 +2384,10 @@ __global__ void iq2_xxs_aligned_moe_gate_up_mid_dedup_kernel(
             for (int m = 0; m < MAXM; m++) {
                 if (m < nm) {
                     const int *u = (const int *)xcol[m][q8i].qs;
-                    sumi_g[m] = ggml_cuda_dp4a(g0g, u[k0 + 0], sumi_g[m]);
-                    sumi_g[m] = ggml_cuda_dp4a(g1g, u[k0 + 1], sumi_g[m]);
-                    sumi_u[m] = ggml_cuda_dp4a(g0u, u[k0 + 0], sumi_u[m]);
-                    sumi_u[m] = ggml_cuda_dp4a(g1u, u[k0 + 1], sumi_u[m]);
+                    sumi_g[m] = ds4_ggml_hip_dp4a(g0g, u[k0 + 0], sumi_g[m]);
+                    sumi_g[m] = ds4_ggml_hip_dp4a(g1g, u[k0 + 1], sumi_g[m]);
+                    sumi_u[m] = ds4_ggml_hip_dp4a(g0u, u[k0 + 0], sumi_u[m]);
+                    sumi_u[m] = ds4_ggml_hip_dp4a(g1u, u[k0 + 1], sumi_u[m]);
                 }
             }
         }
@@ -2467,7 +2447,7 @@ int ds4_mmq_moe_pair_raw_vec_impl(
         int             n_tokens,
         int             n_experts,
         int             n_expert_used,
-        cudaStream_t    stream) {
+        hipStream_t    stream) {
 
     if (!W_a || !W_b || !X_f32 || !ids || !out_a || !out_b) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -2487,10 +2467,10 @@ int ds4_mmq_moe_pair_raw_vec_impl(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
 
@@ -2499,23 +2479,23 @@ int ds4_mmq_moe_pair_raw_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
                                 sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1_ptr = nullptr;
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     
 
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1_ptr,
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
-                tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n",
+                tag, hipGetErrorString(err));
         return -2;
     }
 
@@ -2527,13 +2507,13 @@ int ds4_mmq_moe_pair_raw_vec_impl(
     const int64_t s1_dst    = (int64_t)M;
     const int64_t s2_dst    = (int64_t)n_expert_used * M;
     const int ids_stride    = n_expert_used;
-    const int cc            = ggml_cuda_info().devices[dev].cc;
-    const int col_cap       = get_mmvq_mmid_max_batch(type, ggml_cuda_highest_compiled_arch(cc));
-    ggml_cuda_mm_fusion_args_device fusion = {};
+    const int cc            = ds4_ggml_hip_info().devices[dev].cc;
+    const int col_cap       = get_mmvq_mmid_max_batch(type, ds4_ggml_hip_highest_compiled_arch(cc));
+    ds4_ggml_hip_mm_fusion_args_device fusion = {};
 
     const size_t out_bytes = (size_t)M * (size_t)n_tokens * (size_t)n_expert_used * sizeof(float);
-    cudaMemsetAsync(out_a, 0, out_bytes, stream);
-    cudaMemsetAsync(out_b, 0, out_bytes, stream);
+    hipMemsetAsync(out_a, 0, out_bytes, stream);
+    hipMemsetAsync(out_b, 0, out_bytes, stream);
 
     for (int c0 = 0; c0 < n_tokens; c0 += col_cap) {
         const int ncols = (n_tokens - c0 < col_cap) ? (n_tokens - c0) : col_cap;
@@ -2559,10 +2539,10 @@ int ds4_mmq_moe_pair_raw_vec_impl(
             /*nsamples_x=*/1, /*nsamples_dst=*/1,
             /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
             /*ids_stride=*/ids_stride, stream);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
+        err = hipGetLastError();
+        if (err != hipSuccess) {
             fprintf(stderr, "%s: mul_mat_vec_q_switch_type (a) failed: %s (cols %d..%d cap %d)\n",
-                    tag, cudaGetErrorString(err), c0, c0 + ncols - 1, col_cap);
+                    tag, hipGetErrorString(err), c0, c0 + ncols - 1, col_cap);
             return -3;
         }
 
@@ -2583,10 +2563,10 @@ int ds4_mmq_moe_pair_raw_vec_impl(
             /*nsamples_x=*/1, /*nsamples_dst=*/1,
             /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
             /*ids_stride=*/ids_stride, stream);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
+        err = hipGetLastError();
+        if (err != hipSuccess) {
             fprintf(stderr, "%s: mul_mat_vec_q_switch_type (b) failed: %s (cols %d..%d cap %d)\n",
-                    tag, cudaGetErrorString(err), c0, c0 + ncols - 1, col_cap);
+                    tag, hipGetErrorString(err), c0, c0 + ncols - 1, col_cap);
             return -4;
         }
     }
@@ -2609,7 +2589,7 @@ int ds4_mmq_moe_pair_vec_impl(
         int             K,
         int             n_experts,
         int             n_expert_used,
-        cudaStream_t    stream) {
+        hipStream_t    stream) {
 
     if (!W_a || !W_b || !X_f32 || !ids || !out_silu) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -2629,14 +2609,14 @@ int ds4_mmq_moe_pair_vec_impl(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
 
-    // Route the pool's cudaMallocAsync through the caller-supplied stream
+    // Route the pool's hipMallocAsync through the caller-supplied stream
     // for graph capture compatibility.  See ds4_mmq_moe_vec_impl.
     ds4_pool_set_stream(stream);
 
@@ -2646,19 +2626,19 @@ int ds4_mmq_moe_pair_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
                                 sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
 
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
-                tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n",
+                tag, hipGetErrorString(err));
         return -2;
     }
 
@@ -2674,11 +2654,11 @@ int ds4_mmq_moe_pair_vec_impl(
     // mmvq's kernel will compute, for each (channel_dst, row):
     //   a = vec_dot(W_a, x); b = vec_dot(W_b, x);
     //   dst = silu(a) * b
-    ggml_cuda_mm_fusion_args_device fusion = {};
+    ds4_ggml_hip_mm_fusion_args_device fusion = {};
     fusion.gate   = W_b;
     fusion.glu_op = GGML_GLU_OP_SWIGLU;
 
-    cudaMemsetAsync(out_silu, 0, (size_t)M * (size_t)n_expert_used * sizeof(float), stream);
+    hipMemsetAsync(out_silu, 0, (size_t)M * (size_t)n_expert_used * sizeof(float), stream);
 
     mul_mat_vec_q_switch_type(
         /*vx=*/W_a, /*type_x=*/type,
@@ -2699,10 +2679,10 @@ int ds4_mmq_moe_pair_vec_impl(
         /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
         /*ids_stride=*/ids_stride, stream);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
+    err = hipGetLastError();
+    if (err != hipSuccess) {
         fprintf(stderr, "%s: mul_mat_vec_q_switch_type (fused) launch failed: %s\n",
-                tag, cudaGetErrorString(err));
+                tag, hipGetErrorString(err));
         return -3;
     }
     ds4_mmq_sanitize_f32(out_silu, (uint64_t)M * (uint64_t)n_expert_used, stream);
@@ -2718,7 +2698,7 @@ int ds4_mmq_dense_vec_impl(
         int           M,
         int           N,
         int           K,
-        cudaStream_t  stream) {
+        hipStream_t  stream) {
 
     if (!W || !X_f32 || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -2738,14 +2718,14 @@ int ds4_mmq_dense_vec_impl(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
 
-    // Route the pool's cudaMallocAsync through the caller-supplied stream
+    // Route the pool's hipMallocAsync through the caller-supplied stream
     // for graph capture compatibility.  See ds4_mmq_moe_vec_impl.
     ds4_pool_set_stream(stream);
 
@@ -2753,20 +2733,20 @@ int ds4_mmq_dense_vec_impl(
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)N * ne10_padded *
                                 sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1(ctx->pool(), nbytes_q8_1);
 
     // Dense src1 layout: K innermost, N next; ne11=N, ne12=1, ne13=1.
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1.get(),
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
         /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
         stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
-                tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n",
+                tag, hipGetErrorString(err));
         return -2;
     }
 
@@ -2782,9 +2762,9 @@ int ds4_mmq_dense_vec_impl(
     const int64_t s12_y     = (int64_t)N * s11_y;
     const int64_t s1_dst    = (int64_t)M;
 
-    ggml_cuda_mm_fusion_args_device fusion = {};
+    ds4_ggml_hip_mm_fusion_args_device fusion = {};
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
+    hipMemsetAsync(out_f32, 0, (size_t)M * (size_t)N * sizeof(float), stream);
 
     mul_mat_vec_q_switch_type(
         /*vx=*/W, /*type_x=*/type,
@@ -2805,10 +2785,10 @@ int ds4_mmq_dense_vec_impl(
         /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
         /*ids_stride=*/0, stream);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
+    err = hipGetLastError();
+    if (err != hipSuccess) {
         fprintf(stderr, "%s: mul_mat_vec_q_switch_type (dense) launch failed: %s\n",
-                tag, cudaGetErrorString(err));
+                tag, hipGetErrorString(err));
         return -3;
     }
     ds4_mmq_sanitize_f32(out_f32, (uint64_t)M * (uint64_t)N, stream);
@@ -2862,9 +2842,9 @@ static __global__ void ds4_mmq_moe_down_sum6_q8_1_qwarp32_kernel(
         const uint32_t stride_channel_x) {
 
     constexpr int top_k = 6;
-    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qk = ds4_ggml_hip_type_traits<type>::qk;
     constexpr int q8_per_k = qk / QK8_1;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int qi  = ds4_ggml_hip_type_traits<type>::qi;
     constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
     constexpr int lanes_per_k = qi / vdr;
     constexpr int blocks_per_iter = vdr * 16 / qi;
@@ -2925,9 +2905,9 @@ static __global__ void ds4_mmq_moe_gate_up_mid_q8_1_qwarp32_kernel(
         const float clamp) {
 
     constexpr int top_k = 6;
-    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int qk = ds4_ggml_hip_type_traits<type>::qk;
     constexpr int q8_per_k = qk / QK8_1;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int qi  = ds4_ggml_hip_type_traits<type>::qi;
     constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
     constexpr int lanes_per_k = qi / vdr;
     constexpr int blocks_per_iter = vdr * 16 / qi;
@@ -2990,10 +2970,10 @@ static __global__ void ds4_mmq_moe_down_sum6_vec_kernel(
         const uint32_t stride_channel_x) {
 
     constexpr int top_k = 6;
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int qk  = ds4_ggml_hip_type_traits<type>::qk;
+    constexpr int qi  = ds4_ggml_hip_type_traits<type>::qi;
     constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int warp_size = ds4_ggml_hip_get_physical_warp_size();
 
     const uint32_t slot  = threadIdx.y;
     const uint32_t token = blockIdx.y;
@@ -3064,7 +3044,7 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         int             n_tokens,
         int             n_experts,
         int             n_expert_used,
-        cudaStream_t    stream) {
+        hipStream_t    stream) {
 
     if (!W || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -3080,10 +3060,10 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
 
@@ -3094,23 +3074,23 @@ int ds4_mmq_moe_down_sum6_vec_impl(
     const size_t nbytes_q8_1 = (size_t)n_assignments * ne10_padded *
                                sizeof(block_q8_1) / QK8_1;
 
-    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1_ptr = nullptr;
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     
 
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1_ptr,
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_assignments,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_assignments, /*ne3=*/1,
         stream);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
-                tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n",
+                tag, hipGetErrorString(err));
         return -2;
     }
 
@@ -3127,10 +3107,10 @@ int ds4_mmq_moe_down_sum6_vec_impl(
         (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
         stride_row_x, stride_col_y, stride_channel_x);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
+    err = hipGetLastError();
+    if (err != hipSuccess) {
         fprintf(stderr, "%s: fused down+sum launch failed: %s\n",
-                tag, cudaGetErrorString(err));
+                tag, hipGetErrorString(err));
         return -3;
     }
 
@@ -3155,10 +3135,10 @@ static __global__ void ds4_mmq_moe_gate_up_mid_vec_kernel(
         const float clamp) {
 
     constexpr int top_k = 6;
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int qk  = ds4_ggml_hip_type_traits<type>::qk;
+    constexpr int qi  = ds4_ggml_hip_type_traits<type>::qi;
     constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int warp_size = ds4_ggml_hip_get_physical_warp_size();
 
     const uint32_t slot  = threadIdx.y;
     const uint32_t token = blockIdx.y;
@@ -3232,10 +3212,10 @@ static __global__ void ds4_mmq_moe_gate_up_mid_vec_by_slot_kernel(
         const float clamp) {
 
     constexpr int top_k = 6;
-    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
-    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+    constexpr int qk  = ds4_ggml_hip_type_traits<type>::qk;
+    constexpr int qi  = ds4_ggml_hip_type_traits<type>::qi;
     constexpr int vdr = ds4_mmq_vdr_mmvq_value<type>::value;
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int warp_size = ds4_ggml_hip_get_physical_warp_size();
 
     const uint32_t slot  = blockIdx.y;
     const uint32_t token = token0 + threadIdx.y;
@@ -3306,7 +3286,7 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         int             n_experts,
         int             n_expert_used,
         float           clamp,
-        cudaStream_t    stream) {
+        hipStream_t    stream) {
 
     if (!W_gate || !W_up || !X_f32 || !ids || !weights || !mid_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -3322,10 +3302,10 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
 
@@ -3335,27 +3315,27 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
     const size_t nbytes_q8_1 = (size_t)n_tokens * ne10_padded *
                                sizeof(block_q8_1) / QK8_1;
 
-    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1_pool;
     // M2-Inc2a: the fused HC stage may have emitted this activation's q8_1
     // codes already (ffn_norm) -- take them and skip the quantize prelude.
     char *src1_q8_1_ptr = ds4_mmq_folded_q81(X_f32, K, n_tokens, ne10_padded);
-    cudaError_t err;
+    hipError_t err;
     if (!src1_q8_1_ptr) {
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     
 
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1_ptr,
         type, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n",
-                tag, cudaGetErrorString(err));
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n",
+                tag, hipGetErrorString(err));
         return -2;
     }
     }
@@ -3372,10 +3352,10 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
         (uint32_t)K, (uint32_t)M, (uint32_t)n_tokens, (uint32_t)n_experts,
         stride_row_x, stride_col_y, stride_channel_x, clamp);
 
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
+    err = hipGetLastError();
+    if (err != hipSuccess) {
         fprintf(stderr, "%s: fused gate+up qwarp launch failed: %s\n",
-                tag, cudaGetErrorString(err));
+                tag, hipGetErrorString(err));
         return -3;
     }
 
@@ -3387,7 +3367,7 @@ int ds4_mmq_moe_gate_up_mid_vec_impl(
 extern "C" int ds4_mmq_q8_0_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_vec_impl<GGML_TYPE_Q8_0>(
         "ds4_mmq_q8_0_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
@@ -3396,7 +3376,7 @@ extern "C" int ds4_mmq_q8_0_moe_vec(
 extern "C" int ds4_mmq_q2_K_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_vec_impl<GGML_TYPE_Q2_K>(
         "ds4_mmq_q2_K_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
@@ -3405,7 +3385,7 @@ extern "C" int ds4_mmq_q2_K_moe_vec(
 extern "C" int ds4_mmq_iq2_xxs_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_vec_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
@@ -3414,7 +3394,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_vec(
 extern "C" int ds4_mmq_q4_K_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
@@ -3423,7 +3403,7 @@ extern "C" int ds4_mmq_q4_K_moe_vec(
 extern "C" int ds4_mmq_mxfp4_moe_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_vec_impl<GGML_TYPE_MXFP4>(
         "ds4_mmq_mxfp4_moe_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
@@ -3457,7 +3437,7 @@ __global__ void iq2_xxs_aligned_derepack_kernel(
 
 extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
         const void * W_aligned, void * raw_out,
-        int M, int K, int n_experts, cudaStream_t stream) {
+        int M, int K, int n_experts, hipStream_t stream) {
     const char *tag = "ds4_mmq_iq2_xxs_aligned_derepack";
     if (!W_aligned || !raw_out) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -3472,9 +3452,9 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_derepack(
         (const uint2 *)((const char *)W_aligned + dq_bytes),
         (const __half *)W_aligned,
         nblk);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
     }
     return 0;
@@ -3513,14 +3493,14 @@ __global__ void q8_0_aligned_dense_vec_kernel(
         const int4 w1 = qs[(rbase + b) * 2 + 1];
         const int *u = (const int *)x8[b].qs;
         int sumi = 0;
-        sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
-        sumi = ggml_cuda_dp4a(w0.y, u[1], sumi);
-        sumi = ggml_cuda_dp4a(w0.z, u[2], sumi);
-        sumi = ggml_cuda_dp4a(w0.w, u[3], sumi);
-        sumi = ggml_cuda_dp4a(w1.x, u[4], sumi);
-        sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
-        sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
-        sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
+        sumi = ds4_ggml_hip_dp4a(w0.x, u[0], sumi);
+        sumi = ds4_ggml_hip_dp4a(w0.y, u[1], sumi);
+        sumi = ds4_ggml_hip_dp4a(w0.z, u[2], sumi);
+        sumi = ds4_ggml_hip_dp4a(w0.w, u[3], sumi);
+        sumi = ds4_ggml_hip_dp4a(w1.x, u[4], sumi);
+        sumi = ds4_ggml_hip_dp4a(w1.y, u[5], sumi);
+        sumi = ds4_ggml_hip_dp4a(w1.z, u[6], sumi);
+        sumi = ds4_ggml_hip_dp4a(w1.w, u[7], sumi);
         acc += __half2float(dq[rbase + b]) * __low2float(x8[b].ds) * (float)sumi;
     }
 #pragma unroll
@@ -3563,14 +3543,14 @@ __global__ void q8_0_aligned_dense_vec_nc_kernel(
             const block_q8_1 *xb = &x8[(size_t)c * nb + b];
             const int *u = (const int *)xb->qs;
             int sumi = 0;
-            sumi = ggml_cuda_dp4a(w0.x, u[0], sumi);
-            sumi = ggml_cuda_dp4a(w0.y, u[1], sumi);
-            sumi = ggml_cuda_dp4a(w0.z, u[2], sumi);
-            sumi = ggml_cuda_dp4a(w0.w, u[3], sumi);
-            sumi = ggml_cuda_dp4a(w1.x, u[4], sumi);
-            sumi = ggml_cuda_dp4a(w1.y, u[5], sumi);
-            sumi = ggml_cuda_dp4a(w1.z, u[6], sumi);
-            sumi = ggml_cuda_dp4a(w1.w, u[7], sumi);
+            sumi = ds4_ggml_hip_dp4a(w0.x, u[0], sumi);
+            sumi = ds4_ggml_hip_dp4a(w0.y, u[1], sumi);
+            sumi = ds4_ggml_hip_dp4a(w0.z, u[2], sumi);
+            sumi = ds4_ggml_hip_dp4a(w0.w, u[3], sumi);
+            sumi = ds4_ggml_hip_dp4a(w1.x, u[4], sumi);
+            sumi = ds4_ggml_hip_dp4a(w1.y, u[5], sumi);
+            sumi = ds4_ggml_hip_dp4a(w1.z, u[6], sumi);
+            sumi = ds4_ggml_hip_dp4a(w1.w, u[7], sumi);
             acc[c] += dw * __low2float(xb->ds) * (float)sumi;
         }
     }
@@ -3592,7 +3572,7 @@ extern "C" uint64_t ds4_mmq_q8_0_aligned_bytes(int M, int K) {
 
 extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
         const void * W_aligned, const float * X_f32, float * out_f32,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     const char *tag = "ds4_mmq_q8_0_aligned_dense_vec";
     if (!W_aligned || !X_f32 || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -3603,34 +3583,34 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     // also guarantees ne10_padded == K, so the q8_1 col stride is exactly nb.
     if (N < 1 || N > 8 || M <= 0 || K <= 0 || K % 1024 != 0) return -1;
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
     ds4_pool_set_stream(stream);
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)N * ne10_padded * sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> q8_pool;
+    ds4_ggml_hip_pool_alloc<char> q8_pool;
     // M2-Inc2a: producer-emitted q8_1 codes (qr_norm from the qkv-rms
     // kernel) -- take them and skip the quantize prelude.  Single-column
     // producers only; verify widths always quantize.
     char *x8 = N == 1 ? ds4_mmq_folded_q81(X_f32, K, 1, ne10_padded) : NULL;
-    cudaError_t err;
+    hipError_t err;
     if (!x8) {
         q8_pool.alloc(ctx->pool(), nbytes_q8_1);
         x8 = q8_pool.get();
     
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)x8,
         GGML_TYPE_Q8_0, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K * N, /*s13=*/(int64_t)K * N,
         /*ne0=*/ne10_padded, /*ne1=*/N, /*ne2=*/1, /*ne3=*/1,
         stream);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n", tag, hipGetErrorString(err));
         return -2;
     }
     }
@@ -3653,9 +3633,9 @@ extern "C" int ds4_mmq_q8_0_aligned_dense_vec(
     case 7: q8_0_aligned_dense_vec_nc_kernel<7><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
     case 8: q8_0_aligned_dense_vec_nc_kernel<8><<<(unsigned)M, 32, 0, stream>>>(out_f32, qsp, dqp, x8p, M, K / 32); break;
     }
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
     }
     return 0;
@@ -3704,12 +3684,12 @@ static __device__ __forceinline__ float q2_k_vec_dot_windowed(
 
         const int vi = (v >> (2*i)) & 0x03030303;
 
-        sumf_d += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * (sc & 0xF));
+        sumf_d += d8[i] * (ds4_ggml_hip_dp4a(vi, u[i], 0) * (sc & 0xF));
 
         int m = sc >> 4;
         m |= m <<  8;
         m |= m << 16;
-        sumf_m += d8[i] * ggml_cuda_dp4a(m, u[i], 0);
+        sumf_m += d8[i] * ds4_ggml_hip_dp4a(m, u[i], 0);
     }
     const float2 dm2f = __half22float2(dm2);
     return dm2f.x*sumf_d - dm2f.y*sumf_m;
@@ -3718,7 +3698,7 @@ static __device__ __forceinline__ float q2_k_vec_dot_windowed(
 // Twin of mul_mat_vec_q_moe<GGML_TYPE_Q2_K, 2> at the down-leg call shape
 // (nchannels_dst == 1, ids_stride == 1): grid (M/2, 1), block (32, ncols_dst),
 // warp per assignment column.  Keeps the -1 router-id guard (task #23).
-__launch_bounds__(8*32, 1)   /* MMVQ_MAX_BATCH_SIZE (mmvq.cuh) * warp; not included here */
+__launch_bounds__(8*32, 1)   /* MMVQ_MAX_BATCH_SIZE (mmvq.hip.hpp) * warp; not included here */
 __global__ static void q2_k_aligned_moe_vec_kernel(
         const uint2 * __restrict__ dm2_soa,
         const int4  * __restrict__ sc4_soa,
@@ -3839,7 +3819,7 @@ extern "C" uint64_t ds4_mmq_q2_k_aligned_bytes(int M, int K, int n_experts) {
 extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
         const void * W_aligned, const float * X_f32, const int32_t * ids,
         float * out_f32, int M, int K, int n_tokens, int n_experts,
-        int n_expert_used, cudaStream_t stream) {
+        int n_expert_used, hipStream_t stream) {
     const char *tag = "ds4_mmq_q2_K_aligned_moe_vec";
     if (!W_aligned || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -3852,10 +3832,10 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
     ds4_pool_set_stream(stream);
@@ -3864,7 +3844,7 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
      * codes feeding the twin are bit-identical to the raw path's. */
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1_ptr = nullptr;
     if (g_aligned_q81_scratch_ptr &&
         g_aligned_q81_scratch_bytes >= nbytes_q8_1) {
@@ -3873,22 +3853,22 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     }
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1_ptr,
         GGML_TYPE_Q2_K, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n", tag, hipGetErrorString(err));
         return -2;
     }
 
     const int64_t s12_y  = ne10_padded / QK8_1;
     const int64_t s2_dst = (int64_t)M;   /* n_expert_used == 1 */
 
-    cudaMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * sizeof(float), stream);
+    hipMemsetAsync(out_f32, 0, (size_t)M * (size_t)n_tokens * sizeof(float), stream);
 
     const uint64_t npair = (uint64_t)n_experts * (uint64_t)(M/2) * (uint64_t)(K / 256);
     const uint64_t dm_bytes = (npair * 8u + 63u) & ~63ull;
@@ -3910,10 +3890,10 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
             (uint32_t)K, (uint32_t)M,
             (uint32_t)s12_y, (uint32_t)s2_dst,
             (uint32_t)ncols);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) {
+        err = hipGetLastError();
+        if (err != hipSuccess) {
             fprintf(stderr, "%s: kernel launch failed: %s (cols %d..%d)\n",
-                    tag, cudaGetErrorString(err), c0, c0 + ncols - 1);
+                    tag, hipGetErrorString(err), c0, c0 + ncols - 1);
             return -3;
         }
     }
@@ -3924,7 +3904,7 @@ extern "C" int ds4_mmq_q2_K_aligned_moe_vec(
 
 extern "C" int ds4_mmq_q2_K_aligned_derepack(
         const void * W_aligned, void * raw_out,
-        int M, int K, int n_experts, cudaStream_t stream) {
+        int M, int K, int n_experts, hipStream_t stream) {
     const char *tag = "ds4_mmq_q2_K_aligned_derepack";
     if (!W_aligned || !raw_out) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -3942,9 +3922,9 @@ extern "C" int ds4_mmq_q2_K_aligned_derepack(
         (const int4 *)((const char *)W_aligned + dm_bytes),
         (const uint2 *)((const char *)W_aligned + dm_bytes + sc_bytes),
         nblk, (uint32_t)(K / 256), (uint32_t)M);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
     }
     return 0;
@@ -3962,11 +3942,11 @@ extern "C" uint64_t ds4_mmq_iq2_xxs_aligned_bytes(int M, int K, int n_experts) {
 // pool otherwise) or nullptr on failure; *pool must outlive the launches.
 static char *iq2_aligned_quantize_xn(
         const char *tag, const float *X_f32, int K, int n_tokens,
-        ggml_cuda_pool_alloc<char> *pool, cudaStream_t stream) {
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+        ds4_ggml_hip_pool_alloc<char> *pool, hipStream_t stream) {
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return nullptr;
     }
     ds4_pool_set_stream(stream);
@@ -3986,15 +3966,15 @@ static char *iq2_aligned_quantize_xn(
         pool->alloc(ctx->pool(), nbytes_q8_1);
         ptr = pool->get();
     }
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)ptr,
         GGML_TYPE_IQ2_XXS, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n", tag, hipGetErrorString(err));
         return nullptr;
     }
     return ptr;
@@ -4005,7 +3985,7 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
         const float * X_f32, const int32_t * ids,
         float * gate_out, float * up_out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_pair_vec";
     if (!W_gate_aligned || !W_up_aligned || !X_f32 || !ids || !gate_out || !up_out) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -4015,7 +3995,7 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
         n_expert_used <= 0 || n_expert_used > n_experts || K % 1024 != 0) {
         return -1;
     }
-    ggml_cuda_pool_alloc<char> q8_pool;
+    ds4_ggml_hip_pool_alloc<char> q8_pool;
     char *x8 = iq2_aligned_quantize_xn(tag, X_f32, K, n_tokens, &q8_pool, stream);
     if (!x8) return -2;
 
@@ -4029,9 +4009,9 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
         (const uint2 *)((const char *)W_up_aligned + dq_bytes),
         (const __half *)W_up_aligned,
         (const block_q8_1 *)x8, ids, M, K / 256, K / 32, n_expert_used);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
     }
     return 0;
@@ -4042,7 +4022,7 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
         const float * X_f32, const int32_t * ids, const float * weights,
         float * mid_f32,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, hipStream_t stream) {
     const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec";
     if (!W_gate_aligned || !W_up_aligned || !X_f32 || !ids || !weights || !mid_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -4052,7 +4032,7 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
         n_expert_used <= 0 || n_expert_used > n_experts || K % 1024 != 0) {
         return -1;
     }
-    ggml_cuda_pool_alloc<char> q8_pool;
+    ds4_ggml_hip_pool_alloc<char> q8_pool;
     char *x8 = iq2_aligned_quantize_xn(tag, X_f32, K, n_tokens, &q8_pool, stream);
     if (!x8) return -2;
 
@@ -4091,9 +4071,9 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
             mid_f32, qs_g, dq_g, qs_u, dq_u,
             (const block_q8_1 *)x8, ids, weights, M, K / 256, K / 32, n_expert_used, clamp);
     }
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
     }
     return 0;
@@ -4102,7 +4082,7 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
 extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
         const void * W_aligned, const float * X_f32, const int32_t * ids, float * out_f32,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     const char *tag = "ds4_mmq_iq2_xxs_aligned_moe_vec";
     if (!W_aligned || !X_f32 || !ids || !out_f32) {
         fprintf(stderr, "%s: null pointer\n", tag);
@@ -4116,10 +4096,10 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
         return -1;
     }
 
-    const int dev = ggml_cuda_get_device();
-    ggml_backend_cuda_context * ctx = get_ctx_for_device(dev);
+    const int dev = ds4_ggml_hip_get_device();
+    ds4_ggml_hip_context * ctx = get_ctx_for_device(dev);
     if (!ctx) {
-        fprintf(stderr, "%s: failed to get cuda context for device %d\n", tag, dev);
+        fprintf(stderr, "%s: failed to get HIP context for device %d\n", tag, dev);
         return -1;
     }
     ds4_pool_set_stream(stream);
@@ -4129,20 +4109,20 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
     // scratch when enabled).
     const int64_t ne10_padded = GGML_PAD((int64_t)K, MATRIX_ROW_PADDING);
     const size_t  nbytes_q8_1 = (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
-    ggml_cuda_pool_alloc<char> src1_q8_1_pool;
+    ds4_ggml_hip_pool_alloc<char> src1_q8_1_pool;
     char *src1_q8_1_ptr = nullptr;
         src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1);
         src1_q8_1_ptr = src1_q8_1_pool.get();
     
-    quantize_row_q8_1_cuda(
+    ds4_quantize_row_q8_1_hip(
         X_f32, /*ids=*/nullptr, (void *)src1_q8_1_ptr,
         GGML_TYPE_IQ2_XXS, /*ne00=*/K,
         /*s11=*/(int64_t)K, /*s12=*/(int64_t)K, /*s13=*/(int64_t)K * n_tokens,
         /*ne0=*/ne10_padded, /*ne1=*/1, /*ne2=*/n_tokens, /*ne3=*/1,
         stream);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: quantize_row_q8_1_cuda failed: %s\n", tag, cudaGetErrorString(err));
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: ds4_quantize_row_q8_1_hip failed: %s\n", tag, hipGetErrorString(err));
         return -2;
     }
 
@@ -4155,9 +4135,9 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
     iq2_xxs_aligned_moe_vec_kernel<<<grid, 32, 0, stream>>>(
         out_f32, qs, dq, (const block_q8_1 *)src1_q8_1_ptr, ids, M, K / 256,
         K / 32, n_expert_used);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, cudaGetErrorString(err));
+    err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "%s: kernel launch failed: %s\n", tag, hipGetErrorString(err));
         return -3;
     }
 
@@ -4168,7 +4148,7 @@ extern "C" int ds4_mmq_iq2_xxs_aligned_moe_vec(
 extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_Q2_K>(
         "ds4_mmq_q2_K_moe_down_sum6_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
@@ -4177,7 +4157,7 @@ extern "C" int ds4_mmq_q2_K_moe_down_sum6_vec(
 extern "C" int ds4_mmq_q4_K_moe_down_sum6_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_down_sum6_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
@@ -4186,7 +4166,7 @@ extern "C" int ds4_mmq_q4_K_moe_down_sum6_vec(
 extern "C" int ds4_mmq_mxfp4_moe_down_sum6_vec(
         const void * W, const float * X, const int32_t * ids, float * out,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_down_sum6_vec_impl<GGML_TYPE_MXFP4>(
         "ds4_mmq_mxfp4_moe_down_sum6_vec", W, X, ids, out, M, K,
         n_tokens, n_experts, n_expert_used, stream);
@@ -4196,7 +4176,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_gate_up_mid_vec(
         const void * W_gate, const void * W_up,
         const float * X, const int32_t * ids, const float * weights, float * mid,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, hipStream_t stream) {
     return ds4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
         M, K, n_tokens, n_experts, n_expert_used, clamp, stream);
@@ -4206,7 +4186,7 @@ extern "C" int ds4_mmq_q4_K_moe_gate_up_mid_vec(
         const void * W_gate, const void * W_up,
         const float * X, const int32_t * ids, const float * weights, float * mid,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, hipStream_t stream) {
     return ds4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
         M, K, n_tokens, n_experts, n_expert_used, clamp, stream);
@@ -4216,7 +4196,7 @@ extern "C" int ds4_mmq_mxfp4_moe_gate_up_mid_vec(
         const void * W_gate, const void * W_up,
         const float * X, const int32_t * ids, const float * weights, float * mid,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        float clamp, cudaStream_t stream) {
+        float clamp, hipStream_t stream) {
     return ds4_mmq_moe_gate_up_mid_vec_impl<GGML_TYPE_MXFP4>(
         "ds4_mmq_mxfp4_moe_gate_up_mid_vec", W_gate, W_up, X, ids, weights, mid,
         M, K, n_tokens, n_experts, n_expert_used, clamp, stream);
@@ -4226,7 +4206,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_vec(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_silu,
         int M, int K, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_pair_vec_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair_vec", W_a, W_b, X, ids, out_silu,
         M, K, n_experts, n_expert_used, stream);
@@ -4236,7 +4216,7 @@ extern "C" int ds4_mmq_q4_K_moe_pair_vec(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_silu,
         int M, int K, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_pair_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_pair_vec", W_a, W_b, X, ids, out_silu,
         M, K, n_experts, n_expert_used, stream);
@@ -4246,7 +4226,7 @@ extern "C" int ds4_mmq_iq2_xxs_moe_pair_raw_vec(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_pair_raw_vec_impl<GGML_TYPE_IQ2_XXS>(
         "ds4_mmq_iq2_xxs_moe_pair_raw_vec", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
@@ -4256,7 +4236,7 @@ extern "C" int ds4_mmq_q4_K_moe_pair_raw_vec(
         const void * W_a, const void * W_b,
         const float * X, const int32_t * ids, float * out_a, float * out_b,
         int M, int K, int n_tokens, int n_experts, int n_expert_used,
-        cudaStream_t stream) {
+        hipStream_t stream) {
     return ds4_mmq_moe_pair_raw_vec_impl<GGML_TYPE_Q4_K>(
         "ds4_mmq_q4_K_moe_pair_raw_vec", W_a, W_b, X, ids, out_a, out_b,
         M, K, n_tokens, n_experts, n_expert_used, stream);
@@ -4264,22 +4244,22 @@ extern "C" int ds4_mmq_q4_K_moe_pair_raw_vec(
 
 extern "C" int ds4_mmq_q8_0_dense_vec(
         const void * W, const float * X, float * out,
-        int M, int N, int K, cudaStream_t stream) {
+        int M, int N, int K, hipStream_t stream) {
     return ds4_mmq_dense_vec_impl<GGML_TYPE_Q8_0>(
         "ds4_mmq_q8_0_dense_vec", W, X, out, M, N, K, stream);
 }
 
 // Explicit instantiations. One per quant type the public API exposes.
 // Each instantiation drags in the load_tiles_<type> + vec_dot_<type>_*
-// device functions from mmq.cuh, so the .o objects below contain everything
+// device functions from mmq.hip.hpp, so the .o objects below contain everything
 // needed to link against the public C entries.
 template void mul_mat_q_case<GGML_TYPE_Q8_0>(
-    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q2_K>(
-    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_IQ2_XXS>(
-    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_Q4_K>(
-    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);
 template void mul_mat_q_case<GGML_TYPE_MXFP4>(
-    ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream);
+    ds4_ggml_hip_context & ctx, const mmq_args & args, hipStream_t stream);

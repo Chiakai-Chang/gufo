@@ -3,14 +3,7 @@
 
 #pragma once
 
-#if defined(GGML_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
-#ifndef cudaStream_t
-typedef hipStream_t cudaStream_t;
-#endif
-#else
-#include <cuda_runtime.h>
-#endif
 
 #include <stddef.h>
 #include <stdint.h>
@@ -36,7 +29,7 @@ int ds4_mmq_q2_K_moe_d2r_launch(
     int             n_experts,
     void          * worklist_scratch,
     size_t          worklist_scratch_bytes,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 bool ds4_mmq_q8_0_dense_d2r_available(int cc);
 
@@ -50,7 +43,7 @@ int ds4_mmq_q8_0_dense_d2r_launch(
     int            M,
     int            N,
     int            K,
-    cudaStream_t   stream);
+    hipStream_t   stream);
 
 int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
     const void    * gate_soa,
@@ -67,7 +60,7 @@ int ds4_mmq_iq2_xxs_moe_d2r_pair_launch(
     int             n_experts,
     void          * worklist_scratch,
     size_t          worklist_scratch_bytes,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Complete target-prefill gate/up path: both IQ2_XXS projections share one
 // activation tile, then sanitize + clamp + SwiGLU + routing weight are folded
@@ -95,4 +88,4 @@ int ds4_mmq_iq2_xxs_moe_d2r_fused_launch(
     float           clamp,
     void          * worklist_scratch,
     size_t          worklist_scratch_bytes,
-    cudaStream_t    stream);
+    hipStream_t    stream);

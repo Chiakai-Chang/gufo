@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "src/models/minimax_h3/audio_vae.hpp"
-#include "src/models/minimax_h3/audio_vae_ops.cuh"
+#include "src/models/minimax_h3/audio_vae_ops.hip.hpp"
 #include "src/models/minimax_h3/json.hpp"
 
 namespace gufo::minimax_h3 {

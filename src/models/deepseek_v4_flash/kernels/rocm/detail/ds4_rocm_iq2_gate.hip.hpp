@@ -1,5 +1,5 @@
 #pragma once
-#include "../iq2_tables.inc"
+#include "../iq2_tables.hip.hpp"
 #include "ds4_rocm_device.hip.hpp"
 
 __device__ static float dev_f16_to_f32(uint16_t v) {

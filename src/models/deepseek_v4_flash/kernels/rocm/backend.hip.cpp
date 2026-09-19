@@ -8,7 +8,7 @@
 /* MMQ can reuse a producer-emitted Q8_1 activation instead of quantizing its
  * own. This backend keeps no such registry, so MMQ always takes its regular
  * activation-quantize prelude. */
-extern "C" int ds4_cuda_q8_fold_take_q81(
+extern "C" int ds4_hip_q8_fold_take_q81(
         const void *src, uint64_t in_dim, const void **q81) {
     (void)src;
     (void)in_dim;

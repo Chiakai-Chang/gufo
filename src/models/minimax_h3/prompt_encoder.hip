@@ -31,7 +31,7 @@
 #include <vector>
 
 #include "src/models/minimax_h3/prompt_encoder.hpp"
-#include "src/models/minimax_h3/prompt_encoder_ops.cuh"
+#include "src/models/minimax_h3/prompt_encoder_ops.hip.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {

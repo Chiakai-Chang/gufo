@@ -15,7 +15,7 @@
 #include <vector>
 
 #include "src/models/minimax_h3/prompt_encoder.hpp"
-#include "src/models/minimax_h3/prompt_encoder_ops.cuh"
+#include "src/models/minimax_h3/prompt_encoder_ops.hip.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 #include "src/models/minimax_h3/tokenizer.hpp"
 

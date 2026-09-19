@@ -1,5 +1,5 @@
-#include "common.cuh"
-#include "mmid.cuh"
+#include "common.hip.hpp"
+#include "mmid.hip.hpp"
 
 // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
 struct mm_ids_helper_store {
@@ -24,11 +24,11 @@ static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_help
 // ids_dst describes the same mapping but for the dst tensor.
 // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
 template <int n_expert_used_template>
-__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(ds4_ggml_hip_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1) {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int warp_size = ds4_ggml_hip_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
 
@@ -140,11 +140,11 @@ static __global__ void mm_ids_helper(
 // behavior is undefined if one token lists the same expert in multiple slots
 // (the router's top-k is without replacement, so this cannot occur).
 template <int n_expert_used_template>
-__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
+__launch_bounds__(ds4_ggml_hip_get_physical_warp_size(), 1)
 static __global__ void mm_ids_helper_global(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1) {
-    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int warp_size = ds4_ggml_hip_get_physical_warp_size();
     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
     const int expert = blockIdx.x;
 
@@ -239,13 +239,13 @@ static __global__ void mm_ids_helper_global(
 template <int n_expert_used_template>
 static void launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, hipStream_t stream) {
     GGML_ASSERT(n_tokens          < (1 << 22) && "too few bits in mm_ids_helper_store");
     GGML_ASSERT(n_expert_used_var < (1 << 10) && "too few bits in mm_ids_helper_store");
 
-    const int id = ggml_cuda_get_device();
-    const int warp_size = ggml_cuda_info().devices[id].warp_size;
-    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    const int id = ds4_ggml_hip_get_device();
+    const int warp_size = ds4_ggml_hip_info().devices[id].warp_size;
+    const size_t smpbo = ds4_ggml_hip_info().devices[id].smpbo;
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
@@ -266,14 +266,14 @@ static void launch_mm_ids_helper(
         return;
     }
 
-    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
+    DS4_HIP_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1);
 }
 
-void ggml_cuda_launch_mm_ids_helper(
+void ds4_ggml_hip_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, cudaStream_t stream) {
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, hipStream_t stream) {
     switch (n_expert_used) {
         case  1:
             // ds4 local: the routed-MoE down matmul reinterprets (token, slot)

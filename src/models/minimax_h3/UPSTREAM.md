@@ -114,7 +114,7 @@ Current prompt-boundary adaptations:
 | --- | --- | --- |
 | `h3_tokenizer.m` | `tokenizer.cpp`, `tokenizer.hpp` | Semantic translation to C++20; Foundation storage replaced by strict project JSON and ICU NFC/category APIs; stronger duplicate/range/schema rejection |
 | `h3_text_encoder.c` | `prompt_encoder.hip`, `prompt_encoder.hpp` | Layer/tensor contract adapted; Metal resource management replaced by device-copy streaming, next-layer prefetch, hipBLASLt, phase lease, cancellation, and telemetry |
-| text kernels in `h3_shaders.metal` | `prompt_encoder_ops.cuh` | Operation-boundary translation to HIP; BF16 rounding and FP32 reductions retained; no Metal/MPSGraph or ccv TensorOps code imported |
+| text kernels in `h3_shaders.metal` | `prompt_encoder_ops.hip.hpp` | Operation-boundary translation to HIP; BF16 rounding and FP32 reductions retained; no Metal/MPSGraph or ccv TensorOps code imported |
 | `tests/test_tokenizer.c`, `tests/test_real_prompt.c` | MiniMax H3 tokenizer and prompt-encoder tests | Released corpus retained; synthetic malformed cases, analytic HIP fixtures, content-hashed external Transformers boundaries, repetition, and leak checks added |
 
 Current sampler-boundary adaptations:
@@ -131,7 +131,7 @@ Current DiT-boundary adaptations:
 | Upstream source | Local destination | Method and material changes |
 | --- | --- | --- |
 | `h3_dit.c` block load/run paths | `dit.hpp`, `dit.cpp`, `dit.hip` | One-block BF16 session with model-private tensor contracts, direct shard loading, atomics-disabled rocBLAS projections warmed before execution, fixed activation storage, explicit stream/cancellation/telemetry, and no allocation during block execution |
-| DiT kernels in `h3_shaders.metal` | `dit_ops.cuh` | Operation-boundary HIP translation for casts, residual arithmetic, SiLU/SwiGLU, RMS/layer/AdaLN, gated residuals, grouped QKV interpretation, per-head Q/K norm, partial 3D MM-RoPE, and full SDPA |
+| DiT kernels in `h3_shaders.metal` | `dit_ops.hip.hpp` | Operation-boundary HIP translation for casts, residual arithmetic, SiLU/SwiGLU, RMS/layer/AdaLN, gated residuals, grouped QKV interpretation, per-head Q/K norm, partial 3D MM-RoPE, and full SDPA |
 | `tests/test_real_dit_block.c` | `minimax_h3_dit_hip_test.hip`, `tools/gufo/h3_dit_golden.py` | Odd-tail analytic fixtures plus an operator-owned 528-row block-0 oracle produced by direct ROCm PyTorch formulas; retained payloads are never committed |
 
 Current full-denoiser adaptations:
@@ -148,9 +148,9 @@ Current output-decoder adaptations:
 | Upstream source | Local destination | Method and material changes |
 | --- | --- | --- |
 | VisualVAE load, temporal chunk, tiling, and selected-frame paths in `h3_video_vae.c` plus released Diffusers VisualVAE defaults | `video_vae.hpp`, `video_vae.cpp`, `video_vae.hip` | C++20/HIP phase with exact released F32 weights, fixed 256-pixel spatial tiles, seven-latent/22-frame chunks, bounded spatial/temporal output composition, selected-frame pruning, cancellation, and reusable scratch |
-| VisualVAE kernels in `h3_shaders.metal` | `video_vae_ops.cuh` | Independent HIP implementation of latent normalization, patch embedding, RMS/layer norm, once-per-head QKV normalization/RoPE, stable F32 full attention, vectorized SwiGLU, residual scaling, output projection, and selected RGB unpack |
+| VisualVAE kernels in `h3_shaders.metal` | `video_vae_ops.hip.hpp` | Independent HIP implementation of latent normalization, patch embedding, RMS/layer norm, once-per-head QKV normalization/RoPE, stable F32 full attention, vectorized SwiGLU, residual scaling, output projection, and selected RGB unpack |
 | `h3_audio_vae.c` decoder path | `audio_vae.hpp`, `audio_vae.cpp`, `audio_vae.hip` | Released F32 decoder only; exact tensor contracts, resident normalized convolution weights, stereo-as-batch execution, seven BigVGAN stages, cancellation, and memory/fault/swap telemetry; unused encoder attention is excluded |
-| AudioVAE kernels in `h3_shaders.metal` | `audio_vae_ops.cuh` | Independent HIP implementation of latent normalization, weight normalization, bounded F32 im2col plus rocBLAS Conv1d/ConvTranspose1d, released two-stage alias-free SnakeBeta, residual accumulation, clipping, and channel-major PCM output |
+| AudioVAE kernels in `h3_shaders.metal` | `audio_vae_ops.hip.hpp` | Independent HIP implementation of latent normalization, weight normalization, bounded F32 im2col plus rocBLAS Conv1d/ConvTranspose1d, released two-stage alias-free SnakeBeta, residual accumulation, clipping, and channel-major PCM output |
 | `h3_ffmpeg.c`, `tests/test_av_mux.c` | `media.hpp`, `media.cpp`, `minimax_h3_media_test.cpp` | C++20 two-pipe FFmpeg process with bounded PCM interleave staging, nonblocking cancellation-aware writes, deterministic cleanup, headless Nix dependency, FFprobe codec/geometry/rate/duration/sync validation, and no temporary uncompressed media file |
 | `tests/test_real_video_vae.c`, `tests/test_real_audio_vae.c` | VisualVAE/AudioVAE HIP tests and direct PyTorch golden tools | Operator-owned frozen latent/frame/waveform/spectrogram payloads, analytic primitive fixtures, external hashes, one selected-frame video decode, one stereo audio decode, clipping, cancellation, and zero-swap gates |
 

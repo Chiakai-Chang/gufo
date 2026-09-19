@@ -24,7 +24,7 @@
 
 #include "src/models/minimax_h3/denoiser.hpp"
 #include "src/models/minimax_h3/dit.hpp"
-#include "src/models/minimax_h3/dit_ops.cuh"
+#include "src/models/minimax_h3/dit_ops.hip.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {

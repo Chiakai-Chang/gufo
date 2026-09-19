@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "src/models/minimax_h3/dit.hpp"
-#include "src/models/minimax_h3/dit_ops.cuh"
+#include "src/models/minimax_h3/dit_ops.hip.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
 namespace {

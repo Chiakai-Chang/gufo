@@ -1,29 +1,29 @@
 // SPDX-License-Identifier: MIT
 // ds4_ggml_stubs.h - minimal ggml-API stubs for ds4's vendored mmq kernels.
 //
-// The mmq.cuh / mma.cuh / vecdotq.cuh / quantize.cuh / mmid.cuh / common.cuh
+// The mmq.hip.hpp / mma.hip.hpp / vecdotq.hip.hpp / quantize.hip.hpp / mmid.hip.hpp / common.hip.hpp
 // files in this directory are vendored verbatim from llama.cpp's ggml-cuda
 // backend (MIT, copyright 2023-2026 The ggml authors). They transitively
-// #include "ggml.h", "ggml-impl.h", "ggml-cuda.h" - in ds4 those names
+// #include "ggml.h", "ggml-impl.h", "ggml-hip.h" - in ds4 those names
 // resolve to thin redirect headers in this directory which all #include this
 // stubs file.
 //
 // This file declares the minimum surface of the ggml API that the vendored
-// CUDA code references, EXCLUDING what's already provided by common.cuh
-// itself (compute-capability constants, MMA flags, ggml_cuda_device_info,
-// ggml_cuda_pool, ggml_cuda_pool_alloc, ggml_backend_cuda_context, the
-// CUDA_CHECK / CUBLAS_CHECK macros, ggml_cuda_get_device, ggml_cuda_set_device,
-// ggml_cuda_info). Those names live in common.cuh and we let it own them.
+// CUDA code references, EXCLUDING what's already provided by common.hip.hpp
+// itself (compute-capability constants, MMA flags, ds4_ggml_hip_device_info,
+// ds4_ggml_hip_pool, ds4_ggml_hip_pool_alloc, ds4_ggml_hip_context, the
+// DS4_HIP_CHECK / DS4_HIPBLAS_CHECK macros, ds4_ggml_hip_get_device, ds4_ggml_hip_set_device,
+// ds4_ggml_hip_info). Those names live in common.hip.hpp and we let it own them.
 //
 // Things this header DOES provide:
 //   * GGML_ASSERT / GGML_ABORT / GGML_UNUSED / GGML_UNUSED_VARS / GGML_PAD
-//   * GGML_MAX_DIMS / GGML_MAX_SRC / GGML_CUDA_NAME / GGML_CUDA_MAX_DEVICES /
-//     GGML_CUDA_MAX_STREAMS / GGML_LOG_DEBUG
+//   * GGML_MAX_DIMS / GGML_MAX_SRC / DS4_GGML_HIP_NAME / DS4_GGML_HIP_MAX_DEVICES /
+//     DS4_GGML_HIP_MAX_STREAMS / GGML_LOG_DEBUG
 //   * enum ggml_type (all 21 mmq type codes - we only USE a subset for V4
 //     Flash but the switch in mmq.cu's downstream replacement must compile)
 //   * enum ggml_glu_op (just for the unused mm_fusion_args fields)
-//   * struct ggml_tensor (complete enough for common.cuh's
-//     ggml_cuda_concurrent_event::is_valid() to compile - we never call it)
+//   * struct ggml_tensor (complete enough for common.hip.hpp's
+//     ds4_ggml_hip_concurrent_event::is_valid() to compile - we never call it)
 //   * int64_t ggml_nbytes(const ggml_tensor *) (stub - never called)
 //   * int64_t ggml_time_us() (used by USE_CUDA_GRAPH paths we disable)
 //   * inline ggml_type_size() / ggml_blck_size() lookups
@@ -101,16 +101,16 @@
 #define GGML_MAX_SRC  10
 #endif
 
-#ifndef GGML_CUDA_NAME
-#define GGML_CUDA_NAME "DS4_CUDA"
+#ifndef DS4_GGML_HIP_NAME
+#define DS4_GGML_HIP_NAME "DS4_HIP"
 #endif
 
-#ifndef GGML_CUDA_MAX_DEVICES
-#define GGML_CUDA_MAX_DEVICES 16
+#ifndef DS4_GGML_HIP_MAX_DEVICES
+#define DS4_GGML_HIP_MAX_DEVICES 16
 #endif
 
-#ifndef GGML_CUDA_MAX_STREAMS
-#define GGML_CUDA_MAX_STREAMS 8
+#ifndef DS4_GGML_HIP_MAX_STREAMS
+#define DS4_GGML_HIP_MAX_STREAMS 8
 #endif
 
 #ifndef GGML_LOG_DEBUG
@@ -118,7 +118,7 @@
 #endif
 
 // Cuda-graphs are explicitly disabled - ds4 manages its own streams.
-#undef GGML_CUDA_USE_GRAPHS
+#undef DS4_GGML_HIP_USE_GRAPHS
 #undef GGML_HIP_GRAPHS
 #undef GGML_MUSA_GRAPHS
 
@@ -179,8 +179,8 @@ enum ggml_glu_op {
 };
 
 // ----------------------------------------------------------------------------
-// ggml_tensor: complete enough for common.cuh's
-// ggml_cuda_concurrent_event::is_valid() to compile cleanly. We NEVER
+// ggml_tensor: complete enough for common.hip.hpp's
+// ds4_ggml_hip_concurrent_event::is_valid() to compile cleanly. We NEVER
 // instantiate or dereference one of these - the concurrent path is
 // disabled.
 //
@@ -207,7 +207,7 @@ struct ggml_tensor {
 };
 
 // ggml_nbytes: byte size of tensor data. We never call this; provide a
-// stub so common.cuh's is_valid() compiles. If anything does call it the
+// stub so common.hip.hpp's is_valid() compiles. If anything does call it the
 // returned 0 will surface as an immediate logic error.
 static inline int64_t ggml_nbytes(const struct ggml_tensor * /*t*/) { return 0; }
 

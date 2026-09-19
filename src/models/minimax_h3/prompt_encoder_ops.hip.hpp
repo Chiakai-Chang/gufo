@@ -1,5 +1,5 @@
-#ifndef GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
-#define GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
+#ifndef GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_HIP_HPP_
+#define GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_HIP_HPP_
 
 // BF16 text-encoder operation boundaries translated from antirez/h3.c
 // h3_shaders.metal at 8974cc055ea9c02fcd14cc27dfda3e1027c05153 (MIT).
@@ -525,4 +525,4 @@ inline void LaunchSwiGlu(const std::uint16_t* gate, const std::uint16_t* up,
 
 }  // namespace gufo::minimax_h3::ops
 
-#endif  // GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_CUH_
+#endif  // GUFO_MODELS_MINIMAX_H3_PROMPT_ENCODER_OPS_HIP_HPP_

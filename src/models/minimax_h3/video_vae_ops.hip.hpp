@@ -1,5 +1,5 @@
-#ifndef GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_
-#define GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_
+#ifndef GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_HIP_HPP_
+#define GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_HIP_HPP_
 
 #include <hip/hip_runtime.h>
 
@@ -559,4 +559,4 @@ inline void LaunchUnpackRgb(const float* projected, const std::int32_t* frames,
 
 }  // namespace gufo::minimax_h3::video_vae_ops
 
-#endif  // GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_CUH_
+#endif  // GUFO_MODELS_MINIMAX_H3_VIDEO_VAE_OPS_HIP_HPP_

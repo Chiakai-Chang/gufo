@@ -1,27 +1,11 @@
 // SPDX-License-Identifier: MIT
-// ds4_mmq.h - public C ABI for ds4's quantized matmul kernels.
-//
-// All functions are extern "C" so ds4.c / ds4_cuda.cu can call them
-// without C++ compilation. Functions return 0 on success and non-zero on
-// failure (with stderr error message). Device pointers are caller-owned.
-//
-// Phase 0: skeleton only. Q8_0 dense entry compiles and instantiates
-// mul_mat_q_case<Q8_0> but is not yet wired into ds4_cuda.cu.
-// Phase 1: Q8_1 activation quantizer wrapper added.
-// Phase 2: Q8_0 dense entry verified against cublas+dequant baseline.
-// Phase 3: Q2_K + IQ2_XXS dense entries.
-// Phase 4: MoE _id variants of all three.
+// Raw-pointer C ABI for DeepSeek's HIP quantized matrix kernels.
+// Functions return zero on success and nonzero on failure. Device pointers
+// remain caller-owned; every operation uses the supplied HIP stream.
 
 #pragma once
 
-#if defined(GGML_USE_HIP) || defined(__HIP_PLATFORM_AMD__)
 #include <hip/hip_runtime.h>
-#ifndef cudaStream_t
-typedef hipStream_t cudaStream_t;
-#endif
-#else
-#include <cuda_runtime.h>
-#endif
 #include <stddef.h>
 #include <stdint.h>
 
@@ -29,10 +13,10 @@ typedef hipStream_t cudaStream_t;
 extern "C" {
 #endif
 
-// One-time init. Sets the current CUDA device and triggers lazy population
+// One-time init. Sets the current HIP device and triggers lazy population
 // of the device-info singleton. Safe to call repeatedly.
 //
-//   device: CUDA device ordinal (0 for the primary GPU).
+//   device: HIP device ordinal (0 for the primary GPU).
 // Returns 0 on success.
 int ds4_mmq_init(int device);
 void ds4_mmq_cleanup(void);
@@ -80,7 +64,7 @@ int ds4_mmq_routed_tile_cols_for_counts(const unsigned int *counts,
 //   1 if mmq is faster than dequant+cublas for this shape on this device,
 //   0 otherwise (caller should fall back to its existing dequant+cublas path).
 //
-// Wraps ggml_cuda_should_use_mmq. type_x uses ds4 quant codes which match
+// Wraps ds4_ggml_hip_should_use_mmq. type_x uses ds4 quant codes which match
 // ggml's enum:
 //   8  = Q8_0
 //   10 = Q2_K
@@ -115,7 +99,7 @@ int ds4_mmq_q8_0_dense(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 // v0.5 flat-pool p5a: same contract as ds4_mmq_q8_0_dense but the
 // activation arrives PRE-QUANTIZED in the block_q8_1_mmq D4 layout
@@ -133,7 +117,7 @@ int ds4_mmq_q8_0_dense_preq(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 // Dense Q8_0 D2R on the kind-5 aligned artifact (weight server
 // --repack-q8-aligned).  Same in/out contract as ds4_mmq_q8_0_dense but W is
@@ -147,7 +131,7 @@ int ds4_mmq_q8_0_dense_d2r(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 // flat-pool p5c: D2R dense over a producer-quantized token-major Y
 // (block_q8_1_mmq D4, ib = kseg*N + row, requires GGML_PAD(K) == K).
@@ -162,7 +146,7 @@ int ds4_mmq_q8_0_dense_d2r_preq(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 int ds4_mmq_q2_K_dense(
     const void  * W_q2_K,
@@ -171,7 +155,7 @@ int ds4_mmq_q2_K_dense(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 int ds4_mmq_iq2_xxs_dense(
     const void  * W_iq2_xxs,
@@ -180,7 +164,7 @@ int ds4_mmq_iq2_xxs_dense(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 int ds4_mmq_q4_K_dense(
     const void  * W_q4_K,
@@ -189,7 +173,7 @@ int ds4_mmq_q4_K_dense(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 int ds4_mmq_mxfp4_dense(
     const void  * W_mxfp4,
@@ -198,7 +182,7 @@ int ds4_mmq_mxfp4_dense(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 // MoE matmul entry points. For each (token, slot-within-token's-top-k) pair
 // the kernel computes:
@@ -238,7 +222,7 @@ int ds4_mmq_q8_0_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q2_K_moe(
     const void    * W,
@@ -250,7 +234,7 @@ int ds4_mmq_q2_K_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_iq2_xxs_moe(
     const void    * W,
@@ -262,7 +246,7 @@ int ds4_mmq_iq2_xxs_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // ds4 (P4 Inc3): same contract as ds4_mmq_q2_K_moe but W_soa is the aligned
 // row-pair-SoA artifact (weight server --repack-q2k-aligned, layout in
@@ -283,7 +267,7 @@ int ds4_mmq_q2_K_moe_soa(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q4_K_moe(
     const void    * W,
@@ -295,7 +279,7 @@ int ds4_mmq_q4_K_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_mxfp4_moe(
     const void    * W,
@@ -307,14 +291,14 @@ int ds4_mmq_mxfp4_moe(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Paired MoE entries. Compute gate AND up over the same activation in a
 // single call so the Q8_1 quantize of X (and the mm_ids_helper bookkeeping)
 // happens once instead of twice. Both weights must be the same quant type
 // and the same shape (M, K, n_experts); out_a / out_b have the same layout
 // as a single ds4_mmq_<type>_moe call. Saves one launch of
-// quantize_mmq_q8_1_cuda and one ggml_cuda_launch_mm_ids_helper per MoE
+// ds4_quantize_mmq_q8_1_hip and one ds4_ggml_hip_launch_mm_ids_helper per MoE
 // block. See ds4_mmq.cu / routed_moe_launch for the wiring.
 //
 // Returns 0 on success; on error neither output is guaranteed valid.
@@ -331,7 +315,7 @@ int ds4_mmq_iq2_xxs_moe_pair(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Same operation, with the additional contract that each token's selected
 // experts are unique. This permits an n_tokens upper bound for every expert
@@ -348,7 +332,7 @@ int ds4_mmq_iq2_xxs_moe_pair_token_bound(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Non-stream-K variant for ROCm prefill. The up result stays in the MMQ
 // write-back register and is combined with the materialized gate, router
@@ -370,7 +354,7 @@ int ds4_mmq_iq2_xxs_moe_pair_token_bound_swiglu(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // ds4 (P4 Inc3): same contract as ds4_mmq_iq2_xxs_moe_pair but over the
 // aligned-SoA artifacts (weight server --repack-iq2-aligned); see
@@ -387,7 +371,7 @@ int ds4_mmq_iq2_xxs_moe_pair_soa(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 /* v0.5 inc-9 (F7): fused target-prefill pipeline over the aligned-SoA
  * IQ2_XXS gate/up and Q2_K down artifacts.  Builds the expert-major
@@ -413,7 +397,7 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_soa(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 /* Aligned-artifact production fast path: gate/up stay in registers, weighted
  * SwiGLU is quantized directly into down_q8_scratch, and only the pair-major
@@ -449,7 +433,7 @@ int ds4_mmq_iq2_xxs_q2_K_moe_fused_direct_soa(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q4_K_moe_pair(
     const void    * W_a,
@@ -463,7 +447,7 @@ int ds4_mmq_q4_K_moe_pair(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_mxfp4_moe_pair(
     const void    * W_a,
@@ -477,7 +461,7 @@ int ds4_mmq_mxfp4_moe_pair(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // MoE vector matmul entries. Same signature and semantics as the
 // ds4_mmq_<type>_moe entries above, but route through llama.cpp's mmvq
@@ -509,7 +493,7 @@ int ds4_mmq_q8_0_moe_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q2_K_moe_vec(
     const void    * W,
@@ -521,7 +505,7 @@ int ds4_mmq_q2_K_moe_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_iq2_xxs_moe_vec(
     const void    * W,
@@ -533,7 +517,7 @@ int ds4_mmq_iq2_xxs_moe_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q4_K_moe_vec(
     const void    * W,
@@ -545,7 +529,7 @@ int ds4_mmq_q4_K_moe_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_mxfp4_moe_vec(
     const void    * W,
@@ -557,7 +541,7 @@ int ds4_mmq_mxfp4_moe_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Aligned-SoA IQ2_XXS decode matvec (megakernel program M1-Inc1).
 //
@@ -589,7 +573,7 @@ int ds4_mmq_iq2_xxs_aligned_derepack(
     int             M,
     int             K,
     int             n_experts,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // M2 moe-down: aligned row-pair-SoA Q2_K routed-expert decode matvec.  Twin
 // of mul_mat_vec_q_moe<GGML_TYPE_Q2_K, 2> at the down-leg call shape
@@ -617,7 +601,7 @@ int ds4_mmq_q2_K_aligned_moe_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Exact inverse of the weight-server repack: fills raw_out (nblk * 84 bytes,
 // raw block_q2_K stream) from an aligned artifact, device->device on
@@ -629,7 +613,7 @@ int ds4_mmq_q2_K_aligned_derepack(
     int             M,
     int             K,
     int             n_experts,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // M1-Inc3: aligned-SoA Q8_0 dense decode matvec.  Artifact layout
 // [__half dq[nblk]][pad to 64B][int8 qs[nblk*32]], nblk = M * (K/32), block
@@ -646,7 +630,7 @@ int ds4_mmq_q8_0_aligned_dense_vec(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 int ds4_mmq_iq2_xxs_aligned_moe_vec(
     const void    * W_aligned,
@@ -658,7 +642,7 @@ int ds4_mmq_iq2_xxs_aligned_moe_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // M1-Inc2 variants over the same aligned artifacts (n_tokens == 1 only).
 //
@@ -681,7 +665,7 @@ int ds4_mmq_iq2_xxs_aligned_moe_pair_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     const void    * W_gate_aligned,
@@ -696,7 +680,7 @@ int ds4_mmq_iq2_xxs_aligned_moe_gate_up_mid_vec(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Fused down+sum vector entries for routed MoE with top_k=6. These preserve
 // the canonical Q8_1 activation quantization used by the regular _moe_vec
@@ -728,7 +712,7 @@ int ds4_mmq_q2_K_moe_down_sum6_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q4_K_moe_down_sum6_vec(
     const void    * W,
@@ -740,7 +724,7 @@ int ds4_mmq_q4_K_moe_down_sum6_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_mxfp4_moe_down_sum6_vec(
     const void    * W,
@@ -752,7 +736,7 @@ int ds4_mmq_mxfp4_moe_down_sum6_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Fused gate+up+SwiGLU vector entries for routed MoE with top_k=6. These use
 // canonical Q8_1 activation quantization and compute weighted mid directly:
@@ -791,7 +775,7 @@ int ds4_mmq_iq2_xxs_moe_gate_up_mid_vec(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q4_K_moe_gate_up_mid_vec(
     const void    * W_gate,
@@ -806,7 +790,7 @@ int ds4_mmq_q4_K_moe_gate_up_mid_vec(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_mxfp4_moe_gate_up_mid_vec(
     const void    * W_gate,
@@ -821,7 +805,7 @@ int ds4_mmq_mxfp4_moe_gate_up_mid_vec(
     int             n_experts,
     int             n_expert_used,
     float           clamp,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Pair-fused MoE vector matmul entries. Computes
 //
@@ -853,7 +837,7 @@ int ds4_mmq_iq2_xxs_moe_pair_vec(
     int             K,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q4_K_moe_pair_vec(
     const void    * W_a,
@@ -865,7 +849,7 @@ int ds4_mmq_q4_K_moe_pair_vec(
     int             K,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Raw pair MoE vector entries. They quantize X to canonical Q8_1 once, then
 // run the same mmvq matvec kernel twice to produce the unfused gate and up
@@ -889,7 +873,7 @@ int ds4_mmq_iq2_xxs_moe_pair_raw_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 int ds4_mmq_q4_K_moe_pair_raw_vec(
     const void    * W_a,
@@ -903,7 +887,7 @@ int ds4_mmq_q4_K_moe_pair_raw_vec(
     int             n_tokens,
     int             n_experts,
     int             n_expert_used,
-    cudaStream_t    stream);
+    hipStream_t    stream);
 
 // Dense vector matmul entry. Same shape semantics as
 // ds4_mmq_q8_0_dense but routed through mmvq for batch counts that
@@ -918,14 +902,14 @@ int ds4_mmq_q8_0_dense_vec(
     int           M,
     int           N,
     int           K,
-    cudaStream_t  stream);
+    hipStream_t  stream);
 
 // Set the thread-local stream that the internal cuda pool uses for
-// cudaMallocAsync / cudaFreeAsync.  Defaults to cudaStreamPerThread.
+// hipMallocAsync / hipFreeAsync.  Defaults to hipStreamPerThread.
 // Use the graph capture stream so pool
 // allocations land on the captured stream and don't invalidate capture.
-// Pass NULL to reset to cudaStreamPerThread.
-void ds4_pool_set_stream(cudaStream_t stream);
+// Pass NULL to reset to hipStreamPerThread.
+void ds4_pool_set_stream(hipStream_t stream);
 
 #ifdef __cplusplus
 } // extern "C"

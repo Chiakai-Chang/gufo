@@ -22,7 +22,7 @@
 
 #include "src/models/minimax_h3/json.hpp"
 #include "src/models/minimax_h3/video_vae.hpp"
-#include "src/models/minimax_h3/video_vae_ops.cuh"
+#include "src/models/minimax_h3/video_vae_ops.hip.hpp"
 
 namespace gufo::minimax_h3 {
 namespace {
