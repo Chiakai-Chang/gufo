@@ -37,8 +37,8 @@ persistent allocation and leaves cache contents and attention arithmetic intact.
 When all KV heads no longer fit, bounded groups reuse that scratch instead of
 falling back to strided attention. End-to-end speed beyond d128K remains **TODO**.
 
-Projection experiments, 2026-09-19: smaller/larger tiles, alternative wave
-layouts, pipeline depths and quantized Q8 row grouping did not improve the short controls;
+Projection experiments, 2026-09-19: alternative tiles, wave layouts, pipeline
+depths, fixed BF16 dimensions and row grouping did not improve release throughput;
 the current kernels remain.
 
 ## Single user, DFlash2

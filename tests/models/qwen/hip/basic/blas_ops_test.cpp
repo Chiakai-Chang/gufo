@@ -420,6 +420,7 @@ int main() {
   for (const auto batch : {94U, 135U, 2048U})
     TestExactBf16SmallBatchGEMM(batch, 1024, 5120);
   TestExactBf16SmallBatchGEMM(135, 5120, 6144);
+  TestExactBf16SmallBatchGEMM(135, 12288, 5120);
   TestHipblasGEMM();
   TestHipblasLtGEMM();
   std::cout << "Qwen dense GEMM and BLAS ops test passed on gfx1151.\n";
