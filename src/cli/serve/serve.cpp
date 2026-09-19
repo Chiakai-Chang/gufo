@@ -948,10 +948,9 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--preserve-thinking", "MODE",
                          "Replay prior reasoning: on, off, or auto",
                          "Reasoning Defaults", &preserve_thinking);
-    llm_parser.AddOption(
-        "", "--speculative", "MODE",
-        "HTTP draft backend: dspark, dflash2, mtp, or off",
-        "Speculative", &speculative_backend);
+    llm_parser.AddOption("", "--speculative", "MODE",
+                         "HTTP draft backend: dspark, dflash2, mtp, or off",
+                         "Speculative", &speculative_backend);
     llm_parser.AddOption("", "--dflash-model", "PATH",
                          "Path to Qwen DFlash2 GGUF file", "Speculative",
                          &dflash_model_path);

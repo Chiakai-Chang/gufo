@@ -34,14 +34,13 @@ void CopyRecurrentState(void* live, void* packed, std::size_t layer_bytes,
   const std::size_t packed_pitch = (interval - 1) * layer_bytes;
   const std::size_t destination_pitch = save ? packed_pitch : live_pitch;
   const std::size_t source_pitch = save ? live_pitch : packed_pitch;
-  if (layer_bytes >= 1024 * 1024 &&
-      ((live_pitch | packed_pitch) & 15U) == 0 &&
+  if (layer_bytes >= 1024 * 1024 && ((live_pitch | packed_pitch) & 15U) == 0 &&
       groups <= std::numeric_limits<std::uint32_t>::max() / live_pitch) {
-    LaunchCopyRecurrentStateRows(
-        destination, source, static_cast<std::uint32_t>(packed_pitch),
-        static_cast<std::uint32_t>(destination_pitch),
-        static_cast<std::uint32_t>(source_pitch),
-        static_cast<std::uint32_t>(groups), stream);
+    LaunchCopyRecurrentStateRows(destination, source,
+                                 static_cast<std::uint32_t>(packed_pitch),
+                                 static_cast<std::uint32_t>(destination_pitch),
+                                 static_cast<std::uint32_t>(source_pitch),
+                                 static_cast<std::uint32_t>(groups), stream);
   } else {
     HIP_CHECK(hipMemcpy2DAsync(destination, destination_pitch, source,
                                source_pitch, packed_pitch, groups,

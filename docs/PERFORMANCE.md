@@ -253,9 +253,11 @@ Qwen3.8-27B loader registers mapped GGUF shards directly with HIP; see
 List cases, then run the smallest relevant matrix:
 
 ```sh
-./result/bin/gufo-kernel-bench --list
+nix develop -c cmake --preset gpu-test
+nix develop -c cmake --build --preset gpu-test --target gufo-kernel-bench tune_hipblaslt
+./build/gpu-test/gufo-kernel-bench --help
 
-./result/bin/gufo-kernel-bench \
+./build/gpu-test/gufo-kernel-bench \
   --case decode-attention \
   --context 4096,8192,12288,16384 \
   --warmup 5 \
@@ -363,7 +365,7 @@ nix develop -c rocprofv3 \
   --stats \
   --summary \
   --output-directory /tmp/gufo-profile \
-  -- ./result/bin/gufo-kernel-bench \
+  -- ./build/gpu-test/gufo-kernel-bench \
     --case decode-attention \
     --context 16384 \
     --warmup 1 \
@@ -395,7 +397,7 @@ microbenchmark before acting on the mix.
 ### Offline tuning and replay
 
 ```sh
-./result/bin/tune_hipblaslt \
+./build/gpu-test/tune_hipblaslt \
   --out /tmp/gufo-hipblaslt-plans.bin \
   --warmup 3 \
   --repetitions 10
@@ -420,7 +422,7 @@ Generated profiler, plan, and replay artifacts stay outside the repository.
 ### Dispatch telemetry
 
 ```sh
-GUFO_DISPATCH_TELEMETRY=1 ./result/bin/gufo-kernel-bench ...
+GUFO_DISPATCH_TELEMETRY=1 ./build/gpu-test/gufo-kernel-bench ...
 ```
 
 Telemetry is diagnostic JSONL. It records semantic dispatch decisions and

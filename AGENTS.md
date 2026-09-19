@@ -1,48 +1,59 @@
 # AGENTS.md
 
-## Supported Platform
+## Platform and build
 
-Linux x86-64 on AMD Strix Halo (`gfx1151` GPU) is the only
-supported production target.
-
-## Build & Test (Nix)
-
-Build and test with Nix only. Direct host builds and Makefiles are unsupported.
+Production targets Linux x86-64 AMD Strix Halo (`gfx1151`) only. CMake owns
+compiler flags, dependencies and installation; Nix supplies the pinned toolchain.
+Linux source-build prerequisites are in [README.md](README.md#build-from-source).
 
 ```sh
-nix build                          # build default package (gfx1151)
-./result/bin/gufo diagnose        # run hardware probe & diagnostics
-./result/bin/gufo serve           # run server
-nix build .#checks.x86_64-linux.pr # canonical PR test command (all gates)
-nix develop                        # dev shell
+nix build                              # production package, no tests/tools
+./result/bin/gufo diagnose
+nix build .#checks.x86_64-linux.pr      # bounded hosted CPU/repository checks
+nix develop                            # GPU development and reference tools
+
+# Same production build without Nix, with the documented dependencies installed
+cmake --preset release
+cmake --build --preset release --parallel 4
 ```
 
-- `git add` before `nix build` — Nix sees only tracked files.
-- Use binaries under `build/gpu-test` for focused correctness and debugging
-  only; GPU test presets use `RelWithDebInfo`, matching the release build type,
-  with test assertions enabled. Measure performance with binaries produced
-  by `nix build` under
-  `result/bin`. Example:
-  `./result/bin/gufo bench --model <model.gguf> -p 128 -n 16 --validate-prefill 128`.
+Stage only task-owned paths before Nix builds; flakes include tracked files.
+Measure performance with `result/bin/gufo` or `build/release/gufo`. Preserve
+compiler/dependency versions when comparing results.
 
-## Profiling and kernel work
+## Focused tests
 
-Performance tooling lives in `tools/` and is documented in
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md) under "Commands":
+Run the smallest check covering the change. `gpu-test` is RelWithDebInfo with
+assertions enabled. Build only the affected target during iteration:
 
-- `tools/bench/build.sh` builds the standalone microbenchmarks in `tools/bench/`
-  with `hipcc` (seconds, not a full `nix build`); each carries an ablation
-  harness that reports correctness next to throughput.
-- `tools/bench/gfx1151_peak.hip` measures the roofline ceilings every kernel is
-  scored against. Do not use spec-sheet numbers.
-- `tools/prof/prof.py` wraps `rocprofv3` with a pipeline-stage rollup, GPU-busy versus
-  wall-span, and an A/B `diff` mode.
-- `tools/prof/isa_mix.py` summarizes one kernel's instruction mix from an assembly
-  listing.
+```sh
+nix develop -c cmake --preset gpu-test
+nix develop -c cmake --build --preset gpu-test --target <test-target>
+nix develop -c ctest --preset gpu-full -R '^<test-name>$' --output-on-failure
+```
+
+The same CMake/CTest commands work outside Nix. `cmake --build --preset pr`
+runs the hosted contract suite after configuring `cpu-test`. Full CPU checks,
+sanitisers, GPU/operator/model checks and H3 quality tools remain available
+locally; see [docs/TESTING.md](docs/TESTING.md). Do not run full model sweeps,
+video generation or duplicate suites for routine edits. A missing-model skip
+is not a quality pass. Broaden checks when shared behavior changes or failures
+expose risk.
+
+## Profiling and kernels
+
+Apply [.agents/skills/optimize-kernel/SKILL.md](.agents/skills/optimize-kernel/SKILL.md).
+Use `tools/bench/build.sh` for standalone HIP experiments,
+`tools/bench/gfx1151_peak.hip` for measured hardware ceilings,
+`tools/prof/prof.py` for pipeline/wall-time profiles, and
+`tools/prof/isa_mix.py` for instruction analysis. Production paths must retain
+quality; successful optimizations become the default, without extra switches.
 
 ## Development
 
-- Use one canonical long option and backend name for each behavior. Avoid extra aliases.
-- Use `gh` CLI to retrieve and update issues content. Verify if installed and configured with `gh auth status`, and use it unless the user explicitly says otherwise.
-- Follow Conventional Commits format with single-line commit messages (e.g., `feat(scope): summary (#issue)`, `fix(scope): summary (#issue)`).
-- Prefer Jujutsu (`jj`) over Git when possible. Verify that it is available by running `jj version`; fall back to Git if it is unavailable or if the user explicitly requires Git.
+- Keep model code, tests, tools and numerical contracts with their model.
+- Use one canonical long option and backend name per behavior; avoid aliases.
+- Use `gh` for GitHub operations after checking `gh auth status`.
+- Follow Conventional Commits with a single-line message.
+- Prefer `jj` when available (`jj version`); otherwise use Git.
+- Follow the user's remote workflow and preserve unrelated work.

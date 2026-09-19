@@ -83,10 +83,10 @@ void LaunchSSMConvRecurrenceRows(
 void LaunchSSMConvRecurrenceBatch(
     const float* qkv_in, const float* conv_weights, float* conv_out,
     const float* alpha_buf, const float* beta_buf, const float* ssm_a,
-    const float* ssm_dt, const float* ssm_norm, const float* gate, float* out_buf,
-    std::span<const SsmSequenceState> sequences, std::uint32_t layer_idx,
-    std::size_t qkv_size, std::uint32_t num_key_heads, std::uint32_t num_heads,
-    std::uint32_t key_dim, std::uint32_t val_dim,
+    const float* ssm_dt, const float* ssm_norm, const float* gate,
+    float* out_buf, std::span<const SsmSequenceState> sequences,
+    std::uint32_t layer_idx, std::size_t qkv_size, std::uint32_t num_key_heads,
+    std::uint32_t num_heads, std::uint32_t key_dim, std::uint32_t val_dim,
     std::size_t projection_row_stride, std::size_t inner_row_stride,
     hipStream_t stream = nullptr,
     QwenRecurrentStateStorage state_storage = QwenRecurrentStateStorage::kFp32);

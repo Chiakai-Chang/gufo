@@ -61,9 +61,8 @@ public:
     for (std::uint32_t length = 1; length <= cap; ++length) {
       survival *= probability;
       expected_tokens += survival;
-      const float cost = q8_target_
-                             ? 1.0F + 0.02F * static_cast<float>(length)
-                             : kQ4RelativeCost[length - 1];
+      const float cost = q8_target_ ? 1.0F + 0.02F * static_cast<float>(length)
+                                    : kQ4RelativeCost[length - 1];
       const float score = expected_tokens / cost;
       if (score > best_score) {
         best_score = score;

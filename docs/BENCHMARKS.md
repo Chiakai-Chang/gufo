@@ -63,12 +63,16 @@ answers through the OpenAI-compatible server.
 
 ## Focused kernel measurements
 
+Build development tools with `cmake --preset gpu-test` and
+`cmake --build --preset gpu-test --target gufo-kernel-bench tune_hipblaslt`.
+They are omitted from the production package.
+
 `gufo-kernel-bench` exercises production HIP entry points without loading a
 model. Correctness sentinels run outside the timed interval:
 
 ```sh
-./result/bin/gufo-kernel-bench --list
-./result/bin/gufo-kernel-bench \
+./build/gpu-test/gufo-kernel-bench --help
+./build/gpu-test/gufo-kernel-bench \
   --case decode-attention --context 4096,8192,12288,16384 \
   --warmup 5 --repetitions 30 --json
 ```

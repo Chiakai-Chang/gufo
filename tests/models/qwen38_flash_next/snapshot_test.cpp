@@ -37,8 +37,7 @@ Decoded Decode(qfn::Session& session, std::size_t count,
                                sampler, &step, &error, false),
             error);
     Require(!step.tokens.empty(), "empty decode step");
-    out.tokens.insert(out.tokens.end(), step.tokens.begin(),
-                      step.tokens.end());
+    out.tokens.insert(out.tokens.end(), step.tokens.begin(), step.tokens.end());
   }
   const auto after = session.Statistics();
   out.stats = {after.cycles - before.cycles, after.drafted - before.drafted,
@@ -81,11 +80,11 @@ int main(int argc, char** argv) {
   try {
     std::string error;
     constexpr std::uint32_t kContext = 8192;
-    auto model = qfn::Model::Load(
-        argv[2],
-        {.max_context = kContext, .mtp_model_path = argv[4],
-         .max_draft_tokens = 7},
-        &error);
+    auto model = qfn::Model::Load(argv[2],
+                                  {.max_context = kContext,
+                                   .mtp_model_path = argv[4],
+                                   .max_draft_tokens = 7},
+                                  &error);
     Require(model != nullptr, error);
     const auto pattern = model->Tokenize(
         "The quick brown fox jumps over the lazy dog. "
@@ -131,8 +130,8 @@ int main(int argc, char** argv) {
     start = std::chrono::steady_clock::now();
     Require(restored->RestoreSnapshot(*at_prompt, &error), error);
     std::cout << "restore_ms=" << Millis(start) << "\n";
-    Require(std::equal(prompt.begin(), prompt.end(),
-                       restored->Tokens().begin(), restored->Tokens().end()),
+    Require(std::equal(prompt.begin(), prompt.end(), restored->Tokens().begin(),
+                       restored->Tokens().end()),
             "restored tokens differ");
     Require(restored->Position() == prompt.size(), "restored position");
     Require(std::memcmp(prompt_logits.data(), restored->Logits().data(),

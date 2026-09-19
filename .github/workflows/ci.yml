@@ -6,10 +6,15 @@ on:
   pull_request:
     branches: [ main ]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-and-test:
-    name: Build & Quality Gates
+    name: CPU contracts & repository checks
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,7 +52,7 @@ jobs:
           use-flakehub: false
           use-gha-cache: true
 
-      - name: Run Canonical PR Test Suite
+      - name: Run hosted PR checks
         run: |
-          nix build .#checks.x86_64-linux.pr --print-build-logs
+          nix build .#checks.x86_64-linux.pr --print-build-logs --cores 2 --max-jobs 2
           cat ./result/pr-summary.txt

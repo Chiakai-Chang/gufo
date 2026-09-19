@@ -1,7 +1,10 @@
 # Developer tools
 
 Use the Nix development environment for these tools. Production inference and
-speed measurements use `nix build` binaries under `result/bin`.
+speed measurements use `nix build` binaries under `result/bin` or the
+`release` CMake preset with the same toolchain. Tools are not part of the
+production install. `gpu-test` enables `GUFO_BUILD_TOOLS` for the compiled
+benchmark/tuning executables; Python tools run from this source tree.
 
 | Directory | Purpose |
 | --- | --- |

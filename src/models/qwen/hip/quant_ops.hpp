@@ -218,8 +218,8 @@ __device__ inline void GetQKScaleMin(std::size_t index,
     const unsigned upper_scale = (high & 15U) | ((low >> 6U) << 4U);
     const unsigned lower_minimum = middle & 63U;
     const unsigned upper_minimum = (high >> 4U) | ((middle >> 6U) << 4U);
-    sc = static_cast<std::uint8_t>(
-        lower_scale ^ ((lower_scale ^ upper_scale) & upper_mask));
+    sc = static_cast<std::uint8_t>(lower_scale ^
+                                   ((lower_scale ^ upper_scale) & upper_mask));
     m = static_cast<std::uint8_t>(
         lower_minimum ^ ((lower_minimum ^ upper_minimum) & upper_mask));
     return;

@@ -1396,8 +1396,8 @@ int RunBench(std::span<const char* const> args) {
             << " |\n";
   std::cout << "| " << std::string(30, '-') << " | " << std::string(10, '-')
             << " | " << std::string(10, '-') << " | " << std::string(10, '-')
-            << " | " << std::string(15, '-')
-            << " | " << std::string(21, '-') << " |\n";
+            << " | " << std::string(15, '-') << " | " << std::string(21, '-')
+            << " |\n";
 
   // Warmup run
   {

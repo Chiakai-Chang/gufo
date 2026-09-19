@@ -325,8 +325,7 @@ static __global__ void GroupedCausalGqaKernel(
   float* reductions =
       shared_queries + static_cast<std::size_t>(grouped_heads) * head_dimension;
   for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
-    const std::uint32_t query_head =
-        key_value_head * grouped_heads + grouped;
+    const std::uint32_t query_head = key_value_head * grouped_heads + grouped;
     const std::size_t query_base =
         (static_cast<std::size_t>(query_row) * query_heads + query_head) *
         head_dimension;
@@ -334,8 +333,8 @@ static __global__ void GroupedCausalGqaKernel(
          dimension += blockDim.x) {
       shared_queries[static_cast<std::size_t>(grouped) * head_dimension +
                      dimension] =
-          Bf16ToFloat(FloatToBf16(
-              Bf16ToFloat(query[query_base + dimension]) * scale));
+          Bf16ToFloat(
+              FloatToBf16(Bf16ToFloat(query[query_base + dimension]) * scale));
     }
   }
   __syncthreads();
@@ -385,8 +384,7 @@ static __global__ void GroupedCausalGqaKernel(
     for (std::uint32_t stride = kLogicalLanes / 2U; stride != 0;
          stride >>= 1U) {
       if (lane < stride) {
-        reductions[lane] =
-            fmaxf(reductions[lane], reductions[lane + stride]);
+        reductions[lane] = fmaxf(reductions[lane], reductions[lane + stride]);
       }
       __syncthreads();
     }
@@ -434,10 +432,9 @@ static __global__ void GroupedCausalGqaKernel(
             dimension;
         const float value_element = Bf16ToFloat(value[value_index]);
         for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
-          sums[grouped] =
-              fmaf(scores[static_cast<std::size_t>(grouped) * sequence +
-                          key_row],
-                   value_element, sums[grouped]);
+          sums[grouped] = fmaf(
+              scores[static_cast<std::size_t>(grouped) * sequence + key_row],
+              value_element, sums[grouped]);
         }
       }
       for (std::uint32_t grouped = 0; grouped < grouped_heads; ++grouped) {
@@ -468,11 +465,12 @@ inline void LaunchCausalGqa(const std::uint16_t* query,
       sizeof(float);
   constexpr std::size_t kMaximumGroupedSharedBytes = 48U << 10U;
   if (key_value_heads != 0 && query_heads % key_value_heads == 0 &&
-      grouped_heads <= 8 && grouped_shared_bytes <= kMaximumGroupedSharedBytes) {
-    hipLaunchKernelGGL(
-        GroupedCausalGqaKernel, dim3(sequence, key_value_heads), dim3(64),
-        grouped_shared_bytes, stream, query, key, value, output, sequence,
-        query_heads, key_value_heads, head_dimension, scale);
+      grouped_heads <= 8 &&
+      grouped_shared_bytes <= kMaximumGroupedSharedBytes) {
+    hipLaunchKernelGGL(GroupedCausalGqaKernel, dim3(sequence, key_value_heads),
+                       dim3(64), grouped_shared_bytes, stream, query, key,
+                       value, output, sequence, query_heads, key_value_heads,
+                       head_dimension, scale);
     return;
   }
   const std::size_t shared_bytes =

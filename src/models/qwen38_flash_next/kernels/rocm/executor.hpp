@@ -68,10 +68,10 @@ private:
   Session() = default;
 
   struct LinearState {
-    float* conv_state{nullptr};       ///< [kernel-1][channels]
-    float* state{nullptr};            ///< [v_heads][d][d]
-    RollbackRows conv_snapshots;      ///< [max_spec-1][kernel-1][channels]
-    RollbackRows state_snapshots;     ///< [max_spec-1][v_heads][d][d]
+    float* conv_state{nullptr};    ///< [kernel-1][channels]
+    float* state{nullptr};         ///< [v_heads][d][d]
+    RollbackRows conv_snapshots;   ///< [max_spec-1][kernel-1][channels]
+    RollbackRows state_snapshots;  ///< [max_spec-1][v_heads][d][d]
   };
   struct AttentionState {
     const qwen::vision::DeviceRope* rope{nullptr};
@@ -110,8 +110,8 @@ private:
   std::uint32_t position_{0};
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
-  float* ple_history_{nullptr};    ///< [PleConvHistory()][hc_dim]
-  RollbackRows ple_snapshots_;     ///< [max_spec-1][PleConvHistory()][hc_dim]
+  float* ple_history_{nullptr};  ///< [PleConvHistory()][hc_dim]
+  RollbackRows ple_snapshots_;   ///< [max_spec-1][PleConvHistory()][hc_dim]
   NgramHistory ngram_;
   std::vector<NgramHistory> ngram_snapshots_;
   std::uint32_t spec_base_{0};    ///< position before the speculative batch

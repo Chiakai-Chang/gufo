@@ -31,8 +31,8 @@ void TestDefaultOptions() {
 }
 
 void TestDs4SamplingOptions() {
-  const std::array<const char*, 4> args = {
-      "--temperature", "0.6", "--seed", "7"};
+  const std::array<const char*, 4> args = {"--temperature", "0.6", "--seed",
+                                           "7"};
   const auto options = gufo::cli::ParseBenchOptions(args);
   Expect(options && options->sampling.temperature == 0.6F &&
              options->sampling.seed == 7,
@@ -114,8 +114,8 @@ void TestInvalidDepth() {
   Expect(!gufo::cli::ParseBenchOptions(range_args, &error).has_value(),
          "invalid draft range rejected");
 
-  const std::array<const char*, 4> unsupported_floor = {"--speculative", "dflash2",
-                                                  "--min-draft-tokens", "2"};
+  const std::array<const char*, 4> unsupported_floor = {
+      "--speculative", "dflash2", "--min-draft-tokens", "2"};
   Expect(!gufo::cli::ParseBenchOptions(unsupported_floor, &error).has_value() &&
              error.find("min-draft-tokens") != std::string::npos,
          "DFlash2 rejects an unsupported minimum draft length");

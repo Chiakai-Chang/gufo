@@ -3,8 +3,9 @@
 check-dependencies.py — Third-party dependency inventory consistency checker for gufo
 
 Validates that:
-1. Every shipped/linked runtime dependency in Nix/CMake is documented in THIRD_PARTY_NOTICES.md and NOTICE.
-2. SPDX license identifiers and pinned versions are valid and present.
+1. The declared direct-dependency inventory includes required components.
+2. License identifiers and version/source records are present.
+This is a consistency check, not a legal compliance determination.
 3. Emits a deterministic machine-readable dependency inventory report.
 """
 
@@ -21,7 +22,17 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "hipBLASLt",
     "rocBLAS",
     "Composable Kernel",
-    "ROCprofiler SDK / ROCTx",
+    "MIOpen",
+    "AOTriton",
+    "hipCUB",
+    "rocPRIM",
+    "rocWMMA",
+    "OpenSSL",
+    "libpng",
+    "libjpeg-turbo",
+    "DS4",
+    "h3.c",
+    "ccv",
     "llama.cpp",
     "ICU",
     "curl",
@@ -32,6 +43,8 @@ REQUIRED_EVALUATION_COMPONENTS = {
     "PyTorch",
     "Torchvision",
     "LPIPS",
+    "Triton",
+    "ROCprofiler SDK / ROCTx",
 }
 
 
@@ -149,7 +162,7 @@ def verify_dependencies(
 
     print(
         f"[check-dependencies] PASSED: All {len(components)} third-party dependencies "
-        f"verified consistent with licenses, pins, and package boundaries."
+        f"have license/version records and required package bindings."
     )
     return 0
 

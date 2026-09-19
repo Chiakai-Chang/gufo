@@ -114,7 +114,7 @@ struct LayerWeights {
   TensorRef shexp_down;      ///< [shared_ff -> hidden]
 
   // Speculative `nextn` block only.
-  TensorRef nextn_enorm;    ///< [hidden]
+  TensorRef nextn_enorm;  ///< [hidden]
   TensorRef nextn_hnorm;  ///< [hc_dim], one RMS denominator across all streams
   TensorRef nextn_eh_proj;  ///< GGUF rows: [fc_embedding | fc_hidden]
   HcMixer nextn_head;       ///< Output mixer of the draft block.

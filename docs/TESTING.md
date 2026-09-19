@@ -2,7 +2,7 @@
 
 Run the smallest check that covers the change. Correctness and model-owned
 quality limits pass before performance results count. Production targets
-Linux gfx1151; all builds and tests use Nix.
+Linux gfx1151. CMake/CTest work with either system dependencies or `nix develop`.
 
 ## Commands
 
@@ -10,7 +10,7 @@ Linux gfx1151; all builds and tests use Nix.
 # Documentation changes
 nix build .#checks.x86_64-linux.docs
 
-# Canonical PR gates
+# Hosted CPU/repository checks
 nix build .#checks.x86_64-linux.pr
 
 # Focused test (replace the target and expression)
@@ -26,7 +26,8 @@ nix develop -c ctest --preset cpu-sanitizer --output-on-failure
 
 See [development](DEVELOPMENT.md) for all build presets.
 `gpu-test` uses optimized `RelWithDebInfo` with assertions.
-Performance measurements use `nix build` binaries under `result/bin`.
+Performance measurements use `nix build` binaries under `result/bin` or the
+`release` preset with the same compiler and dependencies.
 Add new files to Git before invoking Nix.
 
 `gpu-fast` excludes `slow` and `external-model` tests. The
@@ -34,6 +35,35 @@ Add new files to Git before invoking Nix.
 model/device suites; `gpu-full` covers the complete hardware tree.
 External-model tests require their documented local artifacts. A skip due to
 an absent model or device is not a quality pass.
+
+## Hosted versus local checks
+
+GitHub runs formatting, documentation, dependency-inventory and server-command
+checks plus `cmake/Checks.cmake`: parsing, GGUF safety, sampling, templates,
+server/cache/scheduler behavior, model configuration and small audio/video API
+contracts. It builds only those test executables and the CPU CLI. It does not
+build ROCm, download weights, run full H3 oracles or compile whole-tree clang-tidy.
+The workflow cancels superseded runs and has a 25-minute limit.
+
+```sh
+# Same hosted C++/CLI selection locally
+cmake --preset cpu-test
+cmake --build --preset pr --parallel 4
+
+# Full CPU suite, or explicit non-hosted tools
+nix build .#checks.x86_64-linux.tests
+nix build .#checks.x86_64-linux.static-analysis
+nix build .#checks.x86_64-linux.h3-manifest
+nix build .#checks.x86_64-linux.h3-quality
+nix build .#checks.x86_64-linux.h3-ml-quality
+```
+
+Full CPU builds need Python NumPy for the offline tool tests. GPU model oracles
+need the documented local weights; use focused targets and CTest labels before
+running the complete tree. H3 development normally needs an analytic primitive,
+one transformer block or one denoiser forward. Full video generation and LPIPS
+are release/quality qualification, not routine PR work. `nix flake check` runs
+all declared checks and is deliberately not the hosted CI command.
 
 ## Match validation to the change
 

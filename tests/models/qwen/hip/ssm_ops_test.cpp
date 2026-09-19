@@ -44,7 +44,8 @@ void TestConcurrentSsmRecurrence() {
   constexpr std::size_t qkv = 2 * key_heads * dim + inner;
   constexpr std::size_t conv_per_sequence = layers * qkv * 4;
   constexpr std::size_t state_per_sequence = layers * heads * dim * dim;
-  constexpr std::size_t replay_qkv = layers * gufo::hip::kSsmReplayCapacity * qkv;
+  constexpr std::size_t replay_qkv =
+      layers * gufo::hip::kSsmReplayCapacity * qkv;
   constexpr std::size_t replay_control =
       layers * gufo::hip::kSsmReplayCapacity * heads;
   const auto values = [](std::size_t size, float phase) {
@@ -74,16 +75,18 @@ void TestConcurrentSsmRecurrence() {
     enabled[i] = i % 2;
     offset += i + 1;
   }
-  DeviceBuffer<std::uint32_t> device_positions(positions), device_enabled(enabled);
+  DeviceBuffer<std::uint32_t> device_positions(positions),
+      device_enabled(enabled);
   const auto clear = [](auto& buffer) {
-    HIP_CHECK(hipMemset(buffer.data(), 0,
-                        buffer.size() * sizeof(*buffer.data())));
+    HIP_CHECK(
+        hipMemset(buffer.data(), 0, buffer.size() * sizeof(*buffer.data())));
   };
   const auto expect_equal = [](const auto& expected, const auto& actual) {
     if (expected.size() != actual.size() ||
         std::memcmp(expected.data(), actual.data(),
                     expected.size() * sizeof(expected[0])) != 0)
-      throw std::runtime_error("concurrent SSM changed output, state or replay");
+      throw std::runtime_error(
+          "concurrent SSM changed output, state or replay");
   };
   for (const auto storage : {Storage::kFp32, Storage::kBf16}) {
     const std::size_t element_bytes =
@@ -95,25 +98,27 @@ void TestConcurrentSsmRecurrence() {
                     element_bytes);
       } else {
         const auto bits = gufo::test::FloatToBf16Bits(initial_state[i]);
-        std::memcpy(state_bytes.data() + i * element_bytes, &bits, element_bytes);
+        std::memcpy(state_bytes.data() + i * element_bytes, &bits,
+                    element_bytes);
       }
     }
     DeviceBuffer<std::uint8_t> recurrent(state_bytes);
     for (std::size_t i = 0; i < count; ++i) {
       auto& sequence = sequences[i];
       sequence.conv = conv_state.data() + i * conv_per_sequence;
-      sequence.recurrent = recurrent.data() + i * state_per_sequence * element_bytes;
-      sequence.replay = {
-          captured_qkv.data() + i * replay_qkv,
-          captured_alpha.data() + i * replay_control,
-          captured_beta.data() + i * replay_control,
-          device_positions.data() + sequence.row_offset, device_enabled.data() + i};
+      sequence.recurrent =
+          recurrent.data() + i * state_per_sequence * element_bytes;
+      sequence.replay = {captured_qkv.data() + i * replay_qkv,
+                         captured_alpha.data() + i * replay_control,
+                         captured_beta.data() + i * replay_control,
+                         device_positions.data() + sequence.row_offset,
+                         device_enabled.data() + i};
     }
     const auto reset = [&] {
       conv_state.CopyFrom(initial_conv);
       recurrent.CopyFrom(state_bytes);
       for (auto* buffer : {&conv_output, &output, &captured_qkv,
-                            &captured_alpha, &captured_beta})
+                           &captured_alpha, &captured_beta})
         clear(*buffer);
     };
     for (const std::size_t width : {1U, 2U, 4U, 6U, 8U}) {
@@ -125,8 +130,8 @@ void TestConcurrentSsmRecurrence() {
               input.data() + row * qkv, weights.data(), sequence.conv,
               conv_output.data() + row * qkv, sequence.recurrent,
               controls.data() + row * heads * 2,
-              controls.data() + row * heads * 2 + heads, decay.data(), dt.data(),
-              norm.data(), gate.data() + row * inner,
+              controls.data() + row * heads * 2 + heads, decay.data(),
+              dt.data(), norm.data(), gate.data() + row * inner,
               write_output ? output.data() + row * inner : nullptr, layer, qkv,
               key_heads, heads, dim, dim, sequence.rows, heads * 2, inner,
               nullptr, sequence.replay, storage);
@@ -134,7 +139,7 @@ void TestConcurrentSsmRecurrence() {
         const auto expected_state = recurrent.CopyToHost();
         std::vector<std::vector<float>> expected;
         for (auto* buffer : {&conv_state, &conv_output, &output, &captured_qkv,
-                              &captured_alpha, &captured_beta})
+                             &captured_alpha, &captured_beta})
           expected.push_back(buffer->CopyToHost());
         reset();
         gufo::hip::LaunchSSMConvRecurrenceBatch(
@@ -146,12 +151,13 @@ void TestConcurrentSsmRecurrence() {
         expect_equal(expected_state, recurrent.CopyToHost());
         std::size_t index = 0;
         for (auto* buffer : {&conv_state, &conv_output, &output, &captured_qkv,
-                              &captured_alpha, &captured_beta})
+                             &captured_alpha, &captured_beta})
           expect_equal(expected[index++], buffer->CopyToHost());
       }
     }
   }
-  std::cout << "Concurrent SSM: FP32/BF16 state, ragged rows and replay exact\n";
+  std::cout
+      << "Concurrent SSM: FP32/BF16 state, ragged rows and replay exact\n";
 }
 
 void TestRecurrentRollbackRows(bool large_state) {
@@ -312,7 +318,8 @@ void TestBf16RecurrentMemoryAndSnapshot() {
 }
 
 // Independent causal-convolution oracle, including nonzero carried history.
-// Only short batches need scalar output checks; all batches check the exact tail.
+// Only short batches need scalar output checks; all batches check the exact
+// tail.
 void CheckSSMConvolution(const std::vector<float>& input,
                          const std::vector<float>& weights,
                          const std::vector<float>& history,
@@ -327,7 +334,8 @@ void CheckSSMConvolution(const std::vector<float>& input,
                                  ? history[(c * 4) + batch + j]
                                  : input[((batch + j - 4) * channels) + c];
       if (std::memcmp(&expected, &state[(c * 4) + j], sizeof(float)) != 0) {
-        throw std::runtime_error("convolution history differs from causal tail");
+        throw std::runtime_error(
+            "convolution history differs from causal tail");
       }
     }
   }
@@ -341,9 +349,8 @@ void CheckSSMConvolution(const std::vector<float>& input,
     for (std::size_t c = 0; c < channels; ++c) {
       double dot = 0.0;
       for (std::size_t j = 0; j < 4; ++j) {
-        const float value = t + j < 3
-                                ? history[(c * 4) + t + j + 1]
-                                : input[((t + j - 3) * channels) + c];
+        const float value = t + j < 3 ? history[(c * 4) + t + j + 1]
+                                      : input[((t + j - 3) * channels) + c];
         dot += static_cast<double>(value) * weights[(c * 4) + j];
       }
       const double expected = dot / (1.0 + std::exp(-dot));
@@ -736,11 +743,11 @@ void TestBatchedSSMRowSplitRecurrenceEquivalence(std::size_t batch) {
 
   HIP_CHECK(hipDeviceSynchronize());
   CheckSSMConvolution(h_qkv, h_weights, h_history, d_conv_ref, d_state_ref,
-                       batch, qkv_dim);
+                      batch, qkv_dim);
   CheckSSMConvolution(h_qkv, h_weights, h_history, d_conv_new, d_state_new,
-                       batch, qkv_dim);
+                      batch, qkv_dim);
   CheckSSMConvolution(h_qkv, h_weights, h_history, d_conv_bf16, d_state_bf16,
-                       batch, qkv_dim);
+                      batch, qkv_dim);
 
   const auto download = [](std::vector<float>& dst, const float* src) {
     HIP_CHECK(hipMemcpy(dst.data(), src, dst.size() * sizeof(float),

@@ -17,25 +17,14 @@
       }
     },
     {
-      "name": "development",
-      "displayName": "Development",
-      "description": "CPU-only development build with debug information and warnings enabled",
-      "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
-        "BUILD_TESTING": "ON",
-        "ENGINE_ENABLE_HIP": "OFF"
-      }
-    },
-    {
       "name": "release",
       "displayName": "Release",
-      "description": "CPU-only optimized release build",
+      "description": "Production gfx1151 build; same optimization as the Nix package",
       "inherits": "base",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BUILD_TESTING": "OFF",
-        "ENGINE_ENABLE_HIP": "OFF"
+        "ENGINE_ENABLE_HIP": "ON"
       }
     },
     {
@@ -56,7 +45,7 @@
       "description": "CPU-only build for running unit and smoke tests with CTest",
       "inherits": "base",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BUILD_TESTING": "ON",
         "ENGINE_ENABLE_HIP": "OFF"
       }
@@ -70,16 +59,11 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BUILD_TESTING": "ON",
         "ENGINE_ENABLE_HIP": "ON",
-        "GPU_TARGETS": "gfx1151"
+        "GUFO_BUILD_TOOLS": "ON"
       }
     }
   ],
   "buildPresets": [
-    {
-      "name": "development",
-      "displayName": "Development",
-      "configurePreset": "development"
-    },
     {
       "name": "release",
       "displayName": "Release",
@@ -99,17 +83,16 @@
       "name": "gpu-test",
       "displayName": "gfx1151 GPU Tests",
       "configurePreset": "gpu-test"
+    },
+    {
+      "name": "pr",
+      "configurePreset": "cpu-test",
+      "targets": [
+        "check-pr"
+      ]
     }
   ],
   "testPresets": [
-    {
-      "name": "development",
-      "displayName": "Development Tests",
-      "configurePreset": "development",
-      "output": {
-        "outputOnFailure": true
-      }
-    },
     {
       "name": "cpu-sanitizer",
       "displayName": "CPU ASan and UBSan Tests",

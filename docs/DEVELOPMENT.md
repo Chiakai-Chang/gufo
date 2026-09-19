@@ -1,6 +1,7 @@
 # Development
 
-Use Nix on Linux x86-64 gfx1151. Direct host builds are unsupported.
+Build on Linux x86-64 gfx1151 with CMake. Nix supplies the pinned development
+toolchain; [the README](../README.md#build-from-source) also covers system dependencies.
 
 | Directory | Ownership |
 | --- | --- |
@@ -14,7 +15,8 @@ Use Nix on Linux x86-64 gfx1151. Direct host builds are unsupported.
 | `.devops/nix` | Production package and server configuration |
 
 Stage new files before Nix builds; the flake includes tracked source only.
-Production performance comes from `nix build` / `result/bin`, not test binaries.
+Production performance comes from `nix build` / `result/bin` or the `release`
+CMake preset, with matching compiler and dependencies. Test builds keep assertions.
 
 ```sh
 nix build
@@ -23,8 +25,11 @@ nix develop -c cmake --build --preset gpu-test --target <affected-target>
 nix develop -c ctest --preset gpu-fast -R <affected-check> --output-on-failure
 ```
 
-`gpu-test` uses RelWithDebInfo with assertions. `cpu-test` provides host checks;
+`release` builds only production inference. `GUFO_BUILD_TOOLS=ON` adds kernel
+benchmarks and tuning tools; `gpu-test` enables them and uses RelWithDebInfo with assertions. `cpu-test` provides host checks;
 `cpu-sanitizer` enables ASan/UBSan. `gpu-full` selects the complete GPU tree.
+Commands inside `nix develop -c` also work directly with system dependencies.
+`cmake --preset cpu-test && cmake --build --preset pr` runs hosted contracts.
 Keep slow external-model checks explicit. See [testing](TESTING.md),
 [performance tooling](PERFORMANCE.md) and [model quality contracts](models/README.md).
 

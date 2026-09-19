@@ -1,211 +1,90 @@
-# Third-Party Notices and Inventory
+# Third-party notices
 
-This document records the complete inventory of third-party software, libraries, drivers,
-and system components used, linked, or required by **gufo**.
+Gufo's original source is MIT licensed; this does not relicense dependencies or
+model weights. This inventory covers direct dependencies and adapted code.
+Transitive system/toolchain dependencies retain their upstream licenses.
+`flake.lock` pins Nixpkgs revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a`;
+its package expressions record source revisions, patches and build options.
+Non-Nix builds must retain the notices of the versions they actually distribute.
 
-The engine license is in [LICENSE](LICENSE); model-specific acquisition and
-usage records are linked from [the model guide](docs/models/README.md).
-
----
-
-## Inventory Summary
+## Runtime and compiled code
 
 | Component Name | Relationship | License (SPDX) | Pinned Revision / Version | Upstream Source / Location |
 | --- | --- | --- | --- | --- |
-| **ROCm / HIP** | Linked / Toolchain | `MIT OR Apache-2.0 WITH LLVM-exception` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/clr](https://github.com/ROCm/clr) |
-| **hipBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLAS](https://github.com/ROCm/hipBLAS) |
-| **hipBLASLt** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/hipBLASLt](https://github.com/ROCm/hipBLASLt) |
-| **rocBLAS** | Linked | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocBLAS](https://github.com/ROCm/rocBLAS) |
-| **Composable Kernel** | Header / compiled kernels | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/composable_kernel](https://github.com/ROCm/composable_kernel) |
-| **ROCprofiler SDK / ROCTx** | Benchmark marker library / profiling tool | `MIT` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [ROCm/rocprofiler-sdk](https://github.com/ROCm/rocprofiler-sdk) |
-| **DS4** | Vendored model engine and ROCm kernels | `MIT` | `84cc882352757baf628a1776badf7cc54d584e28` | [antirez/ds4](https://github.com/antirez/ds4) |
-| **h3.c** | Pinned implementation reference; selected code may be adapted model-privately | `MIT` | `8974cc055ea9c02fcd14cc27dfda3e1027c05153` | [antirez/h3.c](https://github.com/antirez/h3.c) |
-| **ccv TensorOps matmul ancestry** | Algorithm/source ancestry identified by h3.c | `BSD-3-Clause` | Notice pinned through h3.c commit `8974cc055ea9c02fcd14cc27dfda3e1027c05153` | [libccv/ccv](https://github.com/liuliu/ccv) |
-| **llama.cpp** | Source-derived algorithm | `MIT` | `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) |
-| **ICU** | Linked | `Unicode-3.0` | Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [unicode-org/icu](https://github.com/unicode-org/icu) |
-| **curl / libcurl** | Linked HTTP client | `curl` | `8.21.0`, Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [curl/curl](https://github.com/curl/curl) |
-| **FFmpeg** | Spawned runtime executable | `LGPL-2.1-or-later AND GPL-2.0-or-later` (enabled components may also be `LGPL-3.0-or-later` / `GPL-3.0-or-later`) | `8.1.2`, Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [FFmpeg/FFmpeg](https://github.com/FFmpeg/FFmpeg) |
-| **PyTorch ROCm** | Evaluation/offline-teacher tool only; not shipped | `BSD-3-Clause` | `2.12.0`, Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [pytorch/pytorch](https://github.com/pytorch/pytorch) |
-| **Torchvision** | Evaluation/LPIPS tool only; not shipped | `BSD-3-Clause` | `0.27.0`, Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [pytorch/vision](https://github.com/pytorch/vision) |
-| **LPIPS** | Perceptual-quality evaluation tool only; not shipped | `BSD-2-Clause` | `0.1.4`, Nixpkgs `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` | [richzhang/PerceptualSimilarity](https://github.com/richzhang/PerceptualSimilarity) |
-| **Torchvision AlexNet weights** | Evaluation model data only; not shipped in the production package | `NOASSERTION` | SHA-256 `7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02` | [PyTorch model distribution](https://download.pytorch.org/models/alexnet-owt-7be5be79.pth) |
-| **MiniMax H3 FL2VA checkpoint** | External operator-supplied model; not distributed | `LicenseRef-MiniMax-H3-Community-2026-08-02` or operator-specific authorization | `42ed227ee7df40d41602854ae760620d6eb651fe` | [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) |
-| **Qwen3-VL-32B encoder weights used by H3** | External operator-supplied model component; not distributed | `Apache-2.0` | Included by the pinned H3 FL2VA checkpoint | [QwenLM/Qwen3-VL](https://github.com/QwenLM/Qwen3-VL) |
+| ROCm / HIP | Linked runtime | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/clr](https://github.com/ROCm/clr) |
+| hipBLAS | Linked | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/hipBLAS](https://github.com/ROCm/hipBLAS) |
+| hipBLASLt | Linked | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/hipBLASLt](https://github.com/ROCm/hipBLASLt) |
+| rocBLAS | Linked | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/rocBLAS](https://github.com/ROCm/rocBLAS) |
+| MIOpen | Linked; ASR convolutions | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/rocm-libraries](https://github.com/ROCm/rocm-libraries) |
+| AOTriton | Linked; H3 attention images | `MIT` | 0.11.1b; flake.lock | [ROCm/aotriton](https://github.com/ROCm/aotriton) |
+| hipCUB | Headers compiled into kernels | `BSD-3-Clause` | ROCm 7.2.3; flake.lock | [ROCm/hipCUB](https://github.com/ROCm/hipCUB) |
+| rocPRIM | Headers compiled into kernels | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/rocm-libraries](https://github.com/ROCm/rocm-libraries) |
+| rocWMMA | Headers compiled into kernels | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/rocWMMA](https://github.com/ROCm/rocWMMA) |
+| Composable Kernel | Headers compiled into attention kernels | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/composable_kernel](https://github.com/ROCm/composable_kernel) |
+| ICU | Linked; Unicode normalization/tokenization | `Unicode-3.0` | 78.3; flake.lock | [unicode-org/icu](https://github.com/unicode-org/icu) |
+| curl / libcurl | Linked; image HTTPS and evaluation client | `curl` | 8.21.0; flake.lock | [curl/curl](https://github.com/curl/curl) |
+| OpenSSL | Linked; cryptographic hashes and HTTPS dependency | `Apache-2.0` | 3.6.3; flake.lock | [openssl/openssl](https://github.com/openssl/openssl) |
+| libpng | Linked; image decoding | `libpng-2.0` | 1.6.58; flake.lock | [pnggroup/libpng](https://github.com/pnggroup/libpng) |
+| libjpeg-turbo | Linked; JPEG decoding | `IJG AND BSD-3-Clause AND Zlib` | 3.1.4.1; flake.lock | [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo) |
+| FFmpeg | Separate ffmpeg/ffprobe executables for media | `GPL-3.0-or-later` (Nix build with GPL/version3 components) | 8.1.2; flake.lock | [FFmpeg](https://github.com/FFmpeg/FFmpeg) |
+| GNU C/C++/OpenMP runtimes | System runtime libraries; no Gufo source import | `LGPL-2.1-or-later AND (GPL-3.0-or-later WITH GCC-exception-3.1)` | glibc/GCC packages in flake.lock | [GNU](https://www.gnu.org/software/) |
+| llama.cpp / ggml | Adapted quantization, attention and model-private HIP kernels | `MIT` | `5c0e9468378eba6bf3cc1989ff5d62fbbe4d9e3a`; attention `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0` | [llama.cpp](https://github.com/ggml-org/llama.cpp) |
+| Qwen chat templates | Reference Jinja and adapted renderer behavior | `Apache-2.0` | `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0` (27B), `de4b8e4d43b917e7706784d8bb445c9af86a3540` (Flash-Next) | [Qwen](https://huggingface.co/Qwen/Qwen3.8-27B) |
+| DS4 | Adapted loader, tokenizer, sessions and HIP kernels | `MIT` | `84cc882352757baf628a1776badf7cc54d584e28` | [antirez/ds4](https://github.com/antirez/ds4) |
+| DS4 GB10/GX10 fork | Adapted paired MoE launch code, now HIP | `MIT` | `910501e` | [xangel82/DS4](https://github.com/xangel82/DS4-GB10-GX10-DSpark-CUDA) |
+| h3.c | Adapted H3 geometry, scheduling and sampler; implementation reference | `MIT` | `8974cc055ea9c02fcd14cc27dfda3e1027c05153` | [antirez/h3.c](https://github.com/antirez/h3.c) |
+| ccv TensorOps ancestry | Attribution retained through h3.c | `BSD-3-Clause` | h3.c pin above | [liuliu/ccv](https://github.com/liuliu/ccv) |
 
----
+Upstream license texts are retained in `licenses/` and
+[src/models/deepseek_v4_flash/LICENSE.ds4](src/models/deepseek_v4_flash/LICENSE.ds4).
+CMake installs these with `LICENSE`, `NOTICE` and this inventory under
+`share/licenses/gufo`. Preserve embedded copyright notices when modifying
+adapted code. Model-private changes and import boundaries are recorded in the
+[DS4 provenance](src/models/deepseek_v4_flash/UPSTREAM.md),
+[DS4 HIP import](src/models/deepseek_v4_flash/kernels/rocm/mmq/VENDOR.md),
+[Flash-Next HIP import](src/models/qwen38_flash_next/kernels/rocm/mmq/VENDOR.md)
+and [H3 evaluation record](docs/models/minimax-h3/EVALUATION.md).
 
-## Distributed Userspace Dependencies
+This software is based in part on the work of the Independent JPEG Group.
 
-### ROCm / HIP (AMD ROCm Compute Language Runtime)
+FFmpeg is invoked as a separate process, not linked into Gufo. The pinned Nix
+build enables GPL/version3 components; a system FFmpeg build can have different
+terms. Redistributors bundling FFmpeg or other copyleft dependencies must also
+provide their applicable license texts and corresponding source/build materials,
+not just this MIT license. The pinned Nixpkgs expressions and `flake.lock`
+identify those sources and build recipes; a source URL alone is not a substitute
+for fulfilling the applicable distribution terms.
 
-- **Component Name**: ROCm / HIP (AMD ROCm Compute Language Runtime)
-- **Upstream URL**: https://github.com/ROCm/clr
-- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.clr` / `rocmPackages.llvm.clang`)
-- **Component Used**: HIP runtime, headers, host/device headers, and Clang compiler for `gfx1151`
-- **SPDX License Identifier**: `MIT OR Apache-2.0 WITH LLVM-exception`
-- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-- **Relationship**: Linked / Toolchain (Build toolchain and runtime library dependency)
-- **Corresponding-Source Location**: https://github.com/ROCm/clr (via Nix derivation `rocmPackages.clr`)
+The official 0731 DeepSeek continuations in
+`tests/models/deepseek_v4_flash/fixtures/official-0731.json` come from DS4 revision
+`6289c516273979173abbc062209a81dd3706b804`; the fixture retains source hashes and
+its upstream MIT notice. External model files are never part of the binary package.
 
-### hipBLAS
+## Build and development only
 
-- **Component Name**: hipBLAS (AMD ROCm BLAS Marshalling Library)
-- **Upstream URL**: https://github.com/ROCm/hipBLAS
-- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.hipblas`)
-- **Component Used**: Dynamic BLAS abstraction library and interface headers
-- **SPDX License Identifier**: `MIT`
-- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-- **Relationship**: Linked (Dynamic library dependency)
-- **Corresponding-Source Location**: https://github.com/ROCm/hipBLAS (via Nix derivation `rocmPackages.hipblas`)
+| Component Name | Relationship | License (SPDX) | Pinned Revision / Version | Upstream Source / Location |
+| --- | --- | --- | --- | --- |
+| LLVM/Clang | HIP build toolchain | `Apache-2.0 WITH LLVM-exception` | ROCm LLVM from flake.lock | [ROCm/llvm-project](https://github.com/ROCm/llvm-project) |
+| Triton | Build-time compilation of retained H3 kernels | `MIT` | 3.7.0; flake.lock | [triton-lang/triton](https://github.com/triton-lang/triton) |
+| ROCprofiler SDK / ROCTx | Development profiling and benchmark markers only | `MIT` | ROCm 7.2.3; flake.lock | [ROCm/rocprofiler-sdk](https://github.com/ROCm/rocprofiler-sdk) |
+| PyTorch ROCm | Independent evaluation; not shipped | `BSD-3-Clause` | 2.12.0; flake.lock | [pytorch/pytorch](https://github.com/pytorch/pytorch) |
+| Torchvision | Evaluation; not shipped | `BSD-3-Clause` | 0.27.0; flake.lock | [pytorch/vision](https://github.com/pytorch/vision) |
+| LPIPS | Evaluation; not shipped | `BSD-2-Clause` | 0.1.4; flake.lock | [PerceptualSimilarity](https://github.com/richzhang/PerceptualSimilarity) |
+| Transformers / Accelerate / Safetensors / Hugging Face Hub | Evaluation, artifact inspection and model acquisition | `Apache-2.0` | flake.lock | [Hugging Face](https://github.com/huggingface) |
+| NumPy / SciPy | Evaluation arrays and signal analysis | `BSD-3-Clause` | flake.lock | [NumPy](https://github.com/numpy/numpy), [SciPy](https://github.com/scipy/scipy) |
+| Requests | Evaluation HTTP client | `Apache-2.0` | flake.lock | [Requests](https://github.com/psf/requests) |
+| SoX | Development audio utility | `GPL-2.0-or-later` | flake.lock | [SoX](https://sourceforge.net/projects/sox/) |
+| Torchvision AlexNet weights | Evaluation data only; not shipped | `NOASSERTION` | SHA-256 `7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02` | [PyTorch model distribution](https://download.pytorch.org/models/alexnet-owt-7be5be79.pth) |
 
-### hipBLASLt
+Python/PyTorch and reference scripts are not installed with Gufo. Triton is
+needed while building H3's native code, not during inference. Kernel/tuning
+executables are built only with `GUFO_BUILD_TOOLS=ON`; ROCprofiler is supplied
+by the development shell. Ordinary build tools (CMake, Ninja, pkg-config,
+Python and the host compiler) retain their own licenses and are not Gufo code.
 
-- **Component Name**: hipBLASLt (AMD ROCm Tunable BLAS Library)
-- **Upstream URL**: https://github.com/ROCm/hipBLASLt
-- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.hipblaslt`)
-- **Component Used**: Tuned BF16 matrix multiplication kernels and algorithm-selection interface for prompt processing
-- **SPDX License Identifier**: `MIT`
-- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-- **Relationship**: Linked (Dynamic library dependency)
-- **Corresponding-Source Location**: https://github.com/ROCm/hipBLASLt (via Nix derivation `rocmPackages.hipblaslt`)
-
-### rocBLAS
-
-- **Component Name**: rocBLAS (AMD ROCm Basic Linear Algebra Subprograms)
-- **Upstream URL**: https://github.com/ROCm/rocBLAS
-- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.rocblas`)
-- **Component Used**: GPU BLAS execution kernels optimized for `gfx1151`
-- **SPDX License Identifier**: `MIT`
-- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-- **Relationship**: Linked (Dynamic library dependency)
-- **Corresponding-Source Location**: https://github.com/ROCm/rocBLAS (via Nix derivation `rocmPackages.rocblas`)
-
-### Composable Kernel
-
-- **Component Name**: Composable Kernel (ROCm GPU kernel library)
-- **Upstream URL**: https://github.com/ROCm/composable_kernel
-- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.composable_kernel`)
-- **Component Used**: Header-instantiated causal grouped-query attention kernel compiled into the `gfx1151` HIP backend
-- **SPDX License Identifier**: `MIT`
-- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-- **Relationship**: Header / compiled kernels
-- **Corresponding-Source Location**: https://github.com/ROCm/composable_kernel (via Nix derivation `rocmPackages.composable_kernel`)
-
-### ROCprofiler SDK / ROCTx
-
-- **Component Name**: ROCprofiler SDK / ROCTx
-- **Upstream URL**: https://github.com/ROCm/rocprofiler-sdk
-- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`rocmPackages.rocprofiler-sdk`)
-- **Component Used**: The `rocprofv3` diagnostic profiler and the lightweight ROCTx marker library linked only by `gufo-kernel-bench`
-- **SPDX License Identifier**: `MIT`
-- **Copyright / Notice Source**: Copyright (c) Advanced Micro Devices, Inc. All rights reserved.
-- **Relationship**: Benchmark marker library / profiling tool; the inference server does not link the profiler SDK
-- **Corresponding-Source Location**: https://github.com/ROCm/rocprofiler-sdk (via Nix derivation `rocmPackages.rocprofiler-sdk`)
-
-### ICU
-
-- **Component Name**: ICU (International Components for Unicode)
-- **Upstream URL**: https://github.com/unicode-org/icu
-- **Pinned Revision**: Nixpkgs `nixos-unstable` lock revision
-  `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a` (`icu`)
-- **Component Used**: Unicode NFC normalization and Unicode general-category /
-  whitespace classification for the model-private MiniMax H3 tokenizer
-- **SPDX License Identifier**: `Unicode-3.0`
-- **Relationship**: Linked dynamic runtime dependency
-- **Corresponding-Source Location**: https://github.com/unicode-org/icu
-  (via Nix derivation `icu`)
-
-### FFmpeg
-
-- **Component Name**: FFmpeg
-- **Upstream URL**: https://github.com/FFmpeg/FFmpeg
-- **Pinned Version**: `8.1.2` from Nixpkgs lock revision
-  `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a`
-- **Component Used**: Headless `ffmpeg` and `ffprobe` executables for
-  concurrent RGB24/F32 PCM input, H.264/AAC MP4 encoding, and output metadata
-  validation
-- **SPDX License Identifiers**: `LGPL-2.1-or-later` and
-  `GPL-2.0-or-later`; the pinned Nix derivation also declares
-  `LGPL-3.0-or-later` and `GPL-3.0-or-later` for enabled optional components
-- **Relationship**: Spawned as a separate runtime process through pipes.
-  Gufo does not link FFmpeg libraries or copy FFmpeg source into the engine.
-- **Corresponding-Source Location**: https://github.com/FFmpeg/FFmpeg
-  (via Nix derivation `ffmpeg-headless`)
-
-The Nix closure retains FFmpeg's complete license and corresponding-source
-metadata. H.264/AAC availability and any patent obligations are deployment
-considerations separate from the MiniMax model license and the engine's MIT
-license.
-
-### llama.cpp
-
-- **Component Name**: llama.cpp
-- **Upstream URL**: https://github.com/ggml-org/llama.cpp
-- **Pinned Revision**: Commit `e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0`
-- **Component Used**: Causal tiled-attention scheduling and online-softmax algorithm adapted into the native Qwen3.8 `gfx1151` HIP kernel
-- **SPDX License Identifier**: `MIT`
-- **Copyright / Notice Source**: Copyright (c) 2023-2026 The ggml authors
-- **Relationship**: Source-derived algorithm; no llama.cpp runtime code or library is linked
-- **Corresponding-Source Location**: https://github.com/ggml-org/llama.cpp/tree/e9fa0781f1c25fc4fe8c86be1edc6970661ad6f0/ggml/src/ggml-cuda
-
-### DS4
-
-- **Component Name**: DS4
-- **Upstream URL**: https://github.com/antirez/ds4
-- **Pinned Revision**: Commit `84cc882352757baf628a1776badf7cc54d584e28`
-- **Component Used**: DeepSeek V4 Flash GGUF loader, tokenizer, request-session
-  graph, and ROCm numerical kernels
-- **SPDX License Identifier**: `MIT`
-- **Copyright / Notice Source**: Copyright (c) 2026 Salvatore Sanfilippo
-  and DS4 contributors; the upstream license is retained under
-  `src/models/deepseek_v4_flash/vendor/antirez/LICENSE`.
-- **Relationship**: Vendored and adapted into a model-private ROCm backend.
-  Gufo does not import the upstream command-line interface, HTTP server,
-  agent, evaluator, or disk-cache frontend.
-- **Corresponding-Source Location**:
-  https://github.com/antirez/ds4/tree/84cc882352757baf628a1776badf7cc54d584e28
-- **Official continuation fixtures**: The matching 0731 hosted-model
-  continuations and five smoke prompts are imported separately from revision
-  `6289c516273979173abbc062209a81dd3706b804`. The fixture
-  `tests/models/deepseek_v4_flash/fixtures/official-0731.json` retains source
-  hashes and the upstream MIT notice (the ds4.c authors and ggml authors).
-
-### h3.c
-
-- **Component Name**: h3.c
-- **Upstream URL**: https://github.com/antirez/h3.c
-- **Pinned Revision**: `8974cc055ea9c02fcd14cc27dfda3e1027c05153`
-- **Component Used**: Native MiniMax H3 architecture, tensor naming, packed
-  multimodal layout, scheduler, sampler, VAE, tokenizer, fixtures, and
-  performance reference for the model-private ROCm/HIP port
-- **SPDX License Identifier**: `MIT`
-- **Copyright / Notice Source**: Copyright (c) 2026 Salvatore Sanfilippo
-- **Relationship**: Pinned implementation reference. Selected compatible code
-  may be copied or adapted into `src/models/minimax_h3/` with provenance and
-  modifications recorded; Metal and Objective-C execution are not imported.
-- **Corresponding-Source Location**:
-  https://github.com/antirez/h3.c/tree/8974cc055ea9c02fcd14cc27dfda3e1027c05153
-
-The upstream `THIRD_PARTY_NOTICES.md` identifies the rectangular Morton
-decoder and dynamic INT8/TensorOps scheduling design in `h3_shaders.metal` as
-adapted from ccv's `NAMatMulKernel` and `NAInt8MatMulKernel`, licensed
-BSD-3-Clause with copyright (c) 2010, Liu Liu. Any adapted expression or design
-retains that notice. See
-[the MiniMax H3 provenance record](docs/models/minimax-h3/EVALUATION.md).
-
-### curl / libcurl
-
-- **Component Name**: curl / libcurl
-- **Upstream URL**: https://github.com/curl/curl
-- **Pinned Revision**: Version `8.21.0` from Nixpkgs lock revision
-  `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a`
-- **Component Used**: HTTPS-capable client library used only by `gufo eval`
-  for OpenAI-compatible model discovery and chat-completion requests
-- **SPDX License Identifier**: `curl`
-- **Relationship**: Linked dynamic runtime dependency
-- **Corresponding-Source Location**: https://github.com/curl/curl
-
----
+The LPIPS evaluator checks the AlexNet digest above and calibration digest
+`df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0`, records the
+loaded module hash and library versions, and requires locally available weights.
 
 ## External Model Artifacts (Non-Distributed)
 
@@ -255,69 +134,3 @@ determination about a downstream operator.
 
 See [the MiniMax H3 guide](docs/models/minimax-h3/README.md) for the acquisition, release, and
 runtime boundary.
-
----
-
-## Evaluation-Only Quality Toolchain (Non-Shipped)
-
-The following packages are present only in the pinned Nix development shell.
-They are not linked into, copied into, or distributed with the production
-`gufo` package.
-
-### PyTorch ROCm
-
-- **Component Name**: PyTorch with ROCm support
-- **Upstream URL**: https://github.com/pytorch/pytorch
-- **Pinned Version**: `2.12.0` from Nixpkgs lock revision
-  `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a`
-- **Component Used**: Independent MiniMax H3 teacher execution and tensor
-  inspection on the supported ROCm host
-- **SPDX License Identifier**: `BSD-3-Clause`
-- **Relationship**: Evaluation and offline tooling only; absent from the
-  production package closure
-
-### Torchvision
-
-- **Component Name**: Torchvision
-- **Upstream URL**: https://github.com/pytorch/vision
-- **Pinned Version**: `0.27.0` from Nixpkgs lock revision
-  `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a`
-- **Component Used**: AlexNet feature network used by the LPIPS evaluator
-- **SPDX License Identifier**: `BSD-3-Clause`
-- **Relationship**: Evaluation-only direct dependency of the pinned Python
-  toolchain; absent from the production package closure
-
-### LPIPS
-
-- **Component Name**: Learned Perceptual Image Patch Similarity (LPIPS)
-- **Upstream URL**: https://github.com/richzhang/PerceptualSimilarity
-- **Pinned Version**: `0.1.4` from Nixpkgs lock revision
-  `2fcb964de67fcf60b43471c55d5d99e61a9ccb5a`
-- **Component Used**: AlexNet-based perceptual comparison of delivered
-  MiniMax H3 video frames
-- **SPDX License Identifier**: `BSD-2-Clause`
-- **Relationship**: Evaluation-only tool; absent from the production package
-  closure
-- **Model Boundary**: Feature-network parameters are not committed or
-  redistributed by gufo. Each promoted quality report records a
-  canonical SHA-256 of the loaded module state and the exact
-  LPIPS/PyTorch/Torchvision versions.
-
-### Torchvision AlexNet evaluation weights
-
-- **Component Name**: Torchvision AlexNet ImageNet weights
-- **Upstream URL**:
-  https://download.pytorch.org/models/alexnet-owt-7be5be79.pth
-- **Pinned Digest**:
-  `7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02`
-- **Component Used**: Frozen AlexNet feature trunk for LPIPS evaluation
-- **SPDX License Identifier**: `NOASSERTION`
-- **Relationship**: Nix-fetched evaluation model data only; absent from the
-  production package closure and not committed to the repository
-
-The evaluator verifies this digest and the bundled LPIPS v0.1 AlexNet
-calibration digest
-`df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0`
-before constructing the metric. It fails closed when either file is absent or
-changed and therefore does not rely on an ambient Torch hub cache or a runtime
-download.

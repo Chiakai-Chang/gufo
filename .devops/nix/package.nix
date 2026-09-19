@@ -12,12 +12,7 @@
   openssl,
   ffmpeg-headless,
   rocmPackages,
-  config,
   version,
-
-  # Overridable feature flags
-  rocmSupport ? config.rocmSupport or false,
-  rocmGpuTargets ? (lib.optionals rocmSupport rocmPackages.clr.gpuTargets),
 }:
 
 let
@@ -33,7 +28,9 @@ let
         relativePath = lib.removePrefix "${root}/" pathString;
       in
       pathString == root
-      || relativePath == "CMakeLists.txt"
+      || builtins.elem relativePath [ "CMakeLists.txt" "LICENSE" "NOTICE" "THIRD_PARTY_NOTICES.md" ]
+      || relativePath == "licenses"
+      || lib.hasPrefix "licenses/" relativePath
       || relativePath == "cmake"
       || lib.hasPrefix "cmake/" relativePath
       || relativePath == "src"
@@ -44,16 +41,12 @@ let
       || relativePath == "tests/models/deepseek_v4_flash/fixtures"
       || relativePath == "tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json"
       || relativePath == "tools"
-      || relativePath == "tools/bench"
-      || relativePath == "tools/bench/tune_hipblaslt.cpp"
-      || relativePath == "tools/bench/benchmark_ssm_replay.cpp"
-      || relativePath == "tools/bench/wmma_layout_test.hip"
       || relativePath == "tools/gufo"
       || relativePath == "tools/gufo/compile_h3_attention.py"
       || relativePath == "tools/gufo/h3_attention_kernel.py";
   };
 in
-stdenv.mkDerivation (finalAttrs: {
+stdenv.mkDerivation {
   pname = "gufo";
   inherit version;
   src = productionSource;
@@ -62,8 +55,6 @@ stdenv.mkDerivation (finalAttrs: {
     cmake
     ninja
     pkg-config
-  ]
-  ++ lib.optionals rocmSupport [
     rocmPackages.clr
     h3TritonCompiler
   ];
@@ -75,8 +66,6 @@ stdenv.mkDerivation (finalAttrs: {
     libjpeg
     openssl
     ffmpeg-headless
-  ]
-  ++ lib.optionals rocmSupport [
     rocmPackages.clr
     rocmPackages.hipblas
     rocmPackages.hipblaslt
@@ -87,7 +76,6 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.rocblas
     rocmPackages.composable_kernel
     rocmPackages.aotriton
-    rocmPackages.rocprofiler-sdk
   ];
 
   cmakeFlags = [
@@ -96,48 +84,8 @@ stdenv.mkDerivation (finalAttrs: {
     "-DGUFO_VERSION=${version}"
     "-DGUFO_FFMPEG_EXECUTABLE=${ffmpeg-headless}/bin/ffmpeg"
     "-DGUFO_FFPROBE_EXECUTABLE=${ffmpeg-headless}/bin/ffprobe"
-  ]
-  ++ lib.optional rocmSupport "-DENGINE_ENABLE_HIP=ON"
-  ++ lib.optional rocmSupport "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
-  ++ lib.optional rocmSupport "-DGPU_TARGETS=${lib.concatStringsSep ";" rocmGpuTargets}"
-  ++ lib.optional rocmSupport "-DHIPCUB_INCLUDE_DIR=${rocmPackages.hipcub}/include"
-  ++ lib.optional rocmSupport "-DROCPRIM_INCLUDE_DIR=${rocmPackages.rocprim}/include"
-  ++ lib.optional rocmSupport "-DROCWMMA_INCLUDE_DIR=${rocmPackages.rocwmma}/include";
-
-  env = lib.optionalAttrs rocmSupport {
-    ROCM_PATH = "${rocmPackages.clr}";
-    GUFO_HIPCUB_ROOT = "${rocmPackages.hipcub}";
-    GUFO_ROCPRIM_ROOT = "${rocmPackages.rocprim}";
-    GUFO_ROCWMMA_ROOT = "${rocmPackages.rocwmma}";
-  };
-
-  installPhase = ''
-    runHook preInstall
-
-    mkdir -p $out/bin
-    cp gufo $out/bin/gufo
-    ln -sf gufo $out/bin/gufo-server
-    mkdir -p $out/share/gufo/models/qwen3_tts
-    cp $src/src/models/qwen3_tts/reference/run_official.py \
-      $out/share/gufo/models/qwen3_tts/
-    mkdir -p $out/share/gufo/models/minimax_h3
-    cp $src/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json \
-      $out/share/gufo/models/minimax_h3/
-    mkdir -p $out/share/gufo/eval
-    cp $src/tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json $out/share/gufo/eval/
-    if [ -f gufo-kernel-bench ]; then
-      cp gufo-kernel-bench $out/bin/gufo-kernel-bench
-    fi
-    if [ -f tune_hipblaslt ]; then
-      cp tune_hipblaslt $out/bin/tune_hipblaslt
-    fi
-    if [ -f benchmark_ssm_replay ]; then
-      cp benchmark_ssm_replay $out/bin/benchmark_ssm_replay
-    fi
-    chmod +x $out/bin/*
-
-    runHook postInstall
-  '';
+    "-DCMAKE_HIP_COMPILER=${rocmPackages.llvm.clang}/bin/clang"
+  ];
 
   doInstallCheck = true;
   installCheckPhase = ''
@@ -147,12 +95,9 @@ stdenv.mkDerivation (finalAttrs: {
     $out/bin/gufo --help >/dev/null
     $out/bin/gufo-server --version
     $out/bin/gufo-server --help >/dev/null
-    if [ -x $out/bin/gufo-kernel-bench ]; then
-      $out/bin/gufo-kernel-bench --help >/dev/null
-    fi
-    if [ -x $out/bin/tune_hipblaslt ]; then
-      $out/bin/tune_hipblaslt --help >/dev/null
-    fi
+    test ! -e $out/bin/gufo-kernel-bench
+    test -f $out/share/licenses/gufo/LICENSE
+    test -f $out/share/licenses/gufo/third-party/LICENSE.ds4
 
     runHook postInstallCheck
   '';
@@ -170,9 +115,9 @@ stdenv.mkDerivation (finalAttrs: {
 
   meta = with lib; {
     description = "Gufo Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU)";
-    homepage = "https://github.com/";
+    homepage = "https://github.com/gufo-org/gufo";
     license = licenses.mit;
     platforms = [ "x86_64-linux" ];
     mainProgram = "gufo";
   };
-})
+}

@@ -34,10 +34,14 @@ __launch_bounds__(Resident ? 128 : 1024, 1) __global__
     rows = sequence.rows;
     const std::size_t offset = sequence.row_offset;
     conv_out += offset * conv_row_stride;
-    if (alpha_buf) alpha_buf += offset * projection_row_stride;
-    if (beta_buf) beta_buf += offset * projection_row_stride;
-    if (gate) gate += offset * inner_row_stride;
-    if (out_buf) out_buf += offset * inner_row_stride;
+    if (alpha_buf)
+      alpha_buf += offset * projection_row_stride;
+    if (beta_buf)
+      beta_buf += offset * projection_row_stride;
+    if (gate)
+      gate += offset * inner_row_stride;
+    if (out_buf)
+      out_buf += offset * inner_row_stride;
   }
   static_assert(!Resident || std::is_same_v<StateT, float>);
   const std::uint32_t key_dim = Resident ? 128 : key_dimension;

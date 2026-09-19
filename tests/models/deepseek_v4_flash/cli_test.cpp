@@ -113,7 +113,6 @@ int main(int argc, char** argv) {
   CheckBackend({"--speculative", "off", "--dspark-model", "support.gguf"}, "");
   CheckBackend({"--dspark-model", "support.gguf", "--speculative", "off"}, "");
 
-
   const char* args[] = {"--dspark-model", "support.gguf", "--draft-tokens",
                         "3"};
   const auto prompt = gufo::cli::ParsePromptOptions(args);

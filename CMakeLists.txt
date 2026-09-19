@@ -1,5 +1,14 @@
 cmake_minimum_required(VERSION 3.21)
 project(gufo LANGUAGES C CXX)
+if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+  message(FATAL_ERROR "Gufo requires Linux x86-64 with an AMD gfx1151 GPU")
+endif()
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Build type" FORCE)
+endif()
+set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+option(BUILD_TESTING "Build correctness tests" OFF)
+option(GUFO_BUILD_TOOLS "Build development benchmarks and tuning tools" OFF)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
@@ -19,27 +28,15 @@ set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
 set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
   "FFprobe executable used to validate generated media")
 
-# ROCm/HIP GPU backend — compiled natively for the Strix Halo gfx1151 target.
-option(ENGINE_ENABLE_HIP "Build gufo with ROCm/HIP GPU backend" OFF)
-
-# ROCm/HIP GPU discovery — compiled natively for the Strix Halo gfx1151 target.
-# Dependencies are supplied by the Nix environment via $ROCM_PATH.
-# Host ambient /usr fallbacks are rejected.
-if (NOT DEFINED ENV{ROCM_PATH})
-  if (EXISTS /opt/rocm)
-    set(ENV{ROCM_PATH} /opt/rocm)
-  endif()
+# CPU-only builds exist for host checks; production targets gfx1151 only.
+option(ENGINE_ENABLE_HIP "Build the gfx1151 HIP backend" ON)
+set(CMAKE_HIP_ARCHITECTURES gfx1151 CACHE STRING "HIP architecture")
+if (ENGINE_ENABLE_HIP AND NOT CMAKE_HIP_ARCHITECTURES STREQUAL "gfx1151")
+  message(FATAL_ERROR "Gufo kernels require CMAKE_HIP_ARCHITECTURES=gfx1151")
 endif()
-
-if (DEFINED ENV{ROCM_PATH})
-  list(APPEND CMAKE_PREFIX_PATH $ENV{ROCM_PATH})
-  list(APPEND CMAKE_PREFIX_PATH "$ENV{ROCM_PATH}/lib64/cmake")
-endif()
-
-# Forward GPU_TARGETS (set by the nix package) to CMAKE_HIP_ARCHITECTURES.
-# e.g. -DGPU_TARGETS=gfx1151
-if (GPU_TARGETS AND NOT CMAKE_HIP_ARCHITECTURES)
-  set(CMAKE_HIP_ARCHITECTURES "${GPU_TARGETS}" CACHE STRING "HIP architectures")
+# Standard ROCm installations; custom prefixes use CMAKE_PREFIX_PATH.
+if (EXISTS /opt/rocm)
+  list(APPEND CMAKE_PREFIX_PATH /opt/rocm)
 endif()
 
 if (ENGINE_ENABLE_HIP)
@@ -51,21 +48,16 @@ if (ENGINE_ENABLE_HIP)
   find_package(rocblas REQUIRED)
   find_package(miopen REQUIRED)
   find_package(aotriton CONFIG REQUIRED)
-  find_path(HIPCUB_INCLUDE_DIR hipcub/hipcub.hpp
-    HINTS "$ENV{GUFO_HIPCUB_ROOT}/include"
-    REQUIRED)
-  find_path(ROCPRIM_INCLUDE_DIR rocprim/rocprim.hpp
-    HINTS "$ENV{GUFO_ROCPRIM_ROOT}/include"
-    REQUIRED)
-  find_path(ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp
-    HINTS "$ENV{GUFO_ROCWMMA_ROOT}/include"
-    REQUIRED)
-  find_path(ROCTX_INCLUDE_DIR rocprofiler-sdk-roctx/roctx.h REQUIRED)
-  find_library(ROCTX_LIBRARY NAMES rocprofiler-sdk-roctx REQUIRED)
+  find_path(HIPCUB_INCLUDE_DIR hipcub/hipcub.hpp REQUIRED)
+  find_path(ROCPRIM_INCLUDE_DIR rocprim/rocprim.hpp REQUIRED)
+  find_path(ROCWMMA_INCLUDE_DIR rocwmma/rocwmma.hpp REQUIRED)
   find_path(COMPOSABLE_KERNEL_INCLUDE_DIR ck/ck.hpp REQUIRED)
-
-  message(STATUS "gufo: ROCm/HIP enabled, architectures=${CMAKE_HIP_ARCHITECTURES}")
-  message(STATUS "gufo: ROCM_PATH=$ENV{ROCM_PATH}")
+  execute_process(COMMAND "${Python3_EXECUTABLE}" -c "import triton"
+    RESULT_VARIABLE GUFO_TRITON_IMPORT OUTPUT_QUIET ERROR_QUIET)
+  if (NOT GUFO_TRITON_IMPORT EQUAL 0)
+    message(FATAL_ERROR "The build needs Python Triton to compile H3 attention; see README.md")
+  endif()
+  message(STATUS "gufo: HIP target ${CMAKE_HIP_ARCHITECTURES}")
 
   set(GUFO_H3_ATTENTION_GENERATED_DIR
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -254,9 +246,7 @@ target_compile_definitions(gufo PRIVATE
   GUFO_EVAL_SOURCE_DATA="${CMAKE_CURRENT_SOURCE_DIR}/tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json"
   GUFO_EVAL_INSTALLED_DATA="${CMAKE_INSTALL_PREFIX}/share/gufo/eval/antirez-ds4.json"
   GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
-  GUFO_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
-  GUFO_QWEN3_TTS_REFERENCE_RUNNER="${CMAKE_CURRENT_SOURCE_DIR}/src/models/qwen3_tts/reference/run_official.py"
-  GUFO_QWEN3_TTS_INSTALLED_REFERENCE_RUNNER="${CMAKE_INSTALL_PREFIX}/share/gufo/models/qwen3_tts/run_official.py")
+  GUFO_H3_INSTALLED_SOURCE_MANIFEST="${CMAKE_INSTALL_PREFIX}/share/gufo/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json")
 
 if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo PRIVATE gufo_deepseek_v4_flash)
@@ -267,12 +257,15 @@ add_custom_target(gufo-server ALL
   COMMAND ${CMAKE_COMMAND} -E create_symlink $<TARGET_FILE_NAME:gufo> ${CMAKE_CURRENT_BINARY_DIR}/gufo-server
   DEPENDS gufo
 )
-add_library(gufo_kernel_bench_support STATIC
-  src/cli/bench/kernel_bench.cpp
-)
-target_include_directories(gufo_kernel_bench_support PUBLIC ${CMAKE_SOURCE_DIR})
+if (BUILD_TESTING OR GUFO_BUILD_TOOLS)
+  add_library(gufo_kernel_bench_support STATIC
+    src/cli/bench/kernel_bench.cpp)
+  target_include_directories(gufo_kernel_bench_support PUBLIC ${CMAKE_SOURCE_DIR})
+endif()
 
-if (ENGINE_ENABLE_HIP)
+if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
+  find_path(ROCTX_INCLUDE_DIR rocprofiler-sdk-roctx/roctx.h REQUIRED)
+  find_library(ROCTX_LIBRARY NAMES rocprofiler-sdk-roctx REQUIRED)
   add_executable(gufo-kernel-bench
     src/cli/bench/kernel_bench_main.cpp
   )
@@ -289,11 +282,8 @@ if (ENGINE_ENABLE_HIP)
   add_executable(tune_hipblaslt tools/bench/tune_hipblaslt.cpp)
   target_link_libraries(tune_hipblaslt PRIVATE gufo_core hip::host)
 
-  option(GUFO_BUILD_DIAG_TOOLS "Build standalone diagnostic tools" OFF)
-  if(GUFO_BUILD_DIAG_TOOLS)
-    add_executable(wmma_layout_test tools/bench/wmma_layout_test.hip)
-    target_link_libraries(wmma_layout_test PRIVATE gufo_core hip::device)
-  endif()
+  add_executable(wmma_layout_test tools/bench/wmma_layout_test.hip)
+  target_link_libraries(wmma_layout_test PRIVATE gufo_core hip::device)
 endif()
 
 install(TARGETS gufo DESTINATION bin)
@@ -301,16 +291,13 @@ install(FILES
   src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json
   DESTINATION share/gufo/models/minimax_h3)
 install(FILES
-  src/models/qwen3_tts/reference/run_official.py
-  DESTINATION share/gufo/models/qwen3_tts)
-install(FILES
-  src/models/qwen3_asr/reference/run_official.py
-  src/models/qwen3_asr/tools/benchmark.py
-  DESTINATION share/gufo/models/qwen3_asr)
-install(FILES
   tests/models/deepseek_v4_flash/fixtures/antirez-ds4.json
   DESTINATION share/gufo/eval)
-if (ENGINE_ENABLE_HIP)
+install(FILES LICENSE NOTICE THIRD_PARTY_NOTICES.md DESTINATION share/licenses/gufo)
+install(DIRECTORY licenses/ DESTINATION share/licenses/gufo/third-party)
+install(FILES src/models/deepseek_v4_flash/LICENSE.ds4 DESTINATION share/licenses/gufo/third-party)
+install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E create_symlink gufo \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server\")")
+if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
   install(TARGETS gufo-kernel-bench tune_hipblaslt
     DESTINATION bin)
 endif()
@@ -935,4 +922,6 @@ if (BUILD_TESTING)
   endif()
 endif()
 
-# Formatting and static analysis are owned by the canonical Nix PR checks.
+if (BUILD_TESTING)
+  include(cmake/Checks.cmake)
+endif()

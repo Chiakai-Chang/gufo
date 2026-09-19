@@ -326,14 +326,14 @@ int main() {
     CheckPooling(29, 16);     // batch wraps the raw-key ring
     CheckPooling(65533, 16);  // many wraps; absolute rotary position retained
     bool ok = true;
-    ok = Run(100, 20000, 0x1234ABCDU) && ok;     // deep, ragged group
+    ok = Run(100, 20000, 0x1234ABCDU) && ok;  // deep, ragged group
     ok = Run(7, 131069, 0x2468ACE0U) && ok;
     ok = Run(257, 131069, 0xC0FFEE01U, false, 0, true, ScoreLayout::kAligned) &&
          ok;
     ok = Run(129, 131069, 0, true, 0, true) && ok;  // deep, partial word
-    ok = Run(1, 9001, 0x0BADF00DU) && ok;        // decode
-    ok = Run(40, 2040, 0xDEADBEEFU) && ok;       // straddles the budget
-    ok = Run(3, 6000, 0x5EED5EEDU, true) && ok;  // all scores tie at zero
+    ok = Run(1, 9001, 0x0BADF00DU) && ok;           // decode
+    ok = Run(40, 2040, 0xDEADBEEFU) && ok;          // straddles the budget
+    ok = Run(3, 6000, 0x5EED5EEDU, true) && ok;     // all scores tie at zero
     // A threshold tie group that fits exactly, then one that needs the
     // lowest-index prefix. Both must produce the same CPU-sorted mask.
     ok = Run(1, 9001, 0, false, kBudget) && ok;

@@ -1,48 +1,28 @@
-gufo
-Copyright (c) 2026 gufo contributors
+Gufo
+Copyright (c) 2026 Gufo contributors
 
-This product includes software developed by the gufo project and
-third-party open source projects.
+Original Gufo code is licensed under the MIT License in LICENSE.
+Third-party code retains its original copyright and license terms.
+See THIRD_PARTY_NOTICES.md for provenance, versions and distribution boundaries;
+full imported notices are installed alongside it in third-party/.
 
-The original gufo source code is licensed under the MIT License.
-See the LICENSE file in the root of this distribution for the full license text.
+Adapted code includes:
+- llama.cpp / ggml: Copyright (c) 2023-2026 The ggml authors (MIT).
+- DS4: Copyright (c) 2026 The ds4.c authors (MIT).
+- DS4 GB10/GX10 changes: Copyright (c) 2026 Marco Palaferri (MIT).
+- Qwen reference chat templates: Alibaba Cloud / Qwen (Apache-2.0); Gufo
+  implements a separate bounded renderer with local validation and API wiring.
+- h3.c: Copyright (c) 2026 Salvatore Sanfilippo (MIT).
+- ccv ancestry through h3.c: Copyright (c) 2010 Liu Liu (BSD-3-Clause).
+- ROCm kernels/headers: AMD and the contributors identified in their notices.
+- hipCUB: Duane Merrill, NVIDIA CORPORATION and AMD (BSD-3-Clause).
 
-For detailed third-party dependency provenance, component breakdown, SPDX identifiers,
-licenses, and corresponding source locations, see THIRD_PARTY_NOTICES.md.
+This software is based in part on the work of the Independent JPEG Group.
 
-================================================================================
-THIRD-PARTY NOTICES
-================================================================================
+Gufo invokes FFmpeg/ffprobe as separate executables. Their license and source
+obligations, and those of any other bundled dependency, remain applicable to
+redistributed packages. Gufo's MIT license does not replace those obligations.
 
---------------------------------------------------------------------------------
-1. FFmpeg - Separate Runtime Executable
---------------------------------------------------------------------------------
-Version: 8.1.2 from pinned Nixpkgs
-Upstream Repository: https://github.com/FFmpeg/FFmpeg
-
-MiniMax H3 media output invokes the headless ffmpeg and ffprobe executables as
-separate processes. No FFmpeg library is linked into gufo. The
-pinned Nix closure supplies FFmpeg's LGPL/GPL license texts and corresponding
-source metadata. See THIRD_PARTY_NOTICES.md for the exact relationship and
-enabled-license inventory.
-
---------------------------------------------------------------------------------
-2. curl / libcurl - OpenAI-Compatible Evaluation Client
---------------------------------------------------------------------------------
-Version: 8.21.0 from pinned Nixpkgs
-Upstream Repository: https://github.com/curl/curl
-
-The gufo eval command links libcurl for HTTP and HTTPS model discovery and
-chat-completion requests. The pinned Nix closure supplies curl's license text
-and corresponding-source metadata. See THIRD_PARTY_NOTICES.md for the exact
-relationship.
-
---------------------------------------------------------------------------------
-3. Evaluation-Only Python Quality Toolchain
---------------------------------------------------------------------------------
-Pinned development environments include PyTorch ROCm 2.12.0, Torchvision
-0.27.0, and LPIPS 0.1.4 for independent teacher execution and perceptual
-quality evaluation. These BSD-licensed packages are not linked into or
-distributed with the production Gufo binaries. Their upstream license texts
-and source metadata are supplied by the pinned Nix packages; exact
-relationships are recorded in THIRD_PARTY_NOTICES.md.
+Model weights are not included. Operators acquire them separately under the
+publisher's terms. Python reference/evaluation tools and their models belong
+to the development environment, not the production Gufo installation.

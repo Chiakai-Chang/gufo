@@ -70,29 +70,84 @@ curl http://localhost:8080/v1/chat/completions \
 The server also exposes `/v1/completions`, `/v1/responses`, `/v1/models`, and
 `/health`. Any OpenAI-compatible client can point at `http://localhost:8080`.
 
-## Supported Platform
+## Build from source
 
-Linux x86-64 on AMD Strix Halo (`gfx1151` GPU) is the only
-planned production platform. Windows, macOS, and CUDA are out of scope.
+Linux x86-64 on AMD Strix Halo (`gfx1151`) is the supported target. CMake owns
+one production configuration for both Nix and ordinary Linux builds. Tests,
+profilers, tuning executables and Python reference runners are not installed
+with the production package. No `build.sh` wrapper is needed.
 
-Build with Nix only; direct host builds are unsupported:
-
-```sh
-nix build                          # build default package (gfx1151)
-./result/bin/gufo diagnose        # run hardware probe & diagnostics
-./result/bin/gufo serve           # run server
-nix build .#checks.x86_64-linux.pr # canonical PR test command (all gates)
-```
-
-For non-Nix users, [toolboxes](https://github.com/gufo-org/toolboxes) for Docker and Podman are available:
+### With Nix
 
 ```sh
-podman pull ghcr.io/gufo-org/toolboxes/gufo-runtime:latest
+nix build
+./result/bin/gufo diagnose
+./result/bin/gufo serve llm --model /path/to/model.gguf
 ```
 
-### Why Nix?
+[flake.lock](flake.lock) pins the dependencies. `nix develop` adds profiling,
+model-download and independent evaluation tools; these are not runtime
+requirements. See [testing](docs/TESTING.md) for the small hosted CI suite and
+explicit local quality checks.
 
-Nix provides a reproducible environment by having all the dependencies in a single file, the [flake.nix](./flake.nix). Our primary goal is to provide an engine that performs better on the Strix Halo without sacrificing accuracy. Nix helps us develop this project by removing all those variables that may make experiments not reproducible across several machines (different driver versions, different environment variables, etc.).
+### Without Nix
+
+Install a C++20 compiler, CMake 3.21+, Ninja, pkg-config, Python 3.10+ and the
+following development libraries. The currently qualified toolchain is GCC
+15.3, ROCm 7.2.3, AOTriton 0.11.1b and Triton 3.7.0.
+
+| Dependency | Used for |
+| --- | --- |
+| ROCm HIP compiler/runtime, hipBLAS, hipBLASLt, rocBLAS | GPU execution and matrix multiplication |
+| hipCUB, rocPRIM, rocWMMA, Composable Kernel headers | Compiled GPU kernels |
+| MIOpen | ASR audio encoder convolutions |
+| AOTriton, including **gfx1151 kernel images** | H3 attention |
+| ICU, libcurl, OpenSSL, libpng, libjpeg | Tokenization, HTTPS, hashing and images |
+| FFmpeg and ffprobe | Video/audio output; invoked as separate executables |
+| Python Triton 3.7.0 | Build-time H3 kernel compilation; not needed to run Gufo |
+
+Install ROCm using [AMD's Linux instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/).
+Use the development packages for the libraries above. AOTriton's Python package
+alone is insufficient: CMake needs its headers, `aotriton-config.cmake`, shared
+library and gfx1151 images. If building it from
+[the upstream source](https://github.com/ROCm/aotriton/tree/0.11.1b), select
+`-DAOTRITON_TARGET_ARCH=gfx1151 -DAOTRITON_USE_TORCH=OFF` and follow its install
+instructions. ROCm normally installs under `/opt/rocm`.
+
+For example, on Debian/Ubuntu the ordinary system libraries are:
+
+```sh
+sudo apt install build-essential cmake ninja-build pkg-config python3-venv \
+  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev ffmpeg
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install triton==3.7.0
+
+cmake --preset release -DCMAKE_INSTALL_PREFIX="$HOME/.local"
+cmake --build --preset release --parallel 4
+./build/release/gufo diagnose
+./build/release/gufo serve llm --model /path/to/model.gguf
+```
+
+Install the ROCm/AOTriton dependencies from the table before configuring.
+For nonstandard installations, pass ordinary CMake paths, for example
+`cmake --preset release -DCMAKE_PREFIX_PATH="/opt/rocm;/opt/aotriton"`.
+If compiler discovery picks a system Clang, also pass
+`-DCMAKE_HIP_COMPILER=/opt/rocm/llvm/bin/clang++`.
+Use `cmake --install build/release` to install Gufo,
+its runtime data and license notices. The GPU driver must allow your user to
+access `/dev/kfd` and `/dev/dri`; model weights are acquired separately.
+
+The same source, compiler flags and install rules serve both builds. Nix pins
+the complete toolchain for reproducible comparisons; changing the compiler or
+math libraries requires the affected model's quality checks.
+
+## License
+
+Gufo's original code is [MIT licensed](LICENSE). Adapted code and dependencies
+retain their own notices in [NOTICE](NOTICE), [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+and `licenses/`, installed under `share/licenses/gufo`. Model weights are not
+bundled and retain their publishers' terms.
 
 ## Reference Projects
 

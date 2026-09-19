@@ -102,10 +102,7 @@
           base = gufoPackages.${system}.gufo;
         in
         {
-          default = base.override {
-            rocmSupport = true;
-            rocmGpuTargets = [ "gfx1151" ];
-          };
+          default = base;
         }
       );
 
@@ -125,10 +122,6 @@
               pkgs.${system}.sqlite
             ];
             env = {
-              ROCM_PATH = "${pkgs.${system}.rocmPackages.clr}";
-              GUFO_HIPCUB_ROOT = "${pkgs.${system}.rocmPackages.hipcub}";
-              GUFO_ROCPRIM_ROOT = "${pkgs.${system}.rocmPackages.rocprim}";
-              GUFO_ROCWMMA_ROOT = "${pkgs.${system}.rocmPackages.rocwmma}";
               TORCH_HOME = "${alexnetTorchHome system}";
               LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
                 pkgs.${system}.stdenv.cc.cc.lib
@@ -196,7 +189,7 @@
               "cmake"
               "src"
               "tests"
-              "tools/gufo"
+              "tools"
             ];
             files = [
               ".clang-format"
@@ -272,6 +265,9 @@
               pkgsSys.findutils
               pkgsSys.icu
               pkgsSys.curl
+              pkgsSys.libpng
+              pkgsSys.libjpeg
+              pkgsSys.openssl
             ];
             src = staticAnalysisSource;
           } ''
@@ -374,15 +370,18 @@
             echo "PASS: MiniMax H3 pinned teacher and offline LPIPS clean" > $out/result.txt
           '';
 
-          testCheck = pkgsSys.runCommand "check-tests" {
+          mkTestCheck = full: pkgsSys.runCommand (if full then "check-tests" else "check-pr-tests") {
             nativeBuildInputs = [
               pkgsSys.stdenv.cc
               pkgsSys.ccache
               pkgsSys.cmake
               pkgsSys.ninja
-              (pkgsSys.python3.withPackages (ps: [ ps.numpy ]))
+              (if full then pkgsSys.python3.withPackages (ps: [ ps.numpy ]) else pkgsSys.python3)
               pkgsSys.icu
               pkgsSys.curl
+              pkgsSys.libpng
+              pkgsSys.libjpeg
+              pkgsSys.openssl
             ];
             src = testSource;
           } ''
@@ -404,39 +403,48 @@
             fi
 
             mkdir -p build && cd build
-            cmake "$src" -GNinja $ccache_launcher -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON -DSTRIX_ENABLE_WARNINGS=ON -DSTRIX_ENABLE_SANITIZERS=OFF
-            ninja
-            ctest --output-on-failure
+            cmake "$src" -GNinja $ccache_launcher -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBUILD_TESTING=ON -DENGINE_ENABLE_HIP=OFF
+            ${if full then ''
+              cmake --build . --parallel "$NIX_BUILD_CORES"
+              ctest --output-on-failure --timeout 120
+            '' else ''
+              cmake --build . --parallel "$NIX_BUILD_CORES" --target check-pr
+            ''}
 
             if [[ -n "$ccache_launcher" ]]; then
               ccache --show-stats
             fi
 
             mkdir -p $out
-            echo "PASS: CPU build and CTest suite passed" > $out/result.txt
+            echo "PASS: ${if full then "Full CPU" else "Hosted CPU contract"} suite passed" > $out/result.txt
           '';
+
+          testCheck = mkTestCheck true;
+          prTestCheck = mkTestCheck false;
 
           mkServeCheck =
             let
-              audioCmd = self.lib.${system}.mkGufoServe {
+              # Test command rendering without realizing the GPU package.
+              mkServe = args: self.lib.${system}.mkGufoServe (args // { gufo = "/gufo-test"; });
+              audioCmd = mkServe {
                 modality = "audio";
                 model = "/var/models/qwen3-tts";
                 context = 4096;
                 port = 9100;
                 sessions = 2;
               };
-              ttsAliasCmd = self.lib.${system}.mkGufoServe {
+              ttsAliasCmd = mkServe {
                 modality = "tts";
                 model = "/var/models/qwen3-tts";
               };
-              bothCmd = self.lib.${system}.mkGufoServe {
+              bothCmd = mkServe {
                 modality = "audio";
                 ttsModel = "/var/models/qwen3-tts";
                 asrModel = "/var/models/qwen3-asr";
                 ttsContext = 4096;
                 asrContext = 1024;
               };
-              voicesCmd = self.lib.${system}.mkGufoServe {
+              voicesCmd = mkServe {
                 modality = "audio";
                 ttsModel = "/var/models/qwen3-tts";
                 voices = {
@@ -451,16 +459,16 @@
                   };
                 };
               };
-              asrCmd = self.lib.${system}.mkGufoServe {
+              asrCmd = mkServe {
                 modality = "asr";
                 model = "/var/models/qwen3-asr";
                 context = 1024;
               };
-              sttAliasCmd = self.lib.${system}.mkGufoServe {
+              sttAliasCmd = mkServe {
                 modality = "stt";
                 model = "/var/models/qwen3-asr";
               };
-              cmd = self.lib.${system}.mkGufoServe {
+              cmd = mkServe {
                 model = "/var/models/qwen.gguf";
                 context = 4096;
                 servedModelName = "qwen-test";
@@ -483,13 +491,13 @@
                 cacheDiskBytes = 1024;
                 cacheDiskStagingBytes = 512;
               };
-              dsparkCmd = self.lib.${system}.mkGufoServe {
+              dsparkCmd = mkServe {
                 model = "/var/models/ds4.gguf";
                 speculative = "dspark";
                 dsparkModel = "/var/models/dspark.gguf";
                 draftTokens = 3;
               };
-              mtpCmd = self.lib.${system}.mkGufoServe {
+              mtpCmd = mkServe {
                 model = "/var/models/qwen-flash.gguf";
                 speculative = "mtp";
                 mtpModel = "/var/models/mtp.gguf";
@@ -564,46 +572,16 @@
               echo "PASS: mkGufoServe CLI string check passed" > $out/result.txt
             '';
 
-          # Canonical PR umbrella. Nix builds these independent derivations in
-          # parallel and reuses their results across flake checks and PR runs.
-          # The ROCm PyTorch/LPIPS closure remains an explicit h3-ml-quality
-          # check: realizing its multi-gigabyte offline-evaluation toolchain on
-          # every hosted PR runner exhausts the runner disk before tests start.
+          # The hosted runner builds CPU contracts only. GPU compilation,
+          # whole-tree clang-tidy, full CPU and H3 oracles are explicit checks.
           prCheck = pkgsSys.runCommand "check-pr" { } ''
-            mkdir -p $out/bin
-            cp "${self.packages.${system}.default}/bin/gufo" $out/bin/gufo
-            ln -sf gufo $out/bin/gufo-server
-
-            cat "${formatCheck}/result.txt"
-            cat "${staticAnalysisCheck}/result.txt"
-            cat "${dependencyInventoryCheck}/result.txt"
-            cat "${docsCheck}/result.txt"
-            cat "${h3ManifestCheck}/result.txt"
-            cat "${h3QualityCheck}/result.txt"
-            cat "${testCheck}/result.txt"
-            cat "${mkServeCheck}/result.txt"
-
-            cat <<EOF > $out/pr-summary.txt
-PR Check Summary
-Status: ALL GATES PASSED
-Package: ${self.packages.${system}.default.name}
-Revision: ${version}
-System: ${system}
-Composed Gates:
-  1. Format Validation (clang-format)
-  2. Static Analysis (clang-tidy)
-  3. Dependency and License Inventory (THIRD_PARTY_NOTICES.md)
-  4. Documentation & Local Link Validation (check-docs.py)
-  5. MiniMax H3 Source-Manifest Validation
-  6. MiniMax H3 Quality-Oracle Validation
-  7. CPU Build and Runtime/Unit Tests (CTest)
-  8. Declarative Server Wrapper Generation (mkGufoServe)
-Explicit Offline Gate (not in hosted PR closure):
-  - MiniMax H3 Pinned Teacher & Offline LPIPS Validation
-Production Package Validation:
-  - gfx1151 ROCm/HIP build
-  - Installed gufo-server version/help smoke
-EOF
+            mkdir -p $out
+            cat ${formatCheck}/result.txt \
+                ${dependencyInventoryCheck}/result.txt \
+                ${docsCheck}/result.txt \
+                ${prTestCheck}/result.txt \
+                ${mkServeCheck}/result.txt > $out/pr-summary.txt
+            cat $out/pr-summary.txt
           '';
         in
         {
@@ -615,6 +593,7 @@ EOF
           h3-quality = h3QualityCheck;
           h3-ml-quality = h3MlQualityCheck;
           tests = testCheck;
+          pr-tests = prTestCheck;
           mk-serve = mkServeCheck;
           pr = prCheck;
         }

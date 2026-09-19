@@ -36,15 +36,12 @@ QwenGemmRoute Route(GgmlType type, std::size_t m, std::size_t k,
 
 void TestFormatCapabilities() {
   constexpr std::array all_types{
-      GgmlType::kF32,           GgmlType::kF16,
-      GgmlType::kQ4_0,          GgmlType::kQ4_1,
-      GgmlType::kQ5_0,          GgmlType::kQ5_1,
-      GgmlType::kQ8_0,          GgmlType::kQ8_1,
-      GgmlType::kQ2_K,          GgmlType::kQ3_K,
-      GgmlType::kQ4_K,          GgmlType::kQ5_K,
-      GgmlType::kQ6_K,          GgmlType::kQ8_K,
-      GgmlType::kIQ2_XXS,       GgmlType::kIQ4_NL,
-      GgmlType::kIQ3_S,         GgmlType::kIQ4_XS,
+      GgmlType::kF32,    GgmlType::kF16,   GgmlType::kQ4_0,
+      GgmlType::kQ4_1,   GgmlType::kQ5_0,  GgmlType::kQ5_1,
+      GgmlType::kQ8_0,   GgmlType::kQ8_1,  GgmlType::kQ2_K,
+      GgmlType::kQ3_K,   GgmlType::kQ4_K,  GgmlType::kQ5_K,
+      GgmlType::kQ6_K,   GgmlType::kQ8_K,  GgmlType::kIQ2_XXS,
+      GgmlType::kIQ4_NL, GgmlType::kIQ3_S, GgmlType::kIQ4_XS,
       GgmlType::kBF16,
   };
   for (const auto type : all_types) {

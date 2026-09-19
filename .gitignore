@@ -87,6 +87,7 @@ test-results/
 *.gguf
 *.ckpt
 pytorch_model*.bin
+/.venv/
 __pycache__/
 *.pyc
 

@@ -1,189 +1,84 @@
 ---
 name: optimize-kernel
-description: "Workflow for optimizing model inference kernels on Strix Halo gfx1151: assess a baseline, change one route behind a policy toggle, verify quality against the baseline, and retain or reject with evidence. Rejection with evidence is a valid card completion."
+description: Optimize Gufo inference on Strix Halo gfx1151 using focused profiles, independent quality checks, and matched end-to-end measurements.
 metadata:
   origin: gufo
 ---
 
-# Optimize Kernel (Agent Skill)
+# Optimize gfx1151 kernels
 
-Workflow for GPU kernel optimization cards (gh issue opt-*). Never promote a
-fusion that degrades end-to-end layer time or spills scratch. Rejection with
-evidence is a valid card completion.
+Read the affected model's `docs/models/<model>/{BENCHMARKS,EVALUATION,EXPERIMENTS}.md`
+and its launch code. Establish the timed scope and arithmetic contract before
+changing dispatch. Follow the user's machine, time, and Git instructions.
 
-## Card contract (read the issue first)
+## Fast experiment loop
 
-- The issue's `## Acceptance` checklist is the contract (e.g. #127 requires
-  "any active-layer degradation from bus contention rejects/disables
-  prefetch"). The `## Verify` snippet may name stale presets; the real ones
-  are `gpu-test` (build) and `gpu-full` (test).
-- Register the equivalence test under the card's CTest label on the focused
-  Qwen HIP target that owns the kernel family in `CMakeLists.txt` (attention,
-  SSM, FFN, quant GEMV, dequant, graph/prefetch, module, or basic/BLAS). Add a
-  new focused target rather than growing an unrelated executable.
+1. Keep baseline and candidate production binaries. Use `nix build`, or the
+   `release` CMake preset with the same compiler/dependency versions. Test
+   binaries keep assertions and are for correctness, not headline timings.
+2. Start with one affected shape and one control. Use pp2048/tg128 for retained
+   end-to-end results; tiny prompts/outputs suffice to debug launches. For a
+   depth issue, try d16K/d32K first. Expand to d64K/d128K only when justified.
+3. Profile separately with `tools/prof/prof.py`; compare stage totals, launch
+   counts, GPU-busy time and wall span. Inspect allocator, synchronization,
+   sampling and cache I/O when GPU time does not explain latency.
+4. Change one mechanism, compile the affected target, then run its existing
+   analytic/operator check. Use `tools/bench/build.sh <name>` for standalone
+   HIP experiments; each result needs correctness alongside throughput.
+5. Compare unprofiled baseline/candidate under identical model, prompt, depth,
+   quantization, sampling, cache history and concurrency. Repeat only to resolve
+   noise. A microbenchmark gain must survive the full inference path.
+6. Keep the winning implementation as default. Delete rejected/dead routes;
+   do not add environment switches or duplicate tests to preserve experiments.
+   Record one concise retained/rejected row in `EXPERIMENTS.md`, current speeds
+   in `BENCHMARKS.md`, and actual quality evidence in `EVALUATION.md`.
 
-## Task scratch file
+## Techniques that worked here
 
-Keep an evidence file at repo root (`task-on-going.md`); it is the only
-artifact that survives context. Record baselines, profile findings, tool
-gotchas, and ideas as they are discovered. DELETE it before finishing - it
-only makes sense during the optimization.
+- **Bandwidth and cache:** measure `tools/bench/gfx1151_peak.hip`, not a spec
+  sheet. Previous large-buffer controls reached roughly 240 GB/s. The 32 MiB
+  MALL cache can make repeatedly reused small matrices look unrealistically
+  fast: rotate weights beyond cache capacity or reproduce full-model traffic.
+- **GEMV:** coalesce packed weight loads, stage shared activations in LDS,
+  fuse QKV or gate/up reads where useful, and preserve each dot product's
+  accumulation order. More fusion can increase VGPR pressure and spills.
+- **Verification and concurrency:** reuse quantized weights across token and
+  request rows. Tune real ragged shapes, including 3–8 rows and partial tiles.
+  Batch the complete draft transformer body, not only the vocabulary head;
+  keep each request's KV, recurrence, acceptance and RNG state independent.
+- **Wave mode and compiler:** selected quantized kernels need wave64 while
+  other paths use wave32. Match helper/caller wave modes per translation unit.
+  Iterative ILP scheduling helped selected 16-row Q4/Q5 kernels; applying it
+  globally was not a win. Inspect VGPR/LDS/private scratch and ISA with
+  `tools/prof/isa_mix.py`; occupancy alone is not the optimization objective.
+- **Attention and selection:** exact partial top-k can avoid sorting the full
+  context. Preserve tie ordering and FP32 ranking. Pack existing KV bytes into
+  bounded scratch/head groups without changing persistent precision. Do not
+  change softmax reduction order without the model's numerical qualification.
+- **Fusion and memory:** split repeated embedding/hidden projections instead
+  of concatenating duplicate inputs. Respect full-width HC normalization.
+  Reuse scratch, allocate rollback depth on demand, and avoid carrying entire
+  prefill chunks into draft catch-up. UMA still has placement costs: mapped
+  quantized weights and copied reusable audio/DiT weights behave differently.
+- **Graphs:** verify replay actually launches every new operation. Side-stream
+  work during capture is not automatically included in the graph. Check the
+  relevant shallow/deep dispatch boundaries and unprofiled wall time.
 
-## 1. Assess the baseline (before any change)
+## Quality and reporting
 
-1. Clean stage state: `git add .` (Nix sees only tracked files).
-2. Probe hardware + record revision/fingerprint: `nix build && ./result/bin/gufo`.
-3. Build:
-   - Release: `nix build` (produces `result/`). It builds fully-optimized
-     binaries and `./result/bin/gufo-server` runs significantly faster with
-     consistent performance.
-   - Fast incremental loop while editing:
-     `nix develop -c cmake --build --preset gpu-test`.
-   - Build after EVERY step that edits kernels or launchers; never batch
-     several uncommitted kernel edits before compiling this allows to iterate faster and safer.
-4. Benchmark with `./result/bin/gufo-server bench`, single reps (do NOT pass
-   `--repetitions`; alternate baseline/candidate runs instead):
-   - Combined headline: `-p 2048 -n 128`
-   - Decode only: `--n-prompt 0 --n-gen 128`
-   - Prefill only: `--n-prompt 2048 --n-gen 0`
-   - Depth scaling: `--n-prompt 2048 --n-depth 0,4096,8192,16384`, plus
-     `--n-gen 128 --n-depth 0,4096,8192,16384` for tg. Read
-     `src/server/bench_cli.cpp` to interpret values before trusting them.
-   - Until the implementation works do NOT test with big numbers, focus on `--n-prompt 128 --n-gen 16`
-5. Logits comparison (correctness before performance counts):
-   `--validate-prefill 1024 --n-prompt 1024 --n-gen 0`; record the envelope
-   (current model: rmse `0.02007260`, cosine `0.99997753`, top-1 `198`). A
-   candidate must not regress it. Comparing logits can be extremely slow, do it ONLY at the end to verify end to end correctness of the change.
-6. Profiling (separate pass; tracing changes timing so never profile the
-   headline run):
-   ```
-   nix develop -c rocprofv3 \
-     --kernel-trace --scratch-memory-trace --summary \
-     --output-directory /tmp/gufo-profile-<tag> \
-     -- ./result/bin/gufo-server bench --model "$MODEL" --n-prompt 0 --n-gen 128
-   ```
-   Collect per-kernel launch count, elapsed time, memory traffic, and resource
-   table (VGPR, SGPR, LDS, scratch, occupancy, waves/SIMD). Headline latency
-   always comes from an unprofiled run.
+Use an independent operator formula or pinned official teacher; two Gufo
+paths agreeing does not prove upstream parity. Compare matched token histories
+and find the first changed layer if logits drift. Never relax tolerances or
+replace goldens to accept a speedup. Test finite outputs and awkward tails
+(e.g. 1/8/9/32/33 rows), not only aligned shapes.
 
-Record the baseline artifact in `task-on-going.md` (fingerprint, revision,
-raw samples, register allocation, scratch, occupancy) before touching
-code.
+For state or speculative changes, cover greedy output, sampled p/q rejection
+and residual correction, seeded replay, EOS, multi-turn continuation and
+snapshot restore. Add images/cancellation when those paths change. Timing-based
+controllers are for greedy decoding; sampled execution must retain seeded
+replay. Full model sweeps are final qualification, not each iteration.
 
-## 2. Introduce the change
-
-- One fused kernel / one route at a time, behind a new policy toggle in
-  `src/core/hip/detail/qwen_attention_policy.hpp` (e.g.
-  `ShouldFuseSSMGateResidual`, `ShouldPrefetchNextLayer`), default OFF. The
-  unfused route stays wired as the independent reference (comparison and
-  revert); a rejected route remains runnable behind the toggle.
-- Reuse existing kernel patterns in `src/core/hip/` (and llama.cpp CUDA
-  kernels in `llama.cpp/` as reference sources). Copy-paste the pattern into
-  that model's own implementation; do not modularize shared code. Only the
-  model being optimized may change.
-- Kernel must sustain >= 4 waves per SIMD and no scratch spilling to be
-  retained; check `__launch_bounds__` and resource usage.
-- When editing `__global__` kernels, re-balance braces before compiling:
-  count `{`/`}` per line skipping `//` and `#` lines. A stray `}` closing the
-  namespace early surfaces as `use of undeclared identifier '<KernelName>'` at
-  the launch site (secondary cascade); a missing `}` surfaces as `function
-  definition is not allowed here`. Fix the FIRST structural error and rebuild
-  before chasing later ones.
-- Register the equivalence test under the card's CTest label.
-- Graph-capture awareness (decode): if the change touches launch structure,
-  verify capture still succeeds with
-  `GUFO_DISPATCH_TELEMETRY=1 ./build/gpu-test/gufo-server bench -p 16 -n 16`
-  -> expect `hip_graph` `miss_captured` then `hit`. Cross-stream rules:
-  - Only the side-stream-records -> main-stream-waits direction is
-    capture-compatible; the reverse fails `hipStreamEndCapture`
-    (`miss_end_failed`).
-  - Work launched on a NON-captured side stream during capture is NOT part of
-    the captured graph (only event edges are baked in); on replay the side
-    kernels never run. Verify with rocprof that new work actually dispatches
-    per token, or it only fires during capture.
-- Record new ideas in `task-on-going.md` as they are discovered (and the
-  model's `docs/models/<model>/BENCHMARKS.md` `# TODOs` dotted list at the end).
-
-## 3. Verify against the baseline
-
-1. Correctness gate first:
-   ```
-   nix develop -c cmake --build --preset gpu-test
-   nix develop -c ctest --preset gpu-full --output-on-failure --no-tests=error -L 'opt-c0XX-...'
-   ```
-   Fused output must match the unfused reference under the arithmetic contract
-   (CPU oracle vs GPU kernel).
-2. Logits: same `--validate-prefill` as baseline; require finite logits,
-   identical top-1, no material envelope regression.
-3. End-to-end interleaved A/B with release binaries. Keep
-   `result-base`/`result-cand` symlinks and alternate binaries:
-   ```
-   val=$(./result-<tag>/bin/gufo-server bench --model "$MODEL" --n-prompt 0 --n-gen 128 2>/dev/null \
-     | rg '\| *tg128' | sed -E 's/.*\|\s*([0-9.]+) ±.*/\1/')
-   ```
-   Depth rows are named `tg128@d4096` etc. Report medians, tail, and raw
-   samples. The host is noisy (background sidekiq/agy spikes produce pp2048
-   outliers ~150-300 tok/s), so a signal is real only if it reproduces across
-   interleaved samples outside the noise band. Include `pp2048` in the same
-   runs as an "untouched-path" sanity check.
-4. Always A/B BOTH paths: decode silently switches to split-K (non-graph) at
-   context >= 4K, and a regression can hide in one path only. Test `tg128`
-   (graph) and `tg@depth 4K/8K/16K` (split-K); to force the non-graph path at
-   shallow depth run `GUFO_ENABLE_HIP_GRAPH=0`.
-5. rocprofv3 with the same command as baseline; compare launch count,
-   eliminated memory traffic, layer latency, VGPR/LDS/scratch, occupancy,
-   waves/SIMD, and raw repetitions (sqlite query below).
-6. Decision:
-   - Retain only if end-to-end evidence improves beyond noise under the
-     acceptance contract AND the kernel meets resources (>= 4 waves, no
-     scratch). If retained, flip the toggle on and consider making the route
-     default.
-   - Reject (valid completion) if neutral-to-regressive or any active-layer
-     degradation; leave the toggle OFF and the code + test behind it for
-     re-evaluation.
-7. Full gates only on the final tree, right before wrap-up:
-   - clang-format edited files first:
-     `nix shell nixpkgs#clang-tools -c clang-format -i <edited .cpp/.hpp>`
-   - `nix build .#checks.x86_64-linux.pr`
-   - `nix flake check`
-
-## 4. Wrap up (evidence-based decision)
-
-1. Update `docs/models/<model>/BENCHMARKS.md` existing sections only: add a row to
-   the Experiment Summary table (retained/rejected) and append follow-up ideas
-   to the `# TODOs` dotted list.
-2. Post the decision to the issue with `gh` and close it if done (rejection is
-   valid). Comment format that worked across cards:
-   - `## Result: REJECTED/...` header with the one-line conclusion
-   - Correctness (CTest label passing; validate-prefill envelope)
-   - rocprofv3 kernel table (VGPR/SGPR/LDS/scratch/wgs/grid + notes)
-   - Interleaved A/B raw samples + medians, memory placement
-   - Mechanism / why
-   - Decision sentence referencing the card contract
-3. Commit locally: `jj commit -m "perf(hip): evaluate <change> (#<issue>)"`,
-   then move the `main` bookmark to the commit and to NOTHING else
-   (`jj bookmark move main --to <commit-id>`; the bookmark lives on the real
-   commit, never on the empty working copy). Do not push.
-4. Delete `task-on-going.md` and squash the deletion into the card commit
-   (`jj squash --into <card-commit>`).
-5. Re-run the full gates on the amended tree, then send the completion
-   notification if the user's convention uses one (e.g. ntfy).
-
-## Platform knowledge (Strix Halo gfx1151, Qwen3.8-27B BF16)
-
-- Weights are `mmap(PROT_READ, MAP_PRIVATE)` + `madvise(MADV_SEQUENTIAL)` then
-  `hipHostRegister(Mapped|ReadOnly)` via `MapRegisteredRegion` (mapped mode is
-  the default on the integrated APU). The shard is fully page-cached, so
-  steady-state decode is DRAM-bandwidth bound (~85 GB/s re-reading ~10-24 GiB
-  of weights per token). Page-touch prefetch only re-reads the same DRAM.
-  `GUFO_GPU_WEIGHT_MODE=copy` makes weights device-resident (slow H2D load).
-- Decode hot kernels (tg128): `Wave32FusedSwiGLUGEMV_2Rows`,
-  `FastGEMVBlockKernel`, `Wave32GEMVKernel_1Row`,
-  `Wave32FusedSSMInputProjections`, `DeltaNetRecurrenceKernel`.
-- Decode attention: online softmax below 4K; split-K (non-graph) at 4K+.
-  HIP-graph capture runs only when `!use_split_k_decode`.
-- Reference: `llama.cpp/` contains llama-bench on the same model; the
-  remaining gap is ~1.07-1.09x decode and ~1.15-1.34x prefill at depth (see
-  `docs/models/qwen3.8-27b/BENCHMARKS.md`).
-- Baseline envelope: pp2048 ~335-341, tg128 3.72-3.74,
-  validate rmse `0.02007260` / cosine `0.99997753` / top-1 `198`.
+Measure C1 plus affected C2/C4/C6/C8. Keep prompt and cache state identical when
+comparing CLI single-user and HTTP C1; report decode rate separately from whole
+request throughput. For H3, prefer an analytic case or one block/forward pass;
+do not generate full videos during routine kernel work.
