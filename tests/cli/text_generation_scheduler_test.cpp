@@ -1277,7 +1277,73 @@ void TestSnapshotDoesNotBlockOtherRequests() {
   }
 }
 
+void TestCapturesAtCapacityAllowQueuedProgress() {
+  for (const bool multi : {false, true}) {
+    for (const std::size_t capacity : {1U, 2U, 4U}) {
+      auto control = std::make_shared<FakeControl>();
+      control->multi_token_decode = multi;
+      control->preview_first_token = true;
+      control->supports_batched_advance = true;
+      control->batched_multi_token_decode = multi;
+      std::counting_semaphore<16> entered(0), release(0);
+      std::atomic<std::size_t> captures{0};
+      control->snapshot_callback = [&] {
+        if (captures.fetch_add(1) < capacity) {
+          entered.release();
+          release.acquire();
+        }
+      };
+      auto scheduler = MakeScheduler(control, capacity);
+      std::vector<TextGenerationScheduler::Request> requests;
+      for (std::size_t i = 0; i < capacity; ++i) {
+        requests.push_back(scheduler->Submit(
+            {static_cast<TextRunnerToken>(i + 1), 10}, 7, 0.0F));
+        Expect(entered.try_acquire_for(kTestTimeout),
+               "every resident reaches snapshot capture");
+      }
+      for (std::size_t i = capacity; i < capacity * 2; ++i)
+        requests.push_back(scheduler->Submit(
+            {static_cast<TextRunnerToken>(i + 1), 10}, 7, 0.0F));
+      release.release(static_cast<std::ptrdiff_t>(capacity));
+      auto results = std::async(std::launch::async, [&] {
+        for (std::size_t i = 0; i < requests.size(); ++i)
+          Expect(requests[i].Wait().tokens ==
+                     ExpectedTokens(static_cast<TextRunnerToken>(i + 1), 7),
+                 "capture and queued requests retain independent output");
+      });
+      Expect(results.wait_for(kTestTimeout) == std::future_status::ready,
+             "all slots capturing must not deadlock queued admission");
+      results.get();
+    }
+  }
+}
+
+void TestShutdownCancelsRunnerAcquisition() {
+  auto control = std::make_shared<FakeControl>();
+  auto pool = std::make_shared<TextRunnerPool>(
+      std::make_shared<FakeRunner>(control), 1);
+  auto lease = pool->Acquire({1, 10});
+  auto scheduler = std::make_unique<TextGenerationScheduler>(pool);
+  std::binary_semaphore acquiring(0);
+  std::atomic<bool> notified{false};
+  auto request = scheduler->Submit({2, 10}, 7, 0.0F, [&] {
+    if (!notified.exchange(true))
+      acquiring.release();
+    return false;
+  });
+  Expect(acquiring.try_acquire_for(kTestTimeout),
+         "request reaches admission with external runner lease");
+  auto stopped = std::async(std::launch::async, [&] { scheduler.reset(); });
+  const bool completed =
+      stopped.wait_for(kTestTimeout) == std::future_status::ready;
+  lease = {};
+  Expect(completed, "shutdown cancels acquisition of a leased runner");
+  stopped.get();
+}
+
 int main() {
+  TestCapturesAtCapacityAllowQueuedProgress();
+  TestShutdownCancelsRunnerAcquisition();
   TestSnapshotDoesNotBlockOtherRequests();
   TestFirstTokenPrecedesSnapshotAndPreservesBudget();
   TestIdlePrefillUsesBulkWorkUnit();

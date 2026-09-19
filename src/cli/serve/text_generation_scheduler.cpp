@@ -396,8 +396,12 @@ struct TextGenerationScheduler::Impl {
   }
 
   void Admit(std::deque<std::shared_ptr<ScheduledRequest>>& prefilling,
-             std::deque<std::shared_ptr<ScheduledRequest>>& decoding) {
-    while (prefilling.size() + decoding.size() < runner_pool->capacity()) {
+             std::deque<std::shared_ptr<ScheduledRequest>>& decoding,
+             std::size_t capturing, const std::stop_token& stop_token) {
+    // Captures retain their runner lease until decoding resumes.
+    while (!stop_token.stop_requested() &&
+           prefilling.size() + decoding.size() + capturing <
+               runner_pool->capacity()) {
       auto request = PopQueued();
       if (request == nullptr) {
         return;
@@ -410,9 +414,10 @@ struct TextGenerationScheduler::Impl {
         const std::weak_ptr<ScheduledRequest> weak_request = request;
         request->runner_request = runner_pool->Acquire(
             std::move(request->prompt), request->sampling,
-            [weak_request] {
+            [weak_request, stop_token] {
               const auto request = weak_request.lock();
-              return request == nullptr || CancellationRequested(request) ||
+              return stop_token.stop_requested() || request == nullptr ||
+                     CancellationRequested(request) ||
                      DeadlineExceeded(request);
             },
             std::move(request->prompt_context));
@@ -436,7 +441,7 @@ struct TextGenerationScheduler::Impl {
                                        Clock::now() - request->request_start)
                                        .count();
         request->result.resident_requests_at_admission =
-            prefilling.size() + decoding.size() + 1;
+            prefilling.size() + decoding.size() + capturing + 1;
         request->phase.store(TextRequestPhase::kAdmitted,
                              std::memory_order_release);
         request->phase.store(request->runner_request.prefill_complete()
@@ -990,7 +995,6 @@ struct TextGenerationScheduler::Impl {
     std::deque<std::shared_ptr<ScheduledRequest>> capturing;
     while (!stop_token.stop_requested()) {
       ProcessQueuedCancellations();
-      Admit(prefilling, decoding);
 
       for (std::size_t count = capturing.size(); count != 0; --count) {
         auto request = std::move(capturing.front());
@@ -1001,10 +1005,13 @@ struct TextGenerationScheduler::Impl {
           decoding.push_back(std::move(request));
         }
       }
+      Admit(prefilling, decoding, capturing.size(), stop_token);
       if (prefilling.empty() && decoding.empty()) {
         std::unique_lock<std::mutex> lock(queue_mutex);
         const auto wake = [&] {
-          return stop_token.stop_requested() || stopping || queued_count != 0;
+          return stop_token.stop_requested() || stopping ||
+                 (queued_count != 0 &&
+                  capturing.size() < runner_pool->capacity());
         };
         if (capturing.empty())
           queue_condition.wait(lock, wake);
