@@ -10,6 +10,7 @@ speed measurements use `nix build` binaries under `result/bin`.
 | `serving/` | Concurrent HTTP serving benchmarks |
 | `ds4/` | DeepSeek-specific validation and experiments |
 | `qwen27b/` | Qwen27B/DFlash2 kernels, reference checks, and vision validation |
+| `qwen-flash/` | Flash-Next projection and MoE microbenchmarks |
 | `h3/` | MiniMax inventory and quality-artifact commands |
 | `audio/` | Audio reference and quality tools |
 | `ci/` | Repository, dependency, and documentation checks |
@@ -21,7 +22,7 @@ MiniMax's manifest and quality tooling. Both support model verification.
 
 See [performance commands](../docs/PERFORMANCE.md),
 [benchmark methodology](../docs/BENCHMARKS.md), and
-[MiniMax validation](../docs/models/MINIMAX_H3.md#quality-and-focused-validation).
+[MiniMax validation](../docs/models/minimax-h3/EVALUATION.md).
 
 ## Qwen27B
 
@@ -68,4 +69,4 @@ with separate or fused SwiGLU, including every activation byte and scale.
 It replaces the old standalone W8A8 kernel copies.
 `qwen27b/dflash_reference.py` checks a GPU trace against
 pinned upstream PyTorch operators using the same GGUF weights. See
-`benchmarks/qwen3.8-27b/README.md` and its quality report for commands and evidence.
+`docs/models/qwen3.8-27b/BENCHMARKS.md` and its quality report for commands and evidence.

@@ -23,17 +23,20 @@ REQUIRED_DOC_FILES = [
     "AGENTS.md",
     "docs/CLI.md",
     "docs/DEVELOPMENT.md",
-    "docs/MODELS.md",
+    "docs/models/README.md",
     "docs/SERVER.md",
     "docs/TESTING.md",
     "docs/BENCHMARKS.md",
     "docs/PERFORMANCE.md",
-    "docs/models/MINIMAX_H3.md",
+    *[f"docs/models/{model}/{document}.md"
+      for model in ("deepseek-v4-flash", "qwen3.8-27b", "qwen3.8-flash-next",
+                    "qwen3-asr", "qwen3-tts", "minimax-h3")
+      for document in ("README", "BENCHMARKS", "EVALUATION", "EXPERIMENTS")],
 ]
 
 EXCLUDE_DIRS = {
     ".git", ".jj", ".direnv", "build", "Build", "result", "node_modules", ".cache",
-    "hrx-system", "llama.cpp", "ds4"
+    "llama.cpp", "ds4"
 }
 
 # Regex to extract Markdown links: [label](target)

@@ -3,11 +3,12 @@
 Build with `nix build` and measure binaries under `result/bin`. Per-model
 results and qualification gaps live in:
 
-- [DeepSeek V4 Flash](../benchmarks/deepseek-v4-flash/README.md)
-- [Qwen3.8 27B](../benchmarks/qwen3.8-27b/README.md)
-- [Qwen3.8 Flash-Next](../benchmarks/qwen3.8-flash-next/README.md)
-- [Audio](benchmarks/TTS_ASR.md)
-- [MiniMax H3](models/MINIMAX_H3.md#profiling)
+- [DeepSeek V4 Flash](models/deepseek-v4-flash/BENCHMARKS.md)
+- [Qwen3.8 27B](models/qwen3.8-27b/BENCHMARKS.md)
+- [Qwen3.8 Flash-Next](models/qwen3.8-flash-next/BENCHMARKS.md)
+- [Qwen3-TTS](models/qwen3-tts/BENCHMARKS.md)
+- [Qwen3-ASR](models/qwen3-asr/BENCHMARKS.md)
+- [MiniMax H3](models/minimax-h3/BENCHMARKS.md)
 
 ## Direct and serving measurements
 

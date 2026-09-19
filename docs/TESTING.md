@@ -2,7 +2,7 @@
 
 Run the smallest check that covers the change. Correctness and model-owned
 quality limits pass before performance results count. Production targets
-Linux gfx1151 and XDNA2; all builds and tests use Nix.
+Linux gfx1151; all builds and tests use Nix.
 
 ## Commands
 
@@ -25,13 +25,13 @@ nix develop -c ctest --preset cpu-sanitizer --output-on-failure
 ```
 
 See [development](DEVELOPMENT.md) for all build presets.
-`gpu-test` and `hardware-test` use optimized `RelWithDebInfo` with assertions.
+`gpu-test` uses optimized `RelWithDebInfo` with assertions.
 Performance measurements use `nix build` binaries under `result/bin`.
 Add new files to Git before invoking Nix.
 
-`hardware-fast` excludes `slow` and `external-model` tests. The
-`deepseek-gpu`, `qwen-gpu-kernel-oracle`, and `xdna2-programs` presets select
-model/device suites; `hardware-full` covers the complete hardware tree.
+`gpu-fast` excludes `slow` and `external-model` tests. The
+`deepseek-gpu` and `qwen-gpu-kernel-oracle` presets select
+model/device suites; `gpu-full` covers the complete hardware tree.
 External-model tests require their documented local artifacts. A skip due to
 an absent model or device is not a quality pass.
 
@@ -53,11 +53,12 @@ timing runs are not the default development loop.
 
 Model-owned procedures and outstanding qualification gaps live with the model:
 
-- [DeepSeek V4 Flash](../benchmarks/deepseek-v4-flash/README.md)
-- [Qwen3.8 27B](../benchmarks/qwen3.8-27b/README.md)
-- [Qwen3.8 Flash-Next](../benchmarks/qwen3.8-flash-next/README.md)
-- [MiniMax H3](models/MINIMAX_H3.md#quality-and-focused-validation)
-- [Qwen3-TTS](../tests/models/qwen3_tts/quality/README.md)
+- [DeepSeek V4 Flash](models/deepseek-v4-flash/EVALUATION.md)
+- [Qwen3.8 27B](models/qwen3.8-27b/EVALUATION.md)
+- [Qwen3.8 Flash-Next](models/qwen3.8-flash-next/EVALUATION.md)
+- [MiniMax H3](models/minimax-h3/EVALUATION.md)
+- [Qwen3-TTS](models/qwen3-tts/EVALUATION.md)
+- [Qwen3-ASR](models/qwen3-asr/EVALUATION.md)
 
 ## Independent references and artifacts
 

@@ -99,12 +99,3 @@ if (ENGINE_ENABLE_HIP)
     PROPERTIES COMPILE_OPTIONS
     "-mwavefrontsize64;-gline-tables-only;-Xarch_device;-mllvm=-amdgpu-sched-strategy=iterative-ilp")
 endif()
-
-if (ENGINE_ENABLE_XRT)
-  target_compile_definitions(gufo_core PUBLIC ENGINE_ENABLE_XRT=1)
-  target_include_directories(gufo_core SYSTEM PUBLIC ${XRT_INCLUDE_DIR})
-  target_link_libraries(gufo_core PUBLIC
-    gufo_diagnostics
-    ${XRT_COREUTIL_LIB}
-    ${UUID_LIBRARY})
-endif()

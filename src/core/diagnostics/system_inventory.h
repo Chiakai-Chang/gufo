@@ -45,25 +45,10 @@ struct GpuInventory {
   std::string source{"HIP + /sys/class/drm"};
 };
 
-struct NpuInventory {
-  std::string identity{"AMD XDNA2 NPU"};
-  std::string architecture{"XDNA2"};
-  std::string pci_device_id{"1022:17f0"};
-  std::string driver_name{"amdxdna"};
-  std::string pci_slot;
-  std::string firmware_version{"npu.sbin (1.1.2.64/65)"};
-  std::uint32_t aie_tiles_spatial{32};  // 4x8 spatial AIE2P tile array
-  std::string availability{"available"};
-  std::string source{"XRT + /sys/class/accel"};
-};
-
 struct DriverToolchainInventory {
   std::string kernel_release;
   std::string amdgpu_status{"loaded"};
-  std::string amdxdna_status{"loaded"};
   std::string rocm_version{"7.2.3"};
-  std::string xrt_commit{"8661761775a266b11992a3bd6eb08209d88aa845"};
-  std::string xrt_plugin_version{"2.21.0"};
   std::string cxx_compiler{"GCC 15.3.0"};
   std::string cpp_standard{"C++20"};
   std::string source{"Nix Toolchain Pins + Linux UAPI"};
@@ -73,7 +58,6 @@ struct SystemInventory {
   CpuInventory cpu;
   MemoryInventory memory;
   GpuInventory gpu;
-  NpuInventory npu;
   DriverToolchainInventory toolchain;
 
   [[nodiscard]] std::string ToJson() const;

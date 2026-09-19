@@ -22,14 +22,8 @@ struct CanonicalFingerprint {
   std::uint32_t gpu_compute_units{0};
   std::string gpu_driver{"amdgpu"};
   std::string gpu_pci_id{"1002:1586"};
-  std::string npu_identity;
-  std::string npu_architecture{"XDNA2"};
-  std::string npu_pci_id{"1022:17f0"};
-  std::string npu_driver{"amdxdna"};
-  std::string npu_firmware_version{"npu.sbin (1.1.2.64/65)"};
   std::string kernel_release;
   std::string rocm_version{"7.2.3"};
-  std::string xrt_commit{"8661761775a266b11992a3bd6eb08209d88aa845"};
   std::string cxx_compiler{"GCC 15.3.0"};
   std::string cpp_standard{"C++20"};
 

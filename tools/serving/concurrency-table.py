@@ -2,7 +2,7 @@
 """Render the README concurrency table from serving benchmark artifacts.
 
 Usage:
-  concurrency-table.py --dir benchmarks/qwen3.8-27b/serving
+  concurrency-table.py --dir docs/models/qwen3.8-27b/artifacts
 
 Reads `{gufo-ar,gufo-dflash2,llama-server}-{mixed,repetition}.json` and prints
 a Markdown table with end-to-end aggregate output tokens per second per

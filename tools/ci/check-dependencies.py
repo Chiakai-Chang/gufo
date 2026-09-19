@@ -16,8 +16,6 @@ from typing import Dict, List
 
 # Expected runtime and build dependencies that must be tracked
 REQUIRED_SHIPPED_COMPONENTS = {
-    "XRT",
-    "xdna-driver",
     "ROCm / HIP",
     "hipBLAS",
     "hipBLASLt",
@@ -25,10 +23,6 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "Composable Kernel",
     "ROCprofiler SDK / ROCTx",
     "llama.cpp",
-    "libuuid",
-    "MLIR-AIE",
-    "LLVM-AIE",
-    "AIEBU",
     "ICU",
     "curl",
     "FFmpeg",
@@ -94,12 +88,9 @@ def verify_dependencies(
     # 2. Check package.nix inputs consistency
     if package_nix_file.is_file():
         pkg_content = package_nix_file.read_text(encoding="utf-8")
-        # Check that rocmPackages, xrt, xrt-plugin-amdxdna, libuuid are wired
+        # Check the runtime inputs required by the shipped GPU package.
         for dep in [
             "rocmPackages",
-            "xrt",
-            "xrt-plugin-amdxdna",
-            "libuuid",
             "icu",
             "curl",
             "ffmpeg-headless",

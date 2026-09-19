@@ -7,11 +7,6 @@
 #include <hip/hip_runtime.h>
 #endif
 
-#if defined(ENGINE_ENABLE_XRT)
-#include <xrt/experimental/xrt_system.h>
-#include <xrt/xrt_device.h>
-#endif
-
 namespace gufo::diagnostics {
 
 namespace {
@@ -119,53 +114,6 @@ SystemInventory CollectSystemInventory(const LinuxSysfs& sysfs) {
   inv.gpu.availability = "uncompiled (ENGINE_ENABLE_HIP=OFF)";
 #endif
 
-  // 5. NPU (Sysfs + XRT query)
-  const auto npus = sysfs.QueryAccelNpuDevices();
-  if (!npus.empty()) {
-    const auto& primary_npu = npus[0];
-    inv.npu.pci_device_id =
-        primary_npu.pci_id.empty() ? "1022:17f0" : primary_npu.pci_id;
-    inv.npu.driver_name =
-        primary_npu.driver.empty() ? "amdxdna" : primary_npu.driver;
-    inv.npu.pci_slot = primary_npu.pci_slot;
-    inv.toolchain.amdxdna_status = "loaded";
-
-    // Normalize architecture
-    if (primary_npu.device_id.find("17f0") != std::string::npos ||
-        primary_npu.pci_id.find("17f0") != std::string::npos ||
-        primary_npu.pci_id.find("17F0") != std::string::npos) {
-      inv.npu.architecture = "XDNA2";
-      inv.npu.availability = "available";
-    } else {
-      inv.npu.architecture = primary_npu.pci_id;
-      inv.npu.availability = "unsupported NPU";
-    }
-  } else {
-    inv.toolchain.amdxdna_status = "not loaded or no device node";
-  }
-
-#if defined(ENGINE_ENABLE_XRT)
-  try {
-    const unsigned int xrt_dev_count = xrt::system::enumerate_devices();
-    if (xrt_dev_count > 0) {
-      auto dev = xrt::device(0);
-      inv.npu.identity = dev.get_info<xrt::info::device::name>();
-      inv.npu.availability = "available";
-      inv.npu.architecture = "XDNA2";
-    }
-  } catch (const std::exception& e) {
-    const std::string err_msg(e.what());
-    if (err_msg.find("Permission denied") != std::string::npos) {
-      inv.npu.availability =
-          "unavailable (permission denied on /dev/accel/accel0)";
-    } else {
-      inv.npu.availability = "unavailable (" + err_msg + ")";
-    }
-  }
-#else
-  inv.npu.availability = "uncompiled (ENGINE_ENABLE_XRT=OFF)";
-#endif
-
   return inv;
 }
 
@@ -232,37 +180,14 @@ std::string SystemInventory::ToJson() const {
   oss << "    \"source\": \"" << EscapeJsonStr(gpu.source) << "\"\n";
   oss << "  },\n";
 
-  // NPU
-  oss << "  \"npu\": {\n";
-  oss << "    \"identity\": \"" << EscapeJsonStr(npu.identity) << "\",\n";
-  oss << "    \"architecture\": \"" << EscapeJsonStr(npu.architecture)
-      << "\",\n";
-  oss << "    \"pciDeviceId\": \"" << EscapeJsonStr(npu.pci_device_id)
-      << "\",\n";
-  oss << "    \"driverName\": \"" << EscapeJsonStr(npu.driver_name) << "\",\n";
-  oss << "    \"pciSlot\": \"" << EscapeJsonStr(npu.pci_slot) << "\",\n";
-  oss << "    \"firmwareVersion\": \"" << EscapeJsonStr(npu.firmware_version)
-      << "\",\n";
-  oss << "    \"aieTilesSpatial\": " << npu.aie_tiles_spatial << ",\n";
-  oss << "    \"availability\": \"" << EscapeJsonStr(npu.availability)
-      << "\",\n";
-  oss << "    \"source\": \"" << EscapeJsonStr(npu.source) << "\"\n";
-  oss << "  },\n";
-
   // Toolchain & Drivers
   oss << "  \"toolchain\": {\n";
   oss << "    \"kernelRelease\": \"" << EscapeJsonStr(toolchain.kernel_release)
       << "\",\n";
   oss << "    \"amdgpuStatus\": \"" << EscapeJsonStr(toolchain.amdgpu_status)
       << "\",\n";
-  oss << "    \"amdxdnaStatus\": \"" << EscapeJsonStr(toolchain.amdxdna_status)
-      << "\",\n";
   oss << "    \"rocmVersion\": \"" << EscapeJsonStr(toolchain.rocm_version)
       << "\",\n";
-  oss << "    \"xrtCommit\": \"" << EscapeJsonStr(toolchain.xrt_commit)
-      << "\",\n";
-  oss << "    \"xrtPluginVersion\": \""
-      << EscapeJsonStr(toolchain.xrt_plugin_version) << "\",\n";
   oss << "    \"cxxCompiler\": \"" << EscapeJsonStr(toolchain.cxx_compiler)
       << "\",\n";
   oss << "    \"cppStandard\": \"" << EscapeJsonStr(toolchain.cpp_standard)
@@ -285,12 +210,8 @@ std::string SystemInventory::ToHuman() const {
       << memory.memory_type << ")\n";
   oss << "GPU Model           : " << gpu.name << " [" << gpu.architecture
       << ", " << gpu.compute_units << " CUs] (" << gpu.availability << ")\n";
-  oss << "NPU Model           : " << npu.identity << " [" << npu.architecture
-      << ", " << npu.aie_tiles_spatial << " AIE tiles] (" << npu.availability
-      << ")\n";
   oss << "Linux Kernel        : " << toolchain.kernel_release << "\n";
-  oss << "ROCm / XRT Stack    : ROCm " << toolchain.rocm_version << " / XRT "
-      << toolchain.xrt_plugin_version << "\n";
+  oss << "ROCm Version        : " << toolchain.rocm_version << "\n";
 
   return oss.str();
 }

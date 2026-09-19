@@ -1,79 +1,33 @@
 # Development
 
-See [testing](TESTING.md) for focused checks and model-specific quality gates.
+Use Nix on Linux x86-64 gfx1151. Direct host builds are unsupported.
 
-## Code structure
+| Directory | Ownership |
+| --- | --- |
+| `src/cli` | Executable commands and HTTP adapters |
+| `src/core` | Shared runtime, sampling, formats and diagnostics |
+| `src/models/<model>` | Model implementation and kernels |
+| `src/eval` | HTTP capability evaluation |
+| `tests` | Maintained fixtures and focused checks |
+| `tools` | Offline evaluation, profiling and microbenchmarks |
+| `docs/models/<model>` | Usage, benchmark, evaluation and experiment docs |
+| `.devops/nix` | Production package and server configuration |
 
-The codebase is organized in following way:
-
-```sh
-.
-├── .devops # infra and nix derivations/helpers
-├── benchmarks # raw docs to keep track of experiments and performances during development
-│   ├── deepseek-v4-flash
-│   ├── qwen3-asr
-│   └── qwen3.8-27b
-├── ...
-├── docs # documentation for the final user
-├── src
-│   ├── cli # cli code
-│   ├── core # core functionalities not specific to any model
-│   ├── eval # gufo internal evaluation framework
-│   ├── models # models collection, each model has its own subdir
-│   │   ├── deepseek_v4_flash
-│   │   ├── minimax_h3
-│   │   ├── qwen
-│   │   ├── qwen3_asr
-│   │   └── qwen3_tts
-│   └── testing # utils for testing
-├── tests # unit tests and more
-└── tools # tools, scripts, utils, for various tasks
-```
-
-Reproducible CMake presets are configured in `CMakePresets.json` and must be entered through the Nix development environment (`nix develop`). Direct host CMake is unsupported.
-
-| Preset          | Purpose             | Description                                                                        |
-| --------------- | ------------------- | ---------------------------------------------------------------------------------- |
-| `development`   | Development         | CPU-only Debug build with warnings (`-Wall -Wextra -Wpedantic`)                    |
-| `release`       | Release             | CPU-only optimized Release build                                                   |
-| `cpu-sanitizer` | Diagnostics         | CPU-only build with AddressSanitizer (ASan) and UndefinedBehaviorSanitizer (UBSan) |
-| `cpu-test`      | Unit Tests          | CPU-only test suite executed with CTest                                            |
-| `gpu-test`      | GPU Tests           | ROCm/HIP enabled for `gfx1151` without XRT                                         |
-| `hardware-test` | Full Hardware Build | Pinned ROCm/HIP (`gfx1151`) and XRT (`XDNA2`) stacks                               |
-
-### Development Workflow
+Stage new files before Nix builds; the flake includes tracked source only.
+Production performance comes from `nix build` / `result/bin`, not test binaries.
 
 ```sh
-# Development build
-nix develop -c cmake --preset development
-nix develop -c cmake --build --preset development
-
-# Release build
-nix develop -c cmake --preset release
-nix develop -c cmake --build --preset release
-
-# Sanitizer build & test
-nix develop -c cmake --preset cpu-sanitizer
-nix develop -c cmake --build --preset cpu-sanitizer
-nix develop -c ctest --preset cpu-sanitizer --output-on-failure
-
-# CPU tests
-nix develop -c cmake --preset cpu-test
-nix develop -c cmake --build --preset cpu-test
-nix develop -c ctest --preset cpu-test --output-on-failure
-
-# HIP GPU tests (gfx1151)
+nix build
 nix develop -c cmake --preset gpu-test
-nix develop -c cmake --build --preset gpu-test
-nix develop -c ctest --preset gpu-full --output-on-failure
-
-# Complete gfx1151 and XDNA2 tests
-nix develop -c cmake --preset hardware-test
-nix develop -c cmake --build --preset hardware-test
-nix develop -c ctest --preset hardware-full --output-on-failure
+nix develop -c cmake --build --preset gpu-test --target <affected-target>
+nix develop -c ctest --preset gpu-fast -R <affected-check> --output-on-failure
 ```
 
-Hardware presets label tests so unavailable devices skip normally during development. Strict presence validation can be enforced with:
+`gpu-test` uses RelWithDebInfo with assertions. `cpu-test` provides host checks;
+`cpu-sanitizer` enables ASan/UBSan. `gpu-full` selects the complete GPU tree.
+Keep slow external-model checks explicit. See [testing](TESTING.md),
+[performance tooling](PERFORMANCE.md) and [model quality contracts](models/README.md).
 
-- `GUFO_REQUIRE_HIP=1` (or `GUFO_REQUIRE_GPU=1`)
-- `GUFO_REQUIRE_XDNA2=1` (or `GUFO_REQUIRE_NPU=1`)
+The production package includes only the HIP backend. Experimental accelerator
+work remains on `perf/qwen27b-dflash2-npu`; offline quantization research remains
+in PR #234. Neither toolchain is required to install or run main.

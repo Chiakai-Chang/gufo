@@ -2,7 +2,7 @@
 
 ## Supported Platform
 
-Linux x86-64 on AMD Strix Halo (`gfx1151` GPU and XDNA2 NPU) is the only
+Linux x86-64 on AMD Strix Halo (`gfx1151` GPU) is the only
 supported production target.
 
 ## Build & Test (Nix)
@@ -10,7 +10,7 @@ supported production target.
 Build and test with Nix only. Direct host builds and Makefiles are unsupported.
 
 ```sh
-nix build                          # build default package (gfx1151 + XRT)
+nix build                          # build default package (gfx1151)
 ./result/bin/gufo diagnose        # run hardware probe & diagnostics
 ./result/bin/gufo serve           # run server
 nix build .#checks.x86_64-linux.pr # canonical PR test command (all gates)

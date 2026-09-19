@@ -1,0 +1,10 @@
+{
+  "sha256": {
+    "Target UD-Q4_K_XL": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+    "Target UD-Q8_K_XL": "af36ecb6b5db1407953345b746c14ac93f0657dda413910b4348683a2d990377",
+    "Draft Q4_K_M": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd",
+    "Draft Q8_0": "c18e800daedc59ca68fd13b6a856d795746af6d399a9279ac6a277d1d422f87e",
+    "Draft BF16": "26d47ca20ab07688327a63d912acad222d924eaaa92a980cc488de3c67e736bc"
+  },
+  "scope": "Artifacts used by the retained 2026-09-16 qualification; see benchmark dates for later controls."
+}

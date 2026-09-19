@@ -3,7 +3,7 @@
 Status: stable guidance, 2026-08-19.
 
 This document defines the measurement and promotion rules for performance
-work. Current model numbers belong in `benchmarks/<model>/README.md`; issue
+work. Current model numbers belong in `docs/models/<model>/BENCHMARKS.md`; issue
 comments and local artifacts hold detailed experiment history.
 
 ## Target
@@ -11,12 +11,11 @@ comments and local artifacts hold detailed experiment history.
 The only production target is Linux x86-64 on AMD Strix Halo:
 
 - `gfx1151` GPU using Wave32 HIP kernels.
-- XDNA2/AIE2P NPU.
-- Unified LPDDR5X shared by CPU, GPU, and NPU.
+- Unified LPDDR5X shared by CPU and GPU.
 - Nix-provided compilers, libraries, profilers, and test tools.
 
 Runtime probes, not assumed peak specifications, determine the available CUs,
-AIE columns, memory, firmware, and power mode.
+memory, firmware, and power mode.
 
 ## Optimization Loop
 
@@ -40,8 +39,8 @@ Comparable runs use the same:
 - Source revision and Nix build mode.
 - Model revision, artifact, quantization, and KV representation.
 - Prompt tokens, generated-token count, batch, depth, and concurrency.
-- GPU/NPU route and dispatch configuration.
-- Driver, firmware, ROCm, XRT, power mode, and memory configuration.
+- GPU route and dispatch configuration.
+- Driver, firmware, ROCm, power mode, and memory configuration.
 - Warmup policy and repetition count.
 
 Alternate baseline and candidate runs on the same machine. Report medians and
@@ -66,7 +65,6 @@ credentials, process secrets, or raw token IDs.
 | Long-context attention | KV traffic and parallelism | Per-layer attention time at 4K/8K/12K/16K |
 | Speculative verification | Checkpoint, rollback, acceptance | Accepted tokens, replay time, baseline token parity |
 | HTTP serving | Admission, queueing, session reuse | TTFT, inter-token latency, cancellation cleanup |
-| NPU offload | DMA, synchronization, padded work | Transfer time, program time, end-to-end overlap |
 
 For decode GEMV, reduce bytes read before chasing peak matrix throughput. For
 prefill GEMM, measure reuse and matrix-instruction utilization. For every
@@ -95,15 +93,6 @@ cost in the result.
 - Retain hipBLASLt or rocBLAS as the baseline for supported matrix shapes.
 - Do not inherit launch geometry from CUDA or another RDNA target without a
   new measurement on `gfx1151`.
-
-### XDNA2
-
-- Include host packing, BO synchronization, program time, and output transfer.
-- Reuse AIE programs, contexts, BOs, and command buffers.
-- Keep memory-tile layouts explicit and reject unbounded padding.
-- Prefer work that is independent of the critical GPU path.
-- Promote concurrent GPU/NPU execution only after measuring shared-memory
-  contention and request latency.
 
 ### Quantization
 
@@ -197,7 +186,7 @@ to measure the best case for shared draft behavior:
 ```sh
 tools/serving/gufo-serving-bench.py \
   --base-url http://127.0.0.1:8080 \
-  --suite benchmarks/qwen3.8-27b/speculative-corpus.json \
+  --suite docs/models/qwen3.8-27b/artifacts/speculative-corpus.json \
   --corpus-layout distinct \
   --concurrency 1,2,4,6,8 \
   --max-tokens 128 \
@@ -205,7 +194,7 @@ tools/serving/gufo-serving-bench.py \
 
 tools/serving/gufo-serving-bench.py \
   --base-url http://127.0.0.1:8080 \
-  --suite benchmarks/qwen3.8-27b/speculative-corpus.json \
+  --suite docs/models/qwen3.8-27b/artifacts/speculative-corpus.json \
   --corpus-layout homogeneous \
   --concurrency 2 \
   --max-tokens 128 \
@@ -257,7 +246,7 @@ advice/prefetch, synchronization, teardown, fault, and checksum behavior:
 The command aborts before a requested size that cannot preserve its memory
 headroom; it never silently substitutes a smaller working set. The production
 Qwen3.8-27B loader registers mapped GGUF shards directly with HIP; see
-[the model's allocation ownership](../src/models/qwen/README.md#hip-target-model).
+[the model's state ownership](../src/models/qwen/README.md#state-and-arithmetic).
 
 ### Focused HIP benchmark
 

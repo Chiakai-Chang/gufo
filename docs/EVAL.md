@@ -175,7 +175,7 @@ is inferred from the sequential single-user run.
 
 The first retained DeepSeek V4 Flash result and its independent repeat are
 documented in
-[the benchmark baseline](../benchmarks/deepseek-v4-flash/eval/README.md).
+[the benchmark baseline](models/deepseek-v4-flash/EVALUATION.md).
 
 ## Tests
 

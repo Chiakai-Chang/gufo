@@ -202,16 +202,8 @@ std::string CanonicalFingerprint::CanonicalJson() const {
   oss << "  \"kernelRelease\": \"" << EscapeJsonStr(kernel_release) << "\",\n";
   oss << "  \"memoryTotalBytes\": " << memory_total_bytes << ",\n";
   oss << "  \"memoryType\": \"" << EscapeJsonStr(memory_type) << "\",\n";
-  oss << "  \"npuArchitecture\": \"" << EscapeJsonStr(npu_architecture)
-      << "\",\n";
-  oss << "  \"npuDriver\": \"" << EscapeJsonStr(npu_driver) << "\",\n";
-  oss << "  \"npuFirmwareVersion\": \"" << EscapeJsonStr(npu_firmware_version)
-      << "\",\n";
-  oss << "  \"npuIdentity\": \"" << EscapeJsonStr(npu_identity) << "\",\n";
-  oss << "  \"npuPciId\": \"" << EscapeJsonStr(npu_pci_id) << "\",\n";
   oss << "  \"rocmVersion\": \"" << EscapeJsonStr(rocm_version) << "\",\n";
-  oss << "  \"schemaVersion\": \"" << EscapeJsonStr(schema_version) << "\",\n";
-  oss << "  \"xrtCommit\": \"" << EscapeJsonStr(xrt_commit) << "\"\n";
+  oss << "  \"schemaVersion\": \"" << EscapeJsonStr(schema_version) << "\"\n";
   oss << "}";
   return oss.str();
 }
@@ -234,14 +226,8 @@ MachineFingerprint GenerateMachineFingerprint(
   fp.canonical.gpu_compute_units = inventory.gpu.compute_units;
   fp.canonical.gpu_driver = inventory.gpu.driver_name;
   fp.canonical.gpu_pci_id = inventory.gpu.pci_id;
-  fp.canonical.npu_identity = inventory.npu.identity;
-  fp.canonical.npu_architecture = inventory.npu.architecture;
-  fp.canonical.npu_pci_id = inventory.npu.pci_device_id;
-  fp.canonical.npu_driver = inventory.npu.driver_name;
-  fp.canonical.npu_firmware_version = inventory.npu.firmware_version;
   fp.canonical.kernel_release = inventory.toolchain.kernel_release;
   fp.canonical.rocm_version = inventory.toolchain.rocm_version;
-  fp.canonical.xrt_commit = inventory.toolchain.xrt_commit;
   fp.canonical.cxx_compiler = inventory.toolchain.cxx_compiler;
   fp.canonical.cpp_standard = inventory.toolchain.cpp_standard;
 
@@ -271,10 +257,7 @@ std::string MachineFingerprint::ToHuman() const {
   oss << "GPU Architecture    : " << canonical.gpu_name << " ["
       << canonical.gpu_architecture << ", " << canonical.gpu_compute_units
       << " CUs]\n";
-  oss << "NPU Architecture    : " << canonical.npu_identity << " ["
-      << canonical.npu_architecture << "]\n";
-  oss << "Pinned Toolchain    : ROCm " << canonical.rocm_version << " / XRT "
-      << canonical.xrt_commit.substr(0, 8) << "\n";
+  oss << "Pinned Toolchain    : ROCm " << canonical.rocm_version << "\n";
   return oss.str();
 }
 

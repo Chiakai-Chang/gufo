@@ -12,7 +12,7 @@
 namespace gufo::diagnostics {
 
 struct BandwidthOptions {
-  std::vector<std::string> backends{"cpu", "hip", "xrt"};
+  std::vector<std::string> backends{"cpu", "hip"};
   std::uint32_t warmup{3};
   std::uint32_t repetitions{10};  // Minimum measured iterations per path.
   std::uint32_t duration_ms{2000};
@@ -20,10 +20,9 @@ struct BandwidthOptions {
 };
 
 struct BandwidthPathResult {
-  std::string backend;    // "cpu", "hip", "xrt"
-  std::string path_name;  // e.g. "cpu_copy", "hip_h2d", "xrt_bo_sync_to_device"
-  std::string
-      allocation_type;  // e.g. "host_pageable", "hip_device_memory", "xrt_bo"
+  std::string backend;          // "cpu", "hip"
+  std::string path_name;        // e.g. "cpu_copy", "hip_h2d"
+  std::string allocation_type;  // e.g. "host_pageable", "hip_device_memory"
   std::size_t working_set_bytes{0};
   std::uint32_t warmup_runs{0};
   std::uint64_t repetitions{0};  // Actual measured iterations.
@@ -54,9 +53,6 @@ struct BandwidthReport {
     const BandwidthOptions& options);
 
 [[nodiscard]] std::vector<BandwidthPathResult> MeasureHipBandwidth(
-    const BandwidthOptions& options);
-
-[[nodiscard]] std::vector<BandwidthPathResult> MeasureXrtBandwidth(
     const BandwidthOptions& options);
 
 [[nodiscard]] BandwidthReport RunBandwidthBenchmark(

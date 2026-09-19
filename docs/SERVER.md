@@ -54,7 +54,7 @@ executes the direct MiniMax H3 route used by the asynchronous video worker.
 `transcribe` executes the native Qwen3-ASR-1.7B route used by the synchronous
 audio transcription endpoint.
 Their detailed contracts are defined in [Command-Line Interface](CLI.md) and
-[MiniMax H3 upstream contract](models/MINIMAX_H3.md#upstream-provenance).
+[MiniMax H3 upstream contract](models/minimax-h3/EVALUATION.md).
 
 ### HIP execution
 
@@ -105,7 +105,7 @@ probabilistic proposals with exact p/q acceptance and residual correction.
 That route preserves the target distribution with its own seeded trace.
 Request decoding leaves EOS and later speculative tokens out of the reusable
 checkpoint. Fixed-length benchmarks may continue through EOS.
-See the [DS4 benchmark and quality contract](../benchmarks/deepseek-v4-flash/README.md).
+See the [DS4 benchmark and quality contract](models/deepseek-v4-flash/BENCHMARKS.md).
 
 Qwen3.8-Flash-Next uses the same scheduler, with independent recurrent, KV,
 indexer, sampling and MTP state per session. Prefix snapshots retain complete
@@ -113,7 +113,7 @@ state; `--cache-disk` adds restart-safe reuse. MTP draft length adapts within th
 configured ceiling. Sampled MTP proposals use p/q acceptance and residual
 correction; greedy verification follows target argmax. Draft and verification
 work can batch across ready requests. See the
-[Flash-Next benchmark and quality contract](../benchmarks/qwen3.8-flash-next/README.md).
+[Flash-Next benchmark and quality contract](models/qwen3.8-flash-next/BENCHMARKS.md).
 
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
@@ -347,7 +347,7 @@ rejected explicitly.
 The MiniMax H3 subset follows the asynchronous OpenAI-style video resource
 shape and is versioned independently as `gufo.video-api.v1`. Its supported
 fields, frozen presets, queue behavior, and deliberate conditioning
-omissions are documented in the [H3 upstream contract](models/MINIMAX_H3.md#upstream-provenance).
+omissions are documented in the [H3 upstream contract](models/minimax-h3/EVALUATION.md).
 Create requests accept both `application/json` and OpenAI-client-compatible
 `multipart/form-data`; duplicate form fields, malformed boundaries, unsupported
 media types, and reference-image parts fail explicitly.
@@ -507,7 +507,7 @@ See [CLI.md](CLI.md) for supported configuration flags.
 
 `GET /health` reports process liveness. `GET /ready` returns 503 until a model
 service is ready, then reports `status` and the active model. It does not expose
-a GPU/NPU health matrix. HTTP model replacement and persistent Responses
+a GPU health matrix. HTTP model replacement and persistent Responses
 conversations are not implemented.
 
 ## Metrics

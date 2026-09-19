@@ -24,8 +24,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "BUILD_TESTING": "ON",
-        "ENGINE_ENABLE_HIP": "OFF",
-        "ENGINE_ENABLE_XRT": "OFF"
+        "ENGINE_ENABLE_HIP": "OFF"
       }
     },
     {
@@ -36,8 +35,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "BUILD_TESTING": "OFF",
-        "ENGINE_ENABLE_HIP": "OFF",
-        "ENGINE_ENABLE_XRT": "OFF"
+        "ENGINE_ENABLE_HIP": "OFF"
       }
     },
     {
@@ -49,8 +47,7 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "BUILD_TESTING": "ON",
         "GUFO_ENABLE_SANITIZERS": "ON",
-        "ENGINE_ENABLE_HIP": "OFF",
-        "ENGINE_ENABLE_XRT": "OFF"
+        "ENGINE_ENABLE_HIP": "OFF"
       }
     },
     {
@@ -61,8 +58,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "BUILD_TESTING": "ON",
-        "ENGINE_ENABLE_HIP": "OFF",
-        "ENGINE_ENABLE_XRT": "OFF"
+        "ENGINE_ENABLE_HIP": "OFF"
       }
     },
     {
@@ -74,20 +70,6 @@
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "BUILD_TESTING": "ON",
         "ENGINE_ENABLE_HIP": "ON",
-        "ENGINE_ENABLE_XRT": "OFF",
-        "GPU_TARGETS": "gfx1151"
-      }
-    },
-    {
-      "name": "hardware-test",
-      "displayName": "gfx1151 and XDNA2 Hardware Tests",
-      "description": "Optimized correctness build with debug symbols and active test assertions",
-      "inherits": "base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "BUILD_TESTING": "ON",
-        "ENGINE_ENABLE_HIP": "ON",
-        "ENGINE_ENABLE_XRT": "ON",
         "GPU_TARGETS": "gfx1151"
       }
     }
@@ -117,11 +99,6 @@
       "name": "gpu-test",
       "displayName": "gfx1151 GPU Tests",
       "configurePreset": "gpu-test"
-    },
-    {
-      "name": "hardware-test",
-      "displayName": "gfx1151 and XDNA2 Hardware Tests",
-      "configurePreset": "hardware-test"
     }
   ],
   "testPresets": [
@@ -163,17 +140,9 @@
       }
     },
     {
-      "name": "hardware-full",
-      "displayName": "Complete gfx1151 and XDNA2 Test Suite",
-      "configurePreset": "hardware-test",
-      "output": {
-        "outputOnFailure": true
-      }
-    },
-    {
-      "name": "hardware-fast",
-      "displayName": "Fast gfx1151 and XDNA2 Tests",
-      "configurePreset": "hardware-test",
+      "name": "gpu-fast",
+      "displayName": "Fast gfx1151 GPU Tests",
+      "configurePreset": "gpu-test",
       "output": {
         "outputOnFailure": true
       },
@@ -206,19 +175,6 @@
       "filter": {
         "include": {
           "label": "qwen-kernel-oracle"
-        }
-      }
-    },
-    {
-      "name": "xdna2-programs",
-      "displayName": "XDNA2 Program Tests",
-      "configurePreset": "hardware-test",
-      "output": {
-        "outputOnFailure": true
-      },
-      "filter": {
-        "include": {
-          "label": "xrt-hardware"
         }
       }
     }

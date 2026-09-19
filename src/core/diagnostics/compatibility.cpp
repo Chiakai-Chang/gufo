@@ -80,51 +80,20 @@ CompatibilityReport EvaluateCompatibility(const SystemInventory& inventory,
     report.items.push_back(std::move(gpu_item));
   }
 
-  // 3. NPU Architecture Check (XDNA2 / 1022:17f0)
-  if (section == "all" || section == "npu" || section == "inventory") {
-    CompatibilityItem npu_item;
-    npu_item.component = "npu";
-    npu_item.detected_value = inventory.npu.architecture + " (PCI " +
-                              inventory.npu.pci_device_id + ")";
-    npu_item.required_value = "XDNA2 / AIE2P (PCI 1022:17f0)";
-    npu_item.evidence = inventory.npu.source;
-    if (inventory.npu.architecture == "XDNA2" ||
-        inventory.npu.architecture == "AIE2P") {
-      npu_item.verdict = CompatibilityVerdict::kSupported;
-      npu_item.remediation_hint = "None";
-    } else if (inventory.npu.availability.find("permission denied") !=
-               std::string::npos) {
-      npu_item.verdict = CompatibilityVerdict::kSupported;
-      npu_item.remediation_hint =
-          "Add current user to video/render group: sudo usermod -aG "
-          "video,render $USER && sudo chmod 666 /dev/accel/accel0";
-    } else {
-      npu_item.verdict = CompatibilityVerdict::kUnsupported;
-      npu_item.remediation_hint =
-          "Ensure AMD XDNA 2 NPU hardware is present and amdxdna kernel module "
-          "is loaded";
-      overall = CompatibilityVerdict::kUnsupported;
-    }
-    report.items.push_back(std::move(npu_item));
-  }
-
-  // 4. Kernel Driver Check
+  // 3. Kernel Driver Check
   if (section == "all" || section == "inventory") {
     CompatibilityItem driver_item;
     driver_item.component = "kernel_driver";
-    driver_item.detected_value =
-        "amdgpu: " + inventory.toolchain.amdgpu_status +
-        ", amdxdna: " + inventory.toolchain.amdxdna_status;
-    driver_item.required_value = "amdgpu: loaded, amdxdna: loaded";
-    driver_item.evidence = "/sys/class/drm and /sys/class/accel";
-    if (inventory.toolchain.amdgpu_status == "loaded" &&
-        inventory.toolchain.amdxdna_status == "loaded") {
+    driver_item.detected_value = "amdgpu: " + inventory.toolchain.amdgpu_status;
+    driver_item.required_value = "amdgpu: loaded";
+    driver_item.evidence = "/sys/class/drm";
+    if (inventory.toolchain.amdgpu_status == "loaded") {
       driver_item.verdict = CompatibilityVerdict::kSupported;
       driver_item.remediation_hint = "None";
     } else {
       driver_item.verdict = CompatibilityVerdict::kUnsupported;
       driver_item.remediation_hint =
-          "Ensure Linux kernel >= 6.10 with amdgpu and amdxdna drivers loaded";
+          "Ensure Linux kernel >= 6.10 with the amdgpu driver loaded";
       overall = CompatibilityVerdict::kUnsupported;
     }
     report.items.push_back(std::move(driver_item));

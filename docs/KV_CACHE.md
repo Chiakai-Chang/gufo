@@ -38,7 +38,7 @@ model-specific state may not fit the conventional formula.
 Memory budgeting reserves space for:
 
 - Model weights.
-- GPU and NPU programs.
+- GPU execution.
 - Persistent scratch and graphs.
 - Active KV pages.
 - Speculative provisional pages.
@@ -112,9 +112,9 @@ requirements:
 - Separate single-token and batched attention views only when lossless.
 - Aligned page starts.
 - No per-step host pointer rebuilding.
-- GPU/NPU visibility for routes that consume shared KV.
+- GPU visibility for routes that consume shared KV.
 
-GPU decode is the initial owner of ordinary KV attention. NPU programs may read
+GPU decode owns ordinary KV attention. Kernels may read
 KV for prefill or verification only after shared access and cache ordering are
 proven.
 
@@ -217,7 +217,7 @@ it is not portable across:
 - Different RoPE scaling.
 - Model implementations with incompatible recurrent state.
 
-Backend portability may be allowed when GPU and NPU use the same defined KV
+Backend portability may be allowed when backends use the same defined KV
 layout and both implementations pass restore tests.
 
 The weight artifact is identified by full-content SHA-256 (`gguf-sha256-v1`),
@@ -321,7 +321,7 @@ Dump and restore use bounded CPU and storage queues. They yield when:
 - The SSD queue is congested.
 
 Where supported, use direct or asynchronous I/O only after proving that
-alignment and buffer pinning do not degrade GPU/NPU access.
+alignment and buffer pinning do not degrade GPU access.
 
 ## Tests
 

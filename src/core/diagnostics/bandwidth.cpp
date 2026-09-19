@@ -315,10 +315,6 @@ BandwidthReport RunBandwidthBenchmark(const BandwidthOptions& options,
       auto hip_paths = MeasureHipBandwidth(options);
       report.paths.insert(report.paths.end(), hip_paths.begin(),
                           hip_paths.end());
-    } else if (backend == "xrt") {
-      auto xrt_paths = MeasureXrtBandwidth(options);
-      report.paths.insert(report.paths.end(), xrt_paths.begin(),
-                          xrt_paths.end());
     }
   }
 

@@ -102,7 +102,7 @@ code.
     kernels never run. Verify with rocprof that new work actually dispatches
     per token, or it only fires during capture.
 - Record new ideas in `task-on-going.md` as they are discovered (and the
-  model's `benchmarks/<model>/README.md` `# TODOs` dotted list at the end).
+  model's `docs/models/<model>/BENCHMARKS.md` `# TODOs` dotted list at the end).
 
 ## 3. Verify against the baseline
 
@@ -149,7 +149,7 @@ code.
 
 ## 4. Wrap up (evidence-based decision)
 
-1. Update `benchmarks/<model>/README.md` existing sections only: add a row to
+1. Update `docs/models/<model>/BENCHMARKS.md` existing sections only: add a row to
    the Experiment Summary table (retained/rejected) and append follow-up ideas
    to the `# TODOs` dotted list.
 2. Post the decision to the issue with `gh` and close it if done (rejection is
@@ -184,6 +184,6 @@ code.
   HIP-graph capture runs only when `!use_split_k_decode`.
 - Reference: `llama.cpp/` contains llama-bench on the same model; the
   remaining gap is ~1.07-1.09x decode and ~1.15-1.34x prefill at depth (see
-  `benchmarks/qwen3.8-27b/README.md`).
+  `docs/models/qwen3.8-27b/BENCHMARKS.md`).
 - Baseline envelope: pp2048 ~335-341, tg128 3.72-3.74,
   validate rmse `0.02007260` / cosine `0.99997753` / top-1 `198`.

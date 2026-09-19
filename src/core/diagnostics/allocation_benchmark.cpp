@@ -216,9 +216,7 @@ std::string AllocationBenchmarkReport::ToJson() const {
          << "\",\n"
          << "    \"pageSizeBytes\": " << page_size_bytes << ",\n"
          << "    \"hugePagesTotal\": " << huge_pages_total << ",\n"
-         << "    \"hugePageSizeBytes\": " << huge_page_size_bytes << ",\n"
-         << "    \"npuFirmwareVersion\": \""
-         << EscapeJson(inventory.npu.firmware_version) << "\"\n"
+         << "    \"hugePageSizeBytes\": " << huge_page_size_bytes << "\n"
          << "  },\n"
          << "  \"fingerprint\": " << fingerprint.ToJson() << ",\n"
          << "  \"paths\": [\n";

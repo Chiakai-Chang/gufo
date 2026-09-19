@@ -45,15 +45,6 @@ struct SysfsGpuDevice {
   std::map<std::string, std::string> hwmon_sensors;
 };
 
-struct SysfsNpuDevice {
-  std::string accel_name;
-  std::string pci_id;
-  std::string pci_slot;
-  std::string driver;
-  std::string vendor_id;
-  std::string device_id;
-};
-
 class LinuxSysfs {
 public:
   explicit LinuxSysfs(const std::filesystem::path& sys_root = "/sys",
@@ -63,7 +54,6 @@ public:
   [[nodiscard]] std::optional<HostCpuInfo> QueryCpuInfo() const;
   [[nodiscard]] std::optional<HostMemInfo> QueryMemInfo() const;
   [[nodiscard]] std::vector<SysfsGpuDevice> QueryDrmGpuDevices() const;
-  [[nodiscard]] std::vector<SysfsNpuDevice> QueryAccelNpuDevices() const;
 
   [[nodiscard]] std::optional<std::string> ReadFile(
       const std::filesystem::path& relative_or_absolute_path) const;

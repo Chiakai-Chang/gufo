@@ -11,19 +11,13 @@
   libjpeg,
   openssl,
   ffmpeg-headless,
-  libuuid,
   rocmPackages,
-  aie-smoke,
-  xrt,
-  xrt-plugin-amdxdna,
   config,
   version,
 
   # Overridable feature flags
   rocmSupport ? config.rocmSupport or false,
   rocmGpuTargets ? (lib.optionals rocmSupport rocmPackages.clr.gpuTargets),
-  # Wire the XRT NPU shim + amdxdna plugin into the build.
-  xrtSupport ? true,
 }:
 
 let
@@ -94,12 +88,6 @@ stdenv.mkDerivation (finalAttrs: {
     rocmPackages.composable_kernel
     rocmPackages.aotriton
     rocmPackages.rocprofiler-sdk
-  ]
-  ++ lib.optionals xrtSupport [
-    aie-smoke
-    xrt
-    xrt-plugin-amdxdna
-    libuuid
   ];
 
   cmakeFlags = [
@@ -114,21 +102,13 @@ stdenv.mkDerivation (finalAttrs: {
   ++ lib.optional rocmSupport "-DGPU_TARGETS=${lib.concatStringsSep ";" rocmGpuTargets}"
   ++ lib.optional rocmSupport "-DHIPCUB_INCLUDE_DIR=${rocmPackages.hipcub}/include"
   ++ lib.optional rocmSupport "-DROCPRIM_INCLUDE_DIR=${rocmPackages.rocprim}/include"
-  ++ lib.optional rocmSupport "-DROCWMMA_INCLUDE_DIR=${rocmPackages.rocwmma}/include"
-  ++ lib.optional xrtSupport "-DENGINE_ENABLE_XRT=ON"
-  ++ lib.optional xrtSupport "-DGUFO_AIE_SMOKE_PROGRAM_DIR=${placeholder "out"}/share/gufo/aie/smoke";
+  ++ lib.optional rocmSupport "-DROCWMMA_INCLUDE_DIR=${rocmPackages.rocwmma}/include";
 
   env = lib.optionalAttrs rocmSupport {
     ROCM_PATH = "${rocmPackages.clr}";
     GUFO_HIPCUB_ROOT = "${rocmPackages.hipcub}";
     GUFO_ROCPRIM_ROOT = "${rocmPackages.rocprim}";
     GUFO_ROCWMMA_ROOT = "${rocmPackages.rocwmma}";
-  }
-  // lib.optionalAttrs xrtSupport {
-    GUFO_AIE_SMOKE_ROOT = "${aie-smoke}";
-    XRT_PATH = "${xrt}/opt/xilinx/xrt";
-    # Combined NPU lib dir so XRT can discover the amdxdna plugin at runtime.
-    LD_LIBRARY_PATH = "${xrt}/opt/xilinx/xrt/lib:${xrt-plugin-amdxdna}/opt/xilinx/xrt/lib";
   };
 
   installPhase = ''
@@ -154,14 +134,6 @@ stdenv.mkDerivation (finalAttrs: {
     if [ -f benchmark_ssm_replay ]; then
       cp benchmark_ssm_replay $out/bin/benchmark_ssm_replay
     fi
-    if [ -d ${aie-smoke} ]; then
-      mkdir -p $out/share/gufo/aie/smoke
-      cp ${aie-smoke}/smoke.xclbin ${aie-smoke}/smoke.insts.elf \
-        ${aie-smoke}/smoke.insts.bin ${aie-smoke}/smoke.pdi \
-        ${aie-smoke}/smoke.aie-partition.json \
-        ${aie-smoke}/manifest.json ${aie-smoke}/SHA256SUMS \
-        $out/share/gufo/aie/smoke/
-    fi
     chmod +x $out/bin/*
 
     runHook postInstall
@@ -186,25 +158,18 @@ stdenv.mkDerivation (finalAttrs: {
   '';
 
   passthru = {
-    inherit rocmPackages xrt xrt-plugin-amdxdna;
+    inherit rocmPackages;
     toolchain = {
       targetPlatform = "x86_64-linux";
       targetGpu = "gfx1151";
-      targetNpu = "XDNA2/AIE2P";
       cxxCompiler = stdenv.cc.name;
       rocmVersion = rocmPackages.clr.version;
       hipClangVersion = rocmPackages.llvm.clang.version;
-      xrtCommit = xrt.src.rev;
-      xrtPluginCommit = xrt-plugin-amdxdna.src.rev;
-      xrtPluginVersion = xrt-plugin-amdxdna.pluginVersion;
-      aiebuRevision = aie-smoke.passthru.aiebu.src.rev;
-      llvmAieVersion = aie-smoke.passthru."llvm-aie".version;
-      mlirAieVersion = aie-smoke.passthru."mlir-aie".version;
     };
   };
 
   meta = with lib; {
-    description = "Gufo Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
+    description = "Gufo Engine — local inference runtime for AMD Strix Halo (gfx1151 GPU)";
     homepage = "https://github.com/";
     license = licenses.mit;
     platforms = [ "x86_64-linux" ];

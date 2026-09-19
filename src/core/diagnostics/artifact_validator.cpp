@@ -92,11 +92,6 @@ ValidationResult ValidateArtifactContent(std::string_view content) {
         if (!arch.empty() && arch != "gfx1151")
           fail("Incompatible GPU architecture: " + arch);
       }
-      if (object.contains("npuArchitecture")) {
-        const auto arch = String(object, "npuArchitecture");
-        if (!arch.empty() && arch != "XDNA2" && arch != "AIE2P")
-          fail("Incompatible NPU architecture: " + arch);
-      }
     };
     check_architecture(root);
     if (root.contains("machine"))
@@ -122,13 +117,7 @@ ValidationResult ValidateArtifactContent(std::string_view content) {
       canonical.kernel_release = String(block, "kernelRelease");
       canonical.memory_total_bytes = Uint(block, "memoryTotalBytes");
       canonical.memory_type = String(block, "memoryType");
-      canonical.npu_architecture = String(block, "npuArchitecture");
-      canonical.npu_driver = String(block, "npuDriver");
-      canonical.npu_firmware_version = String(block, "npuFirmwareVersion");
-      canonical.npu_identity = String(block, "npuIdentity");
-      canonical.npu_pci_id = String(block, "npuPciId");
       canonical.rocm_version = String(block, "rocmVersion");
-      canonical.xrt_commit = String(block, "xrtCommit");
 
       if (canonical.schema_version != res.schema_version)
         fail("Canonical schemaVersion does not match the artifact");
@@ -138,20 +127,7 @@ ValidationResult ValidateArtifactContent(std::string_view content) {
     }
     const auto type =
         root.contains("artifactType") ? String(root, "artifactType") : "";
-    if (type == "xrtSmoke") {
-      const auto& program = Object(root, "program");
-      if (!IsSha256(String(program, "programSha256")))
-        fail("Invalid XRT smoke programSha256");
-      const auto& result = Object(root, "result");
-      const auto iterations = Uint(result, "iterations");
-      if (iterations == 0 || Uint(result, "completedIterations") != iterations)
-        fail("XRT smoke did not complete every requested iteration");
-      if (String(result, "status") != "completed" ||
-          String(result, "completionStatus") != "completed" ||
-          Boolean(result, "quarantined"))
-        fail("XRT smoke did not complete successfully");
-      check_architecture(Object(root, "context"));
-    } else if (type == "hipAllocation") {
+    if (type == "hipAllocation") {
       const auto& summary = Object(root, "summary");
       if (!Boolean(summary, "allRequestedPathsReported") ||
           !Boolean(summary, "checksumsVerified") ||
@@ -159,7 +135,7 @@ ValidationResult ValidateArtifactContent(std::string_view content) {
           String(summary, "status") != "completed")
         fail("HIP allocation diagnostic did not complete all paths and checks");
     }
-    if (!type.empty() && type != "xrtSmoke" && type != "hipAllocation")
+    if (!type.empty() && type != "hipAllocation")
       fail("Unknown diagnostic artifactType: " + type);
     if (type.empty() && !root.contains("canonical")) {
       // Bandwidth artifacts reference a fingerprint rather than embedding it.

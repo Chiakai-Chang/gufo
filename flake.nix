@@ -1,5 +1,5 @@
 {
-  description = "gufo - Gufo Engine for AMD Strix Halo (gfx1151 GPU + XDNA2 NPU)";
+  description = "gufo - Gufo Engine for AMD Strix Halo (gfx1151 GPU)";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -66,9 +66,6 @@
             lpipsRocm
             ps.numpy
             ps.scipy
-            ps.pandas
-            ps.zstandard
-            gufoPackages.${system}.hyperloom
           ]
         );
     in
@@ -105,14 +102,10 @@
           base = gufoPackages.${system}.gufo;
         in
         {
-          # The only package we ship: ROCm/HIP compiled for gfx1151 + XRT NPU
-          # shim. The driver derivations (xrt, xrt-plugin-amdxdna) are internal
-          # build inputs in scope.nix and are not exposed as flake packages.
           default = base.override {
             rocmSupport = true;
             rocmGpuTargets = [ "gfx1151" ];
           };
-          aie-smoke = gufoPackages.${system}.aie-smoke;
         }
       );
 
@@ -136,9 +129,6 @@
               GUFO_HIPCUB_ROOT = "${pkgs.${system}.rocmPackages.hipcub}";
               GUFO_ROCPRIM_ROOT = "${pkgs.${system}.rocmPackages.rocprim}";
               GUFO_ROCWMMA_ROOT = "${pkgs.${system}.rocmPackages.rocwmma}";
-              GUFO_AIE_SMOKE_PROGRAM_DIR = "${gufoPackages.${system}.aie-smoke}";
-              GUFO_AIE_SMOKE_ROOT = "${gufoPackages.${system}.aie-smoke}";
-              XRT_PATH = "${gufoPackages.${system}.xrt}/opt/xilinx/xrt";
               TORCH_HOME = "${alexnetTorchHome system}";
               LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
                 pkgs.${system}.stdenv.cc.cc.lib
@@ -147,21 +137,6 @@
             };
           };
 
-          # Isolated Python 3.12 AIE compiler shell. Keeping this separate
-          # prevents MLIR-AIE's NumPy ABI from leaking into pythonTools.
-          aie = pkgs.${system}.mkShell {
-            packages = [
-              gufoPackages.${system}.aiebu
-              gufoPackages.${system}.llvm-aie
-              gufoPackages.${system}.mlir-aie
-            ];
-            env = {
-              MLIR_AIE_INSTALL_DIR = "${gufoPackages.${system}.mlir-aie}/${pkgs.${system}.python312.sitePackages}/mlir_aie";
-              PEANO_INSTALL_DIR = "${gufoPackages.${system}.llvm-aie}/${pkgs.${system}.python312.sitePackages}/llvm-aie";
-              GUFO_AIE_SMOKE_PROGRAM_DIR = "${gufoPackages.${system}.aie-smoke}";
-              XRT_PATH = "${gufoPackages.${system}.xrt}/opt/xilinx/xrt";
-            };
-          };
         }
       );
 
@@ -302,7 +277,7 @@
           } ''
             export HOME=$TMPDIR
             mkdir -p build && cd build
-            cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF -DENGINE_ENABLE_XRT=OFF
+            cmake "$src" -GNinja -DCMAKE_EXPORT_COMPILE_COMMANDS=ON -DBUILD_TESTING=OFF -DENGINE_ENABLE_HIP=OFF
 
             python3 - "$src" <<'PY' > tidy-files.txt
             import json
@@ -626,7 +601,7 @@ Composed Gates:
 Explicit Offline Gate (not in hosted PR closure):
   - MiniMax H3 Pinned Teacher & Offline LPIPS Validation
 Production Package Validation:
-  - gfx1151 ROCm/HIP + XRT build
+  - gfx1151 ROCm/HIP build
   - Installed gufo-server version/help smoke
 EOF
           '';

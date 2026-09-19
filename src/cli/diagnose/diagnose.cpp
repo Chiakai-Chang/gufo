@@ -17,15 +17,9 @@
 #include "src/core/diagnostics/fingerprint.h"
 #include "src/core/diagnostics/linux_sysfs.h"
 #include "src/core/diagnostics/system_inventory.h"
-#include "src/core/xdna2/smoke.h"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime.h>
-#endif
-
-#if defined(ENGINE_ENABLE_XRT)
-#include <xrt/experimental/xrt_system.h>
-#include <xrt/xrt_device.h>
 #endif
 
 namespace gufo::cli {
@@ -48,11 +42,8 @@ void PrintDiagnoseHelp(std::string_view program_name) {
          "artifact against schema & fingerprint\n"
       << "  --benchmark <name>           Run benchmark suite: bandwidth, "
          "allocation\n"
-      << "  --smoke <name>               Run hardware smoke: xrt\n"
-      << "  --iterations <n>             Smoke command cycles (default: 100)\n"
-      << "  --timeout-ms <ms>            Per-command timeout (default: 30000)\n"
       << "  --backends <csv>             Backends to benchmark (default: "
-         "cpu,hip,xrt)\n"
+         "cpu,hip)\n"
       << "  --warmup <n>                 Number of warmup iterations (default: "
          "3)\n"
       << "  --repetitions <n>            Minimum benchmark repetitions "
@@ -65,7 +56,7 @@ void PrintDiagnoseHelp(std::string_view program_name) {
       << "  --output <path>              Write command output to specified "
          "file\n"
       << "  --section <name>             Diagnostic section to run: all, "
-         "inventory, platform, gpu, npu\n"
+         "inventory, platform, gpu\n"
       << "  -h, --help                   Print help information\n";
 }
 
@@ -186,35 +177,7 @@ diagnostics::DiagnosticReport CollectDiagnostics(
     report.AddCheck(std::move(check));
   }
 
-  // 4. NPU Check
-  if (section == "all" || section == "npu" || section == "inventory") {
-    diagnostics::DiagnosticCheck check;
-    check.name = "npu";
-    check.details["identity"] = inventory.npu.identity;
-    check.details["architecture"] = inventory.npu.architecture;
-    check.details["pciDeviceId"] = inventory.npu.pci_device_id;
-    check.details["driverName"] = inventory.npu.driver_name;
-    check.details["firmwareVersion"] = inventory.npu.firmware_version;
-
-    if (inventory.npu.architecture == "XDNA2" ||
-        inventory.npu.architecture == "AIE2P") {
-      check.status = diagnostics::DiagnosticStatus::kPass;
-      check.message = "Detected AMD XDNA2 NPU";
-    } else if (inventory.npu.availability.find("permission denied") !=
-               std::string::npos) {
-      check.status = diagnostics::DiagnosticStatus::kWarn;
-      check.message =
-          "XDNA2 NPU device node inaccessible: " + inventory.npu.availability;
-      report.AddWarning("XDNA2 NPU device node permission denied");
-    } else {
-      check.status = diagnostics::DiagnosticStatus::kWarn;
-      check.message = "XDNA2 NPU unavailable: " + inventory.npu.availability;
-      report.AddWarning("XDNA2 NPU unavailable or driver not loaded");
-    }
-    report.AddCheck(std::move(check));
-  }
-
-  // 5. Toolchain Check
+  // 4. Toolchain Check
   if (section == "all" || section == "inventory") {
     diagnostics::DiagnosticCheck check;
     check.name = "toolchain";
@@ -222,9 +185,7 @@ diagnostics::DiagnosticReport CollectDiagnostics(
     check.message = "Toolchain and driver stack verified";
     check.details["kernelRelease"] = inventory.toolchain.kernel_release;
     check.details["amdgpuStatus"] = inventory.toolchain.amdgpu_status;
-    check.details["amdxdnaStatus"] = inventory.toolchain.amdxdna_status;
     check.details["rocmVersion"] = inventory.toolchain.rocm_version;
-    check.details["xrtPluginVersion"] = inventory.toolchain.xrt_plugin_version;
     report.AddCheck(std::move(check));
   }
 
@@ -236,14 +197,11 @@ int RunDiagnose(std::span<const char* const> args) {
   bool fingerprint_mode = false;
   std::string validate_artifact_path;
   std::string benchmark_name;
-  std::string smoke_name;
-  std::string backends_csv = "cpu,hip,xrt";
+  std::string backends_csv = "cpu,hip";
   std::uint32_t warmup = 3;
   std::uint32_t repetitions = 10;
   std::uint32_t duration_ms = 2000;
   std::string working_set_mib = "64";
-  std::uint32_t smoke_iterations = 100;
-  std::uint32_t timeout_ms = 30000;
   std::string output_file;
   std::string section = "all";
   std::size_t start_idx = 0;
@@ -285,35 +243,6 @@ int RunDiagnose(std::span<const char* const> args) {
       benchmark_name = args[++i];
     } else if (arg.starts_with("--benchmark=")) {
       benchmark_name = std::string(arg.substr(12));
-    } else if (arg == "--smoke") {
-      if (i + 1 >= args.size()) {
-        std::cerr << "Error: --smoke requires an argument\n";
-        PrintDiagnoseHelp("gufo");
-        return 2;
-      }
-      smoke_name = args[++i];
-    } else if (arg.starts_with("--smoke=")) {
-      smoke_name = std::string(arg.substr(8));
-    } else if (arg == "--iterations") {
-      if (i + 1 >= args.size()) {
-        std::cerr << "Error: --iterations requires an integer argument\n";
-        PrintDiagnoseHelp("gufo");
-        return 2;
-      }
-      smoke_iterations = static_cast<std::uint32_t>(std::stoul(args[++i]));
-    } else if (arg.starts_with("--iterations=")) {
-      smoke_iterations =
-          static_cast<std::uint32_t>(std::stoul(std::string(arg.substr(13))));
-    } else if (arg == "--timeout-ms") {
-      if (i + 1 >= args.size()) {
-        std::cerr << "Error: --timeout-ms requires an integer argument\n";
-        PrintDiagnoseHelp("gufo");
-        return 2;
-      }
-      timeout_ms = static_cast<std::uint32_t>(std::stoul(args[++i]));
-    } else if (arg.starts_with("--timeout-ms=")) {
-      timeout_ms =
-          static_cast<std::uint32_t>(std::stoul(std::string(arg.substr(13))));
     } else if (arg == "--backends") {
       if (i + 1 >= args.size()) {
         std::cerr << "Error: --backends requires an argument\n";
@@ -391,6 +320,12 @@ int RunDiagnose(std::span<const char* const> args) {
     }
   }
 
+  if (section != "all" && section != "inventory" && section != "platform" &&
+      section != "gpu") {
+    std::cerr << "Error: unknown diagnostic section '" << section << "'\n";
+    return 2;
+  }
+
   // Handle artifact validation mode
   if (!validate_artifact_path.empty()) {
     const auto result =
@@ -398,25 +333,6 @@ int RunDiagnose(std::span<const char* const> args) {
     const std::string content = json_mode ? result.ToJson() : result.ToHuman();
     OutputContent(content, output_file);
     return result.is_valid ? 0 : 1;
-  }
-
-  if (!smoke_name.empty()) {
-    if (smoke_name != "xrt") {
-      std::cerr << "Error: unsupported smoke '" << smoke_name
-                << "'. Supported: xrt\n";
-      return 2;
-    }
-    const auto inventory =
-        diagnostics::CollectSystemInventory(diagnostics::LinuxSysfs());
-    const auto fingerprint = diagnostics::GenerateMachineFingerprint(inventory);
-    xdna2::XrtSmokeOptions smoke_options;
-    smoke_options.iterations = smoke_iterations;
-    smoke_options.timeout_ms = timeout_ms;
-    const auto report =
-        xdna2::RunXrtSmoke(smoke_options, inventory, fingerprint);
-    const std::string content = json_mode ? report.ToJson() : report.ToHuman();
-    OutputContent(content, output_file);
-    return report.Success() ? 0 : 1;
   }
 
   // Handle benchmark execution mode
@@ -435,6 +351,16 @@ int RunDiagnose(std::span<const char* const> args) {
     if (benchmark_name == "bandwidth") {
       diagnostics::BandwidthOptions bw_options;
       bw_options.backends = SplitCommaSeparated(backends_csv);
+      if (bw_options.backends.empty()) {
+        std::cerr << "Error: --backends requires at least one backend\n";
+        return 2;
+      }
+      for (const auto& backend : bw_options.backends) {
+        if (backend != "cpu" && backend != "hip") {
+          std::cerr << "Error: unknown bandwidth backend '" << backend << "'\n";
+          return 2;
+        }
+      }
       bw_options.warmup = warmup;
       bw_options.repetitions = repetitions;
       bw_options.duration_ms = duration_ms;
@@ -544,53 +470,8 @@ static void CheckGpu() {
 }
 #endif
 
-#if defined(ENGINE_ENABLE_XRT)
-static bool IsXdna2Required() {
-  const char* val = std::getenv("GUFO_REQUIRE_XDNA2");
-  if (!val) {
-    val = std::getenv("GUFO_REQUIRE_NPU");
-  }
-  return val && std::string_view(val) != "0" &&
-         std::string_view(val) != "false";
-}
-
-static void CheckNpu() {
-  std::printf("XRT NPU shim enabled\n");
-  try {
-    unsigned int npuCount = xrt::system::enumerate_devices();
-    std::printf("XRT device count (NPU): %u\n", npuCount);
-    if (npuCount == 0) {
-      std::printf("No NPU found — is amdxdna loaded? ls /sys/class/accel\n");
-      if (IsXdna2Required()) {
-        std::exit(1);
-      }
-      return;
-    }
-    for (unsigned int i = 0; i < npuCount; ++i) {
-      xrt::device dev(i);
-      std::string name = dev.get_info<xrt::info::device::name>();
-      std::printf("  npu[%u]: %s\n", i, name.c_str());
-    }
-  } catch (const std::exception& e) {
-    std::printf("NPU check error: %s\n", e.what());
-    if (IsXdna2Required()) {
-      std::exit(1);
-    } else {
-      std::printf("SKIP: XDNA2/NPU device not accessible\n");
-    }
-  } catch (...) {
-    std::printf("NPU check error: unknown exception\n");
-    if (IsXdna2Required()) {
-      std::exit(1);
-    } else {
-      std::printf("SKIP: XDNA2/NPU device not accessible\n");
-    }
-  }
-}
-#endif
-
 int RunProbe(std::span<const char* const> args) {
-  ArgParser parser("gufo probe", "Probe GPU and NPU availability.");
+  ArgParser parser("gufo probe", "Probe GPU availability.");
   std::string error;
   if (!parser.Parse(args, &error)) {
     std::cerr << "Error: " << error << '\n';
@@ -607,10 +488,6 @@ int RunProbe(std::span<const char* const> args) {
   CheckGpu();
 #else
   std::printf("Build: CMake, C++20, CPU-only (no ROCm)\n");
-#endif
-
-#if defined(ENGINE_ENABLE_XRT)
-  CheckNpu();
 #endif
 
   std::printf("OK\n");

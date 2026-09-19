@@ -57,7 +57,7 @@
           "rawRepetitionsGbps"
         ],
         "properties": {
-          "backend": { "type": "string", "enum": ["cpu", "hip", "xrt"] },
+          "backend": { "type": "string", "enum": ["cpu", "hip"] },
           "pathName": { "type": "string" },
           "allocationType": { "type": "string" },
           "workingSetBytes": { "type": "integer", "minimum": 1 },

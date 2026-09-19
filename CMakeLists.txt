@@ -101,38 +101,6 @@ add_subdirectory(src/models/qwen3_tts)
 # Qwen3-ASR — model-private 1.7B speech recognition runtime.
 add_subdirectory(src/models/qwen3_asr)
 
-# XRT NPU shim — AMD XDNA2 userspace runtime over the amdxdna kernel driver.
-option(ENGINE_ENABLE_XRT "Build gufo with the XRT NPU shim" OFF)
-
-if (ENGINE_ENABLE_XRT)
-  # XRT install prefix: $XRT_PATH or the default /opt/xilinx/xrt layout.
-  find_path(XRT_INCLUDE_DIR xrt/experimental/xrt_system.h
-    PATHS "$ENV{XRT_PATH}/include" "/opt/xilinx/xrt/include"
-    NO_DEFAULT_PATH)
-  find_library(XRT_COREUTIL_LIB xrt_coreutil
-    PATHS "$ENV{XRT_PATH}/lib" "/opt/xilinx/xrt/lib"
-    NO_DEFAULT_PATH)
-  find_library(UUID_LIBRARY uuid REQUIRED)
-
-  if (NOT XRT_INCLUDE_DIR OR NOT XRT_COREUTIL_LIB)
-    message(FATAL_ERROR "XRT not found (ENGINE_ENABLE_XRT=ON). Please enter the Nix development environment (nix develop)")
-  endif()
-  if (DEFINED ENV{GUFO_AIE_SMOKE_PROGRAM_DIR}
-      AND NOT "$ENV{GUFO_AIE_SMOKE_PROGRAM_DIR}" STREQUAL "")
-    set(GUFO_AIE_SMOKE_PROGRAM_DIR "$ENV{GUFO_AIE_SMOKE_PROGRAM_DIR}"
-      CACHE PATH "Directory containing the reviewed XDNA2 smoke artifacts"
-      FORCE)
-  else()
-    set(GUFO_AIE_SMOKE_PROGRAM_DIR "${GUFO_AIE_SMOKE_PROGRAM_DIR}"
-      CACHE PATH "Directory containing the reviewed XDNA2 smoke artifacts")
-  endif()
-  set(GUFO_AIE_SMOKE_INCLUDE_DIR "$ENV{GUFO_AIE_SMOKE_ROOT}/include")
-  if (NOT GUFO_AIE_SMOKE_PROGRAM_DIR OR NOT GUFO_AIE_SMOKE_INCLUDE_DIR)
-    message(FATAL_ERROR "XDNA2 program artifacts not found. Use the Nix development environment")
-  endif()
-  message(STATUS "gufo: XRT NPU shim enabled, include=${XRT_INCLUDE_DIR}")
-endif()
-
 # Compiler warnings and sanitizers
 option(GUFO_ENABLE_WARNINGS "Enable compiler warnings" ON)
 option(GUFO_ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
@@ -157,9 +125,6 @@ add_library(gufo_diagnostics STATIC
   src/core/diagnostics/allocation_benchmark.cpp
   src/core/diagnostics/bandwidth.cpp
   src/core/hip/bandwidth.cpp
-  src/core/xdna2/bandwidth.cpp
-  src/core/xdna2/device.cpp
-  src/core/xdna2/smoke.cpp
   src/core/diagnostics/report.cpp
   src/cli/diagnose/diagnose.cpp
 )
@@ -172,18 +137,6 @@ if (ENGINE_ENABLE_HIP)
     src/core/hip/allocation_benchmark.hip)
   target_compile_definitions(gufo_diagnostics PRIVATE ENGINE_ENABLE_HIP=1)
   target_link_libraries(gufo_diagnostics PRIVATE hip::host roc::hipblas roc::rocblas)
-endif()
-
-if (ENGINE_ENABLE_XRT)
-  target_compile_definitions(gufo_diagnostics PRIVATE
-    ENGINE_ENABLE_XRT=1
-    GUFO_AIE_SMOKE_PROGRAM_DIR="${GUFO_AIE_SMOKE_PROGRAM_DIR}")
-  target_include_directories(gufo_diagnostics SYSTEM PRIVATE
-    ${XRT_INCLUDE_DIR}
-    ${GUFO_AIE_SMOKE_INCLUDE_DIR})
-  target_link_libraries(gufo_diagnostics PRIVATE
-    ${XRT_COREUTIL_LIB}
-    ${UUID_LIBRARY})
 endif()
 
 add_library(gufo_core STATIC
@@ -548,8 +501,6 @@ if (BUILD_TESTING)
   set_tests_properties(video_api_test PROPERTIES
     LABELS "cpu;server;api;video;minimax-h3;quality")
 
-
-
   add_test(NAME h3_profile_test
     COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/tools/h3_profile_test.py)
@@ -619,18 +570,6 @@ if (BUILD_TESTING)
   add_test(NAME allocation_benchmark_test COMMAND allocation_benchmark_test)
   set_tests_properties(allocation_benchmark_test PROPERTIES
     LABELS "gpu;hip;gfx1151;diagnostics;allocation;opt-c091")
-
-  if (ENGINE_ENABLE_XRT)
-    add_executable(xdna2_xrt_program_test
-      tests/device/xdna2_xrt_program_test.cpp)
-    target_compile_definitions(xdna2_xrt_program_test PRIVATE
-      GUFO_AIE_SMOKE_PROGRAM_DIR="${GUFO_AIE_SMOKE_PROGRAM_DIR}")
-    target_link_libraries(xdna2_xrt_program_test PRIVATE gufo_diagnostics)
-    add_test(NAME xdna2_xrt_program_test COMMAND xdna2_xrt_program_test)
-    set_tests_properties(xdna2_xrt_program_test PROPERTIES
-      LABELS "npu;xdna2;xrt;xrt-hardware")
-
-  endif()
 
   add_executable(gguf_reader_test tests/core/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE gufo_core)
@@ -958,7 +897,6 @@ if (BUILD_TESTING)
       LABELS "gpu;hip;gfx1151;minimax-h3;audio;vae;quality;external-model;very-slow"
       SKIP_RETURN_CODE 77)
 
-
     add_executable(hipblaslt_runtime_cache_test
       tests/kernels/hipblaslt_runtime_cache_test.cpp)
     target_link_libraries(hipblaslt_runtime_cache_test PRIVATE
@@ -986,18 +924,10 @@ if (BUILD_TESTING)
     set_tests_properties(speculative_verification_test PROPERTIES LABELS "hip;gpu;speculative")
   endif()
 
-  if (ENGINE_ENABLE_HIP AND ENGINE_ENABLE_XRT)
-    add_test(NAME gufo_gpu_xdna2_probe COMMAND gufo)
-    set_tests_properties(gufo_gpu_xdna2_probe PROPERTIES
-      LABELS "platform;probe;xdna2;xrt;hip;gpu")
-  elseif (ENGINE_ENABLE_HIP)
+  if (ENGINE_ENABLE_HIP)
     add_test(NAME gufo_gpu_probe COMMAND gufo)
     set_tests_properties(gufo_gpu_probe PROPERTIES
       LABELS "platform;probe;hip;gpu")
-  elseif (ENGINE_ENABLE_XRT)
-    add_test(NAME gufo_xdna2_probe COMMAND gufo)
-    set_tests_properties(gufo_xdna2_probe PROPERTIES
-      LABELS "platform;probe;xdna2;xrt")
   else()
     add_test(NAME gufo_cpu_probe COMMAND gufo)
     set_tests_properties(gufo_cpu_probe PROPERTIES
