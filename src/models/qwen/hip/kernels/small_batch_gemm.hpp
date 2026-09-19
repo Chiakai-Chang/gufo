@@ -83,7 +83,8 @@ __device__ __forceinline__ __attribute__((convergent)) void SyncKQuantTile() {
 // Float4-aligned LDS rows amortize activation loads across output rows.
 template<std::uint32_t WavesPerBlock, std::size_t Batch,
          std::size_t RowsPerWave, bool StreamWeights = true,
-         std::uint32_t HardwareWaveSize = 32, std::size_t TokenGroups = 1>
+         std::uint32_t HardwareWaveSize = 32, std::size_t TokenGroups = 1,
+         bool GroupedGrid = false>
 __launch_bounds__(WavesPerBlock * 32, 1) __global__
     void BatchedExactBf16GEMMFp32VecKernel(const hip_bfloat16* __restrict__ A,
                                            const float* __restrict__ X,
@@ -91,8 +92,10 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
                                            std::size_t K) {
   static_assert(HardwareWaveSize == 32 || HardwareWaveSize == 64);
   static_assert(TokenGroups > 0);
-  X += (blockIdx.x % TokenGroups) * Batch * K;
-  Y += (blockIdx.x % TokenGroups) * Batch * M;
+  const auto group = GroupedGrid ? blockIdx.x : blockIdx.x % TokenGroups;
+  const auto row_block = GroupedGrid ? blockIdx.y : blockIdx.x / TokenGroups;
+  X += group * Batch * K;
+  Y += group * Batch * M;
   constexpr std::size_t kValuesPerVector = 8;
   constexpr std::size_t kVectorsPerTile = 32;
   constexpr std::size_t kStride = kValuesPerVector + 4;
@@ -102,7 +105,7 @@ __launch_bounds__(WavesPerBlock * 32, 1) __global__
   const std::size_t lane = threadIdx.x & 31u;
   const std::size_t warp_id = threadIdx.x >> 5u;
   const std::size_t row_base =
-      (((blockIdx.x / TokenGroups) * WavesPerBlock) + warp_id) * RowsPerWave;
+      ((row_block * WavesPerBlock) + warp_id) * RowsPerWave;
   const std::size_t vector_count = K / kValuesPerVector;
   float sums[RowsPerWave][Batch] = {};
 

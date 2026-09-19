@@ -62,6 +62,16 @@ void TestNumbers() {
 }
 
 void TestStructures() {
+  for (char c = 0; c < 0x20; ++c)
+    ExpectInvalid(std::string{'"', c, '"'});
+  for (const auto bytes :
+       {"\x80", "\xC0\xAF", "\xE0\x80\xAF", "\xED\xA0\x80", "\xF4\x90\x80\x80",
+        "\xF5\x80\x80\x80", "\xC2", "\xE2\x82", "\xC2x"}) {
+    ExpectInvalid(std::string("\"") + bytes + '"');
+    ExpectInvalid(std::string("{\"") + bytes + "\":0}");
+  }
+  const std::string utf8 = "\xC2\x80\xE0\xA0\x80\xF4\x8F\xBF\xBF";
+  assert(parse('"' + utf8 + '"').str() == utf8);
   for (const auto input :
        {"", "01", "1.", "+1", "1e999", "[1,]", "{\"x\":1,}", R"({"x":1,"x":2})",
         R"({"x":1,"\u0078":2})", R"("\uD800")", R"("\uDC00")",

@@ -60,7 +60,10 @@ public:
     }
     capture_attempted_ = true;
 
-    hipError_t err = hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal);
+    // Other request threads may allocate/copy independent snapshots while this
+    // executor records its own nonblocking stream.
+    hipError_t err =
+        hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal);
     if (err != hipSuccess) {
       is_enabled_ = false;
       EmitGraphDispatch("miss_begin_failed", key.execution_identity,
@@ -68,7 +71,18 @@ public:
       return false;
     }
 
-    capture_fn();
+    try {
+      capture_fn();
+    } catch (...) {
+      // End capture even when an allocation/launch helper throws. Leaving the
+      // stream in capture mode would corrupt the next request's reset/work.
+      hipGraph_t abandoned = nullptr;
+      (void)hipStreamEndCapture(stream, &abandoned);
+      if (abandoned != nullptr)
+        (void)hipGraphDestroy(abandoned);
+      Reset();
+      throw;
+    }
 
     err = hipStreamEndCapture(stream, &graph_);
     if (err != hipSuccess || graph_ == nullptr) {

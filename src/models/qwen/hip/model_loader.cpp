@@ -163,15 +163,8 @@ std::shared_ptr<const QwenGpuModel> QwenGpuModel::CreateFromGguf(
 
   auto tokenizer =
       tokenization::QwenTokenizer::CreateFromGguf(*reader, error_msg);
-  if (!tokenizer || tokenizer->GetVocabSize() <= 256) {
-    auto bin_tok = tokenization::QwenTokenizer::CreateFromBinaryFile(
-        "models/qwen_vocab.bin");
-    if (bin_tok) {
-      tokenizer = std::move(bin_tok);
-    } else if (!tokenizer) {
-      return nullptr;
-    }
-  }
+  if (!tokenizer)
+    return nullptr;
 
   std::vector<QwenGpuWeightRegion> weight_regions;
   if (!CreateWeightRegions(*reader, weight_regions, error_msg)) {

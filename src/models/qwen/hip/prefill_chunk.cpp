@@ -50,6 +50,7 @@ bool UseQwen27bFp16Prefill(const models::QwenModelWeights& weights,
 tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     std::span<const tokenization::TokenId> prompt_tokens,
     std::uint32_t start_pos, bool compute_logits) {
+  CheckReset();
   const auto& config = weights_.config;
   const std::size_t hidden_size = config.hidden_size;
   const std::size_t intermediate_size = config.intermediate_size;
@@ -98,8 +99,6 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
                        hidden_size, 1, arena_.stream);
 
   const bool half_prefill = UseQwen27bFp16Prefill(weights_, batch_size);
-  // Execute the pure Qwen route decision while keeping hipBLASLt failure as a
-  // runtime fallback to hipBLAS, not as resolver state.
   const auto gemm_weight = [&](const models::QwenTensorRef& w,
                                const void* bf16_input, const float* fp32_input,
                                float* output, std::size_t m, std::size_t k,
@@ -114,22 +113,15 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
          .batch_size = batch_size,
          .m = m,
          .k = k,
-         .mode = models::qwen::QwenGemmMode::kHipPrefill,
-         .capabilities = {.can_try_hipblaslt =
-                              arena_.hipblaslt_gemm != nullptr}});
+         .mode = models::qwen::QwenGemmMode::kHipPrefill});
     if (!resolution.accepted()) {
       std::abort();
     }
     switch (resolution.route) {
-      case models::qwen::QwenGemmRoute::kHipPrefillBf16LtTryThenBlas:
-        if (arena_.hipblaslt_gemm->RunBf16(w.data, bf16_input, output,
-                                           batch_size, m, k, arena_.stream)) {
-          return;
-        }
-        [[fallthrough]];
-      case models::qwen::QwenGemmRoute::kHipPrefillBf16Blas:
-        LaunchHipblasGEMMBF16(arena_.hipblas_handle, w.data, bf16_input, output,
-                              batch_size, m, k, arena_.stream);
+      case models::qwen::QwenGemmRoute::kHipPrefillBf16Fp32:
+        // Preserve FP32 activation precision and a fixed reduction order.
+        LaunchExactBf16GEMMFp32SmallBatch(w.data, fp32_input, output,
+                                          batch_size, m, k, arena_.stream);
         return;
       case models::qwen::QwenGemmRoute::kHipPrefillF32Blas:
         LaunchHipblasGEMM(arena_.hipblas_handle, w.data, false, fp32_input,

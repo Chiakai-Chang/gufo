@@ -149,7 +149,8 @@ tokenization::ChatRole ParseRole(std::string_view role) {
 }
 
 bool ParseContent(const json::Value* content,
-                  tokenization::ChatMessage* message, std::string* error) {
+                  tokenization::ChatMessage* message,
+                  core::ImageReadBudget& budget, std::string* error) {
   auto* output = &message->content;
   if (content == nullptr || content->is_null()) {
     return true;
@@ -191,7 +192,7 @@ bool ParseContent(const json::Value* content,
       try {
         message->images.push_back(
             {output->size(), std::make_shared<const std::vector<std::uint8_t>>(
-                                 core::ReadImageUrl(url->get_str()))});
+                                 core::ReadImageUrl(url->get_str(), budget))});
       } catch (const std::exception& exception) {
         *error = exception.what();
         return false;
@@ -238,7 +239,7 @@ bool ParseArguments(std::string_view arguments,
 }
 
 bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
-                  std::string* error) {
+                  core::ImageReadBudget& budget, std::string* error) {
   if (!value.is_object()) {
     *error = "each message must be an object";
     return false;
@@ -251,7 +252,7 @@ bool ParseMessage(const json::Value& value, tokenization::ChatMessage* message,
   message->role = ParseRole(role);
   message->name = value.member_str("name");
   message->tool_call_id = value.member_str("tool_call_id");
-  if (!ParseContent(value.find("content"), message, error)) {
+  if (!ParseContent(value.find("content"), message, budget, error)) {
     return false;
   }
   if (const json::Value* reasoning = value.find("reasoning_content");
@@ -543,10 +544,11 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
     return Error(400, "Bad Request", "'messages' must be a non-empty array",
                  "missing_messages");
   }
+  core::ImageReadBudget image_budget;
   for (const auto& item : messages->items()) {
     tokenization::ChatMessage message;
     std::string parse_error;
-    if (!ParseMessage(item, &message, &parse_error)) {
+    if (!ParseMessage(item, &message, image_budget, &parse_error)) {
       return Error(400, "Bad Request", std::move(parse_error),
                    "invalid_messages");
     }

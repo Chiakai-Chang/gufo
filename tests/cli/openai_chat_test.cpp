@@ -949,6 +949,21 @@ void TestImagePartsRetainOrderAndIdentity() {
   }
 }
 
+void TestAggregateImageLimit() {
+  FakeBackend backend;
+  auto body = gufo::json::Value::object();
+  body["model"] = "test-model";
+  body["messages"] = gufo::json::Value::array();
+  const auto message = gufo::json::parse(R"({"role":"user","content":[
+    {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID"}}]})");
+  for (unsigned i = 0; i < 17; ++i)
+    body["messages"].push_back(message);
+  const auto response =
+      gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+  Expect(response.status == 400,
+         "image budget must cover all messages, not each separately");
+}
+
 }  // namespace
 
 int main() {
@@ -973,6 +988,7 @@ int main() {
   TestInvalidClientIdentityIsRejected();
   TestStreamingOverloadIsRejectedBeforeHeaders();
   TestImagePartsRetainOrderAndIdentity();
+  TestAggregateImageLimit();
   std::cout << "All OpenAI chat protocol tests passed\n";
   return 0;
 }

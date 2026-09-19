@@ -9,7 +9,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <fstream>
 #include <memory>
 #include <optional>
 #include <span>
@@ -325,84 +324,6 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
 }
 
 }  // namespace
-
-std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromBinaryFile(
-    const std::string& path, std::string* error_msg) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f.is_open()) {
-    if (error_msg != nullptr) {
-      *error_msg = "Could not open binary vocab file: " + path;
-    }
-    return nullptr;
-  }
-
-  std::uint32_t num_tokens = 0;
-  f.read(reinterpret_cast<char*>(&num_tokens), sizeof(num_tokens));
-  if (!f || num_tokens == 0) {
-    if (error_msg != nullptr) {
-      *error_msg = "Invalid binary vocab format";
-    }
-    return nullptr;
-  }
-
-  auto tokenizer = std::unique_ptr<QwenTokenizer>(new QwenTokenizer());
-  tokenizer->id_to_token_.reserve(num_tokens);
-  tokenizer->token_to_id_.reserve(num_tokens);
-
-  for (std::uint32_t i = 0; i < num_tokens; ++i) {
-    std::uint16_t len = 0;
-    f.read(reinterpret_cast<char*>(&len), sizeof(len));
-    std::string str(len, '\0');
-    f.read(str.data(), len);
-    tokenizer->id_to_token_.push_back(str);
-    tokenizer->token_to_id_[str] = i;
-  }
-
-  std::uint32_t num_merges = 0;
-  f.read(reinterpret_cast<char*>(&num_merges), sizeof(num_merges));
-  tokenizer->merge_ranks_.reserve(num_merges);
-  for (std::uint32_t rank = 0; rank < num_merges; ++rank) {
-    std::uint16_t len = 0;
-    f.read(reinterpret_cast<char*>(&len), sizeof(len));
-    std::string merge(len, '\0');
-    f.read(merge.data(), len);
-
-    const auto space_pos = merge.find(' ');
-    if (space_pos == std::string::npos) {
-      continue;
-    }
-    const std::string part1 = merge.substr(0, space_pos);
-    const std::string part2 = merge.substr(space_pos + 1);
-
-    auto it1 = tokenizer->token_to_id_.find(part1);
-    auto it2 = tokenizer->token_to_id_.find(part2);
-    if (it1 != tokenizer->token_to_id_.end() &&
-        it2 != tokenizer->token_to_id_.end()) {
-      tokenizer->merge_ranks_[{it1->second, it2->second}] = rank;
-    }
-  }
-
-  std::uint32_t num_specials = 0;
-  f.read(reinterpret_cast<char*>(&num_specials), sizeof(num_specials));
-  for (std::uint32_t i = 0; i < num_specials; ++i) {
-    std::uint32_t id = 0;
-    std::uint16_t len = 0;
-    f.read(reinterpret_cast<char*>(&id), sizeof(id));
-    f.read(reinterpret_cast<char*>(&len), sizeof(len));
-    std::string name(len, '\0');
-    f.read(name.data(), len);
-
-    tokenizer->special_token_to_id_[name] = id;
-    tokenizer->is_special_token_[id] = true;
-    if (id < tokenizer->id_to_token_.size()) {
-      tokenizer->id_to_token_[id] = name;
-      tokenizer->token_to_id_[name] = id;
-    }
-  }
-
-  tokenizer->InitializeByteTokens();
-  return tokenizer;
-}
 
 std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromGguf(
     const core::GgufReader& reader, std::string* error_msg) {

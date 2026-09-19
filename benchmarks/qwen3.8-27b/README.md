@@ -18,16 +18,19 @@ Standard sweep: **pp2048 / tg128**, C1. Cells are prefill / generation tok/s.
 
 | Context depth | Q4 | Q8 |
 | ---: | ---: | ---: |
-| 0 | **622.00 / 11.74** | **520.11 / 7.10** |
+| 0 | **622.00 / 11.74** | **445.86 / 7.11** |
 | 4,096 | TODO | TODO |
 | 8,192 | TODO | TODO |
 | 12,288 | TODO | TODO |
 | 16,384 | TODO | TODO |
-| 32,768 | **467.63 / 10.30** | **402.36 / 6.55** |
+| 32,768 | **467.63 / 10.30** | TODO |
 
 Measured **2026-09-19**, one warmed release sample per point; Q4 d0 is the
 mean of two controls (PP range 620.38–623.61 tok/s).
 Q4 uses FP16 activations with packed quantized weights; Q8 retains native wave64.
+BF16 projections use FP32 activations with a fixed reduction order, qualified
+against split prefill and continued-image replay. Q8 depth measurements need
+refreshing after this arithmetic change.
 At depth, large prefill chunks pack keys by head and values into WMMA tiles in
 idle FFN scratch. Small chunks read the canonical cache directly. This adds no
 persistent allocation and leaves cache contents and attention arithmetic intact.
@@ -35,25 +38,25 @@ When all KV heads no longer fit, bounded groups reuse that scratch instead of
 falling back to strided attention. End-to-end speed beyond d128K remains **TODO**.
 
 Projection experiments, 2026-09-19: smaller/larger tiles, alternative wave
-layouts, pipeline depths and Q8 row grouping did not improve the short controls;
+layouts, pipeline depths and quantized Q8 row grouping did not improve the short controls;
 the current kernels remain.
 
 ## Single user, DFlash2
 
 **pp2048 / tg128**, C1, greedy, Q4_K_M draft and adaptive controller.
 Cells are prefill / generation tok/s. Measured **2026-09-19**:
-one warmed sample per point, except the repeated Q8 d32768 control.
+one warmed sample per point.
 
 | Context depth | Q4 target | Q8 target |
 | ---: | ---: | ---: |
-| 0 | **578.04 / 34.32** | **477.27 / 24.71** |
+| 0 | **578.04 / 34.32** | **422.23 / 24.88** |
 | 4,096 | TODO | TODO |
 | 8,192 | TODO | TODO |
 | 12,288 | TODO | TODO |
 | 16,384 | TODO | TODO |
-| 32,768 | **442.86 / 31.01** | **384.86 / 27.05** |
+| 32,768 | **442.86 / 31.01** | TODO |
 
-These repetitive CLI inputs accept 96.5% / 97.4% of proposals at d32768.
+The repetitive Q4 CLI input accepts 96.5% of proposals at d32768.
 Greedy outputs match AR. Natural prompts have different acceptance and speed.
 
 Draft-precision control, **2026-09-16**: cached `prose_tides`, **tg64**,

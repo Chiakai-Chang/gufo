@@ -315,7 +315,13 @@ ContinuationCache::SnapshotSupport MakeSnapshotSupport(
 void TextModelRunner::AdvanceBatch(
     std::span<const TextRunnerAdvance> advances) const {
   for (const auto& advance : advances) {
-    Advance(advance.state.get(), advance.token);
+    try {
+      Advance(advance.state.get(), advance.token);
+    } catch (...) {
+      if (!advance.failure)
+        throw;
+      *advance.failure = std::current_exception();
+    }
   }
 }
 
@@ -347,8 +353,14 @@ std::vector<TextDecodeStep> TextModelRunner::DecodeBatch(
   std::vector<TextDecodeStep> steps;
   steps.reserve(decodes.size());
   for (const auto& decode : decodes) {
-    steps.push_back(DecodeStep(decode.state.get(), decode.max_tokens,
-                               decode.sampler.get()));
+    try {
+      steps.push_back(DecodeStep(decode.state.get(), decode.max_tokens,
+                                 decode.sampler.get()));
+    } catch (...) {
+      TextDecodeStep failed;
+      failed.failure = std::current_exception();
+      steps.push_back(std::move(failed));
+    }
   }
   return steps;
 }
@@ -1021,8 +1033,8 @@ TextExecutionPlan TextRunnerPool::SelectDecodePlan(
   return *serial;
 }
 
-void TextRunnerPool::AdvanceBatch(std::span<Request*> requests,
-                                  const TextExecutionPlan& plan) {
+std::vector<std::exception_ptr> TextRunnerPool::AdvanceBatch(
+    std::span<Request*> requests, const TextExecutionPlan& plan) {
   if (plan.kind != TextExecutionPlanKind::kBatched || requests.size() < 2 ||
       requests.size() > plan.physical_width) {
     throw std::invalid_argument("invalid batched text execution plan");
@@ -1033,6 +1045,7 @@ void TextRunnerPool::AdvanceBatch(std::span<Request*> requests,
         "text runner does not support the requested batched plan");
   }
 
+  std::vector<std::exception_ptr> failures(requests.size());
   std::vector<TextRunnerAdvance> advances;
   advances.reserve(requests.size());
   for (std::size_t index = 0; index < requests.size(); ++index) {
@@ -1051,15 +1064,18 @@ void TextRunnerPool::AdvanceBatch(std::span<Request*> requests,
     advances.push_back({
         .state = dynamic_cast<TextRunnerState&>(request->impl_->lease.state()),
         .token = request->impl_->pending_selection->token,
+        .failure = &failures[index],
     });
   }
 
   for (auto* request : requests)
     request->CapturePromptSnapshot();
   impl_->validated.runner->AdvanceBatch(advances);
-  for (auto* request : requests) {
-    request->impl_->pending_selection.reset();
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    if (!failures[i])
+      requests[i]->impl_->pending_selection.reset();
   }
+  return failures;
 }
 
 std::vector<TextDecodeStep> TextRunnerPool::DecodeBatch(
@@ -1109,6 +1125,8 @@ std::vector<TextDecodeStep> TextRunnerPool::DecodeBatch(
   }
   for (std::size_t index = 0; index < requests.size(); ++index) {
     auto& step = steps[index];
+    if (step.failure)
+      continue;
     auto& request = *requests[index]->impl_;
     if (step.execution_plan.physical_width == 0 ||
         step.execution_plan.physical_width > requests.size() ||

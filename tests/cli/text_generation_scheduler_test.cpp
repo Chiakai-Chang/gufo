@@ -469,9 +469,7 @@ public:
       const std::lock_guard<std::mutex> lock(control_->mutex);
       control_->advance_batches.push_back(std::move(labels));
     }
-    for (const auto& advance : advances) {
-      Advance(advance.state.get(), advance.token);
-    }
+    TextModelRunner::AdvanceBatch(advances);
   }
 
   [[nodiscard]] std::size_t CheckpointPosition(
@@ -622,6 +620,32 @@ void TestMultiTokenRunnerCanSwitchToBatchedExecution() {
          "target batching bypasses per-request draft steps");
   Expect(control->batch_preparations.load(std::memory_order_relaxed) >= 2,
          "both resident states are prepared before target batching");
+}
+
+void TestBatchFailureIsolation() {
+  for (const bool speculative : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->multi_token_decode = speculative;
+    control->batched_multi_token_decode = speculative;
+    control->supports_batched_advance = true;
+    control->block_prefill_label = 1;
+    control->throw_advance_label = 1;
+    auto scheduler = MakeScheduler(control, 2);
+    auto failed = scheduler->Submit({1}, 12, 0.0F);
+    control->WaitForPrefill(1);
+    auto healthy = scheduler->Submit({2}, 12, 0.0F);
+    control->ReleasePrefill();
+    bool threw = false;
+    try {
+      (void)failed.Wait();
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    Expect(threw, "failed batch member reports its error");
+    const auto result = healthy.Wait();
+    Expect(result.tokens == ExpectedTokens(2, 12),
+           "a failing batch member must not fail or corrupt a healthy peer");
+  }
 }
 
 void TestModelOwnedBatchMetrics() {
@@ -1262,6 +1286,7 @@ int main() {
   TestMultiTokenDecodePublishesDraftMetricsAndDisablesPrefixReuse();
   TestMultiTokenRunnerCanSwitchToBatchedExecution();
   TestModelOwnedBatchMetrics();
+  TestBatchFailureIsolation();
   TestMultiResidentPrefillUsesBoundedWorkUnits();
   for (const bool multi_token : {false, true}) {
     for (const bool batched : {false, true}) {

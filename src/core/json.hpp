@@ -463,7 +463,30 @@ struct Parser {
             fail("bad escape");
         }
       } else {
-        out += c;
+        const auto lead = static_cast<unsigned char>(c);
+        if (lead < 0x20)
+          fail("unescaped control character");
+        if (lead < 0x80) {
+          out += c;
+          continue;
+        }
+        const unsigned length = lead >= 0xC2 && lead <= 0xDF   ? 2
+                                : lead >= 0xE0 && lead <= 0xEF ? 3
+                                : lead >= 0xF0 && lead <= 0xF4 ? 4
+                                                               : 0;
+        if (length == 0 || length - 1 > s.size() - i)
+          fail("invalid UTF-8");
+        for (unsigned j = 1; j < length; ++j) {
+          const auto byte = static_cast<unsigned char>(s[i + j - 1]);
+          if (byte < 0x80 || byte > 0xBF ||
+              (j == 1 && ((lead == 0xE0 && byte < 0xA0) ||
+                          (lead == 0xED && byte > 0x9F) ||
+                          (lead == 0xF0 && byte < 0x90) ||
+                          (lead == 0xF4 && byte > 0x8F))))
+            fail("invalid UTF-8");
+        }
+        out.append(s.substr(i - 1, length));
+        i += length - 1;
       }
     }
     fail("unterminated string");

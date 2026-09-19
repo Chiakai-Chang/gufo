@@ -127,12 +127,18 @@ void QwenGpuExecutor::Reset() noexcept {
   h_last_hidden_.clear();
   last_verification_rows_ = 0;
   last_hidden_offset_ = 0;
-  arena_.Reset();
+  try {
+    arena_.Reset();
+    reset_failure_ = nullptr;
+  } catch (...) {
+    reset_failure_ = std::current_exception();
+  }
   graph_executor_.Reset();
 }
 
 std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(
     std::uint32_t valid_context) {
+  CheckReset();
   auto snapshot = arena_.SaveSnapshot(valid_context);
   snapshot->vision_layout_ = vision_input_.layout();
   return snapshot;
@@ -141,6 +147,7 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuExecutor::SaveSnapshot(
 void QwenGpuExecutor::ConfigureVision(
     std::shared_ptr<const models::qwen::vision::Prompt> prompt,
     std::shared_ptr<models::qwen::vision::Encoder> encoder) {
+  CheckReset();
   const auto* previous = vision_input_.rope();
   if (prompt)
     prompt->rope.Validate(arena_.GetMaxContext());
@@ -150,6 +157,7 @@ void QwenGpuExecutor::ConfigureVision(
 }
 
 void QwenGpuExecutor::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
+  CheckReset();
   replaying_ssm_state_ = false;
   next_token_.reset();
   h_prompt_hidden_.clear();
@@ -166,6 +174,7 @@ void QwenGpuExecutor::RestoreSnapshot(const QwenGpuSnapshot& snapshot) {
 void QwenGpuExecutor::RestoreCompactSnapshot(
     std::span<const std::uint8_t> payload,
     std::uint32_t expected_valid_context) {
+  CheckReset();
   replaying_ssm_state_ = false;
   next_token_.reset();
   h_prompt_hidden_.clear();
@@ -181,6 +190,7 @@ void QwenGpuExecutor::RestoreCompactSnapshot(
 }
 
 void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
+  CheckReset();
   replaying_ssm_state_ = false;
   arena_.SaveState(valid_context);
   if (arena_.BeginSsmReplayCapture()) {
@@ -189,6 +199,7 @@ void QwenGpuExecutor::SaveState(std::uint32_t valid_context) {
 }
 
 void QwenGpuExecutor::RestoreState() {
+  CheckReset();
   if (arena_.IsSsmReplayCaptureActive())
     arena_.DisableSsmReplayCapture();
   arena_.RestoreState();
@@ -196,6 +207,7 @@ void QwenGpuExecutor::RestoreState() {
 }
 
 void QwenGpuExecutor::FinishVerification() {
+  CheckReset();
   arena_.DisableSsmReplayCapture();
 }
 
@@ -237,6 +249,7 @@ void QwenGpuExecutor::ReplaySsmState(std::uint32_t position,
 }
 
 std::span<const float> QwenGpuExecutor::CopyLastLogits() {
+  CheckReset();
   auto scratch = arena_.GetScratchView();
   HIP_CHECK(hipMemcpyAsync(h_logits_.data(), scratch.decode.logits.data(),
                            h_logits_.size() * sizeof(float),
@@ -247,6 +260,7 @@ std::span<const float> QwenGpuExecutor::CopyLastLogits() {
 
 tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
     sampling::SamplerState& sampler) {
+  CheckReset();
   auto parameters = PrepareGpuSamplingParameters(sampler);
   if (sampler.config().uses_random_sampling()) {
     parameters.uniform = static_cast<float>(sampler.Uniform());
@@ -268,6 +282,7 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
 
 tokenization::TokenId QwenGpuExecutor::SampleCachedLogits(
     std::span<const float> logits, sampling::SamplerState& sampler) {
+  CheckReset();
   if (logits.size() != weights_.config.vocab_size)
     throw std::invalid_argument(
         "cached Qwen frontier has the wrong vocabulary");
@@ -296,6 +311,7 @@ GpuSamplingParameters QwenGpuExecutor::PrepareGpuSamplingParameters(
 
 tokenization::TokenId QwenGpuExecutor::SampleVerificationLogits(
     std::size_t row, sampling::SamplerState& sampler) {
+  CheckReset();
   if (row >= last_verification_rows_ || d_verification_logits_ == nullptr) {
     throw std::out_of_range("Qwen verification logit row is unavailable");
   }
@@ -322,6 +338,7 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
     std::span<const tokenization::TokenId> draft_candidate_ids,
     std::span<const float> draft_candidate_probabilities,
     double draft_token_probability, sampling::SamplerState& sampler) {
+  CheckReset();
   if (row >= last_verification_rows_ || d_verification_logits_ == nullptr) {
     throw std::out_of_range("Qwen verification logit row is unavailable");
   }
@@ -370,6 +387,7 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
 
 std::span<const float> QwenGpuExecutor::CopyVerificationLogits(
     std::size_t row) {
+  CheckReset();
   if (row >= last_verification_rows_ || d_verification_logits_ == nullptr) {
     throw std::out_of_range("Qwen verification logit row is unavailable");
   }
@@ -392,6 +410,7 @@ void QwenGpuExecutor::SetPromptHiddenCapture(
 }
 
 std::span<const float> QwenGpuExecutor::CopyLastHidden() {
+  CheckReset();
   const std::size_t hidden_size = weights_.config.hidden_size;
   const std::size_t target_layer_count = arena_.GetTargetLayerCapture().size();
   if (target_layer_count > 0) {
@@ -418,7 +437,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::Generate(
     const std::function<bool(tokenization::TokenId, std::string_view)>&
         on_token) {
   next_token_.reset();
-  arena_.Reset();
+  Reset();
   return GenerateFromPrefix(prompt_tokens, 0, options, on_token);
 }
 
@@ -427,6 +446,7 @@ std::vector<tokenization::TokenId> QwenGpuExecutor::GenerateFromPrefix(
     std::size_t cached_prefix_tokens, const models::GenerationOptions& options,
     const std::function<bool(tokenization::TokenId, std::string_view)>&
         on_token) {
+  CheckReset();
   std::vector<tokenization::TokenId> output_tokens;
   if (prompt_tokens.empty()) {
     return output_tokens;

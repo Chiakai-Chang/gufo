@@ -29,6 +29,14 @@ public:
     Check(hipStreamSynchronize(stream_));
   }
 
+  void Copy2D(void* destination, std::size_t destination_pitch,
+              const void* source, std::size_t source_pitch, std::size_t width,
+              std::size_t height) {
+    Check(hipMemcpy2DAsync(destination, destination_pitch, source, source_pitch,
+                           width, height, hipMemcpyDeviceToHost, stream_));
+    Check(hipStreamSynchronize(stream_));
+  }
+
 private:
   static void Check(hipError_t status) {
     if (status != hipSuccess)

@@ -143,18 +143,26 @@ public:
                                 DecodeResult* result,
                                 std::string* error_msg = nullptr,
                                 bool stop_at_eos = true);
+  struct BatchOutcome {
+    bool completed{false};
+    std::string error{};
+  };
   struct DecodeRequest {
     Session* session;
     std::size_t max_tokens;
     sampling::SamplerState* sampler;
     DecodeResult* result;
     bool stop_at_eos{true};
+    BatchOutcome* outcome{nullptr};
   };
+  /// A false return may include completed peers. Inspect each outcome; only
+  /// sessions whose persistent state was partly mutated become invalid.
   [[nodiscard]] static bool DecodeBatch(std::span<const DecodeRequest> requests,
                                         std::string* error_msg = nullptr);
   struct AdvanceRequest {
     Session* session;
     std::int32_t token;
+    BatchOutcome* outcome{nullptr};
   };
   [[nodiscard]] static bool EvaluateBatch(
       std::span<const AdvanceRequest> requests,
@@ -217,6 +225,13 @@ private:
   bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
                    std::int32_t* hidden_row, std::string* error_msg) const;
   static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
+                                std::string* error_msg);
+  template<class Request>
+  static bool RunIsolatedBatch(std::span<const Request> requests,
+                               std::string* error_msg);
+  static bool DecodeBatchImpl(std::span<const DecodeRequest> requests,
+                              std::string* error_msg);
+  static bool EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg);
   struct PendingDecode;
   bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,

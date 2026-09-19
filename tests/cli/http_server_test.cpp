@@ -6,9 +6,11 @@
 
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <semaphore>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -44,10 +46,21 @@ public:
   }
   Result complete(std::string_view prompt, std::size_t limit,
                   const gufo::sampling::SamplingConfig& sampling,
-                  const CancellationCheck&,
+                  const CancellationCheck& cancel,
                   const TokenCallback& token) override {
     ++calls;
     Result result;
+    if (wait_for_disconnect) {
+      entered.release();
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (!(disconnected = cancel && cancel()) &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      finished.release();
+      result.cancelled = disconnected;
+      return result;
+    }
     {
       const std::lock_guard lock(mutex_);
       last_ = {.prompt = std::string(prompt),
@@ -82,6 +95,10 @@ public:
     return result;
   }
   std::atomic<int> calls{0};
+  bool wait_for_disconnect{false};
+  std::atomic<bool> disconnected{false};
+  std::binary_semaphore entered{0};
+  std::binary_semaphore finished{0};
 
 private:
   std::mutex mutex_;
@@ -114,7 +131,7 @@ public:
     worker.join();
   }
 
-  std::string Send(std::string_view request) {
+  int Connect() {
     const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
     const timeval timeout{3, 0};
@@ -126,6 +143,10 @@ public:
     assert(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
     assert(::connect(fd, reinterpret_cast<const sockaddr*>(&address),
                      sizeof(address)) == 0);
+    return fd;
+  }
+  std::string Send(std::string_view request, bool half_close = false) {
+    const int fd = Connect();
     while (!request.empty()) {
       const auto count =
           ::send(fd, request.data(), request.size(), MSG_NOSIGNAL);
@@ -134,7 +155,8 @@ public:
     }
     // A half-close allows malformed/truncated-body tests to complete without
     // timing-dependent sleeps.
-    ::shutdown(fd, SHUT_WR);
+    if (half_close)
+      ::shutdown(fd, SHUT_WR);
     std::string response;
     char buffer[4096];
     for (;;) {
@@ -251,8 +273,9 @@ void TestFramingAndMetrics() {
   }
   ExpectStatus(server.Send("POST /echo\r\n\r\n"), 400);
   ExpectStatus(server.Send("POST /echo HTTP/1.1 extra\r\n\r\n"), 400);
-  ExpectStatus(server.Send("POST /echo HTTP/1.1\r\nContent-Length: 4\r\n\r\nx"),
-               400);
+  ExpectStatus(
+      server.Send("POST /echo HTTP/1.1\r\nContent-Length: 4\r\n\r\nx", true),
+      400);
   ExpectStatus(
       server.Send("POST /echo HTTP/1.1\r\nContent-Length: 8193\r\n\r\n"), 413);
   const std::string payload(5000, 'x');
@@ -441,6 +464,23 @@ void TestQueryParameters() {
   assert(request.query_param("empty").empty());
 }
 
+void TestPeerDisconnect() {
+  RunningServer server;
+  server.backend->wait_for_disconnect = true;
+  const int fd = server.Connect();
+  const std::string body = R"({"prompt":"hi","max_tokens":128})";
+  const std::string request =
+      "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n"
+      "Content-Type: application/json\r\nContent-Length: " +
+      std::to_string(body.size()) + "\r\n\r\n" + body;
+  assert(::send(fd, request.data(), request.size(), MSG_NOSIGNAL) ==
+         static_cast<ssize_t>(request.size()));
+  assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
+  ::close(fd);
+  assert(server.backend->finished.try_acquire_for(std::chrono::seconds(2)));
+  assert(server.backend->disconnected);
+}
+
 }  // namespace
 
 int main() {
@@ -451,5 +491,6 @@ int main() {
   TestFramingAndMetrics();
   TestCompatibilityRequests();
   TestCompatibilityUtf8();
+  TestPeerDisconnect();
   std::cout << "HTTP transport checks passed.\n";
 }

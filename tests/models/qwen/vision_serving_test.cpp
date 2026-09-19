@@ -167,6 +167,21 @@ void CheckQwenIncrementalOracle(
             << " total=" << tokens.size() << '\n';
   Require(generated == cached.tokens,
           "Qwen snapshot changed incremental inference");
+
+  // Separate chunk invariance from replaying a generation history: BF16 BLAS
+  // selected different reductions for the two batch shapes despite identical
+  // normed rows, which amplified into different continuation tokens.
+  incremental.Reset();
+  (void)incremental.ForwardPromptBatch(tokens.first(previous.prompt_tokens));
+  (void)incremental.ForwardPromptBatch(tokens.subspan(previous.prompt_tokens),
+                                       previous.prompt_tokens);
+  const auto split_logits = incremental.CopyLastLogits();
+  const std::vector<float> expected(split_logits.begin(), split_logits.end());
+  incremental.Reset();
+  (void)incremental.ForwardPromptBatch(tokens);
+  const auto cold_logits = incremental.CopyLastLogits();
+  Require(std::ranges::equal(expected, cold_logits),
+          "Qwen image prefill logits changed with chunk boundaries");
 }
 }  // namespace
 
@@ -394,6 +409,8 @@ int main(int argc, char** argv) {
                 "disk-restored image state or identity differs");
       }
       const auto result = restored->chat(continuation, 16, greedy);
+      Require(result.cached_prompt_tokens > red.prompt_tokens,
+              "continued image check must reuse generated history");
       if (!flash)
         CheckQwenIncrementalOracle(qwen, continuation, red, result);
       if (flash || !disk_only)

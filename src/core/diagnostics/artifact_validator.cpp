@@ -1,257 +1,199 @@
 #include "src/core/diagnostics/artifact_validator.h"
 
-#include <cstdlib>
+#include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <sstream>
 
 #include "src/core/diagnostics/fingerprint.h"
+#include "src/core/json.hpp"
 
 namespace gufo::diagnostics {
 
 namespace {
 
-std::string ExtractJsonStringField(std::string_view content,
-                                   std::string_view field_name) {
-  const std::string needle = "\"" + std::string(field_name) + "\"";
-  const auto pos = content.find(needle);
-  if (pos == std::string_view::npos) {
-    return {};
-  }
-  const auto colon_pos = content.find(':', pos + needle.size());
-  if (colon_pos == std::string_view::npos) {
-    return {};
-  }
-  const auto quote_start = content.find('"', colon_pos + 1);
-  if (quote_start == std::string_view::npos) {
-    return {};
-  }
-  const auto quote_end = content.find('"', quote_start + 1);
-  if (quote_end == std::string_view::npos) {
-    return {};
-  }
-  return std::string(
-      content.substr(quote_start + 1, quote_end - quote_start - 1));
+constexpr std::size_t kMaxArtifactBytes = 16 * 1024 * 1024;
+
+const json::Value& Object(const json::Value& parent, const std::string& name) {
+  const auto* value = parent.find(name);
+  if (!value || !value->is_object())
+    throw std::invalid_argument("Expected object '" + name + "'");
+  return *value;
 }
 
-std::uint64_t ExtractJsonUint64Field(std::string_view content,
-                                     std::string_view field_name) {
-  const std::string needle = "\"" + std::string(field_name) + "\"";
-  const auto pos = content.find(needle);
-  if (pos == std::string_view::npos) {
-    return 0;
-  }
-  const auto colon_pos = content.find(':', pos + needle.size());
-  if (colon_pos == std::string_view::npos) {
-    return 0;
-  }
-  const auto num_start = content.find_first_of("0123456789", colon_pos + 1);
-  if (num_start == std::string_view::npos) {
-    return 0;
-  }
-  const auto num_end = content.find_first_not_of("0123456789", num_start);
-  const std::string num_str =
-      num_end == std::string_view::npos
-          ? std::string(content.substr(num_start))
-          : std::string(content.substr(num_start, num_end - num_start));
-  return std::strtoull(num_str.c_str(), nullptr, 10);
+std::string String(const json::Value& object, const std::string& name) {
+  const auto* value = object.find(name);
+  if (!value || !value->is_string())
+    throw std::invalid_argument("Expected string '" + name + "'");
+  return value->str();
 }
 
-bool ExtractJsonBoolField(std::string_view content, std::string_view field_name,
-                          bool fallback) {
-  const std::string needle = "\"" + std::string(field_name) + "\"";
-  const auto pos = content.find(needle);
-  if (pos == std::string_view::npos) {
-    return fallback;
-  }
-  const auto colon_pos = content.find(':', pos + needle.size());
-  if (colon_pos == std::string_view::npos) {
-    return fallback;
-  }
-  const auto value_pos = content.find_first_not_of(" \t\r\n", colon_pos + 1);
-  if (value_pos == std::string_view::npos) {
-    return fallback;
-  }
-  if (content.substr(value_pos, 4) == "true") {
-    return true;
-  }
-  if (content.substr(value_pos, 5) == "false") {
-    return false;
-  }
-  return fallback;
+std::uint64_t Uint(const json::Value& object, const std::string& name,
+                   std::uint64_t maximum = 9007199254740991ULL) {
+  const auto* value = object.find(name);
+  if (!value || !value->is_number() || value->as_double() < 0 ||
+      value->as_double() > static_cast<double>(maximum) ||
+      std::floor(value->as_double()) != value->as_double())
+    throw std::invalid_argument("Expected bounded unsigned integer '" + name +
+                                "'");
+  return static_cast<std::uint64_t>(value->as_double());
 }
 
-std::string EscapeJsonString(std::string_view str) {
-  std::ostringstream oss;
-  for (const char character : str) {
-    if (character == '"') {
-      oss << "\\\"";
-    } else if (character == '\\') {
-      oss << "\\\\";
-    } else if (character == '\n') {
-      oss << "\\n";
-    } else if (character == '\t') {
-      oss << "\\t";
-    } else {
-      oss << character;
-    }
-  }
-  return oss.str();
+bool Boolean(const json::Value& object, const std::string& name) {
+  const auto* value = object.find(name);
+  if (!value || !value->is_bool())
+    throw std::invalid_argument("Expected boolean '" + name + "'");
+  return value->as_bool();
+}
+
+bool IsSha256(std::string_view value) {
+  return value.size() == 64 &&
+         std::all_of(value.begin(), value.end(), [](char c) {
+           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+         });
+}
+
+bool ContainsLocalMetadata(const json::Value& value) {
+  if (value.is_string())
+    return value.str().find("/home/") != std::string::npos;
+  for (const auto& [name, member] : value.members())
+    if (name == "hostname" || name == "username" || name == "secret" ||
+        ContainsLocalMetadata(member))
+      return true;
+  for (const auto& item : value.items())
+    if (ContainsLocalMetadata(item))
+      return true;
+  return false;
 }
 
 }  // namespace
 
 ValidationResult ValidateArtifactContent(std::string_view content) {
   ValidationResult res;
-
-  if (content.empty()) {
+  const auto fail = [&](std::string error) {
     res.is_valid = false;
-    res.errors.emplace_back("Artifact is empty");
-    return res;
+    res.errors.push_back(std::move(error));
+  };
+  try {
+    if (content.size() > kMaxArtifactBytes)
+      throw std::invalid_argument("Artifact exceeds the 16 MiB limit");
+    const auto root = json::parse(content);
+    if (!root.is_object())
+      throw std::invalid_argument("Artifact must be a JSON object");
+    res.schema_version = String(root, "schemaVersion");
+    if (res.schema_version != "1.0.0")
+      fail("Unsupported schema version: " + res.schema_version);
+    res.fingerprint_id = String(root, "fingerprintId");
+    if (!IsSha256(res.fingerprint_id))
+      fail("Invalid fingerprintId: expected a lowercase hexadecimal SHA-256");
+    const auto check_architecture = [&](const json::Value& object) {
+      if (object.contains("gpuArchitecture")) {
+        const auto arch = String(object, "gpuArchitecture");
+        if (!arch.empty() && arch != "gfx1151")
+          fail("Incompatible GPU architecture: " + arch);
+      }
+      if (object.contains("npuArchitecture")) {
+        const auto arch = String(object, "npuArchitecture");
+        if (!arch.empty() && arch != "XDNA2" && arch != "AIE2P")
+          fail("Incompatible NPU architecture: " + arch);
+      }
+    };
+    check_architecture(root);
+    if (root.contains("machine"))
+      check_architecture(Object(root, "machine"));
+    if (root.contains("canonical")) {
+      const auto& block = Object(root, "canonical");
+      CanonicalFingerprint canonical;
+      canonical.schema_version = String(block, "schemaVersion");
+      canonical.cpp_standard = String(block, "cppStandard");
+      canonical.cpu_architecture = String(block, "cpuArchitecture");
+      canonical.cpu_logical_cores = static_cast<std::uint32_t>(
+          Uint(block, "cpuLogicalCores", UINT32_MAX));
+      canonical.cpu_model = String(block, "cpuModel");
+      canonical.cpu_physical_cores = static_cast<std::uint32_t>(
+          Uint(block, "cpuPhysicalCores", UINT32_MAX));
+      canonical.cxx_compiler = String(block, "cxxCompiler");
+      canonical.gpu_architecture = String(block, "gpuArchitecture");
+      canonical.gpu_compute_units = static_cast<std::uint32_t>(
+          Uint(block, "gpuComputeUnits", UINT32_MAX));
+      canonical.gpu_driver = String(block, "gpuDriver");
+      canonical.gpu_name = String(block, "gpuName");
+      canonical.gpu_pci_id = String(block, "gpuPciId");
+      canonical.kernel_release = String(block, "kernelRelease");
+      canonical.memory_total_bytes = Uint(block, "memoryTotalBytes");
+      canonical.memory_type = String(block, "memoryType");
+      canonical.npu_architecture = String(block, "npuArchitecture");
+      canonical.npu_driver = String(block, "npuDriver");
+      canonical.npu_firmware_version = String(block, "npuFirmwareVersion");
+      canonical.npu_identity = String(block, "npuIdentity");
+      canonical.npu_pci_id = String(block, "npuPciId");
+      canonical.rocm_version = String(block, "rocmVersion");
+      canonical.xrt_commit = String(block, "xrtCommit");
+
+      if (canonical.schema_version != res.schema_version)
+        fail("Canonical schemaVersion does not match the artifact");
+      if (canonical.ComputeFingerprintId() != res.fingerprint_id)
+        fail("Fingerprint ID mismatch over canonical fields");
+      check_architecture(block);
+    }
+    const auto type =
+        root.contains("artifactType") ? String(root, "artifactType") : "";
+    if (type == "xrtSmoke") {
+      const auto& program = Object(root, "program");
+      if (!IsSha256(String(program, "programSha256")))
+        fail("Invalid XRT smoke programSha256");
+      const auto& result = Object(root, "result");
+      const auto iterations = Uint(result, "iterations");
+      if (iterations == 0 || Uint(result, "completedIterations") != iterations)
+        fail("XRT smoke did not complete every requested iteration");
+      if (String(result, "status") != "completed" ||
+          String(result, "completionStatus") != "completed" ||
+          Boolean(result, "quarantined"))
+        fail("XRT smoke did not complete successfully");
+      check_architecture(Object(root, "context"));
+    } else if (type == "hipAllocation") {
+      const auto& summary = Object(root, "summary");
+      if (!Boolean(summary, "allRequestedPathsReported") ||
+          !Boolean(summary, "checksumsVerified") ||
+          !Boolean(summary, "phasesSeparated") ||
+          String(summary, "status") != "completed")
+        fail("HIP allocation diagnostic did not complete all paths and checks");
+    }
+    if (!type.empty() && type != "xrtSmoke" && type != "hipAllocation")
+      fail("Unknown diagnostic artifactType: " + type);
+    if (type.empty() && !root.contains("canonical")) {
+      // Bandwidth artifacts reference a fingerprint rather than embedding it.
+      // Recognize their structure; schemaVersion and an arbitrary hash alone
+      // are not a diagnostic artifact.
+      const auto& options = Object(root, "options");
+      (void)Uint(options, "warmup");
+      (void)Uint(options, "repetitions");
+      (void)Uint(options, "durationMs");
+      (void)Uint(options, "workingSetBytes");
+      const auto* paths = root.find("paths");
+      if (!paths || !paths->is_array())
+        throw std::invalid_argument("Expected bandwidth paths array");
+      for (const auto& path : paths->items()) {
+        if (!path.is_object())
+          throw std::invalid_argument("Expected bandwidth path object");
+        (void)String(path, "backend");
+        (void)String(path, "pathName");
+        (void)Boolean(path, "sentinelVerified");
+        (void)Uint(path, "workingSetBytes");
+        const auto* samples = path.find("rawRepetitionsGbps");
+        if (!samples || !samples->is_array())
+          throw std::invalid_argument("Expected bandwidth samples array");
+        for (const auto& sample : samples->items())
+          if (!sample.is_number() || sample.as_double() < 0)
+            throw std::invalid_argument("Invalid bandwidth sample");
+      }
+    }
+    if (ContainsLocalMetadata(root))
+      res.warnings.emplace_back(
+          "Artifact contains unredacted local host metadata or paths");
+  } catch (const std::exception& exception) {
+    fail(exception.what());
   }
-
-  // 1. Check schemaVersion
-  res.schema_version = ExtractJsonStringField(content, "schemaVersion");
-  if (res.schema_version.empty()) {
-    res.is_valid = false;
-    res.errors.emplace_back("Missing 'schemaVersion' field in artifact");
-  } else if (res.schema_version != "1.0.0") {
-    res.is_valid = false;
-    res.errors.emplace_back("Unsupported schema version: " +
-                            res.schema_version + " (expected 1.0.0)");
-  }
-
-  // 2. Check fingerprintId
-  res.fingerprint_id = ExtractJsonStringField(content, "fingerprintId");
-  if (res.fingerprint_id.empty()) {
-    res.is_valid = false;
-    res.errors.emplace_back("Missing 'fingerprintId' binding in artifact");
-  } else if (res.fingerprint_id.size() != 64) {
-    res.is_valid = false;
-    res.errors.emplace_back(
-        "Invalid 'fingerprintId' format: expected 64-char hex SHA-256");
-  }
-
-  // 3. Extract and validate canonical block if present
-  const auto canonical_start = content.find("\"canonical\":");
-  if (canonical_start != std::string_view::npos) {
-    CanonicalFingerprint canonical;
-    canonical.schema_version = ExtractJsonStringField(content, "schemaVersion");
-    canonical.cpp_standard = ExtractJsonStringField(content, "cppStandard");
-    canonical.cpu_architecture =
-        ExtractJsonStringField(content, "cpuArchitecture");
-    canonical.cpu_logical_cores = static_cast<std::uint32_t>(
-        ExtractJsonUint64Field(content, "cpuLogicalCores"));
-    canonical.cpu_model = ExtractJsonStringField(content, "cpuModel");
-    canonical.cpu_physical_cores = static_cast<std::uint32_t>(
-        ExtractJsonUint64Field(content, "cpuPhysicalCores"));
-    canonical.cxx_compiler = ExtractJsonStringField(content, "cxxCompiler");
-    canonical.gpu_architecture =
-        ExtractJsonStringField(content, "gpuArchitecture");
-    canonical.gpu_compute_units = static_cast<std::uint32_t>(
-        ExtractJsonUint64Field(content, "gpuComputeUnits"));
-    canonical.gpu_driver = ExtractJsonStringField(content, "gpuDriver");
-    canonical.gpu_name = ExtractJsonStringField(content, "gpuName");
-    canonical.gpu_pci_id = ExtractJsonStringField(content, "gpuPciId");
-    canonical.kernel_release = ExtractJsonStringField(content, "kernelRelease");
-    canonical.memory_total_bytes =
-        ExtractJsonUint64Field(content, "memoryTotalBytes");
-    canonical.memory_type = ExtractJsonStringField(content, "memoryType");
-    canonical.npu_architecture =
-        ExtractJsonStringField(content, "npuArchitecture");
-    canonical.npu_driver = ExtractJsonStringField(content, "npuDriver");
-    canonical.npu_firmware_version =
-        ExtractJsonStringField(content, "npuFirmwareVersion");
-    canonical.npu_identity = ExtractJsonStringField(content, "npuIdentity");
-    canonical.npu_pci_id = ExtractJsonStringField(content, "npuPciId");
-    canonical.rocm_version = ExtractJsonStringField(content, "rocmVersion");
-    canonical.xrt_commit = ExtractJsonStringField(content, "xrtCommit");
-
-    const std::string computed_id = canonical.ComputeFingerprintId();
-
-    if (!res.fingerprint_id.empty() && res.fingerprint_id != computed_id) {
-      res.is_valid = false;
-      res.errors.emplace_back("Fingerprint ID mismatch: claimed '" +
-                              res.fingerprint_id + "', but computed '" +
-                              computed_id + "' over canonical fields");
-    }
-  }
-
-  // 4. Validate architecture
-  const std::string gpu_arch =
-      ExtractJsonStringField(content, "gpuArchitecture");
-  if (!gpu_arch.empty() && gpu_arch != "gfx1151") {
-    res.is_valid = false;
-    res.errors.emplace_back("Incompatible GPU architecture: " + gpu_arch +
-                            " (expected gfx1151)");
-  }
-
-  const std::string npu_arch =
-      ExtractJsonStringField(content, "npuArchitecture");
-  if (!npu_arch.empty() && npu_arch != "XDNA2" && npu_arch != "AIE2P") {
-    res.is_valid = false;
-    res.errors.emplace_back("Incompatible NPU architecture: " + npu_arch +
-                            " (expected XDNA2 or AIE2P)");
-  }
-
-  const std::string artifact_type =
-      ExtractJsonStringField(content, "artifactType");
-  if (artifact_type == "xrtSmoke") {
-    const std::string program_hash =
-        ExtractJsonStringField(content, "programSha256");
-    if (program_hash.size() != 64) {
-      res.is_valid = false;
-      res.errors.emplace_back(
-          "Invalid XRT smoke programSha256: expected 64-char SHA-256");
-    }
-    const auto iterations = ExtractJsonUint64Field(content, "iterations");
-    const auto completed =
-        ExtractJsonUint64Field(content, "completedIterations");
-    if (iterations == 0 || completed != iterations) {
-      res.is_valid = false;
-      res.errors.emplace_back(
-          "XRT smoke did not complete every requested iteration");
-    }
-    if (ExtractJsonStringField(content, "status") != "completed" ||
-        ExtractJsonStringField(content, "completionStatus") != "completed") {
-      res.is_valid = false;
-      res.errors.emplace_back("XRT smoke completion status is not successful");
-    }
-    if (ExtractJsonBoolField(content, "quarantined", true)) {
-      res.is_valid = false;
-      res.errors.emplace_back("XRT smoke context was quarantined");
-    }
-  } else if (artifact_type == "hipAllocation") {
-    if (!ExtractJsonBoolField(content, "allRequestedPathsReported", false)) {
-      res.is_valid = false;
-      res.errors.emplace_back(
-          "HIP allocation diagnostic omitted one or more requested paths");
-    }
-    if (!ExtractJsonBoolField(content, "checksumsVerified", false)) {
-      res.is_valid = false;
-      res.errors.emplace_back(
-          "HIP allocation diagnostic did not verify CPU/GPU checksums");
-    }
-    if (!ExtractJsonBoolField(content, "phasesSeparated", false)) {
-      res.is_valid = false;
-      res.errors.emplace_back(
-          "HIP allocation diagnostic did not keep benchmark phases separate");
-    }
-    if (ExtractJsonStringField(content, "status") != "completed") {
-      res.is_valid = false;
-      res.errors.emplace_back(
-          "HIP allocation diagnostic completion status is not successful");
-    }
-  }
-
-  // 5. Redaction and sensitive field checks
-  if (content.find("\"hostname\":") != std::string_view::npos ||
-      content.find("\"username\":") != std::string_view::npos ||
-      content.find("\"secret\":") != std::string_view::npos ||
-      content.find("/home/") != std::string_view::npos) {
-    res.warnings.emplace_back(
-        "Artifact contains unredacted local host metadata or paths");
-  }
-
   return res;
 }
 
@@ -264,52 +206,30 @@ ValidationResult ValidateArtifactFile(const std::filesystem::path& file_path) {
                             file_path.string());
     return res;
   }
-  std::stringstream buffer;
-  buffer << file.rdbuf();
-  return ValidateArtifactContent(buffer.str());
+  std::string content(kMaxArtifactBytes + 1, '\0');
+  file.read(content.data(), static_cast<std::streamsize>(content.size()));
+  content.resize(static_cast<std::size_t>(file.gcount()));
+  if (file.bad()) {
+    ValidationResult res;
+    res.is_valid = false;
+    res.errors.emplace_back("Could not read artifact file");
+    return res;
+  }
+  return ValidateArtifactContent(content);
 }
 
 std::string ValidationResult::ToJson() const {
-  std::ostringstream oss;
-  oss << "{\n";
-  oss << "  \"isValid\": " << (is_valid ? "true" : "false") << ",\n";
-  oss << "  \"schemaVersion\": \"" << EscapeJsonString(schema_version)
-      << "\",\n";
-  oss << "  \"fingerprintId\": \"" << EscapeJsonString(fingerprint_id)
-      << "\",\n";
-
-  oss << "  \"errors\": [";
-  if (!errors.empty()) {
-    oss << "\n";
-    for (std::size_t i = 0; i < errors.size(); ++i) {
-      oss << "    \"" << EscapeJsonString(errors[i]) << "\"";
-      if (i + 1 < errors.size()) {
-        oss << ",";
-      }
-      oss << "\n";
-    }
-    oss << "  ],\n";
-  } else {
-    oss << "],\n";
-  }
-
-  oss << "  \"warnings\": [";
-  if (!warnings.empty()) {
-    oss << "\n";
-    for (std::size_t i = 0; i < warnings.size(); ++i) {
-      oss << "    \"" << EscapeJsonString(warnings[i]) << "\"";
-      if (i + 1 < warnings.size()) {
-        oss << ",";
-      }
-      oss << "\n";
-    }
-    oss << "  ]\n";
-  } else {
-    oss << "]\n";
-  }
-
-  oss << "}\n";
-  return oss.str();
+  auto value = json::Value::object();
+  value["isValid"] = is_valid;
+  value["schemaVersion"] = schema_version;
+  value["fingerprintId"] = fingerprint_id;
+  value["errors"] = json::Value::array();
+  value["warnings"] = json::Value::array();
+  for (const auto& error : errors)
+    value["errors"].push_back(error);
+  for (const auto& warning : warnings)
+    value["warnings"].push_back(warning);
+  return value.dump() + "\n";
 }
 
 std::string ValidationResult::ToHuman() const {

@@ -186,10 +186,8 @@ void TestBatchedGEMM() {
   HIP_CHECK(hipFree(d_Y));
 }
 
-void TestExactBf16SmallBatchGEMM(std::size_t batch) {
-  constexpr std::size_t M = 65;
-  constexpr std::size_t K = 264;
-
+void TestExactBf16SmallBatchGEMM(std::size_t batch, std::size_t M = 65,
+                                 std::size_t K = 264) {
   std::vector<std::uint16_t> h_A(M * K);
   std::vector<float> h_X(batch * K);
   for (std::size_t index = 0; index < h_A.size(); ++index) {
@@ -419,6 +417,9 @@ int main() {
   for (std::size_t batch : {1, 2, 3, 4, 5, 6, 7, 8, 16}) {
     TestExactBf16SmallBatchGEMM(batch);
   }
+  for (const auto batch : {94U, 135U, 2048U})
+    TestExactBf16SmallBatchGEMM(batch, 1024, 5120);
+  TestExactBf16SmallBatchGEMM(135, 5120, 6144);
   TestHipblasGEMM();
   TestHipblasLtGEMM();
   std::cout << "Qwen dense GEMM and BLAS ops test passed on gfx1151.\n";

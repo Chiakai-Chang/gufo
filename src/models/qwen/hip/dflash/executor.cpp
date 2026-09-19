@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "src/core/hip/hip_utils.hpp"
+#include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
@@ -185,11 +186,12 @@ std::size_t QwenDFlashGpuSnapshot::SerializePersistent(
   PutLittleEndian<std::uint64_t>(destination, 56, history_capacity_);
 
   if (bytes_per_kind != 0) {
-    HIP_CHECK(hipMemcpy(destination.data() + kDFlashGpuPersistentHeaderBytes,
-                        d_k_, bytes_per_kind, hipMemcpyDeviceToHost));
-    HIP_CHECK(hipMemcpy(
+    SnapshotTransfer transfer;
+    transfer.Copy(destination.data() + kDFlashGpuPersistentHeaderBytes, d_k_,
+                  bytes_per_kind);
+    transfer.Copy(
         destination.data() + kDFlashGpuPersistentHeaderBytes + bytes_per_kind,
-        d_v_, bytes_per_kind, hipMemcpyDeviceToHost));
+        d_v_, bytes_per_kind);
   }
   return destination.size();
 }
@@ -776,22 +778,8 @@ void QwenDFlashGpuExecutor::RestorePersistentSnapshot(
 }
 
 void QwenDFlashGpuExecutor::Reset() noexcept {
+  // Attention only reads the valid prefix; new rows overwrite stale KV.
   injected_context_len_ = 0;
-  const std::size_t kv_dim =
-      static_cast<std::size_t>(model_->GetConfig().num_key_value_heads) *
-      model_->GetConfig().head_dim;
-  for (auto* ptr : d_injected_k_) {
-    if (ptr != nullptr) {
-      (void)hipMemsetAsync(ptr, 0, history_capacity_ * kv_dim * sizeof(float),
-                           stream_);
-    }
-  }
-  for (auto* ptr : d_injected_v_) {
-    if (ptr != nullptr) {
-      (void)hipMemsetAsync(ptr, 0, history_capacity_ * kv_dim * sizeof(float),
-                           stream_);
-    }
-  }
 }
 
 bool QwenDFlashGpuExecutor::InjectTargetContext(

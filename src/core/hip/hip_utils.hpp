@@ -5,9 +5,22 @@
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
 
-#include <iostream>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
+
+namespace gufo::hip {
+// Cleanup must not throw while another GPU failure is unwinding the request.
+inline void LogCleanupError(hipError_t error) noexcept {
+  if (error != hipSuccess)
+    std::fprintf(stderr, "HIP cleanup failed: %s\n", hipGetErrorString(error));
+}
+inline void LogCleanupError(hipblasStatus_t error) noexcept {
+  if (error != HIPBLAS_STATUS_SUCCESS)
+    std::fprintf(stderr, "hipBLAS cleanup failed: %d\n",
+                 static_cast<int>(error));
+}
+}  // namespace gufo::hip
 
 #define HIP_CHECK(call)                                                 \
   do {                                                                  \
@@ -16,7 +29,7 @@
       std::string msg = std::string("HIP error in ") + __FILE__ + ":" + \
                         std::to_string(__LINE__) +                      \
                         " (" #call "): " + hipGetErrorString(err);      \
-      std::cerr << msg << std::endl;                                    \
+      throw std::runtime_error(msg);                                    \
     }                                                                   \
   } while (0)
 
@@ -27,7 +40,7 @@
       std::string msg = std::string("hipBLAS error in ") + __FILE__ + ":" + \
                         std::to_string(__LINE__) +                          \
                         " (" #call "): " + std::to_string(status);          \
-      std::cerr << msg << std::endl;                                        \
+      throw std::runtime_error(msg);                                        \
     }                                                                       \
   } while (0)
 

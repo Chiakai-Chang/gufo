@@ -37,15 +37,8 @@ std::unique_ptr<QwenGenerator> QwenGenerator::CreateFromGguf(
 
   auto tokenizer =
       tokenization::QwenTokenizer::CreateFromGguf(reader, error_msg);
-  if (!tokenizer || tokenizer->GetVocabSize() <= 256) {
-    auto bin_tok = tokenization::QwenTokenizer::CreateFromBinaryFile(
-        "models/qwen_vocab.bin");
-    if (bin_tok) {
-      tokenizer = std::move(bin_tok);
-    } else if (!tokenizer) {
-      return nullptr;
-    }
-  }
+  if (!tokenizer)
+    return nullptr;
 
   const std::uint32_t context_len = weights_opt->config.context_length > 0
                                         ? weights_opt->config.context_length

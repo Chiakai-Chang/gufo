@@ -11,6 +11,7 @@
 #include "src/core/diagnostics/artifact_validator.h"
 #include "src/core/diagnostics/fingerprint.h"
 #include "src/core/diagnostics/system_inventory.h"
+#include "src/core/json.hpp"
 
 namespace {
 
@@ -91,6 +92,63 @@ void TestBandwidthReportJsonStructure() {
   Expect(val_res.is_valid, "BandwidthReport JSON is valid artifact");
 }
 
+void TestArtifactValidation() {
+  using gufo::diagnostics::ValidateArtifactContent;
+  gufo::diagnostics::MachineFingerprint fingerprint;
+  fingerprint.canonical.cpu_model = "a \"quoted\" CPU";
+  fingerprint.fingerprint_id = fingerprint.canonical.ComputeFingerprintId();
+  const auto valid = fingerprint.ToJson();
+  Expect(ValidateArtifactContent(valid).is_valid,
+         "escaped canonical fields validate");
+  for (const auto& text : {valid + "garbage", valid.substr(0, valid.size() - 3),
+                           std::string("[]"), std::string("null")})
+    Expect(!ValidateArtifactContent(text).is_valid,
+           "malformed artifact rejected");
+  auto root = gufo::json::parse(valid);
+  root["fingerprintId"] = std::string(64, 'z');
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "non-hex SHA rejected");
+  root = gufo::json::parse(valid);
+  root["schemaVersion"] = 1;
+  Expect(!ValidateArtifactContent(root.dump()).is_valid, "wrong type rejected");
+  root = gufo::json::parse(valid);
+  root["canonical"]["cpuLogicalCores"] = -1;
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "negative core count rejected");
+  root = gufo::json::parse(valid);
+  root["canonical"]["cpuLogicalCores"] = 4294967296.0;
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "overflowing core count rejected");
+  root = gufo::json::parse(valid);
+  root["cpuModel"] = "spoofed value outside canonical";
+  Expect(ValidateArtifactContent(root.dump()).is_valid,
+         "only canonical fields are hashed");
+  root["canonical"]["cpuModel"] = "tampered";
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "tampered canonical field rejected");
+  root = gufo::json::Value::object();
+  root["nested"] = gufo::json::parse(valid);
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "nested required fields rejected");
+  root = gufo::json::parse(valid);
+  root.append_member("fingerprintId", fingerprint.fingerprint_id);
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "duplicate key rejected");
+  root = gufo::json::parse(valid);
+  root["canonical"] = "not an object";
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "canonical must be an object");
+  root = gufo::json::Value::object();
+  root["schemaVersion"] = "1.0.0";
+  root["fingerprintId"] = fingerprint.fingerprint_id;
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "a schema and hash alone are not an artifact");
+  root = gufo::json::parse(valid);
+  root["artifactType"] = "unknown";
+  Expect(!ValidateArtifactContent(root.dump()).is_valid,
+         "unknown artifact type rejected");
+}
+
 void TestSchemaFileExists() {
   const auto schema_path = FindFixturesRoot() / "bandwidth_schema.json";
   Expect(std::filesystem::exists(schema_path),
@@ -110,6 +168,7 @@ int main() {
   TestCpuBandwidthCorrectness();
   TestBandwidthReportJsonStructure();
   TestSchemaFileExists();
+  TestArtifactValidation();
 
   std::cout << "All memory bandwidth tests passed successfully.\n";
   return 0;

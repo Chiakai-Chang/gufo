@@ -25,6 +25,16 @@ bool Check(hipError_t status, std::string* error) {
                                                  hipGetErrorString(status));
 }
 
+// A cancelled row stops touching its private state. Shared projections retain
+// their row layout so cancellation cannot change a peer's arithmetic/order.
+template<class Item>
+bool AnyActive(std::span<const Item> items) {
+  bool active = false;
+  for (const auto& item : items)
+    active |= item.session->CheckCancellation(nullptr);
+  return active;
+}
+
 WeightType EmbeddingType(core::GgmlType type) {
   switch (type) {
     case core::GgmlType::kBF16:
@@ -158,6 +168,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   }
   if (rows > options_.max_batch)
     return Fail(error, "MTP body batch exceeds executor capacity");
+  if (!AnyActive(items))
+    return true;
   if (items.size() == 1) {
     const auto& item = items.front();
     return MtpForward(*item.session, item.tokens, item.hidden_row, {}, error);
@@ -181,6 +193,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   const Scratch base = s_;
   const auto& l = model_->mtp();
   const auto body = [&]() {
+    if (!AnyActive(items))
+      return true;
     if (!Check(hipMemcpyAsync(base.tokens, tokens_host_,
                               rows * sizeof(std::int32_t),
                               hipMemcpyHostToDevice, stream_),
@@ -256,6 +270,16 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       if (l.attn_qkv.empty())
         view.qg = base.qg + std::size_t{offsets[i]} * 2 * c.AttentionQDim();
       UseScratch(view);
+      if (!session.CheckCancellation(nullptr)) {
+        if (!Check(hipMemsetAsync(
+                       s_.ctx, 0,
+                       std::size_t{n} * c.AttentionQDim() * sizeof(float),
+                       stream_),
+                   error))
+          return false;
+        continue;
+      }
+      ++session.mutation_epoch_;
       Session::AttentionState attention;
       attention.rope = session.vision_input_.rope();
       attention.k_cache = session.mtp_.k_cache;
@@ -281,6 +305,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       if (!HcMix(l.hc_ffn, s_.mtp_res, true, s_.mixed, s_.inject, n, error))
         return false;
     }
+    if (!AnyActive(items))
+      return true;
     for (std::uint32_t row = 0; row < rows; row += kDecodeRows) {
       UseScratch(RowScratch(base, row));
       if (!Moe(l, s_.mixed, s_.block_out, std::min(kDecodeRows, rows - row),
@@ -291,6 +317,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
       UseScratch(RowScratch(base, offsets[i]));
       Combine(s_.mtp_res, nullptr, n);
+      if (!items[i].session->CheckCancellation(nullptr))
+        continue;
       if (!Check(hipMemcpyAsync(items[i].session->mtp_.h,
                                 s_.mtp_res + std::size_t{n - 1} * c.HcDim(),
                                 c.HcDim() * sizeof(float),
@@ -300,12 +328,21 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     }
     return true;
   };
-  const bool ok = body();
+  bool ok = false;
+  try {
+    ok = body();
+  } catch (...) {
+    (void)hipStreamSynchronize(stream_);
+    UseScratch(base);
+    throw;
+  }
   const auto status = hipStreamSynchronize(stream_);
   UseScratch(base);
   if (!ok || !Check(status, error))
     return false;
   for (const auto& item : items) {
+    if (item.session->Cancelled())
+      continue;
     item.session->mtp_.position += item.tokens.size();
     if (item.session->mtp_.position > c.indexer_top_k)
       item.session->mtp_.blocks =
@@ -342,8 +379,12 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   }
   const auto& output = model_->output();
   const auto& head = model_->mtp().nextn_head;
+  if (!AnyActive(items))
+    return true;
   if (items.size() == 1) {
     for (const auto& item : items) {
+      if (!item.session->CheckCancellation(nullptr))
+        continue;
       if (!MtpHead(head, item.session->mtp_.h, item.output.token != nullptr,
                    item.output.candidates != nullptr, error) ||
           !Check(hipStreamSynchronize(stream_), error)) {
@@ -371,6 +412,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   const auto count = std::min<std::size_t>(output.rows, kMtpCandidates);
   const Scratch base = s_;
   const auto body = [&]() {
+    if (!AnyActive(items))
+      return true;
     for (std::uint32_t i = 0; i < n; ++i) {
       UseScratch(RowScratch(base, i));
       if (!HcMix(head, items[i].session->mtp_.h, false, s_.mixed, nullptr, 1,
@@ -379,9 +422,13 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       }
     }
     UseScratch(base);
+    if (!AnyActive(items))
+      return true;
     if (!DenseBatch(output, base.mixed, batch_logits_, n, error))
       return false;
     for (std::uint32_t i = 0; i < n; ++i) {
+      if (!items[i].session->CheckCancellation(nullptr))
+        continue;
       if (items[i].output.candidates == nullptr) {
         Argmax(batch_logits_ + std::size_t(i) * output.rows, s_.mtp_argmax,
                s_.mtp_token, 1, output.rows, stream_);
@@ -405,12 +452,21 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     }
     return true;
   };
-  const bool ok = body();
+  bool ok = false;
+  try {
+    ok = body();
+  } catch (...) {
+    (void)hipStreamSynchronize(stream_);
+    UseScratch(base);
+    throw;
+  }
   const auto status = hipStreamSynchronize(stream_);
   UseScratch(base);
   if (!ok || !Check(status, error))
     return false;
   for (std::size_t i = 0; i < items.size(); ++i) {
+    if (items[i].session->Cancelled())
+      continue;
     if (items[i].output.token != nullptr)
       *items[i].output.token = batch_candidates_host_[i].ids[0];
     if (items[i].output.candidates != nullptr)
@@ -499,6 +555,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   if (rows > options_.max_batch) {
     return Fail(error, "decode batch exceeds executor capacity");
   }
+  if (!AnyActive(items))
+    return true;
   for (const auto& item : items) {
     if (item.speculative &&
         !EnsureRollback(*item.session, item.tokens.size() - 1, error))
@@ -520,6 +578,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     auto& session = *item.session;
+    ++session.mutation_epoch_;
     session.spec_base_ = session.position_;
     session.spec_tokens_ = item.speculative ? item.tokens.size() : 0;
     batch_controls_[i] = {session.position_, session.blocks_,
@@ -552,6 +611,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   // Every exit restores the ordinary single-session scratch view. Enqueued
   // work is drained before a caller can reuse its pinned staging buffers.
   const auto body = [&]() -> bool {
+    if (!AnyActive(items))
+      return true;
     for (std::size_t i = 0; i < items.size(); ++i) {
       if (!Check(hipMemcpyAsync(items[i].session->control_, batch_controls_ + i,
                                 sizeof(Session::Control), hipMemcpyHostToDevice,
@@ -578,6 +639,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     const auto& layers = model_->layers();
     bool normed = false;
     for (std::uint32_t il = 0; il < c.num_layers; ++il) {
+      if (!AnyActive(items))
+        return true;
       const auto& l = layers[il];
       if (c.IsPleLayer(il)) {
         if (!WaitPle(error) ||
@@ -593,8 +656,9 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         const auto& item = items[i];
         const auto n = static_cast<std::uint32_t>(item.tokens.size());
         UseScratch(RowScratch(base, offsets[i]));
-        if ((c.IsPleLayer(il) && !Ple(l, *item.session, n, s_.res,
-                                      item.speculative, error, true)) ||
+        if ((!item.session->Cancelled() && c.IsPleLayer(il) &&
+             !Ple(l, *item.session, n, s_.res, item.speculative, error,
+                  true)) ||
             !HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error)) {
           return false;
         }
@@ -633,6 +697,16 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                                   c.AttentionQDim();
         }
         UseScratch(view);
+        if (!session.CheckCancellation(nullptr)) {
+          auto* output = l.linear ? s_.gdn_out : s_.ctx;
+          const auto width = l.linear ? c.SsmValueDim() : c.AttentionQDim();
+          if (!Check(hipMemsetAsync(output, 0,
+                                    std::size_t{n} * width * sizeof(float),
+                                    stream_),
+                     error))
+            return false;
+          continue;
+        }
         if (l.linear) {
           if (!LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out,
                                n, item.speculative, error, true, false)) {
@@ -685,7 +759,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
       UseScratch(RowScratch(base, offsets[i]));
-      if (items[i].session->mtp_enabled_ &&
+      if (!items[i].session->Cancelled() && items[i].session->mtp_enabled_ &&
           !Check(hipMemcpyAsync(
                      items[i].session->mtp_.target_hidden, s_.res,
                      static_cast<std::size_t>(n) * c.HcDim() * sizeof(float),
@@ -701,13 +775,22 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     UseScratch(base);
     return DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
   };
-  const bool ok = body();
+  bool ok = false;
+  try {
+    ok = body();
+  } catch (...) {
+    (void)hipStreamSynchronize(stream_);
+    UseScratch(base);
+    throw;
+  }
   const auto status = hipStreamSynchronize(stream_);
   UseScratch(base);
   if (!ok || !Check(status, error)) {
     return false;
   }
   for (std::size_t i = 0; i < items.size(); ++i) {
+    if (items[i].session->Cancelled())
+      continue;
     items[i].session->position_ += items[i].tokens.size();
     if (sparse[i]) {
       items[i].session->blocks_ = complete[i];

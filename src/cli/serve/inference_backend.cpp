@@ -281,6 +281,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
            << tokenization::QwenChatTemplate::OfficialTemplateSha256() << '\n'
            << "state_abi=" << state_abi << '\n'
            << "payload_layout=qwen-gfx1151-live-prefix-v2\n"
+           << "numerics=qwen-bf16-fp32-prefill-v1\n"
            << "kv_storage="
            << (execution_policy.UsesFp16AttentionKv() ? "fp16" : "fp32") << '\n'
            << "recurrent_storage="
@@ -2371,6 +2372,7 @@ public:
     if (advances.size() < 2) {
       return TextModelRunner::AdvanceBatch(advances);
     }
+    std::vector<QwenFlashNextSession::BatchOutcome> outcomes(advances.size());
     std::vector<QwenFlashNextSession::AdvanceRequest> requests;
     for (const auto& advance : advances) {
       if (advance.token > static_cast<TextRunnerToken>(
@@ -2379,16 +2381,21 @@ public:
       }
       requests.push_back(
           {&RequireQwenFlashNextState(advance.state.get()).session(),
-           static_cast<std::int32_t>(advance.token)});
+           static_cast<std::int32_t>(advance.token),
+           &outcomes[requests.size()]});
     }
     std::string error;
-    if (!QwenFlashNextSession::EvaluateBatch(requests, &error)) {
-      for (const auto& advance : advances) {
-        RequireQwenFlashNextState(advance.state.get()).Invalidate();
+    (void)QwenFlashNextSession::EvaluateBatch(requests, &error);
+    for (std::size_t i = 0; i < advances.size(); ++i) {
+      const auto& advance = advances[i];
+      if (!outcomes[i].completed) {
+        auto failure = std::make_exception_ptr(std::runtime_error(
+            "Flash-Next advance failed: " + outcomes[i].error));
+        if (!advance.failure)
+          std::rethrow_exception(failure);
+        *advance.failure = failure;
+        continue;
       }
-      throw std::runtime_error("Flash-Next batched advance failed: " + error);
-    }
-    for (const auto& advance : advances) {
       auto& state = RequireQwenFlashNextState(advance.state.get());
       state.set_position(state.session().Position());
     }
@@ -2402,6 +2409,7 @@ public:
     const auto count = decodes.size();
     std::vector<sampling::SamplerState> samplers;
     std::vector<QwenFlashNextSession::DecodeResult> results(count);
+    std::vector<QwenFlashNextSession::BatchOutcome> outcomes(count);
     std::vector<QwenFlashNextSession::SpeculativeStats> before;
     std::vector<QwenFlashNextSession::DecodeRequest> requests;
     samplers.reserve(count);
@@ -2416,20 +2424,20 @@ public:
           {&session,
            std::min<std::size_t>(decodes[i].max_tokens,
                                  std::uint64_t{max_draft_tokens_} + 1),
-           &sampler, &results[i]});
+           &sampler, &results[i], true, &outcomes[i]});
     }
     std::string error;
-    if (!QwenFlashNextSession::DecodeBatch(requests, &error)) {
-      for (const auto& decode : decodes) {
-        RequireQwenFlashNextState(decode.state.get()).Invalidate();
-      }
-      throw std::runtime_error("Flash-Next batched MTP failed: " + error);
-    }
+    (void)QwenFlashNextSession::DecodeBatch(requests, &error);
     const auto active_count = static_cast<std::size_t>(std::count_if(
         results.begin(), results.end(),
         [](const auto& result) { return !result.tokens.empty(); }));
     std::vector<TextDecodeStep> steps(count);
     for (std::size_t i = 0; i < count; ++i) {
+      if (!outcomes[i].completed) {
+        steps[i].failure = std::make_exception_ptr(
+            std::runtime_error("Flash-Next MTP failed: " + outcomes[i].error));
+        continue;
+      }
       auto& state = RequireQwenFlashNextState(decodes[i].state.get());
       decodes[i].sampler.get().CopyDrawStateFrom(samplers[i]);
       state.set_position(state.session().Position());

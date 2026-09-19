@@ -31,8 +31,7 @@ enum class QwenGemmRoute : std::uint8_t {
   kHipBf16Baseline512,
   kHipBf16Wave32Single,
   kHipPrefillF32Blas,
-  kHipPrefillBf16Blas,
-  kHipPrefillBf16LtTryThenBlas,
+  kHipPrefillBf16Fp32,
   kHipPrefillQuantDirect,
 };
 
@@ -101,17 +100,12 @@ struct QwenGemmFormatCapabilities {
   return {};
 }
 
-struct QwenGemmCapabilities {
-  bool can_try_hipblaslt{false};
-};
-
 struct QwenGemmRequest {
   core::GgmlType type{core::GgmlType::kF32};
   std::size_t batch_size{1};
   std::size_t m{0};
   std::size_t k{0};
   QwenGemmMode mode{QwenGemmMode::kCpu};
-  QwenGemmCapabilities capabilities{};
 };
 
 [[nodiscard]] constexpr std::string_view QwenGemmRouteName(
@@ -138,10 +132,9 @@ struct QwenGemmRequest {
     case QwenGemmRoute::kHipBf16Wave32Single:
       return "wave32_single_row";
     case QwenGemmRoute::kHipPrefillF32Blas:
-    case QwenGemmRoute::kHipPrefillBf16Blas:
       return "hipblas";
-    case QwenGemmRoute::kHipPrefillBf16LtTryThenBlas:
-      return "hipblaslt_try_then_hipblas";
+    case QwenGemmRoute::kHipPrefillBf16Fp32:
+      return "bf16_fp32";
   }
   return "unknown";
 }
@@ -229,11 +222,7 @@ struct QwenGemmResolution {
     if (request.type == core::GgmlType::kF32) {
       return {.route = QwenGemmRoute::kHipPrefillF32Blas};
     }
-    if (request.capabilities.can_try_hipblaslt && request.m >= 1024 &&
-        request.k >= 1024) {
-      return {.route = QwenGemmRoute::kHipPrefillBf16LtTryThenBlas};
-    }
-    return {.route = QwenGemmRoute::kHipPrefillBf16Blas};
+    return {.route = QwenGemmRoute::kHipPrefillBf16Fp32};
   }
 
   if (format.quantized) {

@@ -96,6 +96,17 @@ public:
   void SetRngState(std::uint64_t state) noexcept;
   /// Publish RNG and any deferred draw without accepting tentative history.
   void CopyDrawStateFrom(const SamplerState& other) noexcept;
+  struct DrawState {
+    std::uint64_t rng;
+    std::optional<TokenId> pending;
+  };
+  [[nodiscard]] DrawState SaveDrawState() const noexcept {
+    return {rng_state_, pending_sample_};
+  }
+  void RestoreDrawState(DrawState state) noexcept {
+    rng_state_ = state.rng;
+    pending_sample_ = state.pending;
+  }
 
   /// Starts a request: tokens initialize repetition only; generated counts
   /// reset.

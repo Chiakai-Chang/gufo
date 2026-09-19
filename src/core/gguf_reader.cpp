@@ -7,10 +7,12 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -23,6 +25,8 @@
 #include <variant>
 #include <vector>
 
+#include "src/core/quant/ggml_dequant.hpp"
+
 namespace gufo::core {
 
 namespace {
@@ -32,7 +36,7 @@ constexpr std::array<char, 4> kGgufMagic = {'G', 'G', 'U', 'F'};
 template<typename T>
 bool ReadPod(const std::uint8_t* data, std::size_t size, std::size_t& offset,
              T& out) {
-  if (offset + sizeof(T) > size) {
+  if (offset > size || sizeof(T) > size - offset) {
     return false;
   }
   std::memcpy(&out, data + offset, sizeof(T));
@@ -46,7 +50,7 @@ bool ReadString(const std::uint8_t* data, std::size_t size, std::size_t& offset,
   if (!ReadPod(data, size, offset, len)) {
     return false;
   }
-  if (offset + len > size) {
+  if (offset > size || len > size - offset) {
     return false;
   }
   out = std::string_view(reinterpret_cast<const char*>(data + offset), len);
@@ -124,6 +128,13 @@ std::unique_ptr<GgufReader> GgufReader::OpenFile(
   }
 
   const auto split_count = first->GetMetadataUint32("split.count").value_or(1U);
+  if (first->FindMetadata("split.count") &&
+      (!first->GetMetadataUint32("split.count") || split_count == 0 ||
+       split_count > 65535)) {
+    if (error_msg)
+      *error_msg = "Invalid GGUF split count";
+    return nullptr;
+  }
   if (split_count <= 1) {
     return first;
   }
@@ -167,7 +178,15 @@ std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
   reader->fd_ = fd;
   reader->owns_mmap_ = true;
 
-  if (!reader->ParseHeaders(error_msg)) {
+  try {
+    if (!reader->ParseHeaders(error_msg)) {
+      if (error_msg && error_msg->empty())
+        *error_msg = "Malformed or truncated GGUF";
+      return nullptr;
+    }
+  } catch (const std::bad_alloc&) {
+    if (error_msg)
+      *error_msg = "Insufficient memory for GGUF descriptors";
     return nullptr;
   }
   reader->mapped_regions_.push_back(
@@ -254,13 +273,27 @@ std::unique_ptr<GgufReader> GgufReader::OpenSplitFileSet(
   combined->version_ = shards[0]->version_;
   combined->alignment_ = shards[0]->alignment_;
   combined->metadata_ = shards[0]->metadata_;
-  combined->tensors_.reserve(static_cast<std::size_t>(*total_tensor_count));
+  std::size_t actual_count = 0;
+  for (const auto& shard : shards) {
+    if (shard->tensors_.size() >
+            std::numeric_limits<std::size_t>::max() - actual_count ||
+        shard->size_ >
+            std::numeric_limits<std::size_t>::max() - combined->size_)
+      return nullptr;
+    actual_count += shard->tensors_.size();
+    combined->size_ += shard->size_;
+  }
+  if (actual_count != *total_tensor_count) {
+    if (error_msg)
+      *error_msg = "Split GGUF tensor count mismatch";
+    return nullptr;
+  }
+  combined->tensors_.reserve(actual_count);
   combined->tensor_index_.reserve(
       static_cast<std::size_t>(*total_tensor_count));
   combined->mapped_regions_.reserve(split_count);
 
   for (const auto& shard : shards) {
-    combined->size_ += shard->size_;
     combined->mapped_regions_.push_back(
         {shard->data_, shard->size_, shard->fd_});
     for (const auto& tensor : shard->tensors_) {
@@ -306,7 +339,15 @@ std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
   reader->fd_ = -1;
   reader->owns_mmap_ = false;
 
-  if (!reader->ParseHeaders(error_msg)) {
+  try {
+    if (!reader->ParseHeaders(error_msg)) {
+      if (error_msg && error_msg->empty())
+        *error_msg = "Malformed or truncated GGUF";
+      return nullptr;
+    }
+  } catch (const std::bad_alloc&) {
+    if (error_msg)
+      *error_msg = "Insufficient memory for GGUF descriptors";
     return nullptr;
   }
   reader->mapped_regions_.push_back(
@@ -354,6 +395,22 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
     return false;
   }
 
+  // Bound host-side descriptor allocations independently of mapped weight size.
+  std::size_t budget = 128 * 1024 * 1024;
+  const auto charge = [&](std::uint64_t count, std::size_t item_bytes) {
+    if (count > budget / item_bytes)
+      return false;
+    budget -= static_cast<std::size_t>(count) * item_bytes;
+    return true;
+  };
+  if (metadata_count > (size_ - offset) / 13 ||
+      tensor_count > (size_ - offset) / 32 ||
+      !charge(metadata_count, sizeof(GgufMetadataValue) + 64) ||
+      !charge(tensor_count, sizeof(GgufTensorInfo) + 128)) {
+    if (error_msg)
+      *error_msg = "GGUF descriptor counts exceed file or memory limits";
+    return false;
+  }
   metadata_.reserve(metadata_count);
 
   // Parse metadata key-value pairs
@@ -366,6 +423,11 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
       return false;
     }
 
+    if (key.empty() || key.size() > 65535 || !charge(key.size(), 1)) {
+      if (error_msg)
+        *error_msg = "GGUF metadata key exceeds limits";
+      return false;
+    }
     std::uint32_t val_type_raw = 0;
     if (!ReadPod(data_, size_, offset, val_type_raw)) {
       if (error_msg != nullptr) {
@@ -374,6 +436,8 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
       return false;
     }
 
+    if (val_type_raw > static_cast<std::uint32_t>(GgufValueType::kFloat64))
+      return false;
     const auto val_type = static_cast<GgufValueType>(val_type_raw);
     GgufMetadataValue meta_val;
     meta_val.type = val_type;
@@ -437,7 +501,7 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
       }
       case GgufValueType::kBool: {
         std::uint8_t v = 0;
-        if (!ReadPod(data_, size_, offset, v)) {
+        if (!ReadPod(data_, size_, offset, v) || v > 1) {
           return false;
         }
         meta_val.value = (v != 0);
@@ -448,6 +512,8 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
         if (!ReadString(data_, size_, offset, s)) {
           return false;
         }
+        if (!charge(s.size(), 1))
+          return false;
         meta_val.value = s;
         break;
       }
@@ -482,6 +548,17 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
             !ReadPod(data_, size_, offset, array_len)) {
           return false;
         }
+        if (item_type_raw >
+                static_cast<std::uint32_t>(GgufValueType::kFloat64) ||
+            item_type_raw == static_cast<std::uint32_t>(GgufValueType::kArray))
+          return false;
+        constexpr std::size_t item_bytes[] = {1, 1, 2, 2, 4, 4, 4,
+                                              1, 8, 0, 8, 8, 8};
+        if (offset > size_ ||
+            array_len > (size_ - offset) / item_bytes[item_type_raw] ||
+            !charge(array_len,
+                    item_type_raw == 8 ? sizeof(std::string_view) : 8))
+          return false;
         const auto item_type = static_cast<GgufValueType>(item_type_raw);
         if (item_type == GgufValueType::kString) {
           std::vector<std::string_view> str_arr;
@@ -491,9 +568,11 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
             if (!ReadString(data_, size_, offset, s)) {
               return false;
             }
+            if (!charge(s.size(), 1))
+              return false;
             str_arr.push_back(s);
           }
-          meta_val.value = str_arr;
+          meta_val.value = std::move(str_arr);
         } else if (item_type == GgufValueType::kFloat32 ||
                    item_type == GgufValueType::kFloat64) {
           const auto bytes = item_type == GgufValueType::kFloat32 ? 4U : 8U;
@@ -539,7 +618,7 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
             }
             u_arr.push_back(val);
           }
-          meta_val.value = u_arr;
+          meta_val.value = std::move(u_arr);
         } else if (item_type == GgufValueType::kInt32 ||
                    item_type == GgufValueType::kInt64) {
           std::vector<std::int64_t> i_arr;
@@ -557,7 +636,7 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
             }
             i_arr.push_back(val);
           }
-          meta_val.value = i_arr;
+          meta_val.value = std::move(i_arr);
         } else {
           // Skip other array types cleanly
           std::size_t item_size = 4;
@@ -573,7 +652,7 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
                      item_type == GgufValueType::kFloat64) {
             item_size = 8;
           }
-          if (offset + (array_len * item_size) > size_) {
+          if (offset > size_ || array_len > (size_ - offset) / item_size) {
             return false;
           }
           offset += (array_len * item_size);
@@ -583,11 +662,19 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
     }
 
     if (key == "general.alignment") {
-      if (std::holds_alternative<std::uint64_t>(meta_val.value)) {
-        alignment_ = std::get<std::uint64_t>(meta_val.value);
+      const auto* value = std::get_if<std::uint64_t>(&meta_val.value);
+      if (!value || !std::has_single_bit(*value) || *value > UINT32_MAX) {
+        if (error_msg)
+          *error_msg = "Invalid GGUF alignment";
+        return false;
       }
+      alignment_ = *value;
     }
-    metadata_.emplace(key, std::move(meta_val));
+    if (!metadata_.emplace(key, std::move(meta_val)).second) {
+      if (error_msg)
+        *error_msg = "Duplicate GGUF metadata key";
+      return false;
+    }
   }
 
   // Parse tensor infos
@@ -603,8 +690,11 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
       return false;
     }
 
+    if (info.name.empty() || info.name.size() > 65535 ||
+        !charge(info.name.size(), 1))
+      return false;
     std::uint32_t n_dims = 0;
-    if (!ReadPod(data_, size_, offset, n_dims) || n_dims > 8) {
+    if (!ReadPod(data_, size_, offset, n_dims) || n_dims == 0 || n_dims > 8) {
       if (error_msg != nullptr) {
         *error_msg = "Invalid tensor dimensions count";
       }
@@ -622,23 +712,42 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
     if (!ReadPod(data_, size_, offset, type_raw)) {
       return false;
     }
+    if (type_raw > UINT16_MAX)
+      return false;
     info.type = static_cast<GgmlType>(type_raw);
+    const auto elements = info.ElementCount();
+    const auto block = quant::QuantizedBlockElements(info.type);
+    info.size_bytes = quant::EncodedSizeBytes(info.type, elements);
+    if (!info.size_bytes || (block && info.dimensions.front() % block != 0)) {
+      if (error_msg)
+        *error_msg = "Invalid GGUF tensor shape or unsupported storage type: " +
+                     std::string(info.name);
+      return false;
+    }
 
     if (!ReadPod(data_, size_, offset, info.offset)) {
       return false;
     }
 
-    tensor_index_[info.name] = tensors_.size();
+    if (!tensor_index_.emplace(info.name, tensors_.size()).second) {
+      if (error_msg)
+        *error_msg = "Duplicate GGUF tensor name";
+      return false;
+    }
     tensors_.push_back(std::move(info));
   }
 
   // Align data payload base to alignment boundary
-  const std::size_t data_base = (offset + alignment_ - 1) & ~(alignment_ - 1);
+  const auto padding = (alignment_ - offset % alignment_) % alignment_;
+  if (offset > size_ || padding > size_ - offset)
+    return false;
+  const std::size_t data_base = offset + padding;
   for (auto& tensor : tensors_) {
-    if (data_base + tensor.offset > size_) {
+    if (tensor.offset % alignment_ != 0 || tensor.offset > size_ - data_base ||
+        tensor.size_bytes > size_ - data_base - tensor.offset) {
       if (error_msg != nullptr) {
-        *error_msg =
-            "Tensor offset exceeds file size: " + std::string(tensor.name);
+        *error_msg = "Tensor extent or alignment is invalid: " +
+                     std::string(tensor.name);
       }
       return false;
     }

@@ -284,6 +284,7 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
   PutLittleEndian<std::uint64_t>(
       destination, 64, static_cast<std::uint64_t>(layout.total_bytes));
 
+  SnapshotTransfer transfer;
   if (layout.live_kv_bytes_per_plane != 0) {
     const std::size_t kv_element_bytes =
         kv_storage_ == QwenKvCacheStorage::kFp16 ? sizeof(std::uint16_t)
@@ -295,23 +296,19 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
     if (source == nullptr) {
       throw std::logic_error("Qwen compact snapshot has no KV storage");
     }
-    ThrowOnHipError(
-        hipMemcpy2D(destination.data() + layout.k_offset,
+    transfer.Copy2D(destination.data() + layout.k_offset,
                     layout.live_kv_bytes_per_plane / attention_layers_, source,
                     source_pitch,
                     layout.live_kv_bytes_per_plane / attention_layers_,
-                    attention_layers_, hipMemcpyDeviceToHost),
-        "failed to serialize compact Qwen K cache");
+                    attention_layers_);
     const auto* source_bytes = static_cast<const std::uint8_t*>(source);
     const std::size_t full_plane_bytes =
         CheckedMultiply(kv_elements_per_plane_, kv_element_bytes);
-    ThrowOnHipError(
-        hipMemcpy2D(destination.data() + layout.v_offset,
+    transfer.Copy2D(destination.data() + layout.v_offset,
                     layout.live_kv_bytes_per_plane / attention_layers_,
                     source_bytes + full_plane_bytes, source_pitch,
                     layout.live_kv_bytes_per_plane / attention_layers_,
-                    attention_layers_, hipMemcpyDeviceToHost),
-        "failed to serialize compact Qwen V cache");
+                    attention_layers_);
   }
   if (layout.conv_bytes != 0) {
     const std::size_t row_bytes =
@@ -326,11 +323,8 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
               ? remaining
               : static_cast<std::size_t>(full_attention_interval_ - 1U);
       const std::size_t bytes = CheckedMultiply(rows, row_bytes);
-      ThrowOnHipError(
-          hipMemcpy(destination.data() + destination_offset,
-                    source + CheckedMultiply(group_start, row_bytes), bytes,
-                    hipMemcpyDeviceToHost),
-          "failed to serialize compact Qwen convolution state");
+      transfer.Copy(destination.data() + destination_offset,
+                    source + CheckedMultiply(group_start, row_bytes), bytes);
       destination_offset = CheckedSum(destination_offset, bytes);
     }
     if (destination_offset != layout.deltanet_offset) {
@@ -352,11 +346,8 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
               ? remaining
               : static_cast<std::size_t>(full_attention_interval_ - 1U);
       const std::size_t bytes = CheckedMultiply(rows, row_bytes);
-      ThrowOnHipError(
-          hipMemcpy(destination.data() + destination_offset,
-                    source + CheckedMultiply(group_start, row_bytes), bytes,
-                    hipMemcpyDeviceToHost),
-          "failed to serialize compact Qwen DeltaNet state");
+      transfer.Copy(destination.data() + destination_offset,
+                    source + CheckedMultiply(group_start, row_bytes), bytes);
       destination_offset = CheckedSum(destination_offset, bytes);
     }
     if (destination_offset != layout.rope_offset) {
@@ -720,105 +711,113 @@ QwenGpuArena::QwenGpuArena(const core::ModelConfig& config,
       max_context_(std::max(max_context, 1U)),
       max_batch_(std::min(max_context_, kMaxPromptBatch)),
       policy_(policy) {
-  HIP_CHECK(hipStreamCreate(&stream));
-  HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
-  HIPBLAS_CHECK(hipblasSetStream(hipblas_handle, stream));
-  hipblaslt_gemm = std::make_unique<HipblasLtGemm>();
+  try {
+    HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
+    HIPBLAS_CHECK(hipblasCreate(&hipblas_handle));
+    HIPBLAS_CHECK(hipblasSetStream(hipblas_handle, stream));
+    hipblaslt_gemm = std::make_unique<HipblasLtGemm>();
 
-  const std::size_t hidden_size = config_.hidden_size;
-  const std::size_t intermediate_size = config_.intermediate_size;
-  const std::size_t vocab_size = config_.vocab_size;
-  const std::size_t num_layers = config_.num_layers;
-  const std::size_t num_kv_heads = config_.num_key_value_heads;
-  const std::size_t head_dim = config_.head_dim;
-  const std::size_t batch = max_batch_;
-  const std::size_t attention_size = config_.AttentionSize();
-  const std::size_t kv_size = num_kv_heads * head_dim;
-  const std::size_t q_projection_size = 2 * attention_size;
-  const std::size_t ssm_qkv_size = config_.SsmQkvSize();
-  const std::size_t ssm_inner_size = config_.ssm_inner_size;
-  const std::size_t recurrent_width = std::max(attention_size, ssm_inner_size);
-  const std::size_t projection_width =
-      std::max(q_projection_size, ssm_qkv_size);
-  const std::size_t time_step_rank = config_.ssm_time_step_rank;
+    const std::size_t hidden_size = config_.hidden_size;
+    const std::size_t intermediate_size = config_.intermediate_size;
+    const std::size_t vocab_size = config_.vocab_size;
+    const std::size_t num_layers = config_.num_layers;
+    const std::size_t num_kv_heads = config_.num_key_value_heads;
+    const std::size_t head_dim = config_.head_dim;
+    const std::size_t batch = max_batch_;
+    const std::size_t attention_size = config_.AttentionSize();
+    const std::size_t kv_size = num_kv_heads * head_dim;
+    const std::size_t q_projection_size = 2 * attention_size;
+    const std::size_t ssm_qkv_size = config_.SsmQkvSize();
+    const std::size_t ssm_inner_size = config_.ssm_inner_size;
+    const std::size_t recurrent_width =
+        std::max(attention_size, ssm_inner_size);
+    const std::size_t projection_width =
+        std::max(q_projection_size, ssm_qkv_size);
+    const std::size_t time_step_rank = config_.ssm_time_step_rank;
 
-  HIP_CHECK(hipMalloc(&d_hidden, batch * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_normed, batch * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_q, batch * attention_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_k, batch * kv_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_v, batch * kv_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_attn_out, batch * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ffn_gate, batch * intermediate_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ffn_up, batch * intermediate_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ffn_act, batch * intermediate_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ffn_out, batch * hidden_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_qkv, batch * projection_width * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_conv_out, batch * ssm_qkv_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_gate, batch * recurrent_width * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_out, batch * recurrent_width * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_alpha_buf, batch * time_step_rank * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_beta_buf, batch * time_step_rank * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_ssm_kq_scales,
-                      batch * config_.ssm_group_count * 3 * sizeof(float)));
-  HIP_CHECK(
-      hipMalloc(&d_ssm_alpha_beta, batch * time_step_rank * 2 * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_logits, vocab_size * sizeof(float)));
-  HIP_CHECK(hipMalloc(&d_prompt_tokens,
-                      std::max<std::size_t>(batch, 2) * sizeof(std::uint32_t)));
-  HIP_CHECK(
-      hipMalloc(&d_target_layer_features, 5 * hidden_size * sizeof(float)));
-
-  const std::size_t scratch_elements =
-      batch * std::max<std::size_t>(
-                  {intermediate_size, hidden_size, projection_width,
-                   ssm_qkv_size + ssm_inner_size + (2 * time_step_rank)});
-  HIP_CHECK(
-      hipMalloc(&d_scratch_bf16, scratch_elements * sizeof(hip_bfloat16)));
-  // The tiled Q8_1 activation layout groups 16 tokens per tile, so size for a
-  // batch rounded up to a whole tile. The base layout remains 36 bytes per 32
-  // elements; reserve another float per block for the K-quant
-  // activation-sum sidecar without changing the Q8 payload or its stride.
-  const std::size_t q8_rows = ((batch + 15) / 16) * 16;
-  const std::size_t q8_row_elements =
-      scratch_elements / std::max<std::size_t>(batch, 1);
-  const std::size_t scratch_q8_bytes =
-      ((((q8_rows * q8_row_elements) + 31) / 32) * sizeof(float) * 10) +
-      4096;  // 36-byte payload + 4-byte sidecar per 32 elems
-  HIP_CHECK(hipMalloc(&d_scratch_q8_act, scratch_q8_bytes));
-  const std::size_t split_k_elements = detail::DecodeAttentionScratchElements(
-      config_.num_attention_heads, config_.head_dim);
-  HIP_CHECK(hipMalloc(&d_split_k_attention, split_k_elements * sizeof(float)));
-
-  // Weight BF16 scratch: largest per-layer matmul weight in bf16 elements,
-  // used by the prefill dequant-to-BF16 then BF16 GEMM path.
-  const std::size_t max_weight_elems =
-      hidden_size *
-      std::max<std::size_t>({q_projection_size, kv_size, attention_size,
-                             intermediate_size, ssm_qkv_size, ssm_inner_size,
-                             time_step_rank});
-  HIP_CHECK(
-      hipMalloc(&d_weights_bf16, max_weight_elems * sizeof(hip_bfloat16)));
-
-  const std::size_t total_kv = GetAttentionKvPlaneElements();
-  if (policy_.UsesFp16AttentionKv()) {
+    HIP_CHECK(hipMalloc(&d_hidden, batch * hidden_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_normed, batch * hidden_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_q, batch * attention_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_k, batch * kv_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_v, batch * kv_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_attn_out, batch * hidden_size * sizeof(float)));
     HIP_CHECK(
-        hipMalloc(&d_attention_kv_f16, total_kv * sizeof(std::uint16_t) * 2));
-  } else {
-    HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
+        hipMalloc(&d_ffn_gate, batch * intermediate_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_ffn_up, batch * intermediate_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_ffn_act, batch * intermediate_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_ffn_out, batch * hidden_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_ssm_qkv, batch * projection_width * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_conv_out, batch * ssm_qkv_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_ssm_gate, batch * recurrent_width * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_ssm_out, batch * recurrent_width * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_alpha_buf, batch * time_step_rank * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_beta_buf, batch * time_step_rank * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_ssm_kq_scales,
+                        batch * config_.ssm_group_count * 3 * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_ssm_alpha_beta,
+                        batch * time_step_rank * 2 * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_logits, vocab_size * sizeof(float)));
+    HIP_CHECK(hipMalloc(&d_prompt_tokens, std::max<std::size_t>(batch, 2) *
+                                              sizeof(std::uint32_t)));
+    HIP_CHECK(
+        hipMalloc(&d_target_layer_features, 5 * hidden_size * sizeof(float)));
+
+    const std::size_t scratch_elements =
+        batch * std::max<std::size_t>(
+                    {intermediate_size, hidden_size, projection_width,
+                     ssm_qkv_size + ssm_inner_size + (2 * time_step_rank)});
+    HIP_CHECK(
+        hipMalloc(&d_scratch_bf16, scratch_elements * sizeof(hip_bfloat16)));
+    // The tiled Q8_1 activation layout groups 16 tokens per tile, so size for a
+    // batch rounded up to a whole tile. The base layout remains 36 bytes per 32
+    // elements; reserve another float per block for the K-quant
+    // activation-sum sidecar without changing the Q8 payload or its stride.
+    const std::size_t q8_rows = ((batch + 15) / 16) * 16;
+    const std::size_t q8_row_elements =
+        scratch_elements / std::max<std::size_t>(batch, 1);
+    const std::size_t scratch_q8_bytes =
+        ((((q8_rows * q8_row_elements) + 31) / 32) * sizeof(float) * 10) +
+        4096;  // 36-byte payload + 4-byte sidecar per 32 elems
+    HIP_CHECK(hipMalloc(&d_scratch_q8_act, scratch_q8_bytes));
+    const std::size_t split_k_elements = detail::DecodeAttentionScratchElements(
+        config_.num_attention_heads, config_.head_dim);
+    HIP_CHECK(
+        hipMalloc(&d_split_k_attention, split_k_elements * sizeof(float)));
+
+    // Weight BF16 scratch: largest per-layer matmul weight in bf16 elements,
+    // used by the prefill dequant-to-BF16 then BF16 GEMM path.
+    const std::size_t max_weight_elems =
+        hidden_size *
+        std::max<std::size_t>({q_projection_size, kv_size, attention_size,
+                               intermediate_size, ssm_qkv_size, ssm_inner_size,
+                               time_step_rank});
+    HIP_CHECK(
+        hipMalloc(&d_weights_bf16, max_weight_elems * sizeof(hip_bfloat16)));
+
+    const std::size_t total_kv = GetAttentionKvPlaneElements();
+    if (policy_.UsesFp16AttentionKv()) {
+      HIP_CHECK(
+          hipMalloc(&d_attention_kv_f16, total_kv * sizeof(std::uint16_t) * 2));
+    } else {
+      HIP_CHECK(hipMalloc(&d_kv_cache, total_kv * sizeof(float) * 2));
+    }
+
+    const std::size_t total_conv =
+        num_layers * ssm_qkv_size * config_.ssm_conv_kernel;
+    HIP_CHECK(hipMalloc(&d_ssm_conv_state, total_conv * sizeof(float)));
+
+    const std::size_t total_deltanet = num_layers * time_step_rank *
+                                       config_.ssm_state_size *
+                                       config_.SsmValueSize();
+    HIP_CHECK(hipMalloc(&d_ssm_deltanet_state,
+                        total_deltanet * QwenRecurrentStateElementBytes(
+                                             policy_.recurrent_state_storage)));
+
+    Reset();
+  } catch (...) {
+    FreeAll();
+    throw;
   }
-
-  const std::size_t total_conv =
-      num_layers * ssm_qkv_size * config_.ssm_conv_kernel;
-  HIP_CHECK(hipMalloc(&d_ssm_conv_state, total_conv * sizeof(float)));
-
-  const std::size_t total_deltanet = num_layers * time_step_rank *
-                                     config_.ssm_state_size *
-                                     config_.SsmValueSize();
-  HIP_CHECK(hipMalloc(&d_ssm_deltanet_state,
-                      total_deltanet * QwenRecurrentStateElementBytes(
-                                           policy_.recurrent_state_storage)));
-
-  Reset();
 }
 
 QwenGpuArena::~QwenGpuArena() {
@@ -1108,7 +1107,7 @@ QwenGpuArena& QwenGpuArena::operator=(QwenGpuArena&& other) noexcept {
   return *this;
 }
 
-void QwenGpuArena::Reset() noexcept {
+void QwenGpuArena::Reset() {
   const std::size_t num_layers = config_.num_layers;
   const std::size_t total_kv = GetAttentionKvPlaneElements() * 2;
   const std::size_t total_conv =
@@ -1144,82 +1143,82 @@ void QwenGpuArena::Reset() noexcept {
 
 void QwenGpuArena::FreeAll() noexcept {
   if (d_hidden != nullptr)
-    HIP_CHECK(hipFree(d_hidden));
+    LogCleanupError(hipFree(d_hidden));
   if (d_normed != nullptr)
-    HIP_CHECK(hipFree(d_normed));
+    LogCleanupError(hipFree(d_normed));
   if (d_q != nullptr)
-    HIP_CHECK(hipFree(d_q));
+    LogCleanupError(hipFree(d_q));
   if (d_k != nullptr)
-    HIP_CHECK(hipFree(d_k));
+    LogCleanupError(hipFree(d_k));
   if (d_v != nullptr)
-    HIP_CHECK(hipFree(d_v));
+    LogCleanupError(hipFree(d_v));
   if (d_attn_out != nullptr)
-    HIP_CHECK(hipFree(d_attn_out));
+    LogCleanupError(hipFree(d_attn_out));
   if (d_ffn_gate != nullptr)
-    HIP_CHECK(hipFree(d_ffn_gate));
+    LogCleanupError(hipFree(d_ffn_gate));
   if (d_ffn_up != nullptr)
-    HIP_CHECK(hipFree(d_ffn_up));
+    LogCleanupError(hipFree(d_ffn_up));
   if (d_ffn_act != nullptr)
-    HIP_CHECK(hipFree(d_ffn_act));
+    LogCleanupError(hipFree(d_ffn_act));
   if (d_ffn_out != nullptr)
-    HIP_CHECK(hipFree(d_ffn_out));
+    LogCleanupError(hipFree(d_ffn_out));
   if (d_ssm_qkv != nullptr)
-    HIP_CHECK(hipFree(d_ssm_qkv));
+    LogCleanupError(hipFree(d_ssm_qkv));
   if (d_conv_out != nullptr)
-    HIP_CHECK(hipFree(d_conv_out));
+    LogCleanupError(hipFree(d_conv_out));
   if (d_ssm_gate != nullptr)
-    HIP_CHECK(hipFree(d_ssm_gate));
+    LogCleanupError(hipFree(d_ssm_gate));
   if (d_ssm_out != nullptr)
-    HIP_CHECK(hipFree(d_ssm_out));
+    LogCleanupError(hipFree(d_ssm_out));
   if (d_alpha_buf != nullptr)
-    HIP_CHECK(hipFree(d_alpha_buf));
+    LogCleanupError(hipFree(d_alpha_buf));
   if (d_beta_buf != nullptr)
-    HIP_CHECK(hipFree(d_beta_buf));
+    LogCleanupError(hipFree(d_beta_buf));
   if (d_ssm_kq_scales != nullptr)
-    HIP_CHECK(hipFree(d_ssm_kq_scales));
+    LogCleanupError(hipFree(d_ssm_kq_scales));
   if (d_ssm_alpha_beta != nullptr)
-    HIP_CHECK(hipFree(d_ssm_alpha_beta));
+    LogCleanupError(hipFree(d_ssm_alpha_beta));
   if (d_logits != nullptr)
-    HIP_CHECK(hipFree(d_logits));
+    LogCleanupError(hipFree(d_logits));
   if (d_attention_kv_f16 != nullptr)
-    HIP_CHECK(hipFree(d_attention_kv_f16));
+    LogCleanupError(hipFree(d_attention_kv_f16));
   if (d_target_layer_features != nullptr) {
-    HIP_CHECK(hipFree(d_target_layer_features));
+    LogCleanupError(hipFree(d_target_layer_features));
     d_target_layer_features = nullptr;
   }
   if (d_kv_cache != nullptr)
-    HIP_CHECK(hipFree(d_kv_cache));
+    LogCleanupError(hipFree(d_kv_cache));
   if (d_ssm_conv_state != nullptr)
-    HIP_CHECK(hipFree(d_ssm_conv_state));
+    LogCleanupError(hipFree(d_ssm_conv_state));
   if (d_ssm_deltanet_state != nullptr)
-    HIP_CHECK(hipFree(d_ssm_deltanet_state));
+    LogCleanupError(hipFree(d_ssm_deltanet_state));
   if (d_prompt_tokens != nullptr)
-    HIP_CHECK(hipFree(d_prompt_tokens));
+    LogCleanupError(hipFree(d_prompt_tokens));
   if (d_scratch_bf16 != nullptr)
-    HIP_CHECK(hipFree(d_scratch_bf16));
+    LogCleanupError(hipFree(d_scratch_bf16));
   if (d_scratch_q8_act != nullptr)
-    HIP_CHECK(hipFree(d_scratch_q8_act));
+    LogCleanupError(hipFree(d_scratch_q8_act));
   if (d_split_k_attention != nullptr)
-    HIP_CHECK(hipFree(d_split_k_attention));
+    LogCleanupError(hipFree(d_split_k_attention));
   if (d_weights_bf16 != nullptr)
-    HIP_CHECK(hipFree(d_weights_bf16));
+    LogCleanupError(hipFree(d_weights_bf16));
   if (d_saved_ssm_conv_state_ != nullptr)
-    HIP_CHECK(hipFree(d_saved_ssm_conv_state_));
+    LogCleanupError(hipFree(d_saved_ssm_conv_state_));
   if (d_saved_ssm_deltanet_state_ != nullptr)
-    HIP_CHECK(hipFree(d_saved_ssm_deltanet_state_));
+    LogCleanupError(hipFree(d_saved_ssm_deltanet_state_));
   if (d_ssm_replay_qkv_ != nullptr)
-    HIP_CHECK(hipFree(d_ssm_replay_qkv_));
+    LogCleanupError(hipFree(d_ssm_replay_qkv_));
   if (d_ssm_replay_alpha_ != nullptr)
-    HIP_CHECK(hipFree(d_ssm_replay_alpha_));
+    LogCleanupError(hipFree(d_ssm_replay_alpha_));
   if (d_ssm_replay_beta_ != nullptr)
-    HIP_CHECK(hipFree(d_ssm_replay_beta_));
+    LogCleanupError(hipFree(d_ssm_replay_beta_));
   if (d_ssm_replay_enabled_ != nullptr)
-    HIP_CHECK(hipFree(d_ssm_replay_enabled_));
+    LogCleanupError(hipFree(d_ssm_replay_enabled_));
   if (hipblas_handle != nullptr)
-    HIPBLAS_CHECK(hipblasDestroy(hipblas_handle));
+    LogCleanupError(hipblasDestroy(hipblas_handle));
   hipblaslt_gemm.reset();
   if (stream != nullptr)
-    HIP_CHECK(hipStreamDestroy(stream));
+    LogCleanupError(hipStreamDestroy(stream));
 
   d_hidden = nullptr;
   d_normed = nullptr;
@@ -1246,6 +1245,7 @@ void QwenGpuArena::FreeAll() noexcept {
   d_ssm_deltanet_state = nullptr;
   d_prompt_tokens = nullptr;
   d_scratch_bf16 = nullptr;
+  d_scratch_q8_act = nullptr;
   d_split_k_attention = nullptr;
   d_weights_bf16 = nullptr;
   d_saved_ssm_conv_state_ = nullptr;

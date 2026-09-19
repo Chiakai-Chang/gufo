@@ -99,7 +99,7 @@ void LaunchExactBf16GEMMFp32SmallBatch(const void* A, const float* X, float* Y,
     return;
   }
   if (batch_size >= 32) {
-    const auto groups = std::min<std::size_t>(4, batch_size / 16);
+    const auto groups = std::min<std::size_t>(16, batch_size / 16);
     if (detail::TryLaunchBf16SmallBatchWave64(A, X, Y, 16, M, K, stream,
                                               groups)) {
       const auto consumed = groups * 16;

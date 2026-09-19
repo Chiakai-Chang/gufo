@@ -49,6 +49,10 @@ public:
   void Reset();
   void SetCancellationCheck(std::function<bool()> check);
   [[nodiscard]] bool CheckCancellation(std::string* error) const;
+  [[nodiscard]] bool Cancelled() const noexcept { return cancelled_; }
+  [[nodiscard]] std::uint64_t MutationEpoch() const noexcept {
+    return mutation_epoch_;
+  }
   [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
@@ -96,6 +100,8 @@ private:
     std::uint32_t position{0};
   };
 
+  mutable bool cancelled_{false};
+  std::uint64_t mutation_epoch_{0};
   const Executor* owner_{nullptr};
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};

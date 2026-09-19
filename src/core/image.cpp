@@ -2,7 +2,9 @@
 
 #include <curl/curl.h>
 #include <jpeglib.h>
+#include <netinet/in.h>
 #include <png.h>
+#include <sys/socket.h>
 
 #include <algorithm>
 #include <array>
@@ -392,6 +394,45 @@ std::vector<std::uint8_t> ReadImageFile(const std::filesystem::path& path) {
 }
 
 std::vector<std::uint8_t> ReadImageUrl(std::string_view url) {
+  ImageReadBudget budget;
+  return ReadImageUrl(url, budget);
+}
+
+bool IsPublicImageAddress(std::span<const std::uint8_t> address) noexcept {
+  if (address.size() == 4) {
+    const auto a = address[0], b = address[1], c = address[2];
+    return a != 0 && a != 10 && a != 127 && a < 224 &&
+           !(a == 100 && b >= 64 && b <= 127) && !(a == 169 && b == 254) &&
+           !(a == 172 && b >= 16 && b <= 31) &&
+           !(a == 192 && (b == 168 || (b == 0 && (c == 0 || c == 2)) ||
+                          (b == 88 && c == 99))) &&
+           !(a == 198 && (b == 18 || b == 19 || (b == 51 && c == 100))) &&
+           !(a == 203 && b == 0 && c == 113);
+  }
+  if (address.size() != 16 || (address[0] & 0xe0) != 0x20)
+    return false;
+  // Only native global unicast; no mapped IPv4, NAT64, Teredo or 6to4
+  // tunnelling, which could otherwise reach an embedded private IPv4 address.
+  if (address[0] == 0x20 &&
+      ((address[1] == 0x01 &&
+        (address[2] < 2 || (address[2] == 0x0d && address[3] == 0xb8))) ||
+       address[1] == 0x02))
+    return false;
+  return !(address[0] == 0x3f && address[1] == 0xff &&
+           (address[2] & 0xf0) == 0);
+}
+
+std::vector<std::uint8_t> ReadImageUrl(std::string_view url,
+                                       ImageReadBudget& budget) {
+  const auto remaining_ms =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          budget.deadline - std::chrono::steady_clock::now())
+          .count();
+  if (budget.remaining_images == 0 || budget.remaining_bytes == 0 ||
+      remaining_ms <= 0)
+    throw std::invalid_argument(
+        "request image count, byte or time budget exceeded");
+  --budget.remaining_images;
   if (url.starts_with("data:")) {
     const auto comma = url.find(',');
     if (comma == std::string_view::npos ||
@@ -399,7 +440,17 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url) {
           url.substr(0, comma) == "data:image/jpeg;base64")) {
       throw std::invalid_argument("image data URL must use base64 PNG or JPEG");
     }
-    return DecodeBase64(url.substr(comma + 1));
+    const auto encoded = url.substr(comma + 1);
+    // Check the decoded size before allocating, including base64 padding.
+    const auto padding = encoded.ends_with("==")  ? 2U
+                         : encoded.ends_with("=") ? 1U
+                                                  : 0U;
+    if (encoded.size() / 4 * 3 < padding ||
+        encoded.size() / 4 * 3 - padding > budget.remaining_bytes)
+      throw std::invalid_argument("request image byte budget exceeded");
+    auto bytes = DecodeBase64(encoded);
+    budget.remaining_bytes -= bytes.size();
+    return bytes;
   }
   if (!url.starts_with("https://") || url.size() > 8192) {
     throw std::invalid_argument(
@@ -411,28 +462,66 @@ std::vector<std::uint8_t> ReadImageUrl(std::string_view url) {
     throw std::runtime_error("cannot initialize image download");
   std::vector<std::uint8_t> bytes;
   const std::string address(url);
-  curl_easy_setopt(curl.get(), CURLOPT_URL, address.c_str());
-  curl_easy_setopt(curl.get(), CURLOPT_PROTOCOLS_STR, "https");
-  curl_easy_setopt(curl.get(), CURLOPT_REDIR_PROTOCOLS_STR, "https");
-  curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
-  curl_easy_setopt(curl.get(), CURLOPT_MAXREDIRS, 3L);
-  curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, 15000L);
-  curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, 5000L);
-  curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
-  curl_easy_setopt(curl.get(), CURLOPT_FAILONERROR, 1L);
-  curl_easy_setopt(curl.get(), CURLOPT_MAXFILESIZE_LARGE,
-                   static_cast<curl_off_t>(kMaxEncodedImageBytes));
-  curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &bytes);
-  curl_easy_setopt(
-      curl.get(), CURLOPT_WRITEFUNCTION,
+  const auto set = [&](CURLoption option, auto value) {
+    if (curl_easy_setopt(curl.get(), option, value) != CURLE_OK)
+      throw std::runtime_error("cannot configure image download");
+  };
+  set(CURLOPT_URL, address.c_str());
+  set(CURLOPT_PROTOCOLS_STR, "https");
+  set(CURLOPT_REDIR_PROTOCOLS_STR, "https");
+  set(CURLOPT_DISALLOW_USERNAME_IN_URL, 1L);
+  // A proxy would hide the destination address from our socket callback.
+  set(CURLOPT_PROXY, "");
+  set(CURLOPT_FOLLOWLOCATION, 1L);
+  set(CURLOPT_MAXREDIRS, 3L);
+  set(CURLOPT_TIMEOUT_MS, static_cast<long>(remaining_ms));
+  set(CURLOPT_CONNECTTIMEOUT_MS,
+      std::min(5000L, static_cast<long>(remaining_ms)));
+  set(CURLOPT_NOSIGNAL, 1L);
+  set(CURLOPT_FAILONERROR, 1L);
+  set(CURLOPT_MAXFILESIZE_LARGE,
+      static_cast<curl_off_t>(budget.remaining_bytes));
+  set(
+      CURLOPT_OPENSOCKETFUNCTION,
+      +[](void*, curlsocktype purpose,
+          curl_sockaddr* endpoint) -> curl_socket_t {
+        if (purpose != CURLSOCKTYPE_IPCXN)
+          return CURL_SOCKET_BAD;
+        std::span<const std::uint8_t> ip;
+        if (endpoint->family == AF_INET &&
+            endpoint->addrlen >= sizeof(sockaddr_in)) {
+          const auto* v4 =
+              reinterpret_cast<const sockaddr_in*>(&endpoint->addr);
+          ip = {reinterpret_cast<const std::uint8_t*>(&v4->sin_addr), 4};
+        } else if (endpoint->family == AF_INET6 &&
+                   endpoint->addrlen >= sizeof(sockaddr_in6)) {
+          const auto* v6 =
+              reinterpret_cast<const sockaddr_in6*>(&endpoint->addr);
+          if (v6->sin6_scope_id != 0)
+            return CURL_SOCKET_BAD;
+          ip = {reinterpret_cast<const std::uint8_t*>(&v6->sin6_addr), 16};
+        }
+        if (!IsPublicImageAddress(ip))
+          return CURL_SOCKET_BAD;
+        return ::socket(endpoint->family, endpoint->socktype | SOCK_CLOEXEC,
+                        endpoint->protocol);
+      });
+  struct Download {
+    std::vector<std::uint8_t>& bytes;
+    ImageReadBudget& budget;
+  } download{bytes, budget};
+  set(CURLOPT_WRITEDATA, &download);
+  set(
+      CURLOPT_WRITEFUNCTION,
       +[](char* data, std::size_t size, std::size_t count,
           void* opaque) -> std::size_t {
-        auto& output = *static_cast<std::vector<std::uint8_t>*>(opaque);
-        if (size != 0 &&
-            count > (kMaxEncodedImageBytes - output.size()) / size) {
+        auto& state = *static_cast<Download*>(opaque);
+        auto& output = state.bytes;
+        if (size != 0 && count > state.budget.remaining_bytes / size) {
           return 0;
         }
         const std::size_t length = size * count;
+        state.budget.remaining_bytes -= length;
         try {
           output.insert(output.end(), data, data + length);
         } catch (...) {

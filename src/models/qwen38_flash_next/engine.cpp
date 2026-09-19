@@ -855,38 +855,135 @@ bool Session::DecodeStep(std::size_t max_tokens,
   return ok;
 }
 
-bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
-                          std::string* error_msg) {
+template<class Request>
+bool Session::RunIsolatedBatch(std::span<const Request> requests,
+                               std::string* error_msg) {
   if (requests.empty() || requests.size() > 8) {
-    AssignError(error_msg, "decode batch must contain 1..8 sessions");
+    AssignError(error_msg, "batch must contain 1..8 sessions");
     return false;
   }
+  std::array<BatchOutcome, 8> outcomes{};
+  std::array<std::uint64_t, 8> epochs{};
+  std::array<sampling::SamplerState::DrawState, 8> draws{};
+  std::vector<Request> active;
+  active.reserve(requests.size());
+  Model* model = nullptr;
   for (std::size_t i = 0; i < requests.size(); ++i) {
-    const auto& request = requests[i];
-    if (request.session == nullptr || !request.session->valid_ ||
-        request.sampler == nullptr || request.result == nullptr ||
-        request.max_tokens == 0 || request.session->tokens_.empty() ||
-        request.session->model_ != requests.front().session->model_) {
-      AssignError(error_msg, "invalid decode batch request");
-      return false;
+    const auto& r = requests[i];
+    auto& outcome = outcomes[i];
+    if (r.session)
+      epochs[i] = r.session->session_->MutationEpoch();
+    bool valid = r.session && r.session->valid_;
+    if constexpr (std::is_same_v<Request, DecodeRequest>) {
+      valid = valid && r.sampler && r.result && r.max_tokens > 0 &&
+              !r.session->tokens_.empty();
+    } else {
+      valid = valid && r.token >= 0 &&
+              static_cast<std::uint32_t>(r.token) <
+                  r.session->model_->VocabSize() &&
+              r.session->Position() < r.session->ContextSize();
     }
-    for (std::size_t j = 0; j < i; ++j) {
-      if (requests[j].session == request.session ||
-          requests[j].sampler == request.sampler ||
-          requests[j].result == request.result) {
-        AssignError(error_msg, "decode batch requests must be independent");
-        return false;
+    for (std::size_t j = 0; j < requests.size(); ++j) {
+      if (i == j)
+        continue;
+      valid = valid && r.session != requests[j].session;
+      if constexpr (std::is_same_v<Request, DecodeRequest>)
+        valid = valid && r.sampler != requests[j].sampler &&
+                r.result != requests[j].result;
+    }
+    if (valid && model && r.session->model_.get() != model)
+      valid = false;
+    if (!valid) {
+      outcome.error = "invalid or non-independent batch request";
+      continue;
+    }
+    if (!r.session->session_->CheckCancellation(&outcome.error))
+      continue;
+    model = r.session->model_.get();
+    if constexpr (std::is_same_v<Request, DecodeRequest>) {
+      draws[i] = r.sampler->SaveDrawState();
+    }
+    auto copy = r;
+    copy.outcome = &outcome;
+    active.push_back(copy);
+  }
+  std::string shared_error;
+  try {
+    if (!active.empty()) {
+      if constexpr (std::is_same_v<Request, DecodeRequest>)
+        (void)DecodeBatchImpl(active, &shared_error);
+      else
+        (void)EvaluateBatchImpl(active, &shared_error);
+    }
+  } catch (const std::exception& exception) {
+    shared_error = exception.what();
+  }
+  bool success = true;
+  for (std::size_t i = 0; i < requests.size(); ++i) {
+    const auto& r = requests[i];
+    auto& outcome = outcomes[i];
+    if (!outcome.completed && outcome.error.empty()) {
+      auto& session = *r.session;
+      if (session.session_->Cancelled()) {
+        outcome.error = "generation cancelled";
+      } else if (session.session_->MutationEpoch() == epochs[i]) {
+        // A preparation/batch-allocation failure did not touch this peer.
+        // Retry it independently, without changing its cached frontier.
+        session.valid_ = true;
+        if constexpr (std::is_same_v<Request, DecodeRequest>) {
+          r.sampler->RestoreDrawState(draws[i]);
+        }
+        try {
+          if constexpr (std::is_same_v<Request, DecodeRequest>)
+            outcome.completed =
+                session.DecodeStep(r.max_tokens, *r.sampler, r.result,
+                                   &outcome.error, r.stop_at_eos);
+          else
+            outcome.completed = session.Evaluate(r.token, &outcome.error);
+        } catch (const std::exception& exception) {
+          outcome.error = exception.what();
+        }
+      } else {
+        outcome.error =
+            shared_error.empty() ? "batch execution failed" : shared_error;
       }
     }
+    if (!outcome.completed) {
+      if (outcome.error.empty())
+        outcome.error = "batch request failed";
+      if (r.session && r.session->session_->MutationEpoch() != epochs[i])
+        r.session->valid_ = false;
+      if (success)
+        AssignError(error_msg, outcome.error);
+      success = false;
+    } else {
+      r.session->valid_ = true;
+    }
+    if (r.outcome)
+      *r.outcome = std::move(outcome);
   }
+  return success;
+}
+
+bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
+                          std::string* error_msg) {
+  return RunIsolatedBatch(requests, error_msg);
+}
+
+bool Session::EvaluateBatch(std::span<const AdvanceRequest> requests,
+                            std::string* error_msg) {
+  return RunIsolatedBatch(requests, error_msg);
+}
+
+bool Session::DecodeBatchImpl(std::span<const DecodeRequest> requests,
+                              std::string* error_msg) {
   if (requests.size() == 1) {
     const auto& r = requests.front();
-    return r.session->DecodeStep(r.max_tokens, *r.sampler, r.result, error_msg,
-                                 r.stop_at_eos);
+    r.outcome->completed = r.session->DecodeStep(
+        r.max_tokens, *r.sampler, r.result, &r.outcome->error, r.stop_at_eos);
+    return r.outcome->completed;
   }
   auto& exec = *requests.front().session->model_->executor_;
-  for (const auto& request : requests)
-    request.session->valid_ = false;
   std::optional<std::uint32_t> batch_drafts;
   std::uint32_t batch_context = 0;
   auto& policy = requests.front().session->model_->batch_policy_;
@@ -913,9 +1010,13 @@ bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
   std::vector<PendingDecode> pending(requests.size());
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& r = requests[i];
-    if (!r.session->PrepareDecode(r, &pending[i], error_msg, true,
-                                  batch_drafts)) {
-      return false;
+    try {
+      if (!r.session->PrepareDecode(r, &pending[i], &r.outcome->error, true,
+                                    batch_drafts))
+        pending[i] = {};
+    } catch (const std::exception& exception) {
+      r.outcome->error = exception.what();
+      pending[i] = {};
     }
   }
   std::vector<AdvanceRequest> catchup;
@@ -932,7 +1033,8 @@ bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
     std::vector<rocm::Executor::MtpBatchItem> bodies;
     for (std::size_t i = 0; i < requests.size(); ++i) {
       auto& p = pending[i];
-      if (p.speculative && p.chain.size() < p.width) {
+      if (!requests[i].session->session_->Cancelled() && p.speculative &&
+          p.chain.size() < p.width) {
         heads.push_back({requests[i].session->session_.get(),
                          {.token = p.sampled ? nullptr : &p.draft,
                           .candidates = p.sampled ? &p.candidates : nullptr}});
@@ -944,7 +1046,8 @@ bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
       return false;
     for (std::size_t i = 0; i < requests.size(); ++i) {
       auto& p = pending[i];
-      if (!p.speculative || p.chain.size() >= p.width)
+      if (requests[i].session->session_->Cancelled() || !p.speculative ||
+          p.chain.size() >= p.width)
         continue;
       AppendDraft(p);
       if (p.chain.size() < p.width)
@@ -957,75 +1060,66 @@ bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
   std::vector<rocm::Executor::BatchItem> items;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& r = requests[i];
-    if (!pending[i].chain.empty()) {
+    if (!r.session->session_->Cancelled() && !pending[i].chain.empty()) {
       items.push_back({r.session->session_.get(), pending[i].chain,
                        pending[i].speculative});
     }
   }
-  if (items.empty()) {
-    for (const auto& request : requests)
-      request.session->valid_ = true;
-    return true;
-  }
-  if (!exec.ForwardBatch(items, error_msg)) {
+  if (!items.empty() && !exec.ForwardBatch(items, error_msg))
     return false;
-  }
   std::uint32_t offset = 0;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     const auto& p = pending[i];
-    if (p.chain.empty()) {
+    const auto& r = requests[i];
+    auto& session = *r.session;
+    const bool included =
+        std::any_of(items.begin(), items.end(), [&](const auto& item) {
+          return item.session == session.session_.get();
+        });
+    const auto row_offset = offset;
+    if (included)
+      offset += p.chain.size();
+    if (!r.outcome->error.empty())
+      continue;
+    if (session.session_->Cancelled()) {
+      r.outcome->error = "generation cancelled";
       continue;
     }
-    auto& session = *requests[i].session;
+    if (p.chain.empty()) {
+      r.outcome->completed = true;
+      continue;
+    }
     float* logits = !p.speculative       ? session.logits_.data()
                     : p.gpu_verification ? nullptr
                                          : session.verify_logits_.data();
-    if (!exec.SelectBatchLogits(offset, p.chain.size(), logits, error_msg) ||
-        !session.FinishDecode(requests[i], p, error_msg)) {
-      return false;
+    try {
+      r.outcome->completed =
+          exec.SelectBatchLogits(row_offset, p.chain.size(), logits,
+                                 &r.outcome->error) &&
+          session.FinishDecode(r, p, &r.outcome->error);
+    } catch (const std::exception& exception) {
+      r.outcome->error = exception.what();
     }
-    offset += p.chain.size();
   }
-  if (batch_drafts && items.size() == requests.size()) {
+  if (batch_drafts && items.size() == requests.size() &&
+      std::ranges::all_of(requests,
+                          [](const auto& r) { return r.outcome->completed; })) {
     const auto ms = std::chrono::duration<float, std::milli>(
                         std::chrono::steady_clock::now() - cycle_start)
                         .count();
     policy.Observe(requests.size(), batch_context, *batch_drafts, ms);
   }
-  for (const auto& request : requests)
-    request.session->valid_ = true;
   return true;
 }
 
-bool Session::EvaluateBatch(std::span<const AdvanceRequest> requests,
-                            std::string* error_msg) {
-  if (requests.empty() || requests.size() > 8) {
-    AssignError(error_msg, "advance batch must contain 1..8 sessions");
-    return false;
-  }
-  for (std::size_t i = 0; i < requests.size(); ++i) {
-    const auto& r = requests[i];
-    if (r.session == nullptr || !r.session->valid_ || r.token < 0 ||
-        static_cast<std::uint32_t>(r.token) >= r.session->model_->VocabSize() ||
-        r.session->model_ != requests.front().session->model_ ||
-        r.session->Position() >= r.session->ContextSize()) {
-      AssignError(error_msg, "invalid advance batch request");
-      return false;
-    }
-    for (std::size_t j = 0; j < i; ++j) {
-      if (requests[j].session == r.session) {
-        AssignError(error_msg, "advance batch contains a duplicate session");
-        return false;
-      }
-    }
-  }
+bool Session::EvaluateBatchImpl(std::span<const AdvanceRequest> requests,
+                                std::string* error_msg) {
   if (requests.size() == 1) {
-    return requests.front().session->Evaluate(requests.front().token,
-                                              error_msg);
+    const auto& r = requests.front();
+    r.outcome->completed = r.session->Evaluate(r.token, &r.outcome->error);
+    return r.outcome->completed;
   }
   auto& exec = *requests.front().session->model_->executor_;
-  for (const auto& request : requests)
-    request.session->valid_ = false;
   if (!DraftCatchUpBatch(requests, error_msg))
     return false;
   std::vector<rocm::Executor::BatchItem> items;
@@ -1037,14 +1131,21 @@ bool Session::EvaluateBatch(std::span<const AdvanceRequest> requests,
   }
   for (std::size_t i = 0; i < requests.size(); ++i) {
     auto& session = *requests[i].session;
-    if (!exec.SelectBatchLogits(i, 1, session.logits_.data(), error_msg)) {
-      return false;
+    auto& outcome = *requests[i].outcome;
+    if (session.session_->Cancelled()) {
+      outcome.error = "generation cancelled";
+      continue;
     }
-    session.hidden_base_ = static_cast<std::uint32_t>(session.tokens_.size());
-    session.tokens_.push_back(requests[i].token);
+    try {
+      if (!exec.SelectBatchLogits(i, 1, session.logits_.data(), &outcome.error))
+        continue;
+      session.hidden_base_ = static_cast<std::uint32_t>(session.tokens_.size());
+      session.tokens_.push_back(requests[i].token);
+      outcome.completed = true;
+    } catch (const std::exception& exception) {
+      outcome.error = exception.what();
+    }
   }
-  for (const auto& request : requests)
-    request.session->valid_ = true;
   return true;
 }
 

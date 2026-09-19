@@ -240,10 +240,10 @@ void ExecuteDecodeStep(QwenGpuArena& arena,
 
     if (const auto tap_index = arena.GetTargetLayerCaptureIndex(l);
         tap_index.has_value()) {
-      (void)hipMemcpyAsync(
+      HIP_CHECK(hipMemcpyAsync(
           arena.d_target_layer_features + (*tap_index * hidden_size),
           decode_scratch.hidden.data(), hidden_size * sizeof(float),
-          hipMemcpyDeviceToDevice, arena.stream);
+          hipMemcpyDeviceToDevice, arena.stream));
     }
   }
 

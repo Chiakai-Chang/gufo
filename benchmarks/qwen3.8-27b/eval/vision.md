@@ -41,8 +41,10 @@ request = urllib.request.Request(
 print(urllib.request.urlopen(request).read().decode())
 ```
 
-PNG/JPEG data URLs and HTTPS images are supported; `detail` is `auto`.
-Limits: 20 MiB encoded, 32 megapixels decoded, 16 images per message.
+PNG/JPEG data URLs and public HTTPS images are supported; `detail` is `auto`.
+Requests share a 20 MiB encoded-byte, 16-image and 15-second download budget.
+Each decoded image is limited to 32 megapixels. Private, loopback and link-local
+destinations are rejected after DNS resolution and on every redirect.
 Images use the official dynamic resolution policy; their expanded tokens
 count toward the context limit. Unsupported or invalid input returns an error.
 The synthetic `bench` command remains a text benchmark.
@@ -66,13 +68,11 @@ Controls also cover spatial shape recognition, a 2,304-token image crossing
 prefill chunks, and Flash-Next image decoding/cache replay at 10,495 tokens.
 Image throughput sweeps remain **TODO**.
 
-Known gap: the Q8_K_XL continued-image fixture produces different greedy text
-from a fresh full prefill. This reproduces on `bc4c4a5` before the cache cleanup.
-Replaying the same prompt/decode history matches the live cache exactly.
-AR and DFlash2 can also retain different final decode frontiers, leaving different
-prefill suffixes on continuation.
-The full vision check retains its cold-versus-live equality gate; `--disk-only`
-checks persistence and history replay without claiming that stronger parity.
+Q8_K_XL uses FP32 activations and a fixed per-row reduction for BF16
+projections. The image suite requires identical logits across prefill chunk
+boundaries and identical greedy continuation text for cold, live and disk-restored
+sessions, with AR and DFlash2. It also requires reuse of generated history.
+`--disk-only` is a focused persistence check; qualification uses the full suite.
 
 ```sh
 nix develop -c cmake --build --preset gpu-test \

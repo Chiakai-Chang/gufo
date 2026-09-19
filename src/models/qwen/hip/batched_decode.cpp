@@ -138,6 +138,9 @@ SsmControls LaunchSsmControls(const models::QwenLayerWeights& layer,
 
 std::vector<tokenization::TokenId> QwenGpuExecutor::ForwardTokenBatch(
     std::span<const QwenGpuBatchItem> items) {
+  for (const auto& item : items)
+    if (item.executor)
+      item.executor->CheckReset();
   if (items.size() < 2 || items.size() > kMaxDecodeBatch) {
     throw std::invalid_argument(
         "Qwen GPU decode batch requires two to eight sessions");
@@ -426,6 +429,9 @@ QwenGpuExecutor::ForwardDecodeEquivalentVerificationChunk(
 std::vector<std::vector<tokenization::TokenId>>
 QwenGpuExecutor::ForwardVerificationBatch(
     std::span<const QwenGpuVerificationItem> items) {
+  for (const auto& item : items)
+    if (item.executor)
+      item.executor->CheckReset();
   if (items.empty() || items.size() > kMaxDecodeBatch ||
       items.front().executor == nullptr) {
     throw std::invalid_argument(

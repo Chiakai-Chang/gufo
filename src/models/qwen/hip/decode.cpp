@@ -11,6 +11,7 @@ namespace gufo::hip {
 
 tokenization::TokenId QwenGpuExecutor::ForwardToken(
     tokenization::TokenId token_id, std::uint32_t pos, bool compute_logits) {
+  CheckReset();
   if (pos >= arena_.GetMaxContext()) {
     throw std::length_error("token position exceeds the GPU context length");
   }

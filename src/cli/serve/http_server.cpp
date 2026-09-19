@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <csignal>
 #include <cstdlib>
@@ -94,12 +95,27 @@ bool SendAll(int fd, std::string_view data) {
 bool IsPeerDisconnected(int fd) noexcept {
   pollfd descriptor{
       .fd = fd,
-      .events = POLLERR | POLLHUP,
+      .events = POLLIN | POLLERR | POLLHUP,
       .revents = 0,
   };
+#ifdef POLLRDHUP
+  descriptor.events |= POLLRDHUP;
+#endif
   const int ready = ::poll(&descriptor, 1, 0);
-  return ready > 0 &&
-         (descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0;
+  if (ready <= 0)
+    return false;
+  if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+    return true;
+#ifdef POLLRDHUP
+  if ((descriptor.revents & POLLRDHUP) != 0)
+    return true;
+#endif
+  if ((descriptor.revents & POLLIN) == 0)
+    return false;
+  char byte;
+  const auto count = ::recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+  return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                        errno != EINTR);
 }
 
 // ---------------------------------------------------------------------------

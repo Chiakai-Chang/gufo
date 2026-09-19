@@ -166,6 +166,29 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
   const std::size_t block_qk = QuantizedBlockElements(type);
   std::size_t block_bytes = 0;
   switch (type) {
+    // GGML storage layouts also used by the DeepSeek runtime. Storage support
+    // here does not imply that every model has a compute kernel for the type.
+    case core::GgmlType::kQ4_0:
+      block_bytes = 18;
+      break;
+    case core::GgmlType::kQ4_1:
+      block_bytes = 20;
+      break;
+    case core::GgmlType::kQ5_0:
+      block_bytes = 22;
+      break;
+    case core::GgmlType::kQ5_1:
+      block_bytes = 24;
+      break;
+    case core::GgmlType::kQ8_1:
+      block_bytes = 36;
+      break;
+    case core::GgmlType::kQ2_K:
+      block_bytes = 84;
+      break;
+    case core::GgmlType::kIQ2_XXS:
+      block_bytes = 66;
+      break;
     case core::GgmlType::kQ3_K:
       block_bytes = sizeof(block_q3_K);
       break;

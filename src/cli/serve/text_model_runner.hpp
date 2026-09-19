@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <functional>
 #include <memory>
@@ -130,6 +131,7 @@ struct TextDecodeStep {
   /// Execution actually used for this request, including model-owned subgroup
   /// dispatch. A runner's advertised maximum is not evidence of batching.
   TextExecutionPlan execution_plan{};
+  std::exception_ptr failure{};
 };
 
 /// Model-private state driven only through TextModelRunner work units.
@@ -167,6 +169,7 @@ public:
 struct TextRunnerAdvance {
   std::reference_wrapper<TextRunnerState> state;
   TextRunnerToken token{0};
+  std::exception_ptr* failure{nullptr};
 };
 
 struct TextRunnerDecode {
@@ -387,8 +390,8 @@ public:
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<Request*> requests, std::span<const std::size_t> max_tokens,
       const TextExecutionPlan& plan);
-  void AdvanceBatch(std::span<Request*> requests,
-                    const TextExecutionPlan& plan);
+  std::vector<std::exception_ptr> AdvanceBatch(std::span<Request*> requests,
+                                               const TextExecutionPlan& plan);
   [[nodiscard]] Request Acquire(
       std::vector<TextRunnerToken> prompt,
       const sampling::SamplingConfig& sampling,

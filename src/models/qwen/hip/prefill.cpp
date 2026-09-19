@@ -8,6 +8,7 @@ namespace gufo::hip {
 tokenization::TokenId QwenGpuExecutor::ForwardPromptBatch(
     std::span<const tokenization::TokenId> prompt_tokens,
     std::uint32_t start_pos, bool compute_logits) {
+  CheckReset();
   if (prompt_tokens.empty()) {
     return 0;
   }

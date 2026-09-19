@@ -149,7 +149,7 @@ bool QwenGpuArena::BeginSsmReplayCapture() {
   return allocated;
 }
 
-void QwenGpuArena::DisableSsmReplayCapture() noexcept {
+void QwenGpuArena::DisableSsmReplayCapture() {
   if (d_ssm_replay_enabled_ != nullptr) {
     HIP_CHECK(hipMemsetAsync(d_ssm_replay_enabled_, 0, sizeof(std::uint32_t),
                              stream));

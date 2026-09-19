@@ -244,6 +244,100 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
   }
 }
 
+void CheckBatchFailureIsolation(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  const auto prompt = model->Tokenize("Repeat red, blue, red, blue,");
+  for (const auto mode : {gufo::core::SessionMode::kAutoregressive,
+                          gufo::core::SessionMode::kSpeculative}) {
+    auto first = model->CreateSession(mode, 256, &error);
+    auto second = model->CreateSession(mode, 256, &error);
+    Require(first && second && first->Sync(prompt, &error), error);
+    const auto snapshot = first->SaveSnapshot(&error);
+    Require(snapshot && second->RestoreSnapshot(*snapshot, &error), error);
+    const auto token = prompt.front();
+    const std::array baseline{
+        qfn::Session::AdvanceRequest{first.get(), token},
+        qfn::Session::AdvanceRequest{second.get(), token}};
+    Require(qfn::Session::EvaluateBatch(baseline, &error), error);
+    const std::vector<float> expected(second->Logits().begin(),
+                                      second->Logits().end());
+    Require(first->RestoreSnapshot(*snapshot, &error) &&
+                second->RestoreSnapshot(*snapshot, &error),
+            error);
+    unsigned checks = 0;
+    first->SetCancellationCheck([&] { return ++checks >= 12; });
+    std::array<qfn::Session::BatchOutcome, 2> outcomes;
+    const std::array cancelled{
+        qfn::Session::AdvanceRequest{first.get(), token, &outcomes[0]},
+        qfn::Session::AdvanceRequest{second.get(), token, &outcomes[1]}};
+    Require(!qfn::Session::EvaluateBatch(cancelled, &error),
+            "batch cancellation not reported");
+    Require(!outcomes[0].completed && !outcomes[0].error.empty() &&
+                outcomes[1].completed && second->IsValid() && !first->IsValid(),
+            "cancellation must invalidate only the partially executed session");
+    RequireExact(expected, second->Logits(),
+                 "cancelled peer changed target logits");
+    first->SetCancellationCheck({});
+    Require(first->RestoreSnapshot(*snapshot, &error) &&
+                second->RestoreSnapshot(*snapshot, &error),
+            error);
+    const std::array invalid{
+        qfn::Session::AdvanceRequest{first.get(), -1, &outcomes[0]},
+        qfn::Session::AdvanceRequest{second.get(), token, &outcomes[1]}};
+    Require(!qfn::Session::EvaluateBatch(invalid, &error) && first->IsValid() &&
+                second->IsValid() && outcomes[1].completed,
+            "invalid preparation poisoned a peer or the untouched session");
+    RequireExact(expected, second->Logits(),
+                 "invalid peer changed target logits");
+    Require(first->RestoreSnapshot(*snapshot, &error) &&
+                second->RestoreSnapshot(*snapshot, &error),
+            error);
+    const sampling::SamplingConfig config{
+        .temperature = 0.7F, .top_p = 0.9F, .seed = 73};
+    sampling::SamplerState control(config), a(config), b(config);
+    qfn::Session::DecodeResult reference, ignored, actual;
+    Require(second->DecodeStep(3, control, &reference, &error, false), error);
+    const std::vector<float> speculative_logits(second->Logits().begin(),
+                                                second->Logits().end());
+    Require(second->RestoreSnapshot(*snapshot, &error), error);
+    const std::array invalid_decode{
+        qfn::Session::DecodeRequest{first.get(), 0, &a, &ignored, false,
+                                    &outcomes[0]},
+        qfn::Session::DecodeRequest{second.get(), 3, &b, &actual, false,
+                                    &outcomes[1]}};
+    Require(!qfn::Session::DecodeBatch(invalid_decode, &error) &&
+                first->IsValid() && outcomes[1].completed &&
+                actual.tokens == reference.tokens &&
+                b.rng_state() == control.rng_state(),
+            "invalid decode peer changed sampling replay");
+    RequireExact(speculative_logits, second->Logits(),
+                 "invalid decode peer changed logits");
+    if (mode == gufo::core::SessionMode::kSpeculative) {
+      Require(first->RestoreSnapshot(*snapshot, &error) &&
+                  second->RestoreSnapshot(*snapshot, &error),
+              error);
+      a = sampling::SamplerState(config);
+      b = sampling::SamplerState(config);
+      checks = 0;
+      first->SetCancellationCheck([&] { return ++checks >= 6; });
+      const std::array mtp_cancel{
+          qfn::Session::DecodeRequest{first.get(), 3, &a, &ignored, false,
+                                      &outcomes[0]},
+          qfn::Session::DecodeRequest{second.get(), 3, &b, &actual, false,
+                                      &outcomes[1]}};
+      Require(!qfn::Session::DecodeBatch(mtp_cancel, &error) &&
+                  !outcomes[0].completed && outcomes[1].completed &&
+                  second->IsValid() && actual.tokens == reference.tokens &&
+                  b.rng_state() == control.rng_state(),
+              "cancelled MTP peer changed sampling replay");
+      RequireExact(speculative_logits, second->Logits(),
+                   "cancelled MTP peer changed logits");
+    }
+  }
+  std::cout << "batch preparation and mid-execution cancellation isolate peers "
+               "and sampling replay\n";
+}
+
 void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   std::size_t sampled_rejections = 0;
@@ -601,6 +695,7 @@ int main(int argc, char** argv) {
     CheckFailureRecovery(model);
     CheckRollbackReuse(model);
     CheckImageSnapshotAttachment(model);
+    CheckBatchFailureIsolation(model);
     CheckBatchedSessions(model);
     if (batch_only)
       return 0;

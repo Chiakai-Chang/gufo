@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -16,6 +17,7 @@
 
 #include "src/core/hip/detail/hip_graph_decode_executor.hpp"
 #include "src/core/hip/hip_utils.hpp"
+#include "src/core/hip/snapshot_transfer.hpp"
 #include "src/core/quant/ggml_dequant.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/ops.hpp"
@@ -31,7 +33,7 @@
 
 void TestHipGraphDecodeStep() {
   hipStream_t stream = nullptr;
-  HIP_CHECK(hipStreamCreate(&stream));
+  HIP_CHECK(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking));
 
   constexpr std::size_t hidden_size = 256;
   constexpr std::size_t vocab_size = 1024;
@@ -72,6 +74,19 @@ void TestHipGraphDecodeStep() {
   gufo::test::Expect(!executor.IsCaptured(),
                      "new HIP graph executor is already captured");
 
+  bool threw = false;
+  try {
+    executor.TryCapture(stream, graph_key,
+                        [] { HIP_CHECK(hipErrorOutOfMemory); });
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  gufo::test::Expect(threw, "capture failure must propagate");
+  hipStreamCaptureStatus capture = hipStreamCaptureStatusActive;
+  HIP_CHECK(hipStreamIsCapturing(stream, &capture));
+  gufo::test::Expect(capture == hipStreamCaptureStatusNone,
+                     "failed capture must release the stream");
+
   // Test across 5 consecutive tokens with graph replay
   for (std::uint32_t step = 0; step < 5; ++step) {
     const std::uint32_t token_id = step * 10 + 3;
@@ -89,7 +104,31 @@ void TestHipGraphDecodeStep() {
     };
 
     if (!executor.IsCaptured()) {
-      const bool ok = executor.TryCapture(stream, graph_key, StepOps);
+      const bool ok = executor.TryCapture(stream, graph_key, [&] {
+        StepOps();
+        // A different request may allocate/copy a snapshot during capture.
+        // Global capture or a blocking stream makes these independent copies
+        // invalidate the decode graph (previously hidden by HIP_CHECK).
+        std::async(std::launch::async, [&] {
+          void* independent = nullptr;
+          HIP_CHECK(hipMalloc(&independent, hidden_size * sizeof(float)));
+          try {
+            gufo::hip::SnapshotTransfer transfer;
+            transfer.Copy(independent, h_w.data(), hidden_size * sizeof(float),
+                          hipMemcpyHostToDevice);
+            std::vector<float> restored(hidden_size);
+            transfer.Copy2D(restored.data(), 64 * sizeof(float), independent,
+                            64 * sizeof(float), 64 * sizeof(float),
+                            hidden_size / 64);
+            gufo::test::Expect(restored == h_w,
+                               "snapshot copy during capture changed values");
+          } catch (...) {
+            (void)hipFree(independent);
+            throw;
+          }
+          HIP_CHECK(hipFree(independent));
+        }).get();
+      });
       gufo::test::Expect(ok, "HIP graph capture failed");
       gufo::test::Expect(executor.IsCapturedFor(graph_key),
                          "HIP graph capture key was not retained");

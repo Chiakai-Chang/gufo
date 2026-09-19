@@ -34,6 +34,26 @@
 
 namespace {
 
+void TestGpuErrorsThrow() {
+  for (const auto error : {hipErrorOutOfMemory, hipErrorInvalidValue}) {
+    bool threw = false;
+    try {
+      HIP_CHECK(error);
+    } catch (const std::runtime_error& exception) {
+      threw = std::string_view(exception.what()).find("HIP error") !=
+              std::string_view::npos;
+    }
+    assert(threw);
+  }
+  bool threw = false;
+  try {
+    HIPBLAS_CHECK(HIPBLAS_STATUS_ALLOC_FAILED);
+  } catch (const std::runtime_error&) {
+    threw = true;
+  }
+  assert(threw);
+}
+
 using gufo::core::GgmlType;
 using gufo::core::ModelConfig;
 using gufo::models::QwenTensorRef;
@@ -192,6 +212,7 @@ void TestGpuL2MultiLayerModuleForward() {
 }  // namespace
 
 int main() {
+  TestGpuErrorsThrow();
   TestGpuL2MultiLayerModuleForward();
   std::cout << "All Qwen L2 GPU module integration tests passed.\n";
   return 0;

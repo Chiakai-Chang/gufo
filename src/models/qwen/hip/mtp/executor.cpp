@@ -140,13 +140,7 @@ void QwenMtpGpuExecutor::Free() noexcept {
 }
 
 void QwenMtpGpuExecutor::Reset() noexcept {
-  const auto& config = model_->GetConfig();
-  const std::size_t total_kv =
-      static_cast<std::size_t>(config.num_key_value_heads) * max_context_ *
-      config.head_dim;
-  (void)hipMemsetAsync(d_kv_cache_, 0, 2 * total_kv * sizeof(float), stream_);
-  (void)hipMemsetAsync(d_kv_cache_f16_, 0, 2 * total_kv * sizeof(std::uint16_t),
-                       stream_);
+  // Attention only reads the valid prefix; new rows overwrite stale KV.
   next_position_ = 0;
 }
 

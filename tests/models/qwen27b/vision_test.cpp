@@ -1,3 +1,5 @@
+#include <arpa/inet.h>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -63,6 +65,54 @@ void TestPreprocessing() {
   }
 }
 
+void TestImageTransportLimits() {
+  for (const auto* address :
+       {"0.0.0.0", "10.1.2.3", "100.64.0.1", "127.0.0.1", "169.254.169.254",
+        "172.16.1.2", "192.168.0.1", "198.18.0.1", "224.0.0.1", "::1",
+        "::ffff:127.0.0.1", "64:ff9b::a00:1", "fc00::1", "fe80::1",
+        "2002:7f00:1::", "2001::1", "2001:db8::1", "3fff::1"}) {
+    std::array<std::uint8_t, 16> bytes{};
+    const bool v4 =
+        std::string_view(address).find(':') == std::string_view::npos;
+    assert(inet_pton(v4 ? AF_INET : AF_INET6, address, bytes.data()) == 1);
+    assert(!gufo::core::IsPublicImageAddress({bytes.data(), v4 ? 4U : 16U}));
+  }
+  for (const auto* address : {"1.1.1.1", "8.8.8.8", "2001:4860:4860::8888"}) {
+    std::array<std::uint8_t, 16> bytes{};
+    const bool v4 =
+        std::string_view(address).find(':') == std::string_view::npos;
+    assert(inet_pton(v4 ? AF_INET : AF_INET6, address, bytes.data()) == 1);
+    assert(gufo::core::IsPublicImageAddress({bytes.data(), v4 ? 4U : 16U}));
+  }
+  const auto rejects = [](std::string_view url,
+                          gufo::core::ImageReadBudget& budget) {
+    bool failed = false;
+    try {
+      (void)gufo::core::ReadImageUrl(url, budget);
+    } catch (const std::invalid_argument&) {
+      failed = true;
+    }
+    assert(failed);
+  };
+  gufo::core::ImageReadBudget budget;
+  for (const auto* url :
+       {"https://127.0.0.1:1/image.png", "https://[::1]:1/image.png",
+        "https://2130706433:1/image.png", "https://localhost:1/image.png"})
+    rejects(url, budget);
+  budget = {};
+  budget.remaining_bytes = 3;
+  assert(
+      gufo::core::ReadImageUrl("data:image/png;base64,AQID", budget).size() ==
+      3);
+  rejects("data:image/png;base64,AQID", budget);
+  budget = {};
+  budget.deadline = std::chrono::steady_clock::now();
+  rejects("data:image/png;base64,AQID", budget);
+  budget = {};
+  budget.remaining_images = 0;
+  rejects("data:image/png;base64,AQID", budget);
+}
+
 void TestRendering() {
   using namespace gufo::tokenization;
   ChatMessage message{ChatRole::kUser, "beforeafter"};
@@ -87,6 +137,7 @@ int main(int argc, char** argv) {
     TestPositionLayout();
     TestPreprocessing();
     TestRendering();
+    TestImageTransportLimits();
     if (argc == 1) {
       std::cout << "vision input, layout and rendering: passed\n";
       return 0;

@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -250,11 +251,11 @@ public:
   QwenGpuArena(QwenGpuArena&&) noexcept;
   QwenGpuArena& operator=(QwenGpuArena&&) noexcept;
 
-  void Reset() noexcept;
+  void Reset();
   void SaveState(std::uint32_t valid_context);
   void RestoreState();
   [[nodiscard]] bool BeginSsmReplayCapture();
-  void DisableSsmReplayCapture() noexcept;
+  void DisableSsmReplayCapture();
   void MarkSsmReplayPosition(std::uint32_t position) noexcept;
   [[nodiscard]] bool CanReplaySsmPosition(
       std::uint32_t position) const noexcept;
@@ -526,7 +527,8 @@ public:
   void RestoreCompactSnapshot(std::span<const std::uint8_t> payload,
                               std::uint32_t expected_valid_context);
 
-  /// Resets GPU cache and recurrent states in the arena.
+  /// Resets GPU state. Any reset failure is retained and rethrown by the next
+  /// fallible operation; invalidation/cleanup itself remains noexcept.
   void Reset() noexcept;
   void SaveState(std::uint32_t valid_context);
   void RestoreState();
@@ -534,6 +536,11 @@ public:
   void FinishVerification();
 
 private:
+  void CheckReset() const {
+    if (reset_failure_)
+      std::rethrow_exception(reset_failure_);
+  }
+  std::exception_ptr reset_failure_;
   void ReplaySsmState(std::uint32_t position, std::uint32_t count = 1);
   void EnsureVerificationLogits(std::size_t batch_size);
   [[nodiscard]] GpuSamplingParameters PrepareGpuSamplingParameters(

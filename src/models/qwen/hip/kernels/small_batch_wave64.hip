@@ -347,8 +347,19 @@ bool TryLaunchBf16SmallBatchWave64(const void* w, const float* x, float* y,
     const bool up =
         k == 5120 && (m == 1024 || m == 12288 || m == 17408 || m == 248320);
     const bool down = m == 5120 && k == 6144;
-    if (batch != 16 || groups > 4 || !(up || down))
+    if (batch != 16 || !(up || down))
       return false;
+    if (groups > 4) {
+      // Bounded groups reuse cached weight rows while retaining a small enough
+      // activation working set. Every dot product keeps decode's FP32 order.
+      const auto launch = [&]<std::size_t Rows>() {
+        BatchedExactBf16GEMMFp32VecKernel<16, 16, Rows, false, 64, 1, true>
+            <<<dim3(groups, (m + 16 * Rows - 1) / (16 * Rows)), 512, 0,
+               stream>>>(static_cast<const hip_bfloat16*>(w), x, y, m, k);
+      };
+      launch.template operator()<3>();
+      return true;
+    }
     const auto launch = [&]<std::size_t Groups, std::size_t Rows>() {
       // Neighboring token groups reuse the same weight rows through cache.
       BatchedExactBf16GEMMFp32VecKernel<16, 16, Rows, false, 64, Groups>

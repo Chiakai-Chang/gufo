@@ -777,8 +777,9 @@ struct TextGenerationScheduler::Impl {
     for (const auto& item : prepared) {
       runner_requests.push_back(&item.request->runner_request);
     }
+    std::vector<std::exception_ptr> failures;
     try {
-      runner_pool->AdvanceBatch(runner_requests, plan);
+      failures = runner_pool->AdvanceBatch(runner_requests, plan);
     } catch (...) {
       const auto failure = std::current_exception();
       for (const auto& item : prepared) {
@@ -789,7 +790,12 @@ struct TextGenerationScheduler::Impl {
 
     const std::string execution_plan =
         "batched-w" + std::to_string(plan.physical_width);
-    for (const auto& item : prepared) {
+    for (std::size_t i = 0; i < prepared.size(); ++i) {
+      const auto& item = prepared[i];
+      if (failures[i]) {
+        CompleteFailure(item.request, failures[i]);
+        continue;
+      }
       item.request->result.physical_execution_width = std::max(
           item.request->result.physical_execution_width, plan.physical_width);
       item.request->result.execution_plan = execution_plan;
@@ -872,6 +878,10 @@ struct TextGenerationScheduler::Impl {
     for (std::size_t index = 0; index < prepared.size(); ++index) {
       const auto& item = prepared[index];
       const auto& step = steps[index];
+      if (step.failure) {
+        CompleteFailure(item.request, step.failure);
+        continue;
+      }
       if (step.execution_plan.physical_width >=
           item.request->result.physical_execution_width) {
         item.request->result.physical_execution_width =

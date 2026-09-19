@@ -175,12 +175,18 @@ void Session::ConfigureVision(
 }
 
 void Session::SetCancellationCheck(std::function<bool()> check) {
+  cancelled_ = false;
   is_cancelled_ = std::move(check);
   vision_input_.SetCancellationCheck(is_cancelled_);
 }
 
 bool Session::CheckCancellation(std::string* error) const {
-  if (is_cancelled_ && is_cancelled_()) {
+  try {
+    cancelled_ = cancelled_ || (is_cancelled_ && is_cancelled_());
+  } catch (...) {
+    cancelled_ = true;
+  }
+  if (cancelled_) {
     AssignError(error, "generation cancelled");
     return false;
   }
@@ -1768,6 +1774,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   }
   if (speculative && !EnsureRollback(session, n - 1, error_msg))
     return false;
+  ++session.mutation_epoch_;
   session.spec_base_ = start_pos;
   session.spec_tokens_ = speculative ? n : 0;
   // Everything the launched work reads from the host sits in pinned
@@ -2476,6 +2483,7 @@ bool Executor::MtpForward(Session& session,
     AssignError(error_msg, "MTP context is full");
     return false;
   }
+  ++session.mutation_epoch_;
   std::copy(tokens.begin(), tokens.end(), tokens_host_);
   control_host_->position = session.position_;
   control_host_->blocks = session.blocks_;

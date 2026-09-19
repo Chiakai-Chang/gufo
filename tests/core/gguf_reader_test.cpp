@@ -8,11 +8,13 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "src/core/model_config.hpp"
+#include "src/core/quant/ggml_dequant.hpp"
 
 namespace {
 
@@ -136,6 +138,16 @@ public:
       buffer_.resize(buffer_.size() + (32 - rem), 0);
     }
 
+    // Fixtures carry the complete declared payload, just like real files.
+    for (const auto& tensor : tensors_to_write_) {
+      std::size_t elements = 1;
+      for (auto dimension : tensor.dims)
+        elements *= dimension;
+      payload_bytes =
+          std::max(payload_bytes,
+                   static_cast<std::size_t>(tensor.offset) +
+                       gufo::quant::EncodedSizeBytes(tensor.type, elements));
+    }
     // Append payload dummy data
     buffer_.resize(buffer_.size() + payload_bytes, 0xAB);
     return buffer_;
@@ -188,12 +200,12 @@ void TestBasicGgufParsing() {
   builder.AddMetadataInt32Array("qwen35.rope.dimension_sections",
                                 {64, 0, 0, 0});
 
-  builder.AddTensor("token_embd.weight", {248320, 2560},
-                    gufo::core::GgmlType::kBF16, 0);
-  builder.AddTensor("blk.0.attn_q.weight", {2560, 2560},
-                    gufo::core::GgmlType::kStrixSHQ4_T16, 64);
-  builder.AddTensor("mtp.0.proj.weight", {2560, 2560},
-                    gufo::core::GgmlType::kStrixSHQ8_T16, 128);
+  builder.AddTensor("token_embd.weight", {2560, 8}, gufo::core::GgmlType::kBF16,
+                    0);
+  builder.AddTensor("blk.0.attn_q.weight", {256, 8},
+                    gufo::core::GgmlType::kQ4_K, 64);
+  builder.AddTensor("mtp.0.proj.weight", {256, 8}, gufo::core::GgmlType::kQ8_0,
+                    128);
 
   auto binary = builder.Build(512);
 
@@ -225,15 +237,14 @@ void TestBasicGgufParsing() {
   const auto* t0 = reader->FindTensor("token_embd.weight");
   Expect(t0 != nullptr, "token_embd.weight found");
   Expect(t0->dimensions.size() == 2, "2 dimensions");
-  Expect(t0->dimensions[0] == 248320 && t0->dimensions[1] == 2560,
+  Expect(t0->dimensions[0] == 2560 && t0->dimensions[1] == 8,
          "Dimensions match");
   Expect(t0->type == gufo::core::GgmlType::kBF16, "BF16 type");
   Expect(t0->data != nullptr, "Valid memory mapped data pointer");
 
   const auto* t1 = reader->FindTensor("blk.0.attn_q.weight");
   Expect(t1 != nullptr, "blk.0.attn_q.weight found");
-  Expect(t1->type == gufo::core::GgmlType::kStrixSHQ4_T16,
-         "Gufo SHQ4_T16 type");
+  Expect(t1->type == gufo::core::GgmlType::kQ4_K, "Q4_K type");
 
   // MTP presence
   Expect(reader->HasMtpTensors(), "MTP tensors detected");
@@ -272,14 +283,14 @@ void TestQwen38_27BParsing() {
   builder.AddMetadataUint32("qwen35.rope.dimension_count", 64);
   builder.AddMetadataFloat32("qwen35.rope.freq_base", 10000000.0F);
 
-  builder.AddTensor("token_embd.weight", {248320, 5120},
-                    gufo::core::GgmlType::kBF16, 0);
-  builder.AddTensor("blk.3.attn_q.weight", {12288, 5120},
-                    gufo::core::GgmlType::kStrixSHQ4_T16, 64);
-  builder.AddTensor("blk.63.ffn_gate.weight", {17408, 5120},
-                    gufo::core::GgmlType::kStrixSHQ4_T16, 128);
+  builder.AddTensor("token_embd.weight", {5120, 8}, gufo::core::GgmlType::kBF16,
+                    0);
+  builder.AddTensor("blk.3.attn_q.weight", {256, 8},
+                    gufo::core::GgmlType::kQ4_K, 64);
+  builder.AddTensor("blk.63.ffn_gate.weight", {256, 8},
+                    gufo::core::GgmlType::kQ4_K, 128);
   builder.AddTensor("blk.64.nextn.enorm.weight", {5120},
-                    gufo::core::GgmlType::kStrixSHQ8_T16, 192);
+                    gufo::core::GgmlType::kQ8_0, 192);
 
   auto binary = builder.Build(512);
 
@@ -398,7 +409,7 @@ void TestQuantizationLabel() {
     GgufBuilder builder;
     builder.AddMetadataString("general.architecture", "qwen35");
     builder.AddMetadataUint32("general.file_type", 15);
-    builder.AddTensor("token_embd.weight", {4096, 4096},
+    builder.AddTensor("token_embd.weight", {256, 256},
                       gufo::core::GgmlType::kQ8_0, 0);
     builder.AddTensor("blk.0.attn_norm.weight", {64},
                       gufo::core::GgmlType::kF32, 64);
@@ -419,11 +430,11 @@ void TestQuantizationLabel() {
     // label has to say so instead of claiming the file is its largest format.
     GgufBuilder builder;
     builder.AddMetadataString("general.architecture", "qwen35");
-    builder.AddTensor("blk.0.ffn_up.weight", {1024, 1024},
+    builder.AddTensor("blk.0.ffn_up.weight", {256, 16},
                       gufo::core::GgmlType::kQ5_K, 0);
-    builder.AddTensor("blk.0.ffn_gate.weight", {1024, 512},
+    builder.AddTensor("blk.0.ffn_gate.weight", {256, 8},
                       gufo::core::GgmlType::kIQ4_XS, 64);
-    builder.AddTensor("blk.0.attn_qkv.weight", {1024, 256},
+    builder.AddTensor("blk.0.attn_qkv.weight", {256, 4},
                       gufo::core::GgmlType::kQ4_K, 128);
     auto binary = builder.Build(512);
     std::string err;
@@ -436,7 +447,7 @@ void TestQuantizationLabel() {
   {
     GgufBuilder builder;
     builder.AddMetadataString("general.architecture", "qwen35");
-    builder.AddTensor("blk.0.ffn_up.weight", {4096, 4096},
+    builder.AddTensor("blk.0.ffn_up.weight", {256, 256},
                       gufo::core::GgmlType::kBF16, 0);
     auto binary = builder.Build(512);
     std::string err;
@@ -461,6 +472,78 @@ void TestMalformedGgufRejection() {
   auto r2 =
       gufo::core::GgufReader::OpenMemory(truncated, sizeof(truncated), &err);
   Expect(r2 == nullptr, "Truncated buffer rejected");
+}
+
+void TestHostileHeaders() {
+  const auto rejects = [](const std::vector<std::uint8_t>& bytes) {
+    std::string error;
+    Expect(
+        !gufo::core::GgufReader::OpenMemory(bytes.data(), bytes.size(), &error),
+        "malformed GGUF must fail closed");
+    Expect(!error.empty(), "failed parse explains rejection");
+  };
+  const auto patch = [](auto& bytes, std::size_t offset, auto value) {
+    std::memcpy(bytes.data() + offset, &value, sizeof(value));
+  };
+  for (std::size_t offset : {8U, 16U}) {
+    auto bytes = GgufBuilder{}.Build(0);
+    patch(bytes, offset, UINT64_MAX);
+    rejects(bytes);
+  }
+  for (std::uint32_t alignment : {0U, 3U, UINT32_MAX}) {
+    GgufBuilder builder;
+    builder.AddMetadataUint32("general.alignment", alignment);
+    rejects(builder.Build());
+  }
+  {
+    GgufBuilder builder;
+    builder.AddMetadataString("x", "y");
+    auto original = builder.Build();
+    for (std::size_t offset : {24U, 37U}) {
+      auto bytes = original;
+      patch(bytes, offset, UINT64_MAX);
+      rejects(bytes);
+    }
+    auto bytes = original;
+    patch(bytes, 33, std::uint32_t{0x108});  // Must not truncate to STRING.
+    rejects(bytes);
+  }
+  for (const auto type :
+       {gufo::core::GgufValueType::kString, gufo::core::GgufValueType::kUint64,
+        gufo::core::GgufValueType::kInt32,
+        gufo::core::GgufValueType::kFloat32}) {
+    GgufBuilder builder;
+    builder.AddMetadataArray<std::uint64_t>("x", type, {});
+    auto bytes = builder.Build();
+    patch(bytes, 41, UINT64_MAX);
+    rejects(bytes);
+  }
+  {
+    GgufBuilder builder;
+    builder.AddMetadataUint32("x", 0);
+    builder.AddMetadataUint32("x", 1);
+    rejects(builder.Build());
+  }
+  {
+    GgufBuilder builder;
+    builder.AddTensor("x", {32}, gufo::core::GgmlType::kQ8_0, 0);
+    auto original = builder.Build(34);
+    auto bytes = original;
+    bytes.pop_back();
+    rejects(bytes);  // Tensor start fits, final byte does not.
+    bytes = original;
+    patch(bytes, 37, UINT64_MAX);  // Dimension/product overflow.
+    rejects(bytes);
+    bytes = original;
+    patch(bytes, 45, std::uint32_t{0x10008});  // No narrowing of storage type.
+    rejects(bytes);
+    bytes = original;
+    patch(bytes, 49, UINT64_MAX);  // Tensor offset overflow.
+    rejects(bytes);
+    bytes = original;
+    patch(bytes, 49, std::uint64_t{1});  // Unaligned offset.
+    rejects(bytes);
+  }
 }
 
 void TestVisionMetadataArrays() {
@@ -501,6 +584,7 @@ int main() {
   TestVisionExclusionValidation();
   TestQuantizationLabel();
   TestMalformedGgufRejection();
+  TestHostileHeaders();
   std::cout << "All GgufReader tests passed successfully!\n";
   return 0;
 }
