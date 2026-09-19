@@ -8,6 +8,8 @@
 #include <exception>
 #include <vector>
 
+#include "src/core/diagnostics/bandwidth_run.hpp"
+
 #ifdef ENGINE_ENABLE_XRT
 #include <xrt/experimental/xrt_system.h>
 #include <xrt/xrt_bo.h>
@@ -96,21 +98,19 @@ std::vector<BandwidthPathResult> MeasureXrtBandwidth(
       path.allocation_type = "xrt_bo_dma_sync";
       path.working_set_bytes = size;
       path.warmup_runs = options.warmup;
-      path.repetitions = options.repetitions;
 
       for (std::uint32_t w = 0; w < options.warmup; ++w) {
         bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
       }
 
-      for (std::uint32_t r = 0; r < options.repetitions; ++r) {
-        const auto start = std::chrono::high_resolution_clock::now();
+      for (detail::BandwidthRun run(options, path); run.ShouldContinue();) {
+        const auto start = std::chrono::steady_clock::now();
         bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        const auto end = std::chrono::high_resolution_clock::now();
+        const auto end = std::chrono::steady_clock::now();
 
         const double elapsed_sec =
             std::chrono::duration<double>(end - start).count();
-        const double gbps = (static_cast<double>(size) / 1e9) / elapsed_sec;
-        path.raw_repetitions_gbps.push_back(gbps);
+        run.Record(elapsed_sec, static_cast<double>(size));
       }
 
       path.sentinel_verified = true;
@@ -126,21 +126,19 @@ std::vector<BandwidthPathResult> MeasureXrtBandwidth(
       path.allocation_type = "xrt_bo_dma_sync";
       path.working_set_bytes = size;
       path.warmup_runs = options.warmup;
-      path.repetitions = options.repetitions;
 
       for (std::uint32_t w = 0; w < options.warmup; ++w) {
         bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
       }
 
-      for (std::uint32_t r = 0; r < options.repetitions; ++r) {
-        const auto start = std::chrono::high_resolution_clock::now();
+      for (detail::BandwidthRun run(options, path); run.ShouldContinue();) {
+        const auto start = std::chrono::steady_clock::now();
         bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        const auto end = std::chrono::high_resolution_clock::now();
+        const auto end = std::chrono::steady_clock::now();
 
         const double elapsed_sec =
             std::chrono::duration<double>(end - start).count();
-        const double gbps = (static_cast<double>(size) / 1e9) / elapsed_sec;
-        path.raw_repetitions_gbps.push_back(gbps);
+        run.Record(elapsed_sec, static_cast<double>(size));
       }
 
       path.sentinel_verified = (ptr[0] == static_cast<std::uint8_t>(7));

@@ -10,6 +10,8 @@
 #include <sstream>
 #include <vector>
 
+#include "src/core/diagnostics/bandwidth_run.hpp"
+
 namespace gufo::diagnostics {
 
 namespace {
@@ -90,7 +92,6 @@ std::vector<BandwidthPathResult> MeasureCpuBandwidth(
     path.allocation_type = "host_pageable";
     path.working_set_bytes = size;
     path.warmup_runs = options.warmup;
-    path.repetitions = options.repetitions;
 
     // Warmup
     for (std::uint32_t w = 0; w < options.warmup; ++w) {
@@ -99,17 +100,16 @@ std::vector<BandwidthPathResult> MeasureCpuBandwidth(
 
     // Repetitions
     bool sentinel_ok = true;
-    for (std::uint32_t r = 0; r < options.repetitions; ++r) {
+    for (detail::BandwidthRun run(options, path); run.ShouldContinue();) {
       std::memset(dst.data(), 0, size);
-      const auto start = std::chrono::high_resolution_clock::now();
+      const auto start = std::chrono::steady_clock::now();
       std::memcpy(dst.data(), src.data(), size);
-      const auto end = std::chrono::high_resolution_clock::now();
+      const auto end = std::chrono::steady_clock::now();
 
       const double elapsed_sec =
           std::chrono::duration<double>(end - start).count();
       // Copy moves size bytes read + size bytes written = 2 * size
-      const double gbps = (static_cast<double>(size * 2) / 1e9) / elapsed_sec;
-      path.raw_repetitions_gbps.push_back(gbps);
+      run.Record(elapsed_sec, static_cast<double>(size) * 2);
 
       if (dst[0] != src[0] || dst[size / 2] != src[size / 2] ||
           dst[size - 1] != src[size - 1]) {
@@ -130,7 +130,6 @@ std::vector<BandwidthPathResult> MeasureCpuBandwidth(
     path.allocation_type = "host_pageable";
     path.working_set_bytes = size;
     path.warmup_runs = options.warmup;
-    path.repetitions = options.repetitions;
 
     // Warmup
     volatile std::uint64_t sum = 0;
@@ -143,19 +142,18 @@ std::vector<BandwidthPathResult> MeasureCpuBandwidth(
     }
 
     // Repetitions
-    for (std::uint32_t r = 0; r < options.repetitions; ++r) {
-      const auto start = std::chrono::high_resolution_clock::now();
+    for (detail::BandwidthRun run(options, path); run.ShouldContinue();) {
+      const auto start = std::chrono::steady_clock::now();
       std::uint64_t local_sum = 0;
       for (std::size_t i = 0; i < size; ++i) {
         local_sum += src[i];
       }
       sum = local_sum;
-      const auto end = std::chrono::high_resolution_clock::now();
+      const auto end = std::chrono::steady_clock::now();
 
       const double elapsed_sec =
           std::chrono::duration<double>(end - start).count();
-      const double gbps = (static_cast<double>(size) / 1e9) / elapsed_sec;
-      path.raw_repetitions_gbps.push_back(gbps);
+      run.Record(elapsed_sec, static_cast<double>(size));
     }
 
     path.sentinel_verified = (sum != 0);
@@ -171,7 +169,6 @@ std::vector<BandwidthPathResult> MeasureCpuBandwidth(
     path.allocation_type = "host_pageable";
     path.working_set_bytes = size;
     path.warmup_runs = options.warmup;
-    path.repetitions = options.repetitions;
 
     // Warmup
     for (std::uint32_t w = 0; w < options.warmup; ++w) {
@@ -180,16 +177,15 @@ std::vector<BandwidthPathResult> MeasureCpuBandwidth(
 
     // Repetitions
     bool sentinel_ok = true;
-    for (std::uint32_t r = 0; r < options.repetitions; ++r) {
-      const int val = static_cast<int>((r + 0x5A) & 0xFF);
-      const auto start = std::chrono::high_resolution_clock::now();
+    for (detail::BandwidthRun run(options, path); run.ShouldContinue();) {
+      const int val = static_cast<int>((path.repetitions + 0x5A) & 0xFF);
+      const auto start = std::chrono::steady_clock::now();
       std::memset(dst.data(), val, size);
-      const auto end = std::chrono::high_resolution_clock::now();
+      const auto end = std::chrono::steady_clock::now();
 
       const double elapsed_sec =
           std::chrono::duration<double>(end - start).count();
-      const double gbps = (static_cast<double>(size) / 1e9) / elapsed_sec;
-      path.raw_repetitions_gbps.push_back(gbps);
+      run.Record(elapsed_sec, static_cast<double>(size));
 
       if (dst[0] != static_cast<std::uint8_t>(val) ||
           dst[size - 1] != static_cast<std::uint8_t>(val)) {
@@ -234,6 +230,7 @@ std::string BandwidthReport::ToJson() const {
     oss << "      \"workingSetBytes\": " << p.working_set_bytes << ",\n";
     oss << "      \"warmupRuns\": " << p.warmup_runs << ",\n";
     oss << "      \"repetitions\": " << p.repetitions << ",\n";
+    oss << "      \"elapsedMs\": " << p.elapsed_ms << ",\n";
     oss << "      \"medianGbps\": " << std::fixed << std::setprecision(2)
         << p.median_gbps << ",\n";
     oss << "      \"p95Gbps\": " << std::fixed << std::setprecision(2)

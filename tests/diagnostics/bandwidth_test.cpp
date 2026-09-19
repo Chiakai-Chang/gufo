@@ -46,6 +46,7 @@ void TestCpuBandwidthCorrectness() {
   opts.backends = {"cpu"};
   opts.warmup = 1;
   opts.repetitions = 3;
+  opts.duration_ms = 0;
   opts.working_set_bytes = 16ULL * 1024ULL * 1024ULL;  // 16 MiB for fast test
 
   const auto results = gufo::diagnostics::MeasureCpuBandwidth(opts);
@@ -72,6 +73,7 @@ void TestBandwidthReportJsonStructure() {
   opts.backends = {"cpu"};
   opts.warmup = 1;
   opts.repetitions = 2;
+  opts.duration_ms = 0;
   opts.working_set_bytes = 8ULL * 1024ULL * 1024ULL;
 
   const auto report = gufo::diagnostics::RunBandwidthBenchmark(opts, fp);
@@ -90,6 +92,25 @@ void TestBandwidthReportJsonStructure() {
   // Validate artifact
   const auto val_res = gufo::diagnostics::ValidateArtifactContent(json);
   Expect(val_res.is_valid, "BandwidthReport JSON is valid artifact");
+}
+
+void TestBandwidthDuration() {
+  gufo::diagnostics::BandwidthOptions opts;
+  opts.backends = {"cpu"};
+  opts.working_set_bytes = 1 << 20;
+  opts.warmup = 1;
+  opts.repetitions = 2;
+  for (const auto duration_ms : {1U, 30U}) {
+    opts.duration_ms = duration_ms;
+    for (const auto& path : gufo::diagnostics::MeasureCpuBandwidth(opts)) {
+      Expect(path.elapsed_ms >= duration_ms, "requested duration is measured");
+      Expect(path.repetitions >= opts.repetitions &&
+                 path.raw_repetitions_gbps.size() == path.repetitions,
+             "artifact reports actual iteration count");
+      Expect(path.sentinel_verified && path.median_gbps > 0,
+             "sustained transfers retain correctness");
+    }
+  }
 }
 
 void TestArtifactValidation() {
@@ -166,6 +187,7 @@ int main() {
   std::cout << "Running memory bandwidth benchmark test suite...\n";
 
   TestCpuBandwidthCorrectness();
+  TestBandwidthDuration();
   TestBandwidthReportJsonStructure();
   TestSchemaFileExists();
   TestArtifactValidation();

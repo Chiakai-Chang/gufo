@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "src/core/diagnostics/bandwidth_run.hpp"
+
 #ifdef ENGINE_ENABLE_HIP
 #include <hip/hip_runtime.h>
 #endif
@@ -97,13 +99,12 @@ std::vector<BandwidthPathResult> MeasureHipBandwidth(
     path.allocation_type = "hip_device_memory";
     path.working_set_bytes = size;
     path.warmup_runs = options.warmup;
-    path.repetitions = options.repetitions;
 
     for (std::uint32_t w = 0; w < options.warmup; ++w) {
       hipMemcpy(d_src, h_src.data(), size, hipMemcpyHostToDevice);
     }
 
-    for (std::uint32_t r = 0; r < options.repetitions; ++r) {
+    for (detail::BandwidthRun run(options, path); run.ShouldContinue();) {
       hipEventRecord(start_event, nullptr);
       hipMemcpy(d_src, h_src.data(), size, hipMemcpyHostToDevice);
       hipEventRecord(stop_event, nullptr);
@@ -112,8 +113,7 @@ std::vector<BandwidthPathResult> MeasureHipBandwidth(
       float elapsed_ms = 0.0F;
       hipEventElapsedTime(&elapsed_ms, start_event, stop_event);
       const double elapsed_sec = static_cast<double>(elapsed_ms) / 1000.0;
-      const double gbps = (static_cast<double>(size) / 1e9) / elapsed_sec;
-      path.raw_repetitions_gbps.push_back(gbps);
+      run.Record(elapsed_sec, static_cast<double>(size));
     }
 
     path.sentinel_verified = true;
@@ -129,13 +129,12 @@ std::vector<BandwidthPathResult> MeasureHipBandwidth(
     path.allocation_type = "hip_device_memory";
     path.working_set_bytes = size;
     path.warmup_runs = options.warmup;
-    path.repetitions = options.repetitions;
 
     for (std::uint32_t w = 0; w < options.warmup; ++w) {
       hipMemcpy(d_dst, d_src, size, hipMemcpyDeviceToDevice);
     }
 
-    for (std::uint32_t r = 0; r < options.repetitions; ++r) {
+    for (detail::BandwidthRun run(options, path); run.ShouldContinue();) {
       hipEventRecord(start_event, nullptr);
       hipMemcpy(d_dst, d_src, size, hipMemcpyDeviceToDevice);
       hipEventRecord(stop_event, nullptr);
@@ -145,8 +144,7 @@ std::vector<BandwidthPathResult> MeasureHipBandwidth(
       hipEventElapsedTime(&elapsed_ms, start_event, stop_event);
       const double elapsed_sec = static_cast<double>(elapsed_ms) / 1000.0;
       // D2D reads size bytes and writes size bytes = 2 * size
-      const double gbps = (static_cast<double>(size * 2) / 1e9) / elapsed_sec;
-      path.raw_repetitions_gbps.push_back(gbps);
+      run.Record(elapsed_sec, static_cast<double>(size) * 2);
     }
 
     path.sentinel_verified = true;
@@ -162,14 +160,13 @@ std::vector<BandwidthPathResult> MeasureHipBandwidth(
     path.allocation_type = "hip_device_memory";
     path.working_set_bytes = size;
     path.warmup_runs = options.warmup;
-    path.repetitions = options.repetitions;
 
     for (std::uint32_t w = 0; w < options.warmup; ++w) {
       hipMemcpy(h_dst.data(), d_dst, size, hipMemcpyDeviceToHost);
     }
 
     bool sentinel_ok = true;
-    for (std::uint32_t r = 0; r < options.repetitions; ++r) {
+    for (detail::BandwidthRun run(options, path); run.ShouldContinue();) {
       std::fill(h_dst.begin(), h_dst.end(), 0);
       hipEventRecord(start_event, nullptr);
       hipMemcpy(h_dst.data(), d_dst, size, hipMemcpyDeviceToHost);
@@ -179,8 +176,7 @@ std::vector<BandwidthPathResult> MeasureHipBandwidth(
       float elapsed_ms = 0.0F;
       hipEventElapsedTime(&elapsed_ms, start_event, stop_event);
       const double elapsed_sec = static_cast<double>(elapsed_ms) / 1000.0;
-      const double gbps = (static_cast<double>(size) / 1e9) / elapsed_sec;
-      path.raw_repetitions_gbps.push_back(gbps);
+      run.Record(elapsed_sec, static_cast<double>(size));
 
       if (h_dst[0] != h_src[0] || h_dst[size / 2] != h_src[size / 2] ||
           h_dst[size - 1] != h_src[size - 1]) {
