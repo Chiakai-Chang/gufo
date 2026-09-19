@@ -10,6 +10,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/core/session_mode.hpp"
 #include "src/models/deepseek_v4_flash/chat_template.hpp"
 #include "src/models/deepseek_v4_flash/runtime/model.h"
 
@@ -57,7 +58,8 @@ public:
       std::string* error_msg = nullptr);
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
-      std::uint32_t max_context, std::string* error_msg = nullptr);
+      core::SessionMode mode, std::uint32_t max_context,
+      std::string* error_msg = nullptr);
   [[nodiscard]] bool EvaluateBatch(std::span<const SessionBatchItem> items,
                                    std::string* error_msg = nullptr) const;
   [[nodiscard]] bool DsparkStepBatch(
@@ -107,7 +109,7 @@ public:
                                float min_p = 0.0F) const;
   [[nodiscard]] bool Evaluate(int token, std::string* error_msg = nullptr);
   /// True when this session has a DSpark drafter attached.
-  [[nodiscard]] bool HasDspark() const;
+  [[nodiscard]] bool DsparkEnabled() const;
   /// Reset request statistics and draft policy, retaining a restored prefix.
   void BeginRequest();
   /// Discards DSpark-only request state before exact multi-session execution.

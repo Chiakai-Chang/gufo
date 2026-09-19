@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "src/core/session_mode.hpp"
 #include "src/models/qwen/hip/ops/token.hpp"
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
@@ -39,6 +40,7 @@ public:
   Session(const Session&) = delete;
   Session& operator=(const Session&) = delete;
 
+  [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
@@ -97,6 +99,7 @@ private:
   const Executor* owner_{nullptr};
   qwen::vision::DeviceInput vision_input_;
   std::uint32_t max_context_{0};
+  bool mtp_enabled_{false};
   std::uint32_t index_capacity_{0};  ///< power-of-two raw indexer ring rows
   std::uint32_t position_{0};
   std::vector<LinearState> linear_;
@@ -145,11 +148,13 @@ public:
       std::string* error_msg = nullptr);
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
-      std::uint32_t max_context, std::string* error_msg = nullptr) const;
+      core::SessionMode mode, std::uint32_t max_context,
+      std::string* error_msg = nullptr) const;
   [[nodiscard]] bool EnsureRollback(Session& session, std::uint32_t depth,
                                     std::string* error_msg) const;
   [[nodiscard]] std::size_t SessionBytes(
-      std::uint32_t max_context, std::uint32_t rollback_depth) const noexcept;
+      core::SessionMode mode, std::uint32_t max_context,
+      std::uint32_t rollback_depth) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
@@ -512,8 +517,6 @@ private:
   std::int32_t* mtp_token_host_{nullptr};
   MtpCandidateLogits* mtp_candidates_host_{nullptr};
   mutable gufo::hip::GpuSamplingWorkspace sampling_workspace_;
-  mutable std::vector<std::uint32_t> penalty_tokens_;
-  mutable std::vector<std::uint32_t> penalty_counts_;
   /// The model geometry allows the wide mixer route (see Combine).
   bool wide_mixer_{false};
   /// Set by Moe when its epilogue is left for the combine that follows.

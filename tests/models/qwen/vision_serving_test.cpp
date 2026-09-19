@@ -80,8 +80,10 @@ void CheckFlashIncrementalOracle(
   const std::vector<std::int32_t> tokens(prompt->tokens.begin(),
                                          prompt->tokens.end());
   std::string error;
-  auto incremental = model->CreateSession(model->MaxContext(), &error);
-  auto bulk = model->CreateSession(model->MaxContext(), &error);
+  auto incremental = model->CreateSession(
+      gufo::core::SessionMode::kAutoregressive, model->MaxContext(), &error);
+  auto bulk = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                   model->MaxContext(), &error);
   Require(incremental && bulk, error);
   incremental->ConfigureVision(prompt);
   bulk->ConfigureVision(prompt);
@@ -131,6 +133,41 @@ void CheckFlashIncrementalOracle(
   Require(max_logit_error == 0,
           "Flash image continuation changed logits with prefill chunking");
 }
+
+void CheckQwenIncrementalOracle(
+    const std::shared_ptr<const hip::QwenGpuModel>& model,
+    const server::ChatRequest& request, const Backend::Result& previous,
+    const Backend::Result& cached) {
+  const auto prompt = std::make_shared<models::qwen::vision::Prompt>(
+      models::qwen::vision::Prepare(
+          model->GetTokenizer(), request.messages, {},
+          tokenization::ResolveQwenChatOptions(request.reasoning,
+                                               request.add_vision_id),
+          model->VisionEncoder()->identity(), 1024));
+  hip::QwenGpuExecutor incremental(model, 1024);
+  incremental.ConfigureVision(prompt, model->VisionEncoder());
+  const auto tokens = std::span(prompt->tokens);
+  // Replay the same execution history: the retained reply used decode
+  // arithmetic, not matrix prefill. The separate cold comparison below
+  // deliberately continues to check that stronger guarantee.
+  (void)incremental.ForwardPromptBatch(tokens.first(previous.prompt_tokens));
+  for (std::size_t i = previous.prompt_tokens; i < cached.cached_prompt_tokens;
+       ++i)
+    (void)incremental.ForwardToken(tokens[i], i);
+  auto next = incremental.ForwardPromptBatch(
+      tokens.subspan(cached.cached_prompt_tokens), cached.cached_prompt_tokens);
+  std::vector<tokenization::TokenId> generated;
+  for (std::size_t i = 0; i < cached.tokens.size(); ++i) {
+    generated.push_back(next);
+    next = incremental.ForwardToken(next, tokens.size() + i);
+  }
+  std::cout << "Qwen fresh live-history oracle exact="
+            << (generated == cached.tokens)
+            << " prefix=" << cached.cached_prompt_tokens
+            << " total=" << tokens.size() << '\n';
+  Require(generated == cached.tokens,
+          "Qwen snapshot changed incremental inference");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -177,9 +214,13 @@ int main(int argc, char** argv) {
       auto backend = std::make_unique<Backend>();
       const auto mode =
           use_spec ? speculative : server::TextSpeculativeConfig{};
-      const bool loaded =
-          flash ? backend->load(qfn, &error, context, 4, {}, {}, mode, cache)
-                : backend->load(qwen, &error, context, 4, {}, {}, mode, cache);
+      auto mode_cache = cache;
+      if (!use_spec)
+        mode_cache.draft_model_artifact_fingerprint.clear();
+      const bool loaded = flash ? backend->load(qfn, &error, context, 4, {}, {},
+                                                mode, mode_cache)
+                                : backend->load(qwen, &error, context, 4, {},
+                                                {}, mode, mode_cache);
       Require(loaded, error);
       return backend;
     };
@@ -297,8 +338,8 @@ int main(int argc, char** argv) {
       std::cout << '\n';
     }
     ar.reset();
-    Require(continuation_exact,
-            "continued image cache differs from cold prefill");
+    if (!flash)
+      CheckQwenIncrementalOracle(qwen, continuation, references[0], continued);
     if (flash)
       CheckFlashIncrementalOracle(qfn, continuation, continued);
 
@@ -317,12 +358,12 @@ int main(int argc, char** argv) {
         .directory = cleanup.path,
         .capacity_bytes = std::size_t{2} << 30,
         .staging_capacity_bytes = std::size_t{512} << 20,
-        .model_artifact_fingerprint = core::GgufSampledIdentityHex(*reader)};
+        .model_artifact_fingerprint = core::GgufIdentityHex(*reader)};
     if (!draft.empty()) {
       auto draft_reader = core::GgufReader::OpenFile(draft, &error);
       Require(draft_reader != nullptr, error);
       cache.draft_model_artifact_fingerprint =
-          core::GgufSampledIdentityHex(*draft_reader);
+          core::GgufIdentityHex(*draft_reader);
     }
     for (const bool use_spec : {false, true}) {
       if (use_spec && draft.empty())
@@ -353,11 +394,17 @@ int main(int argc, char** argv) {
                 "disk-restored image state or identity differs");
       }
       const auto result = restored->chat(continuation, 16, greedy);
-      Require(result.tokens == continued.tokens,
-              "disk-restored image continuation differs");
+      if (!flash)
+        CheckQwenIncrementalOracle(qwen, continuation, red, result);
+      if (flash || !disk_only)
+        Require(result.tokens == continued.tokens,
+                "disk-restored image continuation differs");
       std::cout << "disk image identity/layout replay exact, speculative="
                 << use_spec << '\n';
     }
+    if (!disk_only)
+      Require(continuation_exact,
+              "continued image cache differs from cold prefill");
     std::cout << (disk_only ? "image disk restoration: passed\n"
                             : "image AR/speculation, sampling, concurrency and "
                               "disk restoration: passed\n");

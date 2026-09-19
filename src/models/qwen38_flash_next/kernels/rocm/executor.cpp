@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "qfn_mmq.h"
+#include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
@@ -483,10 +484,16 @@ std::unique_ptr<Executor> Executor::Create(const DeviceModel& model,
   return e;
 }
 
-std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
+std::unique_ptr<Session> Executor::CreateSession(core::SessionMode mode,
+                                                 std::uint32_t max_context,
                                                  std::string* error_msg) const {
   std::unique_ptr<Session> s(new Session());
   s->owner_ = this;
+  s->mtp_enabled_ = mode == core::SessionMode::kSpeculative;
+  if (s->mtp_enabled_ && !has_mtp()) {
+    AssignError(error_msg, "MTP session requires a loaded predictor");
+    return nullptr;
+  }
   const Config& c = config();
   if (max_context == 0 || max_context > c.context_length) {
     AssignError(error_msg, "session context exceeds the model context");
@@ -535,7 +542,7 @@ std::unique_ptr<Session> Executor::CreateSession(std::uint32_t max_context,
     s->ple_history_ = Alloc<float>(a, hist, error_msg, &s->allocated_bytes_);
   }
   s->control_ = Alloc<Session::Control>(a, 1, error_msg, &s->allocated_bytes_);
-  if (model_->has_mtp()) {
+  if (s->mtp_enabled_) {
     s->mtp_.target_hidden = Alloc<float>(
         a, static_cast<std::size_t>(options_.max_speculative) * c.HcDim(),
         error_msg, &s->allocated_bytes_);
@@ -612,7 +619,8 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
 }
 
 std::size_t Executor::SessionBytes(
-    std::uint32_t max_context, std::uint32_t rollback_depth) const noexcept {
+    core::SessionMode mode, std::uint32_t max_context,
+    std::uint32_t rollback_depth) const noexcept {
   const auto& c = config();
   const std::size_t attention = c.num_layers / c.full_attention_interval;
   const std::size_t linear = c.num_layers - attention;
@@ -632,10 +640,11 @@ std::size_t Executor::SessionBytes(
   return (linear * (conv + state) + ple) * (rollback_depth + 1) *
              sizeof(float) +
          attention * (kv + index) + sizeof(Session::Control) +
-         (has_mtp() ? kv + index +
-                          std::size_t{options_.max_speculative + 1} *
-                              c.HcDim() * sizeof(float)
-                    : 0);
+         (mode == core::SessionMode::kSpeculative
+              ? kv + index +
+                    std::size_t{options_.max_speculative + 1} * c.HcDim() *
+                        sizeof(float)
+              : 0);
 }
 
 std::size_t Executor::DeferredScratchBytes() const {
@@ -1628,8 +1637,8 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
 
 bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
                                std::string* error_msg) const {
-  if (!has_mtp() || session.owner_ != this || session.position_ == 0 ||
-      hidden.size() != config().HcDim()) {
+  if (!session.mtp_enabled_ || session.owner_ != this ||
+      session.position_ == 0 || hidden.size() != config().HcDim()) {
     AssignError(error_msg, "invalid trunk hidden diagnostic input");
     return false;
   }
@@ -1751,7 +1760,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   const std::uint32_t start_pos = session.position_;
   if (!session.CheckCancellation(error_msg))
     return false;
-  if (model_->has_mtp() && prefill_phase &&
+  if (session.mtp_enabled_ && prefill_phase &&
       session.mtp_.position != start_pos) {
     AssignError(error_msg,
                 "MTP must consume the preceding frontier before prefill");
@@ -1835,7 +1844,7 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   if (sparse) {
     session.blocks_ = complete;
   }
-  if (model_->has_mtp() && prefill_phase && n > 1) {
+  if (session.mtp_enabled_ && prefill_phase && n > 1) {
     // Every successor except the last one is already known. Consume it while
     // the trunk residual is still in shared scratch. MtpBody reads that
     // residual into xn before reusing res for the predictor output.
@@ -1914,7 +1923,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
   // Prefill catches up immediately from shared scratch. Only the short tail
   // needed across calls belongs to this session.
   const auto kept = std::min(n, options_.max_speculative);
-  if (model_->has_mtp() &&
+  if (session.mtp_enabled_ &&
       !Check(hipMemcpyAsync(
                  session.mtp_.target_hidden,
                  s_.res + static_cast<std::size_t>(n - kept) * c.HcDim(),
@@ -2191,7 +2200,8 @@ std::uint64_t Executor::WalkSnapshot(const SnapshotHeader& h,
 
 std::uint64_t Executor::SnapshotBytes(const Session& session,
                                       std::uint32_t hidden_rows) const {
-  SnapshotHeader h = MakeSnapshotHeader(config(), model_->has_mtp(), session);
+  SnapshotHeader h =
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
   h.blocks = session.blocks_;
   h.mtp_blocks = session.mtp_.blocks;
   h.mtp_position = session.mtp_.position;
@@ -2218,7 +2228,8 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     AssignError(error_msg, "kept trunk rows exceed the position or batch");
     return false;
   }
-  SnapshotHeader h = MakeSnapshotHeader(config(), model_->has_mtp(), session);
+  SnapshotHeader h =
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
   h.blocks = session.blocks_;
   h.mtp_blocks = session.mtp_.blocks;
   h.mtp_position = session.mtp_.position;
@@ -2229,10 +2240,7 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
     AssignError(error_msg, "snapshot buffer size does not match the payload");
     return false;
   }
-  // Queued work may still be writing the caches this reads.
-  if (!Check(hipStreamSynchronize(stream_), "snapshot drain", error_msg)) {
-    return false;
-  }
+  gufo::hip::SnapshotTransfer transfer;
   std::memcpy(payload.data(), &h, sizeof(h));
   const auto grid_bytes =
       std::size_t{h.image_count} * sizeof(qwen::vision::ImageGrid);
@@ -2242,11 +2250,11 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
   }
   return WalkSnapshot(h, &session,
                       [&](void* device, std::uint64_t offset,
-                          std::uint64_t bytes, const char* what) {
-                        return session.CheckCancellation(error_msg) &&
-                               Check(hipMemcpy(payload.data() + offset, device,
-                                               bytes, hipMemcpyDeviceToHost),
-                                     what, error_msg);
+                          std::uint64_t bytes, const char*) {
+                        if (!session.CheckCancellation(error_msg))
+                          return false;
+                        transfer.Copy(payload.data() + offset, device, bytes);
+                        return true;
                       }) != 0;
 }
 
@@ -2265,7 +2273,7 @@ bool Executor::RestoreSnapshot(Session& session,
   SnapshotHeader h{};
   std::memcpy(&h, payload.data(), sizeof(h));
   const SnapshotHeader mine =
-      MakeSnapshotHeader(config(), model_->has_mtp(), session);
+      MakeSnapshotHeader(config(), session.mtp_enabled_, session);
   if (!SameGeometry(h, mine)) {
     AssignError(error_msg, "snapshot was taken with another model geometry");
     return false;
@@ -2390,26 +2398,6 @@ bool Executor::VerifyMtpProposal(std::uint32_t row, const MtpProposal& proposal,
     return false;
   }
   const auto& config = sampler.config();
-  penalty_tokens_.clear();
-  penalty_counts_.clear();
-  if (config.penalties_enabled()) {
-    for (const auto id : sampler.history()) {
-      if (id < this->config().vocab_size) {
-        penalty_tokens_.push_back(id);
-      }
-    }
-    std::sort(penalty_tokens_.begin(), penalty_tokens_.end());
-    std::size_t count = 0;
-    for (const auto id : penalty_tokens_) {
-      if (count == 0 || penalty_tokens_[count - 1] != id) {
-        penalty_tokens_[count++] = id;
-        penalty_counts_.push_back(1);
-      } else {
-        ++penalty_counts_.back();
-      }
-    }
-    penalty_tokens_.resize(count);
-  }
   const gufo::hip::GpuSamplingParameters parameters{
       .temperature = config.temperature,
       .top_k = config.top_k,
@@ -2429,8 +2417,8 @@ bool Executor::VerifyMtpProposal(std::uint32_t row, const MtpProposal& proposal,
       s_.mtp_ids, s_.mtp_ids + 1, this->config().vocab_size, parameters,
       proposal.token, proposal.probability, proposal.ids.data(),
       proposal.probabilities.data(), proposal.size, acceptance_uniform,
-      residual_uniform, penalty_tokens_.data(), penalty_counts_.data(),
-      penalty_tokens_.size(), &sampling_workspace_, stream_);
+      residual_uniform, sampler.penalties().data(), sampler.penalties().size(),
+      &sampling_workspace_, stream_);
   if (!Check(
           hipMemcpyAsync(mtp_token_host_, s_.mtp_ids, 2 * sizeof(std::int32_t),
                          hipMemcpyDeviceToHost, stream_),
@@ -2461,7 +2449,7 @@ bool Executor::MtpForward(Session& session,
   }
   if (!session.CheckCancellation(error_msg))
     return false;
-  if (!model_->has_mtp()) {
+  if (!session.mtp_enabled_) {
     AssignError(error_msg, "no MTP block loaded");
     return false;
   }

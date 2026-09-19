@@ -381,6 +381,17 @@ void TestHuggingFaceRenderedGoldens() {
                std::vector<ChatMessage>{base[0], {role, "Late instructions"}}),
            "Late system/developer messages are rejected");
   }
+  for (const auto role : {ChatRole::kSystem, ChatRole::kDeveloper,
+                          ChatRole::kAssistant, ChatRole::kTool}) {
+    std::string error;
+    Expect(!QwenChatTemplate::Render(
+               std::vector<ChatMessage>{{role, "No user query"}}, {}, &error) &&
+               error == "No user query found in messages.",
+           "A system/assistant/tool-only transcript has no user query");
+  }
+  Expect(!QwenChatTemplate::Render(std::vector<ChatMessage>{
+             {ChatRole::kUser, "<tool_response>result</tool_response>"}}),
+         "A wrapped tool response is not a user query");
 }
 
 void TestRenderAndTokenize() {
@@ -551,6 +562,7 @@ void TestToolReplayPreservesGeneratedPrefix() {
   });
 
   const std::vector<gufo::tokenization::ChatMessage> messages = {
+      {gufo::tokenization::ChatRole::kUser, "Read the file."},
       std::move(assistant),
   };
   gufo::tokenization::ChatTemplateOptions options;
@@ -565,7 +577,9 @@ void TestToolReplayPreservesGeneratedPrefix() {
       "<tool_call>\n<function=read>\n<parameter=path>\n/etc/hostname\n"
       "</parameter>\n</function>\n</tool_call>";
   const std::string expected =
-      "<|im_start|>assistant\n" + generated + "<|im_end|>\n";
+      "<|im_start|>user\nRead the file.<|im_end|>\n"
+      "<|im_start|>assistant\n" +
+      generated + "<|im_end|>\n";
   Expect(*rendered == expected,
          "Structured tool replay is byte-identical to generated syntax");
 }

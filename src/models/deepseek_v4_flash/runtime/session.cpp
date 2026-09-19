@@ -24,6 +24,7 @@ struct ds4_session {
     uint32_t prefill_capacity;
     int context_size;
     bool checkpoint_valid;
+    bool use_dspark;
     ds4_dspark_request_state dspark_state{};
     /* Verified target rows for a sampled concurrent cycle; grown on demand. */
     std::unique_ptr<float[]> spec_rows;
@@ -47,56 +48,56 @@ static void session_dspark_reset_request_state(ds4_session *session,
                                                bool preserve_force_plain) {
     if (!session) return;
     const bool force_plain =
-        preserve_force_plain && session->dspark_state.force_plain_request;
+        !session->use_dspark ||
+        (preserve_force_plain && session->dspark_state.force_plain_request);
     session->dspark_state = {};
     session->dspark_state.force_plain_request = force_plain;
     session->dspark_state.plain_only = force_plain;
     ds4_rocm_graph_dspark_set_capture_enabled(session->graph, !force_plain);
 }
 
-int ds4_session_create(ds4_session **out,
-                       ds4_engine *engine,
-                       int context_size) {
-    if (!out || !engine || context_size <= 0) return 1;
+int ds4_session_create(ds4_session** out, ds4_engine* engine, int context_size,
+                       bool use_dspark) {
+  if (!out || !engine || context_size <= 0 || (use_dspark && !engine->dspark))
+    return 1;
 
-    auto session = std::unique_ptr<ds4_session>(
-        new (std::nothrow) ds4_session{});
-    if (!session) return 1;
+  auto session = std::unique_ptr<ds4_session>(new (std::nothrow) ds4_session{});
+  if (!session)
+    return 1;
 
-    session->engine = engine;
-    session->context_size = context_size;
-    session->prefill_capacity =
-        ds4_rocm_graph_prefill_capacity(context_size);
-    session->graph = ds4_rocm_graph_create(engine,
-                                           context_size,
-                                           session->prefill_capacity);
-    if (!session->graph) {
-        return 1;
-    }
+  session->engine = engine;
+  session->use_dspark = use_dspark;
+  session->context_size = context_size;
+  session->prefill_capacity = ds4_rocm_graph_prefill_capacity(context_size);
+  session->graph =
+      ds4_rocm_graph_create(engine, context_size, session->prefill_capacity);
+  if (!session->graph) {
+    return 1;
+  }
 
-    const int vocabulary_size = ds4_engine_vocab_size(engine);
-    if (vocabulary_size <= 0 ||
-        (size_t)vocabulary_size > SIZE_MAX / sizeof(session->logits[0])) {
+  const int vocabulary_size = ds4_engine_vocab_size(engine);
+  if (vocabulary_size <= 0 ||
+      (size_t)vocabulary_size > SIZE_MAX / sizeof(session->logits[0])) {
+    ds4_rocm_graph_destroy(session->graph);
+    return 1;
+  }
+  session->logits.reset(new (std::nothrow) float[vocabulary_size]);
+  if (!session->logits) {
+    ds4_rocm_graph_destroy(session->graph);
+    return 1;
+  }
+
+  /* Prefill captures target features and seeds the attached support model's
+   * KV. */
+  if (use_dspark) {
+    if (!ds4_rocm_graph_dspark_attach(session->graph, engine, engine->dspark)) {
       ds4_rocm_graph_destroy(session->graph);
       return 1;
     }
-    session->logits.reset(new (std::nothrow) float[vocabulary_size]);
-    if (!session->logits) {
-        ds4_rocm_graph_destroy(session->graph);
-        return 1;
-    }
+  }
 
-    /* Prefill captures target features and seeds the attached support model's
-     * KV. */
-    if (engine->dspark != nullptr) {
-        if (!ds4_rocm_graph_dspark_attach(session->graph, engine, engine->dspark)) {
-            ds4_rocm_graph_destroy(session->graph);
-            return 1;
-        }
-    }
-
-    *out = session.release();
-    return 0;
+  *out = session.release();
+  return 0;
 }
 
 void ds4_session_free(ds4_session *session) {
@@ -104,6 +105,10 @@ void ds4_session_free(ds4_session *session) {
     ds4_rocm_graph_destroy(session->graph);
     ds4_tokens_free(&session->checkpoint);
     delete session;
+}
+
+bool ds4_session_dspark_enabled(const ds4_session* session) {
+  return session && session->use_dspark;
 }
 
 void ds4_session_set_cancel(ds4_session *session,
@@ -124,9 +129,8 @@ void ds4_session_begin_request(ds4_session* session) {
   if (!session)
     return;
   const bool incomplete_support =
-      session->engine->dspark &&
-      ds4_rocm_graph_dspark_context_len(session->graph) <
-          static_cast<uint32_t>(session->checkpoint.len);
+      session->use_dspark && ds4_rocm_graph_dspark_context_len(session->graph) <
+                                 static_cast<uint32_t>(session->checkpoint.len);
   session_dspark_reset_request_state(session, false);
   if (incomplete_support)
     ds4_session_prepare_batch_execution(session);

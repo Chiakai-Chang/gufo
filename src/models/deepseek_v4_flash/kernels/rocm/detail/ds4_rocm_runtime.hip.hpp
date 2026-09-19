@@ -44,6 +44,7 @@ static int g_rocm_mmq_ready;
 #endif
 #ifdef __HIP_PLATFORM_AMD__
 #include "ds4_rocm_hipblaslt.hip.hpp"
+#include "src/core/hip/snapshot_transfer.hpp"
 #endif
 enum {
     DS4_ROCM_N_EXPERT = 256u,
@@ -1178,6 +1179,21 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return hip_ok(hipMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, hipMemcpyDeviceToHost), "tensor read");
+}
+
+extern "C" int ds4_gpu_tensor_snapshot_read(const ds4_gpu_tensor* tensor,
+                                            uint64_t offset, void* data,
+                                            uint64_t bytes) {
+  if (!tensor || !data || offset > tensor->bytes ||
+      bytes > tensor->bytes - offset)
+    return 0;
+  try {
+    thread_local gufo::hip::SnapshotTransfer transfer;
+    transfer.Copy(data, static_cast<const char*>(tensor->ptr) + offset, bytes);
+    return 1;
+  } catch (const std::exception&) {
+    return 0;
+  }
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,

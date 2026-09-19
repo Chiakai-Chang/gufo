@@ -30,14 +30,10 @@ void Expect(bool condition, std::string_view message) {
   }
 }
 
-std::uint32_t Sample(std::span<const float> logits,
-                     const gufo::hip::GpuSamplingParameters& parameters,
-                     std::span<const std::uint32_t> penalty_tokens = {},
-                     std::span<const std::uint32_t> penalty_counts = {}) {
-  if (penalty_tokens.size() != penalty_counts.size()) {
-    throw std::invalid_argument("penalty vectors must have equal lengths");
-  }
-
+std::uint32_t Sample(
+    std::span<const float> logits,
+    const gufo::hip::GpuSamplingParameters& parameters,
+    std::span<const gufo::sampling::TokenPenalty> penalties = {}) {
   float* device_logits = nullptr;
   std::uint32_t* device_token = nullptr;
   CheckHip(hipMalloc(&device_logits, logits.size_bytes()), "allocate logits");
@@ -48,10 +44,9 @@ std::uint32_t Sample(std::span<const float> logits,
 
   gufo::hip::GpuSamplingWorkspace workspace;
   gufo::hip::AllocateGpuSamplingWorkspace(&workspace, logits.size(),
-                                          penalty_tokens.size());
+                                          penalties.size());
   gufo::hip::LaunchGPUSampling(device_logits, device_token, logits.size(),
-                               parameters, penalty_tokens.data(),
-                               penalty_counts.data(), penalty_tokens.size(),
+                               parameters, penalties.data(), penalties.size(),
                                &workspace);
 
   std::uint32_t token = 0;
@@ -76,10 +71,8 @@ SpeculativeSample SampleSpeculatively(
     std::span<const std::uint32_t> draft_candidate_ids,
     std::span<const float> draft_candidate_probabilities,
     float acceptance_uniform, float residual_uniform,
-    std::span<const std::uint32_t> penalty_tokens = {},
-    std::span<const std::uint32_t> penalty_counts = {}) {
-  if (draft_candidate_ids.size() != draft_candidate_probabilities.size() ||
-      penalty_tokens.size() != penalty_counts.size()) {
+    std::span<const gufo::sampling::TokenPenalty> penalties = {}) {
+  if (draft_candidate_ids.size() != draft_candidate_probabilities.size()) {
     throw std::invalid_argument("sparse vectors must have equal lengths");
   }
 
@@ -97,13 +90,13 @@ SpeculativeSample SampleSpeculatively(
   gufo::hip::GpuSamplingWorkspace workspace;
   gufo::hip::AllocateGpuSamplingWorkspace(
       &workspace, logits.size(),
-      std::max(draft_candidate_ids.size(), penalty_tokens.size()));
+      std::max(draft_candidate_ids.size(), penalties.size()));
   gufo::hip::LaunchGPUSpeculativeSampling(
       device_logits, device_token, device_accepted, logits.size(), parameters,
       draft_token, draft_token_probability, draft_candidate_ids.data(),
       draft_candidate_probabilities.data(), draft_candidate_ids.size(),
-      acceptance_uniform, residual_uniform, penalty_tokens.data(),
-      penalty_counts.data(), penalty_tokens.size(), &workspace);
+      acceptance_uniform, residual_uniform, penalties.data(), penalties.size(),
+      &workspace);
 
   SpeculativeSample result;
   std::uint32_t accepted = 0;
@@ -123,12 +116,11 @@ SpeculativeSample SampleSpeculatively(
 
 void TestGreedySparsePenalty() {
   const std::vector<float> logits = {5.0F, 4.0F, 3.0F};
-  const std::vector<std::uint32_t> penalty_tokens = {0U};
-  const std::vector<std::uint32_t> penalty_counts = {1U};
+  const std::vector<gufo::sampling::TokenPenalty> penalties = {{0, 0, 1}};
   gufo::hip::GpuSamplingParameters parameters;
   parameters.repeat_penalty = 2.0F;
 
-  Expect(Sample(logits, parameters, penalty_tokens, penalty_counts) == 1U,
+  Expect(Sample(logits, parameters, penalties) == 1U,
          "sparse repeat penalty changes the greedy winner");
 }
 
@@ -199,6 +191,31 @@ void TestTopKOneIsDeterministic() {
          "top-k one remains deterministic argmax");
 }
 
+void TestFullGenerationPenalties() {
+  const std::vector<float> logits{3, 2, 1};
+  gufo::sampling::SamplerState sampler({.repeat_last_n = 0,
+                                        .frequency_penalty = 0.5F,
+                                        .presence_penalty = 0.25F},
+                                       std::vector<std::uint32_t>{0, 0, 0});
+  gufo::hip::GpuSamplingParameters p{.frequency_penalty = 0.5F,
+                                     .presence_penalty = 0.25F};
+  Expect(Sample(logits, p, sampler.penalties()) == 0,
+         "prompt occurrences must not count as generated text");
+  sampler.Accept(std::vector<std::uint32_t>{0, 0});
+  sampler.Accept(std::vector<std::uint32_t>(80, 2));
+  // [3 - 2*.5 - .25, 2, 1 - 80*.5 - .25] -> token 1.
+  Expect(
+      Sample(logits, p, sampler.penalties()) == 1,
+      "GPU penalties retain response counts beyond 64 with no repeat window");
+  p.temperature = 1;
+  const std::vector<std::uint32_t> ids{0};
+  const std::vector<float> q{1};
+  const auto result = SampleSpeculatively(logits, p, 0, 1, ids, q, 0.99F, 0.5F,
+                                          sampler.penalties());
+  Expect(!result.accepted && result.token == 1,
+         "GPU residual verification uses the same full generated counts");
+}
+
 void TestTopKOneRespectsMinimumKeep() {
   const std::vector<float> logits = {std::log(0.20F), std::log(0.80F)};
   gufo::hip::GpuSamplingParameters parameters;
@@ -219,17 +236,12 @@ void TestTopKOneRespectsMinimumKeep() {
 void CheckSamplingDistribution(const gufo::sampling::SamplingConfig& config) {
   const std::vector<float> logits{0.4F, 2.0F, -1.0F, 1.1F, -0.3F};
   const std::vector<std::uint32_t> history{1, 1, 2, 3};
+  const std::vector<std::uint32_t> generated{3, 1, 4};
   const auto distribution =
-      gufo::sampling::BuildDistribution(logits, config, history);
-  const gufo::sampling::SamplerState sampler(config, history);
-  std::vector<std::uint32_t> ids, counts;
-  for (std::uint32_t token = 0; token < logits.size(); ++token) {
-    const auto count = std::ranges::count(sampler.history(), token);
-    if (count > 0 && config.penalties_enabled()) {
-      ids.push_back(token);
-      counts.push_back(static_cast<std::uint32_t>(count));
-    }
-  }
+      gufo::sampling::BuildDistribution(logits, config, history, generated);
+  gufo::sampling::SamplerState sampler(config, history);
+  sampler.Accept(generated);
+  const auto penalties = sampler.penalties();
   std::vector<gufo::sampling::Probability> ordered(
       distribution.entries().begin(), distribution.entries().end());
   const bool linear = config.top_k == 0 && config.top_p == 1.0F &&
@@ -260,9 +272,8 @@ void CheckSamplingDistribution(const gufo::sampling::SamplingConfig& config) {
   };
   for (const float uniform : {0.0F, 0.23F, 0.91F, 0.99999994F}) {
     parameters.uniform = uniform;
-    Expect(
-        Sample(logits, parameters, ids, counts) == quantile(ordered, uniform),
-        "AR quantile differs from the double-precision reference");
+    Expect(Sample(logits, parameters, penalties) == quantile(ordered, uniform),
+           "AR quantile differs from the double-precision reference");
   }
   if (!config.uses_random_sampling())
     return;  // Greedy proposal verification is covered by the verifier/model.
@@ -282,16 +293,16 @@ void CheckSamplingDistribution(const gufo::sampling::SamplingConfig& config) {
     if (ratio > tolerance) {
       const auto result = SampleSpeculatively(
           logits, parameters, draft_ids[i], draft_probabilities[i], draft_ids,
-          draft_probabilities, static_cast<float>(ratio - tolerance), 0.5F, ids,
-          counts);
+          draft_probabilities, static_cast<float>(ratio - tolerance), 0.5F,
+          penalties);
       Expect(result.accepted && result.token == draft_ids[i],
              "DFlash2 acceptance below p/q differs from reference");
     }
     if (ratio < 1.0 - tolerance) {
       const auto result = SampleSpeculatively(
           logits, parameters, draft_ids[i], draft_probabilities[i], draft_ids,
-          draft_probabilities, static_cast<float>(ratio + tolerance), 0.5F, ids,
-          counts);
+          draft_probabilities, static_cast<float>(ratio + tolerance), 0.5F,
+          penalties);
       Expect(!result.accepted,
              "DFlash2 rejection above p/q differs from reference");
       rejected_candidate = i;
@@ -327,7 +338,7 @@ void CheckSamplingDistribution(const gufo::sampling::SamplingConfig& config) {
     const auto result = SampleSpeculatively(
         logits, parameters, draft_ids[rejected_candidate],
         draft_probabilities[rejected_candidate], draft_ids, draft_probabilities,
-        rejection_draw, uniform, ids, counts);
+        rejection_draw, uniform, penalties);
     Expect(!result.accepted && result.token == quantile(residual, uniform),
            "DFlash2 residual CDF differs from normalized positive p-q");
   }
@@ -678,6 +689,7 @@ void TestBatchedArgmaxTiles() {
 }  // namespace
 
 int main() {
+  TestFullGenerationPenalties();
   int device_count = 0;
   if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0) {
     return 77;

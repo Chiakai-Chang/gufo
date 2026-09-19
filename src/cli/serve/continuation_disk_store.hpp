@@ -1,6 +1,7 @@
 #ifndef GUFO_SERVER_CONTINUATION_DISK_STORE_HPP_
 #define GUFO_SERVER_CONTINUATION_DISK_STORE_HPP_
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -65,8 +66,8 @@ struct ContinuationDiskStoreOptions {
 /// owns checksums, exact token verification, byte limits, atomic publication,
 /// startup indexing, LRU replacement, permissions, and collision-safe lookup.
 ///
-/// Persistence uses one bounded worker. Optional request lookups skip a busy
-/// store instead of waiting for disk I/O on the generation scheduler.
+/// Persistence uses one bounded worker. Payload writes and fsync run outside
+/// the metadata gate, so existing entries remain readable during persistence.
 class ContinuationDiskStore {
 public:
   using EventSink = std::function<void(const ContinuationDiskEvent&)>;
@@ -102,6 +103,28 @@ public:
       const TextRunnerSnapshot& snapshot,
       std::span<const std::uint8_t> input_identity = {});
 
+  /// Holds disk-only capture memory against the staging budget until it is
+  /// queued or discarded. Reservations can safely outlive the store.
+  class CaptureReservation {
+  public:
+    ~CaptureReservation();
+    CaptureReservation(const CaptureReservation&) = delete;
+    CaptureReservation& operator=(const CaptureReservation&) = delete;
+
+  private:
+    friend class ContinuationDiskStore;
+    CaptureReservation(std::shared_ptr<std::atomic<std::size_t>> counter,
+                       std::size_t bytes)
+        : counter_(std::move(counter)), bytes_(bytes) {}
+    std::shared_ptr<std::atomic<std::size_t>> counter_;
+    std::size_t bytes_;
+  };
+
+  [[nodiscard]] std::unique_ptr<CaptureReservation> ReserveCapture(
+      const TextModelRunner& runner, std::size_t token_count,
+      std::size_t snapshot_bytes,
+      std::span<const std::uint8_t> input_identity = {});
+
   /// Conservative admission before capturing a snapshot. Includes queued and
   /// active snapshot bytes; failure means a harmless cache skip.
   [[nodiscard]] bool CanSave(
@@ -115,7 +138,8 @@ public:
       std::shared_ptr<const TextModelRunner> runner,
       std::vector<TextRunnerToken> checkpoint_tokens,
       std::shared_ptr<const TextRunnerSnapshot> snapshot,
-      std::vector<std::uint8_t> input_identity = {});
+      std::vector<std::uint8_t> input_identity = {},
+      std::unique_ptr<CaptureReservation> reservation = {});
 
   /// Drains accepted writes. Shutdown also drains automatically.
   void Flush();

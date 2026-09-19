@@ -126,7 +126,10 @@ void ScoreOfficialReference(
     Require(prompt.size() + target.size() + 1 < context,
             id + ": official case exceeds context");
     std::string error;
-    auto session = model->CreateSession(context, &error);
+    auto session = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        context, &error);
     Require(session != nullptr, error);
     Require(session->Sync(prompt, &error), error);
     Totals result{.cases = 1, .tokens = target.size()};
@@ -281,7 +284,10 @@ void DumpReferenceFrontiers(
     prompt_file.close();
     for (const std::size_t prefill_step : {2048u, 4096u}) {
       std::string error;
-      auto session = model->CreateSession(20480, &error);
+      auto session = model->CreateSession(
+          model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                             : gufo::core::SessionMode::kAutoregressive,
+          20480, &error);
       Require(session != nullptr, error);
       manifest << prefill_step << '\t' << depth << '\t' << prefix << '\t'
                << session->PrefillCapacity() << '\t'

@@ -186,14 +186,14 @@ void TestFrequencyAndPresencePenaltiesUseCounts() {
   gufo::sampling::SamplingConfig frequency_config;
   frequency_config.frequency_penalty = 0.4F;
   const auto frequency_distribution =
-      gufo::sampling::BuildDistribution(logits, frequency_config, history);
+      gufo::sampling::BuildDistribution(logits, frequency_config, {}, history);
   Expect(frequency_distribution.best_token() == 1,
          "frequency penalty scales with occurrence count");
 
   gufo::sampling::SamplingConfig presence_config;
   presence_config.presence_penalty = 0.7F;
   const auto presence_distribution =
-      gufo::sampling::BuildDistribution(logits, presence_config, history);
+      gufo::sampling::BuildDistribution(logits, presence_config, {}, history);
   Expect(presence_distribution.best_token() == 1,
          "presence penalty applies once when a token is present");
 }
@@ -371,10 +371,11 @@ void TestStrategyReplayAgainstReference() {
       config.seed = seed;
       std::vector<gufo::sampling::TokenId> history{1, 1, 2, 3};
       gufo::sampling::SamplerState sampler(config, history);
+      std::vector<gufo::sampling::TokenId> generated;
       auto replay = sampler;
       for (int step = 0; step < 16; ++step) {
-        const auto distribution =
-            gufo::sampling::BuildDistribution(logits, config, history);
+        const auto distribution = gufo::sampling::BuildDistribution(
+            logits, config, history, generated);
         std::vector<gufo::sampling::Probability> ordered(
             distribution.entries().begin(), distribution.entries().end());
         if (config.top_k == 0 && config.top_p == 1.0F &&
@@ -395,7 +396,7 @@ void TestStrategyReplayAgainstReference() {
         }
         const auto token = sampler.Sample(logits);
         Expect(token == expected && token == replay.Sample(logits), test.name);
-        history.push_back(token);
+        generated.push_back(token);
         sampler.Accept(token);
         replay.Accept(token);
       }
@@ -465,9 +466,44 @@ void TestDeferredResidualReplay() {
   Expect(sampler.Sample(logits) == 0, "RNG reset discards pending residual");
 }
 
+void TestResponsePenaltyScope() {
+  using gufo::sampling::SamplerState;
+  using gufo::sampling::TokenId;
+  const std::array<float, 3> logits{3, 2, 1};
+  SamplerState sampler({.temperature = 1,
+                        .seed = 7,
+                        .repeat_last_n = 0,
+                        .frequency_penalty = .5F,
+                        .presence_penalty = .25F},
+                       std::vector<TokenId>{0, 0, 0});
+  Expect(sampler.Distribution(logits).best_token() == 0,
+         "frequency/presence must not penalize prompt tokens");
+  sampler.Accept(std::vector<TokenId>{0, 0});
+  sampler.Accept(std::vector<TokenId>(80, 2));
+  const std::array<float, 3> expected_logits{1.75F, 2, -39.25F};
+  const auto expected =
+      gufo::sampling::BuildDistribution(expected_logits, {.temperature = 1});
+  for (const auto token : {0U, 1U, 2U})
+    Expect(std::abs(sampler.Distribution(logits).probability(token) -
+                    expected.probability(token)) < 1e-12,
+           "full response counts must outlive the repetition window");
+  auto rejected = sampler;
+  rejected.Accept(1);
+  Expect(sampler.Distribution(logits).best_token() == 1 &&
+             rejected.Distribution(logits).best_token() == 0,
+         "tentative penalty counts must not leak through speculative rollback");
+  auto replay = sampler;
+  Expect(replay.Sample(logits) == sampler.Sample(logits),
+         "penalty copies preserve RNG replay");
+  sampler.ResetHistory(std::vector<TokenId>{0, 0});
+  Expect(sampler.Distribution(logits).best_token() == 0,
+         "new request resets generated counts");
+}
+
 }  // namespace
 
 int main() {
+  TestResponsePenaltyScope();
   TestGreedySelectsFiniteArgmaxWithoutAdvancingRng();
   TestDefaultConfigPreservesGreedyDecoding();
   TestTemperatureSamplingIsDeterministicAndNonGreedy();

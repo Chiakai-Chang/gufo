@@ -580,6 +580,36 @@ void TestBackendSamplingDefaults() {
          "Explicit temperature overrides the backend default");
 }
 
+void TestCompleteToolDefinitionsReachTemplate() {
+  FakeBackend backend;
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+    "model":"test-model",
+    "messages":[{"role":"user","content":"Emit a value."}],
+    "tools":[{"type":"function","function":{"name":"emit","strict":true,
+      "parameters":{"type":"object","additionalProperties":false}},
+      "vendor":{"version":2}}]
+  })"),
+                                                       backend);
+  Expect(response.status == 200 && backend.last_request.tools.size() == 1,
+         "complete function definition reaches the backend");
+  const auto& tool = backend.last_request.tools.front();
+  Expect(
+      tool.definition_json ==
+          R"({"type":"function","function":{"name":"emit","strict":true,"parameters":{"type":"object","additionalProperties":false}},"vendor":{"version":2}})",
+      "tool fields, omitted description and original field order survive");
+  gufo::tokenization::ChatTemplateOptions options;
+  options.enable_thinking = false;
+  const auto rendered = gufo::tokenization::QwenChatTemplate::Render(
+      backend.last_request.messages, backend.last_request.tools, options);
+  Expect(
+      rendered &&
+          rendered->find(
+              "<tools>\n"
+              R"({"type": "function", "function": {"name": "emit", "strict": true, "parameters": {"type": "object", "additionalProperties": false}}, "vendor": {"version": 2}})"
+              "\n</tools>") != std::string::npos,
+      "template serializes the complete original tool object");
+}
+
 void TestAllSamplingControlsReachBackend() {
   FakeBackend backend;
   const auto response = gufo::server::HandleOpenAiChat(Request(R"({
@@ -927,6 +957,7 @@ int main() {
   TestUtf8Output();
   TestCachedPrefillMetrics();
   TestBackendSamplingDefaults();
+  TestCompleteToolDefinitionsReachTemplate();
   TestAllSamplingControlsReachBackend();
   TestUnsupportedSamplingControlsAreRejected();
   TestAssistantReasoningContentReachesBackend();

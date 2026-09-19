@@ -332,6 +332,7 @@ bool ParseTools(const json::Value* tools,
       return false;
     }
     tool.parameters_json = parameters->dump();
+    tool.definition_json = item.dump();
     output->push_back(std::move(tool));
   }
   return true;

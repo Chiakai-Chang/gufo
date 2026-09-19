@@ -35,6 +35,8 @@ struct ChatTool {
   std::string name;
   std::string description;
   std::string parameters_json{"{}"};
+  /// Complete function definition, including optional fields such as strict.
+  std::string definition_json;
 };
 
 struct ChatTemplateOptions {

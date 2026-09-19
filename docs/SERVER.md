@@ -423,6 +423,12 @@ sentinel expected by common clients.
 The adapter must not implement a second inference path. It converts messages
 into the same prompt and sampling structures used by `/v1/responses`.
 
+Frequency and presence penalties count every committed token generated in the
+current request, excluding its prompt. Repetition penalties use `repeat_last_n`
+and may include prompt tokens. Setting that window to zero disables only the
+repetition penalty. Speculative rejection discards tentative counts; seeded
+sampling replay retains independent request histories.
+
 ## Model Discovery
 
 `GET /v1/models` lists the configured text model and ready audio/video

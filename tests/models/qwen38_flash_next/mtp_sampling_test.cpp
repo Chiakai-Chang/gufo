@@ -1,5 +1,6 @@
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <iostream>
@@ -150,6 +151,33 @@ void CheckCompactProposals() {
                 "bounded draft support changes target output probability");
       }
     }
+  }
+  sampling::SamplerState counted({.temperature = 1,
+                                  .repeat_penalty = 1.5F,
+                                  .repeat_last_n = 1,
+                                  .frequency_penalty = 0.25F,
+                                  .presence_penalty = 0.5F},
+                                 std::array<sampling::TokenId, 2>{1, 1});
+  counted.Accept(std::array<sampling::TokenId, 2>{3, 3});
+  counted.Accept(std::vector<sampling::TokenId>(80, 0));
+  counted.Accept(4);
+  std::uint64_t rng = 17;
+  const auto proposal = qfn::SampleMtpProposal(candidates, counted, &rng);
+  // Token 3 is outside the repetition window but keeps both generated counts.
+  // Token 1 occurs only in the prompt. Token 4 gets all three penalties.
+  const std::array<double, 3> adjusted{1.2 - 2 * 0.25 - 0.5, 0.1,
+                                       -0.7 * 1.5 - 0.25 - 0.5};
+  double sum = 0;
+  for (auto logit : adjusted)
+    sum += std::exp(logit);
+  for (std::size_t i = 0; i < proposal.size; ++i) {
+    const auto index = std::find(candidates.ids.begin(),
+                                 candidates.ids.begin() + 3, proposal.ids[i]) -
+                       candidates.ids.begin();
+    Require(index < 3 &&
+                std::abs(proposal.probabilities[i] -
+                         std::exp(adjusted[index]) / sum) < 2.0 / (1U << 24),
+            "compact MTP proposal lost full generated penalty counts");
   }
 }
 

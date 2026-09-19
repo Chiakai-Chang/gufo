@@ -153,6 +153,8 @@ struct GgufTensorInfo {
 struct GgufMappedRegion {
   const void* data{nullptr};
   std::size_t size{0};
+  /// Borrowed descriptor, valid for the reader lifetime; -1 for memory images.
+  int file_descriptor{-1};
 };
 
 /// Zero-copy, lightweight GGUF binary reader and tensor indexer.
@@ -206,15 +208,6 @@ public:
       std::string_view key) const noexcept;
   [[nodiscard]] std::vector<std::string_view> GetMetadataStringArray(
       std::string_view key) const;
-  /// Every metadata key, sorted, so callers can walk entries deterministically.
-  [[nodiscard]] std::vector<std::string_view> GetMetadataKeys() const;
-
-  /// Asks the kernel to fetch exactly the mapped bytes in
-  /// [address, address + length) ahead of use, without dragging the device
-  /// readahead window in behind them. Advisory; a no-op for in-memory readers
-  /// and for addresses outside the mapping.
-  void PrefetchMapped(const void* address, std::size_t length) const noexcept;
-
   /// Tensor lookup helpers
   [[nodiscard]] const GgufTensorInfo* FindTensor(
       std::string_view name) const noexcept;

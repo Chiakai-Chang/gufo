@@ -221,7 +221,8 @@ int main(int argc, char** argv) {
       return 1;
     }
   }
-  auto session = executor->CreateSession(context, &error);
+  auto session = executor->CreateSession(
+      gufo::core::SessionMode::kAutoregressive, context, &error);
   if (!session) {
     std::fprintf(stderr, "session failed: %s\n", error.c_str());
     return 1;

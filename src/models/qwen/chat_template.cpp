@@ -195,6 +195,11 @@ void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools,
   output.append(
       "# Tools\n\nYou have access to the following functions:\n\n<tools>");
   for (const auto& tool : tools) {
+    if (!tool.definition_json.empty()) {
+      output.push_back('\n');
+      output.append(PythonJsonSpacing(tool.definition_json));
+      continue;
+    }
     output.append("\n{\"type\": \"function\", \"function\": {\"name\": ");
     AppendJsonString(output, tool.name);
     output.append(", \"description\": ");
@@ -359,7 +364,8 @@ std::optional<std::string> QwenChatTemplate::Render(
   }
   for (const auto& tool : tools) {
     estimated_len += tool.name.size() + tool.description.size() +
-                     tool.parameters_json.size() + 96;
+                     tool.parameters_json.size() +
+                     2 * tool.definition_json.size() + 96;
   }
   if (options.add_generation_prompt) {
     estimated_len += 64;
@@ -418,6 +424,11 @@ std::optional<std::string> QwenChatTemplate::Render(
       last_user_index = index - 1;
       break;
     }
+  }
+  if (last_user_index == messages.size()) {
+    if (error_msg != nullptr)
+      *error_msg = "No user query found in messages.";
+    return std::nullopt;
   }
 
   std::size_t image_count = 0;

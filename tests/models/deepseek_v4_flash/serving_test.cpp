@@ -36,7 +36,10 @@ std::vector<gufo::tokenization::TokenId> GenerateDirect(
     std::size_t max_tokens, const gufo::sampling::SamplingConfig& sampling = {},
     bool dspark = false) {
   std::string error;
-  auto session = model->CreateSession(dspark ? 4096 : 512, &error);
+  auto session =
+      model->CreateSession(dspark ? gufo::core::SessionMode::kSpeculative
+                                  : gufo::core::SessionMode::kAutoregressive,
+                           dspark ? 4096 : 512, &error);
   Expect(session != nullptr, error);
   Expect(session->Sync(prompt, &error), error);
   const std::vector<gufo::sampling::TokenId> history(prompt.begin(),
@@ -112,7 +115,10 @@ void CheckSampledBatchReplay(const std::shared_ptr<Model>& model,
                                                        prompt.end());
     std::array<std::vector<int>, 2> output;
     for (std::size_t i = 0; i < sessions.size(); ++i) {
-      sessions[i] = model->CreateSession(4096, &error);
+      sessions[i] = model->CreateSession(
+          model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                             : gufo::core::SessionMode::kAutoregressive,
+          4096, &error);
       Expect(sessions[i] && sessions[i]->Sync(prompt, &error), error);
       samplers[i].ResetHistory(history);
     }
@@ -205,7 +211,10 @@ void CheckDsparkEosBoundary(const std::shared_ptr<Model>& model) {
   std::array<SessionDsparkBatchItem, 3> items{};
   std::string error;
   for (std::size_t i = 0; i < sessions.size(); ++i) {
-    sessions[i] = model->CreateSession(4096, &error);
+    sessions[i] = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        4096, &error);
     Expect(sessions[i] && sessions[i]->Sync(prompt, &error), error);
     hooks[i] = {.ctx = &draws[i],
                 .sample = [](void* ctx, const float*, uint32_t) {
@@ -258,6 +267,39 @@ void CheckDsparkEosBoundary(const std::shared_ptr<Model>& model) {
          "fixed-length decoding still consumes EOS as an ordinary token");
 }
 
+void CheckExecutionModes(const std::shared_ptr<Model>& model) {
+  using gufo::core::SessionMode;
+  std::string error;
+  auto ar = model->CreateSession(SessionMode::kAutoregressive, 512, &error);
+  auto spec = model->CreateSession(SessionMode::kSpeculative, 512, &error);
+  Expect(ar && spec, error);
+  Expect(!ar->DsparkEnabled() && spec->DsparkEnabled(),
+         "session mode reports model capability instead of enabled execution");
+  const std::string text = "The capital of France is";
+  const auto prompt = model->Tokenize(text);
+  Expect(ar->Sync(prompt, &error) && spec->Sync(prompt, &error), error);
+  Expect(ar->CopyLogits(&error) == spec->CopyLogits(&error),
+         "DSpark sidecar changes AR logits");
+  Expect(ar->DsparkStatistics().context_tokens == 0 &&
+             spec->DsparkStatistics().context_tokens == prompt.size(),
+         "AR session maintains DSpark state");
+  auto saved_ar = ar->SaveSnapshot(&error);
+  auto saved_spec = spec->SaveSnapshot(&error);
+  Expect(
+      saved_ar && saved_spec && saved_ar->SizeBytes() < saved_spec->SizeBytes(),
+      "AR snapshot includes predictor state");
+  gufo::server::InferenceBackend backend;
+  Expect(backend.load(model, &error, 512, 1), error);
+  const auto actual = backend.complete(text, 8, 0.0F);
+  Expect(actual.draft_tokens == 0 &&
+             actual.tokens == GenerateDirect(model, prompt, 8),
+         "disabled backend executed DSpark with a resident sidecar");
+  Expect(!ar->RestoreSnapshot(*saved_spec, &error) &&
+             !spec->RestoreSnapshot(*saved_ar, &error),
+         "DeepSeek snapshots crossed execution modes");
+  std::cout << "DSpark execution modes and snapshot isolation passed\n";
+}
+
 void CheckDsparkServing(const char* model_path, const char* support_path) {
   using namespace gufo::server;
   std::string error;
@@ -266,6 +308,7 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
       ModelOptions{.max_context = 262144, .dspark_model_path = support_path},
       &error);
   Expect(model != nullptr, error);
+  CheckExecutionModes(model);
   CheckDsparkEosBoundary(model);
   const TextSpeculativeConfig speculative{
       .backend = TextSpeculativeBackend::kDSpark,
@@ -463,6 +506,7 @@ int main(int argc, char** argv) {
           ModelOptions{.max_context = 4096, .dspark_model_path = support},
           &error);
       Expect(model != nullptr, error);
+      CheckExecutionModes(model);
       CheckDsparkEosBoundary(model);
       std::cout << "DSpark EOS checkpoint checks passed\n";
       return 0;

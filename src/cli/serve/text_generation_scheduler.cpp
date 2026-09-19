@@ -76,6 +76,9 @@ struct ScheduledRequest {
   std::size_t inter_token_samples{0};
   bool decode_due{false};
   std::optional<TextRunnerToken> preview_token;
+  std::optional<TextGenerationScheduler::Clock::time_point>
+      pending_advance_start;
+  bool preview_stops{false};
   std::size_t generated_output_bytes{0};
 
   std::mutex output_mutex;
@@ -515,6 +518,21 @@ struct TextGenerationScheduler::Impl {
       return std::nullopt;
     }
 
+    if (request->pending_advance_start) {
+      if (!request->runner_request.PreparePromptSnapshot())
+        return std::nullopt;
+      const auto start = *request->pending_advance_start;
+      request->pending_advance_start.reset();
+      if (!final_token_advance_required &&
+          request->result.tokens.size() >= request->token_limit) {
+        request->result.decode_ms +=
+            std::chrono::duration<double, std::milli>(Clock::now() - start)
+                .count();
+        CompleteSuccess(request, TextGenerationBackend::FinishReason::kLength);
+        return std::nullopt;
+      }
+      return start;
+    }
     request->phase.store(TextRequestPhase::kDecoding,
                          std::memory_order_release);
     const auto decode_start = Clock::now();
@@ -530,16 +548,8 @@ struct TextGenerationScheduler::Impl {
     if (!PublishSelection(request, selection)) {
       return std::nullopt;
     }
-    request->runner_request.CapturePromptSnapshot();
-    if (!final_token_advance_required &&
-        request->result.tokens.size() >= request->token_limit) {
-      request->result.decode_ms +=
-          std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
-              .count();
-      CompleteSuccess(request, TextGenerationBackend::FinishReason::kLength);
-      return std::nullopt;
-    }
-    return decode_start;
+    request->pending_advance_start = decode_start;
+    return PrepareDecode(request);
   }
 
   [[nodiscard]] bool PublishSelection(
@@ -664,16 +674,18 @@ struct TextGenerationScheduler::Impl {
   }
 
   bool PrepareFirstSnapshot(const std::shared_ptr<ScheduledRequest>& request) {
-    if (!request->result.tokens.empty())
-      return true;
-    const auto preview = request->runner_request.PreviewFirstToken();
-    if (preview && !preview->stop) {
-      if (!PublishSelection(request, *preview))
-        return false;
-      request->preview_token = preview->token;
+    if (request->result.tokens.empty() && !request->preview_stops) {
+      const auto preview = request->runner_request.PreviewFirstToken();
+      if (preview && !preview->stop) {
+        if (!PublishSelection(request, *preview))
+          return false;
+        request->preview_token = preview->token;
+      }
+      request->preview_stops = preview && preview->stop;
     }
-    request->runner_request.CapturePromptSnapshot();
-    if (preview && preview->stop) {
+    if (!request->runner_request.PreparePromptSnapshot())
+      return false;
+    if (request->preview_stops) {
       CompleteSuccess(request, TextGenerationBackend::FinishReason::kStop);
       return false;
     }
@@ -965,15 +977,29 @@ struct TextGenerationScheduler::Impl {
   void Run(const std::stop_token& stop_token) noexcept {
     std::deque<std::shared_ptr<ScheduledRequest>> prefilling;
     std::deque<std::shared_ptr<ScheduledRequest>> decoding;
+    std::deque<std::shared_ptr<ScheduledRequest>> capturing;
     while (!stop_token.stop_requested()) {
       ProcessQueuedCancellations();
       Admit(prefilling, decoding);
 
+      for (std::size_t count = capturing.size(); count != 0; --count) {
+        auto request = std::move(capturing.front());
+        capturing.pop_front();
+        if (request->runner_request.SnapshotPending()) {
+          capturing.push_back(std::move(request));
+        } else if (!CompleteIfStopped(request)) {
+          decoding.push_back(std::move(request));
+        }
+      }
       if (prefilling.empty() && decoding.empty()) {
         std::unique_lock<std::mutex> lock(queue_mutex);
-        queue_condition.wait(lock, [&] {
+        const auto wake = [&] {
           return stop_token.stop_requested() || stopping || queued_count != 0;
-        });
+        };
+        if (capturing.empty())
+          queue_condition.wait(lock, wake);
+        else
+          queue_condition.wait_for(lock, std::chrono::milliseconds(1), wake);
         continue;
       }
 
@@ -1039,7 +1065,10 @@ struct TextGenerationScheduler::Impl {
         StepDecodeBatch(batch);
         for (auto& request : batch) {
           if (!IsTerminal(request)) {
-            decoding.push_back(std::move(request));
+            if (request->runner_request.SnapshotPending())
+              capturing.push_back(std::move(request));
+            else
+              decoding.push_back(std::move(request));
           }
         }
         continue;
@@ -1057,6 +1086,8 @@ struct TextGenerationScheduler::Impl {
         }
       }
     }
+    for (auto& request : capturing)
+      decoding.push_back(std::move(request));
     CancelRemaining(prefilling, decoding);
   }
 

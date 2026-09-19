@@ -32,10 +32,14 @@ void RequireExact(std::span<const float> expected,
 
 void CheckFailureRecovery(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
-  auto session = model->CreateSession(4096, &error);
+  auto session = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      4096, &error);
   Require(session != nullptr, error);
   const auto initial_bytes = session->AllocatedBytes();
-  Require(model->SessionBytes(4096) > initial_bytes + 700ULL * 1024 * 1024,
+  Require(model->SessionBytes(gufo::core::SessionMode::kSpeculative, 4096) >
+              initial_bytes + 700ULL * 1024 * 1024,
           "unused deep rollback state was allocated eagerly");
   const auto pattern =
       model->Tokenize("Explain virtual memory in a short sentence.");
@@ -80,7 +84,10 @@ void CheckRollbackReuse(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   const auto prompt = model->Tokenize("Continue: red, blue, red, blue,");
   const auto context = static_cast<std::uint32_t>(prompt.size() + 4);
-  auto session = model->CreateSession(context, &error);
+  auto session = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      context, &error);
   Require(session != nullptr, error);
   const auto empty_bytes = session->AllocatedBytes();
   Require(session->Sync(prompt, &error), error);
@@ -90,9 +97,10 @@ void CheckRollbackReuse(const std::shared_ptr<qfn::Model>& model) {
   qfn::Session::DecodeResult step;
   Require(session->DecodeStep(2, sampler, &step, &error, false), error);
   const auto warm_bytes = session->AllocatedBytes();
-  Require(
-      warm_bytes > empty_bytes && warm_bytes <= model->SessionBytes(context),
-      "rollback allocation exceeded its configured bound");
+  Require(warm_bytes > empty_bytes &&
+              warm_bytes <= model->SessionBytes(
+                                gufo::core::SessionMode::kSpeculative, context),
+          "rollback allocation exceeded its configured bound");
   session->ResetDraftPolicy();
   const auto warm = session->SaveSnapshot(&error);
   Require(warm && session->RestoreSnapshot(*warm, &error), error);
@@ -149,9 +157,18 @@ void CheckImageSnapshotAttachment(const std::shared_ptr<qfn::Model>& model) {
   const std::vector<std::int32_t> tokens(red->tokens.begin(),
                                          red->tokens.end());
   std::string error;
-  auto origin = model->CreateSession(64, &error);
-  auto restored = model->CreateSession(64, &error);
-  auto text = model->CreateSession(64, &error);
+  auto origin = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      64, &error);
+  auto restored = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      64, &error);
+  auto text = model->CreateSession(
+      model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                      : gufo::core::SessionMode::kAutoregressive,
+      64, &error);
   Require(origin && restored && text, error);
   origin->ConfigureVision(red);
   Require(origin->Sync(std::span(tokens).first(2), &error), error);
@@ -196,8 +213,14 @@ void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
     std::vector<std::int32_t> tokens(length);
     for (std::size_t i = 0; i < tokens.size(); ++i)
       tokens[i] = pattern[i % pattern.size()];
-    auto bulk = model->CreateSession(6145, &error);
-    auto split = model->CreateSession(6145, &error);
+    auto bulk = model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        6145, &error);
+    auto split = model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        6145, &error);
     Require(bulk && split, error);
     Require(bulk->Sync(tokens, &error) &&
                 split->Sync(std::span(tokens).first(boundary), &error) &&
@@ -229,8 +252,14 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   std::vector<sampling::SamplerState> serial_samplers, batch_samplers;
   const auto cases = gufo::test::QwenSamplingCases();
   for (std::size_t i = 0; i < 8; ++i) {
-    serial.push_back(model->CreateSession(6145, &error));
-    batched.push_back(model->CreateSession(6145, &error));
+    serial.push_back(model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        6145, &error));
+    batched.push_back(model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        6145, &error));
     Require(serial.back() && batched.back(), error);
     auto prompt = model->Tokenize("Batch request " + std::to_string(i) +
                                   ": Continue red, blue, blue, red,");
@@ -360,6 +389,44 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
   std::cout << "batch independent_state_exact=1\n" << std::flush;
 }
 
+void CheckExecutionModes(const std::shared_ptr<qfn::Model>& model) {
+  using gufo::core::SessionMode;
+  std::string error;
+  auto ar = model->CreateSession(SessionMode::kAutoregressive, 128, &error);
+  auto mtp = model->CreateSession(SessionMode::kSpeculative, 128, &error);
+  Require(ar && mtp, error);
+  Require(ar->AllocatedBytes() < mtp->AllocatedBytes(),
+          "AR allocated predictor state");
+  const auto prompt = model->Tokenize("Continue: red, blue, red, blue,");
+  Require(ar->Sync(prompt, &error) && mtp->Sync(prompt, &error), error);
+  RequireExact(ar->Logits(), mtp->Logits(),
+               "execution mode changes target prefill logits");
+  const auto ar_snapshot = ar->SaveSnapshot(&error);
+  const auto mtp_snapshot = mtp->SaveSnapshot(&error);
+  Require(ar_snapshot && mtp_snapshot &&
+              ar_snapshot->SizeBytes() < mtp_snapshot->SizeBytes(),
+          "AR snapshot includes predictor state");
+  const auto anchor = static_cast<std::int32_t>(
+      std::max_element(ar->Logits().begin(), ar->Logits().end()) -
+      ar->Logits().begin());
+  const std::array<qfn::Session::AdvanceRequest, 2> mixed{
+      {{ar.get(), anchor}, {mtp.get(), anchor}}};
+  Require(qfn::Session::EvaluateBatch(mixed, &error), error);
+  RequireExact(ar->Logits(), mtp->Logits(),
+               "mixed execution modes contaminate target logits");
+  sampling::SamplerState sampler;
+  qfn::Session::DecodeResult step;
+  Require(ar->DecodeStep(8, sampler, &step, &error, false), error);
+  Require(step.tokens.size() == 1 && ar->Statistics().drafted == 0,
+          "AR session with a resident sidecar executed speculative decoding");
+  Require(!mtp->RestoreSnapshot(*ar_snapshot, &error) &&
+              !ar->RestoreSnapshot(*mtp_snapshot, &error),
+          "snapshots crossed execution modes");
+  std::cout << "execution_modes=independent AR_predictor_bytes=0 "
+               "mixed_batch_exact=1\n"
+            << std::flush;
+}
+
 void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
   namespace server = gufo::server;
   using Backend = server::InferenceBackend;
@@ -382,7 +449,10 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
     auto speculative = mtp.complete(prompt, 8, test.config);
     // Exercise the serving handoff against the model session directly.
     // Replaying HTTP alone would not detect a consistently dropped residual.
-    auto direct = model->CreateSession(6145, &error);
+    auto direct = model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        6145, &error);
     const auto encoded = model->Tokenize(prompt);
     Require(direct && direct->Sync(encoded, &error), error);
     const std::vector<sampling::TokenId> history(encoded.begin(),
@@ -519,6 +589,7 @@ int main(int argc, char** argv) {
         {.max_context = 6145, .mtp_model_path = argv[4], .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
+    CheckExecutionModes(model);
     if (sampling_only) {
       CheckServingSampling(model);
       return 0;
@@ -570,8 +641,12 @@ int main(int argc, char** argv) {
                                                    prefix.end());
       for (std::size_t c = 0; c < configs.size(); ++c) {
         const bool sampled = configs[c].uses_random_sampling();
-        auto ar = model->CreateSession(6145, &error);
-        auto mtp = model->CreateSession(6145, &error);
+        auto ar = model->CreateSession(gufo::core::SessionMode::kAutoregressive,
+                                       6145, &error);
+        auto mtp = model->CreateSession(
+            model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                            : gufo::core::SessionMode::kAutoregressive,
+            6145, &error);
         Require(ar && mtp, error);
         Require(ar->Sync(prefix, &error), error);
         // Prefill the other session before decoding either: retained target
@@ -698,7 +773,10 @@ int main(int argc, char** argv) {
                                                    prefix.end());
       for (const bool speculative : {false, true}) {
         const bool sampled = configs[saved.config].uses_random_sampling();
-        auto session = model->CreateSession(6145, &error);
+        auto session = model->CreateSession(
+            model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                            : gufo::core::SessionMode::kAutoregressive,
+            6145, &error);
         Require(session && session->Sync(prefix, &error), error);
         RequireExact(saved.prefill_logits, session->Logits(),
                      "fresh load changed prefill logits");

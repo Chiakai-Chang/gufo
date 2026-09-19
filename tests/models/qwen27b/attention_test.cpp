@@ -123,15 +123,15 @@ void TestProposalVerification(std::span<const std::uint32_t> ids,
         .min_p = config.min_p,
         .repeat_penalty = config.repeat_penalty,
     };
-    const std::array<std::uint32_t, 1> penalty_ids{ids[0]}, counts{2};
+    const std::array<gufo::sampling::TokenPenalty, 1> penalties{
+        {{ids[0], 0, 1}}};
     const auto verify = [&](std::size_t candidate, double accept_u,
                             double residual_u, bool accepted,
                             std::uint32_t expected) {
       gufo::hip::LaunchGPUSpeculativeSampling(
           d_logits.data(), d_token.data(), d_accepted.data(), vocab, parameters,
           ids[candidate], q[candidate], ids.data(), q.data(), ids.size(),
-          accept_u, residual_u, penalty_ids.data(), counts.data(),
-          filtered ? 1 : 0, &workspace);
+          accept_u, residual_u, penalties.data(), filtered ? 1 : 0, &workspace);
       Expect(
           d_accepted.CopyToHost()[0] == static_cast<std::uint32_t>(accepted) &&
               d_token.CopyToHost()[0] == expected,

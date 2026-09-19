@@ -178,6 +178,12 @@ void AppendToolsPrompt(std::string& output, std::span<const ChatTool> tools,
       "### Available Tool Schemas\n\n");
   for (std::size_t index = 0; index < tools.size(); ++index) {
     const auto& tool = tools[index];
+    if (!tool.definition_json.empty()) {
+      output.append(PythonJsonSpacing(tool.definition_json));
+      if (index + 1 < tools.size())
+        output.push_back('\n');
+      continue;
+    }
     output.append("{\"name\": ");
     AppendJsonString(output, tool.name);
     output.append(", \"description\": ");

@@ -97,8 +97,10 @@ char* ds4_token_text(ds4_engine* engine, int token, size_t* length);
 int ds4_token_eos(const ds4_engine* engine);
 bool ds4_token_is_stop(const ds4_engine* engine, int token);
 
-int ds4_session_create(ds4_session** out, ds4_engine* engine, int context_size);
+int ds4_session_create(ds4_session** out, ds4_engine* engine, int context_size,
+                       bool use_dspark);
 void ds4_session_free(ds4_session* session);
+bool ds4_session_dspark_enabled(const ds4_session* session);
 int ds4_session_sync(ds4_session* session, const ds4_tokens* prompt,
                      char* error, size_t error_capacity);
 int ds4_session_argmax(const ds4_session* session);

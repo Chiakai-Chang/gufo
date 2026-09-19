@@ -65,7 +65,10 @@ void CheckPinnedTrajectory(
   const auto prompt = model->Tokenize(kTrajectoryPrompt);
   Expect(!prompt.empty(), "trajectory prompt tokenization");
 
-  auto session = model->CreateSession(512, &error);
+  auto session = model->CreateSession(
+      model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+      512, &error);
   Expect(session != nullptr, error);
   Expect(session->Sync(prompt, &error), error);
 
@@ -108,7 +111,10 @@ void CheckPinnedTrajectory(
 void CheckSessionBounds(
     const std::shared_ptr<gufo::models::deepseek_v4_flash::Model>& model) {
   std::string error;
-  auto session = model->CreateSession(32, &error);
+  auto session = model->CreateSession(
+      model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+      32, &error);
   Expect(session != nullptr, error);
   Expect(session->PrefillCapacity() > 0 && session->PrefillCapacity() <= 32,
          "prefill allocation fits the session context");
@@ -156,7 +162,10 @@ void CheckWidePrefill(
   }
   const auto run = [&](std::uint32_t context_capacity) {
     std::string error;
-    auto session = model->CreateSession(context_capacity, &error);
+    auto session = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        context_capacity, &error);
     Expect(session != nullptr, error);
     Expect(session->Sync(tokens, &error), error);
     std::vector<float> trajectory;
@@ -200,13 +209,19 @@ void CheckBatchedPrefill(
                   kPinnedDs4Trajectory.end());
   }
 
-  auto batched = model->CreateSession(4096, &error);
+  auto batched = model->CreateSession(
+      model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+      4096, &error);
   Expect(batched != nullptr, error);
   Expect(batched->Sync(tokens, &error), error);
   const auto batched_logits = batched->CopyLogits(&error);
   Expect(!batched_logits.empty(), error);
 
-  auto sequential = model->CreateSession(4096, &error);
+  auto sequential = model->CreateSession(
+      model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+      4096, &error);
   Expect(sequential != nullptr, error);
   Expect(sequential->Sync(prompt, &error), error);
   for (int repetition = 0; repetition < kTrajectoryRepetitions; ++repetition) {
@@ -286,13 +301,19 @@ void CheckConversationalPrefill(
           kPinnedDs4Trajectory[index % kPinnedDs4Trajectory.size()]);
     }
 
-    auto batched = model->CreateSession(512, &error);
+    auto batched = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        512, &error);
     Expect(batched != nullptr, error);
     Expect(batched->Sync(tokens, &error), error);
     const auto batched_logits = batched->CopyLogits(&error);
     Expect(!batched_logits.empty(), error);
 
-    auto sequential = model->CreateSession(512, &error);
+    auto sequential = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        512, &error);
     Expect(sequential != nullptr, error);
     const std::vector<int> first_token{tokens.front()};
     Expect(sequential->Sync(first_token, &error), error);
@@ -398,8 +419,14 @@ void CheckSessionBatch(
   }
   const auto reset_sessions = [&] {
     for (std::size_t index = 0; index < kPrompts.size(); ++index) {
-      batched[index] = model->CreateSession(512, &error);
-      sequential[index] = model->CreateSession(512, &error);
+      batched[index] = model->CreateSession(
+          model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                             : gufo::core::SessionMode::kAutoregressive,
+          512, &error);
+      sequential[index] = model->CreateSession(
+          model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                             : gufo::core::SessionMode::kAutoregressive,
+          512, &error);
       Expect(batched[index] != nullptr, error);
       Expect(sequential[index] != nullptr, error);
       Expect(batched[index]->Sync(session_prompts[index], &error),
@@ -573,7 +600,10 @@ void CheckDsparkPromptSeed(
       "The quick brown fox jumps over the lazy dog. Explain why.");
   Expect(!prompt.empty(), "DSpark seed prompt tokenization");
 
-  auto session = model->CreateSession(512, &error);
+  auto session = model->CreateSession(
+      model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+      512, &error);
   Expect(session != nullptr, error);
   Expect(session->Sync(prompt, &error), error);
   auto stats = session->DsparkStatistics();
@@ -596,7 +626,10 @@ void CheckDsparkPromptSeed(
   short_extension.push_back(session->SelectNext(0.0F, nullptr));
   session.reset();
 
-  auto extended = model->CreateSession(512, &error);
+  auto extended = model->CreateSession(
+      model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+      512, &error);
   Expect(extended != nullptr, error);
   Expect(extended->Sync(prompt, &error), error);
   Expect(extended->Sync(short_extension, &error), error);
@@ -616,6 +649,8 @@ void CheckDsparkPromptSeed(
     std::vector<gufo::models::deepseek_v4_flash::SessionDsparkBatchItem> items;
     for (std::size_t i = 0; i < concurrency; ++i) {
       auto member = model->CreateSession(
+          model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                             : gufo::core::SessionMode::kAutoregressive,
           static_cast<uint32_t>(prompt.size() + 5), &error);
       Expect(member != nullptr && member->Sync(prompt, &error), error);
       items.push_back({.session = member.get(),
@@ -643,8 +678,14 @@ void CheckDsparkSnapshots(
     std::vector<int> prompt(depth);
     for (std::size_t i = 0; i < depth; ++i)
       prompt[i] = pattern[i % pattern.size()];
-    auto source = model->CreateSession(20480, &error);
-    auto fork = model->CreateSession(20480, &error);
+    auto source = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        20480, &error);
+    auto fork = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        20480, &error);
     Expect(source != nullptr && fork != nullptr, error);
     Expect(source->Sync(prompt, &error), error);
     // Exercise both a fresh prefix and a controller with acceptance history.
@@ -749,7 +790,10 @@ void CheckDsparkScalarQuality(
       prefix[i] = pattern[i % pattern.size()];
     std::unique_ptr<SessionSnapshot> snapshot;
     if (depth != 0) {
-      auto base = model->CreateSession(context, &error);
+      auto base = model->CreateSession(
+          model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                             : gufo::core::SessionMode::kAutoregressive,
+          context, &error);
       Expect(base && base->Sync(prefix, &error), error);
       snapshot = base->SaveSnapshot(&error);
       Expect(snapshot != nullptr, error);
@@ -767,7 +811,10 @@ void CheckDsparkScalarQuality(
       std::vector<std::size_t> generated(concurrency);
       std::vector<std::vector<int>> emitted(concurrency);
       const auto make_session = [&](std::size_t member) {
-        auto session = model->CreateSession(context, &error);
+        auto session = model->CreateSession(
+            model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                               : gufo::core::SessionMode::kAutoregressive,
+            context, &error);
         Expect(session != nullptr, error);
         if (snapshot)
           Expect(session->RestoreSnapshot(*snapshot, &error), error);
@@ -905,7 +952,10 @@ void CheckConcurrentPolicySnapshot(
     std::vector<std::vector<int>> emitted(concurrency);
     std::vector<SessionDsparkBatchItem> items(concurrency);
     for (std::size_t i = 0; i < concurrency; ++i) {
-      sessions[i] = model->CreateSession(512, &error);
+      sessions[i] = model->CreateSession(
+          model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                             : gufo::core::SessionMode::kAutoregressive,
+          512, &error);
       Expect(sessions[i] != nullptr, error);
       auto prompt = model->Tokenize(kTrajectoryPrompt);
       Expect(sessions[i]->Sync(prompt, &error), error);
@@ -981,7 +1031,10 @@ void CheckDsparkChangingMembership(
     for (std::size_t i = 0; i < sessions.size(); ++i) {
       // Grow shared scratch while older sessions remain live. Their borrowed
       // buffers must survive; the repeat can reuse the largest cached arena.
-      sessions[i] = model->CreateSession(512 + 256 * i, &error);
+      sessions[i] = model->CreateSession(
+          model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                             : gufo::core::SessionMode::kAutoregressive,
+          512 + 256 * i, &error);
       Expect(sessions[i] != nullptr, error);
       auto prompt = model->Tokenize(kTrajectoryPrompt);
       while (prompt.size() < 120 + i)
@@ -1059,8 +1112,14 @@ void CheckDsparkReproducibility(
 
   std::string error;
   for (const std::uint32_t tail : {1U, 3U, 7U}) {
-    auto configured = model->CreateSession(512, &error);
-    auto legacy = model->CreateSession(512, &error);
+    auto configured = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        512, &error);
+    auto legacy = model->CreateSession(
+        model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                           : gufo::core::SessionMode::kAutoregressive,
+        512, &error);
     Expect(configured != nullptr && legacy != nullptr, error);
     const auto prompt = model->Tokenize(kPrompts[0]);
     Expect(configured->Sync(prompt, &error), error);
@@ -1098,7 +1157,10 @@ void CheckDsparkReproducibility(
     auto run = [&] {
       std::vector<std::unique_ptr<Session>> sessions;
       for (std::size_t i = 0; i < concurrency; ++i) {
-        auto session = model->CreateSession(512, &error);
+        auto session = model->CreateSession(
+            model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                               : gufo::core::SessionMode::kAutoregressive,
+            512, &error);
         Expect(session != nullptr, error);
         auto prompt = model->Tokenize(kPrompts[i % kPrompts.size()]);
         Expect(!prompt.empty(), "DSpark repeat prompt tokenization");
@@ -1329,7 +1391,10 @@ int main(int argc, char** argv) try {
       model->EncodeChat("You are a concise assistant.", "Reply with one word.");
   Expect(!prompt.empty(), "chat prompt tokenization");
 
-  auto session = model->CreateSession(4096, &error);
+  auto session = model->CreateSession(
+      model->HasDspark() ? gufo::core::SessionMode::kSpeculative
+                         : gufo::core::SessionMode::kAutoregressive,
+      4096, &error);
   Expect(session != nullptr, error);
   Expect(session->Sync(prompt, &error), error);
   Expect(session->Position() == static_cast<int>(prompt.size()),

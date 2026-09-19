@@ -67,8 +67,6 @@ QwenGpuExecutor::QwenGpuExecutor(std::shared_ptr<const QwenGpuModel> model,
       h_logits_(weights_.config.vocab_size, 0.0F) {
   AllocateGpuSamplingWorkspace(&sampling_workspace_, weights_.config.vocab_size,
                                max_context);
-  h_penalty_tokens_.reserve(max_context);
-  h_penalty_counts_.reserve(max_context);
   detail::EmitQwenExecutionPolicy(policy_.Fingerprint());
 }
 
@@ -256,10 +254,10 @@ tokenization::TokenId QwenGpuExecutor::SampleLastLogits(
 
   auto scratch = arena_.GetScratchView();
   auto* const d_out_token = scratch.decode.sampled_token.data();
-  LaunchGPUSampling(
-      scratch.decode.logits.data(), d_out_token, weights_.config.vocab_size,
-      parameters, h_penalty_tokens_.data(), h_penalty_counts_.data(),
-      h_penalty_tokens_.size(), &sampling_workspace_, arena_.stream);
+  LaunchGPUSampling(scratch.decode.logits.data(), d_out_token,
+                    weights_.config.vocab_size, parameters,
+                    sampler.penalties().data(), sampler.penalties().size(),
+                    &sampling_workspace_, arena_.stream);
 
   tokenization::TokenId token = 0;
   HIP_CHECK(hipMemcpyAsync(&token, d_out_token, sizeof(token),
@@ -283,24 +281,6 @@ tokenization::TokenId QwenGpuExecutor::SampleCachedLogits(
 GpuSamplingParameters QwenGpuExecutor::PrepareGpuSamplingParameters(
     const sampling::SamplerState& sampler) {
   const auto& config = sampler.config();
-  const auto history = sampler.history();
-  h_penalty_tokens_.assign(history.begin(), history.end());
-  std::ranges::sort(h_penalty_tokens_);
-  h_penalty_counts_.clear();
-  std::size_t unique_count = 0;
-  for (const std::uint32_t token : h_penalty_tokens_) {
-    if (unique_count == 0 || h_penalty_tokens_[unique_count - 1U] != token) {
-      h_penalty_tokens_[unique_count++] = token;
-      h_penalty_counts_.push_back(1U);
-    } else {
-      ++h_penalty_counts_.back();
-    }
-  }
-  h_penalty_tokens_.resize(unique_count);
-  if (!config.penalties_enabled()) {
-    h_penalty_tokens_.clear();
-    h_penalty_counts_.clear();
-  }
 
   return GpuSamplingParameters{
       .temperature = config.temperature,
@@ -327,9 +307,8 @@ tokenization::TokenId QwenGpuExecutor::SampleVerificationLogits(
   auto* const d_out_token = scratch.decode.sampled_token.data();
   LaunchGPUSampling(d_verification_logits_ + (row * weights_.config.vocab_size),
                     d_out_token, weights_.config.vocab_size, parameters,
-                    h_penalty_tokens_.data(), h_penalty_counts_.data(),
-                    h_penalty_tokens_.size(), &sampling_workspace_,
-                    arena_.stream);
+                    sampler.penalties().data(), sampler.penalties().size(),
+                    &sampling_workspace_, arena_.stream);
 
   tokenization::TokenId token = 0;
   HIP_CHECK(hipMemcpyAsync(&token, d_out_token, sizeof(token),
@@ -367,8 +346,8 @@ QwenSampledVerificationResult QwenGpuExecutor::VerifySampledToken(
       parameters, draft_token, static_cast<float>(draft_token_probability),
       draft_candidate_ids.data(), draft_candidate_probabilities.data(),
       draft_candidate_ids.size(), acceptance_uniform, residual_uniform,
-      h_penalty_tokens_.data(), h_penalty_counts_.data(),
-      h_penalty_tokens_.size(), &sampling_workspace_, arena_.stream);
+      sampler.penalties().data(), sampler.penalties().size(),
+      &sampling_workspace_, arena_.stream);
 
   QwenSampledVerificationResult result;
   std::uint32_t accepted = 0;

@@ -397,7 +397,7 @@ int GenerateDeepSeekResponse(
   }
   sampling::SamplerState sampler(opt.sampling, sampling_history);
 
-  const bool use_dspark = dspark_requested && session.HasDspark();
+  const bool use_dspark = session.DsparkEnabled();
 
   const auto generation_start = std::chrono::steady_clock::now();
   std::size_t generated = 0;
@@ -507,7 +507,10 @@ int RunDeepSeekPrompt(const PromptOptions& opt, const core::GgufReader& reader,
   if (!model)
     return 1;
   std::string error;
-  auto session = model->CreateSession(kDefaultContext, &error);
+  auto session = model->CreateSession(
+      opt.speculative_backend.empty() ? gufo::core::SessionMode::kAutoregressive
+                                      : gufo::core::SessionMode::kSpeculative,
+      kDefaultContext, &error);
   if (!session) {
     std::cerr << "DeepSeek session creation failed: " << error << '\n';
     return 1;
@@ -551,7 +554,10 @@ int RunDeepSeekChat(const PromptOptions& opt, const core::GgufReader& reader,
   if (!model)
     return 1;
   std::string error;
-  auto session = model->CreateSession(kDefaultContext, &error);
+  auto session = model->CreateSession(
+      opt.speculative_backend.empty() ? gufo::core::SessionMode::kAutoregressive
+                                      : gufo::core::SessionMode::kSpeculative,
+      kDefaultContext, &error);
   if (!session) {
     std::cerr << "DeepSeek session creation failed: " << error << '\n';
     return 1;
@@ -1022,7 +1028,11 @@ int RunPrompt(std::span<const char* const> args) {
     auto model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!model)
       return 1;
-    auto session = model->CreateSession(kDefaultContext, &err);
+    auto session =
+        model->CreateSession(opt.speculative_backend.empty()
+                                 ? gufo::core::SessionMode::kAutoregressive
+                                 : gufo::core::SessionMode::kSpeculative,
+                             kDefaultContext, &err);
     if (!session) {
       std::cerr << "Flash-Next session failed: " << err << '\n';
       return 1;
@@ -1218,7 +1228,11 @@ int RunChat(std::span<const char* const> args) {
     flash_model = LoadFlashNextModel(opt, *reader, model_load_start);
     if (!flash_model)
       return 1;
-    flash_session = flash_model->CreateSession(kDefaultContext, &err);
+    flash_session = flash_model->CreateSession(
+        opt.speculative_backend.empty()
+            ? gufo::core::SessionMode::kAutoregressive
+            : gufo::core::SessionMode::kSpeculative,
+        kDefaultContext, &err);
     if (!flash_session) {
       std::cerr << "Flash-Next session failed: " << err << '\n';
       return 1;

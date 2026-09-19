@@ -54,14 +54,16 @@ inline void RegisterSamplingOptions(ArgParser& parser,
                    "Trailing token window used by repetition penalties "
                    "(default: 64; 0 = disabled)",
                    group, &config->repeat_last_n);
-  parser.AddOption("", "--frequency-penalty", "N",
-                   "Penalty multiplied by each token's recent occurrence count "
-                   "(default: 0.0 = disabled)",
-                   group, &config->frequency_penalty);
-  parser.AddOption("", "--presence-penalty", "N",
-                   "One-time penalty for tokens present in the recent window "
-                   "(default: 0.0 = disabled)",
-                   group, &config->presence_penalty);
+  parser.AddOption(
+      "", "--frequency-penalty", "N",
+      "Penalty multiplied by each token's generated occurrence count "
+      "(default: 0.0 = disabled)",
+      group, &config->frequency_penalty);
+  parser.AddOption(
+      "", "--presence-penalty", "N",
+      "One-time penalty for tokens already generated in this response "
+      "(default: 0.0 = disabled)",
+      group, &config->presence_penalty);
 }
 
 }  // namespace gufo::cli

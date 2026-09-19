@@ -165,6 +165,9 @@ int ds4_gpu_tensor_convert_f32_to_f16(ds4_gpu_tensor *dst, const ds4_gpu_tensor 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
+/// Reads a completed, frozen session without joining unrelated execution.
+int ds4_gpu_tensor_snapshot_read(const ds4_gpu_tensor* tensor, uint64_t offset,
+                                 void* data, uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset, uint64_t bytes);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 

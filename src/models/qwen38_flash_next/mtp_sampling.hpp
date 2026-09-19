@@ -1,14 +1,11 @@
 #ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_MTP_SAMPLING_HPP_
 #define GUFO_MODELS_QWEN38_FLASH_NEXT_MTP_SAMPLING_HPP_
 
-#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <span>
 #include <stdexcept>
-#include <vector>
 
 #include "src/core/sampling.hpp"
 
@@ -41,18 +38,9 @@ inline MtpProposal SampleMtpProposal(const MtpCandidateLogits& candidates,
   if (candidates.size == 0 || candidates.size > kMtpCandidates) {
     throw std::invalid_argument("invalid MTP candidate count");
   }
-  std::vector<sampling::TokenId> history;
-  history.reserve(sampler.history().size());
-  const auto ids = std::span(candidates.ids).first(candidates.size);
-  for (const auto token : sampler.history()) {
-    const auto it = std::find(ids.begin(), ids.end(), token);
-    history.push_back(it == ids.end()
-                          ? std::numeric_limits<sampling::TokenId>::max()
-                          : static_cast<sampling::TokenId>(it - ids.begin()));
-  }
-  const auto distribution = sampling::BuildDistribution(
-      std::span(candidates.logits).first(candidates.size), sampler.config(),
-      history);
+  const auto distribution =
+      sampler.Distribution(std::span(candidates.logits).first(candidates.size),
+                           std::span(candidates.ids).first(candidates.size));
   constexpr std::uint32_t units = 1U << 24;
   std::array<std::uint32_t, kMtpCandidates> mass{};
   MtpProposal proposal;

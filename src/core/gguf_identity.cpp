@@ -1,15 +1,18 @@
 #include "src/core/gguf_identity.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
-#include <bit>
-#include <cstddef>
-#include <cstdint>
+#include <atomic>
+#include <cerrno>
+#include <cstdlib>
+#include <filesystem>
 #include <span>
+#include <stdexcept>
 #include <string>
-#include <string_view>
-#include <type_traits>
-#include <variant>
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
@@ -17,187 +20,177 @@
 namespace gufo::core {
 namespace {
 
-constexpr std::size_t kSampleWindowBytes = 4096;
-
-class IdentityStream {
+class FileDescriptor {
 public:
-  void Tag(std::string_view tag) {
-    Bytes(std::as_bytes(std::span(tag)));
-    const std::uint8_t terminator = 0;
-    hasher_.Update(std::span(&terminator, 1));
+  explicit FileDescriptor(int fd) : fd_(fd) {}
+  ~FileDescriptor() {
+    if (fd_ >= 0)
+      close(fd_);
   }
-
-  void U64(std::uint64_t value) {
-    std::array<std::uint8_t, 8> encoded{};
-    for (std::size_t index = 0; index < encoded.size(); ++index) {
-      encoded[index] = static_cast<std::uint8_t>(value >> (index * 8U));
-    }
-    hasher_.Update(encoded);
-  }
-
-  void I64(std::int64_t value) { U64(static_cast<std::uint64_t>(value)); }
-  void F64(double value) { U64(std::bit_cast<std::uint64_t>(value)); }
-
-  void String(std::string_view value) {
-    U64(value.size());
-    Bytes(std::as_bytes(std::span(value)));
-  }
-
-  void Bytes(std::span<const std::byte> bytes) {
-    hasher_.Update(std::span(
-        reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()));
-  }
-
-  [[nodiscard]] std::string FinishHex() { return hasher_.FinishHex(); }
+  FileDescriptor(const FileDescriptor&) = delete;
+  FileDescriptor& operator=(const FileDescriptor&) = delete;
+  [[nodiscard]] int get() const { return fd_; }
 
 private:
-  crypto::Sha256Hasher hasher_;
+  int fd_;
 };
 
-void StreamMetadataValue(IdentityStream& stream,
-                         const GgufMetadataValue& entry) {
-  stream.U64(static_cast<std::uint64_t>(entry.type));
-  stream.U64(entry.value.index());
-  std::visit(
-      [&stream](const auto& value) {
-        using Value = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<Value, std::uint64_t>) {
-          stream.U64(value);
-        } else if constexpr (std::is_same_v<Value, std::int64_t>) {
-          stream.I64(value);
-        } else if constexpr (std::is_same_v<Value, double>) {
-          stream.F64(value);
-        } else if constexpr (std::is_same_v<Value, bool>) {
-          stream.U64(value ? 1 : 0);
-        } else if constexpr (std::is_same_v<Value, std::string_view>) {
-          stream.String(value);
-        } else if constexpr (std::is_same_v<Value,
-                                            std::vector<std::string_view>>) {
-          stream.U64(value.size());
-          for (const auto item : value) {
-            stream.String(item);
-          }
-        } else if constexpr (std::is_same_v<Value,
-                                            std::vector<std::uint64_t>>) {
-          stream.U64(value.size());
-          for (const auto item : value) {
-            stream.U64(item);
-          }
-        } else if constexpr (std::is_same_v<Value, std::vector<std::int64_t>>) {
-          stream.U64(value.size());
-          for (const auto item : value) {
-            stream.I64(item);
-          }
-        } else if constexpr (std::is_same_v<Value, std::vector<double>>) {
-          stream.U64(value.size());
-          for (const auto item : value) {
-            stream.F64(item);
-          }
-        }
-      },
-      entry.value);
+void HashString(crypto::Sha256Hasher& hash, std::string_view value) {
+  hash.Update(
+      {reinterpret_cast<const std::uint8_t*>(value.data()), value.size()});
 }
 
-using SampleWindow = std::span<const std::byte>;
+std::string FileStamp(int fd, std::size_t size) {
+  struct stat st{};
+  if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+      static_cast<std::size_t>(st.st_size) != size) {
+    throw std::runtime_error("GGUF file changed or cannot be inspected");
+  }
+  return std::to_string(st.st_dev) + ':' + std::to_string(st.st_ino) + ':' +
+         std::to_string(st.st_size) + ':' + std::to_string(st.st_mtim.tv_sec) +
+         ':' + std::to_string(st.st_mtim.tv_nsec) + ':' +
+         std::to_string(st.st_ctim.tv_sec) + ':' +
+         std::to_string(st.st_ctim.tv_nsec);
+}
 
-/// Start, middle, and end windows of one tensor's payload extent. Extents
-/// shorter than three windows are sampled whole.
-void AppendTensorWindows(std::vector<SampleWindow>& windows,
-                         const std::byte* begin, std::size_t extent) {
-  if (extent <= 3 * kSampleWindowBytes) {
-    windows.emplace_back(begin, extent);
+int OpenCacheDirectory() {
+  const char* base = std::getenv("XDG_CACHE_HOME");
+  std::filesystem::path path;
+  if (base && *base)
+    path = base;
+  else {
+    const char* home = std::getenv("HOME");
+    if (!home || !*home)
+      return -1;
+    path = std::filesystem::path(home) / ".cache";
+  }
+  path /= "gufo";
+  std::error_code error;
+  std::filesystem::create_directories(path, error);
+  if (error)
+    return -1;
+  path /= "gguf-sha256-v1";
+  (void)mkdir(path.c_str(), 0700);
+  int fd = open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0)
+    return -1;
+  struct stat st{};
+  if (fstat(fd, &st) != 0 || st.st_uid != geteuid() ||
+      (st.st_mode & 0077) != 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+std::string ReadDigest(int directory, const std::string& key) {
+  if (directory < 0)
+    return {};
+  FileDescriptor file(
+      openat(directory, key.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
+  struct stat st{};
+  if (file.get() < 0 || fstat(file.get(), &st) != 0 || !S_ISREG(st.st_mode) ||
+      st.st_uid != geteuid() || (st.st_mode & 0022) != 0 || st.st_size != 65)
+    return {};
+  std::array<char, 65> bytes{};
+  if (read(file.get(), bytes.data(), bytes.size()) !=
+          static_cast<ssize_t>(bytes.size()) ||
+      bytes.back() != '\n' ||
+      !std::all_of(bytes.begin(), bytes.end() - 1, [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+      }))
+    return {};
+  return {bytes.data(), bytes.size() - 1};
+}
+
+void StoreDigest(int directory, const std::string& key,
+                 const std::string& digest) {
+  if (directory < 0)
     return;
+  static std::atomic<unsigned long> serial{0};
+  const std::string temp = "." + key + "." + std::to_string(getpid()) + "." +
+                           std::to_string(serial.fetch_add(1));
+  FileDescriptor file(
+      openat(directory, temp.c_str(),
+             O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600));
+  if (file.get() < 0)
+    return;
+  const std::string contents = digest + '\n';
+  if (write(file.get(), contents.data(), contents.size()) ==
+      static_cast<ssize_t>(contents.size())) {
+    (void)renameat(directory, temp.c_str(), directory, key.c_str());
   }
-  const std::size_t middle =
-      ((extent - kSampleWindowBytes) / 2) & ~(kSampleWindowBytes - 1);
-  windows.emplace_back(begin, kSampleWindowBytes);
-  windows.emplace_back(begin + middle, kSampleWindowBytes);
-  windows.emplace_back(begin + extent - kSampleWindowBytes, kSampleWindowBytes);
+  (void)unlinkat(directory, temp.c_str(), 0);
 }
 
-/// Asks the kernel to fetch the sampled pages before they are touched.
-/// Faulting them one at a time would serialize thousands of reads and drag the
-/// device's readahead window (megabytes) in behind each 4 KiB sample.
-void PrefetchWindows(const GgufReader& reader,
-                     std::span<const SampleWindow> windows) {
-  for (const SampleWindow& window : windows) {
-    reader.PrefetchMapped(window.data(), window.size());
+std::string RegionDigest(const GgufMappedRegion& region) {
+  std::string stamp;
+  if (region.file_descriptor >= 0)
+    stamp = FileStamp(region.file_descriptor, region.size);
+  FileDescriptor cache(stamp.empty() ? -1 : OpenCacheDirectory());
+  crypto::Sha256Hasher key_hash;
+  HashString(key_hash, stamp);
+  const auto key = key_hash.FinishHex();
+  std::string digest = ReadDigest(cache.get(), key);
+  const bool cached = !digest.empty();
+  if (!cached) {
+    crypto::Sha256Hasher hash;
+    constexpr std::size_t chunk = 8 * 1024 * 1024;
+    if (region.file_descriptor >= 0) {
+      // Buffered sequential reads do not depend on mapped weight residency,
+      // and report truncation as an error instead of a mapped SIGBUS.
+      std::vector<std::uint8_t> buffer(std::min(chunk, region.size));
+      for (std::size_t offset = 0; offset < region.size;) {
+        const auto length = std::min(buffer.size(), region.size - offset);
+        const auto count = pread(region.file_descriptor, buffer.data(), length,
+                                 static_cast<off_t>(offset));
+        if (count < 0 && errno == EINTR)
+          continue;
+        if (count <= 0)
+          throw std::runtime_error("cannot read complete GGUF for identity");
+        hash.Update({buffer.data(), static_cast<std::size_t>(count)});
+        offset += static_cast<std::size_t>(count);
+      }
+    } else {
+      const auto* bytes = static_cast<const std::uint8_t*>(region.data);
+      for (std::size_t offset = 0; offset < region.size;) {
+        const auto length = std::min(chunk, region.size - offset);
+        hash.Update({bytes + offset, length});
+        offset += length;
+      }
+    }
+    digest = hash.FinishHex();
   }
+  if (!stamp.empty() &&
+      FileStamp(region.file_descriptor, region.size) != stamp) {
+    throw std::runtime_error("GGUF file changed during identity lookup");
+  }
+  if (!cached)
+    StoreDigest(cache.get(), key, digest);
+  return digest;
 }
 
 }  // namespace
 
-std::string GgufSampledIdentityHex(const GgufReader& reader) {
-  IdentityStream stream;
-  stream.Tag(kGgufSampledIdentityScheme);
-
-  stream.Tag("header");
-  stream.U64(reader.GetVersion());
-  stream.U64(reader.GetAlignment());
-  const auto regions = reader.GetMappedRegions();
-  stream.U64(regions.size());
-  for (const GgufMappedRegion& region : regions) {
-    stream.U64(region.size);
+std::string GgufIdentityHex(const GgufReader& reader) {
+  std::vector<std::string> stamps;
+  for (const auto& region : reader.GetMappedRegions())
+    stamps.push_back(region.file_descriptor < 0
+                         ? std::string{}
+                         : FileStamp(region.file_descriptor, region.size));
+  crypto::Sha256Hasher hash;
+  HashString(hash, kGgufIdentityScheme);
+  for (const auto& region : reader.GetMappedRegions()) {
+    HashString(hash, ":" + std::to_string(region.size) + ":");
+    HashString(hash, RegionDigest(region));
   }
-
-  stream.Tag("metadata");
-  const auto keys = reader.GetMetadataKeys();
-  stream.U64(keys.size());
-  for (const std::string_view key : keys) {
-    stream.String(key);
-    StreamMetadataValue(stream, *reader.FindMetadata(key));
+  for (std::size_t index = 0; index < stamps.size(); ++index) {
+    const auto& region = reader.GetMappedRegions()[index];
+    if (!stamps[index].empty() &&
+        stamps[index] != FileStamp(region.file_descriptor, region.size))
+      throw std::runtime_error("GGUF artifact changed during identity lookup");
   }
-
-  const auto tensors = reader.GetTensors();
-  stream.Tag("tensors");
-  stream.U64(tensors.size());
-  for (const GgufTensorInfo& tensor : tensors) {
-    stream.String(tensor.name);
-    stream.U64(tensor.dimensions.size());
-    for (const std::uint64_t dimension : tensor.dimensions) {
-      stream.U64(dimension);
-    }
-    stream.U64(static_cast<std::uint64_t>(tensor.type));
-    stream.U64(tensor.offset);
-  }
-
-  // A tensor's byte extent is the span from its payload to the next payload
-  // in the same region (or the region end). Deriving it from the layout keeps
-  // this independent of per-type size tables, including custom quantizations.
-  std::vector<SampleWindow> windows;
-  std::vector<std::uint64_t> extents;
-  for (const GgufMappedRegion& region : regions) {
-    const auto* region_begin = static_cast<const std::byte*>(region.data);
-    const std::byte* region_end = region_begin + region.size;
-    std::vector<const std::byte*> starts;
-    for (const GgufTensorInfo& tensor : tensors) {
-      const auto* payload = static_cast<const std::byte*>(tensor.data);
-      if (payload != nullptr && payload >= region_begin &&
-          payload < region_end) {
-        starts.push_back(payload);
-      }
-    }
-    std::sort(starts.begin(), starts.end());
-    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
-    extents.push_back(starts.size());
-    for (std::size_t index = 0; index < starts.size(); ++index) {
-      const std::byte* next =
-          index + 1 < starts.size() ? starts[index + 1] : region_end;
-      const auto extent = static_cast<std::size_t>(next - starts[index]);
-      extents.push_back(extent);
-      AppendTensorWindows(windows, starts[index], extent);
-    }
-  }
-
-  PrefetchWindows(reader, windows);
-  stream.Tag("payload");
-  for (const std::uint64_t extent : extents) {
-    stream.U64(extent);
-  }
-  for (const SampleWindow& window : windows) {
-    stream.Bytes(window);
-  }
-  return stream.FinishHex();
+  return hash.FinishHex();
 }
 
 }  // namespace gufo::core

@@ -152,13 +152,14 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   return m;
 }
 
-std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
+std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
+                                              std::uint32_t max_context,
                                               std::string* error_msg) {
   if (max_context == 0 || max_context > options_.max_context) {
     AssignError(error_msg, "session context is outside the model limits");
     return nullptr;
   }
-  auto native = executor_->CreateSession(max_context, error_msg);
+  auto native = executor_->CreateSession(mode, max_context, error_msg);
   if (!native) {
     return nullptr;
   }
@@ -217,13 +218,17 @@ std::size_t Model::ResidentBytes() const noexcept {
   return device_->resident_bytes() + (vision_ ? vision_->ResidentBytes() : 0);
 }
 
-std::size_t Model::SessionBytes(std::uint32_t context) const noexcept {
+std::size_t Model::SessionBytes(core::SessionMode mode,
+                                std::uint32_t context) const noexcept {
   const std::size_t vision =
       vision_ ? std::size_t{context} * (config().hidden_size * sizeof(float) +
                                         3 * sizeof(std::int32_t)) +
                     64
               : 0;
-  return executor_->SessionBytes(context, executor_->max_speculative() - 1) +
+  return executor_->SessionBytes(mode, context,
+                                 mode == core::SessionMode::kSpeculative
+                                     ? executor_->max_speculative() - 1
+                                     : 0) +
          vision;
 }
 
@@ -233,6 +238,10 @@ std::size_t Model::DeferredScratchBytes() const {
 
 std::size_t Session::AllocatedBytes() const noexcept {
   return session_->AllocatedBytes();
+}
+
+bool Session::MtpEnabled() const noexcept {
+  return session_->mtp_enabled();
 }
 
 Session::Session(std::shared_ptr<Model> model,
@@ -282,7 +291,7 @@ void Session::ConfigureVision(
 }
 
 std::uint32_t Session::KeptHiddenRows() const noexcept {
-  return model_->HasMtp()
+  return MtpEnabled()
              ? static_cast<std::uint32_t>(tokens_.size() - hidden_base_)
              : 0;
 }
@@ -398,9 +407,9 @@ bool Session::RestoreSnapshot(std::span<const std::uint8_t> payload,
   rocm::Executor::SnapshotInfo info;
   const auto remaining = ContextSize() - header.token_count;
   const auto next_drafts =
-      model_->HasMtp() ? restored_policy.Choose(remaining ? remaining - 1 : 0,
-                                                header.token_count)
-                       : 0;
+      MtpEnabled() ? restored_policy.Choose(remaining ? remaining - 1 : 0,
+                                            header.token_count)
+                   : 0;
   if (!model_->executor_->RestoreSnapshot(
           *session_,
           std::span<const std::uint8_t>(
@@ -499,13 +508,15 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
 
 bool Session::DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
                                 std::string* error_msg) {
-  if (requests.empty() || !requests.front().session->model_->HasMtp())
+  if (requests.empty())
     return true;
   auto& exec = *requests.front().session->model_->executor_;
   std::vector<std::vector<std::int32_t>> replays(requests.size());
   std::vector<rocm::Executor::MtpBatchItem> items;
   for (std::size_t i = 0; i < requests.size(); ++i) {
     auto& session = *requests[i].session;
+    if (!session.MtpEnabled())
+      continue;
     std::int32_t hidden_row = 0;
     if (!session.DraftReplay(requests[i].token, &replays[i], &hidden_row,
                              error_msg))
@@ -524,7 +535,7 @@ bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
     const std::size_t n =
         std::min<std::size_t>(exec.max_batch(), tokens.size() - off);
     const auto chunk = tokens.subspan(off, n);
-    if (model_->HasMtp() && !tokens_.empty() &&
+    if (MtpEnabled() && !tokens_.empty() &&
         !DraftCatchUp(chunk[0], false, error_msg)) {
       return false;
     }
@@ -636,7 +647,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
   const std::size_t cap =
       std::min<std::size_t>({max_tokens, room, exec.max_speculative()});
   const std::size_t width =
-      model_->HasMtp() && cap > 1
+      MtpEnabled() && cap > 1
           ? 1 + (batch_drafts ? std::min<std::uint32_t>(*batch_drafts, cap - 1)
                               : draft_length_.Choose(
                                     static_cast<std::uint32_t>(cap - 1),
@@ -651,8 +662,8 @@ bool Session::PrepareDecode(const DecodeRequest& request,
     result->stop = true;
     return true;
   }
-  if (!model_->HasMtp() || width < 2) {
-    if (model_->HasMtp() && !defer_head &&
+  if (!MtpEnabled() || width < 2) {
+    if (MtpEnabled() && !defer_head &&
         !DraftCatchUp(anchor, false, error_msg)) {
       return false;
     }
@@ -879,7 +890,8 @@ bool Session::DecodeBatch(std::span<const DecodeRequest> requests,
   std::optional<std::uint32_t> batch_drafts;
   std::uint32_t batch_context = 0;
   auto& policy = requests.front().session->model_->batch_policy_;
-  if (requests.front().session->model_->HasMtp() &&
+  if (std::ranges::all_of(
+          requests, [](const auto& r) { return r.session->MtpEnabled(); }) &&
       std::ranges::none_of(requests, [](const auto& request) {
         return request.sampler->config().uses_random_sampling();
       })) {

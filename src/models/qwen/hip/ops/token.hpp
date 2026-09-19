@@ -6,6 +6,7 @@
 #include <span>
 
 #include "src/core/gguf_reader.hpp"
+#include "src/core/sampling.hpp"
 #include "src/models/qwen/vision/rope.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -18,8 +19,7 @@ struct GpuSamplingWorkspace {
   float* sorted_logits{nullptr};
   std::uint32_t* token_ids{nullptr};
   std::uint32_t* sorted_token_ids{nullptr};
-  std::uint32_t* penalty_tokens{nullptr};
-  std::uint32_t* penalty_counts{nullptr};
+  sampling::TokenPenalty* penalties{nullptr};
   std::uint32_t* draft_candidate_ids{nullptr};
   float* draft_candidate_probabilities{nullptr};
   std::uint32_t* speculative_accepted{nullptr};
@@ -32,7 +32,8 @@ struct GpuSamplingWorkspace {
     if (vocab_size == 0)
       return 0;
     return 2 * vocab_size * (sizeof(float) + sizeof(std::uint32_t)) +
-           penalty_capacity * (3 * sizeof(std::uint32_t) + sizeof(float)) +
+           penalty_capacity * (sizeof(sampling::TokenPenalty) +
+                               sizeof(std::uint32_t) + sizeof(float)) +
            sizeof(std::uint32_t) + sort_temp_storage_bytes;
   }
 };
@@ -63,12 +64,11 @@ void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
 
 /// Samples one device-resident logit row and writes a single device token.
 ///
-/// Penalty token/count spans are host-resident compact unique-token arrays.
+/// Penalties are host-resident unique-token records from SamplerState.
 void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
                        std::size_t vocab_size,
                        const GpuSamplingParameters& parameters,
-                       const std::uint32_t* penalty_tokens,
-                       const std::uint32_t* penalty_counts,
+                       const sampling::TokenPenalty* penalties,
                        std::size_t penalty_count,
                        GpuSamplingWorkspace* workspace,
                        hipStream_t stream = nullptr);
@@ -85,9 +85,9 @@ void LaunchGPUSpeculativeSampling(
     const std::uint32_t* draft_candidate_ids,
     const float* draft_candidate_probabilities,
     std::size_t draft_candidate_count, float acceptance_uniform,
-    float residual_uniform, const std::uint32_t* penalty_tokens,
-    const std::uint32_t* penalty_counts, std::size_t penalty_count,
-    GpuSamplingWorkspace* workspace, hipStream_t stream = nullptr);
+    float residual_uniform, const sampling::TokenPenalty* penalties,
+    std::size_t penalty_count, GpuSamplingWorkspace* workspace,
+    hipStream_t stream = nullptr);
 
 /// Asynchronously copies embedding row for token_id into out_hidden
 void LaunchEmbeddingLookup(const void* table, core::GgmlType type,

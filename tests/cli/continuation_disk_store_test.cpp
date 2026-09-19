@@ -827,19 +827,34 @@ void TestBoundedAsyncPersistenceDoesNotBlockLookup() {
   TemporaryDirectory directory;
   auto runner = std::make_shared<FakeRunner>("async-store");
   std::binary_semaphore entered(0), release(0);
-  runner->before_stream = [&] {
-    entered.release();
-    release.acquire();
-  };
   const auto bytes = ExpectedFileBytes(
       runner->Descriptor().persistence->compatibility_identity.size(), 2);
   {
     ContinuationDiskStore store(
         StoreOptions(directory.path(), 4096, bytes + sizeof(FakeSnapshot)));
+    Expect(store
+               .Save(*runner, std::vector<TextRunnerToken>{7, 8},
+                     *MakeSnapshot(*runner, 99, 2))
+               .stored,
+           "an existing entry is available before the new write");
+    runner->before_stream = [&] {
+      entered.release();
+      release.acquire();
+    };
     auto snapshot = MakeSnapshot(*runner, 42, 2);
     Expect(store.CanSave(*runner, 2, snapshot->PayloadBytes()),
            "empty persistence queue admits the snapshot before capture");
-    Expect(store.SaveAsync(runner, {1, 2}, std::move(snapshot)) == bytes,
+    auto capture = store.ReserveCapture(*runner, 2, snapshot->PayloadBytes());
+    Expect(capture != nullptr &&
+               !store.CanSave(*runner, 2, snapshot->PayloadBytes()) &&
+               !store.ReserveCapture(*runner, 2, snapshot->PayloadBytes()),
+           "in-flight captures reserve staging before any allocation");
+    capture.reset();
+    Expect(store.CanSave(*runner, 2, snapshot->PayloadBytes()),
+           "discarded captures release their reservation");
+    capture = store.ReserveCapture(*runner, 2, snapshot->PayloadBytes());
+    Expect(store.SaveAsync(runner, {1, 2}, std::move(snapshot), {},
+                           std::move(capture)) == bytes,
            "immutable snapshot is queued without waiting for serialization");
     const bool started = entered.try_acquire_for(std::chrono::seconds(2));
     Expect(started, "persistence worker starts independently");
@@ -849,7 +864,10 @@ void TestBoundedAsyncPersistenceDoesNotBlockLookup() {
         "active writes count against the bounded queue");
     auto lookup = std::async(std::launch::async, [&] {
       auto state = runner->CreateState();
-      return !RestoreTokens(store, *runner, *state, {1, 2, 9}).restored &&
+      return RestoreTokens(store, *runner, *state, {7, 8, 9}).restored &&
+             RequireFakeState(*state).value == 99 &&
+             store.Touch(*runner, std::vector<TextRunnerToken>{7, 8}) &&
+             !RestoreTokens(store, *runner, *state, {1, 2, 9}).restored &&
              store
                  .SharedPrefixBoundaries(
                      *runner, std::vector<TextRunnerToken>{1, 9}, 1, 4)
@@ -860,7 +878,7 @@ void TestBoundedAsyncPersistenceDoesNotBlockLookup() {
         lookup.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
     release.release();
     Expect(ready && lookup.get(),
-           "lookup skips a blocked writer without stalling generation");
+           "existing entries remain readable while a writer is blocked");
     store.Flush();
     runner->before_stream = {};
     auto state = runner->CreateState();
@@ -871,7 +889,7 @@ void TestBoundedAsyncPersistenceDoesNotBlockLookup() {
            "completed writes release queue admission");
   }
   ContinuationDiskStore restarted(StoreOptions(directory.path()));
-  Expect(restarted.entry_count() == 2,
+  Expect(restarted.entry_count() == 3,
          "shutdown drains accepted persistence jobs");
 }
 

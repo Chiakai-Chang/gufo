@@ -566,8 +566,6 @@ private:
   std::size_t last_hidden_offset_{0};
   float* d_target_layer_features_{nullptr};
   GpuSamplingWorkspace sampling_workspace_;
-  std::vector<std::uint32_t> h_penalty_tokens_;
-  std::vector<std::uint32_t> h_penalty_counts_;
   std::optional<tokenization::TokenId> next_token_;
   bool capture_prompt_hidden_{false};
   bool replaying_ssm_state_{false};

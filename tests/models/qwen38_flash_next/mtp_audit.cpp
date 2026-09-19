@@ -127,8 +127,10 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
   auto vision =
       gufo::models::qwen::vision::Encoder::Open(path, {}, c.hidden_size);
   for (unsigned sequence = 0; sequence < 2; ++sequence) {
-    sessions[sequence] = exec.CreateSession(64, &error);
-    serial[sequence] = exec.CreateSession(64, &error);
+    sessions[sequence] =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, 64, &error);
+    serial[sequence] =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, 64, &error);
     references[sequence] = std::make_unique<q::ReferenceModel>(
         weights, nullptr, 64, q::ReferenceModel::Storage::kDecode);
     Require(sessions[sequence] && serial[sequence], error);
@@ -146,7 +148,8 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
       sessions[sequence]->ConfigureVision(prompt, vision, stream);
       serial[sequence]->ConfigureVision(prompt, vision, stream);
     }
-    auto origin = exec.CreateSession(64, &error);
+    auto origin =
+        exec.CreateSession(gufo::core::SessionMode::kSpeculative, 64, &error);
     Require(origin != nullptr, error);
     const auto encoded = tokenizer.Encode(
         sequence == 0
@@ -282,7 +285,8 @@ void AuditMtpCosts(q::rocm::Executor& exec,
     std::vector<std::int32_t> prefix(prefix_size);
     for (std::size_t i = 0; i < prefix.size(); ++i)
       prefix[i] = pattern[i % pattern.size()];
-    auto base = exec.CreateSession(capacity, &error);
+    auto base = exec.CreateSession(gufo::core::SessionMode::kSpeculative,
+                                   capacity, &error);
     Require(base != nullptr, error);
     for (std::size_t offset = 0; offset < prefix.size();) {
       const auto n =
@@ -311,7 +315,8 @@ void AuditMtpCosts(q::rocm::Executor& exec,
       std::array<std::int32_t, 8> anchors{};
       const unsigned count = concurrency;
       for (unsigned i = 0; i < count; ++i) {
-        sessions.push_back(exec.CreateSession(capacity, &error));
+        sessions.push_back(exec.CreateSession(
+            gufo::core::SessionMode::kSpeculative, capacity, &error));
         Require(sessions.back() != nullptr, error);
         q::rocm::Executor::SnapshotInfo info;
         Require(exec.RestoreSnapshot(*sessions.back(), common, &info, &error),

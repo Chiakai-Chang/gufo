@@ -437,8 +437,16 @@ int RunDeepSeekBenchmark(
 
   const auto tokens = MakeDeepSeekBenchmarkTokens(*model, required_context);
   if (options.validate_prefill_tokens != 0) {
-    auto sequential = model->CreateSession(required_context, &error);
-    auto batched = model->CreateSession(required_context, &error);
+    auto sequential =
+        model->CreateSession(options.speculative_backend.empty()
+                                 ? gufo::core::SessionMode::kAutoregressive
+                                 : gufo::core::SessionMode::kSpeculative,
+                             required_context, &error);
+    auto batched =
+        model->CreateSession(options.speculative_backend.empty()
+                                 ? gufo::core::SessionMode::kAutoregressive
+                                 : gufo::core::SessionMode::kSpeculative,
+                             required_context, &error);
     const auto prefix =
         std::span(tokens).first(options.validate_prefill_tokens);
     if (!sequential || !batched || !sequential->Sync(prefix.first(1), &error) ||
@@ -511,6 +519,9 @@ int RunDeepSeekBenchmark(
       using models::deepseek_v4_flash::Session;
       for (const std::size_t depth : options.n_depths) {
         auto base = model->CreateSession(
+            options.speculative_backend.empty()
+                ? gufo::core::SessionMode::kAutoregressive
+                : gufo::core::SessionMode::kSpeculative,
             static_cast<uint32_t>(required_context), &error);
         const std::size_t prefix = depth > 0 ? depth : 16;
         if (!base || !base->Sync(std::span(tokens).first(prefix), &error)) {
@@ -538,6 +549,9 @@ int RunDeepSeekBenchmark(
                   sampling::SamplerState(sampling_config, history));
               for (std::size_t i = 0; i < concurrency; ++i) {
                 auto session = model->CreateSession(
+                    options.speculative_backend.empty()
+                        ? gufo::core::SessionMode::kAutoregressive
+                        : gufo::core::SessionMode::kSpeculative,
                     static_cast<uint32_t>(required_context), &error);
                 if (!session ||
                     ((generate || depth > 0) &&
@@ -676,6 +690,9 @@ int RunDeepSeekBenchmark(
       if (depth > 0) {
         if (prepared_session == nullptr || depth < prepared_depth) {
           prepared_session = model->CreateSession(
+              options.speculative_backend.empty()
+                  ? gufo::core::SessionMode::kAutoregressive
+                  : gufo::core::SessionMode::kSpeculative,
               static_cast<std::uint32_t>(required_context), &error);
           prepared_depth = 0;
         }
@@ -711,6 +728,9 @@ int RunDeepSeekBenchmark(
           models::deepseek_v4_flash::Session* session = prepared_session.get();
           if (snapshot == nullptr) {
             local_session = model->CreateSession(
+                options.speculative_backend.empty()
+                    ? gufo::core::SessionMode::kAutoregressive
+                    : gufo::core::SessionMode::kSpeculative,
                 static_cast<std::uint32_t>(required_context), &error);
             session = local_session.get();
             if (session != nullptr && depth > 0 &&
@@ -758,6 +778,9 @@ int RunDeepSeekBenchmark(
           models::deepseek_v4_flash::Session* session = prepared_session.get();
           if (snapshot == nullptr) {
             local_session = model->CreateSession(
+                options.speculative_backend.empty()
+                    ? gufo::core::SessionMode::kAutoregressive
+                    : gufo::core::SessionMode::kSpeculative,
                 static_cast<std::uint32_t>(required_context), &error);
             session = local_session.get();
             if (session != nullptr &&
@@ -938,8 +961,14 @@ int RunQwen38FlashNextBenchmark(
     // Batched prefill against one-token-at-a-time evaluation of the same
     // prefix; both run on the GPU, so this checks the batched kernels.
     auto sequential = model->CreateSession(
+        options.speculative_backend.empty()
+            ? gufo::core::SessionMode::kAutoregressive
+            : gufo::core::SessionMode::kSpeculative,
         static_cast<std::uint32_t>(required_context), &error);
     auto batched = model->CreateSession(
+        options.speculative_backend.empty()
+            ? gufo::core::SessionMode::kAutoregressive
+            : gufo::core::SessionMode::kSpeculative,
         static_cast<std::uint32_t>(required_context), &error);
     const auto prefix =
         std::span(tokens).first(options.validate_prefill_tokens);
@@ -1020,6 +1049,9 @@ int RunQwen38FlashNextBenchmark(
       for (std::size_t repetition = warm_prefix ? 1 : 0;
            repetition <= options.repetitions; ++repetition) {
         auto session = model->CreateSession(
+            options.speculative_backend.empty()
+                ? gufo::core::SessionMode::kAutoregressive
+                : gufo::core::SessionMode::kSpeculative,
             static_cast<std::uint32_t>(required_context), &error);
         if (!session ||
             (depth > 0 &&
@@ -1054,6 +1086,9 @@ int RunQwen38FlashNextBenchmark(
       for (std::size_t repetition = 0; repetition < options.repetitions;
            ++repetition) {
         auto session = model->CreateSession(
+            options.speculative_backend.empty()
+                ? gufo::core::SessionMode::kAutoregressive
+                : gufo::core::SessionMode::kSpeculative,
             static_cast<std::uint32_t>(required_context), &error);
         if (!session ||
             !session->Sync(std::span(tokens).first(prefix_length), &error)) {

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -458,7 +459,25 @@ struct TextRunnerPool::Request::Impl {
     }
   }
 
-  void CapturePromptSnapshot() noexcept {
+  ~Impl() {
+    // The worker borrows this lease's state; join before any field is
+    // destroyed.
+    if (snapshot_future.valid())
+      snapshot_future.wait();
+  }
+
+  void CapturePromptSnapshot(bool wait = true) noexcept {
+    if (!prompt_snapshot_attempted)
+      StartPromptSnapshot();
+    if (!snapshot_future.valid())
+      return;
+    if (!wait && snapshot_future.wait_for(std::chrono::seconds(0)) !=
+                     std::future_status::ready)
+      return;
+    FinishPromptSnapshot();
+  }
+
+  void StartPromptSnapshot() noexcept {
     if (prompt_snapshot_attempted || !decode_ready) {
       return;
     }
@@ -486,7 +505,7 @@ struct TextRunnerPool::Request::Impl {
     } catch (...) {
       return;
     }
-    std::size_t snapshot_bytes = 0;
+    snapshot_bytes = 0;
     try {
       if (runner->CheckpointPosition(*state) != prompt.size()) {
         lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, 0,
@@ -500,7 +519,7 @@ struct TextRunnerPool::Request::Impl {
       return;
     }
 
-    bool retain_snapshot = false;
+    retain_snapshot = false;
     try {
       retain_snapshot = lease.TryReserveSnapshot(snapshot_bytes, prompt.size());
     } catch (...) {
@@ -508,34 +527,42 @@ struct TextRunnerPool::Request::Impl {
     }
     if (!retain_snapshot) {
       try {
-        if (disk_store == nullptr ||
-            !disk_store->CanSave(*runner, prompt.size(), snapshot_bytes,
-                                 InputIdentity()))
+        if (!disk_store)
+          return;
+        disk_capture = disk_store->ReserveCapture(
+            *runner, prompt.size(), snapshot_bytes, InputIdentity());
+        if (!disk_capture)
           return;
       } catch (...) {
         return;
       }
     }
 
-    const auto snapshot_start = std::chrono::steady_clock::now();
+    snapshot_start = std::chrono::steady_clock::now();
     try {
-      prompt_snapshot = runner->Snapshot(*state);
-      snapshot_metrics.snapshot_ms =
-          std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - snapshot_start)
-              .count();
+      snapshot_future = std::async(std::launch::async, [owner = runner, state] {
+        return owner->Snapshot(*state);
+      });
     } catch (...) {
-      snapshot_metrics.snapshot_ms =
-          std::chrono::duration<double, std::milli>(
-              std::chrono::steady_clock::now() - snapshot_start)
-              .count();
-      if (retain_snapshot) {
+      disk_capture.reset();
+      if (retain_snapshot)
         lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, snapshot_bytes,
                            prompt.size());
-      }
-      return;
     }
+  }
+
+  void FinishPromptSnapshot() noexcept {
+    try {
+      prompt_snapshot = snapshot_future.get();
+    } catch (...) {
+      prompt_snapshot.reset();
+    }
+    snapshot_metrics.snapshot_ms =
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - snapshot_start)
+            .count();
     if (prompt_snapshot == nullptr) {
+      disk_capture.reset();
       if (retain_snapshot) {
         lease.SkipSnapshot(SnapshotEventReason::kCaptureFailure, snapshot_bytes,
                            prompt.size());
@@ -557,7 +584,8 @@ struct TextRunnerPool::Request::Impl {
       try {
         snapshot_metrics.disk_queued_bytes = disk_store->SaveAsync(
             runner, prompt, prompt_snapshot,
-            {InputIdentity().begin(), InputIdentity().end()});
+            {InputIdentity().begin(), InputIdentity().end()},
+            std::move(disk_capture));
       } catch (...) {
         snapshot_metrics.disk_queued_bytes = 0;
       }
@@ -566,6 +594,7 @@ struct TextRunnerPool::Request::Impl {
               std::chrono::steady_clock::now() - started)
               .count();
     }
+    disk_capture.reset();
     if (!retain_snapshot)
       prompt_snapshot.reset();
   }
@@ -647,6 +676,11 @@ struct TextRunnerPool::Request::Impl {
   bool prompt_snapshot_attempted{false};
   std::shared_ptr<const TextRunnerSnapshot> prompt_snapshot;
   TextRunnerPool::Request::CommitMetrics snapshot_metrics;
+  std::size_t snapshot_bytes{0};
+  bool retain_snapshot{false};
+  std::chrono::steady_clock::time_point snapshot_start;
+  std::unique_ptr<ContinuationDiskStore::CaptureReservation> disk_capture;
+  std::future<std::unique_ptr<TextRunnerSnapshot>> snapshot_future;
 };
 
 TextRunnerPool::Request::Request() = default;
@@ -657,6 +691,18 @@ TextRunnerPool::Request::Request(std::unique_ptr<Impl> impl)
 void TextRunnerPool::Request::CapturePromptSnapshot() {
   if (impl_)
     impl_->CapturePromptSnapshot();
+}
+
+bool TextRunnerPool::Request::PreparePromptSnapshot() {
+  if (impl_)
+    impl_->CapturePromptSnapshot(false);
+  return !impl_ || !impl_->snapshot_future.valid();
+}
+
+bool TextRunnerPool::Request::SnapshotPending() const {
+  return impl_ && impl_->snapshot_future.valid() &&
+         impl_->snapshot_future.wait_for(std::chrono::seconds(0)) !=
+             std::future_status::ready;
 }
 
 std::optional<TextDecodeSelection>
@@ -908,6 +954,8 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
 
 void TextRunnerPool::Request::Invalidate() noexcept {
   if (impl_ != nullptr) {
+    if (impl_->snapshot_future.valid())
+      impl_->snapshot_future.wait();
     dynamic_cast<TextRunnerState&>(impl_->lease.state())
         .SetCancellationCheck({});
     impl_->lease.Invalidate();

@@ -7,6 +7,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -23,6 +25,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
@@ -48,6 +51,49 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
+/// Ordinary host allocations use the host budget, not HIP's device capacity.
+std::size_t HostSnapshotBudgetBytes() {
+  const long pages = sysconf(_SC_AVPHYS_PAGES);
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (pages <= 0 || page_size <= 0)
+    return 0;
+  std::uint64_t available = std::uint64_t(pages) * page_size;
+  std::ifstream meminfo("/proc/meminfo");
+  for (std::string line; std::getline(meminfo, line);) {
+    if (line.starts_with("MemAvailable:")) {
+      std::istringstream fields(line.substr(13));
+      std::uint64_t kib = 0;
+      if (fields >> kib)
+        available = kib * 1024;
+      break;
+    }
+  }
+  // A cgroup limit can be much smaller than the host's available memory.
+  // Walk parents too: a child may say "max" beneath a limited ancestor.
+  std::ifstream membership("/proc/self/cgroup");
+  for (std::string line; std::getline(membership, line);) {
+    if (!line.starts_with("0::/"))
+      continue;
+    const auto relative = std::filesystem::path(line.substr(4));
+    if (std::ranges::any_of(relative,
+                            [](const auto& part) { return part == ".."; }))
+      continue;
+    const std::filesystem::path root("/sys/fs/cgroup");
+    for (auto path = root / relative;; path = path.parent_path()) {
+      std::ifstream limit_file(path / "memory.max");
+      std::ifstream used_file(path / "memory.current");
+      std::uint64_t limit = 0, used = 0;
+      if ((limit_file >> limit) && (used_file >> used))
+        available = std::min(available, limit > used ? limit - used : 0);
+      if (path == root)
+        break;
+    }
+    break;
+  }
+  return static_cast<std::size_t>(std::min<std::uint64_t>(
+      available / 2, std::numeric_limits<std::size_t>::max()));
+}
+
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
 };
@@ -145,7 +191,7 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=deepseek4\n"
-           << "artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
            << artifact_fingerprint << '\n'
            << "tokenizer=joyai-byte-bpe-v1\n"
            << "chat_template=" << models::deepseek_v4_flash::ChatTemplateId()
@@ -160,7 +206,7 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
            << "position_policy=absolute-v1\n"
            << "rope_window_policy=deepseek4-compiled-v1\n"
            << "adapters=none\n";
-  identity << "support_id=" << core::kGgufSampledIdentityScheme << ':'
+  identity << "support_id=" << core::kGgufIdentityScheme << ':'
            << support_fingerprint << '\n'
            << "max_draft_tokens=" << max_draft_tokens << '\n'
            << "draft_policy=dspark-cost-v5-window128\n";
@@ -184,7 +230,7 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=qwen38-flash-next\n"
-           << "artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
            << artifact_fingerprint << '\n'
            << "tokenizer=embedded-in-artifact\n"
            << "chat_template=qwen38-reasoning-compiled-v3\n"
@@ -199,7 +245,7 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
            << "adapters=none\n";
   if (has_mtp) {
     identity << "draft_backend=qfn-mtp-v1\n"
-             << "draft_artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+             << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
              << mtp_fingerprint << '\n'
              << "draft_max_tokens=" << max_draft_tokens << '\n'
              << "draft_cost_concurrency=" << decode_concurrency << '\n';
@@ -227,7 +273,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
   std::ostringstream identity;
   identity << "schema=gufo-text-continuation-v2\n"
            << "model_kind=qwen3.8\n"
-           << "artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
            << artifact_fingerprint << '\n'
            << "tokenizer=embedded-in-artifact\n"
            << "chat_template=qwen38-reasoning-compiled-v3\n"
@@ -247,7 +293,7 @@ std::vector<std::uint8_t> QwenCompatibilityIdentity(
   if (speculative) {
     identity
         << "draft_backend=dflash2-gfx1151-v1\n"
-        << "draft_artifact_id=" << core::kGgufSampledIdentityScheme << ':'
+        << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
         << draft_artifact_fingerprint << '\n'
         << "draft_state_layout=dflash-window-kv-and-frontier-v3\n"
         << "draft_policy="
@@ -1267,9 +1313,12 @@ class DeepSeekTextRunnerState final : public TextRunnerState {
 public:
   DeepSeekTextRunnerState(
       const std::shared_ptr<models::deepseek_v4_flash::Model>& model,
-      std::uint32_t max_context) {
+      std::uint32_t max_context, bool use_dspark) {
     std::string error;
-    session_ = model->CreateSession(max_context, &error);
+    session_ = model->CreateSession(
+        use_dspark ? gufo::core::SessionMode::kSpeculative
+                   : gufo::core::SessionMode::kAutoregressive,
+        max_context, &error);
     if (session_ == nullptr) {
       throw std::runtime_error("Failed to create DeepSeek session: " + error);
     }
@@ -1353,20 +1402,23 @@ const DeepSeekTextRunnerState& RequireDeepSeekState(
 class DeepSeekTextRunner final : public TextModelRunner {
 public:
   DeepSeekTextRunner(std::shared_ptr<models::deepseek_v4_flash::Model> model,
-                     std::uint32_t max_context, std::uint32_t max_draft_tokens,
+                     std::uint32_t max_context, bool use_dspark,
+                     std::uint32_t max_draft_tokens,
                      std::string artifact_fingerprint = {},
                      std::string support_fingerprint = {})
       : model_(std::move(model)),
         max_context_(max_context),
+        use_dspark_(use_dspark),
         max_draft_tokens_(std::max(max_draft_tokens, 1u)) {
     if (!artifact_fingerprint.empty()) {
-      if (model_->HasDspark() && !IsSha256Hex(support_fingerprint)) {
+      if (use_dspark_ && !IsSha256Hex(support_fingerprint)) {
         throw std::invalid_argument(
             "DSpark disk cache requires a support SHA-256 fingerprint");
       }
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = DeepSeekCompatibilityIdentity(
-              artifact_fingerprint, support_fingerprint, max_context_,
+              artifact_fingerprint,
+              use_dspark_ ? support_fingerprint : std::string{}, max_context_,
               max_draft_tokens_),
           .payload_version = DS4_SESSION_PAYLOAD_VERSION,
       };
@@ -1374,7 +1426,7 @@ public:
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
-    const bool dspark = model_->HasDspark();
+    const bool dspark = use_dspark_;
     return {
         .model_id = model_->ModelName(),
         .state_abi = std::string(kDeepSeekStateAbi),
@@ -1407,7 +1459,7 @@ public:
         .state_capacity_bytes = capacity,
         .per_request_state_bytes = std::nullopt,
         .temporary_scratch_bytes = std::nullopt,
-        .retained_snapshot_capacity_bytes = capacity,
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
         .requires_device_runtime_lock = true,
     };
   }
@@ -1473,6 +1525,10 @@ public:
             .name = tool.name,
             .description = tool.description,
             .parameters_json = tool.parameters_json,
+            .definition_json =
+                tool.definition_json.empty()
+                    ? std::string{}
+                    : json::parse(tool.definition_json)["function"].dump(),
         });
       }
     }
@@ -1517,7 +1573,8 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<DeepSeekTextRunnerState>(model_, max_context_);
+    return std::make_unique<DeepSeekTextRunnerState>(model_, max_context_,
+                                                     use_dspark_);
   }
 
   void PreparePrefixReuse(
@@ -1620,7 +1677,7 @@ public:
   [[nodiscard]] TextDecodeStep DecodeStep(
       TextRunnerState& state, std::size_t max_tokens,
       sampling::SamplerState& sampler) const override {
-    if (!model_->HasDspark()) {
+    if (!use_dspark_) {
       return TextModelRunner::DecodeStep(state, max_tokens, sampler);
     }
     if (max_tokens == 0) {
@@ -1674,7 +1731,7 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
-    if (!model_->HasDspark() || decodes.size() < 2 || decodes.size() > 8) {
+    if (!use_dspark_ || decodes.size() < 2 || decodes.size() > 8) {
       return TextModelRunner::DecodeBatch(decodes);
     }
     if (std::any_of(decodes.begin(), decodes.end(), [&](const auto& item) {
@@ -1814,8 +1871,8 @@ public:
   [[nodiscard]] std::size_t SnapshotPayloadBytes(
       const TextRunnerState& state) const override {
     const auto& session = RequireDeepSeekState(state).session();
-    if (model_->HasDspark() && session.DsparkStatistics().context_tokens !=
-                                   static_cast<uint32_t>(session.Position())) {
+    if (use_dspark_ && session.DsparkStatistics().context_tokens !=
+                           static_cast<uint32_t>(session.Position())) {
       throw std::runtime_error("DSpark prefix lacks complete support state");
     }
     const std::uint64_t bytes = session.PayloadBytes();
@@ -1914,18 +1971,18 @@ public:
 private:
   std::shared_ptr<models::deepseek_v4_flash::Model> model_;
   std::uint32_t max_context_;
+  bool use_dspark_;
   std::uint32_t max_draft_tokens_;
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 
 /// Derives the content identity that keys persistent continuations for one
-/// GGUF artifact. Sampled rather than hashed in full so an 80 GiB model costs
-/// about the same as a small one at every start.
+/// GGUF artifact. Full digests are cached by the open file metadata.
 bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
                          std::string* fingerprint, std::string* error) {
   const auto start = std::chrono::steady_clock::now();
   try {
-    *fingerprint = core::GgufSampledIdentityHex(reader);
+    *fingerprint = core::GgufIdentityHex(reader);
   } catch (const std::exception& exception) {
     SetError(error, std::string("Failed to fingerprint ") + std::string(label) +
                         " GGUF: " + exception.what());
@@ -1936,7 +1993,7 @@ bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
                                 .count();
   std::ostringstream message;
   message << "Fingerprinted " << label << " artifact ("
-          << core::kGgufSampledIdentityScheme << ", " << reader.GetTensorCount()
+          << core::kGgufIdentityScheme << ", " << reader.GetTensorCount()
           << " tensors) in " << std::fixed << std::setprecision(0) << elapsed_ms
           << " ms";
   Logger::Info("engine", message.str());
@@ -1985,9 +2042,12 @@ std::vector<std::int32_t> QwenFlashNextEngineTokens(
 class QwenFlashNextTextRunnerState final : public TextRunnerState {
 public:
   QwenFlashNextTextRunnerState(const std::shared_ptr<QwenFlashNextModel>& model,
-                               std::uint32_t max_context) {
+                               std::uint32_t max_context, bool use_mtp) {
     std::string error;
-    session_ = model->CreateSession(max_context, &error);
+    session_ =
+        model->CreateSession(use_mtp ? gufo::core::SessionMode::kSpeculative
+                                     : gufo::core::SessionMode::kAutoregressive,
+                             max_context, &error);
     if (session_ == nullptr) {
       throw std::runtime_error("Failed to create Qwen3.8-Flash-Next session: " +
                                error);
@@ -2041,19 +2101,6 @@ public:
   std::size_t position;
 };
 
-/// Host memory the retained snapshots of one process may occupy: half of
-/// what is free now, so the model's own page cache and request buffers
-/// keep their share.
-std::size_t HostSnapshotBudgetBytes() noexcept {
-  const long pages = sysconf(_SC_AVPHYS_PAGES);
-  const long page_size = sysconf(_SC_PAGESIZE);
-  if (pages <= 0 || page_size <= 0) {
-    return 0;
-  }
-  return static_cast<std::size_t>(pages) * static_cast<std::size_t>(page_size) /
-         2;
-}
-
 QwenFlashNextTextRunnerState& RequireQwenFlashNextState(
     TextRunnerState& state) {
   auto* qfn = dynamic_cast<QwenFlashNextTextRunnerState*>(&state);
@@ -2086,8 +2133,9 @@ public:
     if (!artifact_fingerprint.empty()) {
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
-              artifact_fingerprint, mtp_fingerprint, model_->HasMtp(),
-              max_context_, max_draft_tokens_, model_->DecodeConcurrency()),
+              artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
+              use_mtp_, max_context_, max_draft_tokens_,
+              model_->DecodeConcurrency()),
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
@@ -2127,7 +2175,10 @@ public:
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = model_->SessionBytes(max_context_),
+        .per_request_state_bytes = model_->SessionBytes(
+            use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                     : gufo::core::SessionMode::kAutoregressive,
+            max_context_),
         // Runtime scratch is shared and already allocated at model load;
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
@@ -2187,7 +2238,8 @@ public:
   }
 
   [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<QwenFlashNextTextRunnerState>(model_, max_context_);
+    return std::make_unique<QwenFlashNextTextRunnerState>(model_, max_context_,
+                                                          use_mtp_);
   }
 
   void PreparePrefixReuse(
@@ -2647,7 +2699,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
-    if (DiskCacheEnabled(resolved_disk_cache_config) && model->HasDspark() &&
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        speculative_config.backend == TextSpeculativeBackend::kDSpark &&
         resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
         !FingerprintArtifactFile(
             "DSpark", speculative_config.draft_model_path,
@@ -2716,7 +2769,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
       return false;
     }
-    if (DiskCacheEnabled(resolved_disk_cache_config) && model->HasMtp() &&
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        speculative_config.backend == TextSpeculativeBackend::kMtp &&
         resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
         !FingerprintArtifactFile(
             "Qwen3.8-Flash-Next MTP", speculative_config.draft_model_path,
@@ -2904,6 +2958,13 @@ bool InferenceBackend::load(
     SetError(error, "DeepSeek model must not be null");
     return false;
   }
+  const bool use_dspark =
+      speculative_config.backend == TextSpeculativeBackend::kDSpark;
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      (!use_dspark || !model->HasDspark())) {
+    SetError(error, "DeepSeek DSpark requires a loaded support model");
+    return false;
+  }
   if (session_count == 0) {
     SetError(error, "HTTP session count must be at least one");
     return false;
@@ -2912,14 +2973,14 @@ bool InferenceBackend::load(
     SetError(error, "HTTP context exceeds the loaded DeepSeek model context");
     return false;
   }
-  if (model->HasDspark() && (speculative_config.max_draft_tokens == 0 ||
-                             speculative_config.min_draft_tokens == 0 ||
-                             speculative_config.min_draft_tokens >
-                                 speculative_config.max_draft_tokens)) {
+  if (use_dspark && (speculative_config.max_draft_tokens == 0 ||
+                     speculative_config.min_draft_tokens == 0 ||
+                     speculative_config.min_draft_tokens >
+                         speculative_config.max_draft_tokens)) {
     SetError(error, "DeepSeek DSpark draft limits are invalid");
     return false;
   }
-  if (model->HasDspark() && speculative_config.min_draft_tokens != 1) {
+  if (use_dspark && speculative_config.min_draft_tokens != 1) {
     SetError(error,
              "DSpark uses model-owned adaptive drafting; custom draft "
              "floors are unsupported");
@@ -2927,7 +2988,7 @@ bool InferenceBackend::load(
   }
   if (DiskCacheEnabled(disk_cache_config) &&
       (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
-       (model->HasDspark() &&
+       (use_dspark &&
         !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) ||
        disk_cache_config.capacity_bytes == 0 ||
        disk_cache_config.staging_capacity_bytes == 0)) {
@@ -2938,7 +2999,8 @@ bool InferenceBackend::load(
   try {
     auto new_state = std::make_shared<Impl::State>();
     auto runner = std::make_shared<DeepSeekTextRunner>(
-        std::move(model), max_context, speculative_config.max_draft_tokens,
+        std::move(model), max_context, use_dspark,
+        speculative_config.max_draft_tokens,
         disk_cache_config.model_artifact_fingerprint,
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
@@ -3002,7 +3064,7 @@ bool InferenceBackend::load(
   }
   if (DiskCacheEnabled(disk_cache_config) &&
       (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
-       (model->HasMtp() &&
+       (speculative_config.backend == TextSpeculativeBackend::kMtp &&
         !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) ||
        disk_cache_config.capacity_bytes == 0 ||
        disk_cache_config.staging_capacity_bytes == 0)) {

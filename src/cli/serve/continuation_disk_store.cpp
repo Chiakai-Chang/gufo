@@ -126,6 +126,14 @@ public:
       gate_.release();
   }
   explicit operator bool() const noexcept { return acquired_; }
+  void Unlock() {
+    gate_.release();
+    acquired_ = false;
+  }
+  void Lock() {
+    gate_.acquire();
+    acquired_ = true;
+  }
 
   ScopedOperationPermit(const ScopedOperationPermit&) = delete;
   ScopedOperationPermit& operator=(const ScopedOperationPermit&) = delete;
@@ -557,15 +565,11 @@ struct ContinuationDiskStore::Impl {
         job = std::move(pending.front());
         pending.pop_front();
       }
-      {
-        const ScopedOperationPermit permit(operation_gate);
-        try {
-          (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity);
-        } catch (...) {
-          Emit(ContinuationDiskEventAction::kSkipped,
-               ContinuationDiskEventReason::kIoFailure, 0, 0,
-               job.tokens.size());
-        }
+      try {
+        (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity);
+      } catch (...) {
+        Emit(ContinuationDiskEventAction::kSkipped,
+             ContinuationDiskEventReason::kIoFailure, 0, 0, job.tokens.size());
       }
       const auto released = job.retained_bytes;
       // Release GPU/host snapshot storage before making its budget available.
@@ -1010,6 +1014,10 @@ struct ContinuationDiskStore::Impl {
       std::span<const TextRunnerToken> checkpoint_tokens,
       const TextRunnerSnapshot& snapshot,
       std::span<const std::uint8_t> input_identity) {
+    // Serialize writers, but keep existing entries readable during payload
+    // serialization, hashing and filesystem durability operations.
+    const std::lock_guard write_lock(write_mutex);
+    ScopedOperationPermit metadata_lock(operation_gate);
     const auto descriptor = DescriptorForInput(runner, input_identity);
     if (!descriptor.persistence.has_value()) {
       Emit(ContinuationDiskEventAction::kSkipped,
@@ -1071,18 +1079,23 @@ struct ContinuationDiskStore::Impl {
       return {};
     }
 
-    if (!MakeCapacity(file_bytes)) {
-      Emit(ContinuationDiskEventAction::kSkipped,
-           ContinuationDiskEventReason::kByteCapacity, file_bytes,
-           payload_bytes, checkpoint_tokens.size());
-      return {};
-    }
-
     const std::string filename = NewFinalFilename(digest);
-    if (!PublishImage(filename, header, runner, snapshot, payload_bytes)) {
+    metadata_lock.Unlock();
+    const bool published =
+        PublishImage(filename, header, runner, snapshot, payload_bytes);
+    metadata_lock.Lock();
+    if (!published) {
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kIoFailure, file_bytes, payload_bytes,
            checkpoint_tokens.size());
+      return {};
+    }
+    // No visible entry is evicted until its replacement is fully durable.
+    if (!MakeCapacity(file_bytes)) {
+      RemoveFileOnly(filename);
+      Emit(ContinuationDiskEventAction::kSkipped,
+           ContinuationDiskEventReason::kByteCapacity, file_bytes,
+           payload_bytes, checkpoint_tokens.size());
       return {};
     }
 
@@ -1260,6 +1273,7 @@ struct ContinuationDiskStore::Impl {
   KeyHashFunction key_hash;
   int directory_fd{-1};
   mutable std::binary_semaphore operation_gate{1};
+  std::mutex write_mutex;
   std::list<Entry> entries;
   std::unordered_multimap<std::string, EntryIterator> index;
   std::map<PersistenceKey, PrefixNode> prefixes;
@@ -1271,6 +1285,8 @@ struct ContinuationDiskStore::Impl {
   std::condition_variable queue_changed;
   std::deque<PendingSave> pending;
   std::size_t queued_bytes{0};
+  std::shared_ptr<std::atomic<std::size_t>> capture_bytes =
+      std::make_shared<std::atomic<std::size_t>>(0);
   bool stopping{false};
   std::thread writer;
 };
@@ -1282,6 +1298,33 @@ ContinuationDiskStore::ContinuationDiskStore(
                                    std::move(key_hash))) {}
 
 ContinuationDiskStore::~ContinuationDiskStore() = default;
+
+ContinuationDiskStore::CaptureReservation::~CaptureReservation() {
+  counter_->fetch_sub(bytes_, std::memory_order_relaxed);
+}
+
+std::unique_ptr<ContinuationDiskStore::CaptureReservation>
+ContinuationDiskStore::ReserveCapture(
+    const TextModelRunner& runner, std::size_t token_count,
+    std::size_t snapshot_bytes, std::span<const std::uint8_t> input_identity) {
+  const auto descriptor = DescriptorForInput(runner, input_identity);
+  if (!descriptor.persistence || token_count == 0 || snapshot_bytes == 0)
+    return {};
+  const auto bytes =
+      CheckedFileBytes(descriptor.persistence->compatibility_identity.size(),
+                       token_count, snapshot_bytes);
+  const auto limit = std::min(impl_->options.capacity_bytes,
+                              impl_->options.staging_capacity_bytes);
+  std::lock_guard lock(impl_->queue_mutex);
+  const auto captures = impl_->capture_bytes->load(std::memory_order_relaxed);
+  if (impl_->stopping || bytes > limit || captures > limit - bytes ||
+      impl_->queued_bytes > limit - bytes - captures)
+    return {};
+  auto reservation = std::unique_ptr<CaptureReservation>(
+      new CaptureReservation(impl_->capture_bytes, bytes));
+  impl_->capture_bytes->fetch_add(bytes, std::memory_order_relaxed);
+  return reservation;
+}
 
 bool ContinuationDiskStore::CanSave(
     const TextModelRunner& runner, std::size_t token_count,
@@ -1297,15 +1340,17 @@ bool ContinuationDiskStore::CanSave(
   const auto limit = std::min(impl_->options.capacity_bytes,
                               impl_->options.staging_capacity_bytes);
   std::lock_guard lock(impl_->queue_mutex);
-  return !impl_->stopping && bytes <= limit &&
-         impl_->queued_bytes <= limit - bytes;
+  const auto captures = impl_->capture_bytes->load(std::memory_order_relaxed);
+  return !impl_->stopping && bytes <= limit && captures <= limit - bytes &&
+         impl_->queued_bytes <= limit - bytes - captures;
 }
 
 std::size_t ContinuationDiskStore::SaveAsync(
     std::shared_ptr<const TextModelRunner> runner,
     std::vector<TextRunnerToken> checkpoint_tokens,
     std::shared_ptr<const TextRunnerSnapshot> snapshot,
-    std::vector<std::uint8_t> input_identity) {
+    std::vector<std::uint8_t> input_identity,
+    std::unique_ptr<CaptureReservation> reservation) {
   if (!runner || !snapshot || checkpoint_tokens.empty())
     return 0;
   const auto descriptor = DescriptorForInput(*runner, input_identity);
@@ -1324,8 +1369,14 @@ std::size_t ContinuationDiskStore::SaveAsync(
                               impl_->options.staging_capacity_bytes);
   {
     std::lock_guard lock(impl_->queue_mutex);
-    if (impl_->stopping || charge > limit ||
-        impl_->queued_bytes > limit - charge)
+    if (reservation) {
+      if (reservation->counter_ != impl_->capture_bytes)
+        return 0;
+      reservation.reset();
+    }
+    const auto captures = impl_->capture_bytes->load(std::memory_order_relaxed);
+    if (impl_->stopping || charge > limit || captures > limit - charge ||
+        impl_->queued_bytes > limit - charge - captures)
       return 0;
     impl_->pending.push_back({std::move(runner), std::move(checkpoint_tokens),
                               std::move(snapshot), std::move(input_identity),
@@ -1346,7 +1397,6 @@ ContinuationDiskStore::SaveResult ContinuationDiskStore::Save(
     std::span<const TextRunnerToken> checkpoint_tokens,
     const TextRunnerSnapshot& snapshot,
     std::span<const std::uint8_t> input_identity) {
-  const ScopedOperationPermit permit(impl_->operation_gate);
   return impl_->Save(runner, checkpoint_tokens, snapshot, input_identity);
 }
 

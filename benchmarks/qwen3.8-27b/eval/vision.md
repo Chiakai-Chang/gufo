@@ -66,6 +66,14 @@ Controls also cover spatial shape recognition, a 2,304-token image crossing
 prefill chunks, and Flash-Next image decoding/cache replay at 10,495 tokens.
 Image throughput sweeps remain **TODO**.
 
+Known gap: the Q8_K_XL continued-image fixture produces different greedy text
+from a fresh full prefill. This reproduces on `bc4c4a5` before the cache cleanup.
+Replaying the same prompt/decode history matches the live cache exactly.
+AR and DFlash2 can also retain different final decode frontiers, leaving different
+prefill suffixes on continuation.
+The full vision check retains its cold-versus-live equality gate; `--disk-only`
+checks persistence and history replay without claiming that stronger parity.
+
 ```sh
 nix develop -c cmake --build --preset gpu-test \
   --target qwen27b_vision_test qwen_vision_serving_test

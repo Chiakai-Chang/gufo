@@ -9,6 +9,7 @@
 #include <utility>
 
 #include "src/core/hip/hip_utils.hpp"
+#include "src/core/hip/snapshot_transfer.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen/hip/ops/gemm.hpp"
@@ -531,28 +532,19 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
   ThrowOnHipError(hipMalloc(&snapshot->d_ssm_deltanet_, deltanet_bytes),
                   "failed to allocate Qwen DeltaNet snapshot");
 
+  SnapshotTransfer transfer;
   if (kv_f32_bytes != 0) {
-    if (policy_.UsesFp16AttentionKv()) {
-      ThrowOnHipError(
-          hipMemcpyAsync(snapshot->d_kv_f16_, d_attention_kv_f16, kv_f16_bytes,
-                         hipMemcpyDeviceToDevice, stream),
-          "failed to capture Qwen FP16 KV snapshot");
-    } else {
-      ThrowOnHipError(
-          hipMemcpyAsync(snapshot->d_kv_f32_, d_kv_cache, kv_f32_bytes,
-                         hipMemcpyDeviceToDevice, stream),
-          "failed to capture Qwen FP32 KV snapshot");
-    }
+    if (policy_.UsesFp16AttentionKv())
+      transfer.Copy(snapshot->d_kv_f16_, d_attention_kv_f16, kv_f16_bytes,
+                    hipMemcpyDeviceToDevice);
+    else
+      transfer.Copy(snapshot->d_kv_f32_, d_kv_cache, kv_f32_bytes,
+                    hipMemcpyDeviceToDevice);
   }
-  ThrowOnHipError(hipMemcpyAsync(snapshot->d_ssm_conv_, d_ssm_conv_state,
-                                 conv_bytes, hipMemcpyDeviceToDevice, stream),
-                  "failed to capture Qwen convolution snapshot");
-  ThrowOnHipError(
-      hipMemcpyAsync(snapshot->d_ssm_deltanet_, d_ssm_deltanet_state,
-                     deltanet_bytes, hipMemcpyDeviceToDevice, stream),
-      "failed to capture Qwen DeltaNet snapshot");
-  ThrowOnHipError(hipStreamSynchronize(stream),
-                  "failed to synchronize Qwen snapshot");
+  transfer.Copy(snapshot->d_ssm_conv_, d_ssm_conv_state, conv_bytes,
+                hipMemcpyDeviceToDevice);
+  transfer.Copy(snapshot->d_ssm_deltanet_, d_ssm_deltanet_state, deltanet_bytes,
+                hipMemcpyDeviceToDevice);
   return snapshot;
 }
 

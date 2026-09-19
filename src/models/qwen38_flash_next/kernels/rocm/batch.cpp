@@ -136,8 +136,9 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     const auto n = item.tokens.size();
-    if (item.session == nullptr || item.session->owner_ != this || n == 0 ||
-        n > kDecodeRows || (item.hidden_row < 0 && n != 1) ||
+    if (item.session == nullptr || item.session->owner_ != this ||
+        !item.session->mtp_enabled_ || n == 0 || n > kDecodeRows ||
+        (item.hidden_row < 0 && n != 1) ||
         (item.hidden_row >= 0 &&
          static_cast<std::uint32_t>(item.hidden_row) + n >
              options_.max_speculative) ||
@@ -323,7 +324,8 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     if (item.session == nullptr || item.session->owner_ != this ||
-        item.session->mtp_.position == 0 || item.output.trace != nullptr ||
+        !item.session->mtp_enabled_ || item.session->mtp_.position == 0 ||
+        item.output.trace != nullptr ||
         (item.output.token == nullptr && item.output.candidates == nullptr)) {
       return Fail(error, "invalid MTP head request");
     }
@@ -683,7 +685,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
       UseScratch(RowScratch(base, offsets[i]));
-      if (has_mtp() &&
+      if (items[i].session->mtp_enabled_ &&
           !Check(hipMemcpyAsync(
                      items[i].session->mtp_.target_hidden, s_.res,
                      static_cast<std::size_t>(n) * c.HcDim() * sizeof(float),

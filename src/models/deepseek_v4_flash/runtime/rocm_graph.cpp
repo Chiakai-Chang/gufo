@@ -7466,9 +7466,10 @@ static int payload_write_tensor_span(FILE *fp, const ds4_gpu_tensor *tensor,
     uint64_t done = 0;
     while (done < bytes) {
         const size_t n = bytes - done > (uint64_t)cap ? cap : (size_t)(bytes - done);
-        if (ds4_gpu_tensor_read(tensor, offset + done, buf, n) == 0) {
-            payload_set_err(err, errlen, "failed to read accelerator session tensor");
-            return 1;
+        if (ds4_gpu_tensor_snapshot_read(tensor, offset + done, buf, n) == 0) {
+          payload_set_err(err, errlen,
+                          "failed to read accelerator session tensor");
+          return 1;
         }
         if (payload_write_bytes(fp, buf, n, err, errlen) != 0) return 1;
         done += n;
@@ -7571,11 +7572,8 @@ static int rocm_graph_save_payload(const ds4_rocm_graph* graph,
     payload_set_err(err, errlen, "invalid graph snapshot save");
     return 1;
   }
-  if (ds4_gpu_synchronize() == 0) {
-    payload_set_err(err, errlen,
-                    "failed to synchronize accelerator before snapshot");
-    return 1;
-  }
+  // Successful session operations have already completed device writes.
+  // The capture worker holds this session frozen while other sessions run.
 
   const uint32_t raw_live =
       session_raw_live_rows(graph, (uint32_t)checkpoint->len);

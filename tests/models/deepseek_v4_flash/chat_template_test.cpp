@@ -342,6 +342,21 @@ void TestPinnedArtifactTemplateValidation() {
 }  // namespace
 
 int main() {
+  {
+    const std::vector<ChatMessage> messages{
+        {.role = "user", .content = "Emit."}};
+    const std::vector<gufo::models::deepseek_v4_flash::ChatTool> tools{
+        {.name = "emit",
+         .definition_json =
+             R"({"name":"emit","strict":true,"parameters":{"type":"object","additionalProperties":false},"vendor":2})"}};
+    const auto rendered =
+        gufo::models::deepseek_v4_flash::RenderChat(messages, tools);
+    Expect(
+        rendered.find(
+            R"({"name": "emit", "strict": true, "parameters": {"type": "object", "additionalProperties": false}, "vendor": 2})") !=
+            std::string::npos,
+        "complete function definition survives DeepSeek rendering");
+  }
   TestParallelToolOrder();
   TestChatAndThinkingPrefixes();
   TestHistoricalThinkingPolicy();

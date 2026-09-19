@@ -170,7 +170,8 @@ std::unique_ptr<GgufReader> GgufReader::OpenSingleFile(
   if (!reader->ParseHeaders(error_msg)) {
     return nullptr;
   }
-  reader->mapped_regions_.push_back({reader->data_, reader->size_});
+  reader->mapped_regions_.push_back(
+      {reader->data_, reader->size_, reader->fd_});
   return reader;
 }
 
@@ -260,7 +261,8 @@ std::unique_ptr<GgufReader> GgufReader::OpenSplitFileSet(
 
   for (const auto& shard : shards) {
     combined->size_ += shard->size_;
-    combined->mapped_regions_.push_back({shard->data_, shard->size_});
+    combined->mapped_regions_.push_back(
+        {shard->data_, shard->size_, shard->fd_});
     for (const auto& tensor : shard->tensors_) {
       if (combined->tensor_index_.contains(tensor.name)) {
         if (error_msg != nullptr) {
@@ -307,7 +309,8 @@ std::unique_ptr<GgufReader> GgufReader::OpenMemory(const void* data,
   if (!reader->ParseHeaders(error_msg)) {
     return nullptr;
   }
-  reader->mapped_regions_.push_back({reader->data_, reader->size_});
+  reader->mapped_regions_.push_back(
+      {reader->data_, reader->size_, reader->fd_});
   return reader;
 }
 
@@ -643,38 +646,6 @@ bool GgufReader::ParseHeaders(std::string* error_msg) {
   }
 
   return true;
-}
-
-std::vector<std::string_view> GgufReader::GetMetadataKeys() const {
-  std::vector<std::string_view> keys;
-  keys.reserve(metadata_.size());
-  for (const auto& [key, value] : metadata_) {
-    keys.push_back(key);
-  }
-  std::sort(keys.begin(), keys.end());
-  return keys;
-}
-
-void GgufReader::PrefetchMapped(const void* address,
-                                std::size_t length) const noexcept {
-  for (const auto& shard : shards_) {
-    shard->PrefetchMapped(address, length);
-  }
-  if (!owns_mmap_ || mmap_addr_ == nullptr || address == nullptr) {
-    return;
-  }
-  auto* base = static_cast<std::byte*>(mmap_addr_);
-  const auto* target = static_cast<const std::byte*>(address);
-  if (target < base || target >= base + size_) {
-    return;
-  }
-  const auto page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
-  const auto offset = static_cast<std::size_t>(target - base);
-  const std::size_t aligned_offset = offset - (offset % page);
-  const std::size_t aligned_length =
-      std::min(length + (offset - aligned_offset), size_ - aligned_offset);
-  (void)::madvise(base + aligned_offset, aligned_length, MADV_RANDOM);
-  (void)::madvise(base + aligned_offset, aligned_length, MADV_WILLNEED);
 }
 
 const GgufMetadataValue* GgufReader::FindMetadata(

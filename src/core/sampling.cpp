@@ -65,34 +65,29 @@ void SortCandidates(std::vector<Candidate>* candidates) {
   return weights;
 }
 
+double Penalize(double logit, const SamplingConfig& config,
+                const TokenPenalty& penalty) {
+  if (penalty.repeated && config.repeat_penalty != 1.0F) {
+    logit = logit <= 0 ? logit * config.repeat_penalty
+                       : logit / config.repeat_penalty;
+  }
+  logit -=
+      static_cast<double>(config.frequency_penalty) * penalty.generated_count;
+  if (penalty.generated_count != 0)
+    logit -= config.presence_penalty;
+  return logit;
+}
+
 void ApplyPenalties(std::vector<Candidate>* candidates,
                     const SamplingConfig& config,
-                    std::span<const TokenId> recent_tokens) {
-  if (!config.penalties_enabled() || config.repeat_last_n == 0 ||
-      recent_tokens.empty()) {
+                    std::span<const TokenPenalty> penalties) {
+  if (penalties.empty())
     return;
-  }
-  const std::size_t first = recent_tokens.size() > config.repeat_last_n
-                                ? recent_tokens.size() - config.repeat_last_n
-                                : 0;
-  std::unordered_map<TokenId, std::size_t> counts;
-  for (const TokenId token : recent_tokens.subspan(first)) {
-    ++counts[token];
-  }
-  for (Candidate& candidate : *candidates) {
-    const auto found = counts.find(candidate.token);
-    if (found == counts.end()) {
-      continue;
-    }
-    if (config.repeat_penalty != 1.0F) {
-      candidate.logit =
-          candidate.logit <= 0.0
-              ? candidate.logit * static_cast<double>(config.repeat_penalty)
-              : candidate.logit / static_cast<double>(config.repeat_penalty);
-    }
-    candidate.logit -= static_cast<double>(config.frequency_penalty) *
-                       static_cast<double>(found->second);
-    candidate.logit -= static_cast<double>(config.presence_penalty);
+  for (auto& candidate : *candidates) {
+    const auto found = std::ranges::lower_bound(penalties, candidate.token, {},
+                                                &TokenPenalty::token);
+    if (found != penalties.end() && found->token == candidate.token)
+      candidate.logit = Penalize(candidate.logit, config, *found);
   }
 }
 
@@ -308,9 +303,9 @@ TokenId SamplingDistribution::SampleResidual(
   return SamplingDistribution(std::move(residual)).Sample(rng_state);
 }
 
-SamplingDistribution BuildDistribution(std::span<const float> logits,
-                                       const SamplingConfig& config,
-                                       std::span<const TokenId> recent_tokens) {
+static SamplingDistribution DistributionWithPenalties(
+    std::span<const float> logits, const SamplingConfig& config,
+    std::span<const TokenPenalty> penalties) {
   config.Validate();
   if (logits.empty()) {
     throw std::invalid_argument("cannot sample an empty logit distribution");
@@ -334,7 +329,7 @@ SamplingDistribution BuildDistribution(std::span<const float> logits,
     throw std::runtime_error("logit distribution contains no finite values");
   }
 
-  ApplyPenalties(&candidates, config, recent_tokens);
+  ApplyPenalties(&candidates, config, penalties);
   ApplyTopK(&candidates, config);
   if (config.temperature == 0.0F) {
     return SamplingDistribution(
@@ -351,6 +346,38 @@ SamplingDistribution BuildDistribution(std::span<const float> logits,
         {.token = candidates[index].token, .value = probabilities[index]});
   }
   return SamplingDistribution(std::move(entries));
+}
+
+SamplingDistribution BuildDistribution(
+    std::span<const float> logits, const SamplingConfig& config,
+    std::span<const TokenId> prompt_tokens,
+    std::span<const TokenId> generated_tokens) {
+  std::unordered_map<TokenId, TokenPenalty> counts;
+  if (config.frequency_penalty != 0 || config.presence_penalty != 0) {
+    for (const auto token : generated_tokens) {
+      auto& p = counts[token];
+      p.token = token;
+      ++p.generated_count;
+    }
+  }
+  if (config.repeat_penalty != 1 && config.repeat_last_n != 0) {
+    const auto tail = generated_tokens.last(
+        std::min(generated_tokens.size(), config.repeat_last_n));
+    const auto prompt_tail = prompt_tokens.last(
+        std::min(prompt_tokens.size(), config.repeat_last_n - tail.size()));
+    for (auto sequence : {prompt_tail, tail}) {
+      for (const auto token : sequence) {
+        auto& p = counts[token];
+        p.token = token;
+        p.repeated = 1;
+      }
+    }
+  }
+  std::vector<TokenPenalty> penalties;
+  for (const auto& [token, penalty] : counts)
+    penalties.push_back(penalty);
+  std::ranges::sort(penalties, {}, &TokenPenalty::token);
+  return DistributionWithPenalties(logits, config, penalties);
 }
 
 SamplerState::SamplerState(SamplingConfig config,
@@ -411,26 +438,32 @@ void SamplerState::CopyDrawStateFrom(const SamplerState& other) noexcept {
 
 void SamplerState::ResetHistory(std::span<const TokenId> tokens) {
   pending_sample_.reset();
+  penalty_counts_.clear();
   history_.assign(tokens.begin(), tokens.end());
   TrimHistory();
   RebuildPenaltyCounts();
 }
 
 void SamplerState::Accept(TokenId token) {
-  if (config_.repeat_last_n == 0) {
-    return;
-  }
-  history_.push_back(token);
-  TrimHistory();
-  RebuildPenaltyCounts();
+  Accept(std::span<const TokenId>(&token, 1));
 }
 
 void SamplerState::Accept(std::span<const TokenId> tokens) {
-  if (config_.repeat_last_n == 0) {
-    return;
+  if (config_.frequency_penalty != 0 || config_.presence_penalty != 0) {
+    for (const auto token : tokens) {
+      auto found = std::ranges::lower_bound(penalty_counts_, token, {},
+                                            &TokenPenalty::token);
+      if (found == penalty_counts_.end() || found->token != token)
+        found = penalty_counts_.insert(found, TokenPenalty{.token = token});
+      if (found->generated_count == std::numeric_limits<std::uint32_t>::max())
+        throw std::overflow_error("generated token count overflow");
+      ++found->generated_count;
+    }
   }
-  history_.insert(history_.end(), tokens.begin(), tokens.end());
-  TrimHistory();
+  if (config_.repeat_last_n != 0) {
+    history_.insert(history_.end(), tokens.begin(), tokens.end());
+    TrimHistory();
+  }
   RebuildPenaltyCounts();
 }
 
@@ -449,7 +482,25 @@ SamplingDistribution SamplerState::Distribution(
           std::exp((candidate.value - maximum) / config_.temperature);
     return SamplingDistribution(std::move(candidates));
   }
-  return BuildDistribution(logits, config_, history_);
+  return DistributionWithPenalties(logits, config_, penalty_counts_);
+}
+
+SamplingDistribution SamplerState::Distribution(
+    std::span<const float> logits, std::span<const TokenId> token_ids) const {
+  if (logits.size() != token_ids.size())
+    throw std::invalid_argument("compact logits and token IDs differ in size");
+  std::vector<TokenPenalty> penalties;
+  penalties.reserve(token_ids.size());
+  for (std::size_t i = 0; i < token_ids.size(); ++i) {
+    const auto found = std::ranges::lower_bound(penalty_counts_, token_ids[i],
+                                                {}, &TokenPenalty::token);
+    if (found != penalty_counts_.end() && found->token == token_ids[i]) {
+      auto penalty = *found;
+      penalty.token = static_cast<TokenId>(i);
+      penalties.push_back(penalty);
+    }
+  }
+  return DistributionWithPenalties(logits, config_, penalties);
 }
 
 void SamplerState::DeferSample(TokenId token) {
@@ -511,47 +562,30 @@ void SamplerState::TrimHistory() {
 }
 
 void SamplerState::RebuildPenaltyCounts() {
-  penalty_counts_.clear();
-  if (!config_.penalties_enabled() || config_.repeat_last_n == 0) {
+  if (!config_.penalties_enabled())
     return;
-  }
-  penalty_counts_.reserve(history_.size());
-  for (const TokenId token : history_) {
-    const auto found = std::ranges::find_if(
-        penalty_counts_,
-        [token](const auto& entry) { return entry.first == token; });
-    if (found == penalty_counts_.end()) {
-      penalty_counts_.emplace_back(token, 1U);
-    } else {
-      ++found->second;
+  for (auto& penalty : penalty_counts_)
+    penalty.repeated = 0;
+  if (config_.repeat_penalty != 1) {
+    for (const auto token : history_) {
+      auto found = std::ranges::lower_bound(penalty_counts_, token, {},
+                                            &TokenPenalty::token);
+      if (found == penalty_counts_.end() || found->token != token)
+        found = penalty_counts_.insert(found, TokenPenalty{.token = token});
+      found->repeated = 1;
     }
   }
-  std::ranges::sort(penalty_counts_, [](const auto& left, const auto& right) {
-    return left.first < right.first;
+  std::erase_if(penalty_counts_, [](const auto& p) {
+    return p.generated_count == 0 && p.repeated == 0;
   });
 }
 
 double SamplerState::AdjustedLogit(TokenId token, float logit) const noexcept {
-  if (penalty_counts_.empty()) {
-    return static_cast<double>(logit);
-  }
-  const auto found = std::lower_bound(
-      penalty_counts_.begin(), penalty_counts_.end(), token,
-      [](const auto& entry, TokenId value) { return entry.first < value; });
-  if (found == penalty_counts_.end() || found->first != token) {
-    return static_cast<double>(logit);
-  }
-
-  double adjusted = static_cast<double>(logit);
-  if (config_.repeat_penalty != 1.0F) {
-    adjusted = adjusted <= 0.0
-                   ? adjusted * static_cast<double>(config_.repeat_penalty)
-                   : adjusted / static_cast<double>(config_.repeat_penalty);
-  }
-  adjusted -= static_cast<double>(config_.frequency_penalty) *
-              static_cast<double>(found->second);
-  adjusted -= static_cast<double>(config_.presence_penalty);
-  return adjusted;
+  const auto found = std::ranges::lower_bound(penalty_counts_, token, {},
+                                              &TokenPenalty::token);
+  return found == penalty_counts_.end() || found->token != token
+             ? static_cast<double>(logit)
+             : Penalize(logit, config_, *found);
 }
 
 TokenId SamplerState::SampleGreedy(std::span<const float> logits) const {

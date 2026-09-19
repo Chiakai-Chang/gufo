@@ -8,22 +8,15 @@
 
 namespace gufo::core {
 
-/// Scheme tag for GgufSampledIdentityHex. Bump when the sampled stream changes.
-inline constexpr std::string_view kGgufSampledIdentityScheme =
-    "gguf-sampled-v1";
+/// Scheme tag for full-content GGUF identities.
+inline constexpr std::string_view kGgufIdentityScheme = "gguf-sha256-v1";
 
-/// Content-derived identity of a GGUF artifact for cache compatibility.
-///
-/// Hashes the parsed header, every metadata entry in key order, the full tensor
-/// table, and three 4 KiB windows (start, middle, end) of each tensor's payload
-/// extent. Any change of layout, quantization, metadata, or whole-tensor data
-/// changes the digest; only a sub-tensor same-size edit with identical metadata
-/// escapes it. Cost is a few thousand random 4 KiB reads regardless of file
-/// size, so startup pays sub-second on any artifact.
-///
-/// Depends only on file bytes: path, mtime, inode, and copies are irrelevant.
-/// Returns 64 lowercase hex characters.
-[[nodiscard]] std::string GgufSampledIdentityHex(const GgufReader& reader);
+/// Hashes every byte of every shard, including metadata and tensor padding.
+/// File digests are cached privately by inode, size, mtime and ctime; memory
+/// images are always hashed. Copies have identical identities. The initial
+/// scan reads the full artifact; later launches reuse its cached full digest.
+/// Throws if the mapped artifact changes while its identity is computed.
+[[nodiscard]] std::string GgufIdentityHex(const GgufReader& reader);
 
 }  // namespace gufo::core
 

@@ -1219,7 +1219,42 @@ void TestFirstTokenPrecedesSnapshotAndPreservesBudget() {
   }
 }
 
+void TestSnapshotDoesNotBlockOtherRequests() {
+  for (const bool multi : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->multi_token_decode = multi;
+    control->preview_first_token = true;
+    control->supports_batched_advance = true;
+    control->batched_multi_token_decode = multi;
+    std::binary_semaphore entered(0), release(0);
+    std::atomic<unsigned> captures{0};
+    control->snapshot_callback = [&] {
+      if (captures.fetch_add(1) == 0) {
+        entered.release();
+        release.acquire();
+      }
+    };
+    auto scheduler = MakeScheduler(control, 2);
+    auto first = scheduler->Submit({1, 10}, 7, 0.0F);
+    const bool started = entered.try_acquire_for(kTestTimeout);
+    auto second = scheduler->Submit({2, 20}, 7, 0.0F);
+    auto result = std::async(std::launch::async, [&] { return second.Wait(); });
+    const bool independent =
+        result.wait_for(kTestTimeout) == std::future_status::ready;
+    release.release();
+    Expect(started && independent, "one capture must not block other requests");
+    Expect(result.get().tokens == ExpectedTokens(2, 7),
+           "other request stays independent");
+    Expect(first.Wait().tokens == ExpectedTokens(1, 7),
+           "captured request resumes exactly");
+    auto cached = scheduler->Submit({1, 10}, 7, 0.0F).Wait();
+    Expect(cached.cache_hit && cached.tokens == ExpectedTokens(1, 7),
+           "asynchronous capture retains the immutable prompt frontier");
+  }
+}
+
 int main() {
+  TestSnapshotDoesNotBlockOtherRequests();
   TestFirstTokenPrecedesSnapshotAndPreservesBudget();
   TestIdlePrefillUsesBulkWorkUnit();
   TestRunnerCanSkipUnusedFinalAdvance();

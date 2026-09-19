@@ -108,9 +108,10 @@ states and mRoPE. See the [source audit and independent oracle](eval/mtp.md).
 
 An immutable prompt snapshot supports branching; the final live session serves
 likely continuations without re-prefilling executed assistant tokens. First-token
-publication precedes optional capture. Disk capacity is checked before capture
-when RAM cannot retain it. A bounded worker streams/checksums writes; lookups use
-a compressed token-prefix index and skip a busy writer.
+publication precedes capture on a worker; other sessions keep decoding while
+that session is frozen. Disk-only capture reserves staging capacity before
+allocation. A bounded worker streams/checksums writes outside the lookup gate.
+GGUF compatibility uses cached full-content SHA-256.
 
 MTP trails prefill by one token; kept hidden state is 320 KiB/session. Rollback
 rows allocate progressively, up to about 788 MiB for seven drafts. Restoration
@@ -151,6 +152,8 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]select_op
   cancellation recovery and image attachments. `--sampling-only` covers 23
   AR/MTP configurations, penalties, residual correction and short budgets.
   `qwen38_flash_next_snapshot_test` checks persistence and continuation replay.
+  AR sessions sharing an MTP-capable model allocate no predictor state;
+  mixed-mode target logits match exactly and snapshots cannot cross modes.
 - **Prefill and serving:** `--prefill-only` checks full logits across boundaries
   through 4096 tokens, including 1/8/9/32/33-token tails. Image checks cover
   AR/MTP, concurrency, RAM reuse and disk restoration. Official template and

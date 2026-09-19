@@ -273,6 +273,8 @@ public:
   /// advertise the corresponding capabilities.
   [[nodiscard]] virtual std::size_t SnapshotPayloadBytes(
       const TextRunnerState& state) const;
+  /// May run on a capture worker while this state is frozen. Must not mutate
+  /// shared execution scratch; other sessions may execute concurrently.
   [[nodiscard]] virtual std::unique_ptr<TextRunnerSnapshot> Snapshot(
       const TextRunnerState& state) const;
   virtual void RestoreOrFork(TextRunnerState& state,
@@ -355,6 +357,9 @@ public:
     CommitMetrics Commit();
     [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken();
     void CapturePromptSnapshot();
+    /// Starts capture and polls completion without blocking other sessions.
+    [[nodiscard]] bool PreparePromptSnapshot();
+    [[nodiscard]] bool SnapshotPending() const;
     void Invalidate() noexcept;
 
   private:

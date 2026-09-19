@@ -69,26 +69,27 @@ __global__ void PrepareCandidateLogitsKernel(const float* logits, float* scores,
 
 __global__ void ApplySparsePenaltiesKernel(
     float* __restrict__ logits,
-    const std::uint32_t* __restrict__ penalty_tokens,
-    const std::uint32_t* __restrict__ penalty_counts, std::size_t penalty_count,
-    std::size_t vocab_size, float repeat_penalty, float frequency_penalty,
-    float presence_penalty) {
+    const sampling::TokenPenalty* __restrict__ penalties,
+    std::size_t penalty_count, std::size_t vocab_size, float repeat_penalty,
+    float frequency_penalty, float presence_penalty) {
   const std::size_t index =
       static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (index >= penalty_count) {
     return;
   }
-  const std::uint32_t token = penalty_tokens[index];
+  const auto penalty = penalties[index];
+  const std::uint32_t token = penalty.token;
   if (token >= vocab_size) {
     return;
   }
   float adjusted = logits[token];
-  if (repeat_penalty != 1.0F) {
+  if (penalty.repeated && repeat_penalty != 1.0F) {
     adjusted = adjusted <= 0.0F ? adjusted * repeat_penalty
                                 : adjusted / repeat_penalty;
   }
-  adjusted -= frequency_penalty * static_cast<float>(penalty_counts[index]);
-  adjusted -= presence_penalty;
+  adjusted -= frequency_penalty * static_cast<float>(penalty.generated_count);
+  if (penalty.generated_count != 0)
+    adjusted -= presence_penalty;
   logits[token] = adjusted;
 }
 
@@ -1050,10 +1051,8 @@ void AllocateGpuSamplingWorkspace(GpuSamplingWorkspace* workspace,
     HIP_CHECK(hipMalloc(&workspace->sorted_token_ids,
                         vocab_size * sizeof(std::uint32_t)));
     if (penalty_capacity > 0) {
-      HIP_CHECK(hipMalloc(&workspace->penalty_tokens,
-                          penalty_capacity * sizeof(std::uint32_t)));
-      HIP_CHECK(hipMalloc(&workspace->penalty_counts,
-                          penalty_capacity * sizeof(std::uint32_t)));
+      HIP_CHECK(hipMalloc(&workspace->penalties,
+                          penalty_capacity * sizeof(sampling::TokenPenalty)));
       HIP_CHECK(hipMalloc(&workspace->draft_candidate_ids,
                           penalty_capacity * sizeof(std::uint32_t)));
       HIP_CHECK(hipMalloc(&workspace->draft_candidate_probabilities,
@@ -1087,8 +1086,7 @@ void FreeGpuSamplingWorkspace(GpuSamplingWorkspace* workspace) noexcept {
   free_buffer(workspace->sorted_logits);
   free_buffer(workspace->token_ids);
   free_buffer(workspace->sorted_token_ids);
-  free_buffer(workspace->penalty_tokens);
-  free_buffer(workspace->penalty_counts);
+  free_buffer(workspace->penalties);
   free_buffer(workspace->draft_candidate_ids);
   free_buffer(workspace->draft_candidate_probabilities);
   free_buffer(workspace->speculative_accepted);
@@ -1118,8 +1116,7 @@ void LaunchGPUSortLogits(const float* logits, GpuSamplingWorkspace* workspace,
 void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
                        std::size_t vocab_size,
                        const GpuSamplingParameters& parameters,
-                       const std::uint32_t* penalty_tokens,
-                       const std::uint32_t* penalty_counts,
+                       const sampling::TokenPenalty* penalties,
                        std::size_t penalty_count,
                        GpuSamplingWorkspace* workspace, hipStream_t stream) {
   if (logits == nullptr || out_token == nullptr || workspace == nullptr ||
@@ -1142,19 +1139,15 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
     sampling_logits = workspace->adjusted_logits;
   }
   if (has_penalties) {
-    HIP_CHECK(hipMemcpyAsync(workspace->penalty_tokens, penalty_tokens,
-                             penalty_count * sizeof(std::uint32_t),
-                             hipMemcpyHostToDevice, stream));
-    HIP_CHECK(hipMemcpyAsync(workspace->penalty_counts, penalty_counts,
-                             penalty_count * sizeof(std::uint32_t),
+    HIP_CHECK(hipMemcpyAsync(workspace->penalties, penalties,
+                             penalty_count * sizeof(sampling::TokenPenalty),
                              hipMemcpyHostToDevice, stream));
     const std::size_t blocks =
         (penalty_count + kSamplingThreads - 1U) / kSamplingThreads;
     ApplySparsePenaltiesKernel<<<static_cast<unsigned int>(blocks),
                                  kSamplingThreads, 0, stream>>>(
-        workspace->adjusted_logits, workspace->penalty_tokens,
-        workspace->penalty_counts, penalty_count, vocab_size,
-        parameters.repeat_penalty, parameters.frequency_penalty,
+        workspace->adjusted_logits, workspace->penalties, penalty_count,
+        vocab_size, parameters.repeat_penalty, parameters.frequency_penalty,
         parameters.presence_penalty);
   }
 
@@ -1185,16 +1178,15 @@ void LaunchGPUSampling(const float* logits, std::uint32_t* out_token,
 }
 
 void LaunchGPUSpeculativeSampling(
-    const float* logits, std::uint32_t* out_token,
-    std::uint32_t* out_accepted, std::size_t vocab_size,
-    const GpuSamplingParameters& parameters, std::uint32_t draft_token,
-    float draft_token_probability,
+    const float* logits, std::uint32_t* out_token, std::uint32_t* out_accepted,
+    std::size_t vocab_size, const GpuSamplingParameters& parameters,
+    std::uint32_t draft_token, float draft_token_probability,
     const std::uint32_t* draft_candidate_ids,
     const float* draft_candidate_probabilities,
     std::size_t draft_candidate_count, float acceptance_uniform,
-    float residual_uniform, const std::uint32_t* penalty_tokens,
-    const std::uint32_t* penalty_counts, std::size_t penalty_count,
-    GpuSamplingWorkspace* workspace, hipStream_t stream) {
+    float residual_uniform, const sampling::TokenPenalty* penalties,
+    std::size_t penalty_count, GpuSamplingWorkspace* workspace,
+    hipStream_t stream) {
   if (logits == nullptr || out_token == nullptr || out_accepted == nullptr ||
       workspace == nullptr || vocab_size == 0 ||
       workspace->vocab_size != vocab_size || draft_candidate_count == 0 ||
@@ -1231,19 +1223,15 @@ void LaunchGPUSpeculativeSampling(
     sampling_logits = workspace->adjusted_logits;
   }
   if (has_penalties) {
-    HIP_CHECK(hipMemcpyAsync(workspace->penalty_tokens, penalty_tokens,
-                             penalty_count * sizeof(std::uint32_t),
-                             hipMemcpyHostToDevice, stream));
-    HIP_CHECK(hipMemcpyAsync(workspace->penalty_counts, penalty_counts,
-                             penalty_count * sizeof(std::uint32_t),
+    HIP_CHECK(hipMemcpyAsync(workspace->penalties, penalties,
+                             penalty_count * sizeof(sampling::TokenPenalty),
                              hipMemcpyHostToDevice, stream));
     const std::size_t blocks =
         (penalty_count + kSamplingThreads - 1U) / kSamplingThreads;
     ApplySparsePenaltiesKernel<<<static_cast<unsigned int>(blocks),
                                  kSamplingThreads, 0, stream>>>(
-        workspace->adjusted_logits, workspace->penalty_tokens,
-        workspace->penalty_counts, penalty_count, vocab_size,
-        parameters.repeat_penalty, parameters.frequency_penalty,
+        workspace->adjusted_logits, workspace->penalties, penalty_count,
+        vocab_size, parameters.repeat_penalty, parameters.frequency_penalty,
         parameters.presence_penalty);
   }
 

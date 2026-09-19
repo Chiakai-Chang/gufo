@@ -83,6 +83,8 @@ struct ChatTool {
   std::string name;
   std::string description;
   std::string parameters_json{"{}"};
+  /// Complete validated HTTP tool object, preserving field order/extensions.
+  std::string definition_json;
 };
 
 enum class QwenReasoningEffort : std::uint8_t {

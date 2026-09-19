@@ -100,7 +100,10 @@ int main(int argc, char** argv) {
         .temperature = 0.8F, .top_k = 40, .top_p = 0.9F, .seed = 7};
     constexpr std::size_t kTokens = 48;
 
-    auto origin = model->CreateSession(kContext, &error);
+    auto origin = model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        kContext, &error);
     Require(origin != nullptr, error);
     Require(origin->Sync(prompt, &error), error);
     const std::vector<float> prompt_logits(origin->Logits().begin(),
@@ -120,7 +123,10 @@ int main(int argc, char** argv) {
     Require(expected.stats.drafted > 0, "MTP did not draft");
 
     // Restore into a fresh session.
-    auto restored = model->CreateSession(kContext, &error);
+    auto restored = model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        kContext, &error);
     Require(restored != nullptr, error);
     start = std::chrono::steady_clock::now();
     Require(restored->RestoreSnapshot(*at_prompt, &error), error);
@@ -138,7 +144,10 @@ int main(int argc, char** argv) {
     // The persistent byte form restores the same way.
     std::vector<std::uint8_t> bytes(at_prompt->SizeBytes());
     Require(at_prompt->CopyTo(bytes), "snapshot copy");
-    auto persisted = model->CreateSession(kContext, &error);
+    auto persisted = model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        kContext, &error);
     Require(persisted != nullptr, error);
     Require(persisted->RestoreSnapshot(bytes, &error), error);
     RequireSame(expected, Decode(*persisted, kTokens, config, 8),
@@ -172,7 +181,10 @@ int main(int argc, char** argv) {
 
     // Capture a rejected proposal before its residual has been evaluated.
     // The context snapshot and the request-owned sampler must replay together.
-    auto pending = model->CreateSession(kContext, &error);
+    auto pending = model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        kContext, &error);
     const auto short_prompt = std::span(prompt).first(16);
     Require(pending && pending->Sync(short_prompt, &error), error);
     const std::vector<sampling::TokenId> short_history(short_prompt.begin(),
@@ -224,7 +236,10 @@ int main(int argc, char** argv) {
             "truncated payload accepted");
     Require(restored->Position() == extended.size(),
             "rejected payload disturbed the session");
-    auto small = model->CreateSession(2048, &error);
+    auto small = model->CreateSession(
+        model->HasMtp() ? gufo::core::SessionMode::kSpeculative
+                        : gufo::core::SessionMode::kAutoregressive,
+        2048, &error);
     Require(small != nullptr, error);
     Require(!small->RestoreSnapshot(*at_prompt, &error),
             "oversized snapshot accepted");

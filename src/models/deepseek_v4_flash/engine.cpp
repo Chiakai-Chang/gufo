@@ -70,7 +70,8 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
   return std::shared_ptr<Model>(new Model(engine, options));
 }
 
-std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
+std::unique_ptr<Session> Model::CreateSession(core::SessionMode mode,
+                                              std::uint32_t max_context,
                                               std::string* error_msg) {
   if (max_context < 2 || max_context > options_.max_context ||
       max_context >
@@ -81,8 +82,8 @@ std::unique_ptr<Session> Model::CreateSession(std::uint32_t max_context,
   }
 
   ds4_session* session = nullptr;
-  if (ds4_session_create(&session, engine_, static_cast<int>(max_context)) !=
-          0 ||
+  if (ds4_session_create(&session, engine_, static_cast<int>(max_context),
+                         mode == core::SessionMode::kSpeculative) != 0 ||
       session == nullptr) {
     AssignError(error_msg, "failed to create DeepSeek V4 Flash session");
     return nullptr;
@@ -310,8 +311,8 @@ bool Session::Evaluate(int token, std::string* error_msg) {
   return true;
 }
 
-bool Session::HasDspark() const {
-  return ds4_engine_has_dspark(model_->engine_);
+bool Session::DsparkEnabled() const {
+  return ds4_session_dspark_enabled(session_);
 }
 
 void Session::BeginRequest() {

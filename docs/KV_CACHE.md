@@ -220,12 +220,15 @@ it is not portable across:
 Backend portability may be allowed when GPU and NPU use the same defined KV
 layout and both implementations pass restore tests.
 
-The weight artifact is identified by a sampled content digest
-(`gguf-sampled-v1`): the GGUF header, every metadata entry, the full tensor
-table, and 4 KiB windows at the start, middle, and end of each tensor payload.
-It changes on any layout, quantization, metadata, or whole-tensor change, costs
-a few thousand small reads regardless of file size, and depends on nothing but
-the file bytes, so restarts, copies, and moves never re-read the model.
+The weight artifact is identified by full-content SHA-256 (`gguf-sha256-v1`),
+including every byte of every GGUF shard. The first lookup reads the full model.
+Later lookups reuse owner-private digests under the standard user cache
+folder, validated against the open file's device, inode, size, mtime and ctime.
+Copies still produce identical identities; edits invalidate the digest even
+when the file size and mtime are preserved. Unsafe or malformed cache files
+are ignored. Old sampled identities cannot restore snapshots into this scheme.
+This cache assumes the filesystem reports content changes in file metadata;
+unreported storage corruption requires a fresh full scan.
 
 ### File organization
 
@@ -242,6 +245,14 @@ session-id/
 Write chunks to temporary names, fsync according to configured durability, then
 atomically publish the final manifest. The manifest is the commit record.
 
+Prompt capture runs on a worker while its source session is frozen. Other
+sessions remain runnable; completed captures are attached before that session
+advances. DeepSeek and Qwen use separate HIP transfer streams. RAM snapshots
+reserve host or device capacity according to their actual storage, and
+snapshots retained only for disk reserve staging capacity before allocation.
+Disk serialization and durability operations run outside the lookup gate, so
+existing entries remain readable while a new snapshot is written.
+
 ### Shared prefixes
 
 Entries hold complete prompts, and a restore needs an entry that is an exact
@@ -251,7 +262,7 @@ therefore never an entry on its own: `sys + turn1_A` is not a prefix of
 prompt is admitted, the longest common prefix with every stored entry is
 computed; each distinct length that is at least `shared_prefix_min_tokens`
 (128) and not stored exactly becomes a boundary. Prefill stops on each
-boundary, snapshots the continuation, and writes it before continuing, so the
+boundary, snapshots the continuation, and queues persistence, so the
 next conversation with the same prefix restores it and prefills only its own
 turn. Writing happens once per distinct prefix: saving tokens that already
 have an entry only refreshes their recency.

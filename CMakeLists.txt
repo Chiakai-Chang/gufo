@@ -13,6 +13,7 @@ find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
 find_package(PNG REQUIRED)
 find_package(JPEG REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 set(GUFO_FFMPEG_EXECUTABLE "ffmpeg" CACHE STRING
   "FFmpeg executable used for generated media")
 set(GUFO_FFPROBE_EXECUTABLE "ffprobe" CACHE STRING
@@ -216,7 +217,7 @@ target_compile_definitions(gufo_core PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}"
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
 target_link_libraries(gufo_core PUBLIC ICU::uc Threads::Threads
-  PNG::PNG JPEG::JPEG CURL::libcurl)
+  PNG::PNG JPEG::JPEG CURL::libcurl OpenSSL::Crypto)
 
 add_subdirectory(src/models/qwen)
 

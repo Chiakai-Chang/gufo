@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "src/core/sampling.hpp"
+#include "src/core/session_mode.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "src/models/qwen/vision/encoder.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
@@ -62,7 +63,8 @@ public:
       std::string* error_msg = nullptr);
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
-      std::uint32_t max_context, std::string* error_msg = nullptr);
+      core::SessionMode mode, std::uint32_t max_context,
+      std::string* error_msg = nullptr);
 
   [[nodiscard]] std::vector<std::int32_t> Tokenize(std::string_view text) const;
   [[nodiscard]] std::string Decode(std::span<const std::int32_t> tokens) const;
@@ -85,7 +87,8 @@ public:
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
   /// Worst-case private device state, including the configured rollback cap.
-  [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
+  [[nodiscard]] std::size_t SessionBytes(core::SessionMode mode,
+                                         std::uint32_t context) const noexcept;
   [[nodiscard]] std::size_t DeferredScratchBytes() const;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
@@ -184,7 +187,7 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 12;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 13;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent
@@ -234,6 +237,7 @@ private:
   SpeculativeStats stats_;
   std::vector<std::uint8_t> image_identity_;
   bool valid_{true};
+  [[nodiscard]] bool MtpEnabled() const noexcept;
 };
 
 /// Immutable host copy of a session context. The same bytes restore in

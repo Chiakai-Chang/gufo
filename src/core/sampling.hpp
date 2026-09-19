@@ -35,6 +35,13 @@ struct SamplingConfig {
   [[nodiscard]] bool can_use_unmodified_argmax() const noexcept;
 };
 
+/// Unique token counts: repetition window and full generated response.
+struct TokenPenalty {
+  TokenId token{0};
+  std::uint32_t generated_count{0};
+  std::uint32_t repeated{0};
+};
+
 struct Probability {
   TokenId token{0};
   double value{0.0};
@@ -59,12 +66,13 @@ private:
   std::vector<Probability> entries_;
 };
 
-/// Builds the exact distribution used for both normal and speculative decode.
+/// Builds the exact distribution from prompt and request-generated tokens.
 [[nodiscard]] SamplingDistribution BuildDistribution(
     std::span<const float> logits, const SamplingConfig& config,
-    std::span<const TokenId> recent_tokens = {});
+    std::span<const TokenId> prompt_tokens = {},
+    std::span<const TokenId> generated_tokens = {});
 
-/// Request-owned sampling state: controls, bounded token history, and RNG.
+/// Request-owned controls, repetition window, full generated counts and RNG.
 ///
 /// Call Accept only for committed tokens. The type is copyable so speculative
 /// decode can work on a tentative state and discard it on rollback.
@@ -80,18 +88,26 @@ public:
 
   [[nodiscard]] const SamplingConfig& config() const noexcept;
   [[nodiscard]] std::span<const TokenId> history() const noexcept;
+  [[nodiscard]] std::span<const TokenPenalty> penalties() const noexcept {
+    return penalty_counts_;
+  }
   [[nodiscard]] std::uint64_t rng_state() const noexcept;
   [[nodiscard]] std::uint64_t* mutable_rng_state() noexcept;
   void SetRngState(std::uint64_t state) noexcept;
   /// Publish RNG and any deferred draw without accepting tentative history.
   void CopyDrawStateFrom(const SamplerState& other) noexcept;
 
+  /// Starts a request: tokens initialize repetition only; generated counts
+  /// reset.
   void ResetHistory(std::span<const TokenId> tokens);
   void Accept(TokenId token);
   void Accept(std::span<const TokenId> tokens);
 
   [[nodiscard]] SamplingDistribution Distribution(
       std::span<const float> logits) const;
+  /// Compact logits use token_ids for penalties; returned IDs index logits.
+  [[nodiscard]] SamplingDistribution Distribution(
+      std::span<const float> logits, std::span<const TokenId> token_ids) const;
   /// Retain a speculative residual draw for the next Sample call. Copies
   /// preserve this draw along with the RNG; resetting history discards it.
   void DeferSample(TokenId token);
@@ -113,7 +129,7 @@ private:
 
   SamplingConfig config_;
   std::vector<TokenId> history_;
-  std::vector<std::pair<TokenId, std::uint32_t>> penalty_counts_;
+  std::vector<TokenPenalty> penalty_counts_;
   std::vector<Probability> candidate_scratch_;
   std::uint64_t rng_state_{0};
   std::optional<TokenId> pending_sample_;
