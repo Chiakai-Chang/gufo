@@ -2,6 +2,7 @@
 #define GUFO_SERVER_LOGGING_HPP_
 
 #include <cstdint>
+#include <string>
 #include <string_view>
 
 namespace gufo::server {
@@ -19,12 +20,14 @@ public:
   static void Log(LogLevel level, std::string_view component,
                   std::string_view message);
 
-  /// Logs an HTTP access request:
-  /// YYYY-MM-DD HH:MM:SS [INFO] [http] METHOD /path STATUS REASON in DURATIONms
-  /// | DETAILS
-  static void LogRequest(std::string_view method, std::string_view path,
-                         int status_code, std::string_view reason,
-                         double duration_ms, std::string_view details = "");
+  /// Logs completion after the response body, including streamed generation.
+  static void LogRequest(std::string_view id, std::string_view method,
+                         std::string_view path, int status_code,
+                         double duration_ms, std::string_view details = "",
+                         std::string_view outcome = "completed");
+
+  /// Process RSS and host available memory; these are not additive GPU totals.
+  static std::string MemoryStatus();
 
   /// Convenience helpers
   static void Info(std::string_view component, std::string_view message) {

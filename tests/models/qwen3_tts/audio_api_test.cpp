@@ -124,6 +124,11 @@ void TestSpeech() {
       service, "POST", "/v1/audio/speech",
       R"({"model":"qwen3-tts","input":"The boy who lived.","voice":"vivian","language":"english","instruct":"calm","seed":7,"max_new_tokens":12,"greedy":true,"response_format":"wav","speed":1.0})");
   Check(response.status == 200, "valid request succeeds");
+  Check(
+      response.log_details.find("codec_steps=2") != std::string::npos &&
+          response.log_details.find("synthesis_ms=") != std::string::npos &&
+          response.log_details.find("The boy who lived.") == std::string::npos,
+      "speech diagnostics report work without input text");
   Check(response.body.size() == 54 && response.body.substr(0, 4) == "RIFF" &&
             response.body.substr(8, 8) == "WAVEfmt ",
         "response is a mono PCM16 WAV");

@@ -45,9 +45,8 @@ if(ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/continuation_disk_store.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_model_runner.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/text_generation_scheduler.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp
-    ${PROJECT_SOURCE_DIR}/src/cli/serve/logging.cpp)
-  target_link_libraries(ds4_serving_test PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp)
+  target_link_libraries(ds4_serving_test PRIVATE gufo_logging
     gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next hip::host)
   add_test(NAME ds4.serving COMMAND ds4_serving_test)
   set_tests_properties(ds4.serving PROPERTIES

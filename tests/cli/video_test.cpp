@@ -119,13 +119,44 @@ void TestSelectedFramesAndFailures() {
       "--model", "/models/h3", "--first-frame", "input.png", "A fox"};
   Expect(!gufo::cli::ParseVideoOptions(unsupported, &error).has_value(),
          "first-frame input rejected");
-  Expect(error.find("not implemented") != std::string::npos,
-         "future input error is explicit");
+  Expect(error.find("Unknown option") != std::string::npos,
+         "unsupported input is an unknown option");
 
   const std::array<const char*, 4> no_audio = {"--model", "/models/h3",
                                                "--no-audio", "A fox"};
   Expect(!gufo::cli::ParseVideoOptions(no_audio, &error).has_value(),
          "audio cannot be disabled while muxing");
+}
+
+void TestSharedOptionParsing() {
+  std::string error;
+  const auto options = gufo::cli::ParseVideoOptions(
+      std::array{"--model", "--preset", "--steps=7", "--preset=dev",
+                 "--frames-dir=frames", "--profile", "A fox"},
+      &error);
+  Expect(options.has_value(), "inline options and flag-like values parse");
+  Expect(options->request.model_root == "--preset",
+         "option values are not scanned as flags");
+  Expect(options->request.parameters.evaluations == 7,
+         "explicit overrides win regardless of preset argument order");
+  Expect(options->profile, "documented profile option is wired");
+
+  const auto help_value = gufo::cli::ParseVideoOptions(
+      std::array{"--model", "--help", "--preset=dev", "--frames-dir=frames",
+                 "A fox"},
+      &error);
+  Expect(help_value && help_value->request.model_root == "--help",
+         "help used as an option value does not trigger help");
+  Expect(
+      !gufo::cli::ParseVideoOptions(std::array{"--selected-frames="}, &error) &&
+          !error.empty(),
+      "explicit empty frame selection is rejected");
+  Expect(!gufo::cli::ParseVideoOptions(std::array{"--steps=7junk"}, &error) &&
+             !error.empty(),
+         "partial integers are rejected");
+  Expect(!gufo::cli::ParseVideoOptions(std::array{"--help"}, &error) &&
+             error.empty(),
+         "actual help request succeeds without requiring a model");
 }
 
 }  // namespace
@@ -134,6 +165,7 @@ int main() {
   TestPresets();
   TestDevelopmentAndOverrides();
   TestSelectedFramesAndFailures();
+  TestSharedOptionParsing();
   std::cout << "All MiniMax H3 video CLI tests passed.\n";
   return 0;
 }

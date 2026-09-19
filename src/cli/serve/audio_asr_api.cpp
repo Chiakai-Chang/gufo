@@ -343,9 +343,16 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
                                 std::string(kAudioAsrApiSchema));
   response.headers.emplace_back("X-Gufo-ASR-Backend", service.backend_name());
   response.headers.emplace_back("Server-Timing", ServerTiming(result.timings));
-  response.log_details = std::to_string(result.audio_tokens) + " audio tok | " +
-                         std::to_string(result.generated_ids.size()) +
-                         " generated tok";
+  response.log_details =
+      "model=" + service.model_id() +
+      " audio_tokens=" + std::to_string(result.audio_tokens) +
+      " generated_tokens=" + std::to_string(result.generated_ids.size()) +
+      " audio_ms=" +
+      std::to_string(1000ULL * result.audio_samples /
+                     std::max(1U, result.sample_rate)) +
+      " feature_ms=" + std::to_string(result.timings.feature_extraction_ms) +
+      " encoder_ms=" + std::to_string(result.timings.audio_encoder_ms) +
+      " decoder_ms=" + std::to_string(result.timings.text_decoder_ms);
   return response;
 }
 

@@ -324,86 +324,6 @@ std::size_t PersistentSizeFromU64(std::uint64_t value) {
   return static_cast<std::size_t>(value);
 }
 
-std::uint64_t ClientLabel(std::string_view client_id) noexcept {
-  constexpr std::uint64_t kFnvOffset = 14695981039346656037ULL;
-  constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
-  std::uint64_t hash = kFnvOffset;
-  for (const unsigned char character : client_id) {
-    hash ^= character;
-    hash *= kFnvPrime;
-  }
-  return hash;
-}
-
-void EmitRequestMetrics(const InferenceBackend::Result& result,
-                        std::string_view status) {
-  static const bool enabled = (std::getenv("GUFO_DEBUG_METRICS") != nullptr);
-  if (!enabled) {
-    return;
-  }
-  static std::mutex output_mutex;
-  std::ostringstream line;
-  line << std::fixed << std::setprecision(3)
-       << "{\"event\":\"http_inference\",\"status\":\"" << status
-       << "\",\"client_label\":\"" << std::hex << ClientLabel(result.client_id)
-       << std::dec << "\",\"prompt_tokens\":" << result.prompt_tokens
-       << ",\"cache_hit\":" << (result.cache_hit ? "true" : "false")
-       << ",\"cached_prompt_tokens\":" << result.cached_prompt_tokens
-       << ",\"uncached_prompt_tokens\":"
-       << (result.prompt_tokens - result.cached_prompt_tokens)
-       << ",\"cache_restore_bytes\":" << result.cache_restore_bytes
-       << ",\"cache_snapshot_bytes\":" << result.cache_snapshot_bytes
-       << ",\"cache_disk_write_bytes\":" << result.cache_disk_write_bytes
-       << ",\"cache_shared_bytes\":" << result.cache_shared_bytes
-       << ",\"cache_restore_ms\":" << result.cache_restore_ms
-       << ",\"cache_snapshot_ms\":" << result.cache_snapshot_ms
-       << ",\"cache_disk_write_ms\":" << result.cache_disk_write_ms
-       << ",\"cache_shared_prefix_snapshots\":"
-       << result.cache_shared_prefix_snapshots
-       << ",\"cache_shared_prefix_bytes\":" << result.cache_shared_prefix_bytes
-       << ",\"cache_shared_prefix_ms\":" << result.cache_shared_prefix_ms
-       << ",\"cache_disk_hit\":" << (result.cache_disk_hit ? "true" : "false")
-       << ",\"prefill_tokens\":" << result.prefill_tokens
-       << ",\"prefill_chunks\":" << result.prefill_chunks
-       << ",\"active_decode_prefill_chunks\":"
-       << result.active_decode_prefill_chunks
-       << ",\"max_prefill_chunk_tokens\":" << result.max_prefill_chunk_tokens
-       << ",\"max_consecutive_active_prefill_chunks\":"
-       << result.max_consecutive_active_prefill_chunks
-       << ",\"configured_active_prefill_tokens\":"
-       << result.configured_active_prefill_tokens
-       << ",\"queue_depth_at_submit\":" << result.queue_depth_at_submit
-       << ",\"client_queue_depth_at_submit\":"
-       << result.client_queue_depth_at_submit
-       << ",\"resident_requests_at_admission\":"
-       << result.resident_requests_at_admission
-       << ",\"queue_ms\":" << result.queue_ms
-       << ",\"requested_logical_concurrency\":"
-       << result.requested_logical_concurrency
-       << ",\"physical_execution_width\":" << result.physical_execution_width
-       << ",\"execution_plan\":\"" << result.execution_plan << '"'
-       << ",\"max_buffered_output_bytes\":" << result.max_buffered_output_bytes
-       << ",\"incremental_prefill_supported\":"
-       << (result.incremental_prefill_supported ? "true" : "false")
-       << ",\"prefill_fallback_reason\":";
-  if (result.prefill_fallback_reason.empty()) {
-    line << "null";
-  } else {
-    line << '"' << result.prefill_fallback_reason << '"';
-  }
-  line << ",\"prefill_ms\":" << result.prefill_ms
-       << ",\"completion_tokens\":" << result.completion_tokens
-       << ",\"draft_tokens\":" << result.draft_tokens
-       << ",\"draft_tokens_accepted\":" << result.draft_accepted_tokens
-       << ",\"ttft_ms\":" << result.ttft_ms
-       << ",\"mean_inter_token_ms\":" << result.mean_inter_token_ms
-       << ",\"max_inter_token_ms\":" << result.max_inter_token_ms
-       << ",\"decode_ms\":" << result.decode_ms
-       << ",\"cancelled\":" << (result.cancelled ? "true" : "false") << "}";
-  const std::lock_guard<std::mutex> lock(output_mutex);
-  std::clog << line.str() << '\n';
-}
-
 bool IsQwenStopToken(const tokenization::QwenTokenizer& tokenizer,
                      TextRunnerToken token) noexcept {
   return token == tokenizer.GetEosTokenId() ||
@@ -2564,23 +2484,12 @@ struct InferenceBackend::Impl {
   public:
     ScheduledGenerationRequest(
         std::shared_ptr<const State> model_state,
-        TextGenerationScheduler::Request scheduled_request, Result error_result)
+        TextGenerationScheduler::Request scheduled_request)
         : state_(std::move(model_state)),
-          request_(std::move(scheduled_request)),
-          error_result_(std::move(error_result)) {}
+          request_(std::move(scheduled_request)) {}
 
     Result Wait(const TokenCallback& on_token) override {
-      try {
-        Result result = request_.Wait(on_token);
-        EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
-        return result;
-      } catch (const TextGenerationError& exception) {
-        EmitRequestMetrics(error_result_, exception.stable_code());
-        throw;
-      } catch (...) {
-        EmitRequestMetrics(error_result_, "error");
-        throw;
-      }
+      return request_.Wait(on_token);
     }
 
     void Cancel() noexcept override { request_.Cancel(); }
@@ -2588,7 +2497,6 @@ struct InferenceBackend::Impl {
   private:
     std::shared_ptr<const State> state_;
     TextGenerationScheduler::Request request_;
-    Result error_result_;
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
@@ -2612,27 +2520,20 @@ struct InferenceBackend::Impl {
     }
     if (is_cancelled && is_cancelled()) {
       result.cancelled = true;
-      EmitRequestMetrics(result, "cancelled");
       return result;
     }
 
-    try {
-      auto request = current->scheduler->Submit(
-          std::move(prompt_tokens), max_tokens, sampling, is_cancelled,
-          static_cast<bool>(on_token),
-          TextRequestMetadata{
-              .client_id = std::move(client_id),
-              .deadline = std::nullopt,
-              .request_start = request_start,
-              .prompt_context = std::move(context),
-          });
-      result = request.Wait(on_token);
-    } catch (...) {
-      EmitRequestMetrics(result, "error");
-      throw;
-    }
+    auto request = current->scheduler->Submit(
+        std::move(prompt_tokens), max_tokens, sampling, is_cancelled,
+        static_cast<bool>(on_token),
+        TextRequestMetadata{
+            .client_id = std::move(client_id),
+            .deadline = std::nullopt,
+            .request_start = request_start,
+            .prompt_context = std::move(context),
+        });
+    result = request.Wait(on_token);
 
-    EmitRequestMetrics(result, result.cancelled ? "cancelled" : "ok");
     return result;
   }
 
@@ -3270,21 +3171,19 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
         request, max_tokens, sampling_config, is_cancelled, stream_output);
   }
 
-  Result error_result;
-  error_result.prompt_tokens = prompt->tokens.size();
-  error_result.client_id =
+  const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
   auto scheduled_request =
       state->scheduler->Submit(std::move(prompt->tokens), max_tokens,
                                sampling_config, is_cancelled, stream_output,
                                TextRequestMetadata{
-                                   .client_id = error_result.client_id,
+                                   .client_id = client_id,
                                    .deadline = std::nullopt,
                                    .request_start = request_start,
                                    .prompt_context = std::move(prompt->context),
                                });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
-      state, std::move(scheduled_request), std::move(error_result));
+      state, std::move(scheduled_request));
 #else
   return TextGenerationBackend::start_chat(request, max_tokens, sampling_config,
                                            is_cancelled, stream_output);

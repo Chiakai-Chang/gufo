@@ -223,6 +223,9 @@ void TestLifecycleAndRange(const std::filesystem::path& root) {
         "create returns a private, queued video object");
   const std::string id = CreatedId(created);
   Check(!id.empty(), "create response includes an ID");
+  Check(created.log_details.find("job=" + id) != std::string::npos &&
+            created.log_details.find("private fox prompt") == std::string::npos,
+        "request diagnostics link the worker job without logging the prompt");
   runner.WaitForCalls(1);
   WaitCompleted(service, id);
 

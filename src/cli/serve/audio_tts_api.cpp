@@ -1,6 +1,7 @@
 #include "src/cli/serve/audio_tts_api.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -336,6 +337,7 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
   };
   models::qwen3_tts::SynthesisResult result;
   std::string error;
+  const auto started = std::chrono::steady_clock::now();
   if (!service.Synthesize(synthesis, request.is_cancelled, &result, &error)) {
     if (request.is_cancelled && request.is_cancelled()) {
       return Error(499, "Client Closed Request", "audio generation cancelled",
@@ -363,6 +365,17 @@ HttpResponse Speech(const HttpRequest& request, TtsService& service) {
                               std::max<std::uint32_t>(1, result.code_groups))},
           },
       .streaming_body = {},
+      .log_details =
+          "model=" + service.model_id() + " codec_steps=" +
+          std::to_string(result.codes.size() /
+                         std::max<std::uint32_t>(1, result.code_groups)) +
+          " audio_ms=" +
+          std::to_string(1000ULL * result.samples.size() /
+                         std::max(1U, result.sample_rate)) +
+          " synthesis_ms=" +
+          std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - started)
+                             .count()),
   };
 }
 

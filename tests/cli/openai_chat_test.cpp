@@ -239,6 +239,40 @@ void TestStreamingIsLive() {
       "Usage reports the executed serving plan");
   Expect(output.ends_with("data: [DONE]\n\n"),
          "Stream terminates with the OpenAI DONE sentinel");
+  Expect(response.stream_log &&
+             response.stream_log->details.find("cached_tokens=5") !=
+                 std::string::npos &&
+             response.stream_log->details.find("finish=length") !=
+                 std::string::npos,
+         "Streaming completion retains request diagnostics");
+}
+
+void TestStreamingWithoutUsage() {
+  for (const auto* options :
+       {"", R"(,"stream_options":{"include_usage":false})"}) {
+    FakeBackend backend;
+    backend.pieces = {"ok"};
+    auto response = gufo::server::HandleOpenAiChat(
+        Request(
+            std::string(
+                R"({"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":true)") +
+            options + "}"),
+        backend);
+    Expect(response.status == 200 && response.streaming_body,
+           "Stream without usage is accepted");
+    std::string output;
+    response.streaming_body([&](std::string_view chunk) {
+      output += chunk;
+      return true;
+    });
+    Expect(output.find(R"("usage":)") == std::string::npos &&
+               output.ends_with("data: [DONE]\n\n"),
+           "Usage chunk is opt-in");
+    Expect(response.stream_log &&
+               response.stream_log->details.find("generated_tokens=1") !=
+                   std::string::npos,
+           "Request diagnostics do not depend on client usage preference");
+  }
 }
 
 void TestCachedPrefillMetrics() {
@@ -692,6 +726,7 @@ void TestImagePartsRetainOrderAndIdentity() {
 
 int main() {
   TestStreamingIsLive();
+  TestStreamingWithoutUsage();
   TestCachedPrefillMetrics();
   TestBackendSamplingDefaults();
   TestAllSamplingControlsReachBackend();

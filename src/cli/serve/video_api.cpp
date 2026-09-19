@@ -84,6 +84,9 @@ HttpResponse SnapshotResponse(int status, std::string reason,
       .body = SnapshotValue(snapshot).dump(),
       .headers = {},
       .streaming_body = {},
+      .log_details = "job=" + snapshot.id +
+                     " state=" + std::string(ToString(snapshot.status)) +
+                     " model=" + snapshot.model + " size=" + snapshot.size,
   };
 }
 

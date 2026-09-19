@@ -8,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -890,12 +891,23 @@ int main() {
   TestResourceClaimsAreValidatedBeforeAllocation();
   TestSnapshotForkAndUnsupportedCapabilities();
   TestSnapshotCacheBranchesOnePrefixIntoIndependentStates();
+  std::ostringstream normal_log;
+  auto* previous = std::clog.rdbuf(normal_log.rdbuf());
   TestSnapshotRetentionUsesPromptBoundary();
+  std::clog.rdbuf(previous);
+  Expect(normal_log.str().empty(), "routine cache replacement stays quiet");
   TestPersistentSnapshotRestoresAcrossPools();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
   TestMeasuredStateIsReconciledWithClaim();
   TestSnapshotBudgetRefusalDoesNotFailCompletedRequest();
+  std::ostringstream failure_log;
+  previous = std::clog.rdbuf(failure_log.rdbuf());
   TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful();
+  std::clog.rdbuf(previous);
+  Expect(
+      failure_log.str().find("[WARN] [cache]") != std::string::npos &&
+          failure_log.str().find("reason=capture_failure") != std::string::npos,
+      "cache fallback retains an actionable warning");
   std::cout << "All text model runner tests passed\n";
   return 0;
 }

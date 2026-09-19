@@ -25,6 +25,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/cli/serve/logging.hpp"
 #include "src/core/json.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
@@ -283,6 +284,8 @@ struct VideoJobService::Impl {
     std::string media_type;
     minimax_h3::CancellationToken cancellation;
     bool deleted{false};
+    std::string logged_phase;
+    int logged_bucket{-1};
   };
 
   explicit Impl(VideoJobServiceOptions supplied)
@@ -510,6 +513,17 @@ struct VideoJobService::Impl {
     job->snapshot.progress =
         std::max(job->snapshot.progress,
                  std::clamp(ProgressPercent(phase, completed, total), 1, 99));
+    const int bucket =
+        total > 0 ? static_cast<int>(10LL * completed / total) : 0;
+    if (job->logged_phase != phase || bucket > job->logged_bucket) {
+      job->logged_phase = phase;
+      job->logged_bucket = bucket;
+      Logger::Info("video", "job=" + job->snapshot.id +
+                                " event=progress phase=" + std::string(phase) +
+                                " completed=" + std::to_string(completed) +
+                                " total=" + std::to_string(total) + " " +
+                                Logger::MemoryStatus());
+    }
   }
 
   struct ProgressContext {
@@ -563,6 +577,15 @@ struct VideoJobService::Impl {
         continue;
       }
 
+      const auto start_time = std::chrono::steady_clock::now();
+      Logger::Info(
+          "video",
+          "job=" + job->snapshot.id + " event=started preset=" +
+              job->request.parameters.preset + " size=" + job->request.size +
+              " frames=" + std::to_string(job->request.parameters.frames) +
+              " steps=" + std::to_string(job->request.parameters.evaluations) +
+              " seed=" + std::to_string(job->request.seed) + " " +
+              Logger::MemoryStatus());
       minimax_h3::GenerationRequest generation{
           .model_root = options.model_root,
           .source_manifest = options.source_manifest,
@@ -571,11 +594,16 @@ struct VideoJobService::Impl {
                                   ? job->directory / "frames"
                                   : std::filesystem::path(),
           .latents_directory = {},
-          .prompt = std::move(job->request.prompt),
+          .prompt = {},
           .seed = job->request.seed,
           .parameters = job->request.parameters,
       };
-      WipeString(&job->request.prompt);
+      {
+        // Delete can clear a queued/active prompt concurrently with admission.
+        const std::lock_guard<std::mutex> lock(mutex);
+        generation.prompt = std::move(job->request.prompt);
+        WipeString(&job->request.prompt);
+      }
       const std::string prompt_hash = minimax_h3::Sha256(std::span(
           reinterpret_cast<const unsigned char*>(generation.prompt.data()),
           generation.prompt.size()));
@@ -605,12 +633,16 @@ struct VideoJobService::Impl {
       try {
         success = options.runner(generation, &job->cancellation, Progress,
                                  &progress, &telemetry, &error);
-      } catch (const std::exception&) {
-        error = "video generation backend threw an exception";
+      } catch (const std::exception& exception) {
+        error = exception.what();
       } catch (...) {
         error = "video generation backend failed unexpectedly";
       }
       WipeString(&generation.prompt);
+      if (!success && !job->cancellation.IsCancelled()) {
+        Logger::Error("video", "job=" + job->snapshot.id +
+                                   " event=backend_failed detail=" + error);
+      }
 
       std::filesystem::path content_path;
       std::string media_type;
@@ -691,6 +723,19 @@ struct VideoJobService::Impl {
           }
         }
       }
+      Logger::Log(snapshot.status == VideoJobStatus::kFailed ? LogLevel::kError
+                                                             : LogLevel::kInfo,
+                  "video",
+                  "job=" + job->snapshot.id + " event=finished state=" +
+                      (deleted ? std::string("deleted")
+                               : std::string(ToString(snapshot.status))) +
+                      " elapsed_ms=" +
+                      std::to_string(
+                          std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start_time)
+                              .count()) +
+                      " error_code=" + snapshot.error_code + " " +
+                      Logger::MemoryStatus());
       if (deleted) {
         std::error_code ignored;
         std::filesystem::remove_all(job->directory, ignored);
@@ -814,6 +859,8 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
     }
     admitted = impl_->Snapshot(*job);
   }
+  Logger::Info("video", "job=" + admitted.id + " event=queued preset=" +
+                            request.parameters.preset);
   impl_->condition.notify_one();
   return {
       .result = VideoJobResult::kOk, .job = std::move(admitted), .error = {}};

@@ -15,6 +15,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -26,6 +27,11 @@
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/http_server.hpp"
 #include "src/cli/serve/inference_backend.hpp"
+#include "src/cli/serve/logging.hpp"
+
+#if defined(ENGINE_ENABLE_HIP)
+#include <hip/hip_runtime_api.h>
+#endif
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
@@ -33,6 +39,50 @@
 
 namespace gufo::cli {
 namespace {
+
+class ModelLoadLog {
+public:
+  ModelLoadLog(std::string kind, const std::filesystem::path& artifact)
+      : kind_(std::move(kind)), start_(std::chrono::steady_clock::now()) {
+    server::Logger::Info("loader", "event=load_started kind=" + kind_ +
+                                       " artifact=" + artifact.string() + " " +
+                                       server::Logger::MemoryStatus());
+  }
+  ~ModelLoadLog() {
+    if (!completed_) {
+      try {
+        server::Logger::Error("loader", "event=load_failed kind=" + kind_ +
+                                            " " +
+                                            server::Logger::MemoryStatus());
+      } catch (...) {
+      }
+    }
+  }
+  void Complete(std::string_view details, bool gpu_loaded = true) {
+    completed_ = true;
+    std::ostringstream out;
+    out << "event=load_completed kind=" << kind_ << " elapsed_ms="
+        << std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - start_)
+               .count()
+        << ' ' << details << ' ' << server::Logger::MemoryStatus();
+#if defined(ENGINE_ENABLE_HIP)
+    std::size_t free = 0, total = 0;
+    if (gpu_loaded && hipMemGetInfo(&free, &total) == hipSuccess) {
+      out << " gpu_device_used_mib=" << (total - free) / (1024 * 1024)
+          << " gpu_device_total_mib=" << total / (1024 * 1024);
+    }
+#else
+    (void)gpu_loaded;
+#endif
+    server::Logger::Info("loader", out.str());
+  }
+
+private:
+  std::string kind_;
+  std::chrono::steady_clock::time_point start_;
+  bool completed_{false};
+};
 
 std::optional<ReasoningEffort> ParseReasoningEffort(std::string_view value) {
   if (value == "minimal") {
@@ -645,6 +695,7 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
 
+    ModelLoadLog load_log("video_inventory", video_model);
     video_jobs = std::make_shared<server::VideoJobService>(
         server::VideoJobServiceOptions{
             .model_root = video_model,
@@ -663,6 +714,8 @@ int RunServe(std::span<const char* const> args) {
                 << video_jobs->initialization_error() << '\n';
       return 1;
     }
+    load_log.Complete(
+        "model=minimax-h3 sessions=1 queue_capacity=1 weights=lazy", false);
   } else if (subcommand == "audio") {
     // One audio server hosts Qwen3-TTS synthesis, Qwen3-ASR transcription, or
     // both: HttpServer already dispatches /v1/audio/speech and
@@ -789,6 +842,7 @@ int RunServe(std::span<const char* const> args) {
     }
 
     if (!tts_model.empty()) {
+      ModelLoadLog load_log("tts", tts_model);
       tts = std::make_shared<server::TtsService>(server::TtsServiceOptions{
           .model_root = tts_model,
           .native_context_tokens = tts_context_tokens,
@@ -803,9 +857,13 @@ int RunServe(std::span<const char* const> args) {
                   << tts->initialization_error() << '\n';
         return 1;
       }
+      load_log.Complete(
+          "model=" + tts->model_id() +
+          " sessions=1 context_tokens=" + std::to_string(tts_context_tokens));
     }
 
     if (!asr_model.empty()) {
+      ModelLoadLog load_log("asr", asr_model);
       asr = std::make_shared<server::AsrService>(server::AsrServiceOptions{
           .model_root = asr_model,
           .native_context_tokens = asr_context_tokens,
@@ -818,6 +876,9 @@ int RunServe(std::span<const char* const> args) {
                   << asr->initialization_error() << '\n';
         return 1;
       }
+      load_log.Complete(
+          "model=" + asr->model_id() +
+          " sessions=1 context_tokens=" + std::to_string(asr_context_tokens));
     }
   } else {
     // Default to LLM server
@@ -1040,6 +1101,7 @@ int RunServe(std::span<const char* const> args) {
     speculative_config.min_draft_tokens =
         static_cast<std::uint32_t>(min_draft_tokens);
     std::string err;
+    ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
     if (!backend->load(model, &err, max_context, session_count,
                        server::TextPrefillPolicy{
@@ -1070,22 +1132,23 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
       return 1;
     }
-    if (speculative_config.backend == server::TextSpeculativeBackend::kDFlash) {
-      std::cout << "[Speculative]: DFlash enabled (max_draft_tokens="
-                << speculative_config.max_draft_tokens
-                << ", min_draft_tokens=" << speculative_config.min_draft_tokens
-                << ")\n";
-    } else if (speculative_config.backend ==
-               server::TextSpeculativeBackend::kDSpark) {
-      std::cout << "[Speculative]: DSpark enabled\n";
-    } else if (speculative_config.backend ==
-               server::TextSpeculativeBackend::kMtp) {
-      std::cout << "[Speculative]: MTP enabled (max_draft_tokens="
-                << speculative_config.max_draft_tokens << ")\n";
-    }
     backend->set_model_id(served_model_name);
     backend->set_sampling_defaults(max_tokens, sampling_config);
     backend->set_reasoning_defaults(*reasoning_defaults);
+    const char* speculation =
+        speculative_config.backend == server::TextSpeculativeBackend::kDFlash
+            ? "dflash2"
+        : speculative_config.backend == server::TextSpeculativeBackend::kDSpark
+            ? "dspark"
+        : speculative_config.backend == server::TextSpeculativeBackend::kMtp
+            ? "mtp"
+            : "off";
+    load_log.Complete(
+        "model=" + backend->model_id() +
+        " sessions=" + std::to_string(session_count) + " context_tokens=" +
+        std::to_string(max_context) + " speculative=" + speculation +
+        " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
+        " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
   }
 
   server::HttpServer server(

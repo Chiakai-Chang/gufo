@@ -1298,47 +1298,13 @@ HttpResponse NonStreamingResponse(
          << ", inter_token;dur=" << result.mean_inter_token_ms
          << ", max_inter_token;dur=" << result.max_inter_token_ms;
 
-  std::ostringstream details;
-  const double prompt_per_second = PrefillTokensPerSecond(result);
-  const double tok_per_sec =
-      (result.decode_ms > 0.0 && result.completion_tokens > 0)
-          ? (static_cast<double>(result.completion_tokens) /
-             (result.decode_ms / 1000.0))
-          : 0.0;
-
-  details << result.prompt_tokens << " prompt tok";
-  if (prompt_per_second > 0.0) {
-    details << " (" << std::fixed << std::setprecision(1) << prompt_per_second
-            << " tok/s)";
-  }
-  details << " | " << result.completion_tokens << " gen tok";
-  if (tok_per_sec > 0.0) {
-    details << " (" << std::fixed << std::setprecision(1) << tok_per_sec
-            << " tok/s)";
-  }
-  if (result.cached_prompt_tokens > 0) {
-    details << " | cache: " << result.cached_prompt_tokens << " tok";
-  }
-  if (result.draft_tokens > 0) {
-    const double accept_pct =
-        (static_cast<double>(result.draft_accepted_tokens) * 100.0) /
-        static_cast<double>(result.draft_tokens);
-    details << " | draft: " << result.draft_accepted_tokens << "/"
-            << result.draft_tokens << " (" << std::fixed << std::setprecision(1)
-            << accept_pct << "%)";
-  }
-  if (result.ttft_ms > 0.0) {
-    details << " | TTFT: " << std::fixed << std::setprecision(1)
-            << result.ttft_ms << "ms";
-  }
-
   return {
       .status = 200,
       .reason = "OK",
       .body = response.dump(),
       .headers = {{"Server-Timing", timing.str()}},
       .streaming_body = {},
-      .log_details = details.str(),
+      .log_details = GenerationLogDetails(result),
   };
 }
 
@@ -1349,6 +1315,7 @@ HttpResponse StreamingResponse(
   const std::string id = RandomId("chatcmpl-");
   const long long created = Now();
   const std::string model = backend.model_id();
+  auto stream_log = std::make_shared<HttpResponse::StreamLog>();
   return {
       .status = 200,
       .reason = "OK",
@@ -1361,7 +1328,8 @@ HttpResponse StreamingResponse(
           },
       .streaming_body =
           [request, generation = std::move(generation), id, created, model,
-           initial_output_state](const HttpResponse::BodyWriter& writer) {
+           initial_output_state,
+           stream_log](const HttpResponse::BodyWriter& writer) {
             json::Value role_delta = json::Value::object();
             role_delta["role"] = "assistant";
             if (!writer(Sse(
@@ -1392,6 +1360,8 @@ HttpResponse StreamingResponse(
               const auto result = generation->Wait([&](std::string_view piece) {
                 return connected && filter.Push(piece);
               });
+              stream_log->details = GenerationLogDetails(result);
+              RecordServerMetrics(result);
               if (!connected || result.cancelled) {
                 return;
               }
@@ -1428,17 +1398,19 @@ HttpResponse StreamingResponse(
                       FinishReason(result, !generated.tool_calls.empty()))))) {
                 return;
               }
-              json::Value usage_chunk = BaseChunk(id, created, model);
-              usage_chunk["choices"] = json::Value::array();
-              usage_chunk["usage"] = Usage(result);
-              usage_chunk["timings"] = GenerationTimings(result);
-              usage_chunk["metrics"] = Metrics(result);
-              RecordServerMetrics(result);
-              if (!writer(Sse(usage_chunk))) {
-                return;
+              if (request.include_usage) {
+                json::Value usage_chunk = BaseChunk(id, created, model);
+                usage_chunk["choices"] = json::Value::array();
+                usage_chunk["usage"] = Usage(result);
+                usage_chunk["timings"] = GenerationTimings(result);
+                usage_chunk["metrics"] = Metrics(result);
+                if (!writer(Sse(usage_chunk))) {
+                  return;
+                }
               }
               (void)writer("data: [DONE]\n\n");
             } catch (const TextGenerationError& exception) {
+              stream_log->error_code = exception.stable_code();
               json::Value error = json::Value::object();
               json::Value detail = json::Value::object();
               detail["message"] = exception.what();
@@ -1448,6 +1420,7 @@ HttpResponse StreamingResponse(
               (void)writer(Sse(error));
               (void)writer("data: [DONE]\n\n");
             } catch (const std::exception&) {
+              stream_log->error_code = "generation_failed";
               json::Value error = json::Value::object();
               json::Value detail = json::Value::object();
               detail["message"] = "generation failed";
@@ -1458,6 +1431,7 @@ HttpResponse StreamingResponse(
               (void)writer("data: [DONE]\n\n");
             }
           },
+      .stream_log = std::move(stream_log),
   };
 }
 

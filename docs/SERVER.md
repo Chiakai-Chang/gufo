@@ -458,7 +458,7 @@ CORS preflight (`OPTIONS`) does not require credentials. Select the listen
 address with `--host`; it must be an IPv4 address. TLS termination belongs in
 a reverse proxy.
 
-Prompt and generated text logging is disabled by default.
+Request bodies, prompts, generated text and credentials are not logged.
 
 Tool definitions and generated tool calls are treated as data. `gufo`
 never executes tools, shell commands, URLs, or generated code.
@@ -492,15 +492,54 @@ capacity or admission decisions.
 TODO: real slot/KV metrics, a validated administrative reload/drain interface,
 and automatic recovery after device reset or suspend/resume.
 
+## Troubleshooting logs
+
+Server lifecycle and request logs go to stderr. Each request gets an
+`X-Request-ID` response header matching its `request=rN` log entries. Inference
+requests log receipt and completion; streaming completion is logged after the
+stream ends. Successful health/metrics and video-status polls are quiet.
+
+Text completion logs include stop/length/cancellation, queue and first-token
+latency, prefill/decode speed, execution width, memory/disk cache hits and reused
+tokens, plus accepted/proposed drafts and acceptance percentage. These metrics
+are logged even when a streaming client does not request a usage chunk.
+Errors include a stable error code; disconnects and stream failures are marked.
+Routine cache replacement is quiet; failed captures, disk corruption and cache
+capacity refusals produce warnings. Cache capacity is a budget, not allocated
+memory.
+
+Loading logs report elapsed time, model, context and session capacity,
+speculative mode and memory. `rss_mib` is process resident memory;
+`host_available_mib` is available system memory. At load completion,
+`gpu_device_used_mib` is device-wide HIP usage. These overlap on unified memory
+and must not be added together.
+
+Audio summaries include model, duration and generation/transcription timings.
+Video requests log a job ID linking queue, start, throttled phase progress and
+completion/failure events. Video startup validates inventory; weights load
+lazily in the worker. Control characters are escaped in log lines.
+
 ## Focused checks
 
 - `json_test`: number precision, Unicode escapes, malformed input and depth limits.
 - `http_server_test`: transport framing, authentication, compatibility validation,
-  sampling forwarding and completion metadata without loading a model.
+  sampling forwarding, request logs and streaming failures without loading a model.
 - `openai_chat_test`: chat parsing, streaming, images, tools and sampling controls.
 - `serve_cli_test`: executable help, argument wiring and rejected configurations.
 - Per-model serving tests: greedy/sampled decoding, batching, cache reuse and
   cancellation. Use the affected model's benchmark README for commands and limits.
+
+For session-boundary changes, also run a six-turn conversation: remember a fact,
+force one token-limit stop, recall the fact, update it and recall the update.
+Compare greedy AR/speculative token traces and repeat each sampled mode with the
+same seed. Mix EOS and token-limit stops rather than testing only fixed-length
+generation. This is a session/replay check, not a capability or distribution test.
+
+2026-09-19: six-turn greedy AR/speculative traces matched for DS4/DSpark,
+Flash-Next/MTP and Qwen27B Q4/Q8 with the Q4 DFlash2 draft. Speculative runs
+repeated exactly at temperature 0.6, seed 7, with a 32-token turn limit.
+Two simultaneous Qwen27B Q4/DFlash2 HTTP conversations also retained independent
+facts through six turns, with streaming and memory-cache reuse.
 
 DSpark's short boundary check is available without the complete serving suite:
 

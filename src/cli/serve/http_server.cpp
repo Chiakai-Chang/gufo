@@ -321,40 +321,7 @@ HttpResponse WithTiming(HttpResponse response,
         << ", max_inter_token;dur=" << result.max_inter_token_ms;
   response.headers.emplace_back("Server-Timing", value.str());
 
-  std::ostringstream details;
-  const double prompt_per_second = PrefillTokensPerSecond(result);
-  const double tok_per_sec =
-      (result.decode_ms > 0.0 && result.completion_tokens > 0)
-          ? (static_cast<double>(result.completion_tokens) /
-             (result.decode_ms / 1000.0))
-          : 0.0;
-
-  details << result.prompt_tokens << " prompt tok";
-  if (prompt_per_second > 0.0) {
-    details << " (" << std::fixed << std::setprecision(1) << prompt_per_second
-            << " tok/s)";
-  }
-  details << " | " << result.completion_tokens << " gen tok";
-  if (tok_per_sec > 0.0) {
-    details << " (" << std::fixed << std::setprecision(1) << tok_per_sec
-            << " tok/s)";
-  }
-  if (result.cached_prompt_tokens > 0) {
-    details << " | cache: " << result.cached_prompt_tokens << " tok";
-  }
-  if (result.draft_tokens > 0) {
-    const double accept_pct =
-        (static_cast<double>(result.draft_accepted_tokens) * 100.0) /
-        static_cast<double>(result.draft_tokens);
-    details << " | draft: " << result.draft_accepted_tokens << "/"
-            << result.draft_tokens << " (" << std::fixed << std::setprecision(1)
-            << accept_pct << "%)";
-  }
-  if (result.ttft_ms > 0.0) {
-    details << " | TTFT: " << std::fixed << std::setprecision(1)
-            << result.ttft_ms << "ms";
-  }
-  response.log_details = details.str();
+  response.log_details = GenerationLogDetails(result);
   return response;
 }
 
@@ -1021,20 +988,12 @@ bool HttpServer::start(std::string* error) {
 }
 
 void HttpServer::run() {
-  Logger::Info("server",
-               "Listening on http://" + host_ + ":" + std::to_string(port_));
-  if (backend_ != nullptr) {
-    Logger::Info("engine", "Loaded text model: " + backend_->model_id());
-  }
-  if (video_jobs_ != nullptr && video_jobs_->ready()) {
-    Logger::Info("video", "MiniMax H3 video API enabled");
-  }
-  if (tts_ != nullptr && tts_->ready()) {
-    Logger::Info("audio", "Qwen3-TTS audio API enabled");
-  }
-  if (asr_ != nullptr && asr_->ready()) {
-    Logger::Info("audio", "Qwen3-ASR transcription API enabled");
-  }
+  Logger::Info(
+      "server",
+      "event=listening address=http://" + host_ + ":" + std::to_string(port_) +
+          " auth=" + (options_.api_key.empty() ? "off" : "bearer") +
+          " max_connections=" + std::to_string(options_.max_connections) +
+          " max_body_bytes=" + std::to_string(options_.max_request_body_bytes));
   while (!stopped_.load(std::memory_order_acquire)) {
     const int client_fd = ::accept(listen_fd_, nullptr, nullptr);
     if (client_fd < 0) {
@@ -1203,6 +1162,15 @@ void HttpServer::handle_connection(int client_fd) {
 
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;
+  static std::atomic<std::uint64_t> next_request{0};
+  req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
+  bool response_started = false;
+  int response_status = 0;
+  const auto elapsed_ms = [&] {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - start_time)
+        .count();
+  };
   try {
     bool ok = false;
     bool payload_too_large = false;
@@ -1298,6 +1266,17 @@ void HttpServer::handle_connection(int client_fd) {
       }
     }
 
+    // Successful health/metrics polling and video status polling stay quiet.
+    const bool log_request = req.method == "POST" || req.method == "DELETE" ||
+                             req.path == "/v1/models" ||
+                             req.path.ends_with("/content");
+    if (ok && log_request) {
+      Logger::Info("http", "request=" + req.request_id +
+                               " event=received method=" + req.method +
+                               " path=" + req.path + " body_bytes=" +
+                               std::to_string(req.body.size()));
+    }
+
     HttpResponse resp;
     if (payload_too_large) {
       resp = Err(413, "Payload Too Large", "request body is too large",
@@ -1311,21 +1290,44 @@ void HttpServer::handle_connection(int client_fd) {
       resp = handle_request(req);
     }
 
-    const auto duration_ms = std::chrono::duration<double, std::milli>(
-                                 std::chrono::steady_clock::now() - start_time)
-                                 .count();
-    Logger::LogRequest(req.method.empty() ? "UNKNOWN" : req.method,
-                       req.path.empty() ? "/" : req.path, resp.status,
-                       resp.reason, duration_ms, resp.log_details);
-
+    resp.headers.emplace_back("X-Request-ID", req.request_id);
+    response_status = resp.status;
+    bool connected = true;
     if (resp.streaming_body) {
-      if (SendAll(client_fd, BuildResponseHead(resp, std::nullopt))) {
-        resp.streaming_body([client_fd](std::string_view chunk) {
-          return SendAll(client_fd, chunk);
+      const auto head = BuildResponseHead(resp, std::nullopt);
+      response_started = true;
+      connected = SendAll(client_fd, head);
+      if (connected) {
+        resp.streaming_body([&](std::string_view chunk) {
+          connected = connected && SendAll(client_fd, chunk);
+          return connected;
         });
       }
     } else {
-      (void)SendAll(client_fd, BuildResponse(resp));
+      const auto payload = BuildResponse(resp);
+      response_started = true;
+      connected = SendAll(client_fd, payload);
+    }
+    std::string outcome = connected ? "completed" : "disconnected";
+    if (resp.stream_log) {
+      resp.log_details = resp.stream_log->details;
+      if (!resp.stream_log->error_code.empty()) {
+        outcome = "stream_error";
+        resp.log_details += " error_code=" + resp.stream_log->error_code;
+      }
+    }
+    if (resp.status >= 400) {
+      try {
+        const auto body = json::parse(resp.body);
+        if (const auto* error = body.find("error"))
+          resp.log_details += " error_code=" + error->member_str("code");
+      } catch (const std::exception&) {
+        // The status remains useful for an endpoint returning a non-JSON error.
+      }
+    }
+    if (log_request || resp.status >= 400 || !connected) {
+      Logger::LogRequest(req.request_id, req.method, req.path, resp.status,
+                         elapsed_ms(), resp.log_details, outcome);
     }
   } catch (const TextGenerationError& exception) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
@@ -1339,34 +1341,44 @@ void HttpServer::handle_connection(int client_fd) {
     }
     HttpResponse resp = Err(exception.http_status(), reason, exception.what(),
                             "server_error", exception.stable_code());
+    resp.headers.emplace_back("X-Request-ID", req.request_id);
     if (exception.retryable()) {
       resp.headers.emplace_back("Retry-After", "1");
     }
-    Logger::LogRequest(req.method.empty() ? "UNKNOWN" : req.method,
-                       req.path.empty() ? "/" : req.path, resp.status,
-                       resp.reason, duration_ms, exception.what());
-    (void)SendAll(client_fd, BuildResponse(resp));
+    Logger::LogRequest(req.request_id, req.method, req.path,
+                       response_started ? response_status : resp.status,
+                       duration_ms,
+                       std::string("error_code=") + exception.stable_code(),
+                       response_started ? "stream_error" : "failed");
+    if (!response_started)
+      (void)SendAll(client_fd, BuildResponse(resp));
   } catch (const std::exception& e) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
                                  .count();
-    const HttpResponse resp = Err(500, "Internal Server Error", e.what(),
-                                  "internal_error", "server_exception");
-    Logger::LogRequest(req.method.empty() ? "UNKNOWN" : req.method,
-                       req.path.empty() ? "/" : req.path, resp.status,
-                       resp.reason, duration_ms, e.what());
-    (void)SendAll(client_fd, BuildResponse(resp));
+    HttpResponse resp = Err(500, "Internal Server Error", e.what(),
+                            "internal_error", "server_exception");
+    resp.headers.emplace_back("X-Request-ID", req.request_id);
+    Logger::LogRequest(req.request_id, req.method, req.path,
+                       response_started ? response_status : resp.status,
+                       duration_ms, "error_code=server_exception",
+                       response_started ? "stream_error" : "failed");
+    if (!response_started)
+      (void)SendAll(client_fd, BuildResponse(resp));
   } catch (...) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
                                  .count();
-    const HttpResponse resp =
+    HttpResponse resp =
         Err(500, "Internal Server Error", "unknown server error",
             "internal_error", "server_exception");
-    Logger::LogRequest(req.method.empty() ? "UNKNOWN" : req.method,
-                       req.path.empty() ? "/" : req.path, resp.status,
-                       resp.reason, duration_ms, "unknown server error");
-    (void)SendAll(client_fd, BuildResponse(resp));
+    resp.headers.emplace_back("X-Request-ID", req.request_id);
+    Logger::LogRequest(req.request_id, req.method, req.path,
+                       response_started ? response_status : resp.status,
+                       duration_ms, "error_code=server_exception",
+                       response_started ? "stream_error" : "failed");
+    if (!response_started)
+      (void)SendAll(client_fd, BuildResponse(resp));
   }
 }
 

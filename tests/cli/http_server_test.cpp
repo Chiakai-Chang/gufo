@@ -9,8 +9,12 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
+
+#include "src/cli/serve/logging.hpp"
 
 namespace {
 
@@ -36,7 +40,8 @@ public:
   }
   Result complete(std::string_view prompt, std::size_t limit,
                   const gufo::sampling::SamplingConfig& sampling,
-                  const CancellationCheck&, const TokenCallback&) override {
+                  const CancellationCheck&,
+                  const TokenCallback& token) override {
     ++calls;
     {
       const std::lock_guard lock(mutex_);
@@ -48,12 +53,17 @@ public:
     result.text = "ok";
     result.prompt_tokens = 10;
     result.cached_prompt_tokens = 8;
+    result.cache_hit = true;
+    result.draft_accepted_tokens = 4;
+    result.draft_tokens = 8;
     result.prefill_tokens = 2;
     result.prefill_ms = 4;
     result.completion_tokens = 1;
     result.decode_ms = 2;
     result.finish_reason =
         limit == 1 ? FinishReason::kLength : FinishReason::kStop;
+    if (token)
+      (void)token("ok");
     return result;
   }
   Result chat(const gufo::server::ChatRequest& request, std::size_t limit,
@@ -82,6 +92,13 @@ public:
                std::move(options)) {
     server.add("POST", "/echo", [](const auto& request, auto&) {
       return gufo::server::HttpResponse{.body = request.body};
+    });
+    server.add("POST", "/stream-error", [](const auto&, auto&) {
+      return gufo::server::HttpResponse{
+          .streaming_body = [](const auto& write) {
+            (void)write("first chunk");
+            throw std::runtime_error("injected stream failure");
+          }};
     });
     std::string error;
     assert(server.start(&error));
@@ -176,6 +193,44 @@ void TestAuthorization() {
                             std::to_string(body.size()) + "\r\n\r\n" + body),
                200);
   assert(secured.backend->calls == 1);
+}
+
+void TestRequestLogging() {
+  std::ostringstream output;
+  auto* previous = std::clog.rdbuf(output.rdbuf());
+  std::string request_id;
+  {
+    RunningServer server;
+    ExpectStatus(server.Send("GET /health HTTP/1.1\r\n\r\n"), 200);
+    const auto response = server.Post(
+        "/v1/chat/completions?private-query",
+        R"({"model":"test","messages":[{"role":"user","content":"private-prompt"}],"stream":true})");
+    ExpectStatus(response, 200);
+    const auto header = response.find("X-Request-ID: ");
+    assert(header != std::string::npos);
+    const auto begin = header + std::string("X-Request-ID: ").size();
+    request_id = response.substr(begin, response.find("\r\n", begin) - begin);
+
+    const auto failed = server.Post("/stream-error", "");
+    ExpectStatus(failed, 200);
+    assert(failed.find("first chunk") != std::string::npos);
+    assert(failed.find("HTTP/1.1", 1) == std::string::npos);
+  }
+  gufo::server::Logger::Info("test", "escaped\n\x1b[31m");
+  std::clog.rdbuf(previous);
+  const auto log = output.str();
+  assert(log.find("request=" + request_id + " event=received") !=
+         std::string::npos);
+  assert(log.find("request=" + request_id + " event=completed") !=
+         std::string::npos);
+  assert(log.find("cache=memory") != std::string::npos);
+  assert(log.find("acceptance_pct=50.0") != std::string::npos);
+  assert(log.find("rss_mib=") != std::string::npos);
+  assert(log.find("error_code=server_exception") != std::string::npos);
+  assert(log.find("path=/health") == std::string::npos);
+  assert(log.find("private-query") == std::string::npos);
+  assert(log.find("private-prompt") == std::string::npos);
+  assert(log.find("escaped\\x0a\\x1b[31m") != std::string::npos);
 }
 
 void TestFramingAndMetrics() {
@@ -352,6 +407,7 @@ void TestQueryParameters() {
 }  // namespace
 
 int main() {
+  TestRequestLogging();
   TestInvalidBindSettings();
   TestQueryParameters();
   TestAuthorization();

@@ -144,6 +144,12 @@ void TestJsonRequest() {
         "multipart fields reach the model contract");
   Check(HasHeader(response, "X-Gufo-ASR-Backend", "native-hip"),
         "native backend is exposed");
+  Check(response.log_details.find("encoder_ms=") != std::string::npos &&
+            response.log_details.find("decoder_ms=") != std::string::npos &&
+            response.log_details.find("A native transcript.") ==
+                std::string::npos &&
+            response.log_details.find("Names: Gufo.") == std::string::npos,
+        "transcription diagnostics report work without transcript or context");
 }
 
 void TestFormatsAndValidation() {

@@ -28,118 +28,6 @@
 
 namespace gufo::cli {
 
-void PrintVideoHelp(std::string_view program_name) {
-  std::filesystem::path model_dir;
-  std::filesystem::path output_path;
-  std::string preset = "exact";
-  std::uint64_t seed = 42;
-  int width = 512;
-  int height = 512;
-  int out_width = 512;
-  int out_height = 512;
-  int frames = 56;
-  int steps = 50;
-  int blocks = 50;
-  int reuse = 1;
-  std::string kernel = "row-parallel";
-  std::string selected_frames;
-  std::filesystem::path frames_dir;
-  std::filesystem::path latents_dir;
-  bool no_audio = false;
-  bool no_mux = false;
-  std::filesystem::path manifest = DefaultH3SourceManifest();
-  std::filesystem::path parameters_path;
-  std::filesystem::path report_path;
-  bool profile = false;
-
-  gufo::cli::ArgParser parser(
-      std::string(program_name) + " video [OPTIONS] <PROMPT>",
-      "Generate MiniMax H3 text-to-video on a Strix Halo gfx1151 GPU.\n"
-      "There is no CPU inference fallback and weights are never downloaded.");
-
-  // Model & Output
-  parser.AddOption("-m", "--model", "DIR",
-                   "Operator-supplied MiniMax H3 directory", "Model & Output",
-                   &model_dir);
-  parser.AddOption("-o", "--output", "MP4",
-                   "Destination path for atomic MP4 video output",
-                   "Model & Output", &output_path);
-  parser.AddOption(
-      "", "--preset", "NAME",
-      "Quality preset: exact, exact-1344x768, fast, aggressive, or dev "
-      "(default: exact)",
-      "Model & Output", &preset);
-
-  // Canvas & Denoising
-  parser.AddOption(
-      "", "--seed", "N",
-      "RNG seed for deterministic noise initialization (default: 42)",
-      "Denoising", &seed);
-  parser.AddOption("", "--width", "N",
-                   "Internal denoiser canvas width (default: 512)", "Denoising",
-                   &width);
-  parser.AddOption("", "--height", "N",
-                   "Internal denoiser canvas height (default: 512)",
-                   "Denoising", &height);
-  parser.AddOption(
-      "", "--output-width", "N",
-      "Encoded video canvas width (default: matches internal canvas)",
-      "Denoising", &out_width);
-  parser.AddOption(
-      "", "--output-height", "N",
-      "Encoded video canvas height (default: matches internal canvas)",
-      "Denoising", &out_height);
-  parser.AddOption(
-      "", "--frames", "N",
-      "VisualVAE-decodable frame count (22+17n, e.g. 56, 124) (default: 56)",
-      "Denoising", &frames);
-  parser.AddOption("", "--steps", "N",
-                   "Number of DiT denoising evaluations (default: 50)",
-                   "Denoising", &steps);
-  parser.AddOption("", "--blocks", "N",
-                   "Active DiT prefix blocks to evaluate (default: 50)",
-                   "Denoising", &blocks);
-  parser.AddOption("", "--reuse", "N",
-                   "Whole-denoiser latent reuse interval (default: 1 = off)",
-                   "Denoising", &reuse);
-
-  // Diagnostics & Artifacts
-  parser.AddOption("", "--attention-kernel", "NAME",
-                   "Attention kernel variant: row-parallel or scalar (default: "
-                   "row-parallel)",
-                   "Diagnostics", &kernel);
-  parser.AddOption("", "--selected-frames", "LIST",
-                   "Frames to extract (e.g. first,middle,last or 0,11,21)",
-                   "Diagnostics", &selected_frames);
-  parser.AddOption("", "--frames-dir", "DIR",
-                   "Directory to write atomic uncompressed PPM frame dumps",
-                   "Diagnostics", &frames_dir);
-  parser.AddOption(
-      "", "--latents-dir", "DIR",
-      "Directory to write diagnostic final F32 latent tensor dumps",
-      "Diagnostics", &latents_dir);
-  parser.AddFlag("", "--no-audio",
-                 "Skip AudioVAE generation (requires --no-mux)", "Diagnostics",
-                 &no_audio);
-  parser.AddFlag("", "--no-mux",
-                 "Skip MP4 container composition and audio interleaving",
-                 "Diagnostics", &no_mux);
-  parser.AddOption("", "--manifest", "PATH",
-                   "Pinned MiniMax H3 source manifest JSON override",
-                   "Diagnostics", &manifest);
-  parser.AddOption("", "--parameters", "PATH",
-                   "Output path for versioned parameter report JSON",
-                   "Diagnostics", &parameters_path);
-  parser.AddOption("", "--report", "PATH",
-                   "Output path for execution timing and memory report JSON",
-                   "Diagnostics", &report_path);
-  parser.AddFlag("-v", "--profile",
-                 "Print real-time phase progress and hardware metrics",
-                 "General", &profile);
-
-  parser.PrintHelp();
-}
-
 namespace {
 
 volatile std::sig_atomic_t g_cancel_requested = 0;  // NOLINT
@@ -164,6 +52,92 @@ bool ParseInteger(std::string_view text, Integer* output) {
   const auto result =
       std::from_chars(text.data(), text.data() + text.size(), *output);
   return result.ec == std::errc{} && result.ptr == text.data() + text.size();
+}
+
+struct VideoOverrides {
+  std::string preset = "exact";
+  std::optional<std::string> selected_frames;
+  std::string kernel = "row-parallel";
+  std::optional<int> width, height, output_width, output_height;
+  std::optional<int> frames, steps, blocks, reuse;
+  bool no_audio = false;
+  bool no_mux = false;
+};
+
+void RegisterVideoOptions(ArgParser& parser, VideoCliOptions& options,
+                          VideoOverrides& overrides) {
+  auto& request = options.request;
+  parser.AddOption("-m", "--model", "DIR", "MiniMax H3 model directory",
+                   "Model & Output", &request.model_root);
+  parser.AddOption("-o", "--output", "MP4", "Destination MP4 path",
+                   "Model & Output", &request.output_path);
+  parser.AddOption(
+      "", "--preset", "NAME",
+      "exact, exact-1344x768, fast, aggressive, or dev (default: exact)",
+      "Model & Output", &overrides.preset);
+  parser.AddOption("", "--seed", "N", "Noise RNG seed (default: 42)",
+                   "Denoising", &request.seed);
+  const auto integer_override = [&](std::string_view name,
+                                    std::string_view description,
+                                    std::optional<int>* target) {
+    parser.AddCustomOption(
+        "", name, "N", description, "Denoising",
+        [target](std::string_view flag, std::string_view value,
+                 std::string* error) {
+          int parsed = 0;
+          if (!ParseInteger(value, &parsed)) {
+            SetError(error, "Invalid integer for " + std::string(flag));
+            return false;
+          }
+          *target = parsed;
+          return true;
+        });
+  };
+  integer_override("--width", "Override preset internal canvas width",
+                   &overrides.width);
+  integer_override("--height", "Override preset internal canvas height",
+                   &overrides.height);
+  integer_override("--output-width", "Override preset encoded width",
+                   &overrides.output_width);
+  integer_override("--output-height", "Override preset encoded height",
+                   &overrides.output_height);
+  integer_override("--frames", "Override preset frame count (22+17n)",
+                   &overrides.frames);
+  integer_override("--steps", "Override preset denoising evaluations",
+                   &overrides.steps);
+  integer_override("--blocks", "Override preset active DiT prefix blocks",
+                   &overrides.blocks);
+  integer_override("--reuse",
+                   "Override preset denoiser reuse interval (1 = off)",
+                   &overrides.reuse);
+  parser.AddOption("", "--attention-kernel", "NAME",
+                   "row-parallel or scalar (default: row-parallel)",
+                   "Diagnostics", &overrides.kernel);
+  parser.AddCustomOption(
+      "", "--selected-frames", "LIST",
+      "Frames to extract (first,middle,last or frame indices)", "Diagnostics",
+      [&overrides](std::string_view, std::string_view value, std::string*) {
+        overrides.selected_frames = value;
+        return true;
+      });
+  parser.AddOption("", "--frames-dir", "DIR", "PPM frame dump directory",
+                   "Diagnostics", &request.frames_directory);
+  parser.AddOption("", "--latents-dir", "DIR",
+                   "Final F32 latent dump directory", "Diagnostics",
+                   &request.latents_directory);
+  parser.AddFlag("", "--no-audio", "Skip AudioVAE (requires --no-mux)",
+                 "Diagnostics", &overrides.no_audio);
+  parser.AddFlag("", "--no-mux", "Skip MP4 composition (requires --frames-dir)",
+                 "Diagnostics", &overrides.no_mux);
+  parser.AddOption("", "--manifest", "PATH", "Pinned source manifest override",
+                   "Diagnostics", &request.source_manifest);
+  parser.AddOption("", "--parameters", "PATH", "Parameter report JSON path",
+                   "Diagnostics", &options.parameters_path);
+  parser.AddOption("", "--report", "PATH", "Timing and memory report JSON path",
+                   "Diagnostics", &options.telemetry_path);
+  parser.AddFlag("", "--profile", "Print phase progress and hardware metrics",
+                 "General", &options.profile);
+  parser.JoinPositionals(&request.prompt);
 }
 
 std::optional<std::vector<int>> ParseSelectedFrames(std::string_view text,
@@ -266,167 +240,59 @@ std::filesystem::path DefaultH3SourceManifest() {
   return GUFO_H3_INSTALLED_SOURCE_MANIFEST;
 }
 
+void PrintVideoHelp(std::string_view program_name) {
+  VideoCliOptions options;
+  VideoOverrides overrides;
+  ArgParser parser(
+      std::string(program_name) + " video",
+      "Generate MiniMax H3 text-to-video on a Strix Halo gfx1151 GPU.\n"
+      "Supply a model directory and a positional text prompt. Canvas, frame,\n"
+      "and denoising defaults come from the selected preset.");
+  RegisterVideoOptions(parser, options, overrides);
+  parser.PrintHelp();
+}
+
 std::optional<VideoCliOptions> ParseVideoOptions(
     std::span<const char* const> args, std::string* error) {
-  std::string preset_name = "exact";
-  for (std::size_t index = 0; index < args.size(); ++index) {
-    if (std::string_view(args[index]) == "--preset") {
-      if (index + 1 >= args.size()) {
-        SetError(error, "missing argument for --preset");
-        return std::nullopt;
-      }
-      preset_name = args[++index];
-    }
-  }
-  auto parameters = minimax_h3::ResolveGenerationPreset(preset_name, error);
-  if (!parameters.has_value()) {
-    return std::nullopt;
-  }
   VideoCliOptions options;
-  options.request.parameters = std::move(*parameters);
   options.request.seed = 42;
   options.request.source_manifest = DefaultH3SourceManifest();
-  bool selected_frames_set = false;
-  std::string selected_frames;
-
-  const auto take_value =
-      [&](std::size_t* index,
-          std::string_view option) -> std::optional<std::string_view> {
-    if (*index + 1 >= args.size()) {
-      SetError(error, "missing argument for " + std::string(option));
-      return std::nullopt;
-    }
-    return std::string_view(args[++*index]);
-  };
-  for (std::size_t index = 0; index < args.size(); ++index) {
-    const std::string_view arg = args[index];
-    if (arg == "-h" || arg == "--help") {
-      return std::nullopt;
-    }
-    if (arg == "--preset") {
-      ++index;
-      continue;
-    }
-    if (arg == "--first-frame" || arg == "--last-frame" ||
-        arg == "--reference" || arg == "--ordered-reference") {
-      SetError(error, std::string(arg) +
-                          " is not implemented for the text-only H3 milestone");
-      return std::nullopt;
-    }
-    if (arg == "-m" || arg == "--model") {
-      const auto value = take_value(&index, arg);
-      if (!value) {
-        return std::nullopt;
-      }
-      options.request.model_root = *value;
-    } else if (arg == "-o" || arg == "--output") {
-      const auto value = take_value(&index, arg);
-      if (!value) {
-        return std::nullopt;
-      }
-      options.request.output_path = *value;
-    } else if (arg == "--frames-dir") {
-      const auto value = take_value(&index, arg);
-      if (!value) {
-        return std::nullopt;
-      }
-      options.request.frames_directory = *value;
-    } else if (arg == "--latents-dir") {
-      const auto value = take_value(&index, arg);
-      if (!value) {
-        return std::nullopt;
-      }
-      options.request.latents_directory = *value;
-    } else if (arg == "--manifest") {
-      const auto value = take_value(&index, arg);
-      if (!value) {
-        return std::nullopt;
-      }
-      options.request.source_manifest = *value;
-    } else if (arg == "--parameters") {
-      const auto value = take_value(&index, arg);
-      if (!value) {
-        return std::nullopt;
-      }
-      options.parameters_path = *value;
-    } else if (arg == "--report") {
-      const auto value = take_value(&index, arg);
-      if (!value) {
-        return std::nullopt;
-      }
-      options.telemetry_path = *value;
-    } else if (arg == "--selected-frames") {
-      const auto value = take_value(&index, arg);
-      if (!value) {
-        return std::nullopt;
-      }
-      selected_frames = *value;
-      selected_frames_set = true;
-    } else if (arg == "--profile") {
-      options.profile = true;
-    } else if (arg == "--attention-kernel") {
-      const auto value = take_value(&index, arg);
-      if (!value || (*value != "row-parallel" && *value != "scalar")) {
-        SetError(error, "--attention-kernel must be row-parallel or scalar");
-        return std::nullopt;
-      }
-      options.request.parameters.row_parallel_attention =
-          *value == "row-parallel";
-    } else if (arg == "--no-audio") {
-      options.request.parameters.decode_audio = false;
-    } else if (arg == "--no-mux") {
-      options.request.parameters.mux = false;
-    } else if (arg == "--seed") {
-      const auto value = take_value(&index, arg);
-      if (!value || !ParseInteger(*value, &options.request.seed)) {
-        SetError(error, "invalid integer for --seed");
-        return std::nullopt;
-      }
-    } else if (arg == "--width" || arg == "--height" ||
-               arg == "--output-width" || arg == "--output-height" ||
-               arg == "--frames" || arg == "--steps" || arg == "--blocks" ||
-               arg == "--reuse") {
-      const auto value = take_value(&index, arg);
-      int parsed = 0;
-      if (!value || !ParseInteger(*value, &parsed)) {
-        SetError(error, "invalid integer for " + std::string(arg));
-        return std::nullopt;
-      }
-      if (arg == "--width") {
-        options.request.parameters.internal_width = parsed;
-      } else if (arg == "--height") {
-        options.request.parameters.internal_height = parsed;
-      } else if (arg == "--output-width") {
-        options.request.parameters.output_width = parsed;
-      } else if (arg == "--output-height") {
-        options.request.parameters.output_height = parsed;
-      } else if (arg == "--frames") {
-        options.request.parameters.frames = parsed;
-      } else if (arg == "--steps") {
-        options.request.parameters.evaluations = parsed;
-      } else if (arg == "--blocks") {
-        options.request.parameters.active_blocks = parsed;
-      } else {
-        options.request.parameters.reuse_interval = parsed;
-      }
-    } else if (!arg.empty() && arg.front() == '-') {
-      SetError(error, "unknown MiniMax H3 video option: " + std::string(arg));
-      return std::nullopt;
-    } else if (options.request.prompt.empty()) {
-      options.request.prompt = arg;
-    } else {
-      options.request.prompt += " ";
-      options.request.prompt += arg;
-    }
+  VideoOverrides overrides;
+  ArgParser parser("gufo video");
+  RegisterVideoOptions(parser, options, overrides);
+  if (!parser.Parse(args, error) || parser.IsHelpRequested()) {
+    return std::nullopt;
   }
-  if (selected_frames_set) {
-    auto frames = ParseSelectedFrames(selected_frames,
-                                      options.request.parameters.frames, error);
-    if (!frames.has_value()) {
-      return std::nullopt;
-    }
-    options.request.parameters.selected_frames = std::move(*frames);
+  auto parameters =
+      minimax_h3::ResolveGenerationPreset(overrides.preset, error);
+  if (!parameters)
+    return std::nullopt;
+  auto& p = *parameters;
+  p.internal_width = overrides.width.value_or(p.internal_width);
+  p.internal_height = overrides.height.value_or(p.internal_height);
+  p.output_width = overrides.output_width.value_or(p.output_width);
+  p.output_height = overrides.output_height.value_or(p.output_height);
+  p.frames = overrides.frames.value_or(p.frames);
+  p.evaluations = overrides.steps.value_or(p.evaluations);
+  p.active_blocks = overrides.blocks.value_or(p.active_blocks);
+  p.reuse_interval = overrides.reuse.value_or(p.reuse_interval);
+  if (overrides.kernel != "row-parallel" && overrides.kernel != "scalar") {
+    SetError(error, "--attention-kernel must be row-parallel or scalar");
+    return std::nullopt;
   }
+  p.row_parallel_attention = overrides.kernel == "row-parallel";
+  if (overrides.no_audio)
+    p.decode_audio = false;
+  if (overrides.no_mux)
+    p.mux = false;
+  if (overrides.selected_frames) {
+    auto frames =
+        ParseSelectedFrames(*overrides.selected_frames, p.frames, error);
+    if (!frames)
+      return std::nullopt;
+    p.selected_frames = std::move(*frames);
+  }
+  options.request.parameters = std::move(p);
   if (options.request.model_root.empty() || options.request.prompt.empty()) {
     SetError(error, "MiniMax H3 video requires --model and a prompt");
     return std::nullopt;
@@ -462,15 +328,10 @@ std::optional<VideoCliOptions> ParseVideoOptions(
 }
 
 int RunVideo(std::span<const char* const> args) {
-  const bool help =
-      std::find_if(args.begin(), args.end(), [](const char* value) {
-        const std::string_view arg = value;
-        return arg == "-h" || arg == "--help";
-      }) != args.end();
   std::string error;
   auto options = ParseVideoOptions(args, &error);
   if (!options.has_value()) {
-    if (help && error.empty()) {
+    if (error.empty()) {
       PrintVideoHelp("gufo");
       return 0;
     }

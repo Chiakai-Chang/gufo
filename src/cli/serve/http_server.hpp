@@ -27,6 +27,7 @@ struct HttpRequest {
   std::string body;
   std::vector<std::pair<std::string, std::string>> headers;
   TextGenerationBackend::CancellationCheck is_cancelled;
+  std::string request_id{};
 
   /// URL-decoded value of a query param, or "" if absent.
   std::string query_param(const std::string& key) const;
@@ -64,6 +65,11 @@ struct HttpResponse {
   std::vector<std::pair<std::string, std::string>> headers;
   StreamingBody streaming_body;
   std::string log_details;
+  struct StreamLog {
+    std::string details;
+    std::string error_code;
+  };
+  std::shared_ptr<StreamLog> stream_log{};
 };
 
 using Handler =

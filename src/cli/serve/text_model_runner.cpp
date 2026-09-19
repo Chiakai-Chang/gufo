@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <iostream>
 #include <limits>
 #include <mutex>
 #include <sstream>
@@ -10,6 +9,7 @@
 #include <utility>
 
 #include "src/cli/serve/continuation_disk_store.hpp"
+#include "src/cli/serve/logging.hpp"
 
 namespace gufo::server {
 namespace {
@@ -173,22 +173,21 @@ std::string_view SnapshotEventReasonName(SnapshotEventReason reason) noexcept {
 }
 
 void EmitSnapshotEvent(const SnapshotEvent& event) noexcept {
+  // Replacing or evicting a retained prefix is routine; request summaries
+  // already report whether reuse succeeded. Failed captures need attention.
+  if (event.action == SnapshotEventAction::kRemoved)
+    return;
   try {
     std::ostringstream line;
-    line << "{\"event\":\"continuation_snapshot\",\"action\":\""
-         << SnapshotEventActionName(event.action) << "\",\"reason\":\""
-         << SnapshotEventReasonName(event.reason)
-         << "\",\"bytes\":" << event.snapshot_bytes
-         << ",\"token_count\":" << event.token_count
-         << ",\"retained_bytes\":" << event.retained_snapshot_bytes
-         << ",\"reserved_bytes\":" << event.reserved_snapshot_bytes
-         << ",\"capacity_bytes\":" << event.capacity_bytes << "}";
-    static std::mutex output_mutex;
-    const std::lock_guard<std::mutex> lock(output_mutex);
-    std::clog << line.str() << '\n';
+    line << "event=snapshot action=" << SnapshotEventActionName(event.action)
+         << " reason=" << SnapshotEventReasonName(event.reason)
+         << " bytes=" << event.snapshot_bytes << " tokens=" << event.token_count
+         << " retained_bytes=" << event.retained_snapshot_bytes
+         << " reserved_bytes=" << event.reserved_snapshot_bytes
+         << " capacity_bytes=" << event.capacity_bytes;
+    Logger::Warn("cache", line.str());
   } catch (...) {
-    // Optional cache logging must not affect request execution.
-    return;
+    // Cache logging must not affect request execution.
   }
 }
 
@@ -245,21 +244,32 @@ std::string_view DiskEventReasonName(
 }
 
 void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
+  switch (event.reason) {
+    case ContinuationDiskEventReason::kSaved:
+    case ContinuationDiskEventReason::kHit:
+    case ContinuationDiskEventReason::kNotFound:
+    case ContinuationDiskEventReason::kLru:
+    case ContinuationDiskEventReason::kExactReplacement:
+      return;
+    case ContinuationDiskEventReason::kByteCapacity:
+      if (event.action == ContinuationDiskEventAction::kRemoved)
+        return;
+      break;
+    default:
+      break;
+  }
   try {
     std::ostringstream line;
-    line << "{\"event\":\"continuation_disk_cache\",\"action\":\""
-         << DiskEventActionName(event.action) << "\",\"reason\":\""
-         << DiskEventReasonName(event.reason)
-         << "\",\"file_bytes\":" << event.file_bytes
-         << ",\"payload_bytes\":" << event.payload_bytes
-         << ",\"token_count\":" << event.token_count
-         << ",\"retained_bytes\":" << event.retained_bytes
-         << ",\"capacity_bytes\":" << event.capacity_bytes << "}";
-    static std::mutex output_mutex;
-    const std::lock_guard<std::mutex> lock(output_mutex);
-    std::clog << line.str() << '\n';
+    line << "event=disk_cache action=" << DiskEventActionName(event.action)
+         << " reason=" << DiskEventReasonName(event.reason)
+         << " file_bytes=" << event.file_bytes
+         << " payload_bytes=" << event.payload_bytes
+         << " tokens=" << event.token_count
+         << " retained_bytes=" << event.retained_bytes
+         << " capacity_bytes=" << event.capacity_bytes;
+    Logger::Warn("cache", line.str());
   } catch (...) {
-    return;
+    // Cache logging must not affect request execution.
   }
 }
 
