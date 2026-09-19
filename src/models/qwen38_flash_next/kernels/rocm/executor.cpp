@@ -71,6 +71,23 @@ WeightType SmallType(GgmlType type) {
 // The tier's tiled kernels compute whole column tiles; below this width the
 // matrix-vector kernels read each weight once per row and win outright.
 constexpr std::uint32_t kVecBatch = 8;
+// Keep prompt arithmetic independent of chunk width. A scoped, per-thread
+// policy also lets the output head retain its existing logits-row arithmetic.
+thread_local bool prefill_phase = false;
+struct PrefillPhase {
+  bool previous;
+  explicit PrefillPhase(bool enabled) : previous(prefill_phase) {
+    prefill_phase = enabled;
+  }
+  ~PrefillPhase() { prefill_phase = previous; }
+};
+bool MatrixRows(std::uint32_t rows) {
+  return prefill_phase || rows > kVecBatch;
+}
+bool ExpertMatrixRows(std::uint32_t rows) {
+  return prefill_phase || rows > 4 * kVecBatch;
+}
+
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
 constexpr std::uint32_t kAttnSplits = 8;
 /// Wide dense Q8_0 projections take the F16 WMMA GEMM (F16 activation
@@ -518,7 +535,7 @@ bool Executor::Quantize(const float* x, std::uint32_t n_tokens, std::uint32_t k,
   q->data = nullptr;
   q->n = n_tokens;
   q->k = k;
-  if (n_tokens > kVecBatch) {
+  if (MatrixRows(n_tokens)) {
     return true;  // the tiled path quantizes per call
   }
   // Two slots alternate, so an input stays valid across one other
@@ -558,7 +575,7 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
                           std::string* error_msg) const {
   // Decode and verification use the same fused projections and activation.
   // A different SwiGLU rounding can change later activation quantization.
-  if (n_tokens <= kVecBatch && up.type == GgmlType::kQ8_0 &&
+  if (!MatrixRows(n_tokens) && up.type == GgmlType::kQ8_0 &&
       gate.type == GgmlType::kQ8_0 && up.rows == gate.rows &&
       up.cols == gate.cols) {
     Q8Input xq;
@@ -582,7 +599,7 @@ bool Executor::GatedDense(const DeviceTensor& up, const DeviceTensor& gate,
   // A wide batch writes the down projection's staged input directly (the
   // F32 rows are read by nothing else): F16 rows for the F16 route, else
   // the tiled Q8 layout; the cache lets Dense skip its activation pass.
-  if (down != nullptr && down->cols == up.rows && n_tokens > kVecBatch &&
+  if (down != nullptr && down->cols == up.rows && MatrixRows(n_tokens) &&
       n_tokens <= options_.max_batch) {
     if (DenseF16Route(*down, n_tokens)) {
       SwigluHalf(out, s_.shexp_gate, static_cast<__half*>(s_.x_half),
@@ -623,7 +640,7 @@ void Executor::PrepareHalfInput(const float* x, std::uint32_t rows,
 
 bool Executor::DenseF16Route(const DeviceTensor& w,
                              std::uint32_t n_tokens) const {
-  return w.type == GgmlType::kQ8_0 && n_tokens > kVecBatch &&
+  return w.type == GgmlType::kQ8_0 && MatrixRows(n_tokens) &&
          w.rows >= kDenseF16MinRows && w.cols <= kDenseF16MaxCols &&
          w.cols <= model_->max_half_cols();
 }
@@ -631,7 +648,7 @@ bool Executor::DenseF16Route(const DeviceTensor& w,
 bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
                      std::uint32_t n_tokens, std::string* error_msg) const {
   if (w.type == GgmlType::kQ8_0) {
-    if (n_tokens <= kVecBatch) {
+    if (!MatrixRows(n_tokens)) {
       Q8Input q;
       return Quantize(x, n_tokens, w.cols, &q, error_msg) &&
              Dense(w, q, out, error_msg);
@@ -673,7 +690,7 @@ bool Executor::Dense(const DeviceTensor& w, const float* x, float* out,
     }
     return true;
   }
-  if (n_tokens <= kVecBatch) {
+  if (!MatrixRows(n_tokens)) {
     SmallGemm(w.data, SmallType(w.type), x, out, n_tokens, w.rows, w.cols,
               stream_);
     return true;
@@ -735,7 +752,7 @@ bool Executor::RouteHints(std::uint32_t n_tokens,
   routed_pair_tiles_ = 0;
   routed_pair_offset_ = 0;
   routed_pair_rows_ = 64;
-  if (n_tokens <= 4 * kVecBatch) {
+  if (!ExpertMatrixRows(n_tokens)) {
     return true;
   }
   if (!Check(hipEventSynchronize(counts_ready_), "expert counts", error_msg)) {
@@ -806,7 +823,7 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
   // projection (top-k rows, one expert each) stays on them as well.
   // Verification keeps the same quantization and reduction as single-token
   // decoding even when top-k expansion produces more than 32 slot rows.
-  const bool tiled = n_rows > 4 * kVecBatch && n_tokens > kVecBatch;
+  const bool tiled = n_rows > 4 * kVecBatch && MatrixRows(n_tokens);
   if (tiled) {
     RoutedHints(w, n_tokens);
   }
@@ -845,7 +862,7 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
                             std::string* error_msg) const {
   const bool same_shape = a.type == b.type && a.rows == b.rows &&
                           a.cols == b.cols && a.experts == b.experts;
-  if (n_tokens <= kVecBatch && n_used <= 32 && same_shape &&
+  if (!MatrixRows(n_tokens) && n_used <= 32 && same_shape &&
       (a.type == GgmlType::kQ4_K || a.type == GgmlType::kQ5_K ||
        a.type == GgmlType::kQ8_0)) {
     if (qfn_mmq_moe_gated_vec(
@@ -858,7 +875,7 @@ bool Executor::GatedExperts(const DeviceTensor& a, const DeviceTensor& b,
     }
     return true;
   }
-  if (n_tokens <= 4 * kVecBatch && same_shape) {
+  if (!ExpertMatrixRows(n_tokens) && same_shape) {
     if (qfn_mmq_moe_vec(static_cast<int>(a.type), a.data, x, ids, out,
                         static_cast<int>(a.rows), static_cast<int>(a.cols),
                         static_cast<int>(n_tokens), static_cast<int>(a.experts),
@@ -895,7 +912,7 @@ void Executor::Combine(float* res, const float* gamma,
   // same norm quantized into the tiled Q8 layout for its W8A8 down
   // projection: half the bytes for the combine and the epilogue, and no
   // separate activation pass for the projection.
-  xn_half_ = wide_mixer_ && n_tokens > kVecBatch && gamma != nullptr;
+  xn_half_ = wide_mixer_ && MatrixRows(n_tokens) && gamma != nullptr;
   if (moe_pending_) {
     // The MoE epilogue was deferred to this combine (see Moe).
     moe_pending_ = false;
@@ -971,7 +988,7 @@ bool Executor::HcMix(const DeviceMixer& m, const float* res, bool normed,
   const float* xn = s_.xn;
   const bool vectorized =
       xn_half_ ||
-      (n_tokens > kVecBatch && c.hc_count == 4 && c.hidden_size % 4 == 0);
+      (MatrixRows(n_tokens) && c.hc_count == 4 && c.hidden_size % 4 == 0);
   // `mixed` is being rewritten: whatever the input caches held of it is
   // stale. The wide F16 route also emits the F16 and tiled Q8 copies the
   // projections that follow read.
@@ -1150,7 +1167,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
   // Keep the same activation precision across prefill chunk boundaries.
   // The F16 epilogue reuses the F32 output allocation. Switching this
   // projection to Q8 for a short tail changes every subsequent layer.
-  const bool tiled = n_tokens > kVecBatch &&
+  const bool tiled = MatrixRows(n_tokens) &&
                      l.ssm_out.type == GgmlType::kQ8_0 &&
                      n_tokens <= options_.max_batch;
   const bool half_output =
@@ -1164,7 +1181,7 @@ bool Executor::LinearAttention(const DeviceLayer& l, Session::LinearState& s,
                 speculative ? s.state_snapshots : nullptr,
                 speculative ? s.conv_snapshots : nullptr, n_tokens,
                 c.ssm_num_k_heads, c.ssm_num_v_heads, c.ssm_head_dim,
-                c.ssm_conv_kernel, n_tokens > kVecBatch && !speculative,
+                c.ssm_conv_kernel, MatrixRows(n_tokens) && !speculative,
                 convolved, c.rms_eps, stream_, out_half);
   if (!project_output) {
     return true;
@@ -1225,11 +1242,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
           !Dense(l.attn_qkv, x, s_.qg, n_tokens, error_msg)) {
         return false;
       }
-      prepared = PrepareAttention(s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(),
-                                  l.attn_k_norm.f32(), s_.q, s_.attn_gate,
-                                  s.k_cache, s.v_cache, n_tokens, c.num_heads,
-                                  c.num_kv_heads, c.head_dim, c.rotary_dim, pos,
-                                  c.rope_theta, c.rms_eps, stream_, s.rope);
+      prepared = PrepareAttention(
+          s_.qg, l.attn_qkv.rows, l.attn_q_norm.f32(), l.attn_k_norm.f32(),
+          s_.q, s_.attn_gate, s.k_cache, s.v_cache, n_tokens, c.num_heads,
+          c.num_kv_heads, c.head_dim, c.rotary_dim, pos, c.rope_theta,
+          c.rms_eps, stream_, s.rope, prefill_phase);
       if (!prepared) {
         UnpackQGate(s_.qg, l.attn_qkv.rows, s_.q, s_.attn_gate, s_.k, s_.v,
                     n_tokens, c.num_heads, c.head_dim, kv_row, stream_);
@@ -1316,7 +1333,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
                           "draft attention output initialization", error_msg)) {
     return false;
   }
-  if (n_tokens > kVecBatch &&
+  if (MatrixRows(n_tokens) &&
       WmmaCausalAttention(s_.q, s_.attn_gate, s.k_cache, s.v_cache, mask,
                           mask_words_, s_.ctx, n_tokens, start_pos, c.num_heads,
                           c.num_kv_heads, c.head_dim, c.compress_ratio, stream_,
@@ -1326,7 +1343,7 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
   }
   // Narrow batches split each row's key tiles over kAttnSplits blocks so a
   // decode step at depth fills the device.
-  const bool split = n_tokens <= kVecBatch;
+  const bool split = !MatrixRows(n_tokens);
   rocm::Attention(s_.q, s.k_cache, s.v_cache, mask, mask_words_, s_.ctx,
                   split ? s_.attn_partials : nullptr, kAttnSplits, n_tokens,
                   pos, c.num_heads, c.num_kv_heads, c.head_dim,
@@ -1347,7 +1364,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   }
   RouterTopK(s_.router, c.num_experts + 1, s_.ids, s_.weights, n_tokens,
              c.num_experts, used, stream_);
-  if (n_tokens > 4 * kVecBatch) {
+  if (ExpertMatrixRows(n_tokens)) {
     ExpertCounts(s_.ids, s_.expert_counts, n_tokens, c.num_experts, used,
                  stream_);
     if (!Check(hipMemcpyAsync(counts_host_, s_.expert_counts,
@@ -1373,7 +1390,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
   // Tiled batches take the WMMA route: assignments compacted by expert
   // into 16-row padded buckets, token rows narrowed to F16 once, then the
   // F16 matrix-core GEMM per (expert, row tile).
-  const bool wmma_experts = n_tokens > 4 * kVecBatch &&
+  const bool wmma_experts = ExpertMatrixRows(n_tokens) &&
                             (l.ffn_gate_exps.type == GgmlType::kQ4_K ||
                              l.ffn_gate_exps.type == GgmlType::kQ5_K) &&
                             l.ffn_up_exps.type == l.ffn_gate_exps.type &&
@@ -1466,7 +1483,7 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                          c.num_experts + 1, out, n_tokens, used, c.hidden_size,
                          stream_);
     }
-  } else if (n_tokens > kVecBatch) {
+  } else if (MatrixRows(n_tokens)) {
     MoeEpilogueVec4(s_.down_e, s_.weights, s_.shexp_out,
                     s_.router + c.num_experts, c.num_experts + 1, out, n_tokens,
                     used, c.hidden_size, stream_);
@@ -1596,8 +1613,10 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
 }
 
 bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
-                       std::uint32_t n_logits, float* logits, bool speculative,
+                       std::uint32_t n_logits, float* logits, ForwardMode mode,
                        std::string* error_msg) const {
+  const bool speculative = mode == ForwardMode::kVerify;
+  PrefillPhase phase(mode == ForwardMode::kPrefill);
   selected_logits_ = nullptr;
   const Config& c = config();
   const auto n = static_cast<std::uint32_t>(tokens.size());
@@ -1650,7 +1669,8 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   // Decode-sized batches replay as graphs; a pooling backlog (the first
   // batch past the budget) needs the wider eager grid.
   const std::uint32_t graph_pool_grid = n / std::max(c.compress_ratio, 1u) + 1;
-  const bool graph = n <= kVecBatch && pool_grid <= graph_pool_grid &&
+  const bool graph = !prefill_phase && n <= kVecBatch &&
+                     pool_grid <= graph_pool_grid &&
                      session.position_ >= session.VisionLayout().PrefixLength();
   const std::uint64_t key = static_cast<std::uint64_t>(n) |
                             (static_cast<std::uint64_t>(n_logits) << 16) |
@@ -1771,6 +1791,7 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
     return false;
   }
   if (n_logits > 0) {
+    PrefillPhase head_phase(false);
     // The head mixer norms its tail rows itself: the last combine's norm is
     // laid out for the whole batch (and tiled on the wide route), so a row
     // offset into it is not addressable.

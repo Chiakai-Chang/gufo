@@ -176,7 +176,8 @@ int main(int argc, char** argv) {
     std::vector<float> out(static_cast<std::size_t>(rows) * c.vocab_size);
     if (!executor->Forward(
             *session, std::span<const std::int32_t>(tokens.data() + off, n),
-            rows, out.data(), false, &error)) {
+            rows, out.data(), q::rocm::Executor::ForwardMode::kPrefill,
+            &error)) {
       std::fprintf(stderr, "prefill failed: %s\n", error.c_str());
       return 1;
     }

@@ -411,8 +411,8 @@ bool Session::DraftCatchUp(std::int32_t next_token, bool propose,
   return true;
 }
 
-bool Session::Feed(std::span<const std::int32_t> tokens,
-                   std::string* error_msg) {
+bool Session::Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
+                   bool prefill) {
   rocm::Executor& exec = *model_->executor_;
   for (std::size_t off = 0; off < tokens.size(); off += exec.max_batch()) {
     const std::size_t n =
@@ -422,7 +422,9 @@ bool Session::Feed(std::span<const std::int32_t> tokens,
         !DraftCatchUp(chunk[0], false, error_msg)) {
       return false;
     }
-    if (!exec.Forward(*session_, chunk, 1, logits_.data(), false, error_msg)) {
+    const auto mode = prefill ? rocm::Executor::ForwardMode::kPrefill
+                              : rocm::Executor::ForwardMode::kDecode;
+    if (!exec.Forward(*session_, chunk, 1, logits_.data(), mode, error_msg)) {
       return false;
     }
     hidden_base_ = static_cast<std::uint32_t>(tokens_.size());
@@ -455,7 +457,7 @@ bool Session::Sync(std::span<const std::int32_t> prompt,
     Reset();
     common = 0;
   }
-  return Feed(prompt.subspan(common), error_msg);
+  return Feed(prompt.subspan(common), error_msg, true);
 }
 
 bool Session::Evaluate(std::int32_t token, std::string* error_msg) {
@@ -697,9 +699,11 @@ bool Session::DecodeStep(std::size_t max_tokens,
   float* logits = !pending.speculative       ? logits_.data()
                   : pending.gpu_verification ? nullptr
                                              : verify_logits_.data();
-  if (!model_->executor_->Forward(*session_, pending.chain,
-                                  pending.chain.size(), logits,
-                                  pending.speculative, error_msg)) {
+  if (!model_->executor_->Forward(
+          *session_, pending.chain, pending.chain.size(), logits,
+          pending.speculative ? rocm::Executor::ForwardMode::kVerify
+                              : rocm::Executor::ForwardMode::kDecode,
+          error_msg)) {
     return false;
   }
   return FinishDecode(request, pending, error_msg);

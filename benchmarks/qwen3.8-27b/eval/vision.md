@@ -89,9 +89,10 @@ input handling or persistence.
 Flash-Next's maintained continuation fixture requires **identical full logits**
 for bulk prefill, incremental prefill and restored cache state. Its router and
 recurrent-gate projections keep one accumulation order when rows move between
-chunks. Prefill retains F16 SSM output activations, and attention accumulates
-each query's final partial tile using only visible keys. Tests cover unaligned
-boundaries, full-model continuations through 4096 tokens, and FP64 operator
+chunks. Prompt projections and normalization retain their arithmetic even for
+one-token tails. Prefill retains F16 SSM output activations, and attention
+accumulates each query's final partial tile using only visible keys. Tests cover
+unaligned boundaries, full-model continuations through 4096 tokens, and FP64 operator
 controls.
 This does not establish bit-identical output between prefill and token-at-a-time
 kernels, which use different arithmetic routes.

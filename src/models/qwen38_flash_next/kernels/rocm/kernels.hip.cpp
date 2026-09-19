@@ -4358,7 +4358,8 @@ void HcCombineF16(float* res, const float* block_out, const float* inject,
                   std::uint32_t inject_parts, const float* gamma, __half* xn,
                   void* xn_q8, std::uint32_t n_tokens, std::uint32_t hidden,
                   std::uint32_t streams, float eps, hipStream_t stream) {
-  if (n_tokens >= 16 && streams == 4 && hidden % 128 == 0 && hidden <= 2560) {
+  // F16 prefill keeps the same reduction even for a one-token tail.
+  if (streams == 4 && hidden % 128 == 0 && hidden <= 2560) {
     hipLaunchKernelGGL(HcCombineVec4Kernel<__half>, dim3(n_tokens),
                        dim3(kThreads), 0, stream, res, block_out, inject,
                        inject_parts, gamma, xn, xn_q8, hidden, eps);
@@ -5529,7 +5530,7 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
                       std::uint32_t kv_heads, std::uint32_t d,
                       std::uint32_t rotary_dim, const std::uint32_t* start_pos,
                       float theta, float eps, hipStream_t stream,
-                      const qwen::vision::DeviceRope* rope) {
+                      const qwen::vision::DeviceRope* rope, bool prefill) {
   if (d == 0 || d > 256 || rotary_dim == 0 || rotary_dim > d ||
       rotary_dim % 2 != 0 || heads == 0 || kv_heads == 0 ||
       stride < static_cast<std::size_t>(2) * (heads + kv_heads) * d) {
@@ -5537,7 +5538,7 @@ bool PrepareAttention(const float* packed, std::uint32_t stride,
   }
   if (n_tokens == 0)
     return true;
-  if (n_tokens < 32) {
+  if (!prefill && n_tokens < 32) {
     hipLaunchKernelGGL((PrepareAttentionKernel<1>),
                        dim3(n_tokens, heads + kv_heads), dim3(kThreads), 0,
                        stream, packed, stride, q_gamma, k_gamma, q, gate,

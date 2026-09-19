@@ -486,7 +486,30 @@ int main() {
         }
       }
     }
-    std::cout << "HC mixed F16/Q8 and inject outputs work independently\n";
+    for (const std::uint32_t chunk : {1U, 8U, 9U, 16U}) {
+      Upload(&d_res_f16, res);
+      Upload(&d_inject_vec, inject_vec);
+      for (std::uint32_t off = 0; off < kTokens; off += chunk) {
+        q::HcCombineF16(
+            d_res_f16.get() + std::size_t(off) * kHcDim,
+            d_block_out.get() + std::size_t(off) * kHidden,
+            d_inject_vec.get() + std::size_t(off) * kStreams * vec_parts,
+            vec_parts, d_gamma.get(),
+            d_xn_f16.get() + std::size_t(off) * kHcDim, nullptr,
+            std::min(chunk, kTokens - off), kHidden, kStreams, kEps, nullptr);
+      }
+      CheckHip(hipDeviceSynchronize(), "short HC prefill");
+      const auto actual_res = Download(&d_res_f16, kRows);
+      std::vector<__half> actual_norm(kRows);
+      CheckHip(hipMemcpy(actual_norm.data(), d_xn_f16.get(),
+                         kRows * sizeof(__half), hipMemcpyDeviceToHost),
+               "short HC norm");
+      if (actual_res != res_f16 ||
+          std::memcmp(actual_norm.data(), xn_f16.data(),
+                      kRows * sizeof(__half)) != 0)
+        throw std::runtime_error("HC prefill depends on chunk width");
+    }
+    std::cout << "HC mixed outputs and short prefill chunks passed\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

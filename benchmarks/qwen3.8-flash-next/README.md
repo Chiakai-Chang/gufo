@@ -18,12 +18,12 @@ use the same 34,817-token context capacity. MTP PP includes draft catch-up.
 
 | Depth | AR pp2048 | MTP pp2048 | AR tg128 | MTP tg128 |
 | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1504.43 | 1531.14 | 26.13 | 46.25 |
+| 0 | 1556.12 | 1531.43 | 26.36 | 50.76 |
 | 4096 | TODO | TODO | TODO | TODO |
 | 8192 | TODO | TODO | TODO | TODO |
 | 12288 | TODO | TODO | TODO | TODO |
 | 16384 | TODO | TODO | TODO | TODO |
-| 32768 | 1408.86 | 1363.98 | 24.15 | 58.40 |
+| 32768 | 1419.46 | 1371.32 | 24.10 | 58.76 |
 | 65536 | TODO | TODO | TODO | TODO |
 | 131072 | TODO | TODO | TODO | TODO |
 
@@ -98,7 +98,9 @@ storage. Concurrent logit scratch is allocated on first use and sized for the
 configured verification width; C1 needs none.
 
 Internal prefill chunks use 2048 tokens. HTTP accepts arbitrary prompt lengths
-and yields between chunks. PLE reads and routing-count downloads overlap GPU
+and yields between chunks. Prompt projections and normalization keep the same
+arithmetic even for a one-token tail; decode and verification retain their
+dedicated paths. PLE reads and routing-count downloads overlap GPU
 work. Prefill fuses SSM convolution and attention preparation into projections.
 Headless MTP catch-up retains all KV rows and computes only the final attention
 query tile, preserving the carried hidden state.
@@ -142,13 +144,16 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]projectio
   slots. Router and recurrent-gate projections require exact results across
   prefill chunk boundaries, including unaligned rows, and pass FP64 controls.
   Attention checks include deep contexts and
-  exact agreement between full and final-tile catch-up. Indexer masks match a
+  exact agreement between full and final-tile catch-up. Attention preparation
+  and mHC normalization must also match across short prompt chunks.
+  Indexer masks match a
   CPU full sort. N-gram reads cover cold/cache/mixed paths and I/O failures.
 - **Model state:** `qwen38_flash_next_session_test` checks full logits, tokens,
   RNG and acceptance against serial execution at C2/C4/C6/C8, including ragged
   budgets, reordered requests, a 4K boundary and complete snapshot bytes.
   Bulk and split prefill must produce identical full logits at maintained
-  unaligned boundaries through 4096 tokens. Use `--prefill-only` for this
+  unaligned boundaries through 4096 tokens, including tails of 1, 8, 9, 32
+  and 33 tokens. Use `--prefill-only` for this
   focused check; image continuations also compare cold, RAM-cached and
   disk-restored sessions.
   Sampled cycles must exercise acceptance and rejection, preserving penalty
@@ -164,7 +169,7 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]projectio
 - **Qualification:** scheduling/fusion changes must preserve operator rounding
   and model replay. Arithmetic changes additionally need CPU/reference probes
   and `gufo bench --validate-prefill N`. The current 1024-token prefill check has
-  finite logits, scalar-winner rank 1, RMSE 0.23 and maximum error 1.22. Snapshot
+  finite logits, scalar-winner rank 1, RMSE 0.20 and maximum error 1.48. Snapshot
   compatibility changes when inference arithmetic changes.
 
 Measure retained changes with Nix release binaries and the same artifact,

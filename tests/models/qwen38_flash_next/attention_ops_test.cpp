@@ -202,6 +202,29 @@ void CheckPreparation(std::uint32_t n, std::uint32_t start,
     same(v_ref.get() + first * kKvWidth, v_out.get() + first * kKvWidth, window,
          "value cache", replay);
   }
+  if (n >= 32) {
+    // Each small prefill piece must match the full preparation, including
+    // normalization rounding and absolute rotary positions.
+    for (const std::uint32_t chunk : {1U, 8U, 9U, 16U, 32U}) {
+      for (std::uint32_t off = 0; off < n; off += chunk) {
+        Upload(&pos, std::vector<std::uint32_t>{start + 1 + off});
+        if (!q::PrepareAttention(
+                packed.get() + std::size_t(off) * stride, stride, q_gamma.get(),
+                k_gamma.get(), q_out.get() + std::size_t(off) * kQWidth,
+                gate_out.get() + std::size_t(off) * kQWidth, k_out.get(),
+                v_out.get(), std::min(chunk, n - off), kHeads, kKvHeads, kDim,
+                rotary, pos.get(), 1e7F, 1e-6F, nullptr, nullptr, true))
+          throw std::runtime_error("prefill preparation rejected a short tail");
+      }
+      CheckHip(hipDeviceSynchronize(), "short prefill preparation");
+      same(q_ref.get(), q_out.get(), count, "prefill queries", chunk);
+      same(gate_ref.get(), gate_out.get(), count, "prefill gates", chunk);
+      same(k_ref.get(), k_out.get(), cache_rows * kKvWidth, "prefill keys",
+           chunk);
+      same(v_ref.get(), v_out.get(), cache_rows * kKvWidth, "prefill values",
+           chunk);
+    }
+  }
   std::cout << "attention preparation n=" << n << " start=" << start
             << " rotary=" << rotary << ": exact, including graph positions\n";
 }

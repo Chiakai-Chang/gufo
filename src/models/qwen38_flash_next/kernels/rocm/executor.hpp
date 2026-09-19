@@ -133,16 +133,19 @@ public:
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       std::uint32_t max_context, std::string* error_msg = nullptr) const;
 
+  enum class ForwardMode { kDecode, kVerify, kPrefill };
+
   /// Appends `tokens` (at most max_batch) to the session and returns the
   /// logits of the last `n_logits` tokens in `logits` (n_logits * vocab
   /// floats, host memory). A null `logits` keeps the rows on the GPU for
   /// verification. The final wide residual of those tokens stays on
-  /// the device for MtpForward. With `speculative` set (batch at most
-  /// max_speculative) the batch can be cut back with Rollback.
+  /// the device for MtpForward. kVerify permits Rollback (at most
+  /// max_speculative rows). kPrefill uses consistent prompt arithmetic at
+  /// every chunk width.
   [[nodiscard]] bool Forward(Session& session,
                              std::span<const std::int32_t> tokens,
                              std::uint32_t n_logits, float* logits,
-                             bool speculative, std::string* error_msg) const;
+                             ForwardMode mode, std::string* error_msg) const;
 
   struct BatchItem {
     Session* session;

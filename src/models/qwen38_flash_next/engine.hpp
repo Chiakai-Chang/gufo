@@ -168,7 +168,7 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 8;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 9;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent
@@ -186,7 +186,8 @@ private:
   friend class Model;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 
-  bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg);
+  bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
+            bool prefill = false);
   /// Trunk rows the draft block may still read: [hidden_base_, size).
   [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
   bool DraftCatchUp(std::int32_t next_token, bool propose,
