@@ -105,7 +105,7 @@ def compare(args) -> dict:
     if hashlib.sha256(args.upstream.read_bytes()).hexdigest() != UPSTREAM_SHA256:
         raise ValueError("upstream model.py does not match the pinned source")
     upstream = module("dflash_upstream", args.upstream)
-    codec = module("gufo_gguf", ROOT / "tools/quant/gufo-gguf.py")
+    codec = module("gufo_gguf", ROOT / "tools/gufo/gguf.py")
     weights = Weights(args.draft, codec)
     meta = json.loads((args.trace / "trace.json").read_text())
     config = upstream.Qwen3Config(**json.loads(args.config.read_text()))

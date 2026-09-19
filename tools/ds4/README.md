@@ -17,7 +17,7 @@ are in [the DS4 benchmark README](../../benchmarks/deepseek-v4-flash/README.md).
 | `result/bin/gufo bench -c 1,2,4 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v --temperature 0.6 --top-p 0.95 --seed 7` | Filtered sampled sweep; C1 retains AR seed identity, while C>1 uses exact probabilistic proposals |
 | `tools/ds4/check.py benchmark --concurrency 1,2,4 --temperature 0.6 --top-p 0.95 --seed 7 --ar-log /tmp/ar-t06.log --dspark-log /tmp/dspark-t06.log --output /tmp/bench-t06.json` | Repeated output/counters, AR identity for point-mass cohorts, acceptance and proposal policy |
 | `tools/serving/gufo-serving-bench.py` | Shared HTTP concurrency, scheduling, and acceptance measurement |
-| `tools/quant/speculative-corpus.py` | Shared AR/speculative text comparison on the fixed corpus |
+| `tools/bench/speculative-corpus.py` | Shared AR/speculative text comparison on the fixed corpus |
 | `tools/prof/prof.py` | Shared rocprofv3 capture, rollup, and A/B diff |
 
 The attention oracle also supports isolated timing with the production

@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
-SCRIPT = ROOT / "tools" / "quant" / "speculative-corpus.py"
+SCRIPT = ROOT / "tools" / "bench" / "speculative-corpus.py"
 SPEC = importlib.util.spec_from_file_location("speculative_corpus", SCRIPT)
 if SPEC is None or SPEC.loader is None:
     raise RuntimeError("failed to load speculative corpus module")

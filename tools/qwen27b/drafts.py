@@ -101,7 +101,7 @@ def main() -> int:
                     label = f"{prefix}{target}-{draft}-r{repetition + 1}"
                     report_path = (args.output / f"{label}.json").resolve()
                     command = [
-                        sys.executable, str(ROOT / "tools/quant/speculative-corpus.py"),
+                        sys.executable, str(ROOT / "tools/bench/speculative-corpus.py"),
                         "--binary", str(binary),
                         "--model", str(artifacts[f"target_{target}"]),
                         "--draft-model", str(artifacts[f"draft_{draft}"]),

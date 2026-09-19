@@ -36,7 +36,7 @@
       # dependency of the server (see tools/README.md for the offline toolchain).
       # Unified python313 + torchWithRocm: every Strix Halo box ships ROCm, so
       # the single toolchain serves CPU flows and the --device cuda
-      # calibration forward alike. gfx1151 verified on this host.
+      # reference forward alike. gfx1151 verified on this host.
       pythonTools = system:
         let pt = pkgs.${system}.python313; in
         pt.withPackages (
@@ -120,7 +120,7 @@
         system:
         {
           # Unified toolchain (CPU + ROCm torch): one default shell serves all
-          # offline CPU flows and the --device cuda calibration forward.
+          # offline CPU flows and the ROCm reference forward.
           default = pkgs.${system}.mkShell {
             inputsFrom = [ self.packages.${system}.default ];
             packages = [
@@ -227,7 +227,7 @@
               ".clang-format"
               "CMakeLists.txt"
               "tools/prof/prof.py"
-              "tools/quant/speculative-corpus.py"
+              "tools/bench/speculative-corpus.py"
             ];
           };
 

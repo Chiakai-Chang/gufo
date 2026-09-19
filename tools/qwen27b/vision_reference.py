@@ -116,7 +116,7 @@ def source_model(source, output_width):
 
 
 def load_weights(path, source):
-    spec = importlib.util.spec_from_file_location("vision_gguf", ROOT / "tools/quant/gufo-gguf.py")
+    spec = importlib.util.spec_from_file_location("vision_gguf", ROOT / "tools/gufo/gguf.py")
     codec = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(codec)
     metadata = codec.parse_gguf(path)

@@ -13,7 +13,7 @@ drafts = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(drafts)
 
 gguf_spec = importlib.util.spec_from_file_location(
-    "gufo_gguf", ROOT / "tools/quant/gufo-gguf.py")
+    "gufo_gguf", ROOT / "tools/gufo/gguf.py")
 gguf = importlib.util.module_from_spec(gguf_spec)
 gguf_spec.loader.exec_module(gguf)
 
