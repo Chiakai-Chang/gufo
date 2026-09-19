@@ -22,6 +22,7 @@
 // mistake would not.
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -42,7 +43,6 @@ namespace {
 constexpr std::uint32_t kNumHeads = 24;
 constexpr std::uint32_t kNumKvHeads = 4;
 constexpr std::uint32_t kHeadDim = 256;
-constexpr std::uint32_t kMaxContext = 16384;
 
 class Rng {
 public:
@@ -87,6 +87,8 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
             << " batch=" << batch_size << " lse=" << (want_lse ? "yes" : "no")
             << "\n";
 
+  const auto kMaxContext = std::max<std::uint32_t>(
+      1024, start_pos + static_cast<std::uint32_t>(batch_size) + 64);
   const std::size_t attention_size =
       static_cast<std::size_t>(kNumHeads) * kHeadDim;
   const std::size_t kv_size = static_cast<std::size_t>(kNumKvHeads) * kHeadDim;
@@ -212,6 +214,67 @@ void RunCase(std::uint32_t start_pos, std::size_t batch_size, bool want_lse) {
   }
   std::cout << "  replay: byte-identical over " << q_elements << " elements\n";
 
+  if (start_pos >= 8192) {
+    const std::size_t words = (start_pos + batch_size) * kv_size / 2;
+    std::array<float*, 2> storage{};
+    std::array<std::span<float>, 2> work{};
+    for (std::size_t i = 0; i < storage.size(); ++i) {
+      HIP_CHECK(hipMalloc(&storage[i], (words + 32) * sizeof(float)));
+      HIP_CHECK(hipMemset(storage[i], 0xA5, (words + 32) * sizeof(float)));
+      work[i] = {storage[i] + 16, words};
+    }
+    std::vector<float> lse_expected(lse_elements);
+    if (want_lse)
+      HIP_CHECK(hipMemcpy(lse_expected.data(), d_lse_new,
+                          lse_elements * sizeof(float), hipMemcpyDeviceToHost));
+    for (const bool enough : {true, false}) {
+      for (float* data : storage)
+        HIP_CHECK(hipMemset(data, 0xA5, (words + 32) * sizeof(float)));
+      const auto k_work = enough ? work[0] : work[0].first(words - 1);
+      if (!gufo::hip::LaunchQwenWmmaAttention(
+              d_q, d_k, d_v, d_gate, d_cache, v_cache, d_cache_f16, cache_f16_v,
+              d_out_new, 0, start_pos, batch_size, kMaxContext, kNumHeads,
+              kNumKvHeads, kHeadDim, nullptr, lse_new, 0, true, k_work,
+              work[1]))
+        std::abort();
+      HIP_CHECK(hipDeviceSynchronize());
+      HIP_CHECK(hipMemcpy(again.data(), d_out_new, q_elements * sizeof(float),
+                          hipMemcpyDeviceToHost));
+      if (std::memcmp(again.data(), got.data(), q_elements * sizeof(float)) !=
+          0)
+        std::abort();
+      if (want_lse) {
+        std::vector<float> actual(lse_elements);
+        HIP_CHECK(hipMemcpy(actual.data(), d_lse_new,
+                            lse_elements * sizeof(float),
+                            hipMemcpyDeviceToHost));
+        if (actual != lse_expected)
+          std::abort();
+      }
+      for (float* data : storage) {
+        std::array<std::uint8_t, 64> first{};
+        HIP_CHECK(hipMemcpy(first.data(), data + 16, first.size(),
+                            hipMemcpyDeviceToHost));
+        const bool untouched = std::all_of(
+            first.begin(), first.end(), [](auto byte) { return byte == 0xA5; });
+        if (untouched == (enough && batch_size >= 1024))
+          std::abort();
+        for (std::size_t off : {std::size_t{0}, words + 16}) {
+          std::array<std::uint8_t, 64> guard{};
+          HIP_CHECK(hipMemcpy(guard.data(), data + off, guard.size(),
+                              hipMemcpyDeviceToHost));
+          if (!std::all_of(guard.begin(), guard.end(),
+                           [](auto byte) { return byte == 0xA5; }))
+            std::abort();
+        }
+      }
+    }
+    for (float* data : storage)
+      HIP_CHECK(hipFree(data));
+    std::cout << "  contiguous heads: exact output/LSE, bounded scratch and "
+                 "fallback\n";
+  }
+
   if (want_lse) {
     std::vector<float> lref(lse_elements);
     std::vector<float> lgot(lse_elements);
@@ -256,6 +319,10 @@ int main() {
   RunCase(1500, 128, false);
   // The log-sum-exp path, which also suppresses the gate.
   RunCase(1024, 256, true);
+  RunCase(8192, 100, false);
+  RunCase(8192, 1023, false);
+  RunCase(8192, 1024, false);
+  RunCase(32781, 1025, true);
 
   std::cout << "Qwen WMMA prefill attention ops test passed on gfx1151.\n";
   return 0;

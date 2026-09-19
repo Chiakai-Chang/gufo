@@ -71,6 +71,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
     throw std::length_error("prompt chunk exceeds the GPU batch length");
   }
   auto scratch = arena_.GetScratchView(batch_size);
+  const auto attention_workspace =
+      arena_.GetScratchView(arena_.GetMaxBatch()).ffn;
   const std::size_t target_layer_count = arena_.GetTargetLayerCapture().size();
   const std::size_t prompt_capture_offset = h_prompt_hidden_.size();
   if (capture_prompt_hidden_ && target_layer_count > 0) {
@@ -331,7 +333,8 @@ tokenization::TokenId QwenGpuExecutor::ForwardPromptChunk(
           arena_.GetMaxContext(), config.num_attention_heads,
           config.num_key_value_heads, config.head_dim, arena_.stream,
           /*lse_out=*/nullptr, /*key_begin=*/0,
-          /*skip_kv_write=*/kv_already_written);
+          /*skip_kv_write=*/kv_already_written, attention_workspace.gate,
+          attention_workspace.up);
       if (wmma_attention) {
         detail::EmitAttentionDispatch("prefill_wmma", "");
       }

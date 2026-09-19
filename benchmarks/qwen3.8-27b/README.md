@@ -8,8 +8,8 @@ remain supported; a full comparison across context depths is **TODO**.
 PNG/JPEG image input uses the matching BF16 projector with AR, DFlash2 or
 native MTP. [CLI/HTTP usage and vision quality checks](eval/vision.md).
 
-Tables show the latest qualified release measurements. C1/C4 repetition was
-rechecked on the current release; the remaining performance refresh is **TODO**.
+Each table identifies its workload and measurement date. Unmeasured points
+are **TODO**; the concurrency sweep still needs a performance refresh.
 
 ## Single user, autoregressive
 
@@ -18,20 +18,39 @@ Standard sweep: **pp2048 / tg128**, C1. Cells are prefill / generation tok/s.
 
 | Context depth | Q4 | Q8 |
 | ---: | ---: | ---: |
-| 0 | **610.56** / TODO | **503.17** / TODO |
+| 0 | **619.82 / 11.66** | **510.39 / 7.07** |
 | 4,096 | TODO | TODO |
 | 8,192 | TODO | TODO |
 | 12,288 | TODO | TODO |
 | 16,384 | TODO | TODO |
+| 32,768 | **451.81 / 10.23** | **388.38 / 6.53** |
 
-Prefill measured with 12 warmed release samples for Q4 (2026-09-14) and
-two for Q8 (2026-09-13).
+Measured **2026-09-19**, one warmed release sample per point.
 Q4 uses FP16 activations with packed quantized weights; Q8 retains native wave64.
+At depth, large prefill chunks temporarily group existing KV bytes by head in
+idle FFN scratch. Small chunks read the canonical cache directly. This adds no
+persistent allocation and leaves cache contents and attention arithmetic intact.
 
 ## Single user, DFlash2
 
-Short control, **2026-09-16**: cached `prose_tides`, **tg64**, adaptive,
-greedy C1, one warmed release sample per draft. Generation tok/s:
+**pp2048 / tg128**, C1, greedy, Q4_K_M draft and adaptive controller.
+Cells are prefill / generation tok/s. Measured **2026-09-19**:
+one warmed sample at d0, two at d32768.
+
+| Context depth | Q4 target | Q8 target |
+| ---: | ---: | ---: |
+| 0 | **571.53 / 34.12** | **473.36 / 24.63** |
+| 4,096 | TODO | TODO |
+| 8,192 | TODO | TODO |
+| 12,288 | TODO | TODO |
+| 16,384 | TODO | TODO |
+| 32,768 | **427.74 / 30.75** | **372.30 / 26.79** |
+
+These repetitive CLI inputs accept 96.5% / 97.4% of proposals at d32768.
+Greedy outputs match AR. Natural prompts have different acceptance and speed.
+
+Draft-precision control, **2026-09-16**: cached `prose_tides`, **tg64**,
+adaptive, greedy C1, one warmed release sample per draft. Generation tok/s:
 
 | Draft | Q4 target | Q8 target |
 | --- | ---: | ---: |
@@ -39,8 +58,7 @@ greedy C1, one warmed release sample per draft. Generation tok/s:
 | Q8_0 | 22.66 | 15.33 |
 | BF16 | 21.96 | 14.11 |
 
-pp2048/tg128 at depths **0 / 4,096 / 8,192 / 12,288 / 16,384**,
-for Q4 and Q8 targets: **TODO**. MTP performance: **TODO**.
+Full depth comparison across all three drafts and MTP performance: **TODO**.
 [Prompts, artifact identities and quality checks](eval/README.md).
 
 ## Multiple users, autoregressive
@@ -119,8 +137,8 @@ distribution and reproduce seeded runs within the same configuration.
 Independent original-target/MTP qualification and the full context/concurrency
 sweep: **TODO**.
 
-Current optimization target: **Q4 and Q8 generation at C2, C4, C6 and C8,
-with and without DFlash2**. C1 must retain its performance. Track aggregate
+Optimization targets: **prefill scaling with context, and Q4/Q8 generation
+at C2, C4, C6 and C8 with and without DFlash2**. C1 must retain its performance. Track aggregate
 throughput, per-user latency, physical batch width, output correctness and
 seeded sampling at every concurrency level. Screen changes with short runs;
 check retained changes across C1/2/4/6/8 before publishing speed.

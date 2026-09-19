@@ -138,7 +138,9 @@ void LaunchBatchedFusedQKNormRoPEKvWrite(
     std::size_t batch_size, std::uint32_t max_context, std::uint32_t num_heads,
     std::uint32_t num_kv_heads, std::uint32_t head_dim,
     hipStream_t stream = nullptr, float* lse_out = nullptr,
-    std::uint32_t key_begin = 0, bool skip_kv_write = false);
+    std::uint32_t key_begin = 0, bool skip_kv_write = false,
+    std::span<float> packed_k_workspace = {},
+    std::span<float> packed_v_workspace = {});
 
 /// Causal GQA through ROCm Composable Kernel. Inputs and outputs remain FP32
 /// at the executor boundary; the fused attention operator uses FP16 tiles with
