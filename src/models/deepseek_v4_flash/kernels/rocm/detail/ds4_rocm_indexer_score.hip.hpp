@@ -67,18 +67,49 @@ __global__ static void indexer_pack_keys_kernel(const float* keys,
     packed[i] = __float2half_rn(i < uint64_t(count) * 128u ? keys[i] : 0.0F);
 }
 
-// Each wave keeps its eight key fragments across all 64 query heads. This
-// removes the 32 KiB shared key tile and repeated fragment loads. The fallback
-// handles callers without sufficient temporary storage; both routes preserve
-// the same K16 products and head reduction order.
+__global__ static void indexer_pack_queries_kernel(const float* q,
+                                                   __half* packed,
+                                                   uint32_t tokens) {
+  __shared__ __half tile[128][18];
+  // Adjacent blocks visit adjacent heads in the source token rows.
+  const uint32_t tid = threadIdx.x, token0 = blockIdx.y * 16, h = blockIdx.x;
+  for (uint32_t i = tid; i < 512; i += 256) {
+    const uint32_t row = i / 32, d = (i % 32) * 4;
+    const float4 x = token0 + row < tokens
+                         ? *reinterpret_cast<const float4*>(
+                               q + (uint64_t(token0 + row) * 64 + h) * 128 + d)
+                         : make_float4(0, 0, 0, 0);
+    tile[d][row] = __float2half_rn(x.x);
+    tile[d + 1][row] = __float2half_rn(x.y);
+    tile[d + 2][row] = __float2half_rn(x.z);
+    tile[d + 3][row] = __float2half_rn(x.w);
+  }
+  __syncthreads();
+  const uint32_t d = tid / 2, row = (tid % 2) * 8;
+  union {
+    uint4 packed;
+    __half halves[8];
+  } value;
+#pragma unroll
+  for (uint32_t i = 0; i < 8; ++i)
+    value.halves[i] = tile[d][row + i];
+  *reinterpret_cast<uint4*>(packed + (uint64_t(blockIdx.y) * 64 + h) * 2048 +
+                            d * 16 + row) = value.packed;
+}
+
+// Each wave keeps its eight key fragments across all 64 query heads. Packed
+// queries feed WMMA directly, avoiding per-head LDS staging and barriers.
+// Callers without enough scratch retain the shared-memory route. Both use
+// the same F16 operands, K16 products and head reduction order.
 template<bool kCached>
 __global__ static void indexer_scores_wmma128_kernel(
-    float* scores, const float* q, const float* weights,
+    float* scores, const void* query_input, const float* weights,
     const void* index_input, uint32_t n_comp, uint32_t n_tokens, uint32_t pos0,
     uint32_t n_head, uint32_t head_dim, uint32_t ratio, float scale,
     int causal) {
 #if defined(__HIP_DEVICE_COMPILE__)
   namespace wmma = rocwmma;
+  const auto* q = static_cast<const float*>(query_input);
   const auto* index_comp = static_cast<const float*>(index_input);
   const uint32_t tile_c = blockIdx.x * 128u;
   const uint32_t tile_t = blockIdx.y * 16u;
@@ -106,7 +137,7 @@ __global__ static void indexer_scores_wmma128_kernel(
   }
 
   constexpr uint32_t QT_PITCH = 18u;
-  __shared__ __half a_sh[2][128 * QT_PITCH];
+  __shared__ __half a_sh[kCached ? 1 : 2][kCached ? 1 : 128 * QT_PITCH];
   __shared__ __half b_sh[kCached ? 1 : 128 * 128];
 
   const uint32_t lane = tid & 31u;
@@ -138,7 +169,8 @@ __global__ static void indexer_scores_wmma128_kernel(
       *reinterpret_cast<uint2*>(&b_sh[d + c * 128u]) = packed;
     }
   }
-  __syncthreads();
+  if constexpr (!kCached)
+    __syncthreads();
 
   const auto stage_q_head = [&](uint32_t h, __half* dst) {
     for (uint32_t i4 = tid; i4 < 16u * 32u; i4 += 256u) {
@@ -168,15 +200,18 @@ __global__ static void indexer_scores_wmma128_kernel(
                                  step * 16u,
                              128);
   }
-  if (n_head != 0u)
-    stage_q_head(0u, a_sh[0]);
-  __syncthreads();
+  if constexpr (!kCached) {
+    if (n_head != 0u)
+      stage_q_head(0u, a_sh[0]);
+    __syncthreads();
+  }
 
   for (uint32_t h = 0; h < n_head; h++) {
     const uint32_t cur = h & 1u;
 
-    if (h + 1u < n_head)
-      stage_q_head(h + 1u, a_sh[cur ^ 1u]);
+    if constexpr (!kCached)
+      if (h + 1u < n_head)
+        stage_q_head(h + 1u, a_sh[cur ^ 1u]);
 
     wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
@@ -189,7 +224,14 @@ __global__ static void indexer_scores_wmma128_kernel(
         a_frag = keys[k0 / 16u];
       else
         wmma::load_matrix_sync(a_frag, b_sh + comp_row0 * 128u + k0, 128);
-      wmma::load_matrix_sync(b_frag, a_sh[cur] + k0 * QT_PITCH, QT_PITCH);
+      if constexpr (kCached)
+        wmma::load_matrix_sync(
+            b_frag,
+            static_cast<const __half*>(query_input) +
+                (uint64_t(tile_t / 16u) * n_head + h) * 128u * 16u + k0 * 16u,
+            16u);
+      else
+        wmma::load_matrix_sync(b_frag, a_sh[cur] + k0 * QT_PITCH, QT_PITCH);
       wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
     }
 
@@ -201,7 +243,8 @@ __global__ static void indexer_scores_wmma128_kernel(
       }
     }
 
-    __syncthreads();
+    if constexpr (!kCached)
+      __syncthreads();
   }
 
   if (token_own < n_tokens) {

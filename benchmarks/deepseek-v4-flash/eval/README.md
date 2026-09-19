@@ -57,8 +57,13 @@ The precise arithmetic cause remains under investigation. Limits are unchanged.
 
 The retained indexer changes preserve all ten full-logit prefill vectors from
 the 2K/4K, five-depth control. Five more vectors match across a 64K disk
-snapshot, continued prefill and subsequent decoding. Independent score formulas,
-156 exact top-k cases and 736 DSpark replay token/frontier comparisons pass.
+snapshot, continued prefill and subsequent decoding. Packing queries for direct
+WMMA reads also preserves five complete vectors across a 32K disk snapshot,
+2K prefill and subsequent decoding. Six complete score matrices match the
+unpacked kernel, including ragged tails and 64K context; independent FP64
+formulas, causal masks and scratch guards pass. The packing launch-order
+control requires identical F16 bytes. All 156 exact top-k cases and 736 DSpark
+replay token/frontier comparisons pass.
 These checks qualify preservation by the indexer changes, not correction of
 the earlier distribution discrepancies.
 

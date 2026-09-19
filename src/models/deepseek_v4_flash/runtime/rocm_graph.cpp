@@ -909,8 +909,8 @@ static bool rocm_graph_alloc_raw_cap(
           ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
       g->batch_indexer_weights =
           ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
-      // Indexer scoring may borrow this range for F16 keys before attention
-      // writes its heads. It is disjoint from the still-live attention Q.
+      // Indexer scoring may borrow this range for F16 keys and queries before
+      // attention writes its heads. It is disjoint from live attention Q.
       g->batch_heads =
           ds4_gpu_tensor_view(g->batch_stage_scratch, q_bytes, q_bytes);
       g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));

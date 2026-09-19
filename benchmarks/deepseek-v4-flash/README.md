@@ -12,33 +12,34 @@ Target: `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-073
 
 ## Single user, autoregressive
 
-Latest depth control: **2026-09-19**, two release measurements at d0/d32K and
-one at d64K. Where repeated, values are mean ± standard deviation; initial
-kernel setup contributes to depth-zero prefill variation.
+Latest depth control: **2026-09-19**, two release measurements at d0/d32K.
+Values are mean ± standard deviation; initial kernel setup contributes to
+depth-zero prefill variation. The final packing layout needs a d64K speed refresh.
 
 | Context depth | pp2048 tok/s | tg128 tok/s |
 | ---: | ---: | ---: |
-| 0 | 459.83 ± 25.33 | 17.72 ± 0.01 |
+| 0 | 450.26 ± 33.18 | 17.74 ± 0.00 |
 | 4,096 | TODO | TODO |
 | 8,192 | TODO | TODO |
 | 12,288 | TODO | TODO |
 | 16,384 | TODO | TODO |
-| 32,768 | 419.31 ± 3.23 | 14.95 ± 0.00 |
-| 65,536 | 381.34 | 13.93 |
+| 32,768 | 422.18 ± 3.61 | 14.86 ± 0.00 |
+| 65,536 | TODO | TODO |
 
 ## Single user, DSpark
 
-Same workload and measurement date. DSpark prefill includes support-state work.
+Same workload and measurement date: two measurements at d0, one at d32K.
+DSpark prefill includes support-state work.
 
 | Context depth | pp2048 tok/s | tg128 tok/s |
 | ---: | ---: | ---: |
-| 0 | 454.77 ± 23.60 | 17.41 ± 0.00 |
+| 0 | 453.49 ± 25.96 | 17.45 ± 0.00 |
 | 4,096 | TODO | TODO |
 | 8,192 | TODO | TODO |
 | 12,288 | TODO | TODO |
 | 16,384 | TODO | TODO |
-| 32,768 | 416.82 ± 2.95 | 35.29 ± 0.01 |
-| 65,536 | 378.90 | 29.88 |
+| 32,768 | 417.80 | 35.30 |
+| 65,536 | TODO | TODO |
 
 The CLI uses a repeating token sequence. Natural prompts can have substantially
 different acceptance and speed. Depth-zero generation starts from 16 tokens;
@@ -92,7 +93,8 @@ The [memory control](memory-c1-262k.json) records these measurements. Target and
 support weights, KV and working buffers all contribute. Compressed KV and score
 scratch grow with actual use. Prefill reuses scratch across ordered stages;
 indexer scoring borrows the idle attention-output range for temporary F16 keys.
-Persistent KV precision is unchanged.
+Queries share that range and feed WMMA directly. Persistent KV precision is
+unchanged.
 
 ## Reproduce
 
@@ -158,7 +160,7 @@ on those cases, not resolution of the existing build-sensitive discrepancy.
 
 ## Current implementation notes
 
-- Prefill indexer scoring reuses F16 key fragments across its 64 heads, preserving the existing products and reduction order.
+- Prefill indexer scoring packs queries once and reuses F16 key fragments across its 64 heads, preserving the existing products and reduction order.
 - Exact partial top-k covers wide prefill through 32,768 compressed keys; deeper inputs use the parallel fallback. Tie ordering is unchanged.
 - Scalar-equivalent speculative projections and attention retain independent request state.
 - Additional F16 rounding in HC and FP32 compressor/router experiments were rejected by the maintained quality controls.

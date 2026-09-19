@@ -316,14 +316,12 @@ __global__ static void indexed_topk_sort_512_asc_kernel(
     dst_row[tid] = rows[tid];
 }
 
-static int indexer_scores_launch(ds4_gpu_tensor* scores,
-                                 const ds4_gpu_tensor* q,
-                                 const ds4_gpu_tensor* weights,
-                                 const ds4_gpu_tensor* index_comp,
-                                 uint32_t n_comp, uint32_t n_tokens,
-                                 uint32_t pos0, uint32_t n_head,
-                                 uint32_t head_dim, uint32_t ratio, float scale,
-                                 uint32_t causal, ds4_gpu_tensor* key_scratch) {
+static int indexer_scores_launch(
+    ds4_gpu_tensor* scores, const ds4_gpu_tensor* q,
+    const ds4_gpu_tensor* weights, const ds4_gpu_tensor* index_comp,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t pos0, uint32_t n_head,
+    uint32_t head_dim, uint32_t ratio, float scale, uint32_t causal,
+    ds4_gpu_tensor* score_scratch) {
   if (!scores || !q || !weights || !index_comp || n_comp == 0 ||
       n_tokens == 0 || n_head == 0 || head_dim == 0 ||
       q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
@@ -345,12 +343,18 @@ static int indexer_scores_launch(ds4_gpu_tensor* scores,
   if (head_dim == 128u && n_head == 64u) {
     dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
     const uint64_t padded = ((uint64_t(n_comp) + 127u) / 128u) * 128u * 128u;
-    if (key_scratch && key_scratch->bytes >= padded * sizeof(__half)) {
-      auto* packed = static_cast<__half*>(key_scratch->ptr);
+    const uint64_t query_elements =
+        ((uint64_t(n_tokens) + 15u) / 16u) * 16u * 64u * 128u;
+    if (score_scratch &&
+        score_scratch->bytes >= (padded + query_elements) * sizeof(__half)) {
+      auto* packed = static_cast<__half*>(score_scratch->ptr);
+      auto* packed_queries = packed + padded;
       indexer_pack_keys_kernel<<<(padded + 255u) / 256u, 256>>>(
           static_cast<const float*>(index_comp->ptr), packed, n_comp, padded);
+      indexer_pack_queries_kernel<<<dim3(64, (n_tokens + 15u) / 16u), 256>>>(
+          static_cast<const float*>(q->ptr), packed_queries, n_tokens);
       indexer_scores_wmma128_kernel<true><<<grid, 256>>>(
-          static_cast<float*>(scores->ptr), static_cast<const float*>(q->ptr),
+          static_cast<float*>(scores->ptr), packed_queries,
           static_cast<const float*>(weights->ptr), packed, n_comp, n_tokens,
           pos0, n_head, head_dim, ratio, scale, causal ? 1 : 0);
     } else {
@@ -386,10 +390,10 @@ extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
     ds4_gpu_tensor* scores, const ds4_gpu_tensor* q,
     const ds4_gpu_tensor* weights, const ds4_gpu_tensor* index_comp,
     uint32_t n_comp, uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
-    uint32_t ratio, float scale, ds4_gpu_tensor* key_scratch) {
+    uint32_t ratio, float scale, ds4_gpu_tensor* score_scratch) {
   return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens,
                                0, n_head, head_dim, ratio, scale, 1,
-                               key_scratch);
+                               score_scratch);
 }
 
 extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
@@ -397,10 +401,10 @@ extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
     const ds4_gpu_tensor* weights, const ds4_gpu_tensor* index_comp,
     uint32_t n_comp, uint32_t n_tokens, uint32_t pos0, uint32_t n_head,
     uint32_t head_dim, uint32_t ratio, float scale,
-    ds4_gpu_tensor* key_scratch) {
+    ds4_gpu_tensor* score_scratch) {
   return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens,
                                pos0, n_head, head_dim, ratio, scale, 1,
-                               key_scratch);
+                               score_scratch);
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(

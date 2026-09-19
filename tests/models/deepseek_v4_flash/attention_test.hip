@@ -224,7 +224,8 @@ void check_indexer_prefill_scores() {
   std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
   for (const auto [rows, tokens, pos0] :
        {Shape{1024, 33, 0}, Shape{513, 17, 2048}, Shape{8704, 33, 32768},
-        Shape{8704, 2048, 32768}, Shape{16385, 17, 65536}}) {
+        Shape{8704, 2048, 32768}, Shape{16385, 17, 65536},
+        Shape{16896, 2048, 65536}}) {
     std::vector<float> q(size_t(tokens) * heads * dim), k(size_t(rows) * dim),
         weights(size_t(tokens) * heads), expected(size_t(tokens) * rows),
         actual(expected.size());
@@ -236,13 +237,16 @@ void check_indexer_prefill_scores() {
     std::fill(k.begin() + size_t(visible_end) * dim, k.end(),
               std::numeric_limits<float>::quiet_NaN());
     const uint64_t padded = ((uint64_t(rows) + 127) / 128) * 128 * dim;
+    const uint64_t query_elements =
+        ((uint64_t(tokens) + 15) / 16) * 16 * heads * dim;
+    const uint64_t scratch_elements = padded + query_elements;
     float *dq, *dk, *dw, *out;
     __half* storage;
     check(hipMalloc(&dq, q.size() * sizeof(float)));
     check(hipMalloc(&dk, k.size() * sizeof(float)));
     check(hipMalloc(&dw, weights.size() * sizeof(float)));
     check(hipMalloc(&out, expected.size() * sizeof(float)));
-    check(hipMalloc(&storage, (padded + 64) * sizeof(__half)));
+    check(hipMalloc(&storage, (scratch_elements + 64) * sizeof(__half)));
     check(hipMemcpy(dq, q.data(), q.size() * sizeof(float),
                     hipMemcpyHostToDevice));
     check(hipMemcpy(dk, k.data(), k.size() * sizeof(float),
@@ -255,12 +259,16 @@ void check_indexer_prefill_scores() {
     check(hipMemcpy(expected.data(), out, expected.size() * sizeof(float),
                     hipMemcpyDeviceToHost));
     for (unsigned repeat = 0; repeat < 2; ++repeat) {
-      check(hipMemset(storage, 0xA5, (padded + 64) * sizeof(__half)));
+      check(hipMemset(storage, 0xA5, (scratch_elements + 64) * sizeof(__half)));
       auto* packed = storage + 32;
+      auto* packed_queries = packed + padded;
       indexer_pack_keys_kernel<<<(padded + 255) / 256, 256>>>(dk, packed, rows,
                                                               padded);
-      indexer_scores_wmma128_kernel<true><<<grid, 256>>>(
-          out, dq, dw, packed, rows, tokens, pos0, heads, dim, ratio, scale, 1);
+      indexer_pack_queries_kernel<<<dim3(heads, (tokens + 15) / 16), 256>>>(
+          dq, packed_queries, tokens);
+      indexer_scores_wmma128_kernel<true>
+          <<<grid, 256>>>(out, packed_queries, dw, packed, rows, tokens, pos0,
+                          heads, dim, ratio, scale, 1);
       check(hipMemcpy(actual.data(), out, actual.size() * sizeof(float),
                       hipMemcpyDeviceToHost));
       if (std::memcmp(expected.data(), actual.data(),
@@ -269,7 +277,7 @@ void check_indexer_prefill_scores() {
                      rows, tokens);
         std::exit(7);
       }
-      for (const auto* guard : {storage, packed + padded}) {
+      for (const auto* guard : {storage, packed + scratch_elements}) {
         uint16_t values[32];
         check(hipMemcpy(values, guard, sizeof(values), hipMemcpyDeviceToHost));
         for (const auto value : values)
@@ -318,7 +326,7 @@ void check_indexer_prefill_scores() {
       check(hipFree(pointer));
     check(hipFree(storage));
   }
-  std::puts("Indexer prefill: five shapes exact, F64, masks and guards passed");
+  std::puts("Indexer prefill: six shapes exact, F64, masks and guards passed");
 }
 
 // Previous production arithmetic, retained only as the bitwise oracle. The
