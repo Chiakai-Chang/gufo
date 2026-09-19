@@ -32,8 +32,6 @@
 namespace gufo::server {
 namespace {
 
-constexpr std::size_t kMaximumPromptBytes = 4096;
-
 bool IsH3Model(std::string_view model) {
   return model == "minimax-h3" || model == "minimax-h3-exact" ||
          model == "minimax-h3-fast" || model == "minimax-h3-aggressive" ||
@@ -785,7 +783,6 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
             .error = initialization_error()};
   }
   if (!IsH3Model(request.model) || request.prompt.empty() ||
-      request.prompt.size() > kMaximumPromptBytes ||
       request.prompt.find('\0') != std::string::npos ||
       (request.seconds != "1" && request.seconds != "5") ||
       (request.output_format != "mp4" && request.output_format != "ppm") ||

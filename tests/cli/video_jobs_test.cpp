@@ -380,10 +380,11 @@ void TestValidation(const std::filesystem::path& root) {
                    h3::GenerationProgress, void*, h3::GenerationTelemetry*,
                    std::string*) { return false; },
   });
-  std::string too_long(4097, 'x');
-  Check(service.Create(Mp4Request(std::move(too_long))).result ==
+  Check(service.Create(Mp4Request("")).result == VideoJobResult::kInvalid,
+        "empty prompt is rejected");
+  Check(service.Create(Mp4Request(std::string("A\0B", 3))).result ==
             VideoJobResult::kInvalid,
-        "prompt size limit");
+        "embedded NUL in prompt is rejected");
   auto invalid = Mp4Request();
   invalid.model = "../escape";
   Check(service.Create(invalid).result == VideoJobResult::kInvalid,

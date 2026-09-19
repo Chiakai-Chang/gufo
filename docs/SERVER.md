@@ -54,7 +54,7 @@ executes the direct MiniMax H3 route used by the asynchronous video worker.
 `transcribe` executes the native Qwen3-ASR-1.7B route used by the synchronous
 audio transcription endpoint.
 Their detailed contracts are defined in [Command-Line Interface](CLI.md) and
-[MiniMax H3 Integration Boundary](MINIMAX_H3.md).
+[MiniMax H3 upstream contract](../src/models/minimax_h3/UPSTREAM.md).
 
 ### HIP execution
 
@@ -119,6 +119,11 @@ Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
 
 ### Reasoning controls
+
+Gufo defaults thinking off, including Flash-Next. Its upstream chat template
+defaults thinking on when the setting is omitted. Set `--think on` or
+`chat_template_kwargs.enable_thinking=true` explicitly for that behavior;
+quality comparisons must use the same reasoning mode.
 
 `POST /v1/chat/completions` accepts top-level `reasoning_effort` (`off`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`) and Pi/llama.cpp-style
@@ -340,13 +345,18 @@ rejected explicitly.
 The MiniMax H3 subset follows the asynchronous OpenAI-style video resource
 shape and is versioned independently as `gufo.video-api.v1`. Its supported
 fields, frozen presets, queue behavior, and deliberate conditioning
-omissions are documented in [MINIMAX_H3.md](MINIMAX_H3.md).
+omissions are documented in the [H3 upstream contract](../src/models/minimax_h3/UPSTREAM.md).
 Create requests accept both `application/json` and OpenAI-client-compatible
 `multipart/form-data`; duplicate form fields, malformed boundaries, unsupported
 media types, and reference-image parts fail explicitly.
 The production H3 contract supports both the rapid `512x512`, one-second MP4
 route and the released `1344x768`, five-second exact route (124 aligned frames
-at 24 fps).
+at 24 fps). The HTTP route intentionally exposes one or five seconds; it does
+not implement upstream's complete aligned 5–15-second request range.
+The encoder accepts at most 4,096 tokens after tokenization and normalization.
+There is no 4,096-byte prompt limit. HTTP request bodies remain bounded by
+`--max-request-bytes`; token-limit violations fail the asynchronous job before
+prompt-encoder weights or activations are allocated.
 The bounded worker retains prompt text only in volatile queued or active
 request memory, persists only its SHA-256 digest, and wipes both source and
 active string storage after transfer and completion. Completed MP4s are probed

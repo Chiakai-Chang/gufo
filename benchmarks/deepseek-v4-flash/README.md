@@ -4,6 +4,10 @@ Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Nix release binaries.
 `C` is simultaneous requests. Single-user measurements use **pp2048 / tg128**;
 depth precedes the measured operation. Unknown current measurements are **TODO**.
 
+**Target parity remains open:** the optimized build misses the historical
+trajectory gate, and four post-prefill differential alerts remain unresolved.
+DSpark replay does not establish target correctness. [Evidence and limits](eval/README.md).
+
 Target: `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`
 (80.76 GiB), `antirez/deepseek-v4-gguf` revision
 `1cd7b564460821938add0475a60b942c409295e0`. DSpark support:

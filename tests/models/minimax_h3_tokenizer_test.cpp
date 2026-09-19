@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -153,6 +154,20 @@ void CheckSynthetic(const std::filesystem::path& directory) {
     const std::string invalid{"\xF0\x28\x8C\x28", 4};
     CHECK(!tokenizer.Encode(invalid, true, &ids, &error));
   }
+  {
+    // A byte bound would reject both valid prompts. BPE and NFC determine
+    // the sequence length the encoder actually receives.
+    std::vector<std::uint32_t> ids;
+    CHECK(tokenizer.EncodePrompt(std::string(8192, 'A'), &ids, &error));
+    CHECK(ids.size() == 4096);
+    CHECK(std::ranges::all_of(ids, [](auto id) { return id == 500; }));
+    std::string unicode;
+    for (int i = 0; i < 2048; ++i)
+      unicode += "e\xCC\x81";
+    CHECK(unicode.size() == 6144);
+    CHECK(tokenizer.EncodePrompt(unicode, &ids, &error));
+    CHECK(ids.size() == 4096);
+  }
 
   const auto wrong_normalizer = directory / "tokenizer-nfd.json";
   WriteTinyTokenizer(wrong_normalizer, "NFD", false);
@@ -191,6 +206,16 @@ void CheckPinnedCheckpoint() {
   CheckIds(
       tokenizer, "A cinematic close-up of a clockwork bird taking flight.",
       {32, 64665, 3265, 5239, 315, 264, 8866, 1778, 11958, 4633, 10971, 13});
+  std::string unicode;
+  for (int i = 0; i < 2048; ++i)
+    unicode += "e\xCC\x81";
+  for (const auto& prompt : {std::string(8192, 'A'), unicode}) {
+    std::vector<std::uint32_t> ids;
+    CHECK(tokenizer.EncodePrompt(prompt, &ids, &error));
+    CHECK(!ids.empty() && ids.size() <= 4096);
+    std::cout << "Pinned H3 tokenizer: bytes=" << prompt.size()
+              << " tokens=" << ids.size() << '\n';
+  }
 }
 
 void CheckNoCpuTensorFallback() {
@@ -206,6 +231,21 @@ void CheckNoCpuTensorFallback() {
 #endif
 }
 
+void CheckPromptTokenLimit() {
+#if defined(ENGINE_ENABLE_HIP)
+  // Validation happens before inventory access or GPU allocation.
+  gufo::minimax_h3::ModelInventory inventory;
+  const std::vector<std::uint32_t> ids(4097, Tokenizer::kPadTokenId);
+  gufo::minimax_h3::PromptEmbedding output;
+  gufo::minimax_h3::PromptEncoderTelemetry telemetry;
+  std::string error;
+  CHECK(!gufo::minimax_h3::EncodePromptLayer50(inventory, ids, {}, nullptr,
+                                               &output, &telemetry, &error));
+  CHECK(error == "MiniMax H3 prompt exceeds 4096 tokens");
+  CHECK(output.values.empty() && telemetry.peak_device_bytes == 0);
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -218,6 +258,7 @@ int main() {
   CheckSynthetic(directory);
   CheckPinnedCheckpoint();
   CheckNoCpuTensorFallback();
+  CheckPromptTokenLimit();
   std::filesystem::remove_all(directory, filesystem_error);
   if (failures != 0) {
     std::cerr << failures << " MiniMax H3 tokenizer checks failed\n";

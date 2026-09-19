@@ -62,8 +62,8 @@ arithmetic or decoder context.
 | decoder precision | released CUDA VisualVAE uses FP16 autocast | F32 decoder implementation | F32 VisualVAE and AudioVAE quality route; comparisons use numerical bounds rather than byte identity with CUDA |
 | RGB quantization | NumPy ties-to-even | `lrintf`, ties-to-even under the default rounding mode | explicit deterministic ties-to-even; covered by a byte-level PPM test |
 | output resize | pipeline/output-processor dependent | vImage high-quality scaling | FFmpeg Lanczos for fast/aggressive output-canvas scaling; exact performs no resize |
-| request duration | released pipeline accepts aligned 5--15 second requests | short native development examples | native additionally supports a 22-frame diagnostic/serving extension; it is not described as the released request envelope |
-| prompt length | pipeline/model tokenizer contract | implementation-specific | text-only serving deliberately caps prompts at 4,096 tokens |
+| request duration | released pipeline accepts aligned 5--15 second requests | short native development examples | HTTP deliberately supports one or five seconds, including the 22-frame extension; this is not the full released request envelope |
+| prompt length | pipeline/model tokenizer contract | implementation-specific | prompt encoder accepts up to 4,096 tokens after tokenization and normalization; HTTP/job admission does not equate UTF-8 bytes with tokens |
 | conditioning modes | FL2VA plus first/last/reference pipeline layouts | corresponding reference modes exist | only text-only FL2VA is admitted; first frame, last frame, ordered references, and Ref2VA remain explicit future work |
 
 The audit found no remaining semantic difference in prompt presentation and

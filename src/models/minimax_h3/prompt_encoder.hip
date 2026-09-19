@@ -885,9 +885,12 @@ bool EncodePromptLayer50(const ModelInventory& inventory,
   if (telemetry != nullptr) {
     *telemetry = {};
   }
+  if (token_ids.size() > kMaximumPromptTokens) {
+    SetError(error, "MiniMax H3 prompt exceeds 4096 tokens");
+    return false;
+  }
   if (output == nullptr || telemetry == nullptr || token_ids.empty() ||
-      token_ids.size() > kMaximumPromptTokens || options.layer_count == 0 ||
-      options.layer_count > kPromptEncoderLayers) {
+      options.layer_count == 0 || options.layer_count > kPromptEncoderLayers) {
     SetError(error, "invalid MiniMax H3 prompt encoder arguments");
     return false;
   }

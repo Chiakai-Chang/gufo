@@ -5,6 +5,11 @@ Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Target:
 `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP uses `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
 
+**Upstream model parity remains unqualified.** MTP/session replay and vision
+operator checks do not establish equivalence to the original unquantized model
+or independently validate GGUF conversion. Gufo defaults thinking off;
+upstream's template defaults it on when unspecified.
+
 PNG/JPEG image input uses the matching `mmproj-BF16.gguf`, with AR or MTP.
 [CLI/HTTP usage, cache behavior and vision checks](../qwen3.8-27b/eval/vision.md).
 

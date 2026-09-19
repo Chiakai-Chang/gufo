@@ -348,14 +348,6 @@ void TestValidation(const std::filesystem::path& root) {
                 std::string::npos,
         "wrongly typed optional fields do not fall back to defaults");
 
-  const std::string oversized = "{\"model\":\"minimax-h3\",\"prompt\":\"" +
-                                std::string(4097, 'x') +
-                                "\",\"seconds\":\"1\"}";
-  const HttpResponse too_large = Send(service, "POST", "/v1/videos", oversized);
-  Check(too_large.status == 413 &&
-            too_large.body.find("prompt_too_large") != std::string::npos,
-        "oversized prompts use the documented HTTP 413 contract");
-
   Check(Send(service, "GET", "/v1/videos/../../private").status == 404,
         "path traversal-like IDs fail closed");
 
@@ -423,6 +415,42 @@ void TestValidation(const std::filesystem::path& root) {
         "unsupported create content types fail explicitly");
 }
 
+void TestLongPrompts(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobService service(Options(root, &runner));
+  std::string unicode;
+  for (int i = 0; i < 2048; ++i)
+    unicode += "e\xCC\x81";
+  int calls = 0;
+  for (const auto& prompt : {std::string(8192, 'A'), unicode}) {
+    for (const bool multipart : {false, true}) {
+      std::string body;
+      std::string content_type;
+      if (multipart) {
+        body = Multipart(
+            "long-prompt",
+            {{"model", "minimax-h3"}, {"prompt", prompt}, {"seconds", "1"}});
+        content_type = "multipart/form-data; boundary=long-prompt";
+      } else {
+        auto json = gufo::json::Value::object();
+        json["model"] = "minimax-h3";
+        json["prompt"] = prompt;
+        json["seconds"] = "1";
+        body = json.dump();
+        content_type = "application/json";
+      }
+      const auto response =
+          Send(service, "POST", "/v1/videos", body, {}, content_type);
+      Check(response.status == 202,
+            "byte length does not replace the encoder's token limit");
+      runner.WaitForCalls(++calls);
+      Check(runner.latest().prompt == prompt,
+            "HTTP and job admission preserve the entire UTF-8 prompt");
+      WaitCompleted(service, CreatedId(response));
+    }
+  }
+}
+
 void TestQueueSaturation(const std::filesystem::path& root) {
   FakeRunner runner(true);
   VideoJobService service(Options(root, &runner));
@@ -455,6 +483,7 @@ int main() {
   std::filesystem::create_directories(base);
   TestLifecycleAndRange(base / "lifecycle");
   TestValidation(base / "validation");
+  TestLongPrompts(base / "long-prompts");
   TestQueueSaturation(base / "queue");
   std::filesystem::remove_all(base, ignored);
   std::cout << "Video API contract tests passed.\n";

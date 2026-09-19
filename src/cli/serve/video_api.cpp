@@ -22,7 +22,6 @@ namespace {
 
 constexpr std::string_view kVideosPath = "/v1/videos";
 constexpr double kMaximumExactJsonInteger = 9007199254740991.0;
-constexpr std::size_t kMaximumPromptBytes = 4096;
 constexpr std::size_t kMaximumMultipartHeadersBytes = 16U << 10U;
 constexpr std::size_t kMaximumMultipartFields = 16;
 
@@ -449,11 +448,6 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
                  "'model', 'prompt', and 'seconds' are required",
                  "missing_required_parameter");
   }
-  if (prompt.size() > kMaximumPromptBytes) {
-    return Error(413, "Payload Too Large",
-                 "video prompt exceeds 4096 UTF-8 bytes", "prompt_too_large");
-  }
-
   std::string preset =
       size == "1344x768" && seconds == "5" ? "exact-1344x768" : "exact";
   std::string model_preset;
