@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -17,6 +18,30 @@
 #include "src/models/minimax_h3/tokenizer.hpp"
 
 namespace gufo::minimax_h3 {
+
+std::optional<int> ResolveDurationFrames(std::string_view seconds,
+                                         std::string* error) {
+  double duration = 0.0;
+  const auto [end, status] = std::from_chars(
+      seconds.data(), seconds.data() + seconds.size(), duration);
+  if (status == std::errc{} && end == seconds.data() + seconds.size() &&
+      std::isfinite(duration)) {
+    if (duration == 1.0)
+      return 22;
+    if (duration >= 5.0 && duration <= 15.0) {
+      const int frames = AlignFrameCount(
+          static_cast<int>(std::ceil(duration * kH3FramesPerSecond)));
+      if (frames <= kH3MaximumFrames)
+        return frames;
+    }
+  }
+  if (error != nullptr)
+    *error =
+        "MiniMax H3 seconds must be 1 (diagnostic) or 5..15 with "
+        "24-fps VAE alignment fitting within 345 frames (14.375 seconds)";
+  return std::nullopt;
+}
+
 namespace {
 
 constexpr std::string_view kModelRevision =

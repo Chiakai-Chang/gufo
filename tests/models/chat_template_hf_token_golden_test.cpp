@@ -82,6 +82,8 @@ void TestQwenGoldens(const json::Value& fixture,
                          "\"required\":[\"city\"]}",
   }};
 
+  CheckQwenCase(fixture, "thinking_xhigh", *tokenizer, base, {}, {});
+
   qwen::ChatTemplateOptions options;
   options.enable_thinking = false;
   CheckQwenCase(fixture, "chat", *tokenizer, base, {}, options);
@@ -102,6 +104,7 @@ void TestQwenGoldens(const json::Value& fixture,
   CheckQwenCase(fixture, "history_preserve", *tokenizer, history, {}, options);
 
   options = {};
+  options.enable_thinking = false;
   CheckQwenCase(fixture, "tools", *tokenizer, base, tools, options);
 }
 

@@ -266,6 +266,7 @@ void TestHuggingFaceRenderedGoldens() {
   using gufo::tokenization::ChatTemplateOptions;
   using gufo::tokenization::QwenChatTemplate;
   using gufo::tokenization::QwenReasoningEffort;
+  using gufo::tokenization::ResolveQwenChatOptions;
 
   const std::vector<ChatMessage> base = {
       {ChatRole::kUser, "Name one color.", "", ""},
@@ -285,6 +286,10 @@ void TestHuggingFaceRenderedGoldens() {
   };
 
   ChatTemplateOptions options;
+  check(base, options,
+        "97dbf46721e76ae30614f4b4d6bdb6147bc9b34d1a0f93e04699b3ac622fb99d");
+  check(base, ResolveQwenChatOptions({}),
+        "97dbf46721e76ae30614f4b4d6bdb6147bc9b34d1a0f93e04699b3ac622fb99d");
   options.enable_thinking = false;
   check(base, options,
         "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7");
@@ -299,6 +304,26 @@ void TestHuggingFaceRenderedGoldens() {
   options.reasoning_effort = QwenReasoningEffort::kXHigh;
   check(base, options,
         "97dbf46721e76ae30614f4b4d6bdb6147bc9b34d1a0f93e04699b3ac622fb99d");
+  for (const auto effort :
+       {gufo::ReasoningEffort::kLow, gufo::ReasoningEffort::kMedium,
+        gufo::ReasoningEffort::kXHigh}) {
+    const auto resolved = ResolveQwenChatOptions({.effort = effort});
+    const auto expected = effort == gufo::ReasoningEffort::kLow
+                              ? QwenReasoningEffort::kLow
+                          : effort == gufo::ReasoningEffort::kMedium
+                              ? QwenReasoningEffort::kMedium
+                              : QwenReasoningEffort::kXHigh;
+    options.reasoning_effort = expected;
+    Expect(resolved.enable_thinking && resolved.preserve_thinking,
+           "Effort selection retains official thinking/history defaults");
+    Expect(QwenChatTemplate::Render(base, resolved) ==
+               QwenChatTemplate::Render(base, options),
+           "Shared CLI/server effort resolution matches the native template");
+  }
+  check(base,
+        ResolveQwenChatOptions(
+            {.enabled = false, .effort = gufo::ReasoningEffort::kLow}),
+        "323dbd5987839260d0dd3350d815ab3b5cdffe3c0a33b467c3579fe202e990f7");
 
   options.reasoning_effort = QwenReasoningEffort::kMedium;
   options.preserve_thinking = false;
@@ -341,6 +366,7 @@ void TestRenderAndTokenize() {
   gufo::tokenization::ChatTemplateOptions opts;
   opts.add_generation_prompt = true;
 
+  opts.enable_thinking = false;
   auto token_ids = tpl->RenderAndTokenize(*tokenizer, messages, opts, &err);
   Expect(token_ids.has_value(), "RenderAndTokenize succeeds: " + err);
   Expect(!token_ids->empty(), "Token IDs not empty");
@@ -361,6 +387,7 @@ void TestChatCorpusConformance() {
         {gufo::tokenization::ChatRole::kUser, "Hello, Strix Halo!", "", ""}};
     gufo::tokenization::ChatTemplateOptions opts;
     opts.add_generation_prompt = true;
+    opts.enable_thinking = false;
     auto res = tpl->Render(msgs, opts);
     Expect(res.has_value() && *res ==
                                   "<|im_start|>user\nHello, Strix "
@@ -377,6 +404,7 @@ void TestChatCorpusConformance() {
          "{\"temp\": 22, \"city\": \"Rome\"}", "", ""}};
     gufo::tokenization::ChatTemplateOptions opts;
     opts.add_generation_prompt = true;
+    opts.enable_thinking = false;
     auto res = tpl->Render(msgs, opts);
     Expect(res.has_value() &&
                *res ==
@@ -394,6 +422,7 @@ void TestChatCorpusConformance() {
         {gufo::tokenization::ChatRole::kUser, "你好，世界！🚀", "", ""}};
     gufo::tokenization::ChatTemplateOptions opts;
     opts.add_generation_prompt = true;
+    opts.enable_thinking = false;
     auto res = tpl->Render(msgs, opts);
     Expect(res.has_value() && *res ==
                                   "<|im_start|>user\n你好，世界！🚀<|im_end|>"
@@ -478,6 +507,7 @@ void TestToolReplayPreservesGeneratedPrefix() {
   };
   gufo::tokenization::ChatTemplateOptions options;
   options.add_generation_prompt = false;
+  options.enable_thinking = false;
 
   const auto rendered = tpl->Render(messages, options);
   Expect(rendered.has_value(), "Assistant tool replay renders");

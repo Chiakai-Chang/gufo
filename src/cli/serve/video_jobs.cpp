@@ -49,34 +49,33 @@ bool ModelMatchesPreset(std::string_view model, std::string_view preset) {
          (model == "minimax-h3-fullres" && preset == "exact-1344x768");
 }
 
-bool MatchesFrozenOutputContract(const VideoJobRequest& request) {
+bool MatchesOutputContract(const VideoJobRequest& request) {
   const auto& parameters = request.parameters;
-  if (!ModelMatchesPreset(request.model, parameters.preset)) {
+  const auto frames = minimax_h3::ResolveDurationFrames(request.seconds);
+  if (!frames || parameters.frames != *frames ||
+      !ModelMatchesPreset(request.model, parameters.preset)) {
     return false;
   }
   if (request.output_format == "mp4") {
-    const bool one_second =
-        request.seconds == "1" && request.size == "512x512" &&
-        parameters.output_width == 512 && parameters.output_height == 512 &&
-        parameters.frames == 22 &&
+    const bool square =
+        request.size == "512x512" && parameters.output_width == 512 &&
+        parameters.output_height == 512 &&
         (parameters.preset == "exact-512" || parameters.preset == "fast-384" ||
          parameters.preset == "aggressive-320");
     const bool released_full_resolution =
-        request.seconds == "5" && request.size == "1344x768" &&
-        parameters.preset == "exact-1344x768" &&
+        request.size == "1344x768" && parameters.preset == "exact-1344x768" &&
         parameters.internal_width == 1344 &&
         parameters.internal_height == 768 && parameters.output_width == 1344 &&
-        parameters.output_height == 768 && parameters.frames == 124;
-    return (one_second || released_full_resolution) && parameters.mux &&
+        parameters.output_height == 768;
+    return (square || released_full_resolution) && parameters.mux &&
            parameters.decode_audio && parameters.selected_frames.empty();
   }
   return request.output_format == "ppm" && request.size == "256x256" &&
          parameters.preset == "development-256" &&
          parameters.internal_width == 256 &&
          parameters.internal_height == 256 && parameters.output_width == 256 &&
-         parameters.output_height == 256 && parameters.frames == 22 &&
-         !parameters.mux && !parameters.decode_audio &&
-         parameters.selected_frames.size() == 1;
+         parameters.output_height == 256 && !parameters.mux &&
+         !parameters.decode_audio && parameters.selected_frames.size() == 1;
 }
 
 void WipeString(std::string* value) noexcept {
@@ -452,7 +451,7 @@ struct VideoJobService::Impl {
         if (value.member_str("schema") != "gufo.video-job.v1" ||
             !IsVideoId(job->snapshot.id) || job->snapshot.id != directory_id ||
             !IsH3Model(job->snapshot.model) ||
-            (job->snapshot.seconds != "1" && job->snapshot.seconds != "5") ||
+            !minimax_h3::ResolveDurationFrames(job->snapshot.seconds) ||
             !valid_output || !valid_numbers ||
             expires_at <= static_cast<double>(now_value) ||
             value.member_str("status") != "completed") {
@@ -784,10 +783,9 @@ VideoJobCreateResult VideoJobService::Create(const VideoJobRequest& request) {
   }
   if (!IsH3Model(request.model) || request.prompt.empty() ||
       request.prompt.find('\0') != std::string::npos ||
-      (request.seconds != "1" && request.seconds != "5") ||
       (request.output_format != "mp4" && request.output_format != "ppm") ||
       !minimax_h3::ValidateGenerationParameters(request.parameters, nullptr) ||
-      !MatchesFrozenOutputContract(request)) {
+      !MatchesOutputContract(request)) {
     return {.result = VideoJobResult::kInvalid,
             .job = std::nullopt,
             .error = "invalid MiniMax H3 video job request"};

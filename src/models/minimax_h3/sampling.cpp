@@ -146,7 +146,7 @@ std::optional<GenerationGeometry> ResolveGenerationGeometry(
   if (requested_frames < 5 || requested_frames > kH3MaximumFrames) {
     SetError(error,
              "MiniMax H3 requested frame count must be in the released "
-             "5..362 range");
+             "5..345 range");
     return std::nullopt;
   }
   const int frames = AlignFrameCount(requested_frames);

@@ -39,6 +39,11 @@ struct GenerationParameters {
 
 [[nodiscard]] std::optional<GenerationParameters> ResolveGenerationPreset(
     std::string_view name, std::string* error = nullptr);
+/// HTTP duration at 24 fps, snapped upward to the official VAE frame grid.
+/// The aligned result must fit in 5..15 seconds. "1" selects the existing
+/// 22-frame diagnostic extension.
+[[nodiscard]] std::optional<int> ResolveDurationFrames(
+    std::string_view seconds, std::string* error = nullptr);
 [[nodiscard]] bool ValidateGenerationParameters(
     const GenerationParameters& parameters, std::string* error = nullptr);
 [[nodiscard]] std::string GenerationParametersJson(

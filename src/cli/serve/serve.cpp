@@ -381,7 +381,7 @@ void PrintServeHelp(std::string_view program_name,
     std::uint32_t max_context = 4096;
     std::size_t max_tokens = 128;
     sampling::SamplingConfig sampling_config;
-    std::string reasoning_mode = "off";
+    std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
     std::string speculative_backend;
@@ -434,9 +434,10 @@ void PrintServeHelp(std::string_view program_name,
     RegisterSamplingOptions(parser, &sampling_config, "Sampling Defaults");
 
     // Reasoning Defaults
-    parser.AddOption("", "--think", "MODE",
-                     "Default reasoning mode: on, off, or auto (default: off)",
-                     "Reasoning Defaults", &reasoning_mode);
+    parser.AddOption(
+        "", "--think", "MODE",
+        "Default reasoning mode: on, off, or auto (default: model template)",
+        "Reasoning Defaults", &reasoning_mode);
     parser.AddOption(
         "", "--reasoning-effort", "LEVEL",
         "Default effort: auto, minimal, low, medium, high, xhigh, or max",
@@ -887,7 +888,7 @@ int RunServe(std::span<const char* const> args) {
     std::uint32_t max_context = 4096;
     std::size_t max_tokens = 128;
     sampling::SamplingConfig sampling_config;
-    std::string reasoning_mode = "off";
+    std::string reasoning_mode = "auto";
     std::string reasoning_effort = "auto";
     std::string preserve_thinking = "auto";
     std::string speculative_backend;
@@ -938,7 +939,7 @@ int RunServe(std::span<const char* const> args) {
     RegisterSamplingOptions(llm_parser, &sampling_config, "Sampling Defaults");
     llm_parser.AddOption(
         "", "--think", "MODE",
-        "Default reasoning mode: on, off, or auto (default: off)",
+        "Default reasoning mode: on, off, or auto (default: model template)",
         "Reasoning Defaults", &reasoning_mode);
     llm_parser.AddOption(
         "", "--reasoning-effort", "LEVEL",

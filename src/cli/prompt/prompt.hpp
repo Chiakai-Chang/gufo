@@ -20,11 +20,10 @@ struct PromptOptions {
   std::vector<std::string> image_paths;
   std::string prompt_text;
   std::string prompt_file;
-  std::string system_prompt =
-      "You are a helpful, respectful, and honest assistant.";
+  std::string system_prompt;
   std::size_t max_tokens = 128;
   sampling::SamplingConfig sampling;
-  std::string reasoning_mode = "off";
+  std::string reasoning_mode = "auto";
   std::string reasoning_effort = "auto";
   std::string preserve_thinking = "auto";
   bool display_prompt = true;

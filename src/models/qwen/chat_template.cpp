@@ -16,6 +16,28 @@
 
 namespace gufo::tokenization {
 
+ChatTemplateOptions ResolveQwenChatOptions(const ReasoningOptions& reasoning) {
+  ChatTemplateOptions options;
+  options.enable_thinking = reasoning.enabled.value_or(options.enable_thinking);
+  options.preserve_thinking =
+      reasoning.preserve_thinking.value_or(options.preserve_thinking);
+  switch (reasoning.effort.value_or(ReasoningEffort::kXHigh)) {
+    case ReasoningEffort::kMinimal:
+    case ReasoningEffort::kLow:
+      options.reasoning_effort = QwenReasoningEffort::kLow;
+      break;
+    case ReasoningEffort::kMedium:
+      options.reasoning_effort = QwenReasoningEffort::kMedium;
+      break;
+    case ReasoningEffort::kHigh:
+    case ReasoningEffort::kXHigh:
+    case ReasoningEffort::kMax:
+      options.reasoning_effort = QwenReasoningEffort::kXHigh;
+      break;
+  }
+  return options;
+}
+
 namespace {
 
 constexpr std::string_view kDefaultChatmlTemplate =

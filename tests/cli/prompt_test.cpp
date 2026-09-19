@@ -14,7 +14,8 @@ void TestDefaultOptions() {
   assert(opt->max_tokens == 128);
   assert(opt->sampling.temperature == 0.0F);
   assert(opt->use_chat_template);
-  assert(opt->reasoning_mode == "off");
+  assert(opt->system_prompt.empty());
+  assert(opt->reasoning_mode == "auto");
   assert(opt->reasoning_effort == "auto");
   assert(opt->preserve_thinking == "auto");
   assert(!opt->verbose);

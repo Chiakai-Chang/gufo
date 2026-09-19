@@ -97,8 +97,10 @@ Jinja is never executed at runtime.
 
 Chat Completions accepts Pi/OpenAI-style `reasoning_effort` and
 `chat_template_kwargs` with `enable_thinking`, `reasoning_effort`, and
-`preserve_thinking`. Server and CLI thinking defaults to off unless explicitly
-enabled. Native Qwen effort mapping is:
+`preserve_thinking`. Qwen27B and Flash-Next default to thinking enabled at
+`xhigh`, matching their identical official Jinja templates. `--think auto`
+(the CLI/server default) selects the model default; `--think off` or
+`enable_thinking=false` disables reasoning. Native Qwen effort mapping is:
 
 | Requested | Qwen template level |
 |---|---|
@@ -113,7 +115,8 @@ prompt-opened `<think>` block, so HTTP responses expose those bytes as
 `reasoning_content`, not `content`.
 
 The CLI controls are `--think`, `--reasoning-effort`, and
-`--preserve-thinking`. This path has no custom Jinja override and no
+`--preserve-thinking`. CLI prompts add no implicit system message; use
+`--system` to supply one. This path has no custom Jinja override and no
 reasoning-token-budget enforcement.
 
 Pi should configure this model with `thinkingFormat:
@@ -124,12 +127,12 @@ Pi should configure this model with `thinkingFormat:
 Rendered-byte and token-ID SHA goldens generated with the pinned Hugging Face
 template/tokenizer are stored in
 [`tests/fixtures/chat_template_hf_goldens.json`](../../../tests/fixtures/chat_template_hf_goldens.json).
-The template tests cover chat mode, all native effort levels, history
+The template tests cover omitted/default controls, chat mode, all native effort levels, history
 preservation, and tools. The model-backed
 `chat_template_hf_token_golden_test` loads a real Qwen3.8 GGUF, applies its
 `qwen35` pre-tokenizer and added tool tokens, and compares Gufo's complete
-token-ID sequences with those goldens. Set `GUFO_QWEN_GGUF` and
-`GUFO_DEEPSEEK_GGUF` to run it; CTest skips it when the artifacts are absent.
+token-ID sequences with those goldens. Set `GUFO_QWEN_GGUF` to either a Qwen27B
+or Flash-Next target GGUF to run it; CTest skips it when the artifact is absent.
 
 ### HIP target model
 

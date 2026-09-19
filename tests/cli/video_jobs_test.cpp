@@ -221,7 +221,10 @@ void TestQueueLifecycleAndRecovery(const std::filesystem::path& root) {
     Check(running.job->progress >= 80 && running.job->progress < 100,
           "progress is monotonic and bounded before completion");
 
-    const auto second = service.Create(Mp4Request("private prompt two"));
+    auto longer_request = Mp4Request("private prompt two");
+    longer_request.seconds = "14.375";
+    longer_request.parameters.frames = 345;
+    const auto second = service.Create(longer_request);
     Check(second.result == VideoJobResult::kOk && second.job.has_value(),
           "one queued video job is admitted");
     completed_id = second.job->id;
@@ -262,7 +265,8 @@ void TestQueueLifecycleAndRecovery(const std::filesystem::path& root) {
                 request.parameters.output_width == 512 &&
                 request.parameters.evaluations == 19 &&
                 request.parameters.active_blocks == 45 &&
-                request.parameters.reuse_interval == 2 && request.seed == 42,
+                request.parameters.reuse_interval == 2 &&
+                request.parameters.frames == 345 && request.seed == 42,
             "server request matches direct fast CLI parameters");
     }
     const std::filesystem::path directory = root / completed_id;
@@ -386,6 +390,14 @@ void TestValidation(const std::filesystem::path& root) {
             VideoJobResult::kInvalid,
         "embedded NUL in prompt is rejected");
   auto invalid = Mp4Request();
+  invalid.seconds = "10";
+  Check(service.Create(invalid).result == VideoJobResult::kInvalid,
+        "job admission rejects seconds/frame mismatch independently of HTTP");
+  invalid.parameters.frames = 362;
+  invalid.seconds = "15";
+  Check(service.Create(invalid).result == VideoJobResult::kInvalid,
+        "job admission rejects alignment beyond the released limit");
+  invalid = Mp4Request();
   invalid.model = "../escape";
   Check(service.Create(invalid).result == VideoJobResult::kInvalid,
         "invalid model and traversal-like value rejected");

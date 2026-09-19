@@ -53,21 +53,7 @@ struct QwenImageContext final : TextPromptContext {
 };
 
 tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request) {
-  tokenization::ChatTemplateOptions options;
-  options.enable_thinking = request.reasoning.enabled.value_or(false);
-  options.preserve_thinking =
-      request.reasoning.preserve_thinking.value_or(true);
-  switch (request.reasoning.effort.value_or(ReasoningEffort::kXHigh)) {
-    case ReasoningEffort::kMinimal:
-    case ReasoningEffort::kLow:
-      options.reasoning_effort = tokenization::QwenReasoningEffort::kLow;
-      break;
-    case ReasoningEffort::kMedium:
-      options.reasoning_effort = tokenization::QwenReasoningEffort::kMedium;
-      break;
-    default:
-      options.reasoning_effort = tokenization::QwenReasoningEffort::kXHigh;
-  }
+  auto options = tokenization::ResolveQwenChatOptions(request.reasoning);
   options.require_tool_call =
       request.tool_choice == ChatRequest::ToolChoice::kRequired;
   return options;
@@ -799,7 +785,7 @@ public:
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
-    return request.reasoning.enabled.value_or(false)
+    return QwenChatOptions(request).enable_thinking
                ? TextGenerationBackend::InitialOutputState::kReasoning
                : TextGenerationBackend::InitialOutputState::kContent;
   }
@@ -2146,7 +2132,7 @@ public:
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
       const ChatRequest& request) const override {
-    return request.reasoning.enabled.value_or(false)
+    return QwenChatOptions(request).enable_thinking
                ? TextGenerationBackend::InitialOutputState::kReasoning
                : TextGenerationBackend::InitialOutputState::kContent;
   }

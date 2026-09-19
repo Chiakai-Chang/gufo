@@ -415,6 +415,56 @@ void TestValidation(const std::filesystem::path& root) {
         "unsupported create content types fail explicitly");
 }
 
+void TestDurations(const std::filesystem::path& root) {
+  FakeRunner runner;
+  VideoJobService service(Options(root, &runner));
+  int calls = 0;
+  for (const auto size : {"512x512", "1344x768"}) {
+    for (const auto& [seconds, frames] :
+         std::vector<std::pair<std::string, int>>{
+             {"5", 124}, {"8", 192}, {"10", 243}, {"14.375", 345}}) {
+      const auto response =
+          Send(service, "POST", "/v1/videos",
+               "{\"model\":\"minimax-h3\",\"prompt\":\"x\",\"size\":\"" +
+                   std::string(size) + "\",\"seconds\":" + seconds + "}");
+      Check(response.status == 202,
+            "numeric aligned duration accepted: " + response.body);
+      runner.WaitForCalls(++calls);
+      WaitCompleted(service, CreatedId(response));
+      Check(runner.latest().parameters.frames == frames,
+            "duration reaches generation with official aligned frames");
+    }
+  }
+  const std::string boundary = "h3-duration";
+  const auto multipart = Send(service, "POST", "/v1/videos",
+                              Multipart(boundary, {{"model", "minimax-h3"},
+                                                   {"prompt", "x"},
+                                                   {"size", "1344x768"},
+                                                   {"seconds", "14.375"}}),
+                              {}, "multipart/form-data; boundary=" + boundary);
+  Check(multipart.status == 202, "multipart accepts fractional duration");
+  runner.WaitForCalls(++calls);
+  WaitCompleted(service, CreatedId(multipart));
+  Check(runner.latest().parameters.frames == 345,
+        "multipart resolves the maximum aligned duration");
+
+  for (const auto seconds : {"0", "4", "14.376", "15", "16"}) {
+    const auto response =
+        Send(service, "POST", "/v1/videos",
+             "{\"model\":\"minimax-h3\",\"prompt\":\"x\",\"seconds\":\"" +
+                 std::string(seconds) + "\"}");
+    Check(response.status == 400 &&
+              response.body.find("invalid_seconds") != std::string::npos,
+          "unsupported duration fails before job admission");
+  }
+  const auto mismatch = Send(
+      service, "POST", "/v1/videos",
+      R"({"model":"minimax-h3","prompt":"x","seconds":10,"gufo":{"frames":124}})");
+  Check(mismatch.status == 400 &&
+            mismatch.body.find("invalid_frames") != std::string::npos,
+        "explicit frames cannot disagree with duration");
+}
+
 void TestLongPrompts(const std::filesystem::path& root) {
   FakeRunner runner;
   VideoJobService service(Options(root, &runner));
@@ -483,6 +533,7 @@ int main() {
   std::filesystem::create_directories(base);
   TestLifecycleAndRange(base / "lifecycle");
   TestValidation(base / "validation");
+  TestDurations(base / "durations");
   TestLongPrompts(base / "long-prompts");
   TestQueueSaturation(base / "queue");
   std::filesystem::remove_all(base, ignored);

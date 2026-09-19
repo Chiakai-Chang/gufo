@@ -394,7 +394,7 @@ bool AssignReasoningEnabled(ReasoningOptions* options, bool enabled,
 }
 
 bool AssignReasoningEffort(ReasoningOptions* options, std::string_view value,
-                           std::string* error) {
+                           std::string* error, bool enable_thinking = true) {
   if (value == "off" || value == "none") {
     return AssignReasoningEnabled(options, false, error);
   }
@@ -410,7 +410,7 @@ bool AssignReasoningEffort(ReasoningOptions* options, std::string_view value,
     return false;
   }
   options->effort = effort;
-  return AssignReasoningEnabled(options, true, error);
+  return !enable_thinking || AssignReasoningEnabled(options, true, error);
 }
 
 bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
@@ -483,7 +483,8 @@ bool ParseReasoningOptions(const json::Value& body, ReasoningOptions* options,
   }
   if (const json::Value* effort = kwargs->find("reasoning_effort")) {
     if (!effort->is_string() ||
-        !AssignReasoningEffort(options, effort->get_str(), error)) {
+        !AssignReasoningEffort(options, effort->get_str(), error,
+                               options->enabled.value_or(true))) {
       if (error->empty()) {
         *error = "'chat_template_kwargs.reasoning_effort' must be a string";
       }

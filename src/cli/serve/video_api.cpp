@@ -438,18 +438,21 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   std::string seconds;
   if (seconds_value != nullptr && seconds_value->is_string()) {
     seconds = seconds_value->str();
-  } else if (seconds_value != nullptr && seconds_value->is_number() &&
-             (seconds_value->as_double() == 1.0 ||
-              seconds_value->as_double() == 5.0)) {
-    seconds = seconds_value->as_double() == 5.0 ? "5" : "1";
+  } else if (seconds_value != nullptr && seconds_value->is_number()) {
+    seconds = seconds_value->dump();
   }
   if (model.empty() || prompt.empty() || seconds.empty()) {
     return Error(400, "Bad Request",
                  "'model', 'prompt', and 'seconds' are required",
                  "missing_required_parameter");
   }
-  std::string preset =
-      size == "1344x768" && seconds == "5" ? "exact-1344x768" : "exact";
+  std::string duration_error;
+  const auto duration_frames =
+      minimax_h3::ResolveDurationFrames(seconds, &duration_error);
+  if (!duration_frames) {
+    return Error(400, "Bad Request", duration_error, "invalid_seconds");
+  }
+  std::string preset = size == "1344x768" ? "exact-1344x768" : "exact";
   std::string model_preset;
   if (model == "minimax-h3-exact") {
     model_preset = "exact";
@@ -532,9 +535,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   if (!parameters.has_value()) {
     return Error(400, "Bad Request", preset_error, "invalid_preset");
   }
-  if (frames.has_value()) {
-    parameters->frames = *frames;
-  }
+  parameters->frames = frames.value_or(*duration_frames);
   if (output_format == "ppm") {
     if (parameters->preset != "development-256" || size != "256x256") {
       return Error(400, "Bad Request",
@@ -544,16 +545,7 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
     parameters->selected_frames = {
         selected_frame.value_or(parameters->frames / 2)};
   } else if (output_format == "mp4") {
-    const bool one_second = size == "512x512" && seconds == "1" &&
-                            parameters->frames == 22 &&
-                            (parameters->preset == "exact-512" ||
-                             parameters->preset == "fast-384" ||
-                             parameters->preset == "aggressive-320");
-    const bool released_full_resolution =
-        size == "1344x768" && seconds == "5" &&
-        parameters->preset == "exact-1344x768" && parameters->frames == 124;
-    if (!parameters->mux || selected_frame.has_value() ||
-        (!one_second && !released_full_resolution)) {
+    if (!parameters->mux || selected_frame.has_value()) {
       return Error(400, "Bad Request",
                    "MP4 output requires a supported preset, duration, and "
                    "resolution combination",
@@ -568,6 +560,11 @@ HttpResponse CreateVideo(const HttpRequest& request, VideoJobService& service) {
   if (!minimax_h3::ValidateGenerationParameters(*parameters,
                                                 &parameter_error)) {
     return Error(400, "Bad Request", parameter_error, "invalid_frames");
+  }
+  if (parameters->frames != *duration_frames) {
+    return Error(400, "Bad Request",
+                 "'gufo.frames' must match the aligned 'seconds' duration",
+                 "invalid_frames");
   }
 
   const VideoJobCreateResult created = service.Create({

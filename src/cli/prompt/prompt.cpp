@@ -97,8 +97,7 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
                      &opt.prompt_file);
   }
   parser.AddOption("", "--system", "PROMPT",
-                   "System role instructions prepended to the prompt "
-                   "(default: helpful assistant)",
+                   "Optional system role instructions prepended to the prompt",
                    "Prompt", &opt.system_prompt);
   if (command == "prompt") {
     parser.AddInverseFlag("", "--raw",
@@ -117,7 +116,7 @@ static void RegisterTextOptions(ArgParser& parser, PromptOptions& opt,
 
   // Reasoning
   parser.AddOption("", "--think", "MODE",
-                   "Reasoning mode: on, off, or auto (default: off)",
+                   "Reasoning mode: on, off, or auto (default: model template)",
                    "Reasoning", &opt.reasoning_mode);
   parser.AddOption("", "--reasoning-effort", "LEVEL",
                    "Effort: auto, minimal, low, medium, high, xhigh, or max",
@@ -288,22 +287,6 @@ ReasoningOptions PromptReasoningOptions(const PromptOptions& options) {
     reasoning.preserve_thinking = false;
   }
   return reasoning;
-}
-
-tokenization::QwenReasoningEffort QwenEffort(
-    std::optional<ReasoningEffort> effort) {
-  switch (effort.value_or(ReasoningEffort::kXHigh)) {
-    case ReasoningEffort::kMinimal:
-    case ReasoningEffort::kLow:
-      return tokenization::QwenReasoningEffort::kLow;
-    case ReasoningEffort::kMedium:
-      return tokenization::QwenReasoningEffort::kMedium;
-    case ReasoningEffort::kHigh:
-    case ReasoningEffort::kXHigh:
-    case ReasoningEffort::kMax:
-      return tokenization::QwenReasoningEffort::kXHigh;
-  }
-  return tokenization::QwenReasoningEffort::kXHigh;
 }
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -529,16 +512,17 @@ int RunDeepSeekPrompt(const PromptOptions& opt, const core::GgufReader& reader,
   std::vector<int> prompt_tokens;
   if (opt.use_chat_template) {
     const auto reasoning = PromptReasoningOptions(opt);
-    const std::vector<models::deepseek_v4_flash::ChatMessage> messages = {
-        {.role = "system",
-         .content = opt.system_prompt,
-         .reasoning_content = {},
-         .tool_calls = {}},
-        {.role = "user",
-         .content = opt.prompt_text,
-         .reasoning_content = {},
-         .tool_calls = {}},
-    };
+    std::vector<models::deepseek_v4_flash::ChatMessage> messages;
+    if (!opt.system_prompt.empty()) {
+      messages.push_back({.role = "system",
+                          .content = opt.system_prompt,
+                          .reasoning_content = {},
+                          .tool_calls = {}});
+    }
+    messages.push_back({.role = "user",
+                        .content = opt.prompt_text,
+                        .reasoning_content = {},
+                        .tool_calls = {}});
     prompt_tokens = model->EncodeChat(
         messages,
         models::deepseek_v4_flash::ChatTemplateOptions{
@@ -644,11 +628,8 @@ std::shared_ptr<const models::qwen::vision::Prompt> PrepareVision(
   return std::make_shared<models::qwen::vision::Prompt>(
       models::qwen::vision::Prepare(
           tokenizer, messages, {},
-          {.add_generation_prompt = true,
-           .enable_thinking = reasoning.enabled.value_or(false),
-           .reasoning_effort = QwenEffort(reasoning.effort),
-           .preserve_thinking = reasoning.preserve_thinking.value_or(true)},
-          encoder->identity(), kDefaultContext));
+          tokenization::ResolveQwenChatOptions(reasoning), encoder->identity(),
+          kDefaultContext));
 }
 
 std::shared_ptr<models::qwen38_flash_next::Model> LoadFlashNextModel(
@@ -1023,13 +1004,7 @@ int RunPrompt(std::span<const char* const> args) {
         {tokenization::ChatRole::kUser, opt.prompt_text, "", ""});
     const auto reasoning = PromptReasoningOptions(opt);
     const auto rendered = tokenization::QwenChatTemplate::Render(
-        messages,
-        tokenization::ChatTemplateOptions{
-            .add_generation_prompt = true,
-            .enable_thinking = reasoning.enabled.value_or(false),
-            .reasoning_effort = QwenEffort(reasoning.effort),
-            .preserve_thinking = reasoning.preserve_thinking.value_or(true),
-        });
+        messages, tokenization::ResolveQwenChatOptions(reasoning));
     if (rendered.has_value()) {
       rendered_prompt = *rendered;
     } else {
@@ -1321,13 +1296,7 @@ int RunChat(std::span<const char* const> args) {
     history.push_back({tokenization::ChatRole::kUser, user_input, "", ""});
     const auto reasoning = PromptReasoningOptions(opt);
     const auto rendered_prompt = tokenization::QwenChatTemplate::Render(
-        history,
-        tokenization::ChatTemplateOptions{
-            .add_generation_prompt = true,
-            .enable_thinking = reasoning.enabled.value_or(false),
-            .reasoning_effort = QwenEffort(reasoning.effort),
-            .preserve_thinking = reasoning.preserve_thinking.value_or(true),
-        });
+        history, tokenization::ResolveQwenChatOptions(reasoning));
     if (!rendered_prompt.has_value()) {
       std::cerr << "Error formatting chat template.\n";
       return 1;
@@ -1380,7 +1349,7 @@ int RunChat(std::span<const char* const> args) {
 
     std::cout << '\n';
     tokenization::ChatMessage reply{tokenization::ChatRole::kAssistant, ""};
-    if (reasoning.enabled.value_or(false)) {
+    if (tokenization::ResolveQwenChatOptions(reasoning).enable_thinking) {
       constexpr std::string_view end = "</think>";
       const auto boundary = assistant_reply.find(end);
       reply.thought = assistant_reply.substr(0, boundary);

@@ -120,10 +120,11 @@ between active decode rounds without changing a lone request's kernel policy.
 
 ### Reasoning controls
 
-Gufo defaults thinking off, including Flash-Next. Its upstream chat template
-defaults thinking on when the setting is omitted. Set `--think on` or
-`chat_template_kwargs.enable_thinking=true` explicitly for that behavior;
-quality comparisons must use the same reasoning mode.
+`--think auto` uses the model's default. Qwen27B and Flash-Next match the
+official Jinja: thinking enabled, `xhigh` effort, prior reasoning preserved.
+Use `--think off` or `chat_template_kwargs.enable_thinking=false` for direct
+answers. DeepSeek retains its chat-mode default. Quality comparisons must use
+the same reasoning mode and effort.
 
 `POST /v1/chat/completions` accepts top-level `reasoning_effort` (`off`,
 `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`) and Pi/llama.cpp-style
@@ -151,8 +152,9 @@ Pi's native DeepSeek request shape is also accepted:
 
 `thinking.type` accepts `enabled` or `disabled`. DeepSeek also accepts
 `thinking_mode` (`thinking`, `chat`, or `auto`) in `chat_template_kwargs`.
-Conflicting controls return `invalid_reasoning`. Thinking is off by default
-unless the request or `gufo serve llm --think on` enables it.
+Conflicting controls return `invalid_reasoning`. In template kwargs,
+`enable_thinking=false` suppresses the configured effort, matching Qwen's
+Jinja; a non-off top-level `reasoning_effort` explicitly enables reasoning.
 Generated reasoning is returned as `reasoning_content` in ordinary and
 streaming Chat Completions responses. Per-model effort mappings and history
 policies are documented in the model cards under `src/models/`.
@@ -349,10 +351,13 @@ omissions are documented in the [H3 upstream contract](../src/models/minimax_h3/
 Create requests accept both `application/json` and OpenAI-client-compatible
 `multipart/form-data`; duplicate form fields, malformed boundaries, unsupported
 media types, and reference-image parts fail explicitly.
-The production H3 contract supports both the rapid `512x512`, one-second MP4
-route and the released `1344x768`, five-second exact route (124 aligned frames
-at 24 fps). The HTTP route intentionally exposes one or five seconds; it does
-not implement upstream's complete aligned 5–15-second request range.
+H3 accepts `seconds` as a JSON number or string (including multipart), at
+`512x512` or `1344x768`. Durations from 5 seconds are converted to 24-fps frames
+and rounded up to the official VAE grid (`17n + 5`), within upstream's
+15-second ceiling: 5 → 124 frames, 10 → 243, 14 → 345. The maximum is
+`14.375` seconds (345 frames); `15` would round to 362 frames and is rejected,
+as upstream does. An explicit `gufo.frames` must match the aligned duration.
+The one-second/22-frame diagnostic extension remains available.
 The encoder accepts at most 4,096 tokens after tokenization and normalization.
 There is no 4,096-byte prompt limit. HTTP request bodies remain bounded by
 `--max-request-bytes`; token-limit violations fail the asynchronous job before

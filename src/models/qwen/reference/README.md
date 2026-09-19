@@ -2,6 +2,12 @@
 
 The compiled formatter is pinned to `Qwen/Qwen3.8-27B` revision
 `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
+The official `Qwen/Qwen3.8-Flash-Next` template at revision
+`de4b8e4d43b917e7706784d8bb445c9af86a3540` has the same SHA-256.
+Both default to `enable_thinking=true`, `reasoning_effort="xhigh"`, and
+`preserve_thinking=true`. Native efforts are `low`, `medium`, and `xhigh`;
+medium adds no effort instruction. Explicit thinking-off suppresses the
+effort instruction and closes the generation prompt's thinking block.
 
 - Official `chat_template.jinja` SHA-256:
   `c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041`

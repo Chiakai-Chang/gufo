@@ -548,6 +548,29 @@ void TestPiReasoningControlsAndOutputFraming() {
          "Prompt-opened reasoning is returned separately");
   Expect(response.body.find(R"("content":"Forty-two.")") != std::string::npos,
          "Visible answer excludes reasoning");
+
+  for (const auto effort : {"low", "medium", "xhigh"}) {
+    const auto native = gufo::server::HandleOpenAiChat(
+        Request("{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\","
+                "\"content\":\"hello\"}],\"chat_template_kwargs\":{"
+                "\"reasoning_effort\":\"" +
+                std::string(effort) + "\"}}"),
+        backend);
+    Expect(
+        native.status == 200 && backend.last_request.reasoning.enabled == true,
+        "Native effort alone enables thinking");
+  }
+  backend.pieces = {"Done."};
+  const auto disabled = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"hello"}],
+                  "chat_template_kwargs":{"enable_thinking":false,"reasoning_effort":"low"}})"),
+      backend);
+  Expect(
+      disabled.status == 200 && backend.last_request.reasoning.enabled == false,
+      "Template enable_thinking=false suppresses the configured effort");
+  Expect(disabled.body.find(R"("content":"Done.")") != std::string::npos,
+         "Explicit thinking-off produces visible content");
 }
 
 void TestPiNativeDeepSeekThinkingObject() {

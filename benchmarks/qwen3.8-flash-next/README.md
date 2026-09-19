@@ -7,8 +7,9 @@ MTP uses `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
 
 **Upstream model parity remains unqualified.** MTP/session replay and vision
 operator checks do not establish equivalence to the original unquantized model
-or independently validate GGUF conversion. Gufo defaults thinking off;
-upstream's template defaults it on when unspecified.
+or independently validate GGUF conversion. Chat defaults match the official
+template: thinking on, `xhigh` effort, prior reasoning preserved. The raw-text
+benchmarks below do not apply a chat template.
 
 PNG/JPEG image input uses the matching `mmproj-BF16.gguf`, with AR or MTP.
 [CLI/HTTP usage, cache behavior and vision checks](../qwen3.8-27b/eval/vision.md).

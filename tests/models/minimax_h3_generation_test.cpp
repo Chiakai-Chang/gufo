@@ -92,6 +92,35 @@ void TestGateRankedBlocks() {
         "gate ranking rejects a count smaller than protected blocks");
 }
 
+void TestDurations() {
+  // Expected frame counts from the pinned Diffusers align_num_frames rule.
+  for (const auto& [seconds, frames] :
+       std::vector<std::pair<std::string_view, int>>{{"1", 22},
+                                                     {"5", 124},
+                                                     {"6", 158},
+                                                     {"7", 175},
+                                                     {"8", 192},
+                                                     {"9", 226},
+                                                     {"10", 243},
+                                                     {"11", 277},
+                                                     {"12", 294},
+                                                     {"13", 328},
+                                                     {"14", 345},
+                                                     {"14.375", 345}}) {
+    Check(h3::ResolveDurationFrames(seconds) == frames,
+          "duration uses the official 24-fps VAE grid");
+    auto parameters = h3::ResolveGenerationPreset("exact-1344x768");
+    parameters->frames = frames;
+    std::string error;
+    Check(h3::ValidateGenerationParameters(*parameters, &error), error);
+  }
+  for (const auto seconds :
+       {"", "0", "2", "4.99", "14.376", "15", "16", "nan", "inf", "5x"}) {
+    Check(!h3::ResolveDurationFrames(seconds),
+          "invalid or over-limit aligned duration is rejected");
+  }
+}
+
 bool HasPartial(const std::filesystem::path& target) {
   const std::filesystem::path parent = target.parent_path().empty()
                                            ? std::filesystem::path(".")
@@ -329,6 +358,7 @@ void TestAtomicLatents() {
 }  // namespace
 
 int main() {
+  TestDurations();
   TestGateRankedBlocks();
   TestPresetsAndReports();
   TestAtomicFrames();
