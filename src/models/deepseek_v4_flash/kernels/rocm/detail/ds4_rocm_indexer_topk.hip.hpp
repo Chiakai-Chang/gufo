@@ -433,12 +433,12 @@ __global__ static void indexer_topk_tree_merge_pow2_kernel(
 // candidates remain, then sort their complete score/index keys. Keeping the
 // input keys in registers avoids rescanning score memory. Prefix compression
 // skips identical digits, including large ties in the floating-point score.
-template<uint32_t MAX_N>
+template<uint32_t MAX_N, uint32_t THREADS = 256>
 __global__ static void indexer_partial_topk_kernel(uint32_t* selected,
                                                    const float* scores,
                                                    uint32_t n,
                                                    uint32_t tokens) {
-  constexpr uint32_t threads = 256, waves = threads / 32, cap = 1024;
+  constexpr uint32_t threads = THREADS, waves = threads / 32, cap = 1024;
   using Sort = hipcub::BlockRadixSort<uint64_t, threads, cap / threads>;
   __shared__ typename Sort::TempStorage sort_storage;
   __shared__ uint32_t histogram[waves][16];
@@ -587,18 +587,21 @@ __global__ static void indexer_partial_topk_kernel(uint32_t* selected,
   }
 }
 
-// The parallel tree wins beyond this range; wide prefill retains its full sort.
+// Partial selection also avoids sorting most scores in wide prefill batches.
+// The parallel tree covers contexts beyond the register-resident input range.
 static bool indexer_partial_topk_launch(uint32_t* selected, const float* scores,
                                         uint32_t n_comp, uint32_t n_tokens,
                                         uint32_t top_k) {
-  if (top_k != 512u || n_comp <= 1024u || n_comp > 16384u || n_tokens == 0u ||
-      n_tokens > 6u)
+  if (top_k != 512u || n_comp <= 1024u || n_comp > 32768u || n_tokens == 0u)
     return false;
   if (n_comp <= 8192u)
     indexer_partial_topk_kernel<8192>
         <<<n_tokens, 256>>>(selected, scores, n_comp, n_tokens);
-  else
+  else if (n_comp <= 16384u)
     indexer_partial_topk_kernel<16384>
         <<<n_tokens, 256>>>(selected, scores, n_comp, n_tokens);
+  else
+    indexer_partial_topk_kernel<32768, 512>
+        <<<n_tokens, 512>>>(selected, scores, n_comp, n_tokens);
   return true;
 }

@@ -909,6 +909,8 @@ static bool rocm_graph_alloc_raw_cap(
           ds4_gpu_tensor_alloc(pc * indexer_q_dim * sizeof(float));
       g->batch_indexer_weights =
           ds4_gpu_tensor_alloc(pc * DS4_N_INDEXER_HEAD * sizeof(float));
+      // Indexer scoring may borrow this range for F16 keys before attention
+      // writes its heads. It is disjoint from the still-live attention Q.
       g->batch_heads =
           ds4_gpu_tensor_view(g->batch_stage_scratch, q_bytes, q_bytes);
       g->batch_attn_low = ds4_gpu_tensor_alloc(pc * low_dim * sizeof(float));
@@ -3299,14 +3301,14 @@ static bool rocm_graph_encode_layer_attention_batch(
                                                                     n_comp,
                                                                     &index_stage_t0);
                 }
-                ok =
-                    ok &&
-                    rocm_graph_reserve_indexer_scores(g, n_comp, n_tokens) &&
-                    ds4_gpu_indexer_scores_decode_batch_tensor(
-                        g->indexer_scores, g->batch_indexer_q,
-                        g->batch_indexer_weights, g->layer_index_comp_cache[il],
-                        n_comp, n_tokens, pos0, DS4_N_INDEXER_HEAD,
-                        DS4_N_INDEXER_HEAD_DIM, ratio, index_scale) != 0;
+                ok = ok &&
+                     rocm_graph_reserve_indexer_scores(g, n_comp, n_tokens) &&
+                     ds4_gpu_indexer_scores_decode_batch_tensor(
+                         g->indexer_scores, g->batch_indexer_q,
+                         g->batch_indexer_weights,
+                         g->layer_index_comp_cache[il], n_comp, n_tokens, pos0,
+                         DS4_N_INDEXER_HEAD, DS4_N_INDEXER_HEAD_DIM, ratio,
+                         index_scale, g->batch_heads) != 0;
                 if (ok && index_stage_profile) {
                     ok = rocm_graph_indexer_stage_profile_boundary("score",
                                                                     il,
@@ -3391,7 +3393,8 @@ static bool rocm_graph_encode_layer_attention_batch(
                      g->indexer_scores, g->batch_indexer_q,
                      g->batch_indexer_weights, g->layer_index_comp_cache[il],
                      n_comp, n_tokens, DS4_N_INDEXER_HEAD,
-                     DS4_N_INDEXER_HEAD_DIM, ratio, index_scale) != 0;
+                     DS4_N_INDEXER_HEAD_DIM, ratio, index_scale,
+                     g->batch_heads) != 0;
             if (ok && index_stage_profile) {
                 ok = rocm_graph_indexer_stage_profile_boundary("score",
                                                                 il,

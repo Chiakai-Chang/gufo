@@ -93,188 +93,6 @@ __global__ static void indexer_scores_kernel(
     if (threadIdx.x == 0) scores[(uint64_t)t * n_comp + c] = total * scale;
 }
 
-__global__ static void indexer_scores_wmma128_kernel(
-        float *scores,
-        const float *q,
-        const float *weights,
-        const float *index_comp,
-        uint32_t n_comp,
-        uint32_t n_tokens,
-        uint32_t pos0,
-        uint32_t n_head,
-        uint32_t head_dim,
-        uint32_t ratio,
-        float scale,
-        int causal) {
-#if __ROCM_ARCH__ >= 700 || defined(__HIP_DEVICE_COMPILE__)
-#ifdef __HIP_PLATFORM_AMD__
-    namespace wmma = rocwmma;
-#else
-    namespace wmma = nvhip::wmma;
-#endif
-    const uint32_t tile_c = blockIdx.x * 128u;
-    const uint32_t tile_t = blockIdx.y * 16u;
-    const uint32_t tid = threadIdx.x;
-    const uint32_t warp = tid >> 5u;
-    if (tid >= 256u || head_dim != 128u) return;
-
-    if (causal) {
-        const uint32_t last_token = min(tile_t + 16u, n_tokens);
-        const uint32_t max_visible = last_token > tile_t
-            ? min((pos0 + last_token) / ratio, n_comp)
-            : 0u;
-        if (tile_c >= max_visible) {
-            for (uint32_t i = tid; i < 16u * 128u; i += 256u) {
-                const uint32_t r = i >> 7u;
-                const uint32_t c = i & 127u;
-                const uint32_t token = tile_t + r;
-                const uint32_t comp = tile_c + c;
-                if (token < n_tokens && comp < n_comp) {
-                    scores[(uint64_t)token * n_comp + comp] = -INFINITY;
-                }
-            }
-            return;
-        }
-    }
-
-    /* `c_sh` is gone. It existed only to redistribute each warp's 16x16 result
-     * so that all 256 threads could stripe across all eight warp tiles, which
-     * forced a store, a barrier and a strided read per head, 64 heads deep, plus
-     * 8,192 B of LDS. Instead each warp now accumulates its *own* tile in
-     * registers, reachable because the gfx1151 wave32 accumulator maps element
-     * `e` of lane `l` to (row `2 * e + l / 16`, col `l % 16`) -- recovered by
-     * `rocm/tools/wmma_acc_layout.cpp`, not assumed.
-     *
-     * LDS drops 12,288 -> 4,096 B, so residency stops being LDS-bound and hits
-     * the 16-waves-per-SIMD ceiling instead: 1 workgroup per CU becomes 4. The
-     * per-output accumulation order over heads is unchanged, so this is
-     * bit-identical. `b_sh` stays: it is staged once and reused by all 64 heads,
-     * and serving those B fragments from global instead would re-read 8.4 GB. */
-    /* `a_sh` is double buffered. Each head's 16x128 q tile is a scattered global
-     * read -- consecutive token rows are `n_head * head_dim` floats apart, so 16
-     * separate cache lines -- and it used to sit between two barriers with only
-     * eight `mma_sync` of work after it, 64 heads deep: 128 barriers per block
-     * with the load latency fully exposed. Staging head h+1 into the other
-     * buffer before consuming head h leaves one barrier per head and lets that
-     * read retire underneath the matrix ops. FETCH_SIZE says this kernel moves
-     * 9.9 GB/s, 4% of the DRAM ceiling, so it is latency bound rather than
-     * bandwidth bound and the extra 4 KiB is free. Head accumulation order is
-     * unchanged, so output is bit-identical. */
-    /* q is staged **transposed**, as qt[d][token]. The product becomes
-     * scoresT[comp][token] = K[comp][d] . Qt[d][token], which makes both
-     * fragments row_major: `b_sh` is already [comp][d]. A col_major matrix_b
-     * load costs several times its row_major twin on gfx1151 -- the same swap in
-     * this model's attention score pass was worth -21% to -31% of that kernel.
-     * The pitch carries +2 halves so the 16 token columns of consecutive `d`
-     * rows do not share LDS banks. */
-    constexpr uint32_t QT_PITCH = 18u;
-    __shared__ __half a_sh[2][128 * QT_PITCH];
-    __shared__ __half b_sh[128 * 128];
-
-    const uint32_t lane = tid & 31u;
-    /* The gfx1151 wave32 accumulator maps element `e` of lane `l` to
-     * (row 2 * e + l / 16, col l % 16). Rows are now comp and cols are tokens,
-     * so the token is fixed per lane and comp varies with `e` -- the reverse of
-     * the untransposed form. */
-    const uint32_t acc_col = lane & 15u;
-    const uint32_t acc_row_base = lane >> 4u;
-    const uint32_t token_own = tile_t + acc_col;
-    const uint32_t comp_base = tile_c + warp * 16u + acc_row_base;
-
-    float acc[8];
-#pragma unroll
-    for (uint32_t i = 0; i < 8u; i++) acc[i] = 0.0f;
-
-    /* Four values per lane: a single half is a 2-byte LDS store, which uses half
-     * the bytes the LDS can retire per cycle and shares banks between adjacent
-     * lanes. The row pitch is 128 halves and `d` steps by four, so the uint2 store
-     * and the float4 read are both aligned. */
-    for (uint32_t i4 = tid; i4 < 128u * 32u; i4 += 256u) {
-        const uint32_t c = i4 >> 5u;
-        const uint32_t d = (i4 & 31u) * 4u;
-        const uint32_t comp = tile_c + c;
-        uint2 packed = make_uint2(0u, 0u);
-        if (comp < n_comp) {
-            const float4 v4 = *reinterpret_cast<const float4 *>(
-                    index_comp + (uint64_t)comp * head_dim + d);
-            const __half2 lo = __floats2half2_rn(v4.x, v4.y);
-            const __half2 hi = __floats2half2_rn(v4.z, v4.w);
-            packed.x = *reinterpret_cast<const uint32_t *>(&lo);
-            packed.y = *reinterpret_cast<const uint32_t *>(&hi);
-        }
-        *reinterpret_cast<uint2 *>(&b_sh[d + c * 128u]) = packed;
-    }
-    __syncthreads();
-
-    /* Stage one head's 16x128 q tile transposed into `dst` as qt[d][token]. The
-     * global read stays a coalesced float4 over four consecutive `d`; the four
-     * halves then land in four different `d` rows, so the stores are scalar. */
-    const auto stage_q_head = [&](uint32_t h, __half *dst) {
-        for (uint32_t i4 = tid; i4 < 16u * 32u; i4 += 256u) {
-            const uint32_t r = i4 >> 5u;
-            const uint32_t d = (i4 & 31u) * 4u;
-            const uint32_t token = tile_t + r;
-            float4 v4 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            if (token < n_tokens) {
-                v4 = *reinterpret_cast<const float4 *>(
-                        q + ((uint64_t)token * n_head + h) * head_dim + d);
-            }
-            dst[(d + 0u) * QT_PITCH + r] = __float2half_rn(v4.x);
-            dst[(d + 1u) * QT_PITCH + r] = __float2half_rn(v4.y);
-            dst[(d + 2u) * QT_PITCH + r] = __float2half_rn(v4.z);
-            dst[(d + 3u) * QT_PITCH + r] = __float2half_rn(v4.w);
-        }
-    };
-
-    if (n_head != 0u) stage_q_head(0u, a_sh[0]);
-    __syncthreads();
-
-    for (uint32_t h = 0; h < n_head; h++) {
-        const uint32_t cur = h & 1u;
-        /* Issue the next head's scattered global read now. It targets the other
-         * buffer, so it cannot race this head's reads below, and the barrier at
-         * the end of the iteration publishes it. */
-        if (h + 1u < n_head) stage_q_head(h + 1u, a_sh[cur ^ 1u]);
-
-        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a_frag;
-        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b_frag;
-        wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
-        wmma::fill_fragment(c_frag, 0.0f);
-        const uint32_t comp_row0 = warp * 16u;
-        for (uint32_t k0 = 0; k0 < 128u; k0 += 16u) {
-            wmma::load_matrix_sync(a_frag, b_sh + comp_row0 * 128u + k0, 128);
-            wmma::load_matrix_sync(b_frag, a_sh[cur] + k0 * QT_PITCH, QT_PITCH);
-            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
-        }
-        /* The token is fixed per lane, so its head weight is one load rather
-         * than eight. */
-        if (token_own < n_tokens) {
-            const float w = weights[(uint64_t)token_own * n_head + h];
-#pragma unroll
-            for (uint32_t e = 0; e < 8u; e++) {
-                acc[e] += fmaxf(c_frag.x[e], 0.0f) * w;
-            }
-        }
-        /* Orders this head's `a_sh[cur]` reads against the writes that iteration
-         * h+1 makes to that same buffer, and publishes `a_sh[cur ^ 1]`. */
-        __syncthreads();
-    }
-
-    if (token_own < n_tokens) {
-        const uint32_t visible = causal ? (pos0 + token_own + 1u) / ratio : n_comp;
-#pragma unroll
-        for (uint32_t e = 0; e < 8u; e++) {
-            const uint32_t comp = comp_base + 2u * e;
-            if (comp < n_comp) {
-                float out = acc[e] * scale;
-                if (causal && comp >= visible) out = -INFINITY;
-                scores[(uint64_t)token_own * n_comp + comp] = out;
-            }
-        }
-    }
-#endif
-}
-
 /* DSpark Markov correction: select argmax(logits + W2 * W1[prev]) without
  * moving the vocabulary row back to the host. W1 and W2 are Q8_0. */
 __global__ static void dspark_markov_argmax_kernel(
@@ -498,54 +316,57 @@ __global__ static void indexed_topk_sort_512_asc_kernel(
     dst_row[tid] = rows[tid];
 }
 
-static int indexer_scores_launch(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                pos0,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                ratio,
-        float                   scale,
-        uint32_t                causal) {
-    if (!scores || !q || !weights || !index_comp ||
-        n_comp == 0 || n_tokens == 0 || n_head == 0 || head_dim == 0 ||
-        q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
-        weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
-        index_comp->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
-        scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
-        return 0;
+static int indexer_scores_launch(ds4_gpu_tensor* scores,
+                                 const ds4_gpu_tensor* q,
+                                 const ds4_gpu_tensor* weights,
+                                 const ds4_gpu_tensor* index_comp,
+                                 uint32_t n_comp, uint32_t n_tokens,
+                                 uint32_t pos0, uint32_t n_head,
+                                 uint32_t head_dim, uint32_t ratio, float scale,
+                                 uint32_t causal, ds4_gpu_tensor* key_scratch) {
+  if (!scores || !q || !weights || !index_comp || n_comp == 0 ||
+      n_tokens == 0 || n_head == 0 || head_dim == 0 ||
+      q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
+      weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
+      index_comp->bytes < (uint64_t)n_comp * head_dim * sizeof(float) ||
+      scores->bytes < (uint64_t)n_tokens * n_comp * sizeof(float)) {
+    return 0;
+  }
+  if (causal && ratio == 0)
+    return 0;
+  if ((n_tokens == 1u || ds4_rocm_verifier_batch_mode()) && head_dim == 128u &&
+      n_head == 64u) {
+    indexer_score_one_direct_kernel<<<dim3(n_comp, n_tokens), 128>>>(
+        (float*)scores->ptr, (const float*)q->ptr, (const float*)weights->ptr,
+        (const float*)index_comp->ptr, n_comp, pos0, ratio, scale,
+        causal ? 1 : 0);
+    return hip_ok(hipGetLastError(), "indexer score one direct launch");
+  }
+  if (head_dim == 128u && n_head == 64u) {
+    dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
+    const uint64_t padded = ((uint64_t(n_comp) + 127u) / 128u) * 128u * 128u;
+    if (key_scratch && key_scratch->bytes >= padded * sizeof(__half)) {
+      auto* packed = static_cast<__half*>(key_scratch->ptr);
+      indexer_pack_keys_kernel<<<(padded + 255u) / 256u, 256>>>(
+          static_cast<const float*>(index_comp->ptr), packed, n_comp, padded);
+      indexer_scores_wmma128_kernel<true><<<grid, 256>>>(
+          static_cast<float*>(scores->ptr), static_cast<const float*>(q->ptr),
+          static_cast<const float*>(weights->ptr), packed, n_comp, n_tokens,
+          pos0, n_head, head_dim, ratio, scale, causal ? 1 : 0);
+    } else {
+      indexer_scores_wmma128_kernel<false><<<grid, 256>>>(
+          static_cast<float*>(scores->ptr), static_cast<const float*>(q->ptr),
+          static_cast<const float*>(weights->ptr), index_comp->ptr, n_comp,
+          n_tokens, pos0, n_head, head_dim, ratio, scale, causal ? 1 : 0);
     }
-    if (causal && ratio == 0) return 0;
-    if ((n_tokens == 1u || ds4_rocm_verifier_batch_mode()) &&
-        head_dim == 128u && n_head == 64u) {
-      indexer_score_one_direct_kernel<<<dim3(n_comp, n_tokens), 128>>>(
-          (float*)scores->ptr, (const float*)q->ptr, (const float*)weights->ptr,
-          (const float*)index_comp->ptr, n_comp, pos0, ratio, scale,
-          causal ? 1 : 0);
-      return hip_ok(hipGetLastError(), "indexer score one direct launch");
-    }
-    if (head_dim == 128u && n_head == 64u) {
-        dim3 grid((n_comp + 127u) / 128u, (n_tokens + 15u) / 16u, 1);
-        indexer_scores_wmma128_kernel<<<grid, 256>>>((float *)scores->ptr,
-                                                     (const float *)q->ptr,
-                                                     (const float *)weights->ptr,
-                                                     (const float *)index_comp->ptr,
-                                                     n_comp, n_tokens, pos0, n_head,
-                                                     head_dim, ratio, scale, causal ? 1 : 0);
-        return hip_ok(hipGetLastError(), "indexer scores wmma128 launch");
-    }
-    dim3 grid(n_comp, n_tokens, 1);
-    indexer_scores_kernel<<<grid, 256>>>((float *)scores->ptr,
-                                         (const float *)q->ptr,
-                                         (const float *)weights->ptr,
-                                         (const float *)index_comp->ptr,
-                                         n_comp, n_tokens, pos0, n_head,
-                                         head_dim, ratio, scale, causal ? 1 : 0);
-    return hip_ok(hipGetLastError(), "indexer scores launch");
+    return hip_ok(hipGetLastError(), "indexer scores wmma128 launch");
+  }
+  dim3 grid(n_comp, n_tokens, 1);
+  indexer_scores_kernel<<<grid, 256>>>(
+      (float*)scores->ptr, (const float*)q->ptr, (const float*)weights->ptr,
+      (const float*)index_comp->ptr, n_comp, n_tokens, pos0, n_head, head_dim,
+      ratio, scale, causal ? 1 : 0);
+  return hip_ok(hipGetLastError(), "indexer scores launch");
 }
 
 extern "C" int ds4_gpu_indexer_score_one_tensor(
@@ -557,39 +378,29 @@ extern "C" int ds4_gpu_indexer_score_one_tensor(
         uint32_t                n_head,
         uint32_t                head_dim,
         float                   scale) {
-    return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
-                                 n_head, head_dim, 1, scale, 0);
+  return indexer_scores_launch(scores, q, weights, index_comp, n_comp, 1, 0,
+                               n_head, head_dim, 1, scale, 0, nullptr);
 }
 
 extern "C" int ds4_gpu_indexer_scores_prefill_tensor(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                ratio,
-        float                   scale) {
-    return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, 0,
-                                 n_head, head_dim, ratio, scale, 1);
+    ds4_gpu_tensor* scores, const ds4_gpu_tensor* q,
+    const ds4_gpu_tensor* weights, const ds4_gpu_tensor* index_comp,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t n_head, uint32_t head_dim,
+    uint32_t ratio, float scale, ds4_gpu_tensor* key_scratch) {
+  return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens,
+                               0, n_head, head_dim, ratio, scale, 1,
+                               key_scratch);
 }
 
 extern "C" int ds4_gpu_indexer_scores_decode_batch_tensor(
-        ds4_gpu_tensor       *scores,
-        const ds4_gpu_tensor *q,
-        const ds4_gpu_tensor *weights,
-        const ds4_gpu_tensor *index_comp,
-        uint32_t                n_comp,
-        uint32_t                n_tokens,
-        uint32_t                pos0,
-        uint32_t                n_head,
-        uint32_t                head_dim,
-        uint32_t                ratio,
-        float                   scale) {
-    return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens, pos0,
-                                 n_head, head_dim, ratio, scale, 1);
+    ds4_gpu_tensor* scores, const ds4_gpu_tensor* q,
+    const ds4_gpu_tensor* weights, const ds4_gpu_tensor* index_comp,
+    uint32_t n_comp, uint32_t n_tokens, uint32_t pos0, uint32_t n_head,
+    uint32_t head_dim, uint32_t ratio, float scale,
+    ds4_gpu_tensor* key_scratch) {
+  return indexer_scores_launch(scores, q, weights, index_comp, n_comp, n_tokens,
+                               pos0, n_head, head_dim, ratio, scale, 1,
+                               key_scratch);
 }
 
 extern "C" int ds4_gpu_indexer_topk_tensor(
@@ -614,66 +425,6 @@ extern "C" int ds4_gpu_indexer_topk_tensor(
                                                      (const float *)scores->ptr,
                                                      n_comp, n_tokens, top_k);
         return hip_ok(hipGetLastError(), "indexer topk 1024 launch");
-    }
-    if (top_k == 512u && n_comp <= 2048u) {
-        indexer_topk_pow2_kernel<2048><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k);
-        return hip_ok(hipGetLastError(), "indexer topk 2048 launch");
-    }
-    if (top_k == 512u && n_comp <= 4096u) {
-        if (n_comp == 4096u) {
-            using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
-            const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
-            int dev = 0;
-            int max_optin_smem = 0;
-            hipError_t attr_err = hipGetDevice(&dev);
-            if (attr_err == hipSuccess) {
-                attr_err = hipDeviceGetAttribute(&max_optin_smem,
-                                                  hipDeviceAttributeSharedMemPerBlockOptin,
-                                                  dev);
-            }
-            if (attr_err == hipSuccess && max_optin_smem >= smem) {
-                attr_err = ds4_hip_set_dynamic_shared_memory(indexer_topk_8192_cub_kernel, smem);
-                if (attr_err == hipSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
-                    return hip_ok(hipGetLastError(), "indexer topk 4096 cub launch");
-                }
-            }
-        }
-        indexer_topk_pow2_kernel<4096><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                           (const float *)scores->ptr,
-                                                           n_comp, n_tokens, top_k);
-        return hip_ok(hipGetLastError(), "indexer topk 4096 launch");
-    }
-    if (top_k == 512u && n_comp <= 8192u) {
-        if (n_comp > 4096u) {
-            using TopkCubSort = cub::BlockRadixSort<uint64_t, 512, 16>;
-            const int smem = (int)sizeof(typename TopkCubSort::TempStorage);
-            int dev = 0;
-            int max_optin_smem = 0;
-            hipError_t attr_err = hipGetDevice(&dev);
-            if (attr_err == hipSuccess) {
-                attr_err = hipDeviceGetAttribute(&max_optin_smem,
-                                                  hipDeviceAttributeSharedMemPerBlockOptin,
-                                                  dev);
-            }
-            if (attr_err == hipSuccess && max_optin_smem >= smem) {
-                attr_err = ds4_hip_set_dynamic_shared_memory(indexer_topk_8192_cub_kernel, smem);
-                if (attr_err == hipSuccess) {
-                    indexer_topk_8192_cub_kernel<<<n_tokens, 512, (size_t)smem>>>((uint32_t *)selected->ptr,
-                                                                                 (const float *)scores->ptr,
-                                                                                 n_comp, n_tokens, top_k);
-                    return hip_ok(hipGetLastError(), "indexer topk 8192 cub launch");
-                }
-            }
-        }
-        indexer_topk_pow2_u16_kernel<8192><<<n_tokens, 1024>>>((uint32_t *)selected->ptr,
-                                                               (const float *)scores->ptr,
-                                                               n_comp, n_tokens, top_k);
-        return hip_ok(hipGetLastError(), "indexer topk 8192 launch");
     }
     if (top_k == 1024u && n_comp <= 1024u) {
         indexer_topk_1024_kernel<<<n_tokens, 1024>>>((uint32_t *)selected->ptr,

@@ -72,9 +72,12 @@ void CheckPinnedTrajectory(
   int top1_matches = 0;
   std::uint64_t rank_sum = 0;
   int worst_rank = 0;
+  gufo::crypto::Sha256Hasher fingerprint;
   for (const int expected_token : kPinnedDs4Trajectory) {
     const auto logits = session->CopyLogits(&error);
     Expect(!logits.empty(), error);
+    fingerprint.Update({reinterpret_cast<const std::uint8_t*>(logits.data()),
+                        logits.size() * sizeof(float)});
     Expect(expected_token >= 0 &&
                static_cast<std::size_t>(expected_token) < logits.size(),
            "trajectory token range");
@@ -96,7 +99,7 @@ void CheckPinnedTrajectory(
 
   std::cout << "Pinned DS4 trajectory: top1=" << top1_matches
             << "/128 rank_sum=" << rank_sum << " worst_rank=" << worst_rank
-            << '\n';
+            << " logits_sha256=" << fingerprint.FinishHex() << '\n';
   Expect(top1_matches >= 116, "128-token top-1 agreement");
   Expect(rank_sum <= 142, "128-token aggregate rank");
   Expect(worst_rank <= 3, "128-token worst rank");

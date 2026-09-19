@@ -214,6 +214,113 @@ void check_indexer_scores(bool benchmark) {
       "including verifier masks and poisoned rows");
 }
 
+void check_indexer_prefill_scores() {
+  constexpr uint32_t heads = 64, dim = 128, ratio = 4;
+  const float scale = 1.0F / std::sqrt(float(heads * dim));
+  struct Shape {
+    uint32_t keys, tokens, position;
+  };
+  std::mt19937 gen(732);
+  std::uniform_real_distribution<float> dist(-1.0F, 1.0F);
+  for (const auto [rows, tokens, pos0] :
+       {Shape{1024, 33, 0}, Shape{513, 17, 2048}, Shape{8704, 33, 32768},
+        Shape{8704, 2048, 32768}, Shape{16385, 17, 65536}}) {
+    std::vector<float> q(size_t(tokens) * heads * dim), k(size_t(rows) * dim),
+        weights(size_t(tokens) * heads), expected(size_t(tokens) * rows),
+        actual(expected.size());
+    for (auto* values : {&q, &k, &weights})
+      for (auto& value : *values)
+        value = dist(gen);
+    std::copy_n(k.begin(), dim, k.begin() + dim);
+    const auto visible_end = std::min(rows, (pos0 + tokens) / ratio);
+    std::fill(k.begin() + size_t(visible_end) * dim, k.end(),
+              std::numeric_limits<float>::quiet_NaN());
+    const uint64_t padded = ((uint64_t(rows) + 127) / 128) * 128 * dim;
+    float *dq, *dk, *dw, *out;
+    __half* storage;
+    check(hipMalloc(&dq, q.size() * sizeof(float)));
+    check(hipMalloc(&dk, k.size() * sizeof(float)));
+    check(hipMalloc(&dw, weights.size() * sizeof(float)));
+    check(hipMalloc(&out, expected.size() * sizeof(float)));
+    check(hipMalloc(&storage, (padded + 64) * sizeof(__half)));
+    check(hipMemcpy(dq, q.data(), q.size() * sizeof(float),
+                    hipMemcpyHostToDevice));
+    check(hipMemcpy(dk, k.data(), k.size() * sizeof(float),
+                    hipMemcpyHostToDevice));
+    check(hipMemcpy(dw, weights.data(), weights.size() * sizeof(float),
+                    hipMemcpyHostToDevice));
+    const dim3 grid((rows + 127) / 128, (tokens + 15) / 16);
+    indexer_scores_wmma128_kernel<false><<<grid, 256>>>(
+        out, dq, dw, dk, rows, tokens, pos0, heads, dim, ratio, scale, 1);
+    check(hipMemcpy(expected.data(), out, expected.size() * sizeof(float),
+                    hipMemcpyDeviceToHost));
+    for (unsigned repeat = 0; repeat < 2; ++repeat) {
+      check(hipMemset(storage, 0xA5, (padded + 64) * sizeof(__half)));
+      auto* packed = storage + 32;
+      indexer_pack_keys_kernel<<<(padded + 255) / 256, 256>>>(dk, packed, rows,
+                                                              padded);
+      indexer_scores_wmma128_kernel<true><<<grid, 256>>>(
+          out, dq, dw, packed, rows, tokens, pos0, heads, dim, ratio, scale, 1);
+      check(hipMemcpy(actual.data(), out, actual.size() * sizeof(float),
+                      hipMemcpyDeviceToHost));
+      if (std::memcmp(expected.data(), actual.data(),
+                      actual.size() * sizeof(float)) != 0) {
+        std::fprintf(stderr, "Packed indexer differs: keys=%u tokens=%u\n",
+                     rows, tokens);
+        std::exit(7);
+      }
+      for (const auto* guard : {storage, packed + padded}) {
+        uint16_t values[32];
+        check(hipMemcpy(values, guard, sizeof(values), hipMemcpyDeviceToHost));
+        for (const auto value : values)
+          if (value != 0xA5A5) {
+            std::fprintf(stderr, "Packed indexer overwrote its workspace\n");
+            std::exit(7);
+          }
+      }
+    }
+    for (uint32_t t = 0; t < tokens; ++t) {
+      const auto visible = std::min(rows, (pos0 + t + 1) / ratio);
+      for (uint32_t c = 0; c < rows; ++c) {
+        const float value = actual[size_t(t) * rows + c];
+        if ((c < visible && !std::isfinite(value)) ||
+            (c >= visible && value != -INFINITY)) {
+          std::fprintf(stderr, "Packed indexer lost its causal mask\n");
+          std::exit(7);
+        }
+      }
+    }
+    // Independent F64 dots of the same F16 operands, with CPU work bounded
+    // independently of the production-sized query/key matrix.
+    for (uint32_t t : {0u, tokens / 2, tokens - 1}) {
+      const auto visible = std::min(rows, (pos0 + t + 1) / ratio);
+      for (uint32_t c : {0u, 1u, rows / 2, rows - 1}) {
+        if (c >= visible)
+          continue;
+        double reference = 0.0;
+        for (uint32_t h = 0; h < heads; ++h) {
+          double dot = 0.0;
+          for (uint32_t d = 0; d < dim; ++d)
+            dot += double(__half2float(
+                       __float2half_rn(q[(size_t(t) * heads + h) * dim + d]))) *
+                   __half2float(__float2half_rn(k[size_t(c) * dim + d]));
+          reference += std::max(dot, 0.0) * weights[size_t(t) * heads + h];
+        }
+        reference *= scale;
+        if (std::abs(reference - actual[size_t(t) * rows + c]) >
+            1e-4 + 2e-6 * std::abs(reference)) {
+          std::fprintf(stderr, "Packed indexer differs from F64 formula\n");
+          std::exit(7);
+        }
+      }
+    }
+    for (auto* pointer : {dq, dk, dw, out})
+      check(hipFree(pointer));
+    check(hipFree(storage));
+  }
+  std::puts("Indexer prefill: five shapes exact, F64, masks and guards passed");
+}
+
 // Previous production arithmetic, retained only as the bitwise oracle. The
 // independent CPU calculation below additionally checks the attention formula.
 __global__ static void reference_attention(float* heads, const float* sinks,
@@ -673,6 +780,7 @@ int main(int argc, char** argv) {
   }
 
   check_indexer_scores(benchmark);
+  check_indexer_prefill_scores();
   check_indexer_selection(benchmark);
   check_target_attention();
   check_dspark_window();

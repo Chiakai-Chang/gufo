@@ -64,8 +64,13 @@ void check_indexer_selection(bool benchmark) {
     radix_bytes = 0;
   std::mt19937 random(731);
   std::uniform_real_distribution<float> values(-4.F, 4.F);
-  for (uint32_t tokens : {1u, 6u}) {
-    for (uint32_t n : {1025u, 2048u, 2049u, 4096u, 8192u, 16384u}) {
+  unsigned cases_passed = 0;
+  for (uint32_t tokens : {1u, 6u, 33u, 2048u}) {
+    for (uint32_t n :
+         {1025u, 2048u, 2049u, 4096u, 8192u, 8704u, 16384u, 16385u, 32768u}) {
+      if ((tokens == 33 && n < 4096) ||
+          (tokens == 2048 && n != 8704 && n != 16385))
+        continue;
       std::vector<float> input(n * tokens);
       std::vector<uint32_t> expected(512 * tokens), actual(expected.size()),
           reference(expected.size());
@@ -74,7 +79,7 @@ void check_indexer_selection(bool benchmark) {
       check(hipMalloc(&scores, input.size() * sizeof(float)));
       check(hipMalloc(&out, actual.size() * sizeof(uint32_t)));
       check(hipMalloc(&ref, actual.size() * sizeof(uint32_t)));
-      check(hipMalloc(&scratch, tokens * 2048 * sizeof(uint32_t)));
+      check(hipMalloc(&scratch, tokens * 4096 * sizeof(uint32_t)));
       for (unsigned mode = 0; mode < 6; ++mode) {
         for (uint32_t t = 0; t < tokens; ++t) {
           for (uint32_t i = 0; i < n; ++i) {
@@ -125,7 +130,9 @@ void check_indexer_selection(bool benchmark) {
             std::exit(8);
           }
         }
+        ++cases_passed;
         if (benchmark && (mode == 0 || mode == 2 || mode == 4)) {
+          const int repetitions = tokens > 6 ? 3 : 50;
           hipEvent_t start, end;
           check(hipEventCreate(&start));
           check(hipEventCreate(&end));
@@ -143,7 +150,7 @@ void check_indexer_selection(bool benchmark) {
               for (int i = 0; i < 5; ++i)
                 launch();
               check(hipEventRecord(start));
-              for (int i = 0; i < 50; ++i)
+              for (int i = 0; i < repetitions; ++i)
                 launch();
               check(hipEventRecord(end));
               check(hipEventSynchronize(end));
@@ -152,7 +159,8 @@ void check_indexer_selection(bool benchmark) {
             std::printf(
                 "selection n=%u tokens=%u mode=%u pass=%d old_us=%.3f "
                 "new_us=%.3f\n",
-                n, tokens, mode, pass, ms[0] * 20.F, ms[1] * 20.F);
+                n, tokens, mode, pass, ms[0] * 1000.F / repetitions,
+                ms[1] * 1000.F / repetitions);
           }
           check(hipEventDestroy(start));
           check(hipEventDestroy(end));
@@ -163,7 +171,8 @@ void check_indexer_selection(bool benchmark) {
         check(hipFree(ptr));
     }
   }
-  std::puts(
-      "Indexer selection: 72 cases exact twice against CPU ordering and "
-      "fallback kernels, including signed-zero ties and causal masks");
+  std::printf(
+      "Indexer selection: %u cases exact twice against CPU ordering and "
+      "fallback kernels, including signed-zero ties and causal masks\n",
+      cases_passed);
 }

@@ -21,12 +21,13 @@ to the target filename used here.
 | Published ROCm | 0.398181736 | 56/100 | 5.170 |
 | Published CUDA | 0.404714573 | 55/100 | 4.890 |
 | Same-machine upstream control | 0.403401036 | 54/100 | 5.240 |
-| Gufo | 0.399423334 | 56/100 | 5.470 |
+| Gufo, legacy Debug | 0.399423334 | 56/100 | 5.470 |
+| Gufo, optimized (2026-09-19) | 0.400592218 | 56/100 | 5.280 |
 
 First-token matches measure agreement with the hosted model, independently of
 the question-answer grades below. The same-machine runs use the same GGUF and
-pinned upstream source. Gufo repeats exactly across all 105 cases / 2,327
-steps. Its 100-case NLL difference is −0.003978; a paired case bootstrap gives
+pinned upstream source. The legacy Debug run repeats exactly across all 105
+cases / 2,327 steps. Its 100-case NLL difference is −0.003978; a paired case bootstrap gives
 a 95% interval of [−0.011932, +0.003730]. This finds no regression in this
 sample and does not establish an improvement.
 
@@ -36,6 +37,30 @@ lower continuation likelihood, including the short reasoning and long memory
 prompts. These differences remain visible even though greedy answers match.
 The published QA does not pin the GGUF hash/build used for those scores; our
 same-machine control does not reproduce its exact numbers.
+
+The 2026-09-19 optimized/Debug control uses the same source, GGUF and ROCm
+7.2.3 toolchain. Debug reproduces the historical scores. Optimized execution
+has NLL **0.400592** on the 100 cases and **0.034343** on the smoke cases,
+retaining all 14 smoke tokens. Its paired 100-case NLL delta against Debug is
+**+0.001169**, with a 95% case-bootstrap interval of
+**[−0.003416, +0.005655]** (20,000 draws, seed 20260919). The builds disagree
+on 33/2,327 greedy choices. This sample establishes neither equivalence nor
+a quality improvement.
+
+The optimized build also misses the historical trajectory guard:
+**115/128 top-1, rank sum 145, worst rank 4**, versus Debug's **116/128, 142,
+3**. Fresh optimized builds and the unchanged pre-optimization baseline
+produce identical full trajectory logits. Mixed-library controls isolate the
+build sensitivity to `backend.hip.cpp`; both configurations compile it at
+`-O3`, with `NDEBUG` changing assertion control flow in HIP shuffle wrappers.
+The precise arithmetic cause remains under investigation. Limits are unchanged.
+
+The retained indexer changes preserve all ten full-logit prefill vectors from
+the 2K/4K, five-depth control. Five more vectors match across a 64K disk
+snapshot, continued prefill and subsequent decoding. Independent score formulas,
+156 exact top-k cases and 736 DSpark replay token/frontier comparisons pass.
+These checks qualify preservation by the indexer changes, not correction of
+the earlier distribution discrepancies.
 
 The [matched 2K/4K, five-depth comparison](antirez-ds4-ar-comparison.json)
 **fails four of 20 full-logit checks**, all immediately after prefill. Worst

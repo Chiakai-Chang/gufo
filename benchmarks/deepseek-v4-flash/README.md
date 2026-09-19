@@ -1,288 +1,164 @@
 # DeepSeek V4 Flash on Strix Halo
 
-Linux x86-64, AMD Strix Halo `gfx1151`, 128 GB unified memory. All model timings
-use Nix release binaries. `C` is simultaneous requests. Prefill payloads are shown in each table; generation uses **128 tokens** at each
-listed context depth.
+Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Nix release binaries.
+`C` is simultaneous requests. Single-user measurements use **pp2048 / tg128**;
+depth precedes the measured operation. Unknown current measurements are **TODO**.
 
-Results are means of two repetitions. The C1 autoregressive table uses the
-[latest bulk-kernel sweep](bulk-kernels.md); DSpark and
-multiple-user tables retain the earlier [full matrix](speed-matrix.json).
-Both reports retain deviations, token hashes and binary/model identities.
-C1 has the highest per-user generation rate at every depth.
-
-| Artifact | Pin |
-| --- | --- |
-| Target | `antirez/deepseek-v4-gguf`, revision `1cd7b564460821938add0475a60b942c409295e0` |
-| Target file | `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf` (80.76 GiB) |
-| DSpark support | `DeepSeek-V4-Flash-DSpark-support-0731.gguf`, revision `e7f04037032990db0346398d249baf9fb9df1ccc` |
-| Short-trajectory comparison | `antirez/ds4` revision `84cc882352757baf628a1776badf7cc54d584e28` |
-| Official 0731 continuations | `antirez/ds4` revision `6289c516273979173abbc062209a81dd3706b804` |
-| Official computation | `deepseek-ai/DeepSeek-V4-Flash-0731` revision `7872f01b1d1fe23eabc4c98b48bffcef5a386062` |
+Target: `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`
+(80.76 GiB), `antirez/deepseek-v4-gguf` revision
+`1cd7b564460821938add0475a60b942c409295e0`. DSpark support:
+`DeepSeek-V4-Flash-DSpark-support-0731.gguf`, revision
+`e7f04037032990db0346398d249baf9fb9df1ccc`.
 
 ## Single user, autoregressive
 
-| Context depth | pp4096 tok/s | tg128 tok/s |
-| ---: | ---: | ---: |
-| 0 | 490.03 | 17.73 |
-| 4,096 | 482.87 | 15.90 |
-| 8,192 | 471.78 | 15.75 |
-| 12,288 | 465.62 | 15.57 |
-| 16,384 | 457.08 | 15.44 |
-
-The matched 4K control confirms about **0.6% faster prefill** from mixed MoE
-row tiles. Generation has no qualified gain from this round. See the
-[comparison and limits](bulk-kernels.md); the earlier projection/selection
-change delivered the larger [5.4–6.2% generation gain](selection-projection.md).
-
-## Single user, DSpark
+Latest depth control: **2026-09-19**, two release measurements at d0/d32K and
+one at d64K. Where repeated, values are mean ± standard deviation; initial
+kernel setup contributes to depth-zero prefill variation.
 
 | Context depth | pp2048 tok/s | tg128 tok/s |
 | ---: | ---: | ---: |
-| 0 | 452.23 | 16.50 |
-| 4,096 | 440.47 | 39.53 |
-| 8,192 | 432.81 | 38.50 |
-| 12,288 | 427.24 | 37.74 |
-| 16,384 | 420.87 | 36.03 |
+| 0 | 459.83 ± 25.33 | 17.72 ± 0.01 |
+| 4,096 | TODO | TODO |
+| 8,192 | TODO | TODO |
+| 12,288 | TODO | TODO |
+| 16,384 | TODO | TODO |
+| 32,768 | 419.31 ± 3.23 | 14.95 ± 0.00 |
+| 65,536 | 381.34 | 13.93 |
 
-Warm C1 prefill reaches **468.5 / 464.8 tok/s at pp2048** and
-**492.9 / 487.7 tok/s at pp4096** (AR / DSpark; four warm repetitions).
-The first C1/depth-zero prefill row above includes first-use work, which lowers
-its mean and increases its deviation. The full report retains both measurements.
+## Single user, DSpark
+
+Same workload and measurement date. DSpark prefill includes support-state work.
+
+| Context depth | pp2048 tok/s | tg128 tok/s |
+| ---: | ---: | ---: |
+| 0 | 454.77 ± 23.60 | 17.41 ± 0.00 |
+| 4,096 | TODO | TODO |
+| 8,192 | TODO | TODO |
+| 12,288 | TODO | TODO |
+| 16,384 | TODO | TODO |
+| 32,768 | 416.82 ± 2.95 | 35.29 ± 0.01 |
+| 65,536 | 378.90 | 29.88 |
+
+The CLI uses a repeating token sequence. Natural prompts can have substantially
+different acceptance and speed. Depth-zero generation starts from 16 tokens;
+it does not follow the measured 2048-token prefill.
 
 ## Multiple users, autoregressive
 
-Cells are **aggregate pp2048 / per-user tg128**, in tok/s.
+Current pp2048/tg128 depth sweep: **TODO**. Report aggregate prompt throughput
+and per-user generation throughput at each depth.
 
-| Context depth | C2 | C4 | C6 | C8 |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 469.66 / 16.24 | 467.92 / 13.89 | 467.03 / 11.46 | 466.11 / 9.93 |
-| 4,096 | 443.33 / 13.64 | 441.27 / 10.64 | 441.46 / 8.36 | 440.98 / 7.12 |
-| 8,192 | 434.47 / 13.22 | 434.07 / 10.15 | 433.70 / 7.92 | 433.93 / 6.70 |
-| 12,288 | 430.31 / 12.92 | 429.46 / 9.81 | 429.64 / 7.62 | 430.04 / 6.41 |
-| 16,384 | 424.25 / 12.74 | 424.18 / 9.63 | 423.73 / 7.45 | 424.06 / 6.25 |
+| Users | d0 / d4K / d8K / d12K / d16K / d32K |
+| ---: | --- |
+| 2 | TODO |
+| 4 | TODO |
+| 6 | TODO |
+| 8 | TODO |
 
 ## Multiple users, DSpark
 
-Cells are **aggregate pp2048 / per-user tg128**, in tok/s.
+Current pp2048/tg128 depth sweep: **TODO**, including acceptance and output
+checks at every concurrency.
 
-| Context depth | C2 | C4 | C6 | C8 |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 463.78 / 16.11 | 463.05 / 13.00 | 460.27 / 10.82 | 461.10 / 9.63 |
-| 4,096 | 438.88 / 24.78 | 438.76 / 14.21 | 438.71 / 9.18 | 438.59 / 6.98 |
-| 8,192 | 431.19 / 23.88 | 431.52 / 13.69 | 431.51 / 8.84 | 431.49 / 6.57 |
-| 12,288 | 426.60 / 23.14 | 427.06 / 13.25 | 427.04 / 8.59 | 427.18 / 6.65 |
-| 16,384 | 420.83 / 22.50 | 421.07 / 12.86 | 420.97 / 8.34 | 421.23 / 6.44 |
+| Users | d0 / d4K / d8K / d12K / d16K / d32K |
+| ---: | --- |
+| 2 | TODO |
+| 4 | TODO |
+| 6 | TODO |
+| 8 | TODO |
 
-In the earlier matched matrix, DSpark speeds up generation at 4K–16K by **2.48–2.62× at C1,
-1.77–1.82× at C2, 1.34–1.35× at C4, and 1.10–1.13× at C6**.
-C8 is about 2% slower at 4K/8K and 3–4% faster at 12K/16K.
-Depth-zero generation is 0.8–6.4% slower with DSpark on this workload.
+Earlier raw [greedy](speed-matrix.json) and [sampled](sampled-speed-matrix.json)
+matrices retain their release identities, deviations, hashes and counters.
+They are not a refresh of the current kernels.
 
-DSpark chooses draft lengths from [measured cycle costs](cost-calibration.json)
-and backs off when acceptance is too low. It skips cycles whose verification
-cost cannot be repaid even at full acceptance. Decisions use token history and
-offline calibration; wall-clock timing never changes token decisions. Sampled requests
-draft in the same cohort as greedy peers: each verified row is drawn with the
-request sampler and accepted while the draw reproduces the draft, so a seeded
-request emits the tokens autoregressive decoding would; acceptance is the
-target probability of the draft and falls with temperature. Changes
-in concurrency reset the decision history. Complete support state and controller
-state survive snapshots; a new request reusing a prefix starts fresh statistics.
+DSpark chooses draft lengths from offline cycle costs and accepted-token
+history. It backs off when verification cannot repay its cost; live timing
+does not change token decisions. Requests keep private sampling, proposal,
+acceptance and controller state. Snapshots preserve this state; a new request
+reusing a prefix starts fresh controller statistics.
 
-## Sampled requests, `temperature 0.6`
+## Memory
 
-Cells are **per-user tg128 AR / DSpark**, in tok/s, with the DSpark support
-acceptance; `--seed 7`, pp2048, two repetitions, from the
-[sampled matrix](sampled-speed-matrix.json). Every request's DSpark output
-hash equals its autoregressive hash.
+C1 with context capacity **262,144**. GPU-visible unified allocations exclude
+separate CPU memory; capacity does not imply filling the window.
 
-| Context depth | C1 | C2 | C4 |
-| ---: | ---: | ---: | ---: |
-| 0 | 17.27 / 15.69 (0.13) | 16.25 / 24.88 (0.87) | 13.63 / 14.12 (0.91) |
-| 4,096 | 15.46 / 39.15 (1.00) | 13.66 / 24.17 (1.00) | 10.51 / 13.64 (1.00) |
-| 8,192 | 15.31 / 38.34 (1.00) | 13.43 / 22.37 (1.00) | 10.29 / 13.29 (1.00) |
-| 12,288 | 15.15 / 37.56 (1.00) | 13.14 / 21.81 (1.00) | 9.94 / 12.93 (1.00) |
-| 16,384 | 15.03 / 35.93 (0.98) | 12.97 / 21.24 (1.00) | 9.77 / 12.58 (1.00) |
+| DSpark workload | GPU allocation |
+| --- | ---: |
+| pp2048/4096 + tg128 | 90.74 GiB |
+| 16K prefix, pp4096 + tg128 | 91.46 GiB |
 
-The fixed repeating benchmark sequence leaves the target distribution nearly a
-spike at 4K–16K, so sampled acceptance equals greedy acceptance there and the
-speedups (**2.39–2.53× at C1, 1.64–1.77× at C2, 1.29–1.30× at C4**) match the
-greedy tables; the sampled cycle adds no measurable cost. The depth-zero seed
-is the only point where draws reject drafts (C1 backs off after 5 cycles).
-
-Natural text is where temperature matters. The serving harness on the shared
-speculative corpus (`--corpus-layout distinct`, 128-token budget, one warmup
-and two rounds, release servers with eight sessions, 8K context) reports
-aggregate output tok/s **AR / DSpark** with the DSpark support acceptance:
-
-| Temperature | C1 | C2 | C4 | C8 |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 16.2 / 20.5 (0.66) | 25.8 / 26.0 (0.71) | 39.2 / 35.7 (0.75) | 49.3 / 45.8 (skipped) |
-| 0.6 | 16.3 / 22.0 (0.63) | 25.6 / 25.6 (0.66) | 38.3 / 33.6 (0.64) | 46.5 / 45.1 (0.60) |
-| 1.0 | 16.3 / 19.1 (0.56) | 25.5 / 25.4 (0.63) | 38.6 / 33.0 (0.66) | 44.4 / 44.2 (0.62) |
-
-Sampled acceptance stays 0.56–0.66 through `temperature 1.0`, above the 0.48
-break-even, so the sampled cycle behaves like the greedy one at every width:
-C1 gains 17–35%, C2 is even, and C4/C8 on these short prompts lose 3–14% in
-both modes, the known depth-zero cost of the concurrent policy rather than a
-sampling effect. Reports: `serving-{ar,dspark}-t{0,0.6,1.0}.json`.
-
-## C1 memory with a 262,144-token capacity
-
-The 80.76 GiB target weights are only part of the footprint: DSpark adds
-5.58 GiB of support weights, and inference also needs projection caches,
-KV state, and work buffers. The runtime reuses scratch across consecutive
-attention and FFN stages, omits the dense attention mask, and grows compressed
-KV storage and indexer score scratch with actual context use. Cache precision
-is unchanged; prefill reserves 128 tokens of decode headroom.
-
-| C1 DSpark workload | Previous GPU allocation (GiB) | Current (GiB) | Saved (GiB) |
-| --- | ---: | ---: | ---: |
-| pp2048/4096 + tg128 | 98.79 | 90.74 | 8.06 |
-| 16K prefix, pp4096 + tg128 | 98.79 | 91.46 | 7.33 |
-
-These are driver GTT measurements, not whole-system RAM usage. The
-[memory report](memory-c1-262k.json) retains matched release runs, exact output
-hashes and draft counts, timings, and memory observations. Scratch reuse and
-growing KV save another **6.07 GiB** at pp2048/4096 beyond the earlier indexer
-scratch reduction. The controls found no material speed regression; a separate
-256-token continuation checks growth during generation. Only up to 20,608
-tokens are used; capacity does not imply filling the window. KV storage grows
-with longer inputs.
+The [memory control](memory-c1-262k.json) records these measurements. Target and
+support weights, KV and working buffers all contribute. Compressed KV and score
+scratch grow with actual use. Prefill reuses scratch across ordered stages;
+indexer scoring borrows the idle attention-output range for temporary F16 keys.
+Persistent KV precision is unchanged.
 
 ## Reproduce
 
 ```sh
-git add <changed-paths>
 nix build
 MODEL=/path/to/target.gguf
 DSPARK=/path/to/DSpark-support.gguf
-
-# Omit --dspark-model for autoregressive runs; use -c 1 for single user.
+./result/bin/gufo bench --model "$MODEL" \
+  -c 1 -p 2048 -n 128 -d 0,32768 -r 2 -v
 ./result/bin/gufo bench --model "$MODEL" --dspark-model "$DSPARK" \
-  -c 1,2,4,6,8 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v
-# Capture stdout and stderr for each run, then validate the pair:
-nix develop -c tools/ds4/check.py benchmark \
-  --ar-log /tmp/ar.log --dspark-log /tmp/dspark.log --output /tmp/bench.json
-# Sampled column: same seed on both runs, then validate with the sampling flags.
-./result/bin/gufo bench --model "$MODEL" --dspark-model "$DSPARK" \
-  -c 1,2,4 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v \
-  --temperature 0.6 --seed 7
-nix develop -c tools/ds4/check.py benchmark --concurrency 1,2,4 \
-  --temperature 0.6 --seed 7 \
-  --ar-log /tmp/ar-t06.log --dspark-log /tmp/dspark-t06.log --output /tmp/bench-t06.json
-
-# Large capacity, single-user server; ordinary prompts suffice for memory checks.
-./result/bin/gufo serve --host 127.0.0.1 --port 19231 --sessions 1 llm \
-  --model "$MODEL" --dspark-model "$DSPARK" --context 262144
+  -c 1 -p 2048 -n 128 -d 0,32768 -r 2 -v
 ```
 
-Prefill and generation are separate measurements. The prefix uses a fixed
-repeating token sequence, identical across concurrent requests; generation
-follows the model’s greedy choices. Depth-zero generation uses a 16-token seed. Context preparation and
-snapshot restoration occur outside timing. Prefill runs each request in
-sequence and reports aggregate prompt throughput; decode reports 128 divided
-by the whole batch's elapsed seconds.
-Stop-token IDs count toward the fixed workload. Verbose output records generated
-token hashes and draft counters for every request and repetition. Natural
-prompts can have different acceptance and speed. Run model jobs and builds
-sequentially, including correctness runs; the 128 GB memory is shared by CPU
-and GPU. Keep other CPU/GPU work out of timed runs. HTTP scheduling measurements
-use the shared `tools/serving/gufo-serving-bench.py` with matched prompts, caching,
-output budgets, concurrency, and repetitions.
+Use `-c 1,2,4,6,8` for concurrency and
+`-d 0,4096,8192,12288,16384,32768` for the full depth sweep. Use `-p 4096`
+for pp4096. Sampled controls use the same `--temperature` and `--seed` in both
+modes. Context preparation and restoration are outside timing. Verbose output
+records hashes and draft counts; compare these alongside speed. Run model
+jobs, builds and profiles sequentially. The HTTP benchmark is
+`tools/serving/gufo-serving-bench.py`; distinguish cold requests from cache hits.
 
-## Quality contract
+## Maintain quality
 
-**Qualification:** the [prior complete run](quality-qualification.json) passes
-all nine checks, including 736 exact DSpark scalar replay choices through C8/16K.
-The [projection/selection changes](selection-projection.md) retain the pinned target
-trajectory and all 1,280 paired token positions in the repeated C1 speed sweep.
-Their projection, attention, target and full DSpark checks pass, including all
-736 scalar replay choices and exact frontier logits through C8/16K.
-The [bulk-kernel follow-up](bulk-kernels.md) also passes projection/attention,
-target and full DSpark checks, including the same 736 exact replay choices.
-Its C1 pp4096/tg128 sweep and reversed control retain all 1,792 paired token
-positions; the DSpark check retained at least 15.37 GiB available.
-The repeated speed matrix passes exact output/hash and draft-counter checks:
-53,760 generated tokens across both modes and repetitions. Its DSpark run kept
-at least 13.89 GiB available under a 12 GiB memory guard.
-Full capability qualification remains pending.
-Antirez comparisons flag four post-prefill differences; they do not establish
-which implementation is more accurate.
-See the [scores and limits](eval/README.md).
-
-DS4 checks live in [one directory](../../tests/models/deepseek_v4_flash/CMakeLists.txt).
-Shared sampler, scheduler, and HTTP tests remain with their shared components.
-The [tools index](../../tools/ds4/README.md) lists the maintained entry points.
+Checks live in `tests/models/deepseek_v4_flash`; maintained commands live in
+[tools/ds4](../../tools/ds4/README.md). Run only affected checks while iterating.
 
 | Check | Required coverage |
 | --- | --- |
-| `ds4.template`, `ds4.cli`, `ds4.dataset`, `ds4.eval` | Official framing, option wiring, pinned fixture integrity, probability-metric invariants, answer grading |
-| `ds4.projections` | Q8/IQ2/F16 shapes and batch widths; all 32,768 IQ2 grid/sign combinations; cached and uncached activation widths; exact MoE tile ownership/output at 64/128-row boundaries; cached RMS; official HC projection, Sinkhorn epsilon placement, weighted reduction and residual-matrix orientation |
-| `ds4.attention` | 28 target/support arithmetic cases, 16 official DSpark window cases, 16 exact score cases and 72 repeated top-k cases; independent references, poisoned rows, ring wrap, causal masks and score ties |
-| `ds4.target` | Official token goldens, pinned trajectory, full-logit prefill/decode comparisons, exact 2K logits at 4K/262K capacities, concurrent state isolation, bounds |
-| `ds4.dspark` | Scalar quality; exact tokens/logits/counters at fixed and changing C; short budgets; complete snapshot continuation through 16K; policy backoff and fork isolation |
-| `ds4.serving` | Mixed sampling and actual batch widths, bounded prefill under arrivals, C1 warm-prefix equality at 262K capacity, disk identity, cancellation, context exhaustion |
+| `ds4.template`, `ds4.cli`, `ds4.dataset`, `ds4.eval` | Framing, wiring, pinned fixtures and probability/grading invariants |
+| `ds4.projections` | Independent weight decoding, FP64 formulas, all IQ2 signs, MoE ownership, exact batch/scalar outputs, official HC/Sinkhorn equations |
+| `ds4.attention` | Independent attention and DSpark window formulas; exact prefill scores, causal masks, poisoned rows, ties, scratch bounds and top-k ordering |
+| `ds4.target` | Official tokens, pinned trajectory, full logits, replay, capacity equality and state isolation |
+| `ds4.dspark` | Exact scalar tokens/frontier logits through C8/16K, acceptance, policy, snapshots and forks |
+| `ds4.serving` | Sampling, physical batching, bounded prefill, prefix/disk caches, cancellation and exhaustion |
 
 ```sh
 nix develop -c tools/ds4/check.py fast
 nix develop -c tools/ds4/check.py kernels
-nix develop -c tools/ds4/check.py all --model "$MODEL" --dspark-model "$DSPARK"
-nix develop -c tools/ds4/check.py reference --model "$MODEL" \
-  --upstream /path/to/pinned-antirez-checkout --output /tmp/ds4-reference
-nix build --no-link .#checks.x86_64-linux.pr
-# Against a C1 DSpark server; repeat and compare response, reasoning and grades:
-./result/bin/gufo eval --base-url http://127.0.0.1:8080/v1 \
-  --questions 16 --greedy --output /tmp/ds4-quality.json
+nix develop -c tools/ds4/check.py model --model "$MODEL" --dspark-model "$DSPARK"
 ```
 
-The pinned target trajectory requires at least 116/128 top-1 choices, rank sum
-at most 142, and worst rank at most 3. State comparisons require finite logits,
-RMSE ≤1.12, cosine ≥0.979, and max error ≤5. DSpark scalar replay requires exact greedy tokens (including tie-breaking)
-and frontier logits. The eight-scenario C1/C2/C4/C6/C8 replay through 16K
-covers **736 token choices** across four diverse continuations. Never weaken these bounds to accept a faster implementation.
-The replay records speculative frontiers, frees those sessions, then checks
-one scalar session at a time, keeping at most C model sessions resident.
+Numerical changes require independent operator controls and model qualification.
+The pinned trajectory requires **116/128 top-1 choices**, rank sum ≤142 and
+worst rank ≤3. State comparisons require finite logits, **RMSE ≤1.12,
+cosine ≥0.979, max error ≤5**. DSpark replay covers **736 exact token choices**
+through C8/16K. Never loosen these limits to accept a faster implementation.
+Repeatability assumes the same inputs, seeds and execution schedule. It does
+not establish general equality across different batch compositions.
 
-Repeatability means identical inputs, seeds, and execution schedule, including
-prefill boundaries and batch membership. AR/DSpark output equality passes this
-speed workload; general text equality and batch-composition invariance are not
-established. Check repeated output hashes and draft decisions alongside
-speed; throughput alone cannot qualify a change. Retain an optimization only
-after the relevant numerical oracle, model checks, and repeated release A/B
-measurements pass. During iteration, run the affected fast/kernel checks; run
-the complete model/serving suite for retained changes. Extend coverage for newly affected shapes and shared runners.
-AR qualification also requires the external 100-case continuation comparison:
-agreement between DSpark and AR cannot detect a bug shared by both paths.
-The scorer records every reference token; compare likelihood and greedy
-agreement against a matched independent upstream control. The same command
-compares full logits before and after 128 forced tokens at all five depths,
-using matched 2K and 4K prefill calls. It checks exact repeated Gufo output,
-identical input token IDs, and actual prefill capacities.
-It retains the full-logit bounds above and rejects a detectable 100-case NLL
-increase using a paired case bootstrap 95% interval (seed 731).
-Antirez is an independent implementation, not ground truth. Cross-engine logit
-differences require investigation against the official computation and task
-scores; do not add approximations solely to match another implementation.
-Separate GGUF quantization error from additional kernel approximations. The HC
-oracle uses GGUF weight precision with the official FP32 activation formula.
-Repeated-word prompts probe numerical behavior, not long-context task accuracy.
-Capability subset results: TODO. Full capability scores remain TODO; see the
-[retained AR evaluation](eval/README.md) for earlier regression samples.
+Four post-prefill differential alerts against Antirez remain unresolved;
+Antirez is not official ground truth. AR/DSpark agreement cannot detect shared
+model errors. Original-checkpoint distribution parity and full capability
+qualification remain TODO. See [quality evidence and limits](eval/README.md).
 
-## Experiments
+The latest optimized target check also misses the historical trajectory guard:
+115/128, rank sum 145, worst rank 4. The unchanged baseline produces identical
+full logits, while the legacy Debug configuration passes at 116/128, 142 and 3.
+The limits remain unchanged. Indexer changes match the baseline's ten complete
+prefill vectors across 2K/4K calls and five depths; this establishes preservation
+on those cases. At 64K, five full-logit vectors also match across disk-snapshot
+transfer, continued prefill and decoding. These checks establish preservation
+on those cases, not resolution of the existing build-sensitive discrepancy.
 
-- Retained: simpler IQ2 signs and mixed MoE down row tiles; **about 0.6% faster pp4096** in the matched 4K control, no qualified generation gain. Q8 load variants and global MMQ row-tile changes did not justify new routes. [Results](bulk-kernels.md).
-- Retained: vector C1 projections, cached RMS and exact partial top-k; **5.4–6.2% faster C1 tg128** across 0–16K with identical tokens. Full norm/projection fusion was slower and removed. [Results and profile](selection-projection.md).
-- Retained: indexer head accumulation removes 31 block barriers per score; C1 tg128 at 16K improves **0.8–1.0%** in repeated release A/B, with identical tokens. [Official-kernel review and next opportunities](official-kernel-review.md).
-- Retained: scalar-equivalent verifier projections and attention; exact 736-token replay across the maintained concurrency/depth matrix.
-- Retained: attention ring indexing; removes integer division without changing arithmetic.
-- Retained: reusable request scratch and complete DSpark snapshots; exact continuation across changing batch membership and session capacities.
-- Retained: exact-size weight allocations remove 6.74 GiB of arena padding; the complete guarded DSpark suite kept at least 13.84 GiB available.
-- Retained: official DSpark feature injection and 128-row attention window, checked independently across ring boundaries.
-- Retained: direct IQ2 activation reads; C8 verifier gate/up GPU time 140.94→62.29 ms, total verifier 531.08→452.74 ms, exact scalar outputs.
-- Rejected: F16 rounding inside fused HC; closer to Antirez's logits, but adds an approximation absent from the official formula.
-- Retained: concurrent cost policy calibrated at 0/4K/16K; the repeated full sweep passes output equality and reports the gains and losses above.
-- Rejected: speculative MMQ (numerical mismatch), confidence trimming and alternate grouped gate variants (no qualified speed win).
-- Rejected: two prefill Q2 column fragments; exact logits, pp2048 fell 502.09→490.74 tok/s.
-- Current profiles: Q8 projections remain about 51% of generation GPU time; quantized matrix multiplication takes about 36% of pp4096 GPU time. [Profile and rejected experiments](bulk-kernels.md).
+## Current implementation notes
+
+- Prefill indexer scoring reuses F16 key fragments across its 64 heads, preserving the existing products and reduction order.
+- Exact partial top-k covers wide prefill through 32,768 compressed keys; deeper inputs use the parallel fallback. Tie ordering is unchanged.
+- Scalar-equivalent speculative projections and attention retain independent request state.
+- Additional F16 rounding in HC and FP32 compressor/router experiments were rejected by the maintained quality controls.
