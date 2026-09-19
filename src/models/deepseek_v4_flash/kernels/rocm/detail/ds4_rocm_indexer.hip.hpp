@@ -1,3 +1,4 @@
+#include "ds4_dspark_sampling.hip.hpp"
 #include "ds4_rocm_indexer_score.hip.hpp"
 #include "ds4_rocm_indexer_topk.hip.hpp"
 
@@ -612,6 +613,56 @@ __global__ static void dspark_markov_key_decode_batch_kernel(
  * coupling with a rank-256 bilinear term, and it stays on the device: the
  * vocabulary row never moves to the host.
  */
+extern "C" int ds4_gpu_dspark_candidates_tensor(
+    ds4_gpu_tensor* out, ds4_gpu_tensor* scratch, const ds4_gpu_tensor* logits,
+    uint64_t logits_stride, const ds4_gpu_tensor* hidden,
+    uint64_t hidden_stride, const ds4_gpu_tensor* previous,
+    const void* model_map, uint64_t model_size, uint64_t w1_offset,
+    uint64_t w2_offset, uint64_t confidence_offset, uint32_t vocab,
+    uint32_t rank, uint32_t hidden_width, uint32_t requests) {
+  if (!out || !scratch || !logits || !hidden || !previous || !model_map ||
+      !vocab || !rank || rank > 256 || rank % 32 || !hidden_width ||
+      hidden_width % 32 || !requests || requests > 8 || logits_stride < vocab ||
+      hidden_stride < hidden_width)
+    return 0;
+  const uint32_t blocks = (vocab + 255u) / 256u;
+  const uint64_t table_bytes = (uint64_t)vocab * (rank / 32) * 34;
+  const uint64_t confidence_bytes = (uint64_t)(hidden_width + rank) / 32 * 34;
+  if (!hip_tensor_has_elems(out, requests, sizeof(ds4_dspark_candidates)) ||
+      !hip_tensor_has_elems(scratch,
+                            (uint64_t)requests * blocks * DS4_DSPARK_CANDIDATES,
+                            sizeof(uint64_t)) ||
+      !hip_tensor_has_elems(logits, (requests - 1) * logits_stride + vocab,
+                            sizeof(float)) ||
+      !hip_tensor_has_elems(hidden,
+                            (requests - 1) * hidden_stride + hidden_width,
+                            sizeof(float)) ||
+      !hip_tensor_has_elems(previous, requests, sizeof(int32_t)) ||
+      !hip_model_range_fits(model_size, w1_offset, table_bytes) ||
+      !hip_model_range_fits(model_size, w2_offset, table_bytes) ||
+      !hip_model_range_fits(model_size, confidence_offset, confidence_bytes))
+    return 0;
+  const auto* w1 = reinterpret_cast<const unsigned char*>(hip_model_range_ptr(
+      model_map, w1_offset, table_bytes, "dspark_markov_w1"));
+  const auto* w2 = reinterpret_cast<const unsigned char*>(hip_model_range_ptr(
+      model_map, w2_offset, table_bytes, "dspark_markov_w2"));
+  const auto* confidence =
+      reinterpret_cast<const unsigned char*>(hip_model_range_ptr(
+          model_map, confidence_offset, confidence_bytes, "dspark_confidence"));
+  if (!w1 || !w2 || !confidence)
+    return 0;
+  dspark_markov_candidates_kernel<<<dim3(blocks, requests), 256>>>(
+      (uint64_t*)scratch->ptr, (const float*)logits->ptr, logits_stride,
+      (const int32_t*)previous->ptr, w1, w2, vocab, rank);
+  if (!hip_ok(hipGetLastError(), "dspark candidates launch"))
+    return 0;
+  dspark_merge_candidates_kernel<<<requests, 256>>>(
+      (ds4_dspark_candidates*)out->ptr, (const uint64_t*)scratch->ptr, blocks,
+      (const float*)hidden->ptr, hidden_stride, hidden_width,
+      (const int32_t*)previous->ptr, w1, confidence, rank);
+  return hip_ok(hipGetLastError(), "dspark candidates merge launch");
+}
+
 extern "C" int ds4_gpu_dspark_markov_argmax_tensor(
         ds4_gpu_tensor       *out_index,
         ds4_gpu_tensor       *scratch_key,

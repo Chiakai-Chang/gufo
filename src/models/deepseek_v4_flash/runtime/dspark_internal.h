@@ -107,6 +107,7 @@ struct ds4_dspark_stage_weights {
     ds4_tensor *hc_head_scale;
     ds4_tensor *markov_w1;
     ds4_tensor* markov_w2;
+    ds4_tensor* confidence;
     /* Every stage is a DS4 block with no compressor and no indexer, so it
      * binds into the same layout the target's ratio-0 layers use. */
     ds4_layer_weights block;

@@ -5,10 +5,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <numeric>
 #include <random>
 #include <vector>
 
+#include "src/models/deepseek_v4_flash/kernels/rocm/detail/ds4_dspark_sampling.hip.hpp"
 #include "src/models/deepseek_v4_flash/kernels/rocm/detail/ds4_rocm_indexer_topk.hip.hpp"
 
 namespace {
@@ -48,6 +50,107 @@ void reference_topk(uint32_t* out, const float* scores, uint32_t* scratch,
   }
 }
 }  // namespace
+
+void check_dspark_candidates() {
+  constexpr unsigned vocab = 523, rank = 256, hidden_width = 128;
+  constexpr unsigned blocks = (vocab + 255) / 256, stride = vocab + 17;
+  std::vector<unsigned char> weights(vocab * rank / 32 * 34);
+  for (unsigned b = 0; b < vocab * rank / 32; ++b) {
+    const __half scale = __float2half(0.001F * (1 + b % 7));
+    std::memcpy(weights.data() + b * 34, &scale, 2);
+    for (unsigned j = 0; j < 32; ++j)
+      weights[b * 34 + 2 + j] = (unsigned char)(int8_t)((b + 3 * j) % 31 - 15);
+  }
+  const auto unpack = [&](unsigned i) {
+    __half scale;
+    std::memcpy(&scale, weights.data() + i / 32 * 34, 2);
+    return __half2float(scale) * (int8_t)weights[i / 32 * 34 + 2 + i % 32];
+  };
+  unsigned char* gpu_weights;
+  check(hipMalloc(&gpu_weights, weights.size()));
+  check(hipMemcpy(gpu_weights, weights.data(), weights.size(),
+                  hipMemcpyHostToDevice));
+  for (unsigned requests : {1u, 2u, 3u, 4u, 6u, 8u}) {
+    std::vector<float> logits(requests * stride),
+        hidden(requests * hidden_width);
+    std::vector<int32_t> previous(requests);
+    for (unsigned c = 0; c < requests; ++c) {
+      previous[c] = 7 + c * 13;
+      for (unsigned v = 0; v < vocab; ++v)
+        logits[c * stride + v] = 0.01F * ((v * 11 + c * 19) % 59);
+      for (unsigned j = 0; j < hidden_width; ++j)
+        hidden[c * hidden_width + j] = 0.02F * ((j + 17 * c) % 19);
+    }
+    float *gpu_logits, *gpu_hidden;
+    int32_t* gpu_previous;
+    uint64_t* partial;
+    ds4_dspark_candidates* out;
+    check(hipMalloc(&gpu_logits, logits.size() * 4));
+    check(hipMalloc(&gpu_hidden, hidden.size() * 4));
+    check(hipMalloc(&gpu_previous, previous.size() * 4));
+    check(hipMalloc(&partial, requests * blocks * 8 * 8));
+    check(hipMalloc(&out, requests * sizeof(*out)));
+    check(hipMemcpy(gpu_logits, logits.data(), logits.size() * 4,
+                    hipMemcpyHostToDevice));
+    check(hipMemcpy(gpu_hidden, hidden.data(), hidden.size() * 4,
+                    hipMemcpyHostToDevice));
+    check(hipMemcpy(gpu_previous, previous.data(), previous.size() * 4,
+                    hipMemcpyHostToDevice));
+    dspark_markov_candidates_kernel<<<dim3(blocks, requests), 256>>>(
+        partial, gpu_logits, stride, gpu_previous, gpu_weights, gpu_weights,
+        vocab, rank);
+    dspark_merge_candidates_kernel<<<requests, 256>>>(
+        out, partial, blocks, gpu_hidden, hidden_width, hidden_width,
+        gpu_previous, gpu_weights, gpu_weights, rank);
+    std::vector<ds4_dspark_candidates> actual(requests);
+    check(hipMemcpy(actual.data(), out, requests * sizeof(*out),
+                    hipMemcpyDeviceToHost));
+    for (unsigned c = 0; c < requests; ++c) {
+      std::vector<float> corrected(vocab);
+      std::vector<unsigned> indices(vocab);
+      std::iota(indices.begin(), indices.end(), 0);
+      for (unsigned v = 0; v < vocab; ++v) {
+        double sum = logits[c * stride + v];
+        for (unsigned j = 0; j < rank; ++j)
+          sum += (double)unpack(v * rank + j) * unpack(previous[c] * rank + j);
+        corrected[v] = sum;
+      }
+      std::partial_sort(indices.begin(), indices.begin() + 8, indices.end(),
+                        [&](unsigned a, unsigned b) {
+                          return corrected[a] > corrected[b] ||
+                                 (corrected[a] == corrected[b] && a < b);
+                        });
+      double confidence = 0;
+      for (unsigned j = 0; j < hidden_width + rank; ++j)
+        confidence +=
+            (double)unpack(j) *
+            (j < hidden_width ? hidden[c * hidden_width + j]
+                              : unpack(previous[c] * rank + j - hidden_width));
+      confidence = 1.0 / (1 + std::exp(-confidence));
+      for (unsigned k = 0; k < 8; ++k) {
+        if (actual[c].ids[k] != (int32_t)indices[k] ||
+            std::abs(actual[c].logits[k] - corrected[indices[k]]) > 2e-5F) {
+          std::fprintf(stderr,
+                       "DSpark Markov top-k oracle failed C=%u row=%u k=%u\n",
+                       requests, c, k);
+          std::exit(1);
+        }
+      }
+      if (std::abs(actual[c].confidence - confidence) > 2e-6) {
+        std::fprintf(stderr, "DSpark pre-norm confidence oracle failed\n");
+        std::exit(1);
+      }
+    }
+    check(hipFree(out));
+    check(hipFree(partial));
+    check(hipFree(gpu_previous));
+    check(hipFree(gpu_hidden));
+    check(hipFree(gpu_logits));
+  }
+  check(hipFree(gpu_weights));
+  std::puts(
+      "DSpark Markov candidates and pre-norm confidence: C1/2/3/4/6/8 pass");
+}
 
 void check_indexer_selection(bool benchmark) {
   int device = 0, max_shared = 0;

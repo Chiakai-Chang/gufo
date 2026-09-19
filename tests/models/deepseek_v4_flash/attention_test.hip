@@ -16,6 +16,7 @@
 #include "src/models/deepseek_v4_flash/runtime/dspark_internal.h"
 
 void check_indexer_selection(bool benchmark);
+void check_dspark_candidates();
 
 namespace {
 void check(hipError_t error) {
@@ -790,6 +791,7 @@ int main(int argc, char** argv) {
   check_indexer_scores(benchmark);
   check_indexer_prefill_scores();
   check_indexer_selection(benchmark);
+  check_dspark_candidates();
   check_target_attention();
   check_dspark_window();
   constexpr unsigned heads = 64, dim = 512, cap = 4352;

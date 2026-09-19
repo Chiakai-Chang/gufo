@@ -33,6 +33,14 @@ struct ds4_session_batch_item {
   int token;
 };
 
+inline constexpr uint32_t DS4_DSPARK_CANDIDATES = 8;
+
+struct ds4_dspark_candidates {
+  int32_t ids[DS4_DSPARK_CANDIDATES];
+  float logits[DS4_DSPARK_CANDIDATES];
+  float confidence;
+};
+
 /* Request sampler for a DSpark cycle. NULL keeps the greedy argmax cycle.
  *
  * `sample` draws the next token from one row of target logits with the
@@ -40,11 +48,21 @@ struct ds4_session_batch_item {
  * emitted in draw order (accepted rows now, a rejected row as the next cycle's
  * anchor), so the callee may record it as request history immediately.
  * `accept` reports a token the runtime emits without drawing it: the anchor
- * carried over from the previous cycle's rejected row. */
+ * carried over from the previous cycle's rejected row.
+ *
+ * Optional paired callbacks `propose`/`verify` implement stochastic proposals.
+ * `propose` retains the normalized q actually used to draw this position;
+ * `verify` returns either that draft (accepted) or an exact residual draw.
+ * Each callback and its probability rows belong to one request and one cycle.
+ * Greedy-with-penalties and legacy callers retain the point-mass path. */
 struct ds4_dspark_sampler {
   void* ctx;
   int (*sample)(void* ctx, const float* logits, uint32_t vocabulary_size);
   void (*accept)(void* ctx, int token);
+  int (*propose)(void* ctx, uint32_t row,
+                 const ds4_dspark_candidates* candidates) = nullptr;
+  int (*verify)(void* ctx, uint32_t row, const float* logits,
+                uint32_t vocabulary_size, int draft) = nullptr;
 };
 
 struct ds4_session_dspark_batch_item {

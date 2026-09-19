@@ -1583,11 +1583,10 @@ static void dspark_bind(ds4_dspark_model *d) {
                          d->markov_rank, DS4_N_VOCAB, 0);
     tensor_expect_layout(final_stage->markov_w2, DS4_TENSOR_Q8_0, 2,
                          d->markov_rank, DS4_N_VOCAB, 0);
-    // Validate the artifact's confidence head; the runtime controller uses
-    // observed acceptance and does not execute this projection.
-    tensor_expect_layout(
-        dspark_required_tensor_stage(m, "confidence_head.proj.weight", last),
-        DS4_TENSOR_Q8_0, 2, (uint64_t)DS4_N_EMBD + d->markov_rank, 1, 0);
+    final_stage->confidence =
+        dspark_required_tensor_stage(m, "confidence_head.proj.weight", last);
+    tensor_expect_layout(final_stage->confidence, DS4_TENSOR_Q8_0, 2,
+                         (uint64_t)DS4_N_EMBD + d->markov_rank, 1, 0);
 }
 
 /* Copy every bound DSpark tensor into the support arena. The residency policy

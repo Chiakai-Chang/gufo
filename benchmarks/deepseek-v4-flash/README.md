@@ -73,11 +73,19 @@ Earlier raw [greedy](speed-matrix.json) and [sampled](sampled-speed-matrix.json)
 matrices retain their release identities, deviations, hashes and counters.
 They are not a refresh of the current kernels.
 
-DSpark chooses draft lengths from offline cycle costs and accepted-token
-history. It backs off when verification cannot repay its cost; live timing
-does not change token decisions. Requests keep private sampling, proposal,
-acceptance and controller state. Snapshots preserve this state; a new request
-reusing a prefix starts fresh controller statistics.
+Latest fixed-prompt sampled HTTP control (2026-09-19, C2, temperature 1,
+top-p 0.95, seed 7): **17.40 tok/s per user** for an autumn explanation,
+**21.01** for a repeating pattern, and **15.27** for a short naming task.
+Two fresh-server measurements; details and limits are in the
+[DSpark sampling report](dspark-sampling.md).
+
+DSpark combines offline cycle costs and acceptance history with checkpoint
+confidence for filtered sampled C>1 requests. These use exact hybrid top-8
+proposals; C1 and unfiltered sampling retain point-mass proposals. Stochastic
+verification preserves the target distribution, with its own seeded trace.
+Greedy behavior is unchanged. Requests keep private RNG, proposal, acceptance
+and controller state; prefix reuse starts fresh request statistics. Live timing
+never changes token decisions.
 
 ## Memory
 
@@ -124,11 +132,13 @@ Checks live in `tests/models/deepseek_v4_flash`; maintained commands live in
 | Check | Required coverage |
 | --- | --- |
 | `ds4.template`, `ds4.cli`, `ds4.dataset`, `ds4.eval` | Framing, wiring, pinned fixtures and probability/grading invariants |
+| `ds4.sampling` | Exact p/q and residual distributions, conditional proposals, penalties, seed replay and confidence stopping |
 | `ds4.projections` | Independent weight decoding, FP64 formulas, all IQ2 signs, MoE ownership, exact batch/scalar outputs, official HC/Sinkhorn equations |
-| `ds4.attention` | Independent attention and DSpark window formulas; exact prefill scores, causal masks, poisoned rows, ties, scratch bounds and top-k ordering |
+| `ds4.attention` | Independent attention, DSpark Markov/confidence and window formulas; exact prefill scores, masks, poisoned rows, ties, scratch bounds and top-k ordering |
 | `ds4.target` | Official tokens, pinned trajectory, full logits, replay, capacity equality and state isolation |
 | `ds4.dspark` | Exact scalar tokens/frontier logits through C8/16K, acceptance, policy, snapshots and forks |
 | `ds4.serving` | Sampling, physical batching, bounded prefill, prefix/disk caches, cancellation and exhaustion |
+| `ds4.chat` | Real sampled prompt and two-turn chat execution, AR/DSpark token identity and active drafting |
 
 ```sh
 nix develop -c tools/ds4/check.py fast

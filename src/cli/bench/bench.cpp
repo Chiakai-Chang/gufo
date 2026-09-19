@@ -291,8 +291,8 @@ int RunDeepSeekBenchmark(
     return 1;
   }
 
-  // Sampled generation draws with the shared server sampler on both paths so
-  // the AR and DSpark runs of one seed produce comparable token hashes.
+  // Both paths use the server's target distribution. Stochastic DSpark
+  // preserves that distribution, with its own reproducible RNG trace.
   const bool sampled = !options.sampling.can_use_unmodified_argmax();
   const auto sampling_config = options.sampling;
   const auto sample_next = [&](models::deepseek_v4_flash::Session& session,
@@ -420,8 +420,11 @@ int RunDeepSeekBenchmark(
                  ++repeat) {
               std::vector<std::unique_ptr<Session>> sessions;
               std::vector<std::vector<int>> generated(concurrency);
+              const std::vector<sampling::TokenId> history(
+                  tokens.begin(), tokens.begin() + prefix);
               std::vector<sampling::SamplerState> samplers(
-                  concurrency, sampling::SamplerState(sampling_config));
+                  concurrency,
+                  sampling::SamplerState(sampling_config, history));
               for (std::size_t i = 0; i < concurrency; ++i) {
                 auto session = model->CreateSession(
                     static_cast<uint32_t>(required_context), &error);
@@ -662,7 +665,9 @@ int RunDeepSeekBenchmark(
 
           std::vector<int> generated;
           generated.reserve(generation_length);
-          sampling::SamplerState sampler(sampling_config);
+          const std::vector<sampling::TokenId> history(
+              tokens.begin(), tokens.begin() + prefix_length);
+          sampling::SamplerState sampler(sampling_config, history);
           const auto start = std::chrono::steady_clock::now();
           for (std::size_t step = 0; step < generation_length;) {
             if (dspark) {

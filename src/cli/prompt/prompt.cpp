@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -17,6 +18,7 @@
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/image.hpp"
+#include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/generator.hpp"
@@ -324,6 +326,9 @@ int GenerateDeepSeekResponse(
     std::cerr << "DeepSeek V4 Flash prefill failed: " << error << '\n';
     return 1;
   }
+  // Chat can extend an existing prefix. A new turn keeps its support KV but
+  // must discard the previous turn's deferred draw and controller history.
+  session.BeginRequest();
 
   if (opt.verbose) {
     std::cout << "[Engine]: DeepSeek V4 Flash ROCm (gfx1151)\n"
@@ -344,17 +349,7 @@ int GenerateDeepSeekResponse(
   }
   sampling::SamplerState sampler(opt.sampling, sampling_history);
 
-  /*
-   * DSpark drives generation only for greedy decoding. Its verification rule is
-   * a greedy prefix match, so a sampled request keeps the ordinary decode path
-   * rather than silently changing the distribution.
-   */
-  const bool use_dspark = dspark_requested && session.HasDspark() &&
-                          opt.sampling.can_use_unmodified_argmax();
-  if (dspark_requested && !use_dspark) {
-    std::cerr << "[Speculative]: dspark needs greedy sampling; using "
-                 "autoregressive decode\n";
-  }
+  const bool use_dspark = dspark_requested && session.HasDspark();
 
   const auto generation_start = std::chrono::steady_clock::now();
   std::size_t generated = 0;
@@ -363,14 +358,20 @@ int GenerateDeepSeekResponse(
     std::vector<int> emitted;
     bool stop = false;
     while (generated < opt.max_tokens && !stop) {
+      std::optional<models::deepseek_v4_flash::DsparkSamplerBridge> bridge;
+      if (!opt.sampling.can_use_unmodified_argmax())
+        bridge.emplace(sampler);
       if (!session.DsparkStep(opt.max_tokens - generated, opt.draft_tokens,
-                              &emitted, &error)) {
+                              &emitted, &error,
+                              bridge ? bridge->hook() : nullptr)) {
         std::cerr << "\nDeepSeek V4 Flash speculative decode failed: " << error
                   << '\n';
         return 1;
       }
       if (emitted.empty())
         break;
+      if (bridge)
+        sampler.SetRngState(bridge->rng_state());
       for (const int token : emitted) {
         if (model->IsStopToken(token) || generated >= opt.max_tokens) {
           stop = true;
@@ -399,7 +400,11 @@ int GenerateDeepSeekResponse(
       emit(token);
       if (opt.verbose)
         generated_ids.push_back(token);
-      if (generated + 1 < opt.max_tokens && !session.Evaluate(token, &error)) {
+      // A reusable chat session must own the complete emitted prefix, like
+      // the server and DSpark. Leaving its last token to the next bulk
+      // prefill changes that call's boundary and numerical trajectory.
+      if ((reply != nullptr || generated + 1 < opt.max_tokens) &&
+          !session.Evaluate(token, &error)) {
         std::cerr << "\nDeepSeek V4 Flash decode failed: " << error << '\n';
         return 1;
       }

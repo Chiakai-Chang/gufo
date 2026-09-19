@@ -435,6 +435,19 @@ void SamplerState::Accept(std::span<const TokenId> tokens) {
 
 SamplingDistribution SamplerState::Distribution(
     std::span<const float> logits) const {
+  // Reuse the bounded candidate selection used by ordinary filtered decode.
+  // The full-sort implementation remains the reference for unfiltered rows.
+  if (!logits.empty() && config_.temperature > 0 &&
+      (config_.top_k > 0 || config_.top_p < 1 || config_.min_p > 0)) {
+    auto working = *this;
+    working.PrepareSelected(logits);
+    auto& candidates = working.candidate_scratch_;
+    const double maximum = candidates.front().value;
+    for (auto& candidate : candidates)
+      candidate.value =
+          std::exp((candidate.value - maximum) / config_.temperature);
+    return SamplingDistribution(std::move(candidates));
+  }
   return BuildDistribution(logits, config_, history_);
 }
 
@@ -710,7 +723,7 @@ TokenId SamplerState::SampleLinear(std::span<const float> logits) {
   return last_token;
 }
 
-TokenId SamplerState::SampleSelected(std::span<const float> logits) {
+void SamplerState::PrepareSelected(std::span<const float> logits) {
   candidate_scratch_.clear();
   const auto read_adjusted = [&](std::size_t index) {
     const double adjusted =
@@ -846,7 +859,10 @@ TokenId SamplerState::SampleSelected(std::span<const float> logits) {
     keep = std::min(keep, std::max(min_p_keep, minimum));
   }
   candidate_scratch_.resize(keep);
+}
 
+TokenId SamplerState::SampleSelected(std::span<const float> logits) {
+  PrepareSelected(logits);
   if (candidate_scratch_.size() == 1) {
     return candidate_scratch_.front().token;
   }

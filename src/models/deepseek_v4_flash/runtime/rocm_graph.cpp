@@ -14,6 +14,7 @@
 
 #include "../kernels/rocm/resident_api.h"
 #include "dspark_internal.h"
+#include "dspark_policy.h"
 #include "model_data_internal.h"
 #include "native_internal.h"
 
@@ -260,6 +261,8 @@ struct ds4_rocm_graph {
      * stage's input, which is how the drafter sees the target's current state
      * on the query side rather than only as injected history. */
     ds4_gpu_tensor *dspark_markov_key;
+    ds4_gpu_tensor* dspark_candidates;
+    ds4_gpu_tensor* dspark_candidate_scratch;
     ds4_gpu_tensor *dspark_markov_index;
     /* Bitmask of sampled target layers captured for the current position. */
     uint32_t dspark_capture_mask;
@@ -329,6 +332,8 @@ static void rocm_graph_dspark_free(ds4_gpu_graph *g) {
     }
     ds4_gpu_tensor_free(g->dspark_markov_index);
     ds4_gpu_tensor_free(g->dspark_markov_key);
+    ds4_gpu_tensor_free(g->dspark_candidates);
+    ds4_gpu_tensor_free(g->dspark_candidate_scratch);
     ds4_gpu_tensor_free(g->dspark_fused);
     ds4_gpu_tensor_free(g->dspark_features_batch);
     ds4_gpu_tensor_free(g->dspark_features);
@@ -336,6 +341,8 @@ static void rocm_graph_dspark_free(ds4_gpu_graph *g) {
     ds4_gpu_tensor_free(g->dspark_hc_mean);
     g->dspark_markov_index = NULL;
     g->dspark_markov_key = NULL;
+    g->dspark_candidates = nullptr;
+    g->dspark_candidate_scratch = nullptr;
     g->dspark_fused = NULL;
     g->dspark_features_batch = NULL;
     g->dspark_features = NULL;
@@ -6160,12 +6167,99 @@ static bool rocm_graph_encode_dspark_logits(
 /*
  * Trace the block's trajectory with the Markov path selector.
  *
- * Selecting each position by its own argmax lets the block drift: the best token
- * at position t given the block's shared context is not the best token given what
- * position t-1 actually emitted. The rank-256 bilinear term restores that
- * coupling. Positions are resolved in order because each one conditions the next,
- * but each step stays on the device and only the chosen index is read back.
+ * Selecting each position by its own argmax lets the block drift: the best
+ * token at position t given the block's shared context is not the best token
+ * given what position t-1 actually emitted. The rank-256 bilinear term restores
+ * that coupling. Positions resolve in order because each conditions the next.
+ * Greedy reads back the chosen index; sampled cohorts read a compact shortlist
+ * and confidence for each request.
  */
+static bool rocm_graph_dspark_select_sampled(
+    ds4_gpu_graph* g, const ds4_rocm_dspark_draft_item* items, size_t count,
+    uint32_t rows_per_item) {
+  constexpr uint32_t blocks = (DS4_N_VOCAB + 255u) / 256u;
+  if (!g->dspark_candidates)
+    g->dspark_candidates =
+        ds4_gpu_tensor_alloc(8u * sizeof(ds4_dspark_candidates));
+  if (!g->dspark_candidate_scratch)
+    g->dspark_candidate_scratch = ds4_gpu_tensor_alloc(
+        8u * blocks * DS4_DSPARK_CANDIDATES * sizeof(uint64_t));
+  if (!g->dspark_candidates || !g->dspark_candidate_scratch)
+    return false;
+  const auto* d = g->dspark;
+  const auto& last = d->stage[d->n_stages - 1];
+  std::array<int32_t, 8> previous{};
+  std::array<ds4_dspark_candidates, 8> candidates{};
+  std::array<ds4_dspark_confidence_policy, 8> policies{};
+  std::array<bool, 8> stopped{};
+  uint32_t max_rows = 0;
+  for (size_t i = 0; i < count; ++i) {
+    previous[i] = items[i].target_next_token;
+    if (previous[i] < 0 || (uint32_t)previous[i] >= DS4_N_VOCAB)
+      return false;
+    policies[i] = {
+        .depth = items[i].position,
+        .concurrency = items[i].concurrency,
+        .maximum = std::min(items[i].max_draft_tokens, rows_per_item)};
+    *items[i].n_tokens = 0;
+    max_rows =
+        std::max(max_rows, std::min(items[i].max_draft_tokens, rows_per_item));
+  }
+  for (uint32_t row = 0; row < max_rows; ++row) {
+    if (!ds4_gpu_tensor_write(g->prefill_tokens, 0, previous.data(),
+                              count * sizeof(previous[0])))
+      return false;
+    const uint64_t span_rows = (count - 1) * rows_per_item + 1;
+    auto* logits = ds4_gpu_tensor_view(
+        g->spec_logits, (uint64_t)row * DS4_N_VOCAB * sizeof(float),
+        span_rows * DS4_N_VOCAB * sizeof(float));
+    // DS4 confidence uses hc_head(x), before norm; this buffer survives the
+    // tied LM-head projection and holds independent rows for every request.
+    auto* hidden = ds4_gpu_tensor_view(
+        g->batch_ffn_cur, (uint64_t)row * DS4_N_EMBD * sizeof(float),
+        span_rows * DS4_N_EMBD * sizeof(float));
+    const bool ok =
+        logits && hidden &&
+        ds4_gpu_dspark_candidates_tensor(
+            g->dspark_candidates, g->dspark_candidate_scratch, logits,
+            (uint64_t)rows_per_item * DS4_N_VOCAB, hidden,
+            (uint64_t)rows_per_item * DS4_N_EMBD, g->prefill_tokens,
+            d->model->map, d->model->size, last.markov_w1->abs_offset,
+            last.markov_w2->abs_offset, last.confidence->abs_offset,
+            DS4_N_VOCAB, d->markov_rank, DS4_N_EMBD, count);
+    ds4_gpu_tensor_free(hidden);
+    ds4_gpu_tensor_free(logits);
+    if (!ok || !ds4_gpu_tensor_read(g->dspark_candidates, 0, candidates.data(),
+                                    count * sizeof(candidates[0])))
+      return false;
+    for (size_t i = 0; i < count; ++i) {
+      if (stopped[i] || row >= items[i].max_draft_tokens)
+        continue;
+      const auto* sampler = items[i].sampler;
+      if (sampler && sampler->propose &&
+          !policies[i].Include(candidates[i].confidence)) {
+        stopped[i] = true;
+        continue;
+      }
+      const int token =
+          sampler && sampler->propose
+              ? sampler->propose(sampler->ctx, row, &candidates[i])
+              : candidates[i].ids[0];
+      if (token < 0 || (uint32_t)token >= DS4_N_VOCAB)
+        return false;
+      items[i].tokens[row] = token;
+      previous[i] = token;
+      *items[i].n_tokens = row + 1;
+    }
+    bool more = false;
+    for (size_t i = 0; i < count; ++i)
+      more |= !stopped[i] && row + 1 < items[i].max_draft_tokens;
+    if (!more)
+      break;
+  }
+  return true;
+}
+
 static bool rocm_graph_dspark_select_block(ds4_gpu_graph* g,
                                            const ds4_gpu_tensor* logits_rows,
                                            int target_next_token,
@@ -6665,7 +6759,9 @@ static bool rocm_graph_dspark_draft(ds4_gpu_graph* g,
                                     const ds4_model* target_model,
                                     const ds4_weights* target_weights,
                                     int target_next_token, uint32_t pos0,
-                                    int32_t* tokens_out, uint32_t* n_out) {
+                                    int32_t* tokens_out, uint32_t* n_out,
+                                    const ds4_dspark_sampler* sampler,
+                                    uint32_t max_tokens, size_t concurrency) {
   if (!g || !tokens_out || !n_out)
     return false;
   *n_out = 0;
@@ -6699,13 +6795,25 @@ static bool rocm_graph_dspark_draft(ds4_gpu_graph* g,
     return false;
   }
 
-  const bool selected = rocm_graph_dspark_select_block(
-      g, g->spec_logits, target_next_token, block, tokens_out);
+  const ds4_rocm_dspark_draft_item item{.graph = g,
+                                        .target_next_token = target_next_token,
+                                        .position = pos0,
+                                        .max_draft_tokens = max_tokens,
+                                        .tokens = tokens_out,
+                                        .n_tokens = n_out,
+                                        .sampler = sampler,
+                                        .concurrency = concurrency};
+  const bool sampled = sampler && sampler->propose;
+  const bool selected =
+      sampled ? rocm_graph_dspark_select_sampled(g, &item, 1, block)
+              : rocm_graph_dspark_select_block(
+                    g, g->spec_logits, target_next_token, block, tokens_out);
   ds4_gpu_set_small_batch_mode(0);
   if (!selected) {
     return false;
   }
-  *n_out = block;
+  if (!sampled)
+    *n_out = block;
   return true;
 }
 
@@ -6776,9 +6884,14 @@ static bool rocm_graph_dspark_draft_head_batch(
     return false;
   }
 
-  ok = rocm_graph_dspark_select_block_batch(coordinator, items, item_count,
-                                            coordinator->spec_logits,
-                                            requested_block);
+  const bool sampled = std::any_of(
+      items, items + item_count,
+      [](const auto& item) { return item.sampler && item.sampler->propose; });
+  ok = sampled ? rocm_graph_dspark_select_sampled(coordinator, items,
+                                                  item_count, requested_block)
+               : rocm_graph_dspark_select_block_batch(
+                     coordinator, items, item_count, coordinator->spec_logits,
+                     requested_block);
 
   ds4_gpu_set_small_batch_mode(0);
   return ok;
@@ -7099,10 +7212,13 @@ void ds4_rocm_graph_dspark_truncate_context(ds4_rocm_graph *graph, uint32_t leng
 
 bool ds4_rocm_graph_dspark_draft(ds4_rocm_graph* graph, ds4_engine* engine,
                                  int target_next_token, uint32_t pos0,
-                                 int32_t* tokens_out, uint32_t* n_out) {
+                                 int32_t* tokens_out, uint32_t* n_out,
+                                 const ds4_dspark_sampler* sampler,
+                                 uint32_t max_tokens, size_t concurrency) {
   return graph && engine &&
          rocm_graph_dspark_draft(graph, engine->model, engine->weights,
-                                 target_next_token, pos0, tokens_out, n_out);
+                                 target_next_token, pos0, tokens_out, n_out,
+                                 sampler, max_tokens, concurrency);
 }
 
 bool ds4_rocm_graph_dspark_draft_head_batch(

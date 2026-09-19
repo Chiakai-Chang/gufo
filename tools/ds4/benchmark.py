@@ -70,15 +70,20 @@ def summarize(ar_log: Path, dspark_log: Path, repetitions: int, output: Path,
               sampling: dict | None = None) -> None:
     """Validate a matched AR/DSpark pair of `gufo bench -v` logs.
 
-    `sampling` records the `--temperature`/`--seed` both logs were produced
-    with; token equality is then the seeded sampled equality DSpark
-    guarantees, and acceptance is reported next to each request.
+    `sampling` records the sampling controls used for both logs. Stochastic
+    DSpark guarantees replay within a fixed configuration, not the AR seed
+    trace. Point-mass cohorts retain the stronger equality requirement.
     """
     require(repetitions >= 2, "benchmark qualification requires at least two repeats")
     require(not output.exists(), "benchmark report already exists")
     ar, ar_hashes = parse(ar_log, repetitions, concurrency)
     dspark, dspark_hashes = parse(dspark_log, repetitions, concurrency)
     mode = "sampled" if sampling else "greedy"
+    stochastic = bool(
+        sampling and sampling["temperature"] > 0
+        and (sampling.get("top_k", 0) != 1 or sampling.get("min_keep", 0) > 1)
+        and (sampling.get("top_p", 1) < 1
+             or 0 < sampling.get("top_k", 0) <= 256))
     records = []
     for c, depth in sorted(ar):
         key = (c, depth)
@@ -87,13 +92,15 @@ def summarize(ar_log: Path, dspark_log: Path, repetitions: int, output: Path,
         requests = []
         for member in range(c):
             before, after = ar_hashes[(*key, member)], dspark_hashes[(*key, member)]
-            require(before[0]["output_sha256"] == after[0]["output_sha256"],
-                    f"AR/DSpark {mode} tokens differ at C{c}/depth{depth}/request{member}")
+            if not stochastic or c == 1:
+                require(before[0]["output_sha256"] == after[0]["output_sha256"],
+                        f"AR/DSpark tokens differ at C{c}/depth{depth}/request{member}")
             requests.append({"request": member, "ar": before, "dspark": after})
         drafted = sum(request["dspark"][0]["drafted"] for request in requests)
         accepted = sum(request["dspark"][0]["accepted"] for request in requests)
         records.append({
             "concurrency": c, "depth": depth,
+            "proposal": "hybrid" if stochastic and c > 1 else "point-mass",
             "ar": ar[key], "dspark": dspark[key], "requests": requests,
             "acceptance": accepted / drafted if drafted else None,
         })
@@ -109,5 +116,5 @@ def summarize(ar_log: Path, dspark_log: Path, repetitions: int, output: Path,
     }
     output.write_text(json.dumps(report, indent=2) + "\n")
     print(f"Checked all {len(records)} {mode} points: repeated output/draft "
-          "decisions and AR/DSpark token equality.")
+          "decisions; AR/DSpark token equality required for point-mass cohorts.")
     print(f"Report: {output}")

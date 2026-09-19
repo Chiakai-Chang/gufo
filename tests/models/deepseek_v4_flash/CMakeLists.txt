@@ -1,5 +1,10 @@
 # DS4 CTest checks are registered here. Shared CLI/parser and scheduler
 # tests remain with their shared components.
+add_executable(ds4_sampling_test sampling_test.cpp)
+target_link_libraries(ds4_sampling_test PRIVATE gufo_core)
+add_test(NAME ds4.sampling COMMAND ds4_sampling_test)
+set_tests_properties(ds4.sampling PROPERTIES LABELS "cpu;ds4;sampling")
+
 add_executable(ds4_chat_template_test
   chat_template_test.cpp
   ${PROJECT_SOURCE_DIR}/src/models/deepseek_v4_flash/chat_template.cpp)
@@ -15,6 +20,12 @@ add_test(NAME ds4.cli COMMAND ds4_cli_test)
 set_tests_properties(ds4.cli PROPERTIES LABELS "cpu;ds4;cli")
 
 if(ENGINE_ENABLE_HIP)
+  add_test(NAME ds4.chat COMMAND ds4_cli_test --sampled-chat)
+  set_tests_properties(ds4.chat PROPERTIES
+    LABELS "gpu;hip;ds4;cli;external-model;slow"
+    RESOURCE_LOCK ds4_model
+    SKIP_RETURN_CODE 77)
+
   add_executable(ds4_quality_test quality_test.cpp token_goldens.cpp
     official_reference.cpp)
   target_compile_definitions(ds4_quality_test PRIVATE
@@ -37,7 +48,7 @@ if(ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/cli/serve/inference_backend.cpp
     ${PROJECT_SOURCE_DIR}/src/cli/serve/logging.cpp)
   target_link_libraries(ds4_serving_test PRIVATE
-    gufo_core gufo_deepseek_v4_flash hip::host)
+    gufo_core gufo_deepseek_v4_flash gufo_qwen38_flash_next hip::host)
   add_test(NAME ds4.serving COMMAND ds4_serving_test)
   set_tests_properties(ds4.serving PROPERTIES
     LABELS "gpu;hip;ds4;server;external-model;slow"

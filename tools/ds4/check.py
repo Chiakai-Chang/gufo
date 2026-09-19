@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 SUITES = {
-    "fast": ("^ds4\\.(template|cli|dataset|eval)$", ["ds4_chat_template_test", "ds4_cli_test", "ds4_eval_test"]),
+    "fast": ("^ds4\\.(template|cli|dataset|eval|sampling)$", ["ds4_chat_template_test", "ds4_cli_test", "ds4_eval_test", "ds4_sampling_test"]),
     "kernels": ("^ds4\\.(projections|attention)$",
                 ["ds4_projection_test",
                  "ds4_attention_test"]),
-    "model": ("^ds4\\.(target|dspark|serving)$", ["ds4_quality_test", "ds4_serving_test"]),
+    "model": ("^ds4\\.(target|dspark|serving|chat)$", ["ds4_quality_test", "ds4_serving_test", "ds4_cli_test"]),
 }
 
 
@@ -38,6 +39,12 @@ def main() -> None:
                         help="benchmark: --temperature both logs were produced with")
     parser.add_argument("--seed", type=int, default=0,
                         help="benchmark: --seed both logs were produced with")
+    parser.add_argument("--top-k", type=int, default=0,
+                        help="benchmark: --top-k both logs were produced with")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                        help="benchmark: --top-p both logs were produced with")
+    parser.add_argument("--min-keep", type=int, default=0,
+                        help="benchmark: --min-keep both logs were produced with")
     args = parser.parse_args()
     if not os.environ.get("IN_NIX_SHELL"):
         parser.error("run with nix develop -c tools/ds4/check.py")
@@ -48,15 +55,22 @@ def main() -> None:
             parser.error("benchmark requires --ar-log, --dspark-log and --output")
         if args.model or args.dspark_model or args.upstream:
             parser.error("benchmark validates existing logs; model/upstream options do not apply")
+        if (not math.isfinite(args.temperature) or args.temperature < 0
+                or args.seed < 0 or args.top_k < 0 or args.min_keep < 0
+                or not 0 < args.top_p <= 1):
+            parser.error("benchmark needs valid sampling controls and a fixed seed")
         from benchmark import summarize
         concurrency = tuple(int(value) for value in args.concurrency.split(","))
-        sampling = ({"temperature": args.temperature, "seed": args.seed}
+        sampling = ({"temperature": args.temperature, "seed": args.seed,
+                     "top_k": args.top_k, "top_p": args.top_p,
+                     "min_keep": args.min_keep}
                     if args.temperature > 0.0 else None)
         summarize(args.ar_log, args.dspark_log, args.repetitions, args.output,
                   concurrency, sampling)
         return
     if (args.ar_log or args.dspark_log or args.repetitions != 2 or
-            args.concurrency != "1,2,4,6,8" or args.temperature or args.seed):
+            args.concurrency != "1,2,4,6,8" or args.temperature or args.seed or
+            args.top_k or args.top_p != 1 or args.min_keep):
         parser.error("benchmark log/repetition options require the benchmark suite")
     environment = os.environ.copy()
     reference = args.suite == "reference"

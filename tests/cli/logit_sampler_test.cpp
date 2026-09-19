@@ -360,6 +360,32 @@ void TestStrategyReplayAgainstReference() {
   }
 }
 
+void TestFilteredDistributionAgainstFullSort() {
+  std::vector<float> logits(4099);
+  const std::array<gufo::sampling::TokenId, 6> history{8, 8, 8, 11, 17, 29};
+  for (bool concentrated : {false, true}) {
+    for (std::size_t i = 0; i < logits.size(); ++i)
+      logits[i] = concentrated ? -(float)((i * 73) % logits.size()) * 0.2F
+                               : std::sin((float)i * 0.7F);
+    for (const auto& test : gufo::test::QwenSamplingCases()) {
+      gufo::sampling::SamplerState sampler(test.config, history);
+      const auto rng = sampler.rng_state();
+      const auto expected =
+          gufo::sampling::BuildDistribution(logits, test.config, history);
+      const auto actual = sampler.Distribution(logits);
+      Expect(actual.entries().size() == expected.entries().size(), test.name);
+      for (std::size_t i = 0; i < actual.entries().size(); ++i) {
+        Expect(actual.entries()[i].token == expected.entries()[i].token &&
+                   std::abs(actual.entries()[i].value -
+                            expected.entries()[i].value) < 1e-12,
+               test.name);
+      }
+      Expect(sampler.rng_state() == rng,
+             "materializing probabilities consumes no random draws");
+    }
+  }
+}
+
 void TestDeferredResidualReplay() {
   const std::array<float, 3> logits{100.0F, -100.0F, -100.0F};
   gufo::sampling::SamplerState sampler({.temperature = 1.0F, .seed = 7});
@@ -417,6 +443,7 @@ int main() {
   TestSamplingFailsClosedOnInvalidInputs();
   TestZeroDrawAndNonFiniteCandidates();
   TestStrategyReplayAgainstReference();
+  TestFilteredDistributionAgainstFullSort();
   TestDeferredResidualReplay();
   std::cout << "All logit sampler tests passed.\n";
   return 0;

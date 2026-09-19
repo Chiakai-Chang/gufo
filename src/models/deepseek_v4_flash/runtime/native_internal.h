@@ -52,6 +52,8 @@ struct ds4_rocm_dspark_draft_item {
   uint32_t max_draft_tokens;
   int32_t* tokens;
   uint32_t* n_tokens;
+  const ds4_dspark_sampler* sampler = nullptr;
+  size_t concurrency = 1;
 };
 
 struct ds4_engine {
@@ -186,7 +188,10 @@ void ds4_rocm_graph_dspark_truncate_context(ds4_rocm_graph* graph,
                                             uint32_t length);
 bool ds4_rocm_graph_dspark_draft(ds4_rocm_graph* graph, ds4_engine* engine,
                                  int target_next_token, uint32_t pos0,
-                                 int32_t* tokens_out, uint32_t* n_out);
+                                 int32_t* tokens_out, uint32_t* n_out,
+                                 const ds4_dspark_sampler* sampler = nullptr,
+                                 uint32_t max_tokens = UINT32_MAX,
+                                 size_t concurrency = 1);
 bool ds4_rocm_graph_dspark_draft_head_batch(
     ds4_engine* engine, const ds4_rocm_dspark_draft_item* items,
     size_t item_count);

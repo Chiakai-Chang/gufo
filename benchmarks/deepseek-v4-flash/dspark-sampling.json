@@ -1,0 +1,500 @@
+{
+  "schema": "gufo.ds4-dspark-sampling.v1",
+  "date": "2026-09-19",
+  "source_base": "8342fe1bd1ecbc646271f45e9ca904754b10e34b",
+  "canonical": {
+    "cppStandard": "C++20",
+    "cpuArchitecture": "x86_64",
+    "cpuLogicalCores": 32,
+    "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+    "cpuPhysicalCores": 16,
+    "cxxCompiler": "GCC 15.3.0",
+    "gpuArchitecture": "gfx1151",
+    "gpuComputeUnits": 20,
+    "gpuDriver": "amdgpu",
+    "gpuName": "AMD Radeon 8060S Graphics",
+    "gpuPciId": "1002:1586",
+    "kernelRelease": "7.1.8",
+    "memoryTotalBytes": 134309875712,
+    "memoryType": "LPDDR5X (Unified)",
+    "npuArchitecture": "XDNA2",
+    "npuDriver": "amdxdna",
+    "npuFirmwareVersion": "npu.sbin (1.1.2.64/65)",
+    "npuIdentity": "RyzenAI-npu5",
+    "npuPciId": "1022:17F0",
+    "rocmVersion": "7.2.3",
+    "schemaVersion": "1.0.0",
+    "xrtCommit": "8661761775a266b11992a3bd6eb08209d88aa845"
+  },
+  "fingerprintId": "316e27ee2a1cf0168595922b88a557c8a085216a2417261e39d8309e602b6a58",
+  "artifacts": {
+    "target": {
+      "repo": "antirez/deepseek-v4-gguf",
+      "revision": "1cd7b564460821938add0475a60b942c409295e0",
+      "file": "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
+    },
+    "dspark": {
+      "repo": "antirez/deepseek-v4-gguf",
+      "revision": "e7f04037032990db0346398d249baf9fb9df1ccc",
+      "file": "DeepSeek-V4-Flash-DSpark-support-0731.gguf"
+    }
+  },
+  "releases": {
+    "baseline": "/nix/store/gcsl2m44v2674ya79vxz4j2699vckzrw-gufo-a6c029d-dirty/bin/gufo",
+    "hybrid": "/nix/store/75p75cb4rmvsck49zj2n1ry4l50h8338-gufo-8342fe1-dirty/bin/gufo"
+  },
+  "settings": {
+    "temperature": 1,
+    "top_p": 0.95,
+    "seed": 7,
+    "max_tokens": 128,
+    "context_capacity": 8192,
+    "server_sessions": 4,
+    "concurrency": 2,
+    "fresh_server_each_run": true,
+    "repetitions": 2
+  },
+  "prompts": [
+    {
+      "id": "autumn",
+      "category": "autumn",
+      "text": "Explain why leaves change color in autumn, how the process varies between tree species, and how weather affects the colors. Give a clear, detailed answer."
+    },
+    {
+      "id": "club-names",
+      "category": "club-names",
+      "text": "List six short, distinct names for a small astronomy club. Give only the names separated by commas."
+    },
+    {
+      "id": "repetitive",
+      "category": "repetitive",
+      "text": "Continue this pattern for twenty more terms: red, blue, blue, red, blue, blue, red, blue, blue,"
+    }
+  ],
+  "c2": [
+    {
+      "variant": "baseline",
+      "runs": [
+        {
+          "order": "baseline-first",
+          "cache_hits": 0,
+          "aggregate_output_tps": 26.383948682167844,
+          "cases": {
+            "autumn": {
+              "per_user_decode_tps": 15.560805979343769,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 34,
+                  "completion_tokens": 128,
+                  "draft_tokens": 35,
+                  "draft_accepted_tokens": 21,
+                  "completion_sha256": "e38e5f3c9f7eb06eb743bbe396200e5900eb09df201cc6c99a368135ea492df9",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 34,
+                  "completion_tokens": 128,
+                  "draft_tokens": 35,
+                  "draft_accepted_tokens": 21,
+                  "completion_sha256": "e38e5f3c9f7eb06eb743bbe396200e5900eb09df201cc6c99a368135ea492df9",
+                  "physical_execution_width": 2
+                }
+              ]
+            },
+            "club-names": {
+              "per_user_decode_tps": 15.74442014493422,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 24,
+                  "completion_tokens": 23,
+                  "draft_tokens": 28,
+                  "draft_accepted_tokens": 12,
+                  "completion_sha256": "9d578e69f081315ffa9b79feac3767416f7f896bef3d074f97b23323a02d06fe",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 24,
+                  "completion_tokens": 23,
+                  "draft_tokens": 28,
+                  "draft_accepted_tokens": 12,
+                  "completion_sha256": "9d578e69f081315ffa9b79feac3767416f7f896bef3d074f97b23323a02d06fe",
+                  "physical_execution_width": 2
+                }
+              ]
+            },
+            "repetitive": {
+              "per_user_decode_tps": 17.237258066231632,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 30,
+                  "completion_tokens": 128,
+                  "draft_tokens": 60,
+                  "draft_accepted_tokens": 39,
+                  "completion_sha256": "2fe846f90e1a8e94fbbb2620e00279943df1e607c6685ca0403d097833b44ed4",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 30,
+                  "completion_tokens": 128,
+                  "draft_tokens": 60,
+                  "draft_accepted_tokens": 39,
+                  "completion_sha256": "2fe846f90e1a8e94fbbb2620e00279943df1e607c6685ca0403d097833b44ed4",
+                  "physical_execution_width": 2
+                }
+              ]
+            }
+          }
+        },
+        {
+          "order": "hybrid-first",
+          "cache_hits": 0,
+          "aggregate_output_tps": 27.092760926822212,
+          "cases": {
+            "autumn": {
+              "per_user_decode_tps": 16.018230749178358,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 34,
+                  "completion_tokens": 128,
+                  "draft_tokens": 35,
+                  "draft_accepted_tokens": 21,
+                  "completion_sha256": "e38e5f3c9f7eb06eb743bbe396200e5900eb09df201cc6c99a368135ea492df9",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 34,
+                  "completion_tokens": 128,
+                  "draft_tokens": 35,
+                  "draft_accepted_tokens": 21,
+                  "completion_sha256": "e38e5f3c9f7eb06eb743bbe396200e5900eb09df201cc6c99a368135ea492df9",
+                  "physical_execution_width": 2
+                }
+              ]
+            },
+            "club-names": {
+              "per_user_decode_tps": 15.761143301294904,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 24,
+                  "completion_tokens": 23,
+                  "draft_tokens": 28,
+                  "draft_accepted_tokens": 12,
+                  "completion_sha256": "9d578e69f081315ffa9b79feac3767416f7f896bef3d074f97b23323a02d06fe",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 24,
+                  "completion_tokens": 23,
+                  "draft_tokens": 28,
+                  "draft_accepted_tokens": 12,
+                  "completion_sha256": "9d578e69f081315ffa9b79feac3767416f7f896bef3d074f97b23323a02d06fe",
+                  "physical_execution_width": 2
+                }
+              ]
+            },
+            "repetitive": {
+              "per_user_decode_tps": 17.231526426623727,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 30,
+                  "completion_tokens": 128,
+                  "draft_tokens": 60,
+                  "draft_accepted_tokens": 39,
+                  "completion_sha256": "2fe846f90e1a8e94fbbb2620e00279943df1e607c6685ca0403d097833b44ed4",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 30,
+                  "completion_tokens": 128,
+                  "draft_tokens": 60,
+                  "draft_accepted_tokens": 39,
+                  "completion_sha256": "2fe846f90e1a8e94fbbb2620e00279943df1e607c6685ca0403d097833b44ed4",
+                  "physical_execution_width": 2
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "variant": "hybrid",
+      "runs": [
+        {
+          "order": "baseline-first",
+          "cache_hits": 0,
+          "aggregate_output_tps": 29.813315287451353,
+          "cases": {
+            "autumn": {
+              "per_user_decode_tps": 17.15800444458768,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 34,
+                  "completion_tokens": 128,
+                  "draft_tokens": 70,
+                  "draft_accepted_tokens": 46,
+                  "completion_sha256": "7e2311e0eef6bf0dd815c549812784c7c34724774634ca890204a0aa740240ac",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 34,
+                  "completion_tokens": 128,
+                  "draft_tokens": 70,
+                  "draft_accepted_tokens": 46,
+                  "completion_sha256": "7e2311e0eef6bf0dd815c549812784c7c34724774634ca890204a0aa740240ac",
+                  "physical_execution_width": 2
+                }
+              ]
+            },
+            "club-names": {
+              "per_user_decode_tps": 15.255640955662937,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 24,
+                  "completion_tokens": 21,
+                  "draft_tokens": 2,
+                  "draft_accepted_tokens": 2,
+                  "completion_sha256": "08f02a6ac8be41bb4393f2fe2d28d8aafc1241cf41178d0987b5cb1bd8da8214",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 24,
+                  "completion_tokens": 21,
+                  "draft_tokens": 2,
+                  "draft_accepted_tokens": 2,
+                  "completion_sha256": "08f02a6ac8be41bb4393f2fe2d28d8aafc1241cf41178d0987b5cb1bd8da8214",
+                  "physical_execution_width": 2
+                }
+              ]
+            },
+            "repetitive": {
+              "per_user_decode_tps": 21.235807888088154,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 30,
+                  "completion_tokens": 128,
+                  "draft_tokens": 102,
+                  "draft_accepted_tokens": 84,
+                  "completion_sha256": "42f67318bdaaeff958b553b5cac16157307ffb5df55a05afe12452b75dc51985",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 30,
+                  "completion_tokens": 128,
+                  "draft_tokens": 102,
+                  "draft_accepted_tokens": 84,
+                  "completion_sha256": "42f67318bdaaeff958b553b5cac16157307ffb5df55a05afe12452b75dc51985",
+                  "physical_execution_width": 2
+                }
+              ]
+            }
+          }
+        },
+        {
+          "order": "hybrid-first",
+          "cache_hits": 0,
+          "aggregate_output_tps": 30.00493975605474,
+          "cases": {
+            "autumn": {
+              "per_user_decode_tps": 17.64908652219099,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 34,
+                  "completion_tokens": 128,
+                  "draft_tokens": 70,
+                  "draft_accepted_tokens": 46,
+                  "completion_sha256": "7e2311e0eef6bf0dd815c549812784c7c34724774634ca890204a0aa740240ac",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 34,
+                  "completion_tokens": 128,
+                  "draft_tokens": 70,
+                  "draft_accepted_tokens": 46,
+                  "completion_sha256": "7e2311e0eef6bf0dd815c549812784c7c34724774634ca890204a0aa740240ac",
+                  "physical_execution_width": 2
+                }
+              ]
+            },
+            "club-names": {
+              "per_user_decode_tps": 15.27650473895012,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 24,
+                  "completion_tokens": 21,
+                  "draft_tokens": 2,
+                  "draft_accepted_tokens": 2,
+                  "completion_sha256": "08f02a6ac8be41bb4393f2fe2d28d8aafc1241cf41178d0987b5cb1bd8da8214",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 24,
+                  "completion_tokens": 21,
+                  "draft_tokens": 2,
+                  "draft_accepted_tokens": 2,
+                  "completion_sha256": "08f02a6ac8be41bb4393f2fe2d28d8aafc1241cf41178d0987b5cb1bd8da8214",
+                  "physical_execution_width": 2
+                }
+              ]
+            },
+            "repetitive": {
+              "per_user_decode_tps": 20.78704967003041,
+              "requests": [
+                {
+                  "request_index": 0,
+                  "prompt_tokens": 30,
+                  "completion_tokens": 128,
+                  "draft_tokens": 102,
+                  "draft_accepted_tokens": 84,
+                  "completion_sha256": "42f67318bdaaeff958b553b5cac16157307ffb5df55a05afe12452b75dc51985",
+                  "physical_execution_width": 2
+                },
+                {
+                  "request_index": 1,
+                  "prompt_tokens": 30,
+                  "completion_tokens": 128,
+                  "draft_tokens": 102,
+                  "draft_accepted_tokens": 84,
+                  "completion_sha256": "42f67318bdaaeff958b553b5cac16157307ffb5df55a05afe12452b75dc51985",
+                  "physical_execution_width": 2
+                }
+              ]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "c4_screen": [
+    {
+      "variant": "baseline",
+      "qualification": "single screen, warm prefix cache; not a repeated cold control",
+      "cache_hits": 12,
+      "aggregate_output_tps": 49.29871586281448,
+      "cases": {
+        "autumn": {
+          "per_user_decode_tps": 12.505831581138196,
+          "drafted": 84,
+          "accepted": 52
+        },
+        "club-names": {
+          "per_user_decode_tps": 10.813415692744556,
+          "drafted": 24,
+          "accepted": 4
+        },
+        "repetitive": {
+          "per_user_decode_tps": 12.517388658406396,
+          "drafted": 116,
+          "accepted": 84
+        }
+      }
+    },
+    {
+      "variant": "hybrid",
+      "qualification": "single screen, warm prefix cache; not a repeated cold control",
+      "cache_hits": 12,
+      "aggregate_output_tps": 51.04829644576177,
+      "cases": {
+        "autumn": {
+          "per_user_decode_tps": 12.770436441231167,
+          "drafted": 76,
+          "accepted": 68
+        },
+        "club-names": {
+          "per_user_decode_tps": 11.996708731385905,
+          "drafted": 8,
+          "accepted": 8
+        },
+        "repetitive": {
+          "per_user_decode_tps": 12.966368230901786,
+          "drafted": 96,
+          "accepted": 88
+        }
+      }
+    }
+  ],
+  "source_reports_sha256": {
+    "fixed-baseline": "33fa1e12ee7ca7689b20cdb6a2b5d207cb9bdb90603cf7e0bc14ac2b939831b7",
+    "fixed-hybrid": "0409ce5f114aaa63058407ef82d969f4faa06b306c2b7b02e3fdeeae9e41626f",
+    "repeat-baseline": "1eaa6b14ce2c1f3f20d28b10bb6095bdf038b7e08d870473dd6f940944dc54d2",
+    "repeat-hybrid": "a4f281bccf3c2d9f380671c985a7e07b73e10ab6dde1176381300564b5e7e1c5"
+  },
+  "notes": [
+    "Per-user decode rates average the two simultaneous members; aggregate output includes prefill and queueing.",
+    "Same-mode hashes and draft counters repeated for every C2 request.",
+    "Different proposal modes consume RNG differently; comparing their sampled output hashes is not a distribution test.",
+    "The naming case ended before 128 tokens: 23 baseline and 21 hybrid.",
+    "No full-logit arrays retained."
+  ],
+  "quality_release": "/nix/store/j3zj2xg9mw5g35jza9zyz5i8kpmnb3ky-gufo-8342fe1-dirty/bin/gufo",
+  "quality": {
+    "nix_release_build": "passed",
+    "focused_ctest": [
+      "logit_sampler_test",
+      "ds4.sampling",
+      "ds4.cli",
+      "ds4.attention"
+    ],
+    "serving": "passed, including two-request fixed-schedule stochastic proposal/verification replay and C1 AR seed identity",
+    "greedy_replay": {
+      "command": "ds4_quality_test --dspark-replay",
+      "exact_tokens": 736,
+      "maximum_logit_error": 0,
+      "maximum_concurrency": 8,
+      "maximum_depth": 16384
+    },
+    "cli_replay": "ds4.chat passed: actual prompt plus two sampled chat turns match AR token traces, with DSpark active"
+  },
+  "greedy_control": {
+    "depth": 0,
+    "tokens": 128,
+    "repetitions": 1,
+    "all_output_hashes_and_counters_identical": true,
+    "requests_compared": 15,
+    "per_user_tps": [
+      {
+        "concurrency": 1,
+        "baseline": 17.43,
+        "final": 17.42
+      },
+      {
+        "concurrency": 2,
+        "baseline": 16.42,
+        "final": 16.43
+      },
+      {
+        "concurrency": 4,
+        "baseline": 13.29,
+        "final": 13.31
+      },
+      {
+        "concurrency": 8,
+        "baseline": 9.78,
+        "final": 9.84
+      }
+    ]
+  },
+  "published_release": "/nix/store/mwfi22zq48xw1wb54j1v6bpa92j4mlhf-gufo-8342fe1-dirty/bin/gufo"
+}

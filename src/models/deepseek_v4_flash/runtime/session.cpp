@@ -9,6 +9,7 @@
 #include <new>
 
 #include "dspark_internal.h"
+#include "dspark_policy.h"
 #include "native_internal.h"
 
 #define DS4_SESSION_NEG_INF (-1.0e30f)
@@ -574,23 +575,7 @@ static void session_dspark_note_cycle(ds4_session* session,
 // never influence token decisions.
 static uint32_t session_dspark_cycle_cost(const ds4_session* session,
                                           uint32_t tail, size_t concurrency) {
-  using Costs = std::array<uint32_t, 3>;
-  static constexpr std::array<Costs, 4> short_context{
-      {{165, 185, 215}, {195, 260, 430}, {225, 275, 375}, {255, 330, 445}}};
-  static constexpr std::array<Costs, 4> medium_context{
-      {{160, 190, 220}, {185, 245, 295}, {215, 275, 360}, {230, 305, 410}}};
-  static constexpr std::array<Costs, 4> long_context{
-      {{160, 190, 225}, {185, 240, 300}, {210, 270, 370}, {220, 305, 390}}};
-  const size_t group = std::min((concurrency - 1u) / 2u, size_t{3});
-  const size_t column = std::clamp(tail, 1u, 3u) - 1u;
-  const uint32_t depth = static_cast<uint32_t>(session->checkpoint.len);
-  const bool deep = depth > 4096u;
-  const uint32_t span = deep ? 12288u : 3968u;
-  const uint32_t weight =
-      deep ? std::min(depth - 4096u, span) : (depth > 128u ? depth - 128u : 0u);
-  const uint32_t low = (deep ? medium_context : short_context)[group][column];
-  const uint32_t high = (deep ? long_context : medium_context)[group][column];
-  return (low * (span - weight) + high * weight) / span;
+  return ds4_dspark_cycle_cost(session->checkpoint.len, tail, concurrency);
 }
 
 static uint32_t session_dspark_profitable_tail(const ds4_session* session,
@@ -703,10 +688,9 @@ static void session_dspark_update_adaptive_width(ds4_session* session,
  * Decide the accepted prefix of a verified block.
  *
  * Greedy requests accept while the target argmax reproduces the draft. Sampled
- * requests draw each row with the request sampler and accept while the draw
- * reproduces the draft; the first rejected draw is exactly the token
- * autoregressive decoding would have produced there, so it becomes the next
- * anchor. Row i is the target output after draft i, read from `row_logits`
+ * requests use point-mass or p/q verification. The first rejected target or
+ * residual draw becomes the next anchor. Row i is the target output after
+ * draft i, read from `row_logits`
  * (concurrent cycles) or on demand from the graph (single cycles, where the
  * last read row is the frontier).
  */
@@ -733,8 +717,11 @@ static uint32_t session_dspark_accept_prefix(
     } else {
       return 0;
     }
-    const int drawn = sampler->sample(sampler->ctx, row,
-                                      (uint32_t)vocabulary_size);
+    const int drawn =
+        sampler->verify != nullptr
+            ? sampler->verify(sampler->ctx, accepted - 1u, row,
+                              (uint32_t)vocabulary_size, drafts[accepted])
+            : sampler->sample(sampler->ctx, row, (uint32_t)vocabulary_size);
     if (drawn != drafts[accepted]) {
       session->dspark_state.pending_anchor = drawn;
       return accepted;
@@ -923,7 +910,9 @@ static int session_dspark_step(ds4_session* session, int* emitted,
                                uint32_t max_draft_tokens,
                                const ds4_dspark_sampler* sampler) {
   if (!session || !session->checkpoint_valid || !emitted || !n_emitted ||
-      emitted_cap < 1) {
+      emitted_cap < 1 ||
+      (sampler && (!sampler->sample || ((sampler->propose == nullptr) !=
+                                        (sampler->verify == nullptr))))) {
     set_error(error, error_capacity, "invalid DSpark step request");
     return 1;
   }
@@ -931,6 +920,15 @@ static int session_dspark_step(ds4_session* session, int* emitted,
   if (session->checkpoint.len >= session->context_size) {
     set_error(error, error_capacity, "DSpark decode exceeds session context");
     return 1;
+  }
+  // C1 controls did not repay probabilistic proposal/verification overhead.
+  // Keep the qualified point-mass path (and AR seed identity) for this cohort.
+  ds4_dspark_sampler scalar_sampler{};
+  if (sampler && sampler->propose) {
+    scalar_sampler = *sampler;
+    scalar_sampler.propose = nullptr;
+    scalar_sampler.verify = nullptr;
+    sampler = &scalar_sampler;
   }
   session_dspark_use_concurrency(session, 1u);
   const uint32_t block = ds4_rocm_graph_dspark_block_size(session->graph);
@@ -968,9 +966,9 @@ static int session_dspark_step(ds4_session* session, int* emitted,
 
   int32_t drafts[DS4_DSPARK_MAX_BLOCK + 1u];
   uint32_t tail_drafted = 0;
-  const bool proposed =
-      ds4_rocm_graph_dspark_draft(session->graph, session->engine, target_first,
-                                  (uint32_t)length, drafts + 1, &tail_drafted);
+  const bool proposed = ds4_rocm_graph_dspark_draft(
+      session->graph, session->engine, target_first, (uint32_t)length,
+      drafts + 1, &tail_drafted, sampler, requested_tail);
   uint32_t drafted = 0;
   if (proposed && tail_drafted <= DS4_DSPARK_MAX_BLOCK) {
     // Keep the qualified support computation and select only the requested
@@ -981,7 +979,7 @@ static int session_dspark_step(ds4_session* session, int* emitted,
     drafted = tail_drafted + 1u;
   }
   const uint32_t drafted_cap = DS4_DSPARK_MAX_BLOCK + 1u;
-  if (!proposed || drafted == 0 || drafted > drafted_cap) {
+  if (!proposed || drafted <= 1 || drafted > drafted_cap) {
     if (!session_commit_and_extend(session, target_first)) {
       set_error(error, error_capacity,
                 "DeepSeek decode failed after draft failure");
@@ -1065,7 +1063,10 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
     const ds4_session_dspark_batch_item& item = items[index];
     ds4_session* session = item.session;
     if (!session || !session->checkpoint_valid || !item.emitted ||
-        !item.n_emitted || item.emitted_cap < 1) {
+        !item.n_emitted || item.emitted_cap < 1 ||
+        (item.sampler &&
+         (!item.sampler->sample || ((item.sampler->propose == nullptr) !=
+                                    (item.sampler->verify == nullptr))))) {
       set_error(error, error_capacity,
                 "DSpark batch contains an invalid session");
       return 1;
@@ -1171,6 +1172,8 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
           .max_draft_tokens = verify_tails[index],
           .tokens = drafts[index].data() + 1,
           .n_tokens = &tail_drafted[index],
+          .sampler = items[index].sampler,
+          .concurrency = item_count,
       };
     }
   }
@@ -1183,7 +1186,8 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
     proposed_all = ds4_rocm_graph_dspark_draft(
         items[index].session->graph, engine, target_first[index],
         static_cast<uint32_t>(lengths[index]), drafts[index].data() + 1,
-        &tail_drafted[index]);
+        &tail_drafted[index], items[index].sampler, verify_tails[index],
+        item_count);
   }
   const double draft_ms =
       trace_timing ? (ds4_now_seconds() - draft_t0) * 1000.0 : 0.0;
@@ -1199,6 +1203,17 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
                    drafted_counts[index] <= kDraftCapacity;
   }
 
+  if (proposed_all) {
+    // Confidence describes this block, so retry after one budget. Historical
+    // rejection retains its longer backoff for persistently poor acceptance.
+    for (size_t index = 0; index < item_count; ++index)
+      if (can_draft_items[index] && items[index].sampler &&
+          items[index].sampler->propose && tail_drafted[index] == 0)
+        items[index].session->dspark_state.skip_remaining = verify_tails[index];
+    if (std::all_of(drafted_counts.begin(), drafted_counts.begin() + item_count,
+                    [](uint32_t count) { return count == 1; }))
+      proposed_all = false;
+  }
   if (!proposed_all) {
     if (!sessions_commit_and_extend_batch(items, target_first, item_count)) {
       for (size_t index = 0; index < item_count; ++index) {

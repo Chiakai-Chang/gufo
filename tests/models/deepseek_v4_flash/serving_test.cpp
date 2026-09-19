@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "src/cli/serve/inference_backend.hpp"
+#include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
@@ -31,10 +33,10 @@ void Expect(bool condition, std::string_view message) {
 
 std::vector<gufo::tokenization::TokenId> GenerateDirect(
     const std::shared_ptr<Model>& model, std::span<const int> prompt,
-    std::size_t max_tokens,
-    const gufo::sampling::SamplingConfig& sampling = {}) {
+    std::size_t max_tokens, const gufo::sampling::SamplingConfig& sampling = {},
+    bool dspark = false) {
   std::string error;
-  auto session = model->CreateSession(512, &error);
+  auto session = model->CreateSession(dspark ? 4096 : 512, &error);
   Expect(session != nullptr, error);
   Expect(session->Sync(prompt, &error), error);
   const std::vector<gufo::sampling::TokenId> history(prompt.begin(),
@@ -43,6 +45,24 @@ std::vector<gufo::tokenization::TokenId> GenerateDirect(
 
   std::vector<gufo::tokenization::TokenId> result;
   result.reserve(max_tokens);
+  if (dspark) {
+    while (result.size() < max_tokens) {
+      gufo::models::deepseek_v4_flash::DsparkSamplerBridge bridge(sampler);
+      std::vector<int> emitted;
+      Expect(session->DsparkStep(max_tokens - result.size(), 7, &emitted,
+                                 &error, bridge.hook()),
+             error);
+      Expect(!emitted.empty(), "direct DSpark progress");
+      sampler.SetRngState(bridge.rng_state());
+      for (const int token : emitted) {
+        if (model->IsStopToken(token))
+          return result;
+        sampler.Accept(token);
+        result.push_back(token);
+      }
+    }
+    return result;
+  }
   for (std::size_t index = 0; index < max_tokens; ++index) {
     int token = -1;
     if (sampling.can_use_unmodified_argmax()) {
@@ -63,6 +83,111 @@ std::vector<gufo::tokenization::TokenId> GenerateDirect(
     }
   }
   return result;
+}
+
+void CheckSampledBatchReplay(const std::shared_ptr<Model>& model,
+                             std::span<const int> prompt) {
+  using namespace gufo::models::deepseek_v4_flash;
+  // A fixed dispatch schedule separates sampler reproducibility from HTTP
+  // arrival order. Different seeds/filters exercise independent request state.
+  std::array<std::vector<int>, 2> reference;
+  std::array<std::uint64_t, 2> reference_drafted{}, reference_accepted{};
+  std::size_t probabilistic_draws = 0, verifications = 0;
+  struct Probe {
+    DsparkSamplerBridge* bridge;
+    std::size_t *draws, *verified;
+  };
+  for (int run = 0; run < 2; ++run) {
+    std::string error;
+    std::array<std::unique_ptr<Session>, 2> sessions;
+    std::array<gufo::sampling::SamplerState, 2> samplers{
+        gufo::sampling::SamplerState(
+            {.temperature = 1.F, .top_p = 0.95F, .seed = 7}),
+        gufo::sampling::SamplerState({.temperature = 0.8F,
+                                      .top_k = 40,
+                                      .top_p = 0.95F,
+                                      .seed = 11,
+                                      .repeat_penalty = 1.1F})};
+    const std::vector<gufo::sampling::TokenId> history(prompt.begin(),
+                                                       prompt.end());
+    std::array<std::vector<int>, 2> output;
+    for (std::size_t i = 0; i < sessions.size(); ++i) {
+      sessions[i] = model->CreateSession(4096, &error);
+      Expect(sessions[i] && sessions[i]->Sync(prompt, &error), error);
+      samplers[i].ResetHistory(history);
+    }
+    for (int cycle = 0; cycle < 16; ++cycle) {
+      std::array<std::optional<DsparkSamplerBridge>, 2> bridges;
+      std::array<Probe, 2> probes;
+      std::array<ds4_dspark_sampler, 2> hooks;
+      std::array<std::vector<int>, 2> emitted;
+      std::array<SessionDsparkBatchItem, 2> items;
+      for (std::size_t i = 0; i < sessions.size(); ++i) {
+        bridges[i].emplace(samplers[i]);
+        probes[i] = {&*bridges[i], &probabilistic_draws, &verifications};
+        hooks[i] = {
+            .ctx = &probes[i],
+            .sample =
+                [](void* ctx, const float* logits, uint32_t vocab) {
+                  const auto* hook = static_cast<Probe*>(ctx)->bridge->hook();
+                  return hook->sample(hook->ctx, logits, vocab);
+                },
+            .accept =
+                [](void* ctx, int token) {
+                  const auto* hook = static_cast<Probe*>(ctx)->bridge->hook();
+                  hook->accept(hook->ctx, token);
+                },
+            .propose =
+                [](void* ctx, uint32_t row,
+                   const ds4_dspark_candidates* candidates) {
+                  auto& probe = *static_cast<Probe*>(ctx);
+                  const auto* hook = probe.bridge->hook();
+                  const auto rng = probe.bridge->rng_state();
+                  const int token = hook->propose(hook->ctx, row, candidates);
+                  *probe.draws += rng != probe.bridge->rng_state();
+                  return token;
+                },
+            .verify =
+                [](void* ctx, uint32_t row, const float* logits, uint32_t vocab,
+                   int token) {
+                  auto& probe = *static_cast<Probe*>(ctx);
+                  ++*probe.verified;
+                  const auto* hook = probe.bridge->hook();
+                  return hook->verify(hook->ctx, row, logits, vocab, token);
+                }};
+        items[i] = {.session = sessions[i].get(),
+                    .max_tokens = 4,
+                    .max_draft_tokens = 3,
+                    .emitted = &emitted[i],
+                    .sampler = &hooks[i]};
+      }
+      Expect(model->DsparkStepBatch(items, &error), error);
+      for (std::size_t i = 0; i < sessions.size(); ++i) {
+        Expect(!emitted[i].empty(), "sampled batch makes progress");
+        samplers[i].SetRngState(bridges[i]->rng_state());
+        for (const int token : emitted[i])
+          samplers[i].Accept(token);
+        output[i].insert(output[i].end(), emitted[i].begin(), emitted[i].end());
+      }
+    }
+    for (std::size_t i = 0; i < sessions.size(); ++i) {
+      const auto stats = sessions[i]->DsparkStatistics();
+      if (run == 0) {
+        reference[i] = output[i];
+        reference_drafted[i] = stats.support_drafted;
+        reference_accepted[i] = stats.support_accepted;
+      } else {
+        Expect(output[i] == reference[i] &&
+                   stats.support_drafted == reference_drafted[i] &&
+                   stats.support_accepted == reference_accepted[i],
+               "sampled batch replays outputs and decisions independently");
+      }
+    }
+  }
+  Expect(reference_drafted[0] + reference_drafted[1] > 0,
+         "filtered sampled batch exercises DSpark");
+  Expect(probabilistic_draws > 0 && verifications > 0,
+         "concurrent runtime invokes stochastic proposal and verification");
 }
 
 void CheckDsparkServing(const char* model_path, const char* support_path) {
@@ -94,9 +219,7 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
            "decisions");
   }
 
-  // Sampled requests draft too: each verified row is drawn with the request
-  // sampler, so a seeded DSpark request reproduces autoregressive decoding
-  // token for token, including penalties.
+  // C1 retains the point-mass route and its stronger AR seed-trace contract.
   {
     const std::vector<gufo::models::deepseek_v4_flash::ChatMessage>
         direct_messages = {
@@ -108,6 +231,7 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
     InferenceBackend backend;
     Expect(backend.load(model, &error, 4096, 1, {}, {}, speculative), error);
     const auto greedy = backend.chat(prompt, 32, 0.0F);
+    std::size_t sampled_drafts = 0;
     for (const auto& sampling : {
              gufo::sampling::SamplingConfig{.temperature = 0.6F, .seed = 7},
              gufo::sampling::SamplingConfig{.temperature = 1.0F, .seed = 7},
@@ -118,19 +242,28 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
                                             .repeat_penalty = 1.2F,
                                             .frequency_penalty = 0.3F},
          }) {
-      const auto direct = GenerateDirect(model, direct_prompt, 32, sampling);
+      const auto direct =
+          GenerateDirect(model, direct_prompt, 32, sampling, true);
+      const auto autoregressive =
+          GenerateDirect(model, direct_prompt, 32, sampling);
       const auto result = backend.chat(prompt, 32, sampling);
-      Expect(result.draft_tokens > 0,
-             "sampled DSpark request reports draft statistics");
-      Expect(result.tokens == direct,
-             "seeded sampled DSpark output equals autoregressive decoding");
+      const auto repeat = backend.chat(prompt, 32, sampling);
+      sampled_drafts += result.draft_tokens;
+      Expect(result.draft_accepted_tokens <= result.draft_tokens,
+             "sampled DSpark accounting includes legitimate AR fallback");
+      Expect(result.tokens == direct && direct == autoregressive &&
+                 repeat.tokens == result.tokens,
+             "C1 DSpark, AR, frontend and cached seeded replay agree");
     }
+    Expect(sampled_drafts > 0,
+           "sampled C1 serving exercises DSpark verification");
     const auto greedy_again = backend.chat(prompt, 32, 0.0F);
     Expect(
         greedy_again.tokens == greedy.tokens &&
             greedy_again.draft_tokens == greedy.draft_tokens &&
             greedy_again.draft_accepted_tokens == greedy.draft_accepted_tokens,
         "greedy DSpark output is unchanged after sampled cycles");
+    CheckSampledBatchReplay(model, direct_prompt);
   }
 
   // Greedy and seeded sampled requests share one DSpark cohort.
@@ -159,8 +292,8 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
       const auto result = pending[i]->Wait();
       Expect(!result.tokens.empty() && result.tokens.size() <= 32,
              "mixed sampling request completes within its budget");
-      Expect(result.draft_tokens > 0,
-             "greedy and sampled requests both retain DSpark");
+      if (i % 2 == 0)
+        Expect(result.draft_tokens > 0, "greedy requests retain DSpark");
       Expect(result.physical_execution_width == concurrency &&
                  result.execution_plan ==
                      "batched-w" + std::to_string(concurrency),
@@ -225,7 +358,7 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
     InferenceBackend backend;
     Expect(backend.load(model, &error, 4096, 1, {}, {}, speculative, disk),
            error);
-    const auto result = backend.chat(prompt, 8, 0.0F);
+    const auto result = backend.chat(prompt, 8, sampled);
     Expect(result.cache_disk_hit == (run == 1),
            "DSpark disk reuse requires the matching support artifact identity");
     if (run == 0)

@@ -5,17 +5,17 @@ are in [the DS4 benchmark README](../../benchmarks/deepseek-v4-flash/README.md).
 
 | Tool | Purpose |
 | --- | --- |
-| `tools/ds4/check.py fast` | CLI, chat framing, pinned dataset audit, and answer grading |
+| `tools/ds4/check.py fast` | CLI, chat framing, exact DSpark sampling, pinned dataset audit, and answer grading |
 | `tools/ds4/check.py kernels` | Q8/IQ2/F16 and attention oracles, plus complete official HC formulas; no model required |
 | `tools/ds4/check.py reference --model "$MODEL" --upstream "$UPSTREAM" --output /tmp/ds4-reference` | Repeated AR scoring against 105 official continuations; independent full logits and 128 forced tokens at 0/4K/8K/12K/16K, with matched 2K/4K prefill calls |
 | `tools/ds4/check.py reference --prefill-only --model "$MODEL" --upstream "$UPSTREAM" --output /tmp/ds4-prefill` | Same matched prefill grid and exact repeat check; skip continuation scoring and decode replay |
-| `tools/ds4/check.py all --model "$MODEL" --dspark-model "$DSPARK"` | All nine DS4 CTest checks, including changing concurrency, snapshots through 16K, mixed sampling, and prefix/disk reuse |
+| `tools/ds4/check.py all --model "$MODEL" --dspark-model "$DSPARK"` | All maintained DS4 CTest checks, including changing concurrency, snapshots through 16K, mixed sampling, and prefix/disk reuse |
 | `tools/ds4/import-eval.py` | Rebuild pinned fixtures from an upstream checkout; default capability subset, `--suite official` for the 0731 continuations |
 | `result/bin/gufo eval --questions 75 --greedy --output /tmp/ds4-quality.json` | Pinned capability evaluation through the real HTTP server (add `--base-url`) |
 | `result/bin/gufo bench -c 1,2,4,6,8 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v` | Release model sweep; per-request output hashes and draft counters (add model paths) |
 | `tools/ds4/check.py benchmark --ar-log /tmp/ar.log --dspark-log /tmp/dspark.log --output /tmp/bench.json` | Check all 25 points and every member of both repeats; require repeated hashes/counters and matching AR/DSpark tokens |
-| `result/bin/gufo bench -c 1,2,4 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v --temperature 0.6 --seed 7` | Sampled release sweep; the same seed on the AR and DSpark runs must produce the same hashes |
-| `tools/ds4/check.py benchmark --concurrency 1,2,4 --temperature 0.6 --seed 7 --ar-log /tmp/ar-t06.log --dspark-log /tmp/dspark-t06.log --output /tmp/bench-t06.json` | Same checks on the sampled sweep, with per-point DSpark acceptance in the report |
+| `result/bin/gufo bench -c 1,2,4 -p 2048 -n 128 -d 0,4096,8192,12288,16384 -r 2 -v --temperature 0.6 --top-p 0.95 --seed 7` | Filtered sampled sweep; C1 retains AR seed identity, while C>1 uses exact probabilistic proposals |
+| `tools/ds4/check.py benchmark --concurrency 1,2,4 --temperature 0.6 --top-p 0.95 --seed 7 --ar-log /tmp/ar-t06.log --dspark-log /tmp/dspark-t06.log --output /tmp/bench-t06.json` | Repeated output/counters, AR identity for point-mass cohorts, acceptance and proposal policy |
 | `tools/serving/gufo-serving-bench.py` | Shared HTTP concurrency, scheduling, and acceptance measurement |
 | `tools/quant/speculative-corpus.py` | Shared AR/speculative text comparison on the fixed corpus |
 | `tools/prof/prof.py` | Shared rocprofv3 capture, rollup, and A/B diff |
@@ -53,3 +53,10 @@ Model inference timings always use the release `result/bin/gufo`. Do not use
 CTest/debug model executables for performance claims. Temporary profiler traces
 and experiment artifacts stay outside Git; retained experiment decisions belong
 in the benchmark README. There are no production reference-route switches.
+
+For HTTP A/B comparisons, use a fixed `--suite` corpus and a fresh server per
+variant. The ordinary `--prompt` benchmark inserts a random nonce into the
+prompt; separate invocations therefore cannot establish identical-input output
+or acceptance comparisons. Report cache hits explicitly. Sampling contracts
+and the retained confidence/proposal controls are in the
+[DSpark sampling report](../../benchmarks/deepseek-v4-flash/dspark-sampling.md).

@@ -109,6 +109,7 @@ private:
   [[nodiscard]] TokenId SampleGreedy(std::span<const float> logits) const;
   [[nodiscard]] TokenId SampleLinear(std::span<const float> logits);
   [[nodiscard]] TokenId SampleSelected(std::span<const float> logits);
+  void PrepareSelected(std::span<const float> logits);
 
   SamplingConfig config_;
   std::vector<TokenId> history_;
