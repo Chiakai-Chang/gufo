@@ -778,6 +778,13 @@ if (BUILD_TESTING)
   set_tests_properties(eval_http_test PROPERTIES
     LABELS "cpu;quality;eval;http;cli;server")
 
+  add_executable(eval_http_client_test
+    tests/quality/eval_http_client_test.cpp src/eval/http_client.cpp)
+  target_include_directories(eval_http_client_test PRIVATE ${PROJECT_SOURCE_DIR})
+  target_link_libraries(eval_http_client_test PRIVATE CURL::libcurl Threads::Threads)
+  add_test(NAME eval_http_client_test COMMAND eval_http_client_test)
+  set_tests_properties(eval_http_client_test PROPERTIES LABELS "cpu;quality;eval;http")
+
   add_executable(kernel_bench_test tests/benchmarks/kernel_bench_test.cpp)
   target_link_libraries(kernel_bench_test PRIVATE gufo_kernel_bench_support)
   add_test(NAME kernel_bench_test COMMAND kernel_bench_test)

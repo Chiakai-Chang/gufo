@@ -118,6 +118,13 @@ process fail. Transport, HTTP, context-rejection, and malformed-response errors
 are execution failures and produce a nonzero exit status after the report is
 written.
 
+Connections and model discovery have a 30-second deadline. Each completion
+has a 30-minute total deadline, including partial responses, to accommodate
+non-streaming generation of up to 16,000 tokens. Timeouts are recorded as
+`request_timeout` execution errors. The report is atomically checkpointed
+before the first completion and after every case; `completed_cases` shows
+progress if the evaluation is interrupted.
+
 ## Result Artifact
 
 The JSON report records:

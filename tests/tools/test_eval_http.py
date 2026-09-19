@@ -66,6 +66,8 @@ class FixtureState:
         self.api_key = api_key
         self.requests: list[dict[str, Any]] = []
         self.lock = threading.Lock()
+        self.blocked = threading.Event()
+        self.release = threading.Event()
 
     def next_response(self) -> dict[str, Any]:
         with self.lock:
@@ -128,6 +130,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
         self.server.state.requests.append(request)
         response = self.server.state.next_response()
         mode = response.pop("mode", "json")
+        if mode == "wait":
+            self.server.state.blocked.set()
+            if not self.server.state.release.wait(timeout=5):
+                return
         if mode == "disconnect":
             self.connection.shutdown(socket.SHUT_RDWR)
             self.connection.close()
@@ -227,6 +233,36 @@ class EvalHttpTest(unittest.TestCase):
             else None
         )
         return process, report, output
+
+    def test_report_is_checkpointed_before_next_response(self) -> None:
+        second = completion("Answer: C")
+        second["mode"] = "wait"
+        state = FixtureState([completion("Answer: B"), second])
+        with tempfile.TemporaryDirectory() as directory, fixture_server(state) as base_url:
+            output = Path(directory) / "result.json"
+            process = subprocess.Popen(
+                [str(ARGS.gufo), "eval", "--base-url", base_url,
+                 "--questions", "2", "--output", str(output)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                self.assertTrue(state.blocked.wait(timeout=5))
+                report = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(report["summary"]["total_cases"], 2)
+                self.assertEqual(report["summary"]["completed_cases"], 1)
+                self.assertEqual(report["summary"]["passed"], 1)
+                self.assertEqual(len(report["cases"]), 1)
+            finally:
+                state.release.set()
+                try:
+                    _, stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.communicate()
+                    raise
+            self.assertEqual(process.returncode, 0, stderr)
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(report["summary"]["completed_cases"], 2)
 
     def test_default_requests_and_grading(self) -> None:
         state = FixtureState(

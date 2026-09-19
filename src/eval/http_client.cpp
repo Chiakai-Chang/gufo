@@ -2,9 +2,12 @@
 
 #include <curl/curl.h>
 
+#include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstddef>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 
@@ -43,8 +46,10 @@ void EnsureCurlInitialized() {
 std::size_t AppendResponse(char* contents, std::size_t size, std::size_t count,
                            void* opaque) {
   auto* output = static_cast<std::string*>(opaque);
+  if (size != 0 && count > kMaximumResponseBytes / size)
+    return 0;
   const std::size_t bytes = size * count;
-  if (output == nullptr || output->size() + bytes > kMaximumResponseBytes) {
+  if (output == nullptr || output->size() > kMaximumResponseBytes - bytes) {
     return 0;
   }
   output->append(contents, bytes);
@@ -59,9 +64,14 @@ void SetError(std::string* error, std::string message) {
 
 }  // namespace
 
-HttpClient::HttpClient(std::string base_url, std::string bearer_token)
+HttpClient::HttpClient(std::string base_url, std::string bearer_token,
+                       std::chrono::milliseconds request_timeout)
     : base_url_(NormalizeBaseUrl(std::move(base_url))),
-      bearer_token_(std::move(bearer_token)) {
+      bearer_token_(std::move(bearer_token)),
+      request_timeout_(request_timeout) {
+  if (request_timeout.count() <= 0 || request_timeout.count() > LONG_MAX)
+    throw std::invalid_argument(
+        "eval request timeout must be positive and bounded");
   EnsureCurlInitialized();
 }
 
@@ -108,6 +118,14 @@ HttpResult HttpClient::Request(std::string_view method,
   curl_easy_setopt(handle.get(), CURLOPT_HTTPHEADER, headers.get());
   curl_easy_setopt(handle.get(), CURLOPT_NOSIGNAL, 1L);
   curl_easy_setopt(handle.get(), CURLOPT_CONNECTTIMEOUT, 30L);
+  // Non-streaming completions may remain silent while generating 16K tokens.
+  // Bound the whole transfer, including a server that trickles partial bytes.
+  const auto timeout =
+      method == "GET"
+          ? std::min(request_timeout_, std::chrono::milliseconds(30000))
+          : request_timeout_;
+  curl_easy_setopt(handle.get(), CURLOPT_TIMEOUT_MS,
+                   static_cast<long>(timeout.count()));
   curl_easy_setopt(handle.get(), CURLOPT_WRITEFUNCTION, AppendResponse);
   curl_easy_setopt(handle.get(), CURLOPT_WRITEDATA, &result.body);
   curl_easy_setopt(handle.get(), CURLOPT_USERAGENT, "gufo-eval/1");
@@ -125,7 +143,10 @@ HttpResult HttpClient::Request(std::string_view method,
                           std::chrono::steady_clock::now() - started)
                           .count();
   if (code != CURLE_OK) {
-    result.transport_code = "curl_" + std::to_string(static_cast<int>(code));
+    result.transport_code =
+        code == CURLE_OPERATION_TIMEDOUT
+            ? "request_timeout"
+            : "curl_" + std::to_string(static_cast<int>(code));
     return result;
   }
   result.transport_ok = true;

@@ -1,6 +1,7 @@
 #ifndef GUFO_EVAL_HTTP_CLIENT_HPP_
 #define GUFO_EVAL_HTTP_CLIENT_HPP_
 
+#include <chrono>
 #include <string>
 #include <string_view>
 
@@ -16,7 +17,9 @@ struct HttpResult {
 
 class HttpClient {
 public:
-  HttpClient(std::string base_url, std::string bearer_token);
+  static constexpr auto kRequestTimeout = std::chrono::minutes(30);
+  HttpClient(std::string base_url, std::string bearer_token,
+             std::chrono::milliseconds request_timeout = kRequestTimeout);
 
   [[nodiscard]] const std::string& base_url() const noexcept {
     return base_url_;
@@ -33,6 +36,7 @@ private:
 
   std::string base_url_;
   std::string bearer_token_;
+  std::chrono::milliseconds request_timeout_;
 };
 
 [[nodiscard]] bool ValidateBaseUrl(std::string_view base_url,

@@ -458,6 +458,10 @@ int Execute(const EvalOptions& options) {
   run["request_order"] = "sequential";
   run["independent_requests"] = true;
   run["max_completion_tokens"] = kMaximumCompletionTokens;
+  run["request_timeout_ms"] =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          gufo::eval::HttpClient::kRequestTimeout)
+          .count();
   run["temperature"] = options.greedy ? Value(0) : Value();
   run["temperature_policy"] = options.greedy ? "greedy" : "server_default";
   run["thinking_policy"] = "server_default";
@@ -480,12 +484,31 @@ int Execute(const EvalOptions& options) {
   run["model"] = std::move(model_json);
   report["run"] = std::move(run);
 
-  Value cases = Value::array();
+  report["cases"] = Value::array();
+  report["summary"] = Value::object();
+  auto& cases = report["cases"];
   std::size_t passed = 0;
   std::size_t failed = 0;
   std::size_t execution_errors = 0;
   std::size_t completion_tokens = 0;
   std::size_t length_finishes = 0;
+  const auto checkpoint = [&] {
+    Value summary = Value::object();
+    summary["total_cases"] = options.questions;
+    summary["completed_cases"] = cases.items().size();
+    summary["passed"] = passed;
+    summary["failed"] = failed;
+    summary["not_graded"] = execution_errors;
+    summary["execution_errors"] = execution_errors;
+    summary["length_finishes"] = length_finishes;
+    summary["completion_tokens"] = completion_tokens;
+    report["summary"] = std::move(summary);
+    return WriteReport(options.output, report, &error);
+  };
+  if (!checkpoint()) {
+    std::cerr << "eval: " << error << '\n';
+    return 1;
+  }
 
   for (std::size_t index = 0; index < options.questions; ++index) {
     const auto& eval_case = suite->cases[index];
@@ -591,6 +614,10 @@ int Execute(const EvalOptions& options) {
     item["response"] = std::move(response_json);
     item["grade"] = std::move(grade);
     cases.push_back(std::move(item));
+    if (!checkpoint()) {
+      std::cerr << "eval: " << error << '\n';
+      return 1;
+    }
 
     std::cout << '[' << index + 1 << '/' << options.questions << "] "
               << eval_case.source << '/' << eval_case.id << ": ";
@@ -602,22 +629,6 @@ int Execute(const EvalOptions& options) {
                 << " (" << status << ')';
     }
     std::cout << '\n';
-  }
-  report["cases"] = std::move(cases);
-
-  Value summary = Value::object();
-  summary["total_cases"] = options.questions;
-  summary["passed"] = passed;
-  summary["failed"] = failed;
-  summary["not_graded"] = execution_errors;
-  summary["execution_errors"] = execution_errors;
-  summary["length_finishes"] = length_finishes;
-  summary["completion_tokens"] = completion_tokens;
-  report["summary"] = std::move(summary);
-
-  if (!WriteReport(options.output, report, &error)) {
-    std::cerr << "eval: " << error << '\n';
-    return 1;
   }
   std::cout << "eval: wrote " << options.questions << " cases to "
             << options.output << " (passed=" << passed << ", failed=" << failed
