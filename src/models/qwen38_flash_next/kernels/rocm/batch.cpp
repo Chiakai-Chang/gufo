@@ -70,7 +70,6 @@ Executor::Scratch Executor::RowScratch(const Scratch& b,
   s.k += r * c.AttentionKvDim();
   s.v += r * c.AttentionKvDim();
   s.iq += r * c.indexer_heads * c.indexer_head_dim;
-  s.iq_half += r * c.indexer_heads * c.indexer_head_dim;
   s.ik += r * c.indexer_head_dim;
   s.mask += r * mask_words_;
   s.ctx += r * c.AttentionQDim();
@@ -92,6 +91,13 @@ Executor::Scratch Executor::RowScratch(const Scratch& b,
   s.shexp_gate += r * c.shared_expert_ff;
   s.shexp_up += r * c.shared_expert_ff;
   s.shexp_out += r * c.hidden_size;
+  if (has_mtp()) {
+    s.mtp_h += r * c.HcDim();
+    s.mtp_embd += r * c.hidden_size;
+    // This allocation aliases qkvz, but has a different row stride.
+    s.mtp_eproj += r * c.hidden_size;
+    s.mtp_res += r * c.HcDim();
+  }
   // Activation staging, attention partials and convolution staging have
   // one consumer at a time on stream_. They remain at the allocation base.
   return s;
@@ -119,6 +125,194 @@ bool Executor::AllocateBatch(std::string* error) const {
                 error));
 }
 
+bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
+                               std::string* error) const {
+  const Config& c = config();
+  if (!has_mtp() || items.empty() || items.size() > kBatchSessions) {
+    return Fail(error, "invalid MTP body batch");
+  }
+  std::array<std::uint32_t, kBatchSessions> offsets{};
+  std::uint32_t rows = 0;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    const auto& item = items[i];
+    const auto n = item.tokens.size();
+    if (item.session == nullptr || item.session->owner_ != this || n == 0 ||
+        n > kDecodeRows || (item.hidden_row < 0 && n != 1) ||
+        (item.hidden_row >= 0 &&
+         static_cast<std::uint32_t>(item.hidden_row) + n >
+             options_.max_speculative) ||
+        item.session->mtp_.position + n > item.session->max_context_) {
+      return Fail(error, "invalid MTP body request");
+    }
+    for (std::size_t j = 0; j < i; ++j) {
+      if (items[j].session == item.session)
+        return Fail(error, "MTP body requests must be independent");
+    }
+    for (const auto token : item.tokens) {
+      if (token < 0 || static_cast<std::uint32_t>(token) >= c.vocab_size)
+        return Fail(error, "MTP token out of range");
+    }
+    offsets[i] = rows;
+    rows += n;
+  }
+  if (rows > options_.max_batch)
+    return Fail(error, "MTP body batch exceeds executor capacity");
+  if (items.size() == 1) {
+    const auto& item = items.front();
+    return MtpForward(*item.session, item.tokens, item.hidden_row, {}, error);
+  }
+  if (!AllocateBatch(error) ||
+      (batch_controls_ == nullptr &&
+       !Check(hipHostMalloc(&batch_controls_,
+                            kBatchSessions * sizeof(Session::Control)),
+              error))) {
+    return false;
+  }
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    const auto& item = items[i];
+    const auto& session = *item.session;
+    batch_controls_[i] = {session.position_, session.blocks_,
+                          session.mtp_.position, item.hidden_row,
+                          session.mtp_.blocks};
+    std::copy(item.tokens.begin(), item.tokens.end(),
+              tokens_host_ + offsets[i]);
+  }
+  const Scratch base = s_;
+  const auto& l = model_->mtp();
+  const auto body = [&]() {
+    if (!Check(hipMemcpyAsync(base.tokens, tokens_host_,
+                              rows * sizeof(std::int32_t),
+                              hipMemcpyHostToDevice, stream_),
+               error))
+      return false;
+    EmbedTokens(model_->token_embd().data,
+                EmbeddingType(model_->token_embd().type), base.tokens,
+                base.mtp_embd, rows, c.hidden_size, 1, stream_);
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      auto& session = *items[i].session;
+      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+      UseScratch(RowScratch(base, offsets[i]));
+      if (!Check(hipMemcpyAsync(session.control_, batch_controls_ + i,
+                                sizeof(Session::Control), hipMemcpyHostToDevice,
+                                stream_),
+                 error))
+        return false;
+      RmsNormRows(s_.mtp_embd, l.nextn_enorm.f32(), s_.mtp_embd, n,
+                  c.hidden_size, 1, c.rms_eps, stream_);
+      MtpHidden(session.mtp_.target_hidden, session.mtp_.h,
+                &session.control_->hidden_row, s_.mtp_h, n, c.HcDim(), stream_);
+      RmsNormRows(s_.mtp_h, l.nextn_hnorm.f32(), s_.mtp_h, n, c.HcDim(), 1,
+                  c.rms_eps, stream_);
+    }
+    // Keep each session's vector/matrix arithmetic while sharing weight
+    // reads among adjacent vector-sized inputs. Project the embedding once.
+    for (std::size_t i = 0; i < items.size();) {
+      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+      auto end = i + 1;
+      if (n * c.hc_count <= kDecodeRows) {
+        while (end < items.size() &&
+               items[end].tokens.size() * c.hc_count <= kDecodeRows)
+          ++end;
+      }
+      const auto end_row = end == items.size() ? rows : offsets[end];
+      const auto count = end_row - offsets[i];
+      UseScratch(RowScratch(base, offsets[i]));
+      if (n * c.hc_count <= kDecodeRows) {
+        if (!DenseBatch(l.nextn_fc_embedding, s_.mtp_embd, s_.mtp_eproj, count,
+                        error) ||
+            !DenseBatch(l.nextn_fc_hidden, s_.mtp_h, s_.mtp_res,
+                        count * c.hc_count, error))
+          return false;
+      } else if (!Dense(l.nextn_fc_embedding, s_.mtp_embd, s_.mtp_eproj, n,
+                        error) ||
+                 !Dense(l.nextn_fc_hidden, s_.mtp_h, s_.mtp_res, n * c.hc_count,
+                        error)) {
+        return false;
+      }
+      MtpAddEmbedding(s_.mtp_eproj, s_.mtp_res, count, c.hidden_size,
+                      c.hc_count, stream_);
+      i = end;
+    }
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+      UseScratch(RowScratch(base, offsets[i]));
+      if (!HcMix(l.hc_attn, s_.mtp_res, false, s_.mixed, s_.inject, n, error))
+        return false;
+    }
+    UseScratch(base);
+    if (!l.attn_qkv.empty()) {
+      if (!DenseBatch(l.attn_qkv, base.mixed, base.qg, rows, error))
+        return false;
+    } else if (!DenseBatch(l.attn_q, base.mixed, base.qg, rows, error) ||
+               !DenseBatch(l.attn_k, base.mixed, base.k, rows, error) ||
+               !DenseBatch(l.attn_v, base.mixed, base.v, rows, error)) {
+      return false;
+    }
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      auto& session = *items[i].session;
+      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+      auto view = RowScratch(base, offsets[i]);
+      if (l.attn_qkv.empty())
+        view.qg = base.qg + std::size_t{offsets[i]} * 2 * c.AttentionQDim();
+      UseScratch(view);
+      Session::AttentionState attention;
+      attention.rope = session.vision_input_.rope();
+      attention.k_cache = session.mtp_.k_cache;
+      attention.v_cache = session.mtp_.v_cache;
+      attention.index_k = session.mtp_.index_k;
+      attention.block_k = session.mtp_.block_k;
+      const bool sparse = session.mtp_.position + n > c.indexer_top_k;
+      const auto complete = (session.mtp_.position + n) / c.compress_ratio;
+      const auto pool = sparse ? complete - session.mtp_.blocks : 0;
+      if (!Attention(l, attention, s_.mixed, s_.block_out, n,
+                     &session.control_->mtp_position,
+                     &session.control_->mtp_blocks, session.mtp_.position, pool,
+                     session.max_context_, sparse, error, false, true, false))
+        return false;
+    }
+    UseScratch(base);
+    if (!DenseBatch(l.attn_out, base.ctx, base.block_out, rows, error))
+      return false;
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+      UseScratch(RowScratch(base, offsets[i]));
+      Combine(s_.mtp_res, l.hc_ffn.norm.f32(), n);
+      if (!HcMix(l.hc_ffn, s_.mtp_res, true, s_.mixed, s_.inject, n, error))
+        return false;
+    }
+    for (std::uint32_t row = 0; row < rows; row += kDecodeRows) {
+      UseScratch(RowScratch(base, row));
+      if (!Moe(l, s_.mixed, s_.block_out, std::min(kDecodeRows, rows - row),
+               error))
+        return false;
+    }
+    for (std::size_t i = 0; i < items.size(); ++i) {
+      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
+      UseScratch(RowScratch(base, offsets[i]));
+      Combine(s_.mtp_res, nullptr, n);
+      if (!Check(hipMemcpyAsync(items[i].session->mtp_.h,
+                                s_.mtp_res + std::size_t{n - 1} * c.HcDim(),
+                                c.HcDim() * sizeof(float),
+                                hipMemcpyDeviceToDevice, stream_),
+                 error))
+        return false;
+    }
+    return true;
+  };
+  const bool ok = body();
+  const auto status = hipStreamSynchronize(stream_);
+  UseScratch(base);
+  if (!ok || !Check(status, error))
+    return false;
+  for (const auto& item : items) {
+    item.session->mtp_.position += item.tokens.size();
+    if (item.session->mtp_.position > c.indexer_top_k)
+      item.session->mtp_.blocks =
+          item.session->mtp_.position / c.compress_ratio;
+  }
+  return true;
+}
+
 bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
                         std::string* error) const {
   selected_logits_ = nullptr;
@@ -129,7 +323,7 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     if (item.session == nullptr || item.session->owner_ != this ||
-        item.session->mtp_.position == 0 ||
+        item.session->mtp_.position == 0 || item.output.trace != nullptr ||
         (item.output.token == nullptr && item.output.candidates == nullptr)) {
       return Fail(error, "invalid MTP head request");
     }
@@ -144,9 +338,9 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
           &sampling_workspace_, config().vocab_size, config().vocab_size);
     }
   }
-  const auto& output = model_->mtp_output();
+  const auto& output = model_->output();
   const auto& head = model_->mtp().nextn_head;
-  if (items.size() == 1 || output.type != core::GgmlType::kQ4_0) {
+  if (items.size() == 1) {
     for (const auto& item : items) {
       if (!MtpHead(head, item.session->mtp_.h, item.output.token != nullptr,
                    item.output.candidates != nullptr, error) ||
@@ -183,17 +377,22 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
       }
     }
     UseScratch(base);
-    if (qfn_mmq_quantize_q8_1(base.mixed, batch_q8_, n, output.cols, stream_) ||
-        qfn_mmq_q4_0_dense_vec_preq(output.data, batch_q8_, batch_logits_,
-                                    output.rows, output.cols, n, stream_)) {
-      return Fail(error, "batched MTP shortlist projection failed");
-    }
+    if (!DenseBatch(output, base.mixed, batch_logits_, n, error))
+      return false;
     for (std::uint32_t i = 0; i < n; ++i) {
-      const auto* input = static_cast<const std::uint8_t*>(batch_q8_) +
-                          qfn_mmq_q8_1_bytes(i, output.cols);
-      if (!MtpRescore(input, batch_logits_ + std::size_t(i) * output.rows,
-                      error) ||
-          !Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
+      if (items[i].output.candidates == nullptr) {
+        Argmax(batch_logits_ + std::size_t(i) * output.rows, s_.mtp_argmax,
+               s_.mtp_token, 1, output.rows, stream_);
+        if (!Check(hipMemcpyAsync(batch_candidates_host_[i].ids.data(),
+                                  s_.mtp_token, sizeof(std::int32_t),
+                                  hipMemcpyDeviceToHost, stream_),
+                   error))
+          return false;
+        continue;
+      }
+      MtpTopCandidates(batch_logits_ + std::size_t(i) * output.rows, s_.mtp_ids,
+                       s_.mtp_scratch_ids, s_.mtp_scores, output.rows, stream_);
+      if (!Check(hipMemcpyAsync(batch_candidates_host_ + i, s_.mtp_ids,
                                 offsetof(MtpCandidateLogits, logits) +
                                     count * sizeof(float),
                                 hipMemcpyDeviceToHost, stream_),
@@ -298,6 +497,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   if (rows > options_.max_batch) {
     return Fail(error, "decode batch exceeds executor capacity");
   }
+  for (const auto& item : items) {
+    if (item.speculative &&
+        !EnsureRollback(*item.session, item.tokens.size() - 1, error))
+      return false;
+  }
   if (!AllocateBatch(error)) {
     return false;
   }
@@ -317,7 +521,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     session.spec_base_ = session.position_;
     session.spec_tokens_ = item.speculative ? item.tokens.size() : 0;
     batch_controls_[i] = {session.position_, session.blocks_,
-                          session.mtp_.position, -1};
+                          session.mtp_.position, -1, session.mtp_.blocks};
     std::copy(item.tokens.begin(), item.tokens.end(),
               tokens_host_ + offsets[i]);
     if (c.ple_layer >= 0) {

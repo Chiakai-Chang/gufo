@@ -123,6 +123,49 @@ void TestMinKeepProvidesAFilterFloor() {
          "min-keep prevents enabled filters from shrinking below its floor");
 }
 
+void TestTemperatureBeforeProbabilityFilters() {
+  // Independent closed-form expectations for softmax([0,-1,-2] / T).
+  // Also exercise the bounded (>1024 vocabulary) candidate selector.
+  for (const std::size_t size : {3U, 2048U}) {
+    std::vector<float> logits(size, -1000.0F);
+    logits[0] = 0.0F;
+    logits[1] = -1.0F;
+    logits[2] = -2.0F;
+    for (const bool nucleus : {false, true}) {
+      gufo::sampling::SamplingConfig config{.temperature = 0.5F, .seed = 42};
+      if (nucleus)
+        config.top_p = 0.8F;
+      else
+        config.min_p = 0.2F;
+      gufo::sampling::SamplerState sampler(config);
+      for (const auto distribution :
+           {gufo::sampling::BuildDistribution(logits, config),
+            sampler.Distribution(logits)}) {
+        Expect(distribution.entries().size() == 1 &&
+                   distribution.probability(0) == 1.0,
+               "temperature sharpens probabilities before filtering");
+      }
+      for (unsigned draw = 0; draw < 32; ++draw)
+        Expect(sampler.Sample(logits) == 0,
+               "ordinary decode uses the tempered candidate set");
+
+      config.temperature = 2.0F;
+      config.top_p = nucleus ? 0.8F : 1.0F;
+      config.min_p = nucleus ? 0.0F : 0.5F;
+      const double first = 1.0 / (1.0 + std::exp(-0.5));
+      for (const auto distribution :
+           {gufo::sampling::BuildDistribution(logits, config),
+            gufo::sampling::SamplerState(config).Distribution(logits)}) {
+        Expect(
+            distribution.entries().size() == 2 &&
+                std::abs(distribution.probability(0) - first) < 1e-12 &&
+                std::abs(distribution.probability(1) - (1.0 - first)) < 1e-12,
+            "temperature flattens probabilities before filtering");
+      }
+    }
+  }
+}
+
 void TestRepeatPenaltyUsesCommittedHistory() {
   const std::array<float, 3> logits = {2.0F, 1.0F, 0.0F};
   const std::array<gufo::sampling::TokenId, 1> history = {0};
@@ -432,6 +475,7 @@ int main() {
   TestTopPFiltersByCumulativeProbability();
   TestMinPFiltersRelativeToTheBestToken();
   TestMinKeepProvidesAFilterFloor();
+  TestTemperatureBeforeProbabilityFilters();
   TestRepeatPenaltyUsesCommittedHistory();
   TestFrequencyAndPresencePenaltiesUseCounts();
   TestRepeatWindowIsBounded();

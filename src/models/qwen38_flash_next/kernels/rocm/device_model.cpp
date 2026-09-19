@@ -78,6 +78,44 @@ struct Uploader {
     return d;
   }
 
+  // GGUF packs [fc_embedding | fc_hidden] across each row. Split on a
+  // quantization-block boundary without dequantizing or changing any weight.
+  void SplitMtpProjection(const TensorRef& t, DeviceTensor& embedding,
+                          DeviceTensor& hidden) {
+    if (t.empty() || !ok)
+      return;
+    const auto combined = Copy(t);
+    if (!ok || !stager.Finish(error)) {
+      Fail("MTP projection upload failed");
+      return;
+    }
+    const std::size_t row_bytes = t.SizeBytes() / t.rows / 2;
+    const std::size_t part_bytes = row_bytes * t.rows;
+    for (std::uint32_t part = 0; part < 2; ++part) {
+      auto& dst = part == 0 ? embedding : hidden;
+      dst = combined;
+      dst.cols /= 2;
+      if (hipMalloc(&dst.data, part_bytes + kTailMargin) != hipSuccess) {
+        Fail("MTP split projection allocation failed");
+        return;
+      }
+      allocations.push_back(dst.data);
+      bytes += part_bytes + kTailMargin;
+      const auto* src =
+          static_cast<const std::uint8_t*>(combined.data) + part * row_bytes;
+      if (hipMemcpy2D(dst.data, row_bytes, src, 2 * row_bytes, row_bytes,
+                      t.rows, hipMemcpyDeviceToDevice) != hipSuccess ||
+          hipMemset(static_cast<std::uint8_t*>(dst.data) + part_bytes, 0,
+                    kTailMargin) != hipSuccess) {
+        Fail("MTP split projection copy failed");
+        return;
+      }
+    }
+    std::erase(allocations, combined.data);
+    (void)hipFree(combined.data);
+    bytes -= t.SizeBytes() + kTailMargin;
+  }
+
   /// Uploads matrices of one type stacked along rows; every input shares
   /// `cols`. An F32 stack (router logits, GDN alpha/beta: the only
   /// unquantized projections) is narrowed to F16, which the wide-batch GEMM
@@ -211,7 +249,8 @@ struct Uploader {
     d.shexp_down = Copy(l.shexp_down);
     d.nextn_enorm = Copy(l.nextn_enorm);
     d.nextn_hnorm = Copy(l.nextn_hnorm);
-    d.nextn_eh_proj = Copy(l.nextn_eh_proj);
+    SplitMtpProjection(l.nextn_eh_proj, d.nextn_fc_embedding,
+                       d.nextn_fc_hidden);
     d.nextn_head = Mixer(l.nextn_head);
     return d;
   }
@@ -282,39 +321,14 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     }
   }
   if (mtp != nullptr) {
-    // The sidecar has its own shard index; use the same readers and staging
-    // pool as the target, without another allocation or pipeline barrier.
+    // The sidecar has its own shard index; reuse the target's readers and
+    // staging pool.
     up.shard_base = shard_count;
     m->mtp_ = up.Layer(mtp->block);
     m->has_mtp_ = true;
   }
   if (!up.ok || !stager->Finish(error_msg)) {
     return nullptr;
-  }
-  if (m->has_mtp_) {
-    m->mtp_output_ = m->output_;
-    if (m->output_.type == core::GgmlType::kQ8_0) {
-      // Q4 selects a shortlist; the original Q8 head rescores those rows.
-      // Convert once while loading, before graph capture.
-      const std::size_t size =
-          std::size_t(m->output_.rows) * m->output_.cols / 32 * 18;
-      void* ptr = nullptr;
-      if (hipMalloc(&ptr, size + kTailMargin) != hipSuccess) {
-        up.Fail("hipMalloc failed for MTP output head");
-        return nullptr;
-      }
-      m->allocations_.push_back(ptr);
-      m->bytes_ += size + kTailMargin;
-      if (qfn_mmq_requantize_q8_0_q4_0(m->output_.data, ptr, m->output_.rows,
-                                       m->output_.cols, nullptr) != 0) {
-        up.Fail("MTP output head conversion failed");
-        return nullptr;
-      }
-      (void)hipMemsetAsync(static_cast<std::uint8_t*>(ptr) + size, 0,
-                           kTailMargin, nullptr);
-      m->mtp_output_.data = ptr;
-      m->mtp_output_.type = core::GgmlType::kQ4_0;
-    }
   }
   for (const auto& c : conversions) {
     NarrowActivations(static_cast<const float*>(c.source), c.destination, false,

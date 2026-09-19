@@ -7,21 +7,27 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <iomanip>
 #include <limits>
 #include <list>
+#include <map>
+#include <mutex>
+#include <optional>
 #include <random>
 #include <semaphore>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <utility>
@@ -106,10 +112,20 @@ private:
 
 class ScopedOperationPermit {
 public:
-  explicit ScopedOperationPermit(std::binary_semaphore& gate) : gate_(gate) {
-    gate_.acquire();
+  explicit ScopedOperationPermit(std::binary_semaphore& gate, bool wait = true)
+      : gate_(gate) {
+    if (wait) {
+      gate_.acquire();
+      acquired_ = true;
+    } else {
+      acquired_ = gate_.try_acquire();
+    }
   }
-  ~ScopedOperationPermit() { gate_.release(); }
+  ~ScopedOperationPermit() {
+    if (acquired_)
+      gate_.release();
+  }
+  explicit operator bool() const noexcept { return acquired_; }
 
   ScopedOperationPermit(const ScopedOperationPermit&) = delete;
   ScopedOperationPermit& operator=(const ScopedOperationPermit&) = delete;
@@ -118,6 +134,7 @@ public:
 
 private:
   std::binary_semaphore& gate_;
+  bool acquired_{false};
 };
 
 template<typename Integer>
@@ -348,12 +365,12 @@ ParseFailure ParseAndVerifyImage(std::vector<std::uint8_t>* image,
   return ParseFailure::kNone;
 }
 
-std::vector<std::uint8_t> BuildImage(
+std::vector<std::uint8_t> BuildHeader(
     const TextRunnerPersistenceDescriptor& persistence,
     std::span<const TextRunnerToken> tokens, std::size_t payload_bytes) {
   const std::size_t file_bytes = CheckedFileBytes(
       persistence.compatibility_identity.size(), tokens.size(), payload_bytes);
-  std::vector<std::uint8_t> image(file_bytes);
+  std::vector<std::uint8_t> image(file_bytes - payload_bytes);
   std::copy(kMagic.begin(), kMagic.end(), image.begin() + kMagicOffset);
   PutLittleEndian<std::uint32_t>(image, kFileVersionOffset, kFileVersion);
   PutLittleEndian<std::uint32_t>(image, kPayloadVersionOffset,
@@ -392,6 +409,112 @@ struct ContinuationDiskStore::Impl {
 
   using EntryIterator = std::list<Entry>::iterator;
 
+  // Compressed token edges keep lookup proportional to the prompt length.
+  // Full compatibility bytes and tokens remain the keys, never only a hash.
+  struct PrefixNode {
+    std::vector<TextRunnerToken> edge;
+    std::optional<EntryIterator> entry;
+    std::map<TextRunnerToken, std::unique_ptr<PrefixNode>> children;
+
+    void Insert(std::span<const TextRunnerToken> tokens, EntryIterator value) {
+      if (tokens.empty()) {
+        entry = value;
+        return;
+      }
+      auto& child = children[tokens.front()];
+      if (!child) {
+        child = std::make_unique<PrefixNode>();
+        child->edge.assign(tokens.begin(), tokens.end());
+        child->entry = value;
+        return;
+      }
+      const auto mismatch = std::ranges::mismatch(child->edge, tokens);
+      const auto shared =
+          static_cast<std::size_t>(mismatch.in1 - child->edge.begin());
+      if (shared < child->edge.size()) {
+        auto branch = std::make_unique<PrefixNode>();
+        branch->edge.assign(child->edge.begin(), child->edge.begin() + shared);
+        child->edge.erase(child->edge.begin(), child->edge.begin() + shared);
+        const auto key = child->edge.front();
+        branch->children.emplace(key, std::move(child));
+        child = std::move(branch);
+      }
+      child->Insert(tokens.subspan(shared), value);
+    }
+
+    void Erase(std::span<const TextRunnerToken> tokens) noexcept {
+      if (tokens.empty()) {
+        entry.reset();
+        return;
+      }
+      auto found = children.find(tokens.front());
+      if (found == children.end())
+        return;
+      auto& child = *found->second;
+      if (tokens.size() < child.edge.size() ||
+          !std::ranges::equal(child.edge, tokens.first(child.edge.size()))) {
+        return;
+      }
+      child.Erase(tokens.subspan(child.edge.size()));
+      if (!child.entry && child.children.empty())
+        children.erase(found);
+    }
+
+    struct Match {
+      std::optional<EntryIterator> longest;
+      std::vector<std::size_t> shared_boundaries;
+    };
+
+    [[nodiscard]] Match Find(std::span<const TextRunnerToken> prompt,
+                             bool boundaries = false) const {
+      Match result;
+      const PrefixNode* node = this;
+      std::size_t offset = 0;
+      while (true) {
+        if (node->entry)
+          result.longest = node->entry;
+        if (offset == prompt.size())
+          break;
+        const auto next = node->children.find(prompt[offset]);
+        if (boundaries && !node->entry && offset != 0 &&
+            (node->children.size() > 1 ||
+             (!node->children.empty() && next == node->children.end()))) {
+          result.shared_boundaries.push_back(offset);
+        }
+        if (next == node->children.end())
+          break;
+        const auto& child = *next->second;
+        const auto mismatch =
+            std::ranges::mismatch(child.edge, prompt.subspan(offset));
+        const auto shared =
+            static_cast<std::size_t>(mismatch.in1 - child.edge.begin());
+        offset += shared;
+        if (shared != child.edge.size()) {
+          if (boundaries && offset != 0 && offset < prompt.size()) {
+            result.shared_boundaries.push_back(offset);
+          }
+          break;
+        }
+        node = &child;
+      }
+      return result;
+    }
+  };
+
+  using PersistenceKey = std::pair<std::uint32_t, std::vector<std::uint8_t>>;
+  static PersistenceKey PrefixKey(
+      const TextRunnerPersistenceDescriptor& descriptor) {
+    return {descriptor.payload_version, descriptor.compatibility_identity};
+  }
+
+  struct PendingSave {
+    std::shared_ptr<const TextModelRunner> runner;
+    std::vector<TextRunnerToken> tokens;
+    std::shared_ptr<const TextRunnerSnapshot> snapshot;
+    std::vector<std::uint8_t> identity;
+    std::size_t retained_bytes;
+  };
+
   Impl(ContinuationDiskStoreOptions store_options, EventSink sink,
        KeyHashFunction hasher)
       : options(std::move(store_options)),
@@ -401,6 +524,7 @@ struct ContinuationDiskStore::Impl {
     InitializeDirectory();
     IndexExistingFiles();
     EvictToCapacity();
+    writer = std::thread([this] { PersistQueued(); });
   }
 
   Impl(const Impl&) = delete;
@@ -409,8 +533,48 @@ struct ContinuationDiskStore::Impl {
   Impl& operator=(Impl&&) = delete;
 
   ~Impl() {
+    {
+      std::lock_guard lock(queue_mutex);
+      stopping = true;
+    }
+    queue_changed.notify_all();
+    if (writer.joinable())
+      writer.join();
     if (directory_fd >= 0) {
       ::close(directory_fd);
+    }
+  }
+
+  void PersistQueued() noexcept {
+    for (;;) {
+      PendingSave job;
+      {
+        std::unique_lock lock(queue_mutex);
+        queue_changed.wait(lock,
+                           [this] { return stopping || !pending.empty(); });
+        if (pending.empty())
+          return;
+        job = std::move(pending.front());
+        pending.pop_front();
+      }
+      {
+        const ScopedOperationPermit permit(operation_gate);
+        try {
+          (void)Save(*job.runner, job.tokens, *job.snapshot, job.identity);
+        } catch (...) {
+          Emit(ContinuationDiskEventAction::kSkipped,
+               ContinuationDiskEventReason::kIoFailure, 0, 0,
+               job.tokens.size());
+        }
+      }
+      const auto released = job.retained_bytes;
+      // Release GPU/host snapshot storage before making its budget available.
+      job = {};
+      {
+        std::lock_guard lock(queue_mutex);
+        queued_bytes -= released;
+      }
+      queue_changed.notify_all();
     }
   }
 
@@ -470,7 +634,8 @@ struct ContinuationDiskStore::Impl {
 
   void Emit(ContinuationDiskEventAction action,
             ContinuationDiskEventReason reason, std::size_t file_bytes,
-            std::size_t payload_bytes, std::size_t token_count) const noexcept {
+            std::size_t payload_bytes, std::size_t token_count,
+            double elapsed_ms = 0.0) const noexcept {
     if (!event_sink) {
       return;
     }
@@ -483,6 +648,7 @@ struct ContinuationDiskStore::Impl {
           .token_count = token_count,
           .retained_bytes = retained,
           .capacity_bytes = options.capacity_bytes,
+          .elapsed_ms = elapsed_ms,
       });
     } catch (...) {
       return;
@@ -642,7 +808,9 @@ struct ContinuationDiskStore::Impl {
       });
       const EntryIterator added = std::prev(entries.end());
       index.emplace(added->key_hash, added);
+      prefixes[PrefixKey(added->persistence)].Insert(added->tokens, added);
       retained += added->file_bytes;
+      retained_entries.fetch_add(1, std::memory_order_relaxed);
     }
   }
 
@@ -662,6 +830,13 @@ struct ContinuationDiskStore::Impl {
   }
 
   void EraseIndex(EntryIterator entry) {
+    const auto prefix = prefixes.find(PrefixKey(entry->persistence));
+    if (prefix != prefixes.end()) {
+      prefix->second.Erase(entry->tokens);
+      if (prefix->second.children.empty() && !prefix->second.entry) {
+        prefixes.erase(prefix);
+      }
+    }
     const auto [begin, end] = index.equal_range(entry->key_hash);
     for (auto current = begin; current != end; ++current) {
       if (current->second == entry) {
@@ -689,6 +864,7 @@ struct ContinuationDiskStore::Impl {
     EraseIndex(entry);
     retained -= file_bytes;
     entries.erase(entry);
+    retained_entries.fetch_sub(1, std::memory_order_relaxed);
     Emit(ContinuationDiskEventAction::kRemoved, reason, file_bytes,
          payload_bytes, token_count);
     return true;
@@ -757,7 +933,10 @@ struct ContinuationDiskStore::Impl {
   }
 
   [[nodiscard]] bool PublishImage(std::string_view final_filename,
-                                  std::span<const std::uint8_t> image) {
+                                  std::span<const std::uint8_t> header,
+                                  const TextModelRunner& runner,
+                                  const TextRunnerSnapshot& snapshot,
+                                  std::size_t payload_bytes) {
     const std::string temporary_filename =
         std::string(kTemporaryPrefix) + UniqueSuffix();
     ScopedFileDescriptor temporary(
@@ -767,7 +946,43 @@ struct ContinuationDiskStore::Impl {
     if (!temporary) {
       return false;
     }
-    bool valid = WriteAll(temporary.get(), image);
+    bool valid = true;
+    try {
+      crypto::Sha256Hasher hasher;
+      std::size_t written = 0;
+      const auto sink = [&](std::span<const std::uint8_t> bytes) {
+        // Keep write sizes bounded and checksum each byte exactly once.
+        while (!bytes.empty()) {
+          const auto chunk =
+              bytes.first(std::min(bytes.size(), std::size_t{1024 * 1024}));
+          if (!WriteAll(temporary.get(), chunk)) {
+            throw std::runtime_error("continuation disk write failed");
+          }
+          hasher.Update(chunk);
+          bytes = bytes.subspan(chunk.size());
+        }
+      };
+      sink(header);
+      runner.StreamPersistentSnapshot(snapshot, [&](auto bytes) {
+        if (bytes.size() > payload_bytes - written) {
+          throw std::runtime_error("snapshot serialization overflow");
+        }
+        sink(bytes);
+        written += bytes.size();
+      });
+      if (written != payload_bytes) {
+        throw std::runtime_error("snapshot serialization truncated");
+      }
+      const auto checksum = hasher.FinishHex();
+      if (::lseek(temporary.get(), kChecksumOffset, SEEK_SET) < 0 ||
+          !WriteAll(temporary.get(),
+                    {reinterpret_cast<const std::uint8_t*>(checksum.data()),
+                     checksum.size()})) {
+        throw std::runtime_error("snapshot checksum write failed");
+      }
+    } catch (...) {
+      valid = false;
+    }
     valid = valid && ::fsync(temporary.get()) == 0;
     const int raw_descriptor = temporary.release();
     if (::close(raw_descriptor) != 0) {
@@ -824,13 +1039,15 @@ struct ContinuationDiskStore::Impl {
     }
 
     std::size_t payload_bytes = 0;
-    std::vector<std::uint8_t> image;
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::uint8_t> header;
+    std::size_t file_bytes = 0;
     try {
       payload_bytes = runner.PersistentSnapshotPayloadBytes(snapshot);
       if (payload_bytes == 0) {
         throw std::runtime_error("persistent snapshot payload is empty");
       }
-      const std::size_t file_bytes = CheckedFileBytes(
+      file_bytes = CheckedFileBytes(
           descriptor.persistence->compatibility_identity.size(),
           checkpoint_tokens.size(), payload_bytes);
       if (file_bytes > options.staging_capacity_bytes) {
@@ -845,39 +1062,26 @@ struct ContinuationDiskStore::Impl {
              payload_bytes, checkpoint_tokens.size());
         return {};
       }
-      image =
-          BuildImage(*descriptor.persistence, checkpoint_tokens, payload_bytes);
-      const std::size_t payload_offset = image.size() - payload_bytes;
-      const std::size_t written = runner.SerializePersistentSnapshot(
-          snapshot, std::span<std::uint8_t>(image).subspan(payload_offset,
-                                                           payload_bytes));
-      if (written != payload_bytes) {
-        throw std::runtime_error(
-            "persistent snapshot serializer returned the wrong byte count");
-      }
+      header = BuildHeader(*descriptor.persistence, checkpoint_tokens,
+                           payload_bytes);
     } catch (...) {
       Emit(ContinuationDiskEventAction::kSkipped,
-           ContinuationDiskEventReason::kSerializationFailure, image.size(),
+           ContinuationDiskEventReason::kSerializationFailure, file_bytes,
            payload_bytes, checkpoint_tokens.size());
       return {};
     }
 
-    std::fill_n(image.begin() + kChecksumOffset, kChecksumBytes, 0);
-    const std::string checksum = crypto::Sha256Hex(image);
-    std::copy(checksum.begin(), checksum.end(),
-              image.begin() + kChecksumOffset);
-
-    if (!MakeCapacity(image.size())) {
+    if (!MakeCapacity(file_bytes)) {
       Emit(ContinuationDiskEventAction::kSkipped,
-           ContinuationDiskEventReason::kByteCapacity, image.size(),
+           ContinuationDiskEventReason::kByteCapacity, file_bytes,
            payload_bytes, checkpoint_tokens.size());
       return {};
     }
 
     const std::string filename = NewFinalFilename(digest);
-    if (!PublishImage(filename, image)) {
+    if (!PublishImage(filename, header, runner, snapshot, payload_bytes)) {
       Emit(ContinuationDiskEventAction::kSkipped,
-           ContinuationDiskEventReason::kIoFailure, image.size(), payload_bytes,
+           ContinuationDiskEventReason::kIoFailure, file_bytes, payload_bytes,
            checkpoint_tokens.size());
       return {};
     }
@@ -888,19 +1092,24 @@ struct ContinuationDiskStore::Impl {
         .persistence = *descriptor.persistence,
         .tokens = std::vector<TextRunnerToken>(checkpoint_tokens.begin(),
                                                checkpoint_tokens.end()),
-        .file_bytes = image.size(),
+        .file_bytes = file_bytes,
         .payload_bytes = payload_bytes,
         .last_access = std::filesystem::file_time_type::clock::now(),
     });
     const EntryIterator added = std::prev(entries.end());
     index.emplace(digest, added);
-    retained += image.size();
+    prefixes[PrefixKey(added->persistence)].Insert(added->tokens, added);
+    retained += file_bytes;
+    retained_entries.fetch_add(1, std::memory_order_relaxed);
     Emit(ContinuationDiskEventAction::kStored,
-         ContinuationDiskEventReason::kSaved, image.size(), payload_bytes,
-         checkpoint_tokens.size());
+         ContinuationDiskEventReason::kSaved, file_bytes, payload_bytes,
+         checkpoint_tokens.size(),
+         std::chrono::duration<double, std::milli>(
+             std::chrono::steady_clock::now() - started)
+             .count());
     return {
         .stored = true,
-        .file_bytes = image.size(),
+        .file_bytes = file_bytes,
         .payload_bytes = payload_bytes,
     };
   }
@@ -908,31 +1117,10 @@ struct ContinuationDiskStore::Impl {
   [[nodiscard]] EntryIterator FindLongestCandidate(
       const TextRunnerPersistenceDescriptor& persistence,
       std::span<const TextRunnerToken> prompt) {
-    std::set<std::size_t, std::greater<>> token_counts;
-    for (const Entry& entry : entries) {
-      if (entry.tokens.size() <= prompt.size()) {
-        token_counts.insert(entry.tokens.size());
-      }
-    }
-    for (const std::size_t token_count : token_counts) {
-      const auto prefix = prompt.first(token_count);
-      const std::string digest = HashKey(persistence, prefix);
-      const auto [begin, end] = index.equal_range(digest);
-      EntryIterator selected = entries.end();
-      for (auto current = begin; current != end; ++current) {
-        const EntryIterator candidate = current->second;
-        if (candidate->persistence == persistence &&
-            std::ranges::equal(candidate->tokens, prefix) &&
-            (selected == entries.end() ||
-             candidate->last_access > selected->last_access)) {
-          selected = candidate;
-        }
-      }
-      if (selected != entries.end()) {
-        return selected;
-      }
-    }
-    return entries.end();
+    const auto root = prefixes.find(PrefixKey(persistence));
+    if (root == prefixes.end())
+      return entries.end();
+    return root->second.Find(prompt).longest.value_or(entries.end());
   }
 
   [[nodiscard]] RestoreResult RestoreLongestPrefix(
@@ -962,9 +1150,11 @@ struct ContinuationDiskStore::Impl {
         const std::size_t file_bytes = candidate->file_bytes;
         const std::size_t payload_bytes = candidate->payload_bytes;
         const std::size_t token_count = candidate->tokens.size();
-        (void)RemoveEntry(candidate, failure_reason);
+        const bool removed = RemoveEntry(candidate, failure_reason);
         Emit(ContinuationDiskEventAction::kMiss, failure_reason, file_bytes,
              payload_bytes, token_count);
+        if (!removed)
+          return {};
         continue;
       }
 
@@ -981,9 +1171,11 @@ struct ContinuationDiskStore::Impl {
         const std::size_t file_bytes = candidate->file_bytes;
         const std::size_t payload_bytes = candidate->payload_bytes;
         const std::size_t token_count = candidate->tokens.size();
-        (void)RemoveEntry(candidate, reason);
+        const bool removed = RemoveEntry(candidate, reason);
         Emit(ContinuationDiskEventAction::kMiss, reason, file_bytes,
              payload_bytes, token_count);
+        if (!removed)
+          return {};
         continue;
       }
 
@@ -1031,31 +1223,12 @@ struct ContinuationDiskStore::Impl {
     if (!descriptor.persistence.has_value() || max_boundaries == 0) {
       return {};
     }
-    std::set<std::size_t> lengths;
-    for (const Entry& entry : entries) {
-      if (entry.persistence != *descriptor.persistence) {
-        continue;
-      }
-      const auto [entry_mismatch, prompt_mismatch] =
-          std::ranges::mismatch(entry.tokens, prompt);
-      const auto shared =
-          static_cast<std::size_t>(entry_mismatch - entry.tokens.begin());
-      // A full match is a restorable prefix, not a new boundary.
-      if (shared < min_tokens || shared >= prompt.size() ||
-          shared == entry.tokens.size()) {
-        continue;
-      }
-      lengths.insert(shared);
-    }
-    std::vector<std::size_t> boundaries;
-    for (const std::size_t length : lengths) {
-      const auto prefix = prompt.first(length);
-      const std::string digest = HashKey(*descriptor.persistence, prefix);
-      if (FindExact(digest, *descriptor.persistence, prefix) != entries.end()) {
-        continue;
-      }
-      boundaries.push_back(length);
-    }
+    const auto root = prefixes.find(PrefixKey(*descriptor.persistence));
+    if (root == prefixes.end())
+      return {};
+    auto boundaries = root->second.Find(prompt, true).shared_boundaries;
+    std::erase_if(boundaries,
+                  [min_tokens](auto length) { return length < min_tokens; });
     // Keep the longest ones: they save the most prefill when they hit.
     if (boundaries.size() > max_boundaries) {
       boundaries.erase(
@@ -1089,9 +1262,17 @@ struct ContinuationDiskStore::Impl {
   mutable std::binary_semaphore operation_gate{1};
   std::list<Entry> entries;
   std::unordered_multimap<std::string, EntryIterator> index;
-  std::size_t retained{0};
+  std::map<PersistenceKey, PrefixNode> prefixes;
+  std::atomic<std::size_t> retained{0};
+  std::atomic<std::size_t> retained_entries{0};
   std::random_device random_device;
   std::uint64_t unique_counter{0};
+  mutable std::mutex queue_mutex;
+  std::condition_variable queue_changed;
+  std::deque<PendingSave> pending;
+  std::size_t queued_bytes{0};
+  bool stopping{false};
+  std::thread writer;
 };
 
 ContinuationDiskStore::ContinuationDiskStore(
@@ -1101,6 +1282,64 @@ ContinuationDiskStore::ContinuationDiskStore(
                                    std::move(key_hash))) {}
 
 ContinuationDiskStore::~ContinuationDiskStore() = default;
+
+bool ContinuationDiskStore::CanSave(
+    const TextModelRunner& runner, std::size_t token_count,
+    std::size_t snapshot_bytes,
+    std::span<const std::uint8_t> input_identity) const {
+  const auto descriptor = DescriptorForInput(runner, input_identity);
+  if (!descriptor.persistence || token_count == 0 || snapshot_bytes == 0) {
+    return false;
+  }
+  const auto bytes =
+      CheckedFileBytes(descriptor.persistence->compatibility_identity.size(),
+                       token_count, snapshot_bytes);
+  const auto limit = std::min(impl_->options.capacity_bytes,
+                              impl_->options.staging_capacity_bytes);
+  std::lock_guard lock(impl_->queue_mutex);
+  return !impl_->stopping && bytes <= limit &&
+         impl_->queued_bytes <= limit - bytes;
+}
+
+std::size_t ContinuationDiskStore::SaveAsync(
+    std::shared_ptr<const TextModelRunner> runner,
+    std::vector<TextRunnerToken> checkpoint_tokens,
+    std::shared_ptr<const TextRunnerSnapshot> snapshot,
+    std::vector<std::uint8_t> input_identity) {
+  if (!runner || !snapshot || checkpoint_tokens.empty())
+    return 0;
+  const auto descriptor = DescriptorForInput(*runner, input_identity);
+  if (!descriptor.persistence)
+    return 0;
+  const auto file_bytes =
+      CheckedFileBytes(descriptor.persistence->compatibility_identity.size(),
+                       checkpoint_tokens.size(),
+                       runner->PersistentSnapshotPayloadBytes(*snapshot));
+  const auto charge = CheckedFileBytes(
+      descriptor.persistence->compatibility_identity.size(),
+      checkpoint_tokens.size(),
+      std::max(snapshot->PayloadBytes(),
+               runner->PersistentSnapshotPayloadBytes(*snapshot)));
+  const auto limit = std::min(impl_->options.capacity_bytes,
+                              impl_->options.staging_capacity_bytes);
+  {
+    std::lock_guard lock(impl_->queue_mutex);
+    if (impl_->stopping || charge > limit ||
+        impl_->queued_bytes > limit - charge)
+      return 0;
+    impl_->pending.push_back({std::move(runner), std::move(checkpoint_tokens),
+                              std::move(snapshot), std::move(input_identity),
+                              charge});
+    impl_->queued_bytes += charge;
+  }
+  impl_->queue_changed.notify_one();
+  return file_bytes;
+}
+
+void ContinuationDiskStore::Flush() {
+  std::unique_lock lock(impl_->queue_mutex);
+  impl_->queue_changed.wait(lock, [this] { return impl_->queued_bytes == 0; });
+}
 
 ContinuationDiskStore::SaveResult ContinuationDiskStore::Save(
     const TextModelRunner& runner,
@@ -1116,7 +1355,12 @@ ContinuationDiskStore::RestoreLongestPrefix(
     const TextModelRunner& runner, TextRunnerState& state,
     std::span<const TextRunnerToken> prompt,
     std::span<const std::uint8_t> input_identity) {
-  const ScopedOperationPermit permit(impl_->operation_gate);
+  const ScopedOperationPermit permit(impl_->operation_gate, false);
+  if (!permit) {
+    impl_->Emit(ContinuationDiskEventAction::kMiss,
+                ContinuationDiskEventReason::kBusy, 0, 0, prompt.size());
+    return {};
+  }
   return impl_->RestoreLongestPrefix(runner, state, prompt, input_identity);
 }
 
@@ -1124,7 +1368,9 @@ std::vector<std::size_t> ContinuationDiskStore::SharedPrefixBoundaries(
     const TextModelRunner& runner, std::span<const TextRunnerToken> prompt,
     std::size_t min_tokens, std::size_t max_boundaries,
     std::span<const std::uint8_t> input_identity) {
-  const ScopedOperationPermit permit(impl_->operation_gate);
+  const ScopedOperationPermit permit(impl_->operation_gate, false);
+  if (!permit)
+    return {};
   return impl_->SharedPrefixBoundaries(runner, prompt, min_tokens,
                                        max_boundaries, input_identity);
 }
@@ -1132,18 +1378,18 @@ std::vector<std::size_t> ContinuationDiskStore::SharedPrefixBoundaries(
 bool ContinuationDiskStore::Touch(
     const TextModelRunner& runner, std::span<const TextRunnerToken> tokens,
     std::span<const std::uint8_t> input_identity) {
-  const ScopedOperationPermit permit(impl_->operation_gate);
+  const ScopedOperationPermit permit(impl_->operation_gate, false);
+  if (!permit)
+    return false;
   return impl_->Touch(runner, tokens, input_identity);
 }
 
 std::size_t ContinuationDiskStore::entry_count() const noexcept {
-  const ScopedOperationPermit permit(impl_->operation_gate);
-  return impl_->entries.size();
+  return impl_->retained_entries.load(std::memory_order_relaxed);
 }
 
 std::size_t ContinuationDiskStore::retained_bytes() const noexcept {
-  const ScopedOperationPermit permit(impl_->operation_gate);
-  return impl_->retained;
+  return impl_->retained.load(std::memory_order_relaxed);
 }
 
 std::size_t ContinuationDiskStore::capacity_bytes() const noexcept {

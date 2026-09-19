@@ -1,197 +1,183 @@
 # Qwen3.8-Flash-Next on Strix Halo
 
-Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Target:
-`unsloth/Qwen3.8-Flash-Next-GGUF` at revision
-`38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
-MTP uses `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
+Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Nix release, measured
+2026-09-19, one repetition per point. Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
+revision `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
+MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
 
-**Upstream model parity remains unqualified.** MTP/session replay and vision
-operator checks do not establish equivalence to the original unquantized model
-or independently validate GGUF conversion. Chat defaults match the official
-template: thinking on, `xhigh` effort, prior reasoning preserved. The raw-text
-benchmarks below do not apply a chat template.
-
-PNG/JPEG image input uses the matching `mmproj-BF16.gguf`, with AR or MTP.
-[CLI/HTTP usage, cache behavior and vision checks](../qwen3.8-27b/eval/vision.md).
+Chat follows the official template: thinking on, `xhigh` effort, prior reasoning
+preserved. PNG/JPEG input works with AR/MTP and `mmproj-BF16.gguf`; see
+[image usage and validation](../qwen3.8-27b/eval/vision.md).
+**Original unquantized-model and GGUF-conversion parity remain unqualified.**
 
 ## Single user
 
-Nix release, pp2048 and tg128, one measured repetition, seed 1,
-2026-09-19 UTC. Rates are tok/s. Depth precedes the measured operation;
-TG starts from 16 prompt tokens at d0. The CLI uses deterministic repetitive
-text, warms prefill and continues generation past EOS. Known greedy rows
-use the same 34,817-token context capacity. MTP PP includes draft catch-up.
+Tok/s, pp2048/tg128, greedy, seed 1, context capacity 133121. Depth precedes
+the timed operation. The raw CLI uses a fixed repeated token pattern, warms
+prefill and continues past EOS; d0 TG starts from 16 tokens. MTP PP includes
+predictor catch-up through all known successor tokens.
 
-| Depth | AR pp2048 | MTP pp2048 | AR tg128 | MTP tg128 |
-| ---: | ---: | ---: | ---: | ---: |
-| 0 | 1556.12 | 1531.43 | 26.36 | 50.76 |
-| 4096 | TODO | TODO | TODO | TODO |
-| 8192 | TODO | TODO | TODO | TODO |
-| 12288 | TODO | TODO | TODO | TODO |
-| 16384 | TODO | TODO | TODO | TODO |
-| 32768 | 1419.46 | 1371.32 | 24.10 | 58.76 |
-| 65536 | TODO | TODO | TODO | TODO |
-| 131072 | TODO | TODO | TODO | TODO |
+| Depth | AR pp2048 | MTP pp2048 | AR tg128 | MTP tg128 | MTP acceptance |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1525.9 | 1473.2 | 26.33 | 42.74 | 70.0% |
+| 4K | 1455.1 | 1399.4 | 25.48 | 40.35 | 65.6% |
+| 8K | 1432.0 | 1374.4 | 25.25 | 35.68 | 58.3% |
+| 12K | 1421.4 | 1362.2 | 25.19 | 52.03 | 85.7% |
+| 16K | 1412.3 | 1352.8 | 24.91 | 56.31 | 88.5% |
+| 32K | 1390.1 | 1328.2 | 24.10 | 61.59 | 100.0% |
+| 64K | 1342.7 | 1282.1 | 23.08 | 59.67 | 100.0% |
+| 128K | 1282.2 | 1225.4 | 22.14 | 57.65 | 100.0% |
 
-AR and MTP emit identical 128-token outputs at both measured depths.
-These are single samples; small PP differences between modes can be noise.
-Sampled performance needs a refresh after the prefill arithmetic correction:
-
-| Sampling | MTP tg128 | Acceptance |
-| --- | ---: | ---: |
-| Temperature 0.7, seed 1 | TODO | TODO |
-| Temperature 1.0, top-p 0.95 | TODO | TODO |
-
-The targets of 1700 tok/s pp2048 and near-flat PP through d128K remain TODO.
+AR prefill falls 16.0% from d0 to d128K. The 1700 tok/s target and flat
+deep-context throughput remain unmet.
 
 ```sh
 ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \
-  -d 0,32768 --temperature 0 --seed 1 -v
-./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \
-  -d 0,32768 --temperature 0 --seed 1 -v \
-  --speculative mtp --mtp-model "$MTP"
+  -d 0,4096,8192,12288,16384,32768,65536,131072 --temperature 0 --seed 1 -v
+# Add --speculative mtp --mtp-model "$MTP" for MTP.
 ```
+
+Sampled MTP, d0 raw prefix, seed 1, tg128, top-k/top-p/min-p disabled:
+
+| Sampling | MTP tok/s | Acceptance |
+| --- | ---: | ---: |
+| T=0.7 | 43.41 | 65.2% |
+| T=1.0 | 29.16 | 56.5% |
 
 ## Concurrent serving
 
-HTTP aggregate output tok/s, context 4096, greedy, up to 128 output tokens.
-The performance refresh after the prefill arithmetic correction is **TODO**.
-These are whole-request rates, including scheduling and prompt handling.
-The corpus is [speculative-corpus.json](../qwen3.8-27b/speculative-corpus.json):
-`repetition_word` uses identical concurrent requests; mixed requests use
-`expository_pangram`, `cpp_ring_buffer` and `reasoning_train`.
+Aggregate **output** tok/s, including prompt handling and scheduling. Context
+4096, greedy, thinking off, 128 output tokens, one cold cohort on a fresh server
+per point; no cache hits. The [corpus](../qwen3.8-27b/speculative-corpus.json)
+uses `repetition_word` for repetition and distinct requests cycling through
+`expository_pangram`, `cpp_ring_buffer`, `reasoning_train` for mixed work.
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | TODO | TODO | TODO | TODO |
-| 2 | TODO | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO | TODO |
-| 6 | TODO | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO | TODO |
+| 1 | 25.24 | 62.56 | 25.12 | 41.92 |
+| 2 | 38.60 | 77.14 | 36.25 | 52.94 |
+| 4 | 53.09 | 87.00 | 48.41 | 58.80 |
+| 6 | 60.68 | 89.88 | 54.51 | 63.16 |
+| 8 | 65.17 | 91.41 | 58.45 | 67.74 |
 
-Current C2/C4/C6/C8 correctness checks retain exact isolated tokens, logits,
-RNG and acceptance, including sampled rejection and residual correction.
-Measure cold requests separately: prompt-cache hits do not establish
-cold-request acceptance.
+MTP acceptance is 100% on repetition and 72.9–85.3% on the mixed cohorts.
+Every completion matches AR; all cohorts report zero cache hits.
 
-Target projections share batches across requests; KV, recurrent state,
-sampling history and rollback stay independent. MTP advances proposals one
-round across ready requests, sharing the Q4 vocabulary head while keeping
-draft bodies, probabilities and acceptance private. Ragged Q8 projections
-pad their input rows to avoid rereading weights for a separate tail launch.
-Verification reads each request's logit rows directly without copying them
-into another GPU buffer. C1 retains its single-request execution path.
+**C1 is a single user.** The HTTP and raw CLI prompts above differ. With the
+same repetitive chat prompt, CLI decode measured 75.42 tok/s and HTTP
+C1 75.85 tok/s. Whole-request HTTP throughput also includes prefill
+and scheduling. Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
 
-## Memory and execution
+## MTP and profiling
 
-Target weights occupy about 77 GiB of GPU memory. The 26.8 GiB n-gram table
-stays on disk; about 6 MiB of compressed rows are cached in RAM. NVMe loading
-takes about 15 seconds. Upload staging is released before inference.
+Adaptive MTP is the default; `--draft-tokens` caps it at 1–7 proposals.
+Sampled requests use deterministic per-session acceptance history and fixed
+cost curves, preserving seeded replay independently of scheduler timing.
+The curves cover C1/C2/C4/C6/C8 and d0/d4K/d32K; they interpolate context costs
+and extrapolate the measured slope to the native 262144-token limit.
 
-C1, context capacity 262144, a 3891-token repetitive prompt and 128 generated
-tokens. GPU-visible unified allocations below use the Linux GTT counter with
-idle usage subtracted; separate CPU memory is excluded.
+All-greedy C>1 batches choose one width from live cycle timings and conditional
+acceptance at each depth. Occupancy/context bins remain separate. Plain controls
+start after occupancy stabilizes; width transitions are excluded from estimates
+because they replay the preceding chain. C1 uses deterministic acceptance-based
+control.
 
-| Mode | Loaded GiB | After generation GiB |
-| --- | ---: | ---: |
-| AR | 85.39 | 85.66 |
-| MTP | 89.72 | 90.01 |
+Predictor QKV/output, expert and vocabulary projections batch across requests;
+KV, positions, recurrent state, rollback and RNG remain private. MTP uses
+ratio-four QSA with independent index caches and snapshot/rewind state. Ranking
+retains FP32 queries, FP16 pooled keys and a fixed FP32 reduction. Verification
+uses `min(1, p/q)` acceptance and normalized `max(p-q, 0)` residual correction.
+Temperature precedes top-p/min-p for both target and draft sampling.
 
-KV retains the full requested capacity. Raw indexer keys use a 4096-row ring;
-completed blocks keep pooled keys. Transient PLE, MTP and trunk buffers share
-storage. Concurrent logit scratch is allocated on first use and sized for the
-configured verification width; C1 needs none.
+The d32K pp2048 trace spends 29.1% of kernel time in MoE, 34.9% in dense
+projections and 12.6% in attention/indexing. The C4 mixed MTP trace (32 output
+tokens/request) is 80.7% GPU-busy across its inference span; MoE/MMQ accounts
+for 51.3% and dense projections 36.1% of kernel time. Throughput tables use
+separate unprofiled runs. Packing more vocabulary rows per Q8 block gave no
+C1 improvement; that experiment was not retained.
 
-Internal prefill chunks use 2048 tokens. HTTP accepts arbitrary prompt lengths
-and yields between chunks. Prompt projections and normalization keep the same
-arithmetic even for a one-token tail; decode and verification retain their
-dedicated paths. PLE reads and routing-count downloads overlap GPU
-work. Prefill fuses SSM convolution and attention preparation into projections.
-Headless MTP catch-up retains all KV rows and computes only the final attention
-query tile, preserving the carried hidden state.
+MTP normalizes the complete 10240-wide hidden stream. Separate embedding and
+hidden projections avoid repeating the embedding work across four HC branches.
+The original Q8 head scores the full vocabulary; sampled proposals use its exact
+top 64 with p/q verification. There is no private Q4 head. Predictor inputs use
+shifted text-token embeddings, with image information carried by target hidden
+states and mRoPE. See the [source audit and independent oracle](eval/mtp.md).
 
-`prompt`, `chat` and `serve llm` share MTP and sampling options. Adaptive MTP is
-the default; `--draft-tokens` caps it at 1–7 proposals. Acceptance history drives
-the controller, independent of timing. Snapshots preserve it; new HTTP requests
-reset it when reusing context.
+## Continuations and memory
 
-A private 0.33 GiB Q4 head shortlists 256 vocabulary rows; the original Q8 head
-rescores them. Greedy takes the best rescored row. Sampling draws from the best
-64 using the request's filters and penalties. Full-vocabulary target verification
-accepts with `min(1, p/q)` or samples normalized `max(p-q, 0)`; the residual draw
-becomes the next anchor. Draft shortlisting does not truncate the target.
+An immutable prompt snapshot supports branching; the final live session serves
+likely continuations without re-prefilling executed assistant tokens. First-token
+publication precedes optional capture. Disk capacity is checked before capture
+when RAM cannot retain it. A bounded worker streams/checksums writes; lookups use
+a compressed token-prefix index and skip a busy writer.
 
-Experiments not retained: target batch graph caching gave no speed gain;
-SSM selective prefetch spilled registers and was slower; concurrent short
-prefill improved cohort completion but increased median request latency,
-including when limited to pairs. Those paths and their temporary tests were
-removed.
-Aligned Q8 weight groups and directly loaded four-key value blocks
-(2026-09-19) preserved output bits but lost their small kernel gains once packing
-was included; the existing layouts remain.
+MTP trails prefill by one token; kept hidden state is 320 KiB/session. Rollback
+rows allocate progressively, up to about 788 MiB for seven drafts. Restoration
+retains only existing rows useful to the restored policy and remaining context;
+reset releases all rows. A 4095-token MTP snapshot occupies 221 MiB. Session
+admission accounts for context state, the configured rollback cap and shared
+scratch before allocation.
 
-Current sampled C4 target-decode GPU time: 43% routed expert projections,
-34% dense Q8 projections. Model loading is excluded from these shares.
+MTP projection scratch reuses target scratch; no separate concatenation buffer
+or output-head copy is allocated.
+
+Image snapshots require a matching prompt attachment; text restores clear image
+state. Cancellation covers prefill layers, vision tiles and snapshot regions.
+Failed mutations invalidate the session until reset/rebuild.
 
 ## Maintaining quality
 
-Tests and probes live in `tests/models/qwen38_flash_next/`. The
-`qwen38_flash_next_tests` target contains 13 distinct operator/I/O checks.
-Build and run only the affected checks during an experiment, for example:
+All eight greedy depth points and all fresh-server cohorts match AR. The
+2176-token scalar/prefill control retains the same top-1 token (logit RMSE 0.18).
+
+Tests/probes live in `tests/models/qwen38_flash_next/`. The
+`qwen38_flash_next_tests` target contains 14 focused operator/configuration/I/O
+checks. Build only affected targets during iteration:
 
 ```sh
-nix develop -c cmake --build --preset gpu-test --target qwen38_flash_next_projection_ops_test
-nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]projection_ops' \
+nix develop -c cmake --build --preset gpu-test --target qwen38_flash_next_select_ops_test
+nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]select_ops' \
   --no-tests=error --output-on-failure
 ```
 
-- **Operators:** independent numerical references, FP64 dots, output guards,
-  ragged shapes, finite values, tied selections and replay. Q8 projections must
-  match scalar evaluation at every ungated width 1–32 and gated width 1–8;
-  Q4 MTP heads at widths 1–8. Grouped experts cover duplicate and inactive
-  slots. Router and recurrent-gate projections require exact results across
-  prefill chunk boundaries, including unaligned rows, and pass FP64 controls.
-  Attention checks include deep contexts and
-  exact agreement between full and final-tile catch-up. Attention preparation
-  and mHC normalization must also match across short prompt chunks.
-  Indexer masks match a
-  CPU full sort. N-gram reads cover cold/cache/mixed paths and I/O failures.
-- **Model state:** `qwen38_flash_next_session_test` checks full logits, tokens,
-  RNG and acceptance against serial execution at C2/C4/C6/C8, including ragged
-  budgets, reordered requests, a 4K boundary and complete snapshot bytes.
-  Bulk and split prefill must produce identical full logits at maintained
-  unaligned boundaries through 4096 tokens, including tails of 1, 8, 9, 32
-  and 33 tokens. Use `--prefill-only` for this
-  focused check; image continuations also compare cold, RAM-cached and
-  disk-restored sessions.
-  Sampled cycles must exercise acceptance and rejection, preserving penalty
-  history and deferred residual draws across requests.
-  Its shared 23-case serving matrix checks AR/MTP filters, penalties, replay,
-  C2, reported execution width and short budgets. Sampled tokens teacher-forced
-  through AR must reproduce each frontier. `qwen38_flash_next_snapshot_test`
-  checks persistence, rollback and deferred residual draws. Both accept
-  `--model "$MODEL" --mtp-model "$MTP"`
-  and belong to the explicit `qwen38_flash_next_model_tests` build target.
-  Pass `--batch-only` to the session test for a focused C2/C4/C6/C8 check
-  during iteration; run the full serving matrix when sampling or wiring changes.
-- **Qualification:** scheduling/fusion changes must preserve operator rounding
-  and model replay. Arithmetic changes additionally need CPU/reference probes
-  and `gufo bench --validate-prefill N`. The current 1024-token prefill check has
-  finite logits, scalar-winner rank 1, RMSE 0.20 and maximum error 1.48. Snapshot
-  compatibility changes when inference arithmetic changes.
+- **Operators and loading:** independent scalar/FP64 references, exact FP32
+  selector scores, near-tie ranking cases, ragged shapes, guards and replay.
+  Malformed compression/mRoPE metadata, unsupported kernel geometry and
+  incompatible MTP sidecars fail loading.
+- **State and sampling:** `qwen38_flash_next_session_test --batch-only` compares
+  tokens/full logits and sampled RNG/acceptance against isolated execution at
+  C2/C4/C6/C8, including ragged budgets, reordered requests, bounded rollback,
+  cancellation recovery and image attachments. `--sampling-only` covers 23
+  AR/MTP configurations, penalties, residual correction and short budgets.
+  `qwen38_flash_next_snapshot_test` checks persistence and continuation replay.
+- **Prefill and serving:** `--prefill-only` checks full logits across boundaries
+  through 4096 tokens, including 1/8/9/32/33-token tails. Image checks cover
+  AR/MTP, concurrency, RAM reuse and disk restoration. Official template and
+  Unicode/NFC token goldens cover both Qwen models. HTTP tests require complete
+  UTF-8 in every streamed JSON event and schema-correct tool arguments, including
+  quoted closing markers and calls after unclosed reasoning.
+- **Audits:** `qwen38_flash_next_gpu_probe --mtp-audit` checks original encoded
+  weights, full-width normalization, predictor stages with independently
+  computed caches, recursive carry and independent text/image batches against
+  a scalar CPU oracle. `--cost-audit C`
+  measures warmed catch-up/proposal/verification costs (`0` selects
+  C1/C2/C4/C6/C8). Both avoid storing logit fixtures.
 
-Measure retained changes with Nix release binaries and the same artifact,
-capacity, prompts and sampling setup. Keep output/acceptance checks beside
-rates. Profiler timings are diagnostic, not benchmark results.
-`tools/prof/prof.py run --stages qwen-flash -- ...` profiles a release command;
-[projection_plans.hip](tools/projection_plans.hip) uses `tools/bench/build.sh`.
-Standalone ablations must match production flags:
-`-O3 -ffast-math -fno-finite-math-only`.
+The model tests/probes accept `--model "$MODEL" --mtp-model "$MTP"`; build the
+session/snapshot tests with `qwen38_flash_next_model_tests`. Preserve arithmetic
+and replay when optimizing layout/fusion. Arithmetic corrections additionally
+need independent references and `gufo bench --validate-prefill N`. Measure with
+Nix release binaries, matching artifacts, capacity, prompts and sampling;
+profile separately using `tools/prof/prof.py run --stages qwen-flash -- ...`.
 
-Sampled MTP preserves the target distribution within floating-point precision;
-it need not match AR's same-seed tokens or prefixes across different budgets.
-Greedy decoding retains those guarantees. Prefill and token-at-a-time decoding
-use different floating-point reduction shapes. These regression checks do not
-establish equivalence to the unquantized upstream model; that qualification
-remains TODO.
+Sampled MTP preserves the target distribution within floating-point precision.
+Replay requires the same seed, request budget, configured capacity and sampling
+settings; sampled MTP need not match AR's same-seed sequence. Greedy output must
+remain independent of draft width and batching.
+
+The pinned official image processor allows 64–16384 merged tokens; a 1024-token
+cap changes resolution and output. Short prefill tails retain the arithmetic of
+larger chunks. The artifact uses native RoPE without YaRN extension. Official
+Transformers `c587bc884db2c2e31fc2b8102314656b17aa07b1` defines FP32 QSA but ignores
+MTP weights; operator/export audits do not close original-model parity.

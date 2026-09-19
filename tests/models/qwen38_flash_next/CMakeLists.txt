@@ -12,6 +12,7 @@ function(add_qwen38_flash_next_test name library labels)
   add_dependencies(qwen38_flash_next_tests ${target})
 endfunction()
 
+add_qwen38_flash_next_test(config gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(ngram gufo_qwen38_flash_next "cpu")
 add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
 
@@ -41,7 +42,8 @@ if (ENGINE_ENABLE_HIP)
   add_custom_target(qwen38_flash_next_model_tests
     DEPENDS qwen38_flash_next_session_test qwen38_flash_next_snapshot_test)
 
-  add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp)
+  add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
+    mtp_audit.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
     gufo_qwen38_flash_next)
 endif()

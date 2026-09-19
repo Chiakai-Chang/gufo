@@ -213,6 +213,28 @@ void TestGgufTokenizerLoading() {
          "Qwen tool-response markers are parsed as special tokens");
 }
 
+void TestUnicodeContractionBoundary() {
+  GgufTokenizerBuilder builder;
+  builder.AddMetadataString("tokenizer.ggml.model", "gpt2");
+  builder.AddMetadataString("tokenizer.ggml.pre", "qwen35");
+  // Byte-level spellings for U+017F, with a merge across the boundary that
+  // the official case-insensitive 's contraction must prevent.
+  builder.AddMetadataStringArray("tokenizer.ggml.tokens",
+                                 {"'", "Å", "¿", "a", "Å¿", "Å¿a"});
+  builder.AddMetadataStringArray("tokenizer.ggml.merges", {"Å ¿", "Å¿ a"});
+  auto binary = builder.Build();
+  std::string error;
+  auto reader =
+      gufo::core::GgufReader::OpenMemory(binary.data(), binary.size(), &error);
+  Expect(reader != nullptr, error);
+  auto tokenizer =
+      gufo::tokenization::QwenTokenizer::CreateFromGguf(*reader, &error);
+  Expect(tokenizer != nullptr, error);
+  Expect(tokenizer->Encode("'ſa") ==
+             std::vector<gufo::tokenization::TokenId>({0, 4, 3}),
+         "Unicode contraction prevents a merge into the following word");
+}
+
 void TestEmptyAndSpecialEdgeCases() {
   std::vector<std::string> tokens = {"<|endoftext|>", "a", "b", "c"};
   std::vector<std::string> merges = {};
@@ -283,6 +305,7 @@ int main() {
   std::cout << "Running QwenTokenizer unit tests...\n";
   TestDirectVocabularyTokenizer();
   TestGgufTokenizerLoading();
+  TestUnicodeContractionBoundary();
   TestEmptyAndSpecialEdgeCases();
   TestCorpusConformance();
   std::cout << "All QwenTokenizer tests passed successfully!\n";

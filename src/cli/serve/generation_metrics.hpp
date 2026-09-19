@@ -49,8 +49,8 @@ inline std::string GenerationLogDetails(
         << 100.0 * result.draft_accepted_tokens / result.draft_tokens;
   if (result.cache_snapshot_bytes > 0)
     out << " cache_snapshot_bytes=" << result.cache_snapshot_bytes;
-  if (result.cache_disk_write_bytes > 0)
-    out << " cache_disk_write_bytes=" << result.cache_disk_write_bytes;
+  if (result.cache_disk_queued_bytes > 0)
+    out << " cache_disk_queued_bytes=" << result.cache_disk_queued_bytes;
   return out.str();
 }
 
@@ -78,7 +78,7 @@ inline json::Value GenerationTimings(
   timings["cache_n"] = result.cached_prompt_tokens;
   timings["cache_restore_ms"] = result.cache_restore_ms;
   timings["cache_snapshot_ms"] = result.cache_snapshot_ms;
-  timings["cache_disk_write_ms"] = result.cache_disk_write_ms;
+  timings["cache_disk_enqueue_ms"] = result.cache_disk_enqueue_ms;
   timings["draft_n"] = result.draft_tokens;
   timings["draft_n_accepted"] = result.draft_accepted_tokens;
   return timings;

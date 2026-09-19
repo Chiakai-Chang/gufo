@@ -4,6 +4,7 @@ The compiled formatter is pinned to `Qwen/Qwen3.8-27B` revision
 `1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0`.
 The official `Qwen/Qwen3.8-Flash-Next` template at revision
 `de4b8e4d43b917e7706784d8bb445c9af86a3540` has the same SHA-256.
+The two pinned `tokenizer.json` files are also byte-identical.
 Both default to `enable_thinking=true`, `reasoning_effort="xhigh"`, and
 `preserve_thinking=true`. Native efforts are `low`, `medium`, and `xhigh`;
 medium adds no effort instruction. Explicit thinking-off suppresses the
@@ -20,3 +21,15 @@ effort instruction and closes the generation prompt's thinking block.
 
 `chat_template.jinja` is reference data only. Gufo validates recognized
 artifact hashes and executes the bounded C++ implementation.
+
+Full rendered-byte goldens cover tools before system instructions, the Unsloth
+artifact's leading developer-message extension, tool-loop reasoning retention,
+Unicode trimming around images and optional `Picture N:` numbering.
+Late system/developer messages are rejected. Tool/system cases also compare
+complete token sequences using the real GGUF tokenizer.
+
+The tokenizer applies NFC normalization and the pinned Unicode split pattern,
+including Unicode case-insensitive contractions, letter/mark runs and
+trailing-whitespace backtracking. Ten raw-text
+goldens check exact token IDs for spacing, code, accents, scripts with combining
+marks, Unicode number categories and special-token boundaries on both models.

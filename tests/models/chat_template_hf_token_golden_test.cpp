@@ -65,6 +65,17 @@ void TestQwenGoldens(const json::Value& fixture,
   const auto tokenizer = qwen::QwenTokenizer::CreateFromGguf(*reader, &error);
   Expect(tokenizer != nullptr, "Qwen tokenizer loads: " + error);
 
+  for (const auto& example :
+       fixture.find("qwen")->find("tokenization")->items()) {
+    const auto tokens = tokenizer->Encode(example.member_str("text"));
+    const auto name = example.member_str("name");
+    Expect(tokens.size() == example.member_size("token_count"),
+           "official Unicode token count: " + name);
+    Expect(TokenSha256<qwen::TokenId>(tokens) ==
+               example.member_str("token_ids_le_u32_sha256"),
+           "official Unicode token IDs: " + name);
+  }
+
   const std::vector<qwen::ChatMessage> base = {
       {qwen::ChatRole::kUser, "Name one color.", "", ""},
   };

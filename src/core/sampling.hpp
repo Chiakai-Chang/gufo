@@ -14,7 +14,7 @@ using TokenId = std::uint32_t;
 
 /// Model-independent controls for selecting a token from a logit row.
 ///
-/// Filters run in this order: penalties, top-k, top-p, min-p, temperature.
+/// Filters run in this order: penalties, temperature, top-k, top-p, min-p.
 /// The defaults preserve Gufo's existing greedy decoding behavior.
 struct SamplingConfig {
   float temperature{0.0F};

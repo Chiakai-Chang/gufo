@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <span>
 #include <string>
@@ -40,6 +41,9 @@ struct ModelOptions {
   /// Maximum proposals per cycle; acceptance history selects the length.
   std::uint32_t max_draft_tokens = kMaxMtpDraftTokens;
   std::string vision_model_path;
+  /// Fixed serving capacity used by the calibrated MTP cost model. Keeping
+  /// it independent of scheduler timing preserves seeded request replay.
+  std::uint32_t decode_concurrency = 1;
 };
 
 class Session;
@@ -71,12 +75,18 @@ public:
     return options_.max_context;
   }
   [[nodiscard]] bool HasMtp() const noexcept;
+  [[nodiscard]] std::uint32_t DecodeConcurrency() const noexcept {
+    return options_.decode_concurrency;
+  }
   [[nodiscard]] std::string ModelName() const;
   [[nodiscard]] const Config& config() const noexcept;
   [[nodiscard]] const tokenization::QwenTokenizer& tokenizer() const noexcept {
     return *tokenizer_;
   }
   [[nodiscard]] std::size_t ResidentBytes() const noexcept;
+  /// Worst-case private device state, including the configured rollback cap.
+  [[nodiscard]] std::size_t SessionBytes(std::uint32_t context) const noexcept;
+  [[nodiscard]] std::size_t DeferredScratchBytes() const;
   [[nodiscard]] const std::shared_ptr<qwen::vision::Encoder>& VisionEncoder()
       const noexcept {
     return vision_;
@@ -95,6 +105,7 @@ private:
   std::unique_ptr<rocm::DeviceModel> device_;
   std::unique_ptr<rocm::Executor> executor_;
   std::shared_ptr<qwen::vision::Encoder> vision_;
+  MtpBatchController batch_policy_;
 
   friend class Session;
 };
@@ -146,14 +157,19 @@ public:
       std::span<const AdvanceRequest> requests,
       std::string* error_msg = nullptr);
   [[nodiscard]] std::span<const float> Logits() const noexcept {
-    return logits_;
+    return valid_ ? std::span<const float>(logits_) : std::span<const float>{};
   }
   [[nodiscard]] std::uint32_t Position() const noexcept;
   [[nodiscard]] std::uint32_t ContextSize() const noexcept;
   [[nodiscard]] std::span<const std::int32_t> Tokens() const noexcept {
-    return tokens_;
+    return valid_ ? std::span<const std::int32_t>(tokens_)
+                  : std::span<const std::int32_t>{};
   }
   void Reset();
+  /// Cancellation is checked at model, layer and snapshot-copy boundaries.
+  void SetCancellationCheck(std::function<bool()> check);
+  [[nodiscard]] bool IsValid() const noexcept { return valid_; }
+  [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt);
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy() noexcept { draft_length_.Reset(); }
@@ -168,7 +184,7 @@ public:
   }
 
   /// Compatibility version; bump on payload or inference arithmetic changes.
-  static constexpr std::uint32_t kSnapshotPayloadVersion = 9;
+  static constexpr std::uint32_t kSnapshotPayloadVersion = 12;
   /// Bytes a snapshot of the current context occupies.
   [[nodiscard]] std::uint64_t SnapshotBytes() const;
   /// Captures the whole context (tokens, device caches and recurrent
@@ -177,6 +193,8 @@ public:
   [[nodiscard]] std::unique_ptr<SessionSnapshot> SaveSnapshot(
       std::string* error_msg = nullptr) const;
   /// Replaces this session's context with a snapshot of the same model.
+  /// Image snapshots require ConfigureVision with the matching immutable
+  /// prompt first; pixel data is not serialized. Text snapshots clear images.
   [[nodiscard]] bool RestoreSnapshot(const SessionSnapshot& snapshot,
                                      std::string* error_msg = nullptr);
   [[nodiscard]] bool RestoreSnapshot(std::span<const std::uint8_t> payload,
@@ -193,9 +211,14 @@ private:
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
                     MtpCandidateLogits* candidates = nullptr);
+  bool DraftReplay(std::int32_t next_token, std::vector<std::int32_t>* replay,
+                   std::int32_t* hidden_row, std::string* error_msg) const;
+  static bool DraftCatchUpBatch(std::span<const AdvanceRequest> requests,
+                                std::string* error_msg);
   struct PendingDecode;
   bool PrepareDecode(const DecodeRequest& request, PendingDecode* pending,
-                     std::string* error_msg, bool defer_head = false);
+                     std::string* error_msg, bool defer_head = false,
+                     std::optional<std::uint32_t> batch_drafts = {});
   static void AppendDraft(PendingDecode& pending);
   bool FinishDecode(const DecodeRequest& request, const PendingDecode& pending,
                     std::string* error_msg);
@@ -210,6 +233,7 @@ private:
   MtpLengthController draft_length_;
   SpeculativeStats stats_;
   std::vector<std::uint8_t> image_identity_;
+  bool valid_{true};
 };
 
 /// Immutable host copy of a session context. The same bytes restore in

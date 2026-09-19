@@ -75,6 +75,7 @@ struct ScheduledRequest {
   std::chrono::duration<double, std::milli> inter_token_total{0};
   std::size_t inter_token_samples{0};
   bool decode_due{false};
+  std::optional<TextRunnerToken> preview_token;
   std::size_t generated_output_bytes{0};
 
   std::mutex output_mutex;
@@ -351,17 +352,21 @@ struct TextGenerationScheduler::Impl {
 
   void CompleteSuccess(const std::shared_ptr<ScheduledRequest>& request,
                        TextGenerationBackend::FinishReason finish_reason) {
-    FinalizeResult(request, finish_reason);
     const auto cache_commit = request->runner_request.Commit();
     request->result.cache_snapshot_bytes = cache_commit.snapshot_bytes;
     request->result.cache_snapshot_ms = cache_commit.snapshot_ms;
-    request->result.cache_disk_write_bytes = cache_commit.disk_write_bytes;
-    request->result.cache_disk_write_ms = cache_commit.disk_write_ms;
+    request->result.cache_disk_queued_bytes = cache_commit.disk_queued_bytes;
+    request->result.cache_disk_enqueue_ms = cache_commit.disk_enqueue_ms;
     request->result.cache_shared_prefix_snapshots =
         cache_commit.shared_prefix_snapshots;
     request->result.cache_shared_prefix_bytes =
         cache_commit.shared_prefix_bytes;
     request->result.cache_shared_prefix_ms = cache_commit.shared_prefix_ms;
+    // Prompt capture now follows first-token publication, but remains its own
+    // phase rather than inflating the model's decode time.
+    request->result.decode_ms =
+        std::max(0.0, request->result.decode_ms - cache_commit.snapshot_ms);
+    FinalizeResult(request, finish_reason);
     PublishTerminal(request);
   }
 
@@ -525,6 +530,7 @@ struct TextGenerationScheduler::Impl {
     if (!PublishSelection(request, selection)) {
       return std::nullopt;
     }
+    request->runner_request.CapturePromptSnapshot();
     if (!final_token_advance_required &&
         request->result.tokens.size() >= request->token_limit) {
       request->result.decode_ms +=
@@ -622,15 +628,19 @@ struct TextGenerationScheduler::Impl {
 
       request->phase.store(TextRequestPhase::kDecoding,
                            std::memory_order_release);
-      const std::size_t remaining =
-          request->token_limit - request->result.tokens.size();
       const auto decode_start = Clock::now();
+      if (!PrepareFirstSnapshot(request))
+        return;
+      const std::size_t remaining =
+          request->token_limit - request->result.tokens.size() +
+          (request->preview_token.has_value() ? 1 : 0);
       const auto step = request->runner_request.DecodeStep(remaining);
       request->result.draft_tokens += step.draft_tokens;
       request->result.draft_accepted_tokens += step.draft_accepted_tokens;
 
+      CheckPreviewResult(request, step);
       for (const auto& selection : step.selections) {
-        if (!PublishSelection(request, selection)) {
+        if (!PublishDecodedSelection(request, selection)) {
           return;
         }
       }
@@ -651,6 +661,42 @@ struct TextGenerationScheduler::Impl {
         CompleteFailure(request, failure);
       }
     }
+  }
+
+  bool PrepareFirstSnapshot(const std::shared_ptr<ScheduledRequest>& request) {
+    if (!request->result.tokens.empty())
+      return true;
+    const auto preview = request->runner_request.PreviewFirstToken();
+    if (preview && !preview->stop) {
+      if (!PublishSelection(request, *preview))
+        return false;
+      request->preview_token = preview->token;
+    }
+    request->runner_request.CapturePromptSnapshot();
+    if (preview && preview->stop) {
+      CompleteSuccess(request, TextGenerationBackend::FinishReason::kStop);
+      return false;
+    }
+    return !CompleteIfStopped(request);
+  }
+
+  static void CheckPreviewResult(
+      const std::shared_ptr<ScheduledRequest>& request,
+      const TextDecodeStep& step) {
+    if (request->preview_token &&
+        (step.selections.empty() ||
+         step.selections.front().token != *request->preview_token)) {
+      throw std::runtime_error("first-token preview disagrees with decoding");
+    }
+  }
+
+  bool PublishDecodedSelection(const std::shared_ptr<ScheduledRequest>& request,
+                               const TextDecodeSelection& selection) {
+    if (request->preview_token) {
+      request->preview_token.reset();
+      return true;
+    }
+    return PublishSelection(request, selection);
   }
 
   void StepDecodeBatch(
@@ -760,10 +806,19 @@ struct TextGenerationScheduler::Impl {
       }
       request->phase.store(TextRequestPhase::kDecoding,
                            std::memory_order_release);
+      const auto decode_start = Clock::now();
+      try {
+        if (!PrepareFirstSnapshot(request))
+          continue;
+      } catch (...) {
+        CompleteFailure(request, std::current_exception());
+        continue;
+      }
       prepared.push_back({
           .request = request,
-          .decode_start = Clock::now(),
-          .remaining = request->token_limit - request->result.tokens.size(),
+          .decode_start = decode_start,
+          .remaining = request->token_limit - request->result.tokens.size() +
+                       (request->preview_token.has_value() ? 1 : 0),
       });
     }
     if (prepared.empty()) {
@@ -820,8 +875,14 @@ struct TextGenerationScheduler::Impl {
       item.request->result.draft_accepted_tokens += step.draft_accepted_tokens;
 
       bool published = true;
+      try {
+        CheckPreviewResult(item.request, step);
+      } catch (...) {
+        CompleteFailure(item.request, std::current_exception());
+        continue;
+      }
       for (const auto& selection : step.selections) {
-        if (!PublishSelection(item.request, selection)) {
+        if (!PublishDecodedSelection(item.request, selection)) {
           published = false;
           break;
         }

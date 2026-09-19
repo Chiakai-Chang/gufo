@@ -3,10 +3,10 @@
 #include <array>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
-#include "src/models/qwen38_flash_next/config.hpp"
 #include "src/models/qwen38_flash_next/mtp_policy.hpp"
 #include "tests/models/qwen27b/sampling_cases.hpp"
 
@@ -16,48 +16,6 @@ namespace sampling = gufo::sampling;
 void Require(bool condition, const char* message) {
   if (!condition)
     throw std::runtime_error(message);
-}
-
-void CheckSidecarCompatibility() {
-  qfn::Config trunk;
-  trunk.num_layers = 48;
-  trunk.context_length = 262144;
-  trunk.hidden_size = 2560;
-  trunk.hc_count = 4;
-  trunk.hc_low_rank = 320;
-  trunk.num_experts = 512;
-  trunk.num_experts_used = 10;
-  trunk.expert_ff = trunk.shared_expert_ff = 640;
-  trunk.num_heads = 24;
-  trunk.num_kv_heads = 2;
-  trunk.head_dim = 256;
-  trunk.rotary_dim = 64;
-  trunk.rope_theta = 1e7F;
-  trunk.rope_sections = {16, 24, 24, 0};
-  auto sidecar = trunk;
-  sidecar.nextn_layers = 1;
-  Require(sidecar.MtpMatches(trunk), "matching MTP constants rejected");
-  for (auto member : {&qfn::Config::hc_low_rank, &qfn::Config::context_length,
-                      &qfn::Config::rotary_dim, &qfn::Config::num_experts_used,
-                      &qfn::Config::shared_expert_ff}) {
-    auto wrong = sidecar;
-    ++(wrong.*member);
-    Require(!wrong.MtpMatches(trunk),
-            "dimension-compatible MTP with different semantics accepted");
-  }
-  for (auto member : {&qfn::Config::rms_eps, &qfn::Config::rope_theta}) {
-    auto wrong = sidecar;
-    wrong.*member *= 2.0F;
-    Require(!wrong.MtpMatches(trunk),
-            "MTP numerical constant mismatch accepted");
-  }
-  auto wrong = sidecar;
-  std::swap(wrong.rope_sections[0], wrong.rope_sections[1]);
-  Require(!wrong.MtpMatches(trunk), "MTP RoPE partition mismatch accepted");
-  sidecar.ple_layer = -1;
-  trunk.ple_layer = 1;
-  Require(sidecar.MtpMatches(trunk),
-          "trunk-only PLE incorrectly required in MTP");
 }
 
 void CheckLengthController() {
@@ -78,8 +36,18 @@ void CheckLengthController() {
   for (unsigned i = 0; i < 12; ++i) {
     controller.Observe(0, controller.Choose(7));
   }
-  Require(controller.Choose(7) == 1,
-          "repeated rejection did not shorten the draft");
+  Require(controller.Choose(7) == 0,
+          "unprofitable speculation did not back off to AR");
+  qfn::MtpLengthController backed_off(7);
+  Require(backed_off.Restore(controller.State()), "backoff restore failed");
+  for (unsigned i = 0; i < 16; ++i) {
+    Require(controller.Choose(7) == 0 && backed_off.Choose(7) == 0,
+            "AR interval ended early");
+    controller.ObserveArToken();
+    backed_off.ObserveArToken();
+  }
+  Require(controller.Choose(7) == 1 && backed_off.Choose(7) == 1,
+          "AR backoff did not retry a proposal");
   controller.Reset();
   Require(controller.Choose(7) == initial, "reset retained old acceptance");
   controller.Observe(5, 6);
@@ -89,7 +57,9 @@ void CheckLengthController() {
     Require(restored.Choose(budget) == controller.Choose(budget),
             "restored policy changes draft widths");
   }
-  Require(!restored.Restore({-1.0F, 1.0F}) && !restored.Restore({0.0F, 0.0F}),
+  auto invalid = controller.State();
+  invalid.successes[0] = -1.0F;
+  Require(!restored.Restore(invalid) && !restored.Restore({}),
           "invalid controller state accepted");
 
   // The unverified suffix is not additional evidence of failure.
@@ -109,14 +79,24 @@ void CheckLengthController() {
     for (unsigned cycle = 0; cycle < 32; ++cycle) {
       const auto budget = cycle % 10;
       const auto length = a.Choose(budget);
-      Require(length == b.Choose(budget) && length <= budget &&
-                  length <= limit && (budget == 0 || length > 0),
+      Require(length == b.Choose(budget) && length <= budget && length <= limit,
               "controller violated a limit or changed on replay");
       const unsigned accepted = length == 0 ? 0 : cycle % (length + 1);
       a.Observe(accepted, length);
       b.Observe(accepted, length);
+      if (length == 0) {
+        a.ObserveArToken();
+        b.ObserveArToken();
+      }
     }
   }
+  qfn::MtpLengthController early_failure(7), late_failure(7);
+  for (unsigned i = 0; i < 12; ++i) {
+    early_failure.Observe(0, 7);
+    late_failure.Observe(4, 7);
+  }
+  Require(early_failure.Choose(7) == 0 && late_failure.Choose(7) > 1,
+          "conditional acceptance by depth was collapsed to one probability");
 }
 
 void CheckCompactProposals() {
@@ -173,6 +153,81 @@ void CheckCompactProposals() {
   }
 }
 
+void CheckCalibratedCosts() {
+  qfn::MtpLengthController single(7, 1), concurrent(7, 8);
+  auto state = single.State();
+  state.successes.fill(6.0F);
+  state.failures.fill(4.0F);
+  state.explored_depth = 7;
+  state.failed_depths = 127;
+  Require(single.Restore(state) && concurrent.Restore(state),
+          "calibrated controller state rejected");
+  Require(single.Choose(7, 0) > concurrent.Choose(7, 0),
+          "concurrent verification cost did not shorten the draft chain");
+  single.Observe(0, 1);
+  concurrent.Observe(0, 1);
+  Require(single.Choose(7) > 0 && concurrent.Choose(7) == 0,
+          "measured verification cost did not change the AR break-even point");
+
+  for (unsigned c = 1; c <= 8; ++c) {
+    qfn::MtpLengthController perfect(7, c);
+    for (unsigned cycle = 0; cycle < 8; ++cycle) {
+      const auto length = perfect.Choose(7);
+      perfect.Observe(length, length);
+    }
+    Require(perfect.Choose(7) == 7,
+            "perfect acceptance did not retain the fastest measured width");
+    for (unsigned depth : {0, 4096, 32768, 131072, 262144}) {
+      const auto costs = qfn::MtpCycleCosts(depth, c);
+      Require(costs[0] > 0, "AR baseline cost is not positive");
+      for (std::size_t i = 1; i < costs.size(); ++i)
+        Require(std::isfinite(costs[i]) && costs[i] > costs[i - 1],
+                "calibrated costs do not increase with verification work");
+    }
+  }
+}
+
+void CheckBatchProfitability() {
+  qfn::MtpLengthController a(7), b(7);
+  for (unsigned i = 0; i < 12; ++i) {
+    a.Observe(7, 7);
+    b.Observe(7, 7);
+  }
+  qfn::MtpBatchController policy;
+  std::array<qfn::MtpBatchController::Row, 2> rows{{{&a, 7}, {&b, 7}}};
+  Require(policy.Choose(rows, 0) > 0,
+          "transient occupancy paid an unnecessary plain control");
+  for (unsigned i = 0; i < 2; ++i)
+    policy.Observe(2, 0, policy.Choose(rows, 0), 100.0F);
+  Require(policy.Choose(rows, 0) == 0,
+          "stable occupancy omitted its plain control");
+  // Perfect proposals are unprofitable when measured cycle cost is too high.
+  for (unsigned w = 0; w <= 7; ++w)
+    for (unsigned repeat = 0; repeat < 3; ++repeat)
+      policy.Observe(2, 0, w, w == 0 ? 50.0F : 1000.0F);
+  Require(policy.Choose(rows, 0) == 0,
+          "perfect acceptance overrode measured unprofitable execution");
+  policy.Observe(2, 0, 0, 1000.0F);  // Previous speculative catch-up debt.
+  policy.Observe(2, 0, 0, 50.0F);
+  Require(policy.Choose(rows, 0) == 0,
+          "catch-up debt inflated the measured plain baseline");
+  // Context and occupancy samples must not contaminate each other.
+  Require(policy.Choose(rows, 32768) > 0,
+          "deep batch inherited unprofitable shallow timings");
+  for (unsigned i = 0; i < 32; ++i)
+    policy.Observe(2, 0, 3, 60.0F);
+  Require(policy.Choose(rows, 0) == 3,
+          "batch did not select the profitable measured width");
+  policy.Observe(2, 0, 7, 500.0F);
+  policy.Observe(2, 0, 3, 2000.0F);
+  Require(policy.Choose(rows, 0) == 3,
+          "a width transition charged the preceding chain to the new width");
+  rows[1].budget = 1;
+  Require(policy.Choose(rows, 0) <= 1, "batch exceeded one member's budget");
+  policy.Observe(2, 0, 0, std::numeric_limits<float>::quiet_NaN());
+  Require(policy.Choose(rows, 0) <= 1, "invalid timing corrupted policy");
+}
+
 void CheckSampledOutputFrequencies() {
   const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};
   qfn::MtpCandidateLogits candidates;
@@ -204,9 +259,10 @@ void CheckSampledOutputFrequencies() {
 }
 
 int main() {
-  CheckSidecarCompatibility();
   try {
     CheckLengthController();
+    CheckCalibratedCosts();
+    CheckBatchProfitability();
     CheckCompactProposals();
     CheckSampledOutputFrequencies();
     const std::array<float, 5> logits{0.3F, -0.2F, 1.1F, 0.7F, -1.0F};

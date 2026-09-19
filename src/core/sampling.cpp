@@ -121,7 +121,8 @@ void ApplyTopP(std::vector<Candidate>* candidates,
   if (config.top_p >= 1.0F || candidates->size() <= 1) {
     return;
   }
-  const auto probabilities = SoftmaxWeights(*candidates, 1.0);
+  const auto probabilities =
+      SoftmaxWeights(*candidates, static_cast<double>(config.temperature));
   const std::size_t minimum = MinimumKept(config, candidates->size());
   double cumulative = 0.0;
   std::size_t keep = 0;
@@ -140,7 +141,8 @@ void ApplyMinP(std::vector<Candidate>* candidates,
   if (config.min_p <= 0.0F || candidates->size() <= 1) {
     return;
   }
-  const double threshold = std::log(static_cast<double>(config.min_p));
+  const double threshold = static_cast<double>(config.temperature) *
+                           std::log(static_cast<double>(config.min_p));
   const double maximum = candidates->front().logit;
   std::size_t keep = 0;
   while (keep < candidates->size() &&
@@ -334,13 +336,12 @@ SamplingDistribution BuildDistribution(std::span<const float> logits,
 
   ApplyPenalties(&candidates, config, recent_tokens);
   ApplyTopK(&candidates, config);
-  ApplyTopP(&candidates, config);
-  ApplyMinP(&candidates, config);
-
   if (config.temperature == 0.0F) {
     return SamplingDistribution(
         {{.token = candidates.front().token, .value = 1.0}});
   }
+  ApplyTopP(&candidates, config);
+  ApplyMinP(&candidates, config);
   const auto probabilities =
       SoftmaxWeights(candidates, static_cast<double>(config.temperature));
   std::vector<Probability> entries;
@@ -612,9 +613,11 @@ TokenId SamplerState::SampleLinear(std::span<const float> logits) {
     }
 
     const double min_p_threshold =
-        config_.min_p > 0.0F ? static_cast<double>(maximum) +
-                                   std::log(static_cast<double>(config_.min_p))
-                             : -std::numeric_limits<double>::infinity();
+        config_.min_p > 0.0F
+            ? static_cast<double>(maximum) +
+                  static_cast<double>(config_.temperature) *
+                      std::log(static_cast<double>(config_.min_p))
+            : -std::numeric_limits<double>::infinity();
     const double inverse_temperature =
         1.0 / static_cast<double>(config_.temperature);
     double sum = 0.0;
@@ -676,7 +679,8 @@ TokenId SamplerState::SampleLinear(std::span<const float> logits) {
 
   const double min_p_threshold =
       config_.min_p > 0.0F
-          ? maximum + std::log(static_cast<double>(config_.min_p))
+          ? maximum + static_cast<double>(config_.temperature) *
+                          std::log(static_cast<double>(config_.min_p))
           : -std::numeric_limits<double>::infinity();
   const double inverse_temperature =
       1.0 / static_cast<double>(config_.temperature);
@@ -797,7 +801,8 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
     }
     for (std::size_t index = 0; index < logits.size(); ++index) {
       if (std::isfinite(logits[index])) {
-        full_softmax_sum += std::exp(read_adjusted(index) - maximum);
+        full_softmax_sum +=
+            std::exp((read_adjusted(index) - maximum) / config_.temperature);
       }
     }
     if (!(full_softmax_sum > 0.0) || !std::isfinite(full_softmax_sum)) {
@@ -813,7 +818,8 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
 
     double selected_mass = 0.0;
     for (const auto& candidate : candidate_scratch_) {
-      selected_mass += std::exp(candidate.value - maximum);
+      selected_mass +=
+          std::exp((candidate.value - maximum) / config_.temperature);
     }
     if (selected_mass < static_cast<double>(config_.top_p) * full_softmax_sum) {
       select_all();
@@ -833,14 +839,15 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
     if (!has_full_softmax_sum) {
       sum = 0.0;
       for (const auto& candidate : candidate_scratch_) {
-        sum += std::exp(candidate.value - maximum);
+        sum += std::exp((candidate.value - maximum) / config_.temperature);
       }
     }
     const double target = static_cast<double>(config_.top_p) * sum;
     double cumulative = 0.0;
     std::size_t top_p_keep = 0;
     while (top_p_keep < keep) {
-      cumulative += std::exp(candidate_scratch_[top_p_keep].value - maximum);
+      cumulative += std::exp((candidate_scratch_[top_p_keep].value - maximum) /
+                             config_.temperature);
       ++top_p_keep;
       if (top_p_keep >= minimum && cumulative >= target) {
         break;
@@ -850,7 +857,8 @@ void SamplerState::PrepareSelected(std::span<const float> logits) {
   }
   if (config_.min_p > 0.0F && keep > 1) {
     const double threshold = candidate_scratch_.front().value +
-                             std::log(static_cast<double>(config_.min_p));
+                             static_cast<double>(config_.temperature) *
+                                 std::log(static_cast<double>(config_.min_p));
     std::size_t min_p_keep = 0;
     while (min_p_keep < keep &&
            candidate_scratch_[min_p_keep].value >= threshold) {

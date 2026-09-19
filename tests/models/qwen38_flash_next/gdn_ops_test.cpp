@@ -179,13 +179,12 @@ int RunCase(std::uint32_t kTokens) {
       HipBuffer<float> d_out(kOut);
       Upload(&d_conv_state, conv_state);
       Upload(&d_state, state);
-      q::GatedDeltaNet(d_qkv.get(), kChannels, d_z.get(), kZ,
-                       d_alpha_beta.get(), d_conv_w.get(), d_a.get(),
-                       d_dt.get(), d_norm_w.get(), d_conv_state.get(),
-                       d_scratch.get(), d_qn.get(), d_kn.get(), d_raw.get(),
-                       d_state.get(), d_out.get(), nullptr, nullptr, nullptr,
-                       kTokens, kKHeads, kVHeads, kDim, kKernel, route == 1,
-                       false, kEps, nullptr);
+      q::GatedDeltaNet(
+          d_qkv.get(), kChannels, d_z.get(), kZ, d_alpha_beta.get(),
+          d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
+          d_conv_state.get(), d_scratch.get(), d_qn.get(), d_kn.get(),
+          d_raw.get(), d_state.get(), d_out.get(), nullptr, {}, {}, kTokens,
+          kKHeads, kVHeads, kDim, kKernel, route == 1, false, kEps, nullptr);
       CheckHip(hipDeviceSynchronize(), "GDN synchronization");
       outs[route] = Download(&d_out, kOut);
       states[route] = Download(&d_state, kStateCount);
@@ -201,9 +200,9 @@ int RunCase(std::uint32_t kTokens) {
                        d_alpha_beta.get(), d_conv_w.get(), d_a.get(),
                        d_dt.get(), d_norm_w.get(), d_conv_state.get(),
                        d_scratch.get(), d_qn.get(), d_kn.get(), d_raw.get(),
-                       d_state.get(), nullptr, nullptr, nullptr, nullptr,
-                       kTokens, kKHeads, kVHeads, kDim, kKernel, route == 1,
-                       false, kEps, nullptr, d_half.get());
+                       d_state.get(), nullptr, nullptr, {}, {}, kTokens,
+                       kKHeads, kVHeads, kDim, kKernel, route == 1, false, kEps,
+                       nullptr, d_half.get());
       std::vector<__half> half(kOut + kHalfGuard);
       CheckHip(hipMemcpy(half.data(), d_half.get(), d_half.bytes(),
                          hipMemcpyDeviceToHost),
@@ -270,15 +269,22 @@ int RunCase(std::uint32_t kTokens) {
       HipBuffer<float> current_state(kStateCount), current_conv(kConvState);
       HipBuffer<float> current_out(kOut);
       auto forward = [&](std::uint32_t n, float* ss, float* cs) {
+        q::RollbackRows states, convs;
+        // Reverse the physical rows to prove that the kernel honors independent
+        // prefix addresses rather than relying on a contiguous allocation.
+        for (std::size_t i = 0; i < saved; ++i) {
+          states.rows[i] = ss ? ss + (saved - 1 - i) * kStateCount : nullptr;
+          convs.rows[i] = cs ? cs + (saved - 1 - i) * kConvState : nullptr;
+        }
         Upload(&current_state, state);
         Upload(&current_conv, conv_state);
         q::GatedDeltaNet(d_qkv.get(), kChannels, d_z.get(), kZ,
                          d_alpha_beta.get(), d_conv_w.get(), d_a.get(),
                          d_dt.get(), d_norm_w.get(), current_conv.get(),
                          d_scratch.get(), d_qn.get(), d_kn.get(), d_raw.get(),
-                         current_state.get(), current_out.get(), nullptr, ss,
-                         cs, n, kKHeads, kVHeads, kDim, kKernel, false, false,
-                         kEps, nullptr);
+                         current_state.get(), current_out.get(), nullptr,
+                         states, convs, n, kKHeads, kVHeads, kDim, kKernel,
+                         false, false, kEps, nullptr);
       };
       forward(kTokens, state_snaps.get(), conv_snaps.get());
       const auto saved_states =
@@ -303,10 +309,10 @@ int RunCase(std::uint32_t kTokens) {
         const auto expected_state = Download(&current_state, kStateCount);
         const auto expected_conv = Download(&current_conv, kConvState);
         if (std::memcmp(expected_state.data(),
-                        saved_states.data() + (keep - 1) * kStateCount,
+                        saved_states.data() + (saved - keep) * kStateCount,
                         kStateCount * sizeof(float)) ||
             std::memcmp(expected_conv.data(),
-                        saved_convs.data() + (keep - 1) * kConvState,
+                        saved_convs.data() + (saved - keep) * kConvState,
                         kConvState * sizeof(float))) {
           throw std::runtime_error("GDN rollback prefix changed state");
         }
@@ -322,9 +328,13 @@ int RunCase(std::uint32_t kTokens) {
       Upload(&ple_snaps,
              std::vector<float>(saved * kPleHistory + kGuard, kSentinel));
       auto ple = [&](std::uint32_t n, float* snapshots) {
+        q::RollbackRows rows;
+        for (std::size_t i = 0; i < saved; ++i)
+          rows.rows[i] =
+              snapshots ? snapshots + (saved - 1 - i) * kPleHistory : nullptr;
         Upload(&ple_current, ple_history);
         q::PleConv(d_qkv.get(), d_conv_w.get(), ple_current.get(),
-                   ple_scratch.get(), ple_out.get(), snapshots, n, kChannels,
+                   ple_scratch.get(), ple_out.get(), rows, n, kChannels,
                    kKernel, kDilation, nullptr);
       };
       ple(kTokens, ple_snaps.get());
@@ -338,9 +348,9 @@ int RunCase(std::uint32_t kTokens) {
       for (std::uint32_t keep = 1; keep <= kTokens; ++keep) {
         ple(keep, nullptr);
         const auto expected = Download(&ple_current, kPleHistory);
-        const float* actual = keep == kTokens
-                                  ? full_ple.data()
-                                  : saved_ple.data() + (keep - 1) * kPleHistory;
+        const float* actual =
+            keep == kTokens ? full_ple.data()
+                            : saved_ple.data() + (saved - keep) * kPleHistory;
         if (std::memcmp(expected.data(), actual, kPleHistory * sizeof(float)))
           throw std::runtime_error("PLE rollback prefix changed history");
       }

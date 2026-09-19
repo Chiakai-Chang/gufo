@@ -466,6 +466,10 @@ std::uint64_t SessionSnapshot::SizeBytes() const noexcept {
   return snapshot_.len;
 }
 
+std::span<const std::uint8_t> SessionSnapshot::bytes() const noexcept {
+  return {snapshot_.ptr, snapshot_.len};
+}
+
 bool SessionSnapshot::CopyTo(
     std::span<std::uint8_t> destination) const noexcept {
   if (snapshot_.ptr == nullptr || snapshot_.len != destination.size()) {

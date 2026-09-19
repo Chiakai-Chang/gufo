@@ -114,6 +114,8 @@ public:
     [[nodiscard]] bool restored_from_disk() const noexcept {
       return restored_from_disk_;
     }
+    [[nodiscard]] bool HasSnapshotFor(
+        std::span<const ContinuationToken> tokens) const;
 
     /// Records a successful restore performed by an optional lower cache tier.
     void AdoptRestoredPrefix(std::size_t cached_tokens,
@@ -135,7 +137,8 @@ public:
     /// publish no snapshot when admission or capture failed.
     std::size_t Commit(
         std::vector<ContinuationToken> tokens,
-        std::unique_ptr<ContinuationSnapshot> snapshot = nullptr);
+        std::shared_ptr<const ContinuationSnapshot> snapshot = nullptr,
+        std::vector<ContinuationToken> live_tokens = {});
 
     /// Explicitly discards partial state. The destructor does the same if a
     /// lease is not committed.
@@ -172,7 +175,8 @@ public:
   [[nodiscard]] Lease Acquire(
       std::span<const ContinuationToken> prompt,
       const CancellationCheck& is_cancelled = {},
-      std::span<const std::uint8_t> input_identity = {});
+      std::span<const std::uint8_t> input_identity = {},
+      const std::function<void(ContinuationState&)>& prepare_state = {});
 
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] std::size_t snapshot_capacity_bytes() const noexcept;
@@ -192,8 +196,9 @@ private:
   [[nodiscard]] std::size_t Commit(
       std::size_t index, std::size_t source_index,
       std::size_t reservation_bytes, std::vector<ContinuationToken> tokens,
-      std::unique_ptr<ContinuationSnapshot> snapshot,
-      std::vector<std::uint8_t> input_identity);
+      std::shared_ptr<const ContinuationSnapshot> snapshot,
+      std::vector<std::uint8_t> input_identity,
+      std::vector<ContinuationToken> live_tokens);
   void Invalidate(std::size_t index, std::size_t reservation_bytes) noexcept;
 
   struct Impl;

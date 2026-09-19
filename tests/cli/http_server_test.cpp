@@ -33,6 +33,10 @@ public:
     const std::lock_guard lock(mutex_);
     return last_;
   }
+  void SetOutput(std::string text) {
+    const std::lock_guard lock(mutex_);
+    output_ = std::move(text);
+  }
   std::string model_id() const override { return "test"; }
   bool ready() const override { return true; }
   std::size_t count_tokens(std::string_view text) const override {
@@ -43,14 +47,14 @@ public:
                   const CancellationCheck&,
                   const TokenCallback& token) override {
     ++calls;
+    Result result;
     {
       const std::lock_guard lock(mutex_);
       last_ = {.prompt = std::string(prompt),
                .max_tokens = limit,
                .sampling = sampling};
+      result.text = output_;
     }
-    Result result;
-    result.text = "ok";
     result.prompt_tokens = 10;
     result.cached_prompt_tokens = 8;
     result.cache_hit = true;
@@ -63,7 +67,7 @@ public:
     result.finish_reason =
         limit == 1 ? FinishReason::kLength : FinishReason::kStop;
     if (token)
-      (void)token("ok");
+      (void)token(result.text);
     return result;
   }
   Result chat(const gufo::server::ChatRequest& request, std::size_t limit,
@@ -82,6 +86,7 @@ public:
 private:
   std::mutex mutex_;
   Call last_;
+  std::string output_{"ok"};
 };
 
 class RunningServer {
@@ -392,6 +397,38 @@ void TestInvalidBindSettings() {
   assert(!error.empty());
 }
 
+void TestCompatibilityUtf8() {
+  RunningServer server;
+  server.backend->SetOutput("é中😀\xE2\x94!\xF0\x9F");
+  const std::string expected = "é中😀\xEF\xBF\xBD!\xEF\xBF\xBD";
+  for (const auto& [path, input] : {
+           std::pair{"/v1/completions", R"({"prompt":"hi"})"},
+           std::pair{"/v1/responses", R"({"input":"hi"})"},
+           std::pair{"/v1/messages",
+                     R"({"messages":[{"role":"user","content":"hi"}]})"},
+           std::pair{"/completion", R"({"prompt":"hi"})"},
+       }) {
+    const auto response = server.Post(path, input);
+    ExpectStatus(response, 200);
+    const auto output =
+        gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+    std::string text;
+    if (std::string_view(path) == "/v1/completions")
+      text = output.find("choices")->items()[0].member_str("text");
+    else if (std::string_view(path) == "/v1/responses")
+      text = output.find("output")
+                 ->items()[0]
+                 .find("content")
+                 ->items()[0]
+                 .member_str("text");
+    else if (std::string_view(path) == "/v1/messages")
+      text = output.find("content")->items()[0].member_str("text");
+    else
+      text = output.member_str("content");
+    assert(text == expected);
+  }
+}
+
 void TestQueryParameters() {
   gufo::server::HttpRequest request;
   request.query = "notafter=wrong&note=after=wrong&after=right+value%26x";
@@ -413,5 +450,6 @@ int main() {
   TestAuthorization();
   TestFramingAndMetrics();
   TestCompatibilityRequests();
+  TestCompatibilityUtf8();
   std::cout << "HTTP transport checks passed.\n";
 }

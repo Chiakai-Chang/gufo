@@ -9,11 +9,13 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -272,6 +274,17 @@ public:
     return destination.size();
   }
 
+  std::function<void()> before_stream;
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    if (before_stream)
+      before_stream();
+    std::array<std::uint8_t, kFakePayloadBytes> bytes{};
+    (void)SerializePersistentSnapshot(snapshot, bytes);
+    sink(std::span(bytes).first(7));
+    sink(std::span(bytes).subspan(7));
+  }
+
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
@@ -449,6 +462,22 @@ void TestCorruptionBecomesDeterministicMissAndRemoval() {
   stream.seekp(-1, std::ios::end);
   stream.write(&value, 1);
   stream.close();
+
+  if (::geteuid() != 0) {
+    Expect(::chmod(directory.path().c_str(), S_IRUSR | S_IXUSR) == 0,
+           "cache directory can simulate an unlink failure");
+    auto lookup = std::async(std::launch::async, [&] {
+      auto state = runner.CreateState();
+      return RestoreTokens(store, runner, *state, {4, 4, 4, 5});
+    });
+    const bool returned =
+        lookup.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    Expect(::chmod(directory.path().c_str(), S_IRWXU) == 0,
+           "cache directory permissions restored");
+    const auto result = lookup.get();
+    Expect(returned && !result.restored && store.entry_count() == 1,
+           "unremovable corrupt entries miss without an infinite retry");
+  }
 
   auto state = runner.CreateState();
   Expect(!RestoreTokens(store, runner, *state, {4, 4, 4, 5}).restored,
@@ -794,6 +823,86 @@ void TestSharedPrefixBoundariesAndExactDedup() {
          "capping keeps the longest boundary");
 }
 
+void TestBoundedAsyncPersistenceDoesNotBlockLookup() {
+  TemporaryDirectory directory;
+  auto runner = std::make_shared<FakeRunner>("async-store");
+  std::binary_semaphore entered(0), release(0);
+  runner->before_stream = [&] {
+    entered.release();
+    release.acquire();
+  };
+  const auto bytes = ExpectedFileBytes(
+      runner->Descriptor().persistence->compatibility_identity.size(), 2);
+  {
+    ContinuationDiskStore store(
+        StoreOptions(directory.path(), 4096, bytes + sizeof(FakeSnapshot)));
+    auto snapshot = MakeSnapshot(*runner, 42, 2);
+    Expect(store.CanSave(*runner, 2, snapshot->PayloadBytes()),
+           "empty persistence queue admits the snapshot before capture");
+    Expect(store.SaveAsync(runner, {1, 2}, std::move(snapshot)) == bytes,
+           "immutable snapshot is queued without waiting for serialization");
+    const bool started = entered.try_acquire_for(std::chrono::seconds(2));
+    Expect(started, "persistence worker starts independently");
+    Expect(
+        !store.CanSave(*runner, 2, sizeof(FakeSnapshot)) &&
+            store.SaveAsync(runner, {3, 4}, MakeSnapshot(*runner, 43, 2)) == 0,
+        "active writes count against the bounded queue");
+    auto lookup = std::async(std::launch::async, [&] {
+      auto state = runner->CreateState();
+      return !RestoreTokens(store, *runner, *state, {1, 2, 9}).restored &&
+             store
+                 .SharedPrefixBoundaries(
+                     *runner, std::vector<TextRunnerToken>{1, 9}, 1, 4)
+                 .empty() &&
+             !store.Touch(*runner, std::vector<TextRunnerToken>{1, 2});
+    });
+    const bool ready =
+        lookup.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    release.release();
+    Expect(ready && lookup.get(),
+           "lookup skips a blocked writer without stalling generation");
+    store.Flush();
+    runner->before_stream = {};
+    auto state = runner->CreateState();
+    Expect(RestoreTokens(store, *runner, *state, {1, 2, 9}).restored &&
+               RequireFakeState(*state).value == 42,
+           "streamed chunks form a checksummed restorable snapshot");
+    Expect(store.SaveAsync(runner, {3, 4}, MakeSnapshot(*runner, 43, 2)) != 0,
+           "completed writes release queue admission");
+  }
+  ContinuationDiskStore restarted(StoreOptions(directory.path()));
+  Expect(restarted.entry_count() == 2,
+         "shutdown drains accepted persistence jobs");
+}
+
+void TestIndexedPrefixLookup() {
+  TemporaryDirectory directory;
+  FakeRunner runner("prefix-index");
+  ContinuationDiskStore store(StoreOptions(directory.path()));
+  // Many independent branches, with terminal prefixes inside compressed edges.
+  for (TextRunnerToken branch = 0; branch < 96; ++branch) {
+    Expect(SaveTokens(store, runner, {7, branch, 8, 9},
+                      *MakeSnapshot(runner, branch, 4))
+               .stored,
+           "indexed branch stores");
+  }
+  Expect(
+      SaveTokens(store, runner, {7, 45}, *MakeSnapshot(runner, 999, 2)).stored,
+      "shorter prefix splits an existing compressed edge");
+  auto state = runner.CreateState();
+  Expect(RestoreTokens(store, runner, *state, {7, 45, 8, 9, 10}).token_count ==
+                 4 &&
+             RequireFakeState(*state).value == 45,
+         "longest terminal on the matching path wins");
+  Expect(RestoreTokens(store, runner, *state, {7, 45, 10}).token_count == 2 &&
+             RequireFakeState(*state).value == 999,
+         "a mismatched edge falls back to its terminal ancestor");
+  Expect(store.SharedPrefixBoundaries(
+             runner, std::vector<TextRunnerToken>{7, 46, 8, 10}, 1, 4) ==
+             std::vector<std::size_t>({1, 3}),
+         "index returns branch and partial-edge boundaries in prompt order");
+}
+
 }  // namespace
 
 void TestImageIdentitySurvivesRestart() {
@@ -828,6 +937,8 @@ void TestImageIdentitySurvivesRestart() {
 }
 
 int main() {
+  TestBoundedAsyncPersistenceDoesNotBlockLookup();
+  TestIndexedPrefixLookup();
   TestImageIdentitySurvivesRestart();
   TestSharedPrefixBoundariesAndExactDedup();
   TestSha256KnownVector();

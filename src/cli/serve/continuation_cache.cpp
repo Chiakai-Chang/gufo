@@ -46,6 +46,8 @@ struct ContinuationCache::Entry {
   std::shared_ptr<const ContinuationSnapshot> snapshot;
   std::vector<ContinuationToken> tokens;
   std::vector<std::uint8_t> input_identity;
+  std::vector<ContinuationToken> live_tokens;
+  std::vector<std::uint8_t> live_identity;
   std::size_t snapshot_bytes{0};
   std::uint64_t state_last_used{0};
   std::uint64_t snapshot_last_used{0};
@@ -172,13 +174,14 @@ void ContinuationCache::Lease::SkipSnapshot(SnapshotEventReason reason,
 
 std::size_t ContinuationCache::Lease::Commit(
     std::vector<ContinuationToken> tokens,
-    std::unique_ptr<ContinuationSnapshot> snapshot) {
+    std::shared_ptr<const ContinuationSnapshot> snapshot,
+    std::vector<ContinuationToken> live_tokens) {
   if (cache_ == nullptr) {
     throw std::logic_error("continuation cache lease is empty");
   }
   const std::size_t retained = cache_->Commit(
       index_, source_index_, reserved_snapshot_bytes_, std::move(tokens),
-      std::move(snapshot), std::move(input_identity_));
+      std::move(snapshot), std::move(input_identity_), std::move(live_tokens));
   cache_ = nullptr;
   reserved_snapshot_bytes_ = 0;
   return retained;
@@ -226,10 +229,24 @@ ContinuationCache::ContinuationCache(std::size_t capacity,
 
 ContinuationCache::~ContinuationCache() = default;
 
+bool ContinuationCache::Lease::HasSnapshotFor(
+    std::span<const ContinuationToken> tokens) const {
+  if (!cache_)
+    return false;
+  const std::lock_guard lock(cache_->impl_->mutex);
+  if (source_index_ >= cache_->impl_->entries.size())
+    return false;
+  const auto& source = *cache_->impl_->entries[source_index_];
+  return source.valid && source.snapshot &&
+         source.input_identity == input_identity_ &&
+         std::ranges::equal(source.tokens, tokens);
+}
+
 ContinuationCache::Lease ContinuationCache::Acquire(
     std::span<const ContinuationToken> prompt,
     const CancellationCheck& is_cancelled,
-    std::span<const std::uint8_t> input_identity) {
+    std::span<const std::uint8_t> input_identity,
+    const std::function<void(ContinuationState&)>& prepare_state) {
   while (true) {
     std::unique_lock<std::mutex> lock(impl_->mutex);
 
@@ -249,10 +266,26 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         cached_tokens = entry.tokens.size();
       }
     }
+    // A live final frontier can extend the immutable prompt snapshot. Prefer
+    // it on equal prefix lengths too: no restoration or D2H copy is needed.
+    std::size_t live_source = no_entry;
+    if (impl_->snapshot_mode()) {
+      for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
+        const auto& entry = *impl_->entries[index];
+        if (entry.available && !entry.live_tokens.empty() &&
+            entry.live_tokens.size() >= cached_tokens &&
+            std::ranges::equal(entry.live_identity, input_identity) &&
+            IsPrefix(entry.live_tokens, prompt)) {
+          live_source = index;
+          cached_tokens = entry.live_tokens.size();
+        }
+      }
+    }
 
-    const bool cache_hit = source != no_entry;
-    std::size_t selected = source;
-    if (impl_->snapshot_mode() || !cache_hit) {
+    const bool live_hit = live_source != no_entry;
+    const bool cache_hit = live_hit || source != no_entry;
+    std::size_t selected = live_hit ? live_source : source;
+    if ((impl_->snapshot_mode() && !live_hit) || !cache_hit) {
       selected = no_entry;
       std::uint64_t oldest = std::numeric_limits<std::uint64_t>::max();
       for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
@@ -270,10 +303,12 @@ ContinuationCache::Lease ContinuationCache::Acquire(
       const bool needs_invalidation = entry.dirty && !cache_hit;
       entry.dirty = true;
       entry.state_last_used = ++impl_->clock;
+      entry.live_tokens.clear();
+      entry.live_identity.clear();
 
       std::shared_ptr<const ContinuationSnapshot> snapshot;
       if (impl_->snapshot_mode()) {
-        if (cache_hit) {
+        if (cache_hit && !live_hit) {
           auto& source_entry = *impl_->entries[source];
           snapshot = source_entry.snapshot;
           source_entry.snapshot_last_used = ++impl_->clock;
@@ -287,7 +322,11 @@ ContinuationCache::Lease ContinuationCache::Acquire(
       std::size_t restored_snapshot_bytes = 0;
       double restore_ms = 0.0;
       try {
-        if (cache_hit && impl_->snapshot_mode()) {
+        if (needs_invalidation)
+          entry.state->Invalidate();
+        if (prepare_state)
+          prepare_state(*entry.state);
+        if (cache_hit && impl_->snapshot_mode() && !live_hit) {
           if (snapshot == nullptr) {
             throw std::runtime_error(
                 "continuation cache snapshot entry is empty");
@@ -298,8 +337,6 @@ ContinuationCache::Lease ContinuationCache::Acquire(
           restore_ms = std::chrono::duration<double, std::milli>(
                            std::chrono::steady_clock::now() - restore_start)
                            .count();
-        } else if (needs_invalidation) {
-          entry.state->Invalidate();
         }
       } catch (...) {
         entry.state->Invalidate();
@@ -465,8 +502,9 @@ void ContinuationCache::SkipSnapshot(std::size_t reservation_bytes,
 std::size_t ContinuationCache::Commit(
     std::size_t index, std::size_t source_index, std::size_t reservation_bytes,
     std::vector<ContinuationToken> tokens,
-    std::unique_ptr<ContinuationSnapshot> snapshot,
-    std::vector<std::uint8_t> input_identity) {
+    std::shared_ptr<const ContinuationSnapshot> snapshot,
+    std::vector<std::uint8_t> input_identity,
+    std::vector<ContinuationToken> live_tokens) {
   const std::size_t token_count = tokens.size();
   const std::size_t snapshot_bytes =
       snapshot != nullptr ? snapshot->PayloadBytes() : 0;
@@ -483,13 +521,7 @@ std::size_t ContinuationCache::Commit(
 
   std::shared_ptr<const ContinuationSnapshot> retained_snapshot;
   if (retain_snapshot) {
-    try {
-      retained_snapshot =
-          std::shared_ptr<const ContinuationSnapshot>(std::move(snapshot));
-    } catch (...) {
-      retain_snapshot = false;
-      skip_reason = SnapshotEventReason::kCaptureFailure;
-    }
+    retained_snapshot = std::move(snapshot);
   }
 
   std::vector<std::shared_ptr<const ContinuationSnapshot>> removed_snapshots;
@@ -521,6 +553,8 @@ std::size_t ContinuationCache::Commit(
 
     auto& state_entry = *impl_->entries.at(index);
     if (impl_->snapshot_mode()) {
+      state_entry.live_tokens = std::move(live_tokens);
+      state_entry.live_identity = input_identity;
       if (retain_snapshot) {
         const std::size_t no_entry = impl_->entries.size();
         std::size_t target = no_entry;
@@ -632,6 +666,8 @@ void ContinuationCache::Invalidate(std::size_t index,
       entry.tokens.clear();
       entry.valid = false;
     }
+    entry.live_tokens.clear();
+    entry.live_identity.clear();
     entry.dirty = false;
     entry.available = true;
     entry.state_last_used = ++impl_->clock;

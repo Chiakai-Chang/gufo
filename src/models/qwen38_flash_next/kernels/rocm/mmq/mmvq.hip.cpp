@@ -4,121 +4,21 @@ namespace qfn_mmq {
 #include "unary.hpp"
 #include "vecdotq.hpp"
 
-// MTP shortlists with a private Q4 head, then rescores using the original Q8.
-static __global__ void requantize_q8_0_q4_0_kernel(const block_q8_0* source,
-                                                   block_q4_0* destination,
-                                                   size_t blocks) {
-  const size_t block = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (block >= blocks)
-    return;
-  float values[32];
-  float peak = 0.0f, max_abs = 0.0f;
-  const float scale = __half2float(source[block].d);
-#pragma unroll
-  for (int i = 0; i < 32; ++i) {
-    values[i] = scale * static_cast<float>(source[block].qs[i]);
-    if (fabsf(values[i]) > max_abs) {
-      max_abs = fabsf(values[i]);
-      peak = values[i];
-    }
-  }
-  const float delta = peak / -8.0f;
-  const float inverse = delta != 0.0f ? 1.0f / delta : 0.0f;
-  auto& out = destination[block];
-  out.d = __float2half_rn(delta);
-#pragma unroll
-  for (int i = 0; i < 16; ++i) {
-    const unsigned a = min(15, int(values[i] * inverse + 8.5f));
-    const unsigned b = min(15, int(values[i + 16] * inverse + 8.5f));
-    out.qs[i] = a | (b << 4);
-  }
-}
-
-template<int tokens>
-__launch_bounds__(32) static __global__
-    void mul_mat_vec_q4_0(const void* weights, const block_q8_1* input,
-                          float* output, int rows, int cols, int input_stride) {
-  constexpr int vdr = VDR_Q4_0_Q8_1_MMVQ;
-  constexpr int blocks_per_iter = vdr * 32 / QI4_0;
-  const int lane = threadIdx.x;
-  const int blocks_per_row = cols / QK4_0;
-  const int row_offset = blockIdx.x * blocks_per_row;
-  const int part = vdr * (lane % (QI4_0 / vdr));
-  float sum[tokens] = {};
-  for (int kb = lane / (QI4_0 / vdr); kb < blocks_per_row;
-       kb += blocks_per_iter) {
-#pragma unroll
-    for (int t = 0; t < tokens; ++t) {
-      sum[t] += vec_dot_q4_0_q8_1(weights, input + t * input_stride + kb,
-                                  row_offset + kb, part);
-    }
-  }
-#pragma unroll
-  for (int t = 0; t < tokens; ++t) {
-    sum[t] = warp_reduce_sum<32>(sum[t]);
-    if (lane == 0)
-      output[t * rows + blockIdx.x] = sum[t];
-  }
-}
-
-template<int tokens = 1>
-static void launch_q4(const void* weights, const block_q8_1* input,
-                      float* output, int rows, int cols, int n,
-                      hipStream_t stream) {
-  if (n == tokens) {
-    mul_mat_vec_q4_0<tokens>
-        <<<rows, 32, 0, stream>>>(weights, input, output, rows, cols,
-                                  GGML_PAD(cols, MATRIX_ROW_PADDING) / QK8_1);
-  } else if constexpr (tokens < 8) {
-    launch_q4<tokens + 1>(weights, input, output, rows, cols, n, stream);
-  }
-}
-
-extern "C" int qfn_mmq_requantize_q8_0_q4_0(const void* source,
-                                            void* destination, int rows,
-                                            int cols, hipStream_t stream) {
-  if (!source || !destination || rows <= 0 || cols <= 0 || cols % 32)
-    return -1;
-  const size_t blocks = size_t(rows) * cols / 32;
-  requantize_q8_0_q4_0_kernel<<<(blocks + 255) / 256, 256, 0, stream>>>(
-      static_cast<const block_q8_0*>(source),
-      static_cast<block_q4_0*>(destination), blocks);
-  return hipGetLastError() == hipSuccess ? 0 : -2;
-}
-
-extern "C" int qfn_mmq_q4_0_dense_vec_preq(const void* weights,
-                                           const void* input, float* output,
-                                           int rows, int cols, int tokens,
-                                           hipStream_t stream) {
-  if (!weights || !input || !output || rows <= 0 || cols <= 0 || cols % 32 ||
-      tokens < 1 || tokens > 8)
-    return -1;
-  launch_q4(weights, static_cast<const block_q8_1*>(input), output, rows, cols,
-            tokens, stream);
-  return hipGetLastError() == hipSuccess ? 0 : -2;
-}
-
 // Each wave handles up to eight dense inputs for one weight row on gfx1151.
-template<int ncols_dst, bool has_gate, bool selected = false,
-         int token_waves = 1>
+template<int ncols_dst, bool has_gate, int token_waves = 1>
 __launch_bounds__(32 * token_waves, 1) static __global__
     void mul_mat_vec_q8(const void* __restrict__ weights,
                         const void* __restrict__ gate,
                         const block_q8_1* __restrict__ input,
                         float* __restrict__ output, const uint32_t ncols_x,
                         const uint32_t nrows_x, const uint32_t stride_col_y,
-                        const uint32_t* selected_ids = nullptr,
                         const uint32_t valid_tokens = ncols_dst) {
   constexpr int qi = QI8_0;
   constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
   constexpr int blocks_per_iter = vdr * 32 / qi;
   const int lane = token_waves > 1 ? threadIdx.x % 32 : threadIdx.x;
   const int first_token = token_waves > 1 ? threadIdx.x / 32 * ncols_dst : 0;
-  const int row = selected ? selected_ids[blockIdx.x] : blockIdx.x;
-  if constexpr (selected) {
-    if (static_cast<uint32_t>(row) >= nrows_x)
-      return;
-  }
+  const int row = blockIdx.x;
   const int blocks_per_row = ncols_x / QK8_0;
   const int row_offset = row * blocks_per_row;
   const int kqs = vdr * (lane % (qi / vdr));
@@ -149,18 +49,6 @@ __launch_bounds__(32 * token_waves, 1) static __global__
       output[(first_token + j) * nrows_x + row] = value;
     }
   }
-}
-
-extern "C" int qfn_mmq_q8_0_selected_vec_preq(
-    const void* weights, const void* input, const uint32_t* ids, float* output,
-    int count, int rows, int cols, hipStream_t stream) {
-  if (!weights || !input || !ids || !output || count <= 0 || rows <= 0 ||
-      cols <= 0 || cols % 32)
-    return -1;
-  mul_mat_vec_q8<1, false, true><<<count, 32, 0, stream>>>(
-      weights, nullptr, static_cast<const block_q8_1*>(input), output, cols,
-      rows, cols / 32, ids);
-  return hipGetLastError() == hipSuccess ? 0 : -2;
 }
 
 typedef float (*vec_dot_q_hip_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -432,17 +320,14 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
     // Each wave retains the eight-row arithmetic. Adjacent waves work
     // on the same weight row, reusing cache lines across requests.
     if (tokens <= 16) {
-      mul_mat_vec_q8<8, false, false, 2>
-          <<<rows, 64, 0, stream>>>(weights, nullptr, input, output, k, rows,
-                                    input_stride, nullptr, tokens);
+      mul_mat_vec_q8<8, false, 2><<<rows, 64, 0, stream>>>(
+          weights, nullptr, input, output, k, rows, input_stride, tokens);
     } else if (tokens <= 24) {
-      mul_mat_vec_q8<8, false, false, 3>
-          <<<rows, 96, 0, stream>>>(weights, nullptr, input, output, k, rows,
-                                    input_stride, nullptr, tokens);
+      mul_mat_vec_q8<8, false, 3><<<rows, 96, 0, stream>>>(
+          weights, nullptr, input, output, k, rows, input_stride, tokens);
     } else {
-      mul_mat_vec_q8<8, false, false, 4>
-          <<<rows, 128, 0, stream>>>(weights, nullptr, input, output, k, rows,
-                                     input_stride, nullptr, tokens);
+      mul_mat_vec_q8<8, false, 4><<<rows, 128, 0, stream>>>(
+          weights, nullptr, input, output, k, rows, input_stride, tokens);
     }
     return;
   }

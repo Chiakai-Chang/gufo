@@ -35,9 +35,13 @@ void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
   if (prompt && !prompt->images.empty() && !encoder) {
     throw std::invalid_argument("image input has no vision encoder");
   }
+  const bool reuse = prompt_ && prompt && !prompt->cache_identity.empty() &&
+                     encoder_ == encoder &&
+                     prompt_->cache_identity == prompt->cache_identity;
   prompt_ = std::move(prompt);
   encoder_ = std::move(encoder);
-  embeddings_.clear();
+  if (!reuse)
+    embeddings_.clear();
   if (prompt_)
     embeddings_.resize(prompt_->images.size());
   RestoreLayout(prompt_ ? prompt_->rope : RopeLayout{}, stream);
@@ -89,7 +93,7 @@ void DeviceInput::Inject(float* hidden, std::uint32_t position,
     if (begin >= end)
       continue;
     if (!embeddings_[index])
-      embeddings_[index] = encoder_->Encode(image.pixels);
+      embeddings_[index] = encoder_->Encode(image.pixels, {}, is_cancelled_);
     const auto& embedding = *embeddings_[index];
     if (embedding.width() != width ||
         embedding.rows() != image.grid.height * image.grid.width) {

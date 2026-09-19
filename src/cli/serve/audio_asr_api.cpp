@@ -15,6 +15,7 @@
 #include <utility>
 
 #include "src/core/json.hpp"
+#include "src/core/utf8.hpp"
 
 namespace gufo::server {
 namespace {
@@ -325,11 +326,11 @@ HttpResponse Transcribe(const HttpRequest& request, AsrService& service) {
   response.status = 200;
   response.reason = "OK";
   if (format == "text") {
-    response.body = result.text;
+    response.body = core::Utf8Decoder{}.Push(result.text, true);
     response.headers.emplace_back("Content-Type", "text/plain; charset=utf-8");
   } else {
     json::Value body = json::Value::object();
-    body["text"] = result.text;
+    body["text"] = core::Utf8Decoder{}.Push(result.text, true);
     if (format == "verbose_json") {
       body["task"] = "transcribe";
       body["language"] = Lower(result.language);

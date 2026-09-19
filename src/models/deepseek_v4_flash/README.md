@@ -55,9 +55,11 @@ Rendered-byte and token-ID SHA goldens generated with the pinned official
 encoder/tokenizer are stored in
 [`tests/fixtures/chat_template_hf_goldens.json`](../../../tests/fixtures/chat_template_hf_goldens.json).
 The template tests cover chat mode, all native effort levels, history
-drop/preserve, strict artifact validation, and DSML tool loops. The
+drop/preserve, strict artifact validation, and DSML tool loops, including
+parallel results restored to their original call order by tool-call ID. The
 model-backed `ds4.target` check compares complete token-ID sequences with these
-goldens while reusing the model loaded for target quality checks. All DS4 checks
+goldens while reusing the model loaded for target quality checks; pass
+`--template-only` to `ds4_quality_test` for template-only qualification. All DS4 checks
 are registered in `tests/models/deepseek_v4_flash/CMakeLists.txt`; see the
 [quality workflow](../../../benchmarks/deepseek-v4-flash/README.md).
 

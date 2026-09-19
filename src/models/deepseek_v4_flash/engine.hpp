@@ -179,6 +179,7 @@ public:
   SessionSnapshot& operator=(SessionSnapshot&&) = delete;
 
   [[nodiscard]] std::uint64_t SizeBytes() const noexcept;
+  [[nodiscard]] std::span<const std::uint8_t> bytes() const noexcept;
   [[nodiscard]] bool CopyTo(std::span<std::uint8_t> destination) const noexcept;
 
 private:

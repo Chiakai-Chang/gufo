@@ -616,7 +616,7 @@ int main(int argc, const char* const* argv) {
                "Qwen disk writer differs from cold target execution");
         Expect(persistent_root.text == http_chat.text,
                "Qwen disk writer produced a different reusable root");
-        Expect(persistent_root.cache_disk_write_bytes > 0,
+        Expect(persistent_root.cache_disk_queued_bytes > 0,
                "Qwen disk writer did not publish a compact snapshot");
       }
 
@@ -688,7 +688,7 @@ int main(int argc, const char* const* argv) {
               dflash_writer.chat(messages, 2, {});
           Expect(persistent_dflash_root.tokens == warm_dflash_root.tokens,
                  "DFlash disk writer root differs from warm execution");
-          Expect(persistent_dflash_root.cache_disk_write_bytes > 0,
+          Expect(persistent_dflash_root.cache_disk_queued_bytes > 0,
                  "DFlash disk writer did not publish a compact snapshot");
         }
 

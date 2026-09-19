@@ -170,7 +170,8 @@ std::vector<std::uint8_t> DeepSeekCompatibilityIdentity(
 
 std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
     std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
-    bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens) {
+    bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
+    std::uint32_t decode_concurrency) {
   if (!IsSha256Hex(artifact_fingerprint)) {
     throw std::invalid_argument(
         "Qwen3.8-Flash-Next disk cache requires an artifact fingerprint");
@@ -200,7 +201,8 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
     identity << "draft_backend=qfn-mtp-v1\n"
              << "draft_artifact_id=" << core::kGgufSampledIdentityScheme << ':'
              << mtp_fingerprint << '\n'
-             << "draft_max_tokens=" << max_draft_tokens << '\n';
+             << "draft_max_tokens=" << max_draft_tokens << '\n'
+             << "draft_cost_concurrency=" << decode_concurrency << '\n';
   }
   const std::string canonical = identity.str();
   return {canonical.begin(), canonical.end()};
@@ -869,10 +871,6 @@ public:
   [[nodiscard]] TextDecodeSelection SelectNext(
       TextRunnerState& state, sampling::SamplerState& sampler) const override {
     auto& qwen = RequireQwenState(state);
-    if (qwen.speculative()) {
-      throw std::logic_error(
-          "Qwen DFlash decoding requires a multi-token decode step");
-    }
     const TextRunnerToken token = qwen.SelectFrontier(sampler);
     if (IsQwenStopToken(model_->GetTokenizer(), token)) {
       return {
@@ -901,6 +899,11 @@ public:
         token, static_cast<std::uint32_t>(qwen.position()));
     qwen.set_position(qwen.position() + 1);
     qwen.set_frontier(frontier);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
@@ -1439,12 +1442,14 @@ public:
           .role = std::string(ChatRoleName(message.role)),
           .content = message.content,
           .reasoning_content = message.thought,
+          .tool_calls = {},
           .tool_call_id = message.tool_call_id,
       };
       converted.tool_calls.reserve(message.tool_calls.size());
       for (const auto& call : message.tool_calls) {
         models::deepseek_v4_flash::ChatMessage::ToolCall converted_call{
             .name = call.name,
+            .arguments = {},
             .id = call.id,
         };
         converted_call.arguments.reserve(call.arguments.size());
@@ -1593,6 +1598,23 @@ public:
       throw std::runtime_error("DeepSeek decode failed: " + error);
     }
     deepseek.set_position(deepseek.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& deepseek = RequireDeepSeekState(state);
+    if (deepseek.position() >= max_context_)
+      return TextDecodeSelection{.stop = true, .piece = {}};
+    std::string error;
+    const auto logits = deepseek.session().CopyLogits(&error);
+    if (logits.empty())
+      throw std::runtime_error("DeepSeek token preview failed: " + error);
+    const auto token = sampler.Sample(logits);
+    return TextDecodeSelection{
+        .stop = model_->IsStopToken(static_cast<int>(token)),
+        .token = token,
+        .piece = model_->DecodeToken(static_cast<int>(token)),
+    };
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
@@ -1864,6 +1886,13 @@ public:
     return destination.size();
   }
 
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    (void)PersistentSnapshotPayloadBytes(snapshot);
+    sink(dynamic_cast<const DeepSeekTextRunnerSnapshot&>(snapshot)
+             .snapshot->bytes());
+  }
+
   void RestorePersistentSnapshot(
       TextRunnerState& state,
       std::span<const std::uint8_t> payload) const override {
@@ -1966,8 +1995,17 @@ public:
   }
 
   void Invalidate() noexcept override {
+    session_->SetCancellationCheck({});
     session_->Reset();
     position_ = 0;
+  }
+  void SetCancellationCheck(const CancellationCheck& check) override {
+    session_->SetCancellationCheck(check);
+  }
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    return {.per_request_state_bytes = session_->AllocatedBytes(),
+            .temporary_scratch_bytes = 0};
   }
 
   [[nodiscard]] QwenFlashNextSession& session() const { return *session_; }
@@ -2049,7 +2087,7 @@ public:
       persistence_ = TextRunnerPersistenceDescriptor{
           .compatibility_identity = QwenFlashNextCompatibilityIdentity(
               artifact_fingerprint, mtp_fingerprint, model_->HasMtp(),
-              max_context_, max_draft_tokens_),
+              max_context_, max_draft_tokens_, model_->DecodeConcurrency()),
           .payload_version =
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
@@ -2082,14 +2120,17 @@ public:
     std::size_t total_bytes = 0;
     std::optional<std::size_t> capacity;
     if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
-      capacity = free_bytes;
+      const auto deferred = model_->DeferredScratchBytes();
+      capacity = free_bytes > deferred ? free_bytes - deferred : 0;
     }
     // Snapshots live in host memory, not in the device state pool.
     return {
         .resident_weights_bytes = model_->ResidentBytes(),
         .state_capacity_bytes = capacity,
-        .per_request_state_bytes = std::nullopt,
-        .temporary_scratch_bytes = std::nullopt,
+        .per_request_state_bytes = model_->SessionBytes(max_context_),
+        // Runtime scratch is shared and already allocated at model load;
+        // reserve its remaining lazy buffers once from aggregate capacity.
+        .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
         .requires_device_runtime_lock = true,
     };
@@ -2222,6 +2263,11 @@ public:
       throw std::runtime_error("Qwen3.8-Flash-Next decode failed: " + error);
     }
     qfn.set_position(qfn.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
@@ -2427,6 +2473,13 @@ public:
           "Qwen3.8-Flash-Next persistent snapshot serialization failed");
     }
     return destination.size();
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    (void)PersistentSnapshotPayloadBytes(snapshot);
+    sink(dynamic_cast<const QwenFlashNextTextRunnerSnapshot&>(snapshot)
+             .snapshot->bytes());
   }
 
   void RestorePersistentSnapshot(
@@ -2647,6 +2700,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                     : std::string{},
             .max_draft_tokens = speculative_config.max_draft_tokens,
             .vision_model_path = vision_model_path,
+            .decode_concurrency = static_cast<std::uint32_t>(
+                std::clamp<std::size_t>(session_count, 1, 8)),
         },
         &load_error);
     if (model == nullptr) {

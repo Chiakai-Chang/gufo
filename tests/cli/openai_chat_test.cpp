@@ -275,6 +275,69 @@ void TestStreamingWithoutUsage() {
   }
 }
 
+void TestUtf8Output() {
+  const auto check = [](std::vector<std::string> pieces,
+                        const std::string& expected, bool reasoning) {
+    FakeBackend backend;
+    backend.pieces = std::move(pieces);
+    auto body = gufo::json::parse(R"({
+      "model":"test-model","messages":[{"role":"user","content":"hello"}]
+    })");
+    body["chat_template_kwargs"]["enable_thinking"] = reasoning;
+    const auto field = reasoning ? "reasoning_content" : "content";
+    const auto complete =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(complete.status == 200, "Unicode completion succeeds");
+    const auto parsed = gufo::json::parse(complete.body);
+    Expect(
+        parsed.find("choices")->items().front().find("message")->member_str(
+            field) == expected,
+        "Non-streaming UTF-8 preserves scalars and replaces malformed bytes");
+    body["stream"] = true;
+    const auto stream =
+        gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+    Expect(stream.status == 200 && stream.streaming_body,
+           "Unicode stream succeeds");
+    std::string text;
+    stream.streaming_body([&](std::string_view chunk) {
+      if (chunk == "data: [DONE]\n\n")
+        return true;
+      Expect(chunk.starts_with("data: "), "SSE has a data prefix");
+      const auto event = gufo::json::parse(chunk.substr(6));
+      for (const auto& choice : event.find("choices")->items()) {
+        const auto* delta = choice.find("delta");
+        if (delta)
+          text += delta->member_str(field);
+      }
+      Expect(expected.starts_with(text) &&
+                 (text.size() == expected.size() ||
+                  (static_cast<unsigned char>(expected[text.size()]) & 0xC0) !=
+                      0x80),
+             "Every SSE event ends at a complete Unicode scalar");
+      return true;
+    });
+    Expect(text == expected, "Streaming and non-streaming UTF-8 agree");
+  };
+  const std::string valid = "Aé中┌😀Z";
+  const std::string replacement = "\xEF\xBF\xBD";
+  for (const bool reasoning : {false, true}) {
+    for (std::size_t split = 1; split < valid.size(); ++split)
+      check({valid.substr(0, split), valid.substr(split)}, valid, reasoning);
+    std::vector<std::string> bytes;
+    for (char byte : valid)
+      bytes.emplace_back(1, byte);
+    check(bytes, valid, reasoning);
+    check({"\xE2\x82", "X"}, replacement + "X", reasoning);
+    check({"\xF0", "\x9F"}, replacement, reasoning);
+    check({"\x80", "ok"}, replacement + "ok", reasoning);
+    check({"\xC0\xAF"}, replacement + replacement, reasoning);
+    check({"\xED", "\xA0\x80"}, replacement + replacement + replacement,
+          reasoning);
+    check({"\xF4\x90\x80\x80"},
+          replacement + replacement + replacement + replacement, reasoning);
+  }
+}
+
 void TestCachedPrefillMetrics() {
   FakeBackend backend;
   backend.pieces = {"ok"};
@@ -344,6 +407,104 @@ void TestToolCallsAreStructured() {
   Expect(backend.last_request.tool_choice ==
              gufo::server::ChatRequest::ToolChoice::kRequired,
          "Required tool choice reaches the model backend");
+}
+
+void TestQwenToolBoundariesAndSchema() {
+  using gufo::json::Value;
+  const auto schema = gufo::json::parse(R"({
+    "model":"test-model", "messages":[{"role":"user","content":"use f"}],
+    "tools":[{"type":"function","function":{"name":"f","parameters":{
+      "type":"object","properties":{"text":{"type":"string"},
+      "count":{"type":"integer"}}}}}]
+  })");
+  const std::string good =
+      "<tool_call><function=f><parameter=text>42</parameter>"
+      "<parameter=count>42</parameter></function></tool_call>";
+  struct Case {
+    std::string text;
+    std::size_t calls;
+    std::string argument;
+  };
+  for (const auto& item :
+       {Case{good, 1, R"({"text":"42","count":42})"},
+        Case{"<tool_call><function=f><parameter=text>literal </tool_call> "
+             "and </function></parameter></function></tool_call>",
+             1, R"({"text":"literal </tool_call> and </function>"})"},
+        Case{"<tool_call><function=f><parameter=text>ok</parameter>"
+             "<parameter=count>oops</parameter></function></tool_call>",
+             0, ""},
+        Case{"<tool_call><function=f><parameter=text>ok</parameter>"
+             "<parameter=count>42</function></tool_call>",
+             0, ""},
+        Case{"<tool_call><function=f><parameter=text>ok</parameter>"
+             "<parameter=count>42</function></tool_call>" +
+                 good,
+             1, R"({"text":"42","count":42})"},
+        Case{"<tool_call><function=f><parameter=text>unclosed" + good, 1,
+             R"({"text":"42","count":42})"},
+        Case{"<tool_call><function=f><parameter=text>literal </think>"
+             "</parameter></function></tool_call>",
+             1, R"({"text":"literal </think>"})"},
+        Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"text\":"
+             "\"literal </tool_call>\"}}</tool_call>",
+             1, R"({"text":"literal </tool_call>"})"}}) {
+    for (bool reasoning : {false, true}) {
+      for (bool stream : {false, true}) {
+        auto body = schema;
+        body["stream"] = stream;
+        body["chat_template_kwargs"] = Value::object();
+        body["chat_template_kwargs"]["enable_thinking"] = reasoning;
+        FakeBackend backend;
+        const auto text = (reasoning ? "Considering. " : "") + item.text;
+        // Split every marker and argument across token callbacks.
+        for (char c : text)
+          backend.pieces.emplace_back(1, c);
+        const auto response =
+            gufo::server::HandleOpenAiChat(Request(body.dump()), backend);
+        Expect(response.status == 200, "tool boundary request succeeds");
+        std::vector<Value> calls;
+        if (!stream) {
+          const auto output = gufo::json::parse(response.body);
+          const auto& message =
+              *output.find("choices")->items()[0].find("message");
+          if (const auto* found = message.find("tool_calls"))
+            calls.assign(found->items().begin(), found->items().end());
+        } else {
+          std::string output;
+          response.streaming_body([&](std::string_view part) {
+            output += part;
+            return true;
+          });
+          std::size_t cursor = 0;
+          while ((cursor = output.find("data: ", cursor)) !=
+                 std::string::npos) {
+            const auto begin = cursor + 6;
+            cursor = output.find('\n', begin);
+            const auto payload = output.substr(begin, cursor - begin);
+            if (payload == "[DONE]")
+              break;
+            const auto event = gufo::json::parse(payload);
+            const auto* choices = event.find("choices");
+            if (!choices || choices->empty())
+              continue;
+            const auto* delta = choices->items()[0].find("delta");
+            if (const auto* found = delta ? delta->find("tool_calls") : nullptr)
+              calls.insert(calls.end(), found->items().begin(),
+                           found->items().end());
+            if (item.calls && delta)
+              Expect(delta->member_str("reasoning_content").find('<') ==
+                         std::string::npos,
+                     "tool markers do not leak into reasoning deltas");
+          }
+        }
+        Expect(calls.size() == item.calls, "only complete tool calls emitted");
+        if (!calls.empty())
+          Expect(calls.back().find("function")->member_str("arguments") ==
+                     item.argument,
+                 "tool argument values and schema types preserved");
+      }
+    }
+  }
 }
 
 void TestDeepSeekToolCallsAreStructured() {
@@ -763,6 +924,7 @@ void TestImagePartsRetainOrderAndIdentity() {
 int main() {
   TestStreamingIsLive();
   TestStreamingWithoutUsage();
+  TestUtf8Output();
   TestCachedPrefillMetrics();
   TestBackendSamplingDefaults();
   TestAllSamplingControlsReachBackend();
@@ -773,6 +935,7 @@ int main() {
   TestStreamingPromptOpenedReasoning();
   TestConflictingReasoningControlsAreRejected();
   TestToolCallsAreStructured();
+  TestQwenToolBoundariesAndSchema();
   TestDeepSeekToolCallsAreStructured();
   TestWrongModelIsRejected();
   TestClientIdentityReachesBackend();

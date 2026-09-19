@@ -124,7 +124,7 @@ __global__ void LinearSamplingKernel(const float* __restrict__ logits,
 
   const float maximum = shared_max[0];
   const float min_p_threshold =
-      min_p > 0.0F ? maximum + logf(min_p) : -INFINITY;
+      min_p > 0.0F ? maximum + temperature * logf(min_p) : -INFINITY;
   const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   float local_sum = 0.0F;
   for (std::size_t index = begin; index < end; ++index) {
@@ -195,9 +195,10 @@ __global__ void SortedSamplingKernel(
   const std::size_t top_p_begin = (initial_count * tid) / blockDim.x;
   const std::size_t top_p_end = (initial_count * (tid + 1U)) / blockDim.x;
   const float maximum = sorted_logits[0];
+  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   float local_sum = 0.0F;
   for (std::size_t index = top_p_begin; index < top_p_end; ++index) {
-    local_sum += expf(sorted_logits[index] - maximum);
+    local_sum += expf((sorted_logits[index] - maximum) * inverse_temperature);
   }
   segment_sums[tid] = local_sum;
   __syncthreads();
@@ -228,7 +229,7 @@ __global__ void SortedSamplingKernel(
     float threshold = selected_threshold;
     std::size_t keep = top_p_end;
     for (std::size_t index = top_p_begin; index < top_p_end; ++index) {
-      threshold -= expf(sorted_logits[index] - maximum);
+      threshold -= expf((sorted_logits[index] - maximum) * inverse_temperature);
       if (threshold <= 0.0F) {
         keep = index + 1U;
         break;
@@ -241,7 +242,7 @@ __global__ void SortedSamplingKernel(
   if (tid == 0) {
     final_keep = top_p_keep;
     if (min_p > 0.0F && final_keep > 1U) {
-      const float threshold = maximum + logf(min_p);
+      const float threshold = maximum + temperature * logf(min_p);
       std::size_t low = 0;
       std::size_t high = final_keep;
       while (low < high) {
@@ -265,7 +266,6 @@ __global__ void SortedSamplingKernel(
 
   const std::size_t sample_begin = (final_keep * tid) / blockDim.x;
   const std::size_t sample_end = (final_keep * (tid + 1U)) / blockDim.x;
-  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   local_sum = 0.0F;
   for (std::size_t index = sample_begin; index < sample_end; ++index) {
     local_sum += expf((sorted_logits[index] - maximum) * inverse_temperature);
@@ -344,7 +344,7 @@ __global__ void LinearSpeculativeSamplingKernel(
 
   const float maximum = shared_max[0];
   const float min_p_threshold =
-      min_p > 0.0F ? maximum + logf(min_p) : -INFINITY;
+      min_p > 0.0F ? maximum + temperature * logf(min_p) : -INFINITY;
   const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   float local_sum = 0.0F;
   float local_draft_weight = 0.0F;
@@ -528,7 +528,7 @@ __global__ void SpeculativeSegmentWeightsKernel(
   }
   const float maximum = maxima[0];
   const float min_p_threshold =
-      min_p > 0.0F ? maximum + logf(min_p) : -INFINITY;
+      min_p > 0.0F ? maximum + temperature * logf(min_p) : -INFINITY;
   const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   const std::size_t begin = (vocab_size * blockIdx.x) / kSamplingThreads;
   const std::size_t end = (vocab_size * (blockIdx.x + 1U)) / kSamplingThreads;
@@ -705,9 +705,10 @@ __global__ void SortedSpeculativeSamplingKernel(
   const std::size_t top_p_begin = (initial_count * tid) / blockDim.x;
   const std::size_t top_p_end = (initial_count * (tid + 1U)) / blockDim.x;
   const float maximum = sorted_logits[0];
+  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   float local_sum = 0.0F;
   for (std::size_t index = top_p_begin; index < top_p_end; ++index) {
-    local_sum += expf(sorted_logits[index] - maximum);
+    local_sum += expf((sorted_logits[index] - maximum) * inverse_temperature);
   }
   segment_sums[tid] = local_sum;
   __syncthreads();
@@ -738,7 +739,7 @@ __global__ void SortedSpeculativeSamplingKernel(
     float threshold = selected_threshold;
     std::size_t keep = top_p_end;
     for (std::size_t index = top_p_begin; index < top_p_end; ++index) {
-      threshold -= expf(sorted_logits[index] - maximum);
+      threshold -= expf((sorted_logits[index] - maximum) * inverse_temperature);
       if (threshold <= 0.0F) {
         keep = index + 1U;
         break;
@@ -751,7 +752,7 @@ __global__ void SortedSpeculativeSamplingKernel(
   if (tid == 0) {
     final_keep = top_p_keep;
     if (min_p > 0.0F && final_keep > 1U) {
-      const float threshold = maximum + logf(min_p);
+      const float threshold = maximum + temperature * logf(min_p);
       std::size_t low = 0;
       std::size_t high = final_keep;
       while (low < high) {
@@ -769,7 +770,6 @@ __global__ void SortedSpeculativeSamplingKernel(
 
   const std::size_t sample_begin = (final_keep * tid) / blockDim.x;
   const std::size_t sample_end = (final_keep * (tid + 1U)) / blockDim.x;
-  const float inverse_temperature = 1.0F / fmaxf(temperature, FLT_MIN);
   local_sum = 0.0F;
   float local_draft_weight = 0.0F;
   for (std::size_t index = sample_begin; index < sample_end; ++index) {

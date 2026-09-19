@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "src/models/qwen/vision/prompt.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 #include "src/models/qwen38_flash_next/weights.hpp"
 
@@ -19,8 +20,12 @@ namespace gufo::models::qwen38_flash_next {
 /// and the MTP draft block. Speed is irrelevant here.
 class ReferenceModel {
 public:
+  /// Float32 formulas versus an independent emulation of decode storage:
+  /// Q8 activation blocks, F16 KV/pooled keys and F16 uploaded router weights.
+  enum class Storage { kFloat32, kDecode };
   ReferenceModel(const ModelWeights& weights, NgramTable* ngram,
-                 std::uint32_t max_context);
+                 std::uint32_t max_context,
+                 Storage storage = Storage::kFloat32);
 
   /// Runs one token at the next position; `logits` (vocab floats) receives
   /// the output distribution when non-empty. `hc_out` (hc_dim floats) receives
@@ -29,10 +34,27 @@ public:
                           std::span<float> hc_out = {},
                           std::string* error_msg = nullptr);
 
+  /// Independent scalar predictor. An empty hidden input uses the previous
+  /// predictor residual; otherwise use the supplied pre-head trunk stream.
+  /// The shifted token always uses the text embedding table, including
+  /// image-pad IDs. Visual information is carried by hidden and mRoPE.
+  /// `stage_inputs` optionally supplies observed fusion/attention outputs as
+  /// inputs to the following stages, isolating arithmetic from accumulated
+  /// quantization drift. Attention caches remain independently computed.
+  [[nodiscard]] bool MtpStep(const MtpWeights& mtp, std::int32_t token,
+                             std::span<const float> hidden,
+                             std::span<float> logits, MtpTrace* trace = nullptr,
+                             const qwen::vision::RopeLayout* rope = nullptr,
+                             std::string* error_msg = nullptr,
+                             const MtpTrace* stage_inputs = nullptr);
+
   [[nodiscard]] std::uint32_t Position() const noexcept { return position_; }
   void Reset();
 
 private:
+  void MatVec(const TensorRef& weight, std::uint64_t expert,
+              std::span<const float> x, std::span<float> out,
+              bool narrow_weights = false);
   struct LinearState {
     std::vector<float> conv;   ///< [kernel-1][channels], oldest first
     std::vector<float> state;  ///< [v_heads][head_dim(v)][head_dim(k)]
@@ -55,17 +77,22 @@ private:
                        std::span<const float> x, std::span<float> out);
   void Attention(const LayerWeights& l, AttentionState& s,
                  std::span<const float> x, std::uint32_t pos,
-                 std::span<float> out);
+                 std::span<float> out,
+                 const qwen::vision::RopeLayout* rope = nullptr);
   void Moe(const LayerWeights& l, std::span<const float> x,
            std::span<float> out);
 
   const ModelWeights& w_;
   const Config& c_;
+  Storage storage_;
   NgramTable* ngram_;
   std::uint32_t max_context_;
   std::uint32_t position_{0};
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
+  AttentionState mtp_attention_;
+  std::vector<float> mtp_hidden_;
+  std::uint32_t mtp_position_{0};
   NgramHistory ngram_history_;
   std::vector<float> ple_conv_history_;  ///< [PleConvHistory()][hc_dim]
 };

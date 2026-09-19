@@ -19,6 +19,7 @@
 #include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/blaslt.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/device_model.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/mtp_sampling.hpp"
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
@@ -44,6 +45,9 @@ public:
   }
   /// Drops every token; the next Forward starts at position 0.
   void Reset();
+  void SetCancellationCheck(std::function<bool()> check);
+  [[nodiscard]] bool CheckCancellation(std::string* error) const;
+  [[nodiscard]] std::size_t AllocatedBytes() const noexcept;
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
                        hipStream_t stream);
@@ -60,8 +64,8 @@ private:
   struct LinearState {
     float* conv_state{nullptr};       ///< [kernel-1][channels]
     float* state{nullptr};            ///< [v_heads][d][d]
-    float* conv_snapshots{nullptr};   ///< [max_spec-1][kernel-1][channels]
-    float* state_snapshots{nullptr};  ///< [max_spec-1][v_heads][d][d]
+    RollbackRows conv_snapshots;      ///< [max_spec-1][kernel-1][channels]
+    RollbackRows state_snapshots;     ///< [max_spec-1][v_heads][d][d]
   };
   struct AttentionState {
     const qwen::vision::DeviceRope* rope{nullptr};
@@ -77,12 +81,16 @@ private:
     std::uint32_t blocks;        ///< indexer blocks pooled so far
     std::uint32_t mtp_position;  ///< first position of the draft batch
     std::int32_t hidden_row;     ///< kept trunk row the draft reads, or -1
+    std::uint32_t mtp_blocks;    ///< complete predictor indexer blocks
   };
   struct MtpState {
     __half* k_cache{nullptr};
     __half* v_cache{nullptr};
+    float* index_k{nullptr};
+    __half* block_k{nullptr};
+    std::uint32_t blocks{0};
     float* h{nullptr};  ///< [hc_dim] wide residual handed to the next draft
-    float* target_hidden{nullptr};  ///< this session's last trunk batch
+    float* target_hidden{nullptr};  ///< last max_speculative trunk rows
     std::uint32_t position{0};
   };
 
@@ -94,7 +102,7 @@ private:
   std::vector<LinearState> linear_;
   std::vector<AttentionState> attention_;
   float* ple_history_{nullptr};    ///< [PleConvHistory()][hc_dim]
-  float* ple_snapshots_{nullptr};  ///< [max_spec-1][PleConvHistory()][hc_dim]
+  RollbackRows ple_snapshots_;     ///< [max_spec-1][PleConvHistory()][hc_dim]
   NgramHistory ngram_;
   std::vector<NgramHistory> ngram_snapshots_;
   std::uint32_t spec_base_{0};    ///< position before the speculative batch
@@ -107,6 +115,12 @@ private:
   std::unordered_map<std::uint64_t, hipGraphExec_t> graphs_;
   std::unordered_set<std::uint64_t> warmed_;
   std::vector<void*> allocations_;
+  std::size_t allocated_bytes_{0};
+  std::size_t rollback_bytes_{0};
+  std::function<bool()> is_cancelled_;
+  std::vector<float*> rollback_allocations_;
+  std::uint32_t rollback_depth_{0};
+  void TrimRollback(std::uint32_t depth) noexcept;
 };
 
 /// Runs the trunk graph on the GPU for one session at a time. Buffers are
@@ -132,6 +146,11 @@ public:
 
   [[nodiscard]] std::unique_ptr<Session> CreateSession(
       std::uint32_t max_context, std::string* error_msg = nullptr) const;
+  [[nodiscard]] bool EnsureRollback(Session& session, std::uint32_t depth,
+                                    std::string* error_msg) const;
+  [[nodiscard]] std::size_t SessionBytes(
+      std::uint32_t max_context, std::uint32_t rollback_depth) const noexcept;
+  [[nodiscard]] std::size_t DeferredScratchBytes() const;
 
   enum class ForwardMode { kDecode, kVerify, kPrefill };
 
@@ -178,18 +197,34 @@ public:
   struct MtpOutput {
     std::int32_t* token{nullptr};
     MtpCandidateLogits* candidates{nullptr};
+    MtpTrace* trace{
+        nullptr};  ///< single-row diagnostic; disables graph capture
   };
   struct MtpHeadItem {
     Session* session;
     MtpOutput output;
   };
+  struct MtpBatchItem {
+    Session* session;
+    std::span<const std::int32_t> tokens;
+    std::int32_t hidden_row;
+  };
+  /// Runs independent short predictor chains with shared projections and
+  /// private attention caches, positions and carried hidden states.
+  [[nodiscard]] bool MtpForwardBatch(std::span<const MtpBatchItem> items,
+                                     std::string* error_msg) const;
   /// Projects each session's carried draft hidden state with shared weights.
   [[nodiscard]] bool MtpHeads(std::span<const MtpHeadItem> items,
                               std::string* error_msg) const;
   [[nodiscard]] bool MtpForward(Session& session,
                                 std::span<const std::int32_t> tokens,
                                 std::int32_t hidden_row, MtpOutput output,
-                                std::string* error_msg) const;
+                                std::string* error_msg,
+                                const float* hidden_source = nullptr) const;
+  /// First kept trunk row, for independent predictor qualification.
+  [[nodiscard]] bool CopyTrunkHidden(const Session& session,
+                                     std::span<float> hidden,
+                                     std::string* error_msg) const;
 
   /// Verifies a proposal against a device-resident target logit row.
   /// Returns either the accepted proposal or its residual correction.
@@ -218,14 +253,19 @@ public:
                                   std::uint32_t hidden_rows,
                                   std::span<std::uint8_t> payload,
                                   std::string* error_msg) const;
+  /// Reuse at most the rollback rows needed by the restored operation;
+  /// restoration never grows scratch. Callers derive this bound from the
+  /// restored policy (or the concrete verifier width in a diagnostic).
   [[nodiscard]] bool RestoreSnapshot(Session& session,
                                      std::span<const std::uint8_t> payload,
-                                     SnapshotInfo* info,
-                                     std::string* error_msg) const;
+                                     SnapshotInfo* info, std::string* error_msg,
+                                     std::uint32_t next_drafts = 0) const;
 
   /// Rewinds the draft block's own context.
   void MtpRewind(Session& session, std::uint32_t position) const noexcept {
     session.mtp_.position = position;
+    session.mtp_.blocks =
+        std::min(session.mtp_.blocks, position / config().compress_ratio);
   }
   [[nodiscard]] std::uint32_t MtpPosition(
       const Session& session) const noexcept {
@@ -327,8 +367,6 @@ private:
   /// Selects the greedy token or compact candidates from full MTP logits.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
                bool candidates, std::string* error_msg) const;
-  bool MtpRescore(const void* input, float* logits,
-                  std::string* error_msg) const;
   /// Enqueues one trunk batch (control and token upload through logits).
   bool ForwardBody(Session& session, std::uint32_t n, std::uint32_t n_logits,
                    bool download_logits, bool speculative, bool sparse,
@@ -336,7 +374,8 @@ private:
                    std::uint32_t first_layer, std::uint32_t end_layer,
                    std::string* error_msg) const;
   bool MtpBody(Session& session, std::uint32_t n, std::uint32_t pos, bool token,
-               bool candidates, std::string* error_msg) const;
+               bool candidates, std::string* error_msg, std::uint32_t pool_grid,
+               const float* hidden_source, MtpTrace* trace) const;
   /// Runs `body` eagerly, or as the session's captured graph for `key`
   /// when `graph` is set. A prefix may leave its work queued so the host
   /// can wait for disk reads while the GPU computes it.
@@ -384,7 +423,6 @@ private:
     float* k;
     float* v;
     float* iq;
-    __half* iq_half;
     float* ik;
     std::uint32_t* mask;
     float* scores;
@@ -422,7 +460,7 @@ private:
     // mtp
     float* mtp_h;
     float* mtp_embd;
-    float* mtp_concat;
+    float* mtp_eproj;
     float* mtp_res;
     ArgmaxCandidate* mtp_argmax;
     std::int32_t* mtp_token;

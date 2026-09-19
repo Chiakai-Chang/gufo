@@ -34,6 +34,8 @@ std::string Lower(std::string value) {
 
 server::ChatRequest ImageRequest(const std::filesystem::path& image) {
   server::ChatRequest request;
+  // This 16-token recognition check evaluates the answer, not a thinking trace.
+  request.reasoning.enabled = false;
   request.messages.emplace_back(tokenization::ChatRole::kUser,
                                 "Describe the dominant color of this image, "
                                 "then explain it in a full sentence.");
@@ -70,9 +72,11 @@ void CheckFlashIncrementalOracle(
     const std::shared_ptr<models::qwen38_flash_next::Model>& model,
     const server::ChatRequest& request, const Backend::Result& cached) {
   const auto prompt = std::make_shared<models::qwen::vision::Prompt>(
-      models::qwen::vision::Prepare(model->tokenizer(), request.messages, {},
-                                    {}, model->VisionEncoder()->identity(),
-                                    model->MaxContext()));
+      models::qwen::vision::Prepare(
+          model->tokenizer(), request.messages, {},
+          tokenization::ResolveQwenChatOptions(request.reasoning,
+                                               request.add_vision_id),
+          model->VisionEncoder()->identity(), model->MaxContext()));
   const std::vector<std::int32_t> tokens(prompt->tokens.begin(),
                                          prompt->tokens.end());
   std::string error;
@@ -185,6 +189,7 @@ int main(int argc, char** argv) {
     requests[3].messages.emplace_back(
         tokenization::ChatRole::kUser,
         "Continue counting from one, with commas between the numbers.");
+    requests[3].reasoning.enabled = false;
     auto ar = load(false);
     sampling::SamplingConfig greedy;
     greedy.temperature = 0;
@@ -325,13 +330,24 @@ int main(int argc, char** argv) {
       cache.directory = cleanup.path / (use_spec ? "spec" : "ar");
       auto first = load(use_spec, cache);
       const auto red = first->chat(requests[0], 16, greedy);
+      // Shutdown drains bounded persistence. A GPU-backed Qwen snapshot can
+      // occupy most of the staging budget; a second concurrent enqueue is
+      // allowed to miss. Qualify restoration independently of disk speed.
+      first.reset();
+      first = load(use_spec, cache);
       const auto blue = first->chat(requests[1], 16, greedy);
-      Require(red.cache_disk_write_bytes > 0 && blue.cache_disk_write_bytes > 0,
-              "image snapshots did not reach disk");
+      Require(
+          red.cache_disk_queued_bytes > 0 && blue.cache_disk_queued_bytes > 0,
+          "image snapshots did not reach disk");
       first.reset();
       auto restored = load(use_spec, cache);
       for (const auto i : {0U, 1U}) {
         const auto result = restored->chat(requests[i], 16, greedy);
+        std::cout << "disk image=" << i << " speculative=" << use_spec
+                  << " hit=" << result.cache_disk_hit
+                  << " prefill=" << result.prefill_tokens << " exact="
+                  << (result.tokens == (i == 0 ? red.tokens : blue.tokens))
+                  << '\n';
         Require(result.cache_disk_hit && result.prefill_tokens == 0 &&
                     result.tokens == (i == 0 ? red.tokens : blue.tokens),
                 "disk-restored image state or identity differs");

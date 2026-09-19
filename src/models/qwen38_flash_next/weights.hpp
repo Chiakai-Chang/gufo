@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -13,6 +14,22 @@
 #include "src/models/qwen38_flash_next/config.hpp"
 
 namespace gufo::models::qwen38_flash_next {
+
+/// Optional host destinations for independent predictor qualification.
+/// Every populated span contains one complete row (HC*H, or H for head).
+struct MtpTrace {
+  std::span<float> normalized_hidden;
+  std::span<float> fused;
+  std::span<float> attention;
+  std::span<float> hidden;
+  std::span<float> head;
+  [[nodiscard]] bool Valid(std::size_t H, std::size_t D) const noexcept {
+    for (const auto row : {normalized_hidden, fused, attention, hidden})
+      if (!row.empty() && row.size() != D)
+        return false;
+    return head.empty() || head.size() == H;
+  }
+};
 
 /// Non-owning view of one GGUF tensor. `rows` x `cols` follows the GGUF
 /// convention: cols (ne[0]) is the contiguous reduction dimension, rows
@@ -99,8 +116,8 @@ struct LayerWeights {
 
   // Speculative `nextn` block only.
   TensorRef nextn_enorm;    ///< [hidden]
-  TensorRef nextn_hnorm;    ///< [hc_dim]
-  TensorRef nextn_eh_proj;  ///< [2*hidden -> hidden], applied per stream
+  TensorRef nextn_hnorm;  ///< [hc_dim], one RMS denominator across all streams
+  TensorRef nextn_eh_proj;  ///< GGUF rows: [fc_embedding | fc_hidden]
   HcMixer nextn_head;       ///< Output mixer of the draft block.
 };
 

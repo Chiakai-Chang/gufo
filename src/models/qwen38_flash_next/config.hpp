@@ -120,6 +120,10 @@ struct Config {
            head_dim == trunk.head_dim && rotary_dim == trunk.rotary_dim &&
            rope_theta == trunk.rope_theta &&
            rope_sections == trunk.rope_sections &&
+           indexer_heads == trunk.indexer_heads &&
+           indexer_head_dim == trunk.indexer_head_dim &&
+           indexer_top_k == trunk.indexer_top_k &&
+           compress_ratio == trunk.compress_ratio &&
            num_experts == trunk.num_experts &&
            num_experts_used == trunk.num_experts_used &&
            expert_ff == trunk.expert_ff &&

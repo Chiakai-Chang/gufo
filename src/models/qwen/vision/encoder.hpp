@@ -36,6 +36,7 @@ public:
 
   using Observer =
       std::function<void(std::string_view, std::span<const float>)>;
+  using CancellationCheck = std::function<bool()>;
   Encoder(const std::filesystem::path& path, std::uint32_t output_width);
   /// An explicit sidecar is required to exist. Otherwise discover the canonical
   /// sidecar beside the target or its quantization subdirectory.
@@ -50,7 +51,8 @@ public:
   /// Serialized by the owning model scheduler. Pixel grid is already resized.
   /// Weights upload on the first image; scratch is bounded by image dimensions.
   [[nodiscard]] std::shared_ptr<const Embedding> Encode(
-      const core::Image& image, const Observer& observer = {});
+      const core::Image& image, const Observer& observer = {},
+      const CancellationCheck& is_cancelled = {});
 
 private:
   struct Impl;

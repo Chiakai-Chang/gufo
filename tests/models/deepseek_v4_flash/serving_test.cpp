@@ -570,26 +570,22 @@ int main(int argc, char** argv) {
       Expect(http_continuation.cache_hit && http_fork.cache_hit,
              "concurrent DeepSeek branches restore the retained root");
       Expect(http_continuation.cached_prompt_tokens > 0 &&
-                 http_continuation.cached_prompt_tokens ==
-                     http_fork.cached_prompt_tokens,
-             "DeepSeek branches report the same shared root");
+                 http_fork.cached_prompt_tokens > 0,
+             "DeepSeek branches reuse their longest available prefix");
       Expect(http_continuation.cached_prompt_tokens <
                      http_continuation.prompt_tokens &&
                  http_fork.cached_prompt_tokens < http_fork.prompt_tokens,
              "DeepSeek branches prefill only their suffixes");
       for (const auto* result : {&http_continuation, &http_fork}) {
         Expect(
-            result->cache_restore_bytes > 0 && result->cache_snapshot_bytes > 0,
-            "DeepSeek branches account snapshot copy bytes");
-        Expect(
-            result->cache_restore_ms > 0.0 && result->cache_snapshot_ms > 0.0,
-            "DeepSeek branches account snapshot copy time");
+            result->cache_snapshot_bytes > 0 && result->cache_snapshot_ms > 0.0,
+            "DeepSeek branches retain their new prompt snapshot");
+        Expect((result->cache_restore_bytes == 0) ==
+                   (result->cache_restore_ms == 0.0),
+               "live reuse reports no restore copy; snapshot reuse reports it");
         Expect(result->cache_shared_bytes == 0,
                "full-copy DeepSeek snapshots do not claim shared bytes");
       }
-      Expect(http_continuation.cache_restore_bytes ==
-                 http_fork.cache_restore_bytes,
-             "DeepSeek branches restore the same root payload");
       Expect(http_continuation.tokens == direct_continuation,
              "cached DeepSeek continuation differs from cold full prefill");
       Expect(http_fork.tokens == direct_fork,

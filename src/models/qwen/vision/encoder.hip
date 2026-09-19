@@ -527,7 +527,13 @@ Encoder::Embedding::~Embedding() {
 }
 
 std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
-    const core::Image& image, const Observer& observer) {
+    const core::Image& image, const Observer& observer,
+    const CancellationCheck& is_cancelled) {
+  const auto check_cancelled = [&] {
+    if (is_cancelled && is_cancelled())
+      throw std::runtime_error("vision encoding cancelled");
+  };
+  check_cancelled();
   if (image.width == 0 || image.height == 0 || image.width % 32 != 0 ||
       image.height % 32 != 0 ||
       std::uint64_t{image.width} * image.height > 16777216 ||
@@ -574,6 +580,7 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
   };
   observe("patch", hidden.As<float>(), std::size_t{count} * kHidden);
   for (unsigned layer = 0; layer < 27; ++layer) {
+    check_cancelled();
     const auto prefix = "v.blk." + std::to_string(layer) + ".";
     LayerNorm<<<count, kThreads, 0, stream>>>(
         hidden.As<float>(), normalized.As<Bf16>(),
@@ -589,6 +596,7 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
                         impl_->FloatWeight(prefix + "attn_qkv.bias"), q, k, v,
                         count, image.width / 16);
     for (unsigned begin = 0; begin < count; begin += tile) {
+      check_cancelled();
       const unsigned rows = std::min(tile, count - begin);
       constexpr float zero = 0, one = 1;
       CheckBlas(hipblasGemmStridedBatchedEx(
@@ -655,6 +663,7 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
                      merged * embedding->width_, embedding->width_);
   Check(hipGetLastError());
   Check(hipStreamSynchronize(stream));
+  check_cancelled();
   observe("embedding", embedding->data_,
           std::size_t{merged} * embedding->width_);
   return embedding;

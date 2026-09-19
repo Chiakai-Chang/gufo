@@ -15,6 +15,12 @@
 /// pointers in their GGUF encoding.
 namespace gufo::models::qwen38_flash_next::rocm {
 
+/// Stable per-prefix rollback addresses. Growing the depth does not move
+/// existing buffers or invalidate graphs captured for a smaller batch.
+struct RollbackRows {
+  float* rows[7]{};
+};
+
 /// GGUF type ids the runtime accepts for the small-matrix and lookup paths.
 enum class WeightType : std::uint32_t {
   kF32 = 0,
@@ -237,11 +243,11 @@ void PleGate(const float* key_n, const float* query_n, const float* value,
 /// out[t][c] = silu(sum_k w[c*kernel+k] * in[t - (kernel-1-k)*dilation][c]),
 /// where tokens before the chunk come from `history` ([hist][channels],
 /// oldest first). `history` is then advanced past the chunk.
-/// `snapshots`, when non-null, receives the history as it stands after
+/// `snapshots`, when populated, receives the history as it stands after
 /// each proper prefix: [n_tokens-1][hist][channels]. The full batch's
 /// history remains in `history`.
 void PleConv(const float* in, const float* w, float* history,
-             float* history_scratch, float* out, float* snapshots,
+             float* history_scratch, float* out, RollbackRows snapshots,
              std::uint32_t n_tokens, std::uint32_t channels,
              std::uint32_t kernel, std::uint32_t dilation, hipStream_t stream);
 
@@ -257,7 +263,7 @@ void PleInject(float* res, const float* gated, const float* conv,
 /// sigmoid-gated attention rows [tokens][v_heads*d] ready for the output
 /// projection.
 /// `state_snapshots` ([n_tokens-1][v_heads*d*d]) and `conv_snapshots`
-/// ([n_tokens-1][(kernel-1)*channels]), when non-null, receive the state after
+/// ([n_tokens-1][(kernel-1)*channels]), when populated, receive the state after
 /// each proper prefix. The live state already holds the full batch.
 /// Scratch: `conv_scratch` ((n_tokens + kernel) * channels), `qn`/`kn`
 /// (n_tokens * k_heads * d), `raw` (n_tokens * v_heads * d).
@@ -273,11 +279,12 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    const float* conv_w, const float* a, const float* dt,
                    const float* norm_w, float* conv_state, float* conv_scratch,
                    float* qn, float* kn, float* raw, float* state, float* out,
-                   void* out_q8, float* state_snapshots, float* conv_snapshots,
-                   std::uint32_t n_tokens, std::uint32_t k_heads,
-                   std::uint32_t v_heads, std::uint32_t d, std::uint32_t kernel,
-                   bool row_split, bool convolved, float eps,
-                   hipStream_t stream, __half* out_half = nullptr);
+                   void* out_q8, RollbackRows state_snapshots,
+                   RollbackRows conv_snapshots, std::uint32_t n_tokens,
+                   std::uint32_t k_heads, std::uint32_t v_heads,
+                   std::uint32_t d, std::uint32_t kernel, bool row_split,
+                   bool convolved, float eps, hipStream_t stream,
+                   __half* out_half = nullptr);
 
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row
@@ -336,9 +343,9 @@ void PoolIndexerBlocks(const float* raw_keys, const float* gamma,
 /// complete block below its own tail, keeps the `budget` highest, and
 /// writes a visibility bitmap (`mask_words` uint32 per query, bit b = block
 /// b visible). Every block is visible when the count fits the budget.
-/// Inputs contain the F16 values consumed by the matrix cores; scores
+/// Queries retain F32 precision; pooled cache keys are F16. Scores
 /// still accumulate in FP32. `scores` holds n_tokens * max_blocks floats.
-void SelectBlocks(const __half* q, const __half* blocks, std::uint32_t* mask,
+void SelectBlocks(const float* q, const __half* blocks, std::uint32_t* mask,
                   float* scores, std::uint32_t n_tokens,
                   const std::uint32_t* start_pos, std::uint32_t first_token,
                   std::uint32_t heads, std::uint32_t dim, std::uint32_t ratio,
@@ -401,16 +408,15 @@ void MoeEpilogueVec4F16(const __half* expert_out, const float* weights,
                         std::uint32_t n_tokens, std::uint32_t k,
                         std::uint32_t dim, hipStream_t stream);
 
-/// MTP input: res[t][s][i] = eh_proj( [enorm(embd[t]) ; hnorm(h[t][s])] ) is
-/// assembled here as concat[t][s][2*hidden] for the tier's GEMM.
 /// dst[t] = *row < 0 ? alt[t] : base[*row + t] (rows of `width` floats).
 void MtpHidden(const float* base, const float* alt, const std::int32_t* row,
                float* dst, std::uint32_t n_tokens, std::uint32_t width,
                hipStream_t stream);
 
-void MtpConcat(const float* embd_n, const float* h_n, float* concat,
-               std::uint32_t n_tokens, std::uint32_t hidden,
-               std::uint32_t streams, hipStream_t stream);
+/// Add the projected embedding once to each projected hidden branch.
+void MtpAddEmbedding(const float* embedding, float* residual,
+                     std::uint32_t n_tokens, std::uint32_t hidden,
+                     std::uint32_t streams, hipStream_t stream);
 
 inline constexpr std::uint32_t kArgmaxParts = 64;
 struct ArgmaxCandidate {
@@ -429,11 +435,8 @@ void GatherArgmaxCandidates(const float* logits, const std::uint32_t* ids,
                             ArgmaxCandidate* out, std::uint32_t rows,
                             std::uint32_t vocab, hipStream_t stream);
 
-inline constexpr std::uint32_t kMtpShortlist = 256;
 /// Number of IDs in each of the two selection buffers.
-inline constexpr std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
-  return ((vocab + 1023) / 1024) * kMtpShortlist;
-}
+std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab);
 
 /// Exact MTP top-64 selection, descending score with lowest-token-ID ties.
 /// Nonfinite scores become -infinity. Both ID buffers have room for
@@ -443,17 +446,6 @@ inline constexpr std::uint32_t MtpCandidateWorkspaceSize(std::uint32_t vocab) {
 void MtpTopCandidates(const float* logits, std::uint32_t* ids,
                       std::uint32_t* scratch_ids, float* scores,
                       std::uint32_t vocab, hipStream_t stream);
-
-/// Select min(vocab, kMtpShortlist) IDs before Q8 rescoring.
-void MtpShortlist(const float* logits, std::uint32_t* ids,
-                  std::uint32_t* scratch_ids, std::uint32_t vocab,
-                  hipStream_t stream);
-
-/// Sort rescored shortlist IDs in place and emit the top 64 and their logits.
-/// Ties use the lowest token ID, irrespective of the shortlist's input order.
-void MtpRescoredCandidates(const float* logits, std::uint32_t* ids,
-                           float* scores, std::uint32_t vocab,
-                           hipStream_t stream);
 
 }  // namespace gufo::models::qwen38_flash_next::rocm
 

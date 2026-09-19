@@ -153,7 +153,39 @@ void TestOrderedFilterChain() {
   parameters.uniform = 0.99F;
 
   Expect(Sample(logits, parameters) == 1U,
-         "ordered route applies top-k, top-p, min-p, then temperature");
+         "ordered route applies temperature, top-k, top-p, then min-p");
+}
+
+void TestTemperedFilterExpectations() {
+  // Expected sets come from softmax([0,-1,-2]/T), not the CPU sampler.
+  for (const std::size_t size : {3U, 131072U}) {
+    std::vector<float> logits(size, -1000.0F);
+    logits[0] = 0;
+    logits[1] = -1;
+    logits[2] = -2;
+    for (const bool nucleus : {false, true}) {
+      gufo::hip::GpuSamplingParameters parameters{.temperature = 0.5F};
+      parameters.top_p = nucleus ? 0.8F : 1.0F;
+      parameters.min_p = nucleus ? 0.0F : 0.2F;
+      parameters.uniform = 0.99F;
+      Expect(Sample(logits, parameters) == 0,
+             "tempered filters must exclude the second token");
+      const std::vector<std::uint32_t> ids{1};
+      const std::vector<float> probabilities{1};
+      const auto rejected = SampleSpeculatively(logits, parameters, 1, 1, ids,
+                                                probabilities, 0, 0.99F);
+      Expect(!rejected.accepted && rejected.token == 0,
+             "verification and residual use the tempered target support");
+      parameters.temperature = 2.0F;
+      parameters.min_p = nucleus ? 0.0F : 0.5F;
+      Expect(Sample(logits, parameters) == 1,
+             "higher temperature retains the second token");
+      const auto accepted = SampleSpeculatively(logits, parameters, 1, 1, ids,
+                                                probabilities, 0.3F, 0.99F);
+      Expect(accepted.accepted && accepted.token == 1,
+             "acceptance uses the flattened target probability");
+    }
+  }
 }
 
 void TestTopKOneIsDeterministic() {
@@ -653,6 +685,7 @@ int main() {
   TestGreedySparsePenalty();
   TestLinearTemperatureAndMinP();
   TestOrderedFilterChain();
+  TestTemperedFilterExpectations();
   TestTopKOneIsDeterministic();
   TestTopKOneRespectsMinimumKeep();
   TestFilterCombinations();

@@ -2,6 +2,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -99,11 +100,10 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
       blocks[static_cast<std::size_t>(row) * kDim] = 1.0F;
     }
   }
-  std::vector<__half> q_half(qv.size()), blocks_half(blocks.size());
+  std::vector<__half> blocks_half(blocks.size());
   const auto half = [](float value) { return __float2half_rn(value); };
-  std::transform(qv.begin(), qv.end(), q_half.begin(), half);
   std::transform(blocks.begin(), blocks.end(), blocks_half.begin(), half);
-  __half* d_q = Upload(q_half);
+  float* d_q = Upload(qv);
   __half* d_blocks = Upload(blocks_half);
   std::uint32_t* d_pos = Upload(std::vector<std::uint32_t>{start_pos});
   std::uint32_t* d_mask = Upload(std::vector<std::uint32_t>(
@@ -144,17 +144,30 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
       if (sample_scores && b % 1024 != 0 && b + 1 != complete)
         continue;
       double total = 0.0;
+      float rounded_total = 0.0F;
       for (std::uint32_t h = 0; h < kHeads; ++h) {
         double dot = 0.0;
+        std::array<float, 32> partial{};
         for (std::uint32_t i = 0; i < kDim; ++i) {
-          dot +=
-              static_cast<double>(
-                  qv[(static_cast<std::size_t>(t) * kHeads + h) * kDim + i]) *
-              blocks[static_cast<std::size_t>(b) * kDim + i];
+          const auto query =
+              qv[(static_cast<std::size_t>(t) * kHeads + h) * kDim + i];
+          const auto key =
+              __half2float(blocks_half[static_cast<std::size_t>(b) * kDim + i]);
+          dot += static_cast<double>(query) * key;
+          partial[i % 32] = std::fma(query, key, partial[i % 32]);
         }
         total += std::max(dot, 0.0);
+        for (unsigned delta = 16; delta; delta >>= 1)
+          for (unsigned lane = 0; lane < delta; ++lane)
+            partial[lane] += partial[lane + delta];
+        rounded_total += std::max(partial[0], 0.0F);
       }
       const float got = scores[static_cast<std::size_t>(t) * max_blocks + b];
+      // A loose numerical tolerance cannot detect exchanges at the top-k
+      // boundary. Keep the established F32 reduction as well as the FP64
+      // formula check below when changing kernel layout.
+      if (got != rounded_total)
+        throw std::runtime_error("selector changed the F32 reduction");
       const double err = std::abs(total - got) / std::max(1.0, total);
       worst_score = std::max(worst_score, err);
     }
@@ -191,9 +204,35 @@ bool Run(std::uint32_t n_tokens, std::uint32_t start_pos, std::uint32_t seed,
   (void)hipFree(d_pos);
   (void)hipFree(d_mask);
   (void)hipFree(d_scores);
-  // The scores ride F16 fragments on the matrix cores, so they agree with
-  // the F64 reference to about 1e-3; the mask is exact over the GPU scores.
-  return worst_score < 1e-2 && mismatches == 0;
+  // F32 queries against the stored F16 keys, independently scored in F64.
+  return worst_score < 1e-5 && mismatches == 0;
+}
+
+void CheckQueryPrecisionBoundary() {
+  constexpr unsigned blocks = kBudget + 1, words = (blocks + 31) / 32;
+  std::vector<float> queries(kHeads * kDim, 0);
+  queries[0] = 1.0F;
+  queries[1] = 1.0001F;  // Both become 1.0 in F16.
+  std::vector<__half> keys(blocks * kDim, __float2half(0));
+  for (unsigned b = 0; b < kBudget - 1; ++b)
+    keys[b * kDim] = __float2half(2);
+  keys[(kBudget - 1) * kDim] = __float2half(1);
+  keys[kBudget * kDim + 1] = __float2half(1);
+  auto* dq = Upload(queries);
+  auto* dk = Upload(keys);
+  auto* dp = Upload(std::vector<unsigned>{blocks * kRatio - 1});
+  auto* dm = Upload(std::vector<unsigned>(words, 0));
+  auto* ds = Upload(std::vector<float>(blocks, 0));
+  q::SelectBlocks(dq, dk, dm, ds, 1, dp, 0, kHeads, kDim, kRatio, kBudget,
+                  words, blocks, nullptr);
+  const auto mask = Download(dm, words);
+  if ((mask[(kBudget - 1) / 32] & (1U << ((kBudget - 1) % 32))) != 0 ||
+      (mask[kBudget / 32] & (1U << (kBudget % 32))) == 0)
+    throw std::runtime_error("F16 narrowing changed the top-k boundary");
+  for (void* p :
+       {static_cast<void*>(dq), static_cast<void*>(dk), static_cast<void*>(dp),
+        static_cast<void*>(dm), static_cast<void*>(ds)})
+    CheckHip(hipFree(p), "free precision probe");
 }
 
 void CheckPooling(unsigned start, unsigned capacity) {
@@ -282,6 +321,7 @@ void CheckPooling(unsigned start, unsigned capacity) {
 
 int main() {
   try {
+    CheckQueryPrecisionBoundary();
     CheckPooling(29, 64);
     CheckPooling(29, 16);     // batch wraps the raw-key ring
     CheckPooling(65533, 16);  // many wraps; absolute rotary position retained

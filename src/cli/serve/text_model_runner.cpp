@@ -239,17 +239,19 @@ std::string_view DiskEventReasonName(
       return "serialization_failure";
     case ContinuationDiskEventReason::kRestoreFailure:
       return "restore_failure";
+    case ContinuationDiskEventReason::kBusy:
+      return "busy";
   }
   return "unknown";
 }
 
 void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
   switch (event.reason) {
-    case ContinuationDiskEventReason::kSaved:
     case ContinuationDiskEventReason::kHit:
     case ContinuationDiskEventReason::kNotFound:
     case ContinuationDiskEventReason::kLru:
     case ContinuationDiskEventReason::kExactReplacement:
+    case ContinuationDiskEventReason::kBusy:
       return;
     case ContinuationDiskEventReason::kByteCapacity:
       if (event.action == ContinuationDiskEventAction::kRemoved)
@@ -267,7 +269,12 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
          << " tokens=" << event.token_count
          << " retained_bytes=" << event.retained_bytes
          << " capacity_bytes=" << event.capacity_bytes;
-    Logger::Warn("cache", line.str());
+    if (event.reason == ContinuationDiskEventReason::kSaved) {
+      line << " write_ms=" << event.elapsed_ms;
+      Logger::Info("cache", line.str());
+    } else {
+      Logger::Warn("cache", line.str());
+    }
   } catch (...) {
     // Cache logging must not affect request execution.
   }
@@ -417,6 +424,15 @@ struct TextRunnerPool::Impl {
   std::size_t shared_prefix_max_boundaries{0};
 };
 
+void TextModelRunner::StreamPersistentSnapshot(
+    const TextRunnerSnapshot& snapshot, const SnapshotSink& sink) const {
+  std::vector<std::uint8_t> payload(PersistentSnapshotPayloadBytes(snapshot));
+  if (SerializePersistentSnapshot(snapshot, payload) != payload.size()) {
+    throw std::runtime_error("persistent snapshot byte count mismatch");
+  }
+  sink(payload);
+}
+
 struct TextRunnerPool::Request::Impl {
   Impl(std::shared_ptr<TextModelRunner> model_runner,
        std::shared_ptr<ContinuationDiskStore> persistent_store,
@@ -424,7 +440,6 @@ struct TextRunnerPool::Request::Impl {
        std::vector<TextRunnerToken> prompt_tokens,
        std::vector<std::size_t> shared_prefix_boundaries,
        const sampling::SamplingConfig& sampling_config,
-       const CancellationCheck& is_cancelled,
        std::shared_ptr<const TextPromptContext> prompt_context)
       : runner(std::move(model_runner)),
         disk_store(std::move(persistent_store)),
@@ -436,8 +451,6 @@ struct TextRunnerPool::Request::Impl {
         sampler(sampling_config, prompt),
         context(std::move(prompt_context)) {
     auto& state = dynamic_cast<TextRunnerState&>(lease.state());
-    state.SetCancellationCheck(is_cancelled);
-    runner->SetPromptContext(state, context);
     if (lease.cache_hit()) {
       runner->PreparePrefixReuse(
           state,
@@ -462,7 +475,8 @@ struct TextRunnerPool::Request::Impl {
       return;
     }
     if (lease.cache_hit() && !lease.restored_from_disk() &&
-        lease.cached_tokens() == prompt.size()) {
+        lease.cached_tokens() == prompt.size() &&
+        lease.HasSnapshotFor(prompt)) {
       return;
     }
 
@@ -492,8 +506,15 @@ struct TextRunnerPool::Request::Impl {
     } catch (...) {
       return;
     }
-    if (!retain_snapshot && disk_store == nullptr) {
-      return;
+    if (!retain_snapshot) {
+      try {
+        if (disk_store == nullptr ||
+            !disk_store->CanSave(*runner, prompt.size(), snapshot_bytes,
+                                 InputIdentity()))
+          return;
+      } catch (...) {
+        return;
+      }
     }
 
     const auto snapshot_start = std::chrono::steady_clock::now();
@@ -527,16 +548,34 @@ struct TextRunnerPool::Request::Impl {
                          prompt_snapshot->PayloadBytes(), prompt.size());
       retain_snapshot = false;
     }
-    retain_prompt_snapshot = retain_snapshot;
+    // Charge disk-only snapshots immediately. Holding them until commit would
+    // let concurrent requests each pass the same queue-capacity preflight.
+    const bool already_persisted =
+        lease.restored_from_disk() && lease.cached_tokens() == prompt.size();
+    if (disk_store && !already_persisted) {
+      const auto started = std::chrono::steady_clock::now();
+      try {
+        snapshot_metrics.disk_queued_bytes = disk_store->SaveAsync(
+            runner, prompt, prompt_snapshot,
+            {InputIdentity().begin(), InputIdentity().end()});
+      } catch (...) {
+        snapshot_metrics.disk_queued_bytes = 0;
+      }
+      snapshot_metrics.disk_enqueue_ms =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - started)
+              .count();
+    }
+    if (!retain_snapshot)
+      prompt_snapshot.reset();
   }
 
   /// Persists the continuation at a shared-prefix boundary reached by prefill.
   ///
   /// The boundary was learned from stored entries that agree with this prompt
   /// up to `position`, so the next conversation sharing that prefix restores
-  /// it instead of prefilling it again. Written synchronously: it happens once
-  /// per distinct shared prefix, and holding snapshots until commit would keep
-  /// them in memory for the whole generation.
+  /// it instead of prefilling it again. The bounded worker persists the
+  /// immutable snapshot without blocking other requests on disk I/O.
   void CaptureSharedPrefix(std::size_t position) noexcept {
     if (disk_store == nullptr || position == 0 || position >= prompt.size()) {
       return;
@@ -559,16 +598,21 @@ struct TextRunnerPool::Request::Impl {
       if (disk_store->Touch(*runner, prefix, InputIdentity())) {
         return;
       }
-      (void)runner->SnapshotPayloadBytes(state);
-      const auto snapshot = runner->Snapshot(state);
+      if (!disk_store->CanSave(*runner, position,
+                               runner->SnapshotPayloadBytes(state),
+                               InputIdentity()))
+        return;
+      std::shared_ptr<const TextRunnerSnapshot> snapshot =
+          runner->Snapshot(state);
       if (snapshot == nullptr) {
         return;
       }
-      const auto saved =
-          disk_store->Save(*runner, prefix, *snapshot, InputIdentity());
-      if (saved.stored) {
+      const auto saved = disk_store->SaveAsync(
+          runner, {prefix.begin(), prefix.end()}, std::move(snapshot),
+          {InputIdentity().begin(), InputIdentity().end()});
+      if (saved != 0) {
         ++snapshot_metrics.shared_prefix_snapshots;
-        snapshot_metrics.shared_prefix_bytes += saved.file_bytes;
+        snapshot_metrics.shared_prefix_bytes += saved;
       }
     } catch (...) {
       // Best effort: the request itself is unaffected.
@@ -601,18 +645,28 @@ struct TextRunnerPool::Request::Impl {
                    : std::span<const std::uint8_t>{};
   }
   bool prompt_snapshot_attempted{false};
-  bool retain_prompt_snapshot{false};
-  std::unique_ptr<TextRunnerSnapshot> prompt_snapshot;
+  std::shared_ptr<const TextRunnerSnapshot> prompt_snapshot;
   TextRunnerPool::Request::CommitMetrics snapshot_metrics;
 };
 
 TextRunnerPool::Request::Request() = default;
 
 TextRunnerPool::Request::Request(std::unique_ptr<Impl> impl)
-    : impl_(std::move(impl)) {
-  if (impl_ != nullptr) {
+    : impl_(std::move(impl)) {}
+
+void TextRunnerPool::Request::CapturePromptSnapshot() {
+  if (impl_)
     impl_->CapturePromptSnapshot();
-  }
+}
+
+std::optional<TextDecodeSelection>
+TextRunnerPool::Request::PreviewFirstToken() {
+  if (!impl_ || !impl_->decode_ready || !impl_->generated.empty() ||
+      impl_->pending_selection || impl_->stopped)
+    return std::nullopt;
+  auto sampler = impl_->sampler;
+  return impl_->runner->PreviewFirstToken(
+      dynamic_cast<TextRunnerState&>(impl_->lease.state()), sampler);
 }
 
 TextRunnerPool::Request::~Request() = default;
@@ -716,9 +770,6 @@ TextPrefillStep TextRunnerPool::Request::Prefill(std::size_t max_input_tokens) {
     impl_->boundaries.erase(impl_->boundaries.begin());
     impl_->CaptureSharedPrefix(impl_->prefill_offset);
   }
-  if (reached_frontier) {
-    impl_->CapturePromptSnapshot();
-  }
   return step;
 }
 
@@ -758,6 +809,7 @@ void TextRunnerPool::Request::Advance() {
     throw std::logic_error(
         "text runner request has no selected token to advance");
   }
+  impl_->CapturePromptSnapshot();
   impl_->runner->Advance(dynamic_cast<TextRunnerState&>(impl_->lease.state()),
                          impl_->pending_selection->token);
   impl_->pending_selection.reset();
@@ -783,6 +835,7 @@ TextDecodeStep TextRunnerPool::Request::DecodeStep(std::size_t max_tokens) {
         "text runner decode step budget must be at least one token");
   }
 
+  impl_->CapturePromptSnapshot();
   auto step = impl_->runner->DecodeStep(
       dynamic_cast<TextRunnerState&>(impl_->lease.state()), max_tokens,
       impl_->sampler);
@@ -818,6 +871,7 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
     impl_->pending_selection.reset();
   }
 
+  impl_->CapturePromptSnapshot();
   auto& state = dynamic_cast<TextRunnerState&>(impl_->lease.state());
   state.SetCancellationCheck({});
   if (!impl_->runner->Descriptor().capabilities.prefix_reuse) {
@@ -826,31 +880,6 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
     return {};
   }
   const auto capabilities = impl_->runner->Descriptor().capabilities;
-  if (capabilities.snapshot && capabilities.fork) {
-    CommitMetrics metrics = impl_->snapshot_metrics;
-    if (impl_->prompt_snapshot != nullptr && impl_->disk_store != nullptr) {
-      const auto disk_start = std::chrono::steady_clock::now();
-      try {
-        const auto saved = impl_->disk_store->Save(
-            *impl_->runner, impl_->prompt, *impl_->prompt_snapshot,
-            impl_->InputIdentity());
-        metrics.disk_write_bytes = saved.file_bytes;
-      } catch (...) {
-        metrics.disk_write_bytes = 0;
-      }
-      metrics.disk_write_ms = std::chrono::duration<double, std::milli>(
-                                  std::chrono::steady_clock::now() - disk_start)
-                                  .count();
-    }
-    if (!impl_->retain_prompt_snapshot) {
-      impl_->prompt_snapshot.reset();
-    }
-    metrics.snapshot_bytes = impl_->lease.Commit(
-        std::move(impl_->prompt), std::move(impl_->prompt_snapshot));
-    impl_.reset();
-    return metrics;
-  }
-
   std::vector<ContinuationToken> checkpoint = impl_->prompt;
   checkpoint.insert(checkpoint.end(), impl_->generated.begin(),
                     impl_->generated.end());
@@ -860,6 +889,15 @@ TextRunnerPool::Request::CommitMetrics TextRunnerPool::Request::Commit() {
         "text runner checkpoint is outside executed token history");
   }
   checkpoint.resize(position);
+  if (capabilities.snapshot && capabilities.fork) {
+    CommitMetrics metrics = impl_->snapshot_metrics;
+    metrics.snapshot_bytes = impl_->lease.Commit(
+        std::move(impl_->prompt), std::move(impl_->prompt_snapshot),
+        std::move(checkpoint));
+    impl_.reset();
+    return metrics;
+  }
+
   std::unique_ptr<TextRunnerSnapshot> snapshot;
   CommitMetrics metrics;
   metrics.snapshot_bytes =
@@ -968,6 +1006,8 @@ void TextRunnerPool::AdvanceBatch(std::span<Request*> requests,
     });
   }
 
+  for (auto* request : requests)
+    request->CapturePromptSnapshot();
   impl_->validated.runner->AdvanceBatch(advances);
   for (auto* request : requests) {
     request->impl_->pending_selection.reset();
@@ -1012,6 +1052,8 @@ std::vector<TextDecodeStep> TextRunnerPool::DecodeBatch(
     });
   }
 
+  for (auto* request : requests)
+    request->CapturePromptSnapshot();
   auto steps = impl_->validated.runner->DecodeBatch(decodes);
   if (steps.size() != requests.size()) {
     throw std::runtime_error(
@@ -1061,7 +1103,12 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   const std::span<const std::uint8_t> identity =
       context ? std::span<const std::uint8_t>(context->cache_identity)
               : std::span<const std::uint8_t>{};
-  auto lease = impl_->cache.Acquire(prompt, is_cancelled, identity);
+  auto lease = impl_->cache.Acquire(
+      prompt, is_cancelled, identity, [&](ContinuationState& state) {
+        auto& text_state = dynamic_cast<TextRunnerState&>(state);
+        text_state.SetCancellationCheck(is_cancelled);
+        impl_->validated.runner->SetPromptContext(text_state, context);
+      });
   if (!lease) {
     return {};
   }
@@ -1078,9 +1125,16 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - restore_start)
                 .count());
+      } else {
+        auto& state = dynamic_cast<TextRunnerState&>(lease.state());
+        state.SetCancellationCheck(is_cancelled);
+        impl_->validated.runner->SetPromptContext(state, context);
       }
     } catch (...) {
       lease.state().Invalidate();
+      auto& state = dynamic_cast<TextRunnerState&>(lease.state());
+      state.SetCancellationCheck(is_cancelled);
+      impl_->validated.runner->SetPromptContext(state, context);
     }
   }
   std::vector<std::size_t> boundaries;
@@ -1098,7 +1152,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   }
   return Request(std::make_unique<Request::Impl>(
       impl_->validated.runner, impl_->disk_store, std::move(lease),
-      std::move(prompt), std::move(boundaries), sampling_config, is_cancelled,
+      std::move(prompt), std::move(boundaries), sampling_config,
       std::move(context)));
 }
 

@@ -30,6 +30,158 @@ void RequireExact(std::span<const float> expected,
           message);
 }
 
+void CheckFailureRecovery(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  auto session = model->CreateSession(4096, &error);
+  Require(session != nullptr, error);
+  const auto initial_bytes = session->AllocatedBytes();
+  Require(model->SessionBytes(4096) > initial_bytes + 700ULL * 1024 * 1024,
+          "unused deep rollback state was allocated eagerly");
+  const auto pattern =
+      model->Tokenize("Explain virtual memory in a short sentence.");
+  std::vector<std::int32_t> prompt(2048);
+  for (std::size_t i = 0; i < prompt.size(); ++i)
+    prompt[i] = pattern[i % pattern.size()];
+  Require(session->Sync(prompt, &error), error);
+  const std::vector<float> expected(session->Logits().begin(),
+                                    session->Logits().end());
+  const auto snapshot = session->SaveSnapshot(&error);
+  Require(snapshot != nullptr, error);
+  Require(snapshot->SizeBytes() < 200ULL * 1024 * 1024,
+          "short prompt snapshot retains a full prefill hidden buffer");
+
+  unsigned checks = 0;
+  session->SetCancellationCheck([&] { return ++checks >= 6; });
+  Require(!session->Evaluate(prompt.front(), &error) && !session->IsValid(),
+          "cancelled mutation left a reusable session");
+  Require(session->Tokens().empty() && session->Logits().empty() &&
+              !session->SaveSnapshot(&error),
+          "poisoned state exposed reusable tokens, logits or a snapshot");
+  session->SetCancellationCheck({});
+  Require(session->Sync(prompt, &error) && session->IsValid(), error);
+  RequireExact(expected, session->Logits(),
+               "Sync reused partially mutated state");
+
+  checks = 0;
+  session->SetCancellationCheck([&] { return ++checks >= 3; });
+  Require(!session->RestoreSnapshot(*snapshot, &error),
+          "snapshot restoration ignored cancellation");
+  session->SetCancellationCheck({});
+  Require(session->Sync(prompt, &error), error);
+  RequireExact(expected, session->Logits(),
+               "cancelled restore leaked device state");
+  Require(session->AllocatedBytes() == initial_bytes,
+          "reset retained rollback allocations");
+  std::cout
+      << "cancelled forward/restore recover exactly; rollback starts empty\n";
+}
+
+void CheckRollbackReuse(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  const auto prompt = model->Tokenize("Continue: red, blue, red, blue,");
+  const auto context = static_cast<std::uint32_t>(prompt.size() + 4);
+  auto session = model->CreateSession(context, &error);
+  Require(session != nullptr, error);
+  const auto empty_bytes = session->AllocatedBytes();
+  Require(session->Sync(prompt, &error), error);
+  sampling::SamplerState sampler(
+      {.seed = 73},
+      std::vector<sampling::TokenId>(prompt.begin(), prompt.end()));
+  qfn::Session::DecodeResult step;
+  Require(session->DecodeStep(2, sampler, &step, &error, false), error);
+  const auto warm_bytes = session->AllocatedBytes();
+  Require(
+      warm_bytes > empty_bytes && warm_bytes <= model->SessionBytes(context),
+      "rollback allocation exceeded its configured bound");
+  session->ResetDraftPolicy();
+  const auto warm = session->SaveSnapshot(&error);
+  Require(warm && session->RestoreSnapshot(*warm, &error), error);
+  Require(session->AllocatedBytes() == warm_bytes,
+          "restore discarded reusable rollback or allocated deeper rows");
+  auto replay_sampler = sampler;
+  qfn::Session::DecodeResult expected, actual;
+  Require(session->DecodeStep(2, sampler, &expected, &error, false), error);
+  const std::vector<float> logits(session->Logits().begin(),
+                                  session->Logits().end());
+  Require(session->RestoreSnapshot(*warm, &error) &&
+              session->DecodeStep(2, replay_sampler, &actual, &error, false),
+          error);
+  Require(actual.tokens == expected.tokens &&
+              sampler.rng_state() == replay_sampler.rng_state(),
+          "reused rollback changed continuation replay");
+  RequireExact(logits, session->Logits(), "reused rollback changed logits");
+  while (session->Position() < context)
+    Require(session->Evaluate(prompt.front(), &error), error);
+  const auto full = session->SaveSnapshot(&error);
+  Require(full && session->RestoreSnapshot(*full, &error), error);
+  Require(session->AllocatedBytes() == empty_bytes,
+          "restore kept rollback that the restored context cannot use");
+  session->Reset();
+  Require(session->AllocatedBytes() == empty_bytes,
+          "explicit reset retained rollback");
+  std::cout
+      << "rollback restore is bounded, reuses warm rows and replays exactly\n";
+}
+
+void CheckImageSnapshotAttachment(const std::shared_ptr<qfn::Model>& model) {
+  namespace vision = gufo::models::qwen::vision;
+  if (!model->VisionEncoder()) {
+    std::cout
+        << "image snapshot attachment: matching vision sidecar unavailable\n";
+    return;
+  }
+  const auto image = [](bool blue) {
+    auto prompt = std::make_shared<vision::Prompt>();
+    const vision::ImageGrid grid{0, 2, 2};
+    prompt->tokens = {vision::kImageToken, vision::kImageToken,
+                      vision::kImageToken, vision::kImageToken, 42};
+    prompt->rope.images.push_back(grid);
+    gufo::core::Image pixels;
+    pixels.width = pixels.height = 64;
+    pixels.pixels.resize(64 * 64 * 3);
+    for (std::size_t i = blue ? 2 : 0; i < pixels.pixels.size(); i += 3)
+      pixels.pixels[i] = 255;
+    prompt->images.push_back({std::move(pixels), grid});
+    prompt->cache_identity.assign(32, blue ? 2 : 1);
+    return prompt;
+  };
+  const auto red = image(false), blue = image(true);
+  const std::vector<std::int32_t> tokens(red->tokens.begin(),
+                                         red->tokens.end());
+  std::string error;
+  auto origin = model->CreateSession(64, &error);
+  auto restored = model->CreateSession(64, &error);
+  auto text = model->CreateSession(64, &error);
+  Require(origin && restored && text, error);
+  origin->ConfigureVision(red);
+  Require(origin->Sync(std::span(tokens).first(2), &error), error);
+  const auto snapshot = origin->SaveSnapshot(&error);
+  Require(snapshot != nullptr, error);
+  Require(!restored->RestoreSnapshot(*snapshot, &error),
+          "image snapshot restored without pixels");
+  restored->ConfigureVision(blue);
+  Require(restored->Sync(std::span(tokens).first(2), &error), error);
+  Require(!restored->RestoreSnapshot(*snapshot, &error),
+          "image snapshot inherited another image's pixels");
+  restored->ConfigureVision(red);
+  Require(restored->RestoreSnapshot(*snapshot, &error) &&
+              restored->Sync(tokens, &error) && origin->Sync(tokens, &error),
+          error);
+  RequireExact(origin->Logits(), restored->Logits(),
+               "attached image snapshot changed continuation logits");
+
+  const std::array<std::int32_t, 2> plain{42, 43};
+  Require(text->Sync(plain, &error), error);
+  const auto text_snapshot = text->SaveSnapshot(&error);
+  Require(text_snapshot && restored->RestoreSnapshot(*text_snapshot, &error),
+          error);
+  Require(text->Evaluate(44, &error) && restored->Evaluate(44, &error), error);
+  RequireExact(text->Logits(), restored->Logits(),
+               "text snapshot retained stale image input");
+  std::cout
+      << "image snapshot attachment, replacement and text restore exact\n";
+}
+
 void CheckPrefillChunks(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   const auto pattern = model->Tokenize(
@@ -298,11 +450,12 @@ void CheckServingSampling(const std::shared_ptr<qfn::Model>& model) {
         const auto& saved = references[(offset + row) % references.size()];
         const auto& expected = use_mtp ? saved.mtp : saved.ar;
         const auto actual = pending[row].get();
-        Require(
-            actual.tokens == expected.tokens &&
-                actual.draft_tokens == expected.draft_tokens &&
-                actual.draft_accepted_tokens == expected.draft_accepted_tokens,
-            "interleaving changed serving sampling or acceptance");
+        Require(actual.tokens == expected.tokens &&
+                    (!saved.test.config.uses_random_sampling() ||
+                     (actual.draft_tokens == expected.draft_tokens &&
+                      actual.draft_accepted_tokens ==
+                          expected.draft_accepted_tokens)),
+                "interleaving changed serving sampling or acceptance");
         if (actual.physical_execution_width > 1) {
           Require(actual.physical_execution_width == 2 &&
                       actual.execution_plan == "batched-w2",
@@ -350,11 +503,13 @@ int main(int argc, char** argv) {
       argc == 6 && std::string_view(argv[5]) == "--batch-only";
   const bool prefill_only =
       argc == 6 && std::string_view(argv[5]) == "--prefill-only";
-  if ((argc != 5 && !batch_only && !prefill_only) ||
+  const bool sampling_only =
+      argc == 6 && std::string_view(argv[5]) == "--sampling-only";
+  if ((argc != 5 && !batch_only && !prefill_only && !sampling_only) ||
       std::string_view(argv[1]) != "--model" ||
       std::string_view(argv[3]) != "--mtp-model") {
     std::cerr << "Usage: session_test --model FIRST.gguf --mtp-model MTP.gguf "
-                 "[--batch-only | --prefill-only]\n";
+                 "[--batch-only | --prefill-only | --sampling-only]\n";
     return 77;
   }
   try {
@@ -364,10 +519,17 @@ int main(int argc, char** argv) {
         {.max_context = 6145, .mtp_model_path = argv[4], .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
+    if (sampling_only) {
+      CheckServingSampling(model);
+      return 0;
+    }
     if (!batch_only)
       CheckPrefillChunks(model);
     if (prefill_only)
       return 0;
+    CheckFailureRecovery(model);
+    CheckRollbackReuse(model);
+    CheckImageSnapshotAttachment(model);
     CheckBatchedSessions(model);
     if (batch_only)
       return 0;

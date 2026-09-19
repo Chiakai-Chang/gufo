@@ -211,7 +211,7 @@ public:
       return std::nullopt;
     return TextPreparedPrompt{std::move(*tokens), {}};
   }
-  /// Called after cache restoration and before prefill or selection, including
+  /// Called before cache restoration, prefill or selection, including
   /// a complete prefix hit. Must replace, never inherit, the previous request.
   virtual void SetPromptContext(
       TextRunnerState&,
@@ -229,6 +229,14 @@ public:
 
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> CreateState()
       const = 0;
+
+  /// Optional first-token preview without advancing model state. The caller
+  /// supplies a copy of the sampler; normal decoding must reproduce the token.
+  /// This lets serving publish a token before capturing its prompt snapshot.
+  [[nodiscard]] virtual std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState&, sampling::SamplerState&) const {
+    return std::nullopt;
+  }
   /// Reconciles model-private metadata after an exact mutable or restored
   /// prefix is leased. The default runner state needs no additional work.
   virtual void PreparePrefixReuse(
@@ -286,6 +294,12 @@ public:
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const;
 
+  using SnapshotSink = std::function<void(std::span<const std::uint8_t>)>;
+  /// Reads only immutable snapshot storage. May run on the persistence worker.
+  /// Host-backed providers stream directly without another payload allocation.
+  virtual void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                        const SnapshotSink& sink) const;
+
   /// Restores a version-compatible serialized payload into an existing state.
   virtual void RestorePersistentSnapshot(
       TextRunnerState& state, std::span<const std::uint8_t> payload) const;
@@ -301,9 +315,9 @@ public:
     struct CommitMetrics {
       std::size_t snapshot_bytes{0};
       double snapshot_ms{0.0};
-      std::size_t disk_write_bytes{0};
-      double disk_write_ms{0.0};
-      /// Shared-prefix snapshots written to disk during prefill.
+      std::size_t disk_queued_bytes{0};
+      double disk_enqueue_ms{0.0};
+      /// Shared-prefix snapshots queued for persistence during prefill.
       std::size_t shared_prefix_snapshots{0};
       std::size_t shared_prefix_bytes{0};
       std::size_t shared_prefix_failures{0};
@@ -335,9 +349,12 @@ public:
 
     /// Publishes a reusable continuation boundary.
     ///
-    /// Snapshot-capable runners publish the immutable prompt frontier captured
-    /// before decode. Mutable-state runners publish their reported checkpoint.
+    /// Snapshot-capable runners keep the immutable prompt frontier and the
+    /// final live state. Mutable-state runners publish their reported
+    /// checkpoint.
     CommitMetrics Commit();
+    [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken();
+    void CapturePromptSnapshot();
     void Invalidate() noexcept;
 
   private:

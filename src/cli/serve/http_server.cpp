@@ -37,6 +37,7 @@
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
+#include "src/core/utf8.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
@@ -292,23 +293,6 @@ json::Value UsageJson(const TextGenerationBackend::Result& result) {
   usage["draft_tokens"] = result.draft_tokens;
   usage["draft_tokens_accepted"] = result.draft_accepted_tokens;
   return usage;
-}
-
-json::Value MetricsJson(const TextGenerationBackend::Result& result) {
-  json::Value metrics = json::Value::object();
-  metrics["time_to_first_token_ms"] = result.ttft_ms;
-  metrics["generation_time_ms"] = result.decode_ms;
-  metrics["queue_time_ms"] = result.queue_ms;
-  metrics["mean_itl_ms"] = result.mean_inter_token_ms;
-  metrics["prompt_tokens"] = result.prompt_tokens;
-  metrics["completion_tokens"] = result.completion_tokens;
-  metrics["cached_tokens"] = result.cached_prompt_tokens;
-  metrics["cache_restore_bytes"] = result.cache_restore_bytes;
-  metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
-  metrics["cache_shared_bytes"] = result.cache_shared_bytes;
-  metrics["cache_restore_ms"] = result.cache_restore_ms;
-  metrics["cache_snapshot_ms"] = result.cache_snapshot_ms;
-  return metrics;
 }
 
 HttpResponse WithTiming(HttpResponse response,
@@ -577,7 +561,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   resp["model"] = b.model_id();
   json::Value choices = json::Value::array();
   json::Value c = json::Value::object();
-  c["text"] = res.text;
+  c["text"] = core::Utf8Decoder{}.Push(res.text, true);
   c["index"] = 0;
   c["logprobs"] = json::Value();
   c["finish_reason"] =
@@ -646,7 +630,7 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
   json::Value content = json::Value::array();
   json::Value txt = json::Value::object();
   txt["type"] = "output_text";
-  txt["text"] = res.text;
+  txt["text"] = core::Utf8Decoder{}.Push(res.text, true);
   content.push_back(std::move(txt));
   msg["content"] = std::move(content);
   output.push_back(std::move(msg));
@@ -706,7 +690,7 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   json::Value content = json::Value::array();
   json::Value txt = json::Value::object();
   txt["type"] = "text";
-  txt["text"] = res.text;
+  txt["text"] = core::Utf8Decoder{}.Push(res.text, true);
   content.push_back(std::move(txt));
   resp["content"] = std::move(content);
   resp["stop_reason"] =
@@ -750,7 +734,7 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
       b.complete(prompt, max_tokens, sampling_config, req.is_cancelled);
 
   json::Value resp = json::Value::object();
-  resp["content"] = res.text;
+  resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
   resp["stop"] = true;
   const bool limited =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength;

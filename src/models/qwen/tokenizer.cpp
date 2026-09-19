@@ -1,5 +1,7 @@
 #include "src/models/qwen/tokenizer.hpp"
 
+#include <unicode/bytestream.h>
+#include <unicode/normalizer2.h>
 #include <unicode/uchar.h>
 
 #include <algorithm>
@@ -11,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -174,7 +177,11 @@ Utf8CodePoint DecodeUtf8(std::string_view text, std::size_t offset) noexcept {
 }
 
 bool IsUnicodeLetter(UChar32 value) noexcept {
-  return u_isalpha(value) != 0;
+  return (U_GET_GC_MASK(value) & U_GC_L_MASK) != 0;
+}
+
+bool IsUnicodeLetterOrMark(UChar32 value) noexcept {
+  return (U_GET_GC_MASK(value) & (U_GC_L_MASK | U_GC_M_MASK)) != 0;
 }
 
 bool IsUnicodeNumber(UChar32 value) noexcept {
@@ -191,13 +198,6 @@ bool IsNewline(UChar32 value) noexcept {
   return value == '\r' || value == '\n';
 }
 
-char AsciiLower(char value) noexcept {
-  if (value >= 'A' && value <= 'Z') {
-    return static_cast<char>(value - 'A' + 'a');
-  }
-  return value;
-}
-
 std::size_t Qwen35ContractionEnd(std::string_view text,
                                  std::size_t offset) noexcept {
   if (text[offset] != '\'') {
@@ -207,18 +207,22 @@ std::size_t Qwen35ContractionEnd(std::string_view text,
       "s", "t", "re", "ve", "m", "ll", "d",
   };
   for (const std::string_view suffix : kSuffixes) {
-    if (offset + 1 + suffix.size() > text.size()) {
-      continue;
-    }
+    std::size_t end = offset + 1;
     bool matches = true;
-    for (std::size_t index = 0; index < suffix.size(); ++index) {
-      if (AsciiLower(text[offset + 1 + index]) != suffix[index]) {
+    for (const char letter : suffix) {
+      if (end == text.size()) {
         matches = false;
         break;
       }
+      const auto next = DecodeUtf8(text, end);
+      if (u_foldCase(next.value, U_FOLD_CASE_DEFAULT) != letter) {
+        matches = false;
+        break;
+      }
+      end += next.length;
     }
     if (matches) {
-      return offset + 1 + suffix.size();
+      return end;
     }
   }
   return offset;
@@ -231,11 +235,11 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
   }
 
   const Utf8CodePoint first = DecodeUtf8(text, offset);
-  if (IsUnicodeLetter(first.value)) {
+  if (IsUnicodeLetterOrMark(first.value)) {
     std::size_t end = offset + first.length;
     while (end < text.size()) {
       const Utf8CodePoint next = DecodeUtf8(text, end);
-      if (!IsUnicodeLetter(next.value)) {
+      if (!IsUnicodeLetterOrMark(next.value)) {
         break;
       }
       end += next.length;
@@ -246,11 +250,11 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
   if (!IsNewline(first.value) && !IsUnicodeLetter(first.value) &&
       !IsUnicodeNumber(first.value) && offset + first.length < text.size()) {
     const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
-    if (IsUnicodeLetter(next.value)) {
+    if (IsUnicodeLetterOrMark(next.value)) {
       std::size_t end = offset + first.length + next.length;
       while (end < text.size()) {
         const Utf8CodePoint letter = DecodeUtf8(text, end);
-        if (!IsUnicodeLetter(letter.value)) {
+        if (!IsUnicodeLetterOrMark(letter.value)) {
           break;
         }
         end += letter.length;
@@ -266,20 +270,20 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
   std::size_t punctuation_start = offset;
   if (first.value == ' ' && offset + first.length < text.size()) {
     const Utf8CodePoint next = DecodeUtf8(text, offset + first.length);
-    if (!IsUnicodeWhitespace(next.value) && !IsUnicodeLetter(next.value) &&
-        !IsUnicodeNumber(next.value)) {
+    if (!IsUnicodeWhitespace(next.value) &&
+        !IsUnicodeLetterOrMark(next.value) && !IsUnicodeNumber(next.value)) {
       punctuation_start += first.length;
     }
   }
   const Utf8CodePoint punctuation = DecodeUtf8(text, punctuation_start);
   if (!IsUnicodeWhitespace(punctuation.value) &&
-      !IsUnicodeLetter(punctuation.value) &&
+      !IsUnicodeLetterOrMark(punctuation.value) &&
       !IsUnicodeNumber(punctuation.value)) {
     std::size_t end = punctuation_start;
     while (end < text.size()) {
       const Utf8CodePoint next = DecodeUtf8(text, end);
-      if (IsUnicodeWhitespace(next.value) || IsUnicodeLetter(next.value) ||
-          IsUnicodeNumber(next.value)) {
+      if (IsUnicodeWhitespace(next.value) ||
+          IsUnicodeLetterOrMark(next.value) || IsUnicodeNumber(next.value)) {
         break;
       }
       end += next.length;
@@ -296,12 +300,14 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
 
   if (IsUnicodeWhitespace(first.value)) {
     std::size_t end = offset;
+    std::size_t last_start = offset;
     std::size_t last_newline_end = offset;
     while (end < text.size()) {
       const Utf8CodePoint next = DecodeUtf8(text, end);
       if (!IsUnicodeWhitespace(next.value)) {
         break;
       }
+      last_start = end;
       end += next.length;
       if (IsNewline(next.value)) {
         last_newline_end = end;
@@ -310,7 +316,9 @@ std::size_t Qwen35PieceEnd(std::string_view text, std::size_t offset) {
     if (last_newline_end != offset) {
       return last_newline_end;
     }
-    return end;
+    // \s+(?!\S) consumes all trailing whitespace, but backtracks one
+    // codepoint before non-whitespace so the next piece can own its prefix.
+    return end < text.size() && last_start > offset ? last_start : end;
   }
 
   return offset + first.length;
@@ -633,6 +641,22 @@ std::vector<TokenId> QwenTokenizer::BpeMergeChunk(
 std::vector<TokenId> QwenTokenizer::BpeEncodeText(std::string_view text) const {
   if (pre_tokenizer_ != PreTokenizer::kQwen35) {
     return BpeMergeChunk(text);
+  }
+
+  // Qwen's tokenizer.json normalizes each non-special span before applying
+  // its Unicode split regex. ASCII needs neither conversion nor allocation.
+  std::string normalized;
+  if (std::ranges::any_of(text,
+                          [](unsigned char byte) { return byte >= 0x80; })) {
+    UErrorCode status = U_ZERO_ERROR;
+    const auto* nfc = icu::Normalizer2::getNFCInstance(status);
+    if (U_FAILURE(status))
+      throw std::runtime_error("could not initialize Qwen NFC normalization");
+    icu::StringByteSink<std::string> sink(&normalized);
+    nfc->normalizeUTF8(0, icu::StringPiece(text), sink, nullptr, status);
+    if (U_FAILURE(status))
+      throw std::runtime_error("Qwen NFC normalization failed");
+    text = normalized;
   }
 
   std::vector<TokenId> tokens;

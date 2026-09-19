@@ -4,6 +4,7 @@
 #include <hip/hip_runtime.h>
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "src/models/qwen/vision/encoder.hpp"
@@ -22,6 +23,9 @@ public:
   DeviceInput& operator=(const DeviceInput&) = delete;
   void Configure(std::shared_ptr<const Prompt> prompt,
                  std::shared_ptr<Encoder> encoder, hipStream_t stream);
+  void SetCancellationCheck(Encoder::CancellationCheck check) {
+    is_cancelled_ = std::move(check);
+  }
   void RestoreLayout(const RopeLayout& layout, hipStream_t stream);
   void Inject(float* hidden, std::uint32_t position, std::uint32_t count,
               std::uint32_t width, std::uint32_t hc, hipStream_t stream);
@@ -46,6 +50,7 @@ private:
   DeviceRope* descriptor_{nullptr};
   std::int32_t* positions_{nullptr};
   std::size_t capacity_{0};
+  Encoder::CancellationCheck is_cancelled_;
 };
 
 }  // namespace gufo::models::qwen::vision

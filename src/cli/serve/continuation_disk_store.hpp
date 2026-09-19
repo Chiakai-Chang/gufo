@@ -37,6 +37,7 @@ enum class ContinuationDiskEventReason : std::uint8_t {
   kIoFailure,
   kSerializationFailure,
   kRestoreFailure,
+  kBusy,
 };
 
 /// Sanitized disk-cache event. Prompt contents, token values, paths, model
@@ -49,6 +50,7 @@ struct ContinuationDiskEvent {
   std::size_t token_count{0};
   std::size_t retained_bytes{0};
   std::size_t capacity_bytes{0};
+  double elapsed_ms{0.0};
 };
 
 struct ContinuationDiskStoreOptions {
@@ -63,8 +65,8 @@ struct ContinuationDiskStoreOptions {
 /// owns checksums, exact token verification, byte limits, atomic publication,
 /// startup indexing, LRU replacement, permissions, and collision-safe lookup.
 ///
-/// Operations are synchronous and serialized. This deliberately bounds both
-/// staging memory and outstanding disk I/O to one operation.
+/// Persistence uses one bounded worker. Optional request lookups skip a busy
+/// store instead of waiting for disk I/O on the generation scheduler.
 class ContinuationDiskStore {
 public:
   using EventSink = std::function<void(const ContinuationDiskEvent&)>;
@@ -99,6 +101,24 @@ public:
       std::span<const TextRunnerToken> checkpoint_tokens,
       const TextRunnerSnapshot& snapshot,
       std::span<const std::uint8_t> input_identity = {});
+
+  /// Conservative admission before capturing a snapshot. Includes queued and
+  /// active snapshot bytes; failure means a harmless cache skip.
+  [[nodiscard]] bool CanSave(
+      const TextModelRunner& runner, std::size_t token_count,
+      std::size_t snapshot_bytes,
+      std::span<const std::uint8_t> input_identity = {}) const;
+
+  /// Enqueues immutable storage, retaining both model and snapshot until done.
+  /// The returned byte count is queued work, not completed disk I/O.
+  [[nodiscard]] std::size_t SaveAsync(
+      std::shared_ptr<const TextModelRunner> runner,
+      std::vector<TextRunnerToken> checkpoint_tokens,
+      std::shared_ptr<const TextRunnerSnapshot> snapshot,
+      std::vector<std::uint8_t> input_identity = {});
+
+  /// Drains accepted writes. Shutdown also drains automatically.
+  void Flush();
 
   /// Restores the longest exact saved prefix of prompt into state.
   [[nodiscard]] RestoreResult RestoreLongestPrefix(

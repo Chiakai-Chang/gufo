@@ -5,11 +5,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <semaphore>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -152,6 +155,8 @@ struct FakeControl {
   bool batched_multi_token_decode{false};
   std::size_t actual_batch_width{4};
   bool prefix_reuse{true};
+  bool preview_first_token{false};
+  std::function<void()> snapshot_callback;
 };
 
 class FakeState final : public TextRunnerState {
@@ -203,6 +208,8 @@ public:
         .capabilities =
             TextRunnerCapabilities{
                 .incremental_prefill = control_->incremental_prefill,
+                .snapshot = bool(control_->snapshot_callback),
+                .fork = bool(control_->snapshot_callback),
                 .final_token_advance_required =
                     control_->final_token_advance_required,
                 .incremental_text_is_exact =
@@ -223,7 +230,8 @@ public:
         .state_capacity_bytes = 8 * 64,
         .per_request_state_bytes = 64,
         .temporary_scratch_bytes = 0,
-        .retained_snapshot_capacity_bytes = 0,
+        .retained_snapshot_capacity_bytes =
+            control_->snapshot_callback ? 4096U : 0U,
         .requires_device_runtime_lock = true,
     };
   }
@@ -333,6 +341,47 @@ public:
         .token = *fake.frontier,
         .piece = std::to_string(*fake.frontier),
     };
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state,
+      gufo::sampling::SamplerState& sampler) const override {
+    if (!control_->preview_first_token)
+      return std::nullopt;
+    return SelectNext(state, sampler);
+  }
+
+  struct SnapshotState final : gufo::server::TextRunnerSnapshot {
+    explicit SnapshotState(const FakeState& state)
+        : label(state.label),
+          position(state.position),
+          decode_count(state.decode_count),
+          frontier(state.frontier) {}
+    TextRunnerToken label;
+    std::size_t position, decode_count;
+    std::optional<TextRunnerToken> frontier;
+    std::size_t PayloadBytes() const noexcept override {
+      return sizeof(SnapshotState);
+    }
+  };
+  std::size_t SnapshotPayloadBytes(const TextRunnerState&) const override {
+    return sizeof(SnapshotState);
+  }
+  std::unique_ptr<gufo::server::TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    if (control_->snapshot_callback)
+      control_->snapshot_callback();
+    return std::make_unique<SnapshotState>(RequireFakeState(state));
+  }
+  void RestoreOrFork(
+      TextRunnerState& state,
+      const gufo::server::TextRunnerSnapshot& snapshot) const override {
+    auto& restored = RequireFakeState(state);
+    const auto& saved = dynamic_cast<const SnapshotState&>(snapshot);
+    restored.label = saved.label;
+    restored.position = saved.position;
+    restored.decode_count = saved.decode_count;
+    restored.frontier = saved.frontier;
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
@@ -1127,7 +1176,51 @@ void TestRunnerFailureInvalidatesAndDoesNotPoisonReplacement() {
 
 }  // namespace
 
+void TestFirstTokenPrecedesSnapshotAndPreservesBudget() {
+  for (const bool multi : {false, true}) {
+    auto control = std::make_shared<FakeControl>();
+    control->multi_token_decode = multi;
+    control->preview_first_token = true;
+    std::binary_semaphore captured(0), release(0);
+    control->snapshot_callback = [&] {
+      captured.release();
+      release.acquire();
+    };
+    auto scheduler = MakeScheduler(control, 1);
+    auto request = scheduler->Submit({1, 10}, 7, 0.0F, {}, true);
+    std::counting_semaphore<16> first_token(0);
+    auto result = std::async(std::launch::async, [&] {
+      return request.Wait([&](std::string_view) {
+        first_token.release();
+        return true;
+      });
+    });
+    Expect(captured.try_acquire_for(kTestTimeout), "snapshot capture reached");
+    const bool published = first_token.try_acquire_for(std::chrono::seconds(1));
+    release.release();
+    Expect(published, "first token is delivered while snapshot capture blocks");
+    Expect(result.get().tokens == ExpectedTokens(1, 7),
+           "preview is emitted once and counts toward the original budget");
+  }
+  for (const std::size_t limit : {1U, 7U}) {
+    auto control = std::make_shared<FakeControl>();
+    control->multi_token_decode = true;
+    control->preview_first_token = true;
+    control->batched_multi_token_decode = true;
+    control->supports_batched_advance = true;
+    auto scheduler = MakeScheduler(control, 4);
+    std::vector<TextGenerationScheduler::Request> requests;
+    for (TextRunnerToken label = 1; label <= 4; ++label)
+      requests.push_back(scheduler->Submit({label, 10}, limit, 0.0F));
+    for (std::size_t index = 0; index < requests.size(); ++index)
+      Expect(requests[index].Wait().tokens ==
+                 ExpectedTokens(static_cast<TextRunnerToken>(index + 1), limit),
+             "batched previews retain independent token limits");
+  }
+}
+
 int main() {
+  TestFirstTokenPrecedesSnapshotAndPreservesBudget();
   TestIdlePrefillUsesBulkWorkUnit();
   TestRunnerCanSkipUnusedFinalAdvance();
   TestRunnerCanReuseExactIncrementalText();

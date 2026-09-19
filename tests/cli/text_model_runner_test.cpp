@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <semaphore>
 #include <span>
 #include <sstream>
 #include <stdexcept>
@@ -461,6 +464,7 @@ public:
 
 class PersistentSnapshotRunner final : public SnapshotRunner {
 public:
+  std::function<void()> before_serialize;
   PersistentSnapshotRunner(std::shared_ptr<FakeStats> stats,
                            std::string identity,
                            std::size_t retained_snapshot_capacity_bytes = 256)
@@ -486,6 +490,8 @@ public:
   [[nodiscard]] std::size_t SerializePersistentSnapshot(
       const TextRunnerSnapshot& snapshot,
       std::span<std::uint8_t> destination) const override {
+    if (before_serialize)
+      before_serialize();
     const auto& saved = RequireSnapshot(snapshot);
     if (destination.size() != 4 * sizeof(std::uint64_t)) {
       throw std::invalid_argument("fake persistent payload size mismatch");
@@ -620,13 +626,13 @@ void TestSnapshotCacheBranchesOnePrefixIntoIndependentStates() {
   Expect(
       first.cached_prompt_tokens() == 4 && second.cached_prompt_tokens() == 4,
       "both branches report the same immutable root prefix");
-  Expect(first.cache_restore_bytes() == sizeof(FakeSnapshot) &&
-             second.cache_restore_bytes() == sizeof(FakeSnapshot) &&
-             first.cache_restore_ms() >= 0.0 &&
-             second.cache_restore_ms() >= 0.0,
-         "both branches report full-copy restore bytes and latency");
-  Expect(stats->snapshot_restores == 2,
-         "the root snapshot is copied into two mutable states");
+  Expect(
+      first.cache_restore_bytes() == 0 &&
+          second.cache_restore_bytes() == sizeof(FakeSnapshot) &&
+          first.cache_restore_ms() >= 0.0 && second.cache_restore_ms() >= 0.0,
+      "one branch uses the live frontier and the other restores the snapshot");
+  Expect(stats->snapshot_restores == 1,
+         "only the simultaneous branch needs a snapshot copy");
   Expect(stats->states_created == 2,
          "snapshot branching reuses preallocated request states");
   Expect(stats->snapshot_size_queries == 1 && stats->snapshot_captures == 1,
@@ -656,17 +662,29 @@ void TestSnapshotRetentionUsesPromptBoundary() {
     auto root = pool.Acquire({1, 2, 3, 4});
     Expect(root.Prefill(4).decode_ready,
            "root prompt reaches its decode frontier");
-    Expect(stats->snapshot_captures == 1,
-           "snapshot is captured before generated tokens mutate the state");
+    Expect(stats->snapshot_captures == 0,
+           "prefill returns before optional snapshot capture");
     Expect(root.SelectNext().token == 90,
            "root selects its prompt-boundary frontier");
     root.Advance();
+    Expect(stats->snapshot_captures == 1,
+           "snapshot is captured before generated tokens mutate the state");
     Expect(root.SelectNext().token == 91,
            "root advances beyond the reusable prompt boundary");
     root.Advance();
     const auto commit = root.Commit();
     Expect(commit.snapshot_bytes == sizeof(FakeSnapshot),
            "root commit publishes the held prompt snapshot");
+  }
+
+  {
+    auto continuation = pool.Acquire({1, 2, 3, 4, 90, 91, 7});
+    Expect(continuation.cache_hit() &&
+               continuation.cached_prompt_tokens() == 6 &&
+               continuation.cache_restore_bytes() == 0,
+           "conversation reuses all executed assistant tokens without "
+           "restoration");
+    continuation.Invalidate();
   }
 
   {
@@ -689,6 +707,7 @@ void TestSnapshotRetentionUsesPromptBoundary() {
     const auto suffix = extension.Prefill(8);
     Expect(suffix.consumed_tokens == 2 && suffix.decode_ready,
            "only the extension after the stable prompt is prefetched");
+    extension.CapturePromptSnapshot();
     Expect(stats->snapshot_captures == 2,
            "the extended prompt captures its own reusable boundary");
     Expect(extension.SelectNext().token == 90,
@@ -714,8 +733,8 @@ void TestPersistentSnapshotRestoresAcrossPools() {
     Expect(request.Prefill(3).decode_ready,
            "writer reaches persistent checkpoint");
     const auto commit = request.Commit();
-    Expect(commit.snapshot_bytes == 0 && commit.disk_write_bytes > 0 &&
-               commit.disk_write_ms >= 0.0,
+    Expect(commit.snapshot_bytes == 0 && commit.disk_queued_bytes > 0 &&
+               commit.disk_enqueue_ms >= 0.0,
            "disk publication is independent of RAM snapshot admission");
   }
 
@@ -756,10 +775,9 @@ void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<PersistentSnapshotRunner>(
       stats, "artifact-A", sizeof(FakeSnapshot) - 1);
-  TextRunnerPool pool(runner, 1, disk_cache);
-
   // Conversation A: system prefix {7, 7, 7} plus its own turn.
   {
+    TextRunnerPool pool(runner, 1, disk_cache);
     auto request = pool.Acquire({7, 7, 7, 1, 2});
     Expect(!request.cache_hit(), "first conversation is cold");
     Expect(request.Prefill(8).consumed_tokens == 5,
@@ -772,6 +790,7 @@ void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
   // Conversation B shares only the system prefix. Prefill stops there so the
   // prefix is persisted for the next conversation.
   {
+    TextRunnerPool pool(runner, 1, disk_cache);
     auto request = pool.Acquire({7, 7, 7, 3, 4, 5});
     Expect(!request.cache_hit(), "second conversation still has no prefix");
     const auto first = request.Prefill(8);
@@ -788,6 +807,7 @@ void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
 
   // Conversation C restores the shared prefix and prefills only its turn.
   {
+    TextRunnerPool pool(runner, 1, disk_cache);
     auto request = pool.Acquire({7, 7, 7, 9});
     Expect(request.cache_hit() && request.cache_disk_hit() &&
                request.cached_prompt_tokens() == 3,
@@ -799,6 +819,56 @@ void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
     Expect(commit.shared_prefix_snapshots == 0,
            "a restored prefix is not written again");
   }
+}
+
+void TestDiskOnlyCaptureReservesBudgetBeforeCommit() {
+  TemporaryDirectory directory;
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(
+      stats, "artifact-A", sizeof(FakeSnapshot) - 1);
+  std::binary_semaphore entered(0), release(0);
+  runner->before_serialize = [&] {
+    entered.release();
+    release.acquire();
+  };
+  TextRunnerPool pool(runner, 2,
+                      TextRunnerDiskCacheOptions{
+                          .directory = directory.path(),
+                          .capacity_bytes = 4096,
+                          .staging_capacity_bytes = 192,
+                      });
+  auto first = pool.Acquire({1, 2, 3});
+  (void)first.Prefill(3);
+  first.CapturePromptSnapshot();
+  Expect(entered.try_acquire_for(std::chrono::seconds(2)),
+         "disk-only prompt is queued immediately after capture");
+  auto second = pool.Acquire({4, 5, 6});
+  (void)second.Prefill(3);
+  second.CapturePromptSnapshot();
+  const auto second_commit = second.Commit();
+  Expect(stats->snapshot_captures == 1 && second_commit.disk_queued_bytes == 0,
+         "pending disk-only state prevents another unbudgeted capture");
+  release.release();
+  Expect(first.Commit().disk_queued_bytes != 0,
+         "request reports its earlier background persistence admission");
+}
+
+void TestDiskPreflightAvoidsUnusableCapture() {
+  TemporaryDirectory directory;
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(
+      stats, "artifact-A", sizeof(FakeSnapshot) - 1);
+  TextRunnerPool pool(runner, 1,
+                      TextRunnerDiskCacheOptions{
+                          .directory = directory.path(),
+                          .capacity_bytes = 4096,
+                          .staging_capacity_bytes = 96,
+                      });
+  auto request = pool.Acquire({1, 2, 3});
+  (void)request.Prefill(3);
+  const auto commit = request.Commit();
+  Expect(stats->snapshot_captures == 0 && commit.disk_queued_bytes == 0,
+         "disk staging refusal happens before snapshot capture");
 }
 
 void TestMeasuredStateIsReconciledWithClaim() {
@@ -831,8 +901,9 @@ void TestSnapshotBudgetRefusalDoesNotFailCompletedRequest() {
          "cache admission happens before snapshot allocation");
 
   auto extension = pool.Acquire({1, 2, 3, 4});
-  Expect(!extension.cache_hit(),
-         "a refused snapshot becomes an ordinary deterministic miss");
+  Expect(extension.cache_hit() && extension.cached_prompt_tokens() == 3 &&
+             extension.cache_restore_bytes() == 0,
+         "live state remains reusable when snapshot admission is refused");
   extension.Invalidate();
 }
 
@@ -884,6 +955,8 @@ void TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful() {
 }  // namespace
 
 int main() {
+  TestDiskOnlyCaptureReservesBudgetBeforeCommit();
+  TestDiskPreflightAvoidsUnusableCapture();
   TestBoundedPrefillDecodeAndPrefixReuse();
   TestAbandonedRequestRollsBackState();
   TestRequestBindsAndClearsCancellation();

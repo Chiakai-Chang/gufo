@@ -218,7 +218,7 @@ snapshot and serving checks must also run when those paths change.
 ## Sampling and executable contract
 
 Qwen AR and DFlash2 sample on the GPU. The CPU owns request history and RNG
-state. Target processing is penalties → top-k → top-p → min-p → temperature;
+state. Target processing is penalties → temperature → top-k → top-p → min-p;
 `min-keep` is a candidate floor. Temperature zero uses the adjusted argmax.
 
 Batched unadjusted argmax reduces vocabulary tiles in parallel, then selects the

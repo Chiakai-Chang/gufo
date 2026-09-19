@@ -3,7 +3,10 @@
 //
 // gpu_probe --model FIRST_SHARD.gguf --prompt TEXT [--reference]
 //           [--batch T] [--context N] [--dump logits.bin]
+// Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
+// MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -21,6 +24,15 @@
 #include "src/models/qwen38_flash_next/weights.hpp"
 
 namespace q = gufo::models::qwen38_flash_next;
+
+void AuditMtp(q::rocm::Executor& executor, const q::rocm::DeviceModel& device,
+              const q::ModelWeights& weights, const q::MtpWeights& mtp,
+              const gufo::tokenization::QwenTokenizer& tokenizer,
+              const std::filesystem::path& path);
+void AuditMtpCosts(q::rocm::Executor& executor,
+                   const gufo::tokenization::QwenTokenizer& tokenizer,
+                   std::span<const std::uint32_t> depths,
+                   std::uint32_t concurrency);
 
 namespace {
 
@@ -63,7 +75,11 @@ int main(int argc, char** argv) {
   std::string model_path;
   std::string prompt = "The capital of France is";
   std::string dump_path;
+  std::string mtp_path;
+  bool mtp_audit = false;
   bool reference = false;
+  bool cost_audit = false;
+  std::uint32_t cost_concurrency = 0;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
   for (int i = 1; i < argc; ++i) {
@@ -73,6 +89,22 @@ int main(int argc, char** argv) {
     };
     if (arg == "--model") {
       model_path = next();
+    } else if (arg == "--mtp-model") {
+      mtp_path = next();
+    } else if (arg == "--mtp-audit") {
+      mtp_audit = true;
+    } else if (arg == "--cost-audit") {
+      cost_audit = true;
+      const auto value = next();
+      const auto [end, ec] = std::from_chars(
+          value.data(), value.data() + value.size(), cost_concurrency);
+      if (ec != std::errc{} || end != value.data() + value.size() ||
+          (cost_concurrency != 0 && cost_concurrency != 1 &&
+           cost_concurrency != 2 && cost_concurrency != 4 &&
+           cost_concurrency != 6 && cost_concurrency != 8)) {
+        std::fprintf(stderr, "--cost-audit requires C=0/1/2/4/6/8 (0 = all)\n");
+        return 2;
+      }
     } else if (arg == "--prompt") {
       prompt = next();
     } else if (arg == "--reference") {
@@ -96,6 +128,14 @@ int main(int argc, char** argv) {
   }
   if (model_path.empty()) {
     std::fprintf(stderr, "--model is required\n");
+    return 2;
+  }
+  if ((mtp_audit || cost_audit) && mtp_path.empty()) {
+    std::fprintf(stderr, "MTP audits require --mtp-model\n");
+    return 2;
+  }
+  if (cost_audit && (mtp_audit || reference || !dump_path.empty())) {
+    std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
   std::string error;
@@ -128,8 +168,20 @@ int main(int argc, char** argv) {
     }
   }
 
-  auto device =
-      q::rocm::DeviceModel::Upload(*weights, model_path, nullptr, {}, &error);
+  std::shared_ptr<gufo::core::GgufReader> mtp_reader;
+  std::optional<q::MtpWeights> mtp_weights;
+  if (!mtp_path.empty()) {
+    mtp_reader = gufo::core::GgufReader::OpenFile(mtp_path, &error);
+    if (mtp_reader)
+      mtp_weights = q::MtpWeights::Bind(*mtp_reader, c, &error);
+    if (!mtp_weights) {
+      std::fprintf(stderr, "MTP bind failed: %s\n", error.c_str());
+      return 1;
+    }
+  }
+  auto device = q::rocm::DeviceModel::Upload(
+      *weights, model_path, mtp_weights ? &*mtp_weights : nullptr, mtp_path,
+      &error);
   if (!device) {
     std::fprintf(stderr, "upload failed: %s\n", error.c_str());
     return 1;
@@ -137,11 +189,37 @@ int main(int argc, char** argv) {
   q::rocm::Executor::Options options;
   options.max_batch = batch;
   options.max_logit_rows = std::min<std::uint32_t>(batch, 64);
+
+  if (cost_audit) {
+    options.max_batch = 2048;
+    options.max_logit_rows = 8;
+    options.max_speculative = 8;
+  }
   auto executor =
       q::rocm::Executor::Create(*device, ngram.get(), options, &error);
   if (!executor) {
     std::fprintf(stderr, "executor failed: %s\n", error.c_str());
     return 1;
+  }
+  if (cost_audit) {
+    try {
+      const std::array<std::uint32_t, 3> depths{0, 4096, 32768};
+      AuditMtpCosts(*executor, *tokenizer, depths, cost_concurrency);
+      return 0;
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "cost audit failed: %s\n", e.what());
+      return 1;
+    }
+  }
+  if (mtp_audit) {
+    try {
+      AuditMtp(*executor, *device, *weights, *mtp_weights, *tokenizer,
+               model_path);
+      return 0;
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "MTP oracle failed: %s\n", e.what());
+      return 1;
+    }
   }
   auto session = executor->CreateSession(context, &error);
   if (!session) {
