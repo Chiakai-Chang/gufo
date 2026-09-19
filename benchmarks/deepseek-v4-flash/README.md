@@ -137,8 +137,8 @@ Checks live in `tests/models/deepseek_v4_flash`; maintained commands live in
 | `ds4.attention` | Independent attention, DSpark Markov/confidence and window formulas; exact prefill scores, masks, poisoned rows, ties, scratch bounds and top-k ordering |
 | `ds4.target` | Official tokens, pinned trajectory, full logits, replay, capacity equality and state isolation |
 | `ds4.dspark` | Exact scalar tokens/frontier logits through C8/16K, acceptance, policy, snapshots and forks |
-| `ds4.serving` | Sampling, physical batching, bounded prefill, prefix/disk caches, cancellation and exhaustion |
-| `ds4.chat` | Real sampled prompt and two-turn chat execution, AR/DSpark token identity and active drafting |
+| `ds4.serving` | Sampling, physical batching, EOS checkpoint isolation, bounded prefill, prefix/disk caches, cancellation and exhaustion |
+| `ds4.chat` | Real sampled prompt and three-turn chat after length/EOS stops, AR/DSpark token identity and active drafting |
 
 ```sh
 nix develop -c tools/ds4/check.py fast

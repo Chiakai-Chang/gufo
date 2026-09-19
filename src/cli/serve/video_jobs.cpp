@@ -25,7 +25,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
 
 namespace gufo::server {

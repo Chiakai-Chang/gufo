@@ -36,6 +36,8 @@ struct SessionDsparkBatchItem {
   std::vector<int>* emitted = nullptr;
   /// Request sampler for a sampled cycle; null runs the greedy cycle.
   const ds4_dspark_sampler* sampler = nullptr;
+  /// Request generation leaves EOS unconsumed; fixed-length benchmarks do not.
+  bool stop_at_eos = false;
 };
 
 /// GPU operations, including session creation/destruction, share scratch
@@ -122,7 +124,8 @@ public:
                                 std::uint32_t max_draft_tokens,
                                 std::vector<int>* emitted,
                                 std::string* error_msg = nullptr,
-                                const ds4_dspark_sampler* sampler = nullptr);
+                                const ds4_dspark_sampler* sampler = nullptr,
+                                bool stop_at_eos = false);
   /// Returns and clears the token a sampled cycle drew but has not emitted,
   /// or -1. An exact target step must emit it instead of sampling again.
   [[nodiscard]] int TakePendingDsparkToken();

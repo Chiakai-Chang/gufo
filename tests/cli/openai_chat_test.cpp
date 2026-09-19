@@ -14,7 +14,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 
 namespace {
 
@@ -249,7 +249,7 @@ void TestCachedPrefillMetrics() {
           R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})"),
       backend);
   Expect(response.status == 200, "Cached non-streaming response succeeds");
-  const auto body = gufo::server::json::parse(response.body);
+  const auto body = gufo::json::parse(response.body);
   const auto* usage = body.find("usage");
   const auto* timings = body.find("timings");
   Expect(usage && usage->member_size("prompt_tokens") == 7,
@@ -426,6 +426,15 @@ void TestAllSamplingControlsReachBackend() {
 
 void TestUnsupportedSamplingControlsAreRejected() {
   FakeBackend backend;
+  for (const double choices : {0.0, 1.4, 2.0, 1e100}) {
+    auto request = Request(
+        R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})");
+    auto body = gufo::json::parse(request.body);
+    body["n"] = choices;
+    request.body = body.dump();
+    Expect(gufo::server::HandleOpenAiChat(request, backend).status == 400,
+           "n must be exactly one, without truncation or overflow");
+  }
   for (const auto* field : {"draft_temperature",  "temperature_draft",
                             "draft_top_k",        "draft_top_p",
                             "draft_min_p",        "draft_seed",
@@ -440,7 +449,7 @@ void TestUnsupportedSamplingControlsAreRejected() {
                             "top_n_sigma",        "logit_bias"}) {
     auto request = Request(
         R"({"model":"test-model","messages":[{"role":"user","content":"hello"}]})");
-    auto body = gufo::server::json::parse(request.body);
+    auto body = gufo::json::parse(request.body);
     body[field] = 0.8;
     request.body = body.dump();
     const auto response = gufo::server::HandleOpenAiChat(request, backend);

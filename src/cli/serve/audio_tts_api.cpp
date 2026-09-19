@@ -11,7 +11,7 @@
 #include <string>
 #include <utility>
 
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 #include "src/models/qwen3_tts/audio.hpp"
 
 namespace gufo::server {

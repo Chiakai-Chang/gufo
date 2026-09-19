@@ -8,6 +8,7 @@
 #include <cassert>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -18,15 +19,31 @@ using gufo::server::TextGenerationBackend;
 
 class FakeBackend final : public TextGenerationBackend {
 public:
+  struct Call {
+    std::string prompt;
+    gufo::server::ChatRequest chat;
+    std::size_t max_tokens = 0;
+    gufo::sampling::SamplingConfig sampling;
+  };
+  Call LastCall() {
+    const std::lock_guard lock(mutex_);
+    return last_;
+  }
   std::string model_id() const override { return "test"; }
   bool ready() const override { return true; }
   std::size_t count_tokens(std::string_view text) const override {
     return text.size();
   }
-  Result complete(std::string_view, std::size_t,
-                  const gufo::sampling::SamplingConfig&,
+  Result complete(std::string_view prompt, std::size_t limit,
+                  const gufo::sampling::SamplingConfig& sampling,
                   const CancellationCheck&, const TokenCallback&) override {
     ++calls;
+    {
+      const std::lock_guard lock(mutex_);
+      last_ = {.prompt = std::string(prompt),
+               .max_tokens = limit,
+               .sampling = sampling};
+    }
     Result result;
     result.text = "ok";
     result.prompt_tokens = 10;
@@ -35,15 +52,26 @@ public:
     result.prefill_ms = 4;
     result.completion_tokens = 1;
     result.decode_ms = 2;
+    result.finish_reason =
+        limit == 1 ? FinishReason::kLength : FinishReason::kStop;
     return result;
   }
-  Result chat(const gufo::server::ChatRequest&, std::size_t limit,
+  Result chat(const gufo::server::ChatRequest& request, std::size_t limit,
               const gufo::sampling::SamplingConfig& sampling,
               const CancellationCheck& cancel,
               const TokenCallback& token) override {
-    return complete("", limit, sampling, cancel, token);
+    auto result = complete("", limit, sampling, cancel, token);
+    {
+      const std::lock_guard lock(mutex_);
+      last_.chat = request;
+    }
+    return result;
   }
   std::atomic<int> calls{0};
+
+private:
+  std::mutex mutex_;
+  Call last_;
 };
 
 class RunningServer {
@@ -97,6 +125,11 @@ public:
     }
     ::close(fd);
     return response;
+  }
+
+  std::string Post(std::string_view path, std::string_view body) {
+    return Send("POST " + std::string(path) + " HTTP/1.1\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + std::string(body));
   }
 
   std::shared_ptr<FakeBackend> backend;
@@ -176,13 +209,119 @@ void TestFramingAndMetrics() {
                   std::to_string(body.size()) + "\r\n\r\n" + body);
   ExpectStatus(response, 200);
   const auto parsed =
-      gufo::server::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+      gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
   const auto* timings = parsed.find("timings");
   assert(timings != nullptr);
   assert(timings->member_double("prompt_n") == 2);
   assert(timings->member_double("cache_n") == 8);
   assert(timings->member_double("prompt_per_second") == 500);
   assert(timings->member_double("prompt_per_token_ms") == 2);
+}
+
+void TestCompatibilityRequests() {
+  RunningServer server;
+  using gufo::json::parse;
+  const auto response_body = [](const std::string& response) {
+    ExpectStatus(response, 200);
+    return parse(response.substr(response.find("\r\n\r\n") + 4));
+  };
+  struct Endpoint {
+    const char *path, *body, *limit;
+  };
+  for (const auto& endpoint : {
+           Endpoint{"/v1/completions", R"({"prompt":"hi"})", "max_tokens"},
+           Endpoint{"/v1/responses", R"({"input":"hi"})", "max_output_tokens"},
+           Endpoint{"/v1/messages",
+                    R"({"messages":[{"role":"user","content":"hi"}]})",
+                    "max_tokens"},
+           Endpoint{"/completion", R"({"prompt":"hi"})", "n_predict"},
+       }) {
+    auto body = parse(endpoint.body);
+    body["model"] = "test";
+    body[endpoint.limit] = 1;
+    body["temperature"] = 0.6;
+    body["top_k"] = 40;
+    body["top_p"] = 0.9;
+    body["seed"] = 123;
+    body["repeat_penalty"] = 1.1;
+    const auto output = response_body(server.Post(endpoint.path, body.dump()));
+    const auto last = server.backend->LastCall();
+    assert(last.max_tokens == 1 && last.sampling.temperature == 0.6F &&
+           last.sampling.top_k == 40 && last.sampling.top_p == 0.9F &&
+           last.sampling.seed == 123 && last.sampling.repeat_penalty == 1.1F);
+    if (std::string_view(endpoint.path) == "/v1/responses") {
+      assert(output.member_str("status") == "incomplete");
+      assert(output.find("incomplete_details")->member_str("reason") ==
+             "max_output_tokens");
+      assert(output.find("usage")->contains("input_tokens_details"));
+    } else if (std::string_view(endpoint.path) == "/v1/messages") {
+      assert(output.member_str("stop_reason") == "max_tokens");
+    } else if (std::string_view(endpoint.path) == "/completion") {
+      assert(output.find("stopped_length")->as_bool());
+      assert(!output.find("stopped_eos")->as_bool());
+    } else {
+      assert(output.find("choices")->items()[0].member_str("finish_reason") ==
+             "length");
+    }
+    const int calls = server.backend->calls;
+    for (const auto value : {"0", "-1", "1.5", "1e100", "\"1\"", "null"}) {
+      auto invalid = body;
+      invalid[endpoint.limit] = parse(value);
+      ExpectStatus(server.Post(endpoint.path, invalid.dump()), 400);
+    }
+    for (const auto field : {"stream", "echo", "store", "background", "tools",
+                             "stop", "reasoning", "logit_bias"}) {
+      auto invalid = body;
+      invalid[field] = true;
+      ExpectStatus(server.Post(endpoint.path, invalid.dump()), 400);
+    }
+    auto invalid = body;
+    invalid["n"] = 1.4;
+    ExpectStatus(server.Post(endpoint.path, invalid.dump()), 400);
+    invalid = body;
+    invalid["model"] = "wrong";
+    ExpectStatus(server.Post(endpoint.path, invalid.dump()), 404);
+    ExpectStatus(server.Post(endpoint.path, "[]"), 400);
+    ExpectStatus(server.Post(endpoint.path, "{"), 400);
+    assert(server.backend->calls == calls);
+  }
+  const int calls = server.backend->calls;
+  ExpectStatus(server.Post("/v1/completions", R"({"prompt":["one","two"]})"),
+               400);
+  ExpectStatus(server.Post("/v1/responses",
+                           R"({"input":[{"role":"user","content":[
+                           {"type":"input_text","text":"describe"},
+                           {"type":"input_image","image_url":"data:image/png;base64,AA=="}]}]})"),
+               400);
+  ExpectStatus(server.Post("/v1/messages",
+                           R"({"messages":[{"role":"tool","content":"hi"}]})"),
+               400);
+  ExpectStatus(server.Post("/v1/messages", R"({"messages":[]})"), 400);
+  ExpectStatus(
+      server.Post("/infill", R"({"input_prefix":"one","input_suffix":"two"})"),
+      501);
+  ExpectStatus(server.Post("/v1/messages/count_tokens",
+                           R"({"messages":[{"role":"user","content":"hi"}]})"),
+               501);
+  assert(server.backend->calls == calls);
+
+  const auto response = response_body(server.Post(
+      "/v1/responses",
+      R"({"instructions":"Be concise.","input":[{"role":"user","content":[
+          {"type":"input_text","text":"hi"}]}],"max_output_tokens":2,"store":false})"));
+  assert(response.member_str("status") == "completed");
+  const auto messages = server.backend->LastCall().chat.messages;
+  assert(messages.size() == 2);
+  assert(messages[0].role == gufo::tokenization::ChatRole::kSystem &&
+         messages[0].content == "Be concise." && messages[1].content == "hi");
+
+  const auto anthropic = response_body(
+      server.Post("/v1/messages",
+                  R"({"system":[{"type":"text","text":"Be concise."}],
+          "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
+          "max_tokens":2})"));
+  assert(anthropic.member_str("stop_reason") == "end_turn");
+  assert(server.backend->LastCall().chat.messages[0].content == "Be concise.");
 }
 
 void TestInvalidBindSettings() {
@@ -217,5 +356,6 @@ int main() {
   TestQueryParameters();
   TestAuthorization();
   TestFramingAndMetrics();
+  TestCompatibilityRequests();
   std::cout << "HTTP transport checks passed.\n";
 }

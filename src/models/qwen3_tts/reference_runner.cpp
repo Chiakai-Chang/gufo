@@ -21,7 +21,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/models/qwen3_tts/json.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::models::qwen3_tts {
 namespace {

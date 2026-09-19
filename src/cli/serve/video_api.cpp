@@ -15,7 +15,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::server {
 namespace {

@@ -1,18 +1,12 @@
-// Minimal ordered JSON reader/writer for this model's config and safetensors
-// header parsing.
-//
-// Copied from src/models/qwen3_tts/json.hpp so that src/models/qwen3_asr builds
-// without depending on another model's sources. The two are independent on
-// purpose: neither model may change JSON behaviour under the other.
-
-#ifndef GUFO_MODELS_QWEN3_ASR_JSON_HPP_
-#define GUFO_MODELS_QWEN3_ASR_JSON_HPP_
+#ifndef GUFO_CORE_JSON_HPP_
+#define GUFO_CORE_JSON_HPP_
 
 #include <charconv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <ostream>
 #include <sstream>
 #include <stdexcept>
@@ -23,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace gufo::models::qwen3_asr::json {
+namespace gufo::json {
 
 /// Minimal, ordered JSON value with a recursive-descent parser and serializer.
 /// Object member order is preserved via a vector of (key, value) pairs.
@@ -158,12 +152,14 @@ public:
   double as_double(double def = 0.0) const noexcept {
     return is_number() ? num_ : def;
   }
-  long long as_int(long long def = 0) const noexcept {
-    return is_number() ? static_cast<long long>(std::llround(num_)) : def;
-  }
   std::size_t as_size(std::size_t def = 0) const noexcept {
-    if (!is_number() || num_ < 0.0)
+    // The largest size_t rounds up when converted to double on x86-64.
+    // Compare against the exclusive power-of-two bound before conversion.
+    if (!is_number() || !std::isfinite(num_) || num_ < 0.0 ||
+        std::floor(num_) != num_ ||
+        num_ >= std::ldexp(1.0, std::numeric_limits<std::size_t>::digits)) {
       return def;
+    }
     return static_cast<std::size_t>(num_);
   }
   /// The string payload (empty string if this is not a string).
@@ -172,7 +168,7 @@ public:
     return is_string() ? str_ : kEmpty;
   }
   /// The string payload, or `def` if not a string.
-  std::string get_str(const std::string& def = "") const noexcept {
+  std::string get_str(const std::string& def = "") const {
     return is_string() ? str_ : def;
   }
 
@@ -192,14 +188,19 @@ private:
       case Type::kBool:
         os << (bool_ ? "true" : "false");
         break;
-      case Type::kNumber:
-        if (std::isfinite(num_) && std::floor(num_) == num_ &&
-            std::fabs(num_) < 1e15) {
-          os << static_cast<long long>(std::llround(num_));
-        } else {
-          os << num_;
+      case Type::kNumber: {
+        if (!std::isfinite(num_)) {
+          throw std::invalid_argument("JSON numbers must be finite");
         }
+        char buffer[64];
+        const auto [end, error] =
+            std::to_chars(buffer, buffer + sizeof(buffer), num_);
+        if (error != std::errc{}) {
+          throw std::runtime_error("JSON number serialization failed");
+        }
+        os.write(buffer, end - buffer);
         break;
+      }
       case Type::kString:
         os << '"' << escape(str_) << '"';
         break;
@@ -293,15 +294,18 @@ struct Parser {
     }
   }
   // NOLINTNEXTLINE(misc-no-recursion)
-  Value parse_value() {
+  Value parse_value(std::size_t depth = 0) {
     skip_ws();
     if (i >= s.size())
       fail("unexpected end of input");
     const char c = s[i];
+    if ((c == '{' || c == '[') && depth >= 128) {
+      fail("maximum nesting depth exceeded");
+    }
     if (c == '{')
-      return parse_object();
+      return parse_object(depth + 1);
     if (c == '[')
-      return parse_array();
+      return parse_array(depth + 1);
     if (c == '"')
       return Value(parse_string());
     if (c == 't' || c == 'f')
@@ -311,7 +315,7 @@ struct Parser {
     return parse_number();
   }
   // NOLINTNEXTLINE(misc-no-recursion)
-  Value parse_object() {
+  Value parse_object(std::size_t depth) {
     Value v = Value::object();
     std::unordered_set<std::string> keys;
     ++i;  // {
@@ -331,7 +335,7 @@ struct Parser {
       ++i;
       if (!keys.emplace(key).second)
         fail("duplicate object key");
-      v.append_member(key, parse_value());
+      v.append_member(key, parse_value(depth));
       skip_ws();
       if (i >= s.size())
         fail("unterminated object");
@@ -347,7 +351,7 @@ struct Parser {
     }
   }
   // NOLINTNEXTLINE(misc-no-recursion)
-  Value parse_array() {
+  Value parse_array(std::size_t depth) {
     Value v = Value::array();
     ++i;  // [
     skip_ws();
@@ -356,7 +360,7 @@ struct Parser {
       return v;
     }
     while (true) {
-      v.push_back(parse_value());
+      v.push_back(parse_value(depth));
       skip_ws();
       if (i >= s.size())
         fail("unterminated array");
@@ -370,6 +374,24 @@ struct Parser {
       }
       fail("expected ',' or ']' in array");
     }
+  }
+  unsigned parse_hex_quad() {
+    if (i + 4 > s.size())
+      fail("bad \\u");
+    unsigned code = 0;
+    for (int k = 0; k < 4; ++k) {
+      const char h = s[i++];
+      code <<= 4;
+      if (h >= '0' && h <= '9')
+        code |= h - '0';
+      else if (h >= 'a' && h <= 'f')
+        code |= h - 'a' + 10;
+      else if (h >= 'A' && h <= 'F')
+        code |= h - 'A' + 10;
+      else
+        fail("bad hex");
+    }
+    return code;
   }
   std::string parse_string() {
     ++i;  // opening quote
@@ -408,28 +430,30 @@ struct Parser {
             out += '\t';
             break;
           case 'u': {
-            if (i + 4 > s.size())
-              fail("bad \\u");
-            unsigned code = 0;
-            for (int k = 0; k < 4; ++k) {
-              const char h = s[i++];
-              code <<= 4;
-              if (h >= '0' && h <= '9')
-                code |= h - '0';
-              else if (h >= 'a' && h <= 'f')
-                code |= h - 'a' + 10;
-              else if (h >= 'A' && h <= 'F')
-                code |= h - 'A' + 10;
-              else
-                fail("bad hex");
+            unsigned code = parse_hex_quad();
+            if (code >= 0xD800 && code <= 0xDBFF) {
+              if (i + 2 > s.size() || s[i] != '\\' || s[i + 1] != 'u')
+                fail("unpaired high surrogate");
+              i += 2;
+              const unsigned low = parse_hex_quad();
+              if (low < 0xDC00 || low > 0xDFFF)
+                fail("invalid low surrogate");
+              code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+            } else if (code >= 0xDC00 && code <= 0xDFFF) {
+              fail("unpaired low surrogate");
             }
             if (code < 0x80) {
               out += static_cast<char>(code);
             } else if (code < 0x800) {
               out += static_cast<char>(0xC0 | (code >> 6));
               out += static_cast<char>(0x80 | (code & 0x3F));
-            } else {
+            } else if (code < 0x10000) {
               out += static_cast<char>(0xE0 | (code >> 12));
+              out += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+              out += static_cast<char>(0x80 | (code & 0x3F));
+            } else {
+              out += static_cast<char>(0xF0 | (code >> 18));
+              out += static_cast<char>(0x80 | ((code >> 12) & 0x3F));
               out += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
               out += static_cast<char>(0x80 | (code & 0x3F));
             }
@@ -518,6 +542,6 @@ struct Parser {
   return value;
 }
 
-}  // namespace gufo::models::qwen3_asr::json
+}  // namespace gufo::json
 
-#endif  // GUFO_MODELS_QWEN3_ASR_JSON_HPP_
+#endif  // GUFO_CORE_JSON_HPP_

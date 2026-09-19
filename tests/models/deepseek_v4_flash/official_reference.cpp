@@ -14,13 +14,13 @@
 #include <string_view>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/json.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 
 namespace gufo::testing::ds4 {
 namespace {
-namespace json = gufo::server::json;
+namespace json = gufo::json;
 
 void Require(bool condition, const std::string& message) {
   if (!condition)

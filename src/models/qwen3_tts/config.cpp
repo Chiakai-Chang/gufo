@@ -7,12 +7,12 @@
 #include <string>
 #include <string_view>
 
-#include "src/models/qwen3_tts/json.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::models::qwen3_tts {
 namespace {
 
-namespace json = gufo::models::qwen3_tts::json;
+namespace json = gufo::json;
 
 const json::Value* FindPath(const json::Value& root,
                             std::initializer_list<std::string_view> path) {

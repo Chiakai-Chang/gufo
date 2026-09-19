@@ -6,7 +6,7 @@
 #include <string>
 #include <string_view>
 
-#include "src/models/qwen3_asr/json.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::models::qwen3_asr {
 namespace {

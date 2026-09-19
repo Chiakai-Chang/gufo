@@ -425,7 +425,7 @@ int GenerateDeepSeekResponse(
         bridge.emplace(sampler);
       if (!session.DsparkStep(opt.max_tokens - generated, opt.draft_tokens,
                               &emitted, &error,
-                              bridge ? bridge->hook() : nullptr)) {
+                              bridge ? bridge->hook() : nullptr, true)) {
         std::cerr << "\nDeepSeek V4 Flash speculative decode failed: " << error
                   << '\n';
         return 1;

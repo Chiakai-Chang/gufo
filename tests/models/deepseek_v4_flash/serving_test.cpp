@@ -190,6 +190,74 @@ void CheckSampledBatchReplay(const std::shared_ptr<Model>& model,
          "concurrent runtime invokes stochastic proposal and verification");
 }
 
+void CheckDsparkEosBoundary(const std::shared_ptr<Model>& model) {
+  using namespace gufo::models::deepseek_v4_flash;
+  const auto prompt = model->Tokenize("Continue the pattern: red, blue, red,");
+  struct Draw {
+    int token;
+    int calls = 0;
+  };
+  std::array<Draw, 3> draws{
+      {{model->EosToken()}, {prompt.back()}, {prompt.back()}}};
+  std::array<ds4_dspark_sampler, 3> hooks{};
+  std::array<std::unique_ptr<Session>, 3> sessions;
+  std::array<std::vector<int>, 3> emitted;
+  std::array<SessionDsparkBatchItem, 3> items{};
+  std::string error;
+  for (std::size_t i = 0; i < sessions.size(); ++i) {
+    sessions[i] = model->CreateSession(4096, &error);
+    Expect(sessions[i] && sessions[i]->Sync(prompt, &error), error);
+    hooks[i] = {.ctx = &draws[i],
+                .sample = [](void* ctx, const float*, uint32_t) {
+                  auto& draw = *static_cast<Draw*>(ctx);
+                  ++draw.calls;
+                  return draw.token;
+                }};
+    items[i] = {.session = sessions[i].get(),
+                .max_tokens = 1,
+                .max_draft_tokens = 1,
+                .emitted = &emitted[i],
+                .sampler = &hooks[i],
+                .stop_at_eos = true};
+  }
+  const auto eos_logits = sessions[0]->CopyLogits(&error);
+  Expect(!eos_logits.empty(), error);
+  // Exercise no survivors, one survivor and a compacted GPU batch.
+  for (std::size_t width = 1; width <= items.size(); ++width) {
+    std::array<std::size_t, 3> positions{};
+    for (std::size_t i = 0; i < width; ++i) {
+      positions[i] = sessions[i]->Position();
+      draws[i].calls = 0;
+    }
+    Expect(model->DsparkStepBatch(std::span(items).first(width), &error),
+           error);
+    for (std::size_t i = 0; i < width; ++i) {
+      Expect(
+          emitted[i] == std::vector<int>{draws[i].token} && draws[i].calls == 1,
+          "EOS compaction emits each request's draw without resampling");
+      Expect(sessions[i]->Position() == positions[i] + (i != 0),
+             "only non-EOS anchors enter the request checkpoint");
+    }
+    Expect(sessions[0]->CopyLogits(&error) == eos_logits,
+           "EOS keeps the preceding frontier logits");
+  }
+  std::array<std::size_t, 3> positions{};
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    positions[i] = sessions[i]->Position();
+    draws[i] = {model->EosToken()};
+  }
+  Expect(model->DsparkStepBatch(items, &error), error);
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    Expect(sessions[i]->Position() == positions[i] && draws[i].calls == 1 &&
+               emitted[i] == std::vector<int>{model->EosToken()},
+           "an all-EOS cohort completes without committing tokens");
+  }
+  Expect(sessions[0]->DsparkStep(1, 1, &emitted[0], &error, &hooks[0]), error);
+  Expect(sessions[0]->Position() == prompt.size() + 1 &&
+             emitted[0] == std::vector<int>{model->EosToken()},
+         "fixed-length decoding still consumes EOS as an ordinary token");
+}
+
 void CheckDsparkServing(const char* model_path, const char* support_path) {
   using namespace gufo::server;
   std::string error;
@@ -198,6 +266,7 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
       ModelOptions{.max_context = 262144, .dspark_model_path = support_path},
       &error);
   Expect(model != nullptr, error);
+  CheckDsparkEosBoundary(model);
   const TextSpeculativeConfig speculative{
       .backend = TextSpeculativeBackend::kDSpark,
       .draft_model_path = support_path};
@@ -373,12 +442,30 @@ void CheckDsparkServing(const char* model_path, const char* support_path) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
     const char* model_path = std::getenv("GUFO_DEEPSEEK_V4_FLASH_MODEL");
     if (model_path == nullptr || model_path[0] == '\0') {
       std::cout << "SKIP: GUFO_DEEPSEEK_V4_FLASH_MODEL is not set\n";
       return 77;
+    }
+    if (argc > 1) {
+      Expect(argc == 2 && std::string_view(argv[1]) == "--dspark-eos",
+             "usage: ds4_serving_test [--dspark-eos]");
+      const char* support = std::getenv("GUFO_DEEPSEEK_V4_FLASH_DSPARK_MODEL");
+      if (support == nullptr || *support == '\0') {
+        std::cout << "SKIP: GUFO_DEEPSEEK_V4_FLASH_DSPARK_MODEL is not set\n";
+        return 77;
+      }
+      std::string error;
+      auto model = Model::Load(
+          model_path,
+          ModelOptions{.max_context = 4096, .dspark_model_path = support},
+          &error);
+      Expect(model != nullptr, error);
+      CheckDsparkEosBoundary(model);
+      std::cout << "DSpark EOS checkpoint checks passed\n";
+      return 0;
     }
 
     {

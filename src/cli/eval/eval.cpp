@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 #include "src/eval/dataset.hpp"
 #include "src/eval/extract.hpp"
 #include "src/eval/http_client.hpp"
@@ -40,7 +40,7 @@ namespace gufo::cli {
 namespace {
 
 using gufo::eval::HttpResult;
-using gufo::server::json::Value;
+using gufo::json::Value;
 
 constexpr std::size_t kMaximumQuestions = 75;
 constexpr std::size_t kMaximumCompletionTokens = 16000;
@@ -190,7 +190,7 @@ std::optional<ModelInfo> ParseSingleModel(const HttpResult& response,
   }
 
   try {
-    const Value root = gufo::server::json::parse(response.body);
+    const Value root = gufo::json::parse(response.body);
     const Value* data = root.find("data");
     if (data == nullptr || !data->is_array()) {
       throw std::runtime_error("response has no data array");
@@ -261,7 +261,7 @@ Value RequestJson(const ModelInfo& model, Value messages, bool greedy) {
 std::optional<ParsedCompletion> ParseCompletion(const HttpResult& response,
                                                 std::string* error) {
   try {
-    const Value root = gufo::server::json::parse(response.body);
+    const Value root = gufo::json::parse(response.body);
     const Value* choices = root.find("choices");
     if (choices == nullptr || !choices->is_array() || choices->size() != 1) {
       throw std::runtime_error("response must contain exactly one choice");
@@ -302,7 +302,7 @@ std::optional<ParsedCompletion> ParseCompletion(const HttpResult& response,
 
 std::string ApiErrorCode(const HttpResult& response) {
   try {
-    const Value root = gufo::server::json::parse(response.body);
+    const Value root = gufo::json::parse(response.body);
     const Value* api_error = root.find("error");
     if (api_error != nullptr && api_error->is_object()) {
       return api_error->member_str("code");

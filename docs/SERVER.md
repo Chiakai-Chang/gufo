@@ -1,6 +1,6 @@
 # OpenAI-Compatible Server
 
-Status: active implementation contract, 2026-08-22
+Status: implemented subset, 2026-09-19
 
 ## Purpose
 
@@ -9,9 +9,9 @@ scheduling, and device execution in the C++ process. Compatibility is a
 versioned contract: supported fields behave as documented, and unsupported
 fields return explicit errors.
 
-The primary API is the Responses API. Chat Completions is an adapter over the
-same internal request representation. The implementation should follow the
-official OpenAI API reference for object names and streaming event shapes:
+Chat Completions is the main API, including streaming, images and tools.
+Responses and Anthropic Messages currently expose synchronous text subsets.
+The reference protocols are:
 
 - https://developers.openai.com/api/reference/resources/responses/methods/create/
 - https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create/
@@ -24,18 +24,11 @@ The only supported production platform is Linux x86-64 on Strix Halo.
 
 ## Implementation
 
-Use C++20 for the complete runtime:
-
-- Asynchronous HTTP/1.1 with keep-alive.
-- Server-Sent Events for streaming.
-- Separate I/O, scheduling, and device-execution threads.
-- Incremental JSON parsing with bounded request sizes.
-- Backpressure-aware response writers.
-- Cancellation propagated from socket closure to the scheduler.
-
-Boost.Asio/Beast is a reasonable initial transport. Keep HTTP and JSON types
-outside the inference core so the transport can be replaced without changing
-request scheduling.
+The C++20 runtime uses bounded HTTP/1.1 requests, one connection worker per
+request, and a separate inference scheduler. Connections close after each
+response. Chat Completions supports Server-Sent Events; socket closure
+propagates cancellation to the scheduler. JSON parsing rejects duplicate keys,
+invalid numbers and nesting beyond 128 containers.
 
 Python may be used for development tools and API conformance tests, but it must
 not be required to serve requests.
@@ -63,13 +56,13 @@ audio transcription endpoint.
 Their detailed contracts are defined in [Command-Line Interface](CLI.md) and
 [MiniMax H3 Integration Boundary](MINIMAX_H3.md).
 
-### Current Single-Request HIP Path
+### HIP execution
 
 Qwen HTTP requests share one immutable `QwenGpuModel` containing the mapped
 weights and tokenizer. Each request leases a preallocated `QwenGpuExecutor`
 with independent KV, recurrent, graph, activation, and logit state.
-`--sessions N` controls the bounded session pool; it does not enable
-continuous batching.
+`--sessions N` controls the bounded session pool. The scheduler batches ready
+requests when the model runner supports their execution mode.
 
 ```sh
 nix build
@@ -105,40 +98,25 @@ expert projections share weight reads across the batch; one request uses the
 single-session path.
 
 With `--dspark-model <support.gguf>`, DSpark is selected automatically unless
-`--speculative off` is explicit. Greedy and sampled requests share support
-computation and ragged verification. A sampled request draws every verified
-row with its own sampler (temperature, top-k, top-p, min-p, penalties, seed)
-and accepts the draft while the draw reproduces it, so a seeded request emits
-the same tokens as autoregressive decoding; acceptance falls with temperature
-because a draft is accepted with its target probability rather than by argmax
-match. Draft widths adapt within the requested `--draft-tokens` ceiling. C1 starts at three support
-tokens and can grow to the artifact limit; C2/C4/C8 cap the tail at three and C6
-at two. Low-acceptance C1 requests temporarily return to autoregressive decode.
-These measured defaults are model-owned. See the
-[DS4 benchmark and quality contract](../benchmarks/deepseek-v4-flash/README.md).
+`--speculative off` is explicit. Greedy and sampled requests keep independent
+samplers, cache state and draft policies. C1 uses point-mass proposals and
+retains seeded AR token identity; filtered sampled C>1 can use compact
+probabilistic proposals with exact p/q acceptance and residual correction.
+That route preserves the target distribution with its own seeded trace.
+Request decoding leaves EOS and later speculative tokens out of the reusable
+checkpoint. Fixed-length benchmarks may continue through EOS.
+See the [DS4 benchmark and quality contract](../benchmarks/deepseek-v4-flash/README.md).
 
-Qwen3.8-Flash-Next (`general.architecture = qwen4exp`) serves through the
-same runner interface with one session per request state. Its recurrent
-state cannot be rewound, so continuation reuse works through snapshots: at
-the end of prefill the runner copies the session (recurrent and PLE state,
-KV and indexer rows up to the prompt, the draft block's caches) into host
-memory, keyed on the prompt tokens. A later prompt that extends a retained
-prompt restores that copy into a free session and prefills only the tail;
-the retained set is bounded by half of the host memory free at load, and
-`--cache-disk` adds the restart-safe tier with the same payload. A prompt
-that matches no retained prefix restarts from token zero. Sampling
-runs server-side over the session logits, so every sampling flag applies;
-the artifact's pinned Qwen3.8 reasoning template drives the reasoning
-controls below. `--speculative mtp --mtp-model <mtp-...-shared-*.gguf>`
-enables the MTP draft block (`--draft-tokens`): drafts are
-deterministic, and both greedy and sampled requests verify them with the
-target sampler over the full vocabulary. Accepted tokens update penalty
-history once; rejection restores the RNG to the unconsumed target draw.
-The fixed draft chain supports 1–7 tokens and requires
-`--min-draft-tokens 1`. Drafts also score the full vocabulary.
-Each model yields after its own prefill chunk; spare session slots do not
-change a lone request's chunk size. `--prefill-chunk` separately limits prompt
-work between active decode rounds. Requests run serially across sessions.
+Qwen3.8-Flash-Next uses the same scheduler, with independent recurrent, KV,
+indexer, sampling and MTP state per session. Prefix snapshots retain complete
+state; `--cache-disk` adds restart-safe reuse. MTP draft length adapts within the
+configured ceiling. Sampled MTP proposals use p/q acceptance and residual
+correction; greedy verification follows target argmax. Draft and verification
+work can batch across ready requests. See the
+[Flash-Next benchmark and quality contract](../benchmarks/qwen3.8-flash-next/README.md).
+
+Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
+between active decode rounds without changing a lone request's kernel policy.
 
 ### Reasoning controls
 
@@ -224,52 +202,33 @@ Changing weights for an already supported kind does not.
 
 ## Process and State Ownership
 
-Use separate execution domains:
-
-```text
-HTTP I/O threads
-tokenization workers
-single-owner scheduler
-GPU submit/completion worker
-NPU submit/completion worker
-background storage workers
-```
-
-Only the scheduler mutates logical request, session, KV-ownership, speculative,
-and commit state. Other threads send immutable commands or completion records.
-
-Every completion record contains:
-
-- Request and execution IDs.
-- Allocation and state generations.
-- Backend route and program/kernel identity.
-- Completion status and bounded result metadata.
-
-Stale completions are rejected by generation before they can alter request
-state. I/O threads never wait synchronously for device completion.
+HTTP workers submit requests through `TextGenerationBackend`. The text
+scheduler owns request state and serializes model execution. Model runners own
+weights, tokenization, prefill/decode, speculative verification and complete
+cache snapshots. HTTP handlers do not implement model kernels.
 
 ## Endpoint Set
 
-### Milestone 1
+### Text endpoints
 
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/v1/models` | List loaded model aliases and capabilities |
-| `POST` | `/v1/responses` | Primary text generation API |
-| `POST` | `/v1/chat/completions` | Chat Completions compatibility |
+| `POST` | `/v1/responses` | Synchronous text subset |
+| `POST` | `/v1/chat/completions` | Main chat, streaming, image and tool API |
 | `POST` | `/v1/completions` | Optional legacy text completion adapter |
 | `GET` | `/health` | Process liveness (aliases: `/v1/health`, `/healthz`) |
 | `GET` | `/ready` | Model and backend readiness (aliases: `/v1/ready`, `/readyz`) |
 | `GET` | `/metrics` | Prometheus-format operational metrics (text LLM serving only) |
 
-### Later, capability-gated
+### Other model services
 
 | Method | Path | Condition |
 | --- | --- | --- |
-| `POST` | `/v1/embeddings` | An embedding implementation is compiled and loaded |
+| `POST` | `/v1/embeddings` | Not implemented (501) |
 | `POST` | `/v1/audio/transcriptions` | An STT implementation is compiled and loaded |
 | `POST` | `/v1/audio/speech` | A TTS implementation is compiled and loaded |
-| `POST` | `/v1/images/generations` | An image implementation is compiled and loaded |
+| `POST` | `/v1/images/generations` | Not implemented (501) |
 | `POST` | `/v1/videos` | A validated operator-supplied MiniMax H3 checkpoint is configured |
 | `GET` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 | `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
@@ -396,66 +355,37 @@ atomic publication.
 
 ## Internal Request Model
 
-All public endpoints translate into one scheduler request:
-
-```cpp
-struct GenerationRequest {
-    RequestId id;
-    ModelId model;
-    Prompt prompt;
-    SamplingConfig sampling;
-    OutputConstraints constraints;
-    ToolConfig tools;
-    Priority priority;
-    Deadline deadline;
-    bool stream;
-};
-```
-
-Transport adapters may not directly call a model backend.
-
-The prompt representation must preserve:
-
-- System, developer, user, assistant, and tool roles where supported.
-- Text and structured tool-call items.
-- Model-specific chat-template version.
-- Exact token IDs after tokenization.
-- Request-level stop conditions.
+Text endpoints use `ChatRequest` and `SamplingConfig` at the
+[backend boundary](../src/cli/serve/text_generation_backend.hpp).
+Chat messages retain roles, reasoning, tool calls and image content until the
+model's tokenizer and template turn them into model input. The scheduler owns
+request limits, cancellation, cache accounting and completion state.
 
 ## Responses API Subset
 
-`POST /v1/responses` initially accepts:
+`POST /v1/responses` accepts `model`, `input` as text or text-message arrays,
+`instructions`, `max_output_tokens`, and the shared sampling controls. Clients
+supply the complete conversation. `store`, `background` and `stream` must be
+false when present. Images, tools, structured output, server-side conversations
+and `previous_response_id` are rejected on this route. Use Chat Completions for
+validated image, tool and streaming support.
 
-- `model`
-- `input` as text or a supported item array
-- `instructions`
-- `max_output_tokens`
-- `temperature`
-- `top_p`
-- `stream`
-- `text` for supported text and structured-output configuration
-- `tools` and `tool_choice` for model implementations with validated tool support
-- `metadata`, retained only for logging if enabled
+Responses report `incomplete` with reason `max_output_tokens` when generation
+hits its limit. Otherwise they report `completed`.
 
-The first release is stateless by default:
+The other compatibility routes are deliberately limited:
 
-- `store` is accepted only when it is false; `store: true` is rejected.
-- Server-side conversations and `previous_response_id` are rejected.
-- Clients provide all context required for the request.
+| Route | Supported request | Output limit |
+| --- | --- | --- |
+| `/v1/completions` | One prompt string, one non-streaming completion | `max_tokens` |
+| `/v1/messages` | Text messages and optional text system instructions | `max_tokens` |
+| `/completion` | One prompt string, non-streaming completion | `n_predict` |
 
-Non-streaming responses return one completed response object. Streaming uses
-SSE and emits a stable subset of Responses streaming events, including:
-
-```text
-response.created
-response.output_item.added
-response.content_part.added
-response.output_text.delta
-response.output_text.done
-response.completed
-```
-
-Errors terminate the stream with an error event when possible.
+All four routes validate the loaded model, positive integer limits and shared
+sampling controls. They reject unsupported streaming, multiple candidates,
+stop strings and other generation controls instead of ignoring them.
+`/infill` and `/v1/messages/count_tokens` return 501: suffix-conditioned infill
+and template-aware message counting are not implemented.
 
 ## Chat Completions Adapter
 
@@ -467,11 +397,10 @@ Errors terminate the stream with an error event when possible.
 - `temperature`
 - `top_p`
 - `seed`
-- `stop`
 - `stream`
 - `stream_options.include_usage`
 - `tools` and `tool_choice` when supported
-- common frequency and presence penalties when implemented by the sampler
+- shared top-k, min-p, repeat, frequency and presence sampling controls
 
 Streaming objects use `chat.completion.chunk` and end with the compatibility
 sentinel expected by common clients.
@@ -481,41 +410,10 @@ into the same prompt and sampling structures used by `/v1/responses`.
 
 ## Model Discovery
 
-`GET /v1/models` returns only usable model aliases. Each model entry includes
-the standard identifier fields plus optional local metadata under a namespaced
-extension:
-
-```json
-{
-  "id": "qwen-current-27b",
-  "object": "model",
-  "created": 0,
-  "owned_by": "local",
-  "gufo": {
-    "artifact_id": "qwen-27b-shq-t16-4p42bpw",
-    "context_length": 131072,
-    "quantization": "SHQ-T16",
-    "bits_per_weight": 4.42,
-    "tensor_encodings": ["SHQ4-T16", "SHQ8-T16", "BF16"],
-    "backends": ["gfx1151", "xdna2"],
-    "capabilities": ["responses", "chat", "tools"]
-  }
-}
-```
-
-Clients must not need the extension to use the model.
-
-When several sizes of the same model are loaded, their public aliases must be
-distinct and should expose the measured size, for example:
-
-```text
-qwen-27b-4.4bpw
-qwen-27b-5.2bpw
-qwen-27b-6.1bpw
-```
-
-Aliases are configuration choices; compatibility depends on the immutable
-artifact ID returned in the `gufo` metadata.
+`GET /v1/models` lists the configured text model and ready audio/video
+services. Entries provide `id`, `object`, `created` and `owned_by`; audio/video
+entries also describe their capability. Send the returned model ID in requests.
+Text requests naming another model return 404.
 
 ## Errors
 
@@ -544,8 +442,8 @@ Use appropriate HTTP status codes:
 - `500` internal failure
 - `503` model or backend unavailable
 
-Do not silently clamp context or output limits without returning the effective
-limits in response metadata.
+Generation stops at the request budget or context capacity and reports a
+length finish reason when either limit is reached.
 
 ## Authentication and Exposure
 
@@ -571,153 +469,42 @@ and API key for inference and metrics.
 `gufo eval` and `tools/serving/gufo-serving-bench.py` send `OPENAI_API_KEY`
 as the bearer credential when it is set.
 
-## Backpressure and Cancellation
+## Lifecycle and limits
 
-- Bound accepted request count, queued tokens, and active KV pages.
-- Reject before tokenization when the admission queue is full.
-- Stop scheduling new decode work immediately after cancellation.
-- Reclaim provisional KV and speculative state transactionally.
-- Permit an in-flight device step to finish if it cannot be safely interrupted.
-- Never block an I/O thread waiting for a device event.
+The HTTP transport bounds connection count and request-body size. The scheduler
+bounds admission and output buffering and propagates client cancellation to
+model runners. An in-flight GPU operation may finish before its request retires.
+See [CLI.md](CLI.md) for supported configuration flags.
 
-## Startup and Readiness
-
-Process states are:
-
-```text
-STARTING
-WARMING
-READY
-DEGRADED
-DRAINING
-FAILED
-```
-
-Startup performs:
-
-1. Parse configuration and reject unknown fields.
-2. Discover and fingerprint the Strix Halo GPU and NPU.
-3. Initialize the allocation broker and safety reserves.
-4. Initialize compiled backend programs and kernel registries.
-5. Load each configured weight artifact into unpublished state.
-6. Validate tensors, checksums, tokenizer, quantization, and state contracts.
-7. Prefault required memory and create graph-stable allocations.
-8. Run backend visibility, kernel, and model smoke tests.
-9. Warm required single-request and configured batch routes.
-10. Publish usable model aliases and become ready.
-
-`GET /health` reports whether the process event loops and control plane are
-alive. It does not imply that a model is usable.
-
-`GET /ready` succeeds when at least one advertised model alias can admit work.
-Its body reports:
-
-- Process state.
-- Loaded aliases.
-- GPU and NPU availability.
-- Disabled or degraded routes.
-- Memory-pressure state.
-
-If NPU initialization or recovery fails but a model has a validated GPU route,
-the process enters `DEGRADED` and remains ready for GPU-only serving. A model
-that requires an unavailable backend is omitted from `/v1/models`.
-
-## Configuration
-
-Configuration precedence is:
-
-```text
-compiled safe defaults
-< configuration file
-< explicitly supported command-line flags
-```
-
-Secrets such as bearer tokens may be read from protected files or environment
-variables, but their values are never rendered by configuration diagnostics.
-
-Reject:
-
-- Unknown configuration keys.
-- Duplicate model aliases.
-- Unsupported model kinds.
-- Relative or escaping model paths where policy forbids them.
-- Unsafe memory budgets below the platform minimum without an explicit
-  development override.
-- Remote binding without the remote-exposure flag.
-
-The effective non-secret configuration is available in startup logs and
-diagnostic output.
-
-## Model Replacement
-
-Weight replacement for a supported model kind is transactional:
-
-1. Resolve and validate the candidate artifact.
-2. Reserve its complete load and warmup budget.
-3. Load it under an unpublished internal ID.
-4. Run required smoke and compatibility tests.
-5. Atomically move the public alias to the candidate.
-6. Drain sessions using the previous artifact.
-7. Release previous weights after the final reference retires.
-
-The server never changes the weights underneath an active session. Rollback is
-available only when memory for the previous artifact was deliberately retained.
-
-Replacement is initiated through a local administrative mechanism, not the
-public OpenAI API.
-
-## Graceful Shutdown
-
-On `SIGTERM` or an administrative shutdown:
-
-1. Enter `DRAINING`.
-2. Stop accepting new inference requests.
-3. Finish or cancel queued work according to configured grace time.
-4. Let uninterruptible device operations retire.
-5. Commit only transitions completed before cancellation.
-6. Flush bounded response and metric buffers.
-7. Finish or abort snapshot writes transactionally.
-8. Destroy graphs, NPU contexts, queues, and allocations in dependency order.
-
-A second termination signal or expired hard deadline performs an immediate
-best-effort shutdown without publishing partial snapshots or state.
-
-After system suspend/resume or a backend reset, the server recreates affected
-contexts and imported allocations, reruns visibility and smoke tests, and keeps
-the route disabled until validation succeeds.
+`GET /health` reports process liveness. `GET /ready` returns 503 until a model
+service is ready, then reports `status` and the active model. It does not expose
+a GPU/NPU health matrix. HTTP model replacement and persistent Responses
+conversations are not implemented.
 
 ## Metrics
 
-At minimum expose:
+`/metrics` exposes total prompt/generated tokens and the latest prompt/decode
+speeds. `Server-Timing`, generation `timings`, and Chat Completions
+`usage.gufo` provide request-level measurements. The legacy KV-utilization
+metric and `/slots`/`/props` metadata are placeholders; do not use them for
+capacity or admission decisions.
 
-- Time to first token.
-- Inter-token latency.
-- Prompt and generated tokens per second.
-- Queue and admission delay.
-- Active, queued, cancelled, and failed requests.
-- GPU-only, NPU-only, and heterogeneous route counts.
-- Scheduler batch width and padding.
-- KV pages used, shared, evicted, dumped, and restored.
-- Speculative proposed, verified, accepted, and committed tokens.
-- Per-backend execution and synchronization time.
+TODO: real slot/KV metrics, a validated administrative reload/drain interface,
+and automatic recovery after device reset or suspend/resume.
 
-Metrics labels must use bounded model and route identifiers. Do not place
-request IDs or prompt text in labels.
+## Focused checks
 
-## Conformance Tests
+- `json_test`: number precision, Unicode escapes, malformed input and depth limits.
+- `http_server_test`: transport framing, authentication, compatibility validation,
+  sampling forwarding and completion metadata without loading a model.
+- `openai_chat_test`: chat parsing, streaming, images, tools and sampling controls.
+- `serve_cli_test`: executable help, argument wiring and rejected configurations.
+- Per-model serving tests: greedy/sampled decoding, batching, cache reuse and
+  cancellation. Use the affected model's benchmark README for commands and limits.
 
-- Golden JSON request/response fixtures for every supported field.
-- Official-client smoke tests against a local base URL.
-- Streaming chunk ordering and disconnect tests.
-- Chat Completions and Responses token parity.
-- Tool-call and structured-output fixtures.
-- Unknown and unsupported parameter tests.
-- Queue saturation, timeout, and cancellation tests.
-- Direct runtime versus HTTP exact-token tests for greedy generation.
-- Startup failure at every initialization stage.
-- GPU-only degraded readiness after NPU failure.
-- Model replacement, drain, alias switch, and rollback.
-- Graceful and forced shutdown with active requests.
-- Suspend/resume and backend-context reconstruction.
-- Scheduler stale-completion rejection.
-- Configuration and secret-redaction tests.
+DSpark's short boundary check is available without the complete serving suite:
+
+```sh
+# Set GUFO_DEEPSEEK_V4_FLASH_MODEL and GUFO_DEEPSEEK_V4_FLASH_DSPARK_MODEL first.
+nix develop -c build/gpu-test/tests/models/deepseek_v4_flash/ds4_serving_test --dspark-eos
+```

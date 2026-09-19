@@ -9,7 +9,7 @@
 #include <string>
 #include <string_view>
 
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 #include "src/core/sampling.hpp"
 
 namespace gufo::server {

@@ -20,7 +20,7 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 
 namespace {
 
@@ -190,7 +190,7 @@ std::string Multipart(
 }
 
 std::string CreatedId(const HttpResponse& response) {
-  const auto body = gufo::server::json::parse(response.body);
+  const auto body = gufo::json::parse(response.body);
   return body.member_str("id");
 }
 

@@ -14,12 +14,12 @@
 #include <string_view>
 #include <utility>
 
-#include "src/models/qwen3_tts/json.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::models::qwen3_tts {
 namespace {
 
-namespace json = gufo::models::qwen3_tts::json;
+namespace json = gufo::json;
 
 /// RAII mmap holder; moved into LoadResult::mappings.
 class MappedFile {

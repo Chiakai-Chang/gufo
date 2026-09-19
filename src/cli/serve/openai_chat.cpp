@@ -21,9 +21,9 @@
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/image.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::server {
 namespace {
@@ -630,7 +630,8 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   output->sampling = parsed_sampling;
 
   if (const json::Value* choices = body.find("n");
-      choices != nullptr && (!choices->is_number() || choices->as_int() != 1)) {
+      choices != nullptr &&
+      (!choices->is_number() || choices->as_double() != 1.0)) {
     return Error(400, "Bad Request", "only n=1 is supported", "unsupported_n");
   }
   for (const std::string_view unsupported :

@@ -417,6 +417,11 @@ if (BUILD_TESTING)
   add_test(NAME arg_parser_test COMMAND arg_parser_test)
   set_tests_properties(arg_parser_test PROPERTIES LABELS "cpu;cli")
 
+  add_executable(json_test tests/core/json_test.cpp)
+  target_link_libraries(json_test PRIVATE gufo_core)
+  add_test(NAME json_test COMMAND json_test)
+  set_tests_properties(json_test PROPERTIES LABELS "cpu;json")
+
   add_executable(openai_chat_test
     tests/cli/openai_chat_test.cpp
     src/cli/serve/openai_chat.cpp

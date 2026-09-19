@@ -16,6 +16,7 @@
 #include <ctime>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <random>
 #include <ranges>
@@ -28,7 +29,6 @@
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
-#include "src/cli/serve/json.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/sampling_request.hpp"
@@ -36,6 +36,7 @@
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/json.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
 namespace gufo::server {
@@ -387,18 +388,128 @@ tokenization::ChatRole RoleFrom(const std::string& r) {
   return tokenization::ChatRole::kUser;
 }
 
-std::string ContentToString(const json::Value* content) {
-  std::string out;
+bool ReadTextContent(const json::Value* content, std::string* out) {
   if (content == nullptr)
-    return out;
+    return false;
   if (content->is_string()) {
-    out = content->get_str();
+    *out = content->get_str();
   } else if (content->is_array()) {
     for (const auto& part : content->items()) {
-      out += part.member_str("text", "");
+      const auto* text = part.find("text");
+      const auto type = part.member_str("type");
+      if (!part.is_object() || text == nullptr || !text->is_string() ||
+          (type != "text" && type != "input_text" && type != "output_text")) {
+        return false;
+      }
+      *out += text->str();
+    }
+  } else {
+    return false;
+  }
+  return true;
+}
+
+bool ReadTextMessages(const json::Value* input,
+                      std::vector<tokenization::ChatMessage>* messages) {
+  if (input == nullptr || !input->is_array() || input->empty())
+    return false;
+  for (const auto& item : input->items()) {
+    const auto role = item.member_str("role");
+    if (!item.is_object() ||
+        (role != "user" && role != "assistant" && role != "system" &&
+         role != "developer") ||
+        item.member_str("type", "message") != "message" ||
+        item.contains("tool_calls")) {
+      return false;
+    }
+    tokenization::ChatMessage message;
+    message.role = RoleFrom(role);
+    if (!ReadTextContent(item.find("content"), &message.content))
+      return false;
+    messages->push_back(std::move(message));
+  }
+  return true;
+}
+
+HttpResponse InvalidCompatibilityRequest(std::string_view message) {
+  return Err(400, "Bad Request", std::string(message).c_str(),
+             "invalid_request_error", "invalid_request");
+}
+
+// Compatibility routes implement a synchronous text subset. Validate options
+// before dispatch so a client never gets an answer to a different request.
+std::optional<HttpResponse> ReadCompatibilityOptions(
+    const json::Value& body, TextGenerationBackend& backend,
+    std::string_view token_field, std::size_t* max_tokens,
+    sampling::SamplingConfig* sampling_config) {
+  if (!body.is_object())
+    return InvalidCompatibilityRequest("request body must be an object");
+  if (const auto* model = body.find("model"); model != nullptr) {
+    if (!model->is_string())
+      return InvalidCompatibilityRequest("'model' must be a string");
+    if (model->str() != backend.model_id())
+      return Err(404, "Not Found", "requested model is not loaded",
+                 "invalid_request_error", "model_not_found");
+  }
+  for (const std::string field : {"stream", "echo", "store", "background"}) {
+    if (const auto* value = body.find(field);
+        value != nullptr && (!value->is_bool() || value->as_bool())) {
+      return InvalidCompatibilityRequest("'" + field + "' must be false");
     }
   }
-  return out;
+  for (const std::string field : {"n", "best_of"}) {
+    if (const auto* value = body.find(field);
+        value != nullptr &&
+        (!value->is_number() || value->as_double() != 1.0)) {
+      return InvalidCompatibilityRequest("only '" + field + "=1' is supported");
+    }
+  }
+  for (const std::string field : {"stream_options",
+                                  "stop",
+                                  "stop_sequences",
+                                  "logprobs",
+                                  "top_logprobs",
+                                  "suffix",
+                                  "tools",
+                                  "tool_choice",
+                                  "parallel_tool_calls",
+                                  "response_format",
+                                  "text",
+                                  "reasoning",
+                                  "reasoning_effort",
+                                  "thinking",
+                                  "chat_template_kwargs",
+                                  "previous_response_id",
+                                  "conversation",
+                                  "include",
+                                  "truncation",
+                                  "modalities",
+                                  "audio"}) {
+    if (body.contains(field)) {
+      return InvalidCompatibilityRequest("request field '" + field +
+                                         "' is not supported on this endpoint");
+    }
+  }
+  for (const std::string field : {"max_tokens", "max_completion_tokens",
+                                  "max_output_tokens", "n_predict"}) {
+    if (field != token_field && body.contains(field)) {
+      return InvalidCompatibilityRequest("use '" + std::string(token_field) +
+                                         "' on this endpoint");
+    }
+  }
+  const auto defaults = backend.sampling_defaults();
+  *max_tokens = defaults.max_tokens;
+  if (const auto error = detail::ReadSamplingInteger(
+          body, token_field, std::size_t{1},
+          std::size_t{std::numeric_limits<std::uint32_t>::max()}, max_tokens)) {
+    return InvalidCompatibilityRequest(error->message);
+  }
+  if (const auto error =
+          ParseSamplingConfig(body, defaults.sampling, sampling_config)) {
+    return Err(400, "Bad Request", error->message.c_str(),
+               "invalid_request_error", error->code.c_str());
+  }
+  return std::nullopt;
 }
 
 // ---------------------------------------------------------------------------
@@ -472,28 +583,21 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "parse_error");
   }
 
-  std::string prompt;
-  if (const json::Value* p = body.find("prompt")) {
-    if (p->is_string()) {
-      prompt = p->get_str();
-    } else if (p->is_array()) {
-      for (const auto& it : p->items())
-        prompt += it.get_str();
-    }
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error = ReadCompatibilityOptions(body, b, "max_tokens", &max_tokens,
+                                            &sampling_config)) {
+    return std::move(*error);
   }
+
+  const auto* input = body.find("prompt");
+  if (input == nullptr || !input->is_string()) {
+    return InvalidCompatibilityRequest("'prompt' must be a single string");
+  }
+  const std::string prompt = input->str();
   if (prompt.empty()) {
     return Err(400, "Bad Request", "'prompt' is required",
                "invalid_request_error", "missing_prompt");
-  }
-
-  const auto defaults = b.sampling_defaults();
-  const std::size_t max_tokens =
-      body.member_size("max_tokens", defaults.max_tokens);
-  sampling::SamplingConfig sampling_config;
-  if (const auto error =
-          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
-    return Err(400, "Bad Request", error->message.c_str(),
-               "invalid_request_error", error->code.c_str());
   }
 
   const auto res =
@@ -529,35 +633,28 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
                "parse_error");
   }
 
-  std::vector<tokenization::ChatMessage> messages;
-  if (const json::Value* input = body.find("input")) {
-    if (input->is_string()) {
-      messages.push_back(
-          {tokenization::ChatRole::kUser, input->get_str(), "", ""});
-    } else if (input->is_array()) {
-      for (const auto& item : input->items()) {
-        tokenization::ChatMessage m;
-        m.role = RoleFrom(item.member_str("role", "user"));
-        m.content = ContentToString(item.find("content"));
-        if (m.content.empty())
-          m.content = item.member_str("text", "");
-        messages.push_back(std::move(m));
-      }
-    }
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error = ReadCompatibilityOptions(body, b, "max_output_tokens",
+                                            &max_tokens, &sampling_config)) {
+    return std::move(*error);
   }
 
-  const auto defaults = b.sampling_defaults();
-  std::size_t max_tokens = defaults.max_tokens;
-  if (body.contains("max_output_tokens")) {
-    max_tokens = body.member_size("max_output_tokens", defaults.max_tokens);
-  } else if (body.contains("max_tokens")) {
-    max_tokens = body.member_size("max_tokens", defaults.max_tokens);
+  std::vector<tokenization::ChatMessage> messages;
+  if (const auto* instructions = body.find("instructions")) {
+    if (!instructions->is_string()) {
+      return InvalidCompatibilityRequest("'instructions' must be a string");
+    }
+    messages.push_back(
+        {tokenization::ChatRole::kSystem, instructions->str(), "", ""});
   }
-  sampling::SamplingConfig sampling_config;
-  if (const auto error =
-          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
-    return Err(400, "Bad Request", error->message.c_str(),
-               "invalid_request_error", error->code.c_str());
+  const auto* input = body.find("input");
+  if (input != nullptr && input->is_string() && !input->str().empty()) {
+    messages.push_back({tokenization::ChatRole::kUser, input->str(), "", ""});
+  } else if (!ReadTextMessages(input, &messages)) {
+    return InvalidCompatibilityRequest(
+        "'input' must be nonempty text or text messages; use "
+        "/v1/chat/completions for images and tools");
   }
 
   const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
@@ -566,7 +663,13 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
   json::Value resp = json::Value::object();
   resp["id"] = "resp_" + RandomId();
   resp["object"] = "response";
-  resp["status"] = "completed";
+  const bool limited =
+      res.finish_reason == TextGenerationBackend::FinishReason::kLength;
+  resp["status"] = limited ? "incomplete" : "completed";
+  resp["incomplete_details"] = json::Value();
+  if (limited) {
+    resp["incomplete_details"]["reason"] = "max_output_tokens";
+  }
   resp["model"] = b.model_id();
   json::Value output = json::Value::array();
   json::Value msg = json::Value::object();
@@ -587,7 +690,7 @@ HttpResponse OpenAiResponses(const HttpRequest& req, TextGenerationBackend& b) {
   usage["total_tokens"] = res.prompt_tokens + res.completion_tokens;
   json::Value input_details = json::Value::object();
   input_details["cached_tokens"] = res.cached_prompt_tokens;
-  usage["input_token_details"] = std::move(input_details);
+  usage["input_tokens_details"] = std::move(input_details);
   resp["usage"] = std::move(usage);
   resp["timings"] = GenerationTimings(res);
   return WithTiming(Ok(resp), res);
@@ -603,32 +706,26 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
                "parse_error");
   }
 
-  std::vector<tokenization::ChatMessage> messages;
-  if (const json::Value* system = body.find("system")) {
-    const std::string sys = system->get_str();
-    if (!sys.empty()) {
-      messages.push_back({tokenization::ChatRole::kSystem, sys, "", ""});
-    }
-  }
-  if (const json::Value* msgs = body.find("messages")) {
-    if (msgs->is_array()) {
-      for (const auto& it : msgs->items()) {
-        tokenization::ChatMessage m;
-        m.role = RoleFrom(it.member_str("role", "user"));
-        m.content = ContentToString(it.find("content"));
-        messages.push_back(std::move(m));
-      }
-    }
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error = ReadCompatibilityOptions(body, b, "max_tokens", &max_tokens,
+                                            &sampling_config)) {
+    return std::move(*error);
   }
 
-  const auto defaults = b.sampling_defaults();
-  const std::size_t max_tokens =
-      body.member_size("max_tokens", defaults.max_tokens);
-  sampling::SamplingConfig sampling_config;
-  if (const auto error =
-          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
-    return Err(400, "Bad Request", error->message.c_str(),
-               "invalid_request_error", error->code.c_str());
+  std::vector<tokenization::ChatMessage> messages;
+  if (const auto* system = body.find("system")) {
+    std::string text;
+    if (!ReadTextContent(system, &text)) {
+      return InvalidCompatibilityRequest("'system' must contain only text");
+    }
+    messages.push_back(
+        {tokenization::ChatRole::kSystem, std::move(text), "", ""});
+  }
+  if (!ReadTextMessages(body.find("messages"), &messages)) {
+    return InvalidCompatibilityRequest(
+        "'messages' must contain text messages; use /v1/chat/completions "
+        "for images and tools");
   }
 
   const auto res = b.chat(ChatRequest{std::move(messages)}, max_tokens,
@@ -645,7 +742,10 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   txt["text"] = res.text;
   content.push_back(std::move(txt));
   resp["content"] = std::move(content);
-  resp["stop_reason"] = "end_turn";
+  resp["stop_reason"] =
+      res.finish_reason == TextGenerationBackend::FinishReason::kLength
+          ? "max_tokens"
+          : "end_turn";
   resp["stop_sequence"] = json::Value();
   json::Value usage = json::Value::object();
   usage["input_tokens"] = res.prompt_tokens;
@@ -657,40 +757,6 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   return WithTiming(Ok(resp), res);
 }
 
-HttpResponse AnthropicCountTokens(const HttpRequest& req,
-                                  TextGenerationBackend& b) {
-  json::Value body;
-  try {
-    body = json::parse(req.body);
-  } catch (...) {
-    body = json::Value::object();
-  }
-
-  std::size_t total = 0;
-  if (const json::Value* system = body.find("system")) {
-    total += b.count_tokens(system->get_str());
-  }
-  if (const json::Value* msgs = body.find("messages")) {
-    if (msgs->is_array()) {
-      for (const auto& it : msgs->items()) {
-        if (const json::Value* content = it.find("content")) {
-          if (content->is_string()) {
-            total += b.count_tokens(content->get_str());
-          } else if (content->is_array()) {
-            for (const auto& part : content->items()) {
-              total += b.count_tokens(part.member_str("text", ""));
-            }
-          }
-        }
-      }
-    }
-  }
-
-  json::Value resp = json::Value::object();
-  resp["input_tokens"] = total;
-  return Ok(resp);
-}
-
 HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   json::Value body;
   try {
@@ -700,16 +766,18 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
                "parse_error");
   }
 
-  const std::string prompt = body.member_str("prompt", "");
-  const auto defaults = b.sampling_defaults();
-  const std::size_t max_tokens =
-      body.member_size("n_predict", defaults.max_tokens);
+  std::size_t max_tokens = 0;
   sampling::SamplingConfig sampling_config;
-  if (const auto error =
-          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
-    return Err(400, "Bad Request", error->message.c_str(),
-               "invalid_request_error", error->code.c_str());
+  if (auto error = ReadCompatibilityOptions(body, b, "n_predict", &max_tokens,
+                                            &sampling_config)) {
+    return std::move(*error);
   }
+
+  const auto* input = body.find("prompt");
+  if (input == nullptr || !input->is_string() || input->str().empty()) {
+    return InvalidCompatibilityRequest("'prompt' must be a nonempty string");
+  }
+  const std::string prompt = input->str();
 
   const auto res =
       b.complete(prompt, max_tokens, sampling_config, req.is_cancelled);
@@ -717,45 +785,13 @@ HttpResponse LlamaCompletion(const HttpRequest& req, TextGenerationBackend& b) {
   json::Value resp = json::Value::object();
   resp["content"] = res.text;
   resp["stop"] = true;
-  resp["stopped_eos"] = false;
-  resp["stopped_length"] = false;
+  const bool limited =
+      res.finish_reason == TextGenerationBackend::FinishReason::kLength;
+  resp["stopped_eos"] = !limited && !res.cancelled;
+  resp["stopped_length"] = limited;
   resp["stopped_word"] = false;
-  resp["stopped_limit"] = false;
+  resp["stopped_limit"] = limited;
   resp["stopping_word"] = "";
-  resp["tokens_predicted"] = res.completion_tokens;
-  resp["tokens_evaluated"] = res.prompt_tokens;
-  resp["tokens_cached"] = res.cached_prompt_tokens;
-  resp["timings"] = GenerationTimings(res);
-  resp["usage"] = UsageJson(res);
-  return WithTiming(Ok(resp), res);
-}
-
-HttpResponse LlamaInfill(const HttpRequest& req, TextGenerationBackend& b) {
-  json::Value body;
-  try {
-    body = json::parse(req.body);
-  } catch (...) {
-    body = json::Value::object();
-  }
-
-  // Best effort: the engine only completes forward, so infill runs a plain
-  // completion on the prefix (suffix is ignored by the text model).
-  const std::string prompt = body.member_str("input_prefix", "");
-  const auto defaults = b.sampling_defaults();
-  const std::size_t max_tokens =
-      body.member_size("n_predict", defaults.max_tokens);
-  sampling::SamplingConfig sampling_config;
-  if (const auto error =
-          ParseSamplingConfig(body, defaults.sampling, &sampling_config)) {
-    return Err(400, "Bad Request", error->message.c_str(),
-               "invalid_request_error", error->code.c_str());
-  }
-
-  const auto res =
-      b.complete(prompt, max_tokens, sampling_config, req.is_cancelled);
-
-  json::Value resp = json::Value::object();
-  resp["content"] = res.text;
   resp["tokens_predicted"] = res.completion_tokens;
   resp["tokens_evaluated"] = res.prompt_tokens;
   resp["tokens_cached"] = res.cached_prompt_tokens;
@@ -903,13 +939,13 @@ void HttpServer::register_routes() {
 
   // ---- Anthropic ----
   add("POST", "/v1/messages", AnthropicMessages);
-  add("POST", "/v1/messages/count_tokens", AnthropicCountTokens);
+  add("POST", "/v1/messages/count_tokens", NotImplemented);
 
   // ---- llama-server ----
   add("POST", "/v1/rerank", NotImplemented);
   add("POST", "/v1/reranking", NotImplemented);
   add("POST", "/rerank", NotImplemented);
-  add("POST", "/infill", LlamaInfill);
+  add("POST", "/infill", NotImplemented);
   add("POST", "/completion", LlamaCompletion);
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);

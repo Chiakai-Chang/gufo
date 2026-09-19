@@ -7,10 +7,10 @@
 #include <string_view>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
 #include "src/core/crypto/sha256.hpp"
+#include "src/core/json.hpp"
 namespace gufo::testing::chat_goldens {
-namespace json = gufo::server::json;
+namespace json = gufo::json;
 inline void Expect(bool condition, std::string_view message) {
   if (!condition) {
     std::cerr << "Assertion failed: " << message << '\n';

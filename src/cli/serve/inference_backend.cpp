@@ -1707,9 +1707,9 @@ public:
     }
     std::vector<int> emitted;
     std::string error;
-    if (!deepseek.session().DsparkStep(max_tokens, max_draft_tokens_, &emitted,
-                                       &error,
-                                       bridge ? bridge->hook() : nullptr)) {
+    if (!deepseek.session().DsparkStep(
+            max_tokens, max_draft_tokens_, &emitted, &error,
+            bridge ? bridge->hook() : nullptr, true)) {
       throw std::runtime_error("DeepSeek DSpark decode failed: " + error);
     }
     if (emitted.empty()) {
@@ -1720,7 +1720,7 @@ public:
     }
 
     TextDecodeStep step;
-    deepseek.set_position(deepseek.position() + emitted.size());
+    deepseek.set_position(deepseek.session().Position());
     step.selections.reserve(emitted.size());
     for (const int token : emitted) {
       if (model_->IsStopToken(token)) {
@@ -1792,6 +1792,7 @@ public:
           .max_draft_tokens = max_draft_tokens_,
           .emitted = &emitted[index],
           .sampler = bridges[index] ? bridges[index]->hook() : nullptr,
+          .stop_at_eos = true,
       };
     }
 
@@ -1816,8 +1817,7 @@ public:
           .kind = TextExecutionPlanKind::kBatched,
           .physical_width = decodes.size(),
       };
-      states[index]->set_position(states[index]->position() +
-                                  emitted[index].size());
+      states[index]->set_position(states[index]->session().Position());
       step.selections.reserve(emitted[index].size());
       for (const int token : emitted[index]) {
         if (model_->IsStopToken(token)) {

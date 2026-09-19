@@ -9,16 +9,16 @@
 #include <string_view>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/json.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 #include "tests/models/chat_template_golden_helpers.hpp"
 
 namespace {
 
-namespace json = gufo::server::json;
+namespace json = gufo::json;
 namespace qwen = gufo::tokenization;
 
 using namespace gufo::testing::chat_goldens;

@@ -72,6 +72,7 @@ struct ds4_session_dspark_batch_item {
   uint32_t max_draft_tokens;
   int* n_emitted;
   const ds4_dspark_sampler* sampler;
+  bool stop_at_eos = false;
 };
 
 inline constexpr int DS4_SESSION_SYNC_INTERRUPTED = 2;

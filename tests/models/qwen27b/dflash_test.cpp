@@ -19,8 +19,8 @@
 #include <string_view>
 #include <vector>
 
-#include "src/cli/serve/json.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/core/json.hpp"
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/qwen/chat_template.hpp"
 #include "src/models/qwen/dflash_weights.hpp"
@@ -389,10 +389,10 @@ void CaptureReferenceTrace(
   write("probabilities", probabilities);
   write("selected_probabilities", confidences);
   write("uniforms", uniforms);
-  auto metadata = gufo::server::json::Value::object();
+  auto metadata = gufo::json::Value::object();
   const auto array = [&](const char* key, const auto& values) {
     auto& result = metadata[key];
-    result = gufo::server::json::Value::array();
+    result = gufo::json::Value::array();
     for (const auto value : values)
       result.push_back(static_cast<double>(value));
   };
@@ -417,12 +417,12 @@ void CaptureAcceptanceTrace(
     const std::shared_ptr<const gufo::hip::QwenGpuModel>& target_model,
     const std::shared_ptr<const gufo::hip::QwenDFlashGpuModel>& draft_model,
     const char* input_path, const char* output_path) {
-  using gufo::server::json::Value;
+  using gufo::json::Value;
   using Token = gufo::tokenization::TokenId;
   std::ifstream input(input_path);
   Expect(input.good(), "open acceptance trace request");
-  const auto request = gufo::server::json::parse(
-      std::string(std::istreambuf_iterator<char>(input), {}));
+  const auto request =
+      gufo::json::parse(std::string(std::istreambuf_iterator<char>(input), {}));
   const auto text = request.member_str("prompt");
   const auto limit = request.member_size("max_tokens", 128);
   Expect(!text.empty() && limit > 0 && limit <= 256,

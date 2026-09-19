@@ -1,8 +1,8 @@
 #ifndef GUFO_SERVER_GENERATION_METRICS_HPP_
 #define GUFO_SERVER_GENERATION_METRICS_HPP_
 
-#include "src/cli/serve/json.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::server {
 

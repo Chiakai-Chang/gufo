@@ -5,12 +5,12 @@
 #include <stdexcept>
 #include <string_view>
 
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 
 namespace gufo::eval {
 namespace {
 
-using gufo::server::json::Value;
+using gufo::json::Value;
 
 void SetError(std::string* error, std::string message) {
   if (error != nullptr) {
@@ -96,7 +96,7 @@ std::optional<EvalSuite> LoadEvalSuite(const std::filesystem::path& path,
   contents << input.rdbuf();
 
   try {
-    const Value root = gufo::server::json::parse(contents.str());
+    const Value root = gufo::json::parse(contents.str());
     if (!root.is_object() ||
         RequireString(root, "schema") != "gufo.eval-cases.v2") {
       throw std::runtime_error("unsupported evaluation schema");

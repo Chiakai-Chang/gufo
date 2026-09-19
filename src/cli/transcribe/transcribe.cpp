@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "src/cli/arg_parser.hpp"
-#include "src/cli/serve/json.hpp"
+#include "src/core/json.hpp"
 #include "src/models/qwen3_asr/hip/transcription_runtime.hpp"
 
 namespace gufo::cli {
@@ -20,7 +20,7 @@ namespace {
 
 namespace qwen3_asr = models::qwen3_asr;
 namespace qwen3_asr_hip = models::qwen3_asr::hip;
-namespace json = server::json;
+namespace json = gufo::json;
 
 constexpr std::uintmax_t kMaximumAudioBytes = 256U << 20U;
 volatile std::sig_atomic_t g_cancel_requested = 0;  // NOLINT

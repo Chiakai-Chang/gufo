@@ -697,11 +697,15 @@ static void session_dspark_update_adaptive_width(ds4_session* session,
 static uint32_t session_dspark_accept_prefix(
     ds4_session* session, const ds4_dspark_sampler* sampler,
     const float* row_logits, int vocabulary_size, const int32_t* drafts,
-    uint32_t drafted, const int32_t* row_tops, bool* frontier_read) {
+    uint32_t drafted, const int32_t* row_tops, bool stop_at_eos,
+    bool* frontier_read) {
   uint32_t accepted = 1;
   *frontier_read = false;
   if (sampler == nullptr) {
     while (accepted < drafted && row_tops[accepted - 1] == drafts[accepted]) {
+      if (stop_at_eos && ds4_token_is_stop(session->engine, drafts[accepted])) {
+        return accepted;
+      }
       accepted++;
     }
     return accepted;
@@ -722,7 +726,10 @@ static uint32_t session_dspark_accept_prefix(
             ? sampler->verify(sampler->ctx, accepted - 1u, row,
                               (uint32_t)vocabulary_size, drafts[accepted])
             : sampler->sample(sampler->ctx, row, (uint32_t)vocabulary_size);
-    if (drawn != drafts[accepted]) {
+    if (drawn != drafts[accepted] ||
+        (stop_at_eos && ds4_token_is_stop(session->engine, drawn))) {
+      // EOS is a completed draw, but must not enter the reusable checkpoint.
+      // Emit it as the next anchor without drawing again.
       session->dspark_state.pending_anchor = drawn;
       return accepted;
     }
@@ -736,12 +743,12 @@ static int session_dspark_finish_verified(
     ds4_session* session, int length, int vocabulary_size,
     bool concurrent_batch, const ds4_dspark_sampler* sampler,
     const float* row_logits, const int32_t* drafts, uint32_t drafted,
-    const int32_t* row_tops, int* emitted, int* n_emitted, char* error,
-    size_t error_capacity) {
+    const int32_t* row_tops, bool stop_at_eos, int* emitted, int* n_emitted,
+    char* error, size_t error_capacity) {
   bool frontier_read = false;
   const uint32_t accepted = session_dspark_accept_prefix(
       session, sampler, row_logits, vocabulary_size, drafts, drafted, row_tops,
-      &frontier_read);
+      stop_at_eos, &frontier_read);
   if (accepted == 0u) {
     set_error(error, error_capacity, "DSpark verified row read failed");
     session->checkpoint_valid = false;
@@ -906,9 +913,9 @@ static int session_dspark_finish_verified(
  */
 static int session_dspark_step(ds4_session* session, int* emitted,
                                int emitted_cap, int* n_emitted, char* error,
-                               size_t error_capacity,
-                               uint32_t max_draft_tokens,
-                               const ds4_dspark_sampler* sampler) {
+                               size_t error_capacity, uint32_t max_draft_tokens,
+                               const ds4_dspark_sampler* sampler,
+                               bool stop_at_eos) {
   if (!session || !session->checkpoint_valid || !emitted || !n_emitted ||
       emitted_cap < 1 ||
       (sampler && (!sampler->sample || ((sampler->propose == nullptr) !=
@@ -940,6 +947,10 @@ static int session_dspark_step(ds4_session* session, int* emitted,
   const int vocabulary_size = ds4_engine_vocab_size(session->engine);
   const int target_first =
       session_dspark_anchor(session, sampler, vocabulary_size);
+  if (stop_at_eos && ds4_token_is_stop(session->engine, target_first)) {
+    emitted[(*n_emitted)++] = target_first;
+    return 0;
+  }
   const uint32_t required_context = (uint32_t)length;
 
   (void)session_dspark_seed_pending(session, required_context);
@@ -1015,7 +1026,8 @@ static int session_dspark_step(ds4_session* session, int* emitted,
   const uint64_t accepted_before = session->dspark_state.support_accepted;
   const int status = session_dspark_finish_verified(
       session, length, vocabulary_size, false, sampler, nullptr, drafts,
-      drafted, row_tops, emitted, n_emitted, error, error_capacity);
+      drafted, row_tops, stop_at_eos, emitted, n_emitted, error,
+      error_capacity);
   if (status == 0) {
     session_dspark_update_adaptive_width(
         session, tail_drafted,
@@ -1045,9 +1057,9 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
       set_error(error, error_capacity, "DSpark batch decode cancelled");
       return DS4_SESSION_SYNC_INTERRUPTED;
     }
-    return session_dspark_step(item.session, item.emitted, item.emitted_cap,
-                               item.n_emitted, error, error_capacity,
-                               item.max_draft_tokens, item.sampler);
+    return session_dspark_step(
+        item.session, item.emitted, item.emitted_cap, item.n_emitted, error,
+        error_capacity, item.max_draft_tokens, item.sampler, item.stop_at_eos);
   }
 
   ds4_engine* engine = nullptr;
@@ -1059,6 +1071,7 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
   std::array<uint32_t, 8> verify_tails{};
   std::array<uint32_t, 8> policy_tails{};
   bool any_can_draft = false;
+  bool any_stopped = false;
   for (size_t index = 0; index < item_count; ++index) {
     const ds4_session_dspark_batch_item& item = items[index];
     ds4_session* session = item.session;
@@ -1108,6 +1121,11 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
     lengths[index] = length;
     target_first[index] =
         session_dspark_anchor(session, item.sampler, vocabulary_size);
+    if (item.stop_at_eos &&
+        ds4_token_is_stop(session->engine, target_first[index])) {
+      any_stopped = true;
+      continue;
+    }
     (void)session_dspark_seed_pending(session, static_cast<uint32_t>(length));
 
     const uint32_t maximum =
@@ -1134,10 +1152,30 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
     can_draft_items[index] = can_draft;
     any_can_draft = any_can_draft || can_draft;
   }
-  if (!any_can_draft) {
-    if (!sessions_commit_and_extend_batch(items, target_first, item_count)) {
-      for (size_t index = 0; index < item_count; ++index) {
-        items[index].session->checkpoint_valid = false;
+  if (any_stopped || !any_can_draft) {
+    // Keep completed requests at the frontier before EOS. Surviving requests
+    // commit their already selected anchors without advancing their RNG again.
+    std::array<ds4_session_dspark_batch_item, 8> active_items{};
+    std::array<int, 8> active_tokens{};
+    size_t active_count = 0;
+    for (size_t index = 0; index < item_count; ++index) {
+      if (items[index].stop_at_eos &&
+          ds4_token_is_stop(engine, target_first[index])) {
+        continue;
+      }
+      active_items[active_count] = items[index];
+      active_tokens[active_count++] = target_first[index];
+    }
+    const bool committed =
+        active_count == 0u ||
+        (active_count == 1u
+             ? session_commit_and_extend(active_items[0].session,
+                                         active_tokens[0])
+             : sessions_commit_and_extend_batch(active_items.data(),
+                                                active_tokens, active_count));
+    if (!committed) {
+      for (size_t index = 0; index < active_count; ++index) {
+        active_items[index].session->checkpoint_valid = false;
       }
       set_error(error, error_capacity,
                 "DeepSeek DSpark fallback batch decode failed");
@@ -1286,8 +1324,8 @@ int ds4_sessions_dspark_step_batch(const ds4_session_dspark_batch_item* items,
     const int result = session_dspark_finish_verified(
         items[index].session, lengths[index], vocabulary_size, true,
         items[index].sampler, row_logits[index], drafts[index].data(),
-        drafted_counts[index], row_tops[index].data(), items[index].emitted,
-        items[index].n_emitted, error, error_capacity);
+        drafted_counts[index], row_tops[index].data(), items[index].stop_at_eos,
+        items[index].emitted, items[index].n_emitted, error, error_capacity);
     if (result != 0) {
       for (size_t remaining = index + 1u; remaining < item_count; ++remaining) {
         items[remaining].session->checkpoint_valid = false;

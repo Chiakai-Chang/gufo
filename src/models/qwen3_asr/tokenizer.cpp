@@ -12,8 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/json.hpp"
 #include "src/models/qwen3_asr/bpe.hpp"
-#include "src/models/qwen3_asr/json.hpp"
 
 namespace gufo::models::qwen3_asr {
 namespace {

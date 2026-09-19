@@ -46,8 +46,9 @@ int CheckSampledChat() {
   constexpr const char* prompt =
       "Continue this pattern for twenty more terms: red, blue, blue, red, "
       "blue, blue,";
-  const std::string input =
-      std::string(prompt) + "\nExplain the rule in one short sentence.\nexit\n";
+  const std::string input = std::string(prompt) +
+                            "\nExplain the rule in one short sentence.\nRepeat "
+                            "the rule again.\nexit\n";
   const auto execute = [&](bool chat, bool dspark) {
     std::vector<const char*> args{
         "--model",          model,
@@ -90,13 +91,14 @@ int CheckSampledChat() {
   };
   const auto autoregressive = execute(true, false);
   const auto speculative = execute(true, true);
-  Expect(autoregressive.size() == 2 && speculative == autoregressive,
-         "both sampled chat turns retain AR token identity");
+  Expect(autoregressive.size() == 3 && speculative == autoregressive,
+         "sampled chat retains AR token identity after length and EOS stops");
   const auto single_prompt = execute(false, true);
   Expect(single_prompt.size() == 1 &&
              single_prompt.front() == autoregressive.front(),
          "sampled prompt and first chat turn share the same token trace");
-  std::cout << "Sampled prompt/chat: two turns match AR, with DSpark active\n";
+  std::cout
+      << "Sampled prompt/chat: three turns match AR, with DSpark active\n";
   return 0;
 }
 
