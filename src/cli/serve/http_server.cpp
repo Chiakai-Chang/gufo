@@ -30,12 +30,14 @@
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
+#include "src/cli/serve/audio_websocket.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_api.hpp"
 #include "src/cli/serve/video_jobs.hpp"
+#include "src/cli/serve/websocket.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
@@ -90,6 +92,18 @@ bool SendAll(int fd, std::string_view data) {
     sent += static_cast<std::size_t>(n);
   }
   return true;
+}
+
+bool SendChunk(int fd, std::string_view data) {
+  if (data.empty())
+    return true;
+  char header[2 * sizeof(std::size_t) + 2];
+  const auto length =
+      std::to_chars(header, header + sizeof(header) - 2, data.size(), 16);
+  *length.ptr = '\r';
+  *(length.ptr + 1) = '\n';
+  return SendAll(fd, std::string_view(header, length.ptr + 2 - header)) &&
+         SendAll(fd, data) && SendAll(fd, "\r\n");
 }
 
 bool IsPeerDisconnected(int fd) noexcept {
@@ -235,7 +249,7 @@ std::string BuildResponseHead(const HttpResponse& resp,
   out += ' ';
   out += resp.reason;
   out += "\r\n";
-  if (!HasHeader(resp, "content-type")) {
+  if (resp.status != 101 && !HasHeader(resp, "content-type")) {
     out += "Content-Type: application/json\r\n";
   }
   if (content_length.has_value()) {
@@ -250,7 +264,9 @@ std::string BuildResponseHead(const HttpResponse& resp,
     out += value;
     out += "\r\n";
   }
-  out += "Connection: close\r\n\r\n";
+  if (!HasHeader(resp, "connection"))
+    out += "Connection: close\r\n";
+  out += "\r\n";
   return out;
 }
 
@@ -1148,6 +1164,18 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(),
                       asr_.get());
   }
+  if (req.path == "/v1/audio/speech/stream") {
+    if (!tts_ || !tts_->ready())
+      return Err(503, "Service Unavailable", "TTS is not configured",
+                 "server_error", "tts_service_unavailable");
+    return HandleTtsWebSocket(req, *tts_);
+  }
+  if (req.path == "/v1/realtime") {
+    if (!asr_ || !asr_->ready())
+      return Err(503, "Service Unavailable", "ASR is not configured",
+                 "server_error", "asr_service_unavailable");
+    return HandleAsrWebSocket(req, *asr_);
+  }
   if (IsVideoApiPath(req.path)) {
     if (video_jobs_ == nullptr || !video_jobs_->ready()) {
       return Err(503, "Service Unavailable",
@@ -1198,6 +1226,7 @@ void HttpServer::handle_connection(int client_fd) {
     req.client_id = peer_address;
   req.request_id = "r" + std::to_string(next_request.fetch_add(1) + 1);
   bool response_started = false;
+  bool http11 = false;
   int response_status = 0;
   const auto elapsed_ms = [&] {
     return std::chrono::duration<double, std::milli>(
@@ -1226,6 +1255,7 @@ void HttpServer::handle_connection(int client_fd) {
         std::string version;
         std::string extra;
         ls >> req.method >> target >> version;
+        http11 = version == "HTTP/1.1";
         bool valid_headers = !req.method.empty() && target.starts_with('/') &&
                              (version == "HTTP/1.0" || version == "HTTP/1.1") &&
                              !(ls >> extra);
@@ -1288,7 +1318,8 @@ void HttpServer::handle_connection(int client_fd) {
           }
         } else {
           ok = true;
-          body.clear();
+          if (!IsWebSocketUpgrade(req))
+            body.clear();
         }
         if (ok) {
           req.body = std::move(body);
@@ -1300,9 +1331,10 @@ void HttpServer::handle_connection(int client_fd) {
     }
 
     // Successful health/metrics polling and video status polling stay quiet.
-    const bool log_request = req.method == "POST" || req.method == "DELETE" ||
-                             req.path == "/v1/models" ||
-                             req.path.ends_with("/content");
+    const bool log_request =
+        req.method == "POST" || req.method == "DELETE" ||
+        req.path == "/v1/models" || req.path.ends_with("/content") ||
+        req.path == "/v1/realtime" || req.path == "/v1/audio/speech/stream";
     if (ok && log_request) {
       Logger::Info("http", "request=" + req.request_id +
                                " event=received method=" + req.method +
@@ -1326,15 +1358,32 @@ void HttpServer::handle_connection(int client_fd) {
     resp.headers.emplace_back("X-Request-ID", req.request_id);
     response_status = resp.status;
     bool connected = true;
-    if (resp.streaming_body) {
+    if (resp.websocket) {
+      response_started = true;
+      connected = SendAll(client_fd, BuildResponseHead(resp, std::nullopt));
+      if (connected) {
+        WebSocket socket(client_fd, std::move(req.body));
+        resp.websocket(socket);
+      }
+    } else if (resp.streaming_body) {
+      const bool chunked = http11 && !HasHeader(resp, "content-length");
+      if (chunked)
+        resp.headers.emplace_back("Transfer-Encoding", "chunked");
       const auto head = BuildResponseHead(resp, std::nullopt);
       response_started = true;
       connected = SendAll(client_fd, head);
       if (connected) {
         resp.streaming_body([&](std::string_view chunk) {
-          connected = connected && SendAll(client_fd, chunk);
+          connected = connected && (chunked ? SendChunk(client_fd, chunk)
+                                            : SendAll(client_fd, chunk));
           return connected;
         });
+        // Without the final chunk, HTTP clients report an incomplete body.
+        // Closing an unframed PCM stream would silently look like shorter
+        // audio.
+        if (connected && chunked &&
+            (!resp.stream_log || resp.stream_log->error_code.empty()))
+          connected = SendAll(client_fd, "0\r\n\r\n");
       }
     } else {
       const auto payload = BuildResponse(resp);

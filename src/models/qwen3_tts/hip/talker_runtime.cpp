@@ -115,27 +115,6 @@ private:
   std::size_t count_{0};
 };
 
-enum class WeightMode {
-  kAuto,
-  kMapped,
-  kCopy,
-};
-
-WeightMode GetWeightMode() {
-  const char* value = std::getenv("GUFO_QWEN3_TTS_WEIGHT_MODE");
-  if (value == nullptr) {
-    return WeightMode::kAuto;
-  }
-  const std::string_view mode(value);
-  if (mode == "mapped") {
-    return WeightMode::kMapped;
-  }
-  if (mode == "copy") {
-    return WeightMode::kCopy;
-  }
-  return WeightMode::kAuto;
-}
-
 class DeviceRegion {
 public:
   DeviceRegion() = default;
@@ -155,23 +134,12 @@ public:
     host_ = region.data;
     size_ = region.size;
     payload_offset_ = region.payload_offset;
-    const WeightMode mode = GetWeightMode();
     // gfx1151 shares one physical memory pool with the host, but
     // device-resident weights still use coarse-grained pages the GPU caches and
     // streams far faster than host-registered pages, so decode prefers the
     // copy.
-    if (mode == WeightMode::kMapped) {
-      if (TryMap()) {
-        return true;
-      }
-    } else {
-      if (TryCopy()) {
-        return true;
-      }
-      if (mode == WeightMode::kAuto && TryMap()) {
-        return true;
-      }
-    }
+    if (TryCopy() || TryMap())
+      return true;
     SetError(error, "cannot make Qwen3-TTS safetensors GPU-visible");
     return false;
   }
@@ -349,52 +317,11 @@ std::string AsciiLower(std::string_view value) {
   return result;
 }
 
-struct TokenScore {
-  std::uint32_t token;
-  float score;
-};
-
-/// Reduces `candidates` in place so the caller keeps its capacity between
-/// steps.
-std::uint32_t SelectTopKCode(std::vector<TokenScore>& candidates,
-                             std::size_t top_k, float temperature,
-                             std::mt19937* random) {
-  if (candidates.empty()) {
-    throw std::runtime_error("Qwen3-TTS sampler has no eligible tokens");
-  }
-  const auto higher_score = [](const TokenScore& left,
-                               const TokenScore& right) {
-    if (left.score == right.score) {
-      return left.token < right.token;
-    }
-    return left.score > right.score;
-  };
-  const std::size_t selected_count =
-      random == nullptr ? 1 : std::min(top_k, candidates.size());
-  std::partial_sort(candidates.begin(), candidates.begin() + selected_count,
-                    candidates.end(), higher_score);
-  candidates.resize(selected_count);
-  if (random == nullptr) {
-    return candidates.front().token;
-  }
-  const double maximum = static_cast<double>(candidates.front().score);
-  std::vector<double> weights;
-  weights.reserve(candidates.size());
-  for (const TokenScore& candidate : candidates) {
-    weights.push_back(
-        std::exp((static_cast<double>(candidate.score) - maximum) /
-                 static_cast<double>(temperature)));
-  }
-  std::discrete_distribution<std::size_t> distribution(weights.begin(),
-                                                       weights.end());
-  return candidates[distribution(*random)].token;
-}
-
 std::uint32_t SelectMainCode(
     std::span<const float> logits,
     std::span<const std::uint8_t> generated_first_codes,
     std::size_t generation_step, std::uint32_t eos_token,
-    const TalkerSamplingOptions& sampling, std::mt19937* random,
+    const SamplingOptions& sampling, std::mt19937* random,
     std::vector<TokenScore>* scratch) {
   std::vector<TokenScore>& candidates = *scratch;
   candidates.clear();
@@ -415,8 +342,8 @@ std::uint32_t SelectMainCode(
     }
     candidates.push_back({token, score});
   }
-  return SelectTopKCode(candidates, sampling.top_k, sampling.temperature,
-                        random);
+  return SampleCodec(candidates, sampling.top_k, sampling.top_p,
+                     sampling.temperature, random);
 }
 
 }  // namespace
@@ -432,7 +359,6 @@ struct TalkerHipRuntime::Impl {
           model.config.talker.head_dim),
         v(token_capacity * model.config.talker.num_key_value_heads *
           model.config.talker.head_dim),
-        attention(token_capacity * model.config.talker.hidden_size),
         attention_output(token_capacity * model.config.talker.hidden_size),
         gate(token_capacity * model.config.talker.intermediate_size),
         up(token_capacity * model.config.talker.intermediate_size),
@@ -702,12 +628,12 @@ struct TalkerHipRuntime::Impl {
     return false;
   }
 
-  void RmsNormToBfloat16(const float* input, const float* weight,
+  void RmsNormToBfloat16(float* input, const float* weight,
                          std::size_t batch_size, std::size_t dimension,
                          float epsilon) {
-    gufo::hip::LaunchBatchedRMSNorm(input, weight, normalized.get(),
-                                    bfloat16_scratch.get(), batch_size,
-                                    dimension, epsilon, stream);
+    LaunchBfloat16ResidualAddRMSNorm(input, nullptr, weight,
+                                     bfloat16_scratch.get(), batch_size,
+                                     dimension, epsilon, stream);
   }
 
   /// Folds a residual add into the RMSNorm that always follows it. The float
@@ -816,9 +742,6 @@ struct TalkerHipRuntime::Impl {
         head_index >= predictor_heads.size()) {
       throw std::length_error("Qwen3-TTS predictor step is out of range");
     }
-    const std::size_t hidden_elements = tokens * config.hidden_size;
-    const std::size_t q_elements =
-        tokens * config.num_attention_heads * config.head_dim;
     const std::size_t ffn_elements = tokens * config.intermediate_size;
 
     const auto launch_predictor = [&] {
@@ -839,13 +762,11 @@ struct TalkerHipRuntime::Impl {
             config.num_key_value_heads, config.head_dim, start_position,
             config.rope_theta, config.rms_norm_eps, predictor_key_cache.get(),
             predictor_value_cache.get(), layer, context);
-        gufo::hip::LaunchBatchedAttention(
-            q.get(), k.get(), v.get(), nullptr, predictor_key_cache.get(),
-            predictor_value_cache.get(), nullptr, nullptr, attention.get(),
-            static_cast<std::uint32_t>(layer), start_position, tokens,
-            static_cast<std::uint32_t>(context), config.num_attention_heads,
-            config.num_key_value_heads, config.head_dim, stream, cached,
-            bfloat16_scratch.get());
+        LaunchBfloat16Attention(
+            q.get(), k.get(), v.get(), predictor_key_cache.get(),
+            predictor_value_cache.get(), bfloat16_scratch.get(), layer,
+            start_position, tokens, context, config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim, stream, cached);
         Gemm(weights.o, bfloat16_scratch.get(), attention_output.get(), tokens,
              config.hidden_size, config.num_attention_heads * config.head_dim);
         ResidualAddNormToBfloat16(attention_output.get(),
@@ -899,8 +820,8 @@ struct TalkerHipRuntime::Impl {
       for (std::uint32_t token = 0; token < host_logits->size(); ++token) {
         candidate_scratch.push_back({token, (*host_logits)[token]});
       }
-      return SelectTopKCode(candidate_scratch, predictor_top_k,
-                            predictor_temperature, sampling_rng);
+      return SampleCodec(candidate_scratch, predictor_top_k, predictor_top_p,
+                         predictor_temperature, sampling_rng);
     }
     gufo::hip::LaunchGPUArgmax(logits.get(), predictor_token.get(),
                                config.vocab_size, stream);
@@ -919,8 +840,6 @@ struct TalkerHipRuntime::Impl {
       throw std::length_error("Qwen3-TTS talker cache position is invalid");
     }
     constexpr std::size_t tokens = 1;
-    const std::size_t hidden_elements = config.hidden_size;
-    const std::size_t q_elements = config.num_attention_heads * config.head_dim;
     const std::size_t ffn_elements = config.intermediate_size;
 
     RmsNormToBfloat16(hidden.get(), layers.front().input_norm.values.get(),
@@ -940,14 +859,11 @@ struct TalkerHipRuntime::Impl {
           static_cast<std::uint32_t>(talker_cache_tokens), config.rope_theta,
           config.rms_norm_eps, key_cache.get(), value_cache.get(), layer,
           maximum_tokens);
-      gufo::hip::LaunchBatchedAttention(
-          q.get(), k.get(), v.get(), nullptr, key_cache.get(),
-          value_cache.get(), nullptr, nullptr, attention.get(),
-          static_cast<std::uint32_t>(layer),
-          static_cast<std::uint32_t>(talker_cache_tokens), tokens,
-          static_cast<std::uint32_t>(maximum_tokens),
-          config.num_attention_heads, config.num_key_value_heads,
-          config.head_dim, stream, cached, bfloat16_scratch.get());
+      LaunchBfloat16Attention(
+          q.get(), k.get(), v.get(), key_cache.get(), value_cache.get(),
+          bfloat16_scratch.get(), layer, talker_cache_tokens, tokens,
+          maximum_tokens, config.num_attention_heads,
+          config.num_key_value_heads, config.head_dim, stream, cached);
       Gemm(weights.o, bfloat16_scratch.get(), attention_output.get(), tokens,
            config.hidden_size, config.num_attention_heads * config.head_dim);
       ResidualAddNormToBfloat16(attention_output.get(),
@@ -1069,7 +985,6 @@ struct TalkerHipRuntime::Impl {
   DeviceBuffer<float> q;
   DeviceBuffer<float> k;
   DeviceBuffer<float> v;
-  DeviceBuffer<float> attention;
   DeviceBuffer<float> attention_output;
   DeviceBuffer<float> gate;
   DeviceBuffer<float> up;
@@ -1087,6 +1002,7 @@ struct TalkerHipRuntime::Impl {
   std::mt19937* sampling_rng{nullptr};
   std::size_t predictor_top_k{50};
   float predictor_temperature{0.9F};
+  float predictor_top_p{1.0F};
   // Reused across the sixteen sampling steps of every frame so that decode does
   // not allocate per step.
   std::vector<float> predictor_logit_scratch;
@@ -1139,27 +1055,13 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
   try {
     impl_->talker_cache_tokens = 0;
     const std::size_t hidden_elements = tokens * config.hidden_size;
-    const std::size_t q_elements =
-        tokens * config.num_attention_heads * config.head_dim;
     const std::size_t ffn_elements = tokens * config.intermediate_size;
     RequireHip(hipMemcpyAsync(impl_->hidden.get(), input_embeddings.data(),
                               hidden_elements * sizeof(float),
                               hipMemcpyHostToDevice, impl_->stream),
                "hipMemcpyAsync prefill embeddings");
-    RequireHip(
-        hipMemsetAsync(impl_->key_cache.get(), 0,
-                       static_cast<std::size_t>(config.num_hidden_layers) *
-                           config.num_key_value_heads * impl_->maximum_tokens *
-                           config.head_dim * sizeof(float),
-                       impl_->stream),
-        "hipMemsetAsync key cache");
-    RequireHip(
-        hipMemsetAsync(impl_->value_cache.get(), 0,
-                       static_cast<std::size_t>(config.num_hidden_layers) *
-                           config.num_key_value_heads * impl_->maximum_tokens *
-                           config.head_dim * sizeof(float),
-                       impl_->stream),
-        "hipMemsetAsync value cache");
+    // Each layer overwrites the entire visible prefix before causal attention.
+    // Unused cache capacity is never read, including after a cancelled request.
 
     impl_->RmsNormToBfloat16(impl_->hidden.get(),
                              impl_->layers.front().input_norm.values.get(),
@@ -1183,14 +1085,12 @@ bool TalkerHipRuntime::Prefill(std::span<const float> input_embeddings,
           config.head_dim, 0, config.rope_theta, config.rms_norm_eps,
           impl_->key_cache.get(), impl_->value_cache.get(), layer,
           impl_->maximum_tokens);
-      gufo::hip::LaunchBatchedAttention(
-          impl_->q.get(), impl_->k.get(), impl_->v.get(), nullptr,
-          impl_->key_cache.get(), impl_->value_cache.get(), nullptr, nullptr,
-          impl_->attention.get(), static_cast<std::uint32_t>(layer), 0, tokens,
-          static_cast<std::uint32_t>(impl_->maximum_tokens),
-          config.num_attention_heads, config.num_key_value_heads,
-          config.head_dim, impl_->stream, cached,
-          impl_->bfloat16_scratch.get());
+      LaunchBfloat16Attention(impl_->q.get(), impl_->k.get(), impl_->v.get(),
+                              impl_->key_cache.get(), impl_->value_cache.get(),
+                              impl_->bfloat16_scratch.get(), layer, 0, tokens,
+                              impl_->maximum_tokens, config.num_attention_heads,
+                              config.num_key_value_heads, config.head_dim,
+                              impl_->stream, cached);
       impl_->Gemm(weights.o, impl_->bfloat16_scratch.get(),
                   impl_->attention_output.get(), tokens, config.hidden_size,
                   config.num_attention_heads * config.head_dim);
@@ -1537,14 +1437,16 @@ bool TalkerHipRuntime::PredictCodeFrame(std::span<const float> talker_hidden,
 
 bool TalkerHipRuntime::PredictCodeFrameTrace(
     std::span<const float> talker_hidden, std::uint32_t first_code,
-    CodePredictorOutput* output, std::string* error) {
-  return PredictFrame(talker_hidden, first_code, output, true, error);
+    CodePredictorOutput* output, std::string* error,
+    std::span<const std::uint32_t> reference_codes) {
+  return PredictFrame(talker_hidden, first_code, output, true, error,
+                      reference_codes);
 }
 
-bool TalkerHipRuntime::PredictFrame(std::span<const float> talker_hidden,
-                                    std::uint32_t first_code,
-                                    CodePredictorOutput* output,
-                                    bool collect_logits, std::string* error) {
+bool TalkerHipRuntime::PredictFrame(
+    std::span<const float> talker_hidden, std::uint32_t first_code,
+    CodePredictorOutput* output, bool collect_logits, std::string* error,
+    std::span<const std::uint32_t> reference_codes) {
   if (output == nullptr) {
     SetError(error, "Qwen3-TTS predictor output must not be null");
     return false;
@@ -1560,18 +1462,19 @@ bool TalkerHipRuntime::PredictFrame(std::span<const float> talker_hidden,
     SetError(error, "Qwen3-TTS first codec token is out of range");
     return false;
   }
+  if (!reference_codes.empty() &&
+      (reference_codes.size() != talker.num_code_groups ||
+       reference_codes.front() != first_code ||
+       std::any_of(reference_codes.begin() + 1, reference_codes.end(),
+                   [&](std::uint32_t token) {
+                     return token >= predictor.vocab_size;
+                   }))) {
+    SetError(error, "Qwen3-TTS predictor reference history is invalid");
+    return false;
+  }
   try {
-    const std::size_t context = talker.num_code_groups;
-    const std::size_t cache_elements =
-        static_cast<std::size_t>(predictor.num_hidden_layers) *
-        predictor.num_key_value_heads * context * predictor.head_dim;
-    RequireHip(hipMemsetAsync(impl_->predictor_key_cache.get(), 0,
-                              cache_elements * sizeof(float), impl_->stream),
-               "hipMemsetAsync predictor key cache");
-    RequireHip(hipMemsetAsync(impl_->predictor_value_cache.get(), 0,
-                              cache_elements * sizeof(float), impl_->stream),
-               "hipMemsetAsync predictor value cache");
-
+    // Every frame starts at position zero. Its two prefix rows and each later
+    // codec row overwrite K/V before attention can see them.
     RequireHip(
         hipMemcpyAsync(impl_->attention_output.get(), talker_hidden.data(),
                        talker.hidden_size * sizeof(float),
@@ -1582,6 +1485,16 @@ bool TalkerHipRuntime::PredictFrame(std::span<const float> talker_hidden,
         impl_->attention_output.get() + talker.hidden_size, talker.hidden_size,
         impl_->stream);
     impl_->ProjectPredictorInput(impl_->attention_output.get(), 2);
+    if (collect_logits) {
+      output->projected_input.resize(2 * predictor.hidden_size);
+      RequireHip(
+          hipMemcpyAsync(output->projected_input.data(), impl_->hidden.get(),
+                         output->projected_input.size() * sizeof(float),
+                         hipMemcpyDeviceToHost, impl_->stream),
+          "hipMemcpyAsync predictor projected input");
+      RequireHip(hipStreamSynchronize(impl_->stream),
+                 "hipStreamSynchronize predictor input trace");
+    }
 
     output->codes.reserve(talker.num_code_groups);
     output->codes.push_back(first_code);
@@ -1601,7 +1514,8 @@ bool TalkerHipRuntime::PredictFrame(std::span<const float> talker_hidden,
     output->codes.push_back(code);
     for (std::size_t head = 1; head < impl_->predictor_heads.size(); ++head) {
       gufo::hip::LaunchEmbeddingLookup(
-          impl_->predictor_embeddings[head - 1], core::GgmlType::kBF16, code,
+          impl_->predictor_embeddings[head - 1], core::GgmlType::kBF16,
+          reference_codes.empty() ? code : reference_codes[head],
           impl_->attention_output.get(), talker.hidden_size, impl_->stream);
       impl_->ProjectPredictorInput(impl_->attention_output.get(), 1);
       code = impl_->RunPredictor(1, static_cast<std::uint32_t>(head + 1), head,
@@ -1706,25 +1620,25 @@ bool TalkerHipRuntime::GenerateGreedy(const CustomVoicePromptOutput& prompt,
                                       std::size_t maximum_new_tokens,
                                       TalkerGenerationOutput* output,
                                       std::string* error) {
-  TalkerSamplingOptions sampling;
+  SamplingOptions sampling;
   sampling.sample = false;
+  sampling.predictor_sample = false;
   return Generate(prompt, maximum_new_tokens, sampling, output, error);
 }
 
 bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
                                 std::size_t maximum_new_tokens,
-                                const TalkerSamplingOptions& sampling,
+                                const SamplingOptions& sampling,
                                 TalkerGenerationOutput* output,
                                 std::string* error) {
   return Generate(prompt, maximum_new_tokens, sampling, {}, output, error);
 }
 
-bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
-                                std::size_t maximum_new_tokens,
-                                const TalkerSamplingOptions& sampling,
-                                const CancellationCheck& is_cancelled,
-                                TalkerGenerationOutput* output,
-                                std::string* error) {
+bool TalkerHipRuntime::Generate(
+    const CustomVoicePromptOutput& prompt, std::size_t maximum_new_tokens,
+    const SamplingOptions& sampling, const CancellationCheck& is_cancelled,
+    TalkerGenerationOutput* output, std::string* error,
+    const std::function<bool(const TalkerGenerationOutput&)>& on_codes) {
   if (output == nullptr) {
     SetError(error, "Qwen3-TTS generation output must not be null");
     return false;
@@ -1740,19 +1654,15 @@ bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
     SetError(error, "Qwen3-TTS generation prompt is invalid");
     return false;
   }
-  if (sampling.top_k == 0 || sampling.predictor_top_k == 0 ||
-      !std::isfinite(sampling.temperature) || sampling.temperature <= 0.0F ||
-      !std::isfinite(sampling.predictor_temperature) ||
-      sampling.predictor_temperature <= 0.0F ||
-      !std::isfinite(sampling.repetition_penalty) ||
-      sampling.repetition_penalty <= 0.0F) {
+  if (!ValidSamplingOptions(sampling)) {
     SetError(error, "Qwen3-TTS sampling options are invalid");
     return false;
   }
   std::mt19937 random(sampling.seed);
-  impl_->sampling_rng = sampling.sample ? &random : nullptr;
+  impl_->sampling_rng = sampling.predictor_sample ? &random : nullptr;
   impl_->predictor_top_k = sampling.predictor_top_k;
   impl_->predictor_temperature = sampling.predictor_temperature;
+  impl_->predictor_top_p = sampling.predictor_top_p;
   struct PredictorSamplingReset {
     Impl* impl;
     ~PredictorSamplingReset() { impl->sampling_rng = nullptr; }
@@ -1799,6 +1709,11 @@ bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput& prompt,
       }
       output->codes.insert(output->codes.end(), frame.begin(), frame.end());
       ++output->frames;
+      if (on_codes && !on_codes(*output)) {
+        SetError(error, "Qwen3-TTS audio stream cancelled or failed");
+        *output = {};
+        return false;
+      }
       if (step + 1 == maximum_new_tokens) {
         break;
       }
@@ -1896,7 +1811,8 @@ bool TalkerHipRuntime::PredictCodeFrame(std::span<const float>, std::uint32_t,
 bool TalkerHipRuntime::PredictCodeFrameTrace(std::span<const float>,
                                              std::uint32_t,
                                              CodePredictorOutput*,
-                                             std::string* error) {
+                                             std::string* error,
+                                             std::span<const std::uint32_t>) {
   if (error != nullptr) {
     *error = "Qwen3-TTS HIP support is not enabled";
   }
@@ -1933,18 +1849,18 @@ bool TalkerHipRuntime::GenerateGreedy(const CustomVoicePromptOutput&,
 }
 
 bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput&, std::size_t,
-                                const TalkerSamplingOptions&,
-                                TalkerGenerationOutput*, std::string* error) {
+                                const SamplingOptions&, TalkerGenerationOutput*,
+                                std::string* error) {
   if (error != nullptr) {
     *error = "Qwen3-TTS HIP support is not enabled";
   }
   return false;
 }
 
-bool TalkerHipRuntime::Generate(const CustomVoicePromptOutput&, std::size_t,
-                                const TalkerSamplingOptions&,
-                                const CancellationCheck&,
-                                TalkerGenerationOutput*, std::string* error) {
+bool TalkerHipRuntime::Generate(
+    const CustomVoicePromptOutput&, std::size_t, const SamplingOptions&,
+    const CancellationCheck&, TalkerGenerationOutput*, std::string* error,
+    const std::function<bool(const TalkerGenerationOutput&)>&) {
   if (error != nullptr) {
     *error = "Qwen3-TTS HIP support is not enabled";
   }
