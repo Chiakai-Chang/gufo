@@ -55,7 +55,7 @@ __launch_bounds__(32 * token_waves, 1) static __global__
   }
 }
 
-// Integer matrix products reuse each Q8 weight across 16 or 32 inputs.
+// Integer matrix products reuse each Q8 weight across up to 48 inputs.
 // Keep four separate K8 sums per wave: merging them into a K32 integer sum
 // would change the scalar kernel's rounded products, FMA chain and reduction.
 template<int token_tiles, bool ragged>
@@ -87,7 +87,7 @@ __launch_bounds__(256) static __global__ void mul_mat_q8_decode_batch(
                      get_int_b2(w->qs, 2 * part + 1), 0, 0};
 #pragma unroll
     for (int tile = 0; tile < token_tiles; ++tile) {
-      const int token = ragged && (token_tiles == 1 || tile == 1)
+      const int token = ragged && tile == token_tiles - 1
                             ? min(tile * 16 + sub, tokens - 1)
                             : tile * 16 + sub;
       const auto* x = input + token * input_stride + kb;
@@ -689,12 +689,15 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
                              const block_q8_1* input, float* output, int k,
                              int rows, int tokens, int input_stride,
                              hipStream_t stream) {
-  if (!gate && k == 2560 && rows >= 2560 && tokens >= 9 && tokens <= 32) {
+  if (!gate && k == 2560 && rows >= 2560 && tokens >= 9 && tokens <= 48) {
     if (tokens <= 16)
       launch_q8_matrix<1>(weights, input, output, k, rows, tokens, input_stride,
                            stream);
-    else
+    else if (tokens <= 32)
       launch_q8_matrix<2>(weights, input, output, k, rows, tokens, input_stride,
+                           stream);
+    else
+      launch_q8_matrix<3>(weights, input, output, k, rows, tokens, input_stride,
                            stream);
     return;
   }

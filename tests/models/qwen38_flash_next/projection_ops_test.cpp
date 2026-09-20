@@ -354,6 +354,86 @@ void CheckHcDownProjection(const void* w, const void* tiled,
   CheckHip(hipFree(activated), "HC activation free");
 }
 
+void CheckRoutedQ8Placement() {
+  constexpr int rows = 64, cols = 512, tokens = 65, experts = 2;
+  const auto weights = MakeWeights(rows * experts, cols, 31415, false);
+  std::vector<float> input(tokens * cols), output(tokens * experts * rows);
+  std::vector<std::int32_t> ids(tokens * experts);
+  std::uint32_t seed = 271828;
+  // Isolate the dot product and row layout from quantizer tie semantics.
+  // Non-power-of-two scales still exercise FP32 product contraction.
+  for (int b = 0; b < cols / 32; ++b) {
+    const float scale = 0.0012345F * (1 + b % 7);
+    for (int j = 0; j < 32; ++j)
+      input[b * 32 + j] =
+          (j == 0 ? 127 : int(NextRandom(&seed) % 255) - 127) * scale;
+  }
+  for (int t = 0; t < tokens; ++t) {
+    if (t)
+      std::copy_n(input.data(), cols, input.data() + t * cols);
+    for (int e = 0; e < experts; ++e)
+      ids[t * experts + e] = (t + e) % experts;
+  }
+  void* dw = nullptr;
+  float *dx = nullptr, *dy = nullptr;
+  std::int32_t* di = nullptr;
+  CheckHip(hipMalloc(&dw, weights.blocks.size()), "routed Q8 weights");
+  CheckHip(hipMalloc(&dx, input.size() * sizeof(float)), "routed Q8 input");
+  CheckHip(hipMalloc(&dy, output.size() * sizeof(float)), "routed Q8 output");
+  CheckHip(hipMalloc(&di, ids.size() * sizeof(std::int32_t)), "routed Q8 IDs");
+  CheckHip(hipMemcpy(dw, weights.blocks.data(), weights.blocks.size(),
+                     hipMemcpyHostToDevice), "routed Q8 upload");
+  CheckHip(hipMemcpy(dx, input.data(), input.size() * sizeof(float),
+                     hipMemcpyHostToDevice), "routed Q8 upload");
+  CheckHip(hipMemcpy(di, ids.data(), ids.size() * sizeof(std::int32_t),
+                     hipMemcpyHostToDevice), "routed Q8 upload");
+  qfn_mmq_set_routed_max_expert_rows(tokens);
+  qfn_mmq_set_routed_tile_cols(32);
+  if (qfn_mmq_q8_0_moe_raw(dw, dx, di, dy, rows, cols, tokens, experts,
+                           experts, nullptr) != 0)
+    throw std::runtime_error("routed Q8 placement projection failed");
+  CheckHip(hipMemcpy(output.data(), dy, output.size() * sizeof(float),
+                     hipMemcpyDeviceToHost), "routed Q8 download");
+  for (int row = 0; row < experts * rows; ++row) {
+    double expected = 0;
+    for (int b = 0; b < cols / 32; ++b) {
+      float maximum = 0;
+      for (int j = 0; j < 32; ++j)
+        maximum = std::max(maximum, std::abs(input[b * 32 + j]));
+      const float inverse = 127.0F / maximum;
+      const float scale = 1.0F / inverse;
+      const auto* block =
+          weights.blocks.data() + (row * (cols / 32) + b) * 34;
+      __half weight_scale;
+      std::memcpy(&weight_scale, block, sizeof(weight_scale));
+      int dot = 0;
+      for (int j = 0; j < 32; ++j)
+        dot += static_cast<std::int8_t>(block[2 + j]) *
+               static_cast<int>(std::round(input[b * 32 + j] * inverse));
+      expected += double(__half2float(weight_scale)) * scale * dot;
+    }
+    if (!std::isfinite(output[row]) ||
+        std::abs(double(output[row]) - expected) > 1e-4)
+      throw std::runtime_error(
+          "routed Q8 differs from FP64 dot oracle at row " +
+          std::to_string(row) + ": actual=" + std::to_string(output[row]) +
+          " expected=" + std::to_string(expected));
+  }
+  // Identical activations must not depend on expert packing, column minitile
+  // or the ragged final tile. Fast-math formerly contracted these differently.
+  for (std::size_t slot = 0; slot < ids.size(); ++slot) {
+    if (std::memcmp(output.data() + slot * rows,
+                    output.data() + ids[slot] * rows,
+                    rows * sizeof(float)) != 0)
+      throw std::runtime_error("routed Q8 output depends on row placement");
+  }
+  qfn_mmq_set_routed_max_expert_rows(0);
+  qfn_mmq_set_routed_tile_cols(0);
+  for (void* p : {dw, static_cast<void*>(dx), static_cast<void*>(dy),
+                  static_cast<void*>(di)})
+    CheckHip(hipFree(p), "routed Q8 free");
+}
+
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
            std::size_t reference_tokens = 0) {
   const Q8Weights w = MakeWeights(m, k, seed);
@@ -582,7 +662,9 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
 }
 
 void CheckDecodeGrouping(int rows, int cols) {
-  const int tokens = rows == 320 && cols == 10240 ? 64 : 32;
+  const int tokens = rows == 320 && cols == 10240
+                         ? 64
+                         : (rows >= 8192 && cols == 2560 ? 48 : 32);
   const auto w = MakeWeights(rows, cols, 11, false);
   // The large fixtures exercise matrix dispatch. Gated vectors already have
   // independent-weight coverage in the small fixtures.
@@ -632,7 +714,7 @@ void CheckDecodeGrouping(int rows, int cols) {
                        hipMemcpyDeviceToHost),
              "scalar output");
     for (int n = 2; n <= (gated ? 8 : tokens); ++n) {
-      if (n > 32 && n % 8 != 0)
+      if (rows == 320 && cols == 10240 && n > 32 && n % 8 != 0)
         continue;
       CheckHip(hipMemset(out, 0xA5, batch.size() * sizeof(float)),
                "decode output guard");
@@ -746,6 +828,7 @@ void CheckMtpOutputHead(float input_scale) {
 
 int main() {
   try {
+    CheckRoutedQ8Placement();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);

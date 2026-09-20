@@ -2,8 +2,7 @@
 
 Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Production builds with the
 pinned Nix toolchain. PP at d0/d32K/d128K, MTP serving and vision: 2026-09-20;
-other CLI/AR measurements: 2026-09-19. One repetition per point; repetitive C2
-was repeated to check scheduling variance.
+other CLI/AR measurements: 2026-09-19. One repetition per point.
 Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
 revision `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
@@ -22,16 +21,16 @@ predictor catch-up through all known successor tokens.
 
 | Depth | AR pp2048 | MTP pp2048 | AR tg128 | MTP tg128 | MTP acceptance |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1523.4 | 1465.4 | 26.33 | 42.74 | 70.0% |
-| 4K | 1455.1 | 1399.4 | 25.48 | 40.35 | 65.6% |
-| 8K | 1432.0 | 1374.4 | 25.25 | 35.68 | 58.3% |
-| 12K | 1421.4 | 1362.2 | 25.19 | 52.03 | 85.7% |
-| 16K | 1412.3 | 1352.8 | 24.91 | 56.31 | 88.5% |
-| 32K | 1396.9 | 1337.2 | 24.10 | 61.59 | 100.0% |
-| 64K | 1342.7 | 1282.1 | 23.08 | 59.67 | 100.0% |
-| 128K | 1304.8 | 1242.1 | 22.14 | 57.65 | 100.0% |
+| 0 | 1525.3 | 1493.6 | 26.33 | 42.74 | 70.0% |
+| 4K | 1455.1 | TODO | 25.48 | 40.35 | 65.6% |
+| 8K | 1432.0 | TODO | 25.25 | 35.68 | 58.3% |
+| 12K | 1421.4 | TODO | 25.19 | 52.03 | 85.7% |
+| 16K | 1412.3 | TODO | 24.91 | 56.31 | 88.5% |
+| 32K | 1393.3 | 1367.2 | 24.10 | 61.59 | 100.0% |
+| 64K | 1342.7 | TODO | 23.08 | 59.67 | 100.0% |
+| 128K | 1301.6 | 1271.5 | 22.14 | 57.65 | 100.0% |
 
-AR prefill falls 14.3% from d0 to d128K. MTP adds 4.0–5.0% to prefill time
+AR prefill falls 14.7% from d0 to d128K. MTP adds 1.9–2.4% to prefill time
 at the three refreshed depths. The 1700 tok/s target and flat deep-context
 throughput remain unmet.
 
@@ -60,24 +59,23 @@ uses `repetition_word` for repetition and distinct requests cycling through
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 25.24 | 64.94 | 25.12 | 42.60 |
-| 2 | 38.60 | 89.0–92.9 | 36.25 | 55.93 |
-| 4 | 53.09 | 115.87 | 48.41 | 75.39 |
-| 6 | 60.68 | 122.21 | 54.51 | 80.03 |
-| 8 | 65.17 | 127.11 | 58.45 | 83.80 |
+| 1 | 25.24 | 65.76 | 25.12 | 42.52 |
+| 2 | 38.60 | 89.68 | 36.25 | 57.08 |
+| 4 | 53.09 | 116.33 | 48.41 | 74.18 |
+| 6 | 60.68 | 124.21 | 54.51 | 83.79 |
+| 8 | 65.17 | 126.74 | 58.45 | 85.79 |
 
-MTP acceptance is 100% on repetition and 71.2–82.0% on the mixed cohorts.
+MTP acceptance is 100% on repetition and 73.9–88.0% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
 Greedy timing-based depth choices can vary between runs.
 
 **C1 is a single user.** The HTTP and raw CLI prompts above differ. With the
-repetitive chat prompt, HTTP C1 decode alone is 80.01 tok/s; the table includes
+repetitive chat prompt, HTTP C1 decode alone is 80.66 tok/s; the table includes
 prefill and scheduling. Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
-Summing the individual repetitive decode rates gives 114.7–115.8/159.3/169.1/178.0
+Summing the individual repetitive decode rates gives 115.0/158.9/171.3/175.9
 tok/s at C2/C4/C6/C8. These exclude waiting and prefill; the table reports
-whole-cohort output throughput. C2's decode rates were stable despite the
-larger variation in request completion time.
+whole-cohort output throughput.
 
 ## Image encoder
 

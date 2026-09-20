@@ -2677,7 +2677,7 @@ __launch_bounds__(256, 2) __global__ void WmmaCausalAttentionKernel(
   // This improves cache reuse without changing any query's key sweep.
   const std::uint32_t linear = blockIdx.y * gridDim.x + blockIdx.x;
   const std::uint32_t query_group =
-      kPackHeads ? linear / kWmmaKvHeads : first_query_group + blockIdx.x;
+      first_query_group + (kPackHeads ? linear / kWmmaKvHeads : blockIdx.x);
   const std::uint32_t query_start = query_group * kQueryRows;
   const std::uint32_t kv_head =
       kPackHeads ? linear % kWmmaKvHeads : blockIdx.y / (kWmmaGqa / kWmmaHeads);
@@ -5675,7 +5675,9 @@ bool WmmaCausalAttention(const float* q, const float* gate,
   }
   if (mask != nullptr) {
     constexpr std::uint32_t kPackedQueries = 4;
-    const dim3 grid((n_tokens + kPackedQueries - 1) / kPackedQueries,
+    const std::uint32_t first_group =
+        last_only ? (n_tokens - 1) / kPackedQueries : 0;
+    const dim3 grid((n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
                     kWmmaKvHeads);
     // At deep sparse windows, staging the current V before fetching the
     // next one shortens their overlapping register lifetimes.
@@ -5683,12 +5685,12 @@ bool WmmaCausalAttention(const float* q, const float* gate,
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true, true>),
           grid, dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens);
+          mask_words, out, start_pos, n_tokens, first_group);
     } else {
       hipLaunchKernelGGL(
           (WmmaCausalAttentionKernel<kPackedQueries, kWmmaKeys, true>), grid,
           dim3(kThreads), 0, stream, q, gate, k_cache, v_cache, mask,
-          mask_words, out, start_pos, n_tokens);
+          mask_words, out, start_pos, n_tokens, first_group);
     }
     return true;
   }

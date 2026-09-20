@@ -538,10 +538,12 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
     const auto full = rows / kDecodeRows * kDecodeRows;
     return project(0, full) && (full == rows || project(full, rows - full));
   }
-  // Wide output matrices benefit from sharing weight rows across waves.
-  // The smaller output projection with its long K sweep stays at eight.
+  // Three matrix tiles help 33–48 rows; four tiles cost more than two
+  // 32-row launches. Small outputs with long K sweeps stay at eight.
   const auto chunk =
-      w.cols == 2560 && w.rows >= 8192 ? 32U : kDecodeRows;
+      w.cols == 2560 && w.rows >= 8192
+          ? (rows > 32 && rows <= 48 ? 48U : 32U)
+          : kDecodeRows;
   for (std::uint32_t r = 0; r < rows; r += chunk) {
     if (!project(r, std::min(chunk, rows - r)))
       return false;

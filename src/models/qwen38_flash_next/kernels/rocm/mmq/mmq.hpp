@@ -1115,7 +1115,11 @@ static __device__ __forceinline__ void vec_dot_q8_0_q8_1_mma(
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
                     const float dA = x_df[i*MMQ_MMA_TILE_X_K_Q8_0 + k0/QI8_0];
-                    sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l] += C.x[l]*dA*dB;
+                    // Keep row placement from changing contraction. The two
+                    // column minitiles otherwise use different FP32 products
+                    // under fast-math, changing identical routed activations.
+                    float& acc = sum[((j0 - cgroup*ntx*tile_C::J)/j_stride*ntx + n)*tile_C::ne + l];
+                    acc = __fmaf_rn(__fmul_rn(float(C.x[l]), dA), dB, acc);
                 }
             }
         }

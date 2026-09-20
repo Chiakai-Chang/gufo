@@ -16,9 +16,9 @@
 | Register-cached vision softmax | Retained for bounded row sizes; unchanged reduction order, byte-identical Flash-Next/Qwen27B embeddings, no additional allocation. |
 | 4096-patch vision attention tiles | Retained; byte-identical GEMMs/embeddings, lower latency and 24 MiB less attention scratch. Other shapes keep their original tiles. |
 | Partitioned BF16 WMMA vision value projection | Rejected: failed the full-encoder reference gate despite lower isolated FP64 error. |
-| Integer WMMA Q8 verification | Retained for 9–32 input rows of wide target projections/heads; preserves K8 partials/FMA order and reduces each result once, with exact session replay. Small batches retain vector kernels. |
+| Integer WMMA Q8 verification | Retained through 48 input rows for wide target projections/heads; preserves K8 partials/FMA order and reduces each result once, with exact session replay. Small batches retain vector kernels. |
 | Q8 activation reuse across output rows | Rejected: no repeatable gain on the real projection shapes. |
-| Wider Q8 decode and Q5 expert tiles | Rejected: exact output, but 33–64 dense rows and 16/32 expert rows were slower on representative shared/distinct/mixed work. |
+| Wider Q8 decode and Q5 expert tiles | Rejected: 56–64 dense rows, phased token tiles and 16/32 Q5 expert rows were slower despite exact output. |
 | Compact expert launch groups | Rejected: improved shared routing but negligible mixed-routing gain. |
 | Sparse attention register/cache retuning | Rejected: exact d128K output, but register scheduling/occupancy gave no material gain and reloading queries was slower. |
 | FP32 selector load scheduling | Retained; bounded scheduling removes scalar-register spills, preserves every score bit and lowers d32K selection time to 22.4 ms per pp2048. Matched d128K AR prefill improves about 1.5%. |
@@ -31,6 +31,10 @@
 | Ratio-four predictor QSA, FP32 ranking queries | Retained with sparse state, rewind and deep selector checks. |
 | Greedy batch cost controller | Retained only for all-greedy C>1; separate occupancy/context bins, stable plain controls, no transition timings. Sampled replay uses fixed curves calibrated from median warmed cycles on 2026-09-20. |
 | One-row MTP prefill lag | Retained; 320 KiB kept hidden state/session, avoids replaying a final prefill chunk. |
+| Final-row MTP catch-up | Retained; preserve every KV/indexer row, compute only the final sparse query tile and final Q8 expert row. Full predictor and catch-up candidates/recursive stages match exactly at 257/2047 rows. |
+| Routed Q8 accumulation order | Retained; explicit rounded product/FMA prevents identical rows changing with column placement. Independent FP64 dot and predictor carry checks pass. |
+| Isolated MMQ quantizer rounding change | Deferred: it changes half-integer tie behavior shared with W8A8 and fails their existing agreement gate. No quantizer change retained. |
+| Wave64 / sixteen-wave dense prefill tiles | Rejected: exact matrix outputs, but slower than the existing eight-wave tile on the SSM projection. |
 | Lazy rollback and shared scratch | Retained; depth grows on demand, reset releases it; seven-draft cap about 788 MiB/session. |
 | Live final frontier and async prompt snapshots | Retained; immutable branch snapshot, worker capture, bounded persistence outside the lookup lock. |
 | Chunk-equivalent projections/attention | Retained with exact continued-image/cache/full-logit gates; one-token tails keep prefill arithmetic. |

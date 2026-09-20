@@ -674,7 +674,11 @@ bool ReferenceModel::MtpStep(const MtpWeights& mtp, std::int32_t token,
   if (stage_inputs)
     res.assign(stage_inputs->attention.begin(), stage_inputs->attention.end());
   HcMix(l.hc_ffn, res, mixed, inject);
+  if (trace)
+    copy(mixed, trace->ffn_input);
   Moe(l, mixed, block);
+  if (trace)
+    copy(block, trace->ffn_output);
   HcCombine(res, block, inject);
   mtp_hidden_ = res;
   if (trace)

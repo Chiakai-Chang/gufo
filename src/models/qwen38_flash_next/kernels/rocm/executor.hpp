@@ -209,7 +209,7 @@ public:
     std::int32_t* token{nullptr};
     MtpCandidateLogits* candidates{nullptr};
     MtpTrace* trace{
-        nullptr};  ///< single-row diagnostic; disables graph capture
+        nullptr};  ///< final-row diagnostic; disables graph capture
   };
   struct MtpHeadItem {
     Session* session;
@@ -372,7 +372,8 @@ private:
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
-           std::uint32_t n_tokens, std::string* error_msg) const;
+           std::uint32_t n_tokens, std::string* error_msg,
+           bool last_only = false) const;
   /// Runs routed experts after the router and shared expert are ready.
   bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
                   std::uint32_t n_tokens, std::string* error_msg) const;

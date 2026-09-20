@@ -5,7 +5,6 @@
 #include <bit>
 #include <cmath>
 #include <cstddef>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -970,7 +969,8 @@ bool Executor::Experts(const DeviceTensor& w, const float* x,
   // projection (top-k rows, one expert each) stays on them as well.
   // Verification keeps the same quantization and reduction as single-token
   // decoding even when top-k expansion produces more than 32 slot rows.
-  const bool tiled = n_rows > 4 * kVecBatch && MatrixRows(n_tokens);
+  const bool tiled =
+      (prefill_phase || n_rows > 4 * kVecBatch) && MatrixRows(n_tokens);
   if (tiled) {
     RoutedHints(w, n_tokens);
   }
@@ -1495,7 +1495,8 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
 }
 
 bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
-                   std::uint32_t n_tokens, std::string* error_msg) const {
+                   std::uint32_t n_tokens, std::string* error_msg,
+                   bool last_only) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
   // Router logits and the shared-expert gate come out of one GEMM.
@@ -1523,6 +1524,26 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                   &l.shexp_down, error_msg) ||
       !Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg)) {
     return false;
+  }
+  if (last_only && l.ffn_gate_exps.type == GgmlType::kQ8_0 &&
+      l.ffn_up_exps.type == GgmlType::kQ8_0 &&
+      l.ffn_down_exps.type == GgmlType::kQ8_0) {
+    // Catch-up retains only the final predictor residual. Keep the router
+    // and shared-expert shapes, then run its routed experts with the same
+    // tiled quantization and accumulation as the complete prompt batch.
+    const auto base = s_;
+    UseScratch(RowScratch(base, n_tokens - 1));
+    PrefillPhase phase(true);
+    try {
+      const std::size_t offset =
+          static_cast<std::size_t>(n_tokens - 1) * c.hidden_size;
+      const bool ok = MoeExperts(l, x + offset, out + offset, 1, error_msg);
+      UseScratch(base);
+      return ok;
+    } catch (...) {
+      UseScratch(base);
+      throw;
+    }
   }
   return MoeExperts(l, x, out, n_tokens, error_msg);
 }
@@ -2423,8 +2444,7 @@ bool Executor::MtpForward(Session& session,
     return false;
   }
   if (output.trace != nullptr &&
-      (n != 1 ||
-       !output.trace->Valid(config().hidden_size, config().HcDim()))) {
+      !output.trace->Valid(config().hidden_size, config().HcDim())) {
     AssignError(error_msg, "invalid MTP trace destinations");
     return false;
   }
@@ -2482,6 +2502,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   const Config& c = config();
   const DeviceLayer& l = model_->mtp();
   const std::uint32_t hc_dim = c.HcDim();
+  const std::size_t final_row = static_cast<std::size_t>(n - 1) * hc_dim;
   const auto copy_trace = [&](const float* source,
                               std::span<float> destination) {
     return destination.empty() ||
@@ -2513,7 +2534,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   // Unlike the HC mixers, this normalization spans the complete HC * H row.
   RmsNormRows(s_.mtp_h, l.nextn_hnorm.f32(), s_.mtp_h, n, hc_dim, 1, c.rms_eps,
               stream_);
-  if (trace && !copy_trace(s_.mtp_h, trace->normalized_hidden))
+  if (trace && !copy_trace(s_.mtp_h + final_row, trace->normalized_hidden))
     return false;
   if (!Dense(l.nextn_fc_embedding, s_.mtp_embd, s_.mtp_eproj, n, error_msg) ||
       !Dense(l.nextn_fc_hidden, s_.mtp_h, s_.mtp_res, n * c.hc_count,
@@ -2522,7 +2543,7 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   }
   MtpAddEmbedding(s_.mtp_eproj, s_.mtp_res, n, c.hidden_size, c.hc_count,
                   stream_);
-  if (trace && !copy_trace(s_.mtp_res, trace->fused))
+  if (trace && !copy_trace(s_.mtp_res + final_row, trace->fused))
     return false;
   Session::AttentionState attn;
   attn.rope = session.vision_input_.rope();
@@ -2544,24 +2565,31 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     return false;
   }
   Combine(s_.mtp_res, l.hc_ffn.norm.f32(), n);
-  if (trace && !copy_trace(s_.mtp_res, trace->attention))
+  if (trace && !copy_trace(s_.mtp_res + final_row, trace->attention))
     return false;
   if (!session.CheckCancellation(error_msg))
     return false;
   if (!HcMix(l.hc_ffn, s_.mtp_res, true, s_.mixed, s_.inject, n, error_msg) ||
-      !Moe(l, s_.mixed, s_.block_out, n, error_msg)) {
+      (trace &&
+       !copy_trace(s_.mixed + static_cast<std::size_t>(n - 1) * c.hidden_size,
+                    trace->ffn_input)) ||
+      !Moe(l, s_.mixed, s_.block_out, n, error_msg, last_only)) {
     return false;
   }
   Combine(s_.mtp_res, nullptr, n);
-  if (trace && !copy_trace(s_.mtp_res, trace->hidden))
+  if (trace &&
+      !copy_trace(s_.block_out + static_cast<std::size_t>(n - 1) * c.hidden_size,
+                   trace->ffn_output))
+    return false;
+  if (trace && !copy_trace(s_.mtp_res + final_row, trace->hidden))
     return false;
   if (trace && !trace->head.empty()) {
-    if (!HcMix(l.nextn_head, s_.mtp_res, false, s_.mixed, nullptr, 1,
+    if (!HcMix(l.nextn_head, s_.mtp_res + final_row, false, s_.mixed, nullptr, 1,
                error_msg) ||
         !copy_trace(s_.mixed, trace->head))
       return false;
   }
-  const float* last = s_.mtp_res + static_cast<std::size_t>(n - 1) * hc_dim;
+  const float* last = s_.mtp_res + final_row;
   if (!Check(hipMemcpyAsync(session.mtp_.h, last, hc_dim * sizeof(float),
                             hipMemcpyDeviceToDevice, stream_),
              "MTP hidden carry", error_msg)) {

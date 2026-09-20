@@ -53,6 +53,9 @@ of device repacking and HIP kernels. It checks:
 - Independent batched versus serial predictor bodies and heads, including
   recursive chains. Candidate IDs/scores match host sorting of the full Q8
   head; operator tests separately check Q8 dots against FP64.
+- Full predictor versus headless catch-up, including FFN input/output and the
+  next recursive step across the sparse-attention boundary. Use `--batch 2048`
+  to cover both 257- and 2047-row calls with exact candidate and stage equality.
 
 Stage comparisons supply the same recorded input to each CPU/GPU stage and
 emulate Q8 activation/F16 cache storage on the CPU. This separates operation
@@ -74,8 +77,11 @@ Current optimization qualification (2026-09-20):
   allocation boundary. Captured model inputs also check FP32 contraction.
 - Q8 matrix verification retains the vector path's four K8 partials, rounded
   products, FMA chain and reduction order. Complete FP32 outputs match through
-  32 input rows, including partial input waves and output matrices with
-  2,561/12,289/65,537 rows.
+  48 inputs for 12,289/65,537-row matrices and 32 inputs for the 2,561-row
+  control, including partial input waves.
+- Routed Q8 checks repeat identical activations across column minitiles,
+  reordered expert slots and a ragged final tile. FP64 dots use unambiguous
+  activation codes, isolating accumulation from quantizer tie semantics.
 - Selector load scheduling preserves exact FP32 scores and top-k masks through
   d128K, including ties, tight strides and replay. Independent FP64 score
   error remains below 1e-5; full prefill logits match across chunk boundaries

@@ -341,18 +341,19 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
   if (std::memcmp(out.data(), replay.data(), q_count * sizeof(float)) != 0) {
     throw std::runtime_error("WMMA attention replay changed the output");
   }
-  if (mask_ptr == nullptr) {
+  {
     constexpr float poison = -12345.0F;
     Upload(&d_wmma, std::vector<float>(q_count, poison));
     if (!q::WmmaCausalAttention(d_q.get(), d_gate.get(), d_k.get(), d_v.get(),
-                                nullptr, mask_words, d_wmma.get(), n_tokens,
+                                mask_ptr, mask_words, d_wmma.get(), n_tokens,
                                 start_pos, kHeads, kKvHeads, kDim, kRatio,
                                 nullptr, true)) {
       throw std::runtime_error("last-tile attention rejected the geometry");
     }
     const auto tail = Download(&d_wmma, q_count);
+    const std::uint32_t tile_rows = mask_ptr ? 4 : 16;
     const std::size_t begin =
-        static_cast<std::size_t>((n_tokens - 1) / 16 * 16) * kQWidth;
+        static_cast<std::size_t>((n_tokens - 1) / tile_rows * tile_rows) * kQWidth;
     for (std::size_t i = 0; i < q_count; ++i) {
       if (i < begin ? tail[i] != poison
                     : std::memcmp(&out[i], &tail[i], sizeof(float)) != 0) {

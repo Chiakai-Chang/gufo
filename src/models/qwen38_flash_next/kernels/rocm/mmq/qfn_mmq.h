@@ -48,8 +48,8 @@ size_t qfn_mmq_q8_1_bytes(int N, int K);
 int qfn_mmq_quantize_q8_1(const float* X_f32, void* X_q8, int N, int K,
                           hipStream_t stream);
 
-// Exact vector arithmetic for 1–8 rows, or up to 32 ungated rows. Above eight,
-// input storage must include initialized padding to a multiple of eight.
+// Exact decode arithmetic for 1–8 rows, or up to 32 ungated rows.
+// Wide projections (M >= 8192, K = 2560) accept up to 48 ungated rows.
 // The 320×10240 HC projection also accepts larger multiples of eight.
 // Only N output rows are written.
 int qfn_mmq_q8_0_dense_vec_preq(const void* W_q8_0, const void* W_gate,

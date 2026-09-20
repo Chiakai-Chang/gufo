@@ -15,18 +15,23 @@
 namespace gufo::models::qwen38_flash_next {
 
 /// Optional host destinations for independent predictor qualification.
-/// Every populated span contains one complete row (HC*H, or H for head).
+/// Every populated span contains the final complete row of its stage.
 struct MtpTrace {
   std::span<float> normalized_hidden;
   std::span<float> fused;
   std::span<float> attention;
   std::span<float> hidden;
   std::span<float> head;
+  std::span<float> ffn_input;
+  std::span<float> ffn_output;
   [[nodiscard]] bool Valid(std::size_t H, std::size_t D) const noexcept {
     for (const auto row : {normalized_hidden, fused, attention, hidden})
       if (!row.empty() && row.size() != D)
         return false;
-    return head.empty() || head.size() == H;
+    for (const auto row : {head, ffn_input, ffn_output})
+      if (!row.empty() && row.size() != H)
+        return false;
+    return true;
   }
 };
 

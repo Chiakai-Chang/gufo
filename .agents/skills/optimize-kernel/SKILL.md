@@ -51,6 +51,8 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   partials and the original reduction tree. Reducing one result per thread
   avoided duplicate wave sums. DPP xor/add helped GDN; fewer waves or smaller
   scratch alone did not help.
+  Repeat identical inputs at different tile columns: fast-math gave routed
+  Q8 minitiles different contraction until the product/FMA order was explicit.
 - **Verification and concurrency:** reuse quantized weights across token and
   request rows. Tune real ragged shapes, including 3–8 rows and partial tiles.
   Batch the complete draft transformer body, not only the vocabulary head;

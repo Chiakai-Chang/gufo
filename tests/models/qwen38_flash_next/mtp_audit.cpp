@@ -45,7 +45,7 @@ struct Arena {
   }
 };
 struct Trace {
-  std::vector<float> norm, fused, attention, hidden, head;
+  std::vector<float> norm, fused, attention, hidden, head, ffn_input, ffn_output;
   q::MtpTrace spans;
   explicit Trace(const q::Config& c)
       : norm(c.HcDim()),
@@ -53,7 +53,9 @@ struct Trace {
         attention(c.HcDim()),
         hidden(c.HcDim()),
         head(c.hidden_size),
-        spans{norm, fused, attention, hidden, head} {}
+        ffn_input(c.hidden_size),
+        ffn_output(c.hidden_size),
+        spans{norm, fused, attention, hidden, head, ffn_input, ffn_output} {}
 };
 void Compare(std::span<const float> actual, std::span<const float> expected,
              const char* stage, double limit) {
@@ -257,6 +259,77 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
   }
   Require(vision->ResidentBytes() == 0,
           "MTP encoded pixels instead of embedding shifted text IDs");
+  // A full predictor forward is the independent execution control for
+  // headless catch-up. Only its final residual is carried; all KV/indexer
+  // rows must still survive. Cross the sparse-attention boundary and then
+  // compare recursive proposals, not only the final argmax.
+  for (const unsigned count :
+       {std::min(exec.max_batch(), 257U), std::min(exec.max_batch(), 2047U)}) {
+    Require(count > 32, "catch-up audit requires --batch greater than 32");
+    const unsigned rounds = c.indexer_top_k / count + 2;
+    const unsigned capacity = rounds * (count + 1) + 1;
+    auto full = exec.CreateSession(gufo::core::SessionMode::kSpeculative,
+                                   capacity, &error);
+    auto tail = exec.CreateSession(gufo::core::SessionMode::kSpeculative,
+                                   capacity, &error);
+    Require(full && tail, error);
+    std::vector<float> hidden(std::size_t(count) * c.HcDim());
+    for (std::size_t i = 0; i < hidden.size(); ++i)
+      hidden[i] = initial[i % initial.size()] *
+                  (0.8F + float((i / initial.size()) % 11) * 0.04F);
+    auto* source = arena.Make<float>(hidden.size());
+    Hip(hipMemcpy(source, hidden.data(), hidden.size() * sizeof(float),
+                   hipMemcpyHostToDevice));
+    const auto pattern = tokenizer.Encode("Red, blue. Explain virtual memory.");
+    Require(!pattern.empty(), "empty catch-up audit prompt");
+    std::vector<std::int32_t> tokens(count);
+    for (unsigned round = 0; round < rounds; ++round) {
+      for (unsigned i = 0; i < count; ++i)
+        tokens[i] = pattern[(round * count + i) % pattern.size()];
+      const auto exact = [&](const auto& expected, const auto& actual,
+                              const char* stage) {
+        if (expected != actual) {
+          std::fprintf(stderr, "catch-up round=%u rows=%u stage=%s\n",
+                       round, count, stage);
+          Compare(actual, expected, stage, 0.0);
+        }
+      };
+      Trace full_row(c), tail_row(c);
+      q::MtpCandidateLogits expected, actual;
+      Require(exec.MtpForward(*full, tokens, 0,
+                               {.candidates = &expected, .trace = &full_row.spans},
+                               &error, source) &&
+                  exec.MtpForward(*tail, tokens, 0, {.trace = &tail_row.spans},
+                                   &error, source),
+              error);
+      exact(full_row.norm, tail_row.norm, "wide hidden norm");
+      exact(full_row.fused, tail_row.fused, "wide fusion");
+      exact(full_row.attention, tail_row.attention, "wide attention");
+      exact(full_row.ffn_input, tail_row.ffn_input, "wide FFN input");
+      exact(full_row.ffn_output, tail_row.ffn_output, "wide FFN output");
+      exact(full_row.hidden, tail_row.hidden, "wide recursive carry");
+      exact(full_row.head, tail_row.head, "wide head mixer");
+      const std::array head{
+          q::rocm::Executor::MtpHeadItem{tail.get(), {.candidates = &actual}}};
+      Require(exec.MtpHeads(head, &error), error);
+      Require(expected.size == actual.size && expected.ids == actual.ids &&
+                  expected.logits == actual.logits,
+              "headless catch-up changed full-head candidates");
+      const auto next = static_cast<std::int32_t>(expected.ids[0]);
+      Trace a(c), b(c);
+      Require(exec.MtpForward(*full, {&next, 1}, -1, {.trace = &a.spans},
+                               &error) &&
+                  exec.MtpForward(*tail, {&next, 1}, -1, {.trace = &b.spans},
+                                  &error),
+              error);
+      exact(a.norm, b.norm, "catch-up hidden norm");
+      exact(a.fused, b.fused, "catch-up fusion");
+      exact(a.attention, b.attention, "catch-up attention");
+      exact(a.hidden, b.hidden, "catch-up recursive carry");
+      exact(a.head, b.head, "catch-up head mixer");
+    }
+    std::puts("MTP catch-up: full/tail candidates and recursive stages exact");
+  }
   std::puts(
       "MTP oracle PASS: full-width norm, byte-exact split, attention, "
       "recursive carry, full-Q8 head, image IDs and independent batches");
