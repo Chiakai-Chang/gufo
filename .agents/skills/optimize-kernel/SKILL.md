@@ -99,6 +99,14 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   token tile cannot overwrite history still being read. UMA has placement
   costs: mapped quantized weights and copied reusable audio/DiT weights behave
   differently.
+  Recurrent rollback can retain one full state plus exact update operands,
+  replaying only rejected prefixes; this cut Flash-Next's seven-draft reserve
+  to about 147 MiB/session. Recording an intermediate changed fast-math
+  contraction here. Compare the original kernel directly, preserve each
+  rounded product/FMA (including lane tails), and test every rollback prefix.
+  After catch-up writes all attention KV rows, only final request rows need
+  the remaining predictor projections/FFN; reuse idle scratch and retain
+  scalar-tail arithmetic.
 - **Graphs:** verify replay actually launches every new operation. Side-stream
   work during capture is not automatically included in the graph. Check the
   relevant shallow/deep dispatch boundaries and unprofiled wall time.

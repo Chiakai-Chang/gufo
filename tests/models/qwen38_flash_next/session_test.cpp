@@ -86,8 +86,12 @@ void CheckFailureRecovery(const std::shared_ptr<qfn::Model>& model) {
       4096, &error);
   Require(session != nullptr, error);
   const auto initial_bytes = session->AllocatedBytes();
+  const auto& c = model->config();
+  const auto checkpoint_bytes =
+      std::size_t{c.num_layers - c.num_layers / c.full_attention_interval} *
+      c.ssm_num_v_heads * c.ssm_head_dim * c.ssm_head_dim * sizeof(float);
   Require(model->SessionBytes(gufo::core::SessionMode::kSpeculative, 4096) >
-              initial_bytes + 700ULL * 1024 * 1024,
+              initial_bytes + checkpoint_bytes,
           "unused deep rollback state was allocated eagerly");
   const auto pattern =
       model->Tokenize("Explain virtual memory in a short sentence.");

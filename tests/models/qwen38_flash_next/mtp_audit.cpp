@@ -160,10 +160,14 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
             : "Write the word red repeatedly, separated by spaces. red red "
               "red");
     const std::vector<std::int32_t> prefix(encoded.begin(), encoded.end());
+    const auto kept =
+        std::min<std::size_t>(prefix.size(), exec.max_speculative());
+    std::vector<float> kept_hidden(kept * c.HcDim());
     Require(exec.Forward(*origin, prefix, 0, nullptr,
                          q::rocm::Executor::ForwardMode::kPrefill, &error) &&
-                exec.CopyTrunkHidden(*origin, initial, &error),
+                exec.CopyTrunkHidden(*origin, kept_hidden, &error),
             error);
+    std::copy_n(kept_hidden.end() - c.HcDim(), c.HcDim(), initial.begin());
     origin.reset();
     Hip(hipMemcpyAsync(input, initial.data(), initial.size() * sizeof(float),
                        hipMemcpyHostToDevice, stream));
@@ -260,6 +264,54 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
   }
   Require(vision->ResidentBytes() == 0,
           "MTP encoded pixels instead of embedding shifted text IDs");
+  // Short catch-up compacts only the final FFN rows. Compare it against
+  // full independent predictor execution, including the one-row arithmetic
+  // tail that must retain its original shape.
+  for (unsigned i = 0; i < 2; ++i) {
+    sessions[i]->ConfigureVision(nullptr, nullptr, stream);
+    serial[i]->ConfigureVision(nullptr, nullptr, stream);
+  }
+  for (const auto widths :
+       {std::array{2U, 7U}, std::array{8U, 8U}, std::array{3U, 7U}}) {
+    std::array<std::vector<std::int32_t>, 2> tokens;
+    std::array<q::rocm::Executor::MtpBatchItem, 2> batch;
+    std::array<q::MtpCandidateLogits, 2> expected, actual;
+    std::array<q::rocm::Executor::MtpHeadItem, 2> heads;
+    for (unsigned i = 0; i < 2; ++i) {
+      tokens[i].resize(widths[i]);
+      std::iota(tokens[i].begin(), tokens[i].end(), 42 + 9 * i);
+      for (auto* session : {sessions[i].get(), serial[i].get()})
+        Require(exec.Forward(*session, tokens[i], 0, nullptr,
+                             q::rocm::Executor::ForwardMode::kDecode, &error),
+                error);
+      batch[i] = {sessions[i].get(), tokens[i], 0};
+      heads[i] = {sessions[i].get(), {.candidates = &actual[i]}};
+      Require(exec.MtpForward(*serial[i], tokens[i], 0,
+                              {.candidates = &expected[i]}, &error),
+              error);
+    }
+    Require(exec.MtpForwardBatch(batch, &error) && exec.MtpHeads(heads, &error),
+            error);
+    for (unsigned i = 0; i < 2; ++i) {
+      Require(actual[i].ids == expected[i].ids &&
+                  actual[i].logits == expected[i].logits,
+              "short catch-up changed full-head candidates");
+      const auto token = static_cast<std::int32_t>(expected[i].ids[0]);
+      Trace full(c), tail(c);
+      Require(exec.MtpForward(*serial[i], {&token, 1}, -1,
+                              {.trace = &full.spans}, &error) &&
+                  exec.MtpForward(*sessions[i], {&token, 1}, -1,
+                                  {.trace = &tail.spans}, &error),
+              error);
+      Require(full.norm == tail.norm && full.fused == tail.fused &&
+                  full.attention == tail.attention &&
+                  full.ffn_input == tail.ffn_input &&
+                  full.ffn_output == tail.ffn_output &&
+                  full.hidden == tail.hidden && full.head == tail.head,
+              "short catch-up changed recursive predictor stages");
+    }
+  }
+  std::puts("MTP short catch-up: ragged/full candidates and carry exact");
   // A full predictor forward is the independent execution control for
   // headless catch-up. Only its final residual is carried; all KV/indexer
   // rows must still survive. Cross the sparse-attention boundary and then

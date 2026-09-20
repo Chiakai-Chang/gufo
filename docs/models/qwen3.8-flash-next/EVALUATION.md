@@ -58,6 +58,9 @@ explicit probes, outside the production/default test build. It checks:
   next recursive step across the sparse-attention boundary. Use `--batch 2048`
   to cover 224/257/2047/2048 rows: the minimum final tile, a two-tile tail,
   and large ragged/aligned chunks. Candidates and recorded stages match exactly.
+- Short batched catch-up at 9/10/16 total rows against independent full
+  predictor execution, including the scalar tail. Full-head candidates and
+  subsequent recursive stages must match exactly.
 
 Stage comparisons supply the same recorded input to each CPU/GPU stage and
 emulate Q8 activation/F16 cache storage on the CPU. This separates operation
@@ -96,6 +99,12 @@ Current optimization qualification (2026-09-20):
   prefix, cancellation/recovery and image restoration. A frozen peer's
   snapshot is copied during decode graph capture; snapshot bytes and
   capture/replay logits remain exact.
+- Compact GDN rollback saves one full state and exact FP32 keys, decay, beta
+  and error values. A host FMA oracle and fresh-prefix GPU execution check
+  every retained prefix, with guarded, independently addressed allocations.
+  Scalar and batched output/state agree; original and optimized kernels also
+  match byte for byte in a separate ablation. Recording intermediate values
+  must preserve the original rounded-product and FMA contraction order.
 - All ten fresh C1/C2/C4/C6/C8 repetitive/mixed serving cohorts match AR
   completion hashes with zero cache hits.
 - Scheduler tests check that decode time covers measured model work even

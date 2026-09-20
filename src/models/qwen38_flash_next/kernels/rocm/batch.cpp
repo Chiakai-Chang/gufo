@@ -174,6 +174,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     return Fail(error, "invalid MTP body batch");
   }
   std::array<std::uint32_t, kBatchSessions> offsets{};
+  std::array<std::uint32_t, kBatchSessions> final_rows{};
   std::uint32_t rows = 0;
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
@@ -197,6 +198,7 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
     }
     offsets[i] = rows;
     rows += n;
+    final_rows[i] = rows - 1;
   }
   if (rows > options_.max_batch)
     return Fail(error, "MTP body batch exceeds executor capacity");
@@ -324,28 +326,53 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                      session.max_context_, sparse, error, false, true, false))
         return false;
     }
-    UseScratch(base);
-    if (!DenseBatch(l.attn_out, base.ctx, base.block_out, rows, error))
+    // Attention retains every catch-up KV row. Only each final residual
+    // contributes to the next proposal, so compact those rows into idle
+    // trunk scratch before the output projection and FFN. A one-row tail
+    // in the original eight-row projection has different scalar rounding.
+    const bool compact_tail = rows > kDecodeRows && rows % kDecodeRows != 1;
+    Scratch tail = base;
+    if (compact_tail) {
+      tail.mtp_res = base.res;
+      tail.ctx = base.qg;
+      tail.inject = base.mtp_h;
+      for (std::size_t i = 0; i < items.size(); ++i) {
+        const auto r = final_rows[i];
+        const auto copy = [&](float* dst, const float* src, std::size_t width) {
+          return Check(hipMemcpyAsync(dst + i * width, src + r * width,
+                                      width * sizeof(float),
+                                      hipMemcpyDeviceToDevice, stream_),
+                       error);
+        };
+        if (!copy(tail.mtp_res, base.mtp_res, c.HcDim()) ||
+            !copy(tail.ctx, base.ctx, c.AttentionQDim()) ||
+            !copy(tail.inject, base.inject, c.hc_count * inject_parts_))
+          return false;
+      }
+    }
+    const auto tail_rows =
+        compact_tail ? static_cast<std::uint32_t>(items.size()) : rows;
+    UseScratch(tail);
+    if (!DenseBatch(l.attn_out, tail.ctx, tail.block_out, tail_rows, error))
       return false;
-    CombineBatch(base.mtp_res, l.hc_ffn.norm.f32(), rows);
-    if (!HcMixBatch(l.hc_ffn, base.mtp_res, true, base.mixed, base.inject, rows,
-                    error))
+    CombineBatch(tail.mtp_res, l.hc_ffn.norm.f32(), tail_rows);
+    if (!HcMixBatch(l.hc_ffn, tail.mtp_res, true, tail.mixed, tail.inject,
+                    tail_rows, error))
       return false;
     if (!AnyActive(items))
       return true;
-    if (!MoeBatch(l, base.mixed, base.block_out, rows, error))
+    if (!MoeBatch(l, tail.mixed, tail.block_out, tail_rows, error))
       return false;
-    CombineBatch(base.mtp_res, nullptr, rows);
+    CombineBatch(tail.mtp_res, nullptr, tail_rows);
     for (std::size_t i = 0; i < items.size(); ++i) {
-      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
-      UseScratch(RowScratch(base, offsets[i]));
       if (!items[i].session->CheckCancellation(nullptr))
         continue;
-      if (!Check(hipMemcpyAsync(items[i].session->mtp_.h,
-                                s_.mtp_res + std::size_t{n - 1} * c.HcDim(),
-                                c.HcDim() * sizeof(float),
-                                hipMemcpyDeviceToDevice, stream_),
-                 error))
+      if (!Check(
+              hipMemcpyAsync(
+                  items[i].session->mtp_.h,
+                  tail.mtp_res + (compact_tail ? i : final_rows[i]) * c.HcDim(),
+                  c.HcDim() * sizeof(float), hipMemcpyDeviceToDevice, stream_),
+              error))
         return false;
     }
     return true;

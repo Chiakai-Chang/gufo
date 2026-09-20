@@ -211,7 +211,6 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
       ++it;
     }
   }
-  const auto row_bytes = rollback_bytes_ / rollback_depth_;
   for (auto row = depth; row < rollback_depth_; ++row) {
     (void)hipFree(rollback_allocations_[row]);
     for (auto& layer : linear_) {
@@ -222,7 +221,10 @@ void Session::TrimRollback(std::uint32_t depth) noexcept {
   }
   rollback_allocations_.resize(depth);
   rollback_depth_ = depth;
-  rollback_bytes_ = row_bytes * depth;
+  rollback_bytes_ =
+      owner_->SessionBytes(core::SessionMode::kAutoregressive, max_context_,
+                           depth) -
+      owner_->SessionBytes(core::SessionMode::kAutoregressive, max_context_, 0);
   ngram_snapshots_.resize(depth);
 }
 
@@ -590,16 +592,16 @@ bool Executor::EnsureRollback(Session& session, std::uint32_t depth,
   const auto& c = config();
   const std::size_t conv =
       std::size_t{c.ssm_conv_kernel - 1} * c.SsmConvChannels();
-  const std::size_t state =
-      std::size_t{c.ssm_num_v_heads} * c.ssm_head_dim * c.ssm_head_dim;
   const std::size_t linear =
       c.num_layers - c.num_layers / c.full_attention_interval;
   const std::size_t ple =
       c.ple_layer >= 0 ? std::size_t{c.PleConvHistory()} * c.HcDim() : 0;
-  const auto bytes = (linear * (conv + state) + ple) * sizeof(float);
   session.rollback_allocations_.reserve(depth);
   session.ngram_snapshots_.resize(depth);
   for (auto row = session.rollback_depth_; row < depth; ++row) {
+    const auto state = GdnRollbackRowFloats(row, c.ssm_num_k_heads,
+                                            c.ssm_num_v_heads, c.ssm_head_dim);
+    const auto bytes = (linear * (conv + state) + ple) * sizeof(float);
     float* allocation = nullptr;
     if (!Check(hipMalloc(&allocation, bytes), "rollback allocation", error_msg))
       return false;
@@ -641,7 +643,14 @@ std::size_t Executor::SessionBytes(
           c.indexer_head_dim * sizeof(float) +
       std::size_t{max_context / c.compress_ratio + 1} * c.indexer_head_dim *
           sizeof(__half);
-  return (linear * (conv + state) + ple) * (rollback_depth + 1) *
+  const auto rollback_state =
+      rollback_depth == 0
+          ? 0
+          : state + (rollback_depth - 1) *
+                        GdnRollbackRowFloats(1, c.ssm_num_k_heads,
+                                             c.ssm_num_v_heads, c.ssm_head_dim);
+  return ((linear * conv + ple) * (rollback_depth + 1) +
+          linear * (state + rollback_state)) *
              sizeof(float) +
          attention * (kv + index) + sizeof(Session::Control) +
          (mode == core::SessionMode::kSpeculative
@@ -1671,7 +1680,10 @@ bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
 bool Executor::CopyTrunkHidden(const Session& session, std::span<float> hidden,
                                std::string* error_msg) const {
   if (!session.mtp_enabled_ || session.owner_ != this ||
-      session.position_ == 0 || hidden.size() != config().HcDim()) {
+      session.position_ == 0 || hidden.empty() ||
+      hidden.size() % config().HcDim() != 0 ||
+      hidden.size() / config().HcDim() >
+          std::min(session.position_, options_.max_speculative)) {
     AssignError(error_msg, "invalid trunk hidden diagnostic input");
     return false;
   }
@@ -2017,18 +2029,14 @@ bool Executor::Rollback(Session& session, std::uint32_t keep,
   if (keep < n) {
     const std::size_t conv_elems =
         static_cast<std::size_t>(c.ssm_conv_kernel - 1) * c.SsmConvChannels();
-    const std::size_t state_elems =
-        static_cast<std::size_t>(c.ssm_num_v_heads) * c.ssm_head_dim *
-        c.ssm_head_dim;
     const std::size_t slot = keep - 1;
     for (auto& l : session.linear_) {
       if (l.state == nullptr) {
         continue;
       }
-      if (!Check(hipMemcpyAsync(l.state, l.state_snapshots.rows[slot],
-                                state_elems * sizeof(float),
-                                hipMemcpyDeviceToDevice, stream_),
-                 "state rollback", error_msg) ||
+      RestoreGdnState(l.state, l.state_snapshots, keep, c.ssm_num_k_heads,
+                      c.ssm_num_v_heads, stream_);
+      if (!Check(hipGetLastError(), "state rollback", error_msg) ||
           !Check(hipMemcpyAsync(l.conv_state, l.conv_snapshots.rows[slot],
                                 conv_elems * sizeof(float),
                                 hipMemcpyDeviceToDevice, stream_),

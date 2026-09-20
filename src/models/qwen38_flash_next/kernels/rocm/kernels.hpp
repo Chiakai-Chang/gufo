@@ -21,6 +21,19 @@ struct RollbackRows {
   float* rows[7]{};
 };
 
+// Recurrent rollback keeps the state after the first token, then exact
+// FP32 keys/decays/betas/errors for later tokens. No inverse or quantization.
+constexpr std::size_t GdnRollbackRowFloats(std::uint32_t row,
+                                           std::uint32_t k_heads,
+                                           std::uint32_t v_heads,
+                                           std::uint32_t dim) {
+  return row == 0 ? std::size_t{v_heads} * dim * dim
+                  : std::size_t{k_heads} * dim + v_heads * (dim + 2);
+}
+void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
+                     std::uint32_t k_heads, std::uint32_t v_heads,
+                     hipStream_t stream);
+
 /// GGUF type ids the runtime accepts for the small-matrix and lookup paths.
 enum class WeightType : std::uint32_t {
   kF32 = 0,

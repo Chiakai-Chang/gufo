@@ -211,11 +211,12 @@ int main(int argc, char** argv) {
   q::rocm::Executor::Options options;
   options.max_batch = batch;
   options.max_logit_rows = std::min<std::uint32_t>(batch, 64);
+  if (mtp_audit || cost_audit)
+    options.max_speculative = 8;
 
   if (cost_audit) {
     options.max_batch = 2048;
     options.max_logit_rows = 8;
-    options.max_speculative = 8;
   }
   auto executor =
       q::rocm::Executor::Create(*device, ngram.get(), options, &error);

@@ -231,7 +231,7 @@ public:
                                 std::int32_t hidden_row, MtpOutput output,
                                 std::string* error_msg,
                                 const float* hidden_source = nullptr) const;
-  /// First kept trunk row, for independent predictor qualification.
+  /// Leading kept trunk rows, for independent predictor qualification.
   [[nodiscard]] bool CopyTrunkHidden(const Session& session,
                                      std::span<float> hidden,
                                      std::string* error_msg) const;

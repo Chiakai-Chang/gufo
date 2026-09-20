@@ -1287,6 +1287,24 @@ __launch_bounds__(256) __global__
 /// GdnEpilogueKernel finishes them.
 constexpr unsigned kGdnLanes = 4;
 constexpr unsigned kGdnRowsPerBlock = 32;
+
+// The original vector kernel rounds error*key and then beta*correction for
+// the last element of each lane, fusing the state decay into that result.
+// HIP's FP intrinsics alone still permit reassociation of this three-product
+// expression under fast-math. Keep its actual instruction sequence explicit.
+__device__ __forceinline__ float GdnLastUpdate(float state, float decay,
+                                               float error, float key,
+                                               float beta) {
+  float value;
+  asm volatile(
+      "v_mul_f32 %0, %1, %2\n\t"
+      "v_mul_f32 %0, %0, %3\n\t"
+      "v_fma_f32 %0, %4, %5, %0"
+      : "=&v"(value)
+      : "v"(error), "v"(key), "v"(beta), "v"(state), "v"(decay));
+  return value;
+}
+
 template<bool kBatch>
 __global__ void GdnKernel(const float* conv_out, const float* qn,
                           const float* kn, const float* alpha_beta,
@@ -1336,6 +1354,7 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
     const float b = SigmoidF(beta);
     float kr[slice];
     float u = 0.0f;
+    const float last = row[slice - 1];
 #pragma unroll
     for (std::uint32_t i = 0; i < slice; ++i) {
       kr[i] = k[i];
@@ -1346,11 +1365,16 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
     for (unsigned off = kGdnLanes / 2; off > 0; off >>= 1) {
       u += __shfl_xor(u, off, kGdnLanes);
     }
-    const float delta = (vv - u) * b;
+    const float error = vv - u;
     float acc = 0.0f;
 #pragma unroll
     for (std::uint32_t i = 0; i < slice; ++i) {
-      row[i] += delta * kr[i];
+      // Preserve the original kernel's contraction: round error*key, then
+      // fuse beta*correction into the decayed state. Materializing error*beta
+      // for rollback would change this order under fast-math.
+      const float correction = __fmul_rn(error, kr[i]);
+      row[i] = i + 1 == slice ? GdnLastUpdate(last, decay, error, kr[i], b)
+                              : __fmaf_rn(b, correction, row[i]);
       acc += row[i] * q[i];
     }
 #pragma unroll
@@ -1364,12 +1388,26 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
     if ((kBatch ? batch[blockIdx.z].state_snapshots.rows[0]
                 : snapshots.rows[0]) != nullptr &&
         t + 1 < n_tokens) {
-      float* snap = (kBatch ? batch[blockIdx.z].state_snapshots.rows[t]
-                            : snapshots.rows[t]) +
-                    static_cast<std::size_t>(h) * d * d + j * d + i0;
+      float* snap = kBatch ? batch[blockIdx.z].state_snapshots.rows[t]
+                           : snapshots.rows[t];
+      if (t == 0) {
+        snap += static_cast<std::size_t>(h) * d * d + j * d + i0;
 #pragma unroll
-      for (std::uint32_t i = 0; i < slice; ++i) {
-        snap[i] = row[i];
+        for (std::uint32_t i = 0; i < slice; ++i)
+          snap[i] = row[i];
+      } else {
+        if (j == 0 && h < k_heads) {
+#pragma unroll
+          for (std::uint32_t i = 0; i < slice; ++i)
+            snap[h * d + i0 + i] = kr[i];
+        }
+        if (lane == 0) {
+          if (j == 0) {
+            snap[k_heads * d + h] = decay;
+            snap[k_heads * d + v_heads + h] = b;
+          }
+          snap[k_heads * d + 2 * v_heads + h * d + j] = error;
+        }
       }
     }
   }
@@ -1377,6 +1415,31 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
   for (std::uint32_t i = 0; i < slice; ++i) {
     S[i] = row[i];
   }
+}
+
+__global__ void RestoreGdnStateKernel(float* state, RollbackRows snapshots,
+                                      std::uint32_t keep, std::uint32_t k_heads,
+                                      std::uint32_t v_heads) {
+  constexpr std::uint32_t d = kGdnDim;
+  const std::size_t i = std::size_t{blockIdx.x} * blockDim.x + threadIdx.x;
+  if (i >= std::size_t{v_heads} * d * d)
+    return;
+  const auto h = i / (d * d);
+  const auto j = (i / d) % d;
+  const auto k = i % d;
+  float value = snapshots.rows[0][i];
+  for (std::uint32_t t = 1; t < keep; ++t) {
+    const auto* update = snapshots.rows[t];
+    const float key = update[(h % k_heads) * d + k];
+    const float decay = update[k_heads * d + h];
+    const float beta = update[k_heads * d + v_heads + h];
+    const float error = update[k_heads * d + 2 * v_heads + h * d + j];
+    const float correction = __fmul_rn(error, key);
+    value = (k + 1) % (d / kGdnLanes) == 0
+                ? GdnLastUpdate(value, decay, error, key, beta)
+                : __fmaf_rn(beta, correction, __fmul_rn(value, decay));
+  }
+  state[i] = value;
 }
 
 /// Per-head RMSNorm of the raw attention rows and the sigmoid output gate,
@@ -5429,6 +5492,14 @@ void PleInject(float* res, const float* gated, const float* conv,
                std::size_t count, hipStream_t stream) {
   hipLaunchKernelGGL(PleInjectKernel, dim3(Blocks(count)), dim3(kThreads), 0,
                      stream, res, gated, conv, count);
+}
+
+void RestoreGdnState(float* state, RollbackRows snapshots, std::uint32_t keep,
+                     std::uint32_t k_heads, std::uint32_t v_heads,
+                     hipStream_t stream) {
+  const auto count = std::size_t{v_heads} * kGdnDim * kGdnDim;
+  RestoreGdnStateKernel<<<(count + 255) / 256, 256, 0, stream>>>(
+      state, snapshots, keep, k_heads, v_heads);
 }
 
 void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,

@@ -271,10 +271,16 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
       constexpr std::size_t kGuard = 32;
       constexpr float kSentinel = 12345.0F;
       const std::size_t saved = kTokens - 1;
-      HipBuffer<float> state_snaps(saved * kStateCount + kGuard);
+      std::vector<std::size_t> state_offsets(saved);
+      std::size_t state_storage = kGuard;
+      for (std::size_t i = saved; i-- > 0;) {
+        state_offsets[i] = state_storage;
+        state_storage +=
+            q::GdnRollbackRowFloats(i, kKHeads, kVHeads, kDim) + kGuard;
+      }
+      HipBuffer<float> state_snaps(state_storage);
       HipBuffer<float> conv_snaps(saved * kConvState + kGuard);
-      Upload(&state_snaps,
-             std::vector<float>(saved * kStateCount + kGuard, kSentinel));
+      Upload(&state_snaps, std::vector<float>(state_storage, kSentinel));
       Upload(&conv_snaps,
              std::vector<float>(saved * kConvState + kGuard, kSentinel));
       HipBuffer<float> current_state(kStateCount), current_conv(kConvState);
@@ -286,7 +292,7 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
         // Reverse the physical rows to prove that the kernel honors independent
         // prefix addresses rather than relying on a contiguous allocation.
         for (std::size_t i = 0; i < saved; ++i) {
-          states.rows[i] = ss ? ss + (saved - 1 - i) * kStateCount : nullptr;
+          states.rows[i] = ss ? ss + state_offsets[i] : nullptr;
           convs.rows[i] = cs ? cs + (saved - 1 - i) * kConvState : nullptr;
         }
         Upload(&current_state, state);
@@ -327,8 +333,7 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
                          false, false, kEps, nullptr);
       };
       forward(kTokens, state_snaps.get(), conv_snaps.get());
-      const auto saved_states =
-          Download(&state_snaps, saved * kStateCount + kGuard);
+      const auto saved_states = Download(&state_snaps, state_storage);
       const auto saved_convs =
           Download(&conv_snaps, saved * kConvState + kGuard);
       const auto final_state = Download(&current_state, kStateCount);
@@ -345,23 +350,61 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
       };
       if (!exact(Download(&current_state, kStateCount), final_state) ||
           !exact(Download(&current_out, kOut), final_out) ||
-          !exact(Download(&state_snaps, saved * kStateCount + kGuard),
-                 saved_states) ||
+          !exact(Download(&state_snaps, state_storage), saved_states) ||
           !exact(Download(&conv_snaps, saved * kConvState + kGuard),
                  saved_convs))
         throw std::runtime_error("GDN batch changed output or rollback state");
       for (std::size_t i = 0; i < kGuard; ++i) {
-        if (saved_states[saved * kStateCount + i] != kSentinel ||
+        if (saved_states[i] != kSentinel ||
             saved_convs[saved * kConvState + i] != kSentinel) {
           throw std::runtime_error("GDN wrote an unused final snapshot");
         }
+      }
+      for (std::size_t row = 0; row < saved; ++row) {
+        const auto end = state_offsets[row] +
+                         q::GdnRollbackRowFloats(row, kKHeads, kVHeads, kDim);
+        for (std::size_t i = 0; i < kGuard; ++i)
+          if (saved_states[end + i] != kSentinel)
+            throw std::runtime_error("GDN overwrote a compact rollback row");
       }
       for (std::uint32_t keep = 1; keep < kTokens; ++keep) {
         forward(keep, nullptr, nullptr, true);
         const auto expected_state = Download(&current_state, kStateCount);
         const auto expected_conv = Download(&current_conv, kConvState);
-        if (std::memcmp(expected_state.data(),
-                        saved_states.data() + (saved - keep) * kStateCount,
+        // An independent host FMA oracle fixes the rounded-product contract.
+        // Comparing only two GPU executions misses compiler reassociation.
+        const auto product = [](float a, float b) {
+          volatile float rounded = a * b;
+          return rounded;
+        };
+        for (std::size_t index = 0; index < kStateCount; ++index) {
+          const auto h = index / (kDim * kDim);
+          const auto j = (index / kDim) % kDim;
+          const auto k = index % kDim;
+          float value = saved_states[state_offsets[0] + index];
+          for (std::uint32_t t = 1; t < keep; ++t) {
+            const auto* update = saved_states.data() + state_offsets[t];
+            const float key = update[(h % kKHeads) * kDim + k];
+            const float decay = update[kKHeads * kDim + h];
+            const float beta = update[kKHeads * kDim + kVHeads + h];
+            const float error =
+                update[kKHeads * kDim + 2 * kVHeads + h * kDim + j];
+            const float correction = product(error, key);
+            value = (k + 1) % 32 == 0
+                        ? std::fma(value, decay, product(beta, correction))
+                        : std::fma(beta, correction, product(value, decay));
+          }
+          if (std::memcmp(&value, &expected_state[index], sizeof(float)))
+            throw std::runtime_error(
+                "GDN changed its rounded-product contract");
+        }
+        q::RollbackRows replay;
+        for (std::size_t i = 0; i < saved; ++i)
+          replay.rows[i] = state_snaps.get() + state_offsets[i];
+        q::RestoreGdnState(current_state.get(), replay, keep, kKHeads, kVHeads,
+                           nullptr);
+        const auto restored_state = Download(&current_state, kStateCount);
+        if (std::memcmp(expected_state.data(), restored_state.data(),
                         kStateCount * sizeof(float)) ||
             std::memcmp(expected_conv.data(),
                         saved_convs.data() + (saved - keep) * kConvState,

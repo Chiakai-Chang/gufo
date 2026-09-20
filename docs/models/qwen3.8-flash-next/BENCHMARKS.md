@@ -61,15 +61,17 @@ uses `repetition_word` for repetition and distinct requests cycling through
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 27.3 | 79.9 | 27.0 | 48.1 |
-| 2 | 46.4 | 117.7 | 43.2 | 64.9 |
-| 4 | 76.7 | 151.2 | 66.8 | 91.8 |
-| 6 | 95.4 | 164.5 | 78.2 | 103.9 |
-| 8 | 108.5 | **171.8** | 86.7 | 109.3 |
+| 1 | 27.3 | 84.6 | 27.0 | 49.3 |
+| 2 | 46.4 | 127.7 | 43.2 | 66.4 |
+| 4 | 76.7 | 166.1 | 66.8 | 95.2 |
+| 6 | 95.4 | 181.2 | 78.2 | 110.4 |
+| 8 | 108.5 | **188.9** | 86.7 | 118.3 |
 
-MTP acceptance is 100% on repetition and 76.1–81.7% on the mixed cohorts.
+MTP acceptance is 100% on repetition and 74.2–84.9% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
 Greedy timing-based depth choices can vary between runs.
+MTP rollback storage grows on demand to about 147 MiB per session at seven
+drafts; KV caches and other session state are additional.
 
 **C1 is a single user.** The HTTP and raw CLI prompts above differ.
 Compare identical prompts and timing boundaries.

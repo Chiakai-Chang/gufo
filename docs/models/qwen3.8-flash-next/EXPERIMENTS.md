@@ -37,27 +37,27 @@
 | Greedy batch cost controller | Retained only for all-greedy C>1; separate occupancy/context bins, stable plain controls, no transition timings. Sampled replay uses fixed curves calibrated from median warmed cycles on 2026-09-20. |
 | One-row MTP prefill lag | Retained; 320 KiB kept hidden state/session, avoids replaying a final prefill chunk. |
 | Final-tile MTP catch-up | Retained; preserve every KV/indexer row, rank only the final attention tile, then restrict output projection, mixers and shared experts to the final aligned tile(s), with one routed Q8 expert row. Full predictor/catch-up stages, candidates and recursive carry match exactly at 224/257/2047/2048 rows. |
+| Batched MTP catch-up tail | Retained; after writing every attention cache row, compact final request rows into existing scratch and skip unused output projections/FFNs. Preserve the scalar arithmetic of one-row tails; full-head candidates and recursive carry match independent execution. |
 | Routed Q8 accumulation order | Retained; explicit rounded product/FMA prevents identical rows changing with column placement. Independent FP64 dot and predictor carry checks pass. |
 | Isolated MMQ quantizer rounding change | Deferred: it changes half-integer tie behavior shared with W8A8 and fails their existing agreement gate. No quantizer change retained. |
 | SSM tile, wave and compiler scheduling variants | Rejected: four/sixteen-wave groups, wave64, wider token tiles and iterative ILP scheduling retained exact output but did not beat the existing eight-wave projection. |
 | Captured shared stages in batched target decoding | Rejected: exact C2/C4/C6/C8 logits, sampled state and cancellation checks, but no serving or warmed-cycle gain justified graph metadata/capture overhead. |
-| Lazy rollback and shared scratch | Retained; depth grows on demand, reset releases it; seven-draft cap about 788 MiB/session. |
+| Compact recurrent rollback | Retained; one full state plus exact FP32 update operands, with the original product/FMA order. All rollback prefixes match fresh execution. Depth grows on demand; seven-draft cap about 147 MiB/session, released on reset. |
 | Live final frontier and async prompt snapshots | Retained; immutable branch snapshot, worker capture, bounded persistence outside the lookup lock. |
 | Thread-local decode graph capture | Retained; independent snapshot workers no longer invalidate a peer's capture. Snapshot bytes and captured/replayed logits are exact; no request serialization added. |
 | Chunk-equivalent projections/attention | Retained with exact continued-image/cache/full-logit gates; one-token tails keep prefill arithmetic. |
 | More Q8 vocabulary rows/block | Rejected: no C1 improvement. |
 
 Separate d32K pp2048 profiling attributes 29.1% of kernel time to MoE, 34.9%
-to dense projections and 12.6% to attention/indexing. A C4 mixed MTP trace with
-64 output tokens is 86.9% GPU-busy during inference; MoE/MMQ is 50.3% and dense
-projections 36.0% of kernel time. The inference window excludes model loading.
-These are profile observations, not unprofiled throughput measurements.
-Final-tile catch-up takes 20.9 ms of MTP kernel time at d32K pp2048; the
-target remains 1450.2 ms in the same trace.
-In the C4 inference window, 4.2% of the scheduling thread's time is outside
-HIP API calls, including model-side CPU work. Cold stalls include a 132.9 ms
-gap around the first BLAS kernel and 110.1 ms in allocation calls; the active
-decode loop has no deliberate sleeps.
+to dense projections and 12.6% to attention/indexing. Final-tile catch-up
+takes 20.9 ms of MTP kernel time; the target takes 1450.2 ms.
+
+A C4 mixed MTP trace with 32 output tokens per request is 84.9% GPU-busy
+during inference, excluding model loading. Batched GDN updates take 40.9 ms,
+rollback replay 14.5 ms and lazy allocations 31.8 ms. The scheduling thread
+spends 5.4% of the window outside HIP API calls, including model-side CPU
+work; this is not pure scheduler overhead. These are profile observations,
+not unprofiled throughput measurements.
 
 Next: improve prefill at depth and target/draft batch projection reuse while
 preserving [quality](EVALUATION.md). The 1700 tok/s PP and flat d0–d128K
