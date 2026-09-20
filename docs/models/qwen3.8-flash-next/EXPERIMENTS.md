@@ -18,13 +18,15 @@
 | Partitioned BF16 WMMA vision value projection | Rejected: failed the full-encoder reference gate despite lower isolated FP64 error. |
 | Integer WMMA Q8 decode projection | Rejected: preserving the original rounded products/FMA sequence makes output exact, but padding/reduction overhead is slower. |
 | Q8 activation reuse across output rows | Rejected: no repeatable gain on the real projection shapes. |
+| Wider Q8 decode and Q5 expert tiles | Rejected: exact output, but 33–64 dense rows and 16/32 expert rows were slower on representative shared/distinct/mixed work. |
 | Compact expert launch groups | Rejected: improved shared routing but negligible mixed-routing gain. |
 | Sparse attention register/cache retuning | Rejected: exact d128K output, but register scheduling/occupancy gave no material gain and reloading queries was slower. |
+| Integer WMMA value transpose and paired FP32 selector lanes | Rejected: bit-preserving transpose and exact selector scores, but both were slower on deep-context inputs. |
 | Packed Q8 prefill staging | Rejected: exact output, but extra decode/register/transpose costs outweighed reduced LDS use. |
 | Smaller-LDS SSM projection and unrolled HC expert sum | Rejected: exact output but no prefill speed gain. |
 | Transient key transpose and mixed expert tiles | Rejected: exact outputs; key transpose slows deep selection, mixed tile sizes provide no useful prefill gain. |
 | Ratio-four predictor QSA, FP32 ranking queries | Retained with sparse state, rewind and deep selector checks. |
-| Greedy batch cost controller | Retained only for all-greedy C>1; separate occupancy/context bins, stable plain controls, no transition timings. Sampled replay uses fixed cost curves. |
+| Greedy batch cost controller | Retained only for all-greedy C>1; separate occupancy/context bins, stable plain controls, no transition timings. Sampled replay uses fixed curves calibrated from median warmed cycles on 2026-09-20. |
 | One-row MTP prefill lag | Retained; 320 KiB kept hidden state/session, avoids replaying a final prefill chunk. |
 | Lazy rollback and shared scratch | Retained; depth grows on demand, reset releases it; seven-draft cap about 788 MiB/session. |
 | Live final frontier and async prompt snapshots | Retained; immutable branch snapshot, worker capture, bounded persistence outside the lookup lock. |

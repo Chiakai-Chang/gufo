@@ -5,7 +5,7 @@ namespace qfn_mmq {
 #include "vecdotq.hpp"
 
 // Each wave handles up to eight dense inputs for one weight row on gfx1151.
-template<int ncols_dst, bool has_gate, int token_waves = 1>
+template<int ncols_dst, bool has_gate, int token_waves = 1, bool ragged = false>
 __launch_bounds__(32 * token_waves, 1) static __global__
     void mul_mat_vec_q8(const void* __restrict__ weights,
                         const void* __restrict__ gate,
@@ -28,8 +28,12 @@ __launch_bounds__(32 * token_waves, 1) static __global__
        kbx += blocks_per_iter) {
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
+      // The last wave may contain fewer than eight inputs. Its inactive
+      // columns reuse a valid row; their results are never stored.
+      const int token =
+          ragged ? min(first_token + j, int(valid_tokens) - 1) : first_token + j;
       sum[j] += vec_dot_q8_0_q8_1(
-          weights, input + (first_token + j) * stride_col_y + kbx,
+          weights, input + token * stride_col_y + kbx,
           row_offset + kbx, kqs);
       if constexpr (has_gate) {
         gate_sum[j] += vec_dot_q8_0_q8_1(gate, input + j * stride_col_y + kbx,
@@ -566,6 +570,19 @@ static void launch_q8(const void* weights, const void* gate, const block_q8_1* i
     }
 }
 
+template<int waves>
+static void launch_q8_batch(const void* weights, const block_q8_1* input,
+                            float* output, int k, int rows, int tokens,
+                            int input_stride, hipStream_t stream) {
+  if (tokens % 8 != 0) {
+    mul_mat_vec_q8<8, false, waves, true><<<rows, 32 * waves, 0, stream>>>(
+        weights, nullptr, input, output, k, rows, input_stride, tokens);
+  } else {
+    mul_mat_vec_q8<8, false, waves><<<rows, 32 * waves, 0, stream>>>(
+        weights, nullptr, input, output, k, rows, input_stride, tokens);
+  }
+}
+
 void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
                              const block_q8_1* input, float* output, int k,
                              int rows, int tokens, int input_stride,
@@ -576,14 +593,14 @@ void mul_mat_vec_q8_dispatch(const void* weights, const void* gate,
     // Each wave retains the eight-row arithmetic. Adjacent waves work
     // on the same weight row, reusing cache lines across requests.
     if (tokens <= 16) {
-      mul_mat_vec_q8<8, false, 2><<<rows, 64, 0, stream>>>(
-          weights, nullptr, input, output, k, rows, input_stride, tokens);
+      launch_q8_batch<2>(weights, input, output, k, rows, tokens, input_stride,
+                          stream);
     } else if (tokens <= 24) {
-      mul_mat_vec_q8<8, false, 3><<<rows, 96, 0, stream>>>(
-          weights, nullptr, input, output, k, rows, input_stride, tokens);
+      launch_q8_batch<3>(weights, input, output, k, rows, tokens, input_stride,
+                          stream);
     } else {
-      mul_mat_vec_q8<8, false, 4><<<rows, 128, 0, stream>>>(
-          weights, nullptr, input, output, k, rows, input_stride, tokens);
+      launch_q8_batch<4>(weights, input, output, k, rows, tokens, input_stride,
+                          stream);
     }
     return;
   }

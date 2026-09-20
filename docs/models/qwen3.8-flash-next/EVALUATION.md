@@ -66,43 +66,21 @@ relative RMS below 0.0008. Full-model session tests additionally cover
 C2/C4/C6/C8, ragged budgets, sampled acceptance/rejection and cache restoration;
 selector/attention operator tests cover sparse deep contexts.
 
-The 2026-09-20 mixer batching change passed this oracle and the full
-`--batch-only` check: exact logits, tokens, acceptance, residual draws and RNG
-at C2/C4/C6/C8, including cancellation and recovery. Vision softmax caching
-retains the original per-thread and block reduction order. Focused 256–16384
-patch-row checks matched every probability byte; complete 256×256 and
-1024×1024 Flash-Next embeddings also matched the previous encoder byte for
-byte. The Qwen27B Q4/Q8 projector passed the 1024×1024 embedding comparison.
+Current optimization qualification (2026-09-20):
 
-Q4 shared-expert weight reuse passed the maintained routed-projection checks:
-exact outputs for widths 1–8, duplicate/inactive experts, nonfinite scales and
-ragged rows. HC Q8 prefetch retains the scalar/batched rounded products and
-FMA sequence; Q5 high-bit expansion changes integer decoding only.
-Batched residual epilogues and MTP norms retain each request's reduction.
-The affected projection checks and full batch session check pass, with exact
-logits, tokens, RNG, acceptance and residual replay at C2/C4/C6/C8.
-Fresh repetitive and mixed serving cohorts match AR completion hashes without
-cache hits.
-Short convolution/history fusion also passes the GDN operator and full batch
-session checks, including every 1–8-token rollback prefix and unused snapshots.
-GDN batching retains these results byte for byte, including ragged row counts
-and cancelled descriptors with null pointers. The full session check also
-passes with mapped descriptors: independent state, image restoration, sampled
-acceptance/residual correction and RNG replay at C2/C4/C6/C8.
-Batched small projections, HC down projection and MoE preparation also pass
-that session check. Projection coverage includes up to 64 independent rows,
-ragged tails and exact scalar/batch FP32 output; activation staging reuses
-existing scratch. All ten fresh C1/C2/C4/C6/C8 repetitive/mixed cohorts match
-AR completion hashes with zero cache hits.
-Q4 expert grouping across the complete batch retains those results. The
-routed-vector check covers 64 input/640 down rows, mixed activation scales,
-duplicate and inactive experts, nonfinite scales and output guards. A captured
-model input additionally checks FP32 contraction; full C2/C4/C6/C8 session
-logits, sampled acceptance/residual draws and RNG remain exact.
-The 4096-patch vision attention specialization matches every QK/PV FP32
-GEMM result for two independent inputs and complete Flash-Next/Qwen27B
-1024×1024 embeddings byte for byte. A 736×736 ragged control also matches;
-other patch counts keep their previous tile shapes.
+- Projection checks retain exact scalar/batch FP32 output through 64 input and
+  640 expert-down rows, including mixed activation scales, duplicate/inactive
+  experts, nonfinite scales and output guards. Ragged Q8 inputs end at the
+  allocation boundary. Captured model inputs also check FP32 contraction.
+- Full `--batch-only` checks retain exact logits, tokens, acceptance, residual
+  draws and RNG at C2/C4/C6/C8, with independent state, every 1–8-token rollback
+  prefix, cancellation/recovery and image restoration.
+- All ten fresh C1/C2/C4/C6/C8 repetitive/mixed serving cohorts match AR
+  completion hashes with zero cache hits.
+- Vision softmax checks match every probability byte over 256–16384 patch
+  rows. The 4096-patch attention specialization retains complete QK/PV FP32
+  output. Full Flash-Next 256×256/1024×1024 and Qwen27B 1024×1024 embeddings
+  match byte for byte; a 736×736 ragged control also matches.
 
 **Open vision parity gap:** a 1024×1024 synthetic texture produces 6.47%
 embedding relative L2 error against the pinned BF16 reference, above the 5%
@@ -154,9 +132,10 @@ nix develop -c ctest --test-dir build/gpu-test -R 'qwen38_flash_next[.]select_op
 - **Audits:** `qwen38_flash_next_gpu_probe --mtp-audit` checks original encoded
   weights, full-width normalization, predictor stages with independently
   computed caches, recursive carry and independent text/image batches against
-  a scalar CPU oracle. `--cost-audit C`
-  measures warmed catch-up/proposal/verification costs (`0` selects
-  C1/C2/C4/C6/C8). Both avoid storing logit fixtures.
+  a scalar CPU oracle. `--cost-audit C` measures catch-up/proposal/verification
+  costs: median of three complete warmed cycles, with two warm-ups per shape.
+  `0` selects C1/C2/C4/C6/C8; `--depth N` restricts the default d0/d4K/d32K
+  calibration for focused iteration. Neither audit stores logit fixtures.
 
 The model tests/probes accept `--model "$MODEL" --mtp-model "$MTP"`; build the
 session/snapshot tests with `qwen38_flash_next_model_tests`. Preserve arithmetic

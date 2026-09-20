@@ -626,14 +626,18 @@ void CheckDecodeGrouping(int rows, int cols) {
         continue;
       CheckHip(hipMemset(out, 0xA5, batch.size() * sizeof(float)),
                "decode output guard");
-      if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, dq, out, rows,
-                                      n, cols, nullptr))
+      // End every shape at the allocation boundary. Using a full shared
+      // input buffer can hide overreads by a partially populated final wave.
+      const auto* input = static_cast<const std::uint8_t*>(dq) +
+                           qfn_mmq_q8_1_bytes(tokens - n, cols);
+      if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, input, out,
+                                      rows, n, cols, nullptr))
         throw std::runtime_error("batched dense projection failed");
       CheckHip(hipMemcpy(batch.data(), out, batch.size() * sizeof(float),
                          hipMemcpyDeviceToHost),
                "batch output");
-      if (std::memcmp(scalar.data(), batch.data(), n * rows * sizeof(float)) !=
-          0)
+      if (std::memcmp(scalar.data() + (tokens - n) * rows, batch.data(),
+                       n * rows * sizeof(float)) != 0)
         throw std::runtime_error(
             "Q8 dense grouping differs: M=" + std::to_string(rows) +
             " K=" + std::to_string(cols) + " N=" + std::to_string(n) +

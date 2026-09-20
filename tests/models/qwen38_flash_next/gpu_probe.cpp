@@ -5,6 +5,7 @@
 //           [--batch T] [--context N] [--dump logits.bin]
 // Independent predictor oracle: --mtp-model MTP.gguf --mtp-audit
 // MTP cost calibration: --mtp-model MTP.gguf --cost-audit C (0 = all)
+//                      [--depth N] (default: 0, 4096, 32768)
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,6 +82,7 @@ int main(int argc, char** argv) {
   bool reference = false;
   bool cost_audit = false;
   std::uint32_t cost_concurrency = 0;
+  std::optional<std::uint32_t> cost_depth;
   std::uint32_t batch = 512;
   std::uint32_t context = 4096;
   for (int i = 1; i < argc; ++i) {
@@ -105,6 +108,16 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--cost-audit requires C=0/1/2/4/6/8 (0 = all)\n");
         return 2;
       }
+    } else if (arg == "--depth") {
+      const auto value = next();
+      std::uint32_t depth = 0;
+      const auto [end, ec] =
+          std::from_chars(value.data(), value.data() + value.size(), depth);
+      if (ec != std::errc{} || end != value.data() + value.size()) {
+        std::fprintf(stderr, "--depth requires a nonnegative integer\n");
+        return 2;
+      }
+      cost_depth = depth;
     } else if (arg == "--prompt") {
       prompt = next();
     } else if (arg == "--reference") {
@@ -138,6 +151,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "--cost-audit cannot be combined with other probes\n");
     return 2;
   }
+  if (cost_depth && !cost_audit) {
+    std::fprintf(stderr, "--depth requires --cost-audit\n");
+    return 2;
+  }
   std::string error;
   auto reader = gufo::core::GgufReader::OpenFile(model_path, &error);
   if (!reader) {
@@ -156,6 +173,11 @@ int main(int argc, char** argv) {
     return 1;
   }
   const auto& c = weights->config;
+  if (cost_depth && (c.context_length < 96 ||
+                     *cost_depth > c.context_length - 96)) {
+    std::fprintf(stderr, "--depth leaves no room for the cost-audit suffix\n");
+    return 2;
+  }
   std::unique_ptr<q::NgramTable> ngram;
   if (c.ple_layer >= 0) {
     const auto& t = weights->ple_table;
@@ -204,7 +226,10 @@ int main(int argc, char** argv) {
   if (cost_audit) {
     try {
       const std::array<std::uint32_t, 3> depths{0, 4096, 32768};
-      AuditMtpCosts(*executor, *tokenizer, depths, cost_concurrency);
+      std::span<const std::uint32_t> selected_depths = depths;
+      if (cost_depth)
+        selected_depths = std::span(&*cost_depth, 1);
+      AuditMtpCosts(*executor, *tokenizer, selected_depths, cost_concurrency);
       return 0;
     } catch (const std::exception& e) {
       std::fprintf(stderr, "cost audit failed: %s\n", e.what());

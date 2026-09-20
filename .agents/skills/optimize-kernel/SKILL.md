@@ -22,6 +22,8 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
 3. Profile separately with `tools/prof/prof.py`; compare stage totals, launch
    counts, GPU-busy time and wall span. Inspect allocator, synchronization,
    sampling and cache I/O when GPU time does not explain latency.
+   Warm each batch shape before calibration: large lazy allocations caused
+   100 ms stalls here. Use a median complete cycle when timings remain noisy.
 4. Change one mechanism, compile the affected target, then run its existing
    analytic/operator check. Use `tools/bench/build.sh <name>` for standalone
    HIP experiments; each result needs correctness alongside throughput.
@@ -94,7 +96,8 @@ Use an independent operator formula or pinned official teacher; two Gufo
 paths agreeing does not prove upstream parity. Compare matched token histories
 and find the first changed layer if logits drift. Never relax tolerances or
 replace goldens to accept a speedup. Test finite outputs and awkward tails
-(e.g. 1/8/9/32/33 rows), not only aligned shapes.
+(e.g. 1/8/9/32/33 rows), not only aligned shapes. End ragged inputs at the
+allocation boundary; oversized shared scratch can conceal invalid reads.
 Moving FP32 expressions into a device helper changed contraction here.
 Capture the first failing operator's inputs for a small replay; include
 unsaturated activations, since large synthetic values can hide the difference.

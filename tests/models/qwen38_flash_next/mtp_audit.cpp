@@ -264,6 +264,8 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
 
 // Model-level cost calibration. Restore identical real states for every
 // shape, warm allocation and C1 graph capture, then measure each stage.
+// Report the median complete cycle of three warmed samples: allocator stalls
+// on large cohorts can outlive the first pass after changing width.
 // Timings never enter the production sampler at runtime.
 void AuditMtpCosts(q::rocm::Executor& exec,
                    const gufo::tokenization::QwenTokenizer& tokenizer,
@@ -341,8 +343,8 @@ void AuditMtpCosts(q::rocm::Executor& exec,
             error);
       }
       for (const unsigned width : {1, 2, 3, 4, 5, 6, 7, 8}) {
-        const unsigned passes = concurrency == 1 ? 3 : 2;
-        for (unsigned repetition = 0; repetition < passes; ++repetition) {
+        std::array<std::array<double, 3>, 3> samples{};
+        for (unsigned repetition = 0; repetition < 5; ++repetition) {
           std::vector<std::vector<std::int32_t>> replays(concurrency);
           std::vector<q::rocm::Executor::MtpBatchItem> catchup;
           std::array<std::int32_t, 8> next = anchors;
@@ -405,15 +407,23 @@ void AuditMtpCosts(q::rocm::Executor& exec,
                       error);
           }
           const double target_ms = elapsed(target_start);
-          if (repetition + 1 == passes) {
-            std::printf(
-                "MTP_COST depth=%u C=%u width=%u catchup_ms=%.4f "
-                "proposal_ms=%.4f target_ms=%.4f total_ms=%.4f\n",
-                depth, concurrency, width, catchup_ms, proposal_ms, target_ms,
-                catchup_ms + proposal_ms + target_ms);
-            std::fflush(stdout);
-          }
+          if (repetition >= 2)
+            samples[repetition - 2] = {catchup_ms, proposal_ms, target_ms};
         }
+        const auto total = [](const auto& sample) {
+          return sample[0] + sample[1] + sample[2];
+        };
+        std::sort(samples.begin(), samples.end(), [&](const auto& a,
+                                                       const auto& b) {
+          return total(a) < total(b);
+        });
+        const auto& sample = samples[1];
+        std::printf(
+            "MTP_COST depth=%u C=%u width=%u catchup_ms=%.4f "
+            "proposal_ms=%.4f target_ms=%.4f total_ms=%.4f\n",
+            depth, concurrency, width, sample[0], sample[1], sample[2],
+            total(sample));
+        std::fflush(stdout);
       }
     }
   }
