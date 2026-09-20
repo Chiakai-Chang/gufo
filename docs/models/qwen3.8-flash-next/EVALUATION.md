@@ -72,6 +72,10 @@ Current optimization qualification (2026-09-20):
   640 expert-down rows, including mixed activation scales, duplicate/inactive
   experts, nonfinite scales and output guards. Ragged Q8 inputs end at the
   allocation boundary. Captured model inputs also check FP32 contraction.
+- Q8 matrix verification retains the vector path's four K8 partials, rounded
+  products, FMA chain and reduction order. Complete FP32 outputs match through
+  32 input rows, including partial input waves and output matrices with
+  2,561/12,289/65,537 rows.
 - Full `--batch-only` checks retain exact logits, tokens, acceptance, residual
   draws and RNG at C2/C4/C6/C8, with independent state, every 1–8-token rollback
   prefix, cancellation/recovery and image restoration.

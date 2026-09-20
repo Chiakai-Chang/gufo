@@ -45,10 +45,12 @@ struct Q8Weights {
   std::vector<float> values;
 };
 
-Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed) {
+Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed,
+                       bool reference_values = true) {
   Q8Weights w;
   w.blocks.resize(m * (k / 32) * 34);
-  w.values.resize(m * k);
+  if (reference_values)
+    w.values.resize(m * k);
   for (std::size_t r = 0; r < m; ++r) {
     for (std::size_t b = 0; b < k / 32; ++b) {
       float raw[32];
@@ -65,7 +67,8 @@ Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed) {
         const auto qv = static_cast<std::int8_t>(
             std::lround(df != 0.0F ? raw[i] / df : 0.0F));
         block[2 + i] = static_cast<std::uint8_t>(qv);
-        w.values[r * k + b * 32 + i] = df * static_cast<float>(qv);
+        if (reference_values)
+          w.values[r * k + b * 32 + i] = df * static_cast<float>(qv);
       }
     }
   }
@@ -580,8 +583,11 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
 
 void CheckDecodeGrouping(int rows, int cols) {
   const int tokens = rows == 320 && cols == 10240 ? 64 : 32;
-  const auto w = MakeWeights(rows, cols, 11);
-  const auto gate = MakeWeights(rows, cols, 17);
+  const auto w = MakeWeights(rows, cols, 11, false);
+  // The large fixtures exercise matrix dispatch. Gated vectors already have
+  // independent-weight coverage in the small fixtures.
+  const auto gate =
+      rows <= 320 ? MakeWeights(rows, cols, 17, false) : Q8Weights{};
   std::vector<float> x(tokens * cols);
   std::uint32_t seed = 37;
   for (auto& v : x)
@@ -592,7 +598,8 @@ void CheckDecodeGrouping(int rows, int cols) {
   void* dq = nullptr;
   float* out = nullptr;
   CheckHip(hipMalloc(&dw, w.blocks.size() + 4096), "decode weights");
-  CheckHip(hipMalloc(&dg, gate.blocks.size() + 4096), "decode gate");
+  if (!gate.blocks.empty())
+    CheckHip(hipMalloc(&dg, gate.blocks.size() + 4096), "decode gate");
   CheckHip(hipMalloc(&dx, x.size() * sizeof(float)), "decode inputs");
   CheckHip(hipMalloc(&dq, qfn_mmq_q8_1_bytes(tokens, cols)),
            "decode quantized inputs");
@@ -601,15 +608,18 @@ void CheckDecodeGrouping(int rows, int cols) {
   CheckHip(
       hipMemcpy(dw, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
       "weights upload");
-  CheckHip(hipMemcpy(dg, gate.blocks.data(), gate.blocks.size(),
-                     hipMemcpyHostToDevice),
-           "gate upload");
+  if (dg != nullptr)
+    CheckHip(hipMemcpy(dg, gate.blocks.data(), gate.blocks.size(),
+                       hipMemcpyHostToDevice),
+             "gate upload");
   CheckHip(
       hipMemcpy(dx, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice),
       "input upload");
   if (qfn_mmq_quantize_q8_1(dx, dq, tokens, cols, nullptr))
     throw std::runtime_error("decode input quantization failed");
   for (const bool gated : {false, true}) {
+    if (gated && dg == nullptr)
+      continue;
     for (int t = 0; t < tokens; ++t) {
       const auto* qrow = static_cast<const std::uint8_t*>(dq) +
                          t * qfn_mmq_q8_1_bytes(1, cols);
@@ -742,6 +752,9 @@ int main() {
     CheckSmallProjection(q::WeightType::kF16, 7, 131);
     CheckDecodeGrouping(64, 2560);
     CheckDecodeGrouping(320, 10240);
+    CheckDecodeGrouping(2561, 2560);
+    CheckDecodeGrouping(12289, 2560);
+    CheckDecodeGrouping(65537, 2560);
     CheckMtpOutputHead(1.0F);
     // Small activations must retain products below F16's normal range.
     CheckMtpOutputHead(0.0001F);

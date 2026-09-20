@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 # Kernel-name substring -> pipeline stage. First match wins, so order matters.
 STAGE_MAPS: dict[str, list[tuple[str, str]]] = {
     "qwen-flash": [
+        ("mul_mat_q8_decode_batch", "dense: quantized vectors"),
         ("RoutedF16", "moe: f16 projections"),
         ("mul_mat_vec_moe_batch", "moe: grouped gate/up"),
         ("mul_mat_vec_moe_grouped", "moe: grouped gate/up"),

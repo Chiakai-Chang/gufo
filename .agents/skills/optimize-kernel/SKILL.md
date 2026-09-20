@@ -47,6 +47,10 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   Two-iteration prefetch helped the small 320×10240 HC projection; wider
   prefetch and applying it to larger matrices did not. Preserve the actual
   rounded products/FMA sequence, not just the algebraic formula.
+  Integer WMMA helped wider Q8 verification only after retaining four K8
+  partials and the original reduction tree. Reducing one result per thread
+  avoided duplicate wave sums. DPP xor/add helped GDN; fewer waves or smaller
+  scratch alone did not help.
 - **Verification and concurrency:** reuse quantized weights across token and
   request rows. Tune real ragged shapes, including 3–8 rows and partial tiles.
   Batch the complete draft transformer body, not only the vocabulary head;

@@ -2,7 +2,8 @@
 
 Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Production builds with the
 pinned Nix toolchain. CLI/AR measurements: 2026-09-19; MTP serving and vision:
-2026-09-20. One repetition per point; C8 mixed MTP has a repeated control.
+2026-09-20. One repetition per point; repetitive C2 was repeated to check
+scheduling variance.
 Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
 revision `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
@@ -58,20 +59,24 @@ uses `repetition_word` for repetition and distinct requests cycling through
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 25.24 | 64.99 | 25.12 | 42.54 |
-| 2 | 38.60 | 90.39 | 36.25 | 57.00 |
-| 4 | 53.09 | 110.35 | 48.41 | 72.96 |
-| 6 | 60.68 | 116.74 | 54.51 | 81.99 |
-| 8 | 65.17 | 119.90 | 58.45 | 80.6–82.9 |
+| 1 | 25.24 | 64.94 | 25.12 | 42.60 |
+| 2 | 38.60 | 89.0–92.9 | 36.25 | 55.93 |
+| 4 | 53.09 | 115.87 | 48.41 | 75.39 |
+| 6 | 60.68 | 122.21 | 54.51 | 80.03 |
+| 8 | 65.17 | 127.11 | 58.45 | 83.80 |
 
-MTP acceptance is 100% on repetition and 75.6–86.9% on the mixed cohorts.
+MTP acceptance is 100% on repetition and 71.2–82.0% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
 Greedy timing-based depth choices can vary between runs.
 
 **C1 is a single user.** The HTTP and raw CLI prompts above differ. With the
-repetitive chat prompt, HTTP C1 decode alone is 80.27 tok/s; the table includes
+repetitive chat prompt, HTTP C1 decode alone is 80.01 tok/s; the table includes
 prefill and scheduling. Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
+Summing the individual repetitive decode rates gives 114.7–115.8/159.3/169.1/178.0
+tok/s at C2/C4/C6/C8. These exclude waiting and prefill; the table reports
+whole-cohort output throughput. C2's decode rates were stable despite the
+larger variation in request completion time.
 
 ## Image encoder
 
