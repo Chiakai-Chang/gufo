@@ -135,6 +135,46 @@ bool Executor::AllocateBatch(std::string* error) const {
                 error));
 }
 
+bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
+                          float* mixed, float* inject, std::uint32_t rows,
+                          std::span<const std::uint32_t> offsets,
+                          std::string* error) const {
+  const auto& c = config();
+  xn_half_ = false;
+  if (!normed)
+    RmsNormRows(res, m.norm.f32(), s_.xn, rows, c.HcDim(), c.hc_count,
+                c.rms_eps, stream_);
+  if (!DenseBatch(m.down, s_.xn, s_.lo, rows, error))
+    return false;
+  SiluScale(s_.lo, 1.0F / static_cast<float>(c.hc_count),
+            std::size_t{rows} * c.hc_low_rank, stream_);
+  if (!DenseBatch(m.up, s_.lo, s_.hc_gate, rows, error))
+    return false;
+  const bool fused_inject = inject != nullptr && !m.inject.empty() &&
+                            m.inject.type == core::GgmlType::kF32;
+  q8t_src_ = nullptr;
+  half_src_ = nullptr;
+  // Every request contains at most eight decode rows. Keep its scalar
+  // epilogue/reduction even when the concatenated batch exceeds eight.
+  HcMixEpilogue(s_.xn, s_.hc_gate, fused_inject ? m.inject.f32() : nullptr,
+                mixed, inject, rows, c.hidden_size, c.hc_count, stream_);
+  inject_parts_ = fused_inject ? HcInjectParts(c.hidden_size) : 1;
+  if (inject != nullptr && !m.inject.empty() && !fused_inject) {
+    // Quantized inject projections use compact rows within each request,
+    // while RowScratch reserves the full partial-sum stride between requests.
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+      const auto begin = offsets[i];
+      const auto end = i + 1 < offsets.size() ? offsets[i + 1] : rows;
+      if (!Dense(m.inject, s_.xn + std::size_t{begin} * c.HcDim(),
+                 inject + std::size_t{begin} * c.hc_count *
+                              HcInjectParts(c.hidden_size),
+                 end - begin, error))
+        return false;
+    }
+  }
+  return true;
+}
+
 bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                                std::string* error) const {
   const Config& c = config();
@@ -248,13 +288,10 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
                       c.hc_count, stream_);
       i = end;
     }
-    for (std::size_t i = 0; i < items.size(); ++i) {
-      const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
-      UseScratch(RowScratch(base, offsets[i]));
-      if (!HcMix(l.hc_attn, s_.mtp_res, false, s_.mixed, s_.inject, n, error))
-        return false;
-    }
     UseScratch(base);
+    if (!HcMixBatch(l.hc_attn, base.mtp_res, false, base.mixed, base.inject,
+                    rows, std::span(offsets).first(items.size()), error))
+      return false;
     if (!l.attn_qkv.empty()) {
       if (!DenseBatch(l.attn_qkv, base.mixed, base.qg, rows, error))
         return false;
@@ -302,9 +339,11 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
       UseScratch(RowScratch(base, offsets[i]));
       Combine(s_.mtp_res, l.hc_ffn.norm.f32(), n);
-      if (!HcMix(l.hc_ffn, s_.mtp_res, true, s_.mixed, s_.inject, n, error))
-        return false;
     }
+    UseScratch(base);
+    if (!HcMixBatch(l.hc_ffn, base.mtp_res, true, base.mixed, base.inject, rows,
+                    std::span(offsets).first(items.size()), error))
+      return false;
     if (!AnyActive(items))
       return true;
     for (std::uint32_t row = 0; row < rows; row += kDecodeRows) {
@@ -410,13 +449,14 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
     if (!AnyActive(items))
       return true;
     for (std::uint32_t i = 0; i < n; ++i) {
-      UseScratch(RowScratch(base, i));
-      if (!HcMix(head, items[i].session->mtp_.h, false, s_.mixed, nullptr, 1,
-                 error)) {
-        return false;
-      }
+      RmsNormRows(items[i].session->mtp_.h, head.norm.f32(),
+                  base.xn + std::size_t{i} * config().HcDim(), 1,
+                  config().HcDim(), config().hc_count, config().rms_eps,
+                  stream_);
     }
     UseScratch(base);
+    if (!HcMixBatch(head, nullptr, true, base.mixed, nullptr, n, {}, error))
+      return false;
     if (!AnyActive(items))
       return true;
     if (!DenseBatch(output, base.mixed, batch_logits_, n, error))
@@ -651,14 +691,15 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         const auto& item = items[i];
         const auto n = static_cast<std::uint32_t>(item.tokens.size());
         UseScratch(RowScratch(base, offsets[i]));
-        if ((!item.session->Cancelled() && c.IsPleLayer(il) &&
-             !Ple(l, *item.session, n, s_.res, item.speculative, error,
-                  true)) ||
-            !HcMix(l.hc_attn, s_.res, normed, s_.mixed, s_.inject, n, error)) {
+        if (!item.session->Cancelled() && c.IsPleLayer(il) &&
+            !Ple(l, *item.session, n, s_.res, item.speculative, error, true)) {
           return false;
         }
       }
       UseScratch(base);
+      if (!HcMixBatch(l.hc_attn, base.res, normed, base.mixed, base.inject,
+                      rows, std::span(offsets).first(items.size()), error))
+        return false;
       if (l.linear) {
         if ((!l.ssm_in.empty()
                  ? !DenseBatch(l.ssm_in, base.mixed, base.qkvz, rows, error)
@@ -729,10 +770,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
         const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
         UseScratch(RowScratch(base, offsets[i]));
         Combine(s_.res, l.hc_ffn.norm.f32(), n);
-        if (!HcMix(l.hc_ffn, s_.res, true, s_.mixed, s_.inject, n, error)) {
-          return false;
-        }
       }
+      UseScratch(base);
+      if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
+                      std::span(offsets).first(items.size()), error))
+        return false;
       for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
         UseScratch(RowScratch(base, r));
         if (!Moe(l, s_.mixed, s_.block_out, std::min(kDecodeRows, rows - r),
@@ -762,13 +804,11 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                  error)) {
         return false;
       }
-      if (!HcMix(model_->hc_head(), s_.res, false, s_.mixed, nullptr, n,
-                 error)) {
-        return false;
-      }
     }
     UseScratch(base);
-    return DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
+    return HcMixBatch(model_->hc_head(), base.res, false, base.mixed, nullptr,
+                      rows, {}, error) &&
+           DenseBatch(model_->output(), base.mixed, batch_logits_, rows, error);
   };
   bool ok = false;
   try {

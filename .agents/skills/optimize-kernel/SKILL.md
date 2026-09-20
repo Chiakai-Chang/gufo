@@ -51,6 +51,8 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   Iterative ILP scheduling helped selected 16-row Q4/Q5 kernels; applying it
   globally was not a win. Inspect VGPR/LDS/private scratch and ISA with
   `tools/prof/isa_mix.py`; occupancy alone is not the optimization objective.
+  For wide register-cached softmax, a scheduling barrier after each exponential
+  removed spills while preserving the sum order. Cache only bounded row sizes.
 - **Attention and selection:** exact partial top-k can avoid sorting the full
   context. Preserve tie ordering and FP32 ranking. Pack existing KV bytes into
   bounded scratch/head groups without changing persistent precision. Do not
@@ -80,5 +82,7 @@ replay. Full model sweeps are final qualification, not each iteration.
 
 Measure C1 plus affected C2/C4/C6/C8. Keep prompt and cache state identical when
 comparing CLI single-user and HTTP C1; report decode rate separately from whole
-request throughput. For H3, prefer an analytic case or one block/forward pass;
+request throughput. Raise the benchmark server's per-client queue limit for
+C8 from one host; a rejected request is not a throughput result. For H3,
+prefer an analytic case or one block/forward pass;
 do not generate full videos during routine kernel work.

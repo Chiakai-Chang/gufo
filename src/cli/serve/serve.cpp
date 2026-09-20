@@ -480,7 +480,7 @@ void PrintServeHelp(std::string_view program_name,
                      "Maximum queued generation requests (default: 16)",
                      "Scheduling", &max_pending_requests);
     parser.AddOption("", "--max-pending-per-client", "N",
-                     "Maximum queued requests per X-Client-ID (default: 4)",
+                     "Maximum queued requests per client IP (default: 4)",
                      "Scheduling", &max_pending_requests_per_client);
     parser.AddOption(
         "", "--request-timeout-ms", "MS",
@@ -982,7 +982,7 @@ int RunServe(std::span<const char* const> args) {
                          "Maximum queued generation requests (default: 16)",
                          "Scheduling", &max_pending_requests);
     llm_parser.AddOption("", "--max-pending-per-client", "N",
-                         "Maximum queued requests per X-Client-ID (default: 4)",
+                         "Maximum queued requests per client IP (default: 4)",
                          "Scheduling", &max_pending_requests_per_client);
     llm_parser.AddOption(
         "", "--request-timeout-ms", "MS",

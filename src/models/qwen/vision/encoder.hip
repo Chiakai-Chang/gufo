@@ -211,14 +211,30 @@ __global__ void QkvRope(const float* input, const float* bias, Bf16* q, Bf16* k,
                    bias[2 * kHidden + head * kHeadDim + d]);
 }
 
+// Keep bounded rows in registers through normalization. Larger rows retain
+// the streaming path; caching them would spill and reread private memory.
+template<unsigned kValues>
 __global__ void Softmax(const float* scores, Bf16* probabilities,
                         unsigned length) {
   const unsigned row = blockIdx.x;
   __shared__ float reduce[kThreads];
+  float values[kValues != 0 ? kValues : 1];
   float maximum = -INFINITY;
-  for (unsigned i = threadIdx.x; i < length; i += kThreads) {
-    maximum = fmaxf(
-        maximum, Round(Round(scores[row * length + i]) * 0.1178511301977579F));
+  if constexpr (kValues != 0) {
+#pragma unroll
+    for (unsigned j = 0; j < kValues; ++j) {
+      const unsigned i = threadIdx.x + j * kThreads;
+      values[j] =
+          i < length
+              ? Round(Round(scores[row * length + i]) * 0.1178511301977579F)
+              : -INFINITY;
+      maximum = fmaxf(maximum, values[j]);
+    }
+  } else {
+    for (unsigned i = threadIdx.x; i < length; i += kThreads) {
+      maximum = fmaxf(maximum, Round(Round(scores[row * length + i]) *
+                                     0.1178511301977579F));
+    }
   }
   reduce[threadIdx.x] = maximum;
   __syncthreads();
@@ -231,9 +247,23 @@ __global__ void Softmax(const float* scores, Bf16* probabilities,
   maximum = reduce[0];
   __syncthreads();
   float sum = 0;
-  for (unsigned i = threadIdx.x; i < length; i += kThreads)
-    sum += expf(Round(Round(scores[row * length + i]) * 0.1178511301977579F) -
-                maximum);
+  if constexpr (kValues != 0) {
+#pragma unroll
+    for (unsigned j = 0; j < kValues; ++j) {
+      if (threadIdx.x + j * kThreads < length) {
+        values[j] = expf(values[j] - maximum);
+        sum += values[j];
+        // Limit overlapping exponential temporaries without changing their
+        // order. Wider shapes otherwise spill registers on gfx1151.
+        if constexpr (kValues > 16)
+          __builtin_amdgcn_sched_barrier(0);
+      }
+    }
+  } else {
+    for (unsigned i = threadIdx.x; i < length; i += kThreads)
+      sum += expf(Round(Round(scores[row * length + i]) * 0.1178511301977579F) -
+                  maximum);
+  }
   reduce[threadIdx.x] = sum;
   __syncthreads();
   for (unsigned stride = kThreads / 2; stride; stride /= 2) {
@@ -242,11 +272,20 @@ __global__ void Softmax(const float* scores, Bf16* probabilities,
     __syncthreads();
   }
   const float inverse = 1.0F / reduce[0];
-  for (unsigned i = threadIdx.x; i < length; i += kThreads) {
-    probabilities[row * length + i] =
-        Bf16(expf(Round(Round(scores[row * length + i]) * 0.1178511301977579F) -
-                  maximum) *
-             inverse);
+  if constexpr (kValues != 0) {
+#pragma unroll
+    for (unsigned j = 0; j < kValues; ++j) {
+      const unsigned i = threadIdx.x + j * kThreads;
+      if (i < length)
+        probabilities[row * length + i] = Bf16(values[j] * inverse);
+    }
+  } else {
+    for (unsigned i = threadIdx.x; i < length; i += kThreads) {
+      probabilities[row * length + i] = Bf16(
+          expf(Round(Round(scores[row * length + i]) * 0.1178511301977579F) -
+               maximum) *
+          inverse);
+    }
   }
 }
 
@@ -605,8 +644,21 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
           HIP_R_16BF, kHeadDim, count * kHeadDim, &zero, scores.data, HIP_R_32F,
           count, rows * count, kHeads, HIPBLAS_COMPUTE_32F,
           HIPBLAS_GEMM_DEFAULT));
-      Softmax<<<kHeads * rows, kThreads, 0, stream>>>(
-          scores.As<float>(), probabilities.As<Bf16>(), count);
+      if (count <= 1024)
+        Softmax<4><<<kHeads * rows, kThreads, 0, stream>>>(
+            scores.As<float>(), probabilities.As<Bf16>(), count);
+      else if (count <= 2048)
+        Softmax<8><<<kHeads * rows, kThreads, 0, stream>>>(
+            scores.As<float>(), probabilities.As<Bf16>(), count);
+      else if (count <= 4096)
+        Softmax<16><<<kHeads * rows, kThreads, 0, stream>>>(
+            scores.As<float>(), probabilities.As<Bf16>(), count);
+      else if (count <= 8192)
+        Softmax<32><<<kHeads * rows, kThreads, 0, stream>>>(
+            scores.As<float>(), probabilities.As<Bf16>(), count);
+      else
+        Softmax<0><<<kHeads * rows, kThreads, 0, stream>>>(
+            scores.As<float>(), probabilities.As<Bf16>(), count);
       CheckBlas(hipblasGemmStridedBatchedEx(
           impl_->blas, HIPBLAS_OP_N, HIPBLAS_OP_N, kHeadDim, rows, count, &one,
           v, HIP_R_16BF, kHeadDim, count * kHeadDim, probabilities.data,

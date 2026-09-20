@@ -8,6 +8,7 @@
 | BF16 draft gate/up reuse and tiled argmax | Retained; complete head, finite filtering and lowest-ID ties; no extra persistent buffer. |
 | Long-context KV packing | Retained in idle FFN scratch with bounded head groups; exact attention output/log-sum-exp, cache bytes unchanged. |
 | BF16 target projection reduction | Fixed per-row FP32 order retained for chunk/cache/continued-image equivalence. |
+| Register-cached vision softmax | Retained; byte-identical embeddings with the shared Q4/Q8 projector, unchanged reduction order and memory allocation. |
 | Alternate tiles/waves/pipeline depths (2026-09-19) | Rejected: no release throughput improvement. |
 | Dynamic verification chunk/controller alternatives | No new default retained; seeded private-acceptance policy remains. |
 

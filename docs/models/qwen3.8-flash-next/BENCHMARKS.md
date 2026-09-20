@@ -1,7 +1,9 @@
 # Qwen3.8-Flash-Next on Strix Halo
 
-Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Nix release, measured
-2026-09-19, one repetition per point. Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
+Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Production builds with the
+pinned Nix toolchain. CLI/AR measurements: 2026-09-19; MTP serving and vision:
+2026-09-20. One repetition per point; mixed C4 was confirmed twice.
+Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
 revision `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
 
@@ -48,23 +50,35 @@ Sampled MTP, d0 raw prefix, seed 1, tg128, top-k/top-p/min-p disabled:
 
 Aggregate **output** tok/s, including prompt handling and scheduling. Context
 4096, greedy, thinking off, 128 output tokens, one cold cohort on a fresh server
-per point; no cache hits. The [corpus](../qwen3.8-27b/artifacts/speculative-corpus.json)
+per point; no cache hits. Set `--sessions C --max-pending-per-client 8` when
+benchmarking up to eight requests from one host.
+The [corpus](../qwen3.8-27b/artifacts/speculative-corpus.json)
 uses `repetition_word` for repetition and distinct requests cycling through
 `expository_pangram`, `cpp_ring_buffer`, `reasoning_train` for mixed work.
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 25.24 | 62.56 | 25.12 | 41.92 |
-| 2 | 38.60 | 77.14 | 36.25 | 52.94 |
-| 4 | 53.09 | 87.00 | 48.41 | 58.80 |
-| 6 | 60.68 | 89.88 | 54.51 | 63.16 |
-| 8 | 65.17 | 91.41 | 58.45 | 67.74 |
+| 1 | 25.24 | 61.91 | 25.12 | 41.82 |
+| 2 | 38.60 | 77.58 | 36.25 | 54.23 |
+| 4 | 53.09 | 87.91 | 48.41 | 63.92 |
+| 6 | 60.68 | 91.35 | 54.51 | 64.70 |
+| 8 | 65.17 | 94.37 | 58.45 | 70.15 |
 
-MTP acceptance is 100% on repetition and 72.9–85.3% on the mixed cohorts.
+MTP acceptance is 100% on repetition and 74.9–79.3% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
 
 **C1 is a single user.** The HTTP and raw CLI prompts above differ. With the
-same repetitive chat prompt, CLI decode measured 75.42 tok/s and HTTP
-C1 75.85 tok/s. Whole-request HTTP throughput also includes prefill
-and scheduling. Compare identical prompts and timing boundaries.
+repetitive chat prompt, HTTP C1 decode alone is 76.37 tok/s; the table includes
+prefill and scheduling. Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
+
+## Image encoder
+
+Warm `mmproj-BF16.gguf` encoding; excludes preprocessing, first weight upload
+and language-model prefill. Complete embeddings are byte-identical to the
+previous encoder and reproduce exactly across runs.
+
+| RGB image | Merged image tokens | Encode latency |
+| --- | ---: | ---: |
+| 256×256 | 64 | 21.3 ms |
+| 1024×1024 | 1024 | 1276 ms |

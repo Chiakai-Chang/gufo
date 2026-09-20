@@ -66,6 +66,14 @@ relative RMS below 0.0008. Full-model session tests additionally cover
 C2/C4/C6/C8, ragged budgets, sampled acceptance/rejection and cache restoration;
 selector/attention operator tests cover sparse deep contexts.
 
+The 2026-09-20 mixer batching change passed this oracle and the full
+`--batch-only` check: exact logits, tokens, acceptance, residual draws and RNG
+at C2/C4/C6/C8, including cancellation and recovery. Vision softmax caching
+retains the original per-thread and block reduction order. Focused 256–16384
+patch-row checks matched every probability byte; complete 256×256 and
+1024×1024 Flash-Next embeddings also matched the previous encoder byte for
+byte. The Qwen27B Q4/Q8 projector passed the 1024×1024 embedding comparison.
+
 **Remaining limit:** these checks use converted GGUF weights. They do not
 establish unquantized-checkpoint equivalence or detect every conversion error.
 Pinned Transformers ignores the MTP weights, so its trunk forward is not an
