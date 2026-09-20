@@ -494,7 +494,7 @@ double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
 // Unquantized router, alpha/beta and indexer projections must keep the same
 // result when a token moves between decode and any verification batch width.
 void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
-  constexpr unsigned tokens = 8;
+  constexpr unsigned tokens = 64;
   const unsigned element_bytes = type == q::WeightType::kF32 ? 4 : 2;
   std::vector<std::uint8_t> weights(std::size_t(rows) * cols * element_bytes);
   std::vector<float> reference_weights(std::size_t(rows) * cols);
@@ -552,7 +552,8 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
             "small projection differs from FP64 reference");
     }
   }
-  for (unsigned n = 1; n <= tokens; ++n) {
+  for (const unsigned n : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 31U,
+                           32U, 33U, tokens}) {
     CheckHip(hipMemset(dy, 0xA5, batch.size() * sizeof(float)),
              "small output poison");
     q::SmallGemm(dw, type, dx, dy, n, rows, cols, nullptr);
@@ -578,7 +579,7 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
 }
 
 void CheckDecodeGrouping(int rows, int cols) {
-  constexpr int tokens = 32;
+  const int tokens = rows == 320 && cols == 10240 ? 64 : 32;
   const auto w = MakeWeights(rows, cols, 11);
   const auto gate = MakeWeights(rows, cols, 17);
   std::vector<float> x(tokens * cols);
@@ -621,6 +622,8 @@ void CheckDecodeGrouping(int rows, int cols) {
                        hipMemcpyDeviceToHost),
              "scalar output");
     for (int n = 2; n <= (gated ? 8 : tokens); ++n) {
+      if (n > 32 && n % 8 != 0)
+        continue;
       CheckHip(hipMemset(out, 0xA5, batch.size() * sizeof(float)),
                "decode output guard");
       if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, dq, out, rows,

@@ -373,6 +373,11 @@ private:
                  bool project_output = true) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg) const;
+  /// Runs routed experts after the router and shared expert are ready.
+  bool MoeExperts(const DeviceLayer& l, const float* x, float* out,
+                  std::uint32_t n_tokens, std::string* error_msg) const;
+  bool MoeBatch(const DeviceLayer& l, const float* x, float* out,
+                std::uint32_t rows, std::string* error) const;
   /// Selects the greedy token or compact candidates from full MTP logits.
   bool MtpHead(const DeviceMixer& head, const float* res, bool token,
                bool candidates, std::string* error_msg) const;
@@ -483,10 +488,14 @@ private:
   void UseScratch(const Scratch& scratch) const;
   bool DenseBatch(const DeviceTensor& w, const float* x, float* out,
                   std::uint32_t rows, std::string* error_msg) const;
+  bool GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
+                       const float* x, float* out, std::uint32_t rows,
+                       std::string* error) const;
+  bool QuantizeBatch(const float* x, std::uint32_t rows, std::uint32_t cols,
+                     std::string* error) const;
   bool AllocateBatch(std::string* error_msg) const;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
-  mutable void* batch_q8_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};
   mutable MtpCandidateLogits* batch_candidates_host_{nullptr};
   // Mapped descriptors, one slice per layer: GPU reads cannot race the host

@@ -54,6 +54,9 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   rows before touching state, and keep descriptor storage alive until completion.
   Test both shared and disjoint expert routing: weight reuse benefits shared
   experts, but single-request experts need a compact path.
+  Group independent small projections in the launch grid and quantize batch
+  activations once in idle prefill scratch. Preserve each row's original
+  dot-product specialization; larger generic GEMV tiles can be slower.
   Exact packed-integer transforms can help both: spreading Q5 high-bit
   nibbles with multiply/mask removed shifts without changing dequantization.
 - **Wave mode and compiler:** selected quantized kernels need wave64 while

@@ -228,8 +228,8 @@ bool RoutedGatedF16Gemm(const void* gate, const void* up, WeightType type,
                         const std::int32_t* rows_out, __half* out,
                         std::size_t m, std::size_t k, hipStream_t stream);
 
-/// F32/BF16/F16 projection for 1–8 token rows. Each token keeps the same
-/// accumulation order at every batch width.
+/// F32/BF16/F16 projection in groups of up to eight token rows. Each token
+/// keeps the same accumulation order at every batch width.
 void SmallGemm(const void* w, WeightType type, const float* x, float* out,
                std::uint32_t n_tokens, std::uint32_t m, std::uint32_t k,
                hipStream_t stream);

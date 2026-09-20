@@ -122,17 +122,12 @@ void Executor::UseScratch(const Scratch& scratch) const {
 }
 
 bool Executor::AllocateBatch(std::string* error) const {
-  return (batch_logits_ != nullptr ||
-          Check(hipMalloc(&batch_logits_,
-                          static_cast<std::size_t>(kBatchSessions) *
-                              std::min(kDecodeRows, options_.max_logit_rows) *
-                              config().vocab_size * sizeof(float)),
-                error)) &&
-         (batch_q8_ != nullptr ||
-          Check(hipMalloc(&batch_q8_,
-                          qfn_mmq_q8_1_bytes(
-                              32, std::max(2560U, config().hidden_size))),
-                error));
+  return batch_logits_ != nullptr ||
+         Check(hipMalloc(&batch_logits_,
+                         static_cast<std::size_t>(kBatchSessions) *
+                             std::min(kDecodeRows, options_.max_logit_rows) *
+                             config().vocab_size * sizeof(float)),
+               error);
 }
 
 bool Executor::HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
@@ -338,13 +333,8 @@ bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
       return false;
     if (!AnyActive(items))
       return true;
-    for (std::uint32_t row = 0; row < rows; row += kDecodeRows) {
-      UseScratch(RowScratch(base, row));
-      if (!Moe(l, s_.mixed, s_.block_out, std::min(kDecodeRows, rows - row),
-               error))
-        return false;
-    }
-    UseScratch(base);
+    if (!MoeBatch(l, base.mixed, base.block_out, rows, error))
+      return false;
     CombineBatch(base.mtp_res, nullptr, rows);
     for (std::size_t i = 0; i < items.size(); ++i) {
       const auto n = static_cast<std::uint32_t>(items[i].tokens.size());
@@ -503,42 +493,117 @@ bool Executor::MtpHeads(std::span<const MtpHeadItem> items,
   return true;
 }
 
+bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
+                             std::uint32_t cols, std::string* error) const {
+  // Quantize once for all independent rows. The prefill staging allocation
+  // is idle during batch decoding; borrow it without adding another buffer.
+  const auto padded = (rows + kDecodeRows - 1) / kDecodeRows * kDecodeRows;
+  const auto bytes = qfn_mmq_q8_1_bytes(padded, cols);
+  if (bytes > Q8TiledBytes(options_.max_batch, model_->max_q8_cols()))
+    return Fail(error, "batched projection exceeds activation scratch");
+  void* quantized = s_.x_q8t;
+  q8t_src_ = nullptr;
+  if (padded != rows &&
+      !Check(hipMemsetAsync(static_cast<std::uint8_t*>(quantized) +
+                               qfn_mmq_q8_1_bytes(rows, cols),
+                           0, qfn_mmq_q8_1_bytes(padded - rows, cols),
+                           stream_),
+             error))
+    return false;
+  return qfn_mmq_quantize_q8_1(x, quantized, rows, cols, stream_) == 0 ||
+         Fail(error, "batched activation quantization failed");
+}
+
 bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
                           std::uint32_t rows, std::string* error) const {
-  // Wide output matrices benefit from sharing weight rows across waves.
-  // The smaller output projection with its long K sweep stays at eight.
-  if (rows > kDecodeRows && w.type == core::GgmlType::kQ8_0 && w.cols == 2560 &&
-      w.rows >= 8192) {
-    constexpr std::uint32_t chunk = 32;
-    for (std::uint32_t r = 0; r < rows;) {
-      const auto n = std::min(chunk, rows - r);
-      const auto padded = (n + kDecodeRows - 1) / kDecodeRows * kDecodeRows;
-      if (n > kDecodeRows && padded != n &&
-          !Check(hipMemsetAsync(static_cast<std::uint8_t*>(batch_q8_) +
-                                    qfn_mmq_q8_1_bytes(n, w.cols),
-                                0, qfn_mmq_q8_1_bytes(padded - n, w.cols),
-                                stream_),
-                 error)) {
-        return false;
-      }
-      if (qfn_mmq_quantize_q8_1(x + static_cast<std::size_t>(r) * w.cols,
-                                batch_q8_, n, w.cols, stream_) != 0 ||
-          qfn_mmq_q8_0_dense_vec_preq(
-              w.data, nullptr, batch_q8_,
-              out + static_cast<std::size_t>(r) * w.rows, w.rows, n, w.cols,
-              stream_) != 0) {
-        return Fail(error, "batched Q8 projection failed");
-      }
-      r += n;
-    }
+  if (rows <= kDecodeRows)
+    return Dense(w, x, out, rows, error);
+  if (w.type != core::GgmlType::kQ8_0) {
+    SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
+               stream_);
     return true;
   }
-  for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
-    if (!Dense(w, x + static_cast<std::size_t>(r) * w.cols,
-               out + static_cast<std::size_t>(r) * w.rows,
-               std::min(kDecodeRows, rows - r), error)) {
+  if (!QuantizeBatch(x, rows, w.cols, error))
+    return false;
+  const auto project = [&](std::uint32_t first, std::uint32_t count) {
+    const auto* input = static_cast<const std::uint8_t*>(s_.x_q8t) +
+                         qfn_mmq_q8_1_bytes(first, w.cols);
+    return qfn_mmq_q8_0_dense_vec_preq(
+               w.data, nullptr, input,
+               out + static_cast<std::size_t>(first) * w.rows, w.rows, count,
+               w.cols, stream_) == 0 ||
+           Fail(error, "batched Q8 projection failed");
+  };
+  if (w.rows == 320 && w.cols == 10240) {
+    const auto full = rows / kDecodeRows * kDecodeRows;
+    return project(0, full) && (full == rows || project(full, rows - full));
+  }
+  // Wide output matrices benefit from sharing weight rows across waves.
+  // The smaller output projection with its long K sweep stays at eight.
+  const auto chunk =
+      w.cols == 2560 && w.rows >= 8192 ? 32U : kDecodeRows;
+  for (std::uint32_t r = 0; r < rows; r += chunk) {
+    if (!project(r, std::min(chunk, rows - r)))
       return false;
+  }
+  return true;
+}
+
+bool Executor::GatedDenseBatch(const DeviceTensor& up,
+                               const DeviceTensor& gate, const float* x,
+                               float* out, std::uint32_t rows,
+                               std::string* error) const {
+  const Scratch base = s_;
+  const bool q8 = up.type == core::GgmlType::kQ8_0 &&
+                  gate.type == core::GgmlType::kQ8_0 &&
+                  up.rows == gate.rows && up.cols == gate.cols;
+  if (q8 && !QuantizeBatch(x, rows, up.cols, error))
+    return false;
+  for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
+    const auto n = std::min(kDecodeRows, rows - r);
+    if (q8) {
+      const auto* input = static_cast<const std::uint8_t*>(base.x_q8t) +
+                           qfn_mmq_q8_1_bytes(r, up.cols);
+      if (qfn_mmq_q8_0_dense_vec_preq(
+              up.data, gate.data, input,
+              out + std::size_t{r} * up.rows, up.rows, n, up.cols,
+              stream_) != 0)
+        return Fail(error, "batched gated Q8 projection failed");
+    } else {
+      UseScratch(RowScratch(base, r));
+      const bool ok = GatedDense(up, gate, x + std::size_t{r} * up.cols,
+                                 out + std::size_t{r} * up.rows, n, nullptr,
+                                 error);
+      UseScratch(base);
+      if (!ok)
+        return false;
     }
+  }
+  return true;
+}
+
+bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
+                        std::uint32_t rows, std::string* error) const {
+  if (rows <= kDecodeRows)
+    return Moe(l, x, out, rows, error);
+  const auto& c = config();
+  const Scratch base = s_;
+  if (!DenseBatch(l.router, x, base.router, rows, error))
+    return false;
+  RouterTopK(base.router, c.num_experts + 1, base.ids, base.weights, rows,
+             c.num_experts, c.num_experts_used, stream_);
+  if (!GatedDenseBatch(l.shexp_up, l.shexp_gate, x, base.shexp_up, rows,
+                       error) ||
+      !DenseBatch(l.shexp_down, base.shexp_up, base.shexp_out, rows, error))
+    return false;
+  for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
+    UseScratch(RowScratch(base, r));
+    const bool ok = MoeExperts(l, x + std::size_t{r} * c.hidden_size,
+                               out + std::size_t{r} * c.hidden_size,
+                               std::min(kDecodeRows, rows - r), error);
+    UseScratch(base);
+    if (!ok)
+      return false;
   }
   return true;
 }
@@ -808,13 +873,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
       if (!HcMixBatch(l.hc_ffn, base.res, true, base.mixed, base.inject, rows,
                       error))
         return false;
-      for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
-        UseScratch(RowScratch(base, r));
-        if (!Moe(l, s_.mixed, s_.block_out, std::min(kDecodeRows, rows - r),
-                 error)) {
-          return false;
-        }
-      }
+      if (!MoeBatch(l, base.mixed, base.block_out, rows, error))
+        return false;
       const float* next_norm =
           il + 1 < c.num_layers
               ? (c.IsPleLayer(il + 1) ? nullptr

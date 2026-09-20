@@ -543,12 +543,16 @@ extern "C" int qfn_mmq_quantize_q8_1(
 
 // The 320-row HC down projection has too few waves to hide its long K
 // loads. Fetch two iterations together, retaining the MMVQ sum order.
-template<int tokens>
+template<int tokens, bool grouped = false>
 __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
         const block_q8_0* __restrict__ weights,
         const block_q8_1* __restrict__ input, float* __restrict__ output) {
     constexpr int blocks = 10240 / QK8_0;
     constexpr int prefetch = 2;
+    if constexpr (grouped) {
+        input += size_t(blockIdx.y) * tokens * blocks;
+        output += size_t(blockIdx.y) * tokens * 320;
+    }
     const int lane = threadIdx.x;
     const int part = (lane & 3) * 2;
     float sum[tokens] = {};
@@ -618,7 +622,8 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
                                            int M, int N, int K,
                                            hipStream_t stream) {
   if (!W || !X_q8 || !out_f32 || M <= 0 || N <= 0 || K <= 0 || K % 32 != 0 ||
-      N > 32 || (N > MMVQ_MAX_BATCH_SIZE && W_gate)) {
+      (N > 32 && (M != 320 || K != 10240 || N % 8 != 0)) ||
+      (N > MMVQ_MAX_BATCH_SIZE && W_gate)) {
     fprintf(stderr,
             "qfn_mmq_q8_0_dense_vec_preq: bad arguments M=%d N=%d K=%d\n", M, N,
             K);
@@ -626,6 +631,12 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
   }
   if (N <= MMVQ_MAX_BATCH_SIZE && M == 320 && K == 10240 && W_gate == nullptr) {
     launch_q8_hc_down(W, X_q8, out_f32, N, stream);
+    return hipGetLastError() == hipSuccess ? 0 : -3;
+  }
+  if (N > MMVQ_MAX_BATCH_SIZE && N % 8 == 0 && M == 320 && K == 10240) {
+    qfn_q8_hc_down_kernel<8, true><<<dim3(320, N / 8), 32, 0, stream>>>(
+        static_cast<const block_q8_0*>(W),
+        static_cast<const block_q8_1*>(X_q8), out_f32);
     return hipGetLastError() == hipSuccess ? 0 : -3;
   }
   const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;

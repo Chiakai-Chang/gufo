@@ -89,6 +89,11 @@ GDN batching retains these results byte for byte, including ragged row counts
 and cancelled descriptors with null pointers. The full session check also
 passes with mapped descriptors: independent state, image restoration, sampled
 acceptance/residual correction and RNG replay at C2/C4/C6/C8.
+Batched small projections, HC down projection and MoE preparation also pass
+that session check. Projection coverage includes up to 64 independent rows,
+ragged tails and exact scalar/batch FP32 output; activation staging reuses
+existing scratch. All ten fresh C1/C2/C4/C6/C8 repetitive/mixed cohorts match
+AR completion hashes with zero cache hits.
 The 4096-patch vision attention specialization matches every QK/PV FP32
 GEMM result for two independent inputs and complete Flash-Next/Qwen27B
 1024×1024 embeddings byte for byte. A 736×736 ragged control also matches;

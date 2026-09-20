@@ -260,7 +260,6 @@ Executor::~Executor() {
     (void)ngram_->WaitRead();
   }
   (void)hipFree(batch_logits_);
-  (void)hipFree(batch_q8_);
   (void)hipHostFree(batch_gdn_host_);
   (void)hipHostFree(batch_controls_);
   (void)hipHostFree(batch_candidates_host_);
@@ -660,8 +659,6 @@ std::size_t Executor::DeferredScratchBytes() const {
                                 std::min(8U, options_.max_logit_rows) *
                                 c.vocab_size * sizeof(float)
                           : 0;
-  if (batch_q8_ == nullptr)
-    bytes += qfn_mmq_q8_1_bytes(32, std::max(2560U, c.hidden_size));
   return bytes;
 }
 
@@ -1501,7 +1498,6 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
                    std::uint32_t n_tokens, std::string* error_msg) const {
   const Config& c = config();
   const std::uint32_t used = c.num_experts_used;
-  const std::uint32_t slots = n_tokens * used;
   // Router logits and the shared-expert gate come out of one GEMM.
   if (!Dense(l.router, x, s_.router, n_tokens, error_msg)) {
     return false;
@@ -1528,6 +1524,15 @@ bool Executor::Moe(const DeviceLayer& l, const float* x, float* out,
       !Dense(l.shexp_down, s_.shexp_up, s_.shexp_out, n_tokens, error_msg)) {
     return false;
   }
+  return MoeExperts(l, x, out, n_tokens, error_msg);
+}
+
+bool Executor::MoeExperts(const DeviceLayer& l, const float* x, float* out,
+                          std::uint32_t n_tokens,
+                          std::string* error_msg) const {
+  const Config& c = config();
+  const std::uint32_t used = c.num_experts_used;
+  const std::uint32_t slots = n_tokens * used;
   if (!RouteHints(n_tokens, error_msg)) {
     return false;
   }

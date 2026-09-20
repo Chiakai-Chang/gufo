@@ -867,9 +867,13 @@ __global__ void NarrowKernel(const float* x, T* out, std::size_t count) {
 /// once (four consecutive elements per lane per step) while up to eight
 /// tokens accumulate in registers, then a wave reduction per token.
 constexpr unsigned kSmallGemmRows = 4;
-template<WeightType type, unsigned tokens>
+template<WeightType type, unsigned tokens, bool grouped = false>
 __global__ void SmallGemmKernel(const void* w, const float* x, float* out,
                                 std::uint32_t m, std::uint32_t k) {
+  if constexpr (grouped) {
+    x += std::size_t{blockIdx.y} * tokens * k;
+    out += std::size_t{blockIdx.y} * tokens * m;
+  }
   const std::uint32_t lane = threadIdx.x % warpSize;
   const std::uint32_t row =
       blockIdx.x * (blockDim.x / warpSize) + threadIdx.x / warpSize;
@@ -5333,6 +5337,18 @@ template<WeightType type>
 void SmallGemmForType(const void* w, const float* x, float* out,
                       std::uint32_t tokens, std::uint32_t m, std::uint32_t k,
                       hipStream_t stream) {
+  if (tokens > 8) {
+    const auto groups = tokens / 8;
+    hipLaunchKernelGGL((SmallGemmKernel<type, 8, true>),
+                       dim3((m + kSmallGemmRows - 1) / kSmallGemmRows, groups),
+                       dim3(kSmallGemmRows * 32), 0, stream, w, x, out, m, k);
+    const auto consumed = groups * 8;
+    x += std::size_t{consumed} * k;
+    out += std::size_t{consumed} * m;
+    tokens -= consumed;
+    if (tokens == 0)
+      return;
+  }
   switch (tokens) {
     case 1:
       return LaunchSmallGemm<type, 1>(w, x, out, m, k, stream);

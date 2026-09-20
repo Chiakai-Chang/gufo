@@ -49,6 +49,7 @@ int qfn_mmq_quantize_q8_1(const float* X_f32, void* X_q8, int N, int K,
 
 // Exact vector arithmetic for 1–8 rows, or up to 32 ungated rows. Above eight,
 // input storage must include initialized padding to a multiple of eight.
+// The 320×10240 HC projection also accepts larger multiples of eight.
 // Only N output rows are written.
 int qfn_mmq_q8_0_dense_vec_preq(const void* W_q8_0, const void* W_gate,
                                 const void* X_q8, float* out_f32, int M, int N,
