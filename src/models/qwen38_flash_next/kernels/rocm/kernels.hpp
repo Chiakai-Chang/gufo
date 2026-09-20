@@ -74,10 +74,12 @@ void HcMixEpilogueVec4F16(const __half* xn, const float* gate,
 /// when `gamma` is non-null also the next mixer's grouped RMSNorm of the
 /// updated residual into `xn`.
 /// `inject` is [t][s][inject_parts] partial sums (1 part for a plain GEMM).
+/// Concatenated decode requests retain scalar reduction with `decode=true`.
 void HcCombine(float* res, const float* block_out, const float* inject,
                std::uint32_t inject_parts, const float* gamma, float* xn,
                std::uint32_t n_tokens, std::uint32_t hidden,
-               std::uint32_t streams, float eps, hipStream_t stream);
+               std::uint32_t streams, float eps, hipStream_t stream,
+               bool decode = false);
 /// HcCombine writing the normalized output as F16, the width the next
 /// mixer's projection and epilogue consume on the F16 mixer input route.
 /// A non-null `xn_q8` also receives the norm quantized into the tiled Q8

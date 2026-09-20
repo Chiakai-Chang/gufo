@@ -543,6 +543,7 @@ extern "C" int qfn_mmq_quantize_q8_1(
 
 // The 320-row HC down projection has too few waves to hide its long K
 // loads. Fetch two iterations together, retaining the MMVQ sum order.
+template<int tokens>
 __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
         const block_q8_0* __restrict__ weights,
         const block_q8_1* __restrict__ input, float* __restrict__ output) {
@@ -550,36 +551,66 @@ __launch_bounds__(32) __global__ static void qfn_q8_hc_down_kernel(
     constexpr int prefetch = 2;
     const int lane = threadIdx.x;
     const int part = (lane & 3) * 2;
-    float sum = 0.0f;
+    float sum[tokens] = {};
     for (int first = lane / 4; first < blocks; first += 8 * prefetch) {
-        int v[prefetch][2], u[prefetch][2];
-        half dw[prefetch], dx[prefetch];
+        int v[prefetch][2], u[prefetch][tokens][2];
+        half dw[prefetch], dx[prefetch][tokens];
 #pragma unroll
         for (int j = 0; j < prefetch; ++j) {
             const int kb = first + 8 * j;
             const auto& w = weights[blockIdx.x * blocks + kb];
-            const auto& x = input[kb];
             dw[j] = w.d;
-            dx[j] = __low2half(x.ds);
 #pragma unroll
-            for (int i = 0; i < 2; ++i) {
+            for (int i = 0; i < 2; ++i)
                 v[j][i] = get_int_b2(w.qs, part + i);
-                u[j][i] = get_int_b4(x.qs, part + i);
+#pragma unroll
+            for (int t = 0; t < tokens; ++t) {
+                const auto& x = input[t * blocks + kb];
+                dx[j][t] = __low2half(x.ds);
+#pragma unroll
+                for (int i = 0; i < 2; ++i)
+                    u[j][t][i] = get_int_b4(x.qs, part + i);
             }
         }
         __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
         for (int j = 0; j < prefetch; ++j) {
-            int dot = ggml_hip_dp4a(v[j][0], u[j][0], 0);
-            dot = ggml_hip_dp4a(v[j][1], u[j][1], dot);
-            const float scale = __fmul_rn(__half2float(dw[j]), __half2float(dx[j]));
-            const float product = __fmul_rn(scale, static_cast<float>(dot));
-            // Match MMVQ's rounded dot product before its accumulator update.
-            sum = __fadd_rn(sum, product);
+#pragma unroll
+            for (int t = 0; t < tokens; ++t) {
+                int dot = ggml_hip_dp4a(v[j][0], u[j][t][0], 0);
+                dot = ggml_hip_dp4a(v[j][1], u[j][t][1], dot);
+                if constexpr (tokens == 1) {
+                    const float scale =
+                        __fmul_rn(__half2float(dw[j]), __half2float(dx[j][t]));
+                    const float product = __fmul_rn(scale, static_cast<float>(dot));
+                    sum[t] = __fadd_rn(sum[t], product);
+                } else {
+                    // Preserve the batched MMVQ weight-dot rounding and
+                    // input-scale FMA; reassociating the scales changes logits.
+                    const float product =
+                        __fmul_rn(__half2float(dw[j]), static_cast<float>(dot));
+                    sum[t] = __fmaf_rn(__half2float(dx[j][t]), product, sum[t]);
+                }
+            }
         }
     }
-    sum = warp_reduce_sum<32>(sum);
-    if (lane == 0) output[blockIdx.x] = sum;
+#pragma unroll
+    for (int t = 0; t < tokens; ++t) {
+        sum[t] = warp_reduce_sum<32>(sum[t]);
+        if (lane == 0) output[t * 320 + blockIdx.x] = sum[t];
+    }
+}
+
+template<int tokens = 1>
+static void launch_q8_hc_down(const void* weights, const void* input,
+                              float* output, int rows, hipStream_t stream) {
+    if (rows == tokens) {
+        qfn_q8_hc_down_kernel<tokens><<<320, 32, 0, stream>>>(
+            static_cast<const block_q8_0*>(weights),
+            static_cast<const block_q8_1*>(input), output);
+    } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
+        launch_q8_hc_down<tokens + 1>(weights, input, output, rows, stream);
+    }
 }
 
 extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
@@ -593,10 +624,8 @@ extern "C" int qfn_mmq_q8_0_dense_vec_preq(const void* W, const void* W_gate,
             K);
     return -1;
   }
-  if (N == 1 && M == 320 && K == 10240 && W_gate == nullptr) {
-    qfn_q8_hc_down_kernel<<<320, 32, 0, stream>>>(
-        static_cast<const block_q8_0*>(W), static_cast<const block_q8_1*>(X_q8),
-        out_f32);
+  if (N <= MMVQ_MAX_BATCH_SIZE && M == 320 && K == 10240 && W_gate == nullptr) {
+    launch_q8_hc_down(W, X_q8, out_f32, N, stream);
     return hipGetLastError() == hipSuccess ? 0 : -3;
   }
   const int input_stride = GGML_PAD(K, MATRIX_ROW_PADDING) / QK8_1;

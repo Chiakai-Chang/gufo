@@ -76,9 +76,22 @@ byte. The Qwen27B Q4/Q8 projector passed the 1024×1024 embedding comparison.
 
 Q4 shared-expert weight reuse passed the maintained routed-projection checks:
 exact outputs for widths 1–8, duplicate/inactive experts, nonfinite scales and
-ragged rows. The full batch session check retained exact logits, tokens, RNG,
-acceptance and residual replay at C2/C4/C6/C8. Fresh repetitive and mixed
-serving cohorts at C1/C2/C4/C6/C8 match AR completion hashes without cache hits.
+ragged rows. HC Q8 prefetch retains the scalar/batched rounded products and
+FMA sequence; Q5 high-bit expansion changes integer decoding only.
+Batched residual epilogues and MTP norms retain each request's reduction.
+The affected projection checks and full batch session check pass, with exact
+logits, tokens, RNG, acceptance and residual replay at C2/C4/C6/C8.
+Fresh repetitive and mixed serving cohorts match AR completion hashes without
+cache hits.
+
+**Open vision parity gap:** a 1024×1024 synthetic texture produces 6.47%
+embedding relative L2 error against the pinned BF16 reference, above the 5%
+gate. This also occurs before the retained byte-exact optimizations. Against
+the FP32 control, native and upstream BF16 errors are 7.83% and 8.10%; the
+discrepancy alone does not establish worse model quality. Cumulative rounding
+needs investigation; keep the existing gate. Reproduce with RGB byte
+`pixels[i] = (137*i + 53*(i//3072)) % 256` and the vision reference commands in
+[Qwen27B evaluation](../qwen3.8-27b/EVALUATION.md#vision).
 
 **Remaining limit:** these checks use converted GGUF weights. They do not
 establish unquantized-checkpoint equivalence or detect every conversion error.

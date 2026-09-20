@@ -2,7 +2,7 @@
 
 Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Production builds with the
 pinned Nix toolchain. CLI/AR measurements: 2026-09-19; MTP serving and vision:
-2026-09-20. One repetition per point; mixed C4 shows the range of two controls.
+2026-09-20. One repetition per point.
 Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
 revision `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
@@ -58,17 +58,18 @@ uses `repetition_word` for repetition and distinct requests cycling through
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 25.24 | 64.11 | 25.12 | 42.01 |
-| 2 | 38.60 | 78.93 | 36.25 | 55.31 |
-| 4 | 53.09 | 92.18 | 48.41 | 63.38–67.75 |
-| 6 | 60.68 | 95.32 | 54.51 | 67.73 |
-| 8 | 65.17 | 98.11 | 58.45 | 72.09 |
+| 1 | 25.24 | 64.72 | 25.12 | 42.42 |
+| 2 | 38.60 | 80.88 | 36.25 | 56.35 |
+| 4 | 53.09 | 94.33 | 48.41 | 68.48 |
+| 6 | 60.68 | 98.06 | 54.51 | 74.23 |
+| 8 | 65.17 | 101.70 | 58.45 | 79.82 |
 
-MTP acceptance is 100% on repetition and 76.7–85.7% on the mixed cohorts.
+MTP acceptance is 100% on repetition and 76.7–84.9% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
+Greedy timing-based depth choices can vary between runs.
 
 **C1 is a single user.** The HTTP and raw CLI prompts above differ. With the
-repetitive chat prompt, HTTP C1 decode alone is 78.95 tok/s; the table includes
+repetitive chat prompt, HTTP C1 decode alone is 80.27 tok/s; the table includes
 prefill and scheduling. Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
 

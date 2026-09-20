@@ -163,18 +163,17 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q5_1_q8_1_imp
 
 #pragma unroll
     for (int i = 0; i < vdr; ++i) {
-        int vi0 = (vl[i] >>  0) & 0x0F0F0F0F; // lower 4 qs bits, still need qh as 5th bits
-        vi0    |= (vh[i] <<  4) & 0x00000010; // 0 ->  4
-        vi0    |= (vh[i] << 11) & 0x00001000; // 1 -> 12
-        vi0    |= (vh[i] << 18) & 0x00100000; // 2 -> 20
-        vi0    |= (vh[i] << 25) & 0x10000000; // 3 -> 28
+        // Spread four high bits into separate bytes. Each nibble is at most
+        // 15, so multiplication cannot carry into another selected bit.
+        const unsigned lo =
+            ((static_cast<unsigned>(vh[i]) & 15u) * 0x00204081u) & 0x01010101u;
+        const unsigned hi =
+            (((static_cast<unsigned>(vh[i]) >> 16) & 15u) * 0x00204081u) &
+            0x01010101u;
+        const int vi0 = (vl[i] & 0x0F0F0F0F) | (lo << 4);
         sumi = ggml_hip_dp4a(vi0, u[2*i+0], sumi); // SIMD dot product of quantized values
 
-        int vi1 = (vl[i] >>  4) & 0x0F0F0F0F; // upper 4 qs bits, still need qh as 5th bits
-        vi1    |= (vh[i] >> 12) & 0x00000010; // 16 ->  4
-        vi1    |= (vh[i] >>  5) & 0x00001000; // 17 -> 12
-        vi1    |= (vh[i] <<  2) & 0x00100000; // 18 -> 20
-        vi1    |= (vh[i] <<  9) & 0x10000000; // 19 -> 28
+        const int vi1 = ((vl[i] >> 4) & 0x0F0F0F0F) | (hi << 4);
         sumi = ggml_hip_dp4a(vi1, u[2*i+1], sumi); // SIMD dot product of quantized values
     }
 

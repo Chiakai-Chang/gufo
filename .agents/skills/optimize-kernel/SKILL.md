@@ -42,12 +42,17 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
 - **GEMV:** coalesce packed weight loads, stage shared activations in LDS,
   fuse QKV or gate/up reads where useful, and preserve each dot product's
   accumulation order. More fusion can increase VGPR pressure and spills.
+  Two-iteration prefetch helped the small 320×10240 HC projection; wider
+  prefetch and applying it to larger matrices did not. Preserve the actual
+  rounded products/FMA sequence, not just the algebraic formula.
 - **Verification and concurrency:** reuse quantized weights across token and
   request rows. Tune real ragged shapes, including 3–8 rows and partial tiles.
   Batch the complete draft transformer body, not only the vocabulary head;
   keep each request's KV, recurrence, acceptance and RNG state independent.
   Test both shared and disjoint expert routing: weight reuse benefits shared
   experts, but single-request experts need a compact path.
+  Exact packed-integer transforms can help both: spreading Q5 high-bit
+  nibbles with multiply/mask removed shifts without changing dequantization.
 - **Wave mode and compiler:** selected quantized kernels need wave64 while
   other paths use wave32. Match helper/caller wave modes per translation unit.
   Iterative ILP scheduling helped selected 16-row Q4/Q5 kernels; applying it

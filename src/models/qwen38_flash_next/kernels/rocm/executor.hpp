@@ -341,11 +341,11 @@ private:
              float* inject, std::uint32_t n_tokens,
              std::string* error_msg) const;
   /// Share mixer projections across decode requests without selecting the
-  /// prefill arithmetic. Offsets preserve each request's compact inject rows.
+  /// prefill arithmetic. Injection rows are compact across the whole batch.
   bool HcMixBatch(const DeviceMixer& m, const float* res, bool normed,
                   float* mixed, float* inject, std::uint32_t rows,
-                  std::span<const std::uint32_t> offsets,
                   std::string* error) const;
+  void CombineBatch(float* res, const float* gamma, std::uint32_t rows) const;
   /// Residual update by the block output plus the grouped norm for the next
   /// mixer (`gamma`); wide batches write it as F16 and tiled Q8.
   void Combine(float* res, const float* gamma, std::uint32_t n_tokens) const;
