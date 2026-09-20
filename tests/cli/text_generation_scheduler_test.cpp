@@ -146,6 +146,7 @@ struct FakeControl {
   std::atomic<std::size_t> states_created{0};
   std::atomic<std::size_t> decode_calls{0};
   std::atomic<std::size_t> batch_preparations{0};
+  std::atomic<std::int64_t> first_request_advance_ns{0};
   bool incremental_prefill{true};
   std::size_t prefill_capacity{std::numeric_limits<std::size_t>::max()};
   bool supports_batched_advance{false};
@@ -385,6 +386,7 @@ public:
   }
 
   void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    const auto started = std::chrono::steady_clock::now();
     auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value() || token != *fake.frontier) {
       throw std::logic_error("scheduler fake frontier mismatch");
@@ -417,6 +419,12 @@ public:
     ++fake.position;
     ++fake.decode_count;
     fake.frontier = token + 1;
+    if (fake.label == 1)
+      control_->first_request_advance_ns.fetch_add(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - started)
+              .count(),
+          std::memory_order_relaxed);
   }
 
   [[nodiscard]] TextDecodeStep DecodeStep(
@@ -1269,8 +1277,13 @@ void TestSnapshotDoesNotBlockOtherRequests() {
     Expect(started && independent, "one capture must not block other requests");
     Expect(result.get().tokens == ExpectedTokens(2, 7),
            "other request stays independent");
-    Expect(first.Wait().tokens == ExpectedTokens(1, 7),
+    const auto first_result = first.Wait();
+    Expect(first_result.tokens == ExpectedTokens(1, 7),
            "captured request resumes exactly");
+    const double advance_ms =
+        control->first_request_advance_ns.load(std::memory_order_relaxed) / 1e6;
+    Expect(advance_ms > 0 && first_result.decode_ms >= advance_ms,
+           "async snapshot time must not be subtracted from timed model work");
     auto cached = scheduler->Submit({1, 10}, 7, 0.0F).Wait();
     Expect(cached.cache_hit && cached.tokens == ExpectedTokens(1, 7),
            "asynchronous capture retains the immutable prompt frontier");

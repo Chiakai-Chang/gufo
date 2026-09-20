@@ -45,7 +45,8 @@ struct Arena {
   }
 };
 struct Trace {
-  std::vector<float> norm, fused, attention, hidden, head, ffn_input, ffn_output;
+  std::vector<float> norm, fused, attention, hidden, head, ffn_input,
+      ffn_output;
   q::MtpTrace spans;
   explicit Trace(const q::Config& c)
       : norm(c.HcDim()),
@@ -283,7 +284,7 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
                   (0.8F + float((i / initial.size()) % 11) * 0.04F);
     auto* source = arena.Make<float>(hidden.size());
     Hip(hipMemcpy(source, hidden.data(), hidden.size() * sizeof(float),
-                   hipMemcpyHostToDevice));
+                  hipMemcpyHostToDevice));
     const auto pattern = tokenizer.Encode("Red, blue. Explain virtual memory.");
     Require(!pattern.empty(), "empty catch-up audit prompt");
     std::vector<std::int32_t> tokens(count);
@@ -291,21 +292,22 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
       for (unsigned i = 0; i < count; ++i)
         tokens[i] = pattern[(round * count + i) % pattern.size()];
       const auto exact = [&](const auto& expected, const auto& actual,
-                              const char* stage) {
+                             const char* stage) {
         if (expected != actual) {
-          std::fprintf(stderr, "catch-up round=%u rows=%u stage=%s\n",
-                       round, count, stage);
+          std::fprintf(stderr, "catch-up round=%u rows=%u stage=%s\n", round,
+                       count, stage);
           Compare(actual, expected, stage, 0.0);
         }
       };
       Trace full_row(c), tail_row(c);
       q::MtpCandidateLogits expected, actual;
-      Require(exec.MtpForward(*full, tokens, 0,
-                               {.candidates = &expected, .trace = &full_row.spans},
-                               &error, source) &&
-                  exec.MtpForward(*tail, tokens, 0, {.trace = &tail_row.spans},
-                                   &error, source),
-              error);
+      Require(
+          exec.MtpForward(*full, tokens, 0,
+                          {.candidates = &expected, .trace = &full_row.spans},
+                          &error, source) &&
+              exec.MtpForward(*tail, tokens, 0, {.trace = &tail_row.spans},
+                              &error, source),
+          error);
       exact(full_row.norm, tail_row.norm, "wide hidden norm");
       exact(full_row.fused, tail_row.fused, "wide fusion");
       exact(full_row.attention, tail_row.attention, "wide attention");
@@ -321,11 +323,11 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
               "headless catch-up changed full-head candidates");
       const auto next = static_cast<std::int32_t>(expected.ids[0]);
       Trace a(c), b(c);
-      Require(exec.MtpForward(*full, {&next, 1}, -1, {.trace = &a.spans},
-                               &error) &&
-                  exec.MtpForward(*tail, {&next, 1}, -1, {.trace = &b.spans},
-                                  &error),
-              error);
+      Require(
+          exec.MtpForward(*full, {&next, 1}, -1, {.trace = &a.spans}, &error) &&
+              exec.MtpForward(*tail, {&next, 1}, -1, {.trace = &b.spans},
+                              &error),
+          error);
       exact(a.norm, b.norm, "catch-up hidden norm");
       exact(a.fused, b.fused, "catch-up fusion");
       exact(a.attention, b.attention, "catch-up attention");
@@ -490,10 +492,9 @@ void AuditMtpCosts(q::rocm::Executor& exec,
         const auto total = [](const auto& sample) {
           return sample[0] + sample[1] + sample[2];
         };
-        std::sort(samples.begin(), samples.end(), [&](const auto& a,
-                                                       const auto& b) {
-          return total(a) < total(b);
-        });
+        std::sort(
+            samples.begin(), samples.end(),
+            [&](const auto& a, const auto& b) { return total(a) < total(b); });
         const auto& sample = samples[1];
         std::printf(
             "MTP_COST depth=%u C=%u width=%u catchup_ms=%.4f "

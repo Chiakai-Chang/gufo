@@ -23,6 +23,14 @@ compiler/dependency versions when comparing results.
 
 ## Focused tests
 
+Formatting and Python repository checks may run on the editing host; they do
+not need the remote GPU. Before committing C++ changes, run the shared CI check:
+
+```sh
+nix shell --inputs-from . nixpkgs#clang-tools -c python3 tools/ci/check-format.py
+# Add --fix to apply formatting, then rerun the check.
+```
+
 Run the smallest check covering the change. `gpu-test` is RelWithDebInfo with
 assertions enabled. Build only the affected target during iteration:
 

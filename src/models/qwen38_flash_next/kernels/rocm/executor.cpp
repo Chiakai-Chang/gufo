@@ -1728,8 +1728,11 @@ bool Executor::Run(Session& session, std::uint64_t key, bool graph,
       exec = it->second;
     } else {
       hipGraph_t captured = nullptr;
-      if (!Check(hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal),
-                 "graph capture", error_msg)) {
+      // Frozen peer sessions can copy snapshots on independent nonblocking
+      // streams while the scheduler records this session's decode graph.
+      if (!Check(
+              hipStreamBeginCapture(stream_, hipStreamCaptureModeThreadLocal),
+              "graph capture", error_msg)) {
         return false;
       }
       const bool ok = body();
@@ -2588,8 +2591,8 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
     auto tail = RowScratch(s_, skipped);
     // Keep the producer's inject stride: it may use vectorized partials or
     // a single quantized projection rather than RowScratch's scalar layout.
-    tail.inject = s_.inject +
-                  static_cast<std::size_t>(skipped) * c.hc_count * inject_parts_;
+    tail.inject = s_.inject + static_cast<std::size_t>(skipped) * c.hc_count *
+                                  inject_parts_;
     UseScratch(tail);
     if (!Dense(l.attn_out, s_.ctx, s_.block_out, tail_rows, error_msg))
       return false;
@@ -2600,11 +2603,10 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   if (!session.CheckCancellation(error_msg))
     return false;
   if (!HcMix(l.hc_ffn, s_.mtp_res, true, s_.mixed, s_.inject, tail_rows,
-              error_msg) ||
-      (trace &&
-       !copy_trace(s_.mixed +
-                       static_cast<std::size_t>(tail_rows - 1) * c.hidden_size,
-                    trace->ffn_input)) ||
+             error_msg) ||
+      (trace && !copy_trace(s_.mixed + static_cast<std::size_t>(tail_rows - 1) *
+                                           c.hidden_size,
+                            trace->ffn_input)) ||
       !Moe(l, s_.mixed, s_.block_out, tail_rows, error_msg, last_only)) {
     return false;
   }
@@ -2612,13 +2614,13 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   if (trace &&
       !copy_trace(s_.block_out +
                       static_cast<std::size_t>(tail_rows - 1) * c.hidden_size,
-                   trace->ffn_output))
+                  trace->ffn_output))
     return false;
   if (trace && !copy_trace(s_.mtp_res + tail_last, trace->hidden))
     return false;
   if (trace && !trace->head.empty()) {
-    if (!HcMix(l.nextn_head, s_.mtp_res + tail_last, false, s_.mixed, nullptr, 1,
-               error_msg) ||
+    if (!HcMix(l.nextn_head, s_.mtp_res + tail_last, false, s_.mixed, nullptr,
+               1, error_msg) ||
         !copy_trace(s_.mixed, trace->head))
       return false;
   }

@@ -76,8 +76,7 @@ struct ScheduledRequest {
   std::size_t inter_token_samples{0};
   bool decode_due{false};
   std::optional<TextRunnerToken> preview_token;
-  std::optional<TextGenerationScheduler::Clock::time_point>
-      pending_advance_start;
+  bool advance_pending{false};
   bool preview_stops{false};
   std::size_t generated_output_bytes{0};
 
@@ -365,10 +364,6 @@ struct TextGenerationScheduler::Impl {
     request->result.cache_shared_prefix_bytes =
         cache_commit.shared_prefix_bytes;
     request->result.cache_shared_prefix_ms = cache_commit.shared_prefix_ms;
-    // Prompt capture now follows first-token publication, but remains its own
-    // phase rather than inflating the model's decode time.
-    request->result.decode_ms =
-        std::max(0.0, request->result.decode_ms - cache_commit.snapshot_ms);
     FinalizeResult(request, finish_reason);
     PublishTerminal(request);
   }
@@ -523,20 +518,17 @@ struct TextGenerationScheduler::Impl {
       return std::nullopt;
     }
 
-    if (request->pending_advance_start) {
+    if (request->advance_pending) {
       if (!request->runner_request.PreparePromptSnapshot())
         return std::nullopt;
-      const auto start = *request->pending_advance_start;
-      request->pending_advance_start.reset();
+      request->advance_pending = false;
       if (!final_token_advance_required &&
           request->result.tokens.size() >= request->token_limit) {
-        request->result.decode_ms +=
-            std::chrono::duration<double, std::milli>(Clock::now() - start)
-                .count();
         CompleteSuccess(request, TextGenerationBackend::FinishReason::kLength);
         return std::nullopt;
       }
-      return start;
+      // Snapshot capture and work for other requests are outside this step.
+      return Clock::now();
     }
     request->phase.store(TextRequestPhase::kDecoding,
                          std::memory_order_release);
@@ -553,7 +545,10 @@ struct TextGenerationScheduler::Impl {
     if (!PublishSelection(request, selection)) {
       return std::nullopt;
     }
-    request->pending_advance_start = decode_start;
+    request->result.decode_ms +=
+        std::chrono::duration<double, std::milli>(Clock::now() - decode_start)
+            .count();
+    request->advance_pending = true;
     return PrepareDecode(request);
   }
 
@@ -643,9 +638,9 @@ struct TextGenerationScheduler::Impl {
 
       request->phase.store(TextRequestPhase::kDecoding,
                            std::memory_order_release);
-      const auto decode_start = Clock::now();
       if (!PrepareFirstSnapshot(request))
         return;
+      const auto decode_start = Clock::now();
       const std::size_t remaining =
           request->token_limit - request->result.tokens.size() +
           (request->preview_token.has_value() ? 1 : 0);
@@ -680,6 +675,7 @@ struct TextGenerationScheduler::Impl {
 
   bool PrepareFirstSnapshot(const std::shared_ptr<ScheduledRequest>& request) {
     if (request->result.tokens.empty() && !request->preview_stops) {
+      const auto preview_start = Clock::now();
       const auto preview = request->runner_request.PreviewFirstToken();
       if (preview && !preview->stop) {
         if (!PublishSelection(request, *preview))
@@ -687,6 +683,9 @@ struct TextGenerationScheduler::Impl {
         request->preview_token = preview->token;
       }
       request->preview_stops = preview && preview->stop;
+      request->result.decode_ms += std::chrono::duration<double, std::milli>(
+                                       Clock::now() - preview_start)
+                                       .count();
     }
     if (!request->runner_request.PreparePromptSnapshot())
       return false;
@@ -829,7 +828,6 @@ struct TextGenerationScheduler::Impl {
       }
       request->phase.store(TextRequestPhase::kDecoding,
                            std::memory_order_release);
-      const auto decode_start = Clock::now();
       try {
         if (!PrepareFirstSnapshot(request))
           continue;
@@ -839,7 +837,7 @@ struct TextGenerationScheduler::Impl {
       }
       prepared.push_back({
           .request = request,
-          .decode_start = decode_start,
+          .decode_start = Clock::now(),
           .remaining = request->token_limit - request->result.tokens.size() +
                        (request->preview_token.has_value() ? 1 : 0),
       });

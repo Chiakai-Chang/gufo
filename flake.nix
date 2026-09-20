@@ -169,7 +169,10 @@
               "src"
               "tests"
             ];
-            files = [ ".clang-format" ];
+            files = [
+              ".clang-format"
+              "tools/ci/check-format.py"
+            ];
           };
 
           staticAnalysisSource = mkFilteredSource {
@@ -239,18 +242,11 @@
           };
 
           formatCheck = pkgsSys.runCommand "check-format" {
-            nativeBuildInputs = [ pkgsSys.clang-tools pkgsSys.findutils ];
+            nativeBuildInputs = [ pkgsSys.clang-tools pkgsSys.python3 ];
             src = formatSource;
           } ''
             cd "$src"
-            find src tests \
-              -not -path "*/fixtures/*" \
-              -not -path "*/vendor/*" \
-              -not -path "src/models/deepseek_v4_flash/runtime/*" \
-              -not -path "src/models/deepseek_v4_flash/kernels/rocm/*" \
-              -not -path "src/models/qwen38_flash_next/kernels/rocm/mmq/*" \
-              \( -name "*.cpp" -o -name "*.h" -o -name "*.hpp" \) \
-              -exec clang-format --dry-run --Werror {} +
+            python3 tools/ci/check-format.py
             mkdir -p $out
             echo "PASS: Formatting check clean" > $out/result.txt
           '';

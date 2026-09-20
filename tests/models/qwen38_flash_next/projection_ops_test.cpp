@@ -46,7 +46,7 @@ struct Q8Weights {
 };
 
 Q8Weights MakeWeights(std::size_t m, std::size_t k, std::uint32_t seed,
-                       bool reference_values = true) {
+                      bool reference_values = true) {
   Q8Weights w;
   w.blocks.resize(m * (k / 32) * 34);
   if (reference_values)
@@ -382,18 +382,22 @@ void CheckRoutedQ8Placement() {
   CheckHip(hipMalloc(&dy, output.size() * sizeof(float)), "routed Q8 output");
   CheckHip(hipMalloc(&di, ids.size() * sizeof(std::int32_t)), "routed Q8 IDs");
   CheckHip(hipMemcpy(dw, weights.blocks.data(), weights.blocks.size(),
-                     hipMemcpyHostToDevice), "routed Q8 upload");
+                     hipMemcpyHostToDevice),
+           "routed Q8 upload");
   CheckHip(hipMemcpy(dx, input.data(), input.size() * sizeof(float),
-                     hipMemcpyHostToDevice), "routed Q8 upload");
+                     hipMemcpyHostToDevice),
+           "routed Q8 upload");
   CheckHip(hipMemcpy(di, ids.data(), ids.size() * sizeof(std::int32_t),
-                     hipMemcpyHostToDevice), "routed Q8 upload");
+                     hipMemcpyHostToDevice),
+           "routed Q8 upload");
   qfn_mmq_set_routed_max_expert_rows(tokens);
   qfn_mmq_set_routed_tile_cols(32);
-  if (qfn_mmq_q8_0_moe_raw(dw, dx, di, dy, rows, cols, tokens, experts,
-                           experts, nullptr) != 0)
+  if (qfn_mmq_q8_0_moe_raw(dw, dx, di, dy, rows, cols, tokens, experts, experts,
+                           nullptr) != 0)
     throw std::runtime_error("routed Q8 placement projection failed");
   CheckHip(hipMemcpy(output.data(), dy, output.size() * sizeof(float),
-                     hipMemcpyDeviceToHost), "routed Q8 download");
+                     hipMemcpyDeviceToHost),
+           "routed Q8 download");
   for (int row = 0; row < experts * rows; ++row) {
     double expected = 0;
     for (int b = 0; b < cols / 32; ++b) {
@@ -402,8 +406,7 @@ void CheckRoutedQ8Placement() {
         maximum = std::max(maximum, std::abs(input[b * 32 + j]));
       const float inverse = 127.0F / maximum;
       const float scale = 1.0F / inverse;
-      const auto* block =
-          weights.blocks.data() + (row * (cols / 32) + b) * 34;
+      const auto* block = weights.blocks.data() + (row * (cols / 32) + b) * 34;
       __half weight_scale;
       std::memcpy(&weight_scale, block, sizeof(weight_scale));
       int dot = 0;
@@ -635,8 +638,8 @@ void CheckSmallProjection(q::WeightType type, unsigned rows, unsigned cols) {
             "small projection differs from FP64 reference");
     }
   }
-  for (const unsigned n : {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 31U,
-                           32U, 33U, tokens}) {
+  for (const unsigned n :
+       {1U, 2U, 3U, 4U, 5U, 6U, 7U, 8U, 9U, 16U, 31U, 32U, 33U, tokens}) {
     CheckHip(hipMemset(dy, 0xA5, batch.size() * sizeof(float)),
              "small output poison");
     q::SmallGemm(dw, type, dx, dy, n, rows, cols, nullptr);
@@ -721,7 +724,7 @@ void CheckDecodeGrouping(int rows, int cols) {
       // End every shape at the allocation boundary. Using a full shared
       // input buffer can hide overreads by a partially populated final wave.
       const auto* input = static_cast<const std::uint8_t*>(dq) +
-                           qfn_mmq_q8_1_bytes(tokens - n, cols);
+                          qfn_mmq_q8_1_bytes(tokens - n, cols);
       if (qfn_mmq_q8_0_dense_vec_preq(dw, gated ? dg : nullptr, input, out,
                                       rows, n, cols, nullptr))
         throw std::runtime_error("batched dense projection failed");
@@ -729,7 +732,7 @@ void CheckDecodeGrouping(int rows, int cols) {
                          hipMemcpyDeviceToHost),
                "batch output");
       if (std::memcmp(scalar.data() + (tokens - n) * rows, batch.data(),
-                       n * rows * sizeof(float)) != 0)
+                      n * rows * sizeof(float)) != 0)
         throw std::runtime_error(
             "Q8 dense grouping differs: M=" + std::to_string(rows) +
             " K=" + std::to_string(cols) + " N=" + std::to_string(n) +

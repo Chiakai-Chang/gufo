@@ -295,17 +295,26 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           // Cancelled peers have no valid pointers. Every batch stage must
           // skip them before reading or mutating any request-local state.
           std::array<q::GdnBatchItem, 3> items{};
-          items[1] = {d_qkv.get(), d_z.get(), d_alpha_beta.get(),
-                      current_conv.get(), d_scratch.get(), d_qn.get(),
-                      d_kn.get(), d_raw.get(), current_state.get(),
-                      current_out.get(), states, convs, n};
+          items[1] = {d_qkv.get(),
+                      d_z.get(),
+                      d_alpha_beta.get(),
+                      current_conv.get(),
+                      d_scratch.get(),
+                      d_qn.get(),
+                      d_kn.get(),
+                      d_raw.get(),
+                      current_state.get(),
+                      current_out.get(),
+                      states,
+                      convs,
+                      n};
           CheckHip(hipMemcpy(batch_items.get(), items.data(),
                              batch_items.bytes(), hipMemcpyHostToDevice),
                    "batch descriptors");
-          if (!q::GatedDeltaNetBatch(
-                  batch_items.get(), items.size(), kTokens, 2U, kChannels, kZ,
-                  d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
-                  kKHeads, kVHeads, kEps, nullptr))
+          if (!q::GatedDeltaNetBatch(batch_items.get(), items.size(), kTokens,
+                                     2U, kChannels, kZ, d_conv_w.get(),
+                                     d_a.get(), d_dt.get(), d_norm_w.get(),
+                                     kKHeads, kVHeads, kEps, nullptr))
             throw std::runtime_error("GDN batch launch failed");
           return;
         }
@@ -338,7 +347,8 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           !exact(Download(&current_out, kOut), final_out) ||
           !exact(Download(&state_snaps, saved * kStateCount + kGuard),
                  saved_states) ||
-          !exact(Download(&conv_snaps, saved * kConvState + kGuard), saved_convs))
+          !exact(Download(&conv_snaps, saved * kConvState + kGuard),
+                 saved_convs))
         throw std::runtime_error("GDN batch changed output or rollback state");
       for (std::size_t i = 0; i < kGuard; ++i) {
         if (saved_states[saved * kStateCount + i] != kSentinel ||

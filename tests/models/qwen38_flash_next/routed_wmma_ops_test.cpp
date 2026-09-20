@@ -575,8 +575,8 @@ void CheckVectorGrouping(bool down = false) {
         throw std::runtime_error("paired reference projection failed");
       const auto reference_b = check_output(paired_scalar, tokens);
       const auto widths =
-          down ? std::vector{2, 3, 4, 7, 8, 10, 20, 21, 30, 40, 79, 80,
-                            160, 319, 640}
+          down ? std::vector{2,  3,  4,  7,  8,   10,  20, 21,
+                             30, 40, 79, 80, 160, 319, 640}
                : std::vector{2, 3, 4, 7, 8, 9, 16, 31, 32, 33, 64};
       for (int n : widths) {
         CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
@@ -620,10 +620,10 @@ void CheckVectorGrouping(bool down = false) {
         // retain their exact values and output guards.
         q::Swiglu(scalar + guard, paired_scalar + guard, count, nullptr);
         const auto gated_reference = Download(scalar, dirty.size());
-        const auto gated_widths = !down && formats[f] == q::WeightType::kQ4_K
-                                      ? std::vector{1, 2, 3, 4, 5, 6, 7, 8,
-                                                    9, 16, 31, 32, 33, 64}
-                                      : std::vector{1, 2, 3, 4, 5, 6, 7, 8};
+        const auto gated_widths =
+            !down && formats[f] == q::WeightType::kQ4_K
+                ? std::vector{1, 2, 3, 4, 5, 6, 7, 8, 9, 16, 31, 32, 33, 64}
+                : std::vector{1, 2, 3, 4, 5, 6, 7, 8};
         for (int n : gated_widths) {
           CheckHip(hipMemcpy(batch, dirty.data(), dirty.size() * sizeof(float),
                              hipMemcpyHostToDevice),
@@ -638,8 +638,9 @@ void CheckVectorGrouping(bool down = false) {
             for (int i = 0; i < n * used * rows; ++i) {
               if (std::memcmp(&gated_reference[guard + i], &gated[guard + i],
                               sizeof(float)) != 0) {
-                std::cerr << "first changed slot/row=" << i << " expected="
-                          << std::hexfloat << gated_reference[guard + i]
+                std::cerr << "first changed slot/row=" << i
+                          << " expected=" << std::hexfloat
+                          << gated_reference[guard + i]
                           << " actual=" << gated[guard + i] << std::defaultfloat
                           << '\n';
                 break;

@@ -1,8 +1,8 @@
 # Qwen3.8-Flash-Next on Strix Halo
 
 Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Production builds with the
-pinned Nix toolchain. PP at d0/d32K/d128K, MTP serving and vision: 2026-09-20;
-other CLI/AR measurements: 2026-09-19. One repetition per point.
+pinned Nix toolchain. PP at d0/d32K/d128K, serving and vision: 2026-09-20;
+other CLI measurements: 2026-09-19. One repetition per point.
 Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
 revision `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
@@ -49,43 +49,29 @@ Sampled MTP, d0 raw prefix, seed 1, tg128, top-k/top-p/min-p disabled:
 
 ## Concurrent serving
 
-**Whole-cohort output throughput** in tok/s, including prompt handling and
-scheduling. Context 4096, greedy, thinking off, 128 output tokens, one cold cohort on a fresh server
-per point; no cache hits. Set `--sessions C --max-pending-per-client 8` when
-benchmarking up to eight requests from one host.
+**Sum of individual request decode rates**, in tok/s. Each rate uses
+`completion_tokens / decode_seconds` from server-reported decode time;
+prefill and waiting between decode steps are excluded. Context 4096, greedy,
+thinking off, 128 output tokens, one cold cohort on a fresh server per point;
+no cache hits. Set `--sessions C --max-pending-per-client 8` when benchmarking
+up to eight requests from one host.
 The [corpus](../qwen3.8-27b/artifacts/speculative-corpus.json)
 uses `repetition_word` for repetition and distinct requests cycling through
 `expository_pangram`, `cpp_ring_buffer`, `reasoning_train` for mixed work.
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 25.24 | 65.48 | 25.12 | 42.61 |
-| 2 | 38.60 | 91.42 | 36.25 | 57.11 |
-| 4 | 53.09 | 118.80 | 48.41 | 73.51 |
-| 6 | 60.68 | 126.58 | 54.51 | 83.18 |
-| 8 | 65.17 | 128.83 | 58.45 | 90.30 |
+| 1 | 27.3 | 79.9 | 27.0 | 48.1 |
+| 2 | 46.4 | 117.7 | 43.2 | 64.9 |
+| 4 | 76.7 | 151.2 | 66.8 | 91.8 |
+| 6 | 95.4 | 164.5 | 78.2 | 103.9 |
+| 8 | 108.5 | **171.8** | 86.7 | 109.3 |
 
-MTP acceptance is 100% on repetition and 72.3–84.9% on the mixed cohorts.
+MTP acceptance is 100% on repetition and 76.1–81.7% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
 Greedy timing-based depth choices can vary between runs.
 
-**Repetitive MTP decode rates**, summed across requests in the same cohorts:
-
-| Users | Sum of individual decode rates (tok/s) |
-| ---: | ---: |
-| 1 | 80.6 |
-| 2 | 117.3 |
-| 4 | 162.9 |
-| 6 | 175.8 |
-| 8 | **180.2** |
-
-Each value sums `completion_tokens / decode_seconds` using each request's
-server-reported decode time, excluding prefill. These separate timing windows
-do not measure whole-cohort throughput; that metric is **128.83 tok/s at C8**
-in the table above.
-
-**C1 is a single user.** The HTTP and raw CLI prompts above differ. With the
-repetitive chat prompt, HTTP C1 decode alone is 80.56 tok/s.
+**C1 is a single user.** The HTTP and raw CLI prompts above differ.
 Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
 

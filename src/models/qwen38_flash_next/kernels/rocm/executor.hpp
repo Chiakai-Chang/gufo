@@ -208,8 +208,7 @@ public:
   struct MtpOutput {
     std::int32_t* token{nullptr};
     MtpCandidateLogits* candidates{nullptr};
-    MtpTrace* trace{
-        nullptr};  ///< final-row diagnostic; disables graph capture
+    MtpTrace* trace{nullptr};  ///< final-row diagnostic; disables graph capture
   };
   struct MtpHeadItem {
     Session* session;

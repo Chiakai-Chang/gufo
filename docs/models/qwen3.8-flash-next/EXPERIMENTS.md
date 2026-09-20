@@ -43,6 +43,7 @@
 | Captured shared stages in batched target decoding | Rejected: exact C2/C4/C6/C8 logits, sampled state and cancellation checks, but no serving or warmed-cycle gain justified graph metadata/capture overhead. |
 | Lazy rollback and shared scratch | Retained; depth grows on demand, reset releases it; seven-draft cap about 788 MiB/session. |
 | Live final frontier and async prompt snapshots | Retained; immutable branch snapshot, worker capture, bounded persistence outside the lookup lock. |
+| Thread-local decode graph capture | Retained; independent snapshot workers no longer invalidate a peer's capture. Snapshot bytes and captured/replayed logits are exact; no request serialization added. |
 | Chunk-equivalent projections/attention | Retained with exact continued-image/cache/full-logit gates; one-token tails keep prefill arithmetic. |
 | More Q8 vocabulary rows/block | Rejected: no C1 improvement. |
 
@@ -53,6 +54,10 @@ projections 36.0% of kernel time. The inference window excludes model loading.
 These are profile observations, not unprofiled throughput measurements.
 Final-tile catch-up takes 20.9 ms of MTP kernel time at d32K pp2048; the
 target remains 1450.2 ms in the same trace.
+In the C4 inference window, 4.2% of the scheduling thread's time is outside
+HIP API calls, including model-side CPU work. Cold stalls include a 132.9 ms
+gap around the first BLAS kernel and 110.1 ms in allocation calls; the active
+decode loop has no deliberate sleeps.
 
 Next: improve prefill at depth and target/draft batch projection reuse while
 preserving [quality](EVALUATION.md). The 1700 tok/s PP and flat d0–d128K

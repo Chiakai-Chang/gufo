@@ -353,7 +353,8 @@ double Compare(std::uint32_t n_tokens, std::uint32_t start_pos, bool masked,
     const auto tail = Download(&d_wmma, q_count);
     const std::uint32_t tile_rows = mask_ptr ? 4 : 16;
     const std::size_t begin =
-        static_cast<std::size_t>((n_tokens - 1) / tile_rows * tile_rows) * kQWidth;
+        static_cast<std::size_t>((n_tokens - 1) / tile_rows * tile_rows) *
+        kQWidth;
     for (std::size_t i = 0; i < q_count; ++i) {
       if (i < begin ? tail[i] != poison
                     : std::memcmp(&out[i], &tail[i], sizeof(float)) != 0) {

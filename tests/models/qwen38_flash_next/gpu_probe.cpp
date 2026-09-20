@@ -173,8 +173,8 @@ int main(int argc, char** argv) {
     return 1;
   }
   const auto& c = weights->config;
-  if (cost_depth && (c.context_length < 96 ||
-                     *cost_depth > c.context_length - 96)) {
+  if (cost_depth &&
+      (c.context_length < 96 || *cost_depth > c.context_length - 96)) {
     std::fprintf(stderr, "--depth leaves no room for the cost-audit suffix\n");
     return 2;
   }

@@ -30,6 +30,54 @@ void RequireExact(std::span<const float> expected,
           message);
 }
 
+void CheckSnapshotDuringGraphCapture(const std::shared_ptr<qfn::Model>& model) {
+  std::string error;
+  const auto mode = gufo::core::SessionMode::kAutoregressive;
+  auto decoding = model->CreateSession(mode, 128, &error);
+  auto reference = model->CreateSession(mode, 128, &error);
+  auto frozen = model->CreateSession(mode, 128, &error);
+  Require(decoding && reference && frozen, error);
+  const auto prompt = model->Tokenize("Continue: red, blue, red, blue,");
+  for (auto* session : {decoding.get(), reference.get(), frozen.get()})
+    Require(session->Sync(prompt, &error), error);
+  const auto expected_snapshot = frozen->SaveSnapshot(&error);
+  Require(expected_snapshot != nullptr, error);
+
+  // Warm the one-token shape; its next execution records the decode graph.
+  Require(decoding->Evaluate(prompt.front(), &error) &&
+              reference->Evaluate(prompt.front(), &error),
+          error);
+  std::unique_ptr<qfn::SessionSnapshot> concurrent_snapshot;
+  std::string snapshot_error;
+  unsigned checkpoints = 0;
+  decoding->SetCancellationCheck([&] {
+    // Forward checks once before capture and again at its first layer.
+    if (++checkpoints == 2)
+      concurrent_snapshot = std::async(std::launch::async, [&] {
+                              return frozen->SaveSnapshot(&snapshot_error);
+                            }).get();
+    return false;
+  });
+  Require(decoding->Evaluate(prompt.back(), &error), error);
+  decoding->SetCancellationCheck({});
+  Require(concurrent_snapshot != nullptr, snapshot_error);
+  Require(concurrent_snapshot->bytes().size() ==
+                  expected_snapshot->bytes().size() &&
+              std::memcmp(concurrent_snapshot->bytes().data(),
+                          expected_snapshot->bytes().data(),
+                          expected_snapshot->bytes().size()) == 0,
+          "decode graph capture changed a peer snapshot");
+  Require(reference->Evaluate(prompt.back(), &error), error);
+  RequireExact(reference->Logits(), decoding->Logits(),
+               "snapshot capture changed decode logits");
+  Require(decoding->Evaluate(prompt.front(), &error) &&
+              reference->Evaluate(prompt.front(), &error),
+          error);
+  RequireExact(reference->Logits(), decoding->Logits(),
+               "snapshot capture changed graph replay logits");
+  std::cout << "peer snapshot bytes, graph capture and replay logits exact\n";
+}
+
 void CheckFailureRecovery(const std::shared_ptr<qfn::Model>& model) {
   std::string error;
   auto session = model->CreateSession(
@@ -685,6 +733,7 @@ int main(int argc, char** argv) {
         {.max_context = 6145, .mtp_model_path = argv[4], .max_draft_tokens = 7},
         &error);
     Require(model != nullptr, error);
+    CheckSnapshotDuringGraphCapture(model);
     CheckExecutionModes(model);
     if (sampling_only) {
       CheckServingSampling(model);

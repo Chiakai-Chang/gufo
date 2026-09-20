@@ -93,9 +93,14 @@ Current optimization qualification (2026-09-20):
   through 4096 tokens.
 - Full `--batch-only` checks retain exact logits, tokens, acceptance, residual
   draws and RNG at C2/C4/C6/C8, with independent state, every 1–8-token rollback
-  prefix, cancellation/recovery and image restoration.
+  prefix, cancellation/recovery and image restoration. A frozen peer's
+  snapshot is copied during decode graph capture; snapshot bytes and
+  capture/replay logits remain exact.
 - All ten fresh C1/C2/C4/C6/C8 repetitive/mixed serving cohorts match AR
   completion hashes with zero cache hits.
+- Scheduler tests check that decode time covers measured model work even
+  when asynchronous prompt capture overlaps other requests. AR and MTP time
+  selection/execution directly, excluding capture and waits between steps.
 - Vision softmax checks match every probability byte over 256–16384 patch
   rows. The 4096-patch attention specialization retains complete QK/PV FP32
   output. Full Flash-Next 256×256/1024×1024 and Qwen27B 1024×1024 embeddings

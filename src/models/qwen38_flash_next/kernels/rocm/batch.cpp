@@ -164,7 +164,7 @@ void Executor::CombineBatch(float* res, const float* gamma,
                             std::uint32_t rows) const {
   const auto& c = config();
   HcCombine(res, s_.block_out, s_.inject, inject_parts_, gamma, s_.xn, rows,
-             c.hidden_size, c.hc_count, c.rms_eps, stream_, true);
+            c.hidden_size, c.hc_count, c.rms_eps, stream_, true);
 }
 
 bool Executor::MtpForwardBatch(std::span<const MtpBatchItem> items,
@@ -504,11 +504,11 @@ bool Executor::QuantizeBatch(const float* x, std::uint32_t rows,
   void* quantized = s_.x_q8t;
   q8t_src_ = nullptr;
   if (padded != rows &&
-      !Check(hipMemsetAsync(static_cast<std::uint8_t*>(quantized) +
-                               qfn_mmq_q8_1_bytes(rows, cols),
-                           0, qfn_mmq_q8_1_bytes(padded - rows, cols),
-                           stream_),
-             error))
+      !Check(
+          hipMemsetAsync(static_cast<std::uint8_t*>(quantized) +
+                             qfn_mmq_q8_1_bytes(rows, cols),
+                         0, qfn_mmq_q8_1_bytes(padded - rows, cols), stream_),
+          error))
     return false;
   return qfn_mmq_quantize_q8_1(x, quantized, rows, cols, stream_) == 0 ||
          Fail(error, "batched activation quantization failed");
@@ -520,14 +520,14 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
     return Dense(w, x, out, rows, error);
   if (w.type != core::GgmlType::kQ8_0) {
     SmallGemm(w.data, EmbeddingType(w.type), x, out, rows, w.rows, w.cols,
-               stream_);
+              stream_);
     return true;
   }
   if (!QuantizeBatch(x, rows, w.cols, error))
     return false;
   const auto project = [&](std::uint32_t first, std::uint32_t count) {
     const auto* input = static_cast<const std::uint8_t*>(s_.x_q8t) +
-                         qfn_mmq_q8_1_bytes(first, w.cols);
+                        qfn_mmq_q8_1_bytes(first, w.cols);
     return qfn_mmq_q8_0_dense_vec_preq(
                w.data, nullptr, input,
                out + static_cast<std::size_t>(first) * w.rows, w.rows, count,
@@ -540,10 +540,9 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   }
   // Three matrix tiles help 33–48 rows; four tiles cost more than two
   // 32-row launches. Small outputs with long K sweeps stay at eight.
-  const auto chunk =
-      w.cols == 2560 && w.rows >= 8192
-          ? (rows > 32 && rows <= 48 ? 48U : 32U)
-          : kDecodeRows;
+  const auto chunk = w.cols == 2560 && w.rows >= 8192
+                         ? (rows > 32 && rows <= 48 ? 48U : 32U)
+                         : kDecodeRows;
   for (std::uint32_t r = 0; r < rows; r += chunk) {
     if (!project(r, std::min(chunk, rows - r)))
       return false;
@@ -551,31 +550,29 @@ bool Executor::DenseBatch(const DeviceTensor& w, const float* x, float* out,
   return true;
 }
 
-bool Executor::GatedDenseBatch(const DeviceTensor& up,
-                               const DeviceTensor& gate, const float* x,
-                               float* out, std::uint32_t rows,
+bool Executor::GatedDenseBatch(const DeviceTensor& up, const DeviceTensor& gate,
+                               const float* x, float* out, std::uint32_t rows,
                                std::string* error) const {
   const Scratch base = s_;
   const bool q8 = up.type == core::GgmlType::kQ8_0 &&
-                  gate.type == core::GgmlType::kQ8_0 &&
-                  up.rows == gate.rows && up.cols == gate.cols;
+                  gate.type == core::GgmlType::kQ8_0 && up.rows == gate.rows &&
+                  up.cols == gate.cols;
   if (q8 && !QuantizeBatch(x, rows, up.cols, error))
     return false;
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
     const auto n = std::min(kDecodeRows, rows - r);
     if (q8) {
       const auto* input = static_cast<const std::uint8_t*>(base.x_q8t) +
-                           qfn_mmq_q8_1_bytes(r, up.cols);
-      if (qfn_mmq_q8_0_dense_vec_preq(
-              up.data, gate.data, input,
-              out + std::size_t{r} * up.rows, up.rows, n, up.cols,
-              stream_) != 0)
+                          qfn_mmq_q8_1_bytes(r, up.cols);
+      if (qfn_mmq_q8_0_dense_vec_preq(up.data, gate.data, input,
+                                      out + std::size_t{r} * up.rows, up.rows,
+                                      n, up.cols, stream_) != 0)
         return Fail(error, "batched gated Q8 projection failed");
     } else {
       UseScratch(RowScratch(base, r));
-      const bool ok = GatedDense(up, gate, x + std::size_t{r} * up.cols,
-                                 out + std::size_t{r} * up.rows, n, nullptr,
-                                 error);
+      const bool ok =
+          GatedDense(up, gate, x + std::size_t{r} * up.cols,
+                     out + std::size_t{r} * up.rows, n, nullptr, error);
       UseScratch(base);
       if (!ok)
         return false;
@@ -602,19 +599,19 @@ bool Executor::MoeBatch(const DeviceLayer& l, const float* x, float* out,
       l.ffn_up_exps.type == core::GgmlType::kQ4_K) {
     // Share expert weights across request boundaries while retaining the
     // scalar Q8 activation quantization and dot-product reduction.
-    if (qfn_mmq_moe_gated_vec(
-            static_cast<int>(l.ffn_gate_exps.type), l.ffn_gate_exps.data,
-            l.ffn_up_exps.data, x, base.ids, base.gate_e, c.expert_ff,
-            c.hidden_size, rows, c.num_experts, c.num_experts_used,
-            stream_) != 0 ||
+    if (qfn_mmq_moe_gated_vec(static_cast<int>(l.ffn_gate_exps.type),
+                              l.ffn_gate_exps.data, l.ffn_up_exps.data, x,
+                              base.ids, base.gate_e, c.expert_ff, c.hidden_size,
+                              rows, c.num_experts, c.num_experts_used,
+                              stream_) != 0 ||
         qfn_mmq_moe_vec(
             static_cast<int>(l.ffn_down_exps.type), l.ffn_down_exps.data,
             base.gate_e, base.ids, base.down_e, c.hidden_size, c.expert_ff,
             rows * c.num_experts_used, c.num_experts, 1, stream_) != 0)
       return Fail(error, "batched routed vector projection failed");
     MoeEpilogue(base.down_e, base.weights, base.shexp_out,
-                 base.router + c.num_experts, c.num_experts + 1, out, rows,
-                 c.num_experts_used, c.hidden_size, stream_);
+                base.router + c.num_experts, c.num_experts + 1, out, rows,
+                c.num_experts_used, c.hidden_size, stream_);
     return true;
   }
   for (std::uint32_t r = 0; r < rows; r += kDecodeRows) {
@@ -663,8 +660,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     }
     offsets[i] = rows;
     rows += static_cast<std::uint32_t>(item.tokens.size());
-    max_tokens = std::max(max_tokens,
-                          static_cast<std::uint32_t>(item.tokens.size()));
+    max_tokens =
+        std::max(max_tokens, static_cast<std::uint32_t>(item.tokens.size()));
     const auto end = item.session->position_ + item.tokens.size();
     sparse[i] = c.compress_ratio > 0 && end > c.indexer_top_k;
     complete[i] = c.compress_ratio > 0 ? end / c.compress_ratio : 0;
@@ -688,8 +685,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
              error)) {
     return false;
   }
-  const bool batch_gdn = items.size() > 1 && c.ssm_head_dim == 128 &&
-                         c.ssm_conv_kernel == 4;
+  const bool batch_gdn =
+      items.size() > 1 && c.ssm_head_dim == 128 && c.ssm_conv_kernel == 4;
   if (batch_gdn) {
     const std::size_t bytes =
         std::size_t{c.num_layers} * kBatchSessions * sizeof(GdnBatchItem);
@@ -697,8 +694,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
          !Check(hipHostMalloc(&batch_gdn_host_, bytes, hipHostMallocMapped),
                 error)) ||
         (batch_gdn_ == nullptr &&
-         !Check(hipHostGetDevicePointer(
-                    reinterpret_cast<void**>(&batch_gdn_), batch_gdn_host_, 0),
+         !Check(hipHostGetDevicePointer(reinterpret_cast<void**>(&batch_gdn_),
+                                        batch_gdn_host_, 0),
                 error)))
       return false;
   }
@@ -846,8 +843,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
             batch_gdn_host_[il * kBatchSessions + i] = {
                 l.ssm_in.empty() ? view.qkv : view.qkvz,
                 l.ssm_in.empty() ? view.z : view.qkvz + c.SsmConvChannels(),
-                view.alpha_beta,
-                state.conv_state,
+                view.alpha_beta, state.conv_state,
                 // Short convolution saves history in registers, so each
                 // request needs only its own token rows of staging.
                 base.conv_scratch +

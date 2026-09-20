@@ -1361,12 +1361,12 @@ __global__ void GdnKernel(const float* conv_out, const float* qn,
       raw[static_cast<std::size_t>(t) * v_heads * d + h * d + j] =
           acc * q_scale;
     }
-    if ((kBatch ? batch[blockIdx.z].state_snapshots.rows[0] : snapshots.rows[0]) !=
-            nullptr &&
+    if ((kBatch ? batch[blockIdx.z].state_snapshots.rows[0]
+                : snapshots.rows[0]) != nullptr &&
         t + 1 < n_tokens) {
-      float* snap =
-          (kBatch ? batch[blockIdx.z].state_snapshots.rows[t] : snapshots.rows[t]) +
-          static_cast<std::size_t>(h) * d * d + j * d + i0;
+      float* snap = (kBatch ? batch[blockIdx.z].state_snapshots.rows[t]
+                            : snapshots.rows[t]) +
+                    static_cast<std::size_t>(h) * d * d + j * d + i0;
 #pragma unroll
       for (std::uint32_t i = 0; i < slice; ++i) {
         snap[i] = row[i];
@@ -1512,10 +1512,10 @@ constexpr std::uint32_t kSsmConvTaps = 4;
 constexpr std::uint32_t kSsmConvTokensPerThread = 8;
 template<bool kSaveHistory, bool kBatch>
 __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
-                               const float* w, float* conv_state,
-                               float* out, std::uint32_t n_tokens,
-                               std::uint32_t channels,
-                               RollbackRows snapshots, const GdnBatchItem* batch,
+                               const float* w, float* conv_state, float* out,
+                               std::uint32_t n_tokens, std::uint32_t channels,
+                               RollbackRows snapshots,
+                               const GdnBatchItem* batch,
                                std::uint32_t active) {
   if constexpr (kBatch) {
     if ((active & (1U << blockIdx.z)) == 0)
@@ -1559,11 +1559,11 @@ __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
     window[1] = window[2];
     window[2] = v;
     if constexpr (kSaveHistory) {
-      if ((kBatch ? batch[blockIdx.z].conv_snapshots.rows[0] : snapshots.rows[0]) !=
-              nullptr &&
+      if ((kBatch ? batch[blockIdx.z].conv_snapshots.rows[0]
+                  : snapshots.rows[0]) != nullptr &&
           t + 1 < n_tokens) {
-        float* snapshot =
-            kBatch ? batch[blockIdx.z].conv_snapshots.rows[t] : snapshots.rows[t];
+        float* snapshot = kBatch ? batch[blockIdx.z].conv_snapshots.rows[t]
+                                 : snapshots.rows[t];
 #pragma unroll
         for (std::uint32_t j = 0; j < kSsmConvTaps - 1; ++j)
           snapshot[std::size_t{j} * channels + c] = window[j];
@@ -5448,10 +5448,10 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                              n_tokens <= kSsmConvTokensPerThread;
   if (!convolved) {
     if (saved_history) {
-      hipLaunchKernelGGL(
-          (SsmConv4Kernel<true, false>), dim3(Blocks(channels)), dim3(kThreads), 0,
-          stream, qkv, qkv_stride, conv_w, conv_state, conv_scratch, n_tokens,
-          channels, conv_snapshots, nullptr, 0);
+      hipLaunchKernelGGL((SsmConv4Kernel<true, false>), dim3(Blocks(channels)),
+                         dim3(kThreads), 0, stream, qkv, qkv_stride, conv_w,
+                         conv_state, conv_scratch, n_tokens, channels,
+                         conv_snapshots, nullptr, 0);
     } else if (kernel == kSsmConvTaps) {
       hipLaunchKernelGGL(
           (SsmConv4Kernel<false, false>),
@@ -5467,7 +5467,8 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
   }
   if (!saved_history) {
     if (conv_snapshots.rows[0] != nullptr && n_tokens > 1) {
-      const std::size_t saved = static_cast<std::size_t>(n_tokens - 1) * channels;
+      const std::size_t saved =
+          static_cast<std::size_t>(n_tokens - 1) * channels;
       hipLaunchKernelGGL(RollingSnapshotKernel,
                          dim3(Blocks(saved * (kernel - 1))), dim3(kThreads), 0,
                          stream, qkv, qkv_stride, conv_state, conv_snapshots,
@@ -5500,47 +5501,48 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                        dim3((n_tokens * k_heads + waves - 1) / waves),
                        dim3(kThreads), 0, stream, conv_scratch, qn, kn,
                        n_tokens * k_heads, k_heads, channels, eps, nullptr, 0);
-    hipLaunchKernelGGL(GdnKernel<false>, dim3(v_heads, kGdnDim / kGdnRowsPerBlock),
+    hipLaunchKernelGGL(GdnKernel<false>,
+                       dim3(v_heads, kGdnDim / kGdnRowsPerBlock),
                        dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream,
                        conv_scratch, qn, kn, alpha_beta, a, dt, state, raw,
                        state_snapshots, n_tokens, k_heads, v_heads, nullptr, 0);
   }
-  hipLaunchKernelGGL(GdnEpilogueKernel<false>,
-                     dim3((n_tokens * v_heads + waves - 1) / waves),
-                     dim3(kThreads), 0, stream, raw, z, z_stride, norm_w, out,
-                     out_q8, out_half, n_tokens * v_heads, v_heads, eps,
-                     nullptr, 0);
+  hipLaunchKernelGGL(
+      GdnEpilogueKernel<false>, dim3((n_tokens * v_heads + waves - 1) / waves),
+      dim3(kThreads), 0, stream, raw, z, z_stride, norm_w, out, out_q8,
+      out_half, n_tokens * v_heads, v_heads, eps, nullptr, 0);
 }
 
-bool GatedDeltaNetBatch(
-    const GdnBatchItem* items, std::uint32_t count, std::uint32_t max_tokens,
-    std::uint32_t active, std::uint32_t qkv_stride, std::uint32_t z_stride,
-    const float* conv_w, const float* a, const float* dt, const float* norm_w,
-    std::uint32_t k_heads, std::uint32_t v_heads, float eps, hipStream_t stream) {
+bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
+                        std::uint32_t max_tokens, std::uint32_t active,
+                        std::uint32_t qkv_stride, std::uint32_t z_stride,
+                        const float* conv_w, const float* a, const float* dt,
+                        const float* norm_w, std::uint32_t k_heads,
+                        std::uint32_t v_heads, float eps, hipStream_t stream) {
   if (items == nullptr || count == 0 || count > 8 || max_tokens == 0 ||
       max_tokens > kSsmConvTokensPerThread)
     return false;
   const auto channels = (2 * k_heads + v_heads) * kGdnDim;
   constexpr auto waves = kThreads / 32;
-  hipLaunchKernelGGL(
-      (SsmConv4Kernel<true, true>), dim3(Blocks(channels), 1, count),
-      dim3(kThreads), 0, stream, nullptr, qkv_stride, conv_w, nullptr, nullptr,
-      max_tokens, channels, RollbackRows{}, items, active);
-  hipLaunchKernelGGL(
-      GdnPrepKernel<true>,
-      dim3((max_tokens * k_heads + waves - 1) / waves, 1, count),
-      dim3(kThreads), 0, stream, nullptr, nullptr, nullptr,
-      max_tokens * k_heads, k_heads, channels, eps, items, active);
+  hipLaunchKernelGGL((SsmConv4Kernel<true, true>),
+                     dim3(Blocks(channels), 1, count), dim3(kThreads), 0,
+                     stream, nullptr, qkv_stride, conv_w, nullptr, nullptr,
+                     max_tokens, channels, RollbackRows{}, items, active);
+  hipLaunchKernelGGL(GdnPrepKernel<true>,
+                     dim3((max_tokens * k_heads + waves - 1) / waves, 1, count),
+                     dim3(kThreads), 0, stream, nullptr, nullptr, nullptr,
+                     max_tokens * k_heads, k_heads, channels, eps, items,
+                     active);
   hipLaunchKernelGGL(
       GdnKernel<true>, dim3(v_heads, kGdnDim / kGdnRowsPerBlock, count),
       dim3(kGdnRowsPerBlock * kGdnLanes), 0, stream, nullptr, nullptr, nullptr,
       nullptr, a, dt, nullptr, nullptr, RollbackRows{}, max_tokens, k_heads,
       v_heads, items, active);
-  hipLaunchKernelGGL(
-      GdnEpilogueKernel<true>,
-      dim3((max_tokens * v_heads + waves - 1) / waves, 1, count),
-      dim3(kThreads), 0, stream, nullptr, nullptr, z_stride, norm_w, nullptr,
-      nullptr, nullptr, max_tokens * v_heads, v_heads, eps, items, active);
+  hipLaunchKernelGGL(GdnEpilogueKernel<true>,
+                     dim3((max_tokens * v_heads + waves - 1) / waves, 1, count),
+                     dim3(kThreads), 0, stream, nullptr, nullptr, z_stride,
+                     norm_w, nullptr, nullptr, nullptr, max_tokens * v_heads,
+                     v_heads, eps, items, active);
   return hipGetLastError() == hipSuccess;
 }
 
@@ -5677,8 +5679,9 @@ bool WmmaCausalAttention(const float* q, const float* gate,
     constexpr std::uint32_t kPackedQueries = 4;
     const std::uint32_t first_group =
         last_only ? (n_tokens - 1) / kPackedQueries : 0;
-    const dim3 grid((n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
-                    kWmmaKvHeads);
+    const dim3 grid(
+        (n_tokens + kPackedQueries - 1) / kPackedQueries - first_group,
+        kWmmaKvHeads);
     // At deep sparse windows, staging the current V before fetching the
     // next one shortens their overlapping register lifetimes.
     if (start_pos >= 65536) {

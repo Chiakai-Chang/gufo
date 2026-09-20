@@ -7,6 +7,10 @@ Linux gfx1151. CMake/CTest work with either system dependencies or `nix develop`
 ## Commands
 
 ```sh
+# Formatting on the editing host, using CI's pinned formatter
+nix shell --inputs-from . nixpkgs#clang-tools -c python3 tools/ci/check-format.py
+# Add --fix to apply formatting.
+
 # Documentation changes
 nix build .#checks.x86_64-linux.docs
 
@@ -29,6 +33,8 @@ See [development](DEVELOPMENT.md) for all build presets.
 Performance measurements use `nix build` binaries under `result/bin` or the
 `release` preset with the same compiler and dependencies.
 Add new files to Git before invoking Nix.
+Formatting and the Python documentation/dependency checks also run on the
+editing host without building Gufo. Their entrypoints are in `tools/ci/`.
 
 `gpu-fast` excludes `slow` and `external-model` tests. The
 `deepseek-gpu` and `qwen-gpu-kernel-oracle` presets select

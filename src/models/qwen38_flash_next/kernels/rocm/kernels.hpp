@@ -309,11 +309,12 @@ struct GdnBatchItem {
 /// Runs the decode arithmetic for 1–8 independent requests of 1–8 rows,
 /// 128-wide heads and four convolution taps. `items` is device-accessible;
 /// inactive requests are untouched. The caller zeros their output rows.
-bool GatedDeltaNetBatch(
-    const GdnBatchItem* items, std::uint32_t count, std::uint32_t max_tokens,
-    std::uint32_t active, std::uint32_t qkv_stride, std::uint32_t z_stride,
-    const float* conv_w, const float* a, const float* dt, const float* norm_w,
-    std::uint32_t k_heads, std::uint32_t v_heads, float eps, hipStream_t stream);
+bool GatedDeltaNetBatch(const GdnBatchItem* items, std::uint32_t count,
+                        std::uint32_t max_tokens, std::uint32_t active,
+                        std::uint32_t qkv_stride, std::uint32_t z_stride,
+                        const float* conv_w, const float* a, const float* dt,
+                        const float* norm_w, std::uint32_t k_heads,
+                        std::uint32_t v_heads, float eps, hipStream_t stream);
 
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row

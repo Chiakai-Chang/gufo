@@ -102,6 +102,9 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
 - **Graphs:** verify replay actually launches every new operation. Side-stream
   work during capture is not automatically included in the graph. Check the
   relevant shallow/deep dispatch boundaries and unprofiled wall time.
+  Independent snapshot workers need nonblocking streams and thread-local
+  capture validation; global capture failed when a peer copied its frozen
+  state. Test that overlap and compare snapshot bytes and replay logits.
 
 ## Quality and reporting
 
@@ -122,8 +125,11 @@ controllers are for greedy decoding; sampled execution must retain seeded
 replay. Full model sweeps are final qualification, not each iteration.
 
 Measure C1 plus affected C2/C4/C6/C8. Keep prompt and cache state identical when
-comparing CLI single-user and HTTP C1; report decode rate separately from whole
-request throughput. Raise the benchmark server's per-client queue limit for
+comparing CLI single-user and HTTP C1. Model serving tables report the sum of
+individual request decode rates; define the timed scope and retain request
+latencies in raw profiling artifacts. Time execution directly: an asynchronous
+snapshot outside the decode timer must not be subtracted again at completion.
+Raise the benchmark server's per-client queue limit for
 C8 from one host; a rejected request is not a throughput result. For H3,
 prefer an analytic case or one block/forward pass;
 do not generate full videos during routine kernel work.
