@@ -49,8 +49,8 @@ Sampled MTP, d0 raw prefix, seed 1, tg128, top-k/top-p/min-p disabled:
 
 ## Concurrent serving
 
-Aggregate **output** tok/s, including prompt handling and scheduling. Context
-4096, greedy, thinking off, 128 output tokens, one cold cohort on a fresh server
+**Whole-cohort output throughput** in tok/s, including prompt handling and
+scheduling. Context 4096, greedy, thinking off, 128 output tokens, one cold cohort on a fresh server
 per point; no cache hits. Set `--sessions C --max-pending-per-client 8` when
 benchmarking up to eight requests from one host.
 The [corpus](../qwen3.8-27b/artifacts/speculative-corpus.json)
@@ -69,13 +69,25 @@ MTP acceptance is 100% on repetition and 72.3–84.9% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
 Greedy timing-based depth choices can vary between runs.
 
+**Repetitive MTP decode rates**, summed across requests in the same cohorts:
+
+| Users | Sum of individual decode rates (tok/s) |
+| ---: | ---: |
+| 1 | 80.6 |
+| 2 | 117.3 |
+| 4 | 162.9 |
+| 6 | 175.8 |
+| 8 | **180.2** |
+
+Each value sums `completion_tokens / decode_seconds` using each request's
+server-reported decode time, excluding prefill. These separate timing windows
+do not measure whole-cohort throughput; that metric is **128.83 tok/s at C8**
+in the table above.
+
 **C1 is a single user.** The HTTP and raw CLI prompts above differ. With the
-repetitive chat prompt, HTTP C1 decode alone is 80.56 tok/s; the table includes
-prefill and scheduling. Compare identical prompts and timing boundaries.
+repetitive chat prompt, HTTP C1 decode alone is 80.56 tok/s.
+Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
-Summing the individual repetitive decode rates gives 117.3/162.9/175.8/180.2
-tok/s at C2/C4/C6/C8. These exclude waiting and prefill; the table reports
-whole-cohort output throughput.
 
 ## Image encoder
 
