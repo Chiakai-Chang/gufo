@@ -72,6 +72,8 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   nibbles with multiply/mask removed shifts without changing dequantization.
 - **Wave mode and compiler:** selected quantized kernels need wave64 while
   other paths use wave32. Match helper/caller wave modes per translation unit.
+  One wave64 helped batched Q4 gate/up while preserving separate 32-lane
+  reductions; wider output tiles then lost on disjoint and mixed routing.
   Iterative ILP scheduling helped selected 16-row Q4/Q5 kernels; applying it
   globally was not a win. Inspect VGPR/LDS/private scratch and ISA with
   `tools/prof/isa_mix.py`; occupancy alone is not the optimization objective.

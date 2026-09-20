@@ -31,3 +31,9 @@ void mul_mat_vec_moe_gated(const void* gate, const void* up, ggml_type type,
                            int32_t* groups, float* output, int k, int rows,
                            int tokens, int experts_used, int input_stride,
                            hipStream_t stream);
+
+void mul_mat_vec_moe_batch_wave64(const void* gate, const void* up,
+                                 const block_q8_1* input, const int32_t* groups,
+                                 float* output, int k, int rows,
+                                 int experts_used, int input_stride,
+                                 hipStream_t stream);

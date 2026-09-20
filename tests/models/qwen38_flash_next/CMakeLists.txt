@@ -18,7 +18,7 @@ add_qwen38_flash_next_test(mtp_sampling gufo_core "cpu")
 
 add_executable(qwen38_flash_next_reference_probe EXCLUDE_FROM_ALL reference_probe.cpp)
 target_link_libraries(qwen38_flash_next_reference_probe PRIVATE
-  gufo_qwen38_flash_next)
+  gufo_qwen38_flash_next_reference)
 set_source_files_properties(reference_probe.cpp PROPERTIES COMPILE_OPTIONS "-O2")
 
 if (ENGINE_ENABLE_HIP)
@@ -45,5 +45,5 @@ if (ENGINE_ENABLE_HIP)
   add_executable(qwen38_flash_next_gpu_probe EXCLUDE_FROM_ALL gpu_probe.cpp
     mtp_audit.cpp)
   target_link_libraries(qwen38_flash_next_gpu_probe PRIVATE
-    gufo_qwen38_flash_next)
+    gufo_qwen38_flash_next_reference)
 endif()

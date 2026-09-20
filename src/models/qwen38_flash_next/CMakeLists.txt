@@ -1,15 +1,17 @@
-# Qwen3.8-Flash-Next (qwen4exp) model package. CPU side: GGUF binding,
-# tokenizer, n-gram disk reader and the float32 reference graph. The ROCm
-# runtime is added below when HIP is enabled.
+# Qwen3.8-Flash-Next (qwen4exp) model package. The scalar oracle is built
+# only by explicit validation targets, not by production or routine checks.
 add_library(gufo_qwen38_flash_next STATIC
   config.cpp
-  cpu_ops.cpp
   ngram.cpp
-  reference.cpp
   weights.cpp)
 
 target_include_directories(gufo_qwen38_flash_next PUBLIC ${PROJECT_SOURCE_DIR})
 target_link_libraries(gufo_qwen38_flash_next PUBLIC gufo_core Threads::Threads)
+
+add_library(gufo_qwen38_flash_next_reference STATIC EXCLUDE_FROM_ALL
+  cpu_ops.cpp reference.cpp)
+target_link_libraries(gufo_qwen38_flash_next_reference PUBLIC
+  gufo_qwen38_flash_next)
 
 # The reference decodes every weight on the fly; unoptimized it is unusable
 # even as an oracle, so it keeps -O2 in every configuration.
@@ -27,10 +29,13 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_MMQ_DIR}/qfn_mmq.hip.cpp
     ${QFN_MMQ_DIR}/mmid.hip.cpp
     ${QFN_MMQ_DIR}/mmvq.hip.cpp
+    ${QFN_MMQ_DIR}/moe_wave64.hip.cpp
     ${QFN_MMQ_DIR}/quantize.hip.cpp)
 
   add_library(gufo_qwen38_flash_next_mmq STATIC ${QFN_MMQ_SOURCES})
   set_source_files_properties(${QFN_MMQ_SOURCES} PROPERTIES LANGUAGE HIP)
+  set_source_files_properties(${QFN_MMQ_DIR}/moe_wave64.hip.cpp
+    PROPERTIES COMPILE_OPTIONS "-mwavefrontsize64")
   set_target_properties(gufo_qwen38_flash_next_mmq PROPERTIES
     HIP_STANDARD 17
     HIP_STANDARD_REQUIRED ON

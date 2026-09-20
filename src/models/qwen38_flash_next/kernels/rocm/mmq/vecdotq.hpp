@@ -1270,3 +1270,49 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
+
+// Decode each packed weight fragment once when several requests use an
+// expert. Dot retains the original Q4_K/Q8_1 integer and floating sum order.
+struct Q4MoeFragment {
+  int v[2];
+  uint16_t aux[2];
+  half2 dm;
+
+  __device__ __forceinline__ Q4MoeFragment(const void* weights, int block,
+                                          int iqs) {
+    const auto* w = static_cast<const block_q4_K*>(weights) + block;
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+    const auto* q = reinterpret_cast<const int*>(
+        w->qs + 16 * offset + 4 * ((iqs / 2) % 4));
+    v[0] = q[0];
+    v[1] = q[4];
+    dm = w->dm;
+    const auto* scales = reinterpret_cast<const uint16_t*>(w->scales);
+    const int j = offset / 2;
+    if (j < 2) {
+      aux[0] = scales[j] & 0x3f3f;
+      aux[1] = scales[j + 2] & 0x3f3f;
+    } else {
+      aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) |
+               ((scales[j - 2] & 0xc0c0) >> 2);
+      aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) |
+               ((scales[j] & 0xc0c0) >> 2);
+    }
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* x, int iqs) const {
+    int u[4];
+    float d8[2];
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const auto* block = x + offset + i;
+      d8[i] = __low2float(block->ds);
+      const auto* q = reinterpret_cast<const int*>(block->qs) + ((iqs / 2) % 4);
+      u[2 * i] = q[0];
+      u[2 * i + 1] = q[4];
+    }
+    const auto* sc = reinterpret_cast<const uint8_t*>(aux);
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, sc + 2, dm, d8);
+  }
+};

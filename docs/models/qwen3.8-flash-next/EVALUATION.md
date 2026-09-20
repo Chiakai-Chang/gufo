@@ -42,7 +42,8 @@ nix develop -c build/gpu-test/tests/models/qwen38_flash_next/qwen38_flash_next_g
 ```
 
 The audit uses scalar CPU operators and the original GGUF weights, independently
-of device repacking and HIP kernels. It checks:
+of device repacking and HIP kernels. Its reference library is built only by the
+explicit probes, outside the production/default test build. It checks:
 
 - Exact encoded weight bytes after splitting; adversarial unequal HC scales
   distinguish full-width RMSNorm from branch-wise normalization.
@@ -75,6 +76,9 @@ Current optimization qualification (2026-09-20):
   640 expert-down rows, including mixed activation scales, duplicate/inactive
   experts, nonfinite scales and output guards. Ragged Q8 inputs end at the
   allocation boundary. Captured model inputs also check FP32 contraction.
+- Batched Q4 gate/up uses wave64 with independent 32-lane reductions.
+  Shared, disjoint and mixed routing retain exact outputs, including small
+  unsaturated activations and captured model inputs. C1 keeps its vector path.
 - Q8 matrix verification retains the vector path's four K8 partials, rounded
   products, FMA chain and reduction order. Complete FP32 outputs match through
   48 inputs for 12,289/65,537-row matrices and 32 inputs for the 2,561-row
