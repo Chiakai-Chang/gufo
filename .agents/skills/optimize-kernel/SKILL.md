@@ -46,6 +46,8 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   request rows. Tune real ragged shapes, including 3–8 rows and partial tiles.
   Batch the complete draft transformer body, not only the vocabulary head;
   keep each request's KV, recurrence, acceptance and RNG state independent.
+  Test both shared and disjoint expert routing: weight reuse benefits shared
+  experts, but single-request experts need a compact path.
 - **Wave mode and compiler:** selected quantized kernels need wave64 while
   other paths use wave32. Match helper/caller wave modes per translation unit.
   Iterative ILP scheduling helped selected 16-row Q4/Q5 kernels; applying it

@@ -198,7 +198,53 @@ static __global__ void group_moe_slots(const int32_t* ids, int32_t* groups,
   }
 }
 
-template<ggml_type type, int tokens>
+// Decode each packed weight fragment once when several requests use an
+// expert. Dot retains the original Q4_K/Q8_1 integer and floating sum order.
+struct Q4MoeFragment {
+  int v[2];
+  uint16_t aux[2];
+  half2 dm;
+
+  __device__ __forceinline__ Q4MoeFragment(const void* weights, int block,
+                                          int iqs) {
+    const auto* w = static_cast<const block_q4_K*>(weights) + block;
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+    const auto* q = reinterpret_cast<const int*>(
+        w->qs + 16 * offset + 4 * ((iqs / 2) % 4));
+    v[0] = q[0];
+    v[1] = q[4];
+    dm = w->dm;
+    const auto* scales = reinterpret_cast<const uint16_t*>(w->scales);
+    const int j = offset / 2;
+    if (j < 2) {
+      aux[0] = scales[j] & 0x3f3f;
+      aux[1] = scales[j + 2] & 0x3f3f;
+    } else {
+      aux[0] = ((scales[j + 2] >> 0) & 0x0f0f) |
+               ((scales[j - 2] & 0xc0c0) >> 2);
+      aux[1] = ((scales[j + 2] >> 4) & 0x0f0f) |
+               ((scales[j] & 0xc0c0) >> 2);
+    }
+  }
+
+  __device__ __forceinline__ float Dot(const block_q8_1* x, int iqs) const {
+    int u[4];
+    float d8[2];
+    const int offset = QR4_K * ((iqs / 2) / (QI8_1 / 2));
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const auto* block = x + offset + i;
+      d8[i] = __low2float(block->ds);
+      const auto* q = reinterpret_cast<const int*>(block->qs) + ((iqs / 2) % 4);
+      u[2 * i] = q[0];
+      u[2 * i + 1] = q[4];
+    }
+    const auto* sc = reinterpret_cast<const uint8_t*>(aux);
+    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, sc + 2, dm, d8);
+  }
+};
+
+template<ggml_type type, int tokens, bool single_request = false>
 __launch_bounds__(64) static __global__
     void mul_mat_vec_moe_grouped(const void* __restrict__ gate,
                                  const void* __restrict__ up,
@@ -219,38 +265,71 @@ __launch_bounds__(64) static __global__
   const int32_t* group = groups + anchor * (tokens + 1);
   const int expert = group[0];
   if (expert < 0) {
-    if (expert == -2 && tid < 2 && row0 + tid < rows)
+    if (!single_request && expert == -2 && tid < 2 && row0 + tid < rows)
       output[anchor * rows + row0 + tid] = 0.0f;
     return;
   }
 
-  const void* weights = is_up ? up : gate;
-  const int blocks_per_row = k / qk;
-  uint32_t slots[tokens];
-#pragma unroll
-  for (int t = 0; t < tokens; ++t)
-    slots[t] = static_cast<uint32_t>(group[t + 1]);
-  float sum[tokens][2] = {};
-  for (int kb = lane / (qi / vdr); kb < blocks_per_row; kb += blocks_per_iter) {
-    const int kqs = vdr * (lane % (qi / vdr));
+  constexpr bool split = type == GGML_TYPE_Q4_K && tokens >= 3;
+  constexpr int columns = single_request ? 1 : tokens;
+  int token = 0;
+  if constexpr (split) {
+    int active = 0;
 #pragma unroll
     for (int t = 0; t < tokens; ++t) {
-      if (slots[t] == 0)
-        continue;
+      if (group[t + 1] != 0) {
+        ++active;
+        token = t;
+      }
+    }
+    if (single_request ? active != 1 : active <= 1)
+      return;
+  }
+  const void* weights = is_up ? up : gate;
+  const int blocks_per_row = k / qk;
+  uint32_t slots[columns];
 #pragma unroll
-      for (int r = 0; r < 2; ++r)
-        sum[t][r] +=
-            dot(weights, input + t * input_stride + kb * (qk / QK8_1),
-                (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
-                kqs);
+  for (int t = 0; t < columns; ++t)
+    slots[t] = static_cast<uint32_t>(group[(single_request ? token : t) + 1]);
+  float sum[columns][2] = {};
+  for (int kb = lane / (qi / vdr); kb < blocks_per_row; kb += blocks_per_iter) {
+    const int kqs = vdr * (lane % (qi / vdr));
+    if constexpr (split && !single_request) {
+      const Q4MoeFragment w0(
+          weights, (expert * rows + row0) * blocks_per_row + kb, kqs);
+      const Q4MoeFragment w1(
+          weights, (expert * rows + min(row0 + 1, rows - 1)) * blocks_per_row + kb,
+          kqs);
+#pragma unroll
+      for (int t = 0; t < columns; ++t) {
+        if (slots[t] == 0)
+          continue;
+        const auto* x = input + t * input_stride + kb * (qk / QK8_1);
+        sum[t][0] += w0.Dot(x, kqs);
+        sum[t][1] += w1.Dot(x, kqs);
+      }
+    } else {
+#pragma unroll
+      for (int t = 0; t < columns; ++t) {
+        if (slots[t] == 0)
+          continue;
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+          sum[t][r] += dot(
+              weights,
+              input + (single_request ? token : t) * input_stride +
+                  kb * (qk / QK8_1),
+              (expert * rows + min(row0 + r, rows - 1)) * blocks_per_row + kb,
+              kqs);
+      }
     }
   }
 
   // Gate and up stay in separate waves to retain the scalar projection's
   // sum order, including the treatment of nonfinite quantization scales.
-  __shared__ float values[tokens][2][2];
+  __shared__ float values[columns][2][2];
 #pragma unroll
-  for (int t = 0; t < tokens; ++t) {
+  for (int t = 0; t < columns; ++t) {
     if (slots[t] == 0)
       continue;
 #pragma unroll
@@ -262,7 +341,7 @@ __launch_bounds__(64) static __global__
   __syncthreads();
   if (!is_up && lane < 2 && row0 + lane < rows) {
 #pragma unroll
-    for (int t = 0; t < tokens; ++t) {
+    for (int t = 0; t < columns; ++t) {
       if (slots[t] == 0)
         continue;
       const float g = values[t][0][lane];
@@ -270,7 +349,8 @@ __launch_bounds__(64) static __global__
       uint32_t bits = slots[t];
       while (bits) {
         const int slot = __ffs(static_cast<int>(bits)) - 1;
-        output[(t * experts_used + slot) * rows + row0 + lane] =
+        output[((single_request ? token : t) * experts_used + slot) * rows +
+               row0 + lane] =
             (g * (1.0f / (1.0f + __expf(-g)))) * u;
         bits &= bits - 1;
       }
@@ -289,6 +369,12 @@ static void launch_moe_grouped(const void* gate, const void* up,
         <<<dim3((rows + 1) / 2, tokens * experts_used), 64, 0, stream>>>(
             gate, up, input, groups, output, k, rows, experts_used,
             input_stride);
+    if constexpr (type == GGML_TYPE_Q4_K && tokens >= 3) {
+      mul_mat_vec_moe_grouped<type, tokens, true>
+          <<<dim3((rows + 1) / 2, tokens * experts_used), 64, 0, stream>>>(
+              gate, up, input, groups, output, k, rows, experts_used,
+              input_stride);
+    }
   } else if constexpr (tokens < MMVQ_MAX_BATCH_SIZE) {
     launch_moe_grouped<type, tokens + 1>(gate, up, input, groups, output, k,
                                          rows, n_tokens, experts_used,

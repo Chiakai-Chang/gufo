@@ -74,6 +74,12 @@ patch-row checks matched every probability byte; complete 256×256 and
 1024×1024 Flash-Next embeddings also matched the previous encoder byte for
 byte. The Qwen27B Q4/Q8 projector passed the 1024×1024 embedding comparison.
 
+Q4 shared-expert weight reuse passed the maintained routed-projection checks:
+exact outputs for widths 1–8, duplicate/inactive experts, nonfinite scales and
+ragged rows. The full batch session check retained exact logits, tokens, RNG,
+acceptance and residual replay at C2/C4/C6/C8. Fresh repetitive and mixed
+serving cohorts at C1/C2/C4/C6/C8 match AR completion hashes without cache hits.
+
 **Remaining limit:** these checks use converted GGUF weights. They do not
 establish unquantized-checkpoint equivalence or detect every conversion error.
 Pinned Transformers ignores the MTP weights, so its trunk forward is not an
