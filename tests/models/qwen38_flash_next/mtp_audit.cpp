@@ -262,9 +262,13 @@ void AuditMtp(q::rocm::Executor& exec, const q::rocm::DeviceModel& device,
   // A full predictor forward is the independent execution control for
   // headless catch-up. Only its final residual is carried; all KV/indexer
   // rows must still survive. Cross the sparse-attention boundary and then
-  // compare recursive proposals, not only the final argmax.
-  for (const unsigned count :
-       {std::min(exec.max_batch(), 257U), std::min(exec.max_batch(), 2047U)}) {
+  // compare recursive proposals, not only the final argmax. Cover the minimum
+  // 96-row tail tile, a two-tile tail, and aligned/ragged large chunks.
+  std::vector<unsigned> counts{224U, 257U, 2047U, 2048U};
+  for (auto& count : counts)
+    count = std::min(exec.max_batch(), count);
+  counts.erase(std::unique(counts.begin(), counts.end()), counts.end());
+  for (const unsigned count : counts) {
     Require(count > 32, "catch-up audit requires --batch greater than 32");
     const unsigned rounds = c.indexer_top_k / count + 2;
     const unsigned capacity = rounds * (count + 1) + 1;

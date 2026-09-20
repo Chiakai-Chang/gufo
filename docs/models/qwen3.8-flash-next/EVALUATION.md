@@ -56,7 +56,8 @@ explicit probes, outside the production/default test build. It checks:
   head; operator tests separately check Q8 dots against FP64.
 - Full predictor versus headless catch-up, including FFN input/output and the
   next recursive step across the sparse-attention boundary. Use `--batch 2048`
-  to cover both 257- and 2047-row calls with exact candidate and stage equality.
+  to cover 224/257/2047/2048 rows: the minimum final tile, a two-tile tail,
+  and large ragged/aligned chunks. Candidates and recorded stages match exactly.
 
 Stage comparisons supply the same recorded input to each CPU/GPU stage and
 emulate Q8 activation/F16 cache storage on the CPU. This separates operation

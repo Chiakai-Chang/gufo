@@ -1452,7 +1452,11 @@ bool Executor::Attention(const DeviceLayer& l, Session::AttentionState& s,
     const std::uint32_t blocks =
         (max_context + c.compress_ratio - 1) / c.compress_ratio;
     const std::uint32_t max_blocks = (blocks + 31) / 32 * 32;
-    for (std::uint32_t t0 = 0; t0 < n_tokens; t0 += select_chunk_) {
+    // Catch-up consumes only the final attention tile. Keep all its query
+    // masks (sparse attention packs four queries; dense tiles hold sixteen)
+    // but avoid scoring the unused prefix against the complete context.
+    const auto first_query = last_only ? (n_tokens - 1) / 16 * 16 : 0U;
+    for (std::uint32_t t0 = first_query; t0 < n_tokens; t0 += select_chunk_) {
       const std::uint32_t n = std::min(select_chunk_, n_tokens - t0);
       SelectBlocks(s_.iq + static_cast<std::size_t>(t0) * c.indexer_heads *
                                c.indexer_head_dim,
@@ -2553,43 +2557,72 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   attn.block_k = session.mtp_.block_k;
   // The draft block's attention runs at its own position.
   // Catch-up exports KV for every row but only carries its final residual.
-  // Preserve that row's original query tile and all projection shapes;
-  // earlier attention results never contribute to the carried state.
+  // Preserve that row's original query tile; earlier attention results
+  // never contribute to the carried state.
   const bool last_only =
       !token && !candidates && n > 32 && control_host_->hidden_row >= 0;
+  // Keep the final 128-column tile (and its predecessor for short tails).
+  // At least 96 rows retain the wide mixer/projection arithmetic. Attention
+  // still writes every KV/indexer row before the scratch view is narrowed.
+  const auto skipped = last_only && n >= 224 ? (n - 96) / 128 * 128 : 0U;
   if (!HcMix(l.hc_attn, s_.mtp_res, false, s_.mixed, s_.inject, n, error_msg) ||
       !Attention(l, attn, s_.mixed, s_.block_out, n,
                  &session.control_->mtp_position, &session.control_->mtp_blocks,
                  pos, pool_grid, session.max_context_,
-                 pos + n > c.indexer_top_k, error_msg, last_only)) {
+                 pos + n > c.indexer_top_k, error_msg, last_only, false,
+                 skipped == 0)) {
     return false;
   }
-  Combine(s_.mtp_res, l.hc_ffn.norm.f32(), n);
-  if (trace && !copy_trace(s_.mtp_res + final_row, trace->attention))
+  struct RestoreScratch {
+    const Executor* executor;
+    Scratch scratch;
+    bool changed;
+    ~RestoreScratch() {
+      if (changed)
+        executor->UseScratch(scratch);
+    }
+  } restore{this, s_, skipped != 0};
+  const auto tail_rows = n - skipped;
+  const auto tail_last = static_cast<std::size_t>(tail_rows - 1) * hc_dim;
+  if (skipped != 0) {
+    auto tail = RowScratch(s_, skipped);
+    // Keep the producer's inject stride: it may use vectorized partials or
+    // a single quantized projection rather than RowScratch's scalar layout.
+    tail.inject = s_.inject +
+                  static_cast<std::size_t>(skipped) * c.hc_count * inject_parts_;
+    UseScratch(tail);
+    if (!Dense(l.attn_out, s_.ctx, s_.block_out, tail_rows, error_msg))
+      return false;
+  }
+  Combine(s_.mtp_res, l.hc_ffn.norm.f32(), tail_rows);
+  if (trace && !copy_trace(s_.mtp_res + tail_last, trace->attention))
     return false;
   if (!session.CheckCancellation(error_msg))
     return false;
-  if (!HcMix(l.hc_ffn, s_.mtp_res, true, s_.mixed, s_.inject, n, error_msg) ||
+  if (!HcMix(l.hc_ffn, s_.mtp_res, true, s_.mixed, s_.inject, tail_rows,
+              error_msg) ||
       (trace &&
-       !copy_trace(s_.mixed + static_cast<std::size_t>(n - 1) * c.hidden_size,
+       !copy_trace(s_.mixed +
+                       static_cast<std::size_t>(tail_rows - 1) * c.hidden_size,
                     trace->ffn_input)) ||
-      !Moe(l, s_.mixed, s_.block_out, n, error_msg, last_only)) {
+      !Moe(l, s_.mixed, s_.block_out, tail_rows, error_msg, last_only)) {
     return false;
   }
-  Combine(s_.mtp_res, nullptr, n);
+  Combine(s_.mtp_res, nullptr, tail_rows);
   if (trace &&
-      !copy_trace(s_.block_out + static_cast<std::size_t>(n - 1) * c.hidden_size,
+      !copy_trace(s_.block_out +
+                      static_cast<std::size_t>(tail_rows - 1) * c.hidden_size,
                    trace->ffn_output))
     return false;
-  if (trace && !copy_trace(s_.mtp_res + final_row, trace->hidden))
+  if (trace && !copy_trace(s_.mtp_res + tail_last, trace->hidden))
     return false;
   if (trace && !trace->head.empty()) {
-    if (!HcMix(l.nextn_head, s_.mtp_res + final_row, false, s_.mixed, nullptr, 1,
+    if (!HcMix(l.nextn_head, s_.mtp_res + tail_last, false, s_.mixed, nullptr, 1,
                error_msg) ||
         !copy_trace(s_.mixed, trace->head))
       return false;
   }
-  const float* last = s_.mtp_res + final_row;
+  const float* last = s_.mtp_res + tail_last;
   if (!Check(hipMemcpyAsync(session.mtp_.h, last, hc_dim * sizeof(float),
                             hipMemcpyDeviceToDevice, stream_),
              "MTP hidden carry", error_msg)) {

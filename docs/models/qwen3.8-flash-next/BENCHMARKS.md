@@ -21,16 +21,16 @@ predictor catch-up through all known successor tokens.
 
 | Depth | AR pp2048 | MTP pp2048 | AR tg128 | MTP tg128 | MTP acceptance |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1525.3 | 1493.6 | 26.33 | 42.74 | 70.0% |
+| 0 | 1525.3 | 1507.7 | 26.33 | 42.74 | 70.0% |
 | 4K | 1455.1 | TODO | 25.48 | 40.35 | 65.6% |
 | 8K | 1432.0 | TODO | 25.25 | 35.68 | 58.3% |
 | 12K | 1421.4 | TODO | 25.19 | 52.03 | 85.7% |
 | 16K | 1412.3 | TODO | 24.91 | 56.31 | 88.5% |
-| 32K | 1393.3 | 1367.2 | 24.10 | 61.59 | 100.0% |
+| 32K | 1393.3 | 1376.7 | 24.10 | 61.59 | 100.0% |
 | 64K | 1342.7 | TODO | 23.08 | 59.67 | 100.0% |
-| 128K | 1301.6 | 1271.5 | 22.14 | 57.65 | 100.0% |
+| 128K | 1301.6 | 1286.7 | 22.14 | 57.65 | 100.0% |
 
-AR prefill falls 14.7% from d0 to d128K. MTP adds 1.9–2.4% to prefill time
+AR prefill falls 14.7% from d0 to d128K. MTP adds about 1.2% to prefill time
 at the three refreshed depths. The 1700 tok/s target and flat deep-context
 throughput remain unmet.
 
