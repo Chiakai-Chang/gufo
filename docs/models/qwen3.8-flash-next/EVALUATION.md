@@ -83,6 +83,8 @@ The affected projection checks and full batch session check pass, with exact
 logits, tokens, RNG, acceptance and residual replay at C2/C4/C6/C8.
 Fresh repetitive and mixed serving cohorts match AR completion hashes without
 cache hits.
+Short convolution/history fusion also passes the GDN operator and full batch
+session checks, including every 1–8-token rollback prefix and unused snapshots.
 
 **Open vision parity gap:** a 1024×1024 synthetic texture produces 6.47%
 embedding relative L2 error against the pinned BF16 reference, above the 5%

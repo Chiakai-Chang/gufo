@@ -67,8 +67,11 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
 - **Fusion and memory:** split repeated embedding/hidden projections instead
   of concatenating duplicate inputs. Respect full-width HC normalization.
   Reuse scratch, allocate rollback depth on demand, and avoid carrying entire
-  prefill chunks into draft catch-up. UMA still has placement costs: mapped
-  quantized weights and copied reusable audio/DiT weights behave differently.
+  prefill chunks into draft catch-up. Fuse short convolution/history saves
+  while values are in registers; require one owner per channel so another
+  token tile cannot overwrite history still being read. UMA has placement
+  costs: mapped quantized weights and copied reusable audio/DiT weights behave
+  differently.
 - **Graphs:** verify replay actually launches every new operation. Side-stream
   work during capture is not automatically included in the graph. Check the
   relevant shallow/deep dispatch boundaries and unprofiled wall time.

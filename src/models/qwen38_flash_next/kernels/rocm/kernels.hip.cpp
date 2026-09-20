@@ -1467,10 +1467,12 @@ __global__ void SsmConvKernel(const float* qkv, std::uint32_t qkv_stride,
 /// loads. Lanes run along channels, so every access is a contiguous row.
 constexpr std::uint32_t kSsmConvTaps = 4;
 constexpr std::uint32_t kSsmConvTokensPerThread = 8;
+template<bool kSaveHistory>
 __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
-                               const float* w, const float* conv_state,
+                               const float* w, float* conv_state,
                                float* out, std::uint32_t n_tokens,
-                               std::uint32_t channels) {
+                               std::uint32_t channels,
+                               RollbackRows snapshots) {
   const std::uint32_t c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= channels) {
     return;
@@ -1503,6 +1505,20 @@ __global__ void SsmConv4Kernel(const float* qkv, std::uint32_t qkv_stride,
     window[0] = window[1];
     window[1] = window[2];
     window[2] = v;
+    if constexpr (kSaveHistory) {
+      if (snapshots.rows[0] != nullptr && t + 1 < n_tokens) {
+#pragma unroll
+        for (std::uint32_t j = 0; j < kSsmConvTaps - 1; ++j)
+          snapshots.rows[t][std::size_t{j} * channels + c] = window[j];
+      }
+    }
+  }
+  if constexpr (kSaveHistory) {
+    // Only one token tile may update history: each channel then has one
+    // owner, which has already consumed all three original history values.
+#pragma unroll
+    for (std::uint32_t j = 0; j < kSsmConvTaps - 1; ++j)
+      conv_state[std::size_t{j} * channels + c] = window[j];
   }
 }
 
@@ -5355,35 +5371,44 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    __half* out_half) {
   const std::uint32_t channels = 2 * k_heads * d + v_heads * d;
   const std::size_t count = static_cast<std::size_t>(n_tokens) * channels;
+  const bool saved_history = !convolved && kernel == kSsmConvTaps &&
+                             n_tokens <= kSsmConvTokensPerThread;
   if (!convolved) {
-    if (kernel == kSsmConvTaps) {
+    if (saved_history) {
       hipLaunchKernelGGL(
-          SsmConv4Kernel,
+          SsmConv4Kernel<true>, dim3(Blocks(channels)), dim3(kThreads), 0,
+          stream, qkv, qkv_stride, conv_w, conv_state, conv_scratch, n_tokens,
+          channels, conv_snapshots);
+    } else if (kernel == kSsmConvTaps) {
+      hipLaunchKernelGGL(
+          SsmConv4Kernel<false>,
           dim3(Blocks(channels), (n_tokens + kSsmConvTokensPerThread - 1) /
                                      kSsmConvTokensPerThread),
           dim3(kThreads), 0, stream, qkv, qkv_stride, conv_w, conv_state,
-          conv_scratch, n_tokens, channels);
+          conv_scratch, n_tokens, channels, RollbackRows{});
     } else {
       hipLaunchKernelGGL(SsmConvKernel, dim3(Blocks(count)), dim3(kThreads), 0,
                          stream, qkv, qkv_stride, conv_w, conv_state,
                          conv_scratch, n_tokens, channels, kernel);
     }
   }
-  if (conv_snapshots.rows[0] != nullptr && n_tokens > 1) {
-    const std::size_t saved = static_cast<std::size_t>(n_tokens - 1) * channels;
-    hipLaunchKernelGGL(RollingSnapshotKernel,
-                       dim3(Blocks(saved * (kernel - 1))), dim3(kThreads), 0,
-                       stream, qkv, qkv_stride, conv_state, conv_snapshots,
-                       n_tokens - 1, channels, kernel - 1);
+  if (!saved_history) {
+    if (conv_snapshots.rows[0] != nullptr && n_tokens > 1) {
+      const std::size_t saved = static_cast<std::size_t>(n_tokens - 1) * channels;
+      hipLaunchKernelGGL(RollingSnapshotKernel,
+                         dim3(Blocks(saved * (kernel - 1))), dim3(kThreads), 0,
+                         stream, qkv, qkv_stride, conv_state, conv_snapshots,
+                         n_tokens - 1, channels, kernel - 1);
+    }
+    // The rolling state is the last kernel-1 projections: [history ; qkv].
+    const std::uint32_t hist = kernel - 1;
+    const std::size_t hist_count = static_cast<std::size_t>(hist) * channels;
+    hipLaunchKernelGGL(HistoryShiftKernel, dim3(Blocks(hist_count)),
+                       dim3(kThreads), 0, stream, qkv, qkv_stride, conv_state,
+                       conv_scratch + count, n_tokens, channels, hist);
+    hipLaunchKernelGGL(CopyKernel, dim3(Blocks(hist_count)), dim3(kThreads), 0,
+                       stream, conv_scratch + count, conv_state, hist_count);
   }
-  // The rolling state is the last kernel-1 projections: [history ; qkv].
-  const std::uint32_t hist = kernel - 1;
-  const std::size_t hist_count = static_cast<std::size_t>(hist) * channels;
-  hipLaunchKernelGGL(HistoryShiftKernel, dim3(Blocks(hist_count)),
-                     dim3(kThreads), 0, stream, qkv, qkv_stride, conv_state,
-                     conv_scratch + count, n_tokens, channels, hist);
-  hipLaunchKernelGGL(CopyKernel, dim3(Blocks(hist_count)), dim3(kThreads), 0,
-                     stream, conv_scratch + count, conv_state, hist_count);
   const unsigned waves = kThreads / 32;
   if (row_split && d == kGdnDim && state_snapshots.rows[0] == nullptr) {
     hipLaunchKernelGGL(GdnPrepKqKernel, dim3(k_heads, n_tokens), dim3(32), 0,
