@@ -288,6 +288,33 @@ void GatedDeltaNet(const float* qkv, std::uint32_t qkv_stride, const float* z,
                    bool convolved, float eps, hipStream_t stream,
                    __half* out_half = nullptr);
 
+/// Private rows for one request in a decode batch. Scratch regions and all
+/// recurrent/history/rollback buffers must be disjoint between requests.
+struct GdnBatchItem {
+  const float* qkv;
+  const float* z;
+  const float* alpha_beta;
+  float* conv_state;
+  float* conv_scratch;
+  float* qn;
+  float* kn;
+  float* raw;
+  float* state;
+  float* out;
+  RollbackRows state_snapshots;
+  RollbackRows conv_snapshots;
+  std::uint32_t n_tokens;
+};
+
+/// Runs the decode arithmetic for 1–8 independent requests of 1–8 rows,
+/// 128-wide heads and four convolution taps. `items` is device-accessible;
+/// inactive requests are untouched. The caller zeros their output rows.
+bool GatedDeltaNetBatch(
+    const GdnBatchItem* items, std::uint32_t count, std::uint32_t max_tokens,
+    std::uint32_t active, std::uint32_t qkv_stride, std::uint32_t z_stride,
+    const float* conv_w, const float* a, const float* dt, const float* norm_w,
+    std::uint32_t k_heads, std::uint32_t v_heads, float eps, hipStream_t stream);
+
 /// Splits the interleaved [q|gate] projection (rows `qg_stride` apart) into
 /// q [t][heads][d] and gate [t][heads*d]. With non-null `k`, the row
 /// continues with k and v (`kv_width` each), copied out contiguously.

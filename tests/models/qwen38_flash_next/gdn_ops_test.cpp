@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -278,7 +279,9 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
              std::vector<float>(saved * kConvState + kGuard, kSentinel));
       HipBuffer<float> current_state(kStateCount), current_conv(kConvState);
       HipBuffer<float> current_out(kOut);
-      auto forward = [&](std::uint32_t n, float* ss, float* cs) {
+      HipBuffer<q::GdnBatchItem> batch_items(3);
+      auto forward = [&](std::uint32_t n, float* ss, float* cs,
+                         bool batch = false) {
         q::RollbackRows states, convs;
         // Reverse the physical rows to prove that the kernel honors independent
         // prefix addresses rather than relying on a contiguous allocation.
@@ -288,6 +291,24 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
         }
         Upload(&current_state, state);
         Upload(&current_conv, conv_state);
+        if (batch) {
+          // Cancelled peers have no valid pointers. Every batch stage must
+          // skip them before reading or mutating any request-local state.
+          std::array<q::GdnBatchItem, 3> items{};
+          items[1] = {d_qkv.get(), d_z.get(), d_alpha_beta.get(),
+                      current_conv.get(), d_scratch.get(), d_qn.get(),
+                      d_kn.get(), d_raw.get(), current_state.get(),
+                      current_out.get(), states, convs, n};
+          CheckHip(hipMemcpy(batch_items.get(), items.data(),
+                             batch_items.bytes(), hipMemcpyHostToDevice),
+                   "batch descriptors");
+          if (!q::GatedDeltaNetBatch(
+                  batch_items.get(), items.size(), kTokens, 2U, kChannels, kZ,
+                  d_conv_w.get(), d_a.get(), d_dt.get(), d_norm_w.get(),
+                  kKHeads, kVHeads, kEps, nullptr))
+            throw std::runtime_error("GDN batch launch failed");
+          return;
+        }
         q::GatedDeltaNet(d_qkv.get(), kChannels, d_z.get(), kZ,
                          d_alpha_beta.get(), d_conv_w.get(), d_a.get(),
                          d_dt.get(), d_norm_w.get(), current_conv.get(),
@@ -308,6 +329,17 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
           std::memcmp(final_out.data(), outs[0].data(), kOut * sizeof(float))) {
         throw std::runtime_error("GDN snapshots changed the full forward");
       }
+      forward(kTokens, state_snaps.get(), conv_snaps.get(), true);
+      const auto exact = [](const auto& a, const auto& b) {
+        return a.size() == b.size() &&
+               std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+      };
+      if (!exact(Download(&current_state, kStateCount), final_state) ||
+          !exact(Download(&current_out, kOut), final_out) ||
+          !exact(Download(&state_snaps, saved * kStateCount + kGuard),
+                 saved_states) ||
+          !exact(Download(&conv_snaps, saved * kConvState + kGuard), saved_convs))
+        throw std::runtime_error("GDN batch changed output or rollback state");
       for (std::size_t i = 0; i < kGuard; ++i) {
         if (saved_states[saved * kStateCount + i] != kSentinel ||
             saved_convs[saved * kConvState + i] != kSentinel) {
@@ -315,7 +347,7 @@ int RunCase(std::uint32_t kTokens, bool extreme_gates = false) {
         }
       }
       for (std::uint32_t keep = 1; keep < kTokens; ++keep) {
-        forward(keep, nullptr, nullptr);
+        forward(keep, nullptr, nullptr, true);
         const auto expected_state = Download(&current_state, kStateCount);
         const auto expected_conv = Download(&current_conv, kConvState);
         if (std::memcmp(expected_state.data(),

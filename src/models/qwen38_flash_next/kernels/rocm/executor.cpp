@@ -261,6 +261,7 @@ Executor::~Executor() {
   }
   (void)hipFree(batch_logits_);
   (void)hipFree(batch_q8_);
+  (void)hipHostFree(batch_gdn_host_);
   (void)hipHostFree(batch_controls_);
   (void)hipHostFree(batch_candidates_host_);
   for (void* p : allocations_) {

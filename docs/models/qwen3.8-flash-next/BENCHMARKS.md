@@ -58,18 +58,18 @@ uses `repetition_word` for repetition and distinct requests cycling through
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 25.24 | 64.72 | 25.12 | 42.42 |
-| 2 | 38.60 | 80.88 | 36.25 | 56.35 |
-| 4 | 53.09 | 94.33 | 48.41 | 68.48 |
-| 6 | 60.68 | 98.06 | 54.51 | 74.23 |
-| 8 | 65.17 | 101.70 | 58.45 | 79.82 |
+| 1 | 25.24 | 65.35 | 25.12 | 42.52 |
+| 2 | 38.60 | 82.96 | 36.25 | 55.43 |
+| 4 | 53.09 | 95.14 | 48.41 | 69.90 |
+| 6 | 60.68 | 98.43 | 54.51 | 72.11 |
+| 8 | 65.17 | 102.51 | 58.45 | 74.33 |
 
-MTP acceptance is 100% on repetition and 76.7–84.9% on the mixed cohorts.
+MTP acceptance is 100% on repetition and 73.5–84.0% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
 Greedy timing-based depth choices can vary between runs.
 
 **C1 is a single user.** The HTTP and raw CLI prompts above differ. With the
-repetitive chat prompt, HTTP C1 decode alone is 80.27 tok/s; the table includes
+repetitive chat prompt, HTTP C1 decode alone is 80.42 tok/s; the table includes
 prefill and scheduling. Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
 

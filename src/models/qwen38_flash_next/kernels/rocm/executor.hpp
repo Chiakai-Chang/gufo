@@ -489,6 +489,10 @@ private:
   mutable void* batch_q8_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};
   mutable MtpCandidateLogits* batch_candidates_host_{nullptr};
+  // Mapped descriptors, one slice per layer: GPU reads cannot race the host
+  // preparing the next layer. ForwardBatch drains before reusing this table.
+  mutable GdnBatchItem* batch_gdn_host_{nullptr};
+  mutable GdnBatchItem* batch_gdn_{nullptr};
   mutable std::uint32_t batch_rows_{0};
   mutable const float* selected_logits_{nullptr};
   [[nodiscard]] const float* VerificationLogits() const {

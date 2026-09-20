@@ -85,6 +85,10 @@ Fresh repetitive and mixed serving cohorts match AR completion hashes without
 cache hits.
 Short convolution/history fusion also passes the GDN operator and full batch
 session checks, including every 1–8-token rollback prefix and unused snapshots.
+GDN batching retains these results byte for byte, including ragged row counts
+and cancelled descriptors with null pointers. The full session check also
+passes with mapped descriptors: independent state, image restoration, sampled
+acceptance/residual correction and RNG replay at C2/C4/C6/C8.
 
 **Open vision parity gap:** a 1024×1024 synthetic texture produces 6.47%
 embedding relative L2 error against the pinned BF16 reference, above the 5%

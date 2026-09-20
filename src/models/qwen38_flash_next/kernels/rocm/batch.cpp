@@ -554,6 +554,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
   std::array<bool, kBatchSessions> sparse{};
   std::array<std::uint32_t, kBatchSessions> complete{};
   std::uint32_t rows = 0;
+  std::uint32_t max_tokens = 0;
   for (std::size_t i = 0; i < items.size(); ++i) {
     const auto& item = items[i];
     if (item.session == nullptr || item.session->owner_ != this ||
@@ -576,6 +577,8 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
     }
     offsets[i] = rows;
     rows += static_cast<std::uint32_t>(item.tokens.size());
+    max_tokens = std::max(max_tokens,
+                          static_cast<std::uint32_t>(item.tokens.size()));
     const auto end = item.session->position_ + item.tokens.size();
     sparse[i] = c.compress_ratio > 0 && end > c.indexer_top_k;
     complete[i] = c.compress_ratio > 0 ? end / c.compress_ratio : 0;
@@ -598,6 +601,20 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
                            kBatchSessions * sizeof(Session::Control)),
              error)) {
     return false;
+  }
+  const bool batch_gdn = items.size() > 1 && c.ssm_head_dim == 128 &&
+                         c.ssm_conv_kernel == 4;
+  if (batch_gdn) {
+    const std::size_t bytes =
+        std::size_t{c.num_layers} * kBatchSessions * sizeof(GdnBatchItem);
+    if ((batch_gdn_host_ == nullptr &&
+         !Check(hipHostMalloc(&batch_gdn_host_, bytes, hipHostMallocMapped),
+                error)) ||
+        (batch_gdn_ == nullptr &&
+         !Check(hipHostGetDevicePointer(
+                    reinterpret_cast<void**>(&batch_gdn_), batch_gdn_host_, 0),
+                error)))
+      return false;
   }
   if (ple_pending_ && !WaitPle(error)) {
     return false;
@@ -716,6 +733,7 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
           return false;
         }
       }
+      std::uint32_t gdn_active = 0;
       for (std::size_t i = 0; i < items.size(); ++i) {
         const auto& item = items[i];
         auto& session = *item.session;
@@ -737,8 +755,24 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
           continue;
         }
         if (l.linear) {
-          if (!LinearAttention(l, session.linear_[il], s_.mixed, s_.block_out,
-                               n, item.speculative, error, true, false)) {
+          if (batch_gdn) {
+            const auto& state = session.linear_[il];
+            batch_gdn_host_[il * kBatchSessions + i] = {
+                l.ssm_in.empty() ? view.qkv : view.qkvz,
+                l.ssm_in.empty() ? view.z : view.qkvz + c.SsmConvChannels(),
+                view.alpha_beta,
+                state.conv_state,
+                // Short convolution saves history in registers, so each
+                // request needs only its own token rows of staging.
+                base.conv_scratch +
+                    std::size_t{offsets[i]} * c.SsmConvChannels(),
+                view.qn, view.kn, view.gdn_raw, state.state, view.gdn_out,
+                item.speculative ? state.state_snapshots : RollbackRows{},
+                item.speculative ? state.conv_snapshots : RollbackRows{}, n};
+            gdn_active |= 1U << i;
+          } else if (!LinearAttention(l, session.linear_[il], s_.mixed,
+                                      s_.block_out, n, item.speculative, error,
+                                      true, false)) {
             return false;
           }
         } else {
@@ -752,6 +786,17 @@ bool Executor::ForwardBatch(std::span<const BatchItem> items,
             return false;
           }
         }
+      }
+      if (l.linear && batch_gdn && gdn_active != 0) {
+        const auto offset = il * kBatchSessions;
+        if (!GatedDeltaNetBatch(
+                batch_gdn_ + offset, items.size(), max_tokens, gdn_active,
+                l.ssm_in.empty() ? c.SsmConvChannels() : l.ssm_in.rows,
+                l.ssm_in.empty() ? c.SsmValueDim() : l.ssm_in.rows,
+                l.ssm_conv1d.f32(), l.ssm_a.f32(), l.ssm_dt.f32(),
+                l.ssm_norm.f32(), c.ssm_num_k_heads, c.ssm_num_v_heads,
+                c.rms_eps, stream_))
+          return Fail(error, "batched GatedDeltaNet launch failed");
       }
       UseScratch(base);
       if (!DenseBatch(l.linear ? l.ssm_out : l.attn_out,

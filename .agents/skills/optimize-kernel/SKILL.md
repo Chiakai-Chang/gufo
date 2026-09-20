@@ -49,6 +49,9 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   request rows. Tune real ragged shapes, including 3–8 rows and partial tiles.
   Batch the complete draft transformer body, not only the vocabulary head;
   keep each request's KV, recurrence, acceptance and RNG state independent.
+  A request dimension in GDN's grid reduced launch overhead for shallow
+  verification. Use disjoint scratch and rollback pointers, skip cancelled
+  rows before touching state, and keep descriptor storage alive until completion.
   Test both shared and disjoint expert routing: weight reuse benefits shared
   experts, but single-request experts need a compact path.
   Exact packed-integer transforms can help both: spreading Q5 high-bit
