@@ -107,7 +107,7 @@ Controller and verification details: [evaluation](EVALUATION.md).
 ## Reproduce and maintain quality
 
 The shared image encoder, measured separately on 2026-09-20 with
-`mmproj-BF16.gguf`, takes **1297 ms** for a 1024×1024 RGB image (1024 merged
+`mmproj-BF16.gguf`, takes **1252 ms** for a 1024×1024 RGB image (1024 merged
 tokens). This is a warm encode, excluding image preprocessing, first weight
 upload and language-model prefill. Q4 and Q8 use the same projector. Embeddings
 are byte-identical to the prior encoder; see [experiments](EXPERIMENTS.md).

@@ -9,6 +9,7 @@
 | Long-context KV packing | Retained in idle FFN scratch with bounded head groups; exact attention output/log-sum-exp, cache bytes unchanged. |
 | BF16 target projection reduction | Fixed per-row FP32 order retained for chunk/cache/continued-image equivalence. |
 | Register-cached vision softmax | Retained; byte-identical embeddings with the shared Q4/Q8 projector, unchanged reduction order and memory allocation. |
+| 4096-patch vision attention tiles | Retained; byte-identical full embeddings, lower latency and 24 MiB less attention scratch. |
 | Alternate tiles/waves/pipeline depths (2026-09-19) | Rejected: no release throughput improvement. |
 | Dynamic verification chunk/controller alternatives | No new default retained; seeded private-acceptance policy remains. |
 

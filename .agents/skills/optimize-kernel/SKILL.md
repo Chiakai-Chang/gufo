@@ -67,6 +67,9 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   context. Preserve tie ordering and FP32 ranking. Pack existing KV bytes into
   bounded scratch/head groups without changing persistent precision. Do not
   change softmax reduction order without the model's numerical qualification.
+  Smaller vision attention tiles saved scratch and time at 4096 patches;
+  ragged BLAS tails changed rounding. Qualify complete GEMM/encoder outputs
+  and specialize only the shapes that retain both quality and speed.
 - **Fusion and memory:** split repeated embedding/hidden projections instead
   of concatenating duplicate inputs. Respect full-width HC normalization.
   Reuse scratch, allocate rollback depth on demand, and avoid carrying entire

@@ -89,6 +89,10 @@ GDN batching retains these results byte for byte, including ragged row counts
 and cancelled descriptors with null pointers. The full session check also
 passes with mapped descriptors: independent state, image restoration, sampled
 acceptance/residual correction and RNG replay at C2/C4/C6/C8.
+The 4096-patch vision attention specialization matches every QK/PV FP32
+GEMM result for two independent inputs and complete Flash-Next/Qwen27B
+1024×1024 embeddings byte for byte. A 736×736 ragged control also matches;
+other patch counts keep their previous tile shapes.
 
 **Open vision parity gap:** a 1024×1024 synthetic texture produces 6.47%
 embedding relative L2 error against the pinned BF16 reference, above the 5%

@@ -82,4 +82,7 @@ previous encoder and reproduce exactly across runs.
 | RGB image | Merged image tokens | Encode latency |
 | --- | ---: | ---: |
 | 256×256 | 64 | 21.3 ms |
-| 1024×1024 | 1024 | 1276 ms |
+| 1024×1024 | 1024 | 1249 ms |
+
+The 4096-patch attention specialization saves 24 MiB of score/probability
+scratch. Other image shapes retain their original tile layout.

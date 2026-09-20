@@ -29,7 +29,6 @@ constexpr unsigned kFfn = 4304;
 constexpr unsigned kMergeHidden = kHidden * 4;
 constexpr unsigned kPatchDim = 3 * 2 * 16 * 16;
 constexpr unsigned kThreads = 256;
-constexpr unsigned kAttentionTile = 128;
 
 void Check(hipError_t error) {
   if (error != hipSuccess)
@@ -591,7 +590,10 @@ std::shared_ptr<const Encoder::Embedding> Encoder::Encode(
                         sizeof(Bf16));
   Allocation qkv(std::size_t{3} * count * kHidden * sizeof(Bf16));
   Allocation attention(std::size_t{count} * kHidden * sizeof(Bf16));
-  const unsigned tile = std::min(count, kAttentionTile);
+  // Smaller attention tiles reduce scratch traffic for the 4096-patch
+  // shape while preserving its BLAS reductions. Ragged tails require
+  // their existing GEMM shapes to preserve rounding.
+  const unsigned tile = std::min(count, count == 4096 ? 64U : 128U);
   Allocation scores(std::size_t{kHeads} * tile * count * sizeof(float));
   Allocation probabilities(std::size_t{kHeads} * tile * count * sizeof(Bf16));
   Allocation output_tile(std::size_t{tile} * kHidden * sizeof(float));
