@@ -21,6 +21,7 @@
 | Wider Q8 decode and Q5 expert tiles | Rejected: exact output, but 33–64 dense rows and 16/32 expert rows were slower on representative shared/distinct/mixed work. |
 | Compact expert launch groups | Rejected: improved shared routing but negligible mixed-routing gain. |
 | Sparse attention register/cache retuning | Rejected: exact d128K output, but register scheduling/occupancy gave no material gain and reloading queries was slower. |
+| FP32 selector load scheduling | Retained; bounded scheduling removes scalar-register spills, preserves every score bit and lowers d32K selection time to 22.4 ms per pp2048. Matched d128K AR prefill improves about 1.5%. |
 | Integer WMMA value transpose and paired FP32 selector lanes | Rejected: bit-preserving transpose and exact selector scores, but both were slower on deep-context inputs. |
 | Packed Q8 prefill staging | Rejected: exact output, but extra decode/register/transpose costs outweighed reduced LDS use. |
 | Transient F16 SSM weights and parallel HC branches | Rejected: F16 staging was exact but slower overall; parallel HC branches changed quantization ties. |

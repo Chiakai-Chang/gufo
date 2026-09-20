@@ -76,6 +76,10 @@ Current optimization qualification (2026-09-20):
   products, FMA chain and reduction order. Complete FP32 outputs match through
   32 input rows, including partial input waves and output matrices with
   2,561/12,289/65,537 rows.
+- Selector load scheduling preserves exact FP32 scores and top-k masks through
+  d128K, including ties, tight strides and replay. Independent FP64 score
+  error remains below 1e-5; full prefill logits match across chunk boundaries
+  through 4096 tokens.
 - Full `--batch-only` checks retain exact logits, tokens, acceptance, residual
   draws and RNG at C2/C4/C6/C8, with independent state, every 1–8-token rollback
   prefix, cancellation/recovery and image restoration.

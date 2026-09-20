@@ -75,6 +75,9 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   `tools/prof/isa_mix.py`; occupancy alone is not the optimization objective.
   For wide register-cached softmax, a scheduling barrier after each exponential
   removed spills while preserving the sum order. Cache only bounded row sizes.
+  FP32 selector queries also benefited from bounded load scheduling: grouping
+  16 dot-product chains removed scalar-register spills without changing scores.
+  Verify generated register use and full-model time; barriers elsewhere lost.
 - **Attention and selection:** exact partial top-k can avoid sorting the full
   context. Preserve tie ordering and FP32 ranking. Pack existing KV bytes into
   bounded scratch/head groups without changing persistent precision. Do not

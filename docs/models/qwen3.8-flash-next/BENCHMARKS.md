@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next on Strix Halo
 
 Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Production builds with the
-pinned Nix toolchain. CLI/AR measurements: 2026-09-19; MTP serving and vision:
-2026-09-20. One repetition per point; repetitive C2 was repeated to check
-scheduling variance.
+pinned Nix toolchain. PP at d0/d32K/d128K, MTP serving and vision: 2026-09-20;
+other CLI/AR measurements: 2026-09-19. One repetition per point; repetitive C2
+was repeated to check scheduling variance.
 Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
 revision `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
@@ -22,17 +22,18 @@ predictor catch-up through all known successor tokens.
 
 | Depth | AR pp2048 | MTP pp2048 | AR tg128 | MTP tg128 | MTP acceptance |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1525.9 | 1473.2 | 26.33 | 42.74 | 70.0% |
+| 0 | 1523.4 | 1465.4 | 26.33 | 42.74 | 70.0% |
 | 4K | 1455.1 | 1399.4 | 25.48 | 40.35 | 65.6% |
 | 8K | 1432.0 | 1374.4 | 25.25 | 35.68 | 58.3% |
 | 12K | 1421.4 | 1362.2 | 25.19 | 52.03 | 85.7% |
 | 16K | 1412.3 | 1352.8 | 24.91 | 56.31 | 88.5% |
-| 32K | 1390.1 | 1328.2 | 24.10 | 61.59 | 100.0% |
+| 32K | 1396.9 | 1337.2 | 24.10 | 61.59 | 100.0% |
 | 64K | 1342.7 | 1282.1 | 23.08 | 59.67 | 100.0% |
-| 128K | 1282.2 | 1225.4 | 22.14 | 57.65 | 100.0% |
+| 128K | 1304.8 | 1242.1 | 22.14 | 57.65 | 100.0% |
 
-AR prefill falls 16.0% from d0 to d128K. The 1700 tok/s target and flat
-deep-context throughput remain unmet.
+AR prefill falls 14.3% from d0 to d128K. MTP adds 4.0–5.0% to prefill time
+at the three refreshed depths. The 1700 tok/s target and flat deep-context
+throughput remain unmet.
 
 ```sh
 ./result/bin/gufo bench --model "$MODEL" -p 2048 -n 128 \

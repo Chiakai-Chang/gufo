@@ -1850,6 +1850,10 @@ __global__ void SelectScoreKernel(const float* q, const __half* blocks,
       for (unsigned i = 0; i < 4; ++i)
         dot = fmaf(query[lane + i * 32], key[lane + i * 32], dot);
       partial[lane] = dot;
+      // Bound query-load hoisting: keeping all 128 scalar values live spills
+      // registers on gfx1151. Scheduling groups retain every FMA and sum.
+      if ((lane + 1) % 16 == 0)
+        __builtin_amdgcn_sched_barrier(0);
     }
 #pragma unroll
     for (unsigned delta = 16; delta; delta >>= 1) {
