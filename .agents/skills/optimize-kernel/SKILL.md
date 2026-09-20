@@ -13,7 +13,7 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
 
 ## Fast experiment loop
 
-1. Keep baseline and candidate production binaries. Use `nix build`, or the
+1. Keep baseline and candidate production binaries/objects. Use `nix build`, or the
    `release` CMake preset with the same compiler/dependency versions. Test
    binaries keep assertions and are for correctness, not headline timings.
 2. Start with one affected shape and one control. Use pp2048/tg128 for retained
@@ -22,6 +22,8 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
 3. Profile separately with `tools/prof/prof.py`; compare stage totals, launch
    counts, GPU-busy time and wall span. Inspect allocator, synchronization,
    sampling and cache I/O when GPU time does not explain latency.
+   Exclude model loading from request-time GPU utilization: a server trace here
+   looked 18% busy overall but was 87% busy during inference.
    Warm each batch shape before calibration: large lazy allocations caused
    100 ms stalls here. Use a median complete cycle when timings remain noisy.
 4. Change one mechanism, compile the affected target, then run its existing
@@ -73,7 +75,7 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
 - **Wave mode and compiler:** selected quantized kernels need wave64 while
   other paths use wave32. Match helper/caller wave modes per translation unit.
   One wave64 helped batched Q4 gate/up while preserving separate 32-lane
-  reductions; wider output tiles then lost on disjoint and mixed routing.
+  reductions; Q5 down, wider output tiles and 16-input Q4 groups were slower.
   Iterative ILP scheduling helped selected 16-row Q4/Q5 kernels; applying it
   globally was not a win. Inspect VGPR/LDS/private scratch and ISA with
   `tools/prof/isa_mix.py`; occupancy alone is not the optimization objective.

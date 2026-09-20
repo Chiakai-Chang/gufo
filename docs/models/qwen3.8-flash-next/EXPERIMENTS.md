@@ -12,14 +12,14 @@
 | Short convolution/history fusion | Retained for 1–8 tokens; exact output, rolling state and rollback snapshots, fewer launches and no additional allocation. |
 | Batched GDN recurrence | Retained; private ragged state/rollback rows, cancellation isolation and exact session replay. Helps shallow batches most; end-to-end gains are modest. |
 | Batched small projections and MoE preparation | Retained; group independent rows, quantize activations once in existing scratch, and batch router/shared-expert work. Exact scalar/batch outputs and sampled state; C1 unchanged. |
-| Q4 expert grouping across the full batch | Retained; bounded groups share weights across request boundaries, with original scalar arithmetic and exact session replay. Q5 down grouping was slower on mixed routing and was rejected. |
-| Wave64 batched Q4 gate/up | Retained above eight rows; independent 32-lane reductions preserve exact outputs and sampled state. Repetitive serving improves, C1 remains stable. Four output rows per block were slower on mixed/disjoint routing. |
+| Q4 expert grouping across the full batch | Retained; bounded groups share weights across request boundaries, with original scalar arithmetic and exact session replay. Q5 down grouping/reordering was slower on mixed routing and was rejected. |
+| Wave64 batched Q4 gate/up | Retained above eight rows; independent 32-lane reductions preserve exact outputs and sampled state. Repetitive serving improves, C1 remains stable. Four output rows, 16-input groups and replacing the slot scan did not improve performance. |
 | Register-cached vision softmax | Retained for bounded row sizes; unchanged reduction order, byte-identical Flash-Next/Qwen27B embeddings, no additional allocation. |
 | 4096-patch vision attention tiles | Retained; byte-identical GEMMs/embeddings, lower latency and 24 MiB less attention scratch. Other shapes keep their original tiles. |
 | Partitioned BF16 WMMA vision value projection | Rejected: failed the full-encoder reference gate despite lower isolated FP64 error. |
 | Integer WMMA Q8 verification | Retained through 48 input rows for wide target projections/heads; preserves K8 partials/FMA order and reduces each result once, with exact session replay. Small batches retain vector kernels. |
 | Q8 activation reuse across output rows | Rejected: no repeatable gain on the real projection shapes. |
-| Wider Q8 decode and Q5 expert tiles | Rejected: 56–64 dense rows, phased/packed token tiles and 16/32 Q5 expert rows were slower despite exact output. |
+| Wider Q8 decode and Q5 expert tiles | Rejected: 56–64 dense rows, phased/packed token tiles, Q5 wave64 and 16/32 Q5 expert rows were slower despite exact output. |
 | Compact expert launch groups | Rejected: improved shared routing but negligible mixed-routing gain. |
 | Sparse attention register/cache retuning | Rejected: exact d128K output, but register scheduling/occupancy gave no material gain and reloading queries was slower. |
 | Shared attention selection lists | Rejected: exact outputs, but roughly 1% isolated gain did not justify another buffer and setup kernel. |
@@ -44,8 +44,9 @@
 | More Q8 vocabulary rows/block | Rejected: no C1 improvement. |
 
 Separate d32K pp2048 profiling attributes 29.1% of kernel time to MoE, 34.9%
-to dense projections and 12.6% to attention/indexing. A C4 mixed MTP trace is
-80.7% GPU-busy; MoE/MMQ is 51.3% and dense projections 36.1% of kernel time.
+to dense projections and 12.6% to attention/indexing. A C4 mixed MTP trace with
+64 output tokens is 86.9% GPU-busy during inference; MoE/MMQ is 50.3% and dense
+projections 36.0% of kernel time. The inference window excludes model loading.
 These are profile observations, not unprofiled throughput measurements.
 
 Next: improve prefill at depth and target/draft batch projection reuse while

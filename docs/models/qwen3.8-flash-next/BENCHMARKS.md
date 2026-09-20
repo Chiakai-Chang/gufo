@@ -63,7 +63,7 @@ uses `repetition_word` for repetition and distinct requests cycling through
 | 2 | 38.60 | 91.42 | 36.25 | 57.11 |
 | 4 | 53.09 | 118.80 | 48.41 | 73.51 |
 | 6 | 60.68 | 126.58 | 54.51 | 83.18 |
-| 8 | 65.17 | 129.46 | 58.45 | 90.30 |
+| 8 | 65.17 | 128.83 | 58.45 | 90.30 |
 
 MTP acceptance is 100% on repetition and 72.3–84.9% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
@@ -73,7 +73,7 @@ Greedy timing-based depth choices can vary between runs.
 repetitive chat prompt, HTTP C1 decode alone is 80.56 tok/s; the table includes
 prefill and scheduling. Compare identical prompts and timing boundaries.
 `gufo bench` is C1; use `tools/serving/gufo-serving-bench.py` for concurrency.
-Summing the individual repetitive decode rates gives 117.3/162.9/175.8/180.8
+Summing the individual repetitive decode rates gives 117.3/162.9/175.8/180.2
 tok/s at C2/C4/C6/C8. These exclude waiting and prefill; the table reports
 whole-cohort output throughput.
 
