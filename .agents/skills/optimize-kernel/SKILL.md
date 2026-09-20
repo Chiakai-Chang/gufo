@@ -57,6 +57,9 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   Group independent small projections in the launch grid and quantize batch
   activations once in idle prefill scratch. Preserve each row's original
   dot-product specialization; larger generic GEMV tiles can be slower.
+  For Q4 experts, grouping across the full batch improved weight reuse.
+  A bounded grid can consume a compact device list without downloading its
+  count. Qualify disjoint routing too; the same approach slowed Q5 mixed work.
   Exact packed-integer transforms can help both: spreading Q5 high-bit
   nibbles with multiply/mask removed shifts without changing dequantization.
 - **Wave mode and compiler:** selected quantized kernels need wave64 while
@@ -92,6 +95,9 @@ paths agreeing does not prove upstream parity. Compare matched token histories
 and find the first changed layer if logits drift. Never relax tolerances or
 replace goldens to accept a speedup. Test finite outputs and awkward tails
 (e.g. 1/8/9/32/33 rows), not only aligned shapes.
+Moving FP32 expressions into a device helper changed contraction here.
+Capture the first failing operator's inputs for a small replay; include
+unsaturated activations, since large synthetic values can hide the difference.
 
 For state or speculative changes, cover greedy output, sampled p/q rejection
 and residual correction, seeded replay, EOS, multi-turn continuation and

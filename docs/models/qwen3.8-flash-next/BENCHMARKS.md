@@ -2,7 +2,7 @@
 
 Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Production builds with the
 pinned Nix toolchain. CLI/AR measurements: 2026-09-19; MTP serving and vision:
-2026-09-20. One repetition per point.
+2026-09-20. One repetition per point; C4 mixed MTP has two controls.
 Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
 revision `38bb39ee97821de2c9009abb7e93950eec396e66`, `UD-Q4_K_XL` (four shards).
 MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the same revision.
@@ -58,13 +58,13 @@ uses `repetition_word` for repetition and distinct requests cycling through
 
 | Users | AR repetitive | MTP repetitive | AR mixed | MTP mixed |
 | ---: | ---: | ---: | ---: | ---: |
-| 1 | 25.24 | 65.32 | 25.12 | 42.56 |
-| 2 | 38.60 | 85.06 | 36.25 | 56.87 |
-| 4 | 53.09 | 98.14 | 48.41 | 71.92 |
-| 6 | 60.68 | 103.08 | 54.51 | 72.90 |
-| 8 | 65.17 | 106.96 | 58.45 | 78.93 |
+| 1 | 25.24 | 65.37 | 25.12 | 42.50 |
+| 2 | 38.60 | 87.14 | 36.25 | 57.08 |
+| 4 | 53.09 | 110.76 | 48.41 | 69.4–71.5 |
+| 6 | 60.68 | 116.09 | 54.51 | 79.01 |
+| 8 | 65.17 | 119.97 | 58.45 | 83.93 |
 
-MTP acceptance is 100% on repetition and 76.7–84.1% on the mixed cohorts.
+MTP acceptance is 100% on repetition and 72.1–82.5% on the mixed cohorts.
 Every completion matches AR; all cohorts report zero cache hits.
 Greedy timing-based depth choices can vary between runs.
 

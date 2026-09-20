@@ -94,6 +94,11 @@ that session check. Projection coverage includes up to 64 independent rows,
 ragged tails and exact scalar/batch FP32 output; activation staging reuses
 existing scratch. All ten fresh C1/C2/C4/C6/C8 repetitive/mixed cohorts match
 AR completion hashes with zero cache hits.
+Q4 expert grouping across the complete batch retains those results. The
+routed-vector check covers 64 input/640 down rows, mixed activation scales,
+duplicate and inactive experts, nonfinite scales and output guards. A captured
+model input additionally checks FP32 contraction; full C2/C4/C6/C8 session
+logits, sampled acceptance/residual draws and RNG remain exact.
 The 4096-patch vision attention specialization matches every QK/PV FP32
 GEMM result for two independent inputs and complete Flash-Next/Qwen27B
 1024×1024 embeddings byte for byte. A 736×736 ragged control also matches;

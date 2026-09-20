@@ -382,12 +382,14 @@ static int moe_vector_projection(int weight_type, const void* W,
             n_experts);
     return -1;
   }
-  if (gated && (n_tokens > MMVQ_MAX_BATCH_SIZE || n_expert_used > 32 ||
+  const int max_gated_rows = type == GGML_TYPE_Q4_K
+                                 ? MMVQ_MAX_ROUTED_BATCH
+                                 : MMVQ_MAX_BATCH_SIZE;
+  if (gated && (n_tokens > max_gated_rows || n_expert_used > 32 ||
                 (type != GGML_TYPE_Q4_K && type != GGML_TYPE_Q5_K &&
                  type != GGML_TYPE_Q8_0))) {
     fprintf(stderr,
-            "%s: gated vector requires 1–8 Q4_K/Q5_K/Q8_0 tokens and "
-            "at most 32 selected experts\n",
+            "%s: gated vector exceeds its format's row or expert limit\n",
             tag);
     return -1;
   }
@@ -404,7 +406,11 @@ static int moe_vector_projection(int weight_type, const void* W,
       (size_t)n_tokens * ne10_padded * sizeof(block_q8_1) / QK8_1;
   const size_t group_bytes =
       gated && n_tokens > 1
-          ? size_t(n_tokens) * n_expert_used * (n_tokens + 1) * sizeof(int32_t)
+          ? (n_tokens > MMVQ_MAX_BATCH_SIZE
+                 ? sizeof(int32_t) +
+                       size_t(n_tokens) * n_expert_used * sizeof(MoeBatchGroup)
+                 : size_t(n_tokens) * n_expert_used * (n_tokens + 1) *
+                       sizeof(int32_t))
           : 0;
   ggml_hip_pool_alloc<char> src1_q8_1_pool;
   src1_q8_1_pool.alloc(ctx->pool(), nbytes_q8_1 + group_bytes);
@@ -423,6 +429,10 @@ static int moe_vector_projection(int weight_type, const void* W,
 
   const int input_stride = ne10_padded / QK8_1;
   if (gated) {
+    if (n_tokens > MMVQ_MAX_BATCH_SIZE &&
+        hipMemsetAsync(src1_q8_1_ptr + nbytes_q8_1, 0, sizeof(int32_t),
+                       stream) != hipSuccess)
+      return -2;
     mul_mat_vec_moe_gated(
         W, W_b, type, reinterpret_cast<const block_q8_1*>(src1_q8_1_ptr), ids,
         reinterpret_cast<int32_t*>(src1_q8_1_ptr + nbytes_q8_1), out_f32, K, M,

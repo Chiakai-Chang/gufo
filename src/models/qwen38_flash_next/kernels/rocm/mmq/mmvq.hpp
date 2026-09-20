@@ -2,6 +2,16 @@
 #include "common.hpp"
 
 constexpr int MMVQ_MAX_BATCH_SIZE = 8;
+constexpr int MMVQ_MAX_ROUTED_BATCH = 64;
+
+// One expert's independent inputs, in groups of eight. The anchor also
+// identifies an inactive slot that must be zeroed.
+struct MoeBatchGroup {
+  int expert;
+  int anchor;
+  int token[MMVQ_MAX_BATCH_SIZE];
+  uint32_t slots[MMVQ_MAX_BATCH_SIZE];
+};
 
 // Tuned routed-vector batch limits for gfx1151.
 constexpr __host__ __device__ int mmvq_moe_max_batch(ggml_type type) {

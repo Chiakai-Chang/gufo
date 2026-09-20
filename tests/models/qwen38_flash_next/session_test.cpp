@@ -432,7 +432,9 @@ void CheckBatchedSessions(const std::shared_ptr<qfn::Model>& model) {
                                batched[i]->Tokens().end()),
                 "batched decode tokens, RNG or acceptance differ");
         RequireExact(serial[i]->Logits(), batched[i]->Logits(),
-                     "batched MTP frontier differs");
+                     "batched MTP frontier differs at C" +
+                         std::to_string(width) + " row " + std::to_string(i) +
+                         " cycle " + std::to_string(cycle));
         Require(std::equal(serial_samplers[i].history().begin(),
                            serial_samplers[i].history().end(),
                            batch_samplers[i].history().begin(),
