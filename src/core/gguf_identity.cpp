@@ -10,6 +10,8 @@
 #include <cerrno>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -123,6 +125,73 @@ void StoreDigest(int directory, const std::string& key,
   (void)unlinkat(directory, temp.c_str(), 0);
 }
 
+void HashFile(crypto::Sha256Hasher& hash, int fd, std::size_t size) {
+  constexpr std::size_t kChunk = 8 * 1024 * 1024;
+  constexpr std::size_t kAlignment = 4096;
+  constexpr std::size_t kReaders = 4;
+  // Preserve the open inode and avoid filling the remaining UMA with a second
+  // copy of weights after GPU loading. Hashing stays in exact file order.
+  FileDescriptor direct(
+      size >= kChunk ? open(("/proc/self/fd/" + std::to_string(fd)).c_str(),
+                            O_RDONLY | O_CLOEXEC | O_DIRECT)
+                     : -1);
+  struct Slot {
+    std::unique_ptr<std::uint8_t, decltype(&std::free)> buffer{nullptr,
+                                                               std::free};
+    std::future<void> read;
+    std::size_t size{0};
+  };
+  std::array<Slot, kReaders> slots;
+  std::size_t next = 0;
+  const auto queue = [&](Slot& slot) {
+    if (next == size)
+      return;
+    if (!slot.buffer) {
+      slot.buffer.reset(
+          static_cast<std::uint8_t*>(std::aligned_alloc(kAlignment, kChunk)));
+      if (!slot.buffer)
+        throw std::bad_alloc();
+    }
+    const auto offset = next;
+    slot.size = std::min(kChunk, size - next);
+    next += slot.size;
+    slot.read = std::async(std::launch::async, [&, offset] {
+      std::size_t done = 0;
+      bool buffered = direct.get() < 0;
+      while (done < slot.size) {
+        const auto remaining = slot.size - done;
+        const auto requested =
+            buffered ? remaining
+                     : (remaining + kAlignment - 1) / kAlignment * kAlignment;
+        const auto count =
+            pread(buffered ? fd : direct.get(), slot.buffer.get() + done,
+                  requested, static_cast<off_t>(offset + done));
+        if (count < 0 && errno == EINTR)
+          continue;
+        if (count < 0 && !buffered &&
+            (errno == EINVAL || errno == EOPNOTSUPP)) {
+          buffered = true;
+          continue;
+        }
+        if (count <= 0)
+          throw std::runtime_error("cannot read complete GGUF for identity");
+        done += std::min(static_cast<std::size_t>(count), remaining);
+        if (done % kAlignment != 0)
+          buffered = true;
+      }
+    });
+  };
+  for (auto& slot : slots)
+    queue(slot);
+  for (std::size_t index = 0; slots[index].read.valid();
+       index = (index + 1) % slots.size()) {
+    auto& slot = slots[index];
+    slot.read.get();
+    hash.Update({slot.buffer.get(), slot.size});
+    queue(slot);
+  }
+}
+
 std::string RegionDigest(const GgufMappedRegion& region) {
   std::string stamp;
   if (region.file_descriptor >= 0)
@@ -137,20 +206,7 @@ std::string RegionDigest(const GgufMappedRegion& region) {
     crypto::Sha256Hasher hash;
     constexpr std::size_t chunk = 8 * 1024 * 1024;
     if (region.file_descriptor >= 0) {
-      // Buffered sequential reads do not depend on mapped weight residency,
-      // and report truncation as an error instead of a mapped SIGBUS.
-      std::vector<std::uint8_t> buffer(std::min(chunk, region.size));
-      for (std::size_t offset = 0; offset < region.size;) {
-        const auto length = std::min(buffer.size(), region.size - offset);
-        const auto count = pread(region.file_descriptor, buffer.data(), length,
-                                 static_cast<off_t>(offset));
-        if (count < 0 && errno == EINTR)
-          continue;
-        if (count <= 0)
-          throw std::runtime_error("cannot read complete GGUF for identity");
-        hash.Update({buffer.data(), static_cast<std::size_t>(count)});
-        offset += static_cast<std::size_t>(count);
-      }
+      HashFile(hash, region.file_descriptor, region.size);
     } else {
       const auto* bytes = static_cast<const std::uint8_t*>(region.data);
       for (std::size_t offset = 0; offset < region.size;) {

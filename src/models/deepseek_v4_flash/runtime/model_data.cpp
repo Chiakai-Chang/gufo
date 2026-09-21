@@ -25,6 +25,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "src/core/mapped_prefetch.hpp"
 #include "../kernels/rocm/resident_api.h"
 #include "dspark_internal.h"
 #include "model.h"
@@ -733,8 +734,8 @@ static bool accelerator_cache_model_tensors(const ds4_model *m) {
     const double t0 = ds4_now_seconds();
     uint64_t cached = 0;
     const bool cache_ok = accelerator_cache_model_tensor_spans(m, &cached);
-    ds4_gpu_release_model_staging();
-    if (!cache_ok) return false;
+    const bool upload_ok = ds4_gpu_release_model_staging() != 0;
+    if (!cache_ok || !upload_ok) return false;
     if (cached != 0) {
         const double t1 = ds4_now_seconds();
         if (ds4_log_is_tty(stderr)) fputc('\n', stderr);
@@ -1602,6 +1603,11 @@ static void dspark_bind(ds4_dspark_model *d) {
  * prompt processing retains its device-memory headroom. */
 static bool dspark_cache_tensors(const ds4_dspark_model *d) {
     const ds4_model *m = d->model;
+    const double start = ds4_now_seconds();
+    // Expose disk queue depth before copying into the managed arena. Serial
+    // mmap faults otherwise make the small sidecar a long, silent load phase.
+    gufo::core::PrefaultMappedRange(m->map + m->tensor_data_pos,
+                                  m->size - m->tensor_data_pos);
     uint64_t total = 0;
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         /* 256-byte span alignment matches ds4_gpu_cache_support_range. */
@@ -1624,8 +1630,8 @@ static bool dspark_cache_tensors(const ds4_dspark_model *d) {
             return false;
         }
     }
-    fprintf(stderr, "ds4: DSpark support model cached %.2f GiB of tensor spans\n",
-            (double)total / 1073741824.0);
+    fprintf(stderr, "ds4: DSpark support model cached %.2f GiB of tensor spans in %.3fs\n",
+            (double)total / 1073741824.0, ds4_now_seconds() - start);
     return true;
 }
 

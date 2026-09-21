@@ -5,9 +5,9 @@
 #include <algorithm>
 #include <initializer_list>
 
+#include "src/core/hip/weight_upload.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
-#include "src/models/qwen38_flash_next/kernels/rocm/weight_upload.hpp"
 
 namespace gufo::models::qwen38_flash_next::rocm {
 namespace {
@@ -26,7 +26,7 @@ struct Conversion {
 };
 
 struct Uploader {
-  WeightUpload& stager;
+  hip::WeightUpload& stager;
   std::vector<Conversion>& conversions;
   std::vector<void*>& allocations;
   std::size_t& bytes;
@@ -300,7 +300,7 @@ std::unique_ptr<DeviceModel> DeviceModel::Upload(
     const auto extra = mtp_reader->GetMappedRegions();
     shards.insert(shards.end(), extra.begin(), extra.end());
   }
-  auto stager = WeightUpload::Create(shards, error_msg);
+  auto stager = hip::WeightUpload::Create(shards, error_msg);
   if (!stager) {
     return nullptr;
   }

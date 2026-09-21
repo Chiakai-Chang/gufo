@@ -176,7 +176,8 @@ public:
       std::span<const ContinuationToken> prompt,
       const CancellationCheck& is_cancelled = {},
       std::span<const std::uint8_t> input_identity = {},
-      const std::function<void(ContinuationState&)>& prepare_state = {});
+      const std::function<void(ContinuationState&)>& prepare_state = {},
+      bool reuse_prompt = true);
 
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] std::size_t snapshot_capacity_bytes() const noexcept;

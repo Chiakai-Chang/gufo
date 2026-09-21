@@ -148,8 +148,7 @@ static int hipblaslt_gemm_f16_launch(
 }
 
 static int hipblaslt_gemm_plan_select(hip_hipblaslt_gemm_plan* p, void* out,
-                                      const __half* a, const __half* b,
-                                      const char* label) {
+                                      const __half* a, const __half* b) {
   if (!p || p->candidates.empty())
     return 0;
   // Runtime timing made the near-tied 64x2048x4096 shape alternate between
@@ -182,12 +181,6 @@ static int hipblaslt_gemm_plan_select(hip_hipblaslt_gemm_plan* p, void* out,
         hipblaslt_gemm_f16_launch(p, out, a, b, &candidate.algo)) {
       p->algo = candidate.algo;
       p->selected = true;
-      fprintf(stderr,
-              "ds4: ROCm hipBLASLt selected fixed %s candidate %zu/%zu "
-              "(opA=%c m=%u n=%u k=%u)\n",
-              label ? label : "gemm", gfx1151_preferred_candidate,
-              p->candidates.size(), p->op_a == HIPBLAS_OP_T ? 'T' : 'N',
-              p->out_dim, p->n_tok, p->in_dim);
       return 1;
     }
   }
@@ -203,12 +196,6 @@ static int hipblaslt_gemm_plan_select(hip_hipblaslt_gemm_plan* p, void* out,
     }
     p->algo = candidate.algo;
     p->selected = true;
-    fprintf(stderr,
-            "ds4: ROCm hipBLASLt selected fixed fallback %s candidate %zu/%zu "
-            "(opA=%c m=%u n=%u k=%u)\n",
-            label ? label : "gemm", i, p->candidates.size(),
-            p->op_a == HIPBLAS_OP_T ? 'T' : 'N', p->out_dim, p->n_tok,
-            p->in_dim);
     return 1;
   }
   return 0;
@@ -256,7 +243,7 @@ static int hipblaslt_gemm_f16(
     hip_hipblaslt_gemm_plan *p = hipblaslt_gemm_plan_get(
         out_dim, n_tok, in_dim, op_a, output_type, label);
     if (!p) return 0;
-    if (!p->selected && !hipblaslt_gemm_plan_select(p, out, a, b, label))
+    if (!p->selected && !hipblaslt_gemm_plan_select(p, out, a, b))
       return 0;
     return hipblaslt_gemm_f16_launch(p, out, a, b, &p->algo);
 }

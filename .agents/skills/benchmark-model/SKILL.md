@@ -225,15 +225,14 @@ model has several quantizations, e.g. `single-ar-q4`):
    context capacity 4096, 128 output tokens, fresh server per point,
    `cache_prompt=false`. Two workloads from
    `docs/models/qwen3.8-27b/artifacts/speculative-corpus.json`: `repetition`
-   and `mixed` (distinct layout). Metric: aggregate delivered output tok/s
-   (`aggregate.output_tokens_per_second.overall`). `Exact` is the count of
+   and `mixed` (distinct layout). Metric: sum of individual request decode
+   rates per concurrent group, averaged across groups. `Exact` is the count of
    llama.cpp AR completions whose hash matches the Gufo AR C1 reference.
    Report C8 median / p95 latency and acceptance under the table.
    `Users | Gufo AR | llama.cpp AR | Gain | Gufo <spec> | llama.cpp <spec> | Gain | Exact`.
    Every artifact, including Gufo AR, compares its C2+ completions against
-   the Gufo AR C1 hashes. Known gap (gufo-org/gufo#245): Gufo ignores
-   `cache_prompt=false`, so its corpus reports show cache hits the reference
-   does not have; state it under the table.
+   the Gufo AR C1 hashes. Reject any corpus run with cache hits when it sent
+   `cache_prompt=false`; do not publish cache-assisted comparisons.
 5. **Memory** (`memory`). Peak device-global HIP memory in use
    (`hipMemGetInfo` total − free, the counter Gufo's loader logs as
    `gpu_device_used_mib`, sampled every 250 ms by the driver through the

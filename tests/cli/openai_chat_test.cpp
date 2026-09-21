@@ -248,6 +248,32 @@ void TestStreamingIsLive() {
          "Streaming completion retains request diagnostics");
 }
 
+void TestCachePromptOption() {
+  for (bool stream : {false, true}) {
+    for (const auto value : {"true", "false", "null", "0", "\"false\""}) {
+      FakeBackend backend;
+      auto response = gufo::server::HandleOpenAiChat(
+          Request(
+              std::string(
+                  R"({"model":"test-model","messages":[{"role":"user","content":"hello"}],"stream":)") +
+              (stream ? "true" : "false") + R"(,"cache_prompt":)" + value +
+              "}"),
+          backend);
+      const bool valid = std::string_view(value) == "true" ||
+                         std::string_view(value) == "false";
+      Expect(response.status == (valid ? 200 : 400),
+             "cache_prompt accepts only JSON booleans");
+      if (valid) {
+        if (response.streaming_body)
+          response.streaming_body([](std::string_view) { return true; });
+        Expect(backend.last_request.cache_prompt ==
+                   (std::string_view(value) == "true"),
+               "cache_prompt reaches both buffered and streaming backends");
+      }
+    }
+  }
+}
+
 void TestStreamingWithoutUsage() {
   for (const auto* options :
        {"", R"(,"stream_options":{"include_usage":false})"}) {
@@ -1014,6 +1040,7 @@ void TestAggregateImageLimit() {
 }  // namespace
 
 int main() {
+  TestCachePromptOption();
   TestToolChoiceEnforcement();
   TestStreamingIsLive();
   TestStreamingWithoutUsage();

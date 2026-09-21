@@ -63,6 +63,8 @@ public:
     std::optional<Clock::time_point> deadline;
     Clock::time_point request_start{Clock::now()};
     std::shared_ptr<const TextPromptContext> prompt_context;
+    bool cache_prompt{true};
+    std::size_t cache_prefix_tokens{0};
   };
 
   class Request {

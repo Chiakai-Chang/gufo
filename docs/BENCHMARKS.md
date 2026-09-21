@@ -32,10 +32,10 @@ and client TTFT, token ITL, whole-request throughput, and aggregate concurrency
 throughput. C1 serving and a direct single-user benchmark are comparable only
 when prompt, cache state, sampling, speculation, and timed scope match.
 
-Use `aggregate.output_tokens_per_second.overall` for corpus throughput:
-delivered output tokens divided by the sum of measured round spans.
-Per-round medians describe variation; they are not the corpus throughput.
-`measuredSpanMs` excludes warmups and time between rounds.
+Model tables report the **sum of individual request decode rates** in each
+concurrent group, averaged across measured groups. Prefill and queue time
+remain in the latency diagnostics. Missing decode timings are **TODO**;
+whole-request throughput is not a substitute.
 
 `--endpoint-profile openai` supports other OpenAI-compatible servers. Missing
 server-stage metrics remain null. `--reference-report` compares completion

@@ -6,6 +6,22 @@ Snapshots retain the live attention/compression windows and committed DSpark
 frontier. The loader accepts the checkpoint's integer expert-mapping tensor
 without weakening tensor extent validation.
 
+The interrupted-chat check also passes on the production AR/DSpark server at
+262,144-token capacity: stop inside reasoning or visible text, retain or omit
+reasoning, replay greedy/seeded requests, continue a third turn, and restart
+from disk. Reasoning removal retains the stable prompt prefix; explicit
+`cache_prompt: false` reports no reuse. Run
+[`check-continuation.py`](../../../tools/serving/check-continuation.py) as
+described in [server documentation](../../SERVER.md). Exact replay uses the
+same prefill/decode history; it does not close the target arithmetic gaps below.
+
+Focused C1 startup controls at the same capacity: target upload **14.49 s**,
+DSpark upload **0.56 s**. An empty digest cache required **46.72 s** for the
+target's full SHA-256 and **3.26 s** for DSpark; total load **65.55 s**.
+Both digests exactly match the previous full-file scans. Reused digests avoid
+that work. These are startup controls, not a refreshed performance sweep.
+The discarded scratch warmup before first prefill has been removed.
+
 **Target parity is unresolved. No quality improvement is established by the
 current arithmetic audits.** Antirez's implementation is a differential control,
 not official ground truth. DSpark/AR agreement cannot detect shared target errors.

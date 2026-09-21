@@ -65,7 +65,8 @@ public:
   [[nodiscard]] bool DsparkStepBatch(
       std::span<const SessionDsparkBatchItem> items,
       std::string* error_msg = nullptr) const;
-  [[nodiscard]] std::vector<int> Tokenize(std::string_view text) const;
+  [[nodiscard]] std::vector<int> Tokenize(
+      std::string_view text, bool parse_special_tokens = false) const;
   [[nodiscard]] std::vector<int> EncodeChat(std::string_view system_prompt,
                                             std::string_view user_prompt) const;
   [[nodiscard]] std::vector<int> EncodeChat(

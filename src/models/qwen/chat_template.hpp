@@ -104,6 +104,9 @@ struct ChatTemplateOptions {
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
 };
 
+/// Suffix opened for a new assistant turn, outside the stable conversation.
+[[nodiscard]] std::string_view GenerationPrompt(bool enable_thinking);
+
 /// Resolve CLI/API controls against the official Qwen3.8 template defaults.
 /// Provider-neutral minimal/high/max map to native low/xhigh/xhigh.
 [[nodiscard]] ChatTemplateOptions ResolveQwenChatOptions(

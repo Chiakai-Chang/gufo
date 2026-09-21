@@ -47,6 +47,8 @@ struct ChatTemplateOptions {
   bool require_tool_call{false};
 };
 
+[[nodiscard]] std::string_view GenerationPrompt(bool enable_thinking);
+
 /// Renders the pinned DeepSeek V4 Flash 0731 conversation format.
 [[nodiscard]] std::string RenderChat(std::span<const ChatMessage> messages,
                                      const ChatTemplateOptions& options = {});

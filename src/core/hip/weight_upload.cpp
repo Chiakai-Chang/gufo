@@ -1,4 +1,4 @@
-#include "src/models/qwen38_flash_next/kernels/rocm/weight_upload.hpp"
+#include "src/core/hip/weight_upload.hpp"
 
 #include <fcntl.h>
 #include <hip/hip_runtime.h>
@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace gufo::models::qwen38_flash_next::rocm {
+namespace gufo::hip {
 namespace {
 
 constexpr std::size_t kAlignment = 4096;
@@ -258,4 +258,4 @@ bool WeightUpload::Finish(std::string* error) {
   return s.Status(error);
 }
 
-}  // namespace gufo::models::qwen38_flash_next::rocm
+}  // namespace gufo::hip

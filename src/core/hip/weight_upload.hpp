@@ -1,5 +1,5 @@
-#ifndef GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_WEIGHT_UPLOAD_HPP_
-#define GUFO_MODELS_QWEN38_FLASH_NEXT_KERNELS_ROCM_WEIGHT_UPLOAD_HPP_
+#ifndef GUFO_CORE_HIP_WEIGHT_UPLOAD_HPP_
+#define GUFO_CORE_HIP_WEIGHT_UPLOAD_HPP_
 
 #include <cstddef>
 #include <cstdint>
@@ -9,11 +9,11 @@
 
 #include "src/core/gguf_reader.hpp"
 
-namespace gufo::models::qwen38_flash_next::rocm {
+namespace gufo::hip {
 
 /// Bounded disk-to-device pipeline. Copy queues a tensor without waiting for
 /// its upload; destinations must remain alive until Finish or destruction.
-/// The n-gram table and mapped GGUF payloads are never touched.
+/// The mapped GGUF payloads are never touched.
 class WeightUpload {
 public:
   static std::unique_ptr<WeightUpload> Create(
@@ -33,6 +33,6 @@ private:
   std::unique_ptr<State> state_;
 };
 
-}  // namespace gufo::models::qwen38_flash_next::rocm
+}  // namespace gufo::hip
 
 #endif

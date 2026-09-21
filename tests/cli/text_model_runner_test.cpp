@@ -791,6 +791,14 @@ void TestPersistentSnapshotRestoresAcrossPools() {
   auto reader =
       std::make_shared<PersistentSnapshotRunner>(reader_stats, "artifact-A");
   TextRunnerPool restarted(reader, 1, disk_cache);
+  {
+    auto cold = restarted.Acquire({1, 2, 3, 4, 5}, {}, {}, {}, false);
+    Expect(!cold.cache_hit() && !cold.cache_disk_hit() &&
+               cold.cached_prompt_tokens() == 0 &&
+               reader_stats->snapshot_restores == 0,
+           "cache_prompt=false bypasses disk restoration");
+    cold.Invalidate();
+  }
   auto extension = restarted.Acquire({1, 2, 3, 4, 5});
   Expect(extension.cache_hit() && extension.cache_disk_hit(),
          "clean pool restores compatible prefix from disk");
@@ -810,6 +818,79 @@ void TestPersistentSnapshotRestoresAcrossPools() {
   Expect(!miss.cache_hit() && !miss.cache_disk_hit(),
          "changed compatibility identity is a cold miss");
   miss.Invalidate();
+}
+
+void TestPromptReuseCanBeDisabledPerRequest() {
+  auto stats = std::make_shared<FakeStats>();
+  TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1);
+  {
+    auto initial = pool.Acquire({1, 2});
+    initial.Prefill(2);
+    (void)initial.SelectNext();
+    initial.Advance();
+    initial.Commit();
+  }
+  const auto restores = stats->snapshot_restores;
+  auto cold = pool.Acquire({1, 2, 90, 7}, {}, {}, {}, false);
+  Expect(!cold.cache_hit() && cold.cached_prompt_tokens() == 0 &&
+             stats->snapshot_restores == restores,
+         "cache_prompt=false bypasses both live and immutable RAM frontiers");
+  Expect(cold.Prefill(8).consumed_tokens == 4,
+         "disabled reuse processes every prompt token");
+  cold.Commit();
+  auto retained = pool.Acquire({1, 2, 90, 7, 8});
+  Expect(retained.cached_prompt_tokens() == 4,
+         "a no-reuse request can populate the cache for later requests");
+  retained.Invalidate();
+}
+
+void TestStableChatPrefixSurvivesInterruptedFraming() {
+  TemporaryDirectory directory;
+  const TextRunnerDiskCacheOptions disk_cache{.directory = directory.path(),
+                                              .capacity_bytes = 8192,
+                                              .staging_capacity_bytes = 4096};
+  auto stats = std::make_shared<FakeStats>();
+  auto runner = std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A");
+  {
+    TextRunnerPool pool(runner, 1, disk_cache);
+    // {1,2,3} is stable history; {40,41} opens assistant reasoning.
+    auto initial = pool.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
+    auto step = initial.Prefill(64);
+    Expect(step.consumed_tokens == 3 && !step.decode_ready,
+           "prefill stops before mutable assistant framing");
+    Expect(initial.Prefill(64).decode_ready,
+           "assistant suffix completes prefill");
+    (void)initial.SelectNext();
+    initial.Advance();
+    initial.Cancel();
+    // Client omits the unfinished reasoning and closes the assistant turn.
+    auto resumed = pool.Acquire({1, 2, 3, 50, 51, 60}, {}, {}, {}, true, 5);
+    Expect(resumed.cached_prompt_tokens() == 3,
+           "changed assistant framing retains all stable prompt tokens");
+    resumed.Invalidate();
+  }
+  TextRunnerPool restarted(runner, 1, disk_cache);
+  auto restored = restarted.Acquire({1, 2, 3, 50, 51, 60}, {}, {}, {}, true, 5);
+  Expect(restored.cache_disk_hit() && restored.cached_prompt_tokens() == 3,
+         "interrupted stable chat prefix survives server restart");
+  restored.Invalidate();
+
+  // Full-prompt entries written by older servers must not prevent creating
+  // the shorter, stable checkpoint on the next request.
+  TextRunnerPool legacy(runner, 1);
+  auto old = legacy.Acquire({1, 2, 3, 40, 41});
+  old.Prefill(64);
+  old.Commit();
+  auto migrated = legacy.Acquire({1, 2, 3, 40, 41}, {}, {}, {}, true, 3);
+  Expect(!migrated.cache_hit(),
+         "legacy mutable-suffix snapshot cannot bypass the stable boundary");
+  Expect(migrated.Prefill(64).consumed_tokens == 3,
+         "legacy entry is replaced by a stable chat checkpoint");
+  migrated.Cancel();
+  auto next = legacy.Acquire({1, 2, 3, 50, 51, 60}, {}, {}, {}, true, 5);
+  Expect(next.cached_prompt_tokens() == 3,
+         "migrated checkpoint survives changed assistant framing");
+  next.Invalidate();
 }
 
 void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
@@ -1005,6 +1086,8 @@ void TestSnapshotCaptureFailureReleasesReservationAndKeepsRequestSuccessful() {
 
 int main() {
   TestCancellationRetainsOnlyCompletedWork();
+  TestPromptReuseCanBeDisabledPerRequest();
+  TestStableChatPrefixSurvivesInterruptedFraming();
   TestDiskOnlyCaptureReservesBudgetBeforeCommit();
   TestDiskPreflightAvoidsUnusableCapture();
   TestBoundedPrefillDecodeAndPrefixReuse();

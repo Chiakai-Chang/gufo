@@ -1,5 +1,3 @@
-#include "src/models/qwen38_flash_next/kernels/rocm/weight_upload.hpp"
-
 #include <fcntl.h>
 #include <hip/hip_runtime.h>
 #include <unistd.h>
@@ -14,7 +12,9 @@
 #include <string>
 #include <vector>
 
-using gufo::models::qwen38_flash_next::rocm::WeightUpload;
+#include "src/core/hip/weight_upload.hpp"
+
+using gufo::hip::WeightUpload;
 
 namespace {
 
@@ -28,7 +28,7 @@ void Require(bool ok, const std::string& message) {
 struct Files {
   std::filesystem::path directory;
   Files() {
-    char path[] = "/tmp/qfn-weight-upload-XXXXXX";
+    char path[] = "/tmp/gufo-weight-upload-XXXXXX";
     const char* result = ::mkdtemp(path);
     Require(result != nullptr, "mkdtemp");
     directory = result;

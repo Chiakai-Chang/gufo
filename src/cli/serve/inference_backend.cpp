@@ -106,30 +106,50 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request) {
   return options;
 }
 
+std::size_t StablePromptPrefix(std::span<const TextRunnerToken> tokens,
+                               std::span<const TextRunnerToken> generation) {
+  if (generation.empty() || tokens.size() <= generation.size() ||
+      !std::ranges::equal(tokens.last(generation.size()), generation))
+    return 0;
+  return tokens.size() - generation.size();
+}
+
 TextPreparedPrompt PrepareQwenPrompt(
     const ChatRequest& request, const tokenization::QwenTokenizer& tokenizer,
     const std::shared_ptr<models::qwen::vision::Encoder>& encoder,
     std::uint32_t max_context) {
   const bool has_images = std::ranges::any_of(
       request.messages, [](const auto& m) { return !m.images.empty(); });
+  const auto options = QwenChatOptions(request);
   auto prompt = std::make_shared<models::qwen::vision::Prompt>(
       models::qwen::vision::Prepare(
           tokenizer, request.messages,
           request.tool_choice == ChatRequest::ToolChoice::kNone
               ? std::span<const tokenization::ChatTool>{}
               : std::span<const tokenization::ChatTool>{request.tools},
-          QwenChatOptions(request),
+          options,
           encoder && has_images ? encoder->identity() : std::string_view{},
           max_context));
+  // With preserved reasoning, the official template retains the generation
+  // suffix verbatim in subsequent turns, including empty reasoning blocks.
+  // Keep that full frontier and its existing prefill arithmetic. Only stop
+  // earlier when the next turn's template will actually remove the suffix.
+  std::size_t cache_prefix = 0;
+  if (!options.preserve_thinking) {
+    const auto generation = tokenizer.Encode(
+        tokenization::GenerationPrompt(options.enable_thinking),
+        {.add_bos = false, .add_eos = false, .parse_special_tokens = true});
+    cache_prefix = StablePromptPrefix(prompt->tokens, generation);
+  }
   if (prompt->images.empty())
-    return {std::move(prompt->tokens), {}};
+    return {std::move(prompt->tokens), {}, cache_prefix};
   if (!encoder)
     throw std::invalid_argument(
         "image input requires a matching --mmproj BF16 sidecar");
   auto context = std::make_shared<QwenImageContext>();
   context->cache_identity = prompt->cache_identity;
   context->prompt = prompt;
-  return {prompt->tokens, std::move(context)};
+  return {prompt->tokens, std::move(context), cache_prefix};
 }
 
 std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
@@ -1560,6 +1580,25 @@ public:
                : TextGenerationBackend::InitialOutputState::kContent;
   }
 
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    auto prepared = TextModelRunner::PreparePrompt(request);
+    const bool preserves_thinking =
+        request.reasoning.preserve_thinking.value_or(false) ||
+        (!request.tools.empty() &&
+         request.tool_choice != ChatRequest::ToolChoice::kNone);
+    if (prepared && request.reasoning.enabled.value_or(false) &&
+        !preserves_thinking) {
+      const auto generation = DeepSeekRunnerTokens(
+          model_->Tokenize(models::deepseek_v4_flash::GenerationPrompt(
+                               request.reasoning.enabled.value_or(false)),
+                           true));
+      prepared->cache_prefix_tokens =
+          StablePromptPrefix(prepared->tokens, generation);
+    }
+    return prepared;
+  }
+
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override {
     std::string text;
@@ -1982,6 +2021,8 @@ private:
 bool FingerprintArtifact(std::string_view label, const core::GgufReader& reader,
                          std::string* fingerprint, std::string* error) {
   const auto start = std::chrono::steady_clock::now();
+  Logger::Info("loader", "event=load_phase phase=artifact_identity model=" +
+                             std::string(label));
   try {
     *fingerprint = core::GgufIdentityHex(reader);
   } catch (const std::exception& exception) {
@@ -2613,7 +2654,8 @@ struct InferenceBackend::Impl {
       const sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled, const TokenCallback& on_token,
       std::string client_id,
-      std::shared_ptr<const TextPromptContext> context = {}) const {
+      std::shared_ptr<const TextPromptContext> context = {},
+      bool cache_prompt = true, std::size_t cache_prefix_tokens = 0) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -2633,6 +2675,8 @@ struct InferenceBackend::Impl {
             .deadline = std::nullopt,
             .request_start = request_start,
             .prompt_context = std::move(context),
+            .cache_prompt = cache_prompt,
+            .cache_prefix_tokens = cache_prefix_tokens,
         });
     result = request.Wait(on_token);
 
@@ -3264,10 +3308,11 @@ InferenceBackend::Result InferenceBackend::chat(
   if (!prompt.has_value() || prompt->tokens.empty()) {
     return {};
   }
-  return impl_->GenerateScheduled(state, std::move(prompt->tokens),
-                                  request_start, max_tokens, sampling_config,
-                                  is_cancelled, on_token, request.client_id,
-                                  std::move(prompt->context));
+  return impl_->GenerateScheduled(
+      state, std::move(prompt->tokens), request_start, max_tokens,
+      sampling_config, is_cancelled, on_token, request.client_id,
+      std::move(prompt->context), request.cache_prompt,
+      prompt->cache_prefix_tokens);
 #else
   (void)request;
   (void)max_tokens;
@@ -3299,15 +3344,17 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
-  auto scheduled_request =
-      state->scheduler->Submit(std::move(prompt->tokens), max_tokens,
-                               sampling_config, is_cancelled, stream_output,
-                               TextRequestMetadata{
-                                   .client_id = client_id,
-                                   .deadline = std::nullopt,
-                                   .request_start = request_start,
-                                   .prompt_context = std::move(prompt->context),
-                               });
+  auto scheduled_request = state->scheduler->Submit(
+      std::move(prompt->tokens), max_tokens, sampling_config, is_cancelled,
+      stream_output,
+      TextRequestMetadata{
+          .client_id = client_id,
+          .deadline = std::nullopt,
+          .request_start = request_start,
+          .prompt_context = std::move(prompt->context),
+          .cache_prompt = request.cache_prompt,
+          .cache_prefix_tokens = prompt->cache_prefix_tokens,
+      });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request));
 #else

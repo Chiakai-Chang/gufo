@@ -2,11 +2,8 @@ static const void *g_model_host_base;
 static uint64_t g_model_registered_size;
 static int g_model_fd = -1;
 static const void *g_model_fd_host_base;
-static int g_model_direct_fd = -1;
-static uint64_t g_model_direct_align = 1;
-static uint64_t g_model_file_size;
 static int g_model_cache_full;
-static hipStream_t g_model_upload_stream;
+static std::unique_ptr<gufo::hip::WeightUpload> g_model_uploader;
 static hipblasHandle_t g_hipblas;
 static int g_hipblas_ready;
 /* Strix Halo detection. The optimized prefill routes below are scored on
@@ -137,17 +134,6 @@ static int g_model_load_progress_started;
 static int g_model_load_progress_tty;
 static void *g_hip_tmp;
 static uint64_t g_hip_tmp_bytes;
-/*
- * One worker per common 528-672 MiB tensor span keeps the SN7100 near its
- * useful direct-I/O queue depth. The chunk is sized per span below, so sixteen
- * slots retain the same roughly 1 GiB peak staging budget for larger ranges.
- */
-enum { DS4_ROCM_MODEL_STAGE_COUNT = 16 };
-static void *g_model_stage_raw[DS4_ROCM_MODEL_STAGE_COUNT];
-static void *g_model_stage[DS4_ROCM_MODEL_STAGE_COUNT];
-static hipEvent_t g_model_stage_event[DS4_ROCM_MODEL_STAGE_COUNT];
-static uint64_t g_model_stage_bytes;
-
 static int hip_ok(hipError_t err, const char *what);
 
 static int hip_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
@@ -208,7 +194,7 @@ static const char *hip_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes,
-        const char *what);
+        const char *what, bool wait = true);
 __global__ static void dequant_q8_0_to_f16_kernel(
         __half *out,
         const unsigned char *w,
@@ -652,197 +638,14 @@ static void hip_model_load_progress_note(uint64_t cached_bytes) {
     }
 }
 
-static uint64_t hip_model_copy_chunk_bytes(uint64_t range_bytes) {
-    const uint64_t mib = 1048576ull;
-    uint64_t bytes =
-        (range_bytes + DS4_ROCM_MODEL_STAGE_COUNT - 1u) /
-        DS4_ROCM_MODEL_STAGE_COUNT;
-    bytes = ((bytes + mib - 1u) / mib) * mib;
-    if (bytes < 16u * mib) bytes = 16u * mib;
-    if (bytes > 64u * mib) bytes = 64u * mib;
-    return bytes;
-}
-
-static void hip_model_discard_source_pages(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes) {
-#if defined(POSIX_MADV_DONTNEED)
-    if (!model_map || bytes == 0 || offset > model_size) return;
-    if (bytes > model_size - offset) bytes = model_size - offset;
-    const long page_sz_l = sysconf(_SC_PAGESIZE);
-    const uint64_t page_sz = page_sz_l > 0 ? (uint64_t)page_sz_l : 4096u;
-    const uintptr_t h0 = (uintptr_t)((const char *)model_map + offset);
-    const uintptr_t h1 = h0 + bytes;
-    const uintptr_t p0 = h0 & ~(uintptr_t)(page_sz - 1u);
-    const uintptr_t p1 = (h1 + page_sz - 1u) & ~(uintptr_t)(page_sz - 1u);
-    if (p1 > p0) (void)posix_madvise((void *)p0, (size_t)(p1 - p0), POSIX_MADV_DONTNEED);
-#else
-    (void)model_map;
-    (void)model_size;
-    (void)offset;
-    (void)bytes;
-#endif
-}
-
-static void hip_model_drop_file_pages(uint64_t offset, uint64_t bytes) {
-#if defined(POSIX_FADV_DONTNEED)
-    if (g_model_fd < 0 || bytes == 0) return;
-    (void)posix_fadvise(g_model_fd, (off_t)offset, (off_t)bytes, POSIX_FADV_DONTNEED);
-#else
-    (void)offset;
-    (void)bytes;
-#endif
-}
-
-static uint64_t hip_round_down(uint64_t v, uint64_t align) {
-    if (align <= 1) return v;
-    return (v / align) * align;
-}
-
 static uint64_t hip_round_up(uint64_t v, uint64_t align) {
     if (align <= 1) return v;
     const uint64_t rem = v % align;
     return rem == 0 ? v : v + (align - rem);
 }
 
-static void *hip_align_ptr(void *ptr, uint64_t align) {
-    if (align <= 1) return ptr;
-    uintptr_t p = (uintptr_t)ptr;
-    uintptr_t a = (uintptr_t)align;
-    return (void *)(((p + a - 1u) / a) * a);
-}
-
-static void hip_model_stage_pool_free_buffers(void) {
-    for (size_t i = 0; i < DS4_ROCM_MODEL_STAGE_COUNT; i++) {
-        if (g_model_stage_event[i]) {
-            (void)hipEventDestroy(g_model_stage_event[i]);
-            g_model_stage_event[i] = NULL;
-        }
-        if (g_model_stage_raw[i]) {
-            (void)hipFreeHost(g_model_stage_raw[i]);
-            g_model_stage_raw[i] = NULL;
-            g_model_stage[i] = NULL;
-        }
-    }
-    g_model_stage_bytes = 0;
-}
-
-static int hip_model_stage_pool_alloc(uint64_t bytes) {
-    if (g_model_stage_bytes >= bytes) return 1;
-    hip_model_stage_pool_free_buffers();
-    if (!g_model_upload_stream) {
-        hipError_t err = hipStreamCreateWithFlags(&g_model_upload_stream, hipStreamNonBlocking);
-        if (err != hipSuccess) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX "model upload stream creation failed: %s\n", hipGetErrorString(err));
-            (void)hipGetLastError();
-            return 0;
-        }
-    }
-    uint64_t alloc_bytes = bytes;
-    if (g_model_direct_align > 1u) {
-        const uint64_t pad = g_model_direct_align - 1u;
-        if (alloc_bytes > UINT64_MAX - pad) return 0;
-        alloc_bytes += pad;
-    }
-    if (alloc_bytes > (uint64_t)SIZE_MAX) return 0;
-    for (size_t i = 0; i < DS4_ROCM_MODEL_STAGE_COUNT; i++) {
-        hipError_t err = hipMallocHost(&g_model_stage_raw[i], (size_t)alloc_bytes);
-        if (err != hipSuccess) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX "pinned model staging allocation failed: %s\n", hipGetErrorString(err));
-            (void)hipGetLastError();
-            return 0;
-        }
-        g_model_stage[i] = hip_align_ptr(g_model_stage_raw[i], g_model_direct_align);
-        err = hipEventCreateWithFlags(&g_model_stage_event[i], hipEventDisableTiming);
-        if (err != hipSuccess) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX "model staging event creation failed: %s\n", hipGetErrorString(err));
-            (void)hipGetLastError();
-            return 0;
-        }
-    }
-    g_model_stage_bytes = bytes;
-    return 1;
-}
-
 static void hip_model_staging_release(void) {
-    if (g_model_upload_stream) {
-        (void)hipStreamSynchronize(g_model_upload_stream);
-    }
-    hip_model_stage_pool_free_buffers();
-    if (g_model_upload_stream) {
-        (void)hipStreamDestroy(g_model_upload_stream);
-        g_model_upload_stream = NULL;
-    }
-    if (g_model_direct_fd >= 0) {
-        (void)close(g_model_direct_fd);
-        g_model_direct_fd = -1;
-    }
-    g_model_direct_align = 1;
-}
-
-static int hip_pread_full(int fd, void *buf, uint64_t bytes, uint64_t offset) {
-    uint64_t done = 0;
-    while (done < bytes) {
-        const size_t n_req = (bytes - done > (uint64_t)SSIZE_MAX) ? (size_t)SSIZE_MAX : (size_t)(bytes - done);
-        ssize_t n = pread(fd, (char *)buf + done, n_req, (off_t)(offset + done));
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            return 0;
-        }
-        if (n == 0) return 0;
-        done += (uint64_t)n;
-    }
-    return 1;
-}
-
-static int hip_model_stage_read(void *stage, uint64_t stage_bytes,
-                                 uint64_t offset, uint64_t bytes,
-                                 const char **payload) {
-    *payload = (const char *)stage;
-#if defined(__linux__) && defined(O_DIRECT)
-    const int direct_fd = g_model_direct_fd;
-    const uint64_t direct_align = g_model_direct_align;
-    if (direct_fd >= 0 && direct_align > 1 && g_model_file_size != 0) {
-        const uint64_t aligned_off = hip_round_down(offset, direct_align);
-        const uint64_t delta = offset - aligned_off;
-        uint64_t read_size = hip_round_up(delta + bytes, direct_align);
-        if (aligned_off <= g_model_file_size &&
-            read_size <= stage_bytes &&
-            read_size <= g_model_file_size - aligned_off) {
-            const int saved_errno = errno;
-            errno = 0;
-            if (hip_pread_full(direct_fd, stage, read_size, aligned_off)) {
-                *payload = (const char *)stage + delta;
-                errno = saved_errno;
-                return 1;
-            }
-        }
-    }
-#else
-    (void)stage_bytes;
-#endif
-    return hip_pread_full(g_model_fd, stage, bytes, offset);
-}
-
-struct hip_model_stage_read_task {
-    void *stage;
-    uint64_t stage_bytes;
-    uint64_t offset;
-    uint64_t bytes;
-    const char *payload;
-    int ok;
-    int error;
-};
-
-static void *hip_model_stage_read_worker(void *opaque) {
-    hip_model_stage_read_task *task =
-        static_cast<hip_model_stage_read_task *>(opaque);
-    task->ok = hip_model_stage_read(
-        task->stage,
-        task->stage_bytes,
-        task->offset,
-        task->bytes,
-        &task->payload);
-    task->error = task->ok ? 0 : errno;
-    return NULL;
+    g_model_uploader.reset();
 }
 
 static char* hip_model_range_alloc(uint64_t bytes, const char* what) {
@@ -873,115 +676,27 @@ static const char *hip_model_range_ptr_from_fd(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes,
-        const char *what) {
+        const char *what, bool wait) {
     if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     char* dev = hip_model_range_alloc(bytes, what);
     if (!dev) {
         return NULL;
     }
-    hipError_t err = hipSuccess;
-
-    const uint64_t chunk = hip_model_copy_chunk_bytes(bytes);
-    const uint64_t stage_bytes = chunk + (g_model_direct_align > 1 ? g_model_direct_align : 1);
-    if (!hip_model_stage_pool_alloc(stage_bytes)) return NULL;
-
-    uint64_t copied = 0;
-    uint64_t chunk_idx = 0;
-    while (copied < bytes) {
-        hip_model_stage_read_task tasks[DS4_ROCM_MODEL_STAGE_COUNT] = {};
-        pthread_t threads[DS4_ROCM_MODEL_STAGE_COUNT] = {};
-        int thread_started[DS4_ROCM_MODEL_STAGE_COUNT] = {};
-        uint64_t batch_bytes = 0;
-        size_t batch_count = 0;
-        while (batch_count < DS4_ROCM_MODEL_STAGE_COUNT &&
-               copied + batch_bytes < bytes) {
-            const uint64_t remaining = bytes - copied - batch_bytes;
-            const uint64_t n = remaining < chunk ? remaining : chunk;
-            const size_t bi = batch_count;
-            if (chunk_idx >= DS4_ROCM_MODEL_STAGE_COUNT) {
-                err = hipEventSynchronize(g_model_stage_event[bi]);
-                if (err != hipSuccess) {
-                    fprintf(stderr, DS4_GPU_LOG_PREFIX "model staging wait failed for %s: %s\n",
-                            what ? what : "weights", hipGetErrorString(err));
-                    (void)hipGetLastError();
-                    return NULL;
-                }
-            }
-            tasks[bi] = {
-                g_model_stage[bi],
-                g_model_stage_bytes,
-                offset + copied + batch_bytes,
-                n,
-                NULL,
-                0,
-                0,
-            };
-            if (pthread_create(
-                    &threads[bi],
-                    NULL,
-                    hip_model_stage_read_worker,
-                    &tasks[bi]) == 0) {
-                thread_started[bi] = 1;
-            } else {
-                (void)hip_model_stage_read_worker(&tasks[bi]);
-            }
-            batch_bytes += n;
-            batch_count++;
-            chunk_idx++;
-        }
-        for (size_t bi = 0; bi < batch_count; bi++) {
-            if (thread_started[bi]) {
-                (void)pthread_join(threads[bi], NULL);
-            }
-            if (!tasks[bi].ok) {
-                fprintf(stderr, DS4_GPU_LOG_PREFIX "model range read failed for %s at %.2f MiB: %s\n",
-                        what ? what : "weights",
-                        (double)(tasks[bi].offset - offset) / 1048576.0,
-                        strerror(tasks[bi].error));
-                return NULL;
-            }
-        }
-        for (size_t bi = 0; bi < batch_count; bi++) {
-            const uint64_t n = tasks[bi].bytes;
-            const uint64_t relative_offset = tasks[bi].offset - offset;
-            err = hipMemcpyAsync(
-                dev + relative_offset,
-                tasks[bi].payload,
-                (size_t)n,
-                hipMemcpyHostToDevice,
-                g_model_upload_stream);
-            if (err != hipSuccess) {
-                fprintf(stderr, DS4_GPU_LOG_PREFIX "model range copy failed for %s at %.2f MiB: %s\n",
-                        what ? what : "weights",
-                        (double)relative_offset / 1048576.0,
-                        hipGetErrorString(err));
-                (void)hipGetLastError();
-                return NULL;
-            }
-            err = hipEventRecord(g_model_stage_event[bi], g_model_upload_stream);
-            if (err != hipSuccess) {
-                fprintf(stderr, DS4_GPU_LOG_PREFIX "model staging record failed for %s: %s\n",
-                        what ? what : "weights", hipGetErrorString(err));
-                (void)hipGetLastError();
-                return NULL;
-            }
-            hip_model_drop_file_pages(tasks[bi].offset, n);
-            hip_model_discard_source_pages(
-                model_map,
-                g_model_registered_size,
-                tasks[bi].offset,
-                n);
-            hip_model_load_progress_note(
-                g_model_range_bytes + relative_offset + n);
-        }
-        copied += batch_bytes;
+    std::string error;
+    if (!g_model_uploader) {
+        const gufo::core::GgufMappedRegion region{
+            .data = model_map,
+            .size = static_cast<size_t>(g_model_registered_size),
+            .file_descriptor = g_model_fd,
+        };
+        g_model_uploader = gufo::hip::WeightUpload::Create({&region, 1}, &error);
     }
-    err = hipStreamSynchronize(g_model_upload_stream);
-    if (err != hipSuccess) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "model range upload sync failed for %s: %s\n",
-                what ? what : "weights", hipGetErrorString(err));
-        (void)hipGetLastError();
+    if (!g_model_uploader ||
+        !g_model_uploader->Copy(0, offset, bytes, dev, &error) ||
+        (wait && !g_model_uploader->Finish(&error))) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "model upload failed for %s: %s\n",
+                what ? what : "weights", error.c_str());
         return NULL;
     }
 
@@ -1045,6 +760,7 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_release_support_map(void);
 
 extern "C" void ds4_gpu_cleanup(void) {
+    hip_model_staging_release();
     (void)hipDeviceSynchronize();
     ds4_mmq_cleanup();
     ds4_gpu_release_support_map();
@@ -1076,7 +792,6 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_host_base = NULL;
     g_model_registered_size = 0;
     g_model_fd = -1;
-    g_model_file_size = 0;
     g_model_cache_full = 0;
 }
 
@@ -1259,41 +974,24 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
-    g_model_file_size = 0;
-    if (g_model_direct_fd >= 0) {
-        (void)close(g_model_direct_fd);
-        g_model_direct_fd = -1;
-    }
-    g_model_direct_align = 1;
-    if (fd >= 0) {
-        struct stat st;
-        if (fstat(fd, &st) == 0 && st.st_size > 0) {
-            g_model_file_size = (uint64_t)st.st_size;
-            if (st.st_blksize > 1) g_model_direct_align = (uint64_t)st.st_blksize;
-        }
-#if defined(__linux__) && defined(O_DIRECT)
-        {
-            char proc_path[64];
-            snprintf(proc_path, sizeof(proc_path), "/proc/self/fd/%d", fd);
-            int direct_fd = open(proc_path, O_RDONLY | O_DIRECT);
-            if (direct_fd >= 0) {
-                g_model_direct_fd = direct_fd;
-                if (g_model_direct_align < 512) g_model_direct_align = 512;
-            }
-        }
-#endif
-    }
     return 1;
 }
 
-extern "C" void ds4_gpu_release_model_staging(void) {
+extern "C" int ds4_gpu_release_model_staging(void) {
+    std::string error;
+    const bool ok = !g_model_uploader || g_model_uploader->Finish(&error);
+    if (!ok)
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "model upload failed: %s\n", error.c_str());
     hip_model_staging_release();
+    return ok;
 }
 
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
-    if (!hip_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
+    if (hip_model_range_is_cached(model_map, offset, bytes)) return 1;
+    if (!hip_model_range_ptr_from_fd(model_map, offset, bytes,
+                                     label ? label : "model_tensor", false)) return 0;
     return hip_model_range_is_cached(model_map, offset, bytes);
 }
 

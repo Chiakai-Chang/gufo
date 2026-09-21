@@ -391,11 +391,14 @@ std::string RenderChat(std::span<const ChatMessage> messages,
     const std::string_view last_role = messages.back().role;
     if (last_role == "user" || last_role == "developer" ||
         last_role == "tool" || last_role == "function") {
-      output.append(kAssistant);
-      output.append(options.enable_thinking ? kThinkStart : kThinkEnd);
+      output.append(GenerationPrompt(options.enable_thinking));
     }
   }
   return output;
+}
+
+std::string_view GenerationPrompt(bool enable_thinking) {
+  return enable_thinking ? "<｜Assistant｜><think>" : "<｜Assistant｜></think>";
 }
 
 bool ValidateGgufTemplate(const core::GgufReader& reader,

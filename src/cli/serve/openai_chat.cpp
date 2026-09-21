@@ -523,6 +523,13 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   }
 
   output->chat.client_id = request.client_id;
+  if (const auto* cache_prompt = body.find("cache_prompt")) {
+    if (!cache_prompt->is_bool()) {
+      return Error(400, "Bad Request", "'cache_prompt' must be a boolean",
+                   "invalid_cache_prompt");
+    }
+    output->chat.cache_prompt = cache_prompt->as_bool();
+  }
 
   const json::Value* messages = body.find("messages");
   if (messages == nullptr || !messages->is_array() || messages->empty()) {

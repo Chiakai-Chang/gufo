@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import math
+import statistics
 from dataclasses import dataclass
 from typing import Any
 
@@ -212,7 +214,23 @@ def _serving_rate(report: dict[str, Any] | None, users: int) -> float | None:
     result = report.get("results", {}).get(f"c{users}")
     if result is None:
         return None
-    return result["aggregate"]["output_tokens_per_second"]["overall"]
+    # Report the sum of individual decode rates in each simultaneous group,
+    # then average groups. Queue/prefill latency stays in the raw artifact.
+    samples = result.get("samples", [])
+    sums = []
+    offset = 0
+    for group in result.get("rounds", []):
+        count = group.get("sampleCount", 0)
+        rows = samples[offset:offset + count]
+        offset += count
+        rates = [row.get("decode_tokens_per_second") for row in rows]
+        if count != users or len(rates) != count or any(
+                rate is None or not math.isfinite(rate) or rate < 0 for rate in rates):
+            return None
+        sums.append(sum(rates))
+    if offset != len(samples) or not sums:
+        return None
+    return statistics.fmean(sums)
 
 
 def _serving_exact(report: dict[str, Any] | None, users: int) -> str | None:

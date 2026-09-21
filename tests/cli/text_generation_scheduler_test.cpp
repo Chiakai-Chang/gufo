@@ -1313,8 +1313,13 @@ void TestCapturesAtCapacityAllowQueuedProgress() {
       auto scheduler = MakeScheduler(control, capacity);
       std::vector<TextGenerationScheduler::Request> requests;
       for (std::size_t i = 0; i < capacity; ++i) {
-        requests.push_back(scheduler->Submit(
-            {static_cast<TextRunnerToken>(i + 1), 10}, 7, 0.0F));
+        TextGenerationScheduler::RequestMetadata metadata;
+        // Exercise captures during prefill as well as after first-token
+        // publication, including the single-slot admission deadlock.
+        metadata.cache_prefix_tokens = multi ? 1 : 0;
+        requests.push_back(
+            scheduler->Submit({static_cast<TextRunnerToken>(i + 1), 10}, 7,
+                              0.0F, {}, false, metadata));
         Expect(entered.try_acquire_for(kTestTimeout),
                "every resident reaches snapshot capture");
       }

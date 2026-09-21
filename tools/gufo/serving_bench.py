@@ -1210,6 +1210,11 @@ def run_corpus_benchmark(
 
         _warn_capacity(warnings, concurrency, summary)
         cache_hits = summary["speculative"]["cacheHits"]
+        if cache_hits and cache_prompt is False:
+            raise RuntimeError(
+                f"C={concurrency}: server ignored cache_prompt=false "
+                f"({cache_hits} cache hits); refusing an incomparable benchmark"
+            )
         if cache_hits:
             warnings.append(
                 f"C={concurrency} observed {cache_hits} prompt-cache hits; "
@@ -1535,7 +1540,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-cache-prompt",
         action="store_true",
-        help="Send cache_prompt=false with every request (llama-server)",
+        help="Disable prompt reuse for every request",
     )
     parser.add_argument(
         "--reference-report",

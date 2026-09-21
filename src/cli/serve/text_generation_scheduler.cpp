@@ -56,6 +56,8 @@ struct ScheduledRequest {
   std::string client_id{"anonymous"};
   std::vector<TextRunnerToken> prompt;
   std::shared_ptr<const TextPromptContext> prompt_context;
+  bool cache_prompt{true};
+  std::size_t cache_prefix_tokens{0};
   std::size_t token_limit{1};
   sampling::SamplingConfig sampling;
   TextGenerationScheduler::CancellationCheck external_cancellation;
@@ -419,7 +421,8 @@ struct TextGenerationScheduler::Impl {
                      CancellationRequested(request) ||
                      DeadlineExceeded(request);
             },
-            std::move(request->prompt_context));
+            std::move(request->prompt_context), request->cache_prompt,
+            request->cache_prefix_tokens);
         if (!request->runner_request) {
           CompleteCancelled(request);
           continue;
@@ -1008,7 +1011,10 @@ struct TextGenerationScheduler::Impl {
         if (request->runner_request.SnapshotPending()) {
           capturing.push_back(std::move(request));
         } else if (!CompleteIfStopped(request)) {
-          decoding.push_back(std::move(request));
+          if (request->runner_request.prefill_complete())
+            decoding.push_back(std::move(request));
+          else
+            prefilling.push_back(std::move(request));
         }
       }
       Admit(prefilling, decoding, capturing.size(), stop_token);
@@ -1056,7 +1062,9 @@ struct TextGenerationScheduler::Impl {
         prefilling.pop_front();
         StepPrefill(request, true);
         if (!IsTerminal(request)) {
-          if (request->runner_request.prefill_complete()) {
+          if (request->runner_request.SnapshotPending()) {
+            capturing.push_back(std::move(request));
+          } else if (request->runner_request.prefill_complete()) {
             decoding.push_back(std::move(request));
           } else {
             prefilling.push_back(std::move(request));
@@ -1101,7 +1109,9 @@ struct TextGenerationScheduler::Impl {
       prefilling.pop_front();
       StepPrefill(request, false, !capturing.empty());
       if (!IsTerminal(request)) {
-        if (request->runner_request.prefill_complete()) {
+        if (request->runner_request.SnapshotPending()) {
+          capturing.push_back(std::move(request));
+        } else if (request->runner_request.prefill_complete()) {
           request->decode_due = true;
           decoding.push_back(std::move(request));
         } else {
@@ -1302,6 +1312,8 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       impl_->runner_pool->capacity() == 1 ? "serial-c1" : "serial-fallback";
   request->prompt = std::move(prompt);
   request->prompt_context = std::move(metadata.prompt_context);
+  request->cache_prompt = metadata.cache_prompt;
+  request->cache_prefix_tokens = metadata.cache_prefix_tokens;
   request->token_limit = max_tokens > 0 ? max_tokens : 1;
   request->sampling = sampling;
   request->external_cancellation = is_cancelled;

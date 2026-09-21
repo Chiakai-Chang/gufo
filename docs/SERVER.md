@@ -119,6 +119,31 @@ work can batch across ready requests. See the
 Each model chooses its prefill chunk. `--prefill-chunk` limits prompt work
 between active decode rounds without changing a lone request's kernel policy.
 
+Prompt reuse is enabled by default. `cache_prompt: false` on
+`/v1/chat/completions` bypasses both memory and disk lookup for that request;
+the result can still populate the cache. When the chat template removes prior
+reasoning, snapshots stop before the assistant-generation suffix so that
+removal does not discard the unchanged conversation. Templates that preserve
+the suffix keep the full prompt frontier. Exact live continuations reuse
+generated tokens too. The server reports cached and newly processed tokens
+separately; reasoning-removal requests may process the short assistant suffix.
+Changed system instructions, tool definitions, or image identities must match
+before a cached prefix can be reused.
+
+For a focused cancellation check, run
+`python3 tools/serving/check-continuation.py --output /tmp/cache-check.json`
+against a private server named `cache-test` on port 5815 with `--cache-disk`.
+It checks interruption during reasoning and visible output, with and without
+reasoning replay, greedy/seeded sampling, and explicit cache bypass. Restart
+the same server and add `--restore /tmp/cache-check.json` to verify disk reuse.
+Use `--image /path/to/image.png` for Qwen image conversations.
+Each case continues for a third turn; repeat `--case NAME` to select only the
+cases needed for a change.
+The check requires exact snapshot and matched-history replay. It separately
+reports equality to a fresh full prefill, whose different matrix shapes and
+prefill/decode history can change rounding; that comparison is not silently
+counted as an exact cache replay.
+
 ### Reasoning controls
 
 `--think auto` uses the model's default. Qwen27B and Flash-Next match the
@@ -537,6 +562,11 @@ speculative mode and memory. `rss_mib` is process resident memory;
 `host_available_mib` is available system memory. At load completion,
 `gpu_device_used_mib` is device-wide HIP usage. These overlap on unified memory
 and must not be added together.
+With disk caching enabled, `phase=artifact_identity` identifies full-file
+SHA-256 work. Digests are cached against the open file's identity, size and
+modification/change timestamps; unchanged artifacts avoid another scan.
+Startup qualification measures process launch through first prefill and first
+token, including work deferred until the first request.
 
 Audio summaries include model, duration and generation/transcription timings.
 Video requests log a job ID linking queue, start, throttled phase progress and

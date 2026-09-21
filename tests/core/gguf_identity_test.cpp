@@ -192,6 +192,22 @@ void TestFileDigestCache() {
   std::filesystem::remove_all(root);
 }
 
+void TestPipelinedFileHash() {
+  const auto bytes = BuildImage("pipeline", "first", 40 * 1024 * 1024, 8194);
+  const auto path = std::filesystem::temp_directory_path() /
+                    ("gufo-identity-pipeline-" + std::to_string(getpid()));
+  {
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+  }
+  std::string error;
+  const auto reader = gufo::core::GgufReader::OpenFile(path.string(), &error);
+  Expect(reader != nullptr, "pipelined fixture opens");
+  Expect(gufo::core::GgufIdentityHex(*reader) == Identity(bytes),
+         "parallel disk reads hash all chunks and the unaligned tail in order");
+  std::filesystem::remove(path);
+}
+
 void TestSha256() {
   const std::string text = "abc";
   gufo::crypto::Sha256Hasher hash;
@@ -210,6 +226,7 @@ void TestSha256() {
 int main() {
   TestSha256();
   TestFileDigestCache();
+  TestPipelinedFileHash();
   TestDeterministic();
   TestHeaderChangesIdentity();
   TestEveryPayloadByte();

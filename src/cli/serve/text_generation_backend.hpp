@@ -97,6 +97,8 @@ struct ChatRequest {
   ToolChoice tool_choice{ToolChoice::kAuto};
   ReasoningOptions reasoning;
   bool add_vision_id{false};
+  /// Bypass prompt reuse for this request; its completed state may be retained.
+  bool cache_prompt{true};
 };
 
 /// Model-agnostic text generation boundary used by the HTTP transport.

@@ -32,6 +32,8 @@ struct TextPromptContext {
 struct TextPreparedPrompt {
   std::vector<TextRunnerToken> tokens;
   std::shared_ptr<const TextPromptContext> context;
+  /// Snapshot before mutable assistant framing. Zero uses the complete prompt.
+  std::size_t cache_prefix_tokens{0};
 };
 
 struct TextRunnerDiskCacheOptions {
@@ -399,7 +401,8 @@ public:
       std::vector<TextRunnerToken> prompt,
       const sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled = {},
-      std::shared_ptr<const TextPromptContext> context = {});
+      std::shared_ptr<const TextPromptContext> context = {},
+      bool reuse_prompt = true, std::size_t cache_prefix_tokens = 0);
   [[nodiscard]] Request Acquire(std::vector<TextRunnerToken> prompt,
                                 const CancellationCheck& is_cancelled = {});
 

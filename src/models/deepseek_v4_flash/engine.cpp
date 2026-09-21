@@ -176,10 +176,14 @@ bool Model::DsparkStepBatch(std::span<const SessionDsparkBatchItem> items,
   return true;
 }
 
-std::vector<int> Model::Tokenize(std::string_view text) const {
+std::vector<int> Model::Tokenize(std::string_view text,
+                                 bool parse_special_tokens) const {
   const std::string owned(text);
   ds4_tokens tokens{};
-  ds4_tokenize_text(engine_, owned.c_str(), &tokens);
+  if (parse_special_tokens)
+    ds4_tokenize_rendered_chat(engine_, owned.c_str(), &tokens);
+  else
+    ds4_tokenize_text(engine_, owned.c_str(), &tokens);
   return TakeTokens(&tokens);
 }
 
@@ -201,9 +205,7 @@ std::vector<int> Model::EncodeChat(std::span<const ChatMessage> messages,
                                    std::span<const ChatTool> tools,
                                    const ChatTemplateOptions& options) const {
   const std::string rendered = RenderChat(messages, tools, options);
-  ds4_tokens tokens{};
-  ds4_tokenize_rendered_chat(engine_, rendered.c_str(), &tokens);
-  return TakeTokens(&tokens);
+  return Tokenize(rendered, true);
 }
 
 std::string Model::DecodeToken(int token) const {

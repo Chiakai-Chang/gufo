@@ -2017,45 +2017,6 @@ static bool rocm_graph_upload_prompt_embeddings_hc(
                                            DS4_N_HC) != 0;
 }
 
-static bool rocm_graph_warmup_prefill_kernels(
-        ds4_gpu_graph   *g,
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           n_tokens) {
-    static bool warmed = false;
-    if (warmed) return true;
-
-    /*
-     * The first batched F16 matmul can pay ROCm's one-time pipeline execution
-     * cost. Run the same HC attention projection on scratch storage before the
-     * measured prefill. The output is overwritten by the real graph.
-     */
-    if (n_tokens <= 8) return true;
-
-    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
-    const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
-
-    bool ok = ds4_gpu_begin_commands() != 0;
-    if (ok) {
-        ok = ds4_gpu_matmul_f16_tensor(g->batch_hc_mix,
-                                         model->map,
-                                         model->size,
-                                         weights->layer[0].hc_attn_fn->abs_offset,
-                                         hc_dim,
-                                         mix_hc,
-                                         g->batch_flat_hc,
-                                         n_tokens) != 0;
-    }
-    if (ok) ok = ds4_gpu_end_commands() != 0;
-    if (!ok) {
-        fprintf(stderr, "ds4: ROCm prefill kernel warmup failed\n");
-        return false;
-    }
-
-    warmed = true;
-    return true;
-}
-
 /* Encode the batched prefill attention half for one layer.  It mirrors the CPU
  * layer-major path: HC pre/norm, Q/KV, cache/compression, prefix attention. */
 static bool rocm_graph_indexer_stage_profile_boundary(
@@ -4381,8 +4342,6 @@ static bool rocm_graph_prefill_layer_major(
     bool ok = rocm_graph_upload_prompt_tokens(g->prefill_tokens, prompt, start, n_tokens);
     if (!ok) return false;
 
-    if (!rocm_graph_warmup_prefill_kernels(g, model, weights, n_tokens)) return false;
-
     const bool profile =
         getenv("GUFO_DEEPSEEK_ROCM_GRAPH_PREFILL_PROFILE") != NULL;
     const double t0 = profile ? ds4_now_seconds() : 0.0;
@@ -5138,8 +5097,6 @@ static bool rocm_graph_verify_suffix(ds4_gpu_graph* g, const ds4_model* model,
                                        n_tokens)) {
     return false;
   }
-  if (!rocm_graph_warmup_prefill_kernels(g, model, weights, n_tokens))
-    return false;
   if (!rocm_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
                                               g->prefill_tokens, model, weights,
                                               tokens, start, n_tokens)) {

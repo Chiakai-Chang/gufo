@@ -52,7 +52,6 @@ if (ENGINE_ENABLE_HIP)
     ${QFN_ROCM_DIR}/w8a8_wave64.hip
     ${QFN_ROCM_DIR}/blaslt.cpp
     ${QFN_ROCM_DIR}/device_model.cpp
-    ${QFN_ROCM_DIR}/weight_upload.cpp
     ${QFN_ROCM_DIR}/executor.cpp
     ${QFN_ROCM_DIR}/batch.cpp
     engine.cpp)

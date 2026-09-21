@@ -246,14 +246,16 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     std::span<const ContinuationToken> prompt,
     const CancellationCheck& is_cancelled,
     std::span<const std::uint8_t> input_identity,
-    const std::function<void(ContinuationState&)>& prepare_state) {
+    const std::function<void(ContinuationState&)>& prepare_state,
+    bool reuse_prompt) {
   while (true) {
     std::unique_lock<std::mutex> lock(impl_->mutex);
 
     const std::size_t no_entry = impl_->entries.size();
     std::size_t source = no_entry;
     std::size_t cached_tokens = 0;
-    for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
+    for (std::size_t index = 0; reuse_prompt && index < impl_->entries.size();
+         ++index) {
       const auto& entry = *impl_->entries[index];
       if ((!impl_->snapshot_mode() && !entry.available) || !entry.valid ||
           !std::equal(entry.input_identity.begin(), entry.input_identity.end(),
@@ -269,7 +271,7 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     // A live final frontier can extend the immutable prompt snapshot. Prefer
     // it on equal prefix lengths too: no restoration or D2H copy is needed.
     std::size_t live_source = no_entry;
-    if (impl_->snapshot_mode()) {
+    if (reuse_prompt && impl_->snapshot_mode()) {
       for (std::size_t index = 0; index < impl_->entries.size(); ++index) {
         const auto& entry = *impl_->entries[index];
         if (entry.available && !entry.live_tokens.empty() &&

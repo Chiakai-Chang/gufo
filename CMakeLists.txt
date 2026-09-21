@@ -161,6 +161,7 @@ if (ENGINE_ENABLE_HIP)
     src/models/minimax_h3/sampling.hip
     src/models/minimax_h3/video_vae.hip
     src/models/minimax_h3/attention.hip
+    src/core/hip/weight_upload.cpp
     src/core/speculative/speculative_verifier.cpp
   )
   target_compile_definitions(gufo_core PUBLIC ENGINE_ENABLE_HIP=1)
@@ -856,6 +857,11 @@ if (BUILD_TESTING)
     set_tests_properties(minimax_h3_audio_vae_real PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;audio;vae;quality;external-model;very-slow"
       SKIP_RETURN_CODE 77)
+
+    add_executable(hip_weight_upload_test tests/core/hip_weight_upload_test.cpp)
+    target_link_libraries(hip_weight_upload_test PRIVATE gufo_core)
+    add_test(NAME hip_weight_upload_test COMMAND hip_weight_upload_test)
+    set_tests_properties(hip_weight_upload_test PROPERTIES LABELS "hip;gpu;gfx1151")
 
     add_executable(hipblaslt_runtime_cache_test
       tests/kernels/hipblaslt_runtime_cache_test.cpp)

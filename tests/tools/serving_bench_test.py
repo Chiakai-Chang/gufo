@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 
 from gufo import serving_bench
+from gufo.model_bench.render import _serving_rate
 
 
 def check(condition, message):
@@ -466,6 +467,21 @@ check(
     "openai profile, cache flag, notes, and reference are recorded",
 )
 check(openai_report["warnings"] == [], "no spurious warnings without metrics")
+with patch.object(serving_bench.urllib.request, "urlopen", fake_urlopen):
+    try:
+        serving_bench.run_corpus_benchmark(
+            base_url="https://private.example", model="test-model",
+            cases=[serving_bench.PromptCase("code", "code", "write C++")],
+            workload_id="no-cache-contract", max_tokens=2, temperature=0.0,
+            concurrency_levels=[1], warmup_rounds=0, repetitions=1,
+            timeout_seconds=5, fingerprint=fingerprint,
+            source_revision="a" * 40, source_dirty=False,
+            suite_bytes=b"test", cache_prompt=False,
+        )
+        raise AssertionError("cache hits must reject a no-cache benchmark")
+    except RuntimeError as error:
+        check("ignored cache_prompt=false" in str(error),
+              "cache-policy violation is explicit")
 check(
     openai_report["results"]["c2"]["completionExactness"]["matchedRounds"] == 1,
     "fully matching rounds are counted",
@@ -581,5 +597,16 @@ try:
         raise AssertionError("unknown categories must be rejected")
 finally:
     suite_path.unlink()
+
+rate_report = {"results": {"c2": {
+    "rounds": [{"sampleCount": 2}, {"sampleCount": 2}],
+    "samples": [{"decode_tokens_per_second": value} for value in (10, 20, 30, 40)],
+    "aggregate": {"output_tokens_per_second": {"overall": 1}},
+}}}
+check(_serving_rate(rate_report, 2) == 50,
+      "model tables average the sum of individual decode rates per group")
+rate_report["results"]["c2"]["samples"][0]["decode_tokens_per_second"] = None
+check(_serving_rate(rate_report, 2) is None,
+      "missing decode timings must not fall back to whole-request throughput")
 
 print("Serving benchmark harness tests passed.")

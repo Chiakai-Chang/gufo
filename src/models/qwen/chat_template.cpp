@@ -519,14 +519,8 @@ std::optional<std::string> QwenChatTemplate::Render(
     }
   }
 
-  if (options.add_generation_prompt) {
-    output.append("<|im_start|>assistant\n");
-    if (options.enable_thinking) {
-      output.append("<think>\n");
-    } else {
-      output.append("<think>\n\n</think>\n\n");
-    }
-  }
+  if (options.add_generation_prompt)
+    output.append(GenerationPrompt(options.enable_thinking));
 
   if (output.size() > options.max_output_bytes) {
     if (error_msg != nullptr) {
@@ -536,6 +530,11 @@ std::optional<std::string> QwenChatTemplate::Render(
   }
 
   return output;
+}
+
+std::string_view GenerationPrompt(bool enable_thinking) {
+  return enable_thinking ? "<|im_start|>assistant\n<think>\n"
+                         : "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 }
 
 std::optional<std::vector<TokenId>> QwenChatTemplate::RenderAndTokenize(

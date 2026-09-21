@@ -11,6 +11,15 @@ KV rows. Operator checks cover FP16 production and head-major FP32 reference
 snapshots, dirty unused tails and exact disk round trips. Matched production
 pp2048/tg128 controls show no material speed regression.
 
+Interrupted-chat qualification also passes on Q4_K_XL and **Q8_K_XL**, both
+AR and Q4 DFlash2: reasoning/visible-text cancellation, preserved/removed
+reasoning, greedy/seeded replay, a third turn, images and disk restart.
+The native vision checks retain their cold-versus-live equality gate and
+concurrent image/text isolation. The HTTP check requires exact replay with
+the same history and verifies that `cache_prompt: false` bypasses reuse.
+See [server check instructions](../../SERVER.md). Existing benchmark tables
+were not refreshed by this cache qualification.
+
 ## Maintained checks
 
 Run on gfx1151 through Nix. Model-specific tests and tools live in

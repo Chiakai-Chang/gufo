@@ -10,7 +10,7 @@ benchmark/tuning executables; Python tools run from this source tree.
 | --- | --- |
 | `bench/` | Kernel microbenchmarks, hipBLASLt tuning, and direct speculative-corpus checks; `model-bench.py` drives per-model BENCHMARKS.md tables against llama.cpp |
 | `prof/` | rocprofv3 capture, stage summaries, and ISA inspection |
-| `serving/` | Concurrent HTTP serving benchmarks |
+| `serving/` | Concurrent HTTP benchmarks and interrupted-chat/disk replay checks |
 | `ds4/` | DeepSeek-specific validation and experiments |
 | `qwen27b/` | Qwen27B/DFlash2 kernels, reference checks, and vision validation |
 | `qwen-flash/` | Flash-Next projection and MoE microbenchmarks |

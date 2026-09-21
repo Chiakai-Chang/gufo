@@ -42,9 +42,8 @@
             src = pkgs.${system}.fetchFromGitHub {
               owner = "ggml-org";
               repo = "llama.cpp";
-              tag = "b${llamaCppVersion}";
+              rev = llamaCppCommit;
               hash = "sha256-BnGWYIkVe9y4aufhS5s3Jco1j/BY0MgBlzXrRQFMW3o=";
-              leaveDotGit = true;
             };
             npmDepsHash = "sha256-2Q7XhaLAArmviOLdQsNbYTfdyDE5pW9lR26cRHEVl9k=";
             cmakeFlags = (oldAttrs.cmakeFlags or [ ]) ++ [

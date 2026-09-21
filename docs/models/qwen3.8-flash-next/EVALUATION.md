@@ -7,6 +7,13 @@ mid-decode save, ring wrap, pending predictor state and RNG replay. Snapshots
 retain live KV, unpooled indexer rows, pooled keys, recurrence/PLE history and
 the required MTP frontier; temporary verifier scratch is excluded.
 
+Production HTTP checks also pass for AR/MTP interruption inside reasoning and
+visible text, preserved/removed reasoning, greedy/seeded replay, third-turn
+continuation, images and disk restart. Removing prior reasoning retains the
+stable prompt checkpoint. `cache_prompt: false` bypasses both live and disk
+reuse. The native image checks retain exact cold-versus-live output and
+independent concurrent sessions; see [server check instructions](../../SERVER.md).
+
 The predictor uses one RMSNorm over all 10,240 hidden values, a shared
 2,560-wide hidden projection per HC branch, and one embedding projection
 broadcast to the four branches. It embeds shifted text token IDs; visual
