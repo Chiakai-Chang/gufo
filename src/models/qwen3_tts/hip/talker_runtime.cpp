@@ -28,6 +28,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/core/mapped_prefetch.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 #include "src/models/qwen3_tts/hip/talker_ops.hpp"
 #include "src/models/qwen3_tts/loader.hpp"
@@ -134,6 +135,7 @@ public:
     host_ = region.data;
     size_ = region.size;
     payload_offset_ = region.payload_offset;
+    core::PrefaultMappedRange(host_, size_);
     // gfx1151 shares one physical memory pool with the host, but
     // device-resident weights still use coarse-grained pages the GPU caches and
     // streams far faster than host-registered pages, so decode prefers the
@@ -391,8 +393,9 @@ struct TalkerHipRuntime::Impl {
                            model.config.talker.num_code_groups),
         codec_embedding_tables(model.config.talker.num_code_groups),
         predictor_token(1) {
-    if (model.mapped_regions.empty() ||
-        !main_weights.Initialize(model.mapped_regions.front(), nullptr)) {
+    const auto talker_regions = model.RegionsFor("talker.");
+    if (talker_regions.size() != 1 ||
+        !main_weights.Initialize(talker_regions.front(), nullptr)) {
       throw std::runtime_error(
           "cannot initialize Qwen3-TTS GPU weight mapping");
     }
