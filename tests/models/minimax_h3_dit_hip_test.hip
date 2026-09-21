@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "src/models/minimax_h3/attention.hip.hpp"
+#include "src/models/minimax_h3/dense.hip.hpp"
 #include "src/models/minimax_h3/dit.hpp"
 #include "src/models/minimax_h3/dit_ops.hip.hpp"
 #include "src/models/minimax_h3/sha256.hpp"
@@ -101,6 +102,17 @@ void CheckClose(std::span<const std::uint16_t> got,
       return;
     }
   }
+}
+
+__global__ void ApplyLookupForTest(const std::uint16_t* fused,
+                                   std::uint16_t* output, const float* lookup,
+                                   unsigned rows, unsigned width) {
+  const unsigned row = blockIdx.y,
+                 column = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < rows && column < width)
+    output[std::size_t(row) * width + column] = ops::ApplySwiGluLookup(
+        fused[std::size_t(row) * width * 2 + column],
+        fused[(std::size_t(row) * 2 + 1) * width + column], lookup);
 }
 
 void CheckCastsElementwiseAndNorms() {
@@ -254,6 +266,19 @@ void CheckAdaLnGateAndSwiGlu() {
       CHECK(std::abs(ToFloat(got[row * kWidth + column]) - expected) < 0.02F);
     }
   }
+  DeviceArray<float> d_final(input.size());
+  std::vector<float> final_output(input.size());
+  for (std::uint32_t modulation_row = 0; modulation_row < kModulationRows;
+       ++modulation_row) {
+    ops::LaunchFinalAdaLn(d_input.get(), d_weight.get(), d_modulation.get(),
+                          modulation_row, d_final.get(), kRows, kWidth, kSlots,
+                          0, 1, 1.0e-5F, nullptr);
+    CHECK(hipDeviceSynchronize() == hipSuccess);
+    CHECK(d_final.CopyTo(final_output));
+    for (std::size_t index = 0; index < got.size(); ++index)
+      if (row_map[index / kWidth] == modulation_row)
+        CHECK(final_output[index] == ToFloat(got[index]));
+  }
   ops::LaunchGate(d_input.get(), d_branch.get(), d_modulation.get(),
                   d_row_map.get(), d_output.get(), kRows, kWidth, kSlots, 2,
                   nullptr);
@@ -262,6 +287,32 @@ void CheckAdaLnGateAndSwiGlu() {
   for (std::size_t index = 0; index < got.size(); ++index) {
     CHECK(std::abs(ToFloat(got[index]) - (ToFloat(input[index]) + 0.125F)) <
           0.015F);
+  }
+
+  ops::LaunchGate(d_input.get(), d_branch.get(), d_modulation.get(),
+                  d_row_map.get(), d_input.get(), kRows, kWidth, kSlots, 2,
+                  nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  std::vector<std::uint16_t> in_place(input.size());
+  CHECK(d_input.CopyTo(in_place));
+  CHECK(in_place == got);
+  CHECK(d_input.CopyFrom(input));
+  ops::LaunchGateRmsInverse(d_input.get(), d_branch.get(), d_modulation.get(),
+                            d_row_map.get(), d_input.get(), d_inverse.get(),
+                            kRows, kWidth, kSlots, 2, 1.0e-5F, nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  CHECK(d_input.CopyTo(in_place));
+  CHECK(in_place == got);
+  std::vector<float> inverse_result(kRows);
+  CHECK(d_inverse.CopyTo(inverse_result));
+  for (std::size_t row = 0; row < kRows; ++row) {
+    double square = 0;
+    for (std::size_t c = 0; c < kWidth; ++c) {
+      double v = ToFloat(got[row * kWidth + c]);
+      square += v * v;
+    }
+    CHECK(std::abs(inverse_result[row] -
+                   1 / std::sqrt(square / kWidth + 1.0e-5)) < 1.0e-6);
   }
 
   constexpr std::uint32_t kSwiRows = 2;
@@ -293,11 +344,12 @@ void CheckAdaLnGateAndSwiGlu() {
     }
   }
 
-  constexpr std::uint32_t kLookupRows = 256;
+  constexpr std::uint32_t kLookupRows = 257;
   constexpr std::uint32_t kLookupWidth = 256;
   constexpr std::size_t kLookupEntries = 1ULL << 16U;
-  std::vector<std::uint16_t> lookup_fused(kLookupEntries * 2U);
-  for (std::size_t index = 0; index < kLookupEntries; ++index) {
+  constexpr std::size_t kLookupElements = kLookupRows * kLookupWidth;
+  std::vector<std::uint16_t> lookup_fused(kLookupElements * 2U);
+  for (std::size_t index = 0; index < kLookupElements; ++index) {
     const std::size_t row = index / kLookupWidth;
     const std::size_t column = index % kLookupWidth;
     lookup_fused[(row * 2U) * kLookupWidth + column] =
@@ -306,19 +358,19 @@ void CheckAdaLnGateAndSwiGlu() {
         ToBf16((static_cast<float>(index % 31U) - 15.0F) / 7.0F);
   }
   DeviceArray<std::uint16_t> d_lookup_fused(lookup_fused.size());
-  DeviceArray<std::uint16_t> d_lookup_reference(kLookupEntries);
-  DeviceArray<std::uint16_t> d_lookup_output(kLookupEntries);
+  DeviceArray<std::uint16_t> d_lookup_reference(kLookupElements);
+  DeviceArray<std::uint16_t> d_lookup_output(kLookupElements);
   DeviceArray<float> d_silu_lookup(kLookupEntries);
   CHECK(d_lookup_fused.CopyFrom(lookup_fused));
   ops::LaunchBf16SiluLookup(d_silu_lookup.get(), nullptr);
   ops::LaunchSwiGlu(d_lookup_fused.get(), d_lookup_reference.get(), kLookupRows,
                     kLookupWidth, nullptr);
-  ops::LaunchSwiGluLookup(d_lookup_fused.get(), d_lookup_output.get(),
-                          d_silu_lookup.get(), kLookupRows, kLookupWidth,
-                          nullptr);
+  ApplyLookupForTest<<<dim3(kLookupWidth / 256, kLookupRows), 256>>>(
+      d_lookup_fused.get(), d_lookup_output.get(), d_silu_lookup.get(),
+      kLookupRows, kLookupWidth);
   CHECK(hipDeviceSynchronize() == hipSuccess);
-  std::vector<std::uint16_t> lookup_reference(kLookupEntries);
-  std::vector<std::uint16_t> lookup_output(kLookupEntries);
+  std::vector<std::uint16_t> lookup_reference(kLookupElements);
+  std::vector<std::uint16_t> lookup_output(kLookupElements);
   CHECK(d_lookup_reference.CopyTo(lookup_reference));
   CHECK(d_lookup_output.CopyTo(lookup_output));
   CHECK(lookup_output == lookup_reference);
@@ -454,7 +506,350 @@ void CheckGroupedQkvAndAttention() {
   }
 }
 
-void CheckNativeAttention(std::uint32_t rows, float query_scale = 1.7F) {
+void CheckFusedQkvNormRope() {
+  constexpr std::uint32_t rows = 17, heads = 3, dim = 128, half = 48;
+  constexpr std::size_t elements = rows * heads * dim;
+  std::vector<std::uint16_t> qkv(elements * 3), qw(dim), kw(dim);
+  std::vector<std::uint16_t> cosine(rows * half), sine(rows * half);
+  for (std::size_t i = 0; i < qkv.size(); ++i)
+    qkv[i] = ToBf16(std::sin(float(i) * 0.017F));
+  for (std::size_t i = 0; i < dim; ++i) {
+    qw[i] = ToBf16(0.7F + float(i % 13) * 0.031F);
+    kw[i] = ToBf16(1.2F - float(i % 17) * 0.029F);
+  }
+  for (std::size_t i = 0; i < cosine.size(); ++i) {
+    cosine[i] = ToBf16(std::cos(float(i) * 0.013F));
+    sine[i] = ToBf16(std::sin(float(i) * 0.013F));
+  }
+  DeviceArray<std::uint16_t> dqkv(qkv.size()), dqw(dim), dkw(dim),
+      dc(cosine.size()), ds(sine.size()), dq(elements), dk(elements),
+      dv(elements);
+  CHECK(dqkv.CopyFrom(qkv));
+  CHECK(dqw.CopyFrom(qw));
+  CHECK(dkw.CopyFrom(kw));
+  CHECK(dc.CopyFrom(cosine));
+  CHECK(ds.CopyFrom(sine));
+  std::vector<std::uint16_t> query(elements), key(elements), value(elements);
+  std::vector<std::uint16_t> row_query, row_key, row_value;
+  for (bool head_major : {false, true}) {
+    ops::LaunchGroupedQkvNormRope(dqkv.get(), dqw.get(), dkw.get(), dc.get(),
+                                  ds.get(), dq.get(), dk.get(), dv.get(), rows,
+                                  heads, dim, half, 1.0e-5F, nullptr,
+                                  head_major);
+    CHECK(hipDeviceSynchronize() == hipSuccess);
+    CHECK(dq.CopyTo(query));
+    CHECK(dk.CopyTo(key));
+    CHECK(dv.CopyTo(value));
+    double error_squared = 0, norm_squared = 0;
+    for (std::uint32_t r = 0; r < rows; ++r) {
+      for (std::uint32_t h = 0; h < heads; ++h) {
+        const auto base = (r * heads + h) * dim * 3;
+        const auto out = (head_major ? h * rows + r : r * heads + h) * dim;
+        for (unsigned plane = 0; plane < 2; ++plane) {
+          const auto& weight = plane == 0 ? qw : kw;
+          const auto& actual = plane == 0 ? query : key;
+          double square_sum = 0;
+          for (unsigned d = 0; d < dim; ++d) {
+            const double x = ToFloat(qkv[base + plane * dim + d]);
+            square_sum += x * x;
+          }
+          const double inverse = 1 / std::sqrt(square_sum / dim + 1.0e-5);
+          const auto normalized = [&](unsigned d) {
+            return ToFloat(qkv[base + plane * dim + d]) * inverse *
+                   ToFloat(weight[d]);
+          };
+          for (unsigned d = 0; d < dim; ++d) {
+            double expected = normalized(d);
+            if (d < half * 2) {
+              const auto rotary = r * half + d % half;
+              const double c = ToFloat(cosine[rotary]);
+              const double s = ToFloat(sine[rotary]);
+              expected = d < half ? expected * c - normalized(d + half) * s
+                                  : expected * c + normalized(d - half) * s;
+            }
+            CHECK(std::isfinite(ToFloat(actual[out + d])));
+            const double delta = ToFloat(actual[out + d]) - expected;
+            error_squared += delta * delta;
+            norm_squared += expected * expected;
+          }
+        }
+        for (unsigned d = 0; d < dim; ++d) {
+          CHECK(value[out + d] == qkv[base + 2 * dim + d]);
+          if (head_major) {
+            const auto row_out = (r * heads + h) * dim + d;
+            CHECK(query[out + d] == row_query[row_out]);
+            CHECK(key[out + d] == row_key[row_out]);
+            CHECK(value[out + d] == row_value[row_out]);
+          }
+        }
+      }
+    }
+    CHECK(std::sqrt(error_squared / norm_squared) < 0.004);
+    if (!head_major) {
+      row_query = query;
+      row_key = key;
+      row_value = value;
+    }
+  }
+}
+
+void CheckNativeQkv() {
+  constexpr std::size_t rows = 129, padded = 160, guard = 16;
+  constexpr auto heads = h3::kDitAttentionHeads, dim = h3::kDitHeadDimension;
+  constexpr auto m = heads * dim * 3, k = h3::kDitHiddenSize;
+  const auto elements = rows * heads * dim,
+             packed_elements = padded * heads * dim;
+  std::vector<std::uint16_t> weights(m * k, 0), input(rows * k), raw(rows * m);
+  for (std::size_t i = 0; i < input.size(); ++i)
+    input[i] = ToBf16(float(int((i * 17) % 193) - 96) / 32);
+  // Independent, exactly soluble dots exercise every interleaved Q/K/V head,
+  // both sides of every 256-channel tile, and the partial token tile.
+  for (std::size_t r = 0; r < m; ++r) {
+    const auto first = (r * 37) % k, second = (first + k / 2) % k;
+    weights[r * k + first] = ToBf16(0.5F);
+    weights[r * k + second] = ToBf16(-0.25F);
+    for (std::size_t t = 0; t < rows; ++t)
+      raw[t * m + r] = ToBf16(ToFloat(input[t * k + first]) * 0.5F -
+                              ToFloat(input[t * k + second]) * 0.25F);
+  }
+  std::vector<std::uint16_t> qw(dim), kw(dim), cosine(rows * 48),
+      sine(rows * 48);
+  for (std::size_t d = 0; d < dim; ++d) {
+    qw[d] = ToBf16(float(3 + d % 7) / 8);
+    kw[d] = ToBf16(float(5 + d % 11) / 8);
+  }
+  for (std::size_t i = 0; i < cosine.size(); ++i) {
+    cosine[i] = ToBf16(std::cos(float(i) * 0.013F));
+    sine[i] = ToBf16(std::sin(float(i) * 0.013F));
+  }
+  DeviceArray<std::uint16_t> dw(weights.size()), pw(weights.size()),
+      dx(input.size()), px(input.size()), dr(raw.size()), dqw(dim), dkw(dim),
+      dc(cosine.size()), ds(sine.size()), dq(elements + guard),
+      dk(elements + guard), dv(packed_elements + guard), rq(elements),
+      rk(elements), rv(elements);
+  CHECK(dw.CopyFrom(weights));
+  CHECK(dx.CopyFrom(input));
+  CHECK(dr.CopyFrom(raw));
+  CHECK(dqw.CopyFrom(qw));
+  CHECK(dkw.CopyFrom(kw));
+  CHECK(dc.CopyFrom(cosine));
+  CHECK(ds.CopyFrom(sine));
+  std::vector<std::uint16_t> query(elements + guard, 0x7fc1U), key(query),
+      value(packed_elements + guard, 0x7fc1U);
+  CHECK(dq.CopyFrom(query));
+  CHECK(dk.CopyFrom(key));
+  CHECK(dv.CopyFrom(value));
+  ops::LaunchPackDense(dw.get(), pw.get(), m, k, nullptr);
+  ops::LaunchPackDense(dx.get(), px.get(), rows, k, nullptr);
+  ops::LaunchQkv(pw.get(), px.get(), dqw.get(), dkw.get(), dc.get(), ds.get(),
+                 dq.get(), dk.get(), dv.get(), rows, nullptr);
+  ops::LaunchGroupedQkvNormRope(
+      dr.get(), dqw.get(), dkw.get(), dc.get(), ds.get(), rq.get(), rk.get(),
+      rv.get(), rows, heads, dim, 48, h3::kDitNormEpsilon, nullptr, true);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  CHECK(dq.CopyTo(query));
+  CHECK(dk.CopyTo(key));
+  CHECK(dv.CopyTo(value));
+  std::vector<std::uint16_t> expected_q(elements), expected_k(elements),
+      expected_v(elements);
+  CHECK(rq.CopyTo(expected_q));
+  CHECK(rk.CopyTo(expected_k));
+  CHECK(rv.CopyTo(expected_v));
+  // The pinned rocBLAS and native WMMA agree byte-for-byte on this case,
+  // including up to 5.96e-8 at exact cancellation of the sparse CPU dots.
+  // That FP32 residual can select an adjacent BF16 after RoPE. Bound it
+  // against the independent dots; checkpoint replay separately requires
+  // identical complete block/forward bytes, and norm/RoPE has an FP64 oracle.
+  const auto matches = [](std::uint16_t actual, std::uint16_t expected,
+                          float cancellation_bound, bool normalized) {
+    if (actual == expected)
+      return true;
+    if (ToFloat(expected) == 0.0F)
+      return std::abs(ToFloat(actual)) <= cancellation_bound;
+    return normalized && std::isfinite(ToFloat(actual)) &&
+           std::abs(int(actual) - int(expected)) <= 1;
+  };
+  bool exact = true;
+  for (std::size_t i = 0; i < elements; ++i) {
+    exact &= matches(query[i], expected_q[i], 1.0e-6F, true);
+    exact &= matches(key[i], expected_k[i], 1.0e-6F, true);
+  }
+  for (std::size_t h = 0; h < heads; ++h)
+    for (std::size_t d = 0; d < dim; ++d)
+      for (std::size_t t = 0; t < padded; ++t)
+        exact &= matches(value[(h * dim + d) * padded + t],
+                         t < rows ? expected_v[(h * rows + t) * dim + d] : 0,
+                         t < rows ? 1.0e-7F : 0.0F, false);
+  CHECK(exact);
+  for (std::size_t i = 0; i < guard; ++i) {
+    CHECK(query[elements + i] == 0x7fc1U);
+    CHECK(key[elements + i] == 0x7fc1U);
+    CHECK(value[packed_elements + i] == 0x7fc1U);
+  }
+}
+
+void CheckNativeHiddenProjection(bool attention) {
+  // Two nonzero coefficients per output give an independent exact result
+  // across every output tile and K group, including the partial 129-row tile.
+  constexpr std::size_t rows = 129, guard = 16;
+  constexpr auto m = h3::kDitHiddenSize;
+  const auto k = attention ? h3::kDitAttentionWidth : h3::kDitFeedForwardSize;
+  std::vector<std::uint16_t> weights(std::size_t(m) * k, 0), input(rows * k);
+  for (std::size_t i = 0; i < input.size(); ++i)
+    input[i] = ToBf16(float(int((i * 17) % 193) - 96) / 64);
+  for (std::size_t r = 0; r < m; ++r) {
+    weights[r * k + (r * 37) % k] = ToBf16(0.5F);
+    weights[r * k + ((r * 37) % k + k / 2) % k] = ToBf16(-0.25F);
+  }
+  DeviceArray<std::uint16_t> dw(weights.size()), packed_weight(weights.size()),
+      dx(input.size()), packed_input(input.size()), dy(rows * m + guard);
+  CHECK(dw.CopyFrom(weights));
+  CHECK(dx.CopyFrom(input));
+  std::vector<std::uint16_t> result(rows * m + guard, 0x7fc1U);
+  CHECK(dy.CopyFrom(result));
+  ops::LaunchPackDense(dw.get(), packed_weight.get(), m, k, nullptr);
+  ops::LaunchPackDense(dx.get(), packed_input.get(), rows, k, nullptr);
+  if (attention)
+    ops::LaunchAttentionOutput(packed_weight.get(), packed_input.get(),
+                               dy.get(), rows, nullptr);
+  else
+    ops::LaunchFfnDown(packed_weight.get(), packed_input.get(), dy.get(), rows,
+                       nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  CHECK(dy.CopyTo(result));
+  bool exact = true;
+  for (std::size_t t = 0; t < rows; ++t) {
+    for (std::size_t r = 0; r < m; ++r) {
+      const auto first = (r * 37) % k, second = (first + k / 2) % k;
+      const float expected = ToFloat(input[t * k + first]) * 0.5F -
+                             ToFloat(input[t * k + second]) * 0.25F;
+      exact &= result[t * m + r] == ToBf16(expected);
+    }
+  }
+  CHECK(exact);
+  for (std::size_t i = rows * m; i < result.size(); ++i)
+    CHECK(result[i] == 0x7fc1U);
+}
+
+void CheckPackedAdaLn(bool attention) {
+  constexpr std::size_t rows = 129, width = h3::kDitHiddenSize, guard = 16;
+  std::vector<std::uint16_t> input(rows * width), weight(width),
+      modulation(3 * h3::kDitModulationSlots * width);
+  std::vector<std::uint32_t> row_map(rows);
+  std::vector<float> inverse(rows);
+  for (std::size_t i = 0; i < input.size(); ++i)
+    input[i] = ToBf16(float(int(i % 193) - 96) / 32);
+  for (std::size_t i = 0; i < width; ++i)
+    weight[i] = ToBf16(float(3 + i % 7) / 8);
+  for (std::size_t i = 0; i < modulation.size(); ++i)
+    modulation[i] = ToBf16(float(int(i % 23) - 11) / 32);
+  for (std::size_t i = 0; i < rows; ++i) {
+    row_map[i] = (i * 13) % 3;
+    inverse[i] = float(1 + i % 3) / 4;
+  }
+  DeviceArray<std::uint16_t> dx(input.size()), dw(weight.size()),
+      dm(modulation.size()), dy(input.size() + guard);
+  DeviceArray<std::uint32_t> dr(row_map.size());
+  DeviceArray<float> di(inverse.size());
+  std::vector<std::uint16_t> result(input.size() + guard, 0x7fc1U);
+  CHECK(dx.CopyFrom(input));
+  CHECK(dw.CopyFrom(weight));
+  CHECK(dm.CopyFrom(modulation));
+  CHECK(dr.CopyFrom(row_map));
+  CHECK(di.CopyFrom(inverse));
+  CHECK(dy.CopyFrom(result));
+  if (attention)
+    ops::LaunchPackedAttentionAdaLn(dx.get(), dw.get(), dm.get(), dr.get(),
+                                    di.get(), dy.get(), rows, nullptr);
+  else
+    ops::LaunchPackedMlpAdaLn(dx.get(), dw.get(), dm.get(), dr.get(), di.get(),
+                              dy.get(), rows, nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  CHECK(dy.CopyTo(result));
+  bool exact = true;
+  for (std::size_t t = 0; t < rows; ++t)
+    for (std::size_t c = 0; c < width; ++c) {
+      const auto base = row_map[t] * h3::kDitModulationSlots * width;
+      const double norm = double(ToFloat(input[t * width + c])) * inverse[t] *
+                          ToFloat(weight[c]);
+      const double expected =
+          norm * (1.0 +
+                  ToFloat(modulation[base + (attention ? 1 : 4) * width + c])) +
+          ToFloat(modulation[base + (attention ? 0 : 3) * width + c]);
+      exact &= result[(c / 16 * rows + t) * 16 + c % 16] ==
+               ToBf16(static_cast<float>(expected));
+    }
+  CHECK(exact);
+  for (std::size_t i = input.size(); i < result.size(); ++i)
+    CHECK(result[i] == 0x7fc1U);
+  // Diagnostic readback must restore the public row-major tensor layout.
+  ops::LaunchUnpackDense(dy.get(), dx.get(), rows, width, nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  CHECK(dx.CopyTo(input));
+  exact = true;
+  for (std::size_t t = 0; t < rows; ++t)
+    for (std::size_t c = 0; c < width; ++c)
+      exact &=
+          input[t * width + c] == result[(c / 16 * rows + t) * 16 + c % 16];
+  CHECK(exact);
+}
+
+void CheckNativeFfnUp() {
+  constexpr std::size_t rows = 129, guard = 16;
+  constexpr auto m = h3::kDitFeedForwardSize, k = h3::kDitHiddenSize;
+  std::vector<std::uint16_t> weights(std::size_t(m) * k * 2, 0),
+      input(rows * k);
+  for (std::size_t i = 0; i < input.size(); ++i)
+    input[i] = ToBf16(float(int((i * 17) % 193) - 96) / 32);
+  for (std::size_t r = 0; r < m; ++r) {
+    weights[r * k + (r * 37) % k] = ToBf16(0.5F);
+    weights[(r + m) * k + ((r * 37) % k + k / 2) % k] = ToBf16(-0.25F);
+  }
+  std::vector<std::uint16_t> expected_fused(rows * m * 2);
+  for (std::size_t t = 0; t < rows; ++t)
+    for (std::size_t r = 0; r < m; ++r) {
+      const auto first = (r * 37) % k, second = (first + k / 2) % k;
+      expected_fused[t * m * 2 + r] =
+          ToBf16(std::fma(ToFloat(input[t * k + first]), 0.5F, 0.0F));
+      expected_fused[t * m * 2 + m + r] =
+          ToBf16(std::fma(ToFloat(input[t * k + second]), -0.25F, 0.0F));
+    }
+  DeviceArray<std::uint16_t> dw(weights.size()), packed_weight(weights.size()),
+      dx(input.size()), packed_input(input.size()), dy(rows * m + guard),
+      d_expected_fused(expected_fused.size()), d_expected(rows * m);
+  DeviceArray<float> lookup(65536);
+  CHECK(dw.CopyFrom(weights));
+  CHECK(dx.CopyFrom(input));
+  CHECK(d_expected_fused.CopyFrom(expected_fused));
+  std::vector<std::uint16_t> result(rows * m + guard, 0x7fc1U);
+  CHECK(dy.CopyFrom(result));
+  ops::LaunchBf16SiluLookup(lookup.get(), nullptr);
+  ops::LaunchPackFfnUpWeights(dw.get(), packed_weight.get(), nullptr);
+  ops::LaunchPackDense(dx.get(), packed_input.get(), rows, k, nullptr);
+  ops::LaunchFfnUp(packed_weight.get(), packed_input.get(), dy.get(),
+                   lookup.get(), rows, nullptr);
+  ops::LaunchSwiGlu(d_expected_fused.get(), d_expected.get(), rows, m, nullptr);
+  CHECK(hipDeviceSynchronize() == hipSuccess);
+  CHECK(dy.CopyTo(result));
+  std::vector<std::uint16_t> expected(rows * m);
+  CHECK(d_expected.CopyTo(expected));
+  bool exact = true;
+  for (std::size_t t = 0; t < rows; ++t)
+    for (std::size_t r = 0; r < m; ++r) {
+      const auto actual = result[(r / 16 * rows + t) * 16 + r % 16];
+      if (exact && actual != expected[t * m + r])
+        std::cerr << "FFN up mismatch row=" << t << " channel=" << r
+                  << " actual_bits=" << actual
+                  << " expected_bits=" << expected[t * m + r] << '\n';
+      exact &= actual == expected[t * m + r];
+    }
+  CHECK(exact);
+  for (std::size_t i = rows * m; i < result.size(); ++i)
+    CHECK(result[i] == 0x7fc1U);
+}
+
+void CheckNativeAttention(std::uint32_t rows, float query_scale = 1.7F,
+                          bool packed_output = false) {
   constexpr std::uint32_t kHeads = 3, kDimension = 128;
   constexpr std::size_t kGuard = 16;
   const std::size_t elements = std::size_t(rows) * kHeads * kDimension;
@@ -474,18 +869,39 @@ void CheckNativeAttention(std::uint32_t rows, float query_scale = 1.7F) {
   }
   DeviceArray<std::uint16_t> dq(elements), dk(elements), dv(elements);
   DeviceArray<std::uint16_t> output(elements + kGuard);
+  const std::size_t packed_elements =
+      std::size_t((rows + 31U) & ~31U) * kHeads * kDimension;
+  DeviceArray<std::uint16_t> packed(packed_elements + kGuard);
+  std::vector<std::uint16_t> packed_host(packed_elements + kGuard, 0x7fc1U);
+  if (packed_output) {
+    const auto stride = (rows + 31U) & ~31U;
+    for (std::uint32_t h = 0; h < kHeads; ++h)
+      for (std::uint32_t d = 0; d < kDimension; ++d)
+        for (std::uint32_t t = 0; t < stride; ++t)
+          packed_host[(std::size_t(h) * kDimension + d) * stride + t] =
+              t < rows ? value[(std::size_t(h) * rows + t) * kDimension + d]
+                       : 0;
+  }
+  CHECK(packed.CopyFrom(packed_host));
   CHECK(dq.CopyFrom(query));
   CHECK(dk.CopyFrom(key));
   CHECK(dv.CopyFrom(value));
   std::vector<std::uint16_t> actual(elements + kGuard, 0x7fc1U);
   CHECK(output.CopyFrom(actual));
   const auto run = [&] {
-    ops::LaunchWmmaAttention(dq.get(), dk.get(), dv.get(), output.get(), rows,
-                             kHeads, nullptr);
+    if (packed_output)
+      ops::LaunchProjectionAttention(dq.get(), dk.get(), packed.get(),
+                                     output.get(), rows, kHeads, nullptr);
+    else
+      ops::LaunchWmmaAttention(dq.get(), dk.get(), dv.get(), output.get(),
+                               packed.get(), rows, kHeads, nullptr);
     CHECK(hipDeviceSynchronize() == hipSuccess);
   };
   run();
   CHECK(output.CopyTo(actual));
+  CHECK(packed.CopyTo(packed_host));
+  for (std::size_t i = packed_elements; i < packed_host.size(); ++i)
+    CHECK(packed_host[i] == 0x7fc1U);
   for (std::size_t i = 0; i < elements; ++i) {
     if (!std::isfinite(ToFloat(actual[i]))) {
       CHECK(false);
@@ -527,10 +943,12 @@ void CheckNativeAttention(std::uint32_t rows, float query_scale = 1.7F) {
           reference +=
               probabilities[k] / denominator *
               ToFloat(value[(std::size_t(head) * rows + k) * kDimension + d]);
-        const double delta =
-            ToFloat(
-                actual[(std::size_t(row) * kHeads + head) * kDimension + d]) -
-            reference;
+        const auto index =
+            packed_output ? ((std::size_t(head) * kDimension + d) / 16 * rows +
+                             row) * 16 +
+                                d % 16
+                          : (std::size_t(row) * kHeads + head) * kDimension + d;
+        const double delta = ToFloat(actual[index]) - reference;
         error_squared += delta * delta;
         norm_squared += reference * reference;
         max_error = std::max(max_error, std::abs(delta));
@@ -541,7 +959,8 @@ void CheckNativeAttention(std::uint32_t rows, float query_scale = 1.7F) {
   const double relative_l2 = std::sqrt(error_squared / norm_squared);
   const double relative_max = max_error / max_reference;
   std::cout << "H3 native attention FP64 teacher rows=" << rows
-            << " scale=" << query_scale << " relative_l2=" << relative_l2
+            << " scale=" << query_scale << " packed=" << packed_output
+            << " relative_l2=" << relative_l2
             << " relative_max=" << relative_max << '\n';
   CHECK(relative_l2 < 0.004);
   CHECK(relative_max < 0.01);
@@ -565,11 +984,20 @@ int CheckAnalytic() {
   CheckAdaLnGateAndSwiGlu();
   CheckPatchAndFinalProjection();
   CheckGroupedQkvAndAttention();
+  CheckFusedQkvNormRope();
+  CheckNativeQkv();
+  CheckNativeHiddenProjection(false);
+  CheckNativeHiddenProjection(true);
+  CheckPackedAdaLn(false);
+  CheckPackedAdaLn(true);
+  CheckNativeFfnUp();
   for (std::uint32_t rows : {1U, 8U, 9U, 31U, 32U, 33U, 63U, 64U, 65U, 127U,
                              128U, 129U, 528U, 4096U, 4097U})
     CheckNativeAttention(rows);
   CheckNativeAttention(33, 0.0F);
   CheckNativeAttention(65, 6.0F);
+  CheckNativeAttention(129, 1.7F, true);
+  CheckNativeAttention(4097, 1.7F, true);
   if (failures != 0) {
     std::cerr << failures << " MiniMax H3 DiT analytic checks failed\n";
     return 1;

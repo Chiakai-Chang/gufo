@@ -20,7 +20,7 @@ Output is byte-identical to the previous loader. No full video was generated.
 One worker executes jobs, with one queued job. There is no parallel C>1 model
 execution; throughput/queue latency measurements are **TODO**.
 
-## Native attention components — 2026-09-21
+## Native DiT components — 2026-09-21
 
 gfx1151, ROCm 7.2.3, BF16 inputs/output, 56 heads of width 128. Kernel
 measurements use the production compiler flags; real-weight block controls
@@ -30,19 +30,36 @@ not complete-generation latency.
 | Sequence rows | Native attention, GPU ms | Real-weight block, GPU ms | Block wall ms |
 | --- | ---: | ---: | ---: |
 | 528 | 0.63 | TODO | TODO |
-| 1,872 | 6.02 | 59.24 | 63.68 |
+| 1,872 | 6.02 | TODO | TODO |
 | 4,096 | 27.33 | TODO | TODO |
 | 4,097 | 14.20 | TODO | TODO |
-| 7,136 | 42.88 | 320.23 | 332.55 |
-| 37,716 | 1,215.70 | 2,219.87 | 2,284.40 |
+| 7,136 | 39.50 | 312.85 | 326.31 |
+| 37,716 | 1,087.53 | 1,761.13 | 1,823.90 |
 
-Short attention averages ten timed launches after warm-up; long attention
-averages two. The 1,872-row block is one paired process control; long-block
-values are medians of three process runs. Model loading is excluded. The 7,136-row inference trace
-attributes 81.6% of GPU time to projections and 13.6% to attention, with 0.04 ms
-between kernels. No complete-video speedup is established.
-See [quality evidence](EVALUATION.md#native-attention-qualification)
-and the [measurement record](artifacts/native-attention.json).
+Short attention averages ten timed launches after warm-up; the current long
+attention controls time one launch after warm-up, including value packing.
+Block controls use one process run per shape. Loading is excluded.
+Full-resolution QKV projection includes normalization/RoPE and packed V;
+FFN up includes SwiGLU. AdaLN and attention write directly in the next
+projection's packed layout. Packing replaces original weights during loading.
+
+**91.00 s is the time for one denoiser evaluation, not a complete video.**
+The exact preset needs **49 evaluations**, followed by video/audio decoding.
+Complete-generation latency remains **TODO**.
+
+This single evaluation runs all 50 transformer blocks at **1344×768×124**,
+with six text rows and zero initial latents. Setup/loading is excluded.
+It does not run the denoising schedule or VAE.
+Peak retained memory is **40.01 GiB**, including **2.93 GiB** scratch and
+retained BLAS workspace. Full-resolution transformer blocks use only native
+projections and allocate no BLAS handles.
+
+Attention remains the largest cost, followed by projections; the GPU is
+continuously busy during the transformer blocks. Block activation storage is
+**2.90 GiB**. No complete-video speedup is established.
+See [quality evidence](EVALUATION.md#full-resolution-kernel-qualification),
+the [current measurement record](artifacts/full-resolution-kernels.json), and
+the [short-attention record](artifacts/native-attention.json).
 
 The production Nix runtime closure is **3.82 GiB** with no Triton/AOTriton,
 Composable Kernel or MIOpen dependencies.
@@ -71,8 +88,10 @@ phase peaks must not be added as though all were resident together.
    AdaLN projection is loaded, used to precompute schedule constants, and
    released. Core loading is bounded to two workers. Construction validates
    BF16 GEMM plans and releases temporary validation/staging buffers.
-3. **Denoising:** retained core blocks stay resident. Two BF16 device buffers
-   carry hidden states on one ordered stream; per-block scratch is stable.
+3. **Denoising:** retained core blocks stay resident. One BF16 device buffer
+   carries hidden states in place on one ordered stream; scratch reuses dead
+   activations. Final normalization writes BF16-rounded values directly into
+   F32 projection scratch.
    F32 sample and velocity buffers implement Diffusers' two-stage Euler
    operation order. Reuse retains the previous video/audio velocities.
    Cancellation is checked at block and step boundaries.
