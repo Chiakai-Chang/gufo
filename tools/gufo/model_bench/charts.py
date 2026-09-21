@@ -39,11 +39,10 @@ def _plt() -> Any:
     return plt
 
 
-def _series(rows: dict[str, list[str]], labels: list[str], index: int) -> list[float]:
+def _series(rows: dict[str, dict[str, str]], labels: list[str], header: str) -> list[float]:
     values = []
     for label in labels:
-        cells = rows.get(label, [])
-        value = _number(cells[index]) if index < len(cells) else None
+        value = _number(rows.get(label, {}).get(header))
         values.append(math.nan if value is None else value)
     return values
 
@@ -88,7 +87,7 @@ def _bars(ax: Any, labels: list[str], series: list[tuple[str, list[float], str]]
     _finish_axes(ax, labels, series, ylabel)
 
 
-def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, list[str]], path: Path) -> bool:
+def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, str]], path: Path) -> bool:
     """Write one SVG for a rendered table; return False when there is nothing to draw."""
     layout = layout_for(config, table)
     labels = layout.rows
@@ -101,7 +100,7 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, list[str]],
     plt = _plt()
 
     if kind == "single" and not table.speculative:
-        gp, rp, gt, rt = (_series(rows, labels, i) for i in (0, 1, 3, 4))
+        gp, rp, gt, rt = (_series(rows, labels, h) for h in ("Gufo pp", f"{ref} pp", "Gufo tg", f"{ref} tg"))
         if not _has_data(gp, gt):
             return False
         fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
@@ -112,17 +111,26 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, list[str]],
         a2.set_xlabel("context depth (tokens)")
         a1.legend(loc="lower left")
     elif kind == "single":
-        gt, acc, rt = (_series(rows, labels, i) for i in (1, 2, 3))
+        gp, gt, acc = (_series(rows, labels, h) for h in ("Gufo pp", "Gufo tg", "Gufo acceptance"))
         if not _has_data(gt):
             return False
-        fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
         ticks = _depth_ticks(labels)
-        ref_name = f"{ref} {spec_label}" if config.reference_speculative else f"{ref} AR"
+        if config.reference_speculative:
+            rp, rt, racc = (_series(rows, labels, h) for h in (f"{ref} pp", f"{ref} tg", f"{ref} acceptance"))
+            fig, (a0, a1, a2) = plt.subplots(1, 3, figsize=(11, 3.2))
+            _lines(a0, labels, [(f"Gufo {spec_label}", gp, COLORS["spec"]), (f"{ref} {spec_label}", rp, COLORS["ref_spec"])],
+                   "prefill tok/s", ticks)
+            a0.set_xlabel("context depth (tokens)")
+            a0.legend(loc="lower left")
+            ref_name = f"{ref} {spec_label}"
+            acceptance = [(f"Gufo acceptance", acc, COLORS["spec"]), (f"{ref} acceptance", racc, COLORS["ref_spec"])]
+        else:
+            rt = _series(rows, labels, f"{ref} AR tg")
+            fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
+            ref_name = f"{ref} AR"
+            acceptance = [(f"Gufo {spec_label} acceptance", acc, COLORS["spec"])]
         _lines(a1, labels, [(f"Gufo {spec_label}", gt, COLORS["spec"]), (ref_name, rt, COLORS["ref_spec"])],
                "generation tok/s", ticks)
-        acceptance = [(f"Gufo {spec_label} acceptance", acc, COLORS["spec"])]
-        if config.reference_speculative:
-            acceptance.append((f"{ref} acceptance", _series(rows, labels, 4), COLORS["ref_spec"]))
         _lines(a2, labels, acceptance, "acceptance %", ticks)
         a2.legend(loc="lower right")
         a2.set_ylim(0, 105)
@@ -130,20 +138,20 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, list[str]],
         a2.set_xlabel("context depth (tokens)")
         a1.legend(loc="lower left")
     elif kind == "multi":
-        ga, ra, gs = (_series(rows, labels, i) for i in (0, 1, 3))
+        ga, ra, gs = (_series(rows, labels, h) for h in ("Gufo AR", f"{ref} AR", f"Gufo {spec_label}"))
         if not _has_data(ga, gs):
             return False
         series = [("Gufo AR", ga, COLORS["gufo"]), (f"{ref} AR", ra, COLORS["reference"]),
                   (f"Gufo {spec_label}", gs, COLORS["spec"])]
         if config.reference_speculative:
-            series.append((f"{ref} {spec_label}", _series(rows, labels, 4), COLORS["ref_spec"]))
+            series.append((f"{ref} {spec_label}", _series(rows, labels, f"{ref} {spec_label}"), COLORS["ref_spec"]))
         fig, ax = plt.subplots(figsize=(6.5, 3.2))
         _bars(ax, labels, series, "aggregate output tok/s")
         ax.set_xlabel("concurrent users")
         ax.legend(loc="upper left")
     elif kind in ("loading", "memory", "image-encoder"):
-        first = 1 if kind == "image-encoder" else 0
-        g, r = _series(rows, labels, first), _series(rows, labels, first + 1)
+        unit_header = {"loading": "ready", "memory": "GiB", "image-encoder": "ms"}[kind]
+        g, r = _series(rows, labels, f"Gufo {unit_header}"), _series(rows, labels, f"{ref} {unit_header}")
         if not _has_data(g):
             return False
         unit = {"loading": "seconds to ready", "memory": "GiB", "image-encoder": "encode ms"}[kind]

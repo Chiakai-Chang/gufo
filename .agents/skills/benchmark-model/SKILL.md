@@ -215,7 +215,7 @@ model has several quantizations, e.g. `single-ar-q4`):
    `draft-mtp` or `draft-dspark` (`speculative.reference.args` in
    `bench.json`, otherwise llama.cpp's defaults; tune them only when the
    reference project documents better values, and record the change).
-   `Depth | Gufo pp | Gufo tg | Gufo acceptance | llama.cpp <spec> tg | llama.cpp acceptance | Gain`.
+   `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance`.
    Both acceptance columns are accepted draft tokens over proposed draft
    tokens as each server reports them; the two drafters propose different
    block lengths, so compare tg, and treat acceptance as a diagnostic.

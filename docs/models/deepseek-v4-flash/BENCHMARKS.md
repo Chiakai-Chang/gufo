@@ -66,16 +66,16 @@ DSpark prefill includes support-state work. The reference column is
 llama.cpp with the same DSpark support file (`draft-dspark`).
 
 <!-- bench:single-dspark -->
-| Depth | Gufo pp | Gufo tg | Gufo acceptance | llama.cpp DSpark tg | llama.cpp acceptance | Gain |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 453.49 ± 25.96 | 17.45 ± 0.00 | TODO | TODO | TODO | TODO |
-| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 32,768 | 417.80 | 35.30 | TODO | TODO | TODO | TODO |
-| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 453.49 ± 25.96 | TODO | TODO | 17.45 ± 0.00 | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | 417.80 | TODO | TODO | 35.30 | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 <!-- /bench -->
 
 ![Single user, DSpark](artifacts/charts/single-dspark.svg)

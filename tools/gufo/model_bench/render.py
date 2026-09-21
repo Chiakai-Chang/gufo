@@ -94,15 +94,15 @@ def layout_for(config: BenchConfig, table: TableSpec) -> Layout:
         )
     if kind == "single":
         if config.reference_speculative:
-            reference = [Column(f"{ref} {spec_label} tg", "reference"), Column(f"{ref} acceptance", "reference"),
-                         Column("Gain", "gain")]
+            columns = [Column("Depth", "label"),
+                       Column("Gufo pp", "gufo"), Column(f"{ref} pp", "reference"), Column("Gain", "gain"),
+                       Column("Gufo tg", "gufo"), Column(f"{ref} tg", "reference"), Column("Gain", "gain"),
+                       Column("Gufo acceptance", "gufo"), Column(f"{ref} acceptance", "reference")]
         else:
-            reference = [Column(f"{ref} AR tg", "reference"), Column(f"Gain vs {ref} AR", "gain")]
-        return Layout(
-            [Column("Depth", "label"), Column("Gufo pp", "gufo"), Column("Gufo tg", "gufo"),
-             Column("Gufo acceptance", "gufo"), *reference],
-            [_depth_label(d) for d in table.spec["depths"]],
-        )
+            columns = [Column("Depth", "label"), Column("Gufo pp", "gufo"), Column("Gufo tg", "gufo"),
+                       Column("Gufo acceptance", "gufo"), Column(f"{ref} AR tg", "reference"),
+                       Column(f"Gain vs {ref} AR", "gain")]
+        return Layout(columns, [_depth_label(d) for d in table.spec["depths"]])
     if kind == "multi":
         if config.reference_speculative:
             speculative = [Column(f"Gufo {spec_label}", "gufo"), Column(f"{ref} {spec_label}", "reference"),
@@ -129,17 +129,23 @@ def layout_for(config: BenchConfig, table: TableSpec) -> Layout:
     raise SystemExit(f"no renderer for table {table.id}")
 
 
-def parse_table(body: str) -> dict[str, list[str]]:
-    """Existing table cells keyed by first-column label."""
+OLD_HEADERS = {"Acceptance": "Gufo acceptance"}
+
+
+def parse_table(body: str) -> dict[str, dict[str, str]]:
+    """Existing cells keyed by row label, then by column header (old header names normalized)."""
     lines = [line for line in body.strip().splitlines() if line.startswith("|")]
-    rows: dict[str, list[str]] = {}
+    if len(lines) < 2:
+        return {}
+    headers = [OLD_HEADERS.get(h.strip(), h.strip()) for h in lines[0].strip().strip("|").split("|")][1:]
+    rows: dict[str, dict[str, str]] = {}
     for line in lines[2:]:
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        rows[cells[0].replace("**", "")] = cells[1:]
+        rows[cells[0].replace("**", "")] = dict(zip(headers, cells[1:]))
     return rows
 
 
-def existing_tables(document: str) -> dict[str, dict[str, list[str]]]:
+def existing_tables(document: str) -> dict[str, dict[str, dict[str, str]]]:
     return {m.group("id"): parse_table(m.group("body")) for m in MARKER_RE.finditer(document)}
 
 
@@ -231,7 +237,7 @@ def _ref(fresh: str | None) -> str:
     return fresh if fresh is not None else TODO
 
 
-def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, list[str]] | None) -> str:
+def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, dict[str, str]] | None) -> str:
     layout = layout_for(config, table)
     values = _row_values(config, table)
     better = table.spec.get("better", "higher")
@@ -239,28 +245,31 @@ def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, list
     lines = ["| " + " | ".join(c.header for c in layout.columns) + " |",
              "| " + " | ".join(c.align for c in layout.columns) + " |"]
     for label in layout.rows:
-        old = (existing or {}).get(label, [])
-        cell = lambda index: old[index] if index < len(old) else None  # noqa: E731
+        old = (existing or {}).get(label, {})
+        cell = old.get
         fresh = values.get(label, {})
         if kind == "loading" or kind == "memory":
-            g = _pick(fresh.get("gufo"), cell(0))
+            g = _pick(fresh.get("gufo"), cell("Gufo ready") or cell("Gufo GiB"))
             r = _ref(fresh.get("reference"))
             cells = [g, r, gain(_number(g), _number(r), better)]
         elif kind == "single" and not table.speculative:
-            gp = _pick(fresh.get("gufo_pp"), cell(0)); rp = _ref(fresh.get("ref_pp"))
-            gt = _pick(fresh.get("gufo_tg"), cell(3)); rt = _ref(fresh.get("ref_tg"))
+            gp = _pick(fresh.get("gufo_pp"), cell("Gufo pp")); rp = _ref(fresh.get("ref_pp"))
+            gt = _pick(fresh.get("gufo_tg"), cell("Gufo tg")); rt = _ref(fresh.get("ref_tg"))
             cells = [gp, rp, gain(_number(gp), _number(rp), better),
                      gt, rt, gain(_number(gt), _number(rt), better)]
         elif kind == "single":
-            gp = _pick(fresh.get("gufo_pp"), cell(0)); gt = _pick(fresh.get("gufo_tg"), cell(1))
-            acc = _pick(fresh.get("acceptance"), cell(2)); rt = _ref(fresh.get("ref_tg"))
-            cells = [gp, gt, acc, rt]
+            gp = _pick(fresh.get("gufo_pp"), cell("Gufo pp")); gt = _pick(fresh.get("gufo_tg"), cell("Gufo tg"))
+            acc = _pick(fresh.get("acceptance"), cell("Gufo acceptance"))
+            rp = _ref(fresh.get("ref_pp")); rt = _ref(fresh.get("ref_tg"))
             if config.reference_speculative:
-                cells.append(_ref(fresh.get("ref_acceptance")))
-            cells.append(gain(_number(gt), _number(rt), better))
+                cells = [gp, rp, gain(_number(gp), _number(rp), better),
+                         gt, rt, gain(_number(gt), _number(rt), better),
+                         acc, _ref(fresh.get("ref_acceptance"))]
+            else:
+                cells = [gp, gt, acc, rt, gain(_number(gt), _number(rt), better)]
         elif kind == "multi":
-            ga = _pick(fresh.get("gufo_ar"), cell(0)); ra = _ref(fresh.get("reference"))
-            gs = _pick(fresh.get("gufo_spec"), cell(3)); ex = _ref(fresh.get("exact"))
+            ga = _pick(fresh.get("gufo_ar"), cell("Gufo AR")); ra = _ref(fresh.get("reference"))
+            gs = _pick(fresh.get("gufo_spec"), cell(f"Gufo {config.speculative['label']}")); ex = _ref(fresh.get("exact"))
             cells = [ga, ra, gain(_number(ga), _number(ra), better), gs]
             if config.reference_speculative:
                 rs = _ref(fresh.get("ref_spec"))
@@ -269,7 +278,7 @@ def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, list
                 cells += [gain(_number(gs), _number(ra), better), ex]
         elif kind == "image-encoder":
             size = int(label.split("×")[0])
-            g = _pick(fresh.get("gufo"), cell(1)); r = _ref(fresh.get("reference"))
+            g = _pick(fresh.get("gufo"), cell("Gufo ms")); r = _ref(fresh.get("reference"))
             cells = [str(_merged_tokens(size)), g, r, gain(_number(g), _number(r), better)]
         else:
             raise SystemExit(f"no renderer for table {table.id}")
@@ -328,12 +337,12 @@ def hand_cells(config: BenchConfig, document: str) -> dict[str, list[str]]:
         if table.id not in tables:
             continue
         layout = layout_for(config, table)
-        owned = [i for i, c in enumerate(layout.columns[1:]) if c.owner == "gufo"]
+        owned = [c.header for c in layout.columns[1:] if c.owner == "gufo"]
         fresh = _row_values(config, table)
         rows = []
         for label, cells in tables[table.id].items():
             provided = any(v is not None for k, v in fresh.get(label, {}).items() if k.startswith("gufo") or k == "acceptance")
-            has_text = any(i < len(cells) and cells[i] != TODO for i in owned)
+            has_text = any(cells.get(h, TODO) != TODO for h in owned)
             if has_text and not provided:
                 rows.append(label)
         if rows:
@@ -347,9 +356,9 @@ def todo_rows(config: BenchConfig, document: str, table: TableSpec, target: str)
     if table.id not in tables:
         return None
     layout = layout_for(config, table)
-    owned = [i for i, c in enumerate(layout.columns[1:]) if c.owner == target or (target == "reference" and c.owner == "exact")]
+    owned = [c.header for c in layout.columns[1:] if c.owner == target or (target == "reference" and c.owner == "exact")]
     todo: set[str] = set()
     for label, cells in tables[table.id].items():
-        if any(i >= len(cells) or cells[i] == TODO for i in owned):
+        if any(cells.get(h, TODO) == TODO for h in owned):
             todo.add(label)
     return todo

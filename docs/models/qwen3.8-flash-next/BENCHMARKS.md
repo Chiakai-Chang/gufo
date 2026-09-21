@@ -72,16 +72,16 @@ three refreshed depths; greedy output matches AR at each depth. The
 reference column is llama.cpp with the same MTP sidecar (`draft-mtp`).
 
 <!-- bench:single-mtp -->
-| Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp MTP tg | Gain |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1503.6 | 43.95 | 69.2% | TODO | TODO |
-| 4,096 | TODO | 40.35 | 65.6% | TODO | TODO |
-| 8,192 | TODO | 35.68 | 58.3% | TODO | TODO |
-| 12,288 | TODO | 52.03 | 85.7% | TODO | TODO |
-| 16,384 | TODO | 56.31 | 88.5% | TODO | TODO |
-| 32,768 | 1380.3 | 65.65 | 100.0% | TODO | TODO |
-| 65,536 | TODO | 59.67 | 100.0% | TODO | TODO |
-| 131,072 | 1287.5 | 61.19 | 100.0% | TODO | TODO |
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1503.6 | TODO | TODO | 43.95 | TODO | TODO | 69.2% | TODO |
+| 4,096 | TODO | TODO | TODO | 40.35 | TODO | TODO | 65.6% | TODO |
+| 8,192 | TODO | TODO | TODO | 35.68 | TODO | TODO | 58.3% | TODO |
+| 12,288 | TODO | TODO | TODO | 52.03 | TODO | TODO | 85.7% | TODO |
+| 16,384 | TODO | TODO | TODO | 56.31 | TODO | TODO | 88.5% | TODO |
+| 32,768 | 1380.3 | TODO | TODO | 65.65 | TODO | TODO | 100.0% | TODO |
+| 65,536 | TODO | TODO | TODO | 59.67 | TODO | TODO | 100.0% | TODO |
+| 131,072 | 1287.5 | TODO | TODO | 61.19 | TODO | TODO | 100.0% | TODO |
 <!-- /bench -->
 
 ![Single user, MTP](artifacts/charts/single-mtp.svg)
