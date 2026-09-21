@@ -32,7 +32,16 @@
       "--mtp-model",
       "{mtp}"
     ],
-    "reference": "ar"
+    "reference": {
+      "args": [
+        "--spec-type",
+        "draft-mtp",
+        "--spec-draft-model",
+        "{mtp}",
+        "--spec-draft-ngl",
+        "999"
+      ]
+    }
   },
   "tables": {
     "loading": {
@@ -60,7 +69,7 @@
         65536,
         131072
       ],
-      "context": 133121,
+      "context": 133760,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -86,7 +95,7 @@
         65536,
         131072
       ],
-      "context": 133121,
+      "context": 133760,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -171,7 +180,8 @@
         }
       ],
       "metric": "GiB",
-      "better": "lower"
+      "better": "lower",
+      "mode": "ar"
     },
     "image-encoder": {
       "title": "Image encoder",

@@ -26,16 +26,17 @@
   "mode": null,
   "model": {
     "id": "Qwen3.8-27B",
-    "variant": "q4"
+    "variant": "q8"
   },
   "notes": [
+    "llama.cpp: version: 0.4.1-dev (build 11069, commit )",
     "pp2048/tg128; depth is a cached prefix of synthetic text; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
     "synthetic text: 1.167 tokens/word, template overhead 12 tokens"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "0": {
-      "command": "gufo serve --port 35199 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 35456 -np 1 --port 47617 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
       "counts": [
         {
           "cache_n": 0,
@@ -43,108 +44,113 @@
           "prompt_n": 2033
         }
       ],
-      "pp": 633.08,
+      "pp": 317.3,
       "pp_sd": null,
       "samples": 1,
-      "tg": 9.68,
+      "tg": 8.01,
       "tg_sd": null
     },
     "12288": {
-      "command": "gufo serve --port 35199 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 35456 -np 1 --port 47617 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
       "counts": [
         {
-          "cache_n": 12276,
-          "predicted_n": 128,
-          "prompt_n": 2054
-        }
-      ],
-      "pp": 489.85,
-      "pp_sd": null,
-      "samples": 1,
-      "tg": 11.24,
-      "tg_sd": null
-    },
-    "16384": {
-      "command": "gufo serve --port 35199 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8",
-      "counts": [
-        {
-          "cache_n": 16374,
-          "predicted_n": 128,
-          "prompt_n": 2049
-        }
-      ],
-      "pp": 459.05,
-      "pp_sd": null,
-      "samples": 1,
-      "tg": 11.03,
-      "tg_sd": null
-    },
-    "32768": {
-      "command": "gufo serve --port 35199 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8",
-      "counts": [
-        {
-          "cache_n": 32779,
+          "cache_n": 12275,
           "predicted_n": 128,
           "prompt_n": 2055
         }
       ],
-      "pp": 415.94,
+      "pp": 273.43,
       "pp_sd": null,
       "samples": 1,
-      "tg": 10.33,
+      "tg": 7.79,
+      "tg_sd": null
+    },
+    "16384": {
+      "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 35456 -np 1 --port 47617 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "counts": [
+        {
+          "cache_n": 16373,
+          "predicted_n": 128,
+          "prompt_n": 2050
+        }
+      ],
+      "pp": 262.89,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 7.73,
+      "tg_sd": null
+    },
+    "32768": {
+      "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 35456 -np 1 --port 47617 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "counts": [
+        {
+          "cache_n": 32778,
+          "predicted_n": 128,
+          "prompt_n": 2056
+        }
+      ],
+      "pp": 226.12,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 7.48,
       "tg_sd": null
     },
     "4096": {
-      "command": "gufo serve --port 35199 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 35456 -np 1 --port 47617 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
       "counts": [
         {
-          "cache_n": 4095,
+          "cache_n": 4094,
           "predicted_n": 128,
-          "prompt_n": 2036
+          "prompt_n": 2037
         }
       ],
-      "pp": 583.61,
+      "pp": 297.17,
       "pp_sd": null,
       "samples": 1,
-      "tg": 11.7,
+      "tg": 7.93,
       "tg_sd": null
     },
     "8192": {
-      "command": "gufo serve --port 35199 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8",
+      "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 35456 -np 1 --port 47617 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
       "counts": [
         {
-          "cache_n": 8200,
+          "cache_n": 8199,
           "predicted_n": 128,
-          "prompt_n": 2042
+          "prompt_n": 2043
         }
       ],
-      "pp": 553.05,
+      "pp": 284.36,
       "pp_sd": null,
       "samples": 1,
-      "tg": 11.32,
+      "tg": 7.86,
       "tg_sd": null
     }
   },
   "schemaVersion": 1,
   "server": {
     "command": [
-      "gufo",
-      "serve",
-      "--port",
-      "35199",
-      "--sessions",
-      "1",
-      "llm",
-      "--model",
-      "Qwen3.8-27B-UD-Q4_K_XL.gguf",
-      "--context",
+      "llama-server",
+      "-m",
+      "Qwen3.8-27B-UD-Q8_K_L.gguf",
+      "-c",
       "35456",
-      "--served-model-name",
+      "-np",
+      "1",
+      "--port",
+      "47617",
+      "--host",
+      "127.0.0.1",
+      "--alias",
       "bench",
-      "--think",
-      "off",
-      "--max-pending-per-client",
-      "8"
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off"
     ]
   },
   "source": {
@@ -152,6 +158,6 @@
     "dirty": true,
     "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
   },
-  "table": "single-ar-q4",
-  "target": "gufo"
+  "table": "single-ar-q8",
+  "target": "reference"
 }

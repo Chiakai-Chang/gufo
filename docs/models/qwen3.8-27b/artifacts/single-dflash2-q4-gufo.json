@@ -37,6 +37,7 @@
     "0": {
       "acceptance": 43.15,
       "acceptance_sd": null,
+      "command": "gufo serve --port 36373 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8 --speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
       "counts": [
         {
           "cache_n": 0,
@@ -44,15 +45,16 @@
           "prompt_n": 2033
         }
       ],
-      "pp": 572.72,
+      "pp": 544.51,
       "pp_sd": null,
       "samples": 1,
-      "tg": 23.83,
+      "tg": 23.38,
       "tg_sd": null
     },
     "12288": {
       "acceptance": 41.92,
       "acceptance_sd": null,
+      "command": "gufo serve --port 36373 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8 --speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
       "counts": [
         {
           "cache_n": 12275,
@@ -60,15 +62,16 @@
           "prompt_n": 2055
         }
       ],
-      "pp": 471.71,
+      "pp": 459.28,
       "pp_sd": null,
       "samples": 1,
-      "tg": 22.05,
+      "tg": 21.72,
       "tg_sd": null
     },
     "16384": {
       "acceptance": 40.8,
       "acceptance_sd": null,
+      "command": "gufo serve --port 36373 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8 --speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
       "counts": [
         {
           "cache_n": 16373,
@@ -76,15 +79,33 @@
           "prompt_n": 2050
         }
       ],
-      "pp": 456.53,
+      "pp": 438.24,
       "pp_sd": null,
       "samples": 1,
-      "tg": 20.54,
+      "tg": 20.37,
+      "tg_sd": null
+    },
+    "32768": {
+      "acceptance": 40.2,
+      "acceptance_sd": null,
+      "command": "gufo serve --port 36373 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8 --speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+      "counts": [
+        {
+          "cache_n": 32778,
+          "predicted_n": 128,
+          "prompt_n": 2056
+        }
+      ],
+      "pp": 397.08,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 15.86,
       "tg_sd": null
     },
     "4096": {
       "acceptance": 48.66,
       "acceptance_sd": null,
+      "command": "gufo serve --port 36373 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8 --speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
       "counts": [
         {
           "cache_n": 4094,
@@ -92,15 +113,16 @@
           "prompt_n": 2037
         }
       ],
-      "pp": 530.83,
+      "pp": 519.67,
       "pp_sd": null,
       "samples": 1,
-      "tg": 29.21,
+      "tg": 28.67,
       "tg_sd": null
     },
     "8192": {
       "acceptance": 41.41,
       "acceptance_sd": null,
+      "command": "gufo serve --port 36373 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8 --speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
       "counts": [
         {
           "cache_n": 8199,
@@ -108,10 +130,10 @@
           "prompt_n": 2043
         }
       ],
-      "pp": 530.12,
+      "pp": 508.39,
       "pp_sd": null,
       "samples": 1,
-      "tg": 22.76,
+      "tg": 22.43,
       "tg_sd": null
     }
   },
@@ -121,22 +143,20 @@
       "gufo",
       "serve",
       "--port",
-      "36185",
+      "36373",
       "--sessions",
       "1",
       "llm",
       "--model",
       "Qwen3.8-27B-UD-Q4_K_XL.gguf",
       "--context",
-      "34944",
+      "35456",
       "--served-model-name",
       "bench",
       "--think",
       "off",
       "--max-pending-per-client",
       "8",
-      "--mmproj",
-      "mmproj-BF16.gguf",
       "--speculative",
       "dflash2",
       "--dflash-model",
@@ -146,7 +166,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "c0abb9f6779908b96a4831b58a0e41ea93566d92"
+    "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
   },
   "table": "single-dflash2-q4",
   "target": "gufo"

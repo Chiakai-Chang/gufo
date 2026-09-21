@@ -71,6 +71,23 @@ class BenchConfig:
     def speculative(self) -> dict[str, Any]:
         return self.data["speculative"]
 
+    @property
+    def reference_speculative(self) -> list[str] | None:
+        """Reference server arguments for the equivalent speculative mode, if any."""
+        reference = self.speculative.get("reference")
+        if isinstance(reference, dict) and reference.get("args"):
+            return list(reference["args"])
+        return None
+
+    def substitute(self, args: list[str], variant: str | None) -> list[str]:
+        """Replace `{role}` placeholders with the variant's file paths."""
+        out = []
+        for part in args:
+            if part.startswith("{") and part.endswith("}"):
+                part = str(self.file(part[1:-1], variant))
+            out.append(part)
+        return out
+
     def tables(self) -> list[TableSpec]:
         result: list[TableSpec] = []
         for base, spec in self.data["tables"].items():

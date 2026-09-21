@@ -27,21 +27,33 @@
 
       # Reference LLM runtime for benchmark comparisons (llama-server,
       # llama-bench), built for gfx1151 with unified memory like the Strix
-      # Halo toolbox.
+      # Halo toolbox. The source is pinned to a release that carries DFlash2
+      # (#27816), Qwen3.8-Flash-Next (#27742) and DSpark support; nixpkgs'
+      # b10273 predates them.
+      llamaCppVersion = "11069"; # release tag b11069, 2026-09-21
       llamaCpp = system:
         (pkgs.${system}.llama-cpp.override {
           rocmSupport = true;
           rocmGpuTargets = [ "gfx1151" ];
         }).overrideAttrs
           (oldAttrs: {
+            version = llamaCppVersion;
+            src = pkgs.${system}.fetchFromGitHub {
+              owner = "ggml-org";
+              repo = "llama.cpp";
+              tag = "b${llamaCppVersion}";
+              hash = "sha256-BnGWYIkVe9y4aufhS5s3Jco1j/BY0MgBlzXrRQFMW3o=";
+              leaveDotGit = true;
+            };
+            npmDepsHash = "sha256-2Q7XhaLAArmviOLdQsNbYTfdyDE5pW9lR26cRHEVl9k=";
             cmakeFlags = (oldAttrs.cmakeFlags or [ ]) ++ [
               "-DLLAMA_HIP_UMA=ON" # unified memory
             ];
             # Pin the ROCm path explicitly and raise the local unroll
             # threshold for gfx1151 kernels.
-            cmakeFlagsArray = (oldAttrs.cmakeFlagsArray or [ ]) ++ [
-              "-DCMAKE_HIP_FLAGS=--rocm-path=${pkgs.${system}.rocmPackages.clr} -mllvm --amdgpu-unroll-threshold-local=600"
-            ];
+            preConfigure = (oldAttrs.preConfigure or "") + ''
+              cmakeFlagsArray+=("-DCMAKE_HIP_FLAGS=--rocm-path=${pkgs.${system}.rocmPackages.clr} -mllvm --amdgpu-unroll-threshold-local=600")
+            '';
           });
 
       alexnetWeights = system:

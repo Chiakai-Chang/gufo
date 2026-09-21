@@ -86,21 +86,24 @@ class Session:
                    *cfg.data["gufo"].get("serve", []), "llm", "--model", str(gguf),
                    "--context", str(context), "--served-model-name", MODEL_ALIAS,
                    *cfg.data["gufo"].get("llm", [])]
-        if "mmproj" in cfg.files:
+        if table.kind == "image-encoder":
             command += ["--mmproj", str(cfg.file("mmproj", table.variant))]
         if mode and mode != "ar":
-            for part in cfg.speculative["gufo_args"]:
-                if part.startswith("{") and part.endswith("}"):
-                    part = str(cfg.file(part[1:-1], table.variant))
-                command.append(part)
+            command += cfg.substitute(cfg.speculative["gufo_args"], table.variant)
         return command
 
-    def reference_command(self, table: TableSpec, *, context: int, parallel: int, port: int) -> list[str]:
+    def reference_command(self, table: TableSpec, *, mode: str | None, context: int, parallel: int, port: int) -> list[str]:
         cfg = self.config
         gguf = cfg.file("gguf", table.variant)
-        return [self.reference_binary, "-m", str(gguf), "-c", str(context), "-np", str(parallel),
-                "--port", str(port), "--host", "127.0.0.1", "--alias", MODEL_ALIAS,
-                *cfg.data["reference"]["args"]]
+        command = [self.reference_binary, "-m", str(gguf), "-c", str(context), "-np", str(parallel),
+                   "--port", str(port), "--host", "127.0.0.1", "--alias", MODEL_ALIAS,
+                   *cfg.data["reference"]["args"]]
+        if mode and mode != "ar":
+            args = cfg.reference_speculative
+            if args is None:
+                raise RuntimeError(f"{cfg.reference_name} has no configured {mode} mode")
+            command += cfg.substitute(args, table.variant)
+        return command
 
     def server(self, table: TableSpec, *, mode: str | None, context: int, sessions: int, tag: str) -> Server:
         readiness = self.config.data["gufo"]["readiness"] if self.target == "gufo" else self.config.data["reference"]["readiness"]
@@ -109,7 +112,7 @@ class Session:
         if self.target == "gufo":
             command = self.gufo_command(table, mode=mode, context=context, sessions=sessions, port=placeholder.port)
         else:
-            command = self.reference_command(table, context=context, parallel=sessions, port=placeholder.port)
+            command = self.reference_command(table, mode=mode, context=context, parallel=sessions, port=placeholder.port)
         placeholder.command = command
         return placeholder
 
@@ -118,8 +121,9 @@ class Session:
             return None
         if not hasattr(self, "_reference_version"):
             completed = subprocess.run([self.reference_binary, "--version"], capture_output=True, text=True)
-            text = (completed.stdout or completed.stderr).strip().splitlines()
-            self._reference_version = text[0] if text else None
+            lines = (completed.stdout + completed.stderr).splitlines()
+            versions = [line.strip() for line in lines if line.strip().startswith("version:")]
+            self._reference_version = versions[0] if versions else (lines[0].strip() if lines else None)
         return self._reference_version
 
     def artifact(self, table: TableSpec, *, mode: str | None, command: list[str], notes: list[str]) -> dict[str, Any]:
@@ -228,13 +232,19 @@ def run_loading(session: Session, table: TableSpec) -> None:
         return
     rows: dict[str, Any] = {}
     command: list[str] = []
+    try:
+        drop_file_cache(session.drop_caches)
+    except SystemExit as reason:
+        print(f"{table.id}: skipped; {reason}")
+        return
     for variant in keys:
         sub = TableSpec(table.id, table.base, variant, spec)
         cfg.require_files(variant)
         samples: list[float] = []
         for repetition in range(int(spec.get("repetitions", 1))):
             drop_file_cache(session.drop_caches)
-            mode = cfg.speculative["mode"] if session.target == "gufo" else None
+            # Load with the speculative support files on both sides when the reference has the mode.
+            mode = cfg.speculative["mode"] if (session.target == "gufo" or cfg.reference_speculative) else None
             server = session.server(sub, mode=mode, context=int(spec["context"]),
                                     sessions=int(spec.get("sessions", 2)), tag=f"{variant}-{repetition}")
             command = server.command
@@ -244,7 +254,7 @@ def run_loading(session: Session, table: TableSpec) -> None:
             wait_process_exit(server)
         mean, sd = _mean_sd(samples)
         rows[variant] = {"ready_s": round(mean, 3), "ready_s_sd": None if sd is None else round(sd, 3),
-                         "samples": len(samples)}
+                         "samples": len(samples), "command": " ".join(public_command(command))}
         print(f"{table.id} {variant}: ready {mean:.2f} s")
     artifact = session.artifact(table, mode=None, command=command,
                                 notes=["cold file cache: `echo 3 > /proc/sys/vm/drop_caches` before each launch",
@@ -256,8 +266,8 @@ def run_loading(session: Session, table: TableSpec) -> None:
 def run_single(session: Session, table: TableSpec) -> None:
     cfg = session.config
     spec = table.spec
-    if table.speculative and session.target != "gufo":
-        print(f"{table.id}: reference uses the single-ar table ({cfg.speculative['reference']})")
+    if table.speculative and session.target != "gufo" and cfg.reference_speculative is None:
+        print(f"{table.id}: {cfg.reference_name} has no {cfg.speculative['label']} mode; the table compares against its AR column")
         return
     cfg.require_files(table.variant)
     depths = [int(d) for d in spec["depths"]]
@@ -296,7 +306,8 @@ def run_single(session: Session, table: TableSpec) -> None:
                 counts.append({"cache_n": observation.cached_prompt_tokens,
                                "prompt_n": observation.prefill_tokens,
                                "predicted_n": observation.completion_tokens})
-            row: dict[str, Any] = {"counts": counts, "samples": repetitions}
+            row: dict[str, Any] = {"counts": counts, "samples": repetitions,
+                                   "command": " ".join(public_command(server.command))}
             for name, values in (("pp", pps), ("tg", tgs), ("acceptance", accepts)):
                 if values:
                     mean, sd = _mean_sd(values)
@@ -334,6 +345,11 @@ def _measure_depth(session: Session, base_url: str, tokenizer: Tokenizer, *, dep
         new_text = synthetic_text(100_000 + depth * 10 + repetition * 100 + attempt, max(1, round(new_target / ratio)))
         messages.append({"role": "user", "content": new_text})
         observation = session.request(base_url, new_text, output_tokens, index=attempt, messages=messages)
+        if observation.completion_tokens < output_tokens:
+            raise RuntimeError(
+                f"depth {depth}: server generated {observation.completion_tokens} of {output_tokens} tokens; "
+                "the context capacity is too small for prefix + prompt + output, raise the table's `context`"
+            )
         cache_ok = abs(observation.cached_prompt_tokens - depth) <= _tolerance(depth, fraction)
         prefill_ok = abs(observation.prefill_tokens - prompt_tokens) <= _tolerance(prompt_tokens, fraction)
         if cache_ok and prefill_ok:
@@ -357,9 +373,12 @@ def run_multi(session: Session, table: TableSpec) -> None:
         return
     suite = (cfg.model_dir / "artifacts" / spec["suite"]).resolve()
     cases = load_prompt_suite(suite, selected=set(spec["cases"]))
-    modes = list(spec.get("modes", ["ar"])) if session.target == "gufo" else [None]
+    modes = list(spec.get("modes", ["ar"]))
+    if session.target != "gufo":
+        modes = [m for m in modes if m == "ar" or cfg.reference_speculative is not None]
     for mode in modes:
-        path = artifact_path(cfg, table, session.target, mode)
+        # Reference AR keeps the unsuffixed name; its speculative run is suffixed like Gufo's.
+        path = artifact_path(cfg, table, session.target, None if (session.target != "gufo" and mode == "ar") else mode)
         reference = None
         ar_path = artifact_path(cfg, table, "gufo", "ar")
         if path != ar_path and ar_path.exists():
@@ -372,7 +391,7 @@ def run_multi(session: Session, table: TableSpec) -> None:
             with server:
                 report = run_corpus_benchmark(
                     base_url=server.base_url, model=MODEL_ALIAS, cases=cases,
-                    workload_id=f"{cfg.model}-{table.id}-{mode or session.target}",
+                    workload_id=f"{cfg.model}-{table.id}-{session.target}-{mode}",
                     max_tokens=int(spec["output_tokens"]),
                     temperature=float(cfg.data["sampling"]["temperature"]),
                     concurrency_levels=[users], warmup_rounds=int(spec.get("warmup", 1)),
@@ -395,7 +414,7 @@ def run_multi(session: Session, table: TableSpec) -> None:
                                       "measuredOn": dt.date.today().isoformat()}
             save_artifact(path, combined)
             rate = report["results"][f"c{users}"]["aggregate"]["output_tokens_per_second"]["overall"]
-            print(f"{table.id} {mode or session.target} C{users}: {rate:.2f} tok/s -> {path}")
+            print(f"{table.id} {session.target} {mode} C{users}: {rate:.2f} tok/s -> {path}")
 
 
 class MemoryPoller:
@@ -431,7 +450,7 @@ def run_memory(session: Session, table: TableSpec) -> None:
         return
     if rocm_used_gib() is None:
         raise SystemExit("memory table needs rocm-smi with --showmemuse --json")
-    mode = cfg.speculative["mode"] if session.target == "gufo" else "ar"
+    mode = spec.get("mode", "ar")
     server = session.server(table, mode=mode, context=int(spec["context"]), sessions=1, tag="memory")
     rows: dict[str, Any] = {}
     with server:
@@ -443,11 +462,13 @@ def run_memory(session: Session, table: TableSpec) -> None:
                 _measure_depth(session, server.base_url, tokenizer, depth=depth,
                                prompt_tokens=int(workload["prompt_tokens"]),
                                output_tokens=int(workload["output_tokens"]), fraction=0.02, seed=1, repetition=0)
-            rows[key] = {"gib": None if poller.peak is None else round(poller.peak, 2)}
+            rows[key] = {"gib": None if poller.peak is None else round(poller.peak, 2),
+                         "command": " ".join(public_command(server.command))}
             print(f"{table.id} {key}: {rows[key]['gib']} GiB")
     wait_process_exit(server)
     artifact = session.artifact(table, mode=None, command=server.command,
-                                notes=["peak device-wide VRAM use sampled with rocm-smi every 250 ms during the request"])
+                                notes=["peak device-wide VRAM + GTT use sampled with rocm-smi every 250 ms during the request",
+                                       f"server mode: {mode}"])
     artifact["rows"] = rows
     session.store(artifact_path(cfg, table, session.target), artifact)
 

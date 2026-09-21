@@ -39,7 +39,16 @@
       "--dflash-model",
       "{draft}"
     ],
-    "reference": "ar"
+    "reference": {
+      "args": [
+        "--spec-type",
+        "draft-dflash",
+        "--spec-draft-model",
+        "{draft}",
+        "--spec-draft-ngl",
+        "999"
+      ]
+    }
   },
   "tables": {
     "loading": {
@@ -65,7 +74,7 @@
         16384,
         32768
       ],
-      "context": 34944,
+      "context": 35456,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -89,7 +98,7 @@
         16384,
         32768
       ],
-      "context": 34944,
+      "context": 35456,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -180,7 +189,8 @@
         }
       ],
       "metric": "GiB",
-      "better": "lower"
+      "better": "lower",
+      "mode": "ar"
     },
     "image-encoder": {
       "title": "Image encoder",

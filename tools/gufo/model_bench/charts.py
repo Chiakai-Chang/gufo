@@ -11,7 +11,7 @@ from .config import BenchConfig, TableSpec
 from .render import MARKER_RE, _number, layout_for, parse_table
 
 # Categorical slots from the validated default palette: Gufo, reference, Gufo speculative.
-COLORS = {"gufo": "#2a78d6", "reference": "#eb6834", "spec": "#1baf7a"}
+COLORS = {"gufo": "#2a78d6", "reference": "#eb6834", "spec": "#1baf7a", "ref_spec": "#eda100"}
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
@@ -117,7 +117,8 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, list[str]],
             return False
         fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
         ticks = _depth_ticks(labels)
-        _lines(a1, labels, [(f"Gufo {spec_label}", gt, COLORS["spec"]), (f"{ref} AR", rt, COLORS["reference"])],
+        ref_name = f"{ref} {spec_label}" if config.reference_speculative else f"{ref} AR"
+        _lines(a1, labels, [(f"Gufo {spec_label}", gt, COLORS["spec"]), (ref_name, rt, COLORS["ref_spec"])],
                "generation tok/s", ticks)
         _lines(a2, labels, [(f"{spec_label} acceptance", acc, COLORS["spec"])], "acceptance %", ticks)
         a2.set_ylim(0, 105)
@@ -128,9 +129,12 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, list[str]],
         ga, ra, gs = (_series(rows, labels, i) for i in (0, 1, 3))
         if not _has_data(ga, gs):
             return False
-        fig, ax = plt.subplots(figsize=(6, 3.2))
-        _bars(ax, labels, [("Gufo AR", ga, COLORS["gufo"]), (f"{ref} AR", ra, COLORS["reference"]),
-                           (f"Gufo {spec_label}", gs, COLORS["spec"])], "aggregate output tok/s")
+        series = [("Gufo AR", ga, COLORS["gufo"]), (f"{ref} AR", ra, COLORS["reference"]),
+                  (f"Gufo {spec_label}", gs, COLORS["spec"])]
+        if config.reference_speculative:
+            series.append((f"{ref} {spec_label}", _series(rows, labels, 4), COLORS["ref_spec"]))
+        fig, ax = plt.subplots(figsize=(6.5, 3.2))
+        _bars(ax, labels, series, "aggregate output tok/s")
         ax.set_xlabel("concurrent users")
         ax.legend(loc="upper left")
     elif kind in ("loading", "memory", "image-encoder"):

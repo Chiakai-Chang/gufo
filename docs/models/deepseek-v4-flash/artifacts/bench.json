@@ -29,7 +29,16 @@
       "--dspark-model",
       "{dspark}"
     ],
-    "reference": "ar"
+    "reference": {
+      "args": [
+        "--spec-type",
+        "draft-dspark",
+        "--spec-draft-model",
+        "{dspark}",
+        "--spec-draft-ngl",
+        "999"
+      ]
+    }
   },
   "tables": {
     "loading": {
@@ -56,7 +65,7 @@
         32768,
         65536
       ],
-      "context": 67712,
+      "context": 68224,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -81,7 +90,7 @@
         32768,
         65536
       ],
-      "context": 67712,
+      "context": 68224,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -172,7 +181,8 @@
         }
       ],
       "metric": "GiB",
-      "better": "lower"
+      "better": "lower",
+      "mode": "ar"
     }
   },
   "gufo": {

@@ -29,15 +29,18 @@
     "variant": "q4"
   },
   "notes": [
-    "peak device-wide VRAM use sampled with rocm-smi every 250 ms during the request"
+    "peak device-wide VRAM + GTT use sampled with rocm-smi every 250 ms during the request",
+    "server mode: ar"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "16K prefix, pp4096 + tg128": {
-      "gib": 23.21
+      "command": "gufo serve --port 48801 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
+      "gib": 21.24
     },
     "pp2048 + tg128": {
-      "gib": 21.31
+      "command": "gufo serve --port 48801 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
+      "gib": 19.35
     }
   },
   "schemaVersion": 1,
@@ -46,7 +49,7 @@
       "gufo",
       "serve",
       "--port",
-      "54711",
+      "48801",
       "--sessions",
       "1",
       "llm",
@@ -59,19 +62,13 @@
       "--think",
       "off",
       "--max-pending-per-client",
-      "8",
-      "--mmproj",
-      "mmproj-BF16.gguf",
-      "--speculative",
-      "dflash2",
-      "--dflash-model",
-      "Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+      "8"
     ]
   },
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "c0abb9f6779908b96a4831b58a0e41ea93566d92"
+    "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
   },
   "table": "memory-q4",
   "target": "gufo"

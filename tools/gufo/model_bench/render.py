@@ -93,17 +93,24 @@ def layout_for(config: BenchConfig, table: TableSpec) -> Layout:
             [_depth_label(d) for d in table.spec["depths"]],
         )
     if kind == "single":
+        if config.reference_speculative:
+            reference = [Column(f"{ref} {spec_label} tg", "reference"), Column("Gain", "gain")]
+        else:
+            reference = [Column(f"{ref} AR tg", "reference"), Column(f"Gain vs {ref} AR", "gain")]
         return Layout(
             [Column("Depth", "label"), Column("Gufo pp", "gufo"), Column("Gufo tg", "gufo"),
-             Column("Acceptance", "gufo"), Column(f"{ref} AR tg", "reference"),
-             Column(f"Gain vs {ref} AR", "gain")],
+             Column("Acceptance", "gufo"), *reference],
             [_depth_label(d) for d in table.spec["depths"]],
         )
     if kind == "multi":
+        if config.reference_speculative:
+            speculative = [Column(f"Gufo {spec_label}", "gufo"), Column(f"{ref} {spec_label}", "reference"),
+                           Column("Gain", "gain")]
+        else:
+            speculative = [Column(f"Gufo {spec_label}", "gufo"), Column(f"Gain vs {ref} AR", "gain")]
         return Layout(
             [Column("Users", "label"), Column("Gufo AR", "gufo"), Column(f"{ref} AR", "reference"),
-             Column("Gain", "gain"), Column(f"Gufo {spec_label}", "gufo"),
-             Column(f"Gain vs {ref} AR", "gain"), Column("Exact", "exact")],
+             Column("Gain", "gain"), *speculative, Column("Exact", "exact")],
             [str(c) for c in table.spec["concurrency"]],
         )
     if kind == "memory":
@@ -140,20 +147,23 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
     values: dict[str, dict[str, str | None]] = {}
     kind = table.kind
     if kind == "multi":
+        mode = config.speculative["mode"]
         gufo_ar = load_artifact(artifact_path(config, table, "gufo", "ar"))
-        gufo_spec = load_artifact(artifact_path(config, table, "gufo", config.speculative["mode"]))
+        gufo_spec = load_artifact(artifact_path(config, table, "gufo", mode))
         reference = load_artifact(artifact_path(config, table, "reference"))
+        ref_spec = load_artifact(artifact_path(config, table, "reference", mode))
         for users in table.spec["concurrency"]:
             values[str(users)] = {
                 "gufo_ar": _fmt(_serving_rate(gufo_ar, users)) if gufo_ar else None,
                 "reference": _fmt(_serving_rate(reference, users)) if reference else None,
                 "gufo_spec": _fmt(_serving_rate(gufo_spec, users)) if gufo_spec else None,
+                "ref_spec": _fmt(_serving_rate(ref_spec, users)) if ref_spec else None,
                 "exact": _serving_exact(reference, users) if reference else None,
             }
         return values
 
     gufo = load_artifact(artifact_path(config, table, "gufo"))
-    if kind == "single" and table.speculative:
+    if kind == "single" and table.speculative and not config.reference_speculative:
         ar_table = config.table("single-ar" + (f"-{table.variant}" if table.variant else ""))
         reference = load_artifact(artifact_path(config, ar_table, "reference"))
     else:
@@ -208,9 +218,15 @@ def _serving_exact(report: dict[str, Any] | None, users: int) -> str | None:
 
 
 def _pick(fresh: str | None, existing: str | None) -> str:
+    """Gufo cells keep hand-entered text when no artifact covers them."""
     if fresh is not None:
         return fresh
     return existing if existing else TODO
+
+
+def _ref(fresh: str | None) -> str:
+    """Reference cells come from artifacts only, so layout changes never carry stale values."""
+    return fresh if fresh is not None else TODO
 
 
 def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, list[str]] | None) -> str:
@@ -226,25 +242,29 @@ def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, list
         fresh = values.get(label, {})
         if kind == "loading" or kind == "memory":
             g = _pick(fresh.get("gufo"), cell(0))
-            r = _pick(fresh.get("reference"), cell(1))
+            r = _ref(fresh.get("reference"))
             cells = [g, r, gain(_number(g), _number(r), better)]
         elif kind == "single" and not table.speculative:
-            gp = _pick(fresh.get("gufo_pp"), cell(0)); rp = _pick(fresh.get("ref_pp"), cell(1))
-            gt = _pick(fresh.get("gufo_tg"), cell(3)); rt = _pick(fresh.get("ref_tg"), cell(4))
+            gp = _pick(fresh.get("gufo_pp"), cell(0)); rp = _ref(fresh.get("ref_pp"))
+            gt = _pick(fresh.get("gufo_tg"), cell(3)); rt = _ref(fresh.get("ref_tg"))
             cells = [gp, rp, gain(_number(gp), _number(rp), better),
                      gt, rt, gain(_number(gt), _number(rt), better)]
         elif kind == "single":
             gp = _pick(fresh.get("gufo_pp"), cell(0)); gt = _pick(fresh.get("gufo_tg"), cell(1))
-            acc = _pick(fresh.get("acceptance"), cell(2)); rt = _pick(fresh.get("ref_tg"), cell(3))
+            acc = _pick(fresh.get("acceptance"), cell(2)); rt = _ref(fresh.get("ref_tg"))
             cells = [gp, gt, acc, rt, gain(_number(gt), _number(rt), better)]
         elif kind == "multi":
-            ga = _pick(fresh.get("gufo_ar"), cell(0)); ra = _pick(fresh.get("reference"), cell(1))
-            gs = _pick(fresh.get("gufo_spec"), cell(3)); ex = _pick(fresh.get("exact"), cell(5))
-            cells = [ga, ra, gain(_number(ga), _number(ra), better), gs,
-                     gain(_number(gs), _number(ra), better), ex]
+            ga = _pick(fresh.get("gufo_ar"), cell(0)); ra = _ref(fresh.get("reference"))
+            gs = _pick(fresh.get("gufo_spec"), cell(3)); ex = _ref(fresh.get("exact"))
+            cells = [ga, ra, gain(_number(ga), _number(ra), better), gs]
+            if config.reference_speculative:
+                rs = _ref(fresh.get("ref_spec"))
+                cells += [rs, gain(_number(gs), _number(rs), better), ex]
+            else:
+                cells += [gain(_number(gs), _number(ra), better), ex]
         elif kind == "image-encoder":
             size = int(label.split("×")[0])
-            g = _pick(fresh.get("gufo"), cell(1)); r = _pick(fresh.get("reference"), cell(2))
+            g = _pick(fresh.get("gufo"), cell(1)); r = _ref(fresh.get("reference"))
             cells = [str(_merged_tokens(size)), g, r, gain(_number(g), _number(r), better)]
         else:
             raise SystemExit(f"no renderer for table {table.id}")

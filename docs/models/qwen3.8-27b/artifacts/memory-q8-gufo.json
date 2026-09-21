@@ -26,49 +26,43 @@
   "mode": null,
   "model": {
     "id": "Qwen3.8-27B",
-    "variant": "q4"
+    "variant": "q8"
   },
   "notes": [
-    "llama.cpp: version: 0.4.1-dev (build 11069, commit )",
     "peak device-wide VRAM + GTT use sampled with rocm-smi every 250 ms during the request",
     "server mode: ar"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "16K prefix, pp4096 + tg128": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 262144 -np 1 --port 58297 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
-      "gib": 32.68
+      "command": "gufo serve --port 42115 --sessions 1 llm --model Qwen3.8-27B-UD-Q8_K_L.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
+      "gib": 21.26
     },
     "pp2048 + tg128": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 262144 -np 1 --port 58297 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
-      "gib": 32.68
+      "command": "gufo serve --port 42115 --sessions 1 llm --model Qwen3.8-27B-UD-Q8_K_L.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
+      "gib": 19.37
     }
   },
   "schemaVersion": 1,
   "server": {
     "command": [
-      "llama-server",
-      "-m",
-      "Qwen3.8-27B-UD-Q4_K_XL.gguf",
-      "-c",
-      "262144",
-      "-np",
-      "1",
+      "gufo",
+      "serve",
       "--port",
-      "58297",
-      "--host",
-      "127.0.0.1",
-      "--alias",
+      "42115",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "Qwen3.8-27B-UD-Q8_K_L.gguf",
+      "--context",
+      "262144",
+      "--served-model-name",
       "bench",
-      "-ngl",
-      "999",
-      "-fa",
-      "on",
-      "--cache-reuse",
-      "0",
-      "--jinja",
-      "--reasoning",
-      "off"
+      "--think",
+      "off",
+      "--max-pending-per-client",
+      "8"
     ]
   },
   "source": {
@@ -76,6 +70,6 @@
     "dirty": true,
     "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
   },
-  "table": "memory-q4",
-  "target": "reference"
+  "table": "memory-q8",
+  "target": "gufo"
 }

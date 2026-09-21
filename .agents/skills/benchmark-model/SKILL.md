@@ -21,10 +21,18 @@ Ask the user before measuring anything:
 2. Where the model files are: target GGUF or safetensors directory per
    variant, draft/MTP/DSpark support files, mmproj, audio fixtures. Model
    files live wherever the user keeps them; nothing in Git records paths.
-3. Full benchmark (every table, every cell, both targets) or only the cells
-   currently `TODO` in `BENCHMARKS.md`.
+3. Full benchmark (every table, every row, both targets) or only the rows
+   with `TODO` cells in `BENCHMARKS.md`. A TODO-only refresh is valid only
+   when the retained rows of that table came from this driver with the same
+   workload; a table whose retained cells come from another method (`gufo
+   bench`, an older prompt) must be refreshed whole, because one Gain column
+   cannot mix two methods.
 
-Then confirm the time budget: a full LLM sweep with the reference is hours.
+Then confirm the time budget. Measured on Strix Halo with a 27B Q4 model:
+a single-user depth table (six depths) takes about 4 min for Gufo and 8 min
+for llama.cpp; memory 1–2 min per target; each concurrency table 10–15 min
+per target and mode; loading about 1 min per variant. A full LLM refresh with
+both targets and both modes is 1.5–3 h.
 
 ## Measurement model
 
@@ -46,20 +54,26 @@ one JSON per table (and per mode for concurrency tables) into
 nix build   # production Gufo binary at result/bin/gufo
 FILES="--gguf q4=/path/to/target-q4.gguf --draft q4=/path/to/draft-q4.gguf --mmproj /path/to/mmproj.gguf"
 nix develop -c python3 tools/bench/model-bench.py --model <model> tables            # ids and existing artifacts
-nix develop -c python3 tools/bench/model-bench.py --model <model> $FILES run --target gufo
-nix develop -c python3 tools/bench/model-bench.py --model <model> $FILES run --target reference
+nix develop -c python3 tools/bench/model-bench.py --model <model> $FILES run --target gufo --table single-ar-q4,single-dflash2-q4
+nix develop -c python3 tools/bench/model-bench.py --model <model> $FILES run --target reference --table single-ar-q4,single-dflash2-q4
 nix develop -c python3 tools/bench/model-bench.py --model <model> render           # or render --check
 ```
 
-`run` flags: `--todo` measures only rows whose target-owned cells are `TODO`
-in `BENCHMARKS.md`; `--table <id>[,<id>]` restricts to named tables;
-`--drop-caches "<privileged command>"` is needed by the loading table on hosts
-without passwordless sudo/doas (`sync; echo 3 > /proc/sys/vm/drop_caches`);
-`--config` and `--artifacts-dir` point at an alternative `bench.json` and
-output directory for experiments that must not touch the retained artifacts.
+`run` flags: `--table <id>[,<id>]` selects tables (without it every table
+runs in `bench.json` order); `--todo` measures only rows that have a `TODO`
+in a cell owned by the target (row-granular: one `TODO` Acceptance cell
+re-measures that row's pp and tg too); `--drop-caches "<privileged command>"`
+gives the loading table its page-cache drop (`sync; echo 3 >
+/proc/sys/vm/drop_caches`) on hosts without passwordless sudo/doas — without
+it the loading table is skipped with a message and the other tables still
+run; `--config` and `--artifacts-dir` point at an alternative `bench.json`
+and output directory for experiments. A partial re-run under changed flags
+(for example `--config` with a larger context) updates only the rows it
+measured; every row records the exact server command it ran under.
 Server logs go to the ignored `artifacts/model-bench/`. `render` keeps
-hand-entered cells that no artifact covers, so tables can hold both, and it
-draws one SVG chart per table with data into
+hand-entered Gufo cells that no artifact covers, so tables can hold both;
+reference cells always come from artifacts. It draws one SVG chart per
+table with data into
 `docs/models/<model>/artifacts/charts/` (matplotlib, deterministic output),
 placed as an image line right after the table. Tables stay the source of
 truth for agents; charts are an addition for readers. `--no-charts` skips them.
@@ -85,11 +99,14 @@ and the table says so.
 
 ## Rules for every category
 
-1. Production binary: `nix build`, `./result/bin/gufo`. Record the binary
-   SHA-256 prefix, Git revision, model artifact identities (repo, revision,
-   quantization, hashes), reference tool version/commit, backend (ROCm/Vulkan),
-   full server command lines and the measurement date. Server flags go into
-   the artifact `notes`; hosts, prompts, generated text and paths never do.
+1. Production binary: `nix build`, `./result/bin/gufo`. The driver records
+   the Git revision, machine fingerprint, reference tool version, measurement
+   date and every server command line (file paths reduced to basenames) in
+   each artifact. You record by hand, in `artifacts/model-identities.json`
+   or the card's prose: the Gufo binary SHA-256 prefix, the model files'
+   repository/revision/quantization/hashes, and the reference backend
+   (ROCm/Vulkan). Hosts, prompts, generated text and private paths never
+   enter Git.
 2. Same input, same artifact, same timed scope on both sides: same GGUF or
    safetensors, same prompt or audio file, same output length, same
    seed/temperature, same context depth, same concurrency, fresh server per
@@ -98,12 +115,17 @@ and the table says so.
    measure the closest configuration and state the mismatch under the table.
 3. Warm once, then time. One warmed sample per point is acceptable for a
    sweep; add repetitions when two runs differ by more than about 2% or a
-   regression is suspected, and report mean ± sd. Run model jobs sequentially;
-   nothing else on the GPU.
-4. Run the model's quality checks in `EVALUATION.md` before publishing speed.
-   Greedy speculative output must match AR token IDs; the reference's greedy
-   output is compared by completion hash and the match count is reported. A
-   mismatch or device fault is not a result.
+   regression is suspected, and report mean ± sd. A sample whose generated
+   token count is below the requested output length (context overflow, early
+   stop) is not a result; the driver rejects it and names the table's
+   `context` to raise. Run model jobs sequentially; nothing else on the GPU.
+4. Before publishing a speed refresh of unchanged code, run the model's fast
+   correctness suite (for Qwen3.8 27B `nix develop -c python3
+   tools/qwen27b/check.py fast`); the full `EVALUATION.md` suites are for
+   changed kernels or models. Greedy speculative output must match AR token
+   IDs. Concurrency tables compare every completion hash against the Gufo AR
+   C1 reference and report the match count (`Exact`); single-user tables
+   check token counts only. A mismatch or device fault is not a result.
 5. A cell without a current qualified measurement is `TODO`, never a stale
    number. Keep dates per table; do not sum stage medians into a headline.
 6. Retained JSON goes to `docs/models/<model>/artifacts/`; raw samples,
@@ -140,9 +162,11 @@ Models: `deepseek-v4-flash`, `qwen3.8-27b`, `qwen3.8-flash-next`.
 Reference: **llama.cpp** `llama-server`, same GGUF, ROCm build,
 `-ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off`, `-np` equal to the
 largest concurrency, `-c` covering the deepest sweep point plus 2048 + 128.
-Gufo: `gufo serve --sessions 8 --max-pending-per-client 8`, thinking off,
-greedy, seed 1. The sweep parameters are identical across the three models so
-the documents stay comparable.
+Gufo: `gufo serve llm --think off --max-pending-per-client 8`, greedy, seed
+1; the driver sets `--sessions 1` for single-user tables and `--sessions C`
+(llama.cpp `-np C -c 4096·C`) for concurrency tables, and attaches `--mmproj`
+only for the image-encoder table. The sweep parameters are identical across
+the three models so the documents stay comparable.
 
 Tables, in order (table ids in parentheses; append `-<quant>` when the
 model has several quantizations, e.g. `single-ar-q4`):
@@ -153,35 +177,43 @@ model has several quantizations, e.g. `single-ar-q4`):
    the same GGUF. `Target | Gufo ready | llama.cpp ready | Gain`.
 2. **Single user, autoregressive** (`single-ar`). pp2048 / tg128, C1, depth
    `0,4096,8192,12288,16384,32768`; add `65536,131072` when the model's
-   context allows. Depth `d` is a cached prefix: send the `d`-token prefix once
-   with `cache_prompt=true`, then prefix + 2048 new tokens with 128 output
-   tokens. Neither server exposes a tokenizer endpoint, so the driver
-   calibrates the synthetic prefix text (`prefix.generator`, seeded) against
-   each server's reported `prompt_n`/`cache_n` and accepts a point only when
-   `cache_n` is within `depth_tolerance` of `d` and `prompt_n` within it of
-   2048; the actual counts are stored in the artifact. The same text is sent
-   to both servers.
+   context allows. Depth `d` is a cached conversation prefix: the driver sends
+   a user turn of about `d` tokens (one generated token as the reply), then
+   the measured request continues that conversation with a new user turn of
+   about 2048 tokens and 128 output tokens; Gufo reuses its prompt snapshot
+   and llama-server its prompt cache (`cache_prompt=true`). Neither server
+   exposes a tokenizer endpoint, so the driver calibrates the synthetic text
+   (`prefix.generator`, seeded) against each server's reported
+   `prompt_n`/`cache_n` and accepts a point only when `cache_n` is within
+   `depth_tolerance` (at least 32 tokens) of `d` and `prompt_n` within it of
+   2048; the actual counts are stored per sample. The table's `context` must
+   be the deepest depth + 2048 + 128 plus a calibration margin (512 in the
+   shipped configurations).
    `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain`.
 3. **Single user, speculative** (`single-<spec>`, DFlash2 / DSpark / MTP as
    the model supports). Same grid plus `Acceptance` from `usage.gufo`.
-   Reference: `llama-server --model-draft` when an equivalent draft exists
-   (`llama.cpp draft tg | Gain`), otherwise llama.cpp AR
-   (`llama.cpp AR tg | Gain vs llama.cpp AR`); the note under the table says
-   which. `Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp ... tg | Gain ...`.
+   llama.cpp runs the same draft file through `--spec-type draft-dflash`,
+   `draft-mtp` or `draft-dspark` (`speculative.reference.args` in
+   `bench.json`, otherwise llama.cpp's defaults; tune them only when the
+   reference project documents better values, and record the change).
+   `Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp <spec> tg | Gain`.
+   When a model's `bench.json` has no `speculative.reference`, the reference
+   column falls back to llama.cpp AR and is labelled `Gain vs llama.cpp AR`.
 4. **Multiple users** (`multi-mixed`, `multi-repetition`). `C = 1,2,4,6,8`,
    context capacity 4096, 128 output tokens, fresh server per point,
    `cache_prompt=false`. Two workloads from
    `docs/models/qwen3.8-27b/artifacts/speculative-corpus.json`: `repetition`
    and `mixed` (distinct layout). Metric: aggregate delivered output tok/s
    (`aggregate.output_tokens_per_second.overall`). `Exact` is the count of
-   llama.cpp completions whose hash matches the Gufo AR C1 reference. Report
-   C8 median / p95 latency and acceptance under the table.
-   `Users | Gufo AR | llama.cpp AR | Gain | Gufo <spec> | Gain vs llama.cpp AR | Exact`.
-5. **Memory** (`memory`). GPU-visible allocation at the documented context
-   capacity for pp2048+tg128 and a 16K-prefix pp4096+tg128 (`usage.gufo`
-   memory fields / `gufo diagnose`). Reference: `llama-server` resident
-   device memory at the same `-c`, read from the ROCm SMI while the request
-   runs. `Workload | Gufo GiB | llama.cpp GiB | Gain`.
+   llama.cpp AR completions whose hash matches the Gufo AR C1 reference.
+   Report C8 median / p95 latency and acceptance under the table.
+   `Users | Gufo AR | llama.cpp AR | Gain | Gufo <spec> | llama.cpp <spec> | Gain | Exact`.
+5. **Memory** (`memory`). Peak device-visible memory (VRAM + GTT from
+   `rocm-smi`, sampled every 250 ms) while pp2048+tg128 and a 16K-prefix
+   pp4096+tg128 run, both servers autoregressive at the same context
+   capacity, no projector loaded. llama-server preallocates its KV cache, so
+   its footprint does not grow with the prefix; say so under the table.
+   `Workload | Gufo GiB | llama.cpp GiB | Gain`.
 6. **Image encoder** (`image-encoder`, vision models only). Warm encode
    latency for 256×256 and 1024×1024 RGB through the chat endpoint with the
    BF16 projector, isolated from language prefill via `usage.gufo` stages.
@@ -190,7 +222,8 @@ model has several quantizations, e.g. `single-ar-q4`):
    `RGB image | Merged tokens | Gufo ms | llama.cpp ms | Gain`.
 
 Concurrency artifacts are `gufo-serving-bench` corpus reports named
-`<table>-gufo-ar.json`, `<table>-gufo-<spec>.json` and `<table>-reference.json`;
+`<table>-gufo-ar.json`, `<table>-gufo-<spec>.json`, `<table>-reference.json`
+(llama.cpp AR) and `<table>-reference-<spec>.json`;
 the other tables use the compact `model-bench-table` schema with one entry per
 row and the actual `cache_n`/`prompt_n` counts. The image-encoder table is not
 automated yet; leave its cells `TODO` or fill them by hand from a documented
@@ -287,8 +320,11 @@ explicit approval and `--allow-full-generation`.
 ## Finish
 
 Render the tables, check that every Gufo/reference pair used the same
-workload identity, update dates and the reproduction block, and list the
-remaining `TODO` cells with the reason (tool missing, reference unsupported,
-time budget). Update `EXPERIMENTS.md` only when a measurement changes a
+workload identity, and rewrite the prose around each table: dates, method,
+server versions and flags, artifact file names, caveats such as a skipped
+loading table, and the reproduction block with the exact `model-bench.py`
+commands (paths as placeholders). Remove statements the new numbers
+contradict. List the remaining `TODO` cells with the reason (tool missing,
+reference unsupported, time budget). Update `EXPERIMENTS.md` only when a measurement changes a
 retained decision. Summarize per table: Gufo, reference, best and worst gain,
 and every cell where completion hashes or transcripts did not match.

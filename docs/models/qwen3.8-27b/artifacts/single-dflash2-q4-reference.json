@@ -36,7 +36,9 @@
   "referenceName": "llama.cpp",
   "rows": {
     "0": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 55429 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "acceptance": 66.14,
+      "acceptance_sd": null,
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 41191 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-dflash --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft-ngl 999",
       "counts": [
         {
           "cache_n": 0,
@@ -44,14 +46,16 @@
           "prompt_n": 2033
         }
       ],
-      "pp": 326.21,
+      "pp": 314.59,
       "pp_sd": null,
       "samples": 1,
-      "tg": 12.09,
+      "tg": 27.11,
       "tg_sd": null
     },
     "12288": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 55429 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "acceptance": 52.38,
+      "acceptance_sd": null,
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 41191 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-dflash --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft-ngl 999",
       "counts": [
         {
           "cache_n": 12275,
@@ -59,14 +63,16 @@
           "prompt_n": 2055
         }
       ],
-      "pp": 275.09,
+      "pp": 271.08,
       "pp_sd": null,
       "samples": 1,
-      "tg": 11.61,
+      "tg": 22.2,
       "tg_sd": null
     },
     "16384": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 55429 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "acceptance": 51.01,
+      "acceptance_sd": null,
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 41191 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-dflash --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft-ngl 999",
       "counts": [
         {
           "cache_n": 16373,
@@ -74,14 +80,16 @@
           "prompt_n": 2050
         }
       ],
-      "pp": 264.36,
+      "pp": 261.57,
       "pp_sd": null,
       "samples": 1,
-      "tg": 11.45,
+      "tg": 21.45,
       "tg_sd": null
     },
     "32768": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 55429 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "acceptance": 52.38,
+      "acceptance_sd": null,
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 41191 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-dflash --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft-ngl 999",
       "counts": [
         {
           "cache_n": 32778,
@@ -89,14 +97,16 @@
           "prompt_n": 2056
         }
       ],
-      "pp": 228.96,
+      "pp": 224.52,
       "pp_sd": null,
       "samples": 1,
-      "tg": 10.91,
+      "tg": 20.54,
       "tg_sd": null
     },
     "4096": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 55429 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "acceptance": 66.14,
+      "acceptance_sd": null,
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 41191 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-dflash --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft-ngl 999",
       "counts": [
         {
           "cache_n": 4094,
@@ -104,14 +114,16 @@
           "prompt_n": 2037
         }
       ],
-      "pp": 302.46,
+      "pp": 292.45,
       "pp_sd": null,
       "samples": 1,
-      "tg": 11.92,
+      "tg": 26.64,
       "tg_sd": null
     },
     "8192": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 55429 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "acceptance": 53.06,
+      "acceptance_sd": null,
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 35456 -np 1 --port 41191 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-dflash --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft-ngl 999",
       "counts": [
         {
           "cache_n": 8199,
@@ -119,10 +131,10 @@
           "prompt_n": 2043
         }
       ],
-      "pp": 287.14,
+      "pp": 282.76,
       "pp_sd": null,
       "samples": 1,
-      "tg": 11.77,
+      "tg": 22.44,
       "tg_sd": null
     }
   },
@@ -137,7 +149,7 @@
       "-np",
       "1",
       "--port",
-      "55429",
+      "41191",
       "--host",
       "127.0.0.1",
       "--alias",
@@ -150,7 +162,13 @@
       "0",
       "--jinja",
       "--reasoning",
-      "off"
+      "off",
+      "--spec-type",
+      "draft-dflash",
+      "--spec-draft-model",
+      "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+      "--spec-draft-ngl",
+      "999"
     ]
   },
   "source": {
@@ -158,6 +176,6 @@
     "dirty": true,
     "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
   },
-  "table": "single-ar-q4",
+  "table": "single-dflash2-q4",
   "target": "reference"
 }

@@ -14,9 +14,9 @@ preserved. PNG/JPEG input works with AR/MTP and `mmproj-BF16.gguf`; see
 
 Reference implementation: **llama.cpp** `llama-server` from this repository's
 `flake.nix` (ROCm, gfx1151, same sharded GGUF), measured over HTTP with the
-same prompts and timed scope. **Gain** is Gufo over llama.cpp, positive when
-Gufo is faster; `Gain vs llama.cpp AR` compares MTP against llama.cpp without
-a draft. All llama.cpp cells are **TODO** until the first HTTP sweep. Layout
+same prompts and timed scope; llama.cpp runs the same MTP sidecar through
+`--spec-type draft-mtp`. **Gain** is Gufo over llama.cpp, positive when Gufo
+is faster. All llama.cpp cells are **TODO** until the first HTTP sweep. Layout
 and method: [benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md).
 
 ## Loading
@@ -68,12 +68,11 @@ throughput remain unmet.
 
 Same workload with `--speculative mtp`. MTP PP includes predictor catch-up
 through all known successor tokens and adds about 2% to prefill time at the
-three refreshed depths; greedy output matches AR at each depth. llama.cpp has
-no MTP for this model: the reference column is llama.cpp autoregressive
-generation with the same target GGUF.
+three refreshed depths; greedy output matches AR at each depth. The
+reference column is llama.cpp with the same MTP sidecar (`draft-mtp`).
 
 <!-- bench:single-mtp -->
-| Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp AR tg | Gain vs llama.cpp AR |
+| Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp MTP tg | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | 1503.6 | 43.95 | 69.2% | TODO | TODO |
 | 4,096 | TODO | 40.35 | 65.6% | TODO | TODO |
@@ -119,25 +118,25 @@ that uses the corpus aggregate metric on both sides is **TODO**; until then
 the Gufo and llama.cpp columns are not the same metric.
 
 <!-- bench:multi-repetition -->
-| Users | Gufo AR | llama.cpp AR | Gain | Gufo MTP | Gain vs llama.cpp AR | Exact |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 27.3 | TODO | TODO | 84.6 | TODO | TODO |
-| 2 | 46.4 | TODO | TODO | 127.7 | TODO | TODO |
-| 4 | 76.7 | TODO | TODO | 166.1 | TODO | TODO |
-| 6 | 95.4 | TODO | TODO | 181.2 | TODO | TODO |
-| 8 | 108.5 | TODO | TODO | **188.9** | TODO | TODO |
+| Users | Gufo AR | llama.cpp AR | Gain | Gufo MTP | llama.cpp MTP | Gain | Exact |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 27.3 | TODO | TODO | 84.6 | TODO | TODO | TODO |
+| 2 | 46.4 | TODO | TODO | 127.7 | TODO | TODO | TODO |
+| 4 | 76.7 | TODO | TODO | 166.1 | TODO | TODO | TODO |
+| 6 | 95.4 | TODO | TODO | 181.2 | TODO | TODO | TODO |
+| 8 | 108.5 | TODO | TODO | **188.9** | TODO | TODO | TODO |
 <!-- /bench -->
 
 ![Multiple users, repetition](artifacts/charts/multi-repetition.svg)
 
 <!-- bench:multi-mixed -->
-| Users | Gufo AR | llama.cpp AR | Gain | Gufo MTP | Gain vs llama.cpp AR | Exact |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 27.0 | TODO | TODO | 49.3 | TODO | TODO |
-| 2 | 43.2 | TODO | TODO | 66.4 | TODO | TODO |
-| 4 | 66.8 | TODO | TODO | 95.2 | TODO | TODO |
-| 6 | 78.2 | TODO | TODO | 110.4 | TODO | TODO |
-| 8 | 86.7 | TODO | TODO | 118.3 | TODO | TODO |
+| Users | Gufo AR | llama.cpp AR | Gain | Gufo MTP | llama.cpp MTP | Gain | Exact |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 27.0 | TODO | TODO | 49.3 | TODO | TODO | TODO |
+| 2 | 43.2 | TODO | TODO | 66.4 | TODO | TODO | TODO |
+| 4 | 66.8 | TODO | TODO | 95.2 | TODO | TODO | TODO |
+| 6 | 78.2 | TODO | TODO | 110.4 | TODO | TODO | TODO |
+| 8 | 86.7 | TODO | TODO | 118.3 | TODO | TODO | TODO |
 <!-- /bench -->
 
 ![Multiple users, mixed corpus](artifacts/charts/multi-mixed.svg)

@@ -1,10 +1,23 @@
 {
   "sha256": {
     "Target UD-Q4_K_XL": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+    "Target UD-Q8_K_L": "2a13bba36d2efa213f9275abc430c40e4d914b145bfde976f30f1bb5b7e23ac2",
     "Target UD-Q8_K_XL": "af36ecb6b5db1407953345b746c14ac93f0657dda413910b4348683a2d990377",
     "Draft Q4_K_M": "1a25c56858e1ebe93f2718ac1d49d1151f9323325c1bbfd6209370f4db131ebd",
     "Draft Q8_0": "c18e800daedc59ca68fd13b6a856d795746af6d399a9279ac6a277d1d422f87e",
-    "Draft BF16": "26d47ca20ab07688327a63d912acad222d924eaaa92a980cc488de3c67e736bc"
+    "Draft BF16": "26d47ca20ab07688327a63d912acad222d924eaaa92a980cc488de3c67e736bc",
+    "mmproj BF16": "83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53"
   },
-  "scope": "Artifacts used by the retained 2026-09-16 qualification; see benchmark dates for later controls."
+  "sources": {
+    "targets": "unsloth/Qwen3.8-27B-GGUF, snapshot 4ca720788d1e01f1bff70c033e0d0028fd02e502",
+    "draft": "z-lab/Qwen3.8-27B-DFlash2-GGUF, Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+  },
+  "benchmarks-2026-09-21": {
+    "gufo": "revision 1589ed79 (dirty), nix build, binary sha256 prefix 73590c9c12fb",
+    "reference": "llama.cpp b11069 from flake.nix (0.4.1-dev build 11069), ROCm gfx1151, LLAMA_HIP_UMA=ON",
+    "targets": ["Target UD-Q4_K_XL", "Target UD-Q8_K_L"],
+    "draft": "Draft Q4_K_M",
+    "note": "The Q8 tables in BENCHMARKS.md measure UD-Q8_K_L; UD-Q8_K_XL is the artifact of the retained 2026-09-16 qualification."
+  },
+  "scope": "Artifacts used by the retained 2026-09-16 qualification and the 2026-09-21 benchmark refresh; see benchmark dates for later controls."
 }

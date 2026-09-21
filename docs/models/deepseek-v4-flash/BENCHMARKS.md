@@ -17,9 +17,9 @@ Target: `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-073
 
 Reference implementation: **llama.cpp** `llama-server` from this repository's
 `flake.nix` (ROCm, gfx1151, same target GGUF), measured over HTTP with the
-same prompts and timed scope. **Gain** is Gufo over llama.cpp, positive when
-Gufo is faster; `Gain vs llama.cpp AR` compares DSpark against llama.cpp
-without a draft. All llama.cpp cells are **TODO** until the first HTTP sweep.
+same prompts and timed scope; llama.cpp runs the same DSpark support file
+through `--spec-type draft-dspark`. **Gain** is Gufo over llama.cpp, positive
+when Gufo is faster. All llama.cpp cells are **TODO** until the first HTTP sweep.
 Layout and method: [benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md).
 
 ## Loading
@@ -61,12 +61,11 @@ needs a d64K speed refresh. Gain uses means.
 ## Single user, DSpark
 
 Same workload and measurement date: two measurements at d0, one at d32K.
-DSpark prefill includes support-state work. llama.cpp has no DSpark
-equivalent: the reference column is llama.cpp autoregressive generation with
-the same target GGUF.
+DSpark prefill includes support-state work. The reference column is
+llama.cpp with the same DSpark support file (`draft-dspark`).
 
 <!-- bench:single-dspark -->
-| Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp AR tg | Gain vs llama.cpp AR |
+| Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp DSpark tg | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | 453.49 ± 25.96 | 17.45 ± 0.00 | TODO | TODO | TODO |
 | 4,096 | TODO | TODO | TODO | TODO | TODO |
@@ -95,23 +94,23 @@ Gufo AR C1 reference. The current sweep is **TODO**, including acceptance and
 output checks at every concurrency.
 
 <!-- bench:multi-repetition -->
-| Users | Gufo AR | llama.cpp AR | Gain | Gufo DSpark | Gain vs llama.cpp AR | Exact |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 2 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 6 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO | TODO | TODO | TODO |
+| Users | Gufo AR | llama.cpp AR | Gain | Gufo DSpark | llama.cpp DSpark | Gain | Exact |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 2 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 6 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 <!-- /bench -->
 
 <!-- bench:multi-mixed -->
-| Users | Gufo AR | llama.cpp AR | Gain | Gufo DSpark | Gain vs llama.cpp AR | Exact |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 2 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 4 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 6 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 8 | TODO | TODO | TODO | TODO | TODO | TODO |
+| Users | Gufo AR | llama.cpp AR | Gain | Gufo DSpark | llama.cpp DSpark | Gain | Exact |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 2 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 6 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8 | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
 <!-- /bench -->
 
 Latest fixed-prompt sampled HTTP control (2026-09-19, C2, temperature 1,
