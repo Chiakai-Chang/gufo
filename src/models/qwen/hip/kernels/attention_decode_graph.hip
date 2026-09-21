@@ -197,39 +197,72 @@ __launch_bounds__(32) __global__ void QwenDecodeOnlineAttentionHalfPtrKernel(
   float running_sum = 0.0F;
   const std::uint32_t pos = *d_pos;
   const std::size_t sequence_length = static_cast<std::size_t>(pos) + 1;
-  for (std::size_t position = 0; position < sequence_length; ++position) {
-    const __half* key = k_cache + cache_head_offset + (position * kv_width);
-    float score = 0.0F;
+  // Load neighboring keys and values together, then retain the scalar
+  // position order for every softmax and output update.
+  constexpr std::size_t positions_per_load = 2;
+  for (std::size_t position = 0; position < sequence_length;
+       position += positions_per_load) {
+    float scores[positions_per_load]{};
+    float4 values[positions_per_load][vectors_per_lane];
 #pragma unroll
-    for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
-      const float4 query_value = query_values[vector];
-      const float4 key_value =
-          LoadGraphHalf4(key + ((lane + (vector * 32)) * 4));
-      score += (query_value.x * key_value.x) + (query_value.y * key_value.y) +
-               (query_value.z * key_value.z) + (query_value.w * key_value.w);
+    for (std::size_t step = 0; step < positions_per_load; ++step) {
+      if (position + step >= sequence_length)
+        break;
+      const auto offset = cache_head_offset + ((position + step) * kv_width);
+      const __half* key = k_cache + offset;
+      const __half* value = v_cache + offset;
+      float score = 0.0F;
+#pragma unroll
+      for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+        const float4 query_value = query_values[vector];
+        const auto element = (lane + (vector * 32)) * 4;
+        const float4 key_value = LoadGraphHalf4(key + element);
+        values[step][vector] = LoadGraphHalf4(value + element);
+        score += (query_value.x * key_value.x) + (query_value.y * key_value.y) +
+                 (query_value.z * key_value.z) + (query_value.w * key_value.w);
+      }
+      // Lane zero keeps the descending reduction tree. Inside each
+      // 16-lane row, DPP avoids the LDS path used by shuffle instructions.
+      score += __shfl_down(score, 16);
+      score += __builtin_bit_cast(
+          float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, score),
+                                             0x168, 0xF, 0xF, false));
+      score += __builtin_bit_cast(
+          float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, score),
+                                             0x164, 0xF, 0xF, false));
+      score += __builtin_bit_cast(
+          float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, score),
+                                             0x162, 0xF, 0xF, false));
+      score += __builtin_bit_cast(
+          float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, score),
+                                             0x161, 0xF, 0xF, false));
+      scores[step] = __shfl(score, 0) * scale;
     }
-#pragma unroll
-    for (int offset = 16; offset > 0; offset /= 2) {
-      score += __shfl_down(score, offset);
-    }
-    score = __shfl(score, 0) * scale;
 
-    const float new_max = fmaxf(running_max, score);
-    const float previous_scale = expf(running_max - new_max);
-    const float value_scale = expf(score - new_max);
-    running_sum = (running_sum * previous_scale) + value_scale;
-    running_max = new_max;
-
-    const __half* value = v_cache + cache_head_offset + (position * kv_width);
 #pragma unroll
-    for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
-      const float4 value_data =
-          LoadGraphHalf4(value + ((lane + (vector * 32)) * 4));
-      float4& output = output_values[vector];
-      output.x = (output.x * previous_scale) + (value_data.x * value_scale);
-      output.y = (output.y * previous_scale) + (value_data.y * value_scale);
-      output.z = (output.z * previous_scale) + (value_data.z * value_scale);
-      output.w = (output.w * previous_scale) + (value_data.w * value_scale);
+    for (std::size_t step = 0; step < positions_per_load; ++step) {
+      if (position + step >= sequence_length)
+        break;
+      const float new_max = fmaxf(running_max, scores[step]);
+      const float previous_scale = expf(running_max - new_max);
+      const float value_scale = expf(scores[step] - new_max);
+      running_sum = (running_sum * previous_scale) + value_scale;
+      running_max = new_max;
+
+#pragma unroll
+      for (std::uint32_t vector = 0; vector < vectors_per_lane; ++vector) {
+        const float4 value_data = values[step][vector];
+        float4& output = output_values[vector];
+        // Retain the original half-pair kernel's rounded product and FMA.
+        output.x = __fmaf_rn(output.x, previous_scale,
+                             __fmul_rn(value_data.x, value_scale));
+        output.y = __fmaf_rn(output.y, previous_scale,
+                             __fmul_rn(value_data.y, value_scale));
+        output.z = __fmaf_rn(value_data.z, value_scale,
+                             __fmul_rn(output.z, previous_scale));
+        output.w = __fmaf_rn(value_data.w, value_scale,
+                             __fmul_rn(output.w, previous_scale));
+      }
     }
   }
 

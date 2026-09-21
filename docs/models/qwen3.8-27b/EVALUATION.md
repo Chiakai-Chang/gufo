@@ -13,6 +13,16 @@ hashes and accepted/proposed counts at d0 and d32K, with comparable PP speed.
 Fresh AR requests match DFlash2 on all four 128-token outputs at those depths.
 These focused controls do not refresh the benchmark sweep.
 
+The shallow FP16 attention pipeline retains the original product/FMA order and
+lane-zero sum tree. Scalar, batched and device-position paths match the previous
+kernel byte-for-byte on 72 controls across amplitudes and ragged lengths.
+Focused attention, graph and KV/snapshot tests pass. Q4_K_XL and Q8_K_XL retain
+all four d0 pp2048/tg128 AR/DFlash2 output hashes and both acceptance counts.
+Both targets also pass C2/C4/C6/C8 full-logit, feature and verification-replay
+checks, including ragged cohorts and shrinking batches.
+The full AR profile confirms lower attention time; the deep split-K path and
+prefill kernels are unchanged.
+
 The 2026-09-21 compact-state qualification preserves Q4/Q8 AR and DFlash2
 tokens across all 23 sampling cases and C2/C4/C6/C8. Active recurrence and
 rollback buffers contain only recurrent layers; snapshots retain only valid
