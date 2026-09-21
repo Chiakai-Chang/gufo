@@ -64,6 +64,21 @@
       "tg": 11.24,
       "tg_sd": null
     },
+    "131072": {
+      "command": "gufo serve --port 32911 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "counts": [
+        {
+          "cache_n": 131068,
+          "predicted_n": 128,
+          "prompt_n": 2048
+        }
+      ],
+      "pp": 267.41,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 7.38,
+      "tg_sd": null
+    },
     "16384": {
       "command": "gufo serve --port 35199 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
@@ -109,6 +124,21 @@
       "tg": 11.7,
       "tg_sd": null
     },
+    "65536": {
+      "command": "gufo serve --port 32911 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8",
+      "counts": [
+        {
+          "cache_n": 65522,
+          "predicted_n": 128,
+          "prompt_n": 2030
+        }
+      ],
+      "pp": 376.89,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 9.26,
+      "tg_sd": null
+    },
     "8192": {
       "command": "gufo serve --port 35199 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 35456 --served-model-name bench --think off --max-pending-per-client 8",
       "counts": [
@@ -131,14 +161,14 @@
       "gufo",
       "serve",
       "--port",
-      "35199",
+      "32911",
       "--sessions",
       "1",
       "llm",
       "--model",
       "Qwen3.8-27B-UD-Q4_K_XL.gguf",
       "--context",
-      "35456",
+      "133760",
       "--served-model-name",
       "bench",
       "--think",
@@ -149,8 +179,8 @@
   },
   "source": {
     "buildMode": "nix-release",
-    "dirty": true,
-    "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
+    "dirty": false,
+    "revision": "8e496f82b370f84308b04c8f6112102f5ae8eb50"
   },
   "table": "single-ar-q4",
   "target": "gufo"

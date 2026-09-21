@@ -29,9 +29,9 @@
     "variant": "q4"
   },
   "notes": [
-    "llama.cpp: version: 0.4.1-dev (build 11069, commit )",
+    "llama.cpp: version: 0.4.1-dev (build 11069, commit 68d9053a)",
     "pp2048/tg128; depth is a cached prefix of synthetic text; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
-    "synthetic text: 1.167 tokens/word, template overhead 12 tokens"
+    "synthetic text: 1.160 tokens/word, template overhead 12 tokens"
   ],
   "referenceName": "llama.cpp",
   "rows": {
@@ -67,6 +67,23 @@
       "pp_sd": null,
       "samples": 1,
       "tg": 22.2,
+      "tg_sd": null
+    },
+    "131072": {
+      "acceptance": 53.79,
+      "acceptance_sd": null,
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 133760 -np 1 --port 51359 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-dflash --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 131086,
+          "predicted_n": 128,
+          "prompt_n": 2045
+        }
+      ],
+      "pp": 131.01,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 15.34,
       "tg_sd": null
     },
     "16384": {
@@ -120,6 +137,23 @@
       "tg": 26.64,
       "tg_sd": null
     },
+    "65536": {
+      "acceptance": 58.7,
+      "acceptance_sd": null,
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 133760 -np 1 --port 51359 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-dflash --spec-draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 65521,
+          "predicted_n": 128,
+          "prompt_n": 2031
+        }
+      ],
+      "pp": 177.98,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 19.81,
+      "tg_sd": null
+    },
     "8192": {
       "acceptance": 53.06,
       "acceptance_sd": null,
@@ -145,11 +179,11 @@
       "-m",
       "Qwen3.8-27B-UD-Q4_K_XL.gguf",
       "-c",
-      "35456",
+      "133760",
       "-np",
       "1",
       "--port",
-      "41191",
+      "51359",
       "--host",
       "127.0.0.1",
       "--alias",
@@ -174,7 +208,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
+    "revision": "8e496f82b370f84308b04c8f6112102f5ae8eb50"
   },
   "table": "single-dflash2-q4",
   "target": "reference"

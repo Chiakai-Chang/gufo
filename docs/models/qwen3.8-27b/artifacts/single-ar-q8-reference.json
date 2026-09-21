@@ -29,9 +29,9 @@
     "variant": "q8"
   },
   "notes": [
-    "llama.cpp: version: 0.4.1-dev (build 11069, commit )",
+    "llama.cpp: version: 0.4.1-dev (build 11069, commit 68d9053a)",
     "pp2048/tg128; depth is a cached prefix of synthetic text; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
-    "synthetic text: 1.167 tokens/word, template overhead 12 tokens"
+    "synthetic text: 1.160 tokens/word, template overhead 12 tokens"
   ],
   "referenceName": "llama.cpp",
   "rows": {
@@ -63,6 +63,21 @@
       "pp_sd": null,
       "samples": 1,
       "tg": 7.79,
+      "tg_sd": null
+    },
+    "131072": {
+      "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 133760 -np 1 --port 39873 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "counts": [
+        {
+          "cache_n": 131086,
+          "predicted_n": 128,
+          "prompt_n": 2045
+        }
+      ],
+      "pp": 131.1,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 6.24,
       "tg_sd": null
     },
     "16384": {
@@ -110,6 +125,21 @@
       "tg": 7.93,
       "tg_sd": null
     },
+    "65536": {
+      "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 133760 -np 1 --port 39873 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "counts": [
+        {
+          "cache_n": 65521,
+          "predicted_n": 128,
+          "prompt_n": 2031
+        }
+      ],
+      "pp": 179.05,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 7.01,
+      "tg_sd": null
+    },
     "8192": {
       "command": "llama-server -m Qwen3.8-27B-UD-Q8_K_L.gguf -c 35456 -np 1 --port 47617 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
       "counts": [
@@ -133,11 +163,11 @@
       "-m",
       "Qwen3.8-27B-UD-Q8_K_L.gguf",
       "-c",
-      "35456",
+      "133760",
       "-np",
       "1",
       "--port",
-      "47617",
+      "39873",
       "--host",
       "127.0.0.1",
       "--alias",
@@ -156,7 +186,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
+    "revision": "8e496f82b370f84308b04c8f6112102f5ae8eb50"
   },
   "table": "single-ar-q8",
   "target": "reference"

@@ -63,8 +63,9 @@ continues that conversation with a new ~2048-token user turn. Synthetic
 paragraph text (1.167 tokens/word, 12-token template overhead); the driver
 accepted a point only when `cache_n` was within 0.5% of `d` and `prompt_n`
 within 0.5% of 2048 (actual counts per sample are in the artifacts).
-Context capacity 35456 on both servers for the 0–32K rows; one warmed
-sample per point. The 64K and 128K rows (context 133760) are **TODO**.
+Context capacity 35456 on both servers for the 0–32K rows and 133760 for
+the 64K and 128K rows (measured 2026-09-21 in a later pass with the same
+method); one warmed sample per point.
 Artifacts: `artifacts/single-ar-{q4,q8}-{gufo,reference}.json`.
 
 <!-- bench:single-ar-q4 -->
@@ -76,8 +77,8 @@ Artifacts: `artifacts/single-ar-{q4,q8}-{gufo,reference}.json`.
 | 12,288 | 489.85 | 275.09 | +78.1% | 11.24 | 11.61 | -3.2% |
 | 16,384 | 459.05 | 264.36 | +73.6% | 11.03 | 11.45 | -3.7% |
 | 32,768 | 415.94 | 228.96 | +81.7% | 10.33 | 10.91 | -5.3% |
-| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | 376.89 | 179.00 | +110.6% | 9.26 | 9.95 | -6.9% |
+| 131,072 | 267.41 | 131.74 | +103.0% | 7.38 | 8.47 | -12.9% |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar-q4.svg)
@@ -91,8 +92,8 @@ Artifacts: `artifacts/single-ar-{q4,q8}-{gufo,reference}.json`.
 | 12,288 | 533.89 | 273.43 | +95.3% | 7.27 | 7.79 | -6.7% |
 | 16,384 | 507.32 | 262.89 | +93.0% | 7.19 | 7.73 | -7.0% |
 | 32,768 | 442.06 | 226.12 | +95.5% | 6.90 | 7.48 | -7.8% |
-| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | 361.73 | 179.05 | +102.0% | 6.37 | 7.01 | -9.1% |
+| 131,072 | 261.72 | 131.10 | +99.6% | 5.43 | 6.24 | -13.0% |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar-q8.svg)
@@ -116,7 +117,8 @@ sample per point. llama.cpp `b11069` runs the same draft through
 with its default draft parameters, so the reference column is a real DFlash2
 comparison. Each acceptance column is that server's accepted/proposed draft
 ratio; the two drafters propose different block lengths, so compare tg and
-read acceptance as a diagnostic. The 64K and 128K rows are **TODO**.
+read acceptance as a diagnostic. The 64K and 128K rows were measured in a
+later pass at context 133760.
 Artifacts: `artifacts/single-dflash2-{q4,q8}-{gufo,reference}.json`.
 
 <!-- bench:single-dflash2-q4 -->
@@ -128,8 +130,8 @@ Artifacts: `artifacts/single-dflash2-{q4,q8}-{gufo,reference}.json`.
 | 12,288 | 459.28 | 21.72 | 41.9% | 22.20 | 52.4% | -2.2% |
 | 16,384 | 438.24 | 20.37 | 40.8% | 21.45 | 51.0% | -5.0% |
 | 32,768 | 397.08 | 15.86 | 40.2% | 20.54 | 52.4% | -22.8% |
-| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | 344.28 | 8.42 | 41.8% | 19.81 | 58.7% | -57.5% |
+| 131,072 | 244.44 | 4.13 | 41.3% | 15.34 | 53.8% | -73.1% |
 <!-- /bench -->
 
 ![Single user, DFlash2](artifacts/charts/single-dflash2-q4.svg)
@@ -143,19 +145,23 @@ Artifacts: `artifacts/single-dflash2-{q4,q8}-{gufo,reference}.json`.
 | 12,288 | 482.49 | 17.11 | 35.6% | 16.32 | 50.0% | +4.8% |
 | 16,384 | 461.23 | 14.69 | 29.1% | 16.14 | 51.0% | -9.0% |
 | 32,768 | 413.87 | 12.27 | 32.5% | 16.37 | 55.2% | -25.0% |
-| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | 344.08 | 6.19 | 31.7% | 15.43 | 58.8% | -59.9% |
+| 131,072 | 246.69 | 3.21 | 32.3% | 12.93 | 55.2% | -75.2% |
 <!-- /bench -->
 
 ![Single user, DFlash2](artifacts/charts/single-dflash2-q8.svg)
 
 On this synthetic prose the adaptive controller accepts 40–49% (Q4) and
 29–40% (Q8) of proposals; Gufo DFlash2 generation is within ±14% of
-llama.cpp up to 16K and falls behind by 23–25% at 32K, where Gufo's
-speculative decode drops to 15.9 / 12.3 tok/s while llama.cpp holds
-20.5 / 16.4 tok/s. Greedy DFlash2 output matches AR token IDs (verified by
-the concurrency `Exact` checks below at C1). Natural prompts have different
-acceptance and speed; the repetitive corpus below accepts 100%.
+llama.cpp up to 16K and falls behind by 23–25% at 32K. Beyond that Gufo's
+speculative decode collapses: 8.4 / 4.1 tok/s (Q4) and 6.2 / 3.2 tok/s
+(Q8) at 64K / 128K, **slower than Gufo AR at the same depth** (9.3 / 7.4 and
+6.4 / 5.4), while llama.cpp DFlash2 holds 19.8 / 15.3 and 15.4 / 12.9 with
+54–59% acceptance. Gufo's acceptance stays flat, so the loss is in the
+per-step cost of verification at depth, not in the draft quality. Greedy
+DFlash2 output matches AR token IDs (verified by the concurrency `Exact`
+checks below at C1). Natural prompts have different acceptance and speed;
+the repetitive corpus below accepts 100%.
 
 Draft-precision control, **2026-09-16**: cached `prose_tides`, **tg64**,
 adaptive, greedy C1, one warmed release sample per draft. Generation tok/s:

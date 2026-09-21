@@ -370,6 +370,9 @@ def _measure_depth(session: Session, base_url: str, tokenizer: Tokenizer, *, dep
         measured = observation.prefill_tokens + observation.cached_prompt_tokens
         expected_words = sum(len(m["content"].split()) for m in messages if m["role"] == "user")
         ratio = (measured - tokenizer.overhead) / expected_words
+        # Long texts tokenize slightly differently from the 3000-word probe; keep the
+        # corrected ratio so later (deeper) points do not repeat the miss.
+        tokenizer.ratio = ratio
     raise RuntimeError(f"depth {depth}: cached prefix outside tolerance after 4 attempts")
 
 

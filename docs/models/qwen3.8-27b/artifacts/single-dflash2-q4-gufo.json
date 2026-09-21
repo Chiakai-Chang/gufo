@@ -68,6 +68,23 @@
       "tg": 21.72,
       "tg_sd": null
     },
+    "131072": {
+      "acceptance": 41.29,
+      "acceptance_sd": null,
+      "command": "gufo serve --port 38959 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+      "counts": [
+        {
+          "cache_n": 131067,
+          "predicted_n": 128,
+          "prompt_n": 2049
+        }
+      ],
+      "pp": 244.44,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 4.13,
+      "tg_sd": null
+    },
     "16384": {
       "acceptance": 40.8,
       "acceptance_sd": null,
@@ -119,6 +136,23 @@
       "tg": 28.67,
       "tg_sd": null
     },
+    "65536": {
+      "acceptance": 41.79,
+      "acceptance_sd": null,
+      "command": "gufo serve --port 38959 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 133760 --served-model-name bench --think off --max-pending-per-client 8 --speculative dflash2 --dflash-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+      "counts": [
+        {
+          "cache_n": 65521,
+          "predicted_n": 128,
+          "prompt_n": 2031
+        }
+      ],
+      "pp": 344.28,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 8.42,
+      "tg_sd": null
+    },
     "8192": {
       "acceptance": 41.41,
       "acceptance_sd": null,
@@ -143,14 +177,14 @@
       "gufo",
       "serve",
       "--port",
-      "36373",
+      "38959",
       "--sessions",
       "1",
       "llm",
       "--model",
       "Qwen3.8-27B-UD-Q4_K_XL.gguf",
       "--context",
-      "35456",
+      "133760",
       "--served-model-name",
       "bench",
       "--think",
@@ -165,8 +199,8 @@
   },
   "source": {
     "buildMode": "nix-release",
-    "dirty": true,
-    "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
+    "dirty": false,
+    "revision": "8e496f82b370f84308b04c8f6112102f5ae8eb50"
   },
   "table": "single-dflash2-q4",
   "target": "gufo"
