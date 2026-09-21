@@ -10,6 +10,15 @@ results and qualification gaps live in:
 - [Qwen3-ASR](models/qwen3-asr/BENCHMARKS.md)
 - [MiniMax H3](models/minimax-h3/BENCHMARKS.md)
 
+## Model benchmark driver
+
+`tools/bench/model-bench.py` measures the tables of a model's `BENCHMARKS.md`
+over HTTP for Gufo and for the reference project of its category (llama.cpp
+for GGUF language models), writes per-table artifacts, and renders the tables
+and SVG charts between the `<!-- bench:<id> -->` markers. Workloads and table
+layouts are declared in `docs/models/<model>/artifacts/bench.json`; the
+`benchmark-model` skill in `.agents/skills` describes the procedure.
+
 ## Direct and serving measurements
 
 `gufo bench` measures the model path. Keep model artifact, prompt length,

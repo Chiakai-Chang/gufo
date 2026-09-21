@@ -38,10 +38,17 @@
   "model": {
     "id": "Qwen3.8-27B"
   },
+  "modelBench": {
+    "measuredOn": "2026-09-16",
+    "mode": null,
+    "table": "multi-mixed-q4",
+    "target": "reference"
+  },
   "notes": [
     "llama-server 10063 (7d56da7, nixpkgs llama-cpp-10063) -ngl 999 -np 8 -c 32768 -fa on --cache-reuse 0 --jinja --reasoning off; cache_prompt=false per request; one process for the whole sweep; same Q4 GGUF",
     "Retained summary: raw request samples and rounds are omitted; aggregates and per-case completion hashes are preserved."
   ],
+  "rawReportSha256": "c32ab4c82bbcf95fe3da182477cf7e25e19c7d2fac5217205e24dd7edcd5cfd9",
   "reference": {
     "modelId": "Qwen3.8-27B",
     "source": "report",
@@ -3766,6 +3773,5 @@
     "temperature": 0.0,
     "transport": "openai-chat-completions-sse",
     "warmupRounds": 1
-  },
-  "rawReportSha256": "c32ab4c82bbcf95fe3da182477cf7e25e19c7d2fac5217205e24dd7edcd5cfd9"
+  }
 }

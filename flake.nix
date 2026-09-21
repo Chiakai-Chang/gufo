@@ -3,10 +3,16 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Reference ASR/TTS runtime for benchmark comparisons; exposes a
+    # ROCm gfx1151 package tuned for Strix Halo.
+    audio-cpp = {
+      url = "github:0xShug0/audio.cpp";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    { self, nixpkgs, audio-cpp }:
     let
       # Strix Halo is a Linux x86-64-only target (see README non-goals).
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" ];
@@ -18,6 +24,25 @@
         system:
         pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit version; }
       );
+
+      # Reference LLM runtime for benchmark comparisons (llama-server,
+      # llama-bench), built for gfx1151 with unified memory like the Strix
+      # Halo toolbox.
+      llamaCpp = system:
+        (pkgs.${system}.llama-cpp.override {
+          rocmSupport = true;
+          rocmGpuTargets = [ "gfx1151" ];
+        }).overrideAttrs
+          (oldAttrs: {
+            cmakeFlags = (oldAttrs.cmakeFlags or [ ]) ++ [
+              "-DLLAMA_HIP_UMA=ON" # unified memory
+            ];
+            # Pin the ROCm path explicitly and raise the local unroll
+            # threshold for gfx1151 kernels.
+            cmakeFlagsArray = (oldAttrs.cmakeFlagsArray or [ ]) ++ [
+              "-DCMAKE_HIP_FLAGS=--rocm-path=${pkgs.${system}.rocmPackages.clr} -mllvm --amdgpu-unroll-threshold-local=600"
+            ];
+          });
 
       alexnetWeights = system:
         pkgs.${system}.fetchurl {
@@ -66,6 +91,7 @@
             lpipsRocm
             ps.numpy
             ps.scipy
+            ps.matplotlib # benchmark charts (tools/bench/model-bench.py render)
           ]
         );
     in
@@ -120,6 +146,9 @@
               pkgs.${system}.sox
               pkgs.${system}.rocmPackages.rocprofiler-sdk
               pkgs.${system}.sqlite
+              # Benchmark comparison baselines (see .agents/skills/benchmark-model).
+              (llamaCpp system)
+              audio-cpp.packages.${system}.rocm-gfx1151
             ];
             env = {
               TORCH_HOME = "${alexnetTorchHome system}";

@@ -38,11 +38,18 @@
   "model": {
     "id": "Qwen3.8-27B"
   },
+  "modelBench": {
+    "measuredOn": "2026-09-16",
+    "mode": "dflash2",
+    "table": "multi-repetition-q4",
+    "target": "gufo"
+  },
   "notes": [
     "gufo serve --sessions 8 llm --context 4096 --think off; one process for the whole sweep; Qwen3.8-27B-UD-Q4_K_XL (unsloth snapshot 4ca72078)",
     "speculative dflash2, draft Qwen3.8-27B-DFlash2-Q4_K_M, draft-policy adaptive, draft-tokens 7",
     "Retained summary: raw request samples and rounds are omitted; aggregates and per-case completion hashes are preserved."
   ],
+  "rawReportSha256": "1a2ec688be053a6cf028eb683ad405a5236bf58d0225babdeb365543a2af36a5",
   "reference": {
     "modelId": "Qwen3.8-27B",
     "source": "report",
@@ -1297,6 +1304,5 @@
     "temperature": 0.0,
     "transport": "openai-chat-completions-sse",
     "warmupRounds": 1
-  },
-  "rawReportSha256": "1a2ec688be053a6cf028eb683ad405a5236bf58d0225babdeb365543a2af36a5"
+  }
 }

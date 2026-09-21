@@ -327,12 +327,14 @@ def run_request(
     clock: Callable[[], float] = time.perf_counter,
     endpoint_profile: str = "gufo",
     cache_prompt: bool | None = None,
+    messages: list[dict[str, str]] | None = None,
 ) -> RequestObservation:
     if endpoint_profile not in ENDPOINT_PROFILES:
         raise ValueError("endpoint profile must be gufo or openai")
     payload: dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        # `messages` overrides the single-turn prompt for cached-prefix workloads.
+        "messages": messages or [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": temperature,
         "stream": True,

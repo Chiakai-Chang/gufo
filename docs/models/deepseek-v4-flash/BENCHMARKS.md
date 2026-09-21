@@ -2,7 +2,8 @@
 
 Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Nix release binaries.
 `C` is simultaneous requests. Single-user measurements use **pp2048 / tg128**;
-depth precedes the measured operation. Unknown current measurements are **TODO**.
+depth is a cached prefix and precedes the measured operation. Unknown current
+measurements are **TODO**.
 
 **Target parity remains open:** the optimized build misses the historical
 trajectory gate, and four post-prefill differential alerts remain unresolved.
@@ -14,69 +15,104 @@ Target: `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-073
 `DeepSeek-V4-Flash-DSpark-support-0731.gguf`, revision
 `e7f04037032990db0346398d249baf9fb9df1ccc`.
 
-Cold-file-cache launch to HTTP readiness: **36.82 s** on 2026-09-21,
-including DSpark and two sessions at context capacity 4096. The integer
-expert-routing tensor loads without conversion; serving replay remains exact
-under the [state checks](EVALUATION.md).
+Reference implementation: **llama.cpp** `llama-server` from this repository's
+`flake.nix` (ROCm, gfx1151, same target GGUF), measured over HTTP with the
+same prompts and timed scope. **Gain** is Gufo over llama.cpp, positive when
+Gufo is faster; `Gain vs llama.cpp AR` compares DSpark against llama.cpp
+without a draft. All llama.cpp cells are **TODO** until the first HTTP sweep.
+Layout and method: [benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md).
+
+## Loading
+
+Cold-file-cache launch to HTTP readiness on 2026-09-21, including DSpark and
+two sessions at context capacity 4096. The integer expert-routing tensor
+loads without conversion; serving replay remains exact under the
+[state checks](EVALUATION.md).
+
+<!-- bench:loading -->
+| Target | Gufo ready | llama.cpp ready | Gain |
+| --- | ---: | ---: | ---: |
+| Flash 0731 | 36.82 s | TODO | TODO |
+<!-- /bench -->
+
+![Cold-file-cache launch to readiness](artifacts/charts/loading.svg)
 
 ## Single user, autoregressive
 
-Latest depth control: **2026-09-19**, two release measurements at d0/d32K.
-Values are mean ± standard deviation; initial kernel setup contributes to
-depth-zero prefill variation. The final packing layout needs a d64K speed refresh.
+Latest depth control: **2026-09-19**, two release measurements at d0/d32K
+with `gufo bench`. Values are mean ± standard deviation; initial kernel
+setup contributes to depth-zero prefill variation. The final packing layout
+needs a d64K speed refresh. Gain uses means.
 
-| Context depth | pp2048 tok/s | tg128 tok/s |
-| ---: | ---: | ---: |
-| 0 | 450.26 ± 33.18 | 17.74 ± 0.00 |
-| 4,096 | TODO | TODO |
-| 8,192 | TODO | TODO |
-| 12,288 | TODO | TODO |
-| 16,384 | TODO | TODO |
-| 32,768 | 422.18 ± 3.61 | 14.86 ± 0.00 |
-| 65,536 | TODO | TODO |
+<!-- bench:single-ar -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 450.26 ± 33.18 | TODO | TODO | 17.74 ± 0.00 | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | 422.18 ± 3.61 | TODO | TODO | 14.86 ± 0.00 | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
+
+![Single user, autoregressive](artifacts/charts/single-ar.svg)
 
 ## Single user, DSpark
 
 Same workload and measurement date: two measurements at d0, one at d32K.
-DSpark prefill includes support-state work.
+DSpark prefill includes support-state work. llama.cpp has no DSpark
+equivalent: the reference column is llama.cpp autoregressive generation with
+the same target GGUF.
 
-| Context depth | pp2048 tok/s | tg128 tok/s |
-| ---: | ---: | ---: |
-| 0 | 453.49 ± 25.96 | 17.45 ± 0.00 |
-| 4,096 | TODO | TODO |
-| 8,192 | TODO | TODO |
-| 12,288 | TODO | TODO |
-| 16,384 | TODO | TODO |
-| 32,768 | 417.80 | 35.30 |
-| 65,536 | TODO | TODO |
+<!-- bench:single-dspark -->
+| Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp AR tg | Gain vs llama.cpp AR |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 453.49 ± 25.96 | 17.45 ± 0.00 | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | 417.80 | 35.30 | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
+
+![Single user, DSpark](artifacts/charts/single-dspark.svg)
 
 The CLI uses a repeating token sequence. Natural prompts can have substantially
 different acceptance and speed. Depth-zero generation starts from 16 tokens;
 it does not follow the measured 2048-token prefill.
 
-## Multiple users, autoregressive
+## Multiple users
 
-Current pp2048/tg128 depth sweep: **TODO**. Report aggregate prompt throughput
-and per-user generation throughput at each depth.
+Aggregate delivered output tok/s (`aggregate.output_tokens_per_second.overall`).
+Context capacity 4096, greedy, 128 output tokens, `cache_prompt=false`, fresh
+server per point. Workloads come from the
+[speculative corpus](../qwen3.8-27b/artifacts/speculative-corpus.json):
+`repetition` runs `repetition_word`; `mixed` cycles through the distinct
+corpus cases. `Exact` counts llama.cpp completions whose hash matches the
+Gufo AR C1 reference. The current sweep is **TODO**, including acceptance and
+output checks at every concurrency.
 
-| Users | d0 / d4K / d8K / d12K / d16K / d32K |
-| ---: | --- |
-| 2 | TODO |
-| 4 | TODO |
-| 6 | TODO |
-| 8 | TODO |
+<!-- bench:multi-repetition -->
+| Users | Gufo AR | llama.cpp AR | Gain | Gufo DSpark | Gain vs llama.cpp AR | Exact |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 2 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 6 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8 | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
 
-## Multiple users, DSpark
-
-Current pp2048/tg128 depth sweep: **TODO**, including acceptance and output
-checks at every concurrency.
-
-| Users | d0 / d4K / d8K / d12K / d16K / d32K |
-| ---: | --- |
-| 2 | TODO |
-| 4 | TODO |
-| 6 | TODO |
-| 8 | TODO |
+<!-- bench:multi-mixed -->
+| Users | Gufo AR | llama.cpp AR | Gain | Gufo DSpark | Gain vs llama.cpp AR | Exact |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 2 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 6 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8 | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
 
 Latest fixed-prompt sampled HTTP control (2026-09-19, C2, temperature 1,
 top-p 0.95, seed 7): **17.40 tok/s per user** for an autumn explanation,
@@ -95,19 +131,24 @@ never changes token decisions.
 ## Memory
 
 C1 with context capacity **262,144**. GPU-visible unified allocations exclude
-separate CPU memory; capacity does not imply filling the window.
+separate CPU memory; capacity does not imply filling the window. Gufo values
+come from the earlier C1 capacity control with DSpark (the first row was
+recorded as pp2048/4096 + tg128); a current refresh is TODO. llama.cpp resident device memory at the same `-c`: **TODO**.
 
-| DSpark workload | GPU allocation |
-| --- | ---: |
-| pp2048/4096 + tg128 | 90.74 GiB |
-| 16K prefix, pp4096 + tg128 | 91.46 GiB |
+<!-- bench:memory -->
+| Workload | Gufo GiB | llama.cpp GiB | Gain |
+| --- | ---: | ---: | ---: |
+| pp2048 + tg128 | 90.74 | TODO | TODO |
+| 16K prefix, pp4096 + tg128 | 91.46 | TODO | TODO |
+<!-- /bench -->
 
-Measured in the earlier C1 capacity control; a current memory refresh is TODO. Target and
-support weights, KV and working buffers all contribute. Compressed KV and score
-scratch grow with actual use. Prefill reuses scratch across ordered stages;
-indexer scoring borrows the idle attention-output range for temporary F16 keys.
-Queries share that range and feed WMMA directly. Persistent KV precision is
-unchanged.
+![GPU-visible allocation](artifacts/charts/memory.svg)
+
+Target and support weights, KV and working buffers all contribute. Compressed
+KV and score scratch grow with actual use. Prefill reuses scratch across
+ordered stages; indexer scoring borrows the idle attention-output range for
+temporary F16 keys. Queries share that range and feed WMMA directly.
+Persistent KV precision is unchanged.
 
 ## Reproduce
 
@@ -126,5 +167,7 @@ Use `-c 1,2,4,6,8` for concurrency and
 for pp4096. Sampled controls use the same `--temperature` and `--seed` in both
 modes. Context preparation and restoration are outside timing. Verbose output
 records hashes and draft counts; compare these alongside speed. Run model
-jobs, builds and profiles sequentially. The HTTP benchmark is
-`tools/serving/gufo-serving-bench.py`; distinguish cold requests from cache hits.
+jobs, builds and profiles sequentially. `gufo bench` is the kernel-iteration
+tool; the published comparison tables are measured over HTTP on both sides
+and rendered with `tools/bench/model-bench.py` as described by the
+`benchmark-model` skill. Distinguish cold requests from cache hits.
