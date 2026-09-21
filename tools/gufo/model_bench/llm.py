@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import json
 import random
 import statistics
@@ -24,6 +25,8 @@ from gufo.serving_bench import (
 from .artifacts import artifact_path, load_artifact, merge_rows, new_artifact, public_command, save_artifact
 from .config import BenchConfig, TableSpec
 from .servers import Server, drop_file_cache, rocm_used_gib, wait_process_exit
+
+print = functools.partial(print, flush=True)  # progress must reach redirected logs immediately
 
 MODEL_ALIAS = "bench"
 CLIENT_ID = "model-bench"
@@ -57,6 +60,8 @@ class Session:
         document: str,
         todo_only: bool,
         drop_caches: str | None = None,
+        repetitions: int | None = None,
+        fresh: bool = False,
     ):
         self.config = config
         self.target = target
@@ -68,6 +73,11 @@ class Session:
         self.document = document
         self.todo_only = todo_only
         self.drop_caches = drop_caches
+        self.repetitions = repetitions
+        self.fresh = fresh
+
+    def reps(self, spec: dict[str, Any], default: int = 1) -> int:
+        return self.repetitions or int(spec.get("repetitions", default))
 
     @property
     def profile(self) -> str:
@@ -123,7 +133,7 @@ class Session:
             completed = subprocess.run([self.reference_binary, "--version"], capture_output=True, text=True)
             lines = (completed.stdout + completed.stderr).splitlines()
             versions = [line.strip() for line in lines if line.strip().startswith("version:")]
-            self._reference_version = versions[0] if versions else (lines[0].strip() if lines else None)
+            self._reference_version = versions[0] if versions else "version unknown"
         return self._reference_version
 
     def artifact(self, table: TableSpec, *, mode: str | None, command: list[str], notes: list[str]) -> dict[str, Any]:
@@ -134,7 +144,8 @@ class Session:
                             source=self.source, fingerprint=self.fingerprint, notes=notes)
 
     def store(self, path: Path, artifact: dict[str, Any]) -> None:
-        save_artifact(path, merge_rows(load_artifact(path), artifact))
+        existing = None if self.fresh else load_artifact(path)
+        save_artifact(path, merge_rows(existing, artifact))
         print(f"artifact: {path}")
 
     def request(self, base_url: str, prompt: str, max_tokens: int, *, index: int = 0,
@@ -241,7 +252,7 @@ def run_loading(session: Session, table: TableSpec) -> None:
         sub = TableSpec(table.id, table.base, variant, spec)
         cfg.require_files(variant)
         samples: list[float] = []
-        for repetition in range(int(spec.get("repetitions", 1))):
+        for repetition in range(session.reps(spec)):
             drop_file_cache(session.drop_caches)
             # Load with the speculative support files on both sides when the reference has the mode.
             mode = cfg.speculative["mode"] if (session.target == "gufo" or cfg.reference_speculative) else None
@@ -278,7 +289,7 @@ def run_single(session: Session, table: TableSpec) -> None:
     prompt_tokens = int(spec["prompt_tokens"])
     output_tokens = int(spec["output_tokens"])
     fraction = float(spec.get("depth_tolerance", 0.005))
-    repetitions = int(spec.get("repetitions", 1))
+    repetitions = session.reps(spec)
     base_seed = int(spec.get("prefix", {}).get("seed", 1))
     mode = cfg.speculative["mode"] if table.speculative else "ar"
 
@@ -383,7 +394,7 @@ def run_multi(session: Session, table: TableSpec) -> None:
         ar_path = artifact_path(cfg, table, "gufo", "ar")
         if path != ar_path and ar_path.exists():
             reference = load_reference_report(ar_path)
-        combined = load_artifact(path)
+        combined = None if session.fresh else load_artifact(path)
         for users in keys:
             context = int(spec["context"])
             server = session.server(table, mode=mode, context=context if session.target == "gufo" else context * users,
@@ -395,7 +406,7 @@ def run_multi(session: Session, table: TableSpec) -> None:
                     max_tokens=int(spec["output_tokens"]),
                     temperature=float(cfg.data["sampling"]["temperature"]),
                     concurrency_levels=[users], warmup_rounds=int(spec.get("warmup", 1)),
-                    repetitions=int(spec.get("repetitions", 1)), timeout_seconds=REQUEST_TIMEOUT,
+                    repetitions=session.reps(spec), timeout_seconds=REQUEST_TIMEOUT,
                     fingerprint=session.fingerprint or {}, source_revision=session.source["revision"],
                     source_dirty=session.source["dirty"], suite_bytes=suite.read_bytes(),
                     corpus_layout=spec.get("corpus_layout", "distinct"), endpoint_profile=session.profile,
@@ -474,7 +485,7 @@ def run_memory(session: Session, table: TableSpec) -> None:
 
 
 def run_image_encoder(session: Session, table: TableSpec) -> None:
-    raise SystemExit(f"{table.id}: image-encoder measurement is not implemented yet; leave the cells TODO")
+    print(f"{table.id}: skipped; image-encoder measurement is not implemented yet, cells stay TODO")
 
 
 RUNNERS = {

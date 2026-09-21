@@ -63,9 +63,10 @@
         12288,
         16384,
         32768,
-        65536
+        65536,
+        131072
       ],
-      "context": 68224,
+      "context": 133760,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -88,9 +89,10 @@
         12288,
         16384,
         32768,
-        65536
+        65536,
+        131072
       ],
-      "context": 68224,
+      "context": 133760,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",

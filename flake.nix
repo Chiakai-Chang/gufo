@@ -31,6 +31,7 @@
       # (#27816), Qwen3.8-Flash-Next (#27742) and DSpark support; nixpkgs'
       # b10273 predates them.
       llamaCppVersion = "11069"; # release tag b11069, 2026-09-21
+      llamaCppCommit = "68d9053afd4f4d0752ced6187585f862355a40be";
       llamaCpp = system:
         (pkgs.${system}.llama-cpp.override {
           rocmSupport = true;
@@ -48,6 +49,9 @@
             npmDepsHash = "sha256-2Q7XhaLAArmviOLdQsNbYTfdyDE5pW9lR26cRHEVl9k=";
             cmakeFlags = (oldAttrs.cmakeFlags or [ ]) ++ [
               "-DLLAMA_HIP_UMA=ON" # unified memory
+              # The fetched tree has no git metadata; stamp the release commit
+              # so `llama-server --version` identifies the build in artifacts.
+              "-DLLAMA_BUILD_COMMIT:STRING=${builtins.substring 0 8 llamaCppCommit}"
             ];
             # Pin the ROCm path explicitly and raise the local unroll
             # threshold for gfx1151 kernels.

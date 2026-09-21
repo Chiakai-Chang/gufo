@@ -28,11 +28,19 @@ Ask the user before measuring anything:
    bench`, an older prompt) must be refreshed whole, because one Gain column
    cannot mix two methods.
 
-Then confirm the time budget. Measured on Strix Halo with a 27B Q4 model:
-a single-user depth table (six depths) takes about 4 min for Gufo and 8 min
-for llama.cpp; memory 1–2 min per target; each concurrency table 10–15 min
-per target and mode; loading about 1 min per variant. A full LLM refresh with
-both targets and both modes is 1.5–3 h.
+Then confirm the time budget. Measured on Strix Halo with Qwen3.8 27B:
+a single-user depth table (0–32K, six depths) takes 4–7 min for Gufo and
+about 10 min for llama.cpp; the 64K and 128K rows add roughly as much again
+because the prefix itself must be prefilled; memory 1–2 min per target; each
+concurrency table about 5 min per target and mode; loading about 1 min per
+variant. One variant with both targets and both modes is about 1 h 20 min;
+Q4 + Q8 took 2 h 41 min. When the budget cannot hold everything, measure in
+this order and say what was left: Q4 before Q8, single-user AR, single-user
+speculative, concurrency, memory, loading.
+
+Run every driver command in the foreground and wait for it (a long shell
+timeout, or block on its log); a turn that ends while the driver runs does
+not resume by itself. Progress lines are flushed as they happen.
 
 ## Measurement model
 
@@ -60,19 +68,24 @@ nix develop -c python3 tools/bench/model-bench.py --model <model> render        
 ```
 
 `run` flags: `--table <id>[,<id>]` selects tables (without it every table
-runs in `bench.json` order); `--todo` measures only rows that have a `TODO`
-in a cell owned by the target (row-granular: one `TODO` Acceptance cell
-re-measures that row's pp and tg too); `--drop-caches "<privileged command>"`
-gives the loading table its page-cache drop (`sync; echo 3 >
-/proc/sys/vm/drop_caches`) on hosts without passwordless sudo/doas — without
-it the loading table is skipped with a message and the other tables still
-run; `--config` and `--artifacts-dir` point at an alternative `bench.json`
-and output directory for experiments. A partial re-run under changed flags
-(for example `--config` with a larger context) updates only the rows it
-measured; every row records the exact server command it ran under.
-Server logs go to the ignored `artifacts/model-bench/`. `render` keeps
-hand-entered Gufo cells that no artifact covers, so tables can hold both;
-reference cells always come from artifacts. It draws one SVG chart per
+runs in `bench.json` order; loading and image-encoder are skipped with a
+message when they cannot run); `--todo` measures only rows that have a
+`TODO` in a cell owned by the target (row-granular: one `TODO` acceptance
+cell re-measures that row's pp and tg too); `--fresh` discards the rows of
+an existing artifact instead of merging into them — use it for a full
+refresh so an interrupted run cannot leave mixed-date rows; `--repetitions N`
+overrides every table's repetition count (mean ± sd above 1);
+`--drop-caches "<privileged command>"` gives the loading table its
+page-cache drop (`sync; echo 3 > /proc/sys/vm/drop_caches`) on hosts without
+passwordless sudo/doas; `--config` and `--artifacts-dir` point at an
+alternative `bench.json` and output directory for experiments. A partial
+re-run under changed flags updates only the rows it measured; every row
+records the exact server command it ran under. Server logs go to the
+ignored `artifacts/model-bench/`. `render` keeps hand-entered Gufo cells that
+no artifact covers and prints which rows those are; when a table was skipped
+in a refresh, blank those cells to `TODO` by hand rather than leave an old
+number next to a fresh reference. Reference cells always come from
+artifacts. It draws one SVG chart per
 table with data into
 `docs/models/<model>/artifacts/charts/` (matplotlib, deterministic output),
 placed as an image line right after the table. Tables stay the source of
@@ -152,6 +165,9 @@ Every headline table carries the reference project next to Gufo:
 - One table per quantization and per mode; never pack `pp / tg` pairs or two
   quantizations into one cell.
 
+The driver package is `tools/gufo/model_bench/` (`cli.py`, `llm.py`,
+`render.py`, `charts.py`); `tools/bench/model-bench.py` is a shim.
+
 Rendered tables sit between `<!-- bench:<table-id> -->` and
 `<!-- /bench -->` markers so `render` can replace them in place; the prose
 around them (dates, acceptance notes, caveats) is hand-maintained.
@@ -171,7 +187,8 @@ the three models so the documents stay comparable.
 Tables, in order (table ids in parentheses; append `-<quant>` when the
 model has several quantizations, e.g. `single-ar-q4`):
 
-1. **Loading** (`loading`). Cold-file-cache launch to `/health` readiness
+1. **Loading** (`loading`). Cold-file-cache launch to readiness (`/ready` on
+   Gufo, `/health` on llama-server)
    (drop caches, start the server, poll), then Gufo snapshot size and restore
    time for the documented prompt. Reference: `llama-server` readiness with
    the same GGUF. `Target | Gufo ready | llama.cpp ready | Gain`.
@@ -188,7 +205,9 @@ model has several quantizations, e.g. `single-ar-q4`):
    `depth_tolerance` (at least 32 tokens) of `d` and `prompt_n` within it of
    2048; the actual counts are stored per sample. The table's `context` must
    be the deepest depth + 2048 + 128 plus a calibration margin (512 in the
-   shipped configurations).
+   shipped configurations). The first turn of a fresh conversation (d0) is a
+   prompt-cache miss on Gufo and decodes measurably slower than a cached
+   continuation; d0 is therefore a different regime from d4096+, not noise.
    `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain`.
 3. **Single user, speculative** (`single-<spec>`, DFlash2 / DSpark / MTP as
    the model supports). Same grid plus `Acceptance` from `usage.gufo`.
@@ -196,7 +215,10 @@ model has several quantizations, e.g. `single-ar-q4`):
    `draft-mtp` or `draft-dspark` (`speculative.reference.args` in
    `bench.json`, otherwise llama.cpp's defaults; tune them only when the
    reference project documents better values, and record the change).
-   `Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp <spec> tg | Gain`.
+   `Depth | Gufo pp | Gufo tg | Gufo acceptance | llama.cpp <spec> tg | llama.cpp acceptance | Gain`.
+   Both acceptance columns are accepted draft tokens over proposed draft
+   tokens as each server reports them; the two drafters propose different
+   block lengths, so compare tg, and treat acceptance as a diagnostic.
    When a model's `bench.json` has no `speculative.reference`, the reference
    column falls back to llama.cpp AR and is labelled `Gain vs llama.cpp AR`.
 4. **Multiple users** (`multi-mixed`, `multi-repetition`). `C = 1,2,4,6,8`,
@@ -208,11 +230,17 @@ model has several quantizations, e.g. `single-ar-q4`):
    llama.cpp AR completions whose hash matches the Gufo AR C1 reference.
    Report C8 median / p95 latency and acceptance under the table.
    `Users | Gufo AR | llama.cpp AR | Gain | Gufo <spec> | llama.cpp <spec> | Gain | Exact`.
+   Known gaps (gufo-org/gufo#245): Gufo ignores `cache_prompt=false`, so its
+   corpus reports show cache hits the reference does not have, and Gufo AR
+   C2–C8 hashes are not yet compared with C1; state both under the table.
 5. **Memory** (`memory`). Peak device-visible memory (VRAM + GTT from
    `rocm-smi`, sampled every 250 ms) while pp2048+tg128 and a 16K-prefix
    pp4096+tg128 run, both servers autoregressive at the same context
    capacity, no projector loaded. llama-server preallocates its KV cache, so
-   its footprint does not grow with the prefix; say so under the table.
+   its footprint does not grow with the prefix. This counter does not see
+   Gufo's weight mapping on unified memory (gufo-org/gufo#245): quote Gufo's
+   loader `gpu_device_used_mib` from the server log next to the table and
+   mark the Gain as not like-for-like until the counter is fixed.
    `Workload | Gufo GiB | llama.cpp GiB | Gain`.
 6. **Image encoder** (`image-encoder`, vision models only). Warm encode
    latency for 256×256 and 1024×1024 RGB through the chat endpoint with the

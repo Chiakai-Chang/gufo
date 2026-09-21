@@ -36,6 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--reference-binary", default=None, help="reference server executable (default from bench.json)")
     run.add_argument("--drop-caches", default=None,
                      help="privileged shell command that drops the page cache before a loading launch")
+    run.add_argument("--repetitions", type=int, default=None,
+                     help="override each table's repetitions (mean ± sd is reported above 1)")
+    run.add_argument("--fresh", action="store_true",
+                     help="discard rows of an existing artifact instead of merging into them")
 
     render = sub.add_parser("render", help="rewrite marked tables in BENCHMARKS.md from artifacts")
     render.add_argument("--table", action="append", default=[])
@@ -60,8 +64,9 @@ def cmd_tables(config: BenchConfig) -> int:
     for table in config.tables():
         paths = [artifact_path(config, table, target) for target in TARGETS]
         if table.kind == "multi":
-            paths = [artifact_path(config, table, "gufo", m) for m in table.spec.get("modes", ["ar"])]
-            paths.append(artifact_path(config, table, "reference"))
+            modes = table.spec.get("modes", ["ar"])
+            paths = [artifact_path(config, table, "gufo", m) for m in modes]
+            paths += [artifact_path(config, table, "reference", None if m == "ar" else m) for m in modes]
         present = [p.name for p in paths if p.exists()]
         print(f"{table.id:28} {table.kind:14} {', '.join(present) or '-'}")
     return 0
@@ -85,6 +90,12 @@ def cmd_render(config: BenchConfig, args: argparse.Namespace) -> int:
         return 0
     if updated != document:
         config.benchmarks_path.write_text(updated, encoding="utf-8")
+    from .render import hand_cells, multi_summary
+
+    for line in multi_summary(config):
+        print(line)
+    for table_id, rows in hand_cells(config, updated).items():
+        print(f"{table_id}: hand-entered Gufo cells kept for rows {', '.join(rows)} (no artifact covers them)")
     print(f"rendered {len(rendered)} tables and {len(charts)} charts in {config.benchmarks_path}")
     return 0
 
@@ -109,6 +120,7 @@ def cmd_run(config: BenchConfig, args: argparse.Namespace) -> int:
         source={"revision": revision, "dirty": dirty, "buildMode": "nix-release"},
         fingerprint=fingerprint, log_dir=(args.log_dir if args.log_dir.is_absolute() else root / args.log_dir),
         document=document, todo_only=args.todo, drop_caches=args.drop_caches,
+        repetitions=args.repetitions, fresh=args.fresh,
     )
     wanted = _table_ids(args.table)
     tables = [t for t in config.tables() if not wanted or t.id in wanted]

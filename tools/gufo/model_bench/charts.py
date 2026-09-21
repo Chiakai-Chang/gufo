@@ -120,7 +120,11 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, list[str]],
         ref_name = f"{ref} {spec_label}" if config.reference_speculative else f"{ref} AR"
         _lines(a1, labels, [(f"Gufo {spec_label}", gt, COLORS["spec"]), (ref_name, rt, COLORS["ref_spec"])],
                "generation tok/s", ticks)
-        _lines(a2, labels, [(f"{spec_label} acceptance", acc, COLORS["spec"])], "acceptance %", ticks)
+        acceptance = [(f"Gufo {spec_label} acceptance", acc, COLORS["spec"])]
+        if config.reference_speculative:
+            acceptance.append((f"{ref} acceptance", _series(rows, labels, 4), COLORS["ref_spec"]))
+        _lines(a2, labels, acceptance, "acceptance %", ticks)
+        a2.legend(loc="lower right")
         a2.set_ylim(0, 105)
         a1.set_xlabel("context depth (tokens)")
         a2.set_xlabel("context depth (tokens)")

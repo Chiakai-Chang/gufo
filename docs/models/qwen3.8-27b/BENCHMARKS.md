@@ -63,7 +63,8 @@ continues that conversation with a new ~2048-token user turn. Synthetic
 paragraph text (1.167 tokens/word, 12-token template overhead); the driver
 accepted a point only when `cache_n` was within 0.5% of `d` and `prompt_n`
 within 0.5% of 2048 (actual counts per sample are in the artifacts).
-Context capacity 35456 on both servers; one warmed sample per point.
+Context capacity 35456 on both servers for the 0–32K rows; one warmed
+sample per point. The 64K and 128K rows (context 133760) are **TODO**.
 Artifacts: `artifacts/single-ar-{q4,q8}-{gufo,reference}.json`.
 
 <!-- bench:single-ar-q4 -->
@@ -75,6 +76,8 @@ Artifacts: `artifacts/single-ar-{q4,q8}-{gufo,reference}.json`.
 | 12,288 | 489.85 | 275.09 | +78.1% | 11.24 | 11.61 | -3.2% |
 | 16,384 | 459.05 | 264.36 | +73.6% | 11.03 | 11.45 | -3.7% |
 | 32,768 | 415.94 | 228.96 | +81.7% | 10.33 | 10.91 | -5.3% |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar-q4.svg)
@@ -88,6 +91,8 @@ Artifacts: `artifacts/single-ar-{q4,q8}-{gufo,reference}.json`.
 | 12,288 | 533.89 | 273.43 | +95.3% | 7.27 | 7.79 | -6.7% |
 | 16,384 | 507.32 | 262.89 | +93.0% | 7.19 | 7.73 | -7.0% |
 | 32,768 | 442.06 | 226.12 | +95.5% | 6.90 | 7.48 | -7.8% |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar-q8.svg)
@@ -109,32 +114,37 @@ prompts, depths and context capacity as the autoregressive table, one warmed
 sample per point. llama.cpp `b11069` runs the same draft through
 `--spec-type draft-dflash --spec-draft-model <draft> --spec-draft-ngl 999`
 with its default draft parameters, so the reference column is a real DFlash2
-comparison. `Acceptance` is Gufo's accepted/proposed ratio from `usage.gufo`;
-llama.cpp reported 51–66% (Q4) and 50–66% (Q8) on the same text.
+comparison. Each acceptance column is that server's accepted/proposed draft
+ratio; the two drafters propose different block lengths, so compare tg and
+read acceptance as a diagnostic. The 64K and 128K rows are **TODO**.
 Artifacts: `artifacts/single-dflash2-{q4,q8}-{gufo,reference}.json`.
 
 <!-- bench:single-dflash2-q4 -->
-| Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp DFlash2 tg | Gain |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 544.51 | 23.38 | 43.1% | 27.11 | -13.8% |
-| 4,096 | 519.67 | 28.67 | 48.7% | 26.64 | +7.6% |
-| 8,192 | 508.39 | 22.43 | 41.4% | 22.44 | -0.0% |
-| 12,288 | 459.28 | 21.72 | 41.9% | 22.20 | -2.2% |
-| 16,384 | 438.24 | 20.37 | 40.8% | 21.45 | -5.0% |
-| 32,768 | 397.08 | 15.86 | 40.2% | 20.54 | -22.8% |
+| Depth | Gufo pp | Gufo tg | Gufo acceptance | llama.cpp DFlash2 tg | llama.cpp acceptance | Gain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 544.51 | 23.38 | 43.1% | 27.11 | 66.1% | -13.8% |
+| 4,096 | 519.67 | 28.67 | 48.7% | 26.64 | 66.1% | +7.6% |
+| 8,192 | 508.39 | 22.43 | 41.4% | 22.44 | 53.1% | -0.0% |
+| 12,288 | 459.28 | 21.72 | 41.9% | 22.20 | 52.4% | -2.2% |
+| 16,384 | 438.24 | 20.37 | 40.8% | 21.45 | 51.0% | -5.0% |
+| 32,768 | 397.08 | 15.86 | 40.2% | 20.54 | 52.4% | -22.8% |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
 <!-- /bench -->
 
 ![Single user, DFlash2](artifacts/charts/single-dflash2-q4.svg)
 
 <!-- bench:single-dflash2-q8 -->
-| Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp DFlash2 tg | Gain |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 573.39 | 21.38 | 40.4% | 19.14 | +11.7% |
-| 4,096 | 544.16 | 17.84 | 30.4% | 19.78 | -9.8% |
-| 8,192 | 531.90 | 17.07 | 32.5% | 17.58 | -2.9% |
-| 12,288 | 482.49 | 17.11 | 35.6% | 16.32 | +4.8% |
-| 16,384 | 461.23 | 14.69 | 29.1% | 16.14 | -9.0% |
-| 32,768 | 413.87 | 12.27 | 32.5% | 16.37 | -25.0% |
+| Depth | Gufo pp | Gufo tg | Gufo acceptance | llama.cpp DFlash2 tg | llama.cpp acceptance | Gain |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 573.39 | 21.38 | 40.4% | 19.14 | 62.1% | +11.7% |
+| 4,096 | 544.16 | 17.84 | 30.4% | 19.78 | 65.6% | -9.8% |
+| 8,192 | 531.90 | 17.07 | 32.5% | 17.58 | 56.0% | -2.9% |
+| 12,288 | 482.49 | 17.11 | 35.6% | 16.32 | 50.0% | +4.8% |
+| 16,384 | 461.23 | 14.69 | 29.1% | 16.14 | 51.0% | -9.0% |
+| 32,768 | 413.87 | 12.27 | 32.5% | 16.37 | 55.2% | -25.0% |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO |
 <!-- /bench -->
 
 ![Single user, DFlash2](artifacts/charts/single-dflash2-q8.svg)

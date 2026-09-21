@@ -94,12 +94,13 @@ def layout_for(config: BenchConfig, table: TableSpec) -> Layout:
         )
     if kind == "single":
         if config.reference_speculative:
-            reference = [Column(f"{ref} {spec_label} tg", "reference"), Column("Gain", "gain")]
+            reference = [Column(f"{ref} {spec_label} tg", "reference"), Column(f"{ref} acceptance", "reference"),
+                         Column("Gain", "gain")]
         else:
             reference = [Column(f"{ref} AR tg", "reference"), Column(f"Gain vs {ref} AR", "gain")]
         return Layout(
             [Column("Depth", "label"), Column("Gufo pp", "gufo"), Column("Gufo tg", "gufo"),
-             Column("Acceptance", "gufo"), *reference],
+             Column("Gufo acceptance", "gufo"), *reference],
             [_depth_label(d) for d in table.spec["depths"]],
         )
     if kind == "multi":
@@ -184,6 +185,7 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
                 "gufo_pp": _fmt_stat(g, "pp"), "gufo_tg": _fmt_stat(g, "tg"),
                 "acceptance": _fmt_stat(g, "acceptance", 1, "%"),
                 "ref_pp": _fmt_stat(r, "pp"), "ref_tg": _fmt_stat(r, "tg"),
+                "ref_acceptance": _fmt_stat(r, "acceptance", 1, "%"),
             }
     elif kind == "memory":
         for workload in table.spec["workloads"]:
@@ -252,7 +254,10 @@ def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, list
         elif kind == "single":
             gp = _pick(fresh.get("gufo_pp"), cell(0)); gt = _pick(fresh.get("gufo_tg"), cell(1))
             acc = _pick(fresh.get("acceptance"), cell(2)); rt = _ref(fresh.get("ref_tg"))
-            cells = [gp, gt, acc, rt, gain(_number(gt), _number(rt), better)]
+            cells = [gp, gt, acc, rt]
+            if config.reference_speculative:
+                cells.append(_ref(fresh.get("ref_acceptance")))
+            cells.append(gain(_number(gt), _number(rt), better))
         elif kind == "multi":
             ga = _pick(fresh.get("gufo_ar"), cell(0)); ra = _ref(fresh.get("reference"))
             gs = _pick(fresh.get("gufo_spec"), cell(3)); ex = _ref(fresh.get("exact"))
@@ -286,6 +291,54 @@ def render_document(config: BenchConfig, document: str, only: set[str] | None = 
         return f"<!-- bench:{table_id} -->\n{body}<!-- /bench -->"
 
     return MARKER_RE.sub(replace, document), rendered
+
+
+def multi_summary(config: BenchConfig) -> list[str]:
+    """One line per concurrency artifact: top-level request latency, acceptance and cache hits."""
+    lines: list[str] = []
+    mode = config.speculative["mode"]
+    for table in config.tables():
+        if table.kind != "multi":
+            continue
+        for target, suffix in (("gufo", "ar"), ("gufo", mode), ("reference", None), ("reference", mode)):
+            report = load_artifact(artifact_path(config, table, target, suffix))
+            if report is None:
+                continue
+            top = max((int(k[1:]) for k in report.get("results", {})), default=None)
+            if top is None:
+                continue
+            result = report["results"][f"c{top}"]
+            latency = result.get("latency", {}).get("request_ms", {})
+            spec = result.get("speculative") or {}
+            parts = [f"{table.id} {target}-{suffix or 'ar'} C{top}:",
+                     f"request median {latency.get('median', 0) / 1000:.2f} s / p95 {latency.get('p95', 0) / 1000:.2f} s"]
+            if spec.get("acceptance") is not None:
+                parts.append(f"acceptance {spec['acceptance'] * 100:.1f}%")
+            if spec.get("cacheHits"):
+                parts.append(f"cache hits {spec['cacheHits']}/{result.get('requestCount')}")
+            lines.append(" ".join(parts))
+    return lines
+
+
+def hand_cells(config: BenchConfig, document: str) -> dict[str, list[str]]:
+    """Rows per table whose Gufo cells hold text no artifact provides (hand-entered, possibly stale)."""
+    tables = existing_tables(document)
+    result: dict[str, list[str]] = {}
+    for table in config.tables():
+        if table.id not in tables:
+            continue
+        layout = layout_for(config, table)
+        owned = [i for i, c in enumerate(layout.columns[1:]) if c.owner == "gufo"]
+        fresh = _row_values(config, table)
+        rows = []
+        for label, cells in tables[table.id].items():
+            provided = any(v is not None for k, v in fresh.get(label, {}).items() if k.startswith("gufo") or k == "acceptance")
+            has_text = any(i < len(cells) and cells[i] != TODO for i in owned)
+            if has_text and not provided:
+                rows.append(label)
+        if rows:
+            result[table.id] = rows
+    return result
 
 
 def todo_rows(config: BenchConfig, document: str, table: TableSpec, target: str) -> set[str] | None:
