@@ -181,11 +181,12 @@ come from the [speculative corpus](artifacts/speculative-corpus.json):
 nine distinct corpus cases. DFlash2 uses the Q4_K_M draft on both servers
 (Gufo adaptive controller; llama.cpp `draft-dflash` defaults). `Exact` counts
 llama.cpp AR completions whose hash matches the Gufo AR C1 reference; every
-Gufo DFlash2 completion matched that reference at every concurrency.
+Gufo AR and Gufo DFlash2 completion at C2–C8 matched that reference.
 Artifacts: `artifacts/multi-{mixed,repetition}-{q4,q8}-{gufo-ar,gufo-dflash2,reference,reference-dflash2}.json`.
 
-Prompt-cache mismatch: the driver sends `cache_prompt=false`, which
-llama-server honours (0 cache hits) but Gufo ignores, so Gufo reused its
+Prompt-cache mismatch ([#245](https://github.com/gufo-org/gufo/issues/245)):
+the driver sends `cache_prompt=false`, which llama-server honours (0 cache
+hits) but Gufo ignores, so Gufo reused its
 prompt snapshot for repeated prompts (all `repetition` requests; 14 of 16
 `mixed` requests at C8). The prompts are 30–53 tokens, so the skipped
 prefill is about 0.2 s of a 15–19 s request (≈1–2% of the Gufo AR span);
@@ -196,11 +197,11 @@ completions reach 128 tokens.
 <!-- bench:multi-mixed-q4 -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo DFlash2 | llama.cpp DFlash2 | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 11.47 | 11.81 | -2.9% | 28.95 | 23.80 | +21.6% | 3/9 |
-| 2 | 20.41 | 19.96 | +2.3% | 34.70 | 29.39 | +18.1% | 5/10 |
-| 4 | 37.15 | 33.50 | +10.9% | 42.15 | 49.91 | -15.5% | 8/12 |
-| 6 | 50.02 | 32.75 | +52.7% | 43.76 | 46.45 | -5.8% | 8/12 |
-| 8 | 61.07 | 32.21 | +89.6% | 47.56 | 43.88 | +8.4% | 11/16 |
+| 1 | 11.50 | 11.81 | -2.6% | 29.05 | 23.80 | +22.1% | 3/9 |
+| 2 | 20.45 | 19.96 | +2.5% | 34.77 | 29.39 | +18.3% | 5/10 |
+| 4 | 37.10 | 33.50 | +10.7% | 41.98 | 49.91 | -15.9% | 8/12 |
+| 6 | 50.37 | 32.75 | +53.8% | 44.18 | 46.45 | -4.9% | 8/12 |
+| 8 | 61.40 | 32.21 | +90.6% | 47.61 | 43.88 | +8.5% | 11/16 |
 <!-- /bench -->
 
 ![Multiple users, mixed corpus](artifacts/charts/multi-mixed-q4.svg)
@@ -208,11 +209,11 @@ completions reach 128 tokens.
 <!-- bench:multi-repetition-q4 -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo DFlash2 | llama.cpp DFlash2 | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 11.77 | 11.78 | -0.1% | 65.04 | 33.04 | +96.9% | 1/1 |
-| 2 | 22.97 | 21.40 | +7.3% | 88.09 | 42.46 | +107.5% | 2/2 |
-| 4 | 41.65 | 35.92 | +16.0% | 95.22 | 79.15 | +20.3% | 4/4 |
-| 6 | 56.33 | 41.76 | +34.9% | 95.51 | 81.90 | +16.6% | 6/6 |
-| 8 | 67.05 | 42.95 | +56.1% | 98.54 | 93.84 | +5.0% | 8/8 |
+| 1 | 11.84 | 11.78 | +0.5% | 65.98 | 33.04 | +99.7% | 1/1 |
+| 2 | 23.02 | 21.40 | +7.6% | 89.12 | 42.46 | +109.9% | 2/2 |
+| 4 | 41.93 | 35.92 | +16.7% | 97.04 | 79.15 | +22.6% | 4/4 |
+| 6 | 56.88 | 41.76 | +36.2% | 96.94 | 81.90 | +18.4% | 6/6 |
+| 8 | 67.84 | 42.95 | +58.0% | 101.14 | 93.84 | +7.8% | 8/8 |
 <!-- /bench -->
 
 ![Multiple users, repetition](artifacts/charts/multi-repetition-q4.svg)
@@ -234,11 +235,11 @@ corpus, and above C4 delivers less than Gufo AR, so the **100 tok/s at C2 /
 <!-- bench:multi-mixed-q8 -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo DFlash2 | llama.cpp DFlash2 | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 7.40 | 7.86 | -5.9% | 22.21 | 17.66 | +25.8% | 4/9 |
-| 2 | 14.01 | 13.75 | +1.9% | 29.44 | 26.25 | +12.2% | 6/10 |
-| 4 | 26.98 | 24.70 | +9.2% | 33.01 | 41.61 | -20.7% | 4/12 |
-| 6 | 37.71 | 26.23 | +43.8% | 35.29 | 37.50 | -5.9% | 3/12 |
-| 8 | 47.98 | 30.90 | +55.3% | 37.00 | 39.35 | -6.0% | 4/16 |
+| 1 | 7.40 | 7.86 | -5.9% | 22.17 | 17.66 | +25.5% | 4/9 |
+| 2 | 14.02 | 13.75 | +2.0% | 29.33 | 26.25 | +11.7% | 6/10 |
+| 4 | 26.68 | 24.70 | +8.0% | 33.03 | 41.61 | -20.6% | 4/12 |
+| 6 | 37.64 | 26.23 | +43.5% | 34.87 | 37.50 | -7.0% | 3/12 |
+| 8 | 47.70 | 30.90 | +54.4% | 37.06 | 39.35 | -5.8% | 4/16 |
 <!-- /bench -->
 
 ![Multiple users, mixed corpus](artifacts/charts/multi-mixed-q8.svg)
@@ -246,11 +247,11 @@ corpus, and above C4 delivers less than Gufo AR, so the **100 tok/s at C2 /
 <!-- bench:multi-repetition-q8 -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo DFlash2 | llama.cpp DFlash2 | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 7.50 | 7.85 | -4.5% | 53.72 | 24.62 | +118.2% | 1/1 |
-| 2 | 15.66 | 14.82 | +5.7% | 79.55 | 40.95 | +94.3% | 2/2 |
-| 4 | 29.83 | 26.46 | +12.7% | 86.16 | 66.94 | +28.7% | 4/4 |
-| 6 | 42.18 | 35.07 | +20.3% | 87.35 | 69.40 | +25.9% | 6/6 |
-| 8 | 53.14 | 40.65 | +30.7% | 90.65 | 80.57 | +12.5% | 8/8 |
+| 1 | 7.50 | 7.85 | -4.5% | 53.65 | 24.62 | +117.9% | 1/1 |
+| 2 | 15.66 | 14.82 | +5.7% | 79.44 | 40.95 | +94.0% | 2/2 |
+| 4 | 29.82 | 26.46 | +12.7% | 85.72 | 66.94 | +28.1% | 4/4 |
+| 6 | 42.19 | 35.07 | +20.3% | 88.62 | 69.40 | +27.7% | 6/6 |
+| 8 | 53.19 | 40.65 | +30.8% | 90.30 | 80.57 | +12.1% | 8/8 |
 <!-- /bench -->
 
 ![Multiple users, repetition](artifacts/charts/multi-repetition-q8.svg)
@@ -273,18 +274,21 @@ retain their performance. Controller and verification details:
 
 ## Memory
 
-Peak device-wide VRAM + GTT use from `rocm-smi --showmeminfo vram gtt`,
-sampled every 250 ms while the request ran (idle baseline 0.17 GiB), C1,
-context capacity 262144 on both servers, both autoregressive, no draft and
-no projector loaded. llama.cpp preallocates its whole KV cache at `-c`, so
-its footprint does not change with the prefix.
+Peak device-global HIP memory in use (`hipMemGetInfo` total − free, the
+counter Gufo's loader logs as `gpu_device_used_mib`), sampled every 250 ms by
+the driver while the request ran; idle baseline 2.38 GiB before either server
+started. C1, context capacity 262144 on both servers, both autoregressive, no
+draft and no projector loaded. llama.cpp preallocates its whole KV cache at
+`-c`, so its footprint changes little with the prefix; Gufo's grows with the
+retained prompt state. Gufo's loader reported 38208 (Q4) and 48209 (Q8) MiB
+at readiness, which the sampled peaks reproduce.
 Artifacts: `artifacts/memory-{q4,q8}-{gufo,reference}.json`.
 
 <!-- bench:memory-q4 -->
 | Workload | Gufo GiB | llama.cpp GiB | Gain |
 | --- | ---: | ---: | ---: |
-| pp2048 + tg128 | 19.35 | 32.68 | +68.9% |
-| 16K prefix, pp4096 + tg128 | 21.24 | 32.68 | +53.9% |
+| pp2048 + tg128 | 37.99 | 36.72 | -3.3% |
+| 16K prefix, pp4096 + tg128 | 39.89 | 37.42 | -6.2% |
 <!-- /bench -->
 
 ![GPU-visible allocation](artifacts/charts/memory-q4.svg)
@@ -292,21 +296,16 @@ Artifacts: `artifacts/memory-{q4,q8}-{gufo,reference}.json`.
 <!-- bench:memory-q8 -->
 | Workload | Gufo GiB | llama.cpp GiB | Gain |
 | --- | ---: | ---: | ---: |
-| pp2048 + tg128 | 19.37 | 41.68 | +115.2% |
-| 16K prefix, pp4096 + tg128 | 21.26 | 41.69 | +96.1% |
+| pp2048 + tg128 | 47.76 | 46.32 | -3.0% |
+| 16K prefix, pp4096 + tg128 | 49.65 | 47.01 | -5.3% |
 <!-- /bench -->
 
 ![GPU-visible allocation](artifacts/charts/memory-q8.svg)
 
-**Metric caveat.** The `rocm-smi` counter does not see Gufo's weight
-mapping: the Gufo Q4 and Q8 peaks differ by 0.02 GiB although the weights
-differ by 9.8 GiB, whereas the llama.cpp step (32.7 → 41.7 GiB) tracks the
-weight size. Gufo's own loader log reports `gpu_device_used_mib` 38208
-(Q4) and 48209 (Q8) at readiness with context 262144, and the process RSS
-was 17.3 / 27.3 GiB. Read the Gufo column as request state plus scratch
-visible to the driver, not as total footprint; the Gain column is therefore
-not a like-for-like comparison until the driver samples a counter that
-covers both allocation paths.
+Gufo uses 3–6% more device memory than llama.cpp at the same context
+capacity, with the gap widening as the prefix grows. An earlier version of
+this table sampled `rocm-smi` VRAM + GTT, which does not see Gufo's weight
+mapping on unified memory; those numbers are superseded.
 
 ## Image encoder
 

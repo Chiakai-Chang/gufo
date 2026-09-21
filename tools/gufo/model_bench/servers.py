@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
 import json
 import os
-import shutil
 import signal
 import socket
 import subprocess
@@ -44,31 +44,35 @@ def drop_file_cache(command: str | None = None) -> None:
     )
 
 
-def rocm_used_gib() -> float | None:
-    """Device-visible memory in use (VRAM + GTT) from rocm-smi, or None when unavailable."""
-    if shutil.which("rocm-smi") is None:
+class HipMemory:
+    """Device-global used memory from `hipMemGetInfo`, the counter Gufo's loader logs.
+
+    An external process sees every process's HIP allocations on this driver, so
+    both servers are measured the same way; `rocm-smi` VRAM+GTT does not count
+    Gufo's weight mapping on unified memory.
+    """
+
+    def __init__(self, library: Path):
+        self.library = library
+        self._lib = ctypes.CDLL(str(library))
+
+    @classmethod
+    def for_binary(cls, gufo_binary: Path) -> "HipMemory | None":
+        """Resolve libamdhip64 the way the Gufo binary links it."""
+        completed = subprocess.run(["ldd", str(gufo_binary)], capture_output=True, text=True)
+        for line in completed.stdout.splitlines():
+            if "libamdhip64" in line and "=>" in line:
+                path = Path(line.split("=>", 1)[1].split()[0])
+                if path.exists():
+                    return cls(path)
         return None
-    completed = subprocess.run(
-        ["rocm-smi", "--showmeminfo", "vram", "gtt", "--json"], capture_output=True, text=True
-    )
-    if completed.returncode != 0:
-        return None
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return None
-    total = 0.0
-    found = False
-    for card in payload.values():
-        if not isinstance(card, dict):
-            continue
-        for key in ("VRAM Total Used Memory (B)", "GTT Total Used Memory (B)"):
-            try:
-                total += float(card[key])
-                found = True
-            except (KeyError, TypeError, ValueError):
-                continue
-    return total / (1024 ** 3) if found else None
+
+    def used_gib(self) -> float | None:
+        free = ctypes.c_size_t()
+        total = ctypes.c_size_t()
+        if self._lib.hipMemGetInfo(ctypes.byref(free), ctypes.byref(total)) != 0:
+            return None
+        return (total.value - free.value) / (1024 ** 3)
 
 
 class Server:

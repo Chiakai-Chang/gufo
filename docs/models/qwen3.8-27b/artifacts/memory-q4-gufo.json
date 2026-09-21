@@ -29,18 +29,20 @@
     "variant": "q4"
   },
   "notes": [
-    "peak device-wide VRAM + GTT use sampled with rocm-smi every 250 ms during the request",
+    "peak device-global hipMemGetInfo used bytes (total - free), sampled every 250 ms during the request; idle_gib is the same counter before the server started",
     "server mode: ar"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "16K prefix, pp4096 + tg128": {
-      "command": "gufo serve --port 48801 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
-      "gib": 21.24
+      "command": "gufo serve --port 44441 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
+      "gib": 39.89,
+      "idle_gib": 2.38
     },
     "pp2048 + tg128": {
-      "command": "gufo serve --port 48801 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
-      "gib": 19.35
+      "command": "gufo serve --port 44441 --sessions 1 llm --model Qwen3.8-27B-UD-Q4_K_XL.gguf --context 262144 --served-model-name bench --think off --max-pending-per-client 8",
+      "gib": 37.99,
+      "idle_gib": 2.38
     }
   },
   "schemaVersion": 1,
@@ -49,7 +51,7 @@
       "gufo",
       "serve",
       "--port",
-      "48801",
+      "44441",
       "--sessions",
       "1",
       "llm",
@@ -68,7 +70,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
+    "revision": "1651963f0861ce962dddefe0733980ae58363cfa"
   },
   "table": "memory-q4",
   "target": "gufo"

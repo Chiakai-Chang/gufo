@@ -24,7 +24,7 @@ from gufo.serving_bench import (
 
 from .artifacts import artifact_path, load_artifact, merge_rows, new_artifact, public_command, save_artifact
 from .config import BenchConfig, TableSpec
-from .servers import Server, drop_file_cache, rocm_used_gib, wait_process_exit
+from .servers import HipMemory, Server, drop_file_cache, wait_process_exit
 
 print = functools.partial(print, flush=True)  # progress must reach redirected logs immediately
 
@@ -396,6 +396,9 @@ def run_multi(session: Session, table: TableSpec) -> None:
             reference = load_reference_report(ar_path)
         combined = None if session.fresh else load_artifact(path)
         for users in keys:
+            if path == ar_path and reference is None and combined is not None and "c1" in combined.get("results", {}):
+                # Gufo AR C2+ compares against this same artifact's C1 completions.
+                reference = load_reference_report(ar_path) if ar_path.exists() else None
             context = int(spec["context"])
             server = session.server(table, mode=mode, context=context if session.target == "gufo" else context * users,
                                     sessions=users, tag=f"{mode or 'ref'}-c{users}")
@@ -429,14 +432,17 @@ def run_multi(session: Session, table: TableSpec) -> None:
 
 
 class MemoryPoller:
-    def __init__(self) -> None:
+    """Samples device-global HIP memory use on a thread and keeps the peak."""
+
+    def __init__(self, hip: HipMemory) -> None:
+        self.hip = hip
         self.peak: float | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            used = rocm_used_gib()
+            used = self.hip.used_gib()
             if used is not None and (self.peak is None or used > self.peak):
                 self.peak = used
             time.sleep(0.25)
@@ -459,8 +465,10 @@ def run_memory(session: Session, table: TableSpec) -> None:
     if not keys:
         print(f"{table.id}: nothing to do")
         return
-    if rocm_used_gib() is None:
-        raise SystemExit("memory table needs rocm-smi with --showmemuse --json")
+    hip = HipMemory.for_binary(session.gufo_binary)
+    if hip is None:
+        raise SystemExit("memory table needs libamdhip64 (resolved through `ldd` of the Gufo binary)")
+    idle = hip.used_gib()
     mode = spec.get("mode", "ar")
     server = session.server(table, mode=mode, context=int(spec["context"]), sessions=1, tag="memory")
     rows: dict[str, Any] = {}
@@ -469,16 +477,18 @@ def run_memory(session: Session, table: TableSpec) -> None:
         for key in keys:
             workload = workloads[key]
             depth = int(workload["depth"])
-            with MemoryPoller() as poller:
+            with MemoryPoller(hip) as poller:
                 _measure_depth(session, server.base_url, tokenizer, depth=depth,
                                prompt_tokens=int(workload["prompt_tokens"]),
                                output_tokens=int(workload["output_tokens"]), fraction=0.02, seed=1, repetition=0)
             rows[key] = {"gib": None if poller.peak is None else round(poller.peak, 2),
+                         "idle_gib": None if idle is None else round(idle, 2),
                          "command": " ".join(public_command(server.command))}
             print(f"{table.id} {key}: {rows[key]['gib']} GiB")
     wait_process_exit(server)
     artifact = session.artifact(table, mode=None, command=server.command,
-                                notes=["peak device-wide VRAM + GTT use sampled with rocm-smi every 250 ms during the request",
+                                notes=["peak device-global hipMemGetInfo used bytes (total - free), sampled every 250 ms "
+                                       "during the request; idle_gib is the same counter before the server started",
                                        f"server mode: {mode}"])
     artifact["rows"] = rows
     session.store(artifact_path(cfg, table, session.target), artifact)

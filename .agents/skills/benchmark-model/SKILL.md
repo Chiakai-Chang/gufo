@@ -230,17 +230,18 @@ model has several quantizations, e.g. `single-ar-q4`):
    llama.cpp AR completions whose hash matches the Gufo AR C1 reference.
    Report C8 median / p95 latency and acceptance under the table.
    `Users | Gufo AR | llama.cpp AR | Gain | Gufo <spec> | llama.cpp <spec> | Gain | Exact`.
-   Known gaps (gufo-org/gufo#245): Gufo ignores `cache_prompt=false`, so its
-   corpus reports show cache hits the reference does not have, and Gufo AR
-   C2–C8 hashes are not yet compared with C1; state both under the table.
-5. **Memory** (`memory`). Peak device-visible memory (VRAM + GTT from
-   `rocm-smi`, sampled every 250 ms) while pp2048+tg128 and a 16K-prefix
+   Every artifact, including Gufo AR, compares its C2+ completions against
+   the Gufo AR C1 hashes. Known gap (gufo-org/gufo#245): Gufo ignores
+   `cache_prompt=false`, so its corpus reports show cache hits the reference
+   does not have; state it under the table.
+5. **Memory** (`memory`). Peak device-global HIP memory in use
+   (`hipMemGetInfo` total − free, the counter Gufo's loader logs as
+   `gpu_device_used_mib`, sampled every 250 ms by the driver through the
+   `libamdhip64` the Gufo binary links) while pp2048+tg128 and a 16K-prefix
    pp4096+tg128 run, both servers autoregressive at the same context
-   capacity, no projector loaded. llama-server preallocates its KV cache, so
-   its footprint does not grow with the prefix. This counter does not see
-   Gufo's weight mapping on unified memory (gufo-org/gufo#245): quote Gufo's
-   loader `gpu_device_used_mib` from the server log next to the table and
-   mark the Gain as not like-for-like until the counter is fixed.
+   capacity, no projector loaded. The idle value before the server starts is
+   stored per row. llama-server preallocates its KV cache, so its footprint
+   does not grow with the prefix; say so under the table.
    `Workload | Gufo GiB | llama.cpp GiB | Gain`.
 6. **Image encoder** (`image-encoder`, vision models only). Warm encode
    latency for 256×256 and 1024×1024 RGB through the chat endpoint with the

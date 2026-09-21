@@ -29,19 +29,21 @@
     "variant": "q4"
   },
   "notes": [
-    "llama.cpp: version: 0.4.1-dev (build 11069, commit )",
-    "peak device-wide VRAM + GTT use sampled with rocm-smi every 250 ms during the request",
+    "llama.cpp: version: 0.4.1-dev (build 11069, commit 68d9053a)",
+    "peak device-global hipMemGetInfo used bytes (total - free), sampled every 250 ms during the request; idle_gib is the same counter before the server started",
     "server mode: ar"
   ],
   "referenceName": "llama.cpp",
   "rows": {
     "16K prefix, pp4096 + tg128": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 262144 -np 1 --port 58297 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
-      "gib": 32.68
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 262144 -np 1 --port 48655 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "gib": 37.42,
+      "idle_gib": 2.38
     },
     "pp2048 + tg128": {
-      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 262144 -np 1 --port 58297 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
-      "gib": 32.68
+      "command": "llama-server -m Qwen3.8-27B-UD-Q4_K_XL.gguf -c 262144 -np 1 --port 48655 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off",
+      "gib": 36.72,
+      "idle_gib": 2.38
     }
   },
   "schemaVersion": 1,
@@ -55,7 +57,7 @@
       "-np",
       "1",
       "--port",
-      "58297",
+      "48655",
       "--host",
       "127.0.0.1",
       "--alias",
@@ -74,7 +76,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "1589ed791a843ff05685c74a37b3c2bdb4cf5c1b"
+    "revision": "1651963f0861ce962dddefe0733980ae58363cfa"
   },
   "table": "memory-q4",
   "target": "reference"
