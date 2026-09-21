@@ -341,6 +341,7 @@ public:
 
     [[nodiscard]] explicit operator bool() const noexcept;
     [[nodiscard]] bool cache_hit() const noexcept;
+    [[nodiscard]] ContinuationLookup cache_lookup() const noexcept;
     [[nodiscard]] std::size_t cached_prompt_tokens() const noexcept;
     [[nodiscard]] std::size_t cache_restore_bytes() const noexcept;
     [[nodiscard]] double cache_restore_ms() const noexcept;

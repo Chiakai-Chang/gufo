@@ -52,6 +52,8 @@ void TestColdMissThenExactExtensionHit() {
     auto lease = cache.Acquire(first_prompt);
     Expect(static_cast<bool>(lease), "cold request acquires the slot");
     Expect(!lease.cache_hit(), "first request is a cache miss");
+    Expect(lease.lookup().miss_reason == "no_checkpoint",
+           "cold miss is distinguished from changed input");
     Expect(lease.cached_tokens() == 0, "cold request reuses no tokens");
     Expect(dynamic_cast<FakeState&>(lease.state()).id == 0,
            "lease exposes the opaque model state");
@@ -63,6 +65,7 @@ void TestColdMissThenExactExtensionHit() {
   {
     auto lease = cache.Acquire(extension);
     Expect(lease.cache_hit(), "exact extension reuses the slot");
+    Expect(lease.lookup().miss_reason.empty(), "hits carry no miss reason");
     Expect(lease.cached_tokens() == 4,
            "hit reports the complete retained prefix");
     Expect(dynamic_cast<FakeState&>(lease.state()).id == 0,
@@ -86,6 +89,10 @@ void TestDivergenceInvalidatesOldState() {
     auto lease =
         cache.Acquire(std::vector<gufo::server::ContinuationToken>{1, 9});
     Expect(!lease.cache_hit(), "divergent request is a miss");
+    Expect(lease.lookup().miss_reason == "prefix_changed" &&
+               lease.lookup().common_prefix_tokens == 1 &&
+               lease.lookup().checkpoint_tokens == 3,
+           "miss identifies the first changed token without exposing it");
     Expect(invalidations[0] == 1,
            "divergence invalidates the previous model state");
     lease.Commit({1, 9});

@@ -1099,6 +1099,11 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
 
   json::Value metrics = json::Value::object();
   metrics["cache_hit"] = result.cache_hit;
+  if (!result.cache_miss_reason.empty()) {
+    metrics["cache_miss_reason"] = result.cache_miss_reason;
+    metrics["cache_common_prefix_tokens"] = result.cache_common_prefix_tokens;
+    metrics["cache_checkpoint_tokens"] = result.cache_checkpoint_tokens;
+  }
   metrics["cache_restore_bytes"] = result.cache_restore_bytes;
   metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
   metrics["cache_disk_queued_bytes"] = result.cache_disk_queued_bytes;

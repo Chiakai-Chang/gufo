@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string_view>
 #include <vector>
 
 namespace gufo::server {
@@ -70,6 +71,13 @@ struct SnapshotEvent {
   std::size_t capacity_bytes{0};
 };
 
+/// Explains a miss without exposing prompt or token contents.
+struct ContinuationLookup {
+  std::string_view miss_reason;
+  std::size_t common_prefix_tokens{0};
+  std::size_t checkpoint_tokens{0};
+};
+
 /// Bounded exact-prefix cache over opaque model continuation states.
 ///
 /// The first deployment uses one entry. Supporting a bounded entry count here
@@ -114,6 +122,7 @@ public:
     [[nodiscard]] bool restored_from_disk() const noexcept {
       return restored_from_disk_;
     }
+    [[nodiscard]] ContinuationLookup lookup() const noexcept { return lookup_; }
     [[nodiscard]] bool HasSnapshotFor(
         std::span<const ContinuationToken> tokens) const;
 
@@ -161,6 +170,7 @@ public:
     bool restored_from_disk_{false};
     std::size_t reserved_snapshot_bytes_{0};
     std::vector<std::uint8_t> input_identity_;
+    ContinuationLookup lookup_;
   };
 
   ContinuationCache(std::size_t capacity, const StateFactory& factory,

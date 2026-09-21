@@ -121,21 +121,25 @@ between active decode rounds without changing a lone request's kernel policy.
 
 Prompt reuse is enabled by default. `cache_prompt: false` on
 `/v1/chat/completions` bypasses both memory and disk lookup for that request;
-the result can still populate the cache. When the chat template removes prior
-reasoning, snapshots stop before the assistant-generation suffix so that
-removal does not discard the unchanged conversation. Templates that preserve
-the suffix keep the full prompt frontier. Exact live continuations reuse
-generated tokens too. The server reports cached and newly processed tokens
-separately; reasoning-removal requests may process the short assistant suffix.
-Changed system instructions, tool definitions, or image identities must match
-before a cached prefix can be reused.
+the result can still populate the cache. DeepSeek and Qwen tool requests retain
+a checkpoint before the assistant-generation suffix, including when a client
+drops the interrupted assistant and appends `"."` after a tool result. DeepSeek
+also accounts for tokenization changes where adjacent user/tool turns join.
+Qwen requests that remove previous reasoning retain this checkpoint too.
+Exact live continuations reuse generated tokens. The server reports cached
+and newly processed tokens separately; resuming from the checkpoint processes
+the short suffix. System instructions, tool definitions and image identities
+must match the retained prefix.
 
 For a focused cancellation check, run
 `python3 tools/serving/check-continuation.py --output /tmp/cache-check.json`
-against a private server named `cache-test` on port 5815 with `--cache-disk`.
+against a private server named `cache-test` on port 5815.
 It checks interruption during reasoning and visible output, with and without
-reasoning replay, greedy/seeded sampling, and explicit cache bypass. Restart
-the same server and add `--restore /tmp/cache-check.json` to verify disk reuse.
+reasoning replay, greedy/seeded sampling, and explicit cache bypass. Use
+`--tools --discard-assistant` to exercise interrupted agent tool turns; add
+`--prefix-repetitions 5500` for a roughly 50K-token prefix.
+For persistence, enable `--cache-disk` before the check, restart the same server,
+and add `--restore /tmp/cache-check.json`.
 Use `--image /path/to/image.png` for Qwen image conversations.
 Each case continues for a third turn; repeat `--case NAME` to select only the
 cases needed for a change.
@@ -553,6 +557,15 @@ latency, prefill/decode speed, execution width, memory/disk cache hits and reuse
 tokens, plus accepted/proposed drafts and acceptance percentage. These metrics
 are logged even when a streaming client does not request a usage chunk.
 Errors include a stable error code; disconnects and stream failures are marked.
+On a cache miss, `cache_miss_reason` distinguishes a missing checkpoint, changed
+token prefix, changed image input, and explicit cache bypass. Common-prefix and
+nearest-checkpoint token counts explain how far the inputs agree, without
+logging prompt text. Adding tools or editing system/developer instructions near
+the beginning invalidates the later state: keep those inputs stable during an
+agent conversation. A disconnected SSE stream may never deliver its terminal
+usage chunk; proxy counters can then show zero despite generated tokens.
+The server's cancellation log retains the actual token counts.
+
 Routine cache replacement is quiet; failed captures, disk corruption and cache
 capacity refusals produce warnings. Cache capacity is a budget, not allocated
 memory.

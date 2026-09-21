@@ -51,6 +51,10 @@ inline std::string GenerationLogDetails(
     out << " cache_snapshot_bytes=" << result.cache_snapshot_bytes;
   if (result.cache_disk_queued_bytes > 0)
     out << " cache_disk_queued_bytes=" << result.cache_disk_queued_bytes;
+  if (!result.cache_hit && !result.cache_miss_reason.empty())
+    out << " cache_miss_reason=" << result.cache_miss_reason
+        << " common_prefix_tokens=" << result.cache_common_prefix_tokens
+        << " nearest_checkpoint_tokens=" << result.cache_checkpoint_tokens;
   return out.str();
 }
 

@@ -169,6 +169,9 @@ public:
     std::string client_id{"anonymous"};
     std::string execution_plan{"serial-c1"};
     std::string prefill_fallback_reason;
+    std::string cache_miss_reason;
+    std::size_t cache_common_prefix_tokens{0};
+    std::size_t cache_checkpoint_tokens{0};
     FinishReason finish_reason{FinishReason::kStop};
     bool incremental_prefill_supported{false};
     bool cache_hit{false};

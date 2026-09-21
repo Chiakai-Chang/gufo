@@ -78,7 +78,14 @@ public:
     result.mean_inter_token_ms = 2.0;
     result.max_inter_token_ms = 2.5;
     result.execution_plan = "serial-fallback";
-    result.cache_hit = true;
+    result.cache_hit = cache_miss_reason.empty();
+    result.cache_miss_reason = cache_miss_reason;
+    if (!result.cache_hit) {
+      result.cached_prompt_tokens = 0;
+      result.prefill_tokens = result.prompt_tokens;
+      result.cache_common_prefix_tokens = 2;
+      result.cache_checkpoint_tokens = 5;
+    }
     for (const std::string& piece : pieces) {
       if ((is_cancelled && is_cancelled()) || (on_token && !on_token(piece))) {
         result.cancelled = true;
@@ -135,6 +142,7 @@ public:
   }
 
   std::vector<std::string> pieces;
+  std::string cache_miss_reason;
   FinishReason finish_reason{FinishReason::kStop};
   bool block_after_first_piece{false};
   std::atomic<bool> completed{false};
@@ -399,6 +407,20 @@ void TestCachedPrefillMetrics() {
   cached.prefill_ms = 0;
   Expect(gufo::server::PrefillTokensPerSecond(cached) == 0,
          "Untimed work does not divide by zero");
+
+  backend.cache_miss_reason = "prefix_changed";
+  const auto miss = gufo::server::HandleOpenAiChat(
+      Request(
+          R"({"model":"test-model","messages":[{"role":"user","content":"changed"}]})"),
+      backend);
+  const auto miss_body = gufo::json::parse(miss.body);
+  const auto* miss_usage = miss_body.find("usage");
+  const auto* metrics = miss_usage ? miss_usage->find("gufo") : nullptr;
+  Expect(metrics &&
+             metrics->member_str("cache_miss_reason") == "prefix_changed" &&
+             metrics->member_size("cache_common_prefix_tokens") == 2 &&
+             metrics->member_size("cache_checkpoint_tokens") == 5,
+         "Usage explains cache misses without exposing prompt text");
 }
 
 void TestToolCallsAreStructured() {

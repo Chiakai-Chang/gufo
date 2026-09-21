@@ -130,12 +130,11 @@ TextPreparedPrompt PrepareQwenPrompt(
           options,
           encoder && has_images ? encoder->identity() : std::string_view{},
           max_context));
-  // With preserved reasoning, the official template retains the generation
-  // suffix verbatim in subsequent turns, including empty reasoning blocks.
-  // Keep that full frontier and its existing prefill arithmetic. Only stop
-  // earlier when the next turn's template will actually remove the suffix.
+  // Agent clients may discard an interrupted assistant entirely and append
+  // the next user turn directly after tool results. Preserve a checkpoint
+  // before the generation suffix even when reasoning itself is retained.
   std::size_t cache_prefix = 0;
-  if (!options.preserve_thinking) {
+  if (!options.preserve_thinking || !request.tools.empty()) {
     const auto generation = tokenizer.Encode(
         tokenization::GenerationPrompt(options.enable_thinking),
         {.add_bos = false, .add_eos = false, .parse_special_tokens = true});
@@ -1583,18 +1582,22 @@ public:
   [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
       const ChatRequest& request) const override {
     auto prepared = TextModelRunner::PreparePrompt(request);
-    const bool preserves_thinking =
-        request.reasoning.preserve_thinking.value_or(false) ||
-        (!request.tools.empty() &&
-         request.tool_choice != ChatRequest::ToolChoice::kNone);
-    if (prepared && request.reasoning.enabled.value_or(false) &&
-        !preserves_thinking) {
-      const auto generation = DeepSeekRunnerTokens(
-          model_->Tokenize(models::deepseek_v4_flash::GenerationPrompt(
-                               request.reasoning.enabled.value_or(false)),
-                           true));
-      prepared->cache_prefix_tokens =
-          StablePromptPrefix(prepared->tokens, generation);
+    if (prepared) {
+      // DeepSeek joins adjacent user/tool messages into one user block.
+      // A new user turn after a discarded assistant can therefore also change
+      // the final BPE token before the generation suffix (e.g. ">\n\n").
+      // Find the exact stable frontier using the renderer/tokenizer instead
+      // of assuming the suffix alone is the only changed part of the prompt.
+      auto continuation = request;
+      continuation.messages.emplace_back(tokenization::ChatRole::kUser, "");
+      const auto continued = RenderAndTokenize(continuation);
+      if (continued) {
+        prepared->cache_prefix_tokens = static_cast<std::size_t>(
+            std::mismatch(prepared->tokens.begin(), prepared->tokens.end(),
+                          continued->begin(), continued->end())
+                .first -
+            prepared->tokens.begin());
+      }
     }
     return prepared;
   }

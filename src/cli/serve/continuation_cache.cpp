@@ -100,7 +100,8 @@ ContinuationCache::Lease::Lease(Lease&& other) noexcept
       restored_from_disk_(std::exchange(other.restored_from_disk_, false)),
       reserved_snapshot_bytes_(
           std::exchange(other.reserved_snapshot_bytes_, 0)),
-      input_identity_(std::move(other.input_identity_)) {}
+      input_identity_(std::move(other.input_identity_)),
+      lookup_(std::exchange(other.lookup_, {})) {}
 
 ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     Lease&& other) noexcept {
@@ -116,6 +117,7 @@ ContinuationCache::Lease& ContinuationCache::Lease::operator=(
     restored_from_disk_ = std::exchange(other.restored_from_disk_, false);
     reserved_snapshot_bytes_ = std::exchange(other.reserved_snapshot_bytes_, 0);
     input_identity_ = std::move(other.input_identity_);
+    lookup_ = std::exchange(other.lookup_, {});
   }
   return *this;
 }
@@ -143,6 +145,7 @@ void ContinuationCache::Lease::AdoptRestoredPrefix(std::size_t cached_tokens,
   restored_snapshot_bytes_ = restored_bytes;
   restore_ms_ = restore_ms;
   restored_from_disk_ = true;
+  lookup_ = {};
 }
 
 bool ContinuationCache::Lease::TryReserveSnapshot(std::size_t snapshot_bytes,
@@ -286,6 +289,35 @@ ContinuationCache::Lease ContinuationCache::Acquire(
 
     const bool live_hit = live_source != no_entry;
     const bool cache_hit = live_hit || source != no_entry;
+    ContinuationLookup lookup;
+    if (!cache_hit) {
+      lookup.miss_reason = reuse_prompt ? "no_checkpoint" : "disabled";
+      const auto inspect = [&](const auto& tokens, const auto& identity) {
+        if (tokens.empty())
+          return;
+        if (!std::ranges::equal(identity, input_identity)) {
+          if (lookup.miss_reason == "no_checkpoint")
+            lookup.miss_reason = "input_changed";
+          return;
+        }
+        const auto common =
+            static_cast<std::size_t>(std::mismatch(tokens.begin(), tokens.end(),
+                                                   prompt.begin(), prompt.end())
+                                         .first -
+                                     tokens.begin());
+        if (lookup.checkpoint_tokens == 0 ||
+            common > lookup.common_prefix_tokens) {
+          lookup = {"prefix_changed", common, tokens.size()};
+        }
+      };
+      if (reuse_prompt) {
+        for (const auto& entry : impl_->entries) {
+          if (entry->valid)
+            inspect(entry->tokens, entry->input_identity);
+          inspect(entry->live_tokens, entry->live_identity);
+        }
+      }
+    }
     std::size_t selected = live_hit ? live_source : source;
     if ((impl_->snapshot_mode() && !live_hit) || !cache_hit) {
       selected = no_entry;
@@ -355,6 +387,7 @@ ContinuationCache::Lease ContinuationCache::Acquire(
                   restored_snapshot_bytes, restore_ms);
       lease.input_identity_.assign(input_identity.begin(),
                                    input_identity.end());
+      lease.lookup_ = lookup;
       return lease;
     }
 

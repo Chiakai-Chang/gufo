@@ -760,6 +760,10 @@ std::size_t TextRunnerPool::Request::cached_prompt_tokens() const noexcept {
   return impl_ != nullptr ? impl_->lease.cached_tokens() : 0;
 }
 
+ContinuationLookup TextRunnerPool::Request::cache_lookup() const noexcept {
+  return impl_ != nullptr ? impl_->lease.lookup() : ContinuationLookup{};
+}
+
 std::size_t TextRunnerPool::Request::cache_restore_bytes() const noexcept {
   return impl_ != nullptr ? impl_->lease.restored_snapshot_bytes() : 0;
 }

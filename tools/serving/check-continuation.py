@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Short HTTP cancellation/replay checks; restart the same server for --restore.
 
-Use a private server with --cache-disk and --served-model-name cache-test.
+Use a private server with --served-model-name cache-test. Add --cache-disk
+only when checking restart persistence; in-memory reuse needs no disk cache.
 Run once per AR/speculative backend. Reports contain synthetic requests and
 completion hashes, never logits. --image adds an image to each conversation.
 """
@@ -81,6 +82,12 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--restore", type=Path)
     parser.add_argument("--image", type=Path)
+    parser.add_argument("--tools", action="store_true",
+                        help="Resume after a completed tool response")
+    parser.add_argument("--discard-assistant", action="store_true",
+                        help="Drop the interrupted assistant and send '.' like an agent client")
+    parser.add_argument("--prefix-repetitions", type=int, default=32,
+                        help="Length of the synthetic shared system prefix")
     parser.add_argument("--case", action="append", choices=CASES,
                         help="Run only this case (repeatable for focused checks)")
     args = parser.parse_args()
@@ -121,25 +128,41 @@ def main():
                         {"type": "text", "text": content}]
                 messages = [
                     {"role": "system", "content": name + ". " +
-                     "Follow the user instruction carefully and answer accurately. " * 32},
+                     "Follow the user instruction carefully and answer accurately. " *
+                     args.prefix_repetitions},
                     {"role": "user", "content": content}]
+                if args.tools:
+                    messages.extend([
+                        {"role": "assistant", "content": "", "reasoning_content": "Read the fixture.",
+                         "tool_calls": [{"id": "fixture-call", "type": "function", "function": {
+                             "name": "read_fixture", "arguments": "{}"}}]},
+                        {"role": "tool", "tool_call_id": "fixture-call",
+                         "content": "The fixture is ready. Answer the user's request directly."}])
                 body = {"model": args.model, "messages": messages, "max_tokens": 256,
                         "temperature": 0.8 if sampled else 0, "seed": 1234,
                         "top_k": 20, "top_p": 0.95,
                         "chat_template_kwargs": {"enable_thinking": thinking,
                                                  "preserve_thinking": preserve},
                         "stream": True}
+                if args.tools:
+                    body["tools"] = [{"type": "function", "function": {
+                        "name": "read_fixture", "description": "Read the fixture.",
+                        "parameters": {"type": "object", "properties": {}}}}]
                 initial = {**body, "messages": list(messages), "cache_prompt": False}
                 assistant, elapsed = call(args.url, initial, field)
                 if not preserve:
                     assistant.pop("reasoning_content")
-                messages.extend([assistant, {"role": "user", "content":
-                    "Now reply with only the number 7."}])
+                if not args.discard_assistant:
+                    messages.append(assistant)
+                messages.append({"role": "user", "content":
+                    "." if args.discard_assistant else "Now reply with only the number 7."})
                 body.update(stream=False, max_tokens=12)
                 resumed = call(args.url, body)
                 measured = metrics(resumed)
                 if measured["cached"] < 128:
                     raise RuntimeError(f"{name}: interrupted conversation lost its prefix: {measured}")
+                if args.discard_assistant and measured["prefill"] > 16:
+                    raise RuntimeError(f"{name}: discarded assistant caused re-prefill: {measured}")
                 repeated = call(args.url, body)
                 cold = call(args.url, {**body, "cache_prompt": False})
                 if metrics(cold)["cached"] or cold["usage"]["gufo"]["cache_hit"]:
@@ -168,6 +191,7 @@ def main():
                 if digest(followup) != digest(call(args.url, followup_body)):
                     raise RuntimeError(f"{name}: third-turn snapshot changed seeded output")
                 report = {"case": name, "request": body, "sha256": digest(resumed),
+                          "discard_assistant": args.discard_assistant,
                           "interrupt_seconds": elapsed, **measured, "exact": True,
                           "full_prefill_equal": digest(resumed) == digest(cold),
                           "followup": {"request": followup_body,

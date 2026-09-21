@@ -429,6 +429,11 @@ struct TextGenerationScheduler::Impl {
         }
 
         request->result.cache_hit = request->runner_request.cache_hit();
+        const auto lookup = request->runner_request.cache_lookup();
+        request->result.cache_miss_reason = lookup.miss_reason;
+        request->result.cache_common_prefix_tokens =
+            lookup.common_prefix_tokens;
+        request->result.cache_checkpoint_tokens = lookup.checkpoint_tokens;
         request->result.cached_prompt_tokens =
             request->runner_request.cached_prompt_tokens();
         request->result.cache_restore_bytes =
