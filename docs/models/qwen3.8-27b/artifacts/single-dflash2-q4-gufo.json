@@ -1,0 +1,153 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.1.8",
+      "memoryTotalBytes": 134309879808,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "34bee0c70b5847b76a43f2c6da016bafed74530bff113cc4ffc5f43f21fe2f96",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-09-21",
+  "mode": null,
+  "model": {
+    "id": "Qwen3.8-27B",
+    "variant": "q4"
+  },
+  "notes": [
+    "pp2048/tg128; depth is a cached prefix of synthetic text; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.167 tokens/word, template overhead 12 tokens"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "acceptance": 43.15,
+      "acceptance_sd": null,
+      "counts": [
+        {
+          "cache_n": 0,
+          "predicted_n": 128,
+          "prompt_n": 2033
+        }
+      ],
+      "pp": 572.72,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 23.83,
+      "tg_sd": null
+    },
+    "12288": {
+      "acceptance": 41.92,
+      "acceptance_sd": null,
+      "counts": [
+        {
+          "cache_n": 12275,
+          "predicted_n": 128,
+          "prompt_n": 2055
+        }
+      ],
+      "pp": 471.71,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 22.05,
+      "tg_sd": null
+    },
+    "16384": {
+      "acceptance": 40.8,
+      "acceptance_sd": null,
+      "counts": [
+        {
+          "cache_n": 16373,
+          "predicted_n": 128,
+          "prompt_n": 2050
+        }
+      ],
+      "pp": 456.53,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 20.54,
+      "tg_sd": null
+    },
+    "4096": {
+      "acceptance": 48.66,
+      "acceptance_sd": null,
+      "counts": [
+        {
+          "cache_n": 4094,
+          "predicted_n": 128,
+          "prompt_n": 2037
+        }
+      ],
+      "pp": 530.83,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 29.21,
+      "tg_sd": null
+    },
+    "8192": {
+      "acceptance": 41.41,
+      "acceptance_sd": null,
+      "counts": [
+        {
+          "cache_n": 8199,
+          "predicted_n": 128,
+          "prompt_n": 2043
+        }
+      ],
+      "pp": 530.12,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 22.76,
+      "tg_sd": null
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "gufo",
+      "serve",
+      "--port",
+      "36185",
+      "--sessions",
+      "1",
+      "llm",
+      "--model",
+      "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "--context",
+      "34944",
+      "--served-model-name",
+      "bench",
+      "--think",
+      "off",
+      "--max-pending-per-client",
+      "8",
+      "--mmproj",
+      "mmproj-BF16.gguf",
+      "--speculative",
+      "dflash2",
+      "--dflash-model",
+      "Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "c0abb9f6779908b96a4831b58a0e41ea93566d92"
+  },
+  "table": "single-dflash2-q4",
+  "target": "gufo"
+}

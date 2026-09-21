@@ -21,7 +21,8 @@ are **TODO**.
 
 2026-09-21, one cold-file-cache launch to HTTP readiness, including Q4_K_M
 DFlash2 and two sessions at context capacity 262144. llama.cpp readiness
-with the same GGUF: **TODO**.
+with the same GGUF: **TODO** (the 2026-09-21 refresh host has no privileged
+page-cache drop, so the driver's loading table was skipped).
 
 <!-- bench:loading -->
 | Target | Gufo ready | llama.cpp ready | Gain |
@@ -40,20 +41,27 @@ These are bounded controls, not a long-conversation latency distribution.
 ## Single user, autoregressive
 
 Standard sweep: **pp2048 / tg128**, C1, greedy. Cells are tok/s; depth is a
-cached prefix, and the timed operation follows it. Gufo values measured
-**2026-09-19** with `gufo bench`, one warmed release sample per point; Q4 d0
-is the mean of two controls (PP range 620.38–623.61 tok/s). The HTTP refresh
-of both sides with identical prompts is **TODO**.
+cached prefix, and the timed operation follows it. Q4 rows 4,096–16,384
+(Gufo) and every Q4 llama.cpp cell were measured **2026-09-21** over HTTP
+with `tools/bench/model-bench.py` (synthetic-paragraph prefix, one warmed
+sample per point, context capacity 34944; llama.cpp d32768 needed 36864
+because the calibrated prefix plus pp2048 + tg128 overflowed 34944), against
+`llama-server` 10273 (`a6aa6f5`) with
+`-ngl 999 -np 1 -fa on --cache-reuse 0 --jinja --reasoning off`.
+Gufo Q4 d0 and d32768 and all Q8 values still date from **2026-09-19**
+`gufo bench` runs with a different prompt (Q4 d0 is the mean of two controls,
+PP range 620.38–623.61 tok/s); their Gain cells compare two methods and are
+provisional until those rows are refreshed over HTTP.
 
 <!-- bench:single-ar-q4 -->
 | Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 622.00 | TODO | TODO | 11.74 | TODO | TODO |
-| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO |
-| 32,768 | 467.63 | TODO | TODO | 10.30 | TODO | TODO |
+| 0 | 622.00 | 343.18 | +81.2% | 11.74 | 12.06 | -2.7% |
+| 4,096 | 622.04 | 310.23 | +100.5% | 11.72 | 11.89 | -1.4% |
+| 8,192 | 586.75 | 284.36 | +106.3% | 11.54 | 11.74 | -1.7% |
+| 12,288 | 512.65 | 263.88 | +94.3% | 11.34 | 11.58 | -2.1% |
+| 16,384 | 487.32 | 248.50 | +96.1% | 11.12 | 11.44 | -2.8% |
+| 32,768 | 467.63 | 195.39 | +139.3% | 10.30 | 10.89 | -5.4% |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar-q4.svg)
@@ -74,19 +82,24 @@ of both sides with identical prompts is **TODO**.
 ## Single user, DFlash2
 
 **pp2048 / tg128**, C1, greedy, Q4_K_M draft and adaptive controller.
-Depth zero refreshed **2026-09-21**; 32K measured **2026-09-19**. One warmed
-sample per point. llama.cpp has no DFlash2 equivalent: the reference column
-is llama.cpp autoregressive generation with the same target GGUF.
+Q4 depths 0–16,384 measured **2026-09-21** over HTTP with the same
+synthetic-paragraph prompts as the autoregressive table (acceptance
+41–49% on that text). The Q4 32K row and all Q8 values are **2026-09-19**
+`gufo bench` runs on the repetitive CLI input (96.5% acceptance); its Gain
+cell against the HTTP llama.cpp number is not a like-for-like comparison.
+One warmed sample per point. llama.cpp has no DFlash2 equivalent: the
+reference column is llama.cpp autoregressive generation with the same target
+GGUF, taken from the autoregressive table above.
 
 <!-- bench:single-dflash2-q4 -->
 | Depth | Gufo pp | Gufo tg | Acceptance | llama.cpp AR tg | Gain vs llama.cpp AR |
 | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 635.75 | 27.86 | TODO | TODO | TODO |
-| 4,096 | TODO | TODO | TODO | TODO | TODO |
-| 8,192 | TODO | TODO | TODO | TODO | TODO |
-| 12,288 | TODO | TODO | TODO | TODO | TODO |
-| 16,384 | TODO | TODO | TODO | TODO | TODO |
-| 32,768 | 442.86 | 31.01 | 96.5% | TODO | TODO |
+| 0 | 572.72 | 23.83 | 43.1% | 12.06 | +97.6% |
+| 4,096 | 530.83 | 29.21 | 48.7% | 11.89 | +145.7% |
+| 8,192 | 530.12 | 22.76 | 41.4% | 11.74 | +93.9% |
+| 12,288 | 471.71 | 22.05 | 41.9% | 11.58 | +90.4% |
+| 16,384 | 456.53 | 20.54 | 40.8% | 11.44 | +79.5% |
+| 32,768 | 442.86 | 31.01 | 96.5% | 10.89 | +184.8% |
 <!-- /bench -->
 
 ![Single user, DFlash2](artifacts/charts/single-dflash2-q4.svg)
@@ -201,14 +214,21 @@ controls must retain their performance. Controller and verification details:
 ## Memory
 
 GPU-visible unified allocation, C1, context capacity 262144, excluding
-separate CPU memory. llama.cpp resident device memory at the same `-c`: **TODO**.
+separate CPU memory. Q4 measured **2026-09-21**: peak device-wide VRAM + GTT
+use from `rocm-smi`, sampled every 250 ms while the request ran (idle
+baseline 0.17 GiB). The Gufo server ran with the Q4_K_M DFlash2 draft loaded
+and the BF16 projector attached; llama.cpp ran autoregressive at the same
+`-c` and preallocates the whole KV cache, so its footprint does not change
+with the prefix. Q8: **TODO**.
 
 <!-- bench:memory-q4 -->
 | Workload | Gufo GiB | llama.cpp GiB | Gain |
 | --- | ---: | ---: | ---: |
-| pp2048 + tg128 | TODO | TODO | TODO |
-| 16K prefix, pp4096 + tg128 | TODO | TODO | TODO |
+| pp2048 + tg128 | 21.31 | 32.37 | +51.9% |
+| 16K prefix, pp4096 + tg128 | 23.21 | 32.37 | +39.5% |
 <!-- /bench -->
+
+![GPU-visible allocation](artifacts/charts/memory-q4.svg)
 
 <!-- bench:memory-q8 -->
 | Workload | Gufo GiB | llama.cpp GiB | Gain |
@@ -245,13 +265,21 @@ DRAFT=/path/to/Qwen3.8-27B-DFlash2-Q4_K_M.gguf
 ./result/bin/gufo bench --model "$MODEL" \
   --speculative dflash2 --dflash-model "$DRAFT" \
   -p 2048 -n 128 -d 0,4096,8192,12288,16384,32768 -c 1 -r 2 -v
+MMPROJ=/path/to/mmproj-BF16.gguf
+FILES="--gguf q4=$MODEL --draft q4=$DRAFT --mmproj $MMPROJ"
+nix develop -c python3 tools/bench/model-bench.py --model qwen3.8-27b $FILES \
+  run --target gufo --todo --table single-ar-q4,single-dflash2-q4,memory-q4
+nix develop -c python3 tools/bench/model-bench.py --model qwen3.8-27b $FILES \
+  run --target reference --todo --table single-ar-q4,memory-q4
+nix develop -c python3 tools/bench/model-bench.py --model qwen3.8-27b render
 ```
 
 `gufo bench` is greedy and C1 and is the kernel-iteration tool. Published
 comparison tables are measured over HTTP on both sides and rendered with
 `tools/bench/model-bench.py` (`run --target gufo`, `run --target reference`,
 `render`); the `benchmark-model` skill describes the workloads, artifacts and
-table layout. DFlash2 prefill includes feature capture and draft context
+table layout. Drop `--todo` to refresh whole tables; add `q8=` file entries
+for the Q8 tables. DFlash2 prefill includes feature capture and draft context
 injection.
 
 Start with `nix develop -c python3 tools/qwen27b/check.py fast`, then run the

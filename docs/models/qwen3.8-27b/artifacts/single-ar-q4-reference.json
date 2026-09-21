@@ -1,0 +1,157 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.1.8",
+      "memoryTotalBytes": 134309879808,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "34bee0c70b5847b76a43f2c6da016bafed74530bff113cc4ffc5f43f21fe2f96",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-09-21",
+  "mode": null,
+  "model": {
+    "id": "Qwen3.8-27B",
+    "variant": "q4"
+  },
+  "notes": [
+    "llama.cpp: version: 10273 (a6aa6f5)",
+    "pp2048/tg128; depth is a cached prefix of synthetic text; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.167 tokens/word, template overhead 12 tokens"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "counts": [
+        {
+          "cache_n": 0,
+          "predicted_n": 128,
+          "prompt_n": 2033
+        }
+      ],
+      "pp": 343.18,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 12.06,
+      "tg_sd": null
+    },
+    "12288": {
+      "counts": [
+        {
+          "cache_n": 12275,
+          "predicted_n": 128,
+          "prompt_n": 2055
+        }
+      ],
+      "pp": 263.88,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 11.58,
+      "tg_sd": null
+    },
+    "16384": {
+      "counts": [
+        {
+          "cache_n": 16373,
+          "predicted_n": 128,
+          "prompt_n": 2050
+        }
+      ],
+      "pp": 248.5,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 11.44,
+      "tg_sd": null
+    },
+    "32768": {
+      "counts": [
+        {
+          "cache_n": 32778,
+          "predicted_n": 128,
+          "prompt_n": 2056
+        }
+      ],
+      "pp": 195.39,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 10.89,
+      "tg_sd": null
+    },
+    "4096": {
+      "counts": [
+        {
+          "cache_n": 4094,
+          "predicted_n": 128,
+          "prompt_n": 2037
+        }
+      ],
+      "pp": 310.23,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 11.89,
+      "tg_sd": null
+    },
+    "8192": {
+      "counts": [
+        {
+          "cache_n": 8199,
+          "predicted_n": 128,
+          "prompt_n": 2043
+        }
+      ],
+      "pp": 284.36,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 11.74,
+      "tg_sd": null
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "llama-server",
+      "-m",
+      "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+      "-c",
+      "36864",
+      "-np",
+      "1",
+      "--port",
+      "60011",
+      "--host",
+      "127.0.0.1",
+      "--alias",
+      "bench",
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "c0abb9f6779908b96a4831b58a0e41ea93566d92"
+  },
+  "table": "single-ar-q4",
+  "target": "reference"
+}
