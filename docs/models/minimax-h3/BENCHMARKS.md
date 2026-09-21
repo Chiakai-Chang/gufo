@@ -20,6 +20,34 @@ Output is byte-identical to the previous loader. No full video was generated.
 One worker executes jobs, with one queued job. There is no parallel C>1 model
 execution; throughput/queue latency measurements are **TODO**.
 
+## Native attention components — 2026-09-21
+
+gfx1151, ROCm 7.2.3, BF16 inputs/output, 56 heads of width 128. Kernel
+measurements use the production compiler flags; real-weight block controls
+use the optimized diagnostic executable. These are component measurements,
+not complete-generation latency.
+
+| Sequence rows | Native attention, GPU ms | Real-weight block, GPU ms | Block wall ms |
+| --- | ---: | ---: | ---: |
+| 528 | 0.63 | TODO | TODO |
+| 1,872 | 6.02 | 59.24 | 63.68 |
+| 4,096 | 27.33 | TODO | TODO |
+| 4,097 | 14.20 | TODO | TODO |
+| 7,136 | 42.88 | 320.23 | 332.55 |
+| 37,716 | 1,215.70 | 2,219.87 | 2,284.40 |
+
+Short attention averages ten timed launches after warm-up; long attention
+averages two. The 1,872-row block is one paired process control; long-block
+values are medians of three process runs. Model loading is excluded. The 7,136-row inference trace
+attributes 81.6% of GPU time to projections and 13.6% to attention, with 0.04 ms
+between kernels. No complete-video speedup is established.
+See [quality evidence](EVALUATION.md#native-attention-qualification)
+and the [measurement record](artifacts/native-attention.json).
+
+The production Nix runtime closure is **3.82 GiB** with no Triton/AOTriton,
+Composable Kernel or MIOpen dependencies.
+This is package storage, not model RAM or GPU memory.
+
 ## Memory and phase ownership
 
 | Component inventory | Tensor bytes | GiB |

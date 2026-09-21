@@ -22,8 +22,6 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "hipBLASLt",
     "rocBLAS",
     "Composable Kernel",
-    "MIOpen",
-    "AOTriton",
     "hipCUB",
     "rocPRIM",
     "rocWMMA",
@@ -43,7 +41,6 @@ REQUIRED_EVALUATION_COMPONENTS = {
     "PyTorch",
     "Torchvision",
     "LPIPS",
-    "Triton",
     "ROCprofiler SDK / ROCTx",
 }
 
