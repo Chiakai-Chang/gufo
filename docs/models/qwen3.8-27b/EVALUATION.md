@@ -4,6 +4,15 @@ Targets Q4/Q8; DFlash2 drafts Q4_K_M/Q8_0/BF16. Independent original-target,
 conversion and native MTP parity remain **TODO**. Packed-weight operator
 agreement is narrower evidence. [Artifact identities](artifacts/model-identities.json).
 
+Grouping verification queries by KV partition retains the existing arithmetic.
+The old/new FP16 kernels are byte-identical on 36 full-output cases through 64K
+plus six partition-boundary controls. Maintained checks cover FP16/FP32,
+1/3/8 query rows, scratch fallback and compact snapshot restoration. Matched
+pp2048/tg128 C1 HTTP controls on Q4_K_XL and Q8_K_XL with Q4 DFlash2 retain output
+hashes and accepted/proposed counts at d0 and d32K, with comparable PP speed.
+Fresh AR requests match DFlash2 on all four 128-token outputs at those depths.
+These focused controls do not refresh the benchmark sweep.
+
 The 2026-09-21 compact-state qualification preserves Q4/Q8 AR and DFlash2
 tokens across all 23 sampling cases and C2/C4/C6/C8. Active recurrence and
 rollback buffers contain only recurrent layers; snapshots retain only valid

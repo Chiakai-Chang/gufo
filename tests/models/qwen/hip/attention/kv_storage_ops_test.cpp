@@ -70,7 +70,7 @@ gufo::core::ModelConfig ProductionQwen27BConfig() {
 void TestCausalDecodeRows() {
   using gufo::test::DeviceBuffer;
   constexpr unsigned heads = 6, kv_heads = 1, dim = 256, rows = 8;
-  constexpr unsigned context = 8200, layer = 1, width = heads * dim;
+  constexpr unsigned context = 65544, layer = 1, width = heads * dim;
   constexpr std::size_t cache_size = 2U * context * kv_heads * dim;
   std::vector<float> query(rows * width), gate(query.size()), cache(cache_size);
   std::vector<__half> cache_half(cache_size);
@@ -91,7 +91,8 @@ void TestCausalDecodeRows() {
   for (bool fp16 : {false, true}) {
     for (bool gated : {false, true}) {
       for (unsigned batch : {1U, 3U, rows}) {
-        for (unsigned start : {0U, 17U, 4088U, 4092U, 4095U, 8192U}) {
+        for (unsigned start :
+             {0U, 17U, 4088U, 4092U, 4095U, 8192U, 32768U, 65536U}) {
           float* const cache32 = fp16 ? nullptr : kv.data();
           void* const cache16 = fp16 ? kv_half.data() : nullptr;
           for (unsigned row = 0; row < batch; ++row) {
@@ -177,6 +178,7 @@ void TestCanonicalMemoryAccountingAndSnapshot() {
          "FP16-only arena must not allocate an FP32 KV plane");
   Expect(fp16_arena.d_attention_kv_f16 != nullptr,
          "FP16-only arena must allocate its canonical KV plane");
+  HIP_CHECK(hipStreamSynchronize(fp16_arena.stream));
   auto snapshot = fp16_arena.SaveSnapshot(7);
   Expect(snapshot->KvStorage() == QwenKvCacheStorage::kFp16,
          "snapshot must record the canonical FP16 KV format");
@@ -219,6 +221,7 @@ void TestCompactPersistentSnapshotRoundTrip() {
   constexpr std::size_t header_bytes = 80;
   const auto policy = Fp16Policy();
   QwenGpuArena source(config, context, policy);
+  HIP_CHECK(hipStreamSynchronize(source.stream));
 
   const std::size_t attention_layers = config.FullAttentionLayerCount();
   const std::size_t kv_width =
@@ -263,6 +266,7 @@ void TestCompactPersistentSnapshotRoundTrip() {
   HIP_CHECK(hipMemcpy(source.d_ssm_deltanet_state, source_deltanet.data(),
                       source_deltanet.size() * sizeof(float),
                       hipMemcpyHostToDevice));
+  HIP_CHECK(hipDeviceSynchronize());
 
   auto snapshot = source.SaveSnapshot(valid_context);
   const std::size_t expected_compact_bytes =
@@ -282,6 +286,9 @@ void TestCompactPersistentSnapshotRoundTrip() {
   QwenGpuArena restored(config, context, policy);
   HIP_CHECK(hipMemset(restored.d_attention_kv_f16, 0xA5,
                       source_kv.size() * sizeof(std::uint16_t)));
+  // The arena restores on a nonblocking stream; finish the default-stream
+  // sentinel fill before starting those copies.
+  HIP_CHECK(hipDeviceSynchronize());
   restored.RestoreCompactSnapshot(payload, valid_context);
   std::vector<std::uint16_t> restored_kv(source_kv.size());
   std::vector<float> restored_conv(source_conv.size());

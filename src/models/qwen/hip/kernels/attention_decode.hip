@@ -494,14 +494,14 @@ __launch_bounds__(32) __global__ void QwenDecodeSplitKAttentionPartialsKernel(
   constexpr std::uint32_t vector_width = head_dim / 4;
   constexpr std::uint32_t vectors_per_lane = vector_width / 32;
 
-  const std::size_t row = blockIdx.z;
+  const std::size_t row = blockIdx.y;
   q += row * num_heads * head_dim;
   scratch += row * num_heads * detail::kSplitKDecodeAttentionMaxSplits *
              (head_dim + 2);
-  pos += blockIdx.z;
+  pos += blockIdx.y;
 
   const std::uint32_t head = blockIdx.x;
-  const std::uint32_t split = blockIdx.y;
+  const std::uint32_t split = blockIdx.z;
   const std::uint32_t lane = threadIdx.x;
   if (head >= num_heads || split >= split_count || lane >= 32) {
     return;
@@ -597,14 +597,14 @@ __launch_bounds__(32) __global__
   constexpr std::uint32_t vector_width = head_dim / 4;
   constexpr std::uint32_t vectors_per_lane = vector_width / 32;
 
-  const std::size_t row = blockIdx.z;
+  const std::size_t row = blockIdx.y;
   q += row * num_heads * head_dim;
   scratch += row * num_heads * detail::kSplitKDecodeAttentionMaxSplits *
              (head_dim + 2);
-  pos += blockIdx.z;
+  pos += blockIdx.y;
 
   const std::uint32_t head = blockIdx.x;
-  const std::uint32_t split = blockIdx.y;
+  const std::uint32_t split = blockIdx.z;
   const std::uint32_t lane = threadIdx.x;
   if (head >= num_heads || split >= split_count || lane >= 32) {
     return;
@@ -791,7 +791,7 @@ void LaunchAttention(const float* q, const float* k, const float* v,
   if (split_k_supported && split_k_scratch != nullptr) {
     const std::uint32_t split_count =
         detail::SelectDecodeAttentionSplitCount(sequence_length);
-    const dim3 partial_grid(num_heads, split_count);
+    const dim3 partial_grid(num_heads, 1, split_count);
     if (k_cache != nullptr && v_cache != nullptr) {
       detail::EmitAttentionDispatch("decode_split_k_fp32", "");
       QwenDecodeSplitKAttentionPartialsKernel<<<partial_grid, 32, 0, stream>>>(
@@ -869,7 +869,9 @@ void LaunchCausalDecodeAttention(
           head_dim)) {
     const auto splits = detail::SelectDecodeAttentionSplitCount(
         static_cast<std::size_t>(start_pos) + 1);
-    const dim3 grid(num_heads, splits, static_cast<unsigned>(batch_size));
+    // Keep a partition's KV resident while visiting every query row. With the
+    // row as the slow grid dimension, each row rereads the entire long cache.
+    const dim3 grid(num_heads, static_cast<unsigned>(batch_size), splits);
     if (k_cache != nullptr && v_cache != nullptr) {
       QwenDecodeSplitKAttentionPartialsKernel<<<grid, 32, 0, stream>>>(
           q, k_cache, v_cache, split_k_scratch, layer_idx, start_pos,
