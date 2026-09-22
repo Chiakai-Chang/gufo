@@ -201,8 +201,15 @@ around them (dates, acceptance notes, caveats) is hand-maintained.
 
 Models: `deepseek-v4-flash`, `qwen3.8-27b`, `qwen3.8-flash-next`.
 Reference: **llama.cpp** `llama-server`, same GGUF, ROCm build,
-`-ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off`, `-np` equal to the
-largest concurrency, `-c` covering the deepest sweep point plus 2048 + 128.
+`-ngl 999 -fa on --cache-reuse 0 --cache-ram 0 --jinja --reasoning off`,
+`-np` equal to the largest concurrency, `-c` covering the deepest sweep
+point plus 2048 + 128. `--cache-ram 0` matters: the driver sends
+`cache_prompt=false`, so llama-server's 8 GiB RAM prompt cache is never
+used, and on a unified-memory host it is the difference between a deep
+sweep running and the kernel OOM-killing the server. When a reference row
+still dies, check `free` and the kernel log before recording `n/a` — a run
+that finishes only by evicting and re-reading its mapped weights is not a
+speed measurement either.
 Gufo: `gufo serve llm --think off --max-pending-per-client 8`, greedy, seed
 1; the driver sets `--sessions 1` for single-user tables and `--sessions C`
 (llama.cpp `-np C -c 4096·C`) for concurrency tables, and attaches `--mmproj`

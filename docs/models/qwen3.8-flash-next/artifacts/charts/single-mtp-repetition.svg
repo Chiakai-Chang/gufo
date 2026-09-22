@@ -286,9 +286,12 @@ z
     </g>
    </g>
    <g id="line2d_26">
-    <path d="M 62.195154 153.082228 
-L 89.536441 156.702884 
-L 116.877729 159.034533 
+    <path d="M 62.195154 152.264091 
+L 89.536441 156.047029 
+L 116.877729 158.467807 
+L 144.219016 160.912128 
+L 171.560304 162.933507 
+L 198.901591 168.336744 
 " clip-path="url(#p9a3e05e441)" style="fill: none; stroke: #eda100; stroke-width: 2; stroke-linecap: square"/>
     <defs>
      <path id="mb9ac056d34" d="M 0 3 
@@ -304,9 +307,12 @@ z
 " style="stroke: #fcfcfb"/>
     </defs>
     <g clip-path="url(#p9a3e05e441)">
-     <use xlink:href="#mb9ac056d34" x="62.195154" y="153.082228" style="fill: #eda100; stroke: #fcfcfb"/>
-     <use xlink:href="#mb9ac056d34" x="89.536441" y="156.702884" style="fill: #eda100; stroke: #fcfcfb"/>
-     <use xlink:href="#mb9ac056d34" x="116.877729" y="159.034533" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="62.195154" y="152.264091" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="89.536441" y="156.047029" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="116.877729" y="158.467807" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="144.219016" y="160.912128" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="171.560304" y="162.933507" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="198.901591" y="168.336744" style="fill: #eda100; stroke: #fcfcfb"/>
     </g>
    </g>
    <g id="patch_3">
@@ -587,14 +593,20 @@ L 511.480104 102.586581
     </g>
    </g>
    <g id="line2d_54">
-    <path d="M 320.091091 91.677268 
-L 347.432379 87.404454 
-L 374.773666 107.563954 
+    <path d="M 320.091091 82.313442 
+L 347.432379 87.790826 
+L 374.773666 90.972709 
+L 402.114954 92.745472 
+L 429.456241 92.450011 
+L 456.797529 102.404759 
 " clip-path="url(#p20af60e24b)" style="fill: none; stroke: #eda100; stroke-width: 2; stroke-linecap: square"/>
     <g clip-path="url(#p20af60e24b)">
-     <use xlink:href="#mb9ac056d34" x="320.091091" y="91.677268" style="fill: #eda100; stroke: #fcfcfb"/>
-     <use xlink:href="#mb9ac056d34" x="347.432379" y="87.404454" style="fill: #eda100; stroke: #fcfcfb"/>
-     <use xlink:href="#mb9ac056d34" x="374.773666" y="107.563954" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="320.091091" y="82.313442" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="347.432379" y="87.790826" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="374.773666" y="90.972709" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="402.114954" y="92.745472" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="429.456241" y="92.450011" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="456.797529" y="102.404759" style="fill: #eda100; stroke: #fcfcfb"/>
     </g>
    </g>
    <g id="patch_6">
@@ -833,11 +845,17 @@ L 769.376041 102.895653
     <path d="M 577.987029 95.677471 
 L 605.328316 95.677471 
 L 632.669604 92.06838 
+L 660.010891 95.677471 
+L 687.352179 92.06838 
+L 714.693466 92.06838 
 " clip-path="url(#pdb354bad89)" style="fill: none; stroke: #eda100; stroke-width: 2; stroke-linecap: square"/>
     <g clip-path="url(#pdb354bad89)">
      <use xlink:href="#mb9ac056d34" x="577.987029" y="95.677471" style="fill: #eda100; stroke: #fcfcfb"/>
      <use xlink:href="#mb9ac056d34" x="605.328316" y="95.677471" style="fill: #eda100; stroke: #fcfcfb"/>
      <use xlink:href="#mb9ac056d34" x="632.669604" y="92.06838" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="660.010891" y="95.677471" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="687.352179" y="92.06838" style="fill: #eda100; stroke: #fcfcfb"/>
+     <use xlink:href="#mb9ac056d34" x="714.693466" y="92.06838" style="fill: #eda100; stroke: #fcfcfb"/>
     </g>
    </g>
    <g id="patch_9">

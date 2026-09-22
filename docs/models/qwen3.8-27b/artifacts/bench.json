@@ -259,7 +259,9 @@
       "0",
       "--jinja",
       "--reasoning",
-      "off"
+      "off",
+      "--cache-ram",
+      "0"
     ],
     "endpoint_profile": "openai",
     "readiness": "/health"

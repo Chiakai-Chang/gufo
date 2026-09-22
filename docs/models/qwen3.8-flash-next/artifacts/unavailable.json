@@ -1,5 +1,1 @@
-{
-  "single-ar": {
-    "131,072": "llama.cpp b11069 is OOM-killed at -c 133760 with this 104 GiB model on 125 GiB of RAM"
-  }
-}
+{}

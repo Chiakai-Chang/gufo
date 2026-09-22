@@ -7,7 +7,7 @@
 | Target | `unsloth/Qwen3.8-Flash-Next-GGUF` revision `38bb39ee`, **UD-Q4_K_XL** (four shards, 103.7 GiB) |
 | Speculative | MTP sidecar `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, same revision, adaptive up to 7 proposals |
 | Reference | llama.cpp `llama-server` release `b11069` (`0.4.1-dev (build 11069, commit 68d9053a)`), ROCm gfx1151 from `flake.nix`, same GGUF. MTP cells use `llama-server-mtp`, the same build recipe on the open [ggml-org/llama.cpp#28243](https://github.com/ggml-org/llama.cpp/pull/28243) branch (commit `6fcaa16f`), because the release cannot load the shared MTP sidecar |
-| Method | HTTP on both servers, same prompts and timed scope, greedy, thinking off, one sample per point, fresh server per table and concurrency level; `tools/bench/model-bench.py`, 2026-09-22. Every artifact records its server command |
+| Method | HTTP on both servers, same prompts and timed scope, greedy, thinking off, one sample per point, fresh server per table and concurrency level; `tools/bench/model-bench.py`, 2026-09-22. llama.cpp runs `--cache-ram 0` since the driver never reuses prompts. Every artifact records its server command |
 | Gain | Gufo over llama.cpp, positive when Gufo is better |
 | Identities | [`artifacts/model-identities.json`](artifacts/model-identities.json) |
 | Layout | [benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md) |
@@ -65,14 +65,14 @@ Artifacts: `artifacts/single-ar-gufo.json`, `artifacts/single-ar-reference.json`
 <!-- bench:single-ar -->
 | Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1628.52 | 490.33 | +232.1% | 26.04 | 22.11 | +17.8% |
-| 4,096 | 1523.39 | 428.50 | +255.5% | 25.98 | 21.18 | +22.7% |
-| 8,192 | 1499.13 | 422.44 | +254.9% | 25.91 | 20.35 | +27.3% |
-| 12,288 | 1477.98 | 395.59 | +273.6% | 25.46 | 18.72 | +36.0% |
-| 16,384 | 1457.16 | 378.65 | +284.8% | 25.20 | 18.96 | +32.9% |
-| 32,768 | 1421.93 | 306.77 | +363.5% | 24.33 | 16.07 | +51.4% |
-| 65,536 | 1304.01 | 224.90 | +479.8% | 23.21 | 11.86 | +95.7% |
-| 131,072 | 1292.02 | n/a | n/a | 21.93 | n/a | n/a |
+| 0 | 1628.52 | 489.59 | +232.6% | 26.04 | 22.20 | +17.3% |
+| 4,096 | 1523.39 | 455.24 | +234.6% | 25.98 | 21.21 | +22.5% |
+| 8,192 | 1499.13 | 428.85 | +249.6% | 25.91 | 20.40 | +27.0% |
+| 12,288 | 1477.98 | 400.21 | +269.3% | 25.46 | 19.64 | +29.6% |
+| 16,384 | 1457.16 | 375.89 | +287.7% | 25.20 | 18.95 | +33.0% |
+| 32,768 | 1421.93 | 301.31 | +371.9% | 24.33 | 16.54 | +47.1% |
+| 65,536 | 1304.01 | 221.94 | +487.6% | 23.21 | 11.62 | +99.7% |
+| 131,072 | 1292.02 | 144.78 | +792.4% | 21.93 | 7.98 | +174.8% |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar.svg)
@@ -90,12 +90,12 @@ Artifact: `artifacts/single-mtp-gufo.json`.
 <!-- bench:single-mtp -->
 | Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1438.69 | 444.77 | +223.5% | 32.18 | 31.58 | +1.9% | 0.64 | 1.46 |
-| 4,096 | 1304.23 | 418.21 | +211.9% | 33.45 | 30.12 | +11.1% | 0.97 | 1.46 |
-| 8,192 | 1324.72 | n/a | n/a | 33.32 | n/a | n/a | 0.91 | n/a |
-| 12,288 | 1317.14 | n/a | n/a | 34.06 | n/a | n/a | 1.06 | n/a |
-| 16,384 | 1298.17 | n/a | n/a | 33.09 | n/a | n/a | 0.94 | n/a |
-| 32,768 | 1278.93 | n/a | n/a | 28.70 | n/a | n/a | 0.71 | n/a |
+| 0 | 1438.69 | 460.85 | +212.2% | 32.18 | 31.73 | +1.4% | 0.64 | 1.46 |
+| 4,096 | 1304.23 | 423.79 | +207.8% | 33.45 | 34.48 | -3.0% | 0.97 | 1.72 |
+| 8,192 | 1324.72 | 393.56 | +236.6% | 33.32 | 32.20 | +3.5% | 0.91 | 1.78 |
+| 12,288 | 1317.14 | 363.44 | +262.4% | 34.06 | 32.32 | +5.4% | 1.06 | 1.72 |
+| 16,384 | 1298.17 | 341.98 | +279.6% | 33.09 | 32.07 | +3.2% | 0.94 | 1.78 |
+| 32,768 | 1278.93 | 271.28 | +371.4% | 28.70 | 25.41 | +12.9% | 0.71 | 1.46 |
 | 65,536 | 1176.17 | n/a | n/a | 28.69 | n/a | n/a | 1.13 | n/a |
 | 131,072 | 1191.27 | n/a | n/a | 26.31 | n/a | n/a | 1.06 | n/a |
 <!-- /bench -->
@@ -110,12 +110,12 @@ controller is tuned to push hard on this case.
 <!-- bench:single-mtp-repetition -->
 | Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1605.30 | 459.03 | +249.7% | 59.39 | 44.00 | +35.0% | 3.74 | 2.66 |
-| 4,096 | 1509.49 | 415.97 | +262.9% | 48.07 | 45.88 | +4.8% | 2.28 | 2.66 |
-| 8,192 | 1472.04 | 388.24 | +279.2% | 50.19 | 37.01 | +35.6% | 2.46 | 2.76 |
-| 12,288 | 1451.29 | n/a | n/a | 40.07 | n/a | n/a | 1.17 | n/a |
-| 16,384 | 1429.19 | n/a | n/a | 50.57 | n/a | n/a | 2.76 | n/a |
-| 32,768 | 1389.83 | n/a | n/a | 45.25 | n/a | n/a | 2.56 | n/a |
+| 0 | 1605.30 | 468.76 | +242.5% | 59.39 | 48.12 | +23.4% | 3.74 | 2.66 |
+| 4,096 | 1509.49 | 423.77 | +256.2% | 48.07 | 45.71 | +5.2% | 2.28 | 2.66 |
+| 8,192 | 1472.04 | 394.98 | +272.7% | 50.19 | 44.31 | +13.3% | 2.46 | 2.76 |
+| 12,288 | 1451.29 | 365.91 | +296.6% | 40.07 | 43.53 | -7.9% | 1.17 | 2.66 |
+| 16,384 | 1429.19 | 341.87 | +318.1% | 50.57 | 43.66 | +15.8% | 2.76 | 2.76 |
+| 32,768 | 1389.83 | 277.61 | +400.6% | 45.25 | 39.28 | +15.2% | 2.56 | 2.76 |
 | 65,536 | 1202.92 | n/a | n/a | 37.23 | n/a | n/a | 2.28 | n/a |
 | 131,072 | 1272.39 | n/a | n/a | 39.20 | n/a | n/a | 2.46 | n/a |
 <!-- /bench -->
@@ -128,19 +128,22 @@ The llama.cpp MTP columns come from **`llama-server-mtp`**, built in
 (commit `6fcaa16f`, same ROCm build recipe as the release): release `b11069`
 rejects the shared sidecar (`check_tensor_dims: tensor 'token_embd.weight'
 not found`). Replace it with the release pin once the change is merged.
-With the MTP draft loaded, llama.cpp's resident set exceeds the host's RAM
-from the 12K prefix on (the kernel OOM-kills it at `-c 35456`), so the
-deeper rows are **n/a** for llama.cpp on this host; a d8192 prose sample
-that completed under swap pressure (1.66 tok/s) is excluded.
+llama.cpp runs with `--cache-ram 0`: the driver sends `cache_prompt=false`,
+so the server's 8 GiB RAM prompt cache is dead weight, and with the MTP
+draft loaded it is the difference between running and being OOM-killed. Even
+so, the 64K and 128K MTP rows are **n/a**: the 128K server is killed while
+loading at `-c 133760`, and the 64K run only finishes with its mapped
+weights being evicted and re-read (3.2–13.1 tok/s), which is not a speed
+measurement. Gufo holds every depth at context capacity 133760.
 
-On generic prose Gufo MTP accepts 0.6–1.1 draft tokens per step and decodes
-**32.2 tok/s** at d0 (+24% over Gufo AR) and **26.3 tok/s** at 128K (+20%);
-llama.cpp MTP accepts 1.46 per step and decodes 31.6 / 30.1 tok/s at d0 /
-4K, so the two are within 2–11% where both run. MTP costs Gufo 8–12% of
-prefill throughput. On the repetitive workload Gufo MTP accepts 2.3–3.7 per
-step and decodes **59.4 tok/s** at d0 and **39.2 tok/s** at 128K (2.3× /
-1.8× Gufo AR); llama.cpp MTP reaches 44–46 tok/s at d0–4K with 2.7 per
-step, so Gufo leads by 5–36% on the shared depths.
+On generic prose Gufo MTP accepts 0.6–1.1 draft tokens per step and
+llama.cpp 1.3–1.8, and the two decode within 5% of each other up to 16K;
+Gufo leads by 13% at 32K and holds **26.3 tok/s** at 128K where llama.cpp
+cannot run. MTP costs Gufo 8–12% of prefill throughput. On the repetitive
+workload Gufo MTP decodes **59.4 tok/s** at d0 (+23% over llama.cpp) and
+39.2 tok/s at 128K, with 2.3–3.7 accepted tokens per step against
+llama.cpp's 2.7; the d12288 dip to 40.1 tok/s (1.17 per step) is the one
+depth where llama.cpp leads.
 
 `gufo bench` controls (CLI, raw prefix, not HTTP; 2026-09-21): sampled MTP at
 d0, seed 1, tg128, top-k/top-p/min-p disabled:
@@ -168,10 +171,10 @@ Artifacts: `artifacts/multi-<table>-gufo-ar.json`, `-gufo-mtp.json`,
 <!-- bench:multi-repetition -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo MTP | llama.cpp MTP | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 26.10 | 21.42 | +21.8% | 76.86 | 44.98 | +70.9% | 1/1 |
-| 2 | 43.38 | 38.34 | +13.1% | 113.15 | 69.55 | +62.7% | 2/2 |
-| 4 | 68.94 | 60.78 | +13.4% | 138.82 | 79.81 | +73.9% | 4/4 |
-| 6 | 83.87 | 72.91 | +15.0% | 145.07 | 91.03 | +59.4% | 6/6 |
+| 1 | 26.10 | 21.42 | +21.8% | 76.86 | 45.71 | +68.1% | 1/1 |
+| 2 | 43.38 | 38.34 | +13.1% | 113.15 | 72.64 | +55.8% | 2/2 |
+| 4 | 68.94 | 60.78 | +13.4% | 138.82 | 74.99 | +85.1% | 4/4 |
+| 6 | 83.87 | 72.91 | +15.0% | 145.07 | 85.47 | +69.7% | 6/6 |
 | 8 | 94.19 | 78.45 | +20.1% | 145.43 | n/a | n/a | 8/8 |
 <!-- /bench -->
 
@@ -180,21 +183,20 @@ Artifacts: `artifacts/multi-<table>-gufo-ar.json`, `-gufo-mtp.json`,
 <!-- bench:multi-mixed -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo MTP | llama.cpp MTP | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 25.87 | 21.56 | +20.0% | 44.66 | 38.94 | +14.7% | 1/3 |
-| 2 | 40.43 | 33.88 | +19.3% | 62.66 | 50.89 | +23.1% | 2/4 |
-| 4 | 58.41 | 51.80 | +12.8% | 84.97 | 53.16 | +59.8% | 2/4 |
-| 6 | 71.69 | 61.49 | +16.6% | 91.29 | n/a | n/a | 4/6 |
+| 1 | 25.87 | 21.56 | +20.0% | 44.66 | 39.09 | +14.2% | 1/3 |
+| 2 | 40.43 | 33.88 | +19.3% | 62.66 | 50.11 | +25.0% | 2/4 |
+| 4 | 58.41 | 51.80 | +12.8% | 84.97 | 53.58 | +58.6% | 2/4 |
+| 6 | 71.69 | 61.49 | +16.6% | 91.29 | 60.03 | +52.1% | 4/6 |
 | 8 | 78.30 | 67.49 | +16.0% | 95.43 | n/a | n/a | 3/8 |
 <!-- /bench -->
 
 ![Multiple users, mixed corpus](artifacts/charts/multi-mixed.svg)
 
 The llama.cpp MTP column uses `llama-server-mtp` (see the single-user MTP
-table). It is OOM-killed at C8 on `repetition` and from C6 on `mixed`
-(`-c 4096·C` plus the draft exceed the host's RAM), so those cells are
-**n/a**. Where both run, Gufo MTP delivers +59…+74% on `repetition` and
-+15…+60% on `mixed` (Gufo 1.4–4.3 accepted per step vs llama.cpp 2.4–2.9;
-Gufo AR alone is +13…+22% over llama.cpp AR).
+table). C8 is **n/a** on both corpora: `-c 4096·8` plus the draft exceed the
+host's RAM and the server is OOM-killed. Where both run, Gufo MTP delivers
++56…+85% on `repetition` and +14…+59% on `mixed` (Gufo 1.4–4.3 accepted per
+step vs llama.cpp 2.4–2.9); Gufo AR alone is +13…+22% over llama.cpp AR.
 
 Gufo honours `cache_prompt=false`: all twenty Gufo cohorts and all ten
 llama.cpp cohorts report **zero prompt-cache hits** (`render` prints

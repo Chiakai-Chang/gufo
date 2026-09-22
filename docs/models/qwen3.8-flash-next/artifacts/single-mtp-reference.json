@@ -31,8 +31,8 @@
   "notes": [
     "llama.cpp: llama-server-mtp version: 0.4.1-dev (build 11069, commit 6fcaa16f)",
     "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task: prose; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
-    "synthetic text: 1.161 tokens/word, template overhead 12 tokens",
-    "server exited with -9 while measuring d8192 (context 35456); OOM-killed; deeper rows are n/a on this host"
+    "synthetic text: 1.160 tokens/word, template overhead 12 tokens",
+    "llama.cpp with the MTP draft exhausts the host's 125 GiB: the 128K server is OOM-killed while loading (-c 133760) and the 64K run completes only with the mapped weights being evicted and re-read, which is not a valid speed measurement"
   ],
   "referenceName": "llama.cpp",
   "rows": {
@@ -41,7 +41,7 @@
       "acceptance_sd": null,
       "accepted_per_step": 1.46,
       "accepted_per_step_sd": null,
-      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 44719 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 35455 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
       "counts": [
         {
           "cache_n": 0,
@@ -51,50 +51,122 @@
           "prompt_n": 2040
         }
       ],
-      "pp": 444.77,
+      "pp": 460.85,
       "pp_sd": null,
       "samples": 1,
-      "tg": 31.58,
+      "tg": 31.73,
       "tg_sd": null
     },
     "12288": {
-      "unavailable": "server exited with -9 while measuring d8192 (context 35456); OOM-killed"
+      "acceptance": 59.56,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.72,
+      "accepted_per_step_sd": null,
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 35455 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 12249,
+          "draft_n": 136,
+          "draft_n_accepted": 81,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 363.44,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 32.32,
+      "tg_sd": null
     },
     "131072": {
-      "unavailable": "server exited with -9 while measuring d8192 (context 35456); OOM-killed"
+      "unavailable": "llama.cpp with the MTP draft exhausts the host's 125 GiB: the 128K server is OOM-killed while loading (-c 133760) and the 64K run completes only with the mapped weights being evicted and re-read, which is not a valid speed measurement"
     },
     "16384": {
-      "unavailable": "server exited with -9 while measuring d8192 (context 35456); OOM-killed"
+      "acceptance": 61.19,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.78,
+      "accepted_per_step_sd": null,
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 35455 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 16324,
+          "draft_n": 134,
+          "draft_n_accepted": 82,
+          "predicted_n": 128,
+          "prompt_n": 2047
+        }
+      ],
+      "pp": 341.98,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 32.07,
+      "tg_sd": null
     },
     "32768": {
-      "unavailable": "server exited with -9 while measuring d8192 (context 35456); OOM-killed"
-    },
-    "4096": {
-      "acceptance": 50.0,
+      "acceptance": 49.67,
       "acceptance_sd": null,
       "accepted_per_step": 1.46,
       "accepted_per_step_sd": null,
-      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 44719 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 35455 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 32718,
+          "draft_n": 153,
+          "draft_n_accepted": 76,
+          "predicted_n": 128,
+          "prompt_n": 2029
+        }
+      ],
+      "pp": 271.28,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 25.41,
+      "tg_sd": null
+    },
+    "4096": {
+      "acceptance": 60.0,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.72,
+      "accepted_per_step_sd": null,
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 35455 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
       "counts": [
         {
           "cache_n": 4095,
-          "draft_n": 152,
-          "draft_n_accepted": 76,
+          "draft_n": 135,
+          "draft_n_accepted": 81,
           "predicted_n": 128,
           "prompt_n": 2043
         }
       ],
-      "pp": 418.21,
+      "pp": 423.79,
       "pp_sd": null,
       "samples": 1,
-      "tg": 30.12,
+      "tg": 34.48,
       "tg_sd": null
     },
     "65536": {
-      "unavailable": "server exited with -9 while measuring d8192 (context 35456); OOM-killed"
+      "unavailable": "llama.cpp with the MTP draft exhausts the host's 125 GiB: the 128K server is OOM-killed while loading (-c 133760) and the 64K run completes only with the mapped weights being evicted and re-read, which is not a valid speed measurement"
     },
     "8192": {
-      "unavailable": "server exited with -9 while measuring d8192 (context 35456); OOM-killed"
+      "acceptance": 61.19,
+      "acceptance_sd": null,
+      "accepted_per_step": 1.78,
+      "accepted_per_step_sd": null,
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 35455 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --cache-ram 0 --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 8184,
+          "draft_n": 134,
+          "draft_n_accepted": 82,
+          "predicted_n": 128,
+          "prompt_n": 2048
+        }
+      ],
+      "pp": 393.56,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 32.2,
+      "tg_sd": null
     }
   },
   "schemaVersion": 1,
@@ -104,11 +176,11 @@
       "-m",
       "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
       "-c",
-      "35456",
+      "68224",
       "-np",
       "1",
       "--port",
-      "44719",
+      "55557",
       "--host",
       "127.0.0.1",
       "--alias",
@@ -122,6 +194,8 @@
       "--jinja",
       "--reasoning",
       "off",
+      "--cache-ram",
+      "0",
       "--spec-type",
       "draft-mtp",
       "--spec-draft-model",
@@ -133,7 +207,7 @@
   "source": {
     "buildMode": "nix-release",
     "dirty": true,
-    "revision": "9d739bde42e299c43b7f47376a4941c533ad660c"
+    "revision": "ff539ca5a1b321c917dbed2f19a868a17e1383f7"
   },
   "table": "single-mtp",
   "target": "reference"
