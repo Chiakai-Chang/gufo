@@ -102,10 +102,6 @@ class Session:
         cfg = self.config
         gguf = cfg.file("gguf", table.variant)
         llm_args = list(cfg.data["gufo"].get("llm", []))
-        if table.spec.get("workload") == THINKING_WORKLOAD:
-            # The model's own template decides; drop the benchmark's `--think off`.
-            llm_args = [a for i, a in enumerate(llm_args)
-                        if a != "--think" and (i == 0 or llm_args[i - 1] != "--think")]
         command = [str(self.gufo_binary), "serve", "--port", str(port), "--sessions", str(sessions),
                    *cfg.data["gufo"].get("serve", []), "llm", "--model", str(gguf),
                    "--context", str(context), "--served-model-name", MODEL_ALIAS, *llm_args]
@@ -127,9 +123,6 @@ class Session:
         cfg = self.config
         gguf = cfg.file("gguf", table.variant)
         args = list(cfg.data["reference"]["args"])
-        if table.spec.get("workload") == THINKING_WORKLOAD:
-            args = [a for i, a in enumerate(args)
-                    if a != "--reasoning" and (i == 0 or args[i - 1] != "--reasoning")]
         command = [self.reference_binary_for(mode), "-m", str(gguf), "-c", str(context), "-np", str(parallel),
                    "--port", str(port), "--host", "127.0.0.1", "--alias", MODEL_ALIAS, *args]
         if table.kind == "image-encoder":
@@ -178,21 +171,26 @@ class Session:
 
     def request(self, base_url: str, prompt: str, max_tokens: int, *, index: int = 0,
                 messages: list[dict[str, Any]] | None = None,
-                cache_prompt: bool | None = "default") -> RequestObservation:  # type: ignore[assignment]
+                cache_prompt: bool | None = "default",  # type: ignore[assignment]
+                extra_body: dict[str, Any] | None = None) -> RequestObservation:
         return run_request(
             base_url=base_url, model=MODEL_ALIAS, prompt=prompt, max_tokens=max_tokens,
             temperature=float(self.config.data["sampling"]["temperature"]),
             timeout_seconds=REQUEST_TIMEOUT, client_id=CLIENT_ID, concurrency=1,
             repetition=1, request_index=index, endpoint_profile=self.profile,
             cache_prompt=self.cache_prompt if cache_prompt == "default" else cache_prompt, messages=messages,
+            extra_body=extra_body,
         )
 
-    def chat_text(self, base_url: str, messages: list[dict[str, str]], max_tokens: int) -> str:
+    def chat_text(self, base_url: str, messages: list[dict[str, str]], max_tokens: int,
+                  extra_body: dict[str, Any] | None = None) -> str:
         """Non-streaming completion text, used to build a reusable conversation prefix."""
         payload = {"model": MODEL_ALIAS, "messages": messages, "max_tokens": max_tokens,
                    "temperature": float(self.config.data["sampling"]["temperature"]), "stream": False}
         if self.cache_prompt is not None:
             payload["cache_prompt"] = self.cache_prompt
+        if extra_body:
+            payload.update(extra_body)
         body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(
             base_url.rstrip("/") + "/v1/chat/completions", data=body,
@@ -417,8 +415,8 @@ TASKS = {
               "Write at least 500 words."),
     # Fully predictable output: the single-user analogue of the `repetition` corpus.
     "repetition": "\n\nRepeat the passage above word for word, from the beginning.",
-    # Reasoning output: the model's default mode, where the generated tokens are
-    # chain-of-thought rather than prose. The server keeps thinking enabled.
+    # Reasoning output: the generated tokens are chain-of-thought rather than prose.
+    # Thinking is enabled per request so the cached prefix turn renders unchanged.
     "thinking": ("\n\nHow many distinct words appear in the passage above, and which three are "
                  "the most frequent? Work through it carefully before answering."),
 }
@@ -439,18 +437,24 @@ def _measure_depth(session: Session, base_url: str, tokenizer: Tokenizer, *, dep
     """
     new_target = prompt_tokens - tokenizer.overhead
     ratio = tokenizer.ratio
+    # The template renders earlier turns differently when thinking is enabled, so the
+    # prefix turn must carry the same options for its cached tokens to match.
+    extra = ({"chat_template_kwargs": {"enable_thinking": True}, "reasoning_effort": "high"}
+             if task == THINKING_WORKLOAD else None)
     for attempt in range(4):
         messages: list[dict[str, str]] = []
         if depth > 0:
             prefix_target = depth - tokenizer.overhead - PREFIX_REPLY_TOKENS
             prefix = synthetic_text(seed + depth, max(1, round(prefix_target / ratio)))
-            reply = session.chat_text(base_url, [{"role": "user", "content": prefix}], PREFIX_REPLY_TOKENS)
+            reply = session.chat_text(base_url, [{"role": "user", "content": prefix}], PREFIX_REPLY_TOKENS,
+                                      extra_body=extra)
             messages = [{"role": "user", "content": prefix}, {"role": "assistant", "content": reply}]
         instruction = TASKS[task]
         new_words = max(1, round(new_target / ratio) - len(instruction.split()))
         new_text = synthetic_text(100_000 + depth * 10 + repetition * 100 + attempt, new_words) + instruction
         messages.append({"role": "user", "content": new_text})
-        observation = session.request(base_url, new_text, output_tokens, index=attempt, messages=messages)
+        observation = session.request(base_url, new_text, output_tokens, index=attempt, messages=messages,
+                                      extra_body=extra)
         if observation.completion_tokens < output_tokens:
             raise RuntimeError(
                 f"depth {depth}: server generated {observation.completion_tokens} of {output_tokens} tokens "

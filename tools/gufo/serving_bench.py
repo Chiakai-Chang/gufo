@@ -328,6 +328,7 @@ def run_request(
     endpoint_profile: str = "gufo",
     cache_prompt: bool | None = None,
     messages: list[dict[str, str]] | None = None,
+    extra_body: dict[str, Any] | None = None,
 ) -> RequestObservation:
     if endpoint_profile not in ENDPOINT_PROFILES:
         raise ValueError("endpoint profile must be gufo or openai")
@@ -343,6 +344,8 @@ def run_request(
     if cache_prompt is not None:
         # llama-server honours this field; gufo ignores unknown fields.
         payload["cache_prompt"] = cache_prompt
+    if extra_body:
+        payload.update(extra_body)
     body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/chat/completions",

@@ -269,15 +269,14 @@ nix build
 FILES="--gguf /path/to/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf \
        --mtp /path/to/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
 nix develop -c python3 tools/bench/model-bench.py --model qwen3.8-flash-next tables
-nix develop -c python3 tools/bench/model-bench.py --model qwen3.8-flash-next $FILES \
-  run --target gufo --fresh --table single-ar,single-mtp,multi-repetition,multi-mixed,memory
-nix develop -c python3 tools/bench/model-bench.py --model qwen3.8-flash-next $FILES \
-  run --target reference --fresh --table single-ar,multi-repetition,multi-mixed,memory
-nix develop -c python3 tools/bench/model-bench.py --model qwen3.8-flash-next render
-# Loading needs --drop-caches "<privileged command>"; single-mtp on the
-# reference fails to load the sidecar with llama.cpp b11069.
+BENCH="nix develop -c python3 tools/bench/model-bench.py --model qwen3.8-flash-next"
+$BENCH tables
+$BENCH $FILES run --target gufo --fresh          # every table
+$BENCH $FILES run --target reference --fresh --depths 0,4096,8192,12288,16384,32768 --context 35456
+$BENCH $FILES run --target reference --depths 65536 --context 68224
+$BENCH $FILES run --target reference --depths 131072 --context 133760
+$BENCH render
+# Loading needs --drop-caches "<privileged command>". The reference runs at
+# the smallest context that holds each depth because it leaves little RAM
+# headroom on this host; add --mode ar to skip its MTP launches.
 ```
-
-Until the driver's prefix turn is fixed, the single-user and memory runs
-stop at the first depth row; run them with `--todo` after blanking only the
-d0 / `pp2048 + tg128` rows, or expect the abort after d0 has been stored.

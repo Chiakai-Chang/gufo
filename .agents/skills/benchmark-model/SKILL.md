@@ -84,6 +84,11 @@ When a reference server is killed mid-table (SIGKILL is the kernel OOM
 killer on this host), the driver marks that row and every deeper depth or
 larger concurrency `unavailable` in the artifact and `render` shows `n/a`
 for them, since they are a host limit rather than missing work.
+The thinking workload enables reasoning per request
+(`chat_template_kwargs.enable_thinking`) rather than through a server flag,
+so the cached prefix renders the same way; on Gufo its depth rows are
+blocked by gufo-org/gufo#248 (the prefix cache misses when thinking is on),
+so only d0 is measurable today.
 `--depths 0,4096` restricts single-user tables to those depths and
 `--mode ar` / `--mode <spec>` restricts to one mode (use it to skip a
 reference speculative mode the reference cannot load);
@@ -104,6 +109,13 @@ table with data into
 `docs/models/<model>/artifacts/charts/` (matplotlib, deterministic output),
 placed as an image line right after the table. Tables stay the source of
 truth for agents; charts are an addition for readers. `--no-charts` skips them.
+
+Starting a new model: copy `assets/llm-bench-template.json` to
+`docs/models/<model>/artifacts/bench.json` and
+`assets/llm-benchmarks-template.md` to the card, replace the placeholders,
+delete the tables the model does not have, and render. The template mirrors
+the Qwen3.8-Flash-Next card, including which prose belongs next to each
+table.
 
 `bench.json` (`schema: gufo-model-bench/1`) holds: `category`; `model.id`;
 `files` (the file roles the CLI must supply, with a description each);
