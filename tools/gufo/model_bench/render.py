@@ -341,8 +341,7 @@ def multi_summary(config: BenchConfig) -> list[str]:
                      f"request median {latency.get('median', 0) / 1000:.2f} s / p95 {latency.get('p95', 0) / 1000:.2f} s"]
             if spec.get("acceptance") is not None:
                 parts.append(f"acceptance {spec['acceptance'] * 100:.1f}%")
-            if spec.get("cacheHits"):
-                parts.append(f"cache hits {spec['cacheHits']}/{result.get('requestCount')}")
+            parts.append(f"cache hits {spec.get('cacheHits', 0)}/{result.get('requestCount')}")
             lines.append(" ".join(parts))
     return lines
 

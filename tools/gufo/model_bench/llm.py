@@ -62,6 +62,9 @@ class Session:
         drop_caches: str | None = None,
         repetitions: int | None = None,
         fresh: bool = False,
+        depths: list[int] | None = None,
+        modes: list[str] | None = None,
+        context: int | None = None,
     ):
         self.config = config
         self.target = target
@@ -75,6 +78,9 @@ class Session:
         self.drop_caches = drop_caches
         self.repetitions = repetitions
         self.fresh = fresh
+        self.depths = depths
+        self.modes = modes
+        self.context = context
 
     def reps(self, spec: dict[str, Any], default: int = 1) -> int:
         return self.repetitions or int(spec.get("repetitions", default))
@@ -277,11 +283,16 @@ def run_loading(session: Session, table: TableSpec) -> None:
 def run_single(session: Session, table: TableSpec) -> None:
     cfg = session.config
     spec = table.spec
+    if session.modes and ("ar" if not table.speculative else cfg.speculative["mode"]) not in session.modes:
+        print(f"{table.id}: skipped by --mode")
+        return
     if table.speculative and session.target != "gufo" and cfg.reference_speculative is None:
         print(f"{table.id}: {cfg.reference_name} has no {cfg.speculative['label']} mode; the table compares against its AR column")
         return
     cfg.require_files(table.variant)
     depths = [int(d) for d in spec["depths"]]
+    if session.depths:
+        depths = [d for d in depths if d in session.depths]
     keys = _selected_rows(session, table, {d: f"{d:,}" for d in depths})
     if not keys:
         print(f"{table.id}: nothing to do")
@@ -293,21 +304,31 @@ def run_single(session: Session, table: TableSpec) -> None:
     base_seed = int(spec.get("prefix", {}).get("seed", 1))
     mode = cfg.speculative["mode"] if table.speculative else "ar"
 
-    server = session.server(table, mode=mode, context=int(spec["context"]), sessions=1, tag="single")
+    context = session.context or int(spec["context"])
+    server = session.server(table, mode=mode, context=context, sessions=1, tag="single")
     rows: dict[str, Any] = {}
     with server:
         tokenizer = Tokenizer(session, server.base_url)
         # Warm kernels and allocations with an untimed full-size request.
         session.request(server.base_url, synthetic_text(8888, tokenizer.words_for(prompt_tokens)), 16)
+        failures: list[str] = []
         for depth in keys:
             pps: list[float] = []
             tgs: list[float] = []
             accepts: list[float] = []
             counts: list[dict[str, int]] = []
-            for repetition in range(repetitions):
-                observation = _measure_depth(session, server.base_url, tokenizer, depth=depth,
-                                             prompt_tokens=prompt_tokens, output_tokens=output_tokens,
-                                             fraction=fraction, seed=base_seed, repetition=repetition)
+            try:
+                observations = [
+                    _measure_depth(session, server.base_url, tokenizer, depth=depth,
+                                   prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+                                   fraction=fraction, seed=base_seed, repetition=repetition)
+                    for repetition in range(repetitions)
+                ]
+            except (RuntimeError, OSError) as failure:  # OSError: server died mid-request
+                print(f"{table.id} d{depth}: FAILED, row left as is: {failure}")
+                failures.append(f"d{depth}: {failure}")
+                continue
+            for observation in observations:
                 if observation.prefill_tokens_per_second is not None:
                     pps.append(observation.prefill_tokens_per_second)
                 if observation.decode_tokens_per_second is not None:
@@ -328,12 +349,21 @@ def run_single(session: Session, table: TableSpec) -> None:
             print(f"{table.id} d{depth}: pp {row.get('pp')} tg {row.get('tg')} acc {row.get('acceptance')}")
     wait_process_exit(server)
     artifact = session.artifact(table, mode=None, command=server.command, notes=[
-        f"pp{prompt_tokens}/tg{output_tokens}; depth is a cached prefix of synthetic text; "
+        f"pp{prompt_tokens}/tg{output_tokens}; depth is a cached conversation prefix of synthetic text "
+        f"({PREFIX_REPLY_TOKENS}-token reply); the measured turn asks for a long continuation; "
         f"tolerance max(32, {fraction:.3%}) on cache_n and prompt_n; actual counts per sample in rows",
         f"synthetic text: {tokenizer.ratio:.3f} tokens/word, template overhead {tokenizer.overhead} tokens",
+        *[f"not measured, {failure}" for failure in failures],
     ])
     artifact["rows"] = rows
-    session.store(artifact_path(cfg, table, session.target), artifact)
+    if rows:
+        session.store(artifact_path(cfg, table, session.target), artifact)
+    if failures:
+        raise SystemExit(f"{table.id}: {len(failures)} depth(s) failed; see the artifact notes")
+
+
+PREFIX_REPLY_TOKENS = 8
+CONTINUATION = "\n\nContinue this text in the same style for at least 500 more words."
 
 
 def _measure_depth(session: Session, base_url: str, tokenizer: Tokenizer, *, depth: int, prompt_tokens: int,
@@ -341,25 +371,30 @@ def _measure_depth(session: Session, base_url: str, tokenizer: Tokenizer, *, dep
     """Time pp/tg after a cached conversation prefix of about `depth` tokens.
 
     Both servers reuse a prior turn's state: the prefix is sent as its own turn
-    (one generated token), and the measured request continues that conversation
-    with a new user turn of about `prompt_tokens` tokens.
+    (a short generated reply), and the measured request continues that
+    conversation with a new user turn of about `prompt_tokens` tokens that asks
+    for a long continuation, so greedy decoding does not stop at EOS before the
+    requested output length on either server.
     """
     new_target = prompt_tokens - tokenizer.overhead
     ratio = tokenizer.ratio
     for attempt in range(4):
         messages: list[dict[str, str]] = []
         if depth > 0:
-            prefix_target = depth - tokenizer.overhead - 1
+            prefix_target = depth - tokenizer.overhead - PREFIX_REPLY_TOKENS
             prefix = synthetic_text(seed + depth, max(1, round(prefix_target / ratio)))
-            reply = session.chat_text(base_url, [{"role": "user", "content": prefix}], 1)
+            reply = session.chat_text(base_url, [{"role": "user", "content": prefix}], PREFIX_REPLY_TOKENS)
             messages = [{"role": "user", "content": prefix}, {"role": "assistant", "content": reply}]
-        new_text = synthetic_text(100_000 + depth * 10 + repetition * 100 + attempt, max(1, round(new_target / ratio)))
+        new_words = max(1, round(new_target / ratio) - len(CONTINUATION.split()))
+        new_text = synthetic_text(100_000 + depth * 10 + repetition * 100 + attempt, new_words) + CONTINUATION
         messages.append({"role": "user", "content": new_text})
         observation = session.request(base_url, new_text, output_tokens, index=attempt, messages=messages)
         if observation.completion_tokens < output_tokens:
             raise RuntimeError(
-                f"depth {depth}: server generated {observation.completion_tokens} of {output_tokens} tokens; "
-                "the context capacity is too small for prefix + prompt + output, raise the table's `context`"
+                f"depth {depth}: server generated {observation.completion_tokens} of {output_tokens} tokens "
+                f"(cache_n {observation.cached_prompt_tokens}, prompt_n {observation.prefill_tokens}); either the "
+                "model stopped at EOS despite the continuation request, or prefix + prompt + output exceed the "
+                "table's `context`"
             )
         cache_ok = abs(observation.cached_prompt_tokens - depth) <= _tolerance(depth, fraction)
         prefill_ok = abs(observation.prefill_tokens - prompt_tokens) <= _tolerance(prompt_tokens, fraction)
@@ -390,6 +425,8 @@ def run_multi(session: Session, table: TableSpec) -> None:
     modes = list(spec.get("modes", ["ar"]))
     if session.target != "gufo":
         modes = [m for m in modes if m == "ar" or cfg.reference_speculative is not None]
+    if session.modes:
+        modes = [m for m in modes if m in session.modes]
     for mode in modes:
         # Reference AR keeps the unsuffixed name; its speculative run is suffixed like Gufo's.
         path = artifact_path(cfg, table, session.target, None if (session.target != "gufo" and mode == "ar") else mode)

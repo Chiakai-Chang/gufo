@@ -1,0 +1,20 @@
+{
+  "sha256": {
+    "Target UD-Q4_K_XL shard 1 of 4": "4448186216b3af4cc558bbce2c3213f01608f8f8b2e5267a9767971dd3ec8082",
+    "Target UD-Q4_K_XL shard 2 of 4": "3f342f1c1580473f1ee94ddd5b28206e8c07a70fa1a366f59d1d6c922919a6c9",
+    "Target UD-Q4_K_XL shard 3 of 4": "56758f40269cad5cd9b0d3d6fbae0f40f6d5be6de49e4ab392dbe83157d9cbd3",
+    "Target UD-Q4_K_XL shard 4 of 4": "753bda48b98ba4f1636134a90a967de1b2d3908a236c026e464777342e53510a",
+    "MTP shared Q8_0": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+  },
+  "sources": {
+    "target": "unsloth/Qwen3.8-Flash-Next-GGUF, revision 38bb39ee97821de2c9009abb7e93950eec396e66, UD-Q4_K_XL (four shards)",
+    "mtp": "unsloth/Qwen3.8-Flash-Next-GGUF, same revision, mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"
+  },
+  "benchmarks-2026-09-22": {
+    "gufo": "revision 89d58eb7 (tree dirty only by docs/models/qwen3.8-flash-next), nix build, binary sha256 prefix 4b1e592acb7e4a56",
+    "reference": "llama.cpp b11069 from flake.nix (0.4.1-dev build 11069, commit 68d9053a), ROCm gfx1151",
+    "mmproj": "not present on the refresh host; image-encoder table not measured",
+    "note": "Depth rows (d4096+) and the 16K-prefix memory row are unmeasured on both targets: the driver's one-token prefix turn makes both servers stop after echoing that token. llama.cpp b11069 cannot load the MTP sidecar as a draft model."
+  },
+  "scope": "Artifacts of the 2026-09-22 HTTP benchmark refresh."
+}

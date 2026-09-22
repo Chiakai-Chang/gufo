@@ -40,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="override each table's repetitions (mean ± sd is reported above 1)")
     run.add_argument("--fresh", action="store_true",
                      help="discard rows of an existing artifact instead of merging into them")
+    run.add_argument("--depths", default=None, help="comma-separated depths to measure in single-user tables")
+    run.add_argument("--mode", action="append", default=[], help="restrict to a mode: ar or the speculative mode")
+    run.add_argument("--context", type=int, default=None,
+                     help="override the single-user tables' context capacity (e.g. to fit a reference server in RAM)")
 
     render = sub.add_parser("render", help="rewrite marked tables in BENCHMARKS.md from artifacts")
     render.add_argument("--table", action="append", default=[])
@@ -121,6 +125,8 @@ def cmd_run(config: BenchConfig, args: argparse.Namespace) -> int:
         fingerprint=fingerprint, log_dir=(args.log_dir if args.log_dir.is_absolute() else root / args.log_dir),
         document=document, todo_only=args.todo, drop_caches=args.drop_caches,
         repetitions=args.repetitions, fresh=args.fresh,
+        depths=[int(d) for d in args.depths.split(",")] if args.depths else None,
+        modes=args.mode or None, context=args.context,
     )
     wanted = _table_ids(args.table)
     tables = [t for t in config.tables() if not wanted or t.id in wanted]

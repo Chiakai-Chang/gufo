@@ -38,9 +38,14 @@ Q4 + Q8 took 2 h 41 min. When the budget cannot hold everything, measure in
 this order and say what was left: Q4 before Q8, single-user AR, single-user
 speculative, concurrency, memory, loading.
 
-Run every driver command in the foreground and wait for it (a long shell
-timeout, or block on its log); a turn that ends while the driver runs does
-not resume by itself. Progress lines are flushed as they happen.
+Driver commands run longer than a tool call may; start each one in the
+background with its output redirected to a log, then block on that log with
+an `until grep -q ... ; do sleep 30; done` loop (repeat the loop when it
+times out) — a turn that ends while the driver runs does not resume by
+itself. Progress lines are flushed as they happen. Before starting, check
+whether the host lets you drop the page cache (`sudo -n true` or `doas -n
+true`); without it the loading table is skipped, so say so up front instead
+of discovering it in the run.
 
 ## Measurement model
 
@@ -75,10 +80,15 @@ cell re-measures that row's pp and tg too); `--fresh` discards the rows of
 an existing artifact instead of merging into them — use it for a full
 refresh so an interrupted run cannot leave mixed-date rows; `--repetitions N`
 overrides every table's repetition count (mean ± sd above 1);
+`--depths 0,4096` restricts single-user tables to those depths and
+`--mode ar` / `--mode <spec>` restricts to one mode (use it to skip a
+reference speculative mode the reference cannot load);
 `--drop-caches "<privileged command>"` gives the loading table its
 page-cache drop (`sync; echo 3 > /proc/sys/vm/drop_caches`) on hosts without
 passwordless sudo/doas; `--config` and `--artifacts-dir` point at an
-alternative `bench.json` and output directory for experiments. A partial
+alternative `bench.json` and output directory for experiments. A depth that
+fails is reported, left as it was, and listed in the artifact notes; the
+other depths are still stored. A partial
 re-run under changed flags updates only the rows it measured; every row
 records the exact server command it ran under. Server logs go to the
 ignored `artifacts/model-bench/`. `render` keeps hand-entered Gufo cells that
@@ -133,9 +143,11 @@ and the table says so.
    stop) is not a result; the driver rejects it and names the table's
    `context` to raise. Run model jobs sequentially; nothing else on the GPU.
 4. Before publishing a speed refresh of unchanged code, run the model's fast
-   correctness suite (for Qwen3.8 27B `nix develop -c python3
-   tools/qwen27b/check.py fast`); the full `EVALUATION.md` suites are for
-   changed kernels or models. Greedy speculative output must match AR token
+   correctness suite when it has one (Qwen3.8 27B: `nix develop -c python3
+   tools/qwen27b/check.py fast`; Qwen3.8-Flash-Next and DeepSeek V4 Flash:
+   none today — say so in the card and rely on the concurrency `Exact`
+   checks); the full `EVALUATION.md` suites are for changed kernels or
+   models. Greedy speculative output must match AR token
    IDs. Concurrency tables compare every completion hash against the Gufo AR
    C1 reference and report the match count (`Exact`); single-user tables
    check token counts only. A mismatch or device fault is not a result.
@@ -195,10 +207,12 @@ model has several quantizations, e.g. `single-ar-q4`):
 2. **Single user, autoregressive** (`single-ar`). pp2048 / tg128, C1, depth
    `0,4096,8192,12288,16384,32768`; add `65536,131072` when the model's
    context allows. Depth `d` is a cached conversation prefix: the driver sends
-   a user turn of about `d` tokens (one generated token as the reply), then
-   the measured request continues that conversation with a new user turn of
-   about 2048 tokens and 128 output tokens; Gufo reuses its prompt snapshot
-   and llama-server its prompt cache (`cache_prompt=true`). Neither server
+   a user turn of about `d` tokens answered with an 8-token generated reply,
+   then the measured request continues that conversation with a new user
+   turn of about 2048 tokens that ends with a request for a long continuation
+   (so greedy decoding does not stop at EOS before 128 output tokens) and 128
+   output tokens; Gufo reuses its prompt snapshot and llama-server its prompt
+   cache (`cache_prompt=true`). Neither server
    exposes a tokenizer endpoint, so the driver calibrates the synthetic text
    (`prefix.generator`, seeded) against each server's reported
    `prompt_n`/`cache_n` and accepts a point only when `cache_n` is within
@@ -214,7 +228,11 @@ model has several quantizations, e.g. `single-ar-q4`):
    llama.cpp runs the same draft file through `--spec-type draft-dflash`,
    `draft-mtp` or `draft-dspark` (`speculative.reference.args` in
    `bench.json`, otherwise llama.cpp's defaults; tune them only when the
-   reference project documents better values, and record the change).
+   reference project documents better values, and record the change). When
+   the pinned llama.cpp cannot load the sidecar (Qwen3.8-Flash-Next MTP with
+   b11069: `check_tensor_dims: tensor 'token_embd.weight' not found`), record
+   the error once, run the reference with `--mode ar`, and leave its
+   speculative cells `TODO`.
    `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance`.
    Both acceptance columns are accepted draft tokens over proposed draft
    tokens as each server reports them; the two drafters propose different

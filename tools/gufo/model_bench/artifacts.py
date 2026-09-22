@@ -79,3 +79,4 @@ def merge_rows(existing: dict[str, Any] | None, fresh: dict[str, Any]) -> dict[s
 
 def save_artifact(path: Path, artifact: dict[str, Any]) -> None:
     atomic_json(path, artifact)
+    path.chmod(0o644)  # tempfile-created artifacts default to 0600
