@@ -171,6 +171,15 @@ Every headline table carries the reference project next to Gufo:
   makes wide tables unreadable. When a cell is `mean ± sd`, Gain uses means.
 - Name the reference in the header (`llama.cpp pp`, `audio.cpp RTF`).
 - `TODO` on either side leaves `Gain` as `TODO`.
+- A reference cell the host cannot produce for hardware reasons — the
+  reference is OOM-killed at the required context, the model does not fit —
+  is `n/a`, not `TODO`. A missing software feature (the reference cannot
+  load a sidecar yet) stays `TODO` with the upstream reference noted, since
+  a newer pin can fill it. Declare `n/a` cells in `docs/models/<model>/artifacts/unavailable.json`
+  (`{"<table id>": {"<row label>" | "*": "<reason>"}}`; the suffix
+  `-speculative` on a concurrency table id targets only its speculative
+  reference column) and state the reason under the table. `render` prints
+  `n/a` there and in the matching Gain cell.
 - When Gufo runs a mode the reference lacks (DFlash2, DSpark, MTP without a
   matching draft), compare against the reference's AR number and label the
   column `Gain vs <ref> AR`.

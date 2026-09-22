@@ -20,12 +20,12 @@ unquantized-model and GGUF-conversion parity remain unqualified.** This
 model has no fast correctness suite; the driver's checks (128 generated
 tokens per single-user sample, MTP completion hashes against the Gufo AR C1
 reference) are the correctness gates of this refresh. Unmeasured cells are
-**TODO**; the reason is stated next to each table.
+**TODO**; cells this host cannot produce for the reference (a hardware
+limit, not a missing feature) are **n/a**, with the reason next to the table.
 
 ## Loading
 
-Cold-file-cache launch to `/ready`, measured 2026-09-22 after
-`sync; echo 3 > /proc/sys/vm/drop_caches`, one launch per server. Gufo loaded
+Cold-file-cache launch to `/ready`. Gufo loaded
 the four shards plus the MTP sidecar with two sessions at context capacity
 262144. llama.cpp loaded the same shards at `-c 35456` (the capacity of its
 depth rows): at `-c 262144` it preallocates the whole KV cache for this
@@ -59,7 +59,7 @@ every depth at context capacity 133760. llama.cpp ran d0–32K at 35456 and
 64K at 68224 because at `-c 133760` its resident set (103.7 GiB of mapped
 weights plus 33 GiB of KV and compute buffers) exceeded the 125 GiB of RAM
 and the kernel OOM-killed it during the 12K prefix; the 128K row is
-therefore **not measurable for llama.cpp on this host** and stays TODO.
+therefore **n/a for llama.cpp on this host**.
 Artifacts: `artifacts/single-ar-gufo.json`, `artifacts/single-ar-reference.json`.
 
 <!-- bench:single-ar -->
@@ -72,18 +72,10 @@ Artifacts: `artifacts/single-ar-gufo.json`, `artifacts/single-ar-reference.json`
 | 16,384 | 1457.16 | 378.65 | +284.8% | 25.20 | 18.96 | +32.9% |
 | 32,768 | 1421.93 | 306.77 | +363.5% | 24.33 | 16.07 | +51.4% |
 | 65,536 | 1304.01 | 224.90 | +479.8% | 23.21 | 11.86 | +95.7% |
-| 131,072 | 1292.02 | TODO | TODO | 21.93 | TODO | TODO |
+| 131,072 | 1292.02 | n/a | n/a | 21.93 | n/a | n/a |
 <!-- /bench -->
 
 ![Single user, autoregressive](artifacts/charts/single-ar.svg)
-
-Gufo prefills **3.3× faster** than llama.cpp at d0 (1628.5 vs 490.3 tok/s)
-and the gap widens with depth to **5.8×** at 64K (1304.0 vs 224.9); Gufo AR
-prefill falls 21% from d0 to d128K. Gufo decodes 18% faster at d0 and
-**96% faster at 64K** (23.2 vs 11.9 tok/s): llama.cpp's decode halves over
-the sweep while Gufo's loses 16%. The first turn of a fresh conversation is
-a prompt-cache miss on Gufo and is a different regime from a cached
-continuation.
 
 ## Single user, MTP
 
@@ -130,7 +122,7 @@ controller is tuned to push hard on this case.
 
 ![Single user, MTP, repetitive](artifacts/charts/single-mtp-repetition.svg)
 
-The llama.cpp column is **TODO**: llama.cpp `b11069` cannot load this MTP
+The llama.cpp columns are **TODO**: llama.cpp `b11069` cannot load this MTP
 sidecar as a draft model. The recorded attempt
 (`llama-server ... --spec-type draft-mtp --spec-draft-model
 mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999`, log
@@ -145,8 +137,10 @@ srv    load_model: failed to load draft model, '.../mtp-Qwen3.8-Flash-Next-share
 srv  llama_server: exiting due to model loading error
 ```
 
-Upstream support for this sidecar is an open pull request; until the pin
-moves, compare MTP against llama.cpp AR by reading the previous table. On
+Upstream support for this shared sidecar is
+[ggml-org/llama.cpp#28243](https://github.com/ggml-org/llama.cpp/pull/28243)
+(open); until the `flake.nix` pin moves past it, compare MTP against
+llama.cpp AR by reading the previous table. On
 generic prose MTP accepts 0.6–1.1 draft tokens per step and decodes
 **32.2 tok/s** at d0 (+24% over Gufo AR) and **26.3 tok/s** at 128K (+20%),
 1.5–2.2× llama.cpp AR at the depths llama.cpp could run. MTP costs 8–12% of
@@ -240,10 +234,9 @@ started was 2.38 GiB and is included in both cells. Artifacts:
 
 ![GPU-visible allocation](artifacts/charts/memory.svg)
 
-llama-server preallocates its KV cache at `-c`, so its footprint would not
-grow with the prefix; Gufo reserves the configured capacity at admission.
-The 16K-prefix row is **TODO** on both sides: it uses the same cached-prefix
-turn as the depth rows and stops after one token (see the AR table).
+llama-server preallocates its KV cache at `-c`, so its footprint barely
+grows with the prefix; Gufo's grows with the retained prompt state. The two
+servers are within 1% of each other at this capacity.
 
 ## Image encoder
 

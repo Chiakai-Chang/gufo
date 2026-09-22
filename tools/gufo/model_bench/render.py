@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import math
 import statistics
@@ -12,6 +13,7 @@ from .artifacts import artifact_path, load_artifact
 from .config import BenchConfig, TableSpec
 
 TODO = "TODO"
+NA = "n/a"  # reference cell that cannot be measured on this host (see artifacts/unavailable.json)
 MARKER_RE = re.compile(
     r"<!-- bench:(?P<id>[\w-]+) -->\n(?P<body>.*?)<!-- /bench -->", re.DOTALL
 )
@@ -62,7 +64,9 @@ def _fmt_stat(row: dict[str, Any] | None, key: str, digits: int = 2, suffix: str
     return text + suffix
 
 
-def gain(gufo: float | None, reference: float | None, better: str) -> str:
+def gain(gufo: float | None, reference: float | None, better: str, unavailable: bool = False) -> str:
+    if unavailable:
+        return NA
     if gufo is None or reference is None or gufo <= 0 or reference <= 0:
         return TODO
     ratio = gufo / reference if better == "higher" else reference / gufo
@@ -250,9 +254,23 @@ def _pick(fresh: str | None, existing: str | None) -> str:
     return existing if existing else TODO
 
 
-def _ref(fresh: str | None) -> str:
+def _ref(fresh: str | None, unavailable: bool = False) -> str:
     """Reference cells come from artifacts only, so layout changes never carry stale values."""
-    return fresh if fresh is not None else TODO
+    if fresh is not None:
+        return fresh
+    return NA if unavailable else TODO
+
+
+def unavailable_rows(config: BenchConfig, table: TableSpec) -> set[str] | None:
+    """Row labels whose reference cells are declared unmeasurable; None for none, {'*'} for all."""
+    path = config.artifacts_dir / "unavailable.json"
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    entry = data.get(table.id) or data.get(table.base)
+    if not entry:
+        return None
+    return set(entry)
 
 
 def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, dict[str, str]] | None) -> str:
@@ -262,42 +280,46 @@ def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, dict
     kind = table.kind
     lines = ["| " + " | ".join(c.header for c in layout.columns) + " |",
              "| " + " | ".join(c.align for c in layout.columns) + " |"]
+    unavailable = unavailable_rows(config, table) or set()
+    spec_unavailable = unavailable_rows(config, TableSpec(table.id, table.base + "-speculative", table.variant, table.spec)) or set()
     for label in layout.rows:
         old = (existing or {}).get(label, {})
         cell = old.get
         fresh = values.get(label, {})
+        na = "*" in unavailable or label in unavailable
+        na_spec = na or "*" in spec_unavailable or label in spec_unavailable
         if kind == "loading" or kind == "memory":
             g = _pick(fresh.get("gufo"), cell("Gufo ready") or cell("Gufo GiB"))
-            r = _ref(fresh.get("reference"))
-            cells = [g, r, gain(_number(g), _number(r), better)]
+            r = _ref(fresh.get("reference"), na)
+            cells = [g, r, gain(_number(g), _number(r), better, r == NA)]
         elif kind == "single" and not table.speculative:
-            gp = _pick(fresh.get("gufo_pp"), cell("Gufo pp")); rp = _ref(fresh.get("ref_pp"))
-            gt = _pick(fresh.get("gufo_tg"), cell("Gufo tg")); rt = _ref(fresh.get("ref_tg"))
-            cells = [gp, rp, gain(_number(gp), _number(rp), better),
-                     gt, rt, gain(_number(gt), _number(rt), better)]
+            gp = _pick(fresh.get("gufo_pp"), cell("Gufo pp")); rp = _ref(fresh.get("ref_pp"), na)
+            gt = _pick(fresh.get("gufo_tg"), cell("Gufo tg")); rt = _ref(fresh.get("ref_tg"), na)
+            cells = [gp, rp, gain(_number(gp), _number(rp), better, rp == NA),
+                     gt, rt, gain(_number(gt), _number(rt), better, rt == NA)]
         elif kind == "single":
             gp = _pick(fresh.get("gufo_pp"), cell("Gufo pp")); gt = _pick(fresh.get("gufo_tg"), cell("Gufo tg"))
             acc = _pick(fresh.get("acceptance"), cell("Gufo accepted/step"))
-            rp = _ref(fresh.get("ref_pp")); rt = _ref(fresh.get("ref_tg"))
+            rp = _ref(fresh.get("ref_pp"), na); rt = _ref(fresh.get("ref_tg"), na)
             if config.reference_speculative:
-                cells = [gp, rp, gain(_number(gp), _number(rp), better),
-                         gt, rt, gain(_number(gt), _number(rt), better),
-                         acc, _ref(fresh.get("ref_acceptance"))]
+                cells = [gp, rp, gain(_number(gp), _number(rp), better, rp == NA),
+                         gt, rt, gain(_number(gt), _number(rt), better, rt == NA),
+                         acc, _ref(fresh.get("ref_acceptance"), na)]
             else:
-                cells = [gp, gt, acc, rt, gain(_number(gt), _number(rt), better)]
+                cells = [gp, gt, acc, rt, gain(_number(gt), _number(rt), better, rt == NA)]
         elif kind == "multi":
-            ga = _pick(fresh.get("gufo_ar"), cell("Gufo AR")); ra = _ref(fresh.get("reference"))
-            gs = _pick(fresh.get("gufo_spec"), cell(f"Gufo {config.speculative['label']}")); ex = _ref(fresh.get("exact"))
-            cells = [ga, ra, gain(_number(ga), _number(ra), better), gs]
+            ga = _pick(fresh.get("gufo_ar"), cell("Gufo AR")); ra = _ref(fresh.get("reference"), na)
+            gs = _pick(fresh.get("gufo_spec"), cell(f"Gufo {config.speculative['label']}")); ex = _ref(fresh.get("exact"), na)
+            cells = [ga, ra, gain(_number(ga), _number(ra), better, ra == NA), gs]
             if config.reference_speculative:
-                rs = _ref(fresh.get("ref_spec"))
-                cells += [rs, gain(_number(gs), _number(rs), better), ex]
+                rs = _ref(fresh.get("ref_spec"), na_spec)
+                cells += [rs, gain(_number(gs), _number(rs), better, rs == NA), ex]
             else:
-                cells += [gain(_number(gs), _number(ra), better), ex]
+                cells += [gain(_number(gs), _number(ra), better, ra == NA), ex]
         elif kind == "image-encoder":
             size = int(label.split("×")[0])
-            g = _pick(fresh.get("gufo"), cell("Gufo ms")); r = _ref(fresh.get("reference"))
-            cells = [str(_merged_tokens(size)), g, r, gain(_number(g), _number(r), better)]
+            g = _pick(fresh.get("gufo"), cell("Gufo ms")); r = _ref(fresh.get("reference"), na)
+            cells = [str(_merged_tokens(size)), g, r, gain(_number(g), _number(r), better, r == NA)]
         else:
             raise SystemExit(f"no renderer for table {table.id}")
         lines.append("| " + " | ".join([label, *cells]) + " |")
