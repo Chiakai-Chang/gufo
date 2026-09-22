@@ -1,34 +1,21 @@
 # Qwen3.8 27B on Strix Halo
 
-Linux x86-64, gfx1151, 128 GB unified memory; Nix release binaries.
-Measured targets: **UD-Q4_K_XL** (16.35 GiB) and **UD-Q8_K_L** (26.12 GiB;
-the unsloth snapshot `4ca72078` ships `Qwen3.8-27B-UD-Q8_K_L.gguf`, so every
-Q8 number below is Q8_K_L, not the Q8_K_XL named in earlier revisions of this
-card). DFlash2 draft: **Q4_K_M** with the **adaptive** controller. Q8_0 and
-BF16 drafts remain supported; a full comparison across context depths is
-**TODO**.
+| | |
+| --- | --- |
+| Host | Linux x86-64, AMD `gfx1151`, 128 GB unified memory |
+| Gufo | `nix build` at revision `1589ed79` (dirty tree), binary SHA-256 `73590c9c12fb…` |
+| Targets | `unsloth/Qwen3.8-27B-GGUF` snapshot `4ca72078`: **UD-Q4_K_XL** (16.35 GiB) and **UD-Q8_K_L** (26.12 GiB; the snapshot ships Q8_K_L, not the Q8_K_XL named in earlier revisions of this card) |
+| Speculative | DFlash2 draft **Q4_K_M** with the **adaptive** controller; Q8_0 and BF16 drafts supported, their depth comparison is **TODO** |
+| Reference | llama.cpp `llama-server` release `b11069` (`0.4.1-dev (build 11069)`), ROCm gfx1151, `LLAMA_HIP_UMA=ON`, from `flake.nix`, same GGUF files and same draft through `--spec-type draft-dflash` |
+| Method | HTTP on both servers, same prompts and timed scope, greedy, thinking off, one sample per point, fresh server per table and concurrency level; `tools/bench/model-bench.py`, 2026-09-21/22. Every artifact records its server command |
+| Gain | Gufo over llama.cpp, positive when Gufo is better |
+| Quality gate | `tools/qwen27b/check.py fast` passed (8/8) on the same build before the refresh |
+| Identities | [`artifacts/model-identities.json`](artifacts/model-identities.json) |
+| Layout | [benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md) |
 
-PNG/JPEG image input uses the matching BF16 projector with AR or DFlash2.
-Native MTP is CLI-only. [Image usage and quality checks](README.md#images).
-
-Reference implementation: **llama.cpp** `llama-server` from this repository's
-`flake.nix` (release `b11069`, reported as `0.4.1-dev (build 11069)`, ROCm,
-gfx1151, `LLAMA_HIP_UMA=ON`, same GGUF files), measured over HTTP with the
-same prompts and timed scope. **Gain** is Gufo over llama.cpp, positive when
-Gufo is better. Layout and method:
-[benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md).
-
-All tables were refreshed **2026-09-21** with `tools/bench/model-bench.py`
-at Gufo revision `1589ed79` (dirty tree, `nix build`, binary SHA-256
-`73590c9c12fb…`), one target at a time, nothing else on the GPU, fresh server
-per table and per concurrency level. Gufo ran
-`gufo serve --sessions N llm --context C --think off --max-pending-per-client 8`
-(plus `--speculative dflash2 --dflash-model` for DFlash2); llama.cpp ran
-`llama-server -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off -np N -c C`
-(plus `--spec-type draft-dflash --spec-draft-model <draft> --spec-draft-ngl 999`
-for DFlash2). Greedy, seed 1, thinking off. `tools/qwen27b/check.py fast`
-passed (8/8) on the same build before the refresh. Unmeasured points are
-**TODO**; the reason is stated next to each table.
+PNG/JPEG image input uses the matching BF16 projector with AR or DFlash2;
+native MTP is CLI-only. [Image usage and quality checks](README.md#images).
+Unmeasured points are **TODO**; the reason is stated next to each table.
 
 ## Loading and continuation
 

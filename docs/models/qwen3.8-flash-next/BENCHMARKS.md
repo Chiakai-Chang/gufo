@@ -1,41 +1,26 @@
 # Qwen3.8-Flash-Next on Strix Halo
 
-Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Production builds with the
-pinned Nix toolchain. Target: `unsloth/Qwen3.8-Flash-Next-GGUF`
-revision `38bb39ee97821de2c9009abb7e93950eec396e66`, **UD-Q4_K_XL** (four
-shards, 103.7 GiB). MTP: `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` from the
-same revision. File hashes and the binary identity are in
-[`artifacts/model-identities.json`](artifacts/model-identities.json).
+| | |
+| --- | --- |
+| Host | Linux x86-64, AMD `gfx1151`, 128 GB unified memory |
+| Gufo | `nix build` at revision `89d58eb7`, binary SHA-256 `4b1e592acb7e4a56…` |
+| Target | `unsloth/Qwen3.8-Flash-Next-GGUF` revision `38bb39ee`, **UD-Q4_K_XL** (four shards, 103.7 GiB) |
+| Speculative | MTP sidecar `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, same revision, adaptive up to 7 proposals |
+| Reference | llama.cpp `llama-server` release `b11069` (`0.4.1-dev (build 11069, commit 68d9053a)`), ROCm gfx1151 from `flake.nix`, same GGUF; cannot load the MTP sidecar |
+| Method | HTTP on both servers, same prompts and timed scope, greedy, thinking off, one sample per point, fresh server per table and concurrency level; `tools/bench/model-bench.py`, 2026-09-22. Every artifact records its server command |
+| Gain | Gufo over llama.cpp, positive when Gufo is better |
+| Identities | [`artifacts/model-identities.json`](artifacts/model-identities.json) |
+| Layout | [benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md) |
 
-Chat follows the official template: thinking on, `xhigh` effort, prior reasoning
-preserved; the benchmarks below run with thinking off. PNG/JPEG input works
-with AR/MTP and `mmproj-BF16.gguf`; see
-[image usage and validation](README.md#images).
-**Original unquantized-model and GGUF-conversion parity remain unqualified.**
-
-Reference implementation: **llama.cpp** `llama-server` from this repository's
-`flake.nix` (release `b11069`, reported as `0.4.1-dev (build 11069, commit
-68d9053a)`, ROCm, gfx1151, same sharded GGUF), measured over HTTP with the
-same prompts and timed scope. **Gain** is Gufo over llama.cpp, positive when
-Gufo is better. Layout and method:
-[benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md).
-
-All tables were refreshed **2026-09-22** with `tools/bench/model-bench.py`
-(`--fresh`) at Gufo revision `89d58eb7` (`nix build`, binary SHA-256
-`4b1e592acb7e4a56…`; the tree was dirty only by this document), one target
-at a time, nothing else on the GPU, fresh server per table and per
-concurrency level. Gufo ran
-`gufo serve --sessions N llm --context C --think off --max-pending-per-client 8`
-(plus `--speculative mtp --mtp-model <mtp>` for MTP); llama.cpp ran
-`llama-server -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off -np N -c C`.
-Greedy, seed 1, one repetition per point. Earlier hand-entered values that
-came from `gufo bench` or from the serving benchmark with a different metric
-were retired rather than kept next to fresh HTTP measurements. This model
-has no fast correctness suite comparable to `tools/qwen27b/check.py fast`;
-the driver's own checks (128 generated tokens per single-user sample, MTP
-completion hashes against the Gufo AR C1 reference) are the only correctness
-gates this refresh ran. Unmeasured cells are **TODO**; the reason is stated
-next to each table.
+Chat follows the official template (thinking on, `xhigh` effort, prior
+reasoning preserved); the benchmarks run with thinking off. PNG/JPEG input
+works with AR/MTP and `mmproj-BF16.gguf`; see
+[image usage and validation](README.md#images). **Original
+unquantized-model and GGUF-conversion parity remain unqualified.** This
+model has no fast correctness suite; the driver's checks (128 generated
+tokens per single-user sample, MTP completion hashes against the Gufo AR C1
+reference) are the correctness gates of this refresh. Unmeasured cells are
+**TODO**; the reason is stated next to each table.
 
 ## Loading
 

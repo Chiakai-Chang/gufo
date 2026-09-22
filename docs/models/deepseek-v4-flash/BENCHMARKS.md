@@ -1,26 +1,19 @@
 # DeepSeek V4 Flash on Strix Halo
 
-Linux x86-64, AMD `gfx1151`, 128 GB unified memory. Nix release binaries.
-`C` is simultaneous requests. Single-user measurements use **pp2048 / tg128**;
-depth is a cached prefix and precedes the measured operation. Unknown current
-measurements are **TODO**.
+| | |
+| --- | --- |
+| Host | Linux x86-64, AMD `gfx1151`, 128 GB unified memory; Nix release binaries |
+| Target | `antirez/deepseek-v4-gguf` revision `1cd7b564`: `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf` (80.76 GiB) |
+| Speculative | DSpark support `DeepSeek-V4-Flash-DSpark-support-0731.gguf`, revision `e7f04037` |
+| Reference | llama.cpp `llama-server` release `b11069`, ROCm gfx1151 from `flake.nix`, same target GGUF and DSpark file through `--spec-type draft-dspark`; all llama.cpp cells are **TODO** until the first HTTP sweep |
+| Method | HTTP on both servers, same prompts and timed scope; single-user tables are **pp2048 / tg128** after a cached prefix of the stated depth; `C` is simultaneous requests |
+| Gain | Gufo over llama.cpp, positive when Gufo is faster |
+| Layout | [benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md) |
 
 **Target parity remains open:** the optimized build misses the historical
 trajectory gate, and four post-prefill differential alerts remain unresolved.
-DSpark replay does not establish target correctness. [Evidence and limits](EVALUATION.md).
-
-Target: `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`
-(80.76 GiB), `antirez/deepseek-v4-gguf` revision
-`1cd7b564460821938add0475a60b942c409295e0`. DSpark support:
-`DeepSeek-V4-Flash-DSpark-support-0731.gguf`, revision
-`e7f04037032990db0346398d249baf9fb9df1ccc`.
-
-Reference implementation: **llama.cpp** `llama-server` from this repository's
-`flake.nix` (ROCm, gfx1151, same target GGUF), measured over HTTP with the
-same prompts and timed scope; llama.cpp runs the same DSpark support file
-through `--spec-type draft-dspark`. **Gain** is Gufo over llama.cpp, positive
-when Gufo is faster. All llama.cpp cells are **TODO** until the first HTTP sweep.
-Layout and method: [benchmark-model skill](../../../.agents/skills/benchmark-model/SKILL.md).
+DSpark replay does not establish target correctness.
+[Evidence and limits](EVALUATION.md). Unknown current measurements are **TODO**.
 
 ## Loading
 
