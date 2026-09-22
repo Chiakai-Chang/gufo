@@ -59,6 +59,34 @@
             '';
           });
 
+      # llama.cpp built from the open Qwen3.8-Flash-Next MTP pull request
+      # (ggml-org/llama.cpp#28243), exposed as `llama-server-mtp` next to the
+      # release build so only the sidecar-dependent cells use it. Drop this
+      # once the release pin includes the merged change.
+      llamaCppMtpCommit = "6fcaa16f4b360649933a54d1f91ad40ed35c0e11";
+      llamaCppMtp = system:
+        (llamaCpp system).overrideAttrs (oldAttrs: {
+          pname = "llama-cpp-mtp";
+          version = "11069"; # LLAMA_BUILD_NUMBER must be numeric; the PR branch is based near b11069
+          src = pkgs.${system}.fetchFromGitHub {
+            owner = "danielhanchen";
+            repo = "llama.cpp";
+            rev = llamaCppMtpCommit;
+            hash = "sha256-YgIkYHiV1LNA1OvTcB8SSdOeqr37+cEFAOQjEBfXcK4=";
+            leaveDotGit = true;
+          };
+          npmDepsHash = "sha256-2Q7XhaLAArmviOLdQsNbYTfdyDE5pW9lR26cRHEVl9k=";
+          cmakeFlags = builtins.filter (f: !(pkgs.${system}.lib.hasPrefix "-DLLAMA_BUILD_COMMIT" f)) (oldAttrs.cmakeFlags or [ ]) ++ [
+            "-DLLAMA_BUILD_COMMIT:STRING=${builtins.substring 0 8 llamaCppMtpCommit}"
+          ];
+        });
+      llamaCppMtpBin = system:
+        pkgs.${system}.runCommand "llama-cpp-mtp-bin" { } ''
+          mkdir -p $out/bin
+          ln -s ${llamaCppMtp system}/bin/llama-server $out/bin/llama-server-mtp
+          ln -s ${llamaCppMtp system}/bin/llama-bench $out/bin/llama-bench-mtp
+        '';
+
       alexnetWeights = system:
         pkgs.${system}.fetchurl {
           url = "https://download.pytorch.org/models/alexnet-owt-7be5be79.pth";
@@ -163,6 +191,7 @@
               pkgs.${system}.sqlite
               # Benchmark comparison baselines (see .agents/skills/benchmark-model).
               (llamaCpp system)
+              (llamaCppMtpBin system)
               audio-cpp.packages.${system}.rocm-gfx1151
             ];
             env = {

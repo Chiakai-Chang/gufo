@@ -40,7 +40,8 @@
         "{mtp}",
         "--spec-draft-ngl",
         "999"
-      ]
+      ],
+      "server": "llama-server-mtp"
     }
   },
   "tables": {

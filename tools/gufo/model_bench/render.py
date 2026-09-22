@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import math
-import statistics
 from dataclasses import dataclass
 from typing import Any
 
@@ -165,13 +163,19 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
         gufo_spec = load_artifact(artifact_path(config, table, "gufo", mode))
         reference = load_artifact(artifact_path(config, table, "reference"))
         ref_spec = load_artifact(artifact_path(config, table, "reference", mode))
+        def rate(report: dict[str, Any] | None, users: int) -> str | None:
+            value = _serving_rate(report, users)
+            return None if value is None else _fmt(value)
+
         for users in table.spec["concurrency"]:
             values[str(users)] = {
-                "gufo_ar": _fmt(_serving_rate(gufo_ar, users)) if gufo_ar else None,
-                "reference": _fmt(_serving_rate(reference, users)) if reference else None,
-                "gufo_spec": _fmt(_serving_rate(gufo_spec, users)) if gufo_spec else None,
-                "ref_spec": _fmt(_serving_rate(ref_spec, users)) if ref_spec else None,
+                "gufo_ar": rate(gufo_ar, users),
+                "reference": rate(reference, users),
+                "gufo_spec": rate(gufo_spec, users),
+                "ref_spec": rate(ref_spec, users),
                 "exact": _serving_exact(reference, users) if reference else None,
+                "ref_unavailable": _serving_unavailable(reference, users),
+                "ref_spec_unavailable": _serving_unavailable(ref_spec, users),
             }
         return values
 
@@ -198,6 +202,7 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
                 "acceptance": _fmt_stat(g, "accepted_per_step", 2),
                 "ref_pp": _fmt_stat(r, "pp"), "ref_tg": _fmt_stat(r, "tg"),
                 "ref_acceptance": _fmt_stat(r, "accepted_per_step", 2),
+                "ref_unavailable": bool(r and r.get("unavailable")),
             }
     elif kind == "memory":
         for workload in table.spec["workloads"]:
@@ -213,34 +218,28 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
 
 
 def _serving_rate(report: dict[str, Any] | None, users: int) -> float | None:
+    """Aggregate delivered output tok/s: output tokens over the sum of measured round spans."""
     if report is None:
         return None
     result = report.get("results", {}).get(f"c{users}")
-    if result is None:
+    if result is None or "unavailable" in result:
         return None
-    # Report the sum of individual decode rates in each simultaneous group,
-    # then average groups. Queue/prefill latency stays in the raw artifact.
-    samples = result.get("samples", [])
-    sums = []
-    offset = 0
-    for group in result.get("rounds", []):
-        count = group.get("sampleCount", 0)
-        rows = samples[offset:offset + count]
-        offset += count
-        rates = [row.get("decode_tokens_per_second") for row in rows]
-        if count != users or len(rates) != count or any(
-                rate is None or not math.isfinite(rate) or rate < 0 for rate in rates):
-            return None
-        sums.append(sum(rates))
-    if offset != len(samples) or not sums:
-        return None
-    return statistics.fmean(sums)
+    return result["aggregate"]["output_tokens_per_second"]["overall"]
+
+
+def _serving_unavailable(report: dict[str, Any] | None, users: int) -> bool:
+    if report is None:
+        return False
+    result = report.get("results", {}).get(f"c{users}")
+    return bool(result and result.get("unavailable"))
 
 
 def _serving_exact(report: dict[str, Any] | None, users: int) -> str | None:
     if report is None:
         return None
     result = report.get("results", {}).get(f"c{users}")
+    if result and "unavailable" in result:
+        return None
     exactness = (result or {}).get("completionExactness")
     if not isinstance(exactness, dict):
         return None
@@ -286,8 +285,8 @@ def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, dict
         old = (existing or {}).get(label, {})
         cell = old.get
         fresh = values.get(label, {})
-        na = "*" in unavailable or label in unavailable
-        na_spec = na or "*" in spec_unavailable or label in spec_unavailable
+        na = "*" in unavailable or label in unavailable or bool(fresh.get("ref_unavailable"))
+        na_spec = na or "*" in spec_unavailable or label in spec_unavailable or bool(fresh.get("ref_spec_unavailable"))
         if kind == "loading" or kind == "memory":
             g = _pick(fresh.get("gufo"), cell("Gufo ready") or cell("Gufo GiB"))
             r = _ref(fresh.get("reference"), na)
@@ -360,9 +359,10 @@ def multi_summary(config: BenchConfig) -> list[str]:
             report = load_artifact(artifact_path(config, table, target, suffix))
             if report is None:
                 continue
-            top = max((int(k[1:]) for k in report.get("results", {})), default=None)
-            if top is None:
+            measured = [int(k[1:]) for k, v in report.get("results", {}).items() if "unavailable" not in v]
+            if not measured:
                 continue
+            top = max(measured)
             result = report["results"][f"c{top}"]
             latency = result.get("latency", {}).get("request_ms", {})
             spec = result.get("speculative") or {}

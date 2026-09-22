@@ -80,6 +80,10 @@ cell re-measures that row's pp and tg too); `--fresh` discards the rows of
 an existing artifact instead of merging into them — use it for a full
 refresh so an interrupted run cannot leave mixed-date rows; `--repetitions N`
 overrides every table's repetition count (mean ± sd above 1);
+When a reference server is killed mid-table (SIGKILL is the kernel OOM
+killer on this host), the driver marks that row and every deeper depth or
+larger concurrency `unavailable` in the artifact and `render` shows `n/a`
+for them, since they are a host limit rather than missing work.
 `--depths 0,4096` restricts single-user tables to those depths and
 `--mode ar` / `--mode <spec>` restricts to one mode (use it to skip a
 reference speculative mode the reference cannot load);
@@ -247,8 +251,12 @@ model has several quantizations, e.g. `single-ar-q4`):
    `bench.json`, otherwise llama.cpp's defaults; tune them only when the
    reference project documents better values, and record the change). When
    the pinned llama.cpp cannot load the sidecar (Qwen3.8-Flash-Next MTP with
-   b11069: `check_tensor_dims: tensor 'token_embd.weight' not found`), record
-   the error once, run the reference with `--mode ar`, and leave its
+   b11069: `check_tensor_dims: tensor 'token_embd.weight' not found`),
+   `speculative.reference.server` in `bench.json` can name a parallel build
+   for the speculative cells only — `flake.nix` exposes `llama-server-mtp`
+   from the open ggml-org/llama.cpp#28243 branch — and the card must say the
+   speculative reference comes from that branch. Without such a build,
+   record the error once, run the reference with `--mode ar`, and leave its
    speculative cells `TODO`.
    `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step`.
    `accepted/step` is the mean number of accepted draft tokens per
@@ -282,20 +290,19 @@ model has several quantizations, e.g. `single-ar-q4`):
    stored per row. llama-server preallocates its KV cache, so its footprint
    does not grow with the prefix; say so under the table.
    `Workload | Gufo GiB | llama.cpp GiB | Gain`.
-6. **Image encoder** (`image-encoder`, vision models only). Warm encode
-   latency for 256×256 and 1024×1024 RGB through the chat endpoint with the
-   BF16 projector, isolated from language prefill via `usage.gufo` stages.
-   Reference: `llama-server --mmproj` with the same file; whole-request wall
-   when it reports no encode stage.
+6. **Image encoder** (`image-encoder`, vision models only). Prefill time
+   (`prompt_ms`) of a chat request with one 256×256 or 1024×1024 gradient PNG
+   and a one-line text turn, `max_tokens` 1, no prompt cache, one warm-up and
+   three timed samples, both servers loading the same BF16 projector. The
+   time covers the projector encode plus the prefill of the image and text
+   tokens; the encode alone is not separable over HTTP.
    `RGB image | Merged tokens | Gufo ms | llama.cpp ms | Gain`.
 
 Concurrency artifacts are `gufo-serving-bench` corpus reports named
 `<table>-gufo-ar.json`, `<table>-gufo-<spec>.json`, `<table>-reference.json`
 (llama.cpp AR) and `<table>-reference-<spec>.json`;
 the other tables use the compact `model-bench-table` schema with one entry per
-row and the actual `cache_n`/`prompt_n` counts. The image-encoder table is not
-automated yet; leave its cells `TODO` or fill them by hand from a documented
-measurement.
+row and the actual `cache_n`/`prompt_n` counts.
 
 ## ASR (audio to text)
 

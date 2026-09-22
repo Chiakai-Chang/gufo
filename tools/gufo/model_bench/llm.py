@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import functools
 import json
+import struct
+import zlib
 import random
 import statistics
 import subprocess
@@ -103,17 +106,27 @@ class Session:
                    "--context", str(context), "--served-model-name", MODEL_ALIAS,
                    *cfg.data["gufo"].get("llm", [])]
         if table.kind == "image-encoder":
-            command += ["--mmproj", str(cfg.file("mmproj", table.variant))]
+            command += ["--mmproj", str(cfg.file("mmproj", table.variant)), "--max-request-bytes", str(64 << 20)]
         if mode and mode != "ar":
             command += cfg.substitute(cfg.speculative["gufo_args"], table.variant)
         return command
 
+    def reference_binary_for(self, mode: str | None) -> str:
+        """The reference executable; a speculative mode may name its own build."""
+        if mode and mode != "ar":
+            override = self.config.speculative.get("reference", {}).get("server")
+            if override:
+                return override
+        return self.reference_binary
+
     def reference_command(self, table: TableSpec, *, mode: str | None, context: int, parallel: int, port: int) -> list[str]:
         cfg = self.config
         gguf = cfg.file("gguf", table.variant)
-        command = [self.reference_binary, "-m", str(gguf), "-c", str(context), "-np", str(parallel),
+        command = [self.reference_binary_for(mode), "-m", str(gguf), "-c", str(context), "-np", str(parallel),
                    "--port", str(port), "--host", "127.0.0.1", "--alias", MODEL_ALIAS,
                    *cfg.data["reference"]["args"]]
+        if table.kind == "image-encoder":
+            command += ["--mmproj", str(cfg.file("mmproj", table.variant))]
         if mode and mode != "ar":
             args = cfg.reference_speculative
             if args is None:
@@ -132,18 +145,20 @@ class Session:
         placeholder.command = command
         return placeholder
 
-    def reference_version(self) -> str | None:
+    def reference_version(self, mode: str | None = None) -> str | None:
         if self.target != "reference":
             return None
-        if not hasattr(self, "_reference_version"):
-            completed = subprocess.run([self.reference_binary, "--version"], capture_output=True, text=True)
+        binary = self.reference_binary_for(mode)
+        cache = self.__dict__.setdefault("_reference_versions", {})
+        if binary not in cache:
+            completed = subprocess.run([binary, "--version"], capture_output=True, text=True)
             lines = (completed.stdout + completed.stderr).splitlines()
             versions = [line.strip() for line in lines if line.strip().startswith("version:")]
-            self._reference_version = versions[0] if versions else "version unknown"
-        return self._reference_version
+            cache[binary] = f"{binary} {versions[0] if versions else 'version unknown'}"
+        return cache[binary]
 
     def artifact(self, table: TableSpec, *, mode: str | None, command: list[str], notes: list[str]) -> dict[str, Any]:
-        version = self.reference_version()
+        version = self.reference_version(mode)
         if version:
             notes = [f"{self.config.reference_name}: {version}", *notes]
         return new_artifact(self.config, table, self.target, mode=mode, command=command,
@@ -155,13 +170,14 @@ class Session:
         print(f"artifact: {path}")
 
     def request(self, base_url: str, prompt: str, max_tokens: int, *, index: int = 0,
-                messages: list[dict[str, str]] | None = None) -> RequestObservation:
+                messages: list[dict[str, Any]] | None = None,
+                cache_prompt: bool | None = "default") -> RequestObservation:  # type: ignore[assignment]
         return run_request(
             base_url=base_url, model=MODEL_ALIAS, prompt=prompt, max_tokens=max_tokens,
             temperature=float(self.config.data["sampling"]["temperature"]),
             timeout_seconds=REQUEST_TIMEOUT, client_id=CLIENT_ID, concurrency=1,
             repetition=1, request_index=index, endpoint_profile=self.profile,
-            cache_prompt=self.cache_prompt, messages=messages,
+            cache_prompt=self.cache_prompt if cache_prompt == "default" else cache_prompt, messages=messages,
         )
 
     def chat_text(self, base_url: str, messages: list[dict[str, str]], max_tokens: int) -> str:
@@ -328,6 +344,17 @@ def run_single(session: Session, table: TableSpec) -> None:
                     for repetition in range(repetitions)
                 ]
             except (RuntimeError, OSError) as failure:  # OSError: server died mid-request
+                exit_code = server.process.poll() if server.process else None
+                if exit_code is not None:
+                    # The server was killed (SIGKILL = the kernel OOM killer on this host):
+                    # this depth and every deeper one are unmeasurable here, not TODO.
+                    reason = (f"server exited with {exit_code} while measuring d{depth} "
+                              f"(context {context}); {'OOM-killed' if exit_code == -9 else 'crashed'}")
+                    for remaining in keys[keys.index(depth):]:
+                        rows[str(remaining)] = {"unavailable": reason}
+                        print(f"{table.id} d{remaining}: n/a, {reason}")
+                    failures.append(reason)
+                    break
                 print(f"{table.id} d{depth}: FAILED, row left as is: {failure}")
                 failures.append(f"d{depth}: {failure}")
                 continue
@@ -359,7 +386,7 @@ def run_single(session: Session, table: TableSpec) -> None:
             rows[str(depth)] = row
             print(f"{table.id} d{depth}: pp {row.get('pp')} tg {row.get('tg')} accepted/step {row.get('accepted_per_step')}")
     wait_process_exit(server)
-    artifact = session.artifact(table, mode=None, command=server.command, notes=[
+    artifact = session.artifact(table, mode=(mode if table.speculative else None), command=server.command, notes=[
         f"pp{prompt_tokens}/tg{output_tokens}; depth is a cached conversation prefix of synthetic text "
         f"({PREFIX_REPLY_TOKENS}-token reply); measured turn task: {spec.get('workload', 'prose')}; "
         f"tolerance max(32, {fraction:.3%}) on cache_n and prompt_n; actual counts per sample in rows",
@@ -465,8 +492,9 @@ def run_multi(session: Session, table: TableSpec) -> None:
             context = int(spec["context"])
             server = session.server(table, mode=mode, context=context if session.target == "gufo" else context * users,
                                     sessions=users, tag=f"{mode or 'ref'}-c{users}")
-            with server:
-                report = run_corpus_benchmark(
+            try:
+                with server:
+                    report = run_corpus_benchmark(
                     base_url=server.base_url, model=MODEL_ALIAS, cases=cases,
                     workload_id=f"{cfg.model}-{table.id}-{session.target}-{mode}",
                     max_tokens=int(spec["output_tokens"]),
@@ -478,9 +506,25 @@ def run_multi(session: Session, table: TableSpec) -> None:
                     corpus_layout=spec.get("corpus_layout", "distinct"), endpoint_profile=session.profile,
                     cache_prompt=False if not spec.get("cache_prompt", False) else None,
                     reference=reference,
-                    notes=[note for note in (session.reference_version(), " ".join(public_command(server.command)),
+                    notes=[note for note in (session.reference_version(mode), " ".join(public_command(server.command)),
                                              "fresh server per concurrency level") if note],
-                )
+                    )
+            except (RuntimeError, OSError) as failure:
+                exit_code = server.process.poll() if server.process else None
+                wait_process_exit(server)
+                if exit_code is None:
+                    raise
+                # Killed mid-cohort (SIGKILL = the kernel OOM killer): this level and the
+                # larger ones are unmeasurable on this host.
+                reason = f"server exited with {exit_code} at C{users}; {'OOM-killed' if exit_code == -9 else 'crashed'}"
+                combined = combined or {"artifactType": "model-bench-unavailable", "results": {}}
+                for remaining in keys[keys.index(users):]:
+                    combined.setdefault("results", {})[f"c{remaining}"] = {"unavailable": reason}
+                    print(f"{table.id} {session.target} {mode} C{remaining}: n/a, {reason}")
+                combined["modelBench"] = {"table": table.id, "target": session.target, "mode": mode,
+                                          "measuredOn": dt.date.today().isoformat()}
+                save_artifact(path, combined)
+                break
             wait_process_exit(server)
             if combined is None or combined.get("artifactType") != report.get("artifactType"):
                 combined = report
@@ -557,8 +601,65 @@ def run_memory(session: Session, table: TableSpec) -> None:
     session.store(artifact_path(cfg, table, session.target), artifact)
 
 
+def _png(size: int, seed: int) -> bytes:
+    """A deterministic RGB gradient PNG (compresses well, differs per seed)."""
+    def chunk(kind: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+    rows = bytearray()
+    for y in range(size):
+        rows.append(0)  # filter: none
+        for x in range(size):
+            rows += bytes((((x + seed) * 255 // size) & 0xFF, ((y + 3 * seed) * 255 // size) & 0xFF,
+                           ((x ^ y) + 7 * seed) & 0xFF))
+    header = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(bytes(rows), 6)) + chunk(b"IEND", b"")
+
+
 def run_image_encoder(session: Session, table: TableSpec) -> None:
-    print(f"{table.id}: skipped; image-encoder measurement is not implemented yet, cells stay TODO")
+    """Prefill time of a request carrying one image: encoder plus the image tokens' prefill.
+
+    Both servers are timed on the same scope (`prompt_ms` of the request); the
+    projector's encode alone is not separable over HTTP.
+    """
+    cfg = session.config
+    spec = table.spec
+    cfg.require_files(table.variant)
+    cfg.file("mmproj", table.variant)
+    sizes = [int(v) for v in spec["sizes"]]
+    keys = _selected_rows(session, table, {v: f"{v}×{v}" for v in sizes})
+    if not keys:
+        print(f"{table.id}: nothing to do")
+        return
+    warmup = int(spec.get("warmup", 1))
+    repetitions = session.reps(spec, int(spec.get("repetitions", 3)))
+    context = session.context or int(spec.get("context", 8192))
+    server = session.server(table, mode="ar", context=context, sessions=1, tag="image")
+    rows: dict[str, Any] = {}
+    with server:
+        for size in keys:
+            samples: list[float] = []
+            tokens: list[int] = []
+            for index in range(warmup + repetitions):
+                image = base64.b64encode(_png(size, index)).decode("ascii")
+                messages = [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image}"}},
+                    {"type": "text", "text": "Describe this image in one word."}]}]
+                observation = session.request(server.base_url, "", 1, index=index, messages=messages, cache_prompt=False)
+                if index >= warmup and observation.prefill_ms is not None:
+                    samples.append(observation.prefill_ms)
+                    tokens.append(observation.prefill_tokens)
+            mean, sd = _mean_sd(samples)
+            rows[str(size)] = {"ms": round(mean, 1), "ms_sd": None if sd is None else round(sd, 1),
+                               "prompt_n": tokens, "samples": len(samples),
+                               "command": " ".join(public_command(server.command))}
+            print(f"{table.id} {size}×{size}: {mean:.1f} ms prefill ({tokens[0]} prompt tokens)")
+    wait_process_exit(server)
+    artifact = session.artifact(table, mode=None, command=server.command, notes=[
+        "prompt_ms of a request with one gradient PNG and a one-line text turn, max_tokens 1, cache_prompt=false, "
+        f"{warmup} warm-up then {repetitions} timed samples per size; includes the projector encode and the "
+        "prefill of the image and text tokens on both servers"])
+    artifact["rows"] = rows
+    session.store(artifact_path(cfg, table, session.target), artifact)
 
 
 RUNNERS = {

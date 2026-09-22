@@ -6,7 +6,7 @@
 | Gufo | `nix build` at revision `89d58eb7`, binary SHA-256 `4b1e592acb7e4a56…` |
 | Target | `unsloth/Qwen3.8-Flash-Next-GGUF` revision `38bb39ee`, **UD-Q4_K_XL** (four shards, 103.7 GiB) |
 | Speculative | MTP sidecar `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, same revision, adaptive up to 7 proposals |
-| Reference | llama.cpp `llama-server` release `b11069` (`0.4.1-dev (build 11069, commit 68d9053a)`), ROCm gfx1151 from `flake.nix`, same GGUF; cannot load the MTP sidecar |
+| Reference | llama.cpp `llama-server` release `b11069` (`0.4.1-dev (build 11069, commit 68d9053a)`), ROCm gfx1151 from `flake.nix`, same GGUF. MTP cells use `llama-server-mtp`, the same build recipe on the open [ggml-org/llama.cpp#28243](https://github.com/ggml-org/llama.cpp/pull/28243) branch (commit `6fcaa16f`), because the release cannot load the shared MTP sidecar |
 | Method | HTTP on both servers, same prompts and timed scope, greedy, thinking off, one sample per point, fresh server per table and concurrency level; `tools/bench/model-bench.py`, 2026-09-22. Every artifact records its server command |
 | Gain | Gufo over llama.cpp, positive when Gufo is better |
 | Identities | [`artifacts/model-identities.json`](artifacts/model-identities.json) |
@@ -90,14 +90,14 @@ Artifact: `artifacts/single-mtp-gufo.json`.
 <!-- bench:single-mtp -->
 | Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1438.69 | TODO | TODO | 32.18 | TODO | TODO | 0.64 | TODO |
-| 4,096 | 1304.23 | TODO | TODO | 33.45 | TODO | TODO | 0.97 | TODO |
-| 8,192 | 1324.72 | TODO | TODO | 33.32 | TODO | TODO | 0.91 | TODO |
-| 12,288 | 1317.14 | TODO | TODO | 34.06 | TODO | TODO | 1.06 | TODO |
-| 16,384 | 1298.17 | TODO | TODO | 33.09 | TODO | TODO | 0.94 | TODO |
-| 32,768 | 1278.93 | TODO | TODO | 28.70 | TODO | TODO | 0.71 | TODO |
-| 65,536 | 1176.17 | TODO | TODO | 28.69 | TODO | TODO | 1.13 | TODO |
-| 131,072 | 1191.27 | TODO | TODO | 26.31 | TODO | TODO | 1.06 | TODO |
+| 0 | 1438.69 | 444.77 | +223.5% | 32.18 | 31.58 | +1.9% | 0.64 | 1.46 |
+| 4,096 | 1304.23 | 418.21 | +211.9% | 33.45 | 30.12 | +11.1% | 0.97 | 1.46 |
+| 8,192 | 1324.72 | n/a | n/a | 33.32 | n/a | n/a | 0.91 | n/a |
+| 12,288 | 1317.14 | n/a | n/a | 34.06 | n/a | n/a | 1.06 | n/a |
+| 16,384 | 1298.17 | n/a | n/a | 33.09 | n/a | n/a | 0.94 | n/a |
+| 32,768 | 1278.93 | n/a | n/a | 28.70 | n/a | n/a | 0.71 | n/a |
+| 65,536 | 1176.17 | n/a | n/a | 28.69 | n/a | n/a | 1.13 | n/a |
+| 131,072 | 1191.27 | n/a | n/a | 26.31 | n/a | n/a | 1.06 | n/a |
 <!-- /bench -->
 
 ![Single user, MTP](artifacts/charts/single-mtp.svg)
@@ -110,43 +110,37 @@ controller is tuned to push hard on this case.
 <!-- bench:single-mtp-repetition -->
 | Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1605.30 | TODO | TODO | 59.39 | TODO | TODO | 3.74 | TODO |
-| 4,096 | 1509.49 | TODO | TODO | 48.07 | TODO | TODO | 2.28 | TODO |
-| 8,192 | 1472.04 | TODO | TODO | 50.19 | TODO | TODO | 2.46 | TODO |
-| 12,288 | 1451.29 | TODO | TODO | 40.07 | TODO | TODO | 1.17 | TODO |
-| 16,384 | 1429.19 | TODO | TODO | 50.57 | TODO | TODO | 2.76 | TODO |
-| 32,768 | 1389.83 | TODO | TODO | 45.25 | TODO | TODO | 2.56 | TODO |
-| 65,536 | 1202.92 | TODO | TODO | 37.23 | TODO | TODO | 2.28 | TODO |
-| 131,072 | 1272.39 | TODO | TODO | 39.20 | TODO | TODO | 2.46 | TODO |
+| 0 | 1605.30 | 459.03 | +249.7% | 59.39 | 44.00 | +35.0% | 3.74 | 2.66 |
+| 4,096 | 1509.49 | 415.97 | +262.9% | 48.07 | 45.88 | +4.8% | 2.28 | 2.66 |
+| 8,192 | 1472.04 | 388.24 | +279.2% | 50.19 | 37.01 | +35.6% | 2.46 | 2.76 |
+| 12,288 | 1451.29 | n/a | n/a | 40.07 | n/a | n/a | 1.17 | n/a |
+| 16,384 | 1429.19 | n/a | n/a | 50.57 | n/a | n/a | 2.76 | n/a |
+| 32,768 | 1389.83 | n/a | n/a | 45.25 | n/a | n/a | 2.56 | n/a |
+| 65,536 | 1202.92 | n/a | n/a | 37.23 | n/a | n/a | 2.28 | n/a |
+| 131,072 | 1272.39 | n/a | n/a | 39.20 | n/a | n/a | 2.46 | n/a |
 <!-- /bench -->
 
 ![Single user, MTP, repetitive](artifacts/charts/single-mtp-repetition.svg)
 
-The llama.cpp columns are **TODO**: llama.cpp `b11069` cannot load this MTP
-sidecar as a draft model. The recorded attempt
-(`llama-server ... --spec-type draft-mtp --spec-draft-model
-mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999`, log
-`artifacts/model-bench/single-mtp-reference-single.log`) exits with:
-
-```text
-common_speculative_init_result: loading draft model '.../mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf'
-llama_model_load: error loading model: check_tensor_dims: tensor 'token_embd.weight' not found
-llama_model_load_from_file_impl: failed to load model
-common_speculative_init_result: failed to load draft model, '.../mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf'
-srv    load_model: failed to load draft model, '.../mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf'
-srv  llama_server: exiting due to model loading error
-```
-
-Upstream support for this shared sidecar is
+The llama.cpp MTP columns come from **`llama-server-mtp`**, built in
+`flake.nix` from the open pull request
 [ggml-org/llama.cpp#28243](https://github.com/ggml-org/llama.cpp/pull/28243)
-(open); until the `flake.nix` pin moves past it, compare MTP against
-llama.cpp AR by reading the previous table. On
-generic prose MTP accepts 0.6–1.1 draft tokens per step and decodes
-**32.2 tok/s** at d0 (+24% over Gufo AR) and **26.3 tok/s** at 128K (+20%),
-1.5–2.2× llama.cpp AR at the depths llama.cpp could run. MTP costs 8–12% of
-prefill throughput. On the repetitive workload MTP accepts 2.3–3.7 draft
-tokens per step and decodes **59.4 tok/s** at d0 and **39.2 tok/s** at
-128K, 2.3× / 1.8× Gufo AR.
+(commit `6fcaa16f`, same ROCm build recipe as the release): release `b11069`
+rejects the shared sidecar (`check_tensor_dims: tensor 'token_embd.weight'
+not found`). Replace it with the release pin once the change is merged.
+With the MTP draft loaded, llama.cpp's resident set exceeds the host's RAM
+from the 12K prefix on (the kernel OOM-kills it at `-c 35456`), so the
+deeper rows are **n/a** for llama.cpp on this host; a d8192 prose sample
+that completed under swap pressure (1.66 tok/s) is excluded.
+
+On generic prose Gufo MTP accepts 0.6–1.1 draft tokens per step and decodes
+**32.2 tok/s** at d0 (+24% over Gufo AR) and **26.3 tok/s** at 128K (+20%);
+llama.cpp MTP accepts 1.46 per step and decodes 31.6 / 30.1 tok/s at d0 /
+4K, so the two are within 2–11% where both run. MTP costs Gufo 8–12% of
+prefill throughput. On the repetitive workload Gufo MTP accepts 2.3–3.7 per
+step and decodes **59.4 tok/s** at d0 and **39.2 tok/s** at 128K (2.3× /
+1.8× Gufo AR); llama.cpp MTP reaches 44–46 tok/s at d0–4K with 2.7 per
+step, so Gufo leads by 5–36% on the shared depths.
 
 `gufo bench` controls (CLI, raw prefix, not HTTP; 2026-09-21): sampled MTP at
 d0, seed 1, tg128, top-k/top-p/min-p disabled:
@@ -174,11 +168,11 @@ Artifacts: `artifacts/multi-<table>-gufo-ar.json`, `-gufo-mtp.json`,
 <!-- bench:multi-repetition -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo MTP | llama.cpp MTP | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 27.05 | 22.82 | +18.5% | 86.30 | TODO | TODO | 1/1 |
-| 2 | 46.23 | 41.19 | +12.2% | 132.99 | TODO | TODO | 2/2 |
-| 4 | 76.55 | 66.37 | +15.3% | 173.25 | TODO | TODO | 4/4 |
-| 6 | 96.12 | 79.58 | +20.8% | 190.48 | TODO | TODO | 6/6 |
-| 8 | 110.51 | 86.38 | +27.9% | 199.02 | TODO | TODO | 8/8 |
+| 1 | 26.10 | 21.42 | +21.8% | 76.86 | 44.98 | +70.9% | 1/1 |
+| 2 | 43.38 | 38.34 | +13.1% | 113.15 | 69.55 | +62.7% | 2/2 |
+| 4 | 68.94 | 60.78 | +13.4% | 138.82 | 79.81 | +73.9% | 4/4 |
+| 6 | 83.87 | 72.91 | +15.0% | 145.07 | 91.03 | +59.4% | 6/6 |
+| 8 | 94.19 | 78.45 | +20.1% | 145.43 | n/a | n/a | 8/8 |
 <!-- /bench -->
 
 ![Multiple users, repetition](artifacts/charts/multi-repetition.svg)
@@ -186,18 +180,21 @@ Artifacts: `artifacts/multi-<table>-gufo-ar.json`, `-gufo-mtp.json`,
 <!-- bench:multi-mixed -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo MTP | llama.cpp MTP | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 26.84 | 22.88 | +17.3% | 47.91 | TODO | TODO | 1/3 |
-| 2 | 42.92 | 37.05 | +15.8% | 71.26 | TODO | TODO | 2/4 |
-| 4 | 63.86 | 58.56 | +9.1% | 97.54 | TODO | TODO | 2/4 |
-| 6 | 80.82 | 70.62 | +14.4% | 112.20 | TODO | TODO | 4/6 |
-| 8 | 89.74 | 79.88 | +12.3% | 122.77 | TODO | TODO | 3/8 |
+| 1 | 25.87 | 21.56 | +20.0% | 44.66 | 38.94 | +14.7% | 1/3 |
+| 2 | 40.43 | 33.88 | +19.3% | 62.66 | 50.89 | +23.1% | 2/4 |
+| 4 | 58.41 | 51.80 | +12.8% | 84.97 | 53.16 | +59.8% | 2/4 |
+| 6 | 71.69 | 61.49 | +16.6% | 91.29 | n/a | n/a | 4/6 |
+| 8 | 78.30 | 67.49 | +16.0% | 95.43 | n/a | n/a | 3/8 |
 <!-- /bench -->
 
 ![Multiple users, mixed corpus](artifacts/charts/multi-mixed.svg)
 
-The llama.cpp MTP column is TODO for the reason given under the single-user
-MTP table (the driver's `draft-mtp` launch fails after the AR rows; log
-`artifacts/model-bench/multi-<table>-reference-mtp-c1.log`).
+The llama.cpp MTP column uses `llama-server-mtp` (see the single-user MTP
+table). It is OOM-killed at C8 on `repetition` and from C6 on `mixed`
+(`-c 4096·C` plus the draft exceed the host's RAM), so those cells are
+**n/a**. Where both run, Gufo MTP delivers +59…+74% on `repetition` and
++15…+60% on `mixed` (Gufo 1.4–4.3 accepted per step vs llama.cpp 2.4–2.9;
+Gufo AR alone is +13…+22% over llama.cpp AR).
 
 Gufo honours `cache_prompt=false`: all twenty Gufo cohorts and all ten
 llama.cpp cohorts report **zero prompt-cache hits** (`render` prints
@@ -240,17 +237,20 @@ servers are within 1% of each other at this capacity.
 
 ## Image encoder
 
-Warm `mmproj-BF16.gguf` encoding; excludes preprocessing, first weight upload
-and language-model prefill. The Gufo cells are hand measurements from
-2026-09-20 (`usage.gufo` stage times); the driver does not automate this
-table yet, and the refresh host had no projector file, so the llama.cpp
-`--mmproj` column stays **TODO**.
+Prefill time (`prompt_ms`) of a chat request carrying one gradient PNG and
+a one-line text turn, `max_tokens` 1, `cache_prompt=false`, one warm-up then
+three timed samples per size (mean ± sd), both servers loading
+`mmproj-BF16.gguf` (Gufo `--mmproj`, llama.cpp `--mmproj`). The time covers
+the projector encode plus the prefill of the 64 / 1024 image tokens and the
+text tokens (85 / 1045 prompt tokens on both servers); the encode alone is
+not separable over HTTP, so the earlier hand-measured encode-only figures
+(21.3 ms / 1249 ms, 2026-09-20) are superseded and not comparable.
 
 <!-- bench:image-encoder -->
 | RGB image | Merged tokens | Gufo ms | llama.cpp ms | Gain |
 | --- | ---: | ---: | ---: | ---: |
-| 256×256 | 64 | 21.3 | TODO | TODO |
-| 1024×1024 | 1024 | 1249 | TODO | TODO |
+| 256×256 | 64 | 253.9 ± 26.7 | 636.5 ± 106.6 | +150.7% |
+| 1024×1024 | 1024 | 2078.6 ± 104.3 | 3212.2 ± 5.5 | +54.5% |
 <!-- /bench -->
 
 ![Image encoder](artifacts/charts/image-encoder.svg)

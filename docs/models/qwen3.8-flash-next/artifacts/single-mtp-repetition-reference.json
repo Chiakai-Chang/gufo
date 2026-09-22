@@ -1,0 +1,158 @@
+{
+  "artifactType": "model-bench-table",
+  "fingerprint": {
+    "canonical": {
+      "cppStandard": "C++20",
+      "cpuArchitecture": "x86_64",
+      "cpuLogicalCores": 32,
+      "cpuModel": "AMD RYZEN AI MAX+ 395 w/ Radeon 8060S",
+      "cpuPhysicalCores": 16,
+      "cxxCompiler": "GCC 15.3.0",
+      "gpuArchitecture": "gfx1151",
+      "gpuComputeUnits": 20,
+      "gpuDriver": "amdgpu",
+      "gpuName": "AMD Radeon 8060S Graphics",
+      "gpuPciId": "1002:1586",
+      "kernelRelease": "7.1.8",
+      "memoryTotalBytes": 134309879808,
+      "memoryType": "LPDDR5X (Unified)",
+      "rocmVersion": "7.2.3",
+      "schemaVersion": "1.0.0"
+    },
+    "fingerprintId": "34bee0c70b5847b76a43f2c6da016bafed74530bff113cc4ffc5f43f21fe2f96",
+    "schemaVersion": "1.0.0"
+  },
+  "measuredOn": "2026-09-22",
+  "mode": "mtp",
+  "model": {
+    "id": "Qwen3.8-Flash-Next",
+    "variant": null
+  },
+  "notes": [
+    "llama.cpp: llama-server-mtp version: 0.4.1-dev (build 11069, commit 6fcaa16f)",
+    "pp2048/tg128; depth is a cached conversation prefix of synthetic text (8-token reply); measured turn task: repetition; tolerance max(32, 0.500%) on cache_n and prompt_n; actual counts per sample in rows",
+    "synthetic text: 1.160 tokens/word, template overhead 12 tokens",
+    "server exited with -9 while measuring d12288 (context 35456); OOM-killed; deeper rows are n/a on this host"
+  ],
+  "referenceName": "llama.cpp",
+  "rows": {
+    "0": {
+      "acceptance": 93.94,
+      "acceptance_sd": null,
+      "accepted_per_step": 2.66,
+      "accepted_per_step_sd": null,
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 42971 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 0,
+          "draft_n": 99,
+          "draft_n_accepted": 93,
+          "predicted_n": 128,
+          "prompt_n": 2034
+        }
+      ],
+      "pp": 459.03,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 44.0,
+      "tg_sd": null
+    },
+    "12288": {
+      "unavailable": "server exited with -9 while measuring d12288 (context 35456); OOM-killed"
+    },
+    "131072": {
+      "unavailable": "server exited with -9 while measuring d12288 (context 35456); OOM-killed"
+    },
+    "16384": {
+      "unavailable": "server exited with -9 while measuring d12288 (context 35456); OOM-killed"
+    },
+    "32768": {
+      "unavailable": "server exited with -9 while measuring d12288 (context 35456); OOM-killed"
+    },
+    "4096": {
+      "acceptance": 92.08,
+      "acceptance_sd": null,
+      "accepted_per_step": 2.66,
+      "accepted_per_step_sd": null,
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 42971 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 4095,
+          "draft_n": 101,
+          "draft_n_accepted": 93,
+          "predicted_n": 128,
+          "prompt_n": 2039
+        }
+      ],
+      "pp": 415.97,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 45.88,
+      "tg_sd": null
+    },
+    "65536": {
+      "unavailable": "server exited with -9 while measuring d12288 (context 35456); OOM-killed"
+    },
+    "8192": {
+      "acceptance": 95.92,
+      "acceptance_sd": null,
+      "accepted_per_step": 2.76,
+      "accepted_per_step_sd": null,
+      "command": "llama-server-mtp -m Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf -c 35456 -np 1 --port 42971 --host 127.0.0.1 --alias bench -ngl 999 -fa on --cache-reuse 0 --jinja --reasoning off --spec-type draft-mtp --spec-draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --spec-draft-ngl 999",
+      "counts": [
+        {
+          "cache_n": 8188,
+          "draft_n": 98,
+          "draft_n_accepted": 94,
+          "predicted_n": 128,
+          "prompt_n": 2043
+        }
+      ],
+      "pp": 388.24,
+      "pp_sd": null,
+      "samples": 1,
+      "tg": 37.01,
+      "tg_sd": null
+    }
+  },
+  "schemaVersion": 1,
+  "server": {
+    "command": [
+      "llama-server-mtp",
+      "-m",
+      "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+      "-c",
+      "35456",
+      "-np",
+      "1",
+      "--port",
+      "42971",
+      "--host",
+      "127.0.0.1",
+      "--alias",
+      "bench",
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "--cache-reuse",
+      "0",
+      "--jinja",
+      "--reasoning",
+      "off",
+      "--spec-type",
+      "draft-mtp",
+      "--spec-draft-model",
+      "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+      "--spec-draft-ngl",
+      "999"
+    ]
+  },
+  "source": {
+    "buildMode": "nix-release",
+    "dirty": true,
+    "revision": "9d739bde42e299c43b7f47376a4941c533ad660c"
+  },
+  "table": "single-mtp-repetition",
+  "target": "reference"
+}
