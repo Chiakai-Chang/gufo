@@ -115,53 +115,87 @@ prompts, depths and context capacity as the autoregressive table, one warmed
 sample per point. llama.cpp `b11069` runs the same draft through
 `--spec-type draft-dflash --spec-draft-model <draft> --spec-draft-ngl 999`
 with its default draft parameters, so the reference column is a real DFlash2
-comparison. Each acceptance column is that server's accepted/proposed draft
-ratio; the two drafters propose different block lengths, so compare tg and
-read acceptance as a diagnostic. The 64K and 128K rows were measured in a
-later pass at context 133760.
+comparison. `accepted/step` is the mean number of accepted draft tokens per
+verification step (`draft_n_accepted / (predicted_n − draft_n_accepted)`);
+tokens per step is this plus one, so it is proportional to the speculative
+speedup and, unlike an acceptance rate, does not reward a controller for
+proposing less. The measured turn asks for a detailed summary and a story,
+so the generated text is ordinary prose; the repetitive workload has its own
+table. The 64K and 128K rows were measured at context 133760.
 Artifacts: `artifacts/single-dflash2-{q4,q8}-{gufo,reference}.json`.
 
 <!-- bench:single-dflash2-q4 -->
-| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance |
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 544.51 | 314.59 | +73.1% | 23.38 | 27.11 | -13.8% | 43.1% | 66.1% |
-| 4,096 | 519.67 | 292.45 | +77.7% | 28.67 | 26.64 | +7.6% | 48.7% | 66.1% |
-| 8,192 | 508.39 | 282.76 | +79.8% | 22.43 | 22.44 | -0.0% | 41.4% | 53.1% |
-| 12,288 | 459.28 | 271.08 | +69.4% | 21.72 | 22.20 | -2.2% | 41.9% | 52.4% |
-| 16,384 | 438.24 | 261.57 | +67.5% | 20.37 | 21.45 | -5.0% | 40.8% | 51.0% |
-| 32,768 | 397.08 | 224.52 | +76.9% | 15.86 | 20.54 | -22.8% | 40.2% | 52.4% |
-| 65,536 | 344.28 | 177.98 | +93.4% | 8.42 | 19.81 | -57.5% | 41.8% | 58.7% |
-| 131,072 | 244.44 | 131.01 | +86.6% | 4.13 | 15.34 | -73.1% | 41.3% | 53.8% |
+| 0 | 596.64 | 317.38 | +88.0% | 21.97 | 23.41 | -6.2% | 1.72 | 1.51 |
+| 4,096 | 555.70 | 298.19 | +86.4% | 25.48 | 23.03 | +10.6% | 1.91 | 1.51 |
+| 8,192 | 537.88 | 284.44 | +89.1% | 24.18 | 21.76 | +11.1% | 1.98 | 1.42 |
+| 12,288 | 521.47 | 272.58 | +91.3% | 21.46 | 22.66 | -5.3% | 1.72 | 1.61 |
+| 16,384 | 499.96 | 260.16 | +92.2% | 20.34 | 21.87 | -7.0% | 1.72 | 1.51 |
+| 32,768 | 440.44 | 224.69 | +96.0% | 15.10 | 18.77 | -19.6% | 1.51 | 1.29 |
+| 65,536 | 338.23 | 177.90 | +90.1% | 8.84 | 18.32 | -51.7% | 2.05 | 1.51 |
+| 131,072 | 258.41 | 126.64 | +104.1% | 4.38 | 14.16 | -69.1% | 2.12 | 1.37 |
 <!-- /bench -->
 
 ![Single user, DFlash2](artifacts/charts/single-dflash2-q4.svg)
 
-<!-- bench:single-dflash2-q8 -->
-| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance |
+Repetitive workload (**TODO**, pending the 27B DFlash2 changes in progress):
+same prefixes and depths, the measured turn asks the model to repeat the
+passage word for word, so the output is fully predictable — the single-user
+analogue of the `repetition` corpus below.
+
+<!-- bench:single-dflash2-repetition-q4 -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 573.39 | 304.51 | +88.3% | 21.38 | 19.14 | +11.7% | 40.4% | 62.1% |
-| 4,096 | 544.16 | 283.14 | +92.2% | 17.84 | 19.78 | -9.8% | 30.4% | 65.6% |
-| 8,192 | 531.90 | 272.09 | +95.5% | 17.07 | 17.58 | -2.9% | 32.5% | 56.0% |
-| 12,288 | 482.49 | 263.16 | +83.3% | 17.11 | 16.32 | +4.8% | 35.6% | 50.0% |
-| 16,384 | 461.23 | 253.07 | +82.3% | 14.69 | 16.14 | -9.0% | 29.1% | 51.0% |
-| 32,768 | 413.87 | 219.24 | +88.8% | 12.27 | 16.37 | -25.0% | 32.5% | 55.2% |
-| 65,536 | 344.08 | 174.21 | +97.5% | 6.19 | 15.43 | -59.9% | 31.7% | 58.8% |
-| 131,072 | 246.69 | 129.05 | +91.2% | 3.21 | 12.93 | -75.2% | 32.3% | 55.2% |
+| 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
+
+<!-- bench:single-dflash2-q8 -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 558.66 | 302.75 | +84.5% | 15.29 | 17.21 | -11.2% | 1.56 | 1.51 |
+| 4,096 | 534.82 | 279.73 | +91.2% | 16.78 | 17.72 | -5.3% | 1.67 | 1.61 |
+| 8,192 | 511.24 | 268.09 | +90.7% | 13.40 | 17.51 | -23.5% | 1.21 | 1.61 |
+| 12,288 | 504.53 | 258.92 | +94.9% | 14.93 | 14.84 | +0.6% | 1.61 | 1.25 |
+| 16,384 | 486.49 | 251.53 | +93.4% | 13.88 | 15.79 | -12.1% | 1.51 | 1.42 |
+| 32,768 | 428.83 | 216.95 | +97.7% | 11.04 | 18.26 | -39.5% | 1.46 | 1.91 |
+| 65,536 | 333.39 | 172.91 | +92.8% | 6.32 | 14.20 | -55.5% | 1.91 | 1.46 |
+| 131,072 | 256.23 | 123.84 | +106.9% | 2.98 | 12.74 | -76.6% | 1.61 | 1.56 |
 <!-- /bench -->
 
 ![Single user, DFlash2](artifacts/charts/single-dflash2-q8.svg)
 
-On this synthetic prose the adaptive controller accepts 40–49% (Q4) and
-29–40% (Q8) of proposals; Gufo DFlash2 generation is within ±14% of
-llama.cpp up to 16K and falls behind by 23–25% at 32K. Beyond that Gufo's
-speculative decode collapses: 8.4 / 4.1 tok/s (Q4) and 6.2 / 3.2 tok/s
+
+
+<!-- bench:single-dflash2-repetition-q8 -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
+
+On generic prose Gufo accepts **more draft tokens per step than llama.cpp**
+at every depth (Q4 1.5–2.1 vs 1.3–1.6; Q8 1.4–1.9 vs 1.2–1.5), yet its
+DFlash2 decode is only within ±11% of llama.cpp up to 16K, falls behind by
+20% at 32K and collapses beyond: 8.8 / 4.4 tok/s (Q4) and 6.3 / 3.0 tok/s
 (Q8) at 64K / 128K, **slower than Gufo AR at the same depth** (9.3 / 7.4 and
-6.4 / 5.4), while llama.cpp DFlash2 holds 19.8 / 15.3 and 15.4 / 12.9 with
-54–59% acceptance. Gufo's acceptance stays flat, so the loss is in the
-per-step cost of verification at depth, not in the draft quality. Greedy
-DFlash2 output matches AR token IDs (verified by the concurrency `Exact`
-checks below at C1). Natural prompts have different acceptance and speed;
-the repetitive corpus below accepts 100%.
+6.4 / 5.4), while llama.cpp DFlash2 holds 18.3 / 14.2 and 15.4 / 12.9. With
+draft quality equal or better, the loss is entirely in the per-step cost of
+verification at depth. Greedy DFlash2 output matches AR token IDs (verified
+by the concurrency `Exact` checks below at C1).
 
 Draft-precision control, **2026-09-16**: cached `prose_tides`, **tg64**,
 adaptive, greedy C1, one warmed release sample per draft. Generation tok/s:
@@ -203,11 +237,11 @@ completions reach 128 tokens.
 <!-- bench:multi-mixed-q4 -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo DFlash2 | llama.cpp DFlash2 | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 11.50 | 11.81 | -2.6% | 29.05 | 23.80 | +22.1% | 3/9 |
-| 2 | 20.45 | 19.96 | +2.5% | 34.77 | 29.39 | +18.3% | 5/10 |
-| 4 | 37.10 | 33.50 | +10.7% | 41.98 | 49.91 | -15.9% | 8/12 |
-| 6 | 50.37 | 32.75 | +53.8% | 44.18 | 46.45 | -4.9% | 8/12 |
-| 8 | 61.40 | 32.21 | +90.6% | 47.61 | 43.88 | +8.5% | 11/16 |
+| 1 | 11.76 | 12.22 | -3.8% | 33.99 | 26.55 | +28.0% | 3/9 |
+| 2 | 22.99 | 22.65 | +1.5% | 47.29 | 36.33 | +30.2% | 5/10 |
+| 4 | 41.96 | 38.69 | +8.5% | 55.55 | 71.42 | -22.2% | 8/12 |
+| 6 | 57.43 | 39.23 | +46.4% | 63.01 | 68.03 | -7.4% | 8/12 |
+| 8 | 69.62 | 39.34 | +77.0% | 64.28 | 67.87 | -5.3% | 11/16 |
 <!-- /bench -->
 
 ![Multiple users, mixed corpus](artifacts/charts/multi-mixed-q4.svg)
@@ -215,11 +249,11 @@ completions reach 128 tokens.
 <!-- bench:multi-repetition-q4 -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo DFlash2 | llama.cpp DFlash2 | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 11.84 | 11.78 | +0.5% | 65.98 | 33.04 | +99.7% | 1/1 |
-| 2 | 23.02 | 21.40 | +7.6% | 89.12 | 42.46 | +109.9% | 2/2 |
-| 4 | 41.93 | 35.92 | +16.7% | 97.04 | 79.15 | +22.6% | 4/4 |
-| 6 | 56.88 | 41.76 | +36.2% | 96.94 | 81.90 | +18.4% | 6/6 |
-| 8 | 67.84 | 42.95 | +58.0% | 101.14 | 93.84 | +7.8% | 8/8 |
+| 1 | 11.84 | 12.20 | -3.0% | 66.10 | 37.00 | +78.6% | 1/1 |
+| 2 | 23.04 | 22.46 | +2.6% | 89.32 | 47.09 | +89.7% | 2/2 |
+| 4 | 41.97 | 38.32 | +9.5% | 97.26 | 92.76 | +4.9% | 4/4 |
+| 6 | 56.96 | 44.74 | +27.3% | 97.16 | 95.00 | +2.3% | 6/6 |
+| 8 | 67.94 | 46.02 | +47.6% | 101.37 | 110.97 | -8.7% | 8/8 |
 <!-- /bench -->
 
 ![Multiple users, repetition](artifacts/charts/multi-repetition-q4.svg)
@@ -227,9 +261,9 @@ completions reach 128 tokens.
 Q4 at C8, request latency median / p95: Gufo AR 15.0 / 15.2 s, Gufo DFlash2
 14.6 / 19.4 s, llama.cpp AR 28.9 / 28.9 s, llama.cpp DFlash2 17.4 / 21.4 s
 (mixed); Gufo AR 15.3 s, Gufo DFlash2 10.4 s, llama.cpp AR 23.8 s, llama.cpp
-DFlash2 10.9 s (repetition, all requests identical). Gufo DFlash2 acceptance
-is 49.6–54.2% on the mixed corpus and 100% on repetition at every
-concurrency; llama.cpp accepts 60–64% on mixed. The mixed `Exact` counts show
+DFlash2 10.9 s (repetition, all requests identical). Accepted draft tokens
+per step at C8: Gufo DFlash2 2.5 on mixed and 6.1 on repetition, llama.cpp
+DFlash2 1.9 and 2.9 (`render` prints them per artifact). The mixed `Exact` counts show
 that llama.cpp's greedy text diverges from Gufo's in most distinct cases
 (3 of 9 identical at C1), so those throughputs compare equal token budgets,
 not identical outputs. Gufo AR scales to 1.9× llama.cpp at C8; Gufo DFlash2
@@ -241,11 +275,11 @@ corpus, and above C4 delivers less than Gufo AR, so the **100 tok/s at C2 /
 <!-- bench:multi-mixed-q8 -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo DFlash2 | llama.cpp DFlash2 | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 7.40 | 7.86 | -5.9% | 22.17 | 17.66 | +25.5% | 4/9 |
-| 2 | 14.02 | 13.75 | +2.0% | 29.33 | 26.25 | +11.7% | 6/10 |
-| 4 | 26.68 | 24.70 | +8.0% | 33.03 | 41.61 | -20.6% | 4/12 |
-| 6 | 37.64 | 26.23 | +43.5% | 34.87 | 37.50 | -7.0% | 3/12 |
-| 8 | 47.70 | 30.90 | +54.4% | 37.06 | 39.35 | -5.8% | 4/16 |
+| 1 | 7.50 | 8.07 | -7.1% | 25.82 | 19.58 | +31.9% | 4/9 |
+| 2 | 15.62 | 15.41 | +1.4% | 39.70 | 33.56 | +18.3% | 6/10 |
+| 4 | 29.62 | 28.06 | +5.6% | 42.66 | 57.86 | -26.3% | 4/12 |
+| 6 | 42.56 | 32.21 | +32.1% | 48.12 | 53.69 | -10.4% | 3/12 |
+| 8 | 53.93 | 39.02 | +38.2% | 50.53 | 64.29 | -21.4% | 4/16 |
 <!-- /bench -->
 
 ![Multiple users, mixed corpus](artifacts/charts/multi-mixed-q8.svg)
@@ -253,11 +287,11 @@ corpus, and above C4 delivers less than Gufo AR, so the **100 tok/s at C2 /
 <!-- bench:multi-repetition-q8 -->
 | Users | Gufo AR | llama.cpp AR | Gain | Gufo DFlash2 | llama.cpp DFlash2 | Gain | Exact |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 7.50 | 7.85 | -4.5% | 53.65 | 24.62 | +117.9% | 1/1 |
-| 2 | 15.66 | 14.82 | +5.7% | 79.44 | 40.95 | +94.0% | 2/2 |
-| 4 | 29.82 | 26.46 | +12.7% | 85.72 | 66.94 | +28.1% | 4/4 |
-| 6 | 42.19 | 35.07 | +20.3% | 88.62 | 69.40 | +27.7% | 6/6 |
-| 8 | 53.19 | 40.65 | +30.8% | 90.30 | 80.57 | +12.1% | 8/8 |
+| 1 | 7.50 | 8.06 | -6.9% | 53.73 | 27.08 | +98.4% | 1/1 |
+| 2 | 15.67 | 15.32 | +2.3% | 79.61 | 45.49 | +75.0% | 2/2 |
+| 4 | 29.84 | 27.79 | +7.4% | 85.90 | 76.78 | +11.9% | 4/4 |
+| 6 | 42.24 | 37.21 | +13.5% | 88.80 | 79.04 | +12.3% | 6/6 |
+| 8 | 53.25 | 43.52 | +22.4% | 90.49 | 93.44 | -3.2% | 8/8 |
 <!-- /bench -->
 
 ![Multiple users, repetition](artifacts/charts/multi-repetition-q8.svg)
@@ -265,8 +299,8 @@ corpus, and above C4 delivers less than Gufo AR, so the **100 tok/s at C2 /
 Q8 at C8, request latency median / p95: Gufo AR 19.2 / 19.4 s, Gufo DFlash2
 18.3 / 25.2 s, llama.cpp AR 24.9 / 35.5 s, llama.cpp DFlash2 17.0 / 23.6 s
 (mixed); Gufo AR 19.3 s, Gufo DFlash2 11.3 s, llama.cpp AR 25.2 s, llama.cpp
-DFlash2 12.7 s (repetition). Gufo DFlash2 acceptance is 40.7–44.7% on mixed
-and 100% on repetition; llama.cpp accepts 59–64% on mixed. Q8 follows the Q4
+DFlash2 12.7 s (repetition). Accepted draft tokens per step at C8: Gufo
+DFlash2 2.4 on mixed and 6.5 on repetition, llama.cpp DFlash2 1.8 and 2.9. Q8 follows the Q4
 pattern with lower absolute rates: Gufo AR leads from C2, Gufo DFlash2 trails
 llama.cpp DFlash2 at C4–C8 on mixed prompts.
 

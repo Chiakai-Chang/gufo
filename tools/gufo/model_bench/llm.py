@@ -321,13 +321,15 @@ def run_single(session: Session, table: TableSpec) -> None:
                 observations = [
                     _measure_depth(session, server.base_url, tokenizer, depth=depth,
                                    prompt_tokens=prompt_tokens, output_tokens=output_tokens,
-                                   fraction=fraction, seed=base_seed, repetition=repetition)
+                                   fraction=fraction, seed=base_seed, repetition=repetition,
+                                   task=spec.get("workload", "prose"))
                     for repetition in range(repetitions)
                 ]
             except (RuntimeError, OSError) as failure:  # OSError: server died mid-request
                 print(f"{table.id} d{depth}: FAILED, row left as is: {failure}")
                 failures.append(f"d{depth}: {failure}")
                 continue
+            per_step: list[float] = []
             for observation in observations:
                 if observation.prefill_tokens_per_second is not None:
                     pps.append(observation.prefill_tokens_per_second)
@@ -335,22 +337,29 @@ def run_single(session: Session, table: TableSpec) -> None:
                     tgs.append(observation.decode_tokens_per_second)
                 if observation.draft_acceptance is not None:
                     accepts.append(observation.draft_acceptance * 100.0)
+                accepted = observation.draft_accepted_tokens
+                # Every verification step yields the accepted draft tokens plus one
+                # target token, so steps = completion - accepted.
+                if observation.draft_tokens > 0 and observation.completion_tokens > accepted:
+                    per_step.append(accepted / (observation.completion_tokens - accepted))
                 counts.append({"cache_n": observation.cached_prompt_tokens,
                                "prompt_n": observation.prefill_tokens,
-                               "predicted_n": observation.completion_tokens})
+                               "predicted_n": observation.completion_tokens,
+                               "draft_n": observation.draft_tokens,
+                               "draft_n_accepted": accepted})
             row: dict[str, Any] = {"counts": counts, "samples": repetitions,
                                    "command": " ".join(public_command(server.command))}
-            for name, values in (("pp", pps), ("tg", tgs), ("acceptance", accepts)):
+            for name, values in (("pp", pps), ("tg", tgs), ("acceptance", accepts), ("accepted_per_step", per_step)):
                 if values:
                     mean, sd = _mean_sd(values)
                     row[name] = round(mean, 2)
                     row[f"{name}_sd"] = None if sd is None else round(sd, 2)
             rows[str(depth)] = row
-            print(f"{table.id} d{depth}: pp {row.get('pp')} tg {row.get('tg')} acc {row.get('acceptance')}")
+            print(f"{table.id} d{depth}: pp {row.get('pp')} tg {row.get('tg')} accepted/step {row.get('accepted_per_step')}")
     wait_process_exit(server)
     artifact = session.artifact(table, mode=None, command=server.command, notes=[
         f"pp{prompt_tokens}/tg{output_tokens}; depth is a cached conversation prefix of synthetic text "
-        f"({PREFIX_REPLY_TOKENS}-token reply); the measured turn asks for a long continuation; "
+        f"({PREFIX_REPLY_TOKENS}-token reply); measured turn task: {spec.get('workload', 'prose')}; "
         f"tolerance max(32, {fraction:.3%}) on cache_n and prompt_n; actual counts per sample in rows",
         f"synthetic text: {tokenizer.ratio:.3f} tokens/word, template overhead {tokenizer.overhead} tokens",
         *[f"not measured, {failure}" for failure in failures],
@@ -363,18 +372,29 @@ def run_single(session: Session, table: TableSpec) -> None:
 
 
 PREFIX_REPLY_TOKENS = 8
-CONTINUATION = "\n\nContinue this text in the same style for at least 500 more words."
+# Asks for natural prose (not a continuation of the synthetic word salad) so the
+# generated tokens resemble real use and speculative drafting is representative;
+# the length request keeps greedy decoding from stopping at EOS before tg128.
+TASKS = {
+    # Generic prose: what a drafter sees in ordinary chat.
+    "prose": ("\n\nSummarize the passage above in detail, then write a short story inspired by it. "
+              "Write at least 500 words."),
+    # Fully predictable output: the single-user analogue of the `repetition` corpus.
+    "repetition": "\n\nRepeat the passage above word for word, from the beginning.",
+}
 
 
 def _measure_depth(session: Session, base_url: str, tokenizer: Tokenizer, *, depth: int, prompt_tokens: int,
-                   output_tokens: int, fraction: float, seed: int, repetition: int) -> RequestObservation:
+                   output_tokens: int, fraction: float, seed: int, repetition: int,
+                   task: str = "prose") -> RequestObservation:
     """Time pp/tg after a cached conversation prefix of about `depth` tokens.
 
     Both servers reuse a prior turn's state: the prefix is sent as its own turn
     (a short generated reply), and the measured request continues that
     conversation with a new user turn of about `prompt_tokens` tokens that asks
-    for a long continuation, so greedy decoding does not stop at EOS before the
-    requested output length on either server.
+    for a long natural-prose answer, so greedy decoding does not stop at EOS
+    before the requested output length on either server and the generated
+    text is representative for speculative drafting.
     """
     new_target = prompt_tokens - tokenizer.overhead
     ratio = tokenizer.ratio
@@ -385,8 +405,9 @@ def _measure_depth(session: Session, base_url: str, tokenizer: Tokenizer, *, dep
             prefix = synthetic_text(seed + depth, max(1, round(prefix_target / ratio)))
             reply = session.chat_text(base_url, [{"role": "user", "content": prefix}], PREFIX_REPLY_TOKENS)
             messages = [{"role": "user", "content": prefix}, {"role": "assistant", "content": reply}]
-        new_words = max(1, round(new_target / ratio) - len(CONTINUATION.split()))
-        new_text = synthetic_text(100_000 + depth * 10 + repetition * 100 + attempt, new_words) + CONTINUATION
+        instruction = TASKS[task]
+        new_words = max(1, round(new_target / ratio) - len(instruction.split()))
+        new_text = synthetic_text(100_000 + depth * 10 + repetition * 100 + attempt, new_words) + instruction
         messages.append({"role": "user", "content": new_text})
         observation = session.request(base_url, new_text, output_tokens, index=attempt, messages=messages)
         if observation.completion_tokens < output_tokens:

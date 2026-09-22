@@ -66,7 +66,7 @@ DSpark prefill includes support-state work. The reference column is
 llama.cpp with the same DSpark support file (`draft-dspark`).
 
 <!-- bench:single-dspark -->
-| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance |
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | 453.49 ± 25.96 | TODO | TODO | 17.45 ± 0.00 | TODO | TODO | TODO | TODO |
 | 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
@@ -79,6 +79,23 @@ llama.cpp with the same DSpark support file (`draft-dspark`).
 <!-- /bench -->
 
 ![Single user, DSpark](artifacts/charts/single-dspark.svg)
+
+Repetitive workload (**TODO**): same prefixes and depths, the measured turn
+asks the model to repeat the passage word for word, so the output is fully
+predictable — the single-user analogue of the `repetition` corpus below.
+
+<!-- bench:single-dspark-repetition -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
 
 The CLI uses a repeating token sequence. Natural prompts can have substantially
 different acceptance and speed. Depth-zero generation starts from 16 tokens;

@@ -223,8 +223,16 @@ model has several quantizations, e.g. `single-ar-q4`):
    prompt-cache miss on Gufo and decodes measurably slower than a cached
    continuation; d0 is therefore a different regime from d4096+, not noise.
    `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain`.
-3. **Single user, speculative** (`single-<spec>`, DFlash2 / DSpark / MTP as
-   the model supports). Same grid plus `Acceptance` from `usage.gufo`.
+3. **Single user, speculative** (`single-<spec>` and
+   `single-<spec>-repetition`, DFlash2 / DSpark / MTP as the model supports).
+   Same grid plus accepted draft tokens per step from each server's
+   usage/timings. Two workloads, because speculative decoding depends on the
+   output: the measured turn of `single-<spec>` asks for a detailed summary
+   and a story (generic prose, `workload: prose`); `single-<spec>-repetition`
+   asks the model to repeat the passage word for word (fully predictable
+   output, `workload: repetition`, the single-user analogue of the
+   `repetition` corpus). The AR table uses the prose task; AR speed does not
+   depend on the generated text.
    llama.cpp runs the same draft file through `--spec-type draft-dflash`,
    `draft-mtp` or `draft-dspark` (`speculative.reference.args` in
    `bench.json`, otherwise llama.cpp's defaults; tune them only when the
@@ -233,10 +241,14 @@ model has several quantizations, e.g. `single-ar-q4`):
    b11069: `check_tensor_dims: tensor 'token_embd.weight' not found`), record
    the error once, run the reference with `--mode ar`, and leave its
    speculative cells `TODO`.
-   `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance`.
-   Both acceptance columns are accepted draft tokens over proposed draft
-   tokens as each server reports them; the two drafters propose different
-   block lengths, so compare tg, and treat acceptance as a diagnostic.
+   `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step`.
+   `accepted/step` is the mean number of accepted draft tokens per
+   verification step, `draft_n_accepted / (predicted_n − draft_n_accepted)`
+   (each step also yields one target token, so tokens per step is this plus
+   one). It is proportional to the speculative speedup and independent of
+   how many tokens were proposed, unlike an acceptance rate, which a
+   controller that drafts fewer tokens inflates; Gufo's adaptive controller
+   makes the rate meaningless as a comparison.
    When a model's `bench.json` has no `speculative.reference`, the reference
    column falls back to llama.cpp AR and is labelled `Gain vs llama.cpp AR`.
 4. **Multiple users** (`multi-mixed`, `multi-repetition`). `C = 1,2,4,6,8`,
@@ -246,7 +258,8 @@ model has several quantizations, e.g. `single-ar-q4`):
    and `mixed` (distinct layout). Metric: sum of individual request decode
    rates per concurrent group, averaged across groups. `Exact` is the count of
    llama.cpp AR completions whose hash matches the Gufo AR C1 reference.
-   Report C8 median / p95 latency and acceptance under the table.
+   Report C8 median / p95 latency and accepted draft tokens per step under
+   the table (`render` prints both per artifact).
    `Users | Gufo AR | llama.cpp AR | Gain | Gufo <spec> | llama.cpp <spec> | Gain | Exact`.
    Every artifact, including Gufo AR, compares its C2+ completions against
    the Gufo AR C1 hashes. Reject any corpus run with cache hits when it sent

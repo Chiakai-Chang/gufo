@@ -101,24 +101,47 @@ continuation.
 ## Single user, MTP
 
 Same workload with `--speculative mtp --mtp-model <mtp>` (adaptive, up to 7
-proposals). Gufo pp includes predictor catch-up; `Gufo acceptance` is
-accepted over proposed draft tokens from `usage` (`draft_tokens_accepted` /
-`draft_tokens`). Artifact: `artifacts/single-mtp-gufo.json`.
+proposals). Gufo pp includes predictor catch-up. `accepted/step` is the mean
+number of accepted draft tokens per verification step
+(`draft_tokens_accepted / (completion_tokens − draft_tokens_accepted)`);
+tokens per step is this plus one. The measured turn asks for a detailed
+summary and a story, so the generated text is ordinary prose.
+Artifact: `artifacts/single-mtp-gufo.json`.
 
 <!-- bench:single-mtp -->
-| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo acceptance | llama.cpp acceptance |
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 1538.07 | TODO | TODO | 35.72 | TODO | TODO | 71.6% | TODO |
-| 4,096 | 1434.40 | TODO | TODO | 32.37 | TODO | TODO | 56.5% | TODO |
-| 8,192 | 1406.61 | TODO | TODO | 36.68 | TODO | TODO | 76.9% | TODO |
-| 12,288 | 1396.57 | TODO | TODO | 34.30 | TODO | TODO | 66.3% | TODO |
-| 16,384 | 1381.99 | TODO | TODO | 29.91 | TODO | TODO | 49.5% | TODO |
-| 32,768 | 1355.36 | TODO | TODO | 28.75 | TODO | TODO | 52.3% | TODO |
-| 65,536 | 1195.55 | TODO | TODO | 27.56 | TODO | TODO | 49.5% | TODO |
-| 131,072 | 1253.69 | TODO | TODO | 26.98 | TODO | TODO | 49.1% | TODO |
+| 0 | 1438.69 | TODO | TODO | 32.18 | TODO | TODO | 0.64 | TODO |
+| 4,096 | 1304.23 | TODO | TODO | 33.45 | TODO | TODO | 0.97 | TODO |
+| 8,192 | 1324.72 | TODO | TODO | 33.32 | TODO | TODO | 0.91 | TODO |
+| 12,288 | 1317.14 | TODO | TODO | 34.06 | TODO | TODO | 1.06 | TODO |
+| 16,384 | 1298.17 | TODO | TODO | 33.09 | TODO | TODO | 0.94 | TODO |
+| 32,768 | 1278.93 | TODO | TODO | 28.70 | TODO | TODO | 0.71 | TODO |
+| 65,536 | 1176.17 | TODO | TODO | 28.69 | TODO | TODO | 1.13 | TODO |
+| 131,072 | 1191.27 | TODO | TODO | 26.31 | TODO | TODO | 1.06 | TODO |
 <!-- /bench -->
 
 ![Single user, MTP](artifacts/charts/single-mtp.svg)
+
+Repetitive workload: same prefixes and depths, but the measured turn asks the
+model to repeat the passage word for word, so the output is fully predictable
+— the single-user analogue of the `repetition` corpus below. Gufo's adaptive
+controller is tuned to push hard on this case.
+
+<!-- bench:single-mtp-repetition -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 1605.30 | TODO | TODO | 59.39 | TODO | TODO | 3.74 | TODO |
+| 4,096 | 1509.49 | TODO | TODO | 48.07 | TODO | TODO | 2.28 | TODO |
+| 8,192 | 1472.04 | TODO | TODO | 50.19 | TODO | TODO | 2.46 | TODO |
+| 12,288 | 1451.29 | TODO | TODO | 40.07 | TODO | TODO | 1.17 | TODO |
+| 16,384 | 1429.19 | TODO | TODO | 50.57 | TODO | TODO | 2.76 | TODO |
+| 32,768 | 1389.83 | TODO | TODO | 45.25 | TODO | TODO | 2.56 | TODO |
+| 65,536 | 1202.92 | TODO | TODO | 37.23 | TODO | TODO | 2.28 | TODO |
+| 131,072 | 1272.39 | TODO | TODO | 39.20 | TODO | TODO | 2.46 | TODO |
+<!-- /bench -->
+
+![Single user, MTP, repetitive](artifacts/charts/single-mtp-repetition.svg)
 
 The llama.cpp column is **TODO**: llama.cpp `b11069` cannot load this MTP
 sidecar as a draft model. The recorded attempt
@@ -136,11 +159,13 @@ srv  llama_server: exiting due to model loading error
 ```
 
 Upstream support for this sidecar is an open pull request; until the pin
-moves, compare MTP against llama.cpp AR by reading the previous table. MTP
-decodes **35.7 tok/s** at d0 (+37% over Gufo AR, 71.6% acceptance) and
-**27.0 tok/s** at 128K (+23%, 49.1% acceptance), 1.6–2.3× llama.cpp AR at
-the depths llama.cpp could run; acceptance on this synthetic prose swings
-between 49% and 77% with depth. MTP costs 3–9% of prefill throughput.
+moves, compare MTP against llama.cpp AR by reading the previous table. On
+generic prose MTP accepts 0.6–1.1 draft tokens per step and decodes
+**32.2 tok/s** at d0 (+24% over Gufo AR) and **26.3 tok/s** at 128K (+20%),
+1.5–2.2× llama.cpp AR at the depths llama.cpp could run. MTP costs 8–12% of
+prefill throughput. On the repetitive workload MTP accepts 2.3–3.7 draft
+tokens per step and decodes **59.4 tok/s** at d0 and **39.2 tok/s** at
+128K, 2.3× / 1.8× Gufo AR.
 
 `gufo bench` controls (CLI, raw prefix, not HTTP; 2026-09-21): sampled MTP at
 d0, seed 1, tg128, top-k/top-p/min-p disabled:
@@ -202,7 +227,7 @@ completion but on only one of the three `mixed` prompts (two at C6; `Exact` 1/3 
 4/6): its greedy continuations of the other prompts diverge from Gufo's, which
 is a numerical difference between implementations, not a benchmark defect;
 timings are still comparable because every request produced 128 tokens.
-MTP acceptance is 100% on `repetition` and 73.5–84.3% on `mixed`.
+MTP accepts 4.3 draft tokens per step on `repetition` and 1.4 on `mixed` at C8.
 C8 request latency (median / p95): repetition Gufo AR 10.70 / 10.86 s, Gufo
 MTP 6.68 / 7.01 s, llama.cpp AR 13.05 / 13.05 s; mixed Gufo AR 12.89 /
 13.06 s, Gufo MTP 9.89 / 10.65 s, llama.cpp AR 15.17 / 15.17 s.

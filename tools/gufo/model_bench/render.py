@@ -99,10 +99,10 @@ def layout_for(config: BenchConfig, table: TableSpec) -> Layout:
             columns = [Column("Depth", "label"),
                        Column("Gufo pp", "gufo"), Column(f"{ref} pp", "reference"), Column("Gain", "gain"),
                        Column("Gufo tg", "gufo"), Column(f"{ref} tg", "reference"), Column("Gain", "gain"),
-                       Column("Gufo acceptance", "gufo"), Column(f"{ref} acceptance", "reference")]
+                       Column("Gufo accepted/step", "gufo"), Column(f"{ref} accepted/step", "reference")]
         else:
             columns = [Column("Depth", "label"), Column("Gufo pp", "gufo"), Column("Gufo tg", "gufo"),
-                       Column("Gufo acceptance", "gufo"), Column(f"{ref} AR tg", "reference"),
+                       Column("Gufo accepted/step", "gufo"), Column(f"{ref} AR tg", "reference"),
                        Column(f"Gain vs {ref} AR", "gain")]
         return Layout(columns, [_depth_label(d) for d in table.spec["depths"]])
     if kind == "multi":
@@ -191,9 +191,9 @@ def _row_values(config: BenchConfig, table: TableSpec) -> dict[str, dict[str, st
             g, r = g_rows.get(str(depth)), r_rows.get(str(depth))
             values[_depth_label(depth)] = {
                 "gufo_pp": _fmt_stat(g, "pp"), "gufo_tg": _fmt_stat(g, "tg"),
-                "acceptance": _fmt_stat(g, "acceptance", 1, "%"),
+                "acceptance": _fmt_stat(g, "accepted_per_step", 2),
                 "ref_pp": _fmt_stat(r, "pp"), "ref_tg": _fmt_stat(r, "tg"),
-                "ref_acceptance": _fmt_stat(r, "acceptance", 1, "%"),
+                "ref_acceptance": _fmt_stat(r, "accepted_per_step", 2),
             }
     elif kind == "memory":
         for workload in table.spec["workloads"]:
@@ -277,7 +277,7 @@ def render_table(config: BenchConfig, table: TableSpec, existing: dict[str, dict
                      gt, rt, gain(_number(gt), _number(rt), better)]
         elif kind == "single":
             gp = _pick(fresh.get("gufo_pp"), cell("Gufo pp")); gt = _pick(fresh.get("gufo_tg"), cell("Gufo tg"))
-            acc = _pick(fresh.get("acceptance"), cell("Gufo acceptance"))
+            acc = _pick(fresh.get("acceptance"), cell("Gufo accepted/step"))
             rp = _ref(fresh.get("ref_pp")); rt = _ref(fresh.get("ref_tg"))
             if config.reference_speculative:
                 cells = [gp, rp, gain(_number(gp), _number(rp), better),
@@ -320,6 +320,13 @@ def render_document(config: BenchConfig, document: str, only: set[str] | None = 
     return MARKER_RE.sub(replace, document), rendered
 
 
+def _serving_output_tokens(result: dict[str, Any]) -> int | None:
+    samples = result.get("samples")
+    if isinstance(samples, list):
+        return sum(int(s.get("completion_tokens", 0)) for s in samples)
+    return None
+
+
 def multi_summary(config: BenchConfig) -> list[str]:
     """One line per concurrency artifact: top-level request latency, acceptance and cache hits."""
     lines: list[str] = []
@@ -339,8 +346,10 @@ def multi_summary(config: BenchConfig) -> list[str]:
             spec = result.get("speculative") or {}
             parts = [f"{table.id} {target}-{suffix or 'ar'} C{top}:",
                      f"request median {latency.get('median', 0) / 1000:.2f} s / p95 {latency.get('p95', 0) / 1000:.2f} s"]
-            if spec.get("acceptance") is not None:
-                parts.append(f"acceptance {spec['acceptance'] * 100:.1f}%")
+            accepted = spec.get("acceptedTokens")
+            output = _serving_output_tokens(result)
+            if accepted and output and output > accepted:
+                parts.append(f"accepted/step {accepted / (output - accepted):.2f}")
             parts.append(f"cache hits {spec.get('cacheHits', 0)}/{result.get('requestCount')}")
             lines.append(" ".join(parts))
     return lines

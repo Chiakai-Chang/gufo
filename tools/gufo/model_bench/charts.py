@@ -111,29 +111,29 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
         a2.set_xlabel("context depth (tokens)")
         a1.legend(loc="lower left")
     elif kind == "single":
-        gp, gt, acc = (_series(rows, labels, h) for h in ("Gufo pp", "Gufo tg", "Gufo acceptance"))
+        gp, gt, acc = (_series(rows, labels, h) for h in ("Gufo pp", "Gufo tg", "Gufo accepted/step"))
         if not _has_data(gt):
             return False
         ticks = _depth_ticks(labels)
         if config.reference_speculative:
-            rp, rt, racc = (_series(rows, labels, h) for h in (f"{ref} pp", f"{ref} tg", f"{ref} acceptance"))
+            rp, rt, racc = (_series(rows, labels, h) for h in (f"{ref} pp", f"{ref} tg", f"{ref} accepted/step"))
             fig, (a0, a1, a2) = plt.subplots(1, 3, figsize=(11, 3.2))
             _lines(a0, labels, [(f"Gufo {spec_label}", gp, COLORS["spec"]), (f"{ref} {spec_label}", rp, COLORS["ref_spec"])],
                    "prefill tok/s", ticks)
             a0.set_xlabel("context depth (tokens)")
             a0.legend(loc="lower left")
             ref_name = f"{ref} {spec_label}"
-            acceptance = [(f"Gufo acceptance", acc, COLORS["spec"]), (f"{ref} acceptance", racc, COLORS["ref_spec"])]
+            acceptance = [("Gufo accepted/step", acc, COLORS["spec"]), (f"{ref} accepted/step", racc, COLORS["ref_spec"])]
         else:
             rt = _series(rows, labels, f"{ref} AR tg")
             fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
             ref_name = f"{ref} AR"
-            acceptance = [(f"Gufo {spec_label} acceptance", acc, COLORS["spec"])]
+            acceptance = [(f"Gufo {spec_label} accepted/step", acc, COLORS["spec"])]
         _lines(a1, labels, [(f"Gufo {spec_label}", gt, COLORS["spec"]), (ref_name, rt, COLORS["ref_spec"])],
                "generation tok/s", ticks)
-        _lines(a2, labels, acceptance, "acceptance %", ticks)
+        _lines(a2, labels, acceptance, "accepted draft tokens per step", ticks)
         a2.legend(loc="lower right")
-        a2.set_ylim(0, 105)
+        pass
         a1.set_xlabel("context depth (tokens)")
         a2.set_xlabel("context depth (tokens)")
         a1.legend(loc="lower left")
