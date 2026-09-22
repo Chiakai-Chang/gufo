@@ -101,10 +101,14 @@ class Session:
     def gufo_command(self, table: TableSpec, *, mode: str | None, context: int, sessions: int, port: int) -> list[str]:
         cfg = self.config
         gguf = cfg.file("gguf", table.variant)
+        llm_args = list(cfg.data["gufo"].get("llm", []))
+        if table.spec.get("workload") == THINKING_WORKLOAD:
+            # The model's own template decides; drop the benchmark's `--think off`.
+            llm_args = [a for i, a in enumerate(llm_args)
+                        if a != "--think" and (i == 0 or llm_args[i - 1] != "--think")]
         command = [str(self.gufo_binary), "serve", "--port", str(port), "--sessions", str(sessions),
                    *cfg.data["gufo"].get("serve", []), "llm", "--model", str(gguf),
-                   "--context", str(context), "--served-model-name", MODEL_ALIAS,
-                   *cfg.data["gufo"].get("llm", [])]
+                   "--context", str(context), "--served-model-name", MODEL_ALIAS, *llm_args]
         if table.kind == "image-encoder":
             command += ["--mmproj", str(cfg.file("mmproj", table.variant)), "--max-request-bytes", str(64 << 20)]
         if mode and mode != "ar":
@@ -122,9 +126,12 @@ class Session:
     def reference_command(self, table: TableSpec, *, mode: str | None, context: int, parallel: int, port: int) -> list[str]:
         cfg = self.config
         gguf = cfg.file("gguf", table.variant)
+        args = list(cfg.data["reference"]["args"])
+        if table.spec.get("workload") == THINKING_WORKLOAD:
+            args = [a for i, a in enumerate(args)
+                    if a != "--reasoning" and (i == 0 or args[i - 1] != "--reasoning")]
         command = [self.reference_binary_for(mode), "-m", str(gguf), "-c", str(context), "-np", str(parallel),
-                   "--port", str(port), "--host", "127.0.0.1", "--alias", MODEL_ALIAS,
-                   *cfg.data["reference"]["args"]]
+                   "--port", str(port), "--host", "127.0.0.1", "--alias", MODEL_ALIAS, *args]
         if table.kind == "image-encoder":
             command += ["--mmproj", str(cfg.file("mmproj", table.variant))]
         if mode and mode != "ar":
@@ -410,7 +417,12 @@ TASKS = {
               "Write at least 500 words."),
     # Fully predictable output: the single-user analogue of the `repetition` corpus.
     "repetition": "\n\nRepeat the passage above word for word, from the beginning.",
+    # Reasoning output: the model's default mode, where the generated tokens are
+    # chain-of-thought rather than prose. The server keeps thinking enabled.
+    "thinking": ("\n\nHow many distinct words appear in the passage above, and which three are "
+                 "the most frequent? Work through it carefully before answering."),
 }
+THINKING_WORKLOAD = "thinking"
 
 
 def _measure_depth(session: Session, base_url: str, tokenizer: Tokenizer, *, depth: int, prompt_tokens: int,

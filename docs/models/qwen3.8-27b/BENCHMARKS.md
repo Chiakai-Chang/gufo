@@ -1,4 +1,4 @@
-# Qwen3.8 27B on Strix Halo
+# Qwen3.8 27B on Gufo
 
 | | |
 | --- | --- |
@@ -162,6 +162,36 @@ analogue of the `repetition` corpus below.
 
 
 <!-- bench:single-dflash2-repetition-q8 -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
+
+Thinking workload (**TODO**, pending the 27B DFlash2 changes in progress):
+thinking left on, the measured turn asks a question that requires reasoning,
+so the timed tokens are chain-of-thought rather than prose.
+
+<!-- bench:single-dflash2-thinking-q4 -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
+
+<!-- bench:single-dflash2-thinking-q8 -->
 | Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |

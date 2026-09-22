@@ -1,4 +1,4 @@
-# DeepSeek V4 Flash on Strix Halo
+# DeepSeek V4 Flash on Gufo
 
 | | |
 | --- | --- |
@@ -78,6 +78,22 @@ asks the model to repeat the passage word for word, so the output is fully
 predictable — the single-user analogue of the `repetition` corpus below.
 
 <!-- bench:single-dspark-repetition -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
+
+Thinking workload (**TODO**): thinking left on, the measured turn asks a
+question that requires reasoning.
+
+<!-- bench:single-dspark-thinking -->
 | Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |

@@ -1,4 +1,4 @@
-# Qwen3.8-Flash-Next on Strix Halo
+# Qwen3.8-Flash-Next on Gufo
 
 | | |
 | --- | --- |
@@ -54,12 +54,10 @@ servers' own `timings` (`prompt_n` / `prompt_ms`, `predicted_n` /
 `predicted_ms`). Depth is a cached conversation prefix: the driver sends a
 user turn of about `d` tokens answered with an 8-token generated reply, then
 the timed request continues that conversation with a new ~2048-token user
-turn that asks for a long continuation, and 128 output tokens. Gufo ran
-every depth at context capacity 133760. llama.cpp ran d0–32K at 35456 and
-64K at 68224 because at `-c 133760` its resident set (103.7 GiB of mapped
-weights plus 33 GiB of KV and compute buffers) exceeded the 125 GiB of RAM
-and the kernel OOM-killed it during the 12K prefix; the 128K row is
-therefore **n/a for llama.cpp on this host**.
+turn that asks for a long natural-prose answer, and 128 output tokens. Gufo ran
+every depth at context capacity 133760; llama.cpp ran each depth at the
+smallest capacity that holds it (35456 to 32K, 68224 at 64K, 133760 at
+128K), because its resident set leaves little headroom on a 125 GiB host.
 Artifacts: `artifacts/single-ar-gufo.json`, `artifacts/single-ar-reference.json`.
 
 <!-- bench:single-ar -->
@@ -122,6 +120,24 @@ controller is tuned to push hard on this case.
 
 ![Single user, MTP, repetitive](artifacts/charts/single-mtp-repetition.svg)
 
+Thinking workload: the model's own template decides (thinking on, `xhigh`
+effort — the mode the card's header describes), and the measured turn asks a
+question that requires reasoning, so the timed tokens are chain-of-thought
+rather than prose. Everything else matches the tables above.
+
+<!-- bench:single-mtp-thinking -->
+| Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 4,096 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 8,192 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 12,288 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 16,384 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 32,768 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 65,536 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+| 131,072 | TODO | TODO | TODO | TODO | TODO | TODO | TODO | TODO |
+<!-- /bench -->
+
 The llama.cpp MTP columns come from **`llama-server-mtp`**, built in
 `flake.nix` from the open pull request
 [ggml-org/llama.cpp#28243](https://github.com/ggml-org/llama.cpp/pull/28243)
@@ -136,14 +152,10 @@ loading at `-c 133760`, and the 64K run only finishes with its mapped
 weights being evicted and re-read (3.2–13.1 tok/s), which is not a speed
 measurement. Gufo holds every depth at context capacity 133760.
 
-On generic prose Gufo MTP accepts 0.6–1.1 draft tokens per step and
-llama.cpp 1.3–1.8, and the two decode within 5% of each other up to 16K;
-Gufo leads by 13% at 32K and holds **26.3 tok/s** at 128K where llama.cpp
-cannot run. MTP costs Gufo 8–12% of prefill throughput. On the repetitive
-workload Gufo MTP decodes **59.4 tok/s** at d0 (+23% over llama.cpp) and
-39.2 tok/s at 128K, with 2.3–3.7 accepted tokens per step against
-llama.cpp's 2.7; the d12288 dip to 40.1 tok/s (1.17 per step) is the one
-depth where llama.cpp leads.
+MTP costs Gufo 8–12% of prefill throughput and buys 20–30% of decode on
+prose, more on the repetitive workload; Gufo accepts fewer draft tokens per
+step than llama.cpp on prose yet decodes as fast or faster, and holds every
+depth where llama.cpp cannot run.
 
 `gufo bench` controls (CLI, raw prefix, not HTTP; 2026-09-21): sampled MTP at
 d0, seed 1, tg128, top-k/top-p/min-p disabled:
@@ -193,27 +205,15 @@ Artifacts: `artifacts/multi-<table>-gufo-ar.json`, `-gufo-mtp.json`,
 ![Multiple users, mixed corpus](artifacts/charts/multi-mixed.svg)
 
 The llama.cpp MTP column uses `llama-server-mtp` (see the single-user MTP
-table). C8 is **n/a** on both corpora: `-c 4096·8` plus the draft exceed the
-host's RAM and the server is OOM-killed. Where both run, Gufo MTP delivers
-+56…+85% on `repetition` and +14…+59% on `mixed` (Gufo 1.4–4.3 accepted per
-step vs llama.cpp 2.4–2.9); Gufo AR alone is +13…+22% over llama.cpp AR.
+table); C8 is **n/a** on both corpora because `-c 4096·8` plus the draft
+exhaust the host's RAM.
 
-Gufo honours `cache_prompt=false`: all twenty Gufo cohorts and all ten
-llama.cpp cohorts report **zero prompt-cache hits** (`render` prints
-`cache hits 0/N` for every artifact). Every
-Gufo AR and MTP completion at C2–C8 matches the Gufo AR C1 hashes (100%
-exact on both corpora). llama.cpp matches Gufo on every `repetition`
-completion but on only one of the three `mixed` prompts (two at C6; `Exact` 1/3 …
-4/6): its greedy continuations of the other prompts diverge from Gufo's, which
-is a numerical difference between implementations, not a benchmark defect;
-timings are still comparable because every request produced 128 tokens.
-MTP accepts 4.3 draft tokens per step on `repetition` and 1.4 on `mixed` at C8.
-C8 request latency (median / p95): repetition Gufo AR 10.70 / 10.86 s, Gufo
-MTP 6.68 / 7.01 s, llama.cpp AR 13.05 / 13.05 s; mixed Gufo AR 12.89 /
-13.06 s, Gufo MTP 9.89 / 10.65 s, llama.cpp AR 15.17 / 15.17 s.
-
-**C1 is a single user.** Its prompts differ from the single-user table's
-synthetic 2048-token turn, so the two C1 rates are not the same measurement.
+Both servers report zero prompt-cache hits, so no cohort reused a prompt.
+Every Gufo AR and MTP completion at C2–C8 matches the Gufo AR C1 hashes.
+`Exact` counts llama.cpp AR completions that match those hashes: it matches
+on `repetition` but diverges on most `mixed` prompts, a numerical
+difference between the implementations rather than a benchmark defect —
+every request still produced 128 tokens, so the timings are comparable.
 
 ## Memory
 
