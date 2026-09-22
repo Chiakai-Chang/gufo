@@ -262,7 +262,9 @@ def run_loading(session: Session, table: TableSpec) -> None:
             drop_file_cache(session.drop_caches)
             # Load with the speculative support files on both sides when the reference has the mode.
             mode = cfg.speculative["mode"] if (session.target == "gufo" or cfg.reference_speculative) else None
-            server = session.server(sub, mode=mode, context=int(spec["context"]),
+            if session.modes and mode not in session.modes:
+                mode = "ar"
+            server = session.server(sub, mode=mode, context=session.context or int(spec["context"]),
                                     sessions=int(spec.get("sessions", 2)), tag=f"{variant}-{repetition}")
             command = server.command
             with server:

@@ -24,26 +24,28 @@ reference) are the correctness gates of this refresh. Unmeasured cells are
 
 ## Loading
 
-The cold-file-cache loading table is **not measured**: the refresh host has
-no privileged page-cache drop (`sync; echo 3 > /proc/sys/vm/drop_caches`, no
-passwordless `sudo`/`doas`), so the driver skipped the table on both targets
-and the earlier hand-measured Gufo cell (14.91 s, 2026-09-21) was retired
-rather than kept next to an unmeasured reference. Rerun with
-`--drop-caches "<privileged command>"` on a host that has one.
+Cold-file-cache launch to `/ready`, measured 2026-09-22 after
+`sync; echo 3 > /proc/sys/vm/drop_caches`, one launch per server. Gufo loaded
+the four shards plus the MTP sidecar with two sessions at context capacity
+262144. llama.cpp loaded the same shards at `-c 35456` (the capacity of its
+depth rows): at `-c 262144` it preallocates the whole KV cache for this
+104 GiB model and the kernel OOM-killed it before readiness, so its number
+is for a smaller window. Gufo maps the weights lazily, which is why its
+cold and warm readiness differ little.
 
 <!-- bench:loading -->
 | Target | Gufo ready | llama.cpp ready | Gain |
 | --- | ---: | ---: | ---: |
-| UD-Q4_K_XL | TODO | TODO | TODO |
+| UD-Q4_K_XL | 16.30 s | 156.35 s | +859.2% |
 <!-- /bench -->
 
-Warm-cache readiness during this refresh (page cache already holding the
-shards, not a cold measurement): Gufo logged `load_completed` after
-**15.6 s** (AR, context 133760) and **16.2 s** (MTP loaded, same context),
-with `gpu_device_used_mib` 86940 (AR) and 89892 (MTP) after loading.
-A 4084-token AR prompt snapshot occupied 212 MiB (`cache_snapshot_bytes`
-222553248) in the 2026-09-22 HTTP controls; restore/replay qualification is
-in [evaluation](EVALUATION.md).
+![Cold-file-cache launch to readiness](artifacts/charts/loading.svg)
+
+Warm-cache readiness for comparison: Gufo logged `load_completed` after
+**15.6 s** (AR, context 133760) and **16.2 s** (MTP), with
+`gpu_device_used_mib` 86940 (AR) and 89892 (MTP). A 4084-token AR prompt
+snapshot occupied 212 MiB; restore/replay qualification is in
+[evaluation](EVALUATION.md).
 
 ## Single user, autoregressive
 
