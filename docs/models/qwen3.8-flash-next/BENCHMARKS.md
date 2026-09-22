@@ -208,6 +208,17 @@ The llama.cpp MTP column uses `llama-server-mtp` (see the single-user MTP
 table); C8 is **n/a** on both corpora because `-c 4096·8` plus the draft
 exhaust the host's RAM.
 
+The two corpora agree at C1 (26.1 vs 25.9 tok/s) and diverge as they batch:
+every request generates 128 tokens and prefill costs the same 160 ms either
+way, but at C8 mixed decode takes 11.4 s against 9.3 s for repetition.
+Identical prompts enter decode in lockstep and route to the same experts of
+this MoE, so a step reads one set of expert weights; the mixed prompts
+(30–53 tokens) finish prefill at different times and route differently,
+which leaves steps running below full width and multiplies expert weight
+traffic. llama.cpp shows the same spread, so it is the workload rather than
+a scheduler artifact: `repetition` is the best case and `mixed` the
+realistic one.
+
 Both servers report zero prompt-cache hits, so no cohort reused a prompt.
 Every Gufo AR and MTP completion at C2–C8 matches the Gufo AR C1 hashes.
 `Exact` counts llama.cpp AR completions that match those hashes: it matches
