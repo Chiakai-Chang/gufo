@@ -28,13 +28,11 @@ Ask the user before measuring anything:
    bench`, an older prompt) must be refreshed whole, because one Gain column
    cannot mix two methods.
 
-Then confirm the time budget. Measured on Strix Halo with Qwen3.8 27B:
-a single-user depth table (0–32K, six depths) takes 4–7 min for Gufo and
-about 10 min for llama.cpp; the 64K and 128K rows add roughly as much again
-because the prefix itself must be prefilled; memory 1–2 min per target; each
-concurrency table about 5 min per target and mode; loading about 1 min per
-variant. One variant with both targets and both modes is about 1 h 20 min;
-Q4 + Q8 took 2 h 41 min. When the budget cannot hold everything, measure in
+Then confirm the time budget. The September 23 Qwen3.8 27B pass took 4 h 14 min
+for Q4 + Q8, both engines, AR plus mixed/repetitive DFlash2, eight depths through
+128K and C1/C2/C4/C6/C8, memory and loading. One depth workload took 12–17 min
+on Gufo and 22–24 min on llama.cpp; large-prefix setup dominates. These are
+single measured runs, with shortened warmup. When the budget cannot hold everything, measure in
 this order and say what was left: Q4 before Q8, single-user AR, single-user
 speculative, concurrency, memory, loading.
 
@@ -42,10 +40,11 @@ Driver commands run longer than a tool call may; start each one in the
 background with its output redirected to a log, then block on that log with
 an `until grep -q ... ; do sleep 30; done` loop (repeat the loop when it
 times out) — a turn that ends while the driver runs does not resume by
-itself. Progress lines are flushed as they happen. Before starting, check
-whether the host lets you drop the page cache (`sudo -n true` or `doas -n
-true`); without it the loading table is skipped, so say so up front instead
-of discovering it in the run.
+itself. Progress lines are flushed as they happen. Before starting, establish
+how loading will get cold model files. Use a privileged page-cache drop, or
+`POSIX_FADV_DONTNEED` on every target/sidecar file and verify zero resident
+pages with `mincore`. Record the method; cold model files do not imply cold
+runtime libraries. Skip loading if neither method is available.
 
 ## Measurement model
 
@@ -75,8 +74,8 @@ nix develop -c python3 tools/bench/model-bench.py --model <model> render        
 `run` flags: `--table <id>[,<id>]` selects tables (without it every table
 runs in `bench.json` order; loading and image-encoder are skipped with a
 message when they cannot run); `--todo` measures only rows that have a
-`TODO` in a cell owned by the target (row-granular: one `TODO` acceptance
-cell re-measures that row's pp and tg too); `--fresh` discards the rows of
+`TODO` in a cell owned by the target (row-granular: a missing tg cell
+re-measures that workload's pp and tg too); `--fresh` discards the rows of
 an existing artifact instead of merging into them — use it for a full
 refresh so an interrupted run cannot leave mixed-date rows; `--repetitions N`
 overrides every table's repetition count (mean ± sd above 1);
@@ -92,9 +91,8 @@ so only d0 is measurable today.
 `--depths 0,4096` restricts single-user tables to those depths and
 `--mode ar` / `--mode <spec>` restricts to one mode (use it to skip a
 reference speculative mode the reference cannot load);
-`--drop-caches "<privileged command>"` gives the loading table its
-page-cache drop (`sync; echo 3 > /proc/sys/vm/drop_caches`) on hosts without
-passwordless sudo/doas; `--config` and `--artifacts-dir` point at an
+`--drop-caches "<command>"` supplies a checked cache-reset command before
+each loading launch; `--config` and `--artifacts-dir` point at an
 alternative `bench.json` and output directory for experiments. A depth that
 fails is reported, left as it was, and listed in the artifact notes; the
 other depths are still stored. A partial
@@ -152,7 +150,10 @@ and the table says so.
    point, no prompt-cache hits unless the cell says so. If the reference cannot
    match (different quantization, no equivalent speculative mode, no batching),
    measure the closest configuration and state the mismatch under the table.
-3. Warm once, then time. One warmed sample per point is acceptable for a
+3. Warm once, then time. Corpus warmup uses only the first concurrent group,
+   capped at 16 output tokens; every corpus group is still measured. Single-user
+   runs share tokenizer calibration across modes of the same target variant.
+   One warmed sample per point is acceptable for a
    sweep; add repetitions when two runs differ by more than about 2% or a
    regression is suspected, and report mean ± sd. A sample whose generated
    token count is below the requested output length (context overflow, early
@@ -164,13 +165,29 @@ and the table says so.
    none today — say so in the card and rely on the concurrency `Exact`
    checks); the full `EVALUATION.md` suites are for changed kernels or
    models. Greedy speculative output must match AR token
-   IDs. Concurrency tables compare every completion hash against the Gufo AR
-   C1 reference and report the match count (`Exact`); single-user tables
-   check token counts only. A mismatch or device fault is not a result.
+   IDs in the model checks. HTTP runs retain completion hashes: concurrency
+   compares them against the Gufo AR C1 reference, while matching single-user
+   AR/speculative depth rows allow the same text-consistency check. These hashes
+   do not prove original-model accuracy. A mismatch or device fault is not a result.
 5. A cell without a current qualified measurement is `TODO`, never a stale
    number. Keep dates per table; do not sum stage medians into a headline.
 6. Retained JSON goes to `docs/models/<model>/artifacts/`; raw samples,
    traces, audio, images and videos stay in the ignored top-level `artifacts/`.
+
+## Results-card format
+
+Keep the results card numerical and concise. Put model, quantization and mode
+in the first column header as well as the row dimension (depth/users/workload).
+Throughput headers must say `tok/s`; loading, memory and encoder latency retain
+seconds, GiB and ms. Add `---` between each Q4 table/figure and its Q8 counterpart.
+Keep acceptance statistics in artifacts, not Markdown columns or charts. Group
+mixed/repetitive speculative results into one table and figure per quantization
+for single-user depth sweeps and for concurrency. Single-user tables share pp
+columns and show separate tg/gain columns per text type; choose the highest
+measured pp per engine/depth across the workloads and state this beside the table.
+Retain independent workload artifacts and TODO cells. Place **Loading time**
+immediately before **Memory occupation**. Put commands and detailed methodology in
+`EVALUATION.md`; keep only interpretation-critical notes beside the tables.
 
 ## Comparison columns
 
@@ -196,9 +213,10 @@ Every headline table carries the reference project next to Gufo:
   `-speculative` on a concurrency table id targets only its speculative
   reference column) and state the reason under the table. `render` prints
   `n/a` there and in the matching Gain cell.
-- When Gufo runs a mode the reference lacks (DFlash2, DSpark, MTP without a
-  matching draft), compare against the reference's AR number and label the
-  column `Gain vs <ref> AR`.
+- Keep AR comparisons in the dedicated AR table. If the reference lacks a
+  speculative mode, leave that mode's cells TODO; do not launch another AR
+  sweep for each speculative workload. Existing combined-mode cards label
+  their fallback explicitly as `Gain vs <ref> AR`.
 - One table per quantization and per mode; never pack `pp / tg` pairs or two
   quantizations into one cell.
 
@@ -228,8 +246,8 @@ Gufo: `gufo serve llm --think off --max-pending-per-client 8`, greedy, seed
 only for the image-encoder table. The sweep parameters are identical across
 the three models so the documents stay comparable.
 
-Tables, in order (table ids in parentheses; append `-<quant>` when the
-model has several quantizations, e.g. `single-ar-q4`):
+Tables (append `-<quant>` for several quantizations, e.g. `single-ar-q4`);
+place loading immediately before memory in the rendered card:
 
 1. **Loading** (`loading`). Cold-file-cache launch to readiness (`/ready` on
    Gufo, `/health` on llama-server)
@@ -255,16 +273,21 @@ model has several quantizations, e.g. `single-ar-q4`):
    prompt-cache miss on Gufo and decodes measurably slower than a cached
    continuation; d0 is therefore a different regime from d4096+, not noise.
    `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain`.
-3. **Single user, speculative** (`single-<spec>` and
-   `single-<spec>-repetition`, DFlash2 / DSpark / MTP as the model supports).
-   Same grid plus accepted draft tokens per step from each server's
-   usage/timings. Two workloads, because speculative decoding depends on the
-   output: the measured turn of `single-<spec>` asks for a detailed summary
-   and a story (generic prose, `workload: prose`); `single-<spec>-repetition`
+3. **Single user, speculative** (`single-<spec>`,
+   DFlash2 / DSpark / MTP as the model supports).
+   Same depth grid. Retain accepted draft tokens per step in the
+   artifacts, without displaying them in the results card. Two workloads, because speculative decoding depends on the
+   output: the mixed workload asks for a detailed summary
+   and a story (generic prose, `workload: prose`); the repetitive workload
    asks the model to repeat the passage word for word (fully predictable
    output, `workload: repetition`, the single-user analogue of the
-   `repetition` corpus). The AR table uses the prose task; AR speed does not
-   depend on the generated text.
+   `repetition` corpus). The AR depth table uses the prose task; keep one AR workload for each
+   fixed depth and batch configuration instead of repeating it by text category.
+   The table's `workloads` map retains `single-<spec>` and
+   `single-<spec>-repetition` artifact identities. The runner measures each
+   workload separately; `--todo` selects its missing tg cells or missing shared
+   pp. The renderer selects the highest pp per engine/depth, preserving that
+   measurement's standard deviation, and recalculates pp gain from the maxima.
    llama.cpp runs the same draft file through `--spec-type draft-dflash`,
    `draft-mtp` or `draft-dspark` (`speculative.reference.args` in
    `bench.json`, otherwise llama.cpp's defaults; tune them only when the
@@ -277,7 +300,7 @@ model has several quantizations, e.g. `single-ar-q4`):
    speculative reference comes from that branch. Without such a build,
    record the error once, run the reference with `--mode ar`, and leave its
    speculative cells `TODO`.
-   `Depth | Gufo pp | llama.cpp pp | Gain | Gufo tg | llama.cpp tg | Gain | Gufo accepted/step | llama.cpp accepted/step`.
+   `Model / depth | Gufo pp (tok/s) | llama.cpp pp (tok/s) | Gain pp | Gufo tg mixed (tok/s) | llama.cpp tg mixed (tok/s) | Gain mixed | Gufo tg repetitive (tok/s) | llama.cpp tg repetitive (tok/s) | Gain repetitive`.
    `accepted/step` is the mean number of accepted draft tokens per
    verification step, `draft_n_accepted / (predicted_n − draft_n_accepted)`
    (each step also yields one target token, so tokens per step is this plus
@@ -287,19 +310,29 @@ model has several quantizations, e.g. `single-ar-q4`):
    makes the rate meaningless as a comparison.
    When a model's `bench.json` has no `speculative.reference`, the reference
    column falls back to llama.cpp AR and is labelled `Gain vs llama.cpp AR`.
-4. **Multiple users** (`multi-mixed`, `multi-repetition`). `C = 1,2,4,6,8`,
-   context capacity 4096, 128 output tokens, fresh server per point,
-   `cache_prompt=false`. Two workloads from
-   `docs/models/qwen3.8-27b/artifacts/speculative-corpus.json`: `repetition`
-   and `mixed` (distinct layout). Metric: sum of individual request decode
-   rates per concurrent group, averaged across groups. `Exact` is the count of
-   llama.cpp AR completions whose hash matches the Gufo AR C1 reference.
-   Report C8 median / p95 latency and accepted draft tokens per step under
-   the table (`render` prints both per artifact).
-   `Users | Gufo AR | llama.cpp AR | Gain | Gufo <spec> | llama.cpp <spec> | Gain | Exact`.
-   Every artifact, including Gufo AR, compares its C2+ completions against
-   the Gufo AR C1 hashes. Reject any corpus run with cache hits when it sent
-   `cache_prompt=false`; do not publish cache-assisted comparisons.
+4. **Multiple users**. Measure AR once in `multi-ar` (`modes: ["ar"]`),
+   using `repetition_word` and 128 output tokens to keep the batch full.
+   `multi-<spec>` groups mixed and repetitive workloads, using only the model's
+   speculative mode in `modes`. Its `workloads` map keeps `multi-mixed` and
+   `multi-repetition` artifact identities, case lists and corpus layouts.
+   Shared context/concurrency parameters belong to the parent. The renderer
+   displays both workloads side by side; the runner measures them separately.
+   `--todo` selects missing cells independently by workload. No extra AR
+   performance sweep runs. Each workload compares Gufo and the reference
+   in the same mode, with explicit `tok/s` units.
+   Existing combined-mode cards remain supported until migrated.
+   `C = 1,2,4,6,8`, context capacity 4096, fresh server per point,
+   `cache_prompt=false`. Workloads come from
+   `docs/models/qwen3.8-27b/artifacts/speculative-corpus.json`; mixed cases
+   may end before the output cap, so retain actual token counts.
+   Metric: sum of individual request decode rates, averaged across cohorts.
+   Save isolated Gufo C1 AR completion hashes once per workload in
+   `<table>-gufo-ar.json`; these are reusable quality references, not another
+   performance table. Refresh them when target arithmetic, weights, tokenizer
+   or request settings change. The driver rejects missing speculative case
+   references before loading a model. Keep cross-engine agreement and batch
+   consistency in `EVALUATION.md`; agreement is not an accuracy score.
+   Reject cache-assisted corpus measurements when `cache_prompt=false`.
 5. **Memory** (`memory`). Peak device-global HIP memory in use
    (`hipMemGetInfo` total − free, the counter Gufo's loader logs as
    `gpu_device_used_mib`, sampled every 250 ms by the driver through the
@@ -317,10 +350,11 @@ model has several quantizations, e.g. `single-ar-q4`):
    tokens; the encode alone is not separable over HTTP.
    `RGB image | Merged tokens | Gufo ms | llama.cpp ms | Gain`.
 
-Concurrency artifacts are `gufo-serving-bench` corpus reports named
-`<table>-gufo-ar.json`, `<table>-gufo-<spec>.json`, `<table>-reference.json`
-(llama.cpp AR) and `<table>-reference-<spec>.json`;
-the other tables use the compact `model-bench-table` schema with one entry per
+Concurrency performance artifacts are `gufo-serving-bench` corpus reports:
+`multi-ar[-<quant>]-gufo-ar.json` and `multi-ar[-<quant>]-reference.json` for AR;
+`<table>-gufo-<spec>.json` and `<table>-reference-<spec>.json` for speculative runs.
+Speculative tables also retain `<table>-gufo-ar.json` as a C1 quality reference;
+   the other tables use the compact `model-bench-table` schema with one entry per
 row and the actual `cache_n`/`prompt_n` counts.
 
 ## ASR (audio to text)
@@ -414,11 +448,9 @@ explicit approval and `--allow-full-generation`.
 ## Finish
 
 Render the tables, check that every Gufo/reference pair used the same
-workload identity, and rewrite the prose around each table: dates, method,
-server versions and flags, artifact file names, caveats such as a skipped
-loading table, and the reproduction block with the exact `model-bench.py`
-commands (paths as placeholders). Remove statements the new numbers
-contradict. List the remaining `TODO` cells with the reason (tool missing,
+workload identity, and keep only concise interpretation notes beside them. Put dates, method,
+server flags, artifact provenance and reproduction commands in `EVALUATION.md`.
+Remove statements the new numbers contradict. List the remaining `TODO` cells with the reason (tool missing,
 reference unsupported, time budget). Update `EXPERIMENTS.md` only when a measurement changes a
 retained decision. Summarize per table: Gufo, reference, best and worst gain,
 and every cell where completion hashes or transcripts did not match.

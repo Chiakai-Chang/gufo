@@ -85,8 +85,15 @@ void CheckPrefillReplay(
   // A deep ragged suffix also checks restored attention state and the feature
   // taps consumed by DFlash2 after prefill uses temporary KV layouts.
   for (const auto [depth, length] :
-       {std::pair{0U, 128U}, std::pair{0U, 257U}, std::pair{0U, 2048U},
-        std::pair{8192U, 1025U}}) {
+       {std::pair{0U, 64U}, std::pair{0U, 128U}, std::pair{0U, 257U},
+        std::pair{0U, 2048U}, std::pair{8192U, 1025U},
+        std::pair{8193U, 2059U}}) {
+    const bool check_chunks = depth == 8193;
+    // Q8 uses the same projection precision at every chunk size. Q4's
+    // separately qualified large-prefill route uses FP16 activations.
+    if (check_chunks && model->GetWeights().layers.front().ffn_gate.type !=
+                            gufo::core::GgmlType::kQ8_0)
+      continue;
     const std::uint32_t end = depth + length;
     std::vector<Token> tokens(end + 2);
     for (std::size_t i = 0; i < tokens.size(); ++i)
@@ -96,7 +103,11 @@ void CheckPrefillReplay(
     executor->SetPromptHiddenCapture(false);
     std::unique_ptr<gufo::hip::QwenGpuSnapshot> prefix;
     if (depth != 0) {
-      (void)executor->ForwardPromptBatch(std::span(tokens).first(depth));
+      const auto prefill_depth = check_chunks ? depth - 1 : depth;
+      (void)executor->ForwardPromptBatch(
+          std::span(tokens).first(prefill_depth));
+      if (check_chunks)
+        (void)executor->ForwardToken(tokens[depth - 1], depth - 1);
       prefix = executor->SaveSnapshot(depth);
       Expect(prefix != nullptr, "deep prefill snapshot");
     }
@@ -119,6 +130,25 @@ void CheckPrefillReplay(
               << " logits=" << Fingerprint(expected) << " features=" << features
               << '\n';
 
+    if (check_chunks) {
+      for (const std::uint32_t budget : {512U, 2048U}) {
+        executor->RestoreSnapshot(*prefix);
+        std::vector<float> captured;
+        for (std::uint32_t offset = 0; offset < length; offset += budget) {
+          const auto count = std::min(budget, length - offset);
+          (void)executor->ForwardPromptBatch(prompt.subspan(offset, count),
+                                             depth + offset);
+          const auto part = executor->GetPromptHiddenStates();
+          captured.insert(captured.end(), part.begin(), part.end());
+        }
+        Expect(ByteEqual(Logits(*executor), expected) &&
+                   Fingerprint(captured) == features,
+               "scheduled prefill chunks changed logits or draft features");
+        std::cout << "prefill chunk budget=" << budget
+                  << ": full logits and all feature rows exact\n";
+      }
+    }
+
     const auto snapshot = executor->SaveSnapshot(end);
     const auto suffix = std::span(tokens).subspan(end);
     (void)executor->ForwardVerificationChunk(suffix, end, true);
@@ -131,12 +161,28 @@ void CheckPrefillReplay(
     const std::vector<float> verified_features(hidden.begin(), hidden.end());
     executor->RestoreSnapshot(*snapshot);
     for (std::size_t row = 0; row < suffix.size(); ++row) {
+      // Changing taps after the first capture must replace its copy nodes.
+      const bool reverse_taps = length == 64 && row == 1;
+      if (reverse_taps) {
+        auto reversed = layers;
+        std::reverse(reversed.begin(), reversed.end());
+        executor->SetPromptHiddenCapture(true, reversed);
+      }
       (void)executor->ForwardToken(suffix[row], end + row);
       const auto last_hidden = executor->CopyLastHidden();
+      const auto reference =
+          std::span(verified_features)
+              .subspan(row * last_hidden.size(), last_hidden.size());
+      std::vector<float> expected_features(reference.begin(), reference.end());
+      if (reverse_taps) {
+        const auto width = executor->GetConfig().hidden_size;
+        for (std::size_t layer = 0; layer < layers.size(); ++layer) {
+          std::copy_n(reference.data() + (layers.size() - 1 - layer) * width,
+                      width, expected_features.data() + layer * width);
+        }
+      }
       Expect(ByteEqual(Logits(*executor), verified[row]) &&
-                 ByteEqual(last_hidden, std::span(verified_features)
-                                            .subspan(row * last_hidden.size(),
-                                                     last_hidden.size())),
+                 ByteEqual(last_hidden, expected_features),
              "verification after matrix prefill changed logits or features");
       std::cout << "prefill continuation tokens=" << length << " row=" << row
                 << " logits=" << Fingerprint(verified[row])
@@ -205,8 +251,17 @@ void CheckMixedContextBatch(const Executor& owner, bool replay) {
       Expect(predictions.size() == sessions.size(),
              "mixed-context batch returned the wrong number of rows");
       for (std::size_t row = 0; row < sessions.size(); ++row) {
-        Expect(ByteEqual(Logits(*sessions[row]), expected[row][step]),
-               "mixed-context batching changed target logits");
+        const auto actual = Logits(*sessions[row]);
+        const bool exact = ByteEqual(actual, expected[row][step]);
+        if (!exact) {
+          const auto comparison =
+              gufo::testing::CompareLogits(actual, expected[row][step]);
+          std::cerr << "mixed-context storage=" << static_cast<int>(storage)
+                    << " replay=" << replay << " row=" << row
+                    << " step=" << step
+                    << " max_abs=" << comparison.max_abs_diff << '\n';
+        }
+        Expect(exact, "mixed-context batching changed target logits");
         const auto& logits = expected[row][step];
         const auto next = static_cast<Token>(std::ranges::max_element(logits) -
                                              logits.begin());
@@ -283,8 +338,9 @@ void CheckConcurrencyWidths(const Executor& owner) {
     }
     std::cout << "concurrency width=" << width << " logits/features exact=1\n";
 
-    for (const std::size_t cohort_rows : {0U, 9U, 10U, 11U, 12U, 13U, 14U, 15U,
-                                          16U, 28U, 32U, 42U, 48U, 56U, 64U}) {
+    for (const std::size_t cohort_rows :
+         {0U,  9U,  10U, 11U, 12U, 13U, 14U, 15U, 16U, 17U, 23U, 24U,
+          25U, 28U, 31U, 32U, 33U, 35U, 36U, 42U, 48U, 56U, 64U}) {
       if ((cohort_rows > 16 && width != count) ||
           (cohort_rows > 0 && cohort_rows <= 16 && width != 2))
         continue;

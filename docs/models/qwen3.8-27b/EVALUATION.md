@@ -1,43 +1,138 @@
 # Qwen3.8 27B evaluation
 
-Targets Q4/Q8; DFlash2 drafts Q4_K_M/Q8_0/BF16. Independent original-target,
-conversion and native MTP parity remain **TODO**. Packed-weight operator
-agreement is narrower evidence. [Artifact identities](artifacts/model-identities.json).
+Targets **Q4_K_XL / Q8_K_XL**, DFlash2 draft **Q4_K_M**. Independent
+original-target, GGUF conversion and native MTP parity remain **TODO**.
+Agreement between Gufo paths is execution consistency, not proof of upstream
+model accuracy. [Artifact identities](artifacts/model-identities.json).
 
-Grouping verification queries by KV partition retains the existing arithmetic.
-The old/new FP16 kernels are byte-identical on 36 full-output cases through 64K
-plus six partition-boundary controls. Maintained checks cover FP16/FP32,
-1/3/8 query rows, scratch fallback and compact snapshot restoration. Matched
-pp2048/tg128 C1 HTTP controls on Q4_K_XL and Q8_K_XL with Q4 DFlash2 retain output
-hashes and accepted/proposed counts at d0 and d32K, with comparable PP speed.
-Fresh AR requests match DFlash2 on all four 128-token outputs at those depths.
-These focused controls do not refresh the benchmark sweep.
+## Current qualification
 
-The shallow FP16 attention pipeline retains the original product/FMA order and
-lane-zero sum tree. Scalar, batched and device-position paths match the previous
-kernel byte-for-byte on 72 controls across amplitudes and ragged lengths.
-Focused attention, graph and KV/snapshot tests pass. Q4_K_XL and Q8_K_XL retain
-all four d0 pp2048/tg128 AR/DFlash2 output hashes and both acceptance counts.
-Both targets also pass C2/C4/C6/C8 full-logit, feature and verification-replay
-checks, including ragged cohorts and shrinking batches.
-The full AR profile confirms lower attention time; the deep split-K path and
-prefill kernels are unchanged.
+| Area | Retained evidence |
+| --- | --- |
+| Target execution | Full logits and all five feature taps match scalar execution at verification widths 2–8, including ragged 17–36-row cohorts, mixed FP16/FP32 KV, shrinking cohorts, snapshots and 8K + 1025-token continuation. Both target quants pass; grouped Q8 projections retain scalar FP32 bits and guarded output bounds. |
+| RMSNorm | 90 maintained FP64 controls at absolute tolerance 1e-5, dimensions 5119/5120/5121, rows 1/7/33/64/65, three scales and optional weights; scalar/batched output is byte-identical. Explicit fused square accumulation prevents compiler contraction drift. |
+| Target attention | Independent FP64 checks, FP16/FP32 KV and dispatch boundaries pass. Shared partition scales retain 128 byte-exact comparisons through 64K; the split-K threshold has maximum absolute error 1.17e-6 against FP64. Prefill causal tails retain byte-exact chunk/packing controls; maximum absolute error against original-input FP64 attention is 2.11e-4. |
+| Draft attention / selector | 216 byte-exact attention controls include ring wrap and ragged blocks. Real-weight layer traces, complete logits, conditional probabilities, private RNG and persistent replay pass through C8. |
+| Sampling | Maintained GPU sampler covers 216 AR policies, p/q acceptance and residual sampling, ties, nonfinite rows and tile boundaries. Seeded cold/cache replay retains IDs and proposal counts. |
+| Weight placement | Complete 17,559,178,144-byte Q4 encoded-weight copy matches; read-only huge pages retain target arithmetic. Q8 full-target qualification also passes with this layout. |
+| Serving | Q4/Q8 AR and DFlash2 pass live continuation, disk restoration, C4 generated-history forks, sampled/greedy transitions and cancellation inside a verified block. Q8 also retains all eight d32K generated-history forks. |
 
-The 2026-09-21 compact-state qualification preserves Q4/Q8 AR and DFlash2
-tokens across all 23 sampling cases and C2/C4/C6/C8. Active recurrence and
-rollback buffers contain only recurrent layers; snapshots retain only valid
-KV rows. Operator checks cover FP16 production and head-major FP32 reference
-snapshots, dirty unused tails and exact disk round trips. Matched production
-pp2048/tg128 controls show no material speed regression.
+Current controls and binary/source identities:
+[Q4 AR](artifacts/q4-ar-c1-pruning.json),
+[Q4 DFlash2](artifacts/q4-dflash2-c1-focused.json),
+[Q8 decoding and continuation](artifacts/q8-tg-focused.json).
+No equality gate or tolerance was relaxed. Full-logit captures stay outside Git.
 
-Interrupted-chat qualification also passes on Q4_K_XL and **Q8_K_XL**, both
-AR and Q4 DFlash2: reasoning/visible-text cancellation, preserved/removed
-reasoning, greedy/seeded replay, a third turn, images and disk restart.
-The native vision checks retain their cold-versus-live equality gate and
-concurrent image/text isolation. The HTTP check requires exact replay with
-the same history and verifies that `cache_prompt: false` bypasses reuse.
-See [server check instructions](../../SERVER.md). Existing benchmark tables
-were not refreshed by this cache qualification.
+Generated history must retain **decode arithmetic** when a conversation resumes.
+Qwen prefill and decode use different projection arithmetic: putting an unconsumed
+output token into a new prefill chunk can change recurrent state. The server now
+records published pending IDs separately from the greedy frontier and replays
+those IDs with decode before prefilling the new suffix.
+
+Cancellation can arrive while a verified block is being published. The runner
+reuses its existing verification rollback, retains the completed frontier and
+replays at most the latest block (nine tokens; one for AR). This adds no GPU copy
+to normal decoding. The focused test covers first-token cancellation, longer
+output, sampled replay and fresh-backend disk restore on both target quants.
+A single rollback checkpoint does not cover a client lagging several complete
+blocks. Disk payload/layout version 3 includes pending IDs and rejects stale
+arithmetic/policy identities.
+
+```sh
+nix develop -c build/gpu-test/tests/models/qwen27b/inference_backend_gpu_test \
+  "$MODEL" "$DRAFT" --continuation-only
+```
+
+The Q8 C1 HTTP controls retain all 128 AR tokens with DFlash2 at d0 and d32K,
+including the same generated prefix history. The full Q8 target test and shared
+runner/scheduler tests pass. The compact Q8 artifact records request hashes,
+counts and validation log hashes.
+
+Concurrent continuations freeze the live generated frontier before its first
+branch mutates it. Peers restore that checkpoint instead of prefilling the
+generated reply; the original prompt checkpoint remains available for branching.
+This is budgeted and applies only to pools with multiple sessions. C1 retains
+its copy-free live path. The 32K Q8 HTTP control reuses 32,764 tokens on all four
+DFlash2 requests, and every 128-token continuation matches isolated AR.
+
+Scheduled prefill also needs consistent attention at chunk boundaries. A
+masked populated future value could change WMMA rounding compared with absent
+padding. Each query's final partial tile now accumulates visible keys with FP32
+FMA; complete tiles keep WMMA. At 8,193 + 2,059 tokens, Q8 full logits and all
+five feature taps match whole-chunk execution exactly with 512/2,048-row
+scheduling budgets. Independent FP64 attention and packed/unpacked operator
+checks pass, including shallow packed chunks of 1,025/2,048 rows. Q4's distinct
+large-prefill projection precision is outside that whole-model chunk equality
+claim. The persistent arithmetic identity rejects
+snapshots made before the attention fix.
+
+## Adaptive decoding and concurrency
+
+The controller chooses a block before sampling from private accepted-length
+history and deterministic position. Full acceptance is censored: a saturated
+history probes wider blocks. An independent geometric-distribution check verifies
+zero expected feedback drift at every width 1–7 below saturation. Request timings
+never enter sampled decisions; controller history resets for a new request.
+
+Q4 greedy costs account for complete measured cycles and context growth,
+including odd cohorts as requests finish. Private sampled/mixed cohorts match
+isolated proposal IDs, probabilities, RNG and restored state. The retained d32K
+C4 continuation reuses 32,552 tokens per request, prefills 2,011 new tokens and
+matches the 128-token AR continuation. Evidence:
+[current qualification](artifacts/q4-c4-focused.json),
+[earlier C2](artifacts/q4-c2-focused.json), [C6](artifacts/q4-c6-focused.json)
+and [C8](artifacts/q4-c8-focused.json). Profitability remains workload-dependent.
+
+Q8 greedy cohorts of two through eight requests use one shared width chosen from
+private acceptance histories and measured cycle costs. Odd cohorts use the next
+measured capacity's estimate. Full-acceptance probes also cover growing cohorts
+when two established histories support the probe and the remaining estimates
+are neutral or fully accepted. Fixed, sampled and mixed cohorts retain private
+choices; C1 keeps its existing policy. Real-weight checks cover layers, logits,
+selector probabilities, RNG and persistent state at every cohort size C2–C8.
+
+Q8_K_XL controls cover the nine-case mixed corpus, repetitive output and
+C2–C8, comparing every Gufo completion with isolated AR. Ragged projections group
+weight reads without changing per-row arithmetic, and shared widths avoid
+excessive proposals when the active cohort shrinks. At d32K, all eight requests
+reuse 32,764 tokens, prefill 2,060 new tokens and match the isolated 128-token
+AR continuation. Real-weight continuation tests also retain generated-history
+forks and cancellation replay.
+
+Profiles, ablations and source identities remain in the
+[compact Q8 artifact](artifacts/q8-tg-focused.json). Current measured rates live
+only in [benchmarks](BENCHMARKS.md). Admission order affects mixed-cohort timings;
+a single measured run does not establish a confidence interval for small gains.
+
+## Meaning of Exact
+
+Concurrency benchmarks measure AR once per quantization, then run DFlash2
+workloads independently. The `multi-{mixed,repetition}-<quant>-gufo-ar.json`
+files retain reusable C1 hashes; mixed AR/reference files also retain batch
+consistency evidence. These quality records contain no performance timings.
+Refresh the isolated AR reference when target arithmetic, weights, tokenizer
+or request settings change. DFlash2 benchmarking rejects a missing case hash
+before starting a model server; it never silently runs an extra AR sweep.
+
+`Exact` in the retained quality artifacts compares llama.cpp AR text hashes with
+Gufo C1 AR. It is **cross-engine agreement**, not an accuracy percentage. In the retained
+September 21 corpus, each engine's C1 DFlash2 matches its own AR on all nine cases.
+Cross-engine C1 agreement is 3/9 for Q4 and 4/9 for the historical Q8_K_L file.
+Compared with its own C1, llama.cpp AR agrees on 7/10, 7/12, 8/12 and 10/16 Q4
+requests at C2/C4/C6/C8; historical Q8_K_L agrees on 7/10, 3/12, 4/12 and 6/16.
+The [hash audit](artifacts/q4-dflash2-c1-focused.json) records source identities.
+
+Fresh pinned llama.cpp `68d9053a` controls also show AR/DFlash2 differences on a
+Q4 prose prompt and on the Q8_K_XL d32K continuation. Each comparison uses the
+same messages, model files and greedy settings within that engine; Gufo retains
+AR/DFlash2 agreement. The Q8 d0 outputs match across all four modes. These
+observations do not determine which arithmetic matches the original checkpoint.
+Original-target qualification is still needed to resolve that question.
+
+On the current Q8_K_XL nine-case corpus, cross-engine C1 AR agreement is 7/9.
+At C8, llama.cpp preserves 10/16 of its own C1 AR completions with AR and 6/16
+with DFlash2; Gufo preserves 16/16 with both. These are execution-consistency
+checks, not evidence that either engine matches the unquantized checkpoint.
 
 ## Maintained checks
 
@@ -79,7 +174,7 @@ nix develop -c build/gpu-test/tests/models/qwen27b/inference_backend_gpu_test \
 
 For an optimization, first check the affected operator against independent
 formulas or scalar decode. Then check model replay on each affected target and
-draft precision. Compare full logits/features and token IDs, including cached
+supported draft. Compare full logits/features and token IDs, including cached
 replay; retain the established tolerances. Run short warmed release timings
 with matched artifacts and prompts, alternating binaries during experiments.
 Profile separately. Broaden to depth/concurrency sweeps only when needed.
@@ -118,8 +213,9 @@ so equal seeds need not produce identical continuations across the two modes.
 Repeated runs within one configuration must reproduce IDs, including cache hits.
 
 Adaptive chooses the block length before drawing proposals using accepted-length
-history and offline verification costs. It never uses live timing or the current
-sample. Controller state persists within a request and resets for a new one.
+history and offline verification costs, including context-dependent attention
+cost. It never uses live timing or the current sample. Controller state persists
+within a request and resets for a new one.
 `--draft-tokens` caps length; `--draft-policy fixed` selects the comparison policy.
 
 | Entry point | Contract |
@@ -130,7 +226,7 @@ sample. Controller state persists within a request and resets for a new one.
 | `eval` | Uses server draft configuration and sampling defaults. |
 | Audio/video, diagnostics and probes | Do not run Qwen27B DFlash2; unsupported draft flags are rejected. |
 
-The retained matrix covers 23 named strategies on Q4/Q8 AR and every draft under
+The retained matrix covers 23 named strategies on Q4/Q8 AR and Q4 DFlash2 under
 fixed/adaptive controllers; 15 executable/HTTP configurations exercise six
 adapters, request overrides, cold/cached replay, streaming, multi-turn EOS,
 C2 isolation and cancellation. See
@@ -152,14 +248,10 @@ windowed noncausal attention, causal dynamic convolution and selector transition
 scores. Each layer is checked both cumulatively and with captured layer inputs;
 the head and conditional selector probabilities are also isolated.
 
-One real 24-token Q4 target prefix, seven proposals, temperature 0.8: all three
-drafts pass; all 21 candidate sets and random draws match.
-
-| Draft | Worst stage relative RMSE | Full-logit max error | Proposal max total variation |
-| --- | ---: | ---: | ---: |
-| Q4_K_M | 5.83e-6 | 7.72e-5 | 1.60e-5 |
-| Q8_0 | 5.74e-6 | 9.54e-5 | 1.25e-5 |
-| BF16 | 6.16e-6 | 1.13e-4 | 7.01e-6 |
+One real 24-token Q4 target prefix, seven proposals, temperature 0.8:
+all seven candidate sets and random draws match with the Q4_K_M draft.
+Worst stage relative RMSE is **5.83e-6**, full-logit maximum error **7.72e-5**,
+and proposal maximum total variation **1.60e-5**.
 
 Gates: stage relative RMSE ≤1e-4; full-logit maximum error ≤1e-3; proposal total
 variation ≤1e-4; isolated selector probability error ≤5e-6.
@@ -262,3 +354,63 @@ axial vision RoPE, normalization and GELU variants, language mRoPE, Flash
 indexer positions, and shifted MTP inputs. Secondary implementation controls:
 llama.cpp `18a04f09c24616898792bcfaa17f3550bdc78912` and
 vLLM `63d9ad0a3a435cdf3a44495028b10f390a38f960`.
+
+## Benchmark method
+
+The September 23 refresh uses Nix release Gufo `628ed18e` and pinned llama.cpp
+`68d9053a`, over HTTP with identical Q4_K_XL / Q8_K_XL files, greedy decoding
+and thinking off. Inference code is unchanged during the refresh.
+The fast correctness suite passes; full binary hashes are in
+[model identities](artifacts/model-identities.json).
+
+| Refresh consistency check | Q4_K_XL | Q8_K_XL |
+| --- | ---: | ---: |
+| AR/DFlash2 mixed continuation hashes, depths 0–128K | 8/8 | 8/8 |
+| AR C2/C4/C6/C8 hashes matching C1 | 20/20 | 20/20 |
+| DFlash2 mixed hashes matching isolated AR | 59/59 | 59/59 |
+| DFlash2 repetitive hashes matching isolated AR | 21/21 | 21/21 |
+| Concurrency prompt-cache hits | 0 | 0 |
+
+The same AR/DFlash2 depth check matches 2/8 completions per quantization in
+pinned llama.cpp. Each mode generates its own prefix reply, as described below;
+this result does not identify which engine matches the original checkpoint.
+
+Each point has one measured run. Throughput tables warm once per server;
+concurrency warms only its first cohort, capped at 16 output tokens. Existing
+isolated AR completion hashes qualify the mixed/repetitive workloads without
+another AR performance sweep. Every measured corpus group still runs, padding
+its last group to the requested concurrency.
+
+Single-user controls request pp2048/tg128 at depths 0–128K, seed 1, with context
+capacity 133760. Both engines receive the same synthetic user turns; each mode
+continues its own eight-token generated prefix reply. Prefix replies can differ
+across engines, so these controls do not establish equal internal histories.
+Actual prefix/new-token counts are retained and must fit the configured tolerance
+(maximum of 32 tokens or 0.5%). Each engine's DFlash2 pp cell takes the highest
+measured rate across mixed/repetitive text at that depth; pp gain compares those
+maxima. tg and its gain stay separate by text type.
+
+Concurrency uses context 4096 per request and up to 128 output tokens. AR uses
+`repetition_word`; DFlash2 has mixed and repetitive workloads. The summary case
+ends early. Rates sum individual request decode rates and average complete
+cohorts, excluding prefill and scheduling. Every concurrency starts a fresh
+server, and a prompt-cache hit fails qualification. Its C1 workload has a short
+prompt, so its rate need not equal the single-user pp2048 depth sweep.
+
+Loading measures cold target/draft files to HTTP readiness, C1 with DFlash2 and
+context capacity 262144. `POSIX_FADV_DONTNEED` evicts the model files;
+`mincore` must confirm zero resident pages before launch. Runtime libraries can
+remain cached. Memory uses AR at the same capacity and records the peak global
+HIP allocation every 250 ms, including the separately recorded idle allocation.
+
+Refresh selected rows with `tools/bench/model-bench.py --model qwen3.8-27b`:
+`run --target gufo --table <table>` or `run --target reference --table <table>`
+with the model paths supplied as documented in the
+[benchmark skill](../../../.agents/skills/benchmark-model/SKILL.md).
+Pass `--reference-binary PATH` for the pinned Nix `llama-server`.
+`single-dflash2-q4` / `single-dflash2-q8` and
+`multi-dflash2-q4` / `multi-dflash2-q8` run both workloads; `--todo` selects missing
+cells separately for each workload (including missing shared pp for single-user
+tables). Use `render` to regenerate the results card and charts without running
+a model. Artifact rows retain commands, counts, dates and draft statistics;
+completion hashes test execution consistency, not original-model accuracy.

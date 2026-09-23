@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
@@ -108,21 +109,9 @@ __global__ void dflash_silu_mul_kernel(float* __restrict__ gate,
   gate[idx] = silu_g * up[idx];
 }
 
-/// Query heads per key/value head that the group-query attention route keeps
-/// live in registers. The shipped DFlash-2 topology has sixteen query heads
-/// over four key/value heads; the launcher rejects anything wider or any width
-/// it has no instantiation for.
-
-/// Wave-per-key variant of the QK stage below.
-///
-/// The reference kernel gives each key position one thread, which then walks
-/// head_dim contiguous floats. Consecutive threads are therefore kv_dim apart
-/// and every four-byte read pulls a whole cache line for itself, while all
-/// num_q_heads query heads re-read the same num_kv_heads K rows. This variant
-/// gives each key position one wave with float4 lane-strided loads -- the same
-/// shape the target's batched attention already uses -- so one wave's read of a
-/// K row is 32 consecutive float4. The PV stage is already coalesced (thread
-/// per head_dim element) and is unchanged.
+// Coalesced QK loads and shared K/V reads for adjacent query heads. Each
+// head retains its original dot-product and 256-thread softmax reduction.
+template<uint32_t QueryHeads>
 __global__ void dflash_noncausal_attention_wave_kernel(
     const float* __restrict__ q, const float* __restrict__ injected_k,
     const float* __restrict__ injected_v, const float* __restrict__ block_k,
@@ -130,133 +119,180 @@ __global__ void dflash_noncausal_attention_wave_kernel(
     uint32_t current_pos, uint32_t history_length, uint32_t block_count,
     uint32_t sliding_window, uint32_t num_q_heads, uint32_t num_kv_heads,
     uint32_t head_dim, float scale, uint32_t history_capacity) {
-  const uint32_t tok = blockIdx.x;
-  const uint32_t h = blockIdx.y;
-  if (tok >= block_count || h >= num_q_heads)
+  constexpr uint32_t kPrefetch = 32;
+  const uint32_t tok = blockIdx.x, h = blockIdx.y * QueryHeads;
+  if (tok >= block_count || h + QueryHeads > num_q_heads)
     return;
-
-  const uint32_t gqa_group = num_q_heads / num_kv_heads;
-  const uint32_t kv_h = h / gqa_group;
-  const uint32_t q_dim = num_q_heads * head_dim;
-  const uint32_t kv_dim = num_kv_heads * head_dim;
+  const uint32_t kv_h = h / (num_q_heads / num_kv_heads),
+                 q_dim = num_q_heads * head_dim,
+                 kv_dim = num_kv_heads * head_dim;
   const uint32_t query_position = current_pos + tok;
   const uint32_t history_start = current_pos + 1U > sliding_window
                                      ? current_pos + 1U - sliding_window
                                      : 0U;
-  const uint32_t history_count =
-      history_length > history_start ? history_length - history_start : 0U;
-  const uint32_t total_k = history_count + block_count;
-
-  const float* q_ptr = q + ((uint64_t)tok * q_dim + (uint64_t)h * head_dim);
-  float* out_ptr = out + ((uint64_t)tok * q_dim + (uint64_t)h * head_dim);
-  const float4* q_vec = reinterpret_cast<const float4*>(q_ptr);
-  const uint32_t num_vec = head_dim / 4U;
-
-  extern __shared__ float s_scores[];
-
-  const uint32_t lane = threadIdx.x & 31U;
-  const uint32_t wave = threadIdx.x >> 5U;
-  const uint32_t waves = blockDim.x >> 5U;
-
+  const uint32_t history_count = history_length > history_start
+                                     ? history_length - history_start
+                                     : 0U,
+                 total_k = history_count + block_count;
+  const float4* q_vec = reinterpret_cast<const float4*>(
+      q + uint64_t(tok) * q_dim + uint64_t(h) * head_dim);
+  const uint32_t num_vec = head_dim / 4U, lane = threadIdx.x & 31U,
+                 wave = threadIdx.x >> 5U, waves = blockDim.x >> 5U;
+  extern __shared__ float scores[];
+  __shared__ float reduce[QueryHeads][256];
   for (uint32_t local = wave; local < history_count; local += waves) {
     const uint32_t position = history_start + local;
-    const float4* k_vec = reinterpret_cast<const float4*>(
-        injected_k + ((uint64_t)(position % history_capacity) * kv_dim +
-                      (uint64_t)kv_h * head_dim));
-    float dot = 0.0F;
+    const float4* key = reinterpret_cast<const float4*>(
+        injected_k + uint64_t(position % history_capacity) * kv_dim +
+        uint64_t(kv_h) * head_dim);
+    float dot[QueryHeads] = {};
     for (uint32_t d = lane; d < num_vec; d += 32U) {
-      const float4 qv = q_vec[d];
-      const float4 kv = k_vec[d];
-      dot += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+      const float4 kv = key[d];
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g) {
+        const float4 qv = q_vec[g * num_vec + d];
+        dot[g] += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+      }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
-      dot += __shfl_xor(dot, offset);
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g)
+        dot[g] += __shfl_xor(dot[g], offset);
     }
-    if (lane == 0U) {
-      s_scores[local] =
-          query_position - position < sliding_window ? dot * scale : -1e20F;
+    if (lane == 0) {
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g)
+        scores[g * total_k + local] = query_position - position < sliding_window
+                                          ? dot[g] * scale
+                                          : -1e20F;
     }
   }
-
   for (uint32_t p = wave; p < block_count; p += waves) {
-    const float4* k_vec = reinterpret_cast<const float4*>(
-        block_k + ((uint64_t)p * kv_dim + (uint64_t)kv_h * head_dim));
-    float dot = 0.0F;
+    const float4* key = reinterpret_cast<const float4*>(
+        block_k + uint64_t(p) * kv_dim + uint64_t(kv_h) * head_dim);
+    float dot[QueryHeads] = {};
     for (uint32_t d = lane; d < num_vec; d += 32U) {
-      const float4 qv = q_vec[d];
-      const float4 kv = k_vec[d];
-      dot += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+      const float4 kv = key[d];
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g) {
+        const float4 qv = q_vec[g * num_vec + d];
+        dot[g] += (qv.x * kv.x) + (qv.y * kv.y) + (qv.z * kv.z) + (qv.w * kv.w);
+      }
     }
     for (int offset = 16; offset > 0; offset >>= 1) {
-      dot += __shfl_xor(dot, offset);
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g)
+        dot[g] += __shfl_xor(dot[g], offset);
     }
-    if (lane == 0U) {
+    if (lane == 0) {
       const uint32_t key_position = current_pos + p;
       const uint32_t distance = query_position > key_position
                                     ? query_position - key_position
                                     : key_position - query_position;
-      s_scores[history_count + p] =
-          distance < sliding_window ? dot * scale : -1e20F;
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g)
+        scores[g * total_k + history_count + p] =
+            distance < sliding_window ? dot[g] * scale : -1e20F;
     }
   }
   __syncthreads();
-
-  __shared__ float s_reduce[256];
-  float local_max = -1e20F;
+  float maxima[QueryHeads];
+#pragma unroll
+  for (unsigned g = 0; g < QueryHeads; ++g)
+    maxima[g] = -1e20F;
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
-    local_max = fmaxf(local_max, s_scores[p]);
+#pragma unroll
+    for (unsigned g = 0; g < QueryHeads; ++g)
+      maxima[g] = fmaxf(maxima[g], scores[g * total_k + p]);
   }
-  s_reduce[threadIdx.x] = local_max;
+#pragma unroll
+  for (unsigned g = 0; g < QueryHeads; ++g)
+    reduce[g][threadIdx.x] = maxima[g];
   __syncthreads();
-
   for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
     if (threadIdx.x < stride) {
-      s_reduce[threadIdx.x] =
-          fmaxf(s_reduce[threadIdx.x], s_reduce[threadIdx.x + stride]);
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g)
+        reduce[g][threadIdx.x] =
+            fmaxf(reduce[g][threadIdx.x], reduce[g][threadIdx.x + stride]);
     }
     __syncthreads();
   }
-  const float max_val = s_reduce[0];
+#pragma unroll
+  for (unsigned g = 0; g < QueryHeads; ++g)
+    maxima[g] = reduce[g][0];
   __syncthreads();
-
-  float local_sum = 0.0F;
+  float sums[QueryHeads] = {};
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
-    const float exp_score = expf(s_scores[p] - max_val);
-    s_scores[p] = exp_score;
-    local_sum += exp_score;
+#pragma unroll
+    for (unsigned g = 0; g < QueryHeads; ++g) {
+      const float e = expf(scores[g * total_k + p] - maxima[g]);
+      scores[g * total_k + p] = e;
+      sums[g] += e;
+    }
   }
-  s_reduce[threadIdx.x] = local_sum;
+#pragma unroll
+  for (unsigned g = 0; g < QueryHeads; ++g)
+    reduce[g][threadIdx.x] = sums[g];
   __syncthreads();
-
   for (uint32_t stride = blockDim.x / 2; stride > 0; stride /= 2) {
     if (threadIdx.x < stride) {
-      s_reduce[threadIdx.x] += s_reduce[threadIdx.x + stride];
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g)
+        reduce[g][threadIdx.x] += reduce[g][threadIdx.x + stride];
     }
     __syncthreads();
   }
-  const float inv_sum = 1.0F / (s_reduce[0] + 1e-9F);
+#pragma unroll
+  for (unsigned g = 0; g < QueryHeads; ++g)
+    sums[g] = 1.f / (reduce[g][0] + 1e-9F);
   __syncthreads();
-
   for (uint32_t p = threadIdx.x; p < total_k; p += blockDim.x) {
-    s_scores[p] *= inv_sum;
+#pragma unroll
+    for (unsigned g = 0; g < QueryHeads; ++g)
+      scores[g * total_k + p] *= sums[g];
   }
   __syncthreads();
-
   for (uint32_t d = threadIdx.x; d < head_dim; d += blockDim.x) {
-    float acc = 0.0F;
-    for (uint32_t local = 0; local < history_count; ++local) {
-      const uint32_t position = history_start + local;
-      const float* v_ptr =
-          injected_v + ((uint64_t)(position % history_capacity) * kv_dim +
-                        (uint64_t)kv_h * head_dim);
-      acc += s_scores[local] * v_ptr[d];
+    float acc[QueryHeads] = {};
+    uint32_t slot = history_count > 0 ? history_start % history_capacity : 0;
+    // Issue independent value loads together, then retain the original
+    // ascending-key FMA sequence. Advancing the ring slot avoids a division
+    // for every value without changing the persistent KV layout.
+    uint32_t local = 0;
+    for (; history_count - local >= kPrefetch; local += kPrefetch) {
+      float values[kPrefetch];
+#pragma unroll
+      for (unsigned i = 0; i < kPrefetch; ++i) {
+        values[i] =
+            injected_v[uint64_t(slot) * kv_dim + uint64_t(kv_h) * head_dim + d];
+        slot = slot + 1 == history_capacity ? 0 : slot + 1;
+      }
+#pragma unroll
+      for (unsigned i = 0; i < kPrefetch; ++i) {
+#pragma unroll
+        for (unsigned g = 0; g < QueryHeads; ++g)
+          acc[g] += scores[g * total_k + local + i] * values[i];
+      }
+    }
+    for (; local < history_count; ++local) {
+      const float value =
+          injected_v[uint64_t(slot) * kv_dim + uint64_t(kv_h) * head_dim + d];
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g)
+        acc[g] += scores[g * total_k + local] * value;
+      slot = slot + 1 == history_capacity ? 0 : slot + 1;
     }
     for (uint32_t p = 0; p < block_count; ++p) {
-      const float* v_ptr =
-          block_v + ((uint64_t)p * kv_dim + (uint64_t)kv_h * head_dim);
-      acc += s_scores[history_count + p] * v_ptr[d];
+      const float value =
+          block_v[uint64_t(p) * kv_dim + uint64_t(kv_h) * head_dim + d];
+#pragma unroll
+      for (unsigned g = 0; g < QueryHeads; ++g)
+        acc[g] += scores[g * total_k + history_count + p] * value;
     }
-    out_ptr[d] = acc;
+#pragma unroll
+    for (unsigned g = 0; g < QueryHeads; ++g)
+      out[uint64_t(tok) * q_dim + uint64_t(h + g) * head_dim + d] = acc[g];
   }
 }
 
@@ -452,6 +488,9 @@ __global__ void dflash_selector_partial_topk_kernel(
     const float* __restrict__ logits, float* __restrict__ partial_scores,
     uint32_t* __restrict__ partial_ids, uint32_t vocab_size,
     uint32_t selector_top_k) {
+  logits += uint64_t(blockIdx.y) * vocab_size;
+  partial_scores += uint64_t(blockIdx.y) * gridDim.x * selector_top_k;
+  partial_ids += uint64_t(blockIdx.y) * gridDim.x * selector_top_k;
   __shared__ float shared_scores[kSelectorThreads * kMaxSelectorTopK];
   __shared__ uint32_t shared_ids[kSelectorThreads * kMaxSelectorTopK];
 
@@ -488,7 +527,7 @@ __global__ void dflash_selector_partial_topk_kernel(
   }
 }
 
-__global__ void dflash_selector_finalize_kernel(
+__device__ __forceinline__ void FinalizeSelector(
     const float* __restrict__ partial_scores,
     const uint32_t* __restrict__ partial_ids,
     const float* __restrict__ projected_hidden,
@@ -632,6 +671,63 @@ __global__ void dflash_selector_finalize_kernel(
   }
 }
 
+__global__ void dflash_selector_finalize_kernel(
+    const float* partial_scores, const uint32_t* partial_ids,
+    const float* projected_hidden, const hip_bfloat16* predecessor_codebook,
+    const hip_bfloat16* successor_codebook, const uint32_t* predecessor_token,
+    uint32_t* output_token, float* output_confidence, float temperature,
+    const float* sample_uniform, uint32_t* candidate_ids,
+    float* candidate_probabilities, uint32_t partial_count,
+    uint32_t selector_rank, uint32_t selector_top_k) {
+  FinalizeSelector(partial_scores, partial_ids, projected_hidden,
+                   predecessor_codebook, successor_codebook, predecessor_token,
+                   output_token, output_confidence, temperature, sample_uniform,
+                   candidate_ids, candidate_probabilities, partial_count,
+                   selector_rank, selector_top_k);
+}
+
+struct SelectorBatch {
+  DFlashSelectorSequence sequences[8];
+  uint32_t row_offsets[8];
+  uint32_t token_offsets[8];
+};
+
+__global__ void dflash_selector_finalize_batch_kernel(
+    const float* partial_scores, const uint32_t* partial_ids,
+    const float* projected_hidden, const hip_bfloat16* predecessor_codebook,
+    const hip_bfloat16* successor_codebook, uint32_t* tokens,
+    float* confidences, const float* uniforms, uint32_t* candidate_ids,
+    float* candidate_probabilities, SelectorBatch batch, uint32_t partial_count,
+    uint32_t selector_rank, uint32_t selector_top_k) {
+  const auto sequence = batch.sequences[blockIdx.x];
+  __shared__ uint32_t predecessor;
+  if (threadIdx.x == 0U)
+    predecessor = tokens[batch.token_offsets[blockIdx.x]];
+  __syncthreads();
+  for (uint32_t step = 0; step < sequence.count; ++step) {
+    const uint32_t row = batch.row_offsets[blockIdx.x] + step;
+    const uint32_t token = batch.token_offsets[blockIdx.x] + step;
+    const uint64_t partial = uint64_t(row) * partial_count * selector_top_k;
+    const uint64_t candidate = uint64_t(row) * selector_top_k;
+    FinalizeSelector(
+        partial_scores + partial, partial_ids + partial,
+        projected_hidden + uint64_t(row) * selector_rank, predecessor_codebook,
+        successor_codebook, &predecessor, tokens + token + 1U,
+        confidences == nullptr ? nullptr : confidences + row,
+        sequence.temperature,
+        sequence.temperature > 0.0F ? uniforms + row : nullptr,
+        candidate_ids != nullptr ? candidate_ids + candidate : nullptr,
+        candidate_probabilities != nullptr ? candidate_probabilities + candidate
+                                           : nullptr,
+        partial_count, selector_rank, selector_top_k);
+    // Thread zero publishes the predecessor for this sequence's next step.
+    // Other sequences own separate token, probability and partial buffers.
+    if (threadIdx.x == 0U)
+      predecessor = tokens[token + 1U];
+    __syncthreads();
+  }
+}
+
 void LaunchDFlashGroupedDynamicConv(
     const float* input, const float* dynamic_coefficients,
     const float* base_kernel, float* output, std::uint32_t num_tokens,
@@ -658,10 +754,6 @@ struct DFlashAttentionLaunch {
   dim3 grid;
   std::size_t shared_bytes;
 };
-
-/// Dynamic shared-memory ceiling the group-query route stays under. It holds
-/// one score row per query head in the group instead of one row in total, so
-/// it is the route that can outgrow LDS; the others cannot.
 
 [[nodiscard]] DFlashAttentionLaunch DFlashAttentionGeometry(
     std::uint32_t current_pos, std::uint32_t history_length,
@@ -705,11 +797,25 @@ void LaunchDFlashNonCausalAttentionWave(
     std::uint32_t history_capacity) {
   const auto geometry = DFlashAttentionGeometry(
       current_pos, history_length, block_count, sliding_window, num_q_heads);
-  dflash_noncausal_attention_wave_kernel<<<geometry.grid, 256,
-                                           geometry.shared_bytes, stream>>>(
-      q, injected_k, injected_v, block_k, block_v, out, current_pos,
-      history_length, block_count, sliding_window, num_q_heads, num_kv_heads,
-      head_dim, scale, history_capacity);
+  // Wider blocks benefit from two query heads per CTA. Keep narrow blocks
+  // independent and leave enough LDS for both 256-thread reduction rows.
+  const auto heads_per_kv = num_q_heads / num_kv_heads;
+  if (block_count >= 4 && (heads_per_kv % 2U) == 0U &&
+      geometry.shared_bytes <= (64U * 1024U - 2U * 256U * sizeof(float)) / 2U) {
+    auto grid = geometry.grid;
+    grid.y /= 2U;
+    dflash_noncausal_attention_wave_kernel<2>
+        <<<grid, 256, 2U * geometry.shared_bytes, stream>>>(
+            q, injected_k, injected_v, block_k, block_v, out, current_pos,
+            history_length, block_count, sliding_window, num_q_heads,
+            num_kv_heads, head_dim, scale, history_capacity);
+    return;
+  }
+  dflash_noncausal_attention_wave_kernel<1>
+      <<<geometry.grid, 256, geometry.shared_bytes, stream>>>(
+          q, injected_k, injected_v, block_k, block_v, out, current_pos,
+          history_length, block_count, sliding_window, num_q_heads,
+          num_kv_heads, head_dim, scale, history_capacity);
 }
 
 void LaunchDFlashNonCausalAttention(
@@ -767,6 +873,52 @@ void LaunchDFlashSelectorStep(
       predecessor_token, output_token, output_confidence, temperature,
       sample_uniform, candidate_ids, candidate_probabilities, partial_count,
       selector_rank, selector_top_k);
+}
+
+void LaunchDFlashSelectorBatch(
+    const float* logits, const float* projected_hidden,
+    const void* predecessor_codebook_bf16, const void* successor_codebook_bf16,
+    std::uint32_t* tokens, float* confidences, float* partial_scores,
+    std::uint32_t* partial_ids, const float* uniforms,
+    std::uint32_t* candidate_ids, float* candidate_probabilities,
+    std::span<const DFlashSelectorSequence> sequences, std::uint32_t vocab_size,
+    std::uint32_t selector_rank, std::uint32_t selector_top_k,
+    hipStream_t stream) {
+  if (sequences.empty() || sequences.size() > 8 || logits == nullptr ||
+      projected_hidden == nullptr || predecessor_codebook_bf16 == nullptr ||
+      successor_codebook_bf16 == nullptr || tokens == nullptr ||
+      partial_scores == nullptr || partial_ids == nullptr || vocab_size == 0 ||
+      selector_rank == 0 || selector_top_k == 0 ||
+      selector_top_k > kMaxSelectorTopK || selector_top_k > vocab_size)
+    throw std::invalid_argument("invalid DFlash selector batch or scratch");
+  SelectorBatch batch{};
+  std::uint32_t rows = 0;
+  for (std::size_t index = 0; index < sequences.size(); ++index) {
+    const auto sequence = sequences[index];
+    if (sequence.count == 0 ||
+        sequence.count >
+            std::numeric_limits<std::uint32_t>::max() - 8U - rows ||
+        !std::isfinite(sequence.temperature) || sequence.temperature < 0.0F ||
+        (sequence.temperature > 0.0F && uniforms == nullptr))
+      throw std::invalid_argument("invalid DFlash selector sequence");
+    batch.sequences[index] = sequence;
+    batch.row_offsets[index] = rows;
+    batch.token_offsets[index] = rows + static_cast<std::uint32_t>(index);
+    rows += sequence.count;
+  }
+  const auto partial_count = static_cast<std::uint32_t>(
+      (static_cast<std::uint64_t>(vocab_size) + kSelectorTokensPerBlock - 1U) /
+      kSelectorTokensPerBlock);
+  dflash_selector_partial_topk_kernel<<<dim3(partial_count, rows),
+                                        kSelectorThreads, 0, stream>>>(
+      logits, partial_scores, partial_ids, vocab_size, selector_top_k);
+  dflash_selector_finalize_batch_kernel<<<sequences.size(), kSelectorThreads, 0,
+                                          stream>>>(
+      partial_scores, partial_ids, projected_hidden,
+      static_cast<const hip_bfloat16*>(predecessor_codebook_bf16),
+      static_cast<const hip_bfloat16*>(successor_codebook_bf16), tokens,
+      confidences, uniforms, candidate_ids, candidate_probabilities, batch,
+      partial_count, selector_rank, selector_top_k);
 }
 
 }  // namespace gufo::hip::kernels

@@ -239,8 +239,6 @@ private:
   float* d_ffn_down_{nullptr};
   float* d_logits_{nullptr};
   float* d_selector_hidden_{nullptr};
-  float* d_selector_partial_scores_{nullptr};
-  std::uint32_t* d_selector_partial_ids_{nullptr};
   std::uint32_t* d_selector_candidate_ids_{nullptr};
   float* d_selector_candidate_probabilities_{nullptr};
   float* d_selector_uniforms_{nullptr};
@@ -322,6 +320,9 @@ public:
 
   void Reset() noexcept override;
   void BeginRequest() noexcept override { controller_.Reset(); }
+  /// The most recent verification has not yet injected these target rows.
+  /// Discard them when the target returns to its saved verification frontier.
+  void DiscardPendingTargetContext(std::uint32_t position);
 
   [[nodiscard]] QwenGpuMemoryUsage GetMemoryUsage() const noexcept {
     return executor_->GetMemoryUsage();

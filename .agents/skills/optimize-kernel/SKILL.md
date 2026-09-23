@@ -64,9 +64,16 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   rows before touching state, and keep descriptor storage alive until completion.
   Test both shared and disjoint expert routing: weight reuse benefits shared
   experts, but single-request experts need a compact path.
+  Qualify draft controllers on both ordinary and perfect-acceptance prompts.
+  Context-dependent attention cost favored shorter blocks here, but treating
+  a capped accepted-run estimate as uncensored slowed perfect acceptance.
+  Compare completed-token rates; raw acceptance fractions depend on draft width.
   Group independent small projections in the launch grid and quantize batch
   activations once in idle prefill scratch. Preserve each row's original
   dot-product specialization; larger generic GEMV tiles can be slower.
+  Ragged Q8 groups benefited from masking the final group's loads/stores,
+  avoiding a separate weight pass. Profile mixed cohorts too: saturated
+  full-block costs miss repeated partial verification and odd-cohort fallbacks.
   For Q4 experts, grouping across the full batch improved weight reuse.
   A bounded grid can consume a compact device list without downloading its
   count. Qualify disjoint routing too; the same approach slowed Q5 mixed work.
@@ -88,6 +95,13 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   context. Preserve tie ordering and FP32 ranking. Pack existing KV bytes into
   bounded scratch/head groups without changing persistent precision. Do not
   change softmax reduction order without the model's numerical qualification.
+  Two 16-lane query heads per wave helped verification after preserving both
+  original 32-lane dot partials and their offset-16 addition. Scalar AR stayed
+  faster at 32 lanes; sharing KV across different query rows was slower.
+  In draft attention, prefetching 32 V rows before their original sequential
+  FMAs hid load latency; advance the ring slot instead of dividing each time.
+  Pairing query heads helped wider blocks. Wider prefetch and four-head groups
+  regressed; the component gain translated to about 1% in the complete model.
   For long H3 attention, packing V once into dead projection scratch replaced
   repeated scalar LDS gathers. Sharing K/V LDS in sequential phases retained
   occupancy; transposing V anew inside every attention tile was slower.
@@ -102,6 +116,11 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   token tile cannot overwrite history still being read. UMA has placement
   costs: mapped quantized weights and copied reusable audio/DiT weights behave
   differently.
+  Match production allocation in GEMV microbenchmarks: gate/up gains on
+  `hipMalloc` buffers disappeared with read-only mapped weights. Anonymous
+  huge pages improved Q4 AR by about 2%; bounded parallel copying kept warm
+  readiness below one second. Include startup cost and separate anonymous
+  model memory from the reclaimable file cache when judging that tradeoff.
   Cold HIP registration/upload can serialize page faults. Prefault existing
   mappings in bounded parallel chunks; this improved text/audio/image startup
   without another weight copy. Measure launch-to-ready and the first request,
@@ -123,6 +142,9 @@ changing dispatch. Follow the user's machine, time, and Git instructions.
   This saved more complete-request time than faster individual TTS GEMVs.
   Finish a norm's existing descending sum tree within one wave to remove
   barriers without reordering additions. Check the BF16 output boundaries.
+  Unrolling cached RMSNorm changed FMA contraction despite passing greedy
+  replay. Explicit fused square accumulation restored scalar/batched full-logit
+  agreement; test small unsaturated inputs and every verification width.
   For BF16 image kernels, branchless round-to-nearest-even conversion and
   fused gate/up, SiLU and output packing helped; retain NaN payload handling.
   A BF16 activation has only 65,536 inputs: exhaust that domain before

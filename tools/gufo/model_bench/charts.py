@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import BenchConfig, TableSpec
-from .render import MARKER_RE, _number, layout_for, parse_table
+from .render import MARKER_RE, _number, layout_for, model_label, parse_table
 
 # Categorical slots from the validated default palette: Gufo, reference, Gufo speculative.
 COLORS = {"gufo": "#2a78d6", "reference": "#eb6834", "spec": "#1baf7a", "ref_spec": "#eda100"}
@@ -82,7 +82,7 @@ def _bars(ax: Any, labels: list[str], series: list[tuple[str, list[float], str]]
     width = 0.8 / len(series)
     for offset, (name, values, color) in enumerate(series):
         x = [i - 0.4 + width * (offset + 0.5) for i in range(len(labels))]
-        ax.bar(x, [0 if math.isnan(v) else v for v in values], width=width - 0.04, color=color,
+        ax.bar(x, values, width=width - 0.04, color=color,
                label=name, linewidth=0)
     _finish_axes(ax, labels, series, ylabel)
 
@@ -94,59 +94,82 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
     ref = config.reference_name
     spec_label = config.speculative["label"]
     kind = table.kind
-    title = table.spec.get("title", table.id)
-    if table.variant:
-        title += f" ({config.variant_label(table.variant)})"
+    title = f"{model_label(config, table)} · {table.spec.get('title', table.id)}"
     plt = _plt()
 
-    if kind == "single" and not table.speculative:
-        gp, rp, gt, rt = (_series(rows, labels, h) for h in ("Gufo pp", f"{ref} pp", "Gufo tg", f"{ref} tg"))
+    if kind == "single" and table.workload_tables():
+        workloads = table.workload_tables()
+        panels = [("Prefill", "pp", "prefill tok/s")]
+        panels += [(w.spec["label"].capitalize(), f"tg {w.spec['label']}", "generation tok/s")
+                   for w in workloads]
+        matched_mode = config.reference_speculative
+        series = [
+            (_series(rows, labels, f"Gufo {metric}"),
+             _series(rows, labels, f"{ref if matched_mode or metric == 'pp' else ref + ' AR'} {metric}"))
+            for _, metric, _ in panels
+        ]
+        if not any(_has_data(g, r) for g, r in series):
+            return False
+        fig, axes = plt.subplots(1, len(panels), figsize=(4 * len(panels), 3.2), squeeze=False)
+        for ax, (panel, _, unit), (g, r) in zip(axes[0], panels, series):
+            _lines(ax, labels, [("Gufo", g, COLORS["spec"]),
+                               (ref if matched_mode else f"{ref} AR", r, COLORS["ref_spec"])],
+                   unit, _depth_ticks(labels))
+            ax.set_title(panel)
+            ax.set_xlabel("context depth (tokens)")
+            ax.legend(loc="lower left")
+            if not _has_data(g, r):
+                ax.text(0.5, 0.5, "TODO", transform=ax.transAxes, ha="center")
+    elif kind == "single":
+        gp, gt = (_series(rows, labels, h) for h in ("Gufo pp", "Gufo tg"))
         if not _has_data(gp, gt):
             return False
+        matched_mode = not table.speculative or config.reference_speculative
+        rp = _series(rows, labels, f"{ref} pp") if matched_mode else [math.nan] * len(labels)
+        rt = _series(rows, labels, f"{ref} tg" if matched_mode else f"{ref} AR tg")
+        reference_name = ref if matched_mode else f"{ref} AR"
+        g_color, r_color = (COLORS["spec"], COLORS["ref_spec"]) if table.speculative else (COLORS["gufo"], COLORS["reference"])
         fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
         ticks = _depth_ticks(labels)
-        _lines(a1, labels, [("Gufo", gp, COLORS["gufo"]), (ref, rp, COLORS["reference"])], "prefill tok/s", ticks)
-        _lines(a2, labels, [("Gufo", gt, COLORS["gufo"]), (ref, rt, COLORS["reference"])], "generation tok/s", ticks)
+        _lines(a1, labels, [("Gufo", gp, g_color), (reference_name, rp, r_color)], "prefill tok/s", ticks)
+        _lines(a2, labels, [("Gufo", gt, g_color), (reference_name, rt, r_color)], "generation tok/s", ticks)
         a1.set_xlabel("context depth (tokens)")
         a2.set_xlabel("context depth (tokens)")
         a1.legend(loc="lower left")
-    elif kind == "single":
-        gp, gt, acc = (_series(rows, labels, h) for h in ("Gufo pp", "Gufo tg", "Gufo accepted/step"))
-        if not _has_data(gt):
+    elif kind == "multi" and table.workload_tables():
+        workloads = table.workload_tables()
+        if not any(_has_data(_series(rows, labels, f"Gufo {w.spec['label']}")) for w in workloads):
             return False
-        ticks = _depth_ticks(labels)
-        if config.reference_speculative:
-            rp, rt, racc = (_series(rows, labels, h) for h in (f"{ref} pp", f"{ref} tg", f"{ref} accepted/step"))
-            fig, (a0, a1, a2) = plt.subplots(1, 3, figsize=(11, 3.2))
-            _lines(a0, labels, [(f"Gufo {spec_label}", gp, COLORS["spec"]), (f"{ref} {spec_label}", rp, COLORS["ref_spec"])],
-                   "prefill tok/s", ticks)
-            a0.set_xlabel("context depth (tokens)")
-            a0.legend(loc="lower left")
-            ref_name = f"{ref} {spec_label}"
-            acceptance = [("Gufo accepted/step", acc, COLORS["spec"]), (f"{ref} accepted/step", racc, COLORS["ref_spec"])]
-        else:
-            rt = _series(rows, labels, f"{ref} AR tg")
-            fig, (a1, a2) = plt.subplots(1, 2, figsize=(8, 3.2))
-            ref_name = f"{ref} AR"
-            acceptance = [(f"Gufo {spec_label} accepted/step", acc, COLORS["spec"])]
-        _lines(a1, labels, [(f"Gufo {spec_label}", gt, COLORS["spec"]), (ref_name, rt, COLORS["ref_spec"])],
-               "generation tok/s", ticks)
-        _lines(a2, labels, acceptance, "accepted draft tokens per step", ticks)
-        a2.legend(loc="lower right")
-        pass
-        a1.set_xlabel("context depth (tokens)")
-        a2.set_xlabel("context depth (tokens)")
-        a1.legend(loc="lower left")
+        fig, axes = plt.subplots(1, len(workloads), figsize=(4.5 * len(workloads), 3.2), squeeze=False)
+        for ax, workload in zip(axes[0], workloads):
+            label = workload.spec["label"]
+            g, r = (_series(rows, labels, f"{engine} {label}") for engine in ("Gufo", ref))
+            _bars(ax, labels, [("Gufo", g, COLORS["spec"]), (ref, r, COLORS["ref_spec"])],
+                  "sum of request decode tok/s")
+            ax.set_title(label.capitalize())
+            ax.set_xlabel("concurrent users")
+            ax.legend(loc="upper left")
+            if not _has_data(g, r):
+                ax.text(0.5, 0.5, "TODO", transform=ax.transAxes, ha="center")
     elif kind == "multi":
-        ga, ra, gs = (_series(rows, labels, h) for h in ("Gufo AR", f"{ref} AR", f"Gufo {spec_label}"))
-        if not _has_data(ga, gs):
-            return False
-        series = [("Gufo AR", ga, COLORS["gufo"]), (f"{ref} AR", ra, COLORS["reference"]),
-                  (f"Gufo {spec_label}", gs, COLORS["spec"])]
-        if config.reference_speculative:
-            series.append((f"{ref} {spec_label}", _series(rows, labels, f"{ref} {spec_label}"), COLORS["ref_spec"]))
+        modes = table.spec.get("modes", ["ar"])
+        if len(modes) == 1:
+            g, r = (_series(rows, labels, c.header) for c in layout.columns[1:3])
+            if not _has_data(g):
+                return False
+            colors = ("gufo", "reference") if modes[0] == "ar" else ("spec", "ref_spec")
+            series = [(layout.columns[1].header, g, COLORS[colors[0]]),
+                      (layout.columns[2].header, r, COLORS[colors[1]])]
+        else:
+            ga, ra, gs = (_series(rows, labels, h) for h in ("Gufo AR", f"{ref} AR", f"Gufo {spec_label}"))
+            if not _has_data(ga, gs):
+                return False
+            series = [("Gufo AR", ga, COLORS["gufo"]), (f"{ref} AR", ra, COLORS["reference"]),
+                      (f"Gufo {spec_label}", gs, COLORS["spec"])]
+            if config.reference_speculative:
+                series.append((f"{ref} {spec_label}", _series(rows, labels, f"{ref} {spec_label}"), COLORS["ref_spec"]))
         fig, ax = plt.subplots(figsize=(6.5, 3.2))
-        _bars(ax, labels, series, "aggregate output tok/s")
+        _bars(ax, labels, series, "sum of request decode tok/s")
         ax.set_xlabel("concurrent users")
         ax.legend(loc="upper left")
     elif kind in ("loading", "memory", "image-encoder"):
@@ -166,6 +189,7 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, format="svg", metadata={"Date": None, "Creator": None})
     plt.close(fig)
+    path.write_text("\n".join(line.rstrip() for line in path.read_text().splitlines()) + "\n")
     return True
 
 
@@ -186,7 +210,8 @@ def render_charts(config: BenchConfig, document: str, only: set[str] | None = No
             return block + f"\n\n![{known[table_id].spec.get('title', table_id)}]({CHART_DIR}/{table_id}.svg)"
         return block
 
-    # Strip existing image lines so the pass is idempotent, then re-add for tables with data.
+    # Replace only selected charts; untouched table links must survive a partial render.
     for table_id in known:
-        document = re.sub(IMAGE_RE.format(id=re.escape(table_id)), "", document)
+        if not only or table_id in only:
+            document = re.sub(IMAGE_RE.format(id=re.escape(table_id)), "", document)
     return MARKER_RE.sub(replace, document), written

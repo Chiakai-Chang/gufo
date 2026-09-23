@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--todo", action="store_true", help="measure only rows that are TODO in BENCHMARKS.md")
     run.add_argument("--reference-binary", default=None, help="reference server executable (default from bench.json)")
     run.add_argument("--drop-caches", default=None,
-                     help="privileged shell command that drops the page cache before a loading launch")
+                     help="shell command that evicts model file pages before each loading launch")
     run.add_argument("--repetitions", type=int, default=None,
                      help="override each table's repetitions (mean ± sd is reported above 1)")
     run.add_argument("--fresh", action="store_true",
@@ -66,11 +66,13 @@ def cmd_tables(config: BenchConfig) -> int:
     from .artifacts import artifact_path
 
     for table in config.tables():
-        paths = [artifact_path(config, table, target) for target in TARGETS]
+        sources = table.workload_tables() or [table]
+        paths = [artifact_path(config, source, target) for source in sources for target in TARGETS]
         if table.kind == "multi":
             modes = table.spec.get("modes", ["ar"])
-            paths = [artifact_path(config, table, "gufo", m) for m in modes]
-            paths += [artifact_path(config, table, "reference", None if m == "ar" else m) for m in modes]
+            paths = [artifact_path(config, source, "gufo", m) for source in sources for m in modes]
+            paths += [artifact_path(config, source, "reference", None if m == "ar" else m)
+                      for source in sources for m in modes]
         present = [p.name for p in paths if p.exists()]
         print(f"{table.id:28} {table.kind:14} {', '.join(present) or '-'}")
     return 0

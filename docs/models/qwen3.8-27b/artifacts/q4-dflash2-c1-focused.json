@@ -1,0 +1,1043 @@
+{
+  "date": "2026-09-22",
+  "model": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+  "model_snapshot": "4ca720788d1e01f1bff70c033e0d0028fd02e502",
+  "hardware": "gfx1151",
+  "mode": "dflash2",
+  "concurrency": 1,
+  "requested_prefill_tokens": 2048,
+  "generated_tokens": 128,
+  "temperature": 0,
+  "seed": 1,
+  "repetitions": 1,
+  "draft": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf",
+  "draft_snapshot": "2d9571f8ce46e151f61c6499c99dee6079e1d610",
+  "draft_policy": "adaptive",
+  "baseline": {
+    "revision": "29be53156076fc1f3e502d72f907cc4ff00122af",
+    "binary_sha256": "f2b9d7dedba2b17ba7f8fc69bc4511de79a141a53be5085baababfac0f3fc384"
+  },
+  "candidate": {
+    "base_revision": "29be53156076fc1f3e502d72f907cc4ff00122af",
+    "dirty": true,
+    "binary_sha256": "e41234a9bf4f5fc862654ddbbc9de946e64607150693bfaecddaf55cd1fece2c",
+    "attention_source_sha256": "b9cbfc5387fd657f0d155ccf97a1cc2ce33564118dd7e686b464a262fbda0f44",
+    "policy_source_sha256": "b7333096f4c1c10a075cdd198ea1a1a6644bd411e23d1d285d3d9d6c5e0624c9",
+    "draft_attention_source_sha256": "c73878b3a8a718dde3e98c0fe52f945906a1914ab8d595f390655136306bc09f"
+  },
+  "runs": [
+    {
+      "nominal_depth": 0,
+      "context_capacity": 36864,
+      "prompt_tokens": 2033,
+      "cached_prompt_tokens": 0,
+      "prefill_tokens": 2033,
+      "completion_tokens": 128,
+      "completion_sha256": "31ec3290777e44ce3901428eb5f9f738d4401e2b7eccb8cfee393f5dc5ec25d0",
+      "matches_ar_output": true,
+      "baseline": {
+        "prefill_ms": 3351.379505,
+        "decode_ms": 4598.414494000001,
+        "prefill_tokens_per_second": 606.6158717527874,
+        "decode_tokens_per_second": 27.835681225999544,
+        "draft_tokens": 197,
+        "draft_accepted_tokens": 85
+      },
+      "candidate": {
+        "prefill_ms": 3302.584175,
+        "decode_ms": 4270.817816000001,
+        "prefill_tokens_per_second": 615.5785567524558,
+        "decode_tokens_per_second": 29.97084060117632,
+        "draft_tokens": 186,
+        "draft_accepted_tokens": 88
+      }
+    },
+    {
+      "nominal_depth": 32768,
+      "context_capacity": 36864,
+      "prompt_tokens": 34563,
+      "cached_prompt_tokens": 32552,
+      "prefill_tokens": 2011,
+      "completion_tokens": 128,
+      "completion_sha256": "13297fd0b21d81b9b1d952f559616a797e8e56596905dc4f19a8a24ff5f9bb24",
+      "matches_ar_output": true,
+      "baseline": {
+        "prefill_ms": 4250.686832,
+        "decode_ms": 6106.055058000001,
+        "prefill_tokens_per_second": 473.10001406379774,
+        "decode_tokens_per_second": 20.962798203448493,
+        "draft_tokens": 189,
+        "draft_accepted_tokens": 81
+      },
+      "candidate": {
+        "prefill_ms": 4250.553757,
+        "decode_ms": 5986.84655,
+        "prefill_tokens_per_second": 473.1148257302231,
+        "decode_tokens_per_second": 21.380203907180483,
+        "draft_tokens": 186,
+        "draft_accepted_tokens": 82
+      }
+    },
+    {
+      "nominal_depth": 65536,
+      "context_capacity": 133760,
+      "prompt_tokens": 67152,
+      "cached_prompt_tokens": 65111,
+      "prefill_tokens": 2041,
+      "completion_tokens": 128,
+      "completion_sha256": "d1c24023054df84c662179849627e78085f8368c71c58539615cad7445514baf",
+      "matches_ar_output": true,
+      "baseline": {
+        "prefill_ms": 5175.141936,
+        "decode_ms": 7622.539685,
+        "prefill_tokens_per_second": 394.38531836240634,
+        "decode_tokens_per_second": 16.792303522129842,
+        "draft_tokens": 183,
+        "draft_accepted_tokens": 77
+      },
+      "candidate": {
+        "prefill_ms": 5171.92329,
+        "decode_ms": 7513.962452000002,
+        "prefill_tokens_per_second": 394.63075640474165,
+        "decode_tokens_per_second": 17.034953370831666,
+        "draft_tokens": 173,
+        "draft_accepted_tokens": 77
+      }
+    }
+  ],
+  "ar_regression_control": {
+    "nominal_depth": 0,
+    "binary_sha256": "62fb3add07b011aece82338d7f965440909618ac21b808197912089c8cb6eb0a",
+    "prompt_tokens": 2033,
+    "cached_prompt_tokens": 0,
+    "prefill_tokens": 2033,
+    "completion_tokens": 128,
+    "completion_sha256": "31ec3290777e44ce3901428eb5f9f738d4401e2b7eccb8cfee393f5dc5ec25d0",
+    "prefill_ms": 3073.938372,
+    "decode_ms": 10735.731447999995,
+    "prefill_tokens_per_second": 661.3665447942168,
+    "decode_tokens_per_second": 11.922801964634246
+  },
+  "repetition_controls": [
+    {
+      "nominal_depth": 0,
+      "context_capacity": 36864,
+      "prompt_tokens": 38,
+      "cached_prompt_tokens": 0,
+      "prefill_tokens": 38,
+      "completion_tokens": 128,
+      "completion_sha256": "24d4b2ba40bd0f337229c9a0a75682732b31e562ebd2fd6882a9f72a5b319675",
+      "candidate": {
+        "prefill_ms": 198.071688,
+        "decode_ms": 1868.460758,
+        "prefill_tokens_per_second": 191.84973068942594,
+        "decode_tokens_per_second": 68.50558645770606,
+        "draft_tokens": 110,
+        "draft_accepted_tokens": 110,
+        "binary_sha256": "e41234a9bf4f5fc862654ddbbc9de946e64607150693bfaecddaf55cd1fece2c"
+      },
+      "baseline": {
+        "prefill_ms": 198.788246,
+        "decode_ms": 1871.0984279999998,
+        "prefill_tokens_per_second": 191.15818346724586,
+        "decode_tokens_per_second": 68.4090147715094,
+        "draft_tokens": 110,
+        "draft_accepted_tokens": 110,
+        "binary_sha256": "f2b9d7dedba2b17ba7f8fc69bc4511de79a141a53be5085baababfac0f3fc384"
+      }
+    },
+    {
+      "nominal_depth": 65536,
+      "context_capacity": 133760,
+      "prompt_tokens": 65152,
+      "cached_prompt_tokens": 65111,
+      "prefill_tokens": 41,
+      "completion_tokens": 128,
+      "completion_sha256": "24d4b2ba40bd0f337229c9a0a75682732b31e562ebd2fd6882a9f72a5b319675",
+      "candidate": {
+        "prefill_ms": 312.799902,
+        "decode_ms": 3091.687607,
+        "prefill_tokens_per_second": 131.07420986340335,
+        "decode_tokens_per_second": 41.401336833058636,
+        "draft_tokens": 110,
+        "draft_accepted_tokens": 110,
+        "binary_sha256": "e41234a9bf4f5fc862654ddbbc9de946e64607150693bfaecddaf55cd1fece2c"
+      }
+    }
+  ],
+  "fixed_three_proposal_controls": [
+    {
+      "nominal_depth": 0,
+      "binary_sha256": "62fb3add07b011aece82338d7f965440909618ac21b808197912089c8cb6eb0a",
+      "completion_sha256": "31ec3290777e44ce3901428eb5f9f738d4401e2b7eccb8cfee393f5dc5ec25d0",
+      "prefill_ms": 3313.503092,
+      "decode_ms": 5071.670430000001,
+      "prefill_tokens_per_second": 613.5500536904283,
+      "decode_tokens_per_second": 25.2382329977226,
+      "draft_tokens": 143,
+      "draft_accepted_tokens": 79
+    },
+    {
+      "nominal_depth": 32768,
+      "binary_sha256": "62fb3add07b011aece82338d7f965440909618ac21b808197912089c8cb6eb0a",
+      "completion_sha256": "13297fd0b21d81b9b1d952f559616a797e8e56596905dc4f19a8a24ff5f9bb24",
+      "prefill_ms": 4238.476167,
+      "decode_ms": 5985.923321,
+      "prefill_tokens_per_second": 474.46297224867703,
+      "decode_tokens_per_second": 21.38350144762905,
+      "draft_tokens": 138,
+      "draft_accepted_tokens": 80
+    },
+    {
+      "nominal_depth": 65536,
+      "context_capacity": 133760,
+      "binary_sha256": "f2b9d7dedba2b17ba7f8fc69bc4511de79a141a53be5085baababfac0f3fc384",
+      "prompt_tokens": 67152,
+      "cached_prompt_tokens": 65111,
+      "prefill_tokens": 2041,
+      "completion_tokens": 128,
+      "completion_sha256": "d1c24023054df84c662179849627e78085f8368c71c58539615cad7445514baf",
+      "prefill_ms": 5172.55432,
+      "decode_ms": 7697.801036,
+      "prefill_tokens_per_second": 394.5826131024565,
+      "decode_tokens_per_second": 16.62812527907483,
+      "draft_tokens": 153,
+      "draft_accepted_tokens": 76
+    }
+  ],
+  "controller_cost_calibration": {
+    "method": "Cold-KV attention growth from 2K to 32K across 16 target layers, normalized to an approximately 100 ms shallow cycle; offline estimate, not live timing.",
+    "query_heads": 24,
+    "kv_heads": 4,
+    "head_dim": 256,
+    "query_rows": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "attention_2048_ms": [
+      0.072982,
+      0.083998,
+      0.114455,
+      0.122596,
+      0.131337,
+      0.154015,
+      0.166548
+    ],
+    "attention_32765_ms": [
+      0.761593,
+      0.966008,
+      1.449152,
+      1.568251,
+      1.671159,
+      2.105163,
+      2.37051
+    ],
+    "extra_relative_cost": [
+      0.11,
+      0.14,
+      0.21,
+      0.23,
+      0.25,
+      0.31,
+      0.35
+    ]
+  },
+  "sampled_replay": {
+    "binary_sha256": "e41234a9bf4f5fc862654ddbbc9de946e64607150693bfaecddaf55cd1fece2c",
+    "temperature": 0.8,
+    "seed": 1,
+    "other_sampling_options": "server defaults",
+    "prompt_tokens": 65138,
+    "completion_tokens": 32,
+    "completion_sha256": "b4da479b494f5716e55bee3dbf77635f309cb6c6093dad5b0bbe57d97e6b3be2",
+    "cold_cached_tokens": 0,
+    "replay_cached_tokens": 65138,
+    "draft_tokens": 39,
+    "draft_accepted_tokens": 21,
+    "matches_output_and_draft_counts": true
+  },
+  "draft_attention_qualification": {
+    "direct_bit_exact_comparisons": 216,
+    "query_rows": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "query_scales": [
+      0.3,
+      3,
+      30
+    ],
+    "positions": [
+      0,
+      31,
+      32,
+      33,
+      128,
+      2047,
+      2048,
+      2051,
+      32768
+    ],
+    "operator_reference": "Independent FP64 windowed softmax; maintained tolerances unchanged",
+    "model_check": "Q4 target and Q4 draft; exact layer/logit/selector, private RNG, ragged C2/C4/C6/C8, pending injection and persistent-state checks pass"
+  },
+  "reference_control": {
+    "revision": "68d9053afd4f4d0752ced6187585f862355a40be",
+    "binary_sha256": "81dee29e5fbc234bbb4ae90c022de9c9d8513d1cefa960550b0bb59d9fc5346f",
+    "context_capacity": 36864,
+    "temperature": 0,
+    "seed": 1,
+    "messages_sha256": "1f31e9cab9f2413f4c93a9226a0d7e2c0cfc91111bc7121655049b1c0ce5e891",
+    "same_messages_as_gufo": true,
+    "nominal_depth": 0,
+    "draft_proposals_limit": 3,
+    "runs": {
+      "ar": {
+        "prompt_tokens": 2033,
+        "cached_prompt_tokens": 0,
+        "prefill_tokens": 2033,
+        "completion_tokens": 128,
+        "completion_sha256": "b26d8f23a6ef5fbc6ae04c7bb2781909af94694066d063c433bd51a838bc578d",
+        "prefill_ms": 5654.668,
+        "decode_ms": 10659.269,
+        "prefill_tokens_per_second": 359.52597040179904,
+        "decode_tokens_per_second": 12.008328150832858,
+        "draft_tokens": 0,
+        "draft_accepted_tokens": 0
+      },
+      "dflash2": {
+        "prompt_tokens": 2033,
+        "cached_prompt_tokens": 0,
+        "prefill_tokens": 2033,
+        "completion_tokens": 128,
+        "completion_sha256": "2097a3d6c611f6621b54df500f28159960659ff4805f47efbb67bc67dcfb1214",
+        "prefill_ms": 5900.314,
+        "decode_ms": 4712.965,
+        "prefill_tokens_per_second": 344.55793369641003,
+        "decode_tokens_per_second": 27.15912382120385,
+        "draft_tokens": 127,
+        "draft_accepted_tokens": 84
+      }
+    },
+    "greedy_dflash2_matches_own_ar": false,
+    "first_difference": {
+      "common_utf8_bytes": 124,
+      "ar": "grammatically fragmented phrases",
+      "dflash2": "syntactically broken phrases",
+      "scope": "Observed reference self-disagreement; not original-checkpoint qualification."
+    }
+  },
+  "measurement_notes": [
+    "One fresh-server release sample per point, with the standard warmup. Nominal depth tolerance is 2%.",
+    "Desktop crash reporting was active during both binaries. No other GPU workload or build overlapped; small timing differences remain provisional.",
+    "The matched d0 baseline was run after the candidate. At d32 the additional initial candidate sample had lower PP; the subsequent baseline/candidate control agrees on PP. Both candidate samples are retained. The d64 baseline is from earlier the same day."
+  ],
+  "additional_controls": [
+    {
+      "nominal_depth": 32768,
+      "kind": "initial_candidate",
+      "binary_sha256": "e41234a9bf4f5fc862654ddbbc9de946e64607150693bfaecddaf55cd1fece2c",
+      "prompt_tokens": 34563,
+      "cached_prompt_tokens": 32552,
+      "prefill_tokens": 2011,
+      "completion_tokens": 128,
+      "completion_sha256": "13297fd0b21d81b9b1d952f559616a797e8e56596905dc4f19a8a24ff5f9bb24",
+      "prefill_ms": 4395.684611,
+      "decode_ms": 6060.121129999999,
+      "prefill_tokens_per_second": 457.4941511880913,
+      "decode_tokens_per_second": 21.121690021400617,
+      "draft_tokens": 186,
+      "draft_accepted_tokens": 82
+    }
+  ],
+  "ar_deep_control": {
+    "nominal_depth": 65536,
+    "context_capacity": 133760,
+    "revision": "29be53156076fc1f3e502d72f907cc4ff00122af",
+    "binary_sha256": "f2b9d7dedba2b17ba7f8fc69bc4511de79a141a53be5085baababfac0f3fc384",
+    "prompt_tokens": 67152,
+    "cached_prompt_tokens": 65112,
+    "prefill_tokens": 2040,
+    "completion_tokens": 128,
+    "completion_sha256": "d1c24023054df84c662179849627e78085f8368c71c58539615cad7445514baf",
+    "prefill_ms": 4929.759866,
+    "decode_ms": 13037.210358999995,
+    "prefill_tokens_per_second": 413.8132597633509,
+    "decode_tokens_per_second": 9.818051291290056,
+    "draft_tokens": 0,
+    "draft_accepted_tokens": 0
+  },
+  "controller_feedback_qualification": {
+    "method": "Enumerate the complete censored geometric distribution at its true mean; expected feedback has zero drift at every width away from the saturation cap.",
+    "means": [
+      0.5,
+      1,
+      3,
+      4
+    ],
+    "draft_widths": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "maximum_expected_drift_tolerance": 1e-06,
+    "maintained_model_check": "qwen_dflash_gpu_test: exact batched layers, logits, selector probabilities, private RNG, adaptive state and persistent replay; all passed."
+  },
+  "reference_deep_control": {
+    "revision": "68d9053afd4f4d0752ced6187585f862355a40be",
+    "binary_sha256": "81dee29e5fbc234bbb4ae90c022de9c9d8513d1cefa960550b0bb59d9fc5346f",
+    "nominal_depth": 65536,
+    "context_capacity": 133760,
+    "temperature": 0,
+    "seed": 1,
+    "draft_proposals_limit": 3,
+    "messages_sha256": "a5fcef8fc3147207cc7081ada0c24237dff26444ae9233b207b3aae3e1491ef8",
+    "messages_hash_encoding": "Exact UTF-8 bytes of json.dumps(messages, ensure_ascii=False); checked with cmp against Gufo input.",
+    "same_messages_as_gufo": true,
+    "autoregressive_reference_run": false,
+    "prompt_tokens": 67152,
+    "cached_prompt_tokens": 65111,
+    "prefill_tokens": 2041,
+    "completion_tokens": 128,
+    "prefill_ms": 10382.623,
+    "decode_ms": 6556.979,
+    "prefill_tokens_per_second": 196.57845613772167,
+    "decode_tokens_per_second": 19.521184984731534,
+    "draft_tokens": 140,
+    "draft_accepted_tokens": 79,
+    "completion_sha256": "4b08175e56abe7c2164a91259eb017c9f03fde7d9dbab95189fe2626e45a8616",
+    "cache_hit": true
+  },
+  "reductions_increment": {
+    "date": "2026-09-23",
+    "source_parent": "f7a6effc8fef2d26753b7b6e86028280e4d9a6fd",
+    "source_files_sha256": {
+      "src/cli/serve/inference_backend.cpp": "83aa020e3beacd5befe91bc54c3430a1e4a6bcf7da4844706530c1c3a7a64120",
+      "src/models/qwen/hip/dflash.hpp": "c03847992533edb23e3d47bd8ce6d758b8a27a288c068ee7d3da3b6eb937b00b",
+      "src/models/qwen/hip/dflash/executor.cpp": "4db95d1eb5a93751e25eec9ee4ffd36422d2a56f6e3674e75c52c86fd5e1a7a5",
+      "src/models/qwen/hip/kernels/attention_decode.hip": "c10cd2dfc435d8daea0095f250ea6d29e3e511222ec519f478c478a2b98f1e43",
+      "src/models/qwen/hip/kernels/dflash_kernels.hip": "0ec8a3e3424ec67b3378cbebf090bc9a9ac9f3b597ed550f4bf69b5f0d1da45c",
+      "src/models/qwen/hip/kernels/dflash_kernels.hpp": "205a57964bcb0950351940ee14e06dc37222d17fcf8755fd4872f3b1c8e1a8f4",
+      "src/models/qwen/hip/kernels/norm.hip": "541ca4d1398c7179fd346cd923410ad9202e7c655babada8b769106fc29ebf0a",
+      "src/models/qwen/hip/kernels/prefill_norm.hip": "4305d442a89d2e716451921aa25174892ba1be820aaf8367bed41861dd8b074d",
+      "src/models/qwen/hip/prefill_chunk.cpp": "5132b6c1f5947211213d68c73bf58ab2a24b423eda408ccabdb1396097a65513",
+      "tests/models/qwen/hip/basic/elementwise_ops_test.cpp": "9c6fc1d2fa39b23f0279219ea4d104ac09b1a32430365c0bfe6e85a323725995",
+      "tests/models/qwen27b/attention_test.cpp": "22205e66769bddafba3f3360a2d52b1b475515201200a514e73e7613a88f8587",
+      "tests/models/qwen27b/target_test.cpp": "a096c925712f9dd205474b90705938f45b927ec29c6507bfccc7283d8778d558"
+    },
+    "implementation": "Register-cached small-batch RMSNorm with explicit FMA, reused attention partition exponentials, C1 batched selector/FFN scratch, scalar normalization and missing-record replay corrections.",
+    "controls": {
+      "huge-dflash-d0": {
+        "source": {
+          "revision": "f7a6effc8fef2d26753b7b6e86028280e4d9a6fd",
+          "binary_path": "/nix/store/fiynhkji5j5kwg7135v5lgjhfh89ljfb-gufo-9b23369-dirty/bin/gufo",
+          "binary_sha256": "00e3940504b2e77dc1864c15fdb4c7e7c27d0f835c894a3acd31043346f1274b",
+          "buildMode": "nix-release"
+        },
+        "implementation": "gufo",
+        "variant": "Q4_K_XL",
+        "mode": "dflash2",
+        "depth": 0,
+        "concurrency": 1,
+        "context_capacity": 36864,
+        "ready_seconds": 2.2795158549852204,
+        "load_memory_kib": {
+          "Rss": 18700860,
+          "Pss": 18697276,
+          "Anonymous": 17393776,
+          "AnonHugePages": 17182720,
+          "Locked": 0
+        },
+        "input_sha256": "72e0e890fe139f5120679fd5a363ec73bfd63a22bc81920b9f368587063aabd7",
+        "request": {
+          "concurrency": 1,
+          "repetition": 1,
+          "request_index": 0,
+          "prompt_tokens": 2033,
+          "cached_prompt_tokens": 0,
+          "completion_tokens": 128,
+          "prefill_tokens": 2033,
+          "wall_ms": 7539.932068990311,
+          "client_ttft_ms": 3294.992774986895,
+          "client_event_inter_token_ms": 33.41210073233201,
+          "queue_ms": 1.001387,
+          "prefill_ms": 3293.409219,
+          "decode_ms": 4223.20237,
+          "server_ttft_ms": 3294.424022,
+          "server_inter_token_ms": 33.41186525196849,
+          "server_max_inter_token_ms": 130.632244,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "execution_plan": "serial-c1",
+          "metrics_source": "gufo",
+          "cache_hit": false,
+          "draft_tokens": 186,
+          "draft_accepted_tokens": 88,
+          "draft_acceptance": 0.4731182795698925,
+          "case_id": null,
+          "category": null,
+          "completion_sha256": "31ec3290777e44ce3901428eb5f9f738d4401e2b7eccb8cfee393f5dc5ec25d0",
+          "prefill_tokens_per_second": 617.2934685041337,
+          "decode_tokens_per_second": 30.308753591649456
+        }
+      },
+      "huge-dflash-d32": {
+        "source": {
+          "revision": "f7a6effc8fef2d26753b7b6e86028280e4d9a6fd",
+          "binary_path": "/nix/store/fiynhkji5j5kwg7135v5lgjhfh89ljfb-gufo-9b23369-dirty/bin/gufo",
+          "binary_sha256": "00e3940504b2e77dc1864c15fdb4c7e7c27d0f835c894a3acd31043346f1274b",
+          "buildMode": "nix-release"
+        },
+        "implementation": "gufo",
+        "variant": "Q4_K_XL",
+        "mode": "dflash2",
+        "depth": 32768,
+        "concurrency": 1,
+        "context_capacity": 36864,
+        "ready_seconds": 2.2794113410054706,
+        "load_memory_kib": {
+          "Rss": 18700796,
+          "Pss": 18697212,
+          "Anonymous": 17393712,
+          "AnonHugePages": 17182720,
+          "Locked": 0
+        },
+        "input_sha256": "7444310f6e9f16337a70cf45980260809b8601a91adb667f8a9618ba62414f51",
+        "request": {
+          "concurrency": 1,
+          "repetition": 1,
+          "request_index": 0,
+          "prompt_tokens": 34563,
+          "cached_prompt_tokens": 32552,
+          "completion_tokens": 128,
+          "prefill_tokens": 2011,
+          "wall_ms": 10288.661464001052,
+          "client_ttft_ms": 4236.117953987559,
+          "client_event_inter_token_ms": 47.61332133074482,
+          "queue_ms": 8.503871,
+          "prefill_ms": 4226.781545,
+          "decode_ms": 5906.618999000001,
+          "server_ttft_ms": 4235.304773,
+          "server_inter_token_ms": 47.61338917322834,
+          "server_max_inter_token_ms": 272.060979,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "execution_plan": "serial-c1",
+          "metrics_source": "gufo",
+          "cache_hit": true,
+          "draft_tokens": 186,
+          "draft_accepted_tokens": 82,
+          "draft_acceptance": 0.44086021505376344,
+          "case_id": null,
+          "category": null,
+          "completion_sha256": "13297fd0b21d81b9b1d952f559616a797e8e56596905dc4f19a8a24ff5f9bb24",
+          "prefill_tokens_per_second": 475.77571222692563,
+          "decode_tokens_per_second": 21.67060377885734
+        }
+      },
+      "cached-batch-norm-dflash-d0": {
+        "source": {
+          "revision": "f7a6eff-dirty",
+          "binary_path": "/nix/store/rqlr2b6abwmxzvzk2ic8zlcr1nz3jang-gufo-f7a6eff-dirty/bin/gufo",
+          "binary_sha256": "0690c467d631874cad73b938e04776bdd4ecbe09b8b8a8266123e057ffc22e5d",
+          "buildMode": "nix-release"
+        },
+        "implementation": "gufo",
+        "variant": "Q4_K_XL",
+        "mode": "dflash2",
+        "depth": 0,
+        "concurrency": 1,
+        "context_capacity": 36864,
+        "ready_seconds": 2.2297775570186786,
+        "load_memory_kib": {
+          "Rss": 18700688,
+          "Pss": 18697104,
+          "Anonymous": 17393732,
+          "AnonHugePages": 17182720,
+          "Locked": 0
+        },
+        "input_sha256": "72e0e890fe139f5120679fd5a363ec73bfd63a22bc81920b9f368587063aabd7",
+        "request": {
+          "concurrency": 1,
+          "repetition": 1,
+          "request_index": 0,
+          "prompt_tokens": 2033,
+          "cached_prompt_tokens": 0,
+          "completion_tokens": 128,
+          "prefill_tokens": 2033,
+          "wall_ms": 7453.74894500128,
+          "client_ttft_ms": 3263.0957220098935,
+          "client_event_inter_token_ms": 32.988951921208184,
+          "queue_ms": 1.350744,
+          "prefill_ms": 3261.236571,
+          "decode_ms": 4169.4640660000005,
+          "server_ttft_ms": 3262.599798,
+          "server_inter_token_ms": 32.98882017322836,
+          "server_max_inter_token_ms": 129.167556,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "execution_plan": "serial-c1",
+          "metrics_source": "gufo",
+          "cache_hit": false,
+          "draft_tokens": 186,
+          "draft_accepted_tokens": 88,
+          "draft_acceptance": 0.4731182795698925,
+          "case_id": null,
+          "category": null,
+          "completion_sha256": "31ec3290777e44ce3901428eb5f9f738d4401e2b7eccb8cfee393f5dc5ec25d0",
+          "prefill_tokens_per_second": 623.3831725297429,
+          "decode_tokens_per_second": 30.699389171807287
+        }
+      },
+      "reductions-dflash-d0": {
+        "source": {
+          "revision": "f7a6eff-dirty",
+          "binary_path": "/nix/store/fx9bvv4basxdygr28dj3zfm23lvsg1a8-gufo-f7a6eff-dirty/bin/gufo",
+          "binary_sha256": "eb807a7b10e42fd466786384dc045b7fe7d14a4bb685cf696b05450cc97f5627",
+          "buildMode": "nix-release"
+        },
+        "implementation": "gufo",
+        "variant": "Q4_K_XL",
+        "mode": "dflash2",
+        "depth": 0,
+        "concurrency": 1,
+        "context_capacity": 36864,
+        "ready_seconds": 2.230445838999003,
+        "load_memory_kib": {
+          "Rss": 18700688,
+          "Pss": 18697104,
+          "Anonymous": 17393732,
+          "AnonHugePages": 17182720,
+          "Locked": 0
+        },
+        "input_sha256": "72e0e890fe139f5120679fd5a363ec73bfd63a22bc81920b9f368587063aabd7",
+        "request": {
+          "concurrency": 1,
+          "repetition": 1,
+          "request_index": 0,
+          "prompt_tokens": 2033,
+          "cached_prompt_tokens": 0,
+          "completion_tokens": 128,
+          "prefill_tokens": 2033,
+          "wall_ms": 7440.5485760071315,
+          "client_ttft_ms": 3260.8661350095645,
+          "client_event_inter_token_ms": 32.902408535381426,
+          "queue_ms": 1.388214,
+          "prefill_ms": 3258.795728,
+          "decode_ms": 4158.620653,
+          "server_ttft_ms": 3260.196645,
+          "server_inter_token_ms": 32.90378546456696,
+          "server_max_inter_token_ms": 128.972182,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "execution_plan": "serial-c1",
+          "metrics_source": "gufo",
+          "cache_hit": false,
+          "draft_tokens": 186,
+          "draft_accepted_tokens": 88,
+          "draft_acceptance": 0.4731182795698925,
+          "case_id": null,
+          "category": null,
+          "completion_sha256": "31ec3290777e44ce3901428eb5f9f738d4401e2b7eccb8cfee393f5dc5ec25d0",
+          "prefill_tokens_per_second": 623.8500874823781,
+          "decode_tokens_per_second": 30.7794364238685
+        }
+      },
+      "reductions-dflash-d32": {
+        "source": {
+          "revision": "f7a6eff-dirty",
+          "binary_path": "/nix/store/fx9bvv4basxdygr28dj3zfm23lvsg1a8-gufo-f7a6eff-dirty/bin/gufo",
+          "binary_sha256": "eb807a7b10e42fd466786384dc045b7fe7d14a4bb685cf696b05450cc97f5627",
+          "buildMode": "nix-release"
+        },
+        "implementation": "gufo",
+        "variant": "Q4_K_XL",
+        "mode": "dflash2",
+        "depth": 32768,
+        "concurrency": 1,
+        "context_capacity": 36864,
+        "ready_seconds": 2.230626975011546,
+        "load_memory_kib": {
+          "Rss": 18700688,
+          "Pss": 18697104,
+          "Anonymous": 17393732,
+          "AnonHugePages": 17182720,
+          "Locked": 0
+        },
+        "input_sha256": "7444310f6e9f16337a70cf45980260809b8601a91adb667f8a9618ba62414f51",
+        "request": {
+          "concurrency": 1,
+          "repetition": 1,
+          "request_index": 0,
+          "prompt_tokens": 34563,
+          "cached_prompt_tokens": 32552,
+          "completion_tokens": 128,
+          "prefill_tokens": 2011,
+          "wall_ms": 10218.164560006699,
+          "client_ttft_ms": 4228.179571015062,
+          "client_event_inter_token_ms": 47.11887588189167,
+          "queue_ms": 8.43088,
+          "prefill_ms": 4218.912948,
+          "decode_ms": 5843.612200999998,
+          "server_ttft_ms": 4227.362323,
+          "server_inter_token_ms": 47.118429999999975,
+          "server_max_inter_token_ms": 270.956836,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "execution_plan": "serial-c1",
+          "metrics_source": "gufo",
+          "cache_hit": true,
+          "draft_tokens": 186,
+          "draft_accepted_tokens": 82,
+          "draft_acceptance": 0.44086021505376344,
+          "case_id": null,
+          "category": null,
+          "completion_sha256": "13297fd0b21d81b9b1d952f559616a797e8e56596905dc4f19a8a24ff5f9bb24",
+          "prefill_tokens_per_second": 476.66307050808575,
+          "decode_tokens_per_second": 21.904259830605422
+        }
+      },
+      "final-reductions-dflash-d0": {
+        "source": {
+          "revision": "f7a6eff-dirty",
+          "binary_path": "/nix/store/cd37m3pf6s0pxg25kycl08ysrd5iqcgw-gufo-f7a6eff-dirty/bin/gufo",
+          "binary_sha256": "d3845c81f3eb30ef61333bb88788e7f3bdc46c85b712c6344db7f6a2390b18f4",
+          "buildMode": "nix-release"
+        },
+        "implementation": "gufo",
+        "variant": "Q4_K_XL",
+        "mode": "dflash2",
+        "depth": 0,
+        "concurrency": 1,
+        "context_capacity": 36864,
+        "ready_seconds": 2.230690436990699,
+        "load_memory_kib": {
+          "Rss": 18668420,
+          "Pss": 18664526,
+          "Anonymous": 17381372,
+          "AnonHugePages": 17182720,
+          "Locked": 0
+        },
+        "input_sha256": "72e0e890fe139f5120679fd5a363ec73bfd63a22bc81920b9f368587063aabd7",
+        "request": {
+          "concurrency": 1,
+          "repetition": 1,
+          "request_index": 0,
+          "prompt_tokens": 2033,
+          "cached_prompt_tokens": 0,
+          "completion_tokens": 128,
+          "prefill_tokens": 2033,
+          "wall_ms": 7487.363117019413,
+          "client_ttft_ms": 3282.473444007337,
+          "client_event_inter_token_ms": 33.09675541731133,
+          "queue_ms": 1.202396,
+          "prefill_ms": 3280.399312,
+          "decode_ms": 4174.759064,
+          "server_ttft_ms": 3281.620643,
+          "server_inter_token_ms": 33.09850129921258,
+          "server_max_inter_token_ms": 138.234445,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "execution_plan": "serial-c1",
+          "metrics_source": "gufo",
+          "cache_hit": false,
+          "draft_tokens": 186,
+          "draft_accepted_tokens": 88,
+          "draft_acceptance": 0.4731182795698925,
+          "case_id": null,
+          "category": null,
+          "completion_sha256": "31ec3290777e44ce3901428eb5f9f738d4401e2b7eccb8cfee393f5dc5ec25d0",
+          "prefill_tokens_per_second": 619.7416249183751,
+          "decode_tokens_per_second": 30.660452025549517
+        }
+      },
+      "final-reductions-dflash-d32": {
+        "source": {
+          "revision": "f7a6eff-dirty",
+          "binary_path": "/nix/store/cd37m3pf6s0pxg25kycl08ysrd5iqcgw-gufo-f7a6eff-dirty/bin/gufo",
+          "binary_sha256": "d3845c81f3eb30ef61333bb88788e7f3bdc46c85b712c6344db7f6a2390b18f4",
+          "buildMode": "nix-release"
+        },
+        "implementation": "gufo",
+        "variant": "Q4_K_XL",
+        "mode": "dflash2",
+        "depth": 32768,
+        "concurrency": 1,
+        "context_capacity": 36864,
+        "ready_seconds": 2.2308232779905666,
+        "load_memory_kib": {
+          "Rss": 18668420,
+          "Pss": 18664526,
+          "Anonymous": 17381372,
+          "AnonHugePages": 17182720,
+          "Locked": 0
+        },
+        "input_sha256": "7444310f6e9f16337a70cf45980260809b8601a91adb667f8a9618ba62414f51",
+        "request": {
+          "concurrency": 1,
+          "repetition": 1,
+          "request_index": 0,
+          "prompt_tokens": 34563,
+          "cached_prompt_tokens": 32552,
+          "completion_tokens": 128,
+          "prefill_tokens": 2011,
+          "wall_ms": 10214.978254021844,
+          "client_ttft_ms": 4225.655122019816,
+          "client_event_inter_token_ms": 47.11285866127812,
+          "queue_ms": 7.388135,
+          "prefill_ms": 4217.281598,
+          "decode_ms": 5843.280197,
+          "server_ttft_ms": 4224.685313,
+          "server_inter_token_ms": 47.11418728346455,
+          "server_max_inter_token_ms": 270.654552,
+          "requested_logical_concurrency": 1,
+          "physical_execution_width": 1,
+          "execution_plan": "serial-c1",
+          "metrics_source": "gufo",
+          "cache_hit": true,
+          "draft_tokens": 186,
+          "draft_accepted_tokens": 82,
+          "draft_acceptance": 0.44086021505376344,
+          "case_id": null,
+          "category": null,
+          "completion_sha256": "13297fd0b21d81b9b1d952f559616a797e8e56596905dc4f19a8a24ff5f9bb24",
+          "prefill_tokens_per_second": 476.84745570551775,
+          "decode_tokens_per_second": 21.9055043887364
+        }
+      }
+    },
+    "method": "Fresh HTTP C1 per point, greedy seed 1, adaptive Q4_K_M DFlash2, pinned pp2048/tg128 messages, context 36864, one warmup and one measured request. Intermediate controls are ablations, not final-build numbers. No build or other GPU work overlaps timings.",
+    "profiles": {
+      "before": {
+        "scope": "last complete fixed-three-proposal cycles, from draft embedding through target verification and next context injection",
+        "cycles": 4,
+        "dispatch_count": 4574,
+        "kernel_ms": 415.773184,
+        "busy_ms": 410.024909,
+        "wall_span_ms": 422.151857,
+        "stages": {
+          "other": {
+            "calls": 1880,
+            "ms": 28.32313299999998
+          },
+          "rmsnorm": {
+            "calls": 564,
+            "ms": 6.717920000000002
+          },
+          "projections": {
+            "calls": 1872,
+            "ms": 361.99718000000024
+          },
+          "selector": {
+            "calls": 22,
+            "ms": 0.9700199999999999
+          },
+          "copy_fill": {
+            "calls": 108,
+            "ms": 11.415944000000007
+          },
+          "attention_partials": {
+            "calls": 64,
+            "ms": 5.3568109999999995
+          },
+          "attention_reduce": {
+            "calls": 64,
+            "ms": 0.9921760000000002
+          }
+        }
+      },
+      "after": {
+        "scope": "last complete fixed-three-proposal cycles, from draft embedding through target verification and next context injection",
+        "cycles": 4,
+        "dispatch_count": 4560,
+        "kernel_ms": 411.064371,
+        "busy_ms": 405.329556,
+        "wall_span_ms": 417.317222,
+        "stages": {
+          "other": {
+            "calls": 1880,
+            "ms": 28.365108999999972
+          },
+          "rmsnorm": {
+            "calls": 564,
+            "ms": 1.9930439999999998
+          },
+          "projections": {
+            "calls": 1872,
+            "ms": 362.24868399999957
+          },
+          "selector": {
+            "calls": 8,
+            "ms": 1.091889
+          },
+          "copy_fill": {
+            "calls": 108,
+            "ms": 11.409017000000002
+          },
+          "attention_partials": {
+            "calls": 64,
+            "ms": 5.370962999999999
+          },
+          "attention_reduce": {
+            "calls": 64,
+            "ms": 0.5856650000000001
+          }
+        }
+      },
+      "method": "Separate CLI profile: Q4_K_XL, Q4_K_M DFlash2, fixed three proposals, depth 2048, 16 generated tokens, one process per build. Same last four complete cycles; headline rates use HTTP adaptive requests.",
+      "interpretation": "Normalization and attention reduction explain the gain. Selector launches decrease from 22 to 8; its own kernel time increases by 0.12 ms across four cycles, so no isolated selector speed gain is claimed."
+    },
+    "quality": {
+      "scalar_norm_correction": "Expanded testing exposed an implicit-FMA contraction difference in f7a6eff cached scalar RMSNorm. Explicit fused accumulation and a runtime denominator retain the original generic arithmetic. Earlier eight byte-exact controls were insufficient.",
+      "rmsnorm_operator": "90 maintained FP64-formula controls at 1e-5 absolute tolerance, exact scalar/batch equality, BF16 RNE and optional FP32 output; dimensions 5119/5120/5121, rows 1/7/33/64/65, scales .001/.3/30, weighted/unweighted.",
+      "rmsnorm_ablation": "512 rows compare the original generic scalar, corrected cached scalar, generic batched and cached batched outputs without a differing float; separate 112 batched FP32/BF16 controls are byte-exact, maximum FP64 absolute error 2.42300728e-7.",
+      "attention": "128 byte-exact output comparisons at widths 1/3/7/8, depths 128/2048/32768/65536, four amplitudes, gated/ungated; maintained independent FP64 FP16/FP32 attention check passes through 32K.",
+      "selector": "C1/C2/C4/C6/C8 scalar/batched token chains, confidences and candidate probabilities match. Greedy optional candidates retain one-hot probabilities. Real-weight allocation equals its estimator; 15,616 bytes of separate partial storage removed.",
+      "replay_correction": "Missing verification records previously fell back to prefill arithmetic, reproducing with the original generic norm kernels (mixed-context FP16 KV max logit discrepancy 0.0477962). Reuse the recorded prefix, then execute only unrecorded rows using ForwardToken without logits.",
+      "target_model": "qwen27b_target_test passed: full logits/features, verification widths 2-8, mixed-context FP16/FP32 KV with/without replay, C1/C2/C4/C6/C8 including appended rows, context 262144 allocation, prefill 64/128/257/2048 and 8192-prefix/1025-suffix replay.",
+      "draft_model": "qwen_dflash_gpu_test passed: exact layers/logits/probabilities, ragged/full C2/C4/C6/C8, private fixed/adaptive RNG and policy, pending injection, RAM/persistent replay and ring wrap.",
+      "compatibility": "Snapshot payload unchanged; rmsnorm=fused-square-sum-v1 added to cache identity to reject old arithmetic states.",
+      "http_greedy": "All four d0/d32K release outputs match the pinned 128-token Q4 AR hashes; DFlash proposal/acceptance counts unchanged; PP retained.",
+      "limits": "Quantized execution consistency and independent operator formulas, not original-checkpoint parity. Q8, d64K/d128K and concurrent throughput are not refreshed in this increment; timing changes near 1% remain provisional."
+    },
+    "sampled_replay": {
+      "source": {
+        "revision": "f7a6eff-dirty",
+        "binary_path": "/nix/store/cd37m3pf6s0pxg25kycl08ysrd5iqcgw-gufo-f7a6eff-dirty/bin/gufo",
+        "binary_sha256": "d3845c81f3eb30ef61333bb88788e7f3bdc46c85b712c6344db7f6a2390b18f4",
+        "buildMode": "nix-release"
+      },
+      "mode": "dflash2",
+      "temperature": 0.8,
+      "sampling": {
+        "seed": 47,
+        "top_k": 40,
+        "top_p": 0.9,
+        "min_p": 0.05,
+        "frequency_penalty": 0.1,
+        "presence_penalty": 0.1,
+        "repeat_penalty": 1.05
+      },
+      "input_sha256": "72e0e890fe139f5120679fd5a363ec73bfd63a22bc81920b9f368587063aabd7",
+      "requests": [
+        {
+          "prompt_tokens": 2033,
+          "cached_prompt_tokens": 0,
+          "prefill_tokens": 2033,
+          "completion_tokens": 32,
+          "draft_tokens": 53,
+          "draft_accepted_tokens": 18,
+          "completion_sha256": "d3f1c07cf23d0f5e4c52e912d54bd6d1aa7865c8ab1a07f91bacdd2326530ed1"
+        },
+        {
+          "prompt_tokens": 2033,
+          "cached_prompt_tokens": 2033,
+          "prefill_tokens": 0,
+          "completion_tokens": 32,
+          "draft_tokens": 53,
+          "draft_accepted_tokens": 18,
+          "completion_sha256": "d3f1c07cf23d0f5e4c52e912d54bd6d1aa7865c8ab1a07f91bacdd2326530ed1"
+        }
+      ]
+    }
+  },
+  "retained_exactness_audit": {
+    "date": "2026-09-23",
+    "scope": "Audit of retained September 21 mixed-corpus hashes. Q8 here is the historical Q8_K_L artifact, not a new Q8_K_XL qualification.",
+    "definition": "Exact in BENCHMARKS.md compares llama.cpp AR completions with Gufo C1 AR. It does not measure agreement against the official model.",
+    "targets": {
+      "q4": {
+        "source_artifacts_sha256": {
+          "multi-mixed-q4-gufo-ar.json": "ed6fccf7944fa1893bfaf01340f8ce3ed395dc71839463f112653c576f0710b2",
+          "multi-mixed-q4-gufo-dflash2.json": "8a31e0f3438d3dfeee3f2e1ed55a47cf4eaedaa40de9eaa177e9c4d344bb199c",
+          "multi-mixed-q4-reference.json": "f70e94b2c169f144bd16cae312017b585d05f6e748631603d872d2dde829ab87",
+          "multi-mixed-q4-reference-dflash2.json": "7e85564d5cc895b0ba775178a57be613a2b5eb850c0cc86aee857f7c7396f624"
+        },
+        "c1_cases": 9,
+        "own_ar_speculative_exact": {
+          "gufo-ar": 9,
+          "reference": 9
+        },
+        "cross_engine_c1_mismatches": [
+          "cpp_ring_buffer",
+          "summary_gpu",
+          "italian_explanation",
+          "json_schedule",
+          "creative_station",
+          "instruction_debug"
+        ],
+        "reference_ar_batch_vs_own_c1": {
+          "2": {
+            "exact": 7,
+            "requests": 10
+          },
+          "4": {
+            "exact": 7,
+            "requests": 12
+          },
+          "6": {
+            "exact": 8,
+            "requests": 12
+          },
+          "8": {
+            "exact": 10,
+            "requests": 16
+          }
+        }
+      },
+      "q8": {
+        "source_artifacts_sha256": {
+          "multi-mixed-q8-gufo-ar.json": "ebf7de0e4b897ba3bbda8d920a4128127e7a0104d3009867fe66f33ed2a364b1",
+          "multi-mixed-q8-gufo-dflash2.json": "9c0d97002936cc0157a99e35f2da3959adf4077871438867609bcadac2a48721",
+          "multi-mixed-q8-reference.json": "af2d610afd133aeac1685a24c9fe24944a14b25f82db1eeb9db2ae253cb75711",
+          "multi-mixed-q8-reference-dflash2.json": "ac69833807dbc3a2b2286fe2716af4ef447b0156bac5ed6aff44ab77b766795b"
+        },
+        "c1_cases": 9,
+        "own_ar_speculative_exact": {
+          "gufo-ar": 9,
+          "reference": 9
+        },
+        "cross_engine_c1_mismatches": [
+          "cpp_ring_buffer",
+          "italian_explanation",
+          "chinese_explanation",
+          "creative_station",
+          "instruction_debug"
+        ],
+        "reference_ar_batch_vs_own_c1": {
+          "2": {
+            "exact": 7,
+            "requests": 10
+          },
+          "4": {
+            "exact": 3,
+            "requests": 12
+          },
+          "6": {
+            "exact": 4,
+            "requests": 12
+          },
+          "8": {
+            "exact": 6,
+            "requests": 16
+          }
+        }
+      }
+    }
+  }
+}

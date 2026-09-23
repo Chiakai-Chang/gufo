@@ -43,6 +43,11 @@ void TestLengthController() {
   fixed.Observe(0, 7);
   Expect(fixed.Choose(100) == 7 && fixed.Choose(3) == 3 && fixed.Choose(0) == 0,
          "fixed blocks obey only the configured and remaining budgets");
+  Expect(fixed.Choose(7, 131072) == 7,
+         "context cost does not change the fixed comparison policy");
+  for (const auto users : {2U, 3U, 4U, 5U, 6U, 7U, 8U})
+    Expect(fixed.Choose(3, 131072, users) == 3,
+           "batched verification cannot change a fixed block");
   for (const bool q8_target : {false, true}) {
     DFlashLengthController adaptive(DFlashDraftPolicy::kAdaptive, 7, q8_target);
     for (int round = 0; round < 32; ++round)
@@ -54,10 +59,18 @@ void TestLengthController() {
     }
     Expect(adaptive.Choose(7) == 7,
            "censored full acceptance probes upward instead of getting stuck");
+    for (const auto position : {2048U, 32768U, 65536U, 131072U, 262144U}) {
+      Expect(adaptive.Choose(7, position) == 7,
+             "sustained full acceptance probes the wider profitable block");
+      for (const auto users : {2U, 3U, 4U, 5U, 6U, 7U, 8U})
+        Expect(adaptive.Choose(7, position, users) == 7,
+               "batched full acceptance retains the full block at every depth");
+    }
     const auto saved = adaptive.State();
+    const auto saved_full_width = adaptive.LastFullWidth();
     adaptive.Reset();
     Expect(adaptive.State() != saved, "new requests reset learned acceptance");
-    adaptive.Restore(saved);
+    adaptive.Restore(saved, saved_full_width);
     Expect(adaptive.Choose(7) == 7 && adaptive.Choose(2) == 2,
            "restored decisions retain history and obey the output budget");
     for (const float invalid : {-1.0F, 8.0F, INFINITY, NAN}) {
@@ -67,8 +80,165 @@ void TestLengthController() {
       } catch (const std::invalid_argument&) {
         rejected = true;
       }
-      Expect(rejected && adaptive.State() == saved,
+      Expect(rejected && adaptive.State() == saved &&
+                 adaptive.LastFullWidth() == saved_full_width,
              "malformed controller state cannot mutate the decision history");
+    }
+    bool rejected = false;
+    try {
+      adaptive.Restore(saved, 8);
+    } catch (const std::invalid_argument&) {
+      rejected = true;
+    }
+    Expect(rejected && adaptive.LastFullWidth() == saved_full_width,
+           "restored full-block history must fit the configured draft limit");
+  }
+  DFlashLengthController shallow(DFlashDraftPolicy::kAdaptive, 7);
+  const auto learned = shallow.State();
+  Expect(
+      shallow.Choose(7, 2048) > 3 && shallow.Choose(7, 2048, 2) == 3 &&
+          shallow.Choose(7, 2048, 3) == 3 && shallow.Choose(7, 2048, 4) == 3 &&
+          shallow.Choose(7, 2048, 5) == 1 && shallow.Choose(7, 2048, 6) == 1 &&
+          shallow.Choose(7, 2048, 7) == 1 && shallow.Choose(7, 2048, 8) == 1,
+      "batched costs avoid the projection cliffs above eight/sixteen rows");
+  Expect(shallow.Choose(7, 32768) < shallow.Choose(7, 2048),
+         "long-context attention cost reduces speculative overwork");
+  for (const auto position : {0U, 2048U, 32768U, 65536U, 131072U}) {
+    for (const auto budget : {0U, 1U, 2U, 7U}) {
+      DFlashLengthController replay(DFlashDraftPolicy::kAdaptive, 7);
+      replay.Restore(learned);
+      const auto expected = shallow.Choose(budget, position);
+      Expect(replay.Choose(budget, position) == expected && expected <= budget,
+             "restored history and position reproduce bounded decisions");
+      for (const auto users : {2U, 3U, 4U, 5U, 6U, 7U, 8U})
+        Expect(replay.Choose(budget, position, users) ==
+                       shallow.Choose(budget, position, users) &&
+                   replay.Choose(budget, position, users) <= budget,
+               "batched decisions preserve restored history and budgets");
+      Expect(shallow.State() == learned,
+             "cost evaluation does not mutate acceptance history");
+    }
+  }
+  DFlashLengthController q8(DFlashDraftPolicy::kAdaptive, 7, true);
+  Expect(q8.Choose(7, 131072) == q8.Choose(7, 2048),
+         "Q4 context calibration leaves the Q8 policy unchanged");
+  for (const auto users : {2U, 6U, 8U})
+    Expect(q8.Choose(7, 131072, users) == q8.Choose(7, 131072),
+           "C4 Q8 calibration leaves other Q8 cohorts unchanged");
+  Expect(q8.Choose(7, 2048, 4) == 3 &&
+             q8.Choose(7, 131072, 4) < q8.Choose(7, 2048, 4),
+         "Q8 C4 accounts for separate verification launches and attention");
+  for (const auto position : {0U, 32768U, 131072U}) {
+    DFlashLengthController replay(DFlashDraftPolicy::kAdaptive, 7, true);
+    replay.Restore(q8.State());
+    for (const auto budget : {0U, 1U, 3U, 7U})
+      Expect(replay.Choose(budget, position, 4) ==
+                     q8.Choose(budget, position, 4) &&
+                 replay.Choose(budget, position, 4) <= budget,
+             "Q8 C4 replay preserves history and remaining budgets");
+  }
+  for (const std::size_t users : {2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
+    std::array<DFlashLengthController, 8> cohort{q8, q8, q8, q8,
+                                                 q8, q8, q8, q8};
+    std::array<const DFlashLengthController*, 8> controllers{};
+    for (std::size_t index = 0; index < users; ++index)
+      controllers[index] = &cohort[index];
+    std::array<std::uint32_t, 8> budgets{7, 7, 7, 7, 7, 7, 7, 7};
+    const std::array<std::uint32_t, 8> positions{2048, 2048, 2048, 2048,
+                                                 2048, 2048, 2048, 2048};
+    const auto choose_cohort = [&] {
+      return DFlashLengthController::ChooseGreedyBatch(
+          std::span(controllers).first(users), std::span(budgets).first(users),
+          std::span(positions).first(users));
+    };
+    const auto initial = choose_cohort();
+    Expect(initial == (users == 2                 ? 7U
+                       : users == 5 || users == 6 ? 1U
+                                                  : 3U),
+           "Q8 cohort chooses an efficient target tile");
+    // Start the probe check below saturation, including C2 where a fresh
+    // history already makes a full block profitable.
+    if (users == 2)
+      for (auto& controller : cohort)
+        controller.Restore(1.0F);
+    const auto probe_width = users <= 4 ? 3U : 1U;
+    Expect(choose_cohort() != 7, "probe fixture starts with a short block");
+    cohort[0].Observe(probe_width, probe_width);
+    Expect(choose_cohort() != 7, "one full block cannot force a cohort probe");
+    for (std::size_t index = 1; index < users; ++index)
+      cohort[index].Observe(probe_width, probe_width);
+    const auto saved_mean = cohort[0].State();
+    const auto saved_width = cohort[0].LastFullWidth();
+    cohort[0].Reset();
+    cohort[0].Restore(saved_mean, saved_width);
+    Expect(choose_cohort() == 7,
+           "restoration retains the shared full-block probe");
+    budgets[1] = 2;
+    Expect(choose_cohort() == 2, "a shared block obeys every remaining budget");
+    budgets[1] = 0;
+    Expect(!choose_cohort(), "an exhausted row falls back to private choices");
+    budgets[1] = 7;
+    DFlashLengthController q8_fixed(DFlashDraftPolicy::kFixed, 7, true);
+    controllers[1] = &q8_fixed;
+    Expect(!choose_cohort(), "a fixed request keeps its own requested width");
+    controllers[1] = &shallow;
+    Expect(!choose_cohort(), "Q4 does not use the Q8 cost model");
+    controllers[1] = &cohort[1];
+    cohort[0].Observe(0, 7);
+    Expect(choose_cohort() != 7,
+           "a rejected probe resumes cost-based selection");
+    for (auto& controller : cohort)
+      controller.Reset();
+    Expect(choose_cohort() == initial,
+           "new requests cannot inherit a cohort probe");
+    if (users % 2 != 0) {
+      cohort[0].Observe(3, 3);
+      Expect(choose_cohort() != 7,
+             "one fully accepted history cannot carry neutral peers");
+      cohort[1].Observe(3, 3);
+      Expect(choose_cohort() != 7,
+             "isolated short successes do not justify a growing-cohort probe");
+      cohort[0].Observe(3, 3);
+      cohort[1].Observe(3, 3);
+      Expect(choose_cohort() == 7,
+             "growing cohorts retain an established full-acceptance probe");
+      cohort[2].Observe(0, 7);
+      Expect(choose_cohort() != 7,
+             "a rejecting peer prevents the growing-cohort probe");
+      for (auto& controller : cohort)
+        controller.Reset();
+    }
+    if (users >= 5) {
+      for (auto& controller : cohort)
+        controller.Observe(0, 3);
+      Expect(choose_cohort() == 1,
+             "wide Q8 cohorts avoid overwork when acceptance falls");
+      for (auto& controller : cohort)
+        controller.Observe(1, 1);
+      Expect(choose_cohort() == 7,
+             "wide Q8 cohorts can probe from a fully accepted short tile");
+    }
+  }
+
+  // Enumerate every outcome of a censored geometric run. At the true mean,
+  // expected feedback must have zero drift regardless of the chosen width.
+  // These means stay below the saturation cap for every possible update.
+  for (const float mean : {0.5F, 1.0F, 3.0F, 4.0F}) {
+    const double probability = mean / (static_cast<double>(mean) + 1.0);
+    for (std::uint32_t width = 1; width <= 7; ++width) {
+      double expected = 0.0;
+      double survival = 1.0;
+      for (std::uint32_t accepted = 0; accepted <= width; ++accepted) {
+        DFlashLengthController estimate(DFlashDraftPolicy::kAdaptive, 7);
+        estimate.Restore(mean);
+        estimate.Observe(accepted, width);
+        const double mass =
+            survival * (accepted < width ? 1.0 - probability : 1.0);
+        expected += mass * estimate.State();
+        survival *= probability;
+      }
+      Expect(std::abs(expected - mean) < 1e-6,
+             "censored feedback must not depend on speculative block width");
     }
   }
 }
@@ -144,7 +314,7 @@ void TestConcurrentBlocks(
            (actual.empty() || std::memcmp(actual.data(), expected.data(),
                                           actual.size_bytes()) == 0);
   };
-  for (const std::size_t width : {2U, 4U, 6U, 8U}) {
+  for (const std::size_t width : {2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
     std::vector<QwenDFlashContextRequest> contexts;
     std::array<std::set<std::string>, 8> visited;
     std::vector<std::size_t> order;
@@ -199,7 +369,7 @@ void TestConcurrentBlocks(
                                      : nullptr,
           trace);
     }
-    for (const std::size_t width : {2U, 4U, 6U, 8U}) {
+    for (const std::size_t width : {2U, 3U, 4U, 5U, 6U, 7U, 8U}) {
       std::vector<QwenDFlashBlockRequest> requests;
       std::vector<std::size_t> order;
       std::array<std::set<std::string>, 8> visited;
@@ -252,9 +422,8 @@ void TestConcurrentBlocks(
       }
     }
   }
-  std::cout
-      << "DFlash2 C2/C4/C6/C8: exact layers, logits, selector probabilities; "
-         "ragged/full blocks, distinct positions/temperatures/draws\n";
+  std::cout << "DFlash2 C2-C8: exact layers, logits, selector probabilities; "
+               "ragged/full blocks, distinct positions/temperatures/draws\n";
   for (auto& executor : executors)
     executor.reset();
   std::array<std::unique_ptr<QwenDFlashGpuDraftBackend>, 8> backends;
@@ -281,6 +450,8 @@ void TestConcurrentBlocks(
   }
   const auto payload = [](const QwenDFlashGpuDraftBackend& backend) {
     auto snapshot = backend.Snapshot();
+    Expect(snapshot->PayloadBytes() == backend.SnapshotPayloadBytes(),
+           "snapshot admission includes all controller state");
     std::vector<std::uint8_t> bytes(snapshot->PersistentPayloadBytes());
     Expect(snapshot->SerializePersistent(bytes) == bytes.size(),
            "concurrent backend snapshot size");
@@ -289,13 +460,19 @@ void TestConcurrentBlocks(
   for (std::size_t round = 0; round < 2; ++round) {
     std::array<DraftProposal, 8> expected;
     std::array<std::vector<std::uint8_t>, 8> expected_state;
+    std::array<std::unique_ptr<gufo::speculative::IDraftBackendSnapshot>, 8>
+        initial_state;
+    const auto initial_rng = rng;
     auto expected_rng = rng;
     std::vector<gufo::speculative::DraftProposalRequest> requests;
     std::array<std::size_t, 8> accepted{};
     for (std::size_t index = 0; index < backends.size(); ++index) {
       auto& backend = *backends[index];
-      const auto saved = backend.Snapshot();
-      const auto limit = 1U + static_cast<std::uint32_t>(index % 7U);
+      initial_state[index] = backend.Snapshot();
+      // The cohort probes need a budget at which the cost models choose
+      // different lengths; a tiny cap would conceal accidental policy changes.
+      const auto limit =
+          index < 5 ? 7U : 1U + static_cast<std::uint32_t>(index % 7U);
       expected[index] =
           temperatures[index] > 0.0F
               ? backend.ProposeSampled(sequences[index], positions[index],
@@ -306,10 +483,31 @@ void TestConcurrentBlocks(
       backend.AcceptFeedback(
           std::span(expected[index].tokens).first(accepted[index]), 4);
       expected_state[index] = payload(backend);
-      backend.RestoreSnapshot(*saved);
+      backend.RestoreSnapshot(*initial_state[index]);
       requests.push_back({&backend, sequences[index], positions[index], limit,
                           temperatures[index],
                           temperatures[index] > 0.0F ? &rng[index] : nullptr});
+    }
+    // Both sampled and mixed greedy/sampled cohorts must retain their
+    // private proposal lengths, selector probabilities and random draws.
+    for (const std::size_t width : {2U, 3U, 4U, 5U, 6U, 7U}) {
+      for (const std::size_t first : {0U, 1U}) {
+        const auto cohort = std::span(requests).subspan(first, width);
+        const auto batch = cohort.front().backend->ProposeBatch(cohort);
+        Expect(batch.size() == width, "sampled cohort result count");
+        for (std::size_t row = 0; row < batch.size(); ++row) {
+          const auto index = first + row;
+          Expect(
+              batch[row].tokens == expected[index].tokens &&
+                  batch[row].candidate_ids == expected[index].candidate_ids &&
+                  exact(batch[row].candidate_probabilities,
+                        expected[index].candidate_probabilities) &&
+                  rng[index] == expected_rng[index],
+              "batch cost cannot alter sampled or mixed-cohort replay");
+          backends[index]->RestoreSnapshot(*initial_state[index]);
+          rng[index] = initial_rng[index];
+        }
+      }
     }
     const auto actual = backends.front()->ProposeBatch(requests);
     Expect(rng == expected_rng,
