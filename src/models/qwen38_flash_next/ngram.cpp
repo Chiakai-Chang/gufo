@@ -96,12 +96,20 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   t->base_offset_ = file_offset;
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
   // model must not be used here or every touched row would stay resident.
+#ifdef _WIN32
+  t->fd_ = gufo_reopen_direct(file_descriptor);
+  t->direct_ = t->fd_ >= 0;
+  if (t->fd_ < 0) {
+    t->fd_ = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
+  }
+#else
   const auto path = "/proc/self/fd/" + std::to_string(file_descriptor);
   t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
   t->direct_ = t->fd_ >= 0;
   if (t->fd_ < 0) {
     t->fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
   }
+#endif
   if (t->fd_ < 0) {
     if (error_msg != nullptr) {
       *error_msg = std::string("cannot open bound n-gram table: ") +

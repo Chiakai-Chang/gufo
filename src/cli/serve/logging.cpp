@@ -1,5 +1,10 @@
 #include "src/cli/serve/logging.hpp"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
+
 #include <unistd.h>
 
 #include <array>
@@ -89,9 +94,20 @@ void Logger::Log(LogLevel level, std::string_view component,
 
 std::string Logger::MemoryStatus() {
   std::ostringstream output;
+#ifdef _WIN32
+  PROCESS_MEMORY_COUNTERS counters{};
+  MEMORYSTATUSEX status{};
+  status.dwLength = sizeof(status);
+  const auto rss = GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))
+                       ? counters.WorkingSetSize : 0;
+  const auto available = GlobalMemoryStatusEx(&status) ? status.ullAvailPhys : 0;
+  output << "rss_mib=" << rss / (1024 * 1024)
+         << " host_available_mib=" << available / (1024 * 1024);
+#else
   output << "rss_mib=" << ReadMemoryKiB("/proc/self/status", "VmRSS:") / 1024
          << " host_available_mib="
          << ReadMemoryKiB("/proc/meminfo", "MemAvailable:") / 1024;
+#endif
   return output.str();
 }
 
