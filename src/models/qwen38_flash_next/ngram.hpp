@@ -92,6 +92,13 @@ private:
 
   int fd_{-1};
   bool direct_{false};
+  // Windows: the table is memory-mapped and prefetched in the background.
+  // System RAM is separate from the GPU carve there, so residency is cheap.
+  const std::uint8_t* mapped_{nullptr};
+  void* map_base_{nullptr};
+  std::size_t map_bytes_{0};
+  std::thread prefetch_;
+  std::atomic<bool> prefetch_stop_{false};
   std::uint64_t base_offset_{0};
   std::uint64_t rows_{0};
   std::uint32_t row_dim_{0};

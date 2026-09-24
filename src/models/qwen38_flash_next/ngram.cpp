@@ -1,11 +1,16 @@
 #include "src/models/qwen38_flash_next/ngram.hpp"
 
 #include <fcntl.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <sys/mman.h>
+#endif
 #include <unistd.h>
 
 #include <algorithm>
 #include <bit>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 
@@ -60,6 +65,11 @@ void HashNgramRows(const Config& c, NgramHistory& history,
 
 NgramTable::~NgramTable() {
   (void)WaitRead();
+  prefetch_stop_ = true;
+  if (prefetch_.joinable())
+    prefetch_.join();
+  if (map_base_ != nullptr)
+    (void)::munmap(map_base_, map_bytes_);
   {
     std::lock_guard<std::mutex> lock(mutex_);
     stop_ = true;
@@ -97,7 +107,29 @@ std::unique_ptr<NgramTable> NgramTable::Open(
   // Direct I/O bypasses the page cache; the mapping used for the rest of the
   // model must not be used here or every touched row would stay resident.
 #ifdef _WIN32
-  t->fd_ = gufo_reopen_direct(file_descriptor);
+  // GUFO_PLE_MODE: mmap (default; map + background prefetch), buffered (file
+  // cache reads), or direct (unbuffered reads, as on Linux).
+  const char* mode_env = std::getenv("GUFO_PLE_MODE");
+  const std::string mode = mode_env ? mode_env : "mmap";
+  if (mode == "mmap") {
+    t->map_bytes_ = static_cast<std::size_t>(rows * t->row_bytes_);
+    void* base = ::mmap(nullptr, t->map_bytes_, PROT_READ, MAP_SHARED, file_descriptor,
+                        static_cast<off_t>(file_offset));
+    if (base != MAP_FAILED) {
+      t->map_base_ = base;
+      t->mapped_ = static_cast<const std::uint8_t*>(base);
+      t->cache_count_ = 0;
+      t->prefetch_ = std::thread([raw = t.get()] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+        constexpr std::size_t kStep = 64ull << 20;
+        for (std::size_t off = 0; off < raw->map_bytes_ && !raw->prefetch_stop_; off += kStep) {
+          const std::size_t n = std::min(kStep, raw->map_bytes_ - off);
+          (void)::madvise(const_cast<std::uint8_t*>(raw->mapped_) + off, n, MADV_POPULATE_READ);
+        }
+      });
+    }
+  }
+  t->fd_ = mode == "direct" ? gufo_reopen_direct(file_descriptor) : -1;
   t->direct_ = t->fd_ >= 0;
   if (t->fd_ < 0) {
     t->fd_ = ::fcntl(file_descriptor, F_DUPFD_CLOEXEC, 0);
@@ -159,6 +191,10 @@ bool NgramTable::ReadOne(std::uint32_t row, float* dst,
                          std::vector<std::uint8_t>& buf) {
   if (row >= rows_) {
     return false;
+  }
+  if (mapped_ != nullptr) {
+    DecodeRow(mapped_ + static_cast<std::size_t>(row) * row_bytes_, dst);
+    return true;
   }
   if (ReadCached(row, dst)) {
     return true;
