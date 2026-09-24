@@ -513,6 +513,14 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["object"] = "model";
     model["created"] = Now();
     model["owned_by"] = "gufo";
+    if (const auto n_ctx = backend->context_tokens(); n_ctx != 0) {
+      model["context_length"] = static_cast<std::uint64_t>(n_ctx);
+      model["max_model_len"] = static_cast<std::uint64_t>(n_ctx);
+      json::Value meta = json::Value::object();
+      meta["n_ctx"] = static_cast<std::uint64_t>(n_ctx);
+      meta["n_ctx_train"] = static_cast<std::uint64_t>(n_ctx);
+      model["meta"] = std::move(meta);
+    }
     data.push_back(std::move(model));
   }
   if (video_jobs != nullptr && video_jobs->ready()) {
@@ -822,17 +830,29 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
              "invalid_prompt");
 }
 
-HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend&) {
-  const std::string model = req.query_param("model");
-  if (model.empty()) {
-    return Err(400, "Bad Request", "'model' query parameter is required",
-               "invalid_request_error", "missing_model");
-  }
+HttpResponse LlamaProps(const HttpRequest& req, TextGenerationBackend& b) {
+  // llama-server answers /props without a model; clients read n_ctx here.
+  std::string model = req.query_param("model");
+  if (model.empty())
+    model = b.model_id();
   json::Value resp = json::Value::object();
   resp["model"] = model;
   resp["template"] = "";
   json::Value model_info = json::Value::object();
   resp["model_info"] = std::move(model_info);
+  json::Value settings = json::Value::object();
+  settings["n_ctx"] = static_cast<std::uint64_t>(b.context_tokens());
+  settings["model"] = model;
+  resp["default_generation_settings"] = std::move(settings);
+  resp["total_slots"] = static_cast<std::uint64_t>(b.session_count());
+  resp["model_path"] = model;
+  resp["model_alias"] = model;
+  resp["chat_template"] = "";
+  json::Value modalities = json::Value::object();
+  modalities["vision"] = b.has_vision();
+  modalities["audio"] = false;
+  resp["modalities"] = std::move(modalities);
+  resp["build_info"] = "gufo";
   return Ok(resp);
 }
 
@@ -845,6 +865,7 @@ HttpResponse LlamaSlots(const HttpRequest&, TextGenerationBackend& b) {
   slot["prompt"] = "";
   slot["next_token"] = json::Value();
   slot["model"] = b.model_id();
+  slot["n_ctx"] = static_cast<std::uint64_t>(b.context_tokens());
   resp.push_back(std::move(slot));
   return Ok(resp);
 }

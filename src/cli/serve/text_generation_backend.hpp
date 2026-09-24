@@ -205,6 +205,10 @@ public:
 
   [[nodiscard]] virtual std::string model_id() const = 0;
   [[nodiscard]] virtual bool ready() const = 0;
+  /// Serving limits reported to llama.cpp/vLLM-style clients (0 = unknown).
+  [[nodiscard]] virtual std::uint32_t context_tokens() const { return 0; }
+  [[nodiscard]] virtual std::size_t session_count() const { return 1; }
+  [[nodiscard]] virtual bool has_vision() const { return false; }
   [[nodiscard]] virtual SamplingDefaults sampling_defaults() const {
     return {};
   }

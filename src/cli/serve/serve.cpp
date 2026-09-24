@@ -1157,6 +1157,8 @@ int RunServe(std::span<const char* const> args) {
       return 1;
     }
     backend->set_model_id(served_model_name);
+    backend->set_serving_info(max_context, session_count,
+                              !vision_model_path.empty());
     backend->set_sampling_defaults(max_tokens, sampling_config);
     backend->set_reasoning_defaults(*reasoning_defaults);
     const char* speculation =

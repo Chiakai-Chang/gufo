@@ -121,6 +121,19 @@ public:
   [[nodiscard]] InitialOutputState initial_output_state(
       const ChatRequest& request) const override;
   void set_model_id(const std::string& model_id);
+  void set_serving_info(std::uint32_t context_tokens, std::size_t sessions,
+                        bool vision) {
+    context_tokens_ = context_tokens;
+    session_count_ = sessions;
+    has_vision_ = vision;
+  }
+  [[nodiscard]] std::uint32_t context_tokens() const override {
+    return context_tokens_;
+  }
+  [[nodiscard]] std::size_t session_count() const override {
+    return session_count_;
+  }
+  [[nodiscard]] bool has_vision() const override { return has_vision_; }
   void set_sampling_defaults(std::size_t max_tokens,
                              const sampling::SamplingConfig& sampling);
   void set_reasoning_defaults(const ReasoningOptions& reasoning);
@@ -152,6 +165,10 @@ public:
   [[nodiscard]] std::size_t count_tokens(std::string_view text) const override;
 
 private:
+  std::uint32_t context_tokens_{0};
+  std::size_t session_count_{1};
+  bool has_vision_{false};
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
 };
