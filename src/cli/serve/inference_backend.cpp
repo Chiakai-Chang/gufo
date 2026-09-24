@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -21,6 +22,7 @@
 #include <utility>
 
 #include "src/cli/serve/logging.hpp"
+#include "src/core/platform/gpu_memory.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
 #include "src/core/gguf_identity.hpp"
@@ -899,7 +901,7 @@ public:
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     std::optional<std::size_t> capacity;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+    if (gufo::platform::DeviceMemoryInfo(&free_bytes, &total_bytes) == hipSuccess) {
       capacity = free_bytes;
     }
     return {
@@ -1622,7 +1624,7 @@ public:
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     std::optional<std::size_t> capacity;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+    if (gufo::platform::DeviceMemoryInfo(&free_bytes, &total_bytes) == hipSuccess) {
       capacity = free_bytes;
     }
     return {
@@ -2363,9 +2365,12 @@ public:
     std::size_t free_bytes = 0;
     std::size_t total_bytes = 0;
     std::optional<std::size_t> capacity;
-    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+    if (gufo::platform::DeviceMemoryInfo(&free_bytes, &total_bytes) == hipSuccess) {
       const auto deferred = model_->DeferredScratchBytes();
       capacity = free_bytes > deferred ? free_bytes - deferred : 0;
+      if (std::getenv("GUFO_DEBUG_CAPACITY"))
+        std::fprintf(stderr, "capacity: free=%zu MiB total=%zu MiB deferred=%zu MiB\n",
+                     free_bytes >> 20, total_bytes >> 20, deferred >> 20);
     }
     // Snapshots live in host memory, not in the device state pool.
     return {

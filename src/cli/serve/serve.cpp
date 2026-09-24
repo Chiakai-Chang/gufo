@@ -29,6 +29,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/core/platform/gpu_memory.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
 #include <hip/hip_runtime_api.h>
@@ -69,7 +70,7 @@ public:
         << ' ' << details << ' ' << server::Logger::MemoryStatus();
 #if defined(ENGINE_ENABLE_HIP)
     std::size_t free = 0, total = 0;
-    if (gpu_loaded && hipMemGetInfo(&free, &total) == hipSuccess) {
+    if (gpu_loaded && gufo::platform::DeviceMemoryInfo(&free, &total) == hipSuccess) {
       out << " gpu_device_used_mib=" << (total - free) / (1024 * 1024)
           << " gpu_device_total_mib=" << total / (1024 * 1024);
     }
