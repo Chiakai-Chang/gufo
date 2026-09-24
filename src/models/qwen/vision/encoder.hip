@@ -350,7 +350,11 @@ struct Encoder::Impl {
     if ((width != 5120 && width != 2560) ||
         reader->GetMetadataString("general.architecture") != "clip" ||
         reader->GetMetadataString("general.type") != "mmproj" ||
-        reader->GetMetadataString("general.basename") != model ||
+        // Finetunes keep the tower but rename or drop the basename; the
+        // structural keys above and below still pin the architecture.
+        (reader->GetMetadataString("general.basename").has_value() &&
+         reader->GetMetadataString("general.basename")->find(model) ==
+             std::string_view::npos) ||
         reader->GetMetadataBool("clip.has_vision_encoder") != true ||
         reader->GetMetadataBool("clip.use_gelu") != true ||
         reader->GetMetadataFloat32(
