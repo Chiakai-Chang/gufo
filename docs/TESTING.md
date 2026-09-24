@@ -28,19 +28,16 @@ nix develop -c cmake --build --preset cpu-sanitizer
 nix develop -c ctest --preset cpu-sanitizer --output-on-failure
 ```
 
-See [development](DEVELOPMENT.md) for all build presets.
-`gpu-test` uses optimized `RelWithDebInfo` with assertions.
-Performance measurements use `nix build` binaries under `result/bin` or the
-`release` preset with the same compiler and dependencies.
-Add new files to Git before invoking Nix.
-Formatting and the Python documentation/dependency checks also run on the
-editing host without building Gufo. Their entrypoints are in `tools/ci/`.
+Preset definitions, build options and repository mechanics are in
+[development](DEVELOPMENT.md). Formatting and the Python
+documentation/dependency checks run on the editing host without building Gufo;
+their entrypoints are in `tools/ci/`.
 
-`gpu-fast` excludes `slow` and `external-model` tests. The
-`deepseek-gpu` and `qwen-gpu-kernel-oracle` presets select
-model/device suites; `gpu-full` covers the complete hardware tree.
-External-model tests require their documented local artifacts. A skip due to
-an absent model or device is not a quality pass.
+Selection by preset: `gpu-fast` excludes `slow` and `external-model` tests,
+`deepseek-gpu` and `qwen-gpu-kernel-oracle` select model/device suites, and
+`gpu-full` covers the complete hardware tree. External-model tests require
+their documented local artifacts. A skip due to an absent model or device is
+not a quality pass.
 
 ## Hosted versus local checks
 
