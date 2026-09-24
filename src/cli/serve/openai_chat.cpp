@@ -1,5 +1,6 @@
 #include "src/cli/serve/openai_chat.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -513,6 +514,9 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
   }
 
   output->model = body.member_str("model");
+  // GUFO_ACCEPT_ANY_MODEL=1: behave like llama-server, which ignores 'model'.
+  if (const char* any = std::getenv("GUFO_ACCEPT_ANY_MODEL"); any && any[0] == '1')
+    output->model = backend.model_id();
   if (output->model.empty()) {
     return Error(400, "Bad Request", "'model' is required", "missing_model");
   }

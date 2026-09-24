@@ -430,7 +430,8 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (model->str() != backend.model_id())
+    const char* any = std::getenv("GUFO_ACCEPT_ANY_MODEL");
+    if (model->str() != backend.model_id() && !(any && any[0] == '1'))
       return Err(404, "Not Found", "requested model is not loaded",
                  "invalid_request_error", "model_not_found");
   }
