@@ -1,5 +1,7 @@
 #include "src/cli/serve/serve.hpp"
 
+#include <cstdlib>
+
 #include <arpa/inet.h>
 
 #include <charconv>
@@ -1159,6 +1161,13 @@ int RunServe(std::span<const char* const> args) {
     backend->set_model_id(served_model_name);
     backend->set_serving_info(max_context, session_count,
                               !vision_model_path.empty());
+    {
+      const char* budget = std::getenv("GUFO_SNAPSHOT_BUDGET_MIB");
+      server::Logger::Info("server",
+                           std::string("event=snapshot_budget ") +
+                               (budget && *budget ? std::string("fixed_mib=") + budget
+                                                  : std::string("mode=auto_half_available_at_load")));
+    }
     backend->set_sampling_defaults(max_tokens, sampling_config);
     backend->set_reasoning_defaults(*reasoning_defaults);
     const char* speculation =

@@ -56,6 +56,15 @@ void SetError(std::string* error, std::string message) {
 #if defined(ENGINE_ENABLE_HIP)
 /// Ordinary host allocations use the host budget, not HIP's device capacity.
 std::size_t HostSnapshotBudgetBytes() {
+  // GUFO_SNAPSHOT_BUDGET_MIB fixes the retained host snapshot pool. Without it
+  // the pool is half the memory available at load, which varies run to run;
+  // a single snapshot larger than the pool is never retained.
+  if (const char* fixed = std::getenv("GUFO_SNAPSHOT_BUDGET_MIB"); fixed && *fixed) {
+    char* end = nullptr;
+    const unsigned long long mib = std::strtoull(fixed, &end, 10);
+    if (end != fixed && *end == 0 && mib > 0)
+      return static_cast<std::size_t>(mib) << 20;
+  }
   const long pages = sysconf(_SC_AVPHYS_PAGES);
   const long page_size = sysconf(_SC_PAGESIZE);
   if (pages <= 0 || page_size <= 0)
