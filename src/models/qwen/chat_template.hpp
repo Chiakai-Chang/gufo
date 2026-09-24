@@ -102,6 +102,12 @@ struct ChatTemplateOptions {
   bool add_vision_id{false};
   bool require_tool_call{false};
   std::size_t max_output_bytes{1024ULL * 1024ULL};  ///< 1 MiB upper bound
+  // Controls the request set explicitly. A --chat-template-file template
+  // keeps its own defaults for anything left unset.
+  std::optional<bool> requested_thinking;
+  std::string requested_effort;  ///< empty when unset
+  std::optional<bool> requested_preserve;
+  std::string template_kwargs_json;  ///< raw chat_template_kwargs object
 };
 
 /// Suffix opened for a new assistant turn, outside the stable conversation.

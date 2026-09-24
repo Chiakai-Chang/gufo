@@ -106,6 +106,7 @@ tokenization::ChatTemplateOptions QwenChatOptions(const ChatRequest& request) {
                                                       request.add_vision_id);
   options.require_tool_call =
       request.tool_choice == ChatRequest::ToolChoice::kRequired;
+  options.template_kwargs_json = request.template_kwargs_json;
   return options;
 }
 

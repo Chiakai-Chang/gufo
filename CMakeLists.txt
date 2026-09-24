@@ -112,6 +112,14 @@ if (ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_diagnostics PRIVATE hip::host roc::hipblas roc::rocblas)
 endif()
 
+# llama.cpp Jinja engine (MIT) for --chat-template-file; see third_party/llama_jinja/VENDOR.md.
+file(GLOB GUFO_LLAMA_JINJA_SOURCES ${CMAKE_SOURCE_DIR}/third_party/llama_jinja/jinja/*.cpp)
+add_library(gufo_llama_jinja STATIC ${GUFO_LLAMA_JINJA_SOURCES}
+  third_party/llama_jinja/json.cpp third_party/llama_jinja/unicode.cpp)
+target_include_directories(gufo_llama_jinja PUBLIC
+  ${CMAKE_SOURCE_DIR}/third_party/llama_jinja
+  ${CMAKE_SOURCE_DIR}/third_party/llama_jinja/vendor)
+
 add_library(gufo_core STATIC
   src/core/image.cpp
   src/core/crypto/sha256.cpp
@@ -142,7 +150,7 @@ target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_compile_definitions(gufo_core PRIVATE
   GUFO_FFMPEG_EXECUTABLE="${GUFO_FFMPEG_EXECUTABLE}"
   GUFO_FFPROBE_EXECUTABLE="${GUFO_FFPROBE_EXECUTABLE}")
-target_link_libraries(gufo_core PUBLIC ICU::uc Threads::Threads
+target_link_libraries(gufo_core PUBLIC gufo_llama_jinja ICU::uc Threads::Threads
   PNG::PNG JPEG::JPEG CURL::libcurl OpenSSL::Crypto)
 
 add_subdirectory(src/models/qwen)

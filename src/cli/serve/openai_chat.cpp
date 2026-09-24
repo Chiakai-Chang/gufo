@@ -568,6 +568,8 @@ std::optional<HttpResponse> ParseRequest(const HttpRequest& request,
                  "invalid_reasoning");
   }
   if (const auto* kwargs = body.find("chat_template_kwargs")) {
+    if (kwargs->is_object())
+      output->chat.template_kwargs_json = kwargs->dump();
     if (const auto* vision_id = kwargs->find("add_vision_id")) {
       if (!vision_id->is_bool())
         return Error(400, "Bad Request",

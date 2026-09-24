@@ -4,6 +4,9 @@
 #include <unicode/utf8.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
+#include <type_traits>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -16,6 +19,7 @@
 
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/gguf_reader.hpp"
+#include "src/models/qwen/jinja_chat.hpp"
 #include "src/models/qwen/tokenizer.hpp"
 
 namespace gufo::tokenization {
@@ -24,6 +28,14 @@ ChatTemplateOptions ResolveQwenChatOptions(const ReasoningOptions& reasoning,
                                            bool add_vision_id) {
   ChatTemplateOptions options;
   options.add_vision_id = add_vision_id;
+  options.requested_thinking = reasoning.enabled;
+  options.requested_preserve = reasoning.preserve_thinking;
+  if (reasoning.effort.has_value()) {
+    constexpr std::string_view kNames[] = {"minimal", "low", "medium", "high", "xhigh", "max"};
+    options.requested_effort = kNames[static_cast<int>(*reasoning.effort)];
+  }
+  if (const auto* jinja = ActiveJinjaTemplate())
+    options.enable_thinking = jinja->DefaultThinking();
   options.enable_thinking = reasoning.enabled.value_or(options.enable_thinking);
   options.preserve_thinking =
       reasoning.preserve_thinking.value_or(options.preserve_thinking);
@@ -45,6 +57,24 @@ ChatTemplateOptions ResolveQwenChatOptions(const ReasoningOptions& reasoning,
 }
 
 namespace {
+
+// GUFO_DUMP_PROMPT=FILE appends every rendered prompt, for template debugging.
+template <typename T>
+T DumpPrompt(T rendered) {
+  static const char* path = std::getenv("GUFO_DUMP_PROMPT");
+  if (path != nullptr && *path != 0) {
+    const std::string* text = nullptr;
+    if constexpr (std::is_same_v<T, std::optional<std::string>>)
+      text = rendered ? &*rendered : nullptr;
+    else
+      text = &rendered;
+    if (text != nullptr) {
+      std::ofstream out(path, std::ios::binary | std::ios::app);
+      out << "=====PROMPT=====\n" << *text << "\n=====END=====\n";
+    }
+  }
+  return rendered;
+}
 
 constexpr std::string_view kDefaultChatmlTemplate =
     "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\\n' + "
@@ -332,6 +362,8 @@ std::optional<std::string> QwenChatTemplate::Render(
     std::vector<std::size_t>* image_offsets) {
   if (image_offsets != nullptr)
     image_offsets->clear();
+  if (const auto* jinja = ActiveJinjaTemplate(); jinja && !messages.empty())
+    return DumpPrompt(jinja->Render(messages, tools, options, error_msg, image_offsets));
   if (messages.empty()) {
     if (error_msg != nullptr) {
       *error_msg = "No messages provided";
@@ -521,6 +553,7 @@ std::optional<std::string> QwenChatTemplate::Render(
 
   if (options.add_generation_prompt)
     output.append(GenerationPrompt(options.enable_thinking));
+  DumpPrompt(output);
 
   if (output.size() > options.max_output_bytes) {
     if (error_msg != nullptr) {
@@ -533,6 +566,8 @@ std::optional<std::string> QwenChatTemplate::Render(
 }
 
 std::string_view GenerationPrompt(bool enable_thinking) {
+  if (const auto* jinja = ActiveJinjaTemplate())
+    return jinja->GenerationPrompt(enable_thinking);
   return enable_thinking ? "<|im_start|>assistant\n<think>\n"
                          : "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 }

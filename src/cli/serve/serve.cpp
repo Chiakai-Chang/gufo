@@ -29,6 +29,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/models/qwen/jinja_chat.hpp"
 #include "src/core/platform/gpu_memory.hpp"
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -1010,6 +1011,10 @@ int RunServe(std::span<const char* const> args) {
     llm_parser.AddOption("", "--cache-disk", "DIR",
                          "Opt-in restart-safe continuation cache directory",
                          "Cache", &cache_disk_directory);
+    std::filesystem::path chat_template_file;
+    llm_parser.AddOption("", "--chat-template-file", "PATH",
+                         "Jinja chat template for Qwen models, rendered with the llama.cpp engine",
+                         "Model", &chat_template_file);
     llm_parser.AddOption(
         "", "--cache-disk-bytes", "N",
         "Total retained disk-cache byte budget (default: 4294967296)", "Cache",
@@ -1031,6 +1036,18 @@ int RunServe(std::span<const char* const> args) {
     }
     if (!valid_server_options()) {
       return 2;
+    }
+    if (!chat_template_file.empty()) {
+      std::string template_error;
+      std::shared_ptr<const tokenization::JinjaChatTemplate> tmpl =
+          tokenization::JinjaChatTemplate::Load(chat_template_file, &template_error);
+      if (!tmpl) {
+        std::cerr << "Error: " << template_error << "\n";
+        return 2;
+      }
+      server::Logger::Info("server", "event=chat_template file=" + tmpl->Path() +
+                                 " default_thinking=" + (tmpl->DefaultThinking() ? "on" : "off"));
+      tokenization::SetActiveJinjaTemplate(tmpl);
     }
     bool sampling_valid = true;
     try {

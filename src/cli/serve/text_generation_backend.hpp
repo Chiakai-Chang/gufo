@@ -97,6 +97,8 @@ struct ChatRequest {
   ToolChoice tool_choice{ToolChoice::kAuto};
   ReasoningOptions reasoning;
   bool add_vision_id{false};
+  /// Raw chat_template_kwargs object, passed to --chat-template-file templates.
+  std::string template_kwargs_json;
   /// Bypass prompt reuse for this request; its completed state may be retained.
   bool cache_prompt{true};
 };
